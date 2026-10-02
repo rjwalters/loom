@@ -701,12 +701,14 @@ assert_contains "$src" "git -C" \
   "reconcile-stack.sh runs the push in the worktree the rebase ran in via git -C"
 assert_contains "$src" "push_landed_despite_rejection" \
   "reconcile-stack.sh verifies the actual remote ref state after a rejected --force-with-lease push (#6695)"
-assert_contains "$src" 'push_lease_live_tip origin "$CHILD_BRANCH"' \
-  "reconcile-stack.sh pins the lease to the child's LIVE remote head, not the shared remote-tracking ref (#9487)"
-assert_contains "$src" 'push_lease_pin_flag "$CHILD_BRANCH" "$CHILD_LEASE_OID"' \
-  "reconcile-stack.sh pushes with the PINNED lease argument (#9487)"
-assert_contains "$src" 'push_lease_require_incorporated "$CHILD_LEASE_OID" "$CHILD_BRANCH"' \
-  "reconcile-stack.sh refuses when origin holds commits this clone never incorporated (#9487)"
+assert_contains "$src" '"$DAEMON_BIN" push-lease pin-flag --remote origin --branch "$CHILD_BRANCH" --local-ref "refs/heads/$CHILD_BRANCH"' \
+  "reconcile-stack.sh builds the pinned lease via loom-daemon push-lease pin-flag, not in shell (#9487)"
+assert_contains "$src" 'run "${GIT_C[@]}" push "$PUSH_LEASE_ARG" origin "$CHILD_BRANCH"' \
+  "reconcile-stack.sh pushes with the PINNED lease argument the subcommand printed (#9487)"
+assert_not_contains "$src" 'push --force-with-lease;' \
+  "reconcile-stack.sh never issues a BARE --force-with-lease (#9487)"
+assert_contains "$src" 'loom_daemon_version_preflight push-lease "$DAEMON_BIN"' \
+  "a loom-daemon too old for push-lease is refused with the floor, never degraded to a bare lease (#9487)"
 assert_contains "$src" "PUSH-LEASE-RACE-DETECTED" \
   "reconcile-stack.sh logs a greppable marker when a reported rejection is actually landed"
 assert_contains "$src" '"$SCRIPT_DIR/version-check-gate.sh"' \

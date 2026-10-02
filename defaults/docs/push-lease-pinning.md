@@ -59,17 +59,36 @@ never fetched — makes the push **rejected** (`! [rejected] … (stale info)`),
 never accepted. The pinned form therefore fails closed in exactly the situation
 where the bare form fails open.
 
-## The helpers
+## The implementation: `loom-daemon push-lease pin-flag`
 
-`defaults/scripts/lib/push-lease-verify.sh` carries both halves of lease
-truthfulness. Its own header is the authoritative API reference:
+The pinning logic is a **daemon subcommand**, not shell — new executable logic
+belongs in Rust ([shell-language-policy.md](https://github.com/rjwalters/loom/blob/main/.loom/docs/shell-language-policy.md)
+— an absolute URL because that doc is not installed into consumer repos), and a script that
+reaches it only has to find the binary, pass the arguments, and read the result
+back (`loom-daemon/src/cli/push_lease.rs` is the authoritative reference):
 
-| Function | Use |
+```bash
+# At the point the branch state is READ — before the rebase/amend.
+PUSH_LEASE_ARG="$("$DAEMON_BIN" push-lease pin-flag \
+    --remote origin --branch "$BRANCH" --local-ref "refs/heads/$BRANCH")" || exit 1
+# … rebase / amend / commit …
+git push "$PUSH_LEASE_ARG" origin "$BRANCH"
+```
+
+| Exit | Meaning |
 |---|---|
-| `push_lease_live_tip <remote> <branch>` | Read the **live** remote head (`git ls-remote`, never a tracking ref). Call it where the branch state is read, and keep the value. |
-| `push_lease_pin_flag <branch> <oid>` | Build `--force-with-lease=<branch>:<oid>`. Refuses an empty oid — there is deliberately no bare-flag fallback. |
-| `push_lease_require_incorporated <oid> <local-ref>` | Refuse when the remote head is not an ancestor of what is being pushed, i.e. the remote holds commits this clone never incorporated. The pin would be accurate and the push would still delete them. |
-| `push_landed_despite_rejection <remote> <branch> <sha>` | The other half (#6695): a *reported* rejection for an update that actually landed, via the Git-LFS pre-push hook race. |
+| `0` | stdout is the pinned `--force-with-lease=<branch>:<oid>` argument. An **empty** oid when the remote does not have the branch yet: git reads that as "must not exist", the correct lease for a first push. |
+| `3` | `[FETCH]` — the remote could not be queried, so there is no pin. The caller must refuse, **not** fall back to the bare flag. |
+| `4` | `[LEASE-PIN]` — the remote head is not an ancestor of `--local-ref`, i.e. the remote holds commits this clone never incorporated. The pin would be accurate and the push would still delete them. |
+
+There is deliberately no "could not tell, here is a bare flag" outcome: the only
+safe fallback for a missing pin is not pushing. The bracketed tokens are the same
+greppable prerequisite shape `loom-daemon reconcile-stack` uses.
+
+`defaults/scripts/lib/push-lease-verify.sh` keeps the *other* half of lease
+truthfulness: `push_landed_despite_rejection <remote> <branch> <sha>`, for a
+*reported* rejection of an update that actually landed via the Git-LFS pre-push
+hook race (#6695).
 
 Pinned callers today: `defaults/scripts/reconcile-stack.sh`,
 `defaults/scripts/rebase-stacked-children.sh`, and every push recipe in the
@@ -86,5 +105,9 @@ Doctor role prompt (§"Pin the lease").
 - Scenario **D** covers a commit that landed *before* the run: refused as a
   precondition failure, before the rebase mutates anything.
 - `defaults/scripts/tests/test-rebase-stacked-children.sh` scenarios **(c)**,
-  **(j)**, **(k)** assert the pinned push argument, that the pin is read before
-  the rebase, and the two refusals.
+  **(j)**, **(k)** assert the pinned push argument, that the pin is built before
+  the rebase, and the two refusals (exit 3 / exit 4).
+- `loom-daemon/src/cli/push_lease.rs`'s unit tests cover the subcommand itself
+  against real git: the live tip is read from the remote (not the tracking
+  ref), an unqueryable remote is an error rather than "absent", and a sibling's
+  unfetched commit is correctly reported as not incorporated.
