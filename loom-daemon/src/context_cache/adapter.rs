@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn direct_flow_indexes_once_then_reuses_checkpoint() {
-        use super::augment_direct::{DirectError, DirectTransport};
+        use crate::context_cache::augment_direct::{DirectError, DirectTransport, PinnedBlob};
         use std::collections::VecDeque;
 
         struct MockTransport {
