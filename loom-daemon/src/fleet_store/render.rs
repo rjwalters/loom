@@ -173,7 +173,10 @@ pub fn lost_top_level_keys(target: &Target) -> Vec<String> {
     let (Value::Object(cur), Value::Object(want)) = (&current, &target.value) else {
         return Vec::new();
     };
-    cur.keys().filter(|k| !want.contains_key(*k)).cloned().collect()
+    cur.keys()
+        .filter(|k| !want.contains_key(*k))
+        .cloned()
+        .collect()
 }
 
 /// A path-by-path diff from `current` (on disk) to `wanted` (rendered):

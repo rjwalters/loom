@@ -150,7 +150,8 @@ fn lost_top_level_keys_is_empty_when_nothing_is_lost_or_unreadable() {
 }
 
 #[test]
-fn unparseable_target_is_drift() {    let p = paths();
+fn unparseable_target_is_drift() {
+    let p = paths();
     let targets = render(&snapshot_of(&sample_files()), "build-1", &p.machine, &p.local).unwrap();
     std::fs::create_dir_all(p.machine.parent().unwrap()).unwrap();
     std::fs::write(&p.machine, "{ <<<<<<< HEAD").unwrap();
