@@ -184,7 +184,7 @@ pub fn marker_text(marker: &SequenceMarker) -> String {
 /// Line-local by construction — the same rule as `hold_state::html_comment_spans`,
 /// for the same reason: many bodies are scanned together, and a multi-line
 /// scan lets one malformed comment change how a later one is read.
-fn html_comment_spans(line: &str) -> Vec<&str> {
+pub(crate) fn html_comment_spans(line: &str) -> Vec<&str> {
     let mut spans = Vec::new();
     let mut rest = line;
     while let Some(open) = rest.find("<!--") {

@@ -111,7 +111,7 @@ fn unknown_fields_make_the_span_not_a_marker() {
 fn a_different_marker_namespace_is_not_ours() {
     // `loom:sequence-x` must be ignored outright, not parsed as a malformed
     // sibling: other features may share the prefix without owning this gate.
-    let bodies = vec!["<!-- loom:sequence-extra after=1 -->".to_string()];
+    let bodies = ["<!-- loom:sequence-extra after=1 -->".to_string()];
     assert_eq!(parse(&bodies), None);
 }
 
