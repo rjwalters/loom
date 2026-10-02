@@ -744,3 +744,78 @@ fn the_abort_comment_records_the_adr_cause() {
         assert_eq!(crate::merge_pr::sequence::parse(&[body]), None);
     }
 }
+
+// --- find_open_candidate's fork-trust filter (adopt-first security) -----
+
+fn write_exec(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/usr/bin/env bash\n{body}")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+    path
+}
+
+#[test]
+fn a_same_repo_candidate_is_found_regardless_of_association() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = write_exec(
+        dir.path(),
+        "gh.sh",
+        r#"echo '[{"number":77,"isCrossRepository":false,"authorAssociation":"NONE","author":{"login":"anyone"}}]'"#,
+    );
+    assert_eq!(
+        find_open_candidate(&gh, dir.path(), "loom/consolidated/cons-ab12cd34").unwrap(),
+        Some(77),
+        "a same-repo branch needs write access to push, so it always counts"
+    );
+}
+
+#[test]
+fn a_cross_repo_candidate_from_an_untrusted_author_is_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = write_exec(
+        dir.path(),
+        "gh.sh",
+        r#"echo '[{"number":77,"isCrossRepository":true,"authorAssociation":"NONE","author":{"login":"attacker"}}]'"#,
+    );
+    assert_eq!(
+        find_open_candidate(&gh, dir.path(), "loom/consolidated/cons-ab12cd34").unwrap(),
+        None,
+        "a fork PR by an untrusted author must not be adopted as a candidate ledger"
+    );
+}
+
+#[test]
+fn a_cross_repo_candidate_from_a_trusted_association_is_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = write_exec(
+        dir.path(),
+        "gh.sh",
+        r#"echo '[{"number":77,"isCrossRepository":true,"authorAssociation":"OWNER","author":{"login":"turian"}}]'"#,
+    );
+    assert_eq!(
+        find_open_candidate(&gh, dir.path(), "loom/consolidated/cons-ab12cd34").unwrap(),
+        Some(77),
+        "an insider's association trusts the candidate even from a fork"
+    );
+}
+
+#[test]
+fn an_untrusted_fork_candidate_is_skipped_in_favor_of_a_trusted_same_repo_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = write_exec(
+        dir.path(),
+        "gh.sh",
+        r#"echo '[{"number":77,"isCrossRepository":true,"authorAssociation":"NONE","author":{"login":"attacker"}},{"number":78,"isCrossRepository":false,"authorAssociation":"NONE","author":{"login":"ci-bot"}}]'"#,
+    );
+    assert_eq!(
+        find_open_candidate(&gh, dir.path(), "loom/consolidated/cons-ab12cd34").unwrap(),
+        Some(78),
+        "the untrusted fork row is skipped, not just deprioritized"
+    );
+}

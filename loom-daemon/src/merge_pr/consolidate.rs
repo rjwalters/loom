@@ -714,20 +714,55 @@ pub fn live_base_sha(gh_bin: &Path, root: &Path, default_branch: &str) -> Result
 
 /// An open candidate PR for this head branch, if one exists — the adopt-first
 /// check that makes duplicate workers converge (ADR-0023 §5).
+///
+/// The candidate branch name is a pure function of public data (the sorted
+/// `number:head` pins), so anyone — including a fork contributor — can
+/// precompute it and race to open a same-named branch against this repo
+/// first. A same-repo branch needs write access to push, so it always
+/// counts; a cross-repo (fork) PR only counts when its author is trusted
+/// (the same H14 rule [`crate::comment_trust`] applies to closes-graph
+/// results), otherwise `adopt()` would trust an attacker-controlled ledger.
 pub fn find_open_candidate(gh_bin: &Path, root: &Path, branch: &str) -> Result<Option<u32>> {
     #[derive(Debug, Deserialize)]
     struct Row {
         number: u32,
+        #[serde(default)]
+        #[serde(rename = "isCrossRepository")]
+        is_cross_repository: bool,
+        #[serde(default)]
+        #[serde(rename = "authorAssociation")]
+        author_association: Option<String>,
+        #[serde(default)]
+        author: Option<serde_json::Value>,
     }
     let stdout = gh(
         gh_bin,
         root,
         &[
-            "pr", "list", "--state", "open", "--head", branch, "--json", "number",
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--head",
+            branch,
+            "--json",
+            "number,isCrossRepository,authorAssociation,author",
         ],
     )?;
     let rows: Vec<Row> = serde_json::from_slice(&stdout).context("parse gh pr list JSON")?;
-    Ok(rows.first().map(|r| r.number))
+    let policy = crate::comment_trust::TrustPolicy::for_root(root);
+    Ok(rows.into_iter().find_map(|r| {
+        if r.is_cross_repository {
+            let author = serde_json::json!({
+                "authorAssociation": r.author_association,
+                "author": r.author,
+            });
+            if !policy.trusts_json(&author) {
+                return None;
+            }
+        }
+        Some(r.number)
+    }))
 }
 
 // --- Reservation writing --------------------------------------------------
