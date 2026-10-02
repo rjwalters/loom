@@ -115,6 +115,36 @@ pub fn blob_name(path: &str, contents: &str) -> String {
     hex::encode(h.finalize())
 }
 
+/// Server-side indexing is asynchronous: after upload, blobs sit in an
+/// "uploaded but not yet indexed" state until the backend processes them.
+/// The SDK waits by polling `find-missing` with the non-indexed list
+/// merged in until it comes back empty.
+#[derive(Debug, Clone)]
+pub struct WaitPolicy {
+    /// Poll interval before the backoff threshold (SDK: 3s).
+    pub initial: std::time::Duration,
+    /// Elapsed time after which the poll interval widens (SDK: 60s).
+    pub backoff_after: std::time::Duration,
+    /// Poll interval after the threshold (SDK: 60s).
+    pub backoff_interval: std::time::Duration,
+    /// Total wait budget before giving up (SDK: 600s = 10 minutes).
+    pub max_wait: std::time::Duration,
+}
+
+impl Default for WaitPolicy {
+    fn default() -> Self {
+        Self {
+            initial: std::time::Duration::from_secs(3),
+            backoff_after: std::time::Duration::from_secs(60),
+            backoff_interval: std::time::Duration::from_secs(60),
+            max_wait: std::time::Duration::from_secs(600),
+        }
+    }
+}
+
+/// The SDK batches `find-missing` at 1000 names per call.
+pub const MAX_FIND_MISSING_BATCH: usize = 1000;
+
 /// A failed DirectContext call. `status` is the HTTP status when the round
 /// trip completed; `retryable()` mirrors the SDK's context retry policy:
 /// 499, 503, and the 5xx range — deliberately not 429/504.
@@ -231,6 +261,8 @@ pub struct DirectClient {
     /// Backoff between retries; zero in tests.
     pub backoff: std::time::Duration,
     pub max_attempts: u32,
+    /// Indexing-wait policy; zeroed in tests.
+    pub wait_policy: WaitPolicy,
 }
 
 impl DirectClient {
@@ -240,6 +272,7 @@ impl DirectClient {
             session_id: uuid::Uuid::new_v4().to_string(),
             backoff: std::time::Duration::from_secs(1),
             max_attempts: 3,
+            wait_policy: WaitPolicy::default(),
         }
     }
 
@@ -264,23 +297,67 @@ impl DirectClient {
     }
 
     /// `find-missing`: which of these blob names does the server want?
-    /// Returns the union of `unknown_memory_names` and
-    /// `nonindexed_blob_names` (both are upload-wanted names).
-    pub fn find_missing(&self, blob_names: &[String]) -> Result<Vec<String>, DirectError> {
-        let resp = self.call("find-missing", json!({ "mem_object_names": blob_names }))?;
+    ///
+    /// Mirrors the SDK's client-side semantics over the same endpoint: with
+    /// `include_non_indexed = false` (the indexing step's need) only
+    /// `unknown_memory_names` count as missing; with `true` (the
+    /// indexing-wait step's need) `nonindexed_blob_names` — uploaded but
+    /// not yet processed — merge in. Names are chunked at
+    /// [`MAX_FIND_MISSING_BATCH`] like the SDK.
+    pub fn find_missing(
+        &self,
+        blob_names: &[String],
+        include_non_indexed: bool,
+    ) -> Result<Vec<String>, DirectError> {
         let mut out = Vec::new();
-        for key in ["unknown_memory_names", "nonindexed_blob_names"] {
-            if let Some(list) = resp.get(key).and_then(|v| v.as_array()) {
-                for name in list {
-                    if let Some(n) = name.as_str() {
-                        if !out.iter().any(|existing: &String| existing == n) {
-                            out.push(n.to_string());
+        for chunk in blob_names.chunks(MAX_FIND_MISSING_BATCH) {
+            let resp = self.call("find-missing", json!({ "mem_object_names": chunk }))?;
+            let mut keys = vec!["unknown_memory_names"];
+            if include_non_indexed {
+                keys.push("nonindexed_blob_names");
+            }
+            for key in keys {
+                if let Some(list) = resp.get(key).and_then(|v| v.as_array()) {
+                    for name in list {
+                        if let Some(n) = name.as_str() {
+                            if !out.iter().any(|existing: &String| existing == n) {
+                                out.push(n.to_string());
+                            }
                         }
                     }
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Wait until the backend has indexed every named blob: poll
+    /// `find-missing` with the non-indexed list merged in until it comes
+    /// back empty, per the SDK's timing (3s polls, widening to 60s after a
+    /// minute, 10-minute budget — see [`WaitPolicy`]).
+    pub fn wait_for_indexing(&self, blob_names: &[String]) -> Result<(), DirectError> {
+        let started = std::time::Instant::now();
+        loop {
+            let pending = self.find_missing(blob_names, true)?;
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= self.wait_policy.max_wait {
+                return Err(DirectError::transport(format!(
+                    "indexing timeout: backend did not finish indexing within {}s \
+                     ({} blob(s) still pending)",
+                    self.wait_policy.max_wait.as_secs(),
+                    pending.len()
+                )));
+            }
+            let interval = if elapsed < self.wait_policy.backoff_after {
+                self.wait_policy.initial
+            } else {
+                self.wait_policy.backoff_interval
+            };
+            std::thread::sleep(interval);
+        }
     }
 
     /// `batch-upload`: content-addressed blobs the server is missing.
@@ -364,7 +441,9 @@ impl DirectClient {
 /// follow-up; v1 re-indexes a fresh revision from scratch.)
 pub fn ensure_index(client: &DirectClient, set: &PinnedBlobSet) -> Result<String, DirectError> {
     let names: Vec<String> = set.blobs.iter().map(|b| b.blob_name.clone()).collect();
-    let missing = client.find_missing(&names)?;
+    // Indexing semantics: only blobs the server has never seen get
+    // uploaded (unknown_memory_names — not the merged list).
+    let missing = client.find_missing(&names, false)?;
     let to_upload: Vec<&PinnedBlob> = missing
         .iter()
         .filter_map(|n| set.blobs.iter().find(|b| &b.blob_name == n))
@@ -372,7 +451,11 @@ pub fn ensure_index(client: &DirectClient, set: &PinnedBlobSet) -> Result<String
     if !to_upload.is_empty() {
         client.batch_upload(&to_upload)?;
     }
-    client.checkpoint_blobs(None, &names, &[])
+    let checkpoint = client.checkpoint_blobs(None, &names, &[])?;
+    // Server-side indexing is async: block until every blob is searchable
+    // (the SDK requires callers to wait before searching).
+    client.wait_for_indexing(&names)?;
+    Ok(checkpoint)
 }
 
 /// One retrieval against an indexed checkpoint.
@@ -440,6 +523,12 @@ mod tests {
     fn client(mock: Arc<MockTransport>) -> DirectClient {
         let mut c = DirectClient::new(Box::new(mock));
         c.backoff = std::time::Duration::ZERO;
+        c.wait_policy = WaitPolicy {
+            initial: std::time::Duration::ZERO,
+            backoff_after: std::time::Duration::ZERO,
+            backoff_interval: std::time::Duration::ZERO,
+            max_wait: std::time::Duration::ZERO,
+        };
         c
     }
 
@@ -468,11 +557,24 @@ mod tests {
             "nonindexed_blob_names": ["b2"],
         }))]));
         let c = client(mock.clone());
-        let missing = c.find_missing(&["b1".into(), "b2".into()]).unwrap();
-        assert_eq!(missing, vec!["b1", "b2"]);
+        // Indexing step: include_non_indexed = false -> unknown only.
+        let missing = c.find_missing(&["b1".into(), "b2".into()], false).unwrap();
+        assert_eq!(missing, vec!["b1"]);
         let calls = mock.calls();
         assert_eq!(calls[0].0, "find-missing");
         assert_eq!(calls[0].1.get("mem_object_names").unwrap(), &json!(["b1", "b2"]));
+    }
+
+    #[test]
+    fn find_missing_wait_semantics_merge_nonindexed() {
+        let mock = Arc::new(MockTransport::new(vec![Ok(json!({
+            "unknown_memory_names": [],
+            "nonindexed_blob_names": ["b2"],
+        }))]));
+        let c = client(mock.clone());
+        // Indexing-wait step: both lists count as pending.
+        let pending = c.find_missing(&["b2".into()], true).unwrap();
+        assert_eq!(pending, vec!["b2"]);
     }
 
     #[test]
@@ -484,11 +586,13 @@ mod tests {
             skipped_oversize: 0,
             skipped_unreadable: 0,
         };
-        // Server already has a's blob; wants b's.
+        // Server already has a's blob; wants b's upload AND an indexing wait.
         let mock = Arc::new(MockTransport::new(vec![
             Ok(json!({"unknown_memory_names": [b.blob_name], "nonindexed_blob_names": []})),
             Ok(json!({"blob_names": [b.blob_name]})),
             Ok(json!({"new_checkpoint_id": "cp-1"})),
+            // wait_for_indexing poll: everything indexed.
+            Ok(json!({"unknown_memory_names": [], "nonindexed_blob_names": []})),
         ]));
         let c = client(mock.clone());
         let checkpoint = ensure_index(&c, &set).unwrap();
@@ -496,7 +600,12 @@ mod tests {
         let calls = mock.calls();
         assert_eq!(
             calls.iter().map(|(e, _)| e.as_str()).collect::<Vec<_>>(),
-            vec!["find-missing", "batch-upload", "checkpoint-blobs"]
+            vec![
+                "find-missing",
+                "batch-upload",
+                "checkpoint-blobs",
+                "find-missing"
+            ]
         );
         // batch-upload carries ONLY the missing blob, exact field shapes.
         let uploaded = calls[1].1.get("blobs").unwrap().as_array().unwrap();
@@ -547,6 +656,29 @@ mod tests {
         let err = retrieve(&c, "cp", "q", None).unwrap_err();
         assert_eq!(err.status, Some(401));
         assert!(!err.retryable());
+        assert_eq!(mock.calls().len(), 1);
+    }
+
+    #[test]
+    fn wait_for_indexing_polls_until_empty_then_succeeds() {
+        let mock = Arc::new(MockTransport::new(vec![
+            Ok(json!({"unknown_memory_names": [], "nonindexed_blob_names": ["b1"]})),
+            Ok(json!({"unknown_memory_names": [], "nonindexed_blob_names": []})),
+        ]));
+        let c = client(mock.clone());
+        c.wait_for_indexing(&["b1".into()]).unwrap();
+        assert_eq!(mock.calls().len(), 2);
+    }
+
+    #[test]
+    fn wait_for_indexing_times_out_when_blobs_stay_pending() {
+        let mock = Arc::new(MockTransport::new(vec![Ok(
+            json!({"unknown_memory_names": [], "nonindexed_blob_names": ["b1"]}),
+        )]));
+        let c = client(mock.clone());
+        let err = c.wait_for_indexing(&["b1".into()]).unwrap_err();
+        assert!(err.message.contains("indexing timeout"));
+        assert!(err.message.contains("1 blob(s) still pending"));
         assert_eq!(mock.calls().len(), 1);
     }
 }
