@@ -84,6 +84,7 @@ fn censored_sample(stage: Stage, duration_sec: i64, offset: i64) -> StageSample 
         observed_at: as_of() - Duration::seconds(offset),
         source: SampleSource::StageJournal,
         host: "host-test".to_string(),
+        worked: None,
     }
 }
 

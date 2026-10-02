@@ -2,6 +2,7 @@
 
 mod backtest;
 mod censoring;
+mod conditioning;
 mod config;
 mod emit;
 mod estimate;

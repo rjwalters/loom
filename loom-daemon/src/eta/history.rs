@@ -132,6 +132,40 @@ pub struct StageSample {
     /// The host that recorded it (the envelope's `host_id`, or the local
     /// host for its own stage journal).
     pub host: String,
+    /// Whether the attempt this duration measures did the stage's work
+    /// (Issue #9420) — the sample-level twin of the `loom.attempt.worked`
+    /// span attribute ([`crate::observability::lifecycle::ATTEMPT_WORKED`]).
+    ///
+    /// Three-valued, and only one value is load-bearing:
+    ///
+    /// - `Some(false)` — this duration is **not** a measurement of the stage's
+    ///   work and [`StageSamples::select`] refuses it.
+    /// - `Some(true)` / `None` — admitted. `None` is "the producer did not
+    ///   say", which almost every local journal row is: the forge timelines
+    ///   and all but the zero-second `sweep.outcome` phase rows are
+    ///   worked-only by construction (there is no such thing as a phase
+    ///   duration for a phase that did not run), so marking them would be
+    ///   ceremony, not information.
+    ///
+    /// Why the field matters far more than the handful of local rows it
+    /// refuses today ([`worked_phase`]): the no-op population #9420 measured
+    /// lives in the `loom.role_attempt` span aggregate — 80.4% of this host's
+    /// 130,657 role ticks over 2026-09-18…10-02 never launched a session, and
+    /// their sub-second closes drag the unconditioned median to ~0. That
+    /// aggregate is the feed the remaining half of #9343 (fleet-wide in-sweep
+    /// samples from SigNoz) is slated to read into this very reader. The
+    /// refusal is the precondition that feed has to satisfy, in place before
+    /// the feed, rather than a p50 of milliseconds discovered afterwards.
+    pub worked: Option<bool>,
+}
+
+impl StageSample {
+    /// Whether [`StageSamples::select`] admits this sample's `worked`
+    /// conditioning (#9420): everything except an explicit `Some(false)`.
+    #[must_use]
+    pub fn worked_admitted(&self) -> bool {
+        self.worked != Some(false)
+    }
 }
 
 /// One Judge verdict.
@@ -214,6 +248,15 @@ pub struct Selection {
     pub by_source: std::collections::BTreeMap<String, usize>,
     /// How many of them each recording host contributed.
     pub by_host: std::collections::BTreeMap<String, usize>,
+    /// How many in-window samples of this stage were refused for
+    /// `worked = Some(false)` at the level this selection resolved at
+    /// (#9420). `0` on every selection a local history produces today.
+    ///
+    /// Not on the `eta-explanation/v1` wire: the record is a frozen v1
+    /// schema, and a count that is always `0` is not worth a schema change.
+    /// It is here so the refusal is observable to a test and to a caller that
+    /// wants to log it.
+    pub excluded_unworked: usize,
 }
 
 /// The oldest instant a sample may be observed at for an estimate at `as_of`.
@@ -234,6 +277,29 @@ fn same_repo(a: &str, b: &str) -> bool {
 /// `source` ([`SampleSource::admits`]).
 fn admitted(sources: &[SampleSource], source: SampleSource) -> bool {
     sources.iter().any(|filter| filter.admits(source))
+}
+
+/// [`StageSample::worked`] for one `sweep.outcome` phase duration (#9420).
+///
+/// `Some(false)` for a **role-attempt** stage recorded as zero whole seconds:
+/// a Curator, Builder or Doctor phase cannot spawn a session, run it and close
+/// inside one second, so such a row is an artefact (a phase marked complete
+/// without having run), and admitting it is exactly how a median collapses to
+/// ~0. Every other row is `None` — "the producer did not say" — because a wait
+/// stage can legitimately be ~0 (an already-approved PR entering `merge_wait`)
+/// and a positive role phase duration carries no evidence either way beyond
+/// being positive.
+///
+/// Measured almost inert, deliberately: across this host's 2,810 in-window
+/// `sweep.outcome` phase samples (every workspace root, 2026-09-18…10-02)
+/// exactly **2** are refused — both `curator` rows of 0 s — against nonzero
+/// minima of 2 s (builder), 1 s (curator), 3 s (judge) and 89 s (doctor), so
+/// the conditioning moves a real estimate by nothing measurable today. Its
+/// purpose is the shape the `loom.role_attempt` aggregate actually has —
+/// builder p50 of literally 0 ms — which must not enter the estimator
+/// unnoticed if that aggregate ever becomes a sample source.
+fn worked_phase(stage: Stage, duration_sec: i64) -> Option<bool> {
+    (stage.is_role_attempt() && duration_sec == 0).then_some(false)
 }
 
 impl StageSamples {
@@ -296,6 +362,7 @@ impl StageSamples {
                             observed_at,
                             source: SampleSource::SweepOutcome,
                             host: host.to_string(),
+                            worked: worked_phase(stage, phase.duration_sec),
                         });
                     }
                 }
@@ -370,6 +437,19 @@ impl StageSamples {
     }
 
     /// [`Self::select`] with an explicit floor.
+    ///
+    /// # Worked-only conditioning (#9420)
+    ///
+    /// A sample marked `worked = Some(false)` ([`StageSample::worked`]) is
+    /// refused: its duration does not measure an attempt that did the stage's
+    /// work, so admitting it would be the millisecond-median defect #9420 was
+    /// filed about. The refusal happens *before* `min_samples` is checked, so
+    /// a stage whose only evidence is unworked attempts falls through to the
+    /// host level and then out entirely — `None`, which the estimators already
+    /// report as [`super::NoEstimateReason::InsufficientSamples`]. That is the
+    /// "too few conditioned samples ⇒ explicitly unmeasured, never a
+    /// fabricated value" fallback, and it is deliberately the **existing**
+    /// floor rather than a second mechanism bolted beside it.
     #[must_use]
     pub fn select_at(
         &self,
@@ -380,15 +460,21 @@ impl StageSamples {
         min_samples: usize,
     ) -> Option<Selection> {
         for level in [Level::Repo, Level::Host] {
+            let in_scope = |s: &&StageSample| {
+                s.stage == stage
+                    && admitted(sources, s.source)
+                    && in_window(s.observed_at, as_of)
+                    && (level == Level::Host || same_repo(&s.repo, repo))
+            };
+            let excluded_unworked = self
+                .stages
+                .iter()
+                .filter(|s| in_scope(s) && !s.worked_admitted())
+                .count();
             let mut picked: Vec<&StageSample> = self
                 .stages
                 .iter()
-                .filter(|s| {
-                    s.stage == stage
-                        && admitted(sources, s.source)
-                        && in_window(s.observed_at, as_of)
-                        && (level == Level::Host || same_repo(&s.repo, repo))
-                })
+                .filter(|s| in_scope(s) && s.worked_admitted())
                 .collect();
             if picked.len() < min_samples {
                 continue;
@@ -415,6 +501,7 @@ impl StageSamples {
                 sorted,
                 by_source,
                 by_host,
+                excluded_unworked,
             });
         }
         None
@@ -448,6 +535,9 @@ impl StageSamples {
                     && admitted(sources, s.source)
                     && in_window(s.observed_at, as_of)
                     && (level == Level::Host || same_repo(&s.repo, repo))
+                    // #9420: same conditioning as the observed side, so the
+                    // censored lower bounds describe the same population.
+                    && s.worked_admitted()
             })
             .collect();
         picked.sort_by(|a, b| {

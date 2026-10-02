@@ -274,7 +274,9 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         } else {
             "rejected"
         };
-        span.finish_attempt(outcome, SpanStatus::Error);
+        // #9420: the runtime was never reached, so this attempt's interval
+        // measures admission overhead, not the stage's work.
+        span.finish_attempt(outcome, SpanStatus::Error, Some(false));
     }
     result
 }

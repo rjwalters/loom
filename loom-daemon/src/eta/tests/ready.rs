@@ -34,6 +34,7 @@ fn turnovers(n: usize, base: i64) -> Vec<StageSample> {
             observed_at: as_of() - Duration::hours(i as i64 + 1),
             source: SampleSource::StageJournal,
             host: "host-fixture-a".to_string(),
+            worked: None,
         })
         .collect()
 }

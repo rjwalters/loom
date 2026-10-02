@@ -72,6 +72,7 @@ pub const STORY_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.model",
     "loom.sweep_id",
     "loom.timing_source",
+    crate::observability::lifecycle::ATTEMPT_WORKED,
 ];
 
 /// The bound on one tick's whole story step (`repo_id` plus every GraphQL
@@ -235,6 +236,15 @@ pub fn story_span(facts: &TickFacts, slug: &str, story: &StoryRef) -> SpanRecord
             attributes.insert(key.to_string(), value);
         }
     }
+    // #9420: a story copy is the whole tick's interval, so it carries the same
+    // dwell-conditioning flag as the tick's own root. A story copy only exists
+    // because the tick's transcript named this target, which already implies a
+    // session ran — the flag is derived from the result label anyway rather
+    // than asserted, so an unparseable label leaves it absent.
+    crate::observability::lifecycle::insert_worked(
+        &mut attributes,
+        super::label_spawned(&facts.result),
+    );
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     let started_at = facts.trace.started_at;
     SpanRecord {
