@@ -335,6 +335,28 @@ impl PeerClaimView {
             .collect()
     }
 
+    /// Remaining time on the live fleet-wide no-op cooldown a **peer** host
+    /// armed for `repo`/`issue` at local time `now`, or `None` when no live
+    /// peer window covers it (Issue #9928).
+    ///
+    /// [`Self::noop_cooldown_issues_at`]'s per-issue sibling: the work-finder
+    /// pre-filter wants the whole set, but the dispatch-path guard
+    /// ([`crate::sweep_registry::SweepRegistry::noop_cooldown_dispatch_block`],
+    /// step 2.75) needs the remaining duration for the one issue it was asked
+    /// to dispatch, so it can report `retry_after_secs` on its refusal.
+    /// `Some(Duration::ZERO)` is never returned — an elapsed window reads as
+    /// `None`, mirroring the `expiry > now` filter above.
+    #[must_use]
+    pub fn noop_cooldown_remaining_at(
+        &self,
+        repo: &str,
+        issue: u32,
+        now: Instant,
+    ) -> Option<Duration> {
+        let expiry = self.noop_cooldowns.get(&(repo.to_string(), issue))?;
+        (*expiry > now).then(|| *expiry - now)
+    }
+
     /// [`Self::noop_cooldown_issues_at`]'s sibling for dispatch backoff
     /// (Issue #7477).
     #[must_use]
