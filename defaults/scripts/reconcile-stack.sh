@@ -14,7 +14,8 @@
 #
 # What it does:
 #   git rebase --onto <fetched default-branch COMMIT> <parent-ref> <child-branch>
-#   git push --force-with-lease
+#   git push --force-with-lease=<child-branch>:<child's live remote head, pinned
+#                                               before the rebase>
 #   gh pr edit <child-pr> --base <default-branch>
 #
 # The repo merges with merge commits (setup-repository-settings.sh default,
@@ -41,7 +42,14 @@
 #
 # Safety:
 #   - Uses --force-with-lease (NEVER a bare --force) so a concurrent push to the
-#     child branch aborts the rebase rather than clobbering it.
+#     child branch aborts the rebase rather than clobbering it, and PINS the
+#     lease to the child's live remote head read before the rebase (#9487) —
+#     the bare flag would compare against refs/remotes/origin/<child>, a ref
+#     shared by every linked worktree that a sibling agent's fetch can advance
+#     out from under this run, defeating the lease entirely.
+#   - Refuses when origin/<child> holds commits this clone has not
+#     incorporated: the pin would be accurate and the push would still delete
+#     them (#9487).
 #   - --dry-run plans (and fetches, and verifies every prerequisite) but
 #     mutates no branch and prints the remaining commands.
 #   - Refuses on a dirty working tree, a failed fetch, a missing remote
@@ -74,7 +82,7 @@ info() { echo -e "${BLUE}ℹ $1${NC}" >&2; }
 warn() { echo -e "${YELLOW}⚠ $1${NC}" >&2; }
 
 show_help() {
-    sed -n '2,58p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,66p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 DRY_RUN=false
@@ -150,6 +158,39 @@ info "Child branch: $CHILD_BRANCH"
 info "Parent branch: $PARENT_BRANCH"
 info "Forge retarget base (default branch name): $DEFAULT_BRANCH"
 
+# #9487: capture the child branch's LIVE remote head NOW — before the rebase
+# rewrites anything — and pin step 2's --force-with-lease to it. A bare
+# --force-with-lease compares against refs/remotes/origin/<child>, a ref SHARED
+# by every linked worktree of this clone: a sibling agent's fetch can advance it
+# to a commit this run never saw, after which the bare lease is satisfied and
+# the push silently deletes that commit. Capturing before the rewrite (and
+# never re-reading it later) is the whole point — a fetch taken just before the
+# push would pin the sibling's commit and launder the clobber as "fresh".
+#
+# shellcheck source=lib/push-lease-verify.sh
+source "$SCRIPT_DIR/lib/push-lease-verify.sh"
+CHILD_LEASE_OID="$(push_lease_live_tip origin "$CHILD_BRANCH")" || CHILD_LEASE_OID=""
+if [[ -z "$CHILD_LEASE_OID" ]]; then
+    if [[ "$DRY_RUN" == "true" ]]; then
+        warn "Could not read origin's live head for '$CHILD_BRANCH' — a real run would refuse here (#9487); continuing the dry run."
+    else
+        err "[FETCH] Could not read origin's live head for '$CHILD_BRANCH' (#9487) — refusing to rebase+push without a pinned force-with-lease value. Check network/remote access and re-run; nothing was mutated."
+        exit 1
+    fi
+else
+    info "Pinned force-with-lease value for '$CHILD_BRANCH': $CHILD_LEASE_OID"
+    # The pin is accurate but not sufficient on its own: a commit published
+    # BEFORE the pin was taken and never fetched here would still be deleted by
+    # the push. Require that this clone has incorporated it. Skipped when the
+    # child branch does not resolve locally at all — that is the daemon's
+    # CHILD-BRANCH prerequisite, which reports it far more precisely.
+    if git rev-parse --verify --quiet "refs/heads/$CHILD_BRANCH" >/dev/null 2>&1 \
+       && ! push_lease_require_incorporated "$CHILD_LEASE_OID" "$CHILD_BRANCH"; then
+        err "[LEASE-PIN] origin/$CHILD_BRANCH is at $CHILD_LEASE_OID, which this checkout's '$CHILD_BRANCH' has not incorporated (#9487) — someone pushed commits this clone does not have. Refusing: a rebase+push here would delete them. Run 'git fetch origin $CHILD_BRANCH', reconcile by hand, then re-run. Nothing was mutated."
+        exit 1
+    fi
+fi
+
 # The reconciliation planner/executor. Hard requirement, failing CLOSED: with
 # no binary there is no verified fetch and no pinned destination, and the only
 # thing left to rebase onto would be the stale local branch this exists to
@@ -184,7 +225,7 @@ PLAN_OUT="$("$DAEMON_BIN" reconcile-stack "${RECONCILE_ARGS[@]}")" || PLAN_RC=$?
 if [[ $PLAN_RC -eq 2 ]]; then
     err "Rebase failed (likely a conflict). Resolve it, then re-run this script or finish manually:"
     echo "    git rebase --continue   # after resolving" >&2
-    echo "    git push --force-with-lease" >&2
+    echo "    git push --force-with-lease=$CHILD_BRANCH:${CHILD_LEASE_OID:-<head-you-based-on>}   # pinned, never bare (#9487)" >&2
     echo "    gh pr edit $CHILD_PR --base $DEFAULT_BRANCH" >&2
     exit 2
 elif [[ $PLAN_RC -ne 0 ]]; then
@@ -223,18 +264,23 @@ run() {
 # holds the branch, else here), so the current branch there is the child.
 GIT_C=(git -C "$LOOM_RS_GIT_DIR")
 
-# 2. Publish the rewritten child branch. --force-with-lease (never bare
-#    --force) so a concurrent push aborts rather than clobbers.
-info "Step 2/3: push --force-with-lease"
-if ! run "${GIT_C[@]}" push --force-with-lease; then
+# 2. Publish the rewritten child branch. --force-with-lease PINNED to the head
+#    captured above (never bare --force, and never the bare lease either —
+#    #9487) so a concurrent push aborts rather than clobbers.
+PUSH_LEASE_ARG="$(push_lease_pin_flag "$CHILD_BRANCH" "$CHILD_LEASE_OID")" || PUSH_LEASE_ARG=""
+if [[ -z "$PUSH_LEASE_ARG" ]]; then
+    # Only reachable under --dry-run (a real run exited above without a pin).
+    warn "No pinned lease value — a real run would have refused (#9487)."
+    PUSH_LEASE_ARG="--force-with-lease"
+fi
+info "Step 2/3: push $PUSH_LEASE_ARG"
+if ! run "${GIT_C[@]}" push "$PUSH_LEASE_ARG" origin "$CHILD_BRANCH"; then
     # A reported rejection is not always a real one (#6695): Git LFS's
     # pre-push hook can race the lease re-check on a branch with pending LFS
     # objects, so the ref update lands while the printed rejection reflects a
     # stale read. Verify the LIVE remote ref before trusting the reported
     # failure — never a local remote-tracking ref, which is not re-fetched here.
     PUSH_RACE_SHA="$("${GIT_C[@]}" rev-parse "$CHILD_BRANCH" 2>/dev/null || true)"
-    # shellcheck source=lib/push-lease-verify.sh
-    source "$SCRIPT_DIR/lib/push-lease-verify.sh"
     if [[ "$DRY_RUN" != "true" ]] && push_landed_despite_rejection origin "$CHILD_BRANCH" "$PUSH_RACE_SHA" "${GIT_C[@]}"; then
         warn "PUSH-LEASE-RACE-DETECTED: push --force-with-lease reported a rejection for '$CHILD_BRANCH', but origin already reflects the update ($PUSH_RACE_SHA) — likely the Git LFS pre-push hook racing the lease re-check (#6695). Treating as landed and continuing."
     else

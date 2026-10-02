@@ -609,27 +609,24 @@ if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
     # Check for merge conflicts (ask the forge; `git merge-tree origin/main`
     # alone is not a valid invocation — it needs the base + two commits).
     if [ "$(gh pr view "$UNLABELED_PR" --json mergeable --jq '.mergeable')" = "CONFLICTING" ]; then
+      # Pin the lease to this PR's head BEFORE the rebase rewrites it (#9487).
+      PUSH_LEASE_SHA=$(gh pr view "$UNLABELED_PR" --json headRefOid --jq '.headRefOid')
       # Resolve conflicts
       git fetch origin main
       git rebase origin/main
       # ... resolve conflicts ...
-      # If commit.signoff is true (or the repo requires DCO), re-signed commits
-      # must keep their Signed-off-by: trailer — use `git commit --amend --signoff`
-      # when re-authoring a commit during the rebase. See defaults/docs/commit-signoff.md.
+      # DCO: a commit re-authored during the rebase keeps its Signed-off-by
+      # trailer via `git commit --amend --signoff` (defaults/docs/commit-signoff.md).
 
-      # Version-bearing-file sync gate (#7168, largely moot after #7743): no
-      # PR may carry an edit to a version-bearing file's value anymore (bumps
-      # are version-bump-on-merge.yml's job, once, after merge), so a rebase
-      # now lands exactly origin/main's values with nothing of yours to go
-      # stale. Kept as cheap defense-in-depth -- this path pushes directly,
-      # never through create-pr.sh. If it fires, that is an anomaly: do NOT
-      # hand-edit a version-bearing file or run `version.sh bump patch` --
-      # stop, do not push, report it on the PR.
+      # Version-bearing-file sync gate (#7168; see "Pin the lease" for why).
+      # If it fires that is an anomaly: never hand-edit a version-bearing file
+      # or run `version.sh bump` -- stop, do not push, report it on the PR.
       if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
         echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
         exit 1
       fi
-      git push --force-with-lease
+      # Lease PINNED to the pre-rebase head, never bare (#9487).
+      git push --force-with-lease="$PR_BRANCH:$PUSH_LEASE_SHA"
 
       # Comment but don't add labels
       ./.loom/scripts/post-comment.sh $UNLABELED_PR --pr --body "🔧 Fixed merge conflicts with main branch."
@@ -735,13 +732,13 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
    - This prevents multiple fix-push-fail cycles
 9. **Commit and push**: Push your fixes to the PR branch
    - **Pre-open rebase onto `origin/main` (MANDATORY, #7668)**: immediately before this push — whatever your dispatch reason — run `git fetch origin main && git rebase origin/main`, as in `builder-pr.md` § "Pre-Push Rebase". If it conflicts, resolve it now using the "PR Has Merge Conflicts" recipe below (including its version-bearing-file sync gate) rather than re-requesting review on a PR that lands `DIRTY` on the next pass (the reactive round-trip of Priority 1 above). A no-op when `main` hasn't moved.
-   - **Pre-push head-SHA recheck (MANDATORY)**: before the push, re-compare the PR's `headRefOid` against the `CLAIM_HEAD_SHA` you captured in step 2 — see "Pre-Push Head-SHA Recheck" below. If the head moved, another agent pushed while you were working; re-verify the blocker is still unaddressed and stand down rather than duplicating (or clobbering) their fix.
+   - **Pre-push head-SHA recheck (MANDATORY)**: before the push, re-compare the PR's `headRefOid` against the `CLAIM_HEAD_SHA` you captured in step 2 — see "Pre-Push Head-SHA Recheck" below. If the head moved, another agent pushed while you were working; re-verify the blocker is still unaddressed and stand down rather than duplicating (or clobbering) their fix. Then push with the lease **pinned** to it, never bare (#9487, "Pin the lease").
    - **DCO / sign-off**: if `commit.signoff` is `true` in `.loom/config.json` (read it the same way as `buildGate.command`), or the repo has a DCO / required `sign-off` check, add `--signoff` to **every** commit you author — including `git commit --amend --signoff` when re-authoring during a rebase — so each carries a `Signed-off-by:` trailer. Harmless when not required; git will not add a duplicate trailer. Reference: `defaults/docs/commit-signoff.md`.
    - **9a. Rebase any stacked children** (best-effort): if the just-pushed branch matches `feature/issue-<N>` (i.e. you amended a stacked *parent*), run:
      ```bash
      ./.loom/scripts/rebase-stacked-children.sh feature/issue-<N>
      ```
-     This discovers open child PRs stacked on your branch and rebases any that went stale onto your new tip (safe children auto-rebase + force-with-lease; children whose issue is still `loom:building` get a deferred-reconciliation comment instead). It is a no-op when there are no stacked children. This is **best-effort** — a failure here (rebase conflict, non-GitHub forge) never fails your own Doctor work; carry on to step 10. Preview first with `--dry-run` if unsure.
+     It rebases open child PRs that went stale onto your new tip (safe children auto-rebase with a *pinned* force-with-lease; a child whose issue is still `loom:building` gets a deferred-reconciliation comment). No-op without stacked children, and **best-effort** — a failure (conflict, non-GitHub forge) never fails your own work; carry on to step 10. `--dry-run` previews.
 10. **Verify CI remotely**: Run `gh pr checks <number>` after push to confirm all checks pass
 11. **Signal completion and unclaim** (run the Verdict-Time CAS Recheck — see below — immediately before this write; abort/stand down instead if it finds your claim lost or the PR already moved):
     - Remove `loom:changes-requested` and `loom:treating` labels
@@ -917,17 +914,17 @@ own `labeled` timeline-event timestamp rather than the PR's aggregate
 stand-down comment self-refreshes `updatedAt` but not the label event). That
 pass runs on an interval (up to ~10 minutes of lag) and cannot see an
 *in-flight* Doctor, so it never substitutes for this check or the pre-push
-recheck below. See [`daemon-reference.md`'s "Stale-claim reconciliation"
-section](https://github.com/rjwalters/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
+recheck below. See `defaults/docs/daemon-reference.md` § "Stale-claim
+reconciliation".
 
 ### Pre-Push Head-SHA Recheck (Step 9)
 
 The claim check above closes the window at *claim* time. It does not close the
 window that opens **while you work**: a Doctor dispatched from another path
 (fleet vs. orchestrator) may claim and fix the same PR after you started, or a
-Builder may push to the branch. `--force-with-lease` protects the *branch* from
-a clobbering push, but it does nothing to stop two Doctors from duplicating an
-hour of *work* before either one pushes.
+Builder may push to the branch. A *pinned* `--force-with-lease` (below)
+protects the *branch*, but nothing stops two Doctors duplicating an hour of
+*work* before either pushes.
 
 So immediately before your final push (step 9), re-read the PR head and compare
 it to the SHA you captured at claim time:
@@ -936,7 +933,7 @@ it to the SHA you captured at claim time:
 N=<pr-number>
 CURRENT_HEAD_SHA=$(gh pr view $N --json headRefOid --jq '.headRefOid')
 if [ -z "$CURRENT_HEAD_SHA" ]; then
-  echo "Head SHA unavailable — fail safe: push with --force-with-lease and re-verify CI after"
+  echo "Head SHA unavailable — re-verify the blocker by hand; the pinned lease below still fails closed"
 elif [ "$CURRENT_HEAD_SHA" = "$CLAIM_HEAD_SHA" ]; then
   echo "Head unchanged since claim — safe to push"
 else
@@ -957,34 +954,42 @@ git fetch origin && git log --oneline "$CLAIM_HEAD_SHA..origin/$(git branch --sh
 | Finding | Action |
 |---------|--------|
 | The concurrent push already fixes the blocker (checks green / Judge feedback addressed) | **Stand down.** Do not push. Comment, drop your claim, and exit (see below). |
-| The blocker is still unaddressed, and the new commits are unrelated (e.g. a rebase onto main, an unrelated fix) | Rebase your work onto the new head, re-run local checks, then push with `--force-with-lease`. Never `--force`. |
-| Your work and theirs overlap partially | Keep only the parts still needed, rebase, re-run local checks, then push with `--force-with-lease`. |
+| The blocker is still unaddressed, and the new commits are unrelated (e.g. a rebase onto main, an unrelated fix) | Rebase your work onto the new head, re-run local checks, then **re-pin** `PUSH_LEASE_SHA=$CURRENT_HEAD_SHA` and push (below). Never `--force`. |
+| Your work and theirs overlap partially | Keep only the parts still needed, rebase, re-run local checks, then re-pin and push as above. |
 | You cannot tell | Prefer standing down and commenting — a duplicate fix costs more than a deferred one. |
 
-**If you rebase in either of the two "then push" rows above, gate the push the
-same way the merge-conflict recipes do** (#7168, extended #7341; largely moot
-after #7743 -- see below). Rebasing onto a moved head silently absorbs whatever
-version-bearing values that head already carried, and `.loom/install-metadata.json`
-never raises a git conflict (your branch's own commits never touched it) — so
-it can drift stale relative to `VERSION` and the files that *were* rewritten,
-invisible until CI's "Installer Integration Tests" fails:
+### Pin the lease — a bare `--force-with-lease` is unsafe here (#9487)
+
+The recheck above is the *social* layer; this is the mechanical one beneath it,
+and it is **not optional**. A bare `--force-with-lease` compares origin against
+`refs/remotes/origin/<branch>`, a ref **shared by every linked worktree of this
+clone** — a sibling's `git fetch` advances it to the commit *they* pushed,
+the lease is satisfied by construction, and your push is **accepted**, deleting
+their work with no error (PR #9483). Pin the head you actually built on, and
+never "freshen" the pin with a `git fetch` before pushing — that pins the
+sibling's commit and launders the clobber. Why: `defaults/docs/push-lease-pinning.md`.
 
 ```bash
-# Run in the worktree, after `git rebase`, BEFORE `git push --force-with-lease`.
-if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
-  echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above)." >&2
-  exit 1
-fi
-git push --force-with-lease
+BRANCH=$(git branch --show-current)
+# The head your work is based on: CLAIM_HEAD_SHA from step 2. Re-pin to
+# $CURRENT_HEAD_SHA ONLY after deliberately rebasing onto a moved head.
+PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-$CLAIM_HEAD_SHA}"
+# If you rebased, run the version-bearing-file sync gate first (#7168/#7341 —
+# the `version-check-gate.sh` call in the merge-conflict recipes) and abort on
+# a mismatch; a rebase silently absorbs the new head's version values.
+[ -n "$PUSH_LEASE_SHA" ] || { echo "No pin: do NOT push. Re-read the real head (git ls-remote origin refs/heads/$BRANCH); it must be what you built on." >&2; exit 1; }
+git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"
 ```
 
+An unresolvable expected value is rejected, so the pinned form fails closed
+where the bare one fails open.
+
 **Never hand-patch VERSION/CLAUDE.md/`Cargo.toml`/… to "re-add a bump the rebase
-dropped"** — and since #7743 never run `./scripts/version.sh bump …` here either,
-even if the gate's Fix: line suggests it. Bumps are `version-bump-on-merge.yml`'s
-job (once, after merge) and no PR may carry its own, so this gate should never
-fire on a rebase anymore. If it does, stop, do not push, and report it on the PR
-rather than hand-bumping — a hand-rolled bump is what produced `bef3e07a` (#7341:
-8 core files patched, `.loom/install-metadata.json` missed, CI red).
+dropped"**, and never run `./scripts/version.sh bump …` here even if the gate's
+Fix: line suggests it (#7743): bumps are `version-bump-on-merge.yml`'s job, once,
+after merge, so the gate should never fire on a rebase. If it does, stop, do not
+push, report it on the PR — a hand-rolled bump produced `bef3e07a` (#7341: 8 core
+files patched, `.loom/install-metadata.json` missed, CI red).
 
 **Standing down** (a concurrent fix already landed):
 
@@ -1043,6 +1048,8 @@ write that actually matters, not just at claim time.
       on a fresh claim; reclaimed only on a stale one)
 - [ ] I re-compared the PR's `headRefOid` against `CLAIM_HEAD_SHA` immediately
       before pushing, and on a mismatch re-verified the blocker (or stood down)
+- [ ] Every force-push I made pinned the lease
+      (`--force-with-lease=<branch>:<sha I built on>`), never the bare flag (#9487)
 - [ ] I re-read the PR's labels immediately before the completion write (Verdict-Time
       CAS Recheck above), and aborted/stood down on a lost claim or a raced verdict
       label instead of writing over it
@@ -1436,42 +1443,33 @@ All CI checks passing. Ready for re-review!"
 This is a critical issue that blocks merging. Fix it immediately:
 
 ```bash
-# Fetch latest main
-git fetch origin main
+# Pin the lease BEFORE the rebase rewrites the head (#9487, "Pin the lease").
+PUSH_LEASE_SHA=$(gh pr view 42 --json headRefOid --jq '.headRefOid')
+BRANCH=$(git branch --show-current)
 
-# Try rebasing onto main
+git fetch origin main
 git rebase origin/main
 
-# If conflicts occur:
-# 1. Git will stop and show conflicting files
-# 2. Open each file and resolve conflicts (look for <<<<<<< markers)
-# 3. After fixing each file:
-git add <file>
-
-# Continue rebase after all conflicts resolved
+# On a conflict git stops and names the files: resolve each (<<<<<<< markers),
+# then `git add <file>` and continue.
 git rebase --continue
 
-# Version-bearing-file sync gate (#7168, largely moot after #7743): no PR may
-# carry an edit to a version-bearing file's value anymore (bumps are
-# version-bump-on-merge.yml's job, once, after merge), so a rebase now lands
-# exactly origin/main's values with nothing of yours to go stale. Kept as
-# cheap defense-in-depth -- this path pushes directly, never through
-# create-pr.sh. If it fires, that is an anomaly: do NOT hand-edit a
-# version-bearing file or run `version.sh bump patch` -- stop, do not push,
-# report it on the PR.
+# Version-bearing-file sync gate (#7168). If it fires that is an anomaly:
+# never hand-edit a version-bearing file or run `version.sh bump` -- stop,
+# do not push, report it on the PR.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
   exit 1
 fi
 
-# Force push (PR branch is safe to force push)
-git push --force-with-lease
+# Force push with the lease PINNED (never bare -- #9487)
+git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"
 
 # Verify CI passes after rebase
 gh pr checks 42
 ```
 
-**Important**: Always use `--force-with-lease` instead of `--force` to avoid overwriting others' work.
+**Important**: never `--force`, and never a *bare* `--force-with-lease` — pin it.
 
 #### Which labels to touch after a conflict-only fix
 
