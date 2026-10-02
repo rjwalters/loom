@@ -588,7 +588,7 @@ rm -f "$STUB_DIR/issue-532.json" "$STUB_DIR/issue-8257.json" "$STUB_DIR/rjwalter
 
 # T15l (#9925 THE REGRESSION): an ANNOTATED `### Dependencies` heading - the
 # dating suffix a Curator re-check pass naturally writes - is still the
-# Dependencies section. 2AMLogic/product#135 carried
+# Dependencies section. The reported issue carried
 # `### Dependencies (added 2026-09-24, Curator re-check)` while the #151 its
 # checklist named was genuinely OPEN, and the heading matcher's exact-match
 # end-anchor made the whole section INVISIBLE: empty DEPS and a false
