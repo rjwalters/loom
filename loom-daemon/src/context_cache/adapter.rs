@@ -745,16 +745,18 @@ mod tests {
             matches!(&out, AdapterOutcome::Results(s) if !s.is_empty()),
             "expected parsed snippets, got {out:?}"
         );
-        let after_first = mock.calls_total();
-        // Second query: checkpoint memoized — no re-index.
+        let fm_after_first = mock.find_missing_calls();
+        let calls_after_first = mock.calls_total();
+        // Second query: checkpoint memoized — no re-index (the find-missing
+        // count must not move; only a retrieval call is added).
         let out2 = adapter.query(&spec, &b);
         assert!(matches!(out2, AdapterOutcome::Results(_)));
         assert_eq!(
             mock.find_missing_calls(),
-            1,
+            fm_after_first,
             "checkpoint memoized: the second query must not re-index"
         );
-        assert_eq!(mock.calls_total(), after_first + 1);
+        assert_eq!(mock.calls_total(), calls_after_first + 1);
     }
 
     #[test]
