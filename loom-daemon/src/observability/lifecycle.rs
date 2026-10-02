@@ -93,20 +93,25 @@ impl Span {
             }
         }
     }
-    pub fn finish_attempt(&self, result: &str, status: SpanStatus) {
-        self.finish(result, status);
+    /// Close this `loom.role_attempt` span and its parent `loom.phase`.
+    ///
+    /// `worked` is the [`ATTEMPT_WORKED`] conditioning signal (Issue #9420):
+    /// `Some(false)` for an attempt whose interval provably does not measure
+    /// the stage's work, `Some(true)` when it does, `None` when the caller
+    /// cannot tell — never guessed.
+    pub fn finish_attempt(&self, result: &str, status: SpanStatus, worked: Option<bool>) {
+        let mut close = attributes(&[("loom.result", result)]);
+        insert_worked(&mut close, worked);
+        self.finish_attributes(status, close.clone());
         if let Ok(active) = self.journal.active() {
             for phase in active {
                 if phase.record.name == SpanName::Phase
                     && self.active.record.parent_span_id.as_ref()
                         == Some(&phase.record.context.span_id)
                 {
-                    let _ = self.journal.finish(
-                        &phase,
-                        Utc::now(),
-                        status,
-                        attributes(&[("loom.result", result)]),
-                    );
+                    let _ = self
+                        .journal
+                        .finish(&phase, Utc::now(), status, close.clone());
                 }
             }
         }
@@ -150,6 +155,46 @@ pub fn attributes(values: &[(&str, &str)]) -> TraceAttributes {
         .iter()
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
         .collect()
+}
+
+/// `loom.attempt.worked` (Issue #9420): whether a `loom.role_attempt` span's
+/// **interval measures an attempt that ran the stage's work**.
+///
+/// Not "did the role do anything" — the question a duration aggregate needs
+/// answered is narrower and purely about the span's own measurement:
+///
+/// - `"false"` — the interval provably measures no work. Two populations:
+///   a role-runner tick that never launched a child session
+///   ([`crate::telemetry::RoleTickResult::spawned`] is false — 80.4% of this
+///   host's 130,657 role ticks over 2026-09-18…10-02, 92,869 of them
+///   `skipped_pool_exhausted`, each closing in well under a second), and a
+///   **synthetic** completion span ([`SYNTHETIC_TIMING_SOURCES`]) whose start
+///   was never observed, so it is emitted with `started_at == ended_at` and
+///   its duration is zero by construction.
+/// - `"true"` — a session ran and the span's start is an owned boundary.
+/// - **absent** — undetermined (`exit_unobserved` closes, recovered orphans,
+///   transcript-window carriers). The "unknown != zero" contract every other
+///   measured span attribute follows: never synthesized from a default.
+///
+/// A dwell/percentile aggregate over `loom.role_attempt` **must** filter
+/// `loom.attempt.worked = true`; the unconditioned median is dominated by the
+/// `false` population and collapses to milliseconds. See
+/// `defaults/docs/eta.md` § "Role-attempt stages: read the conditioned
+/// percentile".
+pub const ATTEMPT_WORKED: &str = "loom.attempt.worked";
+
+/// `loom.timing_source` values of a **synthetic** attempt span: one Loom
+/// emits at the instant it observed a completion it did not watch start, so
+/// `started_at == ended_at` and the span carries no duration evidence at all.
+pub const SYNTHETIC_TIMING_SOURCES: [&str; 2] =
+    ["checkpoint_write_observed", "checkpoint_poll_observed"];
+
+/// Record [`ATTEMPT_WORKED`] on `attrs` when it is known; a `None` leaves the
+/// key **absent** rather than writing a default.
+pub fn insert_worked(attrs: &mut TraceAttributes, worked: Option<bool>) {
+    if let Some(worked) = worked {
+        attrs.insert(ATTEMPT_WORKED.to_owned(), worked.to_string());
+    }
 }
 
 /// Instantaneous host memory-pressure state as bounded span attributes — the
@@ -199,10 +244,17 @@ pub fn host_attributes() -> TraceAttributes {
 /// an operator reports about: the measured load against the timeout ceiling,
 /// which pool gated and how large it was, and which capabilities the runtime
 /// lacked — all finite, machine-derived values.
+///
+/// Since #9420 the same close also carries [`ATTEMPT_WORKED`], read off the
+/// outcome's [`crate::telemetry::RoleTickResult::spawned`] — the existing,
+/// documented predicate for "this tick launched a child session". The dwell
+/// conditioning deliberately reuses it instead of inventing a second rule.
 #[must_use]
 pub fn admission_attributes(outcome: &crate::role_runner::RoleTickOutcome) -> TraceAttributes {
     use crate::role_runner::RoleTickOutcome;
     let mut attrs = TraceAttributes::new();
+    let (result, _) = crate::role_tick_telemetry::classify(outcome);
+    insert_worked(&mut attrs, Some(result.spawned()));
     match outcome {
         RoleTickOutcome::Success | RoleTickOutcome::QueueEmpty => {}
         RoleTickOutcome::Failure(_) => {
@@ -457,6 +509,11 @@ fn checkpoint_observation(
         ("loom.timing_source", source),
         ("loom.result", result),
     ]);
+    // #9420: a synthetic observation has no observed start, so it is emitted
+    // with `started_at == ended_at` — a zero duration that measures nothing.
+    // The owned-start branch below overwrites this with `true`: there the
+    // checkpoint completes an attempt whose begin Loom itself recorded.
+    insert_worked(&mut metadata, Some(!SYNTHETIC_TIMING_SOURCES.contains(&source)));
     if role == "judge" {
         metadata.insert(
             "loom.judge_verdict".into(),
@@ -494,6 +551,7 @@ fn checkpoint_observation(
         {
             metadata
                 .insert("loom.timing_source".into(), "owned_start_checkpoint_completion".into());
+            insert_worked(&mut metadata, Some(true));
             let _ = journal.finish(attempt_span, at, status, metadata.clone());
             if let Some(phase_span) = active.iter().find(|p| {
                 p.record.name == SpanName::Phase

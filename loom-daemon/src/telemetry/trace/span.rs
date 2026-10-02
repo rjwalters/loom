@@ -140,6 +140,7 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.role"
                     | "loom.phase"
                     | "loom.attempt"
+                    | "loom.attempt.worked"
                     | "loom.runtime"
                     | "loom.provider"
                     | "loom.model"

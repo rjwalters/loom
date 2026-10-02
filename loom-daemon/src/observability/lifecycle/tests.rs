@@ -291,3 +291,179 @@ fn host_and_admission_attributes_survive_the_span_allowlist() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #9420: loom.attempt.worked — the dwell-conditioning flag
+// ---------------------------------------------------------------------------
+
+/// Every `RoleTickOutcome` shape, and whether its attempt's interval measures
+/// the stage's work. The `false` rows are the population that drags the
+/// unconditioned `loom.role_attempt` median to milliseconds: 80.4% of this
+/// host's 130,657 ticks over the 2026-09-18…10-02 `role_tick.outcome`
+/// journals, 92,869 of them `PoolExhausted`.
+#[test]
+fn an_attempt_that_never_spawned_a_session_closes_as_not_worked() {
+    use crate::role_runner::{CredentialPool, PoolHold, RoleTickOutcome};
+    let exhausted = RoleTickOutcome::PoolExhausted {
+        total: 20,
+        next_clear_at: Utc::now() + chrono::Duration::minutes(15),
+        pool: CredentialPool::ClaudeTokens,
+        hold: PoolHold::SelfHealing,
+    };
+    let cases: Vec<(RoleTickOutcome, &str)> = vec![
+        (RoleTickOutcome::Success, "true"),
+        (RoleTickOutcome::Failure("boom".into()), "true"),
+        (
+            RoleTickOutcome::LoadSkipped {
+                load_per_core: 4.2,
+                detail: "deferred".into(),
+            },
+            "true",
+        ),
+        (exhausted, "false"),
+        (RoleTickOutcome::NoTokenPool, "false"),
+        (RoleTickOutcome::QueueEmpty, "false"),
+    ];
+    for (outcome, expected) in cases {
+        let attrs = admission_attributes(&outcome);
+        assert_eq!(
+            attrs.get(ATTEMPT_WORKED),
+            Some(&expected.to_string()),
+            "{outcome:?} must close with {ATTEMPT_WORKED}={expected}"
+        );
+    }
+}
+
+/// A synthetic completion span is emitted with `started_at == ended_at`, so
+/// its duration measures nothing at all — the shape behind the 0 ms builder
+/// row. It must close `worked=false`; an attempt whose begin Loom itself
+/// recorded closes `worked=true` on the very same code path.
+#[test]
+fn only_an_observed_start_makes_a_checkpoint_completion_count_as_worked() {
+    let dir = tempfile::tempdir().unwrap();
+    for source in SYNTHETIC_TIMING_SOURCES {
+        let journal = Journal::for_context(&dir.path().join(format!("{source}.json")));
+        let root = TraceContext::root(true);
+        checkpoint_observation(
+            &journal,
+            &root,
+            None,
+            9420,
+            "builder-done",
+            Some(1),
+            None,
+            None,
+            source,
+        );
+        let mut spans = Vec::new();
+        journal
+            .drain(|s| {
+                spans.push(s);
+                Ok(())
+            })
+            .unwrap();
+        let attempt = spans
+            .iter()
+            .find(|s| s.name == SpanName::RoleAttempt)
+            .unwrap();
+        assert_eq!(attempt.started_at, attempt.ended_at, "synthetic spans carry no duration");
+        assert_eq!(attempt.attributes[ATTEMPT_WORKED], "false", "{source}");
+        // The parent phase span carries the same verdict, so a phase-level
+        // dwell query conditions identically.
+        let phase = spans.iter().find(|s| s.name == SpanName::Phase).unwrap();
+        assert_eq!(phase.attributes[ATTEMPT_WORKED], "false", "{source}");
+    }
+
+    let journal = Journal::for_context(&dir.path().join("owned.json"));
+    let root = TraceContext::root(true);
+    let attrs = attributes(&[("loom.role", "builder")]);
+    let start = Utc::now() - chrono::Duration::seconds(1450);
+    let phase = journal
+        .start(root.child(), Some(&root), SpanName::Phase, start, attrs.clone())
+        .unwrap();
+    journal
+        .start(
+            phase.record.context.child(),
+            Some(&phase.record.context),
+            SpanName::RoleAttempt,
+            start,
+            attrs,
+        )
+        .unwrap();
+    checkpoint_observation(
+        &journal,
+        &root,
+        None,
+        9420,
+        "builder-done",
+        Some(1),
+        None,
+        None,
+        "checkpoint_write_observed",
+    );
+    let mut spans = Vec::new();
+    journal
+        .drain(|s| {
+            spans.push(s);
+            Ok(())
+        })
+        .unwrap();
+    let attempt = spans
+        .iter()
+        .find(|s| s.name == SpanName::RoleAttempt)
+        .unwrap();
+    assert_eq!(attempt.attributes["loom.timing_source"], "owned_start_checkpoint_completion");
+    assert_eq!(attempt.attributes[ATTEMPT_WORKED], "true");
+    assert!(attempt.ended_at - attempt.started_at >= chrono::Duration::seconds(1450));
+}
+
+/// `finish_attempt` writes the flag onto both the attempt and its phase, and
+/// `None` leaves the key **absent** — the "unknown != zero" half of the
+/// contract. A caller that cannot tell must not publish a guess.
+#[test]
+fn an_undetermined_attempt_leaves_the_worked_key_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    for (worked, expected) in [
+        (None, None),
+        (Some(false), Some("false")),
+        (Some(true), Some("true")),
+    ] {
+        let journal = Journal::for_context(&dir.path().join(format!("{worked:?}.json")));
+        let root = TraceContext::root(true);
+        let attrs = attributes(&[("loom.role", "judge")]);
+        let phase = journal
+            .start(root.child(), Some(&root), SpanName::Phase, Utc::now(), attrs.clone())
+            .unwrap();
+        let attempt = journal
+            .start(
+                phase.record.context.child(),
+                Some(&phase.record.context),
+                SpanName::RoleAttempt,
+                Utc::now(),
+                attrs,
+            )
+            .unwrap();
+        Span {
+            journal: journal.clone(),
+            active: attempt,
+        }
+        .finish_attempt("rejected", SpanStatus::Error, worked);
+        let mut spans = Vec::new();
+        journal
+            .drain(|s| {
+                spans.push(s);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(spans.len(), 2, "attempt and phase both close");
+        for span in &spans {
+            assert_eq!(
+                span.attributes.get(ATTEMPT_WORKED).map(String::as_str),
+                expected,
+                "{:?} on {:?}",
+                worked,
+                span.name
+            );
+        }
+    }
+}

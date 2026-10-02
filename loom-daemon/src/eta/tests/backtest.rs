@@ -156,6 +156,7 @@ fn merge_wait_sample(duration_sec: i64, observed_at: chrono::DateTime<chrono::Ut
         observed_at,
         source: SampleSource::SweepOutcome,
         host: "host-a".to_string(),
+        worked: None,
     }
 }
 

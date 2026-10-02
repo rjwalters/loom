@@ -127,6 +127,9 @@ impl JournalEntry {
             observed_at: self.observed_at,
             source: SampleSource::StageJournal,
             host: host.to_string(),
+            // #9420: a label-transition row records a stage boundary, not an
+            // attempt, so there is no worked/unworked signal to carry.
+            worked: None,
         })
     }
 
@@ -149,6 +152,7 @@ impl JournalEntry {
             observed_at: self.observed_at,
             source: SampleSource::StageJournal,
             host: host.to_string(),
+            worked: None,
         })
     }
 
