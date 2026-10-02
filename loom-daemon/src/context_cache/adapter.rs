@@ -220,8 +220,6 @@ impl RetrievalAdapter for FakeAdapter {
 /// failure mode but never quote file contents or token material.
 pub struct AugmentAdapter {
     token: Option<String>,
-    base_url: String,
-    timeout: Duration,
     /// Why the adapter is unconfigured, when it is — surfaced verbatim as
     /// the Unavailable reason instead of a generic guess.
     config_reason: Option<String>,
@@ -317,8 +315,6 @@ impl AugmentAdapter {
         };
         Self {
             token,
-            base_url,
-            timeout: http.timeout,
             config_reason,
             pinned_tree: None,
             blob_set: OnceLock::new(),
@@ -710,8 +706,6 @@ mod tests {
         ]));
         let adapter = AugmentAdapter {
             token: Some("t".into()),
-            base_url: "https://x".into(),
-            timeout: Duration::from_secs(1),
             config_reason: None,
             pinned_tree: None,
             blob_set: OnceLock::new(),
