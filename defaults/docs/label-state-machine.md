@@ -116,6 +116,13 @@ says so, and no role applies it).
   blocker of a level-2 issue carries the daemon-written
   `loom:high-priority-inherited` and is treated exactly like level 2; no role
   applies or removes it.
+- **No eviction, ties to the earliest star (#9974).** A star orders only *new*
+  work: it never cancels, unclaims or pre-empts a running sweep, a
+  `loom:building` claim or a review in progress (`WorkDispatcher` has no cancel
+  or unclaim operation; the overflow slot only adds one dispatch). Among
+  several stars the earliest `labeled` event wins, not `createdAt` or number; a
+  PR inherits an earlier-starred linked issue's time. `loom-daemon forge starred
+  --kind issue|pr` lists them in that order.
 - **Red-main fixes** are a body marker, not a label: an issue that fixes a red
   `main` carries `<!-- loom:main-red-fix -->` (Doctor adds it when filing a
   pre-existing failure confirmed on `origin/main`). Curator takes these next,

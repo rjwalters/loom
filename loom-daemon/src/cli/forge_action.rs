@@ -136,6 +136,27 @@ pub(crate) enum ForgeAction {
         max_interval: Option<u64>,
     },
 
+    /// `forge starred --kind issue|pr` — open `loom:operator-priority` items,
+    /// best first: earliest star time (the `labeled` event, else `createdAt`),
+    /// then number, via the same comparator `ready-queue` ranks with (#9974).
+    /// A PR inherits an earlier-starred linked issue's star time. Prints one
+    /// number per line (`--json` for details); exits `5` when it could not
+    /// answer (never an empty queue), `3` on Gitea.
+    #[command(name = "starred")]
+    Starred {
+        /// `issue` or `pr`.
+        #[arg(long)]
+        kind: String,
+
+        /// Also require this label (e.g. `loom:issue`, `loom:review-requested`).
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Emit JSON objects instead of bare numbers.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// `forge check-claim <issue> [--force-claim]` — the aggregated
     /// pre-flight claim-CAS probe (#9453 Phase 1): "may I claim issue N
     /// **right now**?" Four legs, cheapest-first, short-circuiting on the
@@ -725,6 +746,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             max_open,
             max_points,
         },
+        ForgeAction::Starred { kind, label, json } => ForgeCmd::Starred { kind, label, json },
         ForgeAction::CheckClaim { issue, force_claim } => {
             ForgeCmd::CheckClaim { issue, force_claim }
         }

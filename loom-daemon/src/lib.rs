@@ -202,6 +202,7 @@ pub mod forge_parser;
 pub mod forge_pr_congestion;
 pub mod forge_pull_listing;
 pub mod forge_read_pool;
+pub mod forge_starred;
 pub mod forge_tree_unchanged;
 pub mod forge_wait_checks;
 pub mod gh_invocation;
