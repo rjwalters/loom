@@ -174,8 +174,44 @@ pub fn dependencies_section(body: &str) -> String {
     out.join("\n")
 }
 
-/// `/^#{2,3}[[:space:]]+Dependencies[[:space:]]*$/` — exactly, including the
-/// end anchor: `## Dependencies (deferred)` is deliberately not this section.
+/// Heading annotations that deliberately mark a `## Dependencies` section
+/// **inactive**, and are therefore the *only* suffixes that suppress it.
+///
+/// Matched case-insensitively against the whole trimmed annotation: the suffix
+/// is an authored marker, so `(Deferred)` means what `(deferred)` means, and
+/// failing to recognise an obvious casing variant would just re-introduce the
+/// same surprise from the other side.
+///
+/// Keep this list short. Everything *not* here is an active section (see
+/// [`is_dependencies_heading`]) — which is the point, so adding vocabulary here
+/// is adding a way to silently clear a live blocker.
+const INACTIVE_HEADING_SUFFIXES: &[&str] = &["(deferred)"];
+
+/// `/^#{2,3}[[:space:]]+Dependencies/`, with an optional whitespace-separated
+/// annotation after the word — `### Dependencies (added 2026-09-24, Curator
+/// re-check)` is this section.
+///
+/// **An unrecognised annotation means "active", not "absent" (#9925).** This
+/// used to require an exact, trimmed match against `"Dependencies"`, anchored
+/// at end-of-line like the pre-port shell. That inverted the fail-direction
+/// every other matcher in this module takes on purpose (`[-*]` bullets,
+/// [`DEPENDENCY_PHRASES`], the `PR `/`Issue ` token, the `owner/repo#N`
+/// prefix): a heading carrying nothing worse than a dating annotation made
+/// [`dependencies_section`] never enter the section at all, so
+/// [`parse_entries`] returned nothing and [`verdict`] defaulted to `"clear"`
+/// for an issue whose checklist named a still-OPEN prerequisite. Live repro:
+/// `2AMLogic/product#135` reported `{"verdict":"clear","deps":""}` while the
+/// `#151` its checklist named was OPEN.
+///
+/// The one case the old end-anchor existed for is kept by **narrowing the
+/// exclusion instead of the inclusion**: an annotation in
+/// [`INACTIVE_HEADING_SUFFIXES`] still suppresses the section, so
+/// `## Dependencies (deferred)` remains a Curator's way to mark one
+/// deliberately inactive.
+///
+/// The annotation must be whitespace-separated, so `## Dependencies-ish` and
+/// `## DependenciesFoo` still name some other section rather than an annotated
+/// version of this one.
 fn is_dependencies_heading(line: &str) -> bool {
     let hashes = line.chars().take_while(|c| *c == '#').count();
     if !(2..=3).contains(&hashes) {
@@ -185,7 +221,19 @@ fn is_dependencies_heading(line: &str) -> bool {
     if !rest.starts_with([' ', '\t']) {
         return false;
     }
-    rest.trim() == "Dependencies"
+    let Some(suffix) = rest.trim().strip_prefix("Dependencies") else {
+        return false;
+    };
+    if suffix.is_empty() {
+        return true;
+    }
+    if !suffix.starts_with([' ', '\t']) {
+        return false;
+    }
+    let suffix = suffix.trim();
+    !INACTIVE_HEADING_SUFFIXES
+        .iter()
+        .any(|inactive| suffix.eq_ignore_ascii_case(inactive))
 }
 
 /// `/^#{1,3}[[:space:]]/` — a same-or-shallower heading ends the section.
