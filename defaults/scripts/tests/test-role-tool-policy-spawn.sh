@@ -27,6 +27,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# spawn-claude.sh / spawn-codex.sh compute their deny-specs by calling a REAL
+# `loom-daemon role-tool-policy` (the #8256 call-out, not a JSON-on-stdin
+# fixture this suite can stub). Left to ambient resolution, a CI runner with
+# no daemon on PATH takes the documented no-op degradation path silently, and
+# every injection assertion below would pass by testing nothing. Pin a real
+# binary and FAIL (never skip) when one cannot be found, same as every other
+# suite whose subject is now a thin stub over a `loom-daemon` subcommand.
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "role-tool-policy"
+
 # Pin the #5979 concurrent-sweep divisor, as test-spawn-claude.sh does: without
 # it spawn-claude.sh's CPU-budget block shells out to `loom-daemon status --json`
 # against whatever daemon happens to be running on the host, making this suite
