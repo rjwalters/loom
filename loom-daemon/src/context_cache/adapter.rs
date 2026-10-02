@@ -685,6 +685,16 @@ mod tests {
                     .expect("script exhausted")
             }
         }
+        impl DirectTransport for Arc<MockTransport> {
+            fn post(
+                &self,
+                endpoint: &str,
+                payload: serde_json::Value,
+                request_id: &str,
+            ) -> Result<serde_json::Value, DirectError> {
+                (**self).post(endpoint, payload, request_id)
+            }
+        }
 
         let blob_set = Arc::new(PinnedBlobSet {
             blobs: vec![PinnedBlob {
