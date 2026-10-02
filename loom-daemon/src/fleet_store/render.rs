@@ -150,6 +150,32 @@ pub fn check_exit_code(drifts: &[Drift]) -> i32 {
     i32::from(drifts.iter().any(|d| *d != Drift::InSync))
 }
 
+/// The top-level keys the file on disk carries that `target`'s rendered
+/// value does not — a **lossy reduction** if written (2am#1653's ask: the
+/// writer that clobbered two Macs' machine-tier config set out to update
+/// one block and wrote the file fresh, losing `runtimes`, `autonomous`,
+/// `safehouse` and `forge` for ~10 h). The store is the tier's record of
+/// truth, so a legitimate reduction happens — but it must never happen by
+/// default: the caller refuses until the operator names it (`--allow-reduce`,
+/// or `fleet-config adopt --from-disk` to push the blocks INTO the store
+/// first, which is what adopt's `plan()` already does).
+///
+/// Returns the lost key names in file order; empty when the file is absent,
+/// unparseable (a separate error class) or the target loses nothing.
+#[must_use]
+pub fn lost_top_level_keys(target: &Target) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(&target.path) else {
+        return Vec::new();
+    };
+    let Ok(current) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let (Value::Object(cur), Value::Object(want)) = (&current, &target.value) else {
+        return Vec::new();
+    };
+    cur.keys().filter(|k| !want.contains_key(*k)).cloned().collect()
+}
+
 /// A path-by-path diff from `current` (on disk) to `wanted` (rendered):
 /// `- path: old`, `+ path: new`, `~ path: old -> new`.
 pub fn diff_values(path: &str, current: &Value, wanted: &Value, out: &mut Vec<String>) {
