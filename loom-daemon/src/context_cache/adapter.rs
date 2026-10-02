@@ -713,6 +713,8 @@ mod tests {
             Ok(serde_json::json!({"new_checkpoint_id": "cp-1"})),
             Ok(serde_json::json!({"unknown_memory_names": [], "nonindexed_blob_names": []})),
             Ok(serde_json::json!({"formatted_retrieval": "src/a.rs:1-2:\nfn a(){}\n"})),
+            // Second query: checkpoint reused — only a retrieval call.
+            Ok(serde_json::json!({"formatted_retrieval": "src/a.rs:1-2:\nfn a(){}\n"})),
         ]));
         let adapter = AugmentAdapter {
             token: Some("t".into()),
