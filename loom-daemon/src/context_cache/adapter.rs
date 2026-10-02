@@ -747,14 +747,14 @@ mod tests {
 
     #[test]
     fn unknown_provenance_is_preserved_never_guessed() {
-        let payload = br#"{"chunks":[{"content":"x"}]}"#;
-        match parse_augment_payload(payload, u64::MAX) {
-            AdapterOutcome::Results(snippets) => {
-                assert_eq!(snippets[0].path, "<unknown-provenance>");
-                assert!(snippets[0].ranges.is_empty());
-            }
-            other => panic!("expected results, got {other:?}"),
-        }
+        // The parser retains unmatched retrieval text as an explicit
+        // <unknown-provenance> snippet (the session keeps unknown
+        // provenance honest; provenance validation bypasses `<` paths).
+        let out = parse_formatted_retrieval("just some text with no locations\n");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "<unknown-provenance>");
+        assert!(out[0].ranges.is_empty());
+        assert!(out[0].text.contains("just some text"));
     }
 
     #[test]
