@@ -29,7 +29,8 @@
 #      uncached `gh api` read — mirrors merge-pr.sh item 1):
 #        - Safe   (child issue NOT loom:building): rebase directly —
 #            git rebase origin/<parent-branch> <child-branch>
-#            git push --force-with-lease
+#            git push --force-with-lease=<child-branch>:<live remote head,
+#                                         pinned before the rebase> origin …
 #          NO PR base retarget: the child's PR base stays <parent-branch>.
 #        - Unsafe (child issue still loom:building): a live Builder likely has
 #          the child branch checked out — skip the rebase (never force-push over
@@ -37,7 +38,13 @@
 #
 # Safety:
 #   - Uses --force-with-lease (NEVER a bare --force) so a concurrent push to the
-#     child branch aborts rather than clobbers.
+#     child branch aborts rather than clobbers, PINNED (#9487) to the child's
+#     live `git ls-remote` head read before the rebase: the bare flag compares
+#     against refs/remotes/origin/<child>, a ref shared by every linked
+#     worktree of this clone that a sibling agent's fetch can advance out from
+#     under this run, which defeats the lease entirely.
+#   - Skips a child whose local branch has not incorporated origin's head —
+#     the pin would be accurate and the push would still delete commits.
 #   - --dry-run reports the per-child outcome (no-op / would-rebase / would-defer)
 #     without executing any git/gh mutation.
 #   - A rebase conflict on one child does NOT abort the whole run — it is a
@@ -71,7 +78,7 @@ info() { echo -e "${BLUE}ℹ $1${NC}" >&2; }
 warn() { echo -e "${YELLOW}⚠ $1${NC}" >&2; }
 
 show_help() {
-    sed -n '2,56p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,63p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 DRY_RUN=false
@@ -168,6 +175,27 @@ _process_one_stacked_child() {
         return 0
     fi
 
+    # #9487: pin the eventual --force-with-lease to the child's LIVE remote head,
+    # read here (before the rebase) rather than left implicit at push time. The
+    # bare flag compares against refs/remotes/origin/<child> — a ref SHARED by
+    # every linked worktree of this clone, which a sibling agent's fetch can
+    # fast-forward to a commit this run never saw. The bare lease is then
+    # satisfied by construction and the push silently deletes that commit (the
+    # live PR #9483 incident). `git ls-remote` asks the remote itself.
+    local child_lease_oid
+    child_lease_oid="$(push_lease_live_tip origin "$child_branch")" || child_lease_oid=""
+    if [[ -z "$child_lease_oid" ]]; then
+        warn "Could not read origin's live head for '$child_branch' (#9487) — skipping child PR #$child_pr rather than pushing with an unpinned lease."
+        RSC_FAILURE=2; return 0
+    fi
+    # The pin is accurate but not sufficient on its own: a commit published
+    # BEFORE the pin was taken and never incorporated into this clone's local
+    # branch would still be deleted by the rebase+push below.
+    if ! push_lease_require_incorporated "$child_lease_oid" "refs/heads/$child_branch"; then
+        warn "Local '$child_branch' has not incorporated origin's head $child_lease_oid (#9487) — skipping child PR #$child_pr; rebasing and pushing from here would delete commits this clone does not have. Fetch, reconcile by hand, then re-run."
+        RSC_FAILURE=2; return 0
+    fi
+
     # Stale relative to the parent's current tip. Derive the child ISSUE number
     # from its head branch (feature/issue-<N>) for the safe/unsafe split. A
     # non-feature/issue-N child has no loom:building claim to race → treated safe.
@@ -221,7 +249,7 @@ Parent branch \`$parent_branch\` advanced (amended/pushed) after this child bran
     info "Child PR #$child_pr ($child_branch) is stale relative to '$parent_branch' — rebasing onto origin/$parent_branch"
     if ! run git rebase -- "origin/$parent_branch" "$child_branch"; then
         err "Rebase of '$child_branch' onto 'origin/$parent_branch' hit a conflict."
-        printf '    Resolve it, then finish manually:\n    git rebase origin/%s %s   # then, after resolving each conflict:\n    git rebase --continue\n    git push --force-with-lease\n' "$parent_branch" "$child_branch" >&2
+        printf '    Resolve it, then finish manually:\n    git rebase origin/%s %s   # then, after resolving each conflict:\n    git rebase --continue\n    git push --force-with-lease=%s:%s origin %s   # pinned, never bare (#9487)\n' "$parent_branch" "$child_branch" "$child_branch" "$child_lease_oid" "$child_branch" >&2
         # Abort the conflicted rebase so the remaining children can still process
         # (best-effort; the whole run is not aborted by one child's conflict).
         git rebase --abort >/dev/null 2>&1 || true
@@ -246,7 +274,8 @@ Parent branch \`$parent_branch\` advanced (amended/pushed) after this child bran
         fi
     fi
 
-    if ! run git push --force-with-lease; then
+    # Pinned, never bare (#9487) — see the capture above.
+    if ! run git push "--force-with-lease=$child_branch:$child_lease_oid" origin "$child_branch"; then
         # A reported rejection is not always a real one (#6695): Git LFS's
         # pre-push hook can race the lease re-check on a branch with pending
         # LFS objects, so the ref update lands while the printed rejection

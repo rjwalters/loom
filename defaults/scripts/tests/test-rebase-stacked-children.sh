@@ -182,8 +182,12 @@ chmod +x "$STUB_DIR/gh"
 
 # --- Stub git on PATH ---
 #   git fetch ...                          -> record + exit 0
-#   git merge-base --is-ancestor A <child> -> exit code from $STUB_DIR/ancestor-<safe child>
-#                                             (file present -> its value; absent -> 1 = stale)
+#   git merge-base --is-ancestor A B       -> exit code from $STUB_DIR/ancestor-<safe B>
+#                                             (file present -> its value; absent -> 1)
+#                                             Two callers key off this, both on their LAST arg:
+#                                             the staleness probe (B = origin/<child>) and
+#                                             #9487's push_lease_require_incorporated
+#                                             (B = refs/heads/<child>).
 #   git rebase --abort                     -> record + exit 0
 #   git rebase A B                         -> record + exit $LOOM_TEST_REBASE_EXIT (default 0)
 #   git push ...                           -> record + exit $LOOM_TEST_PUSH_EXIT (default 0)
@@ -253,6 +257,14 @@ set_rev_parse_sha()  { printf '%s' "$1" > "$STUB_DIR/rev-parse-sha"; }
 clear_rev_parse_sha() { rm -f "$STUB_DIR/rev-parse-sha"; }
 set_ls_remote_sha()   { printf '%s' "$1" > "$STUB_DIR/ls-remote-sha"; }
 clear_ls_remote_sha() { rm -f "$STUB_DIR/ls-remote-sha"; }
+# #9487: push_lease_require_incorporated asks `merge-base --is-ancestor <pin>
+# refs/heads/<child>`, so it keys off the refs/heads/ form of the same fixture
+# the staleness probe uses (which asks about origin/<child>).
+mark_incorporated()     { echo 0 > "$STUB_DIR/ancestor-refs_heads_${1//\//_}"; }
+mark_not_incorporated() { echo 1 > "$STUB_DIR/ancestor-refs_heads_${1//\//_}"; }
+
+# The live-remote head every scenario pins its lease to unless it overrides it.
+DEFAULT_ORIGIN_HEAD="sha-origin-head"
 
 reset_state() {
     : > "$STUB_DIR/gh-calls.log"
@@ -262,7 +274,10 @@ reset_state() {
     unset LOOM_TEST_REBASE_EXIT
     unset LOOM_TEST_PUSH_EXIT
     clear_rev_parse_sha
-    clear_ls_remote_sha
+    # #9487 defaults: origin answers with a head, and this clone has it.
+    set_ls_remote_sha "$DEFAULT_ORIGIN_HEAD"
+    mark_incorporated "feature/issue-201"
+    mark_incorporated "feature/issue-202"
 }
 read_gh()  { cat "$STUB_DIR/gh-calls.log" 2>/dev/null || true; }
 read_git() { cat "$STUB_DIR/git-calls.log" 2>/dev/null || true; }
@@ -293,11 +308,31 @@ clear_uptodate "feature/issue-201"   # stale
 _rebase_stacked_children "feature/issue-100"
 assert_contains "$(read_git)" "git rebase -- origin/feature/issue-100 feature/issue-201" \
   "(c) Safe stale child -> rebased onto origin/feature/issue-100"
-assert_contains "$(read_git)" "git push --force-with-lease" \
-  "(c) Safe stale child -> pushed with --force-with-lease"
+assert_contains "$(read_git)" \
+  "git push --force-with-lease=feature/issue-201:$DEFAULT_ORIGIN_HEAD origin feature/issue-201" \
+  "(c) Safe stale child -> pushed with the lease PINNED to origin's live head (#9487)"
+assert_not_contains "$(read_git)" "git push --force-with-lease origin" \
+  "(c) Safe stale child -> never the bare --force-with-lease (#9487)"
 assert_not_contains "$(read_gh)" "pr edit" "(c) Safe stale child -> PR base NOT retargeted"
 assert_eq "" "$(read_gh)" "(c) Safe stale child -> no deferred comment"
 assert_eq "0" "$RSC_FAILURE" "(c) Safe stale child -> RSC_FAILURE stays 0"
+
+# #9487 ordering: the pin must be captured from the LIVE remote BEFORE the
+# rebase rewrites the branch. A pin taken after (or just before the push) would
+# read whatever a sibling had already published and launder the clobber.
+GIT_LOG_C="$(read_git)"
+LS_LINE="$(printf '%s\n' "$GIT_LOG_C" | grep -n 'ls-remote origin refs/heads/feature/issue-201' | head -1 | cut -d: -f1)"
+REBASE_LINE="$(printf '%s\n' "$GIT_LOG_C" | grep -n 'git rebase -- origin/feature/issue-100' | head -1 | cut -d: -f1)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -n "$LS_LINE" && -n "$REBASE_LINE" && "$LS_LINE" -lt "$REBASE_LINE" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: (c) lease pin is read from the live remote BEFORE the rebase (#9487)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: (c) lease pin is read from the live remote BEFORE the rebase (#9487)"
+    echo "    ls-remote at line '$LS_LINE', rebase at line '$REBASE_LINE' in:"
+    printf '%s\n' "$GIT_LOG_C"
+fi
 
 # (c2) Same as (c), but version-check-gate.sh (real script, #7168) reports a
 #      mismatch via LOOM_VERSION_CHECK_SCRIPT -> rebase runs, but the push is
@@ -430,6 +465,43 @@ assert_not_contains "$OUT_I" "PUSH-LEASE-RACE-DETECTED" \
   "(i) A real rejection is never mislabeled as the race condition"
 unset LOOM_TEST_PUSH_EXIT
 
+# (j) #9487: origin's live head cannot be read -> the child is SKIPPED rather
+#     than pushed with an unpinned (bare) lease. Nothing is rebased or pushed.
+reset_state
+write_prlist "feature/issue-100" '[{"number":501,"headRefName":"feature/issue-201"}]'
+clear_uptodate "feature/issue-201"   # stale
+clear_ls_remote_sha                  # ls-remote answers with no ref
+OUT_J_FILE="$(mktemp)"
+_rebase_stacked_children "feature/issue-100" >"$OUT_J_FILE" 2>&1
+OUT_J="$(cat "$OUT_J_FILE")"
+rm -f "$OUT_J_FILE"
+assert_not_contains "$(read_git)" "git rebase -- origin/feature/issue-100" \
+  "(j) No readable live head -> rebase NOT attempted (#9487)"
+assert_not_contains "$(read_git)" "git push" \
+  "(j) No readable live head -> push NOT attempted with an unpinned lease (#9487)"
+assert_eq "2" "$RSC_FAILURE" "(j) No readable live head -> RSC_FAILURE=2"
+assert_contains "$OUT_J" "#9487" "(j) Refusal cites the pinned-lease requirement"
+
+# (k) #9487: origin's head is NOT an ancestor of this clone's local child
+#     branch -> someone published commits this clone never incorporated. The
+#     pin would be accurate and the push would still delete them, so refuse.
+reset_state
+write_prlist "feature/issue-100" '[{"number":501,"headRefName":"feature/issue-201"}]'
+clear_uptodate "feature/issue-201"   # stale
+mark_not_incorporated "feature/issue-201"
+OUT_K_FILE="$(mktemp)"
+_rebase_stacked_children "feature/issue-100" >"$OUT_K_FILE" 2>&1
+OUT_K="$(cat "$OUT_K_FILE")"
+rm -f "$OUT_K_FILE"
+assert_not_contains "$(read_git)" "git rebase -- origin/feature/issue-100" \
+  "(k) Unincorporated origin head -> rebase NOT attempted (#9487)"
+assert_not_contains "$(read_git)" "git push" \
+  "(k) Unincorporated origin head -> push NOT attempted (#9487)"
+assert_eq "2" "$RSC_FAILURE" "(k) Unincorporated origin head -> RSC_FAILURE=2"
+assert_contains "$OUT_K" "has not incorporated" \
+  "(k) Refusal names the unincorporated remote head"
+mark_incorporated "feature/issue-201"
+
 # --- Source-contains guards (fail if a refactor drops the key behavior) ---
 echo ""
 echo "Testing rebase-stacked-children.sh source guards..."
@@ -444,8 +516,12 @@ assert_contains "$src" "grep -qx 'loom:building'" \
 # headRefName beginning with `-` is parsed by `git rebase` as a switch.
 assert_contains "$src" 'run git rebase -- "origin/$parent_branch" "$child_branch"' \
   "safe path rebases the child onto the parent tip, with the -- separator"
-assert_contains "$src" "run git push --force-with-lease" \
-  "safe path publishes with --force-with-lease (never bare --force)"
+assert_contains "$src" 'run git push "--force-with-lease=$child_branch:$child_lease_oid" origin "$child_branch"' \
+  "safe path publishes with a PINNED --force-with-lease (never bare --force, never the bare lease — #9487)"
+assert_contains "$src" 'push_lease_live_tip origin "$child_branch"' \
+  "script pins the lease to the child's LIVE remote head, not the shared remote-tracking ref (#9487)"
+assert_contains "$src" 'push_lease_require_incorporated "$child_lease_oid" "refs/heads/$child_branch"' \
+  "script refuses when origin holds commits this clone never incorporated (#9487)"
 assert_not_contains "$src" "gh pr edit" \
   "script never retargets the child PR base (stays stacked on the parent)"
 assert_contains "$src" "push_landed_despite_rejection" \
