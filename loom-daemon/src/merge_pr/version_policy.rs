@@ -91,6 +91,14 @@ pub enum Verdict {
     Pass,
     /// A confirmed forbidden version edit. Carries the full refusal text.
     Block(String),
+    /// A ref operand [`crate::refname::check_refname`] refuses (#9106/#9479).
+    /// Returned **before any git process starts**, and — unlike every other
+    /// non-`Pass` outcome here — regardless of `--dry-run`: the guard's
+    /// best-effort contract is about *judging a version edit*, and it has
+    /// nothing to judge on a name it will not hand to git at all. A dry run
+    /// has no would-be block to preview either, because no comparison was
+    /// ever made.
+    InvalidRef(crate::refname::RefnameError),
 }
 
 /// Warnings to print, in order, and the verdict that follows them.
@@ -146,6 +154,16 @@ pub fn checker_fault_warning(
 pub fn block_message(pr_number: &str, output: &str, checker_ref: &str) -> String {
     format!(
         "Merge blocked: PR #{pr_number} hand-edits a version-bearing value (#7827).\n\n{output}\n\nRevert the version-value changes authored by this PR, preserving its other changes,\nthen rerun CI and review. Version bumps are applied automatically by the merge workflow\n(#7743); a no-surface-change marker cannot waive this policy. (Checker from {checker_ref}.)"
+    )
+}
+
+/// The refusal text for [`Verdict::InvalidRef`]. Names the offending operand
+/// (the [`crate::refname::RefnameError`] display does that) and states that
+/// nothing ran, so it is greppable in a merge log and quotable in a forge
+/// comment — the same contract `merge-pr.sh`'s `check_branch_name` refusal has.
+pub fn invalid_ref_message(pr_number: &str, err: &crate::refname::RefnameError) -> String {
+    format!(
+        "Merge blocked: PR #{pr_number} carries a git ref operand the version-policy guard refuses to run git on (#9106/#9479).\n\n{err}\n\nNothing was fetched and no version comparison was made. A branch name must match ^[A-Za-z0-9][A-Za-z0-9._/-]*$ to be merged by Loom."
     )
 }
 
@@ -301,14 +319,33 @@ pub fn evaluate(inputs: &Inputs<'_>) -> Report {
         return Report::pass(Vec::new());
     }
 
+    // #9106/#9479: both names below become bare ref OPERANDS of `git fetch`,
+    // and `$PR_BRANCH` is a PR author's `headRefName`. Git's own ref validator
+    // accepts a leading-dash name, so an unvalidated one is re-parsed as a
+    // switch (`--upload-pack=/tmp/x` on a path origin is code execution).
+    // `merge-pr.sh` has validated it since #9474, but an installed shell
+    // predating that release paired with a newer daemon would not, and this
+    // side must not depend on its caller having been resynced. Fail closed,
+    // before any git process exists.
+    if let Err(e) = crate::refname::check_all(&[inputs.default_branch, inputs.branch]) {
+        return Report {
+            warnings: Vec::new(),
+            verdict: Verdict::InvalidRef(e),
+        };
+    }
+
     // A failed fetch means nothing fresher than what is local can be seen:
     // skip rather than block on stale or missing data.
+    //
+    // `--` ends option parsing before the two ref operands — defence in depth
+    // behind the validator above (#9106 mitigation B).
     if git(
         repo,
         &[
             "fetch",
             "--quiet",
             "origin",
+            "--",
             inputs.default_branch,
             inputs.branch,
         ],
