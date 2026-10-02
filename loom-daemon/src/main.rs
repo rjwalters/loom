@@ -1054,6 +1054,16 @@ enum Commands {
     #[command(flatten)]
     ScriptPorts(cli::script_ports::ScriptPortCommand),
 
+    /// Historical replay of scheduling predictions vs eventual PRs (#9785):
+    /// `overlap-replay validate | outcomes | score`. Nested (not flattened)
+    /// so the verb names cannot collide with existing top-level commands;
+    /// args live in `cli::overlap_replay` because this file is frozen by the
+    /// ratchet.
+    OverlapReplay {
+        #[command(subcommand)]
+        action: cli::overlap_replay::OverlapReplayCommand,
+    },
+
     /// Lease the liveness of a `loom:building` claim (#8193). The args and
     /// their docs live in `cli::lease_ensure` because this file is frozen by
     /// the file-size ratchet.
@@ -2340,6 +2350,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
         }
         Commands::ScriptPorts(cmd) => cmd.run(),
+        Commands::OverlapReplay { action } => action.run(),
         Commands::Lease { action } => action.run(),
         Commands::Inflight { action } => action.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),

@@ -169,6 +169,30 @@ The terminal checkpoint helper journals after its atomic write succeeds. It does
 not infer an earlier start or a missing verdict. A caller that bypasses that
 helper can provide only the phases that the daemon actually observes.
 
+`loom.attempt.worked` (#9420) is the companion a **duration** query needs:
+`"true"` when the span's interval measures an attempt that ran its stage's
+work, `"false"` when it provably does not (a role-runner tick that never
+launched a child session — `RoleTickResult::spawned()` is false — or a
+synthetic zero-duration completion, the two `loom.timing_source` values in
+`SYNTHETIC_TIMING_SOURCES`), and **absent** when undetermined. Absent is not
+`false`: an `exit_unobserved` close and a transcript-window carrier span say
+nothing either way, and guessing would publish a measurement that was never
+taken. Any percentile/dwell aggregate over `loom.role_attempt` must filter
+`loom.attempt.worked = "true"` — unconditioned, the `false` population
+dominates and the median collapses to milliseconds (see
+[`eta.md`](eta.md) § "Role-attempt stages: which percentile to read").
+
+Since #9438 the role runner removes most of that population at the source: a
+role-runner tick opens its `loom.role_attempt` root only at the launch (the
+moment its child command is built, immediately before spawn), started at the
+tick's own instant. A tick that returns before launching — every `skipped_*`
+outcome except `skipped_load` (a session that ran to the ceiling),
+`runtime_rejected`, and a `failure` raised before the launch — journals no
+span, no trace context and no join entry, and its `role_tick.outcome` record
+(still written for every tick) carries no envelope `trace_context`. The filter
+above stays required: synthetic completions, and pre-#9438 data, are still
+`false`.
+
 `loom.role_attempt` spans have distinct IDs for retries. Explicit checkpoint
 attempt numbers are retained. Unknown usage remains absent; measured zero stays
 zero. Each attempt's token usage is a set of per-model `loom.runtime.usage`
@@ -186,7 +210,8 @@ configuration blobs, prompts and account contents are not exported.
 ## Role-runner ticks join stories after the fact (#9168)
 
 A role-runner tick (Judge, Curator, Champion, Doctor, …) is spawned without a
-target, so its `loom.role_attempt` root is its own trace. Once the tick ends,
+target, so its `loom.role_attempt` root — present only when the tick launched
+(#9438) — is its own trace. Once the tick ends,
 the same transcript pass that tallies `role_tick.outcome` `actions` also
 collects the issues and PRs the tick **wrote** to: `gh issue|pr
 comment/edit/close/reopen/…`, `gh pr merge|review|ready`, `merge-pr.sh <N>`
@@ -212,9 +237,10 @@ span id is derived from the story root, `loom.role_tick`, the tick's execution
 id (`loom.sweep_id`) and the target (`pr:<M>` / `issue:<N>`), so a re-emit
 yields the same id. It carries `loom.role`, `loom.issue`, `loom.pr_number`
 (PR targets), `loom.story`, `loom.story.key_version`, `loom.repo`,
-`loom.result`, `loom.runtime`/`loom.model` when known, and
+`loom.result`, `loom.runtime`/`loom.model` when known,
 `loom.timing_source=tick` — its start and end are the whole tick's, not the
-individual action's — plus a link to the tick's own root. The spans are
+individual action's — and `loom.attempt.worked` derived from the tick's result
+label (#9420), plus a link to the tick's own root. The spans are
 appended to the tick's trace journal and drained like every lifecycle span.
 Its token usage is journalled as per-model `loom.runtime.usage` spans:
 `scope=execution` under the tick's own root, and `scope=attempt` under the

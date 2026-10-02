@@ -102,10 +102,27 @@ impl ConsolidatePrepareArgs {
             return Ok(());
         }
 
-        // 4. Construction off the LIVE default-branch tip.
+        // 4. Construction off the LIVE default-branch tip. `construct()` is
+        // pure git mechanics — it references `base` and every pin as bare
+        // local objects, which a clone behind the live tip (the ordinary
+        // case: `base` just came from the API, not a local fetch) or a
+        // component head never otherwise fetched will not have.
         let base = live_base(&gh, &root, &default_branch)?;
+        if !has_commit(&root, &base) {
+            let _ = std::process::Command::new("git")
+                .args(["fetch", "--quiet", "origin", &default_branch])
+                .current_dir(&root)
+                .status();
+            if !has_commit(&root, &base) {
+                bail!("could not fetch the default branch tip {base} before construction");
+            }
+        }
         let worktree = root.join(format!(".loom/worktrees/consolidate-{attempt}"));
         let pin_refs: Vec<(u32, &str)> = components.iter().filter_map(|c| c.pin()).collect();
+        for &(number, head) in &pin_refs {
+            ensure_pr_head_fetched(&root, number, head)
+                .context(format!("fetching PR #{number}'s head before construction"))?;
+        }
         let candidate_head = match cons::construct("git", &root, &worktree, &base, &pin_refs) {
             Ok(head) => head,
             Err(conflict) => {
@@ -469,6 +486,76 @@ fn abort_attempt(
     )
 }
 
+/// Whether `sha` is present as a local git object.
+fn has_commit(root: &std::path::Path, sha: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+        .current_dir(root)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Make sure `sha` (PR #`pr_number`'s head) is a local git object, fetching
+/// the PR's head ref if it is not. Mirrors `stacked_children::establish_pin`:
+/// only the post-fetch re-check decides, the fetch's own exit status is not
+/// interesting on its own.
+fn ensure_pr_head_fetched(root: &std::path::Path, pr_number: u32, sha: &str) -> Result<()> {
+    if has_commit(root, sha) {
+        return Ok(());
+    }
+    let _ = std::process::Command::new("git")
+        .args([
+            "fetch",
+            "--quiet",
+            "origin",
+            &format!("refs/pull/{pr_number}/head"),
+        ])
+        .current_dir(root)
+        .status();
+    if !has_commit(root, sha) {
+        bail!("could not fetch PR #{pr_number}'s head {sha} to verify ancestry");
+    }
+    Ok(())
+}
+
+/// Git-level check that the candidate's tree at `candidate_head` actually
+/// contains every component's pinned commit as an ancestor (ADR-0023 §5
+/// hardening, Judge finding on #9688: `adopt()`'s other checks are entirely
+/// self-consistency over the candidate's own attacker-reachable body/branch).
+/// A same-repo candidate branch needs write access to push, so convergence
+/// alone is not a strong enough guarantee here — `--no-ff` construction makes
+/// inclusion an ancestry fact, so this is checkable directly.
+fn verify_ancestry(
+    root: &std::path::Path,
+    candidate_pr: u32,
+    candidate_head: &str,
+    components: &[cons::ComponentState],
+) -> Result<()> {
+    ensure_pr_head_fetched(root, candidate_pr, candidate_head)?;
+    for c in components {
+        let Some(head) = c.head_sha.as_deref() else {
+            continue;
+        };
+        ensure_pr_head_fetched(root, c.number, head)?;
+        let is_ancestor = std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", head, candidate_head])
+            .current_dir(root)
+            .status()
+            .context("git merge-base --is-ancestor")?
+            .success();
+        if !is_ancestor {
+            bail!(
+                "candidate PR #{candidate_pr}'s tree at {candidate_head} does not actually \
+                 contain PR #{}'s commit {head} as an ancestor — refusing to adopt it (the \
+                 candidate's own body/branch can be attacker-controlled; inspect by hand)",
+                c.number
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Adopt an open candidate for `attempt` — only while the attempt is live.
 ///
 /// The ledger (the candidate body) is the record: its attempt and pins must
@@ -515,6 +602,12 @@ fn adopt(
             },
         ));
     }
+    // The checks above are entirely self-consistency over the candidate's OWN
+    // body/branch — an attacker who precomputes this attempt's deterministic
+    // id can satisfy every one of them. Verify at the git level that the
+    // candidate's tree actually descends from each component's pinned commit
+    // before trusting the ledger any further.
+    verify_ancestry(root, candidate_pr, &mapping.candidate_head, components)?;
     let sources = read_sources(gh, root, &mapping)?;
     let lost: Vec<u32> = sources
         .iter()
@@ -731,4 +824,92 @@ fn abort(
         reason.cause()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git run");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn comp(number: u32, head: &str) -> cons::ComponentState {
+        cons::ComponentState {
+            number,
+            state: "OPEN".to_string(),
+            draft: false,
+            head_sha: Some(head.to_string()),
+            base_ref: "main".to_string(),
+            labels: vec![],
+            files: Default::default(),
+            additions: 1,
+            deletions: 0,
+        }
+    }
+
+    /// A real candidate built by `--no-ff` merging a component branch into a
+    /// base, exactly as `cons::construct` does — so the commit the component
+    /// is checked against genuinely descends from it.
+    fn built_candidate_repo() -> (tempfile::TempDir, String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q", "-b", "main"]);
+        git(tmp.path(), &["config", "user.email", "t@t"]);
+        git(tmp.path(), &["config", "user.name", "t"]);
+        std::fs::write(tmp.path().join("base.txt"), "base\n").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-qm", "base"]);
+        git(tmp.path(), &["checkout", "-qb", "component"]);
+        std::fs::write(tmp.path().join("c.txt"), "c\n").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-qm", "component"]);
+        let component_head = git(tmp.path(), &["rev-parse", "HEAD"]);
+        git(tmp.path(), &["checkout", "-q", "main"]);
+        git(tmp.path(), &["merge", "--no-ff", "--no-edit", "component"]);
+        let candidate_head = git(tmp.path(), &["rev-parse", "HEAD"]);
+        (tmp, candidate_head, component_head)
+    }
+
+    #[test]
+    fn ancestry_holds_when_the_candidate_genuinely_merged_the_component() {
+        let (tmp, candidate_head, component_head) = built_candidate_repo();
+        let components = vec![comp(10, &component_head)];
+        verify_ancestry(tmp.path(), 99, &candidate_head, &components)
+            .expect("the candidate's --no-ff merge makes this an ancestry fact");
+    }
+
+    #[test]
+    fn ancestry_fails_a_forged_candidate_that_never_merged_the_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q", "-b", "main"]);
+        git(tmp.path(), &["config", "user.email", "t@t"]);
+        git(tmp.path(), &["config", "user.name", "t"]);
+        std::fs::write(tmp.path().join("base.txt"), "base\n").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-qm", "base"]);
+        let forged_candidate_head = git(tmp.path(), &["rev-parse", "HEAD"]);
+
+        // A "component" commit that the forged candidate never actually
+        // merged — e.g. a real PR whose number the attacker named in a
+        // crafted body, but whose commit is unreachable from their branch.
+        git(tmp.path(), &["checkout", "-qb", "unrelated"]);
+        std::fs::write(tmp.path().join("c.txt"), "c\n").unwrap();
+        git(tmp.path(), &["add", "."]);
+        git(tmp.path(), &["commit", "-qm", "component"]);
+        let component_head = git(tmp.path(), &["rev-parse", "HEAD"]);
+
+        let components = vec![comp(10, &component_head)];
+        let err = verify_ancestry(tmp.path(), 99, &forged_candidate_head, &components)
+            .expect_err("a candidate that never merged the component must be refused");
+        assert!(
+            format!("{err:#}").contains("does not actually"),
+            "error should name the ancestry failure: {err:#}"
+        );
+    }
 }

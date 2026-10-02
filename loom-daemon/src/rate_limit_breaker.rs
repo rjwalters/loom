@@ -189,6 +189,11 @@ pub struct BudgetSnapshot {
     pub core_reset: DateTime<Utc>,
     pub graphql_remaining: u64,
     pub graphql_reset: DateTime<Utc>,
+    /// The pools' consumed counts this GitHub window (`used`), when the
+    /// response carried them (Issue #9855) — attribution for the trip: the
+    /// daemon's own ledger vs the pool's total spend says who exhausted it.
+    pub core_used: Option<u64>,
+    pub graphql_used: Option<u64>,
     pub probed_at: DateTime<Utc>,
 }
 
@@ -308,6 +313,8 @@ pub struct RateLimitSnapshot {
     pub trips_total: u64,
     pub core_remaining: Option<u64>,
     pub graphql_remaining: Option<u64>,
+    pub core_used: Option<u64>,
+    pub graphql_used: Option<u64>,
     pub budget_probed_at: Option<DateTime<Utc>>,
 }
 
@@ -325,6 +332,8 @@ impl RateLimitSnapshot {
             trips_total: self.trips_total,
             core_remaining: self.core_remaining,
             graphql_remaining: self.graphql_remaining,
+            core_used: self.core_used,
+            graphql_used: self.graphql_used,
             budget_probed_at: self.budget_probed_at,
         }
     }
@@ -472,6 +481,8 @@ impl SharedRateLimitBreaker {
             trips_total: guard.trips_total,
             core_remaining: guard.last_budget.map(|b| b.core_remaining),
             graphql_remaining: guard.last_budget.map(|b| b.graphql_remaining),
+            core_used: guard.last_budget.as_ref().and_then(|b| b.core_used),
+            graphql_used: guard.last_budget.as_ref().and_then(|b| b.graphql_used),
             budget_probed_at: guard.last_budget.map(|b| b.probed_at),
         }
     }
@@ -529,6 +540,30 @@ pub fn global_observe_failure(error_text: &str, source: &str) -> Option<Transiti
     let budget = forge::probe_budget(Path::new("gh"), now);
     let transition = breaker.observe_failure(error_text, source, budget, now)?;
     log::warn!("rate_limit_breaker: {} — {}", transition.kind.as_str(), transition.reason);
+    // Trip attribution (Issue #9855): the probe's pool-wide `used` minus this
+    // host's own ledger says whether this daemon exhausted its own pool or an
+    // external client sharing the credential did.
+    if let Some(b) = &budget {
+        let own = crate::forge_call_stats::consumed_in_window(now);
+        let line = |pool: &str, used: Option<u64>| -> String {
+            match (used, own.as_ref()) {
+                (Some(u), Some(m)) => {
+                    let o = m
+                        .iter()
+                        .find(|(p, _)| p.as_str() == pool)
+                        .map_or(0, |(_, v)| *v);
+                    format!("used={u} own≈{o} external≈{}", u.saturating_sub(o))
+                }
+                (Some(u), None) => format!("used={u} own=? (sink off) external=?"),
+                (None, _) => "used=? (probe without used)".to_string(),
+            }
+        };
+        log::warn!(
+            "rate_limit_breaker: attribution: core {} · graphql {} — external is other clients of this credential",
+            line("core", b.core_used),
+            line("graphql", b.graphql_used),
+        );
+    }
     Some(transition)
 }
 
@@ -596,6 +631,12 @@ pub fn parse_budget(body: &str, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
         let reset = DateTime::from_timestamp(reset_epoch, 0)?;
         Some((remaining, reset))
     };
+    let read_used = |name: &str| -> Option<u64> {
+        resources
+            .get(name)
+            .and_then(|r| r.get("used"))
+            .and_then(serde_json::Value::as_u64)
+    };
     let (core_remaining, core_reset) = read("core")?;
     let (graphql_remaining, graphql_reset) = read("graphql")?;
     Some(BudgetSnapshot {
@@ -603,6 +644,8 @@ pub fn parse_budget(body: &str, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
         core_reset,
         graphql_remaining,
         graphql_reset,
+        core_used: read_used("core"),
+        graphql_used: read_used("graphql"),
         probed_at: now,
     })
 }
@@ -658,6 +701,8 @@ mod tests {
             core_reset: t(core_reset),
             graphql_remaining: gql_rem,
             graphql_reset: t(gql_reset),
+            core_used: None,
+            graphql_used: None,
             probed_at: t(0),
         }
     }
@@ -805,7 +850,25 @@ mod tests {
         let b = parse_budget(body, t(0)).unwrap();
         assert_eq!(b.core_remaining, 4722);
         assert_eq!(b.graphql_remaining, 0);
+        assert_eq!(b.core_used, Some(278));
+        assert_eq!(b.graphql_used, Some(5000));
         assert_eq!(b.graphql_reset, DateTime::from_timestamp(1_785_352_835, 0).unwrap());
+    }
+
+    #[test]
+    fn parse_budget_tolerates_a_body_without_used() {
+        // An older `gh` or a proxy stripping the field: remaining/reset still
+        // win; `used` stays None and attribution renders `used=?`.
+        let body = r#"{
+            "resources": {
+                "core": {"limit": 5000, "remaining": 4722, "reset": 1785352027},
+                "graphql": {"limit": 5000, "remaining": 10, "reset": 1785352835}
+            }
+        }"#;
+        let b = parse_budget(body, t(0)).unwrap();
+        assert_eq!(b.core_remaining, 4722);
+        assert_eq!(b.core_used, None);
+        assert_eq!(b.graphql_used, None);
     }
 
     #[test]

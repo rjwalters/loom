@@ -46,7 +46,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use super::{VerdictKind, VerdictPr, VerdictReconcileStats};
-use crate::forge_tree_unchanged::tree_unchanged;
+use crate::verdict_equivalence::{self, Equivalence, EquivalenceKind};
 
 // The carve-out's kill switch (`LOOM_VERDICT_TREE_CARVEOUT`, nested here inside
 // [`super::VERDICT_STALENESS_ENABLED_ENV`]) moved to the shared module with the
@@ -81,25 +81,30 @@ pub(super) fn handle_invalidate(
     // (comparison unavailable) fall straight through to the ordinary clear,
     // unchanged from before #9124.
     if tree_carveout {
-        if let Some(true) = tree_unchanged(gh_bin, Some(root), marker_sha, head_sha) {
-            match reanchor_tree_unchanged_verdict(gh_bin, root, pr, marker_sha, head_sha) {
+        if let Equivalence::Equivalent(kind) =
+            verdict_equivalence::detect(gh_bin, Some(root), pr.number, marker_sha, head_sha)
+        {
+            match reanchor_equivalent_verdict(gh_bin, root, pr, marker_sha, head_sha, kind) {
                 Ok(()) => {
                     stats.tree_identical_reanchors += 1;
                     log::info!(
                         "claim_reconciliation: PR #{} in {} carries {} with head moved from \
-                         {marker_sha} to {head_sha}, but the trees are identical — re-anchored \
-                         instead of invalidating (#9124)",
+                         {marker_sha} to {head_sha}, but the reviewed change is unchanged \
+                         (equivalence kind: {}) — re-anchored instead of invalidating (#9124, \
+                         #9416)",
                         pr.number,
                         root.display(),
                         pr.kind.label(),
+                        kind.token(),
                     );
                 }
                 Err(e) => {
                     log::warn!(
-                        "claim_reconciliation: failed to re-anchor PR #{}'s tree-identical {} \
+                        "claim_reconciliation: failed to re-anchor PR #{}'s {}-equivalent {} \
                          verdict in {}: {e} — it stays stale (recorded for {marker_sha}) until \
                          the next tick re-evaluates it",
                         pr.number,
+                        kind.token(),
                         pr.kind.label(),
                         root.display()
                     );
@@ -132,43 +137,43 @@ pub(super) fn handle_invalidate(
     }
 }
 
-/// Re-anchor a verdict whose head moved but whose tree did not (Issue #9124):
-/// post an updated `<!-- loom:verdict-sha ... -->` marker for `head_sha` and
-/// leave the verdict label exactly as it is.
+/// Re-anchor a verdict whose head moved but whose reviewed change did not
+/// (Issues #9124, #9416): post an updated `<!-- loom:verdict-sha ... -->`
+/// marker for `head_sha`, plus a `<!-- loom:verdict-equivalence kind=… -->`
+/// marker recording WHICH equivalence carried it, and leave the verdict label
+/// exactly as it is.
 ///
 /// **No label is touched, and nothing is disarmed.** Unlike
-/// [`invalidate_verdict`], this path runs only once GitHub's own compare API
-/// has confirmed `marker_sha` and `head_sha` share the same tree — the
-/// reviewed code is still exactly what is at `head_sha` — so there is nothing
-/// to re-review and nothing unsafe about an auto-merge that was already armed
-/// going on to merge it.
+/// [`invalidate_verdict`], this path runs only once
+/// [`crate::verdict_equivalence::detect`] has proven — from git objects and the
+/// forge's own compare endpoint, never from a marker — that the change at
+/// `head_sha` is the change that was reviewed at `marker_sha`. So there is
+/// nothing to re-review, and nothing unsafe about an auto-merge that was
+/// already armed going on to merge it. CI still re-runs against `head_sha`
+/// either way: this path exempts the review, never a check.
 ///
 /// Idempotent by construction, same as [`super::forge::anchor_verdict`]: the
-/// marker it posts is exactly what [`super::extract_latest_verdict_sha`] scans
-/// for, so the next pass reads the verdict as `Fresh`.
-fn reanchor_tree_unchanged_verdict(
+/// `verdict-sha` marker it posts is exactly what
+/// [`super::extract_latest_verdict_sha`] scans for, so the next pass reads the
+/// verdict as `Fresh`. The body itself lives in
+/// [`crate::verdict_equivalence::reanchor_body`] — with it goes the one rule
+/// that matters for that scan: nothing may be added INSIDE the `verdict-sha`
+/// marker, because both scanners anchor on its trailing ` -->`.
+fn reanchor_equivalent_verdict(
     gh_bin: &Path,
     root: &Path,
     pr: &VerdictPr,
     marker_sha: &str,
     head_sha: &str,
+    kind: EquivalenceKind,
 ) -> Result<()> {
     let label = pr.kind.label();
-    let token = pr.kind.marker_token();
-    let body = format!(
-        "<!-- loom:verdict-sha sha={head_sha} verdict={token} -->\n\
-         **Verdict re-anchored — head moved, but the tree did not**\n\n\
-         This PR's `{label}` verdict was recorded for `{marker_sha}`. The head is now \
-         `{head_sha}`, but comparing the two shows **zero file differences** — the code this \
-         verdict describes is unchanged; only the commit identity moved (commonly the \
-         `#8248` required-check-freshness guard's automated re-date commit, #8508, which \
-         exists only to refresh a merge queue's check timestamps).\n\n\
-         Since the tree is provably identical, clearing `{label}` and sending this PR back \
-         through Judge would buy nothing but another full review of content already \
-         reviewed — exactly the waste #9124 measured. The marker is updated to `{head_sha}` \
-         so a future GENUINE change is still caught by the ordinary staleness check.\n\n\
-         ---\n\
-         *Automated by loom-daemon claim reconciliation (#9124)*"
+    let body = verdict_equivalence::reanchor_body(
+        label,
+        pr.kind.marker_token(),
+        kind,
+        marker_sha,
+        head_sha,
     );
 
     let mut cmd = Command::new(gh_bin);

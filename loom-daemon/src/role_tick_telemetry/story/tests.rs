@@ -539,3 +539,37 @@ fn a_failure_backs_off_from_when_it_was_observed() {
     let _ = resolve(api.as_ref(), &id, &[1], start + Duration::from_secs(81));
     assert_eq!(api.1.load(Ordering::SeqCst), 2);
 }
+
+/// #9420: a story copy carries the tick's whole interval, so it carries the
+/// same `loom.attempt.worked` verdict as the tick's own root — derived from the
+/// result label, and **absent** for a label no `RoleTickResult` round-trips
+/// from rather than guessed `false`.
+#[test]
+fn a_story_copy_carries_the_ticks_worked_verdict() {
+    use crate::observability::lifecycle::ATTEMPT_WORKED;
+    let story = StoryRef {
+        repo_id: REPO_ID,
+        story: "rjwalters/loom#9420".into(),
+        issue: 9420,
+        pr_number: None,
+        root: story_context(REPO_ID, 9420).unwrap(),
+    };
+    for (result, expected) in [
+        ("success", Some("true")),
+        ("failure", Some("true")),
+        ("skipped_pool_exhausted", Some("false")),
+        ("skipped_queue_empty", Some("false")),
+        ("not-a-result-label", None),
+    ] {
+        let mut facts = facts("judge");
+        facts.result = result.to_string();
+        let span = story_span(&facts, "rjwalters/loom", &story);
+        assert_eq!(
+            span.attributes.get(ATTEMPT_WORKED).map(String::as_str),
+            expected,
+            "result {result}"
+        );
+        // Whatever it says, it survives the export allowlist.
+        assert_eq!(span.clone().bounded().attributes, span.attributes);
+    }
+}

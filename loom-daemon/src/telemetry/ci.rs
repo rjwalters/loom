@@ -173,6 +173,18 @@ pub const CI_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.ci.suite",
     "loom.ci.suite.outcome",
     "loom.ci.suite.retried",
+    // `loom.ci.test` span only (#9456): which test of its `nextest-partition`
+    // leg this is, from the JUnit XML the `ci` nextest profile writes. Two
+    // keys rather than one concatenated id, because a test path is only
+    // unique within its binary and "which binary is slow" is its own
+    // group-by. The outcome has its own key for the same reason the suite
+    // outcome does: `loom.ci.conclusion` carries GitHub's vocabulary
+    // everywhere else, and mixing a test's pass/fail/flaky into it would
+    // corrupt every group-by over it. Like a suite span, a test span also
+    // repeats its job's identity and shard trio.
+    "loom.ci.test",
+    "loom.ci.test.binary",
+    "loom.ci.test.outcome",
 ];
 
 /// The low-cardinality metric label allowlist for the two CI duration

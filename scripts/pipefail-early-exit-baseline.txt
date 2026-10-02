@@ -20,7 +20,6 @@
 # that work lands; the ratchet allows that without an --update.
 #
 # <occurrences> <path>
-5 dashboard/scripts/check-deploy-config.sh
 1 defaults/hooks/methodology-inject.sh
 1 defaults/hooks/skill-router.sh
 1 defaults/hooks/tests/test-hook-wiring.sh

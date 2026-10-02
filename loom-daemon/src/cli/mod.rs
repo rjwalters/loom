@@ -76,6 +76,7 @@ pub(crate) mod misc_cmds;
 pub(crate) mod noop_cooldown;
 mod notify_cleared_blockers;
 pub(crate) mod opencode_usage_cli;
+pub(crate) mod overlap_replay;
 mod park_record;
 pub(crate) mod peer_claims_cmd;
 pub(crate) mod pi_usage_cli;

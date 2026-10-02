@@ -270,6 +270,41 @@ pub(crate) enum ForgeAction {
         head: String,
     },
 
+    /// `forge verdict-equivalent <pr> <reviewed> <head>` (#9416) — does a
+    /// verdict rendered against `<reviewed>` still describe `<head>`, and by
+    /// which equivalence? The superset of `tree-unchanged`: it asks that same
+    /// tree-identical test first (#9124/#9576), then the clean-merge-of-base and
+    /// rebase-patch-identical kinds #9416 adds. All three are recomputed from
+    /// the repository — git objects and the forge's own compare endpoint — never
+    /// from a comment or marker, and never from a commit message or the shape of
+    /// a ref update.
+    ///
+    /// Prints `VERDICT_EQUIVALENT=1` plus `EQUIVALENCE_KIND=tree|clean-merge|
+    /// rebase-patch-identical` when the verdict carries, or
+    /// `VERDICT_EQUIVALENT=0` when it provably does not, exiting 0 for both;
+    /// exits 1 with nothing on stdout when it could not be decided. So a caller
+    /// keys on the `EQUIVALENCE_KIND=` line, and every failure mode — absent
+    /// binary, a daemon predating this verb, a `gh` outage, a shallow clone, a
+    /// `merge-tree` conflict, a non-GitHub forge — collapses into the same
+    /// fail-closed "re-review" arm.
+    ///
+    /// Only the REVIEW is ever carried forward. CI re-runs against the new head
+    /// regardless of which kind applied.
+    #[command(name = "verdict-equivalent")]
+    VerdictEquivalent {
+        /// The PR whose base branch the two heads are compared against.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// The commit the verdict was rendered against (7-40 lowercase hex).
+        #[arg(value_name = "REVIEWED")]
+        reviewed: String,
+
+        /// The PR's current head (7-40 lowercase hex).
+        #[arg(value_name = "HEAD")]
+        head: String,
+    },
+
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should use,
     /// replacing its old unconditional `forge_detect_merge_method` call.
@@ -419,9 +454,10 @@ pub(crate) enum ForgeAction {
     /// only, like every daemon comment path (`gh` REST).
     #[command(name = "comment")]
     Comment {
-        /// Issue or PR number to comment on.
+        /// Issue or PR number to comment on (post path; omit when
+        /// `--patch-created` is given).
         #[arg(value_name = "NUMBER")]
-        number: u64,
+        number: Option<u64>,
 
         /// Target `owner/repo`; omitted resolves from the origin remote.
         #[arg(long, value_name = "OWNER/REPO")]
@@ -440,6 +476,14 @@ pub(crate) enum ForgeAction {
         /// The number names a pull request (link says `/pull/N`).
         #[arg(long)]
         pr: bool,
+
+        /// Don't post: append the footer to this CREATED object's existing
+        /// body instead (idempotent) — the post-create step
+        /// create-issue.sh / create-pr.sh run right after a successful
+        /// create, when the number exists only inside the URL. Mutually
+        /// exclusive with NUMBER.
+        #[arg(long, value_name = "URL|OWNER/REPO#N", conflicts_with = "number")]
+        patch_created: Option<String>,
     },
 
     /// `forge dashboard-link <owner/repo> <number> [--pr]` — print the exact
@@ -523,6 +567,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             body,
             body_file,
             pr,
+            patch_created,
         } => {
             return loom_daemon::forge_comment::cli_entrypoint(
                 loom_daemon::forge_comment::CommentArgs {
@@ -531,6 +576,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                     body,
                     body_file,
                     is_pr: pr,
+                    patch_created,
                 },
             );
         }
@@ -581,6 +627,15 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             hold,
         },
         ForgeAction::TreeUnchanged { base, head } => ForgeCmd::TreeUnchanged { base, head },
+        ForgeAction::VerdictEquivalent {
+            pr_number,
+            reviewed,
+            head,
+        } => ForgeCmd::VerdictEquivalent {
+            pr: pr_number,
+            reviewed,
+            head,
+        },
         ForgeAction::MergeMethod { repo, requested } => ForgeCmd::MergeMethod { repo, requested },
         ForgeAction::MergeConfig {
             repo,

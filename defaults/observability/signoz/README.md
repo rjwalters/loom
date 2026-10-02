@@ -226,6 +226,43 @@ queries above: a `metric_name` or label the emitting code no longer produces,
 or the gateway's DATAPOINT `keep_keys` allowlist no longer forwards, fails
 ordinary CI instead of the saved view quietly going empty.
 
+The alert additionally has its own execution proof,
+`loom-daemon/tests/signoz_queue_starvation_alert.rs`, which substitutes
+SigNoz's `{{.start_timestamp_ms}}` / `{{.end_timestamp_ms}}` the way its rule
+evaluator does and then applies the committed `op` / `matchType` / `target` to
+the engine's own output. A wrong alert fails differently from a wrong
+dashboard: an empty dashboard is *visibly* empty, whereas an alert whose query
+returns nothing — or rows its threshold can never cross — is **silently**
+healthy forever, because no page is exactly what a working queue looks like.
+What the run establishes:
+
+- **The threshold separates sustained starvation from a working queue.** A host
+  above zero in every minute fires; a host reporting a measured zero in every
+  minute does not; and a host that starves and clears alternately does not
+  either, because the committed `matchType` demands the breach hold for the
+  whole 15-minute window. The test evaluates both of SigNoz's point-wise match
+  semantics over the same output, so switching that field is visible as a
+  change of operational contract rather than a tweak.
+- **The zero rows stay in the result.** Unlike `queue-dwell.sql` query 1, the
+  alert has no `HAVING starved > 0` — SigNoz needs the zero-valued points to
+  see a series recover — so a measured zero is dropped by the *threshold*, and
+  nothing in the SQL would stop a loosened `target` from paging on every
+  reporting host.
+- **The window is half-open.** The point at exactly `end_ms` is excluded, so two
+  consecutive overlapping evaluations cannot both count the same boundary
+  point, and a spike one minute before `start_ms` does not re-alert.
+- **`GROUP BY ts, host` is what makes the annotation's "see the alert's host
+  label" true.** Dropping `host` collapses every host into one unattributable
+  series whose per-bucket `max()` is the worst host's — still firing, but with
+  nowhere to point and a healthy host hidden rather than visibly healthy.
+
+Each of those is run with the committed JSON mutated as a counterfactual, and
+the rule's own cadence is checked too (`frequency` ≤ `evalWindow`, so no minute
+of starvation falls in a gap between evaluations; neither the rule nor its
+query ships `disabled`). What it does **not** establish: no rule evaluator ran
+and no notification was delivered — the live fire-and-resolve check is
+[#9006](https://github.com/rjwalters/loom/issues/9006).
+
 All five queries are additionally **executed verbatim** against the pinned
 ClickHouse the telemetry store runs, by
 `loom-daemon/tests/signoz_queue_quota_queries.rs`. That run is what establishes
@@ -361,6 +398,66 @@ the type it names, so a subscript into `attributes_number` there would silently
 return 0 on every row instead of erroring. Policy and pipeline:
 [CI observability](../../docs/ci-observability.md).
 
+### ETA accuracy queries
+
+`eta-queries.sql` (#9289) scores the ETA heuristics against what actually
+happened, from the `eta.estimate` / `eta.outcome` **log** records. Section 0 is
+the preflight; Q1 is MAE / 25–75 coverage / bias; Q2 is the mean pinball loss
+that decides a promotion; Q3 ranks the recorded features by how well each
+tracks the error. The model is [`eta.md`](../../docs/eta.md). Bind both
+parameters:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery --param_since='2026-09-01 00:00:00' --param_repo='' < eta-queries.sql
+```
+
+`loom-daemon/tests/signoz_eta_queries.rs` executes the committed file verbatim
+against the same pinned ClickHouse (25.12.5) the telemetry store runs, and runs
+the mutation of the committed SQL that breaks each claim below as a
+counterfactual rather than describing it. **Read section 0 first**, then these
+five, in this order:
+
+- **Absent is never zero.** An `abandoned` outcome (the issue closed as not
+  planned) and a refusal carry no `loom.eta.error_sec` key at all. Dropping the
+  `mapContains` presence filter does not error — `attributes_number` answers the
+  Float64 default — it scores the abandonment as a *flawless* prediction, which
+  **lowers** the MAE. Measured: 1048 → 1000 on the test fixture. A promotion
+  metric that improves when data goes missing is the worst shape of silent
+  defect, which is why section 0 reports `outcomes` and `scored` separately and
+  they must reconcile to `abandoned`.
+- **`refusals` is a subset of `estimates`**, not a disjoint population — a
+  refusal still carries `loom.eta.trigger`. Adding the two columns double-counts.
+- **Q2's subtotals need `rolled_up`.** `ROLLUP` blanks an aggregated column to
+  the type's default, `''` for these Strings — exactly what
+  `attributes_string['loom.eta.heuristic']` answers for a record that lacks the
+  key. The query therefore can and does emit **two rows with the identical key
+  `('', '', '')`**: the grand total (`rolled_up` = 3) and an unlabelled
+  heuristic's own total (`rolled_up` = 2). Without the column they are one
+  unreadable pair.
+- **Q3: an unvarying feature is not scored as uncorrelated.** `rankCorr`
+  average-ranks ties, so a feature that took one value across the window comes
+  out at exactly **`rank_corr` = 0.5** — above any genuine correlation weaker
+  than that, under this section's own `ORDER BY abs(rank_corr) DESC` — while
+  `pearson_corr` reads NaN. `distinct_values` = 1 is the tell. Do not read a
+  0.5 without it. The NaN's **spelling** is architecture-dependent (`nan` on
+  arm64, `-nan` on amd64 Linux), so never string-match it.
+- **Q3 cannot see an estimate older than the window.** Its estimate sub-select
+  carries the same `since` bound as the outcome one, so an outcome whose
+  estimate predates `since` is scored by Q1/Q2 and contributes no features here.
+  Widen `since` past the longest lead time you care about.
+
+`HAVING n >= 20` means a short window makes Q3 return **nothing**, which reads
+like "no feature tracks the error" rather than "not enough data" — check section
+0's counts before concluding either. `eta_artifacts.rs` additionally fails in
+ordinary CI if any attribute drifts from what the ETA mapping emits and the
+gateway forwards, or if either disambiguating column is dropped.
+
+Executed against the pinned ClickHouse with a synthetic fixture, and executed
+verbatim against the **live trial deployment** (ClickHouse 25.12.5.44,
+2026-10-01) where it returned all four sections' documented columns over zero
+rows — no ETA record has been ingested there yet. Not yet run over real canary
+data.
+
 ### Saved views
 
 | Saved view | Procedure |
@@ -372,7 +469,7 @@ return 0 on every row instead of erroring. Policy and pipeline:
 | Host/token gauges | Metrics Explorer: the actual emitted names and units — the shared fixture emits `loom.tokens.usage_fraction` and `loom.tokens.exhausted` only, labelled by `account`. An absent series is not a measured zero: the fixture's `synthetic-unknown` account intentionally has no `usage_fraction` point while `synthetic-zero` has `0.0` (`fixture-queries.sql` 7) |
 | Subscription quota utilization | Dashboards → New dashboard `Loom quota` → Time series panel. Metric `loom.tokens.usage_fraction` (5-hour window) and a second query on `loom.tokens.usage_fraction_weekly` (rolling 7-day window, #9005), aggregation **Max**, group by `provider`, `account`; time range 7 days. Providers with no utilization source (Codex, OpenCode/Z.ai, Kimi) have no series at all — a gap, never a `0`. Last week's used fraction per provider and the idle headroom thrown away at each weekly reset need window functions, so they live in SQL only (`quota-utilization.sql` 1–3) |
 | Ready-queue dwell | Dashboards → New dashboard `Loom queue` → Time series panel. Metric `loom.queue.oldest_wait`, aggregation **Max**, group by `host.id`, `state`; time range 7 days. A second panel on `loom.queue.starved` (Max, group by `host.id`, `state`) is the alert's own signal. Disposition reasons, mean dispatch wait and one issue's admission trail need `JSONExtractString`/span reads and stay SQL-only (`queue-dwell.sql` 1–5) |
-| Queue starvation alert | Alerts → Import `alerts/queue-starvation.json`. Fires when `loom.queue.starved` for `state = 'ready'` stays above threshold for the 15-minute eval window on any one host; the alert's own query is `queue-dwell.sql` 1 narrowed to that state |
+| Queue starvation alert | Alerts → Import `alerts/queue-starvation.json`. Fires when `loom.queue.starved` for `state = 'ready'` stays above threshold for the 15-minute eval window on any one host; the alert's own query is `queue-dwell.sql` 1 narrowed to that state, minus its `HAVING starved > 0` so SigNoz can still see the series recover. The embedded query plus the committed threshold are executed against the pinned ClickHouse by `signoz_queue_starvation_alert.rs` (see "Queue dwell and starvation queries" above); no rule evaluator or notification has run ([#9006](https://github.com/rjwalters/loom/issues/9006)) |
 | Loom measured usage | Trace Explorer: filter `name = 'loom.runtime.usage'`, group by `loom.model` with **Sum** over the token counters, and separately by `loom.role` / `loom.runtime`. The UI reads these attributes as STRINGS (they are exported as strings, like every span attribute), so a numeric aggregation of them belongs in SQL — and the scope resolution a correct total needs cannot be expressed as an Explorer filter at all. Treat the panel as a browsing surface and the SQL as the figures (`usage-queries.sql` 1 and 2) |
 | Usage coverage | Trace Explorer: filter `name = 'loom.role_attempt'` and compare against the usage spans beneath each. An attempt with **no** `loom.runtime.usage` child has usage UNKNOWN; one whose child reports `loom.tokens.total = '0'` is a measured zero. Never impute one from the other — the split is SQL-only (`usage-queries.sql` 3) |
 | Unpriced models and rate-card provenance | Trace Explorer: filter `name = 'loom.runtime.usage'` and add `loom.cost.usd_estimate`, `loom.pricing.source`, `loom.pricing.verified_on` as columns. A blank estimate is a model the rate card does not know, never a $0 model: it must be excluded from spend explicitly, and fixing it is a rate-card change, not a query change. Two `verified_on` values in one window mean the fleet rolled a card mid-window (`usage-queries.sql` 4 and 5) |
@@ -383,7 +480,7 @@ return 0 on every row instead of erroring. Policy and pipeline:
 | CI regression spotlight | Same dashboard → Table panel. Metric `loom.ci.job.duration_ms`, aggregation **P95**, group by `repo`, `workflow`, `job`, time range = the current window; duplicate the panel with the time shift/compare set to one window earlier and sort by the difference. The ranked delta and the ≥2-runs-in-both-windows rule live in the SQL (`ci-queries.sql` 2) |
 | CI outcome mix | Same dashboard → Stacked bar panel. Metric `loom.ci.run.duration_ms`, aggregation **Count** (one data point per run), group by `workflow`, `conclusion`; keep `cancelled` as its own series — never filter it out (`ci-queries.sql` 3) |
 | CI top slow jobs | Logs Explorer: filter `body = 'ci.job'`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.duration_ms`, `loom.ci.run_id`, `loom.ci.job_id`; sort by `loom.ci.duration_ms` descending; save as view `CI top slow jobs` (`ci-queries.sql` 4) |
-| CI failed run → logs | Logs Explorer: filter `body = 'ci.run' AND loom.ci.conclusion IN ('failure', 'timed_out', 'startup_failure')`, save as `CI failed runs`; take a `loom.ci.run_id`, filter `body = 'ci.job' AND loom.ci.run_id = <id> AND loom.ci.conclusion != 'success'` for its failing jobs, then `loom.ci.job_id = <job id> AND loom.ci.chunk_index EXISTS` sorted by `loom.ci.chunk_index` ascending for the job's log, in order (`ci-queries.sql` 5) |
+| CI failed run → logs | Logs Explorer: filter `body = 'ci.run' AND loom.ci.conclusion IN ('failure', 'timed_out', 'startup_failure')`, save as `CI failed runs`; take a `loom.ci.run_id`, filter `body = 'ci.job' AND loom.ci.run_id = <id> AND loom.ci.conclusion != 'success'` for its failing jobs, then `loom.ci.job_id = <job id> AND loom.ci.chunk_index EXISTS` sorted by `loom.ci.chunk_index` ascending for the job's log, in order (`ci-queries.sql` 5). **Read the SQL's two absences apart**: `job_id` NULL with an empty `logs_explorer_filter` means the run failed with *no* non-successful job (a `startup_failure`, a cancelled matrix parent, a required check that never produced a job) — there is no log to look for; `job_id` set with `0 of 0` means the job failed and its log never arrived. Before #8528 both read `job_id` 0 / `0 of 0` / `loom.ci.job_id = 0`, the last of which silently matches nothing when pasted into Logs Explorer |
 | CI run waterfall | Trace Explorer: filter `name = 'loom.ci.run'`, sort by duration descending, open a run; its `loom.ci.job` children are the waterfall, and the longest child against the root's duration is the run/longest-job comparison (`ci-queries.sql` 6) |
 | CI job queue wait | Logs Explorer: filter `body = 'ci.job' AND loom.ci.queued_ms EXISTS`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.queued_ms`; group by `loom.ci.job` with **P50**/**P90**, time range 7 days; **alert when p90 exceeds 60s** — a runner-queue-cap burst shows here long before it shows in the run-level queue segment. A job GitHub reported no `created_at` for contributes no sample, not a zero (`ci-queries.sql` 9) |
 | CI shard balance | Logs Explorer: filter `body = 'ci.job' AND loom.ci.shard.kind != 'none'`, add columns `loom.ci.run_id`, `loom.ci.job`, `loom.ci.shard.index`, `loom.ci.shard.total`, `loom.ci.duration_ms`; group by `loom.ci.run_id`, `loom.ci.shard.kind` — the spread between the slowest and fastest leg of one run is the rebalancing signal. The ranked spread across runs lives in the SQL (`ci-queries.sql` 10) |
@@ -391,7 +488,11 @@ return 0 on every row instead of erroring. Policy and pipeline:
 | CI slowest suites | Trace Explorer: filter `name = 'loom.ci.suite'`, group by `loom.ci.job`, `loom.ci.suite` with **Sum** (and a second query with **P90**), time range 7 days, sorted descending. Add `loom.ci.suite.outcome` / `loom.ci.suite.retried` as filters to separate "slow because it runs twice" from "slow". A suite that did not run in a leg has no span at all, so it never appears here as a fast suite (`ci-queries.sql` 12) |
 | CI suite rebalance | Same filter grouped by `loom.ci.run_id`, `loom.ci.shard.index` with **Sum** — one bar per leg of a run, which is the per-leg suite time a `LOOM_CI_SHARD` split should equalize. `argMax(suite, duration)` per leg (the named suite to move) is SQL-only (`ci-queries.sql` 13). Expect the summed suite time to be **less** than the leg's job wall time (checkout and toolchain setup are steps, not suites) and **more** than the wall time of the step that ran them (suites run concurrently); the comparison that matters is between legs of the same run |
 | CI critical path | Logs Explorer: filter `body = 'ci.job' AND loom.ci.run_id = <id>`, add columns `loom.ci.job`, `loom.ci.dependency_wait_ms`, `loom.ci.queued_ms`, `loom.ci.duration_ms`, and sort by `loom.ci.duration_ms` descending — the leg with the largest dependency + queue + running sum is the run's critical path, and the three columns say which of the three set it. The `unexplained_s` residual (run wall time minus the run's own queue and that leg's total) requires a run↔job join and is SQL-only (`ci-queries.sql` 14) |
+| ETA accuracy | Logs Explorer: filter `body = 'eta.outcome' AND loom.eta.error_sec EXISTS`, add columns `loom.eta.heuristic`, `loom.eta.revision`, `loom.eta.kind`, `loom.eta.horizon_bucket`, `loom.eta.error_sec`, `loom.eta.covered`; group by `loom.eta.heuristic`, `loom.eta.revision` — **both**, never heuristic alone, or a daemon roll mid-window averages two builds into one number. The `EXISTS` clause is not optional: an abandoned sweep has no error field, and without it the panel scores the abandonment as a perfect prediction. Coverage, bias and the pinball loss that decides a promotion need `avg()`/`median()` over these and stay SQL-only (`eta-queries.sql` 0, Q1, Q2) |
+| ETA feature ranking | SQL-only (`eta-queries.sql` Q3): it expands the estimate's explanation body with `JSONExtractKeysAndValuesRaw` and correlates each numeric feature with the error, neither of which is an Explorer operation. Read `distinct_values` beside `rank_corr` — a feature that never varied scores 0.5, not 0 — and `n` beside both: the section's `HAVING n >= 20` makes a short window return nothing at all |
 | CI dependency wait | Logs Explorer: filter `body = 'ci.job' AND loom.ci.dependency_wait_ms EXISTS`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.dependency_wait_ms`, `loom.ci.queued_ms`; group by `loom.ci.job` with **P50**/**P90**, time range 7 days. **Alert when a family's p90 dependency wait exceeds its own p90 queue wait**: it is gated by `needs:`, not capacity-starved, and more runners will not move it. An ungated job measures ~0 by construction — treat sub-2s values as job-creation lag, not a serialized edge (`ci-queries.sql` 15) |
+| CI slowest tests | Trace Explorer: filter `name = 'loom.ci.test'`, group by `loom.ci.test.binary`, `loom.ci.test` with **Sum** (and a second query with **P90**), time range 7 days, sorted descending. Add `loom.ci.test.outcome` as a filter to separate `flaky` (failed then passed — the #7789 signal) from `fail`/`error` from a clean `pass` (`ci-queries.sql` 16). **Only each leg's slow tail is emitted** — tests at or above the 250 ms floor, capped at `MAX_TEST_SPANS_PER_JOB` (512) per leg — so this panel is a ranking, never a test inventory: a test missing from it is fast or outside the cap, not unrun |
+| CI test rebalance | Same filter grouped by `loom.ci.run_id`, `loom.ci.job` with **Sum** — one bar per nextest leg of a run, which is the slow-tail time a `--partition count:k/N` split should equalize. Group by `loom.ci.job` and not by `loom.ci.shard.index` alone: both nextest families shard `1..3`, so index alone merges two unrelated partitions. `argMax(test, duration)` per leg (the named test to move) is SQL-only (`ci-queries.sql` 17). The summed tail time is far **less** than the leg's test-step wall time by design (every sub-floor test is excluded), so compare legs of the same run and the same family, never a leg against its own job span |
 
 `ci-queries.sql` 7) (#9007's per-issue Builder/CI/Judge/merge breakdown) and 8)
 (#9337's CI time per trigger reason) have no row above: 7 joins
@@ -410,6 +511,13 @@ acceptance surface until someone with the trial org's login creates the saved
 views and records it. The seven #9089 rows are additionally **unexecuted**:
 sections 9–15 read attributes and spans that work introduces, so no run
 predating it can have produced a row for them.
+
+The two **ETA** rows are in the same category and for the same reason: written,
+not created in the trial org, and additionally unexecuted over real data — no
+`eta.estimate` or `eta.outcome` record has reached the trial deployment (a
+verbatim run of `eta-queries.sql` against it on 2026-10-01 returned every
+documented column over zero rows). The verified form is
+`loom-daemon/tests/signoz_eta_queries.rs` against the pinned engine.
 
 Save these searches/dashboards through the installed UI and retain sanitized
 exports where supported. These precise steps avoid asserting that mutable
@@ -530,23 +638,40 @@ times columns. Under the 2 GiB cap, its TTL-applying merge failed thousands of
 times an hour, and parts outlived their TTL. `system.metric_log` stays
 queryable as a view with the same columns.
 
-A deployment first started from an older render keeps its wide table. The
-config is a single-file bind mount, so a plain `up -d` does not pick up a
-re-render: recreate the ClickHouse container (its volume persists). On start
-it renames the old table to `system.metric_log_0`, stuck parts included. That
-table holds ClickHouse's own diagnostics only, no Loom signal, so drop it:
+A deployment first started from an older render keeps its wide table. Its
+rendered files live in the deployment's own state directory, **not** in this
+checkout, so step one is to copy the re-rendered `casting.yaml`,
+`casting.yaml.lock` and `pours/` over that directory's copies — a
+`--force-recreate` against the stale copies recreates the container with the
+*old* config and changes nothing. Keep the originals: that diff is the only
+record of what the deployment was running.
+
+The config is then a single-file bind mount, so a plain `up -d` still does not
+pick up the re-render: recreate the ClickHouse container (its volume persists).
+On start it renames the old table to `system.metric_log_0`, stuck parts
+included. That table holds ClickHouse's own diagnostics only, no Loom signal,
+so drop it:
 
 ```console
+diff -r /absolute/deployment/state/pours pours   # expect only the metric_log schema_type line
+cp -R casting.yaml casting.yaml.lock pours /absolute/deployment/state/
 docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml up -d --wait --wait-timeout 1800 --force-recreate --no-deps loom-signoz-telemetrystore-clickhouse-0-0
 docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "DROP TABLE system.metric_log_0"
 ```
 
 Check for merge failures when you check retention. A non-zero count means some
-table has stopped expiring:
+table has stopped expiring. **Bound the window to the running server** — the
+`part_log` rows recording the old failures survive in the volume until their
+own 1-day TTL expires them, so an unbounded count keeps reporting a defect that
+is already fixed:
 
 ```console
-docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT table, countIf(error != 0) failed_merges, countIf(error = 0) ok FROM system.part_log WHERE event_type = 'MergeParts' GROUP BY table HAVING failed_merges > 0"
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT table, countIf(error != 0) failed_merges, countIf(error = 0) ok FROM system.part_log WHERE event_type = 'MergeParts' AND event_time > now() - toIntervalSecond(uptime()) GROUP BY table HAVING failed_merges > 0"
 ```
+
+Drop the `event_time` predicate only to read the pre-restart history
+deliberately; `system.metric_log_0` appearing there is expected for the
+seconds between the rename and the `DROP`.
 
 Use the same `--env-file` and `-f` arguments for every Compose command.
 `docker compose ... stop` preserves all data.

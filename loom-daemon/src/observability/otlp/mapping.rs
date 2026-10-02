@@ -6,6 +6,7 @@ mod ci;
 mod eta;
 mod metadata;
 mod ops;
+mod session_output;
 
 use std::collections::BTreeMap;
 
@@ -171,14 +172,28 @@ pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> 
 /// two host-level record kinds (`tokens.snapshot`, `host.health`) — those
 /// become metrics instead (see [`metric_samples_for`]).
 fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
-    let observed_time_unix_nano = nanos(envelope.emitted_at);
+    let mut observed_time_unix_nano = nanos(envelope.emitted_at);
     let mut time_unix_nano = observed_time_unix_nano;
     // Only `ci.job.log` (#8825) and the ETA kinds (#9289) set this; every
     // other kind's body stays the event name, byte-identical on the wire.
     let mut body_override: Option<String> = None;
+    // Issue #9881: every log record carries its kind as an ORDINARY attribute.
+    // The dashboard's log queries cannot filter on the log `name` column
+    // (SigNoz lowers it to JSON_VALUE on the body and this ClickHouse build
+    // rejects the JSON functions — loom-ui#747), so they discriminate on
+    // `loom.kind` instead. Nothing stamped it: the only rows that ever
+    // matched were d1sync bring-up rows whose payload-copy `kind` predates
+    // the omit list, which is exactly why `charts-outcomes` appeared to
+    // "stop on 2026-09-29" while sweeps kept running — it was reading the
+    // backfill's tail, not live emission. Stamp it here so every
+    // lifecycle-kind log is queryable by kind; the gateway's `keep_keys`
+    // allowlist must admit the key (`sweep_facts_gateway_survival.rs`
+    // guards the pairing).
+    let kind_attribute = kv_string("loom.kind", envelope.record.kind().to_string());
     let (event_name, severity, _body, attributes) = match &envelope.record {
         TelemetryRecord::SweepStarted(r) => {
             let mut attributes = vec![
+                kind_attribute.clone(),
                 kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_int("loom.issue", i64::from(r.issue)),
@@ -210,6 +225,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         }
         TelemetryRecord::SweepIdentity(r) => {
             let mut attributes = vec![
+                kind_attribute.clone(),
                 kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_int("loom.issue", i64::from(r.issue)),
@@ -248,6 +264,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // unresolved case is stamped explicitly instead of a path ever
             // being written.
             let mut attributes = vec![
+                kind_attribute.clone(),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
@@ -275,6 +292,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // Issue #9442: `loom.repo` only when the slug resolved;
             // `loom.repo_unresolved=true` replaces it, never a host path.
             let mut attributes = vec![
+                kind_attribute.clone(),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_int("loom.issue", i64::from(r.issue)),
                 kv_string("loom.sweep_id", r.sweep_id.clone()),
@@ -323,6 +341,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // alongside the sweep lifecycle kinds (not as a metric) because a
             // tick is an event with a result and a detail string, not a gauge.
             let mut attributes = vec![
+                kind_attribute.clone(),
                 kv_string("loom.repo", r.repo.clone()),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_string("loom.role", r.role.clone()),
@@ -379,6 +398,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // the parse never copies message text or tool output, so
             // nothing here needs a free-text bound beyond `bounded`'s.
             let mut attributes = vec![
+                kind_attribute.clone(),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_string("loom.session_id", r.session_id.clone()),
                 kv_string("loom.runtime", r.runtime.clone()),
@@ -457,6 +477,7 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // rollup, mapped as a log record like `session.summary` — an
             // event with counts and a dollar figure, not a gauge.
             let mut attributes = vec![
+                kind_attribute.clone(),
                 kv_string("loom.repo.visibility", visibility_str(r.visibility)),
                 kv_string("loom.session_id", r.session_id.clone()),
             ];
@@ -570,6 +591,19 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
+        }
+        TelemetryRecord::SessionOutput(_) => {
+            // Issue #9764: the body is the producer-redacted readable text,
+            // and this is the only kind that overrides BOTH timestamps — the
+            // source event's time and the producer's read time are separate
+            // facts here, and collapsing either into the envelope's
+            // `emitted_at` would make a quiet run indistinguishable from a
+            // stalled export.
+            let parts = session_output::log_parts(&envelope.record)?;
+            time_unix_nano = parts.source_at;
+            observed_time_unix_nano = parts.observed_at;
+            body_override = Some(parts.body);
+            (parts.event_name, parts.severity, String::new(), parts.attributes)
         }
         // Every kind that is not declared `otlp: Logs` in `telemetry/kinds.rs`:
         // `tokens.snapshot` / `host.health` become gauges, `ci.duration` a

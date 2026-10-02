@@ -1,10 +1,9 @@
 //! Coverage for `merge_plans` (Issue #9310).
 //!
 //! The ordering cases come from the shared fixture
-//! `dashboard/test/fixtures/dispatch-plan-merge.json`, which the dashboard's
-//! port of the same rule (`dashboard/web/test/workQueue.test.ts`) reads too —
-//! so a change to the rule on one side fails the other side's test until it
-//! is ported. Behaviour the fixture cannot express (that the merge is
+//! `loom-daemon/tests/fixtures/dispatch-plan-merge.json`, which the
+//! `2AMLogic/loom-ui` port of the same rule pins too — so a change to the
+//! rule on one side fails the other side's test until it is ported. Behaviour the fixture cannot express (that the merge is
 //! order-independent, and that it is total on empty input) is tested here.
 
 use super::*;
@@ -12,8 +11,8 @@ use crate::types::{HostPlanRow, PlanShard, PlanState};
 
 /// The fixture, verbatim. `include_str!` (not a runtime read) so the test
 /// binary carries it and a moved fixture is a compile error, the same way
-/// `dashboard/test/fixtures/sweep-identity.json` is consumed.
-const FIXTURE: &str = include_str!("../../../dashboard/test/fixtures/dispatch-plan-merge.json");
+/// `sweep-identity.json` is consumed.
+const FIXTURE: &str = include_str!("../../tests/fixtures/dispatch-plan-merge.json");
 
 #[derive(serde::Deserialize)]
 struct Fixture {

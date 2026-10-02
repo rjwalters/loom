@@ -89,7 +89,8 @@ UNION ALL SELECT 'v1', '13', 2000, 8, 110000000;
 -- hw_files (LOC), tokens_in + tokens_out (per sweep, not per phase, #9443),
 -- total_duration_sec (wall — queue-sensitive, a cross-check only, exactly as
 -- the rubric says), and the landed-size LSI when its parameter set is fitted
--- (NULL under `v0-unfitted`; `lsi_params_version` says which).
+-- (NULL while `lsi_params_version` says the parameter set is unfitted, as
+-- the column itself reports).
 --
 -- `churn_class` partitions the population the clean-landing filter excludes
 -- (counted, never silently dropped): no phase breakdown → the filter cannot

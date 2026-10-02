@@ -368,11 +368,31 @@ accept raw shell output, prompts or model completions", which is no longer the
 whole truth): this collector is **not** a general arbitrary-log redactor.
 Source-side Loom privacy rules own bodies, span names and nested values for
 every record kind, and it accepts no prompts or model completions from any
-source. **There is exactly one kind whose body is free text the source did not
-author: `ci.job.log` (#8825)**, which carries GitHub Actions job log text.
-That one is accepted deliberately, and scrubbed *here*, because the operator
-decision for #8825 makes this gateway — not the daemon — the redaction
-boundary for build logs. Concretely:
+source. **There are exactly two kinds whose body is free text the source did not
+author**, each accepted deliberately and each behind its *own* marker-key scope
+guard:
+
+| Kind | Body | Where redaction happens |
+|---|---|---|
+| `ci.job.log` (#8825) | GitHub Actions job log text | **here** — there is no earlier point; the log is fetched wholesale |
+| `session.output` (#9764) | live, already-redacted agent output | **at the producer**; this gateway re-scrubs as defence in depth |
+
+The two differ in *where the boundary is*, and that difference is the reason
+each has its own stage. For `ci.job.log` the operator decision for #8825 makes
+this gateway the redaction boundary for build logs. For `session.output` the
+text is selected line by line inside the daemon, so the earliest point is there
+(`telemetry::kinds::session_output::redact`, policy `producer/v1`, stamped on
+every record as `loom.session.output.redaction`); the gateway stage exists so
+that neither layer is ever the only one — notably for an operator exporting
+straight to their own OTLP endpoint with no Loom collector in front.
+
+The scope guards are deliberately **different** marker keys
+(`loom.ci.chunk_index` vs `loom.session.output.event_id`): a unique marker per
+kind is what stops either body exception from silently widening the other.
+`collector_filelog.rs`'s `BODY_EXCEPTIONS` table is the reviewed registry — a
+kind not listed there fails the build, which is the review gate.
+
+For `ci.job.log`, concretely:
 
 - `transform/ci_log_redaction` runs **first** in the `logs` pipeline, ahead of
   `transform/privacy`, and rewrites the body through the ordered scrub-class

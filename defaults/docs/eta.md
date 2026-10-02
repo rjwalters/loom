@@ -249,6 +249,64 @@ drops `features`, then the stage grids, then the stage marks, then every
 remaining list (`detail`), stopping as soon as it fits, and names each drop
 in `truncated`.
 
+### Role-attempt stages: which percentile to read (#9420)
+
+**Read `stages[].distribution.p50` directly.** Every percentile in an
+`eta-explanation/v1` distribution is already **conditioned on attempts that
+did the stage's work**; there is no second, unconditioned pair to choose
+between, and nothing a consumer has to filter.
+
+That matters because the obvious *other* source for the same question is not
+conditioned. A percentile query over the `loom.role_attempt` **spans** —
+SigNoz, a dashboard, the 30-day `stage-durations` aggregate — reads a
+population dominated by attempts that did nothing, and its median is
+milliseconds:
+
+| population | measured | p50 |
+|---|---|---|
+| all `loom.role_attempt` spans | SigNoz, 30 d, 2026-09-28 (#9420) | builder **0 ms**, judge ≈36 ms, doctor ≈31 ms, curator ≈32 ms |
+| all role-runner ticks | this host's `role_tick.outcome` journals, every workspace root, 2026-09-18…10-02, n=130,657 | champion / curator / doctor / judge **0 s** (80.4% of ticks never launched a session; 92,869 are `skipped_pool_exhausted`) |
+| ticks that launched a session | same journals, n=25,668 | champion 88 s, curator 84 s, doctor 27 s, judge 32 s |
+| `sweep.outcome` phase durations (what the estimator reads) | same host and window, n=2,810 phase samples | builder 1334 s, curator 104 s, judge 419 s, doctor 870 s — only 2 rows (both `curator`) are 0 s |
+
+Two things make the all-attempts median an artefact rather than a fast
+median: a role-runner tick that **never launched a child session** (on this
+host overwhelmingly `skipped_pool_exhausted` — it closes in well under a
+second), and a **synthetic** completion span, which Loom emits at the instant
+it observes a checkpoint whose start it never watched, with
+`started_at == ended_at` and therefore a duration of exactly zero. That
+second shape is the builder `0/0/0/0` row: not a fast distribution, no
+distribution at all.
+
+So, by surface:
+
+- **`eta-explanation/v1`** — `p50` is the conditioned value. The estimator
+  reads `sweep.outcome` phase durations and forge label timelines, which are
+  worked-only by construction (a phase duration exists because the phase
+  ran) apart from the rare zero-second role phase — a phase marked complete
+  without having run — and `StageSamples::select` **refuses** every sample
+  marked `worked = false`, those included. If the refusal leaves a stage
+  under the sample floor the answer is `no_estimate_reason:
+  insufficient_samples` — explicitly unmeasured, never a value scraped from a
+  handful of no-ops.
+- **A `loom.role_attempt` span query** — you **must** add
+  `loom.attempt.worked = "true"`. The attribute is `"true"` when the span's
+  interval measures an attempt that ran the stage's work, `"false"` when it
+  provably does not (no session launched; a synthetic zero-duration
+  completion), and **absent** when undetermined — the same "unknown is not
+  zero" rule every measured span attribute follows, so `!= "false"` and
+  `= "true"` are different questions. Without the filter the p50 is the
+  millisecond artefact above, and the p95 is the only percentile carrying
+  real work.
+
+`story.*` spans (`story.queue_dwell`, `story.review_wait`, …) do **not** have
+this shape and need no such filter: Loom emits none of them — it only derives
+and accepts their ids, the 2am storyline reconciler emits them — and each
+exists because its transition happened. The 2026-09-28 `story.review_wait`
+figures (≈14 min p50 against ≈8.9 h p95) are a genuine long tail in real
+waits, a different phenomenon with a different remedy, not a no-op
+population.
+
 ## No-estimate reasons
 
 | reason | when |
@@ -511,14 +569,32 @@ answers, against `signoz_logs.distributed_logs_v2`:
   is what says whether the figures below rest on anything.
 - **Q1**: MAE, 25–75 coverage and bias per heuristic, revision, kind, repo
   and horizon bucket.
-- **Q2**: mean pinball loss per heuristic × kind, and per revision.
+- **Q2**: mean pinball loss per heuristic × kind, and per revision. `ROLLUP`
+  supplies the subtotals, and `rolled_up` says how many of the three
+  dimensions a given row aggregated away — **0 is a real group, 3 is the grand
+  total**. Read it: ROLLUP blanks an aggregated column to `''`, which is also
+  what a record with no `loom.eta.heuristic` reads as, so the query can emit
+  two rows with the identical key `('', '', '')`.
 - **Q3**: feature ranking. Each outcome joins its estimate on
   `loom.eta.estimate_id`, and every numeric feature is correlated with the
-  error (`rankCorr`, `corr`).
+  error (`rankCorr`, `corr`). Two traps, both measured on the engine rather
+  than reasoned about:
+  - A feature that **never varied** scores `rank_corr` = **0.5**, not 0 and
+    not `nan` — `rankCorr` average-ranks ties — while `pearson_corr` is `nan`.
+    `distinct_values` = 1 is what identifies it. Since the section orders by
+    `abs(rank_corr)`, an unvarying feature outranks any genuine correlation
+    weaker than 0.5.
+  - The estimate side carries the same `since` bound as the outcome side, so a
+    scored outcome whose **estimate predates the window** appears in section 0,
+    Q1 and Q2 but contributes no features here. Widen `since` past the longest
+    lead time before treating a ranking as complete.
 
 Q1–Q3 group by `(heuristic, revision)` as well as by heuristic, so a daemon
 roll shows as two rows, and all three exclude rows with incomplete
 provenance. Every `loom.eta.*` attribute they read is pinned to the emitted
 schema by `loom-daemon/tests/eta_artifacts.rs`, so a renamed or dropped
 attribute fails CI here rather than silently returning empty columns in
-SigNoz.
+SigNoz. `loom-daemon/tests/signoz_eta_queries.rs` goes further: it executes the
+whole file verbatim against the pinned ClickHouse the SigNoz trial deploys and
+checks the answers, with the mutation of the committed SQL that breaks each one
+run as a counterfactual.

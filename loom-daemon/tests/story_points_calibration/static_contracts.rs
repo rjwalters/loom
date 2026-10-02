@@ -28,13 +28,12 @@
 //! CAL1 must report zeros, not fabricate warmth).
 //!
 //! One documented substitution: the fixture's `issue_landed_size` is a
-//! shape-compatible view whose LSI is NULL — exactly what the committed
-//! `landed-size.sql` view yields under its current `v0-unfitted` parameter
-//! set — because the SQLite bundled into CI lacks the math functions
-//! (`ln`, `exp`) that D1 provides and that view needs. The calibration
-//! queries' own arithmetic needs none (class bounds compare squares in
-//! exact integer arithmetic), so everything except the LSI column is
-//! executed as committed.
+//! shape-compatible view whose LSI is NULL — the committed `landed-size.sql`
+//! view is fitted now (`v1-2026-10-02`, #9934), but the SQLite bundled into
+//! CI lacks the math functions (`ln`, `exp`) that D1 provides and that view
+//! needs. The calibration queries' own arithmetic needs none (class bounds
+//! compare squares in exact integer arithmetic), so everything except the
+//! LSI column is executed as committed.
 #![allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 
 use super::shared::{split_statements, QUERIES, QUESTION_IDS};

@@ -128,6 +128,8 @@ fn debt_sums_review_changes_and_merge() {
         review: axis(3),
         changes: None,
         merge: axis(4),
+        // The back-off reads the fresh aggregate, never the #9414 width view.
+        ..HostDebt::default()
     };
     assert_eq!(debt_from(&host).unwrap().total, 7);
 }
