@@ -300,7 +300,10 @@ fn run_fetch(params: FetchParams) -> Result<()> {
     // behavior change has to re-key the cache (#9848 review finding).
     let adapter: Box<dyn adapter::RetrievalAdapter> = match adapter_name.as_str() {
         "fake" => Box::new(adapter::FakeAdapter::default()),
-        "augment" => Box::new(adapter::AugmentAdapter::from_env()),
+        "augment" => Box::new(
+            adapter::AugmentAdapter::from_env()
+                .with_pinned_tree(std::env::current_dir()?, source_rev.clone()),
+        ),
         other => bail!("unknown adapter {other:?} (want `augment` or `fake`)"),
     };
     let mut input = key::InputSnapshot {

@@ -255,8 +255,8 @@ impl DirectTransport for HttpDirectTransport {
 /// The DirectContext client: exact endpoint payloads per the SDK, with the
 /// SDK's retry semantics (stable request id across retries of one call;
 /// 499/503/5xx retriable) and bounded attempts.
-pub struct DirectClient {
-    pub transport: Box<dyn DirectTransport>,
+pub struct DirectClient<'a> {
+    pub transport: &'a dyn DirectTransport,
     pub session_id: String,
     /// Backoff between retries; zero in tests.
     pub backoff: std::time::Duration,
@@ -265,8 +265,8 @@ pub struct DirectClient {
     pub wait_policy: WaitPolicy,
 }
 
-impl DirectClient {
-    pub fn new(transport: Box<dyn DirectTransport>) -> Self {
+impl<'a> DirectClient<'a> {
+    pub fn new(transport: &'a dyn DirectTransport) -> Self {
         Self {
             transport,
             session_id: uuid::Uuid::new_v4().to_string(),
@@ -520,8 +520,8 @@ mod tests {
         }
     }
 
-    fn client(mock: Arc<MockTransport>) -> DirectClient {
-        let mut c = DirectClient::new(Box::new(mock));
+    fn client<'a>(mock: &'a Arc<MockTransport>) -> DirectClient<'a> {
+        let mut c = DirectClient::new(mock.as_ref());
         c.backoff = std::time::Duration::ZERO;
         c.wait_policy = WaitPolicy {
             initial: std::time::Duration::ZERO,
@@ -556,7 +556,7 @@ mod tests {
             "unknown_memory_names": ["b1"],
             "nonindexed_blob_names": ["b2"],
         }))]));
-        let c = client(mock.clone());
+        let c = client(&mock);
         // Indexing step: include_non_indexed = false -> unknown only.
         let missing = c.find_missing(&["b1".into(), "b2".into()], false).unwrap();
         assert_eq!(missing, vec!["b1"]);
@@ -571,7 +571,7 @@ mod tests {
             "unknown_memory_names": [],
             "nonindexed_blob_names": ["b2"],
         }))]));
-        let c = client(mock.clone());
+        let c = client(&mock);
         // Indexing-wait step: both lists count as pending.
         let pending = c.find_missing(&["b2".into()], true).unwrap();
         assert_eq!(pending, vec!["b2"]);
@@ -594,7 +594,7 @@ mod tests {
             // wait_for_indexing poll: everything indexed.
             Ok(json!({"unknown_memory_names": [], "nonindexed_blob_names": []})),
         ]));
-        let c = client(mock.clone());
+        let c = client(&mock);
         let checkpoint = ensure_index(&c, &set).unwrap();
         assert_eq!(checkpoint, "cp-1");
         let calls = mock.calls();
@@ -625,7 +625,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new(vec![Ok(json!({
             "formatted_retrieval": "…evidence…"
         }))]));
-        let c = client(mock.clone());
+        let c = client(&mock);
         let text = retrieve(&c, "cp-1", "implementation sites for x", Some(20_000)).unwrap();
         assert_eq!(text, "…evidence…");
         let calls = mock.calls();
@@ -646,13 +646,13 @@ mod tests {
             Err(DirectError::http(503, "unavailable")),
             Ok(json!({"formatted_retrieval": "ok"})),
         ]));
-        let c = client(mock.clone());
+        let c = client(&mock);
         assert_eq!(retrieve(&c, "cp", "q", None).unwrap(), "ok");
         assert_eq!(mock.calls().len(), 3);
 
         // 401 is not retriable → single attempt, loud failure.
         let mock = Arc::new(MockTransport::new(vec![Err(DirectError::http(401, "denied"))]));
-        let c = client(mock.clone());
+        let c = client(&mock);
         let err = retrieve(&c, "cp", "q", None).unwrap_err();
         assert_eq!(err.status, Some(401));
         assert!(!err.retryable());
@@ -679,7 +679,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new(vec![Ok(
             json!({"unknown_memory_names": [], "nonindexed_blob_names": ["b1"]}),
         )]));
-        let c = client(mock.clone());
+        let c = client(&mock);
         let err = c.wait_for_indexing(&["b1".into()]).unwrap_err();
         assert!(err.message.contains("indexing timeout"));
         assert!(err.message.contains("1 blob(s) still pending"));
