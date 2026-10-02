@@ -48,6 +48,21 @@ pub struct CycleSummary {
     /// emitted no suite spans" and "this leg ran no suites" look identical.
     #[serde(default)]
     pub suite_artifact_failures: usize,
+    /// `loom.ci.test` spans emitted this cycle (#9456). Deliberately far
+    /// below the leg's test count: only the slow tail is emitted, see
+    /// `nextest::MAX_TEST_SPANS_PER_JOB`.
+    #[serde(default)]
+    pub test_spans_emitted: usize,
+    /// JUnit test-timings artifacts read, parsed and paired with a job this
+    /// cycle.
+    #[serde(default)]
+    pub test_records_read: usize,
+    /// JUnit test-timings artifacts that could NOT be turned into spans — a
+    /// failed download, a file that is not JUnit or holds no `<testcase>`, or
+    /// a name whose family + shard matched no unique job. Counted rather than
+    /// silent, for the same reason as `suite_artifact_failures`.
+    #[serde(default)]
+    pub test_artifact_failures: usize,
     /// Emitted runs also stitched into their issue's story trace (#9088).
     #[serde(default)]
     pub story_runs_stitched: usize,
