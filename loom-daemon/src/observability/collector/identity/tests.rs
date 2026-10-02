@@ -80,10 +80,9 @@ fn delayed_launch_survives_partial_reads_and_produces_dashboard_fixture() {
     );
     let envelope = TelemetryEnvelope::new("host-a", TelemetryRecord::SweepIdentity(record));
     assert_eq!(envelope.schema_version, 4);
-    let expected: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../../dashboard/test/fixtures/sweep-identity.json"
-    ))
-    .unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../tests/fixtures/sweep-identity.json"))
+            .unwrap();
     assert_eq!(serde_json::to_value(envelope.record).unwrap(), expected);
     // Later child role launches must not relabel the sweep's own launch.
     writeln!(file, "# LOOM_LAUNCH {{\"runtime\":\"codex\",\"model\":\"other\"}}").unwrap();

@@ -85,7 +85,6 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       mcp: ${{ steps.filter.outputs.mcp }}
       scripts: ${{ steps.filter.outputs.scripts }}
-      dashboard: ${{ steps.filter.outputs.dashboard }}
       docker: ${{ steps.filter.outputs.docker }}
       # Whether anything in this PR can be measured by a gate that runs the
       # shared debug daemon. Computed below, not a raw paths-filter output.
@@ -128,13 +127,6 @@ jobs:
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
-          # `non_dashboard` below is the only filter here with a negated
-          # pattern, and a negation needs a quantifier that knows what `!`
-          # means. `some-with-excludes` is "at least one non-negated pattern
-          # matches AND no negated pattern matches", so for a filter with no
-          # `!` pattern it is byte-for-byte the default `some` — every filter
-          # below keeps the exact semantics it had before #9113.
-          predicate-quantifier: some-with-excludes
           filters: |
             backend:
               - 'loom-daemon/**'
@@ -158,35 +150,6 @@ jobs:
             mcp:
               - 'mcp-loom/**'
               - '.github/workflows/ci.yml'
-            dashboard:
-              - 'dashboard/**'
-              - '.github/workflows/ci.yml'
-            # Does the PR touch anything OUTSIDE dashboard/? (#9113)
-            #
-            # Not `dashboard == 'true'` inverted: a PR touching BOTH the
-            # dashboard and the daemon must still build the daemon, and
-            # `dashboard` is true for both. This asks the question that
-            # actually matters -- "is there any non-dashboard file here" --
-            # so a mixed PR answers true on its non-dashboard half.
-            #
-            # An exclusion is final in `some-with-excludes` (a file excluded
-            # by `!dashboard/**` cannot be re-included by a later pattern),
-            # which is why dashboard shell has its own filter rather than a
-            # re-inclusion here.
-            non_dashboard:
-              - '**'
-              - '!dashboard/**'
-            # The Shell Budget Ratchet measures EVERY tracked `.sh`, including
-            # dashboard/scripts/check-deploy-config.sh (category `contract`,
-            # inside the portable budget) and dashboard/scripts/ensure-web-dist.sh
-            # (`settled`), and it FAILS on any `.sh` with no allowlist entry.
-            # So a dashboard-only PR that adds, deletes or grows a shell script
-            # is a PR that gate can fail on -- ci-principles.md rule 3: a check
-            # that can fail because of a file outside its path group must not
-            # be filtered by path.
-            dashboard_shell:
-              - 'dashboard/*.sh'
-              - 'dashboard/**/*.sh'
             docker:
               - 'docker/**'
               - '.dockerignore'
@@ -229,39 +192,16 @@ jobs:
 
       # Does this run need the shared debug daemon built at all? (#9113)
       #
-      # One output, computed once, so the ten places that consume the
-      # `loom-daemon-debug` artifact all ask the same question and cannot
-      # drift apart. It is false ONLY for a PR that is entirely inside
-      # dashboard/ and carries no shell script -- i.e. a PR on which no gate
-      # that runs the daemon could fail.
-      #
-      # `backend` and `scripts` are OR'd in to keep one invariant absolute:
-      # every job that downloads the artifact must have had it produced.
-      # `scripts` matches `**/package.json`, which DOES match
-      # dashboard/package.json -- without this term a PR touching only
-      # dashboard/package.json would run Installer Integration Tests and both
-      # Native Port Suites jobs against an artifact nobody built.
-      #
-      # Consumers read `!= 'false'`, never `== 'true'`, so every ambiguous
-      # state fails CLOSED: on a push this job does not run at all and the
-      # output is empty, and if the filter above errors it is empty too --
-      # both build the daemon and run every gate.
+      # Always true now that `dashboard/` (the one path group that could make
+      # it false) moved to `2AMLogic/loom-ui` (#9104). The output is kept so
+      # the ten consumers keep asking one question; they read `!= 'false'`,
+      # so every ambiguous state still fails CLOSED.
       - name: Decide whether the shared debug daemon is needed
         id: daemon
-        env:
-          NON_DASHBOARD: ${{ steps.filter.outputs.non_dashboard }}
-          DASHBOARD_SHELL: ${{ steps.filter.outputs.dashboard_shell }}
-          BACKEND: ${{ steps.filter.outputs.backend }}
-          SCRIPTS: ${{ steps.filter.outputs.scripts }}
         run: |
           set -euo pipefail
-          needed=false
-          if [[ "$NON_DASHBOARD" == 'true' || "$DASHBOARD_SHELL" == 'true' \
-             || "$BACKEND" == 'true' || "$SCRIPTS" == 'true' ]]; then
-            needed=true
-          fi
-          echo "daemon needed=$needed (non_dashboard=$NON_DASHBOARD dashboard_shell=$DASHBOARD_SHELL backend=$BACKEND scripts=$SCRIPTS)"
-          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+          echo "daemon needed=true"
+          echo "needed=true" >> "$GITHUB_OUTPUT"
 
   build-daemon:
     name: Build loom-daemon (debug, shared)
@@ -271,10 +211,8 @@ jobs:
     # the jobs themselves dropped to 9-24s once they downloaded the binary
     # instead.
     #
-    # Skipped on a dashboard-only PR (#9113) -- and ONLY there. `changes.daemon`
-    # is false exactly when no gate that runs this binary could fail on the
-    # PR's files; see its comment above for why that is a stricter question
-    # than `dashboard == 'true'`.
+    # `changes.daemon` is now always true (the `dashboard/`-only skip of #9113
+    # left with `dashboard/`, #9104); consumers still read `!= 'false'`.
     #
     # This does NOT make the gates it feeds skippable, which is the trap
     # #9113's original proposal walked into. Daemon Checks is a REQUIRED
@@ -332,10 +270,9 @@ jobs:
   node-packages:
     name: Node Packages (MCP server, dashboard)
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.mcp == 'true' || needs.changes.outputs.dashboard == 'true')
-    # MCP Server Build and Dashboard Tests share one runner and one Node
-    # setup (#9065). Each half still runs only when its own path group
-    # changed (or on push), exactly as when they were separate jobs.
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.mcp == 'true')
+    # The dashboard half moved to `2AMLogic/loom-ui` (#9104); the display
+    # name below is kept as-is so a required-check context is not renamed.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -353,28 +290,6 @@ jobs:
       - name: Verify build output
         if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.mcp == 'true') }}
         run: test -f mcp-loom/dist/index.js
-      # --- Dashboard Tests (Workers backend + web UI) ---
-      # 442 tests (#4849) across two runtimes that were previously unwired: the
-      # Cloudflare Workers backend (dashboard/, 152 Miniflare/vitest-pool-workers
-      # tests — no Cloudflare credentials needed, runs against local D1 + DO
-      # simulation) and the dashboard UI (dashboard/web/, 290 happy-dom tests).
-      # `npm run check:all` runs both in one command (backend typecheck+test,
-      # then `web`'s typecheck+test via --prefix); `dashboard/package.json`'s
-      # `pretest` hook already runs `scripts/ensure-web-dist.sh` first, since
-      # Wrangler will not parse `wrangler.toml` (and therefore Miniflare will not
-      # boot) until `web/dist/` exists.
-      - name: Install backend dependencies
-        if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.dashboard == 'true') }}
-        run: npm ci
-        working-directory: dashboard
-      - name: Install web UI dependencies
-        if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.dashboard == 'true') }}
-        run: npm ci
-        working-directory: dashboard/web
-      - name: Run backend (Miniflare) + web (happy-dom) suites
-        if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.dashboard == 'true') }}
-        run: npm run check:all
-        working-directory: dashboard
 
   backend-lint-and-check:
     name: Rust Linting & Build Check
@@ -1152,10 +1067,8 @@ jobs:
       #
       # `daemon != 'false'` is the one predicate it is allowed to sit behind,
       # because that predicate is built from this gate's own reach rather than
-      # from a file group: it is false only when every changed file is under
-      # `dashboard/` AND none of them is a `.sh`. This gate measures every
-      # tracked `.sh` including dashboard's two, so dashboard shell is exactly
-      # what `changes.dashboard_shell` exists to keep out of the skip.
+      # from a file group (it is now always true; the `dashboard/`-only skip
+      # case left with `dashboard/` for `2AMLogic/loom-ui`, #9104).
       #
       # It measures the pool epic #7810 is retiring — `contract` + `hook-entry`,
       # whose logic moves into the daemon behind a stub — rather than total

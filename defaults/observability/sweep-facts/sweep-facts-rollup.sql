@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS sweep_facts (
 -- Envelope-level fields (emitted_at, host_id, schema_version, repo, issue,
 -- sweep_id) are columns of `records` (migrations/0001_init.sql) and are read
 -- from there; everything else is read out of the verbatim JSON payload with
--- json_extract — the same read surface `dashboard/src/query.ts` and the
+-- json_extract — the same read surface `loom-ui:src/query.ts` and the
 -- issue-level analysis queries already use.
 --
 -- The WHERE clause is the grain: identity columns must be present. An absent

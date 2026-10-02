@@ -290,8 +290,8 @@ async fn handle_event(
 ///
 /// The backend ingests `sweep.outcome` with `INSERT OR IGNORE` against a
 /// partial `UNIQUE(kind, sweep_id)` index — `idx_records_terminal_sweep_once`,
-/// declared in `dashboard/migrations/0002_idempotent_terminal_records.sql` and
-/// applied by `dashboard/src/index.ts` — so the FIRST writer for a given
+/// declared in `loom-ui:migrations/0002_idempotent_terminal_records.sql` and
+/// applied by `loom-ui:src/index.ts` — so the FIRST writer for a given
 /// `sweep_id` wins and every later one is silently absorbed. Two independent
 /// paths write that same `(kind="sweep.outcome", sweep_id)` for one terminal
 /// sweep transition:
@@ -1403,7 +1403,7 @@ fn sample_role_tick_health(records: &[RoleTickRecord]) -> RoleTickHealth {
 /// # Why `halt_reason` carries scalars ONLY — never the attribution
 ///
 /// `halt_reason` is an unconditional member of `host.health`'s **public**
-/// allowlist (`RECORD_FIELD_ALLOWLIST` in `dashboard/src/redaction.ts`), copied
+/// allowlist (`RECORD_FIELD_ALLOWLIST` in `loom-ui:src/redaction.ts`), copied
 /// verbatim into every unauthenticated fleet response. `top_cpu_consumers` is
 /// deliberately **not** in that allowlist — `redactAdmissionBrakeRow` drops it,
 /// because a list of executable basenames is workload detail that has no safe
@@ -1422,7 +1422,7 @@ fn sample_role_tick_health(records: &[RoleTickRecord]) -> RoleTickHealth {
 ///
 /// Pinned end-to-end by
 /// `the_halt_reason_never_carries_process_attribution_past_the_public_boundary`
-/// below and by `dashboard/test/redactionAdmissionBrake.test.ts`'s
+/// below and by `loom-ui:test/redactionAdmissionBrake.test.ts`'s
 /// "no process name survives" case, which assert the two halves of the same
 /// boundary (Judge finding on PR #8547).
 fn dispatch_halt_from_breaker(
