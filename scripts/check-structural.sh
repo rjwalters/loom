@@ -54,15 +54,30 @@
 #     splits on whitespace and will not `eval`;
 #   - a gate whose script is not present in this tree (a consumer repo, or a
 #     workflow ahead of the checkout);
-#   - a gate that exited 127, the conventional "a command it needs is not on
-#     PATH" status. `check-doc-anchors.sh` exits it deliberately when `lychee`
-#     is absent, and CI installs a pinned lychee that a dev host has no reason
-#     to have. A missing tool is "could not check", not "checked and failed" —
-#     reporting it as a red gate forever would train a Builder to ignore the
-#     phase, which is worse than the gap. CI still enforces it for real.
+#   - a gate that exited 78 (`EX_CONFIG`), the REQUIRED-TOOL-ABSENT sentinel.
+#     `check-doc-anchors.sh` exits it deliberately when `lychee` is absent, and
+#     CI installs a pinned lychee that a dev host has no reason to have. A
+#     missing tool is "could not check", not "checked and failed" — reporting it
+#     as a red gate forever would train a Builder to ignore the phase, which is
+#     worse than the gap. CI still enforces it for real.
 # Skips are counted and printed. They never turn a red gate green, and they are
 # never silent — a runner that cannot tell "checked, fine" from "could not
 # check" reports OK forever.
+#
+# WHY THE SENTINEL IS 78 AND NOT 127 (#9494). Until #9494 the arm above keyed on
+# 127, and that arm was wider than its own subject. 127 is not a private
+# sentinel: it is what `set -e` returns from ANY `command not found` inside a
+# gate and what bash returns for a missing interpreter. So a gate that was
+# simply BROKEN got reported as "could not check" — indistinguishable from the
+# deliberate lychee case, and fail-open in exactly the place honesty is this
+# runner's entire job. 78 is reachable only by an explicit `exit 78`, and it is
+# already this repo's "required part of the environment is absent" code
+# (spawn-claude.sh on an empty token pool, spawn-worker.sh on an unknown
+# runtime). 127 is therefore a FAIL again, with a NOTE naming both readings so
+# the author of a new sentinel is told which code to use instead. Keying on the
+# exit code rather than on a matched marker line keeps every gate's own output
+# streaming straight to the terminal, unbuffered and uncaptured, which is the
+# property that makes a failing gate readable.
 #
 # Usage:
 #   check-structural.sh                    Run every gate. Exit 1 if any failed.
@@ -90,6 +105,9 @@ set -euo pipefail
 
 WORKFLOW_DEFAULT=".github/workflows/ci.yml"
 JOB_NAME_DEFAULT="Structural Checks"
+# The one status a gate may use to say "a tool I require is not installed", and
+# so be reported SKIP rather than FAIL. See the header note on why it is not 127.
+TOOL_ABSENT_RC=78
 
 WORKFLOW=""
 JOB_NAME="$JOB_NAME_DEFAULT"
@@ -247,12 +265,18 @@ run_gates() {
     if [[ "$rc" -eq 0 ]]; then
       printf '[structural] PASS  (%ss)  %s\n' "$elapsed" "$cmd"
       passed=$((passed + 1))
-    elif [[ "$rc" -eq 127 ]]; then
-      # 127 = a command the gate needs is not on PATH. "Could not check", not
-      # "checked and failed" — see the header's skip table.
-      printf '[structural] SKIP  %s  — exited 127: a command it needs is not on PATH\n' "$cmd"
+    elif [[ "$rc" -eq "$TOOL_ABSENT_RC" ]]; then
+      # 78 (EX_CONFIG) = the gate declares a tool it requires is not installed.
+      # "Could not check", not "checked and failed" — see the header's skip
+      # table, and the header note on why this is not 127.
+      printf '[structural] SKIP  %s  — exited %s (EX_CONFIG): a tool it requires is not installed\n' \
+        "$cmd" "$TOOL_ABSENT_RC"
       skipped=$((skipped + 1))
     else
+      if [[ "$rc" -eq 127 ]]; then
+        printf '[structural] NOTE  exit 127 means a command INSIDE this gate was not found — a broken gate, counted as FAIL.\n' >&2
+        printf '[structural] NOTE  A deliberate "required tool absent" sentinel must exit %s (EX_CONFIG) to be skipped (#9494).\n' "$TOOL_ABSENT_RC" >&2
+      fi
       printf '[structural] FAIL  (%ss, exit %s)  %s\n' "$elapsed" "$rc" "$cmd"
       failed=$((failed + 1))
       failed_names+=("$cmd")
@@ -289,7 +313,11 @@ self_test() {
   printf '#!/usr/bin/env bash\nexit 0\n' >"$tmp/scripts/ok-one.sh"
   printf '#!/usr/bin/env bash\nexit 0\n' >"$tmp/scripts/ok-two.sh"
   printf '#!/usr/bin/env bash\necho "fixture gate is angry" >&2\nexit 1\n' >"$tmp/scripts/bad.sh"
-  printf '#!/usr/bin/env bash\necho "fixture: no such tool" >&2\nexit 127\n' >"$tmp/scripts/needs-tool.sh"
+  printf '#!/usr/bin/env bash\necho "fixture: SKIP - no such tool" >&2\nexit 78\n' >"$tmp/scripts/needs-tool.sh"
+  # The #9494 pair to needs-tool.sh: a gate that is simply BROKEN. `set -e` plus
+  # a command that does not exist is how a real gate reaches 127, and it must
+  # read as FAIL, not as "could not check".
+  printf '#!/usr/bin/env bash\nset -euo pipefail\nnot-a-real-command-9494\n' >"$tmp/scripts/broken.sh"
 
   cat >"$tmp/.github/workflows/fixture.yml" <<'YAML'
 name: CI
@@ -311,6 +339,7 @@ jobs:
           bash scripts/ok-two.sh
           bash scripts/bad.sh
           bash scripts/needs-tool.sh
+          bash scripts/broken.sh
       - name: provisioning, not a gate
         run: |
           echo "PATH bash: $(command -v bash)"
@@ -336,6 +365,7 @@ YAML
 RUN   bash scripts/ok-two.sh
 RUN   bash scripts/bad.sh
 RUN   bash scripts/needs-tool.sh
+RUN   bash scripts/broken.sh
 SKIP  bash scripts/ok-one.sh --forbid-bump  --base \"\${{ github.event.pull_request.base.sha }}\"  --head \"\${{ github.event.pull_request.head.sha }}\"  [needs the Actions workflow context (\${{ … }} expression)]
 SKIP  bash scripts/not-in-this-tree.sh  [scripts/not-in-this-tree.sh is not present in this tree]"
 
@@ -355,20 +385,31 @@ SKIP  bash scripts/not-in-this-tree.sh  [scripts/not-in-this-tree.sh is not pres
     echo "SELF-TEST FAIL: expected exit 1 from a fixture with one failing gate, got $rc" >&2
     printf '%s\n' "$out" >&2
     fails=$((fails + 1))
-  elif ! printf '%s\n' "$out" | grep -F "2 passed, 1 failed, 3 skipped" >/dev/null; then
-    echo "SELF-TEST FAIL: expected '2 passed, 1 failed, 3 skipped' in the summary" >&2
+  elif ! printf '%s\n' "$out" | grep -F "2 passed, 2 failed, 3 skipped" >/dev/null; then
+    echo "SELF-TEST FAIL: expected '2 passed, 2 failed, 3 skipped' in the summary" >&2
     printf '%s\n' "$out" >&2
     fails=$((fails + 1))
   elif ! printf '%s\n' "$out" | grep -F "fixture gate is angry" >/dev/null; then
     echo "SELF-TEST FAIL: the failing gate's own output was not surfaced" >&2
     printf '%s\n' "$out" >&2
     fails=$((fails + 1))
-  elif ! printf '%s\n' "$out" | grep -F "exited 127" >/dev/null; then
-    echo "SELF-TEST FAIL: a gate exiting 127 must be reported as a SKIP, not counted as a failure" >&2
+  elif ! printf '%s\n' "$out" | grep -F "exited 78 (EX_CONFIG)" >/dev/null; then
+    echo "SELF-TEST FAIL: a gate exiting 78 (EX_CONFIG) must be reported as a SKIP, not counted as a failure" >&2
+    printf '%s\n' "$out" >&2
+    fails=$((fails + 1))
+  elif ! printf '%s\n' "$out" | grep -E '^\[structural\] FAIL .*exit 127.*broken\.sh' >/dev/null; then
+    # #9494: the narrowing. A gate that reaches 127 by `command not found` is
+    # BROKEN, and must be counted as a failure rather than skipped as
+    # "could not check" — the old arm skipped it.
+    echo "SELF-TEST FAIL: a gate exiting 127 (command not found) must be a FAIL, not a SKIP" >&2
+    printf '%s\n' "$out" >&2
+    fails=$((fails + 1))
+  elif ! printf '%s\n' "$out" | grep -F "sentinel must exit 78" >/dev/null; then
+    echo "SELF-TEST FAIL: a 127 FAIL must NOTE that the tool-absent sentinel is 78, not 127" >&2
     printf '%s\n' "$out" >&2
     fails=$((fails + 1))
   else
-    echo "  ok: ran past the failure, surfaced its output, skipped the 127, exited 1"
+    echo "  ok: ran past the failure, surfaced its output, skipped the 78, FAILED the 127, exited 1"
   fi
 
   echo "check-structural --self-test: a job with no derivable gate must FAIL, not pass…"
