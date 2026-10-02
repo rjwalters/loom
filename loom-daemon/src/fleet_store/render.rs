@@ -157,8 +157,8 @@ pub fn check_exit_code(drifts: &[Drift]) -> i32 {
 /// `safehouse` and `forge` for ~10 h). The store is the tier's record of
 /// truth, so a legitimate reduction happens — but it must never happen by
 /// default: the caller refuses until the operator names it (`--allow-reduce`,
-/// or `fleet-config adopt --from-disk` to push the blocks INTO the store
-/// first, which is what adopt's `plan()` already does).
+/// or `fleet-config propose adopt [--host <HOST>]` to push the blocks INTO
+/// the store first, which is what adopt's `plan()` already does).
 ///
 /// Returns the lost key names in file order; empty when the file is absent,
 /// unparseable (a separate error class) or the target loses nothing.

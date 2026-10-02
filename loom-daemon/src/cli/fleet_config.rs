@@ -334,7 +334,7 @@ fn cmd_render(
     // The lossy-reduction guard (2am#1653): a machine-tier target that would
     // DROP top-level blocks the file on disk carries is refused unless the
     // operator names it. The store is the tier's record of truth, so the
-    // blocks belong IN the store first (`fleet-config adopt --from-disk`
+    // blocks belong IN the store first (`fleet-config propose adopt`
     // pushes them there) — a silent write that loses `runtimes`/`forge`/
     // `autonomous`/`safehouse` for half a day is the failure this refuses.
     for t in &targets {
@@ -345,7 +345,7 @@ fn cmd_render(
         let msg = format!(
             "{} would DROP top-level block(s) the file on disk carries: {} — the store's \
              fleet/defaults.json never had them. Add them to the store first \
-             (`fleet-config adopt --from-disk` proposes exactly that), or pass \
+             (`fleet-config propose adopt` proposes exactly that), or pass \
              --allow-reduce to accept the loss knowingly.",
             t.tier.name(),
             lost.join(", ")
