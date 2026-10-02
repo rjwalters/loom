@@ -224,7 +224,9 @@ fn collector_keeps_every_session_output_attribute() {
     let log_keep = CONFIG
         .lines()
         .find(|l| {
-            l.contains("keep_keys(attributes, [\"loom.repo\"") && l.contains("loom.ci.chunk_index")
+            l.contains("keep_keys(attributes, [")
+                && l.contains("loom.ci.chunk_index")
+                && l.contains("loom.session.output.event_id")
         })
         .expect("the transform/privacy log keep_keys line");
     for key in SESSION_OUTPUT_LOG_ATTRIBUTE_KEYS {
