@@ -243,7 +243,7 @@ fn gh_changed_files(gh: &str, repo: &str, pr: u32) -> anyhow::Result<Option<Vec<
 }
 
 fn collision_evidence_id(r: &OutcomeRecord) -> anyhow::Result<String> {
-    Ok(super::super::collision_evidence::record_id(r)?)
+    super::super::collision_evidence::record_id(r)
 }
 
 #[cfg(test)]
