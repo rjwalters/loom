@@ -99,22 +99,39 @@ pub struct CandidateSnapshot {
 /// record per unordered pair. The budget bounds the number of pairs
 /// captured this tick (overrun is recorded, never silently dropped); the
 /// off switch produces zero records and a stopped marker without touching
-/// scheduling.
+/// scheduling. Equivalent to [`capture_with_prior`] with nothing captured
+/// before this tick, so `max_pairs_total` only bounds this single call.
 pub fn capture(
     repo: &str,
     tick: &CandidateSnapshotTick,
     budget: &StudyBudgets,
 ) -> Result<Vec<CaptureRecord>> {
+    capture_with_prior(repo, tick, budget, 0)
+}
+
+/// [`capture`] with `prior_captured` pairs already recorded by earlier
+/// ticks of the study: `max_pairs_total` is enforced against
+/// `prior_captured` plus this tick's records, so the global cap holds across
+/// invocations (the caller owns the persisted count — see
+/// [`count_captured_records`]).
+pub fn capture_with_prior(
+    repo: &str,
+    tick: &CandidateSnapshotTick,
+    budget: &StudyBudgets,
+    prior_captured: usize,
+) -> Result<Vec<CaptureRecord>> {
     let mut records = Vec::new();
     if budget.study_stopped {
         return Ok(records);
     }
+    let total_remaining = budget.max_pairs_total.saturating_sub(prior_captured);
+    let tick_cap = budget.max_pairs_per_tick.min(total_remaining);
     let candidates = &tick.candidates;
     let mut captured = 0usize;
     let mut skipped_over_budget = 0usize;
     for i in 0..candidates.len() {
         for j in (i + 1)..candidates.len() {
-            if captured >= budget.max_pairs_per_tick {
+            if captured >= tick_cap {
                 skipped_over_budget += 1;
                 continue;
             }
@@ -128,12 +145,39 @@ pub fn capture(
     if skipped_over_budget > 0 {
         if let Some(last) = records.last_mut() {
             last.notes.push(format!(
-                "budget: {skipped_over_budget} pair(s) beyond max_pairs_per_tick={} were not captured this tick",
-                budget.max_pairs_per_tick
+                "budget: {skipped_over_budget} pair(s) beyond the effective cap {tick_cap} \
+                 (max_pairs_per_tick={}, max_pairs_total={} with {prior_captured} already captured) \
+                 were not captured this tick",
+                budget.max_pairs_per_tick, budget.max_pairs_total
             ));
         }
     }
     Ok(records)
+}
+
+/// Count capture records already persisted in `out_dir` (`*.jsonl` tick
+/// files written by [`write_tick_records`]), for [`capture_with_prior`]. A
+/// missing directory counts as zero; blank lines and the `{"captured":0}`
+/// empty-tick marker are not records.
+pub fn count_captured_records(out_dir: &std::path::Path) -> Result<usize> {
+    let entries = match std::fs::read_dir(out_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let mut total = 0usize;
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        total += std::fs::read_to_string(&path)?
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && *l != "{\"captured\":0}")
+            .count();
+    }
+    Ok(total)
 }
 
 /// One dispatch tick's capture context.
@@ -214,7 +258,9 @@ pub fn pair_record(
 pub struct StudyBudgets {
     /// Maximum pairs captured per dispatch tick.
     pub max_pairs_per_tick: usize,
-    /// Global capture cap for the study.
+    /// Global capture cap for the study, enforced across ticks by callers
+    /// that pass the already-persisted count to [`capture_with_prior`]
+    /// (`capture-live` does, from its output directory).
     pub max_pairs_total: usize,
     /// Minimum positive outcomes required for a non-inconclusive verdict.
     pub min_positives_for_verdict: usize,
@@ -326,6 +372,43 @@ mod tests {
             .map(|r| capture_id(r).unwrap())
             .collect();
         assert_eq!(ids1, ids1_again);
+    }
+
+    #[test]
+    fn global_cap_counts_prior_captures() {
+        let t = tick(vec![
+            candidate(1, &["a"], None),
+            candidate(2, &["a"], None),
+            candidate(3, &["a"], None),
+        ]);
+        let budgets = StudyBudgets {
+            max_pairs_total: 5,
+            ..Default::default()
+        };
+        // 3 pairs available, 4 of 5 already used -> only 1 admitted.
+        let r = capture_with_prior("o/r", &t, &budgets, 4).unwrap();
+        assert_eq!(r.len(), 1);
+        assert!(r[0].notes.iter().any(|n| n.contains("max_pairs_total=5")));
+        // Cap exhausted -> nothing captured.
+        assert!(capture_with_prior("o/r", &t, &budgets, 5)
+            .unwrap()
+            .is_empty());
+        assert!(capture_with_prior("o/r", &t, &budgets, 9)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn count_captured_records_reads_tick_files() {
+        let dir = std::env::temp_dir().join(format!("loom-cs-count-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(count_captured_records(&dir).unwrap(), 0);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.jsonl"), "{\"x\":1}\n\n{\"x\":2}\n").unwrap();
+        std::fs::write(dir.join("b.jsonl"), "{\"captured\":0}\n").unwrap();
+        std::fs::write(dir.join("ignored.txt"), "{\"x\":3}\n").unwrap();
+        assert_eq!(count_captured_records(&dir).unwrap(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

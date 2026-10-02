@@ -223,7 +223,9 @@ fn run_capture_live(
         captured_at: now.to_rfc3339(),
         candidates,
     };
-    let records = capture("rjwalters/loom", &tick, &budget)?;
+    let prior = loom_daemon::collision_shadow::count_captured_records(out_dir)?;
+    let records =
+        loom_daemon::collision_shadow::capture_with_prior("rjwalters/loom", &tick, &budget, prior)?;
     let path = write_tick_records(out_dir, &tick_id, &mut records.clone())?;
     println!(
         "capture-live: {} candidate(s), {} pair record(s) → {}",
