@@ -958,15 +958,15 @@ BRANCH=$(git branch --show-current)
 # The head your work is based on: CLAIM_HEAD_SHA from step 2. Re-pin to
 # $CURRENT_HEAD_SHA ONLY after deliberately rebasing onto a moved head.
 PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-$CLAIM_HEAD_SHA}"
-# If you rebased, run the version-bearing-file sync gate first (#7168/#7341 —
-# the `version-check-gate.sh` call in the merge-conflict recipes) and abort on
-# a mismatch; a rebase silently absorbs the new head's version values.
+if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
+  echo "Aborting: version-bearing files out of sync after rebase (see BLOCKER:/Fix:)." >&2
+  exit 1
+fi
 [ -n "$PUSH_LEASE_SHA" ] || { echo "No pin: do NOT push. Re-read the real head (git ls-remote origin refs/heads/$BRANCH); it must be what you built on." >&2; exit 1; }
 git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"
 ```
 
-An unresolvable expected value is rejected, so the pinned form fails closed
-where the bare one fails open.
+An unresolvable expected value is rejected: the pinned form fails closed.
 
 **Never hand-patch VERSION/CLAUDE.md/`Cargo.toml`/… to "re-add a bump the rebase
 dropped"**, and never run `./scripts/version.sh bump …` here even if the gate's
