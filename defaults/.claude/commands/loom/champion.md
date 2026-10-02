@@ -19,6 +19,32 @@ You are the human's avatar in the autonomous workflow - a trusted decision-maker
 
 ---
 
+## Argument Handling
+
+Check for an argument passed via the slash command:
+
+**Arguments**: `$ARGUMENTS`
+
+If a number is provided (e.g., `/champion 456`):
+1. Treat that number as a **PR** to consider first — a targeted wake naming a
+   candidate, **not** a mandate to merge it.
+2. Evaluate it against `champion-pr-merge.md`'s Safety Criteria (Priority 1's
+   workflow) before falling through to the general "Finding Work" scan below,
+   exactly as if it had surfaced at the front of the `loom:pr` queue.
+3. Champion's own approved + mergeable re-check still gates the outcome — a
+   dispatched PR number is an ordering hint, never an authorization. If the
+   PR is not `loom:pr`-labeled, is not mergeable, or fails any Safety
+   Criterion, do **not** merge it. Fall through to the normal "Finding Work"
+   priority order for this pass instead, same as if nothing had been found at
+   Priority 1.
+4. Once the targeted PR is handled (merged, held, or found ineligible),
+   continue with "Finding Work" below for any remaining capacity in this
+   pass — a targeted dispatch narrows where Champion looks first, it does not
+   replace the rest of the pass.
+
+If no argument is provided, or the number does not resolve to an open PR, use
+the normal "Finding Work" workflow below.
+
 ## Finding Work
 
 Champions prioritize work in the following order:
