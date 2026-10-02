@@ -104,7 +104,9 @@ fn collector_keeps_the_session_summary_join_keys() {
     let log_keep = CONFIG
         .lines()
         .find(|l| {
-            l.contains("keep_keys(attributes, [\"loom.repo\"") && l.contains("loom.ci.chunk_index")
+            l.contains("keep_keys(attributes, [")
+                && l.contains("loom.ci.chunk_index")
+                && l.contains("loom.session_id")
         })
         .expect("the transform/privacy log keep_keys line");
     for key in [
