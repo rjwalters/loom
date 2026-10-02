@@ -523,6 +523,76 @@ fn ac6_ungated_roles_ignore_the_queue_probe() {
     }
 }
 
+// -- queue kind: a REST issues listing returns PRs too (#9929) -------------
+
+/// A listing row, PR or issue, carrying `labels`.
+fn row(number: u32, is_pr: bool, labels: &[&str]) -> crate::forge_listing::RestIssue {
+    crate::forge_listing::RestIssue {
+        number,
+        title: None,
+        labels: labels.iter().map(|l| (*l).to_string()).collect(),
+        created_at: None,
+        updated_at: None,
+        closed_at: None,
+        state: "open".to_string(),
+        body: None,
+        author: None,
+        is_pull_request: is_pr,
+    }
+}
+
+#[test]
+fn queue_label_kinds_follow_the_pr_lifecycle_labels() {
+    for label in ["loom:review-requested", "loom:changes-requested", "loom:pr"] {
+        assert!(queue_label_holds_prs(label), "{label} is a PR queue");
+    }
+    for label in [
+        "loom:issue",
+        "loom:triage",
+        "loom:curated",
+        "loom:curating",
+        "loom:building",
+        "loom:blocked",
+    ] {
+        assert!(!queue_label_holds_prs(label), "{label} is an issue queue");
+    }
+}
+
+/// Regression for #9929: the queue gate reads the REST issues listing, which
+/// returns pull requests alongside issues. A row of the WRONG lifecycle must
+/// never satisfy the gate — the same issue/PR conflation that let a pull
+/// request be picked up as a curation candidate and labeled `loom:curating` /
+/// `loom:curated`.
+#[test]
+fn queue_work_is_decided_on_rows_of_the_queues_own_kind() {
+    // Judge's queue is PRs: a PR row counts, an ISSUE row carrying the same
+    // label does not.
+    assert!(queue_rows_have_work(
+        "loom:review-requested",
+        &[row(306, true, &["loom:review-requested"])]
+    ));
+    assert!(!queue_rows_have_work(
+        "loom:review-requested",
+        &[row(42, false, &["loom:review-requested"])]
+    ));
+
+    // An issue queue is the mirror: a PR row must not stand in for issue work.
+    assert!(!queue_rows_have_work("loom:issue", &[row(306, true, &["loom:issue"])]));
+    assert!(queue_rows_have_work("loom:issue", &[row(42, false, &["loom:issue"])]));
+
+    // A mixed listing is satisfied by the row of the right kind, either way.
+    let mixed = [
+        row(42, false, &["loom:issue"]),
+        row(306, true, &["loom:pr"]),
+    ];
+    assert!(queue_rows_have_work("loom:review-requested", &mixed));
+    assert!(queue_rows_have_work("loom:issue", &mixed));
+
+    // An empty listing is empty for every queue.
+    assert!(!queue_rows_have_work("loom:review-requested", &[]));
+    assert!(!queue_rows_have_work("loom:issue", &[]));
+}
+
 /// AC6: `QueueEmpty` never enters the #4349 fail/recover edge — a root that
 /// was failing stays failing (no false "recovered"), and one that was not
 /// does not become failing.
