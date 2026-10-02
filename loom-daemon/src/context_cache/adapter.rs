@@ -586,7 +586,7 @@ mod tests {
         // The proven driver format: "Path: <file>" headers with
         // line-numbered content ("   123\tcode").
         let text =
-            "Path: src/a.rs\n   1\tfn a() {}\n   5\tfn b() {}\nPath: src/b.py\n   42\nx = 1\n";
+            "Path: src/a.rs\n   1\tfn a() {}\n   5\tfn b() {}\nPath: src/b.py\n   42\tx = 1\n";
         let out = parse_formatted_retrieval(text);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].path, "src/a.rs");
