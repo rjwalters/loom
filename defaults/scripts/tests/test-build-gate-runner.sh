@@ -206,7 +206,7 @@ stage0_full_output="$(cd "$STAGE0_REPO" && run_gate_full_tier "$STUB_DIR:$MIN_PA
 if [[ "$(head -n 1 "$CARGO_LOG")" == "STRUCTURAL-STUB" ]]; then
     pass "stage 0 runs in the FULL tier too, and runs FIRST (before any cargo step)"
 else
-    fail "expected STRUCTURAL-STUB as the first recorded call in the full tier, calls were: $(cat "$CARGO_LOG")"
+    fail "expected STRUCTURAL-STUB as the first recorded call in the full tier, calls were: $(cat "$CARGO_LOG"); gate output: $stage0_full_output"
 fi
 
 # And it is a GATE, not a report: a red stage 0 must stop the gate before cargo.
