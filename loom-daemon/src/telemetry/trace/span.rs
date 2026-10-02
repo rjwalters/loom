@@ -37,6 +37,14 @@ pub enum SpanName {
     /// durations out of a finished runner.
     #[serde(rename = "loom.ci.suite")]
     CiSuite,
+    /// One test of a `nextest-partition` leg (Issue #9456), parented to its
+    /// [`Self::CiJob`] span. Built from the JUnit XML
+    /// `.config/nextest.toml`'s `ci` profile writes and `ci.yml` uploads —
+    /// the only surface that carries per-test durations out of a finished
+    /// runner. Emitted for the leg's slow tail only, never one span per test;
+    /// see `ci_telemetry::nextest`.
+    #[serde(rename = "loom.ci.test")]
+    CiTest,
     /// One work-finder tick (Issue #8860) — its own root trace per tick.
     #[serde(rename = "loom.dispatch.tick")]
     DispatchTick,
@@ -73,6 +81,7 @@ impl SpanName {
             Self::CiJob => "loom.ci.job",
             Self::CiStep => "loom.ci.step",
             Self::CiSuite => "loom.ci.suite",
+            Self::CiTest => "loom.ci.test",
             Self::DispatchTick => "loom.dispatch.tick",
             Self::RuntimeUsage => "loom.runtime.usage",
             Self::PoolHold => "loom.pool.hold",

@@ -362,6 +362,35 @@ jobs:
           tool: nextest
       - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
         run: cargo nextest run --workspace --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
+      - name: Upload per-test timings (#9456)
+        # The JUnit XML `.config/nextest.toml`'s `[profile.ci.junit]` writes is
+        # the only surface that carries per-test durations out of a finished
+        # runner. `loom-daemon ci-telemetry` turns its slow tail into
+        # `loom.ci.test` spans under THIS leg's job span, which is what makes
+        # "which tests spent this partition's test-step time" answerable in
+        # SigNoz instead of by hand — the data rebalancing
+        # `--partition count:k/N` needs, and the per-test outcome #7789's flake
+        # tracking wants.
+        #
+        # The NAME is a contract, and more load-bearing than the suite one:
+        # JUnit XML carries no run id, no shard and no job name, so the name is
+        # the ONLY pairing key. The poller reads artifacts whose name starts
+        # with `ci-test-timings` and pairs on
+        # `-<family>-<k>-<N>`, where `<family>` is this job's display name with
+        # its `(k/N)` suffix stripped and slugified
+        # (`ci_telemetry::nextest::job_family_slug`; `ci.yml` has TWO
+        # nextest-partition families both sharding 1..3, so the family is what
+        # disambiguates them). Renaming this artifact — or renaming the job
+        # without renaming the artifact — silently stops test spans, which
+        # `ci_telemetry::tests::test_spans` asserts against this file. See
+        # defaults/docs/ci-observability.md §"Per-test spans (#9456)".
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-test-timings-rust-unit-tests-${{ matrix.partition }}-${{ strategy.job-total }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
 
   backend-otlp-feature:
     name: Rust OTLP Feature Build & Test
@@ -492,6 +521,19 @@ jobs:
           tool: nextest
       - name: Run tests (otlp feature, partition ${{ matrix.partition }}/${{ strategy.job-total }})
         run: cargo nextest run --package loom-daemon --features otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
+      - name: Upload per-test timings (#9456)
+        # Same contract as the `Rust Unit Tests` leg above, with this job's own
+        # family slug: the poller pairs `ci-test-timings-<family>-<k>-<N>` on
+        # the family, because both nextest-partition families shard 1..3 and
+        # `(kind, k, N)` alone would match two jobs. See
+        # defaults/docs/ci-observability.md §"Per-test spans (#9456)".
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-test-timings-rust-otlp-feature-tests-${{ matrix.partition }}-${{ strategy.job-total }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
 
   structural-checks:
     name: Structural Checks
