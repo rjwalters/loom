@@ -177,67 +177,6 @@ impl CollisionShadowCommand {
         }
     }
 }
-#[cfg(test)]
-mod repo_resolution_tests {
-    use super::{owner_repo_from_url, resolve_capture_repo, resolve_capture_repo_in};
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    #[test]
-    fn owner_repo_from_url_handles_both_remote_forms() {
-        assert_eq!(owner_repo_from_url("https://github.com/o/r.git"), Some("o/r".to_string()));
-        assert_eq!(owner_repo_from_url("https://github.com/o/r"), Some("o/r".to_string()));
-        assert_eq!(owner_repo_from_url("git@github.com:o/r.git"), Some("o/r".to_string()));
-        assert_eq!(owner_repo_from_url("https://github.com/o/r/"), Some("o/r".to_string()));
-        assert_eq!(owner_repo_from_url("not-a-url"), None);
-        assert_eq!(owner_repo_from_url("https://github.com/only-owner"), None);
-    }
-
-    #[test]
-    fn explicit_repo_wins_and_is_shape_checked() {
-        assert_eq!(resolve_capture_repo(Some("o/r")).unwrap(), "o/r");
-        assert!(resolve_capture_repo(Some("just-a-name"))
-            .unwrap_err()
-            .to_string()
-            .contains("expected OWNER/REPO"));
-    }
-
-    #[test]
-    fn unresolvable_origin_bails_with_the_remedy() {
-        // A directory with no git repo at all: get-url fails → loud bail
-        // naming --repo, never a guessed default.
-        let dir = TempDir::new().unwrap();
-        let out = Command::new("git")
-            .args([
-                "-C",
-                dir.path().to_str().unwrap(),
-                "remote",
-                "get-url",
-                "origin",
-            ])
-            .output()
-            .expect("git present");
-        assert!(!out.status.success(), "precondition: no origin in a temp dir");
-        let err = resolve_capture_repo_in(None, dir.path()).unwrap_err();
-        assert!(err.to_string().contains("pass --repo explicitly"));
-    }
-
-    #[test]
-    fn cwd_origin_resolves_to_owner_repo() {
-        // The real cwd has an origin (github.com/rjwalters/loom); both
-        // verbs' default resolution must land on OWNER/REPO.
-        let err = resolve_capture_repo_in(None, std::path::Path::new("."));
-        assert!(
-            err.is_ok()
-                || err
-                    .unwrap_err()
-                    .to_string()
-                    .contains("pass --repo explicitly"),
-            "a real checkout resolves to OWNER/REPO or bails loudly"
-        );
-    }
-}
-
 /// Resolve the `OWNER/REPO` stamped on capture records. An explicit
 /// `--repo` wins; otherwise the cwd's git `origin` remote is parsed
 /// (https and scp forms). Failure is a loud bail with the remedy — never a
@@ -368,4 +307,65 @@ fn run_capture_live(
         path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod repo_resolution_tests {
+    use super::{owner_repo_from_url, resolve_capture_repo, resolve_capture_repo_in};
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    #[test]
+    fn owner_repo_from_url_handles_both_remote_forms() {
+        assert_eq!(owner_repo_from_url("https://github.com/o/r.git"), Some("o/r".to_string()));
+        assert_eq!(owner_repo_from_url("https://github.com/o/r"), Some("o/r".to_string()));
+        assert_eq!(owner_repo_from_url("git@github.com:o/r.git"), Some("o/r".to_string()));
+        assert_eq!(owner_repo_from_url("https://github.com/o/r/"), Some("o/r".to_string()));
+        assert_eq!(owner_repo_from_url("not-a-url"), None);
+        assert_eq!(owner_repo_from_url("https://github.com/only-owner"), None);
+    }
+
+    #[test]
+    fn explicit_repo_wins_and_is_shape_checked() {
+        assert_eq!(resolve_capture_repo(Some("o/r")).unwrap(), "o/r");
+        assert!(resolve_capture_repo(Some("just-a-name"))
+            .unwrap_err()
+            .to_string()
+            .contains("expected OWNER/REPO"));
+    }
+
+    #[test]
+    fn unresolvable_origin_bails_with_the_remedy() {
+        // A directory with no git repo at all: get-url fails → loud bail
+        // naming --repo, never a guessed default.
+        let dir = TempDir::new().unwrap();
+        let out = Command::new("git")
+            .args([
+                "-C",
+                dir.path().to_str().unwrap(),
+                "remote",
+                "get-url",
+                "origin",
+            ])
+            .output()
+            .expect("git present");
+        assert!(!out.status.success(), "precondition: no origin in a temp dir");
+        let err = resolve_capture_repo_in(None, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("pass --repo explicitly"));
+    }
+
+    #[test]
+    fn cwd_origin_resolves_to_owner_repo() {
+        // The real cwd has an origin (github.com/rjwalters/loom); both
+        // verbs' default resolution must land on OWNER/REPO.
+        let err = resolve_capture_repo_in(None, std::path::Path::new("."));
+        assert!(
+            err.is_ok()
+                || err
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pass --repo explicitly"),
+            "a real checkout resolves to OWNER/REPO or bails loudly"
+        );
+    }
 }
