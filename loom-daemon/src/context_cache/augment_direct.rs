@@ -665,7 +665,7 @@ mod tests {
             Ok(json!({"unknown_memory_names": [], "nonindexed_blob_names": ["b1"]})),
             Ok(json!({"unknown_memory_names": [], "nonindexed_blob_names": []})),
         ]));
-        let mut c = client(mock.clone());
+        let mut c = client(&mock);
         // A small nonzero budget: the first poll comes back pending, the
         // second empty — with a zero budget the timeout would fire before
         // the second poll (as the SDK's semantics dictate).
