@@ -547,22 +547,28 @@ mkdir -p "$HOME" "$TMPDIR" /workspace/repo || exit 90
 # hooks for a real working tree, so give it one.
 git init -q -b main /workspace/repo || exit 91
 
+# Any one of several prompt texts counts: the wording is the CLI's, not ours,
+# and it is reworded between releases without the flow changing.
 await() {
-    local want="$1" i
+    local want i pane
     for i in $(seq 1 60); do
-        case "$(tmux capture-pane -p -t trust 2>/dev/null)" in
-            *"$want"*) return 0 ;;
-        esac
+        pane="$(tmux capture-pane -p -t trust 2>/dev/null)"
+        for want in "$@"; do
+            case "$pane" in
+                *"$want"*) return 0 ;;
+            esac
+        done
         sleep 1
     done
-    echo "TRUST_TIMEOUT waiting for: $want"
+    echo "TRUST_TIMEOUT waiting for: $*"
     tmux capture-pane -p -t trust 2>/dev/null
     return 1
 }
 
 tmux new-session -d -s trust -x 200 -y 50 "bash /opt/loom-engine-tui.sh" || exit 92
-# "Do you trust the contents of this directory?" — option 1 is preselected.
-await "trust the contents of this directory" || exit 93
+# The folder-trust prompt — option 1 is preselected. Codex <= 0.149 asks "Do you
+# trust the contents of this directory?"; 0.160 asks "Trust this folder?".
+await "trust the contents of this directory" "Trust this folder?" || exit 93
 tmux send-keys -t trust Enter
 # "Hooks can run outside the sandbox after you trust them." — 2 = trust all,
 # 3 = continue without trusting.

@@ -1,0 +1,169 @@
+# Keep the image-pinned harness CLIs at upstream latest.
+#
+# WHY THIS EXISTS
+#
+# The fleet tracks the latest release of every harness it dispatches to. Claude
+# Code needs nothing here: docker/worker/Dockerfile and the fleet plan both run
+# claude.ai/install.sh, which installs the current release and updates itself.
+# Codex (docker/session) and OpenCode (docker/native) are PINNED in their
+# images, and nothing ever moved those pins: Renovate has no manager for a
+# Dockerfile `ARG` and opened no PR here. So the pins only moved when someone
+# noticed. In 2026-09 that took a server-side change to notice: once the
+# accounts' default model became `gpt-6-astra`, every Codex 0.149.1 session
+# failed with "requires a newer version of Codex". From 09-30 the fleet's Codex
+# lane ran ~8 successful role ticks against ~550 failures.
+#
+# WHAT IT DOES
+#
+# Every 6 hours, for each pin below, it reads the npm `latest` dist-tag. If that
+# version is newer it rewrites every place the pin lives, then opens (or
+# force-updates) ONE pull request on `bot/harness-pins`. It never merges. The
+# PR changes docker/**, so ci.yml's image smoke jobs build both images and run
+# docker/session/test-image.sh and docker/native/test-image.sh against the new
+# CLI. That includes the real-engine hook check (§12), which proves the guard
+# still blocks a force-push. A release that breaks the hook contract therefore
+# fails CI on the bump PR and never reaches a session container.
+#
+# No release-age quarantine: unlike renovate.json5's 14-day minimumReleaseAge,
+# these pins track latest on purpose (operator direction, 2026-10-02). The
+# provider moves the default model forward on its own schedule, so a lagging
+# CLI is an outage. It is not a safe default. The CI smoke tests and review are
+# the gate.
+#
+# OpenCode tracks the 1.x line only. Loom's guarded binding is verified on 1.x
+# (`Major::guard_verified` refuses 2.x; .loom/docs/guardrail-parity-native.md
+# "OpenCode major versions"). If npm `latest` ever leaves 1.x, the job warns and
+# leaves the pin alone rather than shipping an unguardable major.
+#
+# The pin sites per harness (moved together, never one without the others):
+#   codex    docker/session/Dockerfile          ARG CODEX_VERSION
+#   opencode docker/native/Dockerfile           ARG OPENCODE_VERSION
+#            docker/native/test-image.sh        OPENCODE_VERSION default
+#            loom-daemon/src/native_tools/provision.rs  opencode_plugin_version!
+#              (@opencode-ai/plugin must match the CLI that loads it)
+name: Harness Pins
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: harness-pins
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    name: Bump image-pinned harness CLIs to latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Create repository-scoped PR token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.LOOM_FLEET_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.LOOM_FLEET_DISPATCH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 1
+          token: ${{ steps.app-token.outputs.token }}
+
+      # Before the job writes to the tree, so Loom-Build's state is honest
+      # (2AMLogic CLAUDE.md rule 11; "Automation with no story").
+      - id: prov
+        uses: 2AMLogic/provenance-action@a828bdd201ab4299eeed20bf868abef9a0447914
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Rewrite pins that are behind npm latest
+        id: rewrite
+        run: |
+          set -euo pipefail
+          summary=""
+
+          # latest <npm-package> -> a plain X.Y.Z, or empty (prerelease/garbage)
+          latest() {
+            npm view "$1@latest" version 2>/dev/null | grep -xE '[0-9]+\.[0-9]+\.[0-9]+' || true
+          }
+          # newer <cur> <cand> -> success when cand is strictly newer than cur
+          newer() {
+            [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$2" ]
+          }
+
+          cur=$(sed -nE 's/^ARG CODEX_VERSION=([0-9.]+)$/\1/p' docker/session/Dockerfile)
+          new=$(latest @openai/codex)
+          if [ -n "$cur" ] && [ -n "$new" ] && newer "$cur" "$new"; then
+            sed -i -E "s/^ARG CODEX_VERSION=.*/ARG CODEX_VERSION=$new/" docker/session/Dockerfile
+            summary="$summary codex $cur→$new"
+          fi
+          echo "codex: pinned=${cur:-?} latest=${new:-?}"
+
+          cur=$(sed -nE 's/^ARG OPENCODE_VERSION=([0-9.]+)$/\1/p' docker/native/Dockerfile)
+          new=$(latest opencode-ai)
+          if [ -n "$new" ] && [ "${new%%.*}" != "1" ]; then
+            echo "::warning::opencode-ai latest is $new — outside the guard-verified 1.x line; pin left at $cur"
+          elif [ -n "$cur" ] && [ -n "$new" ] && newer "$cur" "$new"; then
+            sed -i -E "s/^ARG OPENCODE_VERSION=.*/ARG OPENCODE_VERSION=$new/" docker/native/Dockerfile
+            sed -i -E "s/^OPENCODE_VERSION=\"\\\$\{OPENCODE_VERSION:-[0-9.]+\}\"/OPENCODE_VERSION=\"\${OPENCODE_VERSION:-$new}\"/" docker/native/test-image.sh
+            perl -0pi -e "s/(macro_rules! opencode_plugin_version \{\s*\(\) => \{\s*\")[0-9.]+(\")/\${1}$new\${2}/" \
+              loom-daemon/src/native_tools/provision.rs
+            summary="$summary opencode $cur→$new"
+          fi
+          echo "opencode: pinned=${cur:-?} latest=${new:-?}"
+
+          # Every site of a bumped harness must have moved; a half-applied
+          # bump would fail CI on an equality assertion with a worse message.
+          if [ -n "$summary" ]; then
+            oc=$(sed -nE 's/^ARG OPENCODE_VERSION=([0-9.]+)$/\1/p' docker/native/Dockerfile)
+            grep -qF "OPENCODE_VERSION:-$oc}" docker/native/test-image.sh
+            grep -qF "\"$oc\"" loom-daemon/src/native_tools/provision.rs
+          fi
+          echo "summary=${summary# }" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the bump PR
+        if: steps.rewrite.outputs.summary != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          SUMMARY: ${{ steps.rewrite.outputs.summary }}
+          TRAILERS: ${{ steps.prov.outputs.trailers }}
+          MARKER: ${{ steps.prov.outputs.marker }}
+        run: |
+          set -euo pipefail
+          bot_login="${APP_SLUG}[bot]"
+          bot_id="$(gh api "users/$bot_login" --jq '.id')"
+          git config user.name "$bot_login"
+          git config user.email "${bot_id}+${bot_login}@users.noreply.github.com"
+
+          branch=bot/harness-pins
+          title="chore(harness): track latest CLIs — $SUMMARY"
+          git checkout -B "$branch"
+          git commit -a \
+            -m "$title" \
+            -m "Scheduled bump by .github/workflows/harness-pins.yml: the image-pinned harness CLIs track npm latest. CI's docker smoke jobs run both test-image.sh suites, including the real-engine hook check, against the new versions." \
+            -m "$TRAILERS"
+          git push --force origin "$branch"
+
+          body="$(printf '%s\n\n%s\n\n%s\n' \
+            "Scheduled bump: **$SUMMARY**." \
+            "Generated by \`.github/workflows/harness-pins.yml\`, which keeps the image-pinned harness CLIs at upstream latest. The docker smoke jobs in CI are the gate: \`docker/session/test-image.sh\` (including the §12 real-engine hook check) and \`docker/native/test-image.sh\` must pass against the new versions before this merges." \
+            "$MARKER")"
+          number=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --title "$title" --body "$body"
+          else
+            gh pr create --base main --head "$branch" --title "$title" --body "$body" \
+              --label dependencies --label loom:review-requested
+          fi

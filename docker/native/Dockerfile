@@ -26,14 +26,13 @@
 #      this image deliberately does NOT include"); this is a genuine transitive
 #      dependency of "add the native CLIs", the same judgement
 #      docker/session/Dockerfile already made for Codex.
-#   2. The three native CLIs PINNED at the versions .loom/docs/
-#      guardrail-parity-native.md records as tested (see the verification
-#      receipt native-runtime-verification-2026-09-19.md): OpenCode 1.18.31,
-#      Pi 0.85.1 and Kimi 2.0.2. Pinned, never `@latest`: a floating tag would
-#      let an unrelated rebuild silently ship a version nothing has been
-#      verified against, and "CLI exit zero is not acceptance evidence" (the
-#      parity doc's own words) means a drifted version would not announce
-#      itself.
+#   2. The three native CLIs PINNED. Pi 0.85.1 and Kimi 2.0.2 are the versions
+#      .loom/docs/guardrail-parity-native.md records as tested (receipt
+#      native-runtime-verification-2026-09-19.md). OpenCode tracks its latest
+#      1.x release: .github/workflows/harness-pins.yml moves OPENCODE_VERSION
+#      in a reviewed PR that this image's smoke test gates. Pinned, never
+#      `@latest`: a floating tag would let an unrelated rebuild silently ship a
+#      version no PR ever tested.
 #   3. `OPENCODE_DISABLE_AUTOUPDATE=1` / `KIMI_CODE_NO_AUTO_UPDATE=1` — the
 #      runtime half of the same guarantee. Pinning the install is not enough if
 #      the CLI can update ITSELF past the tested version on first launch inside
@@ -69,7 +68,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 # .loom/docs/native-runtime-verification-2026-09-19.md ran its guarded live
 # edit canaries against. Bump both the pin and the parity doc together, with a
 # fresh canary run; never one without the other.
-ARG OPENCODE_VERSION=1.18.31
+ARG OPENCODE_VERSION=1.18.34
 ARG PI_VERSION=0.85.1
 ARG KIMI_CODE_VERSION=2.0.2
 
