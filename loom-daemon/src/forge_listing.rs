@@ -21,7 +21,13 @@
 //! `/repos/{owner}/{repo}/issues` returns **pull requests too** (marked with
 //! a `pull_request` key). [`RestIssue::is_pull_request`] carries the marker
 //! and every converted call site filters on it, so consumers see the same
-//! issue-only (or PR-only) sets as before.
+//! issue-only (or PR-only) sets as before. Say which you want by name —
+//! [`list_issues_only_cached_as`] / [`issues_only`] for issue candidates,
+//! [`pull_requests_only`] for a PR queue — rather than re-deriving the
+//! predicate inline; a call site that forgets it feeds PR numbers to an
+//! issue-targeting consumer (Issue #9929), and
+//! `forge_listing_tests::every_raw_listing_call_site_decides_about_pull_requests`
+//! fails CI when a new one does.
 //!
 //! Scope: single page, `per_page=100` (the old `gh issue list --limit`
 //! ceilings were 100–200; a repo with >100 simultaneously-labeled items is
@@ -74,6 +80,52 @@ pub struct RestIssue {
     /// The REST `comments` count (#10480): a row with `0` needs no comment
     /// read at all. `0` when the forge omitted it.
     pub comments: u32,
+}
+
+/// Keep only the real issues in a REST issues listing (Issue #9929).
+///
+/// `GET /repos/{owner}/{repo}/issues` returns pull requests alongside issues —
+/// a PR row is marked by [`RestIssue::is_pull_request`] and is otherwise
+/// shaped exactly like an issue row. A candidate-selection path that forgets
+/// to drop them hands **PR numbers to an issue-targeting consumer**, and
+/// nothing downstream can tell the difference: issues and PRs share one number
+/// namespace, and `gh issue edit <pr-number>` happily labels a PR. That is not
+/// hypothetical — it is the #9929 incident, where a pull request picked up the
+/// issue-lifecycle labels `loom:curating` → `loom:curated` (plus a `tier:`
+/// label) from a Curator run that had been pointed at it as a curation
+/// candidate, stranding it outside both the issue and the PR pipelines.
+///
+/// Call this (or [`list_issues_only_cached_as`]) rather than repeating the
+/// predicate inline, so the exclusion is one named, tested thing instead of a
+/// convention each new call site has to remember.
+#[must_use]
+pub fn issues_only(rows: Vec<RestIssue>) -> Vec<RestIssue> {
+    rows.into_iter().filter(|r| !r.is_pull_request).collect()
+}
+
+/// The mirror of [`issues_only`]: keep only the pull-request rows, for a
+/// consumer whose queue is PRs (Judge's `loom:review-requested`, Doctor's
+/// `loom:changes-requested`, Champion's `loom:pr`). Stated positively for the
+/// same reason — so the call site's intent is readable and greppable.
+#[must_use]
+pub fn pull_requests_only(rows: Vec<RestIssue>) -> Vec<RestIssue> {
+    rows.into_iter().filter(|r| r.is_pull_request).collect()
+}
+
+/// [`list_issues_cached_as`] with pull requests already excluded
+/// ([`issues_only`]) — the listing every **issue**-targeting
+/// candidate-selection path should use (Issue #9929).
+///
+/// Errors are those of [`list_issues_cached_as`], unchanged.
+pub fn list_issues_only_cached_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    label: &str,
+    state: &str,
+) -> Result<Vec<RestIssue>> {
+    list_issues_cached_as(caller, gh_bin, cwd, repo_override, label, state).map(issues_only)
 }
 
 /// List open/closed issues carrying `label`, via the ETag cache.
