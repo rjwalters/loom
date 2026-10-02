@@ -167,8 +167,9 @@ pub fn attributes(values: &[(&str, &str)]) -> TraceAttributes {
 ///   a role-runner tick that never launched a child session
 ///   ([`crate::telemetry::RoleTickResult::spawned`] is false — 80.4% of this
 ///   host's 130,657 role ticks over 2026-09-18…10-02, 92,869 of them
-///   `skipped_pool_exhausted`, each closing in well under a second), and a
-///   **synthetic** completion span ([`SYNTHETIC_TIMING_SOURCES`]) whose start
+///   `skipped_pool_exhausted`, each closing in well under a second — since
+///   #9438 such a tick emits no span at all, so this row survives only in
+///   pre-#9438 data), and a **synthetic** completion span ([`SYNTHETIC_TIMING_SOURCES`]) whose start
 ///   was never observed, so it is emitted with `started_at == ended_at` and
 ///   its duration is zero by construction.
 /// - `"true"` — a session ran and the span's start is an owned boundary.
@@ -325,14 +326,27 @@ pub fn begin(
     name: SpanName,
     attributes: TraceAttributes,
 ) -> Option<Span> {
+    begin_at(root, execution, name, attributes, None)
+}
+
+/// [`begin`], with the root span's start pinned to `started_at` when given
+/// (a role tick materialized late, #9438) instead of the context's creation.
+fn begin_at(
+    root: &Path,
+    execution: &str,
+    name: SpanName,
+    attributes: TraceAttributes,
+    started_at: Option<chrono::DateTime<Utc>>,
+) -> Option<Span> {
     if !super::tracing::enabled(root) {
         return None;
     }
     let store = TraceStore::new(root);
     let saved = store.load_or_create(root, execution).ok()?;
     let journal = Journal::for_context(&store.path(root, execution));
+    let at = started_at.unwrap_or(saved.started_at);
     let active = journal
-        .start(saved.context, saved.story.as_ref(), name, saved.started_at, attributes)
+        .start(saved.context, saved.story.as_ref(), name, at, attributes)
         .ok()?;
     Some(Span { journal, active })
 }
@@ -778,7 +792,7 @@ fn finish_owned_runtime(journal: &Journal, root: &TraceContext, result: &str) {
 
 pub fn role_child_exited(result: &str) {
     ROLE_CONTEXT.with(|slot| {
-        if let Some(span) = slot.borrow().as_ref() {
+        if let Some(RoleSlot::Open(span)) = slot.borrow().as_ref() {
             finish_owned_runtime(&span.journal, span.context(), result);
         }
     });
@@ -786,7 +800,7 @@ pub fn role_child_exited(result: &str) {
 
 pub fn role_child_spawned(pid: u32) {
     ROLE_CONTEXT.with(|slot| {
-        if let Some(span) = slot.borrow().as_ref() {
+        if let Some(RoleSlot::Open(span)) = slot.borrow().as_ref() {
             let _ = span.journal.set_owner(span.context(), pid);
         }
     });
@@ -881,16 +895,76 @@ pub fn backfill(root: &Path, queue: &dyn super::queue::QueueSink) -> usize {
     count
 }
 
+/// The in-flight role tick's root span (#9438). A tick starts [`Pending`]:
+/// nothing journalled, no context file, no join entry. Only the launch itself
+/// ([`role_command`], called immediately before the child is spawned) opens
+/// the `loom.role_attempt` span, so a tick that returns before launching —
+/// every pre-spawn skip, and a `Failure` raised before the launch — leaves no
+/// span at all, and `loom.role_attempt` stays the population of real
+/// attempts. The tick itself is still recorded durably by `role_tick.outcome`.
+///
+/// [`Pending`]: RoleSlot::Pending
+enum RoleSlot {
+    Pending {
+        root: PathBuf,
+        role: String,
+        execution: String,
+        started_at: chrono::DateTime<Utc>,
+    },
+    Open(Span),
+}
+
 thread_local! {
-    static ROLE_CONTEXT: std::cell::RefCell<Option<Span>> = const { std::cell::RefCell::new(None) };
+    static ROLE_CONTEXT: std::cell::RefCell<Option<RoleSlot>> = const { std::cell::RefCell::new(None) };
 }
 
 pub fn role_command(command: &mut Command) {
     ROLE_CONTEXT.with(|slot| {
-        if let Some(span) = slot.borrow().as_ref() {
+        let mut slot = slot.borrow_mut();
+        if let Some(RoleSlot::Pending {
+            root,
+            role,
+            execution,
+            started_at,
+        }) = slot.as_ref()
+        {
+            *slot = open_role_attempt(root, role, execution, *started_at).map(RoleSlot::Open);
+        }
+        if let Some(RoleSlot::Open(span)) = slot.as_ref() {
             span.command(command);
         }
     });
+}
+
+/// Journal a launching tick's `loom.role_attempt` root, started at the tick's
+/// own start instant so the span still covers its pre-spawn preparation.
+fn open_role_attempt(
+    root: &Path,
+    role: &str,
+    execution: &str,
+    started_at: chrono::DateTime<Utc>,
+) -> Option<Span> {
+    let repo = TraceStore::fallback_repo(root);
+    // Host memory state at the launch — the other end of this span's host
+    // snapshot pair (the end lands in `finish_execution`), so a
+    // deferred/killed/timed-out attempt carries the host state at both
+    // moments instead of a bare 30 s-cadence gauge.
+    let mut start = attributes(&[
+        ("loom.role", role),
+        ("loom.repo", &repo),
+        ("loom.sweep_id", execution),
+        ("loom.timing_source", "owned_boundary"),
+    ]);
+    start.extend(host_attributes());
+    let span = begin_at(root, execution, SpanName::RoleAttempt, start, Some(started_at))?;
+    // #9231: let the transcript-ingest pass join this tick's own
+    // `session.summary` log to the tick's trace — the role-runner counterpart
+    // of `sweep_registry::spawn_process`'s `join::open`, keyed on the role
+    // because a tick names no issue (see `join::JoinKey`). Opened before the
+    // child exists, for the same reason the sweep path does: an ingest pass
+    // that runs while the tick is still in flight must find the entry open.
+    super::runtime_usage::join::open_role(root, execution, role);
+    Some(span)
 }
 
 /// A role tick's execution id: the role plus the tick's start instant. With the
@@ -914,46 +988,35 @@ pub struct RoleTrace {
     pub started_at: chrono::DateTime<Utc>,
 }
 
+/// Run one role tick under its `loom.role_attempt` root span — **if it
+/// launches** (#9438). The span is opened lazily by [`role_command`]; a tick
+/// that returns without reaching the launch (a `skipped_*` outcome,
+/// `runtime_rejected`, or a pre-launch `failure`) journals nothing and returns
+/// no [`RoleTrace`], so its ~30 ms interval never enters the attempt
+/// population. Its `role_tick.outcome` record is unaffected.
 pub fn role_invocation(
     root: &Path,
     role: &str,
     invoke: impl FnOnce() -> crate::role_runner::RoleTickOutcome,
 ) -> (crate::role_runner::RoleTickOutcome, Option<RoleTrace>) {
-    let execution = role_execution_id(role, Utc::now());
-    let repo = TraceStore::fallback_repo(root);
-    let span = begin(root, &execution, SpanName::RoleAttempt, {
-        // Host memory state at the attempt's BEGIN — the other end of this
-        // span's host snapshot pair (the end lands in `finish_execution`),
-        // so a deferred/killed/timed-out attempt carries the host state at
-        // both moments instead of a bare 30 s-cadence gauge.
-        let mut start = attributes(&[
-            ("loom.role", role),
-            ("loom.repo", &repo),
-            ("loom.sweep_id", &execution),
-            ("loom.timing_source", "owned_boundary"),
-        ]);
-        start.extend(host_attributes());
-        start
-    });
-    let trace = span.as_ref().map(|s| RoleTrace {
-        context: s.context().clone(),
-        execution: execution.clone(),
-        started_at: s.active.record.started_at,
-    });
-    // #9231: let the transcript-ingest pass join this tick's own
-    // `session.summary` log to the tick's trace — the role-runner counterpart
-    // of `sweep_registry::spawn_process`'s `join::open`, keyed on the role
-    // because a tick names no issue (see `join::JoinKey`). Opened here, at
-    // dispatch rather than at the terminal transition, for the same reason the
-    // sweep path does: an ingest pass that runs while the tick is still in
-    // flight must find the entry already open.
-    if trace.is_some() {
-        super::runtime_usage::join::open_role(root, &execution, role);
-    }
-    ROLE_CONTEXT.with(|slot| *slot.borrow_mut() = span);
-    let outcome = invoke();
+    let started_at = Utc::now();
+    let execution = role_execution_id(role, started_at);
     ROLE_CONTEXT.with(|slot| {
-        slot.borrow_mut().take();
+        *slot.borrow_mut() = Some(RoleSlot::Pending {
+            root: root.to_path_buf(),
+            role: role.to_owned(),
+            execution: execution.clone(),
+            started_at,
+        });
+    });
+    let outcome = invoke();
+    let Some(RoleSlot::Open(span)) = ROLE_CONTEXT.with(|slot| slot.borrow_mut().take()) else {
+        return (outcome, None);
+    };
+    let trace = Some(RoleTrace {
+        context: span.context().clone(),
+        execution: execution.clone(),
+        started_at: span.active.record.started_at,
     });
     let (result, _) = crate::role_tick_telemetry::classify(&outcome);
     let result = crate::role_tick_telemetry::result_label(result);
