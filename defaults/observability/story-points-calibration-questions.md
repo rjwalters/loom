@@ -129,14 +129,17 @@ only in the Rust contract test.
 - **Token plausibility.** The tokens arm reads sweep totals as published;
   ~19% of token values are implausible (#9454) and `suspect` flagging lives
   in SF6 — read that beside any tokens figure here.
-- **LSI until the landed-size fit.** The `lsi` arm is empty (NULL) while
-  `landed-size.sql` ships `v0-unfitted`; when the D1 backfill fits its
-  params, the arm fills without any change to this file.
+- **LSI now that the landed-size fit has shipped.** `landed-size.sql` carries
+  the `v1-2026-10-02` fit (#9934); the `lsi` arm fills as soon as the D1
+  rollup (`sweep-facts-rollup.sql` + the landed-size view) runs against the
+  production store — no change to this file. The fixture's NULL-LSI
+  substitution below stands for a different reason: the bundled SQLite in CI
+  lacks the math functions D1 provides.
 
 ## Verification status
 
 | Artifact | Status |
 | --- | --- |
-| `story-points-calibration-queries.sql` | **Fixture-executed in ordinary CI**: `loom-daemon/tests/story_points_calibration/execution.rs` builds a synthetic `sweep_facts` through the committed rollup INSERT (`sweep-facts/sweep-facts-rollup.sql`) and executes this file against it, asserting hand-computed medians, quartiles, Spearman ρ (including tie handling), drift ratios, misassignment picks and churn counts. The fixture substitutes a shape-compatible `issue_landed_size` view whose LSI is NULL — exactly what the committed view yields under its current `v0-unfitted` parameter set — because the bundled SQLite in CI lacks the math functions D1 provides. |
+| `story-points-calibration-queries.sql` | **Fixture-executed in ordinary CI**: `loom-daemon/tests/story_points_calibration/execution.rs` builds a synthetic `sweep_facts` through the committed rollup INSERT (`sweep-facts/sweep-facts-rollup.sql`) and executes this file against it, asserting hand-computed medians, quartiles, Spearman ρ (including tie handling), drift ratios, misassignment picks and churn counts. The fixture substitutes a shape-compatible `issue_landed_size` view whose LSI is NULL — the committed view is now fitted (`v1-2026-10-02`, #9934), but the bundled SQLite in CI still lacks the math functions D1 provides, so the substitution remains what makes the fixture executable. |
 | Static contracts (question set, window binding, landing predicate, revision markers, doc mirror, churn-beside-every-score) | Same test file, derived from the committed artifacts (`story-points-calibration-queries.sql`, `../docs/story-points.md`, `sweep-facts/landed-size.sql`). |
 | Live D1 execution | **Not run from the Builder environment** — `wrangler d1 execute --remote` needs `CLOUDFLARE_API_TOKEN`, which is not provisioned for this session (same discipline as [`story-points-evidence.md`](story-points-evidence.md); no credentials were sought elsewhere). The queries are correct and verifiable via the fixture; the first live run pastes CAL1's counts into the evidence trail. |
