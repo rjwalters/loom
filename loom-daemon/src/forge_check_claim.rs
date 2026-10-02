@@ -283,13 +283,12 @@ pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) ->
                     return blocked(
                         issue,
                         &format!("TARGET_IS_PR #{issue}"),
-                        format!(
-                            "that number is a pull request, not an issue — issues and PRs share one \
-                             number namespace, so `gh issue view`/`gh issue edit` accept it \
-                             silently and the issue lifecycle would proceed on something that \
-                             can never close (#9929). --force-claim never overrides this leg: \
-                             there is no issue here to claim."
-                        ),
+                        "that number is a pull request, not an issue — issues and PRs share one \
+                         number namespace, so `gh issue view`/`gh issue edit` accept it \
+                         silently and the issue lifecycle would proceed on something that \
+                         can never close (#9929). --force-claim never overrides this leg: \
+                         there is no issue here to claim."
+                            .to_string(),
                     );
                 }
                 LabelLeg::Claimed(claims) => {
