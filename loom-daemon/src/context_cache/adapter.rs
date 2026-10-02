@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use super::augment_direct::{
-    ensure_index, retrieve, DirectClient, DirectTransport, HttpDirectTransport, PinnedBlob,
-    PinnedBlobSet, WaitPolicy,
+    ensure_index, retrieve, DirectClient, DirectTransport, HttpDirectTransport, PinnedBlobSet,
+    WaitPolicy,
 };
 
 /// One raw retrieved location, before validation/normalization.
@@ -351,6 +351,7 @@ impl AugmentAdapter {
                 MAX_INDEX_FILES,
                 MAX_BLOB_BYTES,
             )
+            .map_err(|e| e.to_string())
             .map(Arc::new),
             None => Err("no pinned tree configured — the context engine indexes a                          file set; construct with `with_pinned_tree`"
                 .to_string()),
@@ -401,7 +402,7 @@ impl RetrievalAdapter for AugmentAdapter {
         // indexing wait re-run.
         let mut checkpoint = self.checkpoint.lock().unwrap_or_else(|p| p.into_inner());
         if checkpoint.is_none() {
-            match ensure_index(&direct, blob_set) {
+            match ensure_index(&direct, &blob_set) {
                 Ok(id) => *checkpoint = Some(id),
                 Err(e) => {
                     return AdapterOutcome::Unavailable {
@@ -467,7 +468,7 @@ pub(crate) fn parse_formatted_retrieval(text: &str) -> Vec<RawSnippet> {
         match parse_location_header(line) {
             Some((path, range)) => {
                 flush_unknown(&mut unknown, &mut out);
-                if let Some(mut cur) = current.take() {
+                if let Some(cur) = current.take() {
                     out.push(cur);
                 }
                 let mut ranges = Vec::new();
