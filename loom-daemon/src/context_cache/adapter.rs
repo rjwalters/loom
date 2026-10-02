@@ -341,15 +341,13 @@ impl AugmentAdapter {
             return ready.clone();
         }
         let result = match &self.pinned_tree {
-            Some((repo, revision)) => PinnedBlobSet::from_pinned_tree(
-                repo,
-                revision,
-                MAX_INDEX_FILES,
-                MAX_BLOB_BYTES,
-            )
-            .map_err(|e| e.to_string())
-            .map(Arc::new),
-            None => Err("no pinned tree configured — the context engine indexes a                          file set; construct with `with_pinned_tree`"
+            Some((repo, revision)) => {
+                PinnedBlobSet::from_pinned_tree(repo, revision, MAX_INDEX_FILES, MAX_BLOB_BYTES)
+                    .map_err(|e| e.to_string())
+                    .map(Arc::new)
+            }
+            None => Err("no pinned tree configured — the context engine indexes a file set; \
+                 construct with `with_pinned_tree`"
                 .to_string()),
         };
         let _ = self.blob_set.set(result.clone());
