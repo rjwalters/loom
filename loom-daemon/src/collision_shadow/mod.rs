@@ -26,6 +26,7 @@
 //!   budget, paired deltas, and an explicit **inconclusive** verdict when
 //!   positives are under the pre-registered minimum.
 
+pub mod attribute;
 pub mod evaluate;
 pub mod records;
 

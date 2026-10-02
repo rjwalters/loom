@@ -59,6 +59,31 @@ pub(crate) enum CollisionShadowCommand {
         budgets: Option<PathBuf>,
     },
 
+    /// Attribute live outcomes to captured pairs from the forge (#9920):
+    /// for each captured pair, resolve both issues' merged PRs (one
+    /// `gh pr list` call total + one files call per PR), compare their
+    /// changed-file sets, and emit idempotent OutcomeRecords keyed to the
+    /// capture pair ids. Semantics pre-registered with the offline
+    /// converter's mapping (shared paths → TextualConflictPinned; none →
+    /// Missing; either side unresolved → Pending).
+    Attribute {
+        /// Directory of capture-record JSONL files (from capture-live).
+        #[arg(long, value_name = "DIR", default_value = ".loom/shadow")]
+        captures: PathBuf,
+
+        /// OWNER/REPO the issues live in.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: String,
+
+        /// Outcomes JSONL output (appended; existing ids skipped).
+        #[arg(
+            long,
+            value_name = "PATH",
+            default_value = ".loom/shadow/outcomes.jsonl"
+        )]
+        out: PathBuf,
+    },
+
     /// Evaluate frozen policies over captured records + recorded outcomes.
     Evaluate {
         /// JSONL of capture records (from `capture`).
@@ -121,6 +146,57 @@ impl CollisionShadowCommand {
                 out_dir,
                 budgets,
             } => run_capture_live(repo.as_deref(), &out_dir, budgets.as_deref()),
+            Self::Attribute {
+                captures,
+                repo,
+                out,
+            } => {
+                let gh_bin = std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".into());
+                let records = read_capture_records(&captures)?;
+                if records.is_empty() {
+                    bail!("no capture records under {}", captures.display());
+                }
+                let attribute_records =
+                    loom_daemon::collision_shadow::attribute::attribute_captures(
+                        &records, &gh_bin, &repo, &captures,
+                    )?;
+                // Idempotent: skip pairs whose record id is already in out.
+                let mut existing: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                if out.exists() {
+                    for line in std::fs::read_to_string(&out)?.lines() {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                            if let Some(id) = v.get("id").and_then(|i| i.as_str()) {
+                                existing.insert(id.to_string());
+                            }
+                        }
+                    }
+                }
+                let fresh: Vec<_> = attribute_records
+                    .iter()
+                    .filter(|r| !existing.contains(&r.id))
+                    .collect();
+                use std::io::Write as _;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&out)
+                    .with_context(|| format!("opening {}", out.display()))?;
+                for r in &fresh {
+                    writeln!(f, "{}", serde_json::to_string(r)?)?;
+                }
+                println!(
+                    "attribute: {} pair(s) → {} new record(s) ({} already present) → {}",
+                    attribute_records.len(),
+                    fresh.len(),
+                    existing.len(),
+                    out.display()
+                );
+                Ok(())
+            }
             Self::Evaluate {
                 captures,
                 outcomes,
@@ -246,6 +322,37 @@ fn owner_repo_from_url(url: &str) -> Option<String> {
 /// (issue numbers, claim state, eligibility) is what the denominators need,
 /// and the ETag-cached listing costs nothing when unchanged (#5057's
 /// API-pressure contract). Feature enrichment rides a follow-up.
+/// Load every capture record from the tick JSONL files under `dir`.
+fn read_capture_records(
+    dir: &std::path::Path,
+) -> Result<Vec<loom_daemon::collision_shadow::CaptureRecord>> {
+    let mut records = Vec::new();
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|x| x == "jsonl")
+                && p.file_stem()
+                    .is_some_and(|s| s.to_string_lossy().starts_with("tick-"))
+        })
+        .collect();
+    files.sort();
+    for f in files {
+        let raw =
+            std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?;
+        for (n, line) in raw.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            records.push(
+                serde_json::from_str::<loom_daemon::collision_shadow::CaptureRecord>(line)
+                    .with_context(|| format!("{} line {}", f.display(), n + 1))?,
+            );
+        }
+    }
+    Ok(records)
+}
+
 fn run_capture_live(
     repo: Option<&str>,
     out_dir: &std::path::Path,
