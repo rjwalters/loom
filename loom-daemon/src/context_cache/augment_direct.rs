@@ -665,7 +665,11 @@ mod tests {
             Ok(json!({"unknown_memory_names": [], "nonindexed_blob_names": ["b1"]})),
             Ok(json!({"unknown_memory_names": [], "nonindexed_blob_names": []})),
         ]));
-        let c = client(mock.clone());
+        let mut c = client(mock.clone());
+        // A small nonzero budget: the first poll comes back pending, the
+        // second empty — with a zero budget the timeout would fire before
+        // the second poll (as the SDK's semantics dictate).
+        c.wait_policy.max_wait = std::time::Duration::from_millis(50);
         c.wait_for_indexing(&["b1".into()]).unwrap();
         assert_eq!(mock.calls().len(), 2);
     }
