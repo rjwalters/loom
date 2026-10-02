@@ -510,3 +510,54 @@ fn overflow_never_passes_disk_or_ram_headroom() {
     let report = tick(&mut FakeSource::once(vec![starred(1, &[])]), &mut dispatcher, 0, false);
     assert_eq!(report.unwrap().dispatched, 0);
 }
+
+// ---- Star order and no-eviction (#9974 slice 1) -------------------------
+
+/// Issue 30 was starred first but created later and has the higher number;
+/// 20 was starred later. Both outrank every unstarred issue, and the queue
+/// rank follows star time, not creation order or issue number.
+#[test]
+fn starred_rank_follows_star_time_not_creation_or_number() {
+    let star = |n: u32, created: &str, at: &str| {
+        WorkItem::with_created_at(
+            n,
+            vec![
+                OPERATOR_PRIORITY_LABEL.to_string(),
+                "loom:issue".to_string(),
+            ],
+            Some(created.to_string()),
+        )
+        .with_operator_priority_at(Some(at.to_string()))
+    };
+    let mut multi = vec![(
+        FakeSource::once(vec![
+            WorkItem::with_created_at(
+                1,
+                vec!["loom:issue".to_string()],
+                Some("2026-08-01T00:00:00Z".to_string()),
+            ),
+            star(20, "2026-09-01T00:00:00Z", "2026-09-29T00:00:00Z"),
+            star(30, "2026-09-10T00:00:00Z", "2026-09-20T00:00:00Z"),
+        ]),
+        RecordingDispatcher::default(),
+    )];
+    let report = tick_multi(&mut multi, &[100], 10, &[false]);
+    let rows = ready_queue::finish(&report.queue, &[]);
+    let rank = |n: u32| rows.iter().find(|r| r.issue == n).unwrap().rank;
+    assert!(rank(30) < rank(20), "earlier star ranks first: {rows:?}");
+    assert!(rank(20) < rank(1), "every star outranks unstarred work");
+    assert_eq!((rank(30), rank(20), rank(1)), (1, 2, 3));
+    assert_eq!(multi[0].1.dispatched, vec![30, 20, 1]);
+}
+
+/// The overflow slot only ever adds a dispatch: in-flight sweeps stay
+/// in flight and `WorkDispatcher` has no cancel/unclaim operation at all.
+#[test]
+fn overflow_starred_sweep_leaves_in_flight_work_untouched() {
+    let mut multi = vec![(FakeSource::once(vec![starred(1, &["loom:issue"])]), full(2))];
+    let before = multi[0].1.in_flight.clone();
+    let report = tick_multi(&mut multi, &[100], 2, &[false]);
+    assert_eq!(report.dispatched_overflow, 1);
+    assert_eq!(multi[0].1.dispatched, vec![1], "only the starred issue is dispatched");
+    assert_eq!(multi[0].1.in_flight, before, "no in-flight sweep was cancelled");
+}
