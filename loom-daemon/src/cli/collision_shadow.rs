@@ -179,7 +179,7 @@ impl CollisionShadowCommand {
 }
 #[cfg(test)]
 mod repo_resolution_tests {
-    use super::{owner_repo_from_url, resolve_capture_repo_in};
+    use super::{owner_repo_from_url, resolve_capture_repo, resolve_capture_repo_in};
     use std::process::Command;
     use tempfile::TempDir;
 
