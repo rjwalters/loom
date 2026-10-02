@@ -33,7 +33,10 @@
 # .loom/docs/shell-language-policy.md. This file keeps its name (merge-pr.sh,
 # role prompts and the sweep lifecycle all invoke it by path) and keeps the
 # three forge/publish steps: resolve the child branch, force-with-lease push,
-# retarget the PR base. New logic goes into the subcommand, not here.
+# retarget the PR base. New logic goes into the subcommand, not here — which is
+# why #9487's pinned-lease logic is `loom-daemon push-lease pin-flag` and this
+# file only calls it, keeps the argument it prints, and refuses on its exit
+# code (see defaults/docs/push-lease-pinning.md).
 #
 # The destination is the commit this run FETCHED from the remote, never the
 # local branch of the same name: a stale local default branch made an
@@ -82,7 +85,7 @@ info() { echo -e "${BLUE}ℹ $1${NC}" >&2; }
 warn() { echo -e "${YELLOW}⚠ $1${NC}" >&2; }
 
 show_help() {
-    sed -n '2,66p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,69p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 DRY_RUN=false
@@ -158,39 +161,6 @@ info "Child branch: $CHILD_BRANCH"
 info "Parent branch: $PARENT_BRANCH"
 info "Forge retarget base (default branch name): $DEFAULT_BRANCH"
 
-# #9487: capture the child branch's LIVE remote head NOW — before the rebase
-# rewrites anything — and pin step 2's --force-with-lease to it. A bare
-# --force-with-lease compares against refs/remotes/origin/<child>, a ref SHARED
-# by every linked worktree of this clone: a sibling agent's fetch can advance it
-# to a commit this run never saw, after which the bare lease is satisfied and
-# the push silently deletes that commit. Capturing before the rewrite (and
-# never re-reading it later) is the whole point — a fetch taken just before the
-# push would pin the sibling's commit and launder the clobber as "fresh".
-#
-# shellcheck source=lib/push-lease-verify.sh
-source "$SCRIPT_DIR/lib/push-lease-verify.sh"
-CHILD_LEASE_OID="$(push_lease_live_tip origin "$CHILD_BRANCH")" || CHILD_LEASE_OID=""
-if [[ -z "$CHILD_LEASE_OID" ]]; then
-    if [[ "$DRY_RUN" == "true" ]]; then
-        warn "Could not read origin's live head for '$CHILD_BRANCH' — a real run would refuse here (#9487); continuing the dry run."
-    else
-        err "[FETCH] Could not read origin's live head for '$CHILD_BRANCH' (#9487) — refusing to rebase+push without a pinned force-with-lease value. Check network/remote access and re-run; nothing was mutated."
-        exit 1
-    fi
-else
-    info "Pinned force-with-lease value for '$CHILD_BRANCH': $CHILD_LEASE_OID"
-    # The pin is accurate but not sufficient on its own: a commit published
-    # BEFORE the pin was taken and never fetched here would still be deleted by
-    # the push. Require that this clone has incorporated it. Skipped when the
-    # child branch does not resolve locally at all — that is the daemon's
-    # CHILD-BRANCH prerequisite, which reports it far more precisely.
-    if git rev-parse --verify --quiet "refs/heads/$CHILD_BRANCH" >/dev/null 2>&1 \
-       && ! push_lease_require_incorporated "$CHILD_LEASE_OID" "$CHILD_BRANCH"; then
-        err "[LEASE-PIN] origin/$CHILD_BRANCH is at $CHILD_LEASE_OID, which this checkout's '$CHILD_BRANCH' has not incorporated (#9487) — someone pushed commits this clone does not have. Refusing: a rebase+push here would delete them. Run 'git fetch origin $CHILD_BRANCH', reconcile by hand, then re-run. Nothing was mutated."
-        exit 1
-    fi
-fi
-
 # The reconciliation planner/executor. Hard requirement, failing CLOSED: with
 # no binary there is no verified fetch and no pinned destination, and the only
 # thing left to rebase onto would be the stale local branch this exists to
@@ -202,6 +172,29 @@ if [[ -z "$DAEMON_BIN" ]]; then
     err "loom-daemon not found — required for 'reconcile-stack' (#8583). Build it (cargo build --release --package loom-daemon) or set LOOM_DAEMON_SELF_BIN=/path/to/loom-daemon. Refusing rather than rebasing onto an unverified destination."
     exit 1
 fi
+
+# #9487: capture the child branch's LIVE remote head NOW — before step 1's
+# rebase rewrites anything — and pin step 2's --force-with-lease to it. A bare
+# --force-with-lease compares against refs/remotes/origin/<child>, a ref SHARED
+# by every linked worktree of this clone: a sibling agent's fetch can advance it
+# to a commit this run never saw, after which the bare lease is satisfied and
+# the push silently deletes that commit (the live PR #9483 incident). Capturing
+# before the rewrite, and never re-reading it later, is the whole point — a
+# fetch taken just before the push would pin the sibling's commit and launder
+# the clobber as "fresh". The query, the rendering, and the ancestry half that
+# catches a commit published BEFORE the pin was taken all live in
+# `loom-daemon push-lease pin-flag` (cli/push_lease.rs) per the shell language
+# policy: exit 3 = origin could not be queried, 4 = origin holds commits this
+# clone never incorporated. There is deliberately no bare-flag fallback.
+# requires-daemon: push-lease >= 0.19.624   #9487 — the pinned-lease builder. Declared at this repo's VERSION because the subcommand lands WITH this marker; the first release actually carrying it is the post-merge bump. A binary predating it is refused here with the floor rather than degraded to the bare lease
+loom_daemon_version_preflight push-lease "$DAEMON_BIN"
+PIN_RC=0
+PUSH_LEASE_ARG="$("$DAEMON_BIN" push-lease pin-flag --remote origin --branch "$CHILD_BRANCH" --local-ref "refs/heads/$CHILD_BRANCH")" || PIN_RC=$?
+if [[ $PIN_RC -ne 0 ]]; then
+    err "No pinned force-with-lease value for '$CHILD_BRANCH' (loom-daemon push-lease pin-flag exit $PIN_RC — the bracketed prerequisite token naming which half refused is above, #9487). Refusing to rebase+push: the only fallback is the bare lease this exists to replace. Nothing was mutated."
+    exit 1
+fi
+info "Pinned force-with-lease argument for '$CHILD_BRANCH': $PUSH_LEASE_ARG"
 
 # 1. Fetch + pin the remote default-branch tip, route to the worktree holding
 #    the child branch, resolve the parent ref (branch name, else the #7982
@@ -225,7 +218,7 @@ PLAN_OUT="$("$DAEMON_BIN" reconcile-stack "${RECONCILE_ARGS[@]}")" || PLAN_RC=$?
 if [[ $PLAN_RC -eq 2 ]]; then
     err "Rebase failed (likely a conflict). Resolve it, then re-run this script or finish manually:"
     echo "    git rebase --continue   # after resolving" >&2
-    echo "    git push --force-with-lease=$CHILD_BRANCH:${CHILD_LEASE_OID:-<head-you-based-on>}   # pinned, never bare (#9487)" >&2
+    echo "    git push $PUSH_LEASE_ARG origin $CHILD_BRANCH   # pinned, never bare (#9487)" >&2
     echo "    gh pr edit $CHILD_PR --base $DEFAULT_BRANCH" >&2
     exit 2
 elif [[ $PLAN_RC -ne 0 ]]; then
@@ -264,15 +257,9 @@ run() {
 # holds the branch, else here), so the current branch there is the child.
 GIT_C=(git -C "$LOOM_RS_GIT_DIR")
 
-# 2. Publish the rewritten child branch. --force-with-lease PINNED to the head
-#    captured above (never bare --force, and never the bare lease either —
-#    #9487) so a concurrent push aborts rather than clobbers.
-PUSH_LEASE_ARG="$(push_lease_pin_flag "$CHILD_BRANCH" "$CHILD_LEASE_OID")" || PUSH_LEASE_ARG=""
-if [[ -z "$PUSH_LEASE_ARG" ]]; then
-    # Only reachable under --dry-run (a real run exited above without a pin).
-    warn "No pinned lease value — a real run would have refused (#9487)."
-    PUSH_LEASE_ARG="--force-with-lease"
-fi
+# 2. Publish the rewritten child branch with $PUSH_LEASE_ARG — the lease PINNED
+#    to the head captured above (never bare --force, and never the bare lease
+#    either, #9487) so a concurrent push aborts rather than clobbers.
 info "Step 2/3: push $PUSH_LEASE_ARG"
 if ! run "${GIT_C[@]}" push "$PUSH_LEASE_ARG" origin "$CHILD_BRANCH"; then
     # A reported rejection is not always a real one (#6695): Git LFS's
@@ -281,6 +268,8 @@ if ! run "${GIT_C[@]}" push "$PUSH_LEASE_ARG" origin "$CHILD_BRANCH"; then
     # stale read. Verify the LIVE remote ref before trusting the reported
     # failure — never a local remote-tracking ref, which is not re-fetched here.
     PUSH_RACE_SHA="$("${GIT_C[@]}" rev-parse "$CHILD_BRANCH" 2>/dev/null || true)"
+    # shellcheck source=lib/push-lease-verify.sh
+    source "$SCRIPT_DIR/lib/push-lease-verify.sh"
     if [[ "$DRY_RUN" != "true" ]] && push_landed_despite_rejection origin "$CHILD_BRANCH" "$PUSH_RACE_SHA" "${GIT_C[@]}"; then
         warn "PUSH-LEASE-RACE-DETECTED: push --force-with-lease reported a rejection for '$CHILD_BRANCH', but origin already reflects the update ($PUSH_RACE_SHA) — likely the Git LFS pre-push hook racing the lease re-check (#6695). Treating as landed and continuing."
     else

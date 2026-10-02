@@ -85,6 +85,7 @@ mod pr_latency_cmd;
 mod pr_latency_render;
 pub(crate) mod premise_check;
 pub(crate) mod provenance;
+pub(crate) mod push_lease;
 pub(crate) mod quarantine;
 pub(crate) mod ready_queue_cmd;
 pub(crate) mod reconcile_stack;
