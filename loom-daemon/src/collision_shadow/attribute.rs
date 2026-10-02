@@ -163,17 +163,30 @@ pub fn attribute_captures(
     let pr_list = pr_list.as_array().cloned().unwrap_or_default();
     let pr_map = map_merged_prs_from_json(&pr_list, &issues);
 
+    // Files cache: ONE call per UNIQUE referenced PR, not per pair
+    // occurrence — capture-live snapshots every concurrent pair per tick, so
+    // a hot issue recurs across pairs and ticks and must not re-trigger the
+    // same `files` call (#9903 review).
+    let unique_prs: std::collections::BTreeSet<u32> = pr_map.values().copied().collect();
+    let mut files_cache: std::collections::BTreeMap<u32, Option<Vec<String>>> =
+        std::collections::BTreeMap::new();
+    for pr in &unique_prs {
+        let files = gh_changed_files(gh, repo, *pr)?;
+        files_cache.insert(*pr, files);
+    }
     let mut out = Vec::new();
     let now = chrono::Utc::now().to_rfc3339();
     for (pair_id, c) in &pairs {
-        let a_files = match pr_map.get(&c.issue_a) {
-            Some(pr) => gh_changed_files(gh, repo, *pr)?,
-            None => None,
-        };
-        let b_files = match pr_map.get(&c.issue_b) {
-            Some(pr) => gh_changed_files(gh, repo, *pr)?,
-            None => None,
-        };
+        let a_files = pr_map
+            .get(&c.issue_a)
+            .and_then(|pr| files_cache.get(pr))
+            .cloned()
+            .flatten();
+        let b_files = pr_map
+            .get(&c.issue_b)
+            .and_then(|pr| files_cache.get(pr))
+            .cloned()
+            .flatten();
         let kind = attribute_pair(a_files, b_files);
         let record = OutcomeRecord {
             id: String::new(),
