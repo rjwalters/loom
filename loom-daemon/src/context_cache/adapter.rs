@@ -436,103 +436,78 @@ impl RetrievalAdapter for AugmentAdapter {
     }
 }
 
-/// Parse the server's `formatted_retrieval` text into raw snippets. The
-/// documented shape (SDK search docstring) is "file paths, line numbers,
-/// and code content in a structured, readable format"; the exact syntax is
-/// not yet pinned by a live sample (#9930 slice 4), so this parser is
-/// deliberately conservative: a line that reads like a `path:line` /
-/// `path:start-end` location (optionally with one trailing colon) opens a
-/// snippet; everything that does not fit — including anything before the
-/// first location — is retained as one explicit `<unknown-provenance>`
-/// snippet. Nothing is dropped, nothing is guessed; revisit against a live
-/// sample.
+/// Parse the server's `formatted_retrieval` text into raw snippets,
+/// mirroring the experiment driver's PROVEN parser (`auggie_driver.py`,
+/// used across the #9785/#9787 experiments) and LIVE-VALIDATED against a
+/// real capture (#9930 slice 4): `Path: <file>` section headers with
+/// line-numbered content (`     1\tcode`), boilerplate preamble and
+/// section separators ignored (exactly as the driver ignores them). The
+/// min/max of the seen line numbers forms the snippet's range; up to 60
+/// content lines are kept per snippet (the full raw text stays in
+/// `raw_responses` for replay). Safety net: a response with NO `Path:`
+/// section at all becomes one explicit `<unknown-provenance>` snippet —
+/// the format surprising us can never silently drop evidence.
 pub(crate) fn parse_formatted_retrieval(text: &str) -> Vec<RawSnippet> {
-    fn flush_unknown(buf: &mut String, out: &mut Vec<RawSnippet>) {
-        if !buf.trim().is_empty() {
+    /// `     123\tcode` — the driver's line-numbered content shape.
+    fn parse_numbered_line(line: &str) -> Option<(u32, &str)> {
+        let trimmed = line.trim_start();
+        let (num, rest) = trimmed.split_once('\t')?;
+        let n: u32 = num.parse().ok()?;
+        Some((n, rest))
+    }
+    struct Parsed {
+        path: String,
+        start: u32,
+        end: u32,
+        lines: Vec<String>,
+    }
+    fn flush_current(cur: &mut Option<Parsed>, out: &mut Vec<RawSnippet>) {
+        if let Some(p) = cur.take() {
             out.push(RawSnippet {
-                path: "<unknown-provenance>".into(),
-                ranges: vec![],
-                text: std::mem::take(buf),
+                path: p.path,
+                ranges: vec![(p.start, p.end)],
+                text: p.lines.join("\n"),
                 source_ref: String::new(),
             });
         }
     }
     let mut out = Vec::new();
-    let mut unknown = String::new();
-    let mut current: Option<RawSnippet> = None;
+    let mut cur: Option<Parsed> = None;
     for line in text.lines() {
-        match parse_location_header(line) {
-            Some((path, range)) => {
-                flush_unknown(&mut unknown, &mut out);
-                if let Some(cur) = current.take() {
-                    out.push(cur);
+        if let Some(path) = line.strip_prefix("Path: ") {
+            flush_current(&mut cur, &mut out);
+            cur = Some(Parsed {
+                path: path.trim().to_string(),
+                start: u32::MAX,
+                end: 0,
+                lines: Vec::new(),
+            });
+        } else if let Some((n, content)) = parse_numbered_line(line) {
+            if let Some(p) = cur.as_mut() {
+                p.start = p.start.min(n);
+                p.end = p.end.max(n);
+                if p.lines.len() < 60 {
+                    p.lines.push(content.to_string());
                 }
-                let mut ranges = Vec::new();
-                if let Some((s, e)) = range {
-                    ranges.push((s, e));
-                }
-                current = Some(RawSnippet {
-                    path,
-                    ranges,
-                    text: String::new(),
-                    source_ref: String::new(),
-                });
             }
-            None => match current.as_mut() {
-                Some(cur) => {
-                    cur.text.push_str(line);
-                    cur.text.push('\n');
-                }
-                None => {
-                    unknown.push_str(line);
-                    unknown.push('\n');
-                }
-            },
+            // Numbered line outside any section: impossible in the
+            // observed format; ignored like the driver ignores it.
         }
+        // All other lines (preamble, blanks, ellipsis, fences): ignored,
+        // mirroring the driver.
     }
-    flush_unknown(&mut unknown, &mut out);
-    if let Some(cur) = current.take() {
-        out.push(cur);
+    flush_current(&mut cur, &mut out);
+    if out.is_empty() && !text.trim().is_empty() {
+        // Safety net: the format surprised us — retain everything as one
+        // explicitly unknown-provenance snippet rather than drop evidence.
+        out.push(RawSnippet {
+            path: "<unknown-provenance>".into(),
+            ranges: vec![],
+            text: text.to_string(),
+            source_ref: String::new(),
+        });
     }
     out
-}
-
-/// A header line that reads like a code location: `path:line` /
-/// `path:start-end`, optionally with one trailing colon. Code lines almost
-/// never qualify: a non-numeric tail after the final `:` fails
-/// (`Foo::bar`), arithmetic never ends in a bare integer after `:`, and
-/// prose with spaces is rejected outright. The exact server syntax gets
-/// pinned by a live sample (#9930 slice 4).
-fn parse_location_header(line: &str) -> Option<(String, Option<(u32, u32)>)> {
-    fn is_num(s: &str) -> bool {
-        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
-    }
-    let mut trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.contains(' ') {
-        return None;
-    }
-    trimmed = trimmed.strip_suffix(':').unwrap_or(trimmed);
-    let (base, range) = {
-        let (base, tail) = trimmed.rsplit_once(':')?;
-        let range = if is_num(tail) {
-            let n: u32 = tail.parse().ok()?;
-            Some((n, n))
-        } else {
-            match tail.split_once('-') {
-                Some((a, b)) if is_num(a) && is_num(b) => {
-                    let s: u32 = a.parse().ok()?;
-                    let e: u32 = b.parse().ok()?;
-                    Some((s, e.max(s)))
-                }
-                _ => return None,
-            }
-        };
-        (base, range)
-    };
-    if base.is_empty() || !(base.contains('/') || base.contains('.')) {
-        return None;
-    }
-    Some((base.to_string(), range))
 }
 
 #[cfg(test)]
@@ -608,14 +583,30 @@ mod tests {
 
     #[test]
     fn formatted_retrieval_parser_locations_with_ranges() {
-        let text = "src/a.rs:1-10:\nfn a() {}\nsrc/b.py:42:\nx = 1\n";
+        // The proven driver format: "Path: <file>" headers with
+        // line-numbered content ("   123\tcode").
+        let text =
+            "Path: src/a.rs\n   1\tfn a() {}\n   5\tfn b() {}\nPath: src/b.py\n   42\nx = 1\n";
         let out = parse_formatted_retrieval(text);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].path, "src/a.rs");
-        assert_eq!(out[0].ranges, vec![(1, 10)]);
-        assert_eq!(out[0].text, "fn a() {}\n");
+        assert_eq!(out[0].ranges, vec![(1, 5)]);
+        assert_eq!(out[0].text, "fn a() {}\nfn b() {}");
         assert_eq!(out[1].path, "src/b.py");
         assert_eq!(out[1].ranges, vec![(42, 42)]);
+        assert_eq!(out[1].text, "x = 1");
+    }
+
+    #[test]
+    fn formatted_retrieval_parser_caps_content_at_60_lines() {
+        let mut text = String::from("Path: src/a.rs\n");
+        for n in 1..=80 {
+            text.push_str(&format!("   {n}\tline {n}\n"));
+        }
+        let out = parse_formatted_retrieval(&text);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].ranges, vec![(1, 80)], "range spans ALL seen lines");
+        assert_eq!(out[0].text.lines().count(), 60, "content capped at 60 lines");
     }
 
     #[test]
@@ -629,14 +620,40 @@ mod tests {
     }
 
     #[test]
-    fn formatted_retrieval_parser_mixed_prose_then_locations() {
-        let text = "Overview of findings:\n\nsrc/a.rs:3:\nfn a() {}\n";
+    fn formatted_retrieval_parser_mirrors_the_driver_on_preamble() {
+        // Boilerplate preamble + blank separators are ignored exactly as
+        // the driver ignores them (live-capture shape).
+        let text =
+            "The following code sections were retrieved:\n\nPath: src/a.rs\n   3\tfn a() {}\n";
         let out = parse_formatted_retrieval(text);
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, "src/a.rs");
+        assert_eq!(out[0].ranges, vec![(3, 3)]);
+        assert_eq!(out[0].text, "fn a() {}");
+    }
+
+    #[test]
+    fn formatted_retrieval_parser_no_sections_falls_back_to_unknown() {
+        // Safety net: a response with no Path: section at all is retained
+        // as one explicit unknown-provenance snippet, never dropped.
+        let out = parse_formatted_retrieval("surprising shape\nno sections\n");
+        assert_eq!(out.len(), 1);
         assert_eq!(out[0].path, "<unknown-provenance>");
-        assert!(out[0].text.contains("Overview"));
-        assert_eq!(out[1].path, "src/a.rs");
-        assert_eq!(out[1].ranges, vec![(3, 3)]);
+        assert!(out[0].text.contains("surprising shape"));
+    }
+
+    #[test]
+    fn formatted_retrieval_parser_matches_the_live_capture_fixture() {
+        // First section of the real captured response (#9930 slice 4 live
+        // validation, 2026-10-01): repo's own files, verbatim shape.
+        let fixture = "The following code sections were retrieved:\n\nPath: AGENTS.md\n     1\t# Loom repository instructions\n     3\tRead and follow [CLAUDE.md](CLAUDE.md) before working in this repository.\n...\n\nPath: loom-daemon/Cargo.toml\n     1\t[package]\n";
+        let out = parse_formatted_retrieval(fixture);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].path, "AGENTS.md");
+        assert_eq!(out[0].ranges, vec![(1, 3)]);
+        assert_eq!(out[0].text, "# Loom repository instructions\nRead and follow [CLAUDE.md](CLAUDE.md) before working in this repository.");
+        assert_eq!(out[1].path, "loom-daemon/Cargo.toml");
+        assert_eq!(out[1].ranges, vec![(1, 1)]);
     }
 
     #[test]
@@ -712,9 +729,13 @@ mod tests {
             Ok(serde_json::json!({"blob_names": ["blob-1"]})),
             Ok(serde_json::json!({"new_checkpoint_id": "cp-1"})),
             Ok(serde_json::json!({"unknown_memory_names": [], "nonindexed_blob_names": []})),
-            Ok(serde_json::json!({"formatted_retrieval": "src/a.rs:1-2:\nfn a(){}\n"})),
+            Ok(
+                serde_json::json!({"formatted_retrieval": "Path: src/a.rs\n   1\tfn a(){}\n   2\tlet x = 1;\n"}),
+            ),
             // Second query: checkpoint reused — only a retrieval call.
-            Ok(serde_json::json!({"formatted_retrieval": "src/a.rs:1-2:\nfn a(){}\n"})),
+            Ok(
+                serde_json::json!({"formatted_retrieval": "Path: src/a.rs\n   1\tfn a(){}\n   2\tlet x = 1;\n"}),
+            ),
         ]));
         let adapter = AugmentAdapter {
             token: Some("t".into()),
@@ -745,6 +766,10 @@ mod tests {
             matches!(&out, AdapterOutcome::Results(s) if !s.is_empty()),
             "expected parsed snippets, got {out:?}"
         );
+        if let AdapterOutcome::Results(snippets) = &out {
+            assert_eq!(snippets[0].path, "src/a.rs", "provenance parsed from the driver format");
+            assert_eq!(snippets[0].ranges, vec![(1, 2)]);
+        }
         let fm_after_first = mock.find_missing_calls();
         let calls_after_first = mock.calls_total();
         // Second query: checkpoint memoized — no re-index (the find-missing
