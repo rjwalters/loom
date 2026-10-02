@@ -74,6 +74,33 @@ pub fn work_queue_labels(role: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// Whether `label`'s work queue is a queue of **pull requests** (#9929).
+///
+/// The three PR-lifecycle labels are the queues the PR roles drain —
+/// `loom:review-requested` (Judge), `loom:changes-requested` (Doctor),
+/// `loom:pr` (Champion's merge queue). Every other `loom:` workflow label
+/// belongs to the *issue* lifecycle.
+///
+/// This distinction has to be made explicitly because the queue probe reads
+/// the REST issues listing, which returns **both** kinds (see
+/// [`crate::forge_listing::issues_only`]): without it, a row of the wrong kind
+/// satisfies the gate, which is the same confusion that let a pull request be
+/// treated as a curation candidate in #9929.
+#[must_use]
+pub fn queue_label_holds_prs(label: &str) -> bool {
+    matches!(label, "loom:review-requested" | "loom:changes-requested" | "loom:pr")
+}
+
+/// Whether a REST issues listing for `label` contains work for that queue:
+/// at least one row of the queue's **own** kind (#9929).
+///
+/// Pure, so the kind decision is unit-testable without a forge.
+#[must_use]
+pub fn queue_rows_have_work(label: &str, rows: &[crate::forge_listing::RestIssue]) -> bool {
+    let want_pr = queue_label_holds_prs(label);
+    rows.iter().any(|r| r.is_pull_request == want_pr)
+}
+
 /// Parse `autonomous.roleRunner.roleMaxConcurrent` (`{"<role>": N}`).
 ///
 /// Keys are trimmed and lower-cased (like `roleModels`/`onIdleMaxWait`); a
@@ -394,7 +421,9 @@ pub fn script_runner_factory() -> RunnerFactory {
 
 /// The production queue probe: the ETag-cached REST listing, so an unchanged
 /// queue costs a free `304`. REST issue listings include pull requests, which
-/// is what judge and doctor queues hold. The PR rows it saw are recorded in
+/// is what judge and doctor queues hold — the gate therefore decides emptiness
+/// on rows of the queue's own kind ([`queue_rows_have_work`], #9929), never on the
+/// raw row count. The PR rows it saw are recorded in
 /// the demand ledger (#9392) — the same listing, no second call. Changes debt
 /// leaves out PRs Doctor will not drain (`loom:blocked` /
 /// `loom:operator-only`, #9421); review debt is unfiltered
@@ -416,8 +445,13 @@ pub fn forge_queue_probe() -> QueueProbe {
                 "open",
             )
             .map_err(|e| e.to_string())?;
+            // The ledger wants the whole listing (it counts PR rows itself).
             demand::record_listing(demand::global(), root, label, &rows);
-            if !rows.is_empty() {
+            // The GATE, though, must only be satisfied by a row of this
+            // queue's own kind (#9929) — a REST issues listing returns PRs
+            // alongside issues, so an unfiltered emptiness test lets an item
+            // of the wrong lifecycle stand in for real queue work.
+            if queue_rows_have_work(label, &rows) {
                 return Ok(true);
             }
         }

@@ -118,9 +118,12 @@ impl WorkSource for GhWorkSource {
 impl GhWorkSource {
     /// One ETag-cached REST listing of open issues carrying `label` (#4428):
     /// a poll where nothing changed costs zero rate limit (304). REST issue
-    /// listings include PRs, so `pull_request`-marked rows are dropped.
+    /// listings include PRs, so `pull_request`-marked rows are dropped by
+    /// [`crate::forge_listing::list_issues_only_cached_as`] — this is the
+    /// daemon's issue candidate set, and a PR number reaching it would be
+    /// dispatched (and curated) as if it were an issue (#9929).
     fn list_label(&self, label: &str) -> Result<Vec<WorkItem>> {
-        let rows = crate::forge_listing::list_issues_cached_as(
+        let rows = crate::forge_listing::list_issues_only_cached_as(
             "work_finder",
             &self.gh_bin,
             self.cwd.as_deref(),
@@ -130,7 +133,6 @@ impl GhWorkSource {
         )?;
         Ok(rows
             .into_iter()
-            .filter(|r| !r.is_pull_request)
             // The REST listing already returns `body` (#4827) — carrying it
             // onto the item costs no extra request and lets dispatch read
             // the `<!-- loom:complexity=... -->` stratum without a
