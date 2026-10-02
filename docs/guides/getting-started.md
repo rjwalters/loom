@@ -596,9 +596,13 @@ the target repo's `.loom/config.json` and re-run the script:
   invalidates the branch its successors just re-ran. Turn it on deliberately —
   it is what stops a stale branch landing green against a base it never
   measured.
+- **A comma inside a check-run name is fine in the JSON array** — e.g.
+  `"Repo checks (headless, no PDK)"` is read as one context, not two (#9926).
 - `LOOM_REQUIRED_STATUS_CHECKS` / `LOOM_REQUIRED_STATUS_CHECKS_STRICT` override
   the config for one run, and `LOOM_DRY_RUN=true` prints the exact ruleset
-  payload without touching the repository.
+  payload without touching the repository. The env form is a single
+  comma-or-newline-separated string, so it **cannot** express a name containing
+  a comma — use the `.loom/config.json` array above for such a name.
 
 ### 3. Your First Sweep
 

@@ -20,6 +20,12 @@
 #                              require. Overrides the target repo's
 #                              .loom/config.json -> branchProtection
 #                              .requiredStatusChecks (#8103).
+#                              NOTE: because this form is one delimited string,
+#                              it CANNOT express a check-run name that itself
+#                              contains a comma (e.g. "Repo checks (headless,
+#                              no PDK)"). Use the .loom/config.json array form
+#                              for such a name — it is read as an array and
+#                              never split (#9926).
 #   LOOM_REQUIRED_STATUS_CHECKS_STRICT=true
 #                              Also require branches to be up to date before
 #                              merging. Overrides branchProtection
@@ -250,9 +256,12 @@ setup_github_branch_protection() {
   #
   #   1. $LOOM_REQUIRED_STATUS_CHECKS — comma- or newline-separated context
   #      names (matches the env > config > default precedence Loom uses
-  #      elsewhere).
+  #      elsewhere). An env var can only carry one flat string, so this form is
+  #      split on commas/newlines and therefore CANNOT express a context name
+  #      that itself contains a comma; see the note at the split itself.
   #   2. `.loom/config.json` -> `.branchProtection.requiredStatusChecks`, a JSON
-  #      array of context names.
+  #      array of context names, consumed AS an array — never joined into a
+  #      delimited string and re-split (#9926).
   #   3. Neither present -> no rule is emitted and behavior is exactly as before.
   #
   # A "context" is the check-run NAME GitHub posts to the Checks tab (a job's
@@ -275,12 +284,43 @@ setup_github_branch_protection() {
   # required check red — which is the larger and cheaper half. Repos that merge
   # rarely, or whose ratchets compare absolute numbers against a moving base,
   # should turn it on deliberately.
-  local rsc_contexts rsc_strict
-  rsc_contexts="${LOOM_REQUIRED_STATUS_CHECKS:-$(jq -r '(.branchProtection.requiredStatusChecks // []) | join(",")' .loom/config.json 2>/dev/null || true)}"
+  #
+  # The context names are carried as a JSON ARRAY (`rsc_json`) from here on, so
+  # a name is never torn apart by a delimiter it happens to contain. The old
+  # code joined the config array with "," and re-split the result on `[,\n]+`;
+  # a perfectly ordinary GitHub job name with a parenthetical qualifier — e.g.
+  # `Repo checks (headless, no PDK)` — therefore became the two contexts
+  # `Repo checks (headless` and `no PDK)`, neither of which can ever report a
+  # conclusion, which blocks EVERY merge on the protected branch forever with
+  # the cause two layers away from the symptom (#9926).
+  local rsc_json rsc_count rsc_strict rsc_display
+  if [[ -n "${LOOM_REQUIRED_STATUS_CHECKS:-}" ]]; then
+    # Env-var form: one delimited string is all an environment variable can
+    # carry, so it is split on commas and newlines with surrounding whitespace
+    # trimmed. CONSEQUENCE: this form cannot express a context name containing a
+    # comma — a repo that needs one must use the `.loom/config.json` array form
+    # below, which is read as an array and never split (#9926).
+    rsc_json="$(jq -cn --arg c "$LOOM_REQUIRED_STATUS_CHECKS" \
+      '$c | [splits("[,\n]+")] | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')"
+  else
+    # Config-file form: already a JSON array, so map it straight to contexts —
+    # no join/re-split round trip, which is what makes a comma-bearing name
+    # expressible at all.
+    rsc_json="$(jq -c '(.branchProtection.requiredStatusChecks // [])
+      | map(select(type == "string"))
+      | map(gsub("^\\s+|\\s+$"; ""))
+      | map(select(length > 0))' .loom/config.json 2>/dev/null || true)"
+  fi
+  [[ -n "$rsc_json" ]] || rsc_json='[]'
+  rsc_count="$(printf '%s' "$rsc_json" | jq 'length' 2>/dev/null || echo 0)"
+  [[ "$rsc_count" =~ ^[0-9]+$ ]] || rsc_count=0
+  # Human-readable summary line: each name is JSON-quoted so a comma inside a
+  # name cannot be misread as a separator between two names.
+  rsc_display="$(printf '%s' "$rsc_json" | jq -r 'map(tojson) | join(", ")' 2>/dev/null || true)"
   rsc_strict="${LOOM_REQUIRED_STATUS_CHECKS_STRICT:-$(jq -r '(.branchProtection.strictRequiredStatusChecks // false) | tostring' .loom/config.json 2>/dev/null || true)}"
   [[ "$rsc_strict" == "true" ]] || rsc_strict=false
-  if [[ -n "${rsc_contexts//[[:space:],]/}" ]]; then
-    ruleset_payload="$(printf '%s' "$ruleset_payload" | jq --arg c "$rsc_contexts" --argjson s "$rsc_strict" '.rules += [{"type": "required_status_checks", "parameters": {"strict_required_status_checks_policy": $s, "do_not_enforce_on_create": false, "required_status_checks": ($c | [splits("[,\n]+")] | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | map({"context": .}))}}]')"
+  if (( rsc_count > 0 )); then
+    ruleset_payload="$(printf '%s' "$ruleset_payload" | jq --argjson c "$rsc_json" --argjson s "$rsc_strict" '.rules += [{"type": "required_status_checks", "parameters": {"strict_required_status_checks_policy": $s, "do_not_enforce_on_create": false, "required_status_checks": ($c | map({"context": .}))}}]')"
   fi
 
   # Preview the exact payload without touching the repository. This is the
@@ -405,7 +445,7 @@ setup_github_branch_protection() {
     echo "  - Require linear history (squash merges only)"
     echo "  - Require pull requests (0 approvals required)"
     echo "  - Dismiss stale reviews on new commits"
-    [[ -n "${rsc_contexts//[[:space:],]/}" ]] && echo "  - Required status checks (up-to-date branch required: ${rsc_strict}): ${rsc_contexts}"
+    (( rsc_count > 0 )) && echo "  - Required status checks (up-to-date branch required: ${rsc_strict}): ${rsc_display}"
     echo "  - Admin bypass: repository admins can push directly without a PR"
     echo ""
     echo "Note: 0 approvals required supports solo development and Loom's label-based review system."
