@@ -967,7 +967,7 @@ _check_loom_pr_label
 # build-stampede guard (#8252). The refusal named neither the version nor the
 # roll command. That is what these markers and the hint below fix.
 #
-# requires-daemon: merge-pr >= 0.19.465   the NEWEST fail-closed verb in this family, not the oldest (#8967): checks-failure (#8191 slice, merged in #9272 at 0.19.464, so first released in 0.19.465); the other fail-closed verbs are partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, check-runs-streak, check-runs-rollup, stacked-children, version-policy, partial-reset, partial-comment, closed-building, issue-close-gate, dirty-guard, worktree-preserve, worktree-contains, cleanup-paths — partial-comment renders two POST-merge audit comments and skips the note rather than posting an empty one; the last four decline only the post-merge worktree removal, never the merge; worktree-preserve preserves the worktree when the verb is missing, worktree-contains declines --worktree-path's override cleanup and keeps that path when it is missing, and cleanup-paths leaves the cleanup targets unnamed so nothing is removed) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
+# requires-daemon: merge-pr >= 0.19.624   the NEWEST fail-closed verb in this family, not the oldest (#8967): revalidate (#8191 slice — --auto's post-wait re-read, #8410/#8896), declared at this repo's VERSION because it lands WITH this marker (the reconcile-stack/worker precedent; a floor above VERSION is refused by check-daemon-subcommand-versions.sh) — the first release actually carrying it is the post-merge bump; the other fail-closed verbs are checks-failure >= 0.19.465 (#9272), partial-conflict >= 0.19.464 (#9246), classify-response >= 0.19.456 (#9228), loom-pr-guard >= 0.19.375 (#7419/#8926), stale-checks >= 0.19.221 (#8248/#8416) and verdict-contradiction >= 0.19.172 (#8112/#8124). One marker covers the whole `merge-pr` family, so it MUST name the highest of them — a host that satisfied an older floor but not the newest fail-closed verb had every merge refused while the hint quoted a floor it already met. Fail-open verbs (head-sync-retry, hold-state, redate-checks, delete-branch, zero-checks-settle, check-runs-streak, check-runs-rollup, stacked-children, version-policy, partial-reset, partial-comment, closed-building, issue-close-gate, dirty-guard, worktree-preserve, worktree-contains, cleanup-paths — partial-comment renders two POST-merge audit comments and skips the note rather than posting an empty one; the last four decline only the post-merge worktree removal, never the merge; worktree-preserve preserves the worktree when the verb is missing, worktree-contains declines --worktree-path's override cleanup and keeps that path when it is missing, and cleanup-paths leaves the cleanup targets unnamed so nothing is removed) deliberately do NOT raise it; the fail-direction table in tests/test-merge-pr-daemon-version-floor.sh enforces both halves.
 # requires-daemon: merge-pr-refs >= 0.19.170   closing-reference analysis (#8191, landed in #8199)
 # requires-daemon: forge optional   --merge-method validation (#8845); command -v probes first, and any non-0/1 exit (older daemon lacking the subcommand, or a Gitea decline) falls back to the unvalidated request with a warning
 # The `merge-pr >=` floor above covers the whole subcommand group, including
@@ -2232,34 +2232,38 @@ unset _MPS_JSON _MPS_FRESH_SHA
 # that guard to cover the wait window is a separate policy call; the window
 # left here is the same one the pre-#8410 UNSTABLE wait path always had.
 _revalidate_merge_guards() {
-  local fresh fresh_sha
-  fresh="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
-  # Merged underneath us while we waited — nothing left to guard.
-  [[ "$(echo "$fresh" | jq -r '.merged // false')" == "true" ]] && return 0
-
-  # Head moved during the wait (PR #8220's 07:12 force-push). The approval and
-  # the check results this run validated describe a tree that is no longer the
-  # head, so this is the #5579 "re-queue, not a failure" signal (exit 3), not a
-  # merge we should complete against the new tree.
-  # #8896: an unusable re-read (the `|| echo '{}'` fallback above, or any
-  # payload with no head SHA in it) must SAY that. It used to fall through to
-  # the loom:pr guard, which reported the genuine-absence wording ("does not
-  # carry the `loom:pr` label") — failing closed, correctly, but sending the
-  # operator to re-review a PR whose approval was never actually read. Nothing
-  # about the verdict changes here: an unreadable response is evidence neither
-  # that loom:pr is present nor that it is absent, so the merge still refuses.
-  fresh_sha="$(echo "$fresh" | jq -r '.head.sha // empty')"; [[ -n "$fresh_sha" ]] || error "Merge blocked: could not re-read PR #$PR_NUMBER after --auto's settle-wait — the uncached re-read returned no usable payload (no head SHA), so neither the head nor the label set could be re-validated against current state. This is a forge read failure, NOT a missing \`loom:pr\` label: refusing to merge rather than treating an unreadable response as a verdict. Re-run once the forge API is healthy."
-  if [[ -n "$fresh_sha" && -n "$MERGE_PRECONDITION_SHA" && "$fresh_sha" != "$MERGE_PRECONDITION_SHA" ]]; then
-    error_head_moved "PR #$PR_NUMBER: head moved while --auto waited for this head's checks to settle (#8410)" \
-      "$MERGE_PRECONDITION_SHA" "$fresh_sha"
-  fi
+  # What the uncached re-read says — merged underneath the wait (nothing left
+  # to guard), head moved (PR #8220's 07:12 force-push: the approval and the
+  # check results describe a tree that is no longer the head, so this is the
+  # #5579 exit-3 re-queue, even when the labels ALSO went stale, as on a
+  # rebase), or the label set to re-run the guards against — is `loom-daemon
+  # merge-pr revalidate` (Rust, loom-daemon/src/merge_pr/revalidate.rs, #8191
+  # slice), in that order. It replaced three `jq` reads that failed in two
+  # silent directions: a payload `jq` could not parse killed this script under
+  # `set -e` with `jq`'s exit 5 (the RE-QUEUE code) and no message, and a label
+  # array it could only partly walk handed the guards a truncated label set
+  # (`|| true`). Every unreadable shape is now #8896's refusal: an unreadable
+  # response is evidence neither that loom:pr is present nor that it is absent,
+  # so it must SAY it is a read failure — never fall through to the loom:pr
+  # guard's genuine-absence wording. Fails CLOSED on any other exit/sentinel
+  # pair (missing or older binary): "re-validated" and "never looked" must not
+  # be confusable at the last check before the merge. `$nl`, not `$'\n'` in a
+  # pattern: bash 3.2 reads the latter literally there (see #9697).
+  local fresh out rc=0 nl=$'\n'; fresh="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
+  out="$(printf '%s\n' "$fresh" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr revalidate --pr "$PR_NUMBER" --precondition-sha "$MERGE_PRECONDITION_SHA" 2>/dev/null)" || rc=$?
+  case "$rc:${out%%"$nl"*}" in
+    "0:LOOM-REVALIDATE MERGED") return 0 ;;
+    "3:LOOM-REVALIDATE HEAD-MOVED "*) error_head_moved "PR #$PR_NUMBER: head moved while --auto waited for this head's checks to settle (#8410)" "$MERGE_PRECONDITION_SHA" "${out##* }" ;;
+    "0:LOOM-REVALIDATE LABELS") PR_LABELS=""; [[ "$out" != *"$nl"* ]] || PR_LABELS="${out#*"$nl"}" ;;
+    "1:Merge blocked: could not re-read PR #$PR_NUMBER "*) error "$out" ;;
+    *) error "Merge blocked: PR #$PR_NUMBER's post-wait re-validation (#8410) could not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr revalidate' exited $rc without a recognized LOOM-REVALIDATE verdict (a loom-daemon predating #8191's slice has no such verb). Refusing rather than merging a head whose approval and label set were never re-read. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")" ;;
+  esac
 
   # Re-point the guards' input at the state just read, then re-run them. A
   # loom:verdict-stale revocation (#5686), a Judge re-claim, or a contradicting
   # verdict label (#8112) now blocks the merge exactly as it would have at
   # queue time. --allow-unapproved still overrides the loom:pr block, as it
   # does on the queue-time evaluation.
-  PR_LABELS="$(echo "$fresh" | jq -r '.labels[]?.name // empty' 2>/dev/null || true)"
   _check_loom_pr_label
   _check_verdict_label_contradiction
 }
