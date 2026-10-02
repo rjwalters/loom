@@ -509,7 +509,7 @@ mod tests {
         }
     }
 
-    impl DirectTransport for Arc<MockTransport> {
+    impl DirectTransport for MockTransport {
         fn post(
             &self,
             endpoint: &str,
