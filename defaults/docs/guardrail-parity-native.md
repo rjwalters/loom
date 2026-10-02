@@ -17,8 +17,10 @@ Tested versions and live outcomes: [verification receipt](native-runtime-verific
 
 `docker/native/Dockerfile` equality-checks all three at build time (`ARG
 OPENCODE_VERSION` / `PI_VERSION` / `KIMI_CODE_VERSION`), so a drifted pin fails
-the image build rather than shipping silently. Bump a pin, this table and a
-fresh run together; never one without the others.
+the image build rather than shipping silently. For Pi and Kimi, bump a pin,
+this table and a fresh run together; never one without the others. OpenCode's
+pin is moved by `harness-pins.yml` alone, so the version in its row above is a
+snapshot; the Dockerfile's `OPENCODE_VERSION` is the current value.
 
 Everything this page says about OpenCode's
 guard was verified on OpenCode 1.x only. **No OpenCode 2.x guarded receipt

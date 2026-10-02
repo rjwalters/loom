@@ -64,10 +64,12 @@ FROM ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Pinned, already-verified native CLI versions — the exact pair
+# Pinned native CLI versions. PI_VERSION and KIMI_CODE_VERSION are the versions
 # .loom/docs/native-runtime-verification-2026-09-19.md ran its guarded live
-# edit canaries against. Bump both the pin and the parity doc together, with a
-# fresh canary run; never one without the other.
+# edit canaries against: bump each with the parity doc and a fresh canary run.
+# OPENCODE_VERSION tracks the latest 1.x release instead
+# (.github/workflows/harness-pins.yml); its gate is docker/native/test-image.sh
+# in CI, and the live canary was last run on 1.18.31.
 ARG OPENCODE_VERSION=1.18.34
 ARG PI_VERSION=0.85.1
 ARG KIMI_CODE_VERSION=2.0.2

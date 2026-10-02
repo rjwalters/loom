@@ -177,7 +177,7 @@ identity, which every recheck refuses rather than treating as proven.
 
 ### Codex 0.149.1 vs the 0.146.0 schema pin — evidence, not assumption
 
-The image pins Codex **0.149.1** while `guard-codex-bridge.sh` and
+When this evidence was taken (2026-09-24), the image pinned Codex **0.149.1** while `guard-codex-bridge.sh` and
 `provision-codex-hooks.sh` pin their tested schema at **0.146.0**. "0.149.1 ≥
 the 0.146.0 floor" is not by itself evidence of compatibility, so the real
 `@openai/codex@0.149.1` package was examined directly (2026-09-24, Linux x64

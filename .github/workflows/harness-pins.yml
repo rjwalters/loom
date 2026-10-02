@@ -128,7 +128,8 @@ jobs:
           if [ -n "$summary" ]; then
             oc=$(sed -nE 's/^ARG OPENCODE_VERSION=([0-9.]+)$/\1/p' docker/native/Dockerfile)
             grep -qF "OPENCODE_VERSION:-$oc}" docker/native/test-image.sh
-            grep -qF "\"$oc\"" loom-daemon/src/native_tools/provision.rs
+            OC="$oc" perl -0ne 'exit(!/opencode_plugin_version \{\s*\(\) => \{\s*"\Q$ENV{OC}\E"/)' \
+              loom-daemon/src/native_tools/provision.rs
           fi
           echo "summary=${summary# }" >> "$GITHUB_OUTPUT"
 
@@ -149,6 +150,31 @@ jobs:
 
           branch=bot/harness-pins
           title="chore(harness): track latest CLIs — $SUMMARY"
+          pins="docker/session/Dockerfile docker/native/Dockerfile docker/native/test-image.sh loom-daemon/src/native_tools/provision.rs"
+
+          # An open bump branch is reused, never churned. Three cases:
+          #  - someone other than the bot pushed to it (a Doctor/human fix,
+          #    e.g. a test-image.sh change a new CLI needed): leave it alone;
+          #    they own it now, and a force-push would destroy their work.
+          #  - it already carries exactly these pin files: nothing to do, so
+          #    CI does not re-run and a Judge verdict on it stays valid.
+          #  - it carries other versions: rewrite it and send it back to
+          #    review, since nobody reviewed the new versions.
+          if git fetch --quiet --depth=1 origin "+refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null; then
+            # Authors from the compare API, not `git log`: this checkout is
+            # depth 1, so a local main..branch walk is not exact.
+            others="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$branch" \
+              --jq '.commits[].commit.author.name' | grep -vxF "$bot_login" | sort -u | tr '\n' ' ' || true)"
+            if [ -n "$others" ]; then
+              echo "::warning::$branch has commits by $others — not overwriting; bump this PR by hand to: $SUMMARY"
+              exit 0
+            fi
+            # shellcheck disable=SC2086 # word-splitting the path list is intended
+            if git diff --quiet "origin/$branch" -- $pins; then
+              echo "$branch already carries these pins; nothing to push"
+              exit 0
+            fi
+          fi
           git checkout -B "$branch"
           git commit -a \
             -m "$title" \
@@ -162,7 +188,11 @@ jobs:
             "$MARKER")"
           number=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')
           if [ -n "$number" ]; then
-            gh pr edit "$number" --title "$title" --body "$body"
+            # New versions on an existing PR: any earlier verdict is about a
+            # head nobody reviewed for THESE versions, so back to review.
+            gh pr edit "$number" --title "$title" --body "$body" \
+              --remove-label loom:pr --remove-label loom:changes-requested \
+              --add-label loom:review-requested
           else
             gh pr create --base main --head "$branch" --title "$title" --body "$body" \
               --label dependencies --label loom:review-requested

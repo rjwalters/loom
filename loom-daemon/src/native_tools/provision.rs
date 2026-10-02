@@ -19,7 +19,7 @@ macro_rules! opencode_plugin_version {
     };
 }
 
-/// [`opencode_plugin_version!`] as a value, for callers outside this module.
+/// The `opencode_plugin_version!` value, for callers outside this module.
 pub const OPENCODE_PLUGIN_VERSION: &str = opencode_plugin_version!();
 
 /// The exact pinned plugin manifest a guarded OpenCode launch provisions.
