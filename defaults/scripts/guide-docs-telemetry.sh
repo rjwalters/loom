@@ -105,8 +105,6 @@ GIT_COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null) || {
 REPO_ROOT=$(cd "$(dirname "$GIT_COMMON_DIR")" && pwd -P)
 LOG_FILE="${LOOM_GUIDE_DOCS_TELEMETRY_LOG:-$REPO_ROOT/.loom/logs/guide-docs-telemetry.jsonl}"
 
-# The daemon's own `host.id` (#10023); LOOM_HOST_ID only for an older binary.
-HOST_ID="$("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" host-id 2>/dev/null || printf '%s' "${LOOM_HOST_ID:-unknown-host}")"
 
 # --- Portable duration-string -> seconds -------------------------------------
 # Accepts a bare integer (seconds) or an integer with a single trailing unit
@@ -178,6 +176,14 @@ case "$CMD" in
             FILES_JSON="$(printf '%s\n' "${_DOCS_FILES_ARR[@]}" | jq -R . | jq -s -c .)"
         fi
 
+        # The daemon's own `host.id` (#10023) via `loom_host_id`
+        # (lib/locate-daemon-bin.sh): the binary loom_resolve_self_daemon_bin
+        # names, else $LOOM_HOST_ID. With neither it explains on stderr and the
+        # row is still written under the `unknown-host` sentinel the daemon's
+        # own telemetry uses for that case -- never matched as an identity.
+        # Resolved here only: `report` never needs it and must not warn.
+        # shellcheck source=./lib/locate-daemon-bin.sh
+        HOST_ID="$(source "$(dirname "${BASH_SOURCE[0]}")/lib/locate-daemon-bin.sh" && loom_host_id)" || HOST_ID="unknown-host"
         mkdir -p "$(dirname "$LOG_FILE")"
 
         jq -nc \
