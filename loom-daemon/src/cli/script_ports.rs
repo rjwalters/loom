@@ -843,6 +843,15 @@ pub(crate) enum MergePrCommand {
     /// 2 = the resolved root cannot be framed unambiguously. The seam fails
     /// OPEN (no targets, clean up nothing) — see `cli::merge_pr_cleanup_paths`.
     CleanupPaths(super::merge_pr_cleanup_paths::CleanupPathsArgs),
+
+    /// `--auto`'s post-wait re-validation read (#8410, #8191 slice): from the
+    /// uncached PR re-read on stdin, whether it merged underneath the wait
+    /// (exit 0 `LOOM-REVALIDATE MERGED`), its head moved (exit 3
+    /// `LOOM-REVALIDATE HEAD-MOVED <sha>`), or the label set to re-run the
+    /// label guards against (exit 0 `LOOM-REVALIDATE LABELS` + one per line).
+    /// An unreadable re-read is exit 1 with the #8896 refusal. Fail-CLOSED —
+    /// see `cli::merge_pr_revalidate`.
+    Revalidate(super::merge_pr_revalidate::RevalidateArgs),
 }
 
 impl MergePrCommand {
@@ -883,6 +892,7 @@ impl MergePrCommand {
             MergePrCommand::ChecksFailure(args) => args.run(),
             MergePrCommand::WorktreePreserve(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
+            MergePrCommand::Revalidate(args) => args.run(),
         }
     }
 }

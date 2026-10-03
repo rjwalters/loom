@@ -235,6 +235,15 @@
 //! `branch_has_landed`'s verdict (#7812) are both already answered by the
 //! caller and passed in; this module owns only the two-input decision and its
 //! byte-frozen message text, consolidating three copies into one.
+//!
+//! [`revalidate`] is `--auto`'s LAST pre-merge read (#8410): what the uncached
+//! PR re-read taken after the check-settle wait says — merged underneath the
+//! wait, head moved (the #5579 exit-3 re-queue), or the label set the
+//! [`loom_pr_guard`] / [`labels`] gates re-run against. It closes the #8896
+//! class one layer below where #8896 left it: a payload `jq` could not parse
+//! used to kill the script under `set -e` with `jq`'s exit 5 and no message,
+//! and a label array `jq` could only partly walk handed the gates a truncated
+//! label set. Fail-CLOSED, like the gates it feeds.
 
 pub mod check_runs_rollup;
 pub mod check_runs_streak;
@@ -256,6 +265,7 @@ pub mod reconcile;
 pub mod redate;
 pub mod refs;
 pub mod response;
+pub mod revalidate;
 pub mod sequence;
 pub mod stacked_children;
 pub mod stale_checks;

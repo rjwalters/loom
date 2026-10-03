@@ -398,16 +398,20 @@ retired "the awk source-order scan asserting _is_head_mismatch_response appeared
 # the merge call — a window the armed queue could not see at all. Assert that
 # re-validation exists and routes to the same exit-3 re-queue signal.
 _reval_body="$(awk '/^_revalidate_merge_guards\(\) \{/{f=1} f; f && /^}/{exit}' "$MERGE_PR_SRC")"
+retired "the source scan asserting _revalidate_merge_guards' body contains the comparison 'fresh_sha\" != \"\$MERGE_PRECONDITION_SHA'" \
+  "A head that moved during --auto's check-settle wait must be compared against the SHA the merge is gated on, and a move must re-queue (exit 3) rather than be merged over (#8410/#5579)." \
+  "The comparison left the file: #8191's revalidate slice moved the re-read's decisions into loom-daemon/src/merge_pr/revalidate.rs::decide, so the shell no longer holds a 'fresh_sha' variable for a source scan to find. What stays in the shell is the ROUTING of the verb's HEAD-MOVED verdict to error_head_moved, which the successor assertion directly below still scans for." \
+  "test-merge-pr-auto-blocked-settle.sh AC3 drives the REAL _revalidate_merge_guards through the real binary and asserts exit 3 plus both SHAs in the diagnostic, including a moved head whose labels also went stale (exit 3, never 1); revalidate/tests.rs::a_moved_head_wins_over_stale_labels and ::sha_comparison_is_exact_not_case_folded_or_prefix pin the comparison itself; loom-daemon/tests/merge_pr_revalidate_differential.rs replays a generated corpus against the frozen retired function (tests/fixtures/merge-pr-revalidate-retired.sh). Strictly stronger: the scan checked a line was PRESENT; these check what a moved head DOES."
 TESTS_RUN=$((TESTS_RUN + 1))
 # Here-strings, never pipes: `grep -q` exits on first match and would SIGPIPE
 # the producer under `set -o pipefail` (#7771 class).
-if grep -qF -- 'fresh_sha" != "$MERGE_PRECONDITION_SHA' <<<"$_reval_body" && \
-   grep -qF -- 'error_head_moved' <<<"$_reval_body"; then
+if grep -qF -- 'merge-pr revalidate' <<<"$_reval_body" && \
+   grep -qE -- '"3:LOOM-REVALIDATE HEAD-MOVED "\*\) error_head_moved ' <<<"$_reval_body"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: --auto re-reads the head after its wait and routes a move to error_head_moved (exit 3, #8410)"
+    echo -e "  ${GREEN}PASS${NC}: --auto re-reads the head after its wait and routes the verb's HEAD-MOVED verdict to error_head_moved (exit 3, #8410)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: --auto must compare the post-wait head against \$MERGE_PRECONDITION_SHA and call error_head_moved"
+    echo -e "  ${RED}FAIL${NC}: --auto must re-read via 'merge-pr revalidate' and route its exit-3 HEAD-MOVED verdict to error_head_moved"
 fi
 
 TESTS_RUN=$((TESTS_RUN + 1))

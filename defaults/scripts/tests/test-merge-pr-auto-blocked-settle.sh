@@ -114,7 +114,7 @@ assert_contains() {
 # like a logic failure" the preflight exists to make legible.
 # shellcheck source=lib/require-daemon-bin.sh
 source "$TEST_DIR/lib/require-daemon-bin.sh"
-loom_test_require_daemon_bin "$HELPERS_DIR" "merge-pr" "merge-pr loom-pr-override-comment"
+loom_test_require_daemon_bin "$HELPERS_DIR" "merge-pr" "merge-pr loom-pr-override-comment" "merge-pr revalidate"
 
 # --- Extract the functions under test from the real merge-pr.sh -------------
 FUNCS_FILE="$(mktemp)"

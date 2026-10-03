@@ -277,12 +277,15 @@ echo "Testing the merge-pr floor covers every fail-closed sub-subcommand (#8967)
 #   classify-response  97609b86f (#9228, squash)          0.19.455 -> 0.19.456
 #   partial-conflict   2ab7630c5 (merge of #9246)          0.19.463 -> 0.19.464
 #   checks-failure     397f06feb (merge of #9272)          0.19.464 -> 0.19.465
+#   revalidate         (#8191 slice) declared at VERSION 0.19.647, the landing commit's
+#                      own (a floor above VERSION is refused); first carried by its post-merge bump
 MERGE_PR_VERB_TABLE="verdict-contradiction closed 0.19.172
 stale-checks closed 0.19.221
 loom-pr-guard closed 0.19.375
 classify-response closed 0.19.456
 partial-conflict closed 0.19.464
 checks-failure closed 0.19.465
+revalidate closed 0.19.647
 head-sync-retry open -
 hold-state open -
 redate-checks open -
@@ -334,7 +337,7 @@ CALLED_VERBS="$(grep -o 'loom-daemon}" merge-pr [a-z][a-z0-9-]*' "$MERGE_PR_SRC"
 # If the invocation idiom is ever refactored, the scan above could come back
 # empty and every assertion below would vacuously pass. Pin the three verbs
 # that are fail-closed TODAY so that refactor fails loudly instead.
-for _known in verdict-contradiction stale-checks loom-pr-guard classify-response partial-conflict checks-failure; do
+for _known in verdict-contradiction stale-checks loom-pr-guard classify-response partial-conflict checks-failure revalidate; do
     assert_contains "$CALLED_VERBS" "$_known" \
       "the invocation scan still finds 'merge-pr $_known' in merge-pr.sh"
 done
