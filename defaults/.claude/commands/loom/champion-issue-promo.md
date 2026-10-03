@@ -285,26 +285,17 @@ Like Pass 0, this looks at issues `champion.md`'s Priority 2/3 discovery
 queries never surface on their own — this time issues carrying
 `loom:evaluating` itself, not `loom:operator-only`.
 
-**The failure mode it closes.** `champion.md`'s discovery queries exclude
-every issue carrying `loom:evaluating`, correctly — that keeps a concurrent
-Champion pass from double-claiming a proposal someone else is actively
-evaluating (#4954). The "Claim (staleness-aware...)" section above already
-reclaims a **stale** `loom:evaluating` claim — one left behind by a prior
-Champion pass that died mid-evaluation without ever writing a verdict — but
-that code only runs on an issue **after** it has already been selected by a
-discovery query. Since discovery excludes every `loom:evaluating` issue
-unconditionally, a stale claim is never selected by anything, ever, so its
-own reconciliation code is unreachable in practice: the two mechanisms assume
-each other runs, and neither can reach the other. Confirmed live on a real
-downstream repo: a `loom:evaluating` claim sat for 9 days after the Champion
-pass that set it died, invisible to every later pass, even though its stated
-blocker had long since cleared.
+**Why.** Discovery rightly excludes every `loom:evaluating` issue (no
+double-claim, #4954), so a stale claim left by a pass that died mid-evaluation
+is never selected, and the "Claim (staleness-aware...)" reclaim above, which
+runs only on a selected issue, never reaches it (one sat 9 days downstream).
 
 ```bash
 # One list call per tick, bounded. `loom:evaluating` is only ever added
 # alongside loom:curated/architect/hermit/auditor, so a direct label query is
 # sufficient here — no need to loop over the four proposal labels the way
-# Pass 0 does for loom:operator-only.
+# Pass 0 does for loom:operator-only. Chore-mail loader (#10000):
+eval "$(awk '/^```bash inbox-mail/{f=1;next} /^```/{f=0} f' .loom/docs/inbox-mail.md 2>/dev/null)"; type inbox_mail >/dev/null 2>&1 || inbox_mail() { [ "$1" != on ]; }
 gh issue list --label "loom:evaluating" --state open --limit 200 \
   --json number --jq '.[] | .number' \
   | sort -un | head -n "${LOOM_MAX_EVALUATING_RESCANS:-5}" | while read -r N; do
@@ -332,14 +323,15 @@ gh issue list --label "loom:evaluating" --state open --limit 200 \
     # only repeat the same crash-and-orphan loop. Route to a human instead of
     # looping forever (mirrors Step 4's escalation shape for a repeatedly
     # unrevised proposal, generalized here to a claim that keeps going stale).
-    ./.loom/scripts/post-comment.sh "$N" --body "<!-- champion:evaluating-stale-escalated -->
+    ./.loom/scripts/post-comment.sh "$N" --body "<!-- champion:evaluating-stale-escalated --><!-- loom:chore-mail -->
 **Champion: Escalating to Operator — Repeated Stale \`loom:evaluating\` Claim**
 
 This issue's \`loom:evaluating\` claim has gone stale and been reclaimed $PRIOR_RECLAIMS time(s) (most recently ${AGE_MIN}m old). A Champion evaluation keeps starting and dying before writing a verdict — reclaiming again would repeat the loop. Something stops evaluation from completing here (a crash, a timeout, an environment problem) and needs a human, not another automated retry.
 
 ---
 *Automated by Champion role*" \
-      && gh issue edit "$N" --remove-label "loom:evaluating" --add-label "loom:operator-only,loom:operator-mechanical"
+      && gh issue edit "$N" --remove-label "loom:evaluating" --add-label "loom:operator-only,loom:operator-mechanical" \
+      && inbox_mail chore issue "$N" "Find what keeps killing Champion's evaluation of this issue and fix it"
   else
     ./.loom/scripts/post-comment.sh "$N" --body "$RECLAIM_MARKER
 **Champion: Reclaiming stale \`loom:evaluating\` claim**
@@ -354,12 +346,9 @@ done
 ```
 
 **Do NOT re-evaluate inline here.** This pass only removes the stale label
-(and, on repeated staleness, escalates) — it never runs the 8 promotion
-criteria itself. Once the label is gone the issue is an ordinary candidate
-again and matches `champion.md`'s Priority 2/3 discovery query in the same or
-a later pass, so the normal idempotency/claim/evaluate machinery runs on it
-exactly once, the normal way — this pass never becomes a second, parallel
-evaluation path.
+(or escalates), never running the 8 criteria. The issue is then an ordinary
+candidate for `champion.md`'s Priority 2/3 discovery, evaluated once the
+normal way — never a second, parallel evaluation path.
 
 `LOOM_MAX_EVALUATING_RESCANS` (default **5**) bounds the per-pass cost the
 same way `LOOM_MAX_UNESCALATION_RESCANS` bounds Pass 0 — a backlog of stuck
@@ -412,11 +401,14 @@ prose.
 # GitHub's `in:comments` search qualifier shortlists candidates without
 # scanning every open issue's full comment thread — mirrors Pass 0's per-label
 # loop shape, but the query itself does the label exclusion (`-label:`) so no
-# separate jq filter is needed here.
+# separate jq filter is needed here. Chore-mail loader (#10000):
+eval "$(awk '/^```bash inbox-mail/{f=1;next} /^```/{f=0} f' .loom/docs/inbox-mail.md 2>/dev/null)"; type inbox_mail >/dev/null 2>&1 || inbox_mail() { [ "$1" != on ]; }
 gh issue list --search 'in:comments "Champion Review: APPROVED" -label:loom:issue' \
   --state open --limit 200 --json number --jq '.[] | .number' \
   | sort -un | head -n "${LOOM_MAX_PROMOTION_MISMATCH_RESCANS:-5}" | while read -r N; do
-  ./.loom/scripts/check-promotion-landed.sh --issue "$N" --apply
+  OUT=$(./.loom/scripts/check-promotion-landed.sh --issue "$N" --apply); printf '%s\n' "$OUT"
+  grep -q '^REASON=.*routed to loom:operator-only,loom:operator-mechanical' <<<"$OUT" \
+    && inbox_mail chore issue "$N" "Apply loom:issue and the tier the approved Champion verdict names"
 done
 ```
 

@@ -3,7 +3,8 @@
 # stubbed curl/gh: unset env -> no-op (no curl, no gh), send/resolve payloads and
 # the Authorization header, failure is non-fatal, the origin-derived key, the
 # human-merge resolve path (resolve-merged), the hold file's loader with the doc
-# missing, plus doc-lint for the shared rule and labels.yml.
+# missing, the chore mail (chore / resolve-closed), plus doc-lint for the shared
+# rule, every role's sub-kind routing, and labels.yml (slice 2 of #10000).
 set -u
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
@@ -26,21 +27,26 @@ while [ $# -gt 0 ]; do [ "$1" = --data-binary ] && { cat "${2#@}" >>"$STUB_LOG";
 sed 's/^/config: /' >>"$STUB_LOG"
 printf '{}\n%s' "${STUB_CODE:-200}"; exit "${STUB_RC:-0}"
 STUB
-# gh stub: honours the `merged:>=DATE` search like the forge does; no such
-# qualifier -> [] (so a query without the date filter finds nothing).
+# gh stub: honours the `merged:>=` / `closed:>=` DATE search like the forge
+# does; no such qualifier -> [] (so a query without the date filter finds
+# nothing). `gh issue|pr view N` prints a URL.
 cat >"$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 echo "gh $*" >>"$GH_LOG"
-since=; while [ $# -gt 0 ]; do [ "$1" = --search ] && since=$(sed -n 's/.*merged:>=\([^ ]*\).*/\1/p' <<<"$2"); shift; done
+[ "${2:-}" = view ] && { echo "https://forge.invalid/acme/widgets/$1/$3"; exit 0; }
+since=; f=mergedAt; fx=$GH_FIXTURE
+while [ $# -gt 0 ]; do [ "$1" = --search ] && { since=$(sed -nE 's/.*(merged|closed):>=([^ ]*).*/\2/p' <<<"$2")
+  case "$2" in *closed:*) f=closedAt fx=$GH_CLOSED_FIXTURE ;; esac; }; shift; done
 [ -n "$since" ] || { echo '[]'; exit 0; }
-jq --arg s "$since" '[.[] | select(.mergedAt >= $s)]' "$GH_FIXTURE" 2>/dev/null || cat "$GH_FIXTURE"
+jq --arg s "$since" --arg f "$f" '[.[] | select(.[$f] >= $s)]' "$fx" 2>/dev/null || cat "$fx"
 STUB
 chmod +x "$T/bin/curl" "$T/bin/gh"
-export PATH="$T/bin:$PATH" STUB_LOG="$T/log" GH_LOG="$T/ghlog" GH_FIXTURE="$T/prs.json"
+export PATH="$T/bin:$PATH" STUB_LOG="$T/log" GH_LOG="$T/ghlog" GH_FIXTURE="$T/prs.json" GH_CLOSED_FIXTURE="$T/closed.json"
 # shellcheck disable=SC1091
 . "$T/fn.sh"
 
-now=$(date -u +%Y-%m-%dT%H:%M:%SZ); old=$(date -u -d '-4 days' +%Y-%m-%dT%H:%M:%SZ); held=$(date -u -d '-30 hours' +%Y-%m-%dT%H:%M:%SZ)
+ago() { date -u -d "-$1 hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-"$1"H +%Y-%m-%dT%H:%M:%SZ; }
+now=$(ago 0); old=$(ago 96); held=$(ago 30)
 M='<!-- champion:critical-file-hold -->'
 jq -n --arg now "$now" --arg old "$old" --arg held "$held" --arg m "$M" '[
   {number: 10, mergedAt: $held, comments: [{body: $m}]},
@@ -89,19 +95,87 @@ echo 'not json' >"$GH_FIXTURE"; (inbox_mail resolve-merged crithold-pr "$M" >/de
 
 # The hold file's loader, run where the doc is missing: defines a no-op, `on` false.
 sed -n '/^_im=\$(awk/,/^type inbox_mail/p' "$HOLD" >"$T/loader.sh"
-[ "$(wc -l <"$T/loader.sh")" = 3 ] && ok "hold file carries the 3-line loader" || bad "loader not found in hold file"
+[ "$(wc -l <"$T/loader.sh" | tr -d ' ')" = 3 ] && ok "hold file carries the 3-line loader" || bad "loader not found in hold file"
 out=$(cd "$T" && bash -c '. ./loader.sh; inbox_mail send k b; echo "send=$?"; inbox_mail on; echo "on=$?"' 2>&1)
 { grep -q 'send=0' <<<"$out" && grep -q 'on=1' <<<"$out" && ! grep -q 'not found' <<<"$out"; } && ok "missing doc: no-op fallback defined" || bad "missing doc fallback: $out"
 mkdir -p "$T/repo/.loom/docs" && cp "$DOC" "$T/repo/.loom/docs/"
 out=$(cd "$T/repo" && bash -c '. ../loader.sh; type inbox_mail | grep -c resolve-merged') && ok "doc present: loader evals the fence" || bad "loader with doc"
 
 grep -q 'Two ways to reach a human' "$ROOT/defaults/docs/label-state-machine.md" && ok "rule in label-state-machine.md" || bad "rule missing"
-[ "$(grep -rl --exclude-dir=tests 'a call is a decision, a human task is a mail' "$ROOT/defaults" | wc -l)" = 1 ] && ok "rule text appears once" || bad "rule text count"
+[ "$(grep -rl --exclude-dir=tests 'a call is a decision, a human task is a mail' "$ROOT/defaults" | wc -l | tr -d ' ')" = 1 ] && ok "rule text appears once" || bad "rule text count"
 grep -q 'loom:operator-mechanical' "$ROOT/defaults/.github/labels.yml" && ok "operator-mechanical label kept" || bad "label removed"
 grep -q 'inbox_mail resolve "\$CF_MAIL_KEY"' "$HOLD" && ok "hold resolves mail" || bad "hold resolve missing"
 grep -q 'inbox_mail send' "$HOLD" && ok "hold sends mail" || bad "hold send missing"
 grep -q 'inbox_mail on &&' "$HOLD" && ok "hold gates its forge read on inbox config" || bad "hold read ungated"
 grep -qF 'inbox_mail resolve-merged crithold-pr "<!-- champion:critical-file-hold -->"' \
   "$ROOT/defaults/.claude/commands/loom/champion-pr-merge.md" && ok "Champion runs resolve-merged per pass" || bad "resolve-merged not wired"
+
+# --- Slice 2: chore mail (loom:operator-mechanical) -------------------------
+CMD="$ROOT/defaults/.claude/commands/loom"; LSM="$ROOT/defaults/docs/label-state-machine.md"
+CM='<!-- loom:chore-mail -->'
+jq -n --arg now "$now" --arg old "$old" --arg held "$held" --arg m "$CM" '[
+  {number: 20, closedAt: $held, labels: [{name: "loom:operator-mechanical"}], comments: []},
+  {number: 21, closedAt: $now, labels: [], comments: [{body: ("Routing\n" + $m)}]},
+  {number: 22, closedAt: $now, labels: [{name: "loom:operator-blocked"}], comments: [{body: "x"}]},
+  {number: 23, closedAt: $old, labels: [{name: "loom:operator-mechanical"}], comments: [{body: $m}]}]' >"$GH_CLOSED_FIXTURE"
+unset LOOM_UI_INBOX_URL LOOM_UI_INGEST_KEY; : >"$STUB_LOG"; : >"$GH_LOG"
+out=$(inbox_mail chore issue 7 "Rotate the key"; inbox_mail resolve-closed issue); rc=$?
+{ [ $rc -eq 0 ] && [ ! -s "$GH_LOG" ] && [ ! -s "$STUB_LOG" ] && grep -q "not configured" <<<"$out"; } \
+  && ok "chore + resolve-closed unconfigured: no-op, no gh, no curl" || bad "chore unconfigured"
+export LOOM_UI_INBOX_URL=http://inbox.invalid LOOM_UI_INGEST_KEY=secret
+: >"$STUB_LOG"; (cd "$T/issue-77" && inbox_mail chore issue 7 "Rotate the deploy key on host-2" >/dev/null)
+{ [ "$(grep -c called "$STUB_LOG")" = 1 ] && grep -q '"key": "mail-widgets-chore-issue-7"' "$STUB_LOG" \
+  && grep -q 'Rotate the deploy key on host-2 — https://forge.invalid/acme/widgets/issue/7' "$STUB_LOG"; } \
+  && ok "chore: one keyed mail naming the action, item linked" || bad "chore payload: $(cat "$STUB_LOG")"
+: >"$STUB_LOG"; (cd "$T/issue-77" && inbox_mail chore pr 8 "Grant the CI token" >/dev/null)
+grep -q '"key": "mail-widgets-chore-pr-8"' "$STUB_LOG" && ok "chore pr: key mail-<repo>-chore-pr-N" || bad "chore pr key"
+: >"$STUB_LOG"; out=$(inbox_mail chore issue 7; inbox_mail chore epic 7 "x"); rc=$?
+{ [ $rc -eq 0 ] && [ ! -s "$STUB_LOG" ]; } && ok "chore without action / bad kind: not sent, rc 0" || bad "chore guards"
+: >"$STUB_LOG"; : >"$GH_LOG"; (cd "$T/issue-77" && inbox_mail resolve-closed issue >/dev/null); rc=$?
+grep -Eq 'issue list --state all --limit 100 --search closed:>=[0-9]{4}-' "$GH_LOG" \
+  && ok "resolve-closed: query filters on close date" || bad "resolve-closed query: $(cat "$GH_LOG")"
+{ [ $rc -eq 0 ] && [ "$(grep -c called "$STUB_LOG")" = 2 ] && [ "$(grep -c '"resolve": true' "$STUB_LOG")" = 2 ] \
+  && grep -q '"key": "mail-widgets-chore-issue-20"' "$STUB_LOG" && grep -q '"key": "mail-widgets-chore-issue-21"' "$STUB_LOG"; } \
+  && ok "resolve-closed: #20 (label) and #21 (marker) resolved; unrelated/old skipped" || bad "resolve-closed selection: $(cat "$STUB_LOG")"
+: >"$GH_LOG"; inbox_mail resolve-closed pr >/dev/null; grep -q '^gh pr list --state all' "$GH_LOG" && ok "resolve-closed pr lists PRs" || bad "resolve-closed pr"
+
+# The Champion blocks' one-line loader: no-op where the doc is missing, real where present.
+L1=$(grep -h '^ *eval "$(awk .*inbox-mail.md' "$CMD/champion-issue-promo.md" "$CMD/champion-epic.md" | sed 's/^ *//' | sort -u)
+[ "$(grep -c . <<<"$L1")" = 1 ] && ok "Champion one-line loaders are identical" || bad "Champion loaders differ/missing"
+printf '%s\n' "$L1" >"$T/l1.sh"
+out=$(cd "$T" && bash -c '. ./l1.sh; inbox_mail chore issue 1 x; echo "rc=$?"; inbox_mail on; echo "on=$?"' 2>&1)
+{ grep -q 'rc=0' <<<"$out" && grep -q 'on=1' <<<"$out"; } && ok "one-line loader: no-op without the doc" || bad "one-line loader: $out"
+(cd "$T/repo" && bash -c '. ../l1.sh; type inbox_mail | grep -q resolve-closed') && ok "one-line loader evals the fence" || bad "one-line loader with doc"
+
+# (a) every doc site that applies loom:operator-mechanical sends the chore mail within 3 lines.
+mech_lint() { awk 'FNR==1{p=0} /--add-label[ =]*"[^"]*loom:operator-mechanical/ {p=FNR; f=FILENAME}
+  p && /inbox_mail chore/ && FNR-p<=3 {p=0} p && FNR-p==3 {print f ":" p; p=0} END{if (p) print f ":" p}' "$@"; }
+printf 'gh issue edit 1 --add-label "loom:operator-only,loom:operator-mechanical"\n' >"$T/bad.md"
+[ -n "$(mech_lint "$T/bad.md")" ] && ok "mechanical lint flags an unmailed application" || bad "mechanical lint vacuous"
+miss=$(mech_lint "$CMD"/*.md)
+[ -z "$miss" ] && ok "every operator-mechanical application sends a chore mail" || bad "no chore mail after: $miss"
+[ "$(grep -lE -- '--add-label[ =]*"[^"]*loom:operator-mechanical' "$CMD"/*.md | wc -l | tr -d ' ')" -ge 4 ] \
+  && ok "lint is not vacuous (>=4 application sites)" || bad "too few mechanical sites found"
+grep -q 'routed to loom:operator-only,loom:operator-mechanical' "$ROOT/defaults/scripts/check-promotion-landed.sh" \
+  && grep -A1 "routed to loom:operator-only,loom:operator-mechanical' <<<" "$CMD/champion-issue-promo.md" | grep -q 'inbox_mail chore issue' \
+  && ok "check-promotion-landed escalation mails via its caller" || bad "promotion-landed escalation not mailed"
+grep -A2 -- '--remove-label "loom:operator-mechanical"' "$CMD/sweep-scheduling-signals.md" | grep -q 'resolve its chore mail' \
+  && ok "lane relabel off mechanical resolves the mail" || bad "lane relabel resolve"
+grep -q 'inbox_mail resolve-closed issue; inbox_mail resolve-closed pr' "$CMD/champion-pr-merge.md" \
+  && ok "Champion resolves chore mail per pass" || bad "resolve-closed not wired"
+# (b)+(c) the four roles that can apply the label: mail on mechanical, objective -> decision, pointer to the rule.
+for r in curator builder judge doctor; do
+  f="$CMD/$r.md"
+  grep -q '^| `loom:operator-mechanical` |.*chore mail' "$f" && grep -q '^| `loom:operator-objective` | Not applied (#10000)' "$f" \
+    && grep -q 'Two ways to reach a human' "$f" && ok "$r.md: mechanical mails, objective is a decision, points to the rule" || bad "$r.md routing"
+done
+grep -rnE -- '--add-label[^|]*loom:operator-objective' "$CMD" "$ROOT/defaults/docs" "$ROOT/defaults/scripts"/*.sh >/dev/null \
+  && bad "something still applies loom:operator-objective" || ok "nothing applies loom:operator-objective"
+sec=$(awk '/^## Two ways to reach a human/{f=1;next} /^## /{f=0} f' "$LSM")
+{ grep -q '`loom:operator-blocked`: nothing' <<<"$sec" && grep -q '`loom:operator-objective`: not applied' <<<"$sec" \
+  && grep -q '`loom:operator-mechanical`.*chore mail' <<<"$sec"; } && ok "shared rule maps every sub-kind" || bad "shared rule sub-kind map"
+for l in loom:operator loom:operator-only loom:operator-mechanical loom:operator-blocked loom:operator-decision loom:operator-objective; do
+  grep -q "^- name: \"\{0,1\}$l\"\{0,1\}$" "$ROOT/defaults/.github/labels.yml" || bad "label $l missing from labels.yml"
+done; ok "all six operator labels kept in labels.yml"
 
 [ "$fails" -eq 0 ] && echo "ALL PASSED" || { echo "$fails failed"; exit 1; }

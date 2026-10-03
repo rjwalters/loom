@@ -921,7 +921,7 @@ it, do it, or leave it in the normal queue. Park only for (a) a PO-level
 design/authority call agents cannot make: `loom:operator-decision`, the
 comment ranking 2-4 options, each with a why; or (b) a step needing a human's
 hands (credential, host access, hardware): `loom:operator-mechanical`, the
-comment naming the exact step (mail it per #10000 once that lane ships).
+comment naming the exact step, plus its chore mail (#10000).
 `loom:operator-blocked` is a self-clearing wait, not a human ask. Before
 applying any operator label, the comment states what an agent tried or why it
 structurally cannot. This is the fleet's one statement of the rule; other
@@ -935,16 +935,15 @@ shape per `.loom/docs/label-state-machine.md` → "Bidirectional routing:
 capability-request issue and cross-linking both ways in the same pass.
 
 **Never apply `loom:operator-only` on its own.** Apply exactly one sub-kind
-in the **same** command. Purely additive — the base label is never removed,
-so every filter keyed on it (sweep pre-flight, `warn-operator-gated.sh`,
-Champion's exclusions, the Priority-2 query above) is unchanged:
+in the **same** command (additive: every filter keyed on the base label is
+unchanged):
 
 | Sub-kind | Apply when |
 |---|---|
 | `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
-| `loom:operator-mechanical` | Needs a human's hands: host or admin access, a credential, hardware — no judgement required |
+| `loom:operator-mechanical` | Needs a human's hands: host or admin access, a credential, hardware — no judgement required. **Also send its chore mail** (#10000) |
 | `loom:operator-decision` | The act requires authority an agent structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) |
-| `loom:operator-objective` | Determined once the operator states an objective — list the candidate objectives and the answer under each (#5826); a missing objective is this, not `-decision` |
+| `loom:operator-objective` | Not applied (#10000): a missing objective is `loom:operator-decision`, the candidate objectives as its ranked options |
 
 ```bash
 # Curator routing a genuine PO-level decision: 2-4 ranked options, each with
@@ -956,17 +955,17 @@ loom-daemon operator-decision apply <number> --input d.json --also-label loom:op
 label is safe to reach for (#5826).** `loom:operator-decision` is **not** a
 safe default: run the falsifiability test from
 `.loom/docs/label-state-machine.md` — name the axis two well-informed people
-would still disagree on, and show it is a preference, not a fact. If you
-can't, the item is determined: finish it, don't park it.
+would still disagree on, and show it is a preference. If you can't, the item
+is determined: finish it.
 
 **Comment requirements, same comment as the label:** `loom:operator-blocked`
 — a literal `Blocked by #N` / `Depends on #N` / `Requires #N` line (the
 phrasings `detect-dependency-cycle.sh` and `warn-operator-gated.sh` parse; a
 backtick-quoted reference does not count). `loom:operator-decision` — name
-the disagreement axis and why it is a preference, not a fact.
-`loom:operator-objective` — the candidate objectives and the answer under
-each. Full taxonomy: `.loom/docs/label-state-machine.md` →
-"`loom:operator-only` sub-kinds".
+the disagreement axis and why it is a preference, not a fact. Full taxonomy:
+`.loom/docs/label-state-machine.md` → "`loom:operator-only` sub-kinds"; how
+the human is told (decision or mail, nothing else): its
+"Two ways to reach a human"; the mail: `.loom/docs/inbox-mail.md` → "Chore mail".
 
 **Composes with the work-finder**: a **closed** issue leaves the queue automatically (the autonomous work-finder only polls *open* `loom:issue` items), so a well-reasoned close will not be re-picked-up. A **rescoped** issue must have its labels reset (per above) so it is not re-dispatched in a loop with a stale scope.
 
@@ -1733,7 +1732,7 @@ gh issue view <number> --json labels --jq '.labels[].name' | grep -q '^loom:oper
     # immediately before mutating, per "Claim discipline (#7617)" above.
     gh issue edit <number> --add-label "loom:curating"
     ./.loom/scripts/post-comment.sh <number> --body "<!-- curator:dep-recheck:$CONCLUSION_HASH -->
-<!-- curator:orthogonal-block:$ORTHOGONAL -->
+<!-- curator:orthogonal-block:$ORTHOGONAL --><!-- loom:chore-mail -->
 **Curator: tracked blocker is stale — the real block is elsewhere**
 
 The Dependencies entry (\`<tracked blocker>\`) is substantively resolved: <evidence>.
@@ -1742,6 +1741,7 @@ condition, and what would clear it>.
 
 Routing to the operator rather than re-confirming a stale blocker (#6516)."
     gh issue edit <number> --add-label "loom:operator-only,loom:operator-mechanical" --remove-label "loom:curating"
+    inbox_mail chore issue <number> "<the step that clears it>"   # mechanical only; loader: .loom/docs/inbox-mail.md
   }
 ```
 

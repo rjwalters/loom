@@ -1027,9 +1027,9 @@ exactly one sub-kind in the **same** command (additive; filters unchanged):
 | Sub-kind | Apply when |
 |---|---|
 | `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
-| `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required |
+| `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required. **Also send its chore mail** (#10000) |
 | `loom:operator-decision` | The act requires authority you structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) |
-| `loom:operator-objective` | The work is determined once the operator states an objective — name the candidate objectives and the answer under each (#5826) |
+| `loom:operator-objective` | Not applied (#10000): a missing objective is `loom:operator-decision`, the candidate objectives as its ranked options |
 
 ```bash
 # Builder parking a claimed issue on a decision: 2-4 ranked options, each with
@@ -1045,8 +1045,7 @@ it, name the axis along which two well-informed people would still disagree
 and show it is a preference, not a fact (the falsifiability test in
 `.loom/docs/label-state-machine.md`). If you cannot name that axis, the
 "decision" is really an unfinished derivation — keep working instead of
-parking it. If the only gap is an unstated objective, that is
-`loom:operator-objective`, not `loom:operator-decision`.
+parking it.
 
 **If you chose `loom:operator-blocked`**, the same comment MUST name the blocker
 in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
@@ -1058,12 +1057,9 @@ pass can tell when the blocker clears.
 **If you chose `loom:operator-decision`**, the options' whys MUST name the
 disagreement axis and why it is a preference, not a fact.
 
-**If you chose `loom:operator-objective`**, the same comment MUST list the
-candidate objectives and the answer under each — not just "needs an
-objective."
-
-Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
-"`loom:operator-only` sub-kinds".
+Full taxonomy: `.loom/docs/label-state-machine.md` → "`loom:operator-only`
+sub-kinds"; how the human is told (decision or mail, nothing else): its
+"Two ways to reach a human"; the mail: `.loom/docs/inbox-mail.md` → "Chore mail".
 
 **Composes with the work-finder**: a **closed** issue leaves the queue automatically (the autonomous work-finder only polls *open* `loom:issue` items), so a well-reasoned close is not re-picked-up. A **rescoped** issue must have its labels reset so it is not re-dispatched in a loop with a stale scope.
 
