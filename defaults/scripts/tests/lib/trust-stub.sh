@@ -23,6 +23,7 @@
 # via two fixture files in `LOOM_TEST_STUB_DIR` (mirroring the gh stub's
 # comments.json/comments-fail convention): `check-branch-rc` (the exit code
 # to return) and `check-branch-stdout` (its stdout, e.g. a timestamp or SHA).
+# Every check-branch argv is appended to `check-branch-args.log` (#10027).
 
 loom_trust_stub() {
     local dir="${1:?loom_trust_stub: stub dir required}"
@@ -38,6 +39,7 @@ fi
 if [[ "${1:-} ${2:-}" == "forge check-branch" ]]; then
     d="${LOOM_TEST_STUB_DIR:-}"
     rc=1
+    [[ -n "$d" ]] && echo "$*" >> "$d/check-branch-args.log"
     if [[ -n "$d" && -f "$d/check-branch-rc" ]]; then
         rc="$(cat "$d/check-branch-rc")"
     fi
