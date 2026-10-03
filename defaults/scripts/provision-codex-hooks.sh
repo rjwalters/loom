@@ -280,6 +280,10 @@ if [[ "$ALL_PROFILES" == "1" ]]; then
     # containing spaces survives (read -d '').
     while IFS= read -r -d '' _profile; do
         [[ "$_profile" == "$_root" ]] && continue
+        # Dot-directories under the root are loom-daemon's own bookkeeping
+        # (`.private-sessions/` holds private-clone session state), never an
+        # account profile: an account name cannot start with a dot.
+        [[ "$(basename "$_profile")" == .* ]] && continue
         if [[ "$REGISTRATION" == "workspace-independent" && "$COMMAND" != "remove" \
               && -n "$(private_session_state "$_profile")" ]]; then
             # A private-clone session's profile carries the pinned, image-owned

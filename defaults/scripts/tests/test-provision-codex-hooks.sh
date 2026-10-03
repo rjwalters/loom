@@ -533,7 +533,8 @@ r="$(run_provision install --codex-home "$PRIVROOT/private" --workspace "$WSA")"
 r="$(run_provision install --all-profiles --profile-root "$PRIVROOT" --workspace "$WSA")"
 [[ "${r%%|*}" == "0" ]] && cmp -s "$PRIVROOT/private/hooks.json" "$TMPROOT/private-hooks.json" \
     && [[ "$(shared_cmd "$PRIVROOT/plain")" == "$CMD_A" ]] \
-    && pass "--all-profiles provisions ordinary profiles and skips private-session ones" \
+    && [[ ! -e "$PRIVROOT/.private-sessions/hooks.json" ]] \
+    && pass "--all-profiles provisions ordinary profiles and skips private-session ones (and .private-sessions itself)" \
     || fail "--all-profiles skips private-session profiles (got ${r%%|*})"
 PP="$(new_profile pinned-private-elsewhere)"
 cp "$TMPROOT/private-hooks.json" "$PP/hooks.json"
