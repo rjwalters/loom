@@ -15,9 +15,12 @@
 //!   the refusal quotes one of the specific forge phrases, one issue search
 //!   for that phrase (repeated each pass only while no open incident is
 //!   known; hits must be trusted-authored and quote it word-bounded);
-//! - one single-issue read per same-repo blocker or child (its state, and
-//!   its labels and body when it inherits a star), at most
-//!   [`MAX_DESCENDANTS_PER_PASS`] per repo.
+//! - one single-issue read per same-repo blocker of a starred issue;
+//! - the inheritance walk: one single-issue read per same-repo child not
+//!   already read this pass (closed children and PRs included), plus the
+//!   reads of each evaluated child's own same-repo blockers. Together these
+//!   are at most [`MAX_WALK_READS_PER_PASS`] per repo per pass, counted as
+//!   forge reads (cache misses), not as open children found.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -50,10 +53,13 @@ pub const PR_LABELS: &[&str] = &[
 /// How deep inheritance follows a chain of blockers.
 pub const MAX_INHERIT_DEPTH: usize = 3;
 
-/// Most inheriting issues one pass reads per repo, so a starred epic with
-/// many children costs a bounded number of reads (the rest wait for a later
-/// pass, after the first ones close).
-pub const MAX_DESCENDANTS_PER_PASS: usize = 50;
+/// Most single-issue forge reads (cache misses) the inheritance walk makes
+/// per repo per pass: every child it reads, open or closed, issue or PR,
+/// plus every blocker read made to evaluate an open child. A child whose
+/// read, or whose blockers' reads, would exceed it waits for a later pass.
+/// The starred issues' own blocker reads are outside the walk and not
+/// counted here.
+pub const MAX_WALK_READS_PER_PASS: usize = 50;
 
 /// Cached refusal detections, keyed by (repo, PR) and valid while the PR's
 /// `updated_at` is unchanged, plus the incident a signature search found
@@ -130,6 +136,10 @@ pub struct Evaluator<'a> {
     issues: HashMap<u32, Option<RestIssue>>,
     prs_by_issue: BTreeMap<u32, RestIssue>,
     propagate: bool,
+    /// Single-issue forge reads (cache misses) made so far.
+    reads: usize,
+    /// While set, no read past this count reaches the forge (the walk).
+    read_cap: Option<usize>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -146,6 +156,8 @@ impl<'a> Evaluator<'a> {
             issues: HashMap::new(),
             prs_by_issue: BTreeMap::new(),
             propagate: true,
+            reads: 0,
+            read_cap: None,
         }
     }
 
@@ -193,6 +205,14 @@ impl<'a> Evaluator<'a> {
         if let Some(cached) = self.issues.get(&n) {
             return cached.clone();
         }
+        if self.read_cap.is_some_and(|cap| self.reads >= cap) {
+            log::debug!(
+                "star_liveness: {} reached its read cap this pass; #{n} not read",
+                self.ctx.slug
+            );
+            return None;
+        }
+        self.reads += 1;
         let read = self.forge.issue(n).unwrap_or_else(|e| {
             log::debug!("star_liveness: reading {}#{n} failed: {e}", self.ctx.slug);
             None
@@ -294,19 +314,39 @@ impl<'a> Evaluator<'a> {
         })
     }
 
-    fn blockers(&mut self, issue: &RestIssue) -> Vec<BlockerRef> {
+    /// The dependency refs [`Self::blockers`] reads, when `issue` is blocked.
+    fn dependency_refs(&self, issue: &RestIssue) -> Vec<String> {
         if !issue.labels.iter().any(|l| l == BLOCKED_LABEL) {
             return Vec::new();
         }
         let body = issue.body.as_deref().unwrap_or_default();
-        let prefix = format!("{}#", self.ctx.slug.to_ascii_lowercase());
         crate::dep_classify::refs::parse_dependency_refs(body, self.ctx.slug)
+    }
+
+    /// `r`'s number when it names an issue in this repo.
+    fn same_repo_number(&self, r: &str) -> Option<u32> {
+        let prefix = format!("{}#", self.ctx.slug.to_ascii_lowercase());
+        r.to_ascii_lowercase()
+            .strip_prefix(&prefix)
+            .and_then(|n| n.parse::<u32>().ok())
+    }
+
+    /// Forge reads [`Self::blockers`] would make for `issue` (its same-repo
+    /// blockers not read yet this pass).
+    fn pending_blocker_reads(&self, issue: &RestIssue) -> usize {
+        self.dependency_refs(issue)
+            .iter()
+            .filter_map(|r| self.same_repo_number(r))
+            .filter(|n| *n != issue.number && !self.issues.contains_key(n))
+            .collect::<BTreeSet<u32>>()
+            .len()
+    }
+
+    fn blockers(&mut self, issue: &RestIssue) -> Vec<BlockerRef> {
+        self.dependency_refs(issue)
             .into_iter()
             .map(|r| {
-                let same = r
-                    .to_ascii_lowercase()
-                    .strip_prefix(&prefix)
-                    .and_then(|n| n.parse::<u32>().ok());
+                let same = self.same_repo_number(&r);
                 match same {
                     Some(n) if n != issue.number => {
                         let open = self.issue(n).map(|b| b.state.eq_ignore_ascii_case("open"));
@@ -501,6 +541,11 @@ impl<'a> Evaluator<'a> {
             .iter()
             .map(|e| (e.facts.issue.number, e.landing.inherits.clone()))
             .collect();
+        // Count the walk's forge reads, not the open children it finds: a
+        // closed child or a PR costs a read too (#10073 review).
+        let walk_start = self.reads;
+        let cap = walk_start + MAX_WALK_READS_PER_PASS;
+        self.read_cap = Some(cap);
         for _ in 0..MAX_INHERIT_DEPTH {
             let mut next = Vec::new();
             for (parent, inherits) in frontier {
@@ -510,18 +555,18 @@ impl<'a> Evaluator<'a> {
                     if !seen.insert(child) {
                         continue;
                     }
-                    if found.len() >= MAX_DESCENDANTS_PER_PASS {
-                        log::debug!(
-                            "star_liveness: {} reached {MAX_DESCENDANTS_PER_PASS} inheriting \
-                             issues this pass; #{child} waits for a later one",
-                            self.ctx.slug
-                        );
-                        continue;
-                    }
                     let Some(issue) = self.issue(child) else {
                         continue;
                     };
                     if issue.is_pull_request || !issue.state.eq_ignore_ascii_case("open") {
+                        continue;
+                    }
+                    if self.reads + self.pending_blocker_reads(&issue) > cap {
+                        log::debug!(
+                            "star_liveness: {} reached {MAX_WALK_READS_PER_PASS} walk reads \
+                             this pass; #{child} waits for a later one",
+                            self.ctx.slug
+                        );
                         continue;
                     }
                     let e = self.evaluate_one(&issue, None, None);
@@ -534,6 +579,7 @@ impl<'a> Evaluator<'a> {
             }
             frontier = next;
         }
+        self.read_cap = None;
         let open: BTreeSet<u32> = found.iter().map(|e| e.facts.issue.number).collect();
         graph.retain(|e| open.contains(&e.child));
         let inherited = edges::descendants(&roots, &graph, MAX_INHERIT_DEPTH);

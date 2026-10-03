@@ -115,3 +115,67 @@ fn a_shared_child_takes_the_earlier_parents_star() {
     let r = Host::new("host-a").pass(&world, &[input], Vec::new(), t(10, 0));
     assert_eq!(inherited(&r), vec![(3, Some(2), Some("2026-09-28T08:00:00Z".to_string()))]);
 }
+
+/// The walk's cap counts forge reads, not open children found: a task list
+/// of 60 closed children costs at most `MAX_WALK_READS_PER_PASS` reads, and
+/// the blocker reads of a blocked child count against it too (#10073 review).
+#[test]
+fn the_walk_caps_forge_reads_counting_closed_children_and_blocker_reads() {
+    use crate::star_liveness::collect::MAX_WALK_READS_PER_PASS;
+    let world = World::default();
+    let slug = "i/cap";
+    // Open, blocked children first (lower numbers), each blocked by one
+    // closed issue, then 60 closed children.
+    let mut list = String::new();
+    for n in 10..=12 {
+        list.push_str(&format!("- [ ] #{n}\n"));
+        let blocked = issue_with_body(n, &["loom:blocked"], &format!("Blocked by #{}\n", n + 290));
+        world.add(slug, blocked);
+        let mut b = issue(n + 290, &["loom:issue"]);
+        b.state = "closed".into();
+        world.add(slug, b);
+    }
+    for n in 100..160 {
+        list.push_str(&format!("- [x] #{n}\n"));
+        let mut c = issue(n, &["loom:issue"]);
+        c.state = "closed".into();
+        world.add(slug, c);
+    }
+    world.add(slug, issue_with_body(1, &[STAR, "loom:issue"], &list));
+    let mut input = repo_input(slug);
+    starred(&mut input, 1, AT);
+    let r = Host::new("host-a").pass(&world, &[input], Vec::new(), t(10, 0));
+    let got: Vec<u32> = inherited(&r).into_iter().map(|(n, _, _)| n).collect();
+    assert_eq!(got, vec![10, 11, 12], "the open children are reached first and inherit");
+    let reads = world.repo(slug).issue_reads;
+    assert_eq!(
+        reads, MAX_WALK_READS_PER_PASS,
+        "3 children + 3 blocker reads + 44 closed children, then the walk stops"
+    );
+}
+
+/// A child whose blocker reads would cross the cap waits; the cap still holds.
+#[test]
+fn a_child_whose_blocker_reads_would_cross_the_cap_waits() {
+    use crate::star_liveness::collect::MAX_WALK_READS_PER_PASS;
+    let world = World::default();
+    let slug = "i/cap2";
+    let mut list = String::new();
+    // 49 closed children, then one open child with two unread blockers.
+    for n in 100..149 {
+        list.push_str(&format!("- [x] #{n}\n"));
+        let mut c = issue(n, &["loom:issue"]);
+        c.state = "closed".into();
+        world.add(slug, c);
+    }
+    list.push_str("- [ ] #200\n");
+    world.add(slug, issue_with_body(200, &["loom:blocked"], "Blocked by #301 and #302\n"));
+    world.add(slug, issue(301, &["loom:issue"]));
+    world.add(slug, issue(302, &["loom:issue"]));
+    world.add(slug, issue_with_body(1, &[STAR, "loom:issue"], &list));
+    let mut input = repo_input(slug);
+    starred(&mut input, 1, AT);
+    let r = Host::new("host-a").pass(&world, &[input], Vec::new(), t(10, 0));
+    assert!(inherited(&r).is_empty(), "#200 waits for a later pass");
+    assert_eq!(world.repo(slug).issue_reads, MAX_WALK_READS_PER_PASS);
+}

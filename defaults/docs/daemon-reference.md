@@ -2455,7 +2455,8 @@ Every open same-repo blocker inherits, not only the first one named. With
 way: `<!-- loom:park Blocked by: #C -->` records, `- [ ] #C` task-list entries,
 and the dependency phrases of a `loom:blocked` issue even when it is also held
 for the operator (#10012). Inheritance is transitive to depth 3 (a cycle stops), never crosses
-repos, reads at most 50 inheriting issues per repo per pass, and a child of
+repos, makes at most 50 walk reads per repo per pass (closed children and
+blocker reads count), and a child of
 several starred issues takes the earliest starred-at. This is the in-memory
 ordering only; the label itself is not written yet.
 
