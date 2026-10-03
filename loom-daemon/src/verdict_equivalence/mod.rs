@@ -344,8 +344,10 @@ pub fn detect(
 /// Indeterminate still fails closed — both callers clear the verdict exactly as
 /// before — but a clear caused by "could not compare" (an unfetchable commit, a
 /// `gh` outage, a shallow clone) must be visible as such, not indistinguishable
-/// from a real content change. `unavailable` is empty for every determinate
-/// answer, so a caller can key on it directly.
+/// from a real content change. `unavailable` is empty for every `Equivalent`
+/// answer and for a `Changed` every kind could weigh in on; a `Changed` reached
+/// only because a stronger kind could not run keeps its reasons (see
+/// [`Assessment::fail_closed_note`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assessment {
     pub equivalence: Equivalence,
@@ -373,6 +375,27 @@ impl Assessment {
     pub fn unavailable_note(&self) -> Option<String> {
         (self.equivalence == Equivalence::Indeterminate && !self.unavailable.is_empty())
             .then(|| self.unavailable.join("; "))
+    }
+
+    /// Why a clear is fail-closed rather than proven: the [`Self::unavailable_note`]
+    /// of an `Indeterminate`, or — for a `Changed` reached only because an
+    /// earlier, stronger kind could not run (e.g. the incident's unfetchable
+    /// head, whose base-touches-a-shared-file shape always refutes the patch
+    /// kind) — that kind's reasons, prefixed so the patch refutation is not
+    /// mistaken for a proven content change. `None` for `Equivalent` and for a
+    /// `Changed` every kind weighed in on.
+    #[must_use]
+    pub fn fail_closed_note(&self) -> Option<String> {
+        match self.equivalence {
+            Equivalence::Indeterminate => self.unavailable_note(),
+            Equivalence::Changed if !self.unavailable.is_empty() => Some(format!(
+                "the PR's diff against its base differs (rebase-patch-identical refuted — a base \
+                 change touching a file this PR also changes does that too), but a stronger \
+                 check could not run: {}",
+                self.unavailable.join("; ")
+            )),
+            _ => None,
+        }
     }
 }
 
@@ -485,7 +508,13 @@ fn assess_with(
         Evidence::Proven => {
             Assessment::determinate(Equivalence::Equivalent(EquivalenceKind::RebasePatchIdentical))
         }
-        Evidence::Refuted => Assessment::determinate(Equivalence::Changed),
+        // #10134: still Changed (fail closed), but keep any reason an earlier
+        // kind could not answer — dropping it would make a failed fetch in
+        // the incident's shared-file shape clear the verdict silently.
+        Evidence::Refuted => Assessment {
+            equivalence: Equivalence::Changed,
+            unavailable,
+        },
         Evidence::Indeterminate => {
             unavailable.push(
                 "rebase-patch-identical: forge compare unavailable or inconclusive (gh failure, \
@@ -568,6 +597,12 @@ pub fn handle(pr: u32, reviewed: &str, head: &str) -> anyhow::Result<()> {
         }
         Equivalence::Changed => {
             println!("VERDICT_EQUIVALENT=0");
+            if let Some(why) = assessment.fail_closed_note() {
+                eprintln!(
+                    "loom-daemon forge verdict-equivalent: PR #{pr} {reviewed} -> {head} not \
+                     shown equivalent — re-review (fail closed). Why: {why}"
+                );
+            }
             std::process::exit(0);
         }
         Equivalence::Indeterminate => {

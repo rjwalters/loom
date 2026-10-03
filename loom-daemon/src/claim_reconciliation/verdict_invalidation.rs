@@ -88,7 +88,7 @@ pub(super) fn handle_invalidate(
     if tree_carveout {
         let assessment =
             verdict_equivalence::assess(gh_bin, Some(root), pr.number, marker_sha, head_sha);
-        unavailable_note = assessment.unavailable_note();
+        unavailable_note = assessment.fail_closed_note();
         if let Some(note) = &unavailable_note {
             log::warn!(
                 "claim_reconciliation: PR #{} in {}: could not determine whether the head move \

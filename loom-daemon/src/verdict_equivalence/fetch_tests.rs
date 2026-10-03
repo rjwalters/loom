@@ -199,6 +199,7 @@ fn a_real_content_commit_absent_from_the_clone_is_still_changed() {
     let a = assess_with(true, true, &gh, Some(&f.host), PR, &f.reviewed, &head);
     assert_eq!(a.equivalence, Equivalence::Changed, "{a:?}");
     assert_eq!(a.unavailable_note(), None, "a determinate answer carries no reason");
+    assert_eq!(a.fail_closed_note(), None, "a provable change is not reported as unchecked");
 }
 
 /// A base merge with a hand edit folded in is not the automatic merge: once
@@ -263,10 +264,19 @@ fn an_unfetchable_head_fails_closed_and_says_why() {
     assert!(why.contains("could not be fetched"), "{why}");
     assert!(why.contains(&head), "{why}");
 
-    // Through detect: the patch kind refutes here, so the overall answer is a
-    // determinate Changed — the case where that refutation is reached only
-    // because the clean-merge kind could not run. Make the patch kind
-    // unavailable too to see the whole fail-closed note.
+    // The incident's own shape (#10134 judge blocker): the base change touches
+    // a file the PR also changes, so the patch kind refutes. The answer stays
+    // Changed (fail closed) but must still carry WHY the clean-merge kind could
+    // not answer — never a silent clear.
+    let a = assess_with(true, true, &gh, Some(&f.host), PR, &f.reviewed, &head);
+    assert_eq!(a.equivalence, Equivalence::Changed, "{a:?}");
+    let note = a
+        .fail_closed_note()
+        .expect("a Changed reached only because clean-merge could not run must say why");
+    assert!(note.contains("could not be fetched"), "{note}");
+    assert!(note.contains("rebase-patch-identical refuted"), "{note}");
+
+    // Make the patch kind unavailable too to see the whole Indeterminate note.
     let gh_down = fake_gh(
         ghdir.path(),
         &log,

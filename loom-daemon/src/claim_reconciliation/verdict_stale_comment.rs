@@ -110,7 +110,7 @@ pub(super) fn unavailable_line(note: Option<&str>) -> String {
     note.map(|why| {
         format!(
             "\n- **Could not check whether the reviewed change is unchanged — cleared to fail \
-             closed, not because a content change was found.** Why: {why}"
+             closed, not because a content change was proven.** Why: {why}"
         )
     })
     .unwrap_or_default()
