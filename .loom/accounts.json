@@ -6,7 +6,7 @@
       "name": "rjwalters",
       "credential_kind": "codex_home",
       "credential_reference": "rjwalters",
-      "enabled": false,
+      "enabled": true,
       "email": null
     },
     {
@@ -14,7 +14,7 @@
       "name": "robb",
       "credential_kind": "codex_home",
       "credential_reference": "robb",
-      "enabled": false,
+      "enabled": true,
       "email": null
     },
     {
@@ -38,7 +38,7 @@
       "name": "agent-3",
       "credential_kind": "codex_home",
       "credential_reference": "agent-3",
-      "enabled": false,
+      "enabled": true,
       "email": null
     },
     {

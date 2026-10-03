@@ -700,13 +700,6 @@ pub fn recover_issue(
     println!("Recovered issue #{issue}");
 }
 
-/// The `gh` binary to invoke for the PR-side claim pass. Honors `LOOM_GH_BIN`
-/// (tests / overrides), the same seam [`super::gh`]'s own `gh_bin()` uses, so
-/// a fixture can steer this pass without mutating the process-wide `PATH`.
-fn pr_claim_gh_bin() -> PathBuf {
-    PathBuf::from(std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string()))
-}
-
 /// Format a [`crate::claim_reconciliation::PrReclaimReason`] as a short,
 /// machine-readable token — consistent with the snake_case reason strings
 /// [`check_untracked_building`] already emits (`no_spawn_loop_entry`,
@@ -743,7 +736,7 @@ fn format_pr_reclaim_reason(reason: crate::claim_reconciliation::PrReclaimReason
 /// edit` calls — every reported entry is detection-only, mirroring the
 /// issue-side dry-run contract.
 pub fn check_stale_pr_claims(repo_root: &Path, result: &mut OrphanRecoveryResult, recover: bool) {
-    let gh_bin = pr_claim_gh_bin();
+    let gh_bin = PathBuf::from(crate::gh_invocation::gh_bin());
     let (_checked, outcomes) =
         crate::claim_reconciliation::forge::reconcile_pr_claims_report(&gh_bin, repo_root, recover);
 

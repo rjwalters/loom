@@ -1,0 +1,1 @@
+../../defaults/docs/inbox-mail.md

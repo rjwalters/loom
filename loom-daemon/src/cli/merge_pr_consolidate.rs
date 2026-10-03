@@ -68,7 +68,7 @@ impl ConsolidatePrepareArgs {
         }
         scope_repo(self.repo.as_deref());
         let root = std::env::current_dir()?;
-        let gh = std::path::PathBuf::from(cons::gh_bin_env());
+        let gh = std::path::PathBuf::from(loom_daemon::gh_invocation::gh_bin());
         let bounds = Bounds::from_env();
 
         // 1-2. Fetch components + default branch, then eligibility — all
@@ -221,7 +221,7 @@ impl ConsolidateAbortArgs {
     pub(crate) fn run(self) -> Result<()> {
         scope_repo(self.repo.as_deref());
         let root = std::env::current_dir()?;
-        let gh = std::path::PathBuf::from(cons::gh_bin_env());
+        let gh = std::path::PathBuf::from(loom_daemon::gh_invocation::gh_bin());
         let reason = match self.cause {
             RequestedCause::Operator => AbortReason::Operator,
             RequestedCause::CiFailure => AbortReason::CiFailure,

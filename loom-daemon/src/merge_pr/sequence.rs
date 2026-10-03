@@ -406,13 +406,6 @@ pub fn verdict_line(verdict: Verdict, marker: &SequenceMarker) -> String {
 // with a script path instead of a global env var that would race across
 // parallel test threads.
 
-/// The `gh` binary, honoring `LOOM_GH_BIN` — the same seam
-/// `redate` and `stale_checks::fetch` provide.
-#[must_use]
-pub fn gh_bin() -> String {
-    std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
-}
-
 /// Fetch every TRUSTED comment body on `pr`, oldest first (#9548: an
 /// outsider's well-formed marker is prose, dropped before any parse).
 /// `--paginate` is REQUIRED: the marker is always among the NEWEST comments,

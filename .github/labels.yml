@@ -12,14 +12,15 @@
 # Sync with: .loom/scripts/sync-labels.sh (from the installed repo root)
 # Or manually: gh label create/edit commands
 #
-# SOURCE OF TRUTH / PARITY CONTRACT (#3896):
+# SOURCE OF TRUTH / PARITY CONTRACT (#3896, #10013):
+#   THIS FILE IS GENERATED from defaults/labels.json (the label registry, the
+#   single source of truth for label semantics). Do NOT edit it by hand: edit
+#   defaults/labels.json, then run `loom-daemon labels generate --write`.
 #   .github/labels.yml (this repo's live label registry) and
 #   defaults/.github/labels.yml (the installer template copied into fresh
-#   installs) are kept BYTE-IDENTICAL. A fresh install must ship exactly the
-#   label set Loom itself uses, so there are NO intentional differences between
-#   the two files. Edit ONE file, then mirror the change to the other so they
-#   match exactly. CI enforces parity via defaults/scripts/check-labels-drift.sh
-#   (installer-tests job) — the build fails on any drift.
+#   installs) are both generated and therefore BYTE-IDENTICAL. CI enforces it
+#   via defaults/scripts/check-labels-drift.sh (installer-tests job) and the
+#   label_registry unit tests — the build fails on any drift.
 
 # Core Workflow States
 - name: loom:triage
@@ -120,7 +121,7 @@
   color: "A16207"  # yellow-700 - a scheduling hold, one shade apart from the in-progress ambers and the operator orange
 
 - name: loom:auto-merge-ok
-  description: Override a Champion merge-risk hold (applied by Judge or human)
+  description: "Override a Champion merge-risk hold (applied by Judge or human)"
   color: "10B981"  # emerald-500 - signals safe to proceed
 
 - name: loom:ci-failure
@@ -145,7 +146,7 @@
   color: "d93f0b"  # red - indicates runtime/build issue
 
 - name: loom:auditor-capability-request
-  description: Auditor capability request for enhanced validation tooling
+  description: "Auditor capability request for enhanced validation tooling"
   color: "6366F1"  # indigo-500 - indicates meta/tooling request
 
 - name: loom:curated
@@ -154,7 +155,7 @@
 
 # Status Labels
 - name: loom:blocked
-  description: Implementation blocked, needs help or clarification
+  description: "Implementation blocked, needs help or clarification"
   color: "EF4444"  # red-500
 
 - name: loom:urgent
@@ -162,7 +163,7 @@
   color: "DC2626"  # red-600
 
 - name: loom:abort
-  description: Signal to abort the sweep for this issue (returns to loom:issue)
+  description: "Signal to abort the sweep for this issue (returns to loom:issue)"
   color: "F97316"  # orange-500 - warning/signal color
 
 # loom:operator-only vs loom:blocked: operator-only = a human must act or rule
@@ -224,6 +225,10 @@
   description: "operator-only sub-kind: preference/authority axis named; not a safe default (#5826)"
   color: "C2410C"  # orange-700 - darkest
 
+- name: loom:decision-malformed
+  description: "operator-decision bounced for missing/invalid decision block; Curator repairs or re-routes (#10057)"
+  color: "C2410C"  # same family as loom:operator-decision
+
 - name: loom:operator-objective
   description: "operator-only sub-kind: determined once operator states objective; lists candidates"
   color: "FED7AA"  # orange-200 - lightest of all: clears on a single stated preference
@@ -265,24 +270,24 @@
 
 # Epic Labels
 - name: loom:epic
-  description: Multi-phase epic proposal (decomposes into implementation issues)
+  description: "Multi-phase epic proposal (decomposes into implementation issues)"
   color: "7C3AED"  # violet-600 - distinguishes from regular proposals
 
 - name: loom:epic-phase
-  description: Issue is part of an epic phase (references parent epic)
+  description: "Issue is part of an epic phase (references parent epic)"
   color: "8B5CF6"  # violet-500 - lighter variant for child issues
 
 # Tier Labels (Goal Alignment)
 - name: tier:goal-advancing
-  description: Directly implements a milestone deliverable or unblocks goal work
+  description: "Directly implements a milestone deliverable or unblocks goal work"
   color: "0E8A16"  # green - highest priority
 
 - name: tier:goal-supporting
-  description: Infrastructure, testing, or docs for milestone features
+  description: "Infrastructure, testing, or docs for milestone features"
   color: "FBCA04"  # yellow - medium priority
 
 - name: tier:maintenance
-  description: Cleanup, refactoring, or improvements not tied to current goals
+  description: "Cleanup, refactoring, or improvements not tied to current goals"
   color: "D4C5F9"  # purple - lower priority
 
 # Story-Point Size Labels (#9431, epic #9429): estimation is paused.

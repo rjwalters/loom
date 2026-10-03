@@ -98,6 +98,14 @@ pub enum TerminalClassification {
     CwdDeleted,
     ModelRefusal,
     SessionLimit,
+    /// The session exited 0 but the runtime's own sandbox refused every tool
+    /// call, so nothing ran (#10003; cause #9979). Produced by
+    /// `spawn-codex.sh`, never by the shared classifier. It records **no**
+    /// account hold, because the account is not at fault: the sandbox is a
+    /// property of the host's session containers. It is also not a success,
+    /// so it neither clears a hold nor stamps `last_success`. The runtime-level
+    /// fall-through lives in `runtime_preference::sandbox_hold`.
+    SandboxUnavailable,
 }
 
 impl std::str::FromStr for TerminalClassification {
@@ -115,6 +123,7 @@ impl std::str::FromStr for TerminalClassification {
             "CWD_DELETED" => Self::CwdDeleted,
             "MODEL_REFUSAL" => Self::ModelRefusal,
             "SESSION_LIMIT" => Self::SessionLimit,
+            "SANDBOX_UNAVAILABLE" => Self::SandboxUnavailable,
             other => bail!("unknown terminal classification {other:?}"),
         })
     }
@@ -637,6 +646,7 @@ pub fn record_terminal_for_class_with_reset_at(
                 | TerminalClassification::Fatal
                 | TerminalClassification::CwdDeleted
                 | TerminalClassification::ModelRefusal
+                | TerminalClassification::SandboxUnavailable
         ) {
             return Ok(());
         }
@@ -745,7 +755,8 @@ pub fn record_terminal_for_class_with_reset_at(
             TerminalClassification::Timeout
             | TerminalClassification::Fatal
             | TerminalClassification::CwdDeleted
-            | TerminalClassification::ModelRefusal => unreachable!(),
+            | TerminalClassification::ModelRefusal
+            | TerminalClassification::SandboxUnavailable => unreachable!(),
         }
         state.accounts.push(entry);
         state

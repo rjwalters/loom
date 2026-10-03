@@ -68,14 +68,38 @@ fn find_failure_sentinel(full_log: &str) -> Option<(&'static str, &'static str)>
 /// the real cause (see #8123: a mid-run pool-exhaustion or rate-limit abort
 /// could previously be masked by a trailing informational WARN). Otherwise
 /// falls back to the pre-existing cleaned/capped byte tail.
+///
+/// The search is scoped to **this tick's own region** of the log (#9980):
+/// `role-<role>.log` is append-only across every tick, so a whole-file search
+/// let one stale sentinel from weeks earlier (e.g. a 2026-09-20 Claude
+/// `# ACCOUNT_POOL_EXHAUSTED`) relabel every later, unrelated failure of the
+/// same (workspace, role) pair as pool exhaustion. `tick_anchor` is the
+/// timestamp written into this tick's header line immediately before the
+/// spawn — the same anchor `provider_health_feedback` and
+/// `toolless_launch::detect` scope to. Within the region the search still
+/// covers everything, not just the retained tail (the #6757 case). An empty
+/// or absent anchor falls back to the whole file, the pre-#9980 behaviour.
 #[must_use]
-pub(super) fn describe_role_failure(full_log: &str, log_path: &Path) -> String {
-    match find_failure_sentinel(full_log) {
+pub(super) fn describe_role_failure(full_log: &str, log_path: &Path, tick_anchor: &str) -> String {
+    let region = tick_region(full_log, tick_anchor);
+    match find_failure_sentinel(region) {
         Some((sentinel, classification)) => {
             format!("{classification} ({sentinel}) — see the full log at {}", log_path.display())
         }
-        None => clean_and_cap_detail(&truncate_tail(full_log)),
+        None => clean_and_cap_detail(&truncate_tail(region)),
     }
+}
+
+/// This tick's slice of the append-only role log: from the last occurrence of
+/// `tick_anchor` onward, or the whole log when the anchor is empty or absent
+/// (#9980).
+fn tick_region<'a>(full_log: &'a str, tick_anchor: &str) -> &'a str {
+    if tick_anchor.is_empty() {
+        return full_log;
+    }
+    full_log
+        .rfind(tick_anchor)
+        .map_or(full_log, |at| &full_log[at..])
 }
 
 #[cfg(test)]
@@ -153,7 +177,7 @@ mod tests {
         let log =
             "INFO: starting up\n# AUTH_PREFLIGHT_FAILED\nINFO: resolved something unrelated\n";
         let log_path = Path::new("/tmp/some-workspace/.loom/logs/role-champion.log");
-        let detail = describe_role_failure(log, log_path);
+        let detail = describe_role_failure(log, log_path, "");
         assert!(detail.contains("AUTH_PREFLIGHT_FAILED"), "{detail:?}");
         assert!(
             detail.contains("/tmp/some-workspace/.loom/logs/role-champion.log"),
@@ -167,7 +191,7 @@ mod tests {
     fn describe_role_failure_falls_back_to_tail_when_no_sentinel() {
         let log = "ordinary error: connection refused\n";
         let log_path = Path::new("/tmp/some-workspace/.loom/logs/role-judge.log");
-        let detail = describe_role_failure(log, log_path);
+        let detail = describe_role_failure(log, log_path, "");
         assert_eq!(detail, "ordinary error: connection refused");
     }
 
@@ -185,7 +209,7 @@ mod tests {
                    WARN: MCP config not found at /repo/.mcp.json (or the git common dir) - \
                    skipping MCP pre-flight (expected under user-scope loom, #4230)\n";
         let log_path = Path::new("/tmp/some-workspace/.loom/logs/role-guide.log");
-        let detail = describe_role_failure(log, log_path);
+        let detail = describe_role_failure(log, log_path, "");
         assert!(detail.contains("ACCOUNT_POOL_EXHAUSTED"), "{detail:?}");
         assert!(detail.contains("token pool exhausted"), "{detail:?}");
         assert!(
@@ -206,8 +230,65 @@ mod tests {
         assert!(log.len() > MAX_OUTPUT_TAIL_BYTES);
         assert!(!truncate_tail(&log).contains("RATE_LIMIT_ABORT"));
         let log_path = Path::new("/tmp/some-workspace/.loom/logs/role-doctor.log");
-        let detail = describe_role_failure(&log, log_path);
+        let detail = describe_role_failure(&log, log_path, "");
         assert!(detail.contains("RATE_LIMIT_ABORT"), "{detail:?}");
         assert!(detail.contains("rate-limit abort"), "{detail:?}");
+    }
+
+    /// Two ticks in one append-only role log, the shape `launch.rs` writes:
+    /// an older Claude tick that ended in pool exhaustion, then this tick
+    /// (a Codex launch that failed for an unrelated reason).
+    fn two_tick_log(this_anchor: &str, this_tick_body: &str) -> String {
+        format!(
+            "\n==== loom-daemon role_runner: 2026-09-20T04:08:55Z role=curator model=sonnet ====\n\
+             You've hit your session limit\n\
+             # ACCOUNT_POOL_EXHAUSTED\n\
+             \n==== loom-daemon role_runner: {this_anchor} role=curator model=<runtime CLI default> ====\n\
+             {this_tick_body}"
+        )
+    }
+
+    #[test]
+    fn describe_role_failure_ignores_a_sentinel_from_an_earlier_tick() {
+        // Issue #9980: the 2026-09-20 sentinel must not relabel a 2026-10-02
+        // Codex account-selection failure as Claude pool exhaustion.
+        let anchor = "2026-10-02T16:42:53.914071Z";
+        let log = two_tick_log(
+            anchor,
+            "Error: no healthy Codex account is available: alice=reauth_required\n",
+        );
+        let log_path = Path::new("/tmp/ws/.loom/logs/role-curator.log");
+        let detail = describe_role_failure(&log, log_path, anchor);
+        assert!(!detail.contains("ACCOUNT_POOL_EXHAUSTED"), "{detail:?}");
+        assert!(!detail.contains("token pool exhausted"), "{detail:?}");
+        assert!(detail.contains("no healthy Codex account"), "{detail:?}");
+        assert!(
+            !detail.contains("session limit"),
+            "the fallback tail must also stay inside this tick: {detail:?}"
+        );
+    }
+
+    #[test]
+    fn describe_role_failure_still_finds_this_ticks_sentinel_outside_the_tail() {
+        // The #6757 guarantee holds inside the tick region: a sentinel this
+        // tick wrote, pushed out of the retained tail by later noise, is found.
+        let anchor = "2026-10-02T17:00:00Z";
+        let noise = "INFO: idle poll, nothing to do\n".repeat(200);
+        let log = two_tick_log(anchor, &format!("# RATE_LIMIT_ABORT\n{noise}"));
+        let log_path = Path::new("/tmp/ws/.loom/logs/role-curator.log");
+        let detail = describe_role_failure(&log, log_path, anchor);
+        assert!(detail.contains("RATE_LIMIT_ABORT"), "{detail:?}");
+        assert!(!detail.contains("ACCOUNT_POOL_EXHAUSTED"), "{detail:?}");
+    }
+
+    #[test]
+    fn describe_role_failure_without_a_found_anchor_searches_the_whole_log() {
+        // Empty or absent anchor: the pre-#9980 whole-file behaviour.
+        let log = two_tick_log("2026-10-02T18:00:00Z", "ordinary error\n");
+        let log_path = Path::new("/tmp/ws/.loom/logs/role-curator.log");
+        for anchor in ["", "2099-01-01T00:00:00Z"] {
+            let detail = describe_role_failure(&log, log_path, anchor);
+            assert!(detail.contains("ACCOUNT_POOL_EXHAUSTED"), "{anchor:?}: {detail:?}");
+        }
     }
 }

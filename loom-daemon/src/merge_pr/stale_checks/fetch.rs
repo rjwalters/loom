@@ -66,11 +66,7 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::process::Command;
 
-/// The `gh` binary, honoring `LOOM_GH_BIN` for overrides/tests — the same
-/// seam `forge_cmd::gh_bin` provides.
-fn gh_bin() -> String {
-    std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
-}
+use crate::gh_invocation::gh_bin;
 
 /// Run `gh api …` with the given args, returning stdout on success. `gh` is
 /// the binary — a plain argument so a caller's tests can inject a stub without

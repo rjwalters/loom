@@ -582,3 +582,37 @@ fn a_backticked_trailer_whose_link_is_also_declared_plainly_does_not_warn() {
     );
     assert_eq!(unparseable_loom_issue_trailer_warnings(body, "1", false), "");
 }
+
+// --- #10029: emphasis around a line-leading declaration is accepted ---
+
+#[test]
+fn emphasis_around_a_line_leading_declaration_is_read() {
+    for (body, want) in [
+        ("**Part of #694** - x", 694),
+        ("__Part of #694__", 694),
+        ("*Part of #694*", 694),
+        ("_Part of #694_", 694),
+        ("- **Part of #5**", 5),
+        ("> **Contributes to #6**", 6),
+        ("1. **Part of #7**", 7),
+        ("* Part of #3", 3),
+    ] {
+        assert_eq!(partial_increment_refs(body), vec![want], "body: {body:?}");
+    }
+}
+
+#[test]
+fn emphasis_does_not_rescue_backticked_or_mid_sentence_mentions() {
+    for body in [
+        "`Part of #4574`",
+        "**`Part of #4574`**",
+        "see **Part of #9** here",
+    ] {
+        assert!(partial_increment_refs(body).is_empty(), "body: {body:?}");
+    }
+}
+
+#[test]
+fn the_snippet_function_matches_emphasised_declarations() {
+    assert_eq!(partial_increment_ref_snippets("**Part of #694** - x", 694), "**Part of #694");
+}

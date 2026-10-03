@@ -1838,8 +1838,8 @@ unknown-kind rule instead (`/public/*` sees `kind` only).
 The Worker keeps the newest tick per host as live state (`hosts[<id>].queue`
 on `GET /api/fleet-state`) and ignores a redelivered or older snapshot, so a
 retried batch never makes a stalled work finder look live. The fleet
-dashboard renders it as the overview's "Work queue" section, the `#/queue`
-route and a per-host panel.
+dashboard renders it as the overview's "Work queue" section, a fleet-wide
+work queue (host, phase, wait, blocking reason, links) and a per-host panel.
 
 ### `eta.estimate` / `eta.outcome`
 
@@ -1928,8 +1928,9 @@ fact from "this host is not estimating".
 | Field | Type | Notes |
 |---|---|---|
 | `as_of` | RFC 3339 | the newest row's `as_of` — the freshness stamp |
-| `rows[]` | array | one row per `(repo, issue, kind)`, in that order, at most 200 |
+| `rows[]` | array | one row per `(repo, issue, kind)`, in that order, at most 200. Past the cap rows are kept by priority (`land` with `p50`, then `land` refusals, then `start`/`finish`), then re-sorted |
 | `rows_truncated` | integer | rows dropped by the 200-row cap |
+| `rows_truncated_by_kind` | object, optional | `rows_truncated` per kind (`start`/`finish`/`land` -> count). Omitted when nothing was dropped and on older daemons |
 
 Each row:
 

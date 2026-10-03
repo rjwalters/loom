@@ -1,6 +1,10 @@
 //! Blocking role launch; runtime decision polling never performs Docker I/O.
 use super::*;
 
+// #10003: an exit-0 Codex tick whose sandbox refused every tool call is a
+// failure, and arms the host-wide hold the preference walk falls through on.
+pub(super) mod sandbox_noop;
+
 /// Run `spawn-claude.sh -p "<prompt>" --model <model> [--effort <level>]
 /// --dangerously-skip-permissions` in `workspace_root`, appending combined
 /// output to `<logs_dir>/role-<role>.log` (never a pipe — avoids the pipe-buffer
@@ -242,6 +246,19 @@ pub(super) fn run_role_with_timeout(
                     log::warn!("role_runner: {detail}");
                     return RoleTickOutcome::Failure(detail);
                 }
+                // Issue #10003: exit 0 is not evidence a CODEX tick did
+                // anything either. When this tick's own terminal record says
+                // the sandbox refused every tool call, report the failed tick
+                // it was and arm the hold that routes the next ticks to the
+                // next preference tap; a record of SUCCESS clears that hold.
+                if let Some(admitted) = admission {
+                    let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+                    let verdict = sandbox_noop::detect(&log_path, admission, &tick_anchor);
+                    if let Some(detail) = sandbox_noop::apply(verdict, &admitted.runtime, now) {
+                        log::warn!("role_runner: role={role} {detail}");
+                        return RoleTickOutcome::Failure(detail);
+                    }
+                }
                 return RoleTickOutcome::Success;
             }
             Ok(Some(status)) => {
@@ -255,7 +272,7 @@ pub(super) fn run_role_with_timeout(
                 // arbitrary tail-window fragment of stderr, when one is
                 // present — see `describe_role_failure`.
                 let full_log = read_role_log(&log_path);
-                let detail = describe_role_failure(&full_log, &log_path);
+                let detail = describe_role_failure(&full_log, &log_path, &tick_anchor);
                 // Issue #8443: same terminal-record feedback on a non-zero
                 // exit — this is the path a `TOKEN_EXHAUSTED` death actually
                 // takes.
