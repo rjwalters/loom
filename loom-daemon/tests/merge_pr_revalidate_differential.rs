@@ -284,6 +284,8 @@ fn inside_contract(c: &Case) -> bool {
     }
     let mut child = Command::new("jq")
         .args(["-e", "--arg", "pre", &c.pre, CONTRACT_JQ])
+        // Pinned like the bash sides: no locale may decide what is in-contract.
+        .env("LC_ALL", "C")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -401,6 +403,7 @@ echo "REACHED-MERGE"
         let out = Command::new("bash")
             .args(["-c", &driver, "driver"])
             .arg(merge_pr_path())
+            .env("LC_ALL", "C")
             .env("LOOM_DAEMON_BIN", bin)
             .env_remove("LOOM_DAEMON_SELF_BIN")
             .output()
