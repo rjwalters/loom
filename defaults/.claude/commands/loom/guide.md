@@ -512,26 +512,15 @@ gh issue view 339 --json state
 # 4. Close with explanation
 gh issue close 339 --comment "✅ **Closing completed issue**
 
-This issue was completed in PR #344 (merged 2025-10-18) but stayed open because the PR didn't use the magic keyword syntax.
+Completed in PR #344 (merged 2025-10-18), but it used 'Issue #339' instead of 'Closes #339', so GitHub never auto-closed it.
 
-**What happened:**
-- PR #344 used 'Issue #339' instead of 'Closes #339'
-- GitHub only auto-closes with specific keywords (Closes, Fixes, Resolves)
-- Manual closure now to clean up backlog
-
-**Completed work:** Improved issue closure workflow with multi-layered safety net
-
-**To prevent this:** See Builder role docs on PR creation - always use 'Closes #X' syntax."
+**To prevent this:** always use 'Closes #X' syntax (see Builder role docs)."
 ```
 
 ### Frequency
 
 Run verification **every 15-30 minutes** alongside priority assessment:
-- Takes ~2-3 minutes
-- Prevents backlog from becoming stale
-- Catches missed closures early
-
-By verifying issue closure, you keep the backlog clean and prevent confusion about what's actually done.
+- Takes ~2-3 minutes; catches missed closures early
 
 ## Unblocking: Resolve Dependency Blocks
 
@@ -540,11 +529,8 @@ By verifying issue closure, you keep the backlog clean and prevent confusion abo
 ### Problem: Stuck Blocked Issues (and PRs, #8925)
 
 When an issue OR pull request is marked `loom:blocked` due to a dependency, it
-may stay blocked indefinitely even after the dependency resolves. This
-creates:
-- ❌ Ready-to-implement issues (or ready-to-land PRs) stuck in blocked state
-- ❌ Manual intervention required to unblock
-- ❌ Delays in the development pipeline
+may stay blocked indefinitely even after the dependency resolves, leaving
+ready work stuck and needing manual intervention.
 
 `gh issue list` never returns a pull request, so `check_and_unblock` runs a
 second enumeration, `check_and_unblock_prs` (below), rather than folding PRs
@@ -605,8 +591,9 @@ the Builder queue.
 was_previously_approved() {
   local number="$1"
   # True if `loom:issue` appears anywhere in the issue's label event history.
-  gh api "repos/{owner}/{repo}/issues/${number}/events" \
-    --jq 'any(.[]; .event == "labeled" and .label.name == "loom:issue")' 2>/dev/null
+  # Repo-level: per-issue /events silently truncates (#8742).
+  [ -n "$(gh api --paginate "repos/{owner}/{repo}/issues/events?per_page=100" \
+    --jq ".[] | select(.issue.number == ${number} and .event == \"labeled\" and .label.name == \"loom:issue\") | 1" 2>/dev/null | head -1)" ] && echo true || echo false
 }
 ```
 
@@ -701,6 +688,10 @@ a later pass to sort out.
 
 ### Unblocking Logic
 
+`has_permanent_block N` = trusted comment (`loom-daemon forge trusted-comments
+--fetch N`) or body holds `<!-- loom:permanent-block -->`. Any path removing
+`loom:blocked` must post an audit comment.
+
 ```bash
 check_and_unblock() {
   # --limit: gh defaults to 30 (#10553)
@@ -714,6 +705,9 @@ check_and_unblock() {
     local number=$(printf '%s\n' "$issue" | jq -r '.number')
     local body=$(printf '%s\n' "$issue" | jq -r '.body')
     local title=$(printf '%s\n' "$issue" | jq -r '.title')
+
+    # Permanent block (#8742): never auto-cleared.
+    [ "$(has_permanent_block "$number")" = "true" ] && continue
 
     local deps=$(parse_dependencies "$body")
 
