@@ -2234,23 +2234,18 @@ unset _MPS_JSON _MPS_FRESH_SHA
 # that guard to cover the wait window is a separate policy call; the window
 # left here is the same one the pre-#8410 UNSTABLE wait path always had.
 _revalidate_merge_guards() {
-  # What the uncached re-read says — merged underneath the wait (nothing left
-  # to guard), head moved (PR #8220's 07:12 force-push: the approval and the
-  # check results describe a tree that is no longer the head, so this is the
-  # #5579 exit-3 re-queue, even when the labels ALSO went stale, as on a
-  # rebase), or the label set to re-run the guards against — is `loom-daemon
-  # merge-pr revalidate` (Rust, loom-daemon/src/merge_pr/revalidate.rs, #8191
-  # slice), in that order. It replaced three `jq` reads that failed in two
-  # silent directions: a payload `jq` could not parse killed this script under
-  # `set -e` with `jq`'s exit 5 (the RE-QUEUE code) and no message, and a label
-  # array it could only partly walk handed the guards a truncated label set
-  # (`|| true`). Every unreadable shape is now #8896's refusal: an unreadable
-  # response is evidence neither that loom:pr is present nor that it is absent,
-  # so it must SAY it is a read failure — never fall through to the loom:pr
-  # guard's genuine-absence wording. Fails CLOSED on any other exit/sentinel
-  # pair (missing or older binary): "re-validated" and "never looked" must not
-  # be confusable at the last check before the merge. `$nl`, not `$'\n'` in a
-  # pattern: bash 3.2 reads the latter literally there (see #9697).
+  # `loom-daemon merge-pr revalidate` (loom-daemon/src/merge_pr/revalidate.rs,
+  # #8191 slice) decides, in order, what the uncached re-read says: merged
+  # underneath the wait; head moved (PR #8220's force-push — the #5579 exit-3
+  # re-queue, even when the labels ALSO went stale); or the label set to re-run
+  # the guards against. It replaced three `jq` reads that failed silently: an
+  # unparseable payload killed this script under `set -e` with `jq`'s exit 5
+  # (the RE-QUEUE code), and a partly-walked label array handed the guards a
+  # truncated set. Every unreadable shape is now #8896's read-failure refusal,
+  # never the loom:pr guard's genuine-absence wording. Fails CLOSED on any
+  # other exit/sentinel pair (missing or older binary): "re-validated" and
+  # "never looked" must not be confusable. `$nl`, not `$'\n'`, in a pattern:
+  # bash 3.2 reads the latter literally there (#9697).
   local fresh out rc=0 nl=$'\n'; fresh="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
   out="$(printf '%s\n' "$fresh" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr revalidate --pr "$PR_NUMBER" --precondition-sha "$MERGE_PRECONDITION_SHA" 2>/dev/null)" || rc=$?
   case "$rc:${out%%"$nl"*}" in
