@@ -146,6 +146,7 @@ pub mod codex_usage;
 pub mod comment_trust;
 pub mod concierge;
 pub mod config_resolver;
+pub mod context_cache;
 pub mod cpu_headroom;
 pub mod credential_preflight;
 pub mod daemon_bin_resolve;
