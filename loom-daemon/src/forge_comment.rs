@@ -144,11 +144,16 @@ pub fn footer_or_body(
 /// single-owner fleets). Returns the response body (the comment JSON, whose
 /// `html_url` is the new comment) on success.
 ///
+/// When the REST POST is rate-limited, the same footered body is posted via
+/// the GraphQL `addComment` mutation instead (#10025); see
+/// [`post_comment_graphql`].
+///
 /// # Errors
 ///
 /// When `gh` cannot be spawned, cannot be written to, exits non-zero, or
 /// produces undecodable output. The error text carries `gh`'s stderr so a
-/// rate-limit message reaches the caller's log.
+/// rate-limit message reaches the caller's log — on a rate limit whose GraphQL
+/// fallback also failed, it is the original REST error.
 pub fn post_comment(
     gh_bin: impl AsRef<OsStr>,
     root: Option<&Path>,
@@ -157,12 +162,133 @@ pub fn post_comment(
     is_pr: bool,
     body: &str,
 ) -> Result<String, String> {
+    let gh_bin = gh_bin.as_ref();
     let full_body = append_dashboard_footer(nwo, &number, is_pr, body);
     let payload = serde_json::json!({ "body": full_body }).to_string();
 
-    let mut cmd = Command::new(gh_bin.as_ref());
+    let rest_error = match gh_api_input(
+        gh_bin,
+        root,
+        &[&format!("repos/{nwo}/issues/{number}/comments")],
+        &payload,
+    ) {
+        Ok(response) => return Ok(response),
+        Err(GhInputError::Spawn(e)) => return Err(format!("gh api (comment) failed: {e}")),
+        Err(GhInputError::Failed(stderr)) => {
+            format!("gh api (comment on {nwo}#{number}) failed: {stderr}")
+        }
+    };
+    // #10025: REST core and GraphQL are separate quotas, so an exhausted REST
+    // pool usually leaves GraphQL with budget to spare. Only a rate limit
+    // earns the fallback — any other REST failure (404, auth) would fail the
+    // same way over GraphQL and is reported as-is.
+    if !crate::rate_limit_breaker::indicates_rate_limit(&rest_error) {
+        return Err(rest_error);
+    }
+    match post_comment_graphql(gh_bin, root, nwo, &number, &full_body) {
+        Ok(response) => {
+            log::info!(
+                "forge_comment: REST rate-limited on {nwo}#{number}; posted via GraphQL addComment (#10025)"
+            );
+            Ok(response)
+        }
+        Err(graphql_error) => {
+            log::warn!(
+                "forge_comment: GraphQL addComment fallback on {nwo}#{number} also failed: {graphql_error}"
+            );
+            // The REST error is the one the caller's log should carry: it
+            // names the rate limit the operator has to wait out.
+            Err(rest_error)
+        }
+    }
+}
+
+/// The GraphQL resolution of an issue-or-PR number to its node id.
+const SUBJECT_ID_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){issueOrPullRequest(number:$number){... on Issue{id} ... on PullRequest{id}}}}";
+
+/// The GraphQL `addComment` mutation, returning the new comment's URL.
+const ADD_COMMENT_MUTATION: &str = "mutation($subjectId:ID!,$body:String!){addComment(input:{subjectId:$subjectId,body:$body}){commentEdge{node{id url}}}}";
+
+/// [`post_comment`]'s REST-exhaustion fallback (#10025): resolve the subject's
+/// node id, then `addComment` with `full_body` — the already-footered body, so
+/// what lands is byte-identical to what the REST POST would have posted. Both
+/// requests go as `{query, variables}` JSON on stdin (the module's no-`-f`
+/// rule). Returns a REST-shaped `{"html_url", "node_id"}` JSON string so a
+/// caller reading `html_url` cannot tell which transport answered.
+fn post_comment_graphql(
+    gh_bin: &OsStr,
+    root: Option<&Path>,
+    nwo: &str,
+    number: &impl fmt::Display,
+    full_body: &str,
+) -> Result<String, String> {
+    let (owner, name) = nwo
+        .split_once('/')
+        .ok_or_else(|| format!("not an owner/repo slug: {nwo:?}"))?;
+    let number: i64 = number
+        .to_string()
+        .parse()
+        .map_err(|e| format!("not an issue number: {number} ({e})"))?;
+    let lookup = serde_json::json!({
+        "query": SUBJECT_ID_QUERY,
+        "variables": { "owner": owner, "name": name, "number": number },
+    });
+    let response = graphql(gh_bin, root, &lookup)?;
+    let subject_id = response
+        .pointer("/data/repository/issueOrPullRequest/id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("GraphQL could not resolve {nwo}#{number} to a node id"))?
+        .to_string();
+    let mutation = serde_json::json!({
+        "query": ADD_COMMENT_MUTATION,
+        "variables": { "subjectId": subject_id, "body": full_body },
+    });
+    let response = graphql(gh_bin, root, &mutation)?;
+    let node = response
+        .pointer("/data/addComment/commentEdge/node")
+        .ok_or_else(|| format!("GraphQL addComment returned no comment: {response}"))?;
+    Ok(serde_json::json!({ "html_url": node["url"], "node_id": node["id"] }).to_string())
+}
+
+/// `gh api graphql --input -` with `request` as the JSON body; the decoded
+/// response, or an error when `gh` fails or the response carries `errors`.
+fn graphql(
+    gh_bin: &OsStr,
+    root: Option<&Path>,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let out =
+        gh_api_input(gh_bin, root, &["graphql"], &request.to_string()).map_err(|e| match e {
+            GhInputError::Spawn(e) | GhInputError::Failed(e) => {
+                format!("gh api graphql failed: {e}")
+            }
+        })?;
+    let value: serde_json::Value = serde_json::from_str(out.trim())
+        .map_err(|e| format!("gh api graphql output was not JSON: {e}"))?;
+    if let Some(errors) = value.get("errors").filter(|e| !e.is_null()) {
+        return Err(format!("gh api graphql returned errors: {errors}"));
+    }
+    Ok(value)
+}
+
+/// Why a [`gh_api_input`] call failed: `gh` could not be run at all, or it
+/// ran and exited non-zero (carrying its trimmed stderr).
+enum GhInputError {
+    Spawn(String),
+    Failed(String),
+}
+
+/// `gh api <args…> --input -` with `payload` on stdin, under `root`'s
+/// owner-partitioned `GH_CONFIG_DIR` when given. The response body on success.
+fn gh_api_input(
+    gh_bin: &OsStr,
+    root: Option<&Path>,
+    args: &[&str],
+    payload: &str,
+) -> Result<String, GhInputError> {
+    let mut cmd = Command::new(gh_bin);
     cmd.arg("api")
-        .arg(format!("repos/{nwo}/issues/{number}/comments"))
+        .args(args)
         .arg("--input")
         .arg("-")
         .stdin(Stdio::piped())
@@ -174,23 +300,21 @@ pub fn post_comment(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("could not exec gh api (comment): {e}"))?;
+        .map_err(|e| GhInputError::Spawn(format!("could not exec gh api: {e}")))?;
     child
         .stdin
         .as_mut()
-        .ok_or_else(|| "gh api stdin was not piped".to_string())?
+        .ok_or_else(|| GhInputError::Spawn("gh api stdin was not piped".to_string()))?
         .write_all(payload.as_bytes())
-        .map_err(|e| format!("could not write the comment request body: {e}"))?;
+        .map_err(|e| GhInputError::Spawn(format!("could not write the request body: {e}")))?;
     let out = child
         .wait_with_output()
-        .map_err(|e| format!("gh api (comment) failed: {e}"))?;
+        .map_err(|e| GhInputError::Spawn(e.to_string()))?;
     if !out.status.success() {
-        return Err(format!(
-            "gh api (comment on {nwo}#{number}) failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return Err(GhInputError::Failed(String::from_utf8_lossy(&out.stderr).trim().to_string()));
     }
-    String::from_utf8(out.stdout).map_err(|e| format!("gh api (comment) output was not UTF-8: {e}"))
+    String::from_utf8(out.stdout)
+        .map_err(|e| GhInputError::Spawn(format!("gh api output was not UTF-8: {e}")))
 }
 
 /// Parse a forge issue reference into `(owner/repo, number)`, where the slug

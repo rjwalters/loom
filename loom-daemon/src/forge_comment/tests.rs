@@ -139,6 +139,107 @@ fn post_comment_surveys_stderr_on_failure() {
 }
 
 // ---------------------------------------------------------------------------
+// #10025: GraphQL `addComment` fallback on a REST rate limit.
+// ---------------------------------------------------------------------------
+
+/// A stub `gh` whose REST POST fails with `rest_stderr` and whose `api
+/// graphql` calls answer the node-id lookup and the mutation — or fail too,
+/// when `graphql_ok` is false. Every call's stdin lands in `gh.stdin.<n>`
+/// (n = 1-based call index) so the bodies can be compared byte for byte.
+fn temp_stub_gh_rest_limited(rest_stderr: &str, graphql_ok: bool) -> StubGh {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display();
+    let graphql = if graphql_ok {
+        r#"case "$(cat "$in")" in
+      *addComment*) echo '{"data":{"addComment":{"commentEdge":{"node":{"id":"IC_new","url":"https://github.com/o/r/issues/42#issuecomment-7"}}}}}' ;;
+      *) echo '{"data":{"repository":{"issueOrPullRequest":{"id":"I_node42"}}}}' ;;
+    esac"#
+            .to_string()
+    } else {
+        "echo 'GraphQL: Something went wrong' >&2; exit 1".to_string()
+    };
+    let script = format!(
+        "#!/bin/sh
+echo \"$@\" >> {d}/gh.args
+n=$(wc -l < {d}/gh.args | tr -d ' ')
+in={d}/gh.stdin.$n
+cat > \"$in\"
+if [ \"$2\" = graphql ]; then
+    {graphql}
+    exit 0
+fi
+echo '{rest_stderr}' >&2
+exit 1
+"
+    );
+    let path = dir.path().join("gh");
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    StubGh(dir)
+}
+
+fn recorded_json(stub: &StubGh, call: usize) -> serde_json::Value {
+    let raw = std::fs::read_to_string(stub.path().join(format!("gh.stdin.{call}")))
+        .unwrap_or_else(|e| panic!("stub recorded call {call}'s stdin: {e}"));
+    serde_json::from_str(&raw).expect("each request body is JSON")
+}
+
+#[test]
+fn rest_rate_limit_falls_back_to_graphql_add_comment_byte_identically() {
+    let stub = temp_stub_gh_rest_limited("HTTP 403: API rate limit exceeded for user ID 1.", true);
+    let body = "multi-line\n\n- with `markdown` and \"quotes\"\n";
+    let response = post_comment(stub.path().join("gh"), None, "o/r", 42, false, body)
+        .expect("GraphQL fallback answers");
+
+    let args = std::fs::read_to_string(stub.path().join("gh.args")).unwrap();
+    let calls: Vec<&str> = args.lines().collect();
+    assert_eq!(calls.len(), 3, "REST POST, node-id lookup, addComment: {args}");
+    assert!(calls[0].contains("repos/o/r/issues/42/comments"), "{args}");
+    assert!(calls[1].starts_with("api graphql --input -"), "{args}");
+    assert!(calls[2].starts_with("api graphql --input -"), "{args}");
+
+    let lookup = recorded_json(&stub, 2);
+    assert_eq!(lookup["variables"]["owner"], "o");
+    assert_eq!(lookup["variables"]["name"], "r");
+    assert_eq!(lookup["variables"]["number"], 42);
+
+    // Byte-identity: the GraphQL body IS the footered body REST was handed.
+    let rest_body = recorded_json(&stub, 1)["body"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mutation = recorded_json(&stub, 3);
+    assert_eq!(mutation["variables"]["subjectId"], "I_node42");
+    assert_eq!(mutation["variables"]["body"].as_str().unwrap(), rest_body);
+    assert_eq!(rest_body, append_dashboard_footer("o/r", 42, false, body));
+    assert!(rest_body.ends_with(&format!("{FOOTER_MARKER}\n")));
+
+    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(parsed["html_url"], "https://github.com/o/r/issues/42#issuecomment-7");
+}
+
+#[test]
+fn graphql_fallback_failure_returns_the_original_rest_error() {
+    let stub = temp_stub_gh_rest_limited("HTTP 403: API rate limit exceeded for user ID 1.", false);
+    let error = post_comment(stub.path().join("gh"), None, "o/r", 42, false, "b")
+        .expect_err("both transports fail");
+    assert!(error.starts_with("gh api (comment on o/r#42) failed:"), "{error}");
+    assert!(error.contains("API rate limit exceeded"), "{error}");
+    assert!(!error.contains("GraphQL"), "the REST error, not the fallback's: {error}");
+}
+
+#[test]
+fn non_rate_limit_rest_failure_does_not_try_graphql() {
+    let stub = temp_stub_gh_rest_limited("HTTP 404: Not Found", true);
+    let error = post_comment(stub.path().join("gh"), None, "o/r", 42, false, "b")
+        .expect_err("a 404 is not retried");
+    assert!(error.contains("HTTP 404"), "{error}");
+    let args = std::fs::read_to_string(stub.path().join("gh.args")).unwrap();
+    assert_eq!(args.lines().count(), 1, "no GraphQL call for a non-rate-limit failure: {args}");
+}
+
+// ---------------------------------------------------------------------------
 // Stub `gh` fixtures (the `merge_pr/redate` pattern: a shell script standing
 // in for the binary, recording what it was handed).
 // ---------------------------------------------------------------------------
