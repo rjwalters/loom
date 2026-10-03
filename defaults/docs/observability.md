@@ -578,7 +578,15 @@ It is **never** `$HOSTNAME` or the `hostname` binary any more: those vary by
 launch context (an interactive shell exports `$HOSTNAME`, launchd/systemd do
 not) and by OS (macOS returns the ComputerName or `*.localdomain`), which is
 how one machine reported as both `joseph-superset` and `2026-009-019`. Only a
-host with no home directory to persist into falls back to `unknown-host`.
+host that can neither read nor create the persisted id (no home directory, a
+read-only `~/.loom`, any other I/O error) falls back to `unknown-host`: the
+daemon keeps running under it (one WARN), but `loom-daemon host-id` exits
+non-zero, and the shell exporters (`lib/locate-daemon-bin.sh`'s
+`loom_host_id`) then fall back only to `$LOOM_HOST_ID` and otherwise refuse
+— a lease is not published, the fence fails open with a warning — rather
+than act under a sentinel every such host shares. At startup the daemon
+exports its resolved id to its children as `$LOOM_HOST_ID`, so a script it
+spawns cannot resolve a different one under another `$HOME`.
 
 **Migrating a hostname-keyed host.** A host that ran without `$LOOM_HOST_ID`
 reported its hostname. After upgrading it reports a generated id instead —
@@ -589,6 +597,19 @@ pre-upgrade rows as legacy. If the old name must be kept — a native ingest key
 bound to it (§3, #4830), fleet-store entries, in-flight peer claims and leases
 — pin `LOOM_HOST_ID=<old name>` (or `fleet.hostId`) **before** upgrading.
 Nothing re-keys silently.
+
+A host with a **native ingest key** bound to its old hostname that upgrades
+without pinning trips the #4830 identity check (§3) on its first acked
+batch: the key's bound `host_id` no longer equals the new generated
+`host.id`, so the daemon publishes `ObservabilityHostIdMismatch`
+(`observability_host_id_mismatch` / `observability_export.state ==
+"host_id_mismatch"` in `loom-daemon status --json`), logs one WARN, and
+`loom-daemon health` reports `observability DEGRADED` (exit `1`). Batches
+are still acked under the key's old name, so the backend and the daemon's
+own records now disagree. Remedy: pin `LOOM_HOST_ID=<the key's bound name>`
+and restart (or re-issue the key for the new id). Check before upgrading
+with `loom-daemon host-id --source`: `env`/`config` is already pinned, while
+`generated`/`persisted` means the host will report the new id.
 
 ### `daemon.start` / `daemon.shutdown` / `daemon.heartbeat`
 
