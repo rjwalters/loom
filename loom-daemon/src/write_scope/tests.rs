@@ -831,6 +831,10 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("action names; writes go through dep_classify"),
         ),
         ("role_tick_telemetry.rs", NotAWrite("classifies commands, runs none")),
+        (
+            "gh_invocation/accounting.rs",
+            NotAWrite("classifies an invocation's argv for call accounting, runs none"),
+        ),
         ("role_tick_telemetry/targets.rs", NotAWrite("classifies commands, runs none")),
         ("terminal.rs", NotAWrite("tmux flags")),
         ("fleet_store/gh.rs", NotAWrite("store reads: its one method is `--method GET`")),

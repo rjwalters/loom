@@ -41,11 +41,10 @@
 //! #9541/#9483 lost verdicts here that the daemon pass would have kept. One
 //! implementation, two callers.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use std::path::Path;
-use std::process::{Command, Stdio};
 
-use super::{VerdictKind, VerdictPr, VerdictReconcileStats};
+use super::{gh_call, VerdictKind, VerdictPr, VerdictReconcileStats};
 use crate::verdict_equivalence::{self, Equivalence, EquivalenceKind};
 use crate::verdict_stale_notice::UntrustedVerdictMarker;
 
@@ -178,7 +177,6 @@ fn reanchor_equivalent_verdict(
         head_sha,
     );
 
-    let mut cmd = Command::new(gh_bin);
     // #9772: the footer's link needs the slug — `LOOM_REPO` when set, else
     // the root's origin remote. An unresolvable slug posts unlinked rather
     // than linking to nowhere.
@@ -186,27 +184,15 @@ fn reanchor_equivalent_verdict(
         crate::worktree_ops::gh::resolve_owner_repo(root).map(|(o, r)| format!("{o}/{r}"))
     });
     let body = crate::forge_comment::footer_or_body(nwo.as_deref(), pr.number, true, &body);
-    cmd.arg("pr")
-        .arg("comment")
-        .arg(pr.number.to_string())
-        .arg("--body")
-        .arg(&body);
-    cmd.current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
-    }
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    let n = pr.number.to_string();
+    let out = gh_call::output(
+        gh_call::write("verdict.reanchor_comment", gh_bin, root)
+            .args(["pr", "comment", &n, "--body", &body])
+            .args(gh_call::loom_repo_flag()),
+    )?;
     if !out.status.success() {
-        return Err(anyhow!(
-            "gh pr comment (reanchor {label}) failed for #{} in {}: {}",
-            pr.number,
-            root.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        let (root, err) = (root.display(), gh_call::stderr(&out));
+        return Err(anyhow!("gh pr comment (reanchor {label}) failed for #{n} in {root}: {err}"));
     }
     Ok(())
 }
@@ -283,28 +269,15 @@ fn invalidate_verdict(
             &disarm_line,
             untrusted.as_ref(),
         );
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("pr")
-            .arg("comment")
-            .arg(pr.number.to_string())
-            .arg("--body")
-            .arg(&body);
-        cmd.current_dir(root);
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        let n = pr.number.to_string();
+        let out = gh_call::output(
+            gh_call::write("verdict.stale_comment", gh_bin, root)
+                .args(["pr", "comment", &n, "--body", &body])
+                .args(gh_call::loom_repo_flag()),
+        )?;
         if !out.status.success() {
-            return Err(anyhow!(
-                "gh pr comment failed for #{} in {}: {}",
-                pr.number,
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            let (root, err) = (root.display(), gh_call::stderr(&out));
+            return Err(anyhow!("gh pr comment failed for #{n} in {root}: {err}"));
         }
         untrusted
     };
@@ -325,36 +298,20 @@ fn invalidate_verdict(
     // pass exists to prevent. `gh pr edit --remove-label` on a label that
     // isn't present is a documented no-op, so requesting removal of both
     // unconditionally is always safe.
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("pr")
-        .arg("edit")
-        .arg(pr.number.to_string())
-        .arg("--remove-label")
-        .arg(VerdictKind::Approved.label())
-        .arg("--remove-label")
-        .arg(VerdictKind::ChangesRequested.label())
-        .arg("--remove-label")
-        .arg("loom:ci-failure")
-        .arg("--remove-label")
-        .arg("loom:merge-conflict")
-        .arg("--add-label")
-        .arg("loom:review-requested");
-    cmd.current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
-    }
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    let n = pr.number.to_string();
+    let out = gh_call::output(
+        gh_call::write("verdict.clear_labels", gh_bin, root)
+            .args(["pr", "edit", &n])
+            .args(["--remove-label", VerdictKind::Approved.label()])
+            .args(["--remove-label", VerdictKind::ChangesRequested.label()])
+            .args(["--remove-label", "loom:ci-failure"])
+            .args(["--remove-label", "loom:merge-conflict"])
+            .args(["--add-label", "loom:review-requested"])
+            .args(gh_call::loom_repo_flag()),
+    )?;
     if !out.status.success() {
-        return Err(anyhow!(
-            "gh pr edit (clear {label}) failed for #{} in {}: {}",
-            pr.number,
-            root.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        let (root, err) = (root.display(), gh_call::stderr(&out));
+        return Err(anyhow!("gh pr edit (clear {label}) failed for #{n} in {root}: {err}"));
     }
     Ok((skipped, untrusted))
 }

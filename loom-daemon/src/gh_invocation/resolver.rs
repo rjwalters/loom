@@ -20,6 +20,9 @@ pub enum GhBinSource {
     EnvOverride,
     /// Bare `gh`, looked up on `PATH` at spawn.
     Path,
+    /// A program the call site injected ([`super::GhInvocation::program`]) —
+    /// a test stub handed down a `gh_bin: &Path` argument (#10089).
+    Injected,
 }
 
 /// The executable a `gh` invocation will run, and why.
