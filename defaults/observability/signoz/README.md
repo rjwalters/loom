@@ -491,6 +491,8 @@ data.
 | ETA accuracy | Logs Explorer: filter `body = 'eta.outcome' AND loom.eta.error_sec EXISTS`, add columns `loom.eta.heuristic`, `loom.eta.revision`, `loom.eta.kind`, `loom.eta.horizon_bucket`, `loom.eta.error_sec`, `loom.eta.covered`; group by `loom.eta.heuristic`, `loom.eta.revision` — **both**, never heuristic alone, or a daemon roll mid-window averages two builds into one number. The `EXISTS` clause is not optional: an abandoned sweep has no error field, and without it the panel scores the abandonment as a perfect prediction. Coverage, bias and the pinball loss that decides a promotion need `avg()`/`median()` over these and stay SQL-only (`eta-queries.sql` 0, Q1, Q2) |
 | ETA feature ranking | SQL-only (`eta-queries.sql` Q3): it expands the estimate's explanation body with `JSONExtractKeysAndValuesRaw` and correlates each numeric feature with the error, neither of which is an Explorer operation. Read `distinct_values` beside `rank_corr` — a feature that never varied scores 0.5, not 0 — and `n` beside both: the section's `HAVING n >= 20` makes a short window return nothing at all |
 | CI dependency wait | Logs Explorer: filter `body = 'ci.job' AND loom.ci.dependency_wait_ms EXISTS`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.dependency_wait_ms`, `loom.ci.queued_ms`; group by `loom.ci.job` with **P50**/**P90**, time range 7 days. **Alert when a family's p90 dependency wait exceeds its own p90 queue wait**: it is gated by `needs:`, not capacity-starved, and more runners will not move it. An ungated job measures ~0 by construction — treat sub-2s values as job-creation lag, not a serialized edge (`ci-queries.sql` 15) |
+| CI slowest tests | Trace Explorer: filter `name = 'loom.ci.test'`, group by `loom.ci.test.binary`, `loom.ci.test` with **Sum** (and a second query with **P90**), time range 7 days, sorted descending. Add `loom.ci.test.outcome` as a filter to separate `flaky` (failed then passed — the #7789 signal) from `fail`/`error` from a clean `pass` (`ci-queries.sql` 16). **Only each leg's slow tail is emitted** — tests at or above the 250 ms floor, capped at `MAX_TEST_SPANS_PER_JOB` (512) per leg — so this panel is a ranking, never a test inventory: a test missing from it is fast or outside the cap, not unrun |
+| CI test rebalance | Same filter grouped by `loom.ci.run_id`, `loom.ci.job` with **Sum** — one bar per nextest leg of a run, which is the slow-tail time a `--partition count:k/N` split should equalize. Group by `loom.ci.job` and not by `loom.ci.shard.index` alone: both nextest families shard `1..3`, so index alone merges two unrelated partitions. `argMax(test, duration)` per leg (the named test to move) is SQL-only (`ci-queries.sql` 17). The summed tail time is far **less** than the leg's test-step wall time by design (every sub-floor test is excluded), so compare legs of the same run and the same family, never a leg against its own job span |
 
 `ci-queries.sql` 7) (#9007's per-issue Builder/CI/Judge/merge breakdown) and 8)
 (#9337's CI time per trigger reason) have no row above: 7 joins
@@ -594,13 +596,25 @@ ClickHouse after changing the setting, including derived tables; record it in
 rollups, but leaves some metadata, reduced-metric and legacy tables at 15 or
 30 days (one month for `top_level_operations`). For this isolated trial, apply
 the reviewed `retention.sql` after the API settings — it sets those existing
-TTLs to 7 days for logs/traces and 30 days for metrics, and restores 30 days
-on a trial that ran its earlier all-seven-day version — using the private
-bundled client:
+TTLs to 7 days for logs/traces and 30 days for metrics, and restores the
+30-day *policy* (not the data) on a trial that ran its earlier all-seven-day
+version — using the private bundled client:
 
 ```console
 docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < retention.sql
 ```
+
+**This deletes data as it runs**, and the deletion is not recoverable:
+`MODIFY TTL` materialises on existing parts, so every row already past the new
+window is gone when the command returns rather than at some later merge. Read
+`retention.sql`'s header before applying it — it carries five behaviours
+measured against the pinned engine by
+`loom-daemon/tests/signoz_retention_ttl.rs` (#8528), including a units slip
+that deletes an entire table while reporting success. **Confirm the command
+printed 16 host rows all reading status 0**: one failing statement stops the
+client, and because the metric statements are last, a partial run shortens
+logs/traces to 7 days while skipping every statement that restores 30 days to
+metrics.
 
 Re-run `queries.sql` after every upgrade or retention-setting change. Resource
 fingerprint tables retain the upstream **30-minute grace beyond seven days**;
@@ -611,8 +625,26 @@ metadata is erased at either boundary. Confirm the split from effective DDL,
 not from the settings page:
 
 ```console
-docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT database, name, extract(create_table_query, 'TTL (.*?)(SETTINGS|\$)') FROM system.tables WHERE database IN ('signoz_logs', 'signoz_traces', 'signoz_metrics') AND create_table_query LIKE '%TTL%' AND engine NOT LIKE 'Distributed%' ORDER BY database, name"
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT database, name, extract(create_table_query, 'TTL (.*?)(SETTINGS|\$)') AS ttl, extract(create_table_query, 'ttl_only_drop_parts = \d') AS only_drop_parts FROM system.tables WHERE database IN ('signoz_logs', 'signoz_traces', 'signoz_metrics') AND create_table_query LIKE '%TTL%' AND engine NOT LIKE 'Distributed%' ORDER BY database, name"
 ```
+
+The TTL column is the **policy**. `ttl_only_drop_parts` is half of the
+**outcome**: where it is set, a part holding one over-age row and one in-window
+row keeps both, so a row well past seven days stays queryable until an
+unrelated merge rewrites that part (measured, with the setting-off and
+two-separate-parts controls run alongside it, in
+`loom-daemon/tests/signoz_retention_ttl.rs`). The other half is per part, and
+needs no per-table time column because ClickHouse stores each part's computed
+TTL instants:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT database, table, count() AS parts, sum(rows) AS rows, countIf(delete_ttl_info_max < now()) AS fully_expired_parts, countIf(delete_ttl_info_min < now() AND delete_ttl_info_max >= now()) AS partly_expired_parts, min(delete_ttl_info_min) AS oldest_row_ttl FROM system.parts WHERE active AND database IN ('signoz_logs', 'signoz_traces', 'signoz_metrics') AND delete_ttl_info_min > toDateTime(0) GROUP BY database, table ORDER BY database, table"
+```
+
+`fully_expired_parts` above zero means TTL merges are behind (check the merge
+failure count in "ClickHouse self-telemetry" below).
+`partly_expired_parts` above zero on a `ttl_only_drop_parts = 1` table is the
+stuck case: those rows are past the window and will not be deleted on their own.
 
 `signoz_logs.logs_v2` keys its TTL on a per-row `_retention_days` column rather
 than a literal interval, so read that column's `default_expression` from

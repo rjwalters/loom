@@ -81,8 +81,8 @@ When you claim an issue and realize mid-work it requires >6 hours or touches >8 
 gh issue edit 812 --body-file /tmp/body-812.md
 
 # 3. Mark the parent blocked — humans close it once children are filed.
-#    NEVER close a parent issue yourself; the park records above
-#    are the record, loom:blocked is the terminal state.
+#    NEVER close a parent yourself; the park records are the
+#    record, loom:blocked is the terminal state.
 gh issue edit 812 --remove-label "loom:building" --add-label "loom:blocked"
 
 # Then exit and let the Curator/sweep pipeline pick up each sub-issue.
@@ -97,13 +97,13 @@ gh issue edit 812 --remove-label "loom:building" --add-label "loom:blocked"
 > **`loom:blocked` is the terminal state for a decomposition — not
 > `loom:operator-only` (#5819).** Size is not a routing signal: "this is too
 > big for one PR" is a `loom:blocked` parent with children filed, and the
-> pipeline picks it up again on its own. Reserve `loom:operator-only` for work
-> a *human* must act on (an authority a human alone holds, host or credential
-> access — not "requires judgement"). On the rare occasion you do apply it,
-> **never apply it alone** — add exactly one sub-kind in the same command
+> pipeline picks it up again on its own. Reserve `loom:operator-only` for a
+> PO-level decision or a human-hands step (#10001; rule: `curator.md` →
+> "Applying `loom:operator-only`"), never "requires judgement". When you do
+> apply it, **never apply it alone** — add exactly one sub-kind in that command
 > (`loom:operator-blocked` / `loom:operator-mechanical` /
 > `loom:operator-decision` / `loom:operator-objective`), e.g.
-> `gh issue edit 812 --remove-label "loom:building" --add-label "loom:operator-only,loom:operator-decision"`.
+> `loom-daemon operator-decision apply 812 --input d.json --also-label loom:operator-only --remove-label loom:building`.
 > Being unsure which sub-kind fits means the analysis isn't finished — it is
 > **not** a reason to default to `loom:operator-decision` (#5826). Full rule,
 > including the machine-readable `Blocked by #N` line required with

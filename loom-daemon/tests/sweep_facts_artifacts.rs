@@ -314,15 +314,57 @@ fn the_effort_view_exposes_the_documented_effort_columns() {
 fn landed_size_parameters_are_named_and_versioned() {
     assert!(
         LANDED_SIZE.contains("params_version"),
-        "landed-size.sql names no versioned parameter set; the fit done during the D1 \
-         backfill run (2AMLogic/2am#1608) would have nothing to bump and no way to \
-         announce itself"
+        "landed-size.sql names no versioned parameter set; the fit that produced it \
+         (#9934) would have nothing to bump and no way to announce itself"
+    );
+    // The fit shipped in v1-2026-10-02 (#9934). A regression to the unfitted
+    // state must fail here rather than pass as a fitted parameter set: if the
+    // version goes back to NULL constants, this test names it. (Scoped to the
+    // params CTE: the file's prose may honestly mention the v0 history.)
+    let params_for_version = LANDED_SIZE
+        .split("params AS (")
+        .nth(1)
+        .unwrap_or_else(|| panic!("landed-size.sql has no params CTE"));
+    let params_for_version = &params_for_version[..params_for_version
+        .find("),")
+        .unwrap_or(params_for_version.len())];
+    assert!(
+        params_for_version.contains("v1-2026-10-02"),
+        "landed-size.sql's params CTE no longer names its fitted parameter version; a \
+         refit (#9934's procedure) must bump params_version so every consumer can see \
+         which standardization produced its numbers"
     );
     assert!(
-        LANDED_SIZE.contains("v0-unfitted"),
-        "landed-size.sql no longer marks its parameter set unfitted; an unfitted \
-         standardization must not pass as fitted"
+        !params_for_version.contains("v0-unfitted"),
+        "landed-size.sql's params CTE still marks the parameter set unfitted; an \
+         unfitted standardization must not pass as fitted"
     );
+    // Structurally: every fitted constant must be a literal, not a NULL —
+    // the v0 state carried `NULL AS mean_log_*` lines, and any regression to
+    // that shape (or a partial paste of a new fit) fails here.
+    let params_block = LANDED_SIZE
+        .split("params AS (")
+        .nth(1)
+        .unwrap_or_else(|| panic!("landed-size.sql has no params CTE"));
+    let params_block = &params_block[..params_block.find("),").unwrap_or(params_block.len())];
+    for name in [
+        "mean_log_hw_lines",
+        "sd_log_hw_lines",
+        "mean_log_hw_files",
+        "sd_log_hw_files",
+        "mean_log_norm_tokens",
+        "sd_log_norm_tokens",
+    ] {
+        let line = params_block
+            .lines()
+            .find(|line| line.contains(&format!("AS {name}")))
+            .unwrap_or_else(|| panic!("landed-size.sql's params CTE lost the {name} constant"));
+        assert!(
+            !line.contains("NULL"),
+            "landed-size.sql's {name} is NULL: the parameter set is unfitted, and an \
+             unfitted standardization must not pass as fitted (#9934)"
+        );
+    }
     assert!(
         LANDED_SIZE.contains("LSI"),
         "landed-size.sql never names LSI; the KPI whose sums must never be raw Fibonacci \
@@ -332,6 +374,15 @@ fn landed_size_parameters_are_named_and_versioned() {
         LANDED_SIZE.contains("exp("),
         "LSI is defined as exp(landed_size); the definition file must compute it, not \
          assume a consumer will"
+    );
+    // The token verdict gate (#9934): the tokens component must be scored only
+    // on a clean measurement — `suspect`/`unattributable`/`not_spawned`
+    // (#9440/#9454) are published numbers, not measurements.
+    assert!(
+        LANDED_SIZE.contains("tokens_status = 'measured'"),
+        "landed-size.sql's tokens component no longer checks the sweep's token \
+         verdict; token readings the sweep flagged as suspect or unattributable \
+         would be standardized as if they were measurements (#9440/#9454, #9934)"
     );
 }
 

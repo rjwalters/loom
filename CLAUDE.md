@@ -272,9 +272,9 @@ See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insuf
   `./.loom/scripts/create-issue.sh`, never a bare `gh issue create`** — that is
   GraphQL-backed and dies on GraphQL exhaustion while the independent REST pool
   sits idle; the script falls back to one REST POST with labels applied
-  atomically (#5047). See [`.loom/docs/github-authentication.md`](.loom/docs/github-authentication.md).
+  atomically (#5047). See [github-authentication](.loom/docs/github-authentication.md); routing policy: [forge-egress](.loom/docs/forge-egress.md).
 - **Gitea** — set `GITEA_TOKEN` or `FORGE_TOKEN` (repository read/write). See
-  [`.loom/docs/forge-authentication.md`](.loom/docs/forge-authentication.md).
+  [forge-authentication](.loom/docs/forge-authentication.md).
 - **Releasing** — **a PR must NEVER bump `VERSION`**: a post-merge workflow does
   it once, and CI fails any PR that hand-edits a version-bearing file (#7743).
   `scripts/version.sh` keeps all 5 in sync (`version.sh list` names them; #5517,
@@ -288,7 +288,7 @@ See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insuf
 
 ## Troubleshooting
 
-See [`.loom/docs/troubleshooting.md`](.loom/docs/troubleshooting.md) for stale
+See [troubleshooting](.loom/docs/troubleshooting.md) for stale
 worktrees, stuck agents, daemon registry/event-bus/reaper issues, host-sleep and
 `.loom/` resync procedures, quarantine safety, and common fixes. Quick fixes:
 `loom-clean --force` (stale worktrees/branches), `loom-recover-orphans

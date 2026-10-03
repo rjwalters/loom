@@ -184,7 +184,7 @@ pub fn marker_text(marker: &SequenceMarker) -> String {
 /// Line-local by construction — the same rule as `hold_state::html_comment_spans`,
 /// for the same reason: many bodies are scanned together, and a multi-line
 /// scan lets one malformed comment change how a later one is read.
-fn html_comment_spans(line: &str) -> Vec<&str> {
+pub(crate) fn html_comment_spans(line: &str) -> Vec<&str> {
     let mut spans = Vec::new();
     let mut rest = line;
     while let Some(open) = rest.find("<!--") {
@@ -332,13 +332,6 @@ pub fn verdict_line(verdict: Verdict, marker: &SequenceMarker) -> String {
 // `stale_checks::fetch` provide: the binary is a parameter, so tests stub it
 // with a script path instead of a global env var that would race across
 // parallel test threads.
-
-/// The `gh` binary, honoring `LOOM_GH_BIN` — the same seam
-/// `redate` and `stale_checks::fetch` provide.
-#[must_use]
-pub fn gh_bin() -> String {
-    std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
-}
 
 /// Fetch every TRUSTED comment body on `pr`, oldest first (#9548: an
 /// outsider's well-formed marker is prose, dropped before any parse).

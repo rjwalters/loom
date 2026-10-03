@@ -11,8 +11,10 @@
 pub(crate) mod fake;
 mod intents_tests;
 mod landing_tests;
+mod named_blocker_tests;
 mod notice_tests;
 mod pass_tests;
 mod replay;
 mod review_fix_tests;
 mod second_review_tests;
+mod suppression_tests;

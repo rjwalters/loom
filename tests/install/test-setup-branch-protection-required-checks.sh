@@ -134,6 +134,57 @@ assert_eq "up-to-date-branch (strict) policy defaults to false" \
   "$(printf '%s' "$payload" | jq -r '.rules[] | select(.type == "required_status_checks") | .parameters.strict_required_status_checks_policy')"
 
 # ============================================================================
+# A comma INSIDE a context name must survive (#9926).
+#
+# Commas in GitHub job names are ordinary (parenthetical qualifiers, matrix
+# labels). The installer used to join the config array into one comma-separated
+# string and re-split it on `[,\n]+`, so `Repo checks (headless, no PDK)` became
+# the two contexts `Repo checks (headless` and `no PDK)`. Neither exists, so
+# neither ever reports a conclusion, so EVERY merge on the protected branch was
+# blocked forever — strictly worse than the no-rule default, with the cause two
+# layers removed from the symptom. The config path now consumes the JSON array
+# as an array, with no delimited-string round trip to tear a name apart.
+# ============================================================================
+echo ""
+echo "=== a comma inside a context name is not a separator ==="
+
+cat > "$REPO_DIR/.loom/config.json" <<'EOF'
+{
+  "branchProtection": {
+    "requiredStatusChecks": [
+      "Repo checks (headless, no PDK)"
+    ]
+  }
+}
+EOF
+
+payload="$(LOOM_DRY_RUN=true run_dry)"
+assert_eq "a comma-bearing name yields exactly ONE context, not two" \
+  "1" \
+  "$(printf '%s' "$payload" | jq '.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks | length')"
+assert_eq "the comma-bearing name is carried through verbatim" \
+  "Repo checks (headless, no PDK)" \
+  "$(printf '%s' "$payload" | jq -r '.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[0].context')"
+
+cat > "$REPO_DIR/.loom/config.json" <<'EOF'
+{
+  "branchProtection": {
+    "requiredStatusChecks": [
+      "Repo checks (headless, no PDK)",
+      "  CLAUDE.md Line Budget  ",
+      "",
+      "Build (linux, release)"
+    ]
+  }
+}
+EOF
+
+payload="$(LOOM_DRY_RUN=true run_dry)"
+assert_eq "multiple comma-bearing names stay distinct; blanks dropped, edges trimmed" \
+  "Repo checks (headless, no PDK)|CLAUDE.md Line Budget|Build (linux, release)" \
+  "$(printf '%s' "$payload" | jq -r '.rules[] | select(.type == "required_status_checks") | [.parameters.required_status_checks[].context] | join("|")')"
+
+# ============================================================================
 # The strict ("require branches to be up to date") toggle is opt-in.
 # ============================================================================
 echo ""
@@ -175,6 +226,27 @@ payload="$(LOOM_DRY_RUN=true LOOM_REQUIRED_STATUS_CHECKS_STRICT=true run_dry)"
 assert_eq "strict env override applies to the configured contexts" \
   "true" \
   "$(printf '%s' "$payload" | jq -r '.rules[] | select(.type == "required_status_checks") | .parameters.strict_required_status_checks_policy')"
+
+# The env form is ONE delimited string, so a comma-bearing name is
+# unrepresentable on that path and still splits — documented, deliberate, and
+# pinned here so it is not mistaken for the config-path bug (#9926). An
+# operator who needs such a name uses the `.loom/config.json` array form.
+payload="$(LOOM_DRY_RUN=true LOOM_REQUIRED_STATUS_CHECKS='Repo checks (headless, no PDK)' run_dry)"
+assert_eq "env form cannot carry a comma-bearing name (use the config array)" \
+  "Repo checks (headless|no PDK)" \
+  "$(printf '%s' "$payload" | jq -r '.rules[] | select(.type == "required_status_checks") | [.parameters.required_status_checks[].context] | join("|")')"
+
+# An empty / whitespace-only env override falls back to the config array rather
+# than emptying the required set (the `:-` default the old code relied on).
+payload="$(LOOM_DRY_RUN=true LOOM_REQUIRED_STATUS_CHECKS='' run_dry)"
+assert_eq "an empty env override falls back to the configured contexts" \
+  "CLAUDE.md Line Budget" \
+  "$(printf '%s' "$payload" | jq -r '.rules[] | select(.type == "required_status_checks") | [.parameters.required_status_checks[].context] | join("|")')"
+
+payload="$(LOOM_DRY_RUN=true LOOM_REQUIRED_STATUS_CHECKS=' , ' run_dry)"
+assert_eq "a separators-only env override emits no rule at all" \
+  "0" \
+  "$(printf '%s' "$payload" | jq '[.rules[] | select(.type == "required_status_checks")] | length')"
 
 # ============================================================================
 # This repository's OWN configuration must never require a path-filtered job:

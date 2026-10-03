@@ -47,12 +47,11 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
-use super::{forge, MAX_ISSUES_PER_WORKSPACE, VERDICT_HOLD_LABELS, VERDICT_MARKER_PREFIX};
+use super::{forge, gh_call, MAX_ISSUES_PER_WORKSPACE, VERDICT_HOLD_LABELS, VERDICT_MARKER_PREFIX};
 
 /// Kill switch for this pass (`0`/`false`/`no`/`off` disables). Defaults ON.
 pub const REVIEW_CONFLICT_ENABLED_ENV: &str = "LOOM_REVIEW_CONFLICT_RECONCILE";
@@ -247,46 +246,73 @@ pub fn parse_pr_list(stdout: &[u8]) -> Result<Vec<ConflictPr>> {
 /// Run `gh pr <args…>` in `root` with the per-root credential and `LOOM_REPO`
 /// applied, returning stdout on success.
 fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("pr").args(args);
-    cmd.current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    let inv = match args.first().copied() {
+        Some("list") => gh_call::read("review_conflict.pr_list", gh_bin, root),
+        Some("view") => gh_call::read("review_conflict.pr_view", gh_bin, root),
+        Some("comment") => gh_call::write("review_conflict.pr_comment", gh_bin, root),
+        _ => gh_call::write("review_conflict.pr_edit", gh_bin, root),
+    };
+    let out = gh_call::output(inv.args(["pr"]).args(args).args(gh_call::loom_repo_flag()))?;
     if !out.status.success() {
         return Err(anyhow!(
             "gh pr {} failed in {}: {}",
             args.first().copied().unwrap_or_default(),
             root.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            gh_call::stderr(&out)
         ));
     }
     Ok(out.stdout)
 }
 
-fn list_prs(gh_bin: &Path, root: &Path, label: &str) -> Result<Vec<ConflictPr>> {
-    let limit = MAX_ISSUES_PER_WORKSPACE.to_string();
-    let stdout = gh_pr(
+/// Fields of the one open-PR listing this pass shares with
+/// [`super::merge_sequence`] (#4429 follow-up): the union of what
+/// [`parse_pr_list`] and `merge_sequence::parse_pr_list` read, so the
+/// sequence pass can reuse the same payload instead of re-listing.
+pub(super) const OPEN_PR_FIELDS: &str =
+    "number,createdAt,updatedAt,headRefOid,headRefName,baseRefName,isDraft,labels,mergeable";
+
+/// Page budget of the shared listing. `gh` pages at 100, so a workspace with
+/// at most 100 open PRs still costs exactly one request; the headroom keeps a
+/// busier repo from silently truncating the label subset the two per-label
+/// listings used to fetch (each capped at [`MAX_ISSUES_PER_WORKSPACE`]).
+const OPEN_PR_LIST_LIMIT: u32 = MAX_ISSUES_PER_WORKSPACE * 3;
+
+/// ONE `gh pr list --state open` for the workspace, raw (#4429 follow-up).
+///
+/// This pass used to issue two GraphQL listings per workspace per tick
+/// (`--label loom:review-requested`, `--label loom:merge-conflict`) and the
+/// merge-sequence pass a third (every open PR) right after it. All three are
+/// subsets of this one payload; the label filter now happens client-side in
+/// [`conflict_candidates`].
+fn list_open_prs_raw(gh_bin: &Path, root: &Path) -> Result<Vec<u8>> {
+    let limit = OPEN_PR_LIST_LIMIT.to_string();
+    gh_pr(
         gh_bin,
         root,
         &[
             "list",
             "--state",
             "open",
-            "--label",
-            label,
             "--limit",
             &limit,
             "--json",
-            "number,headRefOid,mergeable,labels",
+            OPEN_PR_FIELDS,
         ],
-    )?;
-    parse_pr_list(&stdout)
+    )
+}
+
+/// The PRs this pass decides on: those carrying `loom:review-requested` or
+/// `loom:merge-conflict` — exactly what the two former per-label listings
+/// returned, keyed by number (a PR carrying both appears once).
+///
+/// # Errors
+/// Malformed JSON.
+pub fn conflict_candidates(stdout: &[u8]) -> Result<BTreeMap<u32, ConflictPr>> {
+    Ok(parse_pr_list(stdout)?
+        .into_iter()
+        .filter(|p| p.has(REVIEW_REQUESTED) || p.has(MERGE_CONFLICT))
+        .map(|p| (p.number, p))
+        .collect())
 }
 
 /// Comment first, then relabel — a failed comment aborts before any label is
@@ -358,25 +384,40 @@ pub struct ReviewConflictStats {
 /// Run the pass over one workspace `root`. Best effort: any `gh` failure is
 /// logged at `warn` and contributes nothing.
 pub fn reconcile_review_conflicts(gh_bin: &Path, root: &Path) -> ReviewConflictStats {
+    reconcile_review_conflicts_sharing(gh_bin, root).0
+}
+
+/// [`reconcile_review_conflicts`], also handing back the raw open-PR listing
+/// it read — but only when this pass **attempted no write** on the
+/// workspace, so the listing still describes the forge as it is now. The
+/// caller passes it to [`super::merge_sequence::reconcile_merge_sequences_with`],
+/// which runs next on the same root and would otherwise list every open PR
+/// again. Any attempted flag / clear / deferral (successful or not — a
+/// half-applied transition is still a change) returns `None`, and the
+/// sequence pass lists for itself exactly as before.
+pub(super) fn reconcile_review_conflicts_sharing(
+    gh_bin: &Path,
+    root: &Path,
+) -> (ReviewConflictStats, Option<Vec<u8>>) {
     let mut stats = ReviewConflictStats::default();
     if !review_conflict_enabled() {
-        return stats;
+        return (stats, None);
     }
-    // A PR carrying both labels appears in both listings; key by number.
-    let mut prs: BTreeMap<u32, ConflictPr> = BTreeMap::new();
-    for label in [REVIEW_REQUESTED, MERGE_CONFLICT] {
-        match list_prs(gh_bin, root, label) {
-            Ok(v) => prs.extend(v.into_iter().map(|p| (p.number, p))),
-            Err(e) => {
-                log::warn!("claim_reconciliation (review conflicts): {}: {e}", root.display());
-                crate::rate_limit_breaker::global_observe_failure(
-                    &e.to_string(),
-                    "claim_reconciliation",
-                );
-            }
+    let listed = list_open_prs_raw(gh_bin, root)
+        .and_then(|raw| conflict_candidates(&raw).map(|prs| (raw, prs)));
+    let (raw, prs) = match listed {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("claim_reconciliation (review conflicts): {}: {e}", root.display());
+            crate::rate_limit_breaker::global_observe_failure(
+                &e.to_string(),
+                "claim_reconciliation",
+            );
+            return (stats, None);
         }
-    }
+    };
     stats.checked = prs.len();
+    let mut attempted_write = false;
 
     for pr in prs.values() {
         match decide_review_conflict(pr) {
@@ -393,6 +434,7 @@ pub fn reconcile_review_conflicts(gh_bin: &Path, root: &Path) -> ReviewConflictS
                         gh_bin, root, pr.number, &head_sha,
                     ) {
                         Ok(Some(marker)) => {
+                            attempted_write = true;
                             match super::merge_sequence::defer_repair(
                                 gh_bin, root, pr.number, &marker,
                             ) {
@@ -427,6 +469,7 @@ pub fn reconcile_review_conflicts(gh_bin: &Path, root: &Path) -> ReviewConflictS
                         }
                     }
                 }
+                attempted_write = true;
                 match flag(gh_bin, root, pr.number, &head_sha) {
                     Ok(()) => {
                         stats.flagged += 1;
@@ -452,6 +495,7 @@ pub fn reconcile_review_conflicts(gh_bin: &Path, root: &Path) -> ReviewConflictS
                 if !ours {
                     continue;
                 }
+                attempted_write = true;
                 match clear(gh_bin, root, pr.number) {
                     Ok(()) => {
                         stats.cleared += 1;
@@ -472,7 +516,7 @@ pub fn reconcile_review_conflicts(gh_bin: &Path, root: &Path) -> ReviewConflictS
             ConflictAction::Keep(_) => {}
         }
     }
-    stats
+    (stats, (!attempted_write).then_some(raw))
 }
 
 #[cfg(test)]

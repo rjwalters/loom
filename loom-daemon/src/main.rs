@@ -1061,6 +1061,7 @@ enum Commands {
     /// because this file is frozen by the file-size ratchet.
     #[command(flatten)]
     ScriptPorts(cli::script_ports::ScriptPortCommand),
+    Labels(cli::labels_cmd::LabelsArgs),
 
     /// Historical replay of scheduling predictions vs eventual PRs (#9785):
     /// `overlap-replay validate | outcomes | score`. Nested (not flattened)
@@ -2566,5 +2567,6 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
             unreachable!("handled in main() before handle_cli_command")
         }
         Commands::Init(args) => cli::misc_cmds::run_init(args),
+        Commands::Labels(cmd) => cli::labels_cmd::dispatch(cmd),
     }
 }

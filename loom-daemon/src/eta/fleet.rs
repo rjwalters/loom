@@ -164,6 +164,10 @@ impl FleetSample {
             observed_at: self.observed_at,
             source: SampleSource::ForgeTimeline,
             host: FORGE_HOST.to_string(),
+            // #9420: a forge label timeline is worked-only by construction —
+            // a `loom:review-requested` → verdict interval exists because the
+            // transition happened — so there is nothing to condition on.
+            worked: None,
         }
     }
 

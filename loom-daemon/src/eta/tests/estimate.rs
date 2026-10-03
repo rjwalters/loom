@@ -19,6 +19,7 @@ fn synthetic(n: usize, base: i64) -> StageSamples {
                 observed_at: as_of() - Duration::hours(i as i64 + 1),
                 source: SampleSource::SweepOutcome,
                 host: "host-a".to_string(),
+                worked: None,
             });
         }
     }

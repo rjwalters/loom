@@ -125,6 +125,7 @@ _probe_gitea_api() {
   fi
 
   # Try the Gitea version endpoint — lightweight and always available
+  # loom:egress-uncovered=dev-tooling (#9988): installer Gitea probe, not managed-workload traffic.
   local response=""
   if [[ -n "$auth_header" ]]; then
     response=$(curl -s -m 5 -H "$auth_header" "${api_base}/version" 2>/dev/null || echo "")
@@ -171,6 +172,7 @@ gitea_api() {
     curl_args+=(-d "$body")
   fi
 
+  # loom:egress-uncovered=dev-tooling (#9988): installer forge probe, not managed-workload traffic.
   curl "${curl_args[@]}" "$url"
 }
 

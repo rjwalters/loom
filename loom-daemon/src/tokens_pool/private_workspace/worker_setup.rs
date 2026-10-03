@@ -250,6 +250,24 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
 fn admit_role(role: &str) -> Result<()> {
     let rejection =
         match crate::runtime_admission::resolve_and_admit(Path::new(REPO), role, Some("codex")) {
+            // A merging role needs no containment for admission, but it acts
+            // with merge/verdict authority, so the guard obligations a mutable
+            // role proves (managed registration naming the sealed bridge,
+            // Codex trust recorded for it) must hold here too (#9390
+            // follow-up). The same in-container proof, minus the admission it
+            // would otherwise grant.
+            Ok(_) if crate::runtime_preference::codex_guard::guarded(role) => {
+                let bound = std::env::var("LOOM_PRIVATE_CONTROL").unwrap_or_default();
+                let revision = std::env::var("LOOM_PRIVATE_BASE_REVISION").unwrap_or_default();
+                let account = std::env::var("LOOM_ACCOUNT_NAME").unwrap_or_default();
+                containment::in_container(&account, &bound, &revision).map_err(|error| {
+                    anyhow::anyhow!(
+                        "role {role} merges or issues verdicts, and Loom's guard hook is not \
+                         proven for this private session: {error}"
+                    )
+                })?;
+                return Ok(());
+            }
             Ok(_) => return Ok(()),
             Err(rejection) if rejection.containment_eligible() => rejection,
             Err(rejection) => bail!("{}", rejection.diagnostic()),

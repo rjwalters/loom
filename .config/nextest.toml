@@ -133,6 +133,25 @@ fail-fast = false
 failure-output = "immediate-final"
 final-status-level = "fail"
 
+# Per-test JUnit output, `ci` profile ONLY (#9456).
+#
+# nextest writes `target/nextest/ci/junit.xml` (the path is relative to the
+# profile's store directory, never to the repo root). `ci.yml`'s two
+# `--partition count:k/N` job families upload it as a `ci-test-timings-*`
+# artifact and `loom-daemon ci-telemetry` turns the slowest entries into
+# `loom.ci.test` spans under that leg's job span — the only way to answer
+# "WHICH tests spent this partition's test-step time", which is what
+# rebalancing `count:k/N` needs. See
+# `defaults/docs/ci-observability.md` §"Per-test spans (#9456)".
+#
+# Why only `[profile.ci]`, when the file's rule above says to keep the two
+# profiles identical: that rule is about **overrides**, which a named profile
+# does not inherit. `junit` is a scalar profile setting, so it is not subject
+# to it — and a local `cargo nextest run` (the `default` profile) has no
+# artifact upload, no poller, and no reason to pay for the file.
+[profile.ci.junit]
+path = "junit.xml"
+
 [[profile.ci.overrides]]
 filter = 'package(loom-daemon) & kind(test) & binary(/^integration_/)'
 test-group = 'daemon-integration'

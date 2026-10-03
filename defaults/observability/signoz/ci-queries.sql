@@ -31,13 +31,14 @@
 --     job families: `Rust Unit Tests` / `Rust OTLP Feature Tests` via
 --     `cargo nextest run --partition`, and `Shell Test Suites` via
 --     `LOOM_CI_SHARD`).
---   * Sections 11-13 (#9089) are the ONLY sections that read TRACES
---     (`signoz_traces.signoz_index_v3`), not logs or metrics: step timings
---     live on `loom.ci.step` spans and per-suite timings on `loom.ci.suite`
---     spans, neither of which has a log record or a metric series of its own
---     (a per-step or per-suite histogram would multiply the 30-day series
---     count by every job's step count / every leg's suite count). Traces are
---     kept 7 days, the same horizon as the log sections.
+--   * Sections 11-13 (#9089) and 16-17 (#9456) are the ONLY sections that read
+--     TRACES (`signoz_traces.signoz_index_v3`), not logs or metrics: step
+--     timings live on `loom.ci.step` spans, per-suite timings on
+--     `loom.ci.suite` spans and per-test timings on `loom.ci.test` spans, none
+--     of which has a log record or a metric series of its own (a per-step,
+--     per-suite or per-test histogram would multiply the 30-day series count
+--     by every job's step count / every leg's suite count / every leg's test
+--     count). Traces are kept 7 days, the same horizon as the log sections.
 --   * Section 14 (#9089) reads BOTH `ci.run` and `ci.job` log records and
 --     joins them, so a run's critical path can separate its own queue segment
 --     from the dependency + queue + running time of the leg that set its floor
@@ -46,6 +47,15 @@
 --     wait (`loom.ci.dependency_wait_ms`, time blocked on `needs:`
 --     predecessors before the job was created) beside the runner-queue wait
 --     section 9 ranks, so the two are never read as one number (7 days).
+--   * Sections 16-17 (#9456) read `loom.ci.test` TRACES: the per-test half of
+--     #9089's "top 20 slowest tests and suites", for the `nextest-partition`
+--     legs that section 12 cannot see (it reads `loom.ci.suite`, which only
+--     the `LOOM_CI_SHARD` shell legs emit). **Only the SLOW TAIL of each leg
+--     is emitted** -- tests at or above `nextest::MIN_TEST_DURATION_MS`,
+--     slowest first, capped at `nextest::MAX_TEST_SPANS_PER_JOB` per leg -- so
+--     a test missing from these results is below the floor or outside the cap,
+--     never evidence it did not run. Reading them as a complete test inventory
+--     is the one wrong way to use them (7 days).
 --
 -- Vocabulary is pinned to what the daemon exports and the gateway forwards:
 -- `loom-daemon/tests/signoz_trial_artifacts.rs` fails if any attribute key,
@@ -85,7 +95,7 @@
 --   repo          'owner/name' to scope to one repository, '' for the whole org
 --   bucket_hours  trend bucket width for sections 1 and 3 (24 = daily, 168 = weekly)
 --   window_hours  section 2 compares [now - w, now) against [now - 2w, now - w)
---   top           row cap for the ranked sections 2, 4, 6, 10, 11 and 15
+--   top           row cap for the ranked sections 2, 4, 6-7, 10-17
 
 -- 0. Preflight: which CI series and record kinds actually exist. An empty
 --    result here means capture is not flowing (poller disabled, exporter not
@@ -883,4 +893,114 @@ SELECT repo, workflow, job,
 FROM job_waits
 GROUP BY repo, workflow, job
 ORDER BY p90_dep_s DESC, repo, workflow, job
+LIMIT {top:UInt32};
+
+-- ---------------------------------------------------------------------------
+-- 16. Top slowest Rust tests (#9456). P50/P90/max/total of the `loom.ci.test`
+--     span durations per repo + workflow + binary + test, ranked by total
+--     time, over the trace horizon. This is the per-test half of #9089's
+--     proposal 4 ("top 20 slowest tests and suites"); section 12 is the suite
+--     half and cannot answer this one, because it reads `loom.ci.suite` spans,
+--     which only the `LOOM_CI_SHARD` shell legs emit. A `Rust Unit Tests
+--     (1/3)` leg's ~110s test step is one `loom.ci.step` span; only these say
+--     which of its 4,242 tests spent it.
+--
+--     `flaky_runs` is the #7789 signal: the same test under the same binary
+--     that failed at least once and ultimately passed (nextest wrote a
+--     `<flakyFailure>`/`<rerunFailure>` for it). A test that is slow BECAUSE it
+--     is retried is distinguishable here from one that is simply slow, which is
+--     what a quarantine decision needs. `failed_runs` counts the final-attempt
+--     failures (`fail`) and the executions nextest could not complete
+--     (`error`).
+--
+--     TRACES, 7 days, same as sections 11-13 (test spans have no log record and
+--     no metric series: the metric label allowlist admits no test dimension,
+--     and a per-test histogram would multiply the 30-day series count by every
+--     leg's test count). De-duplicate on the derived span id before
+--     aggregating.
+--
+--     **`runs` is NOT how many times the test ran.** Only each leg's slow tail
+--     is emitted (see the file header), so `runs` counts the CI runs in which
+--     this test was slow enough to be emitted. A test absent from these results
+--     is below the duration floor or outside the per-leg cap -- never evidence
+--     that it did not run. `outcome` is the test's own pass/fail/flaky/error,
+--     never its job's GitHub conclusion.
+WITH tests AS (
+    SELECT attributes_string['loom.repo']               AS repo,
+           attributes_string['loom.ci.workflow']        AS workflow,
+           attributes_string['loom.ci.test.binary']     AS binary,
+           attributes_string['loom.ci.test']            AS test,
+           anyIf(1, attributes_string['loom.ci.test.outcome'] = 'flaky') AS flaky,
+           anyIf(1, attributes_string['loom.ci.test.outcome'] IN ('fail', 'error')) AS failed,
+           any(duration_nano)                           AS duration_nano
+    FROM signoz_traces.signoz_index_v3
+    WHERE name = 'loom.ci.test'
+      AND timestamp >= {since:DateTime}
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+    GROUP BY repo, workflow, binary, test, trace_id, span_id
+)
+SELECT repo, workflow, binary, test,
+       count()                                           AS runs,
+       sum(flaky)                                        AS flaky_runs,
+       sum(failed)                                       AS failed_runs,
+       round(quantileExact(0.5)(duration_nano) / 1e9, 1) AS p50_s,
+       round(quantileExact(0.9)(duration_nano) / 1e9, 1) AS p90_s,
+       round(max(duration_nano) / 1e9, 1)                AS max_s,
+       round(sum(duration_nano) / 1e9, 1)                AS total_s
+FROM tests
+GROUP BY repo, workflow, binary, test
+ORDER BY total_s DESC, p90_s DESC
+LIMIT {top:UInt32};
+
+-- ---------------------------------------------------------------------------
+-- 17. Test-level partition rebalance (#9456). Section 10 says WHETHER a run's
+--     `nextest-partition` legs are imbalanced, from their job durations;
+--     section 13 says what to move for the SHELL legs. This says what to move
+--     for the nextest legs: per leg, the summed slow-tail test time it carried
+--     and its slowest named test, so a `--partition count:k/N` split can be
+--     reasoned about from named tests rather than by re-running the matrix and
+--     hoping.
+--
+--     One row per (run attempt, leg). Read `leg_tail_s` only BETWEEN legs of
+--     the same run and the same family: it is the sum of that leg's emitted
+--     slow tail, which is far less than the leg's test-step time (every test
+--     below the floor is excluded by design) and, because nextest runs tests
+--     concurrently, not comparable to any wall clock. `tail_tests` is how many
+--     spans the leg emitted -- at `nextest::MAX_TEST_SPANS_PER_JOB` the cap is
+--     binding and `leg_tail_s` is a floor, not a total.
+--
+--     `job` is in the GROUP BY precisely because `ci.yml` has TWO
+--     nextest-partition families both sharding 1..3: comparing a `Rust Unit
+--     Tests` leg against a `Rust OTLP Feature Tests` leg of the same `(k/N)`
+--     compares two unrelated partitions.
+--
+--     TRACES, 7 days.
+WITH tests AS (
+    SELECT attributes_string['loom.repo']               AS repo,
+           attributes_string['loom.ci.workflow']        AS workflow,
+           attributes_string['loom.ci.run_id']          AS run_id,
+           attributes_string['loom.ci.job']             AS job,
+           attributes_string['loom.ci.shard.index']     AS shard_index,
+           attributes_string['loom.ci.shard.total']     AS shard_total,
+           attributes_string['loom.ci.test.binary']     AS binary,
+           attributes_string['loom.ci.test']            AS test,
+           any(duration_nano)                           AS duration_nano
+    FROM signoz_traces.signoz_index_v3
+    WHERE name = 'loom.ci.test'
+      AND attributes_string['loom.ci.shard.kind'] = 'nextest-partition'
+      AND timestamp >= {since:DateTime}
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+    GROUP BY repo, workflow, run_id, job, shard_index, shard_total, binary, test,
+             trace_id, span_id
+)
+SELECT repo, workflow, run_id, job,
+       shard_index, shard_total,
+       count()                                  AS tail_tests,
+       round(sum(duration_nano) / 1e9, 1)        AS leg_tail_s,
+       argMax(test, duration_nano)              AS slowest_test,
+       argMax(binary, duration_nano)            AS slowest_test_binary,
+       round(max(duration_nano) / 1e9, 1)       AS slowest_test_s
+FROM tests
+GROUP BY repo, workflow, run_id, job, shard_index, shard_total
+ORDER BY run_id DESC, leg_tail_s DESC
 LIMIT {top:UInt32};

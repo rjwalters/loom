@@ -696,7 +696,10 @@ map column each key's OTLP type lands in. It fails on any mismatch.
 `retention.sql` (the 7-day logs/traces, 30-day metrics version) was re-run
 against this trial, and all 16 `ON CLUSTER` statements reported status 0. The
 effective local-table DDL from the README's check query, with Distributed
-tables excluded:
+tables excluded. **This is a grouped summary and a policy reading only** — the
+per-table expressions are in "The retention statements executed against the
+pinned engine" below, and what status 0 plus an effective TTL cannot establish
+about the cleanup *outcome* is set out there too:
 
 | Database | Tables | Effective TTL |
 |---|---|---|
@@ -1630,6 +1633,127 @@ the ambiguity fails on every pull request rather than waiting for the gated
 suite; it was confirmed to fail against the pre-fix artifact, together with
 three of the engine tests.
 
+## The retention statements executed against the pinned engine (2026-10-01)
+
+`retention.sql` was the last committed artifact in this trial with **no** guard
+of any kind — neither a static vocabulary check nor an engine execution
+([#9904](https://github.com/rjwalters/loom/issues/9904)). What it had instead
+was a live application: "Retention DDL observed (2026-09-25)" above records the
+file re-run against this trial with all 16 `ON CLUSTER` statements reporting
+status 0, and the resulting effective TTLs captured per bucket.
+
+**Status 0 and an effective TTL are not a retention outcome.** They say the DDL
+parsed and was stored. They do not say that a row past the window is deleted,
+that a row inside it survives, that the 7/30 split separates anything, or that
+the deletion happens at all. That is the same gap as section 5's chunk join
+above — an artifact whose output was observed in a shape that cannot distinguish
+working from broken — except that this artifact *mutates* the deployment, so
+being wrong about it is not a misleading query result but lost data.
+
+`loom-daemon/tests/signoz_retention_ttl.rs` (9 tests: 8 gated on Docker, 1 in
+ordinary CI) closes it with the technique of the six proofs before it
+(#9705/#9775/#9833/#9857/#9892/#9905), with one difference the artifact forces.
+**`clickhouse local` cannot run this file at all** — `Code: 392 … Replicated DDL
+queries are disabled (QUERY_IS_PROHIBITED)` — because `ON CLUSTER` needs a real
+distributed-DDL queue. So the harness starts a single-node
+`clickhouse/clickhouse-server:25.12.5` with an embedded Keeper, reporting the
+same `25.12.5.44` the trial's own telemetry store reports, and takes the cluster
+name, the `distributed_ddl` path and the macros from the committed render
+(`pours/deployment/telemetrystore/clickhouse/config-0-0.yaml`). The committed
+file then runs **verbatim**, `ON CLUSTER cluster` included: 16 host rows, every
+one status 0, on both of two consecutive passes.
+
+### Per-table effective TTL, as the engine reports it
+
+The grouped summary in "Retention DDL observed" collapses the six 7-day tables
+into one cell and the reduced-metric tables into "6 ×". This is the per-table
+form #9904 asked for, read back out of `system.tables` after the verbatim run:
+
+| Table | Effective TTL |
+| --- | --- |
+| `signoz_logs.tag_attributes_v2` | `toDateTime(unix_milli / 1000) + toIntervalDay(7)` |
+| `signoz_traces.tag_attributes_v2` | `toDateTime(unix_milli / 1000) + toIntervalDay(7)` |
+| `signoz_traces.durationSort` | `toDateTime(timestamp) + toIntervalDay(7)` |
+| `signoz_traces.signoz_index_v2` | `toDateTime(timestamp) + toIntervalDay(7)` |
+| `signoz_traces.signoz_spans` | `toDateTime(timestamp) + toIntervalDay(7)` |
+| `signoz_traces.top_level_operations` | `time + toIntervalDay(7)` |
+| `signoz_metrics.metadata` | `toDateTime(last_reported_unix_milli / 1000) + toIntervalDay(30)` |
+| `signoz_metrics.samples_v2` | `toDateTime(timestamp_ms / 1000) + toIntervalDay(30)` |
+| `signoz_metrics.samples_v4_reduced_last_60s` / `_5m` / `_30m` | `toDateTime(unix_milli / 1000) + toIntervalDay(30)` |
+| `signoz_metrics.samples_v4_reduced_sum_60s` / `_5m` / `_30m` | `toDateTime(unix_milli / 1000) + toIntervalDay(30)` |
+| `signoz_metrics.time_series_v4_reduced` | `toDateTime(unix_milli / 1000) + toIntervalDay(30)` |
+| `signoz_metrics.time_series_v4_reduced_1day` | `toDateTime(unix_milli / 1000) + toIntervalDay(30)` |
+
+These are the expressions **the committed file produces**, asserted per
+statement by the verbatim test rather than transcribed. The equivalent
+per-table read against the live trial is still owed, and the README's check
+query now emits exactly this shape plus the setting below.
+
+### What executing it found
+
+Five behaviours the header did not state. All five are now in it.
+
+| Finding | Why it matters |
+| --- | --- |
+| **`MODIFY TTL` materialises on existing parts immediately.** Over-age rows are gone when the command returns | The header read as a policy change. It is a deletion, and it is not recoverable |
+| **Dropping the `/ 1000` deletes the whole table, not nothing.** `toDateTime` **saturates** an out-of-range argument at `2106-02-07 06:28:15` — the `DateTime` maximum — and `+ INTERVAL 7 DAY` then **overflows past it**, so the TTL lands in the past for every row | The most plausible single edit to this file. It reports status 0 and leaves an effective TTL that reads correctly in `system.tables` |
+| **`ttl_only_drop_parts` decides whether the window is honoured.** A part holding one over-age and one in-window row keeps **both** | The 2026-09-25 capture recorded TTL expressions only, so the trial's actual *cleanup* behaviour is still unestablished. The README's check query now reads the setting, and a per-part `delete_ttl_info_min/max` query for the stuck case |
+| **`MODIFY TTL` replaces, it does not merge.** A table-level `DELETE WHERE` qualification is dropped silently; column TTLs survive | This is why the resource fingerprint tables' 30-minute grace holds *only* because the file omits them. Adding one would erase the grace and report success |
+| **One failing statement aborts the rest of the file.** A renamed table reports host status 60 (`UNKNOWN_TABLE`) and `clickhouse-client --multiquery` stops | The 10 metric statements are last. A partial run therefore shortens logs/traces to 7 days and skips every statement that *restores* 30 days to metrics — the asymmetry that hurts |
+
+A sixth correction is to the header's own history note: the earlier
+all-seven-day version of this file "restores" nothing. It deleted every metric
+row between 8 and 30 days old at the moment it ran; re-widening the window
+afterwards returns the policy and no data.
+
+### Observed, with the mutation run for each
+
+| Property | Observation | Mutation of the committed SQL that breaks it |
+| --- | --- | --- |
+| The file applies verbatim under the render's cluster name | 16 host rows, all status 0, twice; effective TTLs exactly as tabulated above | Renaming the cluster in one statement (`CLUSTER_DOESNT_EXIST`, nothing applies); removing a statement; widening one 7-day statement to 30 |
+| An over-age row is deleted and an in-window row survives, per statement | 16/16; the **same** 10-day-old row is deleted by every 7-day statement and kept by every 30-day one | Dropping the `/ 1000` (table emptied); adding a spurious `/ 1000` to the `DateTime` column |
+| A units slip empties the table rather than widening the window | 0 rows survive where the committed statement keeps both; `toDateTime(now * 1000)` = `2106-02-07 06:28:15` | — (the mutation **is** the observation; the committed statement is run as the control in the same script) |
+| Re-widening restores the policy, not the data | 20-day-old sample gone after the 7-day version, still gone after restoring 30, policy back at `toIntervalDay(30)` | — (the three-phase history is the observation) |
+| `MODIFY TTL` drops a qualified `DELETE WHERE`, keeps column TTLs | `WHERE k != 'pinned'` absent afterwards; `` `payload` String TTL … toIntervalDay(1) `` intact | — (the fixture's "before" read is the control) |
+| An over-age row survives in a mixed part under `ttl_only_drop_parts` | `{ten_days, two_days}` with the setting; `{two_days}` for the same two rows in two parts, and `{two_days}` for the same mixed part with the setting off | — (both controls run in the same script) |
+| A renamed table leaves the metric statements unapplied | statements before the abort at 7 days, the metric statements still at the shortened 7 days, the trace statements after it still at the upstream 15 | Adding a destructive statement to the file (`TRUNCATE`) fails the parse outright |
+| The file is 16 `MODIFY TTL` statements, none naming an API-owned active table | `signoz_index_v3`, `logs_v2`, `samples_v4`, `time_series_v4` are derived from the nine sibling artifacts and asserted disjoint | Pointing a statement at `samples_v4`; at a database outside the three the trial queries |
+
+### The fixture, and what mutation-testing the test itself found
+
+Each of the 16 tables is reproduced as a minimal `MergeTree` carrying exactly
+the time column its own statement keys on, so the `CREATE` side is derived from
+the artifact and a 17th statement would be covered automatically.
+
+Two details were wrong in the first draft and were found by running it:
+
+- **The fixture must start with no TTL for the outcome tests.** ClickHouse
+  evaluates TTL as it *writes* a part, so a 27-day-old row inserted into a table
+  still carrying the upstream 15-day TTL is dropped by the **insert**, before
+  the committed statement runs. The first draft read that as the committed
+  statement deleting an in-window row.
+- **The millisecond encoding must come from the column's name, not from the TTL
+  expression.** A draft that derived it from the expression silently *adapted*
+  to the `/ 1000` mutation — reclassifying the column as a `DateTime64`, typing
+  the fixture to match, and passing. The mutation sweep caught it as a `MISSED`.
+  The pinned schema names every millisecond column `…_milli` / `…_ms`, which is
+  an authority independent of the expression under proof, and the ordinary-CI
+  test now asserts the expression against it.
+
+### What this does not establish
+
+- **Nothing here ran against the live trial deployment.** The trial is on
+  another host; this harness is a single-node stand-in on the same pinned image
+  and version. The 2026-09-25 live run remains the only application to real
+  SigNoz schema and real data.
+- **The live trial's `ttl_only_drop_parts` values and per-part expiry state are
+  unknown** — recorded as the newly-identified gap in the ledger below. The
+  README's two check queries produce them in one pass with no credential beyond
+  the bundled client.
+- **The logs/traces API setting is still unapplied on the current trial**
+  ([#8946](https://github.com/rjwalters/loom/issues/8946)); this proof is about
+  the committed `.sql` artifact, which needs no org login.
+
 ## Acceptance ledger
 
 | Check | Status |
@@ -1642,7 +1766,9 @@ three of the engine tests.
 | Backend outage and recovery through the shared collector | **Passed** — the ingester's receiver was genuinely unavailable until org registration; the gateway's queue preserved and drained all 37/14/3 signals with zero loss and no re-send, while the absent ClickStack exporter stayed visibly stuck in the same scrape |
 | Three fixture signals with matching IDs/values | Passed for the ad-hoc probe; metric timestamp precision conversion documented |
 | Actual Trace Explorer and correlated logs | Passed in authenticated UI; sanitized screenshots linked above |
-| Seven-day effective retention | API, overrides and actual DDL verified; metadata/grace exceptions documented |
+| Seven-day effective retention (**original** arm64 trial deployment) | API, overrides and actual DDL verified on that deployment; metadata/grace exceptions documented. This row does **not** describe the current trial — see "CI logs/traces at 7 days on the current trial" below, which is open, and is not a contradiction with this one (#9904) |
+| Retention statements' expiry outcome (`retention.sql`, scope item 6) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_retention_ttl.rs` runs the committed file **verbatim** — `ON CLUSTER cluster` included, which `clickhouse local` refuses outright — on a single-node 25.12.5.44 with an embedded Keeper under the cluster name read from the committed render: 16 host rows, all status 0, twice, with the per-table effective TTLs now recorded individually rather than bucketed. Executing it closed the gap between the *policy* (status 0 + an effective TTL, which is all the 2026-09-25 live run established) and the *outcome*: an over-age row is deleted and an in-window row survives for every one of the 16, and the same 10-day-old row is deleted by every 7-day statement and kept by every 30-day one. Five behaviours the header did not state were found and corrected — immediate materialisation on existing parts, a units slip that **empties the table** because `toDateTime` saturates then overflows, `ttl_only_drop_parts` keeping an over-age row alive in a mixed part, `MODIFY TTL` silently dropping a qualified `DELETE WHERE`, and one failing statement aborting the file so that exactly the metric statements go unapplied — plus the header's "RESTORE 30 days" corrected to restore the policy and not the data. Every assertion has its breaking mutation of the committed SQL run, not described. See "The retention statements executed against the pinned engine" |
+| Live trial's `ttl_only_drop_parts` and per-part expiry state | **Open** — newly identified by the proof above. The 2026-09-25 capture recorded TTL expressions only, and the setting is what decides whether a part mixing over-age and in-window rows is ever cleaned. The README's "Retention and operation" section now carries both check queries (the setting alongside the TTL, and a `system.parts` `delete_ttl_info_min/max` read for the stuck case); both were executed against the pinned engine, neither against the trial. Needs only the bundled client, no org login |
 | Restart persistence and shared receiver recovery | Passed for signals, account and effective TTL; fresh three-signal replay indexed |
 | Backup restoration rehearsed into a separate project | **Open** — the isolated `loom-signoz-restore` overlay, its documented procedure and a 13-test static isolation contract all landed and the merged render was verified (see "Backup-restore rehearsal overlay"). A real tarball restore *was* found executed on this trial host by an earlier, undocumented session (see "Backup-restore rehearsal: found executed, interrupted, and torn down"): both PostgreSQL's org/user metadata and 37 real ClickHouse trace spans survived the volume round-trip. But the run stopped at the datastore layer — no UI login, no `fixture-queries.sql` diff, no documented teardown — and sat abandoned, burning CPU, for 5 days before this pass found and tore it down (follow-up: [#9762](https://github.com/rjwalters/loom/issues/9762)); [#9279](https://github.com/rjwalters/loom/issues/9279) still owns a complete, documented pass |
 | Saved query artifacts for the shared fixture manifest | **Passed** — executed live above; matches the generated manifest exactly |
@@ -1653,7 +1779,7 @@ three of the engine tests.
 | CI retro queries (`ci-queries.sql`, #8826) | **Passed on live capture** — every section non-empty; metric-path counts and conclusion split reconcile exactly to the records (592 runs / 2,131 jobs); see "CI retro queries, executed live". Section 5's chunk join is still unobserved on real `ci.job.log` data (none reached the trial), but is no longer unobserved anywhere — see the row below |
 | Section 5's failed-run → log chunk join (`ci-queries.sql` 5, #8826) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_ci_failed_run_logs.rs` executes the committed file verbatim on ClickHouse 25.12.5.44 and is the first run anywhere to produce a non-trivial chunk-join row (`3 of 3`, `2 of 3`): the live capture's 60 section-5 rows all read `0 of 0`. Executing it found the join's **two absences reading identically** — a failed run with no non-successful job came back as `job_id` 0 / `truncated` false / `0 of 0` / `loom.ci.job_id = 0`, indistinguishable from a failed job whose log never arrived, with a Logs Explorer filter that silently matches nothing; the committed query now NULL-guards every job- and log-sourced column and empties that filter. At-least-once chunk delivery, the run-level dedupe, the asymmetric `run_attempt`/`attempts` join keys, the log join's repository condition and the wider-than-`failure` conclusion predicate each have their breaking mutation of the committed SQL run, not described (see "The CI failed-run log join executed against the pinned engine"). No `ci.job.log` record went through SigNoz's own ingester — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
 | CI metrics retention ≥ 30 days (#8826) | **Passed in effective DDL** — every metric signal table at 30 days |
-| CI logs/traces at 7 days on the current trial | **Open** — API-owned tables still at the upstream 15 days; needs the org login ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
+| CI logs/traces at 7 days on the **current** trial deployment | **Open** — the API-owned active tables (`logs_v2`, `signoz_index_v3`, and the standard rollups) are still at the upstream 15 days on this deployment; needs the org login ([#8946](https://github.com/rjwalters/loom/issues/8946)). The auxiliary/legacy tables `retention.sql` owns *are* at 7 days here (see "Retention DDL observed") — the two rows describe different table sets on different deployments, which is why neither contradicts the other (#9904) |
 | Six CI saved views in the trial org | **Open** — recreation steps written in the README, not yet executed in the UI ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
 | Measured usage parity with ClickStack's "Loom measured usage" view | **Passed against the pinned ClickHouse, open against the live trial.** `usage-queries.sql` (sections 0–6) plus four README saved-view rows close the parity gap; `signoz_usage_queries.rs` executes the committed file verbatim on ClickHouse 25.12.5 and observes scope resolution, at-least-once dedupe, NULL-not-zero dollars for an unpriced model, unknown-vs-measured-zero, the repo-by-trace join, and the wrong-container silent zero (see "Measured usage" above). No run over real canary data on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
 | Cycle-time analytics parity with ClickStack (`cycle-time-extract.sql`, #8665) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_cycle_time.rs` executes the extraction, the shared rollup and all eight CT queries verbatim over the SAME seven-envelope fixture as the ClickStack proof, and every CT1–CT8 answer matches exactly (see "Cycle-time analytics executed against the pinned engine" above); the `attributes_number`/`attributes_string` fallback and true-absence behavior are also proven. No run through SigNoz's own ingester on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |

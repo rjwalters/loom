@@ -597,6 +597,32 @@ fn publish_notices(bus: Option<&crate::event_bus::EventBus>, host: &str, notices
     }
 }
 
+/// Run `pass` unless the shared rate-limit breaker is tripped (#10020).
+///
+/// While suppressed the pass is skipped entirely, so no `gh` call is made and
+/// the star-intent queue is not drained (the closure owns the drain); queued
+/// intents apply on the next live pass. Logs INFO on the first skip of a
+/// suppression episode and DEBUG afterwards. `is_suppressed` is injected so
+/// tests never touch the global breaker singleton. Returns whether `pass` ran.
+pub(super) fn run_pass_unless_suppressed(
+    is_suppressed: impl Fn() -> bool,
+    already_logged: &mut bool,
+    pass: impl FnOnce(),
+) -> bool {
+    if is_suppressed() {
+        if *already_logged {
+            log::debug!("star_liveness: rate-limit breaker still tripped; skipping pass");
+        } else {
+            log::info!("star_liveness: rate-limit breaker tripped; skipping pass until it clears");
+            *already_logged = true;
+        }
+        return false;
+    }
+    *already_logged = false;
+    pass();
+    true
+}
+
 /// Start the liveness thread for the daemon rooted at `workspace_root`.
 /// Called once, only while the work finder is enabled.
 ///
@@ -617,21 +643,34 @@ pub fn spawn(
             let mut slugs = HashMap::new();
             let mut web_bases = HashMap::new();
             let host = crate::sweep_registry::host_identity();
+            let mut skip_logged = false;
             // Let the work finder complete a first tick before the first pass.
             std::thread::sleep(Duration::from_secs(30));
             loop {
                 let settings = Settings::resolve(&workspace_root);
-                let repos = resolve_repos(&workspace_root, &mut slugs, &mut web_bases);
-                let batch = intents::global_queue()
-                    .map(|q| q.drain())
-                    .unwrap_or_default();
-                let mut factory = |root: &Path, slug: &str| -> Box<dyn StarForge> {
-                    Box::new(GhStarForge::new(root, slug))
-                };
-                let report =
-                    state.run_pass(&repos, batch, settings, &host, Utc::now(), &mut factory);
-                publish_notices(bus.as_deref(), &host, state.take_notices());
-                super::publish_report(report);
+                run_pass_unless_suppressed(
+                    crate::rate_limit_breaker::global_is_suppressed,
+                    &mut skip_logged,
+                    || {
+                        let repos = resolve_repos(&workspace_root, &mut slugs, &mut web_bases);
+                        let batch = intents::global_queue()
+                            .map(|q| q.drain())
+                            .unwrap_or_default();
+                        let mut factory = |root: &Path, slug: &str| -> Box<dyn StarForge> {
+                            Box::new(GhStarForge::new(root, slug))
+                        };
+                        let report = state.run_pass(
+                            &repos,
+                            batch,
+                            settings,
+                            &host,
+                            Utc::now(),
+                            &mut factory,
+                        );
+                        publish_notices(bus.as_deref(), &host, state.take_notices());
+                        super::publish_report(report);
+                    },
+                );
                 std::thread::sleep(settings.interval);
             }
         });

@@ -40,14 +40,19 @@
 //!    diff-vs-base heuristic #9124 originally proposed: `gh api
 //!    compare/{marker_sha}...{head_sha}` reporting `files: []` proves the two
 //!    trees are bit-for-bit identical, not merely "shaped like a rebase". See
-//!    [`super::verdict_invalidation::tree_unchanged`].
+//!    [`crate::forge_tree_unchanged::tree_unchanged`]. #9416 then generalized
+//!    the question from "is the tree identical?" to "is the CHANGE the same?",
+//!    adding the clean-merge-of-base and rebase-patch-identical kinds behind
+//!    the same evidence-only, fail-closed posture
+//!    ([`crate::verdict_equivalence::detect`]).
 //!
 //! # What changed as a result
 //!
 //! [`super::forge::reconcile_pr_verdicts`] now asks that question before
 //! clearing a verdict `decide_verdict` marked `Invalidate`. When the answer is
-//! "yes, identical", it re-anchors the marker to the new head
-//! ([`super::verdict_invalidation::reanchor_tree_unchanged_verdict`]) instead of clearing the
+//! "yes, equivalent", it re-anchors the marker to the new head
+//! ([`super::verdict_invalidation::reanchor_equivalent_verdict`]), recording
+//! which equivalence kind carried it, instead of clearing the
 //! label — the verdict never leaves `loom:pr`/`loom:changes-requested`, so
 //! **this is a direct reduction in PL5a**
 //! (`pr_latency::segments::PrSegments::approval_invalidations`), not merely in
@@ -262,10 +267,17 @@ mod tree_carveout_e2e {
 
     /// A fake `gh` for PR #9124: carries `loom:pr` approved at `SHA_A`, head
     /// is now `SHA_B` (the `#8248`/`#8508` re-date shape), and `pr view`
-    /// reports no auto-merge armed. `compare_body` stands in for GitHub's
-    /// `compare/{base}...{head}` response -- `{"status": "ahead", "files": []}`
-    /// for a tree-identical appended commit, a non-empty `files` array for a
-    /// real change, `{"status": "behind", "files": []}` for a rewind.
+    /// reports no auto-merge armed (plus `baseRefName`, which #9416's two
+    /// merge-base-relative kinds resolve against). `compare_body` stands in for
+    /// GitHub's `compare/{base}...{head}` response -- `{"status": "ahead",
+    /// "files": []}` for a tree-identical appended commit, a non-empty `files`
+    /// array for a real change, `{"status": "behind", "files": []}` for a
+    /// rewind.
+    ///
+    /// A route-specific `<dir>/compare-<refs>.json` file, when present,
+    /// overrides `compare_body` for that one compare. That is what lets a
+    /// #9416 rebase case give `main...<reviewed>` and `main...<head>` DIFFERENT
+    /// answers, which is the whole question the patch-identity kind asks.
     fn fake_gh(
         dir: &std::path::Path,
         log: &std::path::Path,
@@ -280,13 +292,18 @@ if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
-  echo '{{"id":"PR_kwDOQAPbH88AAAABEp4dZw","autoMergeRequest":null}}'
+  echo '{{"id":"PR_kwDOQAPbH88AAAABEp4dZw","autoMergeRequest":null,"baseRefName":"main"}}'
   exit 0
 fi
 if [ "$1" = "api" ]; then
   case "$2" in
     *compare/*)
-      echo '{compare_body}'
+      REFS="${{2##*/compare/}}"
+      if [ -f "{dir}/compare-$REFS.json" ]; then
+        cat "{dir}/compare-$REFS.json"
+      else
+        echo '{compare_body}'
+      fi
       exit 0
       ;;
   esac
@@ -296,6 +313,7 @@ fi
 exit 0
 "#,
             log = log.display(),
+            dir = dir.display(),
             sha_a = SHA_A,
             sha_b = SHA_B,
             compare_body = compare_body,
@@ -479,5 +497,158 @@ exit 0
             "with the switch off, an identical tree still invalidates"
         );
         assert_eq!(stats.tree_identical_reanchors, 0);
+    }
+
+    /// One changed file with every field the patch-identity kind compares.
+    fn one_file_compare(sha: &str, patch: &str) -> String {
+        format!(
+            r#"{{"status":"ahead","files":[{{"filename":"src/lib.rs","status":"modified","sha":"{sha}","patch":"{patch}"}}]}}"#
+        )
+    }
+
+    /// Write the two merge-base-relative compare routes #9416's
+    /// rebase-patch-identical kind reads: `main...SHA_A` (reviewed) and
+    /// `main...SHA_B` (new head).
+    fn write_patch_routes(dir: &std::path::Path, reviewed: &str, head: &str) {
+        std::fs::write(dir.join(format!("compare-main...{SHA_A}.json")), reviewed).unwrap();
+        std::fs::write(dir.join(format!("compare-main...{SHA_B}.json")), head).unwrap();
+    }
+
+    /// #9416, daemon pass, end to end: a head move whose TREE differs (so
+    /// #9124's kind refutes) but whose merge-base-relative patch is
+    /// byte-identical — the rebase-onto-a-newer-base shape — re-anchors instead
+    /// of invalidating, and the comment it posts records WHICH equivalence
+    /// carried the verdict.
+    #[test]
+    #[serial]
+    fn a_rebase_with_a_byte_identical_patch_is_reanchored_not_invalidated() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let log = dir.path().join("gh.log");
+        // The direct reviewed...head compare shows a real tree difference, so
+        // the tree kind must refute and the patch-identity kind must answer.
+        let gh =
+            fake_gh(dir.path(), &log, r#"{"status":"ahead","files":[{"filename":"src/lib.rs"}]}"#);
+        let same = one_file_compare("aaaaaaa1", "@@ -1 +1 @@\\n-old\\n+new\\n");
+        write_patch_routes(dir.path(), &same, &same);
+
+        let stats = with_env(
+            &[
+                (VERDICT_STALENESS_ENABLED_ENV, Some("1")),
+                (VERDICT_TREE_CARVEOUT_ENABLED_ENV, Some("1")),
+            ],
+            || forge::reconcile_pr_verdicts(&gh, &repo_root),
+        );
+
+        assert_eq!(
+            stats.tree_identical_reanchors, 1,
+            "a byte-identical PR patch across the move must be re-anchored"
+        );
+        assert_eq!(stats.invalidated, 0, "it must NOT also count as an invalidation");
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.lines().any(|l| l.starts_with("pr edit 9124")),
+            "no label may be touched by a re-anchor: {calls}"
+        );
+        // The fake `gh` logs `$*` verbatim, so a multi-line `--body` spans
+        // several log lines; match against the whole log, not one line.
+        assert!(
+            calls.lines().any(|l| l.starts_with("pr comment 9124")),
+            "the re-anchor comment must be posted: {calls}"
+        );
+        assert!(
+            calls.contains("loom:verdict-equivalence kind=rebase-patch-identical"),
+            "the re-anchor comment must record which equivalence carried the verdict: {calls}"
+        );
+        assert!(
+            calls.contains(&format!("<!-- loom:verdict-sha sha={SHA_B} verdict=approved -->")),
+            "the verdict-sha marker must still be re-anchored at the new head, unaltered in shape \
+             (both scanners anchor on its trailing ` -->`): {calls}"
+        );
+        assert!(
+            calls.contains("CI is not exempted"),
+            "the re-anchor comment must state that every required check still re-runs: {calls}"
+        );
+    }
+
+    /// The control: the same shape with a DIFFERENT resulting blob id is a
+    /// different change, so it still invalidates. (The patch text alone is not
+    /// the test — a text-only comparison would leave a binary hole.)
+    #[test]
+    #[serial]
+    fn a_rebase_whose_patch_differs_is_still_invalidated() {
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let log = dir.path().join("gh.log");
+        let gh =
+            fake_gh(dir.path(), &log, r#"{"status":"ahead","files":[{"filename":"src/lib.rs"}]}"#);
+        let patch = "@@ -1 +1 @@\\n-old\\n+new\\n";
+        write_patch_routes(
+            dir.path(),
+            &one_file_compare("aaaaaaa1", patch),
+            &one_file_compare("bbbbbbb2", patch),
+        );
+
+        let stats = with_env(
+            &[
+                (VERDICT_STALENESS_ENABLED_ENV, Some("1")),
+                (VERDICT_TREE_CARVEOUT_ENABLED_ENV, Some("1")),
+            ],
+            || forge::reconcile_pr_verdicts(&gh, &repo_root),
+        );
+
+        assert_eq!(stats.invalidated, 1, "a different resulting blob must invalidate");
+        assert_eq!(stats.tree_identical_reanchors, 0);
+    }
+
+    /// The inner kill switch: `LOOM_VERDICT_EQUIVALENCE=0` drops #9416's two
+    /// kinds while leaving #9124's tree kind in place — so the same
+    /// byte-identical-patch rebase above invalidates, and a tree-identical move
+    /// still does not.
+    #[test]
+    #[serial]
+    fn the_inner_kill_switch_drops_only_the_9416_kinds() {
+        let same = one_file_compare("aaaaaaa1", "@@ -1 +1 @@\\n-old\\n+new\\n");
+
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let log = dir.path().join("gh.log");
+        let gh =
+            fake_gh(dir.path(), &log, r#"{"status":"ahead","files":[{"filename":"src/lib.rs"}]}"#);
+        write_patch_routes(dir.path(), &same, &same);
+        let stats = with_env(
+            &[
+                (VERDICT_STALENESS_ENABLED_ENV, Some("1")),
+                (VERDICT_TREE_CARVEOUT_ENABLED_ENV, Some("1")),
+                (crate::verdict_equivalence::VERDICT_EQUIVALENCE_ENABLED_ENV, Some("0")),
+            ],
+            || forge::reconcile_pr_verdicts(&gh, &repo_root),
+        );
+        assert_eq!(
+            stats.invalidated, 1,
+            "with the inner switch off, a byte-identical patch invalidates again"
+        );
+        assert_eq!(stats.tree_identical_reanchors, 0);
+
+        // ...and the #9124 kind is untouched by the inner switch.
+        let dir2 = tempdir().unwrap();
+        let repo_root2 = dir2.path().join("repo");
+        std::fs::create_dir_all(&repo_root2).unwrap();
+        let log2 = dir2.path().join("gh.log");
+        let gh2 = fake_gh(dir2.path(), &log2, r#"{"status": "ahead", "files": []}"#);
+        let stats2 = with_env(
+            &[
+                (VERDICT_STALENESS_ENABLED_ENV, Some("1")),
+                (VERDICT_TREE_CARVEOUT_ENABLED_ENV, Some("1")),
+                (crate::verdict_equivalence::VERDICT_EQUIVALENCE_ENABLED_ENV, Some("0")),
+            ],
+            || forge::reconcile_pr_verdicts(&gh2, &repo_root2),
+        );
+        assert_eq!(stats2.tree_identical_reanchors, 1, "the tree kind survives the inner switch");
+        assert_eq!(stats2.invalidated, 0);
     }
 }

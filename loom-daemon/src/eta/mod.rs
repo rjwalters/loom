@@ -227,6 +227,26 @@ impl Stage {
         }
     }
 
+    /// Whether this stage's duration is **an agent attempt doing work**
+    /// rather than a wait (Issue #9420).
+    ///
+    /// True for the three stages whose whole duration is one role running:
+    /// `sweep.curator`, `sweep.builder`, `doctor`. False for `review_wait`,
+    /// `merge_wait` and `ready_wait` — those measure how long an item *sat*,
+    /// which can legitimately be near zero (a PR that enters `merge_wait`
+    /// already mergeable, an issue dispatched into a free slot), so the
+    /// zero-duration conditioning [`super::history::StageSample::worked`]
+    /// applies must not touch them.
+    ///
+    /// `review_wait` is deliberately on the wait side even though a
+    /// `sweep.outcome` `judge` phase feeds it: the same stage also receives
+    /// forge-timeline waits, and one rule cannot be right for both. Leaving it
+    /// unconditioned keeps every shipped v1 estimate byte-identical.
+    #[must_use]
+    pub fn is_role_attempt(self) -> bool {
+        matches!(self, Stage::SweepCurator | Stage::SweepBuilder | Stage::Doctor)
+    }
+
     /// The stage a `sweep.outcome` phase name records (`judge` is the
     /// in-sweep `review_wait`, `merge` the in-sweep `merge_wait`).
     #[must_use]

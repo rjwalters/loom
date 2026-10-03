@@ -848,10 +848,9 @@ fn mixed_batch_produces_both_a_logs_and_a_metrics_request() {
 
 #[test]
 fn active_identity_maps_distinct_runtime_provider_and_model_without_profile() {
-    let record: TelemetryRecord = serde_json::from_str(include_str!(
-        "../../../../../dashboard/test/fixtures/sweep-identity.json"
-    ))
-    .unwrap();
+    let record: TelemetryRecord =
+        serde_json::from_str(include_str!("../../../../tests/fixtures/sweep-identity.json"))
+            .unwrap();
     let request = build_logs_request(&[envelope("host-a", record)]).unwrap();
     let log = &request.resource_logs[0].scope_logs[0].log_records[0];
     for (key, expected) in [

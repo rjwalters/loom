@@ -19,16 +19,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
+use crate::gh_invocation::gh_bin;
 use crate::proc_exec::{run_bounded, Completion};
-
-/// The `gh` binary to invoke. Honors `LOOM_GH_BIN` (tests / overrides), the
-/// same seam `forge_cmd::gh_bin`, `forge_cached_list`, and `role_collision`
-/// already use — so a fixture can steer these helpers without mutating the
-/// process-wide `PATH`, which races with every other concurrently-running
-/// test's `Command` spawn.
-fn gh_bin() -> String {
-    std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
-}
 
 fn gh_command(repo_root: &Path) -> Command {
     let mut cmd = Command::new(gh_bin());
@@ -85,6 +77,33 @@ pub(crate) fn bounded_output(mut cmd: Command, timeout: Duration) -> Option<Outp
             None
         }
         Err(_) => None,
+    }
+}
+
+/// [`bounded_output`]'s counted twin (#10089): the same `None`-on-no-answer
+/// contract, but the probe runs through the `gh` facade, so it is booked in
+/// `forge_call_stats` under `op` and gets the cross-owner `GH_CONFIG_DIR`
+/// (#5401/#5431) from `repo_root`.
+pub(crate) fn bounded_counted(
+    op: &'static str,
+    repo_root: &Path,
+    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+) -> Option<Output> {
+    use crate::cmd_out::{CmdOutcome, Unavailable};
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    let inv =
+        GhInvocation::new(Operation::new(op), AccessIntent::Read, GhTarget::None, GH_PROBE_TIMEOUT)
+            .args(args)
+            .current_dir(repo_root);
+    match inv.run() {
+        CmdOutcome::Ran(out) => Some(out),
+        CmdOutcome::Unavailable(Unavailable::TimedOut { after, .. }) => {
+            eprintln!(
+                "gh: probe exceeded {after:?} deadline — treating result as UNKNOWN (issue #8708)"
+            );
+            None
+        }
+        CmdOutcome::Unavailable(_) => None,
     }
 }
 
