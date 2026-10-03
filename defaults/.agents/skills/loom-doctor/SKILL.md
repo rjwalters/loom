@@ -426,10 +426,12 @@ Use the shared queue and walk its rows in order:
 QUEUE=$(loom-daemon pr-queue --role doctor) || exit 1
 printf '%s\n' "$QUEUE" | jq -r '.[] | [.number, .origin, .priorityReason] | @tsv'
 ```
-Follow `.loom/docs/pr-planning.md`. Stars precede interactive work; the classes
-below describe the baseline tie-break, not separate passes ahead of the queue.
-After each completed/skipped PR, refresh the queue and take the next unvisited
-row; keep a per-pass visited set. Preserve PR origin during repairs.
+Follow `.loom/docs/pr-planning.md`. **Starred rows lead, earliest star first
+(#9974)**; never abandon a fix in flight for one. Interactive work follows; the
+classes below are the baseline tie-break, not passes ahead of the queue. After
+each completed/skipped PR, refresh the queue and take the next unvisited row;
+keep a per-pass visited set. Preserve PR origin; change the star only on the
+operator's direction.
 
 ### Priority 1: Approved PRs with Merge Conflicts (URGENT)
 
@@ -1062,12 +1064,9 @@ write that actually matters, not just at claim time.
 
 ### Why Check CI First?
 
-In past orchestration runs, Doctors often required 3+ separate passes because they fixed one failure at a time:
-- Round 1: Fixed Rust test only
-- Round 2: Fixed TypeScript error only
-- Round 3: Finally fixed all 21 remaining frontend tests
-
-**Each pass adds latency and token cost.** A comprehensive initial assessment addresses ALL failures in a single pass.
+Past Doctors needed 3+ passes fixing one failure at a time (a Rust test, then a
+TypeScript error, then 21 frontend tests). **Each pass adds latency and token
+cost**; a comprehensive initial assessment addresses ALL failures in one pass.
 
 ### Step 1: Identify ALL Failing Checks
 
@@ -1557,7 +1556,7 @@ If review requests major architectural changes:
 ## Notes
 
 - **Always work in a dedicated worktree** (see "PR Branch Isolation" above): use the issue worktree for `feature/issue-<N>` branches or `pr-worktree.sh` for external/ad-hoc branches. Never run `gh pr checkout` in the orchestrator's main worktree.
-- **Find work by label**: Look for `loom:changes-requested` (amber badges) to find PRs needing fixes
+- **Find work**: `loom-daemon pr-queue --role doctor` (stars first; see "Finding Work")
 - **Signal completion**: After fixing, transition `loom:changes-requested` → `loom:review-requested` to hand back to Reviewer
 - **Be proactive**: Check all open PRs regularly - conflicts can appear even on unlabeled PRs
 - **Stay focused**: Only address review feedback and conflicts - don't add new features

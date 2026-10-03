@@ -740,22 +740,13 @@ pub enum ForgeCmd {
     /// [`crate::forge_check_open_pr`]; see that module for the exit-code
     /// contract.
     CheckOpenPr { issue: u32 },
-    /// `forge starred --kind issue|pr [--label L] [--json]` — starred
+    /// `forge starred --kind issue|pr [--label L] [--without L,..] [--json]` — starred
     /// (`loom:operator-priority`) items in the daemon's own order (#9974).
-    Starred {
-        kind: String,
-        label: Option<String>,
-        json: bool,
-    },
+    Starred(crate::forge_starred::StarredArgs),
     /// `forge star <number> --direction D [--unstar] [--by NAME]` — apply or
     /// remove the star on the operator's direction, with an audit comment
     /// ([`crate::forge_star`], #9974).
-    Star {
-        number: u32,
-        direction: String,
-        unstar: bool,
-        by: Option<String>,
-    },
+    Star(crate::forge_star::StarArgs),
     /// `forge pr-congestion [--json] [--max-open N] [--max-points N]` — the
     /// #9063 **Phase 1** congestion signal, report-only: approved-queue depth,
     /// story points awaiting merge, and a path-disjoint bundle estimate over
@@ -879,15 +870,8 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
         ForgeCmd::Pr(args) => gh_passthrough("pr", &args),
         ForgeCmd::Auth(args) => gh_passthrough("auth", &args),
         ForgeCmd::CheckOpenPr { issue } => crate::forge_check_open_pr::handle(issue),
-        ForgeCmd::Starred { kind, label, json } => {
-            crate::forge_starred::handle(&kind, label.as_deref(), json)
-        }
-        ForgeCmd::Star {
-            number,
-            direction,
-            unstar,
-            by,
-        } => crate::forge_star::handle(number, &direction, unstar, by.as_deref()),
+        ForgeCmd::Starred(a) => crate::forge_starred::handle(a),
+        ForgeCmd::Star(a) => crate::forge_star::handle(a),
         ForgeCmd::PrCongestion {
             json,
             max_open,

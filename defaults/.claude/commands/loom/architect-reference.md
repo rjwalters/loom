@@ -231,10 +231,10 @@ To avoid overwhelming the backlog:
 
 ## Priority Assessment Details
 
-Architects never apply a priority label. `loom:operator-priority` is the
-operator's human-only star (#9244). If an issue looks critical (a user-facing
-bug NOW, a security hole, a hotfix, or it blocks all other work), say so in the
-body and let the operator decide whether to star it.
+Architects never star on their own judgment: `loom:operator-priority` is the
+operator's star (#9244; agents change it only on operator direction). If an
+issue looks critical (user-facing bug NOW, security hole, blocks all work), say
+so in the body; the operator decides.
 
 ---
 

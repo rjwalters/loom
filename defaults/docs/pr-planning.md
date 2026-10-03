@@ -60,7 +60,11 @@ Keep a per-pass visited set so a waiting preferred PR cannot loop or idle others
 This lets a human PR arriving during a fleet batch take the next free turn. They
 use that order, preserving their normal tie-breaks: Judge listing order,
 Doctor approved conflicts before review feedback, Champion oldest first.
-Stars lead; with preference enabled interactive PRs follow, then ordinary work.
+Stars lead, earliest star first (#9974): a PR's star time is its own `labeled`
+event or its linked issue's earlier star (`loom-daemon forge starred`), with a
+`created_at` fallback, and `pr-queue` reports it as `operatorPriorityAt`. With
+preference enabled interactive PRs follow, then ordinary work. Like human
+preference, a star never evicts work already in flight; it takes the next turn.
 Existing emergency recovery of verified-red main remains a separate higher
 priority workflow; this policy changes neither issue/build planning nor recovery.
 

@@ -3194,11 +3194,11 @@ After each completed/skipped PR, refresh the queue and take the next unvisited r
 **Congestion signal, report-only.** At the start of the pass, run
 `loom-daemon forge pr-congestion` from the repo root and copy its verdict
 line into the pass summary — measurement only, never a merge-order input.
-Full policy: `.loom/docs/pr-congestion-signal.md` (source:
-`defaults/docs/pr-congestion-signal.md`).
+Full policy: `.loom/docs/pr-congestion-signal.md`.
 
 **Starred PRs first (`loom:operator-priority`, #9244; level 2 before the star, #10307).** The shared queue puts stars
-ahead of interactive work, then ordinary work (oldest first within each class). The star changes order only: all 6
+first (level 2 first, then earliest star first, #9974), then interactive, then ordinary work (oldest
+first per class). It never evicts work in flight and changes order only: all 6
 Safety Criteria, the Verdict-State Janitor, and every hold (merge-risk,
 critical-file, `loom:operator-only`, `loom:blocked`) apply unchanged. A starred
 PR that passes is merged this pass. A starred PR on a hold stays held and is
@@ -3206,7 +3206,7 @@ never merged — it is listed first in the hold digest (Step 1 sorts it to the
 top, marked ⭐). A failed merge (exit 1, not the 3/4/5 re-queues below) on a
 starred PR is retried **once** this pass; if that fails too, post the "Merge
 Failed" comment with the concrete refusal as a starred-PR escalation and do
-not retry it again this pass. Never add or remove the star.
+not retry it this pass. Change the star only on operator direction.
 
 The **Capped-PR Recovery Pass** drains the same way (oldest first, one decision per parked PR, continue past individual failures), but only after the `loom:pr` merge queue is empty — merging approved work always outranks reconsidering parked work.
 

@@ -106,9 +106,29 @@ fn actor(by: Option<&str>) -> String {
     }
 }
 
+/// Parsed `forge star` arguments.
+#[derive(Debug, Clone)]
+pub struct StarArgs {
+    /// Issue or PR number.
+    pub number: u32,
+    /// The operator direction being executed.
+    pub direction: String,
+    /// Remove the star instead of adding it.
+    pub unstar: bool,
+    /// Executing agent's name (default `$LOOM_ROLE`).
+    pub by: Option<String>,
+}
+
 /// Handle `loom-daemon forge star`. Exits the process.
-pub fn handle(number: u32, direction: &str, unstar: bool, by: Option<&str>) -> Result<()> {
-    let Some(direction) = sanitize_direction(direction) else {
+pub fn handle(args: StarArgs) -> Result<()> {
+    let StarArgs {
+        number,
+        direction,
+        unstar,
+        by,
+    } = args;
+    let by = by.as_deref();
+    let Some(direction) = sanitize_direction(&direction) else {
         bail!(
             "--direction must quote the operator's direction; an agent never stars or \
              unstars on its own judgment (#9974)"

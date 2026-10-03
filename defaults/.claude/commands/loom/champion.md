@@ -32,8 +32,9 @@ loom-daemon pr-queue --role champion
 ```
 
 If found, **read and follow instructions in `.claude/commands/loom/champion-pr-merge.md`**.
-Walk the returned order; follow `.loom/docs/pr-planning.md`. All holds and
-Safety Criteria still apply (see its "Batch Processing").
+Walk the returned order (earliest star first, #9974); follow
+`.loom/docs/pr-planning.md`. All holds and Safety Criteria still apply (see its
+"Batch Processing").
 
 ### Priority 2: Quality Issues Ready to Promote
 
@@ -162,14 +163,10 @@ If found, **read and follow instructions in `.claude/commands/loom/champion-issu
 If no individual proposals need promotion, check for epic proposals:
 
 ```bash
-# Epic proposals, highest priority level first (#9244, #10307)
-# level list: keep in sync with operator_levels.rs LEVELS until #10311
-gh issue list \
-  --label="loom:epic" \
-  --state=open \
-  --limit=500 \
-  --json number,title,body,labels,comments \
-  --jq 'sort_by([.labels[].name] | if any(test("high-priority")) then 0 elif index("loom:operator-priority") then 1 else 2 end) | .[] | "#\(.number) \(.title) [epic]"'
+# Starred epics first, highest level then earliest star first (#9244, #9974, #10307); then the rest
+loom-daemon forge starred --kind issue --label loom:epic
+gh issue list --label="loom:epic" --state=open --limit=500 --json number,title \
+  --jq '.[] | "#\(.number) \(.title) [epic]"'
 ```
 
 If found, **read and follow instructions in `.claude/commands/loom/champion-epic.md`**. Epics have their own evaluation criteria focused on structure and phase decomposition.

@@ -1044,7 +1044,7 @@ For detailed complexity assessment and decomposition guidance, see **builder-com
 
 ## Finding Work: Priority System
 
-Workers use a three-level priority system to determine which issues to work on:
+Three priority levels, highest first:
 
 ### Priority Order
 
@@ -1057,12 +1057,11 @@ Workers use a three-level priority system to determine which issues to work on:
 **Step 1: Check for starred issues first**
 
 ```bash
-# level list: keep in sync with operator_levels.rs LEVELS until #10311
-for L in loom:operator-high-priority loom:high-priority-inherited loom:operator-priority; do
-gh issue list --label="loom:issue" --label="$L" --state=open --limit=5; done
+loom-daemon forge starred --kind issue --label loom:issue
 ```
 
-If any exist, **claim one immediately**.
+Claim the **first** row (highest level, then earliest star, #9974/#10307; exit 5 = no answer, not empty).
+Never drop a claim in flight for a star.
 
 **Step 2: If none starred, check curated issues**
 
@@ -1084,7 +1083,7 @@ gh issue list --label="loom:issue" --state=open --json number,title,labels \
   \"#\(.number): \(.title)\""
 ```
 
-**Why allow this**: work can proceed on human approval alone, before Curator runs.
+**Why allow this**: human approval alone suffices.
 
 **Step 4 (every tier): guard the claim before you flip the label**
 

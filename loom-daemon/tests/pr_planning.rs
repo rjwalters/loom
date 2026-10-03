@@ -45,6 +45,49 @@ fn output(mut cmd: Command) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
+/// #9974: two stars whose star order differs from creation and number
+/// order. Every role's `pr-queue` takes the earlier star first and reports
+/// the star time it ordered by.
+#[test]
+fn pr_queue_orders_stars_by_star_time_for_every_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join(".loom")).unwrap();
+    for (role, label) in [
+        ("judge", "loom:review-requested"),
+        ("doctor", "loom:changes-requested"),
+        ("champion", "loom:pr"),
+    ] {
+        let starred = |n: u64, at: &str| {
+            let mut r = row(n, "autonomous", label);
+            r["labels"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"name":"loom:operator-priority"}));
+            r["operatorPriorityAt"] = serde_json::json!(at);
+            r
+        };
+        let data = root.join("pulls.json");
+        let rows = vec![
+            row(1, "interactive", label),
+            starred(10, "2026-09-28T00:00:00Z"),
+            starred(20, "2026-09-21T00:00:00Z"),
+        ];
+        std::fs::write(&data, serde_json::to_vec(&rows).unwrap()).unwrap();
+        let mut cmd = cli(root);
+        cmd.args(["pr-queue", "--role", role, "--input"]).arg(&data);
+        let out = output(cmd);
+        let ids: Vec<_> = out
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["number"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![20, 10, 1], "{role}");
+        assert_eq!(out[0]["operatorPriorityAt"], "2026-09-21T00:00:00Z", "{role}");
+    }
+}
+
 #[test]
 fn actual_role_entrypoints_use_shared_preference_and_effective_config() {
     let dir = tempfile::tempdir().unwrap();

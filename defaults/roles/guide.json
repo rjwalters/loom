@@ -3,7 +3,7 @@
   "description": "Keeps the backlog healthy: tier labels, orphan verification, unblocking, epic tracking, living docs",
   "suggestedModel": "sonnet",
   "defaultInterval": 900000,
-  "defaultIntervalPrompt": "Run a triage pass: assign missing tier labels, recover orphaned issues, unblock resolved dependencies, track epics, and refresh WORK_PLAN.md. Never apply or remove priority labels (loom:operator-priority is human-only).",
+  "defaultIntervalPrompt": "Run a triage pass: assign missing tier labels, recover orphaned issues, unblock resolved dependencies, track epics, and refresh WORK_PLAN.md. Never apply or remove loom:operator-priority on your own judgment; only on the operator's explicit direction, via loom-daemon forge star.",
   "autonomousRecommended": true,
   "suggestedWorkerType": "claude"
 }

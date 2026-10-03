@@ -152,6 +152,10 @@ pub(crate) enum ForgeAction {
         #[arg(long)]
         label: Option<String>,
 
+        /// Drop items carrying any of these labels (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        without: Vec<String>,
+
         /// Emit JSON objects instead of bare numbers.
         #[arg(long)]
         json: bool,
@@ -769,18 +773,28 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             max_open,
             max_points,
         },
-        ForgeAction::Starred { kind, label, json } => ForgeCmd::Starred { kind, label, json },
+        ForgeAction::Starred {
+            kind,
+            label,
+            without,
+            json,
+        } => ForgeCmd::Starred(loom_daemon::forge_starred::StarredArgs {
+            kind,
+            label,
+            without,
+            json,
+        }),
         ForgeAction::Star {
             number,
             direction,
             unstar,
             by,
-        } => ForgeCmd::Star {
+        } => ForgeCmd::Star(loom_daemon::forge_star::StarArgs {
             number,
             direction,
             unstar,
             by,
-        },
+        }),
         ForgeAction::CheckClaim { issue, force_claim } => {
             ForgeCmd::CheckClaim { issue, force_claim }
         }
