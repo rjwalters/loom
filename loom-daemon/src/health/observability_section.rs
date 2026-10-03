@@ -112,7 +112,8 @@ pub fn assess_observability(inputs: &HealthInputs) -> Option<HealthSection> {
                 Verdict::Degraded,
                 format!(
                 "exporter has been running {} as {} and has NEVER had a batch acked — telemetry \
-                 is not reaching {}{}",
+                 is not reaching {}{} → fix: check this host's OTel egress (edge collector / \
+                 tunnel / ingest key) and the endpoint itself",
                 format_window(export.uptime_secs(inputs.at).unwrap_or(0)),
                 export.host_id.as_deref().unwrap_or("unknown-host"),
                 export.endpoint.as_deref().unwrap_or("the configured endpoint"),
@@ -128,7 +129,9 @@ pub fn assess_observability(inputs: &HealthInputs) -> Option<HealthSection> {
             "observability",
             Verdict::Degraded,
             format!(
-                "{} consecutive failed flush(es) as {}; last successful export {}{}",
+                "{} consecutive failed flush(es) as {}; last successful export {}{} → fix: check \
+                 this host's OTel egress (edge collector / tunnel / ingest key) and the endpoint \
+                 itself",
                 export.consecutive_failures,
                 export.host_id.as_deref().unwrap_or("unknown-host"),
                 export.last_success_age_secs(inputs.at).map_or_else(

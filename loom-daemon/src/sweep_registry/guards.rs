@@ -3,9 +3,8 @@
 
 use super::*;
 use crate::claim_reconciliation::forge::parse_max_timestamp;
-use crate::cmd_out::{CmdOutcome, Unavailable};
 use crate::comment_trust::records;
-use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::gh_invocation::AccessIntent;
 
 /// The pure pre-flip label predicate behind [`CollisionClass`] (Issue #7873).
 /// Declared here rather than in `sweep_registry::mod` because it is this
@@ -21,6 +20,9 @@ pub(crate) mod preflip_labels;
 /// `pub(crate)` so the dispatch-level yield tests can name the identity
 /// constants the leaseless leg reports rather than re-spelling them.
 pub(crate) mod claim_label;
+
+/// The registry's facade `gh` helpers, shared by every `sweep_registry` module.
+mod gh_exec;
 
 /// Three-state result of the open-linked-PR probe (Issue #4452).
 ///
@@ -1274,6 +1276,15 @@ impl SweepRegistry {
         opaque
     }
 
+    /// `body` for an issue comment with the #9772 dashboard footer appended —
+    /// the slug resolves like every forge mutation here (`resolve_owner_repo`
+    /// honors `LOOM_REPO`), and an unresolvable one leaves the body unlinked
+    /// rather than linking to nowhere.
+    fn dashboard_comment_body(&self, issue: u32, body: &str) -> String {
+        let nwo = self.resolve_owner_repo().map(|(o, r)| format!("{o}/{r}"));
+        crate::forge_comment::footer_or_body(nwo.as_deref(), issue, false, body)
+    }
+
     /// Write a lease record (Issue #6179, Epic #6165 Phase 1) — a best-effort
     /// forge comment posted at the moment a dispatch successfully flips
     /// `loom:building`, so the claim gains a liveness dimension (a lease)
@@ -1292,46 +1303,6 @@ impl SweepRegistry {
     /// `post_watchdog_gaveup_comment`: a `gh` failure here only logs (at
     /// `warn`) and never propagates — posting a lease record must never fail
     /// dispatch or undo the claim it documents.
-    /// The configured `gh` binary, or the crate's single resolver
-    /// ([`crate::gh_invocation::gh_bin`]: policy launcher -> `LOOM_GH_BIN` ->
-    /// `PATH`) when no override is configured (#9985).
-    /// A facade invocation for this registry's workspace (#10089): counted per
-    /// `op` in `forge_call_stats`, the cross-owner `GH_CONFIG_DIR` (#5401) and
-    /// `LOOM_REPO` -> `GH_REPO` (#8263) applied by the facade.
-    fn gh_inv(&self, op: &'static str, intent: AccessIntent, gh: &Path) -> GhInvocation {
-        GhInvocation::new(Operation::new(op), intent, GhTarget::None, reap_gh_timeout())
-            .program(gh)
-            .current_dir(&self.config.workspace_root)
-    }
-
-    /// Run `inv` (bounded by [`reap_gh_timeout`]), shaped like
-    /// [`output_with_timeout`]: `Ok(Some(out))` when `gh` ran, `Ok(None)` when
-    /// it outlived the deadline (and was killed), `Err` when it could not be
-    /// started or collected.
-    fn run_counted(&self, inv: GhInvocation) -> std::io::Result<Option<std::process::Output>> {
-        match inv.run() {
-            CmdOutcome::Ran(out) => Ok(Some(out)),
-            CmdOutcome::Unavailable(Unavailable::TimedOut { .. }) => Ok(None),
-            CmdOutcome::Unavailable(u) => Err(std::io::Error::other(u.to_string())),
-        }
-    }
-
-    fn resolved_gh(&self) -> PathBuf {
-        self.config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(crate::gh_invocation::gh_bin()))
-    }
-
-    /// `body` for an issue comment with the #9772 dashboard footer appended —
-    /// the slug resolves like every forge mutation here (`resolve_owner_repo`
-    /// honors `LOOM_REPO`), and an unresolvable one leaves the body unlinked
-    /// rather than linking to nowhere.
-    fn dashboard_comment_body(&self, issue: u32, body: &str) -> String {
-        let nwo = self.resolve_owner_repo().map(|(o, r)| format!("{o}/{r}"));
-        crate::forge_comment::footer_or_body(nwo.as_deref(), issue, false, body)
-    }
-
     pub(crate) fn write_lease_comment(&self, issue: u32, sweep_id: &str) {
         if self.config.skip_label_flip {
             return;
