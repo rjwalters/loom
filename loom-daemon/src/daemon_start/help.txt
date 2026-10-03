@@ -89,7 +89,9 @@ Usage:
 
 Environment:
   LOOM_DAEMON_BIN     Path to the loom-daemon binary (else auto-detected)
-  LOOM_SOCKET_PATH    Override the daemon socket (default ~/.loom/loom-daemon.sock)
+  LOOM_SOCKET_PATH    Override the daemon socket (default ~/.loom/loom-daemon.sock). Test
+                       isolation only -- loom-daemon is ONE daemon per machine; multi-repo
+                       coverage is 'loom-daemon workspace add', not a second daemon (#9815)
   LOOM_PID_FILE       OUTPUT, not input (#6420). This script is the EXPORTER of
                        the pid-file path -- it derives "<state home>/.daemon.pid"
                        and exports/bakes it into the plist/unit for the daemon

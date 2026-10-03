@@ -5359,6 +5359,18 @@ restructuring startup order (and `env_logger` cannot be re-targeted after
 `.init()`) for marginal benefit over the env-only surface — file a follow-up if
 a config tier is wanted later.
 
+Scoping the socket is for **isolated test instances, not a second production
+daemon**: `loom-daemon` is one-per-machine (#3926 — the token pool, the
+per-machine admission budget and the singleton socket are all machine-level),
+multi-repo coverage is the workspace registry (`loom-daemon workspace add`), and
+a scoped start rooted at a non-scratch directory that comes up while another
+daemon is already listening on `~/.loom/loom-daemon.sock` logs an actionable
+warning at startup (#9815). A scratch-rooted daemon (`$TMPDIR`, `*-checkout`,
+`.loom/worktrees/`) is recognized as a test instance and stays silent — the
+same directory-character rule `daemon_start`'s scratch-drift advisory uses.
+The structural complement (a machine-level ownership registry so the
+default-socket daemon can also see scoped siblings) is #9816.
+
 **The launchd `StandardOutPath`/`StandardErrorPath` redirect is a decoy, not a
 second log.** `defaults/scripts/cli/loom-daemon-start.sh` points both launchd
 redirects at a single file, `$REPO_ROOT/.loom/logs/daemon-start.log`
