@@ -16,6 +16,7 @@ fn read_op(target: GhTarget) -> GhInvocation {
         target,
         Duration::from_secs(5),
     )
+    .parent(ParentContext::Missing)
 }
 
 #[test]
@@ -85,8 +86,8 @@ fn target_attribute_is_bounded() {
 }
 
 #[test]
-fn env_plan_with_no_parent_strips_both_traceparents() {
-    let plan = read_op(GhTarget::None).env_plan_with(None);
+fn env_plan_with_no_child_context_strips_both_traceparents() {
+    let plan = read_op(GhTarget::None).env_plan_with(None, None);
     assert_eq!(env_of(&plan, TRACEPARENT_ENV), Some(None));
     assert_eq!(env_of(&plan, W3C_TRACEPARENT_ENV), Some(None));
     assert_eq!(env_of(&plan, "GH_REPO"), None);
@@ -94,10 +95,10 @@ fn env_plan_with_no_parent_strips_both_traceparents() {
 }
 
 #[test]
-fn env_plan_exports_the_parent_under_both_names() {
+fn env_plan_exports_the_child_context_under_both_names() {
     let ctx = TraceContext::derived("sweep", &["gh-invocation-test"]);
     let inv = read_op(GhTarget::None).parent(ParentContext::Parent(ctx.clone()));
-    let plan = inv.env_plan_with(None);
+    let plan = inv.env_plan_with(None, Some(&ctx));
     assert_eq!(env_of(&plan, TRACEPARENT_ENV), Some(Some(ctx.traceparent())));
     assert_eq!(env_of(&plan, W3C_TRACEPARENT_ENV), Some(Some(ctx.traceparent())));
     assert_eq!(inv.context_source(), "parent");
@@ -105,11 +106,11 @@ fn env_plan_exports_the_parent_under_both_names() {
 
 #[test]
 fn env_plan_gh_repo_prefers_the_typed_target_over_loom_repo() {
-    let typed =
-        read_op(GhTarget::repo("acme/widgets").unwrap()).env_plan_with(Some("other/repo".into()));
+    let typed = read_op(GhTarget::repo("acme/widgets").unwrap())
+        .env_plan_with(Some("other/repo".into()), None);
     assert_eq!(env_of(&typed, "GH_REPO"), Some(Some("acme/widgets".into())));
 
-    let ambient = read_op(GhTarget::None).env_plan_with(Some("other/repo".into()));
+    let ambient = read_op(GhTarget::None).env_plan_with(Some("other/repo".into()), None);
     assert_eq!(env_of(&ambient, "GH_REPO"), Some(Some("other/repo".into())));
 }
 
@@ -127,19 +128,19 @@ fn env_plan_scopes_gh_config_dir_by_root_then_target_owner() {
     );
     let target = GhTarget::repo("gh-invocation-test-owner-9985/x").unwrap();
 
-    let by_owner = read_op(target.clone()).env_plan_with(None);
+    let by_owner = read_op(target.clone()).env_plan_with(None, None);
     assert_eq!(
         env_of(&by_owner, "GH_CONFIG_DIR"),
         Some(Some(owner_cfg.to_string_lossy().into_owned()))
     );
 
-    let by_root = read_op(target).current_dir(&root).env_plan_with(None);
+    let by_root = read_op(target).current_dir(&root).env_plan_with(None, None);
     assert_eq!(
         env_of(&by_root, "GH_CONFIG_DIR"),
         Some(Some(root_cfg.to_string_lossy().into_owned()))
     );
 
-    let unscoped = read_op(GhTarget::None).env_plan_with(None);
+    let unscoped = read_op(GhTarget::None).env_plan_with(None, None);
     assert_eq!(env_of(&unscoped, "GH_CONFIG_DIR"), None);
 }
 
@@ -163,8 +164,9 @@ fn captured_execution_runs_the_resolved_program_with_the_assembled_env() {
         .args(["issue", "list"])
         .current_dir(tmp.path())
         .parent(ParentContext::Parent(ctx.clone()));
-    let GhCompletion::Captured(Completion::Exited(out)) =
-        inv.execute_with(&stub(tmp.path())).unwrap()
+    let GhCompletion::Captured(Completion::Exited(out)) = inv
+        .execute_with(&stub(tmp.path()), GhBinSource::EnvOverride)
+        .unwrap()
     else {
         panic!("expected a captured, exited completion");
     };
@@ -179,7 +181,7 @@ fn a_missing_program_is_a_spawn_error_not_an_empty_result() {
     let tmp = tempfile::tempdir().unwrap();
     let missing = tmp.path().join("no-such-gh");
     let err = read_op(GhTarget::None)
-        .execute_with(&missing.to_string_lossy())
+        .execute_with(&missing.to_string_lossy(), GhBinSource::EnvOverride)
         .unwrap_err();
     assert!(matches!(err, ExecError::Spawn(_)), "{err}");
 }
@@ -189,7 +191,10 @@ fn passthrough_contract_is_preserved_and_returns_the_exit_status() {
     let tmp = tempfile::tempdir().unwrap();
     let inv = read_op(GhTarget::None).args(["--version"]).passthrough();
     assert_eq!(inv.contract(), OutputContract::Passthrough);
-    let GhCompletion::Passthrough(status) = inv.execute_with(&stub(tmp.path())).unwrap() else {
+    let GhCompletion::Passthrough(status) = inv
+        .execute_with(&stub(tmp.path()), GhBinSource::EnvOverride)
+        .unwrap()
+    else {
         panic!("expected a passthrough completion");
     };
     assert_eq!(status.code(), Some(7));
