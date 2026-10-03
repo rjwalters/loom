@@ -92,12 +92,17 @@ pub(super) fn run_reconciliation_pass_over_roots(
             .merge(forge::reconcile_pr_verdicts(gh_bin, root));
         // #8922: AFTER the verdict pass, so a verdict it just re-queued to
         // `loom:review-requested` is checked for base conflicts on this tick.
-        review_conflict::reconcile_review_conflicts(gh_bin, root);
+        //
+        // #4429 follow-up: the conflict pass reads ONE open-PR listing and
+        // hands it on when it wrote nothing, so the sequence pass below does
+        // not list every open PR a second time (2 of this root's per-tick
+        // GraphQL `gh pr list`s saved in the steady state).
+        let (_, open_prs) = review_conflict::reconcile_review_conflicts_sharing(gh_bin, root);
         // #9686: after review conflicts, so a repair the conflict pass just
         // deferred (sequenced behind an open predecessor) is recorded by the
         // same tick, and holds a predecessor landing just released are seen
         // before the next planning pass reads the label set.
-        merge_sequence::reconcile_merge_sequences(gh_bin, root);
+        merge_sequence::reconcile_merge_sequences_with(gh_bin, root, open_prs.as_deref());
         // Issue #9464: after every other reconciliation — a claim this pass
         // just reclaimed must not be immediately "healed" back. Re-applies
         // `loom:building` to OPEN issues whose sweep is live here but whose

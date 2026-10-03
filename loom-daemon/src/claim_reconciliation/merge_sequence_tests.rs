@@ -559,3 +559,74 @@ fn a_new_pr_chains_behind_a_held_predecessor() {
     assert_eq!(g.edges.len(), 1);
     assert_eq!((g.edges[0].follower, g.edges[0].after), (2, 1));
 }
+
+// ---- #4429 follow-up: reuse of the review-conflict pass's listing ----
+
+fn listing_json(n: u32) -> String {
+    let rows: Vec<String> = (1..=n)
+        .map(|i| {
+            format!(
+                r#"{{"number":{i},"createdAt":"2026-10-02T00:00:00Z","updatedAt":"2026-10-02T00:00:00Z","headRefOid":"{i:040x}","headRefName":"feature/issue-{i}","baseRefName":"main","isDraft":false,"mergeable":"MERGEABLE","labels":[]}}"#
+            )
+        })
+        .collect();
+    format!("[{}]", rows.join(","))
+}
+
+/// The shared payload (which carries `mergeable` too) parses, and is cut to
+/// the same 100 newest PRs this pass's own `--limit` listing returns.
+#[test]
+fn shared_listing_parses_and_truncates_to_own_limit() {
+    let got = shared_open_prs(listing_json(150).as_bytes()).unwrap();
+    assert_eq!(got.len(), super::super::MAX_ISSUES_PER_WORKSPACE as usize);
+    assert_eq!(got[0].number, 1);
+    assert!(shared_open_prs(b"not json").is_none());
+}
+
+#[cfg(unix)]
+fn logging_gh(dir: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("fake-gh-seq.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"{}\"\necho '[]'\n",
+        log.display()
+    );
+    std::fs::write(&bin, script).unwrap();
+    let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&bin, perms).unwrap();
+    bin
+}
+
+/// A shared listing replaces this pass's own `gh pr list`; without one (or
+/// with one that does not parse) the pass lists for itself as before.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn a_shared_listing_saves_the_pass_its_own_pr_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let prev = std::env::var(MERGE_SEQUENCE_ENABLED_ENV).ok();
+    std::env::remove_var(MERGE_SEQUENCE_ENABLED_ENV);
+    let one = listing_json(1);
+    let cases: [(Option<&[u8]>, bool); 3] = [
+        (Some(one.as_bytes()), false),
+        (None, true),
+        (Some(b"not json"), true),
+    ];
+    for (i, (prefetched, expect_list)) in cases.into_iter().enumerate() {
+        let log = dir.path().join(format!("gh-{i}.log"));
+        std::fs::write(&log, "").unwrap();
+        let gh = logging_gh(dir.path(), &log);
+        let stats = reconcile_merge_sequences_with(&gh, &root, prefetched);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(calls.contains("pr list"), expect_list, "case {i}: {calls}");
+        if !expect_list {
+            assert_eq!(stats.checked, 1, "case {i}");
+        }
+    }
+    if let Some(v) = prev {
+        std::env::set_var(MERGE_SEQUENCE_ENABLED_ENV, v);
+    }
+}
