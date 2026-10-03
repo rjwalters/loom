@@ -259,6 +259,7 @@ pub mod response;
 pub mod sequence;
 pub mod stacked_children;
 pub mod stale_checks;
+pub mod tree_checks;
 pub mod version_policy;
 pub mod worktree_preserve;
 pub mod worktrees;
