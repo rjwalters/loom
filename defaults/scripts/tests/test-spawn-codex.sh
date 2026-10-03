@@ -1555,8 +1555,8 @@ cat > "$SESSION_DOCKER_BIN/docker" <<DOCKERSHIM
 # the same fake codex shim Section 8 uses via a plain \`exec\`, so stdin/
 # stdout/stderr and the exit code all flow through exactly as they would for
 # a real container.
-# The #9979 posture probe (`loom-daemon session-exec posture`) runs
-# `docker inspect --type container <c>`; answer as a hardened host-mode
+# The #9979 posture probe (loom-daemon session-exec posture) runs
+# docker inspect --type container <c>; answer as a hardened host-mode
 # container would (unprivileged, bridge, CapDrop ALL, no-new-privileges).
 case "\$1" in inspect) [[ "\$*" == *"--type container"* ]] && echo '[{"State":{"Running":true},"Config":{"Labels":{"loom.session-posture":"container-boundary-v1"}},"HostConfig":{"Privileged":false,"NetworkMode":"bridge","CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"]},"Mounts":[]}]' || echo true; exit 0;; exec) shift;; *) exit 1;; esac
 while [[ "\$1" == -* ]]; do
