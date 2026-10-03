@@ -471,10 +471,11 @@ fi
 # TUI decision, so this section makes that decision the way an operator does —
 # it runs the shipped TUI under tmux in a throwaway container and answers the
 # prompt — rather than passing `--dangerously-bypass-hook-trust` or writing a
-# `trusted_hash` by hand. #8839 forbids both, and neither appears anywhere in
-# this script or in shipped Loom code (`spawn-codex.sh` refuses the flag,
-# asserted by defaults/scripts/tests/test-provision-codex-hooks.sh). What is
-# measured is therefore the production path exactly as it runs.
+# `trusted_hash` by hand. This section measures the RECORDED-trust path, which
+# private-clone sessions (#8839) and bare-metal profiles still rely on.
+# `spawn-codex.sh` passes the waiver only for a sealed host-mode registration
+# (#10102, defaults/docs/guardrail-parity-codex.md § "Sealed registration"),
+# never for this pinned private-control one.
 #
 # Two profiles, provisioned and registered identically, differing ONLY in the
 # answer given to that one prompt:
