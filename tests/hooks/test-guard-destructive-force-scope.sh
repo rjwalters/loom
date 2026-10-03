@@ -835,6 +835,29 @@ assert_allow "force-op:detached + \$(cd <path> && pwd) capture (#9405 non-regres
     "W=\"\$(cd .loom/worktrees/issue-2 && pwd)\"
 git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
 
+# A refused close must not leave the variable's PREVIOUS value live: the shell
+# DID reassign W (to the repo root / empty), so trusting the earlier worktree
+# value flips ask->allow on a command that targets the primary checkout.
+git -C "$FORCE_DETACHED_WT_REPO" worktree add -q "$FORCE_DETACHED_WT_REPO/.loom/worktrees/issue-3" \
+    -b feature/issue-3 >/dev/null 2>&1
+FORCE_ATTACHED_WT="$FORCE_DETACHED_WT_REPO/.loom/worktrees/issue-3"
+cat > "$FORCE_ATTACHED_WT/.loom-managed" <<'EOF'
+# Loom-managed worktree marker
+# Created by .loom/scripts/worktree.sh
+# Issue: 3
+# Branch: feature/issue-3
+EOF
+assert_ask "force-op:detached + stale-W reassign via \$(cd <repo> | pwd) (#9405): W is now the repo root, previous worktree value must not be kept" \
+    "W=$FORCE_DETACHED_WT; W=\"\$(cd $FORCE_DETACHED_WT_REPO | pwd)\"; git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached + stale-W reassign via \$(cd <repo> & pwd) (#9405): W is now the repo root, previous worktree value must not be kept" \
+    "W=$FORCE_DETACHED_WT; W=\"\$(cd $FORCE_DETACHED_WT_REPO & pwd)\"; git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached + stale-W reassign via \$(cd <repo> || pwd) (#9405): W is now empty (git -C \"\" = cwd), previous worktree value must not be kept" \
+    "W=$FORCE_DETACHED_WT; W=\"\$(cd $FORCE_DETACHED_WT_REPO || pwd)\"; git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:detached + stale-W after a closed && capture then \$(cd . | pwd) (#9405): the refused reassign must poison the earlier resolved value" \
+    "W=\"\$(cd $FORCE_DETACHED_WT && pwd)\"; W=\"\$(cd . | pwd)\"; git -C \"\$W\" reset --hard origin/feature/issue-2" "$FORCE_DETACHED_WT_REPO"
+assert_ask "force-op:attached + stale-W reassign then git -C \"\$W\" push --force origin HEAD (#9405): would force-push the primary checkout" \
+    "W=$FORCE_ATTACHED_WT; W=\"\$(cd $FORCE_DETACHED_WT_REPO | pwd)\"; git -C \"\$W\" push --force origin HEAD" "$FORCE_DETACHED_WT_REPO"
+
 rm -rf "$FORCE_DETACHED_WT_REPO"
 
 # ---- #6077: guard-decision telemetry audit — reproduce the EXACT real-world ----
