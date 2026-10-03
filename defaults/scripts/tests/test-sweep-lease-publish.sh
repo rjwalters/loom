@@ -580,6 +580,45 @@ else
     echo "· skipped: (o) bash 3.2 unbound-variable regression check (no 3.x /bin/bash on this host)"
 fi
 
+# --- (nb) #10023: no host identity -- no loom-daemon anywhere, no
+# LOOM_HOST_ID. A copy of the script under a root with no build, with PATH
+# and the install dir stripped of loom-daemon: loom_host_id resolves nothing,
+# so publish must REFUSE (exit 2, proceed without a lease) rather than post a
+# lease under a made-up `unknown-host` every such host would share.
+NB_ROOT="$STUB_DIR/no-daemon"
+mkdir -p "$NB_ROOT/scripts/lib" "$NB_ROOT/bin" "$NB_ROOT/empty-install"
+cp "$SCRIPT" "$NB_ROOT/scripts/"
+cp "$SCRIPTS_DIR/lib/locate-daemon-bin.sh" "$NB_ROOT/scripts/lib/"
+ln -sf "$STUB_DIR/gh" "$NB_ROOT/bin/gh"
+NB_PATH="$NB_ROOT/bin"
+IFS=: read -ra NB_DIRS <<< "$PATH"
+for d in "${NB_DIRS[@]}"; do
+    [[ -n "$d" && ! -x "$d/loom-daemon" ]] && NB_PATH="$NB_PATH:$d"
+done
+reset_state
+OUT="$(env -u LOOM_DAEMON_SELF_BIN -u CARGO_TARGET_DIR -u REPO_ROOT -u LOOM_HOST_ID \
+    PATH="$NB_PATH" LOOM_DAEMON_BIN_DIR="$NB_ROOT/empty-install" \
+    "$NB_ROOT/scripts/sweep-lease-publish.sh" publish 6320 --sweep-id sweep-nb 2>"$STUB_DIR/stderr.log")"
+RC=$?
+ERR="$(cat "$STUB_DIR/stderr.log" 2>/dev/null || true)"
+assert_eq "2" "$RC" "(nb1) no binary + no LOOM_HOST_ID -> exit 2 (proceed WITHOUT a lease)"
+assert_eq "0" "$(post_count)" "(nb1) no lease comment was posted"
+assert_eq "" "$OUT" "(nb1) no '<host> <sweep-id>' identity line is printed"
+assert_true "$([[ "$ERR" == *"no loom-daemon binary found"* ]] && echo true || echo false)" "(nb1) stderr says the binary is missing"
+
+# An older binary without `host-id` (pinned via LOOM_DAEMON_SELF_BIN): with
+# LOOM_HOST_ID it publishes that id's opaque form; without it, it refuses.
+printf '#!/usr/bin/env bash\necho "error: unrecognized subcommand" >&2\nexit 2\n' > "$STUB_DIR/old-daemon"
+chmod +x "$STUB_DIR/old-daemon"
+reset_state
+LOOM_DAEMON_SELF_BIN="$STUB_DIR/old-daemon" run_script publish 6320 --sweep-id sweep-old
+assert_eq "0" "$RC" "(nb2) older binary + LOOM_HOST_ID -> publishes"
+assert_eq "$OPAQUE_HOST sweep-old" "$OUT" "(nb2) ... under LOOM_HOST_ID's opaque id"
+reset_state
+LOOM_DAEMON_SELF_BIN="$STUB_DIR/old-daemon" LOOM_HOST_ID="" run_script publish 6320 --sweep-id sweep-old
+assert_eq "2" "$RC" "(nb3) older binary + no LOOM_HOST_ID -> exit 2, nothing published"
+assert_eq "0" "$(post_count)" "(nb3) no lease comment was posted"
+
 # --- Contract checks (mirrors test-sweep-lease-renew.sh) ------------------
 "$SCRIPT" --help > "$STUB_DIR/help.out" 2>&1
 HELP_RC=$?

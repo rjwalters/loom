@@ -93,6 +93,32 @@ fn loom_host_id_wins_and_blank_is_ignored() {
     assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "persisted-one");
 }
 
+/// No resolvable identity is an error, not a value: the plain form prints
+/// nothing on stdout and exits non-zero; `--json` still names the source.
+#[test]
+fn no_identity_exits_non_zero_without_printing_unknown_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("a-file");
+    std::fs::write(&blocker, "").unwrap();
+    let id_file = blocker.join("host-id"); // parent is a file: cannot be created
+
+    let out = isolated(Command::new(bin()), &id_file, "h")
+        .arg("host-id")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty(), "stdout must carry no id: {out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("LOOM_HOST_ID"), "{out:?}");
+
+    let out = isolated(Command::new(bin()), &id_file, "h")
+        .args(["host-id", "--json"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["source"], "unknown");
+}
+
 /// AC: the shell exporters report the same id as the daemon. Runs the real
 /// `merge-admission-telemetry.sh record` and `lib/filing-lock.sh` against the
 /// real binary (via `LOOM_DAEMON_SELF_BIN`) and compares.

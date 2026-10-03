@@ -28,8 +28,13 @@
 //! which is how one machine came to report under two `host.id`s in SigNoz.
 //!
 //! Only when no id can be persisted at all (no home directory, a read-only
-//! `~/.loom`) does this fall back to [`UNKNOWN_HOST`], which never
-//! participates in peer-claim self-recognition.
+//! `~/.loom`, any other I/O error) does this fall back to [`UNKNOWN_HOST`],
+//! which never participates in peer-claim self-recognition. The daemon keeps
+//! running under it (WARN logged once); `loom-daemon host-id` instead exits
+//! non-zero, so a shell caller can tell "no identity" from an identity and
+//! never publishes a lease or claim under the shared sentinel. At startup the
+//! daemon exports its resolved id to its children ([`export_for_children`]),
+//! so a script it spawns cannot resolve a different one.
 //!
 //! # Migrating a hostname-keyed host
 //!
@@ -299,16 +304,52 @@ pub fn is_valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+/// Export the resolved id as `$LOOM_HOST_ID` for every child this process
+/// spawns afterwards, so a script the daemon launches reports the daemon's
+/// own id even when its `$HOME` or `~/.loom` differs (sandbox, other user).
+///
+/// Call it **once, at daemon startup, before any task that spawns a child
+/// exists** — the same window `GH_CONFIG_DIR`'s one-time `set_var` relies on
+/// (#4458): a later `set_var` would race the `environ` reads inside a
+/// concurrent `Command::spawn`. An env-sourced id is already exported, and
+/// [`UNKNOWN_HOST`] is never exported: a child then resolves (and, via
+/// `loom-daemon host-id`'s non-zero exit, refuses) on its own rather than
+/// inheriting the shared sentinel as if it were an identity.
+pub fn export_for_children() -> ResolvedHostId {
+    let resolved = resolve();
+    if !matches!(resolved.source, HostIdSource::Env | HostIdSource::Unknown) {
+        std::env::set_var(HOST_ID_ENV, &resolved.id);
+    }
+    resolved
+}
+
 /// Read the id at `path`, creating it first when absent. Returns the id and
 /// whether this call created it.
 ///
 /// Creation is atomic and first-writer-wins: the id is written to an
 /// owner-only (`0600`) temp file in the same directory, then hard-linked into
 /// place, which fails if another process got there first — in which case its
-/// id is read back. A present-but-invalid file (empty, or containing
-/// something that is not an id) is replaced the same way; no valid id exists
-/// for it to re-key.
+/// id is read back. On a filesystem that refuses hard links (EPERM/ENOTSUP on
+/// some mounts) the id is created in place with `O_EXCL` instead, which is
+/// equally first-writer-wins. A present-but-invalid file (empty, or
+/// containing something that is not an id) is replaced by `rename`; no valid
+/// id exists for it to re-key.
+///
+/// The returned id is always **re-read from `path`** after placement, never
+/// assumed to be this call's candidate: two processes replacing the same
+/// invalid file each `rename` in turn, and the re-read makes the earlier one
+/// report the later one's id instead of its own overwritten one. (A replacer
+/// that re-reads *before* the later `rename` lands can still return its own
+/// id once; the window exists only while the file is invalid, and the
+/// process-lifetime cache plus every later read converge on the survivor.)
 pub fn load_or_create(path: &Path) -> std::io::Result<(String, bool)> {
+    load_or_create_with(path, |from, to| std::fs::hard_link(from, to))
+}
+
+fn load_or_create_with(
+    path: &Path,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<(String, bool)> {
     if let Some(id) = read_valid(path)? {
         return Ok((id, false));
     }
@@ -317,23 +358,39 @@ pub fn load_or_create(path: &Path) -> std::io::Result<(String, bool)> {
     let candidate = generate_id();
     let tmp = dir.join(format!(".{HOST_ID_FILENAME}.tmp.{}", uuid::Uuid::new_v4().simple()));
     write_owner_only(&tmp, &candidate)?;
-    let linked = match std::fs::hard_link(&tmp, path) {
-        Ok(()) => Ok(true),
+    let placed = match link(&tmp, path) {
+        Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match read_valid(path)? {
-            Some(_) => Ok(false),
-            // Present but invalid: replace it.
-            None => std::fs::rename(&tmp, path).map(|()| true),
+            Some(_) => Ok(()),
+            // Present but invalid: replace it (the re-read below settles a
+            // race between two replacers).
+            None => std::fs::rename(&tmp, path),
         },
-        Err(e) => Err(e),
+        // Hard links unsupported here: exclusive create in place.
+        Err(_) => match write_owner_only(path, &candidate) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e),
+            _ => Ok(()),
+        },
     };
     let _ = std::fs::remove_file(&tmp);
-    if linked? {
-        Ok((candidate, true))
-    } else {
-        read_valid(path)?
-            .map(|id| (id, false))
-            .ok_or_else(|| std::io::Error::other("persisted host id vanished after creation"))
+    placed?;
+    let id = read_settled(path)?
+        .ok_or_else(|| std::io::Error::other("persisted host id vanished after creation"))?;
+    let created = id == candidate;
+    Ok((id, created))
+}
+
+/// [`read_valid`], retried briefly while the file reads empty: an `O_EXCL`
+/// creator (the no-hard-link path) has the file in place a moment before its
+/// id is written into it.
+fn read_settled(path: &Path) -> std::io::Result<Option<String>> {
+    for _ in 0..20 {
+        if let Some(id) = read_valid(path)? {
+            return Ok(Some(id));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    read_valid(path)
 }
 
 fn read_valid(path: &Path) -> std::io::Result<Option<String>> {

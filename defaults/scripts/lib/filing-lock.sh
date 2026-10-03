@@ -143,14 +143,16 @@ loom_filing_lock_held() {
     esac
 }
 
-# Host identity from `loom-daemon host-id` (#10023) -- the daemon's own
-# resolution, so the owner record this script writes is comparable with one
-# written by the daemon. `${LOOM_HOST_ID:-unknown-host}` only for a binary
-# without that subcommand.
+# Host identity from `loom_host_id` (lib/locate-daemon-bin.sh, #10023): the
+# daemon's own `host-id` on the resolved binary, so the owner record this
+# script writes is comparable with one written by the daemon. Returns 1 (with
+# a stderr explanation) when the host has no identity; callers then skip the
+# host-keyed legs (dead-PID reaping, the fleet advertisement) rather than
+# writing a shared `unknown-host` every unidentified host would match.
+# shellcheck source=./locate-daemon-bin.sh
+source "$(dirname "${BASH_SOURCE[0]}")/locate-daemon-bin.sh"
 loom_filing_lock_host() {
-    local h
-    h="$("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" host-id 2>/dev/null)" || h=""
-    printf '%s' "${h:-${LOOM_HOST_ID:-unknown-host}}"
+    loom_host_id
 }
 
 # Age of a path in whole seconds. An unreadable mtime echoes -1 ("cannot age"),
@@ -200,7 +202,7 @@ _loom_filing_lock_abandoned() {
     if [[ -r "$owner" ]]; then
         o_host="$(sed -n 's/.*"host"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$owner" 2>/dev/null || true)"
         o_pid="$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "$owner" 2>/dev/null || true)"
-        if [[ "$o_host" == "$self_host" && "$o_pid" =~ ^[1-9][0-9]*$ ]] \
+        if [[ -n "$self_host" && "$o_host" == "$self_host" && "$o_pid" =~ ^[1-9][0-9]*$ ]] \
             && ! kill -0 "$o_pid" 2>/dev/null; then
             return 0
         fi
@@ -232,15 +234,18 @@ _loom_filing_lock_blocker() {
 # of them. fleet-send.sh exits 0 silently when the room is unreachable, so a
 # host with no safehouse simply degrades to host-only serialization.
 _loom_filing_lock_advertise() {
-    local kind="$1" label="$2" send
+    local kind="$1" label="$2" send host
     send="$(dirname "${BASH_SOURCE[0]}")/../fleet-send.sh"
     [[ -x "$send" ]] || return 0
+    # No identity: advertise nothing rather than a hold every peer would
+    # attribute to the shared `unknown-host` (host-tier serialization stands).
+    host="$(loom_filing_lock_host 2>/dev/null)" || return 0
     local body room_args=()
     # Matches ClaimAd::to_body_json (peer_claims.rs): the marker/version gate,
     # `issue` pinned to FILING_LOCK_SENTINEL_ISSUE (a burst has no issue number
     # yet — that IS the hazard), and `repo` carried for diagnostics only.
     body="$(printf '{"loom_claim":1,"kind":"%s","issue":0,"repo":"%s","host":"%s","pid":%s,"ts":"%s","pr":null}' \
-        "$kind" "${LOOM_REPO:-$label}" "$(loom_filing_lock_host)" "$$" \
+        "$kind" "${LOOM_REPO:-$label}" "$host" "$$" \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
     # Claim ads ride the CLAIMS room (which falls back to the signal room) —
     # the one deliberate exception to #4225's per-repo firehose routing, since
@@ -274,7 +279,7 @@ loom_filing_lock_acquire() {
     wait_secs="$(_loom_filing_lock_int "${LOOM_FILING_LOCK_WAIT_SECS:-}" 120)"
     stale="$(_loom_filing_lock_int "${LOOM_FILING_LOCK_STALE_SECS:-}" 300)"
     peer_ttl="$(_loom_filing_lock_int "${LOOM_FILING_LOCK_PEER_TTL_SECS:-}" 60)"
-    self_host="$(loom_filing_lock_host)"
+    self_host="$(loom_filing_lock_host)" || self_host=""
 
     if ! mkdir -p "$store" 2>/dev/null; then
         # Property 3: degrade OPEN. A store nobody can write is a store nobody
