@@ -477,8 +477,11 @@ agent exited 0 having done nothing. Keeping bwrap would have needed a custom
 seccomp profile plus a host-loaded AppArmor profile on every Linux host. The
 operator chose the container boundary instead.
 
-**What `spawn-codex.sh` does.** For a session-managed profile it reads the
-container's labels (`docker inspect`) before dispatching:
+**What `spawn-codex.sh` does.** For a session-managed profile it asks
+`loom-daemon session-exec posture` (`loom-daemon/src/session_exec/posture.rs`)
+before dispatching. That command reads the container's labels and its actual
+`HostConfig` from `docker inspect`. A daemon too old to have the command fails
+closed (exit 78).
 
 | Container | Result |
 |---|---|

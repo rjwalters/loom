@@ -89,6 +89,15 @@ esac
             &name,
             "--network",
             "none",
+            // The host-mode session posture spawn-codex.sh requires before
+            // it dispatches with Codex's sandbox off (issue #9979): the
+            // label AND the HostConfig it stands for.
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--label",
+            "loom.session-posture=container-boundary-v1",
             "--entrypoint",
             "/bin/sh",
             "-v",

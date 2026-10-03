@@ -113,37 +113,46 @@ assert_not_contains "--workdir" "$out" "bare-metal dispatch has no docker --work
 
 # --- Issue #9979: the container is the boundary -------------------------------
 # Codex's bubblewrap sandbox cannot start inside a session container, so a
-# session dispatch runs `-s danger-full-access` — but ONLY into a container whose
-# labels say it was created hardened. A fake docker answers the label probe.
+# session dispatch runs `-s danger-full-access` — but ONLY into a container the
+# REAL `loom-daemon session-exec posture` (built from this tree) has checked:
+# posture label AND actual HostConfig. A fake docker answers `docker inspect`
+# with JSON; the full property matrix is pinned in session_exec/posture_tests.rs.
 echo ""
 echo "Testing the session container boundary (#9979)..."
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin --self-only "$(cd "$SCRIPT_DIR/.." && pwd)" session-exec
 FAKE_DOCKER="$TMPROOT/fake-docker"
 cat > "$FAKE_DOCKER" <<'FAKE'
 #!/usr/bin/env bash
-# Answers only `docker inspect --format ... <container>` with $FAKE_LABELS.
+# Answers only `docker inspect ... <container>` with $FAKE_INSPECT (JSON).
 [[ "$1" == "inspect" ]] || exit 1
-[[ -n "${FAKE_LABELS+x}" ]] || { echo "Error: No such object" >&2; exit 1; }
-printf '%s\n' "$FAKE_LABELS"
+[[ -n "${FAKE_INSPECT+x}" ]] || { echo "[]"; echo "Error: No such object" >&2; exit 1; }
+printf '%s\n' "$FAKE_INSPECT"
 FAKE
 chmod +x "$FAKE_DOCKER"
 
-# The HostConfig half of the probe, hardened: privileged|network|pid|ipc|
-# capdrop|capadd|secopt|mount sources (see spawn-codex.sh's inspect format).
-HC_OK="false|bridge|||ALL,||no-new-privileges,|/src;"
+# state <running> <labels-json> [<hostconfig-json>] [<mounts-json>]
+HC_OK='{"Privileged":false,"NetworkMode":"bridge","CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"]}'
+state() {
+    printf '[{"State":{"Running":%s},"Config":{"Labels":%s},"HostConfig":%s,"Mounts":%s}]' \
+        "$1" "$2" "${3:-$HC_OK}" "${4:-[]}"
+}
+HOST_LABEL='{"loom.session-posture":"container-boundary-v1"}'
+CLONE_LABEL='{"loom.workspace-mode":"private-clone"}'
 
 session_run() {
-    # $1 = FAKE_LABELS value ("__unset__" for a missing container); rest = env/args
-    local labels="$1"; shift
+    # $1 = FAKE_INSPECT value ("__unset__" for a missing container); rest = env/args
+    local inspect="$1"; shift
     local -a envs=(LOOM_SWEEP_NICE=0 LOOM_CODEX_NO_EXEC=1 LOOM_WORKSPACE="$WS"
         LOOM_CODEX_HOME="$PROFILE" LOOM_CODEX_SESSION_DOCKER="$FAKE_DOCKER")
-    [[ "$labels" != "__unset__" ]] && envs+=(FAKE_LABELS="$labels")
-    (cd "$WS" && env -u CODEX_HOME -u LOOM_CODEX_PROFILE -u FAKE_LABELS -u GH_CONFIG_DIR \
-        "${envs[@]}" "$@" 2>&1; echo "rc=$?")
+    [[ "$inspect" != "__unset__" ]] && envs+=(FAKE_INSPECT="$inspect")
+    (cd "$WS" && env -u CODEX_HOME -u LOOM_CODEX_PROFILE -u FAKE_INSPECT -u GH_CONFIG_DIR \
+        -u LOOM_CODEX_CONTAINER_SANDBOX -u LOOM_PRIVATE_LEASE_FD "${envs[@]}" "$@" 2>&1; echo "rc=$?")
 }
 
 # Hardened host-mode container: the requested workspace-write becomes
 # danger-full-access, and the requested mode is still named in the log.
-out="$(session_run "true|container-boundary-v1||$HC_OK|/home/loom/.codex-profile;" bash "$SPAWN_CODEX" -p "hi" --dangerously-skip-permissions)"
+out="$(session_run "$(state true "$HOST_LABEL")" bash "$SPAWN_CODEX" -p "hi" --dangerously-skip-permissions)"
 line="$(printf '%s\n' "$out" | grep '^spawn-codex would-exec:' || true)"
 assert_contains "-s danger-full-access" "$line" "a hardened container runs Codex with its own sandbox off"
 assert_not_contains "-s workspace-write" "$line" "the bwrap-dependent mode is never forwarded into the container"
@@ -152,23 +161,40 @@ assert_contains "sandbox=danger-full-access source=session-container-boundary re
 assert_contains "posture=host" "$out" "the container posture is logged"
 
 # An explicit `-s read-only` is replaced too (not forwarded alongside).
-out="$(session_run "true|container-boundary-v1||$HC_OK|/home/loom/.codex-profile;" bash "$SPAWN_CODEX" -p "hi" -s read-only)"
+out="$(session_run "$(state true "$HOST_LABEL")" bash "$SPAWN_CODEX" -p "hi" -s read-only)"
 line="$(printf '%s\n' "$out" | grep '^spawn-codex would-exec:' || true)"
 assert_contains "-s danger-full-access" "$line" "an explicit -s is replaced inside the container"
 assert_not_contains "read-only" "$line" "…and the explicit mode is not forwarded as well"
 
 # Private-clone containers were created hardened (#8787) and qualify.
-out="$(session_run "true||private-clone|$HC_OK|/workspace;" bash "$SPAWN_CODEX" -p "hi")"
+out="$(session_run "$(state true "$CLONE_LABEL")" bash "$SPAWN_CODEX" -p "hi")"
 assert_contains "posture=private-clone" "$out" "a private-clone container qualifies"
 assert_contains "-s danger-full-access" "$out" "…and runs Codex with its sandbox off"
 
 # A container created before the hardening (no posture label) is refused: it
 # mounted the whole checkout parent and the Claude token pool.
-out="$(session_run "true|||$HC_OK|/Users/x/GitHub;" bash "$SPAWN_CODEX" -p "hi")"
+out="$(session_run "$(state true '{}')" bash "$SPAWN_CODEX" -p "hi")"
 assert_contains "rc=78" "$out" "an unhardened container exits 78 (EX_CONFIG)"
 assert_contains "created before the container-boundary hardening" "$out" "…naming why"
 assert_contains "loom-daemon accounts session stop acct" "$out" "…and the recreate step"
 assert_not_contains "would-exec:" "$out" "…before anything is dispatched"
+
+# The label is not the posture: a labelled container whose ACTUAL settings
+# are not hardened is refused with exit 78 before anything is dispatched.
+for bad in \
+    '{"Privileged":true,"NetworkMode":"bridge","CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"]}|privileged=true' \
+    '{"Privileged":false,"NetworkMode":"host","CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"]}|host-namespace(network)' \
+    '{"Privileged":false,"NetworkMode":"bridge","SecurityOpt":["no-new-privileges"]}|cap-drop-ALL-missing' \
+    '{"Privileged":false,"NetworkMode":"bridge","CapDrop":["ALL"],"SecurityOpt":["no-new-privileges","seccomp=unconfined"]}|security-opt=seccomp=unconfined'; do
+    for label in "$HOST_LABEL" "$CLONE_LABEL"; do
+        out="$(session_run "$(state true "$label" "${bad%|*}")" bash "$SPAWN_CODEX" -p "hi" --dangerously-skip-permissions)"
+        assert_contains "rc=78" "$out" "labelled $label but ${bad##*|}: exit 78"
+        assert_contains "${bad##*|}" "$out" "…naming the violation (${bad##*|})"
+        assert_not_contains "would-exec:" "$out" "…before anything is dispatched (${bad##*|})"
+    done
+done
+out="$(session_run "$(state true "$HOST_LABEL" "$HC_OK" '[{"Source":"/var/run/docker.sock","Destination":"/var/run/docker.sock"}]')" bash "$SPAWN_CODEX" -p "hi")"
+assert_contains "docker-socket-mounted" "$out" "a docker.sock mount is refused"
 
 # A missing or stopped container never gets the sandbox dropped: the posture
 # is unverifiable, the requested mode stands, and dispatch is refused
@@ -176,54 +202,39 @@ assert_not_contains "would-exec:" "$out" "…before anything is dispatched"
 out="$(session_run "__unset__" bash "$SPAWN_CODEX" -p "hi" --dangerously-skip-permissions)"
 assert_contains "posture not verified (not-running)" "$out" "a missing container is not treated as hardened"
 assert_not_contains "danger-full-access" "$out" "…and the sandbox is not dropped for it"
-out="$(session_run "false|container-boundary-v1||" bash "$SPAWN_CODEX" -p "hi" --dangerously-skip-permissions)"
+out="$(session_run "$(state false "$HOST_LABEL")" bash "$SPAWN_CODEX" -p "hi" --dangerously-skip-permissions)"
 assert_not_contains "danger-full-access" "$out" "a stopped container is not treated as hardened either"
 
-# The label is not the posture: a labelled container whose ACTUAL settings
-# are not hardened is refused with exit 78 before anything is dispatched.
-for bad in \
-    "true|bridge|||ALL,||no-new-privileges,|/src;:privileged=true" \
-    "false|host|||ALL,||no-new-privileges,|/src;:host-namespace" \
-    "false|bridge|host||ALL,||no-new-privileges,|/src;:host-namespace" \
-    "false|bridge||host|ALL,||no-new-privileges,|/src;:host-namespace" \
-    "false|bridge||||no-new-privileges,|/src;:cap-drop-ALL-missing" \
-    "false|bridge|||ALL,|SYS_ADMIN,|no-new-privileges,|/src;:cap-add=SYS_ADMIN" \
-    "false|bridge|||ALL,|||/src;:no-new-privileges-missing" \
-    "false|bridge|||ALL,||no-new-privileges,seccomp=unconfined,|/src;:security-opt=" \
-    "false|bridge|||ALL,||no-new-privileges,apparmor=unconfined,|/src;:security-opt=" \
-    "false|bridge|||ALL,||no-new-privileges,|/var/run/docker.sock;:docker-socket-mounted"; do
-    hc="${bad%:*}"; why="${bad##*:}"
-    for kind in "container-boundary-v1|" "|private-clone"; do
-        out="$(session_run "true|$kind|$hc|/home/loom/.codex-profile;" bash "$SPAWN_CODEX" -p "hi" --dangerously-skip-permissions)"
-        assert_contains "rc=78" "$out" "labelled ($kind) but $why: exit 78"
-        assert_contains "$why" "$out" "…naming the violation ($why)"
-        assert_not_contains "would-exec:" "$out" "…before anything is dispatched ($why)"
-    done
-done
-# Docker's own spelling of no-new-privileges via daemon config is accepted.
-out="$(session_run "true|container-boundary-v1||false|bridge|||ALL,||no-new-privileges:true,|/src;|/home/loom/.codex-profile;" bash "$SPAWN_CODEX" -p "hi")"
-assert_contains "posture=host" "$out" "no-new-privileges:true counts as no-new-privileges"
-
 # Escape hatch: keep the requested Codex sandbox (needs a userns-capable profile).
-out="$(session_run "true|||$HC_OK|/Users/x/GitHub;" env LOOM_CODEX_CONTAINER_SANDBOX=codex bash "$SPAWN_CODEX" -p "hi" --dangerously-skip-permissions)"
+out="$(session_run "$(state true "$HOST_LABEL")" env LOOM_CODEX_CONTAINER_SANDBOX=codex bash "$SPAWN_CODEX" -p "hi" --dangerously-skip-permissions)"
 assert_contains "-s workspace-write" "$out" "LOOM_CODEX_CONTAINER_SANDBOX=codex keeps the requested sandbox"
 assert_contains "LOOM_CODEX_CONTAINER_SANDBOX=codex keeps sandbox=workspace-write" "$out" "…with a warning"
-out="$(session_run "true|||$HC_OK|/Users/x/GitHub;" env LOOM_CODEX_CONTAINER_SANDBOX=bogus bash "$SPAWN_CODEX" -p "hi")"
+out="$(session_run "$(state true "$HOST_LABEL")" env LOOM_CODEX_CONTAINER_SANDBOX=bogus bash "$SPAWN_CODEX" -p "hi")"
 assert_contains "rc=78" "$out" "an invalid LOOM_CODEX_CONTAINER_SANDBOX exits 78"
 
 # gh inside a host-mode container authenticates through the daemon's App token
-# dir: the PATH is forwarded, never a token value.
-out="$(session_run "true|container-boundary-v1||$HC_OK|/home/loom/.codex-profile;$WS/.loom/gh-config;" env GH_CONFIG_DIR="$WS/.loom/gh-config" GH_TOKEN=never-forward-token bash "$SPAWN_CODEX" -p "hi")"
+# dir: the PATH is passed through by name, never a token value.
+GH_MOUNTS="[{\"Source\":\"$WS/.loom/gh-config\",\"Destination\":\"$WS/.loom/gh-config\"}]"
+out="$(session_run "$(state true "$HOST_LABEL" "$HC_OK" "$GH_MOUNTS")" env GH_CONFIG_DIR="$WS/.loom/gh-config" GH_TOKEN=never-forward-token bash "$SPAWN_CODEX" -p "hi")"
 line="$(printf '%s\n' "$out" | grep '^spawn-codex would-exec:' || true)"
-assert_contains "--env GH_CONFIG_DIR=$WS/.loom/gh-config" "$line" "GH_CONFIG_DIR is forwarded into a host-mode container that mounts it"
+assert_contains "--env GH_CONFIG_DIR --" "$line" "GH_CONFIG_DIR is passed through (by name) into a host-mode container that mounts it"
+assert_not_contains "GH_CONFIG_DIR=" "$line" "…by name only: the inherited value, never a new one"
 assert_not_contains "never-forward-token" "$line" "a GH_TOKEN value is never forwarded"
-out="$(session_run "true|container-boundary-v1||$HC_OK|/home/loom/.codex-profile;/elsewhere;" env GH_CONFIG_DIR="$WS/.loom/gh-config" bash "$SPAWN_CODEX" -p "hi")"
+out="$(session_run "$(state true "$HOST_LABEL")" env GH_CONFIG_DIR="$WS/.loom/gh-config" bash "$SPAWN_CODEX" -p "hi")"
 line="$(printf '%s\n' "$out" | grep '^spawn-codex would-exec:' || true)"
 assert_not_contains "GH_CONFIG_DIR" "$line" "an unmounted GH_CONFIG_DIR is not forwarded"
 assert_contains "gh inside the session will be unauthenticated" "$out" "…and the gap is named"
-out="$(session_run "true||private-clone|$HC_OK|/workspace;" env GH_CONFIG_DIR="$WS/.loom/gh-config" bash "$SPAWN_CODEX" -p "hi")"
+out="$(session_run "$(state true "$CLONE_LABEL" "$HC_OK" "$GH_MOUNTS")" env GH_CONFIG_DIR="$WS/.loom/gh-config" bash "$SPAWN_CODEX" -p "hi")"
 line="$(printf '%s\n' "$out" | grep '^spawn-codex would-exec:' || true)"
 assert_not_contains "GH_CONFIG_DIR" "$line" "a private-clone container keeps its own GH_CONFIG_DIR"
+
+# A daemon without `session-exec posture` (predating #9979) fails closed.
+OLD_DAEMON="$TMPROOT/old-daemon"
+printf '#!/usr/bin/env bash\necho "error: unrecognized subcommand '"'"'posture'"'"'" >&2; exit 2\n' > "$OLD_DAEMON"
+chmod +x "$OLD_DAEMON"
+out="$(session_run "$(state true "$HOST_LABEL")" env LOOM_DAEMON_SELF_BIN="$OLD_DAEMON" bash "$SPAWN_CODEX" -p "hi")"
+assert_contains "rc=78" "$out" "a daemon predating session-exec posture exits 78"
+assert_not_contains "would-exec:" "$out" "…and never dispatches with the sandbox off"
 
 # Bare-metal dispatch is unchanged: the requested sandbox is forwarded as before.
 out="$(cd "$WS" && env -u CODEX_HOME -u LOOM_CODEX_PROFILE \
