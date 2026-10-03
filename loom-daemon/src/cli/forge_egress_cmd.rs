@@ -239,6 +239,7 @@ mod tests {
                 version: loom_daemon::forge_egress::checks::version_tuple(gh),
                 raw: format!("gh version {gh}"),
             },
+            path_gh: Some(PathBuf::from("/usr/local/bin/gh")),
             launcher_exists: true,
             ..Observed::default()
         };

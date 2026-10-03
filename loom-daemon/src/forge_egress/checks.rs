@@ -59,7 +59,8 @@ pub fn api_host_supported(version: Option<Version>, policy: &Value) -> bool {
 /// The effective `gh` build — the binary Loom will actually exec.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GhBuild {
-    /// Resolved path (`$LOOM_GH_BIN`, else `gh` on `PATH`), if any.
+    /// Resolved exec target (the `gh_invocation` resolver's ladder: policy
+    /// launcher, else `$LOOM_GH_BIN`, else `gh` on `PATH`), if any.
     pub path: Option<PathBuf>,
     pub version: Option<Version>,
     /// The first line of `gh --version` (non-secret).
@@ -132,7 +133,14 @@ pub struct Observed {
     pub gh_repo: Option<String>,
     /// The exported `GH_CONFIG_DIR`, if any.
     pub gh_config_dir: Option<PathBuf>,
+    /// The `gh` Loom itself execs — what the version floor measures.
     pub gh: GhBuild,
+    /// The `gh` an agent's plain `gh` resolves to: bare `gh` on `PATH`,
+    /// bypassing the resolver. What `toolchain.launcher-not-first` measures
+    /// (2am semantics) — kept apart from [`Self::gh`] because once the daemon
+    /// execs the policy launcher directly (#9995), the exec target says
+    /// nothing about what agents' shells run.
+    pub path_gh: Option<PathBuf>,
     /// Whether `toolchain.launcherPath` exists on this host.
     pub launcher_exists: bool,
     /// Every active profile, in check order (env/default first).
@@ -258,7 +266,7 @@ pub fn assert_toolchain(policy: &Value, obs: &Observed) -> Vec<Finding> {
     }
     let launcher = dig_str(policy, &["toolchain", "launcherPath"]);
     if !launcher.is_empty() {
-        if let Some(resolved) = &obs.gh.path {
+        if let Some(resolved) = &obs.path_gh {
             if !same_path(resolved, Path::new(launcher)) {
                 let f = Finding::new(
                     "toolchain.launcher-not-first",

@@ -3,13 +3,28 @@
 //! Precedence, first hit wins:
 //!
 //! 1. `toolchain.launcherPath` from the resolved forge-egress policy (C1,
-//!    #9983). The policy reader has not landed, so [`policy_launcher_path`] is
-//!    a stub that always answers `None`; wiring it is a one-function change.
+//!    #9983; wired by #9995). Only an **env**- or **machine**-origin policy may
+//!    choose the executable — a repo-local policy never can (the same trust
+//!    rule as the negative canary, [`may_choose_executable`](crate::forge_egress::policy::Origin::may_choose_executable)) — and
+//!    only when the launcher exists on disk. Anything else (unconfigured,
+//!    unreadable, repo-origin, no `launcherPath`, launcher missing) falls
+//!    through to the next rung.
 //! 2. `LOOM_GH_BIN` — the test/override hook every existing resolver honours.
 //!    Read with `std::env::var` semantics, byte-identical to the ten
 //!    hand-rolled `fn gh_bin*` copies this replaces (a set-but-empty value is
 //!    returned as-is, a non-UTF-8 value is treated as unset).
 //! 3. Bare `"gh"`, resolved from `PATH` by the OS at spawn time.
+//!
+//! The policy is resolved per call, uncached. On a host with no policy that is
+//! one env read and one `stat` of the machine path (`NotFound`); with one it
+//! adds a read + parse of a small JSON file — microseconds against the
+//! milliseconds of the `gh` spawn it precedes. Not caching also means a policy
+//! change (e.g. C4 installing the launcher) takes effect on the next spawn
+//! without a daemon restart.
+
+use std::path::Path;
+
+use crate::forge_egress::policy::{self, PolicySources, Resolution};
 
 /// Which rung of the precedence ladder produced the program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,12 +78,168 @@ pub fn gh_bin() -> String {
     resolve().program
 }
 
-/// `toolchain.launcherPath` from the resolved forge-egress policy.
+/// `toolchain.launcherPath` from the live process's forge-egress policy.
 ///
-/// Stub until the C1 policy reader lands (#9983): no policy source exists in
-/// this crate yet, so this always answers `None` and the ladder starts at
-/// `LOOM_GH_BIN`. Keeping the rung in place now means the follow-up changes one
-/// function, not every caller.
+/// Sources come from [`PolicySources::from_process`] with **no repo root**, so
+/// the repo tier is never consulted; [`launcher_from_sources`] additionally
+/// refuses a repo-origin document, so the rule holds even for injected sources.
 fn policy_launcher_path() -> Option<String> {
-    None
+    launcher_from_sources(&PolicySources::from_process(None))
+}
+
+/// The policy rung, pure over injected `sources` (tests never touch `/etc` or
+/// the process environment).
+///
+/// `Some(launcherPath)` only when the winning policy loaded, its origin
+/// [`may_choose_executable`](crate::forge_egress::policy::Origin::may_choose_executable),
+/// `toolchain.launcherPath` is a non-empty string, and that path exists.
+/// Every other case is `None` (fall through to `LOOM_GH_BIN` / `PATH`).
+#[must_use]
+pub fn launcher_from_sources(sources: &PolicySources) -> Option<String> {
+    let Resolution::Loaded(doc) = policy::resolve(sources) else {
+        return None;
+    };
+    if !doc.origin.may_choose_executable() {
+        return None;
+    }
+    let launcher = policy::dig_str(&doc.data, &["toolchain", "launcherPath"]);
+    (!launcher.is_empty() && Path::new(launcher).exists()).then(|| launcher.to_string())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A temp dir holding a fake launcher and a policy naming it.
+    struct Fixture {
+        dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("launcher"), "#!/bin/sh\n").unwrap();
+            Self { dir }
+        }
+
+        fn launcher(&self) -> PathBuf {
+            self.dir.path().join("launcher")
+        }
+
+        /// Write a policy whose `launcherPath` is `launcher`; return its path.
+        fn policy(&self, name: &str, launcher: &Path) -> PathBuf {
+            let path = self.dir.path().join(name);
+            let doc = serde_json::json!({
+                "schemaVersion": 1,
+                "toolchain": { "launcherPath": launcher.display().to_string() },
+            });
+            std::fs::write(&path, doc.to_string()).unwrap();
+            path
+        }
+    }
+
+    /// The ladder as `resolve()` runs it, with injected policy sources.
+    fn ladder(sources: &PolicySources, env_override: Option<&str>) -> ResolvedGh {
+        resolve_from(launcher_from_sources(sources), env_override.map(str::to_string))
+    }
+
+    #[test]
+    fn env_origin_policy_with_existing_launcher_wins() {
+        let f = Fixture::new();
+        let sources = PolicySources {
+            env_path: Some(f.policy("env.json", &f.launcher())),
+            ..PolicySources::default()
+        };
+        let r = ladder(&sources, Some("/stub/gh"));
+        assert_eq!(r.source, GhBinSource::Policy);
+        assert_eq!(r.program, f.launcher().display().to_string());
+    }
+
+    #[test]
+    fn machine_origin_policy_with_existing_launcher_wins() {
+        let f = Fixture::new();
+        let sources = PolicySources {
+            machine_path: Some(f.policy("machine.json", &f.launcher())),
+            ..PolicySources::default()
+        };
+        let r = ladder(&sources, None);
+        assert_eq!(r.source, GhBinSource::Policy);
+        assert_eq!(r.program, f.launcher().display().to_string());
+    }
+
+    #[test]
+    fn repo_origin_policy_never_chooses_the_executable() {
+        let f = Fixture::new();
+        let sources = PolicySources {
+            repo_path: Some(f.policy("repo.json", &f.launcher())),
+            ..PolicySources::default()
+        };
+        assert_eq!(launcher_from_sources(&sources), None);
+        let r = ladder(&sources, Some("/stub/gh"));
+        assert_eq!((r.program.as_str(), r.source), ("/stub/gh", GhBinSource::EnvOverride));
+        let r = ladder(&sources, None);
+        assert_eq!((r.program.as_str(), r.source), ("gh", GhBinSource::Path));
+    }
+
+    #[test]
+    fn missing_launcher_falls_through() {
+        let f = Fixture::new();
+        let sources = PolicySources {
+            machine_path: Some(f.policy("machine.json", &f.dir.path().join("absent"))),
+            ..PolicySources::default()
+        };
+        let r = ladder(&sources, Some("/stub/gh"));
+        assert_eq!((r.program.as_str(), r.source), ("/stub/gh", GhBinSource::EnvOverride));
+    }
+
+    #[test]
+    fn empty_or_absent_launcher_path_falls_through() {
+        let f = Fixture::new();
+        let empty = f.policy("empty.json", Path::new(""));
+        let none = f.dir.path().join("none.json");
+        std::fs::write(&none, r#"{"schemaVersion": 1}"#).unwrap();
+        for p in [empty, none] {
+            let sources = PolicySources {
+                env_path: Some(p),
+                ..PolicySources::default()
+            };
+            assert_eq!(ladder(&sources, None).source, GhBinSource::Path);
+        }
+    }
+
+    #[test]
+    fn unreadable_or_unconfigured_policy_falls_through() {
+        let f = Fixture::new();
+        // An explicitly named but missing env policy resolves `Unreadable`.
+        let missing = PolicySources {
+            env_path: Some(f.dir.path().join("missing.json")),
+            ..PolicySources::default()
+        };
+        assert_eq!(ladder(&missing, Some("/stub/gh")).source, GhBinSource::EnvOverride);
+        // Unparseable.
+        let garbage = f.dir.path().join("garbage.json");
+        std::fs::write(&garbage, "{not json").unwrap();
+        let unparseable = PolicySources {
+            env_path: Some(garbage),
+            ..PolicySources::default()
+        };
+        assert_eq!(ladder(&unparseable, None).source, GhBinSource::Path);
+        // No candidate at all.
+        assert_eq!(ladder(&PolicySources::default(), None).source, GhBinSource::Path);
+    }
+
+    #[test]
+    fn env_policy_outranks_machine_policy_for_the_launcher() {
+        let f = Fixture::new();
+        let other = f.dir.path().join("other-launcher");
+        std::fs::write(&other, "#!/bin/sh\n").unwrap();
+        let sources = PolicySources {
+            env_path: Some(f.policy("env.json", &other)),
+            machine_path: Some(f.policy("machine.json", &f.launcher())),
+            repo_path: None,
+        };
+        assert_eq!(launcher_from_sources(&sources), Some(other.display().to_string()));
+    }
 }
