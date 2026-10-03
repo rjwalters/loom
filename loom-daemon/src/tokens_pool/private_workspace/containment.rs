@@ -54,7 +54,7 @@ pub const POLICY: &str = "clone-isolation+sealed-control-bundle+ro-profile-contr
 pub(super) const UNPREPARED: &str = "exclusive writer: this launch holds no prepared private-clone selection (owned account lease plus durable job identity), so no containment can be proven for it";
 pub(super) const DRIFTED: &str = "exclusive writer and stale-context refusal: the bound private session container was replaced, renamed, stopped or re-attached between preparation and admission; recover the session before dispatch";
 const UNMANAGED: &str = "protected remote operations and Loom lifecycle controls: this private clone ships no Loom hook provisioner, so no managed pre_tool_use bridge is registered for the session; container isolation alone does not prevent an authenticated force-push or a Loom lifecycle mutation";
-const UNTRUSTED: &str = "protected remote operations and Loom lifecycle controls: the account profile has not established Codex hook trust since Loom's managed registration was installed, and an untrusted hook fails OPEN on the pinned CLI; accept the hook-trust prompt once for this profile on the host, then stop and start the session (Loom never passes --dangerously-bypass-hook-trust)";
+const UNTRUSTED: &str = "protected remote operations and Loom lifecycle controls: the account profile has not established Codex hook trust since Loom's managed registration was installed, and an untrusted hook fails OPEN on the pinned CLI; accept the hook-trust prompt once for this profile with CODEX_HOME at the session's mount point (Codex keys trust by that hooks.json path, so trust accepted on the host does not count), then stop and start the session (Loom never passes --dangerously-bypass-hook-trust)";
 const NOT_IN_CONTAINER: &str = "container identity: this process is not running inside the bound private session container, or the clone's identity record does not match the bound job; refusing to claim containment";
 const NOT_OWNED_CLONE: &str = "host, sibling and peer repository isolation: /workspace/repo is not an owned, independent Git root (missing, symlinked, or carrying object alternates)";
 const MALFORMED: &str = "container identity: the bound container, control identity or base revision is malformed, absent, or predates loom-private-control-v1";
@@ -180,26 +180,34 @@ pub(super) fn enforcing(report: &bundle::Report, profile: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The trust-baseline rule of `provision-codex-hooks.sh verify` (#5005),
-/// evaluated in Rust against the canonical profile.
+/// The trust rule of `provision-codex-hooks.sh verify` (#5005 baseline diff,
+/// keyed since #9390's follow-up), evaluated in Rust against the canonical
+/// profile.
 ///
-/// Codex persists hook trust as `hooks.state."<id>".trusted_hash` in
-/// `config.toml` and exposes no identity string Loom can compute, so the only
-/// observable signal is the SET of trusted hashes. `do_install` snapshots that
-/// set into the receipt's `trustBaselineHashes` at install time; readiness is
-/// therefore "a trusted hash exists that was not already there when Loom's
-/// current registration landed". A receipt with no baseline field at all (an
-/// older Loom provisioned this profile) falls back to the coarse "any trusted
-/// hash present" signal, exactly as the shell does — never punishing an
-/// already-trusted profile for a Loom upgrade.
+/// Codex persists hook trust as
+/// `hooks.state."<hooks.json path>:pre_tool_use:<group>:<handler>".trusted_hash`
+/// in `config.toml` (`codex_hooks::hook_key`), with `<hooks.json path>` under
+/// the CANONICALIZED `CODEX_HOME` Codex runs with. A private session always
+/// runs with [`PROFILE`] as `CODEX_HOME`, so only a hash recorded under
+/// `PROFILE/hooks.json:pre_tool_use:G:H`, for a position `G:H` Loom's managed
+/// entry occupies in that `hooks.json`, can make Codex run Loom's hook. A hash
+/// under any other key (another profile path, the host-side path of this same
+/// profile, an operator hook's position) is trust for a different hook and is
+/// evidence of nothing here: Codex reads Loom's entry as untrusted and skips
+/// it without a word.
 ///
-/// This deliberately mirrors the shell byte for byte rather than improving on
-/// it: the same profile must not read as ready to one gate and not-ready to
-/// the other. It matches only the double-quoted spelling the shell's
-/// `read_trusted_hashes` matches, and skips `#`-commented lines so a
-/// documentation comment cannot fake an entry.
+/// The baseline diff then applies to those keyed hashes: `do_install`
+/// snapshots the profile's trusted hashes into the receipt's
+/// `trustBaselineHashes`, and readiness is "a keyed hash that was not already
+/// there when Loom's current registration landed". A receipt with no baseline
+/// field at all (an older Loom provisioned this profile) falls back to "any
+/// keyed hash present", exactly as the shell does.
+///
+/// `the_rust_trust_gate_agrees_with_the_shipped_provisioner` keeps this and
+/// the shell gate from drifting into disagreeing about one profile.
 fn hook_trust_established(profile: &Path) -> bool {
-    let current = trusted_hashes(&profile.join("config.toml"));
+    let keys = loom_trust_keys(&profile.join("hooks.json"));
+    let current = keyed_trusted_hashes(&profile.join("config.toml"), &keys);
     if current.is_empty() {
         return false;
     }
@@ -210,31 +218,57 @@ fn hook_trust_established(profile: &Path) -> bool {
     current.difference(&baseline).next().is_some()
 }
 
-fn trusted_hashes(config: &Path) -> BTreeSet<String> {
-    let Ok(text) = std::fs::read_to_string(config) else {
+/// The `hooks.state` keys Codex looks Loom's managed entry up under inside a
+/// private session: one per `PreToolUse` position the entry occupies.
+fn loom_trust_keys(hooks: &Path) -> BTreeSet<String> {
+    let Ok(bytes) = std::fs::read(hooks) else {
         return BTreeSet::new();
     };
-    let mut out = BTreeSet::new();
-    for line in text.lines().filter(|l| !l.trim_start().starts_with('#')) {
-        let mut rest = line;
-        while let Some(index) = rest.find("trusted_hash") {
-            rest = &rest[index + "trusted_hash".len()..];
-            let after = rest.trim_start();
-            let Some(after) = after.strip_prefix('=') else {
-                continue;
-            };
-            let after = after.trim_start();
-            let Some(after) = after.strip_prefix('"') else {
-                continue;
-            };
-            if let Some(end) = after.find('"') {
-                if end > 0 {
-                    out.insert(after[..end].to_owned());
-                }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return BTreeSet::new();
+    };
+    let mut keys = BTreeSet::new();
+    for (group, entry) in value["hooks"]["PreToolUse"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for (handler, hook) in entry["hooks"].as_array().into_iter().flatten().enumerate() {
+            if hook["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("guard-codex-bridge.sh"))
+            {
+                keys.insert(format!("{PROFILE}/hooks.json:pre_tool_use:{group}:{handler}"));
             }
         }
     }
-    out
+    keys
+}
+
+/// The non-empty `trusted_hash` values `config.toml` records under any of
+/// `keys`. Parsed as TOML, so every spelling of one key (Codex's own
+/// `[hooks.state."<key>"]` table, dotted keys, inline tables) is the same key;
+/// an unparsable file carries no trust, as it would not load in Codex either.
+fn keyed_trusted_hashes(config: &Path, keys: &BTreeSet<String>) -> BTreeSet<String> {
+    let Ok(text) = std::fs::read_to_string(config) else {
+        return BTreeSet::new();
+    };
+    let Ok(document) = text.parse::<toml::Table>() else {
+        return BTreeSet::new();
+    };
+    let Some(state) = document
+        .get("hooks")
+        .and_then(|hooks| hooks.get("state"))
+        .and_then(toml::Value::as_table)
+    else {
+        return BTreeSet::new();
+    };
+    keys.iter()
+        .filter_map(|key| state.get(key)?.get("trusted_hash")?.as_str())
+        .filter(|hash| !hash.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The receipt's install-time trust baseline, or `None` when the receipt is

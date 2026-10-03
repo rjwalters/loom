@@ -51,11 +51,25 @@ fn profile(dir: &Path, baseline: Option<&[&str]>, trusted: &[&str]) -> PathBuf {
     )
     .unwrap();
     let mut config = String::from("model = \"fixture\"\n# trusted_hash = \"commented-out\"\n");
+    // Codex keeps ONE trusted_hash per key, and Loom's entry has one key; the
+    // other hashes are recorded for other hooks (an operator's, or this same
+    // entry at another path). Loom's key carries the LAST hash: the most
+    // recent decision, which is what the baseline diff asks about.
     for (index, hash) in trusted.iter().enumerate() {
-        config.push_str(&format!("[hooks.state.\"id{index}\"]\ntrusted_hash = \"{hash}\"\n"));
+        let key = if index + 1 == trusted.len() {
+            loom_key()
+        } else {
+            format!("/elsewhere/profile-{index}/hooks.json:pre_tool_use:0:0")
+        };
+        config.push_str(&format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"{hash}\"\n"));
     }
     std::fs::write(profile.join("config.toml"), config).unwrap();
     profile
+}
+
+/// The key Codex records trust for Loom's entry under in a private session.
+fn loom_key() -> String {
+    "/home/loom/.codex-profile/hooks.json:pre_tool_use:0:0".to_owned()
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -90,6 +104,52 @@ const TRUST_CASES: &[TrustCase] = &[
     ("legacy receipt, no trust", None, &[], false),
 ];
 
+/// Trust recorded under a key Codex never looks Loom's private-session entry
+/// up under: `(description, config.toml body)`. Each must read as untrusted to
+/// both gates, with a fresh baseline that would otherwise admit any new hash.
+const WRONG_LOCATION_CASES: &[(&str, &str)] = &[
+    (
+        "host-side path of the same profile",
+        "[hooks.state.\"/Users/op/.loom/codex-profiles/a/hooks.json:pre_tool_use:0:0\"]\ntrusted_hash = \"fresh\"\n",
+    ),
+    (
+        "another profile's path (the robb-studio shape)",
+        "[hooks.state.\"/Users/op/.loom/codex-profiles/r.j.walters/hooks.json:pre_tool_use:0:0\"]\ntrusted_hash = \"fresh\"\n",
+    ),
+    (
+        "another position in the right file",
+        "[hooks.state.\"/home/loom/.codex-profile/hooks.json:pre_tool_use:3:0\"]\ntrusted_hash = \"fresh\"\n",
+    ),
+    (
+        "a commented-out entry for the right key",
+        "# [hooks.state.\"/home/loom/.codex-profile/hooks.json:pre_tool_use:0:0\"]\n# trusted_hash = \"fresh\"\n",
+    ),
+];
+
+/// Spellings of the RIGHT key that both gates must read as trusted.
+const KEYED_SPELLINGS: &[&str] = &[
+    "hooks.state.\"/home/loom/.codex-profile/hooks.json:pre_tool_use:0:0\".trusted_hash = \"fresh\"\n",
+    "[hooks.state]\n\"/home/loom/.codex-profile/hooks.json:pre_tool_use:0:0\" = { trusted_hash = \"fresh\", enabled = true }\n",
+    "[hooks]\nstate.\"/home/loom/.codex-profile/hooks.json:pre_tool_use:0:0\".trusted_hash = \"fresh\"\n",
+    "[hooks.state.\"/home/loom/.codex-profile/hooks.json:pre_tool_use:0:0\"]\nenabled = true\ntrusted_hash = \"fresh\"\n",
+];
+
+#[test]
+fn trust_counts_only_under_the_key_codex_looks_loom_up_under() {
+    for (what, config) in WRONG_LOCATION_CASES {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = profile(dir.path(), Some(&[]), &[]);
+        std::fs::write(profile.join("config.toml"), config).unwrap();
+        assert!(enforcing(&report(true, &profile), &profile).is_err(), "{what}");
+    }
+    for config in KEYED_SPELLINGS {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = profile(dir.path(), Some(&[]), &[]);
+        std::fs::write(profile.join("config.toml"), config).unwrap();
+        assert!(enforcing(&report(true, &profile), &profile).is_ok(), "{config}");
+    }
+}
+
 #[test]
 fn hook_trust_follows_the_install_time_baseline_diff() {
     for (what, baseline, trusted, expected) in TRUST_CASES {
@@ -104,6 +164,9 @@ fn hook_trust_follows_the_install_time_baseline_diff() {
     assert!(enforcing(&report(true, &profile), &profile).is_err());
 }
 
+/// `(description, baseline, config.toml override, is trusted)` for the cross-check.
+type CrossCase = (String, Option<&'static [&'static str]>, Option<&'static str>, bool);
+
 /// The Rust gate and `provision-codex-hooks.sh verify` must agree, profile for
 /// profile: one of them refusing while the other admits is exactly the drift
 /// this cross-check exists to prevent. Skipped where the shell's own
@@ -117,14 +180,39 @@ fn the_rust_trust_gate_agrees_with_the_shipped_provisioner() {
         eprintln!("skipping: provision-codex-hooks.sh or jq unavailable");
         return;
     }
-    for (what, baseline, trusted, expected) in TRUST_CASES {
+    let mut cases: Vec<CrossCase> = TRUST_CASES
+        .iter()
+        .map(|(what, baseline, _, expected)| ((*what).to_owned(), *baseline, None, *expected))
+        .collect();
+    for (what, config) in WRONG_LOCATION_CASES {
+        cases.push(((*what).to_owned(), Some(&[]), Some(*config), false));
+    }
+    for config in KEYED_SPELLINGS {
+        cases.push(((*config).to_owned(), Some(&[]), Some(*config), true));
+    }
+    for (what, baseline, config, expected) in &cases {
         let dir = tempfile::tempdir().unwrap();
+        let trusted: &[&str] = TRUST_CASES
+            .iter()
+            .find(|(name, ..)| name == what)
+            .map_or(&[], |(_, _, trusted, _)| *trusted);
         let profile = profile(dir.path(), *baseline, trusted);
+        if let Some(config) = config {
+            std::fs::write(profile.join("config.toml"), config).unwrap();
+        }
+        // A private session runs Codex with CODEX_HOME at the container's
+        // mount point; that is where its trust is keyed.
         let output = Command::new("bash")
             .arg(&provisioner)
             .args(["verify", "--codex-home"])
             .arg(&profile)
-            .args(["--workspace", REPO, "--bridge"])
+            .args([
+                "--workspace",
+                REPO,
+                "--runtime-codex-home",
+                PROFILE,
+                "--bridge",
+            ])
             .arg(&bridge)
             .arg("--json")
             .output()

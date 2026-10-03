@@ -114,6 +114,28 @@
 # because the private session's admission depends on the sealed entry.
 #
 # ============================================================================
+# TRUST LOCATION (issue #9390 follow-up)
+# ============================================================================
+#
+# Codex records hook trust under a KEY, not just a hash:
+#
+#     hooks.state."<hooks.json path>:pre_tool_use:<group>:<handler>".trusted_hash
+#
+# (`codex_hooks::hook_key`). `<hooks.json path>` is the file as Codex reads it,
+# under its CANONICALIZED CODEX_HOME (`find_codex_home`). A trust decision
+# taken on the host for `~/.loom/codex-profiles/a/hooks.json` therefore does
+# not apply inside that account's session container, where the same file is
+# `/home/loom/.codex-profile/hooks.json`, and vice versa. And a decision taken
+# for a different group/handler position does not apply to Loom's entry.
+# Codex reads such an entry as untrusted and SKIPS the hook without a word.
+#
+# `verify` therefore counts only a trusted_hash recorded under the key(s) Codex
+# will look up for Loom's own entry, at the runtime CODEX_HOME. Any other
+# trusted_hash in config.toml is evidence of nothing. (Measured on robb-studio,
+# 2026-10-02: a profile whose only trust was keyed to another profile's path
+# read as trusted under the old any-key rule while its hook never ran.)
+#
+# ============================================================================
 # USAGE
 # ============================================================================
 #
@@ -122,6 +144,7 @@
 #                                    [--matcher <pattern>]
 #   provision-codex-hooks.sh verify  --codex-home <dir> [--workspace <dir>]
 #                                    [--bridge <path>] [--json]
+#                                    [--runtime-codex-home <path>]
 #   provision-codex-hooks.sh remove  --codex-home <dir>
 #
 # `--all-profiles` replaces `--codex-home` on any subcommand and applies it to
@@ -139,6 +162,11 @@
 # is the WORST of the per-profile results (so a single unready profile fails the
 # whole `verify`), and `--json` emits one object per line (JSONL), never a
 # credential or a path's contents.
+#
+# `--runtime-codex-home` names the CODEX_HOME path as CODEX will see it when it
+# runs (see TRUST LOCATION below). Default: the session container's fixed
+# mount point (/home/loom/.codex-profile) when the profile carries loom's
+# `.session-managed.json` marker, otherwise the profile directory itself.
 #
 # Exit codes:
 #   0   success / ready
@@ -205,6 +233,7 @@ TIMEOUT_ARG=""
 JSON_OUT=0
 ALL_PROFILES=0
 PROFILE_ROOT_ARG=""
+RUNTIME_HOME_ARG=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -221,6 +250,8 @@ while [[ $# -gt 0 ]]; do
         --matcher=*) MATCHER_ARG="${1#--matcher=}"; shift ;;
         --timeout) TIMEOUT_ARG="${2:-}"; shift 2 || shift ;;
         --timeout=*) TIMEOUT_ARG="${1#--timeout=}"; shift ;;
+        --runtime-codex-home) RUNTIME_HOME_ARG="${2:-}"; shift 2 || shift ;;
+        --runtime-codex-home=*) RUNTIME_HOME_ARG="${1#--runtime-codex-home=}"; shift ;;
         --json) JSON_OUT=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) log_error "Unknown argument: $1"; exit 1 ;;
@@ -299,6 +330,7 @@ if [[ "$ALL_PROFILES" == "1" ]]; then
         [[ -n "$BRIDGE_ARG" ]] && _child_args+=(--bridge "$BRIDGE_ARG")
         [[ -n "$MATCHER_ARG" ]] && _child_args+=(--matcher "$MATCHER_ARG")
         [[ -n "$TIMEOUT_ARG" ]] && _child_args+=(--timeout "$TIMEOUT_ARG")
+        [[ -n "$RUNTIME_HOME_ARG" ]] && _child_args+=(--runtime-codex-home "$RUNTIME_HOME_ARG")
         [[ "$JSON_OUT" == "1" ]] && _child_args+=(--json)
         _rc=0
         bash "${BASH_SOURCE[0]}" "${_child_args[@]}" || _rc=$?
@@ -421,6 +453,101 @@ read_trusted_hashes() {
         | sed -E 's/^trusted_hash[[:space:]]*=[[:space:]]*"//; s/"$//' \
         | sort -u
     return 0
+}
+
+# read_keyed_trusted_hashes <config.toml path>
+#
+# Prints `<key>\t<trusted_hash>` for every `hooks.state` entry in config.toml.
+# Understands the spellings TOML allows for one key:
+#   [hooks.state."<key>"]            then  trusted_hash = "..."   (Codex's own)
+#   hooks.state."<key>".trusted_hash = "..."                       (root, dotted)
+#   [hooks.state]                    then  "<key>".trusted_hash = "..."
+#                                    or    "<key>" = { trusted_hash = "..." }
+#   [hooks]                          then  state."<key>".trusted_hash = "..."
+# `#`-commented lines are skipped. Unreadable input prints nothing. Portable
+# awk (no gawk extensions): macOS ships BWK awk.
+read_keyed_trusted_hashes() {
+    local file="$1"
+    [[ -n "$file" && -r "$file" ]] || return 0
+    awk '
+        function unq(s,   i) {           # leading "..." -> its contents
+            if (substr(s, 1, 1) != "\"") return ""
+            i = index(substr(s, 2), "\"")
+            return (i > 0) ? substr(s, 2, i - 1) : ""
+        }
+        function hash_after(s,   i, rest) { # trusted_hash = "H" anywhere in s
+            i = index(s, "trusted_hash")
+            if (i == 0) return ""
+            rest = substr(s, i + 12)
+            sub(/^[ \t]*=[ \t]*/, "", rest)
+            return unq(rest)
+        }
+        function emit(k, h) { if (k != "" && h != "") printf "%s\t%s\n", k, h }
+        {
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            if (line == "" || substr(line, 1, 1) == "#") next
+            if (substr(line, 1, 1) == "[") {
+                table = ""; key = ""
+                if (index(line, "[hooks.state.\"") == 1) {
+                    table = "key"; key = unq(substr(line, 14))
+                } else if (line ~ /^\[hooks\.state\][ \t]*$/) {
+                    table = "state"
+                } else if (line ~ /^\[hooks\][ \t]*$/) {
+                    table = "hooks"
+                }
+                next
+            }
+            if (table == "key" && index(line, "trusted_hash") == 1) {
+                emit(key, hash_after(line)); next
+            }
+            if (table == "" && index(line, "hooks.state.\"") == 1) {
+                emit(unq(substr(line, 13)), hash_after(line)); next
+            }
+            if (table == "hooks" && index(line, "state.\"") == 1) {
+                emit(unq(substr(line, 7)), hash_after(line)); next
+            }
+            if (table == "state" && substr(line, 1, 1) == "\"") {
+                emit(unq(line), hash_after(line)); next
+            }
+        }
+    ' "$file" 2>/dev/null
+    return 0
+}
+
+# runtime_codex_home: the CODEX_HOME path Codex will canonicalize and key
+# trust under when it runs with this profile (see TRUST LOCATION).
+runtime_codex_home() {
+    if [[ -n "$RUNTIME_HOME_ARG" ]]; then
+        printf '%s' "${RUNTIME_HOME_ARG%/}"
+    elif [[ -f "$CODEX_HOME_DIR/.session-managed.json" ]]; then
+        printf '%s' "/home/loom/.codex-profile"
+    else
+        (cd -P -- "$CODEX_HOME_DIR" 2>/dev/null && pwd -P) || printf '%s' "$CODEX_HOME_DIR"
+    fi
+}
+
+# A path-free label for the runtime location, for messages (only the profile
+# directory NAME is ever printed by this script).
+runtime_home_label() {
+    if [[ "$(runtime_codex_home)" == "/home/loom/.codex-profile" ]]; then
+        printf 'the session container'
+    else
+        printf "profile '%s' on this host" "$PROFILE_NAME"
+    fi
+}
+
+# loom_trust_keys <hooks.json content> <runtime home>
+#
+# The hooks.state key(s) Codex looks Loom's managed entry up under: one per
+# position (`<group>:<handler>`) the entry occupies in PreToolUse.
+loom_trust_keys() {
+    printf '%s' "$1" | jq -r --arg marker "$LOOM_HOOK_MARKER" --arg home "$2" '
+        (.hooks?.PreToolUse? // []) | to_entries[] | .key as $g
+        | ((.value.hooks? // []) | to_entries[])
+        | select((.value.command? // "") | contains($marker))
+        | "\($home)/hooks.json:pre_tool_use:\($g):\(.key)"
+    ' 2>/dev/null
 }
 
 # Read the existing hooks.json, or `{}` when absent. A malformed file is a hard
@@ -661,7 +788,7 @@ do_remove() {
 #
 # Prints a machine-readable object under --json:
 #   {"profile","ready":bool,"installed":bool,"version":N,"trusted":bool,
-#    "trustSignal":"none"|"baseline-diff"|"baseline-diff-no-new-trust"|"legacy-coarse",
+#    "trustSignal":"none"|"baseline-diff"|"baseline-diff-no-new-trust"|"legacy-coarse"|"wrong-location",
 #    "stale":bool,"bridgeReadable":bool,"reason":"..."}
 # `trustSignal` records WHICH trust check produced `trusted` (issue #5005):
 # `baseline-diff` is the strengthened signal (a NEW trusted_hash appeared
@@ -710,10 +837,22 @@ do_verify() {
     # strengthens the CORRELATION in time between "Loom installed this
     # content" and "a trust decision happened", which is the concrete gap the
     # coarse existence check left open.
+    # Only trust recorded at the location Codex will look up Loom's entry
+    # under counts (see TRUST LOCATION in the header).
     local -a current_hashes=() baseline_hashes=()
-    while IFS= read -r _h; do
-        [[ -n "$_h" ]] && current_hashes+=("$_h")
-    done < <(read_trusted_hashes "$CONFIG_FILE")
+    local any_trust=false runtime_home _k _h _key
+    runtime_home="$(runtime_codex_home)"
+    local -a expected_keys=()
+    while IFS= read -r _key; do
+        [[ -n "$_key" ]] && expected_keys+=("$_key")
+    done < <([[ "$installed" == true ]] && loom_trust_keys "$existing" "$runtime_home")
+    while IFS=$'\t' read -r _k _h; do
+        [[ -n "$_h" ]] || continue
+        any_trust=true
+        for _key in ${expected_keys[@]+"${expected_keys[@]}"}; do
+            [[ "$_k" == "$_key" ]] && current_hashes+=("$_h")
+        done
+    done < <(read_keyed_trusted_hashes "$CONFIG_FILE")
 
     local baseline_present=false
     if [[ -r "$RECEIPT_FILE" ]] && jq -e '.loomManagedHook | has("trustBaselineHashes")' "$RECEIPT_FILE" >/dev/null 2>&1; then
@@ -796,6 +935,9 @@ do_verify() {
     elif [[ "$trusted" != true && -z "$reason" ]]; then
         if [[ "$trust_signal" == "baseline-diff-no-new-trust" ]]; then
             reason="Codex hook trust has not been (re-)established for this profile since Loom's managed hook was last (re)installed — hooks.state carries no trusted_hash beyond the pre-install baseline"
+        elif [[ "$any_trust" == true ]]; then
+            trust_signal="wrong-location"
+            reason="Codex hook trust is recorded in this profile, but not for Loom's entry at the hooks.json location Codex reads at runtime ($(runtime_home_label)) — trust accepted on the host does not carry into a session container, or the reverse; accept the hook-trust prompt where the role runs"
         else
             reason="Codex hook trust is not established for this profile (no hooks.state trusted_hash in config.toml)"
         fi
@@ -822,11 +964,13 @@ do_verify() {
             --argjson bridgeReadable "$bridge_readable" \
             --argjson version "$LOOM_HOOK_VERSION" \
             --arg registration "$REGISTRATION" \
+            --arg trustLocation "$(runtime_home_label)" \
             --arg reason "$reason" \
             '{profile: $profile, ready: $ready, installed: $installed,
               trusted: $trusted, trustSignal: $trustSignal, stale: $stale,
               bridgeReadable: $bridgeReadable, version: $version,
-              registration: $registration, reason: $reason}'
+              registration: $registration, trustLocation: $trustLocation,
+              reason: $reason}'
     fi
 
     if [[ "$ready" == true ]]; then
