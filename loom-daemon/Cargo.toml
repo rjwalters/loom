@@ -18,8 +18,10 @@ dirs = "7.0"
 base64 = "0.23"
 # `functions` enables `create_scalar_function`, which the landed-size
 # execution test (`tests/landed_size_sqlite.rs`) uses to provide the `ln`/`exp`
-# math functions D1 ships and the bundled build does not (#9934).
-rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+# math functions D1 ships and the bundled build does not (#9934). `limits`
+# enables `set_limit`, which the D1 execution tests use to apply D1's 5-term
+# compound-SELECT ceiling (`tests/support/d1_sqlite.rs`, #10066).
+rusqlite = { version = "0.40", features = ["bundled", "functions", "limits"] }
 regex = "1.12"
 clap = { version = "4.6", features = ["derive", "env"] }
 sha2 = "0.11.0"
