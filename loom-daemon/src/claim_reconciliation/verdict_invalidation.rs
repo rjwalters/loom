@@ -80,10 +80,26 @@ pub(super) fn handle_invalidate(
     // re-review, so this pass re-anchors instead. `Some(false)` or `None`
     // (comparison unavailable) fall straight through to the ordinary clear,
     // unchanged from before #9124.
+    // #10134: when no equivalence could even be EVALUATED (an unfetchable
+    // commit, a `gh` outage, a shallow clone), the clear below still happens —
+    // fail closed — but it says so, in the log and in the PR comment, instead
+    // of reading exactly like a real content change.
+    let mut unavailable_note = None;
     if tree_carveout {
-        if let Equivalence::Equivalent(kind) =
-            verdict_equivalence::detect(gh_bin, Some(root), pr.number, marker_sha, head_sha)
-        {
+        let assessment =
+            verdict_equivalence::assess(gh_bin, Some(root), pr.number, marker_sha, head_sha);
+        unavailable_note = assessment.unavailable_note();
+        if let Some(note) = &unavailable_note {
+            log::warn!(
+                "claim_reconciliation: PR #{} in {}: could not determine whether the head move \
+                 {marker_sha} -> {head_sha} kept the reviewed change — failing closed and \
+                 clearing {} (#10134). Why: {note}",
+                pr.number,
+                root.display(),
+                pr.kind.label(),
+            );
+        }
+        if let Equivalence::Equivalent(kind) = assessment.equivalence {
             match reanchor_equivalent_verdict(gh_bin, root, pr, marker_sha, head_sha, kind) {
                 Ok(()) => {
                     stats.tree_identical_reanchors += 1;
@@ -113,7 +129,8 @@ pub(super) fn handle_invalidate(
             return;
         }
     }
-    match invalidate_verdict(gh_bin, root, pr, marker_sha, head_sha) {
+    let note = unavailable_note.as_deref();
+    match invalidate_verdict(gh_bin, root, pr, marker_sha, head_sha, note) {
         Ok((comment_skipped, untrusted)) => {
             stats.invalidated += 1;
             stats.redundant_comments_skipped += usize::from(comment_skipped);
@@ -232,6 +249,7 @@ fn invalidate_verdict(
     pr: &VerdictPr,
     marker_sha: &str,
     head_sha: &str,
+    unavailable_note: Option<&str>,
 ) -> Result<(bool, Option<UntrustedVerdictMarker>)> {
     let label = pr.kind.label();
     // `None` (the common case: nothing was armed) contributes no line at
@@ -245,7 +263,8 @@ fn invalidate_verdict(
     let disarm_line = disarmed
         .as_ref()
         .map(|line| format!("\n{line}"))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        + &super::verdict_stale_comment::unavailable_line(unavailable_note);
     let skipped =
         !super::verdict_stale_comment::should_post(pr.invalidation_recorded, disarmed.is_some());
     let untrusted = if skipped {
