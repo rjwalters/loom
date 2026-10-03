@@ -165,13 +165,16 @@ Use a **priority-based search** to find the highest-value curation opportunity:
 ### Priority 0: Starred Issues (`loom:operator-priority`, #9244) — first, every pass
 
 ```bash
-gh issue list --label loom:operator-priority --state open --json number,title,labels \
-  --jq '.[] | select([.labels[].name] | any(IN("loom:issue","loom:curating","loom:building","loom:blocked","loom:operator-only","loom:operator-decision")) | not) | "#\(.number) \(.title)"'
+loom-daemon forge starred --kind issue \
+  --without loom:issue,loom:curating,loom:building,loom:blocked,loom:operator-only,loom:operator-decision
 ```
 
-Curate each at once (no workflow label = treat as `loom:triage`), then add
+Take them in order: earliest star first (#9974; exit 5 = no answer, not
+empty). Curate each at once (no workflow label = treat as `loom:triage`), then add
 `loom:curated` and `loom:issue` in ONE `gh issue edit`. A starred `loom:epic` gets
-only `loom:curated`; Champion's epic queue takes it first. Guards still apply: skip the labels in the query above and hard exclusions. The star is human-only — never add or remove it. Next come red-main
+only `loom:curated`; Champion's epic queue takes it first. Hard exclusions still
+apply. A star never evicts work in flight. Star or unstar only on the operator's
+explicit direction (`loom-daemon forge star N --direction "..."`), never on your own judgment. Next come red-main
 fixes (`<!-- loom:main-red-fix -->` in the body): curate them before Priority 1,
 but with **no** promotion bypass.
 
@@ -635,7 +638,7 @@ Issue #99: "fix the crash bug"
 If, during curation, you determine an issue is too large to be a single Builder PR (>6 hours, >8 files, or >400 LOC) and must be split into sub-issues (size each child per "Backlog Rightsizing" below):
 
 1. **Create each sub-issue with `loom:triage` only.** Do NOT apply `loom:curated`, even if your decomposition includes curator-quality detail (acceptance criteria, file references, scope guards).
-2. **Do NOT apply `loom:issue`** — a sub-issue is never starred (the star is human-only), so the starred exception never covers it (see "Who promotes `loom:curated` → `loom:issue`" above).
+2. **Do NOT apply `loom:issue`** — a sub-issue is never starred (only the operator stars), so the starred exception never covers it (see "Who promotes `loom:curated` → `loom:issue`" above).
 3. **Update the parent issue's body or add a comment** with a "Decomposed sub-issues" section linking each child.
 4. **Do not close the parent during decomposition** — it now tracks its children; keep it open (or relabel it as a tracking issue). Closing here would orphan the sub-issues. (Closing/rescoping in general is allowed with a rationale — see "Issues Are Suggestions — Close or Rescope With Rationale" below — but a freshly-decomposed parent is not a close candidate.)
 5. **Do not self-curate your own sub-issues in the same session.** A separate Curator pass (could be the same human-role agent in a later session, or a different agent) must independently review each sub-issue before it can earn `loom:curated`.

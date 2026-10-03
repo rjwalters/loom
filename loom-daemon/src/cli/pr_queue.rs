@@ -38,7 +38,8 @@ impl PrQueueArgs {
             .map(|r| {
                 serde_json::json!({
                     "number": r["number"], "title": r["title"], "origin": r["origin"],
-                    "priorityReason": r["priorityReason"], "mode": r["mode"]
+                    "priorityReason": r["priorityReason"], "mode": r["mode"],
+                    "operatorPriorityAt": r[pr_planning::STAR_AT_FIELD]
                 })
             })
             .collect();

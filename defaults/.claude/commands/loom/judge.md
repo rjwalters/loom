@@ -305,12 +305,9 @@ If no argument is provided, use the normal finding work workflow below.
 loom-daemon pr-queue --role judge
 ```
 
-`$GH_READ` is the short-TTL cached-read wrapper resolved in "Cached Forge Reads
-(`gh-cached`)" under Evaluation Process — it degrades to plain `gh` when the
-wrapper is absent. Queue discovery is the hottest repeated read in this
-document (every cron tick, every concurrent Judge, the fallback queue), so it
-is cached; verdict-gating and claim-arbitration reads are **not** (see that
-section for the full carve-out list).
+`$GH_READ` is the short-TTL cached-read wrapper ("Cached Forge Reads
+(`gh-cached`)" under Evaluation Process; plain `gh` when absent). Verdict-gating
+and claim-arbitration reads are **not** cached (carve-outs listed there).
 
 **Before either command below, run the Verdict-Time CAS Recheck** (see "Verdict-Time CAS Recheck" under Evaluation Process) — abort instead of writing if the recheck finds your claim lost, another Judge's verdict already landed, or the head SHA moved out from under your review. That recheck also hands you `$VERDICT_SHA`, the head SHA every verdict comment below **must** be stamped with.
 
@@ -520,7 +517,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
 ### Primary Queue (Priority)
 
 0. **Sweep stale verdicts first**: run the Stale-Verdict Sweep (see below) over the open `loom:pr` / `loom:changes-requested` PRs. Any PR it re-queues joins step 1's queue on this same pass.
-1. **Find work**: `loom-daemon pr-queue --role judge`. Walk its JSON rows in order; `mode=workflow` uses this workflow, `mode=fallback` uses Fallback Queue below. Follow `.loom/docs/pr-planning.md`; skip non-actionable rows and continue. Never change origin or the operator star.
+1. **Find work**: `loom-daemon pr-queue --role judge`. Walk its JSON rows in order; `mode=workflow` uses this workflow, `mode=fallback` uses Fallback Queue below. Follow `.loom/docs/pr-planning.md`; skip non-actionable rows and continue. **Starred rows (`priorityReason=operator-priority`) lead, earliest star first (#9974)**: review them first, same bar; never abandon a review in flight for one. Never change origin; change the star only on the operator's direction.
 2. **Claim PR** (staleness-aware — see "Stale `loom:reviewing` Claim Check" immediately below before running this): `gh pr edit <number> --add-label "loom:reviewing"` to signal you're working on it
 3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see Automated Rebase for DIRTY PRs below)
    ```bash

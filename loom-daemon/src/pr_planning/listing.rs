@@ -79,6 +79,7 @@ pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
             }
         }
     }
+    stamp_star_times(root, gh, &mut rows);
     let mut queue = ordered_queue(rows, role, prefer_human_prs(root), &TrustPolicy::for_root(root));
     if role == PrRole::Judge {
         let mut guarded = Vec::new();
@@ -116,6 +117,51 @@ pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
         queue = guarded;
     }
     Ok(queue)
+}
+
+/// Stamp each starred row with its effective star time (#9974) so
+/// [`ordered_queue`] takes the earliest star first, a PR inheriting its
+/// linked issue's earlier star. Only needed with two or more stars. A failed
+/// read degrades to the `created_at` fallback with a warning: star time is an
+/// ordering refinement among stars, never an admission decision, and every
+/// star still precedes every unstarred row.
+fn stamp_star_times(root: &Path, gh: &Path, rows: &mut [Value]) {
+    if rows
+        .iter()
+        .filter(|r| has_label(r, "loom:operator-priority"))
+        .count()
+        < 2
+    {
+        return;
+    }
+    let starred = match crate::forge_starred::starred_rows(
+        root,
+        gh,
+        crate::forge_starred::Kind::Pr,
+        None,
+        &[],
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("pr-queue: star-time read failed ({e:#}); ordering stars by created_at");
+            return;
+        }
+    };
+    stamp(rows, &starred);
+}
+
+/// Copy each starred PR's effective star time from `starred` onto its row.
+/// Pure; rows absent from `starred` keep the `created_at` fallback.
+pub(super) fn stamp(rows: &mut [Value], starred: &[crate::forge_starred::StarredRow]) {
+    for row in rows.iter_mut() {
+        let at = row["number"]
+            .as_u64()
+            .and_then(|n| starred.iter().find(|s| u64::from(s.number) == n))
+            .and_then(|s| s.starred_at.clone());
+        if let Some(at) = at {
+            row[STAR_AT_FIELD] = Value::String(at);
+        }
+    }
 }
 
 pub fn has_interactive_fallback(root: &Path, gh: &Path) -> Result<bool> {

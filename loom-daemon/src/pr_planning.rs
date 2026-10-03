@@ -39,6 +39,26 @@ pub fn has_label(row: &Value, label: &str) -> bool {
     })
 }
 
+/// The row field [`listing::fetch_queue`] stamps on a starred PR: its
+/// effective star time from [`crate::forge_starred::starred_rows`] (its own
+/// `labeled` event, or its linked issue's earlier star).
+pub const STAR_AT_FIELD: &str = "operatorPriorityAt";
+
+/// Star-time key among starred rows (#9974): earliest star first, a missing
+/// star time falling back to `created_at` exactly as the work finder's
+/// `candidate_cmp` does. Unstarred rows all share one key, so their order is
+/// untouched. Orders stars only — it never removes or demotes any row.
+fn star_time(row: &Value) -> String {
+    if !has_label(row, "loom:operator-priority") {
+        return String::new();
+    }
+    row[STAR_AT_FIELD]
+        .as_str()
+        .or_else(|| row["created_at"].as_str())
+        .unwrap_or("~")
+        .to_string()
+}
+
 fn fallback(row: &Value) -> bool {
     row["labels"].as_array().is_some_and(|labels| {
         labels.iter().all(|l| {
@@ -111,7 +131,7 @@ pub fn ordered_queue(
         } else {
             false
         };
-        (baseline, star, human)
+        (baseline, star, star_time(r), human)
     });
     for row in &mut candidates {
         let origin = WorkOrigin::trusted_pr(row, trust);

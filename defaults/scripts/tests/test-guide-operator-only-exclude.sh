@@ -11,7 +11,7 @@
 # existed only to feed that duty.)
 #
 # #9244 retired that duty with the urgent label itself. The one priority
-# signal is now `loom:operator-priority`, the operator's human-only star.
+# signal is now `loom:operator-priority`, the operator's star.
 # Guide READS it (WORK_PLAN's "Operator Priority" section) and never writes
 # it.
 #

@@ -197,6 +197,8 @@ pub mod forge_merge_method;
 pub mod forge_parser;
 pub mod forge_pr_congestion;
 pub mod forge_read_pool;
+pub mod forge_star;
+pub mod forge_starred;
 pub mod forge_tree_unchanged;
 pub mod gh_invocation;
 pub mod gh_repo_env;

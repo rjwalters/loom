@@ -94,6 +94,54 @@ pub(crate) enum ForgeAction {
         max_points: u32,
     },
 
+    /// `forge starred --kind issue|pr` — open `loom:operator-priority` items,
+    /// best first: earliest star time (the `labeled` event, else `createdAt`),
+    /// then number, via the same comparator `ready-queue` ranks with (#9974).
+    /// A PR inherits an earlier-starred linked issue's star time. Prints one
+    /// number per line (`--json` for details); exits `5` when it could not
+    /// answer (never an empty queue), `3` on Gitea.
+    #[command(name = "starred")]
+    Starred {
+        /// `issue` or `pr`.
+        #[arg(long)]
+        kind: String,
+
+        /// Also require this label (e.g. `loom:issue`, `loom:review-requested`).
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Drop items carrying any of these labels (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        without: Vec<String>,
+
+        /// Emit JSON objects instead of bare numbers.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// `forge star <number> --direction "<operator's words>" [--unstar]` —
+    /// apply or remove `loom:operator-priority` ON THE OPERATOR'S EXPLICIT
+    /// DIRECTION, never on the agent's own judgment (#9974). Posts a
+    /// loom-ui-intent-shaped audit comment quoting the direction, which also
+    /// records starred-at; a repeat writes nothing. Exits `3` on Gitea.
+    #[command(name = "star")]
+    Star {
+        /// Issue or PR number.
+        number: u32,
+
+        /// The operator's direction being executed (required, quoted).
+        #[arg(long)]
+        direction: String,
+
+        /// Remove the star instead of adding it.
+        #[arg(long)]
+        unstar: bool,
+
+        /// Executing agent's name for the comment (default `$LOOM_ROLE`).
+        #[arg(long)]
+        by: Option<String>,
+    },
+
     /// `forge check-claim <issue> [--force-claim]` — the aggregated
     /// pre-flight claim-CAS probe (#9453 Phase 1): "may I claim issue N
     /// **right now**?" Four legs, cheapest-first, short-circuiting on the
@@ -613,6 +661,28 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             max_open,
             max_points,
         },
+        ForgeAction::Starred {
+            kind,
+            label,
+            without,
+            json,
+        } => ForgeCmd::Starred(loom_daemon::forge_starred::StarredArgs {
+            kind,
+            label,
+            without,
+            json,
+        }),
+        ForgeAction::Star {
+            number,
+            direction,
+            unstar,
+            by,
+        } => ForgeCmd::Star(loom_daemon::forge_star::StarArgs {
+            number,
+            direction,
+            unstar,
+            by,
+        }),
         ForgeAction::CheckClaim { issue, force_claim } => {
             ForgeCmd::CheckClaim { issue, force_claim }
         }
