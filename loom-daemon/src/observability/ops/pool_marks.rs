@@ -100,7 +100,8 @@ impl MarkReason {
             | TerminalClassification::Timeout
             | TerminalClassification::Fatal
             | TerminalClassification::CwdDeleted
-            | TerminalClassification::ModelRefusal => None,
+            | TerminalClassification::ModelRefusal
+            | TerminalClassification::SandboxUnavailable => None,
         }
     }
 

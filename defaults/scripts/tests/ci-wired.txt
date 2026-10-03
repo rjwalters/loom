@@ -119,6 +119,7 @@ test-guide-work-plan-operator-only-exclude.sh
 test-guide-work-plan-ready-open-pr-exclude.sh
 test-hard-exclusion-labels.sh
 test-host-sleep-config.sh
+test-inbox-mail.sh
 test-install-active-session.sh
 test-install-agents-md-reapply.sh
 test-install-full-reinstall-no-target-mutation.sh
@@ -187,6 +188,7 @@ test-safe-stash-pop.sh
 test-safehoused-service.sh
 test-script-helper-version-floor.sh
 test-session-mode.sh
+test-spawn-codex-sandbox-noop.sh
 test-spawn-codex-session-exec.sh
 test-stale-claim-standdown-suppression.sh
 test-stop-hook-subcommand-skew.sh

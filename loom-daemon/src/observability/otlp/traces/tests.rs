@@ -102,3 +102,52 @@ fn traces_resource_carries_the_build_service_version() {
         .map(|kv| kv["value"]["stringValue"].clone());
     assert_eq!(version, Some(serde_json::json!(env!("CARGO_PKG_VERSION"))));
 }
+
+/// #9985: an `invoke github` span reaches the OTLP wire with its fixed name,
+/// derived IDs, every `github.*` attribute and `service.name=loom-daemon`.
+#[test]
+fn invoke_github_spans_export_with_deterministic_ids_and_service_name() {
+    use crate::gh_invocation::telemetry::{InvocationSpan, Outcome, SPAN_ATTRIBUTE_KEYS};
+    use crate::gh_invocation::ParentContext;
+    use crate::gh_invocation::{AccessIntent, GhBinSource, GhInvocation, GhTarget, Operation};
+    let parent = TraceContext::derived("sweep", &["acme/widgets", "sweep-issue-9-1"]);
+    let inv = GhInvocation::new(
+        Operation::new("api.graphql"),
+        AccessIntent::Write,
+        GhTarget::repo("acme/widgets").unwrap(),
+        std::time::Duration::from_secs(5),
+    )
+    .parent(ParentContext::Parent(parent.clone()));
+    let at = Utc::now();
+    let open = InvocationSpan::open_at(&inv, at, "42.0".into());
+    let record = open.record(&inv, GhBinSource::Path, Outcome::Ok, Some(0), at);
+    let again = InvocationSpan::open_at(&inv, at, "42.0".into());
+    assert_eq!(open.context, again.context, "IDs recompute from the span's facts");
+
+    let request = build_traces_request(&[TelemetryEnvelope::new(
+        "host",
+        TelemetryRecord::Span(record),
+    )])
+    .unwrap();
+    let json = serde_json::to_value(&request).unwrap();
+    let resource = json["resourceSpans"][0]["resource"]["attributes"]
+        .as_array()
+        .unwrap();
+    assert!(resource
+        .iter()
+        .any(|kv| kv["key"] == "service.name" && kv["value"]["stringValue"] == "loom-daemon"));
+    let span = &json["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+    assert_eq!(span["name"], "invoke github");
+    assert_eq!(span["traceId"], parent.trace_id.as_str());
+    assert_eq!(span["parentSpanId"], parent.span_id.as_str());
+    assert_eq!(span["spanId"], open.context.span_id.as_str());
+    let keys: Vec<_> = span["attributes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|kv| kv["key"].as_str().unwrap().to_string())
+        .collect();
+    for key in SPAN_ATTRIBUTE_KEYS {
+        assert!(keys.iter().any(|k| k == key), "exported span lacks {key}");
+    }
+}
