@@ -84,6 +84,9 @@ pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
         kv_string("loom.session.output.redaction", r.redaction.clone()),
         kv_int("loom.session.output.producer_lag_ms", r.producer_lag_ms()),
         kv_string("loom.runtime", r.identity.runtime.clone()),
+        // Always present, so `attended` vs `daemon` is a filter rather than an
+        // absence test (#10116).
+        kv_string("loom.session.output.launch", r.identity.launch.as_str()),
     ];
     // Identity: emitted only when genuinely known. An unattributed
     // interactive session omits `loom.repo` / `loom.issue` entirely rather
@@ -197,6 +200,7 @@ mod tests {
             attempt: Some(attempt),
             runtime: "claude".to_string(),
             role: Some("builder".to_string()),
+            launch: crate::telemetry::kinds::session_output::Launch::Daemon,
         }
     }
 
@@ -296,6 +300,68 @@ mod tests {
                 Some(Value::StringValue("rjwalters/loom".to_string()))
             );
         }
+    }
+
+    #[test]
+    fn an_attended_run_exports_the_same_correlation_keys_and_says_it_is_attended() {
+        // #10116: what a consumer filtering one issue's attempts keys on must
+        // be present on an attended record exactly as on a daemon one, and the
+        // launch must tell the two apart.
+        let stream = "755d0cb5-f9ec-464b-8d7a-c134ee5a1ca9/agent-a4555677bacc80e00";
+        let attended = RunIdentity {
+            repo: Some("rjwalters/loom".to_string()),
+            issue: Some(10116),
+            session_kind: Some(crate::telemetry::SessionKind::Sweep),
+            sweep_id: Some("attended-755d0cb5-a4555677bacc80e00".to_string()),
+            session_id: Some(stream.to_string()),
+            runtime: "claude".to_string(),
+            role: Some("builder".to_string()),
+            launch: crate::telemetry::kinds::session_output::Launch::Attended,
+            ..RunIdentity::default()
+        };
+        let output = log(SessionOutputRecord::new_output(
+            attended.clone(),
+            stream,
+            42,
+            at(0),
+            at(1),
+            "running cargo test",
+        ));
+        let string = |s: &str| Some(Value::StringValue(s.to_string()));
+        assert_eq!(attr(&output, "loom.issue"), Some(Value::IntValue(10116)));
+        assert_eq!(attr(&output, "loom.repo"), string("rjwalters/loom"));
+        assert_eq!(attr(&output, "loom.role"), string("builder"));
+        assert_eq!(attr(&output, "loom.sweep_id"), string("attended-755d0cb5-a4555677bacc80e00"));
+        assert_eq!(attr(&output, "loom.session_id"), string(stream));
+        assert_eq!(attr(&output, "loom.session.output.sequence"), Some(Value::IntValue(42)));
+        assert_eq!(attr(&output, "loom.session.output.event_id"), string(&format!("{stream}#42")));
+        assert_eq!(attr(&output, "loom.session.output.launch"), string("attended"));
+        // No dispatch counter numbers an attended run, so none is invented.
+        assert_eq!(attr(&output, "loom.attempt"), None);
+
+        // Status records carry the same keys.
+        let heartbeat = log(SessionOutputRecord::status(
+            attended,
+            OutputCategory::Heartbeat,
+            "attended-755d0cb5-a4555677bacc80e00",
+            3,
+            at(2),
+            Coverage::Live,
+            RunState::Idle,
+        ));
+        assert_eq!(attr(&heartbeat, "loom.issue"), Some(Value::IntValue(10116)));
+        assert_eq!(attr(&heartbeat, "loom.session.output.launch"), string("attended"));
+
+        // And a daemon run's records say `daemon`, so the two are a filter apart.
+        let daemon = log(SessionOutputRecord::new_output(
+            identity(10116, 1, "0f8b"),
+            "0f8b",
+            0,
+            at(0),
+            at(0),
+            "x",
+        ));
+        assert_eq!(attr(&daemon, "loom.session.output.launch"), string("daemon"));
     }
 
     #[test]

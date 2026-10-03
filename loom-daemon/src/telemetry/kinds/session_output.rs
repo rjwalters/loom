@@ -100,6 +100,7 @@ pub const SESSION_OUTPUT_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.session.output.lag_p95_ms",
     "loom.session.output.lag_max_ms",
     "loom.session.output.lag_historical_excluded",
+    "loom.session.output.launch",
 ];
 
 /// What a record represents. The closed vocabulary a consumer switches on;
@@ -282,6 +283,44 @@ pub struct RunIdentity {
     /// The agent role, when the run declares one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Who started the agent this run reads: `loom-daemon`'s dispatch, or an
+    /// attended Claude Code session (#10116). Exported as
+    /// `loom.session.output.launch` on every record. A payload that predates
+    /// the field decodes as [`Launch::Daemon`], which is what every record
+    /// before #10116 was.
+    #[serde(default)]
+    pub launch: Launch,
+}
+
+/// How the agent behind a run was started (#10116), exported verbatim as
+/// `loom.session.output.launch`.
+///
+/// The two values come from two producers. The daemon's bus-driven producer
+/// only ever opens runs for sweeps it dispatched, so it stamps
+/// [`Launch::Daemon`]. The attended tailer (`loom-daemon live-output-attend`,
+/// started from an agent's own claim step) stamps [`Launch::Attended`]. It
+/// refuses to start in a process tree the daemon launched
+/// (`LOOM_WORK_ORIGIN=autonomous`), so one run is never reported under both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Launch {
+    /// Dispatched by `loom-daemon` (a sweep child).
+    #[default]
+    Daemon,
+    /// Started from an attended Claude Code session: a Loom role subagent or a
+    /// `/loom:<role>` slash command run by a person.
+    Attended,
+}
+
+impl Launch {
+    /// The wire string, matching the serde spelling exactly.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Launch::Daemon => "daemon",
+            Launch::Attended => "attended",
+        }
+    }
 }
 
 /// The producer-lag distribution over a run's recent source events, attached

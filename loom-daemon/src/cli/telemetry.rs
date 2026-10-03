@@ -8,7 +8,8 @@
 //! ingestion writes), `opencode-usage` (Issue #8507: the same question asked
 //! of OpenCode's own session store), and `archive-transcripts` (Issue #8494:
 //! a verified `.tar.zst` backstop for the *raw* transcripts, which
-//! ingestion's derived data does not cover).
+//! ingestion's derived data does not cover), and `live-output-attend` (Issue
+//! #10116: live `session.output` for an agent an attended session started).
 //!
 //! They are gathered into one **flattened** enum, exactly as
 //! [`super::script_ports`] is and for the same second reason: `main.rs` is over
@@ -27,6 +28,8 @@ use anyhow::Result;
 
 use loom_daemon::script_helpers;
 
+#[path = "live_output_attend.rs"]
+mod live_output_attend;
 #[path = "record_rework.rs"]
 mod record_rework;
 #[path = "telemetry_export.rs"]
@@ -157,6 +160,16 @@ pub(crate) enum TelemetryCommand {
 
     // Issue #8824 — help text lives on `CiTelemetryArgs` itself.
     CiTelemetry(super::ci_telemetry_cli::CiTelemetryArgs),
+
+    /// Publish live `session.output` for an agent started from an attended
+    /// Claude Code session (Issue #10116).
+    ///
+    /// Run from inside the agent's own tool call with the issue it works on:
+    /// it finds that agent's transcript, detaches a tailer that publishes
+    /// through the configured OTLP exporter, and returns at once. `lease
+    /// ensure` already runs it at every claim step. Always exits 0; a no-op
+    /// unless `observability.liveOutput` and an OTLP exporter are configured.
+    LiveOutputAttend(live_output_attend::LiveOutputAttendArgs),
 }
 
 impl TelemetryCommand {
@@ -194,6 +207,7 @@ impl TelemetryCommand {
             TelemetryCommand::PiUsage(args) => args.run(),
             TelemetryCommand::ArchiveTranscripts(args) => args.run(),
             TelemetryCommand::CiTelemetry(args) => args.run(),
+            TelemetryCommand::LiveOutputAttend(args) => args.run().await,
         }
     }
 }
