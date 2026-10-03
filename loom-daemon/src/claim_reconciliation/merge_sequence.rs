@@ -941,11 +941,40 @@ fn apply_edge(
 /// logged at `warn` and contributes nothing, mirroring the review-conflict
 /// pass's posture.
 pub fn reconcile_merge_sequences(gh_bin: &Path, root: &Path) -> MergeSequenceStats {
+    reconcile_merge_sequences_with(gh_bin, root, None)
+}
+
+/// Parse a listing shared by the review-conflict pass, truncated to the
+/// newest [`super::MAX_ISSUES_PER_WORKSPACE`] rows this pass's own listing
+/// would have returned. `None` when it does not parse (the caller re-lists).
+fn shared_open_prs(raw: &[u8]) -> Option<Vec<SequencePr>> {
+    let mut v = parse_pr_list(raw).ok()?;
+    v.truncate(usize::try_from(super::MAX_ISSUES_PER_WORKSPACE).unwrap_or(usize::MAX));
+    Some(v)
+}
+
+/// [`reconcile_merge_sequences`] with an optional open-PR listing the
+/// review-conflict pass already read on this root this tick and did not
+/// write after (#4429 follow-up). Saves this pass's own `gh pr list` — one
+/// GraphQL request per workspace per tick. `None`, or a payload that does not
+/// parse, lists exactly as before. The shared listing pages further than this
+/// pass's own (see `review_conflict::OPEN_PR_LIST_LIMIT`), so it is truncated
+/// to the same [`super::MAX_ISSUES_PER_WORKSPACE`] newest PRs the pass's own
+/// listing returns: the plan sees the identical input either way.
+pub(super) fn reconcile_merge_sequences_with(
+    gh_bin: &Path,
+    root: &Path,
+    prefetched: Option<&[u8]>,
+) -> MergeSequenceStats {
     let mut stats = MergeSequenceStats::default();
     if !merge_sequence_enabled() {
         return stats;
     }
-    let open = match list_open_prs(gh_bin, root) {
+    let listed = match prefetched.and_then(shared_open_prs) {
+        Some(v) => Ok(v),
+        None => list_open_prs(gh_bin, root),
+    };
+    let open = match listed {
         Ok(v) => v,
         Err(e) => {
             log::warn!("claim_reconciliation (merge sequence): {}: {e}", root.display());
