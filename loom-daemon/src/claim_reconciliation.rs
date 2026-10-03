@@ -2043,7 +2043,7 @@ mod building_listing;
 /// The facade glue every `gh` call below goes through (#10089), and the
 /// version-keyed reuse of its per-PR reads — sibling files per the ratchet.
 pub(crate) mod gh_call;
-mod read_cache;
+pub(crate) mod read_cache;
 
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::work_finder::forge`] / [`crate::epic_supervisor::forge`]) — the

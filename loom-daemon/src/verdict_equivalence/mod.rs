@@ -70,7 +70,6 @@ pub mod patch_identity;
 mod tests;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use crate::forge_tree_unchanged::{tree_unchanged, verdict_tree_carveout_enabled};
 
@@ -205,24 +204,41 @@ pub(crate) fn is_safe_ref(s: &str) -> bool {
 /// failure. `cwd` is what resolves the `{owner}/{repo}` placeholders, so a
 /// daemon managing several roots must pass the root it is asking about —
 /// the same contract [`crate::forge_tree_unchanged::tree_unchanged`] has.
-pub(crate) fn gh_api(gh_bin: &Path, cwd: Option<&Path>, path: &str) -> Option<Vec<u8>> {
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("api").arg(path);
+pub(crate) fn gh_api(
+    op: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    path: &str,
+) -> Option<Vec<u8>> {
+    // #10089: counted via the facade under `op`.
+    crate::claim_reconciliation::gh_call::ok_stdout(optional_cwd(
+        op,
+        gh_bin,
+        cwd,
+        ["api", path].iter().copied(),
+    ))
+}
+
+/// A facade read of `gh_bin` in `cwd` (when given), carrying `args`.
+fn optional_cwd<'a>(
+    op: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    args: impl Iterator<Item = &'a str>,
+) -> crate::gh_invocation::GhInvocation {
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    let mut inv = GhInvocation::new(
+        Operation::new(op),
+        AccessIntent::Read,
+        GhTarget::None,
+        crate::claim_reconciliation::gh_call::GH_TIMEOUT,
+    )
+    .program(gh_bin)
+    .args(args);
     if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-        // #5401: a cross-owner managed repo needs its own owner's
-        // installation-token GH_CONFIG_DIR (no-op for single-owner fleets).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, dir);
+        inv = inv.current_dir(dir);
     }
-    let out = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(out.stdout)
+    inv
 }
 
 /// Does `descendant` descend from (or equal) `ancestor`, per the forge's own
@@ -247,6 +263,7 @@ pub(crate) fn descends_from(
         return None;
     }
     let body = gh_api(
+        "verdict.compare",
         gh_bin,
         cwd,
         &format!("repos/{{owner}}/{{repo}}/compare/{ancestor}...{descendant}"),
@@ -267,28 +284,19 @@ pub(crate) fn pr_base_ref(gh_bin: &Path, cwd: Option<&Path>, pr: u32) -> Option<
         #[serde(rename = "baseRefName")]
         base_ref_name: String,
     }
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("pr")
-        .arg("view")
-        .arg(pr.to_string())
-        .arg("--json")
-        .arg("baseRefName");
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, dir);
-    }
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
-    }
-    let out = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let parsed: Pr = serde_json::from_slice(&out.stdout).ok()?;
+    // #10089: counted via the facade (`verdict.pr_base_ref`).
+    let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();
+    let pr = pr.to_string();
+    let args = ["pr", "view", pr.as_str(), "--json", "baseRefName"]
+        .into_iter()
+        .chain(repo_flag.iter().map(String::as_str));
+    let out = crate::claim_reconciliation::gh_call::ok_stdout(optional_cwd(
+        "verdict.pr_base_ref",
+        gh_bin,
+        cwd,
+        args,
+    ))?;
+    let parsed: Pr = serde_json::from_slice(&out).ok()?;
     is_safe_ref(&parsed.base_ref_name).then_some(parsed.base_ref_name)
 }
 
