@@ -448,13 +448,11 @@ impl GhPipelineSource {
     /// returned JSON array — the count for whatever list query `args`
     /// encodes.
     fn count(&self, root: &Path, args: &[&str]) -> Result<usize> {
-        let mut cmd = Command::new(&self.gh_bin);
-        cmd.args(args).current_dir(root);
-        // #5401: a cross-owner managed repo's count query uses its own owner's
-        // installation-token `GH_CONFIG_DIR` (no-op for single-owner fleets).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        let out = cmd
-            .output()
+        // #10089: counted via the facade (`snapshot.count`); it supplies the
+        // #5401 cross-owner GH_CONFIG_DIR from `root`.
+        let inv = crate::claim_reconciliation::gh_call::read("snapshot.count", &self.gh_bin, root)
+            .args(args);
+        let out = crate::claim_reconciliation::gh_call::output(inv)
             .with_context(|| format!("failed to invoke {}", self.gh_bin.display()))?;
         if !out.status.success() {
             return Err(anyhow!(
@@ -474,8 +472,13 @@ impl GhPipelineSource {
     /// [`Self::count`] — richer per-row shape because those three fields are
     /// all derived from the same row set.
     fn operator_held_rows(&self, root: &Path) -> Result<Vec<OperatorHeldRow>> {
-        let mut cmd = Command::new(&self.gh_bin);
-        cmd.args([
+        // #10089: counted via the facade (`snapshot.operator_held`).
+        let inv = crate::claim_reconciliation::gh_call::read(
+            "snapshot.operator_held",
+            &self.gh_bin,
+            root,
+        )
+        .args([
             "pr",
             "list",
             "--state",
@@ -486,11 +489,8 @@ impl GhPipelineSource {
             "number,mergeable,createdAt",
             "--limit",
             "500",
-        ])
-        .current_dir(root);
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        let out = cmd
-            .output()
+        ]);
+        let out = crate::claim_reconciliation::gh_call::output(inv)
             .with_context(|| format!("failed to invoke {}", self.gh_bin.display()))?;
         if !out.status.success() {
             return Err(anyhow!(

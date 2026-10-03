@@ -83,3 +83,47 @@ fn worktree_clean_probe_is_counted_and_unreadable_is_unknown() {
     assert_eq!(owner.as_deref(), Some("some-owner"));
     assert_eq!(calls(&rows, "clean.repo_owner"), 1, "{rows:?}");
 }
+
+#[test]
+#[serial(loom_config_env)]
+fn tree_compare_of_two_shas_is_spent_once_and_counted() {
+    use crate::claim_reconciliation::read_cache::set_test_enabled;
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    set_test_enabled(true);
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("gh.log");
+    let gh = stub(
+        tmp.path(),
+        "gh-compare",
+        &format!(r#"echo "$*" >> {}; echo '{{"status":"ahead","files":[]}}'"#, log.display()),
+    );
+    let failing = stub(tmp.path(), "gh-fail", "exit 1");
+    let mut answers = Vec::new();
+    let rows = rows_after(|| {
+        for _ in 0..4 {
+            answers.push(crate::forge_tree_unchanged::tree_unchanged(&gh, Some(tmp.path()), A, B));
+        }
+        // A failed compare is not stored: it is retried, never assumed.
+        answers.push(crate::forge_tree_unchanged::tree_unchanged(&failing, Some(tmp.path()), A, B));
+        answers.push(crate::forge_tree_unchanged::tree_unchanged(&failing, Some(tmp.path()), A, B));
+    });
+    set_test_enabled(false);
+    assert_eq!(&answers[..4], &[Some(true); 4]);
+    assert_eq!(&answers[4..], &[None, None]);
+    let spawns = std::fs::read_to_string(&log).unwrap().lines().count();
+    assert_eq!(spawns, 1, "four unchanged passes cost one compare");
+    assert_eq!(calls(&rows, "forge.tree_compare"), 3, "{rows:?}");
+}
+
+#[test]
+fn snapshot_and_complexity_reads_are_counted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gh = stub(tmp.path(), "gh-body", "echo 'no marker here'");
+    let mut body = Some("x".to_string());
+    let rows = rows_after(|| {
+        body = crate::sweep_registry::fetch_issue_complexity(&gh, tmp.path(), 5);
+    });
+    assert_eq!(body, None);
+    assert_eq!(calls(&rows, "model.issue_body"), 1, "{rows:?}");
+}
