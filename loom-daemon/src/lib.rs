@@ -191,6 +191,7 @@ pub mod forge_egress;
 pub(crate) mod forge_etag_store;
 pub mod forge_events;
 pub mod forge_identity;
+pub mod forge_inventory;
 pub mod forge_listing;
 pub mod forge_merge_config;
 pub mod forge_merge_method;
