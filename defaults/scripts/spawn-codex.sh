@@ -854,6 +854,14 @@ fi
 # The audit line names the profile DIRECTORY NAME and the readiness verdict
 # only — never a profile path's contents and never a byte of auth.json.
 LOOM_CODEX_MUTABLE_ROLES="builder doctor"
+# GUARDED roles (#9390) do not write the repository, so they keep the read-only
+# sandbox, but they act with merge (champion) or verdict (judge) authority on
+# the forge, which is what Loom's guards police. They need the same proven hook
+# and fail closed the same way. loom-daemon's runtime preference already passes
+# Codex over for them while any shared profile is unready
+# (runtime_preference::codex_guard, which mirrors this list); this is the
+# backstop, not the router.
+LOOM_CODEX_GUARDED_ROLES="champion judge"
 _hook_role="$(printf '%s' "${LOOM_ROLE:-}" | tr '[:upper:]_' '[:lower:]-')"
 case "$_hook_role" in
     development-worker) _hook_role="builder" ;;
@@ -870,6 +878,7 @@ esac
 
 _hook_role_is_mutable=false
 [[ -n "$_hook_role" && " $LOOM_CODEX_MUTABLE_ROLES " == *" $_hook_role "* ]] && _hook_role_is_mutable=true || true
+[[ -n "$_hook_role" && " $LOOM_CODEX_GUARDED_ROLES " == *" $_hook_role "* ]] && _hook_required=true || _hook_required="$_hook_role_is_mutable"
 
 _hook_provisioner="${_SCRIPT_DIR}/provision-codex-hooks.sh"
 _hook_status="unknown"
@@ -928,22 +937,20 @@ else
     fi
 fi
 
-log_info "spawn-codex: hooks=$_hook_status role=${_hook_role:-unset} mutable=$_hook_role_is_mutable trust-bypass=never${_hook_reason:+ reason=\"$_hook_reason\"}"
+log_info "spawn-codex: hooks=$_hook_status role=${_hook_role:-unset} mutable=$_hook_role_is_mutable required=$_hook_required trust-bypass=never${_hook_reason:+ reason=\"$_hook_reason\"}"
 
-if [[ "$_hook_role_is_mutable" == "true" && "$_hook_status" != "ready" && "$_hook_status" != "verified-in-private-session" ]]; then
-    log_error "Role '$_hook_role' mutates the repository, but Loom's managed Codex pre_tool_use hook is not ready (status=$_hook_status)."
+if [[ "$_hook_required" == "true" && "$_hook_status" != "ready" && "$_hook_status" != "verified-in-private-session" ]]; then
+    log_error "Role '$_hook_role' mutates the repository or merges/issues verdicts, but Loom's managed Codex pre_tool_use hook is not ready (status=$_hook_status)."
     [[ -n "$_hook_reason" ]] && log_error "  reason: $_hook_reason"
-    log_error "Without it a Codex worker runs with NO managed-worktree confinement,"
-    log_error "NO destructive-command blocking, and NO Loom workflow interception."
-    log_error "Provision and trust the profile, then retry:"
+    log_error "Without it a Codex worker runs with NO managed-worktree confinement, NO destructive-command blocking, and NO Loom workflow interception."
+    log_error "Provision and trust the profile, then retry (Loom will not pass --dangerously-bypass-hook-trust, issue #4495):"
     log_error "  .loom/scripts/provision-codex-hooks.sh install --all-profiles --workspace $WORKSPACE"
-    log_error "  CODEX_HOME=<profile> codex     # accept the hook-trust prompt once per profile"
+    log_error "  accept the hook-trust prompt once per profile WHERE IT RUNS (inside its session container if session-managed)"
     log_error "  .loom/scripts/provision-codex-hooks.sh verify --all-profiles --workspace $WORKSPACE --json"
-    log_error "Loom will not pass --dangerously-bypass-hook-trust (issue #4495)."
     exit 78  # EX_CONFIG
 fi
 
-if [[ "$_hook_role_is_mutable" != "true" && "$_hook_status" != "ready" && "$_hook_status" != "verified-in-private-session" ]]; then
+if [[ "$_hook_required" != "true" && "$_hook_status" != "ready" && "$_hook_status" != "verified-in-private-session" ]]; then
     log_warn "spawn-codex: hook parity unavailable — this session gets ONLY the Codex sandbox (${SANDBOX_MODE}) as a boundary. Read-only roles may proceed; this session is NOT Builder-capable."
 fi
 
