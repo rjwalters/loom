@@ -639,19 +639,25 @@ impl GhIssueStateLookup {
     }
 
     fn query(&self, issue: u64) -> Option<bool> {
-        let output = Command::new("gh")
-            .args([
-                "issue",
-                "view",
-                &issue.to_string(),
-                "--json",
-                "state",
-                "-q",
-                ".state",
-            ])
-            .current_dir(&self.repo_root)
-            .output()
-            .ok()?;
+        let crate::cmd_out::CmdOutcome::Ran(output) = crate::gh_invocation::GhInvocation::new(
+            crate::gh_invocation::Operation::new("issue.view"),
+            crate::gh_invocation::AccessIntent::Read,
+            crate::gh_invocation::GhTarget::None,
+            std::time::Duration::from_secs(60),
+        )
+        .args([
+            "issue",
+            "view",
+            &issue.to_string(),
+            "--json",
+            "state",
+            "-q",
+            ".state",
+        ])
+        .current_dir(&self.repo_root)
+        .run() else {
+            return None;
+        };
         if !output.status.success() {
             return None;
         }
