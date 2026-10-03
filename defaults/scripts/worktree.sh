@@ -1019,9 +1019,6 @@ Examples:
     collide — each issue gets its own ref, not a shared stack — so this does
     NOT trigger guard-destructive-generic.sh's stash-scope:worktree-collision
     ask even with several other '.loom-managed' worktrees active.
-    Reports "already clean" only when 'git status' is empty: untracked files
-    it leaves in place are named, and a git error, a 'git add -N' entry, or
-    any change it could not shelve exits 1 instead (#10122).
 
   pnpm worktree stash-push 42 --include-untracked
     Same as above, but also moves untracked files (respecting .gitignore,

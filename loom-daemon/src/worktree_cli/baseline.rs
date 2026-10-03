@@ -140,6 +140,10 @@ impl Capture {
 // ---------------------------------------------------------------------------
 
 /// Run `stash-push`. Returns the process exit code.
+///
+/// Reports "already clean" only when `git status` is empty: untracked files
+/// it leaves in place are named, and a git error, a `git add -N` entry, or any
+/// change it could not shelve exits 1 instead (#10122).
 #[must_use]
 pub fn push(args: &[String]) -> i32 {
     let parsed = match parse(args, "stash-push", PUSH_USAGE, true) {
