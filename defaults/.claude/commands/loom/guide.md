@@ -596,7 +596,8 @@ was blocked pre-approval and must **not** be promoted into the Builder queue.
 was_previously_approved() {
   local number="$1"
   # True if `loom:issue` appears anywhere in the issue's label event history.
-  # Repo-level: per-issue /events silently truncates (#8742).
+  # Repo-level (per-issue /events truncates, #8742); newest-first, so
+  # `head -1` stops paging at the first match.
   [ -n "$(gh api --paginate "repos/{owner}/{repo}/issues/events?per_page=100" \
     --jq ".[] | select(.issue.number == ${number} and .event == \"labeled\" and .label.name == \"loom:issue\") | 1" 2>/dev/null | head -1)" ] && echo true || echo false
 }
@@ -698,19 +699,23 @@ a later pass to sort out.
 
 ### Unblocking Logic
 
-`has_permanent_block N` = trusted comment (`loom-daemon forge trusted-comments
---fetch N`) or body holds `<!-- loom:permanent-block -->`. Any path removing
-`loom:blocked` must post an audit comment.
+Permanent block (#8742): `<!-- loom:permanent-block -->` (own line; quoted prose
+doesn't count) counts from a trusted comment, or the body **only if its author is trusted** (`--with-body`). Champion
+and `check_and_unblock_prs` check the same. Removing `loom:blocked` ⇒ audit comment.
 
 ```bash
+has_permanent_block() {  # unreadable => true
+  local t; t=$(loom-daemon forge trusted-comments --fetch "$1" --with-body 2>/dev/null) || { echo true; return; }
+  jq -e 'any(.[]; (.body // "") | test("(^|\n)[ \t]*<!-- loom:permanent-block -->[ \t\r]*(\n|$)"))' <<<"$t" >/dev/null && echo true || echo false
+}
+
 check_and_unblock() {
   "$GH_READ" issue list --label "loom:blocked" --state open --json number,body,title | jq -c '.[]' | while read -r issue; do
     local number=$(printf '%s\n' "$issue" | jq -r '.number')
     local body=$(printf '%s\n' "$issue" | jq -r '.body')
     local title=$(printf '%s\n' "$issue" | jq -r '.title')
 
-    # Permanent block (#8742): never auto-cleared.
-    [ "$(has_permanent_block "$number")" = "true" ] && continue
+    [ "$(has_permanent_block "$number")" = "true" ] && continue  # #8742
 
     local deps=$(parse_dependencies "$body")
 
@@ -804,13 +809,8 @@ gh issue edit 963 --remove-label "loom:blocked" --add-label "loom:issue"
 # an "Unblocked" comment, no matter how stale the body's Dependencies text
 # looks.
 
-# Counter-example (#7267's exact sequence, issue #6925 against PR #7246): all
-# body-declared dependencies are CLOSED, but has_superseding_block finds
-# linked PR #7246 still OPEN, carrying loom:pr + loom:operator, with
-# mergeable=CONFLICTING / mergeStateStatus=DIRTY → true (both the
-# loom:operator label check AND the merge-state check independently trigger
-# here) → stay blocked, do NOT strip loom:blocked or post an "Unblocked"
-# comment.
+# Counter-example (#7267: #6925 vs PR #7246): deps CLOSED, but #7246 is OPEN
+# with loom:operator and DIRTY → true → stay blocked, same as above.
 
 # A PR-side worked example (#8925's own #8314 shape) is in park-record.md's
 # "The unblock sweep's PR-side functions" section, alongside the three

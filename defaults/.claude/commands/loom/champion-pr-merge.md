@@ -2319,6 +2319,13 @@ fi
 for blocked in $BLOCKED_ISSUES; do
   echo "Checking if #$blocked can be unblocked..."
 
+  # Permanent block (#8742), before the cycle walk: guide.md's
+  # has_permanent_block sources (trusted comments + trusted-author body).
+  PB=$(loom-daemon forge trusted-comments --fetch "$blocked" --with-body 2>/dev/null) || continue
+  if jq -e 'any(.[]; (.body // "") | test("(^|\n)[ \t]*<!-- loom:permanent-block -->[ \t\r]*(\n|$)"))' <<<"$PB" >/dev/null; then
+    echo "  #$blocked: permanent block, skipped"; continue
+  fi
+
   # Get the issue body to check ALL dependencies
   BLOCKED_BODY=$("$GH_READ" issue view "$blocked" --json body --jq '.body')
 
@@ -2397,10 +2404,6 @@ for blocked in $BLOCKED_ISSUES; do
     fi
   fi
 
-  # Permanent block (#8742): trusted `<!-- loom:permanent-block -->` => never clear.
-  if loom-daemon forge trusted-comments --fetch "$blocked" 2>/dev/null | grep -q 'loom:permanent-block'; then
-    continue
-  fi
   if [ "$ALL_RESOLVED" = true ]; then
     echo "  All dependencies resolved - unblocking #$blocked"
     gh issue edit "$blocked" --remove-label "loom:blocked" --add-label "loom:issue"
