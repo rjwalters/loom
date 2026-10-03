@@ -51,6 +51,11 @@ pub(crate) struct VerifyArgs {
     /// named (the provisioner's sibling `../hooks/guard-codex-bridge.sh`).
     #[arg(long)]
     fallback_bridge: Option<PathBuf>,
+    /// `CODEX_HOME` as Codex will see it when it runs (decides which
+    /// `hooks.state` key counts as trust). Default: the session container's
+    /// mount point for a session-managed profile, else the canonical profile.
+    #[arg(long)]
+    runtime_codex_home: Option<PathBuf>,
     /// Print one JSON verdict per profile on stdout.
     #[arg(long)]
     json: bool,
@@ -88,6 +93,7 @@ impl VerifyArgs {
             workspace: self.workspace.clone(),
             registration: self.registration(),
             fallback_bridge: self.fallback_bridge.clone(),
+            runtime_home: self.runtime_codex_home.clone(),
         }
         .verify();
         if self.json {
