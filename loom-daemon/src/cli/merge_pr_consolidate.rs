@@ -107,7 +107,8 @@ impl ConsolidatePrepareArgs {
         let base = live_base(&gh, &root, &default_branch)?;
         if !has_commit(&root, &base) {
             let _ = std::process::Command::new("git")
-                .args(["fetch", "--quiet", "origin", &default_branch])
+                // `--` before the ref operand (#9106 mitigation B, #9479).
+                .args(["fetch", "--quiet", "origin", "--", &default_branch])
                 .current_dir(&root)
                 .status();
             if !has_commit(&root, &base) {
@@ -455,6 +456,8 @@ fn ensure_pr_head_fetched(root: &std::path::Path, pr_number: u32, sha: &str) -> 
             "fetch",
             "--quiet",
             "origin",
+            // `--` before the ref operand (#9106 mitigation B, #9479).
+            "--",
             &format!("refs/pull/{pr_number}/head"),
         ])
         .current_dir(root)
