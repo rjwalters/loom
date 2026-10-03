@@ -1805,6 +1805,11 @@ jobs:
       # and host-side `tokens select`, so it needs the binary this job downloads.
       - name: spawn-claude credential egress proxy (#8697)
         run: bash defaults/scripts/tests/test-spawn-claude-credential-proxy.sh
+      # #9979: spawn-codex.sh drops Codex's sandbox in a session container only
+      # after `loom-daemon session-exec posture` has verified the container's
+      # label AND HostConfig, so this suite needs the binary this job downloads.
+      - name: spawn-codex session container boundary (#8518, #9979)
+        run: bash defaults/scripts/tests/test-spawn-codex-session-exec.sh
       # Moved out of shell-suite-tests by #8191 slice 1: merge-pr.sh's
       # closing-reference analysis now delegates to `loom-daemon`, so this
       # suite's require-daemon-bin harness needs the binary this job downloads.
