@@ -574,7 +574,7 @@ pub const SPECS: &[CheckSpec<'static>] = &[
     // the handler reads `crate::Cli`'s subcommand names to validate
     // `Shell-Budget-Callout:` trailers, so `main.rs` and every enum it
     // `#[command(flatten)]`s (`cli/telemetry.rs`, `cli/script_ports.rs`,
-    // `cli/dep_classify.rs`) are inputs too. MUST grow if the checker starts
+    // `cli/dep_classify.rs`, `cli/collision_evidence.rs`) are inputs too. MUST grow if the checker starts
     // using another module — `daemon_surface_tests.rs` fails until it does.
     CheckSpec {
         context: "Shell Budget Ratchet",
@@ -587,6 +587,7 @@ pub const SPECS: &[CheckSpec<'static>] = &[
             "loom-daemon/src/cli/script_ports.rs",
             "loom-daemon/src/cli/telemetry.rs",
             "loom-daemon/src/cli/dep_classify.rs",
+            "loom-daemon/src/cli/collision_evidence.rs",
             "scripts/shell-allowlist.txt",
             "scripts/shell-budget-baseline.txt",
             "Cargo.toml",
