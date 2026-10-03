@@ -1766,7 +1766,7 @@ with `loom:operator-only`. Read body, escalation comment, and bounce comment, th
 - **No-loop guard**: a decision-bounce comment newer than your repair marker means
   the repair bounced. Comment once and leave it alone.
 
-Once the #9344 helper exists, use it to render the block (not yet present).
+Render: `loom-daemon operator-decision apply` (`operator-decision.md`).
 
 ## Checking Operator-Only Premises (#6849)
 
