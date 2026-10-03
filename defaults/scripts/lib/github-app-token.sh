@@ -322,6 +322,7 @@ _github_app_needs_remint() {
 # script's behaviour unchanged. A host is only proxied once its daemon can
 # say so; dispatch and spawn already refuse on an unreadable policy.
 # Memoised per process (and inherited by the CLI's subshell).
+# requires-daemon: forge optional   No binary, or one predating `forge egress policy` (any non-zero exit / no credentialRef), is treated as "no policy": the gate stays open and minting proceeds exactly as before #9988.
 # shellcheck source=./locate-daemon-bin.sh
 source "$_LOOM_GH_APP_LIB_DIR/locate-daemon-bin.sh"
 _GH_APP_EGRESS_GATE=""
