@@ -188,12 +188,12 @@ pub fn plan(issues: &[BlockedIssue]) -> Vec<(u32, ReconcileAction)> {
 /// thin, best-effort `Command` wrapper.
 pub mod forge {
     use super::{decide, plan, BlockedIssue, ReconcileAction, MAX_ISSUES_PER_WORKSPACE};
-    use crate::sweep_registry::{output_with_timeout, reap_gh_timeout, QUARANTINE_COMMENT_MARKER};
+    use crate::claim_reconciliation::gh_call;
+    use crate::sweep_registry::{reap_gh_timeout, QUARANTINE_COMMENT_MARKER};
     use anyhow::{anyhow, Context, Result};
     use chrono::{DateTime, Utc};
     use serde::Deserialize;
     use std::path::Path;
-    use std::process::{Command, Stdio};
 
     #[derive(Debug, Deserialize)]
     struct GhComment {
@@ -211,34 +211,23 @@ pub mod forge {
     }
 
     fn list_blocked_issues(gh_bin: &Path, root: &Path) -> Result<Vec<BlockedIssue>> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("issue")
-            .arg("list")
-            .arg("--label")
-            .arg("loom:blocked")
-            .arg("--state")
-            .arg("open")
-            .arg("--limit")
-            .arg(MAX_ISSUES_PER_WORKSPACE.to_string())
-            .arg("--json")
-            .arg("number,comments");
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        let limit = MAX_ISSUES_PER_WORKSPACE.to_string();
+        let out = gh_call::output(
+            gh_call::read("quarantine.issue_list", gh_bin, root)
+                .args([
+                    "issue",
+                    "list",
+                    "--label",
+                    "loom:blocked",
+                    "--state",
+                    "open",
+                ])
+                .args(["--limit", &limit, "--json", "number,comments"])
+                .args(gh_call::loom_repo_flag()),
+        )?;
         if !out.status.success() {
-            return Err(anyhow!(
-                "gh issue list --label loom:blocked failed in {}: {}",
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            let (root, err) = (root.display(), gh_call::stderr(&out));
+            return Err(anyhow!("gh issue list --label loom:blocked failed in {root}: {err}"));
         }
         let rows: Vec<GhBlockedIssue> =
             serde_json::from_slice(&out.stdout).context("parse gh issue list JSON")?;
@@ -278,26 +267,14 @@ pub mod forge {
         root: &Path,
         issue: u32,
     ) -> Option<DateTime<Utc>> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline"))
-            .arg("--paginate")
-            .arg("--jq")
-            .arg(
-                r#"[.[] | select(.event == "labeled" and .label.name == "loom:blocked") | .created_at] | max // empty"#,
-            );
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        // #8263: `LOOM_REPO` reaches `gh api` as the GH_REPO env var, NEVER as
-        // a `--repo` flag (`gh api` has none and aborts on one).
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        let out = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
-        if !out.status.success() {
-            return None;
-        }
-        parse_timestamp(&out.stdout)
+        // #8263: `LOOM_REPO` reaches `gh api` as GH_REPO (set by the facade).
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline?per_page=100");
+        let jq = r#"[.[] | select(.event == "labeled" and .label.name == "loom:blocked") | .created_at] | max // empty"#;
+        let out = gh_call::ok_stdout(
+            gh_call::read_within("quarantine.issue_timeline", gh_bin, root, reap_gh_timeout())
+                .args(["api", &path, "--paginate", "--jq", jq]),
+        )?;
+        parse_timestamp(&out)
     }
 
     /// The trusted comments on `issue` that begin with
@@ -308,19 +285,12 @@ pub mod forge {
         root: &Path,
         issue: u32,
     ) -> Option<Vec<serde_json::Value>> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"))
-            .arg("--paginate");
-        cmd.current_dir(root);
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        let out = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
-        if !out.status.success() {
-            return None;
-        }
-        let comments =
-            crate::comment_trust::TrustPolicy::for_root(root).trusted_records(&out.stdout)?;
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments?per_page=100");
+        let out = gh_call::ok_stdout(
+            gh_call::read_within("quarantine.issue_comments", gh_bin, root, reap_gh_timeout())
+                .args(["api", &path, "--paginate"]),
+        )?;
+        let comments = crate::comment_trust::TrustPolicy::for_root(root).trusted_records(&out)?;
         Some(
             comments
                 .into_iter()
@@ -406,31 +376,16 @@ pub mod forge {
     }
 
     fn release(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("issue")
-            .arg("edit")
-            .arg(issue.to_string())
-            .arg("--remove-label")
-            .arg("loom:blocked")
-            .arg("--add-label")
-            .arg("loom:issue");
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        let n = issue.to_string();
+        let out = gh_call::output(
+            gh_call::write("quarantine.issue_release", gh_bin, root)
+                .args(["issue", "edit", &n, "--remove-label", "loom:blocked"])
+                .args(["--add-label", "loom:issue"])
+                .args(gh_call::loom_repo_flag()),
+        )?;
         if !out.status.success() {
-            return Err(anyhow!(
-                "gh issue edit failed for #{issue} in {}: {}",
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            let (root, err) = (root.display(), gh_call::stderr(&out));
+            return Err(anyhow!("gh issue edit failed for #{issue} in {root}: {err}"));
         }
         Ok(())
     }

@@ -47,12 +47,11 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
-use super::{forge, MAX_ISSUES_PER_WORKSPACE, VERDICT_HOLD_LABELS, VERDICT_MARKER_PREFIX};
+use super::{forge, gh_call, MAX_ISSUES_PER_WORKSPACE, VERDICT_HOLD_LABELS, VERDICT_MARKER_PREFIX};
 
 /// Kill switch for this pass (`0`/`false`/`no`/`off` disables). Defaults ON.
 pub const REVIEW_CONFLICT_ENABLED_ENV: &str = "LOOM_REVIEW_CONFLICT_RECONCILE";
@@ -247,23 +246,19 @@ pub fn parse_pr_list(stdout: &[u8]) -> Result<Vec<ConflictPr>> {
 /// Run `gh pr <args…>` in `root` with the per-root credential and `LOOM_REPO`
 /// applied, returning stdout on success.
 fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("pr").args(args);
-    cmd.current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    let inv = match args.first().copied() {
+        Some("list") => gh_call::read("review_conflict.pr_list", gh_bin, root),
+        Some("view") => gh_call::read("review_conflict.pr_view", gh_bin, root),
+        Some("comment") => gh_call::write("review_conflict.pr_comment", gh_bin, root),
+        _ => gh_call::write("review_conflict.pr_edit", gh_bin, root),
+    };
+    let out = gh_call::output(inv.args(["pr"]).args(args).args(gh_call::loom_repo_flag()))?;
     if !out.status.success() {
         return Err(anyhow!(
             "gh pr {} failed in {}: {}",
             args.first().copied().unwrap_or_default(),
             root.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            gh_call::stderr(&out)
         ));
     }
     Ok(out.stdout)
