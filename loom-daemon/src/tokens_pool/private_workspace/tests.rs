@@ -393,21 +393,37 @@ fn gh_credential_helper_is_refused_on_policy_governed_hosts() {
 }
 
 #[test]
-fn policy_governs_host_follows_env_policy_in_temp_home() {
-    // Temp HOME + explicit policy file: required -> governed; no policy -> not.
+fn policy_governs_host_resolves_and_fails_closed_on_unreadable_policy() {
+    use crate::forge_egress::policy::PolicySources;
+    use repository::policy_governs_host;
     let dir = tempfile::tempdir().unwrap();
-    let policy = dir.path().join("policy.json");
-    std::fs::write(&policy, r#"{"enforcement":{"api":"required"}}"#).unwrap();
-    let sources = crate::forge_egress::policy::PolicySources {
-        env_path: Some(policy),
-        machine_path: None,
-        repo_path: None,
-    };
-    let governed = match crate::forge_egress::policy::resolve(&sources) {
-        crate::forge_egress::policy::Resolution::Loaded(doc) => {
-            crate::forge_egress::policy::dig_str(&doc.data, &["enforcement", "api"]) == "required"
+    let env = |name: &str, body: Option<&str>| {
+        let path = dir.path().join(name);
+        if let Some(body) = body {
+            std::fs::write(&path, body).unwrap();
         }
-        _ => false,
+        PolicySources {
+            env_path: Some(path),
+            machine_path: None,
+            repo_path: None,
+        }
     };
-    assert!(governed);
+    // Absent policy -> not governed (the only "no policy" case).
+    assert!(!policy_governs_host(&PolicySources::default()).unwrap());
+    assert!(
+        policy_governs_host(&env("req.json", Some(r#"{"enforcement":{"api":"required"}}"#)))
+            .unwrap()
+    );
+    assert!(
+        !policy_governs_host(&env("obs.json", Some(r#"{"enforcement":{"api":"observe"}}"#)))
+            .unwrap()
+    );
+    // Corrupt or missing-but-named policy -> error, never "not governed".
+    for sources in [
+        env("bad.json", Some("{not json")),
+        env("missing.json", None),
+    ] {
+        let err = policy_governs_host(&sources).unwrap_err().to_string();
+        assert!(err.contains("unreadable") && err.contains(".json"), "{err}");
+    }
 }

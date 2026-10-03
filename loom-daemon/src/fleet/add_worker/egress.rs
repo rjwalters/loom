@@ -8,13 +8,15 @@
 //! `toolchain.upstreamGhPath`, verify its checksum, and finish with
 //! `forge egress doctor`. Hosts with no policy (or `observe`) are unchanged.
 //!
-//! Everything here is pure except [`load_for_operator`]; values interpolated
+//! Everything here is pure except policy loading, which fails closed on an
+//! unreadable policy (only an absent one means "no policy"); values interpolated
 //! into shell are validated against a conservative charset first.
 
+use anyhow::{bail, Result};
 use serde_json::Value;
 
 use super::path_bootstrap;
-use crate::fleet::{Plan, Step};
+use crate::fleet::{Plan, Step, StepStdin};
 use crate::forge_egress::policy::{dig, dig_str, resolve, PolicySources, Resolution};
 
 /// The slice of a `required` policy that provisioning acts on.
@@ -69,20 +71,77 @@ impl EgressProvisioning {
     }
 }
 
-/// Resolve the operator host's policy (env > machine > none). The org policy
-/// is assumed to be the one the worker will be governed by.
-#[must_use]
-pub fn load_for_operator() -> Option<EgressProvisioning> {
-    match resolve(&PolicySources::from_process(None)) {
-        Resolution::Loaded(doc) => EgressProvisioning::from_policy(&doc.data),
-        _ => None,
+/// Resolve the policy from `sources`. The org policy on the operator host is
+/// assumed to be the one the worker will be governed by.
+///
+/// Only an *absent* policy (`Unconfigured`) means "no policy". A present but
+/// unreadable/unparseable policy fails closed (policy.rs contract: never a
+/// fall-through to a narrower policy), so provisioning refuses rather than
+/// silently emitting the legacy `gh auth setup-git` plan.
+pub fn load_for_operator(sources: &PolicySources) -> Result<Option<EgressProvisioning>> {
+    match resolve(sources) {
+        Resolution::Unconfigured => Ok(None),
+        Resolution::Loaded(doc) => Ok(EgressProvisioning::from_policy(&doc.data)),
+        Resolution::Unreadable {
+            candidate, error, ..
+        } => bail!(
+            "forge-egress policy {} is unreadable ({error}); refusing to provision a worker \
+             without knowing whether it is policy-governed. Fix or remove the policy file \
+             (or unset LOOM_FORGE_EGRESS_POLICY) and re-run.",
+            candidate.path.display()
+        ),
     }
 }
 
-/// Forge-auth script: policy-governed hosts drop `gh auth setup-git`.
-#[must_use]
-pub fn forge_auth_script(p: Option<&EgressProvisioning>) -> String {
-    p.map_or_else(render_forge_auth_legacy, render_forge_auth)
+/// [`load_for_operator`] with the production sources (env > machine).
+pub fn load_for_operator_from_process() -> Result<Option<EgressProvisioning>> {
+    load_for_operator(&PolicySources::from_process(None))
+}
+
+/// Step 4, `forge-auth`. Legacy hosts log `gh` in with the PAT (over stdin)
+/// and wire git through `gh auth setup-git`. A policy-governed host stores no
+/// GitHub credential at all (#9986: the gateway owns the API credential, and a
+/// PAT in `~/.config/gh/hosts.yml` would fail the trailing doctor), so the PAT
+/// is neither consumed nor persisted and only `git_protocol` is set.
+pub fn push_forge_auth(plan: &mut Plan, pat: Option<&String>, p: Option<&EgressProvisioning>) {
+    match (p, pat) {
+        (Some(p), _) => {
+            let proto = git_protocol(p);
+            plan.push_step(Step::new(
+                "forge-auth",
+                &format!("set gh git_protocol={proto} (policy-governed: no gh credential stored)"),
+                Some(format!(
+                    "[ \"$(gh config get git_protocol 2>/dev/null)\" = {proto} ]"
+                )),
+                render_forge_auth(p),
+            ));
+        }
+        (None, Some(pat)) => plan.push_step(
+            Step::new(
+                "forge-auth",
+                "authenticate gh with the fine-grained PAT (via stdin) and set up git credential helper",
+                Some("gh auth status >/dev/null 2>&1".to_string()),
+                render_forge_auth_legacy(),
+            )
+            .with_stdin(StepStdin {
+                content: pat.clone(),
+                secret: true,
+            }),
+        ),
+        (None, None) => plan.push_skip(
+            "forge-auth",
+            "authenticate gh with the fine-grained PAT",
+            "no --pat-file supplied",
+        ),
+    }
+}
+
+fn git_protocol(p: &EgressProvisioning) -> &'static str {
+    if p.git_ssh {
+        "ssh"
+    } else {
+        "https"
+    }
 }
 
 fn render_forge_auth_legacy() -> String {
@@ -97,16 +156,17 @@ gh auth setup-git
     )
 }
 
-/// `forge-auth` script for a governed host: no `gh auth setup-git`.
+/// `forge-auth` script for a governed host: no `gh auth login` (the host
+/// holds no GitHub credential) and no `gh auth setup-git`.
 #[must_use]
 pub fn render_forge_auth(p: &EgressProvisioning) -> String {
     let export_line = path_bootstrap::canonical_path_export_line();
-    let proto = if p.git_ssh { "ssh" } else { "https" };
+    let proto = git_protocol(p);
     format!(
         r#"set -e
-{export_line}gh auth login --with-token
-# forge-egress policy (enforcement.api=required): git must never use the gh
-# credential helper, so `gh auth setup-git` is deliberately not run.
+{export_line}# forge-egress policy (enforcement.api=required): this host stores no GitHub
+# credential (the gateway owns it), so no gh login; and git must never use the
+# gh credential helper, so no gh setup-git either.
 gh config set git_protocol {proto}
 "#
     )

@@ -646,24 +646,8 @@ pub fn build_plan_with_policy(
         render_claude_code(),
     ));
 
-    // 4. Forge auth via operator-supplied fine-grained PAT (over stdin).
-    match &secrets.pat {
-        Some(pat) => plan.push_step(
-            Step::new(
-                "forge-auth",
-                "authenticate gh with the fine-grained PAT (via stdin) and set up git credential helper",
-                Some("gh auth status >/dev/null 2>&1".to_string()),
-                egress::forge_auth_script(egress),
-            )
-            .with_stdin(StepStdin { content: pat.clone(), secret: true }),
-        ),
-        None => plan.push_skip(
-            "forge-auth",
-            "authenticate gh with the fine-grained PAT",
-            "no --pat-file supplied",
-        ),
-    }
-
+    // 4. Forge auth (PAT over stdin; policy-governed hosts store none, #10050).
+    egress::push_forge_auth(&mut plan, secrets.pat.as_ref(), egress);
     egress.inspect(|p| egress::push_toolchain_steps(&mut plan, p)); // 4b (#10050)
 
     // 5. Token pool: full account pool (#3979 decision — no pinned subsets).
@@ -976,9 +960,10 @@ fn build_worker_record(
 /// before a single `apt-get`/`systemd` step is rendered, let alone run.
 pub fn run(config: &AddWorkerConfig) -> Result<()> {
     let secrets = preflight(config)?;
+    let egress = egress::load_for_operator_from_process()?; // fails closed (#10050)
 
     if config.dry_run {
-        let plan = build_plan_with_policy(config, &secrets, egress::load_for_operator().as_ref());
+        let plan = build_plan_with_policy(config, &secrets, egress.as_ref());
         print!("{}", plan.render_dry_run("fleet add-worker", &config.ssh_host));
         println!(
             "\n(dry run — no action taken on {}. Re-run without --dry-run to execute.)",
@@ -995,7 +980,7 @@ pub fn run(config: &AddWorkerConfig) -> Result<()> {
     let runner = SshRunner::new(&config.ssh_host);
     ensure_supported_platform(&runner, &config.ssh_host)?;
 
-    let plan = build_plan_with_policy(config, &secrets, egress::load_for_operator().as_ref());
+    let plan = build_plan_with_policy(config, &secrets, egress.as_ref());
     let reports = execute_plan(&runner, &plan);
     print!("{}", render_checklist("fleet add-worker", &config.ssh_host, &reports));
 

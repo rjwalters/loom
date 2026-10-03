@@ -68,9 +68,21 @@ fn required_policy_drops_setup_git_and_follows_rollout() {
     ] {
         let p = EgressProvisioning::from_policy(&policy("required", rollout, Some(SHA))).unwrap();
         let plan = build_plan_with_policy(&base_config(), &secrets(), Some(&p));
-        let auth = &step(&plan, "forge-auth").apply;
-        assert!(!auth.contains("gh auth setup-git\n"), "{auth}");
-        assert!(auth.contains(&format!("gh config set git_protocol {proto}")), "{auth}");
+        let auth = step(&plan, "forge-auth");
+        // No gh credential at all on a governed host: no login, no setup-git,
+        // and the PAT is never consumed on stdin.
+        assert!(
+            !auth
+                .apply
+                .lines()
+                .any(|l| l.trim_start().starts_with("gh auth")),
+            "{}",
+            auth.apply
+        );
+        assert!(auth.stdin.is_none());
+        assert!(auth
+            .apply
+            .contains(&format!("gh config set git_protocol {proto}")));
     }
 }
 
@@ -114,12 +126,44 @@ fn null_checksum_skips_verification_and_bad_values_skip_step() {
 }
 
 #[test]
-fn load_for_operator_reads_env_policy_from_temp_home() {
-    // Pure-resolution check (no process env mutation): a temp-dir policy file.
+fn governed_forge_auth_runs_without_a_pat() {
+    let p = EgressProvisioning::from_policy(&policy("required", "unqualified", None)).unwrap();
+    let plan = build_plan_with_policy(&base_config(), &Secrets::default(), Some(&p));
+    assert!(step(&plan, "forge-auth")
+        .apply
+        .contains("git_protocol https"));
+}
+
+#[test]
+fn load_for_operator_reads_policy_and_fails_closed_when_unreadable() {
+    use super::load_for_operator;
+    use crate::forge_egress::policy::PolicySources;
     let dir = tempfile::tempdir().unwrap();
-    let f = dir.path().join("p.json");
-    std::fs::write(&f, policy("required", "qualified", None).to_string()).unwrap();
-    let doc = std::fs::read_to_string(&f).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
-    assert!(EgressProvisioning::from_policy(&v).unwrap().git_ssh);
+    let env = |name: &str, body: Option<String>| {
+        let path = dir.path().join(name);
+        if let Some(body) = body {
+            std::fs::write(&path, body).unwrap();
+        }
+        PolicySources {
+            env_path: Some(path),
+            machine_path: None,
+            repo_path: None,
+        }
+    };
+    // Absent policy -> legacy plan (the only "no policy" case).
+    assert!(load_for_operator(&PolicySources::default())
+        .unwrap()
+        .is_none());
+    let req = env("req.json", Some(policy("required", "qualified", None).to_string()));
+    assert!(load_for_operator(&req).unwrap().unwrap().git_ssh);
+    let obs = env("obs.json", Some(policy("observe", "qualified", None).to_string()));
+    assert!(load_for_operator(&obs).unwrap().is_none());
+    // Corrupt or missing-but-named policy -> refuse, never the legacy plan.
+    for sources in [
+        env("bad.json", Some("{not json".into())),
+        env("missing.json", None),
+    ] {
+        let err = load_for_operator(&sources).unwrap_err().to_string();
+        assert!(err.contains("unreadable") && err.contains(".json"), "{err}");
+    }
 }
