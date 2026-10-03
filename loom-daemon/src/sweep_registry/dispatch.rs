@@ -1748,6 +1748,21 @@ impl SweepRegistry {
             }
         }
 
+        // Forge egress admission (#9984): a fresh `forge egress assert`. Under
+        // `enforcement.api = required` a routing finding refuses the dispatch
+        // here, before any claim/label/account/log/spawn side effect, and the
+        // refusal is visible on the bus as `sweep.blocked reason=forge-egress`.
+        // `observe` logs and admits; no policy configured is a no-op.
+        if let Some(refusal) =
+            crate::forge_egress::gate::dispatch_refusal(&self.config.workspace_root)
+        {
+            self.emit_event(Event::Generic {
+                topic: crate::forge_egress::gate::SWEEP_BLOCKED_TOPIC.to_string(),
+                payload: refusal.event_payload(serde_json::to_value(kind).unwrap_or_default()),
+            });
+            return Err(anyhow!(refusal.message()));
+        }
+
         // Runtime admission is the first decision for a new dispatch:
         // before account selection, claim lock, forge mutation,
         // log header, or child spawn. A full sweep remains one runtime and is
@@ -3453,3 +3468,8 @@ mod idempotency_inflight_tests;
 // over the file-size ratchet threshold.
 #[cfg(test)]
 mod fleet_noop_cooldown_tests;
+
+// Issue #9984's forge-egress dispatch admission coverage — a sibling module
+// for the same reason as the two above.
+#[cfg(test)]
+mod forge_egress_tests;

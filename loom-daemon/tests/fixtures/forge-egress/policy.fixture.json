@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "policyEpoch": 1,
+  "deployment": "loom-fixture",
+  "github": {
+    "logicalHost": "github.com",
+    "apiOrigin": "https://github-proxy.fixture.invalid",
+    "gitOrigin": {
+      "host": null,
+      "rollout": "unqualified",
+      "note": "No destination serves the Git protocol yet. Do not install insteadOf/pushInsteadOf rewrites before it does (2am#1911 'do not deploy a rewrite before the destination serves the protocol'); P5/#1570 owns qualification."
+    },
+    "allowedDirectEgress": [
+      "github-proxy"
+    ]
+  },
+  "toolchain": {
+    "ghMinimumVersion": "2.100.0",
+    "ghPinnedVersion": "2.102.0",
+    "launcherPath": "/usr/local/bin/gh",
+    "upstreamGhPath": "/usr/local/libexec/2am/github-egress/gh-upstream",
+    "upstreamGhSha256": null,
+    "sdkPins": {
+      "go-gh": "v2.16.1",
+      "octokit-rest-js": "unpinned-pending-P3",
+      "pygithub": "unpinned-pending-P3",
+      "octocrab": "not-used-see-inventory"
+    }
+  },
+  "enforcement": {
+    "api": "observe",
+    "runtimeEgress": "unverified",
+    "negativeCanary": null
+  },
+  "principal": {
+    "profile": "fleet-automation",
+    "credentialRef": "file:/etc/2am/github-egress/credentials/fleet-automation.ref",
+    "ghConfigDirs": [
+      "{root}/cfg",
+      "{root}/home/.config/gh"
+    ]
+  },
+  "telemetry": {
+    "serviceName": "github-proxy",
+    "otlpEndpoint": "http://127.0.0.1:4318",
+    "canaryMaxAgeSeconds": 900
+  }
+}
