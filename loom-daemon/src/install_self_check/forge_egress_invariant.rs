@@ -80,16 +80,24 @@ pub(super) fn reconcile<R: ViolationReporter>(
     let id = outcome.invariant.id();
     let marker = outcome.invariant.issue_marker();
     let root = repo_root.display();
+    // `Skipped` (no policy configured) takes the same close path as `Ok`:
+    // with no policy there is nothing to enforce, so an issue filed while a
+    // policy was in force must not stay open forever once it is removed.
     let detail = match &outcome.status {
         InvariantStatus::Skipped(reason) => {
             log::debug!("install_self_check: {id} skipped ({root}): {reason}");
-            return;
+            None
         }
         InvariantStatus::Violation(d) => {
             log::warn!("install_self_check: {id} VIOLATED ({root}): {d}");
             Some(d.as_str())
         }
         InvariantStatus::Ok => None,
+    };
+    let close_comment = if matches!(outcome.status, InvariantStatus::Skipped(_)) {
+        "No forge egress policy is configured any more — nothing to enforce, closing (#9984)."
+    } else {
+        "Forge egress routing is aligned again (`forge egress assert` exit 0) — closing (#9984)."
     };
     if !repair_mode {
         if detail.is_some() {
@@ -107,10 +115,13 @@ pub(super) fn reconcile<R: ViolationReporter>(
     let result = match (detail, open) {
         (None, None) => Ok(()),
         (None, Some((n, _))) => reporter
-            .close_issue(n, "Forge egress routing is aligned again (`forge egress assert` exit 0) — closing (#9984).")
+            .close_issue(n, close_comment)
             .map(|()| log::info!("install_self_check: closed #{n} — {id} aligned in {root}")),
         (Some(d), None) => reporter
-            .file_issue(&format!("install self-check: {}", outcome.invariant.title()), &issue_body(repo_root, d))
+            .file_issue(
+                &format!("install self-check: {}", outcome.invariant.title()),
+                &issue_body(repo_root, d),
+            )
             .map(|n| log::warn!("install_self_check: filed #{n} for {id} in {root}")),
         (Some(d), Some((n, body))) if !body.contains(&codes_marker(codes_of(d))) => reporter
             .update_issue_body(n, &issue_body(repo_root, d))
@@ -282,6 +293,23 @@ mod tests {
         reconcile(Path::new("/r"), &outcome(violation("a")), false, &fake);
         reconcile(Path::new("/r"), &outcome(InvariantStatus::Skipped("none".into())), true, &fake);
         assert!(fake.log.borrow().is_empty());
+    }
+
+    #[test]
+    fn closes_when_the_policy_is_removed_after_a_violation() {
+        let root = Path::new("/repo");
+        let fake = Fake::default();
+        reconcile(root, &outcome(violation("apiconfig.api-host-missing")), true, &fake);
+        assert!(fake.open.borrow().is_some());
+        // Policy removed: report-only mode still leaves it alone…
+        let skipped = || outcome(InvariantStatus::Skipped("no policy".into()));
+        reconcile(root, &skipped(), false, &fake);
+        assert!(fake.open.borrow().is_some());
+        // …repair mode closes it, and a further skipped pass is a no-op.
+        reconcile(root, &skipped(), true, &fake);
+        reconcile(root, &skipped(), true, &fake);
+        assert_eq!(*fake.log.borrow(), vec!["file", "close 9"]);
+        assert!(fake.open.borrow().is_none());
     }
 
     #[test]

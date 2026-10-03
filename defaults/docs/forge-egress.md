@@ -28,7 +28,9 @@ and the validator never falls back to a cached, default or narrower one:
 1. `$LOOM_FORGE_EGRESS_POLICY` (`origin: env`). When it is set it is
    authoritative even if the file is missing. A missing file is
    `policy.unreadable`, exit 2.
-2. `/etc/loom/forge-egress/policy.json` (`origin: machine`).
+2. `/etc/loom/forge-egress/policy.json` (`origin: machine`). Only a missing
+   file is absent; one that cannot be stat'ed (e.g. `EACCES`) still wins and
+   is `policy.unreadable`, exit 2.
 3. `.loom/config.json` → `forge.egress.policyPath` (`origin: repo`). A relative
    path resolves against the repo root.
 4. None ⇒ `unconfigured`.
@@ -92,7 +94,7 @@ versions, counts and remedies only. Token-shaped strings are redacted.
 | `loom-daemon status` / `status --json` (`forge_egress` key) | fresh `assert` + cached daemon `doctor` | shows the codes and fixes; prints nothing when unconfigured |
 | sweep dispatch | `assert` | refuses before any claim or spawn; event `sweep.blocked` with `reason: forge-egress` |
 | worker spawn (`spawn-worker.sh` → `loom-daemon spawn-worker`) | `assert` | does not spawn (exit 78) |
-| `install_self_check` (`forge-egress-aligned`) | `assert` | files an issue naming the codes, refreshes it when the codes change, and closes it once aligned |
+| `install_self_check` (`forge-egress-aligned`) | `assert` | files an issue naming the codes, refreshes it when the codes change, and closes it once aligned or once no policy is configured |
 | `loom-daemon init` (`install-loom.sh`, `loom update`) | `doctor` | prints the findings; non-zero exit |
 | `/loom:sweep` pre-wave hygiene | `assert` | advisory text in the summary |
 

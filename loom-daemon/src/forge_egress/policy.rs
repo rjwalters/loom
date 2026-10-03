@@ -133,12 +133,21 @@ impl PolicySources {
                 path: p.clone(),
             });
         }
+        // The env and repo tiers are explicitly named, so they are always
+        // candidates (a missing named file resolves `Unreadable`). The machine
+        // tier is probed: only `NotFound` means absent. Any other error (e.g.
+        // EACCES under a root-owned 0700 `/etc/loom/forge-egress/`) means the
+        // policy is present-but-unreadable, so it still wins and resolves
+        // `Unreadable` (exit 2) — never a fall-through to the repo tier or to
+        // `unconfigured`. Matches 2am's `load_policy`, which skips only
+        // `FileNotFoundError`.
         if let Some(p) = &self.machine_path {
-            if std::fs::symlink_metadata(p).is_ok() {
-                out.push(Candidate {
+            match std::fs::symlink_metadata(p) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                _ => out.push(Candidate {
                     origin: Origin::Machine,
                     path: p.clone(),
-                });
+                }),
             }
         }
         if let Some(p) = &self.repo_path {

@@ -183,6 +183,51 @@ fn machine_wins_and_the_repo_policy_is_reported_ignored() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_machine_policy_that_cannot_be_stated_is_unreadable_not_absent() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let machine_path = write(&locked, "policy.json", &example());
+    let mut weaker = example();
+    weaker["enforcement"]["api"] = json!("observe");
+    let repo_path = write(dir.path(), "repo.json", &weaker);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root (or CAP_DAC_OVERRIDE) bypasses the denial: the precondition does
+    // not reproduce, so skip loudly rather than pass vacuously.
+    let denied = std::fs::symlink_metadata(&machine_path)
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+    let resolution = denied.then(|| {
+        resolve(&PolicySources {
+            env_path: None,
+            machine_path: Some(machine_path.clone()),
+            repo_path: Some(repo_path.clone()),
+        })
+    });
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let Some(resolution) = resolution else {
+        eprintln!("skipping: permission denial does not reproduce (running as root?)");
+        return;
+    };
+    let Resolution::Unreadable {
+        candidate, ignored, ..
+    } = resolution
+    else {
+        panic!("a denied machine policy must resolve Unreadable, got {resolution:?}")
+    };
+    assert_eq!(candidate.origin, Origin::Machine);
+    assert_eq!(
+        ignored,
+        vec![Candidate {
+            origin: Origin::Repo,
+            path: repo_path
+        }],
+        "the repo policy must never win over a present-but-unreadable machine policy"
+    );
+}
+
 #[test]
 fn an_unreadable_winner_never_falls_through() {
     let dir = tempfile::tempdir().unwrap();
