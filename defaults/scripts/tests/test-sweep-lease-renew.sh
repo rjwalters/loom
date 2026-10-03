@@ -1321,14 +1321,14 @@ sleep 12 &
 WATCH_PID_W=$!
 LOOP_PID_W="$("$SCRIPT" start 10021 --interval 1 --watch-pid "$WATCH_PID_W" --host w-host --sweep-id w-sweep 2> "$STUB_DIR/start-w-stderr.log")"
 W_WAITED=0
-while ((W_WAITED < 20)) && [[ "$(wc -l < "$STUB_DIR/patch-calls.log" 2> /dev/null | tr -d ' ')" -lt 3 ]]; do
+while ((W_WAITED < 20)) && [[ "$(cat "$STUB_DIR/patch-calls.log" 2> /dev/null | wc -l | tr -d ' ')" -lt 3 ]]; do
     sleep 0.5
     W_WAITED=$((W_WAITED + 1))
 done
 kill "$WATCH_PID_W" 2> /dev/null || true
 wait "$WATCH_PID_W" 2> /dev/null || true
 kill "$LOOP_PID_W" 2> /dev/null || true
-W_PATCHES="$(wc -l < "$STUB_DIR/patch-calls.log" 2> /dev/null | tr -d ' ')"
+W_PATCHES="$(cat "$STUB_DIR/patch-calls.log" 2> /dev/null | wc -l | tr -d ' ')"
 assert_true "$([[ "${W_PATCHES:-0}" -ge 3 ]] && echo true || echo false)" "(w9) the loop renewed over 3+ cycles (got ${W_PATCHES:-0})"
 assert_eq "1" "$(list_count 1)" "(w9) exactly ONE --paginate listing across all cycles"
 assert_true "$([[ "$(list_count 0)" -ge 2 ]] && echo true || echo false)" "(w9) later cycles use the non-paginated window read"
