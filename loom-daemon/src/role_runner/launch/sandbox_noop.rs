@@ -39,9 +39,14 @@
 //! 3. Account health is untouched: `SANDBOX_UNAVAILABLE` records no hold and
 //!    no `last_success` (`tokens_pool::health`).
 //!
-//! A Codex tick whose terminal record is `SUCCESS` proves the sandbox runs
-//! commands again, so it clears the hold at once instead of waiting for it to
-//! age out.
+//! A Codex tick whose terminal record is `SUCCESS` **and** whose region shows
+//! a shell command that ran to a ` succeeded in` result proves the sandbox
+//! runs commands again, so it clears the hold at once instead of waiting for
+//! it to age out. A `SUCCESS` that matches no no-op shape but shows no command
+//! succeeding either is no opinion and leaves the hold alone. robb-studio had
+//! two such ticks on 2026-10-03, where every shell call failed on a read-only
+//! sandbox registry lock with no exec echoed, and they must not clear a hold a
+//! real no-op armed.
 
 use super::super::read_role_log;
 use crate::tokens_pool::TerminalClassification;
@@ -61,7 +66,9 @@ pub(super) enum Verdict {
     /// The runtime's sandbox refused every tool call; carries the failure
     /// detail that replaces `Success`.
     NoOp(String),
-    /// The tick's record is `SUCCESS` and its region shows a tool call ran.
+    /// The tick's record is `SUCCESS` and its region shows a shell command
+    /// that ran to a ` succeeded in` result. Positive evidence only: a
+    /// region that merely matches no no-op shape is [`Self::NoOpinion`].
     Ran,
     /// Not a Codex tick, no admission, no readable/unique record, or any
     /// other category: no opinion, so nothing changes.
@@ -99,7 +106,12 @@ pub(super) fn verdict_in(contents: &str, runtime: &str, tick_anchor: &str) -> Ve
         }
         TerminalClassification::Success => match crate::codex_sandbox_noop::scan(region) {
             Some(noop) => Verdict::NoOp(describe(runtime, &noop.to_string())),
-            None => Verdict::Ran,
+            // Only positive evidence clears the hold. A SUCCESS whose region
+            // matches no no-op shape but shows no command running either
+            // (every call failed some other way without an echoed exec
+            // result) is no opinion, so the hold ages out as designed.
+            None if crate::codex_sandbox_noop::ran_a_command(region) => Verdict::Ran,
+            None => Verdict::NoOpinion,
         },
         _ => Verdict::NoOpinion,
     }
@@ -218,6 +230,26 @@ mod tests {
             panic!("expected the in-process scan to catch the no-op");
         };
         assert!(detail.contains("shape=exec-denied execs=1 denied=1 succeeded=0"), "{detail}");
+    }
+
+    #[test]
+    fn a_success_with_no_command_that_ran_is_no_opinion_and_keeps_the_hold() {
+        // robb-studio 2026-10-03T05:50Z, loom/judge: every shell call failed
+        // on a read-only sandbox registry lock, no exec was echoed, and the
+        // record said SUCCESS. No no-op shape matches, but nothing ran either,
+        // so this must not clear a hold a real no-op armed.
+        let body = "codex\nThe Judge review is blocked: shell commands fail before execution \
+                    because the sandbox's mount-registry lock is on a read-only filesystem.\n\
+                    tokens used\n25,969\n\
+                    # LOOM_TERMINAL_RESULT v=2 provider=codex account=robb category=SUCCESS \
+                    exit_code=0 model=none\n";
+        assert_eq!(verdict_in(&tick(ANCHOR, body), "codex", ANCHOR), Verdict::NoOpinion);
+        // An ordinary failed command with nothing succeeding is no proof either.
+        let body = "exec\n/bin/bash -lc 'cat nope' in /w\n exited 1 in 3ms:\n\
+                    cat: nope: No such file or directory\n\
+                    # LOOM_TERMINAL_RESULT v=2 provider=codex account=agent-1 category=SUCCESS \
+                    exit_code=0 model=none\n";
+        assert_eq!(verdict_in(&tick(ANCHOR, body), "codex", ANCHOR), Verdict::NoOpinion);
     }
 
     #[test]

@@ -120,6 +120,20 @@ fn is_exec_result(line: &str, verb: &str) -> bool {
     body.is_some_and(|duration| !duration.is_empty() && !duration.contains(':'))
 }
 
+/// Whether the captured output shows at least one shell command that ran to
+/// a ` succeeded in …:` result: positive evidence the sandbox runs commands.
+///
+/// [`scan`] returning `None` is not that evidence. It only means neither
+/// measured no-op shape matched, which is also true of a session where every
+/// call failed in some other way without echoing an exec result. For example,
+/// robb-studio 2026-10-03: "the sandbox's mount-registry lock is on a
+/// read-only filesystem", with zero exec lines. The role runner clears the
+/// host-wide hold only on this.
+#[must_use]
+pub fn ran_a_command(text: &str) -> bool {
+    text.lines().any(|line| is_exec_result(line, "succeeded"))
+}
+
 /// Scan a Codex session's captured output. `Some` only for a no-op.
 #[must_use]
 pub fn scan(text: &str) -> Option<NoOp> {
@@ -270,6 +284,22 @@ mod tests {
         let text = "exec\n/bin/bash -lc 'false' in /w\n exited 1 in 2ms:\nsome output first\n\
                     bwrap: No permissions to create a new namespace\n";
         assert_eq!(scan(text), None);
+    }
+
+    #[test]
+    fn only_a_succeeded_exec_is_proof_a_command_ran() {
+        assert!(ran_a_command(&format!("{BANNER}{SUCCEEDED}")));
+        assert!(ran_a_command(&format!("{BANNER}{DENIED}{SUCCEEDED}")));
+        assert!(!ran_a_command(&format!("{BANNER}{ORDINARY_FAIL}{PROSE}")));
+        assert!(!ran_a_command(&format!("{BANNER}{DENIED}{PROSE}")));
+        // No exec echoed at all: neither a no-op shape nor proof of a run.
+        let silent = format!(
+            "{BANNER}codex\nThe Judge review is blocked: shell commands fail before \
+             execution because the sandbox's mount-registry lock is on a read-only \
+             filesystem.\ntokens used\n25,969\n"
+        );
+        assert_eq!(scan(&silent), None);
+        assert!(!ran_a_command(&silent));
     }
 
     #[test]
