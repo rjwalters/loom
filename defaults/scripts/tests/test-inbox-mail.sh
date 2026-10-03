@@ -1,40 +1,71 @@
 #!/usr/bin/env bash
-# Tests the inbox_mail helper in defaults/docs/inbox-mail.md (#10000) against a
-# stubbed curl: unset env -> no-op, send/resolve payloads, failure is non-fatal,
-# plus doc-lint for the shared rule and labels.yml keeping operator-mechanical.
+# Tests the inbox_mail helper in defaults/docs/inbox-mail.md (#10000) against
+# stubbed curl/gh: unset env -> no-op (no curl, no gh), send/resolve payloads and
+# the Authorization header, failure is non-fatal, the origin-derived key, the
+# human-merge resolve path (resolve-merged), the hold file's loader with the doc
+# missing, plus doc-lint for the shared rule and labels.yml.
 set -u
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 fails=0
 ok() { echo "ok: $1"; }
 bad() { echo "FAIL: $1"; fails=$((fails+1)); }
+DOC="$ROOT/defaults/docs/inbox-mail.md"
+HOLD="$ROOT/defaults/.claude/commands/loom/champion-critical-file-hold.md"
 
-awk '/^```bash inbox-mail/{f=1;next} /^```/{f=0} f' "$ROOT/defaults/docs/inbox-mail.md" >"$T/fn.sh"
+awk '/^```bash inbox-mail/{f=1;next} /^```/{f=0} f' "$DOC" >"$T/fn.sh"
 [ -s "$T/fn.sh" ] || { echo "FAIL: no inbox-mail fence"; exit 1; }
 
 mkdir "$T/bin"
+# curl stub: logs the payload file AND the --config stdin (where the header lives).
 cat >"$T/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 echo called >>"$STUB_LOG"
+for a in "$@"; do echo "argv: $a" >>"$STUB_LOG"; done
 while [ $# -gt 0 ]; do [ "$1" = --data-binary ] && { cat "${2#@}" >>"$STUB_LOG"; echo >>"$STUB_LOG"; }; shift; done
-cat >/dev/null 2>&1 </dev/null || true
+sed 's/^/config: /' >>"$STUB_LOG"
 printf '{}\n%s' "${STUB_CODE:-200}"; exit "${STUB_RC:-0}"
 STUB
-chmod +x "$T/bin/curl"
-export PATH="$T/bin:$PATH" STUB_LOG="$T/log"
+# gh stub: `pr list --state merged` returns $GH_FIXTURE.
+cat >"$T/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+echo "gh $*" >>"$GH_LOG"
+cat "$GH_FIXTURE"
+STUB
+chmod +x "$T/bin/curl" "$T/bin/gh"
+export PATH="$T/bin:$PATH" STUB_LOG="$T/log" GH_LOG="$T/ghlog" GH_FIXTURE="$T/prs.json"
 # shellcheck disable=SC1091
 . "$T/fn.sh"
 
-: >"$STUB_LOG"; unset LOOM_UI_INBOX_URL LOOM_UI_INGEST_KEY
+now=$(date -u +%Y-%m-%dT%H:%M:%SZ); old=$(date -u -d '-3 days' +%Y-%m-%dT%H:%M:%SZ)
+M='<!-- champion:critical-file-hold -->'
+jq -n --arg now "$now" --arg old "$old" --arg m "$M" '[
+  {number: 11, mergedAt: $now, comments: [{body: ("## hold\n" + $m)}]},
+  {number: 12, mergedAt: $now, comments: [{body: "unrelated"}]},
+  {number: 13, mergedAt: $old, comments: [{body: $m}]}]' >"$GH_FIXTURE"
+
+: >"$STUB_LOG"; : >"$GH_LOG"; unset LOOM_UI_INBOX_URL LOOM_UI_INGEST_KEY
 out=$(inbox_mail send k1 "hello"); rc=$?
 { [ $rc -eq 0 ] && grep -q "not configured" <<<"$out" && [ ! -s "$STUB_LOG" ]; } && ok "unset env: no-op, no curl" || bad "unset env"
 out=$(inbox_mail resolve k1); rc=$?
 { [ $rc -eq 0 ] && [ ! -s "$STUB_LOG" ]; } && ok "unset env resolve: no-op" || bad "unset env resolve"
+inbox_mail on && bad "on: true while unconfigured" || ok "on: false while unconfigured"
+inbox_mail resolve-merged crithold-pr "$M" >/dev/null
+{ [ ! -s "$GH_LOG" ] && [ ! -s "$STUB_LOG" ]; } && ok "unset env resolve-merged: no gh read" || bad "unset env resolve-merged read the forge"
+
+# Key: from the origin remote, not the checkout directory name.
+git init -q "$T/issue-77" && git -C "$T/issue-77" remote add origin git@github.com:acme/widgets.git
+[ "$(cd "$T/issue-77" && inbox_mail key crithold-pr 5)" = mail-widgets-crithold-pr-5 ] && ok "key from origin (ssh)" || bad "key ssh: $(cd "$T/issue-77" && inbox_mail key crithold-pr 5)"
+git -C "$T/issue-77" remote set-url origin https://github.com/acme/widgets/
+[ "$(cd "$T/issue-77" && inbox_mail key crithold-pr 5)" = mail-widgets-crithold-pr-5 ] && ok "key from origin (https)" || bad "key https"
 
 export LOOM_UI_INBOX_URL=http://inbox.invalid LOOM_UI_INGEST_KEY=secret TO=@op:x
+inbox_mail on && ok "on: true when configured" || bad "on: configured"
 : >"$STUB_LOG"; inbox_mail send mail-loom-crithold-pr-1 "PR 1 needs a human merge" >/dev/null
-grep -q '"key": "mail-loom-crithold-pr-1"' "$STUB_LOG" && grep -q 'needs a human merge' "$STUB_LOG" && ! grep -q secret "$STUB_LOG" \
-  && ok "send payload keyed, no secret in body" || bad "send payload"
+grep -q '"key": "mail-loom-crithold-pr-1"' "$STUB_LOG" && grep -q 'needs a human merge' "$STUB_LOG" \
+  && ok "send payload keyed" || bad "send payload"
+grep -qx 'config: header = "Authorization: Bearer secret"' "$STUB_LOG" && ok "Authorization header via --config stdin" || bad "auth header"
+grep -q '^argv: .*secret' "$STUB_LOG" && bad "ingest key on argv" || ok "ingest key not on argv"
 : >"$STUB_LOG"; inbox_mail send mail-loom-crithold-pr-1 "PR 1 needs a human merge" >/dev/null
 [ "$(grep -c called "$STUB_LOG")" = 1 ] && grep -q '"key": "mail-loom-crithold-pr-1"' "$STUB_LOG" && ok "re-send reuses same key" || bad "re-send key"
 : >"$STUB_LOG"; inbox_mail resolve mail-loom-crithold-pr-1 >/dev/null
@@ -42,10 +73,29 @@ grep -q '"resolve": true' "$STUB_LOG" && grep -q '"key": "mail-loom-crithold-pr-
 out=$(STUB_CODE=500 STUB_RC=22 inbox_mail send k2 body); rc=$?
 { [ $rc -eq 0 ] && grep -q FAILED <<<"$out"; } && ok "failure is non-fatal" || bad "failure handling"
 
+# Human-merge path: a held PR merged outside Champion gets its mail resolved.
+: >"$STUB_LOG"; : >"$GH_LOG"
+(cd "$T/issue-77" && inbox_mail resolve-merged crithold-pr "$M" >/dev/null); rc=$?
+{ [ $rc -eq 0 ] && grep -q 'pr list --state merged' "$GH_LOG" \
+  && [ "$(grep -c called "$STUB_LOG")" = 1 ] && grep -q '"key": "mail-widgets-crithold-pr-11"' "$STUB_LOG" \
+  && grep -q '"resolve": true' "$STUB_LOG"; } && ok "resolve-merged: only recent held PR #11 resolved" || bad "resolve-merged selection"
+echo 'not json' >"$GH_FIXTURE"; (inbox_mail resolve-merged crithold-pr "$M" >/dev/null) && ok "resolve-merged: bad gh output non-fatal" || bad "resolve-merged rc"
+
+# The hold file's loader, run where the doc is missing: defines a no-op, `on` false.
+sed -n '/^_im=\$(awk/,/^type inbox_mail/p' "$HOLD" >"$T/loader.sh"
+[ "$(wc -l <"$T/loader.sh")" = 3 ] && ok "hold file carries the 3-line loader" || bad "loader not found in hold file"
+out=$(cd "$T" && bash -c '. ./loader.sh; inbox_mail send k b; echo "send=$?"; inbox_mail on; echo "on=$?"' 2>&1)
+{ grep -q 'send=0' <<<"$out" && grep -q 'on=1' <<<"$out" && ! grep -q 'not found' <<<"$out"; } && ok "missing doc: no-op fallback defined" || bad "missing doc fallback: $out"
+mkdir -p "$T/repo/.loom/docs" && cp "$DOC" "$T/repo/.loom/docs/"
+out=$(cd "$T/repo" && bash -c '. ../loader.sh; type inbox_mail | grep -c resolve-merged') && ok "doc present: loader evals the fence" || bad "loader with doc"
+
 grep -q 'Two ways to reach a human' "$ROOT/defaults/docs/label-state-machine.md" && ok "rule in label-state-machine.md" || bad "rule missing"
 [ "$(grep -rl --exclude-dir=tests 'a call is a decision, a human task is a mail' "$ROOT/defaults" | wc -l)" = 1 ] && ok "rule text appears once" || bad "rule text count"
 grep -q 'loom:operator-mechanical' "$ROOT/defaults/.github/labels.yml" && ok "operator-mechanical label kept" || bad "label removed"
-grep -q 'inbox_mail resolve' "$ROOT/defaults/.claude/commands/loom/champion-critical-file-hold.md" && ok "hold resolves mail" || bad "hold resolve missing"
-grep -q 'inbox_mail send' "$ROOT/defaults/.claude/commands/loom/champion-critical-file-hold.md" && ok "hold sends mail" || bad "hold send missing"
+grep -q 'inbox_mail resolve "\$CF_MAIL_KEY"' "$HOLD" && ok "hold resolves mail" || bad "hold resolve missing"
+grep -q 'inbox_mail send' "$HOLD" && ok "hold sends mail" || bad "hold send missing"
+grep -q 'inbox_mail on &&' "$HOLD" && ok "hold gates its forge read on inbox config" || bad "hold read ungated"
+grep -qF 'inbox_mail resolve-merged crithold-pr "<!-- champion:critical-file-hold -->"' \
+  "$ROOT/defaults/.claude/commands/loom/champion-pr-merge.md" && ok "Champion runs resolve-merged per pass" || bad "resolve-merged not wired"
 
 [ "$fails" -eq 0 ] && echo "ALL PASSED" || { echo "$fails failed"; exit 1; }

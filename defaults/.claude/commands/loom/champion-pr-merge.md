@@ -1575,6 +1575,9 @@ the ones sitting in a hold-only suspension (#6852) — both still carry
 
 ## Held-PR Census (report every pass, #6720)
 
+**Hold mail (#10000), once per pass:** a critical-file-held PR is merged by a human, never here, so resolve its mail by marker (no-op unconfigured; loader in `.loom/docs/inbox-mail.md`):
+`inbox_mail resolve-merged crithold-pr "<!-- champion:critical-file-hold -->"`
+
 A hold is invisible unless someone counts them. The 21-deep pile above was found
 only because an operator inspected PR labels by hand. Run this once per Champion
 pass — one `gh pr list` call — and put its output in the completion summary
@@ -2000,8 +2003,6 @@ fi
 # ABSENCE is the only evidence that no MERGE_RC was evaluated (#9096).
 echo "CHAMPION-MERGE-OUTCOME pr=$PR_NUMBER rc=$MERGE_RC"
 ```
-
-After `rc=0`, resolve that PR's critical-file-hold mail (`inbox_mail resolve`, key in [`champion-critical-file-hold.md`](champion-critical-file-hold.md), #10000).
 
 **No `CHAMPION-MERGE-OUTCOME` line in that output** — timed out, killed, empty —
 means the outcome is **unknown**: not a failure and not a re-queue code. Never

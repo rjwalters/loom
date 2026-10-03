@@ -75,9 +75,11 @@ PR_NUMBER=<number>
 HOLD_MARKER="<!-- champion:critical-file-hold -->"
 CLEARED_MARKER="<!-- champion:critical-file-hold-cleared -->"
 RELEASED_MARKER="<!-- champion:critical-file-release-respected -->"
-# Human-task mail (#10000): `inbox_mail` is the fence in `.loom/docs/inbox-mail.md` (no-op unconfigured).
-eval "$(awk '/^```bash inbox-mail/{f=1;next} /^```/{f=0} f' .loom/docs/inbox-mail.md 2>/dev/null)" 2>/dev/null || inbox_mail() { :; }
-CF_MAIL_KEY="mail-$(basename "$(git rev-parse --show-toplevel)")-crithold-pr-$PR_NUMBER"
+# Mail (#10000): `.loom/docs/inbox-mail.md`.
+_im=$(awk '/^```bash inbox-mail/{f=1;next} /^```/{f=0} f' .loom/docs/inbox-mail.md 2>/dev/null)
+[ -n "$_im" ] && eval "$_im"
+type inbox_mail >/dev/null 2>&1 || inbox_mail() { [ "$1" != on ]; }
+CF_MAIL_KEY=$(inbox_mail key crithold-pr "$PR_NUMBER")
 
 # Plain `gh` — NOT "$GH_READ": a cached label set misses a human's decision.
 # Markers count from TRUSTED authors only (#9548). Unauthenticated -> the raw
@@ -129,8 +131,8 @@ if [ "$CRITERION3_RESULT" = "FAIL" ]; then
     CF_ACTION=rearm         # a genuinely different diff, or a legacy hold
   fi
 
-  # Mail (#10000): once otherwise mergeable.
-  case "$CF_ACTION" in hold|rearm|stands)
+  # Mail (#10000) once otherwise mergeable; a human merge: `resolve-merged`.
+  case "$CF_ACTION" in hold|rearm|stands) inbox_mail on &&
     [ "$(gh pr view "$PR_NUMBER" --json mergeStateStatus -q .mergeStateStatus 2>/dev/null)" = CLEAN ] &&
       inbox_mail send "$CF_MAIL_KEY" "PR #$PR_NUMBER changes a critical file and needs a human merge: $(gh pr view "$PR_NUMBER" --json url -q .url)" ;; esac
 
