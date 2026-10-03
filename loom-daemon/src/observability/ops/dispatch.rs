@@ -74,6 +74,7 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
 /// |---|---|
 /// | `dispatched` | at least one sweep started |
 /// | `halted_main_red` | a main-health gate held a workspace |
+/// | `halted_ci_billing` | as above, but an owner's Actions jobs are billing-blocked (#10113) |
 /// | `saturation_held` | the saturation admission brake was engaged |
 /// | `build_backoff_held` | the build back-off (#9410) was engaged |
 /// | `error` | a dispatch or listing failed and nothing started |
@@ -82,8 +83,16 @@ pub fn decision_counts(report: &TickReport) -> [(&'static str, usize); 26] {
 /// | `all_skipped` | every candidate was skipped for a per-issue reason |
 #[must_use]
 pub fn tick_result(report: &TickReport) -> &'static str {
+    tick_result_with(report, crate::ci_telemetry::billing::any_blocked())
+}
+
+/// [`tick_result`] with the billing-block signal passed in (a pure seam).
+#[must_use]
+pub fn tick_result_with(report: &TickReport, billing_blocked: bool) -> &'static str {
     if report.dispatched > 0 {
         "dispatched"
+    } else if report.halted && billing_blocked {
+        "halted_ci_billing"
     } else if report.halted {
         "halted_main_red"
     } else if report.saturation_held {
