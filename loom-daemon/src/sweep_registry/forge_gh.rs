@@ -37,22 +37,6 @@ impl SweepRegistry {
             None => inv,
         }
     }
-
-    /// [`gh`](Self::gh) typed to `owner/repo` (a `gh api repos/{owner}/{repo}/…`
-    /// call that already resolved its slug).
-    pub(crate) fn gh_for_repo(
-        &self,
-        operation: &'static str,
-        intent: AccessIntent,
-        owner: &str,
-        repo: &str,
-    ) -> GhInvocation {
-        let target = GhTarget::Repo {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-        };
-        self.gh(operation, intent, target)
-    }
 }
 
 /// `["--repo", $LOOM_REPO]` when the machine-global override is set, else
