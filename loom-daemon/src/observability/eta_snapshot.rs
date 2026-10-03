@@ -145,9 +145,24 @@ pub fn is_changed(now: u64, last: Option<u64>) -> bool {
     last != Some(now)
 }
 
+/// Cut rank under the [`MAX_ROWS`] cap; lower survives first (#10052).
+/// `land` estimates (with a `p50`) answer the dashboard's ETA column, so they
+/// outrank `land` refusals, which outrank every `start`/`finish` row.
+fn cap_rank(estimate: &EstimateSummary) -> u8 {
+    match (estimate.kind, estimate.p50_sec.is_some()) {
+        (Kind::Land, true) => 0,
+        (Kind::Land, false) => 1,
+        _ => 2,
+    }
+}
+
 /// Build the record for `selected` (already in row order). `visibility` tags
 /// each repo; a repo absent from it is [`RepoVisibility::Private`], the
-/// safe default. Pure.
+/// safe default.
+///
+/// The [`MAX_ROWS`] cap is applied by priority ([`cap_rank`]), not by sort
+/// order, so no repo loses its `land` estimates for sorting late (#10052);
+/// the survivors are then restored to `(repo, issue, kind)` order. Pure.
 #[must_use]
 pub fn build_record(
     selected: &[EstimateSummary],
@@ -158,9 +173,19 @@ pub fn build_record(
         .map(|estimate| estimate.as_of)
         .max()
         .unwrap_or_else(chrono::Utc::now);
-    let rows: Vec<EtaSnapshotRow> = selected
-        .iter()
-        .take(MAX_ROWS)
+    let mut ranked: Vec<&EstimateSummary> = selected.iter().collect();
+    // Stable: within a rank the incoming (repo, issue, kind) order holds.
+    ranked.sort_by_key(|estimate| cap_rank(estimate));
+    let mut rows_truncated_by_kind: BTreeMap<Kind, usize> = BTreeMap::new();
+    for dropped in ranked.iter().skip(MAX_ROWS) {
+        *rows_truncated_by_kind.entry(dropped.kind).or_insert(0) += 1;
+    }
+    ranked.truncate(MAX_ROWS);
+    ranked.sort_by_cached_key(|estimate| {
+        (estimate.repo.to_ascii_lowercase(), estimate.issue, estimate.kind)
+    });
+    let rows: Vec<EtaSnapshotRow> = ranked
+        .into_iter()
         .map(|estimate| EtaSnapshotRow {
             repo: estimate.repo.clone(),
             visibility: visibility
@@ -183,6 +208,7 @@ pub fn build_record(
     EtaSnapshotRecord {
         as_of,
         rows_truncated: selected.len().saturating_sub(rows.len()),
+        rows_truncated_by_kind,
         rows,
     }
 }
@@ -237,9 +263,10 @@ pub(super) async fn record() {
     }
     let record = build_record(&selected, &visibility);
     log::debug!(
-        "eta.snapshot: {} row(s) ({} truncated), as_of={}",
+        "eta.snapshot: {} row(s) ({} truncated: {:?}), as_of={}",
         record.rows.len(),
         record.rows_truncated,
+        record.rows_truncated_by_kind,
         record.as_of
     );
     sink.push(record);
