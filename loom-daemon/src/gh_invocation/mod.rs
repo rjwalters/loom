@@ -22,12 +22,18 @@
 //! - `tests/gh_spawn_choke_point.rs` — the CI scan whose checked-in allowlist
 //!   of today's raw sites may only shrink.
 //!
-//! No existing call site is migrated in slice 1; behaviour is unchanged.
-//! Telemetry (`invoke github` spans and local completion records), `gh-cached`
-//! substitution for reads, the async/tokio variant and the Gitea decline move
-//! in with the slices that first need them (see #9985's slicing plan).
+//! - [`telemetry`] (slice 3) — one `invoke github` span per execution and a
+//!   local completion record for every non-`ok` [`telemetry::Outcome`].
+//! - [`GhInvocation::run`] (slice 3) — the `cmd_out::CmdOutcome` bridge, so
+//!   a migrated `run_command` site keeps its exact result classification.
+//!
+//! `gh-cached` substitution for reads, the async/tokio variant and the Gitea
+//! decline move in with the slices that first need them (see #9985's slicing
+//! plan).
 
+mod outcome;
 pub mod resolver;
+pub mod telemetry;
 
 #[cfg(test)]
 mod tests;
@@ -165,12 +171,22 @@ pub enum ParentContext {
     /// The invocation runs inside a traced execution (a sweep, a role run).
     Parent(TraceContext),
     /// No parent: an ad-hoc daemon tick. Recorded as `context_source=missing`;
-    /// any ambient `TRACEPARENT` is stripped from the child rather than
-    /// silently inherited.
+    /// a third-party `TRACEPARENT` in the environment is never inherited.
     Missing,
 }
 
 impl ParentContext {
+    /// The process's ambient execution context: the validated
+    /// `LOOM_TRACEPARENT` a traced sweep exports to its children (so a CLI
+    /// run inside a sweep parents its invocations to that sweep's trace),
+    /// else [`ParentContext::Missing`]. The daemon itself carries none, so
+    /// its concurrent invocations never share an ambient parent — a daemon
+    /// seam that has one passes it explicitly with [`GhInvocation::parent`].
+    #[must_use]
+    pub fn ambient() -> Self {
+        telemetry::ambient_parent().map_or(ParentContext::Missing, ParentContext::Parent)
+    }
+
     /// The `context_source` attribute value.
     #[must_use]
     pub fn source(&self) -> &'static str {
@@ -223,8 +239,8 @@ pub struct GhInvocation {
 }
 
 impl GhInvocation {
-    /// A new invocation. Defaults: no parent context
-    /// ([`ParentContext::Missing`]), no working directory (the daemon's own),
+    /// A new invocation. Defaults: the ambient parent context
+    /// ([`ParentContext::ambient`]), no working directory (the daemon's own),
     /// captured output with `timeout`.
     #[must_use]
     pub fn new(
@@ -237,7 +253,7 @@ impl GhInvocation {
             operation,
             intent,
             target,
-            parent: ParentContext::Missing,
+            parent: ParentContext::ambient(),
             contract: OutputContract::Captured { timeout },
             args: Vec::new(),
             cwd: None,
@@ -301,7 +317,8 @@ impl GhInvocation {
         self.contract
     }
 
-    /// The environment the child receives, in application order.
+    /// The environment the child receives, in application order, when its
+    /// `traceparent` is `child_context` (see [`telemetry::InvocationSpan`]).
     ///
     /// - `GH_CONFIG_DIR`: the cross-owner credential registered for the
     ///   working directory, else for the target's owner (the
@@ -309,14 +326,20 @@ impl GhInvocation {
     ///   lookups). Absent ⇒ the child inherits the process-global value.
     /// - `GH_REPO`: the typed target, else the machine-global `LOOM_REPO`
     ///   override (`gh_repo_env::apply_loom_repo_override`'s contract).
-    /// - `LOOM_TRACEPARENT` / `TRACEPARENT`: set together from the parent, or
-    ///   both removed when there is none.
+    /// - `LOOM_TRACEPARENT` / `TRACEPARENT`: set together from
+    ///   `child_context` — the invocation's own span when it is exported, so
+    ///   the managed launcher (C4) parents its HTTP spans under it — or both
+    ///   removed when there is none.
     #[must_use]
-    pub fn env_plan(&self) -> Vec<EnvEntry> {
-        self.env_plan_with(std::env::var_os("LOOM_REPO"))
+    pub fn env_plan(&self, child_context: Option<&TraceContext>) -> Vec<EnvEntry> {
+        self.env_plan_with(std::env::var_os("LOOM_REPO"), child_context)
     }
 
-    fn env_plan_with(&self, loom_repo: Option<OsString>) -> Vec<EnvEntry> {
+    fn env_plan_with(
+        &self,
+        loom_repo: Option<OsString>,
+        child_context: Option<&TraceContext>,
+    ) -> Vec<EnvEntry> {
         let mut plan = Vec::new();
         let slug = self.target.slug();
         let config_dir = self
@@ -339,10 +362,7 @@ impl GhInvocation {
                 value: Some(repo),
             });
         }
-        let traceparent = match &self.parent {
-            ParentContext::Parent(ctx) => Some(OsString::from(ctx.traceparent())),
-            ParentContext::Missing => None,
-        };
+        let traceparent = child_context.map(|ctx| OsString::from(ctx.traceparent()));
         for key in [TRACEPARENT_ENV, W3C_TRACEPARENT_ENV] {
             plan.push(EnvEntry {
                 key,
@@ -353,13 +373,13 @@ impl GhInvocation {
     }
 
     /// Assemble the child. Private: the facade owns execution.
-    fn command(&self, program: &str) -> Command {
+    fn command(&self, program: &str, child_context: Option<&TraceContext>) -> Command {
         let mut cmd = Command::new(program);
         cmd.args(&self.args);
         if let Some(dir) = &self.cwd {
             cmd.current_dir(dir);
         }
-        for entry in self.env_plan() {
+        for entry in self.env_plan(child_context) {
             match entry.value {
                 Some(value) => cmd.env(entry.key, value),
                 None => cmd.env_remove(entry.key),
@@ -369,7 +389,8 @@ impl GhInvocation {
     }
 
     /// Resolve the executable ([`resolver::resolve`]) and run the invocation
-    /// under its [`OutputContract`].
+    /// under its [`OutputContract`], recording one `invoke github` span (and,
+    /// unless it succeeded, a local completion record — [`telemetry`]).
     ///
     /// # Errors
     ///
@@ -377,25 +398,32 @@ impl GhInvocation {
     /// [`ExecError::Collect`] when it started but its result could not be
     /// collected (side effects may have happened — never retry a write on it).
     pub fn execute(self) -> Result<GhCompletion, ExecError> {
-        self.execute_with(&resolver::resolve().program)
+        let resolved = resolver::resolve();
+        self.execute_with(&resolved.program, resolved.source)
     }
 
-    fn execute_with(self, program: &str) -> Result<GhCompletion, ExecError> {
-        let mut cmd = self.command(program);
+    fn execute_with(self, program: &str, source: GhBinSource) -> Result<GhCompletion, ExecError> {
+        let span = telemetry::InvocationSpan::open(&self);
+        let mut cmd = self.command(program, span.child_context(&self.parent));
         match self.contract {
             OutputContract::Captured { timeout } => {
                 cmd.stdin(Stdio::null());
-                proc_exec::run_bounded(cmd, timeout).map(GhCompletion::Captured)
+                let result = proc_exec::run_bounded(cmd, timeout);
+                let (outcome, code) = telemetry::classify_captured(&result);
+                span.finish(&self, source, outcome, code);
+                result.map(GhCompletion::Captured)
             }
             OutputContract::Passthrough => {
                 cmd.stdin(Stdio::inherit())
                     .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit());
-                let mut child = cmd.spawn().map_err(ExecError::Spawn)?;
-                child
-                    .wait()
-                    .map(GhCompletion::Passthrough)
-                    .map_err(ExecError::Collect)
+                let result = cmd
+                    .spawn()
+                    .map_err(ExecError::Spawn)
+                    .and_then(|mut child| child.wait().map_err(ExecError::Collect));
+                let (outcome, code) = telemetry::classify_passthrough(&result);
+                span.finish(&self, source, outcome, code);
+                result.map(GhCompletion::Passthrough)
             }
         }
     }

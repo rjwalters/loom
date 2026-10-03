@@ -71,8 +71,6 @@ src/merge_pr/consolidate.rs | let mut cmd = Command::new(gh_bin);
 src/merge_pr/head_sync/fetch.rs | let out = Command::new(gh_bin())
 src/merge_pr/stacked_children.rs | let out = Command::new(gh)
 src/merge_pr/stale_checks/fetch.rs | let out = Command::new(gh)
-src/metrics_collector.rs | let output = Command::new("gh")
-src/metrics_collector.rs | match Command::new("gh").args(["api", "rate_limit"]).output() {
 src/observability/collector.rs | let mut cmd = tokio::process::Command::new("gh");
 src/observability/eta.rs | let mut cmd = Command::new("gh");
 src/observability/ops/stage_dwell.rs | let mut cmd = Command::new("gh");
@@ -83,7 +81,6 @@ src/quarantine_reconciliation.rs | let mut cmd = Command::new(gh_bin);
 src/quarantine_reconciliation.rs | let mut cmd = Command::new(gh_bin);
 src/quarantine_reconciliation.rs | let mut cmd = Command::new(gh_bin);
 src/quarantine_reconciliation.rs | let mut cmd = Command::new(gh_bin);
-src/rate_limit_breaker.rs | let output = Command::new(gh_bin)
 src/reclaim_pr_warning.rs | let mut cmd = std::process::Command::new(gh_bin);
 src/release_fetch/fetch.rs | let mut cmd = Command::new("gh");
 src/role_runner/roster.rs | let mut cmd = Command::new(gh);
