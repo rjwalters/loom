@@ -18,8 +18,16 @@
 //! Only a **found** answer is stored ([`ReadCache::get_or`] never caches a
 //! `None`): a failed read is indistinguishable from an absent one at most of
 //! these sites, and caching a failure could hide a live claim's heartbeat.
-//! An entry is also dropped after [`MAX_AGE`] regardless — a backstop for
-//! anything that changes without bumping the version (an edited comment).
+//! An entry is also dropped after its cache's expiry regardless — a backstop
+//! for anything that changes without bumping the version (an edited comment).
+//!
+//! The two claim caches expire after [`CLAIM_MAX_AGE`] rather than
+//! [`MAX_AGE`]: `updatedAt` has 1 s granularity and can lag the timeline /
+//! comments endpoints, so a label event or heartbeat landing in the same
+//! second as a cached read (or a listing ahead of the timeline read) can
+//! leave a stale answer under the new key. For the claim heartbeat a stale,
+//! older timestamp could make a live claim look inactive, so that window is
+//! held to about one tick.
 //!
 //! Kill switch: [`READ_CACHE_ENV`] (`0`/`false`/`off`/`no` disables).
 
@@ -36,28 +44,41 @@ pub const READ_CACHE_ENV: &str = "LOOM_RECONCILE_READ_CACHE";
 /// The age past which an entry is re-read even with an unchanged version.
 pub const MAX_AGE: Duration = Duration::from_secs(3600);
 
+/// The shorter expiry for the claim-label timeline / claim-activity caches,
+/// whose stale answer can misjudge a live claim (see the module docs). 15 min
+/// still spans one default 10-min tick, so an unchanged claim is re-read at
+/// most every other pass.
+pub const CLAIM_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+
 /// Entries per cache before expired ones are swept (and, failing that, the
 /// cache is cleared) — bounds memory by PR count, never by tick count.
 const MAX_ENTRIES: usize = 4096;
 
 /// A claimed PR's newest `labeled <claim label>` instant.
-pub(super) static CLAIM_LABELED: ReadCache<DateTime<Utc>> = ReadCache::new();
+pub(super) static CLAIM_LABELED: ReadCache<DateTime<Utc>> = ReadCache::new(CLAIM_MAX_AGE);
 /// A claimed PR's newest trusted claim-activity comment since that label.
-pub(super) static CLAIM_ACTIVITY: ReadCache<DateTime<Utc>> = ReadCache::new();
+pub(super) static CLAIM_ACTIVITY: ReadCache<DateTime<Utc>> = ReadCache::new(CLAIM_MAX_AGE);
 /// A verdict PR's comment scan: `(latest marker sha, already recorded)`.
-pub(super) static VERDICT_SCAN: ReadCache<(Option<String>, bool)> = ReadCache::new();
-/// An open PR's changed paths.
-pub(super) static CHANGED_FILES: ReadCache<BTreeSet<String>> = ReadCache::new();
+/// Both halves are computed AFTER trusted-author filtering, so a change to
+/// the comment-trust configuration is not seen here until the entry expires.
+pub(super) static VERDICT_SCAN: ReadCache<(Option<String>, bool)> = ReadCache::new(MAX_AGE);
+/// An open PR's changed paths. Keyed on the base branch NAME, not its SHA —
+/// an approximation: a base that advances without the head moving keeps the
+/// cached set until [`MAX_AGE`] (the PR's own diff rarely changes from that).
+pub(super) static CHANGED_FILES: ReadCache<BTreeSet<String>> = ReadCache::new(MAX_AGE);
 
 /// One process-wide cache of found answers, keyed by [`key`].
 pub(super) struct ReadCache<V> {
     entries: Mutex<Option<HashMap<String, (Instant, V)>>>,
+    /// The age past which an entry is re-read even with an unchanged version.
+    max_age: Duration,
 }
 
 impl<V: Clone> ReadCache<V> {
-    const fn new() -> Self {
+    const fn new(max_age: Duration) -> Self {
         Self {
             entries: Mutex::new(None),
+            max_age,
         }
     }
 
@@ -76,7 +97,7 @@ impl<V: Clone> ReadCache<V> {
         if let Ok(mut guard) = self.entries.lock() {
             let map = guard.get_or_insert_with(HashMap::new);
             match map.get(&key) {
-                Some((at, v)) if now.duration_since(*at) < MAX_AGE => return Some(v.clone()),
+                Some((at, v)) if now.duration_since(*at) < self.max_age => return Some(v.clone()),
                 Some(_) => {
                     map.remove(&key);
                 }
@@ -87,7 +108,8 @@ impl<V: Clone> ReadCache<V> {
         if let Ok(mut guard) = self.entries.lock() {
             let map = guard.get_or_insert_with(HashMap::new);
             if map.len() >= MAX_ENTRIES {
-                map.retain(|_, (at, _)| now.duration_since(*at) < MAX_AGE);
+                let max_age = self.max_age;
+                map.retain(|_, (at, _)| now.duration_since(*at) < max_age);
                 if map.len() >= MAX_ENTRIES {
                     map.clear();
                 }

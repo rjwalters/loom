@@ -23,7 +23,7 @@ fn cached<T>(f: impl FnOnce() -> T) -> T {
 
 #[test]
 fn a_found_answer_is_reused_and_a_missing_one_is_not() {
-    let cache: ReadCache<u32> = ReadCache::new();
+    let cache: ReadCache<u32> = ReadCache::new(MAX_AGE);
     let calls = Cell::new(0);
     let fetch = |v: Option<u32>| {
         calls.set(calls.get() + 1);
@@ -50,6 +50,35 @@ fn a_found_answer_is_reused_and_a_missing_one_is_not() {
         assert_eq!(key(root, 3, "x", None), None);
         assert_eq!(key(root, 3, "x", Some("")), None);
     });
+}
+
+#[test]
+fn an_expired_entry_is_re_read_under_the_same_version() {
+    // A zero expiry: every entry is already past it.
+    let cache: ReadCache<u32> = ReadCache::new(Duration::ZERO);
+    let calls = Cell::new(0);
+    cached(|| {
+        let k = || key(Path::new("/r"), 1, "x", Some("v1"));
+        for _ in 0..3 {
+            cache.get_or(k(), || {
+                calls.set(calls.get() + 1);
+                Some(1)
+            });
+        }
+    });
+    assert_eq!(calls.get(), 3, "an expired entry is never served");
+}
+
+#[test]
+fn the_claim_caches_expire_within_about_one_tick() {
+    // `updatedAt` can lag the timeline endpoint (1 s granularity), so a
+    // stale claim heartbeat must not outlive ~one tick (#10096 review).
+    assert!(CLAIM_MAX_AGE <= Duration::from_secs(15 * 60));
+    assert!(CLAIM_MAX_AGE >= Duration::from_secs(10 * 60), "still spans one 10-min tick");
+    assert_eq!(CLAIM_LABELED.max_age, CLAIM_MAX_AGE);
+    assert_eq!(CLAIM_ACTIVITY.max_age, CLAIM_MAX_AGE);
+    assert_eq!(VERDICT_SCAN.max_age, MAX_AGE);
+    assert_eq!(CHANGED_FILES.max_age, MAX_AGE);
 }
 
 #[test]
