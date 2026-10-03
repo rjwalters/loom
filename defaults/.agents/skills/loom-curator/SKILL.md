@@ -212,8 +212,8 @@ loom-daemon forge starred --kind issue \
   --without loom:issue,loom:curating,loom:building,loom:blocked,loom:operator-only,loom:operator-decision
 ```
 
-Take them in output order: highest level first, then earliest star first
-(#9974, #10307; exit 5 = no answer, not empty). Curate each at once (no workflow label = treat as `loom:triage`), then add
+Take them in order: highest level, then earliest star (#9974, #10307; exit 5 = no answer, not
+empty). Curate each at once (no workflow label = treat as `loom:triage`), then add
 `loom:curated` and `loom:issue` in ONE `gh issue edit`. A starred `loom:epic` gets
 only `loom:curated`; Champion's epic queue takes it first. Hard exclusions still
 apply. A star never evicts work in flight. Star or unstar only on the operator's
