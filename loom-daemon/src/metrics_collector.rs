@@ -23,6 +23,13 @@ use std::process::Command;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::cmd_out::CmdOutcome;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+
+/// Deadline for this collector's `gh` calls (#9985: they used to have none,
+/// so a wedged `gh` hung the collector thread forever).
+const GH_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Configuration for metrics collection
 #[derive(Debug, Clone)]
 pub struct MetricsConfig {
@@ -95,6 +102,8 @@ struct GitHubEventItem {
 struct EventCollectionConfig {
     /// Resource type for gh CLI subcommand ("pr" or "issue")
     resource_type: &'static str,
+    /// The `github.operation` of the list call ("pr.list" / "issue.list")
+    operation: &'static str,
     /// State filter for gh CLI ("merged" or "closed")
     state: &'static str,
     /// Query prefix for date filtering ("merged:>" or "closed:>")
@@ -283,10 +292,19 @@ fn collect_and_store_events(config: &MetricsConfig) -> Result<usize> {
 /// `gh api rate_limit` is an account/token-level probe with no `owner/repo`
 /// target and no checkout-root `current_dir` — it reports the limits of
 /// whatever token is ambient, which is exactly what a global pre-flight check
-/// wants. There is no cross-owner repo to key a credential off of here.
+/// wants. There is no cross-owner repo to key a credential off of here
+/// (the facade's `GhTarget::None` with no working directory applies none).
 fn check_rate_limit() -> bool {
-    match Command::new("gh").args(["api", "rate_limit"]).output() {
-        Ok(output) if output.status.success() => {
+    let probe = GhInvocation::new(
+        Operation::new("api.rate_limit"),
+        AccessIntent::Read,
+        GhTarget::None,
+        GH_TIMEOUT,
+    )
+    .args(["api", "rate_limit"])
+    .run();
+    match probe {
+        CmdOutcome::Ran(output) if output.status.success() => {
             match serde_json::from_slice::<RateLimitResponse>(&output.stdout) {
                 Ok(rate_info) => {
                     let remaining = rate_info.resources.core.remaining;
@@ -302,7 +320,7 @@ fn check_rate_limit() -> bool {
                 }
             }
         }
-        Ok(_) | Err(_) => {
+        CmdOutcome::Ran(_) | CmdOutcome::Unavailable(_) => {
             log::warn!("Failed to check rate limit, proceeding anyway");
             true // Assume OK if command fails
         }
@@ -317,6 +335,7 @@ fn collect_pr_events(
 ) -> Result<usize> {
     static PR_CONFIG: EventCollectionConfig = EventCollectionConfig {
         resource_type: "pr",
+        operation: "pr.list",
         state: "merged",
         query_prefix: "merged:>",
         json_fields: "number,mergedAt,author",
@@ -334,6 +353,7 @@ fn collect_issue_events(
 ) -> Result<usize> {
     static ISSUE_CONFIG: EventCollectionConfig = EventCollectionConfig {
         resource_type: "issue",
+        operation: "issue.list",
         state: "closed",
         query_prefix: "closed:>",
         json_fields: "number,closedAt,author",
@@ -375,10 +395,21 @@ fn collect_github_events(
         args.push(query);
     }
 
-    let output = Command::new("gh")
-        .args(&args)
-        .output()
-        .with_context(|| format!("Failed to execute gh {} list", event_config.resource_type))?;
+    let target = GhTarget::repo(&repo_string).map_err(|e| anyhow!("{e}: {repo_string:?}"))?;
+    let output = match GhInvocation::new(
+        Operation::new(event_config.operation),
+        AccessIntent::Read,
+        target,
+        GH_TIMEOUT,
+    )
+    .args(&args)
+    .run()
+    {
+        CmdOutcome::Ran(output) => output,
+        CmdOutcome::Unavailable(u) => {
+            return Err(anyhow!("Failed to execute gh {} list: {u}", event_config.resource_type));
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
