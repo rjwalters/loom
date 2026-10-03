@@ -188,7 +188,11 @@ pub fn assert_no_github_token(policy: &Value, obs: &Observed) -> Vec<Finding> {
 /// API profile (`gh auth git-credential`), #9986.
 #[must_use]
 pub fn assert_git_credential_separation(policy: &Value, obs: &Observed) -> Vec<Finding> {
-    if super::policy::is_observe_only(policy) || !obs.git_helper_is_gh {
+    // Same rule as `assert_no_github_token`: an unknown schema version stays
+    // "verification incomplete", never a finding judged under it.
+    let understood =
+        policy.get("schemaVersion").and_then(Value::as_u64) == Some(super::report::SCHEMA_VERSION);
+    if !understood || super::policy::is_observe_only(policy) || !obs.git_helper_is_gh {
         return vec![];
     }
     vec![Finding::new(
