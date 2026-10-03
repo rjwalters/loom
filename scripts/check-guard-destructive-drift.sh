@@ -178,6 +178,7 @@ _resolve_canonical_ref() {
     auth_header=(-H "Authorization: Bearer $token")
   fi
 
+  # loom:egress-uncovered=dev-tooling (#9988): maintainer drift check, not managed-workload traffic.
   local latest_tag
   latest_tag="$(curl -fsSL --max-time 15 "${auth_header[@]}" \
     "https://api.github.com/repos/${CANONICAL_OWNER_REPO}/tags" 2>/dev/null \
@@ -199,6 +200,7 @@ _fetch_canonical() {
   local ref="$1"
   local tmp
   tmp="$(mktemp)"
+  # loom:egress-uncovered=dev-tooling (#9988): maintainer drift check, not managed-workload traffic.
   if curl -fsSL --max-time 20 \
       "https://raw.githubusercontent.com/${CANONICAL_OWNER_REPO}/${ref}/${CANONICAL_PATH_IN_REPO}" \
       -o "$tmp" 2>/dev/null \
