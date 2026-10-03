@@ -396,9 +396,9 @@ pub fn gitea_config_from_forge(forge: &Value) -> Result<GiteaConfig> {
 // Command dispatch
 // ---------------------------------------------------------------------------
 
-/// Resolve the `gh` binary name (honoring `LOOM_GH_BIN` for tests / overrides).
+/// Resolve the `gh` binary name — delegates to the single resolver (#9985).
 pub(crate) fn gh_bin() -> String {
-    std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
+    crate::gh_invocation::gh_bin()
 }
 
 /// Passthrough the given `gh` args (entity prepended), inheriting stdio and
