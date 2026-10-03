@@ -43,9 +43,12 @@ Two credential modes exist:
   lookup, `access_tokens` mint) are the **only** direct REST-host egress
   in Loom, the inventoried bootstrap exception; each carries the
   `loom:egress-exception=github-app-bootstrap` marker.
-- **Proxied (gateway-owned).** Once the egress policy lands (#9984/#9986), the
-  gateway mints and the script's direct path is skipped. The `credentialRef`
-  gate in `github-app-token.sh` is deferred until a policy reader exists.
+- **Proxied (gateway-owned).** When the resolved egress policy
+  ([forge-egress](forge-egress.md), read via `loom-daemon forge egress
+  policy`) sets `principal.credentialRef`, the gateway mints:
+  `github-app-token.sh get-token` exits `78` with "proxied host: App minting
+  is gateway-owned" and makes no request. No policy, or a daemon too old to
+  answer, leaves App minting unchanged.
 
 `gh` resolution order: the managed shim first on `PATH` (#9987), then the
 system `gh`; `LOOM_GH_BIN` overrides the binary for the daemon, `gh-cached`
