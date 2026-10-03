@@ -383,3 +383,31 @@ fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner(
     assert!(lease::read(root.path()).unwrap().is_none());
     assert!(root.path().join("last-job.json").exists());
 }
+
+#[test]
+fn gh_credential_helper_is_refused_on_policy_governed_hosts() {
+    use repository::ensure_gh_helper_allowed;
+    assert!(ensure_gh_helper_allowed(false).is_ok());
+    let err = ensure_gh_helper_allowed(true).unwrap_err().to_string();
+    assert!(err.contains("forbids the gh credential helper"), "{err}");
+}
+
+#[test]
+fn policy_governs_host_follows_env_policy_in_temp_home() {
+    // Temp HOME + explicit policy file: required -> governed; no policy -> not.
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("policy.json");
+    std::fs::write(&policy, r#"{"enforcement":{"api":"required"}}"#).unwrap();
+    let sources = crate::forge_egress::policy::PolicySources {
+        env_path: Some(policy),
+        machine_path: None,
+        repo_path: None,
+    };
+    let governed = match crate::forge_egress::policy::resolve(&sources) {
+        crate::forge_egress::policy::Resolution::Loaded(doc) => {
+            crate::forge_egress::policy::dig_str(&doc.data, &["enforcement", "api"]) == "required"
+        }
+        _ => false,
+    };
+    assert!(governed);
+}

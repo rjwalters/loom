@@ -320,12 +320,36 @@ fn credential(operation: &str) -> Result<()> {
             }
         }
     }
+    ensure_gh_helper_allowed(policy_governs_host())?;
     let mut helper = Command::new("gh").args(["auth", "git-credential", "get"])
         .stdin(Stdio::piped()).stdout(Stdio::inherit()).stderr(Stdio::null()).spawn()
         .context("forge authentication unavailable; provide an external gh profile or supported token environment")?;
     helper.stdin.take().unwrap().write_all(request.as_bytes())?;
     if !helper.wait()?.success() {
         bail!("forge authentication helper failed");
+    }
+    Ok(())
+}
+
+/// True when a forge-egress policy with `enforcement.api = required` governs
+/// this host (#10050): git credentials must then never come from `gh`.
+fn policy_governs_host() -> bool {
+    use crate::forge_egress::policy::{dig_str, resolve, PolicySources, Resolution};
+    match resolve(&PolicySources::from_process(None)) {
+        Resolution::Loaded(doc) => dig_str(&doc.data, &["enforcement", "api"]) == "required",
+        _ => false,
+    }
+}
+
+/// Fail closed on a policy-governed host instead of spawning
+/// `gh auth git-credential`.
+pub(super) fn ensure_gh_helper_allowed(governed: bool) -> Result<()> {
+    if governed {
+        bail!(
+            "forge-egress policy (enforcement.api=required) forbids the gh credential helper; \
+             use SSH (gh config git_protocol=ssh once gitOrigin.rollout is qualified) or a \
+             dedicated git credential, or supply GH_TOKEN/GITEA_TOKEN in the environment"
+        );
     }
     Ok(())
 }
