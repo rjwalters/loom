@@ -27,10 +27,20 @@
 //! 4. **A readable bridge.** Workspace-independent: the named workspace's own
 //!    `.loom/hooks/guard-codex-bridge.sh`, because that is what the entry will
 //!    run there. Pinned: the named bridge.
-//! 5. **Codex trust**, by the #5005 baseline diff: a `trusted_hash` exists
-//!    that was not already present when Loom's current entry was installed
-//!    (the receipt's `trustBaselineHashes`). A receipt from before that field
-//!    existed falls back to "any trusted hash present" (`legacy-coarse`).
+//! 5. **Codex trust for Loom's entry, where it runs**, by the #5005 baseline
+//!    diff. Codex records trust as
+//!    `hooks.state."<hooks.json path>:pre_tool_use:<group>:<handler>".trusted_hash`
+//!    under the CANONICALIZED `CODEX_HOME` it runs with (`codex_hooks::hook_key`,
+//!    `find_codex_home`). Only a hash under a key Codex would look Loom's entry
+//!    up under, at the runtime `CODEX_HOME` ([`runtime_codex_home`]), counts:
+//!    trust accepted on the host does not apply inside the account's session
+//!    container (where the same file is `/home/loom/.codex-profile/hooks.json`)
+//!    and vice versa, and trust for an operator's hook or another profile's
+//!    path is trust for a different hook. Codex skips Loom's entry silently in
+//!    every such case. Of those keyed hashes, one must be new since Loom's
+//!    current entry was installed (the receipt's `trustBaselineHashes`); a
+//!    receipt from before that field existed falls back to "any keyed hash
+//!    present" (`legacy-coarse`).
 //!
 //! Only the profile's directory NAME is ever reported; no path contents and no
 //! credential bytes. `auth.json` is never opened.
@@ -52,6 +62,12 @@ pub const PINNED_VERSION: u32 = 1;
 pub const SHARED_VERSION: u32 = 2;
 /// Where a private-clone session's image-owned bridge lives (#8839).
 pub const PRIVATE_CONTROL_PREFIX: &str = "/opt/loom/private-control/";
+/// `CODEX_HOME` inside every account session container: the profile's mount
+/// point (`session_lifecycle`'s `CONTAINER_CODEX_HOME`, the session image's
+/// `ENV CODEX_HOME`).
+pub const SESSION_CODEX_HOME: &str = "/home/loom/.codex-profile";
+/// The marker `accounts session start` writes into a profile it adopts.
+const SESSION_MARKER: &str = ".session-managed.json";
 
 /// The workspace-independent managed command (#9390). Must equal
 /// `LOOM_SHARED_HOOK_COMMAND` in `provision-codex-hooks.sh`, which writes it;
@@ -99,6 +115,9 @@ pub struct Check {
     /// The bridge to treat as "this checkout's" when no workspace is named:
     /// the provisioner's own sibling `../hooks/guard-codex-bridge.sh`.
     pub fallback_bridge: Option<PathBuf>,
+    /// `CODEX_HOME` as Codex will see it when it runs; `None` derives it
+    /// ([`runtime_codex_home`]).
+    pub runtime_home: Option<PathBuf>,
 }
 
 /// The verdict, in the JSON shape `provision-codex-hooks.sh verify --json`
@@ -115,6 +134,9 @@ pub struct Verdict {
     pub bridge_readable: bool,
     pub version: u32,
     pub registration: &'static str,
+    /// Where trust must be recorded for this profile, without a path:
+    /// `the session container`, or `profile '<name>' on this host`.
+    pub trust_location: String,
     pub reason: String,
 }
 
@@ -165,7 +187,16 @@ impl Check {
         };
         let installed = installed_cmd.is_some();
 
-        let (trusted, trust_signal) = trust(&self.codex_home);
+        let runtime_home = self
+            .runtime_home
+            .clone()
+            .unwrap_or_else(|| runtime_codex_home(&self.codex_home));
+        let (trusted, trust_signal) = trust_at(&self.codex_home, &runtime_home);
+        let trust_location = if runtime_home == Path::new(SESSION_CODEX_HOME) {
+            "the session container".to_owned()
+        } else {
+            format!("profile '{profile}' on this host")
+        };
 
         let mut stale = false;
         let note = |text: String, reason: &mut String| {
@@ -258,6 +289,18 @@ impl Check {
                  managed hook was last (re)installed — hooks.state carries no trusted_hash beyond \
                  the pre-install baseline"
                     .into()
+            } else if trust_signal == "disabled" {
+                "Codex has Loom's managed hook DISABLED in this profile (hooks.state \
+                 enabled = false), so it never runs whatever its trust reads; remove the \
+                 override from config.toml"
+                    .into()
+            } else if trust_signal == "wrong-location" {
+                format!(
+                    "Codex hook trust is recorded in this profile, but not for Loom's entry at the \
+                     hooks.json location Codex reads at runtime ({trust_location}) — trust \
+                     accepted on the host does not carry into a session container, or the \
+                     reverse; accept the hook-trust prompt where the role runs"
+                )
             } else {
                 "Codex hook trust is not established for this profile (no hooks.state \
                  trusted_hash in config.toml)"
@@ -295,16 +338,49 @@ impl Check {
             bridge_readable,
             version: self.registration.version(),
             registration: self.registration.label(),
+            trust_location,
             reason,
         }
     }
 }
 
-/// `(trusted, trustSignal)` by the #5005 baseline diff.
-fn trust(codex_home: &Path) -> (bool, &'static str) {
-    let current = trusted_hashes(&codex_home.join("config.toml"));
+/// `CODEX_HOME` as Codex will see it when it runs with `codex_home`: the
+/// session container's mount point for a profile an account session has
+/// adopted, otherwise the canonical profile path (Codex canonicalizes
+/// `CODEX_HOME` before keying trust).
+#[must_use]
+pub fn runtime_codex_home(codex_home: &Path) -> PathBuf {
+    if codex_home.join(SESSION_MARKER).is_file() {
+        PathBuf::from(SESSION_CODEX_HOME)
+    } else {
+        codex_home
+            .canonicalize()
+            .unwrap_or_else(|_| codex_home.to_path_buf())
+    }
+}
+
+/// `(trusted, trustSignal)` for Loom's entry in `codex_home`, as Codex will
+/// read it with `CODEX_HOME=runtime_home`: the keyed hashes, then the #5005
+/// baseline diff over them. `wrong-location` = trust exists in the profile,
+/// but none of it is for Loom's entry where it runs. `disabled` = a key Loom's
+/// entry occupies carries `enabled = false`, which Codex honours by dropping
+/// the handler however its trust reads (`discovery.rs::hook_enabled`).
+#[must_use]
+pub fn trust_at(codex_home: &Path, runtime_home: &Path) -> (bool, &'static str) {
+    let keys = read_hooks(codex_home)
+        .map(|hooks| loom_trust_keys(&hooks, runtime_home))
+        .unwrap_or_default();
+    let config = codex_home.join("config.toml");
+    let state = hook_state(&config);
+    if keys.iter().any(|key| {
+        state.get(key).and_then(|entry| entry.get("enabled")) == Some(&toml::Value::Boolean(false))
+    }) {
+        return (false, "disabled");
+    }
+    let current = keyed_trusted_hashes(&config, &keys);
     if current.is_empty() {
-        return (false, "none");
+        let any = state.values().any(|entry| trusted_hash(entry).is_some());
+        return (false, if any { "wrong-location" } else { "none" });
     }
     match trust_baseline(&codex_home.join(RECEIPT)) {
         None => (true, "legacy-coarse"),
@@ -313,32 +389,63 @@ fn trust(codex_home: &Path) -> (bool, &'static str) {
     }
 }
 
-/// Every non-empty `trusted_hash = "..."` value in `config.toml`, skipping
-/// `#`-commented lines so a documentation comment cannot fake an entry.
+/// The `hooks.state` keys Codex looks Loom's entry up under with
+/// `CODEX_HOME=runtime_home`: one per `PreToolUse` position the entry holds.
 #[must_use]
-pub fn trusted_hashes(config: &Path) -> BTreeSet<String> {
-    let Ok(text) = std::fs::read_to_string(config) else {
-        return BTreeSet::new();
-    };
-    let mut out = BTreeSet::new();
-    for line in text.lines().filter(|l| !l.trim_start().starts_with('#')) {
-        let mut rest = line;
-        while let Some(index) = rest.find("trusted_hash") {
-            rest = &rest[index + "trusted_hash".len()..];
-            let Some(after) = rest.trim_start().strip_prefix('=') else {
-                continue;
-            };
-            let Some(after) = after.trim_start().strip_prefix('"') else {
-                continue;
-            };
-            if let Some(end) = after.find('"') {
-                if end > 0 {
-                    out.insert(after[..end].to_owned());
-                }
+pub fn loom_trust_keys(hooks: &serde_json::Value, runtime_home: &Path) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for (group, entry) in hooks["hooks"]["PreToolUse"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for (handler, hook) in entry["hooks"].as_array().into_iter().flatten().enumerate() {
+            if hook["command"].as_str().is_some_and(|c| c.contains(MARKER)) {
+                keys.insert(format!(
+                    "{}/hooks.json:pre_tool_use:{group}:{handler}",
+                    runtime_home.display()
+                ));
             }
         }
     }
-    out
+    keys
+}
+
+/// The non-empty `trusted_hash` values `config.toml` records under `keys`.
+/// An empty `keys` (no Loom entry to look up) yields no trust. Parsed as TOML,
+/// so every spelling of a key (Codex's own `[hooks.state."<key>"]` table,
+/// dotted keys, inline tables) is the same key. A file that does not parse
+/// carries no trust: Codex would not load it either.
+#[must_use]
+pub fn keyed_trusted_hashes(config: &Path, keys: &BTreeSet<String>) -> BTreeSet<String> {
+    let state = hook_state(config);
+    keys.iter()
+        .filter_map(|key| trusted_hash(state.get(key)?))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `config.toml`'s `[hooks.state]` table; empty when absent or unparsable.
+fn hook_state(config: &Path) -> toml::Table {
+    std::fs::read_to_string(config)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|mut document| match document.remove("hooks")? {
+            toml::Value::Table(mut hooks) => match hooks.remove("state")? {
+                toml::Value::Table(state) => Some(state),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn trusted_hash(entry: &toml::Value) -> Option<&str> {
+    entry
+        .get("trusted_hash")?
+        .as_str()
+        .filter(|hash| !hash.is_empty())
 }
 
 /// The receipt's install-time trust baseline, or `None` when the receipt is
