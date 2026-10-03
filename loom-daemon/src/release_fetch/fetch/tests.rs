@@ -42,13 +42,9 @@ fn with_fake_bin<F: FnOnce()>(bindir: &Path, f: F) {
     std::env::set_var("PATH", format!("{}:{old}", bindir.display()));
     // #10088: `gh` resolves through `LOOM_GH_BIN` (a loud-failing stub in
     // test builds), so point it at the fake explicitly.
-    let old_gh = std::env::var_os("LOOM_GH_BIN");
-    std::env::set_var("LOOM_GH_BIN", bindir.join("gh"));
+    let gh = crate::gh_invocation::resolver::test_stub::GhBinGuard::set(&bindir.join("gh"));
     f();
-    match old_gh {
-        Some(v) => std::env::set_var("LOOM_GH_BIN", v),
-        None => std::env::remove_var("LOOM_GH_BIN"),
-    }
+    drop(gh);
     std::env::set_var("PATH", old);
 }
 

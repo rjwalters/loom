@@ -118,4 +118,27 @@ pub(crate) mod test_stub {
         .1
         .clone()
     }
+
+    /// RAII guard pointing `LOOM_GH_BIN` at `bin` and restoring the prior
+    /// value on drop. Tests that stand up their own fake `gh` use this so the
+    /// loud-failing default stub does not shadow it (#10088). Callers must
+    /// serialise on the env lock, as for any other `set_var` test.
+    pub(crate) struct GhBinGuard(Option<std::ffi::OsString>);
+
+    impl GhBinGuard {
+        pub(crate) fn set(bin: &std::path::Path) -> Self {
+            let prior = std::env::var_os("LOOM_GH_BIN");
+            std::env::set_var("LOOM_GH_BIN", bin);
+            Self(prior)
+        }
+    }
+
+    impl Drop for GhBinGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("LOOM_GH_BIN", v),
+                None => std::env::remove_var("LOOM_GH_BIN"),
+            }
+        }
+    }
 }

@@ -1843,7 +1843,7 @@ mod tests {
     /// for [`GhClaimResetter::reset_claim`] to exercise its full parse/branch
     /// logic against a *resolved-via-PATH* binary rather than a mocked trait.
     #[cfg(unix)]
-    fn write_stub_gh(dir: &std::path::Path, has_building_label: bool) {
+    fn write_stub_gh(dir: &std::path::Path, has_building_label: bool) -> impl Drop {
         use std::os::unix::fs::PermissionsExt;
         let script = format!(
             r#"#!/bin/sh
@@ -1864,9 +1864,10 @@ exit 0
         );
         let gh_path = dir.join("gh");
         std::fs::write(&gh_path, script).unwrap();
-        let mut perms = std::fs::metadata(&gh_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&gh_path, perms).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // #10088: `gh` resolves through `LOOM_GH_BIN` (a loud-failing stub in
+        // test builds), so point it at this stub for the caller's scope.
+        crate::gh_invocation::resolver::test_stub::GhBinGuard::set(&gh_path)
     }
 
     /// [`GhClaimResetter`] must resolve `gh` via the canonical PATH built by
@@ -1883,22 +1884,13 @@ exit 0
         let fake_home = tempfile::tempdir().unwrap();
         let local_bin = fake_home.path().join(".local/bin");
         std::fs::create_dir_all(&local_bin).unwrap();
-        write_stub_gh(&local_bin, true);
+        let _gh = write_stub_gh(&local_bin, true);
 
         let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", fake_home.path());
 
-        // #10088: `gh` resolves through `LOOM_GH_BIN` (a loud-failing stub in
-        // test builds), so point it at the stub explicitly.
-        let old_gh = std::env::var_os("LOOM_GH_BIN");
-        std::env::set_var("LOOM_GH_BIN", local_bin.join("gh"));
-
         let result = GhClaimResetter.reset_claim("rjwalters/loom", 4831, "worker-stub");
 
-        match old_gh {
-            Some(v) => std::env::set_var("LOOM_GH_BIN", v),
-            None => std::env::remove_var("LOOM_GH_BIN"),
-        }
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
@@ -1925,22 +1917,13 @@ exit 0
         let fake_home = tempfile::tempdir().unwrap();
         let local_bin = fake_home.path().join(".local/bin");
         std::fs::create_dir_all(&local_bin).unwrap();
-        write_stub_gh(&local_bin, false);
+        let _gh = write_stub_gh(&local_bin, false);
 
         let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", fake_home.path());
 
-        // #10088: `gh` resolves through `LOOM_GH_BIN` (a loud-failing stub in
-        // test builds), so point it at the stub explicitly.
-        let old_gh = std::env::var_os("LOOM_GH_BIN");
-        std::env::set_var("LOOM_GH_BIN", local_bin.join("gh"));
-
         let result = GhClaimResetter.reset_claim("rjwalters/loom", 4831, "worker-stub");
 
-        match old_gh {
-            Some(v) => std::env::set_var("LOOM_GH_BIN", v),
-            None => std::env::remove_var("LOOM_GH_BIN"),
-        }
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
