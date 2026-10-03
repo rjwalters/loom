@@ -2001,6 +2001,8 @@ fi
 echo "CHAMPION-MERGE-OUTCOME pr=$PR_NUMBER rc=$MERGE_RC"
 ```
 
+After `rc=0`, resolve that PR's critical-file-hold mail (`inbox_mail resolve`, key in [`champion-critical-file-hold.md`](champion-critical-file-hold.md), #10000).
+
 **No `CHAMPION-MERGE-OUTCOME` line in that output** — timed out, killed, empty —
 means the outcome is **unknown**: not a failure and not a re-queue code. Never
 infer an `MERGE_RC`; re-read the PR state — a killed call may have merged and
@@ -2725,7 +2727,7 @@ If ANY safety criterion fails, do NOT merge. How the failure is handled depends 
 
 **Merge-risk holds** keep `loom:pr` like a transient failure, but comment **once** behind the `<!-- champion:merge-risk-hold -->` idempotency marker because the condition does not clear on its own, and additionally carry `loom:operator` (#5502) — the first-class "engine will not act further, a human is the only transition out" state, added alongside the marker and removed alongside its reversal, kept **filterable** without making sweep/shepherd skip the PR (see [`.loom/docs/label-state-machine.md`](../../../.loom/docs/label-state-machine.md)). Unlike a transient failure, the hold is **sticky**: later ticks re-check it against the release conditions (`loom:auto-merge-ok`, an explicit operator clearing comment, a new push, a new Judge review) rather than re-deriving it from a fresh axis read, and any merge that reverses one carries a mandatory reversal comment (#4742). The exact commands live with the criterion itself — see "Safety Criteria → 2. Merge-Risk Judgment → Sticky holds / Hold behavior"; do not duplicate them here.
 
-**Critical-file holds** work the same way, for the same reason (#6879): a critical-file FAIL cannot clear without either a human merge or a later push that narrows the diff, so it also keeps `loom:pr`, comments once behind its own idempotency marker (`<!-- champion:critical-file-hold -->`, distinct from `champion:merge-risk-hold`), and carries `loom:operator`. It does **not** need criterion #2's sticky-hold precheck — its check is a deterministic file-pattern match, so a diff cannot score differently on a later read — and its release conditions are simpler: the diff no longer touches any critical-file pattern, or (#9016) the operator hand-removes `loom:operator` at the head the hold was written against — a durable release Champion does not override at that head, which is what makes the `merge-pr.sh` human-merge path work against the #8112 contradiction guard. `loom:auto-merge-ok` does **not** release it — that override is explicitly scoped to criterion #2 only (see "Safety Criteria → 2 → `loom:auto-merge-ok` override"). The exact commands live in [`champion-critical-file-hold.md`](champion-critical-file-hold.md); do not duplicate them here.
+**Critical-file holds** work the same way (#6879): a FAIL keeps `loom:pr`, comments once behind `<!-- champion:critical-file-hold -->` (distinct from `champion:merge-risk-hold`), and carries `loom:operator`. No sticky-hold precheck (the file-pattern match is deterministic); it releases when the diff leaves every critical-file pattern, or (#9016) the operator hand-removes `loom:operator` at the held head — durable, which is what lets the `merge-pr.sh` human-merge path pass the #8112 guard. `loom:auto-merge-ok` does **not** release it (criterion #2 only). Commands: [`champion-critical-file-hold.md`](champion-critical-file-hold.md); do not duplicate them here.
 
 ### Transient failures — keep `loom:pr`, retry next tick
 
