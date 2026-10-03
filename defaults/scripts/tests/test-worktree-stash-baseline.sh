@@ -642,8 +642,18 @@ make_worktree 333
 cd "$REPO"
 echo "t-wip" >> ".loom/worktrees/issue-333/tracked.txt"
 echo "u-wip" > ".loom/worktrees/issue-333/u.txt"
+# Capture the post-push status into a variable rather than piping into
+# `! (... | grep -q .)`: under pipefail an early-exiting grep -q makes the
+# negated pipeline read a failure as "clean" (pipefail ratchet).
+pushed20d=false
+st20d=""
 if ./.loom/scripts/worktree.sh stash-push 333 --include-untracked >/dev/null 2>&1 \
-    && ! (git -C ".loom/worktrees/issue-333" status --porcelain --untracked-files=all | grep -v '\.loom-managed' | grep -q .) \
+    && st20d="$(git -C ".loom/worktrees/issue-333" status --porcelain --untracked-files=all)"; then
+    pushed20d=true
+    st20d="$(grep -v '\.loom-managed' <<<"$st20d" || true)"
+fi
+if $pushed20d \
+    && [[ -z "$st20d" ]] \
     && ./.loom/scripts/worktree.sh stash-pop 333 >/dev/null 2>&1 \
     && grep -q "t-wip" ".loom/worktrees/issue-333/tracked.txt" \
     && [[ -f ".loom/worktrees/issue-333/u.txt" ]]; then
