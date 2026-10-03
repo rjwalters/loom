@@ -68,6 +68,19 @@ if [[ ! -f "$DEFAULTS_LABELS" ]]; then
 fi
 
 # --- Compare (must be byte-identical) ---------------------------------------
+# #10013: both copies are GENERATED from defaults/labels.json. When a
+# loom-daemon binary is available, also fail if the Loom block differs from the
+# registry (a label added only to labels.yml, or an edit that skipped
+# `loom-daemon labels generate --write`). The label_registry unit tests assert
+# the same, so a missing binary is not a gap in CI.
+if [[ -f "$ROOT/defaults/labels.json" ]] && command -v loom-daemon >/dev/null 2>&1 \
+  && loom-daemon labels --help >/dev/null 2>&1; then
+  if ! loom-daemon labels check --root "$ROOT" >&2; then
+    echo "check-labels-drift: FAIL — labels.yml differs from defaults/labels.json." >&2
+    exit 1
+  fi
+fi
+
 if diff -u "$ROOT_LABELS" "$DEFAULTS_LABELS" >/dev/null 2>&1; then
   echo "check-labels-drift: OK — .github/labels.yml and defaults/.github/labels.yml are identical."
   exit 0
