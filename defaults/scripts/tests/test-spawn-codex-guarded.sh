@@ -96,6 +96,22 @@ done
 spawn builder "$BARE"
 check "builder (mutable) is still refused" rc_is 78
 
+# An adopted (session-managed) profile forced onto bare metal with
+# LOOM_CODEX_SESSION_EXEC=0: Codex keys trust by the HOST path there, so trust
+# taken only inside the container must not pass for this launch, and host-keyed
+# trust must. spawn-codex names the runtime CODEX_HOME to verify (#9390).
+ADOPTED="$(profile adopted)"
+bash "$PROVISION_SCRIPT" install --codex-home "$ADOPTED" --workspace "$WS" >/dev/null 2>&1
+printf '{}\n' > "$ADOPTED/.session-managed.json"
+printf '[hooks.state."/home/loom/.codex-profile/hooks.json:pre_tool_use:0:0"]\ntrusted_hash = "op"\n' > "$ADOPTED/config.toml"
+export LOOM_CODEX_SESSION_EXEC=0
+spawn judge "$ADOPTED"
+check "judge on bare metal with container-only trust -> exit 78" rc_is 78
+printf '[hooks.state."%s/hooks.json:pre_tool_use:0:0"]\ntrusted_hash = "op"\n' "$(cd -P "$ADOPTED" && pwd -P)" > "$ADOPTED/config.toml"
+spawn judge "$ADOPTED"
+check "judge on bare metal with host-keyed trust -> proceeds" rc_is 0
+unset LOOM_CODEX_SESSION_EXEC
+
 echo ""
 echo "Tests run: $TESTS_RUN, failed: $TESTS_FAILED"
 [[ "$TESTS_FAILED" -eq 0 ]]
