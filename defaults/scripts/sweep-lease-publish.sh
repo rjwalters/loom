@@ -125,7 +125,9 @@
 #       0  Published, or a live lease for this host+sweep-id already exists.
 #          Proceed.
 #       1  Usage error (bad issue number, unknown flag, bad --ttl-minutes).
-#       2  The publish `gh` call failed. Proceed WITHOUT a lease (best-effort).
+#       2  The publish `gh` call failed, or this host has no identity to
+#          publish under (#10023: no `loom-daemon host-id` answer and no
+#          $LOOM_HOST_ID). Proceed WITHOUT a lease (best-effort).
 #       4  A different host holds a fresh lease, or this identity yielded.
 #          Nothing published. Skip this claim; a yielded ID needs a new run.
 #
@@ -203,13 +205,15 @@ lease_publish_raw_hostname() {
     esac
 }
 
-# --- Host identity: asked of `loom-daemon host-id` (#10023), never re-derived
-# here, so this script and the daemon cannot disagree. `${LOOM_HOST_ID:-
-# unknown-host}` is only the fallback for a binary without that subcommand.
+# --- Host identity (#10023): `loom_host_id` (lib/locate-daemon-bin.sh) asks
+# the daemon's own `host-id` on the binary loom_resolve_self_daemon_bin names,
+# never a bare PATH lookup, so this script and the daemon cannot disagree. It
+# falls back only to $LOOM_HOST_ID, and otherwise returns 1 with a stderr
+# explanation -- never a made-up `unknown-host` shared by every such host.
+# shellcheck source=./lib/locate-daemon-bin.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/locate-daemon-bin.sh"
 resolve_host() {
-    local h
-    h="$("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" host-id 2>/dev/null)" || h=""
-    printf '%s' "${h:-${LOOM_HOST_ID:-unknown-host}}"
+    loom_host_id
 }
 
 # resolve_published_host -- the host identity this script publishes and
@@ -221,7 +225,7 @@ resolve_host() {
 # contract agree even in that rare environment.
 resolve_published_host() {
     local raw
-    raw="$(resolve_host)"
+    raw="$(resolve_host)" || return 1
     if lease_publish_raw_hostname; then
         printf '%s' "$raw"
         return 0
@@ -329,7 +333,11 @@ cmd_publish() {
     # writer of this contract actually PUBLISHES (opaque by default), not the
     # raw hostname -- an explicit --host is a caller-supplied literal and is
     # used verbatim, unmodified by this transform.
-    [[ -n "$host" ]] || host="$(resolve_published_host)"
+    if [[ -z "$host" ]] && ! host="$(resolve_published_host)"; then
+        # #10023: never publish under a made-up id every unidentified host shares.
+        echo "ERROR: publish: no host identity for issue #${issue} (see loom_host_id above) -- not publishing a lease; proceed WITHOUT one" >&2
+        exit 2
+    fi
     [[ -n "$sweep_id" ]] || sweep_id="${LOOM_SWEEP_RUN_ID:-$(gen_sweep_id)}"
     if ! [[ "$ttl_minutes" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         echo "ERROR: publish: --ttl-minutes must be a non-negative number (got: '$ttl_minutes')" >&2

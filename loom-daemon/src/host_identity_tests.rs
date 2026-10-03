@@ -173,3 +173,87 @@ fn id_validation_rejects_unsafe_values() {
     assert!(!is_valid_id("a/b"));
     assert!(!is_valid_id(&"x".repeat(129)));
 }
+
+/// A filesystem that refuses hard links (EPERM on some mounts) still gets a
+/// persisted, owner-only id via the `O_EXCL` fallback — not `unknown-host`.
+#[test]
+fn hard_link_refused_falls_back_to_exclusive_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(HOST_ID_FILENAME);
+    let refuse = |_: &Path, _: &Path| -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    };
+    let (id, created) = load_or_create_with(&path, refuse).unwrap();
+    assert!(created);
+    assert!(id.starts_with(GENERATED_PREFIX), "{id}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), id);
+    // A second caller on the same mount reads it back rather than re-keying.
+    assert_eq!(load_or_create_with(&path, refuse).unwrap(), (id, false));
+    let leftovers = std::fs::read_dir(dir.path()).unwrap().count();
+    assert_eq!(leftovers, 1, "temp file leaked");
+}
+
+/// Many replacers of one corrupt file: every caller gets a valid id read back
+/// from disk (never an unplaced candidate), the file ends valid, and the
+/// on-disk id is among those reported. The residual window — a replacer that
+/// re-reads before a later one's `rename` lands — is documented on
+/// [`load_or_create`]; it cannot recur once the file is valid.
+#[test]
+fn concurrent_replacement_of_an_invalid_file_reports_the_on_disk_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(HOST_ID_FILENAME);
+    std::fs::write(&path, "not an id\n").unwrap();
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let path = path.clone();
+            std::thread::spawn(move || load_or_create(&path).unwrap())
+        })
+        .collect();
+    let results: Vec<(String, bool)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let on_disk = std::fs::read_to_string(&path).unwrap().trim().to_string();
+    assert!(is_valid_id(&on_disk));
+    assert!(results.iter().all(|(id, _)| is_valid_id(id)), "{results:?}");
+    assert!(results.iter().any(|(id, _)| *id == on_disk), "{results:?}");
+    assert_eq!(load_or_create(&path).unwrap(), (on_disk, false));
+}
+
+/// An unwritable id location resolves to the `unknown` source (which
+/// `loom-daemon host-id` turns into a non-zero exit), never a fake id.
+#[test]
+#[serial(loom_config_env)]
+fn an_unwritable_id_path_is_unknown() {
+    let _guard = EnvGuard::clear();
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("not-a-dir");
+    std::fs::write(&blocker, "").unwrap();
+    std::env::set_var(HOST_ID_FILE_ENV, blocker.join(HOST_ID_FILENAME));
+    let resolved = resolve();
+    assert_eq!(resolved.source, HostIdSource::Unknown);
+    assert_eq!(resolved.id, UNKNOWN_HOST);
+}
+
+/// The daemon exports a persisted id to its children; an env-sourced id is
+/// left alone, and `unknown-host` is never exported as if it were an identity.
+#[test]
+#[serial(loom_config_env)]
+fn export_for_children_exports_real_ids_only() {
+    let _guard = EnvGuard::clear();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(HOST_ID_FILENAME);
+    std::fs::write(&path, "persisted-for-export\n").unwrap();
+    std::env::set_var(HOST_ID_FILE_ENV, &path);
+    let resolved = export_for_children();
+    assert_eq!(resolved.id, "persisted-for-export");
+    assert_eq!(std::env::var(HOST_ID_ENV).unwrap(), "persisted-for-export");
+
+    std::env::set_var(HOST_ID_ENV, "pinned");
+    assert_eq!(export_for_children().source, HostIdSource::Env);
+    assert_eq!(std::env::var(HOST_ID_ENV).unwrap(), "pinned");
+
+    std::env::remove_var(HOST_ID_ENV);
+    let blocker = dir.path().join("file");
+    std::fs::write(&blocker, "").unwrap();
+    std::env::set_var(HOST_ID_FILE_ENV, blocker.join(HOST_ID_FILENAME));
+    assert_eq!(export_for_children().source, HostIdSource::Unknown);
+    assert!(std::env::var(HOST_ID_ENV).is_err(), "unknown-host must not be exported");
+}

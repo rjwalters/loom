@@ -355,6 +355,42 @@ _loom_self_bin_answers_as_daemon() {
     [[ "$out" =~ ^loom-daemon[[:space:]]+[0-9] ]]
 }
 
+# loom_host_id -- this host's identity, as the daemon itself resolves it
+# (#10023): `loom-daemon host-id` on the binary loom_resolve_self_daemon_bin
+# names (never a bare PATH lookup), so a script's host id cannot disagree with
+# the daemon's `host.id`. Prints the id (no newline) and returns 0.
+#
+# Fallback: only `$LOOM_HOST_ID` -- tier 1 of the daemon's own precedence, so
+# still the daemon's answer -- when no binary resolves or it cannot answer (an
+# older binary without the subcommand, or one that exits non-zero because it
+# has no identity either). Otherwise prints NOTHING, explains on stderr and
+# returns 1. It never invents `unknown-host`: that string is identical on every
+# host that fails resolution, so a lease, claim or lock owner published or
+# compared under it would collide fleet-wide (#5063). The caller decides what
+# a missing identity means (refuse to publish, degrade a telemetry field).
+# requires-daemon: host-id optional   An older or absent binary falls back to $LOOM_HOST_ID; with neither, this returns 1 with a stderr explanation instead of inventing an id.
+loom_host_id() {
+    local bin id=""
+    bin="$(loom_resolve_self_daemon_bin 2>/dev/null)" || bin=""
+    if [[ -n "$bin" ]]; then
+        id="$("$bin" host-id 2>/dev/null </dev/null)" || id=""
+        id="${id%%$'\n'*}"
+    fi
+    if [[ -z "$id" || "$id" == "unknown-host" ]]; then
+        id="$(printf '%s' "${LOOM_HOST_ID:-}" | tr -d '[:space:]')"
+    fi
+    if [[ -n "$id" ]]; then
+        printf '%s' "$id"
+        return 0
+    fi
+    if [[ -z "$bin" ]]; then
+        echo "loom_host_id: no loom-daemon binary found (\$LOOM_DAEMON_SELF_BIN, a build in this checkout, \$PATH, \${LOOM_DAEMON_BIN_DIR:-\$HOME/.local/bin}) and \$LOOM_HOST_ID is unset -- this host has no identity to publish or compare under. Install loom-daemon or set LOOM_HOST_ID (#10023)." >&2
+    else
+        echo "loom_host_id: '$bin host-id' gave no identity (a binary predating #10023, or one with no persistable id) and \$LOOM_HOST_ID is unset. Run '$bin host-id' to see why, or set LOOM_HOST_ID (#10023)." >&2
+    fi
+    return 1
+}
+
 # loom_daemon_model_select_flag <daemon_bin> <model> -- echo `--model <model>`
 # (two words) when per-model-class token selection is BOTH wanted and
 # supported, or nothing at all otherwise. Issue #8058.

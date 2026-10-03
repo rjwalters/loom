@@ -63,7 +63,7 @@ enum FleetConfigCommand {
     /// keeps reporting it until the daemon that was running at render time
     /// actually restarts.
     Render {
-        /// Host id in the store (default: `LOOM_HOST_ID`, else the hostname).
+        /// Host id in the store (default: this host's `loom-daemon host-id`).
         #[arg(long, value_name = "HOST")]
         host: Option<String>,
         /// Write nothing: print a diff and exit 1 on drift.
@@ -95,7 +95,7 @@ enum FleetConfigCommand {
     /// Print this host's desired run state from `fleet/state.yml`
     /// (report only; nothing enforces it yet).
     State {
-        /// Host id in the store (default: `LOOM_HOST_ID`, else the hostname).
+        /// Host id in the store (default: this host's `loom-daemon host-id`).
         #[arg(long, value_name = "HOST")]
         host: Option<String>,
         /// Emit JSON.
@@ -151,7 +151,7 @@ enum ProposeCommand {
     /// Turn this host's `render --check` drift into a PR that moves the
     /// on-disk values into `fleet.yml`'s `config.hosts.<host>`.
     Adopt {
-        /// Host id in the store (default: `LOOM_HOST_ID`, else the hostname).
+        /// Host id in the store (default: this host's `loom-daemon host-id`).
         #[arg(long, value_name = "HOST")]
         host: Option<String>,
         /// Print the diff without opening a PR.

@@ -68,6 +68,10 @@ export LOOM_FILING_LOCK_WAIT_SECS=1
 # Never reach the real safehouse socket from a test.
 unset SAFEHOUSED_SOCKET LOOM_SAFEHOUSE_SOCKET SAFEHOUSE_PERSONA || true
 unset LOOM_FILING_LOCK_HELD || true
+# #10023: a deterministic identity, so the same-host legs (dead-PID reaping)
+# run even on a runner with no loom-daemon at all (hermetic CI). The
+# no-identity cases below clear it explicitly.
+export LOOM_HOST_ID="filing-lock-test-host"
 
 echo ""
 echo "=== filing-lock.sh: acquire / release round-trip ==="
@@ -295,6 +299,30 @@ assert_eq "$(LOOM_FILING_LOCK_DIR="/tmp/x" loom_filing_lock_store)" "/tmp/x" \
     "LOOM_FILING_LOCK_DIR overrides the default location"
 assert_eq "$(LOOM_FILING_LOCK_DIR="   " HOME=/h loom_filing_lock_store)" "/h/.loom/locks/issue-filing" \
     "a blank override falls back to ~/.loom/locks/issue-filing"
+
+echo ""
+echo "=== no host identity (#10023) ==="
+
+# An older binary without `host-id`, no LOOM_HOST_ID: no identity, so no
+# `unknown-host` owner either -- and acquiring still works (host tier).
+OLD_DAEMON="$TMPROOT/old-daemon"
+printf '#!/usr/bin/env bash\necho "error: unrecognized subcommand" >&2\nexit 2\n' > "$OLD_DAEMON"
+chmod +x "$OLD_DAEMON"
+NOID_OUT="$(LOOM_DAEMON_SELF_BIN="$OLD_DAEMON" LOOM_HOST_ID="" loom_filing_lock_host 2>/dev/null)" && NOID_RC=0 || NOID_RC=$?
+assert_eq "$NOID_RC:$NOID_OUT" "1:" "no identity -> loom_filing_lock_host returns 1 and prints nothing (never unknown-host)"
+assert_eq "$(LOOM_DAEMON_SELF_BIN="$OLD_DAEMON" LOOM_HOST_ID="pinned-host" loom_filing_lock_host)" "pinned-host" \
+    "an older binary falls back to LOOM_HOST_ID"
+STORE="$(new_store)"
+(
+    export LOOM_DAEMON_SELF_BIN="$OLD_DAEMON" LOOM_HOST_ID="" LOOM_FILING_LOCK_DIR="$STORE"
+    loom_filing_lock_acquire noid 2>/dev/null
+    ok=1
+    [[ -n "$LOOM_FILING_LOCK_PATH" && -f "$LOOM_FILING_LOCK_PATH/owner.json" ]] \
+        && ! grep -q unknown-host "$LOOM_FILING_LOCK_PATH/owner.json" && ok=0
+    loom_filing_lock_release 2>/dev/null
+    exit "$ok"
+) && CASE_RC=0 || CASE_RC=$?
+assert_true "$CASE_RC" "acquire without an identity still serializes on this host, with no unknown-host owner"
 
 echo ""
 echo "=== create-issue.sh is wired to the lock ==="
