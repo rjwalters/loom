@@ -358,8 +358,9 @@ assert_eq "-R octocat/hello-world" \
 # The preflight names its target positionally (`gh repo view` has no -R flag),
 # so match on the NWO itself rather than on '-R': no call may go anywhere else.
 assert_eq "" \
-    "$(printf '%s\n' "$LOG" | grep -v -- 'octocat/hello-world' || true)" \
+    "$(printf '%s\n' "$LOG" | grep -v -- 'octocat/hello-world' | grep -vxE -- '--version|--clear-cache' || true)" \
     "no gh call was made without the override target"
+# (the gh-cached wrapper's `--version` liveness probe and --clear-cache are the only target-less calls, #9953)
 
 # --repo=OWNER/NAME is the same flag.
 run_sls -- --repo=octocat/hello-world

@@ -246,6 +246,19 @@ enforced by the skills documenting the plain `gh` form at those call sites.
 | Parked-PR listing (`gh pr list --label …`) | Pre-merge comment's data gathering — must not restate a stale criterion result |
 | | Post-merge linked-issue **state** reads and the dependency-`state` loop — they gate `gh issue close` / removing `loom:blocked` |
 
+## Per-script call-site inventory (#9953)
+
+Standalone `defaults/scripts/*.sh` resolve `$GH_READ` from `$SCRIPT_DIR/gh-cached`
+(same `--version` probe, same fallback to plain `gh`; cwd-independent).
+
+| Cached (`$GH_READ`) | Plain `gh` (and why) |
+|---|---|
+| `check-duplicate.sh` — open/closed issue and closed-PR candidate surveys, cross-reference timeline | `check-evaluating-staleness.sh` — label + timeline reads: **claim arbitration** |
+| `blame-issue.sh` — commit-to-PR, closing-issue, body, label-timeline reads (read-only diagnostics) | `sweep-lease-renew.sh` — lease comments: **CAS-style claim** (own-yield/fence) |
+| `resolve-tier-model.sh` — issue body read | `verdict-staleness-guard.sh` — PR comments: **verdict-time CAS recheck** |
+| `sync-labels.sh` — per-label `label list` existence probe and `--check` label list (`--clear-cache` after create/update/delete) | `sync-labels.sh` `github_label_usage` — gates irreversible `label delete` |
+| | `rebase-stacked-children.sh`, `claim-staleness.sh` — **claim arbitration** |
+
 ## Verification
 
 ### Automated

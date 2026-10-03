@@ -227,6 +227,20 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/forge-helpers.sh
 source "${SCRIPT_DIR}/lib/forge-helpers.sh"
+# $GH_READ (docs/gh-cached.md interface, #9953): the short-TTL read cache when
+# the wrapper ships next to this script, plain `gh` otherwise. Only repeated
+# observation reads use it; writes stay literal `gh`.
+# Resolved lazily (init_gh_read, called from the github_* helpers): the
+# wrapper's --version probe shells out to `gh`, and --dry-run / the Gitea
+# rejection must stay completely forge-free.
+GH_READ="gh"
+init_gh_read() {
+  local _ghc="$SCRIPT_DIR/gh-cached"
+  [[ "${_GH_READ_INIT:-0}" == 1 ]] && return 0
+  _GH_READ_INIT=1
+  if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi
+}
+
 
 # ANSI color codes
 RED='\033[0;31m'
@@ -361,8 +375,10 @@ info "Syncing workflow labels from $LABELS_FILE..."
 
 github_delete_label() {
   local label="$1"
+  init_gh_read
   if output=$(gh label delete "$label" -R "$REPO" --yes 2>&1); then
     info "Deleted default label: $label"
+    "$GH_READ" --clear-cache >/dev/null 2>&1 || true
   elif ! echo "$output" | grep -qi "not found\|404"; then
     warning "Could not delete label '$label': $output"
   fi
@@ -380,6 +396,8 @@ github_delete_label() {
 # reason a label silently fails to sync.
 github_label_usage() {
   local label="$1"
+  # Plain `gh` on purpose (docs/gh-cached.md policy): this in-use check gates the
+  # irreversible `gh label delete`, so a 30s-stale answer must never feed it.
   gh api "repos/${REPO}/issues" \
     -f state=all -f per_page=100 -f "labels=${label}" \
     --jq '.[].number' 2>/dev/null || true
@@ -420,10 +438,12 @@ github_maybe_delete_label() {
 
 github_sync_label() {
   local name="$1" description="$2" color="$3"
+  init_gh_read
 
-  if gh label list -R "$REPO" --json name --jq '.[].name' 2>&1 | grep -q "^${name}$" 2>/dev/null; then
+  if "$GH_READ" label list -R "$REPO" --json name --jq '.[].name' 2>&1 | grep -q "^${name}$" 2>/dev/null; then
     if output=$(gh label edit "$name" -R "$REPO" --description "$description" --color "$color" 2>&1); then
       info "Updated label: $name"
+      "$GH_READ" --clear-cache >/dev/null 2>&1 || true
     else
       warning "Failed to update label: $name"
       echo "$output" >&2
@@ -431,6 +451,7 @@ github_sync_label() {
   else
     if output=$(gh label create "$name" -R "$REPO" --description "$description" --color "$color" 2>&1); then
       info "Created label: $name"
+      "$GH_READ" --clear-cache >/dev/null 2>&1 || true  # a later cached label list must see it
     else
       if echo "$output" | grep -q "already exists"; then
         if update_output=$(gh label edit "$name" -R "$REPO" --description "$description" --color "$color" 2>&1); then
@@ -641,10 +662,11 @@ diff_declared_against_live_tsv() {
 # list --json ... --jq` list of name/color/description tab-triples), never a
 # `gh label create/edit/delete`.
 github_check_labels() {
+  init_gh_read
   read_declared_labels
 
   local live_tsv
-  if ! live_tsv=$(gh label list -R "$REPO" --json name,color,description \
+  if ! live_tsv=$("$GH_READ" label list -R "$REPO" --json name,color,description \
         --jq '.[] | [.name, .color, .description] | @tsv' --limit 300 2>&1); then
     check_unavailable "Could not list labels for $REPO: $live_tsv"
   fi
