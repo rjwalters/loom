@@ -2779,7 +2779,7 @@ _remove_loom_worktree() {
   gate="$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | _mp_worktree remove-gate --path "$worktree_path" --real "$worktree_real" --allow-unmanaged "$allow_unmanaged")" || gate_rc=$?
   verdict="${gate%%$'\n'*}"
   if [[ $gate_rc -ne 0 || ( "$verdict" != "LOOM-REMOVE-GATE PROCEED" && "$verdict" != "LOOM-REMOVE-GATE REFUSE" ) ]]; then
-    warning "Refusing to remove worktree at $worktree_real — the primary-worktree guard (#3710) could not run: 'loom-daemon merge-pr remove-gate' failed, so whether this path IS the primary checkout is unknown. Best-effort cleanup only; the merge itself already succeeded and is unaffected. Remove it by hand once loom-daemon is available, if it really is a worktree: git -C \"$REPO_ROOT\" worktree remove \"$worktree_real\" --force $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" 2>/dev/null || true)")"; return 0; return 0
+    warning "Refusing to remove worktree at $worktree_real — the primary-worktree guard (#3710) could not run: 'loom-daemon merge-pr remove-gate' failed, so whether this path IS the primary checkout is unknown. Best-effort cleanup only; the merge itself already succeeded and is unaffected. Remove it by hand once loom-daemon is available, if it really is a worktree: git -C \"$REPO_ROOT\" worktree remove \"$worktree_real\" --force $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_SELF_BIN:-${LOOM_DAEMON_BIN:-loom-daemon}}" 2>/dev/null || true)")"; return 0
   fi
   while IFS=$'\t' read -r level text; do
     [[ -n "$level" ]] || continue
