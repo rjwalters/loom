@@ -89,17 +89,13 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+use crate::gh_invocation::gh_bin;
+
 pub mod attribution;
 pub mod budget;
 pub mod report;
 pub use attribution::Attribution;
 pub use budget::{BudgetConfig, BudgetDecision};
-
-/// The `gh` binary, honoring `LOOM_GH_BIN` — the same seam
-/// `stale_checks::fetch` / `head_sync::fetch` provide.
-fn gh_bin() -> String {
-    std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
-}
 
 /// `gh api …`, parameterized on the binary — the injection seam this module's
 /// tests use so a stub `gh` can be passed as a plain function argument instead

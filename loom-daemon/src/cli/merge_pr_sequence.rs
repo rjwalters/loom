@@ -50,7 +50,7 @@ impl SequenceEvalArgs {
         // The `{owner}/{repo}` template lets `gh` resolve the repo from cwd,
         // matching the reconciliation scanner's convention.
         let nwo = self.repo.as_deref().unwrap_or("{owner}/{repo}");
-        let bin = sequence::gh_bin();
+        let bin = loom_daemon::gh_invocation::gh_bin();
 
         let Some(bodies) = sequence::fetch_trusted_bodies(&bin, &root, nwo, self.pr) else {
             eprintln!(
