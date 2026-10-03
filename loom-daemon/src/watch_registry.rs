@@ -499,7 +499,7 @@ impl GhWatchProbe {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            gh_bin: PathBuf::from("gh"),
+            gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
             timeout: DEFAULT_PROBE_TIMEOUT,
         }
     }

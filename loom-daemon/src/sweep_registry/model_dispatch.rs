@@ -48,6 +48,7 @@ impl DispatchModel<'_> {
         // actually launched.
         let policy = admitted
             .map_or_else(|| DefaultModelPolicy::resolve(root), DefaultModelPolicy::for_runtime);
+        let gh_default = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
         let resolved = match (self, kind) {
             (Self::Request(None) | Self::Autonomous { .. }, SweepKind::Issue(issue)) => {
                 resolve_autonomous_model_for_runtime(
@@ -56,7 +57,7 @@ impl DispatchModel<'_> {
                     || match self {
                         Self::Autonomous { complexity } => complexity.map(str::to_owned),
                         _ => fetch_issue_complexity(
-                            config.gh_bin.as_deref().unwrap_or_else(|| Path::new("gh")),
+                            config.gh_bin.as_deref().unwrap_or(gh_default.as_path()),
                             root,
                             *issue,
                         ),

@@ -189,7 +189,8 @@ fn roster_heartbeat_once(
     ttl_secs: u64,
     settle_secs: u64,
 ) {
-    let gh = Path::new("gh");
+    let gh_buf = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
+    let gh = gh_buf.as_path();
     let host = roster_host_id();
     let serves = resolve_this_host_serves(fallback_root);
 
