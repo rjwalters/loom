@@ -347,15 +347,13 @@ fn run_probe_against_pool(
     // refresh runs it on a cadence), so it prunes the pool the check is
     // actually anchored to, which may be the shared machine-level pool
     // rather than a per-repo `resolve_tokens_dir(workspace)`.
-    match bad_tokens::cleanup_bad_tokens_in_dir(
-        tokens_dir,
-        bad_tokens::DEFAULT_CLEANUP_MAX_AGE_SECS,
-    ) {
+    let max_age_secs = bad_tokens::resolve_cleanup_max_age_secs();
+    match bad_tokens::cleanup_bad_tokens_in_dir(tokens_dir, max_age_secs) {
         Ok(outcome) if outcome.removed > 0 => eprintln!(
             "note: pruned {} expired .bad_tokens entr{} older than {}h ({} retained)",
             outcome.removed,
             if outcome.removed == 1 { "y" } else { "ies" },
-            bad_tokens::DEFAULT_CLEANUP_MAX_AGE_SECS / 3600,
+            max_age_secs / 3600,
             outcome.kept,
         ),
         Ok(_) => {}

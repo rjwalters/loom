@@ -49,6 +49,21 @@
 //! budgets) onto the same surface; the schema, validation and digest
 //! mechanics here are the whole point — adding a field is one struct entry,
 //! one range check, and one consumer overlay.
+//!
+//! Tranche 2 consolidates the env-only janitor/lifecycle numeric knobs (the
+//! modules that had a `LOOM_*` env override and a built-in constant but no
+//! config tier at all): `supervision.*` (epic supervisor, sweep/API-key
+//! inflight staleness, reapers, token-exhaustion cooldown, bad-token cleanup
+//! age, worktree activity window), `headroom.*` (per-worktree disk/RAM
+//! budgets), `process.*` (restart polls, launchd bootout/bootstrap timings,
+//! the shared IPC timeout floor, the lease-guard read timeout),
+//! `observability.*` (dispatch-disposition refresh, queue starvation), and
+//! `update.*` (self-update staleness warnings). Each keeps its single-knob
+//! env var above the layer (precedence unchanged) and its built-in constant
+//! as the bottom default. Bool feature toggles and path/binary overrides
+//! (`LOOM_PID_FILE`, `LOOM_SHARED_TOKENS_DIR`, `LOOM_QUARANTINE_RECONCILE`,
+//! …) deliberately stay env-only: they are operational switches, not
+//! optimizer coordinates.
 
 use anyhow::{bail, Result};
 use clap::Args;
@@ -65,6 +80,39 @@ use crate::work_finder::{
     DEFAULT_MAX_ADMISSIONS_PER_TICK, DEFAULT_WORK_FINDER_INTERVAL_SECS,
     DEFAULT_WORK_FINDER_MAX_CONCURRENT,
 };
+
+// Tranche-2 schema lives in its own file (source-file ratchet — see the
+// sibling's header). Structs are re-exported so `Hyperparameters`' field
+// types and every external `hyperparams::*Params` reference are unchanged.
+mod tranche2;
+pub use tranche2::{
+    HeadroomParams, ObservabilityParams, ProcessParams, SupervisionParams, UpdateParams,
+};
+
+// Tranche-2 built-in defaults — each is the constant its consumer module uses
+// today, re-exported here as the bottom of that field's precedence chain so
+// the two can never drift apart.
+use crate::api_keys_pool::inflight::DEFAULT_STALE_SECS as DEFAULT_API_KEY_INFLIGHT_STALE_SECS;
+use crate::disk_headroom::DEFAULT_PER_WORKTREE_GB;
+use crate::epic_supervisor::{DEFAULT_INFLIGHT_TTL_SECS, DEFAULT_SUPERVISOR_INTERVAL_SECS};
+use crate::inflight::DEFAULT_STALE_SECS as DEFAULT_SWEEP_INFLIGHT_STALE_SECS;
+use crate::launchd_reload::{
+    DEFAULT_BOOTOUT_SETTLE_SECS, DEFAULT_BOOTSTRAP_RETRY_ATTEMPTS, DEFAULT_BOOTSTRAP_RETRY_SECS,
+};
+use crate::observability::ops::disposition::DEFAULT_REFRESH_SECS as DEFAULT_DISPOSITION_REFRESH_SECS;
+use crate::observability::ops::dwell::DEFAULT_STARVATION_SECS as DEFAULT_QUEUE_STARVATION_SECS;
+use crate::ram_headroom::DEFAULT_PER_WORKTREE_RAM_GB;
+use crate::restart_verify::{
+    DEFAULT_POLL_INTERVAL_MS, DEFAULT_POLL_SECS, DEFAULT_RECOVERY_POLL_SECS,
+};
+use crate::self_update::{DEFAULT_STALE_WARN_COMMITS, DEFAULT_STALE_WARN_HOURS};
+use crate::sweep_registry::reaper::{
+    DEFAULT_REAPER_INTERVAL_SECS as DEFAULT_SWEEP_REAPER_INTERVAL_SECS, REAP_GH_TIMEOUT_SECS,
+};
+use crate::tokens_pool::bad_tokens::{
+    DEFAULT_CLEANUP_MAX_AGE_SECS, DEFAULT_EXHAUSTION_COOLDOWN_SECS,
+};
+use crate::worktree_activity::DEFAULT_ACTIVITY_WINDOW_MINUTES;
 
 /// Env var carrying a **hyperparameter vector** as a JSON object — the
 /// programmatic injection surface external optimizers (CMA-ES loops) set per
@@ -84,10 +132,11 @@ static RESOLVED: OnceLock<Resolved> = OnceLock::new();
 /// The startup vector's digest, computed once so the per-span stamper never
 /// re-serializes (or, worse, allocates) per span.
 static DIGEST: OnceLock<String> = OnceLock::new();
-/// The workspace root `startup_init` resolved against — the anchor for
-/// hot-applied knob re-reads ([`lease_ttl_minutes_from_layer`]). `None`
-/// before `startup_init` runs.
-static ROOT: OnceLock<PathBuf> = OnceLock::new();
+// The workspace root `startup_init` resolved against is owned by
+// `config_resolver` (`startup_root`) — the anchor for hot-applied knob
+// re-reads, shared with every consumer of `u64_from_layer_global`. Owning it
+// there (not here) keeps a consumer's dependency edge pointing at the small
+// resolver module instead of this one.
 
 // ============================================================================
 // Typed schema
@@ -160,6 +209,11 @@ pub struct Hyperparameters {
     pub dispatch: DispatchParams,
     pub lifecycle: LifecycleParams,
     pub rework: ReworkParams,
+    pub supervision: SupervisionParams,
+    pub headroom: HeadroomParams,
+    pub process: ProcessParams,
+    pub observability: ObservabilityParams,
+    pub update: UpdateParams,
 }
 
 impl Default for Hyperparameters {
@@ -177,6 +231,39 @@ impl Default for Hyperparameters {
             rework: ReworkParams {
                 build_backoff_high: DEFAULT_HIGH,
                 build_backoff_low: DEFAULT_LOW,
+            },
+            supervision: SupervisionParams {
+                epic_supervisor_interval_secs: DEFAULT_SUPERVISOR_INTERVAL_SECS,
+                epic_inflight_ttl_secs: DEFAULT_INFLIGHT_TTL_SECS,
+                sweep_reaper_interval_secs: DEFAULT_SWEEP_REAPER_INTERVAL_SECS,
+                reap_gh_timeout_secs: REAP_GH_TIMEOUT_SECS,
+                sweep_inflight_stale_secs: DEFAULT_SWEEP_INFLIGHT_STALE_SECS,
+                api_key_inflight_stale_secs: DEFAULT_API_KEY_INFLIGHT_STALE_SECS,
+                token_exhaustion_cooldown_secs: DEFAULT_EXHAUSTION_COOLDOWN_SECS as u64,
+                bad_token_cleanup_max_age_secs: DEFAULT_CLEANUP_MAX_AGE_SECS as u64,
+                worktree_activity_window_minutes: DEFAULT_ACTIVITY_WINDOW_MINUTES,
+            },
+            headroom: HeadroomParams {
+                per_worktree_gb: DEFAULT_PER_WORKTREE_GB,
+                per_worktree_ram_gb: DEFAULT_PER_WORKTREE_RAM_GB,
+            },
+            process: ProcessParams {
+                restart_poll_secs: DEFAULT_POLL_SECS,
+                restart_kickstart_poll_secs: DEFAULT_RECOVERY_POLL_SECS,
+                restart_poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+                bootout_settle_secs: DEFAULT_BOOTOUT_SETTLE_SECS,
+                bootstrap_retry_attempts: DEFAULT_BOOTSTRAP_RETRY_ATTEMPTS as u64,
+                bootstrap_retry_secs: DEFAULT_BOOTSTRAP_RETRY_SECS,
+                ipc_timeout_ms: 30_000, // == cli::common::DEFAULT_IPC_TIMEOUT_MS_FLOOR (drift-guard test there)
+                lease_guard_timeout_secs: 10, // == cli::lease_co_occupancy::DEFAULT_TIMEOUT_SECS (drift-guard test there)
+            },
+            observability: ObservabilityParams {
+                dispatch_disposition_refresh_secs: DEFAULT_DISPOSITION_REFRESH_SECS as u64,
+                queue_starvation_secs: DEFAULT_QUEUE_STARVATION_SECS as u64,
+            },
+            update: UpdateParams {
+                stale_warn_commits: DEFAULT_STALE_WARN_COMMITS as u64,
+                stale_warn_hours: DEFAULT_STALE_WARN_HOURS as u64,
             },
         }
     }
@@ -209,44 +296,7 @@ pub fn env_vector() -> Result<Option<Value>, String> {
     }
 }
 
-/// Normalize an object's dotted keys into nested groups: `{"a.b": 1}` becomes
-/// `{"a": {"b": 1}}`, merging (last wins) when a dotted key splits into an
-/// existing group. Non-object values pass through untouched.
-#[must_use]
-pub fn normalize_dotted(value: &Value) -> Value {
-    let Some(obj) = value.as_object() else {
-        return value.clone();
-    };
-    let mut out = serde_json::Map::new();
-    for (key, val) in obj {
-        match key.split_once('.') {
-            None => {
-                let normalized = normalize_dotted(val);
-                // A plain key and a dotted key can address the same group
-                // (e.g. `dispatch` and `dispatch.maxConcurrent`); deep-merge
-                // so both survive, the later key winning per field.
-                out.insert(
-                    key.clone(),
-                    match out.get(key) {
-                        Some(existing) => config_resolver::deep_merge(existing, &normalized),
-                        None => normalized,
-                    },
-                );
-            }
-            Some((head, tail)) => {
-                let nested = normalize_dotted(&Value::Object(
-                    [(tail.to_string(), val.clone())].into_iter().collect(),
-                ));
-                let merged = match out.get(head) {
-                    Some(existing) => config_resolver::deep_merge(existing, &nested),
-                    None => nested,
-                };
-                out.insert(head.to_string(), merged);
-            }
-        }
-    }
-    Value::Object(out)
-}
+pub use crate::config_resolver::normalize_dotted;
 
 /// The hyperparameters layer for an already-resolved effective config: the
 /// committed `"hyperparameters"` block with the env vector (if any)
@@ -328,7 +378,8 @@ pub fn validate_layer(layer: &Value) -> Vec<Violation> {
         if !layer.is_null() {
             violations.push(Violation::new(
                 "hyperparameters",
-                "must be an object with `dispatch` / `lifecycle` / `rework` groups",
+                "must be an object with `dispatch` / `lifecycle` / `rework` / `supervision` / \
+                 `headroom` / `process` / `observability` / `update` groups",
             ));
         }
         return violations;
@@ -338,9 +389,15 @@ pub fn validate_layer(layer: &Value) -> Vec<Violation> {
             "dispatch" => validate_dispatch(keys, &mut violations),
             "lifecycle" => validate_lifecycle(keys, &mut violations),
             "rework" => validate_rework(keys, &mut violations),
+            "supervision" => tranche2::validate_supervision(keys, &mut violations),
+            "headroom" => tranche2::validate_headroom(keys, &mut violations),
+            "process" => tranche2::validate_process(keys, &mut violations),
+            "observability" => tranche2::validate_observability(keys, &mut violations),
+            "update" => tranche2::validate_update(keys, &mut violations),
             unknown => violations.push(Violation::new(
                 format!("hyperparameters.{unknown}"),
-                "unknown group (expected dispatch | lifecycle | rework)",
+                "unknown group (expected dispatch | lifecycle | rework | supervision | headroom | \
+                 process | observability | update)",
             )),
         }
     }
@@ -348,7 +405,7 @@ pub fn validate_layer(layer: &Value) -> Vec<Violation> {
 }
 
 /// Check one `u64` field: type first, then inclusive range.
-fn check_u64(
+pub(super) fn check_u64(
     group: &Value,
     group_name: &str,
     key: &str,
@@ -514,7 +571,7 @@ fn tier_value<'a>(
 
 /// Pick one `u64` field down the tier chain, recording its source.
 #[allow(clippy::too_many_arguments)]
-fn pick_u64(
+pub(super) fn pick_u64(
     vector: Option<&Value>,
     block: &Value,
     group: &str,
@@ -581,6 +638,11 @@ pub fn resolve_effective(root: &Path) -> Resolved {
     let idle_legacy = crate::idle_exit::parse_effective(&effective);
 
     let mut sources = BTreeMap::new();
+    // Tranche-2 groups have no legacy config tier (these knobs were env-only
+    // before consolidation): the chain is vector > block > default, resolved
+    // in the sibling (ratchet move).
+    let (supervision, headroom, process, observability, update) =
+        tranche2::resolve_tranche2(vector.as_ref(), &block, &mut sources);
     let params = Hyperparameters {
         dispatch: DispatchParams {
             tick_interval_secs: pick_u64(
@@ -665,6 +727,11 @@ pub fn resolve_effective(root: &Path) -> Resolved {
                 &mut sources,
             ) as usize,
         },
+        supervision,
+        headroom,
+        process,
+        observability,
+        update,
     };
     Resolved { params, sources }
 }
@@ -697,7 +764,7 @@ pub fn lease_ttl_minutes_from_layer() -> Option<f64> {
     // one — a legacy `autonomous.*` value keeps this `None` (the lease TTL
     // has no legacy config tier), falling through to the caller's default.
     // `None` before `startup_init` has run (no root known).
-    let root = ROOT.get()?;
+    let root = config_resolver::startup_root()?;
     let layer = layer(root);
     layer
         .get("lifecycle")
@@ -705,6 +772,23 @@ pub fn lease_ttl_minutes_from_layer() -> Option<f64> {
         .filter(|v| !v.is_null())
         .and_then(Value::as_f64)
         .filter(|mins| *mins > 0.0)
+}
+
+/// Read one `u64` tranche-2 field from an already-built layer value. `None`
+/// when the group/key is absent, `null`, or not a `u64` — the caller's env /
+/// default chain then applies. The generic sibling of the per-field accessors
+/// above: consumer modules call
+/// [`crate::config_resolver::u64_from_layer_global`] (the startup-anchored
+/// form — kept in `config_resolver` so a consumer naming it does not drag
+/// this module's dependency closure into every file-level dependency audit)
+/// between their env tier and their built-in default.
+#[must_use]
+pub fn u64_from_layer(layer: &Value, group: &str, key: &str) -> Option<u64> {
+    layer
+        .get(group)
+        .and_then(|g| g.get(key))
+        .filter(|v| !v.is_null())
+        .and_then(Value::as_u64)
 }
 
 /// Daemon-startup gate (Issue #9683): resolve the hyperparameters layer,
@@ -745,7 +829,7 @@ pub fn startup_init(root: &Path) -> Result<()> {
     let digest = resolved.digest();
     let _ = RESOLVED.set(resolved);
     let _ = DIGEST.set(digest);
-    let _ = ROOT.set(root.to_path_buf());
+    config_resolver::set_startup_root(root);
     log::info!(
         "hyperparams: digest={} ({fields})",
         DIGEST.get().map(String::as_str).unwrap_or_default()
@@ -876,6 +960,124 @@ impl HyperparamsArgs {
             "rework.buildBackoffLow         = {:>6}  [{}]",
             resolved.params.rework.build_backoff_low,
             resolved.sources["rework.buildBackoffLow"].as_str()
+        );
+        println!(
+            "supervision.epicSupervisorIntervalSecs  = {:>6}  [{}]",
+            resolved.params.supervision.epic_supervisor_interval_secs,
+            resolved.sources["supervision.epicSupervisorIntervalSecs"].as_str()
+        );
+        println!(
+            "supervision.epicInflightTtlSecs         = {:>6}  [{}]",
+            resolved.params.supervision.epic_inflight_ttl_secs,
+            resolved.sources["supervision.epicInflightTtlSecs"].as_str()
+        );
+        println!(
+            "supervision.sweepReaperIntervalSecs     = {:>6}  [{}]",
+            resolved.params.supervision.sweep_reaper_interval_secs,
+            resolved.sources["supervision.sweepReaperIntervalSecs"].as_str()
+        );
+        println!(
+            "supervision.reapGhTimeoutSecs           = {:>6}  [{}]",
+            resolved.params.supervision.reap_gh_timeout_secs,
+            resolved.sources["supervision.reapGhTimeoutSecs"].as_str()
+        );
+        println!(
+            "supervision.sweepInflightStaleSecs      = {:>6}  [{}]",
+            resolved.params.supervision.sweep_inflight_stale_secs,
+            resolved.sources["supervision.sweepInflightStaleSecs"].as_str()
+        );
+        println!(
+            "supervision.apiKeyInflightStaleSecs     = {:>6}  [{}]",
+            resolved.params.supervision.api_key_inflight_stale_secs,
+            resolved.sources["supervision.apiKeyInflightStaleSecs"].as_str()
+        );
+        println!(
+            "supervision.tokenExhaustionCooldownSecs = {:>6}  [{}]",
+            resolved.params.supervision.token_exhaustion_cooldown_secs,
+            resolved.sources["supervision.tokenExhaustionCooldownSecs"].as_str()
+        );
+        println!(
+            "supervision.badTokenCleanupMaxAgeSecs   = {:>6}  [{}]",
+            resolved.params.supervision.bad_token_cleanup_max_age_secs,
+            resolved.sources["supervision.badTokenCleanupMaxAgeSecs"].as_str()
+        );
+        println!(
+            "supervision.worktreeActivityWindowMin.  = {:>6}  [{}]",
+            resolved.params.supervision.worktree_activity_window_minutes,
+            resolved.sources["supervision.worktreeActivityWindowMinutes"].as_str()
+        );
+        println!(
+            "headroom.perWorktreeGb                  = {:>6}  [{}]",
+            resolved.params.headroom.per_worktree_gb,
+            resolved.sources["headroom.perWorktreeGb"].as_str()
+        );
+        println!(
+            "headroom.perWorktreeRamGb               = {:>6}  [{}]",
+            resolved.params.headroom.per_worktree_ram_gb,
+            resolved.sources["headroom.perWorktreeRamGb"].as_str()
+        );
+        println!(
+            "process.restartPollSecs                 = {:>6}  [{}]",
+            resolved.params.process.restart_poll_secs,
+            resolved.sources["process.restartPollSecs"].as_str()
+        );
+        println!(
+            "process.restartKickstartPollSecs        = {:>6}  [{}]",
+            resolved.params.process.restart_kickstart_poll_secs,
+            resolved.sources["process.restartKickstartPollSecs"].as_str()
+        );
+        println!(
+            "process.restartPollIntervalMs           = {:>6}  [{}]",
+            resolved.params.process.restart_poll_interval_ms,
+            resolved.sources["process.restartPollIntervalMs"].as_str()
+        );
+        println!(
+            "process.bootoutSettleSecs               = {:>6}  [{}]",
+            resolved.params.process.bootout_settle_secs,
+            resolved.sources["process.bootoutSettleSecs"].as_str()
+        );
+        println!(
+            "process.bootstrapRetryAttempts          = {:>6}  [{}]",
+            resolved.params.process.bootstrap_retry_attempts,
+            resolved.sources["process.bootstrapRetryAttempts"].as_str()
+        );
+        println!(
+            "process.bootstrapRetrySecs              = {:>6}  [{}]",
+            resolved.params.process.bootstrap_retry_secs,
+            resolved.sources["process.bootstrapRetrySecs"].as_str()
+        );
+        println!(
+            "process.ipcTimeoutMs                    = {:>6}  [{}]",
+            resolved.params.process.ipc_timeout_ms,
+            resolved.sources["process.ipcTimeoutMs"].as_str()
+        );
+        println!(
+            "process.leaseGuardTimeoutSecs           = {:>6}  [{}]",
+            resolved.params.process.lease_guard_timeout_secs,
+            resolved.sources["process.leaseGuardTimeoutSecs"].as_str()
+        );
+        println!(
+            "observability.dispatchDispositionRefreshSecs = {:>6}  [{}]",
+            resolved
+                .params
+                .observability
+                .dispatch_disposition_refresh_secs,
+            resolved.sources["observability.dispatchDispositionRefreshSecs"].as_str()
+        );
+        println!(
+            "observability.queueStarvationSecs            = {:>6}  [{}]",
+            resolved.params.observability.queue_starvation_secs,
+            resolved.sources["observability.queueStarvationSecs"].as_str()
+        );
+        println!(
+            "update.staleWarnCommits                 = {:>6}  [{}]",
+            resolved.params.update.stale_warn_commits,
+            resolved.sources["update.staleWarnCommits"].as_str()
+        );
+        println!(
+            "update.staleWarnHours                   = {:>6}  [{}]",
+            resolved.params.update.stale_warn_hours,
+            resolved.sources["update.staleWarnHours"].as_str()
         );
         Ok(())
     }

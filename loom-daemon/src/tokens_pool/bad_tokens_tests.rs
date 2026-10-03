@@ -1197,3 +1197,34 @@ fn ambiguous_entry_ignores_a_ranking_row_that_predates_the_mark() {
         "a stale pre-mark .ranking row must not release the entry"
     );
 }
+
+// ===== resolve tier precedence (env > hyperparameters layer > default) =====
+//
+// Pure-tier tests: the *_from helpers take already-parsed Option tiers, so
+// these never touch process-global env state (no `#[serial]` needed).
+
+#[test]
+fn cooldown_tiers_env_beats_layer_beats_default() {
+    assert_eq!(cooldown_secs_from(Some(600), Some(7200)), 600);
+    assert_eq!(cooldown_secs_from(None, Some(7200)), 7200);
+    assert_eq!(cooldown_secs_from(None, None), DEFAULT_EXHAUSTION_COOLDOWN_SECS);
+}
+
+#[test]
+fn cooldown_tiers_zero_or_invalid_falls_through_to_next_tier() {
+    // Env set-but-zero falls through to the layer, then the default.
+    assert_eq!(cooldown_secs_from(Some(0), Some(7200)), 7200);
+    assert_eq!(cooldown_secs_from(Some(0), None), DEFAULT_EXHAUSTION_COOLDOWN_SECS);
+    // A zero layer is dropped the same way.
+    assert_eq!(cooldown_secs_from(None, Some(0)), DEFAULT_EXHAUSTION_COOLDOWN_SECS);
+}
+
+/// `badTokenCleanupMaxAgeSecs` has no env tier (promoted from a bare
+/// constant): the layer is the only override above the default.
+#[test]
+fn cleanup_max_age_layer_over_default() {
+    assert_eq!(cleanup_max_age_secs_from(Some(3600)), 3600);
+    assert_eq!(cleanup_max_age_secs_from(None), DEFAULT_CLEANUP_MAX_AGE_SECS);
+    // A zero layer falls through to the default, like every other tier.
+    assert_eq!(cleanup_max_age_secs_from(Some(0)), DEFAULT_CLEANUP_MAX_AGE_SECS);
+}

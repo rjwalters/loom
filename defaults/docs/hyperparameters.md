@@ -50,6 +50,73 @@ below. Types/ranges are strict **on this surface** (see Validation).
 | `lifecycle` | `idleExitMinutes` | 60 | 1–10080 | Idle-exit turnaround (#4467) | `autonomous.idleExit.idleMinutes` | `LOOM_AUTONOMOUS_IDLE_EXIT_MINUTES` |
 | `rework` | `buildBackoffHigh` | 40 | 1–100000 | PR-debt level that engages the build back-off (#9410) | `autonomous.workFinder.buildBackoff.high` | — |
 | `rework` | `buildBackoffLow` | 25 | 0–100000, `< high` | PR-debt level that releases it | `autonomous.workFinder.buildBackoff.low` | — |
+| `supervision` | `epicSupervisorIntervalSecs` | 300 | 30–3600 | Epic-supervisor tick cadence | — | `LOOM_EPIC_SUPERVISOR_INTERVAL_SECS` |
+| `supervision` | `epicInflightTtlSecs` | 900 | 60–86400 | Epic-supervisor inflight-record freshness | — | `LOOM_EPIC_INFLIGHT_TTL_SECS` |
+| `supervision` | `sweepReaperIntervalSecs` | 30 | 5–3600 | Sweep-registry reaper tick cadence | — | `LOOM_SWEEP_REAPER_INTERVAL_SECS` |
+| `supervision` | `reapGhTimeoutSecs` | 5 | 1–600 | One reaper `gh api` call budget | — | `LOOM_REAP_GH_TIMEOUT_SECS` |
+| `supervision` | `sweepInflightStaleSecs` | 14400 | 60–604800 | Sweep inflight-record staleness | — | `LOOM_INFLIGHT_STALE_SECS` |
+| `supervision` | `apiKeyInflightStaleSecs` | 14400 | 60–604800 | API-key pool inflight staleness | — | `LOOM_API_KEY_INFLIGHT_STALE_SECS` |
+| `supervision` | `tokenExhaustionCooldownSecs` | 21600 | 60–604800 | Exhausted-token cooldown before re-probe | — | `LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS` |
+| `supervision` | `badTokenCleanupMaxAgeSecs` | 86400 | 3600–2592000 | Age at which a cleaned bad-token record is deleted | — | — |
+| `supervision` | `worktreeActivityWindowMinutes` | 30 | 1–1440 | Inactivity window the activity classifier treats as idle | — | `LOOM_WORKTREE_ACTIVITY_WINDOW_MINUTES` |
+| `headroom` | `perWorktreeGb` | 2 | 1–1024 | Disk GB reserved per live worktree in admission accounting | — | `LOOM_PER_WORKTREE_GB` |
+| `headroom` | `perWorktreeRamGb` | 2 | 1–1024 | RAM GB reserved per live worktree in admission accounting | — | `LOOM_PER_WORKTREE_RAM_GB` |
+| `process` | `restartPollSecs` | 30 | 5–3600 | Restart-verification poll cadence | — | `LOOM_DAEMON_RESTART_POLL_SECS` |
+| `process` | `restartKickstartPollSecs` | 15 | 1–600 | Kickstart poll cadence while a restart recovers | — | `LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS` |
+| `process` | `restartPollIntervalMs` | 1000 | 50–60000 | Fast in-process restart poll interval (ms) | — | `LOOM_DAEMON_RESTART_POLL_INTERVAL` |
+| `process` | `bootoutSettleSecs` | 5 | 1–120 | launchd settle wait after bootout | — | `LOOM_DAEMON_BOOTOUT_SETTLE_SECS` |
+| `process` | `bootstrapRetryAttempts` | 4 | 1–20 | launchd re-bootstrap attempts | — | `LOOM_DAEMON_BOOTSTRAP_RETRY_ATTEMPTS` |
+| `process` | `bootstrapRetrySecs` | 2 | 1–60 | launchd re-bootstrap retry spacing | — | `LOOM_DAEMON_BOOTSTRAP_RETRY_SECS` |
+| `process` | `ipcTimeoutMs` | 30000 | 1000–3600000 | Raise-only floor on client-side daemon IPC round-trips | — | `LOOM_DAEMON_IPC_TIMEOUT_MS` |
+| `process` | `leaseGuardTimeoutSecs` | 10 | 1–600 | Lease co-occupancy guard's one `gh api` read budget | — | `LOOM_WORKTREE_LEASE_GUARD_TIMEOUT` |
+| `observability` | `dispatchDispositionRefreshSecs` | 600 | 30–86400 | Dispatch-disposition view refresh cadence | — | `LOOM_DISPATCH_DISPOSITION_REFRESH_SECS` |
+| `observability` | `queueStarvationSecs` | 21600 | 300–604800 | Unclaimed age that flags queue starvation | — | `LOOM_QUEUE_STARVATION_SECS` |
+| `update` | `staleWarnCommits` | 10 | 1–100000 | Commits behind that trips the stale-install warning | — | `LOOM_SELF_UPDATE_STALE_WARN_COMMITS` |
+| `update` | `staleWarnHours` | 12 | 1–720 | Hours stale that trips the same warning | — | `LOOM_SELF_UPDATE_STALE_WARN_HOURS` |
+
+Tranche 2 notes:
+
+- The `supervision` / `headroom` / `process` / `observability` / `update`
+  groups consolidate knobs that were previously **env-only** (a `LOOM_*` var
+  plus a built-in constant, no config tier). Their single-knob env vars keep
+  working, above the layer, exactly as before.
+- The layer tier for these fields is **startup-anchored** (the daemon's
+  workspace root): it applies inside the daemon, and CLI-only code paths
+  (e.g. `loom-daemon dispatch`'s IPC budget) read env > default as before —
+  `loom-daemon hyperparams` still resolves and validates the full vector from
+  any checkout.
+- `process.ipcTimeoutMs` is **raise-only**, like its env var: a configured
+  value can only widen a client's IPC budget above its per-command floor,
+  never shorten it.
+- `sweep-lease-publish.sh` reads `lifecycle.leaseTtlMinutes` from the
+  committed block as a fallback (env > block > 15) so the shell-side
+  lease guard agrees with the daemon; the `$LOOM_HYPERPARAMS` vector tier is
+  daemon-only and invisible to shell — export `LOOM_LEASE_TTL_MINUTES`
+  alongside a vector that tunes the lease TTL.
+
+### Deliberately NOT moved onto this surface
+
+- **Bool feature toggles** (`LOOM_QUARANTINE_RECONCILE`,
+  `LOOM_MERGE_SEQUENCE_RECONCILE`, `LOOM_REVIEW_CONFLICT_RECONCILE`,
+  `LOOM_VERDICT_TREE_CARVEOUT`, `LOOM_EPIC_SUPERVISOR`,
+  `LOOM_DAEMON_RESTART_VERIFY`, `LOOM_PROFILE_PROVISION_ON_START`) — these
+  are opt-in operational switches a human flips during incident response,
+  not coordinates an optimizer samples.
+- **Path/binary overrides** (`LOOM_PID_FILE`, `LOOM_INFLIGHT_DIR`,
+  `LOOM_SHARED_TOKENS_DIR`, `LOOM_SWEEP_SPAWN_BIN`, `LOOM_DOCKER_BIN`,
+  journal/snapshot path vars, tool-home discovery like `LOOM_CODEX_HOME`) —
+  host-local by nature; a committed, fleet-shared value would be actively
+  wrong.
+- **Process/IPC markers** (`LOOM_SWEEP_ID`, `LOOM_TRACEPARENT`,
+  `LOOM_PROVENANCE_*`, claim-owned markers) — inter-process communication,
+  not configuration.
+- **Page sizes and similarity heuristics in scripts**
+  (`check-duplicate.sh`'s forge page limits and `threshold=18`,
+  `run-job.sh`'s SSH `ConnectTimeout` — already reachable via
+  `SSH_OPTS_RAW`), and the remaining bare constants in diagnostic probes
+  (`foreign_load.rs`'s 3s probe timeout / top-3 report): real values, but
+  not operator-tuning surface — promoting them would be ratchet-bait, not
+  leverage.
 
 ## Precedence
 
@@ -153,8 +220,13 @@ non-booting daemon as an infeasible point, not a crash.
 
 ## Tranche roadmap
 
-Tranche 1 (this issue) consolidates the seven fields above. Later tranches
-migrate the remaining tunables — host-breaker thresholds, admission-brake
-load, merge-train bounds, role execution budgets — onto the same surface.
+Tranche 1 consolidated the seven dispatch/lifecycle/rework fields. Tranche 2
+consolidated the env-only janitor/lifecycle numeric knobs into the
+`supervision`, `headroom`, `process`, `observability` and `update` groups
+(table above). Still on the roadmap: knobs that already have legacy
+`autonomous.*` config homes — host-breaker thresholds, admission-brake load,
+merge-train bounds, role execution budgets — migrate onto the same surface in
+a later tranche (they are already settable per-repo today, so the move is
+provenance/optimizer surface, not new capability).
 Adding a field is: one struct entry + range check in `hyperparams.rs`, one
 consumer overlay, one row in the table above.

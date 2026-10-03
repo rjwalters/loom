@@ -62,13 +62,39 @@ pub const PER_WORKTREE_RAM_GB_ENV: &str = "LOOM_PER_WORKTREE_RAM_GB";
 /// same posture disk headroom takes, and just as tunable per host.
 pub const DEFAULT_PER_WORKTREE_RAM_GB: u64 = 2;
 
-/// Resolve the per-worktree RAM GB estimate from [`PER_WORKTREE_RAM_GB_ENV`],
-/// flooring to a minimum of 1 (mirrors [`crate::disk_headroom::per_worktree_gb`]).
+/// Resolve the per-worktree RAM GB estimate with precedence **env
+/// ([`PER_WORKTREE_RAM_GB_ENV`], which sits ABOVE the layer) > hyperparameters
+/// layer (`hyperparameters.headroom.perWorktreeRamGb`, startup-anchored —
+/// `None` outside a running daemon) > [`DEFAULT_PER_WORKTREE_RAM_GB`]**,
+/// flooring to a minimum of 1 (mirrors
+/// [`crate::disk_headroom::per_worktree_gb`]; a zero or unparseable value at
+/// any tier falls through to the next).
 #[must_use]
 pub fn per_worktree_ram_gb() -> u64 {
-    std::env::var(PER_WORKTREE_RAM_GB_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    per_worktree_ram_gb_with_layer(crate::config_resolver::u64_from_layer_global(
+        "headroom",
+        "perWorktreeRamGb",
+    ))
+}
+
+/// [`per_worktree_ram_gb`] with the layer tier injected — the testable form
+/// (no process-global read). Precedence: env > `layer` > default.
+#[must_use]
+pub fn per_worktree_ram_gb_with_layer(layer: Option<u64>) -> u64 {
+    per_worktree_ram_gb_from(
+        std::env::var(PER_WORKTREE_RAM_GB_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok()),
+        layer,
+    )
+}
+
+/// Pure **env > layer > default** precedence over already-parsed tiers —
+/// split out so tests exercise the precedence without touching process-global
+/// env state. A value below 1 at any tier falls through to the next.
+fn per_worktree_ram_gb_from(env: Option<u64>, layer: Option<u64>) -> u64 {
+    env.filter(|&n| n >= 1)
+        .or(layer)
         .filter(|&n| n >= 1)
         .unwrap_or(DEFAULT_PER_WORKTREE_RAM_GB)
 }
@@ -277,6 +303,21 @@ mod tests {
         std::env::set_var(PER_WORKTREE_RAM_GB_ENV, "garbage");
         assert_eq!(per_worktree_ram_gb(), DEFAULT_PER_WORKTREE_RAM_GB);
         std::env::remove_var(PER_WORKTREE_RAM_GB_ENV);
+    }
+
+    // ===== hyperparameters layer tier (tranche 2) =====
+    //
+    // Pure-tier tests: `per_worktree_ram_gb_from` takes already-parsed Option
+    // tiers, so these never touch process-global env state.
+
+    #[test]
+    fn per_worktree_ram_gb_tiers_env_beats_layer_beats_default() {
+        assert_eq!(per_worktree_ram_gb_from(Some(4), Some(6)), 4);
+        assert_eq!(per_worktree_ram_gb_from(None, Some(6)), 6);
+        assert_eq!(per_worktree_ram_gb_from(None, None), DEFAULT_PER_WORKTREE_RAM_GB);
+        // Zero/invalid at any tier falls through to the next.
+        assert_eq!(per_worktree_ram_gb_from(Some(0), Some(6)), 6);
+        assert_eq!(per_worktree_ram_gb_from(None, Some(0)), DEFAULT_PER_WORKTREE_RAM_GB);
     }
 
     // ===================================================================

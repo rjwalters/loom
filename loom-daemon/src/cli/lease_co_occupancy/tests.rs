@@ -341,3 +341,34 @@ fn the_forge_read_projects_the_author() {
     let recorded = fs::read_to_string(&args).unwrap();
     assert!(recorded.contains(AUTHOR_JQ), "{recorded}");
 }
+
+// ---- hyperparameters layer tier (tranche 2) ----
+//
+// Pure-tier tests: `timeout_secs_from` takes already-parsed Option tiers, so
+// these never touch process-global env state (no `#[serial]` needed).
+
+/// Drift guard: `hyperparams.rs`'s `ProcessParams::default()` sources its
+/// `lease_guard_timeout_secs` field from the same documented literal (its
+/// comment names this test) — if the two ever diverge, the daemon and the
+/// worktree-layer guard would disagree about the same bound.
+#[test]
+fn lease_guard_timeout_default_stays_in_sync_with_the_hyperparams_literal() {
+    assert_eq!(
+        DEFAULT_TIMEOUT_SECS,
+        loom_daemon::hyperparams::Hyperparameters::default()
+            .process
+            .lease_guard_timeout_secs
+    );
+}
+
+#[test]
+fn lease_guard_timeout_tiers_env_beats_layer_beats_default() {
+    assert_eq!(timeout_secs_from(Some(3), Some(20)), 3);
+    assert_eq!(timeout_secs_from(None, Some(20)), 20);
+    assert_eq!(timeout_secs_from(None, None), DEFAULT_TIMEOUT_SECS);
+    // The env tier is honored verbatim (a parsed 0 means "bound the read at
+    // zero" — an instant fail-open, as before).
+    assert_eq!(timeout_secs_from(Some(0), Some(20)), 0);
+    // A zero layer is treated as unset and falls through to the default.
+    assert_eq!(timeout_secs_from(None, Some(0)), DEFAULT_TIMEOUT_SECS);
+}

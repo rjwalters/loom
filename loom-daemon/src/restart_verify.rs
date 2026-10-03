@@ -104,7 +104,12 @@
 //! `LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS`), the plain-never-`-k` kickstart,
 //! and the `ActiveState == failed`-gated systemd recovery are all lifted 1:1
 //! from `loom-daemon-update.sh` so the two paths cannot drift into different
-//! answers on the same host.
+//! answers on the same host. Each numeric knob additionally reads a
+//! `hyperparameters.process.*` layer tier (`.loom/config.json` →
+//! `"hyperparameters"`) *below* its env var — the env var stays the top tier,
+//! so an existing operator override keeps winning. The bool feature toggle
+//! (`LOOM_DAEMON_RESTART_VERIFY`) is deliberately env-only: booleans are not
+//! in the hyperparameters surface.
 //!
 //! # A negative launchd probe is not proof of anything (#6101)
 //!
@@ -137,21 +142,41 @@ use std::time::{Duration, Instant};
 pub const VERIFY_ENV: &str = "LOOM_DAEMON_RESTART_VERIFY";
 
 /// Seconds to wait for the supervisor's OWN relaunch before self-healing.
-/// Same name and default (30) as `loom-daemon-update.sh`.
+/// Same name and default (30) as `loom-daemon-update.sh`. The env var sits
+/// above the `hyperparameters.process.restartPollSecs` layer.
 pub const POLL_SECS_ENV: &str = "LOOM_DAEMON_RESTART_POLL_SECS";
-/// Default for [`POLL_SECS_ENV`].
+/// Default for [`POLL_SECS_ENV`] (and the `hyperparameters.process.restartPollSecs`
+/// layer default).
 pub const DEFAULT_POLL_SECS: u64 = 30;
 
 /// Seconds to wait for the *self-heal* to take effect, after the supervisor's
-/// own relaunch did not. Same name and default (15) as the update script.
+/// own relaunch did not. Same name and default (15) as the update script. The
+/// env var sits above the `hyperparameters.process.restartKickstartPollSecs`
+/// layer.
 pub const RECOVERY_POLL_SECS_ENV: &str = "LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS";
-/// Default for [`RECOVERY_POLL_SECS_ENV`].
+/// Default for [`RECOVERY_POLL_SECS_ENV`] (and the
+/// `hyperparameters.process.restartKickstartPollSecs` layer default).
 pub const DEFAULT_RECOVERY_POLL_SECS: u64 = 15;
 
-/// Seconds between polls. Same name and default (1) as the update script.
+/// Seconds between polls. Same name and default (1) as the update script. The
+/// env var sits above the `hyperparameters.process.restartPollIntervalMs`
+/// layer (note the layer key is in *milliseconds*, like the default below).
 pub const POLL_INTERVAL_SECS_ENV: &str = "LOOM_DAEMON_RESTART_POLL_INTERVAL";
-/// Default for [`POLL_INTERVAL_SECS_ENV`].
+/// Default for [`POLL_INTERVAL_SECS_ENV`] (and the
+/// `hyperparameters.process.restartPollIntervalMs` layer default).
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
+
+// The tranche-2 hyperparameters layer tier of the knobs above (precedence
+// **single-knob env var > `hyperparameters.process.*` layer > default**) lives
+// in the sibling `knob_layer` module — this file sat at the file-size
+// ratchet's edge, and the size policy sends new code to a NEW sibling module.
+// Every name is re-exported here, so all public paths are unchanged.
+mod knob_layer;
+
+pub use knob_layer::{
+    resolve_configured_poll_secs, resolve_configured_poll_secs_with_layer,
+    resolve_interval_with_layer, resolve_recovery_poll_secs, resolve_recovery_poll_secs_with_layer,
+};
 
 /// Wall-clock bound on every query-only subprocess probe here (`systemctl
 /// show`, `launchctl print`, `kill -0`, `id -u`). Mirrors
@@ -385,16 +410,6 @@ pub fn resolve_secs(raw: Option<&str>, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Resolve the configured post-restart verification poll bound from
-/// [`POLL_SECS_ENV`] (or [`DEFAULT_POLL_SECS`]) — the exact knob
-/// [`verify_and_heal`] itself resolves, so every caller describing this bound
-/// in a log line (Issue #6969) can never disagree with the verifier that
-/// actually polls against it.
-#[must_use]
-pub fn resolve_configured_poll_secs() -> u64 {
-    resolve_secs(std::env::var(POLL_SECS_ENV).ok().as_deref(), DEFAULT_POLL_SECS)
-}
-
 /// The shared "here is what confirms this relaunch, and by when" sentence
 /// appended to every in-process drain-and-restart exit that expects a
 /// relaunch (Issue #6969 AC2 — the auto-update roll's own "drain-and-restart
@@ -431,17 +446,18 @@ pub fn relaunch_verify_note(supervisor: &str, verify_poll_secs: u64) -> String {
 }
 
 /// Read the poll interval, which the shell implementation allows to be
-/// fractional (e.g. `0.2`). Falls back to [`DEFAULT_POLL_INTERVAL_MS`] on
-/// absent/unparsable/non-positive input.
+/// fractional (e.g. `0.2`). Precedence: the raw override (read from
+/// [`POLL_INTERVAL_SECS_ENV`] at the call site), else the hyperparameters
+/// layer (`hyperparameters.process.restartPollIntervalMs`, startup-anchored —
+/// `None` outside a running daemon), else [`DEFAULT_POLL_INTERVAL_MS`].
+/// Falls back to the default on absent/unparsable/non-positive input at
+/// either tier. The tier plumbing lives in the sibling `knob_layer` module.
 #[must_use]
 pub fn resolve_interval(raw: Option<&str>) -> Duration {
-    let millis = raw
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .map(|v| (v * 1000.0) as u64)
-        .filter(|ms| *ms > 0)
-        .unwrap_or(DEFAULT_POLL_INTERVAL_MS);
-    Duration::from_millis(millis)
+    resolve_interval_with_layer(
+        raw,
+        crate::config_resolver::u64_from_layer_global("process", "restartPollIntervalMs"),
+    )
 }
 
 /// The systemd `--user` unit name, mirroring `resolve_systemd_unit()` in
@@ -791,11 +807,8 @@ pub fn warn_if_stale_unit(supervisor: Supervisor) {
 /// never fire — so without this the daemon simply stays down.
 #[must_use]
 pub fn verify_and_heal(supervisor: Supervisor, pre_pid: Option<u32>) -> RelaunchOutcome {
-    let poll_secs = resolve_secs(std::env::var(POLL_SECS_ENV).ok().as_deref(), DEFAULT_POLL_SECS);
-    let recovery_secs = resolve_secs(
-        std::env::var(RECOVERY_POLL_SECS_ENV).ok().as_deref(),
-        DEFAULT_RECOVERY_POLL_SECS,
-    );
+    let poll_secs = resolve_configured_poll_secs();
+    let recovery_secs = resolve_recovery_poll_secs();
     let interval = resolve_interval(std::env::var(POLL_INTERVAL_SECS_ENV).ok().as_deref());
 
     eprintln!(

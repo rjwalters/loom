@@ -191,28 +191,67 @@ pub const STALE_WARN_COMMITS_ENV: &str = "LOOM_SELF_UPDATE_STALE_WARN_COMMITS";
 /// Env override for [`DEFAULT_STALE_WARN_HOURS`].
 pub const STALE_WARN_HOURS_ENV: &str = "LOOM_SELF_UPDATE_STALE_WARN_HOURS";
 
-/// Resolve the commit-count warn threshold: env override, else
-/// [`DEFAULT_STALE_WARN_COMMITS`]. A zero/unparseable env value falls back to
-/// the default rather than warning on every single stale commit.
+/// Resolve the commit-count warn threshold: env override, else the
+/// hyperparameters layer (`hyperparameters.update.staleWarnCommits`,
+/// startup-anchored — `None` outside a running daemon), else
+/// [`DEFAULT_STALE_WARN_COMMITS`]. A zero/unparseable value at any tier
+/// falls through to the next rather than warning on every single stale
+/// commit.
 #[must_use]
 pub fn resolve_stale_warn_commits() -> u32 {
-    std::env::var(STALE_WARN_COMMITS_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_STALE_WARN_COMMITS)
+    resolve_stale_warn_commits_with_layer(crate::config_resolver::u64_from_layer_global(
+        "update",
+        "staleWarnCommits",
+    ))
 }
 
-/// Resolve the elapsed-hours warn threshold: env override, else
-/// [`DEFAULT_STALE_WARN_HOURS`]. A zero/unparseable env value falls back to
-/// the default.
+/// [`resolve_stale_warn_commits`] with the layer tier injected — the testable
+/// form (no process-global read). Precedence: env > `layer` > default.
+#[must_use]
+pub fn resolve_stale_warn_commits_with_layer(layer: Option<u64>) -> u32 {
+    warn_threshold_from(
+        std::env::var(STALE_WARN_COMMITS_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok()),
+        layer,
+        DEFAULT_STALE_WARN_COMMITS,
+    )
+}
+
+/// Resolve the elapsed-hours warn threshold: env override, else the
+/// hyperparameters layer (`hyperparameters.update.staleWarnHours`), else
+/// [`DEFAULT_STALE_WARN_HOURS`]. A zero/unparseable value at any tier falls
+/// through to the next.
 #[must_use]
 pub fn resolve_stale_warn_hours() -> u32 {
-    std::env::var(STALE_WARN_HOURS_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
+    resolve_stale_warn_hours_with_layer(crate::config_resolver::u64_from_layer_global(
+        "update",
+        "staleWarnHours",
+    ))
+}
+
+/// [`resolve_stale_warn_hours`] with the layer tier injected — the testable
+/// form. Precedence: env > `layer` > default.
+#[must_use]
+pub fn resolve_stale_warn_hours_with_layer(layer: Option<u64>) -> u32 {
+    warn_threshold_from(
+        std::env::var(STALE_WARN_HOURS_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok()),
+        layer,
+        DEFAULT_STALE_WARN_HOURS,
+    )
+}
+
+/// Pure **env > layer > default** precedence over already-parsed tiers — the
+/// shared core of both warn thresholds, split out so tests exercise the
+/// precedence without touching process-global env state. A zero/unparseable
+/// value at any tier falls through to the next.
+fn warn_threshold_from(env: Option<u64>, layer: Option<u64>, default: u32) -> u32 {
+    env.filter(|&n| n > 0)
+        .or(layer)
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_STALE_WARN_HOURS)
+        .map_or(default, |n| u32::try_from(n).unwrap_or(default))
 }
 
 /// Pure warning-formatting logic (Issue #6261's staleness surface), split out
@@ -887,5 +926,26 @@ mod tests {
 
         std::env::remove_var(STALE_WARN_COMMITS_ENV);
         std::env::remove_var(STALE_WARN_HOURS_ENV);
+    }
+
+    // ===== hyperparameters layer tier (tranche 2) =====
+    //
+    // Pure-tier tests: `warn_threshold_from` takes already-parsed Option
+    // tiers, so these never touch process-global env state.
+
+    #[test]
+    fn stale_warn_tiers_env_beats_layer_beats_default() {
+        assert_eq!(warn_threshold_from(Some(30), Some(50), DEFAULT_STALE_WARN_COMMITS), 30);
+        assert_eq!(warn_threshold_from(None, Some(50), DEFAULT_STALE_WARN_COMMITS), 50);
+        assert_eq!(
+            warn_threshold_from(None, None, DEFAULT_STALE_WARN_COMMITS),
+            DEFAULT_STALE_WARN_COMMITS
+        );
+        // Zero/invalid at any tier falls through to the next.
+        assert_eq!(warn_threshold_from(Some(0), Some(50), DEFAULT_STALE_WARN_COMMITS), 50);
+        assert_eq!(
+            warn_threshold_from(None, Some(0), DEFAULT_STALE_WARN_HOURS),
+            DEFAULT_STALE_WARN_HOURS
+        );
     }
 }

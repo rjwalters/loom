@@ -231,15 +231,39 @@ pub fn store_dir() -> Option<PathBuf> {
     )
 }
 
-/// Resolve the staleness threshold with precedence **env > default**.
+/// Resolve the staleness threshold with precedence **env > hyperparameters
+/// layer (`hyperparameters.supervision.sweepInflightStaleSecs`,
+/// startup-anchored) > default**.
 #[must_use]
 pub fn resolve_stale() -> Duration {
-    let secs = std::env::var(INFLIGHT_STALE_SECS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    resolve_stale_with_layer(crate::config_resolver::u64_from_layer_global(
+        "supervision",
+        "sweepInflightStaleSecs",
+    ))
+}
+
+/// [`resolve_stale`] with the layer tier injected — the testable form (no
+/// process-global read). A zero/invalid value at any tier falls through to
+/// the next.
+#[must_use]
+pub fn resolve_stale_with_layer(layer: Option<u64>) -> Duration {
+    Duration::from_secs(stale_secs_from(
+        std::env::var(INFLIGHT_STALE_SECS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok()),
+        layer,
+    ))
+}
+
+/// Pure **env > layer > default** precedence over already-parsed tiers —
+/// split out so tests exercise the precedence without touching
+/// process-global env state. A zero value at any tier falls through to the
+/// next.
+fn stale_secs_from(env: Option<u64>, layer: Option<u64>) -> u64 {
+    env.filter(|&s| s > 0)
+        .or(layer)
         .filter(|&s| s > 0)
-        .unwrap_or(DEFAULT_STALE_SECS);
-    Duration::from_secs(secs)
+        .unwrap_or(DEFAULT_STALE_SECS)
 }
 
 /// Path of one fingerprint's entry directory inside `store`.
@@ -647,5 +671,26 @@ mod tests {
         assert!(listed[0].age_secs() >= 600);
 
         let _ = std::fs::remove_dir_all(&store);
+    }
+
+    // ===== resolve tier precedence (env > hyperparameters layer > default) =====
+    //
+    // Pure-tier tests: `stale_secs_from` takes already-parsed Option tiers, so
+    // these never touch process-global env state (no `#[serial]` needed).
+
+    #[test]
+    fn stale_tiers_env_beats_layer_beats_default() {
+        assert_eq!(stale_secs_from(Some(60), Some(7200)), 60);
+        assert_eq!(stale_secs_from(None, Some(7200)), 7200);
+        assert_eq!(stale_secs_from(None, None), DEFAULT_STALE_SECS);
+    }
+
+    #[test]
+    fn stale_tiers_zero_or_invalid_falls_through_to_next_tier() {
+        // Env set-but-zero falls through to the layer, then the default.
+        assert_eq!(stale_secs_from(Some(0), Some(7200)), 7200);
+        assert_eq!(stale_secs_from(Some(0), None), DEFAULT_STALE_SECS);
+        // A zero layer is dropped the same way.
+        assert_eq!(stale_secs_from(None, Some(0)), DEFAULT_STALE_SECS);
     }
 }

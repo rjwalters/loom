@@ -9,18 +9,17 @@ pub(crate) mod no_progress;
 pub(crate) mod pid_identity;
 pub(crate) mod pr_park;
 
-// ============================================================================
-// Constants
-// ============================================================================
-
-/// Default reaper polling interval in seconds. Matches
-/// `defaults/scripts/spawn-loop.sh:110` `POLL_INTERVAL`.
-pub const DEFAULT_REAPER_INTERVAL_SECS: u64 = 30;
-
-/// Environment variable for overriding the reaper interval. Naming follows
-/// the existing `LOOM_*` conventions in `main.rs` (e.g., `LOOM_CLAIM_TTL_SECS`,
-/// `LOOM_WORKSPACE`, `LOOM_SOCKET_PATH`).
-pub const REAPER_INTERVAL_ENV: &str = "LOOM_SWEEP_REAPER_INTERVAL_SECS";
+// The cadence knobs (reaper interval, per-call `gh` timeout) live in a
+// sibling module for the file-size-ratchet reason recorded there (this module
+// sits at the budget script's threshold; see `.loom/docs/file-size-policy.md`).
+// Pure move, re-exported here so every existing reference in this file and its
+// siblings is unchanged.
+mod config;
+pub(crate) use config::{reap_gh_timeout, REAP_GH_TIMEOUT, REAP_GH_TIMEOUT_SECS};
+pub use config::{
+    resolve_reaper_interval, resolve_reaper_interval_with_layer, DEFAULT_REAPER_INTERVAL_SECS,
+    REAPER_INTERVAL_ENV, REAP_GH_TIMEOUT_ENV,
+};
 
 /// Retention window after a sweep terminates before it is garbage-collected
 /// from the in-memory map. One hour matches the operator intuition that
@@ -47,23 +46,6 @@ pub const TERMINAL_RETENTION_SECS: i64 = 3600;
 /// periodic Judge role (repo-config backstop (c)) or an operator.
 pub(crate) const MAX_RESUME_ATTEMPTS: u32 = 3;
 
-/// Per-call ceiling for a best-effort `gh` subprocess invoked from the reaper
-/// (Issue #3973).
-///
-/// The reaper's forge-label reconciliation (`restore_label_to_ready`,
-/// `issue_has_blocked_label`, the quarantine label flips) runs on the
-/// `ListSweeps` / `GetSweepStatus` **read path** via [`SweepRegistry::reap_liveness`].
-/// During the 2026-07-26 incident a wedged `gh`/XPC blocked that read under the
-/// registry mutex indefinitely, so an operator `list_sweeps` hung ~15 minutes.
-/// Every reaper `gh` call is bounded to this window: on timeout the child is
-/// killed and the call is treated as the same best-effort failure any other
-/// `gh` error already is, so the in-memory liveness transition always completes.
-/// Overridable via [`REAP_GH_TIMEOUT_ENV`] for operability.
-pub(crate) const REAP_GH_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Env var overriding [`REAP_GH_TIMEOUT`] (whole seconds; zero/invalid ignored).
-pub const REAP_GH_TIMEOUT_ENV: &str = "LOOM_REAP_GH_TIMEOUT_SECS";
-
 /// Poll cadence for [`output_with_timeout`] while waiting on a reaper `gh` call.
 pub(crate) const REAP_GH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -82,18 +64,6 @@ pub(crate) fn wrapper_dispatch_enabled() -> bool {
         Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),
         Err(_) => true,
     }
-}
-
-/// Resolve the per-call reaper `gh` timeout (Issue #3973): the
-/// [`REAP_GH_TIMEOUT_ENV`] override (whole seconds, must be > 0) or the
-/// [`REAP_GH_TIMEOUT`] default.
-pub(crate) fn reap_gh_timeout() -> Duration {
-    std::env::var(REAP_GH_TIMEOUT_ENV)
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(REAP_GH_TIMEOUT)
 }
 
 /// Run `cmd` to completion but abandon (kill) it if it exceeds `timeout`
@@ -129,17 +99,6 @@ pub(crate) fn output_with_timeout(
         }
         std::thread::sleep(REAP_GH_POLL_INTERVAL);
     }
-}
-
-/// Resolve the configured reaper interval from the environment, falling
-/// back to [`DEFAULT_REAPER_INTERVAL_SECS`].
-#[must_use]
-pub fn resolve_reaper_interval() -> Duration {
-    let secs = std::env::var(REAPER_INTERVAL_ENV)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_REAPER_INTERVAL_SECS);
-    Duration::from_secs(secs)
 }
 
 /// A reaper-driven resume dispatch (#4256) whose spawn (`Command::spawn()`)

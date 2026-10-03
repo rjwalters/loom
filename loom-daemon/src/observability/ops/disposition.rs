@@ -446,12 +446,49 @@ fn failed_slugs(
         .collect()
 }
 
+/// The refresh threshold with precedence **env ([`REFRESH_SECS_ENV`], which
+/// sits ABOVE the layer) > hyperparameters layer
+/// (`hyperparameters.observability.dispatchDispositionRefreshSecs`,
+/// startup-anchored — `None` outside a running daemon) >
+/// [`DEFAULT_REFRESH_SECS`]**. A zero/invalid value at any tier falls through
+/// to the next.
+#[must_use]
+pub fn resolve_refresh_secs() -> i64 {
+    resolve_refresh_secs_with_layer(crate::config_resolver::u64_from_layer_global(
+        "observability",
+        "dispatchDispositionRefreshSecs",
+    ))
+}
+
+/// [`resolve_refresh_secs`] with the layer tier injected — the testable form
+/// (no process-global read). Precedence: env > `layer` > default.
+#[must_use]
+pub fn resolve_refresh_secs_with_layer(layer: Option<u64>) -> i64 {
+    refresh_secs_from(
+        std::env::var(REFRESH_SECS_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok()),
+        layer,
+    )
+}
+
 /// The refresh threshold: `raw` seconds when it is a positive integer,
 /// otherwise [`DEFAULT_REFRESH_SECS`].
 #[must_use]
 pub fn refresh_secs(raw: Option<&str>) -> i64 {
-    raw.and_then(|v| v.trim().parse::<i64>().ok())
-        .filter(|v| *v > 0)
+    refresh_secs_from(raw.and_then(|v| v.trim().parse::<i64>().ok()), None)
+}
+
+/// Pure **env > layer > default** precedence over already-parsed tiers —
+/// split out so tests exercise the precedence without touching process-global
+/// env state. A value ≤ 0 at any tier falls through to the next; a layer
+/// value above [`i64::MAX`] (unrepresentable as `i64`) collapses to the
+/// default.
+fn refresh_secs_from(env: Option<i64>, layer: Option<u64>) -> i64 {
+    let layer = layer.and_then(|s| i64::try_from(s).ok());
+    env.filter(|&s| s > 0)
+        .or(layer)
+        .filter(|&s| s > 0)
         .unwrap_or(DEFAULT_REFRESH_SECS)
 }
 
@@ -643,7 +680,7 @@ pub(in crate::observability) async fn record(slug_cache: &mut HashMap<String, St
         &failed,
         now,
     );
-    let refresh = Duration::seconds(refresh_secs(std::env::var(REFRESH_SECS_ENV).ok().as_deref()));
+    let refresh = Duration::seconds(resolve_refresh_secs());
     let emissions = TRACKER
         .get_or_init(|| Mutex::new(DispositionTracker::default()))
         .lock()

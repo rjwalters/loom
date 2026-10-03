@@ -758,3 +758,22 @@ fn refresh_secs_falls_back_to_the_default_on_bad_input() {
     assert_eq!(refresh_secs(Some("0")), DEFAULT_REFRESH_SECS);
     assert_eq!(refresh_secs(Some("120")), 120);
 }
+
+// ===== hyperparameters layer tier (tranche 2) =====
+//
+// Pure-tier tests: `refresh_secs_from` takes already-parsed Option tiers, so
+// these never touch process-global env state (no `#[serial]` needed).
+
+#[test]
+fn refresh_secs_tiers_env_beats_layer_beats_default() {
+    assert_eq!(refresh_secs_from(Some(120), Some(1800)), 120);
+    assert_eq!(refresh_secs_from(None, Some(1800)), 1800);
+    assert_eq!(refresh_secs_from(None, None), DEFAULT_REFRESH_SECS);
+    // Zero/negative at any tier falls through to the next.
+    assert_eq!(refresh_secs_from(Some(0), Some(1800)), 1800);
+    assert_eq!(refresh_secs_from(Some(-5), Some(1800)), 1800);
+    assert_eq!(refresh_secs_from(None, Some(0)), DEFAULT_REFRESH_SECS);
+    // A layer value above i64::MAX cannot be represented and collapses to
+    // the default rather than wrapping.
+    assert_eq!(refresh_secs_from(None, Some(i64::MAX as u64 + 1)), DEFAULT_REFRESH_SECS);
+}

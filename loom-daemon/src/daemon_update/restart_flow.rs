@@ -104,9 +104,14 @@ fn no_restart(p: &Plan<'_>) -> ! {
 }
 
 /// The poll window, its human note, the kickstart window and the interval.
+///
+/// The poll-secs and kickstart fallbacks resolve through
+/// `restart_verify`'s layered resolvers (env >
+/// `hyperparameters.process.restartPollSecs` /
+/// `restartKickstartPollSecs` > default) so this report can never disagree
+/// with the verifier that actually polls against those bounds.
 fn poll_windows(p: &Plan<'_>, default_note: &str) -> (String, String, String, std::time::Duration) {
-    let kickstart = util::env_non_empty("LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS")
-        .unwrap_or_else(|| "15".to_string());
+    let kickstart = crate::restart_verify::resolve_recovery_poll_secs().to_string();
     let interval = poll_interval();
     // An explicit override always wins, drain or not — an operator (or a test)
     // who asked for a specific poll window gets exactly that.
@@ -124,7 +129,12 @@ fn poll_windows(p: &Plan<'_>, default_note: &str) -> (String, String, String, st
             interval,
         );
     }
-    ("30".to_string(), default_note.to_string(), kickstart, interval)
+    (
+        crate::restart_verify::resolve_configured_poll_secs().to_string(),
+        default_note.to_string(),
+        kickstart,
+        interval,
+    )
 }
 
 /// The #5138 fail-safe report, shared by both supervised branches.

@@ -140,7 +140,20 @@ set -euo pipefail
 
 LEASE_MARKER_PREFIX="<!-- loom:lease host="
 YIELD_MARKER_PREFIX="<!-- loom:lease-yield host="
-DEFAULT_TTL_MINUTES="${LOOM_LEASE_TTL_MINUTES:-15}"
+# Lease-freshness TTL, resolved via the daemon's own hyperparams layer
+# (`hyperparameters.lifecycle.leaseTtlMinutes`, defaults/docs/hyperparameters.md)
+# instead of re-implementing that precedence chain in jq -- this script is now
+# a call-site only, not a resolver. The `$LOOM_HYPERPARAMS` vector tier is
+# covered too, since the daemon subcommand resolves it; export
+# `LOOM_LEASE_TTL_MINUTES` to override both from the shell side.
+# requires-daemon: hyperparams optional   a binary predating it (or absent) makes the `jq` read fail; DEFAULT_TTL_MINUTES then falls through to the built-in 15, same as before this script called the daemon at all.
+DEFAULT_TTL_MINUTES="${LOOM_LEASE_TTL_MINUTES:-}"
+if [[ -z "$DEFAULT_TTL_MINUTES" ]]; then
+  lease_repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  DEFAULT_TTL_MINUTES="$("${LOOM_DAEMON_BIN:-loom-daemon}" hyperparams --json "${lease_repo_root:-.}" 2>/dev/null \
+    | jq -r '.params.lifecycle.lease_ttl_minutes // empty' 2>/dev/null || true)"
+fi
+DEFAULT_TTL_MINUTES="${DEFAULT_TTL_MINUTES:-15}"
 
 # --- Opaque host id (Issue #6322, ported from sweep-lease-fence.sh) --------
 # `write_lease_comment` (`loom-daemon/src/sweep_registry/guards.rs`) publishes

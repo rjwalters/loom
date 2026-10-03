@@ -779,6 +779,10 @@ pub const SPECS: &[CheckSpec<'static>] = &[
             "loom-daemon/src/agent_skills.rs",
             "loom-daemon/src/proc_exec.rs",
             "loom-daemon/src/self_update.rs",
+            // `self_update`'s tranche-2 layer read (`hyperparameters.update.*`)
+            // resolves through `config_resolver` — kept a leaf module so this
+            // one edge stays one file, not the hyperparams schema's closure.
+            "loom-daemon/src/config_resolver.rs",
             "loom-daemon/src/main.rs",
             "loom-daemon/src/daemon_service.rs",
             "Cargo.toml",
