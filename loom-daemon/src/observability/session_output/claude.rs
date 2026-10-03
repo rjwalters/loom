@@ -13,6 +13,10 @@
 //! | `assistant` → `content[].tool_use` | `tool_start` | the tool **name** |
 //! | `user` → `content[].tool_result` | `tool_finish` | the tool name + `is_error` |
 //!
+//! `thinking` blocks are never emitted. They are *counted* (never copied) and
+//! surfaced as a `thinking_withheld` gap because Claude Code can file
+//! user-visible narration as `thinking`; see [`THINKING_WITHHELD_REASON`].
+//!
 //! Everything else is dropped at parse time and has no representation on the
 //! wire: user prompts, `thinking` blocks, `tool_use.input` (arguments),
 //! `tool_result.content` (raw results), attachments, and every internal
@@ -63,6 +67,17 @@ pub const ATTACH_TAIL_EVENTS: usize = 20;
 /// history it is going to discard anyway.
 pub const MAX_ATTACH_SCAN_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Gap reason reported when `thinking` blocks were withheld, so a viewer can
+/// say "narration may be missing" (#10124).
+///
+/// No discriminator exists: inspected transcripts from Claude Code 2.1.288
+/// carry `thinking` blocks with exactly the keys `type`, `thinking`,
+/// `signature`; `thinking` is empty and `signature` populated on every block
+/// whether the turn ends in `tool_use` or `end_turn`. A narration-as-thinking
+/// block is structurally identical to real reasoning, so nothing can be
+/// emitted safely (#9764 privacy rules).
+pub const THINKING_WITHHELD_REASON: &str = "thinking_withheld";
+
 /// Per-transcript read position and the little state needed to pair a
 /// `tool_result` back to the `tool_use` that started it.
 #[derive(Debug, Default)]
@@ -80,6 +95,8 @@ pub struct Cursor {
     pending: String,
     /// Whether this cursor has ever read from the file.
     attached: bool,
+    /// `thinking` blocks seen in the line being parsed (a count only).
+    thinking_seen: u64,
 }
 
 /// Ceiling on unmatched `tool_use` ids held for pairing. A session that ends
@@ -95,6 +112,13 @@ pub struct Pass {
     /// Source events this pass could not deliver, with the reason. `None`
     /// when nothing was lost.
     pub gap: Option<(String, u64)>,
+    /// `thinking` blocks withheld this pass (#10124). Only a count — never
+    /// any content. Claude Code (seen on 2.1.288) sometimes files
+    /// user-visible pre-tool-call narration as `thinking`, and nothing in the
+    /// record reliably separates it from real reasoning (see
+    /// [`THINKING_WITHHELD_REASON`]), so every block is dropped and the loss
+    /// is reported as a coverage gap instead.
+    pub thinking_withheld: u64,
     /// Whether the file had more bytes than [`MAX_BYTES_PER_PASS`] allowed —
     /// not a loss (the next pass continues), but useful for a caller that
     /// wants to tick again immediately.
@@ -169,6 +193,7 @@ impl Cursor {
             self.next_sequence += 1;
             pass.records
                 .extend(self.records_for_line(line, stream_id, sequence, identity, now));
+            pass.thinking_withheld += std::mem::take(&mut self.thinking_seen);
         }
         pass
     }
@@ -311,7 +336,11 @@ impl Cursor {
                         Some(ok),
                     ));
                 }
-                // `thinking`, `image`, every user prompt block, and every
+                ("assistant", "thinking") => {
+                    // Counted, never read: the block's content stays unread.
+                    self.thinking_seen += 1;
+                }
+                // `image`, every user prompt block, and every
                 // other record type: no record at all.
                 _ => {}
             }

@@ -614,6 +614,13 @@ fn advance_run(run: &mut Run, projects_dir: &Path, now: DateTime<Utc>) -> Vec<Se
                 .with_gap(reason, run.dropped_events);
             out.push(record);
         }
+        if pass.thinking_withheld > 0 {
+            run.dropped_events = run.dropped_events.saturating_add(pass.thinking_withheld);
+            let record = run
+                .status(OutputCategory::Gap, now, Coverage::Degraded, RunState::Running)
+                .with_gap(claude::THINKING_WITHHELD_REASON, run.dropped_events);
+            out.push(record);
+        }
         if !pass.records.is_empty() {
             run.last_content_at = now;
             // Latency sampling happens here, over the records actually
