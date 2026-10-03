@@ -242,6 +242,7 @@ pub struct GhInvocation {
     args: Vec<OsString>,
     cwd: Option<PathBuf>,
     program: Option<String>,
+    config_dir: Option<PathBuf>,
 }
 
 impl GhInvocation {
@@ -264,6 +265,7 @@ impl GhInvocation {
             args: Vec::new(),
             cwd: None,
             program: None,
+            config_dir: None,
         }
     }
 
@@ -301,6 +303,15 @@ impl GhInvocation {
     pub fn program(mut self, program: impl AsRef<OsStr>) -> Self {
         let program = program.as_ref().to_string_lossy();
         self.program = (program != "gh").then(|| program.into_owned());
+        self
+    }
+
+    /// Run under an explicit `GH_CONFIG_DIR` — a credential the caller chose
+    /// itself (a repo's reader App, a store's writer App, #9537) — instead of
+    /// the facade's working-directory / owner lookup. `None` keeps the lookup.
+    #[must_use]
+    pub fn gh_config_dir(mut self, dir: Option<&Path>) -> Self {
+        self.config_dir = dir.map(Path::to_path_buf);
         self
     }
 
@@ -345,7 +356,8 @@ impl GhInvocation {
     /// The environment the child receives, in application order, when its
     /// `traceparent` is `child_context` (see [`telemetry::InvocationSpan`]).
     ///
-    /// - `GH_CONFIG_DIR`: the cross-owner credential registered for the
+    /// - `GH_CONFIG_DIR`: the explicit [`GhInvocation::gh_config_dir`], else
+    ///   the cross-owner credential registered for the
     ///   working directory, else for the target's owner (the
     ///   `credential_preflight::apply_gh_config_for_{root,owner_slug}`
     ///   lookups). Absent ⇒ the child inherits the process-global value.
@@ -368,9 +380,13 @@ impl GhInvocation {
         let mut plan = Vec::new();
         let slug = self.target.slug();
         let config_dir = self
-            .cwd
-            .as_deref()
-            .and_then(crate::credential_preflight::gh_config_dir_for_root)
+            .config_dir
+            .clone()
+            .or_else(|| {
+                self.cwd
+                    .as_deref()
+                    .and_then(crate::credential_preflight::gh_config_dir_for_root)
+            })
             .or_else(|| {
                 slug.as_deref()
                     .and_then(crate::credential_preflight::gh_config_dir_for_owner_slug)
@@ -467,3 +483,7 @@ impl GhInvocation {
 #[cfg(test)]
 #[path = "migrated_sites_tests.rs"]
 mod migrated_sites_tests;
+
+#[cfg(test)]
+#[path = "rest_readers_tests.rs"]
+mod rest_readers_tests;

@@ -144,17 +144,6 @@ pub fn classify(response: Option<&HttpResponse>, exit_ok: bool, stderr: &str) ->
     (pool, outcome)
 }
 
-/// Record one `gh api --include` call by `caller` (see [`classify`]).
-pub fn record_gh_api(
-    caller: &'static str,
-    response: Option<&HttpResponse>,
-    exit_ok: bool,
-    stderr: &str,
-) {
-    let (pool, outcome) = classify(response, exit_ok, stderr);
-    record(caller, pool, outcome, response.map(|r| &r.ratelimit));
-}
-
 /// Record one forge call. Never blocks or fails the caller: a poisoned lock
 /// or an unwritable sink is silently skipped.
 pub fn record(

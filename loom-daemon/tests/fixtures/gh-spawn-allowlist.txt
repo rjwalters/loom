@@ -11,13 +11,9 @@
 #
 # Empty list == migration complete.
 
-src/ci_telemetry/api.rs | let mut cmd = Command::new(&self.gh_bin);
-src/ci_telemetry/api.rs | let output = Command::new(&self.gh_bin)
 src/cli/lease_co_occupancy.rs | let mut cmd = Command::new(gh_bin);
 src/cli/merge_pr_consolidate.rs | let mut cmd = std::process::Command::new(gh);
 src/cmd_out.rs | let mut cmd = Command::new(gh);
-src/fleet_store/gh.rs | let mut cmd = Command::new(&self.gh_bin);
-src/fleet_store/gh.rs | let mut cmd = Command::new(&self.gh_bin);
 src/forge_cmd.rs | pub(crate) fn gh_bin() -> String {
 src/forge_comment.rs | let mut child = std::process::Command::new(gh_bin)
 src/forge_comment.rs | let mut cmd = Command::new(gh_bin.as_ref());
@@ -25,7 +21,6 @@ src/forge_comment.rs | let out = std::process::Command::new(gh_bin)
 src/forge_disable_auto_merge.rs | let mut cmd = Command::new(gh_bin);
 src/forge_disable_auto_merge.rs | let mut cmd = Command::new(gh_bin);
 src/forge_disable_auto_merge.rs | let mut cmd = Command::new(gh_bin);
-src/forge_etag_store.rs | let mut cmd = Command::new(gh_bin);
 src/forge_merge_config.rs | let mut cmd = Command::new(gh);
 src/forge_merge_method.rs | let mut cmd = Command::new(gh);
 src/merge_pr/consolidate.rs | let mut cmd = Command::new(gh_bin);
