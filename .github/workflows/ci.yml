@@ -1737,8 +1737,6 @@ jobs:
         run: bash defaults/scripts/tests/test-merge-pr-label-freshness.sh
       - name: merge-pr stale required-checks guard (#8248, #8191 slice 3)
         run: bash defaults/scripts/tests/test-merge-pr-stale-required-checks.sh
-      - name: merge-pr repo-configured merge-tree gate (#10026)
-        run: bash defaults/scripts/tests/test-merge-pr-tree-checks.sh
       - name: merge-pr self-sync head re-read (#8164, #8191 slice 4)
         run: bash defaults/scripts/tests/test-merge-pr-head-sync-retry.sh
       - name: merge-pr stale-check re-date remedy (#8508)

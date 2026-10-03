@@ -184,3 +184,10 @@ fn moved_head_and_unfetchable_pr_fail_closed() {
         Outcome::Unknown(_)
     ));
 }
+
+#[test]
+fn failure_comment_fence_outlasts_backticks_in_output() {
+    let c = failure_comment("x", "a\n```\nb ```` c");
+    assert!(c.contains("\n`````\na\n```\nb ```` c\n`````\n"), "{c}");
+    assert!(failure_comment("x", "plain").contains("\n```\nplain\n```\n"));
+}

@@ -122,19 +122,42 @@ pub fn build_tree(
     base_ref: &str,
     head_sha: &str,
 ) -> Result<tempfile::TempDir, String> {
-    let base_spec = format!("refs/heads/{base_ref}");
-    let pr_spec = format!("refs/pull/{pr}/head");
-    git(repo_root, &["fetch", "--quiet", remote, &base_spec, &pr_spec])
-        .map_err(|e| format!("could not fetch the base and PR head: {e}"))?;
-    // Resolve each tip on the remote explicitly (`fetch a b` leaves both in FETCH_HEAD).
-    let base_sha = git(repo_root, &["ls-remote", remote, &base_spec])
+    // Fetch both tips into private refs and resolve them from what was actually
+    // fetched (no second `ls-remote` round trip that could see a newer base).
+    let base_local = format!("refs/loom/tree-checks/{pr}/base");
+    let pr_local = format!("refs/loom/tree-checks/{pr}/head");
+    let base_spec = format!("+refs/heads/{base_ref}:{base_local}");
+    let pr_spec = format!("+refs/pull/{pr}/head:{pr_local}");
+    let fetched = git(
+        repo_root,
+        &[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            remote,
+            &base_spec,
+            &pr_spec,
+        ],
+    )
+    .map_err(|e| format!("could not fetch the base and PR head: {e}"));
+    let resolve = |r: &str| {
+        git(
+            repo_root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{r}^{{commit}}"),
+            ],
+        )
         .ok()
-        .and_then(|s| s.split_whitespace().next().map(str::to_string))
-        .ok_or_else(|| format!("could not resolve {remote}/{base_ref}"))?;
-    let pr_tip = git(repo_root, &["ls-remote", remote, &pr_spec])
-        .ok()
-        .and_then(|s| s.split_whitespace().next().map(str::to_string))
-        .ok_or_else(|| format!("could not resolve {remote} PR #{pr} head"))?;
+    };
+    let tips = fetched.map(|_| (resolve(&base_local), resolve(&pr_local)));
+    let _ = git(repo_root, &["update-ref", "-d", &base_local]);
+    let _ = git(repo_root, &["update-ref", "-d", &pr_local]);
+    let (base_sha, pr_tip) = tips?;
+    let base_sha = base_sha.ok_or_else(|| format!("could not resolve {remote}/{base_ref}"))?;
+    let pr_tip = pr_tip.ok_or_else(|| format!("could not resolve {remote} PR #{pr} head"))?;
     if pr_tip != head_sha {
         return Err(format!(
             "PR #{pr}'s head on {remote} is {pr_tip}, not the {head_sha} being merged (head moved)"
@@ -223,7 +246,12 @@ pub fn run_checks(tree: &Path, cfg: &Config) -> Outcome {
         };
         let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
         let home = std::env::var("HOME").unwrap_or_default();
-        let mut child = match Command::new("sh")
+        let mut cmd = Command::new("sh");
+        // Own process group, so a timeout kills the check's descendants
+        // (e.g. `node` under `npm run`), not just `sh`.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = match cmd
             .arg("-c")
             .arg(check)
             .current_dir(tree)
@@ -248,6 +276,13 @@ pub fn run_checks(tree: &Path, cfg: &Config) -> Outcome {
             match child.try_wait() {
                 Ok(Some(s)) => break Ok(s),
                 Ok(None) if started.elapsed() >= cfg.timeout => {
+                    #[cfg(unix)]
+                    if let Ok(pid) = i32::try_from(child.id()) {
+                        // SAFETY: kill(2) on our own child's process group.
+                        unsafe {
+                            libc::kill(-pid, libc::SIGKILL);
+                        }
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     break Err(());
@@ -322,18 +357,25 @@ pub fn refusal(pr: &str, check: &str, output: &str) -> String {
     )
 }
 
+/// A code fence longer than any backtick run in `text`, so output cannot escape it.
+fn fence_for(text: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    "`".repeat(longest.max(2) + 1)
+}
+
 /// PR comment for a refusal.
 pub fn failure_comment(check: &str, output: &str) -> String {
+    let output = output.trim_end();
+    let fence = fence_for(output);
     format!(
-        "## Merge Blocked: Tree Check Failed\n\nThe merge tree (current base + this PR's head) fails the repo-declared pre-merge check `{check}` (`merge.treeChecks`, #10026).\n\n```\n{}\n```\n\nBypass (operator only): `merge-pr.sh --allow-red-tree`.",
-        output.trim_end()
+        "## Merge Blocked: Tree Check Failed\n\nThe merge tree (current base + this PR's head) fails the repo-declared pre-merge check `{check}` (`merge.treeChecks`, #10026).\n\n{fence}\n{output}\n{fence}\n\nBypass (operator only): `merge-pr.sh --allow-red-tree`."
     )
 }
 
 /// Audit comment for `--allow-red-tree`.
 pub fn bypass_comment(head_sha: &str, check: &str) -> String {
     format!(
-        "## Merge Proceeded With Red Merge Tree (Override)\n\nThis PR was merged via `merge-pr.sh --allow-red-tree` although the merge tree fails the pre-merge check `{check}` (`merge.treeChecks`).\n\n- **Head SHA**: `{head_sha}`\n\nThe operator running this merge explicitly asserted responsibility for this override (#10026)."
+        "## Red Merge Tree Override Recorded\n\nThis PR is being merged via `merge-pr.sh --allow-red-tree` (later merge stages may still refuse) although the merge tree fails the pre-merge check `{check}` (`merge.treeChecks`).\n\n- **Head SHA**: `{head_sha}`\n\nThe operator running this merge explicitly asserted responsibility for this override (#10026)."
     )
 }
 
