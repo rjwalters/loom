@@ -10,29 +10,26 @@ value. Safe to commit: every row below is a placeholder name, not a secret.
 
 | Purpose | Reference | Usage |
 |---|---|---|
-| Gitea Cloud qualification tenant origin (#9788/#9769) | env var `GITEA_QUAL_INSTANCE_URL` | non-secret, environment-specific; used to build API URLs for the hosted-qualification runbook |
-| Gitea Cloud qualification org slug (#9788/#9769) | env var `GITEA_QUAL_ORG` | the disposable qualification org |
-| Gitea Cloud qualification run namespace (#9788/#9769) | env var `GITEA_QUAL_RUN_NS` | prefix for disposable resources created by one provisioning run |
-| Gitea Cloud qualification administrator login (#9788/#9769) | env var `GITEA_QUAL_ADMIN_LOGIN` | used only for setup + branch-protection tests |
-| Gitea Cloud qualification administrator API token (#9788/#9769) | env var `GITEA_QUAL_ADMIN_TOKEN` | org/repo creation, protection config |
-| Gitea Cloud qualification writer identity login (#9788/#9769) | env var `GITEA_QUAL_WRITER_LOGIN` | ordinary automation identity |
-| Gitea Cloud qualification writer identity API token (#9788/#9769) | env var `GITEA_QUAL_WRITER_TOKEN` | push/issue/PR/CI smoke checks |
-| Gitea Cloud qualification writer identity SSH key (#9788/#9769, optional) | provisioned file `~/.ssh/gitea_qual_writer` | `ssh -i <path>`; public half installed on the writer account |
-| Gitea Cloud qualification read-only identity login (#9788/#9769) | env var `GITEA_QUAL_READONLY_LOGIN` | permission-boundary tests |
-| Gitea Cloud qualification read-only identity API token (#9788/#9769) | env var `GITEA_QUAL_READONLY_TOKEN` | must be rejected on any mutating call |
-| Gitea Cloud qualification untrusted-reviewer identity login (#9788/#9769) | env var `GITEA_QUAL_REVIEWER_LOGIN` | outside-collaborator / fork-review trust-boundary tests |
-| Gitea Cloud qualification untrusted-reviewer identity API token (#9788/#9769) | env var `GITEA_QUAL_REVIEWER_TOKEN` | comments/reviews from this identity must never be treated as a trusted collaborator's |
+| Gitea qualification forge origin (#9769) | env var `GITEA_QUAL_INSTANCE_URL` | non-secret; base for API URLs (loopback-only — run on the host or through its SSH tunnel) |
+| Gitea qualification org slug (#9769) | env var `GITEA_QUAL_ORG` | the qualification org |
+| Gitea qualification run namespace (#9769) | env var `GITEA_QUAL_RUN_NS` | prefix for disposable resources created by one run |
+| Gitea qualification administrator login (#9769) | env var `GITEA_QUAL_ADMIN_LOGIN` | used only for setup + branch-protection tests |
+| Gitea qualification administrator API token (#9769) | env var `GITEA_QUAL_ADMIN_TOKEN` | org/repo creation, protection config |
+| Gitea qualification writer identity login (#9769) | env var `GITEA_QUAL_WRITER_LOGIN` | ordinary automation identity |
+| Gitea qualification writer identity API token (#9769) | env var `GITEA_QUAL_WRITER_TOKEN` | push/issue/PR/CI smoke checks |
+| Gitea qualification writer identity SSH key (#9769, optional, unprovisioned) | provisioned file `~/.ssh/gitea_qual_writer` | `ssh -i <path>`; public half installed on the writer account |
+| Gitea qualification read-only identity login (#9769) | env var `GITEA_QUAL_READONLY_LOGIN` | permission-boundary tests |
+| Gitea qualification read-only identity API token (#9769) | env var `GITEA_QUAL_READONLY_TOKEN` | must be rejected on any mutating call |
+| Gitea qualification untrusted-reviewer identity login (#9769) | env var `GITEA_QUAL_REVIEWER_LOGIN` | outside-collaborator / fork-review trust-boundary tests |
+| Gitea qualification untrusted-reviewer identity API token (#9769) | env var `GITEA_QUAL_REVIEWER_TOKEN` | comments/reviews from this identity must never be treated as a trusted collaborator's |
 
-**None of the above are provisioned yet.** As of this writing (#9788) no
-Gitea Cloud tenant, org, repo, or identity exists — this table names where
-each credential will live once an operator completes the external signup
-documented in
-[`docs/research/gitea-cloud-qualification-runbook.md`](../docs/research/gitea-cloud-qualification-runbook.md)
-Step 0. A builder picking up #9789/#9790/#9791 should check these env vars by
-name before asking the operator anything beyond "is Step 0 done yet" — a
-still-unresolved name here is the missing-credential case
-[`.loom/docs/credentials.md`](docs/credentials.md) describes, not a reason
-to fabricate a tenant.
+**Where these resolve:** the self-hosted `gitea-1` forge (2AMLogic/2am#1793),
+not a hosted tenant — the hosted trial was dropped (#9788, operator 2026-10-03).
+Which login and which AWS SSM `/gitea/*` parameter backs each name is recorded
+once, in 2AMLogic/2am `infra/aws/gitea/gitea.md` §Qualification identities —
+Gitea infrastructure docs live in that repo, so the mapping is not repeated
+here. Read values from SSM into the consumer's env (stdin or a 0600 file),
+never onto argv.
 
 If a task needs a credential not listed here, that is a **missing-credential**
 case per `.loom/docs/credentials.md` — ask the operator for the name, shape,
