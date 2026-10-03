@@ -1677,6 +1677,10 @@ jobs:
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
       - name: check-stale-blocked advisory (#8927)
         run: bash defaults/scripts/tests/test-check-stale-blocked.sh
+      # #9390: provision-codex-hooks.sh verify is a stub over `loom-daemon
+      # codex-hooks verify`; the suite pins this job's shared build.
+      - name: provision-codex-hooks (#4495, #5005, #9390)
+        run: bash defaults/scripts/tests/test-provision-codex-hooks.sh
       # #9517: fleet-send.sh is a thin SILENT stub over `loom-daemon
       # fleet-send` (its whole interface is a best-effort exit 0, so it
       # bypasses lib/script-helper.sh's loud missing-daemon path). The suite

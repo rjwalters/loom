@@ -6,7 +6,7 @@
 //! that a bare host process cannot produce worker-side evidence.
 //!
 //! The trust rule is additionally cross-checked against the SHIPPED
-//! `provision-codex-hooks.sh verify` on the same fixture profiles, so the Rust
+//! `provision-codex-hooks.sh verify` (native since #9390) on the same fixture profiles, so the Rust
 //! gate and the shell gate can never drift into disagreeing about whether one
 //! profile is trusted.
 //!
@@ -15,7 +15,6 @@
 //! by `tests/private_workspace_docker`.
 use super::containment::*;
 use super::*;
-use std::process::Command;
 
 /// A profile shaped the way a provisioned private session's profile is: the
 /// managed registration naming the image-owned bridge, Loom's receipt pinning
@@ -104,53 +103,35 @@ fn hook_trust_follows_the_install_time_baseline_diff() {
     assert!(enforcing(&report(true, &profile), &profile).is_err());
 }
 
-/// The Rust gate and `provision-codex-hooks.sh verify` must agree, profile for
-/// profile: one of them refusing while the other admits is exactly the drift
-/// this cross-check exists to prevent. Skipped where the shell's own
-/// dependencies are unavailable.
+/// Private admission and `provision-codex-hooks.sh verify` (since #9390 the
+/// native `codex_hooks::Check`) must agree, profile for profile: one refusing
+/// while the other admits is exactly the drift this cross-check exists to
+/// prevent. They now share the trust reading, and this pins that they also
+/// agree on the verdict built from it.
 #[test]
 fn the_rust_trust_gate_agrees_with_the_shipped_provisioner() {
+    use super::super::codex_hooks::{Check, Registration};
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let provisioner = repo.join("defaults/scripts/provision-codex-hooks.sh");
     let bridge = repo.join("defaults/hooks/guard-codex-bridge.sh");
-    if !provisioner.is_file() || !bridge.is_file() || which("jq").is_none() {
-        eprintln!("skipping: provision-codex-hooks.sh or jq unavailable");
-        return;
-    }
     for (what, baseline, trusted, expected) in TRUST_CASES {
         let dir = tempfile::tempdir().unwrap();
         let profile = profile(dir.path(), *baseline, trusted);
-        let output = Command::new("bash")
-            .arg(&provisioner)
-            .args(["verify", "--codex-home"])
-            .arg(&profile)
-            .args(["--workspace", REPO, "--bridge"])
-            .arg(&bridge)
-            .arg("--json")
-            .output()
-            .unwrap();
-        let verdict: serde_json::Value =
-            serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
-                panic!(
-                    "verify emitted no JSON for {what}: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                )
-            });
-        assert_eq!(verdict["trusted"], *expected, "{what}: shell verdict {verdict}");
+        let verdict = Check {
+            codex_home: profile.clone(),
+            workspace: Some(PathBuf::from(REPO)),
+            registration: Registration::Pinned {
+                bridge: bridge.clone(),
+            },
+            fallback_bridge: None,
+        }
+        .verify();
+        assert_eq!(verdict.trusted, *expected, "{what}: verify verdict {verdict:?}");
         assert_eq!(
             enforcing(&report(true, &profile), &profile).is_ok(),
-            verdict["trusted"] == true,
-            "{what}: the Rust gate disagrees with the shipped provisioner"
+            verdict.trusted,
+            "{what}: the admission gate disagrees with verify"
         );
     }
-}
-
-fn which(bin: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(bin))
-            .find(|candidate| candidate.is_file())
-    })
 }
 
 /// A clone with no Loom surface has no managed bridge to enforce with, so it
