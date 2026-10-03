@@ -226,7 +226,7 @@
   color: "C2410C"  # orange-700 - darkest
 
 - name: loom:decision-malformed
-  description: "operator-decision issue bounced for a missing/invalid decision block; Curator repairs or re-routes (#10057)"
+  description: "operator-decision bounced for missing/invalid decision block; Curator repairs or re-routes (#10057)"
   color: "C2410C"  # same family as loom:operator-decision
 
 - name: loom:operator-objective
