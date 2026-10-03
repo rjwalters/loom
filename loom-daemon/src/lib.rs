@@ -218,6 +218,7 @@ pub mod issue_creation_mutex;
 pub mod jev_merge_risk;
 pub mod jev_tier;
 pub mod kimi_usage;
+pub mod label_registry;
 pub mod launch_env;
 pub mod launch_record;
 pub mod launchd_env_drift;

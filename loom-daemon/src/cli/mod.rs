@@ -41,6 +41,7 @@ mod guard_mcp_tools;
 pub(crate) mod health;
 pub(crate) mod inflight;
 mod label_duplicates;
+pub(crate) mod labels_cmd;
 pub(crate) mod lease_co_occupancy;
 pub(crate) mod lease_ensure;
 pub(crate) mod legacy_script_cmds;

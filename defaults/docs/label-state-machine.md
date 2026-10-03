@@ -38,6 +38,7 @@ pipeline state already lives.
 - [Fact-based de-escalation of a Champion `proposal-escalated` hold (#7650)](#fact-based-de-escalation-of-a-champion-proposal-escalated-hold-7650)
 - [PR verdict-label mutual exclusion: three independent layers (#8112)](#pr-verdict-label-mutual-exclusion-three-independent-layers-8112)
 - [Follow-up work](#follow-up-work)
+- [Label registry: the source of truth (#10013)](#label-registry-the-source-of-truth-10013)
 <!-- toc:end -->
 
 ## Two ways to reach a human (#10000)
@@ -957,3 +958,21 @@ above. Nothing about the guard changes for any other blocking label.
   documented above is a per-occurrence judgment call an agent makes on
   re-read, not something a mechanical closed-dependency check can drive (see
   "This is a per-occurrence judgment call, not an automated pass" above).
+
+## Label registry: the source of truth (#10013)
+
+`defaults/labels.json` is the single source of truth for label semantics: each
+label's name, description, color, `kind`, `applied_by`/`removed_by`, and the
+boolean properties the daemon's hand-listed tables encode (`park`, `skip`,
+`hold`, `operator_gate`, `blocked_colabel`, `hard_exclusion`, `champion_path`,
+`human_gated`, `contradicts_approval`). It is embedded in `loom-daemon`; query
+it with `loom-daemon labels list --property park` / `labels get <name>`
+(non-zero exit on an unknown label or property).
+
+The Loom block of `.github/labels.yml` and `defaults/.github/labels.yml` is
+generated from it: edit the registry, then run `loom-daemon labels generate
+--write`. The `label_registry` tests fail on registry drift;
+`check-labels-drift.sh` only keeps the two copies byte-identical.
+Slice 1 only: the daemon tables are still hand-listed but are held equal to the
+registry by lockstep tests, so a change to a table's meaning goes in the
+registry. `stale_after_minutes`, `lifecycle` and `propagate` are inert.
