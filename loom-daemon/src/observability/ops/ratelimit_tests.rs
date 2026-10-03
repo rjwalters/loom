@@ -1,7 +1,8 @@
 //! Tests for rate-limit trips, quota gauges and breaker skips (#10022).
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+
+use tokio::sync::Mutex as AsyncMutex;
 
 use chrono::DateTime;
 
@@ -13,7 +14,7 @@ use crate::telemetry::ops::{
 };
 
 /// The skip counters are process-global: serialise the tests that touch them.
-static SKIP_LOCK: Mutex<()> = Mutex::new(());
+static SKIP_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
 
 fn t(secs: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(1_785_352_000 + secs, 0).unwrap()
@@ -224,9 +225,7 @@ fn a_gauge_tick_emits_remaining_used_and_reset_per_resource() {
 
 #[tokio::test]
 async fn with_no_sink_a_gauge_tick_emits_and_probes_nothing() {
-    let _guard = SKIP_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = SKIP_LOCK.lock().await;
     if crate::observability::ops::global_ops_sink().is_some() {
         return; // another test in this binary registered the real sink
     }
@@ -267,9 +266,7 @@ fn account_labels_never_carry_a_token_hash_or_path() {
 
 #[test]
 fn each_suppressed_skip_site_counts_once_per_pass_by_job() {
-    let _guard = SKIP_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = SKIP_LOCK.blocking_lock();
     let b = breaker();
     let ((), captured) = capture(|| {
         let _ = drain_skip_points();

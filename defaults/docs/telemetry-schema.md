@@ -1672,7 +1672,7 @@ credential, else `unknown` — never a token, token hash or path. `reason` and
 `loom.ratelimit.source` ∈ `work_finder`, `claim_reconciliation`,
 `role_runner`, `epic_supervisor`, `quarantine_reconciliation`,
 `ci_telemetry`, `outcome_journal`, `star_liveness`, `other`. Names follow the
-`github.ratelimit.*` prefix of 2AMLogic/2am#1911.
+`github.ratelimit.*` prefix of an external fleet schema.
 
 **Usage spans: scope, sources, and how to total them (#9204, #9303).**
 
