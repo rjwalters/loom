@@ -2243,6 +2243,14 @@ pub struct RateLimitBreakerStatus {
     /// Last-probed GraphQL budget remaining.
     #[serde(default)]
     pub graphql_remaining: Option<u64>,
+    /// Last-probed REST core budget consumed this window — `gh api
+    /// rate_limit`'s `used` (Issue #9855): the pool's total spend by *every*
+    /// client of the credential, not just this daemon.
+    #[serde(default)]
+    pub core_used: Option<u64>,
+    /// Last-probed GraphQL budget consumed this window.
+    #[serde(default)]
+    pub graphql_used: Option<u64>,
     /// When the cached budget snapshot was probed.
     #[serde(default)]
     pub budget_probed_at: Option<DateTime<Utc>>,
@@ -2271,6 +2279,12 @@ pub struct ForgeCallsStatus {
     /// or the rate-limit breaker's probe when that is newer.
     #[serde(default)]
     pub budget: Vec<ForgeBudgetReading>,
+    /// This host's own budget-costing spend per pool over the window
+    /// (Issue #9855), so `budget[].used` can be split into own vs external.
+    /// `None` when the sink is disabled or unreadable — the same conditions
+    /// as `host_window`.
+    #[serde(default)]
+    pub own_window: Option<Vec<ForgePoolSpend>>,
 }
 
 /// One caller × pool row of [`ForgeCallsStatus`].
@@ -2295,12 +2309,32 @@ pub struct ForgeCallCounts {
 pub struct ForgeBudgetReading {
     pub pool: String,
     pub remaining: u64,
+    /// The pool's total spend this GitHub window by every client of the
+    /// credential (`x-ratelimit-used` / `rate_limit`'s `used`), when known —
+    /// Issue #9855. `used − own_window`'s consumption for the pool is the
+    /// external drain (other machines, agents, apps sharing the credential).
+    #[serde(default)]
+    pub used: Option<u64>,
     /// When the pool resets, when known.
     #[serde(default)]
     pub reset_at: Option<DateTime<Utc>>,
     pub observed_at: DateTime<Utc>,
     /// `headers` (free `x-ratelimit-*` on a REST response) or `breaker_probe`.
     pub source: String,
+}
+
+/// This host's own budget-costing spend on one pool over
+/// [`ForgeCallsStatus::window_secs`] (Issue #9855): the `200`-class and
+/// error outcomes of [`crate::forge_call_stats`] — a `304` and a
+/// rate-limited call cost nothing. `ForgeBudgetReading::used − consumed` is
+/// the external estimate. The rolling window and GitHub's fixed hourly
+/// window are not the same interval, so treat the difference as approximate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgePoolSpend {
+    /// Rate-limit pool: `core`, `graphql`, `search`, `other`.
+    pub pool: String,
+    /// `ok + error` outcomes host-wide over the window.
+    pub consumed: u64,
 }
 
 /// Live idle-exit eligibility for `loom-daemon status` (Issue #5565).

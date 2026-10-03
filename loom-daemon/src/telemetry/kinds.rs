@@ -164,6 +164,9 @@ pub mod eta;
 /// `eta.snapshot` (#9329).
 pub mod eta_snapshot;
 
+/// `session.output` (#9764) — the live, redacted agent-output feed.
+pub mod session_output;
+
 // ============================================================================
 // THE REGISTRY
 // ============================================================================
@@ -306,6 +309,18 @@ macro_rules! telemetry_kind_table {
             /// instead. See [`eta_snapshot`].
             EtaSnapshot = "eta.snapshot" => $crate::telemetry::kinds::eta_snapshot::EtaSnapshotRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: NotExported, native: true;
+
+            /// One live agent-output event during an in-flight run (Issue
+            /// #9764) — readable, producer-redacted, issue-scoped. The second
+            /// kind whose OTLP body is text the daemon did not author, so it
+            /// pins its own gate for the same reason `ci.job.log` pinned `9`:
+            /// a backend must be able to refuse free-text session content at
+            /// the version level without also refusing every other post-#8921
+            /// kind sharing `NEW_KIND_SCHEMA_VERSION`. OTLP-only by design —
+            /// the native HTTPS ingest backend never receives session text.
+            /// See [`session_output`].
+            SessionOutput = "session.output" => $crate::telemetry::kinds::session_output::SessionOutputRecord,
+                gate: 13, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
             // NEW_KIND_SCHEMA_VERSION). Do not renumber or reorder existing rows —

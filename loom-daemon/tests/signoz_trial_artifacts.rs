@@ -580,9 +580,10 @@ fn ci_queries_read_log_attributes_the_gateway_forwards_from_the_column_the_daemo
     }
 }
 
-/// The trace-reading counterpart (#9089). Step and suite timings live only on
-/// `loom.ci.step` / `loom.ci.suite` spans (there is no log record and no metric
-/// series for either), so sections 11–13 read
+/// The trace-reading counterpart (#9089, extended by #9456). Step, suite and
+/// per-test timings live only on `loom.ci.step` / `loom.ci.suite` /
+/// `loom.ci.test` spans (there is no log record and no metric series for any of
+/// the three), so sections 11–13 and 16–17 read
 /// `signoz_traces.signoz_index_v3`
 /// — a different gateway allowlist (span `keep_keys`) and a different type
 /// rule: every span attribute is exported as an OTLP string, so SigNoz files
@@ -597,8 +598,8 @@ fn ci_queries_read_span_attributes_the_gateway_forwards_from_the_string_column()
     assert!(
         !trace_sql.is_empty(),
         "ci-queries.sql no longer reads signoz_traces.signoz_index_v3; if the step-span and \
-         suite-span sections (#9089) were deliberately removed, remove this guard with them \
-         rather than letting it go vacuous"
+         suite-span sections (#9089) and the test-span sections (#9456) were deliberately \
+         removed, remove this guard with them rather than letting it go vacuous"
     );
     let ci_span_vocabulary: BTreeSet<&str> = CI_SPAN_ATTRIBUTE_KEYS
         .iter()
@@ -635,6 +636,7 @@ fn ci_queries_read_span_attributes_the_gateway_forwards_from_the_string_column()
         SpanName::CiJob,
         SpanName::CiStep,
         SpanName::CiSuite,
+        SpanName::CiTest,
     ]
     .iter()
     .map(|name| name.as_str())
@@ -901,6 +903,47 @@ fn usage_queries_documented_invocation_binds_exactly_the_parameters_used() {
         "usage-queries.sql's documented clickhouse-client invocation must bind exactly the \
          parameters its statements reference"
     );
+}
+
+/// The same coupling for `eta-queries.sql` (#9289, executed against the pinned
+/// engine by `signoz_eta_queries.rs` in #8528). Its sections are `0` plus
+/// `Q1`-`Q3`, so the citation is matched on those tokens rather than on bare
+/// digits — and section 0 is cited here, unlike `usage-queries.sql`'s, because
+/// the ETA preflight is the thing that says whether Q1-Q3 rest on anything and
+/// a reader must be sent to it from the table itself.
+#[test]
+fn every_eta_query_section_is_cited_by_a_readme_saved_view() {
+    let citation = Regex::new(r"`eta-queries\.sql`([^)]*)\)").unwrap();
+    let cited: Vec<String> = SIGNOZ_README
+        .lines()
+        .filter(|line| line.starts_with("| "))
+        .flat_map(|line| {
+            citation
+                .captures_iter(line)
+                .map(|capture| capture.get(1).unwrap().as_str().to_string())
+                .collect::<Vec<String>>()
+        })
+        .collect();
+    assert!(
+        !cited.is_empty(),
+        "the SigNoz README's Saved views table cites no `eta-queries.sql` section at all"
+    );
+    let all = cited.join(" ");
+    for section in ["0", "Q1", "Q2", "Q3"] {
+        assert!(
+            Regex::new(&format!(r"(?m)^-- {}\. ", regex::escape(section)))
+                .unwrap()
+                .is_match(ETA_QUERIES),
+            "eta-queries.sql is missing section {section}"
+        );
+        assert!(
+            Regex::new(&format!(r"\b{}\b", regex::escape(section)))
+                .unwrap()
+                .is_match(&all),
+            "the SigNoz README's Saved views table has no row citing `eta-queries.sql` \
+             {section}; its citations are {cited:?}"
+        );
+    }
 }
 
 /// Sections 1-6 are the reproducible views; section 0 is the arrival preflight

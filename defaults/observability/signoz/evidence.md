@@ -696,7 +696,10 @@ map column each key's OTLP type lands in. It fails on any mismatch.
 `retention.sql` (the 7-day logs/traces, 30-day metrics version) was re-run
 against this trial, and all 16 `ON CLUSTER` statements reported status 0. The
 effective local-table DDL from the README's check query, with Distributed
-tables excluded:
+tables excluded. **This is a grouped summary and a policy reading only** — the
+per-table expressions are in "The retention statements executed against the
+pinned engine" below, and what status 0 plus an effective TTL cannot establish
+about the cleanup *outcome* is set out there too:
 
 | Database | Tables | Effective TTL |
 |---|---|---|
@@ -987,6 +990,116 @@ README's documented operator step. Its effect over a multi-day soak therefore
 remains unobserved on a live stack. After applying it, the README's
 `part_log` failed-merge query is the check that should return no rows.
 
+### Applied to the live deployment, 2026-10-01 — the 9-day soak and the result
+
+The step left undone above was executed. The deployment had by then been
+running the **unfixed** render continuously since its ClickHouse volume was
+created on 2026-09-22T09:13Z, so the "not yet observed on a live soak" row had
+in the meantime accumulated a 9-day observation of the defect, and the fix's
+own effect could be measured against it on the same host, same volume, same
+pinned image.
+
+**Before (2026-10-01 06:56Z, uptime 268,697 s ≈ 3.1 days on this container).**
+The defect had not stabilised; it had grown monotonically since 2026-09-28:
+
+| | 2026-09-28 (#9298) | 2026-10-01 (this pass) |
+| --- | --- | --- |
+| Failed `metric_log` merges per hour | 7,723–9,318 | 8,991–10,991 (70,249 in 6 h 56 m; 10,135/h mean) |
+| Successful `metric_log` merges per hour | ~22 | 19–25 (159 all day: a **441.8 : 1** failure ratio) |
+| Active `metric_log` parts | 54 | **135** |
+| Cumulative `QueryMemoryLimitExceeded` | 570,199 | **803,096** |
+| Oldest active part, past its 1-day TTL by | 5 days | **9 days** (parts dated 2026-09-22, `modification_time` 2026-09-22 18:08Z) |
+
+Every failure was error **241** (`MEMORY_LIMIT_EXCEEDED`) — 70,249 of 70,249,
+with no second error code — against `max_server_memory_usage` of 1.80 GiB.
+Attribution is unambiguous in the same reading: *every other* `system.*_log`
+table expires normally on this exact server, with 1 to 13 lifetime failures
+each (`part_log` 13/673, `text_log` 3/164, `trace_log` 2/153, `error_log`
+2/889, `zookeeper_log` 1/1,578, `asynchronous_metric_log` 1/1,381). The cost
+was concrete: `system` held **999.08 MiB** against **235 KiB** of Loom signal
+across all four `signoz_*` databases — a 4,300x ratio — and the container sat
+at **109.76 % CPU** of one core doing nothing but retrying one merge.
+
+**Applying it.** The deployment's rendered files live in a machine-private
+state directory outside this checkout, and a full recursive diff against the
+committed render showed it was behind by *exactly* the fix: one
+`schema_type: transposed_with_wide_view` line in
+`pours/deployment/telemetrystore/clickhouse/config-0-0.yaml`, plus the lock's
+patch record. Nothing else had drifted in either direction, so the live
+project was running a byte-identical render otherwise. The old casting, lock
+and config were kept aside first; `docker compose … config --quiet` then
+accepted the synced render, and `up -d --wait --force-recreate --no-deps` on
+the ClickHouse service alone returned **healthy in 9.19 s**. The README's
+remediation was found to be missing this sync step, and to carry an unbounded
+failed-merge check query — both corrected there (see "Two README defects the
+live run exposed" below).
+
+**After.** The rendered override took effect exactly as the off-stack
+reproduction predicted:
+
+| Property | Observation |
+| --- | --- |
+| `system.metric_log` | now a **`SystemMetricLogView`**, still **1,552 columns** — queries are source-compatible |
+| Backing table | `system.transposed_metric_log`, **6 columns**, `TTL event_date + toIntervalDay(1)` |
+| View returns real rows | 30 rows over a 30 s window, `event_time` 06:57:21–06:57:50, `max(ProfileEvent_Query)` = 5 — read back through the wide view, not the narrow table |
+| Storage shape | 46,440 rows covering **1,548 distinct metrics** in **1 part, 28.59 KiB** (the wide table held 135 parts / 264.43 MiB) |
+| Old wide table | renamed to `system.metric_log_0` with its 135 stuck parts intact, then dropped per the README |
+| Disk | `system` **999.08 → 737.35 MiB**; `metric_log` left the top-8 table list entirely |
+| CPU | **109.76 % → 9.01 %** within a minute of the drop |
+| Loom signals across the recreate | **37 trace spans / 46 logs / 213 metric series / 213 samples — identical before and after**, a second independent restart-persistence proof |
+| Failed merges after the recreate boundary (06:57:19Z) | **zero on every table except `metric_log_0`**, which logged 73 and stopped at 06:57:48 — the stuck wide parts retrying under their new name until the `DROP` landed. `transposed_metric_log`: none |
+
+The container's `RestartCount` stayed **0** with `OOMKilled=false`, so the
+single recreate is the only restart in this record.
+
+**The merges now succeed — measured, not inferred.** At `uptime()` 1,989 s
+(07:30:28Z) the new backing table had run **13 background merges with 0
+failures**. That is the mechanism the whole defect turned on, and it is the
+single most load-bearing observation here: the wide table managed **159
+successful merges against 70,249 failures in a day**; the transposed table
+managed 13 against 0 in 33 minutes. It held **3 active parts** (3,068,136 rows,
+5.82 MiB) against the wide table's 135 parts, so there is no longer a
+hundred-part merge for the TTL to fail on. `system` sat at 761.46 MiB — now
+dominated by `trace_log`, which expires normally — and CPU at 9.17 % steady.
+All 37 spans / 46 logs / 213 series were still present at the end of the window.
+
+**Still not claimed.** The pre-fix side of this comparison is a genuine 9-day
+soak; the post-fix side is 33 minutes. Successful merges prove the memory
+mechanism is fixed, but they do not yet prove the *retention outcome* across a
+date boundary — that no `transposed_metric_log` part survives past
+`event_date + 1 day`. That needs a multi-day window and one reading of the
+README's (now time-bounded) check query plus `min(min_date)` on the table.
+Until then this row is "applied and working", not "retention confirmed over
+days". That multi-day reading is [#9868](https://github.com/rjwalters/loom/issues/9868).
+
+One unrelated pre-existing warning is visible in the server log and was **not**
+introduced here: `DNSResolver: Cannot resolve host (71f0a3578d29)`, a stale
+Keeper-cluster hostname from an earlier container generation.
+
+### Two README defects the live run exposed
+
+Executing the documented remediation — rather than only rendering it — surfaced
+two errors in it that no static check could have caught:
+
+1. **The sync step was missing.** The remediation went straight to
+   `--force-recreate`. But the deployment's rendered files are not the ones in
+   this checkout; they live in its own state directory. Recreating against
+   those stale copies produces a container with the *old* config and no change
+   at all, while reporting success. The README now copies the re-rendered
+   `casting.yaml` / `casting.yaml.lock` / `pours/` across first, and diffs
+   before copying so an operator sees exactly what the deployment was running.
+2. **The verification query was unbounded in time.** `part_log` retains the old
+   failure rows until its *own* 1-day TTL expires them, so immediately after a
+   successful fix the documented query still returned `metric_log 70,410` — an
+   operator following the README would read a fixed deployment as still broken.
+   It is now bounded to the running server with
+   `AND event_time > now() - toIntervalSecond(uptime())`, which was run verbatim
+   on the live server and correctly reports only the expected
+   `metric_log_0` rename-window rows.
+
+`signoz_deployment_contract.rs` now asserts both, so a later README edit cannot
+silently restore the unbounded query or drop the sync step.
+
 ## Measured usage: the ClickStack parity gap, and how it was closed
 
 ClickStack's README has carried a **Loom measured usage** saved view since its
@@ -1137,6 +1250,510 @@ caveat `signoz_usage_queries.rs` already carries for the measured-usage
 artifact. That gap is the same one #8525 and #9279 name for every other
 not-yet-live-executed SigNoz artifact in this trial.
 
+## The gauge queries executed against the pinned engine (2026-10-01)
+
+`queue-dwell.sql` (#8856) and `quota-utilization.sql` (#9005) were this trial's
+last two scope-item-4 artifacts with no execution proof of any kind.
+`signoz_trial_artifacts.rs` guards their *vocabulary* (see "Closing the drift
+guard's last gap" above) — enough to catch a renamed metric or label, blind to
+whether the SQL computes the right number. The README said so for one of them
+outright ("Neither has been executed against a live SigNoz") and, for the
+other, recorded an ad-hoc `clickhouse-local` session whose fixture and output
+were never committed, so nothing re-ran it and nothing could be inspected.
+
+`loom-daemon/tests/signoz_queue_quota_queries.rs` closes that gap with the
+technique `signoz_usage_queries.rs` and `signoz_cycle_time.rs` already
+established: `clickhouse local` in the pinned
+`clickhouse/clickhouse-server:25.12.5` image, each committed file run verbatim
+as one pass and then query by query. **These are the first artifacts in this
+trial proven against `signoz_metrics.samples_v4` / `time_series_v4` at all** —
+every earlier proof read `signoz_index_v3` or `distributed_logs_v2` — so the
+metric read surface (`unix_milli Int64` milliseconds, `labels` as a JSON
+**string** read with `JSONExtractString`, not a Map) is now exercised rather
+than assumed.
+
+Because both files window on `now()` (24 h / 7 days / 30 days), the fixture
+cannot use fixed timestamps. It anchors every row to one of three computed,
+boundary-aligned points — `toStartOfHour(now() - 2 h)` and
+`toStartOfDay(now() - 3/2 days) + 1 h` — so the committed queries' own
+`toStartOfInterval(..., 5 MINUTE)` / `toStartOfHour` / `toDate` grouping lands
+in a fixed number of buckets no matter what time of day CI runs.
+
+Observed, and each confirmed to change under a deliberate mutation of the
+committed SQL before being asserted:
+
+| Property | Observation | Mutation that breaks it |
+| --- | --- | --- |
+| Duplicate `time_series_v4` hour-rows are harmless to `max()` | Three `loom.queue.starved` points (2, 3, 1) in one 5-minute bucket on a series with **two** hour-rows answer `3` | `max()` → `sum()` answers **12** (the sum, doubled by the join) |
+| …and fatal to `sum()` without the de-duplicating sub-select | Query 4 answers 1800 wait-seconds / 6 dispatches = 5.0 min mean | the naive `INNER JOIN time_series_v4 USING (fingerprint)` answers **3600 / 12** — run as a counterfactual in the test, not just described |
+| A measured zero is not starvation | a host reporting `starved` = 0 is absent from query 1's result, not present with a zero | `HAVING starved > 0` removed |
+| A missing companion metric is NULL, not fast | `dispatch_wait` with no `.samples` series → `dispatches` = 0 and `mean_wait_minutes` = **NULL** | `nullIf(dispatches, 0)` removed (0 reads as "dispatches are instant") |
+| Absent utilization is NULL, not idle | an account with a weekly reading but no 5-hour reading → `util_5h` = **NULL** | `maxOrNullIf` → `maxIf` answers **0** |
+| Over-100% clamps to zero headroom | a 1.05 pre-reset reading → `idle_headroom` = **0** | `least(prev_value, 1)` removed answers **-0.05** |
+| A provider with no utilization source still appears, unmeasured | `zai`/`acct-z` (only `loom.tokens.exhausted`): `accounts` = 1, `accounts_measured` = 0, `coverage` = `unknown`, both fractions NULL | query 3's `LEFT JOIN per_account_weekly` → `INNER JOIN` **drops the provider's row entirely** |
+| One reset per account, not one per hour-row | query 2 returns exactly 2 rows (0.82/0.18 and 1.05/0.0) although both weekly series carry two hour-rows | — (the `max()`-per-`ms` CTE absorbs it) |
+| Query 5 reads spans, and every dispatch attribute is a string | `rank`/`candidate_rank`/`total_candidates`/`priority_score` all resolve from `attributes_string`; the same key read from `attributes_number` returns **0 for every row with no error** | — (negative control, as in `signoz_usage_queries.rs`) |
+| A pre-#9673 halted row's cause is recoverable | `attributes_string['loom.queue.halt_cause']` on a row that omits the key reads `''` rather than erroring, and joining `parentSpanID` to the parent `loom.dispatch.tick` recovers `halted_main_red` | — (the file's own trailing note, now exercised) |
+
+Query 5's three negative controls are also observed to be excluded: a
+different issue in the same repo, the same issue **number** in a different repo
+(issue numbers are not globally unique), and the same issue outside the 24 h
+window.
+
+**One finding that corrects the file's own implied reasoning.** Query 3 ends
+`SETTINGS join_use_nulls = 1`. Removing it on this engine changes **nothing** —
+`zai` still reads `coverage = 'unknown'` with NULL fractions, because
+`per_account_weekly.used_fraction` is already `Nullable(Float64)` (it comes out
+of `argMaxIf`/`lagInFrame(toNullable(...))`), so the LEFT JOIN fills NULL
+regardless. The setting is belt-and-braces, not the mechanism; the mechanism is
+the LEFT JOIN itself, which the mutation above shows is load-bearing. Recorded
+so a future editor does not treat the setting as the thing protecting the NULL.
+
+**What this establishes and what it does not.** The committed gauge SQL
+computes the documented answers on the engine version the trial deploys, and
+the absent-versus-zero distinctions this epic cares about survive the engine
+rather than only the author's intent. It is **not** a live trial observation: no
+metric point went through SigNoz's own ingester, its metric migrator, or
+`time_series_v4` as SigNoz actually creates and fingerprints it — this is
+`clickhouse local` with a hand-written read-surface schema, the same caveat
+`signoz_usage_queries.rs` and `signoz_cycle_time.rs` carry. Nor was it, at the
+time, a proof of the alert: `alerts/queue-starvation.json` embeds the same
+query 1 shape with `{{.start_timestamp_ms}}` placeholders SigNoz substitutes,
+and only its vocabulary was guarded — closed the next day by the section below.
+The remaining gap is the same one #8525, #8946, #8529 and #9279 name for every
+other not-yet-live-executed SigNoz artifact in this trial.
+
+## The alert rule's threshold executed against the pinned engine (2026-10-01)
+
+`alerts/queue-starvation.json` (#8856) was the last query artifact in this
+trial with no execution proof of any kind. The section above says so in as many
+words, and the reason it was left for last is also the reason it mattered most:
+it is the only saved artifact here that **nobody looks at**. A dashboard that
+returns zero rows is *visibly* empty. An alert whose query returns zero rows,
+or returns rows its threshold can never cross, is **silently** healthy forever
+— the absence of a page is exactly what a working queue looks like. That is
+this epic's scope-item-5 absent-versus-zero hazard applied to the one artifact
+with no reader.
+
+`signoz_trial_artifacts.rs`'s
+`queue_starvation_alert_matches_the_ops_metric_vocabulary` can see only half of
+what has to hold. It proves the embedded query names metrics and labels the
+emitters still produce and the gateway's DATAPOINT allowlist still forwards —
+enough to catch a rename, blind to whether the query plus the rule's threshold
+actually separate a starved host from a healthy one.
+
+`loom-daemon/tests/signoz_queue_starvation_alert.rs` closes that with the same
+technique as the three proofs above: `clickhouse local` in the pinned
+`clickhouse/clickhouse-server:25.12.5` image, the committed query run verbatim.
+It differs from them in one way that matters. The alert is **not** windowed on
+`now()`: it carries SigNoz's own `{{.start_timestamp_ms}}` /
+`{{.end_timestamp_ms}}`, which the rule evaluator substitutes with the
+evaluation window's bounds. So the fixture uses *fixed* timestamps
+(2026-10-01T00:00:00Z … 00:15:00Z) and the test substitutes the same two bounds
+it built the rows around — every bucket count below is exact rather than
+clock-dependent. The fixture's window length is asserted equal to the committed
+`evalWindow`, so shortening that field without reworking the fixture fails by
+name instead of quietly changing which hosts fire.
+
+Five synthetic ready/blocked series over the 15 one-minute buckets of one
+evaluation window:
+
+| Series | Shape | Why it exists |
+| --- | --- | --- |
+| `host-starved` | above zero in all 15 minutes (1, 2 or 3), on a fingerprint with **two** `time_series_v4` hour-rows | the host the alert exists to name, and the duplicate-join case |
+| `host-healthy` | a **measured zero** in all 15 minutes, plus two out-of-window spikes of 99 at `start_ms - 60s` and at exactly `end_ms` | separates "reporting zero starvation" from "starved", and makes either window leak visible as a false page |
+| `host-flapping` | 4 in the 8 even buckets, 0 in the 7 odd ones | separates `matchType` "at least once" from "all the time" |
+| `host-blocked-only` | 7 in every minute, `state = 'blocked'` | blocked work waits on a dependency, not on capacity; the alert's name is "ready queue starved" |
+| (no `host.id`) | 5 in every minute, `state = 'ready'` | the shape the data takes if the gateway's allowlist stops forwarding the label |
+
+Plus `loom.queue.starved.by_reason` at 42 in every minute, parked **on
+host-healthy's own fingerprint** — the `USING (fingerprint)` join carries no
+metric-name predicate, so dropping the `metric_name` filter would attach those
+per-reason subtotals to the healthy host's label set and page on it.
+
+Observed, with the mutation of the **committed JSON** that breaks each one
+actually run rather than described:
+
+| Property | Observation | Mutation that breaks it |
+| --- | --- | --- |
+| The threshold fires on sustained starvation | committed `op` = above, `matchType` = all-the-time, `target` = 0 → `host-starved` fires | — (this is the artifact's whole purpose) |
+| …and not on a reporting-zero host | `host-healthy` never fires, in any minute | `target` 0 → -1 fires on **every** reporting host; nothing in the SQL prevents it |
+| …and not on a flapping queue | `host-flapping`, starved in 8 of 15 minutes, does **not** fire | `matchType` 2 → 1 fires on it: "any starvation" is a different operational contract from "sustained starvation" |
+| The zero rows are returned, not filtered | `host-healthy` yields 15 rows reading exactly `0.0` — SigNoz needs them to see a series recover | borrowing `queue-dwell.sql` query 1's `HAVING starved > 0` hides the recovery (asserted absent) |
+| The window is half-open | each host yields exactly 15 buckets; the spike at `start_ms - 60s` and the one at exactly `end_ms` are both absent | `< {{.end_timestamp_ms}}` → `<=` admits the boundary point, two overlapping evaluations double-count it, and `host-healthy` becomes a firing host |
+| `max()` absorbs the duplicated hour-row | bucket 0 of `host-starved` holds three points (2, 3, 1) on a two-hour-row series and answers **3** | `max()` → `sum()` answers **12** — the bucket's real total of 6, doubled by the join (run as a counterfactual) |
+| `state = 'ready'` excludes blocked work | `host-blocked-only` is absent from the result entirely | removing the filter makes its 7-per-minute blocked queue fire for the whole window |
+| `GROUP BY ts, host` carries the annotation's host label | the starved and the healthy host are reported separately | dropping `host` collapses to **one** 15-row series whose every bucket is the worst ready host's value: still firing, no attribution, and `host-healthy` hidden rather than visibly healthy |
+| A label-less series fires with an empty host | the unlabelled ready series fires with `host` = `''` | — (observed behaviour, not a desired one: `JSONExtractString` answers `''` for a missing key, so the annotation's "see the alert's host label" would point at nothing) |
+
+The rule's own cadence is checked in ordinary CI, without Docker: `frequency`
+(5m) ≤ `evalWindow` (15m), so consecutive evaluations overlap and no minute of
+starvation can fall into a gap between them; and neither the rule nor its query
+ships `disabled`, which would make an imported alert silent by construction.
+Eight of the ten tests need the engine and are `#[ignore]`d for CI's explicit
+`--ignored` invocation; the two that only read the committed JSON run on every
+backend PR.
+
+**Derived, not restated.** The window bounds come from the committed
+`evalWindow`; the firing decision comes from the committed `op`, `target` and
+`matchType`; the mutation counterfactuals are built by editing the committed
+query text and fail loudly if that text no longer contains what they edit. A
+semantic change to the rule therefore fails this test by name instead of
+silently re-tuning a production alert. The one thing the repo cannot derive is
+SigNoz's own integer → semantic mapping for `op` and `matchType`; the test
+records it as upstream's published mapping and evaluates **both** candidate
+match semantics over the same engine output, so the result is attributable
+either way.
+
+**What this establishes and what it does not.** The committed alert, as
+imported, distinguishes a sustainedly starved host from a working one on the
+engine version the trial deploys — and the distinction survives the engine
+rather than only the author's intent. No point went through SigNoz's own
+ingester, metric migrator, or `time_series_v4` as SigNoz actually creates and
+fingerprints it; **no rule evaluator ran and no notification was delivered**.
+The live fire-and-resolve check on the trial deployment is
+[#9006](https://github.com/rjwalters/loom/issues/9006); the real-canary gap is
+[#8525](https://github.com/rjwalters/loom/issues/8525).
+
+## The ETA accuracy queries executed against the pinned engine (2026-10-01)
+
+`eta-queries.sql` (#9289) was the last query artifact in this trial with no
+execution proof of any kind. Its static guards are good ones —
+`eta_artifacts.rs` ties every attribute it reads to one
+`observability/otlp/mapping/eta.rs` emits and the gateway's `keep_keys`
+forwards, which is what stops a view going quietly empty after a rename — but a
+name check cannot see an answer. The file is also this trial's only artifact
+that decides something: Q2's mean pinball loss is the number an ETA heuristic
+is **promoted** on, and `eta.md`'s promotion gate reads it.
+
+`loom-daemon/tests/signoz_eta_queries.rs` closes that with the technique of the
+four proofs above: `clickhouse local` in the pinned
+`clickhouse/clickhouse-server:25.12.5` image, the committed file run verbatim,
+every assertion's breaking mutation of the committed SQL executed as a
+counterfactual rather than described. Two things make it differ from them.
+
+**The fixture's DDL was read off the live deployment, not invented.** This is
+the trial's first proof to need `attributes_bool` — the ETA mapping has four
+`kv_bool` sites (`loom.eta.primary`, `loom.eta.covered`,
+`loom.eta.provenance_complete`, `loom.eta.outcome_provenance_complete`) — so
+`SHOW CREATE TABLE signoz_logs.distributed_logs_v2` was run against the running
+trial ClickHouse (25.12.5.44) and the column reproduced from it:
+`Map(LowCardinality(String), Bool)`. That type's behaviour for a **missing** key
+is load-bearing, and the fixture's `c-2` exists to exercise it.
+
+**The committed file was also executed against the live deployment.** Verbatim,
+through `clickhouse-client --multiquery --param_since='2026-09-01 00:00:00'
+--param_repo=''` inside `loom-signoz-telemetrystore-clickhouse-0-0`, exit 0, all
+four sections parsing and returning their documented column sets over **zero
+rows** — the trial store holds 46 log records and none of them is an ETA record.
+That is a weaker claim than the engine proof and a different one: it says the
+SQL is compatible with SigNoz's *real* schema (the `Distributed` table over
+`logs_v2`, with its JSON `body_v2`/`resource` columns and `_retention_days`
+defaults), not merely with a hand-written read surface. Every earlier proof in
+this file could only claim the latter.
+
+### Three claims the engine refuted
+
+Each was a statement in the committed artifact or a reasonable reading of it.
+All three were corrected in the same change.
+
+| Claim as written | What the engine does | Correction |
+| --- | --- | --- |
+| Q3 ranks numeric features; a non-numeric one is skipped, so nothing spurious enters | A feature that **never varied** scores `rank_corr` = **exactly 0.5** — `rankCorr` average-ranks ties — which the file's own `ORDER BY abs(rank_corr) DESC` puts above every genuine correlation weaker than 0.5. `corr` answers `nan` for the same column | Q3 now reports `uniqExact(value) AS distinct_values`; `distinct_values` = 1 is the tell. Header and `eta.md` say so |
+| "the typed `JSONExtractKeysAndValues(body, 'features', 'Float64')` would \[read nulls as 0] — an unmeasured feature must never correlate as a zero" | It does **not** zero a null. Measured: it *drops* `null` and `"refactor"` outright, and **coerces** `"42"` to 42 and `true` to 1 | The raw + `toFloat64OrNull` form is still right; the reason was wrong. The header now states the real damage — two non-numeric features entering the ranking as constants, each at the same spurious 0.5 |
+| Q2's `ROLLUP` subtotals are readable as subtotals | `ROLLUP` blanks an aggregated column to the type's default, `''` — exactly what `attributes_string['loom.eta.heuristic']` answers for a record missing the key. On the fixture Q2 emitted **two rows with the identical key `('', '', '')`**: the grand total (31 observations) and an unlabelled heuristic's own total (1) | Q2 now reports `grouping(heuristic) + grouping(kind) + grouping(revision) AS rolled_up`: 0 is a real group, 3 the grand total, and the collision resolves to `rolled_up` 2 vs 3 |
+
+### The fixture, and what each part is for
+
+73 rows over 12 lettered groups
+(`loom-daemon/tests/fixtures/signoz_eta/fixture.sql`). Which map an attribute
+lands in follows the mapping's call sites, not convenience. The populations
+that carry the answers:
+
+| Group | Shape | Why it exists |
+| --- | --- | --- |
+| A, `a-0`…`a-20` | `land-v1` / revA / `land`, 21 scored pairs, p25/p50/p75 = 1000/2000/3000, errors −2000…+2000 step 200 | the honest baseline: MAE **1048**, coverage **0.524** (11 of 21), median and mean error **0** |
+| E | `a-0`'s outcome and `a-1`'s estimate delivered **twice**, byte-identical | delivery is at least once; `LIMIT 1 BY estimate_id` and `any(body) GROUP BY estimate_id` must absorb both |
+| B, `b-0`…`b-4` | revB, five identical **+5000** errors, none covered | a regressed build, so "grouped by revision" has something to separate |
+| J | revB, one second **before** the bound, error 999999 | a leaking lower bound would show as a sixth revB row |
+| K | `boundary-v0`, outcome at **exactly** the bound, estimate an hour before it | the bound is closed below — and Q3's estimate sub-select carries the same bound, so this row is scored by Q1/Q2 and invisible to Q3 |
+| H | `stage-v2`, error **0** | a *measured* zero, which must produce a row reading 0 |
+| D | an `abandoned` outcome with **no** `loom.eta.error_sec` key, plus a refusal | *absent*, which must produce no row at all |
+| C | the three incomplete-provenance shapes: both builds unpinned; the observing build unpinned; the flag **missing from the map entirely** | `= true` must reject all three and section 0's `!= true` count all three |
+| I | `loom.eta.heuristic` absent from both rows | the shape the data takes if the gateway stops forwarding the key — and the half of the ROLLUP collision that is a real group |
+
+### Observed, with the mutation that breaks each one run
+
+| Property | Observation | Mutation that breaks it |
+| --- | --- | --- |
+| Section 0 reconciles counted against scored | 24 outcomes, 23 scored, 1 abandoned — exactly | — (this is what makes section 0 worth reading first) |
+| **Absent is never zero** | the abandonment produces no Q1 row | removing `mapContains(attributes_number, 'loom.eta.error_sec')` scores it as a *flawless* prediction: 21 → 22 observations and MAE **1048 → 1000**. The promotion metric **improves** because data went missing — and the same row's absent `covered` flag reads `false`, dragging coverage 0.524 → 0.5, so one missing record moves two metrics in opposite directions |
+| …and a measured zero still reports | `stage-v2` yields a row reading `mae_sec` 0 | — (its pair is the row above; neither is inferable from the other) |
+| `refusals` ⊂ `estimates` | the refusal is counted in both columns of its group | — (adding the two columns double-counts it; recorded so a reader does not) |
+| Accuracy is grouped by build | revA MAE 1048, revB MAE 5000, reported separately | dropping `revision` from Q1's grouping answers **1808** over 26 pooled observations — neither build's figure is recoverable from it, nothing in the row says two builds are in it, and the unbiased build acquires a **+962 s** fast bias it does not have |
+| Delivery is at least once | 21 observations from 22 delivered rows | removing `LIMIT 1 BY estimate_id` moves MAE to **1091**, the median from 0 to **−100** and the bias to **−91**: one duplicate makes an unbiased heuristic look slow |
+| The `since` bound is closed below | the outcome at exactly `since` is scored (`boundary-v0`, MAE 700) | `>=` → `>` makes the whole population **vanish** — not a changed number, a missing row — while nothing else moves |
+| Unpinned builds are excluded, not flagged | no `revision = 'unknown'` row in Q1, and no `finish` row at all | removing the two `provenance_complete` filters gives a revision literally named `unknown` an accuracy figure (MAE 4242) and attributes `c-1`/`c-2` to revA, which did not necessarily produce them (MAE 4394) |
+| A missing `Bool` key is rejected by `= true` | `c-2`, whose outcome omits `loom.eta.provenance_complete`, is excluded from Q1/Q2/Q3 and counted by section 0 | — (the `Map(…, Bool)` default is `false`; this is why `!= true` and `= true` are both correct as written) |
+| `{repo}` scopes every section, not just Q1 | `org/alpha` drops the other repo from Q1 (7 → 6 rows) **and** from Q2's inner sub-select (22 → 21 observations, pinball 1280 → 1310) | — |
+| Q2's subtotals are attributable | `rolled_up` 2 (1 observation) vs 3 (31) on otherwise identical keys | removing the column leaves two indistinguishable rows |
+| Q3's nulls are dropped, not zeroed | `unmeasured`, `label`, `numeric_string` and `flaky` are absent from the ranking entirely | the typed extraction admits `numeric_string` and `flaky` at n=21 and `rank_corr` 0.5 each |
+| An unvarying feature is visible as one | `open_prs`: n 21, `distinct_values` **1**, `rank_corr` **0.5**, `pearson_corr` **NaN** | — (observed behaviour, not a desired one; the column exists so it is attributable) |
+| The sample floor holds | three features ranked; `partial` (n=12, `rank_corr` 1.0) excluded | removing `HAVING n >= 20` surfaces a perfect correlation on 12 observations, revB's five-sample features, and `nan` rows from one-observation groups |
+
+Three caveats a reader should carry out of this. `HAVING n >= 20` means a short
+window returns **nothing** from Q3, which reads like "no feature tracks the
+error" rather than "not enough data" — section 0's counts are the check.
+`{since:DateTime}` is interpreted in the **server's** timezone; the trial's
+ClickHouse reports `timezone()` = `UTC`, so the bound means what it says there,
+but that is a property of the deployment, not of the query.
+
+And the **NaN's spelling is architecture-dependent**, which the first CI run of
+this test found rather than its author: ClickHouse 25.12.5 renders the
+zero-variance `corr` as `nan` on arm64 macOS (this trial host) and as `-nan` on
+amd64 Linux (a GitHub runner) — the sign bit the libc `printf` carries out of
+the hardware's quiet NaN, not a different result. Both of the architectures
+[#8696](https://github.com/rjwalters/loom/issues/8696) verified this trial on
+are therefore affected, and so is any consumer that **string-matches** the
+column: a dashboard cell, a CSV export, a downstream parser. The test asserts
+NaN-*ness* rather than either spelling; a literal-string assertion would have
+passed on one architecture and failed on the other.
+
+**What this establishes and what it does not.** The committed file computes the
+documented answers on the engine version the trial deploys, the
+absent-versus-zero distinctions this epic cares about survive the engine rather
+than only the author's intent, and the file parses and runs against SigNoz's
+real schema on the live trial deployment. **No ETA record has been ingested
+there**: nothing went through SigNoz's own ingester or its log migrator, and the
+live run's zero rows are an empty-input result, not a scored one. That remaining
+gap is the same one [#8525](https://github.com/rjwalters/loom/issues/8525) owns
+for every other artifact in this trial.
+
+## The CI failed-run log join executed against the pinned engine (2026-10-01)
+
+Section 5 of `ci-queries.sql` ("Failed run → logs", #8826) was the one standing
+CI view with an *executed* history that still proved nothing about half of it.
+The file ran end to end against the live trial on a real capture — 592 runs /
+2,131 jobs, every section non-empty, reconciling exactly to the records (see
+"CI retro queries, executed live" above). One line of that result was not a
+pass. This file recorded it as: *"Section 5's chunk join is unobserved on real
+`ci.job.log` data (none reached the trial)."* All 60 rows of the live section-5
+result read `0 of 0`, so the half of the query that joins a failed job to its
+captured log chunks had never produced a non-trivial row **anywhere** — not on
+the trial, not in CI, not on a fixture. Everything downstream of that join was
+unexecuted code in a saved view operators are meant to act on.
+
+`loom-daemon/tests/signoz_ci_failed_run_logs.rs` closes that by the technique
+of the five proofs above (#9705/#9775/#9833/#9857/#9892): `clickhouse local` in
+the trial's own pin — `clickhouse/clickhouse-server:25.12.5`, reporting
+`25.12.5.44` — the committed file run **verbatim**, and every assertion's
+breaking mutation of the committed SQL **run** as a counterfactual rather than
+described. Section 5 is located by the `failed_runs` CTE no other section
+declares, so inserting a section above it cannot silently re-point the proof.
+
+### What executing it found: two absences that read identically
+
+A failed run does not always have a failed job. A `startup_failure`, a
+cancelled matrix parent, or a required check that never produced a job all
+leave `failed_jobs` with nothing to offer; the job side of the `LEFT JOIN`
+misses, and **ClickHouse fills an unmatched side with each column's type zero,
+not NULL**. Run 9002 (`startup_failure`) came back from the committed query as:
+
+```json
+{"run_id":9002,"run_conclusion":"startup_failure","job":"","job_id":0,
+ "job_conclusion":"","timed_out":false,"chunks_present":0,"chunk_count":0,
+ "truncated":false,"logs_explorer_filter":"loom.ci.job_id = 0"}
+```
+
+Byte for byte the shape of job 70003 — a job that genuinely failed and whose
+log never arrived — plus a `logs_explorer_filter` that silently returns nothing
+when pasted into Logs Explorer, because no record carries `loom.ci.job_id = 0`.
+`truncated` is the sharpest case: a `Bool` has no zero meaning "unknown", so the
+row asserted that a log nobody holds was **not truncated**.
+
+The committed query now guards every job- and log-sourced column with
+`if(j.job_id = 0, NULL, …)` and empties the filter on that row. Same binding,
+after the fix:
+
+| `run_id` | conclusion | `job_id` | chunks | `truncated` | filter |
+| --- | --- | --- | --- | --- | --- |
+| 9002 | `startup_failure` | **NULL** | **NULL / NULL** | **NULL** | `''` |
+| 9001 | `failure` | 70001 | 3 / 3 | false | `loom.ci.job_id = 70001` |
+| 9001 | `failure` | 70002 | 2 / 3 | **true** | `loom.ci.job_id = 70002` |
+| 9001 | `failure` | 70003 | **0 / 0** | false | `loom.ci.job_id = 70003` |
+| 9001 | `cancelled` | 70006 | 0 / 0 | false | `loom.ci.job_id = 70006` |
+
+A reader can now tell "this run had no job to log" (NULL, empty filter) from
+"this job's log never arrived" (`0 of 0`, filter still usable — which is how an
+operator checks whether capture is even switched on) from "this job's log
+arrived partially" (`2 of 3`). The live capture's 60 all-`0 of 0` rows can no
+longer be assumed to have all meant the same thing.
+
+### Observed, with the mutation run for each
+
+| Property | Observation | Mutation that breaks it |
+| --- | --- | --- |
+| A captured log is reported chunk by chunk | job 70001 `3 of 3`, `truncated` false; job 70002 `2 of 3` with chunk 1 lost in flight, `truncated` **true** | — (the two columns exist precisely so `2 of 3` differs from `3 of 3`; neither had ever been produced) |
+| **The two absences are distinguishable** | run 9002 all-NULL + empty filter; job 70003 `0 of 0` + usable filter | dropping the `if(j.job_id = 0, NULL, …)` guards returns run 9002 as `job_id` 0 / `0 of 0` / `truncated` false / `loom.ci.job_id = 0` — identical in shape to job 70003 |
+| …and the run is still reported at all | run 9002 appears, 5 rows | `LEFT JOIN` → `INNER JOIN` drops it entirely (4 rows): "no failed run had anything wrong with it", the quietest possible failure |
+| Chunk delivery is at-least-once | job 70001 `chunks_present` 3 from 4 delivered rows | `uniqExact(chunk_index)` → `count()` reports **4 of 3** — more log captured than the log has, which reads as corruption rather than the ordinary redelivery it is |
+| A replayed `ci.run` does not fan out its jobs | 5 rows | removing `LIMIT 1 BY repo, run_id, run_attempt` → **9 rows**: run 9001's duplicate record doubles each of its four job rows |
+| Only log-chunk records feed the counts | job 70003 stays `0 of 0` | dropping `mapContains(attributes_number, 'loom.ci.chunk_index')` makes job 70003 read **`1 of 0`** — its own `ci.job` record counted as a chunk; one chunk present out of a zero-chunk log |
+| The attempt join keys are **asymmetric on purpose** | job 70020 (run 9001 attempt 2, which SUCCEEDED) never appears on the failed attempt | "tidying" `failed_jobs`'s `loom.ci.attempts` to `loom.ci.run_attempt` matches nothing, and because it is a LEFT JOIN the result neither shrinks nor errors: **2 rows, every `job_id` NULL** — every failed run now claiming it had no failing job |
+| Another repo's chunks do not count toward this job | ci-alpha job 70001 `3 of 3`; with `repo:''`, ci-beta's own job 70001 reports `2 of 5` | removing `l.repo = j.repo` from the log join attributes ci-beta's private 5-chunk log to ci-alpha's job — a cross-repository leak reporting MORE log than exists |
+| "Non-successful" is wider than "failed" | listed jobs exactly `[70001, 70002, 70003, 70006]`; 70004 succeeded, 70005 was skipped, 70006 was **cancelled** and counts | narrowing `NOT IN ('success','skipped','neutral')` to `= 'failure'` drops the cancelled job — a one-token edit hiding a whole failure class |
+| `since` is a closed lower bound and `repo` scopes the result | run 8000 (failed, failed job, complete 1-chunk log, but before `since`) never appears; `repo:''` is cross-repo, returning 6 rows including ci-beta | — |
+
+### The fixture
+
+359 lines over two synthetic repositories. `synthetic/ci-alpha` run 9001 carries
+the four reportable jobs (complete log, truncated-and-incomplete log, no log at
+all, cancelled), a succeeded and a skipped job that must **not** appear, a
+duplicate `ci.run` record, a replayed log chunk, and an attempt-2 job that
+succeeded. Run 9002 is the `startup_failure` with no non-successful job — the
+whole point of the NULL guard. Run 8000 sits before `since`.
+`synthetic/ci-beta` run 9100 is timed out and stages a deliberate `job_id`
+collision (also 70001) with a 5-chunk log, so the join's repository condition
+has something to keep apart; GitHub job ids are globally unique, so the
+collision is synthetic while the condition it exercises is real — and an
+unexecuted defensive condition is exactly the kind that gets "simplified" away.
+
+### What this does not establish
+
+**No `ci.job.log` record has been ingested into the trial deployment.** Nothing
+went through SigNoz's own ingester or its `logs_v2` as SigNoz actually creates
+it; this is `clickhouse local` over a hand-written read surface, the same caveat
+the five sibling proofs carry, and the same gap
+[#8525](https://github.com/rjwalters/loom/issues/8525) owns. Attribute-container
+placement is not guessed here — `signoz_trial_artifacts.rs` independently pins,
+in ordinary CI, which container the daemon sends each key this section reads.
+The static guard `section_five_null_guards_every_job_sourced_column` runs in
+ordinary CI with no Docker, so a future edit that drops a guard and reintroduces
+the ambiguity fails on every pull request rather than waiting for the gated
+suite; it was confirmed to fail against the pre-fix artifact, together with
+three of the engine tests.
+
+## The retention statements executed against the pinned engine (2026-10-01)
+
+`retention.sql` was the last committed artifact in this trial with **no** guard
+of any kind — neither a static vocabulary check nor an engine execution
+([#9904](https://github.com/rjwalters/loom/issues/9904)). What it had instead
+was a live application: "Retention DDL observed (2026-09-25)" above records the
+file re-run against this trial with all 16 `ON CLUSTER` statements reporting
+status 0, and the resulting effective TTLs captured per bucket.
+
+**Status 0 and an effective TTL are not a retention outcome.** They say the DDL
+parsed and was stored. They do not say that a row past the window is deleted,
+that a row inside it survives, that the 7/30 split separates anything, or that
+the deletion happens at all. That is the same gap as section 5's chunk join
+above — an artifact whose output was observed in a shape that cannot distinguish
+working from broken — except that this artifact *mutates* the deployment, so
+being wrong about it is not a misleading query result but lost data.
+
+`loom-daemon/tests/signoz_retention_ttl.rs` (9 tests: 8 gated on Docker, 1 in
+ordinary CI) closes it with the technique of the six proofs before it
+(#9705/#9775/#9833/#9857/#9892/#9905), with one difference the artifact forces.
+**`clickhouse local` cannot run this file at all** — `Code: 392 … Replicated DDL
+queries are disabled (QUERY_IS_PROHIBITED)` — because `ON CLUSTER` needs a real
+distributed-DDL queue. So the harness starts a single-node
+`clickhouse/clickhouse-server:25.12.5` with an embedded Keeper, reporting the
+same `25.12.5.44` the trial's own telemetry store reports, and takes the cluster
+name, the `distributed_ddl` path and the macros from the committed render
+(`pours/deployment/telemetrystore/clickhouse/config-0-0.yaml`). The committed
+file then runs **verbatim**, `ON CLUSTER cluster` included: 16 host rows, every
+one status 0, on both of two consecutive passes.
+
+### Per-table effective TTL, as the engine reports it
+
+The grouped summary in "Retention DDL observed" collapses the six 7-day tables
+into one cell and the reduced-metric tables into "6 ×". This is the per-table
+form #9904 asked for, read back out of `system.tables` after the verbatim run:
+
+| Table | Effective TTL |
+| --- | --- |
+| `signoz_logs.tag_attributes_v2` | `toDateTime(unix_milli / 1000) + toIntervalDay(7)` |
+| `signoz_traces.tag_attributes_v2` | `toDateTime(unix_milli / 1000) + toIntervalDay(7)` |
+| `signoz_traces.durationSort` | `toDateTime(timestamp) + toIntervalDay(7)` |
+| `signoz_traces.signoz_index_v2` | `toDateTime(timestamp) + toIntervalDay(7)` |
+| `signoz_traces.signoz_spans` | `toDateTime(timestamp) + toIntervalDay(7)` |
+| `signoz_traces.top_level_operations` | `time + toIntervalDay(7)` |
+| `signoz_metrics.metadata` | `toDateTime(last_reported_unix_milli / 1000) + toIntervalDay(30)` |
+| `signoz_metrics.samples_v2` | `toDateTime(timestamp_ms / 1000) + toIntervalDay(30)` |
+| `signoz_metrics.samples_v4_reduced_last_60s` / `_5m` / `_30m` | `toDateTime(unix_milli / 1000) + toIntervalDay(30)` |
+| `signoz_metrics.samples_v4_reduced_sum_60s` / `_5m` / `_30m` | `toDateTime(unix_milli / 1000) + toIntervalDay(30)` |
+| `signoz_metrics.time_series_v4_reduced` | `toDateTime(unix_milli / 1000) + toIntervalDay(30)` |
+| `signoz_metrics.time_series_v4_reduced_1day` | `toDateTime(unix_milli / 1000) + toIntervalDay(30)` |
+
+These are the expressions **the committed file produces**, asserted per
+statement by the verbatim test rather than transcribed. The equivalent
+per-table read against the live trial is still owed, and the README's check
+query now emits exactly this shape plus the setting below.
+
+### What executing it found
+
+Five behaviours the header did not state. All five are now in it.
+
+| Finding | Why it matters |
+| --- | --- |
+| **`MODIFY TTL` materialises on existing parts immediately.** Over-age rows are gone when the command returns | The header read as a policy change. It is a deletion, and it is not recoverable |
+| **Dropping the `/ 1000` deletes the whole table, not nothing.** `toDateTime` **saturates** an out-of-range argument at `2106-02-07 06:28:15` — the `DateTime` maximum — and `+ INTERVAL 7 DAY` then **overflows past it**, so the TTL lands in the past for every row | The most plausible single edit to this file. It reports status 0 and leaves an effective TTL that reads correctly in `system.tables` |
+| **`ttl_only_drop_parts` decides whether the window is honoured.** A part holding one over-age and one in-window row keeps **both** | The 2026-09-25 capture recorded TTL expressions only, so the trial's actual *cleanup* behaviour is still unestablished. The README's check query now reads the setting, and a per-part `delete_ttl_info_min/max` query for the stuck case |
+| **`MODIFY TTL` replaces, it does not merge.** A table-level `DELETE WHERE` qualification is dropped silently; column TTLs survive | This is why the resource fingerprint tables' 30-minute grace holds *only* because the file omits them. Adding one would erase the grace and report success |
+| **One failing statement aborts the rest of the file.** A renamed table reports host status 60 (`UNKNOWN_TABLE`) and `clickhouse-client --multiquery` stops | The 10 metric statements are last. A partial run therefore shortens logs/traces to 7 days and skips every statement that *restores* 30 days to metrics — the asymmetry that hurts |
+
+A sixth correction is to the header's own history note: the earlier
+all-seven-day version of this file "restores" nothing. It deleted every metric
+row between 8 and 30 days old at the moment it ran; re-widening the window
+afterwards returns the policy and no data.
+
+### Observed, with the mutation run for each
+
+| Property | Observation | Mutation of the committed SQL that breaks it |
+| --- | --- | --- |
+| The file applies verbatim under the render's cluster name | 16 host rows, all status 0, twice; effective TTLs exactly as tabulated above | Renaming the cluster in one statement (`CLUSTER_DOESNT_EXIST`, nothing applies); removing a statement; widening one 7-day statement to 30 |
+| An over-age row is deleted and an in-window row survives, per statement | 16/16; the **same** 10-day-old row is deleted by every 7-day statement and kept by every 30-day one | Dropping the `/ 1000` (table emptied); adding a spurious `/ 1000` to the `DateTime` column |
+| A units slip empties the table rather than widening the window | 0 rows survive where the committed statement keeps both; `toDateTime(now * 1000)` = `2106-02-07 06:28:15` | — (the mutation **is** the observation; the committed statement is run as the control in the same script) |
+| Re-widening restores the policy, not the data | 20-day-old sample gone after the 7-day version, still gone after restoring 30, policy back at `toIntervalDay(30)` | — (the three-phase history is the observation) |
+| `MODIFY TTL` drops a qualified `DELETE WHERE`, keeps column TTLs | `WHERE k != 'pinned'` absent afterwards; `` `payload` String TTL … toIntervalDay(1) `` intact | — (the fixture's "before" read is the control) |
+| An over-age row survives in a mixed part under `ttl_only_drop_parts` | `{ten_days, two_days}` with the setting; `{two_days}` for the same two rows in two parts, and `{two_days}` for the same mixed part with the setting off | — (both controls run in the same script) |
+| A renamed table leaves the metric statements unapplied | statements before the abort at 7 days, the metric statements still at the shortened 7 days, the trace statements after it still at the upstream 15 | Adding a destructive statement to the file (`TRUNCATE`) fails the parse outright |
+| The file is 16 `MODIFY TTL` statements, none naming an API-owned active table | `signoz_index_v3`, `logs_v2`, `samples_v4`, `time_series_v4` are derived from the nine sibling artifacts and asserted disjoint | Pointing a statement at `samples_v4`; at a database outside the three the trial queries |
+
+### The fixture, and what mutation-testing the test itself found
+
+Each of the 16 tables is reproduced as a minimal `MergeTree` carrying exactly
+the time column its own statement keys on, so the `CREATE` side is derived from
+the artifact and a 17th statement would be covered automatically.
+
+Two details were wrong in the first draft and were found by running it:
+
+- **The fixture must start with no TTL for the outcome tests.** ClickHouse
+  evaluates TTL as it *writes* a part, so a 27-day-old row inserted into a table
+  still carrying the upstream 15-day TTL is dropped by the **insert**, before
+  the committed statement runs. The first draft read that as the committed
+  statement deleting an in-window row.
+- **The millisecond encoding must come from the column's name, not from the TTL
+  expression.** A draft that derived it from the expression silently *adapted*
+  to the `/ 1000` mutation — reclassifying the column as a `DateTime64`, typing
+  the fixture to match, and passing. The mutation sweep caught it as a `MISSED`.
+  The pinned schema names every millisecond column `…_milli` / `…_ms`, which is
+  an authority independent of the expression under proof, and the ordinary-CI
+  test now asserts the expression against it.
+
+### What this does not establish
+
+- **Nothing here ran against the live trial deployment.** The trial is on
+  another host; this harness is a single-node stand-in on the same pinned image
+  and version. The 2026-09-25 live run remains the only application to real
+  SigNoz schema and real data.
+- **The live trial's `ttl_only_drop_parts` values and per-part expiry state are
+  unknown** — recorded as the newly-identified gap in the ledger below. The
+  README's two check queries produce them in one pass with no credential beyond
+  the bundled client.
+- **The logs/traces API setting is still unapplied on the current trial**
+  ([#8946](https://github.com/rjwalters/loom/issues/8946)); this proof is about
+  the committed `.sql` artifact, which needs no org login.
+
 ## Acceptance ledger
 
 | Check | Status |
@@ -1149,20 +1766,26 @@ not-yet-live-executed SigNoz artifact in this trial.
 | Backend outage and recovery through the shared collector | **Passed** — the ingester's receiver was genuinely unavailable until org registration; the gateway's queue preserved and drained all 37/14/3 signals with zero loss and no re-send, while the absent ClickStack exporter stayed visibly stuck in the same scrape |
 | Three fixture signals with matching IDs/values | Passed for the ad-hoc probe; metric timestamp precision conversion documented |
 | Actual Trace Explorer and correlated logs | Passed in authenticated UI; sanitized screenshots linked above |
-| Seven-day effective retention | API, overrides and actual DDL verified; metadata/grace exceptions documented |
+| Seven-day effective retention (**original** arm64 trial deployment) | API, overrides and actual DDL verified on that deployment; metadata/grace exceptions documented. This row does **not** describe the current trial — see "CI logs/traces at 7 days on the current trial" below, which is open, and is not a contradiction with this one (#9904) |
+| Retention statements' expiry outcome (`retention.sql`, scope item 6) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_retention_ttl.rs` runs the committed file **verbatim** — `ON CLUSTER cluster` included, which `clickhouse local` refuses outright — on a single-node 25.12.5.44 with an embedded Keeper under the cluster name read from the committed render: 16 host rows, all status 0, twice, with the per-table effective TTLs now recorded individually rather than bucketed. Executing it closed the gap between the *policy* (status 0 + an effective TTL, which is all the 2026-09-25 live run established) and the *outcome*: an over-age row is deleted and an in-window row survives for every one of the 16, and the same 10-day-old row is deleted by every 7-day statement and kept by every 30-day one. Five behaviours the header did not state were found and corrected — immediate materialisation on existing parts, a units slip that **empties the table** because `toDateTime` saturates then overflows, `ttl_only_drop_parts` keeping an over-age row alive in a mixed part, `MODIFY TTL` silently dropping a qualified `DELETE WHERE`, and one failing statement aborting the file so that exactly the metric statements go unapplied — plus the header's "RESTORE 30 days" corrected to restore the policy and not the data. Every assertion has its breaking mutation of the committed SQL run, not described. See "The retention statements executed against the pinned engine" |
+| Live trial's `ttl_only_drop_parts` and per-part expiry state | **Open** — newly identified by the proof above. The 2026-09-25 capture recorded TTL expressions only, and the setting is what decides whether a part mixing over-age and in-window rows is ever cleaned. The README's "Retention and operation" section now carries both check queries (the setting alongside the TTL, and a `system.parts` `delete_ttl_info_min/max` read for the stuck case); both were executed against the pinned engine, neither against the trial. Needs only the bundled client, no org login |
 | Restart persistence and shared receiver recovery | Passed for signals, account and effective TTL; fresh three-signal replay indexed |
 | Backup restoration rehearsed into a separate project | **Open** — the isolated `loom-signoz-restore` overlay, its documented procedure and a 13-test static isolation contract all landed and the merged render was verified (see "Backup-restore rehearsal overlay"). A real tarball restore *was* found executed on this trial host by an earlier, undocumented session (see "Backup-restore rehearsal: found executed, interrupted, and torn down"): both PostgreSQL's org/user metadata and 37 real ClickHouse trace spans survived the volume round-trip. But the run stopped at the datastore layer — no UI login, no `fixture-queries.sql` diff, no documented teardown — and sat abandoned, burning CPU, for 5 days before this pass found and tore it down (follow-up: [#9762](https://github.com/rjwalters/loom/issues/9762)); [#9279](https://github.com/rjwalters/loom/issues/9279) still owns a complete, documented pass |
 | Saved query artifacts for the shared fixture manifest | **Passed** — executed live above; matches the generated manifest exactly |
 | Shared fixture manifest observed in SigNoz | **Passed** — see "Shared fixture manifest, executed live" above: 37/14/3 signals, exact totals, graph, grouping, root-less detection, absence-vs-zero and privacy-sentinel queries all verified |
 | Real Loom canary / real Judge-Doctor repair trace | Open — the instrumentation slices landed (#8577/#8579), but #8525 itself stays open for its own live-run acceptance, and the run needs the trial host; see #8529 |
 | Repeated latency/footprint comparison | Open — shared evaluation #8529. A single **co-resident** point-in-time footprint (CPU, memory, volume and per-database disk for both backends) and a same-day query/insert latency distribution are now recorded (see "Co-resident 2.5-day soak"), but no controlled, repeated, same-workload comparison has been run |
-| ClickHouse self-telemetry expires under the rendered 2 GiB cap | **Fixed in the render, not yet observed on a live soak.** The wide upstream `metric_log` failed tens of thousands of TTL merges a day, and its parts outlived their 1-day TTL. The transposed schema, reproduced at about 19x lower peak merge memory on the pinned image, is CI-enforced. A live re-render plus a multi-day failed-merge check is outstanding |
-| CI retro queries (`ci-queries.sql`, #8826) | **Passed on live capture** — every section non-empty; metric-path counts and conclusion split reconcile exactly to the records (592 runs / 2,131 jobs); see "CI retro queries, executed live". Section 5's chunk join is unobserved on real `ci.job.log` data (none reached the trial) |
+| ClickHouse self-telemetry expires under the rendered 2 GiB cap | **Applied live and observed; the post-fix multi-day soak is the remainder.** The defect ran a full **9-day** live soak and worsened monotonically — 10,135 failed `metric_log` TTL merges an hour against 159 successful all day (441.8 : 1), all error 241, 135 active parts, parts 9 days into a 1-day TTL, 999 MiB of `system` against 235 KiB of Loom signal, 109.76 % CPU. The committed render was synced into the deployment's state directory and the ClickHouse service recreated (healthy in 9.19 s): `system.metric_log` became a 1,552-column `SystemMetricLogView` over a 6-column `transposed_metric_log` holding 1,548 metrics in 28.59 KiB / 1 part, `system` fell to 737.35 MiB, CPU to 9.01 %, and all 37/46/213/213 Loom signals survived unchanged. Over the following 33 minutes the new backing table ran **13 merges with 0 failures** in 3 active parts — the wide table managed 159 successes against 70,249 failures in a day. See "Applied to the live deployment, 2026-10-01". **Remaining**: a multi-day window confirming the retention *outcome* (no part past `event_date + 1 day`) across a date boundary, which 33 minutes cannot show — [#9868](https://github.com/rjwalters/loom/issues/9868) |
+| CI retro queries (`ci-queries.sql`, #8826) | **Passed on live capture** — every section non-empty; metric-path counts and conclusion split reconcile exactly to the records (592 runs / 2,131 jobs); see "CI retro queries, executed live". Section 5's chunk join is still unobserved on real `ci.job.log` data (none reached the trial), but is no longer unobserved anywhere — see the row below |
+| Section 5's failed-run → log chunk join (`ci-queries.sql` 5, #8826) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_ci_failed_run_logs.rs` executes the committed file verbatim on ClickHouse 25.12.5.44 and is the first run anywhere to produce a non-trivial chunk-join row (`3 of 3`, `2 of 3`): the live capture's 60 section-5 rows all read `0 of 0`. Executing it found the join's **two absences reading identically** — a failed run with no non-successful job came back as `job_id` 0 / `truncated` false / `0 of 0` / `loom.ci.job_id = 0`, indistinguishable from a failed job whose log never arrived, with a Logs Explorer filter that silently matches nothing; the committed query now NULL-guards every job- and log-sourced column and empties that filter. At-least-once chunk delivery, the run-level dedupe, the asymmetric `run_attempt`/`attempts` join keys, the log join's repository condition and the wider-than-`failure` conclusion predicate each have their breaking mutation of the committed SQL run, not described (see "The CI failed-run log join executed against the pinned engine"). No `ci.job.log` record went through SigNoz's own ingester — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
 | CI metrics retention ≥ 30 days (#8826) | **Passed in effective DDL** — every metric signal table at 30 days |
-| CI logs/traces at 7 days on the current trial | **Open** — API-owned tables still at the upstream 15 days; needs the org login ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
+| CI logs/traces at 7 days on the **current** trial deployment | **Open** — the API-owned active tables (`logs_v2`, `signoz_index_v3`, and the standard rollups) are still at the upstream 15 days on this deployment; needs the org login ([#8946](https://github.com/rjwalters/loom/issues/8946)). The auxiliary/legacy tables `retention.sql` owns *are* at 7 days here (see "Retention DDL observed") — the two rows describe different table sets on different deployments, which is why neither contradicts the other (#9904) |
 | Six CI saved views in the trial org | **Open** — recreation steps written in the README, not yet executed in the UI ([#8946](https://github.com/rjwalters/loom/issues/8946)) |
 | Measured usage parity with ClickStack's "Loom measured usage" view | **Passed against the pinned ClickHouse, open against the live trial.** `usage-queries.sql` (sections 0–6) plus four README saved-view rows close the parity gap; `signoz_usage_queries.rs` executes the committed file verbatim on ClickHouse 25.12.5 and observes scope resolution, at-least-once dedupe, NULL-not-zero dollars for an unpriced model, unknown-vs-measured-zero, the repo-by-trace join, and the wrong-container silent zero (see "Measured usage" above). No run over real canary data on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
 | Cycle-time analytics parity with ClickStack (`cycle-time-extract.sql`, #8665) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_cycle_time.rs` executes the extraction, the shared rollup and all eight CT queries verbatim over the SAME seven-envelope fixture as the ClickStack proof, and every CT1–CT8 answer matches exactly (see "Cycle-time analytics executed against the pinned engine" above); the `attributes_number`/`attributes_string` fallback and true-absence behavior are also proven. No run through SigNoz's own ingester on the trial deployment — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
+| Host/token gauge queries (`queue-dwell.sql` #8856, `quota-utilization.sql` #9005, scope item 4) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_queue_quota_queries.rs` executes both committed files verbatim on ClickHouse 25.12.5 — the first proof in this trial to read `signoz_metrics.samples_v4` / `time_series_v4` at all — and observes the duplicate-hour-row `max()`/`sum()` split (with the naive join run as a counterfactual), measured-zero-is-not-starvation, NULL-not-zero for a missing companion metric and for an absent utilization source, the over-100% headroom clamp, `coverage = 'unknown'` for an exhausted-only provider, and query 5's span reads including the pre-#9673 cause-less-row fallback (see "The gauge queries executed against the pinned engine"). Every assertion was confirmed to break under a mutation of the committed SQL. No metric point went through SigNoz's own ingester or metric migrator — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525) |
+| Queue-starvation alert rule (`alerts/queue-starvation.json` #8856, scope items 4 and 5) | **Passed against the pinned ClickHouse, open against the live trial.** `signoz_queue_starvation_alert.rs` substitutes SigNoz's `{{.start_timestamp_ms}}` / `{{.end_timestamp_ms}}` the way the rule evaluator does, runs the embedded query verbatim on ClickHouse 25.12.5, and applies the committed `op`/`matchType`/`target` to the engine's own output: a host starved for all 15 minutes fires, a host reporting a measured zero does not, and a host that starves and clears alternately does not either (see "The alert rule's threshold executed against the pinned engine"). The half-open window, the `max()` hour-row absorption, the `state = 'ready'` filter and the `GROUP BY ts, host` host label each have their breaking mutation of the committed JSON run, not described. **No rule evaluator ran and no notification was delivered** — the live fire-and-resolve check is [#9006](https://github.com/rjwalters/loom/issues/9006) |
+| ETA accuracy queries (`eta-queries.sql` #9289, scope items 4 and 5) | **Passed against the pinned ClickHouse and parsed against the live trial; open against live DATA.** `signoz_eta_queries.rs` runs the committed file verbatim on ClickHouse 25.12.5 over a fixture whose `distributed_logs_v2` DDL — including the `attributes_bool Map(…, Bool)` column no earlier proof in this trial needed — was read off the running deployment. Observed: the absent-vs-measured-zero pair (an abandonment produces no row; a zero error produces a row reading 0), the closed `since` bound, the per-revision grouping, at-least-once dedupe, the missing-`Bool`-key rejection, and `{repo}` reaching Q2's inner sub-select. Every assertion's breaking mutation of the committed SQL was run, not described. **Three claims the engine refuted** were corrected in the same change: a constant feature scores `rankCorr` 0.5 rather than 0 or NaN (Q3 now reports `distinct_values`); the typed JSON extraction coerces `"42"`/`true` rather than zeroing nulls (header corrected); and `ROLLUP` emitted **two rows with the identical key `('', '', '')`** (Q2 now reports `rolled_up`). The file was additionally executed verbatim against the live trial ClickHouse (25.12.5.44) — exit 0, all four sections' documented columns, **zero rows**: no `eta.estimate`/`eta.outcome` record has reached the deployment. Nothing went through SigNoz's own ingester — same gap as [#8525](https://github.com/rjwalters/loom/issues/8525). See "The ETA accuracy queries executed against the pinned engine" |
 | UI view matrix for Loom's non-HTTP span kinds | **Answered for Service List/APM and Exceptions, via authenticated backend API probes rather than a browser** (see "UI view matrix" above) — Service List/APM populates (`loom-daemon`, correct call/error counts) because RED metrics come from unconditional root-span aggregation, not an HTTP convention; Exceptions stays empty because Loom never emits an OTel `exception` span event. Service Map returned empty and, since 2026-09-30, **is attributable** — see "Resolving the Service Map confound": every Loom span is `SPAN_KIND_INTERNAL` and every resource carries the one `service.name`, both at single unconditional exporter sites and both measured on the real wire payload, so none of the three preconditions for a topology edge can be met; the gateway's allowlist strips every peer key as a second layer. Adding a connector or a multi-service fixture cannot change the answer for Loom's data. Enforced by `signoz_topology_shape.rs` in ordinary CI. No screenshot has been captured on any session |
 
 Synthetic fixture success establishes transport/schema/query behavior, not a

@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/2AMLogic/2am/blob/main/infra/github-proxy/policy.schema.json",
+  "title": "github-egress policy (v1)",
+  "description": "The machine/runner-owned GitHub-egress policy document. Contract 4 of infra/github-proxy/README.md, in machine-readable form. Lives OUTSIDE any checkout (default /etc/2am/github-egress/policy.json); a repo-local copy is a development fixture, never the authority. Carries no secret: credentials are named by external reference only. Versioned and renamed by the same-change rule in README.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "github", "toolchain", "enforcement", "principal"],
+  "properties": {
+    "schemaVersion": {
+      "description": "Policy schema major version. A consumer that does not recognise the value MUST report verification incomplete (exit 2), never 'aligned'.",
+      "const": 1
+    },
+    "policyEpoch": {
+      "description": "Monotonic counter bumped on every policy change. Cache invalidation key for the hot local assertion, and part of a P6 cache partition key.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "deployment": {
+      "description": "Free-form label for the deployment this policy belongs to (e.g. '2am-fleet'). Attribution only; never an authorization input.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "github": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logicalHost", "apiOrigin", "gitOrigin"],
+      "properties": {
+        "logicalHost": {
+          "description": "The LOGICAL GitHub host: repository identity, login, git remotes and web URLs. 'github.com' for this deployment. GH_HOST is compared against THIS, never against apiOrigin -- see README.md Contract 4.",
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$"
+        },
+        "apiOrigin": {
+          "description": "The mandated REST/GraphQL destination origin. HTTPS only. The expected gh `api_host` is this URL's bare hostname -- api_host cannot carry a port, so an apiOrigin with a non-443 port is only usable by SDK facades and the managed adapter, not by stock gh.",
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://[^/?#]+/?$"
+        },
+        "gitOrigin": {
+          "type": "object",
+          "description": "Git transport destination and its rollout state, tracked separately from API routing: git operations are NOT covered by api_host (upstream docs/api-host.md Scope). Pending qualification stays visible rather than being implied by the API rollout.",
+          "additionalProperties": false,
+          "required": ["host", "rollout"],
+          "properties": {
+            "host": {
+              "description": "Qualified Git transport host, or null while none is qualified.",
+              "type": ["string", "null"]
+            },
+            "rollout": {
+              "description": "unqualified: no destination serves the protocol yet -- do NOT install insteadOf rewrites. qualified: destination serves it, rewrites may be installed but absence is not a finding. enforced: missing or overriding rewrites ARE a finding.",
+              "enum": ["unqualified", "qualified", "enforced"]
+            },
+            "note": { "type": "string", "maxLength": 400 }
+          }
+        },
+        "allowedDirectEgress": {
+          "description": "Identities permitted direct GitHub API egress -- the gateway's own upstream transport and nothing else (README.md Contract 1, 'sole direct egress'). An empty array means no exception on this machine.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "maxItems": 4
+        }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "description": "Approved toolchain identity. Version pins here are ROUTING CONTROLS, not hygiene: below the gh api_host floor, api_host is a silent no-op (see README.md 'Verified findings').",
+      "additionalProperties": false,
+      "required": ["ghMinimumVersion", "ghPinnedVersion", "launcherPath", "upstreamGhPath"],
+      "properties": {
+        "ghMinimumVersion": {
+          "description": "Lowest gh version whose api_host setting actually routes requests. Below this, a set api_host is accepted and echoed back by `gh config get` while traffic still goes to the canonical API.",
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "ghPinnedVersion": {
+          "description": "The exact upstream gh version this deployment provisions and qualifies against.",
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "launcherPath": {
+          "description": "Absolute path of the managed executable named `gh` (P2). The name stays `gh` by decision -- README.md 'Keep the command name gh'.",
+          "type": "string",
+          "pattern": "^/"
+        },
+        "upstreamGhPath": {
+          "description": "Absolute private implementation path of the pinned upstream gh binary the launcher execs.",
+          "type": "string",
+          "pattern": "^/"
+        },
+        "upstreamGhSha256": {
+          "description": "Checksum of the pinned upstream binary, or null before provisioning.",
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "sdkPins": {
+          "description": "Approved SDK/library versions per language facade (P3). Keys are facade ids; values are version specifiers.",
+          "type": "object",
+          "additionalProperties": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "enforcement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api", "runtimeEgress"],
+      "properties": {
+        "api": {
+          "description": "required: a managed API workload MUST route through apiOrigin and a routing failure blocks the operation. observe: findings are reported but do not block (migration cohorts only -- README.md 'observe-only cohorts are not the completed mandate').",
+          "enum": ["required", "observe"]
+        },
+        "runtimeEgress": {
+          "description": "State of the host/runner network policy that blocks direct GitHub API egress. 'unverified' is the honest default: config assertions alone can never report enforcement as verified (README.md Contract 4 check 4).",
+          "enum": ["unverified", "installed", "verified"]
+        },
+        "negativeCanary": {
+          "description": "Command the validator runs under the caller's own identity to prove direct egress is blocked. Null means the runtime boundary is unverifiable here -- doctor reports verification incomplete (exit 2) rather than aligned.",
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "principal": {
+      "type": "object",
+      "description": "WHICH external credential profile this machine presents. Never an inline secret -- a policy document carrying a token is invalid by construction.",
+      "additionalProperties": false,
+      "required": ["profile", "credentialRef"],
+      "properties": {
+        "profile": {
+          "description": "The authenticated gateway profile class. Matches README.md Contract 2's four profiles.",
+          "enum": ["fleet-automation", "operator", "restricted-bot", "ci"]
+        },
+        "credentialRef": {
+          "description": "External reference resolving to the proxy credential (file path, keychain item, secret manager URI). Must not look like a token.",
+          "type": "string",
+          "minLength": 1
+        },
+        "ghConfigDirs": {
+          "description": "Every GH_CONFIG_DIR profile the validator must check. A profile absent from this list that is active at runtime is a SHADOWED PROFILE finding -- verified live: a shadowing GH_CONFIG_DIR silently supplies its own token and the operator profile is never consulted.",
+          "type": "array",
+          "items": { "type": "string", "pattern": "^/" }
+        }
+      }
+    },
+    "adapter": {
+      "type": "object",
+      "description": "Managed gh launcher / request-adapter knobs (P2). All optional. NOT routing controls: the adapter only ever connects to github.apiOrigin.",
+      "additionalProperties": false,
+      "properties": {
+        "upstreamUnixSocket": {
+          "description": "QUALIFICATION ONLY: dial the gateway over this Unix socket instead of TCP/TLS (hermetic fixtures, mock-contract development). Absent in production. Machine-owned like the rest of the policy, so a caller cannot redirect the adapter with its environment.",
+          "type": ["string", "null"],
+          "pattern": "^/"
+        },
+        "outcomeLog": {
+          "description": "Absolute path of an append-only JSONL file the adapter writes one client-outcome record to per request (method, api kind, authorities, status, outcome, duration, trace id). Never paths, queries, bodies or headers (Contract 3 content boundary). Null or absent disables; OTLP export is a follow-up.",
+          "type": ["string", "null"],
+          "pattern": "^/"
+        },
+        "requestTimeoutSeconds": {
+          "description": "Per-request upstream timeout in seconds. Default 60.",
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "description": "Delivery readiness, reported SEPARATELY from routing: a sink outage must never switch routing off.",
+      "additionalProperties": false,
+      "properties": {
+        "serviceName": { "type": "string", "minLength": 1 },
+        "otlpEndpoint": { "type": "string", "minLength": 1 },
+        "canaryMaxAgeSeconds": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

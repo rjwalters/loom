@@ -89,17 +89,13 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+use crate::gh_invocation::gh_bin;
+
 pub mod attribution;
 pub mod budget;
 pub mod report;
 pub use attribution::Attribution;
 pub use budget::{BudgetConfig, BudgetDecision};
-
-/// The `gh` binary, honoring `LOOM_GH_BIN` — the same seam
-/// `stale_checks::fetch` / `head_sync::fetch` provide.
-fn gh_bin() -> String {
-    std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
-}
 
 /// `gh api …`, parameterized on the binary — the injection seam this module's
 /// tests use so a stub `gh` can be passed as a plain function argument instead
@@ -563,8 +559,9 @@ no-op commit would not help"
 }
 
 fn post_comment(gh: &str, nwo: &str, pr: &str, body: &str) -> Result<String, String> {
-    let payload = serde_json::json!({ "body": body }).to_string();
-    gh_api_body(gh, &[&format!("repos/{nwo}/issues/{pr}/comments")], Some(&payload))
+    // #9772: the daemon's one comment chokepoint — the dashboard footer is
+    // appended there, structurally impossible to omit.
+    crate::forge_comment::post_comment(gh, None, nwo, pr, /* is_pr */ true, body)
 }
 
 /// `gh_api_with` where an empty answer is itself a failure — every read here

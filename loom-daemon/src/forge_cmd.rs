@@ -396,9 +396,9 @@ pub fn gitea_config_from_forge(forge: &Value) -> Result<GiteaConfig> {
 // Command dispatch
 // ---------------------------------------------------------------------------
 
-/// Resolve the `gh` binary name (honoring `LOOM_GH_BIN` for tests / overrides).
+/// Resolve the `gh` binary name — delegates to the single resolver (#9985).
 pub(crate) fn gh_bin() -> String {
-    std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
+    crate::gh_invocation::gh_bin()
 }
 
 /// Passthrough the given `gh` args (entity prepended), inheriting stdio and
@@ -790,6 +790,17 @@ pub enum ForgeCmd {
     /// [`crate::forge_tree_unchanged::handle`]; see that module for the
     /// stdout/exit-code contract and the fail-closed arm.
     TreeUnchanged { base: String, head: String },
+    /// `forge verdict-equivalent <pr> <reviewed> <head>` (#9416) — does a
+    /// verdict rendered against `reviewed` still describe `head`, and by which
+    /// equivalence (`tree`, `clean-merge`, `rebase-patch-identical`)? The
+    /// superset of [`ForgeCmd::TreeUnchanged`]: it asks that same test first,
+    /// then the two kinds #9416 adds. Implemented in
+    /// [`crate::verdict_equivalence::handle`].
+    VerdictEquivalent {
+        pr: u32,
+        reviewed: String,
+        head: String,
+    },
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should pass
     /// to `forge_merge_pr`. See
@@ -859,6 +870,9 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
             hold.as_deref(),
         ),
         ForgeCmd::TreeUnchanged { base, head } => crate::forge_tree_unchanged::handle(&base, &head),
+        ForgeCmd::VerdictEquivalent { pr, reviewed, head } => {
+            crate::verdict_equivalence::handle(pr, &reviewed, &head)
+        }
         ForgeCmd::MergeMethod { repo, requested } => {
             crate::forge_merge_method::handle_merge_method(&repo, requested.as_deref())
         }

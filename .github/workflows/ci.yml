@@ -85,7 +85,6 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       mcp: ${{ steps.filter.outputs.mcp }}
       scripts: ${{ steps.filter.outputs.scripts }}
-      dashboard: ${{ steps.filter.outputs.dashboard }}
       docker: ${{ steps.filter.outputs.docker }}
       # Whether anything in this PR can be measured by a gate that runs the
       # shared debug daemon. Computed below, not a raw paths-filter output.
@@ -128,13 +127,6 @@ jobs:
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
-          # `non_dashboard` below is the only filter here with a negated
-          # pattern, and a negation needs a quantifier that knows what `!`
-          # means. `some-with-excludes` is "at least one non-negated pattern
-          # matches AND no negated pattern matches", so for a filter with no
-          # `!` pattern it is byte-for-byte the default `some` — every filter
-          # below keeps the exact semantics it had before #9113.
-          predicate-quantifier: some-with-excludes
           filters: |
             backend:
               - 'loom-daemon/**'
@@ -158,35 +150,6 @@ jobs:
             mcp:
               - 'mcp-loom/**'
               - '.github/workflows/ci.yml'
-            dashboard:
-              - 'dashboard/**'
-              - '.github/workflows/ci.yml'
-            # Does the PR touch anything OUTSIDE dashboard/? (#9113)
-            #
-            # Not `dashboard == 'true'` inverted: a PR touching BOTH the
-            # dashboard and the daemon must still build the daemon, and
-            # `dashboard` is true for both. This asks the question that
-            # actually matters -- "is there any non-dashboard file here" --
-            # so a mixed PR answers true on its non-dashboard half.
-            #
-            # An exclusion is final in `some-with-excludes` (a file excluded
-            # by `!dashboard/**` cannot be re-included by a later pattern),
-            # which is why dashboard shell has its own filter rather than a
-            # re-inclusion here.
-            non_dashboard:
-              - '**'
-              - '!dashboard/**'
-            # The Shell Budget Ratchet measures EVERY tracked `.sh`, including
-            # dashboard/scripts/check-deploy-config.sh (category `contract`,
-            # inside the portable budget) and dashboard/scripts/ensure-web-dist.sh
-            # (`settled`), and it FAILS on any `.sh` with no allowlist entry.
-            # So a dashboard-only PR that adds, deletes or grows a shell script
-            # is a PR that gate can fail on -- ci-principles.md rule 3: a check
-            # that can fail because of a file outside its path group must not
-            # be filtered by path.
-            dashboard_shell:
-              - 'dashboard/*.sh'
-              - 'dashboard/**/*.sh'
             docker:
               - 'docker/**'
               - '.dockerignore'
@@ -229,39 +192,16 @@ jobs:
 
       # Does this run need the shared debug daemon built at all? (#9113)
       #
-      # One output, computed once, so the ten places that consume the
-      # `loom-daemon-debug` artifact all ask the same question and cannot
-      # drift apart. It is false ONLY for a PR that is entirely inside
-      # dashboard/ and carries no shell script -- i.e. a PR on which no gate
-      # that runs the daemon could fail.
-      #
-      # `backend` and `scripts` are OR'd in to keep one invariant absolute:
-      # every job that downloads the artifact must have had it produced.
-      # `scripts` matches `**/package.json`, which DOES match
-      # dashboard/package.json -- without this term a PR touching only
-      # dashboard/package.json would run Installer Integration Tests and both
-      # Native Port Suites jobs against an artifact nobody built.
-      #
-      # Consumers read `!= 'false'`, never `== 'true'`, so every ambiguous
-      # state fails CLOSED: on a push this job does not run at all and the
-      # output is empty, and if the filter above errors it is empty too --
-      # both build the daemon and run every gate.
+      # Always true now that `dashboard/` (the one path group that could make
+      # it false) moved to `2AMLogic/loom-ui` (#9104). The output is kept so
+      # the ten consumers keep asking one question; they read `!= 'false'`,
+      # so every ambiguous state still fails CLOSED.
       - name: Decide whether the shared debug daemon is needed
         id: daemon
-        env:
-          NON_DASHBOARD: ${{ steps.filter.outputs.non_dashboard }}
-          DASHBOARD_SHELL: ${{ steps.filter.outputs.dashboard_shell }}
-          BACKEND: ${{ steps.filter.outputs.backend }}
-          SCRIPTS: ${{ steps.filter.outputs.scripts }}
         run: |
           set -euo pipefail
-          needed=false
-          if [[ "$NON_DASHBOARD" == 'true' || "$DASHBOARD_SHELL" == 'true' \
-             || "$BACKEND" == 'true' || "$SCRIPTS" == 'true' ]]; then
-            needed=true
-          fi
-          echo "daemon needed=$needed (non_dashboard=$NON_DASHBOARD dashboard_shell=$DASHBOARD_SHELL backend=$BACKEND scripts=$SCRIPTS)"
-          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+          echo "daemon needed=true"
+          echo "needed=true" >> "$GITHUB_OUTPUT"
 
   build-daemon:
     name: Build loom-daemon (debug, shared)
@@ -271,10 +211,8 @@ jobs:
     # the jobs themselves dropped to 9-24s once they downloaded the binary
     # instead.
     #
-    # Skipped on a dashboard-only PR (#9113) -- and ONLY there. `changes.daemon`
-    # is false exactly when no gate that runs this binary could fail on the
-    # PR's files; see its comment above for why that is a stricter question
-    # than `dashboard == 'true'`.
+    # `changes.daemon` is now always true (the `dashboard/`-only skip of #9113
+    # left with `dashboard/`, #9104); consumers still read `!= 'false'`.
     #
     # This does NOT make the gates it feeds skippable, which is the trap
     # #9113's original proposal walked into. Daemon Checks is a REQUIRED
@@ -332,10 +270,9 @@ jobs:
   node-packages:
     name: Node Packages (MCP server, dashboard)
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.mcp == 'true' || needs.changes.outputs.dashboard == 'true')
-    # MCP Server Build and Dashboard Tests share one runner and one Node
-    # setup (#9065). Each half still runs only when its own path group
-    # changed (or on push), exactly as when they were separate jobs.
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.mcp == 'true')
+    # The dashboard half moved to `2AMLogic/loom-ui` (#9104); the display
+    # name below is kept as-is so a required-check context is not renamed.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -353,28 +290,6 @@ jobs:
       - name: Verify build output
         if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.mcp == 'true') }}
         run: test -f mcp-loom/dist/index.js
-      # --- Dashboard Tests (Workers backend + web UI) ---
-      # 442 tests (#4849) across two runtimes that were previously unwired: the
-      # Cloudflare Workers backend (dashboard/, 152 Miniflare/vitest-pool-workers
-      # tests — no Cloudflare credentials needed, runs against local D1 + DO
-      # simulation) and the dashboard UI (dashboard/web/, 290 happy-dom tests).
-      # `npm run check:all` runs both in one command (backend typecheck+test,
-      # then `web`'s typecheck+test via --prefix); `dashboard/package.json`'s
-      # `pretest` hook already runs `scripts/ensure-web-dist.sh` first, since
-      # Wrangler will not parse `wrangler.toml` (and therefore Miniflare will not
-      # boot) until `web/dist/` exists.
-      - name: Install backend dependencies
-        if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.dashboard == 'true') }}
-        run: npm ci
-        working-directory: dashboard
-      - name: Install web UI dependencies
-        if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.dashboard == 'true') }}
-        run: npm ci
-        working-directory: dashboard/web
-      - name: Run backend (Miniflare) + web (happy-dom) suites
-        if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.dashboard == 'true') }}
-        run: npm run check:all
-        working-directory: dashboard
 
   backend-lint-and-check:
     name: Rust Linting & Build Check
@@ -447,6 +362,35 @@ jobs:
           tool: nextest
       - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
         run: cargo nextest run --workspace --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
+      - name: Upload per-test timings (#9456)
+        # The JUnit XML `.config/nextest.toml`'s `[profile.ci.junit]` writes is
+        # the only surface that carries per-test durations out of a finished
+        # runner. `loom-daemon ci-telemetry` turns its slow tail into
+        # `loom.ci.test` spans under THIS leg's job span, which is what makes
+        # "which tests spent this partition's test-step time" answerable in
+        # SigNoz instead of by hand — the data rebalancing
+        # `--partition count:k/N` needs, and the per-test outcome #7789's flake
+        # tracking wants.
+        #
+        # The NAME is a contract, and more load-bearing than the suite one:
+        # JUnit XML carries no run id, no shard and no job name, so the name is
+        # the ONLY pairing key. The poller reads artifacts whose name starts
+        # with `ci-test-timings` and pairs on
+        # `-<family>-<k>-<N>`, where `<family>` is this job's display name with
+        # its `(k/N)` suffix stripped and slugified
+        # (`ci_telemetry::nextest::job_family_slug`; `ci.yml` has TWO
+        # nextest-partition families both sharding 1..3, so the family is what
+        # disambiguates them). Renaming this artifact — or renaming the job
+        # without renaming the artifact — silently stops test spans, which
+        # `ci_telemetry::tests::test_spans` asserts against this file. See
+        # defaults/docs/ci-observability.md §"Per-test spans (#9456)".
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-test-timings-rust-unit-tests-${{ matrix.partition }}-${{ strategy.job-total }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
 
   backend-otlp-feature:
     name: Rust OTLP Feature Build & Test
@@ -500,6 +444,72 @@ jobs:
       # by cycle_time_clickhouse.rs above.
       - name: Verify the SigNoz cycle-time extraction against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_cycle_time -- --ignored --nocapture
+      # #8528 / #8856 / #9005: the same technique for the trial's two METRIC-signal
+      # artifacts (queue-dwell.sql, quota-utilization.sql). signoz_trial_artifacts.rs
+      # already guards their metric/label vocabulary in ordinary CI; only this run
+      # shows that `max()` absorbs time_series_v4's duplicate per-hour rows while
+      # `sum()` doubles, that maxOrNullIf() answers NULL instead of a fully-idle 0
+      # for a provider with no utilization source, and that an over-100% reading
+      # clamps to zero headroom rather than negative.
+      - name: Verify the SigNoz queue/quota gauge queries against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_queue_quota_queries -- --ignored --nocapture
+      # #8528 / #8856: the same technique for the trial's one saved ALERT RULE
+      # (alerts/queue-starvation.json), the last query artifact in this trial
+      # with only a vocabulary guard. An alert that returns no rows -- or rows
+      # its threshold can never cross -- is silently healthy forever, because
+      # the absence of a page is what a working queue looks like. Only this run
+      # shows that the committed op/matchType/target separate a sustainedly
+      # starved host from a healthy one reporting a measured zero and from a
+      # flapping one, that the half-open window excludes the boundary point two
+      # overlapping evaluations would otherwise double-count, and that the
+      # zero rows survive the SQL so SigNoz can see a series recover.
+      - name: Verify the SigNoz queue-starvation alert rule against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_queue_starvation_alert -- --ignored --nocapture
+      # #8528 / #9289: the same technique for the trial's ETA-accuracy artifact
+      # (eta-queries.sql), whose Q2 mean pinball loss is the number an ETA
+      # heuristic is promoted on. eta_artifacts.rs already pins every attribute
+      # it reads to the emitted schema in ordinary CI; only this run shows that
+      # an abandoned sweep -- which carries no error field at all -- is scored as
+      # a PERFECT prediction once the presence filter goes, lowering the MAE that
+      # decides the promotion; that pooling two revisions hides a 5x regression
+      # behind an average belonging to neither build; that ROLLUP's subtotal rows
+      # are keyed with the same '' a missing heuristic attribute reads as; and
+      # that a feature which never varied scores rankCorr 0.5 rather than 0.
+      - name: Verify the SigNoz ETA accuracy queries against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_eta_queries -- --ignored --nocapture
+      # #8528 / #8826: the same technique for section 5 of ci-queries.sql
+      # ("Failed run -> logs"), the one standing CI view whose chunk join no
+      # deployment has ever exercised -- the live trial capture returned 60 rows
+      # all reading `0 of 0`, so everything downstream of the job->log join was
+      # unexecuted code in a view operators act on. Only this run shows that a
+      # failed run with NO non-successful job (a startup_failure) came back
+      # byte-identical in shape to "a failed job whose log never arrived" --
+      # `job_id` 0, `truncated` false, `0 of 0`, and a Logs Explorer filter of
+      # `loom.ci.job_id = 0` that silently matches nothing -- that a replayed
+      # chunk reports 4 of 3 without uniqExact(), that a replayed ci.run record
+      # doubles every job of that run without the run-level dedupe, and that the
+      # asymmetric run_attempt/attempts join keys are both load-bearing.
+      - name: Verify the SigNoz CI failed-run log join against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_ci_failed_run_logs -- --ignored --nocapture
+      # #8528 / #9904: the same technique for retention.sql, the trial's last
+      # artifact with no guard of any kind -- and the only one that MUTATES the
+      # operator's deployment. It needs a single-node ClickHouse with an
+      # embedded Keeper rather than `clickhouse local`, because `ON CLUSTER
+      # cluster` requires a real distributed-DDL queue (`clickhouse local`
+      # answers QUERY_IS_PROHIBITED). The live record for this file is "all 16
+      # statements reported status 0" plus an effective TTL per table; neither
+      # can show a retention OUTCOME. Only this run shows that dropping the
+      # `/ 1000` from a millisecond statement deletes every row in the table
+      # rather than nothing (toDateTime saturates at the DateTime maximum and
+      # the interval overflows past it), that `ttl_only_drop_parts` keeps an
+      # over-age row alive indefinitely in a part it shares with an in-window
+      # row, that `MODIFY TTL` silently drops a table-level DELETE WHERE
+      # qualification while keeping column TTLs, that re-widening a shortened
+      # window restores the policy and not the data, and that one failing
+      # statement aborts the file leaving exactly the metric statements -- the
+      # ones that restore 30 days -- unapplied.
+      - name: Verify the SigNoz retention statements against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_retention_ttl -- --ignored --nocapture
 
   backend-otlp-tests:
     name: Rust OTLP Feature Tests (${{ matrix.partition }}/${{ strategy.job-total }})
@@ -530,6 +540,19 @@ jobs:
           tool: nextest
       - name: Run tests (otlp feature, partition ${{ matrix.partition }}/${{ strategy.job-total }})
         run: cargo nextest run --package loom-daemon --features otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
+      - name: Upload per-test timings (#9456)
+        # Same contract as the `Rust Unit Tests` leg above, with this job's own
+        # family slug: the poller pairs `ci-test-timings-<family>-<k>-<N>` on
+        # the family, because both nextest-partition families shard 1..3 and
+        # `(kind, k, N)` alone would match two jobs. See
+        # defaults/docs/ci-observability.md §"Per-test spans (#9456)".
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-test-timings-rust-otlp-feature-tests-${{ matrix.partition }}-${{ strategy.job-total }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
 
   structural-checks:
     name: Structural Checks
@@ -1105,10 +1128,8 @@ jobs:
       #
       # `daemon != 'false'` is the one predicate it is allowed to sit behind,
       # because that predicate is built from this gate's own reach rather than
-      # from a file group: it is false only when every changed file is under
-      # `dashboard/` AND none of them is a `.sh`. This gate measures every
-      # tracked `.sh` including dashboard's two, so dashboard shell is exactly
-      # what `changes.dashboard_shell` exists to keep out of the skip.
+      # from a file group (it is now always true; the `dashboard/`-only skip
+      # case left with `dashboard/` for `2AMLogic/loom-ui`, #9104).
       #
       # It measures the pool epic #7810 is retiring — `contract` + `hook-entry`,
       # whose logic moves into the daemon behind a stub — rather than total
@@ -1675,6 +1696,12 @@ jobs:
         run: bash defaults/scripts/tests/test-dep-recheck-fingerprint.sh
       - name: check-stale-blocked advisory (#8927)
         run: bash defaults/scripts/tests/test-check-stale-blocked.sh
+      # #9390: provision-codex-hooks.sh verify is a stub over `loom-daemon
+      # codex-hooks verify`; the suite pins this job's shared build.
+      - name: provision-codex-hooks (#4495, #5005, #9390)
+        run: bash defaults/scripts/tests/test-provision-codex-hooks.sh
+      - name: spawn-codex merging-role hook gate (#9390)
+        run: bash defaults/scripts/tests/test-spawn-codex-guarded.sh
       # #9517: fleet-send.sh is a thin SILENT stub over `loom-daemon
       # fleet-send` (its whole interface is a best-effort exit 0, so it
       # bypasses lib/script-helper.sh's loud missing-daemon path). The suite
@@ -2032,12 +2059,13 @@ jobs:
       # it via loom_test_require_daemon_bin and FAIL rather than skip without one.
       - name: merge-pr local-branch cleanup (#4100, #5015, ported in #8191)
         run: bash defaults/scripts/tests/test-merge-pr-local-branch-cleanup.sh
-      # #9576 / PR #9581 review: the stub-driven verdict-staleness-guard suite
-      # (shell-suite-tests) cannot prove what lives behind `forge
-      # tree-unchanged` — the rewind (`behind`, no files) reading and the
-      # LOOM_VERDICT_TREE_CARVEOUT kill switch — so this sibling drives the
-      # guard against the binary this job downloads.
-      - name: verdict-staleness-guard tree-identical exemption, real verb (#9576)
+      # #9576 / PR #9581 review, extended by #9416: the stub-driven
+      # verdict-staleness-guard suite (shell-suite-tests) cannot prove what lives
+      # behind `forge verdict-equivalent` — the rewind (`behind`, no files)
+      # reading, the rebase-patch-identical kind's fail-closed arms, and the two
+      # kill switches — so this sibling drives the guard against the binary this
+      # job downloads.
+      - name: verdict-staleness-guard equivalence exemption, real verb (#9576, #9416)
         run: bash defaults/scripts/tests/test-verdict-staleness-guard-tree.sh
       - name: merge-pr dirty-worktree guard (#5031, #8191)
         run: bash defaults/scripts/tests/test-merge-pr-dirty-worktree-guard.sh

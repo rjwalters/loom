@@ -19,16 +19,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
+use crate::gh_invocation::gh_bin;
 use crate::proc_exec::{run_bounded, Completion};
-
-/// The `gh` binary to invoke. Honors `LOOM_GH_BIN` (tests / overrides), the
-/// same seam `forge_cmd::gh_bin`, `forge_cached_list`, and `role_collision`
-/// already use — so a fixture can steer these helpers without mutating the
-/// process-wide `PATH`, which races with every other concurrently-running
-/// test's `Command` spawn.
-fn gh_bin() -> String {
-    std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
-}
 
 fn gh_command(repo_root: &Path) -> Command {
     let mut cmd = Command::new(gh_bin());
@@ -627,20 +619,26 @@ pub fn edit_labels(repo_root: &Path, issue: u32, remove: &str, add: &str) -> Res
     Ok(())
 }
 
-/// `gh issue comment <N> --body <body>`.
+/// `gh issue comment <N> --body <body>` through the #9772 chokepoint
+/// (`forge_comment::post_comment`, which appends the dashboard footer the
+/// daemon's comments carry). The `owner/repo` slug resolves from
+/// `repo_root` so the footer's dashboard link can be built; a resolution
+/// failure surfaces as an error rather than posting an unlinked comment.
 pub fn comment(repo_root: &Path, issue: u32, body: &str) -> Result<()> {
     require_write_scope(repo_root)?;
-    let out = gh_command(repo_root)
-        .args(["issue", "comment", &issue.to_string(), "--body", body])
-        .output()
-        .context("failed to invoke gh issue comment")?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "gh issue comment {issue} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(())
+    let (owner, name) = resolve_owner_repo(repo_root).ok_or_else(|| {
+        anyhow!("could not resolve owner/repo from {repo_root:?} to comment on {issue}")
+    })?;
+    crate::forge_comment::post_comment(
+        gh_command(repo_root).get_program(),
+        Some(repo_root),
+        &format!("{owner}/{name}"),
+        issue,
+        /* is_pr */ false,
+        body,
+    )
+    .map(|_| ())
+    .map_err(|e| anyhow!("gh issue comment {issue} failed: {e}"))
 }
 
 #[derive(Debug, Deserialize)]

@@ -457,6 +457,9 @@ fn gateway_collector_keeps_every_ops_label_and_span_attribute() {
     for key in OPS_SPAN_ATTRIBUTE_KEYS {
         assert!(span.contains(*key), "collector span keep_keys lacks {key}");
     }
+    for key in crate::gh_invocation::telemetry::SPAN_ATTRIBUTE_KEYS {
+        assert!(span.contains(*key), "collector span keep_keys lacks {key}");
+    }
 }
 
 #[test]

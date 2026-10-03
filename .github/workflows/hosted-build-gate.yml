@@ -29,6 +29,7 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       LOOM_BUILD_GATE_TIER: full
     steps:
+      # The single Octokit construction site (#9988); later steps use plain node/bash.
       - name: Validate immutable candidate inputs
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
@@ -58,9 +59,10 @@ jobs:
           git branch hosted-gate-base "$LOOM_GATE_SHA"
           bash .loom/scripts/worktree.sh "$LOOM_GATE_ISSUE" "hosted-gate-$GITHUB_RUN_ID" --base hosted-gate-base
       - name: Verify worktree and record gate predicates
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
+        shell: bash
+        run: |
+          node <<'JS'
+          (async () => {
             const fs = require('fs');
             const path = require('path');
             const {execFileSync} = require('child_process');
@@ -80,7 +82,9 @@ jobs:
               realChangeDecision:'orchestrator must verify matching deliverables or record an explicit scope exception',
               host:process.env.RUNNER_OS, target:process.env.CARGO_TARGET_DIR};
             fs.writeFileSync(path.join(process.env.RUNNER_TEMP,'hosted-gate-evidence.json'), JSON.stringify(evidence,null,2));
-            core.info(JSON.stringify(evidence));
+            console.log(JSON.stringify(evidence));
+          })().catch(e => { console.error(e.message); process.exit(1); });
+          JS
       - name: Run the configured full build gate
         working-directory: .loom/worktrees/issue-${{ inputs.issue }}
         shell: bash
@@ -90,9 +94,10 @@ jobs:
         shell: bash
         run: cargo nextest run --package loom-daemon --features otlp --lib --bins --profile ci 2>&1 | tee "$RUNNER_TEMP/hosted-otlp-tests.log"
       - name: Run available lifecycle and native isolation integration tests
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
+        shell: bash
+        run: |
+          node <<'JS'
+          (async () => {
             const fs = require('fs');
             const path = require('path');
             const {spawn} = require('child_process');
@@ -102,12 +107,12 @@ jobs:
             const log = path.join(process.env.RUNNER_TEMP, 'hosted-integration-tests.log');
             fs.writeFileSync(log, `Selected existing integration targets: ${JSON.stringify(targets)}\n`);
             if (targets.length === 0) {
-              core.info('No selected integration targets exist in this candidate; none run.');
+              console.log('No selected integration targets exist in this candidate; none run.');
               return;
             }
             const args = ['nextest', 'run', '--package', 'loom-daemon', '--features', 'otlp', '--profile', 'ci',
               ...targets.flatMap(name => ['--test', name])];
-            core.info(`cargo ${args.join(' ')}`);
+            console.log(`cargo ${args.join(' ')}`);
             const run = (program, args, env) => new Promise((resolve, reject) => {
               const child = spawn(program, args, {cwd, env});
               child.stdout.on('data', data => { fs.appendFileSync(log, data); process.stdout.write(data); });
@@ -122,10 +127,12 @@ jobs:
             if (targets.includes('lifecycle_traces')) {
               const binary = path.join(process.env.CARGO_TARGET_DIR, 'debug/loom-daemon');
               if (!fs.existsSync(binary)) throw new Error('integration tests did not produce the candidate daemon');
-              core.info('Running retained sweep-checkpoint suite against the candidate daemon');
+              console.log('Running retained sweep-checkpoint suite against the candidate daemon');
               await run('bash', ['defaults/scripts/tests/test-sweep-checkpoint.sh'],
                 {...testEnv, LOOM_DAEMON_SELF_BIN:binary, LOOM_DAEMON_BIN:binary});
             }
+          })().catch(e => { console.error(e.message); process.exit(1); });
+          JS
       - name: Retain actual gate output and immutable candidate evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

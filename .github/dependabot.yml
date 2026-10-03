@@ -41,7 +41,7 @@ version: 2
 # language label) and nothing in this file applies.
 #
 # That is exactly how #7474/#7473/#7396/#7395/#7138/#7137/#6890 — bumps inside
-# `/mcp-loom` and `/dashboard/web`, several of them `dependency-type: indirect`,
+# `/mcp-loom` and (formerly) `/dashboard/web`, several of them `dependency-type: indirect`,
 # which only a security update ever touches — were opened carrying
 # `dependencies,javascript` and then sat inert for weeks, re-creating the #5455
 # livelock this file exists to prevent. A root `directory: "/"` entry does NOT
@@ -74,34 +74,6 @@ updates:
   # multiply the Judge's review queue.
   - package-ecosystem: "npm"
     directory: "/mcp-loom"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 0
-    labels:
-      - "dependencies"
-      - "loom:review-requested"
-    groups:
-      all-dependencies:
-        patterns:
-          - "*"
-
-  # NPM dependencies — observability backend (Cloudflare Worker)
-  - package-ecosystem: "npm"
-    directory: "/dashboard"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 0
-    labels:
-      - "dependencies"
-      - "loom:review-requested"
-    groups:
-      all-dependencies:
-        patterns:
-          - "*"
-
-  # NPM dependencies — observability dashboard web client
-  - package-ecosystem: "npm"
-    directory: "/dashboard/web"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 0

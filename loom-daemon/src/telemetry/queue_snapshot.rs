@@ -10,7 +10,7 @@
 //! SigNoz gets the queue as low-cardinality gauges instead
 //! (`loom.queue.issues{state,reason}`, `observability::ops::queue`). Per-issue
 //! rows are high-cardinality and name repositories, so they go only where the
-//! redaction layer (`dashboard/src/redaction.ts`) can apply the per-row
+//! redaction layer (`loom-ui:src/redaction.ts`) can apply the per-row
 //! `visibility` tag.
 //!
 //! Anti-leak rules, enforced where the record is built

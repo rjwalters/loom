@@ -69,12 +69,18 @@ fn shard_kind_vocabulary_is_stable() {
     assert_eq!(ShardKind::None.as_str(), "none");
 }
 
-/// Job 10012 of run 1001 is the one fixture job GitHub reports a
-/// `created_at` for, and its name carries a shard suffix
-/// (`Shell Test Suites (hermetic, 2/2)`); every other fixture job is
-/// unsharded and reports no queue wait.
+/// The fixture has two sharded jobs, one per shard family: job 10012
+/// (`Shell Test Suites (hermetic, 2/2)`, the one job GitHub reports a
+/// `created_at` for, so the only one with a queue wait) and job 10014
+/// (`Rust Unit Tests (2/3)`, added with #9456's JUnit artifact). Every other
+/// fixture job is unsharded and reports no queue wait.
+///
+/// Both halves matter: a sharded job with NO `created_at` must still carry its
+/// shard trio, which is what proves the two attributes are independent rather
+/// than both riding on the same `created_at` the shell-suite leg happens to
+/// have.
 #[test]
-fn the_one_sharded_fixture_job_carries_queue_wait_and_shard_attributes_on_record_and_span() {
+fn the_sharded_fixture_jobs_carry_queue_wait_and_shard_attributes_on_record_and_span() {
     let dir = TempDir::new().unwrap();
     run_cycle(&ctx(dir.path()), &FixtureApi::new()).unwrap();
     let (mut sharded_records, mut sharded_spans, mut plain_records, mut plain_spans) = (0, 0, 0, 0);
@@ -87,6 +93,13 @@ fn the_one_sharded_fixture_job_carries_queue_wait_and_shard_attributes_on_record
                 assert_eq!(r.shard_kind, "shell-suite-shard");
                 sharded_records += 1;
             }
+            TelemetryRecord::CiJob(r) if r.job_id == 10014 => {
+                assert_eq!(r.queued_ms, None, "the nextest leg reports no created_at");
+                assert_eq!(r.shard_index, Some(2));
+                assert_eq!(r.shard_total, Some(3));
+                assert_eq!(r.shard_kind, "nextest-partition");
+                sharded_records += 1;
+            }
             TelemetryRecord::CiJob(r) => {
                 assert_eq!(r.queued_ms, None, "job {}", r.job_id);
                 assert_eq!(r.shard_index, None, "job {}", r.job_id);
@@ -94,9 +107,10 @@ fn the_one_sharded_fixture_job_carries_queue_wait_and_shard_attributes_on_record
                 assert_eq!(r.shard_kind, "none", "job {}", r.job_id);
                 plain_records += 1;
             }
-            // Job spans only: a `loom.ci.step` span (#9089) repeats its job's
-            // shard attributes but carries no queue segment of its own, and
-            // is asserted in `super::step_spans`.
+            // Job spans only: a `loom.ci.step` span (#9089) and a
+            // `loom.ci.test` span (#9456) each repeat their job's shard
+            // attributes but carry no queue segment of their own, and are
+            // asserted in `super::step_spans` / `super::test_spans`.
             TelemetryRecord::Span(s) if s.name != SpanName::CiJob => {}
             TelemetryRecord::Span(s)
                 if s.attributes.get("loom.ci.job_id").map(String::as_str) == Some("10012") =>
@@ -105,6 +119,15 @@ fn the_one_sharded_fixture_job_carries_queue_wait_and_shard_attributes_on_record
                 assert_eq!(s.attributes["loom.ci.shard.index"], "2");
                 assert_eq!(s.attributes["loom.ci.shard.total"], "2");
                 assert_eq!(s.attributes["loom.ci.shard.kind"], "shell-suite-shard");
+                sharded_spans += 1;
+            }
+            TelemetryRecord::Span(s)
+                if s.attributes.get("loom.ci.job_id").map(String::as_str) == Some("10014") =>
+            {
+                assert!(!s.attributes.contains_key("loom.ci.queued_ms"));
+                assert_eq!(s.attributes["loom.ci.shard.index"], "2");
+                assert_eq!(s.attributes["loom.ci.shard.total"], "3");
+                assert_eq!(s.attributes["loom.ci.shard.kind"], "nextest-partition");
                 sharded_spans += 1;
             }
             TelemetryRecord::Span(s) if s.attributes.contains_key("loom.ci.job_id") => {
@@ -117,9 +140,9 @@ fn the_one_sharded_fixture_job_carries_queue_wait_and_shard_attributes_on_record
             _ => {}
         }
     }
-    assert_eq!((sharded_records, sharded_spans), (1, 1));
-    // 24 jobs total across the fixture org, minus the one sharded job.
-    assert_eq!((plain_records, plain_spans), (23, 23));
+    assert_eq!((sharded_records, sharded_spans), (2, 2));
+    // 24 jobs total across the fixture org, minus the two sharded jobs.
+    assert_eq!((plain_records, plain_spans), (22, 22));
 }
 
 #[test]

@@ -1718,7 +1718,7 @@ pub struct MemoryPressureSummary {
 /// This struct carries the repo's **real** slug regardless of visibility —
 /// exactly like [`SweepStartedRecord::repo`] always carries the real slug.
 /// The anti-leak control is enforced at the Phase-2 dashboard's redaction
-/// boundary (`dashboard/src/redaction.ts`), not here; the daemon's own push
+/// boundary (`loom-ui:src/redaction.ts`), not here; the daemon's own push
 /// to the observability backend is authenticated and never reaches an
 /// unauthenticated viewer directly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -26,6 +26,10 @@ pub(crate) enum ScriptPortCommand {
     /// Private workspace endpoint used inside a session container.
     #[command(subcommand)]
     PrivateWorkspace(loom_daemon::tokens_pool::private_workspace::WorkerCommand),
+    /// Readiness of Loom's managed Codex hook, behind
+    /// `provision-codex-hooks.sh verify` (#9390).
+    #[command(subcommand)]
+    CodexHooks(super::codex_hooks::CodexHooksCommand),
     /// Durable phase completion markers and trace observations (#8525).
     SweepCheckpoint(super::sweep_checkpoint::SweepCheckpointArgs),
 
@@ -57,6 +61,13 @@ pub(crate) enum ScriptPortCommand {
     /// = the reason, 1 = the release does carry the artifact. Optional to its
     /// caller — an older binary lacking it degrades to the flat reason.
     ReleaseExplain(super::release_explain::ReleaseExplainArgs),
+
+    /// Whether an exit-0 Codex session ran nothing because its sandbox
+    /// refused every shell command (#10003). Backs `spawn-codex.sh`'s
+    /// terminal classification. Exit 0 + one `shape=…` line = a no-op, 1 = it
+    /// ran something. Optional to its caller — an older binary lacking it
+    /// leaves the session classified as before.
+    CodexSandboxNoop(super::codex_sandbox_noop_cli::CodexSandboxNoopArgs),
 
     /// `merge-pr.sh`'s verdict-label mutual-exclusion guard (#8112), the
     /// second slice of the merge-pr port (#8191). Exit 1 = contradictory,
@@ -491,6 +502,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseFetch(args) => args.run(),
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
             ScriptPortCommand::ReleaseExplain(args) => args.run(),
+            ScriptPortCommand::CodexSandboxNoop(args) => args.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::Eta(cmd) => cmd.run(),
@@ -510,6 +522,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeSparse(args) => args.run(),
             ScriptPortCommand::WorktreeBase(args) => args.run(),
             ScriptPortCommand::WorktreeCheck(args) => args.run(),
+            ScriptPortCommand::CodexHooks(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeExisting(args) => args.run(),
             ScriptPortCommand::WorktreeBranchReuse(args) => args.run(),
             ScriptPortCommand::WorktreeOpenPr(args) => args.run(),
@@ -625,6 +638,23 @@ pub(crate) enum MergePrCommand {
     /// nothing (#9686) — the read-only replay surface: groups, chain edges,
     /// and what the sequencing pass would apply this tick.
     SequencePlan(super::merge_pr_sequence::SequencePlanArgs),
+
+    /// Prepare a combined candidate PR from an eligible group of component
+    /// PRs (#9688, contract ADR-0023): verify eligibility fresh, construct
+    /// the candidate in a scratch worktree, push, create ONE candidate PR
+    /// carrying the trusted component mapping, and reserve every source via
+    /// the #9378 sequencing gate (source = sequenced behind the candidate).
+    /// Adopt-first on the deterministic attempt id, only while the attempt
+    /// is live; hard-abort on conflict or on any push to the candidate or a
+    /// source (ADR-0023 §3).
+    ConsolidatePrepare(super::merge_pr_consolidate::ConsolidatePrepareArgs),
+
+    /// Abort a consolidation attempt (#9688): release ONLY the attempt's own
+    /// still-live reservations, close the candidate PR with the abort cause
+    /// recorded, clean up its branch. Sources
+    /// are preserved untouched. A merged candidate cannot be aborted —
+    /// landing wins and #9689's reconcile owns the aftermath.
+    ConsolidateAbort(super::merge_pr_consolidate::ConsolidateAbortArgs),
 
     /// The async-close-race worktree-cleanup gate (#4186): whether a merged
     /// PR's issue is actually finished, so a partial-increment worktree the
@@ -820,6 +850,8 @@ impl MergePrCommand {
             MergePrCommand::HoldState(args) => args.run(),
             MergePrCommand::SequenceEval(args) => args.run(),
             MergePrCommand::SequencePlan(args) => args.run(),
+            MergePrCommand::ConsolidatePrepare(args) => args.run(),
+            MergePrCommand::ConsolidateAbort(args) => args.run(),
             MergePrCommand::IssueCloseGate(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),

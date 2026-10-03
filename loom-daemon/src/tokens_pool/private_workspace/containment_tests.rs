@@ -6,7 +6,7 @@
 //! that a bare host process cannot produce worker-side evidence.
 //!
 //! The trust rule is additionally cross-checked against the SHIPPED
-//! `provision-codex-hooks.sh verify` on the same fixture profiles, so the Rust
+//! `provision-codex-hooks.sh verify` (native since #9390) on the same fixture profiles, so the Rust
 //! gate and the shell gate can never drift into disagreeing about whether one
 //! profile is trusted.
 //!
@@ -15,7 +15,6 @@
 //! by `tests/private_workspace_docker`.
 use super::containment::*;
 use super::*;
-use std::process::Command;
 
 /// A profile shaped the way a provisioned private session's profile is: the
 /// managed registration naming the image-owned bridge, Loom's receipt pinning
@@ -51,12 +50,23 @@ fn profile(dir: &Path, baseline: Option<&[&str]>, trusted: &[&str]) -> PathBuf {
     )
     .unwrap();
     let mut config = String::from("model = \"fixture\"\n# trusted_hash = \"commented-out\"\n");
+    // Codex keeps ONE trusted_hash per key, and Loom's entry has one key in a
+    // private session; the other hashes are recorded for other hooks. Loom's
+    // key carries the LAST, most recent decision.
     for (index, hash) in trusted.iter().enumerate() {
-        config.push_str(&format!("[hooks.state.\"id{index}\"]\ntrusted_hash = \"{hash}\"\n"));
+        let key = if index + 1 == trusted.len() {
+            LOOM_KEY.to_owned()
+        } else {
+            format!("/elsewhere/profile-{index}/hooks.json:pre_tool_use:0:0")
+        };
+        config.push_str(&format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"{hash}\"\n"));
     }
     std::fs::write(profile.join("config.toml"), config).unwrap();
     profile
 }
+
+/// The key Codex records trust for Loom's entry under in a private session.
+const LOOM_KEY: &str = "/home/loom/.codex-profile/hooks.json:pre_tool_use:0:0";
 
 fn sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -90,6 +100,41 @@ const TRUST_CASES: &[TrustCase] = &[
     ("legacy receipt, no trust", None, &[], false),
 ];
 
+/// Trust recorded under a key Codex never looks Loom's private-session entry
+/// up under. Each must read as untrusted, with a fresh baseline that would
+/// otherwise admit any new hash.
+const WRONG_LOCATION_CASES: &[(&str, &str)] = &[
+    (
+        "host-side path of the same profile",
+        "[hooks.state.\"/Users/op/.loom/codex-profiles/a/hooks.json:pre_tool_use:0:0\"]\ntrusted_hash = \"fresh\"\n",
+    ),
+    (
+        "another profile's path (the robb-studio shape)",
+        "[hooks.state.\"/Users/op/.loom/codex-profiles/r.j.walters/hooks.json:pre_tool_use:0:0\"]\ntrusted_hash = \"fresh\"\n",
+    ),
+    (
+        "another position in the right file",
+        "[hooks.state.\"/home/loom/.codex-profile/hooks.json:pre_tool_use:3:0\"]\ntrusted_hash = \"fresh\"\n",
+    ),
+    (
+        "a commented-out entry for the right key",
+        "# [hooks.state.\"/home/loom/.codex-profile/hooks.json:pre_tool_use:0:0\"]\n# trusted_hash = \"fresh\"\n",
+    ),
+];
+
+#[test]
+fn trust_counts_only_under_the_key_codex_looks_loom_up_under() {
+    for (what, config) in WRONG_LOCATION_CASES {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = profile(dir.path(), Some(&[]), &[]);
+        std::fs::write(profile.join("config.toml"), config).unwrap();
+        assert!(enforcing(&report(true, &profile), &profile).is_err(), "{what}");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let profile = profile(dir.path(), Some(&[]), &["fresh"]);
+    assert!(enforcing(&report(true, &profile), &profile).is_ok());
+}
+
 #[test]
 fn hook_trust_follows_the_install_time_baseline_diff() {
     for (what, baseline, trusted, expected) in TRUST_CASES {
@@ -104,53 +149,38 @@ fn hook_trust_follows_the_install_time_baseline_diff() {
     assert!(enforcing(&report(true, &profile), &profile).is_err());
 }
 
-/// The Rust gate and `provision-codex-hooks.sh verify` must agree, profile for
-/// profile: one of them refusing while the other admits is exactly the drift
-/// this cross-check exists to prevent. Skipped where the shell's own
-/// dependencies are unavailable.
+/// Private admission and `provision-codex-hooks.sh verify` (since #9390 the
+/// native `codex_hooks::Check`) must agree, profile for profile: one refusing
+/// while the other admits is exactly the drift this cross-check exists to
+/// prevent. They now share the trust reading, and this pins that they also
+/// agree on the verdict built from it.
 #[test]
 fn the_rust_trust_gate_agrees_with_the_shipped_provisioner() {
+    use super::super::codex_hooks::{Check, Registration};
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let provisioner = repo.join("defaults/scripts/provision-codex-hooks.sh");
     let bridge = repo.join("defaults/hooks/guard-codex-bridge.sh");
-    if !provisioner.is_file() || !bridge.is_file() || which("jq").is_none() {
-        eprintln!("skipping: provision-codex-hooks.sh or jq unavailable");
-        return;
-    }
     for (what, baseline, trusted, expected) in TRUST_CASES {
         let dir = tempfile::tempdir().unwrap();
         let profile = profile(dir.path(), *baseline, trusted);
-        let output = Command::new("bash")
-            .arg(&provisioner)
-            .args(["verify", "--codex-home"])
-            .arg(&profile)
-            .args(["--workspace", REPO, "--bridge"])
-            .arg(&bridge)
-            .arg("--json")
-            .output()
-            .unwrap();
-        let verdict: serde_json::Value =
-            serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
-                panic!(
-                    "verify emitted no JSON for {what}: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                )
-            });
-        assert_eq!(verdict["trusted"], *expected, "{what}: shell verdict {verdict}");
+        let verdict = Check {
+            codex_home: profile.clone(),
+            workspace: Some(PathBuf::from(REPO)),
+            registration: Registration::Pinned {
+                bridge: bridge.clone(),
+            },
+            fallback_bridge: None,
+            // A private session runs Codex with CODEX_HOME at the container's
+            // mount point; that is where its trust is keyed.
+            runtime_home: Some(PathBuf::from(PROFILE)),
+        }
+        .verify();
+        assert_eq!(verdict.trusted, *expected, "{what}: verify verdict {verdict:?}");
         assert_eq!(
             enforcing(&report(true, &profile), &profile).is_ok(),
-            verdict["trusted"] == true,
-            "{what}: the Rust gate disagrees with the shipped provisioner"
+            verdict.trusted,
+            "{what}: the admission gate disagrees with verify"
         );
     }
-}
-
-fn which(bin: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(bin))
-            .find(|candidate| candidate.is_file())
-    })
 }
 
 /// A clone with no Loom surface has no managed bridge to enforce with, so it

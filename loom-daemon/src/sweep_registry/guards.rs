@@ -331,11 +331,7 @@ impl SweepRegistry {
     /// [`preflip_labels::classify_observed_labels`]'s (Issue #7873 — a snapshot
     /// missing `loom:issue` is unpromoted, not peer-claimed).
     pub(crate) fn classify_preflip_labels(&self, issue: u32) -> CollisionClass {
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("issue")
             .arg("view")
@@ -495,11 +491,7 @@ impl SweepRegistry {
         // exactly as it did with `gh issue view --repo`. Returns `None` (fail
         // open) when the repo cannot be resolved.
         let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
@@ -815,11 +807,7 @@ impl SweepRegistry {
     /// reads as not-open here.
     fn pull_request_is_open(&self, pr: u32) -> Option<bool> {
         let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/pulls/{pr}"))
@@ -882,11 +870,7 @@ impl SweepRegistry {
         let Some((owner, repo)) = self.resolve_owner_repo() else {
             return OpenPrProbe::ProbeFailed;
         };
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.args(crate::worktree_ops::gh::open_linked_pr_args(&owner, &repo, issue));
         // Resolve against this registry's own workspace, matching the label-flip
@@ -948,11 +932,7 @@ impl SweepRegistry {
         let Some((owner, repo)) = self.resolve_owner_repo() else {
             return OpenPrProbe::ProbeFailed;
         };
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.args(crate::worktree_ops::gh::open_linked_pr_timeline_args(&owner, &repo, issue));
         cmd.current_dir(&self.config.workspace_root);
@@ -989,11 +969,7 @@ impl SweepRegistry {
     /// [`issue_is_closed_or_pr`]: Self::issue_is_closed_or_pr
     pub(crate) fn issue_is_pull_request(&self, issue: u32) -> Option<bool> {
         let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
@@ -1137,11 +1113,7 @@ impl SweepRegistry {
     /// any failure; callers treat that as "no declaration" (fail closed).
     pub(crate) fn issue_body_via_rest(&self, issue: u32) -> Option<String> {
         let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
@@ -1167,11 +1139,7 @@ impl SweepRegistry {
     /// a *successful* read and must stay distinguishable from a failed one.
     pub(crate) fn current_labels_via_rest(&self, issue: u32) -> Option<Vec<String>> {
         let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
@@ -1233,11 +1201,7 @@ impl SweepRegistry {
         {
             return Some(cached);
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("repo")
             .arg("view")
@@ -1274,11 +1238,7 @@ impl SweepRegistry {
     }
 
     pub(crate) fn flip_label_to_building(&self, issue: u32) -> Result<()> {
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("issue")
             .arg("edit")
@@ -1392,15 +1352,30 @@ impl SweepRegistry {
     /// `post_watchdog_gaveup_comment`: a `gh` failure here only logs (at
     /// `warn`) and never propagates — posting a lease record must never fail
     /// dispatch or undo the claim it documents.
+    /// The configured `gh` binary, or the crate's single resolver
+    /// ([`crate::gh_invocation::gh_bin`]: policy launcher -> `LOOM_GH_BIN` ->
+    /// `PATH`) when no override is configured (#9985).
+    fn resolved_gh(&self) -> PathBuf {
+        self.config
+            .gh_bin
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(crate::gh_invocation::gh_bin()))
+    }
+
+    /// `body` for an issue comment with the #9772 dashboard footer appended —
+    /// the slug resolves like every forge mutation here (`resolve_owner_repo`
+    /// honors `LOOM_REPO`), and an unresolvable one leaves the body unlinked
+    /// rather than linking to nowhere.
+    fn dashboard_comment_body(&self, issue: u32, body: &str) -> String {
+        let nwo = self.resolve_owner_repo().map(|(o, r)| format!("{o}/{r}"));
+        crate::forge_comment::footer_or_body(nwo.as_deref(), issue, false, body)
+    }
+
     pub(crate) fn write_lease_comment(&self, issue: u32, sweep_id: &str) {
         if self.config.skip_label_flip {
             return;
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
+        let gh = self.resolved_gh();
         let host = self.published_host_id();
         let body = format!(
             "{prefix}{host} sweep={sweep_id} -->\n\
@@ -1423,7 +1398,7 @@ impl SweepRegistry {
             .arg("comment")
             .arg(issue.to_string())
             .arg("--body")
-            .arg(body);
+            .arg(self.dashboard_comment_body(issue, &body));
         // Run in the registry's own workspace so the issue number resolves
         // against *this* repo in a multi-workspace daemon (#3928/#3937),
         // mirroring every other forge mutation in this file.
@@ -1591,11 +1566,7 @@ impl SweepRegistry {
     /// [`parse_lease_comments_json`]: Self::parse_lease_comments_json
     pub(crate) fn read_lease_comments(&self, issue: u32) -> Option<Vec<LeaseComment>> {
         let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))
@@ -1930,11 +1901,7 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return;
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
+        let gh = self.resolved_gh();
         let host = self.published_host_id();
         let body = format!(
             "<!-- loom:lease-yield host={host} sweep={sweep_id} earliest_host={earliest_host} \
@@ -1952,7 +1919,7 @@ impl SweepRegistry {
             .arg("comment")
             .arg(issue.to_string())
             .arg("--body")
-            .arg(body);
+            .arg(self.dashboard_comment_body(issue, &body));
         comment.current_dir(&self.config.workspace_root);
         // #5401: cross-owner managed repo -> its own owner's installation-token
         // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).

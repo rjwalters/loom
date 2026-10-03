@@ -76,13 +76,6 @@ mod gh_shapes {
 /// version: every caller treats "no labels" and "could not read labels" the
 /// same way. What changes is that a malformed response is no longer silently
 /// identical to "this PR has no labels".
-fn gh_label_names(entity: &str, number: i64, repo_root: &Path) -> Vec<String> {
-    match gh_labels_query(entity, number, repo_root) {
-        Query::Populated(names) => names,
-        _ => Vec::new(),
-    }
-}
-
 /// Label names, keeping the outcome classification.
 ///
 /// Callers that must tell "this has no labels" from "the labels could not be
@@ -104,6 +97,27 @@ fn gh_labels_query(entity: &str, number: i64, repo_root: &Path) -> Query<Vec<Str
         Query::Malformed { raw, error } => Query::Malformed { raw, error },
         Query::Failed { status, stderr } => Query::Failed { status, stderr },
         Query::Unavailable(u) => Query::Unavailable(u),
+    }
+}
+
+/// [`gh_labels_query`] narrowed to the two answers a phase check can act on:
+/// the labels, or the `ValidationResult` that fails the phase. `Empty` is a
+/// real answer and flows through as an empty vector (#7810 PR 2 — "no
+/// labels" must reach the checks below); every way of NOT KNOWING fails the
+/// phase instead. `message` stays at the call site so each phase's failure
+/// text is spelled out where it is read.
+fn labels_or_fail(
+    entity: &str,
+    number: i64,
+    repo_root: &Path,
+    role: &str,
+    issue: i64,
+    message: &str,
+) -> Result<Vec<String>, ValidationResult> {
+    match gh_labels_query(entity, number, repo_root) {
+        Query::Populated(names) => Ok(names),
+        Query::Empty => Ok(Vec::new()),
+        _ => Err(ValidationResult::new(role, issue, ValidationStatus::Failed, message)),
     }
 }
 
@@ -384,6 +398,12 @@ fn mark_phase_failed(
         body.push_str("\n\n");
         body.push_str(diagnostics);
     }
+    // #9772: the failure comment carries the dashboard footer like every
+    // daemon comment — the slug comes from the repo root, and an
+    // unresolvable one posts unlinked rather than linking to nowhere.
+    let nwo =
+        crate::worktree_ops::gh::resolve_owner_repo(repo_root).map(|(o, r)| format!("{o}/{r}"));
+    let body = crate::forge_comment::footer_or_body(nwo.as_deref(), &issue_s, false, &body);
     let _ = run_gh(&["issue", "comment", &issue_s, "--body", &body], repo_root, false);
 }
 
@@ -450,13 +470,17 @@ fn find_pr_for_issue(
     None
 }
 
-/// The label names on a PR (one per line from `gh`), or an empty vector on
-/// failure.
+/// The label names on a PR, or an empty vector on failure.
+///
+/// #7810 PR 2: was `--jq .labels[].name` plus newline-splitting. The filter
+/// produced one name per line, so a PR with no labels, a `gh` that failed,
+/// and a malformed response were all "no lines" — indistinguishable.
 fn pr_labels(repo_root: &Path, pr: i64) -> Vec<String> {
-    // #7810 PR 2: was `--jq .labels[].name` plus newline-splitting. The filter
-    // produced one name per line, so a PR with no labels, a `gh` that failed,
-    // and a malformed response were all "no lines" — indistinguishable.
-    gh_label_names("pr", pr, repo_root)
+    // `value()` collapses the four non-populated cases — exactly this call
+    // site's "empty on anything but a populated answer" contract.
+    gh_labels_query("pr", pr, repo_root)
+        .value()
+        .unwrap_or_default()
 }
 
 /// Closing-keyword references (`Closes|Fixes|Resolves #N`) found in `body`.
@@ -1285,19 +1309,16 @@ pub fn validate_curator(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
     // fails the check. Under `--jq .labels[].name` both produced no lines, so a
     // forge hiccup was indistinguishable from an uncurated issue — and the old
     // `!r.succeeded()` guard could not catch it, because `gh` had exited zero.
-    let labels: Vec<String> = match gh_labels_query("issue", issue, repo_root) {
-        Query::Populated(names) => names,
-        Query::Empty => Vec::new(),
-        // Malformed / Failed / Unavailable: we could not read the labels, which
-        // is not the same as the issue having none.
-        _ => {
-            return ValidationResult::new(
-                "curator",
-                issue,
-                ValidationStatus::Failed,
-                "Could not fetch issue labels",
-            );
-        }
+    let labels = match labels_or_fail(
+        "issue",
+        issue,
+        repo_root,
+        "curator",
+        issue,
+        "Could not fetch issue labels",
+    ) {
+        Ok(labels) => labels,
+        Err(result) => return result,
     };
     if labels.iter().any(|l| l.trim() == "loom:curated") {
         return ValidationResult::new(
@@ -1365,18 +1386,11 @@ pub fn validate_judge(repo_root: &Path, opts: &ValidateOpts) -> ValidationResult
     };
     // #7810 PR 2: `Empty` — a PR with no labels at all — is a real answer and
     // must reach the checks below. Only a genuinely unanswered query fails here.
-    let labels: Vec<String> = match gh_labels_query("pr", pr, repo_root) {
-        Query::Populated(names) => names,
-        Query::Empty => Vec::new(),
-        _ => {
-            return ValidationResult::new(
-                "judge",
-                issue,
-                ValidationStatus::Failed,
-                "Could not fetch PR labels",
-            );
-        }
-    };
+    let labels =
+        match labels_or_fail("pr", pr, repo_root, "judge", issue, "Could not fetch PR labels") {
+            Ok(labels) => labels,
+            Err(result) => return result,
+        };
     if labels.iter().any(|l| l.trim() == "loom:pr") {
         return ValidationResult::new(
             "judge",
@@ -1433,18 +1447,11 @@ pub fn validate_doctor(repo_root: &Path, opts: &ValidateOpts) -> ValidationResul
     };
     // #7810 PR 2: `Empty` — a PR with no labels at all — is a real answer and
     // must reach the checks below. Only a genuinely unanswered query fails here.
-    let labels: Vec<String> = match gh_labels_query("pr", pr, repo_root) {
-        Query::Populated(names) => names,
-        Query::Empty => Vec::new(),
-        _ => {
-            return ValidationResult::new(
-                "doctor",
-                issue,
-                ValidationStatus::Failed,
-                "Could not fetch PR labels",
-            );
-        }
-    };
+    let labels =
+        match labels_or_fail("pr", pr, repo_root, "doctor", issue, "Could not fetch PR labels") {
+            Ok(labels) => labels,
+            Err(result) => return result,
+        };
     if labels.iter().any(|l| l.trim() == "loom:review-requested") {
         return ValidationResult::new(
             "doctor",

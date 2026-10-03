@@ -121,6 +121,7 @@ pub mod repo_ref;
 pub mod runtime_usage;
 pub mod sender;
 pub mod session_analysis;
+pub mod session_output;
 pub mod session_summary;
 pub mod shutdown;
 pub mod tracing;
@@ -1118,6 +1119,13 @@ pub fn spawn_task(
     // tracker and its bus subscriber run (and journal) even without them.
     eta::register_sink(otlp_queues.clone(), &host_id);
     ops_handles.extend(eta::spawn_task(bus, workspace_root.clone(), host_id.clone()));
+    // Live agent output (#9764): `session.output` is OTLP-only too, and
+    // additionally opt-in — `spawn_task` returns `None` unless
+    // `observability.liveOutput.enabled` is set. Registered over the
+    // already-resolved OTLP queues only, so enabling it can never add or
+    // start an exporter, least of all the managed HTTPS one.
+    session_output::register_sink(otlp_queues.clone(), &host_id);
+    ops_handles.extend(session_output::spawn_task(bus, workspace_root.clone()));
     if let Some(sink) = ops::sink_for_otlp_queues(otlp_queues, &host_id) {
         ops::register_global_ops_sink(sink);
         // Slot turnaround (#8929): a bus subscriber, OTLP-only like the sink.

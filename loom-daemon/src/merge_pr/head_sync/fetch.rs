@@ -21,11 +21,7 @@
 
 use std::process::Command;
 
-/// The `gh` binary, honoring `LOOM_GH_BIN` — the same seam
-/// `stale_checks::fetch` and `forge_cmd::gh_bin` provide.
-fn gh_bin() -> String {
-    std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
-}
+use crate::gh_invocation::gh_bin;
 
 fn gh_api(args: &[&str]) -> Result<String, String> {
     let out = Command::new(gh_bin())

@@ -11,6 +11,7 @@ use std::path::Path;
 mod drain_render;
 mod fleet_store_line;
 mod forge_calls_render;
+mod forge_egress_line;
 mod forge_events_line;
 mod holds;
 mod model_class;
@@ -672,6 +673,8 @@ pub(crate) fn build_status_json_value(
             "trips_total": r.trips_total,
             "core_remaining": r.core_remaining,
             "graphql_remaining": r.graphql_remaining,
+            "core_used": r.core_used,
+            "graphql_used": r.graphql_used,
             "budget_probed_at": r.budget_probed_at,
         })),
         // Per-caller forge call accounting (#9251); `null` from an older daemon.
@@ -759,6 +762,12 @@ pub(crate) fn build_status_json_value(
     let pending_restart = pending_restart_line::json(report.daemon_pid);
     if !pending_restart.is_null() {
         value["pending_restart"] = pending_restart;
+    }
+    // Forge egress routing (#9984): fresh assert + the daemon's last doctor;
+    // inserted only when a policy resolves or a cached report exists.
+    let forge_egress = forge_egress_line::json();
+    if !forge_egress.is_null() {
+        value["forge_egress"] = forge_egress;
     }
     value
 }
@@ -2226,6 +2235,8 @@ pub(crate) fn print_status_human(
     // render` change this daemon's pid has not yet picked up. Nothing at all
     // once the daemon that saw the drift has restarted (or if none ever did).
     pending_restart_line::print(report.daemon_pid);
+    // Forge egress routing (#9984): nothing at all when no policy is configured.
+    forge_egress_line::print();
 
     // Watchdog protection state (#4354): this daemon is answering, so it is
     // alive — but is anything positioned to notice when it *stops* being? Before

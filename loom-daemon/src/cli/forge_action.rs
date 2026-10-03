@@ -7,6 +7,7 @@
 
 use anyhow::Result;
 use clap::Subcommand;
+use std::path::PathBuf;
 
 /// Sub-actions for `loom-daemon forge`.
 ///
@@ -269,6 +270,41 @@ pub(crate) enum ForgeAction {
         head: String,
     },
 
+    /// `forge verdict-equivalent <pr> <reviewed> <head>` (#9416) — does a
+    /// verdict rendered against `<reviewed>` still describe `<head>`, and by
+    /// which equivalence? The superset of `tree-unchanged`: it asks that same
+    /// tree-identical test first (#9124/#9576), then the clean-merge-of-base and
+    /// rebase-patch-identical kinds #9416 adds. All three are recomputed from
+    /// the repository — git objects and the forge's own compare endpoint — never
+    /// from a comment or marker, and never from a commit message or the shape of
+    /// a ref update.
+    ///
+    /// Prints `VERDICT_EQUIVALENT=1` plus `EQUIVALENCE_KIND=tree|clean-merge|
+    /// rebase-patch-identical` when the verdict carries, or
+    /// `VERDICT_EQUIVALENT=0` when it provably does not, exiting 0 for both;
+    /// exits 1 with nothing on stdout when it could not be decided. So a caller
+    /// keys on the `EQUIVALENCE_KIND=` line, and every failure mode — absent
+    /// binary, a daemon predating this verb, a `gh` outage, a shallow clone, a
+    /// `merge-tree` conflict, a non-GitHub forge — collapses into the same
+    /// fail-closed "re-review" arm.
+    ///
+    /// Only the REVIEW is ever carried forward. CI re-runs against the new head
+    /// regardless of which kind applied.
+    #[command(name = "verdict-equivalent")]
+    VerdictEquivalent {
+        /// The PR whose base branch the two heads are compared against.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// The commit the verdict was rendered against (7-40 lowercase hex).
+        #[arg(value_name = "REVIEWED")]
+        reviewed: String,
+
+        /// The PR's current head (7-40 lowercase hex).
+        #[arg(value_name = "HEAD")]
+        head: String,
+    },
+
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should use,
     /// replacing its old unconditional `forge_detect_merge_method` call.
@@ -408,6 +444,81 @@ pub(crate) enum ForgeAction {
         #[arg(long)]
         json: bool,
     },
+
+    /// `forge comment <number> (--body TEXT | --body-file PATH)
+    /// [--repo OWNER/REPO] [--pr]` — the #9772 comment chokepoint as a verb:
+    /// appends the dashboard link (`loom:dashboard-link`, #9772) and POSTs to
+    /// `repos/<owner>/<repo>/issues/<number>/comments`. A PR IS an issue for
+    /// comments; `--pr` only picks `/pull/N` over `/issues/N` in the link.
+    /// `--repo` defaults to the current checkout's `origin` remote. GitHub
+    /// only, like every daemon comment path (`gh` REST).
+    #[command(name = "comment")]
+    Comment {
+        /// Issue or PR number to comment on (post path; omit when
+        /// `--patch-created` is given).
+        #[arg(value_name = "NUMBER")]
+        number: Option<u64>,
+
+        /// Target `owner/repo`; omitted resolves from the origin remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+
+        /// Comment body as literal text.
+        #[arg(long, value_name = "TEXT")]
+        body: Option<String>,
+
+        /// Read the body from PATH ("-" = stdin). Mutually exclusive with
+        /// `--body` (`--body @path` does NOT expand — see the
+        /// comment-body-literal-path rule).
+        #[arg(long, value_name = "PATH")]
+        body_file: Option<PathBuf>,
+
+        /// The number names a pull request (link says `/pull/N`).
+        #[arg(long)]
+        pr: bool,
+
+        /// Don't post: append the footer to this CREATED object's existing
+        /// body instead (idempotent) — the post-create step
+        /// create-issue.sh / create-pr.sh run right after a successful
+        /// create, when the number exists only inside the URL. Mutually
+        /// exclusive with NUMBER.
+        #[arg(long, value_name = "URL|OWNER/REPO#N", conflicts_with = "number")]
+        patch_created: Option<String>,
+    },
+
+    /// `forge egress assert|doctor|policy` (#9984) — will this process's `gh`
+    /// reach the mandated API origin? Exit 0 aligned / 1 findings / 2
+    /// verification incomplete; no policy configured ⇒ 0. Never a `gh`
+    /// passthrough. See `defaults/docs/forge-egress.md`.
+    Egress {
+        #[command(subcommand)]
+        action: super::forge_egress_cmd::EgressAction,
+    },
+
+    /// `forge dashboard-link <owner/repo> <number> [--pr]` — print the exact
+    /// dashboard footer (#9772) for `number` in `owner/repo`, byte-for-byte
+    /// as `forge comment` would append it. The shell twin's format-pinning
+    /// test (#9774) asserts its bash implementation against this output, so
+    /// the two implementations cannot drift.
+    #[command(name = "dashboard-link")]
+    DashboardLink {
+        /// Target `owner/repo`.
+        #[arg(value_name = "OWNER/REPO")]
+        repo: String,
+
+        /// Issue or PR number.
+        #[arg(value_name = "NUMBER")]
+        number: u64,
+
+        /// The number names a pull request (link says `/pull/N`).
+        #[arg(long)]
+        pr: bool,
+
+        /// Optional body to prepend, so the pinning test can compare a full
+        /// `body + footer` document byte-for-byte.
+        #[arg(long, value_name = "TEXT")]
+        body: Option<String>,
+    },
 }
 
 /// Handle `loom-daemon forge <issue|pr|auth|auto-merge>` (epic #4081 Phase 3,
@@ -434,9 +545,51 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             access,
             force,
         } => return super::forge_identity_cmd::token(&repo, &access, force),
+        ForgeAction::Egress { action } => return super::forge_egress_cmd::handle(action),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
         ForgeAction::MayWrite { repo } => return super::forge_identity_cmd::may_write(repo),
+        ForgeAction::DashboardLink {
+            repo,
+            number,
+            pr,
+            body,
+        } => {
+            let (owner, name) = repo
+                .split_once('/')
+                .ok_or_else(|| anyhow::anyhow!("--repo must be OWNER/REPO, got {repo:?}"))?;
+            let nwo = format!("{owner}/{name}");
+            print!(
+                "{}",
+                loom_daemon::forge_comment::build_dashboard_footer(
+                    &loom_daemon::forge_comment::dashboard_base_url(),
+                    &nwo,
+                    number,
+                    pr,
+                    body.as_deref().unwrap_or(""),
+                )
+            );
+            return Ok(());
+        }
+        ForgeAction::Comment {
+            number,
+            repo,
+            body,
+            body_file,
+            pr,
+            patch_created,
+        } => {
+            return loom_daemon::forge_comment::cli_entrypoint(
+                loom_daemon::forge_comment::CommentArgs {
+                    number,
+                    repo,
+                    body,
+                    body_file,
+                    is_pr: pr,
+                    patch_created,
+                },
+            );
+        }
         ForgeAction::TrustedComments {
             self_login,
             fetch,
@@ -484,6 +637,15 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             hold,
         },
         ForgeAction::TreeUnchanged { base, head } => ForgeCmd::TreeUnchanged { base, head },
+        ForgeAction::VerdictEquivalent {
+            pr_number,
+            reviewed,
+            head,
+        } => ForgeCmd::VerdictEquivalent {
+            pr: pr_number,
+            reviewed,
+            head,
+        },
         ForgeAction::MergeMethod { repo, requested } => ForgeCmd::MergeMethod { repo, requested },
         ForgeAction::MergeConfig {
             repo,
@@ -514,6 +676,10 @@ fn write_target(action: &ForgeAction) -> Option<Option<String>> {
             WRITE_OPS.contains(&op.as_str()).then(|| repo_flag(args))
         }
         ForgeAction::AutoMerge { .. } | ForgeAction::DisableAutoMerge { .. } => Some(None),
+        // #9772: `forge comment` posts, so it is vetted like the other
+        // write verbs — its `--repo` is exactly the `Option<String>` shape
+        // `may_write_from` wants.
+        ForgeAction::Comment { repo, .. } => Some(repo.clone()),
         _ => None,
     }
 }

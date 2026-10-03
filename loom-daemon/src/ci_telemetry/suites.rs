@@ -404,12 +404,21 @@ pub fn suite_envelopes(
 /// half a JSON document does not parse anyway, and truncating would turn a
 /// deliberate flood into a confusing parse error instead of a named skip.
 pub fn read_artifact_text(dir: &Path) -> Option<String> {
+    read_artifact_text_capped(dir, MAX_ARTIFACT_BYTES as u64, "suite-timings")
+}
+
+/// [`read_artifact_text`] with the cap and the log label supplied by the
+/// caller, so the JUnit path (#9456) — whose documents are an order of
+/// magnitude larger, see `nextest::MAX_JUNIT_BYTES` — shares one
+/// implementation of the walk, the cap check and the skip log rather than
+/// cloning it.
+pub fn read_artifact_text_capped(dir: &Path, max_bytes: u64, label: &str) -> Option<String> {
     let mut entries: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().collect();
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
         if path.is_dir() {
-            if let Some(found) = read_artifact_text(&path) {
+            if let Some(found) = read_artifact_text_capped(&path, max_bytes, label) {
                 return Some(found);
             }
             continue;
@@ -417,9 +426,9 @@ pub fn read_artifact_text(dir: &Path) -> Option<String> {
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
-        if metadata.len() > MAX_ARTIFACT_BYTES as u64 {
+        if metadata.len() > max_bytes {
             log::warn!(
-                "ci_telemetry: suite-timings artifact file {} is {} byte(s), over the {MAX_ARTIFACT_BYTES}-byte cap — skipped",
+                "ci_telemetry: {label} artifact file {} is {} byte(s), over the {max_bytes}-byte cap — skipped",
                 path.display(),
                 metadata.len()
             );

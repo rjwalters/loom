@@ -39,14 +39,16 @@ CREATE TABLE records (
 );";
 
 /// The shape-compatible stand-in for `issue_landed_size` (see the module
-/// doc): same grain, LSI NULL — the committed view's own output under its
-/// current `v0-unfitted` parameter set.
+/// doc): same grain, LSI NULL — not because the committed view is unfitted
+/// any more (it carries the `v1-2026-10-02` fit, #9934), but because the
+/// bundled SQLite this fixture runs on lacks the math functions the view
+/// needs.
 const LANDED_SIZE_STUB: &str = "
 CREATE VIEW issue_landed_size AS
 SELECT f.repo AS repo, f.issue AS issue, f.sweep_id AS landing_sweep_id,
        f.emitted_at AS landed_at,
        NULL AS LSI,
-       'v0-unfitted' AS params_version
+       'v1-2026-10-02' AS params_version
 FROM sweep_facts f
 WHERE f.disposition = 'landed'
    OR (f.disposition IS NULL AND f.result = 'success' AND f.pr_number IS NOT NULL);";

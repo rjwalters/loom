@@ -4238,8 +4238,8 @@ function mask_comment(s,   out, n, i, c, prev, mode, SQ, DQ) {
 # EXACTLY the pre-#6152 code path — same fail-toward-asking behavior,
 # unchanged.
 #
-# `NAME=$(pwd)` CAPTURE OF A PROVEN SAME-COMMAND `cd` (#6724): the assignment
-# scan below special-cases a value of EXACTLY `$(pwd)`/`` `pwd` `` (bare or
+# `NAME=$(pwd)` CAPTURE OF curcwd (#6724, widened #9885): the assignment scan
+# below special-cases a value of EXACTLY `$(pwd)`/`` `pwd` `` (bare or
 # double-quoted) as the RHS — e.g. `cd <worktree>; WORKTREE_ABS="$(pwd)"; git
 # -C "$WORKTREE_ABS" reset --hard …` — by recording `varmap[NAME] = curcwd`
 # directly instead of routing through record_assign()'s generic literal-string
@@ -4248,24 +4248,39 @@ function mask_comment(s,   out, n, i, c, prev, mode, SQ, DQ) {
 # (`substr(vv, 1, 1) == "$"` at the top of this same block) then correctly
 # refuses to touch a value it cannot itself evaluate — so `$WORKTREE_ABS`
 # reached the `-C`/`cd` capture points below unresolved even though the
-# preceding `cd` already proved the exact path. This carve-out trusts the
-# SAME cd-tracking model the "@HEAD@" resolution above already trusts (a
-# same-command `cd <path>` is assumed to have succeeded) rather than adding a
-# new trust assumption, and it is intentionally narrow:
+# value was already known. This carve-out trusts the SAME cd-tracking model
+# the "@HEAD@" resolution above already trusts (a same-command `cd <path>` is
+# assumed to have succeeded) rather than adding a new trust assumption, and it
+# is intentionally narrow:
 #   - ONLY the literal `pwd` substitution — any other command substitution
 #     (`$(git rev-parse …)`, `$(readlink -f …)`, etc.) is left to fall through
 #     to record_assign() unresolved, same as before.
-#   - ONLY when a same-command `cd <path>` has actually run earlier in this
-#     segment loop, tracked by the dedicated `cd_proven` flag rather than a
-#     bare `curcwd != ""` check — `curcwd` itself is seeded from `startcwd`
-#     (the hook's own invocation cwd) even when the command has NO `cd` at
-#     all, so `curcwd != ""` alone can never distinguish a proven cd from
-#     that default seed. With no proven `cd`, the assignment falls through to
-#     record_assign() unresolved rather than guessing the hook's own
-#     invocation cwd.
+#   - `curcwd != ""` is the only gate (originally also required the dedicated
+#     `cd_proven` flag — a same-command `cd <path>` having actually run
+#     earlier in this segment loop — see #9885 below for why that extra gate
+#     was dropped).
 #   - a SINGLE-QUOTED `NAME='$(pwd)'` is excluded on purpose: single quotes
 #     suppress command substitution, so that RHS is a literal string the
 #     shell never evaluates, not a cwd capture.
+#
+# DROPPING THE `cd_proven` REQUIREMENT (#9885): #6724 originally required a
+# same-command `cd <path>` to have already run before trusting `curcwd` for a
+# `$(pwd)` capture, reasoning that `curcwd` is seeded from `startcwd` (the
+# hook's own invocation cwd) even with NO `cd` at all, so `curcwd != ""` alone
+# could not distinguish a proven cd from that default seed — and trusting the
+# seed looked like "guessing" the invocation cwd. Guard-decision telemetry (51
+# occurrences) showed this was wrong: a bare, argument-less `pwd` is BY
+# DEFINITION the invoking shell's cwd, so when NO `cd` has run yet in this same
+# command, `curcwd` (== `startcwd`) is not a guess at all — it is already
+# exactly what `pwd` would print. `startcwd` itself is the hook's own
+# already-trusted invocation cwd (the SAME value the `-C`/`cd` capture points'
+# `[[ -z "$_fcwd" ]] && _fcwd="$CWD"` fallback below already trusts
+# unconditionally when no `-C`/`cd` was given at all) — so trusting it for an
+# explicit `NAME="$(pwd)"` capture is strictly no weaker a trust assumption
+# than the fallback this file already makes. The common real-world shape this
+# unblocks has no `cd` at all:
+#   WORKTREE_ABS="$(pwd)"
+#   git -C "$WORKTREE_ABS" reset --hard origin/feature/issue-N
 #
 # `NAME=$(cat <file>)` CAPTURE OF A PROVEN SAME-COMMAND `cd` (#7532):
 # guard-decision telemetry (#7419, dated AFTER the #6724 fix above already
@@ -4284,27 +4299,32 @@ function mask_comment(s,   out, n, i, c, prev, mode, SQ, DQ) {
 # the same-command `cd` target.
 #
 # This hook is a PreToolUse guard: it evaluates the WHOLE compound command
-# BEFORE any of it runs, so unlike the `$(pwd)` case above (which trusts a
-# same-command `cd` to predict a FUTURE `pwd` evaluation), a `$(cat <file>)`
-# capture cannot be proven by predicting a future write within the same
-# command — nothing has executed yet. What CAN be checked, safely and without
-# assuming anything about execution order, is <file>'s content RIGHT NOW: the
-# assignment scan below reads it directly off disk (`getline < path`, never a
-# write, never an exec) and compares it — verbatim, first line only — against
-# the SAME-COMMAND proven `curcwd` (`cd_proven`, exactly the #6724 trust
-# gate). Only an EXACT match resolves `varmap[NAME] = curcwd`; this covers a
-# file already sitting on disk with the right content (written moments
-# earlier by a prior, already-executed command, or via any other legitimate
-# means) — it does NOT require <file> to be created inside the guarded
-# command's own text, and it never depends on THIS command actually running.
-# Narrow scope, mirroring #6724's own narrow scope:
+# BEFORE any of it runs, so unlike the `$(pwd)` case above (which trusts
+# `curcwd` — proven by a same-command `cd`, or already correct as the
+# untouched `startcwd` seed, #9885 — to predict a FUTURE `pwd` evaluation), a
+# `$(cat <file>)` capture cannot be proven by predicting a future write within
+# the same command — nothing has executed yet. What CAN be checked, safely and
+# without assuming anything about execution order, is <file>'s content RIGHT
+# NOW: the assignment scan below reads it directly off disk (`getline <
+# path`, never a write, never an exec) and compares it — verbatim, first line
+# only — against the SAME-COMMAND proven `curcwd` (`cd_proven`, the #6724
+# trust gate). Only an EXACT match resolves `varmap[NAME] = curcwd`; this
+# covers a file already sitting on disk with the right content (written
+# moments earlier by a prior, already-executed command, or via any other
+# legitimate means) — it does NOT require <file> to be created inside the
+# guarded command's own text, and it never depends on THIS command actually
+# running. Narrow scope, mirroring #6724's own narrow scope:
 #   - ONLY a literal `cat <file>` substitution (bare, double-quoted, or the
 #     `` `cat <file>` `` backtick spelling) — any other command (`$(head -1
 #     <file>)`, `$(cat <file1> <file2>)`, etc.) is left to fall through to
 #     record_assign() unresolved, same as before.
 #   - ONLY when a same-command `cd <path>` has already proven `curcwd`
-#     (`cd_proven`) — mirrors #6724 exactly; without a proven `cd` the
-#     assignment falls through to record_assign() unresolved.
+#     (`cd_proven`) — unlike the #9885 widening of the `$(pwd)` carve-out
+#     above, this one still REQUIRES a proven `cd`: an untouched `curcwd` only
+#     proves what `pwd` would print right now (checked directly, no disk I/O),
+#     it says nothing about a SEPARATE file's on-disk content, which could
+#     just as easily hold any other directory's path. Without a proven `cd`
+#     the assignment falls through to record_assign() unresolved.
 #   - ONLY an absolute `<file>` argument (`^/`) is read — a relative path is
 #     ambiguous (it would depend on the hook's own invocation cwd, not
 #     necessarily the command's), so it is left unresolved rather than
@@ -4331,11 +4351,11 @@ function mask_comment(s,   out, n, i, c, prev, mode, SQ, DQ) {
 #   WORKTREE_ABS="$(cd .loom/worktrees/issue-N && pwd)"
 #   git -C "$WORKTREE_ABS" reset --hard origin/feature/issue-N
 #
-# This is NOT the #6724 shape: #6724's cd_proven/$(pwd) carve-out requires a
-# SEPARATE, EARLIER same-command `cd <path>` segment to have already proven
-# curcwd before it will trust a later bare `$(pwd)` -- it never even inspects
-# an assignment whose `cd` and `pwd` are both INSIDE that assignment's own
-# substitution, so that scan never fires for this shape at all. Unlike the
+# This is NOT the #6724 shape: #6724's `$(pwd)` carve-out only ever matches an
+# assignment whose RHS is the EXACT literal `$(pwd)`/`` `pwd` `` substitution
+# -- it never even inspects an assignment whose `cd` and `pwd` are both INSIDE
+# that assignment's own substitution, so that scan never fires for this shape
+# at all. Unlike the
 # `$(pwd)`/`$(cat <file>)` carve-outs above, this capture needs no cd_proven
 # trust gate: the `cd <literal-path>` is itself part of the literal text being
 # recognized, so the resulting absolute path is derived the exact same way a
@@ -4644,10 +4664,16 @@ parse_force_ops() {
                                        # same-command `cd <path>` has actually
                                        # run — curcwd itself is seeded from
                                        # startcwd (the hook'"'"'s own invocation
-                                       # cwd) even with NO cd at all, so
-                                       # curcwd != "" alone cannot distinguish
-                                       # a proven same-command cd from that
-                                       # default seed. pending_cdpwd_name
+                                       # cwd) even with NO cd at all. The bare
+                                       # `$(pwd)` carve-out no longer gates on
+                                       # this flag (#9885: curcwd == startcwd
+                                       # is already correct with no cd, not a
+                                       # guess); cd_proven is still required
+                                       # for the #7532 `$(cat <file>)`
+                                       # carve-out below, which trusts
+                                       # separately-written file CONTENT, a
+                                       # materially different trust question.
+                                       # pending_cdpwd_name
                                        # (#9312) threads an OPEN `NAME=$(cd
                                        # <path>` half (see
                                        # extract_cdpwd_open()'"'"'s header
@@ -4714,17 +4740,24 @@ parse_force_ops() {
                 assignword = substr(seg, 1, _alen)
                 seg = substr(seg, _alen + 1)
                 sub(/[ \t]+$/, "", assignword)
-                # #6724: NAME=$(pwd) / NAME="$(pwd)" / NAME=`pwd` / NAME="`pwd`"
-                # immediately after a same-command `cd <path>` that already
-                # proved curcwd — trust the cd-tracking instead of letting
+                # #6724/#9885: NAME=$(pwd) / NAME="$(pwd)" / NAME=`pwd` /
+                # NAME="`pwd`" -- trust curcwd instead of letting
                 # record_assign() store the un-evaluable substitution text
                 # (see the header comment above for the full rationale and
-                # the narrow scope: pwd only, proven curcwd only, never for
-                # a single-quoted literal).
+                # the narrow scope: pwd only, never for a single-quoted
+                # literal). curcwd is ALWAYS correct here whether or not a
+                # same-command `cd` actually ran: it is seeded from startcwd
+                # (the hook'"'"'s own already-trusted invocation cwd, #9885) and
+                # only ever advanced by a real `cd` segment in THIS loop, so
+                # a bare, argument-less `pwd` evaluated before any such `cd`
+                # is -- by definition, not a guess -- startcwd itself; no
+                # cd_proven gate is needed (unlike #7532'"'"'s cat-file carve-out
+                # below, which trusts separately-written file CONTENT rather
+                # than curcwd itself, and so keeps requiring a proven `cd`).
                 pwdeq = index(assignword, "=")
                 pwdname = substr(assignword, 1, pwdeq - 1)
                 pwdval = substr(assignword, pwdeq + 1)
-                if (cd_proven && curcwd != "" && (pwdval == "$(pwd)" || pwdval == "\"$(pwd)\"" || pwdval == "`pwd`" || pwdval == "\"`pwd`\"")) {
+                if (curcwd != "" && (pwdval == "$(pwd)" || pwdval == "\"$(pwd)\"" || pwdval == "`pwd`" || pwdval == "\"`pwd`\"")) {
                     varmap[pwdname] = curcwd
                 } else if (cd_proven && curcwd != "" && (catfile = extract_cat_file(pwdval)) != "" && catfile ~ /^\// && read_cwd_capture_file(catfile) == curcwd) {
                     # #7532: NAME=$(cat <file>) / NAME=`cat <file>` -- <file>
@@ -5050,16 +5083,32 @@ resolve_stash_cwd() {
 # heredoc in this one provably-inert shape, and only when ALL of these hold:
 #   1. the opener is the complete tail of its line, immediately preceded by a
 #      recognized text-carrying flag, its opening quote, and `$(cat`;
-#   2. the heredoc delimiter is QUOTED (single- or double-quoted, `<<-` allowed)
-#      — a quoted delimiter is what guarantees the outer shell performs NO
-#      expansion on the body, so a `$(…)` sitting IN the body is inert text
-#      rather than live code (an UNQUOTED delimiter is rejected outright);
+#   2. the heredoc delimiter is either QUOTED (single- or double-quoted,
+#      `<<-` allowed) or UNQUOTED — see condition 5 below for why an
+#      unquoted delimiter needs an extra gate that a quoted one does not;
 #   3. the block is CLOSED in this same buffer (mirrors #5087's "never mask
 #      speculatively" rule for mask_heredoc_bodies);
 #   4. the very next line after the delimiter line is `)` + that same opening
 #      quote — i.e. the substitution ends immediately, with nothing chained
-#      after the heredoc inside it.
-# Condition 4 is what keeps a `--body "$(cat <<QUOTED_DELIM … QUOTED_DELIM`
+#      after the heredoc inside it;
+#   5. (UNQUOTED delimiter only, #9860) every line of the body independently
+#      has NO live backtick/`$(` of its own (`has_live_subst()`, the same
+#      escape-aware check `strip_literal_text()` runs on quoted flag values
+#      above). A QUOTED delimiter guarantees the outer shell performs NO
+#      expansion on the body at all, so a `$(…)` sitting IN the body is
+#      inert text regardless — no condition-5 gate is needed there. An
+#      UNQUOTED delimiter is different: the outer shell DOES run parameter/
+#      command/arithmetic expansion on the body as it feeds `cat`, so a live
+#      `$(rm -rf /)` or backtick INSIDE an unquoted-delimiter body genuinely
+#      executes. Condition 5 is what keeps that case denying while still
+#      allowing the common case this repo's own role prompts prescribe — a
+#      `cat <<EOF … EOF` body of plain advisory prose with no substitution
+#      markers of its own, which has nothing for the outer shell to expand.
+#      A body that passes condition 5 can still substitute an EXISTING shell
+#      variable (bare `$NAME`/`${NAME}`, not flagged by `has_live_subst()`),
+#      which is the same risk class the rest of this file already accepts for
+#      a plain variable read — never a NEW attacker-supplied command.
+# Condition 4 is what keeps a `--body "$(cat <<DELIM … DELIM`
 # <newline> `rm -rf /` <newline> `)"` command denying: bash ends the heredoc at
 # the delimiter line and then genuinely RUNS the following line inside the
 # substitution, so nothing is masked there. Condition 1 is what keeps an
@@ -5086,20 +5135,30 @@ strip_literal_text() {
     # load-bearing. Body bytes are replaced 1:1 with "X" so the buffer keeps
     # its byte offsets and line count; the opener line, the delimiter line and
     # everything outside the body are left untouched.
-    function mask_flag_cat_heredocs(s,   lines, nl, i, j, line, pre, oq, delim, dq, closeat, trimmed, body, dashform) {
+    function mask_flag_cat_heredocs(s,   lines, nl, i, j, line, pre, oq, delim, dq, closeat, trimmed, body, dashform, quoted, live) {
         if (index(s, "<<") == 0) return s
         nl = split(s, lines, "\n")
         for (i = 1; i <= nl; i++) {
             line = lines[i]
-            # (2) opener must END the line and carry a QUOTED delimiter.
-            if (match(line, /<<-?["'"'"'][A-Za-z0-9_]+["'"'"'][ \t]*$/) == 0) continue
+            # (2) opener must END the line and carry a delimiter that is EITHER
+            #     quoted OR unquoted (#9860 — see quoted/live gating below).
+            if (match(line, /<<-?["'"'"']?[A-Za-z0-9_]+["'"'"']?[ \t]*$/) == 0) continue
             dashform = (substr(line, RSTART + 2, 1) == "-")
             delim = substr(line, RSTART, RLENGTH)
             sub(/^<<-?/, "", delim)
             sub(/[ \t]*$/, "", delim)
             dq = substr(delim, 1, 1)
-            if (substr(delim, length(delim), 1) != dq) continue   # quotes must match
-            delim = substr(delim, 2, length(delim) - 2)
+            quoted = (dq == DQ || dq == SQ)
+            if (quoted) {
+                if (substr(delim, length(delim), 1) != dq) continue   # quotes must match
+                delim = substr(delim, 2, length(delim) - 2)
+            } else {
+                dq = ""
+                # reject a stray/mismatched quote char that the optional
+                # quote classes above let through on only one side (e.g. a
+                # literal `<<EOF` followed directly by a stray double quote).
+                if (delim !~ /^[A-Za-z0-9_]+$/) continue
+            }
             if (delim == "") continue
             # (1) …immediately preceded by <flag> <openquote>$(cat.
             pre = substr(line, 1, RSTART - 1)
@@ -5122,6 +5181,28 @@ strip_literal_text() {
             #     after the heredoc inside `$( … )` is masked away.
             if (closeat == nl) continue
             if (substr(lines[closeat + 1], 1, 2) != ")" oq) continue
+            # (5) UNQUOTED delimiter only (#9860): an unquoted delimiter means
+            #     the outer shell DOES perform expansion on the heredoc body
+            #     (parameter/command/arithmetic), unlike the quoted-delimiter
+            #     case above where the body is categorically inert. So before
+            #     masking an unquoted-delimiter body, every one of its lines
+            #     must independently fail has_live_subst() — i.e. contain no
+            #     unescaped backtick or `$(` of its own. A body that passes
+            #     this check still only ever substitutes an EXISTING shell
+            #     variable (bare `$NAME`/`${NAME}`, not flagged by
+            #     has_live_subst()), never runs a NEW attacker-supplied
+            #     command, so it carries the same risk class the rest of this
+            #     file already accepts for plain variable reads. A body that
+            #     fails it (contains a live backtick/`$(`) is left completely
+            #     unmasked and keeps denying exactly as before — this never
+            #     reopens the #3679/#5216 anti-smuggling floor.
+            if (!quoted) {
+                live = 0
+                for (j = i + 1; j < closeat; j++) {
+                    if (has_live_subst(lines[j])) { live = 1; break }
+                }
+                if (live) continue
+            }
             for (j = i + 1; j < closeat; j++) {
                 body = lines[j]
                 gsub(/./, "X", body)

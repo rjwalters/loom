@@ -23,6 +23,22 @@
 # only its fragment verdicts and leave every path verdict to the existing
 # checker.
 #
+# WHY THE lychee-ABSENT EXIT IS 78, NOT 127 (#9494). This gate cannot run
+# without lychee, and CI installs a pinned release binary no dev host has a
+# reason to carry — so `scripts/check-structural.sh` reclassifies that one
+# status as SKIP ("could not check") rather than FAIL, because a permanently
+# red gate trains a Builder to ignore the whole phase (#8170). That
+# reclassification has to key on a status the shell cannot produce by
+# accident. 127 is not one: it is also what `set -e` returns on ANY
+# `command not found` and what bash returns for a missing interpreter, so a
+# genuinely BROKEN gate reported as "could not check" was indistinguishable
+# from this deliberate sentinel. 78 (`EX_CONFIG`) is only ever reached by an
+# explicit `exit 78` — and it is already this repo's code for "a required
+# part of the environment is absent, fail closed distinctly" (spawn-claude.sh
+# on an empty token pool, spawn-worker.sh on an unknown runtime). The marker
+# word SKIP in the message below is for a human reading the output; the exit
+# code is what the aggregate keys on.
+#
 # Usage: check-doc-anchors.sh [root]   (requires `lychee` on PATH)
 set -euo pipefail
 
@@ -30,9 +46,9 @@ ROOT="${1:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$ROOT"
 
 if ! command -v lychee >/dev/null 2>&1; then
-  echo "check-doc-anchors: FAIL - lychee not found on PATH." >&2
+  echo "check-doc-anchors: SKIP - lychee not installed; anchors were NOT checked." >&2
   echo "  Install: https://github.com/lycheeverse/lychee (CI pins a release binary)." >&2
-  exit 127
+  exit 78
 fi
 
 # NOTE: no `mapfile` -- it is bash 4+, and macOS ships bash 3.2 (see #7783 for

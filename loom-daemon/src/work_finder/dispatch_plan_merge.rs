@@ -5,9 +5,9 @@
 //! `position` is an index into that host's own shaped pass-2 order, so two
 //! hosts' positions are not comparable — a fleet view that sorted on them
 //! would interleave by an accident of how much work each host happens to
-//! see. This module is the one place the fleet rule lives; the dashboard's
-//! `dashboard/web/src/workQueue.ts` is a port of it, and both are pinned to
-//! the same JSON fixture (`dashboard/test/fixtures/dispatch-plan-merge.json`)
+//! see. This module is the one place the fleet rule lives; the
+//! `2AMLogic/loom-ui` `web/src/workQueue.ts` is a port of it, and both are pinned
+//! to the same JSON fixture (`loom-daemon/tests/fixtures/dispatch-plan-merge.json`)
 //! so the two implementations cannot drift silently.
 //!
 //! # The rule

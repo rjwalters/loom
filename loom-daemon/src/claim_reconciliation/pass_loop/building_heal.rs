@@ -205,9 +205,13 @@ mod tests {
         (fake_gh, gh_log)
     }
 
-    fn seed_live_sweep(root: &Path, issue: u32) {
-        let journal_path = crate::sweep_journal::default_journal_path().unwrap();
-        let mut journal = crate::sweep_journal::load(&journal_path);
+    /// Seed one live-sweep journal entry at `journal_path` (a tempdir-scoped
+    /// path the caller has already pointed [`crate::sweep_journal::JOURNAL_PATH_ENV`]
+    /// at) — never the real `~/.loom/sweeps.json` (#9907: these tests used to
+    /// read/write that file unconditionally via `default_journal_path()`,
+    /// racing a live `loom-daemon` on the same host).
+    fn seed_live_sweep(journal_path: &Path, root: &Path, issue: u32) {
+        let mut journal = crate::sweep_journal::load(journal_path);
         journal.entries.push(crate::sweep_journal::JournalEntry {
             repo: root.display().to_string(),
             issue,
@@ -217,39 +221,44 @@ mod tests {
             pid: std::process::id(),
             started_at: chrono::Utc::now(),
         });
-        crate::sweep_journal::save(&journal_path, &journal).unwrap();
+        crate::sweep_journal::save(journal_path, &journal).unwrap();
     }
 
     #[test]
     #[serial_test::serial]
     fn heals_an_open_issue_whose_claim_label_is_missing() {
+        let journal_path_dir = tempfile::tempdir().unwrap();
+        let journal_path = journal_path_dir.path().join("sweeps.json");
+        std::env::set_var(crate::sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
         let dir = tempfile::tempdir().unwrap();
-        seed_live_sweep(dir.path(), 9464);
+        seed_live_sweep(&journal_path, dir.path(), 9464);
         let (fake_gh, gh_log) = fake_gh(dir.path(), "open", &[]);
 
         let stats = heal_missing_building_labels(&fake_gh, dir.path());
+
+        std::env::remove_var(crate::sweep_journal::JOURNAL_PATH_ENV);
 
         assert_eq!(stats.checked, 1);
         assert_eq!(stats.healed, 1);
         let calls = std::fs::read_to_string(&gh_log).unwrap();
         assert!(calls.contains("issue edit 9464 --add-label loom:building"), "{calls}");
-        // Clean the shared journal so other serial tests start clean.
-        let journal_path = crate::sweep_journal::default_journal_path().unwrap();
-        let mut journal = crate::sweep_journal::load(&journal_path);
-        journal
-            .entries
-            .retain(|entry| entry.repo != dir.path().display().to_string());
-        crate::sweep_journal::save(&journal_path, &journal).unwrap();
     }
 
     #[test]
     #[serial_test::serial]
     fn never_labels_a_closed_issue_and_warns_instead() {
+        let journal_path_dir = tempfile::tempdir().unwrap();
+        let journal_path = journal_path_dir.path().join("sweeps.json");
+        std::env::set_var(crate::sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
         let dir = tempfile::tempdir().unwrap();
-        seed_live_sweep(dir.path(), 9463);
+        seed_live_sweep(&journal_path, dir.path(), 9463);
         let (fake_gh, gh_log) = fake_gh(dir.path(), "closed", &["loom:building"]);
 
         let stats = heal_missing_building_labels(&fake_gh, dir.path());
+
+        std::env::remove_var(crate::sweep_journal::JOURNAL_PATH_ENV);
 
         assert_eq!(stats.checked, 1);
         assert_eq!(stats.healed, 0);
@@ -259,32 +268,26 @@ mod tests {
             !calls.contains("--add-label loom:building"),
             "a closed issue must never gain the queue label (#9463): {calls}"
         );
-        let journal_path = crate::sweep_journal::default_journal_path().unwrap();
-        let mut journal = crate::sweep_journal::load(&journal_path);
-        journal
-            .entries
-            .retain(|entry| entry.repo != dir.path().display().to_string());
-        crate::sweep_journal::save(&journal_path, &journal).unwrap();
     }
 
     #[test]
     #[serial_test::serial]
     fn an_already_claimed_issue_is_untouched() {
+        let journal_path_dir = tempfile::tempdir().unwrap();
+        let journal_path = journal_path_dir.path().join("sweeps.json");
+        std::env::set_var(crate::sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
         let dir = tempfile::tempdir().unwrap();
-        seed_live_sweep(dir.path(), 42);
+        seed_live_sweep(&journal_path, dir.path(), 42);
         let (fake_gh, gh_log) = fake_gh(dir.path(), "open", &["loom:building"]);
 
         let stats = heal_missing_building_labels(&fake_gh, dir.path());
+
+        std::env::remove_var(crate::sweep_journal::JOURNAL_PATH_ENV);
 
         assert_eq!(stats.checked, 1);
         assert_eq!(stats.healed, 0);
         let calls = std::fs::read_to_string(&gh_log).unwrap();
         assert!(!calls.contains("issue edit"), "{calls}");
-        let journal_path = crate::sweep_journal::default_journal_path().unwrap();
-        let mut journal = crate::sweep_journal::load(&journal_path);
-        journal
-            .entries
-            .retain(|entry| entry.repo != dir.path().display().to_string());
-        crate::sweep_journal::save(&journal_path, &journal).unwrap();
     }
 }

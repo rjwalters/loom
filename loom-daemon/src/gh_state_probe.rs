@@ -1,0 +1,52 @@
+//! Read-only `gh` state probes shared by over-threshold modules (#9985).
+//!
+//! Each helper runs one `gh ... view` through the [`GhInvocation`] facade and
+//! returns the raw [`Output`] only when the process actually ran; a spawn
+//! failure, collect failure, or timeout is `None`. Callers keep their own
+//! exit-status and stdout interpretation. These live here (rather than inline
+//! in `stash_retirement` / `sweep_outcome_summary`) so those ratcheted files do
+//! not grow — see `.loom/docs/file-size-policy.md`.
+
+use std::path::Path;
+use std::process::Output;
+use std::time::Duration;
+
+use crate::cmd_out::CmdOutcome;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+
+/// Deadline for a single probe (previously unbounded at both call sites).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn ran(outcome: CmdOutcome) -> Option<Output> {
+    match outcome {
+        CmdOutcome::Ran(output) => Some(output),
+        _ => None,
+    }
+}
+
+/// `gh issue view <issue> --json state -q .state`, run from `repo_root`.
+pub(crate) fn issue_state_output(repo_root: &Path, issue: u64) -> Option<Output> {
+    let issue = issue.to_string();
+    ran(GhInvocation::new(
+        Operation::new("issue.view"),
+        AccessIntent::Read,
+        GhTarget::None,
+        PROBE_TIMEOUT,
+    )
+    .args(["issue", "view", &issue, "--json", "state", "-q", ".state"])
+    .current_dir(repo_root)
+    .run())
+}
+
+/// `gh pr view <pr> --repo <repo> --json mergedAt`.
+pub(crate) fn pr_merged_at_output(repo: &str, pr: u32) -> Option<Output> {
+    let pr = pr.to_string();
+    ran(GhInvocation::new(
+        Operation::new("pr.view"),
+        AccessIntent::Read,
+        GhTarget::repo(repo).unwrap_or(GhTarget::None),
+        PROBE_TIMEOUT,
+    )
+    .args(["pr", "view", &pr, "--repo", repo, "--json", "mergedAt"])
+    .run())
+}

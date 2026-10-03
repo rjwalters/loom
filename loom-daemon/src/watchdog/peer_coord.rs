@@ -13,6 +13,24 @@
 use std::path::Path;
 
 use super::report;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+
+/// One bounded `gh` call through the facade (#9985); `true` only when it ran
+/// and exited 0. Spawn failure and timeout are both "no" — the same answer
+/// the raw `output_with_timeout(..).ok().flatten()` chain gave.
+fn gh_ok(
+    operation: &'static str,
+    intent: AccessIntent,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> bool {
+    matches!(
+        GhInvocation::new(Operation::new(operation), intent, GhTarget::None, timeout)
+            .args(args)
+            .run(),
+        crate::cmd_out::CmdOutcome::Ran(o) if o.status.success()
+    )
+}
 
 /// The daemon's own verdict about its coordination path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,6 +410,28 @@ pub fn sentinel_issue_ref(sentinel: &Path) -> Option<String> {
 /// failure is deliberately NOT one of them: the comment is the record, and a
 /// closed-but-commented issue is better than a duplicate.
 ///
+/// #9772: the peer-coordination comments carry the dashboard footer like
+/// every other daemon comment. The `issue_ref` the sentinel stores is a bare
+/// number against the daemon's own repo, `owner/repo#N`, or a full URL —
+/// parse it for the slug, falling back to the daemon's working directory for
+/// a bare number; anything unparseable posts unlinked rather than linking to
+/// nowhere.
+fn footer_body(issue_ref: &str, body: &str) -> String {
+    let resolved = crate::forge_comment::parse_issue_ref(issue_ref).and_then(|(nwo, number)| {
+        let nwo = nwo.or_else(|| {
+            crate::worktree_ops::gh::resolve_owner_repo(Path::new("."))
+                .map(|(o, r)| format!("{o}/{r}"))
+        })?;
+        Some((nwo, number))
+    });
+    match resolved {
+        Some((nwo, number)) => {
+            crate::forge_comment::append_dashboard_footer(&nwo, number, false, body)
+        }
+        None => body.to_string(),
+    }
+}
+
 /// The cooldown row is rewritten with the ORIGINAL `recovered_at`, not now —
 /// the dedup window measures from the last recovery, so refreshing it here
 /// would let an indefinitely flapping host never escape the window.
@@ -407,21 +447,28 @@ pub fn dedup_comment(
     let window = dedup_window_secs();
     let gh = std::time::Duration::from_secs(60);
 
-    let mut comment = std::process::Command::new("gh");
-    comment
-        .args(["issue", "comment", &cooldown.issue_ref, "--body"])
-        .arg(flap_comment(hostname, summary, flap, window));
-    let commented = crate::sweep_registry::output_with_timeout(comment, gh)
-        .ok()
-        .flatten()
-        .is_some_and(|o| o.status.success());
+    let commented = gh_ok(
+        "issue.comment",
+        AccessIntent::Write,
+        &[
+            "issue",
+            "comment",
+            &cooldown.issue_ref,
+            "--body",
+            &footer_body(&cooldown.issue_ref, &flap_comment(hostname, summary, flap, window)),
+        ],
+        gh,
+    );
     if !commented {
         return None;
     }
 
-    let mut reopen = std::process::Command::new("gh");
-    reopen.args(["issue", "reopen", &cooldown.issue_ref]);
-    let _ = crate::sweep_registry::output_with_timeout(reopen, gh);
+    let _ = gh_ok(
+        "issue.reopen",
+        AccessIntent::Write,
+        &["issue", "reopen", &cooldown.issue_ref],
+        gh,
+    );
 
     write_sentinel(sentinel, &cooldown.issue_ref, reporter);
     // #8649: same fail-open-but-loud treatment as `write_sentinel` above — a
@@ -486,26 +533,35 @@ pub fn recover(sentinel: &Path, cooldown_state: &Path, hostname: &str, summary: 
     };
 
     let gh = std::time::Duration::from_secs(60);
-    let mut comment = std::process::Command::new("gh");
-    comment
-        .args(["issue", "comment", &issue_ref, "--body"])
-        .arg(format!(
-            // Verbatim from the shell (loom-daemon-watchdog.sh:1820). This is
-            // posted to the forge, so a stray run of spaces and a dropped `.sh`
-            // are both visible to an operator reading the issue.
-            "peer-claim coordination has RECOVERED on `{hostname}` ({summary}). Closing \
+    let _ = gh_ok(
+        "issue.comment",
+        AccessIntent::Write,
+        &[
+            "issue",
+            "comment",
+            &issue_ref,
+            "--body",
+            &footer_body(
+                &issue_ref,
+                &format!(
+                    // Verbatim from the shell (loom-daemon-watchdog.sh:1820). This is
+                    // posted to the forge, so a stray run of spaces and a dropped `.sh`
+                    // are both visible to an operator reading the issue.
+                    "peer-claim coordination has RECOVERED on `{hostname}` ({summary}). Closing \
          automatically — filed by the loom-daemon-watchdog.sh peer-coordination escalation \
          (#6222)."
-        ));
+                ),
+            ),
+        ],
+        gh,
+    );
     // The comment is advisory: a failure must not stop the close.
-    let _ = crate::sweep_registry::output_with_timeout(comment, gh);
-
-    let mut close = std::process::Command::new("gh");
-    close.args(["issue", "close", &issue_ref, "--reason", "completed"]);
-    let closed = crate::sweep_registry::output_with_timeout(close, gh)
-        .ok()
-        .flatten()
-        .is_some_and(|o| o.status.success());
+    let closed = gh_ok(
+        "issue.close",
+        AccessIntent::Write,
+        &["issue", "close", &issue_ref, "--reason", "completed"],
+        gh,
+    );
     if !closed {
         return false;
     }

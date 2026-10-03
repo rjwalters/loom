@@ -132,7 +132,7 @@ fn blank_inline_code(text: &str) -> String {
 pub fn partial_increment_refs(text: &str) -> Vec<u64> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"(?im)^[[:blank:]\x0B\x0C\r]*([-*+>]|[0-9]+\.)?[[:blank:]\x0B\x0C\r]*(Part of|Contributes to)[[:blank:]\x0B\x0C\r]+#([0-9]+)")
+        Regex::new(r"(?im)^[[:blank:]\x0B\x0C\r]*([-*+>]|[0-9]+\.)?[[:blank:]\x0B\x0C\r]*(?:\*\*|__|\*|_)?(Part of|Contributes to)[[:blank:]\x0B\x0C\r]+#([0-9]+)")
             .expect("static partial-increment pattern")
     });
     let cleaned = blank_inline_code(&strip_fenced_code_blocks(text));
@@ -284,7 +284,7 @@ pub fn closing_ref_snippets(text: &str, issue: u64) -> String {
 #[must_use]
 pub fn partial_increment_ref_snippets(text: &str, issue: u64) -> String {
     let re = Regex::new(&format!(
-        r"(?im)^[[:blank:]\x0B\x0C\r]*([-*+>]|[0-9]+\.)?[[:blank:]\x0B\x0C\r]*(Part of|Contributes to)[[:blank:]\x0B\x0C\r]+#{issue}\b"
+        r"(?im)^[[:blank:]\x0B\x0C\r]*([-*+>]|[0-9]+\.)?[[:blank:]\x0B\x0C\r]*(?:\*\*|__|\*|_)?(Part of|Contributes to)[[:blank:]\x0B\x0C\r]+#{issue}\b"
     ))
     .expect("partial-increment-snippet pattern");
     let cleaned = blank_inline_code(&strip_fenced_code_blocks(text));

@@ -1,0 +1,10 @@
+# Ratchet allowlist for loom-daemon/tests/forge_egress_surface_lint.rs (#9988).
+#
+# Format: <repo-relative path> <TAB> <pattern class> <TAB> <reason>
+#
+# Entries may only be REMOVED. A stale entry (no matching hit) fails the test,
+# and a new hit that is not listed fails the test. The terminal state is an
+# empty list; the github-app-token.sh api.github.com literals are NOT listed
+# here — they are the inventoried bootstrap exception, recognised in-source by
+# the `loom:egress-exception=github-app-bootstrap` marker.
+defaults/scripts/lib/forge-helpers.sh	gh-config-dir-assign	owner-config ladder rung selects a per-owner credential directory (#446), not a host; refactor once the egress policy (#9984) names a credential reference

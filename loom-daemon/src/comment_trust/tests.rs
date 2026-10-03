@@ -204,6 +204,17 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // Writes the marker; scans only already-filtered bodies.
         ("claim_reconciliation/verdict_stale_comment.rs", "writer + filtered bodies"),
         ("claim_reconciliation/verdict_invalidation.rs", "writer"),
+        // #9416: owns the re-anchor comment BODY (so it names the marker) and
+        // decides equivalence. It reads no comment at all — every answer comes
+        // from git objects or the forge's own compare endpoint, and its module
+        // doc states outright that a marker is never evidence (#9548). So there
+        // is no unfiltered read here either.
+        ("verdict_equivalence/mod.rs", "writer of the marker body; never reads a comment"),
+        ("verdict_equivalence/tests.rs", "test"),
+        // #9772: mentions the marker in its module doc only — forge_comment
+        // WRITES comments (and appends the dashboard footer); it never reads
+        // comment bodies at all, so there is no unfiltered read to guard.
+        ("forge_comment.rs", "doc mention only; writer, never a reader"),
         // Scoring context, never a control decision (High follow-up, #9548).
         ("jev_merge_risk.rs", "shadow scoring input, not control"),
         // Tests and fixtures.

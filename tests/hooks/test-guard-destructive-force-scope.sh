@@ -436,14 +436,50 @@ assert_allow "force-op:detached + \$(pwd) capture (#6724): unquoted WORKTREE_ABS
 WORKTREE_ABS=\$(pwd)
 git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT_REPO"
 
-# Control: a $(pwd) capture with NO preceding same-command `cd` (curcwd is
-# only the hook's own default invocation cwd, never proven) must NOT be
-# guessed -- stays fail-closed, still asks. The command's own hook cwd here
-# is the detached worktree itself, so a naive "trust curcwd unconditionally"
-# implementation would incorrectly allow this.
-assert_ask "force-op:detached + \$(pwd) capture (#6724): \$(pwd) capture with NO preceding cd stays fail-closed, still asks" \
+# #9885: a $(pwd) capture with NO preceding same-command `cd` resolves and
+# allows. curcwd is seeded from startcwd (the hook's own already-trusted
+# invocation cwd) and is untouched here since nothing `cd`s -- a bare,
+# argument-less `pwd` evaluated at that point is BY DEFINITION exactly
+# startcwd, not a guess, so this is no weaker a trust assumption than the
+# `-C`/`cd` capture points' own `[[ -z "$_fcwd" ]] && _fcwd="$CWD"` fallback
+# already makes unconditionally when no `-C`/`cd` is given at all. This was
+# previously a false positive (51 guard-decision-telemetry occurrences, filed
+# as #9885): the hook's own cwd here IS the detached worktree, but the
+# unresolved literal "$WORKTREE_ABS" text reaching the consumption site as a
+# non-empty `_fcpath` suppressed that same fallback from ever using $CWD.
+assert_allow "force-op:detached + \$(pwd) capture (#9885): \$(pwd) capture with NO preceding cd now resolves and allows" \
     "WORKTREE_ABS=\"\$(pwd)\"
 git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT"
+# The issue's own exact reproduction shape: fetch + reset + set-upstream-to,
+# chained on separate lines, no leading cd.
+assert_allow "force-op:detached + \$(pwd) capture (#9885): the issue's exact reproduction -- WORKTREE_ABS=\"\$(pwd)\"; fetch; reset --hard origin/main; branch --set-upstream-to allows" \
+    "WORKTREE_ABS=\"\$(pwd)\"
+git -C \"\$WORKTREE_ABS\" fetch origin
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main
+git -C \"\$WORKTREE_ABS\" branch --set-upstream-to=origin/main" "$FORCE_DETACHED_WT"
+assert_allow "force-op:detached + \$(pwd) capture (#9885): braced \${WORKTREE_ABS} form with NO preceding cd also resolves and allows" \
+    "WORKTREE_ABS=\"\$(pwd)\"
+git -C \"\${WORKTREE_ABS}\" reset --hard origin/main" "$FORCE_DETACHED_WT"
+assert_allow "force-op:detached + \$(pwd) capture (#9885): backtick-substitution spelling WORKTREE_ABS=\`pwd\` with NO preceding cd also resolves and allows" \
+    "WORKTREE_ABS=\"\`pwd\`\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT"
+assert_allow "force-op:detached + \$(pwd) capture (#9885): unquoted WORKTREE_ABS=\$(pwd) with NO preceding cd also resolves and allows" \
+    "WORKTREE_ABS=\$(pwd)
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_DETACHED_WT"
+# Control: the resolved value must still respect the existing recovery-target
+# allowlist even with NO preceding cd -- an unrecognized reset TARGET still
+# asks (the #9885 widening narrows the cwd-resolution gap only, not the
+# target check).
+assert_ask "force-op:detached + \$(pwd) capture (#9885): WORKTREE_ABS resolves via no-cd \$(pwd) but reset target is unrecognized -- still asks" \
+    "WORKTREE_ABS=\"\$(pwd)\"
+git -C \"\$WORKTREE_ABS\" reset --hard some-other-branch" "$FORCE_DETACHED_WT"
+# Control: an UNMANAGED directory (detached HEAD, no .loom-managed sentinel,
+# reuses FORCE_PROT_DETACHED) with NO preceding cd still asks -- the #9885
+# widening only trusts curcwd itself, it does not relax the SEPARATE
+# managed-worktree membership check.
+assert_ask "force-op:detached + \$(pwd) capture (#9885): WORKTREE_ABS resolves via no-cd \$(pwd) but cwd is NOT a managed worktree -- still asks" \
+    "WORKTREE_ABS=\"\$(pwd)\"
+git -C \"\$WORKTREE_ABS\" reset --hard origin/main" "$FORCE_PROT_DETACHED"
 
 # Control: this fix is scoped to the literal `pwd` substitution only -- any
 # other command substitution stays unresolved and still asks.
