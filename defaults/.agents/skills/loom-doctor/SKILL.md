@@ -608,8 +608,8 @@ if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
     # Check for merge conflicts (ask the forge; `git merge-tree origin/main`
     # alone is not a valid invocation — it needs the base + two commits).
     if [ "$(gh pr view "$UNLABELED_PR" --json mergeable --jq '.mergeable')" = "CONFLICTING" ]; then
-      # Pin the lease to this PR's head BEFORE the rebase rewrites it (#9487).
-      PUSH_LEASE_SHA=$(gh pr view "$UNLABELED_PR" --json headRefOid --jq '.headRefOid')
+      # Pin = the head just checked out, BEFORE the rebase; never the forge (#9487).
+      PUSH_LEASE_SHA=$(git rev-parse HEAD)
       # Resolve conflicts
       git fetch origin main
       git rebase origin/main
@@ -624,8 +624,7 @@ if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
         echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
         exit 1
       fi
-      # Lease PINNED to the pre-rebase head, never bare (#9487).
-      git push --force-with-lease="$PR_BRANCH:$PUSH_LEASE_SHA"
+      git push --force-with-lease="$PR_BRANCH:$PUSH_LEASE_SHA" || exit 1
 
       # Comment but don't add labels
       ./.loom/scripts/post-comment.sh $UNLABELED_PR --pr --body "🔧 Fixed merge conflicts with main branch."
@@ -959,29 +958,27 @@ git fetch origin && git log --oneline "$CLAIM_HEAD_SHA..origin/$(git branch --sh
 
 ### Pin the lease — a bare `--force-with-lease` is unsafe here (#9487)
 
-The recheck above is the *social* layer; this is the mechanical one beneath it,
-and it is **not optional**. A bare `--force-with-lease` compares origin against
-`refs/remotes/origin/<branch>`, a ref **shared by every linked worktree of this
-clone** — a sibling's `git fetch` advances it to the commit *they* pushed,
-the lease is satisfied by construction, and your push is **accepted**, deleting
-their work with no error (PR #9483). Pin the head you actually built on, and
-never "freshen" the pin with a `git fetch` before pushing — that pins the
-sibling's commit and launders the clobber. Why: `defaults/docs/push-lease-pinning.md`.
+The recheck above is the *social* layer; this mechanical one is **not
+optional**. A bare `--force-with-lease` checks `refs/remotes/origin/<branch>`,
+**shared by every linked worktree**: a sibling's `git fetch` makes your push
+delete their commit, no error (PR #9483). Pin the head you built on; never
+"freshen" the pin (that pins theirs). Why: `defaults/docs/push-lease-pinning.md`.
 
 ```bash
 BRANCH=$(git branch --show-current)
-# The head your work is based on: CLAIM_HEAD_SHA from step 2. Re-pin to
-# $CURRENT_HEAD_SHA ONLY after deliberately rebasing onto a moved head.
+# CLAIM_HEAD_SHA (step 2, read BEFORE checkout); re-pin only per the table / last line.
 PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-$CLAIM_HEAD_SHA}"
+[ -n "$PUSH_LEASE_SHA" ] || { echo "No pin: STOP. Do not push or re-read the head." >&2; exit 1; }
+# BEFORE any rebase/amend: git accepts ANY full-SHA pin, even unfetched, and overwrites it.
+git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD || { echo "Pin not in HEAD: STOP." >&2; exit 1; }
+git fetch origin main && git rebase origin/main || exit 1  # step 9; on conflict resolve, continue, resume
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Aborting: version-bearing files out of sync after rebase (see BLOCKER:/Fix:)." >&2
   exit 1
 fi
-[ -n "$PUSH_LEASE_SHA" ] || { echo "No pin: do NOT push. Re-read the real head (git ls-remote origin refs/heads/$BRANCH); it must be what you built on." >&2; exit 1; }
-git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"
+git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA" &&
+  { PUSH_LEASE_SHA=$(git rev-parse HEAD); CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }  # own push: re-pin
 ```
-
-An unresolvable expected value is rejected: the pinned form fails closed.
 
 **Never hand-patch VERSION/CLAUDE.md/`Cargo.toml`/… to "re-add a bump the rebase
 dropped"**, and never run `./scripts/version.sh bump …` here even if the gate's
@@ -1047,8 +1044,8 @@ write that actually matters, not just at claim time.
       on a fresh claim; reclaimed only on a stale one)
 - [ ] I re-compared the PR's `headRefOid` against `CLAIM_HEAD_SHA` immediately
       before pushing, and on a mismatch re-verified the blocker (or stood down)
-- [ ] Every force-push I made pinned the lease
-      (`--force-with-lease=<branch>:<sha I built on>`), never the bare flag (#9487)
+- [ ] Every force-push pinned a SHA in my HEAD (`--force-with-lease=<branch>:<sha>`),
+      re-pinned after my own push, never bare (#9487)
 - [ ] I re-read the PR's labels immediately before the completion write (Verdict-Time
       CAS Recheck above), and aborted/stood down on a lost claim or a raced verdict
       label instead of writing over it
@@ -1392,9 +1389,10 @@ All CI checks passing. Ready for re-review!"
 This is a critical issue that blocks merging. Fix it immediately:
 
 ```bash
-# Pin the lease BEFORE the rebase rewrites the head (#9487, "Pin the lease").
-PUSH_LEASE_SHA=$(gh pr view 42 --json headRefOid --jq '.headRefOid')
+# Pin = the claim-time head, never re-read now; check it BEFORE the rebase ("Pin the lease").
+PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-${CLAIM_HEAD_SHA:?}}"
 BRANCH=$(git branch --show-current)
+git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD || { echo "Pin not in HEAD: STOP." >&2; exit 1; }
 
 git fetch origin main
 git rebase origin/main
@@ -1403,16 +1401,15 @@ git rebase origin/main
 # then `git add <file>` and continue.
 git rebase --continue
 
-# Version-bearing-file sync gate (#7168). If it fires that is an anomaly:
-# never hand-edit a version-bearing file or run `version.sh bump` -- stop,
-# do not push, report it on the PR.
+# Version-bearing-file sync gate (#7168): if it fires, stop and report; never hand-bump.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Aborting: version-bearing files are out of sync after rebase (see BLOCKER:/Fix: above) -- unexpected under #7743; report, do not hand-bump." >&2
   exit 1
 fi
 
-# Force push with the lease PINNED (never bare -- #9487)
-git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"
+# Force push with the lease PINNED (never bare -- #9487); re-pin to your own push
+git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA" &&
+  { PUSH_LEASE_SHA=$(git rev-parse HEAD); CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }
 
 # Verify CI passes after rebase
 loom-daemon forge wait-checks 42 --timeout 20

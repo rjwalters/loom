@@ -132,7 +132,7 @@ source "$SCRIPT_DIR/lib/push-lease-verify.sh"
 # (the live PR #9483 incident, #9487). Finding the binary is part of that
 # call-site; an unresolvable one leaves $DAEMON_BIN empty, and the per-child
 # call then fails closed (the child is SKIPPED, never pushed with a bare lease).
-# requires-daemon: push-lease >= 0.19.624   #9487 — the pinned-lease builder. Declared at this repo's VERSION because the subcommand lands WITH this marker; the first release actually carrying it is the post-merge bump. A binary predating it is refused here with the floor and the roll command rather than degraded to the bare lease
+# requires-daemon: push-lease >= 0.19.653   #9487 — the pinned-lease builder. Declared at this repo's VERSION because the subcommand lands WITH this marker; the first release actually carrying it is the post-merge bump. A binary predating it is refused here with the floor and the roll command rather than degraded to the bare lease
 # shellcheck source=lib/locate-daemon-bin.sh
 source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"
 DAEMON_BIN="$(loom_daemon_self_bin_override || loom_locate_daemon_bin "$SCRIPT_DIR/../.." || true)"
