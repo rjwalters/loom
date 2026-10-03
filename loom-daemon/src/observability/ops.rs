@@ -177,6 +177,18 @@ pub fn emit_metrics(points: Vec<MetricPoint>) {
     }
 }
 
+/// Whether [`emit_span`] would deliver a span from this thread: a global sink
+/// is registered, or (test builds) a [`capture::capture`] is active. Lets a
+/// seam avoid handing a child a parent span that will never be exported.
+#[must_use]
+pub fn spans_exported() -> bool {
+    #[cfg(test)]
+    if capture::active() {
+        return true;
+    }
+    global_ops_sink().is_some()
+}
+
 /// Emit a completed span through the global sink; a no-op when none is
 /// registered.
 pub fn emit_span(span: SpanRecord) {
