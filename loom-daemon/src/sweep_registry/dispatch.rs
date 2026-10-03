@@ -1753,9 +1753,15 @@ impl SweepRegistry {
         // here, before any claim/label/account/log/spawn side effect, and the
         // refusal is visible on the bus as `sweep.blocked reason=forge-egress`.
         // `observe` logs and admits; no policy configured is a no-op.
-        if let Some(refusal) =
-            crate::forge_egress::gate::dispatch_refusal(&self.config.workspace_root)
-        {
+        if let Some(refusal) = self.config.forge_egress_sources.as_ref().map_or_else(
+            || crate::forge_egress::gate::dispatch_refusal(&self.config.workspace_root),
+            |sources| {
+                crate::forge_egress::gate::dispatch_refusal_with(
+                    sources,
+                    &self.config.workspace_root,
+                )
+            },
+        ) {
             self.emit_event(Event::Generic {
                 topic: crate::forge_egress::gate::SWEEP_BLOCKED_TOPIC.to_string(),
                 payload: refusal.event_payload(serde_json::to_value(kind).unwrap_or_default()),
