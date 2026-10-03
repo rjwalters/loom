@@ -272,7 +272,7 @@ pub(super) fn run_role_with_timeout(
                 // arbitrary tail-window fragment of stderr, when one is
                 // present — see `describe_role_failure`.
                 let full_log = read_role_log(&log_path);
-                let detail = describe_role_failure(&full_log, &log_path);
+                let detail = describe_role_failure(&full_log, &log_path, &tick_anchor);
                 // Issue #8443: same terminal-record feedback on a non-zero
                 // exit — this is the path a `TOKEN_EXHAUSTED` death actually
                 // takes.
