@@ -21,11 +21,16 @@
 //!   it never merges, vouches, or combines. Within a component, existing
 //!   trusted `loom:sequence` markers and base-branch stacking are
 //!   authoritative constraints; everything else orders oldest-first (stable
-//!   tiebreak on PR number). A constraint cycle skips the whole component
+//!   tiebreak on PR number), except that a starred (`loom:operator-priority`)
+//!   placeable PR goes before an unstarred one and a stalled no-verdict PR
+//!   goes last (#10060). A constraint cycle skips the whole component
 //!   for that tick — a half-rewritten order is worse than a deferred one.
-//! - **Apply.** Consecutive pairs in each ordered component become chain
-//!   edges: the follower gets `loom:sequenced` (#9378's durable gate) and a
-//!   trusted `source=pass` marker pinning both heads and the plan id.
+//! - **Apply.** Edges are a DAG over DIRECT overlap (#10060): a follower
+//!   waits only for its nearest earlier member that shares a changed file
+//!   with it (or that it is stacked on), never for a PR it reaches only
+//!   through a third PR — so the marker's "changes files #N also changes" is
+//!   always true. The follower gets `loom:sequenced` (#9378's durable gate)
+//!   and a trusted `source=pass` marker pinning both heads and the plan id.
 //!   Followers that already carry a trusted marker are never re-planned —
 //!   a human's or another pass's "after" wins over the computed order.
 //! - **Release / replan.** Every open holder is re-evaluated with #9378's
@@ -38,6 +43,12 @@
 //!   preference must not starve mergeable work. Hard holds (no `source=`,
 //!   the human-authored shape) never auto-expire: expiring a semantic
 //!   dependency into merge permission is exactly the failure #9063 forbids.
+//! - **Stalled heads (#10060, [`stall`]).** A predecessor quiet for
+//!   `LOOM_MERGE_SEQUENCE_STALL_HOURS` (default 12) while on a human hold
+//!   (`loom:operator` …) or without a `loom:pr` verdict is a stalled head:
+//!   soft holds on approved followers behind it release early, and the chain
+//!   is escalated once ("operator needed" on the head PR, naming the action
+//!   and the approved PRs it holds). Hard holds still never release.
 //! - **Defer repairs.** The review-conflict pass
 //!   (`super::review_conflict`) consults this module's `defer_base_repair`:
 //!   a base-conflicting review-queue PR whose sequencing predecessor is
@@ -63,13 +74,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use super::gh_call;
 use crate::merge_pr::sequence::{
     evaluate, fetch_predecessor, fetch_trusted_bodies, marker_text, parse, KeepReason,
     PredecessorState, SequenceMarker, Verdict,
@@ -83,6 +94,14 @@ pub const MERGE_SEQUENCE_ENABLED_ENV: &str = "LOOM_MERGE_SEQUENCE_RECONCILE";
 /// bound exists so a stalled ordering cannot starve mergeable work forever.
 pub const MERGE_SEQUENCE_MAX_AGE_ENV: &str = "LOOM_MERGE_SEQUENCE_MAX_AGE_HOURS";
 const DEFAULT_MAX_AGE_HOURS: f64 = 72.0;
+
+// `LOOM_MERGE_SEQUENCE_STALL_HOURS` (default 12, #10060) is the companion
+// bound to `LOOM_MERGE_SEQUENCE_MAX_AGE_HOURS` above: a chain head quiet this
+// long on a human hold / without a verdict releases soft holds on approved
+// followers and is escalated once. Defined in `stall`.
+#[path = "merge_sequence_stall.rs"]
+pub mod stall;
+pub use stall::{stall_hours, MERGE_SEQUENCE_STALL_ENV};
 
 /// The durable hold label this pass applies (defined by #9378).
 pub const SEQUENCE_LABEL: &str = "loom:sequenced";
@@ -311,6 +330,20 @@ pub fn overlap_components(
 /// whole rather than applying a partial order.
 #[must_use]
 pub fn order_component(members: &[&SequencePr], constraints: &[(u32, u32)]) -> Option<Vec<u32>> {
+    order_component_with(members, constraints, &BTreeSet::new())
+}
+
+/// [`order_component`] with the #10060 placeable-set ranking: among members
+/// that are placeable right now (no unplaced constraint predecessor), a
+/// `stalled` member goes last and a starred one goes first, then
+/// oldest-first. A rank never overrides a constraint edge; with no star and
+/// no stall the order is exactly the oldest-first one.
+#[must_use]
+pub fn order_component_with(
+    members: &[&SequencePr],
+    constraints: &[(u32, u32)],
+    stalled: &BTreeSet<u32>,
+) -> Option<Vec<u32>> {
     let nums: BTreeSet<u32> = members.iter().map(|p| p.number).collect();
     let mut succ: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     let mut indegree: BTreeMap<u32, usize> = members.iter().map(|p| (p.number, 0)).collect();
@@ -328,11 +361,13 @@ pub fn order_component(members: &[&SequencePr], constraints: &[(u32, u32)]) -> O
         .collect();
     let mut ordered = Vec::with_capacity(members.len());
     while !ready.is_empty() {
-        // Oldest-first among the currently placeable: a stable total order
+        // Among the currently placeable: not-stalled before stalled, starred
+        // before unstarred, then oldest-first — a stable total order
         // independent of the input listing's order.
+        let rank = |p: &SequencePr| (stalled.contains(&p.number), !stall::starred(p));
         ready.sort_by(|a, b| {
             let (pa, pb) = (by_number[a], by_number[b]);
-            (&pa.created_at, pa.number).cmp(&(&pb.created_at, pb.number))
+            (rank(pa), &pa.created_at, pa.number).cmp(&(rank(pb), &pb.created_at, pb.number))
         });
         let n = ready.remove(0);
         ordered.push(n);
@@ -347,8 +382,12 @@ pub fn order_component(members: &[&SequencePr], constraints: &[(u32, u32)]) -> O
     (ordered.len() == members.len()).then_some(ordered)
 }
 
-/// Plan chain edges for one ordered component.
+/// Plan edges for one ordered component — a DAG over direct overlap (#10060).
 ///
+/// Each follower waits for its NEAREST earlier member (latest in `order`)
+/// that directly shares a changed file with it or whose head branch is its
+/// base; a follower with no such member gets no edge. Two members linked
+/// only through a third PR's files are never ordered against each other.
 /// Followers with no pinnable head SHA yield no edge: an unpinned hold
 /// cannot be re-checked safely. Edges carry [`EdgeReason::SharedFiles`]
 /// except where the follower's base branch IS the predecessor's head branch
@@ -358,11 +397,28 @@ pub fn plan_group(
     plan: &str,
     order: &[u32],
     by_number: &BTreeMap<u32, SequencePr>,
+    files: &BTreeMap<u32, BTreeSet<String>>,
 ) -> SequenceGroup {
+    let shares = |a: u32, b: u32| {
+        files
+            .get(&a)
+            .zip(files.get(&b))
+            .is_some_and(|(fa, fb)| fa.iter().any(|f| fb.contains(f)))
+    };
     let mut edges = Vec::new();
-    for pair in order.windows(2) {
-        let (after, follower) = (pair[0], pair[1]);
-        let (Some(pred), Some(fol)) = (by_number.get(&after), by_number.get(&follower)) else {
+    for (i, &follower) in order.iter().enumerate() {
+        let Some(fol) = by_number.get(&follower) else {
+            continue;
+        };
+        let Some(&after) = order[..i].iter().rev().find(|&&a| {
+            shares(a, follower)
+                || by_number
+                    .get(&a)
+                    .is_some_and(|p| fol.base_ref == p.head_ref)
+        }) else {
+            continue;
+        };
+        let Some(pred) = by_number.get(&after) else {
             continue;
         };
         let (Some(pred_head), Some(follower_head)) =
@@ -393,12 +449,25 @@ pub fn plan_group(
 /// The full plan for one repo's open set. Pure: the caller fetched listing +
 /// files + trusted markers, and gets back the groups to apply. Constraints
 /// come from `markers` (trusted, by follower) and from base-branch stacking
-/// among members. Components of size 1 are not groups.
+/// among members. Components of size 1 are not groups. Stalled no-verdict
+/// PRs are judged against the wall clock and [`stall_hours`].
 #[must_use]
 pub fn plan_repo(
     open_prs: &[SequencePr],
     files: &BTreeMap<u32, BTreeSet<String>>,
     markers: &BTreeMap<u32, SequenceMarker>,
+) -> Vec<SequenceGroup> {
+    let stalled = stall::stalled_for_ordering(open_prs, Utc::now(), stall_hours());
+    plan_repo_with(open_prs, files, markers, &stalled)
+}
+
+/// [`plan_repo`] with an explicit stalled set (deterministic for tests).
+#[must_use]
+pub fn plan_repo_with(
+    open_prs: &[SequencePr],
+    files: &BTreeMap<u32, BTreeSet<String>>,
+    markers: &BTreeMap<u32, SequenceMarker>,
+    stalled: &BTreeSet<u32>,
 ) -> Vec<SequenceGroup> {
     if open_prs.len() <= TRIGGER_OPEN_PRS {
         return Vec::new();
@@ -432,7 +501,7 @@ pub fn plan_repo(
             }
         }
         let members: Vec<&SequencePr> = component.iter().filter_map(|n| by_number.get(n)).collect();
-        let Some(order) = order_component(&members, &constraints) else {
+        let Some(order) = order_component_with(&members, &constraints, stalled) else {
             log::info!(
                 "merge_sequence: component {component:?} has a constraint cycle — skipped this tick"
             );
@@ -448,7 +517,7 @@ pub fn plan_repo(
             })
             .collect();
         let id = plan_id(&member_pins);
-        groups.push(plan_group(&id, &order, &by_number));
+        groups.push(plan_group(&id, &order, &by_number, files));
     }
     groups
 }
@@ -484,6 +553,10 @@ pub enum HoldAction {
     /// Soft hold on an approved follower whose predecessor went quiet past
     /// the bound: release so mergeable work is not starved.
     Expire,
+    /// Soft hold on an approved follower whose predecessor is a stalled head
+    /// (human hold / no verdict, quiet past the stall bound — #10060): release
+    /// so ready work lands first. Decided by [`stall::hold_action_with_stall`].
+    ReleaseStalled,
 }
 
 /// Pure Phase-1 decision for one hold.
@@ -594,6 +667,13 @@ pub fn release_comment_body(marker: &SequenceMarker, action: HoldAction) -> Stri
              the scheduling preference expired rather than starve mergeable work",
             marker.after,
             max_age_hours()
+        ),
+        HoldAction::ReleaseStalled => format!(
+            "#{} has stalled past the {:.0}h bound (on a human hold, or without a verdict) while \
+             this PR is approved — ready work lands first and #{} is rebased afterwards",
+            marker.after,
+            stall_hours(),
+            marker.after
         ),
         _ => "released".to_string(),
     };
@@ -717,6 +797,10 @@ pub struct MergeSequenceStats {
     pub voided: usize,
     pub released: usize,
     pub expired: usize,
+    /// Soft holds released behind a stalled head (#10060).
+    pub stall_released: usize,
+    /// Stalled-chain escalations posted this tick (#10060).
+    pub escalated: usize,
     pub held: usize,
 }
 
@@ -725,23 +809,19 @@ pub struct MergeSequenceStats {
 /// Run `gh pr <args…>` in `root` with the per-root credential and `LOOM_REPO`
 /// applied — the same invocation shape as the review-conflict pass.
 fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("pr").args(args);
-    cmd.current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    let inv = match args.first().copied() {
+        Some("list") => gh_call::read("sequence.pr_list", gh_bin, root),
+        Some("view") => gh_call::read("sequence.pr_view", gh_bin, root),
+        Some("comment") => gh_call::write("sequence.pr_comment", gh_bin, root),
+        _ => gh_call::write("sequence.pr_edit", gh_bin, root),
+    };
+    let out = gh_call::output(inv.args(["pr"]).args(args).args(gh_call::loom_repo_flag()))?;
     if !out.status.success() {
         return Err(anyhow::anyhow!(
             "gh pr {} failed in {}: {}",
             args.first().copied().unwrap_or_default(),
             root.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            gh_call::stderr(&out)
         ));
     }
     Ok(out.stdout)
@@ -766,8 +846,15 @@ fn list_open_prs(gh_bin: &Path, root: &Path) -> Result<Vec<SequencePr>> {
 }
 
 /// Changed paths for one PR. `None` on any failure: a failed read shrinks
-/// the plan (singleton) rather than fabricating overlap.
-fn changed_files(gh_bin: &Path, root: &Path, number: u32) -> Option<BTreeSet<String>> {
+/// the plan (singleton) rather than fabricating overlap. #10089: a PR's
+/// files are a function of its head and base, so a found answer is reused
+/// until either moves (this was one GraphQL view per eligible PR per tick).
+fn changed_files(gh_bin: &Path, root: &Path, pr: &SequencePr) -> Option<BTreeSet<String>> {
+    let key = super::read_cache::key(root, pr.number, &pr.base_ref, pr.head_sha.as_deref());
+    super::read_cache::CHANGED_FILES.get_or(key, || fetch_changed_files(gh_bin, root, pr.number))
+}
+
+fn fetch_changed_files(gh_bin: &Path, root: &Path, number: u32) -> Option<BTreeSet<String>> {
     #[derive(Debug, Deserialize)]
     struct Row {
         path: String,
@@ -838,7 +925,7 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
     report.holders = holder_numbers.len();
     let mut files: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
     for pr in &eligible {
-        if let Some(f) = changed_files(gh_bin, root, pr.number) {
+        if let Some(f) = changed_files(gh_bin, root, pr) {
             files.insert(pr.number, f);
         }
     }
@@ -990,6 +1077,8 @@ pub(super) fn reconcile_merge_sequences_with(
         return stats;
     }
     let max_age = max_age_hours();
+    let (now, stall_bound) = (Utc::now(), stall_hours());
+    let mut stalls = stall::StallLedger::default();
 
     // Phase 1: evaluate every existing hold, oldest first for a stable
     // transcript.
@@ -1029,10 +1118,30 @@ pub(super) fn reconcile_merge_sequences_with(
             continue;
         };
         let pred = fetch_predecessor(&bin, root, "{owner}/{repo}", marker.after);
-        let action =
-            hold_action(&marker, pred.as_ref(), pr.head_sha.as_deref(), pr.has("loom:pr"), max_age);
+        // The head's labels and freshness come from this tick's listing; a
+        // predecessor outside it is never treated as stalled (fail closed).
+        let head = open.iter().find(|p| p.number == marker.after);
+        let cause = head.and_then(|h| stall::stall_cause(h, now, stall_bound));
+        let approved = pr.has("loom:pr");
+        let action = stall::hold_action_with_stall(
+            &marker,
+            pred.as_ref(),
+            pr.head_sha.as_deref(),
+            approved,
+            max_age,
+            cause.as_ref(),
+        );
+        if let (Some(h), Some(c), true) = (head, cause.as_ref(), approved) {
+            if matches!(action, HoldAction::ReleaseStalled | HoldAction::HoldHard) {
+                let quiet = stall::quiet_hours(h, now).unwrap_or(stall_bound);
+                stalls.record(h, c, quiet, pr.number, action == HoldAction::ReleaseStalled);
+            }
+        }
         let result = match action {
-            HoldAction::Release | HoldAction::ReleaseDissolved | HoldAction::Expire => {
+            HoldAction::Release
+            | HoldAction::ReleaseDissolved
+            | HoldAction::Expire
+            | HoldAction::ReleaseStalled => {
                 release_hold(gh_bin, root, pr.number, &release_comment_body(&marker, action))
                     .map(|_| action)
             }
@@ -1045,6 +1154,7 @@ pub(super) fn reconcile_merge_sequences_with(
             Ok(HoldAction::Release) => stats.released += 1,
             Ok(HoldAction::ReleaseDissolved) => stats.released += 1,
             Ok(HoldAction::Expire) => stats.expired += 1,
+            Ok(HoldAction::ReleaseStalled) => stats.stall_released += 1,
             Ok(HoldAction::VoidAndReplan) => stats.voided += 1,
             Ok(_) => stats.held += 1,
             Err(e) => {
@@ -1055,6 +1165,21 @@ pub(super) fn reconcile_merge_sequences_with(
                     root.display()
                 );
             }
+        }
+    }
+
+    // Phase 1b: one escalation per stalled chain (#10060), deduped on the
+    // head PR's own trusted comments.
+    for chain in stalls.chains.iter().filter(|c| c.needs_escalation()) {
+        match stall::escalate(gh_bin, root, chain, stall_bound) {
+            Ok(true) => stats.escalated += 1,
+            Ok(false) => {}
+            Err(e) => log::warn!(
+                "claim_reconciliation (merge sequence): stalled-chain escalation on PR #{} in \
+                 {}: {e}",
+                chain.head,
+                root.display()
+            ),
         }
     }
 
@@ -1075,7 +1200,7 @@ pub(super) fn reconcile_merge_sequences_with(
     }
     let mut files: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
     for pr in &eligible {
-        if let Some(f) = changed_files(gh_bin, root, pr.number) {
+        if let Some(f) = changed_files(gh_bin, root, pr) {
             files.insert(pr.number, f);
         }
     }
