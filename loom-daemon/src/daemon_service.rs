@@ -242,6 +242,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
 
     // Setup logging to ~/.loom/daemon.log
     setup_logging()?;
+    // #10023: export this daemon's `host.id` to every child it spawns, while no
+    // spawning task exists yet (see `export_for_children` for the race).
+    let host_id = loom_daemon::host_identity::export_for_children();
+    log::info!("host identity: {} (source: {})", host_id.id, host_id.source.as_str());
 
     // Check tmux
     check_tmux_installed()?;

@@ -48,15 +48,17 @@ fn the_gateway_admits_loom_kind_on_logs_and_spans() {
 fn the_mapping_stamps_loom_kind_on_every_log_record() {
     // One stamp, applied before the per-kind match: every arm's attribute
     // vector opens with the kind attribute, so a new kind cannot forget it.
-    // Seven log-mapping arms carry it; the eighth `vec![` is the metric
+    // Eight log-mapping arms carry it (daemon.event since #10023, so the
+    // lifecycle recipe can filter on it); the next `vec![` is the metric
     // gauge path (tokens.snapshot's per-account datapoint attributes — not
     // a log record, `loom.kind` is not its discriminator).
     let stamps = MAPPING.matches("kind_attribute.clone()").count();
     assert_eq!(
-        stamps, 7,
+        stamps, 8,
         "the OTLP log mapping must stamp loom.kind on every log-record \
-         attribute vector (expected 7: sweep.started/identity/completed/\
-         outcome, role_tick.outcome, session.summary, session.analysis) — \
+         attribute vector (expected 8: sweep.started/identity/completed/\
+         outcome, role_tick.outcome, session.summary, session.analysis, \
+         daemon.event) — \
          a kind whose attributes miss the stamp is unqueryable by kind at \
          the backend (#9881)"
     );

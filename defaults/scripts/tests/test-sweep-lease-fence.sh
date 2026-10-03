@@ -524,6 +524,61 @@ LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309 --host studio-host
 assert_eq "5" "$RC" "(v) branch probe failure -> exit 5 (ABORT BRANCH_COLLISION, fail CLOSED)"
 assert_contains "$ERR" "BRANCH_COLLISION" "(v) stderr names the collision even though it is unverified"
 
+# --- (nb) #10023: no host identity -- no loom-daemon anywhere, no
+# LOOM_HOST_ID. The script copy lives under a root with no build, PATH and
+# the install dir carry no loom-daemon, so loom_host_id resolves nothing. The
+# fence must neither invent `unknown-host` nor compare under it.
+NB_ROOT="$STUB_DIR/no-daemon"
+mkdir -p "$NB_ROOT/scripts/lib" "$NB_ROOT/bin" "$NB_ROOT/empty-install"
+cp "$SCRIPT" "$NB_ROOT/scripts/"
+cp "$SCRIPTS_DIR/lib/locate-daemon-bin.sh" "$NB_ROOT/scripts/lib/"
+ln -sf "$STUB_DIR/gh" "$NB_ROOT/bin/gh"
+NB_PATH="$NB_ROOT/bin"
+IFS=: read -ra NB_DIRS <<< "$PATH"
+for d in "${NB_DIRS[@]}"; do
+    [[ -n "$d" && ! -x "$d/loom-daemon" ]] && NB_PATH="$NB_PATH:$d"
+done
+run_no_daemon() {
+    OUT="$(env -u LOOM_DAEMON_SELF_BIN -u CARGO_TARGET_DIR -u REPO_ROOT -u LOOM_HOST_ID \
+        PATH="$NB_PATH" LOOM_DAEMON_BIN_DIR="$NB_ROOT/empty-install" \
+        "$NB_ROOT/scripts/sweep-lease-fence.sh" "$@" 2>"$STUB_DIR/stderr.log")"
+    RC=$?
+    ERR="$(cat "$STUB_DIR/stderr.log" 2>/dev/null || true)"
+}
+
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[{"id": 1, "updated_at": "2026-08-15T15:51:00Z", "body": "<!-- loom:lease host=host-peer0001 sweep=sweep-b -->\nprose"}]
+JSON
+LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_no_daemon check 6309
+assert_eq "0" "$RC" "(nb1) no binary + no LOOM_HOST_ID -> fail OPEN (exit 0), not a comparison"
+assert_contains "$ERR" "no loom-daemon binary found" "(nb1) stderr says the binary is missing"
+assert_contains "$ERR" "no host identity" "(nb1) stderr says the fence was skipped for lack of identity"
+assert_true "$([[ "$ERR" != *unknown-host* ]] && echo true || echo false)" "(nb1) unknown-host is never used as an identity"
+
+reset_state
+echo "0" > "$STUB_DIR/check-branch-rc"
+LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_no_daemon check 6309
+assert_eq "5" "$RC" "(nb2) no identity does NOT skip the branch-collision stop (still exit 5)"
+
+# An older binary without `host-id` (explicitly pinned) falls back to
+# LOOM_HOST_ID -- the daemon's own tier-1 answer -- and nothing else.
+printf '#!/usr/bin/env bash\necho "error: unrecognized subcommand" >&2\nexit 2\n' > "$STUB_DIR/old-daemon"
+chmod +x "$STUB_DIR/old-daemon"
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[{"id": 1, "updated_at": "2026-08-15T15:51:00Z", "body": "<!-- loom:lease host=host-60a4fb97 sweep=sweep-a -->\nprose"}]
+JSON
+LOOM_DAEMON_SELF_BIN="$STUB_DIR/old-daemon" LOOM_HOST_ID="opaque-test-host" LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309
+assert_eq "0" "$RC" "(nb3) older binary + LOOM_HOST_ID -> own opaque lease recognised (exit 0)"
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[{"id": 1, "updated_at": "2026-08-15T15:51:00Z", "body": "<!-- loom:lease host=host-peer0001 sweep=sweep-b -->\nprose"}]
+JSON
+LOOM_DAEMON_SELF_BIN="$STUB_DIR/old-daemon" LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309
+assert_eq "0" "$RC" "(nb4) older binary + no LOOM_HOST_ID -> fail OPEN, not SUPERSEDED under a made-up id"
+assert_contains "$ERR" "gave no identity" "(nb4) stderr names the binary that could not answer"
+
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"
 if ((TESTS_FAILED > 0)); then

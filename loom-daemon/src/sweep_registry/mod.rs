@@ -181,32 +181,10 @@ pub const SPAWN_BIN_ENV: &str = "LOOM_SWEEP_SPAWN_BIN";
 /// registry. Falls back to `LOOM_WORKSPACE`, then current dir.
 pub const WORKSPACE_ENV: &str = "LOOM_WORKSPACE";
 
-/// Env var overriding this host's identity string in collision records (Issue
-/// #4085). Falls back to `$HOSTNAME`, then the `hostname` binary, then
-/// `"unknown-host"`. Set it when the daemon runs somewhere `$HOSTNAME` is not
-/// exported (a non-interactive service unit) so cross-host collision logs stay
-/// attributable.
-///
-/// **Set this explicitly on every host (Issue #5063).** It is the only
-/// source in [`host_identity`]'s precedence chain that is stable across
-/// launch contexts (launchd/systemd vs. an interactive shell) and the only
-/// one an operator fully controls — see [`host_identity`]'s doc comment for
-/// why the other two fallbacks are not a substitute. Pin it to whatever
-/// name telemetry/dashboards/ingest keys already use for the host (its
-/// tailnet or fleet name), not to `hostname`'s output, so all four agree.
-pub const HOST_ID_ENV: &str = "LOOM_HOST_ID";
-
-/// Sentinel identity [`host_identity`] returns when every resolution source
-/// fails (no `LOOM_HOST_ID`, no `$HOSTNAME`, and the `hostname` binary is
-/// missing or produced empty output). Exported so callers that reason about
-/// self-claim recognition (e.g. [`crate::peer_claims::PeerClaimView`]) can
-/// special-case it without duplicating the literal string (Issue #5063).
-///
-/// **This value must never participate in self-claim recognition.** Two
-/// hosts that both fail identity resolution would otherwise advertise the
-/// same string and each would treat the other's peer claim as its own,
-/// silently defeating the collision-detection machinery in #4028/#5017.
-pub const UNKNOWN_HOST: &str = "unknown-host";
+/// This host's identity env override and unresolvable-identity sentinel —
+/// defined in [`crate::host_identity`] (Issue #10023), re-exported here for
+/// the many existing `sweep_registry::` call sites.
+pub use crate::host_identity::{HOST_ID_ENV, UNKNOWN_HOST};
 
 // ============================================================================
 // Registry
@@ -858,91 +836,19 @@ pub struct SweepRegistry {
     inflight_idempotency: HashMap<String, SweepId>,
 }
 
-/// Resolve this host's identity string for collision records (Issue #4085) and
-/// peer-claim advertisements (Issue #4028), precedence `LOOM_HOST_ID` env >
-/// `$HOSTNAME` env > the `hostname` binary > [`UNKNOWN_HOST`]. This is loom's
-/// single, explicit host-identity concept — derived (not a new config block).
-///
-/// **Only the `LOOM_HOST_ID` branch is stable across launch contexts (Issue
-/// #5063).** The other two are not, despite the *value* each one would
-/// return being fixed for a given machine:
-///
-/// - `$HOSTNAME` is typically **unset** under a service supervisor
-///   (launchd/systemd export nothing by that name) but **may be set and
-///   differ from the `hostname` binary's output** under an interactive
-///   shell (some shells export it, often in FQDN form). So the same
-///   machine can advertise two different identities depending on whether
-///   its daemon was started by a service unit or from a terminal.
-/// - The `hostname` binary's output is an accident of DHCP/cloud-init/OS
-///   defaults (`ip-198-51-100-42` on an unconfigured EC2 host), not a name
-///   any operator chose — it commonly disagrees with the host's tailnet/
-///   fleet name and with whatever name an observability ingest key was
-///   minted against.
-///
-/// Every caller that needs a name to actually *mean* something (telemetry
-/// attribution, dashboard rows, ingest-key binding, peer-claim self-
-/// recognition) should have `LOOM_HOST_ID` set at provisioning time — see
-/// [`HOST_ID_ENV`]. When it is not set, this function logs a one-time
-/// process-lifetime warning identifying which weaker source it fell back
-/// to, so an operator notices before the mismatch becomes a telemetry/
-/// dashboard-naming (or, worse, a self-claim-recognition, see
-/// [`UNKNOWN_HOST`]) problem.
+/// Resolve this host's identity string for collision records (Issue #4085),
+/// peer-claim advertisements (Issue #4028), telemetry and leases. Delegates to
+/// [`crate::host_identity::host_identity`] (Issue #10023): `LOOM_HOST_ID` >
+/// the configured roster id (`fleet.hostId`) > a persisted generated id —
+/// never `$HOSTNAME` or the `hostname` binary, which vary by launch context
+/// and OS (Issue #5063). See that module for the migration note.
 ///
 /// safehoused stamps the socket `from` from the *persona* (all daemons share
 /// `loom_daemon`), which cannot distinguish hosts, so the claim payload carries
 /// this identity in its body for self-claim recognition.
 #[must_use]
 pub fn host_identity() -> String {
-    // One-time (process-lifetime) warning gate: `host_identity()` is called on
-    // every dispatch/re-advertisement/collision-record path, so logging on
-    // every call would spam the log without adding information — the
-    // resolution source does not change mid-process.
-    static FALLBACK_WARNED: OnceLock<()> = OnceLock::new();
-    let warn_once = |message: String| {
-        FALLBACK_WARNED.get_or_init(|| log::warn!("{message}"));
-    };
-
-    if let Ok(v) = std::env::var(HOST_ID_ENV) {
-        let t = v.trim();
-        if !t.is_empty() {
-            return t.to_string();
-        }
-    }
-    if let Ok(v) = std::env::var("HOSTNAME") {
-        let t = v.trim();
-        if !t.is_empty() {
-            warn_once(format!(
-                "sweep_registry: host identity resolved from $HOSTNAME ({t:?}), not an \
-                 explicit $LOOM_HOST_ID — this makes the identity launch-context-dependent (see \
-                 `host_identity()`'s doc comment) and it may disagree with telemetry/dashboard/\
-                 ingest-key naming for this host (Issue #5063). Set $LOOM_HOST_ID to pin a \
-                 stable, explicit identity."
-            ));
-            return t.to_string();
-        }
-    }
-    if let Ok(out) = Command::new("hostname").output() {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                warn_once(format!(
-                    "sweep_registry: host identity resolved from the `hostname` binary \
-                     ({s:?}), not an explicit $LOOM_HOST_ID — this is commonly an accident of \
-                     DHCP/cloud-init/OS defaults and may disagree with telemetry/dashboard/\
-                     ingest-key naming for this host (Issue #5063). Set $LOOM_HOST_ID to pin a \
-                     stable, explicit identity."
-                ));
-                return s;
-            }
-        }
-    }
-    warn_once(format!(
-        "sweep_registry: host identity could not be resolved from $LOOM_HOST_ID, $HOSTNAME, or \
-         the `hostname` binary — falling back to {UNKNOWN_HOST:?}. This sentinel never \
-         participates in peer-claim self-recognition (Issue #5063); set $LOOM_HOST_ID to give \
-         this host a real identity."
-    ));
-    UNKNOWN_HOST.to_string()
+    crate::host_identity::host_identity()
 }
 
 /// Env var restoring the pre-#6322 behavior of publishing this host's RAW
@@ -1741,73 +1647,71 @@ mod tests {
         std::env::remove_var(SPAWN_BIN_ENV);
     }
 
-    /// RAII guard: saves `LOOM_HOST_ID`/`HOSTNAME`, clears both for the
-    /// duration of the test, and restores whatever the ambient process
-    /// environment actually had on drop — a test that unconditionally
+    /// RAII guard: saves `LOOM_HOST_ID`/`LOOM_HOST_ID_FILE`/`HOSTNAME`, clears
+    /// them for the duration of the test, and restores whatever the ambient
+    /// process environment actually had on drop — a test that unconditionally
     /// `remove_var`s these without restoring would leak into the *next*
-    /// test's `host_identity()` result (and, worse, into the real value this
-    /// binary reports for the remainder of the process).
+    /// test's `host_identity()` result.
     struct HostIdentityEnvGuard {
-        host_id: Option<String>,
-        hostname: Option<String>,
+        saved: Vec<(&'static str, Option<String>)>,
     }
 
     impl HostIdentityEnvGuard {
         fn clear() -> Self {
-            let guard = Self {
-                host_id: std::env::var(HOST_ID_ENV).ok(),
-                hostname: std::env::var("HOSTNAME").ok(),
-            };
-            std::env::remove_var(HOST_ID_ENV);
-            std::env::remove_var("HOSTNAME");
-            guard
+            let keys = [
+                HOST_ID_ENV,
+                crate::host_identity::HOST_ID_FILE_ENV,
+                "HOSTNAME",
+            ];
+            let saved = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+            for k in keys {
+                std::env::remove_var(k);
+            }
+            Self { saved }
         }
     }
 
     impl Drop for HostIdentityEnvGuard {
         fn drop(&mut self) {
-            match &self.host_id {
-                Some(v) => std::env::set_var(HOST_ID_ENV, v),
-                None => std::env::remove_var(HOST_ID_ENV),
-            }
-            match &self.hostname {
-                Some(v) => std::env::set_var("HOSTNAME", v),
-                None => std::env::remove_var("HOSTNAME"),
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
             }
         }
     }
 
-    /// Issue #5063: `LOOM_HOST_ID` must win over both `$HOSTNAME` and the
-    /// `hostname` binary, and the `unknown-host` sentinel constant used
-    /// elsewhere for self-claim recognition must match what this function
-    /// actually returns when every source is unavailable.
+    /// Issue #5063 / #10023: `LOOM_HOST_ID` wins; blank values are ignored;
+    /// without it the id is the persisted one — never `$HOSTNAME`.
     #[test]
-    #[serial]
+    #[serial(loom_config_env)]
     fn host_identity_env_precedence() {
         let _guard = HostIdentityEnvGuard::clear();
+        let dir = tempfile::tempdir().unwrap();
+        let id_file = dir.path().join("host-id");
+        std::fs::write(&id_file, "persisted-studio\n").unwrap();
+        std::env::set_var(crate::host_identity::HOST_ID_FILE_ENV, &id_file);
 
         // Explicit LOOM_HOST_ID wins over everything else.
         std::env::set_var(HOST_ID_ENV, "robb-studio");
         std::env::set_var("HOSTNAME", "studio");
         assert_eq!(host_identity(), "robb-studio");
 
-        // With LOOM_HOST_ID unset, $HOSTNAME is used.
+        // With LOOM_HOST_ID unset, the persisted id is used — not $HOSTNAME.
         std::env::remove_var(HOST_ID_ENV);
-        assert_eq!(host_identity(), "studio");
+        assert_eq!(host_identity(), "persisted-studio");
 
-        // Blank values are treated as absent at every precedence level.
+        // Blank values are treated as absent.
         std::env::set_var(HOST_ID_ENV, "   ");
         assert_eq!(
             host_identity(),
-            "studio",
-            "a whitespace-only LOOM_HOST_ID must not shadow $HOSTNAME"
+            "persisted-studio",
+            "a whitespace-only LOOM_HOST_ID must not shadow the persisted id"
         );
         std::env::remove_var(HOST_ID_ENV);
         std::env::set_var("HOSTNAME", "  ");
-        // Falls all the way through to the `hostname` binary (present on any
-        // dev/CI machine this test runs on) or, failing that, the sentinel —
-        // either way it must not be the blank string.
-        assert_ne!(host_identity(), "");
+        assert_eq!(host_identity(), "persisted-studio");
     }
 
     /// The `UNKNOWN_HOST` constant peer-claim self-recognition special-cases

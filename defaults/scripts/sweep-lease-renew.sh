@@ -308,27 +308,19 @@ lease_publish_raw_hostname() {
     esac
 }
 
+# --- Host identity (#10023): `loom_host_id` (lib/locate-daemon-bin.sh) asks
+# the daemon's own `host-id` on the binary loom_resolve_self_daemon_bin names,
+# never a bare PATH lookup, so this script and the daemon cannot disagree. It
+# falls back only to $LOOM_HOST_ID, and otherwise returns 1 with a stderr
+# explanation -- never a made-up `unknown-host` shared by every such host.
+# (lib/locate-daemon-bin.sh is already sourced via lib/forge-helpers.sh above.)
 resolve_host() {
-    if [[ -n "${LOOM_HOST_ID:-}" ]]; then
-        printf '%s' "$LOOM_HOST_ID"
-        return 0
-    fi
-    if [[ -n "${HOSTNAME:-}" ]]; then
-        printf '%s' "$HOSTNAME"
-        return 0
-    fi
-    local h
-    h="$(hostname 2> /dev/null || true)"
-    if [[ -n "$h" ]]; then
-        printf '%s' "$h"
-        return 0
-    fi
-    printf 'unknown-host'
+    loom_host_id
 }
 
 resolve_published_host() {
     local raw
-    raw="$(resolve_host)"
+    raw="$(resolve_host)" || return 1
     if lease_publish_raw_hostname; then
         printf '%s' "$raw"
         return 0
@@ -887,7 +879,9 @@ cmd_start() {
             auto_sweep_id="${LOOM_TERMINAL_ID#daemon-}"
         fi
         if [[ -n "$auto_sweep_id" ]]; then
-            auto_host="$(resolve_published_host)"
+            # #10023: no identity -> leave auto_host empty (the documented
+            # "neither resolvable" fallback below); loom_host_id warned.
+            auto_host="$(resolve_published_host)" || auto_host=""
         fi
         if [[ -n "$auto_sweep_id" && -n "$auto_host" ]]; then
             host="$auto_host"

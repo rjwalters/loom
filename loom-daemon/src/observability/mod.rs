@@ -104,6 +104,7 @@ pub mod backfill;
 pub mod claude_code_telemetry;
 pub mod collector;
 pub mod daemon_event;
+pub mod daemon_lifecycle;
 pub mod endpoint_policy;
 pub mod eta;
 pub mod eta_snapshot;
@@ -968,6 +969,8 @@ pub fn spawn_task(
     let mut otlp_queues: Vec<Arc<DurableQueue>> = Vec::new();
     // The non-OTLP subset, for the `queue.snapshot` sink (Issue #8852).
     let mut native_queues: Vec<Arc<DurableQueue>> = Vec::new();
+    // Per-exporter export health for `daemon.heartbeat` (Issue #10023).
+    let mut health_sources: Vec<daemon_lifecycle::ExportHealthSource> = Vec::new();
     for (index, (entry, endpoint)) in planned.iter().enumerate() {
         let name = entry.kind.name();
         let queue_path = queue_path_for(&workspace_root, name, sole);
@@ -1080,6 +1083,11 @@ pub fn spawn_task(
                 }
             }
         };
+        health_sources.push(daemon_lifecycle::ExportHealthSource {
+            name: name.to_string(),
+            queue: queue.clone(),
+            status: export_status.clone(),
+        });
         statuses.insert(name.to_string(), export_status);
         if entry.kind == ExporterKind::Otlp {
             otlp_queues.push(queue.clone());
@@ -1147,6 +1155,17 @@ pub fn spawn_task(
     // `daemon_event`'s module doc for why it is a separate subscriber rather
     // than folded into `collector`.
     let daemon_event_handle = daemon_event::spawn_task(bus, fanout.clone(), host_id.clone());
+    // Lifecycle (Issue #10023): `daemon.start` now, `daemon.shutdown` from
+    // `shutdown::exit`, and a low-rate `daemon.heartbeat` carrying the
+    // per-exporter export health collected above.
+    daemon_lifecycle::start(fanout.clone(), host_id.clone(), daemon_started_at);
+    ops_handles.push(daemon_lifecycle::spawn_heartbeat(
+        fanout.clone(),
+        host_id.clone(),
+        health_sources,
+        daemon_lifecycle::resolve_heartbeat_interval(&workspace_root),
+        daemon_started_at,
+    ));
     let collector_handle = collector::spawn_task(
         bus,
         fanout,

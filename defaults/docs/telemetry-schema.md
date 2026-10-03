@@ -108,7 +108,7 @@ host's key file has been installed on a machine.
 
 **How the exporter uses it.** `loom-daemon`'s exporter compares this value
 against the identity the daemon resolved for itself (`$LOOM_HOST_ID`, else
-`$HOSTNAME`, else `hostname`) and on a disagreement logs a WARN **once per
+`fleet.hostId`, else the persisted `~/.loom/host-id` — #10023) and on a disagreement logs a WARN **once per
 daemon lifetime** and reports an `observability DEGRADED` section in
 `loom-daemon health`. Nothing about the export changes: the batch stays acked
 and the backend keeps filing under the key's binding, which remains

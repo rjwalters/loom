@@ -41,6 +41,7 @@ mod forge_identity_cmd;
 mod git_blob_lines;
 mod guard_mcp_tools;
 pub(crate) mod health;
+mod host_id_cmd;
 pub(crate) mod inflight;
 mod label_duplicates;
 pub(crate) mod labels_cmd;

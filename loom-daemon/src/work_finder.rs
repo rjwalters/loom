@@ -746,7 +746,7 @@ pub trait WorkDispatcher {
     /// [`declared_capabilities`](Self::declared_capabilities).
     ///
     /// Defaults to [`crate::sweep_registry::host_identity`] — the same
-    /// `$LOOM_HOST_ID` / `$HOSTNAME` / `hostname`-binary resolution every
+    /// `$LOOM_HOST_ID` / `fleet.hostId` / persisted-id resolution every
     /// other host-identity consumer in the daemon (peer-claim
     /// self-recognition, observability) already uses, so this feature can
     /// never disagree with them about what "this host" means. A test fake
