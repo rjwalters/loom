@@ -248,7 +248,6 @@ fi
 CODEX_HOME_ARG=""
 WORKSPACE_ARG=""
 BRIDGE_ARG=""
-RUNTIME_HOME_ARG=""
 MATCHER_ARG=""
 TIMEOUT_ARG=""
 JSON_OUT=0
@@ -266,7 +265,6 @@ while [[ $# -gt 0 ]]; do
         --workspace=*) WORKSPACE_ARG="${1#--workspace=}"; shift ;;
         --bridge) BRIDGE_ARG="${2:-}"; shift 2 || shift ;;
         --bridge=*) BRIDGE_ARG="${1#--bridge=}"; shift ;;
-        --runtime-codex-home) RUNTIME_HOME_ARG="${2:-}"; shift 2 || shift ;;
         --matcher) MATCHER_ARG="${2:-}"; shift 2 || shift ;;
         --matcher=*) MATCHER_ARG="${1#--matcher=}"; shift ;;
         --timeout) TIMEOUT_ARG="${2:-}"; shift 2 || shift ;;
