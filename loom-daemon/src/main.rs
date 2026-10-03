@@ -1065,6 +1065,14 @@ enum Commands {
         action: cli::overlap_replay::OverlapReplayCommand,
     },
 
+    /// Content-addressed retrieval cache (#9783): `context fetch | status |
+    /// export | import | replay | recover`. Nested family; args live in
+    /// `cli::context` because this file is frozen by the ratchet.
+    Context {
+        #[command(subcommand)]
+        action: cli::context::ContextCommand,
+    },
+
     /// Lease the liveness of a `loom:building` claim (#8193). The args and
     /// their docs live in `cli::lease_ensure` because this file is frozen by
     /// the file-size ratchet.
@@ -2352,6 +2360,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         }
         Commands::ScriptPorts(cmd) => cmd.run(),
         Commands::OverlapReplay { action } => action.run(),
+        Commands::Context { action } => action.run(),
         Commands::Lease { action } => action.run(),
         Commands::Inflight { action } => action.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),

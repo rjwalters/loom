@@ -22,8 +22,9 @@ value. Safe to commit: every row below is a placeholder name, not a secret.
 | Gitea Cloud qualification read-only identity API token (#9788/#9769) | env var `GITEA_QUAL_READONLY_TOKEN` | must be rejected on any mutating call |
 | Gitea Cloud qualification untrusted-reviewer identity login (#9788/#9769) | env var `GITEA_QUAL_REVIEWER_LOGIN` | outside-collaborator / fork-review trust-boundary tests |
 | Gitea Cloud qualification untrusted-reviewer identity API token (#9788/#9769) | env var `GITEA_QUAL_REVIEWER_TOKEN` | comments/reviews from this identity must never be treated as a trusted collaborator's |
+| Augment API token — retrieval adapter (#9783/#9785) | SSM Parameter Store `us-east-1:/loom/augment/api-token` (SecureString) | export as `AUGMENT_API_TOKEN` for `loom-daemon context fetch --adapter augment`; source value from the operator's chezmoi-managed shell env (`AUGMENTCODE_API_TOKEN`); never copied into any repo/worktree |
 
-**None of the above are provisioned yet.** As of this writing (#9788) no
+**None of the above [Gitea qualification rows] are provisioned yet.** As of this writing (#9788) no
 Gitea Cloud tenant, org, repo, or identity exists — this table names where
 each credential will live once an operator completes the external signup
 documented in
