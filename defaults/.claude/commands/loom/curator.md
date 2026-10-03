@@ -7,6 +7,7 @@ You are an issue curator who maintains and enhances the quality of GitHub issues
 
 - [Your Role](#your-role)
 - [⚠️ `--body @path` Does NOT Expand — It Posts the Literal String](#---body-path-does-not-expand--it-posts-the-literal-string)
+- [GraphQL Budget: REST Reads/Writes, Two-Pool Check, Max ~3 Curators (#10039)](#graphql-budget-rest-readswrites-two-pool-check-max-3-curators-10039)
 - [Argument Handling](#argument-handling)
 - [Label Workflow](#label-workflow)
 - [Exception: Explicit User Instructions](#exception-explicit-user-instructions)
@@ -49,6 +50,15 @@ scratch file, `--body @path` (and `gh api -f body=@path`) posts the literal
 string `@path`, not the file's contents — this exact failure mode has hit
 Curator comments in production. **Full pitfall, incident citation, and
 fixes**: [`comment-body-literal-path.md`](comment-body-literal-path.md).
+
+## GraphQL Budget: REST Reads/Writes, Two-Pool Check, Max ~3 Curators (#10039)
+
+`gh issue view/edit/close` cost ~8-10 GraphQL requests per issue from the one
+5,000/hour pool the whole fleet shares. Use REST (`gh api repos/{owner}/{repo}/issues/N ...`)
+for per-issue reads, label add/remove, body edit and close; check BOTH pools
+(`gh api rate_limit` core and `gh api graphql -f query='{rateLimit{remaining}}'`)
+before claiming each issue and back off below 500; run at most ~3 Curators in
+parallel. Recipes, thresholds, measurement: [`curator-rate-budget.md`](curator-rate-budget.md).
 
 ## Argument Handling
 
@@ -2177,38 +2187,9 @@ Every curated issue MUST have an `## Affected Files` section listing files/compo
 
 #### How to Add Missing Sections
 
-When enhancing an issue, check for these sections. If missing, ADD them:
-
-```bash
-# 1. Read current issue
-gh issue view 100 --comments
-
-# 2. Research codebase for affected files
-rg "relevant_pattern" --type py --files-with-matches
-rg "function_name" --type ts -l
-
-# 3. Add enhancement with required sections
-./.loom/scripts/post-comment.sh 100 --body "$(cat <<'EOF'
-## Implementation Guidance
-
-[Your technical analysis...]
-
-## Affected Files
-
-- `src/module/file.ts` - Add new validation logic
-- `tests/module/file.test.ts` - Add test cases for validation
-
-## Test Plan
-
-- [ ] Manual verification: Run the feature and verify [expected behavior]
-- [ ] Automated tests: Add tests in `tests/module/file.test.ts`
-- [ ] Integration test: Verify end-to-end flow works correctly
-EOF
-)"
-
-# 4. Mark as curated
-gh issue edit 100 --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"
-```
+If a section is missing, read the issue, research the code (`rg`), post the
+missing sections via `./.loom/scripts/post-comment.sh <N> --body-file <file>`,
+then mark it curated (`loom:curating`/`loom:triage` off, `loom:curated` on).
 
 ## Working Style
 
@@ -2258,35 +2239,10 @@ with Approach / Pros / Cons / Complexity / Dependencies, then a
 linking anything an option depends on.
 
 ### Missing Test Plan & File Refs → Complete Enhancement
-```markdown
-Issue: "Fix terminal output truncation bug"
 
-Original (missing key sections):
-- Has problem description: "Output gets cut off"
-- Has acceptance criteria checkboxes
-- Missing: Test Plan, Affected Files
-
-Added enhancement:
----
-## Implementation Guidance
-
-The issue is in the output buffer management. When the buffer exceeds
-MAX_LINES, the truncation logic has an off-by-one error.
-
-## Affected Files
-
-- `src/terminal/buffer.ts` - Fix truncation boundary calculation in `trimBuffer()`
-- `src/terminal/buffer.test.ts` - Add test for boundary condition
-- `src/constants.ts` - MAX_LINES constant definition (reference only)
-
-## Test Plan
-
-- [ ] Manual verification: Generate output exceeding MAX_LINES, verify last line is complete
-- [ ] Automated tests: Add test case in `buffer.test.ts` for exact boundary
-- [ ] Edge cases: Test with MAX_LINES-1, MAX_LINES, MAX_LINES+1 line counts
----
-
-```
+Post a comment adding `## Implementation Guidance`, `## Affected Files` (one
+bullet per file with the change) and `## Test Plan` (manual / automated / edge
+cases) -- the same three sections described under "Issue Quality Checklist".
 
 ### Blocked Issue Re-check → Silent Skip vs. Real Comment
 
