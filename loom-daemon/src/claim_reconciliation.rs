@@ -1841,7 +1841,7 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
     let workspace_registry =
         crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
-    let gh_bin = std::path::PathBuf::from("gh");
+    let gh_bin = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
     let pass_kind = if is_startup { "startup" } else { "periodic" };
     let pass_loop::ReconciliationPassStats {
         total_checked,
