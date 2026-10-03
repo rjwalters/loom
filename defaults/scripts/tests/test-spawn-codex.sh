@@ -1127,7 +1127,7 @@ READY_PROFILE="$(mk_hook_profile ready)"
 # copy also exists (see #4787), spuriously reporting hooks=not-ready.
 bash "$PROVISION_SCRIPT" install --codex-home "$READY_PROFILE" \
     --workspace "$LOOM_WORKSPACE" >/dev/null 2>&1
-printf 'hooks.state."loom".trusted_hash = "deadbeef"\n' > "$READY_PROFILE/config.toml"
+printf '[hooks.state."%s/hooks.json:pre_tool_use:0:0"]\ntrusted_hash = "deadbeef"\n' "$(cd -P "$READY_PROFILE" && pwd -P)" > "$READY_PROFILE/config.toml"
 
 BARE_PROFILE="$(mk_hook_profile bare)"
 
@@ -1158,7 +1158,7 @@ run_preflight 78 "builder + installed-but-untrusted profile -> exit 78" \
 STALE_PROFILE="$(mk_hook_profile stale)"
 bash "$PROVISION_SCRIPT" install --codex-home "$STALE_PROFILE" \
     --workspace "$LOOM_WORKSPACE" --bridge "$BRIDGE_SCRIPT" >/dev/null 2>&1
-printf 'hooks.state."loom".trusted_hash = "deadbeef"\n' > "$STALE_PROFILE/config.toml"
+printf '[hooks.state."%s/hooks.json:pre_tool_use:0:0"]\ntrusted_hash = "deadbeef"\n' "$(cd -P "$STALE_PROFILE" && pwd -P)" > "$STALE_PROFILE/config.toml"
 jq '(.hooks.PreToolUse[].hooks[] | select(.command | contains("guard-codex-bridge.sh")) | .command) |= (. + " --tampered")' \
     "$STALE_PROFILE/hooks.json" > "$STALE_PROFILE/hooks.tmp" \
     && mv "$STALE_PROFILE/hooks.tmp" "$STALE_PROFILE/hooks.json"

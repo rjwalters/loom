@@ -916,8 +916,9 @@ fi
 # Roles are therefore split by whether they mutate:
 #
 #   MUTABLE roles (builder, doctor) MUST prove the managed hook is installed at
-#   the expected version, pinned, readable, points at THIS workspace's bridge,
-#   and that the profile has established Codex hook trust. Any failure exits 78
+#   the expected version, pinned, that THIS workspace has a readable bridge for
+#   the workspace-independent entry to run (#9390), and that the profile has
+#   established Codex hook trust. Any failure exits 78
 #   BEFORE the CLI starts. `--dangerously-bypass-hook-trust` is never passed —
 #   #4495's scope guards forbid it, and waiving trust would defeat the very
 #   boundary this preflight exists to prove.
@@ -996,8 +997,12 @@ elif [[ -z "${CODEX_HOME:-}" ]]; then
     _hook_reason="ambient Codex login state (no Loom-managed profile selected)"
 else
     _hook_verify_out=""
-    if _hook_verify_out="$(bash "$_hook_provisioner" verify \
-            --codex-home "$CODEX_HOME" --workspace "$WORKSPACE" --json 2>/dev/null)"; then
+    # Codex keys hook trust by the hooks.json path under the CODEX_HOME it runs
+    # with, so name where THIS launch runs, never the derived default (#9390).
+    _hook_runtime_home="/home/loom/.codex-profile"
+    [[ "$CODEX_SESSION_EXEC" == "true" ]] || _hook_runtime_home="$(cd -P -- "$CODEX_HOME" 2>/dev/null && pwd -P)" || _hook_runtime_home="$CODEX_HOME"
+    if _hook_verify_out="$(bash "$_hook_provisioner" verify --codex-home "$CODEX_HOME" \
+            --workspace "$WORKSPACE" --runtime-codex-home "$_hook_runtime_home" --json 2>/dev/null)"; then
         _hook_status="ready"
     else
         _hook_status="not-ready"
