@@ -60,6 +60,7 @@ mod guard_mcp_tools;
 mod guards_status;
 pub(crate) mod health;
 pub(crate) mod host;
+mod host_id_cmd;
 pub(crate) mod inflight;
 mod install_binary;
 pub(crate) mod install_compat_cli;

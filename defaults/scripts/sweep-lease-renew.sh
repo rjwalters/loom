@@ -396,10 +396,13 @@ lease_publish_raw_hostname() {
     esac
 }
 
+# --- Host identity: asked of `loom-daemon host-id` (#10023), never re-derived
+# here, so this script and the daemon cannot disagree. `${LOOM_HOST_ID:-
+# unknown-host}` is only the fallback for a binary without that subcommand.
 resolve_host() {
-    local h="${LOOM_HOST_ID:-${HOSTNAME:-}}"
-    [[ -n "$h" ]] || h="$(hostname 2> /dev/null || true)"
-    printf '%s' "${h:-unknown-host}"
+    local h
+    h="$("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" host-id 2>/dev/null)" || h=""
+    printf '%s' "${h:-${LOOM_HOST_ID:-unknown-host}}"
 }
 
 resolve_published_host() {

@@ -579,6 +579,10 @@ pub(crate) enum ScriptPortCommand {
     /// `shell-budget`.
     #[command(subcommand)]
     MergeGroupCi(super::merge_group_ci_cmd::MergeGroupCiCommand),
+    /// This host's identity (#10023): `LOOM_HOST_ID` > `fleet.hostId` > the
+    /// persisted `~/.loom/host-id`. Backs every shell exporter's `host_id`,
+    /// so scripts and the daemon can never disagree. Exit 0 always.
+    HostId(super::host_id_cmd::HostIdArgs),
 }
 
 impl ScriptPortCommand {
@@ -658,6 +662,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ForgeProbe(args) => args.run(),
             ScriptPortCommand::ResyncPin(cmd) => cmd.run(),
             ScriptPortCommand::ResyncPayload(args) => args.run(),
+            ScriptPortCommand::HostId(args) => args.run(),
         }
     }
 }
