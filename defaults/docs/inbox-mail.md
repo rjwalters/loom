@@ -12,10 +12,11 @@ source; the full both-legs send (inbox + Matrix) stays in
   both call it. `POST /api/inbox` is idempotent on `key`, so re-sending is safe.
 - **Resolve** with the same key: `POST /api/inbox` `{key, resolve: true}`.
 - **Resolve on a merge nobody announced**: `inbox_mail resolve-merged KIND MARKER`
-  resolves KIND mail for every PR merged in the last 24h that carries a
+  resolves KIND mail for every PR merged in the last 48h that carries a
   `MARKER` comment, whoever merged it (a human, the GitHub UI, `merge-pr.sh`).
-  It costs one `gh pr list` and re-resolving is idempotent. A forged marker can
-  only resolve a mail for a PR that is already merged.
+  It costs one `gh pr list` (a `merged:>=` search, not creation order) and
+  re-resolving is idempotent. A forged marker can only resolve a mail for a PR
+  that is already merged.
 - **No-op when unconfigured**: `LOOM_UI_INBOX_URL` or `LOOM_UI_INGEST_KEY` unset
   prints one note and returns 0, with no forge read. `inbox_mail on` is the same
   test (status only), for gating a caller's own reads. A failed POST warns and
@@ -44,9 +45,13 @@ inbox_mail() {
     echo "inbox not configured — mail $mode skipped (key $key)"; return 0
   fi
   if [ "$mode" = resolve-merged ]; then
-    gh pr list --state merged --limit 30 --json number,mergedAt,comments 2>/dev/null |
-      jq -r --arg m "$body" '.[] | select((.mergedAt|fromdateiso8601) > now - 86400)
-        | select(any(.comments[]?; .body | contains($m))) | .number' 2>/dev/null |
+    # Filter on merge date in the query: plain --limit orders by creation, and a
+    # held PR is usually days old when it merges. GNU date, then BSD date.
+    r=$(date -u -d '-2 days' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-2d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+    [ -n "$r" ] || { echo "inbox mail: no date, resolve-merged skipped"; return 0; }
+    out=$(gh pr list --state merged --limit 100 --search "merged:>=$r" --json number,comments 2>/dev/null)
+    [ "$(jq length <<<"$out" 2>/dev/null)" = 100 ] && echo "inbox mail: 100 merges in 48h, window truncated"
+    jq -r --arg m "$body" '.[] | select(any(.comments[]?; .body | contains($m))) | .number' <<<"$out" 2>/dev/null |
       while read -r n; do inbox_mail resolve "$(inbox_mail key "$key" "$n")"; done
     return 0
   fi

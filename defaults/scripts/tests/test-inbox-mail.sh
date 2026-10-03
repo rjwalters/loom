@@ -26,20 +26,24 @@ while [ $# -gt 0 ]; do [ "$1" = --data-binary ] && { cat "${2#@}" >>"$STUB_LOG";
 sed 's/^/config: /' >>"$STUB_LOG"
 printf '{}\n%s' "${STUB_CODE:-200}"; exit "${STUB_RC:-0}"
 STUB
-# gh stub: `pr list --state merged` returns $GH_FIXTURE.
+# gh stub: honours the `merged:>=DATE` search like the forge does; no such
+# qualifier -> [] (so a query without the date filter finds nothing).
 cat >"$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 echo "gh $*" >>"$GH_LOG"
-cat "$GH_FIXTURE"
+since=; while [ $# -gt 0 ]; do [ "$1" = --search ] && since=$(sed -n 's/.*merged:>=\([^ ]*\).*/\1/p' <<<"$2"); shift; done
+[ -n "$since" ] || { echo '[]'; exit 0; }
+jq --arg s "$since" '[.[] | select(.mergedAt >= $s)]' "$GH_FIXTURE" 2>/dev/null || cat "$GH_FIXTURE"
 STUB
 chmod +x "$T/bin/curl" "$T/bin/gh"
 export PATH="$T/bin:$PATH" STUB_LOG="$T/log" GH_LOG="$T/ghlog" GH_FIXTURE="$T/prs.json"
 # shellcheck disable=SC1091
 . "$T/fn.sh"
 
-now=$(date -u +%Y-%m-%dT%H:%M:%SZ); old=$(date -u -d '-3 days' +%Y-%m-%dT%H:%M:%SZ)
+now=$(date -u +%Y-%m-%dT%H:%M:%SZ); old=$(date -u -d '-4 days' +%Y-%m-%dT%H:%M:%SZ); held=$(date -u -d '-30 hours' +%Y-%m-%dT%H:%M:%SZ)
 M='<!-- champion:critical-file-hold -->'
-jq -n --arg now "$now" --arg old "$old" --arg m "$M" '[
+jq -n --arg now "$now" --arg old "$old" --arg held "$held" --arg m "$M" '[
+  {number: 10, mergedAt: $held, comments: [{body: $m}]},
   {number: 11, mergedAt: $now, comments: [{body: ("## hold\n" + $m)}]},
   {number: 12, mergedAt: $now, comments: [{body: "unrelated"}]},
   {number: 13, mergedAt: $old, comments: [{body: $m}]}]' >"$GH_FIXTURE"
@@ -76,9 +80,11 @@ out=$(STUB_CODE=500 STUB_RC=22 inbox_mail send k2 body); rc=$?
 # Human-merge path: a held PR merged outside Champion gets its mail resolved.
 : >"$STUB_LOG"; : >"$GH_LOG"
 (cd "$T/issue-77" && inbox_mail resolve-merged crithold-pr "$M" >/dev/null); rc=$?
-{ [ $rc -eq 0 ] && grep -q 'pr list --state merged' "$GH_LOG" \
-  && [ "$(grep -c called "$STUB_LOG")" = 1 ] && grep -q '"key": "mail-widgets-crithold-pr-11"' "$STUB_LOG" \
-  && grep -q '"resolve": true' "$STUB_LOG"; } && ok "resolve-merged: only recent held PR #11 resolved" || bad "resolve-merged selection"
+grep -Eq 'pr list --state merged --limit 100 --search merged:>=[0-9]{4}-[0-9]{2}-[0-9]{2}T' "$GH_LOG" \
+  && ok "resolve-merged: query filters on merge date (merged:>=)" || bad "resolve-merged query: $(cat "$GH_LOG")"
+{ [ $rc -eq 0 ] && [ "$(grep -c called "$STUB_LOG")" = 2 ] \
+  && grep -q '"key": "mail-widgets-crithold-pr-10"' "$STUB_LOG" && grep -q '"key": "mail-widgets-crithold-pr-11"' "$STUB_LOG" \
+  && [ "$(grep -c '"resolve": true' "$STUB_LOG")" = 2 ]; } && ok "resolve-merged: held PRs #10 (30h) and #11 resolved; old/unmarked skipped" || bad "resolve-merged selection"
 echo 'not json' >"$GH_FIXTURE"; (inbox_mail resolve-merged crithold-pr "$M" >/dev/null) && ok "resolve-merged: bad gh output non-fatal" || bad "resolve-merged rc"
 
 # The hold file's loader, run where the doc is missing: defines a no-op, `on` false.
