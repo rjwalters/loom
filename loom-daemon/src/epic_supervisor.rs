@@ -1307,9 +1307,10 @@ pub mod forge {
             // ETag-cached REST listing (#4428): unchanged epic sets cost zero
             // rate limit (304). REST reports state lowercase (`"open"` vs
             // GraphQL's `"OPEN"`) — `EpicSnapshot::is_open` compares
-            // case-insensitively, so both forms are safe. The `pull_request`
-            // filter keeps the pre-#4428 issue-only semantics.
-            let rows = crate::forge_listing::list_issues_cached_as(
+            // case-insensitively, so both forms are safe. The issues-only
+            // listing keeps the pre-#4428 semantics (#9929: PR rows must
+            // never reach an issue-targeting consumer).
+            let rows = crate::forge_listing::list_issues_only_cached_as(
                 "epic_supervisor",
                 &self.gh_bin,
                 self.cwd.as_deref(),
@@ -1319,7 +1320,6 @@ pub mod forge {
             )?;
             Ok(rows
                 .into_iter()
-                .filter(|r| !r.is_pull_request)
                 .map(|r| GhIssue {
                     number: r.number,
                     // REST `body` is nullable; the GraphQL-era parse defaulted
