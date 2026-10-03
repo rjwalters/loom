@@ -730,6 +730,15 @@ pub enum ForgeCmd {
         label: Option<String>,
         json: bool,
     },
+    /// `forge star <number> --direction D [--unstar] [--by NAME]` — apply or
+    /// remove the star on the operator's direction, with an audit comment
+    /// ([`crate::forge_star`], #9974).
+    Star {
+        number: u32,
+        direction: String,
+        unstar: bool,
+        by: Option<String>,
+    },
     /// `forge pr-congestion [--json] [--max-open N] [--max-points N]` — the
     /// #9063 **Phase 1** congestion signal, report-only: approved-queue depth,
     /// story points awaiting merge, and a path-disjoint bundle estimate over
@@ -856,6 +865,12 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
         ForgeCmd::Starred { kind, label, json } => {
             crate::forge_starred::handle(&kind, label.as_deref(), json)
         }
+        ForgeCmd::Star {
+            number,
+            direction,
+            unstar,
+            by,
+        } => crate::forge_star::handle(number, &direction, unstar, by.as_deref()),
         ForgeCmd::PrCongestion {
             json,
             max_open,

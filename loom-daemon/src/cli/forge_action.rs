@@ -115,6 +115,29 @@ pub(crate) enum ForgeAction {
         json: bool,
     },
 
+    /// `forge star <number> --direction "<operator's words>" [--unstar]` —
+    /// apply or remove `loom:operator-priority` ON THE OPERATOR'S EXPLICIT
+    /// DIRECTION, never on the agent's own judgment (#9974). Posts a
+    /// loom-ui-intent-shaped audit comment quoting the direction, which also
+    /// records starred-at; a repeat writes nothing. Exits `3` on Gitea.
+    #[command(name = "star")]
+    Star {
+        /// Issue or PR number.
+        number: u32,
+
+        /// The operator's direction being executed (required, quoted).
+        #[arg(long)]
+        direction: String,
+
+        /// Remove the star instead of adding it.
+        #[arg(long)]
+        unstar: bool,
+
+        /// Executing agent's name for the comment (default `$LOOM_ROLE`).
+        #[arg(long)]
+        by: Option<String>,
+    },
+
     /// `forge check-claim <issue> [--force-claim]` — the aggregated
     /// pre-flight claim-CAS probe (#9453 Phase 1): "may I claim issue N
     /// **right now**?" Four legs, cheapest-first, short-circuiting on the
@@ -635,6 +658,17 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             max_points,
         },
         ForgeAction::Starred { kind, label, json } => ForgeCmd::Starred { kind, label, json },
+        ForgeAction::Star {
+            number,
+            direction,
+            unstar,
+            by,
+        } => ForgeCmd::Star {
+            number,
+            direction,
+            unstar,
+            by,
+        },
         ForgeAction::CheckClaim { issue, force_claim } => {
             ForgeCmd::CheckClaim { issue, force_claim }
         }
