@@ -127,3 +127,40 @@ fn snapshot_and_complexity_reads_are_counted() {
     assert_eq!(body, None);
     assert_eq!(calls(&rows, "model.issue_body"), 1, "{rows:?}");
 }
+
+// ---- #10089 increment 3: daemon tick readers + sweep_registry family ----
+
+#[test]
+fn watch_probe_is_counted_and_keeps_its_classification() {
+    use crate::watch_registry::{GhWatchProbe, WatchKind, WatchOutcome, WatchProbe, WatchSpec};
+    let tmp = tempfile::tempdir().unwrap();
+    let closed = stub(tmp.path(), "gh-closed", r#"echo '{"state":"CLOSED","labels":[]}'"#);
+    let failing = stub(tmp.path(), "gh-fail", "echo boom >&2; exit 1");
+    let spec = WatchSpec {
+        id: "watch-issue-9".to_string(),
+        kind: WatchKind::Issue,
+        number: 9,
+        repo: None,
+        workspace_root: Some(tmp.path().to_string_lossy().into_owned()),
+        note: None,
+        registered_at: chrono::Utc::now(),
+    };
+    let (mut ok, mut failed) = (None, None);
+    let rows = rows_after(|| {
+        ok = Some(
+            GhWatchProbe::new()
+                .with_gh_bin(closed)
+                .probe(&spec)
+                .unwrap(),
+        );
+        failed = Some(
+            GhWatchProbe::new()
+                .with_gh_bin(failing)
+                .probe(&spec)
+                .is_err(),
+        );
+    });
+    assert_eq!(ok, Some(Some(WatchOutcome::Closed)));
+    assert_eq!(failed, Some(true), "a non-zero exit stays an error");
+    assert_eq!(calls(&rows, "watch.view"), 2, "{rows:?}");
+}
