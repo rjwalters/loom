@@ -720,24 +720,7 @@ impl MergeLookup for CachedMergeLookup {
 /// caller turns into "unavailable", never into "not merged".
 #[must_use]
 pub fn gh_pr_merged(repo: &str, pr: u32) -> Option<bool> {
-    let crate::cmd_out::CmdOutcome::Ran(output) = crate::gh_invocation::GhInvocation::new(
-        crate::gh_invocation::Operation::new("pr.view"),
-        crate::gh_invocation::AccessIntent::Read,
-        crate::gh_invocation::GhTarget::repo(repo).unwrap_or(crate::gh_invocation::GhTarget::None),
-        std::time::Duration::from_secs(60),
-    )
-    .args([
-        "pr",
-        "view",
-        &pr.to_string(),
-        "--repo",
-        repo,
-        "--json",
-        "mergedAt",
-    ])
-    .run() else {
-        return None;
-    };
+    let output = crate::gh_state_probe::pr_merged_at_output(repo, pr)?;
     if !output.status.success() {
         return None;
     }
