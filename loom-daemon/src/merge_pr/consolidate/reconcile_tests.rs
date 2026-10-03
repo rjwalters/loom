@@ -1,16 +1,49 @@
 //! End-to-end tests for `consolidate-reconcile` (#9689): the real
 //! orchestration against a stub `gh` (state kept in files, every call logged)
 //! and a real git repository for the ancestry proof.
+//!
+//! The stub is installed as `LOOM_GH_BIN`: `reconcile` spawns `gh` only
+//! through the `gh_invocation` facade (#9985), which resolves the program
+//! itself and takes no per-call override. Every test that runs it is therefore
+//! `#[serial(loom_config_env)]` — the crate's one writer group for
+//! `LOOM_GH_BIN` (#8465/#8480) — and holds the variable only while the stub
+//! actually runs ([`StubGh`]).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
+use crate::gh_invocation::ParentContext;
 use crate::merge_pr::consolidate::{
     construct, mapping_body, remove_worktree, reservation_comment_body, reservation_marker,
     ComponentState,
 };
+use crate::proc_exec::ExecError;
+use serial_test::serial;
+use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::process::Command;
+
+/// `LOOM_GH_BIN` pointed at the stub while alive; the prior value is restored
+/// on drop, so a panicking assertion cannot leak the stub into a later test.
+struct StubGh(Option<OsString>);
+
+impl StubGh {
+    fn install(gh: &Path) -> Self {
+        let prior = std::env::var_os("LOOM_GH_BIN");
+        std::env::set_var("LOOM_GH_BIN", gh);
+        Self(prior)
+    }
+}
+
+impl Drop for StubGh {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(v) => std::env::set_var("LOOM_GH_BIN", v),
+            None => std::env::remove_var("LOOM_GH_BIN"),
+        }
+    }
+}
 
 const CANDIDATE: u32 = 99;
 const ATTEMPT: &str = "cons-ab12cd34";
@@ -72,6 +105,9 @@ struct Fixture {
     /// A head created after construction — never an ancestor of the candidate.
     late: String,
     candidate_head: String,
+    /// A commit ON TOP of the recorded candidate head (a base merged in at
+    /// landing): a landed head that still contains the recorded one.
+    landed_descendant: String,
 }
 
 impl Fixture {
@@ -111,6 +147,7 @@ impl Fixture {
             construct("git", &repo, &worktree, &base, &[(10, &a), (12, &b)]).unwrap();
         remove_worktree("git", &repo, &worktree);
         let late = commit("late", &base, "late.txt");
+        let landed_descendant = commit("landed", &candidate_head, "landed.txt");
 
         let gh = tmp.path().join("fake-gh.sh");
         let script = FAKE_GH
@@ -122,18 +159,29 @@ impl Fixture {
         // retries): a concurrent test thread that forked while this script's
         // write fd was open holds it until its exec, and Linux refuses to
         // exec the script meanwhile. Wait that out here, so the run under test
-        // never sees "Text file busy". The probe's log line is cleared.
-        for _ in 0..100 {
-            match Command::new(&gh)
-                .arg("--probe")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-            {
-                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+        // never sees "Text file busy". The probe's log line is cleared. It
+        // spawns through the facade too (#9985), which keeps the spawn error's
+        // `io::ErrorKind`.
+        {
+            let _stub = StubGh::install(&gh);
+            for _ in 0..100 {
+                let probe = GhInvocation::new(
+                    Operation::new("test.probe"),
+                    AccessIntent::Read,
+                    GhTarget::None,
+                    std::time::Duration::from_secs(10),
+                )
+                .parent(ParentContext::Missing)
+                .args(["--probe"])
+                .execute();
+                match probe {
+                    Err(ExecError::Spawn(e))
+                        if e.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    _ => break,
                 }
-                _ => break,
             }
         }
         let _ = std::fs::remove_file(state.join("log"));
@@ -146,6 +194,7 @@ impl Fixture {
             b,
             late,
             candidate_head,
+            landed_descendant,
         }
     }
 
@@ -161,6 +210,7 @@ impl Fixture {
             "state": "MERGED",
             "body": body,
             "headRefName": format!("loom/consolidated/{ATTEMPT}"),
+            "headRefOid": self.candidate_head,
             "mergeCommit": {"oid": MERGE_SHA},
         });
         self.put("cand.json", &cand.to_string());
@@ -193,8 +243,22 @@ impl Fixture {
         }
     }
 
+    fn try_run(&self) -> Result<ReconcileReport> {
+        let _stub = StubGh::install(&self.gh);
+        reconcile("git", &self.repo, CANDIDATE)
+    }
+
     fn run(&self) -> ReconcileReport {
-        reconcile(&self.gh, "git", &self.repo, CANDIDATE).unwrap()
+        self.try_run().unwrap()
+    }
+
+    /// Rewrite the seeded candidate's landed head (`headRefOid`).
+    fn set_landed_head(&self, head: &str) {
+        let mut cand: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(self.state.join("cand.json")).unwrap())
+                .unwrap();
+        cand["headRefOid"] = serde_json::Value::String(head.to_string());
+        self.put("cand.json", &cand.to_string());
     }
 
     fn log(&self) -> Vec<String> {
@@ -234,6 +298,7 @@ impl Fixture {
 }
 
 #[test]
+#[serial(loom_config_env)]
 fn a_full_run_reconciles_every_step_and_a_restart_writes_nothing() {
     let f = Fixture::new();
     f.seed(&[(10, &f.a), (12, &f.b)]);
@@ -269,6 +334,7 @@ fn a_full_run_reconciles_every_step_and_a_restart_writes_nothing() {
 }
 
 #[test]
+#[serial(loom_config_env)]
 fn an_unverified_component_stays_open_and_untouched() {
     let f = Fixture::new();
     // #14's pinned head is NOT an ancestor of the recorded candidate head.
@@ -291,6 +357,7 @@ fn an_unverified_component_stays_open_and_untouched() {
 }
 
 #[test]
+#[serial(loom_config_env)]
 fn reconciliation_never_releases_a_reservation() {
     // ADR-0023 §4 (revised 2026-10-01): the ordering pass is the ONE releaser
     // on landing. Reconciliation removes no label and posts no release
@@ -321,6 +388,7 @@ fn reconciliation_never_releases_a_reservation() {
 }
 
 #[test]
+#[serial(loom_config_env)]
 fn a_source_pushed_after_landing_is_left_untouched_open() {
     // ADR-0023 §6.2: the landed pin is on main, the newer commits are not.
     // Past the abort point, so not an abort: status `untouched-open`, the PR
@@ -348,6 +416,7 @@ fn a_source_pushed_after_landing_is_left_untouched_open() {
 }
 
 #[test]
+#[serial(loom_config_env)]
 fn an_unmerged_candidate_is_refused_without_any_write() {
     let f = Fixture::new();
     f.seed(&[(10, &f.a), (12, &f.b)]);
@@ -356,9 +425,57 @@ fn an_unmerged_candidate_is_refused_without_any_write() {
         &serde_json::json!({"state": "OPEN", "body": "", "headRefName": "x", "mergeCommit": null})
             .to_string(),
     );
-    let err = reconcile(&f.gh, "git", &f.repo, CANDIDATE).unwrap_err();
+    let err = f.try_run().unwrap_err();
     assert!(err.to_string().contains("land it first"), "{err}");
     assert!(f.writes().is_empty(), "{:?}", f.writes());
+}
+
+#[test]
+#[serial(loom_config_env)]
+fn a_candidate_that_landed_without_its_recorded_head_is_refused_without_any_write() {
+    // Every component IS an ancestor of the recorded head, so the per-
+    // component proof alone would pass. But the candidate landed at a head
+    // that does not contain the recorded one (rewritten after preparation):
+    // the proof says nothing about what landed, so nothing may be closed.
+    let f = Fixture::new();
+    f.seed(&[(10, &f.a), (12, &f.b)]);
+    f.set_landed_head(&f.late);
+
+    let err = f.try_run().unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("does not contain the head recorded"), "{msg}");
+    assert!(msg.contains(&f.late) && msg.contains(&f.candidate_head), "{msg}");
+    assert!(f.writes().is_empty(), "a refused landing wrote: {:?}", f.writes());
+    for n in [10, 12] {
+        assert_eq!(f.state_of(&format!("pr-{n}.state")), "OPEN");
+        assert_eq!(f.state_of(&format!("issue-{}.state", 500 + n)), "OPEN");
+    }
+}
+
+#[test]
+#[serial(loom_config_env)]
+fn a_candidate_whose_landed_head_is_withheld_is_refused_without_any_write() {
+    let f = Fixture::new();
+    f.seed(&[(10, &f.a), (12, &f.b)]);
+    f.set_landed_head("");
+
+    let err = f.try_run().unwrap_err();
+    assert!(err.to_string().contains("headRefOid"), "{err}");
+    assert!(f.writes().is_empty(), "{:?}", f.writes());
+}
+
+#[test]
+#[serial(loom_config_env)]
+fn a_landed_head_that_descends_from_the_recorded_one_reconciles() {
+    // Ancestry, not equality: a base merged into the candidate at landing
+    // keeps the recorded head (and so every included pin) in the landed tree.
+    let f = Fixture::new();
+    f.seed(&[(10, &f.a), (12, &f.b)]);
+    f.set_landed_head(&f.landed_descendant);
+
+    let report = f.run();
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.closed_prs, 2, "{report:?}");
 }
 
 #[test]

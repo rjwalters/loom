@@ -248,10 +248,11 @@ impl ConsolidateReconcileArgs {
         // honor GH_REPO, not a `--repo` flag.
         scope_repo(self.repo.as_deref());
         let root = std::env::current_dir()?;
-        let gh = std::path::PathBuf::from(cons::gh_bin_env());
         // The orchestration lives in the library so it runs under test
-        // end-to-end (restart, unverified component, pushed source).
-        let report = cons::reconcile::reconcile(&gh, "git", &root, self.pr)?;
+        // end-to-end (restart, unverified component, pushed source). It spawns
+        // `gh` through the `gh_invocation` facade, which resolves the program
+        // itself (`loom_daemon::gh_invocation::gh_bin()`'s ladder, #9985).
+        let report = cons::reconcile::reconcile("git", &root, self.pr)?;
         println!("{}", report.summary());
         if !report.unverified.is_empty() {
             eprintln!(
