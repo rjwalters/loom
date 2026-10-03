@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # check-labels-drift.sh - Fail if the two label registries drift apart.
+# requires-daemon: labels optional        probes `labels --help`; degrades to the plain diff check when absent
 #
 # Why (#3896): Loom ships the label registry in TWO places —
 #   - <root>/.github/labels.yml          (this repo's live label registry)
