@@ -471,3 +471,7 @@ mod migrated_sites_tests;
 #[cfg(test)]
 #[path = "migrated_sites_tests_b.rs"]
 mod migrated_sites_tests_b;
+
+#[cfg(test)]
+#[path = "migrated_sites_tests_c.rs"]
+mod migrated_sites_tests_c;

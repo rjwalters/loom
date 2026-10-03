@@ -21,10 +21,7 @@ src/fleet_store/gh.rs | let mut cmd = Command::new(&self.gh_bin);
 src/forge_cmd.rs | pub(crate) fn gh_bin() -> String {
 src/forge_comment.rs | let mut child = std::process::Command::new(gh_bin)
 src/forge_comment.rs | let mut cmd = Command::new(gh_bin.as_ref());
-src/forge_comment.rs | let out = std::process::Command::new(gh_bin)
 src/forge_etag_store.rs | let mut cmd = Command::new(gh_bin);
-src/merge_pr/consolidate.rs | let mut cmd = Command::new(gh_bin);
-src/merge_pr/consolidate.rs | let mut cmd = Command::new(gh_bin);
 src/pipeline_snapshot.rs | match Command::new(gh_bin).arg("--version").output() {
 src/safehouse.rs | let mut cmd = tokio::process::Command::new(&gh_bin);
 src/safehouse.rs | let mut cmd = tokio::process::Command::new(&gh_bin);
