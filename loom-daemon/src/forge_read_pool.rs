@@ -196,6 +196,12 @@ pub fn select_for_repo_at<'a>(
     owner_repo: &str,
     now: SystemTime,
 ) -> Option<&'a PoolMember> {
+    // #9986: the gateway owns the pool on a `required` egress host.
+    if crate::forge_egress::publication::github_credential_forbidden(
+        crate::forge_identity::workspace_root(),
+    ) {
+        return None;
+    }
     let start = assignment_index(owner_repo, pool.len())?;
     (0..pool.len()).find_map(|offset| {
         let member = &pool[(start + offset) % pool.len()];

@@ -222,6 +222,36 @@ pub fn loom_owned_profile_dirs(workspace: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Does `<dir>/hosts.yml` carry a non-empty `oauth_token` for any host? Only
+/// the verdict is returned; the token is never retained.
+#[must_use]
+pub fn profile_holds_token(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("hosts.yml")).is_ok_and(|t| hosts_text_has_token(&t))
+}
+
+/// See [`profile_holds_token`].
+#[must_use]
+pub fn hosts_text_has_token(text: &str) -> bool {
+    text.lines().any(|l| {
+        l.trim_start()
+            .strip_prefix("oauth_token:")
+            .is_some_and(|v| !unquote(v.split(" #").next().unwrap_or("")).is_empty())
+    })
+}
+
+/// Is the effective git credential helper `gh auth git-credential`?
+fn git_helper_is_gh(cwd: &Path) -> bool {
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "config",
+        "--get-regexp",
+        r"^credential\..*helper$|^credential\.helper$",
+    ])
+    .current_dir(cwd);
+    run_bounded(&mut cmd, Duration::from_secs(10))
+        .is_some_and(|(_, out)| out.lines().any(|l| l.contains("auth git-credential")))
+}
+
 /// Count `insteadOf`/`pushInsteadOf` rewrites whose matched prefix names the
 /// logical host. Counts only — never URLs (they can embed credentials).
 fn git_rewrites(cwd: &Path, logical: &str) -> usize {
@@ -308,7 +338,14 @@ pub fn observe(doc: &PolicyDoc, workspace: &Path, opts: ProbeOptions) -> Observe
         Some(cmd) => Some(run_canary(cmd)),
         None => None,
     };
+    let token_profiles = profiles
+        .iter()
+        .filter(|p| profile_holds_token(&p.path))
+        .map(|p| p.path.clone())
+        .collect();
     Observed {
+        token_profiles,
+        git_helper_is_gh: git_helper_is_gh(workspace),
         gh_host: env_nonempty("GH_HOST"),
         gh_repo: env_nonempty("GH_REPO"),
         gh_config_dir,

@@ -450,7 +450,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
     };
     let github_app_script = credential_preflight::resolve_github_app_script(&sweep_workspace);
     let github_app_owner_repo = credential_preflight::nwo_from_git_remote(&sweep_workspace);
+    // #9986: `required` egress host: the gateway owns the GitHub credential.
+    let github_credential_forbidden =
+        loom_daemon::forge_egress::publication::github_credential_forbidden(Some(&sweep_workspace));
     let github_app_preflight = match &github_app_script {
+        _ if github_credential_forbidden => credential_preflight::gateway_owned_preflight(),
         Some(script_path) => {
             let minter = credential_preflight::RealGithubAppMinter {
                 script_path: script_path.clone(),
@@ -498,7 +502,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // achieved the same override by unconditionally overwriting `GH_TOKEN`.
     let github_app_config_dir = credential_preflight::github_app_gh_config_dir(&sweep_workspace);
     let mut github_app_gh_config_dir_active = false;
-    if let Some(token) = &github_app_preflight.minted_gh_token {
+    if github_credential_forbidden {
+        github_app_gh_config_dir_active =
+            loom_daemon::forge_egress::publication::activate_tokenless_profile(
+                &github_app_config_dir,
+            );
+    } else if let Some(token) = &github_app_preflight.minted_gh_token {
         match credential_preflight::publish_github_app_token(&github_app_config_dir, token) {
             Ok(()) => {
                 std::env::remove_var("GH_TOKEN");

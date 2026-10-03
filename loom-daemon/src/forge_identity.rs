@@ -451,6 +451,10 @@ pub fn reader_for_at<'a>(
     owner_repo: &str,
     now: SystemTime,
 ) -> Option<&'a Identity> {
+    // #9986: the gateway owns the pool on a `required` egress host.
+    if crate::forge_egress::publication::github_credential_forbidden(workspace_root()) {
+        return None;
+    }
     let n = roster.readers.len();
     let start = forge_read_pool::assignment_index(owner_repo, n)?;
     (0..n)
