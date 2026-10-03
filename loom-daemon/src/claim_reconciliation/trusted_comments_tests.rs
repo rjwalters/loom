@@ -44,9 +44,17 @@ esac
     )
     .unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The #9709 probe spawns through the `gh_invocation` choke point (#9985),
+    // whose resolver honours `LOOM_GH_BIN` rather than the injected `gh`.
+    let prev_gh_bin = std::env::var_os("LOOM_GH_BIN");
+    std::env::set_var("LOOM_GH_BIN", &gh);
     std::env::set_var(VERDICT_ANCHOR_ENABLED_ENV, "0");
     let stats = forge::reconcile_pr_verdicts(&gh, &root);
     std::env::remove_var(VERDICT_ANCHOR_ENABLED_ENV);
+    match prev_gh_bin {
+        Some(v) => std::env::set_var("LOOM_GH_BIN", v),
+        None => std::env::remove_var("LOOM_GH_BIN"),
+    }
     stats
 }
 
@@ -184,9 +192,17 @@ esac
     )
     .unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The #9709 probe spawns through the `gh_invocation` choke point (#9985),
+    // whose resolver honours `LOOM_GH_BIN` rather than the injected `gh`.
+    let prev_gh_bin = std::env::var_os("LOOM_GH_BIN");
+    std::env::set_var("LOOM_GH_BIN", &gh);
     std::env::set_var(VERDICT_ANCHOR_ENABLED_ENV, "0");
     let stats = forge::reconcile_pr_verdicts(&gh, &root);
     std::env::remove_var(VERDICT_ANCHOR_ENABLED_ENV);
+    match prev_gh_bin {
+        Some(v) => std::env::set_var("LOOM_GH_BIN", v),
+        None => std::env::remove_var("LOOM_GH_BIN"),
+    }
     (stats, std::fs::read_to_string(&posted).unwrap_or_default())
 }
 

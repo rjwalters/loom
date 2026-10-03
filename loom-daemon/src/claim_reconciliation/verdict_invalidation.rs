@@ -114,11 +114,8 @@ pub(super) fn handle_invalidate(
             return;
         }
     }
-    // #9709: was a NEWER marker for this verdict dropped as untrusted? Then the
-    // notice and the log line must say so rather than assert a plain head move.
-    let untrusted = probe_untrusted_marker(gh_bin, root, pr);
-    match invalidate_verdict(gh_bin, root, pr, marker_sha, head_sha, untrusted.as_ref()) {
-        Ok(comment_skipped) => {
+    match invalidate_verdict(gh_bin, root, pr, marker_sha, head_sha) {
+        Ok((comment_skipped, untrusted)) => {
             stats.invalidated += 1;
             stats.redundant_comments_skipped += usize::from(comment_skipped);
             log::warn!(
@@ -241,15 +238,15 @@ fn reanchor_equivalent_verdict(
 /// on every pass. The label write is deliberately still attempted — retrying
 /// it is the *point*.
 ///
-/// Returns `true` when the comment was skipped as redundant.
+/// Returns `true` when the comment was skipped as redundant, plus the dropped
+/// untrusted marker the posted notice named (#9709; always `None` when skipped).
 fn invalidate_verdict(
     gh_bin: &Path,
     root: &Path,
     pr: &VerdictPr,
     marker_sha: &str,
     head_sha: &str,
-    untrusted: Option<&UntrustedVerdictMarker>,
-) -> Result<bool> {
+) -> Result<(bool, Option<UntrustedVerdictMarker>)> {
     let label = pr.kind.label();
     // `None` (the common case: nothing was armed) contributes no line at
     // all, so the comment never claims a disarm that did not happen.
@@ -265,20 +262,26 @@ fn invalidate_verdict(
         .unwrap_or_default();
     let skipped =
         !super::verdict_stale_comment::should_post(pr.invalidation_recorded, disarmed.is_some());
-    if skipped {
+    let untrusted = if skipped {
         log::info!(
             "claim_reconciliation: PR #{} in {} already records the {marker_sha} -> {head_sha} \
              invalidation — not re-posting the notice, only re-applying the labels (#9124)",
             pr.number,
             root.display(),
         );
+        None
     } else {
+        // #9709: was a NEWER marker for this verdict dropped as untrusted?
+        // Then the notice (and the caller's log line) must say so rather
+        // than assert a plain head move. Probed only when the notice is
+        // actually posted, so a dedup-skipped pass costs no extra read.
+        let untrusted = probe_untrusted_marker(root, pr);
         let body = super::verdict_stale_comment::attributed_body(
             label,
             marker_sha,
             head_sha,
             &disarm_line,
-            untrusted,
+            untrusted.as_ref(),
         );
         let mut cmd = Command::new(gh_bin);
         cmd.arg("pr")
@@ -303,7 +306,8 @@ fn invalidate_verdict(
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-    }
+        untrusted
+    };
 
     // `loom:ci-failure` / `loom:merge-conflict` are findings about the OLD
     // tree too — they ride along with the verdict they were applied
@@ -352,27 +356,37 @@ fn invalidate_verdict(
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(skipped)
+    Ok((skipped, untrusted))
 }
 
 /// The newer-than-trusted verdict marker the trust filter dropped on this PR,
 /// if any (#9709) — attribution for the notice, never evidence: the decision
 /// above was already made from trusted markers only, and nothing here can
-/// change it. One extra comment read, on the (rare) invalidation path only.
+/// change it. One extra comment read, on the (rare) posting path only.
 /// `None` on any read failure, which falls back to the plain head-moved wording.
-fn probe_untrusted_marker(
-    gh_bin: &Path,
-    root: &Path,
-    pr: &VerdictPr,
-) -> Option<UntrustedVerdictMarker> {
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("api")
-        .arg(format!("repos/{{owner}}/{{repo}}/issues/{}/comments", pr.number))
-        .arg("--paginate");
-    cmd.current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd.output().ok().filter(|o| o.status.success())?;
+///
+/// Built through the [`crate::gh_invocation`] choke point (#9985), so the
+/// executable comes from its resolver (`LOOM_GH_BIN` → `PATH`), not the
+/// caller's `gh_bin`.
+fn probe_untrusted_marker(root: &Path, pr: &VerdictPr) -> Option<UntrustedVerdictMarker> {
+    use crate::cmd_out::CmdOutcome;
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    let path = format!("repos/{{owner}}/{{repo}}/issues/{}/comments", pr.number);
+    let outcome = GhInvocation::new(
+        Operation::new("api.rest"),
+        AccessIntent::Read,
+        GhTarget::None,
+        std::time::Duration::from_secs(60),
+    )
+    .args(["api", path.as_str(), "--paginate"])
+    .current_dir(root)
+    .run();
+    let CmdOutcome::Ran(out) = outcome else {
+        return None;
+    };
+    if !out.status.success() {
+        return None;
+    }
     let items = crate::comment_trust::parse_listing(&out.stdout)?;
     let policy = crate::comment_trust::TrustPolicy::for_root(root);
     crate::verdict_stale_notice::untrusted_newer_marker(&policy, &items, pr.kind)
