@@ -20,15 +20,14 @@
 //! (fail closed, never an empty queue); `3` = Gitea decline.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
-use crate::cmd_out::{run_command, CmdOutcome};
-use crate::credential_preflight::apply_gh_config_for_root;
+use crate::cmd_out::CmdOutcome;
 use crate::forge_cmd::{detect_forge, ForgeType, EX_FORGE_DECLINED, FORGE_CMD_TIMEOUT};
 use crate::forge_pr_congestion::link_issue_number;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::work_finder::operator_priority::{GhTimelineStarredAt, StarredAtSource};
 use crate::work_finder::{candidate_cmp, PriorityCandidate, OPERATOR_PRIORITY_LABEL};
 use crate::worktree_ops::gh::resolve_owner_repo;
@@ -105,19 +104,26 @@ struct Listed {
     link: Option<u32>,
 }
 
-fn list_starred(root: &Path, gh: &Path, owner: &str, repo: &str) -> Result<Vec<Listed>> {
-    let mut cmd = Command::new(gh);
-    cmd.arg("api")
-        .arg(format!(
-            "repos/{owner}/{repo}/issues?labels={OPERATOR_PRIORITY_LABEL}&state=open&per_page=100"
-        ))
-        .arg("--paginate")
-        .arg("--jq")
-        .arg(r#".[] | {number, created_at, pr: (.pull_request != null), body: (.body // ""), labels: [.labels[].name]}"#)
-        .current_dir(root)
-        .stdin(Stdio::null());
-    apply_gh_config_for_root(&mut cmd, root);
-    let stdout = match run_command(cmd, FORGE_CMD_TIMEOUT) {
+fn list_starred(root: &Path, owner: &str, repo: &str) -> Result<Vec<Listed>> {
+    let path = format!(
+        "repos/{owner}/{repo}/issues?labels={OPERATOR_PRIORITY_LABEL}&state=open&per_page=100"
+    );
+    let jq = r#".[] | {number, created_at, pr: (.pull_request != null), body: (.body // ""), labels: [.labels[].name]}"#;
+    // Spawned through the #9985 facade: it resolves `gh` (LOOM_GH_BIN, else
+    // PATH), keys GH_CONFIG_DIR off `root`, and closes stdin.
+    let outcome = GhInvocation::new(
+        Operation::new("api.rest"),
+        AccessIntent::Read,
+        GhTarget::Repo {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        },
+        FORGE_CMD_TIMEOUT,
+    )
+    .args(["api", path.as_str(), "--paginate", "--jq", jq])
+    .current_dir(root)
+    .run();
+    let stdout = match outcome {
         CmdOutcome::Ran(o) if o.status.success() => o.stdout,
         CmdOutcome::Ran(o) => bail!("gh api failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
         CmdOutcome::Unavailable(u) => bail!("gh could not be run: {u}"),
@@ -173,7 +179,7 @@ pub fn starred_rows(
 ) -> Result<Vec<StarredRow>> {
     let (owner, repo) =
         resolve_owner_repo(root).context("could not resolve owner/repo from the git remotes")?;
-    let listed = list_starred(root, gh, &owner, &repo)?;
+    let listed = list_starred(root, &owner, &repo)?;
     let mut src = GhTimelineStarredAt {
         gh_bin: gh.to_path_buf(),
         cwd: Some(root.to_path_buf()),
@@ -239,7 +245,8 @@ pub fn handle(args: StarredArgs) -> Result<()> {
         eprintln!("loom-daemon forge starred: GitHub-only; list starred items by hand.");
         std::process::exit(EX_FORGE_DECLINED);
     }
-    match starred_rows(&root, &PathBuf::from("gh"), kind, label, &without) {
+    let gh = PathBuf::from(crate::gh_invocation::gh_bin());
+    match starred_rows(&root, &gh, kind, label, &without) {
         Ok(rows) => {
             if json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
