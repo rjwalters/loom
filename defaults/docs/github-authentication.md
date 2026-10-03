@@ -53,8 +53,8 @@ Two credential modes exist:
 **Published `gh` profiles follow the egress stance (#9986).** One renderer
 writes every Loom-owned `hosts.yml` (`.loom/gh-config`,
 `.loom/gh-config-by-owner/<owner>`): no policy is byte-identical to the legacy
-token-only shape; `enforcement.api=observe` adds `api_host` (so scenario 17's
-token refresh keeps routing) and runs `forge egress assert`, rolling back to the
+token-only shape; `enforcement.api=observe` adds the gateway API-host routing
+key (so scenario 17's token refresh keeps routing) and runs `forge egress assert`, rolling back to the
 previous profile on a finding about that directory (`loom-daemon status` shows
 the rollback); `enforcement.api=required` publishes **no** `oauth_token`, mints
 nothing, selects no reader pool, and clears `GH_TOKEN`/`GITHUB_TOKEN` -- a
