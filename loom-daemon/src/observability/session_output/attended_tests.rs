@@ -87,6 +87,7 @@ fn request(workspace: &Path) -> StartRequest {
         watch_pid: Some(4242),
         workspace: workspace.to_path_buf(),
         transcript: None,
+        from_offset: None,
         max_age_secs: DEFAULT_MAX_AGE_SECS,
         idle_exit_secs: DEFAULT_IDLE_EXIT_SECS,
     }
@@ -134,6 +135,40 @@ fn tool_result(id: &str) -> String {
         "type": "user",
         "message": {"content": [{"type": "tool_result", "tool_use_id": id, "content": "ok"}]}
     }))
+}
+
+/// The process tree of a call running `command`: the shell Claude Code 2.1.288
+/// wraps every `Bash` call in (`ps` from inside a tool call on macOS showed
+/// this shape), which is an ancestor of `lease ensure`.
+fn caller_running(command: &str) -> Caller {
+    let quoted = command.replace('\'', r#"'"'"'"#);
+    Caller::from_argvs(&[
+        vec![
+            "bash".to_string(),
+            "./.loom/scripts/worktree.sh".to_string(),
+            "10116".to_string(),
+        ],
+        vec![
+            "/bin/zsh".to_string(),
+            "-c".to_string(),
+            format!(
+                "source /Users/op/.claude/shell-snapshots/snapshot-zsh-1.sh 2>/dev/null || true \
+                 && eval '{quoted}' < /dev/null && pwd -P >| /tmp/claude-e0c2-cwd"
+            ),
+        ],
+    ])
+}
+
+/// A caller closure for `start_with`, for a call running `command`.
+#[cfg(feature = "otlp")]
+fn running(command: &str) -> impl FnOnce() -> Result<Caller, String> {
+    let caller = caller_running(command);
+    move || Ok(caller)
+}
+
+/// For paths that must decide before ever reading the process tree.
+fn never_read() -> Result<Caller, String> {
+    panic!("the process tree must not be read on this path")
 }
 
 /// `<projects>/<slug>/<SESSION>.jsonl` plus `<SESSION>/subagents/`.
@@ -196,7 +231,7 @@ fn a_daemon_launched_agent_starts_nothing() {
         daemon_launched: true,
         ..attended_env()
     };
-    let outcome = start_with(&request(&root), &env, Some(&scratch.0), |_| {
+    let outcome = start_with(&request(&root), &env, Some(&scratch.0), never_read, |_| {
         panic!("a daemon-launched agent must not spawn a tailer")
     });
     assert_eq!(outcome, Outcome::DaemonLaunched);
@@ -233,9 +268,10 @@ fn with_no_collector_configured_starting_is_a_fast_no_op() {
         let scratch = Scratch::new("unconfigured");
         let root = checkout(&scratch, config);
         let began = Instant::now();
-        let outcome = start_with(&request(&root), &attended_env(), Some(&scratch.0), |_| {
-            panic!("nothing may be spawned when export is off")
-        });
+        let outcome =
+            start_with(&request(&root), &attended_env(), Some(&scratch.0), never_read, |_| {
+                panic!("nothing may be spawned when export is off")
+            });
         assert!(
             began.elapsed() < Duration::from_secs(1),
             "the no-op path must not wait on anything"
@@ -251,7 +287,7 @@ fn with_no_collector_configured_starting_is_a_fast_no_op() {
 #[test]
 fn outside_a_loom_checkout_starting_is_a_no_op() {
     let scratch = Scratch::new("no-checkout");
-    let outcome = start_with(&request(&scratch.0), &attended_env(), None, |_| {
+    let outcome = start_with(&request(&scratch.0), &attended_env(), None, never_read, |_| {
         panic!("nothing may be spawned outside a checkout")
     });
     assert!(matches!(outcome, Outcome::NotConfigured(_)), "{outcome:?}");
@@ -264,9 +300,10 @@ fn outside_a_loom_checkout_starting_is_a_no_op() {
 fn a_build_without_otlp_never_starts_a_tailer() {
     let scratch = Scratch::new("no-otlp-build");
     let root = checkout(&scratch, Some(&live_config(&scratch)));
-    let outcome = start_with(&request(&root), &attended_env(), Some(&scratch.0), |_| {
-        panic!("no exporter, no tailer")
-    });
+    let outcome =
+        start_with(&request(&root), &attended_env(), Some(&scratch.0), never_read, |_| {
+            panic!("no exporter, no tailer")
+        });
     match outcome {
         Outcome::NotConfigured(reason) => assert!(reason.contains("OTLP"), "{reason}"),
         other => panic!("expected NotConfigured, got {other:?}"),
@@ -281,8 +318,9 @@ fn without_a_session_id_nothing_is_guessed() {
     let scratch = Scratch::new("no-session");
     let root = checkout(&scratch, Some(&live_config(&scratch)));
     let env = AttendEnv::default();
-    let outcome =
-        start_with(&request(&root), &env, Some(&scratch.0), |_| panic!("no session, no tailer"));
+    let outcome = start_with(&request(&root), &env, Some(&scratch.0), never_read, |_| {
+        panic!("no session, no tailer")
+    });
     assert_eq!(outcome, Outcome::NoSession);
 }
 
@@ -290,12 +328,14 @@ fn without_a_session_id_nothing_is_guessed() {
 // Locating the caller's own transcript
 // ---------------------------------------------------------------------------
 
+const BUILDER_CLAIM: &str = "cd ~/dev/loom && ./.loom/scripts/worktree.sh 10116";
+
 #[test]
-fn the_subagent_whose_running_command_names_the_issue_is_the_caller() {
+fn the_subagent_running_this_processs_own_command_is_the_caller() {
     let scratch = Scratch::new("locate-subagent");
     let projects = scratch.path("projects");
-    // The parent is waiting on its subagent: a pending Agent call that names
-    // the issue, which must not count.
+    // The parent is waiting on its subagent: a pending Agent call, not a
+    // Bash one, so it never matches.
     let session = session(
         &projects,
         "-Users-op-loom-ui",
@@ -311,11 +351,11 @@ fn the_subagent_whose_running_command_names_the_issue_is_the_caller() {
         &[
             user_text("Build rjwalters/loom issue #10116"),
             assistant_text("Creating the worktree."),
-            bash_call("toolu_wt", "cd ~/dev/loom && ./.loom/scripts/worktree.sh 10116"),
+            bash_call("toolu_wt", BUILDER_CLAIM),
         ],
     );
-    // A sibling working on another issue, and one whose command naming this
-    // issue already finished.
+    // A sibling working on another issue, a sibling running a command that
+    // names this issue, and one whose identical command already finished.
     subagent(
         &session,
         "a6c7b9ad2124db5ef",
@@ -324,42 +364,30 @@ fn the_subagent_whose_running_command_names_the_issue_is_the_caller() {
     );
     subagent(
         &session,
+        "afeedfacecafe0002",
+        Some("loom-judge"),
+        &[bash_call("toolu_view", "gh issue view 10116")],
+    );
+    subagent(
+        &session,
         "afeedfacecafe0001",
         Some("loom-judge"),
         &[
-            bash_call("toolu_done", "gh issue view 10116"),
+            bash_call("toolu_done", BUILDER_CLAIM),
             tool_result("toolu_done"),
         ],
     );
 
-    let located = locate(&projects, SESSION, ISSUE).unwrap();
+    let located = locate(&projects, SESSION, &caller_running(BUILDER_CLAIM)).unwrap();
     assert_eq!(located.path, caller);
     assert_eq!(located.stream_id, format!("{SESSION}/agent-a4555677bacc80e00"));
     assert_eq!(located.agent_id.as_deref(), Some("a4555677bacc80e00"));
     assert_eq!(located.role.as_deref(), Some("builder"));
     assert_eq!(located.sweep_id(), "attended-755d0cb5-a4555677bacc80e00");
-}
-
-#[test]
-fn a_slash_command_session_is_its_own_transcript() {
-    let scratch = Scratch::new("locate-slash");
-    let projects = scratch.path("projects");
-    let session = session(
-        &projects,
-        "-Users-op-dev-loom",
-        &[
-            user_text(
-                "<command-name>/loom:builder</command-name><command-args>10116</command-args>",
-            ),
-            bash_call("toolu_claim", "loom-daemon lease ensure 10116 --watch-pid \"$CLAUDE_PID\""),
-        ],
-    );
-    let located = locate(&projects, SESSION, ISSUE).unwrap();
-    assert_eq!(located.path, session.main);
-    assert_eq!(located.stream_id, SESSION);
-    assert_eq!(located.agent_id, None);
-    assert_eq!(located.role.as_deref(), Some("builder"));
-    assert_eq!(located.sweep_id(), "attended-755d0cb5");
+    // The run begins at the claim call's own line.
+    let transcript = std::fs::read_to_string(&caller).unwrap();
+    let claim_line = transcript.lines().last().unwrap();
+    assert_eq!(located.from as usize, transcript.len() - claim_line.len() - 1);
 }
 
 #[test]
@@ -367,28 +395,20 @@ fn two_candidates_or_none_is_refused_rather_than_guessed() {
     let scratch = Scratch::new("locate-ambiguous");
     let projects = scratch.path("projects");
     let session = session(&projects, "-p", &[user_text("hi")]);
-    assert!(locate(&projects, SESSION, ISSUE).is_err(), "no candidate");
+    let caller = caller_running("worktree.sh 10116");
+    assert!(locate(&projects, SESSION, &caller).is_err(), "no candidate");
     subagent(&session, "a1", None, &[bash_call("t1", "worktree.sh 10116")]);
     subagent(&session, "a2", None, &[bash_call("t2", "worktree.sh 10116")]);
-    let error = locate(&projects, SESSION, ISSUE).unwrap_err();
+    let error = locate(&projects, SESSION, &caller).unwrap_err();
     assert!(error.contains("not guessing"), "{error}");
-}
-
-#[test]
-fn the_issue_must_appear_as_a_whole_number() {
-    assert!(names_issue("./.loom/scripts/worktree.sh 10116", 10116));
-    assert!(names_issue("cd .loom/worktrees/issue-10116 && ls", 10116));
-    assert!(names_issue("10116", 10116));
-    assert!(!names_issue("worktree.sh 110116", 10116));
-    assert!(!names_issue("worktree.sh 101160", 10116));
-    assert!(!names_issue("worktree.sh 1011", 10116));
 }
 
 #[test]
 fn a_session_id_that_is_not_a_plain_token_is_refused() {
     let scratch = Scratch::new("locate-bad-id");
-    assert!(locate(&scratch.0, "../../etc", ISSUE).is_err());
-    assert!(locate(&scratch.0, "", ISSUE).is_err());
+    let caller = caller_running("worktree.sh 10116");
+    assert!(locate(&scratch.0, "../../etc", &caller).is_err());
+    assert!(locate(&scratch.0, "", &caller).is_err());
 }
 
 #[test]
@@ -400,6 +420,7 @@ fn an_explicit_transcript_path_is_described_without_locating() {
     assert_eq!(located.session_id, "755d0cb5-f9ec");
     assert_eq!(located.stream_id, "755d0cb5-f9ec/agent-a99");
     assert_eq!(located.sweep_id(), "attended-755d0cb5-a99");
+    assert!(!located.is_top_level());
 }
 
 // ---------------------------------------------------------------------------
@@ -417,16 +438,22 @@ fn a_configured_attended_claim_detaches_one_tailer_for_its_own_transcript() {
         &session,
         "a4555677bacc80e00",
         Some("loom-builder"),
-        &[bash_call("toolu_wt", "./.loom/scripts/worktree.sh 10116")],
+        &[bash_call("toolu_wt", BUILDER_CLAIM)],
     );
     let mut argv: Vec<String> = Vec::new();
-    let outcome = start_with(&request(&root), &attended_env(), Some(&projects), |command| {
-        argv = command
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        Ok(31337)
-    });
+    let outcome = start_with(
+        &request(&root),
+        &attended_env(),
+        Some(&projects),
+        running(BUILDER_CLAIM),
+        |command| {
+            argv = command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            Ok(31337)
+        },
+    );
     assert_eq!(
         outcome,
         Outcome::Started {
@@ -442,22 +469,25 @@ fn a_configured_attended_claim_detaches_one_tailer_for_its_own_transcript() {
     assert!(argv.contains(&"--foreground".to_string()));
     assert_eq!(arg("--issue"), "10116");
     assert_eq!(arg("--transcript"), caller.display().to_string());
+    assert_eq!(arg("--from-offset"), "0");
     assert_eq!(arg("--watch-pid"), "4242");
     // No credential is ever handed over on the command line: the tailer
     // reads the key file itself.
     assert!(argv.iter().all(|a| !a.contains("test-ingest-key")), "{argv:?}");
 
-    // A second claim step for the same transcript while a tailer holds it
-    // starts nothing.
-    let lock = StreamLock::try_acquire(
-        &state_dir(&root)
-            .join(format!("{}.lock", file_key(&format!("{SESSION}/agent-a4555677bacc80e00")))),
-    )
-    .unwrap()
-    .unwrap();
-    let again = start_with(&request(&root), &attended_env(), Some(&projects), |_| {
-        panic!("one tailer per transcript")
-    });
+    // The same claim step again while its tailer holds the transcript starts
+    // nothing.
+    let located = Located::from_path(&caller).unwrap();
+    let lock = StreamLock::try_acquire(&lock_path(&root, &located))
+        .unwrap()
+        .unwrap();
+    let again = start_with(
+        &request(&root),
+        &attended_env(),
+        Some(&projects),
+        running(BUILDER_CLAIM),
+        |_| panic!("one tailer per claim"),
+    );
     assert_eq!(again, Outcome::AlreadyRunning);
     lock.release();
 }
@@ -508,13 +538,17 @@ async fn an_attended_run_publishes_correlated_records_marked_attended() {
         Some("loom-builder"),
         &[
             user_text("Build rjwalters/loom issue #10116"),
-            assistant_text("Reading the issue first."),
             bash_call("toolu_wt", &format!("GH_TOKEN={CANARY} ./.loom/scripts/worktree.sh 10116")),
             tool_result("toolu_wt"),
+            assistant_text("Reading the issue first."),
             assistant_text(&format!("Exported GH_TOKEN={CANARY} for the push.")),
         ],
     );
-    let located = Located::from_path(&transcript).unwrap();
+    // The run's lines begin at the claim call, right after the task prompt.
+    let located = Located {
+        from: user_text("Build rjwalters/loom issue #10116").len() as u64,
+        ..Located::from_path(&transcript).unwrap()
+    };
     let identity = identity(&located, ISSUE, None, Some("rjwalters/loom".to_string()));
 
     let queue = Arc::new(DurableQueue::open(scratch.path("queue.jsonl"), 1_000));
@@ -530,11 +564,14 @@ async fn an_attended_run_publishes_correlated_records_marked_attended() {
     };
     // Alive for the first two passes, then the session exits.
     let mut polls = 0;
-    let reason = drive(identity, &located, &scratch.0, &sink, live, limits, move || {
-        polls += 1;
-        polls <= 2
-    })
-    .await;
+    let watch = Watch {
+        session_alive: move || {
+            polls += 1;
+            polls <= 2
+        },
+        newer_claim: || None,
+    };
+    let reason = drive(identity, &located, &scratch.0, &sink, live, limits, watch).await;
     assert_eq!(reason, EndReason::SessionExited);
 
     let published = records(&queue);
@@ -617,9 +654,12 @@ async fn an_attended_run_starts_from_its_retained_tail_and_says_what_it_skipped(
         &sink,
         live,
         limits,
-        move || {
-            polls += 1;
-            polls <= 1
+        Watch {
+            session_alive: move || {
+                polls += 1;
+                polls <= 1
+            },
+            newer_claim: || None,
         },
     )
     .await;
@@ -691,3 +731,8 @@ async fn an_unreachable_collector_never_holds_the_tailer_up() {
         .unwrap_or_default();
     assert!(leftovers.is_empty(), "queue and lock files are removed: {leftovers:?}");
 }
+
+/// The scoping regressions from Judge's review of PR #10121: which agent is
+/// calling, and which of its lines belong to the claimed issue.
+#[path = "attended_scope_tests.rs"]
+mod scope;

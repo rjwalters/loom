@@ -1339,7 +1339,7 @@ Two producers emit the kind, and every record says which one with
 | `launch` | Producer | `loom.sweep_id` | `loom.attempt` |
 |---|---|---|---|
 | `daemon` | `loom-daemon`'s bus subscriber, for a sweep it dispatched | the dispatch's sweep id (`sweep-issue-<N>-<epoch>`) | the Nth run of that issue in this daemon's lifetime |
-| `attended` | the attended tailer (`loom-daemon live-output-attend`, started by `lease ensure` at a claim step) for a Loom role run as a subagent of an attended Claude Code session, or a `/loom:<role>` slash command | `attended-<first 8 chars of the session id>` plus `-<agent id>` for a subagent: a pure function of the transcript | absent |
+| `attended` | the attended tailer (`loom-daemon live-output-attend`, started by `lease ensure` at a claim step) for a Loom role run as a subagent of an attended Claude Code session | `attended-<first 8 chars of the session id>-<agent id>`: a pure function of the transcript | absent |
 
 The rest of the identity is shared: `loom.repo`, `loom.issue`, `loom.role`,
 `loom.session_id`, and the per-record `loom.session.output.stream_id` /

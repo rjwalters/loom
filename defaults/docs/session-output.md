@@ -376,53 +376,100 @@ them).
 
 ## Attended runs (#10116)
 
-The daemon's producer follows only the sweeps it dispatched. An agent started
-from an attended Claude Code session never goes through dispatch: a Loom role
-run as a subagent (`loom-builder` started by the Agent tool), or a person
-running `/loom:builder 42`. Those runs are published by the **attended
-tailer**, which reuses everything above (the Claude adapter, the content
-boundary, redaction, status/heartbeat/gap records, the OTLP mapping and the
-exporter) and differs only in how a run starts and ends.
+The daemon's producer follows only the sweeps it dispatched. A Loom role run
+as a **subagent** of an attended Claude Code session (for example,
+`loom-builder` started by the Agent tool) never goes through dispatch. Those
+runs are published by the **attended tailer**. It reuses everything above:
+the Claude adapter, the content boundary, redaction, status/heartbeat/gap
+records, the OTLP mapping and the exporter. It differs only in how a run
+starts, which lines belong to it, and how it ends.
 
 **How it starts.** `loom-daemon lease ensure <N>`, which `worktree.sh <N>` runs
 at every Builder and Doctor claim, starts it. Any other entry point that knows
 its issue can run the same thing directly:
 
 ```bash
-loom-daemon live-output-attend --issue 42            # from inside the agent's own Bash call
-loom-daemon live-output-attend --issue 42 --role judge --transcript <path>
+loom-daemon live-output-attend --issue 42            # from inside the subagent's own Bash call
+loom-daemon live-output-attend --issue 42 --role judge --transcript <subagent transcript>
 ```
 
-Run from inside the agent's tool call, it finds that agent's own transcript.
-It looks in the Claude Code session named by `$CLAUDE_CODE_SESSION_ID`, at the
-main file and each `subagents/agent-*.jsonl`, for the one whose **pending**
-`Bash` call names issue 42. Claude Code writes a tool call to the transcript
-before it runs, so the call executing the command is that pending call. A
-parent waiting on its subagent has a pending `Agent` call, not a `Bash` one, so
-it never matches. No match, or more than one, starts nothing: the tailer does
-not guess. The tool-call input is read for this match only and never placed on
-a record.
+**Which agent is calling: proven, not guessed.** One Claude Code session can
+run several agents at once, and all of them share
+`$CLAUDE_CODE_SESSION_ID`. The tailer identifies the caller through its
+process tree, not by searching for the issue number in the transcripts:
 
-It then detaches `live-output-attend --foreground` (its own process group, no
-stdio shared with the session) and returns. Starting takes a few milliseconds
-of local file reads and never touches the network.
+- Claude Code writes each tool call to the agent's transcript before running
+  it, then runs it as `<shell> -c '… eval '"'"'<command>'"'"' …'`.
+- `lease ensure` runs as a descendant of that shell.
+- So the caller's transcript is the one in the session whose **pending** `Bash`
+  call is *exactly* the command an ancestor shell is running. Either the
+  shell's whole `-c` script or the word it `eval`s counts; a command that only
+  appears inside a longer script does not.
 
-**How it ends.** With a `coverage = ended` record when the watched session
-process (`--watch-pid`, `lease ensure`'s own) exits, when the transcript has
-been idle for 30 minutes, or after 4 hours, the lease renewer's cap. The
-tailer then drains for at most 5 s and removes its queue and lock files. A
-tail it could not deliver is dropped with its queue: a tailer has no next boot
-to drain it on.
+The issue number plays no part, so two failures of a text match cannot happen:
+
+- A sibling agent whose running command contains the number by chance (a CI
+  wait with `sleep 60`, `--limit 100`) is not taken.
+- A claim step that never spells the number, such as the Doctor's
+  `worktree.sh "$ISSUE_NUM"`, is still found.
+
+A parent waiting on its subagent has a pending `Agent` call, not a `Bash` one,
+so it never matches. No match, more than one, or a process tree that cannot be
+read starts nothing. The tool-call input and ancestor argv are read for this
+match only and never placed on a record. Ancestors are read from `/proc` on
+Linux and `sysctl(KERN_PROCARGS2)` on macOS. On other platforms nothing is
+published.
+
+**Subagents only.** A top-level session's own transcript is refused, with a
+recorded reason. This covers a person typing `/loom:builder 42` directly, and
+an operator's main agent claiming inline. That transcript goes on to carry the
+session's later, unrelated work, so following it would publish that work under
+the issue. Top-level coverage is #10129.
+
+**Which lines belong to the run.** A run owns its subagent's transcript from
+the claim line up to whichever comes first:
+
+- **The agent's next task.** A prompt reaches it from outside: a coordinator's
+  message (`isMeta` with an `origin.kind` other than `task-notification`), or a
+  person's prompt or interrupt (a non-meta `user` line). Lines the harness adds
+  within the same task do not end the run: tool results, the agent's own
+  background-task notices, skill expansions, stop-hook feedback and images.
+- **A newer claim on the same transcript.** Each start records its claim
+  (issue and line) in a per-transcript claim file. A run whose claim is no
+  longer the newest ends at the newer claim's line. The newer claim's tailer
+  takes the transcript over from that same line. If the agent claims #43 after
+  #42, the #42 run stops where #43's begins, and neither publishes the other's
+  lines.
+
+Each line is checked before the cursor may read it, so a line past the end is
+never read under the run's identity. Lines written before the claim belong to
+no run: they are neither published nor counted as skipped. If more than 20 of
+the run's own lines exist by the time it attaches, the older ones are reported
+as a `backlog_skipped` gap, exactly as the daemon does.
+
+**How it ends.** With a `coverage = ended` record, at the first of:
+
+- the end of its lines (above);
+- the watched session process (`--watch-pid`, `lease ensure`'s own) exiting;
+- 30 minutes with no change to the transcript;
+- 4 hours, the lease renewer's cap.
+
+The tailer then lets go of the transcript, so a newer claim can take it over
+at once. It drains for at most 5 s and removes its queue, lock and claim
+files. Queue files are per tailer process. A tailer also removes any queue
+files that an earlier, dead tailer of the same transcript left behind. A tail it could not deliver is dropped with its queue: a tailer has no
+next boot to drain it on. After a run ends at the agent's next task, coverage
+resumes only when the agent runs a claim step again.
 
 **Identity.**
 
 | Attribute | Attended value |
 |---|---|
 | `loom.session.output.launch` | `attended` |
-| `loom.sweep_id` | `attended-<first 8 chars of the session id>` plus `-<agent id>` for a subagent: a pure function of the transcript, so a restarted tailer keeps the same attempt |
-| `loom.session_id` / `stream_id` | `<session>` or `<session>/agent-<id>`, the same shape the daemon's discovery mints |
+| `loom.sweep_id` | `attended-<first 8 chars of the session id>-<agent id>`: a pure function of the transcript, so a restarted tailer keeps the same attempt |
+| `loom.session_id` / `stream_id` | `<session>/agent-<id>`, the same shape the daemon's discovery mints for a subagent |
 | `loom.repo` | the claim checkout's `origin` remote. Never the transcript's `cwd`, which is the operator session's directory and can be another repo. Omitted when there is no remote; no `gh` call is made |
-| `loom.role` | `--role`, else the subagent's `loom-<role>` agent type, else the session's `/loom:<role>` command |
+| `loom.role` | `--role`, else the subagent's `loom-<role>` agent type |
 | `loom.attempt` | absent: no dispatch counter numbers attended runs |
 | `loom.session_kind` | `sweep` (the run names an issue) |
 
@@ -434,19 +481,20 @@ line naming the reason, and the session carries on unchanged:
 - `observability.enabled` or `observability.liveOutput.enabled` is off, or no
   OTLP exporter survives the daemon's own endpoint policy (the same
   [configuration](#configuration), read from the claim checkout);
-- `$CLAUDE_CODE_SESSION_ID` is unset, or the caller's transcript cannot be
-  identified;
-- a tailer already follows this transcript (one `flock` per stream).
+- `$CLAUDE_CODE_SESSION_ID` is unset, or the calling agent's transcript cannot
+  be identified as described above;
+- the caller is a top-level session, not a subagent;
+- a tailer already follows this very claim (the claim step was run twice).
 
 An unreachable collector does not hold anything up either: the tailer is
 detached, and its final drain is bounded.
 
 **Coverage today.** Builder and Doctor reach `lease ensure` through
-`worktree.sh`, so both are covered as a subagent and as a slash command. A role
-that never claims an issue (Judge, Curator) is covered only where its entry
-point calls `live-output-attend` itself. On first attach the tailer keeps the
-transcript's last 20 lines and reports the rest as a `backlog_skipped` gap,
-exactly as the daemon does.
+`worktree.sh`, so both are covered when run as subagents. This includes the
+Doctor's `worktree.sh "$ISSUE_NUM"` form. A role run directly in a top-level
+session is not covered yet (#10129). A role that never claims an issue (Judge,
+Curator) is covered only where its entry point calls `live-output-attend`
+itself (#10120).
 
 ## Supported runtimes
 
@@ -555,7 +603,9 @@ repository's config → SigNoz):
 | [`telemetry/kinds/session_output/redact.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/telemetry/kinds/session_output/redact.rs) | Producer-edge redaction (`producer/v1`), scrub-then-clip |
 | [`observability/session_output.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output.rs) | Config/gate, sink over existing OTLP queues, run tracking, the tick loop |
 | [`observability/session_output/claude.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/claude.rs) | The Claude adapter: incremental tail, content boundary, gap detection |
-| [`observability/session_output/attended.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/attended.rs) | Attended runs (#10116): locating the caller's transcript, the detached tailer, end conditions |
+| [`observability/session_output/attended.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/attended.rs) | Attended runs (#10116): starting, the detached tailer, end conditions |
+| [`observability/session_output/attended_caller.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/attended_caller.rs) | Proving which agent is calling, through its ancestor shells |
+| [`observability/session_output/attended_segment.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/attended_segment.rs) | Which transcript lines belong to a run: the next-task boundary and the claim handover |
 | [`observability/session_output/latency.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/latency.rs) | Producer-lag window, percentiles, historical-sample exclusion |
 | [`observability/otlp/mapping/session_output.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/otlp/mapping/session_output.rs) | OTLP log mapping, dual timestamps, severity |
 | [`defaults/observability/collector/config.yaml`](https://github.com/rjwalters/loom/blob/main/defaults/observability/collector/config.yaml) | Gateway re-scrub stage + attribute allowlist |

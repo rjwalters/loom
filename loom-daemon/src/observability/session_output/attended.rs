@@ -19,19 +19,29 @@
 //! 1. **Who starts it.** `loom-daemon lease ensure`, which every Builder and
 //!    Doctor already runs at claim time (`worktree.sh <N>` calls it), and the
 //!    `loom-daemon live-output-attend` subcommand for any other entry point.
-//! 2. **Which transcript.** The calling agent's own. That is the transcript in
-//!    this Claude Code session (`$CLAUDE_CODE_SESSION_ID`), either its main
-//!    file or one of its `subagents/agent-*.jsonl`, whose **pending** `Bash`
-//!    call names the issue. Claude Code writes a tool call to the transcript
-//!    before running it, so the call executing this code is that pending call.
-//!    A parent session waiting on a subagent has a pending `Agent` call, not a
-//!    `Bash` one, so it does not match. Zero or several matches is refused,
-//!    never guessed.
-//! 3. **How it ends.** The tailer is a detached `live-output-attend
-//!    --foreground` process. It closes the run with `coverage = ended` when the
-//!    watched session process exits, when the transcript has been idle for
-//!    [`DEFAULT_IDLE_EXIT_SECS`], or at [`DEFAULT_MAX_AGE_SECS`] (the lease
-//!    renewer's own cap).
+//! 2. **Which transcript.** The calling agent's own, proven through the
+//!    process tree rather than guessed from text ([`caller`]). Claude Code
+//!    writes a tool call to the transcript before running it, and runs it in
+//!    a shell that is an ancestor of this process. So the caller's transcript
+//!    is the one in this session (`$CLAUDE_CODE_SESSION_ID`) whose **pending**
+//!    `Bash` call is exactly the command that ancestor shell runs. This also
+//!    covers a claim step that never spells the issue number, such as the
+//!    Doctor's `worktree.sh "$ISSUE_NUM"`. Zero or several matches start
+//!    nothing.
+//! 3. **Subagents only.** A top-level session's transcript (a person's
+//!    `/loom:builder 42`, or an operator's main agent claiming inline) goes on
+//!    to carry the session's later, unrelated work. It is refused with a
+//!    recorded reason (#10129).
+//! 4. **Which lines.** The run owns its transcript from the claim line up to
+//!    the agent's next task: a prompt from outside, such as a coordinator's
+//!    message, or a newer claim on the same transcript ([`segment`]). A claim
+//!    for another issue takes the transcript over at its own line, so neither
+//!    run publishes the other's lines.
+//! 5. **How it ends.** The tailer is a detached `live-output-attend
+//!    --foreground` process. It closes the run with `coverage = ended` at the
+//!    end of its segment, when the watched session process exits, when the
+//!    transcript has been idle for [`DEFAULT_IDLE_EXIT_SECS`], or at
+//!    [`DEFAULT_MAX_AGE_SECS`] (the lease renewer's own cap).
 //!
 //! # Identity
 //!
@@ -41,7 +51,7 @@
 //! | `loom.sweep_id` | `attended-<first 8 of session id>[-<agent id>]`, a pure function of the transcript, so a restarted tailer keeps the same attempt |
 //! | `loom.session_id` / `stream_id` | `<session>` or `<session>/agent-<id>`, the same shape [`super::claude::discover`] mints |
 //! | `loom.repo` | the claim checkout's `origin` remote, never the transcript's `cwd`, which is the operator session's directory and can be another repo |
-//! | `loom.role` | `--role`, else the subagent's `loom-<role>` type, else the session's `/loom:<role>` command |
+//! | `loom.role` | `--role`, else the subagent's `loom-<role>` type |
 //! | `loom.attempt` | absent. There is no dispatch counter to number attended runs |
 //!
 //! # Nothing changes when nothing is configured
@@ -49,7 +59,8 @@
 //! Starting is a handful of local file reads and never touches the network.
 //! It stops at the first missing piece and reports which one: an agent the
 //! daemon launched, observability off, live output off, no usable OTLP
-//! exporter, no session id, or no identifiable transcript. The detached tailer
+//! exporter, no session id, or no identifiable transcript. Reading the
+//! process tree comes last, after export is known to be on. The detached tailer
 //! never shares stdio with the session, and its final drain is bounded by
 //! [`FINAL_FLUSH`], so an unreachable collector cannot hold anything up.
 //!
@@ -58,18 +69,26 @@
 //! The ingest key is read only inside the detached tailer, from the configured
 //! key file, and is sent only as the exporter's `Authorization` header, exactly
 //! as the daemon does. It is never on a command line or in a record. The
-//! tool-call input this module reads to find the transcript is used for that
-//! match only and is never placed on a record: the records come from
-//! [`super::claude::Cursor`], which drops tool input at parse time.
+//! tool-call input and ancestor argv this module reads to find the transcript
+//! are used for that match only and are never placed on a record: the records
+//! come from [`super::claude::Cursor`], which drops tool input at parse time.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::Utc;
 use serde_json::Value;
+
+#[path = "attended_caller.rs"]
+pub mod caller;
+#[path = "attended_segment.rs"]
+pub mod segment;
+
+use caller::Caller;
+use segment::{Claim, Segment};
 
 use super::{ResolvedLiveOutput, Run, SessionOutputSink, Source, Tracker};
 use crate::telemetry::kinds::session_output::{
@@ -239,6 +258,9 @@ pub struct Located {
     pub agent_id: Option<String>,
     /// The role the transcript declares, when it declares one.
     pub role: Option<String>,
+    /// Byte offset of the line holding the claim call: where the run's own
+    /// lines begin. `0` until a claim is located.
+    pub from: u64,
 }
 
 impl Located {
@@ -263,7 +285,15 @@ impl Located {
             session_id,
             agent_id,
             role: declared_role(path),
+            from: 0,
         })
+    }
+
+    /// Whether this is a top-level session's own transcript rather than a
+    /// subagent's.
+    #[must_use]
+    pub fn is_top_level(&self) -> bool {
+        self.agent_id.is_none()
     }
 
     /// The attempt id records are grouped by: a pure function of the
@@ -303,12 +333,17 @@ fn loom_role(agent_type: &str) -> Option<String> {
 }
 
 /// Find the calling agent's transcript in session `session_id` under
-/// `projects_dir`: the one whose pending `Bash` call names `issue`.
+/// `projects_dir`: the one whose pending `Bash` call is the command `caller`'s
+/// ancestor shell is running.
+///
+/// The issue number plays no part. A sibling's running command can contain it
+/// by chance, and a Doctor's claim step (`worktree.sh "$ISSUE_NUM"`) does not
+/// contain it at all.
 ///
 /// # Errors
 ///
 /// Why no single transcript qualified. Ambiguity is an error, never a guess.
-pub fn locate(projects_dir: &Path, session_id: &str, issue: u32) -> Result<Located, String> {
+pub fn locate(projects_dir: &Path, session_id: &str, caller: &Caller) -> Result<Located, String> {
     if session_id.is_empty()
         || !session_id
             .chars()
@@ -320,33 +355,43 @@ pub fn locate(projects_dir: &Path, session_id: &str, issue: u32) -> Result<Locat
     if candidates.is_empty() {
         return Err(format!("no transcript for session {session_id}"));
     }
-    let matching: Vec<&PathBuf> = candidates
+    let matching: Vec<(&PathBuf, u64)> = candidates
         .iter()
-        .filter(|path| pending_bash_names_issue(path, issue))
+        .filter_map(|path| callers_pending_call(path, caller).map(|from| (path, from)))
         .collect();
     match matching.as_slice() {
-        [only] => Located::from_path(only).ok_or_else(|| "unreadable transcript path".to_string()),
+        [(only, from)] => Located::from_path(only)
+            .map(|located| Located {
+                from: *from,
+                ..located
+            })
+            .ok_or_else(|| "unreadable transcript path".to_string()),
         [] => Err(format!(
-            "none of session {session_id}'s {} transcript(s) has a running command naming #{issue}",
+            "none of session {session_id}'s {} transcript(s) has a running Bash call that is \
+             this process's own command",
             candidates.len()
         )),
         several => Err(format!(
-            "{} transcripts in session {session_id} have a running command naming #{issue}; \
-             not guessing",
+            "{} transcripts in session {session_id} have a running Bash call that is this \
+             process's own command; not guessing",
             several.len()
         )),
     }
 }
 
 /// [`locate`], retried briefly in case the pending call is not on disk yet.
-fn locate_with_retry(projects_dir: &Path, session_id: &str, issue: u32) -> Result<Located, String> {
-    let mut result = locate(projects_dir, session_id, issue);
+fn locate_with_retry(
+    projects_dir: &Path,
+    session_id: &str,
+    caller: &Caller,
+) -> Result<Located, String> {
+    let mut result = locate(projects_dir, session_id, caller);
     for _ in 1..LOCATE_ATTEMPTS {
         if result.is_ok() {
             break;
         }
         std::thread::sleep(LOCATE_RETRY);
-        result = locate(projects_dir, session_id, issue);
+        result = locate(projects_dir, session_id, caller);
     }
     result
 }
@@ -374,15 +419,18 @@ fn session_transcripts(projects_dir: &Path, session_id: &str) -> Vec<PathBuf> {
     out
 }
 
-/// Whether the newest lines of `path` hold a `Bash` call with no result yet
-/// whose command names `issue`. The command text is read for this match only.
-fn pending_bash_names_issue(path: &Path, issue: u32) -> bool {
-    let Some(tail) = read_tail(path, LOCATE_TAIL_BYTES) else {
-        return false;
-    };
-    let mut pending: Vec<(String, String)> = Vec::new();
-    for line in tail.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
+/// The byte offset of the line holding `path`'s pending `Bash` call that
+/// `caller`'s ancestor shell is running, if its newest lines hold one. The
+/// command text is read for this comparison only.
+fn callers_pending_call(path: &Path, caller: &Caller) -> Option<u64> {
+    let (base, tail) = read_tail(path, LOCATE_TAIL_BYTES)?;
+    let mut pending: Vec<(String, String, u64)> = Vec::new();
+    let mut at = 0_usize;
+    while let Some(newline) = tail[at..].iter().position(|byte| *byte == b'\n') {
+        let offset = base + at as u64;
+        let line = &tail[at..at + newline];
+        at += newline + 1;
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
         let kind = value
@@ -411,12 +459,12 @@ fn pending_bash_names_issue(path: &Path, issue: u32) -> bool {
                             .and_then(|input| input.get("command"))
                             .and_then(Value::as_str)
                             .unwrap_or_default();
-                        pending.push((id.to_string(), command.to_string()));
+                        pending.push((id.to_string(), command.to_string(), offset));
                     }
                 }
                 ("user", "tool_result") => {
                     if let Some(id) = block.get("tool_use_id").and_then(Value::as_str) {
-                        pending.retain(|(open, _)| open != id);
+                        pending.retain(|(open, _, _)| open != id);
                     }
                 }
                 _ => {}
@@ -425,45 +473,25 @@ fn pending_bash_names_issue(path: &Path, issue: u32) -> bool {
     }
     pending
         .iter()
-        .any(|(_, command)| names_issue(command, issue))
+        .filter(|(_, command, _)| caller.runs(command))
+        .map(|(_, _, offset)| *offset)
+        .max()
 }
 
-/// Whether `text` contains `issue` as a whole number (`issue-42` and
-/// `worktree.sh 42` name 42; `142` and `420` do not).
-fn names_issue(text: &str, issue: u32) -> bool {
-    let needle = issue.to_string();
-    let bytes = text.as_bytes();
-    let mut from = 0;
-    while let Some(offset) = text[from..].find(&needle) {
-        let at = from + offset;
-        let end = at + needle.len();
-        let clear_before = at == 0 || !bytes[at - 1].is_ascii_digit();
-        let clear_after = end >= bytes.len() || !bytes[end].is_ascii_digit();
-        if clear_before && clear_after {
-            return true;
-        }
-        from = at + 1;
-    }
-    false
-}
-
-/// The last `max` bytes of `path`, starting at a line boundary.
-fn read_tail(path: &Path, max: u64) -> Option<String> {
+/// The last `max` bytes of `path`, starting at a line boundary, with the
+/// byte offset they start at.
+fn read_tail(path: &Path, max: u64) -> Option<(u64, Vec<u8>)> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let start = len.saturating_sub(max);
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut buffer = Vec::new();
     file.take(max).read_to_end(&mut buffer).ok()?;
-    let text = String::from_utf8_lossy(&buffer).into_owned();
     if start == 0 {
-        return Some(text);
+        return Some((0, buffer));
     }
-    Some(
-        text.split_once('\n')
-            .map(|(_, rest)| rest.to_string())
-            .unwrap_or_default(),
-    )
+    let skip = buffer.iter().position(|byte| *byte == b'\n')? + 1;
+    Some((start + skip as u64, buffer.split_off(skip)))
 }
 
 // ============================================================================
@@ -526,12 +554,47 @@ impl StreamLock {
         }))
     }
 
+    /// [`Self::try_acquire`], waiting up to `wait` for the holder to hand the
+    /// transcript over, unless `give_up` says to stop first.
+    async fn acquire_within(
+        path: &Path,
+        wait: Duration,
+        mut give_up: impl FnMut() -> bool,
+    ) -> std::io::Result<Option<Self>> {
+        let began = Instant::now();
+        loop {
+            if let Some(lock) = Self::try_acquire(path)? {
+                return Ok(Some(lock));
+            }
+            if give_up() || began.elapsed() >= wait {
+                return Ok(None);
+            }
+            tokio::time::sleep(HANDOVER_POLL).await;
+        }
+    }
+
     /// Remove the lock file while still holding it. A tailer that opens the
     /// path afterwards gets a fresh file, which is harmless: this one is only
     /// draining by then.
     fn release(self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// How long a newer claim's tailer waits for the older one to finish its
+/// segment and let go of the transcript. The older one notices the newer
+/// claim on its next pass, so a few seconds suffice.
+const HANDOVER_WAIT: Duration = Duration::from_secs(20);
+const HANDOVER_POLL: Duration = Duration::from_millis(200);
+
+/// One transcript's lock file: one tailer reads a transcript at a time.
+fn lock_path(root: &Path, located: &Located) -> PathBuf {
+    state_dir(root).join(format!("{}.lock", file_key(&located.stream_id)))
+}
+
+/// One transcript's claim file: which claim owns it now.
+fn claim_path(root: &Path, located: &Located) -> PathBuf {
+    state_dir(root).join(format!("{}.claim", file_key(&located.stream_id)))
 }
 
 // ============================================================================
@@ -550,6 +613,10 @@ pub struct StartRequest {
     pub workspace: PathBuf,
     /// The transcript to read, skipping [`locate`].
     pub transcript: Option<PathBuf>,
+    /// Byte offset of the claim line in `transcript`, where the run's own
+    /// lines begin. Without it an explicit transcript is followed from its
+    /// current end.
+    pub from_offset: Option<u64>,
     pub max_age_secs: u64,
     pub idle_exit_secs: u64,
 }
@@ -565,6 +632,11 @@ pub enum EndReason {
     MaxAge,
     /// The transcript disappeared.
     TranscriptGone,
+    /// A prompt from outside the agent (a coordinator's message, a person's
+    /// prompt or interrupt) started its next task.
+    NextTask,
+    /// A newer claim took the transcript over at its own line.
+    Superseded,
 }
 
 impl EndReason {
@@ -575,6 +647,8 @@ impl EndReason {
             EndReason::Idle => "the transcript went idle",
             EndReason::MaxAge => "the tailer reached its maximum age",
             EndReason::TranscriptGone => "the transcript disappeared",
+            EndReason::NextTask => "a new prompt started the agent's next task",
+            EndReason::Superseded => "a newer claim took the transcript over",
         }
     }
 }
@@ -591,7 +665,12 @@ pub enum Outcome {
     NoSession,
     /// The calling agent's transcript could not be identified.
     NotLocated(String),
-    /// A tailer already holds this transcript.
+    /// The caller is a top-level session, not a subagent. Its transcript
+    /// goes on to carry the session's later, unrelated work, so it is not
+    /// followed (#10129).
+    TopLevelSession,
+    /// A tailer already follows this claim, or (for a tailer) the older one
+    /// never let go of the transcript.
     AlreadyRunning,
     /// A detached tailer is now publishing.
     Started { pid: u32, sweep_id: String },
@@ -621,8 +700,13 @@ impl Outcome {
                 "issue #{issue}: not publishing live output, this agent's transcript was not \
                  identified: {why}"
             ),
+            Outcome::TopLevelSession => format!(
+                "issue #{issue}: not publishing live output, the caller is a top-level session, \
+                 whose transcript goes on to carry the session's later, unrelated work; only a \
+                 subagent's transcript is followed (rjwalters/loom#10129)"
+            ),
             Outcome::AlreadyRunning => {
-                format!("issue #{issue}: a live-output tailer already follows this transcript")
+                format!("issue #{issue}: a live-output tailer already follows this claim")
             }
             Outcome::Started { pid, sweep_id } => {
                 format!("issue #{issue}: publishing live output as {sweep_id} (tailer pid {pid})")
@@ -648,14 +732,16 @@ fn root_of(request: &StartRequest) -> Result<PathBuf, Outcome> {
 #[must_use]
 pub fn start(request: &StartRequest, env: &AttendEnv) -> Outcome {
     let projects = crate::transcript_tokens::claude_projects_dir();
-    start_with(request, env, projects.as_deref(), spawn_detached)
+    start_with(request, env, projects.as_deref(), Caller::from_process, spawn_detached)
 }
 
-/// [`start`] with the projects directory and the spawn injected.
+/// [`start`] with the projects directory, the caller's process tree and the
+/// spawn injected.
 fn start_with(
     request: &StartRequest,
     env: &AttendEnv,
     projects_dir: Option<&Path>,
+    caller: impl FnOnce() -> Result<Caller, String>,
     spawn: impl FnOnce(Command) -> std::io::Result<u32>,
 ) -> Outcome {
     if env.daemon_launched {
@@ -670,7 +756,15 @@ fn start_with(
     }
     let located = match &request.transcript {
         Some(path) => match Located::from_path(path) {
-            Some(located) => located,
+            // An explicit transcript is followed from the request's offset,
+            // else from now: what it held before is not known to be this
+            // issue's.
+            Some(located) => Located {
+                from: request
+                    .from_offset
+                    .unwrap_or_else(|| std::fs::metadata(path).map_or(0, |m| m.len())),
+                ..located
+            },
             None => return Outcome::NotLocated(format!("{} is not a transcript", path.display())),
         },
         None => {
@@ -680,19 +774,37 @@ fn start_with(
             let Some(projects) = projects_dir else {
                 return Outcome::NotLocated("no Claude projects directory".to_string());
             };
-            match locate_with_retry(projects, session_id, request.issue) {
+            let caller = match caller() {
+                Ok(caller) => caller,
+                Err(why) => return Outcome::NotLocated(why),
+            };
+            match locate_with_retry(projects, session_id, &caller) {
                 Ok(located) => located,
                 Err(why) => return Outcome::NotLocated(why),
             }
         }
     };
-    let lock_path = state_dir(&root).join(format!("{}.lock", file_key(&located.stream_id)));
-    match StreamLock::try_acquire(&lock_path) {
-        // Probe only: the tailer takes the lock for itself. If two starts
-        // race past this, the loser's tailer finds it held and exits.
-        Ok(Some(probe)) => drop(probe),
-        Ok(None) => return Outcome::AlreadyRunning,
-        Err(error) => return Outcome::SpawnFailed(format!("{}: {error}", lock_path.display())),
+    if located.is_top_level() {
+        return Outcome::TopLevelSession;
+    }
+    let claim = Claim {
+        issue: request.issue,
+        from: located.from,
+    };
+    let claim_file = claim_path(&root, &located);
+    // A second start for the very same claim (a retried claim step) while its
+    // tailer runs is a no-op. Any other claim is recorded as the newest, and
+    // the tailer it starts takes the transcript over from the older one at
+    // the new claim's line.
+    if segment::read_claim(&claim_file) == Some(claim) {
+        match StreamLock::try_acquire(&lock_path(&root, &located)) {
+            Ok(Some(probe)) => drop(probe),
+            Ok(None) => return Outcome::AlreadyRunning,
+            Err(error) => return Outcome::SpawnFailed(error.to_string()),
+        }
+    }
+    if let Err(error) = segment::write_claim(&claim_file, claim) {
+        return Outcome::SpawnFailed(format!("{}: {error}", claim_file.display()));
     }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -708,6 +820,8 @@ fn start_with(
         .arg(&root)
         .arg("--transcript")
         .arg(&located.path)
+        .arg("--from-offset")
+        .arg(located.from.to_string())
         .arg("--max-age")
         .arg(request.max_age_secs.to_string())
         .arg("--idle-exit")
@@ -724,6 +838,8 @@ fn start_with(
             pid,
             sweep_id: located.sweep_id(),
         },
+        // The claim stays recorded even so: an older run on this transcript
+        // still has to end at this line, because the agent has moved on.
         Err(error) => Outcome::SpawnFailed(error.to_string()),
     }
 }
@@ -799,21 +915,40 @@ fn idle_for(path: &Path) -> Option<Duration> {
     )
 }
 
+/// What [`drive`] asks on every pass, besides the transcript itself.
+struct Watch<A, C>
+where
+    A: FnMut() -> bool,
+    C: FnMut() -> Option<u64>,
+{
+    /// Whether the watched session process is still running.
+    session_alive: A,
+    /// Where a newer claim on this transcript starts, once there is one.
+    newer_claim: C,
+}
+
 /// Follow one attended run until it ends, publishing through `sink`. The
 /// daemon producer's own [`super::tick`] does the reading, so an attended run
-/// gets exactly the records, heartbeats and gaps a daemon run gets.
-async fn drive(
+/// gets exactly the records, heartbeats and gaps a daemon run gets. The
+/// [`Segment`] decides how far it may read: from the claim line to the
+/// agent's next task or a newer claim.
+async fn drive<A, C>(
     identity: RunIdentity,
     located: &Located,
     workspace_root: &Path,
     sink: &SessionOutputSink,
     live: ResolvedLiveOutput,
     limits: Limits,
-    mut session_alive: impl FnMut() -> bool,
-) -> EndReason {
+    mut watch: Watch<A, C>,
+) -> EndReason
+where
+    A: FnMut() -> bool,
+    C: FnMut() -> Option<u64>,
+{
     let started = Utc::now();
     let root_key = workspace_root.display().to_string();
     let issue = identity.issue.unwrap_or_default();
+    let key = (root_key.clone(), issue);
     let status_stream = identity
         .sweep_id
         .clone()
@@ -821,6 +956,8 @@ async fn drive(
     let source = Source::Fixed {
         stream_id: located.stream_id.clone(),
         path: located.path.clone(),
+        from: located.from,
+        until: located.from,
     };
     let mut tracker = Tracker::default();
     let run = tracker.insert(
@@ -830,17 +967,37 @@ async fn drive(
     );
     sink.push(run.status(OutputCategory::Coverage, started, Coverage::Degraded, RunState::Running));
 
+    let mut segment = Segment::starting_at(located.from);
     let mut slug_cache: HashMap<String, String> = HashMap::new();
     let mut ticker = tokio::time::interval(live.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let reason = loop {
         ticker.tick().await;
+        if let Some(at) = (watch.newer_claim)() {
+            segment.supersede(at);
+        }
+        // Check the new lines before the cursor may read them.
+        segment.scan(&located.path);
+        if let Some(Source::Fixed { until, .. }) =
+            tracker.runs.get_mut(&key).map(|run| &mut run.source)
+        {
+            *until = segment.limit();
+        }
         super::tick(&mut tracker, sink, &mut slug_cache, live).await;
+        let read_to = tracker
+            .runs
+            .get(&key)
+            .and_then(|run| run.cursors.get(&located.stream_id))
+            .map(|(_, cursor)| cursor.offset());
+        if let Some(reason) = read_to.and_then(|offset| segment.finished(offset)) {
+            break reason;
+        }
         let age = Utc::now()
             .signed_duration_since(started)
             .to_std()
             .unwrap_or_default();
-        if let Some(reason) = end_reason(age, session_alive(), idle_for(&located.path), limits) {
+        let alive = (watch.session_alive)();
+        if let Some(reason) = end_reason(age, alive, idle_for(&located.path), limits) {
             break reason;
         }
     };
@@ -872,12 +1029,36 @@ pub async fn run_foreground(request: &StartRequest, env: &AttendEnv) -> Outcome 
     let Some(located) = request.transcript.as_deref().and_then(Located::from_path) else {
         return Outcome::NotLocated("--foreground needs --transcript".to_string());
     };
-    let key = file_key(&located.stream_id);
-    let lock = match StreamLock::try_acquire(&state_dir(&root).join(format!("{key}.lock"))) {
-        Ok(Some(lock)) => lock,
-        Ok(None) => return Outcome::AlreadyRunning,
-        Err(error) => return Outcome::SpawnFailed(error.to_string()),
+    if located.is_top_level() {
+        return Outcome::TopLevelSession;
+    }
+    let from = request
+        .from_offset
+        .unwrap_or_else(|| std::fs::metadata(&located.path).map_or(0, |m| m.len()));
+    let located = Located { from, ..located };
+    let claim = Claim {
+        issue: request.issue,
+        from,
     };
+    let claim_file = claim_path(&root, &located);
+    let sweep_id = located.sweep_id();
+    // An older claim's tailer may still be reading this transcript. It ends
+    // at this claim's line once it sees the claim file, then lets go.
+    let superseded = || segment::newer_claim(&claim_file, claim).is_some();
+    let lock =
+        match StreamLock::acquire_within(&lock_path(&root, &located), HANDOVER_WAIT, superseded)
+            .await
+        {
+            Ok(Some(lock)) => lock,
+            Ok(None) if superseded() => {
+                return Outcome::Ended {
+                    sweep_id,
+                    reason: EndReason::Superseded,
+                }
+            }
+            Ok(None) => return Outcome::AlreadyRunning,
+            Err(error) => return Outcome::SpawnFailed(error.to_string()),
+        };
     let ingest_key = match super::super::read_ingest_key(&plan.key_file) {
         Ok(ingest_key) => ingest_key,
         Err(detail) => {
@@ -885,34 +1066,72 @@ pub async fn run_foreground(request: &StartRequest, env: &AttendEnv) -> Outcome 
             return Outcome::NotConfigured(detail);
         }
     };
-    let Some((sink, queue_files)) = build_sink(&plan, &state_dir(&root), &key, &ingest_key) else {
+    // Queue files are this process's own, so a newer claim's tailer can take
+    // the transcript over while this one is still draining.
+    let stream_key = file_key(&located.stream_id);
+    sweep_dead_queues(&state_dir(&root), &stream_key);
+    let queue_key = format!("{stream_key}.{}", std::process::id());
+    let Some((sink, queue_files)) = build_sink(&plan, &state_dir(&root), &queue_key, &ingest_key)
+    else {
         lock.release();
         return Outcome::NotConfigured("no OTLP exporter could be constructed".to_string());
     };
     drop(ingest_key);
     let repo = crate::forge_etag_store::remote_identity(&root).map(|(_host, slug)| slug);
     let identity = identity(&located, request.issue, request.role.clone(), repo);
-    let sweep_id = located.sweep_id();
     let limits = Limits {
         max_age: Duration::from_secs(request.max_age_secs),
         idle_exit: Duration::from_secs(request.idle_exit_secs),
     };
     let watch_pid = request.watch_pid;
     let watch_since = Utc::now();
-    let alive = move || {
-        watch_pid.is_none_or(|pid| {
-            crate::sweep_registry::reaper::pid_identity::pid_alive_since(pid, watch_since)
-        })
+    let watch = Watch {
+        session_alive: move || {
+            watch_pid.is_none_or(|pid| {
+                crate::sweep_registry::reaper::pid_identity::pid_alive_since(pid, watch_since)
+            })
+        },
+        newer_claim: || segment::newer_claim(&claim_file, claim),
     };
-    let reason = drive(identity, &located, &root, &sink, plan.live, limits, alive).await;
+    let reason = drive(identity, &located, &root, &sink, plan.live, limits, watch).await;
+    lock.release();
+    segment::clear_claim(&claim_file, claim);
     super::super::shutdown::flush_before_shutdown(FINAL_FLUSH).await;
     // A tailer has no next boot to drain a backlog on, so an undelivered tail
     // is dropped with its queue rather than left to accumulate.
     for file in queue_files {
         let _ = std::fs::remove_file(file);
     }
-    lock.release();
     Outcome::Ended { sweep_id, reason }
+}
+
+/// Remove the queue files that earlier tailers of this transcript left
+/// behind when they died before their own cleanup. A file whose tailer is
+/// still running (one that let go of the transcript and is draining) stays.
+fn sweep_dead_queues(dir: &Path, stream_key: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{stream_key}.");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some((pid, rest)) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&prefix))
+            .and_then(|rest| rest.split_once('.'))
+        else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if rest.starts_with("otlp-")
+            && pid != std::process::id()
+            && !crate::live_claim::pid_is_live_process(pid)
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// The tailer's own OTLP queues and senders, over the plan's endpoints.

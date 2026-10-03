@@ -3,8 +3,9 @@
 //!
 //! `lease ensure` already does this at every Builder and Doctor claim step, so
 //! this verb is for any other entry point that knows its issue. Run it from
-//! inside the agent's own tool call: it finds that agent's transcript by the
-//! running command, detaches a tailer, and returns at once.
+//! inside a subagent's own tool call: it finds that agent's transcript by the
+//! running command (through this process's parent shells), detaches a
+//! tailer, and returns at once. A top-level session is refused (#10129).
 //!
 //! **Always exits 0.** With live output not configured it does nothing and
 //! says why in one stderr line. The logic lives in
@@ -21,8 +22,7 @@ pub(crate) struct LiveOutputAttendArgs {
     /// The issue this agent is working on.
     #[arg(long)]
     issue: u32,
-    /// The Loom role. Defaults to the subagent's `loom-<role>` type, else the
-    /// session's `/loom:<role>` command.
+    /// The Loom role. Defaults to the subagent's `loom-<role>` type.
     #[arg(long)]
     role: Option<String>,
     /// The session's durable pid; the run ends when it exits. Defaults to
@@ -32,9 +32,14 @@ pub(crate) struct LiveOutputAttendArgs {
     /// Any directory inside the claim's checkout.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
-    /// Read this transcript instead of locating the calling agent's own.
+    /// Read this transcript instead of locating the calling agent's own. It
+    /// must be a subagent's.
     #[arg(long)]
     transcript: Option<PathBuf>,
+    /// Byte offset in `--transcript` where this issue's lines begin (the
+    /// claim line). Defaults to the transcript's current end.
+    #[arg(long, value_name = "BYTES", hide = true)]
+    from_offset: Option<u64>,
     /// Stop following after this many seconds.
     #[arg(long, default_value_t = DEFAULT_MAX_AGE_SECS)]
     max_age: u64,
@@ -55,6 +60,7 @@ impl LiveOutputAttendArgs {
             watch_pid: self.watch_pid.or_else(attended::session_pid_from_env),
             workspace: self.workspace,
             transcript: self.transcript,
+            from_offset: self.from_offset,
             max_age_secs: self.max_age,
             idle_exit_secs: self.idle_exit,
         };

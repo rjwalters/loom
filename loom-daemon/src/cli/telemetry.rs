@@ -164,7 +164,7 @@ pub(crate) enum TelemetryCommand {
     /// Publish live `session.output` for an agent started from an attended
     /// Claude Code session (Issue #10116).
     ///
-    /// Run from inside the agent's own tool call with the issue it works on:
+    /// Run from inside a subagent's own tool call with the issue it works on:
     /// it finds that agent's transcript, detaches a tailer that publishes
     /// through the configured OTLP exporter, and returns at once. `lease
     /// ensure` already runs it at every claim step. Always exits 0; a no-op

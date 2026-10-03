@@ -59,8 +59,9 @@
 //! The same blind spot hides the agent's output: the daemon's `session.output`
 //! producer only follows runs it dispatched. So after the lease, `run` also
 //! asks `observability::session_output::attended` to start a tailer for this
-//! agent's own transcript. That call is a few local file reads and a detached
-//! spawn, a silent no-op unless live output and an OTLP exporter are
+//! agent's own transcript when the agent is a subagent. That call is a few
+//! local file reads and a detached spawn, a silent no-op unless live output
+//! and an OTLP exporter are
 //! configured, and skipped outright for a daemon-dispatched child, whose
 //! output the daemon already publishes. Like the lease, it never fails or
 //! delays the claim.
@@ -316,6 +317,7 @@ impl LeaseEnsureArgs {
             watch_pid: Some(self.watch_pid),
             workspace: PathBuf::from(&self.workspace),
             transcript: None,
+            from_offset: None,
             // `0` means "unbounded" for the lease loop; a tailer is always capped.
             max_age_secs: if self.max_age == 0 {
                 attended::DEFAULT_MAX_AGE_SECS

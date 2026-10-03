@@ -257,7 +257,16 @@ enum Source {
     /// writes, located once when the tailer started. Its identity is complete
     /// at open time and is never re-derived from the transcript, whose `cwd`
     /// is the operator session's directory and can name a different repo.
-    Fixed { stream_id: String, path: PathBuf },
+    ///
+    /// The run owns only a segment of that transcript: from its claim line
+    /// (`from`, a byte offset) up to `until`, the end of the lines the tailer
+    /// has checked for the agent's next task. Nothing outside it is read.
+    Fixed {
+        stream_id: String,
+        path: PathBuf,
+        from: u64,
+        until: u64,
+    },
 }
 
 /// One tracked in-flight run.
@@ -625,9 +634,9 @@ fn advance_run(run: &mut Run, projects_dir: &Path, now: DateTime<Utc>) -> Vec<Se
     let mut out = Vec::new();
     let streams = match &run.source {
         Source::Discover => claude::discover(projects_dir, &run.workspace_root, issue),
-        Source::Fixed { stream_id, path } if path.is_file() => {
-            vec![(stream_id.clone(), path.clone())]
-        }
+        Source::Fixed {
+            stream_id, path, ..
+        } if path.is_file() => vec![(stream_id.clone(), path.clone())],
         Source::Fixed { .. } => Vec::new(),
     };
     if !streams.is_empty() {
@@ -663,15 +672,22 @@ fn advance_run(run: &mut Run, projects_dir: &Path, now: DateTime<Utc>) -> Vec<Se
                     run.identity.session_kind = context.session_kind;
                 }
             }
-            run.cursors
-                .insert(stream_id.clone(), (path, claude::Cursor::default()));
+            let cursor = match &run.source {
+                Source::Fixed { from, .. } => claude::Cursor::starting_at(*from),
+                Source::Discover => claude::Cursor::default(),
+            };
+            run.cursors.insert(stream_id.clone(), (path, cursor));
         }
         let identity = run.identity.clone();
+        let limit = match &run.source {
+            Source::Fixed { until, .. } => Some(*until),
+            Source::Discover => None,
+        };
         let Some((path, cursor)) = run.cursors.get_mut(&stream_id) else {
             continue;
         };
         let path = path.clone();
-        let pass = cursor.advance(&path, &stream_id, &identity, now);
+        let pass = cursor.advance_within(&path, &stream_id, &identity, now, limit);
         if let Some((reason, dropped)) = pass.gap {
             run.dropped_events = run.dropped_events.saturating_add(dropped);
             let record = run
