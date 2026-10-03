@@ -48,16 +48,35 @@ clobber proceeds, now laundered as a "fresh" value.
 The pin must be the head the pushing work is **based on**:
 
 - **Doctor**: `CLAIM_HEAD_SHA`, the PR's `headRefOid` captured at claim time
-  (step 2). Re-pin to a newer head **only** after deliberately rebasing onto it.
+  (step 2), **before** `gh pr checkout` — never re-read from the forge after
+  the fix work. Re-pin to a newer head **only** after deliberately rebasing
+  onto it, and to `git rev-parse HEAD` after each successful push of its own
+  (otherwise its second push in a session is rejected and looks foreign).
 - **A rebase/publish script**: the branch's live remote head read **before** the
   rebase runs.
 
-## Fails closed, not open
+## The pin does NOT fail closed on its own
 
-An expected value git cannot resolve locally — a sibling's commit this clone
-never fetched — makes the push **rejected** (`! [rejected] … (stale info)`),
-never accepted. The pinned form therefore fails closed in exactly the situation
-where the bare form fails open.
+git does not check that the expected value is a commit you have. A **full**
+40-hex pin to a commit this clone never fetched is **accepted**: if origin is at
+that commit, the push succeeds and overwrites it. That is exactly the state a
+late-read pin produces (e.g. `gh pr view --json headRefOid` after a sibling
+pushed), so a pin taken at the wrong moment launders the clobber just like the
+bare flag does. Only an *abbreviated* SHA git cannot resolve is refused
+(`cannot parse expected object name`) — no recipe should rely on that.
+
+So every pin is paired with an **incorporation check**, run **before** anything
+is rewritten (a rebase or amend drops the old head from `HEAD`'s history):
+
+```bash
+git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD || { echo "Pin not in HEAD: STOP." >&2; exit 1; }
+```
+
+or, in a script, `pin-flag --local-ref` (below), which performs the same check.
+With both halves the pinned form fails closed: a sibling push after the pin is
+rejected (`! [rejected] … (stale info)`), and a pin that is not yours stops the
+run before it rewrites anything. A missing pin means **stop** — never fall
+back to re-reading the head, which is the "freshen" trap above.
 
 ## The implementation: `loom-daemon push-lease pin-flag`
 
@@ -110,4 +129,8 @@ Doctor role prompt (§"Pin the lease").
 - `loom-daemon/src/cli/push_lease.rs`'s unit tests cover the subcommand itself
   against real git: the live tip is read from the remote (not the tracking
   ref), an unqueryable remote is an error rather than "absent", and a sibling's
-  unfetched commit is correctly reported as not incorporated.
+  unfetched commit is correctly reported as not incorporated. They also pin
+  down the git semantics the Doctor recipes depend on — a never-fetched
+  full-SHA pin is **accepted** (so the ancestry check is load-bearing), and a
+  second push needs a re-pin to the first push's `HEAD` — and assert the Doctor
+  prompt's recipes keep the claim-time pin, the ancestry check and the re-pin.

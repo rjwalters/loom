@@ -351,6 +351,164 @@ mod tests {
         assert!(!incorporated(Some(&work), &sibling_sha, "refs/heads/feature/x"));
     }
 
+    /// `git -C dir args…`: did it succeed? (For the pushes git must REJECT.)
+    fn git_ok(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git runs")
+            .status
+            .success()
+    }
+
+    fn rev_parse(dir: &Path, rev: &str) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", rev])
+            .output()
+            .expect("git");
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_string()
+    }
+
+    /// A sibling clone of `origin` pushes one commit to `feature/x`; returns its SHA.
+    fn sibling_pushes(tmp: &Path, origin: &Path) -> String {
+        let other = tmp.join("sibling");
+        run(
+            tmp,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        run(&other, &["checkout", "-q", "feature/x"]);
+        std::fs::write(other.join("s.txt"), "s\n").expect("write");
+        run(&other, &["add", "s.txt"]);
+        run(&other, &["commit", "-q", "-m", "sibling"]);
+        run(&other, &["push", "-q", "origin", "feature/x"]);
+        rev_parse(&other, "HEAD")
+    }
+
+    /// Negative control for the Doctor's ancestry check (#9487 operator
+    /// review): git does NOT fail closed on a pin this clone never fetched. A
+    /// full-SHA pin to the sibling's commit — what a pin re-read from the forge
+    /// AFTER their push looks like — is accepted and their commit overwritten.
+    /// `incorporated` (`git merge-base --is-ancestor <pin> HEAD`) is the only
+    /// thing that catches it, so it must run before anything is rewritten.
+    #[test]
+    fn a_never_fetched_full_sha_pin_is_accepted_so_the_ancestry_check_is_load_bearing() {
+        let (tmp, origin, work) = fixture();
+        let sibling = sibling_pushes(tmp.path(), &origin);
+        assert!(
+            !git_ok(&work, &["cat-file", "-e", &sibling]),
+            "precondition: this clone never fetched the sibling's commit"
+        );
+        // The guard refuses it…
+        assert!(!incorporated(Some(&work), &sibling, "HEAD"));
+
+        // …and without the guard, git happily clobbers.
+        std::fs::write(work.join("m.txt"), "m\n").expect("write");
+        run(&work, &["add", "m.txt"]);
+        run(&work, &["commit", "-q", "-m", "mine"]);
+        let lease = format!("--force-with-lease=feature/x:{sibling}");
+        assert!(
+            git_ok(&work, &["push", "-q", &lease, "origin", "feature/x"]),
+            "git accepts an unfetched full-SHA pin — the pin alone does not fail closed"
+        );
+        assert_eq!(
+            live_tip(Some(&work), "origin", "feature/x").expect("ls-remote"),
+            LiveTip::At(rev_parse(&work, "HEAD")),
+            "the sibling's commit was overwritten"
+        );
+    }
+
+    /// The Doctor re-pins to its own pushed `HEAD`. Without that, its second
+    /// push in a session is rejected exactly like a foreign push would be.
+    #[test]
+    fn a_second_push_needs_a_re_pin_to_the_first_pushs_head() {
+        let (_tmp, _origin, work) = fixture();
+        let claim = rev_parse(&work, "HEAD");
+        let commit = |name: &str| {
+            std::fs::write(work.join(name), "x\n").expect("write");
+            run(&work, &["add", name]);
+            run(&work, &["commit", "-q", "--amend", "--no-edit"]);
+        };
+
+        // First push: amended (a rewrite), pinned to the claim-time head.
+        commit("one.txt");
+        let first = format!("--force-with-lease=feature/x:{claim}");
+        assert!(git_ok(&work, &["push", "-q", &first, "origin", "feature/x"]));
+        let re_pin = rev_parse(&work, "HEAD");
+
+        // Second rewrite: the stale claim pin is now rejected…
+        commit("two.txt");
+        assert!(
+            !git_ok(&work, &["push", "-q", &first, "origin", "feature/x"]),
+            "a stale pin after your own push is rejected like a foreign push"
+        );
+        // …and the re-pin to the first push's HEAD goes through.
+        let second = format!("--force-with-lease=feature/x:{re_pin}");
+        assert!(git_ok(&work, &["push", "-q", &second, "origin", "feature/x"]));
+    }
+
+    /// Structural guard over the Doctor prompt's push recipes (#9487 operator
+    /// review): the pin comes from claim time (never a post-work forge read),
+    /// is ancestry-checked BEFORE the rebase, and is re-pinned after the
+    /// Doctor's own push. A refactor that drops any of these fails here.
+    #[test]
+    fn the_doctor_prompt_pins_at_claim_time_checks_ancestry_and_re_pins() {
+        let doctor = include_str!("../../../defaults/.claude/commands/loom/doctor.md");
+        assert!(
+            !doctor.contains("PUSH_LEASE_SHA=$(gh pr view"),
+            "a pin re-read from the forge after the fix work can be a sibling's push"
+        );
+        assert!(doctor.contains(r#"PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-${CLAIM_HEAD_SHA:?}}""#));
+        let guard = r#"git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD"#;
+        let re_pin = "{ PUSH_LEASE_SHA=$(git rev-parse HEAD); CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }";
+        assert!(doctor.matches(re_pin).count() >= 2, "both rewrite recipes re-pin");
+        // Every fenced block that rebases onto main and pushes a pinned lease
+        // checks ancestry first — except the one that pins `git rev-parse HEAD`
+        // right before the rebase, where the check is a tautology.
+        let mut guarded = 0;
+        for block in doctor.split("```").skip(1).step_by(2) {
+            let (Some(rebase), true) =
+                (block.find("git rebase origin/main"), block.contains("--force-with-lease=\"$"))
+            else {
+                continue;
+            };
+            if block.contains("PUSH_LEASE_SHA=$(git rev-parse HEAD)\n") {
+                continue;
+            }
+            let at = block
+                .find(guard)
+                .expect("pinned rebase recipe lacks the ancestry check");
+            assert!(at < rebase, "the ancestry check must run BEFORE the rebase");
+            guarded += 1;
+        }
+        assert!(guarded >= 2, "found {guarded} guarded recipes, expected >= 2");
+        assert!(
+            !doctor.contains("Re-read the real head"),
+            "a missing pin means STOP, not re-reading the head"
+        );
+        for line in doctor
+            .lines()
+            .filter(|l| l.contains("git push --force-with-lease"))
+        {
+            assert!(line.contains("--force-with-lease=\""), "bare lease: {line}");
+        }
+    }
+
     #[test]
     fn a_ref_that_does_not_resolve_is_reported_as_such() {
         let (_tmp, _origin, work) = fixture();
