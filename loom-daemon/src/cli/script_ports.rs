@@ -486,6 +486,11 @@ pub(crate) enum ScriptPortCommand {
     /// bypasses `lib/script-helper.sh`, whose missing-daemon path is a loud
     /// error: silence IS this entry point's interface.)
     FleetSend(super::fleet_send::FleetSendArgs),
+
+    /// This host's identity (#10023): `LOOM_HOST_ID` > `fleet.hostId` > the
+    /// persisted `~/.loom/host-id`. Backs every shell exporter's `host_id`,
+    /// so scripts and the daemon can never disagree. Exit 0 always.
+    HostId(super::host_id_cmd::HostIdArgs),
 }
 
 impl ScriptPortCommand {
@@ -551,6 +556,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::SecretScan(args) => args.run(),
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
             ScriptPortCommand::LabelDuplicates(args) => args.run(),
+            ScriptPortCommand::HostId(args) => args.run(),
         }
     }
 }

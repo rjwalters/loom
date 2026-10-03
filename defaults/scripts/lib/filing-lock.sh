@@ -143,16 +143,14 @@ loom_filing_lock_held() {
     esac
 }
 
-# Host identity, mirroring sweep_registry::host_identity()'s precedence (the
-# same helper sweep-lease-fence.sh uses) so the owner record this script writes
-# is comparable with one written by the daemon.
+# Host identity from `loom-daemon host-id` (#10023) -- the daemon's own
+# resolution, so the owner record this script writes is comparable with one
+# written by the daemon. `${LOOM_HOST_ID:-unknown-host}` only for a binary
+# without that subcommand.
 loom_filing_lock_host() {
-    if [[ -n "${LOOM_HOST_ID:-}" ]]; then printf '%s' "$LOOM_HOST_ID"; return 0; fi
-    if [[ -n "${HOSTNAME:-}" ]]; then printf '%s' "$HOSTNAME"; return 0; fi
     local h
-    h="$(hostname 2>/dev/null || true)"
-    if [[ -n "$h" ]]; then printf '%s' "$h"; return 0; fi
-    printf 'unknown-host'
+    h="$("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" host-id 2>/dev/null)" || h=""
+    printf '%s' "${h:-${LOOM_HOST_ID:-unknown-host}}"
 }
 
 # Age of a path in whole seconds. An unreadable mtime echoes -1 ("cannot age"),

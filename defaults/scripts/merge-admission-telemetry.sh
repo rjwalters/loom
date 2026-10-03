@@ -116,7 +116,8 @@ GIT_COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null) || {
 REPO_ROOT=$(cd "$(dirname "$GIT_COMMON_DIR")" && pwd -P)
 LOG_FILE="${LOOM_MERGE_ADMISSION_TELEMETRY_LOG:-$REPO_ROOT/.loom/logs/merge-admission-telemetry.jsonl}"
 
-HOST_ID="${LOOM_HOST_ID:-${HOSTNAME:-$(hostname 2>/dev/null || echo unknown-host)}}"
+# The daemon's own `host.id` (#10023); LOOM_HOST_ID only for an older binary.
+HOST_ID="$("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" host-id 2>/dev/null || printf '%s' "${LOOM_HOST_ID:-unknown-host}")"
 
 # --- Portable duration-string -> seconds -------------------------------------
 # Accepts a bare integer (seconds) or an integer with a single trailing unit

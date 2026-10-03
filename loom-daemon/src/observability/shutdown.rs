@@ -149,8 +149,16 @@ pub async fn intercept(request: &crate::types::Request) {
 /// Signal/IPC shutdown preserves active work; it exports only already-completed
 /// queued spans. SIGKILL cannot run this path and relies on persisted state.
 pub async fn exit(code: i32) -> ! {
-    flush_before_shutdown(Duration::from_secs(2)).await;
+    finish(code, Duration::from_secs(2)).await;
     std::process::exit(code)
+}
+
+/// Enqueue the `daemon.shutdown` record (Issue #10023), then run the bounded
+/// final drain — in that order, so the record is part of what the drain
+/// exports. Split from [`exit`] so the ordering is testable.
+pub(super) async fn finish(code: i32, budget: Duration) {
+    super::daemon_lifecycle::record_shutdown(code);
+    flush_before_shutdown(budget).await;
 }
 
 #[cfg(test)]

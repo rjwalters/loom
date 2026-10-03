@@ -284,6 +284,33 @@ RC=0
 (cd "$SANDBOX_REPO" && "$TELEMETRY_SH" --help >/dev/null 2>&1) || RC=$?
 if [[ "$RC" == "0" ]]; then pass "--help -> exit 0"; else fail "expected exit 0, got $RC"; fi
 
+# --- Test 9: host_id comes from `loom-daemon host-id` (#10023) ---------------
+echo ""
+echo "Test 9: host_id is the daemon's own host id, never \$HOSTNAME"
+
+STUB_BIN="$SANDBOX/stub-daemon"
+# shellcheck disable=SC2016 # literal stub body; $1 expands in the stub
+printf '#!/usr/bin/env bash\n[[ "$1" == host-id ]] && { echo loom-host-stub00000001; exit 0; }\nexit 2\n' >"$STUB_BIN"
+chmod +x "$STUB_BIN"
+(cd "$SANDBOX_REPO" && HOSTNAME=shell-name LOOM_HOST_ID=ignored-by-stub LOOM_DAEMON_SELF_BIN="$STUB_BIN" \
+    "$TELEMETRY_SH" record --pr 9 --repo acme/widgets --action merge --reason x >/dev/null 2>&1)
+if [[ "$(tail -1 "$LOG_FILE" | jq -r '.host_id')" == "loom-host-stub00000001" ]]; then
+    pass "host_id is what loom-daemon host-id printed"
+else
+    fail "host_id did not come from loom-daemon host-id: $(tail -1 "$LOG_FILE")"
+fi
+
+OLD_BIN="$SANDBOX/old-daemon"
+printf '#!/usr/bin/env bash\necho "error: unrecognized subcommand" >&2\nexit 2\n' >"$OLD_BIN"
+chmod +x "$OLD_BIN"
+(cd "$SANDBOX_REPO" && HOSTNAME=shell-name LOOM_HOST_ID=pinned-host LOOM_DAEMON_SELF_BIN="$OLD_BIN" \
+    "$TELEMETRY_SH" record --pr 10 --repo acme/widgets --action merge --reason x >/dev/null 2>&1)
+if [[ "$(tail -1 "$LOG_FILE" | jq -r '.host_id')" == "pinned-host" ]]; then
+    pass "an older binary without host-id falls back to \$LOOM_HOST_ID, not \$HOSTNAME"
+else
+    fail "unexpected fallback host_id: $(tail -1 "$LOG_FILE")"
+fi
+
 # ---------------------------------------------------------------------------
 echo ""
 echo "================================"

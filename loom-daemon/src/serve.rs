@@ -267,8 +267,8 @@ pub fn validate_bind(addr: IpAddr, allow_non_loopback: bool) -> Result<(), Strin
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusSnapshot {
     /// This host's identity, via [`crate::sweep_registry::host_identity`]
-    /// (`LOOM_HOST_ID` env > `$HOSTNAME` env > the `hostname` binary >
-    /// `"unknown-host"`) — loom's single existing host-identity concept,
+    /// (`LOOM_HOST_ID` env > `fleet.hostId` > the persisted `~/.loom/host-id`,
+    /// #10023) — loom's single existing host-identity concept,
     /// reused rather than inventing a second one for this endpoint.
     pub hostname: String,
     #[serde(flatten)]
