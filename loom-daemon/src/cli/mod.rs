@@ -75,6 +75,7 @@ mod merge_pr_stacked_children;
 mod merge_pr_stale_checks;
 mod merge_pr_version_policy;
 mod merge_pr_worktree_preserve;
+mod merge_pr_worktree_teardown;
 mod merge_pr_worktrees;
 mod merge_pr_zero_checks;
 pub(crate) mod misc_cmds;
