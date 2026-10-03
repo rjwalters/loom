@@ -596,13 +596,25 @@ ClickHouse after changing the setting, including derived tables; record it in
 rollups, but leaves some metadata, reduced-metric and legacy tables at 15 or
 30 days (one month for `top_level_operations`). For this isolated trial, apply
 the reviewed `retention.sql` after the API settings — it sets those existing
-TTLs to 7 days for logs/traces and 30 days for metrics, and restores 30 days
-on a trial that ran its earlier all-seven-day version — using the private
-bundled client:
+TTLs to 7 days for logs/traces and 30 days for metrics, and restores the
+30-day *policy* (not the data) on a trial that ran its earlier all-seven-day
+version — using the private bundled client:
 
 ```console
 docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < retention.sql
 ```
+
+**This deletes data as it runs**, and the deletion is not recoverable:
+`MODIFY TTL` materialises on existing parts, so every row already past the new
+window is gone when the command returns rather than at some later merge. Read
+`retention.sql`'s header before applying it — it carries five behaviours
+measured against the pinned engine by
+`loom-daemon/tests/signoz_retention_ttl.rs` (#8528), including a units slip
+that deletes an entire table while reporting success. **Confirm the command
+printed 16 host rows all reading status 0**: one failing statement stops the
+client, and because the metric statements are last, a partial run shortens
+logs/traces to 7 days while skipping every statement that restores 30 days to
+metrics.
 
 Re-run `queries.sql` after every upgrade or retention-setting change. Resource
 fingerprint tables retain the upstream **30-minute grace beyond seven days**;
@@ -613,8 +625,26 @@ metadata is erased at either boundary. Confirm the split from effective DDL,
 not from the settings page:
 
 ```console
-docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT database, name, extract(create_table_query, 'TTL (.*?)(SETTINGS|\$)') FROM system.tables WHERE database IN ('signoz_logs', 'signoz_traces', 'signoz_metrics') AND create_table_query LIKE '%TTL%' AND engine NOT LIKE 'Distributed%' ORDER BY database, name"
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT database, name, extract(create_table_query, 'TTL (.*?)(SETTINGS|\$)') AS ttl, extract(create_table_query, 'ttl_only_drop_parts = \d') AS only_drop_parts FROM system.tables WHERE database IN ('signoz_logs', 'signoz_traces', 'signoz_metrics') AND create_table_query LIKE '%TTL%' AND engine NOT LIKE 'Distributed%' ORDER BY database, name"
 ```
+
+The TTL column is the **policy**. `ttl_only_drop_parts` is half of the
+**outcome**: where it is set, a part holding one over-age row and one in-window
+row keeps both, so a row well past seven days stays queryable until an
+unrelated merge rewrites that part (measured, with the setting-off and
+two-separate-parts controls run alongside it, in
+`loom-daemon/tests/signoz_retention_ttl.rs`). The other half is per part, and
+needs no per-table time column because ClickHouse stores each part's computed
+TTL instants:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT database, table, count() AS parts, sum(rows) AS rows, countIf(delete_ttl_info_max < now()) AS fully_expired_parts, countIf(delete_ttl_info_min < now() AND delete_ttl_info_max >= now()) AS partly_expired_parts, min(delete_ttl_info_min) AS oldest_row_ttl FROM system.parts WHERE active AND database IN ('signoz_logs', 'signoz_traces', 'signoz_metrics') AND delete_ttl_info_min > toDateTime(0) GROUP BY database, table ORDER BY database, table"
+```
+
+`fully_expired_parts` above zero means TTL merges are behind (check the merge
+failure count in "ClickHouse self-telemetry" below).
+`partly_expired_parts` above zero on a `ttl_only_drop_parts = 1` table is the
+stuck case: those rows are past the window and will not be deleted on their own.
 
 `signoz_logs.logs_v2` keys its TTL on a per-row `_retention_days` column rather
 than a literal interval, so read that column's `default_expression` from
