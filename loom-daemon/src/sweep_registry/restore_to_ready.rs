@@ -37,11 +37,6 @@ impl SweepRegistry {
     /// lives here (a sibling module) so the size-ratcheted `guards.rs` only
     /// keeps the delegating entry point.
     pub(crate) fn restore_label_to_ready_with_state_check(&self, issue: u32) -> Result<()> {
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
         let blocked = self.issue_has_blocked_label(issue);
         // Only probe `loom:operator-only` when `loom:blocked` doesn't already
         // decide the outcome — avoids a redundant `gh` call in the (more
@@ -63,12 +58,13 @@ impl SweepRegistry {
             // contract: `None` falls back to the unconditional restore.
             self.fetch_issue_signals(issue).closed
         };
-        let mut cmd = Command::new(&gh);
-        cmd.arg("issue")
-            .arg("edit")
-            .arg(issue.to_string())
-            .arg("--remove-label")
-            .arg("loom:building");
+        let mut args = vec![
+            "issue".to_string(),
+            "edit".to_string(),
+            issue.to_string(),
+            "--remove-label".to_string(),
+            "loom:building".to_string(),
+        ];
         if blocked {
             log::info!(
                 "sweep_registry: restore_label_to_ready for #{issue} found `loom:blocked` \
@@ -96,26 +92,15 @@ impl SweepRegistry {
                  to a closed issue."
             );
         } else {
-            cmd.arg("--add-label").arg("loom:issue");
+            args.extend(["--add-label".to_string(), "loom:issue".to_string()]);
         }
-        // Scope the restore to the registry's workspace so the crash-path label
-        // recovery resolves against the right repo in a multi-workspace daemon
-        // (#3937). LOOM_REPO still overrides when set.
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        // Best-effort during reap, but bounded so a wedged `gh` on the
-        // `ListSweeps` / `GetSweepStatus` read path cannot block the registry
-        // read indefinitely (Issue #3973).
+        // Scoped to the registry's workspace (#3937; LOOM_REPO still overrides)
+        // and counted as `restore.label` (#10089). Best-effort during reap, but
+        // bounded so a wedged `gh` on the `ListSweeps` / `GetSweepStatus` read
+        // path cannot block the registry read indefinitely (Issue #3973).
+        args.extend(crate::claim_reconciliation::gh_call::loom_repo_flag());
         let timeout = reap_gh_timeout();
-        if output_with_timeout(cmd, timeout)?.is_none() {
+        if self.gh_write("restore.label", &args)?.is_none() {
             log::warn!(
                 "sweep_registry: restore_label_to_ready gh for #{issue} exceeded {}s \
                  and was killed (#3973)",
