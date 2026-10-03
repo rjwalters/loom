@@ -47,6 +47,7 @@ use std::process::{Command, Stdio};
 
 use super::{VerdictKind, VerdictPr, VerdictReconcileStats};
 use crate::verdict_equivalence::{self, Equivalence, EquivalenceKind};
+use crate::verdict_stale_notice::UntrustedVerdictMarker;
 
 // The carve-out's kill switch (`LOOM_VERDICT_TREE_CARVEOUT`, nested here inside
 // [`super::VERDICT_STALENESS_ENABLED_ENV`]) moved to the shared module with the
@@ -113,17 +114,21 @@ pub(super) fn handle_invalidate(
             return;
         }
     }
-    match invalidate_verdict(gh_bin, root, pr, marker_sha, head_sha) {
+    // #9709: was a NEWER marker for this verdict dropped as untrusted? Then the
+    // notice and the log line must say so rather than assert a plain head move.
+    let untrusted = probe_untrusted_marker(gh_bin, root, pr);
+    match invalidate_verdict(gh_bin, root, pr, marker_sha, head_sha, untrusted.as_ref()) {
         Ok(comment_skipped) => {
             stats.invalidated += 1;
             stats.redundant_comments_skipped += usize::from(comment_skipped);
             log::warn!(
                 "claim_reconciliation: cleared stale {} from PR #{} in {} (verdict recorded for \
                  {marker_sha}, head is now {head_sha}) — re-queued as loom:review-requested \
-                 (#5686)",
+                 (#5686){}",
                 pr.kind.label(),
                 pr.number,
                 root.display(),
+                crate::verdict_stale_notice::log_note(untrusted.as_ref()),
             );
         }
         Err(e) => {
@@ -243,6 +248,7 @@ fn invalidate_verdict(
     pr: &VerdictPr,
     marker_sha: &str,
     head_sha: &str,
+    untrusted: Option<&UntrustedVerdictMarker>,
 ) -> Result<bool> {
     let label = pr.kind.label();
     // `None` (the common case: nothing was armed) contributes no line at
@@ -267,7 +273,13 @@ fn invalidate_verdict(
             root.display(),
         );
     } else {
-        let body = super::verdict_stale_comment::body(label, marker_sha, head_sha, &disarm_line);
+        let body = super::verdict_stale_comment::attributed_body(
+            label,
+            marker_sha,
+            head_sha,
+            &disarm_line,
+            untrusted,
+        );
         let mut cmd = Command::new(gh_bin);
         cmd.arg("pr")
             .arg("comment")
@@ -341,4 +353,27 @@ fn invalidate_verdict(
         ));
     }
     Ok(skipped)
+}
+
+/// The newer-than-trusted verdict marker the trust filter dropped on this PR,
+/// if any (#9709) — attribution for the notice, never evidence: the decision
+/// above was already made from trusted markers only, and nothing here can
+/// change it. One extra comment read, on the (rare) invalidation path only.
+/// `None` on any read failure, which falls back to the plain head-moved wording.
+fn probe_untrusted_marker(
+    gh_bin: &Path,
+    root: &Path,
+    pr: &VerdictPr,
+) -> Option<UntrustedVerdictMarker> {
+    let mut cmd = Command::new(gh_bin);
+    cmd.arg("api")
+        .arg(format!("repos/{{owner}}/{{repo}}/issues/{}/comments", pr.number))
+        .arg("--paginate");
+    cmd.current_dir(root);
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = cmd.output().ok().filter(|o| o.status.success())?;
+    let items = crate::comment_trust::parse_listing(&out.stdout)?;
+    let policy = crate::comment_trust::TrustPolicy::for_root(root);
+    crate::verdict_stale_notice::untrusted_newer_marker(&policy, &items, pr.kind)
 }
