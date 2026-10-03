@@ -1012,9 +1012,9 @@ exactly one sub-kind in the **same** command (additive; filters unchanged):
 | Sub-kind | Apply when |
 |---|---|
 | `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
-| `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required; also send one mail (below) |
+| `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required. **Also send its chore mail** (#10000) |
 | `loom:operator-decision` | The act requires authority you structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) |
-| `loom:operator-objective` | Do not apply: file `loom:operator-decision` with the candidate objectives as its options (#10000) |
+| `loom:operator-objective` | Not applied (#10000): a missing objective is `loom:operator-decision`, the candidate objectives as its ranked options |
 
 ```bash
 # Builder parking a claimed issue on a decision: 2-4 ranked options, each with
@@ -1042,10 +1042,9 @@ pass can tell when the blocker clears.
 **If you chose `loom:operator-decision`**, the options' whys MUST name the
 disagreement axis and why it is a preference, not a fact.
 
-**If you chose `loom:operator-mechanical`**, also send ONE keyed mail (`mechanical-issue` key; resolve when it clears): `curator.md` → "Mail for `loom:operator-mechanical`". **`loom:operator-objective` is not an ask (#10000):** file `loom:operator-decision`, the candidate objectives as its ranked options.
-
-Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
-"`loom:operator-only` sub-kinds".
+Full taxonomy: `.loom/docs/label-state-machine.md` → "`loom:operator-only`
+sub-kinds"; how the human is told (decision or mail, nothing else): its
+"Two ways to reach a human"; the mail: `.loom/docs/inbox-mail.md` → "Chore mail".
 
 **Composes with the work-finder**: a **closed** issue leaves the queue automatically (the autonomous work-finder only polls *open* `loom:issue` items), so a well-reasoned close is not re-picked-up. A **rescoped** issue must have its labels reset so it is not re-dispatched in a loop with a stale scope.
 

@@ -48,7 +48,11 @@ An agent reaches a human in exactly two ways: a call is a decision, a human task
 1. **It needs a call made:** file a decision (`loom:operator-decision`, 2 to 4 ranked options, each with a why).
 2. **It needs a human to do something:** send one keyed mail to the loom-ui inbox saying in a sentence what to do, and resolve it when the item clears. Helper, key scheme and no-op-when-unconfigured behavior: [`inbox-mail.md`](inbox-mail.md).
 
-Nothing else asks a human. The `loom:operator*` labels keep their engine meaning (skip, hold, dispatch lanes) and no label is removed; they are engine-internal, not how a human finds out. Per label: `loom:operator-mechanical` sends one mail (`mechanical-issue`/`mechanical-pr` key); `loom:operator-objective` is filed as a `loom:operator-decision` (the candidate objectives are the options); `loom:operator-blocked` sends nothing (a wait on another issue is not a human's move). The Champion critical-file hold sends one mail once the PR is otherwise mergeable.
+Nothing else asks a human. The `loom:operator*` labels keep their engine meaning (skip, hold, dispatch lanes) and no label is removed; they are engine-internal, not how a human finds out. Every role that applies one follows this section, its one statement:
+
+- `loom:operator-mechanical` (a human chore): one chore mail naming the action and linking the item, resolved when it clears ([`inbox-mail.md`](inbox-mail.md) → "Chore mail").
+- `loom:operator-decision`: the decision is the ask; no mail. `loom:operator-objective`: not applied; file a decision whose ranked options are the candidate objectives.
+- `loom:operator-blocked`: nothing (a wait on another item is not a human's move). The Champion critical-file hold (bare `loom:operator`) mails once the PR is otherwise mergeable.
 
 ## Definition
 
@@ -406,7 +410,7 @@ by four sub-kind labels applied *alongside* it:
 | `loom:operator-blocked` | Waiting on a named issue, PR, or piece of infrastructure that does not exist yet — the condition is transient and expected to clear once that lands | Yes — a future pass can safely re-evaluate once the named blocker closes/merges |
 | `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required | No (needs the action to happen) |
 | `loom:operator-decision` | The act requires authority the operator alone holds — a preference call or an authority act (binds the entity/a third party, irreversible public disclosure, spending/authorisation, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) | No (needs a human ruling) |
-| `loom:operator-objective` | The decision is determined once the operator states an objective — the item names the candidate objectives and the answer under each (#5826) | Yes — clears the moment the objective is given, and one answer often unblocks several items at once |
+| `loom:operator-objective` | The decision is determined once the operator states an objective — the item names the candidate objectives and the answer under each (#5826). Roles no longer apply it (#10000): that is a decision with the objectives as its options | Yes — clears the moment the objective is given, and one answer often unblocks several items at once |
 
 **Dispatch semantics vs. the "no judgement required" framing (#6881).**
 "Self-clearing?" above answers a different question than "does sweep/shepherd
@@ -552,8 +556,8 @@ into a capability request.
 
 **When anything encountered turns out to require a judgement call** rather than
 mechanical execution, the worker hard-stops and relabels
-`loom:operator-mechanical` → `loom:operator-decision` (or
-`loom:operator-objective`), which makes the stop durable: gate 2 refuses the
+`loom:operator-mechanical` → `loom:operator-decision` (resolving its chore
+mail), which makes the stop durable: gate 2 refuses the
 item on every later pass.
 
 `loom:needs-capability` is **unaffected** — different label, different problem
@@ -570,7 +574,7 @@ split instead of asking "how hard is this call":
 | Kind | Definition | Correct response |
 |---|---|---|
 | **Determined** | The answer follows from physics/constraints/prior art once the analysis is finished — nobody has derived it yet | Derive it. This was never a decision — keep working. |
-| **Underdetermined** | Multiple defensible answers survive *full* analysis because the objective function is contested | State the candidate objectives (`loom:operator-objective`), or, if the axis is a genuine preference/authority call rather than a missing objective, `loom:operator-decision` |
+| **Underdetermined** | Multiple defensible answers survive *full* analysis because the objective function is contested | `loom:operator-decision`, its ranked options the candidate objectives (#10000) or the preference/authority options |
 | **Authority** | Orthogonal to the above — the act requires authority an agent structurally cannot hold, however determined the answer is (see the category list in the sub-label table above) | `loom:operator-decision` or `loom:operator-mechanical`, whichever fits |
 
 **The falsifiability test** — what makes "underdetermined" checkable instead
@@ -606,7 +610,7 @@ judgement call as a disguise. Keep working; don't park it.
    the analysis instead of parking. Only apply `loom:operator-only` once you
    can point to one of:
    - a specific named blocker (→ `loom:operator-blocked`),
-   - a candidate-objective list (→ `loom:operator-objective`),
+   - a candidate-objective list (→ `loom:operator-decision`, the objectives as its options; #10000),
    - a concrete mechanical action (→ `loom:operator-mechanical`), or
    - a nameable preference/authority axis (→ `loom:operator-decision`).
 
@@ -633,27 +637,26 @@ judgement call as a disguise. Keep working; don't park it.
    the falsifiability test above and write down its result. An application
    that cannot name the axis is a bug: the item is determined, not
    underdetermined, and belongs in the normal queue.
-5. **When the sub-kind is `loom:operator-objective`, the same comment MUST
-   list the candidate objectives and the answer under each (#5826)** — not
-   just "needs an objective." The point of the sub-kind is that the operator
-   can clear it with a single preference statement, which only works if the
-   candidates and their downstream answers are already spelled out.
+5. **A missing objective is filed as `loom:operator-decision`, never
+   `loom:operator-objective` (#10000)**: the comment ranks the candidate
+   objectives as its 2-4 options, each with the answer under it and a why, so
+   one preference statement clears it. **`loom:operator-mechanical` also sends
+   its chore mail** (§"Two ways to reach a human").
 6. **No backfill.** Existing plain `loom:operator-only` issues are not
    required to gain a sub-label retroactively — no code path may assume every
    `loom:operator-only` issue already carries one. The value is in the intake
    rate, not a one-time migration.
 
 **Where this is wired today** — every role that can apply the label (#5819),
-with `loom:operator-objective` available to all of them as a fourth choice
-(#5826):
+all following §"Two ways to reach a human" (#10000):
 
 | Role | Site | Sub-kind it applies |
 |---|---|---|
 | Champion | Unrevised-proposal N=2 escalation (`champion-issue-promo.md`), epic-complete-unpromoted escalation (`champion-common.md`) | `loom:operator-blocked` when the recurring finding is itself a live, open dependency; `loom:operator-decision` otherwise. **Exception, no label applied (#7657)**: when every recurring finding is `premise-false` (a cited path/line-range/repo-state claim, re-verified false on current `main`), Champion closes the proposal (`<!-- champion:premise-false-closed:<main-sha> -->`, `gh issue close --reason "not planned"`) instead of escalating — no `loom:operator-only` and no sub-kind, since nothing is routed to a human. Any mixed premise-false + ordinary finding set still escalates via the row above, unchanged. |
 | Champion | Dependency-cycle detector (`detect-dependency-cycle.sh`, invoked from `champion-issue-promo.md` and `champion-pr-merge.md`), capped-PR close recommendation (`champion-pr-merge.md`) | `loom:operator-decision` — matching their own rationale ("breaking a cycle is a human decision" / "the approach itself is not viable") |
-| Curator | "Applying `loom:operator-only`" (`curator.md`) — routing an issue that encodes a still-pending human decision instead of closing it | Caller's choice among all four sub-kinds |
-| Builder | "Applying `loom:operator-only`" (`builder.md`) — parking a claimed issue that turns out to need a human; `builder-complexity.md` additionally states that a *size* finding is `loom:blocked`, never this label | Caller's choice among all four sub-kinds |
-| Judge | "Applying `loom:operator-only`" (`judge.md`) — an issue surfaced during review, or a PR raising a question only a human can answer | Caller's choice among all four sub-kinds |
+| Curator | "Applying `loom:operator-only`" (`curator.md`) — routing an issue that encodes a still-pending human decision instead of closing it | Caller's choice of sub-kind |
+| Builder | "Applying `loom:operator-only`" (`builder.md`) — parking a claimed issue that turns out to need a human; `builder-complexity.md` additionally states that a *size* finding is `loom:blocked`, never this label | Caller's choice of sub-kind |
+| Judge | "Applying `loom:operator-only`" (`judge.md`) — an issue surfaced during review, or a PR raising a question only a human can answer | Caller's choice of sub-kind |
 | Doctor | "Applying `loom:operator-only`" (`doctor.md`) — the rare case a Doctor session parks a PR it cannot fix without host/credential access (Doctor otherwise only *filters* on the label) | Caller's choice; `loom:operator-mechanical` is the typical Doctor case |
 
 See #5664 for the incident that motivated distinguishing the transient

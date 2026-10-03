@@ -373,11 +373,8 @@ is on the default branch, however many children closed.
 
 ```bash
 git fetch origin --quiet   # the check reads the remote's tip, not a stale local ref
-# Path-shaped backticked tokens in the epic body. The required directory
-# component is deliberate: it keeps `loom:epic-phase`, `cargo check`, and a
-# prose "see README.md" out of the deliverable set, at the cost of missing a
-# top-level file — precision matters more here, because a false "missing" only
-# downgrades to an ask while a false "present" would close live work.
+# Backticked paths WITH a directory: keeps `loom:epic-phase` and prose
+# "README.md" out. Precision wins: a false "missing" only downgrades to an ask.
 DELIVERABLES=$(printf '%s\n' "$EPIC_BODY" \
   | grep -Eo '`[A-Za-z0-9._/-]+/[A-Za-z0-9._-]+\.[A-Za-z0-9]+`' | tr -d '`' | sort -u)
 MISSING=""
@@ -386,9 +383,8 @@ for P in $DELIVERABLES; do
 done
 ```
 
-An epic naming no path-shaped deliverable satisfies this vacuously — the same
-evidence standard "Epic Completion" below closes on. A **non-empty** `$MISSING`
-downgrades the candidate to 0c's operator ask, which must name the missing path
+No path-shaped deliverable satisfies this vacuously (the standard "Epic
+Completion" below closes on). A **non-empty** `$MISSING` downgrades the candidate to 0c's operator ask, which must name the missing path
 and must **not** assert completion. The grep is a floor: if you can *see* the
 epic promising an artifact it did not capture, verify that too, and ask rather
 than close when you cannot.
@@ -415,13 +411,13 @@ All $EPIC_CHILD_STRONG_CLOSED linked children are closed (discovered via: $EPIC_
 ---
 *Automated by Champion role*"
 else
-  # Not confident enough to close unilaterally — one mechanical ask, then hands off.
-  # loom:operator-mechanical, not -decision: "is this epic done?" is a fact the
-  # operator can confirm by looking, not a preference call.
+  # Not confident enough to close: one mechanical ask (-mechanical, not -decision:
+  # "is this epic done?" is a fact to confirm, not a preference), then hands off.
   ASK_MARKER="<!-- champion:epic-completion-ask -->"
+  eval "$(awk '/^```bash inbox-mail/{f=1;next} /^```/{f=0} f' .loom/docs/inbox-mail.md 2>/dev/null)"; type inbox_mail >/dev/null 2>&1 || inbox_mail() { [ "$1" != on ]; }
   printf '%s\n' "$EPIC_JSON" | jq -e --arg m "$ASK_MARKER" \
     '.comments[] | select(.body | contains($m))' >/dev/null || {
-    ./.loom/scripts/post-comment.sh "$EPIC_NUMBER" --body "$ASK_MARKER
+    ./.loom/scripts/post-comment.sh "$EPIC_NUMBER" --body "$ASK_MARKER<!-- loom:chore-mail -->
 **Champion: This Epic Looks Complete — Close?**
 
 Every child found for this epic is closed (via: $EPIC_CHILD_SOURCES), so its structural Phase 1/2/3 criteria are no longer meaningful to re-run. $UNCERTAINTY
@@ -430,15 +426,15 @@ Close it, or say what is outstanding.
 
 ---
 *Automated by Champion role*" \
-      && gh issue edit "$EPIC_NUMBER" --add-label "loom:operator-only,loom:operator-mechanical"
+      && gh issue edit "$EPIC_NUMBER" --add-label "loom:operator-only,loom:operator-mechanical" \
+      && inbox_mail chore issue "$EPIC_NUMBER" "Close this epic if it is done, or say what is outstanding"
   }
 fi
 ```
 
-`$UNCERTAINTY` is the one specific reason this is an ask rather than a close —
-0b's missing path, "containment was never established (prose references only)",
-or criterion 4's outstanding-content comment. A bare "not confident" does not
-satisfy it.
+`$UNCERTAINTY` is the one specific reason this is an ask, not a close — 0b's
+missing path, "containment never established (prose references only)", or
+criterion 4's outstanding-content comment; a bare "not confident" does not do.
 
 Either branch **ends the pass for this epic**: do not fall through to Step 1.
 Neither counts against "Epic Rate Limiting" below, and the guard's

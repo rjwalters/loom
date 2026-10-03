@@ -104,7 +104,7 @@ Three rules, all mandatory, all reported in the proposal itself:
   ```bash
   gh issue edit N --remove-label "loom:operator-mechanical" --add-label "loom:operator-decision"
   ```
-  (or `loom:operator-objective` when the blocker is a missing objective rather than an authority call — see the "classifying question" table in `.loom/docs/label-state-machine.md`). The relabel is what makes the stop durable: the item is no longer eligible for this lane on any subsequent pass, by gate 2. **Do not** finish the mechanical part first and flag the judgement afterwards — a partially-completed mechanical action plus an open question is exactly the state this rule exists to prevent.
+  then resolve its chore mail (`inbox_mail resolve "$(inbox_mail key chore-issue N)"`, `.loom/docs/inbox-mail.md`). A missing objective is a decision too, its options the candidate objectives (#10000). The relabel is what makes the stop durable: the item is no longer eligible for this lane on any subsequent pass, by gate 2. **Do not** finish the mechanical part first and flag the judgement afterwards — half a mechanical action plus an open question is the state this rule prevents.
 
 ### Scope
 

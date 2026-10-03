@@ -1576,7 +1576,9 @@ the ones sitting in a hold-only suspension (#6852) — both still carry
 ## Held-PR Census (report every pass, #6720)
 
 **Hold mail (#10000), once per pass:** a critical-file-held PR is merged by a human, never here, so resolve its mail by marker (no-op unconfigured; loader in `.loom/docs/inbox-mail.md`):
-`inbox_mail resolve-merged crithold-pr "<!-- champion:critical-file-hold -->"`
+`inbox_mail resolve-merged crithold-pr "<!-- champion:critical-file-hold -->"`;
+chore mail (`.loom/docs/inbox-mail.md` → "Chore mail") likewise:
+`inbox_mail resolve-closed issue; inbox_mail resolve-closed pr`
 
 A hold is invisible unless someone counts them. The 21-deep pile above was found
 only because an operator inspected PR labels by hand. Run this once per Champion

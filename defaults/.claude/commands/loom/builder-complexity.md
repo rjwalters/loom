@@ -86,8 +86,8 @@ gh issue edit 812 --remove-label "loom:building" --add-label "loom:blocked"
 > PO-level decision or a human-hands step (#10001; rule: `curator.md` →
 > "Applying `loom:operator-only`"), never "requires judgement". When you do
 > apply it, **never apply it alone** — add exactly one sub-kind in that command
-> (`loom:operator-blocked` / `loom:operator-mechanical` /
-> `loom:operator-decision` / `loom:operator-objective`), e.g.
+> (`loom:operator-blocked` / `loom:operator-mechanical` + its chore mail /
+> `loom:operator-decision`; never `-objective`, #10000), e.g.
 > `loom-daemon operator-decision apply 812 --input d.json --also-label loom:operator-only --remove-label loom:building`.
 > Being unsure which sub-kind fits means the analysis isn't finished — it is
 > **not** a reason to default to `loom:operator-decision` (#5826). Full rule,

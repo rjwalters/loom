@@ -33,9 +33,9 @@ type inbox_mail >/dev/null 2>&1 || inbox_mail() { [ "$1" != on ]; }
 
 ```bash inbox-mail
 # inbox_mail send|resolve KEY [BODY] | key KIND N | on | resolve-merged KIND MARKER
-#   (BODY required for send; optional TITLE, TO)
+#   | chore issue|pr N ACTION | resolve-closed issue|pr  (optional TITLE, TO)
 inbox_mail() {
-  local mode="${1:-}" key="${2:-}" body="${3:-}" pf out rc code r n
+  local mode="${1:-}" key="${2:-}" body="${3:-}" pf out rc code r n l=
   case "$mode" in
     key) r=$(git remote get-url origin 2>/dev/null); r=${r%/}; r=${r%.git}; r=${r##*/}; r=${r##*:}
       echo "mail-${r:-repo}-$key-$body"; return 0 ;;
@@ -44,14 +44,27 @@ inbox_mail() {
   if ! inbox_mail on; then
     echo "inbox not configured — mail $mode skipped (key $key)"; return 0
   fi
-  if [ "$mode" = resolve-merged ]; then
-    # Filter on merge date in the query: plain --limit orders by creation, and a
-    # held PR is usually days old when it merges. GNU date, then BSD date.
+  case "$mode:$key" in chore:issue|chore:pr|resolve-closed:issue|resolve-closed:pr) ;;
+    chore:*|resolve-closed:*) echo "inbox mail: $mode needs issue|pr"; return 0 ;; esac
+  if [ "$mode" = chore ]; then
+    [ -n "${4:-}" ] || { echo "inbox mail: chore needs an action, not sent"; return 0; }
+    r=$(gh "$key" view "$body" --json url -q .url 2>/dev/null)
+    inbox_mail send "$(inbox_mail key "chore-$key" "$body")" "$4${r:+ — $r}"; return 0
+  fi
+  if [ "$mode" = resolve-merged ] || [ "$mode" = resolve-closed ]; then
+    # Filter on merge/close date in the query: plain --limit orders by creation,
+    # and a held item is usually days old when it clears. GNU date, then BSD date.
     r=$(date -u -d '-2 days' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-2d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
-    [ -n "$r" ] || { echo "inbox mail: no date, resolve-merged skipped"; return 0; }
-    out=$(gh pr list --state merged --limit 100 --search "merged:>=$r" --json number,comments 2>/dev/null)
-    [ "$(jq length <<<"$out" 2>/dev/null)" = 100 ] && echo "inbox mail: 100 merges in 48h, window truncated"
-    jq -r --arg m "$body" '.[] | select(any(.comments[]?; .body | contains($m))) | .number' <<<"$out" 2>/dev/null |
+    [ -n "$r" ] || { echo "inbox mail: no date, $mode skipped"; return 0; }
+    if [ "$mode" = resolve-merged ]; then
+      out=$(gh pr list --state merged --limit 100 --search "merged:>=$r" --json number,comments 2>/dev/null)
+    else # a chore clears when its item closes (a merged PR is closed too)
+      out=$(gh "$key" list --state all --limit 100 --search "closed:>=$r" --json number,labels,comments 2>/dev/null)
+      body='<!-- loom:chore-mail -->' l=loom:operator-mechanical key="chore-$key"
+    fi
+    [ "$(jq length <<<"$out" 2>/dev/null)" = 100 ] && echo "inbox mail: 100 items in 48h, window truncated"
+    jq -r --arg m "$body" --arg l "$l" '.[] | select(any(.comments[]?; .body | contains($m))
+        or ($l != "" and any(.labels[]?; .name == $l))) | .number' <<<"$out" 2>/dev/null |
       while read -r n; do inbox_mail resolve "$(inbox_mail key "$key" "$n")"; done
     return 0
   fi
@@ -76,6 +89,28 @@ inbox_mail() {
   return 0
 }
 ```
+
+## Chore mail (`loom:operator-mechanical`)
+
+A role applying `loom:operator-only,loom:operator-mechanical` (a human chore: a
+credential, host access, hardware) sends one chore mail right after the label
+edit. ACTION is one imperative sentence naming the step; the item's URL is
+appended. Key `mail-<repo>-chore-issue-<N>` (or `-chore-pr-<N>`):
+
+```bash
+# loader above first
+inbox_mail chore issue "$N" "Rotate the deploy key on build-host-2"   # pr for a PR
+```
+
+- Put `<!-- loom:chore-mail -->` in the routing comment.
+- **Resolve.** Champion runs `inbox_mail resolve-closed issue` and `... pr` once
+  per pass: it resolves chore mail for every item closed in the last 48h that
+  still carries `loom:operator-mechanical` or that marker. A role moving an
+  item off `loom:operator-mechanical` without closing it resolves it itself:
+  `inbox_mail resolve "$(inbox_mail key chore-issue "$N")"`.
+- No mail for `loom:operator-blocked` (a wait) or `loom:operator-decision` (the
+  decision is the ask). Roles do not apply `loom:operator-objective`: it is filed
+  as a decision whose ranked options are the candidate objectives.
 
 Test: `defaults/scripts/tests/test-inbox-mail.sh` (extracts the fence above and
 drives the loader with the doc missing).

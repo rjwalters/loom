@@ -480,13 +480,15 @@ operator-hold exclusion above and every filter keyed on it are unaffected:
 | Sub-kind | Apply when |
 |---|---|
 | `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
-| `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required (the typical Doctor case: a fix that requires a secret rotation or a machine you cannot reach) |
+| `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required (the typical Doctor case: a fix that requires a secret rotation or a machine you cannot reach). **Also send its chore mail** (#10000) |
 | `loom:operator-decision` | The fix requires authority you structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) |
-| `loom:operator-objective` | Do not apply: file `loom:operator-decision` with the candidate objectives as its options (#10000) |
+| `loom:operator-objective` | Not applied (#10000): a missing objective is `loom:operator-decision`, the candidate objectives as its ranked options |
 
 ```bash
-./.loom/scripts/post-comment.sh <number> --pr --body "Routing to the operator: <what a human must do>."
+./.loom/scripts/post-comment.sh <number> --pr --body "<!-- loom:chore-mail -->
+Routing to the operator: <what a human must do>."
 gh pr edit <number> --add-label "loom:operator-only,loom:operator-mechanical"
+inbox_mail chore pr <number> "<what a human must do>"   # loader: .loom/docs/inbox-mail.md
 ```
 
 **Being unsure which sub-kind applies means you haven't finished diagnosing
@@ -507,10 +509,9 @@ does not satisfy this.
 **If you chose `loom:operator-decision`**, use `loom-daemon operator-decision
 apply` (`operator-decision.md`); the ranked whys name the axis.
 
-**If you chose `loom:operator-mechanical`**, also send ONE keyed mail (`mechanical-pr` key; resolve when it clears): `curator.md` → "Mail for `loom:operator-mechanical`". **`loom:operator-objective` is not an ask (#10000):** file `loom:operator-decision`, the candidate objectives as its ranked options.
-
-Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
-"`loom:operator-only` sub-kinds".
+Full taxonomy: `.loom/docs/label-state-machine.md` → "`loom:operator-only`
+sub-kinds"; how the human is told (decision or mail, nothing else): its
+"Two ways to reach a human"; the mail: `.loom/docs/inbox-mail.md` → "Chore mail".
 
 ### Stale-Verdict Check (before claiming from Priority 1 or Priority 2)
 
