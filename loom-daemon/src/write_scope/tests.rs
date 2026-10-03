@@ -828,6 +828,14 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("follow-up on the issue this watchdog filed"),
         ),
         (
+            "forge_probe.rs",
+            NotAWrite(
+                "the hosted-trial probe writes to the candidate instance's disposable \
+                 repo ($GITEA_QUAL_* runbook env) — never the daemon's managed forge: \
+                 no gh, no forge credential path (#9789)",
+            ),
+        ),
+        (
             "dep_recheck/decide.rs",
             NotAWrite("action names; writes go through dep_classify"),
         ),

@@ -155,6 +155,9 @@ mod tests {
                 source: "headers".into(),
             }],
             own_window: None,
+            // #9777's identity rows: `None` is the pre-#9777 wire shape, which
+            // this renderer must keep rendering unchanged.
+            operations: None,
         };
         let lines = render_forge_calls_lines(&report(Some(fc)), now);
         let text = lines.join("\n");
