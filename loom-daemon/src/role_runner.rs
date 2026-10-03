@@ -3244,7 +3244,7 @@ where
             // Shared GitHub rate limit exhausted (#4429): a role session
             // spawned now would burn a token slot just to fail its own gh
             // calls against the same wall — skip until the window resets.
-            if crate::rate_limit_breaker::global_is_suppressed() {
+            if crate::rate_limit_breaker::global_skip_pass("role_runner") {
                 log::debug!(
                     "role_runner: {} tick skipped — rate-limit cooldown (#4429)",
                     spec.name
@@ -3419,7 +3419,7 @@ pub fn spawn_multi_role_task(
             // Shared GitHub rate limit exhausted (#4429): a role session
             // spawned now would burn a token slot just to fail its own gh
             // calls against the same wall — skip until the window resets.
-            if crate::rate_limit_breaker::global_is_suppressed() {
+            if crate::rate_limit_breaker::global_skip_pass("role_runner") {
                 log::debug!(
                     "role_runner: {} multi-workspace tick skipped — rate-limit cooldown (#4429)",
                     spec.name

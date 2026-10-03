@@ -161,7 +161,7 @@ impl GhStarForge {
     }
 
     fn api(&self, args: &[&str], context: &str) -> Result<String> {
-        if crate::rate_limit_breaker::global_is_suppressed() {
+        if crate::rate_limit_breaker::global_skip_pass("star_liveness") {
             return Err(anyhow!("rate-limit breaker is suppressing forge calls"));
         }
         let mut cmd = Command::new(&self.gh_bin);

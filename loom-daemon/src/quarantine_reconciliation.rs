@@ -447,7 +447,7 @@ pub mod forge {
     pub fn reconcile_workspace(gh_bin: &Path, root: &Path) -> (usize, usize) {
         // Shared GitHub rate limit exhausted (#4429): the listing (and the
         // per-candidate timeline probes below) would all fail — skip.
-        if crate::rate_limit_breaker::global_is_suppressed() {
+        if crate::rate_limit_breaker::global_skip_pass("quarantine_reconciliation") {
             log::info!(
                 "quarantine_reconciliation: {} skipped — shared GitHub API rate limit \
                  exhausted (#4429)",

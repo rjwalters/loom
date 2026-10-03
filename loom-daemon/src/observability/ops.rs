@@ -26,7 +26,9 @@
 //! span per pool dispatch hold. [`turnaround`] (#8929) covers slot turnaround
 //! and idle slots per host, [`stage_dwell`] forge label-stage dwell, and
 //! [`disposition`] (#9222) one span per ready-queue row's disposition, on
-//! transition or periodic refresh. A new emitter adds a `MetricName`/
+//! transition or periodic refresh. [`ratelimit`] (#10022) exports GitHub
+//! rate-limit breaker trips, quota gauges and breaker skips. A new emitter
+//! adds a `MetricName`/
 //! `SpanName` variant and calls the same two functions.
 //!
 //! Tests observe what a seam emitted through the global functions with
@@ -42,6 +44,7 @@ pub mod lockout;
 pub mod pool_marks;
 pub mod queue;
 pub mod quota;
+pub mod ratelimit;
 pub mod stage_dwell;
 pub mod turnaround;
 

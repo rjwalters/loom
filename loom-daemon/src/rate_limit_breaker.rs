@@ -30,6 +30,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Duration, Utc};
+use std::collections::BTreeMap;
+
+use crate::forge_call_stats::Pool;
+pub use crate::observability::ops::ratelimit::{Job, TripAttribution};
 
 // ============================================================================
 // Configuration (env > config > default)
@@ -419,6 +423,53 @@ impl SharedRateLimitBreaker {
         })
     }
 
+    /// [`Self::observe_failure`], exporting a fresh trip as one
+    /// `loom.ratelimit.trip` span (Issue #10022). `ledger` (this host's
+    /// forge-call counts, `forge_call_stats::consumed_in_window`) is read
+    /// only for a fresh trip; a re-trip while cooling exports nothing.
+    pub fn observe_failure_exported(
+        &self,
+        error_text: &str,
+        source: &str,
+        budget: Option<BudgetSnapshot>,
+        ledger: impl FnOnce() -> Option<BTreeMap<Pool, u64>>,
+        now: DateTime<Utc>,
+    ) -> Option<Transition> {
+        let transition = self.observe_failure(error_text, source, budget, now)?;
+        log::warn!("rate_limit_breaker: {} — {}", transition.kind.as_str(), transition.reason);
+        let attribution = TripAttribution::from_budget(budget.as_ref(), ledger().as_ref());
+        crate::observability::ops::ratelimit::record_trip(
+            source,
+            now,
+            transition.until,
+            &attribution,
+        );
+        log_attribution(budget.is_some(), &attribution);
+        Some(transition)
+    }
+
+    /// [`Self::is_suppressed`] at a skip site: when suppressed, also counts
+    /// one skipped pass for `job` (`github.ratelimit.breaker_skips`, #10022).
+    /// Call it only where `true` really skips a pass — polling the predicate
+    /// elsewhere would over-count.
+    #[must_use]
+    pub fn skip_if_suppressed(&self, job: &str, now: DateTime<Utc>) -> bool {
+        let suppressed = self.is_suppressed(now);
+        if suppressed {
+            crate::observability::ops::ratelimit::record_skip(Job::from_source(job));
+        }
+        suppressed
+    }
+
+    /// The last budget reading the breaker cached (trip-time probe).
+    #[must_use]
+    pub fn last_budget(&self) -> Option<BudgetSnapshot> {
+        self.inner
+            .lock()
+            .expect("rate-limit breaker mutex poisoned")
+            .last_budget
+    }
+
     /// Lazy release: called by polling loops each tick; returns the
     /// `Released` transition on the tick after the window expires.
     pub fn observe_tick(&self, now: DateTime<Utc>) -> Option<Transition> {
@@ -538,33 +589,37 @@ pub fn global_observe_failure(error_text: &str, source: &str) -> Option<Transiti
         return None;
     }
     let budget = forge::probe_budget(now);
-    let transition = breaker.observe_failure(error_text, source, budget, now)?;
-    log::warn!("rate_limit_breaker: {} — {}", transition.kind.as_str(), transition.reason);
-    // Trip attribution (Issue #9855): the probe's pool-wide `used` minus this
-    // host's own ledger says whether this daemon exhausted its own pool or an
-    // external client sharing the credential did.
-    if let Some(b) = &budget {
-        let own = crate::forge_call_stats::consumed_in_window(now);
-        let line = |pool: &str, used: Option<u64>| -> String {
-            match (used, own.as_ref()) {
-                (Some(u), Some(m)) => {
-                    let o = m
-                        .iter()
-                        .find(|(p, _)| p.as_str() == pool)
-                        .map_or(0, |(_, v)| *v);
-                    format!("used={u} own≈{o} external≈{}", u.saturating_sub(o))
-                }
-                (Some(u), None) => format!("used={u} own=? (sink off) external=?"),
-                (None, _) => "used=? (probe without used)".to_string(),
-            }
-        };
+    // Trip attribution (Issue #9855) is logged and — with an ops sink —
+    // exported as a `loom.ratelimit.trip` span (Issue #10022).
+    breaker.observe_failure_exported(
+        error_text,
+        source,
+        budget,
+        || crate::forge_call_stats::consumed_in_window(now),
+        now,
+    )
+}
+
+/// [`global_is_suppressed`] at a skip site: also counts one skipped pass for
+/// `job` (see [`SharedRateLimitBreaker::skip_if_suppressed`]).
+#[must_use]
+pub fn global_skip_pass(job: &str) -> bool {
+    GLOBAL
+        .get()
+        .is_some_and(|b| b.skip_if_suppressed(job, Utc::now()))
+}
+
+/// Log the trip and its attribution: the probe's pool-wide `used` minus this
+/// host's own ledger says whether this daemon exhausted its own pool or an
+/// external client sharing the credential did.
+fn log_attribution(probed: bool, attribution: &TripAttribution) {
+    if probed {
         log::warn!(
             "rate_limit_breaker: attribution: core {} · graphql {} — external is other clients of this credential",
-            line("core", b.core_used),
-            line("graphql", b.graphql_used),
+            attribution.core.log_text(),
+            attribution.graphql.log_text(),
         );
     }
-    Some(transition)
 }
 
 /// Emit the state-change `daemon.rate_limit_breaker.state` event for a

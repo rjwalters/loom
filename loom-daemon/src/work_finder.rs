@@ -2505,7 +2505,7 @@ where
                     log::info!("rate_limit_breaker: {}", transition.reason);
                     crate::rate_limit_breaker::emit_transition_event(&event_bus, &transition);
                 }
-                if rl.is_suppressed(now) {
+                if rl.skip_if_suppressed("work_finder", now) {
                     if was_rate_limited {
                         log::debug!("work_finder: tick skipped — rate-limit cooldown active");
                     } else {
@@ -2952,7 +2952,7 @@ pub fn spawn_multi_work_finder_task(
                     log::info!("rate_limit_breaker: {}", transition.reason);
                     crate::rate_limit_breaker::emit_transition_event(&event_bus, &transition);
                 }
-                if rl.is_suppressed(now) {
+                if rl.skip_if_suppressed("work_finder", now) {
                     if was_rate_limited {
                         log::debug!("work_finder: tick skipped — rate-limit cooldown active");
                     } else {

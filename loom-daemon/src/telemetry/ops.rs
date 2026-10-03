@@ -32,7 +32,9 @@ use std::collections::BTreeMap;
 /// Label keys a `metric.points` data point may carry. Low-cardinality by
 /// construction — never an issue number, sha, sweep id or path. The gateway
 /// collector's datapoint `keep_keys` must include every key (contract-tested).
-pub const OPS_METRIC_LABEL_KEYS: &[&str] = &["reason", "provider", "account", "model", "state"];
+pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
+    "reason", "provider", "account", "model", "state", "resource",
+];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
 /// `loom.dispatch.admission`) may carry, in
@@ -89,6 +91,16 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "lockout.duration_seconds",
     "lockout.frozen_candidates_count",
     "lockout.frozen_points_sum",
+    // `loom.ratelimit.trip` spans (Issue #10022): the tripping job, the
+    // cooldown end and the trip-time own/external attribution per pool.
+    "loom.ratelimit.source",
+    "loom.ratelimit.cooldown_until",
+    "github.ratelimit.core.used",
+    "github.ratelimit.core.own",
+    "github.ratelimit.core.external",
+    "github.ratelimit.graphql.used",
+    "github.ratelimit.graphql.own",
+    "github.ratelimit.graphql.external",
 ];
 
 /// Longest label value kept, in bytes.
@@ -224,6 +236,22 @@ pub enum MetricName {
     /// (over the per-call row cap) — Issue #9222.
     #[serde(rename = "loom.queue.disposition_rows_dropped")]
     QueueDispositionRowsDropped,
+    // ---- GitHub rate limit (Issue #10022) --------------------------------
+    /// Requests left in a GitHub rate-limit pool, labelled `resource` and
+    /// `account` (the non-secret credential identity).
+    #[serde(rename = "github.ratelimit.remaining")]
+    GithubRateLimitRemaining,
+    /// Requests spent this window in a pool, labelled `resource`/`account`.
+    #[serde(rename = "github.ratelimit.used")]
+    GithubRateLimitUsed,
+    /// When a pool's window resets (Unix epoch seconds), `resource`/`account`.
+    #[serde(rename = "github.ratelimit.reset")]
+    GithubRateLimitReset,
+    /// Job passes skipped because the rate-limit breaker was suppressing,
+    /// labelled `reason` = the job (a closed set — see
+    /// `observability::ops::ratelimit::Job`).
+    #[serde(rename = "github.ratelimit.breaker_skips")]
+    GithubRateLimitBreakerSkips,
 }
 
 impl MetricName {
@@ -265,6 +293,10 @@ impl MetricName {
             Self::ForgeStageDwellSamples => "loom.forge.stage_dwell.samples",
             Self::ForgeStageItems => "loom.forge.stage_items",
             Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
+            Self::GithubRateLimitRemaining => "github.ratelimit.remaining",
+            Self::GithubRateLimitUsed => "github.ratelimit.used",
+            Self::GithubRateLimitReset => "github.ratelimit.reset",
+            Self::GithubRateLimitBreakerSkips => "github.ratelimit.breaker_skips",
         }
     }
 
@@ -288,7 +320,8 @@ impl MetricName {
             | Self::DispatchIdleSlotSeconds
             | Self::ForgeStageDwell
             | Self::ForgeStageDwellSamples
-            | Self::QueueDispositionRowsDropped => MetricKind::DeltaCounter,
+            | Self::QueueDispositionRowsDropped
+            | Self::GithubRateLimitBreakerSkips => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -320,6 +353,9 @@ impl MetricName {
             Self::DispatchSlotTurnaroundSamples | Self::DispatchIdleSlots => "{slot}",
             Self::ForgeStageDwellSamples | Self::ForgeStageItems => "{item}",
             Self::QueueDispositionRowsDropped => "{issue}",
+            Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
+            Self::GithubRateLimitReset => "s",
+            Self::GithubRateLimitBreakerSkips => "{pass}",
             _ => "By",
         }
     }
@@ -369,6 +405,12 @@ impl MetricName {
             Self::ForgeStageItems => "Open items carrying a stage label, by state.",
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
+            }
+            Self::GithubRateLimitRemaining => "GitHub API requests left, by resource and account.",
+            Self::GithubRateLimitUsed => "GitHub API requests spent this window, by resource.",
+            Self::GithubRateLimitReset => "GitHub rate-limit window reset, Unix epoch seconds.",
+            Self::GithubRateLimitBreakerSkips => {
+                "Job passes skipped by the rate-limit breaker, by job."
             }
         }
     }

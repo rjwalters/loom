@@ -232,7 +232,7 @@ impl SweepRegistry {
         if !resolve_sweep_outcome_writeback_config(&self.config.workspace_root).enabled {
             return;
         }
-        if crate::rate_limit_breaker::global_is_suppressed() {
+        if crate::rate_limit_breaker::global_skip_pass("outcome_journal") {
             log::debug!(
                 "sweep_outcomes: skipping issue #{issue}'s sweep-outcome write-back — the \
                  rate-limit breaker is suppressing forge polling (#9056)"
