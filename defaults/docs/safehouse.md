@@ -1142,8 +1142,8 @@ coordination shrinks that window:
   A peer also **retracts** its claim early when its sweep exits/crashes (a
   `retract`-kind ad emitted from the reaper), freeing the issue before the TTL.
 - **Host identity.** loom's single, explicit host-identity concept is
-  `sweep_registry::host_identity()` (`LOOM_HOST_ID` > `$HOSTNAME` > the `hostname`
-  binary > `unknown-host`) — derived, not a new config block, and stable across
+  `sweep_registry::host_identity()` (`LOOM_HOST_ID` > `fleet.hostId` > the
+  persisted `~/.loom/host-id`, #10023) — derived, not a new config block, and stable across
   restarts. safehoused stamps the socket `from` from the *persona* (all daemons
   share `loom_daemon`), which cannot distinguish hosts, so the identity travels in
   the claim body and is what powers self-claim recognition: **a daemon never backs

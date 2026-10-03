@@ -1418,7 +1418,7 @@ answering the on-command verbs below.
 | `fleet.cloneMaxPerPass` | `LOOM_FLEET_CLONE_MAX_PER_PASS` | `2` | Most missing clones one `autoApply` timer pass clones; the rest wait for the next pass. `0` never clones |
 | `fleet.cloneTimeoutSecs` | `LOOM_FLEET_CLONE_TIMEOUT_SECS` | `300` | Wall-clock cap on one clone (clamped up to `30`); a clone that hits it is killed, removed and retried next pass |
 | *(startup cap)* | `LOOM_FLEET_SYNC_STARTUP_TIMEOUT_SECS` | `60` | Wall-clock cap on the startup pass, so a hanging forge cannot hold up boot. `0` waits indefinitely |
-| *(host identity)* | `LOOM_HOST_ID` | `$HOSTNAME` → `hostname` | This host's name in the store (`fleet/hosts/<host>/`, `fleet/state.yml`); `--host` overrides it per command |
+| *(host identity)* | `LOOM_HOST_ID` | `fleet.hostId` → persisted `~/.loom/host-id` (#10023; `loom-daemon host-id`) | This host's name in the store (`fleet/hosts/<host>/`, `fleet/state.yml`); `--host` overrides it per command |
 
 Every sub-verb takes `--workspace <PATH>` (default: the current repo): the
 daemon workspace whose config names the store and supplies the credentials,
@@ -6453,7 +6453,7 @@ knobs not yet audited here.
 | `safehouse.rooms.signal` | `LOOM_SAFEHOUSE_ROOM_SIGNAL` | *(falls back to `safehouse.room`)* | Attention-class routing (#4225): the **signal** room id (`loom-fleet`) — operator conversation, every `handoff`, terminal `ack`/`completion`. Absent **and** no `byRepo` ⇒ single-room mode, byte-identical to pre-#4225 |
 | `safehouse.rooms.byRepo` | `LOOM_SAFEHOUSE_ROOMS_BY_REPO` (`repo=room,…`) | `{}` | Attention-class routing (#4225): per-repo **firehose** room ids keyed by workspace-root basename — `task`/`chat` narration. A repo absent from the map is created lazily as `fleet-<repo>`; a refused creation degrades that repo to the signal room with one `warn!`. The env form replaces the whole map |
 | `safehouse.claimReconcileIntervalSecs` | `LOOM_CLAIM_RECONCILE_INTERVAL_SECS` | `1800` when `safehouse.enabled`, else `600` | Periodic `loom:building`/PR-claim reconciliation cadence (#4431). With safehouse peer-claims carrying the fast in-flight signal (re-advertised each reaper tick), label reconciliation demotes to a slow healing sweep. Env wins on any host; floored at 60s |
-| *(host identity)* | `LOOM_HOST_ID` | `$HOSTNAME` → `hostname` → `unknown-host` | This host's identity string, used in collision log records (#4085) **and** peer-claim self-recognition (#4028); set it where the daemon runs without `$HOSTNAME` exported |
+| *(host identity)* | `LOOM_HOST_ID` | `fleet.hostId` → persisted `~/.loom/host-id` → `unknown-host` (#10023) | This host's identity string, used in collision log records (#4085), peer-claim self-recognition (#4028) and telemetry `host.id`; never the hostname. `loom-daemon host-id` prints it |
 | `autonomous.autoUpdate.enabled` | `LOOM_AUTO_UPDATE` | `false` | Autonomous self-update loop on/off (#4055) **on a host with no fleet store only**. **Opt-in** there (it rebuilds + restarts the daemon process). On a fleet host (`fleet.repo` set) it governs nothing: the loop runs whatever it says, for the fleet floor and for a workspace that needs a newer daemon, and never chases the newest release (#10954, see [The fleet floor drives rolls](#the-fleet-floor-drives-rolls-no-roll-windows-10885)). Exactly one loop per daemon, not a per-workspace fan-out. See [Autonomous self-update loop](#autonomous-self-update-loop-4055) below |
 | `autonomous.autoUpdate.intervalSecs` | `LOOM_AUTO_UPDATE_INTERVAL_SECS` | `900` | Cadence between staleness checks. Zero/invalid → default |
 | `autonomous.autoUpdate.settleSecs` | `LOOM_AUTO_UPDATE_SETTLE_SECS` | `600` | Settle window: wait this long after first observing a stale commit — resetting on every further commit — before rolling, so a burst of merges collapses into one roll. Zero/invalid → default. **Only on a host with no fleet store** (#10885): a fleet host rolls for its floor on the tick that sees it and never waits on settle |
@@ -7344,8 +7344,9 @@ together, any-of semantics):
   (`<!-- loom:capability=<name> -->`, `loom-daemon/src/capability.rs`) is,
   but with an **open** value grammar (a host id is whatever
   `sweep_registry::host_identity()` resolves to on some machine — an explicit
-  `$LOOM_HOST_ID`, or a `$HOSTNAME`/`hostname`-binary fallback that can be
-  mixed-case and dotted, e.g. `Roberts-MacBook-Pro.local` — not a closed list
+  `$LOOM_HOST_ID`, a `fleet.hostId`, or a persisted generated id — and, from
+  pre-#10023 daemons, a hostname that can be mixed-case and dotted, e.g.
+  `Roberts-MacBook-Pro.local` — not a closed list
   this repo can enumerate).
 
 ```
@@ -7705,7 +7706,7 @@ and classifies it:
   present → **collision** (a peer host claimed it first), whether or not
   `loom:issue` is still alongside it. A diagnostic record is logged at `warn` —
   issue number, repo/workspace, this host's identity (`LOOM_HOST_ID` →
-  `$HOSTNAME` → `hostname` → `unknown-host`), timestamp, the observed claim
+  `fleet.hostId` → persisted `~/.loom/host-id`, #10023), timestamp, the observed claim
   label(s), and the full pre-flip label set — a per-registry cumulative counter
   is incremented, and (#5789) the dispatch backs off instead of proceeding.
 - no claim label, `loom:issue` present → **clean** (this host is first).
@@ -8049,8 +8050,8 @@ worker silently lost the job, or a second host silently duplicated it.
 
 `fleet.captain: "<host id>"` in the **tracked** `.loom/config.json` names the
 one host — by its own `host_identity()` (`loom-daemon/src/sweep_registry/mod.rs`;
-precedence `LOOM_HOST_ID` env var > `$HOSTNAME` > the `hostname` binary >
-`UNKNOWN_HOST` — the same operator-controlled identity issue #5063
+precedence `LOOM_HOST_ID` env var > `fleet.hostId` > the persisted
+`~/.loom/host-id` (#10023) — the same operator-controlled identity issue #5063
 established fleet-wide) — that runs every declared singleton job. This
 follows the `shardCount`/`shardKey`
 "identical fleet-wide, tracked" precedent from the sharding table just above
@@ -8710,7 +8711,7 @@ for the full note.
   unchanged.
 - **Self-claim recognition.** A daemon never backs off on its own advertisement:
   the claim body carries the host identity (`host_identity()`:
-  `LOOM_HOST_ID` > `$HOSTNAME` > `hostname` > `unknown-host` — loom's single,
+  `LOOM_HOST_ID` > `fleet.hostId` > persisted `~/.loom/host-id` — loom's single,
   derived, restart-stable host concept), and the view ignores ads from this host.
   safehoused's socket `from` is stamped from the *persona* (all daemons share
   `loom_daemon`) and cannot distinguish hosts, hence the body-carried identity.

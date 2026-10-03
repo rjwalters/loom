@@ -65,8 +65,8 @@ The comment body's literal **first line** is the marker:
   `opaque_host_id(host_identity())` — `host-` followed by the first 8
   lowercase hex chars of `sha256("loom-lease-host-id-v1:" + host_identity())`
   — instead of the raw `sweep_registry::host_identity()` value
-  (`LOOM_HOST_ID` env > `$HOSTNAME` > the `hostname` binary >
-  `unknown-host`).
+  (`LOOM_HOST_ID` env > `fleet.hostId` > the persisted `~/.loom/host-id`,
+  #10023).
   - **This id is still directly `==`-comparable** across every reader in
     this subsystem — [claim-then-verify-order](#phase-2-dispatch-time-half-claim-then-verify-order-6287)
     (`resolve_lease_order`) and sweep-side [fencing](#phase-3-issue-6309-has-now-shipped-sweep-side-fencing-before-pushpr-open)

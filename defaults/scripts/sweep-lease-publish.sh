@@ -107,7 +107,8 @@
 #     form of this host's own identity (Issue #6322): the opaque id
 #     (`opaque_host_id`, mirroring `sweep_registry::opaque_host_id` byte for
 #     byte) of the raw identity `sweep_registry::host_identity()` resolves
-#     (`LOOM_HOST_ID` > `$HOSTNAME` > the `hostname` binary > `unknown-host`)
+#     (`loom-daemon host-id`: `LOOM_HOST_ID` > `fleet.hostId` > the persisted
+#     `~/.loom/host-id`, #10023)
 #     -- unless `LOOM_LEASE_PUBLISH_HOSTNAME` opts into raw publishing, in
 #     which case the raw identity is used directly. An explicit --host is
 #     used verbatim (no transform applied). This is the same identity
@@ -202,23 +203,13 @@ lease_publish_raw_hostname() {
     esac
 }
 
-# --- Host identity, mirroring sweep_registry::host_identity()'s precedence -
+# --- Host identity: asked of `loom-daemon host-id` (#10023), never re-derived
+# here, so this script and the daemon cannot disagree. `${LOOM_HOST_ID:-
+# unknown-host}` is only the fallback for a binary without that subcommand.
 resolve_host() {
-    if [[ -n "${LOOM_HOST_ID:-}" ]]; then
-        printf '%s' "$LOOM_HOST_ID"
-        return 0
-    fi
-    if [[ -n "${HOSTNAME:-}" ]]; then
-        printf '%s' "$HOSTNAME"
-        return 0
-    fi
     local h
-    h="$(hostname 2>/dev/null || true)"
-    if [[ -n "$h" ]]; then
-        printf '%s' "$h"
-        return 0
-    fi
-    printf 'unknown-host'
+    h="$("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" host-id 2>/dev/null)" || h=""
+    printf '%s' "${h:-${LOOM_HOST_ID:-unknown-host}}"
 }
 
 # resolve_published_host -- the host identity this script publishes and
