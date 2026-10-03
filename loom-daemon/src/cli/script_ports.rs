@@ -693,6 +693,14 @@ pub(crate) enum MergePrCommand {
     /// a refusal.
     DirtyGuard(super::merge_pr_dirty_guard::DirtyGuardArgs),
 
+    /// The post-merge `git worktree remove --force` itself (#6372, #8191
+    /// slice), run only after every guard passed: one prune-and-retry on
+    /// failure, then `LOOM-WORKTREE-TEARDOWN REMOVED|FAILED` and
+    /// `LEVEL<TAB>message` records to replay. Always exits 0; the shell reads
+    /// anything else as "did not run" and removes nothing — see
+    /// `cli::merge_pr_worktree_teardown`.
+    WorktreeTeardown(super::merge_pr_worktree_teardown::WorktreeTeardownArgs),
+
     /// Decide ONE zero-row check-runs poll of `--auto`'s settle wait (#9091):
     /// settle now, keep waiting, or report the whole wait spent. Bounded only
     /// when the base branch requires no status-check contexts; a lookup that
@@ -864,6 +872,7 @@ impl MergePrCommand {
             MergePrCommand::IssueCloseGate(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),
+            MergePrCommand::WorktreeTeardown(args) => args.run(),
             MergePrCommand::ZeroChecksSettle(args) => args.run(),
             MergePrCommand::CheckRunsStreak(args) => args.run(),
             MergePrCommand::CheckRunsRollup(args) => args.run(),
