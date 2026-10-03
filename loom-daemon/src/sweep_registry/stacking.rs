@@ -1,6 +1,8 @@
 //! `depends_on` / block-the-subtree bookkeeping (issue #3729).
 
+use super::forge_gh::loom_repo_flag;
 use super::*;
+use crate::gh_invocation::{AccessIntent, GhTarget};
 
 /// Outcome of probing a single label's presence on the forge (Issue
 /// #7553). Distinguishes a probe that ran to completion and found the
@@ -171,36 +173,26 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return LabelProbe::Absent;
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut cmd = Command::new(&gh);
-        cmd.arg("issue")
-            .arg("view")
-            .arg(issue.to_string())
-            .arg("--json")
-            .arg("labels")
-            .arg("--jq")
-            .arg(format!(r#"[.labels[].name] | index("{label}") != null"#));
-        // Scope the label probe to the registry's workspace so it resolves
-        // against the right repo in a multi-workspace daemon (#3937).
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
+        // Scope the label probe to the registry's workspace (`self.gh`) so it
+        // resolves against the right repo in a multi-workspace daemon (#3937).
+        let jq = format!(r#"[.labels[].name] | index("{label}") != null"#);
+        let cmd = self
+            .gh("issue.view", AccessIntent::Read, GhTarget::None)
+            .args([
+                "issue",
+                "view",
+                &issue.to_string(),
+                "--json",
+                "labels",
+                "--jq",
+                &jq,
+            ])
+            .args(loom_repo_flag());
         // Bounded so a wedged `gh` on the `ListSweeps` / `GetSweepStatus` read
         // path (this runs inside `reap_liveness`) cannot block the registry read
         // indefinitely (Issue #3973).
         let timeout = reap_gh_timeout();
-        match output_with_timeout(cmd, timeout) {
+        match cmd.output_bounded() {
             Ok(Some(out)) if out.status.success() => {
                 if String::from_utf8_lossy(&out.stdout).trim() == "true" {
                     LabelProbe::Present

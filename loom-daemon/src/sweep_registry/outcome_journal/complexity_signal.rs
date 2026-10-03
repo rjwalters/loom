@@ -48,6 +48,7 @@
 //! "still open".
 
 use super::*;
+use crate::gh_invocation::{AccessIntent, GhTarget};
 
 use crate::script_helpers::model_tiers::COMPLEXITY_TIERS;
 use crate::script_helpers::sweep_experiment::extract_complexity_marker;
@@ -226,35 +227,23 @@ impl SweepRegistry {
             );
             return IssueSignals::default();
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut cmd = Command::new(&gh);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}"))
-            .arg("--jq")
+        // Resolve the issue against THIS registry's repo, not the daemon's cwd
+        // repo, and honor a cross-owner managed repo's own installation-token
+        // config dir — same rationale as the PR-timeline read. A machine-global
+        // `LOOM_REPO` override reaches `gh api` as `GH_REPO`, never as an
+        // unsupported `--repo` flag (#8263) — both via `self.gh`.
+        let cmd = self
+            .gh("api.rest", AccessIntent::Read, GhTarget::None)
+            .args(["api", &format!("repos/{{owner}}/{{repo}}/issues/{issue}"), "--jq"])
             // One projection, four signals. Kept to exactly the keys this
             // module consumes so the payload stays small and no unrelated
             // issue content (title, assignees, comment bodies) is ever read
             // into the daemon.
-            .arg(
+            .args([
                 "{body: .body, state: .state, closed_at: .closed_at, \
                  labels: [(.labels // [])[] | .name]}",
-            );
-        // Resolve the issue against THIS registry's repo, not the daemon's cwd
-        // repo, and honor a cross-owner managed repo's own installation-token
-        // config dir — same rationale as the PR-timeline read.
-        cmd.current_dir(&self.config.workspace_root);
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        // A machine-global `LOOM_REPO` override reaches `gh api` as `GH_REPO`,
-        // never as an unsupported `--repo` flag (#8263).
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        let output = match output_with_timeout(cmd, reap_gh_timeout()) {
+            ]);
+        let output = match cmd.output_bounded() {
             Ok(Some(o)) if o.status.success() => o,
             Ok(Some(o)) => {
                 let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
@@ -279,10 +268,9 @@ impl SweepRegistry {
             }
             Err(e) => {
                 log::warn!(
-                    "sweep_outcomes: could not invoke {} for issue #{issue}'s signals: \
+                    "sweep_outcomes: could not invoke gh for issue #{issue}'s signals: \
                      {e} — omitting complexity/disposition signals, record still written \
-                     (#8542/#9441)",
-                    gh.display()
+                     (#8542/#9441)"
                 );
                 return IssueSignals::default();
             }

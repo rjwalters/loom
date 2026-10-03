@@ -10,6 +10,10 @@
 //!    hand-rolled `fn gh_bin*` copies this replaces (a set-but-empty value is
 //!    returned as-is, a non-UTF-8 value is treated as unset).
 //! 3. Bare `"gh"`, resolved from `PATH` by the OS at spawn time.
+//!
+//! A caller-injected program ([`crate::gh_invocation::GhInvocation::program`],
+//! for sites whose owner carries a configured `gh` such as
+//! `SweepRegistryConfig.gh_bin`) bypasses the ladder entirely.
 
 /// Which rung of the precedence ladder produced the program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

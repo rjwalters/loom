@@ -26,10 +26,12 @@
 //!   local completion record for every non-`ok` [`telemetry::Outcome`].
 //! - [`GhInvocation::run`] (slice 3) — the `cmd_out::CmdOutcome` bridge, so
 //!   a migrated `run_command` site keeps its exact result classification.
-//!
 //! - [`accounting`] (#10089) — every execution that reached `gh` is one row
 //!   in [`crate::forge_call_stats`], keyed by its [`Operation`], so
 //!   `loom-daemon status` and the breaker's own-versus-external line count it.
+//! - [`GhInvocation::program`] / [`GhInvocation::output_bounded`] (slice 5) —
+//!   an injected executable for owners configured with their own `gh`, and
+//!   the `reaper::output_with_timeout` result shape.
 //!
 //! `gh-cached` substitution for reads, the async/tokio variant and the Gitea
 //! decline move in with the slices that first need them (see #9985's slicing
@@ -398,7 +400,7 @@ impl GhInvocation {
     }
 
     /// Assemble the child. Private: the facade owns execution.
-    fn command(&self, program: &str, child_context: Option<&TraceContext>) -> Command {
+    fn command(&self, program: &OsStr, child_context: Option<&TraceContext>) -> Command {
         let mut cmd = Command::new(program);
         cmd.args(&self.args);
         if let Some(dir) = &self.cwd {
@@ -430,9 +432,13 @@ impl GhInvocation {
         self.execute_with(&resolved.program, resolved.source)
     }
 
-    fn execute_with(self, program: &str, source: GhBinSource) -> Result<GhCompletion, ExecError> {
+    fn execute_with(
+        self,
+        program: impl AsRef<OsStr>,
+        source: GhBinSource,
+    ) -> Result<GhCompletion, ExecError> {
         let span = telemetry::InvocationSpan::open(&self);
-        let mut cmd = self.command(program, span.child_context(&self.parent));
+        let mut cmd = self.command(program.as_ref(), span.child_context(&self.parent));
         match self.contract {
             OutputContract::Captured { timeout } => {
                 cmd.stdin(Stdio::null());

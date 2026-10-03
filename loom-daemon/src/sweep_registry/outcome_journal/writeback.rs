@@ -60,6 +60,7 @@
 //! most three) `gh` calls is individually bounded by `reap_gh_timeout()`.
 
 use super::*;
+use crate::gh_invocation::{AccessIntent, GhTarget};
 
 /// Env var toggling the sweep-outcome issue write-back (Issue #9056).
 /// `0`/`false`/`no`/`off` disables; `1`/`true`/`yes`/`on` enables. Overrides
@@ -268,28 +269,20 @@ impl SweepRegistry {
     /// `guards::read_lease_comments`'s `--jq`-filtered, `--paginate` REST read
     /// but reporting only presence, never the comment bodies themselves.
     fn sweep_outcome_writeback_comment_exists(&self, issue: u32, sweep_id: &str) -> Option<bool> {
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut cmd = Command::new(&gh);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"))
-            .arg("--paginate")
-            .arg("--jq")
-            .arg(format!(
-                r#".[] | select(.body | startswith({})) | .id"#,
-                serde_json::Value::String(sweep_outcome_writeback_marker(sweep_id))
-            ));
-        cmd.current_dir(&self.config.workspace_root);
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
+        let jq = format!(
+            r#".[] | select(.body | startswith({})) | .id"#,
+            serde_json::Value::String(sweep_outcome_writeback_marker(sweep_id))
         );
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        let timeout = reap_gh_timeout();
-        let output = output_with_timeout(cmd, timeout).ok().flatten()?;
+        let output = self
+            .gh("api.rest", AccessIntent::Read, GhTarget::None)
+            .args([
+                "api",
+                &format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"),
+            ])
+            .args(["--paginate", "--jq", &jq])
+            .output_bounded()
+            .ok()
+            .flatten()?;
         if !output.status.success() {
             return None;
         }
@@ -302,15 +295,10 @@ impl SweepRegistry {
     /// so a failure earns more visibility than the debug-level skips above)
     /// and never propagated.
     fn post_sweep_outcome_writeback_comment(&self, issue: u32, body: &str) {
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
         // #9772: the write-back comment carries the dashboard footer like
         // every other daemon comment. The slug prefers the `LOOM_REPO`
-        // override (the same precedence `apply_loom_repo_override` gives the
-        // command below), then the workspace root's origin remote; an
+        // override (the same `GH_REPO` precedence `self.gh` gives the command
+        // below), then the workspace root's origin remote; an
         // unresolvable slug posts unlinked rather than linking to nowhere.
         let nwo = std::env::var("LOOM_REPO")
             .ok()
@@ -324,20 +312,11 @@ impl SweepRegistry {
                     .map(|(o, r)| format!("{o}/{r}"))
             });
         let body = crate::forge_comment::footer_or_body(nwo.as_deref(), issue, false, body);
-        let mut cmd = Command::new(&gh);
-        cmd.arg("issue")
-            .arg("comment")
-            .arg(issue.to_string())
-            .arg("--body")
-            .arg(body);
-        cmd.current_dir(&self.config.workspace_root);
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
+        let cmd = self
+            .gh("issue.comment", AccessIntent::Write, GhTarget::None)
+            .args(["issue", "comment", &issue.to_string(), "--body", &body]);
         let timeout = reap_gh_timeout();
-        match output_with_timeout(cmd, timeout) {
+        match cmd.output_bounded() {
             Ok(Some(o)) if o.status.success() => {
                 log::info!(
                     "sweep_outcomes: posted sweep-outcome write-back comment on issue #{issue} \
@@ -358,9 +337,8 @@ impl SweepRegistry {
                 timeout.as_secs()
             ),
             Err(e) => log::warn!(
-                "sweep_outcomes: could not invoke {} to post issue #{issue}'s sweep-outcome \
-                 write-back comment: {e} (#9056)",
-                gh.display()
+                "sweep_outcomes: could not invoke gh to post issue #{issue}'s sweep-outcome \
+                 write-back comment: {e} (#9056)"
             ),
         }
     }

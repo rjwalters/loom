@@ -115,6 +115,7 @@ pub(crate) mod crash_signals;
 pub use model::generate_sweep_id;
 mod decline_cooldown;
 mod dispatch;
+pub(crate) mod forge_gh;
 mod guards;
 mod heartbeat_broadcast;
 mod lease_episode;

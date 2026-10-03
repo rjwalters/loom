@@ -56,6 +56,7 @@
 //! never a blocked or failed journal append.
 
 use super::*;
+use crate::gh_invocation::{AccessIntent, GhTarget};
 
 /// The label a Builder (or a Doctor handing back a fixed PR) applies to open a
 /// Judge attempt.
@@ -235,34 +236,21 @@ impl SweepRegistry {
             );
             return None;
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut cmd = Command::new(&gh);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/timeline"))
-            .arg("--paginate")
-            .arg("--jq")
-            .arg(TIMELINE_JQ);
         // Resolve the PR against THIS registry's repo, not the daemon's cwd
         // repo (#3937), and honor a cross-owner managed repo's own
-        // installation-token config dir (#5401).
-        cmd.current_dir(&self.config.workspace_root);
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        // A machine-global `LOOM_REPO` override is applied as the `GH_REPO`
-        // ENV VAR, not as a `--repo` flag: `gh api` has no `--repo` flag (it is
-        // `gh issue`/`gh pr` that do), and rejects one with `unknown flag:
-        // --repo` before issuing any request. The five sibling `gh api` call
-        // sites that still passed the flag — and therefore no-op'd under
-        // `LOOM_REPO` — were fixed in #8263, which also moved this inline
-        // idiom into the shared helper below so it cannot be re-copied wrong.
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        let output = match output_with_timeout(cmd, reap_gh_timeout()) {
+        // installation-token config dir (#5401). A machine-global `LOOM_REPO`
+        // override is applied as the `GH_REPO` ENV VAR, not as a `--repo`
+        // flag: `gh api` has no `--repo` flag (it is `gh issue`/`gh pr` that
+        // do), and rejects one with `unknown flag: --repo` before issuing any
+        // request (#8263). `self.gh` applies all three.
+        let cmd = self
+            .gh("api.rest", AccessIntent::Read, GhTarget::None)
+            .args([
+                "api",
+                &format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/timeline"),
+            ])
+            .args(["--paginate", "--jq", TIMELINE_JQ]);
+        let output = match cmd.output_bounded() {
             Ok(Some(o)) if o.status.success() => o,
             Ok(Some(o)) => {
                 let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
@@ -294,9 +282,8 @@ impl SweepRegistry {
             }
             Err(e) => {
                 log::warn!(
-                    "sweep_outcomes: could not invoke {} for PR #{pr_number}'s label timeline: \
-                     {e} — omitting judge_verdicts/doctor_cycles, record still written (#8222)",
-                    gh.display()
+                    "sweep_outcomes: could not invoke gh for PR #{pr_number}'s label timeline: \
+                     {e} — omitting judge_verdicts/doctor_cycles, record still written (#8222)"
                 );
                 return None;
             }

@@ -27,6 +27,8 @@
 //! deliverable, and a role that only commented has not acted.
 
 use super::*;
+use crate::gh_invocation::{AccessIntent, GhTarget};
+use crate::sweep_registry::forge_gh::loom_repo_flag;
 
 /// Marker prefix on every comment this module posts, so the per-attempt notes
 /// and the hold notice are machine-identifiable (and greppable) the way
@@ -368,34 +370,26 @@ impl SweepRegistry {
         issue: u32,
         remove_loom_issue: bool,
     ) -> Result<(), HoldEditFailure> {
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut edit = Command::new(&gh);
-        edit.arg("issue")
-            .arg("edit")
-            .arg(issue.to_string())
-            .arg("--add-label")
-            .arg("loom:blocked");
-        if remove_loom_issue {
-            edit.arg("--remove-label").arg("loom:issue");
-        }
-        edit.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut edit,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            edit.arg("--repo").arg(repo);
-        }
+        let remove: &[&str] = if remove_loom_issue {
+            &["--remove-label", "loom:issue"]
+        } else {
+            &[]
+        };
+        let edit = self
+            .gh("issue.edit", AccessIntent::Write, GhTarget::None)
+            .args([
+                "issue",
+                "edit",
+                &issue.to_string(),
+                "--add-label",
+                "loom:blocked",
+            ])
+            .args(remove)
+            .args(loom_repo_flag());
         // Bounded (Issue #3973): this runs from `reap_once`, which is on the
         // `ListSweeps` / `GetSweepStatus` read path.
         let timeout = reap_gh_timeout();
-        match output_with_timeout(edit, timeout) {
+        match edit.output_bounded() {
             Ok(Some(out)) if out.status.success() => Ok(()),
             Ok(Some(out)) => Err(HoldEditFailure::Rejected(format!(
                 "`gh issue edit` exited {}: {}",
@@ -422,30 +416,12 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return;
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut comment = Command::new(&gh);
-        comment
-            .arg("issue")
-            .arg("comment")
-            .arg(issue.to_string())
-            .arg("--body")
-            .arg(body);
-        comment.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut comment,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            comment.arg("--repo").arg(repo);
-        }
+        let comment = self
+            .gh("issue.comment", AccessIntent::Write, GhTarget::None)
+            .args(["issue", "comment", &issue.to_string(), "--body", body])
+            .args(loom_repo_flag());
         let timeout = reap_gh_timeout();
-        match output_with_timeout(comment, timeout) {
+        match comment.output_bounded() {
             Ok(Some(_)) => {}
             Ok(None) => log::debug!(
                 "sweep_registry: PR-less retry {what} for #{issue} exceeded {}s, killed (#3973)",
