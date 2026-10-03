@@ -960,7 +960,7 @@ Champion's exclusions, the Priority-2 query above) is unchanged:
 | `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
 | `loom:operator-mechanical` | Needs a human's hands: host or admin access, a credential, hardware — no judgement required |
 | `loom:operator-decision` | The act requires authority an agent structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) |
-| `loom:operator-objective` | Determined once the operator states an objective — list the candidate objectives and the answer under each (#5826); a decision whose options are the objectives |
+| `loom:operator-objective` | Determined once the operator states an objective — list the candidate objectives and the answer under each (#5826); a missing objective is this, not `-decision` |
 
 ```bash
 # Curator routing a genuine PO-level decision:
