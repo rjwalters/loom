@@ -184,7 +184,9 @@ impl LivenessState {
                 recorded_starred_at: &recorded,
             };
             let mut forge = forges(&repo.root, &repo.slug);
-            let result = collect::Evaluator::new(forge.as_mut(), ctx, &mut self.refusals).run();
+            let result = collect::Evaluator::new(forge.as_mut(), ctx, &mut self.refusals)
+                .with_propagate(settings.propagate)
+                .run();
             match result {
                 Ok(rows) => {
                     let inherited: Vec<Inherited> = rows

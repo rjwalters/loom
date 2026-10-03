@@ -15,8 +15,8 @@
 //!    → `needs-operator(merge-risk-hold)`;
 //! 4. the forge refused the merge of its approved PR →
 //!    `needs-operator(merge-refused)`;
-//! 5. `loom:blocked`: an open same-repo blocker → `blocked-by` (it inherits
-//!    the star); only a cross-repo blocker → `needs-operator(blocked-cross-repo)`
+//! 5. `loom:blocked`: an open same-repo blocker → `blocked-by` (every open
+//!    same-repo blocker inherits the star); only a cross-repo blocker → `needs-operator(blocked-cross-repo)`
 //!    (stars are not inherited across repos, so nothing else would move it);
 //!    none → `needs-operator(blocked-unnamed)`;
 //! 6. its repo's `main` is red and it has not been dispatched → `blocked-by`
@@ -153,9 +153,10 @@ pub struct Landing {
     pub pr: Option<u32>,
     /// `BlockedBy`: the blocker as shown.
     pub blocked_by: Option<String>,
-    /// `BlockedBy` / `MergeRefused`: the same-repo issue that inherits the
-    /// star, when there is one.
-    pub inherits: Option<u32>,
+    /// `BlockedBy` / `MergeRefused`: the same-repo issues that inherit the
+    /// star, ascending. Every open same-repo blocker inherits, not only the
+    /// first one named (#10012 AC 3).
+    pub inherits: Vec<u32>,
     pub no_capacity: Option<String>,
     pub ask: Option<OperatorAsk>,
 }
@@ -167,7 +168,7 @@ impl Landing {
             next_actor: next_actor.to_string(),
             pr,
             blocked_by: None,
-            inherits: None,
+            inherits: Vec::new(),
             no_capacity: None,
             ask: None,
         }
@@ -294,7 +295,11 @@ pub fn classify(f: &StarFacts) -> Landing {
                 ),
                 Some(p),
             );
-            landing.inherits = refusal.incident.filter(|i| *i != n && *i != p);
+            landing.inherits = refusal
+                .incident
+                .filter(|i| *i != n && *i != p)
+                .into_iter()
+                .collect();
             return landing;
         }
     }
@@ -311,7 +316,17 @@ pub fn classify(f: &StarFacts) -> Landing {
             let mut landing =
                 Landing::stage(LandingStage::BlockedBy, &format!("blocker {}", b.display), pr_num);
             landing.blocked_by = Some(b.display.clone());
-            landing.inherits = b.number.filter(|m| *m != n);
+            let mut inherits: Vec<u32> = f
+                .blockers
+                .iter()
+                .filter(open)
+                .filter(|b| b.cross_repo_managed.is_none())
+                .filter_map(|b| b.number)
+                .filter(|m| *m != n)
+                .collect();
+            inherits.sort_unstable();
+            inherits.dedup();
+            landing.inherits = inherits;
             return landing;
         }
         if let Some(b) = f.blockers.iter().find(open) {
@@ -357,7 +372,7 @@ pub fn classify(f: &StarFacts) -> Landing {
     if let Some(fix) = f.red_main_fix.filter(|fix| *fix != n && !dispatched) {
         let mut landing = Landing::stage(LandingStage::BlockedBy, &format!("blocker #{fix}"), None);
         landing.blocked_by = Some(format!("#{fix}"));
-        landing.inherits = Some(fix);
+        landing.inherits = vec![fix];
         return landing;
     }
 
