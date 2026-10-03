@@ -232,6 +232,38 @@ fn every_role_drains_level_two_before_the_star_before_ordinary_work() {
     }
 }
 
+fn starred_at(mut row: Value, at: Option<&str>) -> Value {
+    if let Some(at) = at {
+        row[STAR_AT_FIELD] = json!(at);
+    }
+    row
+}
+
+/// #9974: B (#10) is older and lower-numbered, A (#20) was starred first.
+/// Every role takes A, then B, then unstarred work, preference on or off.
+#[test]
+fn every_role_orders_stars_by_earliest_star_time_not_creation_or_number() {
+    for (role, label) in [
+        (PrRole::Judge, "loom:review-requested"),
+        (PrRole::Doctor, "loom:changes-requested"),
+        (PrRole::Champion, "loom:pr"),
+    ] {
+        let star = "loom:operator-priority";
+        let rows = vec![
+            pr(5, "interactive", &[label]),
+            starred_at(pr(10, "interactive", &[label, star]), Some("2026-09-25T00:00:00Z")),
+            starred_at(pr(20, "autonomous", &[label, star]), Some("2026-09-21T00:00:00Z")),
+        ];
+        for prefer in [true, false] {
+            assert_eq!(
+                ids(&ordered_queue(rows.clone(), role, prefer, &policy())),
+                vec![20, 10, 5],
+                "{role:?} prefer={prefer}"
+            );
+        }
+    }
+}
+
 /// #10307 AC: a level-3 row in the table is enough for the PR queue to read
 /// level 3 above level 2 (the level key is generic over the table).
 #[test]
@@ -250,4 +282,43 @@ fn a_level_three_row_orders_above_level_two() {
     assert_eq!(operator_level_in(&table, &two), 2);
     assert_eq!(operator_level_in(&table, &three), 3);
     assert_eq!(operator_level(&three), 0, "unknown to the production table");
+}
+
+/// An unknown star time falls back to `created_at`, as in `candidate_cmp`.
+#[test]
+fn an_unknown_star_time_falls_back_to_created_at() {
+    let star = "loom:operator-priority";
+    let rows = vec![
+        pr(3, "autonomous", &["loom:pr", star]),
+        starred_at(pr(4, "autonomous", &["loom:pr", star]), Some("2026-09-02T00:00:00Z")),
+    ];
+    assert_eq!(ids(&ordered_queue(rows, PrRole::Champion, true, &policy())), vec![4, 3]);
+}
+
+/// The stamp copies `forge starred`'s effective time, including a PR's
+/// inherited linked-issue star, and that flips the order.
+#[test]
+fn stamped_inherited_star_time_orders_the_pr() {
+    use crate::forge_starred::{Kind, StarredRow};
+    let star = "loom:operator-priority";
+    let mut rows = vec![
+        pr(10, "autonomous", &["loom:review-requested", star]),
+        pr(20, "autonomous", &["loom:review-requested", star]),
+    ];
+    let starred = |n: u32, at: &str, from: Option<u32>| StarredRow {
+        number: n,
+        kind: Kind::Pr,
+        created_at: None,
+        starred_at: Some(at.into()),
+        inherited_from: from,
+    };
+    listing::stamp(
+        &mut rows,
+        &[
+            starred(10, "2026-09-30T00:00:00Z", None),
+            starred(20, "2026-09-01T00:00:00Z", Some(7)),
+        ],
+    );
+    assert_eq!(rows[1][STAR_AT_FIELD], "2026-09-01T00:00:00Z");
+    assert_eq!(ids(&ordered_queue(rows, PrRole::Judge, true, &policy())), vec![20, 10]);
 }

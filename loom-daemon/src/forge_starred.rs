@@ -19,7 +19,7 @@
 //! empty output = verified answer; [`EX_STARRED_FAILED`] (5) = not answered
 //! (fail closed, never an empty queue); `3` = Gitea decline.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
@@ -105,8 +105,8 @@ struct Listed {
     link: Option<u32>,
 }
 
-fn list_starred(root: &std::path::Path, owner: &str, repo: &str) -> Result<Vec<Listed>> {
-    let mut cmd = Command::new("gh");
+fn list_starred(root: &Path, gh: &Path, owner: &str, repo: &str) -> Result<Vec<Listed>> {
+    let mut cmd = Command::new(gh);
     cmd.arg("api")
         .arg(format!(
             "repos/{owner}/{repo}/issues?labels={OPERATOR_PRIORITY_LABEL}&state=open&per_page=100"
@@ -157,12 +157,24 @@ fn list_starred(root: &std::path::Path, owner: &str, repo: &str) -> Result<Vec<L
     Ok(out)
 }
 
-fn run(root: &std::path::Path, kind: Kind, extra: Option<&str>) -> Result<Vec<StarredRow>> {
+/// Open starred items of `kind` in the repo at `root`, best first, with PR
+/// star inheritance applied. Shared by this command and `pr-queue`
+/// ([`crate::pr_planning`]), so every consumer orders stars identically.
+///
+/// # Errors
+/// The owner/repo could not be resolved or the starred listing failed. An
+/// unreadable per-item timeline is not an error (createdAt fallback).
+pub fn starred_rows(
+    root: &Path,
+    gh: &Path,
+    kind: Kind,
+    extra: Option<&str>,
+) -> Result<Vec<StarredRow>> {
     let (owner, repo) =
         resolve_owner_repo(root).context("could not resolve owner/repo from the git remotes")?;
-    let listed = list_starred(root, &owner, &repo)?;
+    let listed = list_starred(root, gh, &owner, &repo)?;
     let mut src = GhTimelineStarredAt {
-        gh_bin: PathBuf::from("gh"),
+        gh_bin: gh.to_path_buf(),
         cwd: Some(root.to_path_buf()),
         repo: Some(format!("{owner}/{repo}")),
     };
@@ -199,7 +211,7 @@ pub fn handle(kind: &str, label: Option<&str>, json: bool) -> Result<()> {
         eprintln!("loom-daemon forge starred: GitHub-only; list starred items by hand.");
         std::process::exit(EX_FORGE_DECLINED);
     }
-    match run(&root, kind, label) {
+    match starred_rows(&root, &PathBuf::from("gh"), kind, label) {
         Ok(rows) => {
             if json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
