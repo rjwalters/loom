@@ -49,6 +49,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::cmd_out::{self, gh_json, CmdOutcome, Query, DEFAULT_TIMEOUT};
+use crate::gh_invocation::gh_bin;
 use crate::repo_root::{find_repo_root_from_cwd, find_worktree_root_from_cwd};
 
 /// Upper bound on the `state` string handed to Jev — head+tail diff
@@ -98,12 +99,6 @@ fn jev_model() -> String {
         .ok()
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| JEV_DEFAULT_MODEL.to_string())
-}
-
-/// Resolve the `gh` binary name (honoring `LOOM_GH_BIN` for tests/overrides —
-/// same convention the other forge callers in this crate use).
-fn gh_bin() -> String {
-    std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
 }
 
 /// Collapse a Noul probability into a 0..=1 certainty. See

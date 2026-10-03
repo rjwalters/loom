@@ -196,6 +196,7 @@ pub mod forge_parser;
 pub mod forge_pr_congestion;
 pub mod forge_read_pool;
 pub mod forge_tree_unchanged;
+pub mod gh_invocation;
 pub mod gh_repo_env;
 pub mod git_parser;
 pub mod git_utils;
