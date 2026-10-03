@@ -66,8 +66,8 @@ Loom-only codes cover surfaces that 2am's validator cannot see
 (`forge_egress::checks::LOOM_ONLY_CODES`):
 
 - `apiconfig.api-host-missing` / `apiconfig.api-host-mismatch`: a profile's
-  `hosts.yml` logical-host entry lacks the policy's `api_host`, or carries a
-  different one. This covers Loom's token-only republication (scenario 17,
+  `hosts.yml` logical-host entry lacks the API-host setting the policy
+  requires, or names a different host. This covers Loom's token-only republication (scenario 17,
   #9986).
 - `runtime.bypass-open`: the canary's direct request succeeded.
 - `telemetry.loom-exporter-not-otlp`: Loom's own observability config has no
@@ -100,8 +100,8 @@ versions, counts and remedies only. Token-shaped strings are redacted.
 policy, or one with an unknown `schemaVersion`, is never treated as observe-only.
 
 Not wired yet: post-publication `assert` + rollback (C3, #9986) and
-`resync-installed.sh` (shell; run `loom-daemon forge egress doctor` after a
-resync by hand).
+`resync-installed.sh` (#9996; run `loom-daemon forge egress doctor` after a
+resync by hand). The facade resolver's policy-launcher rung is #9995.
 
 ## Lockstep with 2am
 

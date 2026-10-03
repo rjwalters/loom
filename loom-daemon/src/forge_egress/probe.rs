@@ -28,13 +28,17 @@ pub struct ProbeOptions {
     pub run_canary: bool,
 }
 
-/// The `gh` Loom will actually exec: `$LOOM_GH_BIN` (resolved on `PATH`
-/// when bare), else `gh` on `PATH`. Not `command -v gh` in some other shell.
+/// The `gh` Loom will actually exec: the program the spawn choke point's
+/// resolver picks ([`crate::gh_invocation::resolver::resolve`] —
+/// `$LOOM_GH_BIN`, else `gh`), resolved on `PATH` when bare. Not
+/// `command -v gh` in some other shell. Single-sourced so the validator and
+/// every facade spawn agree by construction.
 #[must_use]
 pub fn effective_gh_path() -> Option<PathBuf> {
-    let name = std::env::var_os("LOOM_GH_BIN")
-        .filter(|v| !v.is_empty())
-        .map_or_else(|| PathBuf::from("gh"), PathBuf::from);
+    let name = PathBuf::from(crate::gh_invocation::resolver::resolve().program);
+    if name.as_os_str().is_empty() {
+        return None;
+    }
     if name.components().count() > 1 {
         return name.is_file().then_some(name);
     }

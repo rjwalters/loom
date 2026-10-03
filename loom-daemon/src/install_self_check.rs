@@ -998,6 +998,7 @@ impl ViolationReporter for GhIssueFiler {
     fn update_issue_body(&self, number: u64, body: &str) -> Result<(), String> {
         forge_egress_invariant::gh_issue_op(
             &self.repo_root,
+            "issue.edit",
             &["edit", &number.to_string(), "--body", body],
         )
     }
@@ -1005,6 +1006,7 @@ impl ViolationReporter for GhIssueFiler {
     fn close_issue(&self, number: u64, comment: &str) -> Result<(), String> {
         forge_egress_invariant::gh_issue_op(
             &self.repo_root,
+            "issue.close",
             &["close", &number.to_string(), "--comment", comment],
         )
     }

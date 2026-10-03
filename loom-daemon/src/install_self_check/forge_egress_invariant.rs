@@ -5,7 +5,9 @@
 //! is aligned again. Like every other filing, it acts only in repair/act mode.
 
 use std::path::Path;
-use std::process::Command;
+
+use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
+use crate::proc_exec::Completion;
 
 use super::{Invariant, InvariantOutcome, InvariantStatus, ViolationReporter};
 
@@ -120,17 +122,32 @@ pub(super) fn reconcile<R: ViolationReporter>(
     }
 }
 
-fn gh(repo_root: &Path, args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new("gh");
-    cmd.args(args).current_dir(repo_root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
-    let out = cmd
-        .output()
-        .map_err(|e| format!("could not spawn gh: {e}"))?;
+/// Bound on each lifecycle `gh` call.
+const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One `gh` call through the spawn choke point (#9985): the facade applies the
+/// owner-correct `GH_CONFIG_DIR` for `repo_root` (#5431) and the resolved
+/// executable.
+fn gh(
+    repo_root: &Path,
+    operation: &'static str,
+    intent: AccessIntent,
+    args: &[&str],
+) -> Result<String, String> {
+    let completion =
+        GhInvocation::new(Operation::new(operation), intent, GhTarget::None, GH_TIMEOUT)
+            .args(args)
+            .current_dir(repo_root)
+            .execute()
+            .map_err(|e| format!("could not run gh: {e}"))?;
+    let out = match completion {
+        GhCompletion::Captured(Completion::Exited(out)) => out,
+        GhCompletion::Captured(_) => return Err(format!("gh {operation} timed out")),
+        GhCompletion::Passthrough(_) => return Err("unexpected passthrough".to_string()),
+    };
     if !out.status.success() {
         return Err(format!(
-            "gh {} exited with {}: {}",
-            args.first().copied().unwrap_or(""),
+            "gh {operation} exited with {}: {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         ));
@@ -145,6 +162,8 @@ pub(super) fn gh_find_open_issue(
 ) -> Result<Option<(u64, String)>, String> {
     let stdout = gh(
         repo_root,
+        "issue.list",
+        AccessIntent::Read,
         &[
             "issue",
             "list",
@@ -168,10 +187,14 @@ pub(super) fn gh_find_open_issue(
 }
 
 /// `gh issue <args…>` for the edit/close half of the lifecycle.
-pub(super) fn gh_issue_op(repo_root: &Path, args: &[&str]) -> Result<(), String> {
+pub(super) fn gh_issue_op(
+    repo_root: &Path,
+    operation: &'static str,
+    args: &[&str],
+) -> Result<(), String> {
     let mut full = vec!["issue"];
     full.extend_from_slice(args);
-    gh(repo_root, &full).map(|_| ())
+    gh(repo_root, operation, AccessIntent::Write, &full).map(|_| ())
 }
 
 #[cfg(test)]
