@@ -834,6 +834,15 @@ pub(crate) enum MergePrCommand {
     /// 2 = the resolved root cannot be framed unambiguously. The seam fails
     /// OPEN (no targets, clean up nothing) — see `cli::merge_pr_cleanup_paths`.
     CleanupPaths(super::merge_pr_cleanup_paths::CleanupPathsArgs),
+
+    /// The identity/ownership gate in front of `_remove_loom_worktree` (#8191
+    /// slice): the #3710 primary-worktree hard guard, then the
+    /// `.loom-managed` sentinel guard with its `--worktree-path` bypass.
+    /// `git worktree list --porcelain` on stdin; first line
+    /// `LOOM-REMOVE-GATE PROCEED|REFUSE` then `LEVEL<TAB>message` records.
+    /// The shell treats anything else as REFUSE — see
+    /// `cli::merge_pr_remove_gate`.
+    RemoveGate(super::merge_pr_remove_gate::RemoveGateArgs),
 }
 
 impl MergePrCommand {
@@ -873,6 +882,7 @@ impl MergePrCommand {
             MergePrCommand::ReconcileChild(args) => args.run(),
             MergePrCommand::ChecksFailure(args) => args.run(),
             MergePrCommand::WorktreePreserve(args) => args.run(),
+            MergePrCommand::RemoveGate(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
         }
     }
