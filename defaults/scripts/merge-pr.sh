@@ -508,21 +508,16 @@ REPO_NWO="$(loom_write_repo "${LOOM_REPO:-}")" || error "Merge refused (#9548): 
 REPO_MERGE_METHOD="$(forge_detect_merge_method "$REPO_NWO" "$GH" 2>/dev/null || echo squash)"
 
 # Parse arguments
-PR_NUMBER=""
-CLEANUP_WORKTREE=true
+PR_NUMBER=""; CLEANUP_WORKTREE=true
 # CLEANUP_PRIMARY_CHECKOUT (#5015): gates the automatic primary-checkout
 # branch cleanup performed by _maybe_delete_local_branch. Defaults on
 # (mirrors CLEANUP_WORKTREE's default); --no-cleanup-primary opts out.
 CLEANUP_PRIMARY_CHECKOUT=true
-DRY_RUN=false
-AUTO_MERGE=false
-WORKTREE_PATH_OVERRIDE=""
-ALLOW_STACKED_CHILDREN=false
+DRY_RUN=false; AUTO_MERGE=false; WORKTREE_PATH_OVERRIDE=""; ALLOW_STACKED_CHILDREN=false
 # ALLOW_UNAPPROVED (#7419): bypasses the loom:pr review-signal guard
 # (_check_loom_pr_label below). Off by default — a missing loom:pr label
 # hard-blocks the merge unless the operator explicitly opts in here.
-ALLOW_UNAPPROVED=false
-ALLOW_RED_TREE=false  # #10026: bypasses _check_tree_checks
+ALLOW_UNAPPROVED=false; ALLOW_RED_TREE=false  # ALLOW_RED_TREE (#10026): bypasses _check_tree_checks
 # MERGE_METHOD_REQUESTED (#8845): explicit --merge-method override, resolved
 # against REPO_MERGE_METHOD (set above from auto-detect) once parsing is done.
 MERGE_METHOD_REQUESTED=""
@@ -1164,8 +1159,7 @@ _check_tree_checks
 #       declared intent. Only these are auto-reopened; that keeps a deliberate
 #       human close inside the merge window (which carries no closing reference)
 #       from being reverted.
-PARTIAL_OPEN_BEFORE_MERGE=""
-PARTIAL_CONFLICT_ISSUES=""
+PARTIAL_OPEN_BEFORE_MERGE=""; PARTIAL_CONFLICT_ISSUES=""
 
 # Closing-reference / partial-increment analysis, ported to Rust (#8191).
 #
