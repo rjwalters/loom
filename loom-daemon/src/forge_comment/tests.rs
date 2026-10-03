@@ -6,6 +6,7 @@ use super::*;
 
 #[test]
 fn dashboard_url_issues_vs_pull() {
+    let _env = DefaultDashboardEnv::hold();
     assert_eq!(
         forge_dashboard_url("o/r", 42, false),
         format!("{DEFAULT_DASHBOARD_BASE_URL}/github.com/o/r/issues/42")
@@ -38,6 +39,7 @@ fn footer_is_idempotent_on_its_marker() {
 
 #[test]
 fn footer_or_body_leaves_unresolvable_slugs_untouched() {
+    let _env = DefaultDashboardEnv::hold();
     assert_eq!(footer_or_body(None, 9, false, "body"), "body");
     assert_eq!(
         footer_or_body(Some("o/r"), 9, false, "body"),
@@ -97,6 +99,7 @@ fn parse_issue_ref_accepts_the_stored_shapes() {
 
 #[test]
 fn post_comment_sends_the_footer_through_the_rest_endpoint() {
+    let _env = DefaultDashboardEnv::hold();
     let stub = temp_stub_gh();
     let result = post_comment(stub.path().join("gh"), None, "o/r", 42, false, "the body")
         .expect("stub gh succeeds");
@@ -132,6 +135,7 @@ fn post_comment_sends_the_footer_through_the_rest_endpoint() {
 
 #[test]
 fn post_comment_surveys_stderr_on_failure() {
+    let _env = DefaultDashboardEnv::hold();
     let stub = temp_stub_gh_failing();
     let error =
         post_comment(stub.path().join("gh"), None, "o/r", 42, false, "b").expect_err("stub fails");
@@ -187,6 +191,7 @@ fn recorded_json(stub: &StubGh, call: usize) -> serde_json::Value {
 
 #[test]
 fn rest_rate_limit_falls_back_to_graphql_add_comment_byte_identically() {
+    let _env = DefaultDashboardEnv::hold();
     let stub = temp_stub_gh_rest_limited("HTTP 403: API rate limit exceeded for user ID 1.", true);
     let body = "multi-line\n\n- with `markdown` and \"quotes\"\n";
     let response = post_comment(stub.path().join("gh"), None, "o/r", 42, false, body)
@@ -221,6 +226,7 @@ fn rest_rate_limit_falls_back_to_graphql_add_comment_byte_identically() {
 
 #[test]
 fn graphql_fallback_failure_returns_the_original_rest_error() {
+    let _env = DefaultDashboardEnv::hold();
     let stub = temp_stub_gh_rest_limited("HTTP 403: API rate limit exceeded for user ID 1.", false);
     let error = post_comment(stub.path().join("gh"), None, "o/r", 42, false, "b")
         .expect_err("both transports fail");
@@ -231,6 +237,7 @@ fn graphql_fallback_failure_returns_the_original_rest_error() {
 
 #[test]
 fn non_rate_limit_rest_failure_does_not_try_graphql() {
+    let _env = DefaultDashboardEnv::hold();
     let stub = temp_stub_gh_rest_limited("HTTP 404: Not Found", true);
     let error = post_comment(stub.path().join("gh"), None, "o/r", 42, false, "b")
         .expect_err("a 404 is not retried");
@@ -287,3 +294,32 @@ fn temp_stub_gh_failing() -> StubGh {
 /// in one process, and a global env var would race (the same reasoning
 /// `merge_pr/redate` documents for parameterizing on the binary).
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Holds `ENV_LOCK` and pins `ENV_DASHBOARD_BASE_URL` unset for a test whose
+/// result depends on the footer URL (every `post_comment` call reads it), so a
+/// parallel env-override test cannot change the base mid-test. Restores the
+/// previous value on drop, before releasing the lock.
+struct DefaultDashboardEnv {
+    previous: Option<String>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl DefaultDashboardEnv {
+    fn hold() -> Self {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var(ENV_DASHBOARD_BASE_URL).ok();
+        std::env::remove_var(ENV_DASHBOARD_BASE_URL);
+        Self {
+            previous,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for DefaultDashboardEnv {
+    fn drop(&mut self) {
+        if let Some(value) = self.previous.take() {
+            std::env::set_var(ENV_DASHBOARD_BASE_URL, value);
+        }
+    }
+}
