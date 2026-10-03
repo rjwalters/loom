@@ -815,6 +815,12 @@ pub trait WorkDispatcher {
         false
     }
 
+    /// The red-main-fix escalation (#10118): `waiting` is this repo's
+    /// marker-bearing candidates on a red `main` (empty when `red` is false).
+    /// The production dispatcher alerts the operator once per fix left
+    /// unclaimed past the threshold. Defaults to a no-op.
+    fn escalate_red_fix(&mut self, _red: bool, _waiting: &[u32]) {}
+
     /// Count of in-flight sweeps that occupy the work-finder's concurrency
     /// budget (Issue #4003).
     ///
@@ -1020,9 +1026,8 @@ pub fn tick_with_saturation_brake(
     max_admissions_per_tick: usize,
     saturation_held: bool,
 ) -> Result<TickReport> {
-    let lane = RedMainLane::default();
     let caps = (max_concurrent.into(), max_admissions_per_tick);
-    tick_with_lanes(source, dispatcher, caps, halted, saturation_held, lane)
+    tick_with_lanes(source, dispatcher, caps, halted, saturation_held, RedMainLane::default())
 }
 
 /// Like [`tick_with_saturation_brake`], plus the #9244 lanes: starred and
@@ -1045,6 +1050,8 @@ pub fn tick_with_lanes(
     lane: RedMainLane,
 ) -> Result<TickReport> {
     let mut ready = source.list_ready_issues()?;
+    // #10118: unpromoted red-main fixes stay only while `main` is red.
+    let red = main_red_fix::evaluate(lane, &mut ready, dispatcher);
     let mut report = TickReport {
         seen: ready.len(),
         // Record the brake's engagement even on a tick that defers nothing, so a
@@ -1053,7 +1060,6 @@ pub fn tick_with_lanes(
         saturation_held,
         ..TickReport::default()
     };
-    let red = lane.is_red(&ready, || dispatcher.main_red_via_ci());
     ready_queue::sort_lanes(&mut ready, red);
     let (max_concurrent, mut overflow) = OverflowSlot::open(dispatcher.overflow_in_flight(), terms);
 
@@ -1801,7 +1807,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // decided globally, so dispatch happens in pass 2 after the sort.
     let mut candidates: Vec<PriorityCandidate> = Vec::new();
     for (idx, (source, dispatcher)) in workspaces.iter_mut().enumerate() {
-        let ready = match source.list_ready_issues() {
+        let mut ready = match source.list_ready_issues() {
             Ok(r) => r,
             Err(e) => {
                 // Per-workspace isolation: log, count, and move on — the other
@@ -1816,6 +1822,10 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
                 continue;
             }
         };
+        // #10118: resolve the lane first — unpromoted red-main fixes are
+        // dropped from `ready` (and from `seen`) unless `main` is red.
+        let lane = lanes.get(idx).copied().unwrap_or_default();
+        let red = main_red_fix::evaluate(lane, &mut ready, dispatcher);
         report.seen += ready.len();
         let workspace_priority = priorities
             .get(idx)
@@ -1828,8 +1838,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         // caller can log "backlog is N but halted"; its in-flight sweeps stay in
         // the global occupancy seed and are never touched. #9244: a verified-red
         // repo with no other hold still admits its red-main fixes (only those).
-        let lane = lanes.get(idx).copied().unwrap_or_default();
-        let red = lane.is_red(&ready, || dispatcher.main_red_via_ci());
         let repo_halted = halted.get(idx).copied().unwrap_or(false);
         if repo_halted && !lane.admits_fixes_while_halted() {
             // #9017: name WHICH hold tripped, not just that one did.

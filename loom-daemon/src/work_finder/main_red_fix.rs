@@ -20,13 +20,29 @@
 //! the repo has a marker-bearing candidate.
 //!
 //! A marker on a green repo is inert: no boost, no halt bypass.
+//!
+//! # Unpromoted fixes (#10118)
+//!
+//! A fix is usually filed in `loom:triage` (or curated but not yet promoted),
+//! so it is not in the `loom:issue` listing and could never reach the lane.
+//! The work finder therefore also lists `loom:triage` and `loom:curated` and
+//! keeps the marker-bearing rows ([`merge_red_fix_candidates`]). Those rows
+//! are admitted **only while the repo is red** ([`evaluate`] drops them
+//! otherwise), so a marker on a green repo is still inert. Dispatching an
+//! unpromoted issue needs no new path: the registry's pre-flip classifier
+//! returns `NotYetApproved` and the child sweep starts from Curator.
+//!
+//! If a fix stays unclaimed on a red repo for longer than
+//! [`RED_FIX_ESCALATE_AFTER`] (config:
+//! `autonomous.workFinder.redFixEscalateAfterSecs`), the operator is alerted
+//! once ([`RedFixWatch`]) instead of the repo waiting silently.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::WorkItem;
+use super::{WorkDispatcher, WorkItem};
 use crate::cmd_out::{CmdOutcome, Unavailable};
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
 
@@ -37,7 +53,29 @@ pub const MAIN_RED_FIX_MARKER: &str = "<!-- loom:main-red-fix -->";
 /// fallback costs at most one forge read per repo per tick.
 pub const CI_FALLBACK_TTL: Duration = Duration::from_secs(60);
 
+/// The pre-promotion labels listed for unpromoted fixes (#10118). An issue
+/// with no workflow label at all is not listable this way (a known limit), so
+/// fix filers apply `loom:triage`.
+pub const UNPROMOTED_LABELS: [&str; 2] = ["loom:triage", "loom:curated"];
+
+/// Default for how long a fix may sit unclaimed on a red repo before the
+/// operator is alerted (#10118). An initial value: with the unpromoted
+/// listing, a fix should be claimed within a tick or two, so half an hour
+/// unclaimed means something is stuck. Retune from measured time-to-claim via
+/// `autonomous.workFinder.redFixEscalateAfterSecs` (read live).
+pub const RED_FIX_ESCALATE_AFTER: Duration = Duration::from_secs(30 * 60);
+
 impl WorkItem {
+    /// A marker-bearing row that only the unpromoted listing contributed:
+    /// not `loom:issue` and not starred (a starred row is a candidate on its
+    /// own). Such a row is a candidate only while the repo is red (#10118).
+    #[must_use]
+    pub fn is_unpromoted_red_fix(&self) -> bool {
+        self.is_main_red_fix()
+            && !self.labels.iter().any(|l| l == "loom:issue")
+            && !self.is_operator_priority()
+    }
+
     /// True when [`Self::body`] carries [`MAIN_RED_FIX_MARKER`] at the start
     /// of a line (the same line-anchored style as the complexity and
     /// recheck-interval markers, so prose quoting the marker mid-sentence does
@@ -48,6 +86,163 @@ impl WorkItem {
             b.lines()
                 .any(|l| l.trim_start().starts_with(MAIN_RED_FIX_MARKER))
         })
+    }
+}
+
+/// Fold one unpromoted listing ([`UNPROMOTED_LABELS`]) into the candidate
+/// rows (#10118): keep only marker-bearing rows not already listed, and drop
+/// the rows [`super::operator_priority::excluded_from_side_listing`] drops
+/// from the starred listing (claimed, being curated, or Champion-path). Every
+/// kept row still goes through the normal skip filters.
+#[must_use]
+pub fn merge_red_fix_candidates(mut ready: Vec<WorkItem>, rows: Vec<WorkItem>) -> Vec<WorkItem> {
+    let listed: HashSet<u32> = ready.iter().map(|i| i.number).collect();
+    ready.extend(rows.into_iter().filter(|i| {
+        i.is_main_red_fix()
+            && !listed.contains(&i.number)
+            && !super::operator_priority::excluded_from_side_listing(i)
+    }));
+    ready
+}
+
+/// Resolve one repo's lane for this tick's listing: whether `main` counts as
+/// red, with the unpromoted fixes dropped from `ready` when it does not
+/// (#10118), and the escalation watch fed with the fixes still waiting.
+pub fn evaluate<D: WorkDispatcher + ?Sized>(
+    lane: RedMainLane,
+    ready: &mut Vec<WorkItem>,
+    dispatcher: &mut D,
+) -> bool {
+    let red = lane.is_red(ready, || dispatcher.main_red_via_ci());
+    if !red {
+        ready.retain(|i| !i.is_unpromoted_red_fix());
+    }
+    let waiting: Vec<u32> = ready
+        .iter()
+        .filter(|i| red && i.is_main_red_fix())
+        .map(|i| i.number)
+        .collect();
+    dispatcher.escalate_red_fix(red, &waiting);
+    red
+}
+
+/// Per-repo record of how long each fix has waited unclaimed on a red `main`
+/// (#10118), so the operator is alerted once per fix past the threshold.
+#[derive(Debug, Default)]
+pub struct RedFixWatch {
+    first_seen: HashMap<u32, Instant>,
+    alerted: HashSet<u32>,
+}
+
+impl RedFixWatch {
+    /// Record this tick's waiting fixes and return the ones due an alert now,
+    /// with how long each has waited. A fix is due once, when it has waited
+    /// at least `after`. A green tick, or a fix leaving the waiting set (it
+    /// was claimed), resets its clock.
+    pub fn observe(
+        &mut self,
+        now: Instant,
+        red: bool,
+        waiting: &[u32],
+        after: Duration,
+    ) -> Vec<(u32, Duration)> {
+        let keep: HashSet<u32> = if red {
+            waiting.iter().copied().collect()
+        } else {
+            HashSet::new()
+        };
+        self.first_seen.retain(|n, _| keep.contains(n));
+        self.alerted.retain(|n| keep.contains(n));
+        let mut due = Vec::new();
+        for &n in waiting.iter().filter(|n| keep.contains(n)) {
+            let waited = now.saturating_duration_since(*self.first_seen.entry(n).or_insert(now));
+            if waited >= after && self.alerted.insert(n) {
+                due.push((n, waited));
+            }
+        }
+        due
+    }
+}
+
+/// The escalation threshold for `root`: `autonomous.workFinder.
+/// redFixEscalateAfterSecs` when set to a positive integer, else
+/// [`RED_FIX_ESCALATE_AFTER`]. Read on each call, so a change applies live.
+#[must_use]
+pub fn escalate_after(root: &Path) -> Duration {
+    let effective = crate::config_resolver::resolve_effective_config(root);
+    crate::config_resolver::get_path(&effective, "autonomous.workFinder.redFixEscalateAfterSecs")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|s| *s > 0)
+        .map_or(RED_FIX_ESCALATE_AFTER, Duration::from_secs)
+}
+
+fn watches() -> &'static Mutex<HashMap<PathBuf, RedFixWatch>> {
+    static WATCHES: OnceLock<Mutex<HashMap<PathBuf, RedFixWatch>>> = OnceLock::new();
+    WATCHES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The production escalation for `root` (the work finder rebuilds its
+/// dispatchers every tick, so the watch is process-wide): feed the repo's
+/// watch and file one `loom:operator` alert per fix that is due.
+pub fn escalate_global(root: &Path, red: bool, waiting: &[u32]) {
+    let after = if red && !waiting.is_empty() {
+        escalate_after(root)
+    } else {
+        RED_FIX_ESCALATE_AFTER
+    };
+    let due = {
+        let mut guard = watches()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .entry(root.to_path_buf())
+            .or_default()
+            .observe(Instant::now(), red, waiting, after)
+    };
+    for (issue, waited) in due {
+        file_alert(root, issue, waited);
+    }
+}
+
+/// The alert issue's title for an unclaimed fix.
+#[must_use]
+pub fn alert_title(issue: u32) -> String {
+    format!("Red main: main-red-fix #{issue} is still unclaimed")
+}
+
+/// File the alert as a `loom:operator` issue via `create-issue.sh`, the same
+/// path the CI billing alert uses. No `--force`, so the script's duplicate
+/// backstop dedups across daemon restarts and hosts.
+fn file_alert(root: &Path, issue: u32, waited: Duration) {
+    let minutes = waited.as_secs() / 60;
+    log::error!(
+        "work_finder: main of {} has been red with main-red-fix #{issue} unclaimed for \
+         {minutes} min; alerting operator (#10118)",
+        root.display()
+    );
+    let Some(script) = crate::watchdog::escalate::resolve_issue_script(Some(root), root, None)
+    else {
+        log::error!("work_finder: no create-issue.sh to alert with for #{issue} (#10118)");
+        return;
+    };
+    let body = format!(
+        "`main` is verified red and #{issue} (carrying `{MAIN_RED_FIX_MARKER}`) has waited \
+         unclaimed for about {minutes} minutes. The work finder admits it ahead of other work \
+         while `main` is red, so something is holding it: check its labels (park/skip, \
+         host constraint), backoff, and the repo's holds in the ready queue.\n\n\
+         Filed once per fix by the red-main-fix lane (#10118); threshold: \
+         `autonomous.workFinder.redFixEscalateAfterSecs`."
+    );
+    let mut cmd = std::process::Command::new(script);
+    cmd.current_dir(root)
+        .args(["--title", &alert_title(issue), "--body", &body])
+        .args(["--label", "loom:operator"]);
+    let ok = crate::sweep_registry::output_with_timeout(cmd, Duration::from_secs(60))
+        .ok()
+        .flatten()
+        .is_some_and(|o| o.status.success() || o.status.code() == Some(3));
+    if !ok {
+        log::error!("work_finder: filing the red-main-fix alert for #{issue} failed (#10118)");
     }
 }
 

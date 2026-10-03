@@ -264,3 +264,223 @@ fn the_ci_fallback_reads_the_repos_default_branch() {
     );
     assert_eq!(default_branch_for(dir.path()), "trunk");
 }
+
+// ---- #10118: unpromoted fixes (triage / curated) and escalation ----
+
+use crate::work_finder::main_red_fix::{merge_red_fix_candidates, RedFixWatch};
+
+const MARKER_BODY: &str = "Fixes red main.\n\n<!-- loom:main-red-fix -->\n";
+
+/// A marker-bearing fix still carrying `label` (`loom:triage` / `loom:curated`).
+fn unpromoted(n: u32, label: &str) -> WorkItem {
+    WorkItem::new(n, vec![label.into()]).with_body(Some(MARKER_BODY.into()))
+}
+
+/// Run one multi-workspace tick over `items` with `lane`; return what was
+/// dispatched and the tick's `seen` count.
+fn multi_tick(
+    items: Vec<WorkItem>,
+    lane: RedMainLane,
+    halted: bool,
+    ci_red: bool,
+) -> (Vec<u32>, usize) {
+    let dispatcher = RecordingDispatcher {
+        ci_red,
+        ..RecordingDispatcher::default()
+    };
+    let mut multi = vec![(FakeSource::once(items), dispatcher)];
+    let report = tick_multi_with_repo_cap(
+        &mut multi,
+        &[100],
+        1.into(),
+        &[halted],
+        None,
+        usize::MAX,
+        false,
+        None,
+        None,
+        &[lane],
+    );
+    (multi[0].1.dispatched.clone(), report.seen)
+}
+
+#[test]
+fn an_unpromoted_fix_is_buildable_on_a_red_repo() {
+    for label in ["loom:triage", "loom:curated"] {
+        let fix = unpromoted(9, label);
+        assert!(fix.is_unpromoted_red_fix(), "{label}");
+        let items = || {
+            vec![
+                dated(issue(1), "2026-01-01T00:00:00Z"),
+                dated(fix.clone(), "2026-09-01T00:00:00Z"),
+            ]
+        };
+        // Red: the fix is a candidate, ahead of the older ordinary issue.
+        assert_eq!(multi_tick(items(), RED, false, false), (vec![9], 2), "{label}");
+        // Red and halted by the gate: it is still admitted, alone.
+        assert_eq!(multi_tick(items(), RED, true, false).0, vec![9], "{label}");
+
+        let mut dispatcher = RecordingDispatcher::default();
+        let src = &mut FakeSource::once(items());
+        let report =
+            tick_with_lanes(src, &mut dispatcher, (1.into(), usize::MAX), false, false, RED)
+                .unwrap();
+        assert_eq!((dispatcher.dispatched, report.seen), (vec![9], 2), "{label}");
+    }
+}
+
+#[test]
+fn an_unpromoted_fix_is_inert_on_a_green_repo() {
+    let items = || vec![issue(1), unpromoted(9, "loom:triage")];
+    // Not a candidate at all: the ordinary issue is dispatched and the fix is
+    // not even counted as seen.
+    assert_eq!(multi_tick(items(), RedMainLane::default(), false, false), (vec![1], 1));
+    // A green repo the gate halted (a non-red hold) admits nothing.
+    assert!(multi_tick(items(), RedMainLane::default(), true, false)
+        .0
+        .is_empty());
+
+    let mut dispatcher = RecordingDispatcher::default();
+    let src = &mut FakeSource::once(items());
+    let lane = RedMainLane::default();
+    let report =
+        tick_with_lanes(src, &mut dispatcher, (5.into(), usize::MAX), false, false, lane).unwrap();
+    assert_eq!((dispatcher.dispatched, report.seen), (vec![1], 1));
+}
+
+#[test]
+fn with_the_gate_disabled_ci_decides_whether_an_unpromoted_fix_is_admitted() {
+    let gate_off = RedMainLane {
+        gate_disabled: true,
+        ..RedMainLane::default()
+    };
+    let items = || vec![unpromoted(9, "loom:triage")];
+    assert_eq!(multi_tick(items(), gate_off, false, true).0, vec![9], "CI red");
+    assert!(
+        multi_tick(items(), gate_off, false, false).0.is_empty(),
+        "CI green or unavailable"
+    );
+}
+
+#[test]
+fn an_unpromoted_fix_still_goes_through_the_skip_filters() {
+    for skip in [
+        "loom:blocked",
+        "loom:operator-only",
+        "loom:operator",
+        "loom:operator-decision",
+    ] {
+        let mut fix = unpromoted(9, "loom:triage");
+        fix.labels.push(skip.into());
+        assert!(multi_tick(vec![fix], RED, false, false).0.is_empty(), "{skip}");
+    }
+}
+
+#[test]
+fn the_unpromoted_listing_keeps_only_unclaimed_marker_rows() {
+    let ready = vec![fix(1)];
+    let mut rows = vec![
+        unpromoted(1, "loom:triage"), // already listed as loom:issue
+        unpromoted(2, "loom:triage"),
+        WorkItem::new(3, vec!["loom:triage".into()]), // no marker
+        issue(4).with_body(Some("Quote `<!-- loom:main-red-fix -->` here".into())),
+    ];
+    for (n, extra) in [
+        (5, "loom:building"),
+        (6, "loom:curating"),
+        (7, "loom:epic"),
+        (8, "loom:architect"),
+        (9, "loom:hermit"),
+        (10, "loom:auditor"),
+    ] {
+        let mut row = unpromoted(n, "loom:curated");
+        row.labels.push(extra.into());
+        rows.push(row);
+    }
+    let merged = merge_red_fix_candidates(ready, rows);
+    let numbers: Vec<u32> = merged.iter().map(|i| i.number).collect();
+    assert_eq!(numbers, vec![1, 2]);
+    // The second listing dedups against the first.
+    let merged = merge_red_fix_candidates(merged, vec![unpromoted(2, "loom:curated")]);
+    assert_eq!(merged.len(), 2);
+    // A promoted or starred fix is not "unpromoted": it is a candidate anyway.
+    assert!(!fix(1).is_unpromoted_red_fix());
+    let mut starred = unpromoted(2, "loom:triage");
+    starred.labels.push(OPERATOR_PRIORITY_LABEL.into());
+    assert!(!starred.is_unpromoted_red_fix());
+}
+
+#[test]
+fn the_watch_alerts_once_per_fix_past_the_threshold() {
+    let after = std::time::Duration::from_secs(1800);
+    let t0 = std::time::Instant::now();
+    let at = |mins: u64| t0 + std::time::Duration::from_secs(mins * 60);
+    let mut watch = RedFixWatch::default();
+    assert!(watch.observe(at(0), true, &[9], after).is_empty());
+    assert!(watch.observe(at(29), true, &[9], after).is_empty());
+    let due = watch.observe(at(30), true, &[9], after);
+    assert_eq!(due.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![9]);
+    assert!(watch.observe(at(45), true, &[9], after).is_empty(), "once");
+
+    // Claimed (left the waiting set), then released again: the clock restarts.
+    assert!(watch.observe(at(46), true, &[], after).is_empty());
+    assert!(watch.observe(at(47), true, &[9], after).is_empty());
+    assert!(watch.observe(at(76), true, &[9], after).is_empty());
+    assert_eq!(watch.observe(at(77), true, &[9], after).len(), 1);
+
+    // A green tick resets everything; a green repo never alerts.
+    let mut watch = RedFixWatch::default();
+    assert!(watch.observe(at(0), true, &[9], after).is_empty());
+    assert!(watch.observe(at(20), false, &[9], after).is_empty());
+    assert!(watch.observe(at(40), true, &[9], after).is_empty(), "clock restarted at 40");
+    assert!(watch.observe(at(100), false, &[9], after).is_empty());
+}
+
+/// A dispatcher recording the escalation calls the tick makes.
+#[derive(Default)]
+struct EscalationRecorder {
+    inner: RecordingDispatcher,
+    calls: Vec<(bool, Vec<u32>)>,
+}
+
+impl WorkDispatcher for EscalationRecorder {
+    fn in_flight(&self) -> HashSet<u32> {
+        self.inner.in_flight()
+    }
+    fn dispatch(&mut self, issue: u32, complexity: Option<&str>) -> Result<bool> {
+        self.inner.dispatch(issue, complexity)
+    }
+    fn escalate_red_fix(&mut self, red: bool, waiting: &[u32]) {
+        self.calls.push((red, waiting.to_vec()));
+    }
+}
+
+#[test]
+fn the_tick_feeds_the_escalation_with_the_fixes_waiting_on_a_red_main() {
+    let items = || vec![issue(1), unpromoted(9, "loom:triage"), fix(7)];
+    for (lane, halted, expect) in [
+        (RED, false, (true, vec![9, 7])),
+        (RED, true, (true, vec![9, 7])),
+        (RedMainLane::default(), false, (false, vec![])),
+    ] {
+        let mut multi = vec![(FakeSource::once(items()), EscalationRecorder::default())];
+        tick_multi_with_repo_cap(
+            &mut multi,
+            &[100],
+            0.into(),
+            &[halted],
+            None,
+            usize::MAX,
+            false,
+            None,
+            None,
+            &[lane],
+        );
+        assert_eq!(multi[0].1.calls, vec![expect.clone()], "{lane:?} halted={halted}");
+
+        let mut dispatcher = EscalationRecorder::default();
+        let src = &mut FakeSource::once(items());
+        tick_with_lanes(src, &mut dispatcher, (0.into(), usize::MAX), halted, false, lane).unwrap();
+        assert_eq!(dispatcher.calls, vec![expect], "single: {lane:?} halted={halted}");
+    }
+}

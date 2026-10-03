@@ -98,13 +98,7 @@ impl WorkSource for GhWorkSource {
         // level): a level-2 issue need not carry the star itself.
         let mut starred: Vec<WorkItem> = Vec::new();
         for label in crate::operator_levels::starred_labels(crate::operator_levels::table()) {
-            let rows = self.list_label(label).unwrap_or_else(|e| {
-                log::warn!(
-                    "work_finder: listing {label} issues failed ({e}); using the other rows only"
-                );
-                crate::rate_limit_breaker::global_observe_failure(&e.to_string(), "work_finder");
-                Vec::new()
-            });
+            let rows = self.list_side_label(label);
             let seen: HashSet<u32> = starred.iter().map(|i| i.number).collect();
             starred.extend(rows.into_iter().filter(|i| !seen.contains(&i.number)));
         }
@@ -138,11 +132,29 @@ impl WorkSource for GhWorkSource {
             }
         }
         crate::star_liveness::inherit::apply(self.cwd.as_deref(), &mut items);
+        // #10118: marker-bearing fixes still in triage / curated. Merged after
+        // star inheritance so such a row never looks starred; the lane drops
+        // them again unless this repo's `main` is red (`main_red_fix::evaluate`).
+        for label in super::main_red_fix::UNPROMOTED_LABELS {
+            let rows = self.list_side_label(label);
+            items = super::main_red_fix::merge_red_fix_candidates(items, rows);
+        }
         Ok(items)
     }
 }
 
 impl GhWorkSource {
+    /// A listing other than `loom:issue` (#9244 §4, #10118). Its failure
+    /// never costs the `loom:issue` rows: log, feed the rate-limit breaker,
+    /// and carry on without it.
+    fn list_side_label(&self, label: &str) -> Vec<WorkItem> {
+        self.list_label(label).unwrap_or_else(|e| {
+            log::warn!("work_finder: listing {label} issues failed ({e}); skipping that listing");
+            crate::rate_limit_breaker::global_observe_failure(&e.to_string(), "work_finder");
+            Vec::new()
+        })
+    }
+
     /// One ETag-cached REST listing of open issues carrying `label` (#4428):
     /// a poll where nothing changed costs zero rate limit (304). REST issue
     /// listings include PRs, so `pull_request`-marked rows are dropped.
@@ -538,6 +550,22 @@ impl WorkDispatcher for RegistryDispatcher {
             Err(_) => return false,
         };
         super::main_red_fix::ci_main_red(&root)
+    }
+
+    /// The red-main-fix escalation (#10118) for this workspace's repo; a fix
+    /// this registry is already running is not waiting.
+    fn escalate_red_fix(&mut self, red: bool, waiting: &[u32]) {
+        let root = match self.registry.lock() {
+            Ok(reg) => reg.config().workspace_root.clone(),
+            Err(_) => return,
+        };
+        let in_flight = self.in_flight();
+        let waiting: Vec<u32> = waiting
+            .iter()
+            .copied()
+            .filter(|n| !in_flight.contains(n))
+            .collect();
+        super::main_red_fix::escalate_global(&root, red, &waiting);
     }
 
     fn dispatch_with(
