@@ -245,13 +245,24 @@ pub fn gh_credential_dirs(owners: &[PathBuf], env_gh_config: Option<&Path>) -> V
             candidates.push(root.to_path_buf());
         }
     }
+    // A real directory at a real `.loom/`, never through a symlink: an owner
+    // root is usually inside a read-write session mount, so a session could
+    // otherwise point `.loom/gh-config` (or `.loom` itself) at any host
+    // directory and have the next `session start` bind it into a container.
+    let real_dir = |path: &Path| {
+        path.symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_dir())
+    };
     let mut dirs: Vec<PathBuf> = Vec::new();
     for root in candidates {
+        if !real_dir(&root.join(".loom")) {
+            continue;
+        }
         for dir in [
             crate::credential_preflight::github_app_gh_config_dir(&root),
             root.join(".loom").join("gh-config-by-owner"),
         ] {
-            if dir.is_dir() && !dirs.contains(&dir) {
+            if real_dir(&dir) && !dirs.contains(&dir) {
                 dirs.push(dir);
             }
         }
