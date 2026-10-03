@@ -40,6 +40,7 @@ Loom-Issue: rjwalters/loom#9465
   from — the storyline rollups that motivated #9465 join across repos.
 - **Line-leading**, optionally behind a list marker or blockquote, exactly like
   `Part of #N`. A mid-sentence mention is a mention, not a declaration.
+  (Unlike `Part of #N`, an emphasis opener is not accepted here — see below.)
 - **Plain text, never inside backticks.** See "The backtick pitfall" below.
 - Repeatable: a PR may carry more than one trailer (deduped by the parser).
 
@@ -82,6 +83,15 @@ Merging PR #5686 into #5240 (rjwalters/kicad-tools) did exactly this. Nothing
 logged the skip, so #5240 was stranded at `loom:building` until a stale-claim
 pass reclaimed it. `merge-pr.sh` now warns (non-blocking) on a whole-line
 backticked trailer, but that warning reaches only whoever runs the merge.
+
+Markdown **emphasis is not a code span** and is accepted (#10029): a
+line-leading `Part of #N` / `Contributes to #N` may open with `*`, `**`,
+`***`, `_`, `__` or `___`, behind a list marker or blockquote or not, so
+`**Part of #123**`, `- *Part of #123*` and `> __Contributes to #123__` all
+parse. Backticks stay excluded even inside emphasis (``**`Part of #123`**``
+does not parse), and the line-leading anchor still rejects a mid-sentence
+`see **Part of #123**`. This applies to the `Part of` / `Contributes to`
+keyword form only — `**Loom-Issue: …**` does not parse.
 
 The `Loom-Issue:` trailer inherits the exclusion, and has its own detector —
 `loom-daemon merge-pr-refs loom-issue-trailer-warnings --pr N` — but that

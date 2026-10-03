@@ -72,6 +72,81 @@ fn the_inline_code_strip_changes_the_answer_and_this_pins_which_way() {
     assert_eq!(partial_increment_refs("subject\n\n`Part of #4574`\n"), Vec::<u64>::new());
 }
 
+// --- #10029: an emphasised declaration is still a declaration ---
+
+#[test]
+fn an_emphasised_declaration_is_read() {
+    // The literal repro (2AMLogic/loom-ui PR #1095): a leading `**` broke the
+    // match, so the parent's labels were not reset on merge.
+    for body in [
+        "**Part of #694** - a partial increment.\n",
+        "**Part of #694** — a partial increment.\n",
+        "__Part of #694__\n",
+        "*Part of #694*\n",
+        "_Part of #694_\n",
+        "***Part of #694***\n",
+        "  **Part of #694**\n",
+        "**Contributes to #694**\n",
+        "**part of #694**\n",
+    ] {
+        assert_eq!(
+            partial_increment_refs(body),
+            vec![694],
+            "must read an emphasised declaration: {body:?}"
+        );
+    }
+}
+
+#[test]
+fn an_emphasised_declaration_behind_a_marker_is_read_without_the_ordinal() {
+    for (body, want) in [
+        ("- **Part of #5**\n", 5u64),
+        ("* **Part of #5**\n", 5),
+        ("+ _Part of #5_\n", 5),
+        ("> **Contributes to #6**\n", 6),
+        ("1. **Part of #7**\n", 7),
+        ("12. *Part of #7*\n", 7),
+    ] {
+        assert_eq!(partial_increment_refs(body), vec![want], "{body:?}");
+    }
+}
+
+#[test]
+fn star_as_list_marker_still_reads_alongside_star_as_emphasis() {
+    // `*` is both: the plain list-marker form must survive the widening.
+    assert_eq!(partial_increment_refs("* Part of #3\n"), vec![3]);
+    assert_eq!(partial_increment_refs("*Part of #3*\n"), vec![3]);
+    assert_eq!(partial_increment_refs("- **Part of #3**\n"), vec![3]);
+}
+
+#[test]
+fn emphasis_does_not_reopen_the_backtick_or_mid_sentence_exclusions() {
+    for body in [
+        "`Part of #4574`\n",
+        "**`Part of #4574`**\n",
+        "- **`Part of #4574`**\n",
+        "see **Part of #9** for details\n",
+        "This is **Part of #9**.\n",
+        "** Part of #9**\n", // not valid emphasis: the opener must touch the keyword
+    ] {
+        assert_eq!(partial_increment_refs(body), Vec::<u64>::new(), "must stay excluded: {body:?}");
+    }
+}
+
+#[test]
+fn emphasised_partial_snippets_match_what_was_read() {
+    assert_eq!(partial_increment_ref_snippets("**Part of #694** - x\n", 694), "**Part of #694");
+    assert_eq!(partial_increment_ref_snippets("  - **Part of #5**\n", 5), "- **Part of #5");
+    // `_` is a word character: the closing emphasis must not defeat the
+    // boundary, and must not leak into the quoted snippet.
+    assert_eq!(partial_increment_ref_snippets("_Part of #694_\n", 694), "_Part of #694");
+    // Still issue-scoped and boundary safe.
+    assert_eq!(partial_increment_ref_snippets("**Part of #694**\n", 69), "");
+    assert_eq!(partial_increment_ref_snippets("_Part of #694_\n", 69), "");
+    // Still blind to a code-span-wrapped mention.
+    assert_eq!(partial_increment_ref_snippets("**`Part of #694`**\n", 694), "");
+}
+
 // --- the numbered-list ordinal trap ---
 
 #[test]

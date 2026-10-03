@@ -36,6 +36,12 @@
 //! is how an earlier differential in this epic reported a divergence in the
 //! code when the inputs had diverged instead.
 //!
+//! One deliberate post-port widening: a markdown emphasis opener before a
+//! line-leading `Part of` / `Contributes to` (`**Part of #N**`, #10029) is
+//! read as a declaration; the retired shell never saw one. The differential
+//! corpus carries no emphasis input for that reason, and the cases are pinned
+//! by unit tests instead.
+//!
 //! # The one translation that is not literal: `[[:space:]]`
 //!
 //! The shell matches with `grep -oiE`, which is **line-oriented** — it never
@@ -122,26 +128,50 @@ fn blank_inline_code(text: &str) -> String {
     .into_owned()
 }
 
+/// Head of a `Part of #N` / `Contributes to #N` declaration, up to and
+/// including the `#`: line start, an optional list/blockquote marker, an
+/// optional markdown emphasis opener, the keyword, then whitespace.
+///
+/// Shared by [`partial_increment_refs`] and [`partial_increment_ref_snippets`]
+/// so "what was read" and "what is quoted" cannot drift apart. Contains NO
+/// capturing group, so each caller's own groups number from 1.
+///
+/// The emphasis opener (`*`/`_`, one to three — italic, bold, bold-italic) is
+/// #10029: `**Part of #694** — a partial increment` is a natural way to
+/// emphasise the declaration, and before it was accepted the leading `**`
+/// broke the match (a lone `*` was consumed as a list marker, leaving the
+/// second unmatched), so the parent's labels were silently not reset on merge.
+/// The closing emphasis needs no handling — the match ends at the digits.
+///
+/// `*` is both a list marker and an emphasis marker, so `* Part of #3`,
+/// `*Part of #3*` and `- **Part of #3**` all read #3. Code spans are NOT
+/// emphasis: inline code is blanked before this runs, so `` `Part of #N` ``
+/// and `` **`Part of #N`** `` stay excluded (#5234). The `^` anchor is what
+/// keeps a mid-sentence `see **Part of #9**` excluded.
+const PARTIAL_DECL_HEAD: &str = r"^[[:blank:]\x0B\x0C\r]*(?:[-*+>]|[0-9]+\.)?[[:blank:]\x0B\x0C\r]*(?:\*{1,3}|_{1,3})?(?:Part of|Contributes to)[[:blank:]\x0B\x0C\r]+#";
+
 /// Issue numbers declared with a NON-closing partial-increment keyword
 /// (`Part of #N` / `Contributes to #N`), deduped and ascending.
 ///
 /// "Declaration" is deliberately narrower than "appears anywhere": the keyword
-/// must be line-leading, optionally behind a list marker or blockquote. See the
-/// module docs for the two incidents that shaped this.
+/// must be line-leading, optionally behind a list marker or blockquote and/or
+/// a markdown emphasis opener (see `PARTIAL_DECL_HEAD`). See the module docs
+/// for the two incidents that shaped this.
 #[must_use]
 pub fn partial_increment_refs(text: &str) -> Vec<u64> {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        Regex::new(r"(?im)^[[:blank:]\x0B\x0C\r]*([-*+>]|[0-9]+\.)?[[:blank:]\x0B\x0C\r]*(Part of|Contributes to)[[:blank:]\x0B\x0C\r]+#([0-9]+)")
+        Regex::new(&format!("(?im){PARTIAL_DECL_HEAD}([0-9]+)"))
             .expect("static partial-increment pattern")
     });
     let cleaned = blank_inline_code(&strip_fenced_code_blocks(text));
 
-    // Capture group 3 only — NOT a digit scan over the whole match, which would
-    // also read a numbered-list marker's own ordinal as an issue number.
+    // Capture group 1 (the digits after `#`) only — NOT a digit scan over the
+    // whole match, which would also read a numbered-list marker's own ordinal
+    // as an issue number.
     let mut set: BTreeSet<u64> = BTreeSet::new();
     for caps in re.captures_iter(&cleaned) {
-        if let Some(n) = caps.get(3).and_then(|m| m.as_str().parse::<u64>().ok()) {
+        if let Some(n) = caps.get(1).and_then(|m| m.as_str().parse::<u64>().ok()) {
             set.insert(n);
         }
     }
@@ -279,17 +309,21 @@ pub fn closing_ref_snippets(text: &str, issue: u64) -> String {
 /// `text` for `issue`, with leading whitespace trimmed.
 ///
 /// Runs the identical fence/inline-code stripping as
-/// [`partial_increment_refs`], so a quoted snippet always matches what was
-/// actually matched rather than a code-block artifact.
+/// [`partial_increment_refs`], and the same `PARTIAL_DECL_HEAD`, so a quoted
+/// snippet always matches what was actually matched rather than a code-block
+/// artifact.
 #[must_use]
 pub fn partial_increment_ref_snippets(text: &str, issue: u64) -> String {
-    let re = Regex::new(&format!(
-        r"(?im)^[[:blank:]\x0B\x0C\r]*([-*+>]|[0-9]+\.)?[[:blank:]\x0B\x0C\r]*(Part of|Contributes to)[[:blank:]\x0B\x0C\r]+#{issue}\b"
-    ))
-    .expect("partial-increment-snippet pattern");
+    // The trailing `(?:\b|_)` sits OUTSIDE group 1: `_` is a word character,
+    // so a bare `\b` would reject the underscore-emphasised
+    // `_Part of #694_` that `partial_increment_refs` reads (#10029). The
+    // snippet is group 1, so a consumed closing `_` is never quoted.
+    let re = Regex::new(&format!(r"(?im)({PARTIAL_DECL_HEAD}{issue})(?:\b|_)"))
+        .expect("partial-increment-snippet pattern");
     let cleaned = blank_inline_code(&strip_fenced_code_blocks(text));
     render_snippets(
-        re.find_iter(&cleaned)
+        re.captures_iter(&cleaned)
+            .filter_map(|c| c.get(1))
             .map(|m| m.as_str().trim_start().to_string())
             .collect(),
     )
@@ -421,7 +455,10 @@ pub fn backticked_partial_increment_warnings(text: &str, pr_number: &str, dry_ru
 // blanked — because the failure modes are identical and a second, subtly
 // different set of rules is a second set of bugs. In particular it inherits the
 // #5234/#8796 code-span pitfall AND its #5690-style detector: see
-// [`unparseable_loom_issue_trailer_warnings`].
+// [`unparseable_loom_issue_trailer_warnings`]. The one rule NOT inherited is
+// #10029's emphasis opener (`**Part of #N**`) — it was scoped to the
+// `Part of` / `Contributes to` keyword form, and a `**Loom-Issue: …**`
+// trailer does not parse.
 
 /// One `Loom-Issue: owner/repo#N` declaration.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
