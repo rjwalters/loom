@@ -855,13 +855,9 @@ enum Commands {
         action: CleanupAction,
     },
 
-    /// `collision-evidence` (#9786) — convert an overlap-replay report into
-    /// versioned prediction/outcome records and publish them as checksummed
-    /// JSONL bundles (+ OTLP payload bodies). See `cli::collision_evidence`.
-    CollisionEvidence {
-        #[command(subcommand)]
-        action: cli::collision_evidence::CollisionEvidenceCommand,
-    },
+    /// `collision-evidence` (#9786); see `cli::collision_evidence`.
+    #[command(flatten)]
+    CollisionEvidence(cli::collision_evidence::CollisionEvidenceTop),
 
     /// Native port of `loom-recover-orphans` (Issue #4272): detects `loom:building`
     /// issues with no live sweep tracking them and spawn-loop tasks with a
@@ -2362,7 +2358,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::OverlapReplay { action } => action.run(),
         Commands::Lease { action } => action.run(),
         Commands::Inflight { action } => action.run(),
-        Commands::CollisionEvidence { action } => action.run(),
+        Commands::CollisionEvidence(cmd) => cmd.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
         Commands::ValidatePhase {
             phase,

@@ -18,6 +18,27 @@ use loom_daemon::collision_evidence::{
     self, otlp, records, OutcomeKind, OutcomeRecord, PredictionRecord, SchedulingExposure,
 };
 
+/// Top-level registration, flattened into `Commands` so `main.rs` (frozen by
+/// the file-size ratchet) carries only a one-line variant and dispatch arm.
+#[derive(clap::Subcommand)]
+pub(crate) enum CollisionEvidenceTop {
+    /// `collision-evidence` (#9786) — convert an overlap-replay report into
+    /// versioned prediction/outcome records and publish them as checksummed
+    /// JSONL bundles (+ OTLP payload bodies).
+    CollisionEvidence {
+        #[command(subcommand)]
+        action: CollisionEvidenceCommand,
+    },
+}
+
+impl CollisionEvidenceTop {
+    pub(crate) fn run(self) -> Result<()> {
+        match self {
+            Self::CollisionEvidence { action } => action.run(),
+        }
+    }
+}
+
 #[derive(clap::Subcommand)]
 pub(crate) enum CollisionEvidenceCommand {
     /// Convert an overlap-replay report (manifest + score output) into
