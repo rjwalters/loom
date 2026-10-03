@@ -53,12 +53,11 @@ fixes**: [`comment-body-literal-path.md`](comment-body-literal-path.md).
 
 ## GraphQL Budget: REST Reads/Writes, Two-Pool Check, Max ~3 Curators (#10039)
 
-`gh issue view/edit/close` cost ~8-10 GraphQL requests per issue from the one
-5,000/hour pool the whole fleet shares. Use REST (`gh api repos/{owner}/{repo}/issues/N ...`)
-for per-issue reads, label add/remove, body edit and close; check BOTH pools
-(`gh api rate_limit` core and `gh api graphql -f query='{rateLimit{remaining}}'`)
-before claiming each issue and back off below 500; run at most ~3 Curators in
-parallel. Recipes, thresholds, measurement: [`curator-rate-budget.md`](curator-rate-budget.md).
+`gh issue view/edit/close` burn ~8-10 GraphQL requests per issue from the
+fleet-shared 5,000/hour pool. Use REST (`gh api repos/{owner}/{repo}/issues/N`)
+for per-issue reads/writes; check both pools before each claim (back off
+below ~500); run at most ~3 Curators.
+Recipes: [`curator-rate-budget.md`](curator-rate-budget.md).
 
 ## Argument Handling
 
