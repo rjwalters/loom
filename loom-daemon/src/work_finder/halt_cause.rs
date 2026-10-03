@@ -53,11 +53,15 @@ pub enum HaltCause {
     /// `gh` resolves it to an `upstream` rather than origin, it is not
     /// managed here, or the credential lacks WRITE.
     WriteScope,
+    /// The root's `main` reads red only because the repo owner's GitHub
+    /// Actions jobs are not starting (billing failure / spending limit,
+    /// #10113). A human org owner must fix it; a code fix cannot.
+    CiBilling,
 }
 
 impl HaltCause {
     /// Every halt cause, in [`Self::as_str`] wire-token order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::MainRed,
         Self::GatePending,
         Self::TokenPool,
@@ -65,6 +69,7 @@ impl HaltCause {
         Self::Drain,
         Self::Breaker,
         Self::WriteScope,
+        Self::CiBilling,
     ];
 
     /// The cause whose [`Self::as_str`] is `raw`, or `None` when `raw` is not
@@ -91,6 +96,7 @@ impl HaltCause {
             Self::Drain => "drain",
             Self::Breaker => "breaker",
             Self::WriteScope => "write_scope",
+            Self::CiBilling => "ci_billing",
         }
     }
 }
@@ -138,7 +144,7 @@ pub fn causes_per_root(
         .enumerate()
         .map(|(i, root)| {
             if health_states.is_halted(root) {
-                return Some(HaltCause::MainRed);
+                return Some(main_red_or_billing(root));
             }
             if suppress_dispatch_during_gate && health_states.is_gate_in_flight(root) {
                 return Some(HaltCause::GatePending);
@@ -152,6 +158,21 @@ pub fn causes_per_root(
             breaker_suppressed.then_some(HaltCause::Breaker)
         })
         .collect()
+}
+
+/// A halted root's cause: `ci_billing` when its repo owner's Actions jobs are
+/// billing-blocked (#10113), else `main_red`. Attribution only — the root is
+/// held either way. The git remote is resolved only while some owner is
+/// blocked, so the common path costs one atomic-free mutex read.
+fn main_red_or_billing(root: &std::path::Path) -> HaltCause {
+    if crate::ci_telemetry::billing::any_blocked() {
+        let owner = crate::credential_preflight::nwo_from_git_remote(root)
+            .and_then(|nwo| nwo.split('/').next().map(str::to_string));
+        if owner.is_some_and(|o| crate::ci_telemetry::billing::owner_blocked(&o)) {
+            return HaltCause::CiBilling;
+        }
+    }
+    HaltCause::MainRed
 }
 
 /// Record every `ready` item of held workspace `idx` as a `workspace_halted`

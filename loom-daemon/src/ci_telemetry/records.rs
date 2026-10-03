@@ -268,9 +268,24 @@ pub struct JobJson {
     /// #9089, and on a job that failed before any step ran.
     #[serde(default)]
     pub steps: Vec<StepJson>,
+    /// The runner GitHub assigned. `""` (or absent) on a job that never
+    /// started (#10113).
+    #[serde(default)]
+    pub runner_name: Option<String>,
 }
 
 impl JobJson {
+    /// Shaped like a job GitHub never started: completed `failure`, no
+    /// runner, no steps. Necessary but NOT sufficient for a billing block —
+    /// [`super::billing::classify_job`] confirms via the annotation.
+    #[must_use]
+    pub fn looks_not_started(&self) -> bool {
+        self.is_completed()
+            && self.conclusion.as_deref() == Some("failure")
+            && self.steps.is_empty()
+            && self.runner_name.as_deref().is_none_or(str::is_empty)
+    }
+
     #[must_use]
     pub fn is_completed(&self) -> bool {
         self.status == "completed"
@@ -792,6 +807,20 @@ pub fn job_envelopes(
     baseline: JobCreationBaseline,
     host_id: &str,
 ) -> Vec<TelemetryEnvelope> {
+    job_envelopes_with_reason(repo, run, job, baseline, host_id, None)
+}
+
+/// [`job_envelopes`] plus the job span's `loom.ci.not_started_reason`
+/// attribute when the job never started (#10113).
+#[must_use]
+pub fn job_envelopes_with_reason(
+    repo: &RepoJson,
+    run: &RunJson,
+    job: &JobJson,
+    baseline: JobCreationBaseline,
+    host_id: &str,
+    not_started: Option<super::billing::NotStartedReason>,
+) -> Vec<TelemetryEnvelope> {
     let started_at = job.started_at.unwrap_or(run.created_at);
     let completed_at = job.completed_at.unwrap_or(started_at).max(started_at);
     let duration = duration_ms(started_at, completed_at);
@@ -862,6 +891,10 @@ pub fn job_envelopes(
             ("loom.ci.shard.index", shard.index.map(|i| i.to_string())),
             ("loom.ci.shard.total", shard.total.map(|t| t.to_string())),
             ("loom.ci.shard.kind", Some(shard.kind.as_str().to_string())),
+            (
+                super::billing::NOT_STARTED_REASON_ATTR,
+                not_started.map(|r| r.as_str().to_string()),
+            ),
         ]),
         events: Vec::new(),
         links: Vec::new(),
