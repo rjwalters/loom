@@ -805,6 +805,7 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("cli/forge_action.rs", Gated),
         ("role_runner/launch.rs", Gated),
+        ("operator_decision/cli.rs", Gated),
         (
             "fleet/drain.rs",
             OperatorOnly("`fleet drain`: the operator's own worker, by name"),

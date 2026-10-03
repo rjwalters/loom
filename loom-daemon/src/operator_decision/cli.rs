@@ -16,6 +16,7 @@ use super::render::{compose_body, render_section};
 use super::validate::{parse, validate};
 use super::{Decision, DECISION_LABEL, MALFORMED_LABEL};
 use crate::cmd_out::{run_command, CmdOutcome};
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -242,11 +243,19 @@ pub fn read_input(path: &Path) -> Result<String, String> {
 
 /// The real forge: `gh api` (REST) for reads and writes, `create-issue.sh`
 /// for filing.
+///
+/// Every REST write (body, label add, label remove) is first vetted by
+/// [`crate::write_scope::may_write_from`] (#9548): `--repo OWNER/REPO`
+/// accepts any repository, so a write must target a managed repo the
+/// credential can write. The verdict is computed once per `GhForge`. Filing
+/// (`create`) is vetted by `create-issue.sh` itself (`loom_write_repo`).
 pub struct GhForge {
-    pub repo_root: PathBuf,
+    repo_root: PathBuf,
     /// `owner/repo`; `None` lets `gh` resolve `{owner}/{repo}` from the
     /// checkout's remote.
-    pub repo: Option<String>,
+    repo: Option<String>,
+    /// Memoized write-scope verdict: `Err(reason)` refuses every write.
+    write_ok: Option<Result<(), String>>,
 }
 
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -268,17 +277,43 @@ fn encode_segment(s: &str) -> String {
 }
 
 impl GhForge {
+    #[must_use]
+    pub fn new(repo_root: PathBuf, repo: Option<String>) -> Self {
+        Self {
+            repo_root,
+            repo,
+            write_ok: None,
+        }
+    }
+
+    /// Refuse a forge write the write scope denies (#9548).
+    fn check_write(&mut self) -> Result<(), String> {
+        let (root, repo) = (&self.repo_root, self.repo.as_deref());
+        self.write_ok
+            .get_or_insert_with(|| match crate::write_scope::may_write_from(root, repo) {
+                crate::write_scope::Verdict::Allow(_) => Ok(()),
+                crate::write_scope::Verdict::Deny(why) => {
+                    Err(format!("refusing the write (#9548): {why}"))
+                }
+            })
+            .clone()
+    }
+
     fn issue_path(&self, issue: u64) -> String {
         let slug = self.repo.as_deref().unwrap_or("{owner}/{repo}");
         format!("repos/{slug}/issues/{issue}")
     }
 
-    fn gh(&self, args: &[&str]) -> CmdOutcome {
-        let mut cmd = Command::new("gh");
-        cmd.args(args)
+    fn gh(&self, intent: AccessIntent, args: &[&str]) -> CmdOutcome {
+        let target = self
+            .repo
+            .as_deref()
+            .and_then(|r| GhTarget::repo(r).ok())
+            .unwrap_or(GhTarget::None);
+        GhInvocation::new(Operation::new("api.rest"), intent, target, GH_TIMEOUT)
+            .args(args)
             .current_dir(&self.repo_root)
-            .stdin(std::process::Stdio::null());
-        run_command(cmd, GH_TIMEOUT)
+            .run()
     }
 
     /// `gh api -X <method> <path> --input <json file>`.
@@ -292,7 +327,7 @@ impl GhForge {
         f.write_all(payload.to_string().as_bytes())
             .map_err(|e| e.to_string())?;
         let file = f.path().to_string_lossy().to_string();
-        let r = self.gh(&["api", "-X", method, path, "--input", &file]);
+        let r = self.gh(AccessIntent::Write, &["api", "-X", method, path, "--input", &file]);
         if r.succeeded() {
             Ok(())
         } else {
@@ -315,7 +350,7 @@ impl Forge for GhForge {
             name: String,
         }
         let path = self.issue_path(issue);
-        let r = self.gh(&["api", &path]);
+        let r = self.gh(AccessIntent::Read, &["api", &path]);
         let Some(o) = r.ok_output() else {
             return Err(r.failure_reason(&format!("gh api {path}")));
         };
@@ -327,18 +362,21 @@ impl Forge for GhForge {
     }
 
     fn set_body(&mut self, issue: u64, body: &str) -> Result<(), String> {
+        self.check_write()?;
         let path = self.issue_path(issue);
         self.send_json("PATCH", &path, &serde_json::json!({ "body": body }))
     }
 
     fn add_labels(&mut self, issue: u64, labels: &[String]) -> Result<(), String> {
+        self.check_write()?;
         let path = format!("{}/labels", self.issue_path(issue));
         self.send_json("POST", &path, &serde_json::json!({ "labels": labels }))
     }
 
     fn remove_label(&mut self, issue: u64, label: &str) -> Result<(), String> {
+        self.check_write()?;
         let path = format!("{}/labels/{}", self.issue_path(issue), encode_segment(label));
-        let r = self.gh(&["api", "-X", "DELETE", &path]);
+        let r = self.gh(AccessIntent::Write, &["api", "-X", "DELETE", &path]);
         if r.succeeded() {
             Ok(())
         } else {

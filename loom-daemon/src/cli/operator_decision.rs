@@ -91,10 +91,7 @@ impl OperatorDecisionCommand {
                 };
                 match read_input(&input) {
                     Ok(text) => {
-                        let mut forge = GhForge {
-                            repo_root: default_repo_root(),
-                            repo,
-                        };
+                        let mut forge = GhForge::new(default_repo_root(), repo);
                         let req = ApplyRequest {
                             target,
                             also_labels: also_label,
