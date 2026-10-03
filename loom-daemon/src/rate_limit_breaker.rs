@@ -537,7 +537,7 @@ pub fn global_observe_failure(error_text: &str, source: &str) -> Option<Transiti
     if breaker.is_suppressed(now) {
         return None;
     }
-    let budget = forge::probe_budget(Path::new("gh"), now);
+    let budget = forge::probe_budget(now);
     let transition = breaker.observe_failure(error_text, source, budget, now)?;
     log::warn!("rate_limit_breaker: {} — {}", transition.kind.as_str(), transition.reason);
     // Trip attribution (Issue #9855): the probe's pool-wide `used` minus this
@@ -592,21 +592,34 @@ pub fn emit_transition_event(event_bus: &Arc<crate::event_bus::EventBus>, transi
 /// `forge` modules); the parse half is the tested [`parse_budget`].
 pub mod forge {
     use super::{parse_budget, BudgetSnapshot};
+    use crate::cmd_out::CmdOutcome;
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     use chrono::{DateTime, Utc};
-    use std::path::Path;
-    use std::process::Command;
+    use std::time::Duration;
 
-    /// Probe the live budget. Returns `None` on any failure (spawn error,
-    /// non-zero exit, unparseable JSON) — the caller falls back to the
-    /// configured cooldown. `GET /rate_limit` does not count against the
-    /// primary rate limit, so this probe is safe to run *during* exhaustion.
+    /// Deadline for the probe. It runs inside a gh error arm, so a wedged
+    /// `gh` must not hang that caller (#9985: it used to have no deadline).
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Probe the live budget through the `gh` facade (which resolves the
+    /// executable, honouring `LOOM_GH_BIN`). Returns `None` on any failure
+    /// (spawn error, timeout, non-zero exit, unparseable JSON) — the caller
+    /// falls back to the configured cooldown. `GET /rate_limit` does not
+    /// count against the primary rate limit, so this probe is safe to run
+    /// *during* exhaustion.
     #[must_use]
-    pub fn probe_budget(gh_bin: &Path, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
-        let output = Command::new(gh_bin)
-            .arg("api")
-            .arg("rate_limit")
-            .output()
-            .ok()?;
+    pub fn probe_budget(now: DateTime<Utc>) -> Option<BudgetSnapshot> {
+        let outcome = GhInvocation::new(
+            Operation::new("api.rate_limit"),
+            AccessIntent::Read,
+            GhTarget::None,
+            PROBE_TIMEOUT,
+        )
+        .args(["api", "rate_limit"])
+        .run();
+        let CmdOutcome::Ran(output) = outcome else {
+            return None;
+        };
         if !output.status.success() {
             log::debug!(
                 "rate_limit_breaker: budget probe failed: {}",

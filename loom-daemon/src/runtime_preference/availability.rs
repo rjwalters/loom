@@ -198,8 +198,23 @@ fn claude(root: &Path) -> Availability {
 /// which is the safe direction for a preference walk (it over-prefers a
 /// paid-for seat rather than over-spending on a metered one), but it does mean
 /// a Codex tier cannot be relied on to fall through until #8443 lands.
+///
+/// **Sandbox hold (#10003).** A healthy pool is not enough: a Codex tick
+/// whose sandbox refused every tool call arms a short host-wide hold
+/// ([`super::sandbox_hold`]), and while it is live this tap is unavailable
+/// whatever the pool says. That is what lets `rolePreference:
+/// ["codex","claude"]` fall through to Claude when Codex can run nothing.
+/// The hold is self-healing (`PoolHold::SelfHealing`): it ages out and the next
+/// tick re-tests the sandbox.
 fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
     let source = CredentialSource::CodexAccounts;
+    if let Some(hold) = super::sandbox_hold::active("codex", now) {
+        return Availability::Exhausted {
+            source,
+            hold: PoolHold::SelfHealing,
+            detail: hold.describe("codex", now),
+        };
+    }
     if !crate::role_runner::runtime_preflight::codex_pool_is_the_wall(root, admitted) {
         return ungated(CredentialSource::Unobservable);
     }

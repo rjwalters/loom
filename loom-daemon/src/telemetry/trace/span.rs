@@ -65,6 +65,12 @@ pub enum SpanName {
     /// tick's [`Self::DispatchTick`] span when the tick is still known.
     #[serde(rename = "loom.dispatch.disposition")]
     DispatchDisposition,
+    /// One `gh` invocation through the `gh_invocation` facade (Issue #9985):
+    /// the client-side "caller operation" span of the forge egress trace
+    /// tree. A child of the caller's execution when it has one, else its own
+    /// root (`context_source=missing`).
+    #[serde(rename = "invoke github")]
+    GithubInvoke,
 }
 
 impl SpanName {
@@ -87,6 +93,7 @@ impl SpanName {
             Self::PoolHold => "loom.pool.hold",
             Self::DispatchAdmission => "loom.dispatch.admission",
             Self::DispatchDisposition => "loom.dispatch.disposition",
+            Self::GithubInvoke => "invoke github",
         }
     }
 }
@@ -180,6 +187,7 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.tool.name"
             ) || crate::telemetry::ci::CI_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
                 || crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
+                || crate::gh_invocation::telemetry::SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
                 || super::provenance::KEYS.contains(&key.as_str()))
                 && value.len() <= 256
                 && !value.chars().any(char::is_control)
