@@ -15,7 +15,7 @@
 //! |---|---|---|
 //! | user layer | `$CODEX_HOME/hooks.json`, `[hooks]` in `$CODEX_HOME/config.toml` | [`vet_hooks_json`] / [`vet_user_config`]: exactly Loom's one entry, no `[hooks]` events |
 //! | project layers | `.codex/hooks.json` and `.codex/config.toml` from the cwd up to the project root, plus the main checkout's `.codex/` for a linked worktree | [`vet_project_layers`]: none present |
-//! | session flags | `-c hooks…`, `--enable`/`--disable`, `--profile` | [`vet_session_flags`]: none present |
+//! | session flags | `-c hooks…`, `--enable`/`--disable`, `--profile`, and `-C`/`--cd`/`--worktree` (which move project discovery) | [`vet_session_flags`]: none present |
 //! | plugins | enabled plugins' hook files, some installed remotely by the account's backend | not vetted. Removed instead: a bypassed launch also passes [`PLUGINS_OFF`] |
 //!
 //! #4495 forbade the flag because waiving trust would let a hook nobody
@@ -311,15 +311,18 @@ pub fn vet_session_flags(args: &[String]) -> Result<(), String> {
                     "the launch already carries {BYPASS_FLAG}; only Loom's own vetting may add it"
                 ))
             }
-            "-p" | "--profile" | "--enable" | "--disable" => {
+            // `-C`/`--cd` and `--worktree` move the directory Codex discovers
+            // project layers from away from the one vetted here.
+            "-p" | "--profile" | "--enable" | "--disable" | "-C" | "--cd" | "--worktree" => {
                 return Err(format!("the launch passes {arg}, which can change hook sources"));
             }
-            _ if ["-p=", "--profile=", "--enable=", "--disable="]
+            // Clap also takes a short option's value attached (`-pwork`, `-C/x`).
+            _ if ["-p", "-C", "--profile=", "--enable=", "--disable=", "--cd="]
                 .iter()
                 .any(|prefix| arg.starts_with(prefix)) =>
             {
-                return Err("the launch passes a profile or feature switch, which can change \
-                            hook sources"
+                return Err("the launch passes a profile, feature or working-directory switch, \
+                            which can change hook sources"
                     .into());
             }
             "-c" | "--config" => iter.next().unwrap_or_default(),
@@ -388,9 +391,29 @@ pub fn vet_project_layers(launch: &Path) -> Result<(), String> {
             }
         }
     }
+    // Only "not there" counts as absent. Any other error (a permission the
+    // host lacks but the container may not, a symlink loop) refuses the seal
+    // rather than skipping a layer Codex might still read.
+    let absent = |path: &Path| match path.symlink_metadata() {
+        Ok(_) => Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Err("a project .codex/ entry cannot be inspected, so its hook sources cannot \
+                       be vetted"),
+    };
     for dir in dirs {
         let dot = dir.join(".codex");
-        if dot.join("hooks.json").symlink_metadata().is_ok() {
+        match std::fs::metadata(&dot) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            // Codex reads project layers only from a `.codex` directory.
+            Ok(meta) if !meta.is_dir() => continue,
+            Ok(_) => {}
+            Err(_) => {
+                return Err("a project .codex/ cannot be inspected, so its hook sources cannot \
+                            be vetted"
+                    .into())
+            }
+        }
+        if !absent(&dot.join("hooks.json"))? {
             return Err(
                 "the checkout carries a project .codex/hooks.json, a hook source Loom did \
                         not write"
@@ -398,8 +421,12 @@ pub fn vet_project_layers(launch: &Path) -> Result<(), String> {
             );
         }
         let config = dot.join("config.toml");
-        if config.symlink_metadata().is_err() {
+        if absent(&config)? {
             continue;
+        }
+        // A regular file only: never block on a FIFO someone left there.
+        if !std::fs::metadata(&config).is_ok_and(|meta| meta.is_file()) {
+            return Err("the checkout's project .codex/config.toml is not a regular file".into());
         }
         let table: toml::Table = std::fs::read_to_string(&config)
             .ok()

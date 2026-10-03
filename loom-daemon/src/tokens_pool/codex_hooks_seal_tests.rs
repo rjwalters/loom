@@ -258,7 +258,14 @@ fn every_user_config_tamper_refuses_the_seal() {
 
 #[test]
 fn every_hook_source_in_the_launch_argv_refuses_the_seal() {
-    let refused: [&[&str]; 11] = [
+    let refused: [&[&str]; 18] = [
+        &["-C", "/elsewhere"],
+        &["-C/elsewhere"],
+        &["--cd", "/elsewhere"],
+        &["--cd=/elsewhere"],
+        &["--worktree"],
+        &["-pwork"],
+        &["--profile=work"],
         &["-c", "hooks.PreToolUse=[]"],
         &["--config", "features.hooks=false"],
         &["--config=plugins.x.enabled=true"],
@@ -325,6 +332,29 @@ fn a_project_hook_source_anywhere_codex_looks_refuses_the_seal() {
          [shell_environment_policy]\ninherit = \"all\"\n",
     )
     .unwrap();
+    vet(&profile, Path::new(SESSION_CODEX_HOME), &request).unwrap();
+
+    // A config.toml that is not a regular file refuses (never a blocking read).
+    std::fs::remove_file(repo.join(".codex/config.toml")).unwrap();
+    std::fs::create_dir(repo.join(".codex/config.toml")).unwrap();
+    assert!(vet(&profile, Path::new(SESSION_CODEX_HOME), &request)
+        .unwrap_err()
+        .contains("not a regular file"));
+    std::fs::remove_dir(repo.join(".codex/config.toml")).unwrap();
+
+    // A `.codex/` Loom cannot look inside is not "absent".
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dot = repo.join(".codex");
+        std::fs::set_permissions(&dot, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blind = std::fs::read_dir(&dot).is_err(); // false when running as root
+        let verdict = vet(&profile, Path::new(SESSION_CODEX_HOME), &request);
+        std::fs::set_permissions(&dot, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if blind {
+            assert!(verdict.unwrap_err().contains("cannot be inspected"));
+        }
+    }
     vet(&profile, Path::new(SESSION_CODEX_HOME), &request).unwrap();
 
     // Above the project root Codex does not look, so neither does Loom.

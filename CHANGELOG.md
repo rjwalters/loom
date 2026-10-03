@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **`hooks.json`.** It is exactly Loom's #10008 entry: one `PreToolUse` group, matcher `*`, one `command` handler with timeout 30–600, no other key, and no duplicate keys. The receipt pins the command.
   - **`config.toml`.** It adds no `[hooks]` events, doesn't set `enabled = false` on Loom's key or `features.hooks = false`, has no `project_root_markers`, and no `profiles.*` touching hooks, features or plugins.
   - **Project layers.** There is no `.codex/hooks.json`, and no `.codex/config.toml` touching those keys, from the cwd to the git root or in a worktree's main checkout.
-  - **Session flags.** The argv has no `-c` on those keys, no `--enable`/`--disable`/`--profile`, and no caller-supplied waiver (`spawn-codex.sh` exits 78 on one).
+  - **Session flags.** The argv has no `-c` on those keys, no `--enable`/`--disable`/`--profile`, no `-C`/`--cd`/`--worktree`, and no caller-supplied waiver (`spawn-codex.sh` exits 78 on one).
   - **Plugins.** These can't be vetted, so the launch also passes `-c features.plugins=false`.
   - **Byte identity.** The container's copies of the three profile controls hash to the exact bytes vetted (`docker exec … sha256sum`).
 
