@@ -70,21 +70,6 @@ fi
 # --- Compare (must be byte-identical) ---------------------------------------
 if diff -u "$ROOT_LABELS" "$DEFAULTS_LABELS" >/dev/null 2>&1; then
   echo "check-labels-drift: OK — .github/labels.yml and defaults/.github/labels.yml are identical."
-  # #10013: both copies are GENERATED from defaults/labels.json. When a
-  # loom-daemon is available (LOOM_DAEMON_BIN, else PATH), also verify they
-  # match the registry. No daemon => skipped here; the label_registry cargo
-  # tests enforce the same check in CI.
-  DAEMON_BIN="${LOOM_DAEMON_BIN:-$(command -v loom-daemon 2>/dev/null || true)}"
-  if [[ -f "$ROOT/defaults/labels.json" && -n "$DAEMON_BIN" && -x "$DAEMON_BIN" ]] \
-     && "$DAEMON_BIN" labels --help >/dev/null 2>&1; then
-    if ! "$DAEMON_BIN" labels check --root "$ROOT"; then
-      echo "check-labels-drift: FAIL — labels.yml differs from defaults/labels.json;" >&2
-      echo "  run: loom-daemon labels generate --write" >&2
-      exit 1
-    fi
-  else
-    echo "check-labels-drift: registry check skipped (no loom-daemon with a 'labels' subcommand; cargo tests cover it)."
-  fi
   exit 0
 fi
 
