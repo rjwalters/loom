@@ -28,6 +28,7 @@
 //! yields `None`, never a fabricated value.
 
 use super::*;
+use crate::gh_invocation::{AccessIntent, GhTarget};
 use crate::points_marker::extract_points_marker;
 
 impl SweepRegistry {
@@ -49,23 +50,15 @@ impl SweepRegistry {
             );
             return None;
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut cmd = Command::new(&gh);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}"))
-            .arg("--jq")
-            .arg(".body");
-        cmd.current_dir(&self.config.workspace_root);
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        let output = match output_with_timeout(cmd, reap_gh_timeout()) {
+        let cmd = self
+            .gh("api.rest", AccessIntent::Read, GhTarget::None)
+            .args([
+                "api",
+                &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
+                "--jq",
+                ".body",
+            ]);
+        let output = match cmd.output_bounded() {
             Ok(Some(o)) if o.status.success() => o,
             Ok(Some(o)) => {
                 let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
@@ -89,9 +82,8 @@ impl SweepRegistry {
             }
             Err(e) => {
                 log::warn!(
-                    "sweep_outcomes: could not invoke {} for issue #{issue}'s points marker: {e} \
-                     — omitting points (#9056)",
-                    gh.display()
+                    "sweep_outcomes: could not invoke gh for issue #{issue}'s points marker: {e} \
+                     — omitting points (#9056)"
                 );
                 return None;
             }

@@ -40,6 +40,19 @@ fn resolver_keeps_the_legacy_set_but_empty_semantics() {
 }
 
 #[test]
+fn execute_runs_the_injected_program() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = read_op(GhTarget::None)
+        .args(["issue", "list"])
+        .program(stub(tmp.path()))
+        .output_bounded()
+        .unwrap()
+        .expect("completed inside the deadline");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("argv=issue list"));
+    assert_eq!(out.status.code(), Some(7));
+}
+
+#[test]
 fn operation_names_are_dotted_lowercase_literals() {
     for ok in [
         "issue.list",
@@ -165,7 +178,7 @@ fn captured_execution_runs_the_resolved_program_with_the_assembled_env() {
         .current_dir(tmp.path())
         .parent(ParentContext::Parent(ctx.clone()));
     let GhCompletion::Captured(Completion::Exited(out)) = inv
-        .execute_with(&stub(tmp.path()), GhBinSource::EnvOverride)
+        .execute_with(stub(tmp.path()), GhBinSource::EnvOverride)
         .unwrap()
     else {
         panic!("expected a captured, exited completion");
@@ -181,7 +194,7 @@ fn a_missing_program_is_a_spawn_error_not_an_empty_result() {
     let tmp = tempfile::tempdir().unwrap();
     let missing = tmp.path().join("no-such-gh");
     let err = read_op(GhTarget::None)
-        .execute_with(&missing.to_string_lossy(), GhBinSource::EnvOverride)
+        .execute_with(&*missing.to_string_lossy(), GhBinSource::EnvOverride)
         .unwrap_err();
     assert!(matches!(err, ExecError::Spawn(_)), "{err}");
 }
@@ -192,7 +205,7 @@ fn passthrough_contract_is_preserved_and_returns_the_exit_status() {
     let inv = read_op(GhTarget::None).args(["--version"]).passthrough();
     assert_eq!(inv.contract(), OutputContract::Passthrough);
     let GhCompletion::Passthrough(status) = inv
-        .execute_with(&stub(tmp.path()), GhBinSource::EnvOverride)
+        .execute_with(stub(tmp.path()), GhBinSource::EnvOverride)
         .unwrap()
     else {
         panic!("expected a passthrough completion");

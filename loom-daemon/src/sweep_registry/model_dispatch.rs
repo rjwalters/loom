@@ -55,11 +55,7 @@ impl DispatchModel<'_> {
                     *issue,
                     || match self {
                         Self::Autonomous { complexity } => complexity.map(str::to_owned),
-                        _ => fetch_issue_complexity(
-                            config.gh_bin.as_deref().unwrap_or_else(|| Path::new("gh")),
-                            root,
-                            *issue,
-                        ),
+                        _ => fetch_issue_complexity(config.gh_bin.as_deref(), root, *issue),
                     },
                     policy,
                 )

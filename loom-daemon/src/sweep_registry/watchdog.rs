@@ -5,7 +5,9 @@
 mod dirty_probe;
 mod reset_quarantine;
 
+use super::forge_gh::loom_repo_flag;
 use super::*;
+use crate::gh_invocation::{AccessIntent, GhTarget};
 
 // ----------------------------------------------------------------------------
 // Startup-race mitigation: dispatch stagger + watchdog (Issue #3887)
@@ -1173,11 +1175,6 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return;
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
         let body = format!(
             "{marker}: this issue's sweep made no progress for {elapsed_secs}s, exhausted its \
              one bounded auto-restart (#3887), and is still stuck — the daemon has stopped \
@@ -1188,25 +1185,12 @@ impl SweepRegistry {
             marker = WATCHDOG_GAVEUP_COMMENT_MARKER,
             elapsed_secs = elapsed.as_secs(),
         );
-        let mut comment = Command::new(&gh);
-        comment
-            .arg("issue")
-            .arg("comment")
-            .arg(issue.to_string())
-            .arg("--body")
-            .arg(body);
-        comment.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut comment,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            comment.arg("--repo").arg(repo);
-        }
+        let comment = self
+            .gh("issue.comment", AccessIntent::Write, GhTarget::None)
+            .args(["issue", "comment", &issue.to_string(), "--body", &body])
+            .args(loom_repo_flag());
         let timeout = reap_gh_timeout();
-        match output_with_timeout(comment, timeout) {
+        match comment.output_bounded() {
             Ok(Some(output)) if output.status.success() => {}
             Ok(Some(output)) => log::warn!(
                 "watchdog: give-up comment for #{issue} exited {:?}: {}",
@@ -2287,11 +2271,6 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return;
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
         let body = format!(
             "{marker}: this issue's sweep (pid {pid}) had been running {elapsed_secs}s with its \
              log silent and no daemon-retained process handle for it — a sweep that survived a \
@@ -2302,23 +2281,18 @@ impl SweepRegistry {
             pid = finding.pid,
             elapsed_secs = finding.elapsed.as_secs(),
         );
-        let mut comment = Command::new(&gh);
-        comment
-            .arg("issue")
-            .arg("comment")
-            .arg(finding.issue.to_string())
-            .arg("--body")
-            .arg(body);
-        comment.current_dir(&self.config.workspace_root);
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut comment,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            comment.arg("--repo").arg(repo);
-        }
+        let comment = self
+            .gh("issue.comment", AccessIntent::Write, GhTarget::None)
+            .args([
+                "issue",
+                "comment",
+                &finding.issue.to_string(),
+                "--body",
+                &body,
+            ])
+            .args(loom_repo_flag());
         let timeout = reap_gh_timeout();
-        match output_with_timeout(comment, timeout) {
+        match comment.output_bounded() {
             Ok(Some(output)) if output.status.success() => {}
             Ok(Some(output)) => log::warn!(
                 "stale-sweep-watchdog: reap comment for #{} exited {:?}: {}",

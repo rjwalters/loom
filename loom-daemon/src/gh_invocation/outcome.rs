@@ -10,6 +10,7 @@
 use super::{GhCompletion, GhInvocation, OutputContract};
 use crate::cmd_out::{CmdOutcome, Unavailable};
 use crate::proc_exec::{Completion, ExecError};
+use std::process::Output;
 
 impl GhInvocation {
     /// Execute a captured invocation and classify it as a [`CmdOutcome`]:
@@ -28,6 +29,39 @@ impl GhInvocation {
             ));
         };
         classify(self.execute(), timeout)
+    }
+
+    /// Execute a captured invocation in the `sweep_registry::reaper::
+    /// output_with_timeout` shape its migrated callers already match on:
+    /// exited (any status) ⇒ `Ok(Some(output))`; deadline ⇒ `Ok(None)`;
+    /// spawn or collect failure ⇒ `Err`.
+    ///
+    /// # Errors
+    ///
+    /// The spawn/collect `io::Error`; for a passthrough invocation (not run —
+    /// it has no captured output) an [`std::io::ErrorKind::Unsupported`] error.
+    pub fn output_bounded(self) -> std::io::Result<Option<Output>> {
+        if self.contract == OutputContract::Passthrough {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "a passthrough gh invocation has no captured output",
+            ));
+        }
+        to_output(self.execute())
+    }
+}
+
+/// `output_with_timeout`'s mapping, over the facade's result.
+pub(super) fn to_output(
+    result: Result<GhCompletion, ExecError>,
+) -> std::io::Result<Option<Output>> {
+    match result {
+        Ok(GhCompletion::Captured(Completion::Exited(out))) => Ok(Some(out)),
+        Ok(GhCompletion::Captured(Completion::TimedOut { .. })) => Ok(None),
+        Ok(GhCompletion::Passthrough(status)) => Err(std::io::Error::other(format!(
+            "passthrough completion ({status}) has no captured output"
+        ))),
+        Err(ExecError::Spawn(e) | ExecError::Collect(e)) => Err(e),
     }
 }
 
@@ -123,6 +157,29 @@ mod tests {
             run_with(inv(slow), &stub(tmp.path(), "sleep 5")),
             CmdOutcome::Unavailable(Unavailable::TimedOut { after, .. }) if after == slow
         ));
+    }
+
+    #[test]
+    fn output_bounded_matches_output_with_timeout_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ran = |i: GhInvocation, p: &str| to_output(i.execute_with(p, GhBinSource::EnvOverride));
+        let out = ran(inv(TIMEOUT), &stub(tmp.path(), "echo hi; exit 3"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.stdout, b"hi\n");
+        let slow = ran(inv(Duration::from_millis(300)), &stub(tmp.path(), "sleep 5"));
+        assert!(matches!(slow, Ok(None)));
+        let missing = tmp.path().join("no-such-gh");
+        assert!(ran(inv(TIMEOUT), &missing.to_string_lossy()).is_err());
+        assert_eq!(
+            inv(TIMEOUT)
+                .passthrough()
+                .output_bounded()
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
     }
 
     #[test]

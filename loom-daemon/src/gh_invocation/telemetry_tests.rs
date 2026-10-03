@@ -198,7 +198,7 @@ fn a_spawn_failure_leaves_a_local_completion_record() {
     set_test_record_dir(Some(records_dir.clone()));
     let missing = tmp.path().join("no-such-gh");
     let (result, captured) =
-        capture(|| read_op().execute_with(&missing.to_string_lossy(), GhBinSource::Path));
+        capture(|| read_op().execute_with(&*missing.to_string_lossy(), GhBinSource::Path));
     set_test_record_dir(None);
     assert!(matches!(result, Err(crate::proc_exec::ExecError::Spawn(_))));
     assert_eq!(captured.spans.len(), 1);

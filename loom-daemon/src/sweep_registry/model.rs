@@ -546,17 +546,33 @@ fn resolve_autonomous_model_for_runtime(
 ///
 /// Only ever called from inside [`resolve_autonomous_dispatch_model_lazy`]'s
 /// `experiment` branch, so `off` / `observe` dispatch is untouched.
+///
+/// `gh_bin` is the registry's configured `gh` (`None` ⇒ the crate's single
+/// resolver, #9985); both reads run through the `gh_invocation` facade in
+/// `workspace_root`.
 #[must_use]
-pub fn fetch_issue_complexity(gh_bin: &Path, workspace_root: &Path, issue: u32) -> Option<String> {
+pub fn fetch_issue_complexity(
+    gh_bin: Option<&Path>,
+    workspace_root: &Path,
+    issue: u32,
+) -> Option<String> {
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     use crate::script_helpers::sweep_experiment as se;
 
     let timeout = super::reaper::reap_gh_timeout();
     let repo = std::env::var("LOOM_REPO").ok();
+    let gh = |op: &'static str| {
+        let inv =
+            GhInvocation::new(Operation::new(op), AccessIntent::Read, GhTarget::None, timeout)
+                .current_dir(workspace_root);
+        match gh_bin {
+            Some(gh_bin) => inv.program(gh_bin),
+            None => inv,
+        }
+    };
 
     // 1. GraphQL (`gh issue view`) — the same call `resolve-tier-model.sh` tries first.
-    // #10089: both reads are counted via the facade (`model.issue_body*`).
-    use crate::claim_reconciliation::gh_call;
-    let view = gh_call::read_within("model.issue_body", gh_bin, workspace_root, timeout)
+    let view = gh("model.issue_body")
         .args([
             "issue",
             "view",
@@ -567,7 +583,7 @@ pub fn fetch_issue_complexity(gh_bin: &Path, workspace_root: &Path, issue: u32) 
             ".body",
         ])
         .args(repo.iter().flat_map(|r| ["--repo", r.as_str()]));
-    if let Ok(out) = gh_call::output(view) {
+    if let Ok(Some(out)) = view.output_bounded() {
         if out.status.success() {
             let body = String::from_utf8_lossy(&out.stdout);
             if let Some(tier) = se::extract_complexity_marker(&body) {
@@ -584,9 +600,8 @@ pub fn fetch_issue_complexity(gh_bin: &Path, workspace_root: &Path, issue: u32) 
         || format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
         |r| format!("repos/{r}/issues/{issue}"),
     );
-    let api = gh_call::read_within("model.issue_body_rest", gh_bin, workspace_root, timeout)
-        .args(["api", &path, "--jq", ".body"]);
-    if let Ok(out) = gh_call::output(api) {
+    let api = gh("model.issue_body_rest").args(["api", &path, "--jq", ".body"]);
+    if let Ok(Some(out)) = api.output_bounded() {
         if out.status.success() {
             let body = String::from_utf8_lossy(&out.stdout);
             return se::extract_complexity_marker(&body).map(str::to_owned);
