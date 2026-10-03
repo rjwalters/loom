@@ -30,6 +30,7 @@ fn aligned() -> Observed {
             version: Some((2, 102, 0)),
             raw: "gh version 2.102.0 (2026-09-30)".into(),
         },
+        path_gh: Some(PathBuf::from("/usr/local/bin/gh")),
         launcher_exists: true,
         profiles: vec![Profile {
             path: PathBuf::from("/home/u/.config/gh"),
@@ -229,4 +230,28 @@ fn hosts_token_detection_reads_verdict_only() {
     assert!(hosts_text_has_token("github.com:\n    oauth_token: ghs_x\n"));
     assert!(!hosts_text_has_token("github.com:\n    git_protocol: https\n"));
     assert!(!hosts_text_has_token("github.com:\n    oauth_token: \"\"\n"));
+}
+
+/// #9995: the version floor reads the exec target; launcher-not-first reads
+/// PATH's `gh`, even when the exec target is the launcher itself.
+#[test]
+fn launcher_not_first_and_the_floor_measure_different_gh() {
+    let launcher = PathBuf::from("/usr/local/bin/gh"); // example launcherPath
+    let mut obs = aligned();
+    obs.gh.path = Some(launcher.clone());
+    obs.path_gh = Some(PathBuf::from("/opt/unmanaged/bin/gh"));
+    let r = evaluate(&doc(example()), &obs, Mode::Doctor);
+    assert_eq!(r.routing_codes(), vec!["toolchain.launcher-not-first".to_string()]);
+    assert_eq!(
+        r.to_json()["observed"]["pathGhPath"],
+        "/opt/unmanaged/bin/gh",
+        "the report shows both"
+    );
+
+    // PATH is right but the exec target is below the floor: only the floor.
+    let mut obs = aligned();
+    obs.path_gh = Some(launcher);
+    obs.gh.version = Some((2, 97, 0));
+    let r = evaluate(&doc(example()), &obs, Mode::Doctor);
+    assert_eq!(r.routing_codes(), vec!["toolchain.below-api-host-floor".to_string()]);
 }
