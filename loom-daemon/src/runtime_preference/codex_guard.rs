@@ -32,6 +32,12 @@
 //! operator readies the last profile, the gate opens by itself on the next
 //! tick, and it closes again if one later goes stale.
 //!
+//! A session-managed profile whose registration is **sealed** (#10102,
+//! [`codex_hooks::seal`]) is ready without a recorded trust decision:
+//! `spawn-codex.sh` re-proves the seal for the actual launch (its cwd, its
+//! argv, the container's own copies of the profile controls) and passes
+//! `--dangerously-bypass-hook-trust`, or exits 78 if the proof fails there.
+//!
 //! Private-clone profiles are not judged here. Their registration is the
 //! pinned, image-owned one, and a private launch re-proves the obligation
 //! inside the container before the model runs.
@@ -75,6 +81,14 @@ pub fn unready_profiles(root: &Path) -> Result<Vec<String>, String> {
                 registration: Registration::WorkspaceIndependent,
                 fallback_bridge: None,
                 runtime_home: None,
+                // A sealed session seat counts as ready (#10102): spawn-codex
+                // then passes the trust waiver, after re-proving the seal for
+                // the launch's own cwd, argv and container. This gate vets the
+                // workspace root's project layers and the profile's files.
+                sealed: Some(codex_hooks::seal::Request {
+                    launch_dir: Some(root.to_path_buf()),
+                    ..Default::default()
+                }),
             }
             .verify()
             .ready

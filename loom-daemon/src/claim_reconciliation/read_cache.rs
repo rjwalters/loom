@@ -67,8 +67,20 @@ pub(super) static VERDICT_SCAN: ReadCache<(Option<String>, bool)> = ReadCache::n
 /// cached set until [`MAX_AGE`] (the PR's own diff rarely changes from that).
 pub(super) static CHANGED_FILES: ReadCache<BTreeSet<String>> = ReadCache::new(MAX_AGE);
 
+/// A closed-over compare of two commit SHAs (`tree_unchanged`): whether the
+/// trees are byte-identical. A function of the two SHAs alone, so it never
+/// goes stale; keyed with no version stamp (see [`key_of`]).
+pub(crate) static TREE_COMPARE: ReadCache<bool> = ReadCache::new(MAX_AGE);
+/// A `loom:blocked` issue's quarantine scan, keyed on the issue's
+/// `updatedAt`: `(trusted marker comment present, newest marker comment,
+/// newest `labeled loom:blocked`)`. Stored only when every leg answered.
+pub(crate) static QUARANTINE_SCAN: ReadCache<QuarantineScan> = ReadCache::new(CLAIM_MAX_AGE);
+
+/// See [`QUARANTINE_SCAN`].
+pub(crate) type QuarantineScan = (bool, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
 /// One process-wide cache of found answers, keyed by [`key`].
-pub(super) struct ReadCache<V> {
+pub(crate) struct ReadCache<V> {
     entries: Mutex<Option<HashMap<String, (Instant, V)>>>,
     /// The age past which an entry is re-read even with an unchanged version.
     max_age: Duration,
@@ -85,7 +97,7 @@ impl<V: Clone> ReadCache<V> {
     /// The fresh cached answer for `key`, else `fetch()` — stored when it
     /// found something. A `None` key (no version, or caching off) always
     /// fetches.
-    pub(super) fn get_or(
+    pub(crate) fn get_or(
         &self,
         key: Option<String>,
         fetch: impl FnOnce() -> Option<V>,
@@ -123,9 +135,16 @@ impl<V: Clone> ReadCache<V> {
 /// The cache key for PR `number` in `root`: `what` names the fact (a label,
 /// a base branch), `version` is the listing's version stamp. `None` — never
 /// cached — without a version or with caching off.
-pub(super) fn key(root: &Path, number: u32, what: &str, version: Option<&str>) -> Option<String> {
+pub(crate) fn key(root: &Path, number: u32, what: &str, version: Option<&str>) -> Option<String> {
     let version = version.filter(|v| !v.is_empty())?;
     enabled().then(|| format!("{}\u{1f}{number}\u{1f}{what}\u{1f}{version}", root.display()))
+}
+
+/// A cache key from free-form `parts` (joined unambiguously); `None` when
+/// caching is off. For facts keyed on immutable inputs rather than a listing
+/// version stamp.
+pub(crate) fn key_of(parts: &[&str]) -> Option<String> {
+    enabled().then(|| parts.join("\u{1f}"))
 }
 
 #[cfg(not(test))]

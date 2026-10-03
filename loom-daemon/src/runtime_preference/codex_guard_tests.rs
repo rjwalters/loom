@@ -2,7 +2,7 @@
 use super::*;
 use crate::runtime_preference::availability::{availability, Availability, CredentialSource};
 use crate::runtime_preference::resolve::Tap;
-use crate::tokens_pool::codex_hooks::test_support::guard_ready;
+use crate::tokens_pool::codex_hooks::test_support::{guard_ready, sealed_session_seat};
 use std::fs;
 use std::path::PathBuf;
 
@@ -181,4 +181,26 @@ fn codex_is_unavailable_to_merging_roles_until_every_seat_is_guarded() {
     for role in ["champion", "judge"] {
         assert!(f.codex_for(role).is_spawnable(), "{role}");
     }
+}
+
+/// #10102: a session seat whose registration is sealed counts as guarded
+/// without any recorded trust (spawn-codex passes the waiver for it), and a
+/// tampered one does not.
+#[test]
+#[serial_test::serial]
+fn a_sealed_session_seat_is_guarded_without_recorded_trust() {
+    let f = Fixture::new();
+    sealed_session_seat(&f.profile("missing"));
+    sealed_session_seat(&f.profile("untrusted"));
+    assert_eq!(unready_profiles(f.root.path()).unwrap(), Vec::<String>::new());
+    assert!(f.codex_for("judge").is_spawnable());
+    // An extra hook beside Loom's: no seal, no recorded trust, not guarded.
+    let hooks = f.profile("missing").join("hooks.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&hooks).unwrap()).unwrap();
+    value["hooks"]["PostToolUse"] = serde_json::json!([{"hooks": [
+        {"type": "command", "command": "true", "timeout": 30}
+    ]}]);
+    fs::write(&hooks, value.to_string()).unwrap();
+    assert_eq!(unready_profiles(f.root.path()).unwrap(), ["missing"]);
 }

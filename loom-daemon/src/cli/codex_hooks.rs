@@ -14,12 +14,19 @@
 //!
 //! `--fallback-bridge` is the stub's own `../hooks/guard-codex-bridge.sh`,
 //! used as "this checkout's bridge" when no `--workspace` is named.
+//!
+//! `--allow-sealed` (issue #10102) lets a sealed registration stand in for
+//! recorded hook trust. Only a caller that will then pass the trust waiver may
+//! ask for it, and only `spawn-codex.sh` does, with the launch's `--cwd`, its
+//! `--container`, and the Codex argv after `--`. The verdict's
+//! `bypassHookTrust` says whether the waiver is now REQUIRED, and
+//! `containerVerified` whether the container's copies were proven.
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::tokens_pool::codex_hooks::{pooled_profiles, Check, Registration};
+use loom_daemon::tokens_pool::codex_hooks::{pooled_profiles, seal, Check, Registration};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum CodexHooksCommand {
@@ -59,6 +66,25 @@ pub(crate) struct VerifyArgs {
     /// Print one JSON verdict per profile on stdout.
     #[arg(long)]
     json: bool,
+    /// Let a sealed registration stand in for recorded hook trust (#10102).
+    /// The caller MUST then pass `--dangerously-bypass-hook-trust` when the
+    /// verdict says `bypassHookTrust`.
+    #[arg(long)]
+    allow_sealed: bool,
+    /// The directory Codex will start in (project-layer hook sources are
+    /// vetted from here). Defaults to `--workspace`.
+    #[arg(long, requires = "allow_sealed")]
+    cwd: Option<PathBuf>,
+    /// The session container whose copies of the profile controls must be
+    /// the vetted bytes.
+    #[arg(long, requires = "allow_sealed")]
+    container: Option<String>,
+    /// Docker binary for `--container`.
+    #[arg(long, default_value = "docker")]
+    docker: String,
+    /// The arguments the launch will hand Codex (vetted for hook sources).
+    #[arg(last = true)]
+    codex_args: Vec<String>,
 }
 
 impl CodexHooksCommand {
@@ -94,6 +120,14 @@ impl VerifyArgs {
             registration: self.registration(),
             fallback_bridge: self.fallback_bridge.clone(),
             runtime_home: self.runtime_codex_home.clone(),
+            sealed: self.allow_sealed.then(|| seal::Request {
+                launch_dir: self.cwd.clone().or_else(|| self.workspace.clone()),
+                codex_args: self.codex_args.clone(),
+                container: self.container.clone().map(|name| seal::Container {
+                    docker: self.docker.clone(),
+                    name,
+                }),
+            }),
         }
         .verify();
         if self.json {

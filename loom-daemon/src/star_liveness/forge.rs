@@ -12,7 +12,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -168,10 +167,12 @@ impl GhStarForge {
         if crate::rate_limit_breaker::global_is_suppressed() {
             return Err(anyhow!("rate-limit breaker is suppressing forge calls"));
         }
-        let mut cmd = Command::new(&self.gh_bin);
-        cmd.arg("api").args(args).current_dir(&self.root);
-        crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, Some(&self.root));
-        let out = cmd.output()?;
+        // #10089: counted via the facade (`star.api`); it supplies the #5401
+        // cross-owner GH_CONFIG_DIR from the root.
+        let inv = crate::claim_reconciliation::gh_call::read("star.api", &self.gh_bin, &self.root)
+            .arg("api")
+            .args(args);
+        let out = crate::claim_reconciliation::gh_call::output(inv)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             crate::rate_limit_breaker::global_observe_failure(&stderr, "star_liveness");
@@ -525,6 +526,10 @@ mod tests {
     fn no_raw_gh_spawn_outside_the_shared_helper() {
         let src = include_str!("forge.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap();
-        assert_eq!(prod.matches("Command::new(").count(), 1, "only GhStarForge::api spawns");
+        assert_eq!(
+            prod.matches("Command::new(").count(),
+            0,
+            "GhStarForge::api spawns via GhInvocation"
+        );
     }
 }
