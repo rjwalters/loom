@@ -660,7 +660,7 @@ loom-clean --deep       # Also remove build artifacts
 | `loom:building` | Builder is implementing | Builder |
 | `loom:blocked` | Work is blocked | Builder |
 | `loom:operator-only` | Requires human action; sweep skip | Human |
-| `loom:operator-priority` | Land ASAP | Human |
+| `loom:operator-priority` | Land ASAP | Operator (or agent on its direction) |
 
 **Workflow labels (PR lifecycle):**
 
@@ -685,12 +685,7 @@ loom-clean --deep       # Also remove build artifacts
 
 **Troubleshooting**
 
-**Issue stuck in `loom:building`:**
-```bash
-loom-recover-orphans --recover
-```
-
-**Orphaned sweeps after daemon crash:**
+**Issue stuck in `loom:building`, or orphaned sweeps after a daemon crash:**
 ```bash
 loom-recover-orphans --recover
 ```

@@ -262,10 +262,12 @@
 # starts from Curator), and may run one starred sweep over the concurrency
 # cap. Skip/park labels still win: a starred issue carrying loom:blocked,
 # loom:operator-only, loom:operator-decision or loom:operator is never
-# dispatched. Applied by: humans (directly or via the loom-ui star). Removed
-# by: humans.
+# dispatched. Applied/removed by: the operator (directly or via the loom-ui
+# star), or an agent/bot executing the operator's explicit direction via
+# `loom-daemon forge star` (audit comment quoting it) -- never on the agent's
+# own judgment (#9974). A star never evicts in-flight work.
 - name: loom:operator-priority
-  description: "Land ASAP, ahead of all other work (not a hold). Applied by: humans, directly or via loom-ui star."
+  description: "Land ASAP, ahead of all work (not a hold). Applied by: operator, or agent on operator direction."
   color: "CA8A04"  # yellow-600 - matches loom-ui's star
 
 # Epic Labels

@@ -134,14 +134,19 @@ fn stamp_star_times(root: &Path, gh: &Path, rows: &mut [Value]) {
     {
         return;
     }
-    let starred =
-        match crate::forge_starred::starred_rows(root, gh, crate::forge_starred::Kind::Pr, None) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("pr-queue: star-time read failed ({e:#}); ordering stars by created_at");
-                return;
-            }
-        };
+    let starred = match crate::forge_starred::starred_rows(
+        root,
+        gh,
+        crate::forge_starred::Kind::Pr,
+        None,
+        &[],
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("pr-queue: star-time read failed ({e:#}); ordering stars by created_at");
+            return;
+        }
+    };
     stamp(rows, &starred);
 }
 

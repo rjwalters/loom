@@ -1,4 +1,4 @@
-//! `loom-daemon forge starred --kind issue|pr [--label L] [--json]` — the
+//! `loom-daemon forge starred --kind issue|pr [--label L] [--without L,..] [--json]` — the
 //! shared, star-time-ordered query for `loom:operator-priority` items
 //! (#9974 slice 1).
 //!
@@ -169,6 +169,7 @@ pub fn starred_rows(
     gh: &Path,
     kind: Kind,
     extra: Option<&str>,
+    without: &[String],
 ) -> Result<Vec<StarredRow>> {
     let (owner, repo) =
         resolve_owner_repo(root).context("could not resolve owner/repo from the git remotes")?;
@@ -192,14 +193,41 @@ pub fn starred_rows(
     let filtered: Vec<StarredRow> = only_rows
         .into_iter()
         .zip(rows.iter().map(|r| &r.1))
-        .filter(|(r, labels)| r.kind == kind && extra.is_none_or(|x| labels.iter().any(|l| l == x)))
+        .filter(|(r, labels)| r.kind == kind && keep(labels, extra, without))
         .map(|(r, _)| r)
         .collect();
     Ok(order_starred(filtered))
 }
 
+/// Whether an item with `labels` passes the `--label` / `--without` filter.
+#[must_use]
+pub fn keep(labels: &[String], extra: Option<&str>, without: &[String]) -> bool {
+    extra.is_none_or(|x| labels.iter().any(|l| l == x))
+        && !labels.iter().any(|l| without.contains(l))
+}
+
+/// Parsed `forge starred` arguments.
+#[derive(Debug, Clone)]
+pub struct StarredArgs {
+    /// `issue` or `pr`.
+    pub kind: String,
+    /// Also require this label.
+    pub label: Option<String>,
+    /// Drop items carrying any of these labels.
+    pub without: Vec<String>,
+    /// Emit JSON objects instead of bare numbers.
+    pub json: bool,
+}
+
 /// Handle `loom-daemon forge starred`. Exits the process.
-pub fn handle(kind: &str, label: Option<&str>, json: bool) -> Result<()> {
+pub fn handle(args: StarredArgs) -> Result<()> {
+    let StarredArgs {
+        kind,
+        label,
+        without,
+        json,
+    } = args;
+    let (kind, label) = (kind.as_str(), label.as_deref());
     let kind = match kind {
         "issue" => Kind::Issue,
         "pr" => Kind::Pr,
@@ -211,7 +239,7 @@ pub fn handle(kind: &str, label: Option<&str>, json: bool) -> Result<()> {
         eprintln!("loom-daemon forge starred: GitHub-only; list starred items by hand.");
         std::process::exit(EX_FORGE_DECLINED);
     }
-    match starred_rows(&root, &PathBuf::from("gh"), kind, label) {
+    match starred_rows(&root, &PathBuf::from("gh"), kind, label, &without) {
         Ok(rows) => {
             if json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -260,6 +288,16 @@ mod tests {
         let b = row(6, Kind::Issue, "2026-09-01T00:00:00Z", Some("2026-09-03T00:00:00Z"));
         let order: Vec<u32> = order_starred(vec![b, a]).iter().map(|r| r.number).collect();
         assert_eq!(order, vec![5, 6]);
+    }
+
+    #[test]
+    fn label_and_without_filters() {
+        let l = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let without = l(&["loom:building", "loom:blocked"]);
+        assert!(keep(&l(&["loom:triage"]), None, &without));
+        assert!(!keep(&l(&["loom:triage", "loom:building"]), None, &without));
+        assert!(!keep(&l(&["loom:triage"]), Some("loom:issue"), &[]));
+        assert!(keep(&l(&["loom:issue"]), Some("loom:issue"), &without));
     }
 
     #[test]

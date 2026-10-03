@@ -15,7 +15,7 @@ Follow the complete role definition in `.loom/roles/guide.md` for:
   - Dependencies and blocking relationships
   - Resource requirements
   - Strategic alignment
-- Reading (never applying) `loom:operator-priority`, the operator's human-only star
+- Reading `loom:operator-priority`, the operator's star (changed only on the operator's direction)
 - Updating priorities as the backlog evolves
 - Unblocking dependencies when possible
 

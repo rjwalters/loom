@@ -282,7 +282,7 @@ human, never self-clear it. Rules: `.loom/docs/premise-gate.md` §
 
 ### Priority Assessment
 
-Never apply a priority label (`loom:operator-priority` is human-only, #9244).
+Never star on your own judgment (`loom:operator-priority` is the operator's).
 If it looks critical (user-facing bug NOW, security hole, blocks all work), say
 so in the body; the operator decides.
 
