@@ -42,9 +42,10 @@ pub const CURATING_LABEL: &str = "loom:curating";
 
 /// Labels that route an issue through Champion rather than the Builder: an
 /// epic, and the three proposal kinds. A star on one of these is not a
-/// dispatch request, so the starred listing skips it.
-pub const CHAMPION_PATH_LABELS: [&str; 4] =
-    ["loom:epic", "loom:architect", "loom:hermit", "loom:auditor"];
+/// dispatch request, so the starred listing skips it. Derived from the label
+/// registry's `champion_path` property (#10013).
+pub static CHAMPION_PATH_LABELS: crate::label_registry::LabelSet =
+    crate::label_registry::LabelSet::new(|| crate::label_registry::embedded_set("champion_path"));
 
 /// How long an *unknown* starred-at (the timeline read failed or found no
 /// event) is trusted before it is read again. A known starred-at is kept

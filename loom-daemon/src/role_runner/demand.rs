@@ -457,7 +457,7 @@ pub const MERGE_HOLD_LABELS: [&str; 3] = ["loom:blocked", "loom:operator", "loom
 fn axis_park_labels(axis: DebtAxis) -> &'static [&'static str] {
     match axis {
         DebtAxis::Merge => &MERGE_HOLD_LABELS,
-        DebtAxis::Changes => crate::work_finder::PARK_LABELS,
+        DebtAxis::Changes => &crate::work_finder::PARK_LABELS,
         DebtAxis::Review => &[],
     }
 }
