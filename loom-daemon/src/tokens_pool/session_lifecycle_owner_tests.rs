@@ -1,0 +1,83 @@
+//! Issue #10103: `accounts session start` mounts the daemon root's GitHub App
+//! token dirs even when `LOOM_WORKSPACE` is unset, because the accounts
+//! registry's own workspace is one of the credential owners.
+
+use super::*;
+
+#[test]
+#[serial]
+fn start_hands_create_the_registry_workspace_as_the_daemon_root() {
+    let (workspace, root) = setup();
+    import_account(workspace.path(), root.path(), "alice");
+    let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
+    lifecycle.start("alice").unwrap();
+    assert_eq!(
+        *lifecycle.runner.daemon_roots.lock().unwrap(),
+        vec![workspace.path().to_path_buf()]
+    );
+    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+}
+
+#[test]
+#[serial]
+fn start_with_a_mount_workspace_still_hands_create_the_registry_daemon_root() {
+    // The operator's shape: `cd ~/GitHub/loom && loom-daemon accounts session
+    // start agent-3 --mount-workspace ~/GitHub` (issue #10103).
+    let (workspace, root) = setup();
+    import_account(workspace.path(), root.path(), "alice");
+    let parent = tempfile::tempdir().unwrap();
+    let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
+    lifecycle
+        .start_with_workspace("alice", Some(parent.path()))
+        .unwrap();
+    assert_eq!(lifecycle.runner.creates.lock().unwrap()[0].3, parent.path());
+    assert_eq!(
+        *lifecycle.runner.daemon_roots.lock().unwrap(),
+        vec![workspace.path().to_path_buf()]
+    );
+    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+}
+
+#[test]
+fn gh_credential_owners_include_the_registry_daemon_root_without_loom_workspace() {
+    // Issue #10103: an operator runs `cd ~/GitHub/loom && loom-daemon accounts
+    // session start agent-3 --mount-workspace ~/GitHub` with no
+    // LOOM_WORKSPACE. The mount (~/GitHub) has no `.loom/gh-config`; the
+    // accounts registry's workspace (~/GitHub/loom) does. Before the fix only
+    // the mount and LOOM_WORKSPACE were owners, so nothing was mounted and
+    // posture reported gh=skip.
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("GitHub");
+    let daemon = parent.join("loom");
+    for dir in [
+        daemon.join(".loom/gh-config"),
+        daemon.join(".loom/gh-config-by-owner/2AMLogic"),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+
+    let owners = gh_credential_owners(&parent, &daemon, None);
+    assert_eq!(owners, vec![parent.clone(), daemon.clone()]);
+    assert_eq!(
+        gh_credential_dirs(&owners, None),
+        vec![
+            daemon.join(".loom/gh-config"),
+            daemon.join(".loom/gh-config-by-owner")
+        ]
+    );
+    // The pre-fix owner set finds nothing: the regression this guards.
+    assert!(gh_credential_dirs(std::slice::from_ref(&parent), None).is_empty());
+
+    // LOOM_WORKSPACE still counts, after the two roots, without duplicates.
+    let other = tmp.path().join("loom-daemon");
+    assert_eq!(
+        gh_credential_owners(&parent, &daemon, Some(&other)),
+        vec![parent.clone(), daemon.clone(), other]
+    );
+    assert_eq!(gh_credential_owners(&daemon, &daemon, Some(&daemon)), vec![daemon.clone()]);
+    // An empty LOOM_WORKSPACE is not an owner.
+    assert_eq!(
+        gh_credential_owners(&parent, &daemon, Some(Path::new(""))),
+        vec![parent, daemon]
+    );
+}

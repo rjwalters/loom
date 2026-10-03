@@ -607,7 +607,10 @@ step.
 **Rollout.** Existing session containers keep their old mounts until they are
 recreated. `spawn-codex.sh` refuses to use them (exit 78) instead of dropping
 the sandbox in them. Recreate each one from the daemon's workspace, so the
-App-token dir is found:
+App-token dir is found (the accounts `--workspace`, which defaults to the
+current checkout, is one of the token-dir owners alongside the mount and
+`LOOM_WORKSPACE`; before #10103 a session started without `LOOM_WORKSPACE`
+mounted no token dir and posture reported `gh=skip`):
 `cd <daemon root> && loom-daemon accounts session stop <name> && loom-daemon
 accounts session start <name> --mount-workspace <checkout parent>`. A
 repository admitted later becomes visible only after its account's container

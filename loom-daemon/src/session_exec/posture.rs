@@ -364,7 +364,7 @@ pub fn decide(
             d.forward_gh = posture != Posture::Host || state.is_some_and(|s| mounted(s, dir));
             if !d.forward_gh {
                 d.messages.push(format!(
-                    "GH_CONFIG_DIR is not mounted in {c} — gh inside the session will be unauthenticated. Recreate the session from the daemon's workspace (LOOM_WORKSPACE) so its App-token dir is mounted (issue #9979)."
+                    "GH_CONFIG_DIR is not mounted in {c} — gh inside the session will be unauthenticated. Recreate the session with `accounts session start` run from the daemon's root (its `--workspace`, or with LOOM_WORKSPACE set to it) so its App-token dir is mounted (issues #9979, #10103)."
                 ));
             }
         }
