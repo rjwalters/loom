@@ -486,6 +486,15 @@ pub(crate) enum ForgeAction {
         patch_created: Option<String>,
     },
 
+    /// `forge egress assert|doctor|policy` (#9984) — will this process's `gh`
+    /// reach the mandated API origin? Exit 0 aligned / 1 findings / 2
+    /// verification incomplete; no policy configured ⇒ 0. Never a `gh`
+    /// passthrough. See `defaults/docs/forge-egress.md`.
+    Egress {
+        #[command(subcommand)]
+        action: super::forge_egress_cmd::EgressAction,
+    },
+
     /// `forge dashboard-link <owner/repo> <number> [--pr]` — print the exact
     /// dashboard footer (#9772) for `number` in `owner/repo`, byte-for-byte
     /// as `forge comment` would append it. The shell twin's format-pinning
@@ -536,6 +545,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             access,
             force,
         } => return super::forge_identity_cmd::token(&repo, &access, force),
+        ForgeAction::Egress { action } => return super::forge_egress_cmd::handle(action),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
         ForgeAction::MayWrite { repo } => return super::forge_identity_cmd::may_write(repo),

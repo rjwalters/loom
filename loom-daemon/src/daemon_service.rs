@@ -671,6 +671,17 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let fleet_started =
         loom_daemon::fleet_sync::start(&sweep_workspace, Some(event_bus.clone())).await;
 
+    // Forge egress doctor (#9984), after `GH_CONFIG_DIR` activation above so it
+    // validates the profile this daemon's `gh` children will actually read.
+    // A background loop (first pass now, then every
+    // LOOM_FORGE_EGRESS_DOCTOR_INTERVAL_SECS): logs each finding + its repair
+    // command, caches the report for `status`, publishes `forge.egress.drift`
+    // on change. It never blocks startup or exits the daemon — refusal under
+    // `enforcement.api=required` happens at dispatch/spawn admission, so
+    // local-only commands keep working. No policy configured ⇒ a no-op.
+    let _forge_egress_doctor =
+        loom_daemon::forge_egress::gate::start(&sweep_workspace, Some(event_bus.clone()));
+
     // #4430: ticks every `GITHUB_APP_REFRESH_INTERVAL` (~5min) to keep the
     // minted installation token fresh across its ~1h lifetime for a
     // long-running daemon. Ticks that don't rotate the token
