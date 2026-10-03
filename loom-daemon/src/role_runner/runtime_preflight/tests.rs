@@ -1029,6 +1029,14 @@ fn an_unguarded_codex_seat_sends_judge_down_the_list_body() {
     // Trust recorded for the host path is not trust inside a session
     // container: the seat becomes unguarded for the run it would serve.
     fs::write(profiles.path().join("alice/.session-managed.json"), "{}").unwrap();
+    // ...and an operator hook beside Loom's means the registration cannot be
+    // sealed either (#10102), so nothing stands in for that trust.
+    let hooks = profiles.path().join("alice/hooks.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&hooks).unwrap()).unwrap();
+    value["hooks"]["PostToolUse"] =
+        serde_json::json!([{"hooks": [{"type": "command", "command": "true"}]}]);
+    fs::write(&hooks, value.to_string()).unwrap();
 
     let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
     let outcome = judge_runner(workspace.path())

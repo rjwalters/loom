@@ -74,13 +74,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use super::gh_call;
 use crate::merge_pr::sequence::{
     evaluate, fetch_predecessor, fetch_trusted_bodies, marker_text, parse, KeepReason,
     PredecessorState, SequenceMarker, Verdict,
@@ -809,23 +809,19 @@ pub struct MergeSequenceStats {
 /// Run `gh pr <args…>` in `root` with the per-root credential and `LOOM_REPO`
 /// applied — the same invocation shape as the review-conflict pass.
 fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("pr").args(args);
-    cmd.current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    let inv = match args.first().copied() {
+        Some("list") => gh_call::read("sequence.pr_list", gh_bin, root),
+        Some("view") => gh_call::read("sequence.pr_view", gh_bin, root),
+        Some("comment") => gh_call::write("sequence.pr_comment", gh_bin, root),
+        _ => gh_call::write("sequence.pr_edit", gh_bin, root),
+    };
+    let out = gh_call::output(inv.args(["pr"]).args(args).args(gh_call::loom_repo_flag()))?;
     if !out.status.success() {
         return Err(anyhow::anyhow!(
             "gh pr {} failed in {}: {}",
             args.first().copied().unwrap_or_default(),
             root.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            gh_call::stderr(&out)
         ));
     }
     Ok(out.stdout)
@@ -850,8 +846,15 @@ fn list_open_prs(gh_bin: &Path, root: &Path) -> Result<Vec<SequencePr>> {
 }
 
 /// Changed paths for one PR. `None` on any failure: a failed read shrinks
-/// the plan (singleton) rather than fabricating overlap.
-fn changed_files(gh_bin: &Path, root: &Path, number: u32) -> Option<BTreeSet<String>> {
+/// the plan (singleton) rather than fabricating overlap. #10089: a PR's
+/// files are a function of its head and base, so a found answer is reused
+/// until either moves (this was one GraphQL view per eligible PR per tick).
+fn changed_files(gh_bin: &Path, root: &Path, pr: &SequencePr) -> Option<BTreeSet<String>> {
+    let key = super::read_cache::key(root, pr.number, &pr.base_ref, pr.head_sha.as_deref());
+    super::read_cache::CHANGED_FILES.get_or(key, || fetch_changed_files(gh_bin, root, pr.number))
+}
+
+fn fetch_changed_files(gh_bin: &Path, root: &Path, number: u32) -> Option<BTreeSet<String>> {
     #[derive(Debug, Deserialize)]
     struct Row {
         path: String,
@@ -922,7 +925,7 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
     report.holders = holder_numbers.len();
     let mut files: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
     for pr in &eligible {
-        if let Some(f) = changed_files(gh_bin, root, pr.number) {
+        if let Some(f) = changed_files(gh_bin, root, pr) {
             files.insert(pr.number, f);
         }
     }
@@ -1197,7 +1200,7 @@ pub(super) fn reconcile_merge_sequences_with(
     }
     let mut files: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
     for pr in &eligible {
-        if let Some(f) = changed_files(gh_bin, root, pr.number) {
+        if let Some(f) = changed_files(gh_bin, root, pr) {
             files.insert(pr.number, f);
         }
     }

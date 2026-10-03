@@ -5,6 +5,7 @@
 mod host;
 pub use host::run as run_host;
 mod owner;
+pub mod posture;
 #[cfg(target_os = "linux")]
 mod worker;
 
@@ -36,6 +37,9 @@ pub enum SessionExecCommand {
     Host(HostArgs),
     /// Linux container endpoint. Stdin is the lease, never worker input.
     Worker(WorkerArgs),
+    /// May Codex run with its own sandbox off in this container? Checks the
+    /// posture label AND the actual HostConfig (issue #9979).
+    Posture(posture::PostureArgs),
 }
 
 #[derive(clap::Args)]
@@ -71,6 +75,7 @@ impl SessionExecCommand {
                 Ok(0)
             }
             Self::Host(args) => crate::tokens_pool::private_workspace::transport::run(args),
+            Self::Posture(args) => Ok(posture::run(&args)),
             #[cfg(target_os = "linux")]
             Self::Worker(args) => worker::run(args),
             #[cfg(not(target_os = "linux"))]

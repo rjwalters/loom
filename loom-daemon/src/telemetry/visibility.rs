@@ -40,7 +40,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -251,15 +250,30 @@ impl fmt::Display for ProbeFailure {
 /// default rather than caching a guess — and so the caller can name the
 /// failure mode in its log line instead of it being swallowed.
 fn fetch_visibility_via_gh(owner_repo: &str) -> Result<RepoVisibility, ProbeFailure> {
-    let mut cmd = Command::new("gh");
-    cmd.args(["api", &format!("repos/{owner_repo}"), "--jq", ".private"])
-        .stderr(Stdio::piped());
+    use crate::cmd_out::{CmdOutcome, Unavailable};
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     // #5431: this probe carries `owner/repo` in the API path but no
-    // checkout-root `current_dir`, so key the token off the owner slug. Without
-    // it a cross-owner *private* repo 404s under the root owner's token and is
-    // (safely) reported Private even when the owner's own token could read it.
-    crate::credential_preflight::apply_gh_config_for_owner_slug(&mut cmd, owner_repo);
-    let output = cmd.output().map_err(|_| ProbeFailure::SpawnFailed)?;
+    // checkout-root `current_dir`, so the facade keys the token off the typed
+    // target's owner. Without it a cross-owner *private* repo 404s under the
+    // root owner's token and is (safely) reported Private even when the
+    // owner's own token could read it. #10089: through the facade, so every
+    // probe — including the failed-probe retries #10087 tracks — is counted
+    // under `visibility.repo`.
+    let target = GhTarget::repo(owner_repo).unwrap_or(GhTarget::None);
+    let path = format!("repos/{owner_repo}");
+    let output = match GhInvocation::new(
+        Operation::new("visibility.repo"),
+        AccessIntent::Read,
+        target,
+        Duration::from_secs(30),
+    )
+    .args(["api", &path, "--jq", ".private"])
+    .run()
+    {
+        CmdOutcome::Ran(output) => output,
+        CmdOutcome::Unavailable(Unavailable::Spawn(_)) => return Err(ProbeFailure::SpawnFailed),
+        CmdOutcome::Unavailable(_) => return Err(ProbeFailure::NonZeroExit),
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(classify_failure(&stderr));

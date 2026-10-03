@@ -25,7 +25,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -285,17 +284,21 @@ impl StarredAtSource for GhTimelineStarredAt {
             return Err(anyhow!("rate-limit breaker is suppressing forge reads"));
         }
         let repo = self.repo.as_deref().unwrap_or("{owner}/{repo}");
-        let mut cmd = Command::new(&self.gh_bin);
-        cmd.arg("api")
-            .arg(format!("repos/{repo}/issues/{issue}/timeline"))
-            .arg("--paginate")
-            .arg("--jq")
-            .arg(STARRED_AT_JQ);
+        // #10089: counted via the facade (`work_finder.starred_at`); with no
+        // cwd the facade runs in the daemon's own directory.
+        let mut inv = crate::gh_invocation::GhInvocation::new(
+            crate::gh_invocation::Operation::new("work_finder.starred_at"),
+            crate::gh_invocation::AccessIntent::Read,
+            crate::gh_invocation::GhTarget::None,
+            crate::claim_reconciliation::gh_call::GH_TIMEOUT,
+        )
+        .program(&self.gh_bin)
+        .args(["api", &format!("repos/{repo}/issues/{issue}/timeline")])
+        .args(["--paginate", "--jq", STARRED_AT_JQ]);
         if let Some(dir) = self.cwd.as_deref() {
-            cmd.current_dir(dir);
+            inv = inv.current_dir(dir);
         }
-        crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, self.cwd.as_deref());
-        let out = cmd.output()?;
+        let out = crate::claim_reconciliation::gh_call::output(inv)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             crate::rate_limit_breaker::global_observe_failure(&stderr, "work_finder_starred_at");

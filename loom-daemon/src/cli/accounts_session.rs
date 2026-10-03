@@ -23,6 +23,9 @@ pub(crate) enum SessionAction {
         /// host path (`docker/worker/MOUNT-CONTRACT.md` §1) — normally the
         /// parent directory holding every checkout the container will
         /// serve, since dispatch execs with `--workdir` set to the repo.
+        /// A parent is narrowed to the repositories registered in
+        /// `~/.loom/workspaces.json` under it, each mounted on its own
+        /// (issue #9979: Codex runs with its sandbox off in the container).
         /// Defaults to the `--workspace` this `loom-daemon` invocation
         /// itself resolved (issue #7389). Deliberately NOT named
         /// `--workspace`: `accounts --workspace` is a global `String`

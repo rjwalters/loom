@@ -42,6 +42,17 @@
 //!    receipt from before that field existed falls back to "any keyed hash
 //!    present" (`legacy-coarse`).
 //!
+//!    **Or, instead, a sealed registration** (issue #10102, [`seal`]): when
+//!    the caller opts in ([`Check::sealed`]) and the profile runs inside a
+//!    hardened session container, readiness may rest on Loom's own vetting
+//!    of every hook source Codex would load, rather than on a recorded
+//!    `trusted_hash`. The verdict then says `trustSignal:
+//!    "sealed-registration"` and `bypassHookTrust: true`, and the launch
+//!    MUST pass [`seal::BYPASS_FLAG`] and [`seal::PLUGINS_OFF`]. Without the
+//!    flag, Codex would skip the untrusted entry without a word. That is why
+//!    sealing is opt-in: a caller that doesn't know to pass the flag never
+//!    sees a sealed seat reported as ready.
+//!
 //! Only the profile's directory NAME is ever reported; no path contents and no
 //! credential bytes. `auth.json` is never opened.
 
@@ -49,6 +60,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+
+/// The sealed registration behind `--dangerously-bypass-hook-trust` (#10102).
+#[path = "codex_hooks_seal.rs"]
+pub mod seal;
 
 /// The ownership marker that identifies Loom's entry among an operator's
 /// hooks.
@@ -118,6 +133,10 @@ pub struct Check {
     /// `CODEX_HOME` as Codex will see it when it runs; `None` derives it
     /// ([`runtime_codex_home`]).
     pub runtime_home: Option<PathBuf>,
+    /// Opt in to a sealed registration (#10102) for this launch. `None` keeps
+    /// readiness on recorded trust alone, for any caller that cannot pass the
+    /// trust waiver.
+    pub sealed: Option<seal::Request>,
 }
 
 /// The verdict, in the JSON shape `provision-codex-hooks.sh verify --json`
@@ -138,6 +157,15 @@ pub struct Verdict {
     /// `the session container`, or `profile '<name>' on this host`.
     pub trust_location: String,
     pub reason: String,
+    /// Ready only because the registration is sealed (#10102): the launch
+    /// must pass `--dangerously-bypass-hook-trust` and `-c
+    /// features.plugins=false`, or Codex skips Loom's entry.
+    pub bypass_hook_trust: bool,
+    /// The seal was also proven against the session container's own copies
+    /// of the profile controls ([`seal::container_sees`]).
+    pub container_verified: bool,
+    /// Why the registration is or is not sealed; empty when not asked.
+    pub seal_reason: String,
 }
 
 impl Check {
@@ -191,7 +219,11 @@ impl Check {
             .runtime_home
             .clone()
             .unwrap_or_else(|| runtime_codex_home(&self.codex_home));
-        let (trusted, trust_signal) = trust_at(&self.codex_home, &runtime_home);
+        let seal = self.seal(&runtime_home);
+        let (trusted, trust_signal) = match &seal {
+            Some(Ok(_)) => (true, "sealed-registration"),
+            _ => trust_at(&self.codex_home, &runtime_home),
+        };
         let trust_location = if runtime_home == Path::new(SESSION_CODEX_HOME) {
             "the session container".to_owned()
         } else {
@@ -306,12 +338,23 @@ impl Check {
                  trusted_hash in config.toml)"
                     .into()
             };
+            // Asked for a seal and it was refused: say why, since that is the
+            // thing to fix in a session container (#10102).
+            if let Some(Err(why)) = &seal {
+                reason = format!("{reason}; and the registration is not sealed: {why}");
+            }
         }
 
         let ready = installed && trusted && !stale && bridge_readable;
         if ready {
             let version = self.registration.version();
-            reason = if trust_signal == "baseline-diff" {
+            reason = if trust_signal == "sealed-registration" {
+                format!(
+                    "managed hook v{version} installed, pinned, and sealed: it is the only hook \
+                     source Codex would load in the session container, so Loom passes the trust \
+                     waiver instead of requiring a recorded trust decision (#10102)"
+                )
+            } else if trust_signal == "baseline-diff" {
                 format!(
                     "managed hook v{version} installed, pinned, and a NEW Codex hook trust \
                      decision was recorded for this profile since the managed hook was \
@@ -340,7 +383,29 @@ impl Check {
             registration: self.registration.label(),
             trust_location,
             reason,
+            bypass_hook_trust: ready && trust_signal == "sealed-registration",
+            container_verified: matches!(seal, Some(Ok(true))),
+            seal_reason: match seal {
+                None => String::new(),
+                Some(Ok(_)) => "sealed".into(),
+                Some(Err(why)) => why,
+            },
         }
+    }
+
+    /// The sealed-registration verdict for this check (#10102): `None` when
+    /// not asked, `Ok(container proven)` when sealed.
+    fn seal(&self, runtime_home: &Path) -> Option<Result<bool, String>> {
+        let request = self.sealed.as_ref()?;
+        if self.registration != Registration::WorkspaceIndependent {
+            return Some(Err("only the workspace-independent registration can be sealed".into()));
+        }
+        Some(seal::vet(&self.codex_home, runtime_home, request).and_then(|vetted| {
+            match &request.container {
+                Some(container) => seal::container_sees(container, &vetted).map(|()| true),
+                None => Ok(false),
+            }
+        }))
     }
 }
 
@@ -551,6 +616,14 @@ pub fn pooled_profiles(root: &Path, registration: &Registration) -> Vec<PathBuf>
 pub(crate) mod test_support {
     use super::{sha256_hex, RECEIPT, SHARED_COMMAND};
     use std::path::Path;
+
+    /// Make `profile` a session-managed seat holding only Loom's sealed
+    /// registration and NO recorded trust (#10102).
+    pub(crate) fn sealed_session_seat(profile: &Path) {
+        guard_ready(profile, None);
+        std::fs::write(profile.join("config.toml"), "").unwrap();
+        std::fs::write(profile.join(".session-managed.json"), "{}").unwrap();
+    }
 
     /// Make `profile` guard-ready for a run with `CODEX_HOME=runtime_home`
     /// (`None`: a bare-metal run of the canonical profile path).

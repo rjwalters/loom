@@ -226,35 +226,17 @@ impl SweepRegistry {
             );
             return IssueSignals::default();
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut cmd = Command::new(&gh);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}"))
-            .arg("--jq")
-            // One projection, four signals. Kept to exactly the keys this
-            // module consumes so the payload stays small and no unrelated
-            // issue content (title, assignees, comment bodies) is ever read
-            // into the daemon.
-            .arg(
-                "{body: .body, state: .state, closed_at: .closed_at, \
-                 labels: [(.labels // [])[] | .name]}",
-            );
-        // Resolve the issue against THIS registry's repo, not the daemon's cwd
-        // repo, and honor a cross-owner managed repo's own installation-token
-        // config dir — same rationale as the PR-timeline read.
-        cmd.current_dir(&self.config.workspace_root);
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        // A machine-global `LOOM_REPO` override reaches `gh api` as `GH_REPO`,
-        // never as an unsupported `--repo` flag (#8263).
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        let output = match output_with_timeout(cmd, reap_gh_timeout()) {
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}");
+        // One projection, four signals. Kept to exactly the keys this module
+        // consumes so the payload stays small and no unrelated issue content
+        // (title, assignees, comment bodies) is ever read into the daemon.
+        let jq = "{body: .body, state: .state, closed_at: .closed_at, \
+                  labels: [(.labels // [])[] | .name]}";
+        // Resolved against THIS registry's repo with its own GH_CONFIG_DIR and
+        // `LOOM_REPO` as GH_REPO (#8263) — the same rationale as the
+        // PR-timeline read; counted as `outcome.issue_signals` (#10089).
+        let args = ["api", path.as_str(), "--jq", jq];
+        let output = match self.gh_read("outcome.issue_signals", args) {
             Ok(Some(o)) if o.status.success() => o,
             Ok(Some(o)) => {
                 let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
@@ -279,10 +261,9 @@ impl SweepRegistry {
             }
             Err(e) => {
                 log::warn!(
-                    "sweep_outcomes: could not invoke {} for issue #{issue}'s signals: \
+                    "sweep_outcomes: could not invoke gh for issue #{issue}'s signals: \
                      {e} — omitting complexity/disposition signals, record still written \
-                     (#8542/#9441)",
-                    gh.display()
+                     (#8542/#9441)"
                 );
                 return IssueSignals::default();
             }
