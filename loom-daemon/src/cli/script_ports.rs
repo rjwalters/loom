@@ -340,6 +340,14 @@ pub(crate) enum ScriptPortCommand {
     /// a port either: same frozen-`main.rs` reason as `shell-budget` above.
     PremiseCheck(super::premise_check::PremiseCheckArgs),
 
+    /// The operator-decision helper (#9344): validate a ranked-options
+    /// decision (2-4 options best -> worst, each with a why, recommended
+    /// first) and write it onto an issue as a fenced `decision` block before
+    /// labelling it `loom:operator-decision`. Refuses, touching nothing, on
+    /// any contract failure. Same frozen-`main.rs` reason as `shell-budget`.
+    #[command(subcommand)]
+    OperatorDecision(super::operator_decision::OperatorDecisionCommand),
+
     /// `reconcile-stack.sh`'s rebase planner and executor (#8583): fetch and
     /// PIN the remote default-branch tip, route to the worktree holding the
     /// child branch, resolve the parent ref (with the #7982 pin fallback and
@@ -536,6 +544,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
             ScriptPortCommand::DuplicateScan(args) => args.run(),
             ScriptPortCommand::PremiseCheck(args) => args.run(),
+            ScriptPortCommand::OperatorDecision(cmd) => cmd.run(),
             ScriptPortCommand::ReconcileStack(args) => args.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
