@@ -43,7 +43,7 @@
 1344 loom-daemon/src/install_self_check.rs
 2319 loom-daemon/src/ipc.rs
 4099 loom-daemon/src/ipc/tests.rs
-1045 loom-daemon/src/main.rs
+1050 loom-daemon/src/main.rs
 1788 loom-daemon/src/main_health_gate.rs
 2318 loom-daemon/src/main_health_gate/tests.rs
 1715 loom-daemon/src/orphan_process_reaper.rs

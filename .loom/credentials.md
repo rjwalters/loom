@@ -37,3 +37,5 @@ to fabricate a tenant.
 If a task needs a credential not listed here, that is a **missing-credential**
 case per `.loom/docs/credentials.md` — ask the operator for the name, shape,
 and provisioning path only, never the value, then add the resulting row here.
+
+| Augment context-engine session credential (working pair, #9930) | SSM Parameter Store `us-east-1:/loom/augment/session` (SecureString, JSON: `accessToken` + `tenantURL`) | Consumed via `AUGMENT_SESSION_FILE` pointing at a mounted, root-only session JSON (never inside a repo/worktree). Source value: the operator's `auggie login` session; re-issued on expiry. NOTE (2026-10-01): the SSM `api-token` value 401s on the context engine — the session pair is the working credential. |

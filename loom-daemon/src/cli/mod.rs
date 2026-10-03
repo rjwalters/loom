@@ -19,6 +19,8 @@ pub(crate) mod cleanup_ops;
 pub(crate) mod codex_hooks;
 pub(crate) mod codex_sandbox_noop_cli;
 pub(crate) mod codex_usage_cli;
+pub(crate) mod collision_evidence;
+pub(crate) mod collision_shadow;
 pub(crate) mod common;
 pub(crate) mod concierge;
 mod daemon_start;
