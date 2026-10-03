@@ -160,18 +160,23 @@ fn parse_pr_list_reads_mergeable_and_labels() {
 
 // ---- end to end through a fake `gh` ----
 
-/// Fake `gh`: `pr list --label loom:review-requested` returns `rr_json`,
-/// `--label loom:merge-conflict` returns `mc_json`, `api` returns `comments`.
+/// Fake `gh`: the one `pr list --state open` returns every open PR — the
+/// rows of `rr_json` (the `loom:review-requested` PRs) followed by those of
+/// `mc_json` (the `loom:merge-conflict` PRs) — and `api` returns `comments`.
+/// A label-filtered `pr list` (the pre-#4429-follow-up shape) gets `[]`, so a
+/// regression back to per-label listing fails every end-to-end test here.
 fn fake_gh(dir: &Path, log: &Path, rr_json: &str, mc_json: &str, comments: &str) -> PathBuf {
     let bin = dir.join("fake-gh-conflict.sh");
+    let mut open: Vec<serde_json::Value> = serde_json::from_str(rr_json).unwrap();
+    open.extend(serde_json::from_str::<Vec<serde_json::Value>>(mc_json).unwrap());
+    let open_json = serde_json::Value::Array(open).to_string();
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
 if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
   case "$*" in
-    *"--label loom:review-requested"*) echo '{rr_json}' ;;
-    *"--label loom:merge-conflict"*) echo '{mc_json}' ;;
-    *) echo '[]' ;;
+    *"--label"*) echo '[]' ;;
+    *) echo '{open_json}' ;;
   esac
   exit 0
 fi
@@ -292,4 +297,78 @@ fn end_to_end_an_untrusted_flag_marker_is_not_ours() {
         assert_eq!(stats.cleared, 0, "{author}: {calls}");
         assert!(!calls.contains("pr edit"), "{author}: {calls}");
     }
+}
+
+// ---- #4429 follow-up: one open-PR listing per workspace, shared ----
+
+/// The pass lists open PRs ONCE (no `--label`), with every field both it and
+/// the merge-sequence pass read, instead of one GraphQL listing per label.
+#[test]
+#[serial]
+fn one_unfiltered_listing_per_workspace() {
+    let rr = format!(
+        r#"[{{"number":8909,"headRefOid":"{SHA}","mergeable":"MERGEABLE","labels":[{{"name":"loom:review-requested"}}]}}]"#
+    );
+    let (stats, calls) = run(&rr, "[]", "[]");
+    assert_eq!(stats.checked, 1, "{calls}");
+    let lists: Vec<&str> = calls.lines().filter(|l| l.starts_with("pr list")).collect();
+    assert_eq!(lists.len(), 1, "exactly one listing: {calls}");
+    assert!(!lists[0].contains("--label"), "{calls}");
+    assert!(lists[0].contains("--state open"), "{calls}");
+    assert!(lists[0].contains(&format!("--json {OPEN_PR_FIELDS}")), "{calls}");
+}
+
+/// Client-side filter: only PRs carrying either label are decided on, and a
+/// PR carrying both is one candidate.
+#[test]
+fn conflict_candidates_keeps_only_the_two_labels() {
+    let json = format!(
+        r#"[{{"number":1,"headRefOid":"{SHA}","mergeable":"CONFLICTING","labels":[{{"name":"loom:pr"}}]}},
+            {{"number":2,"headRefOid":"{SHA}","mergeable":"CONFLICTING","labels":[{{"name":"loom:review-requested"}}]}},
+            {{"number":3,"headRefOid":"{SHA}","mergeable":"MERGEABLE","labels":[{{"name":"loom:merge-conflict"}},{{"name":"loom:review-requested"}}]}},
+            {{"number":4,"labels":[]}}]"#
+    );
+    let got = conflict_candidates(json.as_bytes()).unwrap();
+    assert_eq!(got.keys().copied().collect::<Vec<_>>(), vec![2, 3]);
+}
+
+fn run_sharing(rr_json: &str) -> (ReviewConflictStats, Option<Vec<u8>>, String) {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let log = dir.path().join("gh.log");
+    std::fs::write(&log, "").unwrap();
+    let gh = fake_gh(dir.path(), &log, rr_json, "[]", "[]");
+    let prev = std::env::var(REVIEW_CONFLICT_ENABLED_ENV).ok();
+    std::env::remove_var(REVIEW_CONFLICT_ENABLED_ENV);
+    let (stats, shared) = reconcile_review_conflicts_sharing(&gh, &root);
+    if let Some(v) = prev {
+        std::env::set_var(REVIEW_CONFLICT_ENABLED_ENV, v);
+    }
+    (stats, shared, std::fs::read_to_string(&log).unwrap())
+}
+
+/// Nothing written → the listing is handed on for the merge-sequence pass.
+#[test]
+#[serial]
+fn listing_is_shared_when_the_pass_wrote_nothing() {
+    let rr = format!(
+        r#"[{{"number":8909,"headRefOid":"{SHA}","mergeable":"MERGEABLE","labels":[{{"name":"loom:review-requested"}}]}}]"#
+    );
+    let (_, shared, calls) = run_sharing(&rr);
+    let shared = shared.expect("an unwritten listing is shared");
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&shared).unwrap();
+    assert_eq!(rows.len(), 1, "{calls}");
+}
+
+/// A flag moved labels → the listing is stale and must NOT be handed on.
+#[test]
+#[serial]
+fn listing_is_withheld_after_a_write() {
+    let rr = format!(
+        r#"[{{"number":8909,"headRefOid":"{SHA}","mergeable":"CONFLICTING","labels":[{{"name":"loom:review-requested"}}]}}]"#
+    );
+    let (stats, shared, calls) = run_sharing(&rr);
+    assert_eq!(stats.flagged, 1, "{calls}");
+    assert!(shared.is_none(), "a listing read before a relabel is stale");
 }
