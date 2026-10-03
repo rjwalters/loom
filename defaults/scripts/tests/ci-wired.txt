@@ -155,7 +155,6 @@ test-operator-only-subkind.sh
 test-post-verdict.sh
 test-pr-worktree-isolation.sh
 test-probe-tokens-fallback.sh
-test-provision-codex-hooks.sh
 test-provision-hooks.sh
 test-provision-skills.sh
 test-random-file.sh

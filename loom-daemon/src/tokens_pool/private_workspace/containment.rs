@@ -42,7 +42,7 @@ use super::*;
 use crate::runtime_admission::{
     AdmissionContext, ExecutionProvenance, ResolvedRuntime, RuntimeRejection,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// What a proof certifies, recorded verbatim in
 /// [`ExecutionProvenance::policy`] so a reader never has to infer it.
@@ -210,49 +210,7 @@ fn hook_trust_established(profile: &Path) -> bool {
     current.difference(&baseline).next().is_some()
 }
 
-fn trusted_hashes(config: &Path) -> BTreeSet<String> {
-    let Ok(text) = std::fs::read_to_string(config) else {
-        return BTreeSet::new();
-    };
-    let mut out = BTreeSet::new();
-    for line in text.lines().filter(|l| !l.trim_start().starts_with('#')) {
-        let mut rest = line;
-        while let Some(index) = rest.find("trusted_hash") {
-            rest = &rest[index + "trusted_hash".len()..];
-            let after = rest.trim_start();
-            let Some(after) = after.strip_prefix('=') else {
-                continue;
-            };
-            let after = after.trim_start();
-            let Some(after) = after.strip_prefix('"') else {
-                continue;
-            };
-            if let Some(end) = after.find('"') {
-                if end > 0 {
-                    out.insert(after[..end].to_owned());
-                }
-            }
-        }
-    }
-    out
-}
-
-/// The receipt's install-time trust baseline, or `None` when the receipt is
-/// absent/unreadable or predates the field.
-fn trust_baseline(receipt: &Path) -> Option<BTreeSet<String>> {
-    let bytes = std::fs::read(receipt).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let entries = value
-        .get("loomManagedHook")?
-        .get("trustBaselineHashes")?
-        .as_array()?;
-    Some(
-        entries
-            .iter()
-            .filter_map(|entry| entry.as_str().map(str::to_owned))
-            .collect(),
-    )
-}
+use super::super::codex_hooks::{trust_baseline, trusted_hashes};
 
 // ---------------------------------------------------------------------------
 // Host side.

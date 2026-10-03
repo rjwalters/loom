@@ -26,6 +26,10 @@ pub(crate) enum ScriptPortCommand {
     /// Private workspace endpoint used inside a session container.
     #[command(subcommand)]
     PrivateWorkspace(loom_daemon::tokens_pool::private_workspace::WorkerCommand),
+    /// Readiness of Loom's managed Codex hook, behind
+    /// `provision-codex-hooks.sh verify` (#9390).
+    #[command(subcommand)]
+    CodexHooks(super::codex_hooks::CodexHooksCommand),
     /// Durable phase completion markers and trace observations (#8525).
     SweepCheckpoint(super::sweep_checkpoint::SweepCheckpointArgs),
 
@@ -510,6 +514,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeSparse(args) => args.run(),
             ScriptPortCommand::WorktreeBase(args) => args.run(),
             ScriptPortCommand::WorktreeCheck(args) => args.run(),
+            ScriptPortCommand::CodexHooks(cmd) => cmd.run(),
             ScriptPortCommand::WorktreeExisting(args) => args.run(),
             ScriptPortCommand::WorktreeBranchReuse(args) => args.run(),
             ScriptPortCommand::WorktreeOpenPr(args) => args.run(),

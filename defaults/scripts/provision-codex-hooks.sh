@@ -19,7 +19,9 @@
 #   remove  : delete ONLY Loom's entry (and any now-empty group/event it
 #             leaves behind), preserving everything else.
 #   verify  : report readiness WITHOUT mutating anything (exit 0 ready,
-#             78 not ready).
+#             78 not ready). Implemented natively since #9390 by
+#             `loom-daemon codex-hooks verify` (tokens_pool::codex_hooks);
+#             the checks below describe what it decides.
 #
 # Credentials are never read, copied, parsed, or logged. `auth.json` is not
 # touched by any subcommand. Only the profile DIRECTORY NAME is ever printed.
@@ -260,6 +262,33 @@ private_session_state() {
     return 0
 }
 
+# --- verify is native (#9390) ----------------------------------------------
+#
+# The readiness decision lives in `loom-daemon codex-hooks verify`
+# (tokens_pool::codex_hooks), shared with the daemon's own callers and the
+# private-session admission gate, so there is one implementation rather than a
+# shell copy and a Rust copy held together by a test. Same flags, same JSON,
+# same exit codes (0 ready, 78 not ready). A binary that cannot be found is
+# reported as 78, never as ready. Inside a private session's sealed control
+# bundle there is no lib/ helper; the image-owned binary on PATH is used.
+# requires-daemon: codex-hooks >= 0.19.627   #9390 — verify moved into the daemon; an older binary cannot answer, and its refusal must read as not-ready (78), never as ready.
+if [[ "$COMMAND" == "verify" ]]; then
+    _verify=(--fallback-bridge "$SCRIPT_DIR/../hooks/guard-codex-bridge.sh")
+    [[ "$ALL_PROFILES" == "1" ]] && _verify+=(--all-profiles)
+    [[ -n "$PROFILE_ROOT_ARG" ]] && _verify+=(--profile-root "$PROFILE_ROOT_ARG")
+    [[ -n "$CODEX_HOME_ARG" ]] && _verify+=(--codex-home "$CODEX_HOME_ARG")
+    [[ -n "$WORKSPACE_ARG" ]] && _verify+=(--workspace "${WORKSPACE_ARG%/}")
+    [[ -n "$BRIDGE_ARG" ]] && _verify+=(--bridge "$BRIDGE_ARG")
+    [[ "$JSON_OUT" == "1" ]] && _verify+=(--json)
+    if [[ -f "$SCRIPT_DIR/lib/script-helper.sh" ]]; then
+        export LOOM_SCRIPT_HELPER_MISSING_RC=78
+        # shellcheck source=/dev/null
+        source "$SCRIPT_DIR/lib/script-helper.sh"
+        loom_exec_script_helper codex-hooks verify "${_verify[@]}"
+    fi
+    exec loom-daemon codex-hooks verify "${_verify[@]}"
+fi
+
 # --- fan out over every pooled profile ------------------------------------
 #
 # Re-invokes THIS script once per profile with an explicit --codex-home, so the
@@ -408,7 +437,7 @@ sha256_of() {
 # same way, which is the correct baseline for a brand-new profile.
 #
 # This is the building block for the trust-baseline diff in do_install/
-# do_verify below (issue #5005): it lets readiness distinguish "a NEW trust
+# `loom-daemon codex-hooks verify` (issue #5005): it lets readiness distinguish "a NEW trust
 # decision was recorded after Loom's hook was (re)installed" from the old
 # coarse "some trusted_hash exists somewhere in this file" signal, without
 # guessing Codex's internal identity string or hash algorithm — it only ever
@@ -655,191 +684,8 @@ do_remove() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# verify
-# ---------------------------------------------------------------------------
-#
-# Prints a machine-readable object under --json:
-#   {"profile","ready":bool,"installed":bool,"version":N,"trusted":bool,
-#    "trustSignal":"none"|"baseline-diff"|"baseline-diff-no-new-trust"|"legacy-coarse",
-#    "stale":bool,"bridgeReadable":bool,"reason":"..."}
-# `trustSignal` records WHICH trust check produced `trusted` (issue #5005):
-# `baseline-diff` is the strengthened signal (a NEW trusted_hash appeared
-# after Loom's entry was installed); `legacy-coarse` is the old "any
-# trusted_hash exists" fallback, used only when no install-time baseline was
-# recorded for this profile. The profile DIRECTORY NAME is the only identity
-# ever emitted; no path contents, no credential material.
-do_verify() {
-    local installed=false trusted=false stale=false bridge_readable=false
-    local installed_cmd="" reason="" ready=false trust_signal="none"
-
-    if [[ -r "$BRIDGE" ]]; then
-        bridge_readable=true
-    fi
-
-    local existing rc=0
-    existing="$(read_hooks_json)" || rc=$?
-    if [[ "$rc" -ne 0 ]]; then
-        reason="hooks.json is unreadable or malformed"
-    else
-        installed_cmd="$(installed_loom_command "$existing")" || installed_cmd=""
-        [[ -n "$installed_cmd" ]] && installed=true
-    fi
-
-    # Codex-owned trust signal (issue #5005 strengthens this beyond the
-    # coarse "any trusted_hash exists" check): compare the CURRENT set of
-    # hooks.state trusted_hash values against the trust-baseline snapshot
-    # do_install recorded in the receipt (the set of hashes that were already
-    # present when Loom's currently-installed entry was provisioned).
-    #
-    #   trustSignal=baseline-diff       a receipt with a baseline is present,
-    #                                   and readiness is decided by whether a
-    #                                   NEW trusted_hash appeared since — i.e.
-    #                                   Codex hook trust was (re)established
-    #                                   AFTER Loom's entry landed, not merely
-    #                                   "some hook, at some point, was trusted"
-    #   trustSignal=legacy-coarse       no receipt (or a receipt from before
-    #                                   this field existed) — falls back to
-    #                                   the old "any trusted_hash present"
-    #                                   signal so an already-trusted profile
-    #                                   is never punished for a Loom upgrade
-    #
-    # Neither signal can prove Codex trusted LOOM'S SPECIFIC entry (Codex
-    # exposes no identity string Loom can observe or compute — see the header
-    # and defaults/docs/guardrail-parity-codex.md gap 11); baseline-diff only
-    # strengthens the CORRELATION in time between "Loom installed this
-    # content" and "a trust decision happened", which is the concrete gap the
-    # coarse existence check left open.
-    local -a current_hashes=() baseline_hashes=()
-    while IFS= read -r _h; do
-        [[ -n "$_h" ]] && current_hashes+=("$_h")
-    done < <(read_trusted_hashes "$CONFIG_FILE")
-
-    local baseline_present=false
-    if [[ -r "$RECEIPT_FILE" ]] && jq -e '.loomManagedHook | has("trustBaselineHashes")' "$RECEIPT_FILE" >/dev/null 2>&1; then
-        baseline_present=true
-        while IFS= read -r _h; do
-            [[ -n "$_h" ]] && baseline_hashes+=("$_h")
-        done < <(jq -r '.loomManagedHook.trustBaselineHashes[]? // empty' "$RECEIPT_FILE" 2>/dev/null)
-    fi
-
-    if [[ ${#current_hashes[@]} -gt 0 ]]; then
-        local new_hashes
-        new_hashes="$(comm -13 \
-            <(printf '%s\n' ${baseline_hashes[@]+"${baseline_hashes[@]}"} | sort -u) \
-            <(printf '%s\n' "${current_hashes[@]}" | sort -u) 2>/dev/null)"
-        if [[ "$baseline_present" == true ]]; then
-            if [[ -n "$new_hashes" ]]; then
-                trusted=true
-                trust_signal="baseline-diff"
-            else
-                trust_signal="baseline-diff-no-new-trust"
-            fi
-        else
-            # No baseline recorded for this profile at all (receipt missing,
-            # or from before this field existed): fall back to the coarse
-            # signal rather than treat unexplainable state as untrusted.
-            trusted=true
-            trust_signal="legacy-coarse"
-        fi
-    fi
-
-    # Staleness: the installed command must match the receipt's pinned hash.
-    if [[ "$installed" == true ]]; then
-        local pinned=""
-        if [[ -r "$RECEIPT_FILE" ]]; then
-            pinned="$(jq -r '.loomManagedHook.commandSha256 // empty' "$RECEIPT_FILE" 2>/dev/null)" || pinned=""
-        fi
-        if [[ -z "$pinned" ]]; then
-            stale=true
-            [[ -n "$reason" ]] || reason="no managed-hook receipt: the installed entry is unpinned"
-        elif [[ "$pinned" != "$(sha256_of "$installed_cmd")" ]]; then
-            stale=true
-            [[ -n "$reason" ]] || reason="the installed managed-hook entry does not match the pinned receipt (stale)"
-        fi
-        # Version marker must match the version this script installs. (The
-        # workspace-independent check below compares the WHOLE command, which
-        # subsumes this, and gives the more useful reason.)
-        if [[ "$REGISTRATION" == "pinned" && "$installed_cmd" != *"--loom-hook-version $LOOM_HOOK_VERSION"* ]]; then
-            stale=true
-            [[ -n "$reason" ]] || reason="the installed managed-hook entry is not version $LOOM_HOOK_VERSION"
-        fi
-        if [[ "$REGISTRATION" == "workspace-independent" ]]; then
-            # One fixed command for every workspace (#9390): which workspace
-            # last ran `install` is irrelevant, so there is no "different
-            # bridge" verdict. What must hold is that the entry IS that
-            # command — a pre-#9390 per-workspace entry, or a private
-            # session's pinned one, is not.
-            if [[ "$installed_cmd" != "$LOOM_SHARED_HOOK_COMMAND" ]]; then
-                stale=true
-                if [[ "$installed_cmd" == "$LOOM_PRIVATE_CONTROL_PREFIX"* ]]; then
-                    [[ -n "$reason" ]] || reason="this profile carries a private-clone session's pinned registration, not the workspace-independent entry"
-                else
-                    [[ -n "$reason" ]] || reason="the installed managed-hook entry is not the workspace-independent registration (a pre-#9390 per-workspace entry?); re-run install, then re-establish Codex hook trust once for this profile"
-                fi
-            fi
-        # Pinned: the named bridge must be the one this call named.
-        elif [[ "$bridge_readable" == true && "$installed_cmd" != "$BRIDGE"* ]]; then
-            stale=true
-            [[ -n "$reason" ]] || reason="the installed managed-hook entry points at a different bridge than this workspace's"
-        fi
-    else
-        [[ -n "$reason" ]] || reason="Loom's managed PreToolUse hook is not installed in this profile"
-    fi
-
-    if [[ "$bridge_readable" != true ]]; then
-        if [[ "$REGISTRATION" == "workspace-independent" ]]; then
-            reason="this workspace has no readable .loom/hooks/guard-codex-bridge.sh for the managed hook to run"
-        else
-            reason="the managed hook bridge is missing or unreadable"
-        fi
-    elif [[ "$trusted" != true && -z "$reason" ]]; then
-        if [[ "$trust_signal" == "baseline-diff-no-new-trust" ]]; then
-            reason="Codex hook trust has not been (re-)established for this profile since Loom's managed hook was last (re)installed — hooks.state carries no trusted_hash beyond the pre-install baseline"
-        else
-            reason="Codex hook trust is not established for this profile (no hooks.state trusted_hash in config.toml)"
-        fi
-    fi
-
-    if [[ "$installed" == true && "$trusted" == true && "$stale" == false && "$bridge_readable" == true ]]; then
-        ready=true
-        if [[ "$trust_signal" == "baseline-diff" ]]; then
-            reason="managed hook v$LOOM_HOOK_VERSION installed, pinned, and a NEW Codex hook trust decision was recorded for this profile since the managed hook was (re)installed"
-        else
-            reason="managed hook v$LOOM_HOOK_VERSION installed, pinned, and the profile has established Codex hook trust (legacy signal: no install-time baseline recorded for this profile, falling back to any trusted_hash present)"
-        fi
-    fi
-    [[ -n "$reason" ]] || reason="not ready"
-
-    if [[ "$JSON_OUT" == "1" ]]; then
-        jq -nc \
-            --arg profile "$PROFILE_NAME" \
-            --argjson ready "$ready" \
-            --argjson installed "$installed" \
-            --argjson trusted "$trusted" \
-            --arg trustSignal "$trust_signal" \
-            --argjson stale "$stale" \
-            --argjson bridgeReadable "$bridge_readable" \
-            --argjson version "$LOOM_HOOK_VERSION" \
-            --arg registration "$REGISTRATION" \
-            --arg reason "$reason" \
-            '{profile: $profile, ready: $ready, installed: $installed,
-              trusted: $trusted, trustSignal: $trustSignal, stale: $stale,
-              bridgeReadable: $bridgeReadable, version: $version,
-              registration: $registration, reason: $reason}'
-    fi
-
-    if [[ "$ready" == true ]]; then
-        log_info "Codex profile '$PROFILE_NAME': hook parity READY ($reason)."
-        return 0
-    fi
-    log_error "Codex profile '$PROFILE_NAME': hook parity NOT ready — $reason."
-    return 78
-}
-
 case "$COMMAND" in
     install) do_install ;;
-    verify)  do_verify ;;
     remove)  do_remove ;;
 esac
 exit $?

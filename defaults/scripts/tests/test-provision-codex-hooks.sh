@@ -75,6 +75,13 @@ if [[ ! -f "$BRIDGE" ]]; then
     exit 1
 fi
 
+# `verify` is a stub over `loom-daemon codex-hooks verify` since #9390: pin
+# the binary built from this working tree, so the suite tests that and not an
+# ambient install. FAILS, never skips, without one.
+# shellcheck source=lib/require-daemon-bin.sh
+source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$(dirname "$PROVISION")" "codex-hooks"
+
 TMPROOT="$(mktemp -d)"
 trap 'rm -rf "$TMPROOT"' EXIT
 WORKSPACE="$TMPROOT/workspace"
