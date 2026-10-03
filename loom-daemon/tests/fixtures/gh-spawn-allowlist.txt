@@ -22,19 +22,10 @@ src/forge_cmd.rs | pub(crate) fn gh_bin() -> String {
 src/forge_comment.rs | let mut child = std::process::Command::new(gh_bin)
 src/forge_comment.rs | let mut cmd = Command::new(gh_bin.as_ref());
 src/forge_comment.rs | let out = std::process::Command::new(gh_bin)
-src/forge_disable_auto_merge.rs | let mut cmd = Command::new(gh_bin);
-src/forge_disable_auto_merge.rs | let mut cmd = Command::new(gh_bin);
-src/forge_disable_auto_merge.rs | let mut cmd = Command::new(gh_bin);
 src/forge_etag_store.rs | let mut cmd = Command::new(gh_bin);
-src/forge_merge_config.rs | let mut cmd = Command::new(gh);
-src/forge_merge_method.rs | let mut cmd = Command::new(gh);
 src/merge_pr/consolidate.rs | let mut cmd = Command::new(gh_bin);
 src/merge_pr/consolidate.rs | let mut cmd = Command::new(gh_bin);
-src/merge_pr/head_sync/fetch.rs | let out = Command::new(gh_bin())
-src/merge_pr/stacked_children.rs | let out = Command::new(gh)
-src/merge_pr/stale_checks/fetch.rs | let out = Command::new(gh)
 src/pipeline_snapshot.rs | match Command::new(gh_bin).arg("--version").output() {
-src/reclaim_pr_warning.rs | let mut cmd = std::process::Command::new(gh_bin);
 src/safehouse.rs | let mut cmd = tokio::process::Command::new(&gh_bin);
 src/safehouse.rs | let mut cmd = tokio::process::Command::new(&gh_bin);
 src/safehouse.rs | let mut cmd = tokio::process::Command::new(gh_bin);
