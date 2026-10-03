@@ -952,3 +952,158 @@ fn uid_matches_image_reports_mismatch_for_a_tempdir_owned_by_the_test_process() 
     // existing directory.
     assert!(uid_matches_image(profile.path()).is_some());
 }
+
+// ---------------------------------------------------------------------------
+// Issue #9979: the container is Codex's boundary, so its posture and mounts
+// are pinned here.
+// ---------------------------------------------------------------------------
+
+fn run_args_for(roots: &[PathBuf]) -> Vec<String> {
+    host_session_run_args(
+        "loom-codex-session-alice",
+        "img:tag",
+        Path::new("/profiles/alice"),
+        Path::new("/home/u/GitHub"),
+        roots,
+        &[PathBuf::from("/home/u/loom-daemon/.loom/gh-config")],
+    )
+}
+
+#[test]
+fn host_session_run_args_drop_capabilities_and_privilege_escalation() {
+    let args = run_args_for(&[PathBuf::from("/home/u/GitHub/loom")]);
+    let joined = args.join(" ");
+    assert!(joined.contains("--cap-drop ALL"), "{joined}");
+    assert!(joined.contains("--security-opt no-new-privileges"), "{joined}");
+    // Docker's default seccomp/AppArmor stay in force: never overridden, and
+    // nothing is added back.
+    for forbidden in [
+        "seccomp=unconfined",
+        "apparmor=unconfined",
+        "--privileged",
+        "--cap-add",
+        "--network host",
+        "--pid",
+        "docker.sock",
+    ] {
+        assert!(!joined.contains(forbidden), "{forbidden} in {joined}");
+    }
+    assert_eq!(args.last().map(String::as_str), Some("img:tag"), "image is the final arg");
+}
+
+#[test]
+fn host_session_run_args_label_the_posture_spawn_codex_checks() {
+    let args = run_args_for(&[PathBuf::from("/home/u/GitHub/loom")]);
+    assert!(args.contains(&format!("{SESSION_POSTURE_LABEL}={SESSION_POSTURE}")));
+    assert_eq!(SESSION_POSTURE_LABEL, "loom.session-posture");
+    // spawn-codex.sh matches this literal; changing it there and here must
+    // happen together.
+    assert_eq!(SESSION_POSTURE, "container-boundary-v1");
+    assert!(args.contains(&"loom.workspace=/home/u/GitHub".to_string()));
+}
+
+#[test]
+fn host_session_run_args_mount_only_the_profile_and_the_given_roots() {
+    let roots = vec![
+        PathBuf::from("/home/u/GitHub/loom"),
+        PathBuf::from("/home/u/GitHub/anvil"),
+    ];
+    let args = run_args_for(&roots);
+    let mounts: Vec<&str> = args
+        .windows(2)
+        .filter(|pair| pair[0] == "-v" || pair[0] == "--mount")
+        .map(|pair| pair[1].as_str())
+        .collect();
+    assert_eq!(
+        mounts,
+        vec![
+            "/profiles/alice:/home/loom/.codex-profile",
+            "/home/u/GitHub/loom:/home/u/GitHub/loom",
+            "/home/u/GitHub/anvil:/home/u/GitHub/anvil",
+            "/home/u/loom-daemon/.loom/gh-config:/home/u/loom-daemon/.loom/gh-config:ro",
+        ],
+        "no Claude token pool, no personal gh config, no checkout parent; App token dir read-only"
+    );
+}
+
+#[test]
+fn workspace_mount_roots_narrows_a_checkout_parent_to_registered_repos() {
+    let parent = tempfile::tempdir().unwrap();
+    let base = crate::workspace_registry::normalize_path(parent.path());
+    for name in ["loom", "anvil", "firewalled", "loom/nested"] {
+        std::fs::create_dir_all(base.join(name)).unwrap();
+    }
+    let registered = vec![
+        base.join("loom"),
+        base.join("anvil"),
+        base.join("loom/nested"),
+        base.join("registered-but-missing"),
+        PathBuf::from("/somewhere/else/entirely"),
+    ];
+    let roots = workspace_mount_roots(&base, &registered).unwrap();
+    assert_eq!(roots, vec![base.join("anvil"), base.join("loom")]);
+    assert!(!roots.contains(&base.join("firewalled")), "unregistered dirs are never mounted");
+}
+
+#[test]
+fn workspace_mount_roots_keeps_a_single_repository_as_is() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir(repo.path().join(".git")).unwrap();
+    assert_eq!(
+        workspace_mount_roots(repo.path(), &[]).unwrap(),
+        vec![repo.path().to_path_buf()]
+    );
+    let registered_root = tempfile::tempdir().unwrap();
+    let canonical = crate::workspace_registry::normalize_path(registered_root.path());
+    assert_eq!(
+        workspace_mount_roots(&canonical, std::slice::from_ref(&canonical)).unwrap(),
+        vec![canonical]
+    );
+}
+
+#[test]
+fn workspace_mount_roots_refuses_a_parent_with_nothing_registered() {
+    let parent = tempfile::tempdir().unwrap();
+    std::fs::create_dir(parent.path().join("some-repo")).unwrap();
+    let err = workspace_mount_roots(parent.path(), &[])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("refusing to mount it whole"), "{err}");
+}
+
+#[test]
+fn gh_credential_dirs_mounts_only_daemon_owned_app_token_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = tmp.path().join("loom-daemon");
+    let repo = tmp.path().join("GitHub/loom");
+    let personal = tmp.path().join(".config/gh");
+    for dir in [
+        daemon.join(".loom/gh-config"),
+        daemon.join(".loom/gh-config-by-owner/2AMLogic"),
+        repo.join(".loom/gh-config"),
+        personal.clone(),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let mounted = vec![repo.clone()];
+
+    // The daemon root named by a daemon-shaped GH_CONFIG_DIR is found.
+    let dirs = gh_credential_dirs(
+        &[tmp.path().join("GitHub")],
+        Some(&daemon.join(".loom/gh-config-by-owner/2AMLogic")),
+        &mounted,
+    );
+    assert_eq!(
+        dirs,
+        vec![
+            daemon.join(".loom/gh-config"),
+            daemon.join(".loom/gh-config-by-owner")
+        ]
+    );
+
+    // A personal GH_CONFIG_DIR is never mounted.
+    assert!(gh_credential_dirs(&[], Some(&personal), &mounted).is_empty());
+
+    // A dir already inside a mounted repository is left to that mount.
+    assert!(gh_credential_dirs(std::slice::from_ref(&repo), None, &mounted).is_empty());
+}

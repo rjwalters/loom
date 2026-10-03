@@ -1555,7 +1555,9 @@ cat > "$SESSION_DOCKER_BIN/docker" <<DOCKERSHIM
 # the same fake codex shim Section 8 uses via a plain \`exec\`, so stdin/
 # stdout/stderr and the exit code all flow through exactly as they would for
 # a real container.
-case "\$1" in inspect) echo true; exit 0;; exec) shift;; *) exit 1;; esac
+# The #9979 posture probe asks for "<running>|<posture>|<mode>|<mounts>";
+# answer as a hardened host-mode container would.
+case "\$1" in inspect) [[ "\$*" == *session-posture* ]] && echo "true|container-boundary-v1||" || echo true; exit 0;; exec) shift;; *) exit 1;; esac
 while [[ "\$1" == -* ]]; do
     case "\$1" in -i) shift;; --workdir) cd "\$2"; shift 2;; *) export "\$2"; shift 2;; esac
 done

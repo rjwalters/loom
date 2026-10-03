@@ -128,6 +128,12 @@
 #   `guard-worktree-paths.sh` never run). This adapter therefore defaults to the
 #   most restrictive mode and requires an explicit signal to widen it.
 #   Precedence, highest first:
+#     0. A session-container dispatch (see "Session-exec mode" below) runs
+#        `-s danger-full-access` whatever was requested: bubblewrap cannot
+#        start inside the container, and the operator ruled (2026-10-03,
+#        issue #9979) that the hardened container is the boundary. The
+#        requested mode is still logged. LOOM_CODEX_CONTAINER_SANDBOX=codex
+#        opts back into the requested mode.
 #     1. An explicit `-s`/`--sandbox` in the passthrough args.
 #     2. `LOOM_CODEX_SANDBOX` (read-only|workspace-write|danger-full-access).
 #     3. Loom's runner-neutral `--dangerously-skip-permissions` convention ->
@@ -212,6 +218,15 @@
 #                        Overrides the skip-permissions mapping and the default.
 #   LOOM_CODEX_NETWORK   When 1 and the effective sandbox is workspace-write,
 #                        adds `-c sandbox_workspace_write.network_access=true`.
+#   LOOM_CODEX_CONTAINER_SANDBOX  off (default) | codex. Session-container
+#                        dispatch only: `off` runs Codex with its sandbox off
+#                        because the hardened container is the boundary
+#                        (issue #9979); `codex` keeps the requested sandbox
+#                        (needs a userns-capable container profile).
+#   LOOM_CODEX_SESSION_DOCKER  Docker binary used to read the session
+#                        container's posture labels (test seam; default
+#                        `docker`, and not consulted at all in
+#                        LOOM_CODEX_NO_EXEC preview mode unless set).
 #   LOOM_CODEX_HOME      Pins one CODEX_HOME profile directory (auth tier 1).
 #   CODEX_HOME           Honored verbatim if pre-set (auth tier 2).
 #   LOOM_CODEX_PROFILE   Bare profile/account name resolved under the profile
@@ -332,6 +347,7 @@ HAS_MODEL_ARG=false
 EXPLICIT_MODEL=""
 HAS_SANDBOX_ARG=false
 EXPLICIT_SANDBOX=""
+SANDBOX_ARGS=()
 HAS_EFFORT_OVERRIDE=false
 GENERIC_EFFORT=""
 HAS_SKIP_GIT_CHECK_ARG=false
@@ -400,13 +416,15 @@ while [[ $# -gt 0 ]]; do
             fi
             HAS_SANDBOX_ARG=true
             EXPLICIT_SANDBOX="$2"
-            PASSTHROUGH_ARGS+=("$1" "$2")
+            # Held aside, not forwarded yet: a session-container dispatch
+            # replaces it (issue #9979, see "Session container boundary").
+            SANDBOX_ARGS=("$1" "$2")
             shift 2
             ;;
         -s=*|--sandbox=*)
             HAS_SANDBOX_ARG=true
             EXPLICIT_SANDBOX="${1#*=}"
-            PASSTHROUGH_ARGS+=("$1")
+            SANDBOX_ARGS=("$1")
             shift
             ;;
         --dangerously-bypass-approvals-and-sandbox)
@@ -415,7 +433,7 @@ while [[ $# -gt 0 ]]; do
             # Codex would reject as conflicting).
             HAS_SANDBOX_ARG=true
             EXPLICIT_SANDBOX="danger-full-access"
-            PASSTHROUGH_ARGS+=("$1")
+            SANDBOX_ARGS=("$1")
             shift
             ;;
         --skip-git-repo-check)
@@ -558,31 +576,20 @@ elif [[ -n "${LOOM_CODEX_SANDBOX:-}" ]]; then
         log_error "Valid modes: $VALID_SANDBOX_MODES."
         exit 78  # EX_CONFIG
     fi
-    PASSTHROUGH_ARGS+=(-s "$SANDBOX_MODE")
+    SANDBOX_ARGS=(-s "$SANDBOX_MODE")
 elif [[ "$SKIP_PERMISSIONS" == "true" ]]; then
     # Loom's skip-permissions convention maps to workspace-write, NOT full
     # access — see the header's "DELIBERATE DIVERGENCE FROM THE FORK".
     SANDBOX_MODE="workspace-write"
     SANDBOX_SOURCE="loom-skip-permissions-convention"
-    PASSTHROUGH_ARGS+=(-s "$SANDBOX_MODE")
+    SANDBOX_ARGS=(-s "$SANDBOX_MODE")
 else
     SANDBOX_MODE="read-only"
     SANDBOX_SOURCE="adapter-default"
-    PASSTHROUGH_ARGS+=(-s "$SANDBOX_MODE")
+    SANDBOX_ARGS=(-s "$SANDBOX_MODE")
 fi
-log_info "spawn-codex: sandbox=$SANDBOX_MODE source=$SANDBOX_SOURCE"
-
-# Outbound network inside a workspace-write sandbox is OFF in Codex by default,
-# which blocks `git push` / `gh` for a Builder-equivalent worker. Opt in
-# explicitly; a no-op (with a warning) under any other sandbox mode.
-if [[ "${LOOM_CODEX_NETWORK:-}" == "1" ]]; then
-    if [[ "$SANDBOX_MODE" == "workspace-write" ]]; then
-        PASSTHROUGH_ARGS+=(-c "sandbox_workspace_write.network_access=true")
-        log_info "spawn-codex: network=enabled (workspace-write + LOOM_CODEX_NETWORK=1)"
-    else
-        log_warn "spawn-codex: LOOM_CODEX_NETWORK=1 has no effect under sandbox=$SANDBOX_MODE (the network_access key is read only for workspace-write)"
-    fi
-fi
+# The resolved mode is logged and forwarded further down, once session-exec
+# detection has run: a session-container dispatch replaces it (issue #9979).
 
 # --- Git-repo trust check (live-CLI behavior 2) ---
 # `codex exec` refuses to run outside a git work tree. Worktrees ARE work trees,
@@ -767,6 +774,121 @@ if [[ "$CODEX_SESSION_EXEC" == "true" && "$HAS_PROMPT" != "true" ]]; then
     exit 78  # EX_CONFIG
 fi
 
+# --- Session container boundary (issue #9979; operator ruling 2026-10-03) ---
+# Codex's read-only / workspace-write sandbox is bubblewrap, and bubblewrap
+# needs an unprivileged user namespace. A session container cannot create
+# one: Docker's default seccomp profile denies unshare(CLONE_NEWUSER) without
+# CAP_SYS_ADMIN, and on Ubuntu 24.04 hosts
+# (`kernel.apparmor_restrict_unprivileged_userns=1`) AppArmor strips the
+# capabilities bwrap needs inside the namespace even with seccomp disabled.
+# Every shell command a containerized Codex role ran therefore failed with
+# `bwrap: No permissions to create a new namespace`, and the role exited 0
+# having done nothing.
+#
+# The operator ruled that THE CONTAINER IS THE BOUNDARY for Codex: inside a
+# session container Codex runs with its own sandbox off (`-s
+# danger-full-access`), and the container is hardened to carry that weight
+# (`--cap-drop ALL`, `no-new-privileges`, Docker's default seccomp/AppArmor,
+# only the registered repositories mounted, no Claude-pool or personal gh
+# credentials; see session_lifecycle.rs and
+# defaults/docs/guardrail-parity-codex.md § "Session containers").
+#
+# Because the container is now the only boundary, this adapter refuses to drop
+# the sandbox in a container that does not carry that hardening: a host-mode
+# session container must have been created with the
+# `loom.session-posture=container-boundary-v1` label (containers created
+# before this change mounted the whole checkout parent and the Claude token
+# pool, so they exit 78 here until recreated). Private-clone containers
+# (`loom.workspace-mode=private-clone`) were already created with this posture.
+#
+# Escape hatch: LOOM_CODEX_CONTAINER_SANDBOX=codex keeps the requested Codex
+# sandbox inside the container — only useful on a host whose session
+# containers have been given a user-namespace-capable seccomp/AppArmor
+# profile, which no Loom default does.
+SESSION_CONTAINER_MODE=""
+SESSION_CONTAINER_MOUNTS=""
+if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
+    _container_sandbox_pref="${LOOM_CODEX_CONTAINER_SANDBOX:-off}"
+    case "$_container_sandbox_pref" in
+        off|codex) ;;
+        *)
+            log_error "Invalid LOOM_CODEX_CONTAINER_SANDBOX='$_container_sandbox_pref'. Valid values: off (default), codex."
+            exit 78  # EX_CONFIG
+            ;;
+    esac
+
+    # Which kind of session container is this? Read from the container's own
+    # labels (set at creation by loom-daemon), never inferred from a name.
+    # LOOM_CODEX_SESSION_DOCKER is the docker binary used for this inspection
+    # (a test seam); in argv-preview mode (LOOM_CODEX_NO_EXEC) docker is never
+    # touched unless a test names one explicitly.
+    _posture_docker="${LOOM_CODEX_SESSION_DOCKER:-}"
+    if [[ -z "$_posture_docker" && -z "${LOOM_CODEX_NO_EXEC:-}" ]]; then
+        _posture_docker="docker"
+    fi
+    if [[ -z "$_posture_docker" ]]; then
+        SESSION_CONTAINER_MODE="unverified-preview"
+    elif ! command -v "$_posture_docker" >/dev/null 2>&1; then
+        # No docker at all: the binary check below exits 127 with its own
+        # message. Nothing is dispatched, so the sandbox is left as requested.
+        SESSION_CONTAINER_MODE="docker-unavailable"
+    else
+        _posture_inspect="$("$_posture_docker" inspect --format \
+            '{{.State.Running}}|{{index .Config.Labels "loom.session-posture"}}|{{index .Config.Labels "loom.workspace-mode"}}|{{range .Mounts}}{{.Destination}};{{end}}' \
+            "$CODEX_SESSION_CONTAINER" 2>/dev/null)" || _posture_inspect=""
+        # "<running>|<posture>|<workspace-mode>|<mount dest>;<mount dest>;..."
+        _posture_running="" _posture_label="" _workspace_mode=""
+        IFS='|' read -r _posture_running _posture_label _workspace_mode SESSION_CONTAINER_MOUNTS <<< "$_posture_inspect" || true
+        if [[ "$_posture_running" != "true" ]]; then
+            # Missing or stopped: `session-exec host` refuses it with exit 78
+            # and the `session start` fix. Nothing is dispatched, so the
+            # sandbox is left as requested.
+            SESSION_CONTAINER_MODE="not-running"
+        elif [[ "$_workspace_mode" == "private-clone" ]]; then
+            SESSION_CONTAINER_MODE="private-clone"
+        elif [[ "$_posture_label" == "container-boundary-v1" ]]; then
+            SESSION_CONTAINER_MODE="host"
+        else
+            SESSION_CONTAINER_MODE="unhardened"
+        fi
+    fi
+
+    if [[ "$_container_sandbox_pref" == "codex" ]]; then
+        log_warn "spawn-codex: LOOM_CODEX_CONTAINER_SANDBOX=codex keeps sandbox=$SANDBOX_MODE inside $CODEX_SESSION_CONTAINER — bubblewrap fails there unless the container was given a user-namespace-capable seccomp/AppArmor profile (issue #9979)"
+    elif [[ "$SESSION_CONTAINER_MODE" == "docker-unavailable" || "$SESSION_CONTAINER_MODE" == "not-running" ]]; then
+        log_warn "spawn-codex: session container $CODEX_SESSION_CONTAINER posture not verified ($SESSION_CONTAINER_MODE) — sandbox left as requested; dispatch will be refused below"
+    elif [[ "$SESSION_CONTAINER_MODE" == "unhardened" ]]; then
+        log_error "Session container $CODEX_SESSION_CONTAINER was created before the container-boundary hardening (issue #9979)."
+        log_error "Codex runs with its own sandbox off inside a session container, so Loom only dispatches into a container created with the loom.session-posture=container-boundary-v1 label."
+        log_error "Recreate it (this restarts the account's session container):"
+        log_error "  loom-daemon accounts session stop $CODEX_PROFILE_NAME"
+        log_error "  loom-daemon accounts session start $CODEX_PROFILE_NAME --mount-workspace <checkout parent>"
+        exit 78  # EX_CONFIG
+    else
+        if [[ "$SANDBOX_MODE" != "danger-full-access" ]]; then
+            SANDBOX_SOURCE="session-container-boundary requested=$SANDBOX_MODE via $SANDBOX_SOURCE"
+            SANDBOX_MODE="danger-full-access"
+            SANDBOX_ARGS=(-s "$SANDBOX_MODE")
+        fi
+        log_info "spawn-codex: container=$CODEX_SESSION_CONTAINER posture=$SESSION_CONTAINER_MODE — Codex sandbox off, the container is the boundary (issue #9979)"
+    fi
+fi
+
+log_info "spawn-codex: sandbox=$SANDBOX_MODE source=$SANDBOX_SOURCE"
+PASSTHROUGH_ARGS+=(${SANDBOX_ARGS[@]+"${SANDBOX_ARGS[@]}"})
+
+# Outbound network inside a workspace-write sandbox is OFF in Codex by default,
+# which blocks `git push` / `gh` for a Builder-equivalent worker. Opt in
+# explicitly; a no-op (with a warning) under any other sandbox mode.
+if [[ "${LOOM_CODEX_NETWORK:-}" == "1" ]]; then
+    if [[ "$SANDBOX_MODE" == "workspace-write" ]]; then
+        PASSTHROUGH_ARGS+=(-c "sandbox_workspace_write.network_access=true")
+        log_info "spawn-codex: network=enabled (workspace-write + LOOM_CODEX_NETWORK=1)"
+    else
+        log_warn "spawn-codex: LOOM_CODEX_NETWORK=1 has no effect under sandbox=$SANDBOX_MODE (the network_access key is read only for workspace-write)"
+    fi
+fi
+
 # --- ChatGPT-plan auth-mode guard for a pinned model (issue #5499) ---
 # A Codex profile authenticated via a ChatGPT PLAN (interactive `codex login`)
 # restricts the CLI to the account's own default model — an EXPLICITLY pinned
@@ -939,7 +1061,11 @@ if [[ "$_hook_role_is_mutable" == "true" && "$_hook_status" != "ready" && "$_hoo
 fi
 
 if [[ "$_hook_role_is_mutable" != "true" && "$_hook_status" != "ready" && "$_hook_status" != "verified-in-private-session" ]]; then
-    log_warn "spawn-codex: hook parity unavailable — this session gets ONLY the Codex sandbox (${SANDBOX_MODE}) as a boundary. Read-only roles may proceed; this session is NOT Builder-capable."
+    if [[ "$CODEX_SESSION_EXEC" == "true" && "$SANDBOX_MODE" == "danger-full-access" ]]; then
+        log_warn "spawn-codex: hook parity unavailable — this session's only boundary is its session container ($CODEX_SESSION_CONTAINER, issue #9979). Read-only roles may proceed; this session is NOT Builder-capable."
+    else
+        log_warn "spawn-codex: hook parity unavailable — this session gets ONLY the Codex sandbox (${SANDBOX_MODE}) as a boundary. Read-only roles may proceed; this session is NOT Builder-capable."
+    fi
 fi
 
 # --- Assemble the codex invocation ---
@@ -1009,6 +1135,30 @@ if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
     # owns its own CODEX_HOME (ADR-0017 Decision 1).
     CODEX_INVOKE=("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" session-exec host --container "$CODEX_SESSION_CONTAINER" --workdir "$PWD" --env "LOOM_WORKSPACE=$WORKSPACE" --env CARGO_INCREMENTAL=0 --owner-pid "$PPID")
     for _v in LOOM_ROLE LOOM_RUNTIME LOOM_TERMINAL_ID LOOM_SWEEP_ID LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT LOOM_PROJECT_ROOT LOOM_SWEEP_CLAIM_OWNED LOOM_ACCOUNT_NAME LOOM_ACCOUNT_PROVIDER; do [[ -n "${!_v:-}" ]] && CODEX_INVOKE+=(--env "$_v=${!_v}"); done
+    # GH_CONFIG_DIR (issue #9979): the daemon's GitHub App installation token
+    # lives in `<registered repo>/.loom/gh-config`, which a host-mode session
+    # container mounts at path parity — so forwarding the PATH (never a token
+    # value) is what lets `gh` inside the container authenticate as the fleet
+    # App. Not for a private-clone container: it carries its own
+    # GH_CONFIG_DIR, and a host path does not exist inside it.
+    # A host-mode container mounts the daemon's App-token dirs read-only
+    # (session_lifecycle.rs `gh_credential_dirs`); when the label probe saw
+    # the mount list, forward only a path that is actually inside one.
+    if [[ -n "${GH_CONFIG_DIR:-}" && "$SESSION_CONTAINER_MODE" != "private-clone" && -z "${LOOM_PRIVATE_LEASE_FD:-}" ]]; then
+        _gh_visible=true
+        if [[ "$SESSION_CONTAINER_MODE" == "host" ]]; then
+            _gh_visible=false
+            IFS=';' read -r -a _session_mounts <<< "$SESSION_CONTAINER_MOUNTS"
+            for _m in ${_session_mounts[@]+"${_session_mounts[@]}"}; do
+                [[ -n "$_m" && ( "$GH_CONFIG_DIR" == "$_m" || "$GH_CONFIG_DIR" == "$_m"/* ) ]] && _gh_visible=true
+            done
+        fi
+        if [[ "$_gh_visible" == "true" ]]; then
+            CODEX_INVOKE+=(--env "GH_CONFIG_DIR=$GH_CONFIG_DIR")
+        else
+            log_warn "spawn-codex: GH_CONFIG_DIR is not mounted in $CODEX_SESSION_CONTAINER — gh inside the session will be unauthenticated. Recreate the session from the daemon's workspace (LOOM_WORKSPACE) so its App-token dir is mounted (issue #9979)."
+        fi
+    fi
     CODEX_INVOKE+=(--)
 fi
 CODEX_INVOKE+=(codex ${CODEX_ARGS[@]+"${CODEX_ARGS[@]}"})

@@ -31,6 +31,7 @@ Read this before dispatching a Codex worker at anything you care about.
 - [Loom guard intent → Codex mechanism](#loom-guard-intent--codex-mechanism)
 - [Managed `pre_tool_use` hook bridge (issue #4495)](#managed-pre_tool_use-hook-bridge-issue-4495)
 - [Sandbox-mode mapping (what the adapter emits)](#sandbox-mode-mapping-what-the-adapter-emits)
+- [Session containers: the container is the boundary (issue #9979)](#session-containers-the-container-is-the-boundary-issue-9979)
 - [Residual gaps](#residual-gaps)
 - [Admission checklist (contract point 5/6)](#admission-checklist-contract-point-56)
 - [Promotion gate (`hooks` / `worktreeIsolation`)](#promotion-gate-hooks--worktreeisolation)
@@ -415,6 +416,7 @@ Precedence, highest first:
 
 | # | Signal | Effective sandbox |
 |---|---|---|
+| 0 | Dispatch into a session container (`docker exec` via `loom-daemon session-exec host`), unless `LOOM_CODEX_CONTAINER_SANDBOX=codex` | `danger-full-access`; the hardened container is the boundary (see [Session containers](#session-containers-the-container-is-the-boundary-issue-9979)) |
 | 1 | An explicit `-s` / `--sandbox` (or `--dangerously-bypass-approvals-and-sandbox`) in the passthrough args | as given |
 | 2 | `LOOM_CODEX_SANDBOX=read-only\|workspace-write\|danger-full-access` | as given (invalid value → exit 78) |
 | 3 | Loom's runner-neutral `--dangerously-skip-permissions` convention | `workspace-write` |
@@ -455,6 +457,91 @@ The adapter emits `-s danger-full-access` rather than
 `--dangerously-bypass-approvals-and-sandbox` for that case: same sandbox
 posture, without additionally waiving Codex's hook-trust prompt (which is a
 separate protection, and one Loom will want intact once gap 1 is closed).
+
+## Session containers: the container is the boundary (issue #9979)
+
+**Operator ruling, 2026-10-03:** inside a `loom-codex-session-*` container,
+Codex runs with its own sandbox off (`-s danger-full-access`), and the
+container is the boundary. This replaces rows 1–4 above for session
+dispatch only; bare-metal dispatch is unchanged.
+
+**Why.** Codex's `read-only` / `workspace-write` sandbox on Linux is
+bubblewrap, which needs an unprivileged user namespace. A container can't
+create one with Docker's defaults. Docker's default seccomp profile denies
+`unshare(CLONE_NEWUSER)` without `CAP_SYS_ADMIN`. On Ubuntu 24.04 hosts,
+`kernel.apparmor_restrict_unprivileged_userns=1` also strips the namespace's
+capabilities, so `seccomp=unconfined` alone still fails (`Failed to make /
+slave`, then `loopback: Failed RTM_NEWADDR`). Every shell command a Codex role
+ran failed with `bwrap: No permissions to create a new namespace`, and the
+agent exited 0 having done nothing. Keeping bwrap would have needed a custom
+seccomp profile plus a host-loaded AppArmor profile on every Linux host. The
+operator chose the container boundary instead.
+
+**What `spawn-codex.sh` does.** For a session-managed profile it reads the
+container's labels (`docker inspect`) before dispatching:
+
+| Container | Result |
+|---|---|
+| `loom.session-posture=container-boundary-v1` (host mode, created by this release's `session start`) | `-s danger-full-access`. The requested mode is kept in the audit line (`source=session-container-boundary requested=workspace-write via …`). |
+| `loom.workspace-mode=private-clone` (#8787) | Same. These containers were already created with the posture below, plus a read-only rootfs. |
+| A running host-mode container created before this release (no posture label) | **exit 78** with the recreate commands. Those containers mount the whole checkout parent and the Claude token pool, so Loom will not drop the sandbox in them. |
+| A missing or stopped container, or no `docker` | The sandbox stays as requested. Dispatch is refused anyway: `session-exec host` exits 78 for a container that isn't running, and a missing `docker` exits 127. |
+
+`LOOM_CODEX_CONTAINER_SANDBOX=codex` keeps the requested Codex sandbox in the
+container. That only works if an operator has given the container a
+user-namespace-capable seccomp/AppArmor profile, and no Loom default does that.
+
+**What a host-mode session container can reach.** `host_session_run_args` in
+`loom-daemon/src/tokens_pool/session_lifecycle.rs` sets this list, and unit
+tests pin it.
+
+| Surface | Exposure | Why |
+|---|---|---|
+| Account profile (`CODEX_HOME`) | read-write, this account only | The account's own `auth.json` refresh chain (ADR-0017 Decision 1). |
+| Repositories | read-write, **only roots in `~/.loom/workspaces.json`** under `--mount-workspace`, each at its own path | Dispatch runs `--workdir <worktree>`. Before #9979 the whole checkout parent (`~/GitHub`) was mounted, including repositories outside the fleet. A parent with no registered roots under it is refused. |
+| GitHub credential | read-only: the daemon's App installation-token dirs (`<daemon root>/.loom/gh-config`, `…/gh-config-by-owner`) | `spawn-codex.sh` forwards the dispatch's `GH_CONFIG_DIR` (a path, never a token), and only if that path is inside a mount. Personal `GH_CONFIG_DIR`s are never mounted. |
+| Claude token pool (`~/.loom/tokens`) | **not mounted** (was read-only before #9979) | Codex doesn't need it. With the sandbox off, the model can read any mounted file. |
+| Operator `~/.config/gh` | **not mounted** (was read-only before #9979) | On Linux hosts it holds a personal OAuth token in plaintext. |
+| Docker socket, host network/PID namespace | never | — |
+| Capabilities | `--cap-drop ALL`, `--security-opt no-new-privileges` (`CapEff=0`, `NoNewPrivs=1`) | The image has no `sudo`. These flags also block setuid escalation. |
+| Seccomp / AppArmor | Docker defaults, never overridden (`Seccomp: 2`) | `unshare -U` stays denied, so the model gets no new namespaces either. |
+| Network | Docker's default bridge, outbound open | Required by the Codex API and GitHub. See the residual exposures below. |
+
+**Residual exposures. These are operator decisions, not Loom defaults.**
+
+- **Cloud instance metadata.** On EC2 workers, a bridged container can reach
+  IMDS. It received an IMDSv2 token and listed the instance role (verified
+  2026-10-03 on loom-worker-1). With the sandbox off, a model could fetch the
+  instance role's credentials. The host fix is
+  `aws ec2 modify-instance-metadata-options --http-tokens required
+  --http-put-response-hop-limit 1`, which stops the token PUT from crossing
+  the bridge. Loom can't make that change, and it may affect other
+  containers on the host that use IMDS.
+- **Host services.** Ports bound on the host's bridge gateway, and
+  `host.docker.internal` on Docker Desktop, are reachable from the container.
+- **Self-modifiable hooks.** In host mode the profile mount is read-write, so
+  a session could edit its own `config.toml`/`hooks.json`. That would turn
+  off the managed `pre_tool_use` hook for later sessions on the account.
+  Read-only roles never relied on that hook. For mutable roles
+  (builder/doctor), use private-clone mode, which binds those files
+  read-only.
+- **Registered repositories.** Every registered repository is read-write.
+  That is no wider than a Claude role on the same host, whose guard hooks
+  are also in-repo files.
+
+**Rollout.** Existing session containers keep their old mounts until they are
+recreated. `spawn-codex.sh` refuses to use them (exit 78) instead of dropping
+the sandbox in them. Recreate each one from the daemon's workspace, so the
+App-token dir is found:
+`cd <daemon root> && loom-daemon accounts session stop <name> && loom-daemon
+accounts session start <name> --mount-workspace <checkout parent>`. A
+repository admitted later becomes visible only after its account's container
+is recreated.
+
+**Evidence.** `docker/session/test-image.sh` check 13 drives the real `codex
+exec` through one tool call under these exact flags (credential-free,
+loopback provider) and fails if the command did not run. It also reports
+whether `workspace-write` could run on that host.
 
 ### The network coupling (read this before dispatching a Builder)
 

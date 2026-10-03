@@ -174,6 +174,29 @@ adopted by `session start`, it refuses further host-direct `CODEX_HOME` use
 (`accounts reauth`/`status` on that profile) — the container is the sole
 process allowed to touch the volume from then on.
 
+## Security posture of a host-mode session container (issue #9979)
+
+Codex runs with its own sandbox off inside a session container
+(`spawn-codex.sh` emits `-s danger-full-access`). Codex's bubblewrap sandbox
+can't create a user namespace under Docker's default seccomp profile, nor
+under Ubuntu's AppArmor userns restriction. The operator ruled on 2026-10-03
+that the container is the boundary. `loom-daemon accounts session start`
+therefore creates the container with:
+
+- `--cap-drop ALL --security-opt no-new-privileges`, with Docker's default
+  seccomp/AppArmor left in force;
+- the account profile read-write at `CODEX_HOME`;
+- **only the registered repositories** (`~/.loom/workspaces.json`) under
+  `--mount-workspace`, read-write at path parity, not the whole parent;
+- the daemon's GitHub App token dirs, read-only;
+- the label `loom.session-posture=container-boundary-v1`. `spawn-codex.sh`
+  won't dispatch into a host-mode container without it.
+
+The Claude token pool and the operator's `~/.config/gh` are no longer mounted.
+[`defaults/docs/guardrail-parity-codex.md`](../../defaults/docs/guardrail-parity-codex.md#session-containers-the-container-is-the-boundary-issue-9979)
+has the full reach audit, the residual exposures (cloud metadata, host
+services) and the rollout steps.
+
 ## Re-authenticating a session-managed account (the ownership rule, issue #7389)
 
 Once `session start` adopts a profile (writes its
