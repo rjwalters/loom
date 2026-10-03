@@ -8,6 +8,8 @@ struct FakeRunner {
     containers: Mutex<HashMap<String, ContainerState>>,
     busy: Mutex<HashMap<String, bool>>,
     creates: Mutex<Vec<(String, String, PathBuf, PathBuf)>>,
+    /// The `daemon_root` each `create` received (issue #10103).
+    daemon_roots: Mutex<Vec<PathBuf>>,
     stops: Mutex<Vec<String>>,
     attaches: Mutex<Vec<(String, String)>>,
     execs: Mutex<Vec<(String, Vec<String>)>>,
@@ -80,7 +82,10 @@ impl ContainerRunner for FakeRunner {
         image: &str,
         codex_home: &Path,
         workspace: &Path,
+        daemon_root: &Path,
     ) -> Result<()> {
+        let mut roots = self.daemon_roots.lock().unwrap();
+        roots.push(daemon_root.to_path_buf());
         self.creates.lock().unwrap().push((
             container.to_string(),
             image.to_string(),
@@ -1170,3 +1175,7 @@ fn check_mount_denials_refuses_any_root_overlapping_a_firewalled_repo() {
 
 #[path = "session_lifecycle_controls_tests.rs"]
 mod controls;
+
+/// Issue #10103: the accounts registry's daemon root owns App-token dirs.
+#[path = "session_lifecycle_owner_tests.rs"]
+mod owner;

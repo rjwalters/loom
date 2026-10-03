@@ -170,6 +170,41 @@ pub fn workspace_mount_roots(workspace: &Path, registered: &[PathBuf]) -> Result
     Ok(kept)
 }
 
+/// The candidate daemon roots whose App-token dirs a host-mode session
+/// container may mount ([`gh_credential_dirs`]), in order, without
+/// duplicates:
+///
+/// 1. `mount_workspace`: the `--mount-workspace` path the container gets.
+/// 2. `registry_workspace`: the accounts registry's own workspace (the
+///    `--workspace` daemon root whose `.loom/accounts.json` `session start`
+///    updates). This is where `.loom/gh-config` lives when an operator runs
+///    `cd ~/GitHub/loom && loom-daemon accounts session start <name>
+///    --mount-workspace ~/GitHub` by hand. Before issue #10103 it was not
+///    consulted, so a session started without `LOOM_WORKSPACE` mounted no
+///    token dir and posture reported `gh=skip`.
+/// 3. `loom_workspace`: the daemon's `LOOM_WORKSPACE`, when set.
+#[must_use]
+pub fn gh_credential_owners(
+    mount_workspace: &Path,
+    registry_workspace: &Path,
+    loom_workspace: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut owners: Vec<PathBuf> = Vec::new();
+    for owner in [
+        Some(mount_workspace),
+        Some(registry_workspace),
+        loom_workspace,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !owner.as_os_str().is_empty() && !owners.iter().any(|known| known == owner) {
+            owners.push(owner.to_path_buf());
+        }
+    }
+    owners
+}
+
 /// The daemon-owned GitHub App token directories a host-mode session
 /// container mounts **read-only** so `gh` inside it can authenticate (issue
 /// #9979). `spawn-codex.sh` forwards the dispatch's own `GH_CONFIG_DIR` (a
@@ -541,12 +576,17 @@ pub trait ContainerRunner {
     /// read-write at the identical absolute host path (`docker/worker/MOUNT-CONTRACT.md` §1,
     /// "path parity"), recorded in the [`WORKSPACE_LABEL`] container label so
     /// a later [`Self::inspect`] can report it back.
+    ///
+    /// `daemon_root` is the accounts registry's workspace (the `--workspace`
+    /// daemon root): one of the owners whose App-token dirs are mounted
+    /// ([`gh_credential_owners`], issue #10103).
     fn create(
         &self,
         container: &str,
         image: &str,
         codex_home: &Path,
         workspace: &Path,
+        daemon_root: &Path,
     ) -> Result<()>;
 
     /// `docker start` for an existing, stopped-but-not-removed container.
@@ -692,6 +732,7 @@ impl ContainerRunner for ProcessContainerRunner {
         image: &str,
         codex_home: &Path,
         workspace: &Path,
+        daemon_root: &Path,
     ) -> Result<()> {
         // The daemon's own workspace registry is the allow-list of what the
         // container may see (issue #9979): an unreadable registry is an
@@ -704,10 +745,11 @@ impl ContainerRunner for ProcessContainerRunner {
         let firewalled = firewalled_repo_paths(workspace)?;
         check_mount_denials(&roots, dirs::home_dir().as_deref(), &firewalled)?;
         // Daemon-owned App-token dirs for `gh` (see `gh_credential_dirs`):
-        // the session workspace, the daemon's own `LOOM_WORKSPACE`, and the
-        // owner of a daemon-shaped `GH_CONFIG_DIR` in this process's env.
-        let mut owners = vec![workspace.to_path_buf()];
-        owners.extend(std::env::var_os("LOOM_WORKSPACE").map(PathBuf::from));
+        // the session workspace, the accounts registry's daemon root (#10103),
+        // the daemon's own `LOOM_WORKSPACE`, and the owner of a daemon-shaped
+        // `GH_CONFIG_DIR` in this process's env.
+        let loom_workspace = std::env::var_os("LOOM_WORKSPACE").map(PathBuf::from);
+        let owners = gh_credential_owners(workspace, daemon_root, loom_workspace.as_deref());
         let env_gh = std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from);
         let credentials = gh_credential_dirs(&owners, env_gh.as_deref());
         let args =
@@ -1086,8 +1128,13 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
             }
             None => {
                 ensure_profile_controls(&profile)?;
-                self.runner
-                    .create(&container, &self.image, &profile, &requested_workspace)?;
+                self.runner.create(
+                    &container,
+                    &self.image,
+                    &profile,
+                    &requested_workspace,
+                    &self.workspace,
+                )?;
             }
         }
         mark_session_managed(&profile, &container)?;
