@@ -6,6 +6,7 @@ Loom uses the `gh` CLI for all GitHub interactions — label management, PR crea
 **Contents**
 
 - [Quick Start](#quick-start)
+- [Credential modes and `gh` routing (#9988, #9983 C5)](#credential-modes-and-gh-routing-9988-9983-c5)
 - [Required Token Permissions](#required-token-permissions)
 - [Creating a Fine-Grained PAT](#creating-a-fine-grained-pat)
 - [Using the Token](#using-the-token)
