@@ -225,6 +225,10 @@
   description: "operator-only sub-kind: preference/authority axis named; not a safe default (#5826)"
   color: "C2410C"  # orange-700 - darkest
 
+- name: loom:decision-malformed
+  description: "operator-decision bounced for missing/invalid decision block; Curator repairs or re-routes (#10057)"
+  color: "C2410C"  # same family as loom:operator-decision
+
 - name: loom:operator-objective
   description: "operator-only sub-kind: determined once operator states objective; lists candidates"
   color: "FED7AA"  # orange-200 - lightest of all: clears on a single stated preference
