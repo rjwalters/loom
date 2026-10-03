@@ -279,6 +279,12 @@ impl GhInvocation {
         self
     }
 
+    /// Append one `gh` argument; see [`GhInvocation::args`].
+    #[must_use]
+    pub fn arg(self, arg: impl AsRef<OsStr>) -> Self {
+        self.args([arg])
+    }
+
     /// Run in `dir`. Also keys the cross-owner `GH_CONFIG_DIR` lookup.
     #[must_use]
     pub fn current_dir(mut self, dir: impl AsRef<Path>) -> Self {
@@ -457,3 +463,7 @@ impl GhInvocation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "migrated_sites_tests.rs"]
+mod migrated_sites_tests;
