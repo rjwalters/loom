@@ -595,6 +595,12 @@ jq -e '.trusted == false and .trustSignal == "wrong-location" and .trustLocation
 trust_profile "$PK" deadbeefcafe /home/loom/.codex-profile
 jq -e '.ready == true' <<<"$(kverify)" >/dev/null 2>&1 \
     && pass "session-managed profile: container-keyed trust -> ready" || fail "session-managed profile: container-keyed trust -> ready"
+# spawn-codex names where it will actually run (LOOM_CODEX_SESSION_EXEC=0 runs an
+# adopted profile on bare metal); the stub must forward that, not re-derive it.
+v="$(bash "$PROVISION" verify --codex-home "$PK" --workspace "$WSA" --runtime-codex-home "$(cd -P "$PK" && pwd -P)" --json 2>/dev/null)"
+jq -e '.ready == false and .trustSignal == "wrong-location" and (.trustLocation | startswith("profile"))' <<<"$v" >/dev/null 2>&1 \
+    && pass "--runtime-codex-home reaches the native verify: container-keyed trust does not count on bare metal" \
+    || fail "--runtime-codex-home reaches the native verify (got $v)"
 mv "$PK/.session-managed.json" "$TMPROOT/session-managed.json.bak"
 
 echo

@@ -782,32 +782,47 @@ pub fn select_account(
                 upstream_id: selected.upstream_id,
             })
         }
-        AccountProvider::Codex => {
-            let inventory = account_inventory(workspace, provider)?;
-            let now = epoch_now();
-            // Proactive in-container auth probe (issue #6927): a
-            // session-managed account whose refresh chain has died is marked
-            // `reauth_required` *here*, so the exclusion below sees it,
-            // instead of being selected and failing a dispatch first. A no-op
-            // (no `docker` call at all) unless some enabled account has been
-            // adopted by `accounts session start`, and never fatal — see
-            // `refresh_session_health`.
-            let _ = super::session_lifecycle::refresh_session_health(workspace, &inventory, now);
-            let descriptor = super::health::select_healthy_for_model_at(
-                workspace, provider, &inventory, model, now,
-            )?;
-            Ok(SelectedAccount {
-                id: descriptor.id,
-                binding: AccountBinding::CodexHome {
-                    directory: descriptor.credential_reference,
-                },
-                mode: "inventory",
-                // Codex's storage backend (`codex_profile_root()`) has no
-                // `index.json` manifest to source an upstream id from (D9).
-                upstream_id: None,
-            })
-        }
+        AccountProvider::Codex => select_codex_account_where(workspace, model, |_| true),
     }
+}
+
+/// The Codex arm of [`select_account`], restricted to the inventoried accounts
+/// `keep` accepts (issue #9390 follow-up: a private-clone account bound to
+/// another repository must never be picked for this workspace).
+///
+/// Health, cooldown and model-class narrowing are exactly
+/// [`select_account`]'s; only the candidate set is smaller. An empty candidate
+/// set fails the same way an all-unhealthy pool does, never by widening.
+pub fn select_codex_account_where(
+    workspace: &Path,
+    model: Option<&str>,
+    keep: impl Fn(&AccountDescriptor) -> bool,
+) -> Result<SelectedAccount> {
+    let provider = AccountProvider::Codex;
+    let inventory: Vec<AccountDescriptor> = account_inventory(workspace, provider)?
+        .into_iter()
+        .filter(|account| keep(account))
+        .collect();
+    let now = epoch_now();
+    // Proactive in-container auth probe (issue #6927): a session-managed
+    // account whose refresh chain has died is marked `reauth_required` *here*,
+    // so the exclusion below sees it, instead of being selected and failing a
+    // dispatch first. A no-op (no `docker` call at all) unless some enabled
+    // account has been adopted by `accounts session start`, and never fatal —
+    // see `refresh_session_health`.
+    let _ = super::session_lifecycle::refresh_session_health(workspace, &inventory, now);
+    let descriptor =
+        super::health::select_healthy_for_model_at(workspace, provider, &inventory, model, now)?;
+    Ok(SelectedAccount {
+        id: descriptor.id,
+        binding: AccountBinding::CodexHome {
+            directory: descriptor.credential_reference,
+        },
+        mode: "inventory",
+        // Codex's storage backend (`codex_profile_root()`) has no `index.json`
+        // manifest to source an upstream id from (D9).
+        upstream_id: None,
+    })
 }
 
 fn epoch_now() -> u64 {

@@ -289,6 +289,11 @@ impl Check {
                  managed hook was last (re)installed — hooks.state carries no trusted_hash beyond \
                  the pre-install baseline"
                     .into()
+            } else if trust_signal == "disabled" {
+                "Codex has Loom's managed hook DISABLED in this profile (hooks.state \
+                 enabled = false), so it never runs whatever its trust reads; remove the \
+                 override from config.toml"
+                    .into()
             } else if trust_signal == "wrong-location" {
                 format!(
                     "Codex hook trust is recorded in this profile, but not for Loom's entry at the \
@@ -357,16 +362,24 @@ pub fn runtime_codex_home(codex_home: &Path) -> PathBuf {
 /// `(trusted, trustSignal)` for Loom's entry in `codex_home`, as Codex will
 /// read it with `CODEX_HOME=runtime_home`: the keyed hashes, then the #5005
 /// baseline diff over them. `wrong-location` = trust exists in the profile,
-/// but none of it is for Loom's entry where it runs.
+/// but none of it is for Loom's entry where it runs. `disabled` = a key Loom's
+/// entry occupies carries `enabled = false`, which Codex honours by dropping
+/// the handler however its trust reads (`discovery.rs::hook_enabled`).
 #[must_use]
 pub fn trust_at(codex_home: &Path, runtime_home: &Path) -> (bool, &'static str) {
     let keys = read_hooks(codex_home)
         .map(|hooks| loom_trust_keys(&hooks, runtime_home))
         .unwrap_or_default();
     let config = codex_home.join("config.toml");
+    let state = hook_state(&config);
+    if keys.iter().any(|key| {
+        state.get(key).and_then(|entry| entry.get("enabled")) == Some(&toml::Value::Boolean(false))
+    }) {
+        return (false, "disabled");
+    }
     let current = keyed_trusted_hashes(&config, &keys);
     if current.is_empty() {
-        let any = !keyed_trusted_hashes(&config, &BTreeSet::new()).is_empty();
+        let any = state.values().any(|entry| trusted_hash(entry).is_some());
         return (false, if any { "wrong-location" } else { "none" });
     }
     match trust_baseline(&codex_home.join(RECEIPT)) {
@@ -399,33 +412,40 @@ pub fn loom_trust_keys(hooks: &serde_json::Value, runtime_home: &Path) -> BTreeS
     keys
 }
 
-/// The non-empty `trusted_hash` values `config.toml` records under `keys`
-/// (every key when `keys` is empty). Parsed as TOML, so every spelling of a
-/// key (Codex's own `[hooks.state."<key>"]` table, dotted keys, inline
-/// tables) is the same key. A file that does not parse carries no trust: Codex
-/// would not load it either.
+/// The non-empty `trusted_hash` values `config.toml` records under `keys`.
+/// An empty `keys` (no Loom entry to look up) yields no trust. Parsed as TOML,
+/// so every spelling of a key (Codex's own `[hooks.state."<key>"]` table,
+/// dotted keys, inline tables) is the same key. A file that does not parse
+/// carries no trust: Codex would not load it either.
 #[must_use]
 pub fn keyed_trusted_hashes(config: &Path, keys: &BTreeSet<String>) -> BTreeSet<String> {
-    let Ok(text) = std::fs::read_to_string(config) else {
-        return BTreeSet::new();
-    };
-    let Ok(document) = text.parse::<toml::Table>() else {
-        return BTreeSet::new();
-    };
-    let Some(state) = document
-        .get("hooks")
-        .and_then(|hooks| hooks.get("state"))
-        .and_then(toml::Value::as_table)
-    else {
-        return BTreeSet::new();
-    };
-    state
-        .iter()
-        .filter(|(key, _)| keys.is_empty() || keys.contains(*key))
-        .filter_map(|(_, entry)| entry.get("trusted_hash")?.as_str())
-        .filter(|hash| !hash.is_empty())
+    let state = hook_state(config);
+    keys.iter()
+        .filter_map(|key| trusted_hash(state.get(key)?))
         .map(str::to_owned)
         .collect()
+}
+
+/// `config.toml`'s `[hooks.state]` table; empty when absent or unparsable.
+fn hook_state(config: &Path) -> toml::Table {
+    std::fs::read_to_string(config)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|mut document| match document.remove("hooks")? {
+            toml::Value::Table(mut hooks) => match hooks.remove("state")? {
+                toml::Value::Table(state) => Some(state),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn trusted_hash(entry: &toml::Value) -> Option<&str> {
+    entry
+        .get("trusted_hash")?
+        .as_str()
+        .filter(|hash| !hash.is_empty())
 }
 
 /// The receipt's install-time trust baseline, or `None` when the receipt is

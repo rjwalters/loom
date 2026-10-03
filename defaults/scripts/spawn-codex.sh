@@ -922,8 +922,12 @@ elif [[ -z "${CODEX_HOME:-}" ]]; then
     _hook_reason="ambient Codex login state (no Loom-managed profile selected)"
 else
     _hook_verify_out=""
-    if _hook_verify_out="$(bash "$_hook_provisioner" verify \
-            --codex-home "$CODEX_HOME" --workspace "$WORKSPACE" --json 2>/dev/null)"; then
+    # Codex keys hook trust by the hooks.json path under the CODEX_HOME it runs
+    # with, so name where THIS launch runs, never the derived default (#9390).
+    _hook_runtime_home="/home/loom/.codex-profile"
+    [[ "$CODEX_SESSION_EXEC" == "true" ]] || _hook_runtime_home="$(cd -P -- "$CODEX_HOME" 2>/dev/null && pwd -P)" || _hook_runtime_home="$CODEX_HOME"
+    if _hook_verify_out="$(bash "$_hook_provisioner" verify --codex-home "$CODEX_HOME" \
+            --workspace "$WORKSPACE" --runtime-codex-home "$_hook_runtime_home" --json 2>/dev/null)"; then
         _hook_status="ready"
     else
         _hook_status="not-ready"
