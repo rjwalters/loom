@@ -128,10 +128,7 @@ fi
 # $GH_READ (docs/gh-cached.md interface, #9953): the short-TTL read cache when
 # the wrapper ships next to this script, plain `gh` otherwise. Only repeated
 # observation reads use it; writes stay literal `gh`.
-GH_READ="gh"
-_ghc="$(dirname "${BASH_SOURCE[0]}")/gh-cached"
-if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi
-
+GH_READ="gh"; _ghc="$(dirname "${BASH_SOURCE[0]}")/gh-cached"; if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi
 
 # git blame/log need a path relative to the repo (or CWD); resolve to a path
 # git accepts, working whether invoked from repo root or a subdirectory, and
@@ -251,9 +248,7 @@ resolve_commit() {
     fi
 
     pr="$(resolve_pr_from_subject "$subject")"
-    if [[ -z "$pr" ]]; then
-        pr="$(resolve_pr_from_gh "$sha")"
-    fi
+    [[ -n "$pr" ]] || pr="$(resolve_pr_from_gh "$sha")"
 
     issues=""
     role="unknown"

@@ -563,7 +563,8 @@ run_sls -- --repo octocat/hello-world
 assert_eq "0" "$RC" "a reachable, writable --repo target syncs normally"
 assert_contains "$LOG" "repo view octocat/hello-world --json nameWithOwner,viewerPermission" \
     "the real --repo path preflights the named target with 'gh repo view'"
-assert_contains "$(printf '%s\n' "$LOG" | head -1)" "repo view octocat/hello-world" \
+# (filtering the gh-cached wrapper's local `--version` liveness probe, #9953 — not a forge call)
+assert_contains "$(printf '%s\n' "$LOG" | grep -vx -- '--version' | head -1)" "repo view octocat/hello-world" \
     "the preflight is the FIRST gh call — it precedes every label operation"
 
 # A typo that resolves to nothing this identity can see must abort before the
@@ -578,7 +579,7 @@ assert_not_contains "$LOG" "label delete" \
     "the unreachable target aborted BEFORE any label deletion"
 assert_not_contains "$LOG" "label create" \
     "the unreachable target aborted before any label creation"
-assert_eq "1" "$(printf '%s\n' "$LOG" | grep -c . || true)" \
+assert_eq "1" "$(printf '%s\n' "$LOG" | grep -vx -- '--version' | grep -c . || true)" \
     "the preflight was the only gh call made against the bad target"
 
 # Existing-but-read-only is the other half of "existence/permission": deleting

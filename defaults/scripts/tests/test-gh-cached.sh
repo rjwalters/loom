@@ -526,6 +526,16 @@ done
 GH_READ="gh"; _ghc="/nonexistent-dir/gh-cached"
 if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi
 assert_eq "gh" "$GH_READ" "missing wrapper -> GH_READ falls back to plain gh"
+# ...and when it is present but broken (its --version probe fails), under set -euo pipefail.
+BROKEN_DIR="$(mktemp -d)"; printf '#!/usr/bin/env bash\nexit 1\n' > "$BROKEN_DIR/gh-cached"; chmod +x "$BROKEN_DIR/gh-cached"
+broken_out="$(SCRIPT_DIR="$BROKEN_DIR" bash -c 'set -euo pipefail; GH_READ="gh"; _ghc="$SCRIPT_DIR/gh-cached"; if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi; echo "$GH_READ"')"
+assert_eq "gh" "$broken_out" "broken wrapper -> GH_READ falls back to plain gh (set -euo pipefail safe)"
+rm -rf "$BROKEN_DIR"
+# Each routed script resolves the probe on ONE code line (shell budget, #7810).
+for sc in check-duplicate blame-issue resolve-tier-model sync-labels; do
+    grep -qE '^GH_READ="gh"; _ghc=.*"\$_ghc" --version >/dev/null 2>&1; then GH_READ="\$_ghc"; fi$' "$S_DIR/$sc.sh"
+    assert_eq "0" "$?" "$sc.sh resolves \$GH_READ on a single probe line"
+done
 
 # --- Summary ---------------------------------------------------------------
 echo ""

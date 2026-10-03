@@ -47,11 +47,9 @@ RUNTIME="${2:-claude}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # $GH_READ (docs/gh-cached.md interface, #9953): the short-TTL read cache when
 # the wrapper ships next to this script, plain `gh` otherwise. Only repeated
-# observation reads use it; writes stay literal `gh`.
-GH_READ="gh"
-_ghc="$SCRIPT_DIR/gh-cached"
-if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi
-
+# observation reads use it; writes stay literal `gh`. Only the plain-`gh`
+# fallback arms below use it; forge_gh_repo_safe stays uncached.
+GH_READ="gh"; _ghc="$SCRIPT_DIR/gh-cached"; if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "not a git repo" >&2; exit 2; }
 CONFIG="$ROOT/.loom/config.json"

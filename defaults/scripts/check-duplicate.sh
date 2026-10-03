@@ -139,10 +139,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # $GH_READ (docs/gh-cached.md interface, #9953): the short-TTL read cache when
 # the wrapper ships next to this script, plain `gh` otherwise. Only repeated
 # observation reads use it; writes stay literal `gh`.
-GH_READ="gh"
-_ghc="$SCRIPT_DIR/gh-cached"
-if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi
-
+GH_READ="gh"; _ghc="$SCRIPT_DIR/gh-cached"; if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi
 # shellcheck source=lib/script-helper.sh
 source "$SCRIPT_DIR/lib/script-helper.sh"
 export LOOM_SCRIPT_HELPER_MISSING_RC=2
