@@ -524,6 +524,49 @@ pub fn pooled_profiles(root: &Path, registration: &Registration) -> Vec<PathBuf>
     out
 }
 
+/// Fixtures for other modules' tests: a profile holding exactly what
+/// `install` writes plus the operator's trust decision, keyed the way Codex
+/// keys it.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{sha256_hex, RECEIPT, SHARED_COMMAND};
+    use std::path::Path;
+
+    /// Make `profile` guard-ready for a run with `CODEX_HOME=runtime_home`
+    /// (`None`: a bare-metal run of the canonical profile path).
+    pub(crate) fn guard_ready(profile: &Path, runtime_home: Option<&Path>) {
+        std::fs::create_dir_all(profile).unwrap();
+        std::fs::write(
+            profile.join("hooks.json"),
+            serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+                {"type": "command", "command": SHARED_COMMAND, "timeout": 30}
+            ]}]}})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            profile.join(RECEIPT),
+            serde_json::json!({"loomManagedHook": {
+                "command": SHARED_COMMAND,
+                "commandSha256": sha256_hex(SHARED_COMMAND.as_bytes()),
+                "trustBaselineHashes": []
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let home = runtime_home
+            .map_or_else(|| profile.canonicalize().unwrap(), std::path::Path::to_path_buf);
+        std::fs::write(
+            profile.join("config.toml"),
+            format!(
+                "[hooks.state.\"{}/hooks.json:pre_tool_use:0:0\"]\ntrusted_hash = \"sha256:op\"\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+    }
+}
+
 #[cfg(test)]
 #[path = "codex_hooks_tests.rs"]
 mod tests;
