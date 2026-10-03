@@ -451,6 +451,17 @@ pub fn reader_for_at<'a>(
     owner_repo: &str,
     now: SystemTime,
 ) -> Option<&'a Identity> {
+    // #9986: the gateway owns the pool on a `required` egress host.
+    // `workspace_root()` is `None` when `WORKSPACE_ROOT` was never registered
+    // (CLI subcommands, not the daemon). Then only the env/machine policy tiers
+    // are consulted, so a repo-tier-only `required` policy is not honoured
+    // here — a deliberate fail-open for the repo tier alone: the daemon (which
+    // mints and publishes) registers its workspace at startup via
+    // `forge_identity::spawn_reader_refresh`, and
+    // env/machine `required` policies still apply.
+    if crate::forge_egress::publication::github_credential_forbidden(workspace_root()) {
+        return None;
+    }
     let n = roster.readers.len();
     let start = forge_read_pool::assignment_index(owner_repo, n)?;
     (0..n)

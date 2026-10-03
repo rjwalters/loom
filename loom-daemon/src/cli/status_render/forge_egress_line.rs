@@ -111,12 +111,34 @@ fn render(
     Some(out.join("\n"))
 }
 
+/// The `hosts.yml` publication rollback line (#9986), `None` when the last
+/// publication was not rolled back.
+fn rollback_line(rollback: Option<&Value>) -> Option<String> {
+    let r = rollback?;
+    let codes: Vec<&str> = r["codes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    Some(format!(
+        "               FINDING publication rolled back at {} for {} [{}] — previous profile restored",
+        r["at"].as_str().unwrap_or("?"),
+        r["dir"].as_str().unwrap_or("?"),
+        codes.join(", ")
+    ))
+}
+
 /// Print the block, or nothing when unconfigured.
 pub fn print() {
+    let ws = workspace();
     if let Some(block) =
-        render(&forge_egress::assert_for(&workspace()), cached().as_ref(), chrono::Utc::now())
+        render(&forge_egress::assert_for(&ws), cached().as_ref(), chrono::Utc::now())
     {
         println!("{block}");
+        if let Some(line) = rollback_line(forge_egress::publication::read_rollback(&ws).as_ref()) {
+            println!("{line}");
+        }
     }
 }
 
@@ -129,7 +151,11 @@ pub fn json() -> Value {
     if !fresh.is_configured() && cache.is_none() {
         return Value::Null;
     }
-    json!({"assert": fresh.to_json(), "last_doctor": cache})
+    json!({
+        "assert": fresh.to_json(),
+        "last_doctor": cache,
+        "publication_rollback": forge_egress::publication::read_rollback(&workspace()),
+    })
 }
 
 #[cfg(test)]
@@ -137,6 +163,14 @@ pub fn json() -> Value {
 mod tests {
     use super::*;
     use loom_daemon::forge_egress::policy::PolicySources;
+
+    #[test]
+    fn rollback_line_names_codes_and_dir_only() {
+        let rec = json!({"dir": "/w/.loom/gh-config", "codes": ["apiconfig.api-host-missing"], "at": "t"});
+        let line = rollback_line(Some(&rec)).unwrap();
+        assert!(line.contains("apiconfig.api-host-missing") && line.contains("/w/.loom/gh-config"));
+        assert!(rollback_line(None).is_none());
+    }
 
     #[test]
     fn unconfigured_renders_nothing() {
