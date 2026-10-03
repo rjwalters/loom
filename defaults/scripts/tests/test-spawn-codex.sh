@@ -1185,9 +1185,26 @@ run_preflight 78 "BUILDER (case-insensitive) -> exit 78" \
 run_preflight 78 "sweep-lifecycle (daemon sweep-child alias) -> exit 78" \
     LOOM_ROLE=sweep-lifecycle CODEX_HOME="$BARE_PROFILE"
 
-# (6) Read-only roles keep the conservative fallback, with an explicit warning.
-run_preflight 0 "judge + unprovisioned profile -> proceeds (read-only role)" \
+# (5b) Merging roles (#9390 follow-up): champion and judge do not write the
+# repository, but they merge / issue verdicts, so an unguarded session is
+# refused exactly like a mutable one — and they keep the read-only sandbox.
+run_preflight 78 "champion + unprovisioned profile -> exit 78 (merging role)" \
+    LOOM_ROLE=champion CODEX_HOME="$BARE_PROFILE"
+out="$PREFLIGHT_OUT"
+assert_contains "guarded=true" "$out" "the audit line marks champion as a guarded role"
+assert_not_contains "would-exec" "$out" "no codex argv is assembled for an unguarded merging role"
+run_preflight 78 "judge + unprovisioned profile -> exit 78 (merging role)" \
     LOOM_ROLE=judge CODEX_HOME="$BARE_PROFILE"
+run_preflight 78 "judge + installed-but-untrusted profile -> exit 78" \
+    LOOM_ROLE=judge CODEX_HOME="$UNTRUSTED_PROFILE"
+run_preflight 0 "champion + ready managed hook -> proceeds" \
+    LOOM_ROLE=champion CODEX_HOME="$READY_PROFILE"
+out="$PREFLIGHT_OUT"
+assert_contains "sandbox=read-only" "$out" "a guarded role keeps the read-only sandbox"
+
+# (6) Read-only roles keep the conservative fallback, with an explicit warning.
+run_preflight 0 "curator + unprovisioned profile -> proceeds (read-only role)" \
+    LOOM_ROLE=curator CODEX_HOME="$BARE_PROFILE"
 out="$PREFLIGHT_OUT"
 assert_contains "hook parity unavailable" "$out" \
     "a read-only role is told, explicitly, that hook parity is unavailable"

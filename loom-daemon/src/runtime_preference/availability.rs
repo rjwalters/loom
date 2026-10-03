@@ -211,6 +211,29 @@ fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
             detail: format!("{} could not be read: {error}", file.as_str()),
         };
     }
+    // A merging role may draw a Codex seat only when every seat it could draw
+    // runs Loom's guard hook (#9390 follow-up; see `codex_guard`). Otherwise
+    // the walk falls through to the next tap instead of selecting Codex and
+    // failing the tick in spawn-codex.sh's own fail-closed check.
+    if state.spawnable > 0 && super::codex_guard::guarded(&admitted.role) {
+        let unready = super::codex_guard::unready_profiles(root);
+        if unready.as_ref().map_or(true, |names| !names.is_empty()) {
+            return Availability::Exhausted {
+                source,
+                hold: PoolHold::Unprovisioned,
+                detail: match unready {
+                    Ok(names) => format!(
+                        "Loom's guard hook is not ready on Codex profile(s) {} for this \
+                         merging role ({}) — provision-codex-hooks.sh verify --all-profiles \
+                         --workspace <repo>; #9390",
+                        names.join(", "),
+                        admitted.role
+                    ),
+                    Err(reason) => format!("{reason} ({}) — #9390", admitted.role),
+                },
+            };
+        }
+    }
     if state.spawnable > 0 {
         return Availability::Spawnable {
             source,
