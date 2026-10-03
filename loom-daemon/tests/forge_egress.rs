@@ -149,6 +149,10 @@ fn run_row(
         gh_host: env_get("GH_HOST"),
         gh_repo: env_get("GH_REPO"),
         gh_config_dir,
+        // The fixture's single `gh.path` is 2am's one observed `gh` — the
+        // PATH `gh`, which in 2am is also what runs. Loom splits the two
+        // (#9995); a fixture row describes a host where they coincide.
+        path_gh: gh_path.clone(),
         gh: GhBuild {
             path: gh_path,
             version,
@@ -283,6 +287,10 @@ impl Sandbox {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // PATH's `gh` (what `toolchain.launcher-not-first` measures) is
+            // the same fake, so the verdict never depends on this host's PATH.
+            std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+            std::os::unix::fs::symlink(&gh, dir.path().join("bin/gh")).unwrap();
         }
         Self { dir }
     }
@@ -297,11 +305,18 @@ impl Sandbox {
             .args(args)
             .current_dir(self.path())
             .env_clear();
-        c.env("PATH", std::env::var("PATH").unwrap_or_default())
+        c.env("PATH", self.path_env())
             .env("HOME", self.path().join("home"))
             .env("LOOM_GH_BIN", self.path().join("gh"))
             .env("LOOM_SOCKET_PATH", self.path().join("loom-daemon.sock"));
         c
+    }
+
+    /// `PATH` with the sandbox's `bin/` first.
+    fn path_env(&self) -> std::ffi::OsString {
+        let mut dirs = vec![self.path().join("bin")];
+        dirs.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+        std::env::join_paths(dirs).unwrap()
     }
 
     fn policy(&self, mutate: impl FnOnce(&mut Value)) -> PathBuf {
@@ -478,4 +493,39 @@ fn spawn_worker_refuses_on_a_failing_assert_under_required() {
     assert!(stderr.contains("forge-egress"), "{stderr}");
     assert!(stderr.contains("policy.schema-version"), "{stderr}");
     assert!(!spawned.exists(), "no worker may be spawned");
+}
+
+/// #9995: once the daemon execs the policy launcher itself, the version floor
+/// measures that launcher while `toolchain.launcher-not-first` still measures
+/// the `gh` agents get from PATH.
+#[test]
+#[cfg(unix)]
+fn launcher_not_first_measures_path_even_when_the_daemon_execs_the_launcher() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new();
+    // PATH's gh: an unmanaged, below-floor build that is NOT the launcher.
+    let unmanaged = sb.path().join("bin/gh");
+    std::fs::remove_file(&unmanaged).unwrap();
+    std::fs::write(&unmanaged, "#!/bin/sh\necho 'gh version 2.97.0 (unmanaged)'\n").unwrap();
+    std::fs::set_permissions(&unmanaged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = sb.policy(|_| {});
+    let out = sb
+        .cmd(&["doctor", "--json"])
+        // No override: the exec target can only come from the policy rung.
+        .env_remove("LOOM_GH_BIN")
+        .env("LOOM_FORGE_EGRESS_POLICY", &path)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let routing = report["routing"]["findings"].to_string();
+    assert!(routing.contains("toolchain.launcher-not-first"), "{report:#}");
+    assert!(
+        !routing.contains("toolchain.below-api-host-floor"),
+        "the floor measures the exec target (the launcher), not PATH's gh: {report:#}"
+    );
+    let launcher = sb.path().join("gh").display().to_string();
+    assert_eq!(report["observed"]["ghPath"], launcher.as_str(), "{report:#}");
+    assert_eq!(report["observed"]["ghVersion"], "2.102.0");
+    assert_eq!(report["observed"]["pathGhPath"], unmanaged.display().to_string().as_str());
+    assert_eq!(out.status.code(), Some(1));
 }

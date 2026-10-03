@@ -87,6 +87,15 @@ impl Origin {
     /// must never be able to make the daemon execute something.
     #[must_use]
     pub fn may_run_canary(self) -> bool {
+        self.may_choose_executable()
+    }
+
+    /// Whether this origin is trusted to choose which executable the daemon
+    /// runs — `toolchain.launcherPath` as the `gh` resolver's first rung
+    /// (#9995). Same rule as [`Self::may_run_canary`]: env and machine
+    /// policies are operator-owned; a repo-local one is checkout content.
+    #[must_use]
+    pub fn may_choose_executable(self) -> bool {
         matches!(self, Self::Env | Self::Machine)
     }
 }
