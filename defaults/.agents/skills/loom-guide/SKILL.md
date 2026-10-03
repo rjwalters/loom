@@ -626,8 +626,9 @@ was blocked pre-approval and must **not** be promoted into the Builder queue.
 was_previously_approved() {
   local number="$1"
   # True if `loom:issue` appears anywhere in the issue's label event history.
-  gh api "repos/{owner}/{repo}/issues/${number}/events" \
-    --jq 'any(.[]; .event == "labeled" and .label.name == "loom:issue")' 2>/dev/null
+  # Repo-level endpoint: per-issue /events silently truncates on busy issues (#8742).
+  [ -n "$(gh api --paginate "repos/{owner}/{repo}/issues/events?per_page=100" \
+    --jq ".[] | select(.issue.number == ${number} and .event == \"labeled\" and .label.name == \"loom:issue\") | 1" 2>/dev/null | head -1)" ] && echo true || echo false
 }
 ```
 
@@ -727,12 +728,21 @@ a later pass to sort out.
 
 ### Unblocking Logic
 
+`has_permanent_block N` is true when a trusted author's comment (see
+`loom-daemon forge trusted-comments --fetch N`) or the issue body contains
+`<!-- loom:permanent-block -->`; nothing may then remove `loom:blocked`.
+Whenever an unblock path does remove it, it must post an audit comment.
+
 ```bash
 check_and_unblock() {
   "$GH_READ" issue list --label "loom:blocked" --state open --json number,body,title | jq -c '.[]' | while read -r issue; do
     local number=$(printf '%s\n' "$issue" | jq -r '.number')
     local body=$(printf '%s\n' "$issue" | jq -r '.body')
     local title=$(printf '%s\n' "$issue" | jq -r '.title')
+
+    # Permanent block (#8742): a trusted author's `<!-- loom:permanent-block -->`
+    # marker (comment or body, .loom/docs/comment-trust.md) is never auto-cleared.
+    [ "$(has_permanent_block "$number")" = "true" ] && continue
 
     local deps=$(parse_dependencies "$body")
 
