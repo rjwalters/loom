@@ -1043,34 +1043,17 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return;
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-
-        let mut edit = Command::new(&gh);
-        edit.arg("issue")
-            .arg("edit")
-            .arg(issue.to_string())
-            .arg("--add-label")
-            .arg("loom:blocked")
-            .arg("--remove-label")
-            .arg("loom:issue");
-        edit.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut edit,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            edit.arg("--repo").arg(repo);
-        }
-        // Bounded (Issue #3973): quarantine runs from `reap_once`, which is on
-        // the `ListSweeps` / `GetSweepStatus` read path.
+        // Counted as `quarantine.*` (#10089); the facade scopes each call to
+        // the registry's workspace (#5401 GH_CONFIG_DIR). Bounded (Issue
+        // #3973): quarantine runs from `reap_once`, on the `ListSweeps` /
+        // `GetSweepStatus` read path.
+        let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();
+        let issue_arg = issue.to_string();
+        let mut edit = vec!["issue", "edit", &issue_arg, "--add-label", "loom:blocked"];
+        edit.extend(["--remove-label", "loom:issue"]);
+        edit.extend(repo_flag.iter().map(String::as_str));
         let timeout = reap_gh_timeout();
-        match output_with_timeout(edit, timeout) {
+        match self.gh_write("quarantine.label", edit) {
             Ok(Some(_)) => {}
             Ok(None) => log::debug!(
                 "sweep_registry: quarantine label edit for #{issue} exceeded {}s, killed (#3973)",
@@ -1096,24 +1079,9 @@ impl SweepRegistry {
             ttl = self.effective_quarantine_ttl(issue).as_secs(),
             escalation = self.quarantine_escalation_note(issue),
         );
-        let mut comment = Command::new(&gh);
-        comment
-            .arg("issue")
-            .arg("comment")
-            .arg(issue.to_string())
-            .arg("--body")
-            .arg(body);
-        comment.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut comment,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            comment.arg("--repo").arg(repo);
-        }
-        match output_with_timeout(comment, timeout) {
+        let mut comment = vec!["issue", "comment", &issue_arg, "--body", &body];
+        comment.extend(repo_flag.iter().map(String::as_str));
+        match self.gh_write("quarantine.comment", comment) {
             Ok(Some(_)) => {}
             Ok(None) => log::debug!(
                 "sweep_registry: quarantine comment for #{issue} exceeded {}s, killed (#3973)",
@@ -1142,33 +1110,21 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return true;
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut edit = Command::new(&gh);
-        edit.arg("issue")
-            .arg("edit")
-            .arg(issue.to_string())
-            .arg("--remove-label")
-            .arg("loom:blocked")
-            .arg("--add-label")
-            .arg("loom:issue");
-        edit.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut edit,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            edit.arg("--repo").arg(repo);
-        }
-        // Bounded (Issue #3973): expire_quarantine runs from `reap_once`, on the
-        // `ListSweeps` / `GetSweepStatus` read path.
+        // Counted as `quarantine.release` (#10089). Bounded (Issue #3973):
+        // expire_quarantine runs from `reap_once`, on the read path.
+        let issue_arg = issue.to_string();
+        let mut edit = vec![
+            "issue",
+            "edit",
+            &issue_arg,
+            "--remove-label",
+            "loom:blocked",
+        ];
+        edit.extend(["--add-label", "loom:issue"]);
+        let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();
+        edit.extend(repo_flag.iter().map(String::as_str));
         let timeout = reap_gh_timeout();
-        match output_with_timeout(edit, timeout) {
+        match self.gh_write("quarantine.release", edit) {
             Ok(Some(output)) if output.status.success() => true,
             Ok(Some(output)) => {
                 log::warn!(
