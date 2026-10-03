@@ -1780,6 +1780,13 @@ jobs:
       # and host-side `tokens select`, so it needs the binary this job downloads.
       - name: spawn-claude credential egress proxy (#8697)
         run: bash defaults/scripts/tests/test-spawn-claude-credential-proxy.sh
+      # #8256: spawn-claude.sh / spawn-codex.sh compute their deny-specs via a
+      # real `loom-daemon role-tool-policy` call-out, so this suite's
+      # require-daemon-bin harness needs the binary this job downloads. Left
+      # to the hermetic runner (no Rust toolchain), it silently exercises the
+      # no-op degradation path instead of the injection it exists to pin.
+      - name: role-tool-policy spawn-time injection (#8256)
+        run: bash defaults/scripts/tests/test-role-tool-policy-spawn.sh
       # Moved out of shell-suite-tests by #8191 slice 1: merge-pr.sh's
       # closing-reference analysis now delegates to `loom-daemon`, so this
       # suite's require-daemon-bin harness needs the binary this job downloads.

@@ -73,6 +73,18 @@ check() {
 DANGER="rm -r""f /"
 
 # Build an isolated fake repo; returns its path on stdout.
+# Remove one fixture tree. A named helper rather than an inline `rm -rf` on a
+# variable because Loom's own live rm-scope guard (guards.rmScope) fails closed
+# on an unexpanded variable as an rm target — so authoring or editing a case
+# that spells it inline is itself blocked in a Loom session.
+cleanup_dir() {
+  local dir="${1:-}"
+  case "$dir" in
+    /tmp/*|/var/folders/*|/private/var/folders/*) rm -rf "$dir" ;;
+    *) echo "cleanup_dir: refusing to remove unexpected path '$dir'" >&2 ;;
+  esac
+}
+
 make_repo() {
   local repo
   repo="$(mktemp -d)"
@@ -152,16 +164,16 @@ check "dangerous payload still denied via vendored generic" \
   "$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision' 2>/dev/null)"
 rm -rf "$REPO"
 
-# --- Case 3: canonical present WITH ALL FOUR markers → dispatcher execs canonical ---
-echo "Case 3: canonical present with repo#29 marker, write-confinement marker, search/jq-mask markers, AND body-literal-at marker → canonical runs"
+# --- Case 3: canonical present WITH ALL FIVE markers → dispatcher execs canonical ---
+echo "Case 3: canonical present with repo#29, write-confinement, search/jq-mask, body-literal-at, AND role-tool-policy markers → canonical runs"
 REPO="$(make_repo)"
 # assemble the marker so this file itself has no literal 'repo#29' token
 MARK="repo#""29"
-printf '#!/usr/bin/env bash\n# fixed per %s\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\n# denies gh-comment-body-literal-at\necho CANON-RAN\nexit 0\n' "$MARK" \
+printf '#!/usr/bin/env bash\n# fixed per %s\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\n# denies gh-comment-body-literal-at\n# denies role-tool-policy:remote-shell\necho CANON-RAN\nexit 0\n' "$MARK" \
   > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
 chmod +x "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
 OUT="$(run_dispatcher "$REPO" "$DANGER")"
-check "canonical guard is exec'd (all four probes pass)" "CANON-RAN" \
+check "canonical guard is exec'd (all five probes pass)" "CANON-RAN" \
   "$(printf '%s' "$OUT" | grep -o 'CANON-RAN' | head -1)"
 rm -rf "$REPO"
 
@@ -293,6 +305,48 @@ check "no guard → exit 0" "0" "$RC"
 rm -rf "$REPO"
 
 
+# --- Case 12: canonical has probes (a)-(d) but NOT the role-tool-policy marker
+#     (#8256) → still vendored ---
+# The plausible real-world shape once rjwalters/repo ports the four earlier
+# fixes without also porting Loom's per-role tool restriction (which has no
+# upstream counterpart at all — it reads defaults/roles/*.json, a Loom concept).
+echo "Case 12: canonical has probes (a)-(d) but NOT the role-tool-policy marker → vendored generic runs (#8256)"
+REPO="$(make_repo)"
+printf '#!/usr/bin/env bash\n# fixed per %s\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\n# denies gh-comment-body-literal-at\necho CANON-RAN\nexit 0\n' "$MARK" \
+  > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+chmod +x "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+OUT="$(run_dispatcher "$REPO" "$DANGER")"
+check "role-tool-policy capability-gap canonical guard is NOT exec'd" "" \
+  "$(printf '%s' "$OUT" | grep -o 'CANON-RAN' | head -1)"
+check "dangerous payload still denied via vendored generic" \
+  "deny" \
+  "$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision' 2>/dev/null)"
+cleanup_dir "$REPO"
+
+# --- Case 13: regression AC (#8256) — the capability gap must not defeat the
+#     per-role restriction itself ---
+# With the same probe-(e)-missing canonical guard, a restricted role invoking
+# `ssh` must STILL be denied through the dispatcher — proving the vendored
+# fallback's per-role backstop ran, not the stub canonical guard. This is the
+# case that makes the probe worth having: without it, installing an unrelated
+# upstream release would silently disarm the control for every role at once.
+echo "Case 13: role-tool-policy capability-gap canonical guard → a restricted role's 'ssh' still denies through the dispatcher (#8256 regression)"
+REPO="$(make_repo)"
+printf '#!/usr/bin/env bash\n# fixed per %s\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\n# denies gh-comment-body-literal-at\necho CANON-RAN\nexit 0\n' "$MARK" \
+  > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+chmod +x "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+mkdir -p "$REPO/.loom/roles"
+printf '%s' '{"name":"Fixture RO","toolPolicy":{"allowedCapabilities":[]}}' \
+  > "$REPO/.loom/roles/fixture-restricted.json"
+OUT="$(printf '{"tool_name":"Bash","tool_input":{"command":"ssh deploy@example.com"},"cwd":"%s"}\n' "$REPO" \
+  | LOOM_ROLE=fixture-restricted bash "$REPO/.loom/hooks/guard-destructive.sh" 2>/dev/null)"
+check "role-tool-policy capability-gap canonical guard is NOT run" "" \
+  "$(printf '%s' "$OUT" | grep -o 'CANON-RAN' | head -1)"
+check "a restricted role's 'ssh' still denied via the vendored generic's per-role backstop" \
+  "deny" \
+  "$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision' 2>/dev/null)"
+cleanup_dir "$REPO"
+
 # --- Case 5: machine-level layout (Epic #3835 Phase 5, #4262) --------------
 # When the dispatcher runs from a checkout (SCRIPT_DIR does NOT sit at
 # <repo>/.loom/hooks), the SCRIPT_DIR-relative "../../" resolution would point
@@ -308,7 +362,7 @@ chmod +x "$CHECKOUT/defaults/hooks/"*.sh
 REPO="$(mktemp -d)"
 mkdir -p "$REPO/.claude/skills/repo/hooks"
 MARK="repo#""29"
-printf '#!/usr/bin/env bash\n# fixed per %s\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\n# denies gh-comment-body-literal-at\necho CANON-RAN\nexit 0\n' "$MARK" \
+printf '#!/usr/bin/env bash\n# fixed per %s\n# implements worktree-write-confinement\n# masks --comment|--search and --arg|--argjson\n# denies gh-comment-body-literal-at\n# denies role-tool-policy:remote-shell\necho CANON-RAN\nexit 0\n' "$MARK" \
   > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
 chmod +x "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
 OUT="$(printf '{"tool_input":{"command":"%s"},"cwd":"%s"}\n' "$DANGER" "$REPO" \

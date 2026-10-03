@@ -1199,6 +1199,75 @@ if [[ "$_loom_print_mode" == "true" ]]; then
 fi
 unset _loom_print_mode
 
+# --- Per-role tool restriction at session-spawn time (issue #8256) ---
+#
+# The role's own JSON declares which SENSITIVE CAPABILITIES it may reach:
+#
+#     "toolPolicy": { "allowedCapabilities": [] }        <- read-only roles
+#     "toolPolicy": { "allowedCapabilities": ["*"] }     <- builder/doctor/…
+#
+# ONE SOURCE. This block and guard-destructive-generic.sh's PER-ROLE
+# TOOL-RESTRICTION backstop read the SAME declaration; nothing is restated in
+# either. This is the first line — the session simply never has `ssh`, `aws`,
+# `gh secret` or a credential-store write in its permitted tool set — and the
+# guard hook is the backstop that still holds when this one is bypassed.
+#
+# WHY BOTH. `--disallowedTools` is a permission rule keyed on the Bash tool's
+# leading command text, so it is trivially evaded from inside the session
+# (`bash -c 'ssh …'`, a compound command, a shell function). That makes it a
+# useful first line and a useless sole line. The guard hook's segment parser
+# is what actually holds; this block is why a persuaded role has to go looking
+# for an evasion at all instead of simply typing the command.
+#
+# DEGRADATION CONTRACT, matching the safehouse block below: no resolvable role,
+# no role JSON, no `toolPolicy`, a `["*"]` allowlist, no `loom-daemon` binary
+# supporting `role-tool-policy`, or an operator who supplied their own
+# `--disallowedTools` ⇒ byte-for-byte no-op (nothing appended, one log line at
+# most). Never fails the spawn: a restriction that could not be computed must
+# not stop a worker from starting, because the guard hook enforces the same
+# policy either way.
+#
+# The role-name/alias resolution and the toolPolicy.allowedCapabilities ->
+# --disallowedTools spec computation both live in `loom-daemon role-tool-policy
+# deny-specs` (issue #8322) now — ported out of this `contract`-category script
+# because inlining them here is exactly the portable-shell growth
+# `shell-budget --check` refuses. This block is just the call-out.
+# requires-daemon: role-tool-policy optional   #8322/#8939 — merged when VERSION read 0.19.396, first shipped in the 0.19.397 post-merge bump; no binary, no subcommand, or a resolution error all degrade to the byte-for-byte no-op the DEGRADATION CONTRACT above already documents.
+if [[ -n "${LOOM_ROLE:-}" ]]; then
+    # Re-export the role so every child — the `claude` session, and through it
+    # every PreToolUse hook subprocess — sees the identity the guard backstop
+    # keys on. LOOM_ROLE normally arrives already exported from the daemon; a
+    # manual `LOOM_ROLE=curator spawn-claude.sh …` would otherwise reach the
+    # hooks only by accident of the caller's own export.
+    export LOOM_ROLE
+fi
+
+_loom_has_disallowed=false
+printf -v _loom_passthrough_str '%s\n' ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}
+grep -qE '^--disallowed-?[Tt]ools(=|$)' <<<"$_loom_passthrough_str" && _loom_has_disallowed=true
+
+if [[ -n "${LOOM_ROLE:-}" && "$_loom_has_disallowed" == "false" ]]; then
+    _loom_policy_bin="$(loom_locate_daemon_bin "$WORKSPACE" 2>/dev/null)"
+    if [[ -n "$_loom_policy_bin" ]] && command -v jq >/dev/null 2>&1; then
+        _loom_policy_record="$("$_loom_policy_bin" role-tool-policy deny-specs --json \
+            --workspace "$WORKSPACE" --roles-dir "${_script_dir}/../roles" 2>/dev/null)" || true
+        _loom_specs=()
+        while IFS= read -r _spec; do
+            [[ -n "$_spec" ]] || continue
+            _loom_specs+=("$_spec")
+        done < <(jq -r '.specs[]?' <<<"$_loom_policy_record" 2>/dev/null)
+        # `${arr[@]+…}` guard: bash 3.2 (macOS stock) treats an empty array
+        # expansion as an unbound variable under `set -u`.
+        if [[ "${#_loom_specs[@]}" -gt 0 ]]; then
+            PASSTHROUGH_ARGS+=(--disallowedTools "${_loom_specs[@]}")
+            log_info "spawn-claude: per-role tool restriction (#8256): role=$LOOM_ROLE denies ${#_loom_specs[@]} capabilities via ${#_loom_specs[@]} --disallowedTools specs (declared in $(jq -r '.roleJson // "unknown"' <<<"$_loom_policy_record"); guard-destructive-generic.sh enforces the same declaration as the backstop)"
+        fi
+    fi
+elif [[ "$_loom_has_disallowed" == "true" && -n "${LOOM_ROLE:-}" ]]; then
+    log_info "spawn-claude: per-role tool restriction (#8256): an explicit --disallowedTools was supplied, so none is injected for role=$LOOM_ROLE; the guard-hook backstop still enforces the role's declaration."
+fi
+unset _loom_has_disallowed _loom_passthrough_str _loom_policy_bin _loom_policy_record _loom_specs _spec
+
 # --- Optional safehouse MCP server injection (issue #3999) ---
 # When the `safehouse` config block is enabled and a socket + launch command
 # resolve, inject a session-scoped MCP config that adds the `safehouse` stdio
