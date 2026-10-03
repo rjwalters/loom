@@ -19,16 +19,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
+use crate::gh_invocation::gh_bin;
 use crate::proc_exec::{run_bounded, Completion};
-
-/// The `gh` binary to invoke. Honors `LOOM_GH_BIN` (tests / overrides), the
-/// same seam `forge_cmd::gh_bin`, `forge_cached_list`, and `role_collision`
-/// already use — so a fixture can steer these helpers without mutating the
-/// process-wide `PATH`, which races with every other concurrently-running
-/// test's `Command` spawn.
-fn gh_bin() -> String {
-    std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
-}
 
 fn gh_command(repo_root: &Path) -> Command {
     let mut cmd = Command::new(gh_bin());

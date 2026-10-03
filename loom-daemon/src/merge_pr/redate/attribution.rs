@@ -129,7 +129,7 @@ pub fn sanitize(value: &str) -> String {
 /// A reason string whenever no attribution can be produced; the caller falls
 /// back to the generic body.
 pub fn recompute(nwo: &str, pr: &str, head_sha: &str) -> Result<Attribution, String> {
-    recompute_with(&super::gh_bin(), nwo, pr, head_sha)
+    recompute_with(&crate::gh_invocation::gh_bin(), nwo, pr, head_sha)
 }
 
 /// [`recompute`], parameterized on the `gh` binary (the tests' seam).

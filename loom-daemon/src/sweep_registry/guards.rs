@@ -331,7 +331,7 @@ impl SweepRegistry {
     /// [`preflip_labels::classify_observed_labels`]'s (Issue #7873 — a snapshot
     /// missing `loom:issue` is unpromoted, not peer-claimed).
     pub(crate) fn classify_preflip_labels(&self, issue: u32) -> CollisionClass {
-        let gh = self.gh_bin_or_default();
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("issue")
             .arg("view")
@@ -491,7 +491,7 @@ impl SweepRegistry {
         // exactly as it did with `gh issue view --repo`. Returns `None` (fail
         // open) when the repo cannot be resolved.
         let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self.gh_bin_or_default();
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
@@ -807,7 +807,7 @@ impl SweepRegistry {
     /// reads as not-open here.
     fn pull_request_is_open(&self, pr: u32) -> Option<bool> {
         let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self.gh_bin_or_default();
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/pulls/{pr}"))
@@ -870,7 +870,7 @@ impl SweepRegistry {
         let Some((owner, repo)) = self.resolve_owner_repo() else {
             return OpenPrProbe::ProbeFailed;
         };
-        let gh = self.gh_bin_or_default();
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.args(crate::worktree_ops::gh::open_linked_pr_args(&owner, &repo, issue));
         // Resolve against this registry's own workspace, matching the label-flip
@@ -932,7 +932,7 @@ impl SweepRegistry {
         let Some((owner, repo)) = self.resolve_owner_repo() else {
             return OpenPrProbe::ProbeFailed;
         };
-        let gh = self.gh_bin_or_default();
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.args(crate::worktree_ops::gh::open_linked_pr_timeline_args(&owner, &repo, issue));
         cmd.current_dir(&self.config.workspace_root);
@@ -969,7 +969,7 @@ impl SweepRegistry {
     /// [`issue_is_closed_or_pr`]: Self::issue_is_closed_or_pr
     pub(crate) fn issue_is_pull_request(&self, issue: u32) -> Option<bool> {
         let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self.gh_bin_or_default();
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
@@ -1113,7 +1113,7 @@ impl SweepRegistry {
     /// any failure; callers treat that as "no declaration" (fail closed).
     pub(crate) fn issue_body_via_rest(&self, issue: u32) -> Option<String> {
         let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self.gh_bin_or_default();
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
@@ -1139,7 +1139,7 @@ impl SweepRegistry {
     /// a *successful* read and must stay distinguishable from a failed one.
     pub(crate) fn current_labels_via_rest(&self, issue: u32) -> Option<Vec<String>> {
         let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self.gh_bin_or_default();
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
@@ -1201,7 +1201,7 @@ impl SweepRegistry {
         {
             return Some(cached);
         }
-        let gh = self.gh_bin_or_default();
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("repo")
             .arg("view")
@@ -1238,7 +1238,7 @@ impl SweepRegistry {
     }
 
     pub(crate) fn flip_label_to_building(&self, issue: u32) -> Result<()> {
-        let gh = self.gh_bin_or_default();
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("issue")
             .arg("edit")
@@ -1352,13 +1352,14 @@ impl SweepRegistry {
     /// `post_watchdog_gaveup_comment`: a `gh` failure here only logs (at
     /// `warn`) and never propagates — posting a lease record must never fail
     /// dispatch or undo the claim it documents.
-    /// The configured `gh` binary, or `gh` on `PATH` — the default every
-    /// command builder in this file used to inline as a four-line block.
-    fn gh_bin_or_default(&self) -> PathBuf {
+    /// The configured `gh` binary, or the crate's single resolver
+    /// ([`crate::gh_invocation::gh_bin`]: policy launcher -> `LOOM_GH_BIN` ->
+    /// `PATH`) when no override is configured (#9985).
+    fn resolved_gh(&self) -> PathBuf {
         self.config
             .gh_bin
             .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"))
+            .unwrap_or_else(|| PathBuf::from(crate::gh_invocation::gh_bin()))
     }
 
     /// `body` for an issue comment with the #9772 dashboard footer appended —
@@ -1374,7 +1375,7 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return;
         }
-        let gh = self.gh_bin_or_default();
+        let gh = self.resolved_gh();
         let host = self.published_host_id();
         let body = format!(
             "{prefix}{host} sweep={sweep_id} -->\n\
@@ -1565,7 +1566,7 @@ impl SweepRegistry {
     /// [`parse_lease_comments_json`]: Self::parse_lease_comments_json
     pub(crate) fn read_lease_comments(&self, issue: u32) -> Option<Vec<LeaseComment>> {
         let (owner, repo) = self.resolve_owner_repo()?;
-        let gh = self.gh_bin_or_default();
+        let gh = self.resolved_gh();
         let mut cmd = Command::new(&gh);
         cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))
@@ -1900,7 +1901,7 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return;
         }
-        let gh = self.gh_bin_or_default();
+        let gh = self.resolved_gh();
         let host = self.published_host_id();
         let body = format!(
             "<!-- loom:lease-yield host={host} sweep={sweep_id} earliest_host={earliest_host} \

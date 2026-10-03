@@ -552,12 +552,6 @@ pub fn push_branch(
 
 // --- Forge reads ---------------------------------------------------------
 
-/// The `gh` binary, honoring `LOOM_GH_BIN` — the shared seam.
-#[must_use]
-pub fn gh_bin_env() -> String {
-    std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
-}
-
 /// Run `gh <args…>` in `root` with the per-root credential applied.
 fn gh(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let mut cmd = Command::new(gh_bin);

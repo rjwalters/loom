@@ -66,17 +66,10 @@ src/gh_repo_env.rs | let mut cmd = Command::new("gh");
 src/gh_repo_env.rs | let mut cmd = Command::new("gh");
 src/install_self_check.rs | let mut c = Command::new("gh");
 src/install_self_check.rs | let mut cmd = Command::new("gh");
-src/jev_merge_risk.rs | fn gh_bin() -> String {
-src/jev_tier.rs | fn gh_bin() -> String {
 src/merge_pr/consolidate.rs | let mut cmd = Command::new(gh_bin);
 src/merge_pr/consolidate.rs | let mut cmd = Command::new(gh_bin);
-src/merge_pr/consolidate.rs | pub fn gh_bin_env() -> String {
-src/merge_pr/head_sync/fetch.rs | fn gh_bin() -> String {
 src/merge_pr/head_sync/fetch.rs | let out = Command::new(gh_bin())
-src/merge_pr/redate.rs | fn gh_bin() -> String {
-src/merge_pr/sequence.rs | pub fn gh_bin() -> String {
 src/merge_pr/stacked_children.rs | let out = Command::new(gh)
-src/merge_pr/stale_checks/fetch.rs | fn gh_bin() -> String {
 src/merge_pr/stale_checks/fetch.rs | let out = Command::new(gh)
 src/metrics_collector.rs | let output = Command::new("gh")
 src/metrics_collector.rs | match Command::new("gh").args(["api", "rate_limit"]).output() {
@@ -103,7 +96,6 @@ src/safehouse.rs | let mut cmd = tokio::process::Command::new(gh_bin);
 src/star_liveness/forge.rs | let mut cmd = Command::new(&self.gh_bin);
 src/stash_retirement.rs | let output = Command::new("gh")
 src/sweep_outcome_summary.rs | let output = std::process::Command::new("gh")
-src/sweep_registry/guards.rs | fn gh_bin_or_default(&self) -> PathBuf {
 src/sweep_registry/guards.rs | let mut cmd = Command::new(&gh);
 src/sweep_registry/guards.rs | let mut cmd = Command::new(&gh);
 src/sweep_registry/guards.rs | let mut cmd = Command::new(&gh);
@@ -150,7 +142,6 @@ src/worktree_ops/clean.rs | let mut cmd = Command::new("gh");
 src/worktree_ops/clean.rs | let mut cmd = Command::new("gh");
 src/worktree_ops/clean.rs | let mut cmd = Command::new("gh");
 src/worktree_ops/clean.rs | let mut cmd = Command::new("gh");
-src/worktree_ops/gh.rs | fn gh_bin() -> String {
 src/worktree_ops/gh.rs | let mut cmd = Command::new(gh_bin());
 src/worktree_ops/landed.rs | let mut cmd = Command::new("gh");
 src/write_scope/probe.rs | let mut cmd = Command::new(&self.gh);
