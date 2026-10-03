@@ -1,7 +1,7 @@
-//! `loom-daemon forge token | is-fleet | identities | trusted-comments`
-//! (#9537, #9548): the scripts' entry point to the forge identity broker
-//! ([`loom_daemon::forge_identity`]) and the comment-trust predicate
-//! ([`loom_daemon::comment_trust`]).
+//! `loom-daemon forge token | is-fleet | identities | trusted-comments |
+//! verdict-stale-notice` (#9537, #9548, #9709): the scripts' entry point to the
+//! forge identity broker ([`loom_daemon::forge_identity`]) and the
+//! comment-trust predicate ([`loom_daemon::comment_trust`]).
 
 use std::path::{Path, PathBuf};
 
@@ -248,6 +248,34 @@ pub(crate) fn trusted_comments(
             std::process::exit(1)
         }
     }
+}
+
+/// `forge verdict-stale-notice` (#9709): the stale-verdict notice for the
+/// shell guard, from the template the daemon pass uses, attributed against the
+/// raw comment listing on stdin under this workspace's trust policy.
+pub(crate) fn verdict_stale_notice(
+    label: &str,
+    marker_sha: &str,
+    head_sha: &str,
+    source: &str,
+) -> Result<()> {
+    use loom_daemon::verdict_stale_notice as notice;
+    use std::io::Read;
+    let Some(kind) = notice::kind_for_label(label) else {
+        eprintln!("forge verdict-stale-notice: {label:?} is not a terminal verdict label");
+        std::process::exit(1)
+    };
+    let mut input = Vec::new();
+    let untrusted = std::io::stdin()
+        .read_to_end(&mut input)
+        .ok()
+        .and_then(|_| loom_daemon::comment_trust::parse_listing(&input))
+        .and_then(|items| {
+            let policy = loom_daemon::comment_trust::TrustPolicy::for_root(&workspace());
+            notice::untrusted_newer_marker(&policy, &items, kind)
+        });
+    println!("{}", notice::body(label, marker_sha, head_sha, "", untrusted.as_ref(), source));
+    Ok(())
 }
 
 /// Issue/PR `n`'s REST comment listing, with the issue/PR object itself first
