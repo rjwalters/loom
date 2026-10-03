@@ -855,6 +855,10 @@ enum Commands {
         action: CleanupAction,
     },
 
+    /// `collision-evidence` (#9786); see `cli::collision_evidence`.
+    #[command(flatten)]
+    CollisionEvidence(cli::collision_evidence::CollisionEvidenceTop),
+
     /// Native port of `loom-recover-orphans` (Issue #4272): detects `loom:building`
     /// issues with no live sweep tracking them and spawn-loop tasks with a
     /// stale heartbeat + dead PID, and (with `--recover`) resets them. Also
@@ -2354,6 +2358,7 @@ async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::OverlapReplay { action } => action.run(),
         Commands::Lease { action } => action.run(),
         Commands::Inflight { action } => action.run(),
+        Commands::CollisionEvidence(cmd) => cmd.run(),
         Commands::SweepExperiment { action } => handle_sweep_experiment_command(action),
         Commands::ValidatePhase {
             phase,
