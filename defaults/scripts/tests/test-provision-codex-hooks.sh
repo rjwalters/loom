@@ -26,6 +26,10 @@
 #       legacy receipt (no baseline field) falls back to trustSignal=
 #       legacy-coarse rather than losing readiness on a Loom upgrade, and the
 #       next install migrates it by grandfathering existing trust
+#   11. workspace-independent registration (issue #9390): one fixed command
+#       for every profile/workspace, ready from any workspace, executed the
+#       way Codex runs it (cwd -> main checkout's bridge, fail closed with
+#       exit 2), and private-session pinned entries never replaced
 #
 # Usage: ./defaults/scripts/tests/test-provision-codex-hooks.sh
 
@@ -392,6 +396,154 @@ jq -e 'has("hooks") | not' "$P7/hooks.json" >/dev/null 2>&1 \
     && pass "removal cleans up empty hooks structures" || fail "removal cleans up empty hooks structures ($(cat "$P7/hooks.json"))"
 r="$(run_provision remove --codex-home "$(new_profile heidi)")"
 [[ "${r%%|*}" == "0" ]] && pass "remove on a profile with no hooks.json is a no-op success" || fail "remove on a profile with no hooks.json is a no-op success"
+
+echo
+echo "=== workspace-independent registration (issue #9390) ==="
+# Two Loom workspaces sharing one pooled profile — the robb-studio shape that
+# #9390 measured (one daemon, 62 workspaces, a handful of account profiles).
+# Each is a real git checkout with its own installed bridge, plus a managed
+# worktree, so the registered command can be executed exactly as Codex would.
+make_ws() {
+    local ws="$1"
+    mkdir -p "$ws/.loom/hooks"
+    git -C "$ws" init -q -b main 2>/dev/null || git -C "$ws" init -q
+    git -C "$ws" -c user.email=t@example.invalid -c user.name=t commit -q --allow-empty -m init
+    # A recording stub stands in for the bridge: the property under test is
+    # WHICH bridge the registered command runs, from where, with which root.
+    cat > "$ws/.loom/hooks/guard-codex-bridge.sh" <<'STUB'
+#!/usr/bin/env bash
+printf 'bridge=%s args=%s\n' "${BASH_SOURCE[0]}" "$*" >> "${LOOM_TEST_BRIDGE_LOG:?}"
+exit 0
+STUB
+    chmod +x "$ws/.loom/hooks/guard-codex-bridge.sh"
+}
+WSA="$TMPROOT/ws-a"; WSB="$TMPROOT/ws-b"; WSN="$TMPROOT/ws-no-loom"
+make_ws "$WSA"; make_ws "$WSB"
+mkdir -p "$WSN"; git -C "$WSN" init -q 2>/dev/null
+git -C "$WSA" worktree add -q "$WSA/.loom/worktrees/issue-1" -b feature/issue-1 2>/dev/null
+mkdir -p "$WSA/.loom/worktrees/issue-1/src"
+WSA_REAL="$(cd "$WSA" && pwd -P)"; WSB_REAL="$(cd "$WSB" && pwd -P)"
+
+shared_verify() { # <profile> <workspace>
+    bash "$PROVISION" verify --codex-home "$1" --workspace "$2" --json 2>/dev/null
+}
+shared_cmd() { jq -r '.hooks.PreToolUse[] | .hooks[] | select(.command | contains("guard-codex-bridge.sh")) | .command' "$1/hooks.json"; }
+
+PS="$(new_profile shared-pool)"
+r="$(run_provision install --codex-home "$PS" --workspace "$WSA")"
+[[ "${r%%|*}" == "0" ]] && pass "workspace-independent install (no --bridge) exits 0" || fail "workspace-independent install exits 0 (got ${r%%|*})"
+CMD_A="$(shared_cmd "$PS")"
+grep -q -- '--loom-hook-version 2' <<<"$CMD_A" && pass "entry carries managed-hook version 2" || fail "entry carries managed-hook version 2 ($CMD_A)"
+if grep -qF "$WSA" <<<"$CMD_A"; then
+    fail "entry names no workspace path (got $CMD_A)"
+else
+    pass "entry names no workspace path"
+fi
+jq -e '.loomManagedHook.registration == "workspace-independent" and .loomManagedHook.workspace == ""' "$PS/loom-codex-hooks.json" >/dev/null 2>&1 \
+    && pass "receipt records registration=workspace-independent and no workspace" || fail "receipt records registration=workspace-independent"
+
+# Provisioning from the OTHER workspace changes nothing — byte-identical file,
+# so Codex's trust hash for the entry is untouched.
+cp "$PS/hooks.json" "$TMPROOT/hooks-after-a.json"
+run_provision install --codex-home "$PS" --workspace "$WSB" >/dev/null
+cmp -s "$PS/hooks.json" "$TMPROOT/hooks-after-a.json" \
+    && pass "installing for a second workspace leaves hooks.json byte-identical" \
+    || fail "installing for a second workspace leaves hooks.json byte-identical"
+PS2="$(new_profile shared-pool-2)"
+run_provision install --codex-home "$PS2" --workspace "$WSB" >/dev/null
+[[ "$(shared_cmd "$PS2")" == "$CMD_A" ]] && pass "two profiles provisioned from different workspaces carry the identical command" \
+    || fail "two profiles provisioned from different workspaces carry the identical command"
+
+# THE #9390 regression: one trusted profile is ready in EVERY workspace.
+trust_profile "$PS"
+va="$(shared_verify "$PS" "$WSA")"; vb="$(shared_verify "$PS" "$WSB")"
+jq -e '.ready == true and .registration == "workspace-independent"' <<<"$va" >/dev/null 2>&1 \
+    && pass "verify from workspace A -> ready" || fail "verify from workspace A -> ready (got $va)"
+jq -e '.ready == true' <<<"$vb" >/dev/null 2>&1 \
+    && pass "verify from workspace B (not the one that last provisioned) -> ready" || fail "verify from workspace B -> ready (got $vb)"
+if grep -q "different bridge" <<<"$va$vb"; then
+    fail "no 'different bridge than this workspace' verdict for a shared profile"
+else
+    pass "no 'different bridge than this workspace' verdict for a shared profile"
+fi
+# ...and a reinstall from B after trust keeps the trust (no fresh decision needed).
+run_provision install --codex-home "$PS" --workspace "$WSB" >/dev/null
+jq -e '.ready == true' <<<"$(shared_verify "$PS" "$WSA")" >/dev/null 2>&1 \
+    && pass "re-provisioning from another workspace never costs the profile its trust" \
+    || fail "re-provisioning from another workspace never costs the profile its trust"
+
+# A workspace with no installed bridge is not ready — the hook would deny there.
+vn="$(shared_verify "$PS" "$WSN")"
+jq -e '.ready == false and .bridgeReadable == false' <<<"$vn" >/dev/null 2>&1 \
+    && pass "a workspace with no .loom/hooks bridge -> not ready" || fail "a workspace with no .loom/hooks bridge -> not ready (got $vn)"
+
+# A pre-#9390 per-workspace (pinned v1) entry is stale under the shared check.
+PL="$(new_profile legacy-v1)"
+run_provision install --codex-home "$PL" --workspace "$WSA" --bridge "$WSA/.loom/hooks/guard-codex-bridge.sh" >/dev/null
+trust_profile "$PL"
+vl="$(shared_verify "$PL" "$WSA")"
+jq -e '.ready == false and .stale == true' <<<"$vl" >/dev/null 2>&1 && grep -q "pre-#9390" <<<"$vl" \
+    && pass "a legacy per-workspace entry is stale, with a reinstall remedy" || fail "a legacy per-workspace entry is stale (got $vl)"
+run_provision install --codex-home "$PL" --workspace "$WSA" >/dev/null
+[[ "$(shared_cmd "$PL")" == "$CMD_A" ]] && pass "install migrates a legacy entry to the shared command" || fail "install migrates a legacy entry"
+jq -e '.ready == false and .trustSignal == "baseline-diff-no-new-trust"' <<<"$(shared_verify "$PL" "$WSA")" >/dev/null 2>&1 \
+    && pass "the migrated entry needs ONE fresh trust decision (old trust is baselined)" \
+    || fail "the migrated entry needs one fresh trust decision"
+
+# Executing the registered command the way Codex does: `$SHELL -lc <command>`
+# with cwd = the session's cwd, payload on stdin.
+export LOOM_TEST_BRIDGE_LOG="$TMPROOT/bridge.log"
+run_hook() { # <cwd>  -> prints exit code
+    : > "$LOOM_TEST_BRIDGE_LOG"
+    (cd "$1" && printf '{}' | bash -c "$CMD_A" >/dev/null 2>"$TMPROOT/hook.err"); printf '%s' "$?"
+}
+c="$(run_hook "$WSA")"
+[[ "$c" == "0" ]] && grep -q "bridge=$WSA_REAL/.loom/hooks/guard-codex-bridge.sh args=--project-root $WSA_REAL --loom-hook-version 2" "$LOOM_TEST_BRIDGE_LOG" \
+    && pass "from checkout A the hook runs A's bridge with --project-root A" \
+    || fail "from checkout A the hook runs A's bridge (exit $c; $(cat "$LOOM_TEST_BRIDGE_LOG"))"
+c="$(run_hook "$WSA/.loom/worktrees/issue-1/src")"
+[[ "$c" == "0" ]] && grep -q "bridge=$WSA_REAL/.loom/hooks/guard-codex-bridge.sh args=--project-root $WSA_REAL " "$LOOM_TEST_BRIDGE_LOG" \
+    && pass "from a subdirectory of a managed worktree the hook runs the MAIN checkout's bridge" \
+    || fail "from a worktree subdirectory the hook runs the main checkout's bridge (exit $c; $(cat "$LOOM_TEST_BRIDGE_LOG"))"
+c="$(run_hook "$WSB")"
+[[ "$c" == "0" ]] && grep -q "bridge=$WSB_REAL/.loom/hooks/guard-codex-bridge.sh" "$LOOM_TEST_BRIDGE_LOG" \
+    && pass "the SAME command from checkout B runs B's bridge" || fail "the same command from checkout B runs B's bridge (exit $c)"
+c="$(run_hook "$WSN")"
+[[ "$c" == "2" ]] && grep -q "fail closed" "$TMPROOT/hook.err" \
+    && pass "a checkout with no bridge -> exit 2 (Codex's block), never a silent allow" || fail "a checkout with no bridge -> exit 2 (got $c)"
+c="$(run_hook "$TMPROOT")"
+[[ "$c" == "2" ]] && pass "outside any git repository -> exit 2" || fail "outside any git repository -> exit 2 (got $c)"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$WSB/.loom/hooks/guard-codex-bridge.sh"
+c="$(run_hook "$WSB")"
+[[ "$c" == "2" ]] && pass "a bridge that errors -> exit 2 (a hook failure is not an allow)" || fail "a bridge that errors -> exit 2 (got $c)"
+unset LOOM_TEST_BRIDGE_LOG
+
+# Private-clone session profiles keep their pinned, image-owned registration.
+PRIVROOT="$TMPROOT/priv-pool"
+mkdir -p "$PRIVROOT/plain" "$PRIVROOT/private" "$PRIVROOT/.private-sessions/private"
+printf '{}' > "$PRIVROOT/.private-sessions/private/workspace.json"
+cat > "$PRIVROOT/private/hooks.json" <<'EOF'
+{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/opt/loom/private-control/hooks/guard-codex-bridge.sh --project-root /workspace/repo --loom-hook-version 1","timeout":30}]}]}}
+EOF
+cp "$PRIVROOT/private/hooks.json" "$TMPROOT/private-hooks.json"
+r="$(run_provision install --codex-home "$PRIVROOT/private" --workspace "$WSA")"
+[[ "${r%%|*}" == "78" ]] && cmp -s "$PRIVROOT/private/hooks.json" "$TMPROOT/private-hooks.json" \
+    && pass "a workspace-independent install refuses to replace a private session's pinned entry" \
+    || fail "a workspace-independent install refuses to replace a private session's pinned entry (got ${r%%|*})"
+r="$(run_provision install --all-profiles --profile-root "$PRIVROOT" --workspace "$WSA")"
+[[ "${r%%|*}" == "0" ]] && cmp -s "$PRIVROOT/private/hooks.json" "$TMPROOT/private-hooks.json" \
+    && [[ "$(shared_cmd "$PRIVROOT/plain")" == "$CMD_A" ]] \
+    && pass "--all-profiles provisions ordinary profiles and skips private-session ones" \
+    || fail "--all-profiles skips private-session profiles (got ${r%%|*})"
+PP="$(new_profile pinned-private-elsewhere)"
+cp "$TMPROOT/private-hooks.json" "$PP/hooks.json"
+r="$(run_provision install --codex-home "$PP" --workspace "$WSA")"
+[[ "${r%%|*}" == "78" ]] && pass "an /opt/loom/private-control registration is never replaced even without session state" \
+    || fail "an /opt/loom/private-control registration is never replaced (got ${r%%|*})"
+# The pinned path itself is unchanged: private provisioning passes --bridge.
+r="$(run_provision install --codex-home "$PP" --workspace /workspace/repo --bridge "$BRIDGE")"
+[[ "${r%%|*}" == "0" ]] && grep -q -- "--project-root /workspace/repo --loom-hook-version 1" <<<"$(shared_cmd "$PP")" \
+    && pass "an explicit --bridge still writes the pinned v1 entry" || fail "an explicit --bridge still writes the pinned v1 entry"
 
 echo
 echo "=== credential hygiene ==="

@@ -50,8 +50,8 @@
 # `verify` therefore checks three things:
 #
 #   1. STRUCTURE — hooks.json contains Loom's managed entry at the expected
-#      version, and the bridge it names is readable and points at the current
-#      workspace's provisioned guard.
+#      version, and the bridge it will run for the current workspace is
+#      readable (see REGISTRATION MODES for which bridge that is).
 #   2. CODEX TRUST — a NEW `hooks.state` entry with a non-empty `trusted_hash`
 #      appeared since Loom's currently-installed entry was (re)provisioned
 #      (issue #5005's trust-baseline diff; see `read_trusted_hashes` and the
@@ -73,6 +73,45 @@
 # is one of the reasons `defaults/runtimes/codex.json` stays at
 # `hooks: partial` / `worktreeIsolation: partial` (see
 # defaults/docs/guardrail-parity-codex.md gap 11).
+#
+# ============================================================================
+# REGISTRATION MODES (issue #9390)
+# ============================================================================
+#
+# A profile (CODEX_HOME) belongs to an ACCOUNT, and every workspace on the
+# host dispatches through the same pooled profiles. So the managed entry a
+# profile carries must not name any one workspace.
+#
+#   workspace-independent (the default; `--loom-hook-version 2`)
+#       Written when no `--bridge` is given. The command is ONE fixed string,
+#       byte-identical for every profile, every workspace and every host (see
+#       LOOM_SHARED_HOOK_COMMAND). At hook time it resolves the repository the
+#       Codex session is running in from the hook's own cwd (Codex runs each
+#       hook with the session cwd; `git rev-parse --git-common-dir` maps a
+#       worktree back to its main checkout) and runs THAT checkout's
+#       `.loom/hooks/guard-codex-bridge.sh --project-root <checkout>`. If no
+#       readable bridge exists there, or the bridge fails, the command exits 2,
+#       which Codex treats as a block — never as an allow.
+#
+#       Because the command never changes, neither does Codex's trust hash
+#       for it: one operator trust decision per profile covers every
+#       workspace, and re-running `install` for another workspace is a no-op
+#       instead of silently re-pointing (and un-trusting) the profile. Before
+#       #9390 the entry baked in one workspace's bridge path, so whichever
+#       workspace provisioned a profile last "owned" it, `verify` refused every
+#       other workspace ("points at a different bridge than this workspace's"),
+#       and the trust recorded for the old command no longer matched.
+#
+#   pinned (`--bridge <path>` given; `--loom-hook-version 1`)
+#       The pre-#9390 shape, kept exactly for callers that must name one
+#       specific bridge: a private-clone session registers the image-owned,
+#       digest-sealed bridge under /opt/loom/private-control for its one
+#       fixed workspace (`loom-daemon private-workspace`, issue #8839), and
+#       its Rust admission compares the registration byte-for-byte.
+#
+# A workspace-independent `install` never replaces a pinned private-session
+# registration: it refuses for that profile (and `--all-profiles` skips it),
+# because the private session's admission depends on the sealed entry.
 #
 # ============================================================================
 # USAGE
@@ -126,10 +165,28 @@ log_error() { echo -e "${RED}[provision-codex-hooks] ERROR${NC} $*" >&2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Managed-entry contract. Bump LOOM_HOOK_VERSION whenever the bridge's wire
-# behavior changes in a way that invalidates a previously-trusted entry.
-LOOM_HOOK_VERSION=1
+# Managed-entry contract. Bump a version whenever the entry's wire behavior
+# changes in a way that invalidates a previously-trusted entry. The pinned
+# version is also compared by loom-daemon's private-session admission
+# (`private_workspace::bundle::HOOK_VERSION`), so it moves only together with
+# that constant.
+LOOM_HOOK_VERSION_PINNED=1
+LOOM_HOOK_VERSION_SHARED=2
 LOOM_HOOK_MARKER="guard-codex-bridge.sh"
+# The image-owned bridge a private-clone session pins (issue #8839).
+LOOM_PRIVATE_CONTROL_PREFIX="/opt/loom/private-control/"
+
+# The workspace-independent managed command (issue #9390). Evaluated by the
+# shell Codex runs hooks through (`$SHELL -lc`), in the Codex session's cwd.
+# It must stay ONE fixed string: Codex's hook-trust hash covers the command,
+# so any per-profile or per-workspace variation would cost a fresh trust
+# decision. It contains both the ownership marker (guard-codex-bridge.sh) and
+# the version marker. Exit 2 is Codex's "block" exit code for PreToolUse; any
+# other non-zero exit would be a hook FAILURE, which Codex does not treat as a
+# denial — so every failure path here is mapped to 2.
+# shellcheck disable=SC2016  # expanded at hook time, never here
+LOOM_SHARED_HOOK_COMMAND='root="$(cd "$(git rev-parse --git-common-dir 2>/dev/null || echo /nonexistent)/.." 2>/dev/null && pwd -P)" && bash "$root/.loom/hooks/guard-codex-bridge.sh" --project-root "$root" --loom-hook-version 2 || { echo "Loom guard: this workspace has no readable .loom/hooks/guard-codex-bridge.sh, or it failed; denying (fail closed, loom#9390)" >&2; exit 2; }'
+
 RECEIPT_NAME="loom-codex-hooks.json"
 CODEX_SCHEMA_PIN="0.146.0"
 
@@ -181,6 +238,28 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 78
 fi
 
+# Registration mode (issue #9390; see REGISTRATION MODES in the header).
+if [[ -n "$BRIDGE_ARG" ]]; then
+    REGISTRATION="pinned"
+    LOOM_HOOK_VERSION="$LOOM_HOOK_VERSION_PINNED"
+else
+    REGISTRATION="workspace-independent"
+    LOOM_HOOK_VERSION="$LOOM_HOOK_VERSION_SHARED"
+fi
+
+# private_session_state <profile dir>
+#
+# Prints the path of the private-clone session identity loom-daemon keeps for
+# this profile (`<profile root>/.private-sessions/<name>/workspace.json`,
+# `private_workspace::state_dir`) when it exists. Such a profile carries a
+# pinned registration its session admission depends on.
+private_session_state() {
+    local dir="${1%/}"
+    local state="${dir%/*}/.private-sessions/${dir##*/}/workspace.json"
+    [[ -f "$state" ]] && printf '%s' "$state"
+    return 0
+}
+
 # --- fan out over every pooled profile ------------------------------------
 #
 # Re-invokes THIS script once per profile with an explicit --codex-home, so the
@@ -201,6 +280,15 @@ if [[ "$ALL_PROFILES" == "1" ]]; then
     # containing spaces survives (read -d '').
     while IFS= read -r -d '' _profile; do
         [[ "$_profile" == "$_root" ]] && continue
+        if [[ "$REGISTRATION" == "workspace-independent" && "$COMMAND" != "remove" \
+              && -n "$(private_session_state "$_profile")" ]]; then
+            # A private-clone session's profile carries the pinned, image-owned
+            # registration (#8839). It is neither re-registered nor judged
+            # against the workspace-independent entry; `loom-daemon
+            # private-workspace` provisions and proves it.
+            log_info "Skipping Codex profile '$(basename "$_profile")': it backs a private-clone session (pinned registration, managed by loom-daemon private-workspace)."
+            continue
+        fi
         _seen=$((_seen + 1))
         _child_args=("$COMMAND" --codex-home "$_profile")
         [[ -n "$WORKSPACE_ARG" ]] && _child_args+=(--workspace "$WORKSPACE_ARG")
@@ -239,7 +327,11 @@ resolve_bridge() {
     local -a candidates=()
     [[ -n "$BRIDGE_ARG" ]] && candidates+=("$BRIDGE_ARG")
     [[ -n "$WORKSPACE_ARG" && -z "$BRIDGE_ARG" ]] && candidates+=("${WORKSPACE_ARG%/}/.loom/hooks/guard-codex-bridge.sh")
-    [[ -z "$BRIDGE_ARG" ]] && candidates+=("$SCRIPT_DIR/../hooks/guard-codex-bridge.sh")
+    # A workspace-independent entry runs the bridge of whatever checkout the
+    # session is in, so for a named workspace only ITS bridge is evidence; the
+    # provisioner's own sibling stands in only when no workspace was named.
+    [[ -z "$BRIDGE_ARG" && ( -z "$WORKSPACE_ARG" || "$REGISTRATION" != "workspace-independent" ) ]] \
+        && candidates+=("$SCRIPT_DIR/../hooks/guard-codex-bridge.sh")
     local candidate dir
     for candidate in ${candidates[@]+"${candidates[@]}"}; do
         if [[ -r "$candidate" ]]; then
@@ -261,15 +353,32 @@ resolve_bridge() {
 
 BRIDGE="$(resolve_bridge)"
 
-# The exact command string the managed entry carries. The workspace is baked in
-# so a bridge shared by several repos still resolves the right project root,
-# and the version marker makes Loom's entry self-identifying.
+# The exact command string the managed entry carries.
+#
+#   workspace-independent: the one fixed LOOM_SHARED_HOOK_COMMAND (#9390) — the
+#     workspace is resolved at hook time, never baked in.
+#   pinned: the named bridge, with the workspace baked in so that bridge
+#     resolves the right project root, plus the version marker that makes
+#     Loom's entry self-identifying.
 managed_command() {
+    if [[ "$REGISTRATION" == "workspace-independent" ]]; then
+        printf '%s' "$LOOM_SHARED_HOOK_COMMAND"
+        return 0
+    fi
     local cmd="$BRIDGE"
     if [[ -n "$WORKSPACE_ARG" ]]; then
         cmd="$cmd --project-root ${WORKSPACE_ARG%/}"
     fi
     printf '%s --loom-hook-version %s' "$cmd" "$LOOM_HOOK_VERSION"
+}
+
+# The command of Loom's managed entry currently registered in hooks.json, or
+# nothing. Callers have already validated the file parses.
+installed_loom_command() {
+    printf '%s' "$1" | jq -r --arg marker "$LOOM_HOOK_MARKER" '
+        [ (.hooks?.PreToolUse? // []) | .[]? | (.hooks? // []) | .[]?
+          | (.command? // "") | select(contains($marker)) ] | .[0] // empty
+    ' 2>/dev/null
 }
 
 sha256_of() {
@@ -365,6 +474,16 @@ do_install() {
         1) log_error "hooks.json exists in profile '$PROFILE_NAME' but is not readable."; return 78 ;;
         2) log_error "hooks.json in profile '$PROFILE_NAME' is not valid JSON. Refusing to overwrite an operator's config — fix or move it first."; return 78 ;;
     esac
+
+    if [[ "$REGISTRATION" == "workspace-independent" ]]; then
+        local prior_cmd
+        prior_cmd="$(installed_loom_command "$existing")"
+        if [[ -n "$(private_session_state "$CODEX_HOME_DIR")" || "$prior_cmd" == "$LOOM_PRIVATE_CONTROL_PREFIX"* ]]; then
+            log_error "Codex profile '$PROFILE_NAME' backs a private-clone session: its managed entry is the pinned, image-owned registration that session's admission depends on (#8839)."
+            log_error "Refusing to replace it with the workspace-independent entry. Provision it through 'loom-daemon private-workspace', or pass --bridge for an explicit pinned registration."
+            return 78
+        fi
+    fi
 
     local cmd matcher timeout
     cmd="$(managed_command)"
@@ -466,17 +585,19 @@ do_install() {
         --arg hash "$entry_hash" \
         --arg matcher "$matcher" \
         --arg schema "$CODEX_SCHEMA_PIN" \
-        --arg workspace "${WORKSPACE_ARG%/}" \
+        --arg workspace "$([[ "$REGISTRATION" == "pinned" ]] && printf '%s' "${WORKSPACE_ARG%/}")" \
+        --arg registration "$REGISTRATION" \
         --argjson trustBaseline "$baseline_json" \
         '{loomManagedHook: {version: ($version|tonumber), command: $command,
                             commandSha256: $hash, matcher: $matcher,
                             codexSchemaPin: $schema, workspace: $workspace,
+                            registration: $registration,
                             trustBaselineHashes: $trustBaseline}}' 2>/dev/null)" || receipt=""
     if [[ -n "$receipt" ]]; then
         atomic_write "$RECEIPT_FILE" "$receipt" || log_warn "Could not write the managed-hook receipt; verify will report the entry as unpinned."
     fi
 
-    log_info "Installed the managed PreToolUse hook (v$LOOM_HOOK_VERSION) into Codex profile '$PROFILE_NAME'."
+    log_info "Installed the managed PreToolUse hook (v$LOOM_HOOK_VERSION, $REGISTRATION) into Codex profile '$PROFILE_NAME'."
     log_info "Codex hook trust is NOT established by this command. Run 'CODEX_HOME=<profile> codex' once and accept the hook-trust prompt; Loom never passes --dangerously-bypass-hook-trust."
     return 0
 }
@@ -557,11 +678,7 @@ do_verify() {
     if [[ "$rc" -ne 0 ]]; then
         reason="hooks.json is unreadable or malformed"
     else
-        installed_cmd="$(printf '%s' "$existing" | jq -r \
-            --arg marker "$LOOM_HOOK_MARKER" '
-            [ (.hooks?.PreToolUse? // []) | .[]? | (.hooks? // []) | .[]?
-              | (.command? // "") | select(contains($marker)) ] | .[0] // empty
-        ' 2>/dev/null)" || installed_cmd=""
+        installed_cmd="$(installed_loom_command "$existing")" || installed_cmd=""
         [[ -n "$installed_cmd" ]] && installed=true
     fi
 
@@ -636,13 +753,29 @@ do_verify() {
             stale=true
             [[ -n "$reason" ]] || reason="the installed managed-hook entry does not match the pinned receipt (stale)"
         fi
-        # Version marker must match the version this script installs.
-        if [[ "$installed_cmd" != *"--loom-hook-version $LOOM_HOOK_VERSION"* ]]; then
+        # Version marker must match the version this script installs. (The
+        # workspace-independent check below compares the WHOLE command, which
+        # subsumes this, and gives the more useful reason.)
+        if [[ "$REGISTRATION" == "pinned" && "$installed_cmd" != *"--loom-hook-version $LOOM_HOOK_VERSION"* ]]; then
             stale=true
             [[ -n "$reason" ]] || reason="the installed managed-hook entry is not version $LOOM_HOOK_VERSION"
         fi
-        # The named bridge must be the one this workspace provisioned.
-        if [[ "$bridge_readable" == true && "$installed_cmd" != "$BRIDGE"* ]]; then
+        if [[ "$REGISTRATION" == "workspace-independent" ]]; then
+            # One fixed command for every workspace (#9390): which workspace
+            # last ran `install` is irrelevant, so there is no "different
+            # bridge" verdict. What must hold is that the entry IS that
+            # command — a pre-#9390 per-workspace entry, or a private
+            # session's pinned one, is not.
+            if [[ "$installed_cmd" != "$LOOM_SHARED_HOOK_COMMAND" ]]; then
+                stale=true
+                if [[ "$installed_cmd" == "$LOOM_PRIVATE_CONTROL_PREFIX"* ]]; then
+                    [[ -n "$reason" ]] || reason="this profile carries a private-clone session's pinned registration, not the workspace-independent entry"
+                else
+                    [[ -n "$reason" ]] || reason="the installed managed-hook entry is not the workspace-independent registration (a pre-#9390 per-workspace entry?); re-run install, then re-establish Codex hook trust once for this profile"
+                fi
+            fi
+        # Pinned: the named bridge must be the one this call named.
+        elif [[ "$bridge_readable" == true && "$installed_cmd" != "$BRIDGE"* ]]; then
             stale=true
             [[ -n "$reason" ]] || reason="the installed managed-hook entry points at a different bridge than this workspace's"
         fi
@@ -651,7 +784,11 @@ do_verify() {
     fi
 
     if [[ "$bridge_readable" != true ]]; then
-        reason="the managed hook bridge is missing or unreadable"
+        if [[ "$REGISTRATION" == "workspace-independent" ]]; then
+            reason="this workspace has no readable .loom/hooks/guard-codex-bridge.sh for the managed hook to run"
+        else
+            reason="the managed hook bridge is missing or unreadable"
+        fi
     elif [[ "$trusted" != true && -z "$reason" ]]; then
         if [[ "$trust_signal" == "baseline-diff-no-new-trust" ]]; then
             reason="Codex hook trust has not been (re-)established for this profile since Loom's managed hook was last (re)installed — hooks.state carries no trusted_hash beyond the pre-install baseline"
@@ -680,10 +817,12 @@ do_verify() {
             --argjson stale "$stale" \
             --argjson bridgeReadable "$bridge_readable" \
             --argjson version "$LOOM_HOOK_VERSION" \
+            --arg registration "$REGISTRATION" \
             --arg reason "$reason" \
             '{profile: $profile, ready: $ready, installed: $installed,
               trusted: $trusted, trustSignal: $trustSignal, stale: $stale,
-              bridgeReadable: $bridgeReadable, version: $version, reason: $reason}'
+              bridgeReadable: $bridgeReadable, version: $version,
+              registration: $registration, reason: $reason}'
     fi
 
     if [[ "$ready" == true ]]; then

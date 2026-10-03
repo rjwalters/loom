@@ -832,8 +832,9 @@ fi
 # Roles are therefore split by whether they mutate:
 #
 #   MUTABLE roles (builder, doctor) MUST prove the managed hook is installed at
-#   the expected version, pinned, readable, points at THIS workspace's bridge,
-#   and that the profile has established Codex hook trust. Any failure exits 78
+#   the expected version, pinned, that THIS workspace has a readable bridge for
+#   the workspace-independent entry to run (#9390), and that the profile has
+#   established Codex hook trust. Any failure exits 78
 #   BEFORE the CLI starts. `--dangerously-bypass-hook-trust` is never passed —
 #   #4495's scope guards forbid it, and waiving trust would defeat the very
 #   boundary this preflight exists to prove.
