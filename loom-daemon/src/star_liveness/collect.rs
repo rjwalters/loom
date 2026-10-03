@@ -15,13 +15,15 @@
 //!   the refusal quotes one of the specific forge phrases, one issue search
 //!   for that phrase (repeated each pass only while no open incident is
 //!   known; hits must be trusted-authored and quote it word-bounded);
-//! - one single-issue read per same-repo blocker (the blocker's state, and
-//!   its labels when it inherits a star).
+//! - one single-issue read per same-repo blocker or child (its state, and
+//!   its labels and body when it inherits a star), at most
+//!   [`MAX_DESCENDANTS_PER_PASS`] per repo.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::Result;
 
+use super::edges::{self, Edge, EdgeSource, Node, Root};
 use super::forge::StarForge;
 use super::landing::{
     classify, BlockerRef, Capacity, ItemFacts, Landing, MergeRefusal, PrFacts, StarFacts,
@@ -47,6 +49,11 @@ pub const PR_LABELS: &[&str] = &[
 
 /// How deep inheritance follows a chain of blockers.
 pub const MAX_INHERIT_DEPTH: usize = 3;
+
+/// Most inheriting issues one pass reads per repo, so a starred epic with
+/// many children costs a bounded number of reads (the rest wait for a later
+/// pass, after the first ones close).
+pub const MAX_DESCENDANTS_PER_PASS: usize = 50;
 
 /// Cached refusal detections, keyed by (repo, PR) and valid while the PR's
 /// `updated_at` is unchanged, plus the incident a signature search found
@@ -122,6 +129,7 @@ pub struct Evaluator<'a> {
     pub refusals: &'a mut RefusalCache,
     issues: HashMap<u32, Option<RestIssue>>,
     prs_by_issue: BTreeMap<u32, RestIssue>,
+    propagate: bool,
 }
 
 impl<'a> Evaluator<'a> {
@@ -137,7 +145,44 @@ impl<'a> Evaluator<'a> {
             refusals,
             issues: HashMap::new(),
             prs_by_issue: BTreeMap::new(),
+            propagate: true,
         }
+    }
+
+    /// Whether a star also reaches the children [`edges::child_edges`]
+    /// resolves (`autonomous.operatorPriority.propagate`), beyond the
+    /// liveness blockers. On by default.
+    #[must_use]
+    pub fn with_propagate(mut self, propagate: bool) -> Self {
+        self.propagate = propagate;
+        self
+    }
+
+    /// The children of `parent`: the issues its landing says inherit
+    /// (blockers, refusal incident, red-main fix), plus, with `propagate`,
+    /// every child its own text links ([`edges::child_edges`]).
+    fn children(&self, parent: u32, landing_inherits: &[u32]) -> Vec<Edge> {
+        let mut out: Vec<Edge> = landing_inherits
+            .iter()
+            .map(|&child| Edge {
+                parent,
+                child,
+                source: EdgeSource::LandingBlocker,
+            })
+            .collect();
+        if self.propagate {
+            if let Some(Some(issue)) = self.issues.get(&parent) {
+                let node = Node {
+                    number: issue.number,
+                    title: issue.title.as_deref().unwrap_or_default(),
+                    body: issue.body.as_deref().unwrap_or_default(),
+                    labels: &issue.labels,
+                    is_pull_request: issue.is_pull_request,
+                };
+                out.extend(edges::child_edges(self.ctx.slug, &node));
+            }
+        }
+        out
     }
 
     fn tick_row(&self, n: u32) -> Option<&ReadyQueueRow> {
@@ -436,37 +481,69 @@ impl<'a> Evaluator<'a> {
             .iter()
             .map(|i| self.evaluate_one(i, None, None))
             .collect();
-        let mut seen: BTreeSet<u32> = issues.iter().map(|i| i.number).collect();
-        let mut frontier: Vec<(u32, u32, Option<String>)> = out
+        let roots: Vec<Root> = out
             .iter()
-            .filter_map(|e| {
-                e.landing
-                    .inherits
-                    .map(|b| (b, e.facts.issue.number, e.starred_at.clone()))
+            .map(|e| Root {
+                number: e.facts.issue.number,
+                starred_at: e.starred_at.clone(),
             })
+            .collect();
+
+        // Explore breadth-first from every root at once, so each issue is
+        // expanded at its shallowest depth; then [`edges::descendants`]
+        // decides, per child, which starred ancestor it inherits from
+        // (earliest starred-at). Every open child inherits, not only the
+        // first one named (#10012).
+        let mut seen: BTreeSet<u32> = issues.iter().map(|i| i.number).collect();
+        let mut found: Vec<Evaluated> = Vec::new();
+        let mut graph: Vec<Edge> = Vec::new();
+        let mut frontier: Vec<(u32, Vec<u32>)> = out
+            .iter()
+            .map(|e| (e.facts.issue.number, e.landing.inherits.clone()))
             .collect();
         for _ in 0..MAX_INHERIT_DEPTH {
             let mut next = Vec::new();
-            for (blocker, from, at) in frontier {
-                if !seen.insert(blocker) {
-                    continue;
+            for (parent, inherits) in frontier {
+                for edge in self.children(parent, &inherits) {
+                    let child = edge.child;
+                    graph.push(edge);
+                    if !seen.insert(child) {
+                        continue;
+                    }
+                    if found.len() >= MAX_DESCENDANTS_PER_PASS {
+                        log::debug!(
+                            "star_liveness: {} reached {MAX_DESCENDANTS_PER_PASS} inheriting \
+                             issues this pass; #{child} waits for a later one",
+                            self.ctx.slug
+                        );
+                        continue;
+                    }
+                    let Some(issue) = self.issue(child) else {
+                        continue;
+                    };
+                    if issue.is_pull_request || !issue.state.eq_ignore_ascii_case("open") {
+                        continue;
+                    }
+                    let e = self.evaluate_one(&issue, None, None);
+                    next.push((child, e.landing.inherits.clone()));
+                    found.push(e);
                 }
-                let Some(issue) = self.issue(blocker) else {
-                    continue;
-                };
-                if issue.is_pull_request || !issue.state.eq_ignore_ascii_case("open") {
-                    continue;
-                }
-                let e = self.evaluate_one(&issue, Some(from), at);
-                if let Some(b) = e.landing.inherits {
-                    next.push((b, blocker, e.starred_at.clone()));
-                }
-                out.push(e);
             }
             if next.is_empty() {
                 break;
             }
             frontier = next;
+        }
+        let open: BTreeSet<u32> = found.iter().map(|e| e.facts.issue.number).collect();
+        graph.retain(|e| open.contains(&e.child));
+        let inherited = edges::descendants(&roots, &graph, MAX_INHERIT_DEPTH);
+        for mut e in found {
+            let Some(inh) = inherited.get(&e.facts.issue.number) else {
+                continue;
+            };
+            e.inherited_from = Some(inh.via);
+            e.starred_at = inh.starred_at.clone().or(e.starred_at);
+            out.push(e);
         }
         Ok(out)
     }
