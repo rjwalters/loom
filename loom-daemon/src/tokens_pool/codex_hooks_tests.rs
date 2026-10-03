@@ -261,6 +261,11 @@ fn only_trust_keyed_to_loom_where_codex_runs_counts() {
     }
     write(format!("# [hooks.state.\"{key}\"]\n# trusted_hash = \"h\"\n"));
     assert_eq!(check(None).trust_signal, "none");
+    // Codex drops a handler whose state says `enabled = false`, trusted or not.
+    write(format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"h\"\nenabled = false\n"));
+    let verdict = check(None);
+    assert_eq!((verdict.ready, verdict.trust_signal), (false, "disabled"));
+    assert!(verdict.reason.contains("DISABLED"), "{}", verdict.reason);
 
     // An adopted profile runs in its session container: host-keyed trust
     // does not count there, container-keyed trust does, and an explicit
@@ -278,4 +283,18 @@ fn only_trust_keyed_to_loom_where_codex_runs_counts() {
     ));
     assert!(check(None).ready);
     assert!(!check(Some(&host)).trusted);
+}
+
+#[test]
+fn a_profile_without_loom_entry_carries_no_loom_trust() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = profile(dir.path(), SHARED_COMMAND, None, &["h"]);
+    fs::write(
+        home.join("hooks.json"),
+        r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/opt/operator/audit.sh"}]}]}}"#,
+    )
+    .unwrap();
+    let runtime = home.canonicalize().unwrap();
+    assert_eq!(trust_at(&home, &runtime), (false, "wrong-location"));
+    assert!(keyed_trusted_hashes(&home.join("config.toml"), &BTreeSet::new()).is_empty());
 }

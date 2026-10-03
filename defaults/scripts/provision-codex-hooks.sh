@@ -124,6 +124,8 @@
 #                                    [--matcher <pattern>]
 #   provision-codex-hooks.sh verify  --codex-home <dir> [--workspace <dir>]
 #                                    [--bridge <path>] [--json]
+#                                    [--runtime-codex-home <dir>]  (CODEX_HOME
+#                                    as Codex will see it; default: derived)
 #   provision-codex-hooks.sh remove  --codex-home <dir>
 #
 # `--all-profiles` replaces `--codex-home` on any subcommand and applies it to
@@ -202,6 +204,7 @@ COMMAND="${1:-}"
 CODEX_HOME_ARG=""
 WORKSPACE_ARG=""
 BRIDGE_ARG=""
+RUNTIME_HOME_ARG=""
 MATCHER_ARG=""
 TIMEOUT_ARG=""
 JSON_OUT=0
@@ -219,6 +222,7 @@ while [[ $# -gt 0 ]]; do
         --workspace=*) WORKSPACE_ARG="${1#--workspace=}"; shift ;;
         --bridge) BRIDGE_ARG="${2:-}"; shift 2 || shift ;;
         --bridge=*) BRIDGE_ARG="${1#--bridge=}"; shift ;;
+        --runtime-codex-home) RUNTIME_HOME_ARG="${2:-}"; shift 2 || shift ;;
         --matcher) MATCHER_ARG="${2:-}"; shift 2 || shift ;;
         --matcher=*) MATCHER_ARG="${1#--matcher=}"; shift ;;
         --timeout) TIMEOUT_ARG="${2:-}"; shift 2 || shift ;;
@@ -279,6 +283,7 @@ if [[ "$COMMAND" == "verify" ]]; then
     [[ -n "$CODEX_HOME_ARG" ]] && _verify+=(--codex-home "$CODEX_HOME_ARG")
     [[ -n "$WORKSPACE_ARG" ]] && _verify+=(--workspace "${WORKSPACE_ARG%/}")
     [[ -n "$BRIDGE_ARG" ]] && _verify+=(--bridge "$BRIDGE_ARG")
+    [[ -n "$RUNTIME_HOME_ARG" ]] && _verify+=(--runtime-codex-home "$RUNTIME_HOME_ARG")
     [[ "$JSON_OUT" == "1" ]] && _verify+=(--json)
     if [[ -f "$SCRIPT_DIR/lib/script-helper.sh" ]]; then
         export LOOM_SCRIPT_HELPER_MISSING_RC=78
