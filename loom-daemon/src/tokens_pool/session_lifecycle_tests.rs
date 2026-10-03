@@ -1128,20 +1128,6 @@ fn gh_credential_dirs_mounts_only_daemon_owned_app_token_dirs() {
     );
     let token = repo.join(".loom/gh-config").display().to_string();
     assert!(args.contains(&format!("{token}:{token}:ro")), "{args:?}");
-
-    // A symlinked token dir, or a symlinked `.loom`, is never mounted: a
-    // session could otherwise aim it at any host directory (~/.ssh).
-    #[cfg(unix)]
-    {
-        let planted = tmp.path().join("GitHub/planted");
-        std::fs::create_dir_all(planted.join(".loom")).unwrap();
-        std::os::unix::fs::symlink(&personal, planted.join(".loom/gh-config")).unwrap();
-        assert!(gh_credential_dirs(std::slice::from_ref(&planted), None).is_empty());
-        let aliased = tmp.path().join("GitHub/aliased");
-        std::fs::create_dir_all(&aliased).unwrap();
-        std::os::unix::fs::symlink(repo.join(".loom"), aliased.join(".loom")).unwrap();
-        assert!(gh_credential_dirs(std::slice::from_ref(&aliased), None).is_empty());
-    }
 }
 
 #[test]

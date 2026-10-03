@@ -81,3 +81,30 @@ fn gh_credential_owners_include_the_registry_daemon_root_without_loom_workspace(
         vec![parent, daemon]
     );
 }
+
+/// A symlinked token dir, or a symlinked `.loom`, is never mounted: an owner
+/// root usually sits inside a read-write session mount, so a session could
+/// otherwise aim it at any host directory (~/.ssh) for the next start.
+#[cfg(unix)]
+#[test]
+fn gh_credential_dirs_never_follow_a_symlinked_loom_or_token_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let personal = tmp.path().join(".ssh");
+    let repo = tmp.path().join("GitHub/loom");
+    std::fs::create_dir_all(&personal).unwrap();
+    std::fs::create_dir_all(repo.join(".loom/gh-config")).unwrap();
+    assert_eq!(
+        gh_credential_dirs(std::slice::from_ref(&repo), None),
+        vec![repo.join(".loom/gh-config")]
+    );
+
+    let planted = tmp.path().join("GitHub/planted");
+    std::fs::create_dir_all(planted.join(".loom")).unwrap();
+    std::os::unix::fs::symlink(&personal, planted.join(".loom/gh-config")).unwrap();
+    assert!(gh_credential_dirs(std::slice::from_ref(&planted), None).is_empty());
+
+    let aliased = tmp.path().join("GitHub/aliased");
+    std::fs::create_dir_all(&aliased).unwrap();
+    std::os::unix::fs::symlink(repo.join(".loom"), aliased.join(".loom")).unwrap();
+    assert!(gh_credential_dirs(std::slice::from_ref(&aliased), None).is_empty());
+}
