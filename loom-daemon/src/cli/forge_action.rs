@@ -134,11 +134,25 @@ pub(crate) enum ForgeAction {
     /// probe could not answer (fail closed — NOT an absence). Zero
     /// forge-API calls: `git ls-remote` is the git wire protocol, so this
     /// works identically on GitHub and Gitea.
+    ///
+    /// `--branch NAME` probes NAME instead of `feature/issue-N` (#10027).
+    /// `--closed-pr-head` adds one forge read on an existing branch and exits
+    /// `6` (closed PR number on stdout) when its tip is the head of a PR
+    /// closed without merging, no open PR heads it, and the issue has no open
+    /// linked PR — a preserved closed head, not a competing PR. Without it,
+    /// zero forge-API calls.
     #[command(name = "check-branch")]
     CheckBranch {
         /// Issue number whose `feature/issue-N` branch you are about to push.
         #[arg(value_name = "ISSUE")]
         issue: u32,
+        /// Branch to probe instead of the default `feature/issue-N`.
+        #[arg(long, value_name = "BRANCH")]
+        branch: Option<String>,
+        /// Exit 6 instead of 0 when the existing branch is a closed-unmerged
+        /// PR's preserved head and the issue has no open linked PR.
+        #[arg(long)]
+        closed_pr_head: bool,
     },
 
     /// OPERATOR-ONLY: arm GitHub's server-side auto-merge for a PR. Not a
@@ -616,7 +630,15 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::CheckClaim { issue, force_claim } => {
             ForgeCmd::CheckClaim { issue, force_claim }
         }
-        ForgeAction::CheckBranch { issue } => ForgeCmd::CheckBranch { issue },
+        ForgeAction::CheckBranch {
+            issue,
+            branch,
+            closed_pr_head,
+        } => ForgeCmd::CheckBranch {
+            issue,
+            branch,
+            closed_pr_head,
+        },
         ForgeAction::AutoMerge {
             pr_number,
             method,
