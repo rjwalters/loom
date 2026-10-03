@@ -833,23 +833,37 @@ if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
         # message. Nothing is dispatched, so the sandbox is left as requested.
         SESSION_CONTAINER_MODE="docker-unavailable"
     else
+        # The labels say how the container was MEANT to be created; the
+        # HostConfig fields say how it actually was. Both are checked: a
+        # label alone does not make a container a boundary.
         _posture_inspect="$("$_posture_docker" inspect --format \
-            '{{.State.Running}}|{{index .Config.Labels "loom.session-posture"}}|{{index .Config.Labels "loom.workspace-mode"}}|{{range .Mounts}}{{.Destination}};{{end}}' \
+            '{{.State.Running}}|{{index .Config.Labels "loom.session-posture"}}|{{index .Config.Labels "loom.workspace-mode"}}|{{.HostConfig.Privileged}}|{{.HostConfig.NetworkMode}}|{{.HostConfig.PidMode}}|{{.HostConfig.IpcMode}}|{{range .HostConfig.CapDrop}}{{.}},{{end}}|{{range .HostConfig.CapAdd}}{{.}},{{end}}|{{range .HostConfig.SecurityOpt}}{{.}},{{end}}|{{range .Mounts}}{{.Source}};{{end}}|{{range .Mounts}}{{.Destination}};{{end}}' \
             "$CODEX_SESSION_CONTAINER" 2>/dev/null)" || _posture_inspect=""
-        # "<running>|<posture>|<workspace-mode>|<mount dest>;<mount dest>;..."
-        _posture_running="" _posture_label="" _workspace_mode=""
-        IFS='|' read -r _posture_running _posture_label _workspace_mode SESSION_CONTAINER_MOUNTS <<< "$_posture_inspect" || true
+        # "<running>|<posture>|<workspace-mode>|<privileged>|<network>|<pid>|<ipc>|
+        #  <capdrop>,...|<capadd>,...|<secopt>,...|<mount src>;...|<mount dest>;..."
+        _posture_running="" _posture_label="" _workspace_mode="" _hc_privileged="" _hc_net="" _hc_pid="" _hc_ipc="" _hc_capdrop="" _hc_capadd="" _hc_secopt="" _hc_sources=""
+        IFS='|' read -r _posture_running _posture_label _workspace_mode _hc_privileged _hc_net _hc_pid _hc_ipc _hc_capdrop _hc_capadd _hc_secopt _hc_sources SESSION_CONTAINER_MOUNTS <<< "$_posture_inspect" || true
+        _hc_violation=""
+        [[ "$_hc_privileged" == "false" ]] || _hc_violation+=" privileged=${_hc_privileged:-unknown}"
+        [[ "$_hc_net" != "host" && "$_hc_pid" != "host" && "$_hc_ipc" != "host" ]] || _hc_violation+=" host-namespace(net=$_hc_net,pid=$_hc_pid,ipc=$_hc_ipc)"
+        [[ ",$_hc_capdrop" == *",ALL,"* ]] || _hc_violation+=" cap-drop-ALL-missing"
+        [[ -z "$_hc_capadd" ]] || _hc_violation+=" cap-add=${_hc_capadd%,}"
+        [[ ",$_hc_secopt" == *",no-new-privileges,"* || ",$_hc_secopt" == *",no-new-privileges:true,"* ]] || _hc_violation+=" no-new-privileges-missing"
+        [[ "$_hc_secopt" != *unconfined* ]] || _hc_violation+=" security-opt=${_hc_secopt%,}"
+        [[ "$_hc_sources;$SESSION_CONTAINER_MOUNTS" != *docker.sock* ]] || _hc_violation+=" docker-socket-mounted"
         if [[ "$_posture_running" != "true" ]]; then
             # Missing or stopped: `session-exec host` refuses it with exit 78
             # and the `session start` fix. Nothing is dispatched, so the
             # sandbox is left as requested.
             SESSION_CONTAINER_MODE="not-running"
+        elif [[ "$_workspace_mode" != "private-clone" && "$_posture_label" != "container-boundary-v1" ]]; then
+            SESSION_CONTAINER_MODE="unhardened"
+        elif [[ -n "$_hc_violation" ]]; then
+            SESSION_CONTAINER_MODE="posture-mismatch"
         elif [[ "$_workspace_mode" == "private-clone" ]]; then
             SESSION_CONTAINER_MODE="private-clone"
-        elif [[ "$_posture_label" == "container-boundary-v1" ]]; then
-            SESSION_CONTAINER_MODE="host"
         else
-            SESSION_CONTAINER_MODE="unhardened"
+            SESSION_CONTAINER_MODE="host"
         fi
     fi
 
@@ -861,6 +875,12 @@ if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
         log_error "Session container $CODEX_SESSION_CONTAINER was created before the container-boundary hardening (issue #9979)."
         log_error "Codex runs with its own sandbox off inside a session container, so Loom only dispatches into a container created with the loom.session-posture=container-boundary-v1 label."
         log_error "Recreate it (this restarts the account's session container):"
+        log_error "  loom-daemon accounts session stop $CODEX_PROFILE_NAME"
+        log_error "  loom-daemon accounts session start $CODEX_PROFILE_NAME --mount-workspace <checkout parent>"
+        exit 78  # EX_CONFIG
+    elif [[ "$SESSION_CONTAINER_MODE" == "posture-mismatch" ]]; then
+        log_error "Session container $CODEX_SESSION_CONTAINER carries a hardened-posture label, but its actual settings are not hardened:$_hc_violation (issue #9979)."
+        log_error "Codex runs with its own sandbox off inside a session container, so Loom refuses to dispatch into it. Recreate it with loom-daemon:"
         log_error "  loom-daemon accounts session stop $CODEX_PROFILE_NAME"
         log_error "  loom-daemon accounts session start $CODEX_PROFILE_NAME --mount-workspace <checkout parent>"
         exit 78  # EX_CONFIG

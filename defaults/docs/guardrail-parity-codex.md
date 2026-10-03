@@ -484,6 +484,7 @@ container's labels (`docker inspect`) before dispatching:
 |---|---|
 | `loom.session-posture=container-boundary-v1` (host mode, created by this release's `session start`) | `-s danger-full-access`. The requested mode is kept in the audit line (`source=session-container-boundary requested=workspace-write via …`). |
 | `loom.workspace-mode=private-clone` (#8787) | Same. These containers were already created with the posture below, plus a read-only rootfs. |
+| Either label above, but the container's actual `HostConfig` is not hardened: `Privileged`, host network/PID/IPC, `CapDrop` without `ALL`, any `CapAdd`, no `no-new-privileges`, an `unconfined` security option, or a docker.sock mount | **exit 78**, naming the violation. The label records how the container was meant to be created, and the settings record how it was. Both have to agree before the sandbox comes off. |
 | A running host-mode container created before this release (no posture label) | **exit 78** with the recreate commands. Those containers mount the whole checkout parent and the Claude token pool, so Loom will not drop the sandbox in them. |
 | A missing or stopped container, or no `docker` | The sandbox stays as requested. Dispatch is refused anyway: `session-exec host` exits 78 for a container that isn't running, and a missing `docker` exits 127. |
 
@@ -498,8 +499,8 @@ tests pin it.
 | Surface | Exposure | Why |
 |---|---|---|
 | Account profile (`CODEX_HOME`) | read-write, this account only | The account's own `auth.json` refresh chain (ADR-0017 Decision 1). |
-| Repositories | read-write, **only roots in `~/.loom/workspaces.json`** under `--mount-workspace`, each at its own path | Dispatch runs `--workdir <worktree>`. Before #9979 the whole checkout parent (`~/GitHub`) was mounted, including repositories outside the fleet. A parent with no registered roots under it is refused. |
-| GitHub credential | read-only: the daemon's App installation-token dirs (`<daemon root>/.loom/gh-config`, `…/gh-config-by-owner`) | `spawn-codex.sh` forwards the dispatch's `GH_CONFIG_DIR` (a path, never a token), and only if that path is inside a mount. Personal `GH_CONFIG_DIR`s are never mounted. |
+| Repositories | read-write, **only roots in `~/.loom/workspaces.json`** under `--mount-workspace`, each at its own path | Dispatch runs `--workdir <worktree>`. Before #9979 the whole checkout parent (`~/GitHub`) was mounted, including repositories outside the fleet. A parent with no registered roots under it is refused. Explicitly denied whatever the registry says: `/`, the home directory and its ancestors, and any root that contains or sits inside a `firewall: true` repository in the cached fleet-store roster. A cached roster that cannot be parsed refuses the start. |
+| GitHub credential | read-only: the daemon's App installation-token dirs (`<daemon root>/.loom/gh-config`, `…/gh-config-by-owner`) | `spawn-codex.sh` forwards the dispatch's `GH_CONFIG_DIR` (a path, never a token), and only if that path is inside a mount. Personal `GH_CONFIG_DIR`s are never mounted. The `:ro` bind is added even when the dir is inside a mounted repository, where the daemon root is itself registered (robb-studio's `~/GitHub/loom`). It overlays the read-write repository mount, so the daemon's `hosts.yml` can't be rewritten from inside. |
 | Claude token pool (`~/.loom/tokens`) | **not mounted** (was read-only before #9979) | Codex doesn't need it. With the sandbox off, the model can read any mounted file. |
 | Operator `~/.config/gh` | **not mounted** (was read-only before #9979) | On Linux hosts it holds a personal OAuth token in plaintext. |
 | Docker socket, host network/PID namespace | never | — |
@@ -525,9 +526,15 @@ tests pin it.
   Read-only roles never relied on that hook. For mutable roles
   (builder/doctor), use private-clone mode, which binds those files
   read-only.
-- **Registered repositories.** Every registered repository is read-write.
-  That is no wider than a Claude role on the same host, whose guard hooks
-  are also in-repo files.
+- **Registered repositories, including files the host executes.** Every
+  registered repository is read-write in full, not just the dispatch
+  worktree. That includes files that later run **on the host**, outside the
+  container: the main checkout's `.git/hooks/*` (the host daemon's own `git`
+  runs them), `.loom/scripts`, `.loom/hooks` and `.claude/` settings. For
+  code execution, a host-mode container is therefore not a boundary against
+  the host daemon's account. That is no wider than a Claude role, which runs
+  on the host with the same reach. If you need a real boundary, use
+  private-clone mode (#8787), which mounts no host workspace.
 
 **Rollout.** Existing session containers keep their old mounts until they are
 recreated. `spawn-codex.sh` refuses to use them (exit 78) instead of dropping

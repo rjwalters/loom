@@ -182,15 +182,14 @@ pub fn workspace_mount_roots(workspace: &Path, registered: &[PathBuf]) -> Result
 /// Only those two daemon-shaped directories are ever returned — never an
 /// arbitrary `GH_CONFIG_DIR`, which in an operator's shell may be a personal
 /// `gh` login. `owners` are candidate daemon roots; `env_gh_config` names one
-/// more root when it has the daemon's shape. Directories already inside a
-/// mounted root are left to that mount. Directory (not file) binds, so the
-/// daemon's atomic hosts.yml refresh stays visible inside the container.
+/// more root when it has the daemon's shape. A directory inside a mounted
+/// (read-write) repository is still returned: its `:ro` bind overlays the
+/// repository mount (Docker mounts the deeper destination last), so the
+/// token dir is read-only inside the container even when the daemon root is
+/// itself a registered repository (robb-studio's `~/GitHub/loom`). Directory
+/// (not file) binds, so the daemon's atomic hosts.yml refresh stays visible.
 #[must_use]
-pub fn gh_credential_dirs(
-    owners: &[PathBuf],
-    env_gh_config: Option<&Path>,
-    mounted_roots: &[PathBuf],
-) -> Vec<PathBuf> {
+pub fn gh_credential_dirs(owners: &[PathBuf], env_gh_config: Option<&Path>) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = owners.to_vec();
     if let Some(dir) = env_gh_config {
         let loom_dir = match dir.file_name().and_then(|name| name.to_str()) {
@@ -217,15 +216,84 @@ pub fn gh_credential_dirs(
             crate::credential_preflight::github_app_gh_config_dir(&root),
             root.join(".loom").join("gh-config-by-owner"),
         ] {
-            if dir.is_dir()
-                && !mounted_roots.iter().any(|mounted| dir.starts_with(mounted))
-                && !dirs.contains(&dir)
-            {
+            if dir.is_dir() && !dirs.contains(&dir) {
                 dirs.push(dir);
             }
         }
     }
     dirs
+}
+
+/// Refuse mount roots a host-mode session container must never receive,
+/// whatever the registry says (issue #9979). With Codex's sandbox off, every
+/// mounted file is readable and writable by the model, so this is an explicit
+/// deny rather than a consequence of what happens to be registered:
+///
+/// * `/`, the home directory, or any ancestor of it — that would expose
+///   `~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.loom/tokens`, `~/.cloudflare`.
+///   (A home directory that is a git checkout, or a registered `~`, would
+///   otherwise pass [`workspace_mount_roots`] as "one repository".)
+/// * any root that contains, or lies inside, a `firewalled` repository
+///   (`firewall: true` in the fleet roster, [`firewalled_repo_paths`]).
+pub fn check_mount_denials(
+    roots: &[PathBuf],
+    home: Option<&Path>,
+    firewalled: &[PathBuf],
+) -> Result<()> {
+    let normalize = crate::workspace_registry::normalize_path;
+    let home = home.map(normalize);
+    for root in roots {
+        let root = normalize(root);
+        if root.parent().is_none() || home.as_ref().is_some_and(|h| h.starts_with(&root)) {
+            bail!(
+                "refusing to mount {} into a session container: it is the filesystem root, the \
+                 home directory, or an ancestor of it, and Codex runs with its own sandbox off \
+                 there (issue #9979). Pass --mount-workspace <checkout parent or repo>",
+                root.display()
+            );
+        }
+        for wall in firewalled {
+            let wall = normalize(wall);
+            if wall.starts_with(&root) || root.starts_with(&wall) {
+                bail!(
+                    "refusing to mount {} into a session container: it overlaps {}, which the \
+                     fleet roster marks firewall: true (issue #9979)",
+                    root.display(),
+                    wall.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `firewall: true` repository paths in the fleet roster (`repos.yml`),
+/// read from the fleet-store cache the daemon's sync already keeps — never
+/// fetched here, and deny-only, so a stale cache can only under-deny, never
+/// widen a mount (issue #9979). `Ok(empty)` when no store is configured or
+/// nothing is cached yet; `Err` when a cached roster exists but cannot be
+/// read or parsed, so a broken firewall input fails closed.
+pub fn firewalled_repo_paths(workspace: &Path) -> Result<Vec<PathBuf>> {
+    use crate::fleet_store::{self as store, fetch, roster};
+    let effective = crate::config_resolver::resolve_effective_config(workspace);
+    let Some(location) = store::resolve_location(&effective, &|k| std::env::var(k).ok())? else {
+        return Ok(Vec::new());
+    };
+    let cache = store::default_cache_dir(&location)?;
+    let Some(snapshot) = fetch::read_cache(&cache, &location)? else {
+        return Ok(Vec::new());
+    };
+    let Some(text) = snapshot.text(store::ROSTER_PATH)? else {
+        return Ok(Vec::new());
+    };
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
+    let parsed = roster::parse(&text, &home).context("fleet roster (firewall input)")?;
+    Ok(parsed
+        .records
+        .iter()
+        .filter(|record| record.firewall)
+        .map(|record| parsed.root.join(&record.dir))
+        .collect())
 }
 
 /// The full `docker run` argv for a host-mode session container (issue
@@ -569,13 +637,15 @@ impl ContainerRunner for ProcessContainerRunner {
             .map(|registry| registry.roots())
             .unwrap_or_default();
         let roots = workspace_mount_roots(workspace, &registered)?;
+        let firewalled = firewalled_repo_paths(workspace)?;
+        check_mount_denials(&roots, dirs::home_dir().as_deref(), &firewalled)?;
         // Daemon-owned App-token dirs for `gh` (see `gh_credential_dirs`):
         // the session workspace, the daemon's own `LOOM_WORKSPACE`, and the
         // owner of a daemon-shaped `GH_CONFIG_DIR` in this process's env.
         let mut owners = vec![workspace.to_path_buf()];
         owners.extend(std::env::var_os("LOOM_WORKSPACE").map(PathBuf::from));
         let env_gh = std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from);
-        let credentials = gh_credential_dirs(&owners, env_gh.as_deref(), &roots);
+        let credentials = gh_credential_dirs(&owners, env_gh.as_deref());
         let args =
             host_session_run_args(container, image, codex_home, workspace, &roots, &credentials);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();

@@ -1085,13 +1085,11 @@ fn gh_credential_dirs_mounts_only_daemon_owned_app_token_dirs() {
     ] {
         std::fs::create_dir_all(dir).unwrap();
     }
-    let mounted = vec![repo.clone()];
 
     // The daemon root named by a daemon-shaped GH_CONFIG_DIR is found.
     let dirs = gh_credential_dirs(
         &[tmp.path().join("GitHub")],
         Some(&daemon.join(".loom/gh-config-by-owner/2AMLogic")),
-        &mounted,
     );
     assert_eq!(
         dirs,
@@ -1102,8 +1100,67 @@ fn gh_credential_dirs_mounts_only_daemon_owned_app_token_dirs() {
     );
 
     // A personal GH_CONFIG_DIR is never mounted.
-    assert!(gh_credential_dirs(&[], Some(&personal), &mounted).is_empty());
+    assert!(gh_credential_dirs(&[], Some(&personal)).is_empty());
 
-    // A dir already inside a mounted repository is left to that mount.
-    assert!(gh_credential_dirs(std::slice::from_ref(&repo), None, &mounted).is_empty());
+    // A token dir inside a mounted (read-write) repository is STILL returned,
+    // so its `:ro` bind overlays the repository mount: the daemon's hosts.yml
+    // must never be writable from a sandbox-off container (robb-studio's
+    // daemon root is the registered `~/GitHub/loom`).
+    assert_eq!(
+        gh_credential_dirs(std::slice::from_ref(&repo), None),
+        vec![repo.join(".loom/gh-config")]
+    );
+    let args = host_session_run_args(
+        "c",
+        "img",
+        Path::new("/p"),
+        &repo,
+        std::slice::from_ref(&repo),
+        &gh_credential_dirs(std::slice::from_ref(&repo), None),
+    );
+    let token = repo.join(".loom/gh-config").display().to_string();
+    assert!(args.contains(&format!("{token}:{token}:ro")), "{args:?}");
+}
+
+#[test]
+fn check_mount_denials_refuses_home_its_ancestors_and_the_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = crate::workspace_registry::normalize_path(tmp.path()).join("home/u");
+    std::fs::create_dir_all(home.join("GitHub/loom")).unwrap();
+    for bad in [
+        home.clone(),
+        home.parent().unwrap().to_path_buf(),
+        PathBuf::from("/"),
+    ] {
+        let err = check_mount_denials(std::slice::from_ref(&bad), Some(&home), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("home directory"), "{bad:?}: {err}");
+    }
+    // A home reached through `..` is still the home directory.
+    let dotted = home.join("GitHub/..");
+    assert!(check_mount_denials(&[dotted], Some(&home), &[]).is_err());
+    // Repositories under home are fine.
+    assert!(check_mount_denials(&[home.join("GitHub/loom")], Some(&home), &[]).is_ok());
+}
+
+#[test]
+fn check_mount_denials_refuses_any_root_overlapping_a_firewalled_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = crate::workspace_registry::normalize_path(tmp.path());
+    let wall = vec![base.join("GitHub/notebook")];
+    for bad in [
+        base.join("GitHub/notebook"),     // the repo itself
+        base.join("GitHub"),              // a parent that contains it
+        base.join("GitHub/notebook/sub"), // a path inside it
+    ] {
+        let err = check_mount_denials(std::slice::from_ref(&bad), None, &wall)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("firewall: true"), "{bad:?}: {err}");
+    }
+    assert!(check_mount_denials(&[base.join("GitHub/loom")], None, &wall).is_ok());
+    // A sibling whose name merely starts with the firewalled one is fine
+    // (component-wise, not string-prefix, comparison).
+    assert!(check_mount_denials(&[base.join("GitHub/notebook-public")], None, &wall).is_ok());
 }

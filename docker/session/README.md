@@ -188,9 +188,15 @@ therefore creates the container with:
 - the account profile read-write at `CODEX_HOME`;
 - **only the registered repositories** (`~/.loom/workspaces.json`) under
   `--mount-workspace`, read-write at path parity, not the whole parent;
-- the daemon's GitHub App token dirs, read-only;
+- never `/`, the home directory or its ancestors, nor anything overlapping a
+  `firewall: true` repository in the cached fleet roster (explicit deny);
+- the daemon's GitHub App token dirs, read-only (overlaid read-only even
+  inside a mounted repository);
 - the label `loom.session-posture=container-boundary-v1`. `spawn-codex.sh`
-  won't dispatch into a host-mode container without it.
+  won't dispatch into a host-mode container without it, and also checks the
+  container's actual `HostConfig` (no privileged mode, host namespaces, added
+  caps, `unconfined` or docker.sock; `CapDrop ALL` and `no-new-privileges`
+  present).
 
 The Claude token pool and the operator's `~/.config/gh` are no longer mounted.
 [`defaults/docs/guardrail-parity-codex.md`](../../defaults/docs/guardrail-parity-codex.md#session-containers-the-container-is-the-boundary-issue-9979)
