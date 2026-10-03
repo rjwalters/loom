@@ -48,7 +48,7 @@ An agent reaches a human in exactly two ways: a call is a decision, a human task
 1. **It needs a call made:** file a decision (`loom:operator-decision`, 2 to 4 ranked options, each with a why).
 2. **It needs a human to do something:** send one keyed mail to the loom-ui inbox saying in a sentence what to do, and resolve it when the item clears. Helper, key scheme and no-op-when-unconfigured behavior: [`inbox-mail.md`](inbox-mail.md).
 
-Nothing else asks a human. The `loom:operator*` labels keep their engine meaning (skip, hold, dispatch lanes) and no label is removed; they are engine-internal, not how a human finds out. First user: the Champion critical-file hold (one mail once the PR is otherwise mergeable). Remaining holds are tracked on #10000.
+Nothing else asks a human. The `loom:operator*` labels keep their engine meaning (skip, hold, dispatch lanes) and no label is removed; they are engine-internal, not how a human finds out. Per label: `loom:operator-mechanical` sends one mail (`mechanical-issue`/`mechanical-pr` key); `loom:operator-objective` is filed as a `loom:operator-decision` (the candidate objectives are the options); `loom:operator-blocked` sends nothing (a wait on another issue is not a human's move). The Champion critical-file hold sends one mail once the PR is otherwise mergeable.
 
 ## Definition
 

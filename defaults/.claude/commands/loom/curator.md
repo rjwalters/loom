@@ -906,7 +906,7 @@ it, do it, or leave it in the normal queue. Park only for (a) a PO-level
 design/authority call agents cannot make: `loom:operator-decision`, the
 comment ranking 2-4 options, each with a why; or (b) a step needing a human's
 hands (credential, host access, hardware): `loom:operator-mechanical`, the
-comment naming the exact step (mail it per #10000 once that lane ships).
+comment naming the exact step, plus one mail (below).
 `loom:operator-blocked` is a self-clearing wait, not a human ask. Before
 applying any operator label, the comment states what an agent tried or why it
 structurally cannot. This is the fleet's one statement of the rule; other
@@ -929,7 +929,7 @@ Champion's exclusions, the Priority-2 query above) is unchanged:
 | `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
 | `loom:operator-mechanical` | Needs a human's hands: host or admin access, a credential, hardware — no judgement required |
 | `loom:operator-decision` | The act requires authority an agent structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) |
-| `loom:operator-objective` | Determined once the operator states an objective — list the candidate objectives and the answer under each (#5826); a missing objective is this, not `-decision` |
+| `loom:operator-objective` | Do not apply: file `loom:operator-decision` with the candidate objectives as its ranked options, each with a why (#10000) |
 
 ```bash
 # Curator routing a genuine PO-level decision: 2-4 ranked options, each with
@@ -937,9 +937,8 @@ Champion's exclusions, the Priority-2 query above) is unchanged:
 loom-daemon operator-decision apply <number> --input d.json --also-label loom:operator-only
 ```
 
-**Unsure which sub-kind applies means curation is incomplete, not that a
-label is safe to reach for (#5826).** `loom:operator-decision` is **not** a
-safe default: run the falsifiability test from
+**Unsure which sub-kind applies means curation is incomplete (#5826).**
+`loom:operator-decision` is **not** a safe default: run the falsifiability test from
 `.loom/docs/label-state-machine.md` — name the axis two well-informed people
 would still disagree on, and show it is a preference, not a fact. If you
 can't, the item is determined: finish it, don't park it.
@@ -948,12 +947,14 @@ can't, the item is determined: finish it, don't park it.
 — a literal `Blocked by #N` / `Depends on #N` / `Requires #N` line (the
 phrasings `detect-dependency-cycle.sh` and `warn-operator-gated.sh` parse; a
 backtick-quoted reference does not count). `loom:operator-decision` — name
-the disagreement axis and why it is a preference, not a fact.
-`loom:operator-objective` — the candidate objectives and the answer under
-each. Full taxonomy: `.loom/docs/label-state-machine.md` →
-"`loom:operator-only` sub-kinds".
+the axis and why it is a preference, not a fact. Full taxonomy:
+`.loom/docs/label-state-machine.md` → "`loom:operator-only` sub-kinds".
 
-**Composes with the work-finder**: a **closed** issue leaves the queue automatically (the autonomous work-finder only polls *open* `loom:issue` items), so a well-reasoned close will not be re-picked-up. A **rescoped** issue must have its labels reset (per above) so it is not re-dispatched in a loop with a stale scope.
+**Mail for `loom:operator-mechanical` (#10000).** Rule: `label-state-machine.md` → "Two ways to reach a human". Same pass, ONE mail naming the human action and linking the item:
+`inbox_mail send "$(inbox_mail key mechanical-issue <N>)" "<action + URL>"` (`mechanical-pr` for a PR; loader and
+no-op when unconfigured: `.loom/docs/inbox-mail.md`). Same key, so no re-mail; `inbox_mail resolve` when it clears. `-blocked` sends none.
+
+**Composes with the work-finder**: a **closed** issue leaves the queue (it polls only *open* `loom:issue` items); a **rescoped** one must have its labels reset so it is not re-dispatched with a stale scope.
 
 ### Duplicate Detection
 
@@ -1047,9 +1048,8 @@ failure modes to avoid:
    can verify the shipped command/PR, close as duplicate (case 1 or case 4,
    citing the specific command/PR you found) rather than parking it. Only if
    some non-judgment mechanical step genuinely remains (e.g. confirming with
-   whoever filed it before closing) does `loom:operator-mechanical` apply —
-   and even then that is a fallback, not the default, for a confirmed
-   duplicate-of-shipped-work finding.
+   whoever filed it before closing) does `loom:operator-mechanical` apply, as
+   a fallback only.
 
 ```bash
 # Batch audit found #718/#719 novel and #716/#717/#720 duplicate `klt

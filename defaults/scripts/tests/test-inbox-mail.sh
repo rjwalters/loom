@@ -104,4 +104,18 @@ grep -q 'inbox_mail on &&' "$HOLD" && ok "hold gates its forge read on inbox con
 grep -qF 'inbox_mail resolve-merged crithold-pr "<!-- champion:critical-file-hold -->"' \
   "$ROOT/defaults/.claude/commands/loom/champion-pr-merge.md" && ok "Champion runs resolve-merged per pass" || bad "resolve-merged not wired"
 
+# Slice 2: roles that apply operator-only + a sub-kind point at the mail/decision rule.
+RD="$ROOT/defaults/.claude/commands/loom"
+for role in curator builder doctor judge; do
+  grep -q 'mechanical-\(issue\|pr\)' "$RD/$role.md" && ok "$role.md: mechanical sends a keyed mail" || bad "$role.md: mail step missing"
+  grep -q 'operator-objective` is not an ask\|operator-objective` | Do not apply: file `loom:operator-decision`' "$RD/$role.md" \
+    && ok "$role.md: objective filed as a decision" || bad "$role.md: objective-as-decision missing"
+  grep -q 'loom:operator-blocked' "$RD/$role.md" && ok "$role.md: names operator-blocked" || bad "$role.md: operator-blocked missing"
+done
+grep -q 'Mail for `loom:operator-mechanical`' "$RD/curator.md" && ok "curator holds the mail step" || bad "curator mail section missing"
+grep -q 'operator-blocked` sends nothing' "$ROOT/defaults/docs/label-state-machine.md" && ok "rule: operator-blocked sends nothing" || bad "rule: blocked line missing"
+for l in operator-blocked operator-objective operator-decision operator-only operator; do
+  grep -q "name: \"\?loom:$l\"\?\$" "$ROOT/defaults/.github/labels.yml" && ok "label $l kept" || bad "label $l removed"
+done
+
 [ "$fails" -eq 0 ] && echo "ALL PASSED" || { echo "$fails failed"; exit 1; }
