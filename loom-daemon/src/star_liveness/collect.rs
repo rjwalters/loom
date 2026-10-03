@@ -320,7 +320,7 @@ impl<'a> Evaluator<'a> {
             return Vec::new();
         }
         let body = issue.body.as_deref().unwrap_or_default();
-        crate::dep_classify::refs::parse_dependency_refs(body, self.ctx.slug)
+        crate::dep_classify::refs::parse_named_blocker_refs(body, self.ctx.slug)
     }
 
     /// `r`'s number when it names an issue in this repo.

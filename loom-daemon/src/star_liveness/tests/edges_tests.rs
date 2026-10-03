@@ -75,6 +75,24 @@ fn a_task_list_entry_links_checked_or_not() {
 }
 
 #[test]
+fn a_ticked_dependencies_item_is_not_a_child() {
+    // #10024: `## Dependencies` is a dependency list, not containment — a
+    // ticked item there is satisfied, so only the unchecked one links. The
+    // same ticked number listed again outside the section is still a child.
+    let body = "## Dependencies\n- [ ] #31 prerequisite\n- [x] #32 done\n- [X] #33 done\n\n\
+        ## Phases\n- [x] #33 phase\n- [x] #34 phase\n";
+    let e = child_edges(SLUG, &node(30, "", body, &[]));
+    assert_eq!(
+        pairs(&e),
+        vec![
+            (30, 31, EdgeSource::TaskList),
+            (30, 33, EdgeSource::TaskList),
+            (30, 34, EdgeSource::TaskList),
+        ]
+    );
+}
+
+#[test]
 fn an_epic_phase_marker_links_to_its_epic() {
     let body = "Phase two.\n<!-- loom:epic:300:phase:2 -->\n";
     assert_eq!(

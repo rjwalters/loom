@@ -13,7 +13,7 @@
 //! |---|---|---|
 //! | `<!-- loom:park Blocked by: #C … -->` | P's body | [`EdgeSource::ParkRecord`] |
 //! | `Blocked by` / `Depends on` / `Requires #C` on a `loom:blocked` P | P's body | [`EdgeSource::BlockedBy`] |
-//! | `- [ ] #C` / `- [x] #C` task-list entry | P's body | [`EdgeSource::TaskList`] |
+//! | `- [ ] #C` / `- [x] #C` task-list entry (not a ticked `## Dependencies` item, #10024) | P's body | [`EdgeSource::TaskList`] |
 //! | `<!-- loom:epic:P:phase:n -->` | C's body | [`EdgeSource::EpicPhase`] |
 //! | `<!-- loom:parent #P -->` | C's body | [`EdgeSource::ParentMarker`] |
 //! | a line starting `Part of #P` | C's body (issues only) | [`EdgeSource::PartOf`] |
@@ -114,6 +114,41 @@ fn task_re() -> &'static Regex {
     })
 }
 
+fn checked_task_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(&format!(r"(?m)^\s*[-*+]\s+\[[xX]\]\s+({REF})\b"))
+            .expect("static checked-task pattern")
+    })
+}
+
+/// Same-repo task-list children of `body`, minus each **checked** item of its
+/// `## Dependencies` section. That section is a dependency list, not
+/// containment: a ticked item there is a satisfied prerequisite and never a
+/// blocker (#10024), so it inherits nothing. A ticked item anywhere else, or
+/// the same number also listed outside the section, is still a child.
+fn task_children(body: &str, slug: &str) -> BTreeSet<u32> {
+    let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+    for c in task_re().captures_iter(body) {
+        if let Some(n) = c.get(1).and_then(|m| same_repo_number(m.as_str(), slug)) {
+            *counts.entry(n).or_default() += 1;
+        }
+    }
+    let section = crate::dep_recheck::named::dependencies_section(body);
+    for c in checked_task_re().captures_iter(&section) {
+        if let Some(n) = c.get(1).and_then(|m| same_repo_number(m.as_str(), slug)) {
+            if let Some(k) = counts.get_mut(&n) {
+                *k = k.saturating_sub(1);
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, k)| *k > 0)
+        .map(|(n, _)| n)
+        .collect()
+}
+
 fn parent_marker_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -199,10 +234,7 @@ pub fn child_edges(slug: &str, node: &Node<'_>) -> Vec<Edge> {
         let deps = crate::dep_classify::refs::parse_dependency_refs(node.body, slug);
         push(numbers(deps.iter().map(String::as_str), slug), EdgeSource::BlockedBy);
     }
-    let tasks = task_re()
-        .captures_iter(node.body)
-        .filter_map(|c| c.get(1).map(|m| m.as_str()));
-    push(numbers(tasks, slug), EdgeSource::TaskList);
+    push(task_children(node.body, slug), EdgeSource::TaskList);
     out
 }
 
