@@ -311,6 +311,12 @@ fn run_preflight(
     {
         return Err(LaunchError::config("invalid runtime name"));
     }
+    // Forge egress admission (#9984): `spawn-worker.sh` delegates here, so this
+    // is its `forge egress assert`. Under `enforcement.api = required` a routing
+    // finding means no worker is spawned; `observe` logs; no policy is a no-op.
+    if let Some(refusal) = crate::forge_egress::gate::spawn_refusal(root) {
+        return Err(LaunchError::config(refusal));
+    }
     let scripts = args.scripts_dir.unwrap_or_else(|| scripts_dir(root));
     let mut log: Box<dyn Write> = Box::new(std::io::stderr());
     let mut command = if let Some(harness) = Harness::parse(&runtime) {
