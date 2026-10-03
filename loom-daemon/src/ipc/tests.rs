@@ -1309,6 +1309,11 @@ fn test_dispatch_sweep_registered_workspace_missing_spawn_bin_surfaces_inner_err
 #[test]
 #[serial_test::serial]
 fn test_dispatch_sweep_wedge_guard_names_resolved_workspace_not_cwd() {
+    // #9360: an ambient `LOOM_RUNTIME` / `LOOM_RUNTIME_<ROLE>` pin outranks the
+    // surface installed below, so on a native dispatch worker (whose agent
+    // session carries `LOOM_RUNTIME=opencode`) admission rejected this fixture
+    // on an unmet `mcp` capability before the wedge guard was ever reached.
+    let _runtime_env = crate::runtime_selection_test_support::ClearedRuntimeSelectionEnv::new();
     let (tm, db, _, bus) = setup_test_context();
     let dir_a = tempdir().unwrap();
     let dir_b = tempdir().unwrap();
@@ -1317,23 +1322,7 @@ fn test_dispatch_sweep_wedge_guard_names_resolved_workspace_not_cwd() {
     // reaches (and continues to assert) the downstream workspace-command
     // guard rather than bypassing admission.
     for root in [dir_a.path(), dir_b.path()] {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(root.join(".loom/roles")).unwrap();
-        std::fs::create_dir_all(root.join(".loom/runtimes")).unwrap();
-        std::fs::create_dir_all(root.join(".loom/scripts")).unwrap();
-        std::fs::write(
-            root.join(".loom/roles/builder.json"),
-            r#"{"runtimeRequirements":["worktreeIsolation","mcp"]}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            root.join(".loom/runtimes/claude.json"),
-            r#"{"runtime":"claude","capabilities":{"worktreeIsolation":"yes","mcp":"yes"}}"#,
-        )
-        .unwrap();
-        let adapter = root.join(".loom/scripts/spawn-claude.sh");
-        std::fs::write(&adapter, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::runtime_selection_test_support::install_admissible_claude_surface(root);
     }
     // Neither workspace has `.claude/commands/loom/sweep.md`, and
     // `skip_label_flip` is left at its default `false` so the #4027 guard
