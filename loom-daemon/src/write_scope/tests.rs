@@ -815,11 +815,11 @@ fn daemon_write_paths_are_scoped() {
         ),
         (
             "cli/merge_pr_consolidate.rs",
-            OperatorOnly(
-                "`merge-pr consolidate-prepare`/`consolidate-abort` (#9688): an explicit, \
-                 operator-named group; no autonomous caller exists yet (#9689 wires \
-                 reconciliation)",
-            ),
+            OperatorOnly("`merge-pr consolidate-prepare|abort|reconcile`: run by hand against an explicit candidate PR; #9839 is the automated caller"),
+        ),
+        (
+            "merge_pr/consolidate/reconcile.rs",
+            OperatorOnly("library half of `consolidate-reconcile`, reached only via the CLI verb above"),
         ),
         (
             "watchdog/peer_coord.rs",

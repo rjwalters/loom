@@ -52,7 +52,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::claim_reconciliation::merge_sequence::SEQUENCE_LABEL;
-use crate::merge_pr::sequence::{html_comment_spans, SequenceMarker};
+use crate::merge_pr::sequence::{html_comment_spans, release_marker_text, SequenceMarker};
 
 /// The marker prefix identifying a candidate PR's consolidation mapping.
 pub const CONSOLIDATION_PREFIX: &str = "loom:consolidation";
@@ -811,47 +811,16 @@ pub fn reservation_comment_body(marker: &SequenceMarker, attempt: &str) -> Strin
     )
 }
 
-/// The release-marker prefix the abort comment carries. Deliberately NOT a
-/// `loom:sequence` field list: `sequence::parse` skips it (the first token
-/// has no `=`), so it can never be mistaken for a hold. [`live_marker`] reads
-/// it as "the newest reservation for `plan=` is released".
-pub const RESERVATION_RELEASED_PREFIX: &str = "loom:sequence released";
-
-/// The ordering pass's void tombstone (`REPLAN_NOTE_BODY`, #9686): a pinned
-/// head moved, so whatever hold the PR carried is gone. Exact inner text.
-pub const REPLANNED_TOMBSTONE: &str = "loom:sequence replanned";
-
-/// True when `span` (an HTML comment's inner text) is a release marker for
-/// exactly `plan`.
-fn is_release_span_for(span: &str, plan: &str) -> bool {
-    span.trim()
-        .strip_prefix(RESERVATION_RELEASED_PREFIX)
-        .filter(|rest| rest.starts_with(char::is_whitespace))
-        .is_some_and(|rest| {
-            let mut fields = rest.split_whitespace();
-            fields.next() == Some(&format!("plan={plan}")) && fields.next().is_none()
-        })
-}
-
 /// The newest trusted sequencing marker on `component` that still describes
-/// a LIVE hold, or `None`.
+/// a LIVE hold, or `None`: the `loom:sequenced` label is on (the label IS the
+/// hold, #9378) AND [`crate::merge_pr::sequence::parse_live`] says no later
+/// tombstone ended it.
 ///
-/// Two independent signals retire a marker, and either suffices:
-///
-/// 1. **The label is gone.** `loom:sequenced` IS the hold — the #9378 gate
-///    reads the label and the #9686 pass only reads markers of labeled PRs.
-///    Every release path removes it, so a marker on an unlabeled PR is
-///    history.
-/// 2. **A newer release marker names the same plan** (`consolidate-abort`'s
-///    and the ordering pass's `<!-- loom:sequence released plan=… -->`).
-///    `sequence::parse` skips that span by design, so without this check the
-///    old reservation would keep "winning" as the newest valid marker after
-///    an abort.
-/// 3. **A newer void tombstone** (`<!-- loom:sequence replanned -->`, the
-///    ordering pass's `VoidAndReplan` note when a pinned head moved). It names
-///    no plan because it voids whatever hold the PR carried. ADR-0023 §3
-///    (iii): a reservation followed by a `released`/`replanned` tombstone is
-///    lost, even if a label is later put back by hand.
+/// A thin wrapper on purpose (#9745 review): `parse_live` is the one parser
+/// of the hold history. It retires a marker on a `released plan=<same plan>`
+/// tombstone (the ordering pass, `consolidate-abort`) and on the pass's
+/// `replanned` void note, which is ADR-0023 §3 (iii): a reservation followed
+/// by either tombstone is lost, even if a label is later put back by hand.
 ///
 /// Oldest-first `bodies`, as `fetch_trusted_bodies` returns them.
 #[must_use]
@@ -859,39 +828,23 @@ pub fn live_marker(component: &ComponentState, bodies: &[String]) -> Option<Sequ
     if !component.has(SEQUENCE_LABEL) {
         return None;
     }
-    let mut newest: Option<SequenceMarker> = None;
-    for body in bodies {
-        for line in body.lines() {
-            for span in html_comment_spans(line) {
-                let wrapped = format!("<!--{span}-->");
-                if let Some(m) = crate::merge_pr::sequence::parse(std::slice::from_ref(&wrapped)) {
-                    newest = Some(m);
-                } else if span.trim() == REPLANNED_TOMBSTONE
-                    || newest
-                        .as_ref()
-                        .is_some_and(|m| is_release_span_for(span, &m.plan))
-                {
-                    newest = None;
-                }
-            }
-        }
-    }
-    newest
+    crate::merge_pr::sequence::parse_live(bodies)
 }
 
-/// The abort release comment — distinct from the landing release so the
-/// transcript shows which fate the attempt met. Its first line is the
-/// release marker [`live_marker`] honors (the label removal is the primary
-/// release; this marker keeps the transcript self-describing).
+/// The abort release comment. Its first line is the canonical release
+/// tombstone ([`release_marker_text`]) that [`live_marker`] honors (the label
+/// removal is the primary release; the tombstone keeps the transcript
+/// self-describing).
 #[must_use]
 pub fn reservation_release_body(marker: &SequenceMarker, attempt: &str) -> String {
     format!(
-        "<!-- {RESERVATION_RELEASED_PREFIX} plan={} -->\n\
+        "{}\n\
          **Consolidation attempt `{}` released this reservation** — the attempt was aborted; \
          this PR is back to its normal pipeline, untouched and actionable.\n\n\
          ---\n\
          *Automated by loom-daemon merge-pr consolidate-abort (#9688)*",
-        marker.plan, attempt
+        release_marker_text(&marker.plan),
+        attempt
     )
 }
 
@@ -1094,6 +1047,143 @@ pub enum PrepareOutcome {
         reservations_present: usize,
     },
 }
+
+// --- Landing reconciliation (#9689, ADR-0023 §6) --------------------------
+//
+// The candidate merges through the canonical merge-pr.sh path — never here.
+// What this section owns is everything AFTER a verified landing: per-component
+// status, component closure, linked-issue closure, and branch cleanup, in that
+// order, each step idempotent (re-read before acting) so a crash anywhere
+// leaves a state the next run continues from. Releasing the reservations is
+// NOT here: ADR-0023 §4 makes the ordering pass the one releaser on landing
+// (`CLEAR` ⇒ `Release`); reconciliation only observes it (§6 step 4).
+
+/// The per-component status marker: presence = this component's landing
+/// status is durably recorded (the reconciliation ledger entry).
+#[must_use]
+pub fn status_marker(candidate_pr: u32, component: u32) -> String {
+    format!("<!-- {CONSOLIDATION_PREFIX}-status candidate={candidate_pr} component={component} -->")
+}
+
+/// The landing status comment for one component.
+#[must_use]
+pub fn status_comment_body(
+    component: u32,
+    candidate_pr: u32,
+    merge_sha: &str,
+    attempt: &str,
+) -> String {
+    format!(
+        "{}\n**Merged into candidate #{}** — consolidation attempt `{}` landed; this PR's \
+         changes (pinned at construction) are contained in the combined merge `{}`.\n\n\
+         Status: `merged-into #{}` (per ADR-0023 §6: GitHub closing this PR is recorded as \
+         merged-into, never as an independent merge). Follow-up work goes against the default \
+         branch as usual.\n\n\
+         ---\n\
+         *Automated by loom-daemon merge-pr consolidate-reconcile (#9689)*",
+        status_marker(candidate_pr, component),
+        candidate_pr,
+        attempt,
+        merge_sha,
+        candidate_pr
+    )
+}
+
+/// Status recorded? Reads the live comment stream; a failed read is "not
+/// present" (the comment gets re-posted — idempotent recovery errs toward a
+/// duplicate status line, never a lost one).
+#[must_use]
+pub fn status_present(bodies: &[String], candidate_pr: u32, component: u32) -> bool {
+    bodies
+        .iter()
+        .any(|b| b.contains(&status_marker(candidate_pr, component)))
+}
+
+/// Inclusion proof (ADR-0023 §6.2): the pinned head must be an ancestor of
+/// the candidate branch head RECORDED AT PREPARE TIME — the tree the
+/// candidate's CI tested and Judge reviewed, not a live re-read. Construction
+/// merged the pins `--no-ff`, so ancestry is the containment fact.
+pub fn inclusion_verified(
+    git_bin: &str,
+    repo_root: &Path,
+    pinned_head: &str,
+    candidate_head: &str,
+) -> bool {
+    let out = Command::new(git_bin)
+        .args(["merge-base", "--is-ancestor", pinned_head, candidate_head])
+        .current_dir(repo_root)
+        // Only the exit status is read; nothing is piped, so nothing can
+        // fill an undrained pipe (#9745 review).
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    matches!(out, Ok(s) if s.success())
+}
+
+/// The ledger marker for a source pushed after the candidate landed
+/// (ADR-0023 §6.2): distinct from [`status_marker`], so a source that later
+/// returns to its pin is not mistaken for one already reconciled.
+#[must_use]
+pub fn untouched_status_marker(candidate_pr: u32, component: u32) -> String {
+    format!(
+        "<!-- {CONSOLIDATION_PREFIX}-status candidate={candidate_pr} component={component} \
+         status=untouched-open -->"
+    )
+}
+
+/// The `untouched-open` status comment: the candidate landed this PR's
+/// PINNED head, but the PR has moved since, so it is not closed and its
+/// linked issues stay open. A push after landing is past the abort point.
+#[must_use]
+pub fn untouched_open_body(
+    component: u32,
+    candidate_pr: u32,
+    merge_sha: &str,
+    pinned_head: &str,
+    attempt: &str,
+) -> String {
+    format!(
+        "{}\n**Left open: pushed after its consolidation landed.** Candidate #{} (attempt \
+         `{}`) landed this PR's pinned head `{}` in the combined merge `{}`. This PR's head has \
+         moved since, so the commits after the pin are NOT on the default branch: the PR stays \
+         open as an ordinary PR, and its linked issues stay open.\n\n\
+         Status: `untouched-open` (ADR-0023 §6.2).\n\n\
+         ---\n\
+         *Automated by loom-daemon merge-pr consolidate-reconcile (#9689)*",
+        untouched_status_marker(candidate_pr, component),
+        candidate_pr,
+        attempt,
+        pinned_head,
+        merge_sha
+    )
+}
+
+/// The component-PR closure comment: the exact combined merge SHA, per the
+/// contract's "no bare closed".
+#[must_use]
+pub fn component_close_body(candidate_pr: u32, merge_sha: &str) -> String {
+    format!(
+        "Closed as **merged-into #{candidate_pr}** — this PR's changes landed with the \
+         combined candidate; the exact combined merge commit is `{merge_sha}`. (ADR-0023 §6, \
+         #9689)"
+    )
+}
+
+/// The linked-issue closure comment: what landed, where, and why closure is
+/// performed here (the closing PR merged as part of a candidate, so the
+/// forge never fired its own auto-close).
+#[must_use]
+pub fn issue_close_body(component_pr: u32, candidate_pr: u32, merge_sha: &str) -> String {
+    format!(
+        "Closed via consolidation: component PR #{component_pr} (which closes this issue) was \
+         verified as included in combined candidate #{candidate_pr}, which landed as `{merge_sha}` \
+         after its own independent review and green CI. The component's acceptance criteria were \
+         reviewed on the candidate's combined diff; if anything is missing, reopen with the gap \
+         named. (ADR-0023 §6, #9689)"
+    )
+}
+
+pub mod reconcile;
 
 #[cfg(test)]
 mod tests;
