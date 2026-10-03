@@ -127,7 +127,7 @@ pub fn record_runs(
     if let Some(until) = status.backoff_until.filter(|until| *until > ctx.now) {
         return Err(CycleError::BackingOff { until: Some(until) });
     }
-    if crate::rate_limit_breaker::global_is_suppressed() {
+    if crate::rate_limit_breaker::global_skip_pass("ci_telemetry") {
         return Err(CycleError::BackingOff { until: None });
     }
 

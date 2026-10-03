@@ -281,7 +281,7 @@ pub struct GhTimelineStarredAt {
 
 impl StarredAtSource for GhTimelineStarredAt {
     fn starred_at(&mut self, issue: u32) -> Result<Option<String>> {
-        if crate::rate_limit_breaker::global_is_suppressed() {
+        if crate::rate_limit_breaker::global_skip_pass("work_finder") {
             return Err(anyhow!("rate-limit breaker is suppressing forge reads"));
         }
         let repo = self.repo.as_deref().unwrap_or("{owner}/{repo}");

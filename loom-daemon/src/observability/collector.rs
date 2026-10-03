@@ -146,6 +146,9 @@ async fn run_collector(
     identity_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut snapshot_timer = tokio::time::interval(snapshot_interval);
     snapshot_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // GitHub quota gauges + breaker-skip flush (Issue #10022), OTLP-only.
+    let mut ratelimit_timer = tokio::time::interval(super::ops::ratelimit::TICK);
+    ratelimit_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // First-boot backfill (Issue #5084): run once immediately, before the
     // first snapshot tick, so a sweep adopted across a daemon restart does
@@ -185,6 +188,10 @@ async fn run_collector(
             _ = identity_timer.tick() => {
                 identities.sample(queue.as_ref(), &host_id, &workspace_pool, &mut slug_cache)
                     .await;
+            }
+
+            _ = ratelimit_timer.tick() => {
+                super::ops::ratelimit::record(&workspace_root).await;
             }
 
             _ = snapshot_timer.tick() => {

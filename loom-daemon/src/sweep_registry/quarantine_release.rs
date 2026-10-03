@@ -27,14 +27,15 @@ impl SweepRegistry {
     /// that field's doc comment for why that would leak into other tests).
     #[cfg(test)]
     fn quarantine_release_rate_limited(&self) -> bool {
-        self.test_force_rate_limited || crate::rate_limit_breaker::global_is_suppressed()
+        self.test_force_rate_limited
+            || crate::rate_limit_breaker::global_skip_pass("quarantine_release")
     }
 
     /// Non-test build of [`Self::quarantine_release_rate_limited`] above —
     /// same contract, minus the test-only override.
     #[cfg(not(test))]
     fn quarantine_release_rate_limited(&self) -> bool {
-        crate::rate_limit_breaker::global_is_suppressed()
+        crate::rate_limit_breaker::global_skip_pass("quarantine_release")
     }
 
     /// Retry every issue in [`pending_quarantine_release`](Self::pending_quarantine_release_issues)
