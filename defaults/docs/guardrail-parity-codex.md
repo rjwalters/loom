@@ -354,10 +354,18 @@ it explicitly when sizing a multi-account Codex pool):
 
 # 2. accept Codex's hook-trust prompt once per profile (interactive — see above),
 #    WHERE THE PROFILE RUNS. Codex keys trust by the hooks.json path under the
-#    CODEX_HOME it runs with, so for a session-managed profile accept it inside
-#    the account's session container (CODEX_HOME=/home/loom/.codex-profile),
-#    from any Loom checkout; trust accepted on the host does not count there.
-docker exec -it -w "$PWD" loom-codex-session-alice codex      # session-managed
+#    CODEX_HOME it runs with, so for a session-managed profile accept it with
+#    CODEX_HOME=/home/loom/.codex-profile; trust accepted on the host does not
+#    count there. The session container binds config.toml and hooks.json
+#    READ-ONLY (#9979), so the prompt cannot be saved from inside it: take it in
+#    a throwaway container with the profile writable, then restart the session
+#    (the posture gate refuses dispatch until the container sees the new file).
+#    This is the current method while hook trust remains interactive.
+docker run --rm -it --user 1000:1000 -w /tmp \
+  -v ~/.loom/codex-profiles/alice:/home/loom/.codex-profile \
+  ghcr.io/rjwalters/loom-worker-session:latest codex          # session-managed
+loom-daemon accounts session stop alice && \
+  loom-daemon accounts session start alice --mount-workspace ~/GitHub
 CODEX_HOME=~/.loom/codex-profiles/alice codex                 # bare-metal only
 
 # 3. gate the pool: exit 0 only when EVERY profile is ready
@@ -509,6 +517,8 @@ closed (exit 78).
 | `loom.session-posture=container-boundary-v1` (host mode, created by this release's `session start`) | `-s danger-full-access`. The requested mode is kept in the audit line (`source=session-container-boundary requested=workspace-write via …`). |
 | `loom.workspace-mode=private-clone` (#8787) | Same. These containers were already created with the posture below, plus a read-only rootfs. |
 | Either label above, but the container's actual `HostConfig` is not hardened: `Privileged`, host network/PID/IPC, `CapDrop` without `ALL`, any `CapAdd`, no `no-new-privileges`, an `unconfined` security option, or a docker.sock mount | **exit 78**, naming the violation. The label records how the container was meant to be created, and the settings record how it was. Both have to agree before the sandbox comes off. |
+| Either label above, but one of the profile's `hooks.json`, `config.toml`, `loom-codex-hooks.json` is not a read-only bind at `/home/loom/.codex-profile/<file>` | **exit 78**, `profile-control-writable(<file>)`. See "Profile control files" below. |
+| Host mode, but the container's copy of one of those three files differs from (or is missing beside) the host file under the dispatch's `CODEX_HOME` (`docker exec … sha256sum`) | **exit 78**, naming the file, with the restart commands. A file bind does not follow a host-side atomic replace: after provisioning or accepting trust on the host, the container sees the old file (Linux) or no file at all (Docker Desktop, verified on robb-studio), while `verify` on the host reads the new one as ready. |
 | A running host-mode container created before this release (no posture label) | **exit 78** with the recreate commands. Those containers mount the whole checkout parent and the Claude token pool, so Loom will not drop the sandbox in them. |
 | A missing or stopped container, or no `docker` | The sandbox stays as requested. Dispatch is refused anyway: `session-exec host` exits 78 for a container that isn't running, and a missing `docker` exits 127. |
 
@@ -522,7 +532,8 @@ tests pin it.
 
 | Surface | Exposure | Why |
 |---|---|---|
-| Account profile (`CODEX_HOME`) | read-write, this account only | The account's own `auth.json` refresh chain (ADR-0017 Decision 1). |
+| Account profile (`CODEX_HOME`) | read-write, this account only — **except** `hooks.json`, `config.toml`, `loom-codex-hooks.json` | The account's own `auth.json` refresh chain (ADR-0017 Decision 1), plus Codex's state databases, migrations and session files. |
+| Profile control files (`hooks.json`, `config.toml`, `loom-codex-hooks.json`) | **read-only**, each bound over its own path (as private-clone sessions bind them) | Missing files are created first as inert placeholders (no hooks, nothing trusted, nothing pinned), so a session can't create them either. See "Profile control files" below. |
 | Repositories | read-write, **only roots in `~/.loom/workspaces.json`** under `--mount-workspace`, each at its own path | Dispatch runs `--workdir <worktree>`. Before #9979 the whole checkout parent (`~/GitHub`) was mounted, including repositories outside the fleet. A parent with no registered roots under it is refused. Explicitly denied whatever the registry says: `/`, the home directory and its ancestors, and any root that contains or sits inside a `firewall: true` repository in the cached fleet-store roster. A cached roster that cannot be parsed refuses the start. |
 | GitHub credential | read-only: the daemon's App installation-token dirs (`<daemon root>/.loom/gh-config`, `…/gh-config-by-owner`) | `spawn-codex.sh` forwards the dispatch's `GH_CONFIG_DIR` (a path, never a token), and only if that path is inside a mount. Personal `GH_CONFIG_DIR`s are never mounted. The `:ro` bind is added even when the dir is inside a mounted repository, where the daemon root is itself registered (robb-studio's `~/GitHub/loom`). It overlays the read-write repository mount, so the daemon's `hosts.yml` can't be rewritten from inside. |
 | Claude token pool (`~/.loom/tokens`) | **not mounted** (was read-only before #9979) | Codex doesn't need it. With the sandbox off, the model can read any mounted file. |
@@ -531,6 +542,45 @@ tests pin it.
 | Capabilities | `--cap-drop ALL`, `--security-opt no-new-privileges` (`CapEff=0`, `NoNewPrivs=1`) | The image has no `sudo`. These flags also block setuid escalation. |
 | Seccomp / AppArmor | Docker defaults, never overridden (`Seccomp: 2`) | `unshare -U` stays denied, so the model gets no new namespaces either. |
 | Network | Docker's default bridge, outbound open | Required by the Codex API and GitHub. See the residual exposures below. |
+
+**Profile control files.** With Codex's sandbox off, a session that could
+write its own profile could void the *next* session's guard while leaving it
+reading guard-ready. For example, it could change the managed hook's
+`matcher`: the command Loom pins is unchanged, but Codex's trust hash covers
+the whole hook group, so Codex silently skips the hook. It could also forge a
+`trusted_hash` or rewrite the receipt. `verify` can't see either. So in host
+mode, as in private-clone mode, `hooks.json` (registration), `config.toml`
+(Codex's trust state) and `loom-codex-hooks.json` (Loom's receipt) are each
+bound read-only over their own path. Each path is a mount point, which gives:
+
+- write: `EROFS`;
+- unlink, rename, or a symlink over it: `EBUSY`.
+
+`auth.json` and the rest of the profile directory stay writable.
+
+Tested on robb-studio on 2026-10-03 against `codex-cli 0.160.0`, in the
+session image under the session flags (uid 1000, `--cap-drop ALL`,
+`no-new-privileges`):
+
+- `codex exec -s danger-full-access` ran its tool call, including in a folder
+  `config.toml` doesn't list as trusted.
+- `codex login --with-api-key` and `codex login status` worked.
+- The three files were byte-identical afterwards. Codex wrote
+  `.sandbox_migration`, its `*.sqlite` state, `sessions/` and
+  `shell_snapshots/` beside them.
+
+`docker/session/test-image.sh` §13 now runs its host-mode turn in this
+layout. Only one thing needs `config.toml` writable: the interactive TUI's
+own trust prompts. Both "Trust this folder?" for a folder not yet in
+`config.toml` and the hook-trust prompt fail with `config/batchWrite failed
+… failed to persist config.toml`. A `-c projects…trust_level` override does
+not suppress the folder prompt. Already-trusted folders open normally. For now,
+take both decisions in a throwaway container with the profile writable
+(procedure above), then restart the session. Private sessions need the same
+step. This is the current procedure for as long as hook trust is an
+interactive step. The in-container hash comparison above is meant to let a
+later change prove the frozen files are Loom's own registration without that
+step.
 
 **Residual exposures. These are operator decisions, not Loom defaults.**
 
@@ -544,12 +594,6 @@ tests pin it.
   containers on the host that use IMDS.
 - **Host services.** Ports bound on the host's bridge gateway, and
   `host.docker.internal` on Docker Desktop, are reachable from the container.
-- **Self-modifiable hooks.** In host mode the profile mount is read-write, so
-  a session could edit its own `config.toml`/`hooks.json`. That would turn
-  off the managed `pre_tool_use` hook for later sessions on the account.
-  Read-only roles never relied on that hook. For mutable roles
-  (builder/doctor), use private-clone mode, which binds those files
-  read-only.
 - **Registered repositories, including files the host executes.** Every
   registered repository is read-write in full, not just the dispatch
   worktree. That includes files that later run **on the host**, outside the

@@ -903,19 +903,34 @@ fi
 #
 # Credential-free and hermetic, like section 12: `--network none`, a loopback
 # provider that emits one exec_command and a final message, a throwaway
-# CODEX_HOME. The bwrap-dependent `workspace-write` mode is driven too, as a
+# profile mounted at the session's CODEX_HOME with its three hook-control files
+# (hooks.json, config.toml, loom-codex-hooks.json) bound READ-ONLY over their
+# own paths, exactly as `host_session_run_args` binds them — so this also
+# proves the pinned CLI runs with them frozen (it writes its state databases,
+# migrations and session files into the profile directory around them), and
+# that the model cannot rewrite, remove, rename or replace them. The bwrap-dependent `workspace-write` mode is driven too, as a
 # recorded observation rather than an assertion — it is expected NOT to run on
 # Docker's defaults, and a host where it does has a userns-capable profile.
 HOSTMODE_DIR=$(mktemp -d)
-mkdir -p "$HOSTMODE_DIR/ws"
-chmod 777 "$HOSTMODE_DIR/ws"
+mkdir -p "$HOSTMODE_DIR/ws" "$HOSTMODE_DIR/profile"
+chmod 777 "$HOSTMODE_DIR/ws" "$HOSTMODE_DIR/profile"
+printf '{"hooks":{}}\n' > "$HOSTMODE_DIR/profile/hooks.json"
+printf '[projects."/elsewhere"]\ntrust_level = "trusted"\n' > "$HOSTMODE_DIR/profile/config.toml"
+printf '{}\n' > "$HOSTMODE_DIR/profile/loom-codex-hooks.json"
+chmod 644 "$HOSTMODE_DIR/profile/"*
+hostmode_controls() { (cd "$HOSTMODE_DIR/profile" && cat hooks.json config.toml loom-codex-hooks.json | cksum); }
+HOSTMODE_CONTROLS_BEFORE=$(hostmode_controls)
+HOSTMODE_MOUNTS=(-v "$HOSTMODE_DIR/profile:/home/loom/.codex-profile")
+for control in hooks.json config.toml loom-codex-hooks.json; do
+    HOSTMODE_MOUNTS+=(--mount "type=bind,src=$HOSTMODE_DIR/profile/$control,dst=/home/loom/.codex-profile/$control,readonly")
+done
 cleanup_hostmode() { rm -rf "$HOSTMODE_DIR" 2>/dev/null || true; }
 trap 'cleanup; cleanup_protected; cleanup_engine; cleanup_hostmode' EXIT
 
 cat > "$HOSTMODE_DIR/probe.sh" <<'HOSTMODE_PROBE'
 set -u
 WS="$1"
-export HOME=/tmp/home CODEX_HOME=/tmp/codex-home TMPDIR=/tmp
+export HOME=/tmp/home CODEX_HOME=/home/loom/.codex-profile TMPDIR=/tmp
 export FIXTURE_KEY=synthetic-not-a-credential
 mkdir -p "$HOME" "$CODEX_HOME" || exit 90
 git init -q -b main "$WS/repo" || exit 91
@@ -967,18 +982,40 @@ turn() {
 }
 turn danger-full-access full
 turn workspace-write sandboxed
+for control in hooks.json config.toml loom-codex-hooks.json; do
+    f="$CODEX_HOME/$control"
+    if (printf x >> "$f") 2>/dev/null || rm -f "$f" 2>/dev/null \
+        || mv "$f" "$f.moved" 2>/dev/null || ln -sf /tmp/x "$f" 2>/dev/null; then
+        echo "CONTROL_$control mutable"
+    else
+        echo "CONTROL_$control frozen"
+    fi
+done
+if (printf ok > "$CODEX_HOME/auth-sibling-probe") 2>/dev/null; then echo "SIBLING writable"; else echo "SIBLING frozen"; fi
 HOSTMODE_PROBE
 chmod 644 "$HOSTMODE_DIR/probe.sh"
 
 HOSTMODE_OUT=$(docker run --rm --network none --user "$PROBE_USER" \
     --cap-drop ALL --security-opt no-new-privileges \
-    -v "$HOSTMODE_DIR/ws:$HOSTMODE_DIR/ws" \
+    -v "$HOSTMODE_DIR/ws:$HOSTMODE_DIR/ws" "${HOSTMODE_MOUNTS[@]}" \
     --mount "type=bind,src=$HOSTMODE_DIR/probe.sh,dst=/opt/loom-hostmode-probe.sh,readonly" \
     --entrypoint bash "$IMAGE" -lc "bash /opt/loom-hostmode-probe.sh $HOSTMODE_DIR/ws" 2>&1)
 if [[ "$(engine_line "$HOSTMODE_OUT" MARKER_full)" == "ran" ]]; then
     pass "under the host-mode session posture, codex exec -s danger-full-access executes its tool call (#9979)"
 else
     fail "codex exec -s danger-full-access did not execute a tool call under the session posture (role ticks would no-op, #9979): $HOSTMODE_OUT"
+fi
+for control in hooks.json config.toml loom-codex-hooks.json; do
+    if [[ "$(engine_line "$HOSTMODE_OUT" "CONTROL_$control")" == "frozen" ]]; then
+        pass "host-mode session: $control is a read-only mount point (no write, unlink, rename or symlink-over)"
+    else
+        fail "host-mode session: $control is mutable from inside the container, so a session could void the next one's hook: $HOSTMODE_OUT"
+    fi
+done
+if [[ "$(engine_line "$HOSTMODE_OUT" SIBLING)" == "writable" && "$(hostmode_controls)" == "$HOSTMODE_CONTROLS_BEFORE" ]]; then
+    pass "host-mode session: the rest of the profile stays writable (auth refresh) and the controls are byte-identical after a Codex turn"
+else
+    fail "host-mode session: expected a writable profile directory around unchanged controls: $HOSTMODE_OUT"
 fi
 if [[ "$(engine_line "$HOSTMODE_OUT" MARKER_sandboxed)" == "ran" ]]; then
     echo "INFO: codex's own workspace-write sandbox also ran here — this Docker host permits unprivileged user namespaces"

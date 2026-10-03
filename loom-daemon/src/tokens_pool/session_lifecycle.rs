@@ -296,12 +296,68 @@ pub fn firewalled_repo_paths(workspace: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// The account profile's hook-control files — hook registration
+/// (`hooks.json`), Codex's own trust state (`config.toml`) and Loom's
+/// readiness receipt (`loom-codex-hooks.json`) — the same set a private-clone
+/// session freezes ([`super::private_workspace::bundle::PROFILE_CONTROLS`]).
+pub use super::private_workspace::bundle::PROFILE_CONTROLS;
+
+/// Container path of one [`PROFILE_CONTROLS`] entry in a host-mode session.
+#[must_use]
+pub fn profile_control_destination(name: &str) -> String {
+    format!("{CONTAINER_CODEX_HOME}/{name}")
+}
+
+/// Content a missing [`PROFILE_CONTROLS`] file is created with before a
+/// host-mode session is created, so each one can be bound read-only (Docker
+/// cannot bind a file that does not exist). Each placeholder means "nothing
+/// registered, nothing trusted, nothing pinned": an empty `config.toml`, a
+/// `hooks.json` with no hooks, and a receipt pinning nothing, which `verify`
+/// reads as not ready. Without the bind, a session with Codex's sandbox off
+/// could CREATE the absent file — a registration, receipt and trust entry of
+/// its own — for the next session to read.
+const PROFILE_CONTROL_PLACEHOLDERS: [(&str, &str); 3] = [
+    ("hooks.json", "{\"hooks\":{}}\n"),
+    ("config.toml", ""),
+    ("loom-codex-hooks.json", "{}\n"),
+];
+
+/// Create every missing [`PROFILE_CONTROLS`] file in `profile` (mode 0600)
+/// with its placeholder; existing files are left byte-for-byte alone.
+pub fn ensure_profile_controls(profile: &Path) -> Result<()> {
+    for (name, placeholder) in PROFILE_CONTROL_PLACEHOLDERS {
+        let path = profile.join(name);
+        if path.symlink_metadata().is_ok() {
+            continue;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("creating placeholder {}", path.display()))?;
+        std::io::Write::write_all(&mut file, placeholder.as_bytes())
+            .with_context(|| format!("writing placeholder {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// The full `docker run` argv for a host-mode session container (issue
 /// #9979). Pure, so the posture is unit-testable without Docker.
 ///
 /// What the container can reach, and nothing else:
 /// * `codex_home` read-write at the image's fixed `CODEX_HOME` (the
-///   account's own `auth.json` refresh chain; ADR-0017 Decision 1).
+///   account's own `auth.json` refresh chain; ADR-0017 Decision 1) —
+///   except each of [`PROFILE_CONTROLS`], bound **read-only over its own
+///   path** from the identically-named host file, as a private-clone session
+///   binds them. With Codex's sandbox off a session could otherwise rewrite
+///   its own hook registration or trust state (say, change the hook's
+///   matcher: the command Loom pins is unchanged, but Codex's trust hash
+///   covers the whole group, so Codex skips the hook) and the NEXT session
+///   would read guard-ready while running unhooked. A mount point is immune
+///   to write (`EROFS`), unlink, rename and symlink-over (`EBUSY`/`EEXIST`),
+///   while `auth.json` and Codex's state databases beside it stay writable.
 /// * each of `roots` read-write at its own host path (see
 ///   [`workspace_mount_roots`]).
 /// * each of `credentials` read-only at its own host path: the daemon's
@@ -335,6 +391,14 @@ pub fn host_session_run_args(
         "-v".into(),
         format!("{}:{CONTAINER_CODEX_HOME}", codex_home.display()),
     ];
+    for name in PROFILE_CONTROLS {
+        args.push("--mount".into());
+        args.push(format!(
+            "type=bind,src={},dst={},readonly",
+            codex_home.join(name).display(),
+            profile_control_destination(name)
+        ));
+    }
     for root in roots {
         let root = root.display().to_string();
         args.push("-v".into());
@@ -1021,6 +1085,7 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
                 self.runner.start_existing(&container)?;
             }
             None => {
+                ensure_profile_controls(&profile)?;
                 self.runner
                     .create(&container, &self.image, &profile, &requested_workspace)?;
             }

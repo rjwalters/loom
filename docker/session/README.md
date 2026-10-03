@@ -185,7 +185,13 @@ therefore creates the container with:
 
 - `--cap-drop ALL --security-opt no-new-privileges`, with Docker's default
   seccomp/AppArmor left in force;
-- the account profile read-write at `CODEX_HOME`;
+- the account profile read-write at `CODEX_HOME`, **except** its
+  `hooks.json`, `config.toml` and `loom-codex-hooks.json`. Each of those is
+  bound read-only over its own path, as private-clone sessions bind them, and
+  is created as an inert placeholder first if missing. With the sandbox off, a
+  session could otherwise rewrite its own hook registration or trust state.
+  The next session would then read as guard-ready while Codex skipped Loom's
+  hook;
 - **only the registered repositories** (`~/.loom/workspaces.json`) under
   `--mount-workspace`, read-write at path parity, not the whole parent;
 - never `/`, the home directory or its ancestors, nor anything overlapping a
@@ -197,6 +203,18 @@ therefore creates the container with:
   container's actual `HostConfig` (no privileged mode, host namespaces, added
   caps, `unconfined` or docker.sock; `CapDrop ALL` and `no-new-privileges`
   present).
+- The gate also requires the three profile control files to be read-only
+  binds. In host mode it requires the container's copy of each to hash the
+  same as the host file (`docker exec … sha256sum`).
+
+A file bind does not follow a host-side replace: after `provision-codex-hooks.sh
+install` or accepting hook trust, the container sees the old file, or (Docker
+Desktop) no file. So after either step, **restart the session**:
+`accounts session stop` and then `start`. Until then dispatch exits 78. Codex
+0.160 runs normally with these files frozen. The exception is its interactive
+TUI, which cannot save a folder-trust or hook-trust decision. For now, take
+those decisions in a throwaway container with the profile writable (see
+`guardrail-parity-codex.md`, "Procedure").
 
 The Claude token pool and the operator's `~/.config/gh` are no longer mounted.
 [`defaults/docs/guardrail-parity-codex.md`](../../defaults/docs/guardrail-parity-codex.md#session-containers-the-container-is-the-boundary-issue-9979)

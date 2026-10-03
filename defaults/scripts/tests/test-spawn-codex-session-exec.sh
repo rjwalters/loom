@@ -62,6 +62,9 @@ trap 'rm -rf "$TMPROOT"' EXIT
 PROFILE="$TMPROOT/profiles/acct"
 mkdir -p "$PROFILE"
 printf '{"token":"stub"}\n' > "$PROFILE/auth.json"
+printf '{"hooks":{}}\n' > "$PROFILE/hooks.json"
+printf '' > "$PROFILE/config.toml"
+printf '{}\n' > "$PROFILE/loom-codex-hooks.json"
 printf '{"schema_version":1,"container_name":"loom-codex-session-acct","adopted_at_unix":0}\n' \
     > "$PROFILE/.session-managed.json"
 
@@ -124,7 +127,18 @@ loom_test_require_daemon_bin --self-only "$(cd "$SCRIPT_DIR/.." && pwd)" session
 FAKE_DOCKER="$TMPROOT/fake-docker"
 cat > "$FAKE_DOCKER" <<'FAKE'
 #!/usr/bin/env bash
-# Answers only `docker inspect ... <container>` with $FAKE_INSPECT (JSON).
+# Answers `docker inspect ... <container>` with $FAKE_INSPECT (JSON), and the
+# posture gate's `docker exec <c> sha256sum -- <profile controls>` from
+# $CODEX_HOME: the container sees the host's copy, except a control named in
+# $FAKE_CONTROLS_STALE (a host-side replace the file bind did not follow).
+if [[ "$1" == "exec" && "$3" == "sha256sum" ]]; then
+    command -v sha256sum >/dev/null && sum=(sha256sum) || sum=(shasum -a 256)
+    for p in "${@:5}"; do
+        [[ -f "$CODEX_HOME/${p##*/}" && "${p##*/}" != "${FAKE_CONTROLS_STALE:-}" ]] || continue
+        printf '%s  %s\n' "$("${sum[@]}" < "$CODEX_HOME/${p##*/}" | cut -d' ' -f1)" "$p"
+    done
+    exit 0
+fi
 [[ "$1" == "inspect" ]] || exit 1
 [[ -n "${FAKE_INSPECT+x}" ]] || { echo "[]"; echo "Error: No such object" >&2; exit 1; }
 printf '%s\n' "$FAKE_INSPECT"
@@ -133,9 +147,15 @@ chmod +x "$FAKE_DOCKER"
 
 # state <running> <labels-json> [<hostconfig-json>] [<mounts-json>]
 HC_OK='{"Privileged":false,"NetworkMode":"bridge","CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"]}'
+# control_mount <file> [<RW>]: the read-only bind of one profile control.
+control_mount() {
+    printf '{"Type":"bind","Source":"%s/%s","Destination":"/home/loom/.codex-profile/%s","RW":%s}' \
+        "$PROFILE" "$1" "$1" "${2:-false}"
+}
+CONTROLS="$(control_mount hooks.json),$(control_mount config.toml),$(control_mount loom-codex-hooks.json)"
 state() {
     printf '[{"State":{"Running":%s},"Config":{"Labels":%s},"HostConfig":%s,"Mounts":%s}]' \
-        "$1" "$2" "${3:-$HC_OK}" "${4:-[]}"
+        "$1" "$2" "${3:-$HC_OK}" "${4:-[$CONTROLS]}"
 }
 HOST_LABEL='{"loom.session-posture":"container-boundary-v1"}'
 CLONE_LABEL='{"loom.workspace-mode":"private-clone"}'
@@ -196,6 +216,32 @@ done
 out="$(session_run "$(state true "$HOST_LABEL" "$HC_OK" '[{"Source":"/var/run/docker.sock","Destination":"/var/run/docker.sock"}]')" bash "$SPAWN_CODEX" -p "hi")"
 assert_contains "docker-socket-mounted" "$out" "a docker.sock mount is refused"
 
+# The profile's hook-control files are part of the posture: with the sandbox
+# off, a session that could rewrite hooks.json / config.toml /
+# loom-codex-hooks.json could leave the NEXT session reading guard-ready while
+# Codex skips Loom's hook. Each must be a read-only bind, under both labels.
+for name in hooks.json config.toml loom-codex-hooks.json; do
+    others="$(for o in hooks.json config.toml loom-codex-hooks.json; do [[ "$o" == "$name" ]] || printf '%s,' "$(control_mount "$o")"; done)"
+    for label in "$HOST_LABEL" "$CLONE_LABEL"; do
+        for mounts in "[${others}$(control_mount "$name" true)]" "[${others%,}]"; do
+            out="$(session_run "$(state true "$label" "$HC_OK" "$mounts")" bash "$SPAWN_CODEX" -p "hi")"
+            assert_contains "rc=78" "$out" "$name writable or unbound ($label): exit 78"
+            assert_contains "profile-control-writable($name)" "$out" "…naming the control ($name)"
+            assert_not_contains "would-exec:" "$out" "…before anything is dispatched ($name)"
+        done
+    done
+done
+# In host mode the container's copy must be the host's: a file bind does not
+# follow a host-side replace (provisioning, accepting hook trust), so Codex
+# would read a stale or missing registration while the host verifies ready.
+for name in hooks.json config.toml loom-codex-hooks.json; do
+    out="$(session_run "$(state true "$HOST_LABEL")" env FAKE_CONTROLS_STALE="$name" bash "$SPAWN_CODEX" -p "hi")"
+    assert_contains "rc=78" "$out" "a host-mode container with a stale $name exits 78"
+    assert_contains "does not see the host's copy of its profile control files: $name" "$out" "…naming it"
+    assert_contains "loom-daemon accounts session stop acct" "$out" "…and the restart step"
+    assert_not_contains "would-exec:" "$out" "…before anything is dispatched (stale $name)"
+done
+
 # A missing or stopped container never gets the sandbox dropped: the posture
 # is unverifiable, the requested mode stands, and dispatch is refused
 # downstream by `session-exec host` (asserted in test-spawn-codex.sh).
@@ -214,7 +260,7 @@ assert_contains "rc=78" "$out" "an invalid LOOM_CODEX_CONTAINER_SANDBOX exits 78
 
 # gh inside a host-mode container authenticates through the daemon's App token
 # dir: the PATH is passed through by name, never a token value.
-GH_MOUNTS="[{\"Source\":\"$WS/.loom/gh-config\",\"Destination\":\"$WS/.loom/gh-config\"}]"
+GH_MOUNTS="[{\"Source\":\"$WS/.loom/gh-config\",\"Destination\":\"$WS/.loom/gh-config\"},$CONTROLS]"
 out="$(session_run "$(state true "$HOST_LABEL" "$HC_OK" "$GH_MOUNTS")" env GH_CONFIG_DIR="$WS/.loom/gh-config" GH_TOKEN=never-forward-token bash "$SPAWN_CODEX" -p "hi")"
 line="$(printf '%s\n' "$out" | grep '^spawn-codex would-exec:' || true)"
 assert_contains "--env GH_CONFIG_DIR --" "$line" "GH_CONFIG_DIR is passed through (by name) into a host-mode container that mounts it"

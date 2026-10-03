@@ -817,8 +817,8 @@ fi
 # profile, which no Loom default does.
 #
 # The decision itself — read the container's labels AND its actual HostConfig,
-# refuse (78) an unhardened or drifted container, decide whether the
-# dispatch's GH_CONFIG_DIR is mounted in it — lives in the daemon
+# refuse (78) an unhardened or drifted container (incl. unfrozen or stale profile
+# controls), decide whether the dispatch's GH_CONFIG_DIR is mounted in it — lives in the daemon
 # (`loom-daemon session-exec posture`, session_exec/posture.rs), which prints
 # `mode=<m> sandbox=<s> gh=<forward|skip>`. In argv-preview mode
 # (LOOM_CODEX_NO_EXEC) docker is never touched unless a test names one through
@@ -834,7 +834,7 @@ if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
     elif ! command -v "$_posture_docker" >/dev/null 2>&1; then
         _posture="mode=docker-unavailable sandbox=$SANDBOX_MODE gh=skip"
     elif ! _posture="$("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" session-exec posture --docker "$_posture_docker" \
-        --container "$CODEX_SESSION_CONTAINER" --profile "$CODEX_PROFILE_NAME" --requested "$SANDBOX_MODE")"; then
+        --container "$CODEX_SESSION_CONTAINER" --profile "$CODEX_PROFILE_NAME" --codex-home "$CODEX_HOME" --requested "$SANDBOX_MODE")"; then
         log_error "Refusing to dispatch into $CODEX_SESSION_CONTAINER (see above; a loom-daemon predating #9979 has no 'session-exec posture' — update Loom)."
         exit 78  # EX_CONFIG
     fi
@@ -1029,7 +1029,7 @@ if [[ "$_hook_required" == "true" && "$_hook_status" != "ready" && "$_hook_statu
     log_error "Without it a Codex worker runs with NO managed-worktree confinement, NO destructive-command blocking, and NO Loom workflow interception."
     log_error "Provision and trust the profile, then retry (Loom will not pass --dangerously-bypass-hook-trust, issue #4495):"
     log_error "  .loom/scripts/provision-codex-hooks.sh install --all-profiles --workspace $WORKSPACE"
-    log_error "  accept the hook-trust prompt once per profile WHERE IT RUNS (inside its session container if session-managed)"
+    log_error "  accept the hook-trust prompt once per profile WHERE IT RUNS (session-managed: a throwaway container at the session mount point, then restart the session — guardrail-parity-codex.md)"
     log_error "  .loom/scripts/provision-codex-hooks.sh verify --all-profiles --workspace $WORKSPACE --json"
     exit 78  # EX_CONFIG
 fi

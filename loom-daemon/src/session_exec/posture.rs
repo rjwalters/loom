@@ -12,14 +12,30 @@
 //! boundary), the same way `private_workspace::docker::validate_settings`
 //! refuses to reuse a private-clone container whose settings drifted.
 //!
+//! The profile's hook-control files ([`PROFILE_CONTROLS`]) are part of that
+//! posture: with Codex's sandbox off, a session that could write its own
+//! `hooks.json`/`config.toml`/`loom-codex-hooks.json` could leave the NEXT
+//! session reading guard-ready while Codex skips Loom's hook. So each must be
+//! a read-only bind (from `docker inspect`), and in a host-mode container
+//! the container's view of each must be byte-identical to the host file
+//! `spawn-codex.sh` verified (`docker exec … sha256sum`): a file bind does not
+//! follow a host-side atomic replace (provisioning, accepting hook trust), so
+//! after one the container sees a stale or missing file while the host reads
+//! ready.
+//!
 //! Output (stdout, one line): `mode=<m> sandbox=<s> gh=<forward|skip>`.
 //! Refusals print their reason to stderr and exit 78 (EX_CONFIG).
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
 
-use crate::tokens_pool::session_lifecycle::{SESSION_POSTURE, SESSION_POSTURE_LABEL};
+use crate::tokens_pool::profile_ledger::sha256_hex;
+use crate::tokens_pool::session_lifecycle::{
+    profile_control_destination, PROFILE_CONTROLS, SESSION_POSTURE, SESSION_POSTURE_LABEL,
+};
 
 /// Arguments for `session-exec posture`.
 #[derive(clap::Args)]
@@ -33,6 +49,11 @@ pub struct PostureArgs {
     /// The sandbox mode the dispatch resolved before the container was known.
     #[arg(long)]
     pub requested: String,
+    /// The account profile on the host (`CODEX_HOME` as `spawn-codex.sh`
+    /// verified it). Required for a host-mode container, whose view of the
+    /// profile controls is compared with these files.
+    #[arg(long)]
+    pub codex_home: Option<PathBuf>,
     /// Docker binary (test seam; `LOOM_CODEX_SESSION_DOCKER`).
     #[arg(long, default_value = "docker")]
     pub docker: String,
@@ -127,7 +148,64 @@ pub fn violations(state: &Value) -> Vec<String> {
     }) {
         found.push("docker-socket-mounted".into());
     }
+    for name in PROFILE_CONTROLS {
+        let destination = profile_control_destination(name);
+        let frozen = mounts.iter().any(|m| {
+            m["Destination"] == destination.as_str()
+                && m["Type"] == "bind"
+                && m["RW"] == Value::Bool(false)
+        });
+        if !frozen {
+            found.push(format!("profile-control-writable({name})"));
+        }
+    }
     found
+}
+
+/// The container's view of the profile controls, or why it could not be
+/// read. `Ok` holds the names whose container copy differs from (or is
+/// missing beside) the host file.
+pub type ControlDrift = Result<Vec<String>, String>;
+
+/// `sha256sum` output (`<hex>  <path>` per line) as path → hex.
+#[must_use]
+pub fn parse_sha256sum(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| {
+            let (hex, path) = line.split_once("  ").or_else(|| line.split_once(" *"))?;
+            Some((path.to_string(), hex.trim().to_ascii_lowercase()))
+        })
+        .collect()
+}
+
+/// The [`PROFILE_CONTROLS`] whose host file under `codex_home` is missing or
+/// hashes differently from the container's copy in `seen`.
+#[must_use]
+pub fn drifted(codex_home: &Path, seen: &BTreeMap<String, String>) -> Vec<String> {
+    PROFILE_CONTROLS
+        .iter()
+        .filter(|name| {
+            let host = std::fs::read(codex_home.join(name))
+                .ok()
+                .map(|bytes| sha256_hex(&bytes));
+            host.is_none() || seen.get(&profile_control_destination(name)) != host.as_ref()
+        })
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn control_drift(docker: &str, container: &str, codex_home: Option<&Path>) -> ControlDrift {
+    let codex_home = codex_home.ok_or("no --codex-home was given")?;
+    let paths: Vec<String> = PROFILE_CONTROLS
+        .iter()
+        .map(|name| profile_control_destination(name))
+        .collect();
+    let output = Command::new(docker)
+        .args(["exec", container, "sha256sum", "--"])
+        .args(&paths)
+        .output()
+        .map_err(|error| format!("docker exec {container} sha256sum: {error}"))?;
+    Ok(drifted(codex_home, &parse_sha256sum(&String::from_utf8_lossy(&output.stdout))))
 }
 
 /// Classify one `docker inspect` object.
@@ -190,9 +268,16 @@ pub struct Env {
     pub leased: bool,
 }
 
-/// Decide. `state` is `None` when docker could not be asked at all.
+/// Decide. `state` is `None` when docker could not be asked at all. `drift`
+/// reads the container's view of the profile controls; it is called only for
+/// a hardened host-mode container.
 #[must_use]
-pub fn decide(args: &PostureArgs, state: Option<&Value>, env: &Env) -> Decision {
+pub fn decide(
+    args: &PostureArgs,
+    state: Option<&Value>,
+    env: &Env,
+    drift: impl FnOnce() -> ControlDrift,
+) -> Decision {
     let c = &args.container;
     let mut d = Decision {
         mode: String::new(),
@@ -252,6 +337,23 @@ pub fn decide(args: &PostureArgs, state: Option<&Value>, env: &Env) -> Decision 
             ));
         }
     }
+    if posture == Posture::Host {
+        let changed = match drift() {
+            Ok(changed) if changed.is_empty() => None,
+            Ok(changed) => Some(changed.join(" ")),
+            Err(error) => Some(format!("unverifiable ({error})")),
+        };
+        if let Some(changed) = changed {
+            d.messages.push(format!(
+                "Session container {c} does not see the host's copy of its profile control files: {changed}."
+            ));
+            d.messages.push("They are bound read-only, and a file bind does not follow a host-side replace (hook provisioning, accepting hook trust), so Codex inside would read a stale or missing registration while the host reads it as ready (issue #9979).".into());
+            d.messages.extend(recreate);
+            d.sandbox.clone_from(&args.requested);
+            d.code = 78;
+            return d;
+        }
+    }
     // GH_CONFIG_DIR: the daemon's App-token dir, mounted read-only into a
     // host-mode container at path parity; forwarding the PATH lets `gh`
     // inside authenticate as the fleet App. Never into a private clone (it
@@ -297,7 +399,9 @@ pub fn run(args: &PostureArgs) -> i32 {
         leased: std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_some(),
     };
     let state = inspect(&args.docker, &args.container);
-    let d = decide(args, state.as_ref(), &env);
+    let d = decide(args, state.as_ref(), &env, || {
+        control_drift(&args.docker, &args.container, args.codex_home.as_deref())
+    });
     for line in &d.messages {
         eprintln!("session-exec posture: {line}");
     }

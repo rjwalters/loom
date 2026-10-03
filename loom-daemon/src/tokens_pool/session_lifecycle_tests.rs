@@ -1018,11 +1018,14 @@ fn host_session_run_args_mount_only_the_profile_and_the_given_roots() {
         mounts,
         vec![
             "/profiles/alice:/home/loom/.codex-profile",
+            "type=bind,src=/profiles/alice/hooks.json,dst=/home/loom/.codex-profile/hooks.json,readonly",
+            "type=bind,src=/profiles/alice/config.toml,dst=/home/loom/.codex-profile/config.toml,readonly",
+            "type=bind,src=/profiles/alice/loom-codex-hooks.json,dst=/home/loom/.codex-profile/loom-codex-hooks.json,readonly",
             "/home/u/GitHub/loom:/home/u/GitHub/loom",
             "/home/u/GitHub/anvil:/home/u/GitHub/anvil",
             "/home/u/loom-daemon/.loom/gh-config:/home/u/loom-daemon/.loom/gh-config:ro",
         ],
-        "no Claude token pool, no personal gh config, no checkout parent; App token dir read-only"
+        "no Claude token pool, no personal gh config, no checkout parent; App token dir and profile controls read-only"
     );
 }
 
@@ -1164,3 +1167,6 @@ fn check_mount_denials_refuses_any_root_overlapping_a_firewalled_repo() {
     // (component-wise, not string-prefix, comparison).
     assert!(check_mount_denials(&[base.join("GitHub/notebook-public")], None, &wall).is_ok());
 }
+
+#[path = "session_lifecycle_controls_tests.rs"]
+mod controls;
