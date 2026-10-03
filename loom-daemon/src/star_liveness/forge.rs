@@ -157,7 +157,7 @@ impl GhStarForge {
     #[must_use]
     pub fn new(root: &Path, slug: &str) -> Self {
         Self {
-            gh_bin: PathBuf::from("gh"),
+            gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
             root: root.to_path_buf(),
             slug: slug.to_string(),
         }

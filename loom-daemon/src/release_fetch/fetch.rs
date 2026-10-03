@@ -164,7 +164,7 @@ impl Drop for ScratchDir {
 }
 
 fn download(repo_root: &Path, repo_slug: &str, tag: &str, patterns: &[&str], dest: &Path) -> bool {
-    let mut cmd = Command::new("gh");
+    let mut cmd = Command::new(crate::gh_invocation::gh_bin());
     cmd.arg("release")
         .arg("download")
         .arg(tag)

@@ -846,7 +846,7 @@ pub(super) async fn resolve_repo_slug_cached(
 /// timeout, an empty/malformed answer) degrades to `None` — the caller drops
 /// the record rather than emitting a fabricated repo identity.
 async fn fetch_repo_slug(workspace_root: &Path) -> Option<String> {
-    let mut cmd = tokio::process::Command::new("gh");
+    let mut cmd = tokio::process::Command::new(crate::gh_invocation::gh_bin());
     cmd.arg("repo")
         .arg("view")
         .arg("--json")

@@ -918,7 +918,7 @@ impl ViolationReporter for GhIssueFiler {
     fn has_open_issue(&self, marker: &str) -> Result<bool, String> {
         // `gh issue list --search "<marker>" --state open` — GitHub full-text
         // search matches the hidden HTML comment in the body.
-        let mut cmd = Command::new("gh");
+        let mut cmd = Command::new(crate::gh_invocation::gh_bin());
         cmd.args([
             "issue", "list", "--state", "open", "--search", marker, "--json", "number",
         ])
@@ -955,7 +955,7 @@ impl ViolationReporter for GhIssueFiler {
                 .current_dir(&self.repo_root);
             c
         } else {
-            let mut c = Command::new("gh");
+            let mut c = Command::new(crate::gh_invocation::gh_bin());
             c.args([
                 "issue",
                 "create",

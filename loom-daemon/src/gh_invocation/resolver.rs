@@ -35,7 +35,21 @@ pub struct ResolvedGh {
 /// Resolve the `gh` executable from the live process state.
 #[must_use]
 pub fn resolve() -> ResolvedGh {
-    resolve_from(policy_launcher_path(), std::env::var("LOOM_GH_BIN").ok())
+    resolve_from(policy_launcher_path(), env_override())
+}
+
+/// `LOOM_GH_BIN`, and in a unit-test build a loud-failing stub when it is
+/// unset (#10088), so `cargo test` can never reach the real `gh` and spend the
+/// operator's forge quota.
+fn env_override() -> Option<String> {
+    let env = std::env::var("LOOM_GH_BIN").ok();
+    #[cfg(test)]
+    {
+        if env.is_none() {
+            return Some(test_stub::path().to_string_lossy().into_owned());
+        }
+    }
+    env
 }
 
 /// The pure precedence ladder, separated from process state for testing.
@@ -74,4 +88,34 @@ pub fn gh_bin() -> String {
 /// function, not every caller.
 fn policy_launcher_path() -> Option<String> {
     None
+}
+
+/// The unit-test-build `gh` stub (#10088).
+#[cfg(test)]
+pub(crate) mod test_stub {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static STUB: OnceLock<(tempfile::TempDir, PathBuf)> = OnceLock::new();
+
+    /// Path of a `gh` stand-in that prints the args it was called with and
+    /// exits 127, appending them to `$LOOM_GH_STUB_LOG` when set. Written
+    /// once per test process.
+    pub(crate) fn path() -> PathBuf {
+        STUB.get_or_init(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().expect("stub tempdir");
+            let p = dir.path().join("gh");
+            let script = "#!/bin/sh\n\
+                echo \"loom-daemon test reached the real gh: $*\" >&2\n\
+                [ -n \"$LOOM_GH_STUB_LOG\" ] && echo \"$*\" >> \"$LOOM_GH_STUB_LOG\"\n\
+                exit 127\n";
+            std::fs::write(&p, script).expect("write stub");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+            (dir, p)
+        })
+        .1
+        .clone()
+    }
 }

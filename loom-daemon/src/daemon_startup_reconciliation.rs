@@ -188,7 +188,7 @@ fn run_startup_quarantine_pass(fallback_root: &Path) {
     let workspace_registry =
         crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
-    let gh_bin = std::path::PathBuf::from("gh");
+    let gh_bin = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
     let mut total_checked = 0usize;
     let mut total_released = 0usize;
     for root in &roots {

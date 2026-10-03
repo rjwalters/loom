@@ -98,7 +98,7 @@ pub fn gh_cmd(repo_root: &Path) -> PathBuf {
             return cached;
         }
     }
-    PathBuf::from("gh")
+    PathBuf::from(crate::gh_invocation::gh_bin())
 }
 
 #[cfg(unix)]
@@ -123,7 +123,7 @@ pub fn run_gh(args: &[&str], repo_root: &Path, use_cache: bool) -> CmdOutcome {
     let program = if use_cache {
         gh_cmd(repo_root)
     } else {
-        PathBuf::from("gh")
+        PathBuf::from(crate::gh_invocation::gh_bin())
     };
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn gh_cmd_falls_back_to_plain_gh_without_a_wrapper() {
         let dir = tempdir().unwrap();
-        assert_eq!(gh_cmd(dir.path()), PathBuf::from("gh"));
+        assert_eq!(gh_cmd(dir.path()), PathBuf::from(crate::gh_invocation::gh_bin()));
     }
 
     #[test]

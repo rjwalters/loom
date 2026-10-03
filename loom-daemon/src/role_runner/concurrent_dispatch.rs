@@ -405,7 +405,7 @@ pub fn forge_queue_probe() -> QueueProbe {
         let gh_bin = std::env::var("LOOM_GH_BIN")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .map_or_else(|| PathBuf::from("gh"), PathBuf::from);
+            .map_or_else(|| PathBuf::from(crate::gh_invocation::gh_bin()), PathBuf::from);
         for label in labels {
             let rows = crate::forge_listing::list_issues_cached_as(
                 QUEUE_GATE_CALLER,

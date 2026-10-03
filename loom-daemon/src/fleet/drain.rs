@@ -362,7 +362,7 @@ impl ClaimResetter for GhClaimResetter {
         // owner's installation token; without it, the label edit/comment below
         // (writes) would silently 404 under the root owner's token. A no-op for
         // a single-owner fleet or the root owner's own repos.
-        let mut view_cmd = Command::new("gh");
+        let mut view_cmd = Command::new(crate::gh_invocation::gh_bin());
         view_cmd
             .env("PATH", &gh_path)
             .args([
@@ -395,7 +395,7 @@ impl ClaimResetter for GhClaimResetter {
             return Ok(false);
         }
 
-        let mut edit_cmd = Command::new("gh");
+        let mut edit_cmd = Command::new(crate::gh_invocation::gh_bin());
         edit_cmd
             .env("PATH", &gh_path)
             .args([
@@ -424,7 +424,7 @@ impl ClaimResetter for GhClaimResetter {
 
         // Best-effort comment — never fails the reset itself (mirrors the
         // rest of Loom's "a forge comment is advisory" posture).
-        let mut comment_cmd = Command::new("gh");
+        let mut comment_cmd = Command::new(crate::gh_invocation::gh_bin());
         comment_cmd
             .env("PATH", &gh_path)
             .args([
@@ -1888,8 +1888,17 @@ exit 0
         let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", fake_home.path());
 
+        // #10088: `gh` resolves through `LOOM_GH_BIN` (a loud-failing stub in
+        // test builds), so point it at the stub explicitly.
+        let old_gh = std::env::var_os("LOOM_GH_BIN");
+        std::env::set_var("LOOM_GH_BIN", local_bin.join("gh"));
+
         let result = GhClaimResetter.reset_claim("rjwalters/loom", 4831, "worker-stub");
 
+        match old_gh {
+            Some(v) => std::env::set_var("LOOM_GH_BIN", v),
+            None => std::env::remove_var("LOOM_GH_BIN"),
+        }
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
@@ -1921,8 +1930,17 @@ exit 0
         let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", fake_home.path());
 
+        // #10088: `gh` resolves through `LOOM_GH_BIN` (a loud-failing stub in
+        // test builds), so point it at the stub explicitly.
+        let old_gh = std::env::var_os("LOOM_GH_BIN");
+        std::env::set_var("LOOM_GH_BIN", local_bin.join("gh"));
+
         let result = GhClaimResetter.reset_claim("rjwalters/loom", 4831, "worker-stub");
 
+        match old_gh {
+            Some(v) => std::env::set_var("LOOM_GH_BIN", v),
+            None => std::env::remove_var("LOOM_GH_BIN"),
+        }
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),

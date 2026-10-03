@@ -181,7 +181,7 @@ struct RestHead {
 fn merged_head_rest(repo_root: &Path, owner: &str, branch: &str) -> Option<ForgeProbe> {
     let path =
         format!("repos/{{owner}}/{{repo}}/pulls?state=all&head={owner}:{branch}&per_page=30");
-    let mut cmd = Command::new("gh");
+    let mut cmd = Command::new(crate::gh_invocation::gh_bin());
     cmd.args(["api", &path]).current_dir(repo_root);
     crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
     let out = gh::bounded_output(cmd, gh::GH_PROBE_TIMEOUT)?;
