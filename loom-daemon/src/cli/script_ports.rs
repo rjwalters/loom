@@ -58,6 +58,13 @@ pub(crate) enum ScriptPortCommand {
     /// caller — an older binary lacking it degrades to the flat reason.
     ReleaseExplain(super::release_explain::ReleaseExplainArgs),
 
+    /// Whether an exit-0 Codex session ran nothing because its sandbox
+    /// refused every shell command (#10003). Backs `spawn-codex.sh`'s
+    /// terminal classification. Exit 0 + one `shape=…` line = a no-op, 1 = it
+    /// ran something. Optional to its caller — an older binary lacking it
+    /// leaves the session classified as before.
+    CodexSandboxNoop(super::codex_sandbox_noop_cli::CodexSandboxNoopArgs),
+
     /// `merge-pr.sh`'s verdict-label mutual-exclusion guard (#8112), the
     /// second slice of the merge-pr port (#8191). Exit 1 = contradictory,
     /// 0 = clean, 2 = the guard could not run — and 2 must refuse the merge.
@@ -491,6 +498,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::ReleaseFetch(args) => args.run(),
             ScriptPortCommand::ReleaseResolve(args) => args.run(),
             ScriptPortCommand::ReleaseExplain(args) => args.run(),
+            ScriptPortCommand::CodexSandboxNoop(args) => args.run(),
             ScriptPortCommand::MergePr(cmd) => cmd.run(),
             ScriptPortCommand::ShellBudget(args) => args.run(),
             ScriptPortCommand::Eta(cmd) => cmd.run(),
