@@ -603,17 +603,6 @@ max_age_exceeded() {
     ((now - started >= cap))
 }
 
-# --- gh-call attribution (Issue #10139) ----------------------------------
-# The detached renewer is reparented to init/launchd, so a gh shim walking
-# its parent chain never reaches the sweep; LOOM_SWEEP_ID / LOOM_ROLE are the
-# only way its forge calls can be attributed. Telemetry only -- lease
-# targeting still uses the local host/sweep pair, never these variables.
-# An empty sweep id keeps any inherited LOOM_SWEEP_ID (never invent/erase).
-export_gh_attribution() {
-    [[ -z "${1:-}" ]] || export LOOM_SWEEP_ID="$1"
-    export LOOM_ROLE="sweep-lease-renew"
-}
-
 # --- renew-once --------------------------------------------------------
 
 cmd_renew_once() {
@@ -650,7 +639,16 @@ cmd_renew_once() {
         echo "ERROR: renew-once: --cached-lease must be <comment-id>@<created_at> (got: '$cached')" >&2
         exit 1
     fi
-    export_gh_attribution "$sweep_id"
+    # gh-call attribution (Issue #10139): the detached renewer is reparented
+    # to init/launchd, so a gh shim walking its parent chain never reaches the
+    # sweep; these two variables are the only way its forge calls can be
+    # attributed. Every forge call -- including the detached `start` loop's,
+    # which all run through this subcommand with the resolved --sweep-id --
+    # happens after this point. Telemetry only: lease targeting still uses the
+    # local host/sweep pair. An empty sweep id keeps any inherited
+    # LOOM_SWEEP_ID (never invent or erase one).
+    [[ -z "$sweep_id" ]] || export LOOM_SWEEP_ID="$sweep_id"
+    export LOOM_ROLE="sweep-lease-renew"
     # The cache-miss path: the same invocation minus the cache, i.e. today's
     # full paginated lookup. `exec` (not a call) so it can never recurse twice.
     local -a relist=("$SELF" renew-once "$issue" ${host:+--host "$host" --sweep-id "$sweep_id"})
@@ -910,9 +908,6 @@ cmd_start() {
     local -a extra_args=()
     [[ -n "$host" ]] && extra_args+=(--host "$host")
     [[ -n "$sweep_id" ]] && extra_args+=(--sweep-id "$sweep_id")
-    # Before the fork, so the detached loop and every renew-once it runs
-    # inherit the resolved identity (#10139).
-    export_gh_attribution "$sweep_id"
 
     # Save the ORIGINAL stderr (Issue #6541) on a private fd BEFORE the
     # detach redirect below sends the loop's own stdout/stderr to /dev/null.
@@ -991,9 +986,7 @@ cmd_start() {
             elif [[ "$renew_rc" -ne 4 ]]; then
                 echo "sweep-lease-renew: renewal cycle for issue #${issue} FAILED (renew-once exit ${renew_rc}): ${renew_err}" >&9
             fi
-            if [[ "$renew_rc" -eq 4 ]]; then
-                break
-            fi
+            [[ "$renew_rc" -ne 4 ]] || break
         done
     ) < /dev/null > /dev/null 2>&1 &
     local loop_pid=$!
