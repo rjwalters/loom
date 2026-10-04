@@ -46,7 +46,11 @@
 //! be resolved, a non-GitHub forge, a cwd that is not a git repository. Both
 //! callers treat it exactly like [`Equivalence::Changed`]: invalidate the
 //! verdict / re-arm the hold, the pre-#9416 behavior. The only thing an
-//! unavailable comparison can ever cost is a redundant re-review.
+//! unavailable comparison can ever cost is a redundant re-review — and since
+//! #10134 it is never a SILENT one: [`assess`] returns why each kind could not
+//! answer, and both callers surface it (the daemon pass in its log line and
+//! stale-verdict comment, the shell guard in its `REASON`). The clean-merge
+//! kind also fetches an absent head before giving up (see [`git_objects`]).
 //!
 //! # One implementation, two callers
 //!
@@ -67,10 +71,11 @@ pub mod git_objects;
 pub mod patch_identity;
 
 #[cfg(test)]
+mod fetch_tests;
+#[cfg(test)]
 mod tests;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use crate::forge_tree_unchanged::{tree_unchanged, verdict_tree_carveout_enabled};
 
@@ -205,24 +210,41 @@ pub(crate) fn is_safe_ref(s: &str) -> bool {
 /// failure. `cwd` is what resolves the `{owner}/{repo}` placeholders, so a
 /// daemon managing several roots must pass the root it is asking about —
 /// the same contract [`crate::forge_tree_unchanged::tree_unchanged`] has.
-pub(crate) fn gh_api(gh_bin: &Path, cwd: Option<&Path>, path: &str) -> Option<Vec<u8>> {
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("api").arg(path);
+pub(crate) fn gh_api(
+    op: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    path: &str,
+) -> Option<Vec<u8>> {
+    // #10089: counted via the facade under `op`.
+    crate::claim_reconciliation::gh_call::ok_stdout(optional_cwd(
+        op,
+        gh_bin,
+        cwd,
+        ["api", path].iter().copied(),
+    ))
+}
+
+/// A facade read of `gh_bin` in `cwd` (when given), carrying `args`.
+fn optional_cwd<'a>(
+    op: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    args: impl Iterator<Item = &'a str>,
+) -> crate::gh_invocation::GhInvocation {
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    let mut inv = GhInvocation::new(
+        Operation::new(op),
+        AccessIntent::Read,
+        GhTarget::None,
+        crate::claim_reconciliation::gh_call::GH_TIMEOUT,
+    )
+    .program(gh_bin)
+    .args(args);
     if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-        // #5401: a cross-owner managed repo needs its own owner's
-        // installation-token GH_CONFIG_DIR (no-op for single-owner fleets).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, dir);
+        inv = inv.current_dir(dir);
     }
-    let out = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(out.stdout)
+    inv
 }
 
 /// Does `descendant` descend from (or equal) `ancestor`, per the forge's own
@@ -247,6 +269,7 @@ pub(crate) fn descends_from(
         return None;
     }
     let body = gh_api(
+        "verdict.compare",
         gh_bin,
         cwd,
         &format!("repos/{{owner}}/{{repo}}/compare/{ancestor}...{descendant}"),
@@ -267,28 +290,19 @@ pub(crate) fn pr_base_ref(gh_bin: &Path, cwd: Option<&Path>, pr: u32) -> Option<
         #[serde(rename = "baseRefName")]
         base_ref_name: String,
     }
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("pr")
-        .arg("view")
-        .arg(pr.to_string())
-        .arg("--json")
-        .arg("baseRefName");
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, dir);
-    }
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
-    }
-    let out = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let parsed: Pr = serde_json::from_slice(&out.stdout).ok()?;
+    // #10089: counted via the facade (`verdict.pr_base_ref`).
+    let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();
+    let pr = pr.to_string();
+    let args = ["pr", "view", pr.as_str(), "--json", "baseRefName"]
+        .into_iter()
+        .chain(repo_flag.iter().map(String::as_str));
+    let out = crate::claim_reconciliation::gh_call::ok_stdout(optional_cwd(
+        "verdict.pr_base_ref",
+        gh_bin,
+        cwd,
+        args,
+    ))?;
+    let parsed: Pr = serde_json::from_slice(&out).ok()?;
     is_safe_ref(&parsed.base_ref_name).then_some(parsed.base_ref_name)
 }
 
@@ -307,9 +321,9 @@ fn repo_dir(cwd: Option<&Path>) -> Option<PathBuf> {
 /// Tried cheapest-and-strongest first: the already-shipped tree-identical test
 /// (one compare call, no local objects), then the clean-merge test (local
 /// `merge-tree`, which only applies when the head really is a merge of the
-/// base), then the patch-identity test (two compare calls, no local objects,
-/// and the only one that can answer across a rebase whose old head the object
-/// store may no longer hold).
+/// base, fetching an absent head first — #10134), then the patch-identity test
+/// (two compare calls, no local objects, and the only one that can answer
+/// across a rebase whose old head the object store may no longer hold).
 ///
 /// Costs API calls only for a head move the caller has ALREADY decided to
 /// invalidate on — never on the common `Fresh` path.
@@ -321,7 +335,80 @@ pub fn detect(
     reviewed: &str,
     head: &str,
 ) -> Equivalence {
-    detect_with(
+    assess(gh_bin, cwd, pr, reviewed, head).equivalence
+}
+
+/// [`detect`]'s answer plus, when it is [`Equivalence::Indeterminate`], WHY
+/// each kind could not answer (Issue #10134).
+///
+/// Indeterminate still fails closed — both callers clear the verdict exactly as
+/// before — but a clear caused by "could not compare" (an unfetchable commit, a
+/// `gh` outage, a shallow clone) must be visible as such, not indistinguishable
+/// from a real content change. `unavailable` is empty for every `Equivalent`
+/// answer and for a `Changed` every kind could weigh in on; a `Changed` reached
+/// only because a stronger kind could not run keeps its reasons (see
+/// [`Assessment::fail_closed_note`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assessment {
+    pub equivalence: Equivalence,
+    pub unavailable: Vec<String>,
+}
+
+impl Assessment {
+    fn determinate(equivalence: Equivalence) -> Self {
+        Self {
+            equivalence,
+            unavailable: Vec::new(),
+        }
+    }
+
+    fn indeterminate(unavailable: Vec<String>) -> Self {
+        Self {
+            equivalence: Equivalence::Indeterminate,
+            unavailable,
+        }
+    }
+
+    /// The reasons as one line, for a log entry, a CLI diagnostic or a PR
+    /// comment. `None` for a determinate answer.
+    #[must_use]
+    pub fn unavailable_note(&self) -> Option<String> {
+        (self.equivalence == Equivalence::Indeterminate && !self.unavailable.is_empty())
+            .then(|| self.unavailable.join("; "))
+    }
+
+    /// Why a clear is fail-closed rather than proven: the [`Self::unavailable_note`]
+    /// of an `Indeterminate`, or — for a `Changed` reached only because an
+    /// earlier, stronger kind could not run (e.g. the incident's unfetchable
+    /// head, whose base-touches-a-shared-file shape always refutes the patch
+    /// kind) — that kind's reasons, prefixed so the patch refutation is not
+    /// mistaken for a proven content change. `None` for `Equivalent` and for a
+    /// `Changed` every kind weighed in on.
+    #[must_use]
+    pub fn fail_closed_note(&self) -> Option<String> {
+        match self.equivalence {
+            Equivalence::Indeterminate => self.unavailable_note(),
+            Equivalence::Changed if !self.unavailable.is_empty() => Some(format!(
+                "the PR's diff against its base differs (rebase-patch-identical refuted — a base \
+                 change touching a file this PR also changes does that too), but a stronger \
+                 check could not run: {}",
+                self.unavailable.join("; ")
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// [`detect`], with the reasons. See [`Assessment`].
+#[must_use]
+pub fn assess(
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    pr: u32,
+    reviewed: &str,
+    head: &str,
+) -> Assessment {
+    assess_with(
         verdict_tree_carveout_enabled(),
         verdict_equivalence_enabled(),
         gh_bin,
@@ -336,6 +423,7 @@ pub fn detect(
 /// "switched off => nothing asked, no answer" contract is unit-testable without
 /// mutating process env (the same split
 /// [`crate::forge_tree_unchanged`] uses for its own switch).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn detect_with(
     carveout_enabled: bool,
@@ -346,22 +434,44 @@ fn detect_with(
     reviewed: &str,
     head: &str,
 ) -> Equivalence {
+    assess_with(carveout_enabled, new_kinds_enabled, gh_bin, cwd, pr, reviewed, head).equivalence
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assess_with(
+    carveout_enabled: bool,
+    new_kinds_enabled: bool,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    pr: u32,
+    reviewed: &str,
+    head: &str,
+) -> Assessment {
     if !is_sha(reviewed) || !is_sha(head) {
-        return Equivalence::Indeterminate;
+        return Assessment::indeterminate(vec!["an argument is not a bare hex SHA".into()]);
     }
     // The outer kill switch covers all three kinds: with the carve-out off,
     // nothing is asked and nothing is answered.
     if !carveout_enabled {
-        return Equivalence::Indeterminate;
+        return Assessment::indeterminate(vec![
+            "verdict equivalence is switched off (LOOM_VERDICT_TREE_CARVEOUT)".into(),
+        ]);
     }
 
     // Kind 1 — tree-identical (#9124/#9576). Owned by forge_tree_unchanged.
-    if tree_unchanged(gh_bin, cwd, reviewed, head) == Some(true) {
-        return Equivalence::Equivalent(EquivalenceKind::Tree);
+    let mut unavailable = Vec::new();
+    match tree_unchanged(gh_bin, cwd, reviewed, head) {
+        Some(true) => {
+            return Assessment::determinate(Equivalence::Equivalent(EquivalenceKind::Tree))
+        }
+        Some(false) => {}
+        None => unavailable.push(format!("tree: forge compare {reviewed}...{head} unavailable")),
     }
 
     if !new_kinds_enabled {
-        return Equivalence::Indeterminate;
+        unavailable
+            .push("clean-merge / rebase kinds switched off (LOOM_VERDICT_EQUIVALENCE)".into());
+        return Assessment::indeterminate(unavailable);
     }
 
     // Both remaining kinds are relative to the PR's base branch: the
@@ -369,15 +479,25 @@ fn detect_with(
     // patch-identity kind compares two merge-base-relative diffs. An
     // unresolvable base is no answer.
     let Some(base_ref) = pr_base_ref(gh_bin, cwd, pr) else {
-        return Equivalence::Indeterminate;
+        unavailable.push(format!("could not read PR #{pr}'s base branch from the forge"));
+        return Assessment::indeterminate(unavailable);
     };
 
-    // Kind 2 — the clean automatic merge of the base into the branch.
-    let repo = repo_dir(cwd);
-    if let Some(repo) = repo.as_deref() {
-        if clean_merge::evidence(gh_bin, cwd, repo, reviewed, head, &base_ref) == Evidence::Proven {
-            return Equivalence::Equivalent(EquivalenceKind::CleanMerge);
+    // Kind 2 — the clean automatic merge of the base into the branch. Fetches
+    // an absent head first (#10134).
+    match repo_dir(cwd) {
+        Some(repo) => {
+            match clean_merge::assess(gh_bin, cwd, &repo, Some(pr), reviewed, head, &base_ref) {
+                (Evidence::Proven, _) => {
+                    return Assessment::determinate(Equivalence::Equivalent(
+                        EquivalenceKind::CleanMerge,
+                    ))
+                }
+                (_, Some(why)) => unavailable.push(format!("clean-merge: {why}")),
+                (_, None) => {}
+            }
         }
+        None => unavailable.push("clean-merge: no local repository to compare in".into()),
     }
 
     // Kind 3 — the PR's own patch is byte-identical. Deliberately last: it is
@@ -385,9 +505,24 @@ fn detect_with(
     // and the only one that works when the reviewed head has been orphaned by a
     // force-push, because it never touches the object store.
     match patch_identity::evidence(gh_bin, cwd, reviewed, head, &base_ref) {
-        Evidence::Proven => Equivalence::Equivalent(EquivalenceKind::RebasePatchIdentical),
-        Evidence::Refuted => Equivalence::Changed,
-        Evidence::Indeterminate => Equivalence::Indeterminate,
+        Evidence::Proven => {
+            Assessment::determinate(Equivalence::Equivalent(EquivalenceKind::RebasePatchIdentical))
+        }
+        // #10134: still Changed (fail closed), but keep any reason an earlier
+        // kind could not answer — dropping it would make a failed fetch in
+        // the incident's shared-file shape clear the verdict silently.
+        Evidence::Refuted => Assessment {
+            equivalence: Equivalence::Changed,
+            unavailable,
+        },
+        Evidence::Indeterminate => {
+            unavailable.push(
+                "rebase-patch-identical: forge compare unavailable or inconclusive (gh failure, \
+                 truncated or patch-less file list, or two empty diffs)"
+                    .into(),
+            );
+            Assessment::indeterminate(unavailable)
+        }
     }
 }
 
@@ -442,7 +577,8 @@ pub fn reanchor_body(
 /// - `VERDICT_EQUIVALENT=1` + `EQUIVALENCE_KIND=<token>`, exit 0 — a verdict
 ///   rendered against `<reviewed>` still describes `<head>`.
 /// - `VERDICT_EQUIVALENT=0`, exit 0 — it provably does not.
-/// - exit 1 with **nothing on stdout** — no answer.
+/// - exit 1 with **nothing on stdout** — no answer; ONE stderr line names why
+///   (#10134), which the shell guard carries into its `REASON`.
 ///
 /// Both determinate answers exit 0 on purpose, for the same reason
 /// `forge tree-unchanged` does: the *answer* is on stdout and exit 1 means only
@@ -452,7 +588,8 @@ pub fn reanchor_body(
 /// the `EQUIVALENCE_KIND=` line and treat its absence as "re-review".
 pub fn handle(pr: u32, reviewed: &str, head: &str) -> anyhow::Result<()> {
     let gh = crate::forge_cmd::gh_bin();
-    match detect(Path::new(&gh), None, pr, reviewed, head) {
+    let assessment = assess(Path::new(&gh), None, pr, reviewed, head);
+    match assessment.equivalence {
         Equivalence::Equivalent(kind) => {
             println!("VERDICT_EQUIVALENT=1");
             println!("EQUIVALENCE_KIND={}", kind.token());
@@ -460,17 +597,23 @@ pub fn handle(pr: u32, reviewed: &str, head: &str) -> anyhow::Result<()> {
         }
         Equivalence::Changed => {
             println!("VERDICT_EQUIVALENT=0");
+            if let Some(why) = assessment.fail_closed_note() {
+                eprintln!(
+                    "loom-daemon forge verdict-equivalent: PR #{pr} {reviewed} -> {head} not \
+                     shown equivalent — re-review (fail closed). Why: {why}"
+                );
+            }
             std::process::exit(0);
         }
         Equivalence::Indeterminate => {
+            // #10134: ONE line naming WHY, so verdict-staleness-guard.sh can
+            // carry it into its STALE `REASON` instead of a silent clear.
             eprintln!(
-                "loom-daemon forge verdict-equivalent: could not decide whether a verdict \
-                 rendered against {reviewed} still describes {head} on PR #{pr} (a `gh` failure, \
-                 an unparsable or truncated compare, a base ref that could not be resolved, a \
-                 missing git object, a shallow clone, a git predating `merge-tree --write-tree`, \
-                 a `merge-tree` conflict, an argument that is not a bare hex SHA, or a kill \
-                 switch). No answer — callers must treat this as \"the change may have \
-                 changed\" and re-review."
+                "loom-daemon forge verdict-equivalent: could not decide whether the verdict for \
+                 {reviewed} still describes {head} on PR #{pr} — re-review (fail closed). Why: {}",
+                assessment
+                    .unavailable_note()
+                    .unwrap_or_else(|| "no reason recorded".into())
             );
             std::process::exit(1);
         }

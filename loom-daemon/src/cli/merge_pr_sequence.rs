@@ -115,7 +115,9 @@ impl SequencePlanArgs {
         }
         for g in &report.groups {
             let chain: Vec<String> = g.order.iter().map(|n| format!("#{n}")).collect();
-            println!("group {} (plan {}): {}", chain.join(" -> "), g.plan, chain.join(" -> "));
+            // `order` is the landing order; edges are the direct-overlap DAG
+            // (#10060), so two members need not be ordered against each other.
+            println!("group (plan {}) landing order: {}", g.plan, chain.join(" -> "));
             for e in &g.edges {
                 println!(
                     "  would sequence #{follower} after #{after} at pred_head {} [{reason:?}]",

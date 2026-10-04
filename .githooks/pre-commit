@@ -3,18 +3,37 @@
 # Replaces husky + lint-staged with a plain shell script.
 # Activate with: git config core.hooksPath .githooks
 
+# A missing formatter must stop the commit, never silently skip (CI fails on
+# unformatted code anyway). LOOM_PRECOMMIT_ALLOW_MISSING_FORMATTER=1 downgrades
+# a *missing* tool to a loud warning; a formatter that runs and fails still stops.
+require_tool() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  if [ "${LOOM_PRECOMMIT_ALLOW_MISSING_FORMATTER:-}" = "1" ]; then
+    echo "pre-commit: WARNING: $1 not found; staged files were NOT formatted ($2)" >&2
+    return 1
+  fi
+  echo "pre-commit: $1 not found; cannot $2 (set LOOM_PRECOMMIT_ALLOW_MISSING_FORMATTER=1 to bypass)" >&2
+  exit 1
+}
+
 # Format staged TypeScript/JSON files with Biome
 STAGED_TS=$(git diff --cached --name-only --diff-filter=d -- 'src/**/*.ts' 'src/**/*.tsx' 'src/**/*.js' 'src/**/*.jsx' 'e2e/**/*.ts' 'e2e/**/*.tsx' 'defaults/**/*.json')
 if [ -n "$STAGED_TS" ]; then
-  echo "$STAGED_TS" | xargs pnpm biome check --write
-  echo "$STAGED_TS" | xargs git add
+  if require_tool pnpm "format staged TypeScript/JSON files"; then
+    echo "$STAGED_TS" | xargs pnpm biome check --write \
+      || { echo "pre-commit: pnpm biome check failed; fix the errors above and re-commit" >&2; exit 1; }
+    echo "$STAGED_TS" | xargs git add
+  fi
 fi
 
 # Format staged Rust files with rustfmt
 STAGED_RS=$(git diff --cached --name-only --diff-filter=d -- '*.rs')
 if [ -n "$STAGED_RS" ]; then
-  echo "$STAGED_RS" | xargs cargo fmt --
-  echo "$STAGED_RS" | xargs git add
+  if require_tool cargo "format staged Rust files"; then
+    echo "$STAGED_RS" | xargs cargo fmt -- \
+      || { echo "pre-commit: cargo fmt failed; fix the errors above and re-commit" >&2; exit 1; }
+    echo "$STAGED_RS" | xargs git add
+  fi
 fi
 
 # Refuse staged credential-shaped content, whatever its path (#9133). Runs

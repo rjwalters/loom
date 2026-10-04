@@ -19,6 +19,7 @@ mod observability_line;
 mod operator_priority_line;
 mod peer_claims_line;
 mod pending_restart_line;
+mod telemetry_banner;
 
 use loom_daemon::daemon_install_state;
 use loom_daemon::self_update;
@@ -2220,6 +2221,18 @@ pub(crate) fn print_status_human(
         "{}",
         observability_line::render(report.observability_export.as_ref(), Utc::now())
     );
+
+    // The loud telemetry banner (#9950): the one-line render above is the
+    // data; when telemetry is demonstrably broken the common-tool rule says
+    // the status surface must COMPLAIN — what is broken, what it means
+    // (records accumulating locally), and what to fix — on every invocation,
+    // for as long as it lasts. The 2026-10-01 store-tunnel outage ran ~15h on
+    // accurate-but-ignorable one-liners. The host-id mismatch has its own
+    // WARNING block further up and is not duplicated here.
+    if let Some(banner) = telemetry_banner::render(report.observability_export.as_ref(), Utc::now())
+    {
+        println!("\n{banner}");
+    }
 
     // Forge event-feed consumer (ADR-0021, #8765). Same block, same reason:
     // "off", "never provisioned", "wrong key", "wrong host" and "quiet feed"

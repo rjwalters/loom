@@ -333,12 +333,20 @@ pub fn blocked_message(inputs: &Inputs<'_>) -> String {
 /// Returns `[]` on any failure — see the module's fail-open argument.
 #[must_use]
 pub fn discover_open_children(gh: &str, repo: &str, branch: &str) -> String {
-    let out = Command::new(gh)
-        .args(["pr", "list", "--repo", repo, "--base", branch, "--state"])
-        .args(["open", "--json", "number,headRefName"])
-        .output();
+    let out = crate::gh_invocation::GhInvocation::new(
+        crate::gh_invocation::Operation::new("merge_guard.stacked_children"),
+        crate::gh_invocation::AccessIntent::Read,
+        crate::gh_invocation::GhTarget::None,
+        std::time::Duration::from_secs(60),
+    )
+    .program(gh)
+    .args(["pr", "list", "--repo", repo, "--base", branch, "--state"])
+    .args(["open", "--json", "number,headRefName"])
+    .run();
     match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        crate::cmd_out::CmdOutcome::Ran(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        }
         _ => "[]".to_string(),
     }
 }

@@ -20,6 +20,9 @@ pub enum GhBinSource {
     EnvOverride,
     /// Bare `gh`, looked up on `PATH` at spawn.
     Path,
+    /// A program the call site injected ([`super::GhInvocation::program`]) —
+    /// a test stub handed down a `gh_bin: &Path` argument (#10089).
+    Injected,
 }
 
 /// The executable a `gh` invocation will run, and why.
@@ -32,7 +35,21 @@ pub struct ResolvedGh {
 /// Resolve the `gh` executable from the live process state.
 #[must_use]
 pub fn resolve() -> ResolvedGh {
-    resolve_from(policy_launcher_path(), std::env::var("LOOM_GH_BIN").ok())
+    resolve_from(policy_launcher_path(), env_override())
+}
+
+/// `LOOM_GH_BIN`, and in a unit-test build a loud-failing stub when it is
+/// unset (#10088), so `cargo test` can never reach the real `gh` and spend the
+/// operator's forge quota.
+fn env_override() -> Option<String> {
+    let env = std::env::var("LOOM_GH_BIN").ok();
+    #[cfg(test)]
+    {
+        if env.is_none() {
+            return Some(test_stub::path().to_string_lossy().into_owned());
+        }
+    }
+    env
 }
 
 /// The pure precedence ladder, separated from process state for testing.
@@ -71,4 +88,57 @@ pub fn gh_bin() -> String {
 /// function, not every caller.
 fn policy_launcher_path() -> Option<String> {
     None
+}
+
+/// The unit-test-build `gh` stub (#10088).
+#[cfg(test)]
+pub(crate) mod test_stub {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static STUB: OnceLock<(tempfile::TempDir, PathBuf)> = OnceLock::new();
+
+    /// Path of a `gh` stand-in that prints the args it was called with and
+    /// exits 127, appending them to `$LOOM_GH_STUB_LOG` when set. Written
+    /// once per test process.
+    pub(crate) fn path() -> PathBuf {
+        STUB.get_or_init(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().expect("stub tempdir");
+            let p = dir.path().join("gh");
+            let script = "#!/bin/sh\n\
+                echo \"loom-daemon test reached the real gh: $*\" >&2\n\
+                [ -n \"$LOOM_GH_STUB_LOG\" ] && echo \"$*\" >> \"$LOOM_GH_STUB_LOG\"\n\
+                exit 127\n";
+            std::fs::write(&p, script).expect("write stub");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+            (dir, p)
+        })
+        .1
+        .clone()
+    }
+
+    /// RAII guard pointing `LOOM_GH_BIN` at `bin` and restoring the prior
+    /// value on drop. Tests that stand up their own fake `gh` use this so the
+    /// loud-failing default stub does not shadow it (#10088). Callers must
+    /// serialise on the env lock, as for any other `set_var` test.
+    pub(crate) struct GhBinGuard(Option<std::ffi::OsString>);
+
+    impl GhBinGuard {
+        pub(crate) fn set(bin: &std::path::Path) -> Self {
+            let prior = std::env::var_os("LOOM_GH_BIN");
+            std::env::set_var("LOOM_GH_BIN", bin);
+            Self(prior)
+        }
+    }
+
+    impl Drop for GhBinGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("LOOM_GH_BIN", v),
+                None => std::env::remove_var("LOOM_GH_BIN"),
+            }
+        }
+    }
 }

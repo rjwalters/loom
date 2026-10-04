@@ -26,6 +26,27 @@ pub const MIN_BACKOFF: Duration = Duration::from_secs(5);
 /// between retries.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
+/// Consecutive failed flushes after which the per-flush diagnostic warns stop
+/// being enough and the escalated operator warning fires (issue #9950). At
+/// the [`MAX_BACKOFF`] ceiling, 12 consecutive failures is ~1h of continuous
+/// dead sink — an hour of silently accumulating telemetry is where "transport
+/// noise" becomes "the operator needs to go fix this".
+pub const ESCALATE_AFTER_FAILURES: u32 = 12;
+/// Re-fire cadence after the first escalation, in further consecutive
+/// failures. At the backoff ceiling this is ~2h: the reminder exists so a
+/// multi-hour outage (the 2026-10-01 store-tunnel shape — every record the
+/// daemon produced trapped locally while nothing said so) keeps a heartbeat
+/// in daemon.log without re-firing per flush.
+pub const ESCALATE_EVERY_FAILURES: u32 = 24;
+
+/// Whether the `consecutive_failures`-th failed flush should fire the
+/// escalated warning. Pure so the cadence is unit-testable: first at
+/// [`ESCALATE_AFTER_FAILURES`], then every [`ESCALATE_EVERY_FAILURES`] after.
+fn should_escalate(consecutive_failures: u32) -> bool {
+    consecutive_failures >= ESCALATE_AFTER_FAILURES
+        && (consecutive_failures - ESCALATE_AFTER_FAILURES).is_multiple_of(ESCALATE_EVERY_FAILURES)
+}
+
 /// Outcome of one [`try_flush`] attempt, for the caller's retry/backoff
 /// decision.
 #[derive(Debug, PartialEq, Eq)]
@@ -74,6 +95,31 @@ pub async fn try_flush<E: Exporter>(
             queue.len()
         );
         status.record_failure(&error.to_string());
+        // The per-flush diagnostic above is transport noise — the NUMBER of
+        // near-identical lines carries the only signal, and nobody reads
+        // that. #9950: at sustained-failure thresholds, say plainly that
+        // telemetry is not landing, for how long, and WHAT TO DO — the
+        // 2026-10-01 store-tunnel outage produced ~15h of diagnostic lines
+        // and not one of them told the operator to go fix it.
+        let snap = status.snapshot();
+        if should_escalate(snap.consecutive_failures) {
+            let since_success = snap.last_success_age_secs(chrono::Utc::now()).map_or_else(
+                || "never had a successful export".to_string(),
+                |age| format!("last success {} ago", crate::health::format_window(age)),
+            );
+            log::warn!(
+                "observability: telemetry is NOT reaching {} — {} consecutive failed flush(es), \
+                 {since_success}, {} envelope(s) accumulating locally. ACTION REQUIRED: check \
+                 this host's OTel egress (edge collector / tunnel / ingest key) and the endpoint \
+                 itself; `loom-daemon health` has the verdict, `loom-daemon status` the live \
+                 line. (This escalation repeats roughly every 2h of continuous failure.)",
+                snap.endpoint
+                    .as_deref()
+                    .unwrap_or("the configured endpoint"),
+                snap.consecutive_failures,
+                queue.len(),
+            );
+        }
     }
     if acknowledged == batch.len() {
         // Includes non-retryable drops: advance so a poison request cannot starve the queue.
@@ -441,5 +487,128 @@ mod tests {
         assert_eq!(snapshot.consecutive_failures, 5);
         assert_eq!(snapshot.records_exported, 0);
         assert!(snapshot.state.is_problem(), "{:?}", snapshot.state);
+    }
+
+    // --- sustained-failure escalation (#9950) ------------------------------
+
+    #[test]
+    fn escalation_cadence_fires_at_12_then_every_24() {
+        for n in 0..12 {
+            assert!(!should_escalate(n), "n={n} must stay diagnostic-only");
+        }
+        assert!(should_escalate(12), "the ~1h mark must escalate");
+        for n in 13..36 {
+            assert!(!should_escalate(n), "n={n} must not re-fire yet");
+        }
+        assert!(should_escalate(36), "~2h after the first escalation");
+        assert!(!should_escalate(37));
+        assert!(should_escalate(60), "the cadence keeps its ~2h heartbeat");
+    }
+
+    /// Drive `n` failed flushes on a dedicated thread with its own
+    /// current-thread runtime, capturing what they logged. `capture_logs` is
+    /// thread-local by design, and a runtime cannot be `block_on`-ed from
+    /// inside another runtime — so the capture, the runtime and the flushes
+    /// all live on this one spawned thread.
+    fn flush_n_times_logging(n: usize) -> Vec<(log::Level, String)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let dir = tempfile::tempdir().unwrap();
+            let queue = DurableQueue::open(dir.path().join("q.jsonl"), 10);
+            queue.push(envelope());
+            let exporter = FakeExporter::new(false);
+            let status = status_cell();
+            let records = crate::test_log_capture::capture_logs(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    for _ in 0..n {
+                        try_flush(&queue, &exporter, 1, &status).await;
+                    }
+                });
+            });
+            tx.send(records).unwrap();
+        });
+        rx.recv().unwrap()
+    }
+
+    fn escalation_lines(records: &[(log::Level, String)]) -> Vec<&(log::Level, String)> {
+        records
+            .iter()
+            .filter(|(_, m)| m.contains("NOT reaching"))
+            .collect()
+    }
+
+    #[test]
+    fn diagnostic_warns_stay_below_the_escalation_threshold() {
+        let records = flush_n_times_logging(11);
+        assert_eq!(escalation_lines(&records).len(), 0, "11 failures must not escalate");
+        // …but the per-flush diagnostic still fired every time.
+        assert_eq!(
+            records
+                .iter()
+                .filter(|(_, m)| m.contains("export diagnostic"))
+                .count(),
+            11
+        );
+    }
+
+    #[test]
+    fn the_escalated_warning_says_what_broke_and_what_to_do() {
+        let records = flush_n_times_logging(12);
+        let lines = escalation_lines(&records);
+        assert_eq!(lines.len(), 1, "exactly one escalation at #12: {records:?}");
+        let (level, msg) = lines[0];
+        assert_eq!(*level, log::Level::Warn, "escalation must be a WARN");
+        for want in [
+            "NOT reaching https://example.invalid/ingest", // names the endpoint
+            "12 consecutive failed flush(es)",             // names the streak
+            "never had a successful export",               // the status_cell has none
+            "1 envelope(s) accumulating",                  // names the backlog
+            "ACTION REQUIRED",                             // says this is for the operator
+            "edge collector / tunnel / ingest key",        // names the fix surfaces
+            "loom-daemon health",                          // and where the verdict lives
+        ] {
+            assert!(msg.contains(want), "escalation missing {want:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn escalation_re_fires_on_the_cadence_not_per_flush() {
+        let records = flush_n_times_logging(36);
+        assert_eq!(escalation_lines(&records).len(), 2, "escalations at #12 and #36 only");
+    }
+
+    #[test]
+    fn a_success_resets_the_escalation_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = DurableQueue::open(dir.path().join("q.jsonl"), 10);
+        queue.push(envelope());
+        let exporter = FakeExporter::new(false);
+        let status = status_cell();
+        // 12 failures → one escalation, then recovery: the next streak starts
+        // from zero, so 11 more failures must stay diagnostic-only.
+        let records = crate::test_log_capture::capture_logs(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                for _ in 0..12 {
+                    try_flush(&queue, &exporter, 1, &status).await;
+                }
+                exporter.set_up(true);
+                assert_eq!(try_flush(&queue, &exporter, 1, &status).await, FlushOutcome::Sent(1));
+                // Refill: a success consumed the queued envelope.
+                queue.push(envelope());
+                exporter.set_up(false);
+                for _ in 0..11 {
+                    try_flush(&queue, &exporter, 1, &status).await;
+                }
+            });
+        });
+        assert_eq!(escalation_lines(&records).len(), 1, "one escalation, then a clean streak");
     }
 }

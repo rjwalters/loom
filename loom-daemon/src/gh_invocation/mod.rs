@@ -27,10 +27,15 @@
 //! - [`GhInvocation::run`] (slice 3) — the `cmd_out::CmdOutcome` bridge, so
 //!   a migrated `run_command` site keeps its exact result classification.
 //!
+//! - [`accounting`] (#10089) — every execution that reached `gh` is one row
+//!   in [`crate::forge_call_stats`], keyed by its [`Operation`], so
+//!   `loom-daemon status` and the breaker's own-versus-external line count it.
+//!
 //! `gh-cached` substitution for reads, the async/tokio variant and the Gitea
 //! decline move in with the slices that first need them (see #9985's slicing
 //! plan).
 
+pub mod accounting;
 mod outcome;
 pub mod resolver;
 pub mod telemetry;
@@ -236,6 +241,7 @@ pub struct GhInvocation {
     contract: OutputContract,
     args: Vec<OsString>,
     cwd: Option<PathBuf>,
+    program: Option<String>,
 }
 
 impl GhInvocation {
@@ -257,6 +263,7 @@ impl GhInvocation {
             contract: OutputContract::Captured { timeout },
             args: Vec::new(),
             cwd: None,
+            program: None,
         }
     }
 
@@ -272,10 +279,28 @@ impl GhInvocation {
         self
     }
 
+    /// Append one `gh` argument; see [`GhInvocation::args`].
+    #[must_use]
+    pub fn arg(self, arg: impl AsRef<OsStr>) -> Self {
+        self.args([arg])
+    }
+
     /// Run in `dir`. Also keys the cross-owner `GH_CONFIG_DIR` lookup.
     #[must_use]
     pub fn current_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.cwd = Some(dir.as_ref().to_path_buf());
+        self
+    }
+
+    /// Pin the executable to a caller-injected program — the seam for sites
+    /// that hand a `gh_bin: &Path` down their call chain so tests can pass a
+    /// stub. A bare `gh` is "not injected": it goes through the [`resolver`]
+    /// like every other invocation, so production keeps the policy →
+    /// `LOOM_GH_BIN` → `PATH` ladder.
+    #[must_use]
+    pub fn program(mut self, program: impl AsRef<OsStr>) -> Self {
+        let program = program.as_ref().to_string_lossy();
+        self.program = (program != "gh").then(|| program.into_owned());
         self
     }
 
@@ -398,6 +423,9 @@ impl GhInvocation {
     /// [`ExecError::Collect`] when it started but its result could not be
     /// collected (side effects may have happened — never retry a write on it).
     pub fn execute(self) -> Result<GhCompletion, ExecError> {
+        if let Some(program) = self.program.clone() {
+            return self.execute_with(&program, GhBinSource::Injected);
+        }
         let resolved = resolver::resolve();
         self.execute_with(&resolved.program, resolved.source)
     }
@@ -410,6 +438,12 @@ impl GhInvocation {
                 cmd.stdin(Stdio::null());
                 let result = proc_exec::run_bounded(cmd, timeout);
                 let (outcome, code) = telemetry::classify_captured(&result);
+                let captured = match &result {
+                    Ok(Completion::Exited(out)) => Some((&out.stdout[..], &out.stderr[..])),
+                    Ok(Completion::TimedOut { stdout, stderr }) => Some((&stdout[..], &stderr[..])),
+                    Err(_) => None,
+                };
+                accounting::record(&self, outcome, captured);
                 span.finish(&self, source, outcome, code);
                 result.map(GhCompletion::Captured)
             }
@@ -422,9 +456,22 @@ impl GhInvocation {
                     .map_err(ExecError::Spawn)
                     .and_then(|mut child| child.wait().map_err(ExecError::Collect));
                 let (outcome, code) = telemetry::classify_passthrough(&result);
+                accounting::record(&self, outcome, None);
                 span.finish(&self, source, outcome, code);
                 result.map(GhCompletion::Passthrough)
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "migrated_sites_tests.rs"]
+mod migrated_sites_tests;
+
+#[cfg(test)]
+#[path = "migrated_sites_tests_b.rs"]
+mod migrated_sites_tests_b;
+
+#[cfg(test)]
+#[path = "migrated_sites_tests_c.rs"]
+mod migrated_sites_tests_c;

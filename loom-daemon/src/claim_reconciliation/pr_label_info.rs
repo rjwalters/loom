@@ -3,7 +3,8 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
-use std::process::{Command, Stdio};
+
+use super::gh_call;
 
 /// The PR's currently-applied state labels plus its draft status (a
 /// best-effort subset of `--json labels,isDraft`, used only to decide
@@ -33,28 +34,16 @@ pub(super) fn pr_label_names(gh_bin: &Path, root: &Path, pr_number: u32) -> Resu
         #[serde(default, rename = "isDraft")]
         is_draft: bool,
     }
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("pr")
-        .arg("view")
-        .arg(pr_number.to_string())
-        .arg("--json")
-        .arg("labels,isDraft");
-    cmd.current_dir(root);
-    // #5401: cross-owner managed repo -> its own owner's installation-token
-    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    let n = pr_number.to_string();
+    let out = gh_call::output(
+        gh_call::read("claim.pr_labels", gh_bin, root)
+            .args(["pr", "view", &n, "--json", "labels,isDraft"])
+            .args(gh_call::loom_repo_flag()),
+    )?;
     if !out.status.success() {
+        let (root, err) = (root.display(), gh_call::stderr(&out));
         return Err(anyhow!(
-            "gh pr view {pr_number} --json labels,isDraft failed in {}: {}",
-            root.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            "gh pr view {pr_number} --json labels,isDraft failed in {root}: {err}"
         ));
     }
     let parsed: GhPrLabels =
