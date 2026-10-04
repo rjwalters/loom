@@ -259,16 +259,32 @@ impl SelfCheckReport {
 // ============================================================================
 
 /// Tunables for a check pass. Constructed from resolved config/env.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CheckOptions {
     /// Token `.ranking` is considered stale beyond this age.
     pub ranking_max_age: Duration,
+    /// Override the forge-egress policy sources (#9999). `None` (production)
+    /// means `PolicySources::from_process`.
+    pub forge_egress_sources: Option<crate::forge_egress::policy::PolicySources>,
+}
+
+impl CheckOptions {
+    /// Defaults with forge-egress sources pinned to "unconfigured", so a
+    /// test never consults the host's policy.
+    #[must_use]
+    pub fn hermetic() -> Self {
+        Self {
+            forge_egress_sources: Some(crate::forge_egress::policy::PolicySources::default()),
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for CheckOptions {
     fn default() -> Self {
         Self {
             ranking_max_age: Duration::from_secs(DEFAULT_RANKING_MAX_AGE_SECS),
+            forge_egress_sources: None,
         }
     }
 }
@@ -284,7 +300,7 @@ pub fn run_checks(repo_root: &Path, opts: CheckOptions) -> SelfCheckReport {
         .iter()
         .map(|&invariant| InvariantOutcome {
             invariant,
-            status: check(invariant, repo_root, opts),
+            status: check(invariant, repo_root, &opts),
         })
         .collect();
     SelfCheckReport { outcomes }
@@ -292,12 +308,15 @@ pub fn run_checks(repo_root: &Path, opts: CheckOptions) -> SelfCheckReport {
 
 /// Dispatch a single invariant's check.
 #[must_use]
-pub fn check(invariant: Invariant, repo_root: &Path, opts: CheckOptions) -> InvariantStatus {
+pub fn check(invariant: Invariant, repo_root: &Path, opts: &CheckOptions) -> InvariantStatus {
     match invariant {
         Invariant::McpBundleHealth => check_mcp_bundle(repo_root),
         Invariant::RuntimesPresent => check_runtimes_present(repo_root),
         Invariant::TokenRankingFresh => check_token_ranking_fresh(repo_root, opts.ranking_max_age),
-        Invariant::ForgeEgressAligned => forge_egress_invariant::check(repo_root),
+        Invariant::ForgeEgressAligned => match opts.forge_egress_sources.as_ref() {
+            Some(sources) => forge_egress_invariant::check_with(sources, repo_root),
+            None => forge_egress_invariant::check(repo_root),
+        },
     }
 }
 
@@ -1257,6 +1276,7 @@ pub fn spawn_multi_install_self_check_task(
                 let repair_mode = resolve_repair(&config);
                 let check_opts = CheckOptions {
                     ranking_max_age: resolve_ranking_max_age(&config),
+                    forge_egress_sources: None,
                 };
                 let root_for_task = root.clone();
                 let joined = tokio::task::spawn_blocking(move || {

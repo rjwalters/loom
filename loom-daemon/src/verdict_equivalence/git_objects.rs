@@ -22,7 +22,7 @@
 //! changes within a minute of `gh pr update-branch`.
 //!
 //! So [`ensure_commit`] now brings an absent commit in with ONE bounded
-//! `git fetch origin <sha>` (falling back to the PR's `refs/pull/<n>/head`).
+//! `git fetch origin -- <sha>` (falling back to the PR's `refs/pull/<n>/head`).
 //! It writes objects only — `--no-write-fetch-head`, no refspec destination,
 //! no tags — so no ref, no index and no working tree moves. Every other
 //! function here stays read-only; the only other write is `merge-tree
@@ -103,7 +103,7 @@ pub(super) const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// — redacted, one line, for a log or a PR comment — when it could not be
 /// brought in.
 ///
-/// Tried in order: `git fetch origin <sha>` (GitHub serves any reachable commit
+/// Tried in order: `git fetch origin -- <sha>` (GitHub serves any reachable commit
 /// by id), then `refs/pull/<pr>/head` when the PR number is known (a commit the
 /// forge only reaches through the PR ref). Both fetch objects only — no ref,
 /// no `FETCH_HEAD`, no tags — and both run with prompting disabled and stdin
@@ -128,6 +128,7 @@ pub(super) fn ensure_commit(repo: &Path, pr: Option<u32>, sha: &str) -> Result<(
                 "--no-tags",
                 "--no-write-fetch-head",
                 "origin",
+                "--",
                 spec,
             ])
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -137,9 +138,9 @@ pub(super) fn ensure_commit(repo: &Path, pr: Option<u32>, sha: &str) -> Result<(
             return Ok(());
         }
         failures.push(if outcome.succeeded() {
-            format!("`git fetch origin {spec}` succeeded but {sha} is still absent")
+            format!("`git fetch origin -- {spec}` succeeded but {sha} is still absent")
         } else {
-            outcome.failure_reason(&format!("git fetch origin {spec}"))
+            outcome.failure_reason(&format!("git fetch origin -- {spec}"))
         });
     }
     Err(redact(&failures.join("; ")))

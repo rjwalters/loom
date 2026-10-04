@@ -1422,6 +1422,11 @@ pub struct DaemonStatusReport {
     /// wire data compatible.
     #[serde(default)]
     pub auto_update_stale_repo: Option<String>,
+    /// The roll schedule (Issue #9132): next window, target, dispatch-paused flag and
+    /// deferral reason. `None` when no `rollWindowSecs` is configured, or from a
+    /// pre-#9132 daemon. `#[serde(default)]` keeps older wire data compatible.
+    #[serde(default)]
+    pub auto_update_roll_window: Option<crate::auto_update::roll_window::RollWindowStatus>,
     /// Host-distress circuit-breaker state (Issue #4235). `Some` when a breaker
     /// has been registered this process (the work-finder loop is running and the
     /// breaker is enabled); `None` when no breaker is active — which the status
@@ -1856,7 +1861,7 @@ pub use dispatch_plan::{
 mod fleet_plan;
 pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};
 mod work_finder_tick;
-pub use work_finder_tick::WorkFinderTickSummary;
+pub use work_finder_tick::{CapLimiter, CapView, CapacityWait, WorkFinderTickSummary};
 
 mod star_liveness;
 pub use star_liveness::{

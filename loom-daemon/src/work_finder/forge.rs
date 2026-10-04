@@ -80,6 +80,11 @@ impl Default for GhWorkSource {
 
 impl WorkSource for GhWorkSource {
     fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>> {
+        // Curator intake reconcile (#10041): cadence-gated, fail-soft, REST-only;
+        // gives every unlabeled issue `loom:triage` so Curator has one queue.
+        if let Some(root) = self.cwd.as_deref() {
+            crate::intake_reconcile::maybe_run(&self.gh_bin, root);
+        }
         // ETag-cached REST listing (#4428), replacing the per-tick GraphQL
         // `gh issue list`.
         let ready = self.list_label("loom:issue")?;

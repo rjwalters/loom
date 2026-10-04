@@ -71,7 +71,11 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::forge_listing::HttpResponse;
+
+#[path = "forge_call_stats_ops.rs"]
+pub mod ops;
 use crate::types::{ForgeBudgetReading, ForgeCallCounts, ForgeCallsStatus, ForgeOperationCounts};
+pub use ops::ForgeOp;
 
 /// The rolling window `status` reports (the last hour).
 pub const WINDOW_SECS: i64 = 3600;
@@ -265,6 +269,13 @@ impl CallIdentity {
         }
     }
 
+    /// An identity naming a typed [`ForgeOp`]; a deliberate `unknown`
+    /// leaves the operation empty, so it records as [`UNKNOWN_OPERATION`].
+    #[must_use]
+    pub fn for_op(op: ForgeOp) -> Self {
+        op.id().map_or_else(Self::default, Self::operation)
+    }
+
     #[must_use]
     pub fn with_provider(mut self, provider: &str) -> Self {
         self.provider = sanitize(provider);
@@ -357,18 +368,9 @@ pub fn classify(response: Option<&HttpResponse>, exit_ok: bool, stderr: &str) ->
     (pool, outcome)
 }
 
-/// Record one `gh api --include` call by `caller` (see [`classify`]).
-pub fn record_gh_api(
-    caller: &'static str,
-    response: Option<&HttpResponse>,
-    exit_ok: bool,
-    stderr: &str,
-) {
-    let (pool, outcome) = classify(response, exit_ok, stderr);
-    record(caller, pool, outcome, response.map(|r| &r.ratelimit));
-}
-
-/// [`record_gh_api`] plus the #9777 call identity.
+/// Record one `gh api --include` call by `caller` (see [`classify`]) with the
+/// #9777 call identity. Plain `gh` spawns are recorded by the `GhInvocation`
+/// facade (#10089); this is for a caller that carries an explicit identity.
 pub fn record_gh_api_with_identity(
     caller: &'static str,
     identity: &CallIdentity,
@@ -690,13 +692,75 @@ fn prune(dir: &Path, current_hour: i64) {
 /// simply contribute nothing).
 fn read_window(dir: &Path, now: i64) -> Aggregate {
     let since = now - WINDOW_SECS;
+    aggregate_lines(read_since(dir, since, now).lines(), since)
+}
+
+/// The raw sink text of every hour file covering `since..=now`.
+fn read_since(dir: &Path, since: i64, now: i64) -> String {
     let mut raw = String::new();
     for hour in since.div_euclid(3600)..=now.div_euclid(3600) {
         if let Ok(text) = std::fs::read_to_string(sink_file(dir, hour)) {
             raw.push_str(&text);
         }
     }
-    aggregate_lines(raw.lines(), since)
+    raw
+}
+
+/// One operation ID as the sink observed it (Issue #9831).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ObservedOperation {
+    /// Calls recorded under this operation, every outcome included.
+    pub calls: u64,
+    /// The `caller` labels that recorded it — for an `unknown` row, the list
+    /// of sites still to map.
+    pub callers: std::collections::BTreeSet<String>,
+}
+
+/// Operation IDs observed in sink `lines` with `t >= since`. A line written by
+/// a pre-#9777 binary carries no operation and counts as
+/// [`UNKNOWN_OPERATION`], exactly as an un-migrated caller would.
+fn observed_in_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    since: i64,
+) -> BTreeMap<String, ObservedOperation> {
+    let mut seen: BTreeMap<String, ObservedOperation> = BTreeMap::new();
+    for line in lines {
+        let Ok(parsed) = serde_json::from_str::<SinkLine>(line) else {
+            continue;
+        };
+        if parsed.t < since {
+            continue;
+        }
+        let op = parsed.op.unwrap_or_else(|| UNKNOWN_OPERATION.to_string());
+        let entry = seen.entry(op).or_default();
+        entry.calls += 1;
+        entry.callers.insert(parsed.c);
+    }
+    seen
+}
+
+/// Every operation ID this host's sink still retains (the last
+/// [`RETAIN_HOURS`] hours, not just the status window), as of `now`. `None`
+/// when the sink is disabled — nothing observed is unknown, not empty.
+///
+/// This is runtime evidence only: it shows what the daemon *did* call, never
+/// what it *can* call. It supplements the source inventory and can never
+/// establish exhaustiveness on its own (#9777).
+#[must_use]
+pub fn observed_operations(now: DateTime<Utc>) -> Option<BTreeMap<String, ObservedOperation>> {
+    Some(observed_operations_in(&sink_dir()?, now))
+}
+
+/// [`observed_operations`] over an explicit sink directory (the CLI's
+/// `--sink-dir`). Reads only; a missing directory observes nothing.
+#[must_use]
+pub fn observed_operations_in(
+    dir: &Path,
+    now: DateTime<Utc>,
+) -> BTreeMap<String, ObservedOperation> {
+    let now = now.timestamp();
+    let since = now - RETAIN_HOURS * 3600;
+    observed_in_lines(read_since(dir, since, now).lines(), since)
 }
 
 // ============================================================================
@@ -801,3 +865,7 @@ pub fn consumed_in_window(now: DateTime<Utc>) -> Option<BTreeMap<Pool, u64>> {
 #[cfg(test)]
 #[path = "forge_call_stats_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "forge_call_stats_callsite_tests.rs"]
+mod callsite_tests;

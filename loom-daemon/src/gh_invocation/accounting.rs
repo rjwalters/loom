@@ -19,12 +19,24 @@
 //! - `gh api rate_limit` is free on GitHub's side and is booked to
 //!   [`Pool::Other`] so it never inflates the core pool's "own" figure.
 //!
+//! # Call identity (#9831)
+//!
+//! Each row also carries a [`forge_call_stats::CallIdentity`]: the
+//! inventoried operation the site named with [`GhInvocation::forge_op`], the
+//! provider family (`github` — this facade only ever drives `gh`), the origin
+//! host and the `owner/repo` slug. A site that has not named an inventoried
+//! operation records `operation = "unknown"` on purpose: [`super::Operation`]
+//! is a telemetry name, not an inventory ID, and guessing a mapping here would
+//! make the per-operation view lie. Naming the operation is a per-site
+//! decision ([`crate::forge_call_stats::ops`]).
+//!
 //! Recording is local I/O only (the per-host sink) and can never fail the
-//! invocation — [`forge_call_stats::record`] already guarantees that.
+//! invocation — [`forge_call_stats::record_with_identity`] already
+//! guarantees that.
 
 use super::telemetry::Outcome as InvokeOutcome;
 use super::GhInvocation;
-use crate::forge_call_stats::{self, Outcome, Pool};
+use crate::forge_call_stats::{self, CallIdentity, Outcome, Pool};
 use std::ffi::OsString;
 
 /// The pool an invocation spends, from its argv alone (no response needed).
@@ -101,10 +113,57 @@ fn wants_headers(args: &[OsString]) -> bool {
     args.first().is_some_and(|a| a == "api") && args.iter().any(|a| a == "-i" || a == "--include")
 }
 
+/// The value of `--hostname` in a `gh api` argv, if any.
+fn hostname_arg(args: &[OsString]) -> Option<String> {
+    args.windows(2)
+        .find(|w| w[0] == "--hostname")
+        .map(|w| w[1].to_string_lossy().into_owned())
+}
+
+/// The identity a completed invocation is accounted under: what the site
+/// set, with the gaps filled from what the facade itself knows.
+///
+/// - provider: `github` — `gh` is the GitHub family's client.
+/// - origin: the site's, else `gh api --hostname`, else `GH_HOST`, else
+///   `github.com` (`gh`'s own default host resolution, in that order).
+/// - repo: the site's, else the typed [`super::GhTarget`], else `LOOM_REPO`
+///   (the same `GH_REPO` fallback [`GhInvocation::env_plan`] hands the child).
+///
+/// Never a credential, a header or a body: only these four short tokens, and
+/// each still goes through [`forge_call_stats::sanitize`].
+#[must_use]
+pub fn resolved_identity(inv: &GhInvocation) -> CallIdentity {
+    resolved_identity_with(inv, std::env::var("GH_HOST").ok(), std::env::var("LOOM_REPO").ok())
+}
+
+fn resolved_identity_with(
+    inv: &GhInvocation,
+    gh_host: Option<String>,
+    loom_repo: Option<String>,
+) -> CallIdentity {
+    let mut id = inv.identity.clone();
+    if id.provider.is_none() {
+        id = id.with_provider("github");
+    }
+    if id.origin.is_none() {
+        let origin = hostname_arg(&inv.args)
+            .or(gh_host.filter(|h| !h.is_empty()))
+            .unwrap_or_else(|| "github.com".to_string());
+        id = id.with_origin(&origin);
+    }
+    if id.repo.is_none() {
+        if let Some(repo) = inv.target.slug().or(loom_repo.filter(|r| !r.is_empty())) {
+            id = id.with_repo(&repo);
+        }
+    }
+    id
+}
+
 /// Record one completed invocation (see the module docs for what is skipped).
 /// `captured` is `(stdout, stderr)` for a captured run, `None` for passthrough.
 pub(super) fn record(inv: &GhInvocation, outcome: InvokeOutcome, captured: Option<(&[u8], &[u8])>) {
     let caller = inv.operation.as_str();
+    let identity = resolved_identity(inv);
     let pool = static_pool(&inv.args);
     let stderr = captured.map(|(_, e)| String::from_utf8_lossy(e).into_owned());
     let stderr = stderr.as_deref().unwrap_or_default();
@@ -124,7 +183,13 @@ pub(super) fn record(inv: &GhInvocation, outcome: InvokeOutcome, captured: Optio
                 .resource
                 .as_deref()
                 .map_or(pool, Pool::from_resource);
-            forge_call_stats::record(caller, pool, classified, Some(&resp.ratelimit));
+            forge_call_stats::record_with_identity(
+                caller,
+                &identity,
+                pool,
+                classified,
+                Some(&resp.ratelimit),
+            );
             return;
         }
     }
@@ -140,7 +205,7 @@ pub(super) fn record(inv: &GhInvocation, outcome: InvokeOutcome, captured: Optio
         | InvokeOutcome::Timeout
         | InvokeOutcome::CollectFailed => Outcome::Error,
     };
-    forge_call_stats::record(caller, pool, classified, None);
+    forge_call_stats::record_with_identity(caller, &identity, pool, classified, None);
 }
 
 #[cfg(test)]

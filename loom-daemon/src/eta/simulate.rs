@@ -15,8 +15,15 @@
 //! `ready_wait` draws are never age-conditioned: the item's age in the queue
 //! says nothing about the turnover in progress.
 //!
+//! A path from `merge_hold` (#10218) draws the rest of the hold (conditioned
+//! on its age, like any first stage) and then one `merge_wait`; its terminal
+//! is `merge_wait`. No path from any other stage visits `merge_hold`, so
+//! every other draw stream is unchanged.
+//!
 //! The quantiles of the path totals are nearest-rank over the sorted
-//! totals, rounded to whole seconds.
+//! totals, rounded to whole seconds. p90 (#10211) is read off the same
+//! sorted totals by the same rule, so it costs no draws and leaves p25, p50
+//! and p75 exactly as they were.
 //!
 //! [`run_explanation`] rebuilds the whole simulation from an explanation's
 //! fields alone, which is what makes an estimate recomputable offline.
@@ -86,8 +93,8 @@ pub struct PathSpec {
 /// The outcome of a simulation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Simulation {
-    /// Remaining seconds, `(p25, p50, p75)`.
-    pub quantiles: (i64, i64, i64),
+    /// Remaining seconds, `(p25, p50, p75, p90)`.
+    pub quantiles: (i64, i64, i64, i64),
     /// Per-stage cumulative entry-time seconds, `(p25, p50, p75)`, over the
     /// paths that visit the stage (#9366); `None` for a stage no path
     /// visits. The terminal stage's samples are the path completion times,
@@ -106,13 +113,16 @@ pub struct Simulation {
 impl Simulation {
     /// The explanation's `stage_marks`: one mark per [`Stage::ALL`] stage,
     /// in stage order, projected at wall-clock `as_of` (#9366) — preceded by
-    /// a `ready_wait` mark only when the path starts there (#9326).
+    /// a `ready_wait` mark only when the path starts there (#9326), and
+    /// followed by a `merge_hold` mark only when the path starts there
+    /// (#10218), so no other explanation gains an empty mark.
     #[must_use]
     pub fn stage_marks(&self, as_of: DateTime<Utc>) -> Vec<StageMark> {
         Stage::EVERY
             .iter()
             .filter(|&&stage| {
-                stage != Stage::ReadyWait || self.entry_marks[stage.index()].is_some()
+                !matches!(stage, Stage::ReadyWait | Stage::MergeHold)
+                    || self.entry_marks[stage.index()].is_some()
             })
             .map(|&stage| {
                 let times = self.entry_marks[stage.index()].map(|(p25, p50, p75)| {
@@ -212,6 +222,11 @@ pub fn reachable_path(
             push(Stage::ReviewWait);
         }
         Stage::MergeWait => {
+            push(Stage::MergeWait);
+            return stages;
+        }
+        Stage::MergeHold => {
+            push(Stage::MergeHold);
             push(Stage::MergeWait);
             return stages;
         }
@@ -319,6 +334,7 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
                 }
                 Stage::MergeWait => break,
                 Stage::ReadyWait => Stage::SweepCurator,
+                Stage::MergeHold => Stage::MergeWait,
             };
         }
         for (i, s) in seen.iter().enumerate() {
@@ -332,7 +348,8 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     }
 
     totals.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    let quantiles = nearest_rank3(&totals);
+    let (p25, p50, p75) = nearest_rank3(&totals);
+    let quantiles = (p25, p50, p75, nearest_rank(&totals, 90));
 
     // The stage every path ends on: the approving verdict when the path
     // stops there, else `merge_wait`. Its mark is the path completion time —
@@ -340,7 +357,7 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     // so the terminal mark's p50 is the estimate itself, to the second.
     let terminal = if stop {
         Stage::ReadyWait
-    } else if spec.include_merge {
+    } else if spec.include_merge || spec.start == Stage::MergeHold {
         Stage::MergeWait
     } else {
         Stage::ReviewWait
@@ -379,16 +396,19 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     })
 }
 
-/// Nearest-rank `(p25, p50, p75)` over sorted `(value, path)` samples,
-/// rounded to whole seconds — the one quantile discipline for the path
-/// totals and the stage-entry marks alike.
+/// Nearest-rank `(p25, p50, p75)` over sorted `(value, path)` samples, by
+/// [`nearest_rank`].
 fn nearest_rank3(samples: &[(f64, usize)]) -> (i64, i64, i64) {
+    (nearest_rank(samples, 25), nearest_rank(samples, 50), nearest_rank(samples, 75))
+}
+
+/// The nearest-rank `pct`th percentile of sorted `(value, path)` samples,
+/// rounded to whole seconds — the one quantile discipline for the path
+/// totals (p25 to p90) and the stage-entry marks alike.
+fn nearest_rank(samples: &[(f64, usize)], pct: usize) -> i64 {
     let k = samples.len();
-    let q = |pct: usize| -> i64 {
-        let rank = (pct * k).div_ceil(100).clamp(1, k);
-        samples[rank - 1].0.round() as i64
-    };
-    (q(25), q(50), q(75))
+    let rank = (pct * k).div_ceil(100).clamp(1, k);
+    samples[rank - 1].0.round() as i64
 }
 
 /// Mean per-stage time over the paths ranked in `[lo, hi)` (fractions of K).
@@ -518,11 +538,28 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
     })
 }
 
-/// Recompute an explanation's quantiles from its own fields.
+/// Recompute an explanation's `(p25, p50, p75, p90)` from its own fields;
+/// compare with [`Explanation::quantiles_with_p90`].
 #[must_use]
-pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64)> {
+///
+/// A recalibrated explanation (#10207) recomputes through its recorded
+/// [`super::recalibrate::Recalibration`]: the simulation reproduces the base
+/// quantiles, and the recorded ratio distribution moves them exactly as the
+/// heuristic did.
+///
+/// A twin-otter explanation (#10243) has no stage grids: it recomputes
+/// through its own `twin_otter` record (the adapted input, the config and
+/// the model slice) with the seed in `combination`.
+pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)> {
+    if let Some(record) = &explanation.twin_otter {
+        return super::heuristics::recompute_twin_otter(explanation, record);
+    }
     let spec = spec_from_explanation(explanation)?;
-    run(&spec).ok().map(|s| s.quantiles)
+    let simulated = run(&spec).ok().map(|s| s.quantiles)?;
+    Some(match &explanation.recalibration {
+        Some(r) => super::recalibrate::apply(simulated.1, &r.ratios, r.mode),
+        None => simulated,
+    })
 }
 
 /// Recompute an explanation's stage marks (#9366) from the same fields

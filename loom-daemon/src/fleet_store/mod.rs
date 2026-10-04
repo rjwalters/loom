@@ -16,6 +16,8 @@
 //!
 //! - [`fetch`] — conditional fetch into a local cache, through the daemon's
 //!   own `gh` forge path and GitHub App credentials ([`gh`]).
+//! - [`admins`] — the fleet admin roster (`fleet/admins.json`) that comment
+//!   trust consults (#10303). Fails closed.
 //! - [`render`] — the host's machine tier and host-local tier, and drift.
 //! - [`roster`] — `repos.yml` → desired workspace set, diffed against the
 //!   daemon's workspace registry. Fails closed.
@@ -30,6 +32,7 @@
 //! The file contract is documented in `defaults/docs/daemon-reference.md`
 //! §"Fleet store".
 
+pub mod admins;
 pub mod fetch;
 pub mod gh;
 pub mod pending_restart;
@@ -63,6 +66,11 @@ pub const STATE_PATH: &str = "fleet/state.yml";
 /// Store-relative path of the fleet-wide machine-tier config.
 pub const FLEET_DEFAULTS_PATH: &str = "fleet/defaults.json";
 
+/// Store-relative path of the fleet admin roster (#10303):
+/// `{"admins": ["login", ...]}`. Proposed contract; absent until fleet-gitops
+/// publishes it, and comment trust fails closed while it is.
+pub const ADMINS_PATH: &str = "fleet/admins.json";
+
 /// Store-relative path of `host`'s machine-tier overlay.
 #[must_use]
 pub fn host_defaults_path(host: &str) -> String {
@@ -79,7 +87,7 @@ pub fn host_local_path(host: &str) -> String {
 /// store (docs, `hosts.yml`, …) is ignored.
 #[must_use]
 pub fn is_contract_path(path: &str) -> bool {
-    if matches!(path, ROSTER_PATH | STATE_PATH | FLEET_DEFAULTS_PATH) {
+    if matches!(path, ROSTER_PATH | STATE_PATH | FLEET_DEFAULTS_PATH | ADMINS_PATH) {
         return true;
     }
     let Some(rest) = path.strip_prefix("fleet/hosts/") else {

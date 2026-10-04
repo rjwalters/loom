@@ -26,6 +26,7 @@ loom-daemon forge-inventory validate --qualification # could this evidence suppo
 loom-daemon forge-inventory gate                     # any new unclassified direct forge call?
 loom-daemon forge-inventory report                   # four-axis coverage view
 loom-daemon forge-inventory probe-manifest --profile required-coordination
+loom-daemon forge-inventory observed                 # host call sink vs inventory, both directions (#9831)
 ```
 
 `validate` and `gate` also run as Rust tests
@@ -106,3 +107,12 @@ spend to the other on a mixed fleet. An operation the manifest does not know is
 recorded as `unknown` rather than dropped, so an unmapped caller is visible.
 Runtime traces **supplement** this source inventory; they can never establish
 exhaustiveness on their own.
+
+A call site names its operation with a typed constant from
+`loom-daemon/src/forge_call_stats_ops.rs` (checked against this manifest by a
+test), or with `ForgeOp::uninventoried("<why>")` when no row fits — a deliberate
+`unknown` carries its reason at the call site. `forge-inventory observed` sets
+the sink's operation IDs beside this inventory: *inventoried but never
+observed* (rare, script-only, or not yet migrated) and *observed but not
+inventoried* (a missing row or a typo), plus the callers still recording
+`unknown`. A clean diff is not a completeness claim.

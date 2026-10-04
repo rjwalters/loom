@@ -15,8 +15,8 @@
 //!    → `needs-operator(merge-risk-hold)`;
 //! 4. the forge refused the merge of its approved PR →
 //!    `needs-operator(merge-refused)`;
-//! 5. `loom:blocked`: an open same-repo blocker → `blocked-by` (it inherits
-//!    the star); only a cross-repo blocker → `needs-operator(blocked-cross-repo)`
+//! 5. `loom:blocked`: an open same-repo blocker → `blocked-by` (every open
+//!    same-repo blocker inherits the star); only a cross-repo blocker → `needs-operator(blocked-cross-repo)`
 //!    (stars are not inherited across repos, so nothing else would move it);
 //!    none → `needs-operator(blocked-unnamed)`;
 //! 6. its repo's `main` is red and it has not been dispatched → `blocked-by`
@@ -26,10 +26,11 @@
 //! 8. `loom:building`, a live sweep, or a peer claim → `building`;
 //! 9. this host's token pool is exhausted and no peer claimed it →
 //!    `needs-operator(pools-exhausted)`; a capacity-style deferral →
-//!    `no-capacity`;
+//!    `no-capacity`, carrying the structured [`CapacityWait`] (gate, binding
+//!    cap term, queue position; #10214);
 //! 10. `loom:issue` → `ready`; anything else → `curating`.
 
-use crate::types::{AskKind, LandingStage, OperatorAsk};
+use crate::types::{AskKind, CapacityWait, LandingStage, OperatorAsk};
 
 /// The Champion hold on a PR (merge-risk / critical-file).
 pub const HOLD_LABEL: &str = "loom:operator";
@@ -119,8 +120,10 @@ pub enum Capacity {
     /// this host's hold, so every host and every re-exhaustion of an issue
     /// that has not moved share one key ([`super::collect`]).
     PoolExhausted { detail: String },
-    /// The work finder deferred it on a capacity-style limit.
-    Deferred { reason: String },
+    /// The work finder deferred it on a capacity-style limit: which gate,
+    /// what binds it and where the issue stands in the host's starred queue
+    /// (#10214).
+    Deferred(CapacityWait),
 }
 
 /// Everything the classifier needs about one starred issue.
@@ -153,10 +156,14 @@ pub struct Landing {
     pub pr: Option<u32>,
     /// `BlockedBy`: the blocker as shown.
     pub blocked_by: Option<String>,
-    /// `BlockedBy` / `MergeRefused`: the same-repo issue that inherits the
-    /// star, when there is one.
-    pub inherits: Option<u32>,
+    /// `BlockedBy` / `MergeRefused`: the same-repo issues that inherit the
+    /// star, ascending. Every open same-repo blocker inherits, not only the
+    /// first one named (#10012 AC 3).
+    pub inherits: Vec<u32>,
     pub no_capacity: Option<String>,
+    /// `NoCapacity` from a work-finder deferral: the structured wait
+    /// (#10214). `None` for the pool-exhaustion grace window.
+    pub capacity_wait: Option<CapacityWait>,
     pub ask: Option<OperatorAsk>,
 }
 
@@ -167,8 +174,9 @@ impl Landing {
             next_actor: next_actor.to_string(),
             pr,
             blocked_by: None,
-            inherits: None,
+            inherits: Vec::new(),
             no_capacity: None,
+            capacity_wait: None,
             ask: None,
         }
     }
@@ -294,7 +302,11 @@ pub fn classify(f: &StarFacts) -> Landing {
                 ),
                 Some(p),
             );
-            landing.inherits = refusal.incident.filter(|i| *i != n && *i != p);
+            landing.inherits = refusal
+                .incident
+                .filter(|i| *i != n && *i != p)
+                .into_iter()
+                .collect();
             return landing;
         }
     }
@@ -311,7 +323,17 @@ pub fn classify(f: &StarFacts) -> Landing {
             let mut landing =
                 Landing::stage(LandingStage::BlockedBy, &format!("blocker {}", b.display), pr_num);
             landing.blocked_by = Some(b.display.clone());
-            landing.inherits = b.number.filter(|m| *m != n);
+            let mut inherits: Vec<u32> = f
+                .blockers
+                .iter()
+                .filter(open)
+                .filter(|b| b.cross_repo_managed.is_none())
+                .filter_map(|b| b.number)
+                .filter(|m| *m != n)
+                .collect();
+            inherits.sort_unstable();
+            inherits.dedup();
+            landing.inherits = inherits;
             return landing;
         }
         if let Some(b) = f.blockers.iter().find(open) {
@@ -357,7 +379,7 @@ pub fn classify(f: &StarFacts) -> Landing {
     if let Some(fix) = f.red_main_fix.filter(|fix| *fix != n && !dispatched) {
         let mut landing = Landing::stage(LandingStage::BlockedBy, &format!("blocker #{fix}"), None);
         landing.blocked_by = Some(format!("#{fix}"));
-        landing.inherits = Some(fix);
+        landing.inherits = vec![fix];
         return landing;
     }
 
@@ -396,9 +418,10 @@ pub fn classify(f: &StarFacts) -> Landing {
                 None,
             );
         }
-        Capacity::Deferred { reason } => {
+        Capacity::Deferred(wait) => {
             let mut landing = Landing::stage(LandingStage::NoCapacity, "work-finder", None);
-            landing.no_capacity = Some(reason.clone());
+            landing.no_capacity = Some(wait.summary());
+            landing.capacity_wait = Some(wait.clone());
             return landing;
         }
         Capacity::Available => {}

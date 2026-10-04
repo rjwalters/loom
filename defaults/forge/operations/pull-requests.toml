@@ -297,6 +297,9 @@ path = "defaults/scripts/lib/forge-helpers.sh"
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/check-review-feedback.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/eta/fleet_events_forge.rs"
 
 [[operation]]
 id = "review.thread-resolution"
@@ -410,9 +413,11 @@ owner = "daemon-landing"
 risk = "normal"
 github = { commands = [
   "gh pr view --json closingIssuesReferences",
+  "gh pr list --json closingIssuesReferences",
   "gh issue view --json closedByPullRequestsReferences",
 ], routes = [
   "GET repos/{owner}/{repo}/issues/{number}/timeline",
+  "GET repos/{owner}/{repo}/pulls",
 ] }
 platform_support = "unknown"
 adapter_coverage = "partial"
@@ -428,6 +433,12 @@ path = "defaults/scripts/lib/forge-helpers.sh"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/cli/merge_pr_refs.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/eta/fleet_events_forge.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/eta_backtest_cases.rs"
 [[operation.callers]]
 kind = "role-prompt"
 path = "defaults/.claude/commands/loom/curator.md"

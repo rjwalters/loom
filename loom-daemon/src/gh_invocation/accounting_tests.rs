@@ -147,3 +147,59 @@ fn a_bare_gh_program_is_not_an_injection() {
     let bare = inv("claim.pr_view", &[], Path::new("gh"));
     assert_eq!(bare.program, None, "a bare `gh` must go through the resolver");
 }
+
+// ===== #9831 call identity =====
+
+fn bare(op: &'static str, args: &[&str]) -> GhInvocation {
+    GhInvocation::new(
+        Operation::new(op),
+        AccessIntent::Read,
+        GhTarget::None,
+        Duration::from_secs(10),
+    )
+    .args(args.iter().copied())
+}
+
+#[test]
+fn an_unmapped_site_is_unknown_but_still_names_provider_and_origin() {
+    let id = resolved_identity_with(&bare("issue.view", &["issue", "view", "1"]), None, None);
+    assert_eq!(id.operation, None, "no guessed mapping: records as `unknown`");
+    assert_eq!(id.provider.as_deref(), Some("github"));
+    assert_eq!(id.origin.as_deref(), Some("github.com"), "gh's default host");
+    assert_eq!(id.repo, None);
+}
+
+#[test]
+fn origin_and_repo_fall_back_in_gh_resolution_order() {
+    let host = bare("api.rest", &["api", "--hostname", "ghe.example.com", "repos/o/r"]);
+    let id = resolved_identity_with(&host, Some("other.example.com".into()), None);
+    assert_eq!(id.origin.as_deref(), Some("ghe.example.com"), "--hostname wins");
+
+    let env = resolved_identity_with(
+        &bare("api.rest", &["api", "x"]),
+        Some("gh-host.example.com".into()),
+        Some("env/repo".into()),
+    );
+    assert_eq!(env.origin.as_deref(), Some("gh-host.example.com"));
+    assert_eq!(env.repo.as_deref(), Some("env/repo"), "LOOM_REPO, as GH_REPO");
+
+    let typed = GhInvocation::new(
+        Operation::new("api.rest"),
+        AccessIntent::Read,
+        GhTarget::repo("typed/repo").unwrap(),
+        Duration::from_secs(10),
+    );
+    let typed = resolved_identity_with(&typed, None, Some("env/repo".into()));
+    assert_eq!(typed.repo.as_deref(), Some("typed/repo"), "the typed target wins");
+}
+
+#[test]
+fn a_site_scope_and_operation_win_and_never_merge_origin_into_repo() {
+    let inv = bare("fleet_store", &["api", "--hostname", "argv.example.com", "x"])
+        .forge_op(crate::forge_call_stats::ops::GIT_READ_OBJECTS)
+        .identity_scope(Some("gitea.example.com"), Some("acme/app"));
+    let id = resolved_identity_with(&inv, Some("env.example.com".into()), Some("e/r".into()));
+    assert_eq!(id.operation.as_deref(), Some("git.read-objects"));
+    assert_eq!(id.origin.as_deref(), Some("gitea.example.com"));
+    assert_eq!(id.repo.as_deref(), Some("acme/app"));
+}

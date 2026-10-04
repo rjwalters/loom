@@ -85,6 +85,8 @@ pub mod private_workspace;
 pub mod profile_ledger;
 pub mod profile_merge;
 pub mod profile_provisioning;
+#[cfg(test)]
+pub(crate) mod profile_root_env;
 pub mod profile_sharing;
 pub mod ranking_weekly;
 pub mod rng;

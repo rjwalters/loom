@@ -173,6 +173,7 @@ pub mod eta;
 pub mod event_bus;
 pub mod filing_lock;
 pub mod fleet;
+pub mod fleet_alert;
 pub mod fleet_captain;
 pub mod fleet_state;
 pub mod fleet_store;
@@ -216,6 +217,7 @@ pub mod idle_exit;
 pub mod inflight;
 pub mod init;
 pub mod install_self_check;
+pub mod intake_reconcile;
 pub mod ipc;
 pub mod issue_creation_mutex;
 pub mod jev_merge_risk;
@@ -228,8 +230,13 @@ pub mod launchd_env_drift;
 pub mod launchd_reload;
 pub mod limit_calibration;
 pub mod live_claim;
+/// Test-only: a `gh` stand-in prepended to `PATH` before `main`, failing the
+/// run on any spawn of the real `gh` (#10138).
+#[cfg(test)]
+mod live_gh_guard;
 pub mod main_health_gate;
 pub mod mcp_tool_guard;
+pub mod merge_group_ci;
 pub mod merge_pr;
 pub mod metrics_collector;
 pub mod observability;

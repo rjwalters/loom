@@ -360,7 +360,7 @@ mod tests {
             std::fs::write(profile.join("auth.json"), format!("CRED-{name}")).unwrap();
         }
 
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", &profiles);
+        let _profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(&profiles);
         std::env::set_var("LOOM_CODEX_DEFAULT_HOME", &default_home);
         std::env::set_var("LOOM_CODEX_HOOKS_SCRIPT", "");
         std::env::remove_var(PROVISION_ON_START_ENV);
@@ -393,7 +393,6 @@ mod tests {
         assert!(!profiles.join("agent-1").join("AGENTS.md").exists());
 
         std::env::remove_var(PROVISION_ON_START_ENV);
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
         std::env::remove_var("LOOM_CODEX_DEFAULT_HOME");
         std::env::remove_var("LOOM_CODEX_HOOKS_SCRIPT");
     }

@@ -506,6 +506,14 @@ pub(crate) enum ScriptPortCommand {
     /// at zero cost to that file. Makes no forge call.
     #[command(subcommand)]
     ForgeInventory(super::forge_inventory_cmd::ForgeInventoryCommand),
+
+    /// Combined-tree CI qualification for the merge queue (#10257): `audit`
+    /// reports relied-on suites that do not validate the merge-group commit;
+    /// `eligibility` decides whether a repository may pilot queue mode.
+    /// Read-only. Lives here for the same frozen-`main.rs` reason as
+    /// `shell-budget`.
+    #[command(subcommand)]
+    MergeGroupCi(super::merge_group_ci_cmd::MergeGroupCiCommand),
 }
 
 impl ScriptPortCommand {
@@ -573,6 +581,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
             ScriptPortCommand::LabelDuplicates(args) => args.run(),
             ScriptPortCommand::ForgeInventory(cmd) => cmd.run(),
+            ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),
         }
     }
 }
@@ -677,6 +686,17 @@ pub(crate) enum MergePrCommand {
     /// are preserved untouched. A merged candidate cannot be aborted —
     /// landing wins and #9689's reconcile owns the aftermath.
     ConsolidateAbort(super::merge_pr_consolidate::ConsolidateAbortArgs),
+
+    /// Reconcile a MERGED consolidation candidate (#9689, ADR-0023 §6):
+    /// verify each component's inclusion by ancestry against the recorded
+    /// candidate tree, post per-component merged-into status (or
+    /// `untouched-open` for a source pushed after landing), close component
+    /// PRs with the exact combined merge SHA, close their declared
+    /// closing-reference issues through the existing refs analysis, and clean
+    /// the candidate branch — every step idempotent, so a crash anywhere
+    /// resumes. Never merges, and never releases a reservation: the ordering
+    /// pass is the one releaser on landing (ADR-0023 §4).
+    ConsolidateReconcile(super::merge_pr_consolidate::ConsolidateReconcileArgs),
 
     /// The async-close-race worktree-cleanup gate (#4186): whether a merged
     /// PR's issue is actually finished, so a partial-increment worktree the
@@ -883,6 +903,7 @@ impl MergePrCommand {
             MergePrCommand::SequencePlan(args) => args.run(),
             MergePrCommand::ConsolidatePrepare(args) => args.run(),
             MergePrCommand::ConsolidateAbort(args) => args.run(),
+            MergePrCommand::ConsolidateReconcile(args) => args.run(),
             MergePrCommand::IssueCloseGate(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),

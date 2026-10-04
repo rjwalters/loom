@@ -951,6 +951,7 @@ fn inspect_profile_for_uid(profile: &Path, invoking_uid: u32) -> ProfileDiagnost
 #[cfg(test)]
 mod tests {
     use super::super::paths::per_repo_accounts_file;
+    use super::super::profile_root_env::ProfileRootEnv;
     use super::*;
     use serial_test::serial;
     use std::sync::Mutex;
@@ -1030,8 +1031,12 @@ mod tests {
         }
     }
 
-    fn setup() -> (tempfile::TempDir, tempfile::TempDir) {
-        (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
+    /// Workspace + profile root, with `LOOM_CODEX_PROFILE_ROOT` redirected at
+    /// the root (RAII, crate-wide lock, restored on drop/panic — #9964).
+    fn setup() -> (tempfile::TempDir, tempfile::TempDir, ProfileRootEnv) {
+        let (workspace, root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let env = ProfileRootEnv::set(root.path());
+        (workspace, root, env)
     }
 
     /// A manually provisioned (pre-registry) profile with safe permissions,
@@ -1051,8 +1056,7 @@ mod tests {
     #[test]
     #[serial]
     fn add_two_profiles_device_auth_and_reauth_keep_canonical_identity() {
-        let (workspace, root) = setup();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let (workspace, _root, _env) = setup();
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         service.add("alice", true).unwrap();
         service.add("bob", false).unwrap();
@@ -1066,7 +1070,6 @@ mod tests {
         assert_eq!(calls[2].0.file_name().unwrap(), "bob");
         assert_eq!(calls[4].0.file_name().unwrap(), "alice");
         assert!(!format!("{:?}", &*calls).contains("recognizable-fake-secret"));
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     /// #7389: `add --email`/`import --email` register a non-secret email
@@ -1075,8 +1078,7 @@ mod tests {
     #[test]
     #[serial]
     fn add_with_email_registers_the_email_in_the_inventory() {
-        let (workspace, root) = setup();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let (workspace, _root, _env) = setup();
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         service
             .add_with_email("agent-1", false, Some("agent-1@example.com"))
@@ -1084,17 +1086,15 @@ mod tests {
         let accounts = account_inventory(workspace.path(), AccountProvider::Codex).unwrap();
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].email.as_deref(), Some("agent-1@example.com"));
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn import_is_private_atomic_and_secret_free() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("auth.json");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         let status = service.import("alice", &source).unwrap();
         assert!(status.diagnostics.valid());
@@ -1125,14 +1125,12 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exists"));
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn failed_add_leaves_no_account_or_empty_profile() {
-        let (workspace, root) = setup();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let (workspace, root, _env) = setup();
         let service = AccountLifecycle::new(
             workspace.path(),
             FakeRunner {
@@ -1145,7 +1143,6 @@ mod tests {
         assert_eq!(login_exit_code(&error), Some(23));
         assert!(!root.path().join("alice").exists());
         assert!(service.list(false).unwrap().is_empty());
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
@@ -1156,8 +1153,7 @@ mod tests {
         // `CODEX_HOME` — a non-empty, credential-less directory the old
         // `fs::read_dir(...).next().is_none()` emptiness check never cleaned
         // up, permanently wedging the name behind a false "already exists".
-        let (workspace, root) = setup();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let (workspace, root, _env) = setup();
         let flaky = AccountLifecycle::new(
             workspace.path(),
             FakeRunner {
@@ -1179,7 +1175,6 @@ mod tests {
         let healthy = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         healthy.add("alice", true).unwrap();
         assert_eq!(healthy.list(false).unwrap().len(), 1);
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
@@ -1188,9 +1183,8 @@ mod tests {
         // A directory that actually holds a credential is a genuine existing
         // account, not a leftover to reclaim — `add` must still refuse it,
         // and the message must point at the recovery path (issue #7400 AC #3).
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         provision_manual_profile(root.path(), "alice");
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         let error = service.add("alice", false).unwrap_err().to_string();
         assert!(error.contains("already exists"));
@@ -1199,7 +1193,6 @@ mod tests {
             fs::read_to_string(root.path().join("alice").join(AUTH_FILE)).unwrap(),
             "recognizable-fake-secret"
         );
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
@@ -1209,27 +1202,24 @@ mod tests {
         // that predates this fix, or survived a hard-killed process) must not
         // be silently deleted by a later `add` — but the error must say
         // exactly what to remove (issue #7400 AC #3).
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         let leftover = root.path().join("alice");
         fs::create_dir_all(leftover.join("log")).unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         let error = service.add("alice", false).unwrap_err().to_string();
         assert!(!error.contains("already exists"));
         assert!(error.contains(&leftover.display().to_string()));
         assert!(error.to_lowercase().contains("rm -rf"));
         assert!(leftover.exists());
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn enable_requires_safe_shape_and_disable_is_non_destructive() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("auth.json");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         service.import("alice", &source).unwrap();
         service.disable("alice").unwrap();
@@ -1239,17 +1229,15 @@ mod tests {
         );
         fs::remove_file(root.path().join("alice/auth.json")).unwrap();
         assert!(service.enable("alice").is_err());
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn remove_quarantines_without_secret_metadata_and_purge_is_explicit() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("auth.json");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         service.import("alice", &source).unwrap();
         let removed = service.remove("alice", false).unwrap();
@@ -1266,29 +1254,27 @@ mod tests {
         service.import("bob", &source).unwrap();
         assert!(service.remove("bob", true).unwrap().purged);
         assert!(!root.path().join("bob").exists());
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn rejects_names_and_repository_local_root() {
-        let (workspace, _) = setup();
+        let (workspace, _, _env) = setup();
         let local_root = workspace.path().join(".loom/codex-profiles");
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", &local_root);
+        let _profile_root = ProfileRootEnv::set(&local_root);
         assert!(AccountLifecycle::new(workspace.path(), FakeRunner::default()).is_err());
         let external = tempfile::tempdir().unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", external.path());
+        let _profile_root = ProfileRootEnv::set(external.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         for name in ["../escape", "/absolute", "a/b", r"a\b"] {
             assert!(service.add(name, false).is_err());
         }
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn diagnostics_cover_unsafe_shapes_modes_and_invoking_owner() {
-        let (_workspace, root) = setup();
+        let (_workspace, root, _env) = setup();
         let profile = root.path().join("alice");
         fs::create_dir(&profile).unwrap();
 
@@ -1323,11 +1309,10 @@ mod tests {
     #[test]
     #[serial]
     fn import_rejects_symlink_and_never_echoes_secret_in_errors() {
-        let (workspace, root) = setup();
+        let (workspace, _root, _env) = setup();
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("auth.json");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         #[cfg(unix)]
         {
@@ -1337,16 +1322,14 @@ mod tests {
             assert!(error.contains("regular file"));
             assert!(!error.contains("recognizable-fake-secret"));
         }
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn import_registry_failure_removes_committed_profile_without_secret_leak() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         let source = root.path().join("source");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         let lock = per_repo_accounts_file(workspace.path()).with_extension("json.lock");
         fs::create_dir_all(lock.parent().unwrap()).unwrap();
@@ -1358,17 +1341,15 @@ mod tests {
         assert!(!root.path().join("alice").exists());
         assert!(service.list(false).unwrap().is_empty());
         assert!(!error.contains("recognizable-fake-secret"));
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn registry_failure_rolls_quarantine_and_purge_back_to_live_profile() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("auth.json");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
 
         for (name, purge) in [("retire", false), ("purge", true)] {
@@ -1382,16 +1363,14 @@ mod tests {
             assert!(service.find(name).is_ok());
             assert!(!error.contains("recognizable-fake-secret"));
         }
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn quarantine_setup_failure_leaves_live_profile_and_registry_unchanged() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         let source = root.path().join("source");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         service.import("alice", &source).unwrap();
         fs::write(root.path().join(".quarantine"), "not a directory").unwrap();
@@ -1400,16 +1379,14 @@ mod tests {
         assert!(root.path().join("alice").join(AUTH_FILE).exists());
         assert!(service.find("alice").is_ok());
         assert!(!error.contains("recognizable-fake-secret"));
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn recovery_metadata_collision_leaves_live_profile_and_registry_unchanged() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         let source = root.path().join("source");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         service.import("alice", &source).unwrap();
         let recovery = root.path().join("alice/recovery.json");
@@ -1421,7 +1398,6 @@ mod tests {
         assert_eq!(fs::read_to_string(recovery).unwrap(), "recognizable-existing-metadata");
         assert!(!error.contains("recognizable-fake-secret"));
         assert!(!error.contains("recognizable-existing-metadata"));
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
@@ -1435,11 +1411,10 @@ mod tests {
             return;
         }
 
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("auth.json");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         service.import("alice", &source).unwrap();
 
@@ -1475,17 +1450,15 @@ mod tests {
         assert!(removed.recovery_reference.is_some());
         assert!(!root.path().join("alice").exists());
         assert!(service.find("alice").is_err());
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn concurrent_import_of_same_name_never_destroys_the_winner() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("auth.json");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
 
         let outcomes: Vec<Result<AccountStatus>> = std::thread::scope(|scope| {
@@ -1513,14 +1486,12 @@ mod tests {
         let listed = service.list(false).unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].diagnostics.valid());
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn add_registry_failure_rolls_back_profile_and_frees_the_name() {
-        let (workspace, root) = setup();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let (workspace, root, _env) = setup();
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         let lock = per_repo_accounts_file(workspace.path()).with_extension("json.lock");
         fs::create_dir_all(lock.parent().unwrap()).unwrap();
@@ -1535,14 +1506,12 @@ mod tests {
         // The name is immediately reusable, not permanently wedged.
         service.add("alice", false).unwrap();
         assert_eq!(service.list(false).unwrap().len(), 1);
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn add_without_credential_rolls_back_profile_and_frees_the_name() {
-        let (workspace, root) = setup();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+        let (workspace, root, _env) = setup();
         let broken = AccountLifecycle::new(
             workspace.path(),
             FakeRunner {
@@ -1560,16 +1529,14 @@ mod tests {
         let healthy = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         healthy.add("alice", false).unwrap();
         assert_eq!(healthy.list(false).unwrap().len(), 1);
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn discovered_profiles_support_disable_enable_and_remove() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         provision_manual_profile(root.path(), "alice");
         provision_manual_profile(root.path(), "bob");
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
 
         let listed = service.list(false).unwrap();
@@ -1593,15 +1560,13 @@ mod tests {
         assert!(removed.recovery_reference.is_some());
         assert!(!root.path().join("bob").exists());
         assert_eq!(service.list(false).unwrap().len(), 1);
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn disable_enable_and_remove_work_pre_registry_without_registry_file() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         provision_manual_profile(root.path(), "alice");
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
 
         // `remove` on a discovered account adopts and then unregisters it in
@@ -1613,16 +1578,14 @@ mod tests {
             .join(removed.recovery_reference.unwrap());
         assert!(recovery.join(AUTH_FILE).exists());
         assert!(service.list(false).unwrap().is_empty());
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn orphan_profile_directory_does_not_poison_registered_inventory() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         let source = root.path().join("source");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         service.import("alice", &source).unwrap();
         service.import("bob", &source).unwrap();
@@ -1642,7 +1605,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exists"));
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     // ---- rename / adopt (issue #7401) -------------------------------------
@@ -1650,11 +1612,10 @@ mod tests {
     #[test]
     #[serial]
     fn rename_moves_directory_and_updates_registry_atomically() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("auth.json");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         service.import("agent-3", &source).unwrap();
         service.disable("agent-3").unwrap();
@@ -1670,17 +1631,15 @@ mod tests {
         assert!(service.find("agent-3").is_err());
         assert!(service.find("agent-three").is_ok());
         assert_eq!(service.list(false).unwrap().len(), 1);
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn rename_refuses_a_session_managed_profile() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("auth.json");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         service.import("alice", &source).unwrap();
         super::super::session_lifecycle::mark_session_managed(
@@ -1696,17 +1655,15 @@ mod tests {
         assert!(root.path().join("alice").join(AUTH_FILE).is_file());
         assert!(service.find("alice").is_ok());
         assert!(service.find("alice2").is_err());
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn rename_rejects_same_name_missing_source_and_existing_target() {
-        let (workspace, root) = setup();
+        let (workspace, _root, _env) = setup();
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("auth.json");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         service.import("alice", &source).unwrap();
         service.import("bob", &source).unwrap();
@@ -1725,15 +1682,13 @@ mod tests {
             .contains("exists"));
         assert!(service.find("alice").is_ok());
         assert!(service.find("bob").is_ok());
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn adopt_registers_an_unregistered_on_disk_profile() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         provision_manual_profile(root.path(), "alice");
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         // A registry already exists (from an unrelated `import`), which is
         // exactly the "renamed profile vanished from `list`" scenario: once
@@ -1757,17 +1712,15 @@ mod tests {
         assert!(adopted.enabled);
         assert_eq!(service.list(false).unwrap().len(), 2);
         assert!(service.find("alice").is_ok());
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
     #[serial]
     fn adopt_rejects_missing_directory_and_already_registered_name() {
-        let (workspace, root) = setup();
+        let (workspace, _root, _env) = setup();
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("auth.json");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         assert!(service
             .adopt("ghost")
@@ -1791,7 +1744,6 @@ mod tests {
             .to_string()
             .contains("exists"));
         assert!(!service.status_without_probe("alice").unwrap().enabled);
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     // ---- session-managed ownership rule (issue #6925, ADR-0017 Decision 1) ----
@@ -1799,11 +1751,10 @@ mod tests {
     #[test]
     #[serial]
     fn reauth_refuses_a_session_managed_profile() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("auth.json");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         service.import("alice", &source).unwrap();
         super::super::session_lifecycle::mark_session_managed(
@@ -1817,14 +1768,12 @@ mod tests {
         assert!(error.contains("session attach"));
         // Refusal happens before any host-direct `codex login` runs.
         assert!(service.runner.calls.lock().unwrap().is_empty());
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     fn import_session_managed(workspace: &Path, root: &Path, name: &str) {
         let source_dir = tempfile::tempdir().unwrap();
         let source = source_dir.path().join("auth.json");
         fs::write(&source, "recognizable-fake-secret").unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root);
         AccountLifecycle::new(workspace, FakeRunner::default())
             .unwrap()
             .import(name, &source)
@@ -1839,7 +1788,7 @@ mod tests {
     #[test]
     #[serial]
     fn status_of_a_session_managed_account_never_probes_the_host_directly() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         import_session_managed(workspace.path(), root.path(), "alice");
         // A runner with no container seam reports "could not probe" (the
         // trait's default `session_login_status`), never a fabricated state.
@@ -1851,7 +1800,6 @@ mod tests {
         // The host-direct read-only probe must never have run (ADR-0017
         // Decision 1's ownership rule).
         assert!(service.runner.calls.lock().unwrap().is_empty());
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     /// Issue #6927: once the in-container probe answers, a session-managed
@@ -1882,7 +1830,7 @@ mod tests {
             ("logged in", true, LoginState::LoggedIn),
             ("not logged in", false, LoginState::NotLoggedIn),
         ] {
-            let (workspace, root) = setup();
+            let (workspace, root, _env) = setup();
             import_session_managed(workspace.path(), root.path(), "alice");
             let service = AccountLifecycle::new(
                 workspace.path(),
@@ -1907,20 +1855,18 @@ mod tests {
                 vec!["loom-codex-session-alice".to_string()],
                 "the probe must be addressed to the account's own container"
             );
-            std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
         }
     }
 
     #[test]
     #[serial]
     fn a_non_probing_status_of_a_session_managed_account_is_not_checked() {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         import_session_managed(workspace.path(), root.path(), "alice");
         let service = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
         let status = service.status_without_probe("alice").unwrap();
         assert_eq!(status.login_state, LoginState::NotChecked);
         assert!(status.session_managed);
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
@@ -2004,10 +1950,9 @@ mod tests {
             ),
         ];
         for (index, (output, expected)) in cases.into_iter().enumerate() {
-            let (workspace, root) = setup();
+            let (workspace, root, _env) = setup();
             let source = root.path().join(format!("source-{index}"));
             fs::write(&source, "recognizable-fake-secret").unwrap();
-            std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
             let importer = AccountLifecycle::new(workspace.path(), FakeRunner::default()).unwrap();
             importer.import("alice", &source).unwrap();
             let service = AccountLifecycle::new(workspace.path(), StatusRunner(output)).unwrap();
@@ -2017,6 +1962,5 @@ mod tests {
                 .unwrap()
                 .contains("recognizable-fake-secret"));
         }
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 }

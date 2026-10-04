@@ -25,6 +25,8 @@ pub struct Repo {
     pub comment_reads: usize,
     /// Issue searches made through the fake.
     pub searches: usize,
+    /// Single-issue reads made through the fake.
+    pub issue_reads: usize,
     /// `author_association` of each issue's author (absent: `NONE`).
     pub associations: BTreeMap<u32, String>,
     pub fail_listing: bool,
@@ -85,7 +87,9 @@ impl StarForge for FakeForge {
     }
 
     fn issue(&mut self, number: u32) -> Result<Option<RestIssue>> {
-        Ok(self.world.repo(&self.slug).items.get(&number).cloned())
+        let mut repo = self.world.repo(&self.slug);
+        repo.issue_reads += 1;
+        Ok(repo.items.get(&number).cloned())
     }
 
     fn comments(&mut self, number: u32) -> Result<Vec<ForgeComment>> {
@@ -211,6 +215,8 @@ pub fn repo_input(slug: &str) -> RepoInput {
         slug: slug.to_string(),
         tick_rows: Vec::new(),
         pool: None,
+        host_queue: std::sync::Arc::default(),
+        cap: None,
         web_base: crate::star_liveness::task::DEFAULT_WEB_BASE.to_string(),
     }
 }

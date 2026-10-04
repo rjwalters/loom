@@ -301,6 +301,7 @@ fn check_rate_limit() -> bool {
         GhTarget::None,
         GH_TIMEOUT,
     )
+    .forge_op(crate::forge_call_stats::ops::QUOTA_RATE_LIMIT_READING)
     .args(["api", "rate_limit"])
     .run();
     match probe {

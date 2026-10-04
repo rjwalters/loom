@@ -89,7 +89,7 @@ pub fn open_pr_warning(issue: u32, pr: u32, root: &Path) -> String {
 /// `None` covers BOTH "no such PR" and every failure (missing/failed `gh`,
 /// unparseable output) — this is a diagnostic, so an unanswerable probe simply
 /// produces no warning and never affects the reclaim that already happened.
-fn open_pr_on_issue_branch(gh_bin: &Path, root: &Path, issue: u32) -> Option<u32> {
+pub(crate) fn open_pr_on_issue_branch(gh_bin: &Path, root: &Path, issue: u32) -> Option<u32> {
     // #5401: the facade applies the cross-owner GH_CONFIG_DIR for `root`.
     let mut inv = crate::gh_invocation::GhInvocation::new(
         crate::gh_invocation::Operation::new("reclaim.open_pr_probe"),

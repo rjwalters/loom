@@ -6,13 +6,16 @@
 //! [`FeatureOmitted`] reason, never a default; seconds are integers.
 //!
 //! Size: target [`TARGET_BYTES`], hard cap [`MAX_BYTES`] (the trace journal's
-//! entry cap). [`Explanation::enforce_cap`] drops `features` first, then the
-//! stage grids, then the stage marks, and names what it dropped in
-//! `truncated`.
+//! entry cap). [`Explanation::enforce_cap`] drops `features` first, then a
+//! twin-otter model slice, then the stage grids, then the stage marks, and
+//! names what it dropped in `truncated`.
 
+use super::fit::{AftFit, FitStage, HazardFit, PathStats};
+use super::twin_otter::TwinOtterInput;
 use super::{AgeSource, DispatchInput, Kind, NoEstimateReason, Provenance, Stage, Subject};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Hard cap on one serialized explanation.
 pub const MAX_BYTES: usize = 32 * 1024;
@@ -22,6 +25,10 @@ pub const TARGET_BYTES: usize = 8 * 1024;
 
 /// `truncated[]` entry when `features` was dropped.
 pub const TRUNCATED_FEATURES: &str = "features";
+
+/// `truncated[]` entry when a twin-otter record's model slice was dropped
+/// (#10243). Only ever written when the slice was there.
+pub const TRUNCATED_TWIN_OTTER_MODEL: &str = "twin_otter.model";
 
 /// `truncated[]` entry when the stage grids were dropped.
 pub const TRUNCATED_GRIDS: &str = "stages.distribution.grid";
@@ -78,6 +85,64 @@ pub struct Explanation {
     pub no_estimate_reason: Option<NoEstimateReason>,
     /// What [`Explanation::enforce_cap`] dropped, in drop order.
     pub truncated: Vec<String>,
+    /// How a recalibrating heuristic (#10207) moved the simulated quantiles
+    /// into `result`. Absent — and `result` is the simulation's own — for
+    /// every other heuristic, so their explanations are byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recalibration: Option<super::recalibrate::Recalibration>,
+    /// What `land-2026-10-04-twin-otter` (#10243) evaluated: the coefficient
+    /// file, the adapted input, both parts' quantiles and the model slice
+    /// that recomputes them. Absent for every other heuristic and on every
+    /// refusal, so their explanations are byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub twin_otter: Option<TwinOtterRecord>,
+}
+
+/// A twin-otter answer, recorded so it can be recomputed from the
+/// explanation alone ([`super::simulate::run_explanation`]). The master
+/// seed is `combination.seed`; `result` holds the blend.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TwinOtterRecord {
+    /// The coefficient file's content-derived id (16 hex).
+    pub fit_id: String,
+    /// The file's cutoff, strictly before `as_of`.
+    pub fit_as_of: DateTime<Utc>,
+    /// The adapted input, exactly as evaluated.
+    pub input: TwinOtterInput,
+    /// Input fields that were null and imputed at the training mean.
+    pub imputed: Vec<String>,
+    /// Hours per survival step.
+    pub step_h: f64,
+    /// Survival steps.
+    pub steps: usize,
+    /// The cap on every quantile, in hours.
+    pub cap_h: f64,
+    /// Monte Carlo paths.
+    pub paths: usize,
+    /// The age clamp, in hours; `None` = off.
+    pub age_clamp_h: Option<f64>,
+    /// Whether the clamp bound at any step.
+    pub age_clamp_applied: bool,
+    /// The stage-by-stage part's p25/p50/p75/p90, in whole seconds.
+    pub hazard_path_sec: [i64; 4],
+    /// The direct (AFT) part's p25/p50/p75/p90, in whole seconds.
+    pub aft_sec: [i64; 4],
+    /// What the evaluation read. `None` only after
+    /// [`Explanation::enforce_cap`] dropped it, and then nothing recomputes.
+    pub model: Option<TwinOtterModelRecord>,
+}
+
+/// The part of a coefficient file one twin-otter evaluation reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TwinOtterModelRecord {
+    /// Feature names, in coefficient order.
+    pub features: Vec<String>,
+    /// The current stage's exit hazard, and no other stage's.
+    pub hazard: BTreeMap<FitStage, HazardFit>,
+    /// The pooled direct model.
+    pub aft: AftFit,
+    /// Every stage's dwell curve and next-stage table: a path walks them all.
+    pub path_stats: PathStats,
 }
 
 /// The current stage as the estimate saw it.
@@ -227,6 +292,34 @@ pub struct Distribution {
     pub p75: i64,
     /// 90th percentile.
     pub p90: i64,
+    /// How a calibrating heuristic (`land-v3`, #9970) derived `grid_sec`
+    /// from the raw grid. Absent — and `grid_sec` is the raw grid — for
+    /// every heuristic that draws from history unadjusted, so every earlier
+    /// heuristic's explanation is byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjustment: Option<StageAdjustment>,
+}
+
+/// The transform a calibrating heuristic applied to one stage's raw grid,
+/// in order: stretch about the raw median, scale, offset, floor. Recorded so
+/// the adjusted grid (what the simulation draws from) can be traced back to
+/// the history it came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageAdjustment {
+    /// The raw grid's median, before any adjustment.
+    pub raw_p50: i64,
+    /// Factor applied to each grid point's distance above the raw median.
+    pub upper_stretch: f64,
+    /// Factor applied to each grid point's distance below the raw median.
+    pub lower_stretch: f64,
+    /// Multiplier on every grid point (complexity scaling); `1.0` = none.
+    pub scale: f64,
+    /// What `scale` came from: `points:<n>`, or `none`.
+    pub scale_basis: String,
+    /// Seconds added to every grid point (queue friction); `0` = none.
+    pub offset_sec: i64,
+    /// Lowest value any grid point may take; `0` = none.
+    pub floor_sec: i64,
 }
 
 /// The sample filter a distribution was built with.
@@ -337,6 +430,16 @@ pub struct EstimateResult {
     pub p50_sec: i64,
     /// Remaining seconds, 75th percentile.
     pub p75_sec: i64,
+    /// Remaining seconds, 90th percentile (#10211): the displayed upper
+    /// bound a late surprise is scored against. Read off the same simulated
+    /// path totals as the quartiles, by the same nearest-rank rule, with no
+    /// new draws.
+    ///
+    /// Always `Some` on a new estimate. `None` only on an explanation
+    /// recorded before the field existed, which still parses: additive, so
+    /// no schema bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p90_sec: Option<i64>,
     /// `as_of + p50`.
     pub eta_p50_at: DateTime<Utc>,
     /// Smallest `n` over the path's distributions.
@@ -364,7 +467,13 @@ pub struct Contributions {
     pub rework_fraction_by_quartile: Vec<f64>,
 }
 
-/// Recorded context. `null` = not measured; no v1 heuristic reads these.
+/// Recorded context. `null` = not measured, with a [`FeatureOmitted`]
+/// reason. No v1 heuristic reads these (`land-v3` reads two).
+///
+/// The fields from `ahead` on (#10201) post-date the first shipped v1
+/// payloads: an explanation recorded before them still parses (a missing
+/// `Option` reads as `None`), so the change is additive and the schema stays
+/// `eta-explanation/v1`. Their definitions are [`super::queue_features`]'s.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Features {
     /// Current labels.
@@ -431,6 +540,88 @@ pub struct Features {
     pub pool_exhausted: Option<bool>,
     /// The repo's first-pass approval rate.
     pub repo_first_pass_approval_rate: Option<f64>,
+    /// Other open PRs in the repo and stage that entered it earlier.
+    #[serde(default)]
+    pub ahead: Option<u32>,
+    /// Other open PRs in the repo and stage.
+    #[serde(default)]
+    pub n_stage_repo: Option<u32>,
+    /// Other open PRs in the stage, fleet scope.
+    #[serde(default)]
+    pub n_stage_fleet: Option<u32>,
+    /// Departures from the stage in the repo, last hour.
+    #[serde(default)]
+    pub exits_repo_1h: Option<u32>,
+    /// Same, last 6 h.
+    #[serde(default)]
+    pub exits_repo_6h: Option<u32>,
+    /// Same, last 24 h.
+    #[serde(default)]
+    pub exits_repo_24h: Option<u32>,
+    /// Departures from the stage, fleet scope, last hour.
+    #[serde(default)]
+    pub exits_fleet_1h: Option<u32>,
+    /// Same, last 6 h.
+    #[serde(default)]
+    pub exits_fleet_6h: Option<u32>,
+    /// Same, last 24 h.
+    #[serde(default)]
+    pub exits_fleet_24h: Option<u32>,
+    /// PR merges in the repo, last 24 h.
+    #[serde(default)]
+    pub merges_repo_24h: Option<u32>,
+    /// PR merges, fleet scope, last 6 h.
+    #[serde(default)]
+    pub merges_fleet_6h: Option<u32>,
+    /// Seconds since the repo's last merge, capped at 168 h.
+    #[serde(default)]
+    pub since_merge_sec: Option<i64>,
+    /// Open PRs under any review label in the repo, the item's own included.
+    #[serde(default)]
+    pub open_prs_repo: Option<u32>,
+    /// Repos the fleet-scope values cover.
+    #[serde(default)]
+    pub fleet_scope_repos: Option<u32>,
+    /// The repo had a `pr-open-skip` row on the last dispatch plan.
+    #[serde(default)]
+    pub repo_pr_open_skip: Option<bool>,
+    // Queue friction (#10193). Additive and `serde(default)`, like
+    // `stage_marks`: a payload logged before them still parses (with `None`,
+    // and no omission entry), so `eta-explanation/v1` is not bumped. Each is
+    // read before `as_of` and carries the instant it was read, so an offline
+    // model can check it was knowable at the estimate (#10193 rule 1).
+    /// Open PRs in the repo (every open PR, not only Loom's).
+    #[serde(default)]
+    pub repo_open_prs: Option<u32>,
+    /// Whether the repo's ready backlog is frozen behind the open-PR guard
+    /// (`pr-open-skip`) on the work finder's last tick.
+    #[serde(default)]
+    pub repo_pr_open_lockout: Option<bool>,
+    /// The repo's typical (median) recent pull-request CI run duration, from
+    /// runs that had finished before `as_of`.
+    #[serde(default)]
+    pub repo_ci_typical_duration_sec: Option<i64>,
+    /// When the repo-level friction above was read (at or before `as_of`).
+    #[serde(default)]
+    pub repo_friction_observed_at: Option<DateTime<Utc>>,
+    /// The PR head's CI: `passing`, `failing`, `pending` or `none`.
+    #[serde(default)]
+    pub pr_ci_status: Option<String>,
+    /// Whether the PR is behind its base branch.
+    #[serde(default)]
+    pub pr_behind_main: Option<bool>,
+    /// Whether the PR has merge conflicts.
+    #[serde(default)]
+    pub pr_merge_conflict: Option<bool>,
+    /// When the PR-level friction above was read (at or before `as_of`).
+    #[serde(default)]
+    pub pr_friction_observed_at: Option<DateTime<Utc>>,
+    /// Whether a hold label (an operator / merge-risk hold, `loom:blocked`,
+    /// a park) is on the item: explicit, not only inside `labels`. Any
+    /// `labels::hold_labels()` entry (`check_holds`), deliberately broader
+    /// than `pr_flags`' `FLAG_OP_HOLD`; see #10278.
+    #[serde(default)]
+    pub operator_hold: Option<bool>,
 }
 
 /// Why a feature is null.
@@ -444,7 +635,7 @@ pub struct FeatureOmitted {
 
 impl Features {
     /// Every feature name, in field order.
-    pub const NAMES: [&'static str; 32] = [
+    pub const NAMES: [&'static str; 56] = [
         "labels",
         "complexity_marker",
         "points_marker",
@@ -477,6 +668,30 @@ impl Features {
         "pool_usable_accounts",
         "pool_exhausted",
         "repo_first_pass_approval_rate",
+        "ahead",
+        "n_stage_repo",
+        "n_stage_fleet",
+        "exits_repo_1h",
+        "exits_repo_6h",
+        "exits_repo_24h",
+        "exits_fleet_1h",
+        "exits_fleet_6h",
+        "exits_fleet_24h",
+        "merges_repo_24h",
+        "merges_fleet_6h",
+        "since_merge_sec",
+        "open_prs_repo",
+        "fleet_scope_repos",
+        "repo_pr_open_skip",
+        "repo_open_prs",
+        "repo_pr_open_lockout",
+        "repo_ci_typical_duration_sec",
+        "repo_friction_observed_at",
+        "pr_ci_status",
+        "pr_behind_main",
+        "pr_merge_conflict",
+        "pr_friction_observed_at",
+        "operator_hold",
     ];
 
     /// `omitted` plus a `reason` entry for every null feature it does not
@@ -510,6 +725,16 @@ impl Explanation {
             .map(|r| (r.p25_sec, r.p50_sec, r.p75_sec))
     }
 
+    /// The `(p25, p50, p75, p90)` remaining seconds, when there is an
+    /// estimate that recorded a p90 — what
+    /// [`super::simulate::run_explanation`] recomputes. `None` for a refusal
+    /// and for an explanation recorded before p90 existed (#10211).
+    #[must_use]
+    pub fn quantiles_with_p90(&self) -> Option<(i64, i64, i64, i64)> {
+        let r = self.result.as_ref()?;
+        Some((r.p25_sec, r.p50_sec, r.p75_sec, r.p90_sec?))
+    }
+
     /// Serialized size in bytes.
     #[must_use]
     pub fn size_bytes(&self) -> usize {
@@ -518,9 +743,10 @@ impl Explanation {
             .unwrap_or(usize::MAX)
     }
 
-    /// Enforce [`MAX_BYTES`]: drop `features`, then the stage grids, then
-    /// the stage marks, then every remaining list, stopping as soon as the
-    /// record fits, and recording each drop in `truncated`.
+    /// Enforce [`MAX_BYTES`]: drop `features`, then a twin-otter model
+    /// slice (only when there is one), then the stage grids, then the stage
+    /// marks, then every remaining list, stopping as soon as the record fits,
+    /// and recording each drop in `truncated`.
     pub fn enforce_cap(&mut self) {
         if self.size_bytes() <= MAX_BYTES {
             return;
@@ -530,6 +756,17 @@ impl Explanation {
         self.truncated.push(TRUNCATED_FEATURES.to_string());
         if self.size_bytes() <= MAX_BYTES {
             return;
+        }
+        let dropped_model = self
+            .twin_otter
+            .as_mut()
+            .and_then(|record| record.model.take())
+            .is_some();
+        if dropped_model {
+            self.truncated.push(TRUNCATED_TWIN_OTTER_MODEL.to_string());
+            if self.size_bytes() <= MAX_BYTES {
+                return;
+            }
         }
         for entry in &mut self.stages {
             entry.distribution.grid_pct.clear();

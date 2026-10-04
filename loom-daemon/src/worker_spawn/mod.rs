@@ -252,7 +252,7 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         .as_ref()
         .and_then(|a| a.child(SpanName::RuntimePreflight, Default::default()))
         .or_else(|| lifecycle::inherited(&root, SpanName::RuntimePreflight, Default::default()));
-    let result = run_preflight(args, &root, preflight.as_ref(), attempt.as_ref());
+    let result = run_preflight(args, &root, preflight.as_ref(), attempt.as_ref(), None);
     if let Some(span) = preflight {
         // A rejected preflight is one of the two shapes an operator reports
         // ("the attempt failed in 300 ms with no runtime span"): record the
@@ -286,6 +286,7 @@ fn run_preflight(
     root: &Path,
     preflight: Option<&crate::observability::lifecycle::Span>,
     attempt: Option<&crate::observability::lifecycle::Span>,
+    egress_sources: Option<&crate::forge_egress::policy::PolicySources>,
 ) -> Result<(), LaunchError> {
     let mut trace_identity = crate::telemetry::trace::TraceAttributes::new();
     let config = crate::config_resolver::resolve_effective_config(root);
@@ -314,7 +315,11 @@ fn run_preflight(
     // Forge egress admission (#9984): `spawn-worker.sh` delegates here, so this
     // is its `forge egress assert`. Under `enforcement.api = required` a routing
     // finding means no worker is spawned; `observe` logs; no policy is a no-op.
-    if let Some(refusal) = crate::forge_egress::gate::spawn_refusal(root) {
+    // `egress_sources` is `None` in production (`from_process`); tests pin it.
+    if let Some(refusal) = egress_sources.map_or_else(
+        || crate::forge_egress::gate::spawn_refusal(root),
+        |sources| crate::forge_egress::gate::spawn_refusal_with(sources, root),
+    ) {
         return Err(LaunchError::config(refusal));
     }
     let scripts = args.scripts_dir.unwrap_or_else(|| scripts_dir(root));

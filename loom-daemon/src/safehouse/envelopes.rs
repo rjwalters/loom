@@ -257,9 +257,26 @@ pub fn operator_priority_envelope(
     // (whose repo name comes from the workspace-root basename — the same name
     // for every normally-cloned checkout).
     let name = slug.rsplit('/').next().unwrap_or(slug.as_str());
+    // `issue == 0` is a fleet-wide alert (#10164): no `#N`, and no link when
+    // the publisher has no URL to offer.
+    let at = if *issue == 0 {
+        name.to_owned()
+    } else {
+        format!("{name}#{issue}")
+    };
     let task_id = Some(format!("{}_{issue}", sanitize_task_id_segment(name)));
+    let link = if url.is_empty() {
+        String::new()
+    } else {
+        format!("{url} · ")
+    };
     let body = if *resolved {
-        format!("{name}#{issue} · operator ask resolved ✓ · {kind} · {url}")
+        let tail = if url.is_empty() {
+            String::new()
+        } else {
+            format!(" · {url}")
+        };
+        format!("{at} · operator ask resolved ✓ · {kind}{tail}")
     } else {
         let mention = operator_mention
             .map(|m| format!("{m}: "))
@@ -268,8 +285,8 @@ pub fn operator_priority_envelope(
             .map(|n| format!(" (blocks starred #{n})"))
             .unwrap_or_default();
         format!(
-            "{mention}{name}#{issue} · OPERATOR NEEDED · {kind} at {stage}{inherited}\n\
-             {text}\n{url} · observed by {host}"
+            "{mention}{at} · OPERATOR NEEDED · {kind} at {stage}{inherited}\n\
+             {text}\n{link}observed by {host}"
         )
     };
     Some(Envelope {
@@ -409,6 +426,22 @@ mod tests {
         }
         let env = operator_priority_envelope(&event, None).unwrap();
         assert!(env.body.contains("(blocks starred #9244)"), "got {:?}", env.body);
+    }
+
+    #[test]
+    fn a_fleet_wide_alert_has_no_issue_number_or_empty_link() {
+        let mut event = escalation_event(false);
+        if let Event::OperatorPriorityEscalation {
+            issue, url, slug, ..
+        } = &mut event
+        {
+            *issue = 0;
+            url.clear();
+            *slug = "fleet/box".to_owned();
+        }
+        let env = operator_priority_envelope(&event, None).unwrap();
+        assert!(env.body.starts_with("box · OPERATOR NEEDED"), "got {:?}", env.body);
+        assert!(!env.body.contains('#') && !env.body.contains(" · observed"));
     }
 
     #[test]

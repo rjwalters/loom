@@ -491,6 +491,46 @@ pub fn append(path: &Path, entries: &[JournalEntry]) -> std::io::Result<()> {
     file.write_all(text.as_bytes())
 }
 
+/// The identity of one stage segment: `(repo, pr, stage, entered_at)`. `None`
+/// when the row does not carry all four (such rows are never deduplicated).
+type SegmentKey = (String, u32, Stage, DateTime<Utc>);
+
+impl JournalEntry {
+    fn segment_key(&self) -> Option<SegmentKey> {
+        Some((self.repo.clone(), self.pr_number?, self.stage?, self.entered_at?))
+    }
+
+    /// Whether this row records a completed (observed-duration) segment.
+    fn is_completed_segment(&self) -> bool {
+        !self.in_sweep && self.duration_sec.is_some()
+    }
+}
+
+/// [`append`], skipping rows whose segment is already journaled (#9750).
+///
+/// A row is a duplicate when the journal (or this batch) already holds a row
+/// of the same kind (completed vs. open) with the same
+/// `(repo, pr_number, stage, entered_at)`. A completed row is never blocked by
+/// an open one: the read side ([`StageSamples::push_journal`]) suppresses the
+/// censored bound once the real duration exists. Returns the rows written.
+pub fn append_dedup(path: &Path, entries: &[JournalEntry]) -> std::io::Result<usize> {
+    let mut seen: std::collections::HashSet<(SegmentKey, bool)> = read(path)
+        .iter()
+        .filter(|e| !e.in_sweep)
+        .filter_map(|e| Some((e.segment_key()?, e.is_completed_segment())))
+        .collect();
+    let fresh: Vec<JournalEntry> = entries
+        .iter()
+        .filter(|e| match e.segment_key() {
+            Some(key) => seen.insert((key, e.is_completed_segment())),
+            None => true,
+        })
+        .cloned()
+        .collect();
+    append(path, &fresh)?;
+    Ok(fresh.len())
+}
+
 /// Every parseable row of the journal at `path` and its `.1` rotation, oldest
 /// generation first. Malformed lines are skipped.
 #[must_use]
@@ -512,11 +552,21 @@ impl StageSamples {
     /// Add every history sample and verdict `entries` carry; `host` is the
     /// host whose journal they come from.
     pub fn push_journal(&mut self, entries: &[JournalEntry], host: &str) {
+        // #9750: a segment that later completed is counted once — its stale
+        // open-segment bound is dropped when a completed row shares its key.
+        let completed: std::collections::HashSet<SegmentKey> = entries
+            .iter()
+            .filter(|e| e.is_completed_segment())
+            .filter_map(JournalEntry::segment_key)
+            .collect();
         for entry in entries {
             if let Some(sample) = entry.history_sample(host) {
                 self.stages.push(sample);
             }
-            if let Some(sample) = entry.censored_sample(host) {
+            let superseded = entry
+                .segment_key()
+                .is_some_and(|key| completed.contains(&key));
+            if let Some(sample) = entry.censored_sample(host).filter(|_| !superseded) {
                 self.censored.push(sample);
             }
             if let Some(verdict) = entry.history_verdict() {

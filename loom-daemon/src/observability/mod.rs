@@ -106,6 +106,9 @@ pub mod collector;
 pub mod daemon_event;
 pub mod endpoint_policy;
 pub mod eta;
+pub mod eta_fit;
+pub mod eta_fleet_refresh;
+mod eta_friction;
 pub mod eta_snapshot;
 pub mod exporter;
 pub mod lifecycle;
@@ -1141,7 +1144,27 @@ pub fn spawn_task(
     // ETA (#9289): `eta.estimate` / `eta.outcome` are OTLP-only too; the
     // tracker and its bus subscriber run (and journal) even without them.
     eta::register_sink(otlp_queues.clone(), &host_id);
-    ops_handles.extend(eta::spawn_task(bus, workspace_root.clone(), host_id.clone()));
+    ops_handles.extend(eta::spawn_task(
+        bus,
+        workspace_root.clone(),
+        host_id.clone(),
+        workspace_pool.clone(),
+    ));
+    // The daily ETA refit (#10245) and the fleet snapshot refresh (#10263):
+    // either/or. With fleet refresh on, the refit check runs at the end of
+    // every refresh cycle (`eta_fleet_refresh::owns_fit`), so it always sees
+    // that cycle's snapshots and the standalone refit task is not spawned —
+    // two loops calling `refit_if_due` would only race.
+    if eta_fleet_refresh::owns_fit(&crate::eta::config::read(&workspace_root)) {
+        ops_handles.extend(eta_fleet_refresh::spawn_task(
+            workspace_root.clone(),
+            workspace_pool.clone(),
+            otlp_queues.clone(),
+            host_id.clone(),
+        ));
+    } else {
+        ops_handles.extend(eta_fit::spawn_task(workspace_root.clone()));
+    }
     // Live agent output (#9764): `session.output` is OTLP-only too, and
     // additionally opt-in — `spawn_task` returns `None` unless
     // `observability.liveOutput.enabled` is set. Registered over the

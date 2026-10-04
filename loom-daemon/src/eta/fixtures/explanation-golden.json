@@ -292,6 +292,7 @@
     "p25_sec": 943,
     "p50_sec": 2004,
     "p75_sec": 3552,
+    "p90_sec": 4879,
     "eta_p50_at": "2026-09-20T12:33:24Z",
     "samples_min": 22,
     "stage_marks": [
@@ -383,7 +384,31 @@
     "host_id": null,
     "pool_usable_accounts": null,
     "pool_exhausted": null,
-    "repo_first_pass_approval_rate": null
+    "repo_first_pass_approval_rate": null,
+    "ahead": null,
+    "n_stage_repo": null,
+    "n_stage_fleet": null,
+    "exits_repo_1h": null,
+    "exits_repo_6h": null,
+    "exits_repo_24h": null,
+    "exits_fleet_1h": null,
+    "exits_fleet_6h": null,
+    "exits_fleet_24h": null,
+    "merges_repo_24h": null,
+    "merges_fleet_6h": null,
+    "since_merge_sec": null,
+    "open_prs_repo": null,
+    "fleet_scope_repos": null,
+    "repo_pr_open_skip": null,
+    "repo_open_prs": null,
+    "repo_pr_open_lockout": null,
+    "repo_ci_typical_duration_sec": null,
+    "repo_friction_observed_at": null,
+    "pr_ci_status": null,
+    "pr_behind_main": null,
+    "pr_merge_conflict": null,
+    "pr_friction_observed_at": null,
+    "operator_hold": null
   },
   "features_omitted": [
     {
@@ -492,6 +517,102 @@
     },
     {
       "name": "repo_first_pass_approval_rate",
+      "reason": "not_collected"
+    },
+    {
+      "name": "ahead",
+      "reason": "not_collected"
+    },
+    {
+      "name": "n_stage_repo",
+      "reason": "not_collected"
+    },
+    {
+      "name": "n_stage_fleet",
+      "reason": "not_collected"
+    },
+    {
+      "name": "exits_repo_1h",
+      "reason": "not_collected"
+    },
+    {
+      "name": "exits_repo_6h",
+      "reason": "not_collected"
+    },
+    {
+      "name": "exits_repo_24h",
+      "reason": "not_collected"
+    },
+    {
+      "name": "exits_fleet_1h",
+      "reason": "not_collected"
+    },
+    {
+      "name": "exits_fleet_6h",
+      "reason": "not_collected"
+    },
+    {
+      "name": "exits_fleet_24h",
+      "reason": "not_collected"
+    },
+    {
+      "name": "merges_repo_24h",
+      "reason": "not_collected"
+    },
+    {
+      "name": "merges_fleet_6h",
+      "reason": "not_collected"
+    },
+    {
+      "name": "since_merge_sec",
+      "reason": "not_collected"
+    },
+    {
+      "name": "open_prs_repo",
+      "reason": "not_collected"
+    },
+    {
+      "name": "fleet_scope_repos",
+      "reason": "not_collected"
+    },
+    {
+      "name": "repo_pr_open_skip",
+      "reason": "not_collected"
+    },
+    {
+      "name": "repo_open_prs",
+      "reason": "not_collected"
+    },
+    {
+      "name": "repo_pr_open_lockout",
+      "reason": "not_collected"
+    },
+    {
+      "name": "repo_ci_typical_duration_sec",
+      "reason": "not_collected"
+    },
+    {
+      "name": "repo_friction_observed_at",
+      "reason": "not_collected"
+    },
+    {
+      "name": "pr_ci_status",
+      "reason": "not_collected"
+    },
+    {
+      "name": "pr_behind_main",
+      "reason": "not_collected"
+    },
+    {
+      "name": "pr_merge_conflict",
+      "reason": "not_collected"
+    },
+    {
+      "name": "pr_friction_observed_at",
+      "reason": "not_collected"
+    },
+    {
+      "name": "operator_hold",
       "reason": "not_collected"
     }
   ],
