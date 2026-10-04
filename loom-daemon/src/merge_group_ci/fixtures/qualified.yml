@@ -1,0 +1,60 @@
+# Fixture: a workflow whose relied-on suites all validate the merge-group
+# commit. Mirrors the shape of this repo's ci.yml on a small scale.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  merge_group:
+    types: [checks_requested]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'merge_group' && format('merge-group-{0}', github.event.merge_group.head_sha) || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    # merge-group-audit: pr-only -- path groups for PR runs; push and merge_group run everything
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      pull-requests: read
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'src/**'
+
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Lint
+        run: make lint
+      - name: Version guard (PR and merge group)
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
+        run: ./check --base "${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}"
+
+  tests:
+    name: Tests (${{ matrix.partition }}/${{ strategy.job-total }})
+    needs: changes
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        partition: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.merge_group.head_sha || github.sha }}
+      - run: cargo test

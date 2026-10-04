@@ -236,6 +236,7 @@ pub mod live_claim;
 mod live_gh_guard;
 pub mod main_health_gate;
 pub mod mcp_tool_guard;
+pub mod merge_group_ci;
 pub mod merge_pr;
 pub mod metrics_collector;
 pub mod observability;

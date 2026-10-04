@@ -506,6 +506,14 @@ pub(crate) enum ScriptPortCommand {
     /// at zero cost to that file. Makes no forge call.
     #[command(subcommand)]
     ForgeInventory(super::forge_inventory_cmd::ForgeInventoryCommand),
+
+    /// Combined-tree CI qualification for the merge queue (#10257): `audit`
+    /// reports relied-on suites that do not validate the merge-group commit;
+    /// `eligibility` decides whether a repository may pilot queue mode.
+    /// Read-only. Lives here for the same frozen-`main.rs` reason as
+    /// `shell-budget`.
+    #[command(subcommand)]
+    MergeGroupCi(super::merge_group_ci_cmd::MergeGroupCiCommand),
 }
 
 impl ScriptPortCommand {
@@ -573,6 +581,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
             ScriptPortCommand::LabelDuplicates(args) => args.run(),
             ScriptPortCommand::ForgeInventory(cmd) => cmd.run(),
+            ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),
         }
     }
 }
