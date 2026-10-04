@@ -14,6 +14,8 @@
 //! - `refresh` — the incremental top-up: only PRs the forge says moved since
 //!   the cached snapshot's cursor.
 //! - `show` — what is cached, and whether it is enough evidence to estimate.
+//! - `events backfill|refresh`, `state --as-of` — the raw event cache and
+//!   `fleet_state(t)` (#10197); see `eta_fleet_events_cmd.rs`.
 //!
 //! # Sharing a snapshot between hosts
 //!
@@ -59,6 +61,18 @@ pub(crate) enum FleetCommand {
     Refresh(FleetBuildArgs),
     /// Print what is cached: id, as-of, cursor, PR census, per-stage counts.
     Show(FleetShowArgs),
+    /// The raw, resumable per-repo event cache (#10197):
+    /// `eta fleet events backfill|refresh`.
+    Events {
+        #[command(subcommand)]
+        command: super::eta_fleet_events_cmd::EventsCommand,
+    },
+    /// Reconstruct the repo's whole fleet at an instant from the raw event
+    /// cache (#10197): `eta fleet state --as-of RFC3339 [--json]`.
+    State(super::eta_fleet_events_cmd::FleetStateArgs),
+    /// Score `fleet_state(as_of)` against logged `eta.estimate` features
+    /// (#10197): `eta fleet agreement --estimates export.jsonl`.
+    Agreement(super::eta_fleet_events_cmd::AgreementArgs),
 }
 
 impl FleetCommand {
@@ -67,6 +81,9 @@ impl FleetCommand {
             FleetCommand::Backfill(args) => args.run(false),
             FleetCommand::Refresh(args) => args.run(true),
             FleetCommand::Show(args) => args.run(),
+            FleetCommand::Events { command } => command.run(),
+            FleetCommand::State(args) => args.run(),
+            FleetCommand::Agreement(args) => args.run(),
         }
     }
 }
