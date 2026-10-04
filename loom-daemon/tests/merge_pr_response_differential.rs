@@ -199,14 +199,56 @@ fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/merge-pr-response-retired.sh")
 }
 
+/// The only four answers the retired ladder can print. Anything else on stdout
+/// means the oracle did not run the ladder to completion.
+const ROUTES: &[&str] = &[
+    "merge-in-progress",
+    "head-mismatch",
+    "base-modified",
+    "other",
+];
+
 /// Run the retired ladder over `input`, passed exactly as the retry loop passed
 /// it: as an argv argument, read back through `echo "$1"`.
 ///
-/// `None` means the shell itself failed (no `bash`, unreadable fixture), which
-/// the caller counts so a harness that silently stops running cannot pass.
-fn shell(script: &Path, input: &str) -> Option<String> {
+/// Self-validating (#10189): a spawn error, a nonzero exit, ANY stderr, or a
+/// stdout that is not exactly one of [`ROUTES`] panics with `oracle did not
+/// run`. Every caller therefore either gets a real classification or stops —
+/// no case can be skipped, and no harness failure can be read as a route.
+///
+/// # Why `set -u` and NOT `set -uo pipefail` (#10189, main CI run 37178206556)
+///
+/// That run failed with case 159, `"Merge already in progress\n"`, classified
+/// `other` by the shell. The cause is a SIGPIPE race that `pipefail` turns
+/// into a wrong answer:
+///
+/// 1. bash line-buffers its stdout, so `echo "$1"` of an input that ends in a
+///    newline makes TWO `write(2)`s: `"Merge already in progress\n"`, then the
+///    echo's own `"\n"` (confirmed with `strace -e trace=write`).
+/// 2. `grep -q` exits at its first match — i.e. possibly right after the first
+///    write. If it is gone before the second write, the echo subshell dies of
+///    SIGPIPE (status 141).
+/// 3. Under `pipefail` the pipeline's status is then 141, the `if` is false,
+///    and the ladder falls through to the next rung — which does not match —
+///    and finally prints `other`, exiting 0. Nothing on stderr: bash does not
+///    report SIGPIPE deaths of pipeline members.
+///
+/// It only fires when the scheduler runs `grep` between the two writes, which
+/// a CPU-starved CI shard under nextest parallelism can do and an idle laptop
+/// essentially never does (0/3000 locally, pinned or not). Forcing the window
+/// with `strace -f -e inject=write:delay_enter=300000:when=2` reproduces it
+/// deterministically: `set -uo pipefail` prints `other`, `set -u` prints
+/// `merge-in-progress`.
+///
+/// Production `merge-pr.sh` did run under `set -euo pipefail`, so the retired
+/// ladder carried this same latent race; the Rust port (no pipe) does not. The
+/// oracle exists to model the ladder's *matching and precedence*, not a
+/// scheduler-dependent misfire, so the harness drops `pipefail`: without it
+/// the pipeline's status is `grep`'s alone, which is exactly the match result.
+/// The fixture itself stays frozen and verbatim.
+fn shell(script: &Path, input: &str) -> String {
     let prog = r#"
-set -uo pipefail
+set -u
 source "$1"
 retired_classify_merge_response "$2"
 "#;
@@ -221,15 +263,18 @@ retired_classify_merge_response "$2"
         .arg(script)
         .arg(input)
         .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+        .unwrap_or_else(|e| panic!("oracle did not run: could not spawn bash: {e}\n  input: {input:?}"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let answer = stdout.strip_suffix('\n').unwrap_or(&stdout);
+    if !out.status.success() || !stderr.is_empty() || !ROUTES.contains(&answer) {
+        panic!(
+            "oracle did not run: the retired ladder did not produce a classification.\n  \
+             input:  {input:?}\n  status: {}\n  stdout: {stdout:?}\n  stderr: {stderr:?}",
+            out.status
+        );
     }
-    Some(
-        String::from_utf8_lossy(&out.stdout)
-            .trim_end_matches('\n')
-            .to_string(),
-    )
+    answer.to_string()
 }
 
 #[test]
@@ -237,24 +282,26 @@ fn every_route_agrees_with_the_retired_grep_ladder() {
     let script = fixture();
     assert!(script.is_file(), "the frozen fixture must exist at {script:?}");
 
-    let cases = corpus();
-    let mut compared = 0usize;
-    for (i, input) in cases.iter().enumerate() {
-        let Some(want) = shell(&script, input) else {
-            continue;
-        };
+    // `shell` panics rather than returning a non-answer, so every case is
+    // compared; there is no skip path left for a silent harness to hide in.
+    for (i, input) in corpus().iter().enumerate() {
+        let want = shell(&script, input);
         let got = classify(input.as_bytes()).token();
         assert_eq!(
             got, want,
             "case {i} diverged.\n  input: {input:?}\n  shell: {want:?}\n  rust:  {got:?}"
         );
-        compared += 1;
     }
-    assert_eq!(
-        compared,
-        cases.len(),
-        "only {compared}/{} cases were actually compared — the shell harness is not running",
-        cases.len()
+}
+
+/// The oracle's self-check must actually trip: a fixture that cannot be
+/// sourced has to fail as `oracle did not run`, not as a divergence or a pass.
+#[test]
+#[should_panic(expected = "oracle did not run")]
+fn a_broken_oracle_fails_loudly_instead_of_classifying() {
+    shell(
+        Path::new("/nonexistent/merge-pr-response-retired.sh"),
+        "Merge already in progress",
     );
 }
 
@@ -270,14 +317,11 @@ fn the_corpus_reaches_every_route_from_both_sides() {
 
     let mut counts = [0usize; 4];
     for input in &cases {
-        let want = shell(&script, input).expect("the shell harness must run");
-        let idx = match want.as_str() {
-            "merge-in-progress" => 0,
-            "head-mismatch" => 1,
-            "base-modified" => 2,
-            "other" => 3,
-            unexpected => panic!("the retired ladder printed an unknown route {unexpected:?}"),
-        };
+        let want = shell(&script, input);
+        let idx = ROUTES
+            .iter()
+            .position(|r| *r == want)
+            .expect("shell() only returns a member of ROUTES");
         counts[idx] += 1;
     }
 
@@ -304,7 +348,7 @@ fn the_corpus_reaches_every_route_from_both_sides() {
 /// Make the harness go RED on purpose (§6, Cause 1: "before believing a green
 /// number, make it red"). If the ladder's two SHA-shaped routes were swapped,
 /// at least one corpus case must notice. Proving that *here* means the
-/// `compared ==` assertion above is measuring something.
+/// per-case `assert_eq!` above is measuring something.
 #[test]
 fn swapping_the_two_sha_routes_would_be_caught() {
     // A deliberately wrong classifier: base-modified tested BEFORE
