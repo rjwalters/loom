@@ -5222,6 +5222,9 @@ knobs not yet audited here.
 | `autonomous.autoUpdate.deferDeadlineSecs` | `LOOM_AUTO_UPDATE_DEFER_DEADLINE_SECS` | `21600` (6h) | Bound on the build-stampede gate (#4929): after this much **continuous** deferral for in-flight sweeps, the rebuild runs anyway at reduced CPU priority (`nice 19`) instead of deferring forever. Any check that sees zero in-flight sweeps — or a new source commit, or a completed rebuild — re-arms the clock, so short busy bursts never reach it. **Bounds the rebuild/source path only (#8252)** — a resolved release artifact is fetched immediately regardless of in-flight sweeps (niced, not deferred), so this deadline never delays an artifact roll. Zero/invalid → default; there is deliberately no "defer forever" value (set a very large one instead) |
 | `autonomous.autoUpdate.rollStallDeadlines` | `LOOM_AUTO_UPDATE_ROLL_STALL_DEADLINES` | `3` | Unsatisfiable-drain detector (#8998): how many drain deadlines may expire — summed **across roll lifetimes**, not per drain — with the in-flight sweep count never improving before the roll is declared unsatisfiable, abandoned, and *not re-armed* until an auto-update tick samples in-flight at zero (a sample on this cadence, not a continuous watch — see the mechanism entry below, and #9010 for the bounded-retry follow-up). Bounds the arm → refuse → retain → abandon → re-arm *sequence*, which #6007's per-drain paused-dispatch budget does not: each new release (or a #8514 supersede) restarted that budget, so two fleet dispatchers sat paused for 21h behind a legitimate 9h32m analog-simulation sweep and never rolled. Zero/invalid → default; there is deliberately no "never give up" value, since that is the bug. Set it high to make the detector effectively unreachable |
 | `autonomous.autoUpdate.rollStallCooldownSecs` | `LOOM_AUTO_UPDATE_ROLL_STALL_COOLDOWN_SECS` | `21600` (6h) | Bounds the `rollStallDeadlines` suppression above in TIME as well as by the `in_flight == 0` sample (#9010): once a standing unsatisfiability declaration has stood for this long, it is dropped and the next tick arms a roll for **one** more bounded attempt — if the host still cannot drain, the detector re-declares after `rollStallDeadlines` more deadlines rather than cycling, so the cost is one paused-dispatch budget per cooldown period instead of unbounded staleness on a host whose `in_flight == 0` sample never lands. Zero/invalid → default, exactly like `rollStallDeadlines`: a `0` would clear a declaration on the tick it was made, re-entering #8998's livelock through the knob. Set it very large to make the retry effectively unreachable |
+| `autonomous.autoUpdate.rollWindowSecs` | `LOOM_AUTO_UPDATE_ROLL_WINDOW_SECS` | *(off)* | Period of the scheduled roll window (#9132). **Unset/zero/invalid → no window**: rolls arm on every new build exactly as before (opt-in; this default preserves existing behaviour). When set, a new build arms **nothing** outside an open window, the settle gate is bypassed (the window is the batching mechanism, so a busy `main` cannot starve the host), and at most one roll arms per window — see [Scheduled roll windows](#scheduled-roll-windows-9132). **Restart required** |
+| `autonomous.autoUpdate.rollWindowOffsetSecs` | `LOOM_AUTO_UPDATE_ROLL_WINDOW_OFFSET_SECS` | derived from host id | Where window 0 opens within the period. Zero/invalid → the **derived** offset: `fnv1a(host_id) mod period`, stable across restarts and spread across hosts. An explicit value is reduced modulo the period, so the offset is always `< rollWindowSecs`. Only meaningful with `rollWindowSecs`. **Restart required** |
+| `autonomous.autoUpdate.launchdLiveReload` | `LOOM_AUTO_UPDATE_LAUNCHD_LIVE_RELOAD` | `false` | Opt-in for the launchd skip-the-drain path (`restart --reload-supervisor`, #6682). Selected **only** on launchd **and** only when `true`; systemd always uses the bounded drain. Depends on #9452 (the stale-sweep watchdog killing journal-adopted survivors) — do not enable on a real host before that is resolved. **Not yet wired to execute**: the selection is reported in `status` and logged, and rolls still use the bounded drain until live-host verification lands |
 | `autonomous.ciTelemetry.enabled` | `LOOM_CI_TELEMETRY_ENABLED` | `false` | Periodic GitHub Actions run/job capture (#8824, phase 2 #8825). Read-only observer: it can never change a dispatch, claim, or merge decision. **Restart required** — `spawn_task` resolves the whole block once, before the poller task is spawned; it is never re-read inside the poll loop. See [`ci-observability.md`](ci-observability.md) |
 | `autonomous.ciTelemetry.owners` | `LOOM_CI_TELEMETRY_OWNERS` (comma-separated) | `["2amlogic"]` | Orgs **and user accounts** whose repos are auto-discovered and polled (#9188). Each kind comes from `GET /users/{owner}`, probed once per daemon lifetime. Wins over `org` at the same tier. Empty → unset. **Restart required** — same one-time `spawn_task` resolution as `enabled` |
 | `autonomous.ciTelemetry.org` | `LOOM_CI_TELEMETRY_ORG` | — | Deprecated single-owner alias of `owners`: one declared organization, not probed. Empty → unset. **Restart required** |
@@ -5231,6 +5234,42 @@ knobs not yet audited here.
 | `autonomous.ciTelemetry.logCaptureMaxBytes` | `LOOM_CI_TELEMETRY_LOG_CAPTURE_MAX_BYTES` | `5242880` (5 MiB) | Per-job cap on captured log text. Zero/invalid → default. **Restart required** |
 | `autonomous.ciTelemetry.logCaptureExcludedRepos` | *(config only)* | `[]` | Repos excluded from **log capture only** — their `ci.run`/`ci.job` records and duration metrics are still captured unconditionally, same admission rule (`repo` + non-empty `reason`) as `excludedRepos`. Distinct key from `excludedRepos` deliberately: excluding a repo there would also drop its metrics, which the ci-observability policy forbids. **Restart required** |
 | `autonomous.sweepOutcomeWriteback.enabled` | `LOOM_SWEEP_OUTCOME_WRITEBACK` | `false` | Post-`Success` issue write-back comment (#9056). Opt-in, unlike the safety backstops above — it posts a forge-visible comment, not a dispatch decision. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. Resolved fresh at each terminal `Success` transition (not cached at startup), so a config edit takes effect on the very next sweep to finish with no daemon restart. See "Sweep-outcome issue write-back (#9056)" below |
+
+### Scheduled roll windows (#9132)
+
+With `autonomous.autoUpdate.rollWindowSecs` set, the auto-update loop rolls on a
+**schedule**, not on build arrival. Windows start at `offset + k * period` (UTC epoch
+seconds) and stay open for `max(2 x intervalSecs, 600s)` (capped at the period), so a
+tick always lands inside one.
+
+- **Outside an open window nothing arms.** `status` reports `scheduled wait: ...`.
+  The roll targets whatever artifact is on disk when the window is open, so nothing
+  chases a moving target.
+- **One arm per window.** A drain that times out (the roll goes *pending*, #6007) is
+  abandoned so dispatch resumes, and nothing re-arms until the next window, however
+  many ticks or releases pass (`drain timed out, waiting for next window`). This
+  composes with #8998/#9010 (their abandonment and cooldown still apply inside a
+  window) and #8514 (a still-draining roll overtaken by a newer release is retargeted
+  once, inside the same open window; after the window closes the stale target is
+  dropped and the newest waits). Operator drains (`restart --drain`, `--then-exit`
+  teardowns) are never abandoned or counted as an update pause.
+- **Stable per-host offset.** Derived from the host id unless configured, identical on
+  every restart.
+- **`status`** (`Auto-update loop:` lines and `auto_update.roll_window` in `--json`)
+  shows the period/offset, whether a window is open, when the next one opens, the roll
+  target, whether an update drain holds dispatch paused, the last deferral reason and
+  the selected restart path.
+
+**Fleet-overlap guarantee, stated precisely.** Distinct per-host offsets *reduce
+synchronized drain starts*; they do **not** guarantee that two hosts' drains never
+overlap. A drain can last up to its own timeout, which can exceed the gap between two
+hosts' offsets, and there is no fleet coordination or budget rule (a host does not look
+at what its peers are doing). Treat offsets as spreading, not mutual exclusion. A
+fleet-level "do not arm while a peer is draining" rule is not implemented.
+
+**Restart path.** systemd always uses the bounded drain. On launchd the drain is skipped
+only with `launchdLiveReload: true`, which is off by default and is not yet wired to
+execute (see the knob above); freshness deadlines never become an implicit force-kill.
 
 ### Sweep-outcome issue write-back (#9056)
 
