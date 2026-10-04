@@ -22,7 +22,7 @@
 set -uo pipefail
 
 IMAGE="${1:?usage: test-image.sh <image-tag>}"
-OPENCODE_VERSION="${OPENCODE_VERSION:-1.18.31}"
+OPENCODE_VERSION="${OPENCODE_VERSION:-1.18.34}"
 PI_VERSION="${PI_VERSION:-0.85.1}"
 KIMI_CODE_VERSION="${KIMI_CODE_VERSION:-2.0.2}"
 # @moonshot-ai/kimi-code's own engines.node floor (#8565).

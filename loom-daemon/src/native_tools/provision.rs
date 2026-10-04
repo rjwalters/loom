@@ -9,14 +9,30 @@ mod state;
 
 pub use state::{outside_every_repository, private_directory};
 
+/// The `@opencode-ai/plugin` version the guarded binding pins. It moves in
+/// lockstep with `OPENCODE_VERSION` in `docker/native/Dockerfile` — the
+/// binding must match the CLI that loads it — and
+/// `.github/workflows/harness-pins.yml` bumps both together.
+macro_rules! opencode_plugin_version {
+    () => {
+        "1.18.34"
+    };
+}
+
+/// The `opencode_plugin_version!` value, for callers outside this module.
+pub const OPENCODE_PLUGIN_VERSION: &str = opencode_plugin_version!();
+
 /// The exact pinned plugin manifest a guarded OpenCode launch provisions.
 ///
 /// Exposed as a constant so the readiness measurement in
 /// [`crate::native_readiness`] keys its package cache on the same bytes
 /// production writes (#8581). A pin that drifts between the two would produce a
 /// cache entry that is valid for a package set no launch ever uses.
-pub const OPENCODE_PLUGIN_MANIFEST: &str =
-    r#"{"private":true,"dependencies":{"@opencode-ai/plugin":"1.18.31"}}"#;
+pub const OPENCODE_PLUGIN_MANIFEST: &str = concat!(
+    r#"{"private":true,"dependencies":{"@opencode-ai/plugin":""#,
+    opencode_plugin_version!(),
+    r#""}}"#
+);
 
 /// Write the guarded OpenCode bindings — the plugin source and the pinned
 /// package manifest — into `config_dir`.

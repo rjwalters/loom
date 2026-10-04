@@ -45,20 +45,25 @@ This layer adds exactly five things:
 | Addition | Detail |
 |---|---|
 | Node.js + npm | npm is the only distribution channel for all three native CLIs, and OpenCode additionally installs its own `@opencode-ai/plugin` package into its config directory **at launch time**, so npm must be present at run time too. Installed from the official upstream tarball (checksum-verified), identical pins to `docker/session/Dockerfile`. |
-| OpenCode CLI | `opencode-ai`, pinned to `OPENCODE_VERSION` (default `1.18.31`). |
+| OpenCode CLI | `opencode-ai`, pinned to `OPENCODE_VERSION` — kept at npm `latest` within the 1.x line by [`harness-pins.yml`](../../.github/workflows/harness-pins.yml). |
 | Pi CLI | `@earendil-works/pi-coding-agent`, pinned to `PI_VERSION` (default `0.85.1`). |
 | Kimi Code CLI | `@moonshot-ai/kimi-code`, pinned to `KIMI_CODE_VERSION` (default `2.0.2`). Its `engines.node` floor (`KIMI_NODE_FLOOR`, default `22.19.0`) is asserted **before** any package is fetched — npm only *warns* on an engine mismatch, so a future Node downgrade would otherwise ship a Kimi that fails at first launch instead of failing this build. The image's Node (`24.19.0`) already clears it; no bump was needed. |
 | `OPENCODE_DISABLE_AUTOUPDATE=1`, `KIMI_CODE_NO_AUTO_UPDATE=1`, `KIMI_DISABLE_TELEMETRY=1` | The runtime half of the pin — a pinned install is not enough if the CLI can update *itself* past the tested version on first launch. Kimi's telemetry switch rides along: a dispatched worker must not phone home either. |
 
-**The pins are equality-checked at build time, not floor-checked.**
-`1.18.31` / `0.85.1` / `2.0.2` are the exact versions
+**The pins are equality-checked at build time, not floor-checked.** Pi
+(`0.85.1`) and Kimi (`2.0.2`) are the exact versions
 [`.loom/docs/guardrail-parity-native.md`](../../.loom/docs/guardrail-parity-native.md)
 and its [verification receipt](../../.loom/docs/native-runtime-verification-2026-09-19.md)
-record as *tested*. A version floor would be the wrong check here: the parity
-doc records a tested version, and "newer" is not "verified" — that doc's own
-"CLI exit zero is not acceptance evidence" applies to the CLI's own version
-just as much as to a sweep's outcome. Bump the pin, the parity doc, and a fresh
-canary run together; never one without the others.
+record as *tested*. For them, bump the pin, the parity doc and a fresh canary
+run together. OpenCode is different: the fleet tracks its latest 1.x release
+(operator direction, 2026-10-02), so
+[`harness-pins.yml`](../../.github/workflows/harness-pins.yml) moves
+`OPENCODE_VERSION`, this suite's default and the `@opencode-ai/plugin` pin in
+`loom-daemon/src/native_tools/provision.rs` together in one bot PR. That PR is
+gated by this image's smoke test in CI rather than by a live canary. The live
+guarded canary was last run on 1.18.31. A binding that fails to load on a newer
+1.x leaves OpenCode with no tools at all, so it breaks safely instead of
+running unguarded (see the parity doc's "OpenCode major versions").
 
 **No ENTRYPOINT.** The base image's "a pinned shell a caller runs a command in"
 shape is exactly right for an ephemeral dispatch: `worker_spawn::containment`
