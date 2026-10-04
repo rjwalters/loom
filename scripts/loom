@@ -234,6 +234,124 @@ loom_refresh_mcp_bundle() {
     return 0
 }
 
+# ── user-scope provisioning + machine-checkout freshness (#10238) ────────────
+# Before this, provision_loom_skills / provision_loom_dispatcher ran only from
+# the installer, and nothing fast-forwarded the machine checkout on a host
+# without a daemon -- so a machine installed before Phase 4 (#4261) never got
+# the user-scope skill links, and new skills (/loom:star, /star) were
+# unfindable. `loom update` now does both, daemon or not.
+SELF_ROOT="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
+
+# loom_sync_checkout <checkout> — fast-forward a CLEAN `main` checkout to
+# origin/main. Anything else (dirty, diverged, ahead, other branch, detached,
+# fetch failure) warns naming the reason and changes NOTHING. Never reset /
+# checkout / stash / clean (at least as conservative as daemon_update/sync.rs).
+# Always returns 0: advisory, must not block the rest of `update`.
+loom_sync_checkout() {
+    local c="$1" branch
+    if ! git -C "$c" rev-parse --git-dir >/dev/null 2>&1; then
+        _warn "checkout sync skipped: $c is not a git checkout."
+        return 0
+    fi
+    branch="$(git -C "$c" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    if [[ "$branch" != "main" ]]; then
+        _warn "checkout sync skipped: $c is on '${branch:-detached HEAD}', not main (left untouched)."
+        return 0
+    fi
+    if [[ -n "$(git -C "$c" status --porcelain 2>/dev/null)" ]]; then
+        _warn "checkout sync skipped: $c has uncommitted changes (left untouched)."
+        return 0
+    fi
+    if ! git -C "$c" fetch --quiet origin main 2>/dev/null; then
+        _warn "checkout sync skipped: 'git fetch origin main' failed in $c (offline or no origin?)."
+        return 0
+    fi
+    local head remote
+    head="$(git -C "$c" rev-parse HEAD 2>/dev/null)"
+    remote="$(git -C "$c" rev-parse origin/main 2>/dev/null)" || return 0
+    if [[ "$head" == "$remote" ]]; then
+        echo "loom: machine checkout already up to date with origin/main."
+    elif git -C "$c" merge-base --is-ancestor "$head" "$remote" 2>/dev/null; then
+        if git -C "$c" merge --ff-only --quiet origin/main >/dev/null 2>&1; then
+            echo "loom: machine checkout fast-forwarded to origin/main ($(git -C "$c" rev-parse --short HEAD))."
+        else
+            _warn "checkout sync: 'git merge --ff-only origin/main' failed in $c (left as-is)."
+        fi
+    elif git -C "$c" merge-base --is-ancestor "$remote" "$head" 2>/dev/null; then
+        _warn "checkout sync skipped: $c is ahead of origin/main (unpushed commits; left untouched)."
+    else
+        _warn "checkout sync skipped: $c has diverged from origin/main (left untouched)."
+    fi
+    return 0
+}
+
+# loom_provision_user_scope <checkout> — idempotently (re)provision the
+# dispatcher + user-scope skill/agent links using the libs from the checkout.
+# Best-effort: a failure warns and never blocks `update`.
+loom_provision_user_scope() {
+    local c phys lib
+    c="$1"
+    phys="$(cd -P "$c" 2>/dev/null && pwd)" || phys="$c"
+    for lib in provision-dispatcher provision-skills; do
+        if [[ ! -r "$phys/scripts/install/$lib.sh" ]]; then
+            _warn "user-scope provisioning skipped: $phys/scripts/install/$lib.sh not found."
+            return 0
+        fi
+    done
+    (
+        # shellcheck source=/dev/null
+        source "$phys/scripts/install/provision-dispatcher.sh"
+        # shellcheck source=/dev/null
+        source "$phys/scripts/install/provision-skills.sh"
+        provision_loom_dispatcher "$phys" || _warn "dispatcher provisioning reported a soft failure."
+        provision_loom_skills "$HOME/.local/share/loom" || _warn "skills provisioning reported a soft failure."
+    ) || _warn "user-scope provisioning failed (non-fatal)."
+    return 0
+}
+
+# loom_health_problems <checkout> — print one line per problem, from LOCAL
+# state only (symlink existence + the already-fetched origin/main ref); never
+# touches the network. Silent when healthy.
+loom_health_problems() {
+    local c="$1" n limit="${LOOM_STALE_COMMITS:-50}"
+    [[ -e "$HOME/.local/share/loom" ]] || echo "machine checkout missing: $HOME/.local/share/loom"
+    [[ -e "$HOME/.claude/commands/loom" ]] \
+        || echo "user-scope skills not linked: $HOME/.claude/commands/loom (/loom:* commands unavailable outside repos that carry a copy)"
+    if [[ -d "$c" ]] && n="$(git -C "$c" rev-list --count HEAD..origin/main 2>/dev/null)" \
+        && [[ "$n" =~ ^[0-9]+$ ]] && (( n > limit )); then
+        echo "machine checkout $c is $n commits behind origin/main"
+    fi
+}
+
+# loom_health_warn — rate-limited (LOOM_HEALTH_WARN_INTERVAL, default 6h) stderr
+# advisory. No network on the prompt path: the only fetch is a detached,
+# separately rate-limited background one. Always returns 0.
+loom_health_warn() {
+    [[ "${LOOM_NO_HEALTH_WARN:-}" == "1" ]] && return 0
+    local c state now interval last problems line
+    c="$(loom_resolve_checkout)"
+    state="${XDG_STATE_HOME:-$HOME/.local/state}/loom"
+    now="$(date +%s)"
+    interval="${LOOM_HEALTH_WARN_INTERVAL:-21600}"
+    # Refresh origin/main in the background at most once per interval.
+    if [[ -d "$c" ]] && mkdir -p "$state" 2>/dev/null; then
+        last="$(cat "$state/fetch-stamp" 2>/dev/null || echo 0)"
+        if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last >= interval )); then
+            echo "$now" > "$state/fetch-stamp" 2>/dev/null || true
+            ( git -C "$c" fetch --quiet origin main >/dev/null 2>&1 & ) >/dev/null 2>&1 || true
+        fi
+    fi
+    last="$(cat "$state/warn-stamp" 2>/dev/null || echo 0)"
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    (( now - last >= interval )) || return 0
+    problems="$(loom_health_problems "$c" 2>/dev/null || true)"
+    [[ -n "$problems" ]] || return 0
+    mkdir -p "$state" 2>/dev/null && echo "$now" > "$state/warn-stamp" 2>/dev/null || true
+    while IFS= read -r line; do _warn "$line"; done <<<"$problems"
+    _warn "run 'loom update' to fix (silence: LOOM_NO_HEALTH_WARN=1)."
+    return 0
+}
+
 # `update` resolves the machine checkout, refreshes the user-scoped mcp-loom
 # bundle (#4230, above), then delegates the DAEMON update to the existing
 # surface (loom-daemon-update.sh, #3968 + #4055). The daemon half stays a thin
@@ -250,24 +368,43 @@ loom_refresh_mcp_bundle() {
 # to the delegate as an explicit override, so `loom update` rebuilds the
 # checkout from any directory (a consumer repo, or no repo at all).
 loom_cmd_update() {
-    local resolved checkout scripts_dir target
-    resolved="$(loom_resolve_checkout_scripts)" || exit 1
-    checkout="$(sed -n '1p' <<<"$resolved")"
-    scripts_dir="$(sed -n '2p' <<<"$resolved")"
+    local resolved checkout scripts_dir target ro=""
+    if resolved="$(loom_resolve_checkout_scripts 2>/dev/null)"; then
+        checkout="$(sed -n '1p' <<<"$resolved")"
+        scripts_dir="$(sed -n '2p' <<<"$resolved")"
+    elif [[ -n "$SELF_ROOT" && -d "$SELF_ROOT/defaults/scripts" ]]; then
+        # Fresh daemonless machine: no ~/.local/share/loom yet. This script
+        # lives in a source checkout -- provision from it (#10238).
+        checkout="$SELF_ROOT"
+        scripts_dir="$SELF_ROOT/defaults/scripts"
+    else
+        loom_resolve_checkout_scripts >/dev/null || exit 1
+    fi
     target="$scripts_dir/cli/loom-daemon-update.sh"
+    # Honor the daemon updater's read-only modes: `--check/--dry-run` mutate
+    # nothing (no ff-sync, no provisioning, no bundle refresh).
+    if loom_has_flag "--check" "$@"; then ro="--check"
+    elif loom_has_flag "--dry-run" "$@"; then ro="--dry-run"; fi
+    if [[ -n "$ro" ]]; then
+        printf 'loom: (%s) checkout sync, user-scope provisioning and mcp-loom bundle refresh skipped in read-only mode.\n' "$ro"
+    else
+        # ff-sync FIRST so the provisioning libs executed are the fresh ones.
+        loom_sync_checkout "$checkout"
+        loom_provision_user_scope "$checkout"
+        loom_refresh_mcp_bundle "$checkout"
+    fi
+    # The daemon half is optional: a daemonless operator laptop is a supported
+    # setup, so a missing binary is a note, not a failure.
+    if ! command -v loom-daemon >/dev/null 2>&1 \
+        && [[ ! -x "$HOME/.local/bin/loom-daemon" ]] \
+        && [[ ! -x "$checkout/loom-daemon/target/release/loom-daemon" ]]; then
+        echo "loom: loom-daemon not installed; skipping daemon update."
+        exit 0
+    fi
     if [[ ! -x "$target" ]]; then
         _err "update delegate not found or not executable: $target"
         _err "'loom update' is a thin delegator; it does not rebuild/restart the daemon on its own."
         exit 1
-    fi
-    # Refresh the served mcp-loom bundle BEFORE delegating — but honor the
-    # daemon updater's read-only modes so `loom update --check/--dry-run` never
-    # mutates the bundle.
-    if loom_has_flag "--check" "$@" || loom_has_flag "--dry-run" "$@"; then
-        printf 'loom: (%s) mcp-loom bundle refresh skipped in read-only mode.\n' \
-            "$(loom_has_flag "--check" "$@" && echo --check || echo --dry-run)"
-    else
-        loom_refresh_mcp_bundle "$checkout"
     fi
     export LOOM_MACHINE_CHECKOUT="$checkout"
     exec "$target" "$@"
@@ -503,6 +640,13 @@ loom_cmd_status() {
         echo "  loom-daemon:   not on PATH"
     fi
 
+    local hp line
+    hp="$(loom_health_problems "$checkout" 2>/dev/null || true)"
+    if [[ -n "$hp" ]]; then
+        while IFS= read -r line; do echo "  WARNING:       $line"; done <<<"$hp"
+        echo "                 run 'loom update' to fix"
+    fi
+
     echo "Context"
     echo "  cwd:           ${PWD}"
     case "$LOOM_CTX_KIND" in
@@ -586,6 +730,10 @@ EOF
 main() {
     local cmd="${1:-help}"
     shift || true
+    case "$cmd" in
+        update|help|--help|-h|version|--version|-v|status) ;;
+        *) loom_health_warn || true ;;
+    esac
     case "$cmd" in
         start)               loom_cmd_start "$@" ;;
         stop)                loom_cmd_stop "$@" ;;
