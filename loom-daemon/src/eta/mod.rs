@@ -16,8 +16,10 @@
 //! `merge_hold` (#10218) is an approved PR held for a human (`loom:pr` plus
 //! `loom:operator`, `loom:operator-only` or `loom:operator-decision`). It
 //! leaves to `merge_wait` when the hold is lifted, or to `doctor`, a merge or
-//! a close. Every shipped heuristic still refuses it as `blocked`, and its
-//! `merge_wait` samples still run from the approval to the merge, hold
+//! a close. Every path-engine heuristic still refuses it as `blocked` (the
+//! shadow `land-2026-10-04-twin-otter` estimates it from its fit's own
+//! `merge_hold` stage), and the `merge_wait` samples still run from the
+//! approval to the merge, hold
 //! included (the **pooled** definition); the hold-free `merge_wait` and the
 //! hold itself live in [`episodes`], the record a hold-aware heuristic fits.
 //!
@@ -226,7 +228,7 @@ impl Stage {
     /// on an unstarted issue's path but is deliberately not in this list, so
     /// every output built over it before #9326 is unchanged ([`Self::EVERY`]
     /// has all seven). `merge_hold` (#10218) is not in it either, for the same
-    /// reason: no shipped heuristic visits it.
+    /// reason: no path-engine heuristic visits it.
     pub const ALL: [Stage; 5] = [
         Stage::SweepCurator,
         Stage::SweepBuilder,

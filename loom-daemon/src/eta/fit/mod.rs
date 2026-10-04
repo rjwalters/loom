@@ -41,8 +41,8 @@
 //!
 //! - [`FitStage`]: `review_wait`, `doctor_wait`, `merge_wait`, `merge_hold`,
 //!   in that order (`Ord` follows it). Deliberately not [`super::Stage`]:
-//!   `merge_hold` does not exist there until #10218, and the daemon's `doctor`
-//!   is `doctor_wait` here.
+//!   it has only the PR stages, and the daemon's `doctor` is `doctor_wait`
+//!   here ([`FitStage::from_stage`] maps one onto the other).
 //! - [`FEATURES`]: the 20 model features, in the fixture's
 //!   `generator.features` order (not the order of #10221's feature table).
 //! - [`ModelInputs`], [`model_features`] and [`clock`]: the raw per-instant
@@ -191,8 +191,8 @@ impl FitStage {
     /// The coefficient-set stage of a daemon stage: the PR stages map, and
     /// every pre-PR stage is `None` (the models are PR-level). The one
     /// definition train (#10245) and serve (#10243) share. The match has no
-    /// wildcard, so a new [`super::Stage`] (`merge_hold`, #10218) does not
-    /// compile until it is mapped here.
+    /// wildcard, so a new [`super::Stage`] does not compile until it is
+    /// mapped here; `merge_hold` (#10218) is its own fit stage.
     #[must_use]
     pub fn from_stage(stage: super::Stage) -> Option<FitStage> {
         use super::Stage;
@@ -200,6 +200,7 @@ impl FitStage {
             Stage::ReviewWait => Some(FitStage::ReviewWait),
             Stage::Doctor => Some(FitStage::DoctorWait),
             Stage::MergeWait => Some(FitStage::MergeWait),
+            Stage::MergeHold => Some(FitStage::MergeHold),
             Stage::ReadyWait | Stage::SweepCurator | Stage::SweepBuilder => None,
         }
     }

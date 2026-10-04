@@ -1937,9 +1937,10 @@ closes those estimates stay pending.
 `merge_hold` stage, so `merge_hold` is a possible `stage` /
 `stage_at_estimate` value (and a `stage_marks[]` / `stages[]` stage) on
 `eta.estimate` and `eta.outcome`, but **only from a heuristic that models the
-hold**. Every shipped heuristic refuses it as `blocked`, exactly as before, so
-it never appears in `eta.snapshot` while `current.land` is a shipped
-heuristic (those rows carry only `current`'s estimate). Once a hold-aware
+hold**: today the shadow `land-2026-10-04-twin-otter`. Every path-engine
+heuristic refuses it as `blocked`, exactly as before, so it never appears in
+`eta.snapshot` while `current.land` is one of them (those rows carry only
+`current`'s estimate). Once a hold-aware
 heuristic is promoted, consumers must render an unknown `stage` value
 gracefully.
 

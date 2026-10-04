@@ -78,8 +78,9 @@ rides only `blocked` rows, which have no position, so it is refused
 
 Human-gated stages (intake, approval) are outside the model: an issue there
 has no estimate, with a reason (below). An approved PR under an operator hold
-is the `merge_hold` stage, but every shipped heuristic still refuses it as
-`blocked` ([below](#operator-holds-merge_hold-and-stage-episodes-10218)).
+is the `merge_hold` stage, but every path-engine heuristic still refuses it
+as `blocked` ([below](#operator-holds-merge_hold-and-stage-episodes-10218));
+only the shadow `land-2026-10-04-twin-otter` estimates it, from its fit.
 A running sweep gets a `land` estimate from `sweep.curator` on; an item in
 `doctor` always counts at least one rework round, because `doctor` is entered
 only through a rejection.
@@ -263,7 +264,7 @@ raw event cache imports it.
 | `land-v2` | `land` | the same, with **right-censored** stage samples folded in (Kaplan–Meier grids) | after `merge_wait` |
 | `land-v3` | `land` | `land-v2`'s, with each stage grid calibrated first: widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored (recorded per stage as `distribution.adjustment`; #9970) | after `merge_wait` |
 | `land-2026-10-04-amber-heron` | `land` | `land-v2`'s path, then its p25/p75 recalibrated from `land-v2`'s own track record: the current stage's `ln(actual / p50)` distribution (landed estimates as events, still-open ones as censored lower bounds, recency-weighted) fitted at the estimate's own `as_of`; the median is kept (recorded as `recalibration`; #10207) | after `merge_wait` |
-| `land-2026-10-04-twin-otter` | `land` | no history: the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)). PR stages only (`review_wait`, `doctor`, `merge_wait`); the blend of a stage-by-stage exit-hazard Monte Carlo (256 paths, seeded per stage visit) and a log-normal direct model (recorded as `twin_otter`; #10222, #10243) | at the merge |
+| `land-2026-10-04-twin-otter` | `land` | no history: the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)). PR stages only (`review_wait`, `doctor`, `merge_wait`, `merge_hold`); the blend of a stage-by-stage exit-hazard Monte Carlo (256 paths, seeded per stage visit) and a log-normal direct model (recorded as `twin_otter`; #10222, #10243) | at the merge |
 
 A shipped id is **immutable**: a golden test pins each id's output on a fixed
 fixture. A behaviour change is a new id registered beside the old one
@@ -446,8 +447,8 @@ input onto the model's (train and serve share each definition):
 
 | model input | from |
 |---|---|
-| `stage` | `review_wait`, `doctor` → `doctor_wait`, `merge_wait`; every pre-PR stage refuses `unknown_stage` |
-| `age_h` | whole seconds in the current stage episode (since `entered_at`; `age_sec` when there is none) |
+| `stage` | `review_wait`, `doctor` → `doctor_wait`, `merge_wait`, `merge_hold`; every pre-PR stage refuses `unknown_stage` |
+| `age_h` | whole seconds in the current stage episode (since `episode_entered_at`, the release after a hold; else `entered_at`; else `age_sec`) |
 | `ahead`, `n_stage_repo`, `n_stage_fleet`, `exits_repo_6h`, `exits_repo_24h`, `exits_fleet_6h`, `merges_repo_24h`, `merges_fleet_6h` | the same-named queue features; `null` is imputed at the training mean and named in `twin_otter.imputed` |
 | `since_merge_h` | `since_merge_sec / 3600` |
 | `rework` | `doctor_cycles_so_far` (Judge rejections so far), else the resolver's count; at least 1 in `doctor` |
@@ -459,6 +460,13 @@ an unchanged-input refresh moves p50 by the model's drift, not by a redraw
 (pinned under 5%). A stage the fit skipped refuses `insufficient_samples`; a
 missing, model-less, too-new or malformed file refuses `no_model`. It never
 refuses `beyond_history`.
+
+A held PR (`merge_hold`) is estimated, not refused `blocked`, with two known
+limits: its `features` are those of the path-engine heuristics' `blocked`
+refusal, so its stage-dependent counts (`ahead`, `n_stage_*`, `exits_*`) are
+`null` and imputed where training saw real ones; and its estimate is
+emitted at the hold's entry and not refreshed while it stays held (the item
+keeps `refused = blocked`, so the emit signature never refreshes).
 
 ## The explanation (`eta-explanation/v1`)
 

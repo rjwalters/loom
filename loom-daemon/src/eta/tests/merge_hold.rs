@@ -5,7 +5,7 @@
 use super::{as_of, history_a, input_at};
 use crate::eta::explanation::Explanation;
 use crate::eta::grid;
-use crate::eta::heuristics::{estimate_path, PathRules};
+use crate::eta::heuristics::{estimate_path, PathRules, LAND_TWIN_OTTER};
 use crate::eta::history::{SampleSource, StageSample, StageSamples};
 use crate::eta::labels::{
     hold_labels, stage_from_pr_labels, MERGE_HOLD_COMPANION_LABELS, MERGE_HOLD_LABELS,
@@ -118,13 +118,22 @@ fn every_merge_hold_label_is_a_registry_hold_label() {
 
 // -- shipped heuristics refuse it, byte for byte as before ---------------------
 
+/// Every path-engine heuristic. `land-2026-10-04-twin-otter` (#10243) is the
+/// one exception, and only it: it models `merge_hold` from its fit (see
+/// `land_twin_otter::a_held_pr_is_estimated_from_the_fits_merge_hold_stage`).
 #[test]
 fn every_shipped_heuristic_refuses_a_held_pr_exactly_as_before() {
     let registry = Registry::builtin();
     let held = input_at(Stage::MergeHold, 600, 0);
     let mut refused = held.clone();
     refused.current = CurrentState::Refused(NoEstimateReason::Blocked);
-    for id in registry.ids() {
+    let (models_hold, path_engine): (Vec<&str>, Vec<&str>) = registry
+        .ids()
+        .into_iter()
+        .partition(|id| *id == LAND_TWIN_OTTER);
+    assert_eq!(models_hold, vec![LAND_TWIN_OTTER]);
+    assert_eq!(path_engine.len(), 6, "{path_engine:?}");
+    for id in path_engine {
         let heuristic = registry.get(id).unwrap();
         let explanation = heuristic.estimate(&held, &history_a());
         assert_eq!(explanation.no_estimate_reason, Some(NoEstimateReason::Blocked), "{id}");

@@ -69,8 +69,8 @@ pub(crate) struct PathRules {
     pub adjust: Option<GridAdjust>,
     /// `true`: an item in `merge_hold` (#10218) is estimated, along
     /// `merge_hold → merge_wait` (the rest of the hold, conditioned on its
-    /// age, then one merge wait). `false` — every shipped heuristic — refuses
-    /// it as `blocked` before any field is written, so the explanation is
+    /// age, then one merge wait). `false` — every path-engine heuristic —
+    /// refuses it as `blocked` before any field is written, so the explanation is
     /// byte-identical to its refusal of a held PR before the stage existed.
     pub models_hold: bool,
 }

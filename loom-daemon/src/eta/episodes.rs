@@ -6,7 +6,7 @@
 //!
 //! # Why a record of its own
 //!
-//! Every shipped heuristic reads `merge_wait` as **pooled**: a
+//! Every path-engine heuristic reads `merge_wait` as **pooled**: a
 //! [`super::history::StageSample`] runs from the approval in force at merge to
 //! the merge, operator hold included, and must keep doing so (`land-v2` is
 //! `current` and the shadow baseline). An episode instead ends whenever the

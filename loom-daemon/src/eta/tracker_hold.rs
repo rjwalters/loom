@@ -3,8 +3,8 @@
 //!
 //! # Why an overlay, not a stage transition
 //!
-//! Every shipped heuristic reads `merge_wait` as pooled: from the approval to
-//! the merge, hold included. So the tracker keeps the pooled `merge_wait`
+//! Every path-engine heuristic reads `merge_wait` as pooled: from the
+//! approval to the merge, hold included. So the tracker keeps the pooled `merge_wait`
 //! track exactly as before and records the hold beside it:
 //!
 //! - **Entering the hold** never closes the pooled track. It opens the overlay
@@ -28,8 +28,9 @@
 //! While held the item keeps `refused = blocked`, as it had before #10218,
 //! so the emit signature — and with it when a refusal is emitted and that it
 //! is not refreshed — is unchanged. [`held_stage`] reports `At(MergeHold)`,
-//! entered at the overlay, which every shipped heuristic refuses as `blocked`
-//! with a byte-identical explanation. After a release the item is
+//! entered at the overlay, which every path-engine heuristic refuses as
+//! `blocked` with a byte-identical explanation (the shadow
+//! `land-2026-10-04-twin-otter` estimates it from its fit's `merge_hold`). After a release the item is
 //! `At(MergeWait)` with the **pooled** entry, and [`episode_entered_at`] is
 //! the release instant, for a hold-aware heuristic's split age. `merge_hold`
 //! is never pushed into the item's observed stages, so `eta.outcome`'s
