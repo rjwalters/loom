@@ -9,8 +9,9 @@ use crate::tokens_pool::bad_tokens;
 pub enum TokenCause {
     /// No accounts provisioned at all.
     EmptyPool,
-    /// Every account is `blocked` with no `.bad_tokens` history: a 401 or
-    /// shape-mismatch probe result, which never self-heals.
+    /// Every account is `blocked` by an auth-class `.bad_tokens` entry (e.g.
+    /// `auth-dead: 401`) or with no `.bad_tokens` history (a 401 or
+    /// shape-mismatch probe result) — neither self-heals.
     AuthDead,
     /// Quota / session-limit holds that age out on their own.
     Exhausted,
@@ -72,12 +73,24 @@ pub fn token_cause(total_accounts: usize, pool_dir: Option<&Path>) -> TokenCause
             continue;
         };
         any = true;
-        let auth_dead = status == "blocked" && bad_tokens::latest_entry_in_dir(dir, name).is_none();
-        all_auth_dead &= auth_dead;
+        all_auth_dead &= status == "blocked" && blocked_by_auth(dir, name);
     }
     if any && all_auth_dead {
         TokenCause::AuthDead
     } else {
         TokenCause::Exhausted
+    }
+}
+
+/// Whether a `blocked` ranking row is an auth block, decided by the shared
+/// `.bad_tokens` reason classifier rather than re-derived here: an active
+/// entry of class [`bad_tokens::BadReasonClass::Auth`] (the `auth-dead: 401`
+/// line `claude-wrapper.sh` / `tokens check` reprobe write) is auth-dead, as
+/// is a `blocked` row with no `.bad_tokens` history at all (a 401 or
+/// shape-mismatch probe result). Anything else is an exhaustion hold.
+fn blocked_by_auth(dir: &Path, name: &str) -> bool {
+    match bad_tokens::blocking_entry_in_dir(dir, name) {
+        Some(e) => e.class == bad_tokens::BadReasonClass::Auth,
+        None => bad_tokens::latest_entry_in_dir(dir, name).is_none(),
     }
 }

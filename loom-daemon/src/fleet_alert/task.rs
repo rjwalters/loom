@@ -71,15 +71,27 @@ pub struct InboxSink {
 }
 
 impl InboxSink {
-    /// `None` when the inbox is not configured.
-    #[must_use]
-    pub fn from_env() -> Option<Self> {
+    fn env_pair() -> Option<(String, String)> {
         let url = std::env::var(INBOX_URL_ENV)
             .ok()
             .filter(|v| !v.trim().is_empty())?;
         let key = std::env::var(INGEST_KEY_ENV)
             .ok()
             .filter(|v| !v.trim().is_empty())?;
+        Some((url, key))
+    }
+
+    /// Whether the inbox env vars are set (no runtime is built).
+    #[must_use]
+    pub fn configured() -> bool {
+        Self::env_pair().is_some()
+    }
+
+    /// `None` when the inbox is not configured. Owns a tokio `Runtime`, so
+    /// build and drop it off any async context.
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        let (url, key) = Self::env_pair()?;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -196,16 +208,7 @@ pub fn spawn(
         );
         return None;
     }
-    let mut sinks: Vec<Box<dyn AlertSink>> = Vec::new();
-    if let Some(bus) = bus {
-        sinks.push(Box::new(BusSink(bus)));
-    }
-    if let Some(inbox) = InboxSink::from_env() {
-        sinks.push(Box::new(inbox));
-    } else {
-        log::info!("fleet_alert: inbox not configured ({INBOX_URL_ENV}/{INGEST_KEY_ENV}); skipping inbox sink");
-    }
-    if sinks.is_empty() {
+    if bus.is_none() && !InboxSink::configured() {
         log::info!("fleet_alert: no delivery sink available; alerting is a no-op");
         return None;
     }
@@ -216,6 +219,22 @@ pub fn spawn(
     let spawned = std::thread::Builder::new()
         .name("fleet-alert".to_string())
         .spawn(move || {
+            // Sinks are built on this thread: `InboxSink` owns a tokio
+            // `Runtime`, and dropping one inside the daemon's async context
+            // (e.g. if the thread failed to start) panics.
+            let mut sinks: Vec<Box<dyn AlertSink>> = Vec::new();
+            if let Some(bus) = bus {
+                sinks.push(Box::new(BusSink(bus)));
+            }
+            if let Some(inbox) = InboxSink::from_env() {
+                sinks.push(Box::new(inbox));
+            } else {
+                log::info!("fleet_alert: inbox not configured ({INBOX_URL_ENV}/{INGEST_KEY_ENV}); skipping inbox sink");
+            }
+            if sinks.is_empty() {
+                log::info!("fleet_alert: no delivery sink available; alerting is a no-op");
+                return;
+            }
             let mut state =
                 AlertState::load(&state_path, settings.debounce_ticks, settings.reminder);
             let host = crate::sweep_registry::host_identity();

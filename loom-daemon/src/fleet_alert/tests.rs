@@ -266,6 +266,43 @@ fn incident_2026_10_04_produces_alerts_naming_auth_401() {
     );
 }
 
+/// The common 401 path: `claude-wrapper.sh` / the `tokens check` reprobe write
+/// an `auth-dead:` `.bad_tokens` entry, so the `blocked` row HAS history. It
+/// must still classify as auth-dead (re-auth), not "wait for reset".
+#[test]
+fn blocked_with_auth_dead_bad_tokens_entry_is_auth_dead() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".ranking"),
+        "agent15-2amlogic|blocked|0.00|2026-10-04T07:00:00Z\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join(".bad_tokens"),
+        "2026-10-04T03:00:00Z agent15-2amlogic auth-dead: 401/invalid credential\n",
+    )
+    .unwrap();
+    assert_eq!(causes::token_cause(1, Some(dir.path())), TokenCause::AuthDead);
+}
+
+/// A `blocked` row held by an exhaustion-class entry is a timed hold.
+#[test]
+fn blocked_with_exhaustion_bad_tokens_entry_is_exhausted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".ranking"),
+        "agent15-2amlogic|blocked|0.00|2026-10-04T07:00:00Z\n",
+    )
+    .unwrap();
+    let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    std::fs::write(
+        dir.path().join(".bad_tokens"),
+        format!("{ts} agent15-2amlogic exhausted: weekly limit reached\n"),
+    )
+    .unwrap();
+    assert_eq!(causes::token_cause(1, Some(dir.path())), TokenCause::Exhausted);
+}
+
 #[test]
 fn inbox_payload_keyed_and_resolves_on_clear() {
     let t = state::Transition {
