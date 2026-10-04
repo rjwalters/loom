@@ -187,6 +187,22 @@ impl FitStage {
     pub fn index(self) -> usize {
         self as usize
     }
+
+    /// The coefficient-set stage of a daemon stage: the PR stages map, and
+    /// every pre-PR stage is `None` (the models are PR-level). The one
+    /// definition train (#10245) and serve (#10243) share. The match has no
+    /// wildcard, so a new [`super::Stage`] (`merge_hold`, #10218) does not
+    /// compile until it is mapped here.
+    #[must_use]
+    pub fn from_stage(stage: super::Stage) -> Option<FitStage> {
+        use super::Stage;
+        match stage {
+            Stage::ReviewWait => Some(FitStage::ReviewWait),
+            Stage::Doctor => Some(FitStage::DoctorWait),
+            Stage::MergeWait => Some(FitStage::MergeWait),
+            Stage::ReadyWait | Stage::SweepCurator | Stage::SweepBuilder => None,
+        }
+    }
 }
 
 impl fmt::Display for FitStage {
