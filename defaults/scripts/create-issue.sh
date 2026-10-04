@@ -295,7 +295,7 @@ if [[ -n "$PARENT" ]]; then
   fi
   _parent_repo=()
   [[ -n "$REPO_NWO" ]] && _parent_repo=(--repo "$REPO_NWO")
-  BODY="$(printf '%s' "$BODY" | "$PARENT_DAEMON" forge parent body --parent "$PARENT" "${_parent_repo[@]}")" || {
+  BODY="$(printf '%s' "$BODY" | "$PARENT_DAEMON" forge parent body --parent "$PARENT" ${_parent_repo[@]+"${_parent_repo[@]}"})" || {
     echo "create-issue.sh: could not add the parent marker (nothing was filed)" >&2
     exit 1
   }
@@ -468,7 +468,7 @@ echo "$ISSUE_URL"
 
 # --- #10012: native sub-issue link + inherited star, best effort ------------
 if [[ -n "$PARENT_DAEMON" ]]; then
-  "$PARENT_DAEMON" forge parent link --parent "$PARENT" --child "$ISSUE_URL" "${_parent_repo[@]}" >&2 \
+  "$PARENT_DAEMON" forge parent link --parent "$PARENT" --child "$ISSUE_URL" ${_parent_repo[@]+"${_parent_repo[@]}"} >&2 \
     || echo "create-issue.sh: note: --parent #$PARENT follow-up (star / sub-issue link) incomplete; the issue itself is filed and the loom:parent marker is in its body" >&2
 fi
 

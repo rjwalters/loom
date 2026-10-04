@@ -563,6 +563,53 @@ assert_contains "$(cat "$GH_CREATES")" "loom:triage" "a non-loom label still get
 run_create --title "Intake explicit" --body "Body." --label loom:building
 assert_not_contains "$(cat "$GH_CREATES")" "loom:triage" "--label loom:building does not add loom:triage"
 
+# --- 15. --parent glue (#10012) ---------------------------------------------
+# A stub loom-daemon (first on PATH) stands in for `forge parent body|link`.
+# No --repo is passed: the empty --repo array is the shape that aborts under
+# `set -u` on bash < 4.4, so the default invocation must file cleanly.
+echo "--- --parent: marker lands in the filed body; a missing daemon files nothing ---"
+PARENT_BIN="$WORK/parent-bin"
+mkdir -p "$PARENT_BIN"
+cat > "$PARENT_BIN/loom-daemon" << 'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "forge" && "${2:-}" == "parent" && "${3:-}" == "body" ]]; then
+    printf '%s\n' "$*" >> "${STUB_DAEMON_ARGS:-/dev/null}"
+    cat
+    printf '\n<!-- loom:parent #7 -->\n'
+    exit 0
+fi
+if [[ "${1:-}" == "forge" && "${2:-}" == "parent" && "${3:-}" == "link" ]]; then
+    printf '%s\n' "$*" >> "${STUB_DAEMON_ARGS:-/dev/null}"
+    exit 0
+fi
+[[ "${1:-}" == "forge" && "${2:-}" == "comment" ]] && exit 0
+exit 1
+STUB
+chmod +x "$PARENT_BIN/loom-daemon"
+OLD_FAKE_BIN="$FAKE_BIN"
+FAKE_BIN="$PARENT_BIN:$FAKE_BIN"
+run_create --title "Child of seven" --body "Body." --parent 7
+FAKE_BIN="$OLD_FAKE_BIN"
+assert_eq "$RC" "0" "--parent without --repo files cleanly (empty repo array is set -u safe)"
+assert_contains "$(cat "$GH_CREATES")" "loom:parent #7" "the parent marker is in the filed body"
+assert_contains "$(cat "$DAEMON_ARGS")" "forge parent body --parent 7" "forge parent body ran with the parent number"
+assert_contains "$(cat "$DAEMON_ARGS")" "forge parent link --parent 7" "forge parent link ran after filing"
+
+# No daemon on PATH: exit 1, nothing filed.
+NODAEMON_BIN="$WORK/nodaemon-bin"
+mkdir -p "$NODAEMON_BIN"
+cp "$FAKE_BIN/gh" "$NODAEMON_BIN/gh"
+OLD_FAKE_BIN="$FAKE_BIN"
+FAKE_BIN="$NODAEMON_BIN"
+: > "$GH_CREATES"
+OUT="$(PATH="$NODAEMON_BIN:/usr/bin:/bin" LOOM_FORGE_TYPE=github LOOM_FILING_LOCK=0 \
+    STUB_GH_CREATES="$GH_CREATES" bash "$CREATE_ISSUE" --title "Orphan" --body "Body." --parent 7 2>&1)"
+RC=$?
+FAKE_BIN="$OLD_FAKE_BIN"
+assert_eq "$RC" "1" "--parent with no loom-daemon exits 1"
+assert_contains "$OUT" "needs loom-daemon" "…and says why"
+assert_eq "$(cat "$GH_CREATES")" "" "…and nothing was filed"
+
 echo
 echo "=== $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed ==="
 [[ "$TESTS_FAILED" -eq 0 ]]
