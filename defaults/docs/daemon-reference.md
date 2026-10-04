@@ -4616,6 +4616,31 @@ cite it as unpromoted); the Champion-side check is what actually resolves the
 trap once it has already occurred, including across a repo boundary this
 supervisor cannot cross.
 
+### Closed-item poll for cleared blockers (`autonomous.closedWatch`, #10150)
+
+`loom-daemon notify-cleared-blockers` (#9102) posts a `loom:blocker-cleared`
+comment on every open `loom:blocked` issue/PR that cites a just-closed number,
+but `merge-pr.sh` was its only caller, so a merge made in the GitHub UI, with
+the gh CLI, or by hand never fired it. The daemon now polls recently closed
+items and feeds them to the same core (one `list_blocked` scan per tick).
+`merge-pr.sh`'s call stays as the fast path; the per-artifact
+`<!-- loom:blocker-cleared:#N -->` marker dedupes the two paths.
+
+| Knob | Env | Config | Default |
+|------|-----|--------|---------|
+| Enable | `LOOM_CLOSED_WATCH` | `autonomous.closedWatch.enabled` | off |
+| Interval | `LOOM_CLOSED_WATCH_INTERVAL_SECS` | `autonomous.closedWatch.intervalSecs` | 300 |
+
+Precedence is env > config > default. The poll is REST
+(`gh api repos/{o}/{r}/issues?state=closed&since=...`), runs against the
+primary workspace, and persists a cursor (max `updated_at` seen) in
+`.loom/closed-watch-cursor.json`. The first run looks back 24h and a pass reads
+at most 5 pages of 100. The cursor advances only after a successful scan, so a
+failed tick retries; with nothing newly closed no `list_blocked` call is made.
+It never edits labels, and failures are logged, never fatal. Two hosts polling
+one repo may both post in the check-then-post window; the duplicate is harmless
+and accepted. Source: `loom-daemon/src/cli/closed_watch.rs`.
+
 ## Curator intake reconcile (#10041)
 
 Each work-finder listing of a workspace also runs a cadence-gated intake pass

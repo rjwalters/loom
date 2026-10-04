@@ -42,6 +42,9 @@ pub struct ObserverHandles {
     /// telemetry, so a down container is WARNed on every host. Zero docker
     /// calls on a host with no session-managed Codex account.
     pub codex_session: tokio::task::JoinHandle<()>,
+    /// Closed-item poll that drives the cleared-blocker re-check, `None`
+    /// when `autonomous.closedWatch` is off (#10150).
+    pub closed_watch: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Spawn both observers against `workspace_root`'s resolved config.
@@ -86,5 +89,31 @@ pub fn spawn(
         observability,
         forge_events,
         codex_session,
+        closed_watch: spawn_closed_watch(workspace_root),
     }
+}
+
+/// Cleared-blocker poll (#10150). Default off. Unlike the observers above
+/// it can post a `loom:blocker-cleared` comment, but it never edits a label
+/// and never touches dispatch, claims, or merges; it shares this call site as
+/// a small opt-in side channel. Blocking `gh` work runs on `spawn_blocking`.
+fn spawn_closed_watch(workspace_root: &Path) -> Option<tokio::task::JoinHandle<()>> {
+    use crate::cli::closed_watch as cw;
+    let config = cw::read_config(workspace_root);
+    if !cw::resolve_enabled(&config) {
+        log::debug!("closed_watch: disabled (set autonomous.closedWatch.enabled=true)");
+        return None;
+    }
+    let interval = cw::resolve_interval(&config);
+    log::info!("closed_watch: enabled (interval={}s)", interval.as_secs());
+    let root = workspace_root.to_path_buf();
+    Some(tokio::spawn(async move {
+        loop {
+            let r = root.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || cw::poll_once(&r)).await {
+                log::warn!("closed_watch: poll task panicked: {e}");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    }))
 }
