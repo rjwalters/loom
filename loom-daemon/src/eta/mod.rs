@@ -610,7 +610,8 @@ impl Registry {
     }
 
     /// The built-in heuristics, the fitted ones built with `fit`. Pure.
-    /// `land-2026-10-04-twin-otter` is registered last and **always**, with
+    /// `land-2026-10-04-twin-otter` (and its pre-PR composition `-b`, last)
+    /// are registered **always**, with
     /// or without a file, so its refusals are on the record too.
     #[must_use]
     pub fn with_fit(fit: Option<Arc<fit::CoefficientFile>>) -> Self {
@@ -623,6 +624,7 @@ impl Registry {
                 Box::new(heuristics::LandV3),
                 Box::new(heuristics::LandAmberHeron),
                 Box::new(heuristics::LandTwinOtter::new(fit.clone())),
+                Box::new(heuristics::LandTwinOtterB::new(fit.clone())),
             ],
             fit,
         }
