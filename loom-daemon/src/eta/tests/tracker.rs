@@ -587,6 +587,7 @@ fn plan_row(issue: u32, plan_state: PlanState, disposition: QueueDisposition) ->
             ..RowPlan::default()
         },
         disposition,
+        facts: crate::eta::tracker::IssueRow::default(),
     }
 }
 

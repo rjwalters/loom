@@ -57,8 +57,8 @@ use crate::eta::recalibrate::CalibrationObservation;
 use crate::eta::score::EstimateSummary;
 use crate::eta::shadow::{self, ShadowLedger};
 use crate::eta::tracker::{
-    events_from_journal, Effects, Emission, EstimateContext, IssueState, ItemKey, ListedPr,
-    PrState, PrView, ReadyPlan, ReadyRow, Resolved, Tracker,
+    events_from_journal, DispatchMeta, Effects, Emission, EstimateContext, IssueRow, IssueState,
+    ItemKey, ListedPr, PrState, PrView, ReadyPlan, ReadyRow, RegistryMeta, Resolved, Tracker,
 };
 use crate::eta::{Kind, Provenance, Registry, StageSamples};
 use crate::event_bus::EventBus;
@@ -428,6 +428,7 @@ pub fn spawn_task(
     bus: &EventBus,
     workspace_root: PathBuf,
     host_id: String,
+    workspace_pool: Arc<WorkspacePool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let config = crate::eta::config::read(&workspace_root);
     if !config.enabled {
@@ -474,6 +475,7 @@ pub fn spawn_task(
         host_id,
     });
     let default_root = workspace_root.to_string_lossy().to_string();
+    let pool = workspace_pool;
     let mut subscription = bus.subscribe([
         "sweep.global.dispatch",
         "sweep.global.completed",
@@ -516,6 +518,17 @@ pub fn spawn_task(
             let Some(slug) = slug_for(&mut slugs, &root).await else {
                 continue;
             };
+            // What the registry holds for a new sweep (#10231), read before the
+            // tracker lock: its own mutex is never held across ours.
+            let dispatch_meta = match &event {
+                Event::SweepGlobalDispatch {
+                    sweep_id,
+                    kind: SweepKind::Issue(_),
+                    runtime,
+                    ..
+                } => Some(dispatch_meta(&pool, &root, sweep_id, runtime.clone())),
+                _ => None,
+            };
             let effects = {
                 let mut guard = lock();
                 let Some(state) = guard.as_mut() else {
@@ -526,7 +539,15 @@ pub fn spawn_task(
                         sweep_id,
                         kind: SweepKind::Issue(issue),
                         ..
-                    } => state.tracker.on_dispatch(&slug, *issue, sweep_id, now),
+                    } => {
+                        let effects = state.tracker.on_dispatch(&slug, *issue, sweep_id, now);
+                        if let Some(meta) = dispatch_meta {
+                            state
+                                .tracker
+                                .on_sweep_dispatch(&slug, *issue, sweep_id, meta, now);
+                        }
+                        effects
+                    }
                     Event::SweepPhase {
                         issue,
                         phase,
@@ -553,6 +574,31 @@ pub fn spawn_task(
             apply_event(effects, now).await;
         }
     }))
+}
+
+/// The dispatch parameters of `sweep_id` from the registry that owns workspace
+/// `root`: model, effort and spawn time. No forge read. `registry` is `None`
+/// when the workspace has no provisioned registry or no entry for the sweep.
+fn dispatch_meta(
+    pool: &WorkspacePool,
+    root: &str,
+    sweep_id: &str,
+    runtime: Option<String>,
+) -> DispatchMeta {
+    let registry = pool
+        .provisioned_registry_for(std::path::Path::new(root))
+        .and_then(|registry| {
+            registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(sweep_id)
+                .map(|info| RegistryMeta {
+                    model: info.model.clone(),
+                    effort: info.effort.clone(),
+                    started_at: info.started_at,
+                })
+        });
+    DispatchMeta { runtime, registry }
 }
 
 fn parse_time(raw: Option<&str>) -> Option<DateTime<Utc>> {
@@ -997,6 +1043,11 @@ async fn ready_rows(
             issue: row.issue,
             plan: row.plan,
             disposition: row.disposition,
+            facts: IssueRow {
+                workspace_priority: row.workspace_priority,
+                created_at: row.created_at,
+                tier: row.tier,
+            },
         });
     }
     let mut listing_failed = Vec::with_capacity(summary.listing_failed.len());

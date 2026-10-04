@@ -520,7 +520,7 @@ models (`eta fit`, #10221; the twin-otter heuristic, #10222) and for testing
 which inputs matter. No v1 heuristic reads them; `land-v3` reads `labels`
 and `queue_running`. A feature is `null` when unmeasured, with a specific
 `features_omitted` reason. `not_collected` is only the backstop for declared
-features that nothing populates yet (#10231, #10232).
+features that nothing populates yet (#10232).
 
 ### Queue, drain and friction (#10201)
 
@@ -593,6 +593,71 @@ passes later. Training sets `known_at` to the event time plus 2 min
   this host tracks, which are the PRs that close an issue. The history's
   start, for the 168 h rule, is the journal's oldest row; daemon downtime
   inside that span is not visible.
+
+### Item facts: issue, sweep, verdicts (#10231)
+
+Populated from data the daemon already holds in process; **no forge read**.
+Each value is stored with the instant it was *observed* (`known_at`), and an
+estimate at `as_of` reads only observations with `known_at < as_of`, so a
+later queue refresh, registry read or verdict cannot change an earlier
+instant's features. Equality is excluded, as for the queue features.
+
+| Stored | Source | `known_at` | Definition |
+|---|---|---|---|
+| `tier` | ready-queue row (`tier:*` label) | the plan tick | the label value, as the row carries it |
+| `workspace_priority` | ready-queue row | the plan tick | the owning workspace's priority (lower dispatches first) |
+| `issue_created_at` | ready-queue row (`createdAt`) | the plan tick | the issue's creation instant, never the PR's |
+| `issue_age_sec` | derived | | `as_of − issue_created_at`, integer seconds |
+| `urgent` | none | | **deprecated** compatibility field (`loom:urgent` no longer affects dispatch, #9244): always null, serialized as before |
+| `sweep_runtime` | `sweep.global.dispatch` payload | the dispatch | the admitted runtime |
+| `sweep_model`, `sweep_effort` | the owning sweep registry's entry, read when the dispatch event is handled | the dispatch (not the registry's earlier `started_at`) | what the dispatch requested |
+| `attempt` | dispatches of the issue this process observed | the dispatch | 1-based ordinal of the latest dispatch known before `as_of` |
+| `judge_verdicts_so_far` | verdicts the tracker settled | the **settlement** (the next phase or listing), not the verdict's own instant | `"pass"`/`"fail"` in attempt order, one per attempt (duplicates dropped); `[]` is a real empty list |
+| `repo_first_pass_approval_rate` | the loaded verdict history (`StageSamples::verdicts`: three feeders, below) | each verdict's `observed_at` | see below |
+
+Issue facts are kept when the item leaves the ready queue (ready, building,
+PR stages), keyed by the item, with up to 8 distinct observations so an
+earlier `as_of` sees the value of its own time.
+
+**`repo_first_pass_approval_rate`** = approved first verdicts / first
+verdicts, over the repo's `attempt == 1` Judge verdicts in the loaded verdict
+history (`StageSamples::verdicts`) whose `observed_at` is in the history
+window before `as_of`, strictly. A verdict is *approved* unless it is
+`loom:changes-requested` (`fail`); the window is the history window the
+estimators already use. A merge timestamp is never used. The eligible
+population is every first verdict from **all three** feeders of that list, not
+only sweep outcomes:
+
+| Feeder | "First" means | `observed_at` |
+|---|---|---|
+| `sweep.outcome` (in-sweep Judge) | the sweep's attempt-1 verdict | when the outcome recorded it |
+| ETA stage journal, `in_sweep: false` rows (an external Judge's label transition seen by the tracker, and `eta backfill` rows from PR label history) | attempt 1 = the tracker's `rework_rounds + 1` at the transition, or the first `loom:review-requested` lap in the PR's label history | the listing that saw the transition, or the closing label event |
+| fleet snapshot verdicts (`historyScope` `augment`: added to local; `fleet`: replace local) | attempt 1 of the PR's forge label timeline | the label event that closed the stage |
+
+The denominator is not floored, so a rate over one verdict is reported as
+such; a model should weight by its own minimum. Limitations: a verdict sample
+carries no PR id or source tag, so the same first verdict can count more than
+once (a resumed sweep that records attempt 1 twice; a sweep-driven PR also
+backfilled into the journal; local and fleet copies under `augment`).
+
+**Null reasons** (never `not_collected` in a covered state):
+
+| reason | feature | when |
+|---|---|---|
+| `deprecated` | `urgent` | always |
+| `never_in_ready_queue` | `tier`, `workspace_priority`, `issue_created_at`, `issue_age_sec` | this process never saw a queue row for the item (it entered through a review listing, or the daemon restarted) |
+| `not_observed_yet` | the same | the first queue row was observed at or after `as_of` |
+| `no_tier_label` | `tier` | the issue has no `tier:*` label |
+| `issue_created_at_missing` / `_malformed` | `issue_created_at`, `issue_age_sec` | the row's `createdAt` is absent, or not RFC 3339 |
+| `issue_created_in_future` | `issue_age_sec` | `issue_created_at` is after `as_of`: no age is invented (the instant itself is still recorded) |
+| `no_sweep_yet` | `sweep_runtime`, `sweep_model`, `sweep_effort`, `attempt` | no sweep dispatched before `as_of` |
+| `sweep_not_observed` | the same | a sweep is running or ran, but this process did not observe its dispatch (adopted across a restart) |
+| `runtime_not_recorded` | `sweep_runtime` | the dispatch event named no admitted runtime |
+| `registry_unavailable` | `sweep_model`, `sweep_effort` | the owning registry had no entry for the sweep |
+| `runtime_default` | `sweep_model`, `sweep_effort` | the dispatch requested no explicit value, so the runtime's own default applied (not recorded in process; applicability per runtime is not distinguished) |
+| `verdict_history_unobserved` | `judge_verdicts_so_far` | the item has a PR, but this process saw neither its dispatch nor any verdict, or its first observed dispatch came after the PR already existed (a rework re-dispatch after a restart): earlier verdicts are unknown, not empty |
+| `no_verdict_history` | `repo_first_pass_approval_rate` | no verdict (any feeder, any repo) was observed before `as_of` |
+| `no_first_verdicts_before_as_of` | `repo_first_pass_approval_rate` | an empty denominator: the repo has no first verdict in the window before `as_of` |
 
 ### Host and queue context
 

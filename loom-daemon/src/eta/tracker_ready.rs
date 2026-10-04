@@ -43,6 +43,8 @@ pub struct ReadyRow {
     pub plan: RowPlan,
     /// What the work finder did with it (`open_pr` is `pr-open-skip`).
     pub disposition: QueueDisposition,
+    /// The issue's own facts from the queue row (#10231).
+    pub facts: super::IssueRow,
 }
 
 /// The tick a set of [`ReadyRow`]s came from.
@@ -100,6 +102,11 @@ impl Tracker {
         let mut seen = Vec::new();
         for row in rows {
             let key = ItemKey::new(&row.repo, row.issue);
+            // The row's issue facts, observed when the tick completed. Kept
+            // on an item that already exists; a new one takes them below.
+            if let Some(item) = self.items.get_mut(&key) {
+                item.facts.note_issue(&row.facts, plan.at);
+            }
             if row.plan.plan_state == PlanState::Running {
                 // Dispatched: the bus event settles it. Not a departure.
                 seen.push(key);
@@ -143,6 +150,7 @@ impl Tracker {
             let loom = self.loom.clone();
             let dispatch_raw = serde_json::to_value(&ready).unwrap_or(serde_json::Value::Null);
             let item = self.item(&row.repo, row.issue);
+            item.facts.note_issue(&row.facts, plan.at);
             let first_sight = !item.in_ready_queue;
             let changed = first_sight
                 || item.refused != reason
