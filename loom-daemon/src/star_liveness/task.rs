@@ -696,6 +696,7 @@ pub fn spawn(
             let mut slugs = HashMap::new();
             let mut web_bases = HashMap::new();
             let host = crate::sweep_registry::host_identity();
+            let mail = super::mail::sink_from_env(&host);
             let mut skip_logged = false;
             // Let the work finder complete a first tick before the first pass.
             std::thread::sleep(Duration::from_secs(30));
@@ -720,7 +721,9 @@ pub fn spawn(
                             Utc::now(),
                             &mut factory,
                         );
-                        publish_notices(bus.as_deref(), &host, state.take_notices());
+                        let notices = state.take_notices();
+                        super::mail::dispatch_notices(mail.as_ref(), &notices);
+                        publish_notices(bus.as_deref(), &host, notices);
                         super::publish_report(report);
                     },
                 );
