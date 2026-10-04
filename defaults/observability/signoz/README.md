@@ -376,9 +376,9 @@ spotlight, outcome mix, top slow jobs, failed run → logs, run waterfall, the
 per-issue ship breakdown, CI time per trigger reason, and (#9089) job queue
 wait, shard imbalance, step timings, slowest suites, suite-level rebalance and
 dependency wait.
-Sections 1–3 read the `loom.ci.*.duration_ms` histograms (kept 30 days);
-4–10, 14 and 15 read the `ci.run` / `ci.job` / `ci.job.log` records (kept 7
-days); 11–13 read `signoz_traces.signoz_index_v3` (kept 7 days). Bind all five parameters
+Sections 1–3 read the `loom.ci.*.duration_ms` histograms (trial: 30 days);
+4–10, 14 and 15 read the `ci.run` / `ci.job` / `ci.job.log` records (trial: 7
+days); 11–13 read `signoz_traces.signoz_index_v3` (trial: 7 days; live: 10 years). Bind all five parameters
 once:
 
 ```console
@@ -583,6 +583,11 @@ gone through SigNoz's own ingester for this view, which is what #8529's
 real-canary comparison still needs.
 
 ## Retention and operation
+
+> **Trial-only.** This section governs the isolated trial. The live
+> harness-ops store keeps logs 3650 days and traces/metrics 10 years
+> ([#10195](https://github.com/rjwalters/loom/issues/10195)); never apply
+> `retention.sql` there (#8946 item 2 stays held).
 
 Set **seven days for logs and traces and 30 days for metrics** in General
 Settings → Retention (#8826). Metrics outlive raw logs/traces on purpose: the
