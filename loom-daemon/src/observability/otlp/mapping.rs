@@ -168,6 +168,26 @@ pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> 
 // Logs — the four sweep-lifecycle record kinds
 // ============================================================================
 
+/// Deterministic, content-derived id of one envelope (Issue #10196).
+///
+/// `derived_hex(["loom.record", kind, host_id, emitted_at, <record JSON>], 16)`
+/// per `trace-identity.md`: never random, so a retried delivery of the same
+/// envelope hashes identically, while a re-snapshot of unchanged state (a new
+/// `emitted_at`) is a distinct record.
+pub(super) fn record_id(envelope: &TelemetryEnvelope) -> String {
+    let content = serde_json::to_string(&envelope.record).unwrap_or_default();
+    crate::telemetry::trace::derived_hex(
+        &[
+            "loom.record",
+            &envelope.record.kind().to_string(),
+            &envelope.host_id,
+            &crate::telemetry::trace::instant(envelope.emitted_at),
+            &content,
+        ],
+        16,
+    )
+}
+
 /// Maps one lifecycle-kind envelope to a `LogRecord`. Returns `None` for the
 /// two host-level record kinds (`tokens.snapshot`, `host.health`) — those
 /// become metrics instead (see [`metric_samples_for`]).
@@ -624,6 +644,11 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             return None;
         }
     };
+    // Issue #10196: every log kind carries a content-derived record id so a
+    // replay reader can dedupe at-least-once delivery (`LIMIT 1 BY`) without
+    // a per-kind rule. Inserted first so the 64-attribute bound never drops it.
+    let mut attributes = attributes;
+    attributes.insert(0, kv_string("loom.record_id", record_id(envelope)));
     Some(LogRecord {
         time_unix_nano,
         observed_time_unix_nano,

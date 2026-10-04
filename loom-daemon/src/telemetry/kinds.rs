@@ -167,6 +167,27 @@ pub mod eta_snapshot;
 /// `session.output` (#9764) — the live, redacted agent-output feed.
 pub mod session_output;
 
+/// The sorted wire `kind` tags the given exporters (by
+/// `ExporterKind::name`: `"https"`, `"otlp"`) carry, derived from the registry
+/// rows (Issue #10196). `https` carries `native_ingest` kinds; `otlp` carries
+/// every kind whose class is not [`TelemetryKindOtlp::NotExported`]. Unknown
+/// exporter names contribute nothing.
+#[must_use]
+pub fn exported_kinds_for(exporters: &[String]) -> Vec<String> {
+    let https = exporters.iter().any(|e| e == "https");
+    let otlp = exporters.iter().any(|e| e == "otlp");
+    let mut kinds: Vec<String> = TELEMETRY_KINDS
+        .iter()
+        .filter(|k| {
+            (https && k.native_ingest) || (otlp && k.otlp != TelemetryKindOtlp::NotExported)
+        })
+        .map(|k| k.kind.to_string())
+        .collect();
+    kinds.sort();
+    kinds.dedup();
+    kinds
+}
+
 // ============================================================================
 // THE REGISTRY
 // ============================================================================
