@@ -4,10 +4,14 @@
 //! the subset workflow files actually use: block mappings, block sequences
 //! (including `- key: value` mapping items), plain / single- / double-quoted
 //! scalars, `|` / `>` block scalars, and one-line (or bracket-balanced
-//! multi-line) flow sequences and mappings. Anchors, aliases, tags, multi-doc
-//! streams and complex keys are not supported — a workflow using them parses
-//! to whatever the subset can see, and the audit fails closed on anything it
-//! cannot read (an unparseable condition is `Unknown`, never "covered").
+//! multi-line) flow sequences and mappings. Tags, multi-doc streams and
+//! complex keys are not supported — a workflow using them parses to whatever
+//! the subset can see, and the audit fails closed on anything it cannot read
+//! (an unparseable condition is `Unknown`, never "covered"). Anchors (`&a`),
+//! aliases (`*a`) and merge keys (`<<:`) are rejected outright as a parse
+//! error: content pulled in through them (e.g. an `if:` inside an anchored
+//! job body) would otherwise be invisible and read as unconditional, which
+//! fails *open*.
 //!
 //! Every mapping entry records its 1-based source line so findings can name
 //! the exact line, and so job blocks can be located for `# merge-group-audit:`
@@ -287,6 +291,9 @@ impl Parser<'_> {
             let Some((key, value)) = split_key(&line.text) else {
                 return Err(format!("line {}: expected `key: value` in a mapping", line.no));
             };
+            if key == "<<" {
+                return Err(format!("line {}: YAML merge keys (`<<:`) are not supported", line.no));
+            }
             let value = value.to_string();
             self.pos = idx + 1;
             let node = self.value(indent, &value)?;
@@ -338,6 +345,14 @@ impl Parser<'_> {
     /// Parse the value text following a key (or a scalar sequence item) whose
     /// owner sits at `indent`.
     fn value(&mut self, indent: usize, v: &str) -> Result<Node, String> {
+        if v.starts_with('&') || v.starts_with('*') {
+            // `pos` already points past the owning line, so it is that
+            // line's 1-based number.
+            return Err(format!(
+                "line {}: YAML anchors / aliases (`&` / `*`) are not supported",
+                self.pos
+            ));
+        }
         if v.is_empty() {
             return match self.peek() {
                 Some(n) if n.indent > indent => self.block(n.indent),
@@ -561,6 +576,16 @@ mod tests {
         let jobs = doc.get("jobs").unwrap();
         assert_eq!(doc.entries()[0].line, 3);
         assert_eq!(jobs.entries()[0].line, 4);
+    }
+
+    #[test]
+    fn anchors_aliases_and_merge_keys_are_errors() {
+        assert!(parse("base: &base\n  if: false\njobs:\n  a:\n    <<: *base\n").is_err());
+        assert!(parse("jobs:\n  a:\n    <<: {if: false}\n").is_err());
+        assert!(parse("a: &x 1\nb: *x\n").is_err());
+        assert!(parse("a:\n  - *x\n").is_err());
+        // Inside a block scalar they are just script text.
+        assert!(parse("a: |\n  echo *x &y\n").is_ok());
     }
 
     #[test]

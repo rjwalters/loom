@@ -6,6 +6,13 @@
 //! NOT be validated by it. The rule throughout is `ci-principles.md` rule 6:
 //! a suite that is skipped, or that the audit cannot prove runs, is reported
 //! **uncovered**, never green.
+//!
+//! That rule is applied at **job** granularity. Steps are judged by parity
+//! instead: a step is a finding only when it is *less* likely to run on
+//! `merge_group` than on `pull_request` (`mg < pr`). A step whose `if:` is
+//! undecidable on both events (e.g. it reads a prior step's outputs) is
+//! not reported, because the merge-group run then validates exactly what the
+//! PR run did.
 
 use std::collections::BTreeMap;
 
