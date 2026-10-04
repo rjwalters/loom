@@ -215,10 +215,7 @@ while [[ $# -gt 0 ]]; do
       SKIP_DUP_CHECK=true
       shift
       ;;
-    --parent)
-      PARENT="${2:-}"
-      shift 2
-      ;;
+    --parent) PARENT="${2:-}"; shift 2 ;;
     --duplicate-threshold)
       DUP_THRESHOLD="${2:-}"
       if [[ ! "$DUP_THRESHOLD" =~ ^[0-9]+$ ]]; then
