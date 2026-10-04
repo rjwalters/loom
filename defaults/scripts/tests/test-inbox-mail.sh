@@ -115,11 +115,11 @@ grep -qF 'inbox_mail resolve-merged crithold-pr "<!-- champion:critical-file-hol
 # --- #10137: resolve the key file and inbox URL like the daemon does --------
 unset LOOM_UI_INBOX_URL LOOM_UI_INGEST_KEY
 printf 'TOPSECRETKEY\n' >"$T/ingest.key"
-printf 'url=https://dash.acme.dev\nkey_file=%s\n' "$T/ingest.key" >"$T/cfg"
+printf 'url=https://dashboard.example.com\nkey_file=%s\n' "$T/ingest.key" >"$T/cfg"
 export STUB_CFG="$T/cfg" DAEMON_LOG="$T/dlog"
 inbox_mail on && ok "on: true via daemon-resolved url + key file" || bad "on via daemon"
 : >"$STUB_LOG"; out=$(inbox_mail send k10 "hi" 2>&1)
-grep -qx 'argv: https://dash.acme.dev/api/inbox' "$STUB_LOG" && ok "fallback: URL derived from endpoint" || bad "fallback url: $(cat "$STUB_LOG")"
+grep -qx 'argv: https://dashboard.example.com/api/inbox' "$STUB_LOG" && ok "fallback: URL derived from endpoint" || bad "fallback url: $(cat "$STUB_LOG")"
 grep -qx 'config: header = "Authorization: Bearer TOPSECRETKEY"' "$STUB_LOG" && ok "fallback: header carries the key file's key" || bad "fallback header"
 grep -q '^argv: .*TOPSECRETKEY' "$STUB_LOG" && bad "key on argv (fallback)" || ok "fallback: key not on argv"
 grep -q TOPSECRETKEY <<<"$out" && bad "key echoed in output" || ok "key never in output"
@@ -141,12 +141,12 @@ unset STUB_CFG; inbox_mail on && bad "old daemon: on" || ok "old daemon: falls b
 # mail-send.md Phase 2 block: delivers the inbox leg via file+endpoint fallback.
 awk '/^```bash$/{n++; f=(n==1)} /^```$/{f=0} f&&!/^```bash$/' "$ROOT/defaults/.claude/commands/loom/mail-send.md" >"$T/send.sh"
 [ -s "$T/send.sh" ] || bad "mail-send fence not found"
-printf 'url=https://dash.acme.dev\nkey_file=%s\n' "$T/ingest.key" >"$T/cfg"; export STUB_CFG="$T/cfg"
+printf 'url=https://dashboard.example.com\nkey_file=%s\n' "$T/ingest.key" >"$T/cfg"; export STUB_CFG="$T/cfg"
 printf '#!/usr/bin/env bash\necho "$$event"\n' | sed 's/\$\$/\\$/' >"$T/post.sh"; chmod +x "$T/post.sh"
 : >"$STUB_LOG"
 out=$(MATRIX_POST="$T/post.sh" TO=@op:x BODY="need a token" bash "$T/send.sh" 2>&1); rc=$?
 { [ $rc -eq 0 ] && grep -q '^loom-ui: ok' <<<"$out"; } && ok "mail-send: delivered via fallback" || bad "mail-send fallback rc=$rc: $out"
-grep -qx 'argv: https://dash.acme.dev/api/inbox' "$STUB_LOG" && grep -q 'Bearer TOPSECRETKEY' "$STUB_LOG" && ok "mail-send: URL + header from fallback" || bad "mail-send url/header"
+grep -qx 'argv: https://dashboard.example.com/api/inbox' "$STUB_LOG" && grep -q 'Bearer TOPSECRETKEY' "$STUB_LOG" && ok "mail-send: URL + header from fallback" || bad "mail-send url/header"
 grep -q '^argv: .*TOPSECRETKEY' "$STUB_LOG" && bad "mail-send: key on argv" || ok "mail-send: key not on argv"
 grep -q TOPSECRETKEY <<<"$out" && bad "mail-send: key in output" || ok "mail-send: key not in output"
 # Env vars win over whatever the daemon resolves.
