@@ -299,7 +299,21 @@ fn estimate_locked(
         host_id: Some(state.host_id.as_str()),
         repo_ids: &state.repo_ids,
     };
-    state.tracker.estimate(keys, &ctx, now)
+    let emissions = state.tracker.estimate(keys, &ctx, now);
+    // A full pass also tallied every live series' answer state (#10233):
+    // fold it into the ledger as paired answer-rate evidence.
+    let answers = state.tracker.drain_answers();
+    if !answers.is_empty() {
+        let ids = current_ids(state);
+        state
+            .shadow
+            .record_answers(&|kind| ids.get(&kind).cloned().unwrap_or_default(), &answers);
+        let path = shadow::ledger_path(&state.workspace_root);
+        if let Err(error) = shadow::write_ledger(&path, &state.shadow) {
+            log::warn!("eta: persisting the shadow ledger failed: {error}");
+        }
+    }
+    emissions
 }
 
 fn sink() -> Option<&'static dyn QueueSink> {
@@ -439,7 +453,11 @@ pub fn spawn_task(
         config.refresh_secs,
         tracker.pending().len()
     );
-    let shadow = shadow::read_ledger(&shadow::ledger_path(&workspace_root));
+    let (shadow, unreadable) =
+        shadow::load_ledger(&shadow::ledger_path(&workspace_root), Utc::now());
+    if let Some(note) = unreadable {
+        log::error!("eta: {note}");
+    }
     // #10243: the fitted heuristics' coefficient file, loaded once here and
     // re-checked on every pass (`record`), never inside an estimate.
     let registry = Registry::load(&workspace_root, Utc::now());
@@ -910,7 +928,13 @@ pub(super) async fn record(
                 }
             });
         }
+        // A decided late surprise is scored before it expires (#10233).
         let expired = state.tracker.expire(now);
+        effects.push(crate::eta::tracker::Effects {
+            outcomes: expired.censored,
+            ..Default::default()
+        });
+        let expired = expired.dropped;
         let all = crate::eta::tracker::merged(effects);
         note_outcomes(state, &all.outcomes, now);
         (

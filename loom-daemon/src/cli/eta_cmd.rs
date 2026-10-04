@@ -179,7 +179,7 @@ impl EtaPromoteArgs {
             backtest::compare(current, candidate, &history, &cases, filter, &loom).ok();
 
         let ledger_path = shadow::ledger_path(&root);
-        let mut ledger = shadow::read_ledger(&ledger_path);
+        let mut ledger = shadow::read_ledger(&ledger_path)?;
         let now = Utc::now();
         let config_path = loom_daemon::eta::config::promotion_config_path(&root);
         let decision = if self.apply {
