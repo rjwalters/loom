@@ -112,7 +112,9 @@ pub struct RosterEntry {
     pub repo: String,
     /// PR number.
     pub pr: u32,
-    /// Its stage from its labels. `None` for a held PR (no stage).
+    /// Its stage from its labels (an operator-held approved PR is
+    /// `merge_hold`, #10218). `None` when the labels resolve to no stage (a
+    /// refusal such as `loom:blocked`).
     pub stage: Option<Stage>,
     /// When it entered that stage (a lower bound for a first-seen PR).
     pub entered_at: DateTime<Utc>,

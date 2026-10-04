@@ -1098,7 +1098,7 @@ impl Tracker {
         if kind == Kind::Finish && !item.sweep_running {
             return None;
         }
-        let ready_only = item.in_ready_queue && !item.sweep_running && item.pr_number.is_none();
+        let ready_only = features::ready_only(item);
         if kind == Kind::Start && !ready_only {
             return None;
         }
@@ -1137,12 +1137,8 @@ impl Tracker {
             Subject::new(&item.repo, ctx.repo_ids.get(&key.repo).copied(), item.issue);
         subject.pr_number = item.pr_number;
         subject.sweep_id = item.sweep_id.clone().filter(|_| item.sweep_running);
-        let described = hold::described(&current);
-        let (mut features, mut omitted) =
-            self.features_for(key, item, &described, ready_only, ctx, now);
-        let labels = (!item.labels.is_empty()).then_some(item.labels.as_slice());
-        self.friction
-            .apply(&item.repo, item.pr_number, labels, now, &mut features, &mut omitted);
+        let (features, omitted) =
+            self.recorded_features(key, item, &hold::described(&current), ctx, now);
         Some(EstimateInput {
             subject,
             as_of: now,
@@ -1171,6 +1167,11 @@ impl Tracker {
     /// estimate's refresh cadence never gates `current`'s, and vice versa; and
     /// each becomes pending, so one outcome scores both sides at the same
     /// `as_of` — the pairing [`super::shadow::ShadowLedger`] reads.
+    ///
+    /// A held item's candidates that [`Heuristic::models_hold`] read its
+    /// modeled view and their own series signature (#10284,
+    /// `tracker_hold.rs`); every other heuristic, `current` included, reads
+    /// the described input under the item's signature, as before.
     pub fn estimate(
         &mut self,
         keys: Option<&[ItemKey]>,
@@ -1201,6 +1202,9 @@ impl Tracker {
                     rework_rounds: item.rework_rounds,
                     reason: item.refused,
                 };
+                // A held item's view for a heuristic that models the hold,
+                // with its own series signature (#10284, `tracker_hold.rs`).
+                let modeled = self.modeled_input(&key, &item, kind, &input, ctx);
                 // `current` first, then every shadow candidate: the primary
                 // estimate is emitted before any candidate can be mistaken for
                 // it, and its ordering in the output is what it always was.
@@ -1211,12 +1215,16 @@ impl Tracker {
                     .chain(ctx.registry.for_kind(kind).filter(|h| h.id() != current_id))
                     .collect();
                 for heuristic in ordered {
+                    let (input, signature) = match &modeled {
+                        Some((view, held)) if heuristic.models_hold() => (view, *held),
+                        _ => (&input, signature),
+                    };
                     let series = (kind, heuristic.id().to_string());
                     let state = item.emit.get(&series).cloned().unwrap_or_default();
                     let Some(trigger) = state.decide(signature, now, ctx.refresh_secs) else {
                         continue;
                     };
-                    let explanation = heuristic.estimate(&input, ctx.history);
+                    let explanation = heuristic.estimate(input, ctx.history);
                     if let Some(item) = self.items.get_mut(&key) {
                         item.answered
                             .insert(series.clone(), explanation.result.is_some());

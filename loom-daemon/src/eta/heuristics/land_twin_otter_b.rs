@@ -70,6 +70,10 @@ impl Heuristic for LandTwinOtterB {
         Kind::Land
     }
 
+    fn models_hold(&self) -> bool {
+        true
+    }
+
     fn estimate(&self, input: &EstimateInput, history: &StageSamples) -> Explanation {
         match &input.current {
             CurrentState::At(current) if is_pre_pr(current.stage) => {

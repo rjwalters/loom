@@ -26,15 +26,43 @@
 //!   `merge_hold` departure, never a merge.
 //!
 //! While held the item keeps `refused = blocked`, as it had before #10218,
-//! so the emit signature — and with it when a refusal is emitted and that it
-//! is not refreshed — is unchanged. [`held_stage`] reports `At(MergeHold)`,
-//! entered at the overlay, which every path-engine heuristic refuses as
-//! `blocked` with a byte-identical explanation (the shadow
-//! `land-2026-10-04-twin-otter` estimates it from its fit's `merge_hold`). After a release the item is
-//! `At(MergeWait)` with the **pooled** entry, and [`episode_entered_at`] is
-//! the release instant, for a hold-aware heuristic's split age. `merge_hold`
-//! is never pushed into the item's observed stages, so `eta.outcome`'s
-//! `stages_actual` is unchanged.
+//! so the item's emit signature — and with it when a path-engine refusal is
+//! emitted and that it is not refreshed — is unchanged. [`held_stage`]
+//! reports `At(MergeHold)`, entered at the overlay, which every path-engine
+//! heuristic refuses as `blocked` with a byte-identical explanation. After a
+//! release the item is `At(MergeWait)` with the **pooled** entry, and
+//! [`episode_entered_at`] is the release instant, for a hold-aware
+//! heuristic's split age. `merge_hold` is never pushed into the item's
+//! observed stages, so `eta.outcome`'s `stages_actual` is unchanged.
+//!
+//! # Two views of a held item (#10284)
+//!
+//! A heuristic that [`models_hold`](crate::eta::Heuristic::models_hold)
+//! (the shadow `land-2026-10-04-twin-otter` and its `-b`) estimates a held
+//! PR from its fit's `merge_hold`, which was trained on real queue counts.
+//! So the tracker builds two inputs for a held item:
+//!
+//! - the **described** view ([`described`]), every other heuristic's: the
+//!   `blocked` refusal's features, its stage-dependent queue counts omitted
+//!   as `no_stage`, byte for byte as before;
+//! - the **modeled** view ([`Tracker::modeled_input`]), the hold-aware
+//!   heuristics': the same input with its features recomputed for
+//!   `At(MergeHold)` entered at the hold, so the queue counts come from the
+//!   same `queue_features` call training makes for a `merge_hold` row. Its
+//!   explanation records those features, so a replay reads what the model
+//!   read.
+//!
+//! Each hold-aware series of a held item has its own emit signature,
+//! `merge_hold` with no refusal reason ([`held_signature`]): the hold's entry
+//! and release are transitions of that series, it refreshes every
+//! `refresh_secs` under the hourly cap like any answered series, and a
+//! refusal of its own (`no_model` until a fit lands) refreshes too, so a fit
+//! that arrives mid-hold is picked up within one interval. Its Monte Carlo
+//! seed is the hold visit's (`visit_entry` is the hold entry while held), so
+//! refreshes within one visit replay the same uniforms and a re-entry after
+//! a release draws new ones. On the fleet roster a tracked held PR is in
+//! `merge_hold` from its hold entry ([`roster_entry`]), as training's split
+//! episode is.
 //!
 //! # The one deliberate change to a shipped stage's local samples
 //!
@@ -54,10 +82,13 @@
 //! no `merge_hold` row. The overlay is reported only while the pooled track
 //! is `merge_wait`.
 
-use super::{Effects, Item, ItemKey, PrState, PrView, StageTrack, Tracker};
+use super::{Effects, EstimateContext, Item, ItemKey, PrState, PrView, StageTrack, Tracker};
+use crate::eta::emit::Signature;
 use crate::eta::journal::JournalEntry;
 use crate::eta::labels::stage_from_pr_labels;
-use crate::eta::{AgeSource, CurrentStage, CurrentState, NoEstimateReason, Stage};
+use crate::eta::{
+    AgeSource, CurrentStage, CurrentState, EstimateInput, Kind, NoEstimateReason, Stage,
+};
 use chrono::{DateTime, Utc};
 
 /// One item's hold overlay.
@@ -96,17 +127,67 @@ pub(super) fn episode_entered_at(item: &Item) -> Option<DateTime<Utc>> {
         .filter(|at| pooled.stage == Stage::MergeWait && *at > pooled.entered_at)
 }
 
-/// The state an item's `features` (#10201) describe. A held item is the
-/// `blocked` refusal it was before #10218, so its stage-dependent queue
-/// features stay omitted as `no_stage` and every shipped heuristic's refusal
-/// of it, `features` included, is byte-identical to its refusal of a held PR
-/// before the stage existed.
+/// The state an item's described `features` (#10201) describe. A held item
+/// is the `blocked` refusal it was before #10218, so its stage-dependent
+/// queue features stay omitted as `no_stage` and every path-engine
+/// heuristic's refusal of it, `features` included, is byte-identical to its
+/// refusal of a held PR before the stage existed. A heuristic that models
+/// the hold reads the modeled view instead ([`Tracker::modeled_input`]).
 pub(super) fn described(current: &CurrentState) -> CurrentState {
     match current {
         CurrentState::At(held) if held.stage == Stage::MergeHold => {
             CurrentState::Refused(NoEstimateReason::Blocked)
         }
         other => other.clone(),
+    }
+}
+
+/// The emit signature of a hold-aware series of a held item: `merge_hold`,
+/// unrefused, so it refreshes on the ordinary cadence.
+pub(super) fn held_signature(item: &Item) -> Signature {
+    Signature {
+        stage: Some(Stage::MergeHold),
+        rework_rounds: item.rework_rounds,
+        reason: None,
+    }
+}
+
+/// When a tracked `item` the fleet listing shows in `stage` entered it: its
+/// hold entry for `merge_hold`, else its pooled track's entry when that is
+/// in `stage`. `None` when the tracker does not follow it there.
+pub(super) fn roster_entry(item: &Item, stage: Stage) -> Option<DateTime<Utc>> {
+    match (stage, &item.hold.open) {
+        (Stage::MergeHold, Some(open)) => Some(open.entered_at),
+        _ => item
+            .stage
+            .as_ref()
+            .filter(|track| track.stage == stage)
+            .map(|track| track.entered_at),
+    }
+}
+
+impl Tracker {
+    /// The modeled view of a held item's `described` input and its series
+    /// signature, when `kind` has a heuristic that models the hold. `None`
+    /// when the item is not held (its input is not `At(MergeHold)`).
+    pub(super) fn modeled_input(
+        &self,
+        key: &ItemKey,
+        item: &Item,
+        kind: Kind,
+        described: &EstimateInput,
+        ctx: &EstimateContext<'_>,
+    ) -> Option<(EstimateInput, Signature)> {
+        let CurrentState::At(held) = &described.current else {
+            return None;
+        };
+        if held.stage != Stage::MergeHold || !ctx.registry.for_kind(kind).any(|h| h.models_hold()) {
+            return None;
+        }
+        let mut modeled = described.clone();
+        (modeled.features, modeled.features_omitted) =
+            self.recorded_features(key, item, &described.current, ctx, described.as_of);
+        Some((modeled, held_signature(item)))
     }
 }
 
@@ -117,11 +198,27 @@ impl Tracker {
     pub(crate) fn land_input(
         &self,
         key: &ItemKey,
-        ctx: &super::EstimateContext<'_>,
+        ctx: &EstimateContext<'_>,
         now: DateTime<Utc>,
-    ) -> Option<crate::eta::EstimateInput> {
+    ) -> Option<EstimateInput> {
         let item = self.items.get(key)?;
-        self.input_for(key, item, crate::eta::Kind::Land, ctx, now)
+        self.input_for(key, item, Kind::Land, ctx, now)
+    }
+
+    /// The `land` input a hold-aware heuristic reads for `key` at `now`: the
+    /// modeled view when the item is held, else [`Self::land_input`].
+    pub(crate) fn hold_aware_land_input(
+        &self,
+        key: &ItemKey,
+        ctx: &EstimateContext<'_>,
+        now: DateTime<Utc>,
+    ) -> Option<EstimateInput> {
+        let item = self.items.get(key)?;
+        let described = self.input_for(key, item, Kind::Land, ctx, now)?;
+        Some(match self.modeled_input(key, item, Kind::Land, &described, ctx) {
+            Some((modeled, _)) => modeled,
+            None => described,
+        })
     }
 }
 

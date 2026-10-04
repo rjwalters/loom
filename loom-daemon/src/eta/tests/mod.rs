@@ -17,6 +17,8 @@ mod flag_timeline;
 mod fleet;
 mod fleet_refresh;
 mod friction;
+mod hold_parity;
+mod hold_serving;
 mod item_features;
 mod journal;
 pub(crate) mod land_twin_otter;

@@ -47,11 +47,14 @@
 //! # `merge_hold`
 //!
 //! A held approved PR is estimated from the fit's own `merge_hold` stage,
-//! unlike the path-engine heuristics, which refuse it as `blocked`. Its
-//! `features` are those of that `blocked` refusal (#10218 keeps the shipped
-//! explanations byte-identical), so its stage-dependent counts are `null`
-//! and imputed; and the tracker emits a held PR's estimate at the hold's
-//! entry without refreshing it.
+//! unlike the path-engine heuristics, which refuse it as `blocked`. It
+//! [`models_hold`](Heuristic::models_hold), so the tracker hands it the
+//! held item's **modeled** input (#10284): its stage-dependent queue counts
+//! are those of `merge_hold`, entered at the hold, counted by the same
+//! `queue_features` call training makes, and its `features` record them.
+//! The path-engine refusals keep the described `blocked` features. The
+//! series refreshes while held on the ordinary cadence, under one hold
+//! visit's seed.
 //!
 //! # Ships as shadow
 //!
@@ -114,6 +117,10 @@ impl Heuristic for LandTwinOtter {
 
     fn kind(&self) -> Kind {
         Kind::Land
+    }
+
+    fn models_hold(&self) -> bool {
+        true
     }
 
     fn estimate(&self, input: &EstimateInput, _history: &StageSamples) -> Explanation {
