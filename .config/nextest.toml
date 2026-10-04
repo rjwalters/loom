@@ -120,7 +120,9 @@ max-threads = 1
 # timing, but these oracles are still the heaviest fork-storm in the unit
 # shards, so they run one at a time rather than adding to the contention that
 # exposed the race. `max-threads = 1` serialises them against each other only;
-# the rest of the suite still runs alongside.
+# the rest of the suite still runs alongside. The filter names these two
+# binaries exactly: the other `merge_pr_*_differential` binaries do not run
+# this oracle and stay on normal shard scheduling.
 [test-groups.merge-pr-differential]
 max-threads = 1
 
@@ -140,7 +142,7 @@ test-group = 'daemon-integration'
 slow-timeout = { period = "180s", terminate-after = 3 }
 
 [[profile.default.overrides]]
-filter = 'package(loom-daemon) & kind(test) & binary(/^merge_pr_.*_differential$/)'
+filter = 'package(loom-daemon) & kind(test) & (binary(=merge_pr_response_differential) | binary(=merge_pr_head_sync_differential))'
 test-group = 'merge-pr-differential'
 
 # --- CI profile -------------------------------------------------------------
@@ -177,5 +179,5 @@ test-group = 'daemon-integration'
 slow-timeout = { period = "180s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
-filter = 'package(loom-daemon) & kind(test) & binary(/^merge_pr_.*_differential$/)'
+filter = 'package(loom-daemon) & kind(test) & (binary(=merge_pr_response_differential) | binary(=merge_pr_head_sync_differential))'
 test-group = 'merge-pr-differential'
