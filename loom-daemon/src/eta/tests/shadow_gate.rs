@@ -457,6 +457,7 @@ fn ready_row(issue: u32, state: PlanState, position: Option<u32>) -> ReadyRow {
             ..RowPlan::default()
         },
         disposition: crate::types::QueueDisposition::DeferredCapacity,
+        facts: crate::eta::tracker::IssueRow::default(),
     }
 }
 
