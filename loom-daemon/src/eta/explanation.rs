@@ -365,6 +365,16 @@ pub struct EstimateResult {
     pub p50_sec: i64,
     /// Remaining seconds, 75th percentile.
     pub p75_sec: i64,
+    /// Remaining seconds, 90th percentile (#10211): the displayed upper
+    /// bound a late surprise is scored against. Read off the same simulated
+    /// path totals as the quartiles, by the same nearest-rank rule, with no
+    /// new draws.
+    ///
+    /// Always `Some` on a new estimate. `None` only on an explanation
+    /// recorded before the field existed, which still parses: additive, so
+    /// no schema bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p90_sec: Option<i64>,
     /// `as_of + p50`.
     pub eta_p50_at: DateTime<Utc>,
     /// Smallest `n` over the path's distributions.
@@ -536,6 +546,16 @@ impl Explanation {
         self.result
             .as_ref()
             .map(|r| (r.p25_sec, r.p50_sec, r.p75_sec))
+    }
+
+    /// The `(p25, p50, p75, p90)` remaining seconds, when there is an
+    /// estimate that recorded a p90 — what
+    /// [`super::simulate::run_explanation`] recomputes. `None` for a refusal
+    /// and for an explanation recorded before p90 existed (#10211).
+    #[must_use]
+    pub fn quantiles_with_p90(&self) -> Option<(i64, i64, i64, i64)> {
+        let r = self.result.as_ref()?;
+        Some((r.p25_sec, r.p50_sec, r.p75_sec, r.p90_sec?))
     }
 
     /// Serialized size in bytes.

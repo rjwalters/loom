@@ -292,6 +292,7 @@
     "p25_sec": 943,
     "p50_sec": 2004,
     "p75_sec": 3552,
+    "p90_sec": 4879,
     "eta_p50_at": "2026-09-20T12:33:24Z",
     "samples_min": 22,
     "stage_marks": [

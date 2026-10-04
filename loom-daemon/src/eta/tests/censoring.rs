@@ -429,7 +429,7 @@ fn land_v2_equals_land_v1_until_a_censored_sample_exists_then_diverges() {
     // Recomputable: the simulation reads only what the explanation holds, so
     // a KM-gridded explanation replays to the same numbers.
     let replayed = crate::eta::simulate::run_explanation(&v2_after).unwrap();
-    assert_eq!(replayed, v2_after.quantiles().unwrap());
+    assert_eq!(replayed, v2_after.quantiles_with_p90().unwrap());
 }
 
 #[test]

@@ -80,6 +80,7 @@ pub(super) fn log_parts(
                 attributes.push(kv_int("loom.eta.p25_sec", result.p25_sec));
                 attributes.push(kv_int("loom.eta.p50_sec", result.p50_sec));
                 attributes.push(kv_int("loom.eta.p75_sec", result.p75_sec));
+                opt_int(&mut attributes, "loom.eta.p90_sec", result.p90_sec);
                 attributes.push(kv_int("loom.eta.samples_min", result.samples_min as i64));
                 attributes.push(kv_string(
                     "loom.eta.horizon_bucket",
@@ -115,7 +116,12 @@ pub(super) fn log_parts(
             provenance(&mut attributes, "loom.eta.", &e.loom);
             provenance(&mut attributes, "loom.eta.outcome_", &r.loom);
             opt_int(&mut attributes, "loom.pr_number", e.pr_number.map(i64::from));
+            // All four quantiles ride on the outcome row (#10211), so the
+            // accuracy views read an interval without joining the estimate.
+            opt_int(&mut attributes, "loom.eta.p25_sec", e.p25_sec);
             opt_int(&mut attributes, "loom.eta.p50_sec", e.p50_sec);
+            opt_int(&mut attributes, "loom.eta.p75_sec", e.p75_sec);
+            opt_int(&mut attributes, "loom.eta.p90_sec", e.p90_sec);
             opt_int(&mut attributes, "loom.eta.error_sec", s.error_sec);
             opt_int(&mut attributes, "loom.eta.abs_error_sec", s.abs_error_sec);
             opt_int(&mut attributes, "loom.eta.outcome_resolution_sec", r.outcome_resolution_sec);
@@ -125,6 +131,12 @@ pub(super) fn log_parts(
             }
             if let Some(loss) = s.pinball_loss_sec {
                 attributes.push(kv_double("loom.eta.pinball_loss_sec", loss));
+            }
+            if let Some(late) = s.above_p90 {
+                attributes.push(kv_bool("loom.eta.above_p90", late));
+            }
+            if let Some(loss) = s.pinball4_loss_sec {
+                attributes.push(kv_double("loom.eta.pinball4_loss_sec", loss));
             }
             for (key, value) in [
                 ("loom.eta.horizon_bucket", s.horizon_bucket.as_deref()),
@@ -234,14 +246,28 @@ mod tests {
 
     #[test]
     fn every_eta_attribute_is_allowlisted() {
+        use crate::eta::explanation::EstimateResult;
         use crate::eta::score::{score, EstimateSummary, OutcomeKind};
         use crate::telemetry::kinds::eta::{EtaOutcomeRecord, ETA_LOG_ATTRIBUTE_KEYS};
+        // The fixture estimate is a refusal (no history); a copy with a
+        // result exercises the quantile keys an answer adds.
         let estimate = record();
+        let mut answered = estimate.clone();
+        answered.explanation.result = Some(EstimateResult {
+            p25_sec: 60,
+            p50_sec: 120,
+            p75_sec: 240,
+            p90_sec: Some(300),
+            eta_p50_at: answered.explanation.as_of + chrono::Duration::seconds(120),
+            samples_min: 9,
+            stage_marks: Vec::new(),
+        });
         let summary = EstimateSummary::of(&estimate.explanation);
         let mut summary_with_numbers = summary.clone();
         summary_with_numbers.p25_sec = Some(60);
         summary_with_numbers.p50_sec = Some(120);
         summary_with_numbers.p75_sec = Some(240);
+        summary_with_numbers.p90_sec = Some(300);
         summary_with_numbers.pr_number = Some(9301);
         let at = summary.as_of + chrono::Duration::seconds(100);
         let outcome = EtaOutcomeRecord {
@@ -252,8 +278,30 @@ mod tests {
             outcome_resolution_sec: Some(0),
             result: Some("exited".to_string()),
         };
+        // The keys #10211 added are actually emitted, so the allowlist check
+        // below is not vacuous for them.
+        let expected: [(&TelemetryRecord, &[&str]); 2] = [
+            (&TelemetryRecord::EtaEstimate(answered.clone()), &["loom.eta.p90_sec"]),
+            (
+                &TelemetryRecord::EtaOutcome(outcome.clone()),
+                &[
+                    "loom.eta.p25_sec",
+                    "loom.eta.p75_sec",
+                    "loom.eta.p90_sec",
+                    "loom.eta.above_p90",
+                    "loom.eta.pinball4_loss_sec",
+                ],
+            ),
+        ];
+        for (record, keys) in expected {
+            let log = log_record_for(&TelemetryEnvelope::new("host", record.clone())).unwrap();
+            for key in keys {
+                assert!(attr(&log, key).is_some(), "{key} is emitted");
+            }
+        }
         for record in [
             TelemetryRecord::EtaEstimate(estimate),
+            TelemetryRecord::EtaEstimate(answered),
             TelemetryRecord::EtaOutcome(outcome),
         ] {
             let log = log_record_for(&TelemetryEnvelope::new("host", record)).unwrap();
@@ -265,6 +313,51 @@ mod tests {
                     kv.key
                 );
             }
+        }
+    }
+
+    #[test]
+    fn an_outcome_row_carries_the_late_surprise_and_the_four_quantile_loss() {
+        use crate::eta::score::{score, EstimateSummary, OutcomeKind};
+        use crate::telemetry::kinds::eta::EtaOutcomeRecord;
+        let estimate = record();
+        let mut summary = EstimateSummary::of(&estimate.explanation);
+        (summary.p25_sec, summary.p50_sec, summary.p75_sec) = (Some(600), Some(1200), Some(2400));
+        let outcome = |p90: Option<i64>, actual: i64| {
+            let mut summary = summary.clone();
+            summary.p90_sec = p90;
+            let at = summary.as_of + chrono::Duration::seconds(actual);
+            let record = EtaOutcomeRecord {
+                score: score(&summary, OutcomeKind::Landed, at, &[]),
+                estimate: summary,
+                loom: estimate.explanation.loom.clone(),
+                outcome_source: "pulls_read".to_string(),
+                outcome_resolution_sec: Some(0),
+                result: None,
+            };
+            log_record_for(&TelemetryEnvelope::new("host", TelemetryRecord::EtaOutcome(record)))
+                .unwrap()
+        };
+        // Landed at 3600 s, after p90 = 3000: a late surprise. The
+        // three-quantile loss is ρ.25(3000) + ρ.5(2400) + ρ.75(1200)
+        // = 750 + 1200 + 900 = 2850, and ρ.9(600) = 540 makes 3390.
+        let late = outcome(Some(3000), 3600);
+        assert_eq!(attr(&late, "loom.eta.p90_sec"), Some(Value::IntValue(3000)));
+        assert_eq!(attr(&late, "loom.eta.above_p90"), Some(Value::BoolValue(true)));
+        assert_eq!(attr(&late, "loom.eta.pinball_loss_sec"), Some(Value::DoubleValue(2850.0)));
+        assert_eq!(attr(&late, "loom.eta.pinball4_loss_sec"), Some(Value::DoubleValue(3390.0)));
+        assert_eq!(attr(&late, "loom.eta.p25_sec"), Some(Value::IntValue(600)));
+        assert_eq!(attr(&late, "loom.eta.p75_sec"), Some(Value::IntValue(2400)));
+        // A summary from before p90 existed: the three-quantile score still
+        // rides, the p90 keys are absent (never `false`, never 0).
+        let old = outcome(None, 3600);
+        assert_eq!(attr(&old, "loom.eta.pinball_loss_sec"), Some(Value::DoubleValue(2850.0)));
+        for key in [
+            "loom.eta.p90_sec",
+            "loom.eta.above_p90",
+            "loom.eta.pinball4_loss_sec",
+        ] {
+            assert_eq!(attr(&old, key), None, "{key} is absent without a p90");
         }
     }
 }
