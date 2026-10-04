@@ -292,9 +292,19 @@ impl StageEpisode {
     }
 }
 
-/// Every stage episode of `input`, as knowable at `as_of`, in entry order.
-#[must_use]
-pub fn derive(input: &EpisodeInput, as_of: DateTime<Utc>) -> Vec<StageEpisode> {
+/// The replay every label-history derivation shares (#10245): `input`'s
+/// events before `as_of` (and before its merge or close) in `(at, seq)` order,
+/// from an empty label set, calling `visit` once per instant with the labels
+/// in force after every event at that instant. Returns the merge or close, when
+/// one is before `as_of`.
+///
+/// One copy of the tie rule, so the stage episodes ([`derive`]) and the label
+/// flags (`flag_timeline`) cannot drift apart.
+pub(crate) fn replay(
+    input: &EpisodeInput,
+    as_of: DateTime<Utc>,
+    mut visit: impl FnMut(DateTime<Utc>, &[String]),
+) -> Option<(DateTime<Utc>, EpisodeNext)> {
     let mut events: Vec<&LabelEvent> = input.events.iter().filter(|e| e.at < as_of).collect();
     events.sort_by(|a, b| a.at.cmp(&b.at).then(a.seq.cmp(&b.seq)));
     let finish = match input.end {
@@ -306,17 +316,7 @@ pub fn derive(input: &EpisodeInput, as_of: DateTime<Utc>) -> Vec<StageEpisode> {
     if let Some((at, _)) = finish {
         events.retain(|e| e.at < at);
     }
-
-    let episode = |stage: Stage, entered_at: DateTime<Utc>, end: EpisodeEnd| StageEpisode {
-        repo: input.repo.clone(),
-        pr_number: input.pr_number,
-        stage,
-        entered_at,
-        end,
-    };
     let mut labels: BTreeSet<String> = BTreeSet::new();
-    let mut current: Option<(Stage, DateTime<Utc>)> = None;
-    let mut out = Vec::new();
     let mut i = 0;
     while i < events.len() {
         let at = events[i].at;
@@ -329,7 +329,27 @@ pub fn derive(input: &EpisodeInput, as_of: DateTime<Utc>) -> Vec<StageEpisode> {
             i += 1;
         }
         let present: Vec<String> = labels.iter().cloned().collect();
-        let resolved = stage_from_pr_labels(&present).ok();
+        visit(at, &present);
+    }
+    finish
+}
+
+/// Every stage episode of `input`, as knowable at `as_of`, in entry order.
+#[must_use]
+pub fn derive(input: &EpisodeInput, as_of: DateTime<Utc>) -> Vec<StageEpisode> {
+    let episode = |stage: Stage, entered_at: DateTime<Utc>, end: EpisodeEnd| StageEpisode {
+        repo: input.repo.clone(),
+        pr_number: input.pr_number,
+        stage,
+        entered_at,
+        end,
+    };
+    let mut current: Option<(Stage, DateTime<Utc>)> = None;
+    let mut out = Vec::new();
+    let mut last_event: Option<DateTime<Utc>> = None;
+    let finish = replay(input, as_of, |at, present| {
+        last_event = Some(at);
+        let resolved = stage_from_pr_labels(present).ok();
         match (current, resolved) {
             (Some((stage, _)), Some(next)) if stage == next => {}
             (Some((stage, entered_at)), next) => {
@@ -345,7 +365,7 @@ pub fn derive(input: &EpisodeInput, as_of: DateTime<Utc>) -> Vec<StageEpisode> {
             }
             (None, next) => current = next.map(|next| (next, at)),
         }
-    }
+    });
 
     if let Some((stage, entered_at)) = current {
         let end = match (finish, input.end) {
@@ -353,7 +373,7 @@ pub fn derive(input: &EpisodeInput, as_of: DateTime<Utc>) -> Vec<StageEpisode> {
             // Closed with no known instant: end at the last label event (see
             // the module docs for why this one case is not causal).
             (None, PrEnd::Closed(None)) => EpisodeEnd::Unstaged {
-                at: events.last().map_or(entered_at, |e| e.at),
+                at: last_event.unwrap_or(entered_at),
             },
             _ => EpisodeEnd::Open { at: as_of },
         };

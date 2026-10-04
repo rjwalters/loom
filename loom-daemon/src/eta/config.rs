@@ -6,6 +6,7 @@
 //! | `dryRun` | `LOOM_ETA_DRY_RUN` | `false`: compute and log, enqueue nothing |
 //! | `refreshSecs` | `LOOM_ETA_REFRESH_SECS` | `300` |
 //! | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
+//! | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245) |
 //! | `current.start` / `current.finish` / `current.land` | — | `start-v1` / `finish-v1` / `land-v1` |
 
 use super::Kind;
@@ -82,6 +83,8 @@ pub struct EtaConfig {
     pub current_finish: Option<String>,
     /// Configured `current` heuristic for `land`.
     pub current_land: Option<String>,
+    /// Run the daily refit (#10245); only when [`Self::enabled`] too.
+    pub fit_enabled: bool,
 }
 
 impl Default for EtaConfig {
@@ -94,6 +97,7 @@ impl Default for EtaConfig {
             current_start: None,
             current_finish: None,
             current_land: None,
+            fit_enabled: true,
         }
     }
 }
@@ -149,6 +153,12 @@ pub fn resolve(config: &serde_json::Value, env: impl Fn(&str) -> Option<String>)
     resolved.current_start = id("start");
     resolved.current_finish = id("finish");
     resolved.current_land = id("land");
+    if let Some(v) = get("fit")
+        .and_then(|f| f.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+    {
+        resolved.fit_enabled = v;
+    }
 
     if let Some(v) = env("LOOM_ETA_ENABLED").as_deref().and_then(parse_bool) {
         resolved.enabled = v;
@@ -164,6 +174,9 @@ pub fn resolve(config: &serde_json::Value, env: impl Fn(&str) -> Option<String>)
         .and_then(HistoryScopeMode::parse)
     {
         resolved.history_scope = v;
+    }
+    if let Some(v) = env("LOOM_ETA_FIT_ENABLED").as_deref().and_then(parse_bool) {
+        resolved.fit_enabled = v;
     }
     resolved.refresh_secs = resolved.refresh_secs.max(MIN_REFRESH_SECS);
     resolved

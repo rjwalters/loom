@@ -57,6 +57,14 @@
 //! written before #10218 gains episodes only as its PRs are re-read: run
 //! `eta fleet backfill` (not `refresh`) to rebuild the whole window.
 //!
+//! # Label-flag timeline (#10245)
+//!
+//! Beside the episodes, `flag_changes` records when each PR's six model flags
+//! ([`super::labels::pr_flags`]) changed ([`super::flag_timeline`]), from the
+//! same timelines and the same replay, so a fit reads the flags as they were
+//! at each past instant. Same compatibility rules as the episodes: not written
+//! when empty, so an older file keeps its id; rebuilt by `eta fleet backfill`.
+//!
 //! # Deliberately out of scope
 //!
 //! Fleet-wide **in-sweep** samples (`sweep.curator`, `sweep.builder`) would
@@ -68,8 +76,9 @@
 //! guess.
 
 use super::config::HistoryScopeMode;
-use super::episodes::{episodes_from_pr_history, StageEpisode};
+use super::episodes::{derive, input_from_pr_history, StageEpisode};
 use super::explanation::HistoryScope;
+use super::flag_timeline::{self, flag_changes_from_input, FlagChange};
 use super::history::{SampleSource, StageSample, StageSamples, VerdictSample};
 use super::journal::{censored_from_pr_history, entries_from_pr_history, JournalEntry};
 use super::{Provenance, Stage, WINDOW_DAYS};
@@ -234,6 +243,12 @@ pub struct FleetSnapshot {
     /// is not written, so such a file round-trips byte-identically.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub episodes: Vec<StageEpisode>,
+    /// Every PR's label-flag timeline (#10245), sorted by `(pr_number, at)`:
+    /// an entry at its first label event, then one per change. Same
+    /// compatibility rules as `episodes`: a file without it parses, and an
+    /// empty list is not written, so such a file keeps its id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flag_changes: Vec<FlagChange>,
 }
 
 impl FleetSnapshot {
@@ -249,6 +264,7 @@ impl FleetSnapshot {
             prs: Vec::new(),
             samples: Vec::new(),
             episodes: Vec::new(),
+            flag_changes: Vec::new(),
         };
         snapshot.seal();
         snapshot
@@ -270,17 +286,24 @@ impl FleetSnapshot {
     ///
     /// Samples older than [`RETENTION_DAYS`] before `as_of` are pruned, so the
     /// cache file does not grow without bound. Episodes follow the same rules:
-    /// replaced per re-read PR, pruned by the last instant they describe.
+    /// replaced per re-read PR, pruned by the last instant they describe. Flag
+    /// changes are replaced per re-read PR too; the prune keeps each PR's last
+    /// change before the floor (the mask in force there), and a PR that left
+    /// the census takes its flags with it.
     pub fn merge(&mut self, histories: &[PrHistory], as_of: DateTime<Utc>) {
         let usable: Vec<&PrHistory> = histories.iter().filter(|h| h.timeline_complete).collect();
         let replaced: BTreeSet<u32> = usable.iter().map(|h| h.number).collect();
         self.samples.retain(|s| !replaced.contains(&s.pr_number));
         self.episodes.retain(|e| !replaced.contains(&e.pr_number));
+        self.flag_changes
+            .retain(|c| !replaced.contains(&c.pr_number));
         for h in &usable {
             self.samples
                 .extend(samples_from_pr_history(h, &self.repo, as_of));
-            self.episodes
-                .extend(episodes_from_pr_history(h, &self.repo, as_of));
+            let input = input_from_pr_history(h, &self.repo);
+            self.episodes.extend(derive(&input, as_of));
+            self.flag_changes
+                .extend(flag_changes_from_input(&input, as_of));
         }
         self.as_of = self.as_of.max(as_of);
         // `checked_sub_signed`, not `-`: chrono **panics** on overflow, and
@@ -293,6 +316,7 @@ impl FleetSnapshot {
         {
             self.samples.retain(|s| s.observed_at >= floor);
             self.episodes.retain(|e| e.last_at() >= floor);
+            self.flag_changes = flag_timeline::prune(std::mem::take(&mut self.flag_changes), floor);
         }
         let mut prs: BTreeSet<u32> = self.prs.iter().copied().collect();
         prs.extend(replaced);
@@ -305,6 +329,8 @@ impl FleetSnapshot {
                     || self.episodes.iter().any(|e| e.pr_number == *pr)
             })
             .collect();
+        let census: BTreeSet<u32> = self.prs.iter().copied().collect();
+        self.flag_changes.retain(|c| census.contains(&c.pr_number));
         self.seal();
     }
 
@@ -321,12 +347,16 @@ impl FleetSnapshot {
                 .then_with(|| a.digest_line().cmp(&b.digest_line()))
         });
         self.episodes.dedup();
+        self.flag_changes.sort();
+        self.flag_changes.dedup();
         self.cursor = self.samples.iter().map(|s| s.observed_at).max();
         let mut lines: Vec<String> = self.samples.iter().map(FleetSample::digest_line).collect();
         // #10218: episode lines only when there are episodes (each starts
         // `episode|`, so it cannot read as a sample line), so a snapshot with
         // none keeps exactly the id it had before episodes existed.
         lines.extend(self.episodes.iter().map(StageEpisode::digest_line));
+        // #10245: the same rule for flag lines (each starts `flags|`).
+        lines.extend(self.flag_changes.iter().map(FlagChange::digest_line));
         let mut parts: Vec<&str> = vec!["loom.eta.fleet.snapshot"];
         let repo = self.repo.to_ascii_lowercase();
         let at = crate::telemetry::trace::instant(self.as_of);

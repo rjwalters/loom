@@ -19,14 +19,19 @@
 //! quantile functions, Cholesky) — no new crate, since `Cargo.toml` is a
 //! Champion auto-merge veto pattern.
 //!
-//! Building training rows from fleet history, the `eta fit` CLI and the daily
-//! refit are #10245; this module never reads fleet data.
+//! Two modules around that core are #10245's:
+//!
+//! - [`rows`] builds the training rows and dwells from fleet snapshots at a
+//!   cutoff `T` (pure; the point-in-time rules are in its docs);
+//! - [`run`] is the I/O around it: read the snapshots, fit, write and prune
+//!   the coefficient files, and decide when the daily refit is due. The
+//!   `eta fit` CLI and the daemon's daily task both call it.
 //!
 //! # Purity and determinism
 //!
 //! No clock, no globals beyond the [`coeffs::FIT_DIR_ENV`] test seam, no
-//! randomness, and no I/O outside [`coeffs::write`], [`coeffs::read`] and
-//! [`coeffs::load_latest`]. Rows are processed in the order given — canonical
+//! randomness, and no I/O outside [`coeffs::write`], [`coeffs::read`],
+//! [`coeffs::load_latest`] and [`run`]. Rows are processed in the order given — canonical
 //! ordering is the caller's job — so the same input gives a byte-identical
 //! file. Byte identity is per build and platform: `ln`, `exp` and `sin` come
 //! from the platform libm. The file's `id` is derived from its content, never
@@ -63,6 +68,8 @@ pub mod features;
 pub mod logistic;
 pub mod math;
 pub mod paths;
+pub mod rows;
+pub mod run;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

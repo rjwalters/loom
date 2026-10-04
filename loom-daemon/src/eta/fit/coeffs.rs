@@ -176,6 +176,12 @@ pub struct FitWindow {
     pub exit_horizon_sec: i64,
     /// Knowability lag, in seconds.
     pub knowable_lag_sec: i64,
+    /// The data horizon `H` (#10245): every label and censoring instant of a
+    /// fleet fit is at most this, `min(as_of − knowable_lag, oldest snapshot
+    /// as_of)`. `None` for rows not built from fleet snapshots, and then not
+    /// written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_through: Option<DateTime<Utc>>,
 }
 
 impl FitWindow {
@@ -188,6 +194,7 @@ impl FitWindow {
             row_step_sec: ROW_STEP_SEC,
             exit_horizon_sec: EXIT_HORIZON_SEC,
             knowable_lag_sec: KNOWABLE_LAG_SEC,
+            data_through: None,
         }
     }
 }

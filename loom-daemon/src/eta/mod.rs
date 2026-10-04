@@ -101,6 +101,7 @@ pub mod emit;
 pub mod episodes;
 pub mod explanation;
 pub mod fit;
+pub mod flag_timeline;
 pub mod fleet;
 pub mod fleet_agreement;
 pub mod fleet_events;

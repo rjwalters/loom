@@ -295,7 +295,7 @@ fn render(snapshot: &FleetSnapshot, path: &Path) -> String {
     out
 }
 
-fn resolve_root(repo_root: Option<PathBuf>) -> PathBuf {
+pub(super) fn resolve_root(repo_root: Option<PathBuf>) -> PathBuf {
     repo_root
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))

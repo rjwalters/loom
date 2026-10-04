@@ -78,6 +78,9 @@ pub(crate) enum EtaCommand {
     /// Point-in-time walk-forward evaluation on logged estimate/outcome
     /// pairs (#10193): a heuristic's logged estimates vs a fitted model.
     Offline(super::eta_offline_cmd::EtaOfflineArgs),
+    /// Fit the `eta-fit/v1` coefficient file from the fleet snapshots at a
+    /// cutoff (#10245): `loom-daemon eta fit [--as-of RFC3339] [--dry-run]`.
+    Fit(super::eta_fit_cmd::EtaFitArgs),
 }
 
 impl EtaCommand {
@@ -90,6 +93,7 @@ impl EtaCommand {
             EtaCommand::Promote(args) => args.run(),
             EtaCommand::Fleet { command } => command.run(),
             EtaCommand::Offline(args) => args.run(),
+            EtaCommand::Fit(args) => args.run(),
         }
     }
 }
