@@ -16,7 +16,9 @@
 //! says nothing about the turnover in progress.
 //!
 //! The quantiles of the path totals are nearest-rank over the sorted
-//! totals, rounded to whole seconds.
+//! totals, rounded to whole seconds. p90 (#10211) is read off the same
+//! sorted totals by the same rule, so it costs no draws and leaves p25, p50
+//! and p75 exactly as they were.
 //!
 //! [`run_explanation`] rebuilds the whole simulation from an explanation's
 //! fields alone, which is what makes an estimate recomputable offline.
@@ -86,8 +88,8 @@ pub struct PathSpec {
 /// The outcome of a simulation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Simulation {
-    /// Remaining seconds, `(p25, p50, p75)`.
-    pub quantiles: (i64, i64, i64),
+    /// Remaining seconds, `(p25, p50, p75, p90)`.
+    pub quantiles: (i64, i64, i64, i64),
     /// Per-stage cumulative entry-time seconds, `(p25, p50, p75)`, over the
     /// paths that visit the stage (#9366); `None` for a stage no path
     /// visits. The terminal stage's samples are the path completion times,
@@ -332,7 +334,8 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     }
 
     totals.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    let quantiles = nearest_rank3(&totals);
+    let (p25, p50, p75) = nearest_rank3(&totals);
+    let quantiles = (p25, p50, p75, nearest_rank(&totals, 90));
 
     // The stage every path ends on: the approving verdict when the path
     // stops there, else `merge_wait`. Its mark is the path completion time —
@@ -379,16 +382,19 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     })
 }
 
-/// Nearest-rank `(p25, p50, p75)` over sorted `(value, path)` samples,
-/// rounded to whole seconds — the one quantile discipline for the path
-/// totals and the stage-entry marks alike.
+/// Nearest-rank `(p25, p50, p75)` over sorted `(value, path)` samples, by
+/// [`nearest_rank`].
 fn nearest_rank3(samples: &[(f64, usize)]) -> (i64, i64, i64) {
+    (nearest_rank(samples, 25), nearest_rank(samples, 50), nearest_rank(samples, 75))
+}
+
+/// The nearest-rank `pct`th percentile of sorted `(value, path)` samples,
+/// rounded to whole seconds — the one quantile discipline for the path
+/// totals (p25 to p90) and the stage-entry marks alike.
+fn nearest_rank(samples: &[(f64, usize)], pct: usize) -> i64 {
     let k = samples.len();
-    let q = |pct: usize| -> i64 {
-        let rank = (pct * k).div_ceil(100).clamp(1, k);
-        samples[rank - 1].0.round() as i64
-    };
-    (q(25), q(50), q(75))
+    let rank = (pct * k).div_ceil(100).clamp(1, k);
+    samples[rank - 1].0.round() as i64
 }
 
 /// Mean per-stage time over the paths ranked in `[lo, hi)` (fractions of K).
@@ -518,9 +524,10 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
     })
 }
 
-/// Recompute an explanation's quantiles from its own fields.
+/// Recompute an explanation's `(p25, p50, p75, p90)` from its own fields;
+/// compare with [`Explanation::quantiles_with_p90`].
 #[must_use]
-pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64)> {
+pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)> {
     let spec = spec_from_explanation(explanation)?;
     run(&spec).ok().map(|s| s.quantiles)
 }

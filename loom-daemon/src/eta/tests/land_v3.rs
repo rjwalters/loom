@@ -129,8 +129,8 @@ fn land_v3_is_pure_and_recomputes_from_its_own_explanation() {
     assert_eq!(first.heuristic, LAND_V3);
     // The adjusted grids are what the explanation carries, so the simulation
     // rebuilt from the explanation alone reproduces the number exactly.
-    assert!(first.quantiles().is_some());
-    assert_eq!(run_explanation(&first), first.quantiles());
+    assert!(first.quantiles_with_p90().is_some());
+    assert_eq!(run_explanation(&first), first.quantiles_with_p90());
     // Every post-dispatch stage records its adjustment.
     assert!(first
         .stages
