@@ -9082,7 +9082,9 @@ jobs. While it exists each of these exits non-zero naming reason, who, when and
 `loom-daemon-start.sh`, the watchdog tick (no recovery, no page), the watchdog
 provisioning guard, `daemon-update` (restart / relaunch / provision, and so the
 auto-update roll), daemon startup itself (supervised relaunch), and
-`resync-installed.sh` / `install-loom.sh` (via `loom-daemon host check`).
+`resync-installed.sh` / `install-loom.sh` (via `loom-daemon host check`, which
+exits **10** when disabled; the shell guards refuse only on 10, so an older binary
+that exits 1/2 for the unknown `host` subcommand never reads as an opt-out).
 `heal_marker` never re-arms the marker, and `loom-daemon status` / `health` print
 `disabled by operator: <reason> (<when>)` and exit 0 instead of reporting an
 outage. An unreadable marker still counts as disabled (fail closed).

@@ -114,6 +114,19 @@ fn enable_clears_marker_idempotently_and_starts_nothing() {
     assert_eq!(h.run(&["host", "check"]).status.code(), Some(0));
 }
 
+/// `host check` signals disabled with the distinct exit 10 (never 1/2, which an
+/// older binary returns for the unknown subcommand), still naming the record.
+#[test]
+fn host_check_exits_ten_only_when_disabled() {
+    let h = Host::new();
+    assert_eq!(h.run(&["host", "check"]).status.code(), Some(0));
+    h.disable();
+    let o = h.run(&["host", "check", "--entry-point", "resync-installed.sh"]);
+    assert_eq!(o.status.code(), Some(10), "{}", text(&o));
+    assert!(text(&o).contains("resync-installed.sh"));
+    assert!(text(&o).contains("cost freeze"));
+}
+
 #[test]
 fn daemon_start_refuses_with_no_side_effects() {
     let h = Host::new();

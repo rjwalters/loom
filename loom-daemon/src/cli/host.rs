@@ -25,8 +25,10 @@ pub(crate) enum HostCommand {
     Enable,
     /// Print whether this host is disabled (always exits 0).
     Status,
-    /// Exit 1, naming reason/who/when, when the host is disabled; 0 otherwise.
-    /// For shell entry points (installer, resync-installed.sh) to call first.
+    /// Exit 10, naming reason/who/when, when the host is disabled; 0 otherwise.
+    /// For shell entry points (installer, resync-installed.sh) to call first;
+    /// they refuse only on 10, so an older binary that exits 1/2 for an unknown
+    /// subcommand is never mistaken for an opt-out.
     Check {
         /// What to name in the refusal.
         #[arg(long, default_value = "host check")]
@@ -48,7 +50,10 @@ impl HostCommand {
                 Ok(())
             }
             Self::Check { entry_point } => {
-                host_optout::refuse_if_disabled_exit(&entry_point);
+                host_optout::refuse_if_disabled_exit_with(
+                    &entry_point,
+                    host_optout::HOST_CHECK_DISABLED_EXIT,
+                );
                 Ok(())
             }
         }

@@ -200,12 +200,23 @@ pub fn check_or_refuse(entry_point: &str) -> Result<(), Refusal> {
     }
 }
 
+/// Exit code of `loom-daemon host check` when the host is disabled. Distinct
+/// from 1/2 on purpose: an older binary without `host` exits 1 or 2 for the
+/// unknown subcommand, so shell guards refuse ONLY on this affirmative signal.
+pub const HOST_CHECK_DISABLED_EXIT: i32 = 10;
+
 /// [`check_or_refuse`] for entry points that are a process: print the refusal
 /// on stderr and exit 1.
 pub fn refuse_if_disabled_exit(entry_point: &str) {
+    refuse_if_disabled_exit_with(entry_point, 1);
+}
+
+/// [`refuse_if_disabled_exit`] with an explicit exit code (`host check` uses
+/// [`HOST_CHECK_DISABLED_EXIT`]).
+pub fn refuse_if_disabled_exit_with(entry_point: &str, code: i32) {
     if let Err(r) = check_or_refuse(entry_point) {
         eprintln!("{r}");
-        std::process::exit(1);
+        std::process::exit(code);
     }
 }
 
@@ -317,7 +328,7 @@ mod tests {
     fn write_then_refuse_names_reason_who_when_and_enable() {
         let t = tempfile::tempdir().unwrap();
         let p = disabled_path(&marker(t.path()));
-        assert_eq!(write_at(&p, "cost freeze", "alice",).unwrap(), true);
+        assert!(write_at(&p, "cost freeze", "alice",).unwrap());
         let msg = check_at(&p, "daemon-start").unwrap_err().to_string();
         assert!(msg.contains("daemon-start"));
         assert!(msg.contains("cost freeze"));
