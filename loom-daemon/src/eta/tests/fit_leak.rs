@@ -9,6 +9,7 @@ use super::fit_rows::{approve, open, snapshot, OPERATOR, OTHER, REPO, STAR};
 use crate::eta::fit::coeffs::{self, Fitter};
 use crate::eta::fit::{fit_dir, path_for, rows, run};
 use crate::eta::fleet::{self, FleetSnapshot};
+use crate::eta::Stage;
 use crate::pr_latency::history::fixtures::{labeled, t, unlabeled};
 use crate::pr_latency::history::{PrEvent, PrHistory, PrState};
 use crate::pr_latency::{APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED};
@@ -242,6 +243,35 @@ fn the_outcome_of_a_pr_open_across_t_does_not_move_the_file() {
         fleet.replace(outcome);
         assert_eq!(bytes(&fleet.snapshots()), baseline, "{name}");
     }
+}
+
+/// A Judge rejection on #9001 (open across `T`) at `T + 30 min`, before its
+/// `T + 3 h` merge: a post-cutoff `doctor` episode must not count toward
+/// `rework` on its pre-cutoff rows (#10276 review).
+#[test]
+fn a_judge_rejection_after_t_does_not_count_toward_rework() {
+    let rejected = end() + Duration::minutes(30);
+    let mut fleet = Fleet::baseline();
+    fleet.replace(with_events(
+        &across(),
+        &[
+            unlabeled(APPROVED, secs(rejected)),
+            labeled(CHANGES_REQUESTED, secs(rejected)),
+        ],
+    ));
+    let doctor = |s: &[FleetSnapshot]| {
+        s[0].episodes
+            .iter()
+            .filter(|e| e.pr_number == 9001 && e.stage == Stage::Doctor)
+            .count()
+    };
+    let changed = fleet.snapshots();
+    assert_eq!(
+        doctor(&changed),
+        doctor(&Fleet::baseline().snapshots()) + 1,
+        "the perturbation took"
+    );
+    assert_eq!(bytes(&changed), baseline_bytes());
 }
 
 #[test]
