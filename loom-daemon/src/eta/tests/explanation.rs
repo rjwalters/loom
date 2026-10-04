@@ -5,7 +5,7 @@ use crate::eta::explanation::{
     Explanation, MAX_BYTES, TARGET_BYTES, TRUNCATED_DETAIL, TRUNCATED_FEATURES, TRUNCATED_GRIDS,
     TRUNCATED_STAGE_MARKS,
 };
-use crate::eta::heuristics::{FinishV1, LandV1};
+use crate::eta::heuristics::{FinishV1, LandV1, LandV2, LandV3};
 use crate::eta::simulate::{run_explanation, run_marks};
 use crate::eta::{Heuristic, Stage, EXPLANATION_SCHEMA};
 
@@ -23,13 +23,13 @@ fn explanation_recomputes_p50() {
         (Stage::MergeWait, 60, 0),
     ] {
         let explanation = LandV1.estimate(&input_at(stage, age, rework), &history_a());
-        let expected = explanation.quantiles().expect("fixture estimates");
+        let expected = explanation.quantiles_with_p90().expect("fixture estimates");
         // Only the serialized JSON crosses this line.
         let json = serde_json::to_string(&explanation).unwrap();
         let parsed: Explanation = serde_json::from_str(&json).unwrap();
         let recomputed = run_explanation(&parsed).expect("explanation is self-sufficient");
         assert_eq!(recomputed.1, expected.1, "p50 at {stage} age {age}");
-        assert_eq!(recomputed, expected, "all quartiles at {stage} age {age}");
+        assert_eq!(recomputed, expected, "all four quantiles at {stage} age {age}");
     }
 }
 
@@ -325,4 +325,42 @@ fn explanation_cap_holds_even_when_grids_are_not_enough() {
     assert_eq!(huge.estimate_id, golden.estimate_id);
     assert_eq!(huge.loom, golden.loom);
     assert_eq!(huge.quantiles(), golden.quantiles());
+}
+
+#[test]
+fn every_simulating_heuristic_records_an_ordered_recomputable_p90() {
+    // `start-v1` and the unstarted `land-v1` path are covered by
+    // `ready_explanations_recompute_from_their_own_json`.
+    let history = history_a();
+    for explanation in [
+        LandV1.estimate(&input_at(Stage::ReviewWait, 0, 0), &history),
+        LandV2.estimate(&input_at(Stage::ReviewWait, 0, 0), &history),
+        LandV3.estimate(&input_at(Stage::SweepCurator, 0, 0), &history),
+        FinishV1.estimate(&input_at(Stage::SweepBuilder, 0, 0), &history),
+    ] {
+        let id = explanation.heuristic.clone();
+        let (p25, p50, p75, p90) = explanation
+            .quantiles_with_p90()
+            .unwrap_or_else(|| panic!("{id} records p90"));
+        assert!(p25 <= p50 && p50 <= p75 && p75 <= p90, "{id}: {p25} {p50} {p75} {p90}");
+        let json = serde_json::to_string(&explanation).unwrap();
+        let parsed: Explanation = serde_json::from_str(&json).unwrap();
+        assert_eq!(run_explanation(&parsed), Some((p25, p50, p75, p90)), "{id} recomputes");
+    }
+}
+
+#[test]
+fn an_explanation_recorded_before_p90_still_parses() {
+    // The golden minus `result.p90_sec` is the pre-#10211 golden: the
+    // re-bless only added that one key.
+    let mut old: serde_json::Value = serde_json::from_str(EXPLANATION_GOLDEN).unwrap();
+    let removed = old["result"].as_object_mut().unwrap().remove("p90_sec");
+    assert!(removed.is_some(), "the golden records p90");
+    let parsed: Explanation = serde_json::from_value(old).unwrap();
+    assert_eq!(parsed.result.as_ref().unwrap().p90_sec, None);
+    assert_eq!(parsed.quantiles(), golden_explanation().quantiles());
+    assert_eq!(parsed.quantiles_with_p90(), None, "an absent p90 is never fabricated");
+    // It re-serializes in its old shape: no `"p90_sec": null`.
+    let json = serde_json::to_value(&parsed).unwrap();
+    assert!(json["result"].get("p90_sec").is_none());
 }

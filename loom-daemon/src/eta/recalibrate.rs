@@ -477,6 +477,7 @@ pub fn recalibrate(
             result.p25_sec = p25;
             result.p50_sec = p50;
             result.p75_sec = p75;
+            result.p90_sec = Some(p90);
             result.eta_p50_at = as_of + Duration::seconds(p50);
             record
         }

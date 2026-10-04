@@ -379,7 +379,7 @@ fn finish_estimate(
     let Ok(simulation) = run(&spec) else {
         return refuse(explanation, NoEstimateReason::InsufficientSamples);
     };
-    let (p25, p50, p75) = simulation.quantiles;
+    let (p25, p50, p75, p90) = simulation.quantiles;
     for entry in &mut explanation.stages {
         entry.reached_with_probability = Some(simulation.reached[entry.stage.index()]);
         entry.mean_visits = Some(simulation.mean_visits[entry.stage.index()]);
@@ -397,6 +397,7 @@ fn finish_estimate(
         p25_sec: p25,
         p50_sec: p50,
         p75_sec: p75,
+        p90_sec: Some(p90),
         eta_p50_at: as_of + Duration::seconds(p50),
         samples_min,
         stage_marks: simulation.stage_marks(as_of),

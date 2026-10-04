@@ -198,7 +198,7 @@ fn an_empty_table_returns_the_base_estimate_unchanged() {
     assert!(!serde_json::to_string(&plain)
         .unwrap()
         .contains("recalibration"));
-    assert_eq!(run_explanation(&plain), plain.quantiles());
+    assert_eq!(run_explanation(&plain), plain.quantiles_with_p90());
 }
 
 // ------------------------------------------------------- the transform
@@ -277,10 +277,11 @@ fn the_recalibrating_heuristic_is_registered_not_current_and_recomputes_exactly(
     assert_eq!(p50, record.base_p50_sec, "the median is kept");
     assert!(p25 <= p50 && p50 <= p75 && p75 <= record.p90_sec);
     // Explanation first: the result recomputes from the explanation alone.
-    assert_eq!(run_explanation(&estimate), estimate.quantiles());
+    assert_eq!(run_explanation(&estimate), estimate.quantiles_with_p90());
+    assert_eq!(estimate.quantiles_with_p90().unwrap().3, record.p90_sec);
     let parsed: crate::eta::Explanation =
         serde_json::from_str(&serde_json::to_string(&estimate).unwrap()).unwrap();
-    assert_eq!(run_explanation(&parsed), estimate.quantiles());
+    assert_eq!(run_explanation(&parsed), estimate.quantiles_with_p90());
     // Deterministic.
     let again = LandAmberHeron.estimate(&input, &history);
     assert_eq!(

@@ -28,6 +28,7 @@ fn summary(heuristic: &str, offset: i64, quartiles: (i64, i64, i64)) -> Estimate
         p25_sec: quartiles.0,
         p50_sec: quartiles.1,
         p75_sec: quartiles.2,
+        p90_sec: None,
         eta_p50_at: explanation.as_of + Duration::seconds(quartiles.1),
         samples_min: 9,
         stage_marks: Vec::new(),
