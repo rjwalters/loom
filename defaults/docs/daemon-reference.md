@@ -4635,8 +4635,11 @@ Precedence is env > config > default. The poll is REST
 (`gh api repos/{o}/{r}/issues?state=closed&since=...`), runs against the
 primary workspace, and persists a cursor (max `updated_at` seen) in
 `.loom/closed-watch-cursor.json`. The first run looks back 24h and a pass reads
-at most 5 pages of 100. The cursor advances only after a successful scan, so a
-failed tick retries; with nothing newly closed no `list_blocked` call is made.
+at most 5 pages of 100. The cursor advances only when every read answered (the
+listing, each merged PR's closing references, both enumerations, every
+candidate's body/evidence read) and every owed comment posted; otherwise the
+tick retries, and the marker keeps the retry from re-posting. With nothing
+newly closed no `list_blocked` call is made.
 It never edits labels, and failures are logged, never fatal. Two hosts polling
 one repo may both post in the check-then-post window; the duplicate is harmless
 and accepted. Source: `loom-daemon/src/cli/closed_watch.rs`.
