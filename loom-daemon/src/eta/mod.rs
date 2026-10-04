@@ -122,6 +122,7 @@ pub mod labels;
 pub mod offline;
 pub mod queue_features;
 pub mod recalibrate;
+pub mod recency;
 pub mod score;
 pub mod shadow;
 pub mod simulate;
@@ -635,6 +636,7 @@ impl Registry {
                 Box::new(heuristics::LandV2),
                 Box::new(heuristics::LandV3),
                 Box::new(heuristics::LandAmberHeron),
+                Box::new(heuristics::LandFreshTide::default()),
                 Box::new(heuristics::LandTwinOtter::new(fit.clone())),
                 Box::new(heuristics::LandTwinOtterB::new(fit.clone())),
             ],

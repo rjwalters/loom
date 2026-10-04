@@ -281,6 +281,30 @@ fn in_window(observed_at: DateTime<Utc>, as_of: DateTime<Utc>) -> bool {
     observed_at < as_of && observed_at >= window_from(as_of)
 }
 
+/// The [`Selection`] over `picked`, whose durations (ascending) are `sorted`.
+pub(super) fn selection_of(
+    level: Level,
+    sorted: Vec<i64>,
+    picked: &[&StageSample],
+    excluded_unworked: usize,
+) -> Selection {
+    let mut by_source = std::collections::BTreeMap::new();
+    let mut by_host = std::collections::BTreeMap::new();
+    for sample in picked {
+        *by_source
+            .entry(sample.source.journal().to_string())
+            .or_insert(0) += 1;
+        *by_host.entry(sample.host.clone()).or_insert(0) += 1;
+    }
+    Selection {
+        level,
+        sorted,
+        by_source,
+        by_host,
+        excluded_unworked,
+    }
+}
+
 fn same_repo(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
@@ -473,6 +497,26 @@ impl StageSamples {
         sources: &[SampleSource],
         min_samples: usize,
     ) -> Option<Selection> {
+        let (level, picked, excluded_unworked) =
+            self.pick_observed(repo, stage, as_of, sources, min_samples)?;
+        let mut sorted: Vec<i64> = picked.iter().map(|s| s.duration_sec).collect();
+        sorted.sort_unstable();
+        Some(selection_of(level, sorted, &picked, excluded_unworked))
+    }
+
+    /// The observed samples [`Self::select_at`] summarises, before they are
+    /// reduced to durations: the level they resolved at, the picked samples
+    /// (most recent first, capped at [`MAX_SAMPLES`]) and the unworked count.
+    /// Shared with the recency-weighted selection (#10209), which needs each
+    /// sample's `observed_at` to weigh it.
+    pub(super) fn pick_observed(
+        &self,
+        repo: &str,
+        stage: Stage,
+        as_of: DateTime<Utc>,
+        sources: &[SampleSource],
+        min_samples: usize,
+    ) -> Option<(Level, Vec<&StageSample>, usize)> {
         for level in [Level::Repo, Level::Host] {
             let in_scope = |s: &&StageSample| {
                 s.stage == stage
@@ -500,23 +544,7 @@ impl StageSamples {
                     .then(a.duration_sec.cmp(&b.duration_sec))
             });
             picked.truncate(MAX_SAMPLES);
-            let mut sorted: Vec<i64> = picked.iter().map(|s| s.duration_sec).collect();
-            sorted.sort_unstable();
-            let mut by_source = std::collections::BTreeMap::new();
-            let mut by_host = std::collections::BTreeMap::new();
-            for sample in &picked {
-                *by_source
-                    .entry(sample.source.journal().to_string())
-                    .or_insert(0) += 1;
-                *by_host.entry(sample.host.clone()).or_insert(0) += 1;
-            }
-            return Some(Selection {
-                level,
-                sorted,
-                by_source,
-                by_host,
-                excluded_unworked,
-            });
+            return Some((level, picked, excluded_unworked));
         }
         None
     }
@@ -541,6 +569,22 @@ impl StageSamples {
         sources: &[SampleSource],
         level: Level,
     ) -> Vec<i64> {
+        let picked = self.pick_censored(repo, stage, as_of, sources, level);
+        let mut sorted: Vec<i64> = picked.iter().map(|s| s.duration_sec).collect();
+        sorted.sort_unstable();
+        sorted
+    }
+
+    /// The censored samples [`Self::select_censored`] summarises, most recent
+    /// first and capped, before they are reduced to durations.
+    pub(super) fn pick_censored(
+        &self,
+        repo: &str,
+        stage: Stage,
+        as_of: DateTime<Utc>,
+        sources: &[SampleSource],
+        level: Level,
+    ) -> Vec<&StageSample> {
         let mut picked: Vec<&StageSample> = self
             .censored
             .iter()
@@ -560,9 +604,7 @@ impl StageSamples {
                 .then(a.duration_sec.cmp(&b.duration_sec))
         });
         picked.truncate(MAX_SAMPLES);
-        let mut sorted: Vec<i64> = picked.iter().map(|s| s.duration_sec).collect();
-        sorted.sort_unstable();
-        sorted
+        picked
     }
 
     /// The stage episodes (#10218) of `stage` for `repo`, as a derivation cut

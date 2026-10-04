@@ -1,14 +1,17 @@
 //! The shipped heuristics. `start-v1`, `finish-v1`, `land-v1`, `land-v2`,
-//! `land-v3` and `land-2026-10-04-amber-heron` share one engine
-//! ([`estimate_path`]); they differ in which history they read, where the
-//! path ends, (`land-v3`) how each stage's grid is calibrated, and
-//! (`land-2026-10-04-amber-heron`) how the result's interval is recalibrated.
+//! `land-v3`, `land-2026-10-04-amber-heron` and `land-2026-10-04-fresh-tide`
+//! share one engine ([`estimate_path`]); they differ in which history they
+//! read, where the path ends, (`land-v3`) how each stage's grid is
+//! calibrated, (`land-2026-10-04-amber-heron`) how the result's interval is
+//! recalibrated, and (`land-2026-10-04-fresh-tide`) how samples are weighted
+//! by recency.
 //! `land-2026-10-04-twin-otter` (#10243) reads no history: it evaluates a
 //! fitted coefficient file handed to it when the registry was built.
 //! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
 mod land_amber_heron;
+mod land_fresh_tide;
 mod land_twin_otter;
 mod land_twin_otter_b;
 mod land_v1;
@@ -18,6 +21,7 @@ mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
 pub use land_amber_heron::{LandAmberHeron, CALIBRATION_BASE, LAND_AMBER_HERON};
+pub use land_fresh_tide::{LandFreshTide, LAND_FRESH_TIDE};
 pub(crate) use land_twin_otter::recompute as recompute_twin_otter;
 pub use land_twin_otter::{
     adapt_input, visit_entry, visit_seed, LandTwinOtter, DRAW_ORDER, LAND_TWIN_OTTER, METHOD,
@@ -36,7 +40,8 @@ use super::explanation::{
     Distribution, EstimateResult, Explanation, Filters, HistoryRecord, HistoryWindow, PathRecord,
     StageAdjustment, StageEntry,
 };
-use super::history::{window_from, Level, SampleSource, StageSamples};
+use super::history::{window_from, Level, SampleSource, Selection, StageSamples};
+use super::recency::WeightedSelection;
 use super::simulate::{may_reject, reachable_path, run, spec_from_explanation};
 use super::{
     estimate_id, grid, round3, seed_for, CurrentState, EstimateInput, Kind, NoEstimateReason,
@@ -75,6 +80,11 @@ pub(crate) struct PathRules {
     /// refuses it as `blocked` before any field is written, so the explanation is
     /// byte-identical to its refusal of a held PR before the stage existed.
     pub models_hold: bool,
+    /// A recency-weighting heuristic's base half-life, seconds (#10209):
+    /// each stage's samples are weighted `exp(−age / half_life)` with the
+    /// effective-N fallback ([`crate::eta::recency`]) and summarised by the
+    /// weighted grid. `None` for every heuristic that weighs the window flat.
+    pub half_life_sec: Option<i64>,
 }
 
 /// `(stage, input, raw grid) → (grid, what was done)`. Must be pure.
@@ -319,7 +329,8 @@ fn finish_estimate(
     let stop_at_dispatch = rules.kind == Kind::Start;
 
     for stage in reachable_path(start, include_merge, rejectable, stop_at_dispatch) {
-        let Some(selection) = history.select(repo, stage, as_of, rules.sources) else {
+        let stage_samples = select_stage(history, rules, repo, stage, as_of);
+        let Some((selection, weighted)) = stage_samples else {
             return refuse(explanation, NoEstimateReason::InsufficientSamples);
         };
         if let Some(record) = &mut explanation.history {
@@ -334,15 +345,27 @@ fn finish_estimate(
         // #9328: a censoring heuristic also reads the stage's right-censored
         // lower bounds, at the level the observed selection resolved to, and
         // summarises the pair by Kaplan–Meier. Every other heuristic passes an
-        // empty slice, for which `km_grid_of` is exactly `grid_of`.
-        let censored = if rules.censoring {
-            history.select_censored(repo, stage, as_of, rules.sources, selection.level)
-        } else {
-            Vec::new()
+        // empty slice, for which `km_grid_of` is exactly `grid_of`. #10209: a
+        // recency-weighting heuristic summarises its weighted samples instead.
+        let (censored, raw_grid, recency) = match weighted {
+            Some(w) => {
+                let censored: Vec<i64> = w.censored.iter().map(|c| c.0).collect();
+                let raw = grid::weighted_grid_of(&w.observed, &w.censored);
+                (censored, raw, Some((w.half_life_sec, w.effective_n)))
+            }
+            None => {
+                let censored = if rules.censoring {
+                    history.select_censored(repo, stage, as_of, rules.sources, selection.level)
+                } else {
+                    Vec::new()
+                };
+                let raw = grid::km_grid_of(sorted, &censored);
+                (censored, raw, None)
+            }
         };
         let (grid_sec, adjustment) = match rules.adjust {
-            Some(adjust) => adjust(stage, input, grid::km_grid_of(sorted, &censored)),
-            None => (grid::km_grid_of(sorted, &censored), None),
+            Some(adjust) => adjust(stage, input, raw_grid),
+            None => (raw_grid, None),
         };
         // A queue wait is never age-conditioned (see `simulate`).
         let conditioning = if stage == start && age > 0 && stage != Stage::ReadyWait {
@@ -367,6 +390,7 @@ fn finish_estimate(
                     &censored,
                     grid_sec,
                     adjustment,
+                    recency,
                     Some(record),
                 ));
                 return refuse(explanation, NoEstimateReason::BeyondHistory);
@@ -384,6 +408,7 @@ fn finish_estimate(
             &censored,
             grid_sec,
             adjustment,
+            recency,
             conditioning,
         ));
     }
@@ -438,6 +463,25 @@ fn finish_estimate(
     explanation
 }
 
+/// One stage's samples: the flat selection, plus — for a recency-weighting
+/// heuristic (#10209) — the weighted samples over the same population.
+fn select_stage(
+    history: &StageSamples,
+    rules: PathRules,
+    repo: &str,
+    stage: Stage,
+    as_of: chrono::DateTime<chrono::Utc>,
+) -> Option<(Selection, Option<WeightedSelection>)> {
+    match rules.half_life_sec {
+        None => history
+            .select(repo, stage, as_of, rules.sources)
+            .map(|s| (s, None)),
+        Some(half_life) => history
+            .select_weighted(repo, stage, as_of, rules.sources, half_life, rules.censoring)
+            .map(|w| (w.selection.clone(), Some(w))),
+    }
+}
+
 /// The grid index of percentile `pct` (`grid_pct()` is `0, 5, …, 100`).
 fn at_pct(grid_sec: &[i64], pct: usize) -> i64 {
     grid_sec
@@ -456,6 +500,7 @@ fn stage_entry(
     censored: &[i64],
     grid_sec: Vec<i64>,
     adjustment: Option<StageAdjustment>,
+    recency: Option<(Option<i64>, f64)>,
     conditioning: Option<Conditioning>,
 ) -> StageEntry {
     // The quartiles are read off the same grid the simulation draws from, so
@@ -490,6 +535,8 @@ fn stage_entry(
             p75,
             p90,
             adjustment,
+            half_life_sec: recency.and_then(|(h, _)| h),
+            effective_n: recency.map(|(_, e)| e),
         },
         conditioning,
         reached_with_probability: None,
