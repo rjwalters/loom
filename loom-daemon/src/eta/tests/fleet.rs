@@ -616,6 +616,9 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ),
     // #10207: the recalibration fit and transform the heuristic calls.
     ("recalibrate.rs", include_str!("../recalibrate.rs")),
+    ("twin_otter/mod.rs", include_str!("../twin_otter/mod.rs")),
+    ("twin_otter/eval.rs", include_str!("../twin_otter/eval.rs")),
+    ("twin_otter/path.rs", include_str!("../twin_otter/path.rs")),
 ];
 
 /// The whole point of #9343's "the estimator stays pure over a snapshot": a
