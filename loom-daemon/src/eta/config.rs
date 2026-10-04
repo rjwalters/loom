@@ -119,6 +119,8 @@ pub struct FleetRefreshConfig {
     pub reserve_calls: u64,
     /// How far back a backfill reaches, in days.
     pub backfill_days: i64,
+    /// The SigNoz in-sweep half (#9758), refreshed on the same cadence.
+    pub signoz: FleetSignozConfig,
 }
 
 impl Default for FleetRefreshConfig {
@@ -130,6 +132,51 @@ impl Default for FleetRefreshConfig {
             backfill_max_calls_per_cycle: DEFAULT_FLEET_REFRESH_BACKFILL_MAX_CALLS,
             reserve_calls: DEFAULT_FLEET_REFRESH_RESERVE,
             backfill_days: DEFAULT_FLEET_REFRESH_BACKFILL_DAYS,
+            signoz: FleetSignozConfig::default(),
+        }
+    }
+}
+
+/// Default rows per SigNoz page.
+pub const DEFAULT_FLEET_SIGNOZ_PAGE_SIZE: u32 = 500;
+
+/// Default page ceiling per repo per cycle. A fetch that reaches it is not
+/// published: a snapshot is all of the window or nothing.
+pub const DEFAULT_FLEET_SIGNOZ_MAX_PAGES: u32 = 200;
+
+/// `autonomous.eta.fleetRefresh.signoz` (#9758): where the refresh task reads
+/// the fleet's `sweep.outcome` records back from.
+///
+/// **Off by default.** It needs an endpoint and, usually, a credential that
+/// only an operator can provision; with it off nothing is read and no SigNoz
+/// snapshot is written, so every estimate is exactly what it was before.
+/// `credentialFile` is a **path** to an owner-only file outside every
+/// repository (`credential-storage.md`), never the secret itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetSignozConfig {
+    /// Refresh SigNoz snapshots at all.
+    pub enabled: bool,
+    /// The telemetry store's ClickHouse HTTP endpoint (`http(s)://host:port`).
+    pub endpoint: Option<String>,
+    /// The ClickHouse user, when the endpoint requires one.
+    pub user: Option<String>,
+    /// Owner-only file holding that user's password.
+    pub credential_file: Option<std::path::PathBuf>,
+    /// Rows per page.
+    pub page_size: u32,
+    /// Pages per repo per cycle.
+    pub max_pages: u32,
+}
+
+impl Default for FleetSignozConfig {
+    fn default() -> Self {
+        FleetSignozConfig {
+            enabled: false,
+            endpoint: None,
+            user: None,
+            credential_file: None,
+            page_size: DEFAULT_FLEET_SIGNOZ_PAGE_SIZE,
+            max_pages: DEFAULT_FLEET_SIGNOZ_MAX_PAGES,
         }
     }
 }
@@ -300,6 +347,55 @@ fn resolve_fleet_refresh(
     }
     c.interval_secs = c.interval_secs.max(MIN_FLEET_REFRESH_INTERVAL_SECS);
     c.backfill_days = c.backfill_days.max(MIN_FLEET_REFRESH_BACKFILL_DAYS);
+    c.signoz = resolve_fleet_signoz(get("signoz"), env);
+    c
+}
+
+/// `autonomous.eta.fleetRefresh.signoz`, env > config > default (#9758).
+fn resolve_fleet_signoz(
+    block: Option<&serde_json::Value>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> FleetSignozConfig {
+    let get = |key: &str| block.and_then(|b| b.get(key));
+    let text = |key: &str, var: &str| {
+        env(var)
+            .or_else(|| {
+                get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let count = |key: &str, var: &str, default: u32| {
+        env(var)
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .or_else(|| {
+                get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+            })
+            .filter(|v| *v > 0)
+            .unwrap_or(default)
+    };
+    let mut c = FleetSignozConfig::default();
+    if let Some(v) = get("enabled").and_then(serde_json::Value::as_bool) {
+        c.enabled = v;
+    }
+    if let Some(v) = env("LOOM_ETA_FLEET_SIGNOZ_ENABLED")
+        .as_deref()
+        .and_then(parse_bool)
+    {
+        c.enabled = v;
+    }
+    c.endpoint = text("endpoint", "LOOM_ETA_FLEET_SIGNOZ_ENDPOINT");
+    c.user = text("user", "LOOM_ETA_FLEET_SIGNOZ_USER");
+    c.credential_file =
+        text("credentialFile", "LOOM_ETA_FLEET_SIGNOZ_CREDENTIAL_FILE").map(Into::into);
+    c.page_size =
+        count("pageSize", "LOOM_ETA_FLEET_SIGNOZ_PAGE_SIZE", DEFAULT_FLEET_SIGNOZ_PAGE_SIZE);
+    c.max_pages =
+        count("maxPages", "LOOM_ETA_FLEET_SIGNOZ_MAX_PAGES", DEFAULT_FLEET_SIGNOZ_MAX_PAGES);
     c
 }
 

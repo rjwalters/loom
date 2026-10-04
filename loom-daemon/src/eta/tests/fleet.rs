@@ -62,7 +62,7 @@ fn fleet_prs() -> Vec<PrHistory> {
 }
 
 /// A snapshot over [`fleet_prs`], as of the fixture estimate instant.
-fn fleet_snapshot() -> FleetSnapshot {
+pub(super) fn fleet_snapshot() -> FleetSnapshot {
     let mut snapshot = FleetSnapshot::empty(REPO);
     snapshot.merge(&fleet_prs(), as_of());
     snapshot
@@ -70,7 +70,7 @@ fn fleet_snapshot() -> FleetSnapshot {
 
 /// A `land-v1` input sitting in `review_wait` with no age, so nothing is
 /// age-conditioned and the estimate depends on history alone.
-fn input() -> EstimateInput {
+pub(super) fn input() -> EstimateInput {
     EstimateInput {
         subject: subject(),
         as_of: as_of(),
@@ -113,7 +113,7 @@ fn thin_local_history(host: &str, n: usize) -> StageSamples {
     history
 }
 
-fn write_snapshot(root: &Path, snapshot: &FleetSnapshot) -> std::path::PathBuf {
+pub(super) fn write_snapshot(root: &Path, snapshot: &FleetSnapshot) -> std::path::PathBuf {
     let path = fleet::snapshot_path(root, &snapshot.repo);
     fleet::write(&path, snapshot).expect("cache write");
     path
@@ -295,7 +295,7 @@ fn augmenting_a_local_history_reports_fleet_scope_and_both_attributions() {
 
 /// Serialize the way a comparison between two hosts would: whole explanation,
 /// canonical JSON, no field skipped.
-fn bytes(explanation: &Explanation) -> Vec<u8> {
+pub(super) fn bytes(explanation: &Explanation) -> Vec<u8> {
     serde_json::to_vec(explanation).expect("an explanation serializes")
 }
 

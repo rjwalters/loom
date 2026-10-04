@@ -94,8 +94,50 @@ fn fleet_refresh_is_on_by_default_with_the_pinned_budgets() {
             backfill_max_calls_per_cycle: 1500,
             reserve_calls: 1500,
             backfill_days: 21,
+            signoz: crate::eta::config::FleetSignozConfig::default(),
         }
     );
+}
+
+// -- autonomous.eta.fleetRefresh.signoz (#9758) ----------------------------
+
+#[test]
+fn the_signoz_half_is_off_by_default_with_no_endpoint_or_credential() {
+    let c = resolve(&json!({}), no_env).fleet_refresh.signoz;
+    assert!(!c.enabled);
+    assert_eq!(c.endpoint, None);
+    assert_eq!(c.user, None);
+    assert_eq!(c.credential_file, None);
+    assert_eq!(c.page_size, 500);
+    assert_eq!(c.max_pages, 200);
+}
+
+#[test]
+fn the_signoz_half_follows_env_then_config_then_default() {
+    let file = json!({"autonomous": {"eta": {"fleetRefresh": {"signoz": {
+        "enabled": true, "endpoint": "https://ch.example:8443", "user": "reader",
+        "credentialFile": "/home/op/.loom/observability/signoz-read.key",
+        "pageSize": 100, "maxPages": 0
+    }}}}});
+    let c = resolve(&file, no_env).fleet_refresh.signoz;
+    assert!(c.enabled);
+    assert_eq!(c.endpoint.as_deref(), Some("https://ch.example:8443"));
+    assert_eq!(c.user.as_deref(), Some("reader"));
+    assert_eq!(
+        c.credential_file.as_deref(),
+        Some(std::path::Path::new("/home/op/.loom/observability/signoz-read.key"))
+    );
+    assert_eq!(c.page_size, 100);
+    // Zero is not a usable ceiling: it falls back to the default.
+    assert_eq!(c.max_pages, 200);
+    let env = |key: &str| match key {
+        "LOOM_ETA_FLEET_SIGNOZ_ENABLED" => Some("off".to_string()),
+        "LOOM_ETA_FLEET_SIGNOZ_ENDPOINT" => Some("http://127.0.0.1:8123".to_string()),
+        _ => None,
+    };
+    let c = resolve(&file, env).fleet_refresh.signoz;
+    assert!(!c.enabled);
+    assert_eq!(c.endpoint.as_deref(), Some("http://127.0.0.1:8123"));
 }
 
 #[test]

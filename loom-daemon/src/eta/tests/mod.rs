@@ -16,6 +16,7 @@ mod fit_rows;
 mod flag_timeline;
 mod fleet;
 mod fleet_refresh;
+mod fleet_signoz;
 mod friction;
 mod hold_parity;
 mod hold_serving;

@@ -41,6 +41,10 @@
 //!    standalone refit task is not spawned ([`owns_fit`]).
 //! 6. **Telemetry**: one `eta.fleet_refresh` record per repo, and one `info`
 //!    line with the stop-reason counts and the calls spent.
+//! 7. **SigNoz in-sweep half** (#9758, `fleetRefresh.signoz.enabled`, default
+//!    off): each repo's fleet `sweep.outcome` records are re-read from the
+//!    telemetry store into its SigNoz snapshot ([`signoz_cycle`]); a failed
+//!    walk keeps the last valid snapshot and logs why.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -200,8 +204,44 @@ fn run_production_cycle(
             sink.offer(TelemetryEnvelope::new(host_id, TelemetryRecord::EtaFleetRefresh(record)));
         }
     }
+    // #9758: the SigNoz in-sweep half, same cadence, its own backend. Before
+    // the fit only by position; the fit reads forge snapshots alone.
+    if config.signoz.enabled {
+        let repos: Vec<String> = targets.iter().map(|t| t.repo.clone()).collect();
+        signoz_cycle(root, &repos, &config.signoz, Utc::now());
+    }
     // After the records: a fit that panics must not cost the cycle's telemetry.
     after_cycle(root, Utc::now(), outcome.fit_held, fit_enabled, fitter);
+}
+
+/// Refresh every repo's SigNoz in-sweep snapshot (#9758) through the
+/// configured ClickHouse endpoint. A missing endpoint is a warning and a
+/// no-op: nothing is fetched and every published snapshot stays as it is.
+pub fn signoz_cycle(
+    root: &Path,
+    repos: &[String],
+    config: &crate::eta::config::FleetSignozConfig,
+    now: DateTime<Utc>,
+) -> Vec<crate::eta::fleet_signoz_refresh::FetchReport> {
+    use crate::eta::fleet_signoz_refresh::{run_cycle, ClickhouseHttp, Limits};
+    let Some(endpoint) = config.endpoint.clone() else {
+        log::warn!(
+            "eta fleet signoz: enabled but no endpoint configured \
+             (autonomous.eta.fleetRefresh.signoz.endpoint); skipped"
+        );
+        return Vec::new();
+    };
+    let mut reader = ClickhouseHttp {
+        endpoint,
+        user: config.user.clone(),
+        credential_file: config.credential_file.clone(),
+        timeout: Duration::from_secs(60),
+    };
+    let limits = Limits {
+        page_size: config.page_size,
+        max_pages: config.max_pages,
+    };
+    run_cycle(root, repos, &mut reader, now, limits)
 }
 
 /// The repo set, deduplicated by lowercase slug: provisioned roots first (so a

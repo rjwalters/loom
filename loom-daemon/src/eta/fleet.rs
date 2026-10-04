@@ -69,15 +69,14 @@
 //! at each past instant. Same compatibility rules as the episodes: not written
 //! when empty, so an older file keeps its id; rebuilt by `eta fleet backfill`.
 //!
-//! # Deliberately out of scope
+//! # The in-sweep half (#9758)
 //!
-//! Fleet-wide **in-sweep** samples (`sweep.curator`, `sweep.builder`) would
-//! have to come from the fleet's `sweep.outcome` records in SigNoz, which is
-//! blocked on fleet workers exporting at all (harness-ops#249). A forge
-//! timeline cannot see inside a sweep, so a fleet-only history supports `land`
-//! (whose path is `review_wait` → `doctor` → `merge_wait`) and refuses
-//! `finish` for want of phase samples — correctly, as a refusal rather than a
-//! guess.
+//! A forge timeline cannot see inside a sweep, so this snapshot alone supports
+//! `land` and refuses `finish` for want of phase samples. Fleet-wide
+//! **in-sweep** samples come from the fleet's `sweep.outcome` records in
+//! SigNoz, cached per repo by [`super::fleet_signoz`] beside these files.
+//! [`load_history`] folds both kinds of snapshot into the fleet history, so
+//! with both cached `historyScope = fleet` answers every kind.
 
 use super::config::HistoryScopeMode;
 use super::episodes::{derive, input_from_pr_history, StageEpisode};
@@ -644,16 +643,28 @@ pub fn load_all(workspace_root: &Path) -> Vec<FleetSnapshot> {
     paths.iter().filter_map(|p| read(p)).collect()
 }
 
-/// Every cached snapshot under `workspace_root` as one [`StageSamples`], or
-/// `None` when there is no snapshot at all.
+/// Every cached snapshot under `workspace_root` — forge-derived and, since
+/// #9758, SigNoz-derived — as one [`StageSamples`], or `None` when there is no
+/// snapshot of either kind.
 ///
 /// `None` rather than an empty fleet history on purpose: "no snapshot" and "a
 /// snapshot with nothing in it" are different answers, and only the first
 /// should fall back to the local view.
 #[must_use]
 pub fn load_history(workspace_root: &Path) -> Option<StageSamples> {
+    load_history_excluding(workspace_root, &BTreeSet::new())
+}
+
+/// [`load_history`], with every SigNoz outcome whose `(host, sweep_id)` is in
+/// `exclude` left out (#9758): the sweeps the caller already holds from its
+/// own journal.
+fn load_history_excluding(
+    workspace_root: &Path,
+    exclude: &BTreeSet<(String, String)>,
+) -> Option<StageSamples> {
     let snapshots = load_all(workspace_root);
-    if snapshots.is_empty() {
+    let in_sweep = super::fleet_signoz::load_all(workspace_root);
+    if snapshots.is_empty() && in_sweep.is_empty() {
         return None;
     }
     let mut history = StageSamples {
@@ -662,6 +673,9 @@ pub fn load_history(workspace_root: &Path) -> Option<StageSamples> {
     };
     for snapshot in &snapshots {
         history.merge(snapshot.stage_samples());
+    }
+    for snapshot in &in_sweep {
+        history.merge(snapshot.stage_samples(exclude));
     }
     Some(history)
 }
@@ -672,7 +686,9 @@ pub fn load_history(workspace_root: &Path) -> Option<StageSamples> {
 ///
 /// - [`HistoryScopeMode::Local`] — `local` unchanged (`scope = local`).
 /// - [`HistoryScopeMode::Augment`] — `local` **plus** every cached snapshot
-///   (`scope = fleet` once one exists, `local` when none does).
+///   (`scope = fleet` once one exists, `local` when none does). A sweep in
+///   both this host's journal and a SigNoz snapshot counts once, from the
+///   journal (#9758).
 /// - [`HistoryScopeMode::Fleet`] — the snapshots alone, so the estimate is a
 ///   pure function of a named snapshot; `local` when there is no snapshot,
 ///   because a missing cache is not evidence of an empty history.
@@ -684,14 +700,16 @@ pub fn apply_scope(
 ) -> StageSamples {
     match mode {
         HistoryScopeMode::Local => local,
-        HistoryScopeMode::Augment => match load_history(workspace_root) {
-            Some(fleet) => {
-                let mut merged = local;
-                merged.merge(fleet);
-                merged
+        HistoryScopeMode::Augment => {
+            match load_history_excluding(workspace_root, &local.outcome_keys) {
+                Some(fleet) => {
+                    let mut merged = local;
+                    merged.merge(fleet);
+                    merged
+                }
+                None => local,
             }
-            None => local,
-        },
+        }
         HistoryScopeMode::Fleet => load_history(workspace_root).unwrap_or(local),
     }
 }

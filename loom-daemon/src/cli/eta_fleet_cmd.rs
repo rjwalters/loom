@@ -79,11 +79,18 @@ pub(crate) enum FleetCommand {
     /// Score `fleet_state(as_of)` against logged `eta.estimate` features
     /// (#10197): `eta fleet agreement --estimates export.jsonl`.
     Agreement(super::eta_fleet_events_cmd::AgreementArgs),
+    /// The SigNoz in-sweep half of fleet history (#9758):
+    /// `eta fleet signoz refresh|show|query`.
+    Signoz {
+        #[command(subcommand)]
+        command: super::eta_fleet_signoz_cmd::SignozCommand,
+    },
 }
 
 impl FleetCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
+            FleetCommand::Signoz { command } => command.run(),
             FleetCommand::Backfill(args) => args.run(false),
             FleetCommand::Refresh(args) => args.run(true),
             FleetCommand::Show(args) => args.run(),
