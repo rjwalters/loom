@@ -53,10 +53,10 @@ fn print_findings(findings: &[Finding], indent: &str) {
     for f in findings {
         let j = f.to_json();
         let field = |k: &str| j[k].as_str().unwrap_or("").to_string();
-        let mark = if f.severity == Severity::Finding {
-            "FINDING   "
-        } else {
-            "INCOMPLETE"
+        let mark = match f.severity {
+            Severity::Notice => "NOTICE    ",
+            Severity::Finding => "FINDING   ",
+            Severity::Incomplete => "INCOMPLETE",
         };
         println!("{indent}{mark} {}", f.code);
         println!("{indent}  invariant: {}", f.invariant);
@@ -93,10 +93,21 @@ pub(crate) fn post_install_doctor(workspace: &std::path::Path) -> Result<()> {
 }
 
 fn post_install_verdict(report: &forge_egress::Report) -> Result<()> {
-    if !report.is_configured() {
-        return Ok(());
-    }
     let code = report.exit_code();
+    if !report.is_configured() {
+        if report.routing.is_empty() {
+            return Ok(());
+        }
+        println!("\nForge egress (loom-daemon forge egress doctor): no policy resolves");
+        print_findings(&report.routing, "  ");
+        if code == 0 {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "forge egress policy is unconfigured on a host declared managed (exit {code}): [{}]",
+            report.routing_codes().join(", ")
+        );
+    }
     println!("\nForge egress (loom-daemon forge egress doctor): routing {}", verdict(code));
     print_findings(&report.routing, "  ");
     if code == 0 || report.observe_only() {
@@ -157,7 +168,7 @@ pub(crate) fn handle(action: EgressAction) -> Result<()> {
                         }
                     );
                 }
-                if report.is_configured() {
+                if report.is_configured() || !report.routing.is_empty() {
                     for s in Section::ALL {
                         let findings = report.section(s);
                         println!(
