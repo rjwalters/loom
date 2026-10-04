@@ -120,24 +120,17 @@ fn read_issue_state_and_labels(
     root: &Path,
     issue: u32,
 ) -> Option<(String, Vec<String>)> {
-    let mut cmd = std::process::Command::new(gh_bin);
-    cmd.args([
-        "issue",
-        "view",
-        &issue.to_string(),
-        "--json",
-        "state,labels",
-    ])
-    .current_dir(root)
-    .stdin(std::process::Stdio::null());
-    // #5401: cross-owner managed repo -> its own owner's installation-token
-    // GH_CONFIG_DIR (the same treatment every sibling gh call here gets).
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    let output = cmd.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let n = issue.to_string();
+    let stdout = crate::claim_reconciliation::gh_call::ok_stdout(
+        crate::claim_reconciliation::gh_call::read("heal.issue_view", gh_bin, root).args([
+            "issue",
+            "view",
+            &n,
+            "--json",
+            "state,labels",
+        ]),
+    )?;
+    let value: serde_json::Value = serde_json::from_slice(&stdout).ok()?;
     let state = value.get("state")?.as_str()?.to_string();
     let labels = value
         .get("labels")?
@@ -150,20 +143,17 @@ fn read_issue_state_and_labels(
 
 /// Apply the `loom:building` label; `true` when `gh` exited 0.
 fn apply_building_label(gh_bin: &Path, root: &Path, issue: u32) -> bool {
-    let mut cmd = std::process::Command::new(gh_bin);
-    cmd.args([
-        "issue",
-        "edit",
-        &issue.to_string(),
-        "--add-label",
-        "loom:building",
-    ])
-    .current_dir(root)
-    .stdin(std::process::Stdio::null());
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    cmd.output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+    let n = issue.to_string();
+    crate::claim_reconciliation::gh_call::ok_stdout(
+        crate::claim_reconciliation::gh_call::write("heal.issue_add_label", gh_bin, root).args([
+            "issue",
+            "edit",
+            &n,
+            "--add-label",
+            "loom:building",
+        ]),
+    )
+    .is_some()
 }
 
 #[cfg(test)]

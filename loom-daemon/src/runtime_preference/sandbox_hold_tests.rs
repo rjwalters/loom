@@ -5,10 +5,16 @@
 use super::*;
 use std::fs;
 
-/// The second field only keeps the profile root alive for the guard's scope.
-struct Env(Vec<(&'static str, Option<String>)>, #[allow(dead_code)] tempfile::TempDir);
+/// The second field only keeps the profile root alive for the guard's scope;
+/// the third holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964).
+struct Env(
+    Vec<(&'static str, Option<String>)>,
+    #[allow(dead_code)] tempfile::TempDir,
+    #[allow(dead_code)] crate::tokens_pool::profile_root_env::ProfileRootLock,
+);
 impl Env {
     fn new() -> Self {
+        let lock = crate::tokens_pool::profile_root_env::lock();
         let keys = [
             "LOOM_RUNTIME",
             "LOOM_RUNTIME_CURATOR",
@@ -29,7 +35,7 @@ impl Env {
         fs::create_dir_all(profiles.path().join("seat")).unwrap();
         std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
         sandbox_hold::clear("codex");
-        Self(prior, profiles)
+        Self(prior, profiles, lock)
     }
 }
 impl Drop for Env {

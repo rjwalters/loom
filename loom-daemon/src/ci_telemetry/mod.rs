@@ -68,6 +68,7 @@
 
 pub mod api;
 pub mod artifact_spans;
+pub mod billing;
 pub mod export;
 pub mod feed;
 pub mod journal;

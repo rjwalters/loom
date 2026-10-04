@@ -712,7 +712,13 @@ async fn spawn_task_fully_configured_spawns_three_tasks() {
     // Issue #8760: `daemon_event::spawn_task` adds a third handle alongside
     // `collector`'s and the sender's.
     // Issue #9289: the ETA tracker's bus subscriber (on by default) adds one.
-    assert_eq!(handles.len(), 4, "collector + daemon_event collector + eta + sender");
+    // Issue #10245/#10263: the daily refit, run by the fleet snapshot refresh
+    // task (both on by default; either/or, so one handle) adds one.
+    assert_eq!(
+        handles.len(),
+        5,
+        "collector + daemon_event collector + eta + sender + eta fleet refresh owning the refit (#10263)"
+    );
     for handle in handles {
         handle.abort();
     }
@@ -745,7 +751,13 @@ async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
     // `collector`'s and one sender per exporter.
     // Issue #8929: the OTLP ops sink adds the slot-turnaround subscriber.
     // Issue #9289: the ETA tracker's bus subscriber (on by default).
-    assert_eq!(handles.len(), 6, "collector + daemon_event + eta + turnaround + two senders");
+    // Issue #10245/#10263: the fleet refresh task, which owns the daily refit
+    // (either/or with the standalone refit task, so one handle).
+    assert_eq!(
+        handles.len(),
+        7,
+        "collector + daemon_event + eta + turnaround + two senders + eta fleet refresh owning the refit (#10263)"
+    );
     let statuses = global_export_statuses();
     assert_eq!(
         statuses.keys().collect::<Vec<_>>(),
@@ -783,8 +795,8 @@ async fn spawn_task_two_exporters_isolate_the_unbuildable_kind() {
     // Issue #8760: `daemon_event::spawn_task` adds one more handle.
     assert_eq!(
         handles.len(),
-        4,
-        "collector + daemon_event + eta (#9289) + only the https sender"
+        5,
+        "collector + daemon_event + eta (#9289) + only the https sender + eta fleet refresh owning the refit (#10263)"
     );
     let statuses = global_export_statuses();
     assert_eq!(
@@ -897,8 +909,8 @@ async fn spawn_task_otlp_exporter_spawns_three_tasks() {
     let handles = handles.expect("fully configured otlp exporter ⇒ spawn_task must return Some");
     assert_eq!(
         handles.len(),
-        5,
-        "collector + daemon_event + eta (#9289) + turnaround (#8929) + sender"
+        6,
+        "collector + daemon_event + eta (#9289) + turnaround (#8929) + sender + eta fleet refresh owning the refit (#10263)"
     );
     for handle in handles {
         handle.abort();

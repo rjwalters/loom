@@ -64,7 +64,6 @@ use super::workflow_scope::{self, CiScope, Workflow};
 use super::CheckRun;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
-use std::process::Command;
 
 use crate::gh_invocation::gh_bin;
 
@@ -72,11 +71,22 @@ use crate::gh_invocation::gh_bin;
 /// the binary — a plain argument so a caller's tests can inject a stub without
 /// a process-global `LOOM_GH_BIN` (which races across parallel test threads).
 fn gh_api(gh: &str, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(gh)
-        .arg("api")
-        .args(args)
-        .output()
-        .map_err(|e| format!("could not exec gh api: {e}"))?;
+    let out = crate::gh_invocation::GhInvocation::new(
+        crate::gh_invocation::Operation::new("merge_guard.stale_checks"),
+        crate::gh_invocation::AccessIntent::Read,
+        crate::gh_invocation::GhTarget::None,
+        std::time::Duration::from_secs(60),
+    )
+    .program(gh)
+    .arg("api")
+    .args(args)
+    .run();
+    let out = match out {
+        crate::cmd_out::CmdOutcome::Ran(o) => o,
+        crate::cmd_out::CmdOutcome::Unavailable(u) => {
+            return Err(format!("could not exec gh api: {u}"));
+        }
+    };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let trimmed = stderr.trim();

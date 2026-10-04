@@ -17,7 +17,7 @@
 //! - **Order.** The rows are not in dispatch order, so their `rank` is `0`.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::forge_listing::RestIssue;
 use crate::telemetry::queue_snapshot::{QueueRepoRef, QueueSnapshotRow, MAX_ROWS};
@@ -147,7 +147,8 @@ pub(super) async fn list_open(
 ) -> Option<Vec<RestIssue>> {
     let shown = root.display().to_string();
     let result = tokio::task::spawn_blocking(move || {
-        let gh = Path::new("gh");
+        let gh_buf = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
+        let gh = gh_buf.as_path();
         crate::forge_listing::list_issues_cached_as(caller, gh, Some(&root), None, label, "open")
     })
     .await;

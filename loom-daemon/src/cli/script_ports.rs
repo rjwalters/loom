@@ -340,6 +340,14 @@ pub(crate) enum ScriptPortCommand {
     /// a port either: same frozen-`main.rs` reason as `shell-budget` above.
     PremiseCheck(super::premise_check::PremiseCheckArgs),
 
+    /// The operator-decision helper (#9344): validate a ranked-options
+    /// decision (2-4 options best -> worst, each with a why, recommended
+    /// first) and write it onto an issue as a fenced `decision` block before
+    /// labelling it `loom:operator-decision`. Refuses, touching nothing, on
+    /// any contract failure. Same frozen-`main.rs` reason as `shell-budget`.
+    #[command(subcommand)]
+    OperatorDecision(super::operator_decision::OperatorDecisionCommand),
+
     /// `reconcile-stack.sh`'s rebase planner and executor (#8583): fetch and
     /// PIN the remote default-branch tip, route to the worktree holding the
     /// child branch, resolve the parent ref (with the #7982 pin fallback and
@@ -486,6 +494,26 @@ pub(crate) enum ScriptPortCommand {
     /// bypasses `lib/script-helper.sh`, whose missing-daemon path is a loud
     /// error: silence IS this entry point's interface.)
     FleetSend(super::fleet_send::FleetSendArgs),
+
+    /// The versioned forge **operation inventory** and its accounting (#9777,
+    /// phase 1 of epic #9769): the coverage validator, the unclassified-call
+    /// change gate, the four-axis coverage report and the hosted-probe
+    /// manifest. Not a port: brand-new logic, native from the start per the
+    /// shell-language policy — and native specifically so the gate can be a
+    /// real ratchet rather than a grep in a `contract`-category script. It
+    /// lives in this flattened enum for the same frozen-`main.rs` reason as
+    /// `shell-budget`, which keeps `forge-inventory` a real nested subcommand
+    /// at zero cost to that file. Makes no forge call.
+    #[command(subcommand)]
+    ForgeInventory(super::forge_inventory_cmd::ForgeInventoryCommand),
+
+    /// Combined-tree CI qualification for the merge queue (#10257): `audit`
+    /// reports relied-on suites that do not validate the merge-group commit;
+    /// `eligibility` decides whether a repository may pilot queue mode.
+    /// Read-only. Lives here for the same frozen-`main.rs` reason as
+    /// `shell-budget`.
+    #[command(subcommand)]
+    MergeGroupCi(super::merge_group_ci_cmd::MergeGroupCiCommand),
 }
 
 impl ScriptPortCommand {
@@ -536,6 +564,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
             ScriptPortCommand::DuplicateScan(args) => args.run(),
             ScriptPortCommand::PremiseCheck(args) => args.run(),
+            ScriptPortCommand::OperatorDecision(cmd) => cmd.run(),
             ScriptPortCommand::ReconcileStack(args) => args.run(),
             ScriptPortCommand::GenerateAgentSkills(args) => args.run(),
             ScriptPortCommand::GitBlobLines(args) => args.run(),
@@ -551,6 +580,8 @@ impl ScriptPortCommand {
             ScriptPortCommand::SecretScan(args) => args.run(),
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
             ScriptPortCommand::LabelDuplicates(args) => args.run(),
+            ScriptPortCommand::ForgeInventory(cmd) => cmd.run(),
+            ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),
         }
     }
 }
@@ -840,6 +871,15 @@ pub(crate) enum MergePrCommand {
     /// 2 = the resolved root cannot be framed unambiguously. The seam fails
     /// OPEN (no targets, clean up nothing) — see `cli::merge_pr_cleanup_paths`.
     CleanupPaths(super::merge_pr_cleanup_paths::CleanupPathsArgs),
+
+    /// The identity/ownership gate in front of `_remove_loom_worktree` (#8191
+    /// slice): the #3710 primary-worktree hard guard, then the
+    /// `.loom-managed` sentinel guard with its `--worktree-path` bypass.
+    /// `git worktree list --porcelain` on stdin; first line
+    /// `LOOM-REMOVE-GATE PROCEED|REFUSE` then `LEVEL<TAB>message` records.
+    /// The shell treats anything else as REFUSE — see
+    /// `cli::merge_pr_remove_gate`.
+    RemoveGate(super::merge_pr_remove_gate::RemoveGateArgs),
 }
 
 impl MergePrCommand {
@@ -880,6 +920,7 @@ impl MergePrCommand {
             MergePrCommand::ReconcileChild(args) => args.run(),
             MergePrCommand::ChecksFailure(args) => args.run(),
             MergePrCommand::WorktreePreserve(args) => args.run(),
+            MergePrCommand::RemoveGate(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
         }
     }

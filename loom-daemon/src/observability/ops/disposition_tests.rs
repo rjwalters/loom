@@ -472,7 +472,7 @@ fn hard_exclusion_rows_export_exactly_the_closed_exclusion_labels() {
 
     // Every HARD_EXCLUSION_LABELS entry exports verbatim, so a span can say
     // WHICH rule declined the issue.
-    for label in crate::hard_exclusion::HARD_EXCLUSION_LABELS {
+    for label in crate::hard_exclusion::HARD_EXCLUSION_LABELS.iter() {
         let summary = WorkFinderTickSummary {
             queue: vec![summary_row("/repo", 1, 1, Qd::HardExclusion, Some(label))],
             ..Default::default()

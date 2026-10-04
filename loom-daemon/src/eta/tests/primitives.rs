@@ -117,9 +117,18 @@ fn blocked_labels_return_no_estimate() {
     for hold in required {
         assert!(hold_labels().contains(&hold), "{hold} is a hold label");
         for stage_label in ["loom:review-requested", "loom:changes-requested", "loom:pr"] {
+            // #10218: an operator hold on an approved PR is the `merge_hold`
+            // stage (which every shipped heuristic still refuses `blocked`).
+            let expected = if stage_label == "loom:pr"
+                && crate::eta::labels::MERGE_HOLD_LABELS.contains(&hold)
+            {
+                Ok(Stage::MergeHold)
+            } else {
+                Err(NoEstimateReason::Blocked)
+            };
             assert_eq!(
                 stage_from_pr_labels(&labels(&[stage_label, hold])),
-                Err(NoEstimateReason::Blocked),
+                expected,
                 "{hold} on {stage_label}"
             );
         }
@@ -212,7 +221,19 @@ fn provenance_validation_requires_full_sha_and_known_state() {
 #[test]
 fn registry_resolves_current_per_kind() {
     let registry = Registry::builtin();
-    assert_eq!(registry.ids(), vec!["start-v1", "finish-v1", "land-v1", "land-v2"]);
+    assert_eq!(
+        registry.ids(),
+        vec![
+            "start-v1",
+            "finish-v1",
+            "land-v1",
+            "land-v2",
+            "land-v3",
+            "land-2026-10-04-amber-heron",
+            "land-2026-10-04-twin-otter",
+            "land-2026-10-04-twin-otter-b"
+        ]
+    );
     assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
     assert_eq!(registry.current(Kind::Finish, None).id(), "finish-v1");
     // A configured id of the wrong kind, or an unknown one, falls back.
@@ -221,6 +242,25 @@ fn registry_resolves_current_per_kind() {
     // A registered candidate IS selectable as current — that is what the
     // promotion switch flips (#9328).
     assert_eq!(registry.current(Kind::Land, Some("land-v2")).id(), "land-v2");
+    // `land-v3` (#9970) ships registered, not current: the default is
+    // unchanged, and only an explicit config selects it.
+    assert_eq!(registry.current(Kind::Land, Some("land-v3")).id(), "land-v3");
+    // `land-2026-10-04-amber-heron` (#10207) likewise: registered, not current.
+    assert_eq!(
+        registry
+            .current(Kind::Land, Some("land-2026-10-04-amber-heron"))
+            .id(),
+        "land-2026-10-04-amber-heron"
+    );
+    // `land-2026-10-04-twin-otter` (#10243) likewise: registered last, as a
+    // shadow, and refusing `no_model` in `builtin()`, which loads no fit.
+    assert_eq!(
+        registry
+            .current(Kind::Land, Some("land-2026-10-04-twin-otter"))
+            .id(),
+        "land-2026-10-04-twin-otter"
+    );
+    assert_eq!(Registry::default_current(Kind::Land), "land-v1");
 }
 
 #[test]
@@ -228,7 +268,17 @@ fn for_kind_enumerates_every_registered_heuristic_of_a_kind() {
     let registry = Registry::builtin();
     // The shadow-mode input (#9328): `current` is one of these, not all of it.
     let land: Vec<&str> = registry.for_kind(Kind::Land).map(Heuristic::id).collect();
-    assert_eq!(land, vec!["land-v1", "land-v2"]);
+    assert_eq!(
+        land,
+        vec![
+            "land-v1",
+            "land-v2",
+            "land-v3",
+            "land-2026-10-04-amber-heron",
+            "land-2026-10-04-twin-otter",
+            "land-2026-10-04-twin-otter-b"
+        ]
+    );
     assert_eq!(
         registry
             .for_kind(Kind::Finish)

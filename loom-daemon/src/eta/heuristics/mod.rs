@@ -1,22 +1,40 @@
-//! The shipped heuristics. `start-v1`, `finish-v1` and `land-v1` share one
-//! engine ([`estimate_path`]); they differ in which history they read and
-//! where the path ends. Their ids are immutable: a behaviour change is a new
-//! id.
+//! The shipped heuristics. `start-v1`, `finish-v1`, `land-v1`, `land-v2`,
+//! `land-v3` and `land-2026-10-04-amber-heron` share one engine
+//! ([`estimate_path`]); they differ in which history they read, where the
+//! path ends, (`land-v3`) how each stage's grid is calibrated, and
+//! (`land-2026-10-04-amber-heron`) how the result's interval is recalibrated.
+//! `land-2026-10-04-twin-otter` (#10243) reads no history: it evaluates a
+//! fitted coefficient file handed to it when the registry was built.
+//! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
+mod land_amber_heron;
+mod land_twin_otter;
+mod land_twin_otter_b;
 mod land_v1;
 mod land_v2;
+mod land_v3;
 mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
+pub use land_amber_heron::{LandAmberHeron, CALIBRATION_BASE, LAND_AMBER_HERON};
+pub(crate) use land_twin_otter::recompute as recompute_twin_otter;
+pub use land_twin_otter::{
+    adapt_input, visit_entry, visit_seed, LandTwinOtter, DRAW_ORDER, LAND_TWIN_OTTER, METHOD,
+};
+pub use land_twin_otter_b::{LandTwinOtterB, LAND_TWIN_OTTER_B, PRE_PR_METHOD};
 pub use land_v1::{LandV1, LAND_V1};
 pub use land_v2::{LandV2, LAND_V2};
+pub use land_v3::{
+    complexity_scale, story_points, LandV3, COMPLEXITY_ELASTICITY, FRICTION_SEC_PER_RUNNING_SWEEP,
+    INPUT_MISSING, LAND_V3, LOWER_STRETCH, REFERENCE_POINTS, REVIEW_FLOOR_SEC, UPPER_STRETCH,
+};
 pub use start_v1::{StartV1, START_V1};
 
 use super::explanation::{
     Branches, ChangesRequested, Combination, Conditioning, CurrentStageRecord, DispatchRecord,
     Distribution, EstimateResult, Explanation, Filters, HistoryRecord, HistoryWindow, PathRecord,
-    StageEntry,
+    StageAdjustment, StageEntry,
 };
 use super::history::{window_from, Level, SampleSource, StageSamples};
 use super::simulate::{may_reject, reachable_path, run, spec_from_explanation};
@@ -46,7 +64,22 @@ pub(crate) struct PathRules {
     /// lower bounds (#9328). `false`: the plain nearest-rank grid over the
     /// observed durations alone — every v1 heuristic.
     pub censoring: bool,
+    /// A calibrating heuristic's per-stage grid transform (#9970), applied
+    /// to the raw grid before conditioning and simulation, so the explanation
+    /// records — and recomputes from — the grid actually drawn from. `None`
+    /// for every heuristic that draws from history unadjusted.
+    pub adjust: Option<GridAdjust>,
+    /// `true`: an item in `merge_hold` (#10218) is estimated, along
+    /// `merge_hold → merge_wait` (the rest of the hold, conditioned on its
+    /// age, then one merge wait). `false` — every path-engine heuristic —
+    /// refuses it as `blocked` before any field is written, so the explanation is
+    /// byte-identical to its refusal of a held PR before the stage existed.
+    pub models_hold: bool,
 }
+
+/// `(stage, input, raw grid) → (grid, what was done)`. Must be pure.
+pub(crate) type GridAdjust =
+    fn(Stage, &EstimateInput, Vec<i64>) -> (Vec<i64>, Option<StageAdjustment>);
 
 /// Round to six decimals — every float the simulation reads is stored
 /// rounded, so the JSON value parses back to the exact `f64` used.
@@ -59,26 +92,23 @@ fn refuse(mut explanation: Explanation, reason: NoEstimateReason) -> Explanation
     explanation.result = None;
     explanation.contributions = None;
     explanation.combination = None;
+    explanation.twin_otter = None;
     explanation.enforce_cap();
     explanation
 }
 
-/// Estimate `input` along the path `rules` describe.
-pub(crate) fn estimate_path(
-    rules: PathRules,
-    input: &EstimateInput,
-    history: &StageSamples,
-) -> Explanation {
+/// The explanation of `heuristic`'s estimate of `input` before anything is
+/// estimated: identity, provenance, subject and the recorded features.
+fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) -> Explanation {
     let as_of = input.as_of;
-    let id = estimate_id(&input.subject, rules.kind, rules.id, as_of);
     let features_omitted = input
         .features
         .complete_omissions(input.features_omitted.clone(), "not_collected");
-    let mut explanation = Explanation {
+    Explanation {
         schema: EXPLANATION_SCHEMA.to_string(),
-        estimate_id: id,
-        heuristic: rules.id.to_string(),
-        kind: rules.kind,
+        estimate_id: estimate_id(&input.subject, kind, heuristic, as_of),
+        heuristic: heuristic.to_string(),
+        kind,
         loom: input.provenance.clone(),
         as_of,
         subject: input.subject.clone(),
@@ -95,13 +125,33 @@ pub(crate) fn estimate_path(
         features_omitted,
         no_estimate_reason: None,
         truncated: Vec::new(),
-    };
+        recalibration: None,
+        twin_otter: None,
+    }
+}
+
+/// Estimate `input` along the path `rules` describe.
+pub(crate) fn estimate_path(
+    rules: PathRules,
+    input: &EstimateInput,
+    history: &StageSamples,
+) -> Explanation {
+    let as_of = input.as_of;
+    let mut explanation = blank(rules.id, rules.kind, input);
 
     let current = match &input.current {
         CurrentState::Refused(reason) => return refuse(explanation, *reason),
         CurrentState::At(current) => current,
     };
+    // #10218: checked before every other refusal and before any field is
+    // written, so a heuristic that does not model the hold returns exactly
+    // the refusal a held PR got when the hold was a label-level `blocked`.
+    if current.stage == Stage::MergeHold && !rules.models_hold {
+        return refuse(explanation, NoEstimateReason::Blocked);
+    }
     let start = current.stage;
+    // Approved: no verdict ahead, and the path ends with `merge_wait`.
+    let approved = matches!(start, Stage::MergeWait | Stage::MergeHold);
     // `start` exists only for a ready item, and a ready item has no running
     // sweep to `finish`. A ready item with no plan position has no estimate.
     let ready = start == Stage::ReadyWait;
@@ -166,7 +216,7 @@ pub(crate) fn estimate_path(
     }
 
     // Where an approved path ends.
-    let (include_merge, merge_share) = if rules.always_merge || start == Stage::MergeWait {
+    let (include_merge, merge_share) = if rules.always_merge || approved {
         (true, None)
     } else {
         match history.merge_share(repo, as_of) {
@@ -188,9 +238,9 @@ pub(crate) fn estimate_path(
     });
 
     // The Judge branch, when the path still reaches a verdict.
-    let verdict_ahead = start != Stage::MergeWait && rework_rounds < MAX_REWORK_ROUNDS;
+    let verdict_ahead = !approved && rework_rounds < MAX_REWORK_ROUNDS;
     let mut p_by_attempt = Vec::new();
-    if start != Stage::MergeWait {
+    if !approved {
         let level = [Level::Repo, Level::Host].into_iter().find(|level| {
             history
                 .verdict_counts(repo, *level, as_of, MAX_REWORK_ROUNDS)
@@ -290,7 +340,10 @@ fn finish_estimate(
         } else {
             Vec::new()
         };
-        let grid_sec = grid::km_grid_of(sorted, &censored);
+        let (grid_sec, adjustment) = match rules.adjust {
+            Some(adjust) => adjust(stage, input, grid::km_grid_of(sorted, &censored)),
+            None => (grid::km_grid_of(sorted, &censored), None),
+        };
         // A queue wait is never age-conditioned (see `simulate`).
         let conditioning = if stage == start && age > 0 && stage != Stage::ReadyWait {
             // A censored sample longer than the age is evidence the stage can
@@ -313,6 +366,7 @@ fn finish_estimate(
                     sorted,
                     &censored,
                     grid_sec,
+                    adjustment,
                     Some(record),
                 ));
                 return refuse(explanation, NoEstimateReason::BeyondHistory);
@@ -329,6 +383,7 @@ fn finish_estimate(
             sorted,
             &censored,
             grid_sec,
+            adjustment,
             conditioning,
         ));
     }
@@ -355,7 +410,7 @@ fn finish_estimate(
     let Ok(simulation) = run(&spec) else {
         return refuse(explanation, NoEstimateReason::InsufficientSamples);
     };
-    let (p25, p50, p75) = simulation.quantiles;
+    let (p25, p50, p75, p90) = simulation.quantiles;
     for entry in &mut explanation.stages {
         entry.reached_with_probability = Some(simulation.reached[entry.stage.index()]);
         entry.mean_visits = Some(simulation.mean_visits[entry.stage.index()]);
@@ -373,6 +428,7 @@ fn finish_estimate(
         p25_sec: p25,
         p50_sec: p50,
         p75_sec: p75,
+        p90_sec: Some(p90),
         eta_p50_at: as_of + Duration::seconds(p50),
         samples_min,
         stage_marks: simulation.stage_marks(as_of),
@@ -399,6 +455,7 @@ fn stage_entry(
     sorted: &[i64],
     censored: &[i64],
     grid_sec: Vec<i64>,
+    adjustment: Option<StageAdjustment>,
     conditioning: Option<Conditioning>,
 ) -> StageEntry {
     // The quartiles are read off the same grid the simulation draws from, so
@@ -432,6 +489,7 @@ fn stage_entry(
             p50,
             p75,
             p90,
+            adjustment,
         },
         conditioning,
         reached_with_probability: None,

@@ -43,7 +43,7 @@ impl GhWorkSource {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            gh_bin: PathBuf::from("gh"),
+            gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
             repo: std::env::var("LOOM_REPO").ok(),
             cwd: None,
         }
@@ -58,7 +58,7 @@ impl GhWorkSource {
     #[must_use]
     pub fn for_root(root: &Path) -> Self {
         Self {
-            gh_bin: PathBuf::from("gh"),
+            gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
             repo: std::env::var("LOOM_REPO").ok(),
             cwd: Some(root.to_path_buf()),
         }
@@ -80,6 +80,11 @@ impl Default for GhWorkSource {
 
 impl WorkSource for GhWorkSource {
     fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>> {
+        // Curator intake reconcile (#10041): cadence-gated, fail-soft, REST-only;
+        // gives every unlabeled issue `loom:triage` so Curator has one queue.
+        if let Some(root) = self.cwd.as_deref() {
+            crate::intake_reconcile::maybe_run(&self.gh_bin, root);
+        }
         // ETag-cached REST listing (#4428), replacing the per-tick GraphQL
         // `gh issue list`.
         let ready = self.list_label("loom:issue")?;

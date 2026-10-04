@@ -109,6 +109,23 @@ status-level = "fail"
 [test-groups.daemon-integration]
 max-threads = 1
 
+# --- merge-pr shell-oracle differentials (#10189) ----------------------------
+#
+# `merge_pr_response_differential` and `merge_pr_head_sync_differential` spawn
+# `bash` + `grep` once per corpus case (hundreds of short-lived pipelines) to
+# run the frozen retired ladder as an oracle. On a CPU-starved CI shard that
+# made a scheduler-dependent SIGPIPE race observable (main run 37178206556, case
+# 159 — the cause and the harness fix are documented on `shell()` in
+# `merge_pr_response_differential.rs`). The harness no longer depends on
+# timing, but these oracles are still the heaviest fork-storm in the unit
+# shards, so they run one at a time rather than adding to the contention that
+# exposed the race. `max-threads = 1` serialises them against each other only;
+# the rest of the suite still runs alongside. The filter names these two
+# binaries exactly: the other `merge_pr_*_differential` binaries do not run
+# this oracle and stay on normal shard scheduling.
+[test-groups.merge-pr-differential]
+max-threads = 1
+
 # Overrides are declared on *both* profiles on purpose. nextest resolves a test's
 # overrides from the selected profile only — the `default` profile's overrides are
 # not inherited by a named profile — so an override that lived solely under
@@ -123,6 +140,10 @@ filter = 'package(loom-daemon) & kind(test) & binary(/^integration_/)'
 test-group = 'daemon-integration'
 # Booting a real daemon and driving tmux is slow by nature.
 slow-timeout = { period = "180s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+filter = 'package(loom-daemon) & kind(test) & (binary(=merge_pr_response_differential) | binary(=merge_pr_head_sync_differential))'
+test-group = 'merge-pr-differential'
 
 # --- CI profile -------------------------------------------------------------
 #
@@ -156,3 +177,7 @@ path = "junit.xml"
 filter = 'package(loom-daemon) & kind(test) & binary(/^integration_/)'
 test-group = 'daemon-integration'
 slow-timeout = { period = "180s", terminate-after = 3 }
+
+[[profile.ci.overrides]]
+filter = 'package(loom-daemon) & kind(test) & (binary(=merge_pr_response_differential) | binary(=merge_pr_head_sync_differential))'
+test-group = 'merge-pr-differential'

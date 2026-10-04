@@ -6,6 +6,12 @@
 //! (a sibling of this module, not nested under it) owns the daemon's own
 //! bootstrap/service-loop body, which is not a CLI subcommand handler.
 
+// The bin test binary gets the same pre-`main` live-`gh` guard as the lib
+// test binary (#10138). `main.rs` is size-frozen, so it is mounted here.
+#[cfg(test)]
+#[path = "../live_gh_guard.rs"]
+mod live_gh_guard;
+
 pub(crate) mod accounts;
 pub(crate) mod accounts_args;
 pub(crate) mod accounts_session;
@@ -28,8 +34,14 @@ pub(crate) mod dep_recheck;
 pub(crate) mod dispatch;
 pub(crate) mod dispatch_backoff;
 mod duplicate_scan;
+mod eta_backtest_cases;
+mod eta_backtest_render;
 mod eta_cmd;
+mod eta_fit_cmd;
 mod eta_fleet_cmd;
+mod eta_fleet_events_cmd;
+mod eta_offline_cmd;
+mod eta_replay_cmd;
 mod fleet_captain_cmd;
 pub(crate) mod fleet_config;
 mod fleet_config_reload;
@@ -38,6 +50,7 @@ pub(crate) mod fleet_send;
 pub(crate) mod forge_action;
 mod forge_egress_cmd;
 mod forge_identity_cmd;
+pub(crate) mod forge_inventory_cmd;
 mod git_blob_lines;
 mod guard_mcp_tools;
 pub(crate) mod health;
@@ -47,6 +60,7 @@ pub(crate) mod labels_cmd;
 pub(crate) mod lease_co_occupancy;
 pub(crate) mod lease_ensure;
 pub(crate) mod legacy_script_cmds;
+pub(crate) mod merge_group_ci_cmd;
 mod merge_pr_check_runs_rollup;
 mod merge_pr_check_runs_streak;
 mod merge_pr_checks_failure;
@@ -69,6 +83,7 @@ mod merge_pr_reconcile;
 mod merge_pr_redate;
 mod merge_pr_redate_report;
 mod merge_pr_refs;
+mod merge_pr_remove_gate;
 mod merge_pr_response;
 mod merge_pr_sequence;
 mod merge_pr_stacked_children;
@@ -82,6 +97,7 @@ pub(crate) mod misc_cmds;
 pub(crate) mod noop_cooldown;
 mod notify_cleared_blockers;
 pub(crate) mod opencode_usage_cli;
+pub(crate) mod operator_decision;
 pub(crate) mod overlap_replay;
 mod park_record;
 pub(crate) mod peer_claims_cmd;

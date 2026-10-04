@@ -62,6 +62,7 @@ use crate::types::{Event, SweepKind};
 /// runtime-dispatched per-model token lookup. A sibling module because this
 /// file is over `.loom/docs/file-size-policy.md`'s threshold and frozen.
 mod completion_runtime;
+mod forge_gate;
 
 // ============================================================================
 // Constants
@@ -1587,6 +1588,9 @@ pub fn build_completion_envelope(
 /// `title`/`additions`/`deletions`), so enriching the completion costs **zero**
 /// extra forge round-trips on the happy path.
 async fn fetch_merged_pr(workspace_root: &Path, issue: u32) -> Option<MergedPr> {
+    if forge_gate::suppressed("pr list", workspace_root) {
+        return None;
+    }
     let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
     let branch = crate::worktree_ops::naming::branch_name(issue);
     let mut output =
@@ -1606,7 +1610,7 @@ async fn fetch_merged_pr(workspace_root: &Path, issue: u32) -> Option<MergedPr> 
     if !output.status.success() {
         // #6596: the credential-gap symptom (`Could not resolve to a
         // Repository`) surfaces exactly here, and used to be swallowed whole.
-        log_gh_failure_once("pr list", workspace_root, &stderr_head(&output.stderr));
+        forge_gate::failed("pr list", workspace_root, &gh_bin, &output.stderr);
         return None;
     }
     log_gh_recovery_once("pr list", workspace_root);
@@ -1852,6 +1856,9 @@ const REPO_VIEW_FIELDS_BASE: &str = "nameWithOwner";
 /// (#4201) used for `task_id`/body prefixes, which is a local directory name
 /// with no forge meaning.
 async fn fetch_repo_identity(workspace_root: &Path) -> Option<RepoIdentity> {
+    if forge_gate::suppressed("repo view", workspace_root) {
+        return None;
+    }
     let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
     let mut output = run_repo_view_query(&gh_bin, REPO_VIEW_FIELDS, workspace_root).await?;
     if !output.status.success() && rejects_unknown_json_field(&output.stderr) {
@@ -1866,7 +1873,7 @@ async fn fetch_repo_identity(workspace_root: &Path) -> Option<RepoIdentity> {
         output = run_repo_view_query(&gh_bin, REPO_VIEW_FIELDS_BASE, workspace_root).await?;
     }
     if !output.status.success() {
-        log_gh_failure_once("repo view", workspace_root, &stderr_head(&output.stderr));
+        forge_gate::failed("repo view", workspace_root, &gh_bin, &output.stderr);
         return None;
     }
     log_gh_recovery_once("repo view", workspace_root);
@@ -2417,6 +2424,9 @@ fn reconcile_max_age() -> chrono::Duration {
 /// degrades that row (or the whole call) to being silently skipped; a
 /// best-effort reconciliation pass must never panic or block the sink.
 async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedPr> {
+    if forge_gate::suppressed("pr list (reconcile)", workspace_root) {
+        return Vec::new();
+    }
     let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
     let mut cmd = tokio::process::Command::new(&gh_bin);
     cmd.arg("pr")
@@ -2452,7 +2462,7 @@ async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedP
     if !output.status.success() {
         // The #6596 symptom for the reconciliation pass — a whole workspace's
         // merges silently absent from the feed, with nothing in the log.
-        log_gh_failure_once("pr list (reconcile)", workspace_root, &stderr_head(&output.stderr));
+        forge_gate::failed("pr list (reconcile)", workspace_root, &gh_bin, &output.stderr);
         return Vec::new();
     }
     log_gh_recovery_once("pr list (reconcile)", workspace_root);
@@ -3028,6 +3038,9 @@ pub fn spawn_sink(
 /// the event describes (the sink is a pure bus subscriber with no back-channel
 /// to dispatch).
 async fn fetch_issue_title(workspace_root: &Path, issue: u32) -> Option<String> {
+    if forge_gate::suppressed("issue view", workspace_root) {
+        return None;
+    }
     let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
     let mut cmd = tokio::process::Command::new(&gh_bin);
     cmd.arg("issue")
@@ -3056,7 +3069,7 @@ async fn fetch_issue_title(workspace_root: &Path, issue: u32) -> Option<String> 
         }
     };
     if !output.status.success() {
-        log_gh_failure_once("issue view", workspace_root, &stderr_head(&output.stderr));
+        forge_gate::failed("issue view", workspace_root, &gh_bin, &output.stderr);
         return None;
     }
     log_gh_recovery_once("issue view", workspace_root);
@@ -3279,8 +3292,11 @@ async fn run_sink(
                 // to trigger the path above. One workspace per tick (see
                 // `reconcile_cursor`'s doc comment).
                 let targets = reconciliation_targets(&known_workspaces);
+                // #8997: while the rate-limit breaker cools, skip the tick
+                // without advancing the cursor or spending a seed-only slot.
                 if let Some(workspace_root) = (!targets.is_empty())
                     .then(|| targets[reconcile_cursor % targets.len()].clone())
+                    .filter(|root| !forge_gate::suppressed("pr list (reconcile)", Path::new(root)))
                 {
                     reconcile_cursor = reconcile_cursor.wrapping_add(1);
                     // Seed-only first pass (#4649): this workspace's very
@@ -3922,3 +3938,7 @@ mod tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod heartbeat_tests;
+
+// Issue #8997: rate-limit breaker gating of the sink's forge lookups.
+#[cfg(test)]
+mod rate_limit_tests;

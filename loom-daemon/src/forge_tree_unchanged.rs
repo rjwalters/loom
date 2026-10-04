@@ -85,7 +85,6 @@
 //! read.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -164,22 +163,24 @@ pub fn tree_unchanged(gh_bin: &Path, cwd: Option<&Path>, base: &str, head: &str)
     if !is_sha(base) || !is_sha(head) {
         return None;
     }
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("api")
-        .arg(format!("repos/{{owner}}/{{repo}}/compare/{base}...{head}"));
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-        // #5401: a cross-owner managed repo needs its own owner's
-        // installation-token GH_CONFIG_DIR (no-op for single-owner fleets).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, dir);
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let parsed: Compare = serde_json::from_slice(&out.stdout).ok()?;
-    Some(proves_identical_trees(&parsed.status, parsed.files.is_empty()))
+    // #10089: the compare of two commit SHAs is a function of those SHAs
+    // alone, so a found answer is reused for the process lifetime (a pass
+    // that re-sees the same invalidated head move no longer re-spends it).
+    // Only an answered compare is stored; a failure is retried as before.
+    let cache_key = crate::claim_reconciliation::read_cache::key_of(&[
+        &gh_bin.to_string_lossy(),
+        &cwd.map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        base,
+        head,
+    ]);
+    crate::claim_reconciliation::read_cache::TREE_COMPARE.get_or(cache_key, || {
+        // Counted via the facade (`forge.tree_compare`).
+        let path = format!("repos/{{owner}}/{{repo}}/compare/{base}...{head}");
+        let out = crate::verdict_equivalence::gh_api("forge.tree_compare", gh_bin, cwd, &path)?;
+        let parsed: Compare = serde_json::from_slice(&out).ok()?;
+        Some(proves_identical_trees(&parsed.status, parsed.files.is_empty()))
+    })
 }
 
 /// The one predicate: does a three-dot compare response prove `base` and

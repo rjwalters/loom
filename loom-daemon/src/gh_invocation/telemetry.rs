@@ -369,6 +369,7 @@ fn launcher_str(source: super::GhBinSource) -> &'static str {
         super::GhBinSource::Policy => "policy",
         super::GhBinSource::EnvOverride => "env_override",
         super::GhBinSource::Path => "path",
+        super::GhBinSource::Injected => "injected",
     }
 }
 

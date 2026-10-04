@@ -5,31 +5,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::SystemTime;
 use tempfile::tempdir;
 
-/// RAII guard that clears the ambient `LOOM_RUNTIME` env var for the
-/// scope of a test and restores whatever value (if any) it previously
-/// had — including across a mid-test assertion panic, since Rust
-/// unwinds through `Drop`. Some host/dev-container shells export
-/// `LOOM_RUNTIME` (as the `spawn-worker.sh` runtime selector), and
-/// without this guard that ambient value silently outranks the
-/// `runtimes.default` config precedence this test exercises (#4739).
-struct ClearedLoomRuntimeEnv(Option<String>);
-
-impl ClearedLoomRuntimeEnv {
-    fn new() -> Self {
-        let prior = std::env::var("LOOM_RUNTIME").ok();
-        std::env::remove_var("LOOM_RUNTIME");
-        Self(prior)
-    }
-}
-
-impl Drop for ClearedLoomRuntimeEnv {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(v) => std::env::set_var("LOOM_RUNTIME", v),
-            None => std::env::remove_var("LOOM_RUNTIME"),
-        }
-    }
-}
+// The runtime-env guard lives in its own sibling file so this over-threshold
+// file does not grow (#9964, `.loom/docs/file-size-policy.md`).
+#[path = "cleared_runtime_env.rs"]
+mod cleared_runtime_env;
+use cleared_runtime_env::ClearedLoomRuntimeEnv;
 
 /// As [`ClearedLoomRuntimeEnv`] but for `GH_CONFIG_DIR` (#6529): the test
 /// process — or a PREVIOUS test in this same `#[serial]` suite — may

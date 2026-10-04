@@ -35,13 +35,18 @@ const GUARDED_ENV: [&str; 9] = [
     "LOOM_CODEX_PROFILE_ROOT",
 ];
 
-struct EnvGuard(Vec<(&'static str, Option<String>)>);
+/// The second field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964).
+struct EnvGuard(
+    Vec<(&'static str, Option<String>)>,
+    #[allow(dead_code)] crate::tokens_pool::profile_root_env::ProfileRootLock,
+);
 
 impl EnvGuard {
     /// Clear every guarded var, then point the codex profile root at
     /// `profile_root` so no test ever reads the host's real
     /// `~/.loom/codex-profiles`.
     fn new(profile_root: &Path) -> Self {
+        let lock = crate::tokens_pool::profile_root_env::lock();
         let prior = GUARDED_ENV
             .iter()
             .map(|key| (*key, std::env::var(key).ok()))
@@ -50,7 +55,7 @@ impl EnvGuard {
             std::env::remove_var(key);
         }
         std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profile_root);
-        Self(prior)
+        Self(prior, lock)
     }
 }
 
@@ -1029,6 +1034,14 @@ fn an_unguarded_codex_seat_sends_judge_down_the_list_body() {
     // Trust recorded for the host path is not trust inside a session
     // container: the seat becomes unguarded for the run it would serve.
     fs::write(profiles.path().join("alice/.session-managed.json"), "{}").unwrap();
+    // ...and an operator hook beside Loom's means the registration cannot be
+    // sealed either (#10102), so nothing stands in for that trust.
+    let hooks = profiles.path().join("alice/hooks.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&hooks).unwrap()).unwrap();
+    value["hooks"]["PostToolUse"] =
+        serde_json::json!([{"hooks": [{"type": "command", "command": "true"}]}]);
+    fs::write(&hooks, value.to_string()).unwrap();
 
     let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
     let outcome = judge_runner(workspace.path())

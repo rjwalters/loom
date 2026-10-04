@@ -457,7 +457,7 @@ pub const MERGE_HOLD_LABELS: [&str; 3] = ["loom:blocked", "loom:operator", "loom
 fn axis_park_labels(axis: DebtAxis) -> &'static [&'static str] {
     match axis {
         DebtAxis::Merge => &MERGE_HOLD_LABELS,
-        DebtAxis::Changes => crate::work_finder::PARK_LABELS,
+        DebtAxis::Changes => &crate::work_finder::PARK_LABELS,
         DebtAxis::Review => &[],
     }
 }
@@ -501,7 +501,7 @@ pub fn forge_merge_probe() -> DemandProbe {
         let gh_bin = std::env::var("LOOM_GH_BIN")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .map_or_else(|| PathBuf::from("gh"), PathBuf::from);
+            .map_or_else(|| PathBuf::from(crate::gh_invocation::gh_bin()), PathBuf::from);
         crate::forge_listing::list_issues_cached_as(
             DEMAND_CALLER,
             &gh_bin,
