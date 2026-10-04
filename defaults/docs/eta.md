@@ -1275,8 +1275,12 @@ them with a daemon restart.
   `intervalSecs`, skipping missed ticks. Each cycle runs off the tick in a
   blocking task; a panic is logged and the next tick retries.
 - **Repo set.** Every provisioned root and the daemon's own (by `origin`
-  remote), plus every published snapshot's repo. To stop refreshing a repo,
-  delete its `fleet-<owner>-<repo>.json`.
+  remote), plus every published snapshot's repo. Deleting a
+  `fleet-<owner>-<repo>.json` stops refreshing only a snapshot-only repo; for
+  a provisioned root or the daemon's own repo it triggers a full backfill on
+  the next cycle (no published snapshot means a backfill). To opt out, set
+  `autonomous.eta.fleetRefresh.enabled = false` (the whole task) or remove the
+  root from the workspace pool.
 - **Reader Apps only.** Every read runs under the repo's reader App
   (`forge_identity`, #9537) with `GH_TOKEN` / `GITHUB_TOKEN` (and the
   enterprise variants) removed from the child. There is no writer fallback and
@@ -1326,7 +1330,10 @@ them with a daemon restart.
   snapshots; the standalone refit task is then not spawned. It is held while
   a backfill is in progress and younger than 6 h (counted from that pass's
   listing instant), so a fresh host's first fit is not trained on only the
-  repos that finished first. `autonomous.eta.fit.enabled = false` skips it.
+  repos that finished first. A backfill that is due but skipped before its
+  first call (`reserve`, `budget`, a halted or gated cycle) is recorded as in
+  progress from that cycle (#10292), so it holds the fit too, for 6 h from
+  that cycle. `autonomous.eta.fit.enabled = false` skips it.
 - **Rebuilds.** No host has a state file before this task first runs, so every
   repo's first cycle is a full backfill. That also rebuilds snapshots written
   before #10218's episodes and #10245's flag timeline, which a refresh would

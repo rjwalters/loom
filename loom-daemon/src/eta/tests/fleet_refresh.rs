@@ -468,6 +468,12 @@ fn an_open_breaker_makes_no_call() {
         .repos
         .iter()
         .all(|r| r.stop == StopReason::BreakerOpen && r.forge_calls == 0));
+    // A stopped at its first call, B skipped whole: both are in progress (#10292).
+    for repo in [A, B] {
+        let pass = read_state(&state_path(root, repo)).unwrap().pass.unwrap();
+        assert_eq!((pass.kind, pass.listed_at), (PassKind::Backfill, now()), "{repo}");
+    }
+    assert!(fit_held(report.backfill_in_progress_since, now()));
 }
 
 #[test]
@@ -499,13 +505,16 @@ fn a_crash_orphan_is_repaired_on_the_next_cycle() {
     assert_eq!(report.repos[0].stop, StopReason::Complete);
     assert_eq!(published(root, A).unwrap().as_of, later);
 
-    // (2) A staging file with no pass is deleted.
+    // (2) A staging file with no pass is deleted. B has no reader, so the
+    // cycle never pends it a fresh staging file (#10292); recovery still runs.
     let orphan = staging_path(root, B);
     fleet::write(&orphan, &FleetSnapshot::empty(B)).unwrap();
     let mut state = RefreshState::new(B);
     state.last_stop = None;
     write_state(&state_path(root, B), &state).unwrap();
-    run_cycle(root, &[target(root, B, "1")], &mut fake, budgets(300, 0), later);
+    let mut b = target(root, B, "1");
+    b.reader = Err(NoReader::NoReader);
+    run_cycle(root, &[b], &mut fake, budgets(300, 0), later);
     assert!(!orphan.exists());
 }
 
@@ -524,6 +533,8 @@ fn no_usable_reader_costs_zero_calls() {
     assert!(fake.gets.is_empty());
     let stops: Vec<StopReason> = report.repos.iter().map(|r| r.stop).collect();
     assert_eq!(stops, vec![StopReason::NoReader, StopReason::UnsupportedForge]);
+    assert!(!fleet_refresh::refresh_dir(root).exists(), "never pended (#10292)");
+    assert_eq!(report.backfill_in_progress_since, None);
 }
 
 /// The new forge path can reach the forge only through the reader-only
@@ -673,4 +684,110 @@ fn an_in_progress_backfill_holds_the_fit_for_six_hours() {
     assert!(!fit_held(None, now()));
     assert!(fit_held(Some(now()), now() + Duration::hours(5)));
     assert!(!fit_held(Some(now()), now() + Duration::hours(fleet_refresh::FIT_HOLD_HOURS)));
+}
+
+// -- a backfill skipped before its first call holds the fit (#10292) ----------
+
+/// B's pending pass: a backfill begun at `at`, nothing read yet, staging there.
+fn assert_pended(root: &Path, repo: &str, at: DateTime<Utc>) {
+    let pass = read_state(&state_path(root, repo))
+        .unwrap()
+        .pass
+        .expect("a pending pass");
+    assert_eq!(pass.kind, PassKind::Backfill, "{repo}");
+    assert_eq!(pass.listed_at, at, "{repo}");
+    assert_eq!((pass.next_page, pass.done.len()), (1, 0), "{repo}");
+    assert!(staging_path(root, repo).exists(), "{repo}: recover() keeps the pass");
+}
+
+#[test]
+fn a_backfill_skipped_for_the_reserve_holds_the_fit_until_l_plus_six_hours() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut fake = Fake::with(&[(A, Vec::new()), (B, prs(3))]);
+    fake.remaining = Some(100);
+    let targets = [target(root, A, "1"), target(root, B, "1")];
+    let report = run_cycle(root, &targets, &mut fake, budgets(300, 1500), now());
+    assert_eq!(report.repos[0].stop, StopReason::Complete);
+    assert!(report.repos[0].promoted, "A finished first and is published");
+    assert_eq!((report.repos[1].stop, report.repos[1].forge_calls), (StopReason::Reserve, 0));
+    assert_pended(root, B, now());
+    assert_eq!(report.backfill_in_progress_since, Some(now()));
+    assert!(fit_held(report.backfill_in_progress_since, now()));
+
+    // Skipped again an hour later: B resumes its pass, so `L` stays put.
+    let later = now() + Duration::hours(1);
+    let report = run_cycle(root, &targets, &mut fake, budgets(300, 1500), later);
+    assert_eq!((report.repos[1].stop, report.repos[1].forge_calls), (StopReason::Reserve, 0));
+    assert_pended(root, B, now());
+    assert!(fit_held(report.backfill_in_progress_since, later));
+
+    // Still skipped at `L + 6 h`: the hold has lapsed.
+    let lapsed = now() + Duration::hours(fleet_refresh::FIT_HOLD_HOURS);
+    let report = run_cycle(root, &targets, &mut fake, budgets(300, 1500), lapsed);
+    assert_eq!(report.repos[1].stop, StopReason::Reserve);
+    assert_pended(root, B, now());
+    assert!(!fit_held(report.backfill_in_progress_since, lapsed));
+}
+
+#[test]
+fn a_backfill_budget_spent_exactly_at_a_repo_boundary_pends_the_next_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut fake = Fake::with(&[(A, prs(2)), (B, prs(3))]);
+    let targets = [target(root, A, "1"), target(root, B, "1")];
+    let report = run_cycle(root, &targets, &mut fake, budgets(300, 3), now());
+    assert_eq!((report.repos[0].stop, report.repos[0].forge_calls), (StopReason::Complete, 3));
+    assert_eq!(report.remaining.1, 0);
+    assert_eq!((report.repos[1].stop, report.repos[1].forge_calls), (StopReason::Budget, 0));
+    assert_pended(root, B, now());
+    assert_eq!(report.backfill_in_progress_since, Some(now()));
+}
+
+#[test]
+fn a_halted_cycle_pends_the_backfills_it_never_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut fake = Fake::with(&[(A, prs(3)), (B, prs(3))]);
+    fake.fail_at = Some((0, ReadFailure::RateLimited, None));
+    let targets = [target(root, A, "1"), target(root, B, "2")];
+    let report = run_cycle(root, &targets, &mut fake, budgets(300, 1500), now());
+    assert_eq!(report.repos[0].stop, StopReason::RateLimited);
+    assert_eq!(
+        (report.repos[1].stop, report.repos[1].forge_calls),
+        (StopReason::RateLimited, 0)
+    );
+    assert_pended(root, B, now());
+    assert!(fit_held(report.backfill_in_progress_since, now()));
+}
+
+#[test]
+fn a_skipped_refresh_is_not_pended_and_does_not_hold_the_fit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut fake = Fake::with(&[(A, prs(2))]);
+    backfilled(root, &mut fake);
+    let later = now() + Duration::hours(1);
+    let report = run_cycle(root, &[target(root, A, "1")], &mut fake, budgets(0, 1500), later);
+    assert_eq!(
+        (report.repos[0].pass, report.repos[0].stop),
+        (Some(PassKind::Refresh), StopReason::Budget)
+    );
+    assert!(read_state(&state_path(root, A)).unwrap().pass.is_none());
+    assert!(!staging_path(root, A).exists());
+    assert_eq!(report.backfill_in_progress_since, None);
+}
+
+#[test]
+fn pending_never_rewrites_a_pass_in_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut fake = Fake::with(&[(A, prs(150))]);
+    run_cycle(root, &[target(root, A, "1")], &mut fake, budgets(300, 10), now());
+    let before = read_state(&state_path(root, A)).unwrap();
+    assert!(before.pass.is_some());
+    let later = now() + Duration::hours(2);
+    fleet_refresh::pend_backfill(root, A, Some(before.clone()), later, 21, StopReason::Budget)
+        .unwrap();
+    assert_eq!(read_state(&state_path(root, A)).unwrap(), before);
 }
