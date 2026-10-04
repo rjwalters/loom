@@ -49,6 +49,9 @@
 //!   soft holds on approved followers behind it release early, and the chain
 //!   is escalated once ("operator needed" on the head PR, naming the action
 //!   and the approved PRs it holds). Hard holds still never release.
+//! - **No-overlap release (#10077, [`overlap`]).** A soft in-flight hold
+//!   whose two PRs share no changed file (a transitive-only edge recorded
+//!   before #10060) is released; any failed read or unknown keeps it.
 //! - **Defer repairs.** The review-conflict pass
 //!   (`super::review_conflict`) consults this module's `defer_base_repair`:
 //!   a base-conflicting review-queue PR whose sequencing predecessor is
@@ -102,6 +105,11 @@ const DEFAULT_MAX_AGE_HOURS: f64 = 72.0;
 #[path = "merge_sequence_stall.rs"]
 pub mod stall;
 pub use stall::{stall_hours, MERGE_SEQUENCE_STALL_ENV};
+
+// Releasing recorded holds between PRs that share no changed file, and the
+// per-tick changed-files cache both phases share (#10077).
+#[path = "merge_sequence_overlap.rs"]
+pub mod overlap;
 
 /// The durable hold label this pass applies (defined by #9378).
 pub const SEQUENCE_LABEL: &str = "loom:sequenced";
@@ -557,6 +565,9 @@ pub enum HoldAction {
     /// (human hold / no verdict, quiet past the stall bound — #10060): release
     /// so ready work lands first. Decided by [`stall::hold_action_with_stall`].
     ReleaseStalled,
+    /// Soft hold between two PRs that share no changed file (a transitive-only
+    /// edge from before #10060): release. Decided by [`overlap::with_no_overlap`].
+    ReleaseNoOverlap,
 }
 
 /// Pure Phase-1 decision for one hold.
@@ -675,6 +686,7 @@ pub fn release_comment_body(marker: &SequenceMarker, action: HoldAction) -> Stri
             stall_hours(),
             marker.after
         ),
+        HoldAction::ReleaseNoOverlap => overlap::release_reason(marker),
         _ => "released".to_string(),
     };
     format!(
@@ -799,6 +811,8 @@ pub struct MergeSequenceStats {
     pub expired: usize,
     /// Soft holds released behind a stalled head (#10060).
     pub stall_released: usize,
+    /// Soft holds released because the two PRs share no file (#10077).
+    pub overlap_released: usize,
     /// Stalled-chain escalations posted this tick (#10060).
     pub escalated: usize,
     pub held: usize,
@@ -898,6 +912,9 @@ pub struct PlanReport {
     /// "what would the pass write" matches the live pass edge for edge
     /// (Judge re-review of #9707).
     pub skipped_held: usize,
+    /// Existing holds Phase 1 would release as no-overlap (#10077):
+    /// `(follower, predecessor)`.
+    pub would_release_no_overlap: Vec<(u32, u32)>,
 }
 
 /// Compute the plan report without writing anything.
@@ -923,12 +940,12 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
         .map(|p| p.number)
         .collect();
     report.holders = holder_numbers.len();
-    let mut files: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
+    let mut cache = overlap::TickFiles::default();
+    report.would_release_no_overlap = overlap::would_release(gh_bin, root, &open, &mut cache);
     for pr in &eligible {
-        if let Some(f) = changed_files(gh_bin, root, pr) {
-            files.insert(pr.number, f);
-        }
+        cache.get_or_fetch(pr, |p| changed_files(gh_bin, root, p));
     }
+    let files = cache.known(eligible.iter().map(|p| p.number));
     let markers = fetch_markers(gh_bin, root, &eligible);
     report.groups = plan_repo(&open, &files, &markers);
     for g in &mut report.groups {
@@ -1079,6 +1096,8 @@ pub(super) fn reconcile_merge_sequences_with(
     let max_age = max_age_hours();
     let (now, stall_bound) = (Utc::now(), stall_hours());
     let mut stalls = stall::StallLedger::default();
+    // One changed-files read per PR per tick, shared by both phases (#10077).
+    let mut files = overlap::TickFiles::default();
 
     // Phase 1: evaluate every existing hold, oldest first for a stable
     // transcript.
@@ -1137,11 +1156,16 @@ pub(super) fn reconcile_merge_sequences_with(
                 stalls.record(h, c, quiet, pr.number, action == HoldAction::ReleaseStalled);
             }
         }
+        // #10077: a soft hold between PRs sharing no file is released.
+        let fetch = |p: &SequencePr| changed_files(gh_bin, root, p);
+        let action =
+            overlap::with_no_overlap(action, &marker, pred.as_ref(), pr, &open, &mut files, fetch);
         let result = match action {
             HoldAction::Release
             | HoldAction::ReleaseDissolved
             | HoldAction::Expire
-            | HoldAction::ReleaseStalled => {
+            | HoldAction::ReleaseStalled
+            | HoldAction::ReleaseNoOverlap => {
                 release_hold(gh_bin, root, pr.number, &release_comment_body(&marker, action))
                     .map(|_| action)
             }
@@ -1155,6 +1179,7 @@ pub(super) fn reconcile_merge_sequences_with(
             Ok(HoldAction::ReleaseDissolved) => stats.released += 1,
             Ok(HoldAction::Expire) => stats.expired += 1,
             Ok(HoldAction::ReleaseStalled) => stats.stall_released += 1,
+            Ok(HoldAction::ReleaseNoOverlap) => stats.overlap_released += 1,
             Ok(HoldAction::VoidAndReplan) => stats.voided += 1,
             Ok(_) => stats.held += 1,
             Err(e) => {
@@ -1198,12 +1223,10 @@ pub(super) fn reconcile_merge_sequences_with(
     if eligible.len() < 2 {
         return stats;
     }
-    let mut files: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
     for pr in &eligible {
-        if let Some(f) = changed_files(gh_bin, root, pr) {
-            files.insert(pr.number, f);
-        }
+        files.get_or_fetch(pr, |p| changed_files(gh_bin, root, p));
     }
+    let files = files.known(eligible.iter().map(|p| p.number));
     let markers = fetch_markers(gh_bin, root, &eligible);
     for group in plan_repo(&open, &files, &markers) {
         stats.groups += 1;

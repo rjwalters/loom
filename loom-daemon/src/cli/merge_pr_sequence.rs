@@ -109,6 +109,14 @@ impl SequencePlanArgs {
             "{} open PR(s); trigger is >2; {} existing holder(s)",
             report.open_prs, report.holders
         );
+        // #10077: existing holds Phase 1 would release (nothing is written).
+        for (follower, after) in &report.would_release_no_overlap {
+            println!("would release #{follower} (after #{after}): no shared files");
+        }
+        println!(
+            "would release {} hold(s) with no shared files",
+            report.would_release_no_overlap.len()
+        );
         if report.groups.is_empty() {
             println!("no overlapping groups planned");
             return Ok(());
