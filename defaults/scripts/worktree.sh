@@ -1557,14 +1557,23 @@ WORKTREE_PATH="$WORKTREE_ROOT_DIR/issue-$ISSUE_NUMBER"
 # An in-session builder otherwise publishes no liveness record, and
 # `claim_reconciliation` reclaims an actively worked claim (#6286, #7672). Here,
 # not in `builder.md`, so the one call site that cannot be forgotten covers it.
-# #10204: it is called only AFTER the last refusal gate of each arm (claim-lock
-# check, co-occupancy, `forge check-claim`), so a refused run never leaves a
-# lease comment and renewer behind. `--watch-pid` is `${CLAUDE_PID:-$PPID}`,
-# NEVER `$$` (the one-shot tool-call subshell). The remaining policy lives in
-# `loom-daemon lease ensure` (ADR-0018; this file's `contract` category admits
-# no growth). $_WT_DAEMON_BIN is resolved at the top of the create path.
+# #10204: it is called only once each arm's own operation has SUCCEEDED --
+# `_worktree_sparse reconfigure`, `_worktree_existing`, `git worktree add` --
+# never before a gate that can still refuse (claim-lock, co-occupancy,
+# `forge check-claim`, #8280 branch reuse, #7765/#9083 origin-branch reuse) or
+# an add that can still fail, so no nonzero exit before a real worktree exists
+# leaves a lease comment and renewer behind. `--watch-pid` is
+# `${CLAUDE_PID:-$PPID}`, NEVER `$$` (the one-shot tool-call subshell). The
+# remaining policy lives in `loom-daemon lease ensure` (ADR-0018; this file's
+# `contract` category admits no growth). $_WT_DAEMON_BIN: resolved above.
 _wt_lease_claim() { [[ -z "$_WT_DAEMON_BIN" ]] || "$_WT_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --watch-pid "${CLAUDE_PID:-$PPID}" > /dev/null 2>&1 || true; }
 
+# --- Issue claim-lock cross-check (#8553) ------------------------------------
+# Reads (never acquires) the daemon's per-issue sweep-claim lock before every
+# create/reuse path below. Only exit 1 refuses; any other nonzero (e.g. a daemon
+# predating `check-issue`) fails OPEN, matching every other guard here.
+# shellcheck disable=SC2086  # $_ijson is intentionally unquoted: omits the flag when empty
+# requires-daemon: worktree-lock optional   #8553 fails open on a daemon predating check-issue (no lock cross-check performed)
 [[ -z "$_WT_DAEMON_BIN" ]] || { _ijson=""; _irc=0; [[ "$JSON_OUTPUT" == "true" ]] && _ijson="--json"; "$_WT_DAEMON_BIN" worktree-lock check-issue --issue "$ISSUE_NUMBER" --repo "$WORKTREE_REPO_ROOT" $_ijson ${FORCE_CLAIM_LOCK:+--force} >&3 || _irc=$?; [[ "$_irc" -eq 1 ]] && exit 1; }
 
 # Check if worktree already exists
@@ -1577,9 +1586,8 @@ if [[ -d "$WORKTREE_PATH" ]]; then
     # (#8195 slice 10); a refusal or failure exits non-zero, which `set -e`
     # propagates with its code intact.
     if [[ "$SPARSE_MODE" == "true" || "$FULL_MODE" == "true" ]]; then
-        _wt_lease_claim
         _worktree_sparse reconfigure "$WORKTREE_PATH" >&3
-        exit 0
+        _wt_lease_claim; exit 0
     fi
 
     print_warning "Worktree already exists at: $WORKTREE_PATH"
@@ -1604,14 +1612,13 @@ if [[ -d "$WORKTREE_PATH" ]]; then
     # shellcheck disable=SC2086  # $_ljson is intentionally unquoted: omits the flag when empty
     # requires-daemon: lease optional   kicad-tools#5783 fails open on a daemon predating `lease co-occupancy`
     [[ -z "${_WT_DAEMON_BIN:-}" || ! -e "$WORKTREE_PATH/.git" || -z "$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null)" ]] || { _ljson=""; _lrc=0; [[ "$JSON_OUTPUT" == "true" ]] && _ljson="--json"; "$_WT_DAEMON_BIN" lease co-occupancy "$ISSUE_NUMBER" --repo "$WORKTREE_REPO_ROOT" $_ljson >&3 || _lrc=$?; [[ "$_lrc" -eq 1 ]] && exit 1; }
-    _wt_lease_claim
     _worktree_existing || exit 1
     # #9111: under --json the port is --quiet, so the success document for the
     # preserve and both stale-reset outcomes is emitted here — the same key set
     # as the --sparse/--full fast path (sparse.rs JSON_TEMPLATE), which already
     # exited, so $SPARSE_MODE/$CONE_JSON are their not-sparse defaults.
     [[ "$JSON_OUTPUT" != "true" ]] || echo '{"success": true, "worktreePath": "'"$(cd "$WORKTREE_PATH" && pwd)"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": '"$SPARSE_MODE"', "cone": '"$CONE_JSON"'}' >&3
-    exit 0
+    _wt_lease_claim; exit 0
 fi
 
 # --- Pre-creation claim probe (#9453 Phase 1) ----------------------------
@@ -1630,7 +1637,6 @@ fi
 # requires-daemon: forge optional   #9453 — `forge check-claim` at worktree creation; without it (absent or pre-#9453 binary) no pre-create OPEN_PR gate is performed and creation proceeds as before
 # shellcheck disable=SC2015  # the trailing `|| true` IS the fail-open path: only exit 0 (blocked) refuses
 [[ -n "$_WT_DAEMON_BIN" ]] && "$_WT_DAEMON_BIN" forge check-claim "$ISSUE_NUMBER" --force-claim >&3 && exit 1 || true
-_wt_lease_claim
 
 # Check if branch already exists
 if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
@@ -1676,9 +1682,7 @@ else
     else
         # Create new branch from the base ref (origin/$DEFAULT_BRANCH by default, or
         # the --base override for a stacked child — #3729).
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_info "Creating new branch from $BASE_DISPLAY"
-        fi
+        [[ "$JSON_OUTPUT" == "true" ]] || print_info "Creating new branch from $BASE_DISPLAY"
         CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "$BASE_REF")
     fi
 fi
@@ -1799,6 +1803,8 @@ if _try_worktree_add; then
     # for other issues (issue #6014). release_worktree_lock clears
     # WORKTREE_LOCK_TOKEN itself, which makes the EXIT trap's later call a no-op.
     release_worktree_lock "$ISSUE_NUMBER" "$WORKTREE_LOCK_TOKEN"
+    # The worktree now exists, so every refusal gate is behind us (#10204).
+    _wt_lease_claim
 
     # Get absolute path to worktree
     ABS_WORKTREE_PATH=$(cd "$WORKTREE_PATH" && pwd)
