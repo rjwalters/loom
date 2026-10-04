@@ -46,7 +46,9 @@
 //! calls remaining is kept, then every further repo on that reader App is
 //! skipped (`reserve`). A rate limit ends the cycle; a coverage gap or other
 //! forge error ends that repo; an open breaker or a shutdown ends the cycle
-//! before the next call.
+//! before the next call. A due backfill skipped before its first call is
+//! recorded as in progress from that cycle ([`pend_backfill`], #10292), so it
+//! holds the fit like any other.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -457,6 +459,13 @@ pub fn run_cycle(
         };
         let skip = skip.or_else(|| (*remaining == 0).then_some(StopReason::Budget));
         if let Some(stop) = skip {
+            if p.kind == PassKind::Backfill && !p.resuming {
+                let pended =
+                    pend_backfill(root, repo, p.state.clone(), now, budgets.backfill_days, stop);
+                if let Err(e) = pended {
+                    log::warn!("eta fleet refresh: {repo}: could not record its due backfill: {e}");
+                }
+            }
             let mut r = skipped(Some(p.kind), stop);
             r.reader_app = Some(reader.app_id.clone());
             r.pass_done = p
@@ -508,6 +517,73 @@ pub fn run_cycle(
     }
     report.backfill_in_progress_since = backfill_since(root, targets);
     report
+}
+
+/// Record a due backfill that a cycle skips before its first call (`reserve`,
+/// `budget`, a halt, a gated cycle) as in progress from `now` (#10292), so
+/// [`backfill_since`] sees it and the fit is held — for [`FIT_HOLD_HOURS`]
+/// from this first skip, since a later cycle resumes the pass and never
+/// rewrites its `L`. The on-disk shape is the one a first-call stop inside a
+/// walk already checkpoints: empty staging **first** (without it [`recover`]
+/// would drop the pass and the next skip would re-pend at a new `L`), then the
+/// state. A no-op when a pass is already in progress.
+///
+/// # Errors
+///
+/// The staging or state write failed; the repo is then not held (fail open).
+pub fn pend_backfill(
+    root: &Path,
+    repo: &str,
+    state: Option<RefreshState>,
+    now: DateTime<Utc>,
+    backfill_days: i64,
+    stop: StopReason,
+) -> std::io::Result<()> {
+    let mut state = state.unwrap_or_else(|| RefreshState::new(repo));
+    if state.pass.is_some() {
+        return Ok(());
+    }
+    fleet::write(&staging_path(root, repo), &FleetSnapshot::empty(repo))?;
+    state.pass = Some(Pass {
+        kind: PassKind::Backfill,
+        listed_at: now,
+        since: now - Duration::days(backfill_days),
+        next_page: 1,
+        done: Vec::new(),
+        head_etag: None,
+    });
+    state.last_stop = Some(LastStop {
+        at: now,
+        reason: stop,
+    });
+    write_state(&state_path(root, repo), &state)
+}
+
+/// [`pend_backfill`] for every target a gated cycle (`backoff`,
+/// `breaker_open`) skips whole: each one with a reader, no pass in progress,
+/// and a backfill due. Targets with no usable reader are never pended — they
+/// are never served, so they would only hold the fit.
+pub fn pend_due_backfills(
+    root: &Path,
+    targets: &[RepoTarget],
+    now: DateTime<Utc>,
+    backfill_days: i64,
+    stop: StopReason,
+) {
+    for target in targets.iter().filter(|t| t.reader.is_ok()) {
+        let repo = &target.repo;
+        let state = recover(root, repo);
+        if state.as_ref().is_some_and(|s| s.pass.is_some()) {
+            continue;
+        }
+        let published = fleet::read(&fleet::snapshot_path(root, repo)).is_some();
+        if choose_pass(state.as_ref(), published, now, backfill_days) != PassKind::Backfill {
+            continue;
+        }
+        if let Err(e) = pend_backfill(root, repo, state, now, backfill_days, stop) {
+            log::warn!("eta fleet refresh: {repo}: could not record its due backfill: {e}");
+        }
+    }
 }
 
 /// The earliest listing instant `L` of any backfill pass in progress among

@@ -338,6 +338,79 @@ fn an_unfinished_backfill_holds_the_fit() {
     assert!(!free.fit_held, "the hold lapses six hours after the backfill began");
 }
 
+/// A gated cycle on a fresh host makes no call, yet records the due backfill
+/// as in progress, so the fit is held (#10292); a later gated cycle keeps `L`.
+#[test]
+fn a_gated_cycle_pends_due_backfills_and_holds_the_fit() {
+    for breaker in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut none = target(root, "acme/beta");
+        none.reader = Err(NoReader::NoReader);
+        let targets = [target(root, "acme/alpha"), none];
+        let mut task = TaskState {
+            backoff_until: (!breaker).then(|| now() + Span::hours(3)),
+            ..TaskState::default()
+        };
+        let mut forge = Quiet {
+            breaker,
+            ..Quiet::default()
+        };
+        let mut events = no_events();
+        for at in [now(), now() + Span::hours(1)] {
+            let outcome = cycle(root, &targets, &mut forge, &mut events, &config(), &mut task, at);
+            let want = if breaker {
+                StopReason::BreakerOpen
+            } else {
+                StopReason::Backoff
+            };
+            assert_eq!(outcome.report.repos[0].stop, want);
+            assert!(outcome.fit_held, "breaker={breaker}");
+            assert_eq!(outcome.report.backfill_in_progress_since, Some(now()));
+        }
+        assert_eq!(forge.calls, 0);
+        let state = fleet_refresh::read_state(&fleet_refresh::state_path(root, "acme/alpha"));
+        let pass = state.unwrap().pass.unwrap();
+        assert_eq!((pass.kind, pass.listed_at), (fleet_refresh::PassKind::Backfill, now()));
+        assert!(fleet_refresh::staging_path(root, "acme/alpha").exists());
+        assert!(
+            !fleet_refresh::state_path(root, "acme/beta").exists(),
+            "a repo with no reader is never pended"
+        );
+    }
+}
+
+/// The Judge's probe (#10292), end to end: A finishes and is published, B is
+/// skipped for the reserve before its first call, and today's fit is held.
+#[test]
+fn a_backfill_skipped_for_the_reserve_holds_todays_fit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // `Quiet` reports 4000 remaining: below this floor after A's one call.
+    let config = FleetRefreshConfig {
+        reserve_calls: 5000,
+        ..config()
+    };
+    let mut events = no_events();
+    let outcome = cycle(
+        root,
+        &[target(root, "acme/alpha"), target(root, "acme/beta")],
+        &mut Quiet::default(),
+        &mut events,
+        &config,
+        &mut TaskState::default(),
+        now(),
+    );
+    let stops: Vec<StopReason> = outcome.report.repos.iter().map(|r| r.stop).collect();
+    assert_eq!(stops, vec![StopReason::Complete, StopReason::Reserve]);
+    assert_eq!(outcome.report.repos[1].forge_calls, 0);
+    assert!(fleet::read(&fleet::snapshot_path(root, "acme/alpha")).is_some());
+    assert!(outcome.fit_held);
+    let fitter = run::current_fitter();
+    assert_eq!(after_cycle(root, now(), outcome.fit_held, true, &fitter), FitCheck::Held);
+    assert!(!crate::eta::fit::coeffs::fit_dir(root).exists(), "no fit-*.json written");
+}
+
 // -- records ----------------------------------------------------------------
 
 #[test]
