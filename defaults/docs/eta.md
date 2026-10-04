@@ -190,11 +190,13 @@ tracker and every later consumer call it, so the stage a model is trained on
 and the stage it serves cannot drift. `loom:blocked`, `loom:needs-capability`
 and an operator hold on a PR that is not approved are still `blocked`.
 
-**Shipped heuristics do not move.** `start-v1`, `finish-v1` and `land-v1`
-to `land-v3` refuse an item in `merge_hold` as `blocked` before writing any
-field, so their explanations are byte-identical to the refusal of a held PR
-before the stage existed, and no shipped `stage_marks` carries a `merge_hold`
-mark (it is marked only on a path that starts there). Their `merge_wait`
+**Shipped heuristics do not move.** `start-v1`, `finish-v1`, `land-v1` to
+`land-v3` and `land-2026-10-04-amber-heron` refuse an item in `merge_hold` as
+`blocked` before writing any field, and a held item's `features` are those
+of that refusal (`no_stage`), so their explanations are byte-identical to
+the refusal of a held PR before the stage existed, and no shipped
+`stage_marks` carries a `merge_hold` mark (it is marked only on a path that
+starts there). Their `merge_wait`
 history keeps the **pooled** definition from every source: approval in force
 to merge, hold included. A heuristic opts in to modelling the hold with
 `PathRules::models_hold`; its path from `merge_hold` is the rest of the hold
