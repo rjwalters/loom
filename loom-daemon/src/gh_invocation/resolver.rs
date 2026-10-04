@@ -104,7 +104,12 @@ pub(crate) mod test_stub {
     pub(crate) fn path() -> PathBuf {
         STUB.get_or_init(|| {
             use std::os::unix::fs::PermissionsExt;
-            let dir = tempfile::tempdir().expect("stub tempdir");
+            // Named prefix so an exec trace can tell this stub apart from a
+            // test's own fake `gh` (#10138).
+            let dir = tempfile::Builder::new()
+                .prefix("loom-gh-test-stub-")
+                .tempdir()
+                .expect("stub tempdir");
             let p = dir.path().join("gh");
             let script = "#!/bin/sh\n\
                 echo \"loom-daemon test reached the real gh: $*\" >&2\n\
