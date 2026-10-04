@@ -19,6 +19,12 @@
 //!   listing's depth window, so an old PR's closure is known even when its
 //!   `closed` event has aged out of that listing.
 //!
+//! - **Head commits.** One [`EventKind::HeadCommit`] row per PR (`label` =
+//!   `head.sha`), stamped at the PR's `updated_at` — a push bumps
+//!   `updated_at`, so the head was that commit by then. It is the work list of
+//!   the check-run fetcher ([`super::fleet_events_fanout`]); a re-read after
+//!   the PR changed adds a newer row, never rewrites the old one.
+//!
 //! # Knowable-at of a closing reference
 //!
 //! A `closing_ref` row is stamped at the PR's `created_at`: Loom's builder
@@ -68,6 +74,15 @@ struct RestPull {
     merged_at: Option<DateTime<Utc>>,
     #[serde(default)]
     body: Option<String>,
+    #[serde(default)]
+    updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    head: Option<RestHead>,
+}
+
+#[derive(Deserialize)]
+struct RestHead {
+    sha: String,
 }
 
 /// Issues `body` links (ascending, one per issue) and the phrase family that
@@ -117,6 +132,9 @@ pub fn parse_pulls(
                     .with_target(Some(target)),
             );
         }
+        if let (Some(head), Some(at)) = (&pr.head, pr.updated_at) {
+            events.push(row(EventKind::HeadCommit, Some(&head.sha), at, 0));
+        }
         if let Some(at) = pr.merged_at {
             events.push(row(EventKind::Merged, None, at, 0));
         }
@@ -138,6 +156,7 @@ mod tests {
        "body": "Closes #5\n\nAlso fixes #7 and is part of #8."},
       {"id": 9001, "number": 11, "created_at": "2026-10-03T09:00:00Z",
        "closed_at": "2026-10-03T12:00:00Z", "merged_at": "2026-10-03T12:00:00Z",
+       "updated_at": "2026-10-03T12:00:05Z", "head": {"sha": "abc123", "ref": "f"},
        "body": "Part of #5"},
       {"id": 9000, "number": 10, "created_at": "2026-10-02T09:00:00Z",
        "closed_at": "2026-10-02T10:00:00Z", "merged_at": null, "body": null}
@@ -199,6 +218,7 @@ mod tests {
             vec![
                 (EventKind::Opened, None, None, 0),
                 (EventKind::ClosingRef, Some("part_of"), Some(5), 9001),
+                (EventKind::HeadCommit, Some("abc123"), None, 0),
                 (EventKind::Merged, None, None, 0),
                 (EventKind::Closed, None, None, 0),
             ]
@@ -217,6 +237,12 @@ mod tests {
             .find(|e| e.item == 12 && e.target == Some(5))
             .unwrap();
         assert_eq!(r.event_time.to_rfc3339(), "2026-10-04T09:00:00+00:00");
+        // The head commit is stamped at `updated_at`, not at creation.
+        let head = events
+            .iter()
+            .find(|e| e.kind == EventKind::HeadCommit)
+            .unwrap();
+        assert_eq!(head.event_time.to_rfc3339(), "2026-10-03T12:00:05+00:00");
     }
 
     #[test]

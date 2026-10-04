@@ -58,6 +58,10 @@ pub const PR_VIEW_STATE: ForgeOp = ForgeOp::inventoried("pr.view-state");
 /// The closing-issue references of a batch of PRs (GraphQL).
 pub const PR_CLOSING_ISSUE_REFERENCES: ForgeOp =
     ForgeOp::inventoried("pr.closing-issue-references");
+/// `GET repos/{o}/{r}/pulls/{n}/reviews` — one PR's formal reviews.
+pub const REVIEW_LIST_FORMAL: ForgeOp = ForgeOp::inventoried("review.list-formal");
+/// `GET repos/{o}/{r}/commits/{sha}/check-runs` — one commit's check runs.
+pub const CI_CHECK_RUNS_FOR_SHA: ForgeOp = ForgeOp::inventoried("ci.check-runs-for-sha");
 /// `GET repos/{o}/{r}/actions/runs…` (and the jobs of one run).
 pub const CI_WORKFLOW_RUNS_FOR_SHA: ForgeOp = ForgeOp::inventoried("ci.workflow-runs-for-sha");
 /// Job logs, run artifacts and artifact downloads.
@@ -81,6 +85,8 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     COMMENT_LIST,
     PR_VIEW_STATE,
     PR_CLOSING_ISSUE_REFERENCES,
+    REVIEW_LIST_FORMAL,
+    CI_CHECK_RUNS_FOR_SHA,
     CI_WORKFLOW_RUNS_FOR_SHA,
     CI_RUN_LOGS_AND_ARTIFACTS,
     REPO_LIST_FOR_OWNER,

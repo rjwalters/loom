@@ -217,6 +217,17 @@ pub fn agreement(events: &[RawEvent], repo: &str, explanations: &[Explanation]) 
             f.repo_pr_open_skip
                 .and_then(|l| state.pr_open_skip_lockout.map(|r| (r == l, None))),
         );
+        // The logged value was read at `pr_friction_observed_at` (at or
+        // before `as_of`); the reconstruction is at `as_of`. A logged `none`
+        // has no reconstructed counterpart: the cache cannot tell "no runs"
+        // from "an earlier head's runs", so it disagrees or is unreconstructed.
+        tally(
+            "pr_ci_status",
+            f.pr_ci_status.is_some(),
+            f.pr_ci_status
+                .as_deref()
+                .and_then(|l| pr.and_then(|p| p.ci.as_deref()).map(|r| (r == l, None))),
+        );
         tally(
             "pr_created_at",
             f.pr_created_at.is_some(),
@@ -386,5 +397,60 @@ mod tests {
         let r = agreement(&events, "o/r", &[logged(true), logged(false)]);
         let f = &r.features["repo_pr_open_skip"];
         assert_eq!((f.compared, f.agreed, f.unreconstructed), (2, 1, 0));
+    }
+
+    #[test]
+    fn the_pr_ci_status_is_scored_against_cached_check_runs() {
+        use crate::eta::fleet_events::SOURCE_FORGE;
+        let at = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ev = |item, kind, what, label: Option<&str>, secs: i64, seq| {
+            RawEvent::new(
+                "o/r",
+                item,
+                kind,
+                what,
+                label.map(str::to_string),
+                at + chrono::Duration::seconds(secs),
+                SOURCE_FORGE,
+                seq,
+                at,
+            )
+        };
+        let events = vec![
+            ev(7, ItemKind::Issue, EventKind::Opened, None, 0, 0),
+            ev(9, ItemKind::Pr, EventKind::Opened, None, 30, 0),
+            ev(9, ItemKind::Pr, EventKind::HeadCommit, Some("h"), 35, 0),
+            ev(9, ItemKind::Pr, EventKind::CheckRun, Some("started:test"), 40, 55)
+                .with_commit(Some("h".to_string())),
+            ev(9, ItemKind::Pr, EventKind::CheckRun, Some("failure:test"), 900, 55)
+                .with_commit(Some("h".to_string())),
+        ];
+        let logged = |as_of: &str, ci: &str| {
+            let mut e = explanation(
+                as_of,
+                Features {
+                    pr_ci_status: Some(ci.to_string()),
+                    ..Features::default()
+                },
+            );
+            e.subject.pr_number = Some(9);
+            e
+        };
+        let r = agreement(
+            &events,
+            "o/r",
+            &[
+                // Running at 00:10, failed by 00:20.
+                logged("2026-09-01T00:10:00Z", "pending"),
+                logged("2026-09-01T00:20:00Z", "failing"),
+                logged("2026-09-01T00:20:00Z", "passing"),
+                // Before the run started: unknown, not scored.
+                logged("2026-09-01T00:00:35Z", "none"),
+            ],
+        );
+        let f = &r.features["pr_ci_status"];
+        assert_eq!((f.compared, f.agreed, f.unreconstructed), (3, 2, 1));
     }
 }

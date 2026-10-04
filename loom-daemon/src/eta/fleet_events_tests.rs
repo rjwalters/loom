@@ -420,3 +420,20 @@ fn a_target_is_part_of_the_id_and_its_absence_keeps_the_original_id() {
         .contains("target"));
     assert!(serde_json::to_string(&a).unwrap().contains("\"target\":7"));
 }
+
+#[test]
+fn a_commit_is_part_of_the_id_only_when_present() {
+    let row = label(1, "loom:issue", 10, 5);
+    let original = row.id.clone();
+    assert_eq!(row.clone().with_commit(None).id, original);
+    let a = row.clone().with_commit(Some("aaa".to_string()));
+    let b = row.with_commit(Some("bbb".to_string()));
+    assert_ne!(a.id, original);
+    assert_ne!(a.id, b.id);
+    assert!(!serde_json::to_string(&label(1, "x", 1, 1))
+        .unwrap()
+        .contains("commit"));
+    assert!(serde_json::to_string(&a)
+        .unwrap()
+        .contains("\"commit\":\"aaa\""));
+}

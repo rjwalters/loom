@@ -50,9 +50,12 @@
 //!
 //! The sync driver ([`sync`]) is source-agnostic: it pages a
 //! [`RawEventSource`]. The forge sources are the repo-wide issue-events
-//! listing ([`super::fleet_events_forge`]) and the pulls listing (open, merge
-//! and close times plus closing references, [`super::fleet_events_pulls`]);
-//! the webhook-mirror importer and the review/CI fetchers are still to come.
+//! listing ([`super::fleet_events_forge`]), the pulls listing (open, merge
+//! and close times, closing references and head commits,
+//! [`super::fleet_events_pulls`]) and two per-PR listings — formal reviews
+//! and the head commit's check runs ([`super::fleet_events_reviews`]) —
+//! walked one PR at a time by [`super::fleet_events_fanout`]. The
+//! webhook-mirror importer is still to come.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -89,10 +92,9 @@ impl ItemKind {
 
 /// What happened to the item.
 ///
-/// `Review` and `CheckRun` are part of the schema now so the file format does
-/// not change when a later fetcher starts producing them; nothing emits them
-/// yet. `ClosingRef` comes from the pulls listing
-/// ([`super::fleet_events_pulls`]).
+/// `ClosingRef` and `HeadCommit` come from the pulls listing
+/// ([`super::fleet_events_pulls`]); `Review` and `CheckRun` from the per-PR
+/// listings ([`super::fleet_events_reviews`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
@@ -109,6 +111,11 @@ pub enum EventKind {
     /// target and no label, links none. Either way it records that the PR's
     /// linkage references were read.
     ClosingRef,
+    /// The PR's head commit (`label` = the SHA) as the pulls listing showed
+    /// it, stamped at the PR's `updated_at`: a push bumps `updated_at`, so the
+    /// head was this commit by then. The work list of the check-run fetcher,
+    /// and the head [`super::fleet_state_prs`] scopes a PR's CI to.
+    HeadCommit,
 }
 
 impl EventKind {
@@ -124,6 +131,7 @@ impl EventKind {
             EventKind::Review => "review",
             EventKind::CheckRun => "check_run",
             EventKind::ClosingRef => "closing_ref",
+            EventKind::HeadCommit => "head_commit",
         }
     }
 }
@@ -143,7 +151,10 @@ pub struct RawEvent {
     pub item_kind: ItemKind,
     pub kind: EventKind,
     /// The label, for `label_added` / `label_removed`; the phrase family
-    /// (`closes` / `part_of`) for a targeted `closing_ref`.
+    /// (`closes` / `part_of`) for a targeted `closing_ref`; the SHA for
+    /// `head_commit`; the review state for `review` and `<state>:<check name>`
+    /// for `check_run` (absent on a per-PR settle marker,
+    /// [`super::fleet_events_fanout`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     /// The issue a `closing_ref` row says the PR links. Absent on every
@@ -151,6 +162,11 @@ pub struct RawEvent {
     /// field existed keep their ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<u32>,
+    /// The commit a `check_run` row's run ran on (its `head_sha`), so replay
+    /// can scope CI to the PR's head ([`super::fleet_state_prs`]). Absent on
+    /// every other row, and then not part of the id, like `target`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     /// When it happened on the forge — the knowable-at instant.
     pub event_time: DateTime<Utc>,
     /// Where the row came from ([`SOURCE_FORGE`], later `webhook-mirror`).
@@ -186,6 +202,7 @@ impl RawEvent {
             kind,
             label,
             target: None,
+            commit: None,
             event_time,
             source: source.to_string(),
             seq,
@@ -203,12 +220,21 @@ impl RawEvent {
         self
     }
 
+    /// The same row naming the `commit` its run ran on, id re-derived.
+    #[must_use]
+    pub fn with_commit(mut self, commit: Option<String>) -> Self {
+        self.commit = commit;
+        self.id = self.derive_id();
+        self
+    }
+
     fn derive_id(&self) -> String {
         let repo = self.repo.to_ascii_lowercase();
         let item = self.item.to_string();
         let seq = self.seq.to_string();
         let at = crate::telemetry::trace::instant(self.event_time);
         let target = self.target.map(|t| format!("target={t}"));
+        let commit = self.commit.as_ref().map(|c| format!("commit={c}"));
         let mut parts = vec![
             "loom.eta.fleet.event",
             repo.as_str(),
@@ -222,6 +248,9 @@ impl RawEvent {
         ];
         if let Some(target) = &target {
             parts.push(target.as_str());
+        }
+        if let Some(commit) = &commit {
+            parts.push(commit.as_str());
         }
         crate::telemetry::trace::derived_hex(&parts, 16)
     }
@@ -387,6 +416,16 @@ pub struct EndpointCursor {
     /// Pages read from this endpoint, ever (`200`s and `304`s) — the
     /// forge-call ledger for this cache.
     pub pages_fetched: u64,
+    /// A per-PR walk ([`super::fleet_events_fanout`]) that settles the PR
+    /// closed at this instant: once complete, only the marker is left to
+    /// write, so a kill before it re-reads nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_for: Option<DateTime<Utc>>,
+    /// On a per-PR endpoint's ledger entry: the PR whose walk last completed.
+    /// The next run starts at the PR after it (wrapping), so bounded runs
+    /// visit every pending PR ([`super::fleet_events_fanout`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_after: Option<u32>,
 }
 
 /// The cursor file: per-endpoint resume state for one repo.
@@ -465,6 +504,12 @@ pub trait RawEventSource {
     fn cursor_key(&self) -> String;
     /// Fetch one 1-based page, conditional on `etag` when given.
     fn fetch_page(&mut self, page: u32, etag: Option<&str>) -> PageFetch;
+    /// Whether the listing is newest-first. A refresh of a newest-first
+    /// listing stops at the first page holding a cached row; any other
+    /// listing (a PR's reviews, a commit's check runs) is walked to its end.
+    fn newest_first(&self) -> bool {
+        true
+    }
 }
 
 /// Which walk [`sync`] performs.
@@ -513,6 +558,7 @@ pub fn sync(
     max_pages: u64,
 ) -> std::io::Result<SyncReport> {
     let key = source.cursor_key();
+    let newest_first = source.newest_first();
     let mut report = SyncReport {
         outcome: SyncOutcome::Complete,
         pages: 0,
@@ -577,7 +623,7 @@ pub fn sync(
                         if page == 1 {
                             state.refresh_head_etag = etag;
                         }
-                        if overlaps || last {
+                        if (overlaps && newest_first) || last {
                             state.head_etag = state.refresh_head_etag.take();
                             state.refresh_next_page = None;
                             true

@@ -1,13 +1,17 @@
 //! `loom-daemon eta fleet events backfill|refresh` and
 //! `loom-daemon eta fleet state --as-of` (#10197).
 //!
-//! - `events backfill` walks each endpoint (`--endpoint`, default both: the
-//!   issue-events listing, then the pulls listing) from where its cursor left
-//!   off to the end of the listing, checkpointing after every page. A rate-limit stop, the reserve floor or `--max-pages` ends the run
-//!   cleanly with exit `75` (`EX_TEMPFAIL`); re-running resumes at the next
-//!   unread page.
+//! - `events backfill` walks each endpoint (`--endpoint`, default all four:
+//!   the issue-events listing, the pulls listing, then the per-PR reviews and
+//!   check runs) from where its cursor left off to the end of the listing,
+//!   checkpointing after every page. A rate-limit stop, the reserve floor or
+//!   `--max-pages` (per endpoint) ends the run cleanly with exit `75`
+//!   (`EX_TEMPFAIL`); re-running resumes at the next unread page.
 //! - `events refresh` reads from the head (page 1 conditional on the cached
 //!   ETag, so a quiet repo costs one `304`) until it meets rows already cached.
+//! - The per-PR endpoints ([`loom_daemon::eta::fleet_events_fanout`]) do the
+//!   same under both verbs: poll every open PR (conditionally), then read each
+//!   closed PR not yet settled, once.
 //! - `state --as-of T` replays the cached events strictly before `T`
 //!   ([`loom_daemon::eta::fleet_state::fleet_state`]) and makes no forge call.
 
@@ -18,6 +22,7 @@ use chrono::{DateTime, Utc};
 
 use loom_daemon::eta::fleet_agreement;
 use loom_daemon::eta::fleet_events::{self, EventLog, EventsCursor, SyncMode, SyncOutcome};
+use loom_daemon::eta::fleet_events_fanout::{pr_work, sync_per_pr};
 use loom_daemon::eta::fleet_events_forge::{ForgeEndpoint, ForgeEventSource};
 use loom_daemon::eta::fleet_state::{fleet_state, FleetState};
 
@@ -64,8 +69,8 @@ pub(crate) struct EventsSyncArgs {
     #[arg(long, value_name = "N")]
     pub max_pages: Option<u64>,
 
-    /// Read only this listing: `issues-events` or `pulls`. Default: both, in
-    /// that order.
+    /// Read only this listing: `issues-events`, `pulls`, `reviews` or
+    /// `check-runs`. Default: all four, in that order.
     #[arg(long, value_name = "ENDPOINT", value_parser = parse_endpoint)]
     pub endpoint: Option<ForgeEndpoint>,
 
@@ -94,25 +99,48 @@ impl EventsSyncArgs {
                 &root,
                 self.reserve.unwrap_or(DEFAULT_RESERVE),
             );
-            let report = fleet_events::sync(
-                &mut source,
-                &mut log,
-                &mut cursor,
-                &cursor_file,
-                mode,
-                self.max_pages.unwrap_or(DEFAULT_MAX_PAGES),
-            )?;
+            let max_pages = self.max_pages.unwrap_or(DEFAULT_MAX_PAGES);
             let name = endpoint.name();
+            let (outcome, pages, appended) = match endpoint.per_pr() {
+                None => {
+                    let r = fleet_events::sync(
+                        &mut source,
+                        &mut log,
+                        &mut cursor,
+                        &cursor_file,
+                        mode,
+                        max_pages,
+                    )?;
+                    (r.outcome, r.pages, r.appended)
+                }
+                Some(kind) => {
+                    // The work list is whatever the earlier endpoints left on disk.
+                    let work = pr_work(&fleet_events::load_events(&events), &repo);
+                    let r = sync_per_pr(
+                        kind,
+                        &mut source,
+                        &work,
+                        &mut log,
+                        &mut cursor,
+                        &cursor_file,
+                        max_pages,
+                        Utc::now(),
+                    )?;
+                    println!(
+                        "[eta fleet events] {repo} {name}: {} closed PR(s) settled, {} still to read",
+                        r.settled, r.remaining
+                    );
+                    (r.outcome, r.pages, r.appended)
+                }
+            };
             println!(
-                "[eta fleet events] {repo} {name}: {} page(s) read, {} event(s) appended, {} cached ({})",
-                report.pages,
-                report.appended,
+                "[eta fleet events] {repo} {name}: {pages} page(s) read, {appended} event(s) appended, {} cached ({})",
                 log.len(),
                 events.display(),
             );
-            match report.outcome {
+            match outcome {
                 SyncOutcome::Complete => {
-                    if mode == SyncMode::Backfill {
+                    if mode == SyncMode::Backfill && endpoint.per_pr().is_none() {
                         println!(
                             "[eta fleet events] {name}: backfill complete; use `refresh` from now on"
                         );
@@ -248,6 +276,10 @@ fn render(state: &FleetState) -> String {
         .pr_open_skip_lockout
         .map_or("unknown (no closing refs cached)", |l| if l { "yes" } else { "no" });
     let _ = writeln!(out, "  open-PR lockout: {lockout}");
+    let count = |n: Option<usize>| n.map_or("unknown".to_string(), |n| n.to_string());
+    let _ = writeln!(out, "  PRs CI failing:  {}", count(state.open_prs_ci_failing));
+    let _ = writeln!(out, "  PRs CI passing:  {}", count(state.open_prs_ci_passing));
+    let _ = writeln!(out, "  PRs approved:    {}", count(state.open_prs_approved));
     for (stage, n) in &state.stage_counts {
         let _ = writeln!(out, "    {stage:<15} {n}");
     }
@@ -286,8 +318,10 @@ mod tests {
     fn endpoint_names_parse_and_unknown_ones_are_refused() {
         assert_eq!(parse_endpoint("pulls"), Ok(ForgeEndpoint::Pulls));
         assert_eq!(parse_endpoint("issues-events"), Ok(ForgeEndpoint::IssuesEvents));
-        assert!(parse_endpoint("reviews")
+        assert_eq!(parse_endpoint("reviews"), Ok(ForgeEndpoint::Reviews));
+        assert_eq!(parse_endpoint("check-runs"), Ok(ForgeEndpoint::CheckRuns));
+        assert!(parse_endpoint("statuses")
             .unwrap_err()
-            .contains("issues-events, pulls"));
+            .contains("issues-events, pulls, reviews, check-runs"));
     }
 }
