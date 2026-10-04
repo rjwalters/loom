@@ -248,5 +248,9 @@ fn repeated_passes_reach_a_child_whose_blocker_reads_did_not_fit() {
     let second = host.pass(&world, &[input], Vec::new(), t(10, 1));
     assert!(world.repo(slug).issue_reads - before <= MAX_WALK_READS_PER_PASS);
     let got: Vec<u32> = inherited(&second).into_iter().map(|(n, _, _)| n).collect();
-    assert_eq!(got, vec![200], "#200 inherits once the settled children are free");
+    assert_eq!(
+        got,
+        vec![200, 301, 302],
+        "#200 inherits once the settled children are free, and so do its open blockers"
+    );
 }
