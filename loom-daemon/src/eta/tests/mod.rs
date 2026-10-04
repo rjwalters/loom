@@ -11,6 +11,7 @@ mod fleet;
 mod journal;
 mod land_v3;
 mod primitives;
+mod queue_features;
 mod ready;
 mod score;
 mod shadow;

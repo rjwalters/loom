@@ -47,13 +47,13 @@
 //!
 //! A feature `land-v3` reads but the input lacks contributes nothing (scale
 //! `1.0`, offset `0`) and is named in `features_omitted` with reason
-//! [`INPUT_MISSING`]. Today the tracker populates `labels` (so a live
-//! `points:N` label does scale Builder) but not `queue_running`, and the
-//! backtest replays with no features at all — so replayed `land-v3`
-//! estimates are `land-v2` plus the interval widening and floor alone, and
-//! the friction term stays inert until point-in-time queue state is
-//! reconstructed (#10197). The input is read from `EstimateInput` only —
-//! never looked up live.
+//! [`INPUT_MISSING`], unless the tracker already named it with its own
+//! reason. The tracker populates `labels` (so a live `points:N` label does
+//! scale Builder) and, from #10201, `queue_running` on every item while a
+//! fresh dispatch plan exists. The backtest replays with no features at all,
+//! so replayed `land-v3` estimates are `land-v2` plus the interval widening
+//! and floor alone until point-in-time queue state is reconstructed (#10197).
+//! The input is read from `EstimateInput` only — never looked up live.
 //!
 //! # The constants are fixture-derived, not fitted to live data
 //!
