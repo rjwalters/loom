@@ -596,16 +596,14 @@ claim's* activity marker —
 <!-- loom:claim-activity claim=$CLAIMED_AT -->
 ```
 
-Every other comment is ignored: it neither pins nor extends the claim. This is
-the fix for the PR #6513 livelock. The old rule counted **any** non-stand-down
-comment posted after the claim (`COMMENTS_AFTER > 0`) as proof the claimant was
-alive, so a single routine Builder post-push status note — a different author,
-saying nothing about the review — pinned that claim "fresh" for the rest of its
-life, because `CLAIMED_AT` never moves. And claimant activity now only **resets
-the idle clock** rather than pinning the claim, so even a genuine heartbeat buys
-only another `LOOM_STALE_REVIEWING_MINUTES`.
+Also counted (#10235): a trusted Judge-progress comment (`loom:ac-verified`, `loom:verdict-sha`, ...)
+and **your own force-push of the PR head** (a rebase onto `main`) — the daemon reconciler and this
+script both honor them. Every other comment is ignored: it neither pins nor extends the claim (the
+PR #6513 livelock: a routine Builder post-push note used to pin a claim "fresh" forever). Claimant
+activity only **resets the idle clock**, so a genuine heartbeat buys another
+`LOOM_STALE_REVIEWING_MINUTES`.
 
-**If your own review legitimately runs long**, post a progress comment ending
+**If your review runs long** (esp. before a CI wait), post a progress comment ending
 with that marker so the next pass can see you are alive. The script prints the
 marker for the live claim, so you never hand-assemble it:
 

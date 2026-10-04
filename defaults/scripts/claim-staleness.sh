@@ -248,6 +248,21 @@ _claimed_at() {
         sort | tail -n 1
 }
 
+# #10235: newest force-push of the PR head by the CLAIMANT (the actor of the
+# claim's own `labeled` event) after the claim. Only `head_ref_force_pushed`
+# counts (a Judge rebase/merge before a CI wait); an ordinary Builder commit
+# does not. Mirrors most_recent_head_push_at in claim_reconciliation.rs.
+# Prints nothing on any failure (fail-open to the old rule).
+_head_push_at() {
+    gh api "$API_BASE/issues/$NUMBER/timeline?per_page=100" --paginate \
+        --jq ".[] | select((.event==\"labeled\" and .label.name==\"$LABEL\") or .event==\"head_ref_force_pushed\") | {event, created_at, actor: .actor.login}" 2>/dev/null |
+        jq -rs --arg c "$CLAIMED_AT" '
+            ([.[] | select(.event == "labeled" and .created_at == $c) | .actor] | first) as $who
+            | if $who == null then empty else
+                [.[] | select(.event == "head_ref_force_pushed" and .created_at > $c and .actor == $who) | .created_at] | max // empty
+              end' 2>/dev/null
+}
+
 _comments_json() {
     gh api "$API_BASE/issues/$NUMBER/comments?per_page=100" --paginate 2>/dev/null |
         jq -s 'if length == 0 then [] else (map(if type == "array" then . else [.] end) | add) end' 2>/dev/null
@@ -303,6 +318,18 @@ if [[ -z "$CLAIM_STATE" ]]; then
         '[.[] | select(.body | contains($m))] | length' <<<"$AFTER_JSON")"
     LAST_ACTIVITY_AT="$(jq -r --arg m "${ACTIVITY_PREFIX}${CLAIMED_AT} -->" --arg c "$CLAIMED_AT" \
         '([.[] | select(.body | contains($m)) | .created_at] + [$c]) | max' <<<"$AFTER_JSON")"
+
+    # #10235: a claimant that is demonstrably working also resets the idle clock
+    # via (a) a trusted Judge-progress comment (loom:reviewing only; stand-down
+    # comments excluded) and (b) its own force-push of the PR head. The daemon
+    # reconciler (claim_reconciliation.rs pr_liveness) applies the same signals.
+    if [[ "$LABEL" == "loom:reviewing" ]]; then
+        JUDGE_AT="$(jq -r '[.[] | select((.body | contains("<!-- loom:standdown claim=") | not)
+            and (.body | test("<!-- loom:(verdict-sha|review-reconciliation|ac-verified|fast-track-evaluation|docs-fast-path-evaluation|fallback-evaluated)"))) | .created_at] | max // empty' <<<"$AFTER_JSON" 2>/dev/null || true)"
+        [[ -n "$JUDGE_AT" && "$JUDGE_AT" > "$LAST_ACTIVITY_AT" ]] && LAST_ACTIVITY_AT="$JUDGE_AT"
+    fi
+    PUSH_AT="$(_head_push_at || true)"
+    [[ "$PUSH_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ && "$PUSH_AT" > "$LAST_ACTIVITY_AT" ]] && LAST_ACTIVITY_AT="$PUSH_AT"
 
     # Stand-down comments for THIS claim (prefix match covers both the legacy
     # `claim=<ts> -->` form and the `claim=<ts> seq=N -->` form).
