@@ -18,10 +18,10 @@
 //! # Stages
 //!
 //! Stage names follow `.loom/docs/label-state-machine.md` and
-//! [`super::labels`]. One addition: an approved PR (`loom:pr`) that also
-//! carries an operator label is [`ItemStage::HeldForHuman`], not `merge_wait`
-//! — it waits on a person, not a queue, and is a large share of open-PR time
-//! (#10218 builds the estimator for it; this only exposes the stage).
+//! [`super::labels`]. A PR's stage is [`stage_from_pr_labels`] verbatim, with
+//! its `merge_hold` (#10218) named [`ItemStage::HeldForHuman`]: an approved
+//! PR whose only holds are operator holds waits on a person, not a queue.
+//! This module defines no held rule of its own (#10278).
 //!
 //! # Open-PR lockout
 //!
@@ -51,24 +51,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::fleet_events::{EventKind, ItemKind, RawEvent};
-use super::labels::{check_holds, stage_from_pr_labels, APPROVED, READY_LABEL};
+use super::labels::{check_holds, pr_flags, stage_from_pr_labels, FLAG_OP_HOLD, READY_LABEL};
 use super::Stage;
 use crate::work_finder::BUILDING_LABEL;
 
 /// Schema tag of a [`FleetState`].
 pub const STATE_SCHEMA: &str = "eta-fleet-state/v1";
-
-/// Labels that put an item on a human: the operator escalation and its
-/// sub-kinds. `loom:operator-priority` is the operator's star, not a hold, and
-/// is deliberately absent.
-pub const OPERATOR_HOLD_LABELS: &[&str] = &[
-    "loom:operator",
-    "loom:operator-only",
-    "loom:operator-blocked",
-    "loom:operator-mechanical",
-    "loom:operator-decision",
-    "loom:operator-objective",
-];
 
 /// Where an open item is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -86,7 +74,8 @@ pub enum ItemStage {
     ReviewWait,
     Doctor,
     MergeWait,
-    /// Approved PR also carrying an operator label.
+    /// [`stage_from_pr_labels`]' `merge_hold`: an approved PR whose only
+    /// holds are operator holds. A second hold or verdict makes it `Blocked`.
     HeldForHuman,
     /// A hold or park label (including the operator labels on an issue).
     Blocked,
@@ -118,10 +107,12 @@ fn has(labels: &BTreeSet<String>, wanted: &str) -> bool {
     labels.contains(wanted)
 }
 
-/// Whether `labels` carry any [`OPERATOR_HOLD_LABELS`] entry.
+/// Whether `labels` carry an operator hold: [`pr_flags`]' [`FLAG_OP_HOLD`],
+/// the one label → flag definition (#10278).
 #[must_use]
 pub fn operator_hold(labels: &BTreeSet<String>) -> bool {
-    OPERATOR_HOLD_LABELS.iter().any(|l| has(labels, l))
+    let list: Vec<String> = labels.iter().cloned().collect();
+    pr_flags(&list) & FLAG_OP_HOLD != 0
 }
 
 /// The stage an open item with `labels` is in.
@@ -129,21 +120,17 @@ pub fn operator_hold(labels: &BTreeSet<String>) -> bool {
 pub fn item_stage(kind: ItemKind, labels: &BTreeSet<String>) -> ItemStage {
     let list: Vec<String> = labels.iter().cloned().collect();
     match kind {
-        ItemKind::Pr => {
-            if has(labels, APPROVED) && operator_hold(labels) {
-                return ItemStage::HeldForHuman;
-            }
-            match stage_from_pr_labels(&list) {
-                Ok(Stage::ReviewWait) => ItemStage::ReviewWait,
-                Ok(Stage::Doctor) => ItemStage::Doctor,
-                Ok(Stage::MergeWait) => ItemStage::MergeWait,
-                Ok(_) => ItemStage::Unknown,
-                Err(super::NoEstimateReason::Blocked) => ItemStage::Blocked,
-                Err(_) => ItemStage::Unknown,
-            }
-        }
+        ItemKind::Pr => match stage_from_pr_labels(&list) {
+            Ok(Stage::ReviewWait) => ItemStage::ReviewWait,
+            Ok(Stage::Doctor) => ItemStage::Doctor,
+            Ok(Stage::MergeWait) => ItemStage::MergeWait,
+            Ok(Stage::MergeHold) => ItemStage::HeldForHuman,
+            Ok(_) => ItemStage::Unknown,
+            Err(super::NoEstimateReason::Blocked) => ItemStage::Blocked,
+            Err(_) => ItemStage::Unknown,
+        },
         ItemKind::Issue => {
-            if check_holds(&list).is_err() || operator_hold(labels) {
+            if check_holds(&list).is_err() {
                 ItemStage::Blocked
             } else if has(labels, BUILDING_LABEL) {
                 ItemStage::Building
@@ -176,7 +163,7 @@ pub struct ItemState {
     pub time_in_stage_sec: i64,
     /// The item's creation time when the cache holds it, else its first event.
     pub opened_at: DateTime<Utc>,
-    /// Carries an operator label.
+    /// Carries an operator hold ([`operator_hold`]).
     pub operator_hold: bool,
     /// For an issue: the lowest-numbered open PR whose body links it (closing
     /// keyword or `Part of` / `Contributes to`).
@@ -199,7 +186,7 @@ pub struct FleetState {
     pub open_prs: usize,
     /// Open items labelled `loom:building` — the slots-in-use proxy.
     pub building: usize,
-    /// Open items carrying an operator label.
+    /// Open items carrying an operator hold ([`operator_hold`]).
     pub operator_holds: usize,
     /// Open PRs in [`ItemStage::HeldForHuman`].
     pub held_for_human: usize,

@@ -351,3 +351,150 @@ fn closing_refs_at_or_after_the_instant_cannot_change_the_answer() {
         serde_json::to_string(&fleet_state(&late, REPO, as_of)).unwrap()
     );
 }
+
+/// The labels the PR-stage parity test (#10278) enumerates every subset of:
+/// the verdicts, every operator label, the other holds, and the two
+/// non-hold flags.
+const PARITY_UNIVERSE: [&str; 14] = [
+    "loom:pr",
+    "loom:review-requested",
+    "loom:changes-requested",
+    "loom:treating",
+    "loom:operator",
+    "loom:operator-only",
+    "loom:operator-decision",
+    "loom:operator-mechanical",
+    "loom:operator-blocked",
+    "loom:operator-objective",
+    "loom:blocked",
+    "loom:needs-capability",
+    "loom:sequenced",
+    "loom:operator-priority",
+];
+
+fn label_set(labels: &[&str]) -> BTreeSet<String> {
+    labels.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// `fleet_state` has no held rule of its own (#10278): over all 2^14 label
+/// sets, a PR's stage is `stage_from_pr_labels` mapped name for name, and the
+/// operator-hold flag is `pr_flags`' `FLAG_OP_HOLD`.
+#[test]
+fn pr_stage_and_operator_hold_match_labels_on_every_label_set() {
+    use crate::eta::labels::{pr_flags, FLAG_OP_HOLD};
+    use crate::eta::NoEstimateReason;
+    for mask in 0u32..(1 << PARITY_UNIVERSE.len()) {
+        let set: BTreeSet<String> = PARITY_UNIVERSE
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mask & (1 << i) != 0)
+            .map(|(_, l)| (*l).to_string())
+            .collect();
+        let list: Vec<String> = set.iter().cloned().collect();
+        let stage = item_stage(ItemKind::Pr, &set);
+        let labelled = stage_from_pr_labels(&list);
+        assert_eq!(stage == ItemStage::HeldForHuman, labelled == Ok(Stage::MergeHold), "{set:?}");
+        let expected = match labelled {
+            Ok(Stage::ReviewWait) => ItemStage::ReviewWait,
+            Ok(Stage::Doctor) => ItemStage::Doctor,
+            Ok(Stage::MergeWait) => ItemStage::MergeWait,
+            Ok(Stage::MergeHold) => ItemStage::HeldForHuman,
+            Err(NoEstimateReason::Blocked) => ItemStage::Blocked,
+            _ => ItemStage::Unknown,
+        };
+        assert_eq!(stage, expected, "{set:?}");
+        assert_eq!(operator_hold(&set), pr_flags(&list) & FLAG_OP_HOLD != 0, "{set:?}");
+    }
+}
+
+/// The label sets on which the old `fleet_state` rule and `merge_hold`
+/// disagreed (#10278), pinned with explicit stages.
+#[test]
+fn a_second_hold_or_verdict_beside_an_operator_hold_is_blocked() {
+    for (labels, stage) in [
+        (&["loom:pr", "loom:operator", "loom:blocked"][..], ItemStage::Blocked),
+        (&["loom:pr", "loom:operator", "loom:needs-capability"][..], ItemStage::Blocked),
+        (&["loom:pr", "loom:changes-requested", "loom:operator"][..], ItemStage::Blocked),
+        (&["loom:pr", "loom:operator-mechanical"][..], ItemStage::Blocked),
+        (&["loom:pr", "loom:operator", "loom:sequenced"][..], ItemStage::HeldForHuman),
+        (
+            &["loom:pr", "loom:operator-only", "loom:operator-mechanical"][..],
+            ItemStage::HeldForHuman,
+        ),
+        (&["loom:pr", "loom:operator-priority"][..], ItemStage::MergeWait),
+        (&["loom:treating"][..], ItemStage::Doctor),
+    ] {
+        assert_eq!(item_stage(ItemKind::Pr, &label_set(labels)), stage, "{labels:?}");
+    }
+}
+
+/// An issue is `Blocked` exactly when serving refuses it as blocked (#10278).
+#[test]
+fn issue_blocked_matches_unstarted_issue_reason_on_every_label_set() {
+    use crate::eta::labels::unstarted_issue_reason;
+    use crate::eta::NoEstimateReason;
+    const UNIVERSE: [&str; 15] = [
+        "loom:issue",
+        "loom:building",
+        "loom:curated",
+        "loom:curating",
+        "loom:triage",
+        "loom:operator",
+        "loom:operator-only",
+        "loom:operator-decision",
+        "loom:operator-mechanical",
+        "loom:operator-blocked",
+        "loom:operator-objective",
+        "loom:blocked",
+        "loom:needs-capability",
+        "loom:sequenced",
+        "loom:operator-priority",
+    ];
+    for mask in 0u32..(1 << UNIVERSE.len()) {
+        let set: BTreeSet<String> = UNIVERSE
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mask & (1 << i) != 0)
+            .map(|(_, l)| (*l).to_string())
+            .collect();
+        let list: Vec<String> = set.iter().cloned().collect();
+        assert_eq!(
+            item_stage(ItemKind::Issue, &set) == ItemStage::Blocked,
+            unstarted_issue_reason(&list, None) == Some(NoEstimateReason::Blocked),
+            "{set:?}"
+        );
+    }
+}
+
+/// An operator sub-kind without its `loom:operator-only` base no longer
+/// blocks an issue; with the base it still does (#10278).
+#[test]
+fn an_issue_sub_kind_blocks_only_beside_its_operator_only_base() {
+    for (labels, stage) in [
+        (&["loom:issue", "loom:operator-blocked"][..], ItemStage::ReadyWait),
+        (
+            &["loom:issue", "loom:operator-only", "loom:operator-blocked"][..],
+            ItemStage::Blocked,
+        ),
+    ] {
+        assert_eq!(item_stage(ItemKind::Issue, &label_set(labels)), stage, "{labels:?}");
+    }
+}
+
+#[test]
+fn lifting_the_operator_hold_returns_an_approved_pr_to_merge_wait() {
+    use ItemKind::Pr;
+    let events = vec![
+        opened(20, Pr, 0),
+        add(20, Pr, "loom:pr", 10, 1),
+        add(20, Pr, "loom:operator", 20, 2),
+        remove(20, Pr, "loom:operator", 30, 3),
+    ];
+    let held = fleet_state(&events, REPO, t(25));
+    assert_eq!(item(&held, Pr, 20).stage, ItemStage::HeldForHuman);
+    assert_eq!((held.held_for_human, held.operator_holds), (1, 1));
+    let lifted = fleet_state(&events, REPO, t(40));
+    let pr = item(&lifted, Pr, 20);
+    assert_eq!((pr.stage, pr.stage_entered_at), (ItemStage::MergeWait, t(30)));
+    assert_eq!((lifted.held_for_human, lifted.operator_holds), (0, 0));
+}

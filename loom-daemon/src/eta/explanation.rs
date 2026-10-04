@@ -617,7 +617,9 @@ pub struct Features {
     #[serde(default)]
     pub pr_friction_observed_at: Option<DateTime<Utc>>,
     /// Whether a hold label (an operator / merge-risk hold, `loom:blocked`,
-    /// a park) is on the item: explicit, not only inside `labels`.
+    /// a park) is on the item: explicit, not only inside `labels`. Any
+    /// `labels::hold_labels()` entry (`check_holds`), deliberately broader
+    /// than `pr_flags`' `FLAG_OP_HOLD`; see #10278.
     #[serde(default)]
     pub operator_hold: Option<bool>,
 }
