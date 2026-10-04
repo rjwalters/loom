@@ -154,6 +154,10 @@ fn fit_matches_the_fixture_within_tolerance() {
         assert!(max_abs_diff(&got.sd, &want.sd) < 1e-9, "{stage} sd");
         let coef = max_abs_diff(&got.coef, &want.coef);
         let intercept = (got.intercept - want.intercept).abs();
+        eprintln!(
+            "parity {stage}: max|Δcoef| {coef:e}, |Δintercept| {intercept:e}, {} iterations",
+            got.iterations
+        );
         // The issue's AC is 1e-3; the prototype reached 2.2e-7, so anything
         // above 1e-5 is a bug rather than solver noise.
         assert!(
@@ -171,6 +175,10 @@ fn fit_matches_the_fixture_within_tolerance() {
     assert!(max_abs_diff(&got.sd, &want.sd) < 1e-9, "aft sd");
     let beta = max_abs_diff(&got.beta, &want.beta);
     let log_sigma = max_abs_diff(&got.log_sigma, &want.log_sigma);
+    eprintln!(
+        "parity aft: max|Δbeta| {beta:e}, max|Δlog_sigma| {log_sigma:e}, objective {}, {} iterations",
+        got.objective, got.iterations
+    );
     assert!(beta < 1e-5 && log_sigma < 1e-5, "aft: beta {beta:e}, log_sigma {log_sigma:e}");
     assert!(
         (got.objective - 1.453_215_125_245_752_4).abs() < 1e-6,
