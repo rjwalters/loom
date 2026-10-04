@@ -3479,3 +3479,7 @@ mod fleet_noop_cooldown_tests;
 // for the same reason as the two above.
 #[cfg(test)]
 mod forge_egress_tests;
+
+// Issue #8997's rate-limited label-flip breaker coverage (same reason).
+#[cfg(test)]
+mod rate_limit_tests;

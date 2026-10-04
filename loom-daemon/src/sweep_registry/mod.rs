@@ -258,6 +258,10 @@ pub struct SweepRegistryConfig {
     /// means `PolicySources::from_process`; `new` pins the unconfigured
     /// default under `cfg(test)` so tests never read the host policy.
     pub forge_egress_sources: Option<crate::forge_egress::policy::PolicySources>,
+    /// The rate-limit breaker the dispatch path's forge writes (label flip,
+    /// lease comment) report failures to (Issue #8997). `None` ⇒ the
+    /// process-global breaker; tests inject their own.
+    pub rate_limit: Option<crate::rate_limit_breaker::report::BreakerHandle>,
 }
 
 impl SweepRegistryConfig {
@@ -277,6 +281,7 @@ impl SweepRegistryConfig {
             } else {
                 None
             },
+            rate_limit: None,
         }
     }
 

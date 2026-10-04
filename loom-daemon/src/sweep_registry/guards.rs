@@ -23,6 +23,9 @@ pub(crate) mod claim_label;
 
 /// The registry's facade `gh` helpers, shared by every `sweep_registry` module.
 mod gh_exec;
+mod rate_limit_report;
+#[cfg(test)]
+mod rate_limit_report_tests;
 
 /// Three-state result of the open-linked-PR probe (Issue #4452).
 ///
@@ -1213,6 +1216,7 @@ impl SweepRegistry {
             Some(output) if output.status.success() => Ok(()),
             Some(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
+                self.report_forge_failure(&stderr, "sweep_dispatch (label flip)");
                 Err(anyhow!("gh issue edit failed for #{issue}: {}", stderr.trim()))
             }
             None => Err(anyhow!(
@@ -1340,11 +1344,15 @@ impl SweepRegistry {
         let timeout = reap_gh_timeout();
         match self.run_counted(comment) {
             Ok(Some(output)) if output.status.success() => {}
-            Ok(Some(output)) => log::warn!(
-                "lease comment for #{issue} exited {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
+            Ok(Some(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                self.report_forge_failure(&stderr, "sweep_dispatch (lease comment)");
+                log::warn!(
+                    "lease comment for #{issue} exited {:?}: {}",
+                    output.status.code(),
+                    stderr.trim()
+                );
+            }
             Ok(None) => log::warn!(
                 "lease comment for #{issue} exceeded {}s, killed (#3973)",
                 timeout.as_secs()
