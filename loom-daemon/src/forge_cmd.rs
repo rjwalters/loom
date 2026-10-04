@@ -772,11 +772,7 @@ pub enum ForgeCmd {
     /// `origin`? Implemented in [`crate::forge_check_branch`]; see that
     /// module for the exit-code contract. Zero forge-API calls (`git
     /// ls-remote`, not `gh`) unless `closed_pr_head` is set (#10027).
-    CheckBranch {
-        issue: u32,
-        branch: Option<String>,
-        closed_pr_head: bool,
-    },
+    CheckBranch(crate::forge_check_branch::CheckBranchArgs),
     /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]`.
     /// Operator-only (#8427): arms a server-side merge that bypasses Loom's
     /// merge-time gates; never dispatched from a Loom merge path.
@@ -876,11 +872,7 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
         ForgeCmd::CheckClaim { issue, force_claim } => {
             crate::forge_check_claim::handle(issue, force_claim)
         }
-        ForgeCmd::CheckBranch {
-            issue,
-            branch,
-            closed_pr_head,
-        } => crate::forge_check_branch::handle(issue, branch, closed_pr_head),
+        ForgeCmd::CheckBranch(args) => crate::forge_check_branch::handle(args),
         ForgeCmd::AutoMerge {
             pr,
             method,

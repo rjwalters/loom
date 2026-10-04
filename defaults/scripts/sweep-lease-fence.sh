@@ -178,6 +178,12 @@
 # daemon's own refusal of an unsafe `--branch` name) -- exits `6`
 # BRANCH_PROBE_UNAVAILABLE, not `5`: that is a fleet-version (or invocation)
 # problem to fix, not a branch on `origin` to investigate.
+# Rollout compatibility: when the probed branch is the default
+# `feature/issue-<N>` (always a safe name, so a usage error can only mean an
+# older daemon), a usage error is first retried as the pre-#10027
+# `forge check-branch <N>` -- the old existence question, without the
+# closed-head exemption -- so a host whose daemon has not rolled yet keeps
+# its old fail-closed behaviour instead of refusing every push.
 #
 # Before asking the daemon, the check first looks at THIS worktree's own
 # push-tracking state: if the current branch's upstream is already
@@ -420,6 +426,10 @@ check_branch_collision() {
     # origin is then expected, not a foreign collision.
     [[ "$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2> /dev/null || true)" == "origin/${branch}" ]] && return 0
     out="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge check-branch "$issue" --branch "$branch" --closed-pr-head 2>&1)" && rc=0 || rc=$?
+    # A loom-daemon predating --branch/--closed-pr-head refuses them (clap exit 2). For the default
+    # branch that is the only possible cause, so re-ask the pre-#10027 question (no closed-head
+    # exemption, same fail-closed mapping) instead of stalling every push until the daemon rolls.
+    [[ "$rc" == 2 && "$branch" == "feature/issue-${issue}" ]] && { out="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge check-branch "$issue" 2>&1)" && rc=0 || rc=$?; }
     case "$rc" in
         1) return 0 ;;
         6) echo "BRANCH OK: ${out}" >&2 && return 0 ;;

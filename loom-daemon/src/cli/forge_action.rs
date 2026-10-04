@@ -671,11 +671,11 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             issue,
             branch,
             closed_pr_head,
-        } => ForgeCmd::CheckBranch {
+        } => ForgeCmd::CheckBranch(loom_daemon::forge_check_branch::CheckBranchArgs {
             issue,
             branch,
             closed_pr_head,
-        },
+        }),
         ForgeAction::AutoMerge {
             pr_number,
             method,

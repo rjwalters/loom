@@ -186,7 +186,7 @@ loom_trust_stub "$STUB_DIR"
 reset_state() {
     rm -f "$STUB_DIR"/comments.json "$STUB_DIR"/comments-fail \
         "$STUB_DIR"/check-branch-rc "$STUB_DIR"/check-branch-stdout \
-        "$STUB_DIR"/check-branch-args.log
+        "$STUB_DIR"/check-branch-args.log "$STUB_DIR"/check-branch-legacy-rc
     unset LOOM_LEASE_FENCE_NOW LOOM_HOST_ID LOOM_LEASE_TTL_MINUTES HOSTNAME \
         LOOM_LEASE_PUBLISH_HOSTNAME LOOM_REPO 2> /dev/null || true
 }
@@ -580,6 +580,23 @@ assert_eq "4" "$RC" "(y) probe unavailable + superseded lease -> exit 4 (a defin
 echo "$LEASE_OWN" > "$STUB_DIR/comments.json"
 LOOM_DAEMON_BIN="$STUB_DIR/no-such-loom-daemon" LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309 --host studio-host
 assert_eq "6" "$RC" "(y) missing daemon binary -> exit 6, not 5"
+
+# --- (y2) #10027 rollout: an older daemon still answers the legacy question ---
+# Default branch + clap usage error on the new flags -> re-ask flagless; the
+# old daemon's answer is mapped exactly as before #10027.
+reset_state
+echo "2" > "$STUB_DIR/check-branch-rc"
+echo "1" > "$STUB_DIR/check-branch-legacy-rc"
+echo "$LEASE_OWN" > "$STUB_DIR/comments.json"
+LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309 --host studio-host
+assert_eq "0" "$RC" "(y2) old daemon, legacy re-ask verifies absence -> PASS (no rollout stall)"
+assert_eq "forge check-branch 6309" "$(tail -n 1 "$STUB_DIR/check-branch-args.log")" "(y2) the legacy flagless question was re-asked"
+echo "0" > "$STUB_DIR/check-branch-legacy-rc"
+LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309 --host studio-host
+assert_eq "5" "$RC" "(y2) old daemon, legacy re-ask finds the branch -> exit 5 BRANCH_COLLISION (fail closed, as before)"
+echo "1" > "$STUB_DIR/check-branch-legacy-rc"
+LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309 --branch topic/x --host studio-host
+assert_eq "6" "$RC" "(y2) a non-default --branch is never re-asked the legacy question -> exit 6"
 
 # --- (z) #10027: --branch passthrough / default -------------------------------
 reset_state

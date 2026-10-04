@@ -363,6 +363,18 @@ pub(crate) fn probe_remote_branch(git_bin: &Path, root: &Path, branch: &str) -> 
     }
 }
 
+/// Parsed arguments of `loom-daemon forge check-branch` (#10027). Kept here,
+/// not as inline fields on `ForgeCmd::CheckBranch`, so the flags this module
+/// owns do not grow `forge_cmd.rs` past its file-size ratchet.
+pub struct CheckBranchArgs {
+    /// Issue number whose branch is about to be pushed.
+    pub issue: u32,
+    /// `--branch NAME`; `None` probes the default `feature/issue-N`.
+    pub branch: Option<String>,
+    /// `--closed-pr-head`: opt into the closed-PR-head exemption (exit 6).
+    pub closed_pr_head: bool,
+}
+
 /// Handle `loom-daemon forge check-branch <issue> [--branch NAME]
 /// [--closed-pr-head]`. Never returns (exits the process with the code from
 /// [`verdict_for`] / [`closed_pr_head_verdict`]).
@@ -374,7 +386,12 @@ pub(crate) fn probe_remote_branch(git_bin: &Path, root: &Path, branch: &str) -> 
 /// `LOOM_GH_BIN`'s role for the `gh`-backed probes. An unresolvable cwd is
 /// [`EX_PROBE_FAILED`] — never an `Err` the caller's generic error exit could
 /// turn into a `1` that reads as a verified absence.
-pub fn handle(issue: u32, branch: Option<String>, closed_pr_head_check: bool) -> Result<()> {
+pub fn handle(args: CheckBranchArgs) -> Result<()> {
+    let CheckBranchArgs {
+        issue,
+        branch,
+        closed_pr_head: closed_pr_head_check,
+    } = args;
     let branch = branch.unwrap_or_else(|| default_branch(issue));
     if let Err(e) = crate::refname::check_refname(&branch) {
         eprintln!("loom-daemon forge check-branch: --branch {e}");
