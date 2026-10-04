@@ -298,6 +298,21 @@ pub struct Distribution {
     /// heuristic's explanation is byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adjustment: Option<StageAdjustment>,
+    /// The recency half-life the samples were weighted by,
+    /// `exp(−age / half_life_sec)` (#10209), after any effective-N widening.
+    /// Absent when the samples were weighted flat — on every heuristic that
+    /// does not weigh by recency, and on a recency-weighting one whose
+    /// effective-N fallback reached flat weights (then `effective_n` is
+    /// present and equals `n`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub half_life_sec: Option<i64>,
+    /// `(Σw)² / Σw²` over the observed samples' weights, rounded to six
+    /// decimals (#10209): how many equally weighted samples the grid is worth.
+    /// Present exactly on a recency-weighting heuristic's stages, so every
+    /// earlier heuristic's explanation is byte-identical. `n` stays the raw
+    /// sample count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_n: Option<f64>,
 }
 
 /// The transform a calibrating heuristic applied to one stage's raw grid,

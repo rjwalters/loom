@@ -34,6 +34,7 @@ impl Heuristic for FinishV1 {
                 censoring: false,
                 adjust: None,
                 models_hold: false,
+                half_life_sec: None,
             },
             input,
             history,

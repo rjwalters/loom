@@ -64,6 +64,7 @@ impl Heuristic for LandV2 {
                 censoring: true,
                 adjust: None,
                 models_hold: false,
+                half_life_sec: None,
             },
             input,
             history,

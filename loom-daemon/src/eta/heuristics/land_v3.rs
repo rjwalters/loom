@@ -146,6 +146,7 @@ impl Heuristic for LandV3 {
                 censoring: true,
                 adjust: Some(adjust),
                 models_hold: false,
+                half_life_sec: None,
             },
             &input,
             history,
