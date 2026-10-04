@@ -600,6 +600,12 @@ pub(crate) enum MergePrCommand {
     /// could not determine (must also refuse).
     StaleChecks(super::merge_pr_stale_checks::StaleChecksArgs),
 
+    /// Run the repo's `merge.treeChecks` against the merge tree (base + PR
+    /// head) in a temp dir (#10026). Exit 0+CLEAN = pass/none declared (or
+    /// BYPASSED under --allow-red-tree), 1 = a check failed (comment posted),
+    /// 2 = could not run (must also refuse).
+    TreeChecks(super::merge_pr_tree_checks::TreeChecksArgs),
+
     /// The stale-cached-mergeable recheck decision (#6104): once REST
     /// `.mergeable` has read `false`, classify the backoff re-reads plus the
     /// local `git merge-tree` corroboration into `merge:` / `refuse-stale:` /
@@ -893,6 +899,7 @@ impl MergePrCommand {
             MergePrCommand::VerdictContradiction(args) => args.run(),
             MergePrCommand::MergeableRecheck(args) => args.run(),
             MergePrCommand::StaleChecks(args) => args.run(),
+            MergePrCommand::TreeChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::RedateReport(args) => args.run(),
