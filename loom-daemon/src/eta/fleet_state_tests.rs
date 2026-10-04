@@ -239,7 +239,8 @@ fn a_ready_issue_with_a_retained_curated_label_counts_in_ready_wait() {
 }
 
 fn closes(pr: u32, issue: Option<u32>, secs: i64, seq: u64) -> RawEvent {
-    ev(pr, ItemKind::Pr, EventKind::ClosingRef, None, secs, seq).with_target(issue)
+    let family = issue.map(|_| "closes");
+    ev(pr, ItemKind::Pr, EventKind::ClosingRef, family, secs, seq).with_target(issue)
 }
 
 /// Issue 4 ready from 100s; PR 20 (closes 4) opened at 300s, merged at 2000s;
@@ -268,6 +269,42 @@ fn an_open_pr_closing_a_ready_issue_is_a_lockout() {
     let state = fleet_state(&lockout_fleet(), REPO, t(3000));
     assert_eq!(state.pr_open_skip_lockout, Some(false));
     assert_eq!(item(&state, ItemKind::Issue, 4).open_pr, None);
+}
+
+#[test]
+fn an_open_part_of_pr_on_a_ready_issue_is_a_lockout() {
+    // The guard counts `Part of #N` (#8940), so the reconstruction must too:
+    // epic phase PRs are exactly this shape.
+    use ItemKind::{Issue, Pr};
+    let events = vec![
+        opened(4, Issue, 0),
+        add(4, Issue, "loom:issue", 100, 1),
+        opened(30, Pr, 300),
+        ev(30, Pr, EventKind::ClosingRef, Some("part_of"), 300, 9030).with_target(Some(4)),
+    ];
+    let state = fleet_state(&events, REPO, t(1000));
+    assert_eq!(state.pr_open_skip_lockout, Some(true));
+    assert_eq!(item(&state, Issue, 4).open_pr, Some(30));
+    // The `closing_ref` label is a phrase family, not an item label.
+    assert!(item(&state, Pr, 30).labels.is_empty());
+}
+
+#[test]
+fn part_of_and_colon_bodies_parsed_from_the_listing_lock_out() {
+    use super::super::fleet_events_pulls::parse_pulls;
+    for body in ["**Part of:** #4", "Closes: #4", "Part of #4"] {
+        let page = serde_json::json!([{
+            "id": 9040, "number": 40, "created_at": t(300).to_rfc3339(),
+            "closed_at": null, "merged_at": null, "body": body,
+        }])
+        .to_string();
+        let (mut events, _) = parse_pulls(REPO, &page, t(5000)).unwrap();
+        events.push(opened(4, ItemKind::Issue, 0));
+        events.push(add(4, ItemKind::Issue, "loom:issue", 100, 1));
+        let state = fleet_state(&events, REPO, t(1000));
+        assert_eq!(state.pr_open_skip_lockout, Some(true), "body: {body:?}");
+        assert_eq!(item(&state, ItemKind::Issue, 4).open_pr, Some(40), "body: {body:?}");
+    }
 }
 
 #[test]

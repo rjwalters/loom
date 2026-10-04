@@ -104,9 +104,10 @@ pub enum EventKind {
     Merged,
     Review,
     CheckRun,
-    /// A PR's body names an issue it closes ([`RawEvent::target`]), or — with
-    /// no target — names none. Either way it records that the PR's closing
-    /// references were read.
+    /// A PR's body links an issue ([`RawEvent::target`]) with the open-PR
+    /// guard's phrase set — `label` is `"closes"` or `"part_of"` — or, with no
+    /// target and no label, links none. Either way it records that the PR's
+    /// linkage references were read.
     ClosingRef,
 }
 
@@ -141,10 +142,11 @@ pub struct RawEvent {
     pub item: u32,
     pub item_kind: ItemKind,
     pub kind: EventKind,
-    /// The label, for `label_added` / `label_removed`.
+    /// The label, for `label_added` / `label_removed`; the phrase family
+    /// (`closes` / `part_of`) for a targeted `closing_ref`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// The issue a `closing_ref` row says the PR closes. Absent on every
+    /// The issue a `closing_ref` row says the PR links. Absent on every
     /// other row, and then not part of the id, so rows written before the
     /// field existed keep their ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]

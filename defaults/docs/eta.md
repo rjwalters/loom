@@ -775,8 +775,14 @@ of what is on disk and never needs a refetch.
   issues-events|pulls] [--max-pages N] [--reserve CALLS]` read, through the
   shared ETag store, `GET repos/{o}/{r}/issues/events` (labels, close, merge)
   then `GET repos/{o}/{r}/pulls?state=all&sort=created` (PR open/merge/close
-  times, and closing references parsed from the body, stamped at the PR's
-  `created_at`). A rate-limit stop, the reserve floor or `--max-pages` (per
+  times, and linkage references parsed from the body with the open-PR guard's
+  own phrase set — closing keywords plus `Part of #N` / `Contributes to #N`,
+  colon/markdown tolerant — each row's `label` naming the family `closes` /
+  `part_of`, stamped at the PR's `created_at`). A merged/closed PR is stored
+  twice by design (the pulls row has `seq` 0, the issue-events row the event
+  id). A pulls refresh reads only the newest pages: closures of older PRs
+  arrive via the issue-events refresh, and body edits on older PRs are not
+  seen. A rate-limit stop, the reserve floor or `--max-pages` (per
   endpoint) exits `75` (`EX_TEMPFAIL`); re-run to resume. `eta fleet state
   --as-of RFC3339 [--json]` reconstructs the fleet (open issues/PRs, stage and
   time-in-stage per item, `loom:building` count, operator holds, approved PRs
@@ -794,8 +800,10 @@ of what is on disk and never needs a refetch.
   `agreement` cost zero.
 - **Not yet cached** (follow-ups of #10197): reviews, CI check-run conclusions
   and the webhook-mirror source. `pr_open_skip_lockout` is `null` until a
-  closing reference precedes `--as-of`. An item untouched since before the
-  cache window is not reported open.
+  linkage row precedes `--as-of`; during an unfinished pulls backfill it can
+  read `false` rather than unknown (older PRs not yet read link nothing). The
+  guard's PR-author trust filter is not reproduced (can only over-report). An
+  item untouched since before the cache window is not reported open.
 
 `loom eta …` (the machine dispatcher, `scripts/loom`) is a thin passthrough to
 `loom-daemon eta …`.
