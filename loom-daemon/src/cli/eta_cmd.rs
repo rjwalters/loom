@@ -42,6 +42,7 @@ use loom_daemon::worktree_ops::gh::{
     open_linked_pr_args, parse_open_linked_pr_trusted, OpenPrProbe,
 };
 
+use super::eta_backtest_cases::{GhFetcher, PrCaseArgs};
 use super::pr_latency_cmd::fetch_histories;
 
 /// PRs examined per `eta backfill` run, absent `--limit` — generous, since
@@ -57,7 +58,9 @@ pub(crate) enum EtaCommand {
     Backfill(EtaBackfillArgs),
     /// Leak-free replay of a heuristic against real `sweep.outcome` history:
     /// mean pinball loss, p25-p75 coverage and bias, optionally paired
-    /// against a second heuristic id on the identical replay set.
+    /// against a second heuristic id on the identical replay set. `land`
+    /// cases from merged PRs' label timelines are opt-in (`--pr-history`,
+    /// `--forge-pr-cases`, #9579); by default no forge call is made.
     Backtest(EtaBacktestArgs),
     /// The current estimate(s) for one issue (#9327, Phase 4 of #9289):
     /// `loom-daemon eta view owner/repo#123 [--explain] [--json]`.
@@ -376,6 +379,10 @@ pub(crate) struct EtaBacktestArgs {
     /// Emit one JSON document on stdout instead of the human report.
     #[arg(long)]
     pub json: bool,
+
+    /// Opt-in `land` cases from merged PRs' label timelines (#9579).
+    #[command(flatten)]
+    pub pr_cases: PrCaseArgs,
 }
 
 impl EtaBacktestArgs {
@@ -406,13 +413,10 @@ impl EtaBacktestArgs {
             repo: self.repo.as_deref(),
         };
 
-        let envelopes = load_outcome_envelopes(&root);
-        let mut history = StageSamples::default();
-        history.push_envelopes(&envelopes);
-        let journal_entries = journal::read(&journal::journal_path(&root));
-        history.push_journal(&journal_entries, "local");
-        let mut cases = backtest::cases_from_envelopes(&envelopes);
-        cases.extend(backtest::cases_from_journal(&journal_entries));
+        let (mut history, cases, note) = self.replay_inputs(&root, &GhFetcher)?;
+        if let Some(note) = note {
+            eprintln!("{note}");
+        }
         let loom = Provenance::current();
         super::eta_replay_cmd::with_replay_calibration(&registry, &mut history, &cases, &loom);
 
@@ -441,7 +445,7 @@ impl EtaBacktestArgs {
 
 /// Both generations of `sweep-outcome-telemetry.jsonl`, rotated first — the
 /// same order [`StageSamples::load_outcome_journal`] reads them in.
-fn load_outcome_envelopes(root: &Path) -> Vec<TelemetryEnvelope> {
+pub(crate) fn load_outcome_envelopes(root: &Path) -> Vec<TelemetryEnvelope> {
     let path = root
         .join(".loom")
         .join("logs")

@@ -1064,7 +1064,14 @@ accepts `--repo-root PATH` (default: the current directory).
 - **`loom-daemon eta backtest --heuristic ID [--compare ID] [--since RFC3339] [--json]`**
   — leak-free replay of a heuristic against real `sweep.outcome` history: mean
   pinball loss, p25–p75 coverage and bias, optionally paired against a second
-  heuristic on the identical replay set (#9325).
+  heuristic on the identical replay set (#9325). The fleet merges out of
+  sweep, so local records rarely carry a `land` case; `--pr-history PATH`
+  (offline `eta-pr-case/v1` records) or the opt-in `--forge-pr-cases
+  [--pr-limit N] [--save-pr-history PATH]` adds `land` cases from merged PRs'
+  label timelines, deduplicated against sweep-derived ones, with excluded PRs
+  (open, closed unmerged, incomplete timeline, missing/ambiguous closing
+  issue) reported by reason on stderr (#9579). Without either flag the
+  backtest makes no forge call.
 - **`loom-daemon eta view OWNER/NAME#ISSUE [--explain] [--json]`** — the
   current estimate(s) for one issue (#9327). State resolution, in order:
   1. An **open linked PR**: its review labels

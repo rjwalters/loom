@@ -1,6 +1,7 @@
 //! ETA core tests (#9289). Pure: no daemon, no network, no clock.
 
 mod backtest;
+mod backtest_pr;
 mod censoring;
 mod conditioning;
 mod config;
