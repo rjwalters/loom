@@ -60,6 +60,7 @@ fn identity() -> RunIdentity {
         attempt: Some(1),
         runtime: "claude".to_string(),
         role: Some("builder".to_string()),
+        launch: crate::telemetry::kinds::session_output::Launch::Daemon,
     }
 }
 
