@@ -313,6 +313,7 @@ fn row(issue: u32, state: PlanState, position: Option<u32>) -> ReadyRow {
             gate: position.map(|_| PlanGate::Capacity),
             ..RowPlan::default()
         },
+        disposition: crate::types::QueueDisposition::DeferredCapacity,
     }
 }
 
@@ -331,6 +332,7 @@ fn ready_plan(complete: bool) -> ReadyPlan {
             ..DispatchPlanContext::default()
         },
         at: as_of() - Duration::seconds(10),
+        listing_failed: Vec::new(),
     }
 }
 

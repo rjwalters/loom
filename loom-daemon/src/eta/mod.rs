@@ -80,6 +80,7 @@ pub mod heuristics;
 pub mod history;
 pub mod journal;
 pub mod labels;
+pub mod queue_features;
 pub mod recalibrate;
 pub mod score;
 pub mod shadow;

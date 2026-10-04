@@ -548,3 +548,278 @@ fn an_item_first_seen_in_doctor_has_taken_a_rejection() {
     assert_eq!(current.stage, Stage::Doctor);
     assert_eq!(current.rework_rounds, 1);
 }
+
+// ------------------------------------------------------ features (#10201)
+
+use crate::eta::explanation::{Explanation, Features};
+use crate::eta::journal::JournalEntry;
+use crate::eta::queue_features::{
+    queue_features, reason, EventLog, QueueSubject, RosterEntry, NAMES as QUEUE_NAMES,
+};
+use crate::eta::tracker::{events_from_journal, ListedPr, ReadyPlan, ReadyRow, NOT_LISTED_YET};
+use crate::types::{DispatchPlanContext, PlanSlots, PlanState, QueueDisposition, RowPlan};
+
+const REVIEW: &str = "loom:review-requested";
+const PLAN_NAMES: [&str; 5] = [
+    "queue_ready",
+    "queue_running",
+    "max_concurrent",
+    "active_sweeps_host",
+    "repo_pr_open_skip",
+];
+
+fn listed(number: u32, label: &str, updated_secs: i64) -> ListedPr {
+    ListedPr {
+        number,
+        labels: vec![label.to_string()],
+        updated_at: Some(t(updated_secs)),
+    }
+}
+
+fn plan_row(issue: u32, plan_state: PlanState, disposition: QueueDisposition) -> ReadyRow {
+    ReadyRow {
+        repo: REPO.to_string(),
+        issue,
+        plan: RowPlan {
+            plan_state,
+            position: (plan_state == PlanState::Next).then_some(1),
+            ..RowPlan::default()
+        },
+        disposition,
+    }
+}
+
+/// One ready row, one running sweep, one `pr-open-skip` row.
+fn plan_rows() -> Vec<ReadyRow> {
+    vec![
+        plan_row(10, PlanState::Next, QueueDisposition::DeferredCapacity),
+        plan_row(11, PlanState::Running, QueueDisposition::InFlight),
+        plan_row(12, PlanState::Blocked, QueueDisposition::OpenPr),
+    ]
+}
+
+fn plan_at(at: DateTime<Utc>, listing_failed: &[&str]) -> ReadyPlan {
+    ReadyPlan {
+        context: DispatchPlanContext {
+            slots: PlanSlots {
+                max_concurrent: 4,
+                occupancy: Some(3),
+                free: Some(1),
+                ..PlanSlots::default()
+            },
+            tick_interval_secs: Some(60),
+            complete: true,
+            ..DispatchPlanContext::default()
+        },
+        at,
+        listing_failed: listing_failed.iter().map(|s| (*s).to_string()).collect(),
+    }
+}
+
+/// The ETA stage journal of the pass: a departure from `review_wait`, a PR
+/// closed unmerged out of it, and a merge.
+fn journal_rows() -> Vec<JournalEntry> {
+    let at = |event: &str, pr: u32, stage: Stage, secs: i64, raw: serde_json::Value| {
+        let mut row = JournalEntry::new(event, REPO, t(secs), &provenance());
+        row.pr_number = Some(pr);
+        row.stage = Some(stage);
+        row.left_at = Some(t(secs));
+        row.raw = raw;
+        row
+    };
+    vec![
+        at("label.transition", 400, Stage::ReviewWait, -1800, serde_json::json!({})),
+        at(
+            "pr.resolved",
+            401,
+            Stage::MergeWait,
+            -7200,
+            serde_json::json!({"state": "merged"}),
+        ),
+        at(
+            "pr.resolved",
+            402,
+            Stage::ReviewWait,
+            -600,
+            serde_json::json!({"state": "closed"}),
+        ),
+    ]
+}
+
+fn primary(emitted: &[crate::eta::tracker::Emission], issue: u32, kind: Kind) -> &Explanation {
+    &emitted
+        .iter()
+        .find(|e| e.primary && e.explanation.subject.issue == issue && e.explanation.kind == kind)
+        .unwrap_or_else(|| panic!("{issue} {kind}"))
+        .explanation
+}
+
+fn reason_of<'a>(e: &'a Explanation, name: &str) -> Option<&'a str> {
+    e.features_omitted
+        .iter()
+        .find(|o| o.name == name)
+        .map(|o| o.reason.as_str())
+}
+
+/// Train/serve parity: what the tracker records is exactly what
+/// `queue_features` computes from the same listings, events and instant.
+#[test]
+fn the_tracker_records_queue_features_exactly_as_the_contract_computes_them() {
+    let mut h = Harness::new();
+    let prs = [
+        pr(501, 50, &[REVIEW], -600),
+        pr(502, 51, &[REVIEW], -1200),
+        pr(503, 52, &["loom:pr"], -300),
+    ];
+    h.tracker.on_listing(REPO, &prs, t(0), 300);
+    // #600 closes no issue: never a tracker item, still on the roster.
+    let listing = vec![
+        listed(501, REVIEW, -600),
+        listed(502, REVIEW, -1200),
+        listed(503, "loom:pr", -300),
+        listed(600, REVIEW, -3000),
+    ];
+    let log = events_from_journal(&journal_rows(), t(-30));
+    h.tracker
+        .on_fleet_context(&[(REPO.to_string(), listing)], log.clone(), t(0));
+    h.tracker
+        .on_ready_queue(&plan_rows(), &plan_at(t(-30), &[]), t(0));
+    h.tracker.on_dispatch(REPO, 70, "sweep-issue-70-1", t(10));
+    let at = t(60);
+    let emitted = h.estimate_all(at);
+
+    // The same inputs, by hand.
+    let entry = |pr: u32, stage: Stage, secs: i64| RosterEntry {
+        repo: REPO.to_string(),
+        pr,
+        stage: Some(stage),
+        entered_at: t(secs),
+        known_at: t(0),
+    };
+    let roster = vec![
+        entry(501, Stage::ReviewWait, -600),
+        entry(502, Stage::ReviewWait, -1200),
+        entry(503, Stage::MergeWait, -300),
+        entry(600, Stage::ReviewWait, -3000),
+    ];
+    let subject = QueueSubject {
+        repo: REPO.to_string(),
+        pr: Some(501),
+        current: Some((Stage::ReviewWait, t(-600))),
+    };
+    let expected = queue_features(&subject, &roster, &log, &[REPO.to_string()], at);
+    let mut want = Features::default();
+    let mut want_omitted = Vec::new();
+    expected.write_to(&mut want, &mut want_omitted);
+
+    let land = primary(&emitted, 50, Kind::Land);
+    let features = land.features.as_ref().unwrap();
+    let got = serde_json::to_value(features).unwrap();
+    let want = serde_json::to_value(&want).unwrap();
+    for name in QUEUE_NAMES {
+        assert_eq!(got[name], want[name], "{name}");
+        assert!(!got[name].is_null(), "{name}: a PR-stage item carries every feature");
+    }
+    // …and by hand, from the sources.
+    assert_eq!(features.ahead, Some(2), "#502 and #600 entered review earlier");
+    assert_eq!(features.n_stage_repo, Some(2));
+    assert_eq!(features.open_prs_repo, Some(4), "#600 closes no issue but is an open PR");
+    assert_eq!(features.exits_repo_1h, Some(2), "a departure and a PR closed unmerged");
+    assert_eq!(features.merges_repo_24h, Some(1));
+    assert_eq!(features.since_merge_sec, Some(7260));
+    assert_eq!(features.fleet_scope_repos, Some(1));
+
+    // The dispatch plan, on a started item (scope item 2).
+    assert_eq!(features.queue_ready, Some(3));
+    assert_eq!(features.queue_running, Some(1));
+    assert_eq!(features.max_concurrent, Some(4));
+    assert_eq!(features.active_sweeps_host, Some(3));
+    assert_eq!(features.repo_pr_open_skip, Some(true));
+    assert_eq!(features.queue_rank, None);
+    assert_eq!(reason_of(land, "queue_rank"), Some(reason::NOT_APPLICABLE_STAGE));
+
+    // A ready item: a queue position, no PR yet; every item gets the repo
+    // values.
+    let ready = primary(&emitted, 10, Kind::Start);
+    let rf = ready.features.as_ref().unwrap();
+    assert_eq!(rf.queue_rank, Some(1));
+    assert_eq!((rf.merges_repo_24h, rf.open_prs_repo), (Some(1), Some(4)));
+    assert_eq!(reason_of(ready, "ahead"), Some(reason::NO_PR_YET));
+    // A ready row the plan holds (refused): no stage, and its own reason.
+    let held = primary(&emitted, 12, Kind::Start);
+    assert_eq!(reason_of(held, "ahead"), Some(reason::NO_STAGE));
+    assert_eq!(reason_of(held, "queue_rank"), Some("no_dispatch_plan"));
+
+    // An in-sweep item, on both kinds.
+    for kind in [Kind::Finish, Kind::Land] {
+        let sweep = primary(&emitted, 70, kind);
+        let sf = sweep.features.as_ref().unwrap();
+        assert_eq!(reason_of(sweep, "n_stage_fleet"), Some(reason::NO_PR_YET), "{kind}");
+        assert_eq!(reason_of(sweep, "queue_rank"), Some(reason::NOT_APPLICABLE_STAGE));
+        assert_eq!((sf.queue_running, sf.merges_fleet_6h), (Some(1), Some(1)), "{kind}");
+    }
+
+    // No #10201 feature ever falls back to `not_collected`.
+    for e in emitted.iter().map(|e| &e.explanation) {
+        for name in QUEUE_NAMES.iter().chain(&PLAN_NAMES).chain(&["queue_rank"]) {
+            assert_ne!(reason_of(e, name), Some("not_collected"), "{name} on {}", e.subject.issue);
+        }
+    }
+}
+
+/// Nothing observed at or after an estimate's `as_of` reaches its features.
+#[test]
+fn a_view_or_plan_observed_after_as_of_is_not_read() {
+    let mut h = Harness::new();
+    h.tracker
+        .on_listing(REPO, &[pr(501, 50, &[REVIEW], -600)], t(0), 300);
+    let reasons = |h: &mut Harness, at: DateTime<Utc>| {
+        let emitted = h.estimate(at);
+        let land = primary(&emitted, 50, Kind::Land);
+        let of = |names: &[&str]| {
+            let mut r: Vec<String> = names
+                .iter()
+                .map(|n| reason_of(land, n).unwrap_or("-").to_string())
+                .collect();
+            r.dedup();
+            r
+        };
+        (of(&QUEUE_NAMES), of(&PLAN_NAMES))
+    };
+    // Before any pass handed a view over.
+    let (queue, plan) = reasons(&mut h, t(0));
+    assert_eq!(
+        (queue, plan),
+        (vec![NOT_LISTED_YET.to_string()], vec!["no_dispatch_plan".to_string()])
+    );
+
+    // Observed after the estimate's instant: not read.
+    let listing = vec![listed(501, REVIEW, -600)];
+    h.tracker
+        .on_fleet_context(&[(REPO.to_string(), listing)], EventLog::default(), t(500));
+    h.tracker
+        .on_ready_queue(&plan_rows(), &plan_at(t(500), &[]), t(500));
+    let (queue, plan) = reasons(&mut h, t(400));
+    assert_eq!(
+        (queue, plan),
+        (vec![NOT_LISTED_YET.to_string()], vec!["no_dispatch_plan".to_string()])
+    );
+
+    // Read once observed; the plan goes stale after 15 minutes.
+    let (queue, plan) = reasons(&mut h, t(500 + 901));
+    assert_eq!(
+        queue,
+        vec![
+            "-".to_string(),
+            reason::HISTORY_SHORTER_THAN_CAP.to_string(),
+            "-".to_string()
+        ]
+    );
+    assert_eq!(plan, vec!["stale_inputs".to_string()]);
+
+    // A repo whose ready listing failed: its pr-open-skip state is unknown.
+    h.tracker
+        .on_ready_queue(&plan_rows(), &plan_at(t(1400), &[REPO]), t(1400));
+    let (_, plan) = reasons(&mut h, t(1500 + 300));
+    assert_eq!(plan, vec!["-".to_string(), reason::REPO_NOT_LISTED.to_string()]);
+}

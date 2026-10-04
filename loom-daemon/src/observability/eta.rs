@@ -13,8 +13,10 @@
 //!   listing, where an unchanged listing is a free `304`), at most
 //!   [`FORGE_READ_BUDGET`] `pulls/{n}` + `issues/{n}` reads for items whose
 //!   outcome is still unknown, the last work-finder tick's dispatch plan
-//!   ingested as ready items (#9326), history reloaded, and every live item
-//!   re-estimated. An unchanged estimate is refreshed every `refreshSecs`.
+//!   ingested as ready items (#9326), history reloaded, the fleet view (every
+//!   listed PR plus the journal's stage events) handed over for the queue
+//!   features (#10201), and every live item re-estimated. An unchanged
+//!   estimate is refreshed every `refreshSecs`.
 //!
 //! **Reads over the budget, and reads that fail, are not lost.** The tracker
 //! keeps every unanswered check queued and re-offers it on the next pass
@@ -48,12 +50,13 @@ use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::eta::calibration_log;
 use crate::eta::config::EtaConfig;
 use crate::eta::journal::{self, JournalEntry};
+use crate::eta::queue_features::EventLog;
 use crate::eta::recalibrate::CalibrationObservation;
 use crate::eta::score::EstimateSummary;
 use crate::eta::shadow::{self, ShadowLedger};
 use crate::eta::tracker::{
-    Effects, Emission, EstimateContext, IssueState, ItemKey, PrState, PrView, ReadyPlan, ReadyRow,
-    Resolved, Tracker,
+    events_from_journal, Effects, Emission, EstimateContext, IssueState, ItemKey, ListedPr,
+    PrState, PrView, ReadyPlan, ReadyRow, Resolved, Tracker,
 };
 use crate::eta::{Kind, Provenance, Registry, StageSamples};
 use crate::event_bus::EventBus;
@@ -580,6 +583,23 @@ fn gh_json(root: &Path, path: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&output.stdout).ok()
 }
 
+/// Every PR row of a repo's review listings, whatever it closes: the fleet
+/// view's roster (#10201).
+#[must_use]
+pub fn listed_prs(listings: &[Vec<RestIssue>]) -> Vec<ListedPr> {
+    let mut seen = BTreeSet::new();
+    listings
+        .iter()
+        .flatten()
+        .filter(|item| item.is_pull_request && seen.insert(item.number))
+        .map(|item| ListedPr {
+            number: item.number,
+            labels: item.labels.clone(),
+            updated_at: parse_time(item.updated_at.as_deref()),
+        })
+        .collect()
+}
+
 /// How PR `number` ended, from one `pulls/{n}` read. `None` when the read
 /// failed: the tracker keeps the check queued and it is retried next pass.
 fn read_pr_state(root: &Path, slug: &str, number: u32) -> Option<PrState> {
@@ -672,7 +692,10 @@ async fn estimate_isolated(keys: Option<Vec<ItemKey>>, now: DateTime<Utc>) -> Ve
 ///
 /// Fetching stays outside the estimator either way: what crosses into
 /// `Heuristic::estimate` is a `StageSamples` value and nothing else.
-fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> StageSamples {
+///
+/// The stage journal's rows also yield the stage events the queue features
+/// count (#10201), each known at this read.
+fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> (StageSamples, EventLog) {
     let mut history = StageSamples::default();
     let mut seen = BTreeSet::new();
     for root in roots {
@@ -685,13 +708,15 @@ fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> StageS
             history.paths.extend(samples.paths);
         }
     }
-    history.push_journal(&journal::read(&journal::journal_path(journal_root)), host_id);
+    let rows = journal::read(&journal::journal_path(journal_root));
+    history.push_journal(&rows, host_id);
+    let events = events_from_journal(&rows, Utc::now());
     let mode = crate::eta::config::read(journal_root).history_scope;
     let mut history = crate::eta::fleet::apply_scope(mode, journal_root, history);
     // #10207: the calibration outcome log is this host's own scoring record,
     // whatever the stage-sample scope; the open half joins under the lock.
     history.calibration = calibration_log::read(&calibration_log::path(journal_root));
-    history
+    (history, events)
 }
 
 /// One ETA pass: list, resolve, reload history, estimate, deliver. A no-op
@@ -709,7 +734,7 @@ pub(super) async fn record(
     if !roots.iter().any(|r| r == workspace_root) {
         roots.push(workspace_root.to_path_buf());
     }
-    let mut repos: Vec<(PathBuf, String, Vec<PrView>)> = Vec::new();
+    let mut repos: Vec<(PathBuf, String, Vec<PrView>, Vec<ListedPr>)> = Vec::new();
     let mut seen = BTreeSet::new();
     for root in &roots {
         let Some(slug) =
@@ -729,18 +754,20 @@ pub(super) async fn record(
         }
         // A partial listing would read as PRs leaving review; skip the repo.
         if listings.len() == REVIEW_LABELS.len() {
-            repos.push((root.clone(), slug, pr_views(&listings)));
+            repos.push((root.clone(), slug, pr_views(&listings), listed_prs(&listings)));
         }
     }
+    // Before `now`: the fleet view is known strictly before the estimates.
+    let listed_at = Utc::now();
 
-    let slugs: Vec<String> = repos.iter().map(|(_, slug, _)| slug.clone()).collect();
+    let slugs: Vec<String> = repos.iter().map(|(_, slug, ..)| slug.clone()).collect();
     let journal_root = workspace_root.to_path_buf();
     let history_roots = roots.clone();
     let host = lock()
         .as_ref()
         .map(|state| state.host_id.clone())
         .unwrap_or_default();
-    let (history, repo_ids) = tokio::task::spawn_blocking(move || {
+    let ((history, events), repo_ids) = tokio::task::spawn_blocking(move || {
         let ids: BTreeMap<String, u64> = slugs
             .iter()
             .filter_map(|slug| {
@@ -776,7 +803,7 @@ pub(super) async fn record(
         if let Some((rows, plan)) = &ready {
             effects.push(state.tracker.on_ready_queue(rows, plan, now));
         }
-        for (root, slug, prs) in &repos {
+        for (root, slug, prs, _) in &repos {
             let e = state.tracker.on_listing(slug, prs, now, resolution_sec);
             // Checks the tracker still wants answered: PRs that left review
             // and issues whose outcome only the issue can settle. Anything
@@ -799,6 +826,11 @@ pub(super) async fn record(
             }
             effects.push(e);
         }
+        let fleet: Vec<(String, Vec<ListedPr>)> = repos
+            .iter()
+            .map(|(_, slug, _, listed)| (slug.clone(), listed.clone()))
+            .collect();
+        state.tracker.on_fleet_context(&fleet, events, listed_at);
     }
 
     let answers = tokio::task::spawn_blocking(move || run_checks(checks))
@@ -880,13 +912,21 @@ async fn ready_rows(
             repo: slug,
             issue: row.issue,
             plan: row.plan,
+            disposition: row.disposition,
         });
+    }
+    let mut listing_failed = Vec::with_capacity(summary.listing_failed.len());
+    for root in &summary.listing_failed {
+        if let Some(slug) = super::collector::resolve_repo_slug_cached(slug_cache, root).await {
+            listing_failed.push(slug);
+        }
     }
     Some((
         rows,
         ReadyPlan {
             context,
             at: summary.at,
+            listing_failed,
         },
     ))
 }
