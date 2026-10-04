@@ -45,8 +45,10 @@ use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use chrono::{DateTime, Utc};
 
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
+use crate::eta::calibration_log;
 use crate::eta::config::EtaConfig;
 use crate::eta::journal::{self, JournalEntry};
+use crate::eta::recalibrate::CalibrationObservation;
 use crate::eta::score::EstimateSummary;
 use crate::eta::shadow::{self, ShadowLedger};
 use crate::eta::tracker::{
@@ -340,9 +342,31 @@ pub(super) fn snapshot_input() -> Option<(Vec<EstimateSummary>, BTreeMap<Kind, S
 /// are already formed — this only sorts them into `(current, candidate)` runs
 /// and adds them up. Best-effort: a failed persist costs a longer wait for the
 /// 50-pair gate, never a wrong answer.
-fn note_outcomes(state: &mut State, outcomes: &[Resolved]) {
+///
+/// Also the calibration outcome log (#10207): every landed
+/// [`crate::eta::heuristics::CALIBRATION_BASE`] outcome is appended to it and
+/// to the in-memory history, so the recalibrating heuristic's next refit sees
+/// the landing (its point-in-time fit admits it only from `now` on).
+fn note_outcomes(state: &mut State, outcomes: &[Resolved], now: DateTime<Utc>) {
     if outcomes.is_empty() {
         return;
+    }
+    let landed: Vec<CalibrationObservation> = outcomes
+        .iter()
+        .filter(|r| r.estimate.heuristic == crate::eta::heuristics::CALIBRATION_BASE)
+        .filter_map(|r| CalibrationObservation::from_scored(&r.estimate, &r.score, now))
+        .collect();
+    if !landed.is_empty() {
+        let path = calibration_log::path(&state.workspace_root);
+        if let Err(error) = calibration_log::append(&path, &landed) {
+            log::warn!("eta: appending the calibration log failed: {error}");
+        }
+        let resolved: BTreeSet<&str> = landed.iter().map(|r| r.estimate_id.as_str()).collect();
+        state
+            .history
+            .calibration
+            .retain(|r| !resolved.contains(r.estimate_id.as_str()));
+        state.history.calibration.extend(landed);
     }
     let ids = current_ids(state);
     state
@@ -369,7 +393,7 @@ async fn apply_event(effects: Effects, now: DateTime<Utc>) {
     let emissions = estimate_isolated(Some(dirty), now).await;
     append_journal(&root, &effects.journal);
     if let Some(state) = lock().as_mut() {
-        note_outcomes(state, &effects.outcomes);
+        note_outcomes(state, &effects.outcomes, now);
     }
     let loom = Provenance::current();
     deliver(emissions, effects.outcomes, &loom, &host_id, dry_run, sink());
@@ -663,7 +687,11 @@ fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> StageS
     }
     history.push_journal(&journal::read(&journal::journal_path(journal_root)), host_id);
     let mode = crate::eta::config::read(journal_root).history_scope;
-    crate::eta::fleet::apply_scope(mode, journal_root, history)
+    let mut history = crate::eta::fleet::apply_scope(mode, journal_root, history);
+    // #10207: the calibration outcome log is this host's own scoring record,
+    // whatever the stage-sample scope; the open half joins under the lock.
+    history.calibration = calibration_log::read(&calibration_log::path(journal_root));
+    history
 }
 
 /// One ETA pass: list, resolve, reload history, estimate, deliver. A no-op
@@ -736,6 +764,12 @@ pub(super) async fn record(
             return;
         };
         state.history = history;
+        // #10207: every still-pending base estimate is a censored lower bound
+        // for the recalibrating heuristic's point-in-time refit.
+        state.history.calibration = calibration_log::combine(
+            std::mem::take(&mut state.history.calibration),
+            state.tracker.pending(),
+        );
         state.repo_ids.extend(repo_ids);
         // Before the listings, so a departed ready item's `issues/{n}` read
         // is offered in this same pass.
@@ -786,7 +820,7 @@ pub(super) async fn record(
         }
         let expired = state.tracker.expire(now);
         let all = crate::eta::tracker::merged(effects);
-        note_outcomes(state, &all.outcomes);
+        note_outcomes(state, &all.outcomes, now);
         (
             all.journal,
             all.outcomes,

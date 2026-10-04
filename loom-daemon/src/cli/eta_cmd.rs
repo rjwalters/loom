@@ -170,6 +170,7 @@ impl EtaPromoteArgs {
         let mut cases = backtest::cases_from_envelopes(&envelopes);
         cases.extend(backtest::cases_from_journal(&journal_entries));
         let loom = Provenance::current();
+        with_replay_calibration(&registry, &mut history, &cases, &loom);
         let comparison =
             backtest::compare(current, candidate, &history, &cases, filter, &loom).ok();
 
@@ -401,6 +402,7 @@ impl EtaBacktestArgs {
         let mut cases = backtest::cases_from_envelopes(&envelopes);
         cases.extend(backtest::cases_from_journal(&journal_entries));
         let loom = Provenance::current();
+        with_replay_calibration(&registry, &mut history, &cases, &loom);
 
         if let Some(other_id) = &self.compare {
             let Some(other) = registry.get(other_id) else {
@@ -422,6 +424,23 @@ impl EtaBacktestArgs {
             print!("{}", render_report(&report));
         }
         Ok(())
+    }
+}
+
+/// Give the recalibrating `land` heuristic (#10207) its calibration evidence
+/// from the replay itself: the base heuristic's estimate at every `land` case,
+/// landing at the case's own outcome. Leak-free — the recalibrating heuristic
+/// refits at each case's `as_of` ([`backtest::calibration_from_replay`]) — and
+/// inert for every other heuristic, which never reads `calibration`.
+fn with_replay_calibration(
+    registry: &Registry,
+    history: &mut StageSamples,
+    cases: &[backtest::ReplayCase],
+    loom: &Provenance,
+) {
+    if let Some(base) = registry.get(loom_daemon::eta::heuristics::CALIBRATION_BASE) {
+        let replayed = backtest::calibration_from_replay(base, history, cases, loom);
+        history.calibration.extend(replayed);
     }
 }
 
@@ -458,7 +477,11 @@ fn load_history(root: &Path, scope: HistoryScopeMode) -> StageSamples {
     history.push_envelopes(&envelopes);
     let journal_entries = journal::read(&journal::journal_path(root));
     history.push_journal(&journal_entries, "local");
-    fleet::apply_scope(scope, root, history)
+    let mut history = fleet::apply_scope(scope, root, history);
+    // #10207: the daemon's calibration log and pending store, so `eta view`
+    // shows the recalibrated interval the daemon would.
+    history.calibration = loom_daemon::eta::calibration_log::load(root);
+    history
 }
 
 /// The scope a `--scope` flag asks for: the flag when given, else the

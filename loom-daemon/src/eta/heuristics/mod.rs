@@ -1,16 +1,19 @@
-//! The shipped heuristics. `start-v1`, `finish-v1`, `land-v1`, `land-v2` and
-//! `land-v3` share one engine ([`estimate_path`]); they differ in which
-//! history they read, where the path ends, and (`land-v3`) how each stage's
-//! grid is calibrated. Their ids are immutable: a behaviour change is a new
-//! id.
+//! The shipped heuristics. `start-v1`, `finish-v1`, `land-v1`, `land-v2`,
+//! `land-v3` and `land-2026-10-04-amber-heron` share one engine
+//! ([`estimate_path`]); they differ in which history they read, where the
+//! path ends, (`land-v3`) how each stage's grid is calibrated, and
+//! (`land-2026-10-04-amber-heron`) how the result's interval is recalibrated.
+//! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
+mod land_amber_heron;
 mod land_v1;
 mod land_v2;
 mod land_v3;
 mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
+pub use land_amber_heron::{LandAmberHeron, CALIBRATION_BASE, LAND_AMBER_HERON};
 pub use land_v1::{LandV1, LAND_V1};
 pub use land_v2::{LandV2, LAND_V2};
 pub use land_v3::{
@@ -110,6 +113,7 @@ pub(crate) fn estimate_path(
         features_omitted,
         no_estimate_reason: None,
         truncated: Vec::new(),
+        recalibration: None,
     };
 
     let current = match &input.current {

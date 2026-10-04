@@ -70,6 +70,7 @@
 //! — and the switch that flips the config is [`shadow`].
 
 pub mod backtest;
+pub mod calibration_log;
 pub mod config;
 pub mod emit;
 pub mod explanation;
@@ -79,6 +80,7 @@ pub mod heuristics;
 pub mod history;
 pub mod journal;
 pub mod labels;
+pub mod recalibrate;
 pub mod score;
 pub mod shadow;
 pub mod simulate;
@@ -543,6 +545,7 @@ impl Registry {
                 Box::new(heuristics::LandV1),
                 Box::new(heuristics::LandV2),
                 Box::new(heuristics::LandV3),
+                Box::new(heuristics::LandAmberHeron),
             ],
         }
     }

@@ -610,6 +610,12 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ("heuristics/land_v1.rs", include_str!("../heuristics/land_v1.rs")),
     ("heuristics/land_v2.rs", include_str!("../heuristics/land_v2.rs")),
     ("heuristics/land_v3.rs", include_str!("../heuristics/land_v3.rs")),
+    (
+        "heuristics/land_amber_heron.rs",
+        include_str!("../heuristics/land_amber_heron.rs"),
+    ),
+    // #10207: the recalibration fit and transform the heuristic calls.
+    ("recalibrate.rs", include_str!("../recalibrate.rs")),
 ];
 
 /// The whole point of #9343's "the estimator stays pure over a snapshot": a

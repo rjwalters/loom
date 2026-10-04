@@ -175,6 +175,7 @@ in-sweep half and takes the forge's word for the human-gated half.
 | `land-v1` | `land` | in-sweep phases and the stage-sample journal (turnovers too, for an unstarted issue) | after `merge_wait` |
 | `land-v2` | `land` | the same, with **right-censored** stage samples folded in (Kaplan–Meier grids) | after `merge_wait` |
 | `land-v3` | `land` | `land-v2`'s, with each stage grid calibrated first: widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored (recorded per stage as `distribution.adjustment`; #9970) | after `merge_wait` |
+| `land-2026-10-04-amber-heron` | `land` | `land-v2`'s path, then its p25/p75 recalibrated from `land-v2`'s own track record: the current stage's `ln(actual / p50)` distribution (landed estimates as events, still-open ones as censored lower bounds, recency-weighted) fitted at the estimate's own `as_of`; the median is kept (recorded as `recalibration`; #10207) | after `merge_wait` |
 
 A shipped id is **immutable**: a golden test pins each id's output on a fixed
 fixture. A behaviour change is a new id registered beside the old one
@@ -220,6 +221,13 @@ fixture. A behaviour change is a new id registered beside the old one
 all of the above.
 `land-v3` (#9970) ships the same way: its constants are fixture-derived,
 and the live coverage/pinball result is the operator's backtest, not a claim.
+`land-2026-10-04-amber-heron` (#10207) ships the same way, named by the
+datestamp-plus-two-words convention for shipped heuristics. Its evidence is
+`.loom/state/eta/calibration.jsonl` (every landed `land-v2` outcome the
+tracker scored) plus the pending store; `eta backtest` derives the same
+evidence by replaying `land-v2` over the cases, leak-free because the table is
+refitted at each case's own `as_of`. With fewer than 20 landings, even pooled
+across stages, it returns its base estimate unchanged.
 
 ## The explanation (`eta-explanation/v1`)
 
