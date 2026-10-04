@@ -7,6 +7,7 @@ mod ci;
 mod eta;
 mod metadata;
 mod ops;
+mod pick_decision;
 mod session_output;
 
 use std::collections::BTreeMap;
@@ -631,6 +632,14 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // start; the body is the record's JSON.
             let (event_name, severity, at, attributes, body) =
                 auto_update::log_parts(&envelope.record)?;
+            time_unix_nano = at;
+            body_override = Some(body);
+            (event_name, severity, String::new(), attributes)
+        }
+        TelemetryRecord::PickDecision(_) => {
+            // Issue #10212: body is the record's JSON (the ranked candidates).
+            let (event_name, severity, at, attributes, body) =
+                pick_decision::log_parts(&envelope.record)?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)

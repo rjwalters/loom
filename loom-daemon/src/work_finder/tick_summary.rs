@@ -178,6 +178,8 @@ pub fn publish_tick(
     let mut summary = tick_summary(report, max_concurrent, completed_at, roots, plan);
     summary.cap = last_cap().filter(|c| c.effective() == max_concurrent);
     crate::observability::ops::queue::record_queue(&summary);
+    // #10212: the ranked candidates and what the tick did with each.
+    crate::observability::pick_decision::emit_work_finder(&summary, started_at, completed_at);
     store_tick_summary(summary);
     crate::observability::ops::dispatch::record_tick(
         report,
