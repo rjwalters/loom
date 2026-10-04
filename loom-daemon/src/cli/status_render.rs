@@ -19,6 +19,7 @@ mod observability_line;
 mod operator_priority_line;
 mod peer_claims_line;
 mod pending_restart_line;
+mod roll_window_line;
 mod telemetry_banner;
 
 use loom_daemon::daemon_install_state;
@@ -584,6 +585,7 @@ pub(crate) fn build_status_json_value(
             "backoff_secs": report.auto_update_backoff_secs,
             "terminal_reason": report.auto_update_terminal_reason,
             "note": report.auto_update_note,
+            "roll_window": report.auto_update_roll_window,
             // Issue #7609: the release artifact the loop resolved for this
             // host's platform, next to the installed version above. `null`
             // when no artifact resolved (no Releases yet, an unreachable API,
@@ -2783,9 +2785,7 @@ pub(crate) fn print_status_human(
             );
         }
         println!();
-        if let Some(note) = &report.auto_update_note {
-            println!("  last tick: {note}");
-        }
+        roll_window_line::print_tail(report);
     }
 
     println!();
