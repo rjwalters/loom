@@ -226,7 +226,7 @@ pub fn watchdog(w: &Watched<'_>, now: DateTime<Utc>, window: Duration) -> Option
             kind: AskKind::NoProgress,
             key,
             text: format!(
-                "{repo}#{issue} is starred but has waited {minutes} min for a slot: it is {}                  (deferred: {}), and {moving}. {} (last seen: {}).",
+                "{repo}#{issue} is starred but has waited {minutes} min for a slot: it is {} (deferred: {}), and {moving}. {} (last seen: {}).",
                 wait.summary(),
                 wait.limit_phrase(),
                 super::queue::advice(wait),
