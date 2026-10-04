@@ -654,7 +654,7 @@ Issue #99: "fix the crash bug"
 If, during curation, you determine an issue is too large to be a single Builder PR (>6 hours, >8 files, or >400 LOC) and must be split into sub-issues (size each child per "Backlog Rightsizing" below):
 
 1. **Create each sub-issue with `loom:triage` only.** Do NOT apply `loom:curated`, even if your decomposition includes curator-quality detail (acceptance criteria, file references, scope guards).
-2. **Do NOT apply `loom:issue`** — a sub-issue is never starred (only the operator stars), so the starred exception never covers it (see "Who promotes `loom:curated` → `loom:issue`" above).
+2. **Do NOT apply `loom:issue`** — a new sub-issue is unstarred (you never star on your own judgment), so the starred exception does not cover it (see "Who promotes `loom:curated` → `loom:issue`" above).
 3. **Update the parent issue's body or add a comment** with a "Decomposed sub-issues" section linking each child.
 4. **Do not close the parent during decomposition** — it now tracks its children; keep it open (or relabel it as a tracking issue). Closing here would orphan the sub-issues. (Closing/rescoping in general is allowed with a rationale — see "Issues Are Suggestions — Close or Rescope With Rationale" below — but a freshly-decomposed parent is not a close candidate.)
 5. **Do not self-curate your own sub-issues in the same session.** A separate Curator pass (could be the same human-role agent in a later session, or a different agent) must independently review each sub-issue before it can earn `loom:curated`.
