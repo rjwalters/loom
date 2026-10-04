@@ -185,6 +185,7 @@ in-sweep half and takes the forge's word for the human-gated half.
 | `land-v2` | `land` | the same, with **right-censored** stage samples folded in (Kaplan–Meier grids) | after `merge_wait` |
 | `land-v3` | `land` | `land-v2`'s, with each stage grid calibrated first: widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored (recorded per stage as `distribution.adjustment`; #9970) | after `merge_wait` |
 | `land-2026-10-04-amber-heron` | `land` | `land-v2`'s path, then its p25/p75 recalibrated from `land-v2`'s own track record: the current stage's `ln(actual / p50)` distribution (landed estimates as events, still-open ones as censored lower bounds, recency-weighted) fitted at the estimate's own `as_of`; the median is kept (recorded as `recalibration`; #10207) | after `merge_wait` |
+| `land-2026-10-04-twin-otter` | `land` | no history: the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)). PR stages only (`review_wait`, `doctor`, `merge_wait`); the blend of a stage-by-stage exit-hazard Monte Carlo (256 paths, seeded per stage visit) and a log-normal direct model (recorded as `twin_otter`; #10222, #10243) | at the merge |
 
 A shipped id is **immutable**: a golden test pins each id's output on a fixed
 fixture. A behaviour change is a new id registered beside the old one
@@ -237,6 +238,11 @@ tracker scored) plus the pending store; `eta backtest` derives the same
 evidence by replaying `land-v2` over the cases, leak-free because the table is
 refitted at each case's own `as_of`. With fewer than 20 landings, even pooled
 across stages, it returns its base estimate unchanged.
+`land-2026-10-04-twin-otter` (#10243) ships the same way, registered last.
+`eta view`, `eta list`, `eta backtest` and `eta promote` build the registry
+with no coefficient file, so there it refuses `no_model`: its backtest gate
+cannot pass while it is a shadow, by design. Its live evidence is the
+tracker's, which loads the file (below).
 
 ## Fitted coefficients (`eta-fit/v1`)
 
@@ -316,6 +322,45 @@ both sides call on the raw `ModelInputs`.
   before `before`.
 - `aft` is `null` when no stage passes its gate.
 
+**Loading and reloading** (#10243). A heuristic may not read a file, so the
+file is loaded when the **registry** is built, and the fitted heuristic holds
+it:
+
+- `Registry::with_fit(fit)` is the pure constructor; `Registry::builtin()` is
+  `with_fit(None)` and reads nothing; `Registry::load(root, before)` wraps
+  `load_latest`. `land-2026-10-04-twin-otter` is registered with or without a
+  file, so its refusals are on the record.
+- The tracker builds its registry with `load(workspace_root, now)` at
+  startup. On **every pass** (`refreshSecs`, default 300 s) it re-runs
+  `load_latest(workspace_root, listed_at)` off the async runtime, next to the
+  history reload, and swaps in a rebuilt registry when the file id differs
+  from the registered one (a file appearing or disappearing counts). The
+  daily refit therefore reaches a running daemon within one pass, and an
+  unchanged file costs one parse per stored fit and no rebuild.
+- Each change is logged once: `info` with the new id, cutoff and the id it
+  replaced, or one `warn` naming the fit directory when there is no file.
+- An estimate never uses a file whose `as_of` is at or after its own `as_of`
+  (it refuses `no_model`), so a replay cannot see a later fit.
+
+**Serving `land-2026-10-04-twin-otter`.** The adapter maps the estimate's
+input onto the model's (train and serve share each definition):
+
+| model input | from |
+|---|---|
+| `stage` | `review_wait`, `doctor` → `doctor_wait`, `merge_wait`; every pre-PR stage refuses `unknown_stage` |
+| `age_h` | whole seconds in the current stage episode (since `entered_at`; `age_sec` when there is none) |
+| `ahead`, `n_stage_repo`, `n_stage_fleet`, `exits_repo_6h`, `exits_repo_24h`, `exits_fleet_6h`, `merges_repo_24h`, `merges_fleet_6h` | the same-named queue features; `null` is imputed at the training mean and named in `twin_otter.imputed` |
+| `since_merge_h` | `since_merge_sec / 3600` |
+| `rework` | `doctor_cycles_so_far` (Judge rejections so far), else the resolver's count; at least 1 in `doctor` |
+| the six flags | `eta::labels::pr_flags(labels)`: bit 0 `op_hold` (`loom:operator`, `loom:operator-only`, `loom:operator-decision`), 1 `sequenced`, 2 `starred` (`loom:operator-priority`), 3 `conflict` (`loom:merge-conflict`), 4 `ci_fail` (`loom:ci-failure`), 5 `blocked` |
+
+The Monte Carlo seed is `seed_for_visit("<repo_key>#<issue>", stage,
+episode entry)`: every refresh of one stage visit draws the same uniforms, so
+an unchanged-input refresh moves p50 by the model's drift, not by a redraw
+(pinned under 5%). A stage the fit skipped refuses `insufficient_samples`; a
+missing, model-less, too-new or malformed file refuses `no_model`. It never
+refuses `beyond_history`.
+
 ## The explanation (`eta-explanation/v1`)
 
 The heuristic builds the explanation first and computes the numbers from it,
@@ -330,14 +375,15 @@ level: `schema`, `estimate_id`, `heuristic`, `kind`, `loom` (provenance),
 `admission_delay_sec`), `result` (`p25_sec`,
 `p50_sec`, `p75_sec`, `p90_sec`, `eta_p50_at`, `samples_min`, `stage_marks`),
 `contributions`, `features`, `features_omitted`, `no_estimate_reason`,
-`truncated`.
+`truncated`, and, on an answered `land-2026-10-04-twin-otter` estimate only,
+`twin_otter` (below).
 
 `result.p90_sec` (#10211) is the displayed upper bound that a late surprise
 is scored against. It is the nearest-rank 90th percentile of the same
 simulated path totals the quartiles come from, so it costs no new draws and
 leaves `p25_sec`, `p50_sec` and `p75_sec` unchanged; `run_explanation`
 recomputes all four. Every heuristic that simulates (`start-v1`, `finish-v1`,
-`land-v1`, `land-v2`, `land-v3`) records it. It is absent only on a refusal
+`land-v1`, `land-v2`, `land-v3`, `land-2026-10-04-twin-otter`) records it. It is absent only on a refusal
 and on an explanation recorded before the field existed, which still parses:
 the field is additive, so the schema stays `eta-explanation/v1`. The stage
 marks stay at three percentiles.
@@ -351,10 +397,24 @@ path completion time, so its `p50_at` is exactly `eta_p50_at`; a stage no
 path visits carries `null` times, never a fabricated one. A timeline can be
 drawn from `stage_marks` alone.
 
+`twin_otter` (#10243) is how a fitted estimate recomputes without stage
+grids: `fit_id` and `fit_as_of` (the coefficient file), `input` (the adapted
+model input, exactly as evaluated) and `imputed`, the config (`step_h`,
+`steps`, `cap_h`, `paths`, `age_clamp_h`, `age_clamp_applied`; the seed is
+`combination.seed`), both parts' p25/p50/p75/p90 in seconds
+(`hazard_path_sec`, `aft_sec`), and `model`, the slice of the file the
+evaluation read (the feature names, the current stage's hazard, the direct
+model and every stage's path statistics; about 4 KB, at most about 13 KB).
+`result` holds the blend, `combination.method` is `twin_otter_blend`, and
+`path`, `stages`, `branches`, `contributions` and the history fields are
+empty. The field is absent for every other heuristic and on every refusal, and
+an explanation recorded before it still parses.
+
 A feature is `null` when it was not measured, with a `features_omitted`
 reason; never a default ([Features](#features) lists the definitions and
 the reasons). An explanation stays near 8 KiB; over 32 KiB it
-drops `features`, then the stage grids, then the stage marks, then every
+drops `features`, then `twin_otter.model` (only when present; then nothing
+recomputes), then the stage grids, then the stage marks, then every
 remaining list (`detail`), stopping as soon as it fits, and names each drop
 in `truncated`.
 
@@ -534,6 +594,7 @@ Omission reasons are free-form strings.
 | `no_dispatch_plan` | not started, and the dispatch plan gives it no position (blocked, or no plan on this host) |
 | `unknown_stage` | no stage label, or contradictory ones |
 | `stale_inputs` | a ready item whose dispatch plan is older than 15 minutes (or three ticks) |
+| `no_model` | a fitted heuristic (`land-2026-10-04-twin-otter`) has no usable coefficient file: none loaded (always, in the CLI), no direct model, a cutoff at or after `as_of`, or malformed coefficients |
 
 A refusal is emitted as an `eta.estimate` with no `result`, when its reason
 first appears.
