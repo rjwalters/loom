@@ -13,25 +13,46 @@
 //! of this file along with both transports' argv.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
-use crate::gh_invocation::gh_bin;
-use crate::proc_exec::{run_bounded, Completion};
+use crate::cmd_out::{CmdOutcome, Unavailable};
+use crate::gh_invocation::{gh_bin, AccessIntent, GhInvocation, GhTarget, Operation};
 
-fn gh_command(repo_root: &Path) -> Command {
-    let mut cmd = Command::new(gh_bin());
-    cmd.current_dir(repo_root);
-    // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
-    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner). This is the
-    // single choke point every helper in this module builds its `Command` through,
-    // so wiring it here covers `clean.rs` / `aggressive.rs` / `orphan_recovery.rs`
-    // without touching each call site individually.
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
-    cmd
+/// Deadline for the unbounded-by-history `gh` calls this module made through a
+/// bare `Command::output()` (#10089: the facade always bounds its child).
+/// Generous on purpose: paginated timeline walks and writes must not be cut
+/// short by a slow forge, only by a wedged one.
+const GH_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Build one counted facade invocation rooted at `repo_root`.
+///
+/// This is the single choke point every helper in this module builds through
+/// (#5401/#5431 cross-owner `GH_CONFIG_DIR` comes from the cwd lookup inside
+/// the facade), and the call is booked in `forge_call_stats` under `op`
+/// (#10089).
+fn invocation(
+    op: &'static str,
+    intent: AccessIntent,
+    repo_root: &Path,
+    timeout: Duration,
+    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+) -> GhInvocation {
+    GhInvocation::new(Operation::new(op), intent, GhTarget::None, timeout)
+        .args(args)
+        .current_dir(repo_root)
+}
+
+/// Run a counted read with the long deadline.
+fn run_read(
+    op: &'static str,
+    repo_root: &Path,
+    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+) -> CmdOutcome {
+    invocation(op, AccessIntent::Read, repo_root, GH_CALL_TIMEOUT, args).run()
 }
 
 /// Wall-clock deadline for every read-only `gh` probe this module and
@@ -51,50 +72,17 @@ fn gh_command(repo_root: &Path) -> Command {
 /// landed, and "assume it failed" is not a safe default there.
 pub(crate) const GH_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Run one read-only `gh` probe to completion under `timeout` (#8708).
+/// Run one read-only `gh` probe to completion under its invocation's deadline
+/// (#8708), through the counted facade (#10089).
 ///
-/// The seam every bounded probe in this module and `clean.rs` executes
-/// through. Returns `None` on deadline expiry (logged — the operational
-/// signal this bound exists for), on spawn failure, and on
-/// output-collection failure: exactly the "no answer" each caller's
-/// previous `cmd.output().ok()` / `let Ok(..) else` handling already
-/// mapped, now also covering the slow-hang side those handlers could not
-/// see. A probe that **exits** — zero or nonzero — is a completed answer
+/// Returns `None` on deadline expiry (logged — the operational signal this
+/// bound exists for), on spawn failure, and on output-collection failure:
+/// exactly the "no answer" each caller's previous `cmd.output().ok()` handling
+/// mapped. A probe that **exits** — zero or nonzero — is a completed answer
 /// and keeps its [`Output`], so each caller's existing
 /// `!out.status.success()` fail-closed path keeps deciding those.
 #[must_use]
-pub(crate) fn bounded_output(mut cmd: Command, timeout: Duration) -> Option<Output> {
-    // `Command::output()` nulls stdin when the caller left it unset; the
-    // bounded runner leaves stdin to the caller by design, so preserve that
-    // contract here rather than letting the child inherit the daemon's.
-    cmd.stdin(std::process::Stdio::null());
-    match run_bounded(cmd, timeout) {
-        Ok(Completion::Exited(out)) => Some(out),
-        Ok(Completion::TimedOut { .. }) => {
-            eprintln!(
-                "gh: probe exceeded {timeout:?} deadline — treating result as UNKNOWN (issue #8708)"
-            );
-            None
-        }
-        Err(_) => None,
-    }
-}
-
-/// [`bounded_output`]'s counted twin (#10089): the same `None`-on-no-answer
-/// contract, but the probe runs through the `gh` facade, so it is booked in
-/// `forge_call_stats` under `op` and gets the cross-owner `GH_CONFIG_DIR`
-/// (#5401/#5431) from `repo_root`.
-pub(crate) fn bounded_counted(
-    op: &'static str,
-    repo_root: &Path,
-    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
-) -> Option<Output> {
-    use crate::cmd_out::{CmdOutcome, Unavailable};
-    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-    let inv =
-        GhInvocation::new(Operation::new(op), AccessIntent::Read, GhTarget::None, GH_PROBE_TIMEOUT)
-            .args(args)
-            .current_dir(repo_root);
+pub(crate) fn bounded_via(inv: GhInvocation) -> Option<Output> {
     match inv.run() {
         CmdOutcome::Ran(out) => Some(out),
         CmdOutcome::Unavailable(Unavailable::TimedOut { after, .. }) => {
@@ -107,21 +95,34 @@ pub(crate) fn bounded_counted(
     }
 }
 
+/// A bounded counted read probe: the `None`-on-no-answer contract of
+/// [`bounded_via`] for a `gh <args>` call run from `repo_root`, booked under
+/// `op`.
+pub(crate) fn bounded_counted(
+    op: &'static str,
+    repo_root: &Path,
+    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+) -> Option<Output> {
+    bounded_via(invocation(op, AccessIntent::Read, repo_root, GH_PROBE_TIMEOUT, args))
+}
+
 /// `gh issue view <N> --json state --jq .state`. Returns `"UNKNOWN"` on any
 /// failure (matches `clean.py`'s `except Exception: issue_state = "UNKNOWN"`).
 #[must_use]
 pub fn issue_state(repo_root: &Path, issue: u32) -> String {
-    let mut cmd = gh_command(repo_root);
-    cmd.args([
-        "issue",
-        "view",
-        &issue.to_string(),
-        "--json",
-        "state",
-        "--jq",
-        ".state",
-    ]);
-    let out = bounded_output(cmd, GH_PROBE_TIMEOUT);
+    let out = bounded_counted(
+        "worktree.issue_state",
+        repo_root,
+        [
+            "issue",
+            "view",
+            &issue.to_string(),
+            "--json",
+            "state",
+            "--jq",
+            ".state",
+        ],
+    );
     match out {
         Some(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -146,14 +147,16 @@ pub fn issue_state(repo_root: &Path, issue: u32) -> String {
 /// match [`issue_state`]'s contract.
 #[must_use]
 pub fn issue_state_rest(repo_root: &Path, issue: u32) -> String {
-    let mut cmd = gh_command(repo_root);
-    cmd.args([
-        "api",
-        &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
-        "--jq",
-        ".state",
-    ]);
-    let out = bounded_output(cmd, GH_PROBE_TIMEOUT);
+    let out = bounded_counted(
+        "worktree.issue_state_rest",
+        repo_root,
+        [
+            "api",
+            &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
+            "--jq",
+            ".state",
+        ],
+    );
     match out {
         Some(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_uppercase();
@@ -178,14 +181,16 @@ pub fn issue_state_rest(repo_root: &Path, issue: u32) -> String {
 /// never be read as "grace period already elapsed".
 #[must_use]
 pub fn issue_closed_at_rest(repo_root: &Path, issue: u32) -> Option<String> {
-    let mut cmd = gh_command(repo_root);
-    cmd.args([
-        "api",
-        &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
-        "--jq",
-        ".closed_at",
-    ]);
-    let out = bounded_output(cmd, GH_PROBE_TIMEOUT)?;
+    let out = bounded_counted(
+        "worktree.issue_closed_at",
+        repo_root,
+        [
+            "api",
+            &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
+            "--jq",
+            ".closed_at",
+        ],
+    )?;
     if !out.status.success() {
         return None;
     }
@@ -208,13 +213,15 @@ struct PrRow {
 /// lookup must not be silently treated as "no open PR".
 #[must_use]
 pub fn has_open_pr(repo_root: &Path, branch: &str) -> (bool, bool) {
-    let out = gh_command(repo_root)
-        .args([
+    let out = run_read(
+        "worktree.has_open_pr",
+        repo_root,
+        [
             "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1",
-        ])
-        .output();
+        ],
+    );
     match out {
-        Ok(o) if o.status.success() => {
+        CmdOutcome::Ran(o) if o.status.success() => {
             let rows: Result<Vec<PrRow>, _> = serde_json::from_slice(&o.stdout);
             match rows {
                 Ok(v) => (!v.is_empty(), true),
@@ -520,17 +527,21 @@ pub fn parse_open_linked_pr_timeline_trusted(stdout: &str, issue: u32, root: &Pa
 /// failure, which callers must treat as a probe failure.
 #[must_use]
 pub fn resolve_owner_repo(repo_root: &Path) -> Option<(String, String)> {
-    let out = gh_command(repo_root)
-        .args([
+    let out = run_read(
+        "worktree.resolve_repo",
+        repo_root,
+        [
             "repo",
             "view",
             "--json",
             "owner,name",
             "--jq",
             r#".owner.login + "/" + .name"#,
-        ])
-        .output()
-        .ok()?;
+        ],
+    );
+    let CmdOutcome::Ran(out) = out else {
+        return None;
+    };
     if !out.status.success() {
         return None;
     }
@@ -581,15 +592,21 @@ pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
     let Some((owner, repo)) = resolve_owner_repo(repo_root) else {
         return OpenPrProbe::ProbeFailed;
     };
-    let graphql = run_probe(repo_root, open_linked_pr_args(&owner, &repo, issue), &|s| {
-        parse_open_linked_pr_trusted(s, repo_root)
-    });
+    let graphql = run_probe(
+        "worktree.linked_pr_graphql",
+        repo_root,
+        open_linked_pr_args(&owner, &repo, issue),
+        &|s| parse_open_linked_pr_trusted(s, repo_root),
+    );
     if matches!(graphql, OpenPrProbe::Open(_)) {
         return graphql;
     }
-    let timeline = run_probe(repo_root, open_linked_pr_timeline_args(&owner, &repo, issue), &|s| {
-        parse_open_linked_pr_timeline_trusted(s, issue, repo_root)
-    });
+    let timeline = run_probe(
+        "worktree.linked_pr_timeline",
+        repo_root,
+        open_linked_pr_timeline_args(&owner, &repo, issue),
+        &|s| parse_open_linked_pr_timeline_trusted(s, issue, repo_root),
+    );
     // A verified NoneOpen from leg 1 survives a leg-2 probe failure: leg 2 is a
     // superset *when it answers*, and an unanswered superset is no evidence.
     if matches!(timeline, OpenPrProbe::ProbeFailed) {
@@ -603,12 +620,13 @@ pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
 /// A spawn error or non-zero exit (rate limit, auth failure, transient forge
 /// error) is a PROBE FAILURE, never a verified "no open PR".
 fn run_probe(
+    op: &'static str,
     repo_root: &Path,
     args: Vec<String>,
     classify: &dyn Fn(&str) -> OpenPrProbe,
 ) -> OpenPrProbe {
-    match gh_command(repo_root).args(args).output() {
-        Ok(o) if o.status.success() => classify(&String::from_utf8_lossy(&o.stdout)),
+    match run_read(op, repo_root, args) {
+        CmdOutcome::Ran(o) if o.status.success() => classify(&String::from_utf8_lossy(&o.stdout)),
         _ => OpenPrProbe::ProbeFailed,
     }
 }
@@ -622,21 +640,36 @@ fn require_write_scope(repo_root: &Path) -> Result<()> {
     }
 }
 
+/// The completed [`Output`], or an error naming why `gh` gave no answer.
+fn ran_or_err(outcome: CmdOutcome) -> Result<Output> {
+    match outcome {
+        CmdOutcome::Ran(out) => Ok(out),
+        CmdOutcome::Unavailable(u) => Err(anyhow!("{u}")),
+    }
+}
+
 /// `gh issue edit <N> --remove-label <remove> --add-label <add>`.
 pub fn edit_labels(repo_root: &Path, issue: u32, remove: &str, add: &str) -> Result<()> {
     require_write_scope(repo_root)?;
-    let out = gh_command(repo_root)
-        .args([
-            "issue",
-            "edit",
-            &issue.to_string(),
-            "--remove-label",
-            remove,
-            "--add-label",
-            add,
-        ])
-        .output()
-        .context("failed to invoke gh issue edit")?;
+    let out = ran_or_err(
+        invocation(
+            "worktree.edit_labels",
+            AccessIntent::Write,
+            repo_root,
+            GH_CALL_TIMEOUT,
+            [
+                "issue",
+                "edit",
+                &issue.to_string(),
+                "--remove-label",
+                remove,
+                "--add-label",
+                add,
+            ],
+        )
+        .run(),
+    )
+    .context("failed to invoke gh issue edit")?;
     if !out.status.success() {
         return Err(anyhow!(
             "gh issue edit {issue} failed: {}",
@@ -657,7 +690,7 @@ pub fn comment(repo_root: &Path, issue: u32, body: &str) -> Result<()> {
         anyhow!("could not resolve owner/repo from {repo_root:?} to comment on {issue}")
     })?;
     crate::forge_comment::post_comment(
-        gh_command(repo_root).get_program(),
+        std::ffi::OsStr::new(&gh_bin()),
         Some(repo_root),
         &format!("{owner}/{name}"),
         issue,
@@ -677,8 +710,10 @@ pub struct BuildingIssueRow {
 
 /// `gh issue list --label loom:building --state open --json number,title`.
 pub fn list_building_issues(repo_root: &Path) -> Result<Vec<BuildingIssueRow>> {
-    let out = gh_command(repo_root)
-        .args([
+    let out = ran_or_err(run_read(
+        "worktree.list_building",
+        repo_root,
+        [
             "issue",
             "list",
             "--label",
@@ -687,9 +722,9 @@ pub fn list_building_issues(repo_root: &Path) -> Result<Vec<BuildingIssueRow>> {
             "open",
             "--json",
             "number,title",
-        ])
-        .output()
-        .context("failed to invoke gh issue list")?;
+        ],
+    ))
+    .context("failed to invoke gh issue list")?;
     if !out.status.success() {
         return Err(anyhow!(
             "gh issue list --label loom:building failed: {}",
@@ -704,15 +739,18 @@ pub fn list_building_issues(repo_root: &Path) -> Result<Vec<BuildingIssueRow>> {
 /// event, unparseable timestamp). Mirrors `orphan_recovery.py::_get_building_label_age`.
 #[must_use]
 pub fn building_label_age_seconds(repo_root: &Path, issue: u32) -> Option<i64> {
-    let out = gh_command(repo_root)
-        .args([
+    let CmdOutcome::Ran(out) = run_read(
+        "worktree.building_label_age",
+        repo_root,
+        [
             "api",
             &format!("repos/{{owner}}/{{repo}}/issues/{issue}/events"),
             "--jq",
             r#"[.[] | select(.event == "labeled" and .label.name == "loom:building")] | last | .created_at"#,
-        ])
-        .output()
-        .ok()?;
+        ],
+    ) else {
+        return None;
+    };
     if !out.status.success() {
         return None;
     }
@@ -736,8 +774,10 @@ pub fn building_label_age_seconds(repo_root: &Path, issue: u32) -> Option<i64> {
 /// `orphan_recovery.py::_has_recent_orphan_comment`).
 #[must_use]
 pub fn has_recent_orphan_comment(repo_root: &Path, issue: u32, dedup_seconds: i64) -> bool {
-    let out = gh_command(repo_root)
-        .args([
+    let CmdOutcome::Ran(out) = run_read(
+        "worktree.orphan_comment",
+        repo_root,
+        [
             "issue",
             "view",
             &issue.to_string(),
@@ -745,9 +785,10 @@ pub fn has_recent_orphan_comment(repo_root: &Path, issue: u32, dedup_seconds: i6
             "comments",
             "--jq",
             r###".comments | map(select(.body | startswith("## Orphan Recovery"))) | sort_by(.createdAt) | last | .createdAt // empty"###,
-        ])
-        .output();
-    let Ok(out) = out else { return false };
+        ],
+    ) else {
+        return false;
+    };
     if !out.status.success() {
         return false;
     }
@@ -1042,7 +1083,7 @@ mod tests {
     //
     // The 25-hour `clean --deep --safe` hang this issue reports was an
     // unbounded `gh api` child wedged in `futex_do_wait`. Every bounded
-    // probe funnels through `bounded_output`; these tests pin the seam's
+    // probe funnels through `bounded_via`; these tests pin the seam's
     // contract with fixture executables addressed by ABSOLUTE path — no
     // PATH mutation (the #5961 rule) and no `LOOM_GH_BIN` env racing other
     // tests — and a sub-second deadline so CI never pays the 60s budget.
@@ -1059,12 +1100,24 @@ mod tests {
         path
     }
 
+    /// A facade invocation pinned to a fixture executable (no PATH or
+    /// `LOOM_GH_BIN` mutation).
+    fn probe_inv(program: &Path, timeout: Duration) -> GhInvocation {
+        GhInvocation::new(
+            Operation::new("worktree.test_probe"),
+            AccessIntent::Read,
+            GhTarget::None,
+            timeout,
+        )
+        .program(program)
+    }
+
     #[test]
     fn a_hung_gh_probe_is_killed_at_its_deadline_and_reports_no_answer() {
         let tmp = tempfile::tempdir().unwrap();
         let hung = write_probe_fixture(tmp.path(), "hung-probe", "#!/bin/sh\nsleep 30\n");
         let started = std::time::Instant::now();
-        let out = bounded_output(Command::new(&hung), Duration::from_millis(750));
+        let out = bounded_via(probe_inv(&hung, Duration::from_millis(750)));
         assert!(
             out.is_none(),
             "a probe past its deadline must report no answer, never hang: {out:?}"
@@ -1088,7 +1141,7 @@ mod tests {
         // harness — a harness race, not a property of the code under test
         // (same mitigation `clean::tests::spawn_service_in` applies).
         let out = (0..10)
-            .find_map(|_| bounded_output(Command::new(&ok), GH_PROBE_TIMEOUT))
+            .find_map(|_| bounded_via(probe_inv(&ok, GH_PROBE_TIMEOUT)))
             .expect("a probe that exits inside the deadline must return its Output");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "OPEN");
@@ -1100,7 +1153,7 @@ mod tests {
         let fail = write_probe_fixture(tmp.path(), "fail-probe", "#!/bin/sh\nexit 1\n");
         // Same spawn-retry rationale as the fast-probe test above.
         let out = (0..10)
-            .find_map(|_| bounded_output(Command::new(&fail), GH_PROBE_TIMEOUT))
+            .find_map(|_| bounded_via(probe_inv(&fail, GH_PROBE_TIMEOUT)))
             .expect("a probe that ran and exited nonzero completed, it did not time out");
         assert!(
             !out.status.success(),
@@ -1112,7 +1165,7 @@ mod tests {
     #[test]
     fn a_missing_gh_binary_is_no_answer_exactly_as_before_the_bound() {
         let tmp = tempfile::tempdir().unwrap();
-        let out = bounded_output(Command::new(tmp.path().join("no-such-gh")), GH_PROBE_TIMEOUT);
+        let out = bounded_via(probe_inv(&tmp.path().join("no-such-gh"), GH_PROBE_TIMEOUT));
         assert!(out.is_none(), "a spawn failure must stay a no-answer: {out:?}");
     }
 }

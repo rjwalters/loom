@@ -62,13 +62,11 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use loom_daemon::comment_trust::{records::AUTHOR_JQ, TrustPolicy};
-use loom_daemon::proc_exec::{run_bounded, Completion};
 use loom_daemon::sweep_registry::{SweepRegistry, LEASE_MARKER_PREFIX};
 
 /// The first-line prefix of a `loom:lease-yield` standdown record (#6287).
@@ -167,20 +165,28 @@ pub(crate) fn read_rows(
     timeout: Duration,
     policy: &TrustPolicy,
 ) -> Option<Vec<LeaseRow>> {
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("api")
-        .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"))
-        .arg("--paginate")
-        .arg("--jq")
-        .arg(format!(
-            r#".[] | select(.body != null and ((.body | startswith("{LEASE_MARKER_PREFIX}")) or (.body | startswith("{YIELD_MARKER_PREFIX}")))) | {{updated_at: .updated_at, body: .body, {AUTHOR_JQ}}}"#
-        ))
-        .current_dir(repo)
-        .stdin(std::process::Stdio::null());
-    loom_daemon::credential_preflight::apply_gh_config_for_root(&mut cmd, repo);
-    loom_daemon::gh_repo_env::apply_loom_repo_override(&mut cmd);
-    match run_bounded(cmd, timeout) {
-        Ok(Completion::Exited(out)) if out.status.success() => {
+    use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    // Counted as `lease.co_occupancy_comments` (#10089). The facade supplies
+    // the cross-owner `GH_CONFIG_DIR` from `repo` (#5401) and the `LOOM_REPO`
+    // -> `GH_REPO` override, nulls stdin, and bounds the call by `timeout`.
+    let outcome = GhInvocation::new(
+        Operation::new("lease.co_occupancy_comments"),
+        AccessIntent::Read,
+        GhTarget::None,
+        timeout,
+    )
+    .program(gh_bin)
+    .arg("api")
+    .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"))
+    .arg("--paginate")
+    .arg("--jq")
+    .arg(format!(
+        r#".[] | select(.body != null and ((.body | startswith("{LEASE_MARKER_PREFIX}")) or (.body | startswith("{YIELD_MARKER_PREFIX}")))) | {{updated_at: .updated_at, body: .body, {AUTHOR_JQ}}}"#
+    ))
+    .current_dir(repo)
+    .run();
+    match outcome.ok_output() {
+        Some(out) => {
             // #9631: an untrusted (or unattributed) row is prose.
             let trusted = policy.trusted_ndjson(&out.stdout);
             Some(parse_rows(&String::from_utf8_lossy(&trusted)))

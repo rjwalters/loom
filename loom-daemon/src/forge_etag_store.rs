@@ -40,6 +40,8 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::{Context, Result};
 
 use crate::forge_listing::{parse_http_response, HttpResponse};
+use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
+use crate::proc_exec::Completion;
 
 /// `${TMPDIR:-/tmp}` — the per-user, per-host scratch base the ETag store and
 /// the forge-call sink ([`crate::forge_call_stats`]) both live under.
@@ -202,8 +204,10 @@ pub(crate) fn write_disk_entry(path: &Path, entry: &DiskEntry) {
 /// One `gh api --include <url>` invocation against `target`, optionally
 /// conditional on `etag`,
 /// run in `cwd` under that root's credential (#5401). Every call is recorded
-/// against `caller` in [`crate::forge_call_stats`] (#9251) — a local
-/// bookkeeping write, never an extra forge call.
+/// against `caller` in [`crate::forge_call_stats`] (#9251, by the
+/// [`GhInvocation`] facade since #10089) — a local bookkeeping write, never an
+/// extra forge call. `caller` is the facade's operation name, so it must be a
+/// valid [`Operation`] (lowercase `snake_case` segments).
 pub(crate) fn fetch_conditional(
     caller: &'static str,
     gh_bin: &Path,
@@ -255,9 +259,20 @@ pub(crate) fn fetch_conditional(
     run_fetch(caller, gh_bin, cwd, target, url, etag, None)
 }
 
+/// Deadline for one conditional read (they were unbounded `.output()`s before
+/// #10089). A listing is one page, so a minute is generous.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// One `gh api --include` run. `reader_dir` = `Some` runs it under that
 /// reader's `GH_CONFIG_DIR`; `None` under the writer's (#5401 per-owner, else
 /// process-global).
+///
+/// Built through [`GhInvocation`] (#10089), which records the call against
+/// `caller` in [`crate::forge_call_stats`] from the `--include` status line
+/// and rate-limit headers — the same [`crate::forge_call_stats::classify`]
+/// the hand-rolled record call here used. [`GhTarget::None`] on purpose: the
+/// writer credential stays the `cwd` root's (#5401) and nothing else, so the
+/// identity a call runs under keeps matching [`credential_scope`]'s cache key.
 fn run_fetch(
     caller: &'static str,
     gh_bin: &Path,
@@ -267,40 +282,32 @@ fn run_fetch(
     etag: Option<&str>,
     reader_dir: Option<&Path>,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("api").arg("--include").arg(url);
+    let mut inv = GhInvocation::new(
+        Operation::new(caller),
+        AccessIntent::Read,
+        GhTarget::None,
+        FETCH_TIMEOUT,
+    )
+    .program(gh_bin)
+    .args(["api", "--include", url]);
     if let Some(host) = &target.host {
         // The URL names the remote-resolved repo explicitly, so name its host
         // too (gh would otherwise use its default host, not the remote's).
-        cmd.arg("--hostname").arg(host);
+        inv = inv.arg("--hostname").arg(host);
     }
     if let Some(e) = etag {
-        cmd.arg("-H").arg(format!("If-None-Match: {e}"));
+        inv = inv.arg("-H").arg(format!("If-None-Match: {e}"));
     }
     if let Some(dir) = cwd {
-        cmd.current_dir(dir);
+        inv = inv.current_dir(dir);
     }
-    match reader_dir {
-        Some(dir) => {
-            cmd.env("GH_CONFIG_DIR", dir);
-        }
-        // #5401: point a cross-owner managed repo's listing at its own owner's
-        // installation-token `GH_CONFIG_DIR` (no-op for single-owner fleets / a
-        // `None` cwd).
-        None => crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, cwd),
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    let out = match inv.gh_config_dir(reader_dir).execute() {
+        Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
+        Ok(_) => anyhow::bail!("gh api {url} timed out after {}s", FETCH_TIMEOUT.as_secs()),
+        Err(e) => return Err(e).with_context(|| format!("failed to invoke {}", gh_bin.display())),
+    };
     let response = parse_http_response(&String::from_utf8_lossy(&out.stdout));
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    crate::forge_call_stats::record_gh_api(
-        caller,
-        response.as_ref(),
-        out.status.success(),
-        &stderr,
-    );
     Ok((out.status, response, stderr))
 }
 

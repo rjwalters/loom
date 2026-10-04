@@ -357,18 +357,9 @@ pub fn classify(response: Option<&HttpResponse>, exit_ok: bool, stderr: &str) ->
     (pool, outcome)
 }
 
-/// Record one `gh api --include` call by `caller` (see [`classify`]).
-pub fn record_gh_api(
-    caller: &'static str,
-    response: Option<&HttpResponse>,
-    exit_ok: bool,
-    stderr: &str,
-) {
-    let (pool, outcome) = classify(response, exit_ok, stderr);
-    record(caller, pool, outcome, response.map(|r| &r.ratelimit));
-}
-
-/// [`record_gh_api`] plus the #9777 call identity.
+/// Record one `gh api --include` call by `caller` (see [`classify`]) with the
+/// #9777 call identity. Plain `gh` spawns are recorded by the `GhInvocation`
+/// facade (#10089); this is for a caller that carries an explicit identity.
 pub fn record_gh_api_with_identity(
     caller: &'static str,
     identity: &CallIdentity,

@@ -10,7 +10,18 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Output;
+use std::time::Duration;
+
+use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
+use crate::proc_exec::Completion;
+
+/// Deadline for one `gh api` read (#10089: they were unbounded `.output()`s).
+/// Generous because a job-log document can be several MB.
+const API_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Deadline for one `gh run download` (redirect + blob fetch + unzip).
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A successful (2xx) or not-modified (304) response.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -293,30 +304,32 @@ impl GhCliApi {
 
     /// One `gh api --include …` invocation, under `reader_dir`'s credential
     /// when given, else the process's own.
+    ///
+    /// Built through [`GhInvocation`] (#10089): the facade records the call
+    /// under `ci_telemetry` in [`crate::forge_call_stats`] from the
+    /// `--include` status line and headers (the same
+    /// [`crate::forge_call_stats::classify`] the hand-rolled record call it
+    /// replaced used).
     fn run_once(
         &self,
         path: &str,
         extra: &[&str],
         reader_dir: Option<&std::path::Path>,
     ) -> Result<ApiResponse, ApiError> {
-        let mut cmd = Command::new(&self.gh_bin);
-        cmd.arg("api").arg("--include");
-        for argument in extra {
-            cmd.arg(argument);
-        }
-        if let Some(dir) = reader_dir {
-            cmd.env("GH_CONFIG_DIR", dir);
-        }
-        cmd.arg(path).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let output = cmd.output().map_err(|e| {
-            ApiError::Transport(format!("could not run {}: {e}", self.gh_bin.display()))
-        })?;
+        let inv = GhInvocation::new(
+            Operation::new("ci_telemetry"),
+            AccessIntent::Read,
+            GhTarget::None,
+            API_TIMEOUT,
+        )
+        .program(&self.gh_bin)
+        .args(["api", "--include"])
+        .args(extra)
+        .arg(path)
+        .gh_config_dir(reader_dir);
+        let output = self.captured(inv, &format!("gh api {path}"), API_TIMEOUT)?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // #9251: per-caller accounting (a local write, never a forge call).
-        let base = crate::forge_listing::parse_http_response(&stdout);
-        let exit_ok = output.status.success();
-        crate::forge_call_stats::record_gh_api("ci_telemetry", base.as_ref(), exit_ok, &stderr);
         match parse_raw(&stdout) {
             Some(response) => classify(response, path),
             None if crate::rate_limit_breaker::indicates_rate_limit(&stderr) => {
@@ -330,6 +343,25 @@ impl GhCliApi {
                 "gh api {path} produced no HTTP response: {}",
                 bounded(&stderr)
             ))),
+        }
+    }
+
+    /// Execute `inv`: its output when `gh` ran to an exit (any status), else
+    /// a transport error naming `what` (could not start, or timed out).
+    fn captured(
+        &self,
+        inv: GhInvocation,
+        what: &str,
+        timeout: Duration,
+    ) -> Result<Output, ApiError> {
+        match inv.execute() {
+            Ok(GhCompletion::Captured(Completion::Exited(output))) => Ok(output),
+            Ok(_) => {
+                Err(ApiError::Transport(format!("{what} timed out after {}s", timeout.as_secs())))
+            }
+            Err(e) => {
+                Err(ApiError::Transport(format!("could not run {}: {e}", self.gh_bin.display())))
+            }
         }
     }
 }
@@ -386,22 +418,24 @@ terminal escapes will be refused by gh rather than captured (upgrade gh to captu
         name: &str,
         dest: &std::path::Path,
     ) -> Result<(), ApiError> {
-        let output = Command::new(&self.gh_bin)
-            .arg("run")
-            .arg("download")
-            .arg(run_id.to_string())
-            .arg("--repo")
-            .arg(repo)
-            .arg("--name")
-            .arg(name)
-            .arg("--dir")
-            .arg(dest)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| {
-                ApiError::Transport(format!("could not run {}: {e}", self.gh_bin.display()))
-            })?;
+        let inv = GhInvocation::new(
+            Operation::new("ci_telemetry.download"),
+            AccessIntent::Read,
+            // Not `GhTarget::repo`: that would switch the download onto the
+            // owner's registered credential; it keeps the ambient one.
+            GhTarget::None,
+            DOWNLOAD_TIMEOUT,
+        )
+        .program(&self.gh_bin)
+        .args(["run", "download"])
+        .arg(run_id.to_string())
+        .arg("--repo")
+        .arg(repo)
+        .arg("--name")
+        .arg(name)
+        .arg("--dir")
+        .arg(dest);
+        let output = self.captured(inv, &format!("gh run download {run_id}"), DOWNLOAD_TIMEOUT)?;
         if output.status.success() {
             return Ok(());
         }
