@@ -170,6 +170,7 @@ impl EtaPromoteArgs {
         let mut cases = backtest::cases_from_envelopes(&envelopes);
         cases.extend(backtest::cases_from_journal(&journal_entries));
         let loom = Provenance::current();
+        super::eta_replay_cmd::with_replay_calibration(&registry, &mut history, &cases, &loom);
         let comparison =
             backtest::compare(current, candidate, &history, &cases, filter, &loom).ok();
 
@@ -401,6 +402,7 @@ impl EtaBacktestArgs {
         let mut cases = backtest::cases_from_envelopes(&envelopes);
         cases.extend(backtest::cases_from_journal(&journal_entries));
         let loom = Provenance::current();
+        super::eta_replay_cmd::with_replay_calibration(&registry, &mut history, &cases, &loom);
 
         if let Some(other_id) = &self.compare {
             let Some(other) = registry.get(other_id) else {
@@ -458,7 +460,11 @@ fn load_history(root: &Path, scope: HistoryScopeMode) -> StageSamples {
     history.push_envelopes(&envelopes);
     let journal_entries = journal::read(&journal::journal_path(root));
     history.push_journal(&journal_entries, "local");
-    fleet::apply_scope(scope, root, history)
+    let mut history = fleet::apply_scope(scope, root, history);
+    // #10207: the daemon's calibration log and pending store, so `eta view`
+    // shows the recalibrated interval the daemon would.
+    history.calibration = loom_daemon::eta::calibration_log::load(root);
+    history
 }
 
 /// The scope a `--scope` flag asks for: the flag when given, else the

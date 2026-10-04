@@ -37,6 +37,7 @@ mod duplicate_scan;
 mod eta_cmd;
 mod eta_fleet_cmd;
 mod eta_fleet_events_cmd;
+mod eta_replay_cmd;
 mod fleet_captain_cmd;
 pub(crate) mod fleet_config;
 mod fleet_config_reload;

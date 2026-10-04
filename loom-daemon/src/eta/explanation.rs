@@ -78,6 +78,11 @@ pub struct Explanation {
     pub no_estimate_reason: Option<NoEstimateReason>,
     /// What [`Explanation::enforce_cap`] dropped, in drop order.
     pub truncated: Vec<String>,
+    /// How a recalibrating heuristic (#10207) moved the simulated quantiles
+    /// into `result`. Absent — and `result` is the simulation's own — for
+    /// every other heuristic, so their explanations are byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recalibration: Option<super::recalibrate::Recalibration>,
 }
 
 /// The current stage as the estimate saw it.

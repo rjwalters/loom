@@ -527,9 +527,18 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
 /// Recompute an explanation's `(p25, p50, p75, p90)` from its own fields;
 /// compare with [`Explanation::quantiles_with_p90`].
 #[must_use]
+///
+/// A recalibrated explanation (#10207) recomputes through its recorded
+/// [`super::recalibrate::Recalibration`]: the simulation reproduces the base
+/// quantiles, and the recorded ratio distribution moves them exactly as the
+/// heuristic did.
 pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)> {
     let spec = spec_from_explanation(explanation)?;
-    run(&spec).ok().map(|s| s.quantiles)
+    let simulated = run(&spec).ok().map(|s| s.quantiles)?;
+    Some(match &explanation.recalibration {
+        Some(r) => super::recalibrate::apply(simulated.1, &r.ratios, r.mode),
+        None => simulated,
+    })
 }
 
 /// Recompute an explanation's stage marks (#9366) from the same fields
