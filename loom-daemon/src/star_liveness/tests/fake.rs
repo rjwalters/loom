@@ -215,6 +215,8 @@ pub fn repo_input(slug: &str) -> RepoInput {
         slug: slug.to_string(),
         tick_rows: Vec::new(),
         pool: None,
+        host_queue: std::sync::Arc::default(),
+        cap: None,
         web_base: crate::star_liveness::task::DEFAULT_WEB_BASE.to_string(),
     }
 }

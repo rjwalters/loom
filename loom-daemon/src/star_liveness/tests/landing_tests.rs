@@ -70,12 +70,18 @@ fn agent_stages_have_owners_and_no_ask() {
     merging.live_sweep = true;
     assert_eq!(classify(&merging).stage, LandingStage::Merging);
     let mut deferred = facts(&["loom:issue"]);
-    deferred.capacity = Capacity::Deferred {
-        reason: "waiting: concurrency cap full".into(),
-    };
+    deferred.capacity = Capacity::Deferred(crate::types::CapacityWait {
+        gate: "capacity".into(),
+        limiter: None,
+        position: None,
+        total: None,
+        cap: None,
+        configured_cap: None,
+    });
     let l = classify(&deferred);
     assert_eq!(l.stage, LandingStage::NoCapacity);
-    assert_eq!(l.no_capacity.as_deref(), Some("waiting: concurrency cap full"));
+    assert_eq!(l.no_capacity.as_deref(), Some("waiting (concurrency cap full)"));
+    assert!(l.capacity_wait.is_some());
 }
 
 #[test]

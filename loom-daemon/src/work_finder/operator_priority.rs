@@ -346,6 +346,19 @@ impl CapTerms {
         }
     }
 
+    /// [`Self::new`] for a production tick: also records the raw terms for
+    /// the published tick summary (Issue #10214), so the liveness pass and
+    /// the fleet alert can say which term holds the cap down.
+    #[must_use]
+    pub fn observed(configured: usize, disk_headroom: usize, ram_headroom: usize) -> Self {
+        super::tick_summary::record_cap(crate::types::CapView::from_terms(
+            configured,
+            disk_headroom,
+            ram_headroom,
+        ));
+        Self::new(configured, disk_headroom, ram_headroom)
+    }
+
     /// The effective cap every non-overflow admission is held to.
     #[must_use]
     pub fn effective(&self) -> usize {
