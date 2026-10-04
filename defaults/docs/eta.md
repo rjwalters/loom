@@ -233,9 +233,19 @@ level: `schema`, `estimate_id`, `heuristic`, `kind`, `loom` (provenance),
 `combination` (`draws`, `seed`, `rng`, `draw_order`), `path.dispatch` (a
 `ready_wait` start only: the plan inputs, `turnovers`,
 `admission_delay_sec`), `result` (`p25_sec`,
-`p50_sec`, `p75_sec`, `eta_p50_at`, `samples_min`, `stage_marks`),
+`p50_sec`, `p75_sec`, `p90_sec`, `eta_p50_at`, `samples_min`, `stage_marks`),
 `contributions`, `features`, `features_omitted`, `no_estimate_reason`,
 `truncated`.
+
+`result.p90_sec` (#10211) is the displayed upper bound that a late surprise
+is scored against. It is the nearest-rank 90th percentile of the same
+simulated path totals the quartiles come from, so it costs no new draws and
+leaves `p25_sec`, `p50_sec` and `p75_sec` unchanged; `run_explanation`
+recomputes all four. Every heuristic that simulates (`start-v1`, `finish-v1`,
+`land-v1`, `land-v2`, `land-v3`) records it. It is absent only on a refusal
+and on an explanation recorded before the field existed, which still parses:
+the field is additive, so the schema stays `eta-explanation/v1`. The stage
+marks stay at three percentiles.
 
 `result.stage_marks` (#9366) is the projected future, one mark per stage in
 stage order (`ready_wait` only when the path starts there): `p25_at` / `p50_at` / `p75_at` are `as_of` plus that percentile
@@ -374,6 +384,22 @@ Each outcome carries `error_sec` (`actual − p50`), `covered`
 predicted p50, and the per-stage actuals against each stage's predicted
 quartiles. `abandoned` outcomes and outcomes of refusals are counted but have
 no error fields: absent is never zero.
+
+An estimate that recorded a p90 is also scored on it (#10211):
+
+- `above_p90` is the **late surprise**, `actual > p90` (strict, like
+  `above_p75`). Its rate over scored outcomes should sit near 10%.
+- `pinball4_loss_sec` is the same pinball sum over q = .25, .5, .75, .9, that
+  is `pinball_loss_sec + ρ_.9(actual − p90)`.
+
+`pinball_loss_sec` keeps its three-quantile meaning: it is emitted, summed
+into the shadow ledger and pinned by the backtest golden, so redefining it
+would mix three- and four-quantile losses in one sum. Both p90 fields are
+absent on `abandoned` outcomes, on refusals, and on an estimate persisted
+before p90 existed. The outcome row also exports `loom.eta.p25_sec`,
+`loom.eta.p75_sec` and `loom.eta.p90_sec`, so an interval can be read without
+joining the estimate. The promotion gate does not read the p90 fields yet
+(#10233).
 
 **Nothing else is an outcome.** A PR closed unmerged and a sweep that ended
 before any PR are *not* abandonments — a replacement PR or a later sweep
