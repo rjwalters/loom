@@ -132,7 +132,7 @@ source "$SCRIPT_DIR/lib/push-lease-verify.sh"
 # (the live PR #9483 incident, #9487). Finding the binary is part of that
 # call-site; an unresolvable one leaves $DAEMON_BIN empty, and the per-child
 # call then fails closed (the child is SKIPPED, never pushed with a bare lease).
-# requires-daemon: push-lease >= 0.19.653   #9487 — the pinned-lease builder. Declared at this repo's VERSION because the subcommand lands WITH this marker; the first release actually carrying it is the post-merge bump. A binary predating it is refused here with the floor and the roll command rather than degraded to the bare lease
+# requires-daemon: push-lease >= 0.19.655   #9487 — the pinned-lease builder. Declared at this repo's VERSION because the subcommand lands WITH this marker; the first release actually carrying it is the post-merge bump. A binary predating it is refused here with the floor and the roll command rather than degraded to the bare lease
 # shellcheck source=lib/locate-daemon-bin.sh
 source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"
 DAEMON_BIN="$(loom_daemon_self_bin_override || loom_locate_daemon_bin "$SCRIPT_DIR/../.." || true)"
@@ -209,7 +209,7 @@ _process_one_stacked_child() {
     local child_lease_arg="" pin_rc=0
     child_lease_arg="$("$DAEMON_BIN" push-lease pin-flag --remote origin --branch "$child_branch" --local-ref "refs/heads/$child_branch")" || pin_rc=$?
     if [[ $pin_rc -ne 0 || -z "$child_lease_arg" ]]; then
-        warn "No pinned force-with-lease value for '$child_branch' (loom-daemon push-lease pin-flag exit $pin_rc — see above, #9487) — skipping child PR #$child_pr rather than pushing with the bare lease."
+        warn "No pinned force-with-lease value for '$child_branch' (loom-daemon push-lease pin-flag exit $pin_rc — see above, #9487; 'unrecognized subcommand' = this loom-daemon predates #9487: roll it) — skipping child PR #$child_pr rather than pushing with the bare lease."
         RSC_FAILURE=2; return 0
     fi
 

@@ -186,12 +186,12 @@ fi
 # `loom-daemon push-lease pin-flag` (cli/push_lease.rs) per the shell language
 # policy: exit 3 = origin could not be queried, 4 = origin holds commits this
 # clone never incorporated. There is deliberately no bare-flag fallback.
-# requires-daemon: push-lease >= 0.19.653   #9487 — the pinned-lease builder. Declared at this repo's VERSION because the subcommand lands WITH this marker; the first release actually carrying it is the post-merge bump. A binary predating it is refused here with the floor rather than degraded to the bare lease
+# requires-daemon: push-lease >= 0.19.655   #9487 — the pinned-lease builder. Declared at this repo's VERSION because the subcommand lands WITH this marker; the first release actually carrying it is the post-merge bump. A binary predating it is refused here with the floor rather than degraded to the bare lease
 loom_daemon_version_preflight push-lease "$DAEMON_BIN"
 PIN_RC=0
 PUSH_LEASE_ARG="$("$DAEMON_BIN" push-lease pin-flag --remote origin --branch "$CHILD_BRANCH" --local-ref "refs/heads/$CHILD_BRANCH")" || PIN_RC=$?
 if [[ $PIN_RC -ne 0 ]]; then
-    err "No pinned force-with-lease value for '$CHILD_BRANCH' (loom-daemon push-lease pin-flag exit $PIN_RC — the bracketed prerequisite token naming which half refused is above, #9487). Refusing to rebase+push: the only fallback is the bare lease this exists to replace. Nothing was mutated."
+    err "No pinned force-with-lease value for '$CHILD_BRANCH' (loom-daemon push-lease pin-flag exit $PIN_RC — the bracketed prerequisite token naming which half refused is above, #9487; 'unrecognized subcommand' = this loom-daemon predates #9487: roll it). Refusing to rebase+push: the only fallback is the bare lease this exists to replace. Nothing was mutated."
     exit 1
 fi
 info "Pinned force-with-lease argument for '$CHILD_BRANCH': $PUSH_LEASE_ARG"

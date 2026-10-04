@@ -729,8 +729,8 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
    - Do NOT push until all local checks pass
    - This prevents multiple fix-push-fail cycles
 9. **Commit and push**: Push your fixes to the PR branch
-   - **Pre-open rebase onto `origin/main` (MANDATORY, #7668)**: immediately before this push — whatever your dispatch reason — run `git fetch origin main && git rebase origin/main`, as in `builder-pr.md` § "Pre-Push Rebase". If it conflicts, resolve it now using the "PR Has Merge Conflicts" recipe below (including its version-bearing-file sync gate) rather than re-requesting review on a PR that lands `DIRTY` on the next pass (the reactive round-trip of Priority 1 above). A no-op when `main` hasn't moved.
-   - **Pre-push head-SHA recheck (MANDATORY)**: before the push, re-compare the PR's `headRefOid` against the `CLAIM_HEAD_SHA` you captured in step 2 — see "Pre-Push Head-SHA Recheck" below. If the head moved, another agent pushed while you were working; re-verify the blocker is still unaddressed and stand down rather than duplicating (or clobbering) their fix. Then push with the lease **pinned** to it, never bare (#9487, "Pin the lease").
+   - **Pre-push head-SHA recheck (MANDATORY)**: before the push, re-compare the PR's `headRefOid` against the `CLAIM_HEAD_SHA` you captured in step 2 — see "Pre-Push Head-SHA Recheck" below. If the head moved, another agent pushed while you were working; re-verify the blocker is still unaddressed and stand down rather than duplicating (or clobbering) their fix.
+   - **Then run "Pin the lease" below, top to bottom**: it is the pre-open rebase onto `origin/main` (MANDATORY, #7668, as `builder-pr.md` § "Pre-Push Rebase") and the pinned push (#9487). Never rebase onto `main` before it: its ancestry check needs the pre-rebase `HEAD` (a moved `main` drops the pin, so it STOPs your own push). On a conflict resolve in place (`git add`, `git rebase --continue`), resume at its version gate, not "PR Has Merge Conflicts". Any dispatch reason; no-op if `main` hasn't moved.
    - **DCO / sign-off**: if `commit.signoff` is `true` in `.loom/config.json` (read it the same way as `buildGate.command`), or the repo has a DCO / required `sign-off` check, add `--signoff` to **every** commit you author — including `git commit --amend --signoff` when re-authoring during a rebase — so each carries a `Signed-off-by:` trailer. Harmless when not required; git will not add a duplicate trailer. Reference: `defaults/docs/commit-signoff.md`.
    - **9a. Rebase any stacked children** (best-effort): if the just-pushed branch matches `feature/issue-<N>` (i.e. you amended a stacked *parent*), run:
      ```bash
@@ -971,7 +971,7 @@ PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-$CLAIM_HEAD_SHA}"
 [ -n "$PUSH_LEASE_SHA" ] || { echo "No pin: STOP. Do not push or re-read the head." >&2; exit 1; }
 # BEFORE any rebase/amend: git accepts ANY full-SHA pin, even unfetched, and overwrites it.
 git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD || { echo "Pin not in HEAD: STOP." >&2; exit 1; }
-git fetch origin main && git rebase origin/main || exit 1  # step 9; on conflict resolve, continue, resume
+git fetch origin main && git rebase origin/main || exit 1  # conflict: resolve, add, --continue, resume here
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Aborting: version-bearing files out of sync after rebase (see BLOCKER:/Fix:)." >&2
   exit 1
@@ -1390,6 +1390,7 @@ This is a critical issue that blocks merging. Fix it immediately:
 
 ```bash
 # Pin = the claim-time head, never re-read now; check it BEFORE the rebase ("Pin the lease").
+# Mid-rebase, check passed pre-rebase (step 9)? Skip to `git rebase --continue`.
 PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-${CLAIM_HEAD_SHA:?}}"
 BRANCH=$(git branch --show-current)
 git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD || { echo "Pin not in HEAD: STOP." >&2; exit 1; }
