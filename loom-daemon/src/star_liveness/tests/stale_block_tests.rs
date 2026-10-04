@@ -59,7 +59,7 @@ fn all_cited_blockers_closed_is_a_stale_block_with_no_ask() {
     assert_eq!(l.stage, LandingStage::StaleBlock);
     assert_eq!(l.next_actor, "curator");
     assert!(l.ask.is_none(), "no operator ask for a stale block");
-    assert_eq!(l.inherits, None);
+    assert!(l.inherits.is_empty());
     assert_eq!(
         l.stale,
         Some(StaleAction::Unblock {
@@ -74,7 +74,7 @@ fn all_cited_blockers_closed_is_a_stale_block_with_no_ask() {
 fn a_mixed_set_stays_blocked_by_the_open_one_and_unreadable_counts_as_open() {
     let f = facts(&[STAR, BLOCKED], vec![same(5, Some(false)), same(6, Some(true))]);
     let l = classify(&f);
-    assert_eq!((l.stage, l.inherits), (LandingStage::BlockedBy, Some(6)));
+    assert_eq!((l.stage, l.inherits), (LandingStage::BlockedBy, vec![6]));
     assert!(l.stale.is_none());
 
     let f = facts(&[STAR, BLOCKED], vec![same(5, Some(false)), same(7, None)]);
