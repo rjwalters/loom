@@ -210,15 +210,15 @@ fn uname_or_question(flag: &str) -> String {
 }
 
 fn gh_release_view(slug: &str, fields: &str, jq: &str) -> Option<String> {
-    let out = Command::new(crate::gh_invocation::gh_bin())
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    // #10089: through the facade, so the read is counted and bounded.
+    let op = Operation::new("release.view");
+    let timeout = std::time::Duration::from_secs(60);
+    let outcome = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, timeout)
         .args(["release", "view", "--json", fields, "-R", slug, "--jq", jq])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+        .run();
+    let ran = outcome.ok_output()?;
+    Some(String::from_utf8_lossy(&ran.stdout).trim_end().to_string())
 }
 
 /// Why `fetch_and_verify_artifact` did not produce a binary.

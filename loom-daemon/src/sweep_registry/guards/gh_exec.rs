@@ -26,9 +26,13 @@ impl SweepRegistry {
         intent: AccessIntent,
         gh: &Path,
     ) -> GhInvocation {
-        GhInvocation::new(Operation::new(op), intent, GhTarget::None, reap_gh_timeout())
+        let inv = GhInvocation::new(Operation::new(op), intent, GhTarget::None, reap_gh_timeout())
             .program(gh)
-            .current_dir(&self.config.workspace_root)
+            .current_dir(&self.config.workspace_root);
+        match crate::claim_reconciliation::gh_call::forge_op_for(op) {
+            Some(fop) => inv.forge_op(fop),
+            None => inv,
+        }
     }
 
     /// Run `inv`, shaped like

@@ -164,18 +164,16 @@ impl Drop for ScratchDir {
 }
 
 fn download(repo_root: &Path, repo_slug: &str, tag: &str, patterns: &[&str], dest: &Path) -> bool {
-    let mut cmd = Command::new(crate::gh_invocation::gh_bin());
-    cmd.arg("release")
-        .arg("download")
-        .arg(tag)
-        .arg("-R")
-        .arg(repo_slug);
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    // #10089: through the facade, so the download is counted.
+    let op = Operation::new("release.download");
+    let mut inv = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, DOWNLOAD_TIMEOUT)
+        .current_dir(repo_root)
+        .args(["release", "download", tag, "-R", repo_slug]);
     for p in patterns {
-        cmd.arg("-p").arg(p);
+        inv = inv.args(["-p", p]);
     }
-    cmd.arg("-D").arg(dest).arg("--clobber");
-    cmd.current_dir(repo_root).stdin(Stdio::null());
-    cmd_out::run_command(cmd, DOWNLOAD_TIMEOUT).succeeded()
+    inv.arg("-D").arg(dest).arg("--clobber").run().succeeded()
 }
 
 /// One download attempt for an optional asset (a `.sig` or `.pem`): `None`

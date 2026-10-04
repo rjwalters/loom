@@ -77,6 +77,18 @@ pub const GIT_WRITE_REFS_AND_CONTENTS: ForgeOp =
 pub const TIMELINE_READ: ForgeOp = ForgeOp::inventoried("timeline.read");
 /// `GET rate_limit` — the free budget probe.
 pub const QUOTA_RATE_LIMIT_READING: ForgeOp = ForgeOp::inventoried("quota.rate-limit-reading");
+/// `GET repos/{o}/{r}/issues/{n}/timeline` — label age / claim evidence.
+pub const TIMELINE_READ: ForgeOp = ForgeOp::inventoried("timeline.read");
+/// The open PR whose head is a given branch.
+pub const PR_LIST_BY_HEAD: ForgeOp = ForgeOp::inventoried("pr.list-by-head");
+/// Add / remove labels on one issue or PR (a PR's labels are issue labels).
+pub const ISSUE_EDIT_LABELS: ForgeOp = ForgeOp::inventoried("issue.edit-labels");
+/// Post a comment on an issue or PR.
+pub const COMMENT_CREATE: ForgeOp = ForgeOp::inventoried("comment.create");
+/// Edit or delete an existing comment by id.
+pub const COMMENT_EDIT_DELETE: ForgeOp = ForgeOp::inventoried("comment.edit-delete");
+/// A PR's changed-file list.
+pub const PR_DIFF_AND_FILES: ForgeOp = ForgeOp::inventoried("pr.diff-and-files");
 
 /// Every inventoried constant above — the set the inventory test checks.
 pub const ALL_INVENTORIED: &[ForgeOp] = &[
@@ -94,4 +106,10 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     GIT_WRITE_REFS_AND_CONTENTS,
     TIMELINE_READ,
     QUOTA_RATE_LIMIT_READING,
+    TIMELINE_READ,
+    PR_LIST_BY_HEAD,
+    ISSUE_EDIT_LABELS,
+    COMMENT_CREATE,
+    COMMENT_EDIT_DELETE,
+    PR_DIFF_AND_FILES,
 ];

@@ -884,14 +884,29 @@ fn fetch_changed_files(gh_bin: &Path, root: &Path, number: u32) -> Option<BTreeS
 }
 
 /// The newest trusted marker per PR, for PRs carrying the hold label.
-fn fetch_markers(gh_bin: &Path, root: &Path, prs: &[&SequencePr]) -> BTreeMap<u32, SequenceMarker> {
+///
+/// `known` holds this tick's already-completed reads (#10089): Phase 1 walks
+/// every holder's comments, and the hold label is the filter here too, so
+/// re-walking them doubled the pass's largest per-PR read. Reuse is exact,
+/// not a cache: Phase 1's own writes (release / replan notes) carry no
+/// parseable marker, so a fresh read would yield the same newest marker. A
+/// holder whose Phase 1 read failed is absent from `known` and is re-read.
+fn fetch_markers(
+    gh_bin: &Path,
+    root: &Path,
+    prs: &[&SequencePr],
+    known: &BTreeMap<u32, Option<SequenceMarker>>,
+) -> BTreeMap<u32, SequenceMarker> {
     let bin = gh_bin.to_string_lossy().to_string();
     let mut out = BTreeMap::new();
     for pr in prs.iter().filter(|p| p.has(SEQUENCE_LABEL)) {
-        if let Some(bodies) = fetch_trusted_bodies(&bin, root, "{owner}/{repo}", pr.number) {
-            if let Some(m) = parse(&bodies) {
-                out.insert(pr.number, m);
-            }
+        let marker = match known.get(&pr.number) {
+            Some(m) => m.clone(),
+            None => fetch_trusted_bodies(&bin, root, "{owner}/{repo}", pr.number)
+                .and_then(|b| parse(&b)),
+        };
+        if let Some(m) = marker {
+            out.insert(pr.number, m);
         }
     }
     out
@@ -946,7 +961,7 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
         cache.get_or_fetch(pr, |p| changed_files(gh_bin, root, p));
     }
     let files = cache.known(eligible.iter().map(|p| p.number));
-    let markers = fetch_markers(gh_bin, root, &eligible);
+    let markers = fetch_markers(gh_bin, root, &eligible, &BTreeMap::new());
     report.groups = plan_repo(&open, &files, &markers);
     for g in &mut report.groups {
         g.edges.retain(|e| {
@@ -1107,6 +1122,8 @@ pub(super) fn reconcile_merge_sequences_with(
         .cloned()
         .collect();
     let bin = gh_bin.to_string_lossy().to_string();
+    // Each holder's completed marker read, reused by Phase 2 (#10089).
+    let mut read_markers: BTreeMap<u32, Option<SequenceMarker>> = BTreeMap::new();
     for pr in &holders {
         let bodies = match fetch_trusted_bodies(&bin, root, "{owner}/{repo}", pr.number) {
             Some(b) => b,
@@ -1123,7 +1140,9 @@ pub(super) fn reconcile_merge_sequences_with(
                 continue;
             }
         };
-        let Some(marker) = parse(&bodies) else {
+        let parsed = parse(&bodies);
+        read_markers.insert(pr.number, parsed.clone());
+        let Some(marker) = parsed else {
             // A label with no trusted marker is an operator-held PR (the
             // manual shape #9378 documented): nothing here owns releasing it.
             log::info!(
@@ -1227,7 +1246,7 @@ pub(super) fn reconcile_merge_sequences_with(
         files.get_or_fetch(pr, |p| changed_files(gh_bin, root, p));
     }
     let files = files.known(eligible.iter().map(|p| p.number));
-    let markers = fetch_markers(gh_bin, root, &eligible);
+    let markers = fetch_markers(gh_bin, root, &eligible, &read_markers);
     for group in plan_repo(&open, &files, &markers) {
         stats.groups += 1;
         for edge in group.edges {

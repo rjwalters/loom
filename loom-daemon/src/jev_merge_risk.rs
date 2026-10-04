@@ -48,8 +48,8 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::cmd_out::{self, gh_json, CmdOutcome, Query, DEFAULT_TIMEOUT};
-use crate::gh_invocation::gh_bin;
+use crate::cmd_out::{gh_json, CmdOutcome, Query, DEFAULT_TIMEOUT};
+use crate::gh_invocation::{gh_bin, AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::repo_root::{find_repo_root_from_cwd, find_worktree_root_from_cwd};
 
 /// Upper bound on the `state` string handed to Jev — head+tail diff
@@ -295,6 +295,7 @@ fn gather_pr_context(pr: u64) -> Result<PrContext> {
     let pr_arg = pr.to_string();
 
     let view_query = gh_json::<GhPrView, _>(
+        "jev.merge_risk_pr_view",
         Path::new(&gh),
         &[
             "pr",
@@ -322,7 +323,16 @@ fn gather_pr_context(pr: u64) -> Result<PrContext> {
 
     let changed_files: Vec<String> = view.files.into_iter().map(|f| f.path).collect();
 
-    let diff = match cmd_out::run(&gh, &["pr", "diff", &pr_arg], &dir, DEFAULT_TIMEOUT) {
+    let diff_inv = GhInvocation::new(
+        Operation::new("jev.merge_risk_pr_diff"),
+        AccessIntent::Read,
+        GhTarget::None,
+        DEFAULT_TIMEOUT,
+    )
+    .program(&gh)
+    .current_dir(&dir)
+    .args(["pr", "diff", &pr_arg]);
+    let diff = match diff_inv.run() {
         CmdOutcome::Ran(out) if out.status.success() => {
             String::from_utf8_lossy(&out.stdout).into_owned()
         }

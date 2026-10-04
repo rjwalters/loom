@@ -29,6 +29,18 @@ impl GhInvocation {
         };
         classify(self.execute(), timeout)
     }
+
+    /// [`GhInvocation::run`] for an async caller (#10089): the bounded,
+    /// blocking execution moves to tokio's blocking pool so it never stalls
+    /// a runtime worker. A join failure (the blocking task panicked) is
+    /// [`Unavailable::Collect`] — no answer, never an invented one.
+    pub async fn run_async(self) -> CmdOutcome {
+        tokio::task::spawn_blocking(move || self.run())
+            .await
+            .unwrap_or_else(|e| {
+                CmdOutcome::Unavailable(Unavailable::Collect(format!("gh task failed: {e}")))
+            })
+    }
 }
 
 /// `cmd_out::run_command`'s mapping, over the facade's result.
@@ -122,6 +134,26 @@ mod tests {
         assert!(matches!(
             run_with(inv(slow), &stub(tmp.path(), "sleep 5")),
             CmdOutcome::Unavailable(Unavailable::TimedOut { after, .. }) if after == slow
+        ));
+    }
+
+    #[test]
+    fn run_async_classifies_exactly_like_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = stub(tmp.path(), "printf ok; exit 3");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt.block_on(inv(TIMEOUT).program(&gh).run_async());
+        let CmdOutcome::Ran(o) = out else {
+            panic!("expected Ran, got {out:?}");
+        };
+        assert_eq!((o.status.code(), &o.stdout[..]), (Some(3), &b"ok"[..]));
+        let missing = tmp.path().join("no-such-gh");
+        assert!(matches!(
+            rt.block_on(inv(TIMEOUT).program(&missing).run_async()),
+            CmdOutcome::Unavailable(Unavailable::Spawn(_))
         ));
     }
 
