@@ -72,7 +72,8 @@ const SETTLED_TTL_PASSES: u64 = 20;
 /// Also the inheritance walk's memory across passes, so a capped walk makes
 /// progress instead of restarting the same traversal: children it found
 /// closed (or PRs), which cost no read for [`SETTLED_TTL_PASSES`] passes,
-/// and children the cap deferred, which are walked first next pass.
+/// and children the cap deferred, which are resumed first next pass, from
+/// the path that reached them, whatever their depth or root.
 #[derive(Debug, Default)]
 pub struct RefusalCache {
     entries: HashMap<(String, u32), (Option<String>, Option<Detected>)>,
@@ -81,8 +82,9 @@ pub struct RefusalCache {
     walk_pass: u64,
     /// Children that inherit nothing, with the pass that found them so.
     settled: HashMap<(String, u32), u64>,
-    /// Children the read cap deferred, not yet evaluated.
-    deferred: BTreeSet<(String, u32)>,
+    /// Children the read cap deferred, not yet evaluated, each with the edges
+    /// from its starred root down to it.
+    deferred: BTreeMap<(String, u32), Vec<Edge>>,
 }
 
 /// Everything about the repo that is not a forge read.
@@ -142,6 +144,19 @@ fn linked_issues(pr: &RestIssue) -> Vec<u32> {
         .filter_map(|n| u32::try_from(n).ok())
         .collect()
 }
+
+/// What [`Evaluator::visit`] found at a child.
+enum Visit {
+    /// Closed, a PR, or recently found so: it inherits nothing.
+    Settled,
+    /// The read cap did not leave room for it.
+    Deferred,
+    Open(Box<Evaluated>),
+}
+
+/// A node the walk will expand: its number, what its landing says inherits,
+/// and the edges from its starred root down to it (its depth is their count).
+type Pending = (u32, Vec<u32>, Vec<Edge>);
 
 /// The per-pass evaluator for one repo.
 pub struct Evaluator<'a> {
@@ -424,6 +439,33 @@ impl<'a> Evaluator<'a> {
             .min()
     }
 
+    /// One step of the walk onto `child`: skip it when it is known to
+    /// inherit nothing, defer it when the cap is reached, else evaluate it.
+    fn visit(&mut self, child: u32, cap: usize, now: u64) -> Visit {
+        let key = (self.ctx.slug.to_string(), child);
+        if self.refusals.settled.contains_key(&key) {
+            return Visit::Settled;
+        }
+        let Some(issue) = self.issue(child) else {
+            return Visit::Deferred;
+        };
+        if issue.is_pull_request || !issue.state.eq_ignore_ascii_case("open") {
+            self.refusals.deferred.remove(&key);
+            self.refusals.settled.insert(key, now);
+            return Visit::Settled;
+        }
+        if self.reads + self.pending_blocker_reads(&issue) > cap {
+            log::debug!(
+                "star_liveness: {} reached {MAX_WALK_READS_PER_PASS} walk reads \
+                 this pass; #{child} waits for a later one",
+                self.ctx.slug
+            );
+            return Visit::Deferred;
+        }
+        self.refusals.deferred.remove(&key);
+        Visit::Open(Box::new(self.evaluate_one(&issue, None, None)))
+    }
+
     fn evaluate_one(
         &mut self,
         issue: &RestIssue,
@@ -552,9 +594,12 @@ impl<'a> Evaluator<'a> {
         let mut seen: BTreeSet<u32> = issues.iter().map(|i| i.number).collect();
         let mut found: Vec<Evaluated> = Vec::new();
         let mut graph: Vec<Edge> = Vec::new();
-        let mut frontier: Vec<(u32, Vec<u32>)> = out
+        // Nodes to expand, by depth: a deferred child resumed below joins its
+        // own depth's list, so it is not starved by shallower siblings.
+        let mut levels: Vec<Vec<Pending>> = vec![Vec::new(); MAX_INHERIT_DEPTH + 1];
+        levels[0] = out
             .iter()
-            .map(|e| (e.facts.issue.number, e.landing.inherits.clone()))
+            .map(|e| (e.facts.issue.number, e.landing.inherits.clone(), Vec::new()))
             .collect();
         // Count the walk's forge reads, not the open children it finds: a
         // closed child or a PR costs a read too (#10073 review).
@@ -567,51 +612,89 @@ impl<'a> Evaluator<'a> {
         self.refusals
             .settled
             .retain(|_, at| now.saturating_sub(*at) < SETTLED_TTL_PASSES);
-        for _ in 0..MAX_INHERIT_DEPTH {
-            let mut next = Vec::new();
-            for (parent, inherits) in frontier {
-                let mut children = self.children(parent, &inherits);
-                // Children the last pass deferred go first (stable sort).
-                children
-                    .sort_by_key(|e| !self.refusals.deferred.contains(&(slug.clone(), e.child)));
-                for edge in children {
+
+        // Resume what the cap deferred last pass before anything else, down
+        // its recorded path (an ancestor not evaluated yet is evaluated
+        // first), so a deep child is not starved by a full shallow frontier
+        // or by an earlier root. A path the forge text no longer supports is
+        // dropped.
+        let mut inherits_of: HashMap<u32, Vec<u32>> = levels[0]
+            .iter()
+            .map(|(n, inh, _)| (*n, inh.clone()))
+            .collect();
+        let resumable: Vec<(u32, Vec<Edge>)> = self
+            .refusals
+            .deferred
+            .iter()
+            .filter(|((s, _), _)| *s == slug)
+            .map(|((_, child), path)| (*child, path.clone()))
+            .collect();
+        for (target, path) in resumable {
+            let key = (slug.clone(), target);
+            for (i, recorded) in path.iter().enumerate() {
+                let still_linked = inherits_of.get(&recorded.parent).is_some_and(|inh| {
+                    self.children(recorded.parent, inh)
+                        .iter()
+                        .any(|e| e.child == recorded.child)
+                });
+                if !still_linked {
+                    self.refusals.deferred.remove(&key);
+                    break;
+                }
+                let child = recorded.child;
+                if seen.contains(&child) {
+                    continue;
+                }
+                match self.visit(child, cap, now) {
+                    Visit::Settled => {
+                        self.refusals.deferred.remove(&key);
+                        break;
+                    }
+                    Visit::Deferred => break,
+                    Visit::Open(e) => {
+                        seen.insert(child);
+                        inherits_of.insert(child, e.landing.inherits.clone());
+                        levels[i + 1].push((
+                            child,
+                            e.landing.inherits.clone(),
+                            path[..=i].to_vec(),
+                        ));
+                        found.push(*e);
+                    }
+                }
+            }
+        }
+
+        // Explore breadth-first from every root at once, so each issue is
+        // expanded at its shallowest depth; then [`edges::descendants`]
+        // decides, per child, which starred ancestor it inherits from
+        // (earliest starred-at). Every open child inherits, not only the
+        // first one named (#10012).
+        for depth in 0..MAX_INHERIT_DEPTH {
+            let frontier = std::mem::take(&mut levels[depth]);
+            for (parent, inherits, path) in frontier {
+                for edge in self.children(parent, &inherits) {
                     let child = edge.child;
-                    let key = (slug.clone(), child);
                     graph.push(edge);
                     if !seen.insert(child) {
                         continue;
                     }
-                    if self.refusals.settled.contains_key(&key) {
-                        continue;
+                    let mut child_path = path.clone();
+                    child_path.push(edge);
+                    match self.visit(child, cap, now) {
+                        Visit::Settled => {}
+                        Visit::Deferred => {
+                            self.refusals
+                                .deferred
+                                .insert((slug.clone(), child), child_path);
+                        }
+                        Visit::Open(e) => {
+                            levels[depth + 1].push((child, e.landing.inherits.clone(), child_path));
+                            found.push(*e);
+                        }
                     }
-                    let Some(issue) = self.issue(child) else {
-                        self.refusals.deferred.insert(key);
-                        continue;
-                    };
-                    if issue.is_pull_request || !issue.state.eq_ignore_ascii_case("open") {
-                        self.refusals.deferred.remove(&key);
-                        self.refusals.settled.insert(key, now);
-                        continue;
-                    }
-                    if self.reads + self.pending_blocker_reads(&issue) > cap {
-                        log::debug!(
-                            "star_liveness: {} reached {MAX_WALK_READS_PER_PASS} walk reads \
-                             this pass; #{child} waits for a later one",
-                            self.ctx.slug
-                        );
-                        self.refusals.deferred.insert(key);
-                        continue;
-                    }
-                    self.refusals.deferred.remove(&key);
-                    let e = self.evaluate_one(&issue, None, None);
-                    next.push((child, e.landing.inherits.clone()));
-                    found.push(e);
                 }
             }
-            if next.is_empty() {
-                break;
-            }
-            frontier = next;
         }
         self.read_cap = None;
         let open: BTreeSet<u32> = found.iter().map(|e| e.facts.issue.number).collect();

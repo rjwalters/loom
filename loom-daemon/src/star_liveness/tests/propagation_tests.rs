@@ -254,3 +254,72 @@ fn repeated_passes_reach_a_child_whose_blocker_reads_did_not_fit() {
         "#200 inherits once the settled children are free, and so do its open blockers"
     );
 }
+
+/// Runs `passes` passes over unchanged forge data, asserting each stays
+/// within the walk's read cap, and returns the first pass at which every
+/// issue in `want` has inherited (#10073 review).
+fn first_pass_reaching(
+    world: &World,
+    slug: &str,
+    input: &crate::star_liveness::task::RepoInput,
+    want: &[u32],
+    passes: u32,
+) -> Option<u32> {
+    use crate::star_liveness::collect::MAX_WALK_READS_PER_PASS;
+    let mut host = Host::new("host-a");
+    let mut before = world.repo(slug).issue_reads;
+    for pass in 0..passes {
+        let r = host.pass(world, std::slice::from_ref(input), Vec::new(), t(10, pass));
+        let after = world.repo(slug).issue_reads;
+        assert!(after - before <= MAX_WALK_READS_PER_PASS, "pass {pass} stays within the cap");
+        before = after;
+        let got: Vec<u32> = inherited(&r).into_iter().map(|(n, _, _)| n).collect();
+        if want.iter().all(|n| got.contains(n)) {
+            return Some(pass);
+        }
+    }
+    None
+}
+
+/// An open frontier that costs the whole budget every pass must not starve a
+/// deeper child: 50 open direct children, the first linking an open
+/// grandchild. The grandchild is deferred on pass one and resumed first on
+/// pass two, ahead of its shallower cousins.
+#[test]
+fn a_full_open_frontier_does_not_starve_a_deeper_child() {
+    let world = World::default();
+    let slug = "i/cap5";
+    let mut list = String::new();
+    for n in 10..60 {
+        list.push_str(&format!("- [ ] #{n}\n"));
+        let body = if n == 10 { "- [ ] #200\n" } else { "" };
+        world.add(slug, issue_with_body(n, &["loom:issue"], body));
+    }
+    world.add(slug, issue(200, &["loom:issue"]));
+    world.add(slug, issue_with_body(1, &[STAR, "loom:issue"], &list));
+    let mut input = repo_input(slug);
+    starred(&mut input, 1, AT);
+    assert_eq!(first_pass_reaching(&world, slug, &input, &[200], 4), Some(1));
+}
+
+/// Two roots compete for one budget: the first root's 50 open children use it
+/// up every pass, yet the second root's child and its own child inherit.
+#[test]
+fn an_earlier_root_does_not_starve_a_later_roots_deferred_children() {
+    let world = World::default();
+    let slug = "i/cap6";
+    let mut list = String::new();
+    for n in 10..60 {
+        list.push_str(&format!("- [ ] #{n}\n"));
+        world.add(slug, issue(n, &["loom:issue"]));
+    }
+    world.add(slug, issue_with_body(1, &[STAR, "loom:issue"], &list));
+    world.add(slug, issue_with_body(2, &[STAR, "loom:issue"], "- [ ] #300\n"));
+    world.add(slug, issue_with_body(300, &["loom:issue"], "- [ ] #301\n"));
+    world.add(slug, issue(301, &["loom:issue"]));
+    let mut input = repo_input(slug);
+    starred(&mut input, 1, "2026-09-28T08:00:00Z");
+    starred(&mut input, 2, "2026-09-28T09:00:00Z");
+    let reached = first_pass_reaching(&world, slug, &input, &[300, 301], 6);
+    assert!(reached.is_some_and(|p| p <= 3), "both inherit within a few passes: {reached:?}");
+}
