@@ -428,6 +428,59 @@ fn a_second_hold_or_verdict_beside_an_operator_hold_is_blocked() {
     }
 }
 
+/// An issue is `Blocked` exactly when serving refuses it as blocked (#10278).
+#[test]
+fn issue_blocked_matches_unstarted_issue_reason_on_every_label_set() {
+    use crate::eta::labels::unstarted_issue_reason;
+    use crate::eta::NoEstimateReason;
+    const UNIVERSE: [&str; 15] = [
+        "loom:issue",
+        "loom:building",
+        "loom:curated",
+        "loom:curating",
+        "loom:triage",
+        "loom:operator",
+        "loom:operator-only",
+        "loom:operator-decision",
+        "loom:operator-mechanical",
+        "loom:operator-blocked",
+        "loom:operator-objective",
+        "loom:blocked",
+        "loom:needs-capability",
+        "loom:sequenced",
+        "loom:operator-priority",
+    ];
+    for mask in 0u32..(1 << UNIVERSE.len()) {
+        let set: BTreeSet<String> = UNIVERSE
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mask & (1 << i) != 0)
+            .map(|(_, l)| (*l).to_string())
+            .collect();
+        let list: Vec<String> = set.iter().cloned().collect();
+        assert_eq!(
+            item_stage(ItemKind::Issue, &set) == ItemStage::Blocked,
+            unstarted_issue_reason(&list, None) == Some(NoEstimateReason::Blocked),
+            "{set:?}"
+        );
+    }
+}
+
+/// An operator sub-kind without its `loom:operator-only` base no longer
+/// blocks an issue; with the base it still does (#10278).
+#[test]
+fn an_issue_sub_kind_blocks_only_beside_its_operator_only_base() {
+    for (labels, stage) in [
+        (&["loom:issue", "loom:operator-blocked"][..], ItemStage::ReadyWait),
+        (
+            &["loom:issue", "loom:operator-only", "loom:operator-blocked"][..],
+            ItemStage::Blocked,
+        ),
+    ] {
+        assert_eq!(item_stage(ItemKind::Issue, &label_set(labels)), stage, "{labels:?}");
+    }
+}
+
 #[test]
 fn lifting_the_operator_hold_returns_an_approved_pr_to_merge_wait() {
     use ItemKind::Pr;
