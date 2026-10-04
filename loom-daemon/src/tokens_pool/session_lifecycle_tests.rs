@@ -3,6 +3,8 @@ use serial_test::serial;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use super::super::profile_root_env::ProfileRootEnv;
+
 #[derive(Default)]
 struct FakeRunner {
     containers: Mutex<HashMap<String, ContainerState>>,
@@ -185,8 +187,15 @@ impl ContainerRunner for FakeRunner {
     }
 }
 
-fn setup() -> (tempfile::TempDir, tempfile::TempDir) {
-    (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
+/// Fresh workspace + profile-root tempdirs, with `LOOM_CODEX_PROFILE_ROOT`
+/// redirected at the root for as long as the returned guard lives. The guard
+/// holds the crate-wide profile-root lock and restores the prior value on drop,
+/// including on panic (issue #9964) — never a bare `set_var`/`remove_var`.
+fn setup() -> (tempfile::TempDir, tempfile::TempDir, ProfileRootEnv) {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let env = ProfileRootEnv::set(root.path());
+    (workspace, root, env)
 }
 
 fn import_account(workspace: &Path, root: &Path, name: &str) {
@@ -194,7 +203,12 @@ fn import_account(workspace: &Path, root: &Path, name: &str) {
 }
 
 fn import_account_with_email(workspace: &Path, root: &Path, name: &str, email: Option<&str>) {
-    std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root);
+    // `setup()`'s guard owns the redirect; importing must land under `root`.
+    assert_eq!(
+        std::env::var_os("LOOM_CODEX_PROFILE_ROOT").as_deref(),
+        Some(root.as_os_str()),
+        "import_account needs setup()'s ProfileRootEnv guard alive"
+    );
     let source_dir = tempfile::tempdir().unwrap();
     let source = source_dir.path().join("auth.json");
     std::fs::write(&source, "recognizable-fake-secret").unwrap();
@@ -209,7 +223,7 @@ fn import_account_with_email(workspace: &Path, root: &Path, name: &str, email: O
 #[test]
 #[serial]
 fn start_creates_a_fresh_container_and_adopts_the_profile() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     let status = lifecycle.start("alice").unwrap();
@@ -222,25 +236,23 @@ fn start_creates_a_fresh_container_and_adopts_the_profile() {
     assert_eq!(creates[0].0, container_name("alice"));
     assert_eq!(creates[0].1, DEFAULT_SESSION_IMAGE);
     assert!(is_session_managed(&root.path().join("alice")));
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn start_is_idempotent_when_already_running() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     lifecycle.start("alice").unwrap();
     lifecycle.start("alice").unwrap();
     assert_eq!(lifecycle.runner.creates.lock().unwrap().len(), 1);
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn start_resumes_a_stopped_but_present_container() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     lifecycle.start("alice").unwrap();
@@ -251,13 +263,12 @@ fn start_resumes_a_stopped_but_present_container() {
     // same observable "running" outcome either way.
     let status = lifecycle.start("alice").unwrap();
     assert!(status.running);
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn stop_refuses_when_an_exec_is_in_flight_unless_forced() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     lifecycle.start("alice").unwrap();
@@ -272,25 +283,23 @@ fn stop_refuses_when_an_exec_is_in_flight_unless_forced() {
     let status = lifecycle.stop("alice", true).unwrap();
     assert!(!status.running);
     assert_eq!(lifecycle.runner.stops.lock().unwrap().len(), 1);
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn stop_is_idempotent_when_already_stopped() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     let status = lifecycle.stop("alice", false).unwrap();
     assert!(!status.running);
     assert!(lifecycle.runner.stops.lock().unwrap().is_empty());
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn status_reports_not_running_for_an_account_never_started() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     let status = lifecycle.status("alice").unwrap();
@@ -298,7 +307,6 @@ fn status_reports_not_running_for_an_account_never_started() {
     assert!(status.container_id.is_none());
     assert!(!status.session_managed);
     assert!(status.workspace.is_none());
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
@@ -307,44 +315,40 @@ fn status_reports_no_workspace_for_a_container_created_before_the_label_existed(
     // A container `seed_running` without a workspace models a real
     // pre-#7389 session container -- `inspect` finds no `loom.workspace`
     // label, and `status` must report `None`, not synthesize one.
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     lifecycle.runner.seed_running(&container_name("alice"));
     let status = lifecycle.status("alice").unwrap();
     assert!(status.running);
     assert!(status.workspace.is_none());
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn status_and_start_reject_an_unknown_account() {
-    let (workspace, root) = setup();
-    std::env::set_var("LOOM_CODEX_PROFILE_ROOT", root.path());
+    let (workspace, _root, _env) = setup();
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     assert!(lifecycle.status("ghost").is_err());
     assert!(lifecycle.start("ghost").is_err());
     assert!(lifecycle.stop("ghost", false).is_err());
     assert!(lifecycle.attach("ghost").is_err());
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn attach_refuses_when_not_running() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     let error = lifecycle.attach("alice").unwrap_err().to_string();
     assert!(error.contains("not running"));
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn attach_execs_tmux_against_the_running_container() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     lifecycle.start("alice").unwrap();
@@ -354,7 +358,6 @@ fn attach_execs_tmux_against_the_running_container() {
     assert_eq!(attaches.len(), 1);
     assert_eq!(attaches[0].0, container_name("alice"));
     assert_eq!(attaches[0].1, DEFAULT_TMUX_SESSION_NAME);
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 // ---- workspace mount (#7389) -------------------------------------------
@@ -362,7 +365,7 @@ fn attach_execs_tmux_against_the_running_container() {
 #[test]
 #[serial]
 fn start_mounts_the_requested_workspace_and_status_reports_it() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let repo = tempfile::tempdir().unwrap();
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
@@ -379,24 +382,22 @@ fn start_mounts_the_requested_workspace_and_status_reports_it() {
     drop(creates);
     let status = lifecycle.status("alice").unwrap();
     assert_eq!(status.workspace.as_deref(), Some(repo.path()));
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn start_without_a_workspace_defaults_to_the_lifecycles_own_workspace() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     let status = lifecycle.start("alice").unwrap();
     assert_eq!(status.workspace.as_deref(), Some(workspace.path()));
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn starting_a_running_session_against_a_different_workspace_fails_naming_the_current_one() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let first_repo = tempfile::tempdir().unwrap();
     let second_repo = tempfile::tempdir().unwrap();
@@ -416,13 +417,12 @@ fn starting_a_running_session_against_a_different_workspace_fails_naming_the_cur
     // Only the original `create` happened -- the mismatch is rejected
     // before any second `docker run`/`docker start`.
     assert_eq!(lifecycle.runner.creates.lock().unwrap().len(), 1);
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn restarting_a_stopped_session_against_a_different_workspace_also_fails() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let first_repo = tempfile::tempdir().unwrap();
     let second_repo = tempfile::tempdir().unwrap();
@@ -446,13 +446,12 @@ fn restarting_a_stopped_session_against_a_different_workspace_also_fails() {
         .unwrap_err()
         .to_string();
     assert!(error.contains(&first_repo.path().display().to_string()), "{error}");
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn restarting_the_same_workspace_succeeds() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let repo = tempfile::tempdir().unwrap();
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
@@ -466,7 +465,6 @@ fn restarting_the_same_workspace_succeeds() {
         .unwrap();
     assert!(status.running);
     assert_eq!(status.workspace.as_deref(), Some(repo.path()));
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 // ---- email -> short-name resolution (#7389) ----------------------------
@@ -474,7 +472,7 @@ fn restarting_the_same_workspace_succeeds() {
 #[test]
 #[serial]
 fn session_lifecycle_resolves_an_account_by_registered_email() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account_with_email(
         workspace.path(),
         root.path(),
@@ -488,13 +486,12 @@ fn session_lifecycle_resolves_an_account_by_registered_email() {
     assert_eq!(status.name, "agent-1");
     assert_eq!(status.container_name, container_name("agent-1"));
     assert!(!status.container_name.contains('@'));
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn an_unregistered_email_is_rejected_with_a_clear_error() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     let error = lifecycle
@@ -502,7 +499,6 @@ fn an_unregistered_email_is_rejected_with_a_clear_error() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("does not exist"), "{error}");
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 // ---- shell: start-if-absent, run Codex, attach (#7389) -----------------
@@ -510,7 +506,7 @@ fn an_unregistered_email_is_rejected_with_a_clear_error() {
 #[test]
 #[serial]
 fn shell_starts_an_absent_session_and_launches_codex_in_a_new_window() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let repo = tempfile::tempdir().unwrap();
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
@@ -540,13 +536,12 @@ fn shell_starts_an_absent_session_and_launches_codex_in_a_new_window() {
     let attaches = lifecycle.runner.attaches.lock().unwrap();
     assert_eq!(attaches.len(), 1);
     assert_eq!(attaches[0].0, container_name("alice"));
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn shell_passes_through_explicit_codex_args_instead_of_the_default() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let repo = tempfile::tempdir().unwrap();
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
@@ -562,13 +557,12 @@ fn shell_passes_through_explicit_codex_args_instead_of_the_default() {
             "--dangerously-bypass-approvals-and-sandbox".to_string()
         ]
     );
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn shell_reattaches_to_an_existing_codex_window_without_stacking_a_second_process() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let repo = tempfile::tempdir().unwrap();
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
@@ -587,13 +581,12 @@ fn shell_reattaches_to_an_existing_codex_window_without_stacking_a_second_proces
     assert_eq!(lifecycle.runner.new_windows.lock().unwrap().len(), 1);
     assert_eq!(lifecycle.runner.selected_windows.lock().unwrap().len(), 2);
     assert_eq!(lifecycle.runner.attaches.lock().unwrap().len(), 2);
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn shell_resolves_the_account_by_email_before_any_container_call() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account_with_email(
         workspace.path(),
         root.path(),
@@ -611,20 +604,18 @@ fn shell_resolves_the_account_by_email_before_any_container_call() {
     assert_eq!(creates.len(), 1);
     assert_eq!(creates[0].0, container_name("agent-1"));
     assert!(!creates[0].0.contains('@'));
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn adopting_two_accounts_keeps_container_names_and_markers_distinct() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     import_account(workspace.path(), root.path(), "bob");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     lifecycle.start("alice").unwrap();
     assert!(is_session_managed(&root.path().join("alice")));
     assert!(!is_session_managed(&root.path().join("bob")));
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
@@ -685,7 +676,7 @@ fn health_of(workspace: &Path, name: &str) -> Option<super::super::health::Accou
 #[test]
 #[serial]
 fn probe_execs_codex_login_status_inside_the_container() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     lifecycle.start("alice").unwrap();
@@ -695,13 +686,12 @@ fn probe_execs_codex_login_status_inside_the_container() {
     assert_eq!(execs.len(), 1);
     assert_eq!(execs[0].0, container_name("alice"));
     assert_eq!(execs[0].1, vec!["codex", "login", "status"]);
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn probe_reports_not_logged_in_from_the_container_output() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     lifecycle.start("alice").unwrap();
@@ -709,37 +699,34 @@ fn probe_reports_not_logged_in_from_the_container_output() {
         .runner
         .set_exec_result(&container_name("alice"), exec_ok("Not logged in"));
     assert_eq!(lifecycle.probe_login("alice").unwrap(), LoginState::NotLoggedIn);
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn probe_reports_session_unavailable_without_a_running_container() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     // Adopted (the ownership rule applies) but never started.
     mark_session_managed(&root.path().join("alice"), &container_name("alice")).unwrap();
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     assert_eq!(lifecycle.probe_login("alice").unwrap(), LoginState::SessionUnavailable);
     assert!(lifecycle.runner.execs.lock().unwrap().is_empty());
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn probe_leaves_a_host_direct_profile_to_the_host_direct_path() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     assert_eq!(lifecycle.probe_login("alice").unwrap(), LoginState::NotChecked);
     assert!(lifecycle.runner.execs.lock().unwrap().is_empty());
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn an_expired_probe_excludes_the_account_from_selection_before_any_dispatch() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     import_account(workspace.path(), root.path(), "bob");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
@@ -768,13 +755,12 @@ fn an_expired_probe_excludes_the_account_from_selection_before_any_dispatch() {
         health::select_healthy_at(workspace.path(), AccountProvider::Codex, &accounts, 1_001)
             .unwrap();
     assert_eq!(selected.id.name, "bob");
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn a_healthy_probe_clears_an_existing_reauth_hold() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     lifecycle.start("alice").unwrap();
@@ -798,7 +784,6 @@ fn a_healthy_probe_clears_an_existing_reauth_hold() {
     assert!(
         health::select_healthy_at(workspace.path(), AccountProvider::Codex, &accounts, 4).is_ok()
     );
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
@@ -833,7 +818,7 @@ fn an_inconclusive_probe_never_marks_an_account_expired() {
         }),
     ];
     for result in inconclusive {
-        let (workspace, root) = setup();
+        let (workspace, root, _env) = setup();
         import_account(workspace.path(), root.path(), "alice");
         let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
         match result {
@@ -858,14 +843,13 @@ fn an_inconclusive_probe_never_marks_an_account_expired() {
             health::select_healthy_at(workspace.path(), AccountProvider::Codex, &accounts, 11)
                 .is_ok()
         );
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 }
 
 #[test]
 #[serial]
 fn a_fresh_conclusive_result_suppresses_re_probing_until_the_ttl_lapses() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     lifecycle.start("alice").unwrap();
@@ -887,13 +871,12 @@ fn a_fresh_conclusive_result_suppresses_re_probing_until_the_ttl_lapses() {
         .refresh_health_at(&accounts, 1_000 + DEFAULT_SESSION_PROBE_TTL_SECS)
         .unwrap();
     assert_eq!(lifecycle.runner.execs.lock().unwrap().len(), 2);
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
 #[serial]
 fn refresh_is_a_no_op_when_no_account_is_session_managed() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     // Uses the REAL `ProcessContainerRunner`: the point of this test is
     // that the selection path costs zero `docker` invocations for a pool
@@ -902,7 +885,6 @@ fn refresh_is_a_no_op_when_no_account_is_session_managed() {
     let accounts = inventory(workspace.path());
     assert!(refresh_session_health(workspace.path(), &accounts, 1).is_empty());
     assert!(health_of(workspace.path(), "alice").is_none());
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
