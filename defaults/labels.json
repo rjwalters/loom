@@ -876,7 +876,7 @@
     },
     {
       "name": "loom:operator-priority",
-      "description": "Land ASAP, ahead of all other work (not a hold). Applied by: humans, directly or via loom-ui star.",
+      "description": "Land ASAP, not a hold. Applied by: humans/loom-ui; inherited by a starred parent's children",
       "color": "CA8A04",
       "kind": "priority",
       "applied_by": "humans, directly or via loom-ui star",

@@ -55,9 +55,10 @@ When you claim an issue and realize mid-work it requires >6 hours or touches >8 
 #    --add-label`. A separate Curator pass produces loom:curated, and a
 #    human adds loom:issue; do NOT add loom:issue yourself to a sub-issue
 #    you just created -- that would skip both Curator review and the
-#    human-approval gate.
-./.loom/scripts/create-issue.sh --title "[Parent #812] Part 1: Core functionality" --body "..." --label "loom:triage"
-./.loom/scripts/create-issue.sh --title "[Parent #812] Part 2: Edge cases" --body "..." --label "loom:triage"
+#    human-approval gate. --parent writes the loom:parent marker + native
+#    sub-issue link, and a starred parent's star is inherited (#10012).
+./.loom/scripts/create-issue.sh --parent 812 --title "Part 1: Core functionality" --body "..." --label "loom:triage"
+./.loom/scripts/create-issue.sh --parent 812 --title "Part 2: Edge cases" --body "..." --label "loom:triage"
 # ... create remaining sub-issues ...
 
 # 2. Park the parent on its children: one body park record per child, then

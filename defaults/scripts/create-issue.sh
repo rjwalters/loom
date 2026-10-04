@@ -18,7 +18,7 @@
 #
 # Usage:
 #   create-issue.sh --title TITLE (--body BODY | --body-file PATH) \
-#                   [--label LABEL]... [--repo OWNER/REPO] [--force]
+#                   [--label LABEL]... [--repo OWNER/REPO] [--parent N] [--force]
 #   create-issue.sh --help
 #
 # Flags are a subset of `gh issue create`'s, chosen so a role prompt's
@@ -47,6 +47,13 @@
 #                         backstop WARNS (stderr) but still files (#8289).
 #                         Default 13; must stay below the block threshold or
 #                         the warn band is disabled. 0 disables it outright.
+#   --parent N            File the issue as a child of #N (#10012): the body
+#                         gets `<!-- loom:parent #N -->` (and N's red-main
+#                         marker, if it has one); after the create the child
+#                         is linked as a native sub-issue (best effort) and,
+#                         when N carries loom:operator-priority, starred with
+#                         the inherited audit comment. Logic: `loom-daemon
+#                         forge parent`; needs loom-daemon (exit 1 if absent).
 #
 # Output: the new issue's URL on stdout (identical to `gh issue create`).
 #
@@ -144,13 +151,14 @@ source "$SCRIPT_DIR/lib/filing-lock.sh"
 usage() {
   # Line range = the whole leading comment block (keep in sync when the header
   # grows; `--help` silently truncating its own docs is its own small #8289).
-  sed -n '2,135p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '2,143p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 TITLE=""
 BODY=""
 BODY_FILE=""
 REPO_NWO=""
+PARENT=""
 LABELS=()
 HAVE_BODY=false
 # Duplicate backstop (#7971). Env default so a caller that has ALREADY run
@@ -211,6 +219,14 @@ while [[ $# -gt 0 ]]; do
       SKIP_DUP_CHECK=true
       shift
       ;;
+    --parent)
+      PARENT="${2:-}"
+      if [[ ! "$PARENT" =~ ^[0-9]+$ ]]; then
+        echo "create-issue.sh: --parent takes an issue number: $PARENT" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
     --duplicate-threshold)
       DUP_THRESHOLD="${2:-}"
       if [[ ! "$DUP_THRESHOLD" =~ ^[0-9]+$ ]]; then
@@ -262,6 +278,27 @@ if [[ "$FORGE_TYPE" != "github" ]]; then
 on $FORGE_TYPE file the issue with your forge's own CLI (Gitea has no split \
 GraphQL/REST quota, so it has no equivalent failure mode)." >&2
   exit 2
+fi
+
+# --- #10012: --parent adds the machine-readable edge before anything else ----
+# The marker (and the parent's red-main marker) go into the body first, so the
+# duplicate backstop below sees "#N" as cross-referenced and the filed body
+# carries the link from its first revision. No daemon, no --parent: a silent
+# fallback would file a child with no edge.
+PARENT_DAEMON=""
+_parent_repo=()
+if [[ -n "$PARENT" ]]; then
+  PARENT_DAEMON="$(command -v loom-daemon 2>/dev/null || true)"
+  if [[ -z "$PARENT_DAEMON" ]]; then
+    echo "create-issue.sh: --parent needs loom-daemon on PATH (nothing was filed)" >&2
+    exit 1
+  fi
+  _parent_repo=()
+  [[ -n "$REPO_NWO" ]] && _parent_repo=(--repo "$REPO_NWO")
+  BODY="$(printf '%s' "$BODY" | "$PARENT_DAEMON" forge parent body --parent "$PARENT" "${_parent_repo[@]}")" || {
+    echo "create-issue.sh: could not add the parent marker (nothing was filed)" >&2
+    exit 1
+  }
 fi
 
 # Detection backstop (#6771, deferred from #6714's filing-lock): warn -- never
@@ -428,6 +465,12 @@ trap 'loom_filing_lock_release' EXIT INT TERM
 case " ${LABELS[*]-} " in *" loom:"*) ;; *) LABELS+=("loom:triage") ;; esac
 ISSUE_URL="$(forge_gh_create_issue_rl_safe "$REPO_NWO" "$TITLE" "$BODY" "${LABELS[@]+"${LABELS[@]}"}")" || exit 1
 echo "$ISSUE_URL"
+
+# --- #10012: native sub-issue link + inherited star, best effort ------------
+if [[ -n "$PARENT_DAEMON" ]]; then
+  "$PARENT_DAEMON" forge parent link --parent "$PARENT" --child "$ISSUE_URL" "${_parent_repo[@]}" >&2 \
+    || echo "create-issue.sh: note: --parent #$PARENT follow-up (star / sub-issue link) incomplete; the issue itself is filed and the loom:parent marker is in its body" >&2
+fi
 
 # --- #9774: the filed body ends with the dashboard footer -------------------
 # Best-effort, via the daemon's --patch-created (fetch, footer, PATCH — the
