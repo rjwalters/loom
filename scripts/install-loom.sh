@@ -175,7 +175,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Determine Loom repository root (where this script lives)
-LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# #10179: a host that opted out (`loom-daemon host disable`) refuses installs (guard on the next line).
+LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; command -v loom-daemon >/dev/null 2>&1 && { loom-daemon host check --entry-point install-loom.sh; _rc=$?; [ "$_rc" -ne 1 ] || exit 1; } || true  # exit 1 = disabled; an older binary without `host` (2) is ignored
 
 # ANSI color codes
 RED='\033[0;31m'

@@ -300,6 +300,11 @@ pub(crate) enum ScriptPortCommand {
     /// that.
     DaemonStart(super::daemon_start::DaemonStartArgs),
 
+    /// Durable host opt-out (#10179): `disable --reason` / `enable` / `status`
+    /// / `check`. While disabled, every start and re-provision path refuses.
+    #[command(subcommand)]
+    Host(super::host::HostCommand),
+
     /// Fetch-or-rebuild, provision and restart the daemon (#8088), backing
     /// `loom-daemon-update.sh` — epic #7810's last and highest-risk port,
     /// because the file it provisions over is very often the binary
@@ -550,6 +555,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::Provenance(cmd) => cmd.run(),
             ScriptPortCommand::DaemonWatchdog(args) => args.run(),
             ScriptPortCommand::DaemonStart(args) => args.run(),
+            ScriptPortCommand::Host(cmd) => cmd.run(),
             ScriptPortCommand::DaemonUpdate(args) => args.run(),
             ScriptPortCommand::FleetSend(args) => args.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),

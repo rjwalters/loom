@@ -42,6 +42,7 @@ pub(crate) mod forge_inventory_cmd;
 mod git_blob_lines;
 mod guard_mcp_tools;
 pub(crate) mod health;
+pub(crate) mod host;
 pub(crate) mod inflight;
 mod label_duplicates;
 pub(crate) mod labels_cmd;
