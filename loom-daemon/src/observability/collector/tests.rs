@@ -262,12 +262,9 @@ fn token_snapshot_reads_a_ranking_file() {
 fn registry_provider_accounts_are_empty_when_nothing_is_registered() {
     let workspace = tempfile::tempdir().unwrap();
     let profile_root = tempfile::tempdir().unwrap();
-    std::env::set_var(
-        crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV,
-        profile_root.path().to_str().unwrap(),
-    );
+    let _profile_root =
+        crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profile_root.path());
     let accounts = sample_registry_provider_accounts(workspace.path());
-    std::env::remove_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV);
     assert!(accounts.is_empty(), "got {accounts:?}");
 }
 

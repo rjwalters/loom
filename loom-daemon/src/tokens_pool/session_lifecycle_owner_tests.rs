@@ -7,7 +7,7 @@ use super::*;
 #[test]
 #[serial]
 fn start_hands_create_the_registry_workspace_as_the_daemon_root() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     lifecycle.start("alice").unwrap();
@@ -15,7 +15,6 @@ fn start_hands_create_the_registry_workspace_as_the_daemon_root() {
         *lifecycle.runner.daemon_roots.lock().unwrap(),
         vec![workspace.path().to_path_buf()]
     );
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
@@ -23,7 +22,7 @@ fn start_hands_create_the_registry_workspace_as_the_daemon_root() {
 fn start_with_a_mount_workspace_still_hands_create_the_registry_daemon_root() {
     // The operator's shape: `cd ~/GitHub/loom && loom-daemon accounts session
     // start agent-3 --mount-workspace ~/GitHub` (issue #10103).
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let parent = tempfile::tempdir().unwrap();
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
@@ -35,7 +34,6 @@ fn start_with_a_mount_workspace_still_hands_create_the_registry_daemon_root() {
         *lifecycle.runner.daemon_roots.lock().unwrap(),
         vec![workspace.path().to_path_buf()]
     );
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]

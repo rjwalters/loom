@@ -35,10 +35,15 @@ const GUARDED_ENV: [&str; 8] = [
     "LOOM_CODEX_PROFILE_ROOT",
 ];
 
-struct EnvGuard(Vec<(&'static str, Option<String>)>);
+/// The second field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964).
+struct EnvGuard(
+    Vec<(&'static str, Option<String>)>,
+    #[allow(dead_code)] crate::tokens_pool::profile_root_env::ProfileRootLock,
+);
 
 impl EnvGuard {
     fn new(profile_root: &Path) -> Self {
+        let lock = crate::tokens_pool::profile_root_env::lock();
         let prior = GUARDED_ENV
             .iter()
             .map(|key| (*key, std::env::var(key).ok()))
@@ -47,7 +52,7 @@ impl EnvGuard {
             std::env::remove_var(key);
         }
         std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profile_root);
-        Self(prior)
+        Self(prior, lock)
     }
 }
 
