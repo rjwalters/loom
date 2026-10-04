@@ -167,6 +167,36 @@ pub mod eta_snapshot;
 /// `session.output` (#9764) — the live, redacted agent-output feed.
 pub mod session_output;
 
+/// The export-coverage pair `(exporters, exported_kinds)` for `host.health`
+/// (Issue #10196), derived from the per-exporter status map
+/// (`crate::observability::global_export_statuses()`, keyed by
+/// `ExporterKind::name`) as of `now`.
+///
+/// Only exporters that **actually started** count: an entry whose status
+/// classifies as `Misconfigured` (policy rejection, unreadable ingest key,
+/// `otlp` on a build without the feature) or `Disabled` (no `started_at`)
+/// never ran, so advertising it — or the kinds only it carries — would let a
+/// replay reader read that sink's silence as "nothing happened". A started
+/// exporter that is `Failing`/`NeverExported` still counts: its records are
+/// queued durably and retried. When nothing started both lists are empty,
+/// which the contract reads as **unknown**, never "exports nothing".
+#[must_use]
+pub fn export_coverage(
+    statuses: &std::collections::BTreeMap<String, crate::types::ObservabilityExportStatus>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Vec<String>, Vec<String>) {
+    use crate::types::ObservabilityExportState as State;
+    let exporters: Vec<String> = statuses
+        .iter()
+        .filter(|(_, status)| {
+            !matches!(status.classify(now), State::Misconfigured | State::Disabled)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let kinds = exported_kinds_for(&exporters);
+    (exporters, kinds)
+}
+
 /// The sorted wire `kind` tags the given exporters (by
 /// `ExporterKind::name`: `"https"`, `"otlp"`) carry, derived from the registry
 /// rows (Issue #10196). `https` carries `native_ingest` kinds; `otlp` carries

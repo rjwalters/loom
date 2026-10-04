@@ -71,8 +71,8 @@ pub use ci::{CiDurationRecord, CiJobLogRecord, CiJobRecord, CiRunRecord};
 pub use disposition::{classify_disposition, DispositionSignals, IssueEndState, SweepDisposition};
 pub use envelope::TelemetryEnvelope;
 pub use kinds::{
-    exported_kinds_for, TelemetryKindMeta, TelemetryKindOtlp, NEW_KIND_SCHEMA_VERSION,
-    TELEMETRY_KINDS,
+    export_coverage, exported_kinds_for, TelemetryKindMeta, TelemetryKindOtlp,
+    NEW_KIND_SCHEMA_VERSION, TELEMETRY_KINDS,
 };
 pub use ops::MetricPointsRecord;
 pub use queue_snapshot::QueueSnapshotRecord;
@@ -1630,17 +1630,17 @@ pub struct HostHealthRecord {
     /// empty; a pre-#9014 record decodes as empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captainless_singleton_jobs: Vec<String>,
-    /// Record kinds this host's registered exporters carry (Issue #10196),
+    /// Record kinds this host's started exporters carry (Issue #10196),
     /// sorted wire `kind` tags -- the export-coverage half of the replay
     /// contract (`telemetry-replay.md`). Derived from the kind registry via
     /// [`exported_kinds_for`], so it can never drift from routing.
     ///
-    /// Empty means "unknown / no exporter registered yet / pre-#10196
+    /// Empty means "unknown / no exporter started / pre-#10196
     /// daemon", **never** "exports nothing": a reader must not treat an empty
     /// list as proof of silence. `#[serde(default)]` so an older record decodes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exported_kinds: Vec<String>,
-    /// Exporter names registered in this process (`"https"`, `"otlp"`;
+    /// Exporter names that actually started in this process (`"https"`, `"otlp"`;
     /// [`crate::observability::ExporterKind::name`]), sorted. Same
     /// empty-is-unknown and `#[serde(default)]` contract as `exported_kinds`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -1141,13 +1141,14 @@ async fn sample_host_health(
         .await
         .unwrap_or_default();
     let (swap_in_bytes_per_sec, swap_out_bytes_per_sec) = swap_sample_rates(&pressure);
-    // Export coverage (#10196): which exporters this process registered and
-    // which record kinds those exporters carry, so a replay reader can tell
-    // "this host reported nothing" from "this host was not reporting".
-    let exporters: Vec<String> = crate::observability::global_export_statuses()
-        .into_keys()
-        .collect();
-    let exported_kinds = crate::telemetry::exported_kinds_for(&exporters);
+    // Export coverage (#10196): which exporters this process actually started
+    // and which record kinds those exporters carry, so a replay reader can
+    // tell "this host reported nothing" from "this host was not reporting".
+    // Misconfigured/never-started entries are excluded by `export_coverage`.
+    let (exporters, exported_kinds) = crate::telemetry::export_coverage(
+        &crate::observability::global_export_statuses(),
+        Utc::now(),
+    );
     HostHealthRecord {
         captured_at: Utc::now(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),

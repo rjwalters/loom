@@ -2288,9 +2288,10 @@ in `daemon-reference.md` for the full design:
   captain, on a host with no declared singleton jobs at all, and on a record
   from a pre-#8848 daemon.
 - `exporters` / `exported_kinds` (#10196) — export coverage: the exporter names
-  registered in the emitting process and the sorted record `kind` tags they
-  carry (from the kind registry). Omitted when empty; **empty means unknown**
-  (pre-#10196 daemon or no exporter registered yet), never "exports nothing".
+  that actually started in the emitting process (misconfigured, never-started
+  entries excluded) and the sorted record `kind` tags they carry (from the kind
+  registry). Omitted when empty; **empty means unknown** (pre-#10196 daemon or
+  no exporter started), never "exports nothing".
   See [`telemetry-replay.md`](telemetry-replay.md).
 - `captainless_singleton_jobs` (#9014) — in-daemon singleton-job names whose
   most recent gate check was refused because **no** `fleet.captain` is

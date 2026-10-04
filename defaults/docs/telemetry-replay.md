@@ -69,12 +69,14 @@ Absence of a record is ambiguous: nothing happened, or the host was not
 reporting. Each `host.health` record therefore names what the emitting host was
 exporting:
 
-- `exporters`: exporter names registered in the process (`https`, `otlp`).
+- `exporters`: exporter names that actually started in the process (`https`,
+  `otlp`). An entry that never ran (misconfigured, e.g. `otlp` on a build
+  without the feature or a rejected endpoint) is excluded.
 - `exported_kinds`: the wire `kind` tags those exporters carry, derived from
   the kind registry (`telemetry/kinds.rs`).
 
 Both are omitted when empty, and **empty means unknown** (no exporter
-registered yet, or a pre-#10196 daemon), never "exports nothing". A reader at
+started, or a pre-#10196 daemon), never "exports nothing". A reader at
 `t` treats a host as covered when it has a `host.health` record knowable
 before `t` and recent enough, and reads silence for a kind in `exported_kinds`
 as "nothing happened". `host.health` is exported as gauges, so the coverage
