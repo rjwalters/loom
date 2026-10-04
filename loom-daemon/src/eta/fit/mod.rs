@@ -7,12 +7,17 @@
 //! loads. This module is that step's pure core:
 //!
 //! - a per-stage **exit hazard**: L2 logistic regression of "left the stage
-//!   within the next 30 minutes" on standardized features;
+//!   within the next 30 minutes" on standardized features ([`logistic`]);
 //! - the **direct model**: a pooled, censoring-aware log-normal AFT
-//!   regression of time-to-merge;
+//!   regression of time-to-merge ([`aft`]);
 //! - **path statistics**: delayed-entry Kaplan–Meier dwell curves and
-//!   next-stage probabilities;
-//! - the versioned coefficient file that carries all three ([`coeffs`]).
+//!   next-stage probabilities ([`paths`]);
+//! - the versioned coefficient file that carries all three ([`coeffs`]),
+//!   built by [`fit()`].
+//!
+//! [`math`] holds the hand-ported numerics (erfc, the normal tail and
+//! quantile functions, Cholesky) — no new crate, since `Cargo.toml` is a
+//! Champion auto-merge veto pattern.
 //!
 //! Building training rows from fleet history, the `eta fit` CLI and the daily
 //! refit are #10245; this module never reads fleet data.
@@ -52,18 +57,23 @@
 //!   names, so the fixture deserializes straight into it; file-only fields are
 //!   `#[serde(default)]`.
 
+pub mod aft;
 pub mod coeffs;
 pub mod features;
+pub mod logistic;
+pub mod math;
+pub mod paths;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub use coeffs::{
-    fit_dir, load_latest, path_for, read, to_json, write, AftFit, CoefficientFile, FitMeta,
-    FitSettings, FitWindow, Fitter, HazardFit, HazardSkip, KmCurve, NextStep, PathStats,
-    SkipReason,
+    age_p95_sec, fit, fit_dir, load_latest, path_for, read, to_json, write, AftFit,
+    CoefficientFile, FitMeta, FitSettings, FitWindow, Fitter, HazardFit, HazardSkip, KmCurve,
+    NextStep, PathStats, SkipReason,
 };
 pub use features::{clock, model_features, ModelInputs};
+pub use paths::downsample_km;
 
 /// The schema tag of a coefficient file.
 pub const SCHEMA: &str = "eta-fit/v1";

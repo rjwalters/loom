@@ -13,9 +13,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::{
-    FitStage, AFT_L2, EXIT_HORIZON_SEC, FEATURES, HAZARD_C, KM_MAX_POINTS, KNOWABLE_LAG_SEC,
-    MIN_DUR_H, MIN_STAGE_EXITS, MIN_STAGE_ROWS, ROW_STEP_SEC, SCHEMA, STD_EPS, WINDOW_DAYS,
+    aft, logistic, paths, DwellRow, FitStage, TrainingRow, AFT_L2, EXIT_HORIZON_SEC, FEATURES,
+    HAZARD_C, KM_MAX_POINTS, KNOWABLE_LAG_SEC, MIN_DUR_H, MIN_STAGE_EXITS, MIN_STAGE_ROWS,
+    ROW_STEP_SEC, SCHEMA, STD_EPS, WINDOW_DAYS,
 };
+use crate::pr_latency::stats::nearest_rank;
 
 /// Test seam: overrides the directory coefficient files live in (mirrors
 /// `LOOM_ETA_FLEET_SNAPSHOT_DIR`).
@@ -314,6 +316,52 @@ impl CoefficientFile {
         self.id = self.derive_id();
         self
     }
+}
+
+/// Fit everything from `rows` and `dwells`, processed in the order given
+/// (canonical ordering is the caller's job), into a file with its derived id.
+///
+/// Every [`FitStage`] lands in exactly one of `hazard` (fitted) and
+/// `hazard_skipped` (with the gate it failed, even at zero rows).
+#[must_use]
+pub fn fit(meta: &FitMeta, rows: &[TrainingRow], dwells: &[DwellRow]) -> CoefficientFile {
+    let mut file = CoefficientFile::empty(meta);
+    for stage in FitStage::ALL {
+        let of_stage: Vec<&TrainingRow> = rows.iter().filter(|r| r.stage == stage).collect();
+        match logistic::fit_stage(&of_stage) {
+            Ok(hazard) => {
+                file.hazard.insert(stage, hazard);
+            }
+            Err(skip) => {
+                file.hazard_skipped.insert(stage, skip);
+            }
+        }
+    }
+    file.aft = aft::fit(rows);
+    file.path_stats = paths::path_stats(dwells);
+    file.age_p95_sec = age_p95_sec(rows);
+    file.with_derived_id()
+}
+
+/// The training p95 age per stage, in whole seconds: the nearest-rank p95
+/// (rank `⌈95·n/100⌉`) of `round(age_h·3600)` over **all** of the stage's
+/// rows, labelled or not, unweighted. Stages with no rows are absent.
+#[must_use]
+pub fn age_p95_sec(rows: &[TrainingRow]) -> BTreeMap<FitStage, i64> {
+    let mut by_stage: BTreeMap<FitStage, Vec<i64>> = BTreeMap::new();
+    for r in rows {
+        by_stage
+            .entry(r.stage)
+            .or_default()
+            .push((r.inputs.age_h * 3600.0).round() as i64);
+    }
+    by_stage
+        .into_iter()
+        .map(|(stage, mut ages)| {
+            ages.sort_unstable();
+            (stage, nearest_rank(&ages, 95))
+        })
+        .collect()
 }
 
 /// The directory coefficient files live in: `<root>/.loom/state/eta/fit`, a

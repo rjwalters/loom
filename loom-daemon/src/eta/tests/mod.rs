@@ -7,6 +7,8 @@ mod config;
 mod emit;
 mod estimate;
 mod explanation;
+mod fit;
+mod fit_parity;
 mod fleet;
 mod journal;
 mod land_v3;
@@ -33,6 +35,10 @@ pub(crate) const READY_GOLDEN: &str = include_str!("../fixtures/ready-golden.jso
 
 /// The golden backtest report (`land-v1` replayed over history-a, #9325).
 pub(crate) const BACKTEST_GOLDEN: &str = include_str!("../fixtures/backtest-golden.json");
+
+/// The twin-otter parity fixture (#10223): the generator spec, the fitted
+/// reference coefficients and the evaluation rows for #10221 and #10222.
+pub(crate) const TWIN_OTTER_PARITY: &str = include_str!("../fixtures/twin_otter_parity.json");
 
 /// The leakage fixture (#9325): a history whose LAST record, if the replay
 /// could see it, would change the answer — and which every replay instant in
