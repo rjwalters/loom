@@ -413,7 +413,7 @@ impl EtaBacktestArgs {
             repo: self.repo.as_deref(),
         };
 
-        let (history, cases, note) = self.replay_inputs(&root, &GhFetcher)?;
+        let (mut history, cases, note) = self.replay_inputs(&root, &GhFetcher)?;
         if let Some(note) = note {
             eprintln!("{note}");
         }
