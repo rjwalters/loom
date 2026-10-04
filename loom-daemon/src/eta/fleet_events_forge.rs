@@ -404,13 +404,25 @@ impl RawEventSource for ForgeEventSource {
             .remaining
             .is_some_and(|r| r < self.reserve);
         if let Some(reader) = &self.reader {
-            if !matches!(response.status, 200 | 304 | 422) {
+            if withdraws_reader(self.endpoint, response.status) {
                 self.last_stop =
                     Some(withdraw_reader(reader, &self.repo, &url, &response, &stderr));
             }
         }
         let request = (self.endpoint, self.subject.pr);
         classify(request, &self.repo, page, response, &stderr, fetched_at)
+    }
+}
+
+/// Whether a reader read answered with `status` is the reader's failure.
+/// 200/304 are answers and 422 is past the listing's window; a per-PR 404 is
+/// a PR or commit that is gone, which [`classify`] settles as an empty last
+/// page (#10197) -- withdrawing the reader for it would stop every later run.
+fn withdraws_reader(endpoint: ForgeEndpoint, status: u16) -> bool {
+    match status {
+        200 | 304 | 422 => false,
+        404 => endpoint.per_pr().is_none(),
+        _ => true,
     }
 }
 
@@ -527,6 +539,25 @@ mod tests {
        "label": {"name": "loom:issue"},
        "issue": {"number": 9970, "created_at": "2026-10-02T18:45:51Z"}}
     ]"#;
+
+    #[test]
+    fn a_per_pr_404_settles_without_withdrawing_the_reader() {
+        // A deleted PR / GC'd commit is an empty last page (#10197), not a
+        // reader coverage failure (#9537).
+        assert!(!withdraws_reader(ForgeEndpoint::Reviews, 404));
+        assert!(!withdraws_reader(ForgeEndpoint::CheckRuns, 404));
+        // A repo-wide 404 is still the credential's coverage gap.
+        assert!(withdraws_reader(ForgeEndpoint::IssuesEvents, 404));
+        assert!(withdraws_reader(ForgeEndpoint::Pulls, 404));
+        for endpoint in ForgeEndpoint::ALL {
+            for status in [200, 304, 422] {
+                assert!(!withdraws_reader(endpoint, status));
+            }
+            for status in [401, 403, 429, 502] {
+                assert!(withdraws_reader(endpoint, status));
+            }
+        }
+    }
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-10-04T10:00:00Z")
