@@ -144,11 +144,7 @@ scheduled.
 > `defaults/observability/signoz/`), not the live harness-ops store Loom exports
 > to, which keeps logs 3650 days and traces/metrics 10 years
 > ([#10195](https://github.com/rjwalters/loom/issues/10195)). Native-HTTPS-only
-> kinds are governed by loom-ui retention:
-> [2AMLogic/loom-ui#431](https://github.com/2AMLogic/loom-ui/issues/431),
-> [#531](https://github.com/2AMLogic/loom-ui/issues/531),
-> [#544](https://github.com/2AMLogic/loom-ui/issues/544),
-> [#1464](https://github.com/2AMLogic/loom-ui/issues/1464).
+> kinds are governed by the loom-ui telemetry store's own retention issues.
 
 | Signal | Retention | Why |
 |---|---|---|
