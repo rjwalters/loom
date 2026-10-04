@@ -343,3 +343,48 @@ fn paths_live_beside_the_snapshots() {
     assert!(cursor.ends_with("events-rjwalters-loom.cursor.json"), "{}", cursor.display());
     assert_eq!(events.parent(), Some(super::super::fleet::snapshot_dir(root).as_path()));
 }
+
+/// A listing whose first full page held only unsupported events (the source
+/// normalizes it to no rows but reports `last: false`).
+struct UnsupportedFirstPage {
+    labeled: RawEvent,
+}
+
+impl RawEventSource for UnsupportedFirstPage {
+    fn cursor_key(&self) -> String {
+        "forge:unsupported".to_string()
+    }
+
+    fn fetch_page(&mut self, page: u32, _etag: Option<&str>) -> PageFetch {
+        match page {
+            1 => PageFetch::Page {
+                events: Vec::new(),
+                etag: None,
+                last: false,
+            },
+            _ => PageFetch::Page {
+                events: vec![self.labeled.clone()],
+                etag: None,
+                last: true,
+            },
+        }
+    }
+}
+
+#[test]
+fn an_unsupported_only_full_page_does_not_end_backfill_or_refresh() {
+    for mode in [SyncMode::Backfill, SyncMode::Refresh] {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("e.jsonl");
+        let cursor_file = dir.path().join("c.json");
+        let mut source = UnsupportedFirstPage {
+            labeled: label(3, "loom:issue", 10, 1),
+        };
+        let mut log = EventLog::open(&events).unwrap();
+        let mut cursor = EventsCursor::empty(REPO);
+        let report = sync(&mut source, &mut log, &mut cursor, &cursor_file, mode, 100).unwrap();
+        assert_eq!(report.pages, 2, "{mode:?}");
+        assert_eq!(report.appended, 1, "{mode:?}");
+        assert_eq!(load_events(&events).len(), 1);
+    }
+}

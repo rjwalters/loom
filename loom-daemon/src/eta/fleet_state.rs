@@ -131,14 +131,14 @@ pub fn item_stage(kind: ItemKind, labels: &BTreeSet<String>) -> ItemStage {
                 ItemStage::Blocked
             } else if has(labels, BUILDING_LABEL) {
                 ItemStage::Building
+            } else if has(labels, READY_LABEL) {
+                ItemStage::ReadyWait
             } else if has(labels, "loom:curated") {
                 ItemStage::Curated
             } else if has(labels, "loom:curating") {
                 ItemStage::Curating
             } else if has(labels, "loom:triage") {
                 ItemStage::Triage
-            } else if has(labels, READY_LABEL) {
-                ItemStage::ReadyWait
             } else {
                 ItemStage::Untriaged
             }

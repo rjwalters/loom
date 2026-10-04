@@ -533,7 +533,6 @@ pub fn sync(
                 let overlaps = events
                     .iter()
                     .any(|e| e.kind != EventKind::Opened && log.contains(&e.id));
-                let empty = events.is_empty();
                 report.appended += log.append(&events)?;
                 let state = cursor.endpoints.entry(key.clone()).or_default();
                 let done = match mode {
@@ -542,7 +541,7 @@ pub fn sync(
                             state.head_etag = etag;
                         }
                         state.backfill_next_page = page + 1;
-                        if last || empty {
+                        if last {
                             state.backfill_complete = true;
                         }
                         state.backfill_complete
@@ -551,7 +550,7 @@ pub fn sync(
                         if page == 1 {
                             state.refresh_head_etag = etag;
                         }
-                        if overlaps || last || empty {
+                        if overlaps || last {
                             state.head_etag = state.refresh_head_etag.take();
                             state.refresh_next_page = None;
                             true

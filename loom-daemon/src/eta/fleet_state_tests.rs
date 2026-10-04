@@ -206,3 +206,34 @@ fn an_approved_pr_without_an_operator_label_is_merge_wait_and_the_star_is_not_a_
     assert_eq!(item_stage(ItemKind::Pr, &labels), ItemStage::MergeWait);
     assert!(!operator_hold(&labels));
 }
+
+#[test]
+fn a_ready_label_outranks_retained_curation_labels() {
+    for retained in [
+        &["loom:issue", "loom:curated"][..],
+        &["loom:issue", "loom:triage"][..],
+        &["loom:issue", "loom:curated", "loom:triage"][..],
+    ] {
+        let labels: BTreeSet<String> = retained.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(item_stage(ItemKind::Issue, &labels), ItemStage::ReadyWait, "{retained:?}");
+    }
+    let building: BTreeSet<String> = ["loom:issue", "loom:curated", "loom:building"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_eq!(item_stage(ItemKind::Issue, &building), ItemStage::Building);
+}
+
+#[test]
+fn a_ready_issue_with_a_retained_curated_label_counts_in_ready_wait() {
+    use ItemKind::Issue;
+    let events = vec![
+        opened(5, Issue, 0),
+        add(5, Issue, "loom:triage", 10, 1),
+        add(5, Issue, "loom:curated", 20, 2),
+        add(5, Issue, "loom:issue", 30, 3),
+    ];
+    let state = fleet_state(&events, REPO, t(100));
+    assert_eq!(item(&state, Issue, 5).stage, ItemStage::ReadyWait);
+    assert_eq!(state.stage_counts.get("ready_wait").copied(), Some(1));
+}

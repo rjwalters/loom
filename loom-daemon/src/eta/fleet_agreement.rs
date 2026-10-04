@@ -259,6 +259,8 @@ pub fn render(report: &AgreementReport) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::eta::explanation::Features;
+    use crate::eta::fleet_events::EventKind;
 
     #[test]
     fn no_explanations_is_an_empty_report() {
@@ -273,5 +275,59 @@ mod tests {
         let (v, skipped) = parse_explanations("not json\n\n{\"a\":1}\n");
         assert!(v.is_empty());
         assert_eq!(skipped, 2);
+    }
+
+    fn explanation(as_of: &str, features: Features) -> Explanation {
+        let mut e: Explanation = serde_json::from_value(serde_json::json!({
+            "schema": "eta-explanation/v1",
+            "estimate_id": "x",
+            "heuristic": "start-v1",
+            "kind": "start",
+            "loom": {"version": "0", "revision": "unknown", "tree_state": "unknown", "complete": false},
+            "as_of": as_of,
+            "subject": {"repo": "o/r", "repo_id": null, "issue": 7, "pr_number": null,
+                        "story": "o/r#7", "sweep_id": null},
+            "stages": [],
+            "features_omitted": [],
+            "truncated": []
+        }))
+        .unwrap();
+        e.features = Some(features);
+        e
+    }
+
+    #[test]
+    fn a_ready_issue_with_retained_curation_labels_agrees_on_queue_features() {
+        use crate::eta::fleet_events::SOURCE_FORGE;
+        let at = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ev = |what, label: Option<&str>, secs: i64, seq| {
+            RawEvent::new(
+                "o/r",
+                7,
+                ItemKind::Issue,
+                what,
+                label.map(str::to_string),
+                at + chrono::Duration::seconds(secs),
+                SOURCE_FORGE,
+                seq,
+                at,
+            )
+        };
+        let events = vec![
+            ev(EventKind::Opened, None, 0, 0),
+            ev(EventKind::LabelAdded, Some("loom:curated"), 10, 1),
+            ev(EventKind::LabelAdded, Some("loom:issue"), 20, 2),
+        ];
+        let f = Features {
+            queue_ready: Some(1),
+            queue_rank: Some(1),
+            ..Features::default()
+        };
+        let ex = explanation("2026-09-01T00:10:00Z", f);
+        let r = agreement(&events, "o/r", &[ex]);
+        assert_eq!(r.features["queue_ready"].agreed, 1);
+        assert_eq!(r.features["queue_rank_present"].agreed, 1);
     }
 }
