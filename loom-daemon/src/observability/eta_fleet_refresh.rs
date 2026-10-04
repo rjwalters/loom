@@ -19,12 +19,16 @@
 //! # One cycle
 //!
 //! 1. **Repo set** ([`repo_targets`]): every provisioned root and the daemon's
-//!    own, by their `origin` remote, plus every published snapshot's repo (the
-//!    fit reads every file, so delete a file to stop refreshing its repo).
+//!    own, by their `origin` remote, plus every published snapshot's repo.
+//!    Deleting a snapshot file stops refreshing only a snapshot-only repo: a
+//!    provisioned root or the daemon's own repo gets a full backfill next
+//!    cycle instead. To opt out, turn `fleetRefresh.enabled` off or remove the
+//!    root from the workspace pool.
 //!    Each gets its reader App or a zero-call skip (`no_reader`,
 //!    `unsupported_forge`; warned once per daemon lifetime).
 //! 2. **Gates**: inside a rate-limit backoff, or with the breaker suppressed,
-//!    every repo is recorded (`backoff` / `breaker_open`) and no call is made.
+//!    every repo is recorded (`backoff` / `breaker_open`) and no call is made;
+//!    a due backfill is recorded as in progress, so it holds the fit (#10292).
 //! 3. **Snapshots**: [`crate::eta::fleet_refresh::run_cycle`] under the two
 //!    budgets and the reserve floor.
 //! 4. **Raw events** (#10250): each repo's issue-events cache is synced
@@ -301,6 +305,8 @@ pub fn cycle(
                 "rate-limit breaker open".to_string()
             }
         );
+        // A due backfill skipped whole still holds the fit (#10292).
+        fleet_refresh::pend_due_backfills(root, targets, now, config.backfill_days, stop);
         CycleReport {
             repos: targets.iter().map(|t| gated(root, t, stop)).collect(),
             remaining: (config.max_calls_per_cycle, config.backfill_max_calls_per_cycle),
