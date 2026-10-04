@@ -595,6 +595,15 @@ pub trait Heuristic: Send + Sync {
     /// Estimate `input` from `history`. Always returns an explanation; a
     /// refusal sets `no_estimate_reason` and carries no result.
     fn estimate(&self, input: &EstimateInput, history: &StageSamples) -> Explanation;
+    /// Whether it models an operator hold (`merge_hold`, #10218) rather than
+    /// refusing it `blocked`. The tracker hands such a heuristic the held
+    /// item's **modeled** input, with its stage-dependent queue features
+    /// counted from `merge_hold` as training counts them, and refreshes its
+    /// series while held (#10284). Every other heuristic keeps the described
+    /// `blocked` input, byte for byte.
+    fn models_hold(&self) -> bool {
+        false
+    }
 }
 
 /// Every shipped heuristic, and which one is `current` per kind.

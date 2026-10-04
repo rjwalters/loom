@@ -23,14 +23,16 @@
 //! # Serving-side approximations
 //!
 //! - A roster PR's `entered_at` is the tracker's own stage entry when it
-//!   tracks the PR in the stage its labels show, otherwise the listing's
-//!   `updated_at` (a lower bound). So `ahead` is approximate for first-seen
-//!   PRs until exact entry times come from the label stream (#10218).
+//!   tracks the PR in the stage its labels show (for a held PR, `merge_hold`:
+//!   its hold entry, #10284), otherwise the listing's `updated_at` (a lower
+//!   bound). So `ahead` is approximate for first-seen PRs until exact entry
+//!   times come from the label stream (#10218).
 //! - The journal records only PRs this host tracks, which are the PRs that
 //!   close an issue. Departures and merges of other PRs are not counted.
 //! - The log's `from` is the journal's oldest row. Daemon downtime inside
 //!   the journal's span is not visible.
 
+use super::hold;
 use super::ready::plan_max_age_secs;
 use super::{EstimateContext, Item, ItemKey, ReadyPlan, ReadyRow, Tracker};
 use crate::eta::explanation::{FeatureOmitted, Features};
@@ -89,6 +91,12 @@ pub(super) struct PlanView {
     pr_open_skip: Vec<String>,
     /// Repos (lowercased) whose ready listing failed on the tick.
     unlisted: Vec<String>,
+}
+
+/// Whether `item` is only a ready (`loom:issue`) row: no running sweep, no
+/// PR. Such an item gets `start` estimates and a `queue_rank`.
+pub(super) fn ready_only(item: &Item) -> bool {
+    item.in_ready_queue && !item.sweep_running && item.pr_number.is_none()
 }
 
 fn to_u32(n: usize) -> u32 {
@@ -234,12 +242,10 @@ impl Tracker {
         events: EventLog,
         observed_at: DateTime<Utc>,
     ) {
-        let tracked: BTreeMap<(&str, u32), _> = self
+        let tracked: BTreeMap<(&str, u32), &Item> = self
             .items
             .iter()
-            .filter_map(|(key, item)| {
-                Some(((key.repo.as_str(), item.pr_number?), item.stage.as_ref()?))
-            })
+            .filter_map(|(key, item)| Some(((key.repo.as_str(), item.pr_number?), item)))
             .collect();
         let mut roster = Vec::new();
         let mut scope = Vec::new();
@@ -247,10 +253,9 @@ impl Tracker {
             let repo = repo.to_ascii_lowercase();
             for pr in prs {
                 let stage = stage_from_pr_labels(&pr.labels).ok();
-                let followed = tracked
-                    .get(&(repo.as_str(), pr.number))
-                    .filter(|track| stage == Some(track.stage))
-                    .map(|track| track.entered_at);
+                let followed = stage.and_then(|stage| {
+                    hold::roster_entry(tracked.get(&(repo.as_str(), pr.number))?, stage)
+                });
                 roster.push(RosterEntry {
                     repo: repo.clone(),
                     pr: pr.number,
@@ -321,9 +326,27 @@ impl Tracker {
         }
     }
 
-    /// The features `input_for` records for `item` at `now`, and why each
-    /// null one is null.
-    pub(super) fn features_for(
+    /// The features an estimate of `item` in `current` at `now` records,
+    /// friction included, and why each null one is null: `input_for`'s
+    /// described view and `tracker_hold.rs`'s modeled one (#10284).
+    pub(super) fn recorded_features(
+        &self,
+        key: &ItemKey,
+        item: &Item,
+        current: &CurrentState,
+        ctx: &EstimateContext<'_>,
+        now: DateTime<Utc>,
+    ) -> (Features, Vec<FeatureOmitted>) {
+        let (mut features, mut omitted) =
+            self.features_for(key, item, current, ready_only(item), ctx, now);
+        let labels = (!item.labels.is_empty()).then_some(item.labels.as_slice());
+        self.friction
+            .apply(&item.repo, item.pr_number, labels, now, &mut features, &mut omitted);
+        (features, omitted)
+    }
+
+    /// [`Self::recorded_features`] before friction.
+    fn features_for(
         &self,
         key: &ItemKey,
         item: &Item,

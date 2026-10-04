@@ -121,7 +121,8 @@ fn every_merge_hold_label_is_a_registry_hold_label() {
 /// Every path-engine heuristic. `land-2026-10-04-twin-otter` (#10243) is the
 /// one exception, with its composition `-b` (#10244), which hands every PR
 /// stage to it: they model `merge_hold` from the fit (see
-/// `land_twin_otter::a_held_pr_is_estimated_from_the_fits_merge_hold_stage`).
+/// `land_twin_otter::a_held_pr_is_estimated_from_the_fits_merge_hold_stage`),
+/// and are exactly the heuristics that declare `models_hold` (#10284).
 #[test]
 fn every_shipped_heuristic_refuses_a_held_pr_exactly_as_before() {
     let registry = Registry::builtin();
@@ -131,7 +132,7 @@ fn every_shipped_heuristic_refuses_a_held_pr_exactly_as_before() {
     let (models_hold, path_engine): (Vec<&str>, Vec<&str>) = registry
         .ids()
         .into_iter()
-        .partition(|id| *id == LAND_TWIN_OTTER || *id == LAND_TWIN_OTTER_B);
+        .partition(|id| registry.get(id).unwrap().models_hold());
     assert_eq!(models_hold, vec![LAND_TWIN_OTTER, LAND_TWIN_OTTER_B]);
     assert_eq!(path_engine.len(), 6, "{path_engine:?}");
     for id in path_engine {
