@@ -22,6 +22,51 @@ pub const HUMAN_GATED_LABELS: &[&str] = &["loom:triage", "loom:curating", "loom:
 /// The ready label: approved, not yet dispatched.
 pub const READY_LABEL: &str = "loom:issue";
 
+/// [`pr_flags`] bit 0: an operator hold (`loom:operator`,
+/// `loom:operator-only` or `loom:operator-decision`).
+pub const FLAG_OP_HOLD: u8 = 1;
+/// [`pr_flags`] bit 1: `loom:sequenced`.
+pub const FLAG_SEQUENCED: u8 = 1 << 1;
+/// [`pr_flags`] bit 2: `loom:operator-priority` (the operator's star).
+pub const FLAG_STARRED: u8 = 1 << 2;
+/// [`pr_flags`] bit 3: `loom:merge-conflict`.
+pub const FLAG_CONFLICT: u8 = 1 << 3;
+/// [`pr_flags`] bit 4: `loom:ci-failure`.
+pub const FLAG_CI_FAIL: u8 = 1 << 4;
+/// [`pr_flags`] bit 5: `loom:blocked`.
+pub const FLAG_BLOCKED: u8 = 1 << 5;
+
+/// The operator holds behind [`FLAG_OP_HOLD`]. #10218 (PR #10246) adds the
+/// canonical `MERGE_HOLD_LABELS`; whichever of it and #10243 merges second
+/// points [`pr_flags`] at that constant and deletes this one.
+const OP_HOLD_LABELS: &[&str] = &[
+    "loom:operator",
+    "loom:operator-only",
+    "loom:operator-decision",
+];
+
+/// Each [`pr_flags`] bit and the labels that set it.
+const PR_FLAG_LABELS: [(u8, &[&str]); 6] = [
+    (FLAG_OP_HOLD, OP_HOLD_LABELS),
+    (FLAG_SEQUENCED, &["loom:sequenced"]),
+    (FLAG_STARRED, &["loom:operator-priority"]),
+    (FLAG_CONFLICT, &["loom:merge-conflict"]),
+    (FLAG_CI_FAIL, &["loom:ci-failure"]),
+    (FLAG_BLOCKED, &[BLOCKED_LABEL]),
+];
+
+/// A PR's six model flags as a bit mask ([`FLAG_OP_HOLD`] …
+/// [`FLAG_BLOCKED`]). This is the **one** label → flag definition: the fit's
+/// training rows (#10245) and `land-2026-10-04-twin-otter`'s serving input
+/// (#10243) both call it, so train and serve cannot drift.
+#[must_use]
+pub fn pr_flags(labels: &[String]) -> u8 {
+    PR_FLAG_LABELS
+        .iter()
+        .filter(|(_, set)| labels.iter().any(|l| set.contains(&l.as_str())))
+        .fold(0, |mask, (bit, _)| mask | bit)
+}
+
 /// Every label that holds or parks an item: the work finder's park and skip
 /// sets (minus its own claim label, which is not a hold) and the blocked
 /// listing's hold co-labels.

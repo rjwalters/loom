@@ -54,12 +54,19 @@
 //! produced a number. See [`history`] for the trade-offs and [`fleet`] for the
 //! snapshot's determinism and cost properties.
 //!
-//! # Fitted models (#10221)
+//! # Fitted models (#10221, #10243)
 //!
 //! [`fit`] is the pure core of the daily point-in-time fit (`eta-fit/v1`):
 //! per-stage exit hazards, a censored log-normal direct model and dwell-path
 //! statistics, written as one content-addressed coefficient file that fitted
 //! heuristics load instead of reading fleet history themselves.
+//!
+//! The file is loaded **when the registry is built**, never inside an
+//! estimate: [`Registry::load`] reads the newest fit strictly before an
+//! instant, and [`Registry::with_fit`] is the pure constructor it wraps.
+//! The tracker rebuilds its registry when a later pass finds a fit with a
+//! different id, so a daily refit reaches a running daemon within one pass.
+//! A fitted heuristic with no usable file refuses `no_model`.
 //!
 //! # Versioning
 //!
@@ -109,6 +116,8 @@ pub(crate) mod tests;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::Path;
+use std::sync::Arc;
 
 pub use explanation::Explanation;
 pub use history::StageSamples;
@@ -305,6 +314,10 @@ pub enum NoEstimateReason {
     UnknownStage,
     /// The inputs are too old to describe the present.
     StaleInputs,
+    /// A fitted heuristic (#10243) has no usable coefficient file: none is
+    /// loaded, it has no direct model, its cutoff is not strictly before
+    /// `as_of`, or its coefficients are malformed.
+    NoModel,
 }
 
 impl NoEstimateReason {
@@ -319,6 +332,7 @@ impl NoEstimateReason {
             NoEstimateReason::NoDispatchPlan => "no_dispatch_plan",
             NoEstimateReason::UnknownStage => "unknown_stage",
             NoEstimateReason::StaleInputs => "stale_inputs",
+            NoEstimateReason::NoModel => "no_model",
         }
     }
 }
@@ -548,12 +562,23 @@ pub trait Heuristic: Send + Sync {
 /// Every shipped heuristic, and which one is `current` per kind.
 pub struct Registry {
     heuristics: Vec<Box<dyn Heuristic>>,
+    /// The coefficient file the fitted heuristics were built with.
+    fit: Option<Arc<fit::CoefficientFile>>,
 }
 
 impl Registry {
-    /// The built-in heuristics.
+    /// The built-in heuristics, with no coefficient file: reads nothing, so
+    /// every fitted heuristic refuses `no_model`.
     #[must_use]
     pub fn builtin() -> Self {
+        Self::with_fit(None)
+    }
+
+    /// The built-in heuristics, the fitted ones built with `fit`. Pure.
+    /// `land-2026-10-04-twin-otter` is registered last and **always**, with
+    /// or without a file, so its refusals are on the record too.
+    #[must_use]
+    pub fn with_fit(fit: Option<Arc<fit::CoefficientFile>>) -> Self {
         Registry {
             heuristics: vec![
                 Box::new(heuristics::StartV1),
@@ -562,8 +587,30 @@ impl Registry {
                 Box::new(heuristics::LandV2),
                 Box::new(heuristics::LandV3),
                 Box::new(heuristics::LandAmberHeron),
+                Box::new(heuristics::LandTwinOtter::new(fit.clone())),
             ],
+            fit,
         }
+    }
+
+    /// The built-in heuristics with the newest coefficient file under
+    /// `workspace_root` whose cutoff is strictly before `before`
+    /// ([`fit::load_latest`]). The registry's only I/O.
+    #[must_use]
+    pub fn load(workspace_root: &Path, before: DateTime<Utc>) -> Self {
+        Self::with_fit(fit::load_latest(workspace_root, before).map(Arc::new))
+    }
+
+    /// The coefficient file the fitted heuristics were built with.
+    #[must_use]
+    pub fn fit(&self) -> Option<&fit::CoefficientFile> {
+        self.fit.as_deref()
+    }
+
+    /// That file's id, when there is one.
+    #[must_use]
+    pub fn fit_id(&self) -> Option<&str> {
+        self.fit.as_deref().map(|f| f.id.as_str())
     }
 
     /// Look a heuristic up by id.

@@ -13,7 +13,8 @@
 //!   listing, where an unchanged listing is a free `304`), at most
 //!   [`FORGE_READ_BUDGET`] `pulls/{n}` + `issues/{n}` reads for items whose
 //!   outcome is still unknown, the last work-finder tick's dispatch plan
-//!   ingested as ready items (#9326), history reloaded, the fleet view (every
+//!   ingested as ready items (#9326), history reloaded, the registry rebuilt
+//!   when a newer coefficient file appeared (#10243), the fleet view (every
 //!   listed PR plus the journal's stage events) handed over for the queue
 //!   features (#10201), and every live item re-estimated. An unchanged
 //!   estimate is refreshed every `refreshSecs`.
@@ -49,6 +50,7 @@ use chrono::{DateTime, Utc};
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::eta::calibration_log;
 use crate::eta::config::EtaConfig;
+use crate::eta::fit::{self, CoefficientFile};
 use crate::eta::journal::{self, JournalEntry};
 use crate::eta::queue_features::EventLog;
 use crate::eta::recalibrate::CalibrationObservation;
@@ -438,12 +440,16 @@ pub fn spawn_task(
         tracker.pending().len()
     );
     let shadow = shadow::read_ledger(&shadow::ledger_path(&workspace_root));
+    // #10243: the fitted heuristics' coefficient file, loaded once here and
+    // re-checked on every pass (`record`), never inside an estimate.
+    let registry = Registry::load(&workspace_root, Utc::now());
+    log_fit(None, registry.fit(), &workspace_root);
     *lock() = Some(State {
         tracker,
         turnover: super::ops::turnaround::TurnoverLedger::default(),
         shadow,
         config,
-        registry: Registry::builtin(),
+        registry,
         history: StageSamples::default(),
         repo_ids: BTreeMap::new(),
         workspace_root: workspace_root.clone(),
@@ -678,6 +684,37 @@ async fn estimate_isolated(keys: Option<Vec<ItemKey>>, now: DateTime<Utc>) -> Ve
     .unwrap_or_default()
 }
 
+/// The registry to swap in after a pass loaded `loaded` while the live
+/// registry was built with `registered` (#10243), or `None` to keep it.
+/// Pure, and keyed on the id alone: the same file again swaps nothing; a new
+/// id (the daily refit), or a file appearing or disappearing, rebuilds the
+/// whole registry, which is the same as rebuilding the one fitted heuristic.
+fn swap_fit(registered: Option<&str>, loaded: Option<CoefficientFile>) -> Option<Registry> {
+    if registered == loaded.as_ref().map(|f| f.id.as_str()) {
+        return None;
+    }
+    Some(Registry::with_fit(loaded.map(Arc::new)))
+}
+
+/// Log a change of coefficient file: the new id and cutoff, or one warning
+/// naming the directory when there is none.
+fn log_fit(old: Option<&str>, new: Option<&CoefficientFile>, workspace_root: &Path) {
+    match new {
+        Some(file) => log::info!(
+            "eta: coefficient file {} (as_of {}) loaded for the fitted heuristics, replacing {}",
+            file.id,
+            file.as_of.to_rfc3339(),
+            old.unwrap_or("none")
+        ),
+        None => log::warn!(
+            "eta: no coefficient file under {} (replacing {}); \
+             land-2026-10-04-twin-otter refuses no_model until a fit is written",
+            fit::fit_dir(workspace_root).display(),
+            old.unwrap_or("none")
+        ),
+    }
+}
+
 /// The history one ETA pass estimates from: the `sweep.outcome` journal of
 /// every managed root plus the ETA stage journal, then the configured scope
 /// applied on top (#9343).
@@ -767,7 +804,7 @@ pub(super) async fn record(
         .as_ref()
         .map(|state| state.host_id.clone())
         .unwrap_or_default();
-    let ((history, events), repo_ids) = tokio::task::spawn_blocking(move || {
+    let ((history, events), repo_ids, loaded_fit) = tokio::task::spawn_blocking(move || {
         let ids: BTreeMap<String, u64> = slugs
             .iter()
             .filter_map(|slug| {
@@ -775,7 +812,9 @@ pub(super) async fn record(
                     .map(|id| (slug.to_ascii_lowercase(), id.id))
             })
             .collect();
-        (load_history(&history_roots, &journal_root, &host), ids)
+        // #10243: a daily refit reaches the running estimator here.
+        let loaded_fit = fit::load_latest(&journal_root, listed_at);
+        (load_history(&history_roots, &journal_root, &host), ids, loaded_fit)
     })
     .await
     .unwrap_or_default();
@@ -807,6 +846,10 @@ pub(super) async fn record(
             return;
         };
         state.history = history;
+        if let Some(registry) = swap_fit(state.registry.fit_id(), loaded_fit) {
+            log_fit(state.registry.fit_id(), registry.fit(), &state.workspace_root);
+            state.registry = registry;
+        }
         // #10207: every still-pending base estimate is a censored lower bound
         // for the recalibrating heuristic's point-in-time refit.
         state.history.calibration = calibration_log::combine(

@@ -12,6 +12,7 @@ mod fit_parity;
 mod fleet;
 mod friction;
 mod journal;
+pub(crate) mod land_twin_otter;
 mod land_v3;
 mod offline;
 mod primitives;

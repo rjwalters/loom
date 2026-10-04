@@ -532,7 +532,14 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
 /// [`super::recalibrate::Recalibration`]: the simulation reproduces the base
 /// quantiles, and the recorded ratio distribution moves them exactly as the
 /// heuristic did.
+///
+/// A twin-otter explanation (#10243) has no stage grids: it recomputes
+/// through its own `twin_otter` record (the adapted input, the config and
+/// the model slice) with the seed in `combination`.
 pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)> {
+    if let Some(record) = &explanation.twin_otter {
+        return super::heuristics::recompute_twin_otter(explanation, record);
+    }
     let spec = spec_from_explanation(explanation)?;
     let simulated = run(&spec).ok().map(|s| s.quantiles)?;
     Some(match &explanation.recalibration {
