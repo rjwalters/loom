@@ -907,7 +907,7 @@ fn usage_queries_documented_invocation_binds_exactly_the_parameters_used() {
 
 /// The same coupling for `eta-queries.sql` (#9289, executed against the pinned
 /// engine by `signoz_eta_queries.rs` in #8528). Its sections are `0` plus
-/// `Q1`-`Q3`, so the citation is matched on those tokens rather than on bare
+/// `Q1`-`Q7` (Q4-Q7 since #10233), so the citation is matched on those tokens rather than on bare
 /// digits — and section 0 is cited here, unlike `usage-queries.sql`'s, because
 /// the ETA preflight is the thing that says whether Q1-Q3 rest on anything and
 /// a reader must be sent to it from the table itself.
@@ -929,7 +929,7 @@ fn every_eta_query_section_is_cited_by_a_readme_saved_view() {
         "the SigNoz README's Saved views table cites no `eta-queries.sql` section at all"
     );
     let all = cited.join(" ");
-    for section in ["0", "Q1", "Q2", "Q3"] {
+    for section in ["0", "Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7"] {
         assert!(
             Regex::new(&format!(r"(?m)^-- {}\. ", regex::escape(section)))
                 .unwrap()
