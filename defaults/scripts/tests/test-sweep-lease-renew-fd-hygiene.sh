@@ -10,7 +10,8 @@
 #   (1) a pipe handed to `start` on fds 3 and 7 closes as soon as `start`
 #       returns -- pre-fix, `cat` waits out the loop's first 8s sleep
 #   (2) the loop is still running once the pipe has closed
-#   (3) none of fds 3-8 is open in the loop (fd 9 is its own log)
+#   (3) none of fds 3-8 is open in the loop or its `sleep` child once it has
+#       parked in that sleep (fd 9 is its own log)
 #
 # Bounded: a regression fails in ~8s instead of hanging. The watched PID dies
 # (4s) before the loop's first wake-up (8s), so the loop exits without ever
@@ -63,14 +64,30 @@ LOOP_ALIVE=false
 [[ "$LOOP_PID" =~ ^[0-9]+$ ]] && kill -0 "$LOOP_PID" 2> /dev/null && LOOP_ALIVE=true
 check "$LOOP_ALIVE" "(2) the renewal loop is still running after the pipe closed (pid '${LOOP_PID}')"
 
+# Sample only once the loop is parked in its first `sleep`. Before that, its own
+# `$(ps ... | tr ...)` / `$(date ...)` substitutions briefly open a pipe on the
+# lowest free fd -- 3, now that 3-8 are closed -- which a too-early /proc probe
+# misread as a leak on Linux. An inherited fd persists through the sleep, so it
+# is still caught here, in the loop and in the `sleep` child alike.
+SLEEP_PID=""
+for _ in $(seq 1 30); do
+    SLEEP_PID="$(pgrep -P "$LOOP_PID" -x sleep 2> /dev/null | head -n 1)"
+    [[ -n "$SLEEP_PID" ]] && break
+    sleep 0.1
+done
 HELD=""
-if [[ "$LOOP_ALIVE" == true && -d "/proc/$LOOP_PID/fd" ]]; then
-    for fd in 3 4 5 6 7 8; do [[ -e "/proc/$LOOP_PID/fd/$fd" ]] && HELD+="$fd "; done
-elif [[ "$LOOP_ALIVE" == true ]] && command -v lsof > /dev/null 2>&1; then
-    HELD="$(lsof -a -p "$LOOP_PID" -d 3-8 -F f 2> /dev/null | sed -n 's/^f\([0-9][0-9]*\)$/\1/p' | tr '\n' ' ')"
-fi
+for pid in $LOOP_PID $SLEEP_PID; do
+    [[ "$LOOP_ALIVE" == true ]] || break
+    if [[ -d "/proc/$pid/fd" ]]; then
+        for fd in 3 4 5 6 7 8; do [[ -e "/proc/$pid/fd/$fd" ]] && HELD+="$pid:$fd "; done
+    elif command -v lsof > /dev/null 2>&1; then
+        HELD+="$(lsof -a -p "$pid" -d 3-8 -F f 2> /dev/null | sed -n "s/^f\([0-9][0-9]*\)\$/$pid:\1/p" | tr '\n' ' ')"
+    fi
+done
+check "$([[ -n "$SLEEP_PID" ]] && echo true || echo false)" \
+    "(3a) the loop reached its sleep before fds were sampled (sleep pid '${SLEEP_PID}')"
 check "$([[ "$LOOP_ALIVE" == true && -z "$HELD" ]] && echo true || echo false)" \
-    "(3) the loop holds none of fds 3-8 (held: '${HELD}')"
+    "(3) neither the loop nor its sleep holds any of fds 3-8 (held: '${HELD}')"
 
 echo ""
 echo "Results: $((TESTS_RUN - TESTS_FAILED))/$TESTS_RUN passed"
