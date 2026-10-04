@@ -17,6 +17,7 @@ use super::escalate::{self, Ledger, Notice, Outcome, Target};
 use super::forge::{GhStarForge, StarForge};
 use super::inherit::{self, Inherited};
 use super::intents::{self, AppliedIds, StarIntent};
+use super::levels;
 use super::progress::{self, Tracker, Watched};
 use super::stale;
 use super::Settings;
@@ -229,6 +230,7 @@ impl LivenessState {
                 }
             }
         }
+        let level_step = self.levels(repos, &mut evaluated, settings, host, forges);
         for ((slug, number), at) in &self.unmanaged {
             evaluated.push((None, collect::unmanaged(slug, *number, at.clone())));
         }
@@ -278,6 +280,7 @@ impl LivenessState {
                     stage: e.landing.stage,
                     url: escalate::issue_url(web_base, &repo, issue),
                     inherited_from: e.inherited_from,
+                    level_from: e.level_inherited_from.as_deref(),
                 };
                 match self.ledger.escalate(forge.as_mut(), &target, a) {
                     Ok(Outcome::Posted) => {
@@ -331,6 +334,8 @@ impl LivenessState {
                     .clone()
                     .or_else(|| e.facts.issue.created_at.clone()),
                 last_progress_at: Some(progress_at),
+                level: e.level(),
+                level_inherited_from: e.level_inherited_from.clone(),
             });
         }
         self.tracker.retain(&live, &failed);
@@ -352,7 +357,67 @@ impl LivenessState {
             escalations_posted: posted,
             dropped_intents: self.dropped.iter().cloned().collect(),
             failed_repos: failed,
+            over_cap: level_step.over_cap,
+            unfollowed_blockers: level_step.closure.unfollowed.into_iter().collect(),
         }
+    }
+
+    /// The priority-level step (#10307, [`levels`]): walk every level >= 2
+    /// issue's blockers across the managed repos, write the derived labels,
+    /// annotate the rows the star pass already has and add the rest, and
+    /// publish the in-memory twin for the work finder.
+    fn levels(
+        &mut self,
+        repos: &[RepoInput],
+        evaluated: &mut Vec<(Option<PathBuf>, Evaluated)>,
+        settings: Settings,
+        host: &str,
+        forges: &mut ForgeFactory<'_>,
+    ) -> levels::Outcome {
+        let key = |e: &Evaluated| (e.facts.repo.clone(), e.facts.issue.number);
+        let managed_rows = || evaluated.iter().filter(|(root, _)| root.is_some());
+        let landing: HashMap<levels::Key, Vec<u32>> = managed_rows()
+            .map(|(_, e)| (key(e), e.landing.inherits.clone()))
+            .collect();
+        let starred_at: HashMap<levels::Key, Option<String>> = managed_rows()
+            .map(|(_, e)| (key(e), e.starred_at.clone()))
+            .collect();
+        let refs: Vec<levels::RepoRef> = repos
+            .iter()
+            .map(|r| (r.slug.clone(), r.root.clone()))
+            .collect();
+        let caps = settings.level_caps;
+        let mut outcome = levels::run(
+            &refs,
+            &mut *forges,
+            &landing,
+            &starred_at,
+            &|level| caps.cap(level),
+            settings.escalate,
+            host,
+        );
+        for (k, row) in std::mem::take(&mut outcome.rows) {
+            let have = evaluated
+                .iter_mut()
+                .find(|(root, e)| root.is_some() && key(e) == k);
+            if let Some((_, e)) = have {
+                e.level_inherited_from = row.level_inherited_from;
+                e.inherited_level = row.inherited_level;
+            } else {
+                let root = repos.iter().find(|r| r.slug == k.0).map(|r| r.root.clone());
+                evaluated.push((root, row));
+            }
+        }
+        for repo in repos {
+            let items = outcome
+                .items
+                .iter()
+                .filter(|(k, _)| k.0 == repo.slug)
+                .map(|(_, item)| item.clone())
+                .collect();
+            inherit::publish_levels(&repo.root, items);
+        }
+        outcome
     }
 }
 
@@ -452,13 +517,17 @@ impl LivenessState {
     }
 }
 
-/// Starred rows by starred-at (then repo, issue); each inheriting blocker
-/// right after the issue it inherits from.
-fn order_rows(rows: Vec<StarLandingRow>) -> Vec<StarLandingRow> {
+/// Starred rows by level (highest first, #10307), then starred-at (then
+/// repo, issue); each inheriting blocker right after the issue it inherits
+/// from. A blocker that inherits a level and needs the operator
+/// (`loom:operator-only` / `loom:operator-decision`) leads the digest:
+/// often what blocks the operator's top issue is the operator.
+pub(crate) fn order_rows(rows: Vec<StarLandingRow>) -> Vec<StarLandingRow> {
     let (mut roots, children): (Vec<_>, Vec<_>) =
         rows.into_iter().partition(|r| r.inherited_from.is_none());
     roots.sort_by(|a, b| {
-        (&a.operator_priority_at, &a.repo, a.issue).cmp(&(
+        (std::cmp::Reverse(a.level), &a.operator_priority_at, &a.repo, a.issue).cmp(&(
+            std::cmp::Reverse(b.level),
             &b.operator_priority_at,
             &b.repo,
             b.issue,
@@ -482,7 +551,14 @@ fn order_rows(rows: Vec<StarLandingRow>) -> Vec<StarLandingRow> {
         }
     }
     out.extend(pending);
-    out
+    let (mut first, rest): (Vec<_>, Vec<_>) = out.into_iter().partition(|r| {
+        r.level_inherited_from.is_some()
+            && r.ask.as_ref().is_some_and(|a| {
+                matches!(a.kind, AskKind::OperatorOnly | AskKind::OperatorDecision)
+            })
+    });
+    first.extend(rest);
+    first
 }
 
 /// This host's pool exhaustion for `root`, from the work finder's pool holds.

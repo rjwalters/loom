@@ -34,6 +34,10 @@ pub struct Repo {
     pub fail_remove: Vec<String>,
     /// Make every `post_comment` fail.
     pub fail_post: bool,
+    /// Native "blocked by" dependencies per issue (#10307).
+    pub blocked_by: BTreeMap<u32, Vec<(String, u32)>>,
+    /// Label writes made through the fake: (number, "+label" / "-label").
+    pub label_writes: Vec<(u32, String)>,
 }
 
 /// A forge world: repos by slug.
@@ -126,8 +130,19 @@ impl StarForge for FakeForge {
             .collect())
     }
 
+    fn blocked_by(&mut self, number: u32) -> Result<Vec<(String, u32)>> {
+        Ok(self
+            .world
+            .repo(&self.slug)
+            .blocked_by
+            .get(&number)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     fn add_label(&mut self, number: u32, label: &str) -> Result<()> {
         let mut repo = self.world.repo(&self.slug);
+        repo.label_writes.push((number, format!("+{label}")));
         let item = repo
             .items
             .get_mut(&number)
@@ -143,6 +158,7 @@ impl StarForge for FakeForge {
         if repo.fail_remove.iter().any(|l| l == label) {
             return Err(anyhow!("removing {label} from #{number} failed"));
         }
+        repo.label_writes.push((number, format!("-{label}")));
         if let Some(item) = repo.items.get_mut(&number) {
             item.labels.retain(|l| l != label);
         }
