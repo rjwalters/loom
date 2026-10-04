@@ -358,6 +358,22 @@ drops `features`, then the stage grids, then the stage marks, then every
 remaining list (`detail`), stopping as soon as it fits, and names each drop
 in `truncated`.
 
+**Queue-friction features (#10193)** are logged on every estimate so a fitted
+model can be tested against the heuristics once ~14 days of them exist:
+`repo_open_prs`, `repo_pr_open_lockout` (the work finder's last tick had a
+`pr-open-skip` row, or an `open_pr_backoff` row inside the window that skip arms, for the repo; `nothing_ready` if it had no ready row), `repo_ci_typical_duration_sec` (median of
+the repo's PR workflow runs that finished before the read, last 7 days),
+`pr_ci_status` (`passing`/`failing`/`pending`/`none`), `pr_behind_main`,
+`pr_merge_conflict`, `operator_hold`, plus `repo_friction_observed_at` /
+`pr_friction_observed_at`, the instants they were read. They are additive
+`serde(default)` fields, so older v1 payloads still parse and the schema is not
+bumped. Each pass reads them **before** its `as_of` with ETag-conditional
+REST reads (`observability::eta_friction`: per repo at most every 15 min, per
+PR at most every 10 min, 12 PRs a pass); a reading taken after `as_of`, older
+than an hour, or that failed is omitted with its reason (`read_after_as_of`,
+`stale_reading`, `read_failed`, `no_pr`, `not_read_yet`, …), never defaulted.
+No heuristic reads them.
+
 ### Role-attempt stages: which percentile to read (#9420)
 
 **Read `stages[].distribution.p50` directly.** Every percentile in an
@@ -677,11 +693,12 @@ items which are not in it at all.
 
 ## CLI (`loom-daemon eta`)
 
-Six subcommands. All are read-only except `eta promote --apply`, which writes
+Seven subcommands. All are read-only except `eta promote --apply`, which writes
 one config key, and `eta fleet backfill|refresh`, which writes only the
 snapshot cache; nothing here writes an estimate to the journal or telemetry —
-that is the tracker's job, described above. Every subcommand also accepts
-`--repo-root PATH` (default: the current directory).
+that is the tracker's job, described above. Every subcommand but `offline`
+(which reads only its `--input`) also accepts `--repo-root PATH` (default: the
+current directory).
 
 - **`loom-daemon eta backfill [--repo OWNER/NAME] [--limit N] [--dry-run]`** —
   seeds `.loom/logs/eta-stage-samples.jsonl` from `pr-latency`'s own
@@ -749,6 +766,23 @@ that is the tracker's job, described above. Every subcommand also accepts
     form to hand another host.
   - `--as-of` pins the instant the snapshot describes; two hosts that pass the
     same `--as-of` against the same forge state get byte-identical files.
+
+- **`loom-daemon eta offline --input PATH --now RFC3339 [--baseline land-v2] [--train-days 14] [--selection-folds 2] [--reported-folds 2] [--margin-secs 120] [--resamples 1000] [--export PATH] [--json]`**
+  — the #10193 offline comparison on **logged** `eta.estimate` /
+  `eta.outcome` lines (JSONL of `{observed_at, event, body}` exported from
+  the log store). Strict temporal separation (`eta::offline` module doc):
+  every record is keyed by when it became knowable (`observed_at` + margin),
+  training labels are censored at each fold's cutoff, every fitted transform
+  comes from the fold's training rows, and the builder asserts each fold
+  point-in-time. Walk-forward daily folds: settings are chosen per model
+  family (Kaplan–Meier reference, linear quantile regression with
+  inverse-probability-of-censoring weights) on the two folds before
+  `now − 48h`, then each frozen model is scored once against the baseline's
+  own logged estimates on identical rows of the last 48h, still-open items
+  included as censored. Reports truncated pinball loss, landed MAE/bias and
+  25–75% coverage with issue-bootstrap 95% CIs. No random or k-fold split
+  exists; the future-invariance test pins that post-cutoff records cannot
+  move a fit.
 
 `view` and `list` also take `--scope local|augment|fleet`, overriding
 `autonomous.eta.historyScope` for one invocation. Neither makes a forge call to

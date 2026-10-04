@@ -284,6 +284,9 @@ pub struct Tracker {
     cap_dropped: usize,
     /// The last pass's fleet view and dispatch plan, for `features` (#10201).
     context: features::PassContext,
+    /// Latest queue-friction readings (#10193), copied onto every estimate's
+    /// features. Filled by the caller's forge reads, never by the tracker.
+    pub friction: super::friction::FrictionBook,
 }
 
 /// What [`Tracker::drain_dropped`] reports.
@@ -316,6 +319,7 @@ impl Tracker {
             orphaned: 0,
             cap_dropped: 0,
             context: features::PassContext::default(),
+            friction: super::friction::FrictionBook::default(),
         }
     }
 
@@ -1121,8 +1125,11 @@ impl Tracker {
             Subject::new(&item.repo, ctx.repo_ids.get(&key.repo).copied(), item.issue);
         subject.pr_number = item.pr_number;
         subject.sweep_id = item.sweep_id.clone().filter(|_| item.sweep_running);
-        let (features, omitted) =
+        let (mut features, mut omitted) =
             self.features_for(key, item, &current, ready_only, ctx.host_id, now);
+        let labels = (!item.labels.is_empty()).then_some(item.labels.as_slice());
+        self.friction
+            .apply(&item.repo, item.pr_number, labels, now, &mut features, &mut omitted);
         Some(EstimateInput {
             subject,
             as_of: now,

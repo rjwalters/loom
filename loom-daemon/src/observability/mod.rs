@@ -106,6 +106,7 @@ pub mod collector;
 pub mod daemon_event;
 pub mod endpoint_policy;
 pub mod eta;
+mod eta_friction;
 pub mod eta_snapshot;
 pub mod exporter;
 pub mod lifecycle;
