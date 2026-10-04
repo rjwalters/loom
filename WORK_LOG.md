@@ -7,6 +7,19 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 ### 2026-10-04
+- **PR #10172**: fix(forge-inventory): baseline operator_decision/cli.rs growth (3 -> 4)
+- **Issue #10171** (closed): Main red: forge_inventory baseline missing operator_decision/cli.rs growth (3 -> 4)
+- **PR #10160**: feat(park-record): park-record apply writes the body park record before loom:blocked
+- **PR #10157**: feat(install): alias /star to /loom:star via user-scope symlink (#10154)
+- **Issue #10154** (closed): provision-skills: make /star a user-scope alias of /loom:star (symlink, or a progressive-disclosure stub)
+- **Issue #10152** (closed): Applying loom:blocked must write a park record in the body, not only a prose comment
+- **PR #10094**: refactor(labels): derive work-finder and hard-exclusion sets from the registry (#10013 slice 2a)
+- **PR #10093**: feat(merge-pr): port the worktree-removal identity gate to Rust (#8191 slice)
+- **PR #10090**: fix(observability): VALUES instead of >5-term UNION ALL so landed-size.sql runs on D1; guard the limit in CI
+- **Issue #10066** (closed): landed-size.sql fails on D1: 6-term UNION ALL exceeds D1's 5-term compound SELECT limit (LSI can't go live)
+- **PR #9955**: mcp: daemon_status tool — the agent relay for telemetry warnings (#9950)
+- **PR #9832**: feat(forge): version the forge operation inventory and enforce coverage accounting
+- **Issue #9777** (closed): Forge qualification: version the operation inventory and enforce coverage accounting
 - **PR #10153**: feat(session-output): attended live output for top-level /loom:<role> turns
 - **PR #10144**: fix(lease-renew): export LOOM_SWEEP_ID/LOOM_ROLE so renewer gh calls are attributable
 - **PR #10143**: fix(create-issue,create-pr): name the cause when the dashboard footer step fails (#10140)
