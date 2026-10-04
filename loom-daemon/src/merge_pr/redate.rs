@@ -93,6 +93,7 @@ use crate::gh_invocation::gh_bin;
 
 pub mod attribution;
 pub mod budget;
+pub mod chain_telemetry;
 pub mod report;
 pub use attribution::Attribution;
 pub use budget::{BudgetConfig, BudgetDecision};

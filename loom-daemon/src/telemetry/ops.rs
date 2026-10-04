@@ -224,6 +224,20 @@ pub enum MetricName {
     /// (over the per-call row cap) — Issue #9222.
     #[serde(rename = "loom.queue.disposition_rows_dropped")]
     QueueDispositionRowsDropped,
+    // ---- Merge-chain re-date pressure (Issue #10163) ----------------------
+    /// PRs with at least one #8508 re-date commit in the trailing window,
+    /// labelled `state` = `landed` / `pending` / `stuck` (pending with at
+    /// least the default re-date budget spent). Never labelled by PR.
+    #[serde(rename = "loom.merge.redate_prs")]
+    MergeRedatePrs,
+    /// Most re-dates any one PR took in the trailing window, labelled `state`
+    /// = `landed` / `pending`.
+    #[serde(rename = "loom.merge.redates_max")]
+    MergeRedatesMax,
+    /// Longest first-re-date-to-landing time among PRs that landed in the
+    /// trailing window.
+    #[serde(rename = "loom.merge.time_to_land_max")]
+    MergeTimeToLandMax,
 }
 
 impl MetricName {
@@ -265,6 +279,9 @@ impl MetricName {
             Self::ForgeStageDwellSamples => "loom.forge.stage_dwell.samples",
             Self::ForgeStageItems => "loom.forge.stage_items",
             Self::QueueDispositionRowsDropped => "loom.queue.disposition_rows_dropped",
+            Self::MergeRedatePrs => "loom.merge.redate_prs",
+            Self::MergeRedatesMax => "loom.merge.redates_max",
+            Self::MergeTimeToLandMax => "loom.merge.time_to_land_max",
         }
     }
 
@@ -320,6 +337,9 @@ impl MetricName {
             Self::DispatchSlotTurnaroundSamples | Self::DispatchIdleSlots => "{slot}",
             Self::ForgeStageDwellSamples | Self::ForgeStageItems => "{item}",
             Self::QueueDispositionRowsDropped => "{issue}",
+            Self::MergeRedatePrs => "{pull_request}",
+            Self::MergeRedatesMax => "{redate}",
+            Self::MergeTimeToLandMax => "s",
             _ => "By",
         }
     }
@@ -369,6 +389,11 @@ impl MetricName {
             Self::ForgeStageItems => "Open items carrying a stage label, by state.",
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
+            }
+            Self::MergeRedatePrs => "PRs re-dated in the trailing window, by landing state.",
+            Self::MergeRedatesMax => "Most re-dates on one PR in the trailing window, by state.",
+            Self::MergeTimeToLandMax => {
+                "Longest first-re-date-to-landing time of a PR landed in the window."
             }
         }
     }
