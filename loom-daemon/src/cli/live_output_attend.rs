@@ -10,7 +10,8 @@
 //! an operator's main agent is refused with a reason (#10129).
 //!
 //! **Always exits 0.** With live output not configured it does nothing and
-//! says why in one stderr line. The logic lives in
+//! says why in one stderr line, also kept in
+//! `.loom/logs/live-output-attended/last-start.log` (#10125). The logic lives in
 //! `loom_daemon::observability::session_output::attended`.
 
 use std::path::PathBuf;

@@ -67,7 +67,9 @@
 //! and an OTLP exporter are
 //! configured, and skipped outright for a daemon-dispatched child, whose
 //! output the daemon already publishes. Like the lease, it never fails or
-//! delays the claim.
+//! delays the claim. Because `worktree.sh` discards this stderr, the outcome
+//! line is also kept in `.loom/logs/live-output-attended/last-start.log`
+//! (#10125).
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};

@@ -1346,6 +1346,9 @@ The rest of the identity is shared: `loom.repo`, `loom.issue`, `loom.role`,
 `.sequence` / `.event_id`. An attended run's `loom.repo` is the claim
 checkout's `origin` remote, never the transcript's `cwd`. A payload queued
 before #10116 carries no `launch` and decodes as `daemon`, which is what it was.
+A record already exported before #10116 has no `loom.session.output.launch`
+attribute at all; it too came from the daemon, so a consumer filtering on
+`launch = daemon` should treat an absent attribute as `daemon`.
 The attended tailer refuses to start in a process tree the daemon launched
 (`LOOM_WORK_ORIGIN=autonomous`, `LOOM_SWEEP_ID`), so one run never appears
 under both values.
