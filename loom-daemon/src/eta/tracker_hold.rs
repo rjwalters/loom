@@ -51,7 +51,7 @@
 use super::{Effects, Item, ItemKey, PrState, PrView, StageTrack, Tracker};
 use crate::eta::journal::JournalEntry;
 use crate::eta::labels::stage_from_pr_labels;
-use crate::eta::{AgeSource, CurrentStage, NoEstimateReason, Stage};
+use crate::eta::{AgeSource, CurrentStage, CurrentState, NoEstimateReason, Stage};
 use chrono::{DateTime, Utc};
 
 /// One item's hold overlay.
@@ -88,6 +88,20 @@ pub(super) fn episode_entered_at(item: &Item) -> Option<DateTime<Utc>> {
     item.hold
         .released_at
         .filter(|at| pooled.stage == Stage::MergeWait && *at > pooled.entered_at)
+}
+
+/// The state an item's `features` (#10201) describe. A held item is the
+/// `blocked` refusal it was before #10218, so its stage-dependent queue
+/// features stay omitted as `no_stage` and every shipped heuristic's refusal
+/// of it, `features` included, is byte-identical to its refusal of a held PR
+/// before the stage existed.
+pub(super) fn described(current: &CurrentState) -> CurrentState {
+    match current {
+        CurrentState::At(held) if held.stage == Stage::MergeHold => {
+            CurrentState::Refused(NoEstimateReason::Blocked)
+        }
+        other => other.clone(),
+    }
 }
 
 #[cfg(test)]

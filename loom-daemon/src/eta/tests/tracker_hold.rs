@@ -323,3 +323,50 @@ fn a_non_operator_hold_on_an_approved_pr_is_still_only_a_refusal() {
         .unwrap();
     assert_eq!(input.current, CurrentState::Refused(NoEstimateReason::Blocked));
 }
+
+/// #10201 × #10218: a held PR's recorded features are those of the `blocked`
+/// refusal it was before the hold had a stage, so a shipped heuristic's
+/// refusal of it stays byte-identical, `features` included. A `loom:blocked`
+/// PR is that refusal; only the label lists differ.
+#[test]
+fn a_held_prs_features_are_those_of_its_blocked_refusal() {
+    use crate::eta::queue_features::{reason, EventLog};
+    use crate::eta::tracker::ListedPr;
+
+    let input_with = |labels: &[&str]| {
+        let mut h = approved();
+        h.list(labels, 550, 600);
+        let listed = ListedPr {
+            number: 501,
+            labels: labels.iter().map(|s| (*s).to_string()).collect(),
+            updated_at: Some(t(550)),
+        };
+        h.tracker.on_fleet_context(
+            &[(REPO.to_string(), vec![listed])],
+            EventLog::default(),
+            t(650),
+        );
+        h.tracker
+            .land_input(&Harness::key(), &h.ctx(), t(700))
+            .expect("a land input")
+    };
+    let held = input_with(&[PR, OP]);
+    let blocked = input_with(&[PR, "loom:blocked"]);
+    assert!(matches!(&held.current, CurrentState::At(c) if c.stage == Stage::MergeHold));
+    assert_eq!(blocked.current, CurrentState::Refused(NoEstimateReason::Blocked));
+
+    // The fleet view lists the held PR in `merge_hold`, yet its own
+    // stage-dependent queue features stay omitted, as for any refusal.
+    assert_eq!(held.features.n_stage_repo, None);
+    assert!(held
+        .features_omitted
+        .iter()
+        .any(|o| o.name == "n_stage_repo" && o.reason == reason::NO_STAGE));
+    let without_labels = |input: &crate::eta::EstimateInput| {
+        let mut features = input.features.clone();
+        features.labels = None;
+        features
+    };
+    assert_eq!(without_labels(&held), without_labels(&blocked));
+    assert_eq!(held.features_omitted, blocked.features_omitted);
+}

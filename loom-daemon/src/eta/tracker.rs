@@ -1137,8 +1137,9 @@ impl Tracker {
             Subject::new(&item.repo, ctx.repo_ids.get(&key.repo).copied(), item.issue);
         subject.pr_number = item.pr_number;
         subject.sweep_id = item.sweep_id.clone().filter(|_| item.sweep_running);
+        let described = hold::described(&current);
         let (mut features, mut omitted) =
-            self.features_for(key, item, &current, ready_only, ctx, now);
+            self.features_for(key, item, &described, ready_only, ctx, now);
         let labels = (!item.labels.is_empty()).then_some(item.labels.as_slice());
         self.friction
             .apply(&item.repo, item.pr_number, labels, now, &mut features, &mut omitted);
