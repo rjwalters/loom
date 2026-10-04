@@ -706,6 +706,7 @@ async fn handle_health(
         // `tmpfs_visibility` section renders here.
         tmpfs_visibility: None,
         ci_telemetry: None,
+        inbox_mail: None,
     });
 
     let mut body = serde_json::to_value(&health)?;

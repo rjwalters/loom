@@ -222,6 +222,7 @@ pub mod host_breaker;
 pub mod host_pressure;
 pub mod hyperparams;
 pub mod idle_exit;
+pub mod inbox_config;
 pub mod inflight;
 pub mod init;
 pub mod install_self_check;

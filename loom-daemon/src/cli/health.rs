@@ -438,6 +438,8 @@ async fn collect(window: Duration) -> HealthReport {
         tmpfs_visibility: tmpfs_visibility_status,
         // 11. CI-telemetry poller health (#9014) — local status.json read.
         ci_telemetry: Some(loom_daemon::ci_telemetry::collect_health(&transcript_ingest_repo_root)),
+        // 12. Mail config on a mail-meant host (#10137) -- local env/file reads.
+        inbox_mail: loom_daemon::inbox_config::collect_health(&transcript_ingest_repo_root),
     })
 }
 
