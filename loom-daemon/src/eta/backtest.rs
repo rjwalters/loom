@@ -377,7 +377,7 @@ pub struct BacktestReport {
     /// predicted `p50`).
     pub by_horizon: BTreeMap<String, Bucket>,
     /// How far the predicted landing instant moves between consecutive
-    /// answered cases of one series (#10233). Diagnostic; not a gate.
+    /// cases of one series that both answered (#10233). Diagnostic; not a gate.
     #[serde(default)]
     pub stability: Stability,
     /// Interval width per bucket of the actual lead (#10233). Diagnostic;

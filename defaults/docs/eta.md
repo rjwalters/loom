@@ -292,11 +292,12 @@ fixture. A behaviour change is a new id registered beside the old one
    interval as the live gate. Each report also carries two diagnostics that
    do not gate:
    - **stability**: the median and maximum shift of the predicted landing
-     *instant* (`as_of + p50`) between consecutive answered cases of one
-     series (repo, issue, sweep). This is measured on the instant, not on
-     remaining seconds, so a steady promise reads as 0. In a replay the
-     consecutive cases are consecutive stage entries, so this is how far
-     the promise moves as the work advances.
+     *instant* (`as_of + p50`) between consecutive cases of one series
+     (repo, issue, sweep) that both answered; a refusal between two answers
+     breaks the pair rather than being skipped. This is measured on the
+     instant, not on remaining seconds, so a steady promise reads as 0. In
+     a replay the consecutive cases are consecutive stage entries, so this
+     is how far the promise moves as the work advances.
    - **convergence**: the median p25–p75 and p25–p90 widths of scored cases
      per bucket of the actual lead.
 3. **Let it run in shadow** — from the moment it is registered, the tracker

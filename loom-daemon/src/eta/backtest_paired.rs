@@ -42,7 +42,8 @@ pub(super) struct Replayed {
 }
 
 /// How far the predicted landing **instant** (`as_of + p50`) moves between
-/// consecutive answered cases of one series (repo, issue, sweep), in seconds.
+/// consecutive cases of one series (repo, issue, sweep) that both answered, in
+/// seconds. A refusal between two answers breaks the pair; it is not skipped.
 ///
 /// Measured on the instant, not on remaining seconds: a perfectly steady ETA
 /// loses one second of remaining time per second, which a remaining-seconds
@@ -52,7 +53,7 @@ pub(super) struct Replayed {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Stability {
-    /// Consecutive answered pairs measured.
+    /// Consecutive pairs measured where both cases answered.
     pub steps: usize,
     /// Median absolute shift of the predicted instant, seconds.
     pub median_shift_sec: Option<f64>,
@@ -82,7 +83,7 @@ fn median(mut values: Vec<i64>) -> Option<f64> {
     }
     values.sort_unstable();
     let mid = values.len() / 2;
-    Some(if values.len() % 2 == 0 {
+    Some(if values.len().is_multiple_of(2) {
         (values[mid - 1] as f64 + values[mid] as f64) / 2.0
     } else {
         values[mid] as f64
