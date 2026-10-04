@@ -1138,7 +1138,7 @@ impl Tracker {
         subject.pr_number = item.pr_number;
         subject.sweep_id = item.sweep_id.clone().filter(|_| item.sweep_running);
         let (features, omitted) =
-            self.recorded_features(key, item, &hold::described(&current), ctx, now);
+            self.recorded_features(key, item, &hold::described(&current), ctx, now, false);
         Some(EstimateInput {
             subject,
             as_of: now,
@@ -1216,7 +1216,9 @@ impl Tracker {
                     .collect();
                 for heuristic in ordered {
                     let (input, signature) = match &modeled {
-                        Some((view, held)) if heuristic.models_hold() => (view, *held),
+                        Some((view, held)) if heuristic.models_hold() => {
+                            (view, held.unwrap_or(signature))
+                        }
                         _ => (&input, signature),
                     };
                     let series = (kind, heuristic.id().to_string());

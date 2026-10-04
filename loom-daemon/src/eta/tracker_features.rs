@@ -27,6 +27,10 @@
 //!   its hold entry, #10284), otherwise the listing's `updated_at` (a lower
 //!   bound). So `ahead` is approximate for first-seen PRs until exact entry
 //!   times come from the label stream (#10218).
+//! - A hold-aware model reads the **episode roster** captured beside the
+//!   roster (#10312): a tracked `merge_wait` PR released from a hold enters
+//!   at its release, as training's split episode does. A PR the tracker
+//!   does not follow keeps the `updated_at` lower bound there too.
 //! - The journal records only PRs this host tracks, which are the PRs that
 //!   close an issue. Departures and merges of other PRs are not counted.
 //! - The log's `from` is the journal's oldest row. Daemon downtime inside
@@ -73,6 +77,10 @@ pub struct ListedPr {
 #[derive(Debug, Clone)]
 struct FleetView {
     roster: Vec<RosterEntry>,
+    /// The roster as a hold-aware model's training sees it (#10312): a
+    /// tracked released `merge_wait` PR enters at its release. Captured with
+    /// `roster`, from the tracker's state at the same observation.
+    episode_roster: Vec<RosterEntry>,
     events: EventLog,
     scope: Vec<String>,
     observed_at: DateTime<Utc>,
@@ -248,15 +256,14 @@ impl Tracker {
             .filter_map(|(key, item)| Some(((key.repo.as_str(), item.pr_number?), item)))
             .collect();
         let mut roster = Vec::new();
+        let mut episode_roster = Vec::new();
         let mut scope = Vec::new();
         for (repo, prs) in listings {
             let repo = repo.to_ascii_lowercase();
             for pr in prs {
                 let stage = stage_from_pr_labels(&pr.labels).ok();
-                let followed = stage.and_then(|stage| {
-                    hold::roster_entry(tracked.get(&(repo.as_str(), pr.number))?, stage)
-                });
-                roster.push(RosterEntry {
+                let item = tracked.get(&(repo.as_str(), pr.number));
+                let entry = |followed: Option<DateTime<Utc>>| RosterEntry {
                     repo: repo.clone(),
                     pr: pr.number,
                     stage,
@@ -265,12 +272,23 @@ impl Tracker {
                         .unwrap_or(observed_at)
                         .min(observed_at),
                     known_at: observed_at,
-                });
+                };
+                let followed = |episode: bool| {
+                    let (item, stage) = (item?, stage?);
+                    if episode {
+                        hold::episode_roster_entry(item, stage)
+                    } else {
+                        hold::roster_entry(item, stage)
+                    }
+                };
+                roster.push(entry(followed(false)));
+                episode_roster.push(entry(followed(true)));
             }
             scope.push(repo);
         }
         self.context.fleet = Some(FleetView {
             roster,
+            episode_roster,
             events,
             scope,
             observed_at,
@@ -281,10 +299,25 @@ impl Tracker {
     /// observed before `as_of`.
     #[must_use]
     pub fn queue_features_at(&self, subject: &QueueSubject, as_of: DateTime<Utc>) -> QueueFeatures {
+        self.queue_features_view(subject, as_of, false)
+    }
+
+    /// [`Self::queue_features_at`] for the described view (`episode` false)
+    /// or the modeled one (`episode` true, #10312: the episode roster).
+    fn queue_features_view(
+        &self,
+        subject: &QueueSubject,
+        as_of: DateTime<Utc>,
+        episode: bool,
+    ) -> QueueFeatures {
         match &self.context.fleet {
             Some(view) if view.observed_at < as_of => queue_features::queue_features(
                 subject,
-                &view.roster,
+                if episode {
+                    &view.episode_roster
+                } else {
+                    &view.roster
+                },
                 &view.events,
                 &view.scope,
                 as_of,
@@ -336,9 +369,9 @@ impl Tracker {
         current: &CurrentState,
         ctx: &EstimateContext<'_>,
         now: DateTime<Utc>,
+        episode: bool,
     ) -> (Features, Vec<FeatureOmitted>) {
-        let (mut features, mut omitted) =
-            self.features_for(key, item, current, ready_only(item), ctx, now);
+        let (mut features, mut omitted) = self.features_for(key, item, current, ctx, now, episode);
         let labels = (!item.labels.is_empty()).then_some(item.labels.as_slice());
         self.friction
             .apply(&item.repo, item.pr_number, labels, now, &mut features, &mut omitted);
@@ -351,10 +384,11 @@ impl Tracker {
         key: &ItemKey,
         item: &Item,
         current: &CurrentState,
-        ready_only: bool,
         ctx: &EstimateContext<'_>,
         now: DateTime<Utc>,
+        episode: bool,
     ) -> (Features, Vec<FeatureOmitted>) {
+        let ready_only = ready_only(item);
         let mut features = Features {
             labels: (!item.labels.is_empty()).then(|| item.labels.clone()),
             doctor_cycles_so_far: Some(item.rework_rounds),
@@ -389,11 +423,20 @@ impl Tracker {
             repo: key.repo.clone(),
             pr: item.pr_number,
             current: match current {
-                CurrentState::At(stage) => stage.entered_at.map(|at| (stage.stage, at)),
+                CurrentState::At(stage) => stage.entered_at.map(|at| {
+                    (
+                        stage.stage,
+                        if episode {
+                            stage.episode_entered_at.unwrap_or(at)
+                        } else {
+                            at
+                        },
+                    )
+                }),
                 CurrentState::Refused(_) => None,
             },
         };
-        self.queue_features_at(&subject, now)
+        self.queue_features_view(&subject, now, episode)
             .write_to(&mut features, &mut omitted);
         self.item_features(key, item, ctx.history, now, &mut features, &mut omitted);
         (features, omitted)
