@@ -28,10 +28,14 @@
 //!    covers a claim step that never spells the issue number, such as the
 //!    Doctor's `worktree.sh "$ISSUE_NUM"`. Zero or several matches start
 //!    nothing.
-//! 3. **Subagents only.** A top-level session's transcript (a person's
-//!    `/loom:builder 42`, or an operator's main agent claiming inline) goes on
-//!    to carry the session's later, unrelated work. It is refused with a
-//!    recorded reason (#10129).
+//! 3. **Top-level sessions, only for a slash-command turn.** A top-level
+//!    transcript is the whole conversation, so it is followed only when the
+//!    turn holding the claim was opened by a `/loom:<role>` command whose
+//!    arguments name the issue ([`turn`]), on top of the parent-shell binding
+//!    in 2. The run then ends at that turn's next prompt. An operator's main
+//!    agent claiming inline, in a turn no such command opened, can run for
+//!    hours across many issues and repos with no prompt to end it, so it is
+//!    refused with a recorded reason (#10129).
 //! 4. **Which lines.** The run owns its transcript from the claim line up to
 //!    the agent's next task: a prompt from outside, such as a coordinator's
 //!    message, or a newer claim on the same transcript ([`segment`]). A claim
@@ -86,6 +90,8 @@ use serde_json::Value;
 pub mod caller;
 #[path = "attended_segment.rs"]
 pub mod segment;
+#[path = "attended_turn.rs"]
+pub mod turn;
 
 use caller::Caller;
 use segment::{Claim, Segment};
@@ -665,10 +671,10 @@ pub enum Outcome {
     NoSession,
     /// The calling agent's transcript could not be identified.
     NotLocated(String),
-    /// The caller is a top-level session, not a subagent. Its transcript
-    /// goes on to carry the session's later, unrelated work, so it is not
-    /// followed (#10129).
-    TopLevelSession,
+    /// The caller is a top-level session whose turn no `/loom:<role>` command
+    /// naming the issue opened (or whose transcript was named without a
+    /// proven binding). The reason is recorded in the diagnostic (#10129).
+    TopLevelSession(String),
     /// A tailer already follows this claim, or (for a tailer) the older one
     /// never let go of the transcript.
     AlreadyRunning,
@@ -700,10 +706,10 @@ impl Outcome {
                 "issue #{issue}: not publishing live output, this agent's transcript was not \
                  identified: {why}"
             ),
-            Outcome::TopLevelSession => format!(
-                "issue #{issue}: not publishing live output, the caller is a top-level session, \
-                 whose transcript goes on to carry the session's later, unrelated work; only a \
-                 subagent's transcript is followed (rjwalters/loom#10129)"
+            Outcome::TopLevelSession(why) => format!(
+                "issue #{issue}: not publishing live output, the caller is a top-level session \
+                 and {why}; only a subagent, or a turn a /loom:<role> command naming the issue \
+                 opened, is followed (rjwalters/loom#10129)"
             ),
             Outcome::AlreadyRunning => {
                 format!("issue #{issue}: a live-output tailer already follows this claim")
@@ -785,7 +791,16 @@ fn start_with(
         }
     };
     if located.is_top_level() {
-        return Outcome::TopLevelSession;
+        // Naming a transcript carries no proof the caller is bound to it.
+        if request.transcript.is_some() {
+            return Outcome::TopLevelSession(
+                "an explicit transcript is not bound to the caller through its parent shells"
+                    .to_string(),
+            );
+        }
+        if let Err(why) = turn::opened_by_role_command(&located.path, located.from, request.issue) {
+            return Outcome::TopLevelSession(why);
+        }
     }
     let claim = Claim {
         issue: request.issue,
@@ -1029,12 +1044,16 @@ pub async fn run_foreground(request: &StartRequest, env: &AttendEnv) -> Outcome 
     let Some(located) = request.transcript.as_deref().and_then(Located::from_path) else {
         return Outcome::NotLocated("--foreground needs --transcript".to_string());
     };
-    if located.is_top_level() {
-        return Outcome::TopLevelSession;
-    }
     let from = request
         .from_offset
         .unwrap_or_else(|| std::fs::metadata(&located.path).map_or(0, |m| m.len()));
+    // The binding was proven by the start that spawned this tailer; the turn
+    // is checked again here so no path into it follows an inline claim.
+    if located.is_top_level() {
+        if let Err(why) = turn::opened_by_role_command(&located.path, from, request.issue) {
+            return Outcome::TopLevelSession(why);
+        }
+    }
     let located = Located { from, ..located };
     let claim = Claim {
         issue: request.issue,

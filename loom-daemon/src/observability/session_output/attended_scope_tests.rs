@@ -137,27 +137,40 @@ fn a_slash_command_caller_is_located_as_a_top_level_session() {
     assert!(located.is_top_level());
 }
 
-/// Judge's repro: `/loom:builder 42` typed into a top-level session, whose
-/// transcript goes on to hold the operator's later, unrelated work.
+/// An operator's main agent running the claim step inline: no `/loom:`
+/// command opened the turn, so nothing bounds how long it goes on.
+fn inline_main_agent_session(projects: &Path) -> Session {
+    session(
+        projects,
+        "-Users-op-dev-loom",
+        &[
+            user_text("please look at the open PRs and then pick up #10116"),
+            bash_call("toolu_claim", SLASH_CLAIM),
+        ],
+    )
+}
+
+/// Acceptance 3: an inline claim by the main agent is still refused, with a
+/// recorded reason, and nothing is started or written.
 #[cfg(feature = "otlp")]
 #[test]
-fn a_top_level_session_is_refused_with_a_recorded_reason() {
+fn an_inline_main_agent_claim_is_refused_with_a_recorded_reason() {
     let scratch = Scratch::new("top-level");
     let root = checkout(&scratch, Some(&live_config(&scratch)));
     let projects = scratch.path("projects");
-    let claim = SLASH_CLAIM;
-    let session = slash_command_session(&projects);
+    let session = inline_main_agent_session(&projects);
 
     let outcome =
-        start_with(&request(&root), &attended_env(), Some(&projects), running(claim), |_| {
-            panic!("a top-level session must not be followed")
+        start_with(&request(&root), &attended_env(), Some(&projects), running(SLASH_CLAIM), |_| {
+            panic!("an inline main-agent claim must not be followed")
         });
-    assert_eq!(outcome, Outcome::TopLevelSession);
+    assert!(matches!(outcome, Outcome::TopLevelSession(_)), "{outcome:?}");
     let why = outcome.describe(ISSUE);
     assert!(why.contains("top-level session") && why.contains("#10129"), "{why}");
+    assert!(why.contains("not opened by a /loom:<role> command"), "{why}");
     assert!(!state_dir(&root).exists(), "a refused start records nothing on disk");
 
-    // Naming the session's own file explicitly is refused the same way.
+    // Naming the session's own file explicitly carries no binding: refused.
     let explicit = StartRequest {
         transcript: Some(session.main.clone()),
         ..request(&root)
@@ -165,26 +178,226 @@ fn a_top_level_session_is_refused_with_a_recorded_reason() {
     let outcome = start_with(&explicit, &attended_env(), Some(&projects), never_read, |_| {
         panic!("a top-level transcript must not be followed")
     });
-    assert_eq!(outcome, Outcome::TopLevelSession);
+    assert!(matches!(outcome, Outcome::TopLevelSession(_)), "{outcome:?}");
 }
 
-/// The detached tailer itself refuses a top-level transcript too, so no path
-/// into it publishes one.
+/// A slash command that names a different issue does not open this claim's
+/// turn either.
+#[cfg(feature = "otlp")]
+#[test]
+fn a_slash_command_naming_another_issue_is_refused() {
+    let scratch = Scratch::new("top-level-other");
+    let root = checkout(&scratch, Some(&live_config(&scratch)));
+    let projects = scratch.path("projects");
+    slash_command_session(&projects);
+    let outcome = start_with(
+        &StartRequest {
+            issue: SECOND_ISSUE,
+            ..request(&root)
+        },
+        &attended_env(),
+        Some(&projects),
+        running(SLASH_CLAIM),
+        |_| panic!("a command for another issue must not be followed"),
+    );
+    assert!(matches!(outcome, Outcome::TopLevelSession(_)), "{outcome:?}");
+}
+
+/// Acceptance 1, start half: `/loom:builder 10116` in a top-level session is
+/// started, from its own claim line.
+#[cfg(feature = "otlp")]
+#[test]
+fn a_slash_command_turn_is_started_from_its_claim_line() {
+    let scratch = Scratch::new("top-level-start");
+    let root = checkout(&scratch, Some(&live_config(&scratch)));
+    let projects = scratch.path("projects");
+    let session = slash_command_session(&projects);
+    let claim_at = last_line_at(&session.main);
+    let mut argv: Vec<String> = Vec::new();
+    let outcome = start_with(
+        &request(&root),
+        &attended_env(),
+        Some(&projects),
+        running(SLASH_CLAIM),
+        |command| {
+            argv = command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            Ok(31339)
+        },
+    );
+    assert!(matches!(outcome, Outcome::Started { pid: 31339, .. }), "{outcome:?}");
+    let from_arg = argv.iter().position(|a| a == "--from-offset").unwrap() + 1;
+    assert_eq!(argv[from_arg], claim_at.to_string());
+}
+
+/// The detached tailer re-checks the turn itself, so no path into it follows
+/// an inline claim.
 #[cfg(feature = "otlp")]
 #[tokio::test]
-async fn the_foreground_tailer_refuses_a_top_level_transcript() {
+async fn the_foreground_tailer_refuses_an_inline_claim() {
     let scratch = Scratch::new("top-level-fg");
     let root = checkout(&scratch, Some(&live_config(&scratch)));
-    let session = session(&scratch.path("projects"), "-p", &[user_text("hello")]);
+    let session = inline_main_agent_session(&scratch.path("projects"));
     let outcome = run_foreground(
         &StartRequest {
-            transcript: Some(session.main),
+            transcript: Some(session.main.clone()),
+            from_offset: Some(last_line_at(&session.main)),
             ..request(&root)
         },
         &attended_env(),
     )
     .await;
-    assert_eq!(outcome, Outcome::TopLevelSession);
+    assert!(matches!(outcome, Outcome::TopLevelSession(_)), "{outcome:?}");
+}
+
+/// Acceptance 1, tailing half (Judge's scratch test on #10121): the slash
+/// command's own output is published as the issue, and an unrelated reply
+/// after the next human prompt never is.
+#[tokio::test]
+async fn a_slash_command_run_stops_at_the_next_human_prompt() {
+    let scratch = Scratch::new("top-level-next-prompt");
+    let session = slash_command_session(&scratch.path("projects"));
+    let transcript = session.main.clone();
+    let from = last_line_at(&transcript);
+    append(
+        &transcript,
+        &[
+            tool_result("toolu_claim"),
+            assistant_text("Worktree ready."),
+            skill_expansion(),
+            assistant_text("Still on 10116."),
+        ],
+    );
+    let located = Located {
+        from,
+        ..Located::from_path(&transcript).unwrap()
+    };
+    assert!(located.is_top_level());
+    let queue = Arc::new(DurableQueue::open(scratch.path("queue.jsonl"), 1_000));
+    let sink = SessionOutputSink::new(vec![queue.clone()], "host-test").unwrap();
+    let (live, limits) = quick();
+    let late = transcript.clone();
+    let arrive = async move {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        append(
+            &late,
+            &[
+                user_text("thanks, now what is the weather in the other repo?"),
+                assistant_text("UNRELATED: other repo work."),
+            ],
+        );
+    };
+    let run = drive(
+        identity(&located, ISSUE, None, None),
+        &located,
+        &scratch.0,
+        &sink,
+        live,
+        limits,
+        Watch {
+            session_alive: || true,
+            newer_claim: || None,
+        },
+    );
+    let (reason, ()) = tokio::join!(run, arrive);
+    assert_eq!(reason, EndReason::NextTask);
+    let published = records(&queue);
+    assert_eq!(texts(&published), ["Worktree ready.", "Still on 10116."]);
+    let wire = serde_json::to_string(&queue.peek_batch(1_000)).unwrap();
+    assert!(!wire.contains("UNRELATED"), "an unrelated reply was published as #{ISSUE}");
+    assert_eq!(published.last().unwrap().coverage, Coverage::Ended);
+}
+
+/// Acceptance 2: a second `/loom:builder 10117` in the same session ends
+/// #10116's run at its own prompt/claim, and #10117's run starts at its own
+/// claim line. No line crosses in either direction.
+#[tokio::test]
+async fn a_second_slash_command_hands_the_transcript_over() {
+    let scratch = Scratch::new("top-level-second");
+    let session = slash_command_session(&scratch.path("projects"));
+    let transcript = session.main.clone();
+    let first = Located {
+        from: last_line_at(&transcript),
+        ..Located::from_path(&transcript).unwrap()
+    };
+    append(
+        &transcript,
+        &[
+            tool_result("toolu_claim"),
+            assistant_text("Built 10116."),
+            user_text(
+                "<command-name>/loom:builder</command-name><command-args>10117</command-args>",
+            ),
+            bash_call("toolu_claim2", SECOND_CLAIM),
+        ],
+    );
+    let second = Located {
+        from: last_line_at(&transcript),
+        ..first.clone()
+    };
+    append(&transcript, &[tool_result("toolu_claim2"), assistant_text("Built 10117.")]);
+    assert_eq!(turn::opened_by_role_command(&transcript, second.from, SECOND_ISSUE), Ok(()));
+    assert!(turn::opened_by_role_command(&transcript, second.from, ISSUE).is_err());
+
+    let claim_file = scratch.path("state/stream.claim");
+    let first_claim = segment::Claim {
+        issue: ISSUE,
+        from: first.from,
+    };
+    let second_claim = segment::Claim {
+        issue: SECOND_ISSUE,
+        from: second.from,
+    };
+    segment::write_claim(&claim_file, second_claim).unwrap();
+    let (live, limits) = quick();
+
+    let first_queue = Arc::new(DurableQueue::open(scratch.path("first.jsonl"), 1_000));
+    let first_sink = SessionOutputSink::new(vec![first_queue.clone()], "host-test").unwrap();
+    let reason = drive(
+        identity(&first, ISSUE, None, None),
+        &first,
+        &scratch.0,
+        &first_sink,
+        live,
+        limits,
+        Watch {
+            session_alive: || true,
+            newer_claim: || segment::newer_claim(&claim_file, first_claim),
+        },
+    )
+    .await;
+    assert!(matches!(reason, EndReason::NextTask | EndReason::Superseded), "{reason:?}");
+    let published = records(&first_queue);
+    assert_eq!(texts(&published), ["Built 10116."]);
+    assert!(published.iter().all(|r| r.identity.issue == Some(ISSUE)));
+
+    let second_queue = Arc::new(DurableQueue::open(scratch.path("second.jsonl"), 1_000));
+    let second_sink = SessionOutputSink::new(vec![second_queue.clone()], "host-test").unwrap();
+    let mut polls = 0;
+    let reason = drive(
+        identity(&second, SECOND_ISSUE, None, None),
+        &second,
+        &scratch.0,
+        &second_sink,
+        live,
+        limits,
+        Watch {
+            session_alive: move || {
+                polls += 1;
+                polls <= 3
+            },
+            newer_claim: || segment::newer_claim(&claim_file, second_claim),
+        },
+    )
+    .await;
+    assert_eq!(reason, EndReason::SessionExited);
+    let published = records(&second_queue);
+    assert_eq!(texts(&published), ["Built 10117."]);
+    assert!(published
+        .iter()
+        .all(|r| r.identity.issue == Some(SECOND_ISSUE)));
 }
 
 /// The subagent form of Judge's "unrelated post-role reply": after the claimed
