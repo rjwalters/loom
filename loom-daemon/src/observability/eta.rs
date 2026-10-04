@@ -13,7 +13,9 @@
 //!   listing, where an unchanged listing is a free `304`), at most
 //!   [`FORGE_READ_BUDGET`] `pulls/{n}` + `issues/{n}` reads for items whose
 //!   outcome is still unknown, the last work-finder tick's dispatch plan
-//!   ingested as ready items (#9326), history reloaded, the registry rebuilt
+//!   ingested as ready items (#9326), at most
+//!   [`crate::eta::pr_features::FEATURE_READ_BUDGET`] feature reads plus the
+//!   stall snapshot (#10232), history reloaded, the registry rebuilt
 //!   when a newer coefficient file appeared (#10243), the fleet view (every
 //!   listed PR plus the journal's stage events) handed over for the queue
 //!   features (#10201), and every live item re-estimated. An unchanged
@@ -52,6 +54,7 @@ use crate::eta::calibration_log;
 use crate::eta::config::EtaConfig;
 use crate::eta::fit::{self, CoefficientFile};
 use crate::eta::journal::{self, JournalEntry};
+use crate::eta::pr_features::FEATURE_READ_BUDGET;
 use crate::eta::queue_features::EventLog;
 use crate::eta::recalibrate::CalibrationObservation;
 use crate::eta::score::EstimateSummary;
@@ -1007,6 +1010,7 @@ pub(super) async fn record(
     }
     // Before `now`: the fleet view is known strictly before the estimates.
     let listed_at = Utc::now();
+    let feature_reads = feature_reads(&repos, workspace_root).await;
 
     let slugs: Vec<String> = repos.iter().map(|(_, slug, ..)| slug.clone()).collect();
     let journal_root = workspace_root.to_path_buf();
@@ -1168,7 +1172,7 @@ pub(super) async fn record(
     }
     log::info!(
         "eta: pass emitted={} refused={} outcomes={} journaled={} pending={} expired={} \
-         invalid={} reads={} deferred_reads={} orphaned={}",
+         invalid={} reads={} deferred_reads={} feature_reads={} orphaned={}",
         delivered.emitted,
         delivered.refused,
         delivered.outcomes,
@@ -1178,8 +1182,53 @@ pub(super) async fn record(
         delivered.invalid,
         reads_answered(&rows),
         deferred,
+        feature_reads,
         dropped.orphaned
     );
+}
+
+/// The feature reads (#10232): at most [`FEATURE_READ_BUDGET`] conditional
+/// GETs through the ETag store, a budget separate from the outcome reads',
+/// and the host's stall snapshot (no forge call). Both run before the pass's
+/// `now`, so its estimates may use them. While the rate-limit breaker
+/// suppresses polling the budget is zero. Returns how many reads ran.
+async fn feature_reads(
+    repos: &[(PathBuf, String, Vec<PrView>, Vec<ListedPr>)],
+    workspace_root: &Path,
+) -> usize {
+    let roots: Vec<(String, PathBuf)> = repos
+        .iter()
+        .map(|(root, slug, ..)| (slug.to_ascii_lowercase(), root.clone()))
+        .collect();
+    let readable: Vec<String> = roots.iter().map(|(slug, _)| slug.clone()).collect();
+    let budget = if crate::rate_limit_breaker::global_is_suppressed() {
+        0
+    } else {
+        FEATURE_READ_BUDGET
+    };
+    let reads = lock()
+        .as_mut()
+        .map(|state| {
+            state
+                .tracker
+                .plan_feature_reads(&readable, Utc::now(), budget)
+        })
+        .unwrap_or_default();
+    let count = reads.len();
+    let root = workspace_root.to_path_buf();
+    let Ok((answers, stall)) = tokio::task::spawn_blocking(move || {
+        let answers = crate::eta::pr_features_forge::run(reads, &roots);
+        (answers, crate::eta::stall_features::collect(&root, Utc::now()))
+    })
+    .await
+    else {
+        return count;
+    };
+    if let Some(state) = lock().as_mut() {
+        state.tracker.on_feature_reads(&answers);
+        state.tracker.on_stall_snapshot(stall);
+    }
+    count
 }
 
 /// The last work-finder tick's ready rows, keyed by repo slug, and its plan

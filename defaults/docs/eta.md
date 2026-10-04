@@ -1068,6 +1068,100 @@ refusal reason on a ready row the plan gives no position.
 new features `null` (the precedent is `result.stage_marks`, #9366).
 Omission reasons are free-form strings.
 
+### Read features: PR size, checks, issue markers (#10232)
+
+These need their own forge reads, so they have their own budget: at most
+**12 feature reads per pass** (`eta::pr_features::FEATURE_READ_BUDGET`),
+separate from the 8 outcome reads, so neither delays the other. Each read
+is a conditional GET through the shared ETag store (an unchanged answer is
+a free `304` that reuses the stored body), under the repo's reader App when
+one is usable, and counted in the forge-call accounting (caller
+`eta_feature_read`). While the rate-limit breaker suppresses polling the
+budget is zero.
+
+| Stored | Read | Applies to |
+|---|---|---|
+| `pr_additions`, `pr_deletions`, `pr_changed_files`, `pr_commits` | `pulls/{n}` | items with a PR |
+| `checks_pending`, `checks_failed` | `commits/{head}/check-runs` for the head the PR read shows: runs not completed; runs concluded `failure`, `timed_out`, `cancelled`, `action_required` or `startup_failure`. Every run on the head counts, not only required ones | items with an open PR |
+| `complexity_marker`, `points_marker`, `author` | `issues/{n}`: the `<!-- loom:complexity=… -->` and `<!-- loom:points=… -->` markers (the work finder's parsers) and `user.login` | every item |
+
+Each pass plans the reads that are due (`pulls` and checks older than
+15 min, `issues` older than 1 h): never-read first, then oldest. The rest
+wait for the next pass.
+
+**Point in time.** A read returns the current value, so a value is used at
+`as_of` only when it was known then: the read happened before `as_of`, or
+it happened later but the PR or issue was last updated before `as_of`.
+Check runs change without touching the PR's `updated_at`, so they need a
+read before `as_of`. A PR that was closed or merged when read never records
+a size: its final size is not its size at `as_of`. A failed read keeps the
+previous answer, within the max age (1 h for PR reads, 24 h for issue
+reads).
+
+| reason | when |
+|---|---|
+| `no_pr_yet` | PR and check features: the item has no PR |
+| `not_read_yet` | no pass has wanted the read yet (a new item, or its repo was not listed) |
+| `budget_exhausted` | the read was over this pass's budget and there is no earlier answer |
+| `read_failed` | the read failed and there is no earlier answer |
+| `read_stale` | the newest answer is older than the max age |
+| `pr_not_open` | the PR was closed or merged when read |
+| `pr_changed_after_as_of` / `issue_changed_after_as_of` | read after `as_of`, and updated after `as_of` |
+| `checks_read_after_as_of` | the check runs were read at or after `as_of` |
+| `checks_for_other_head` | the check runs read are for another commit than the PR's head |
+| `checks_truncated` | the head has more than 100 check runs |
+| `marker_absent` / `marker_invalid` | the body has no such marker / the points value is outside `1, 2, 3, 5, 8, 13` |
+
+A PR feature's null reason is the PR read's reason; a check feature's is the
+PR read's when that one has no value.
+
+### Stall signals (#10232, for #10210)
+
+Host-wide, so one snapshot per pass serves every item. Taking it makes no
+forge call: the budget comes from the forge-call sink's `x-ratelimit-*`
+header readings (or the breaker's probe, when newer), the breaker from its
+in-process state, the pool from the token directory.
+
+| Stored | Definition |
+|---|---|
+| `ratelimit_core_remaining`, `ratelimit_core_reset_at` | the freshest REST budget reading (≤ 15 min old) and its reset |
+| `ratelimit_graphql_remaining`, `ratelimit_graphql_reset_at` | the same for GraphQL |
+| `breaker_state`, `breaker_cooldown_until` | the rate-limit breaker: `closed` or `cooldown`, and when an active cooldown releases |
+| `pool_usable_accounts`, `pool_exhausted` | spawnable accounts in the pool the workspace resolves to (neither bad-marked nor hard-excluded), and whether that is zero |
+
+The sink keeps readings per pool, not per credential, so on a host that
+reads through several identities (its `gh` login, reader Apps) the reading
+is the freshest one of that pool across them.
+
+Null reasons: `no_stall_snapshot` (no snapshot taken before `as_of`),
+`stale_inputs` (the snapshot is over 15 min old), `no_budget_reading`,
+`no_reset_in_reading` (a breaker probe carries none), `breaker_not_registered`,
+`breaker_closed` (`breaker_cooldown_until` only) and `no_token_pool`.
+
+**Coverage check (post-deploy).** The share of `land` estimates with each
+feature non-null, over estimates where it applies (the applicability
+reasons `no_pr_yet`, `no_stage` and `not_applicable_stage` excluded), from
+the explanation body in SigNoz. Set `since` to the deploy instant and read
+it after at least 6 h; the target is ≥ 95%:
+
+```sql
+SELECT kv.1 AS feature,
+       countIf(kv.2 != 'null') AS non_null,
+       count() AS applicable,
+       round(non_null / applicable, 3) AS share
+FROM signoz_logs.distributed_logs_v2
+ARRAY JOIN JSONExtractKeysAndValuesRaw(body, 'features') AS kv
+WHERE mapContains(attributes_string, 'loom.eta.trigger')
+  AND attributes_string['loom.eta.kind'] = 'land'
+  AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+  AND NOT arrayExists(
+        o -> JSONExtractString(o, 'name') = kv.1
+             AND JSONExtractString(o, 'reason') IN ('no_pr_yet', 'no_stage', 'not_applicable_stage'),
+        JSONExtractArrayRaw(body, 'features_omitted'))
+GROUP BY feature
+ORDER BY share;
+```
+
 ## No-estimate reasons
 
 | reason | when |
@@ -1098,7 +1192,8 @@ triggers:
   review-label listings (ETag-cached, so an unchanged listing is free), at
   most 8 forge reads (`pulls/{n}` for PRs that left review, `issues/{n}` for
   issues whose outcome only the issue can settle — anything over the budget is
-  retried next pass), a history reload, and a refresh of every live estimate.
+  retried next pass), at most 12 feature reads and the stall snapshot
+  (#10232, above), a history reload, and a refresh of every live estimate.
   The estimation step runs on a blocking thread behind a `catch_unwind`, so an
   ETA failure costs only ETA and never the observability collector.
 

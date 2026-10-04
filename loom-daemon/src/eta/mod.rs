@@ -127,6 +127,8 @@ pub mod journal;
 pub mod labels;
 pub mod offline;
 pub mod priority_features;
+pub mod pr_features;
+pub(crate) mod pr_features_forge;
 pub mod queue_features;
 pub mod recalibrate;
 pub mod recency;
@@ -135,6 +137,7 @@ pub mod shadow;
 pub mod simulate;
 pub mod stall;
 pub mod star;
+pub mod stall_features;
 pub mod tracker;
 pub mod twin_otter;
 

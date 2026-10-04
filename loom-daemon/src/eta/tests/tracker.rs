@@ -827,3 +827,72 @@ fn a_view_or_plan_observed_after_as_of_is_not_read() {
     let (_, plan) = reasons(&mut h, t(1500 + 300));
     assert_eq!(plan, vec!["-".to_string(), reason::REPO_NOT_LISTED.to_string()]);
 }
+
+/// #10232: the read and stall features reach estimates through the tracker,
+/// each with a specific reason while it has no value.
+#[test]
+fn the_tracker_records_read_and_stall_features() {
+    use crate::eta::pr_features::{ReadKind, FEATURE_READ_BUDGET};
+    use crate::eta::stall_features::{PoolReading, StallSnapshot};
+    use serde_json::json;
+    let mut h = Harness::new();
+    h.tracker
+        .on_listing(REPO, &[pr(501, 50, &[REVIEW], -600)], t(0), 300);
+    let emitted = h.estimate(t(10));
+    let land = primary(&emitted, 50, Kind::Land);
+    assert_eq!(reason_of(land, "pr_additions"), Some("not_read_yet"));
+    assert_eq!(reason_of(land, "breaker_state"), Some("no_stall_snapshot"));
+
+    let reads = h
+        .tracker
+        .plan_feature_reads(&[REPO.to_string()], t(20), FEATURE_READ_BUDGET);
+    let answers: Vec<_> = reads
+        .into_iter()
+        .map(|r| {
+            let body = match r.kind {
+                ReadKind::Pull => json!({
+                    "state": "open", "merged_at": null, "additions": 12, "deletions": 4,
+                    "changed_files": 3, "commits": 2, "head": {"sha": "abc"},
+                    "updated_at": t(-600).to_rfc3339(),
+                }),
+                ReadKind::Issue => json!({
+                    "body": "<!-- loom:points=3 -->", "user": {"login": "octocat"},
+                    "updated_at": t(-9000).to_rfc3339(),
+                }),
+                ReadKind::Checks => panic!("no head is known before the first PR read"),
+            };
+            (r, Some(body), t(30))
+        })
+        .collect();
+    assert_eq!(answers.len(), 2, "one pulls/{{n}} and one issues/{{n}} read");
+    h.tracker.on_feature_reads(&answers);
+    h.tracker.on_stall_snapshot(StallSnapshot {
+        observed_at: t(30),
+        core: None,
+        graphql: None,
+        breaker: None,
+        pool: PoolReading {
+            usable: 2,
+            total: 3,
+        },
+    });
+
+    let emitted = h.estimate(t(400));
+    let land = primary(&emitted, 50, Kind::Land);
+    let f = land.features.as_ref().unwrap();
+    assert_eq!((f.pr_additions, f.pr_commits), (Some(12), Some(2)));
+    assert_eq!(f.points_marker, Some(3));
+    assert_eq!(f.author.as_deref(), Some("octocat"));
+    assert_eq!((f.pool_usable_accounts, f.pool_exhausted), (Some(2), Some(false)));
+    assert_eq!(reason_of(land, "checks_pending"), Some("not_read_yet"));
+    assert_eq!(reason_of(land, "complexity_marker"), Some("marker_absent"));
+    assert_eq!(reason_of(land, "breaker_state"), Some("breaker_not_registered"));
+    let names = crate::eta::pr_features::PR_SIZE_FEATURES
+        .iter()
+        .chain(&crate::eta::pr_features::CHECK_FEATURES)
+        .chain(&crate::eta::pr_features::ISSUE_FEATURES)
+        .chain(&crate::eta::stall_features::NAMES);
+    for name in names {
+        assert_ne!(reason_of(land, name), Some("not_collected"), "{name}");
+    }
+}
