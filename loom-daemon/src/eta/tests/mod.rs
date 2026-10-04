@@ -14,6 +14,7 @@ mod fit_parity;
 mod fit_rows;
 mod flag_timeline;
 mod fleet;
+mod fleet_refresh;
 mod friction;
 mod item_features;
 mod journal;

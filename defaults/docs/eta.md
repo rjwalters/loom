@@ -152,8 +152,10 @@ verdicts) becomes a sample attributed to source `forge:pr-timeline` and host
   `gh pr list` plus one timeline read per PR, paid once by
   `eta fleet backfill`. After that the snapshot's `cursor` bookmarks the newest
   forge event already ingested and `eta fleet refresh` enumerates only PRs
-  updated since. **The daemon itself never derives**: a tick reads the cached
-  file and makes no forge call at all.
+  updated since. Since #10263 the daemon keeps the snapshots fresh itself, on
+  its own hourly task and never on a tick
+  ([Fleet refresh task](#fleet-refresh-task-autonomousetafleetrefresh-10263));
+  the ETA pass still only reads the cached file.
 - **Open segments are censored, not guessed.** A stage that had not closed when
   the snapshot was taken is a lower bound (#9328), kept out of every v1
   distribution and read only by `land-v2`. `eta backfill` is idempotent
@@ -499,15 +501,20 @@ order of snapshots, episodes or flag changes.
 
 **The daily refit.**
 
-- It is a dedicated daemon task (`observability::eta_fit`) that runs beside
-  the ETA tracker, so it exists only where observability runs.
-- Its first check is 10 min after start, then every hour.
+- With the [fleet refresh task](#fleet-refresh-task-autonomousetafleetrefresh-10263)
+  on (the default, #10263), the check runs at the end of every refresh cycle,
+  so it always sees that cycle's snapshots, and it is held while a backfill
+  younger than 6 h is in progress. Otherwise it is a dedicated daemon task
+  (`observability::eta_fit`) beside the ETA tracker; never both. Either way it
+  exists only where observability runs.
+- The standalone task's first check is 10 min after start, then every hour.
 - It fits at cutoff `T` = today 00:00Z, at most once per UTC day:
   - when every snapshot is as of `T` or later;
   - otherwise 6 h after `T`, with whatever is there.
 - Today's file makes later checks a no-op, whichever process wrote it.
-- It makes no forge call and never refreshes the snapshots. Keeping them
-  fresh (`eta fleet refresh`) is an operator or cron step.
+- The fit itself makes no forge call. Keeping the snapshots fresh is the
+  fleet refresh task's job; with that task off it is an operator or cron step
+  (`eta fleet refresh`).
 - Failures and panics are logged at `warn` and retried on the next check.
 - Writes go to `.loom/state/eta/fit/fit-<T>.json`, and the directory is
   pruned to the newest **14** `fit-*.json` files.
@@ -1126,6 +1133,11 @@ accepts `--repo-root PATH` (default: the current directory).
     `data_through`, `id` and `path`.
   - It fails, naming `eta fleet backfill`, when no snapshot is cached.
 
+The daemon's [fleet refresh task](#fleet-refresh-task-autonomousetafleetrefresh-10263)
+does the same work on a cadence, through reader Apps only. The CLI stays for
+ad-hoc and non-daemon use; it runs under the ambient `gh` credential, so do
+not script it on a host whose daemon already refreshes.
+
 - **`loom-daemon eta offline --input PATH --now RFC3339 [--baseline land-v2] [--train-days 14] [--selection-folds 2] [--reported-folds 2] [--margin-secs 120] [--resamples 1000] [--export PATH] [--json]`**
   — the #10193 offline comparison on **logged** `eta.estimate` /
   `eta.outcome` lines (JSONL of `{observed_at, event, body}` exported from
@@ -1213,6 +1225,12 @@ of what is on disk and never needs a refetch.
 | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
 | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245). It runs only with `enabled` too, is read at start, and is a no-op until a fleet snapshot is cached |
 | `current.start` / `current.finish` / `current.land` | none | `start-v1` / `finish-v1` / `land-v1` |
+| `fleetRefresh.enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | `true` (#10263) |
+| `fleetRefresh.intervalSecs` | `LOOM_ETA_FLEET_REFRESH_INTERVAL_SECS` | `3600` (floor 900) |
+| `fleetRefresh.maxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_MAX_CALLS` | `300` |
+| `fleetRefresh.backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `1500` |
+| `fleetRefresh.reserveCalls` | `LOOM_ETA_FLEET_REFRESH_RESERVE` | `1500` |
+| `fleetRefresh.backfillDays` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS` | `21` (floor 15: the fit window + 1) |
 
 `historyScope` is one of:
 
@@ -1227,11 +1245,93 @@ of what is on disk and never needs a refetch.
 
 An unrecognised value leaves the default in force rather than picking a scope
 at random, and **every** scope falls back to the host-local history when no
-snapshot is cached — a missing cache is not evidence of an empty history. The
-default is therefore a no-op until an operator runs `eta fleet backfill`: a
-host that has not opted in behaves exactly as it did before.
+snapshot is cached — a missing cache is not evidence of an empty history.
+
+**`augment` changes live estimates once a snapshot exists.** With the fleet
+refresh task on by default (#10263), a host with reader Apps publishes its
+first snapshot within a cycle or a few, and from then on its live `current`
+estimates report `scope = fleet`. That is #9343's designed path; set
+`historyScope = local` to keep a host on its own journals.
 
 Each pass logs `eta: pass emitted=N refused=M outcomes=K …`.
+
+### Fleet refresh task (`autonomous.eta.fleetRefresh`, #10263)
+
+The daily fit (#10245) and `augment` read only the cached snapshots, so the
+daemon keeps them fresh itself. The task is spawned beside the ETA tracker,
+only with an observability exporter configured and `autonomous.eta.enabled`.
+It is **on by default** (operator decision): it generates no work, it only
+reads, and it is budgeted with a reserve floor. Without it the fit would have
+no training data on a fleet host. Settings are read once at spawn; change
+them with a daemon restart.
+
+- **Cadence.** The first cycle runs 120 s after start, then every
+  `intervalSecs`, skipping missed ticks. Each cycle runs off the tick in a
+  blocking task; a panic is logged and the next tick retries.
+- **Repo set.** Every provisioned root and the daemon's own (by `origin`
+  remote), plus every published snapshot's repo. To stop refreshing a repo,
+  delete its `fleet-<owner>-<repo>.json`.
+- **Reader Apps only.** Every read runs under the repo's reader App
+  (`forge_identity`, #9537) with `GH_TOKEN` / `GITHUB_TOKEN` (and the
+  enterprise variants) removed from the child. There is no writer fallback and
+  the operator's PAT is never spent. A repo with no usable reader is skipped
+  at zero calls (`no_reader`), and so is a forge other than github.com
+  (`unsupported_forge`, e.g. Gitea); both are warned once per daemon lifetime.
+  REST only: the `issues` listing and the per-PR timeline, never GraphQL.
+- **Pass choice.** A repo gets a **backfill** (`backfillDays` deep) when it has
+  no published snapshot, no state file (a CLI-made snapshot at its default
+  `--limit` covers only days), coverage shallower than `backfillDays`, or an
+  older derivation revision. Otherwise it gets a **refresh** from the last
+  watermark minus 10 minutes. Refreshes run first, then backfills (in-progress
+  ones first).
+- **Budgets.** Every request counts, `304`s and errors included: refresh
+  passes draw from `maxCallsPerCycle`, backfills from
+  `backfillMaxCallsPerCycle`, both host-wide. When a response reports fewer
+  than `reserveCalls` core calls remaining, that page is kept and every further
+  repo on the same reader App is skipped for the cycle (`reserve`).
+- **Calls per refresh.** A quiet repo costs **1** (page 1 sent with its ETag,
+  answered `304`, which still advances `as_of`). An active one costs
+  `ceil(rows updated since the watermark / 100)` listing pages plus one
+  timeline page per moved PR (more for a PR with over 100 timeline entries).
+  A first backfill of `rjwalters/loom` at 21 days is about 1,300 calls, which
+  fits one cycle at the default backfill budget.
+- **Rate limits.** A rate-limited reader is withdrawn App-wide until the
+  forge's reset, the cycle ends, and the task makes **zero** calls until
+  `max(reset, now + intervalSecs)` (`backoff`). With the rate-limit breaker
+  suppressed it makes none either (`breaker_open`). A coverage gap withdraws
+  the reader for that repo only (`coverage`). The task never feeds the global
+  breaker.
+- **Files and resume.** State and the in-progress snapshot live in
+  `.loom/state/eta/fleet/refresh/` (`<owner>-<repo>.json`,
+  `<owner>-<repo>.staging.json`), a subdirectory the snapshot loader never
+  lists. Every merge in a pass uses the pass's listing instant `L`, and the
+  staging file then the state are written after each listing page and at every
+  stop. The next cycle continues the same pass, which is the in-process
+  equivalent of the CLI's exit 75. A pass that completes is published
+  atomically; until then the old snapshot stays in service. A state naming a
+  pass whose staging file is unreadable restarts the pass; a staging file with
+  no pass is deleted.
+- **Raw event cache.** After the snapshots, each repo's
+  [raw event cache](#raw-event-cache-and-fleet_statet-10197) is synced
+  in-process through a reader-only source, from whatever the matching budget
+  has left, resuming from its own cursor.
+- **The fit.** The daily refit check (#10245, `refit_if_due`) runs at the end
+  of each cycle, in the same blocking call, so it always sees that cycle's
+  snapshots; the standalone refit task is then not spawned. It is held while
+  a backfill is in progress and younger than 6 h (counted from that pass's
+  listing instant), so a fresh host's first fit is not trained on only the
+  repos that finished first. `autonomous.eta.fit.enabled = false` skips it.
+- **Rebuilds.** No host has a state file before this task first runs, so every
+  repo's first cycle is a full backfill. That also rebuilds snapshots written
+  before #10218's episodes and #10245's flag timeline, which a refresh would
+  not.
+- **Telemetry.** One `eta.fleet_refresh` record per repo per cycle, skipped
+  repos included ([telemetry-schema](telemetry-schema.md)), and one `info` line
+  per cycle with the stop-reason counts and the calls spent.
+- **Shared snapshot directory.** There is no lock against the CLI or another
+  host: every writer replaces whole files atomically, and the last writer
+  wins. A `LOOM_ETA_FLEET_SNAPSHOT_DIR` shared between hosts works, but enable
+  the task on only one of them.
 
 ## Queries
 

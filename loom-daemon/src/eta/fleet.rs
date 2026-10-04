@@ -19,7 +19,8 @@
 //!
 //! **Purity.** Nothing here touches the forge. [`FleetSnapshot::merge`] takes
 //! already-fetched [`PrHistory`] values, exactly as `pr_latency` does, and the
-//! `gh` reads live in `cli/eta_fleet_cmd.rs`. An estimator therefore still sees
+//! `gh` reads live in `cli/eta_fleet_cmd.rs` and the daemon's
+//! [`super::fleet_fetch`]. An estimator therefore still sees
 //! only `(snapshot, input)` and #9325's backtest harness can replay a fleet
 //! snapshot with no behaviour change to the estimator's core.
 //!
@@ -43,8 +44,11 @@
 //! [`FleetSnapshot::cursor`] bookmarks the newest forge activity already
 //! ingested, so a refresh enumerates only PRs updated since — typically a
 //! handful — and [`FleetSnapshot::merge`] replaces that PR's rows in place.
-//! The daemon itself never derives: it reads the cached file
-//! ([`load_all`]) and makes no forge call at all.
+//! The ETA pass only ever reads the cached file ([`load_all`]) and makes no
+//! forge call. Since #10263 the daemon does derive snapshots, but **off the
+//! tick**: its own hourly task (`observability::eta_fleet_refresh`, driving
+//! [`super::fleet_refresh`]) backfills and refreshes them through reader Apps,
+//! budgeted and resumable.
 //!
 //! # Stage episodes (#10218)
 //!

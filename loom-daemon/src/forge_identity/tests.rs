@@ -329,6 +329,9 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         "forge_identity.rs",
         "forge_identity/tests.rs",
         "forge_etag_store.rs", // issue listings + cached views (GET, conditional)
+        // #10263: the ETA fleet refresh's repo set — issue listings and PR
+        // timelines, GETs only, through `fetch_with_reader`.
+        "observability/eta_fleet_refresh.rs",
         "ci_telemetry/api.rs", // repos/<o>/<r>/actions/... GETs
         "fleet_store/gh.rs",   // fleet-config: commit/tree/blob GETs (`--method GET`)
     ];

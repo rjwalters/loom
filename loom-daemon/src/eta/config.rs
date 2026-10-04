@@ -8,6 +8,19 @@
 //! | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
 //! | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245) |
 //! | `current.start` / `current.finish` / `current.land` | — | `start-v1` / `finish-v1` / `land-v1` |
+//!
+//! `autonomous.eta.fleetRefresh.*` (#10263) — the daemon task that backfills
+//! and refreshes the fleet snapshots (`observability::eta_fleet_refresh`).
+//! Resolved once at spawn, so a change needs a daemon restart.
+//!
+//! | key | env | default |
+//! |---|---|---|
+//! | `enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | `true` |
+//! | `intervalSecs` | `LOOM_ETA_FLEET_REFRESH_INTERVAL_SECS` | `3600` (min `900`) |
+//! | `maxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_MAX_CALLS` | `300` |
+//! | `backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `1500` |
+//! | `reserveCalls` | `LOOM_ETA_FLEET_REFRESH_RESERVE` | `1500` |
+//! | `backfillDays` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS` | `21` (min `fit::WINDOW_DAYS + 1`) |
 
 use super::Kind;
 use std::path::Path;
@@ -20,10 +33,11 @@ pub const MIN_REFRESH_SECS: u64 = 60;
 
 /// Which history an estimate reads (#9343).
 ///
-/// The default is [`HistoryScopeMode::Augment`], and it is a no-op until an
-/// operator runs `loom-daemon eta fleet backfill`: with no cached snapshot
-/// there is nothing to augment with, so a host that has not opted in behaves
-/// exactly as before.
+/// The default is [`HistoryScopeMode::Augment`], a no-op until a fleet
+/// snapshot exists. Since #10263 the daemon's own fleet refresh task builds
+/// one by default (`autonomous.eta.fleetRefresh.enabled`), so on a host with
+/// reader Apps live estimates switch to `scope = fleet` once its first
+/// backfill publishes; [`HistoryScopeMode::Local`] is the escape hatch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HistoryScopeMode {
     /// This host's journals only. Pre-#9343 behaviour, kept as an escape
@@ -66,6 +80,60 @@ impl HistoryScopeMode {
     }
 }
 
+/// Default fleet refresh cadence (#10263).
+pub const DEFAULT_FLEET_REFRESH_INTERVAL_SECS: u64 = 3600;
+
+/// Shortest fleet refresh cadence accepted.
+pub const MIN_FLEET_REFRESH_INTERVAL_SECS: u64 = 900;
+
+/// Default per-cycle forge-call budget for refresh passes.
+pub const DEFAULT_FLEET_REFRESH_MAX_CALLS: u64 = 300;
+
+/// Default per-cycle forge-call budget for backfill passes.
+pub const DEFAULT_FLEET_REFRESH_BACKFILL_MAX_CALLS: u64 = 1500;
+
+/// Default reserve floor: stop a reader App's repos for the cycle once a
+/// response reports fewer core calls than this remaining.
+pub const DEFAULT_FLEET_REFRESH_RESERVE: u64 = 1500;
+
+/// Default backfill depth, in days.
+pub const DEFAULT_FLEET_REFRESH_BACKFILL_DAYS: i64 = 21;
+
+/// Shallowest backfill accepted: one day more than the daily fit's window,
+/// so a fresh host's first fit sees a whole window of history.
+pub const MIN_FLEET_REFRESH_BACKFILL_DAYS: i64 = super::fit::WINDOW_DAYS + 1;
+
+/// `autonomous.eta.fleetRefresh` (#10263): the daemon task that keeps the
+/// fleet snapshots fresh ahead of the daily fit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetRefreshConfig {
+    /// Run the task at all (also requires `autonomous.eta.enabled`).
+    pub enabled: bool,
+    /// Seconds between cycles.
+    pub interval_secs: u64,
+    /// Forge calls per cycle for refresh passes, host-wide.
+    pub max_calls_per_cycle: u64,
+    /// Forge calls per cycle for backfill passes, host-wide.
+    pub backfill_max_calls_per_cycle: u64,
+    /// The reserve floor, in remaining core calls.
+    pub reserve_calls: u64,
+    /// How far back a backfill reaches, in days.
+    pub backfill_days: i64,
+}
+
+impl Default for FleetRefreshConfig {
+    fn default() -> Self {
+        FleetRefreshConfig {
+            enabled: true,
+            interval_secs: DEFAULT_FLEET_REFRESH_INTERVAL_SECS,
+            max_calls_per_cycle: DEFAULT_FLEET_REFRESH_MAX_CALLS,
+            backfill_max_calls_per_cycle: DEFAULT_FLEET_REFRESH_BACKFILL_MAX_CALLS,
+            reserve_calls: DEFAULT_FLEET_REFRESH_RESERVE,
+            backfill_days: DEFAULT_FLEET_REFRESH_BACKFILL_DAYS,
+        }
+    }
+}
+
 /// Resolved ETA settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EtaConfig {
@@ -85,6 +153,8 @@ pub struct EtaConfig {
     pub current_land: Option<String>,
     /// Run the daily refit (#10245); only when [`Self::enabled`] too.
     pub fit_enabled: bool,
+    /// The fleet snapshot refresh task (#10263).
+    pub fleet_refresh: FleetRefreshConfig,
 }
 
 impl Default for EtaConfig {
@@ -98,6 +168,7 @@ impl Default for EtaConfig {
             current_finish: None,
             current_land: None,
             fit_enabled: true,
+            fleet_refresh: FleetRefreshConfig::default(),
         }
     }
 }
@@ -179,7 +250,57 @@ pub fn resolve(config: &serde_json::Value, env: impl Fn(&str) -> Option<String>)
         resolved.fit_enabled = v;
     }
     resolved.refresh_secs = resolved.refresh_secs.max(MIN_REFRESH_SECS);
+    resolved.fleet_refresh = resolve_fleet_refresh(block.and_then(|b| b.get("fleetRefresh")), &env);
     resolved
+}
+
+/// `autonomous.eta.fleetRefresh`, env > config > default, then clamped.
+fn resolve_fleet_refresh(
+    block: Option<&serde_json::Value>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> FleetRefreshConfig {
+    let get = |key: &str| block.and_then(|b| b.get(key));
+    let env_u64 = |key: &str| env(key).and_then(|s| s.trim().parse::<u64>().ok());
+    let mut c = FleetRefreshConfig::default();
+    if let Some(v) = get("enabled").and_then(serde_json::Value::as_bool) {
+        c.enabled = v;
+    }
+    if let Some(v) = env("LOOM_ETA_FLEET_REFRESH_ENABLED")
+        .as_deref()
+        .and_then(parse_bool)
+    {
+        c.enabled = v;
+    }
+    let u64_key = |slot: &mut u64, key: &str, var: &str| {
+        if let Some(v) = get(key).and_then(serde_json::Value::as_u64) {
+            *slot = v;
+        }
+        if let Some(v) = env_u64(var) {
+            *slot = v;
+        }
+    };
+    u64_key(&mut c.interval_secs, "intervalSecs", "LOOM_ETA_FLEET_REFRESH_INTERVAL_SECS");
+    u64_key(
+        &mut c.max_calls_per_cycle,
+        "maxCallsPerCycle",
+        "LOOM_ETA_FLEET_REFRESH_MAX_CALLS",
+    );
+    u64_key(
+        &mut c.backfill_max_calls_per_cycle,
+        "backfillMaxCallsPerCycle",
+        "LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS",
+    );
+    u64_key(&mut c.reserve_calls, "reserveCalls", "LOOM_ETA_FLEET_REFRESH_RESERVE");
+    if let Some(v) = get("backfillDays").and_then(serde_json::Value::as_i64) {
+        c.backfill_days = v;
+    }
+    if let Some(v) = env("LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS").and_then(|s| s.trim().parse().ok())
+    {
+        c.backfill_days = v;
+    }
+    c.interval_secs = c.interval_secs.max(MIN_FLEET_REFRESH_INTERVAL_SECS);
+    c.backfill_days = c.backfill_days.max(MIN_FLEET_REFRESH_BACKFILL_DAYS);
+    c
 }
 
 /// Read the configuration for `workspace_root` from its effective config and
