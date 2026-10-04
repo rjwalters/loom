@@ -23,12 +23,17 @@
 //! — it waits on a person, not a queue, and is a large share of open-PR time
 //! (#10218 builds the estimator for it; this only exposes the stage).
 //!
-//! # What PR 1 cannot see yet
+//! # Open-PR lockout
 //!
-//! `pr_open_skip_lockout` needs each open PR's closing references, which the
-//! issue-events listing does not carry; it is `null` until #10197 PR 2 adds
-//! that fetcher. Items with no event inside the cache's window are invisible:
-//! an item untouched since before the window is not reported as open.
+//! The work finder's open-PR guard (#4123) refuses to dispatch an issue while
+//! a PR that closes it is open (`pr-open-skip`). From the pulls listing's
+//! `closing_ref` rows ([`super::fleet_events_pulls`]) each open issue gets
+//! [`ItemState::open_pr`], and `pr_open_skip_lockout` is whether any
+//! `ready_wait` issue has one. It is `null` while no `closing_ref` row
+//! precedes `as_of` — a cache that never read the pulls listing cannot say.
+//!
+//! Items with no event inside the cache's window are invisible: an item
+//! untouched since before the window is not reported as open.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -162,6 +167,9 @@ pub struct ItemState {
     pub opened_at: DateTime<Utc>,
     /// Carries an operator label.
     pub operator_hold: bool,
+    /// For an issue: the lowest-numbered open PR whose body closes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_pr: Option<u32>,
 }
 
 /// The whole fleet of one repo at one instant.
@@ -183,8 +191,9 @@ pub struct FleetState {
     pub operator_holds: usize,
     /// Open PRs in [`ItemStage::HeldForHuman`].
     pub held_for_human: usize,
-    /// Whether the repo's ready queue was frozen behind the open-PR guard.
-    /// `null` until closing references are cached (#10197 PR 2).
+    /// Whether a `ready_wait` issue had an open PR closing it — a
+    /// `pr-open-skip` row on the work finder's plan. `null` until the cache
+    /// holds closing references from before `as_of`.
     pub pr_open_skip_lockout: Option<bool>,
     /// Open items per stage name.
     pub stage_counts: BTreeMap<String, usize>,
@@ -201,6 +210,8 @@ struct Replay {
     labels: BTreeSet<String>,
     stage: Option<ItemStage>,
     stage_entered_at: Option<DateTime<Utc>>,
+    /// For a PR: the issues its body closes.
+    closes: BTreeSet<u32>,
 }
 
 /// `repo`'s fleet at `as_of`, from `events` (any order, any repos).
@@ -215,6 +226,7 @@ pub fn fleet_state(events: &[RawEvent], repo: &str, as_of: DateTime<Utc>) -> Fle
     known.dedup_by(|a, b| a.id == b.id);
 
     let mut items: BTreeMap<(ItemKind, u32), Replay> = BTreeMap::new();
+    let mut refs_known = false;
     for event in &known {
         let item = items.entry((event.item_kind, event.item)).or_default();
         item.kind = Some(event.item_kind);
@@ -238,12 +250,26 @@ pub fn fleet_state(events: &[RawEvent], repo: &str, as_of: DateTime<Utc>) -> Fle
             }
             EventKind::Closed | EventKind::Merged => item.open = false,
             EventKind::Reopened => item.open = true,
+            EventKind::ClosingRef => {
+                refs_known = true;
+                item.closes.extend(event.target);
+            }
             EventKind::Review | EventKind::CheckRun => {}
         }
         let stage = item_stage(event.item_kind, &item.labels);
         if item.stage != Some(stage) || matches!(event.kind, EventKind::Reopened) {
             item.stage = Some(stage);
             item.stage_entered_at = Some(event.event_time);
+        }
+    }
+
+    // Issue -> lowest open PR closing it.
+    let mut closed_by: BTreeMap<u32, u32> = BTreeMap::new();
+    for ((kind, number), item) in &items {
+        if *kind == ItemKind::Pr && item.open {
+            for issue in &item.closes {
+                closed_by.entry(*issue).or_insert(*number);
+            }
         }
     }
 
@@ -297,7 +323,19 @@ pub fn fleet_state(events: &[RawEvent], repo: &str, as_of: DateTime<Utc>) -> Fle
             time_in_stage_sec: (as_of - entered).num_seconds(),
             opened_at: item.opened_at.unwrap_or(first),
             operator_hold: hold,
+            open_pr: match kind {
+                ItemKind::Issue => closed_by.get(&number).copied(),
+                ItemKind::Pr => None,
+            },
         });
+    }
+    if refs_known {
+        state.pr_open_skip_lockout = Some(
+            state
+                .items
+                .iter()
+                .any(|i| i.stage == ItemStage::ReadyWait && i.open_pr.is_some()),
+        );
     }
     state
 }

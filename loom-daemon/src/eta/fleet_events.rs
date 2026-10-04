@@ -49,9 +49,10 @@
 //! # Sources
 //!
 //! The sync driver ([`sync`]) is source-agnostic: it pages a
-//! [`RawEventSource`]. PR 1 ships the forge source
-//! ([`super::fleet_events_forge`], the repo-wide issue-events listing); the
-//! webhook-mirror importer and the merge/CI fetchers are PR 2.
+//! [`RawEventSource`]. The forge sources are the repo-wide issue-events
+//! listing ([`super::fleet_events_forge`]) and the pulls listing (open, merge
+//! and close times plus closing references, [`super::fleet_events_pulls`]);
+//! the webhook-mirror importer and the review/CI fetchers are still to come.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -89,8 +90,9 @@ impl ItemKind {
 /// What happened to the item.
 ///
 /// `Review` and `CheckRun` are part of the schema now so the file format does
-/// not change when PR 2's fetchers start producing them; PR 1's forge source
-/// emits only the first six.
+/// not change when a later fetcher starts producing them; nothing emits them
+/// yet. `ClosingRef` comes from the pulls listing
+/// ([`super::fleet_events_pulls`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
@@ -102,6 +104,10 @@ pub enum EventKind {
     Merged,
     Review,
     CheckRun,
+    /// A PR's body names an issue it closes ([`RawEvent::target`]), or — with
+    /// no target — names none. Either way it records that the PR's closing
+    /// references were read.
+    ClosingRef,
 }
 
 impl EventKind {
@@ -116,6 +122,7 @@ impl EventKind {
             EventKind::Merged => "merged",
             EventKind::Review => "review",
             EventKind::CheckRun => "check_run",
+            EventKind::ClosingRef => "closing_ref",
         }
     }
 }
@@ -137,6 +144,11 @@ pub struct RawEvent {
     /// The label, for `label_added` / `label_removed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The issue a `closing_ref` row says the PR closes. Absent on every
+    /// other row, and then not part of the id, so rows written before the
+    /// field existed keep their ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<u32>,
     /// When it happened on the forge — the knowable-at instant.
     pub event_time: DateTime<Utc>,
     /// Where the row came from ([`SOURCE_FORGE`], later `webhook-mirror`).
@@ -171,6 +183,7 @@ impl RawEvent {
             item_kind,
             kind,
             label,
+            target: None,
             event_time,
             source: source.to_string(),
             seq,
@@ -180,12 +193,21 @@ impl RawEvent {
         event
     }
 
+    /// The same row naming `target` (a `closing_ref`'s issue), id re-derived.
+    #[must_use]
+    pub fn with_target(mut self, target: Option<u32>) -> Self {
+        self.target = target;
+        self.id = self.derive_id();
+        self
+    }
+
     fn derive_id(&self) -> String {
         let repo = self.repo.to_ascii_lowercase();
         let item = self.item.to_string();
         let seq = self.seq.to_string();
         let at = crate::telemetry::trace::instant(self.event_time);
-        let parts = [
+        let target = self.target.map(|t| format!("target={t}"));
+        let mut parts = vec![
             "loom.eta.fleet.event",
             repo.as_str(),
             self.source.as_str(),
@@ -196,6 +218,9 @@ impl RawEvent {
             at.as_str(),
             seq.as_str(),
         ];
+        if let Some(target) = &target {
+            parts.push(target.as_str());
+        }
         crate::telemetry::trace::derived_hex(&parts, 16)
     }
 

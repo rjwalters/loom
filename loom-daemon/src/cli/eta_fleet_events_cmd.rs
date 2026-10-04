@@ -1,9 +1,9 @@
 //! `loom-daemon eta fleet events backfill|refresh` and
-//! `loom-daemon eta fleet state --as-of` (#10197, PR 1).
+//! `loom-daemon eta fleet state --as-of` (#10197).
 //!
-//! - `events backfill` walks the repo's issue-events listing from where the
-//!   cursor left off to the end of the listing, checkpointing after every
-//!   page. A rate-limit stop, the reserve floor or `--max-pages` ends the run
+//! - `events backfill` walks each endpoint (`--endpoint`, default both: the
+//!   issue-events listing, then the pulls listing) from where its cursor left
+//!   off to the end of the listing, checkpointing after every page. A rate-limit stop, the reserve floor or `--max-pages` ends the run
 //!   cleanly with exit `75` (`EX_TEMPFAIL`); re-running resumes at the next
 //!   unread page.
 //! - `events refresh` reads from the head (page 1 conditional on the cached
@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 
 use loom_daemon::eta::fleet_agreement;
 use loom_daemon::eta::fleet_events::{self, EventLog, EventsCursor, SyncMode, SyncOutcome};
-use loom_daemon::eta::fleet_events_forge::ForgeIssueEvents;
+use loom_daemon::eta::fleet_events_forge::{ForgeEndpoint, ForgeEventSource};
 use loom_daemon::eta::fleet_state::{fleet_state, FleetState};
 
 /// `EX_TEMPFAIL`: the run stopped early and is resumable.
@@ -60,9 +60,14 @@ pub(crate) struct EventsSyncArgs {
     #[arg(long, value_name = "PATH")]
     pub repo_root: Option<PathBuf>,
 
-    /// Maximum page requests this run (100 events each).
+    /// Maximum page requests this run, per endpoint (100 rows each).
     #[arg(long, value_name = "N")]
     pub max_pages: Option<u64>,
+
+    /// Read only this listing: `issues-events` or `pulls`. Default: both, in
+    /// that order.
+    #[arg(long, value_name = "ENDPOINT", value_parser = parse_endpoint)]
+    pub endpoint: Option<ForgeEndpoint>,
 
     /// Stop once the forge reports fewer than this many core calls remaining.
     #[arg(long, value_name = "CALLS")]
@@ -77,40 +82,66 @@ impl EventsSyncArgs {
         let cursor_file = fleet_events::cursor_path(&root, &repo);
         let mut log = EventLog::open(&events)?;
         let mut cursor = EventsCursor::read(&cursor_file, &repo);
-        let mut source =
-            ForgeIssueEvents::new(&repo, &root, self.reserve.unwrap_or(DEFAULT_RESERVE));
-        let report = fleet_events::sync(
-            &mut source,
-            &mut log,
-            &mut cursor,
-            &cursor_file,
-            mode,
-            self.max_pages.unwrap_or(DEFAULT_MAX_PAGES),
-        )?;
-        println!(
-            "[eta fleet events] {repo}: {} page(s) read, {} event(s) appended, {} cached ({})",
-            report.pages,
-            report.appended,
-            log.len(),
-            events.display(),
-        );
-        match report.outcome {
-            SyncOutcome::Complete => {
-                if mode == SyncMode::Backfill {
-                    println!("[eta fleet events] backfill complete; use `refresh` from now on");
+        let endpoints: Vec<ForgeEndpoint> = match self.endpoint {
+            Some(e) => vec![e],
+            None => ForgeEndpoint::ALL.to_vec(),
+        };
+        let mut resumable = false;
+        for endpoint in endpoints {
+            let mut source = ForgeEventSource::new(
+                endpoint,
+                &repo,
+                &root,
+                self.reserve.unwrap_or(DEFAULT_RESERVE),
+            );
+            let report = fleet_events::sync(
+                &mut source,
+                &mut log,
+                &mut cursor,
+                &cursor_file,
+                mode,
+                self.max_pages.unwrap_or(DEFAULT_MAX_PAGES),
+            )?;
+            let name = endpoint.name();
+            println!(
+                "[eta fleet events] {repo} {name}: {} page(s) read, {} event(s) appended, {} cached ({})",
+                report.pages,
+                report.appended,
+                log.len(),
+                events.display(),
+            );
+            match report.outcome {
+                SyncOutcome::Complete => {
+                    if mode == SyncMode::Backfill {
+                        println!(
+                            "[eta fleet events] {name}: backfill complete; use `refresh` from now on"
+                        );
+                    }
                 }
-                Ok(())
-            }
-            SyncOutcome::PageBudget => {
-                eprintln!("[eta fleet events] page budget reached; re-run to continue");
-                std::process::exit(EXIT_RESUMABLE);
-            }
-            SyncOutcome::Stopped(why) => {
-                eprintln!("[eta fleet events] stopped: {why}; re-run to resume");
-                std::process::exit(EXIT_RESUMABLE);
+                SyncOutcome::PageBudget => {
+                    eprintln!("[eta fleet events] {name}: page budget reached; re-run to continue");
+                    resumable = true;
+                }
+                SyncOutcome::Stopped(why) => {
+                    // A rate limit or the reserve floor applies to every
+                    // endpoint alike: stop here rather than spend the next.
+                    eprintln!("[eta fleet events] {name}: stopped: {why}; re-run to resume");
+                    std::process::exit(EXIT_RESUMABLE);
+                }
             }
         }
+        if resumable {
+            std::process::exit(EXIT_RESUMABLE);
+        }
+        Ok(())
     }
+}
+
+fn parse_endpoint(name: &str) -> Result<ForgeEndpoint, String> {
+    ForgeEndpoint::from_name(name).ok_or_else(|| {
+        let known: Vec<&str> = ForgeEndpoint::ALL.iter().map(|e| e.name()).collect();
+        format!("unknown endpoint {name:?}; expected one of {}", known.join(", "))
+    })
 }
 
 #[derive(clap::Args)]
@@ -213,6 +244,10 @@ fn render(state: &FleetState) -> String {
     let _ = writeln!(out, "  building:        {}", state.building);
     let _ = writeln!(out, "  operator holds:  {}", state.operator_holds);
     let _ = writeln!(out, "  held for human:  {}", state.held_for_human);
+    let lockout = state
+        .pr_open_skip_lockout
+        .map_or("unknown (no closing refs cached)", |l| if l { "yes" } else { "no" });
+    let _ = writeln!(out, "  open-PR lockout: {lockout}");
     for (stage, n) in &state.stage_counts {
         let _ = writeln!(out, "    {stage:<15} {n}");
     }
@@ -244,5 +279,15 @@ mod tests {
         let text = render(&state);
         assert!(text.contains("fleet state o/r"), "{text}");
         assert!(text.contains("open PRs:        0"), "{text}");
+        assert!(text.contains("open-PR lockout: unknown"), "{text}");
+    }
+
+    #[test]
+    fn endpoint_names_parse_and_unknown_ones_are_refused() {
+        assert_eq!(parse_endpoint("pulls"), Ok(ForgeEndpoint::Pulls));
+        assert_eq!(parse_endpoint("issues-events"), Ok(ForgeEndpoint::IssuesEvents));
+        assert!(parse_endpoint("reviews")
+            .unwrap_err()
+            .contains("issues-events, pulls"));
     }
 }
