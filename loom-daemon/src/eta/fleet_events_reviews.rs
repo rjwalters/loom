@@ -10,8 +10,11 @@
 //!   [`EventKind::CheckRun`] rows per run, both with `seq` = the run id:
 //!   `started:<name>` at `started_at`, and, once the run has completed,
 //!   `<conclusion>:<name>` at `completed_at`. A queued run (no `started_at`)
-//!   yields nothing. GitHub's default `filter=latest` lists only the latest
-//!   run of each name, which is also how [`super::fleet_state_prs`] reads them.
+//!   yields nothing. Both carry the run's `head_sha` as
+//!   [`RawEvent::commit`] (part of the id), so runs of different heads never
+//!   merge and replay can read only the PR's head's runs. GitHub's default
+//!   `filter=latest` lists only the latest run of each name, which is also how
+//!   [`super::fleet_state_prs`] reads them.
 //!
 //! The item of every row is the PR the listing was read for — the fan-out
 //! driver ([`super::fleet_events_fanout`]) passes it; neither payload names it
@@ -54,6 +57,8 @@ struct RestCheckRun {
     started_at: Option<DateTime<Utc>>,
     #[serde(default)]
     completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    head_sha: Option<String>,
 }
 
 fn row(
@@ -111,12 +116,14 @@ pub fn parse_check_runs(
         let Some(started) = run.started_at else {
             continue;
         };
-        let start = format!("{STARTED}:{}", run.name);
-        events.push(row(repo, pr, EventKind::CheckRun, start, started, run.id, fetched_at));
+        let check = |label: String, at: DateTime<Utc>| {
+            row(repo, pr, EventKind::CheckRun, label, at, run.id, fetched_at)
+                .with_commit(run.head_sha.clone())
+        };
+        events.push(check(format!("{STARTED}:{}", run.name), started));
         if run.status.as_deref() == Some("completed") {
             if let (Some(conclusion), Some(done)) = (&run.conclusion, run.completed_at) {
-                let label = format!("{conclusion}:{}", run.name);
-                events.push(row(repo, pr, EventKind::CheckRun, label, done, run.id, fetched_at));
+                events.push(check(format!("{conclusion}:{}", run.name), done));
             }
         }
     }
@@ -150,9 +157,9 @@ mod tests {
     ]"#;
 
     const CHECKS: &str = r#"{"total_count": 3, "check_runs": [
-      {"id": 71, "name": "test: unit", "status": "completed", "conclusion": "failure",
+      {"id": 71, "name": "test: unit", "head_sha": "abc", "status": "completed", "conclusion": "failure",
        "started_at": "2026-10-03T10:00:00Z", "completed_at": "2026-10-03T10:05:00Z"},
-      {"id": 72, "name": "lint", "status": "in_progress", "conclusion": null,
+      {"id": 72, "name": "lint", "head_sha": "abc", "status": "in_progress", "conclusion": null,
        "started_at": "2026-10-03T10:00:30Z", "completed_at": null},
       {"id": 73, "name": "deploy", "status": "queued", "conclusion": null,
        "started_at": null, "completed_at": null}
@@ -196,6 +203,7 @@ mod tests {
         );
         // The two rows of one run share `seq` but not an id.
         assert_ne!(events[0].id, events[1].id);
+        assert!(events.iter().all(|e| e.commit.as_deref() == Some("abc")));
         assert_eq!(split_check_label("failure:test: unit"), Some(("failure", "test: unit")));
     }
 

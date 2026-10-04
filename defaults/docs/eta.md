@@ -1197,7 +1197,8 @@ of what is on disk and never needs a refetch.
   `submitted_at`, `seq` = review id) and `GET
   repos/{o}/{r}/commits/{head}/check-runs` (`check_run` rows, `seq` = run id:
   `started:<name>` at `started_at`, `<conclusion>:<name>` at
-  `completed_at`). A merged/closed PR is stored twice by design (the pulls
+  `completed_at`; each names its run's `head_sha` in `commit`, part of the
+  id only when present, so older rows keep their ids). A merged/closed PR is stored twice by design (the pulls
   row has `seq` 0, the issue-events row the event id). A pulls refresh reads
   only the newest pages: closures of older PRs arrive via the issue-events
   refresh, and body edits on older PRs are not seen. A rate-limit stop, the
@@ -1215,11 +1216,14 @@ of what is on disk and never needs a refetch.
   features (PR size, model, host pool) are listed, not scored.
 - **Per-PR endpoints** (`reviews`, `check-runs`) take their work list from
   the cache: every PR it holds (check runs: those with a `head_commit` row).
-  Each run polls every **open** PR (page 1 conditional on that PR's ETag) and
-  then reads each **closed** PR not yet settled — once, in full,
-  unconditionally — appending a settle marker (the endpoint's kind, no label,
-  stamped at the close time) so it is never read again. Open PRs go first,
-  then closed PRs newest-numbered first. The per-PR cursor keys
+  An **open** PR is polled (page 1 conditional on that PR's ETag); a
+  **closed** PR not yet settled is read once, in full, unconditionally, then
+  a settle marker (the endpoint's kind, no label, stamped at the close time)
+  means it is never read again. Pending PRs are walked newest-numbered first
+  as a cycle: the ledger entry's `resume_after` (cursor field, added here,
+  absent in older cursors) names the PR last completed and the next run
+  starts after it, wrapping, so under any `--max-pages` every pending PR is
+  reached in bounded runs. The per-PR cursor keys
   (`forge:reviews#<n>`, `forge:check-runs#<n>@<sha>`) exist only while a PR is
   open or mid-walk; `forge:reviews` / `forge:check-runs` keep the call ledger.
   `backfill` and `refresh` behave the same for these two.
@@ -1239,9 +1243,12 @@ of what is on disk and never needs a refetch.
   `--as-of`; during an unfinished pulls backfill it can read `false` rather
   than unknown (older PRs not yet read link nothing). The guard's PR-author
   trust filter is not reproduced (can only over-report). An item untouched
-  since before the cache window is not reported open. Check runs are cached
-  for a PR's **last** head only: before that head's first run started, a PR's
-  CI is unknown (never `none`). A review's state is its current one, so an
+  since before the cache window is not reported open. A PR's CI at `t` reads
+  only runs of its head at `t` (the latest `head_commit` row before `t`); it
+  is unknown (never `none`, never an older head's verdict) with no head row,
+  no started run of that head, or a run on a commit no head row before `t`
+  names (a newer push). A closed PR's runs are cached for its **last** head
+  only; rows without `commit` are ignored. A review's state is its current one, so an
   approval dismissed later reads as dismissed from its submission (can only
   under-report approvals). The CI and approval counts are absent until a row
   of their listing precedes `--as-of`. Not yet cached: the webhook-mirror

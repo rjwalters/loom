@@ -421,8 +421,11 @@ mod tests {
         let events = vec![
             ev(7, ItemKind::Issue, EventKind::Opened, None, 0, 0),
             ev(9, ItemKind::Pr, EventKind::Opened, None, 30, 0),
-            ev(9, ItemKind::Pr, EventKind::CheckRun, Some("started:test"), 40, 55),
-            ev(9, ItemKind::Pr, EventKind::CheckRun, Some("failure:test"), 900, 55),
+            ev(9, ItemKind::Pr, EventKind::HeadCommit, Some("h"), 35, 0),
+            ev(9, ItemKind::Pr, EventKind::CheckRun, Some("started:test"), 40, 55)
+                .with_commit(Some("h".to_string())),
+            ev(9, ItemKind::Pr, EventKind::CheckRun, Some("failure:test"), 900, 55)
+                .with_commit(Some("h".to_string())),
         ];
         let logged = |as_of: &str, ci: &str| {
             let mut e = explanation(

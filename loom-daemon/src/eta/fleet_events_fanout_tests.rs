@@ -211,14 +211,14 @@ fn a_full_walk_settles_closed_prs_and_keeps_only_open_ones_in_the_cursor() {
     assert_eq!(first.report.outcome, SyncOutcome::Complete);
     assert_eq!(first.report.settled, 3);
     assert_eq!(first.report.remaining, 0);
-    // Open PR 3 first, then closed PRs newest-numbered first; PR 4 spans
-    // three pages.
+    // Newest-numbered first, open or closed; PR 4 spans three pages.
     let order: Vec<(u32, u32)> = first.requests.iter().map(|(p, n, _)| (*p, *n)).collect();
-    assert_eq!(order, vec![(3, 1), (4, 1), (4, 2), (4, 3), (2, 1), (1, 1)]);
+    assert_eq!(order, vec![(4, 1), (4, 2), (4, 3), (3, 1), (2, 1), (1, 1)]);
     let cursor = EventsCursor::read(&dir.path().join("events.cursor.json"), REPO);
     let keys: Vec<&str> = cursor.endpoints.keys().map(String::as_str).collect();
     assert_eq!(keys, vec!["forge:reviews", "forge:reviews#3"]);
     assert_eq!(cursor.endpoints["forge:reviews"].pages_fetched, 6);
+    assert_eq!(cursor.endpoints["forge:reviews"].resume_after, Some(1));
     let events = load_events(&dir.path().join("events.jsonl"));
     assert_eq!(
         events
@@ -244,8 +244,9 @@ impl FakeReviews {
 
 #[test]
 fn a_killed_walk_resumes_without_rereading_and_is_byte_identical() {
-    // With an open PR in the mix (it is re-polled, conditionally, on every
-    // run by design, so only the events file is compared) and without one
+    // With an open PR in the mix (a resumed run may reach it again and
+    // re-poll it conditionally, so only the events file is compared) and
+    // without one
     // (the cursor, call ledger included, is byte-identical too).
     let closed_only: Vec<RawEvent> = cache().into_iter().filter(|e| e.item != 3).collect();
     for (seed, compare_cursor) in [(cache(), false), (closed_only, true)] {
@@ -329,14 +330,14 @@ fn a_kill_between_the_settle_walk_and_its_marker_rereads_nothing() {
 fn the_page_budget_is_shared_by_every_pr_of_the_endpoint() {
     let dir = tempfile::tempdir().unwrap();
     let mut source = FakeReviews::new();
-    let first = run(dir.path(), &mut source, 3);
+    let first = run(dir.path(), &mut source, 2);
     assert_eq!(first.report.outcome, SyncOutcome::PageBudget);
-    assert_eq!(first.report.pages, 3);
-    // PR 3 (open) read; PR 4 two pages in; nothing settled yet.
+    assert_eq!(first.report.pages, 2);
+    // PR 4 two pages in; nothing settled yet.
     assert_eq!((first.report.settled, first.report.remaining), (0, 3));
     let second = run(dir.path(), &mut source, 100);
     assert_eq!(second.report.outcome, SyncOutcome::Complete);
-    assert_eq!(second.requests[1], (4, 3, None), "PR 4 resumes at page 3");
+    assert_eq!(second.requests[0], (4, 3, None), "PR 4 resumes at page 3");
     assert_eq!(second.report.remaining, 0);
 }
 
@@ -400,4 +401,86 @@ fn a_moved_head_drops_the_old_check_runs_key() {
     assert!(cursor.endpoints.contains_key("forge:pulls"), "other endpoints untouched");
     assert!(!cursor.endpoints.contains_key("forge:check-runs#3@old"));
     assert_eq!(PerPrKind::CheckRuns.item_key(3, Some("ccc")), "forge:check-runs#3@ccc");
+}
+
+/// Runs at `max_pages` until every PR of `want` has been requested at least
+/// once; returns how many runs that took (`None` past `limit`).
+fn runs_until_all_visited(
+    dir: &Path,
+    source: &mut FakeReviews,
+    seed: &[RawEvent],
+    max_pages: u64,
+    want: &[u32],
+    limit: usize,
+) -> Option<usize> {
+    let mut seen = BTreeSet::new();
+    for n in 1..=limit {
+        let r = run_on(dir, source, max_pages, seed);
+        seen.extend(r.requests.iter().map(|(p, _, _)| *p));
+        if want.iter().all(|p| seen.contains(p)) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+#[test]
+fn a_one_page_budget_reaches_the_closed_pr_behind_an_open_one() {
+    // Open PR 3 (one page) and closed PR 2, `--max-pages 1`, in either
+    // numbering: repeated runs never spend every page on the open PR.
+    for (open, closed) in [(3, 2), (2, 3)] {
+        let seed = vec![
+            pr_row(open, EventKind::Opened, None, 0, 0),
+            pr_row(closed, EventKind::Opened, None, 1, 0),
+            pr_row(closed, EventKind::Closed, None, 50, 0),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = FakeReviews::new();
+        source.rows.insert(2, vec![review(2, "approved", 10, 21)]);
+        source.rows.insert(3, vec![review(3, "approved", 10, 31)]);
+        let mut settled = false;
+        for _ in 0..3 {
+            let r = run_on(dir.path(), &mut source, 1, &seed);
+            assert!(r.report.pages <= 1);
+            settled |= r.report.settled == 1;
+        }
+        assert!(settled, "closed PR {closed} never reached behind open PR {open}");
+        let work = pr_work(&load_events(&dir.path().join("events.jsonl")), REPO);
+        assert!(!work
+            .iter()
+            .any(|w| w.pending(PerPrKind::Reviews) && w.closed_at.is_some()));
+        // And the open PR keeps being polled afterwards.
+        let again = run_on(dir.path(), &mut source, 1, &seed);
+        assert_eq!(again.requests.len(), 1);
+        assert_eq!(again.requests[0].0, open);
+    }
+}
+
+#[test]
+fn more_open_prs_than_the_budget_are_all_visited_in_bounded_runs() {
+    let prs: Vec<u32> = (10..17).collect();
+    let seed: Vec<RawEvent> = prs
+        .iter()
+        .map(|&p| pr_row(p, EventKind::Opened, None, i64::from(p), 0))
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let mut source = FakeReviews::new();
+    for &p in &prs {
+        source
+            .rows
+            .insert(p, vec![review(p, "commented", 100, u64::from(p) * 10)]);
+    }
+    // 7 one-page PRs at 2 pages a run: the backfill reaches all in 4 runs.
+    assert_eq!(runs_until_all_visited(dir.path(), &mut source, &seed, 2, &prs, 10), Some(4));
+    // Once walked, the conditional polls rotate too: every PR again in 4.
+    let polled = runs_until_all_visited(dir.path(), &mut source, &seed, 2, &prs, 10);
+    assert_eq!(polled, Some(4));
+    let events = load_events(&dir.path().join("events.jsonl"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::Review)
+            .count(),
+        prs.len()
+    );
 }

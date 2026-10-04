@@ -352,8 +352,22 @@ fn closing_refs_at_or_after_the_instant_cannot_change_the_answer() {
     );
 }
 
+/// A check-run row of PR `pr`'s commit `h<pr>`.
 fn check(pr: u32, label: &str, secs: i64, run: u64) -> RawEvent {
     ev(pr, ItemKind::Pr, EventKind::CheckRun, Some(label), secs, run)
+        .with_commit(Some(format!("h{pr}")))
+}
+
+/// PR `pr`'s head is `h<pr>` from `secs` on.
+fn head(pr: u32, secs: i64) -> RawEvent {
+    ev(
+        pr,
+        ItemKind::Pr,
+        EventKind::HeadCommit,
+        Some(format!("h{pr}").as_str()),
+        secs,
+        0,
+    )
 }
 
 fn review(pr: u32, state: &str, secs: i64, id: u64) -> RawEvent {
@@ -373,7 +387,8 @@ fn reviewed_fleet() -> Vec<RawEvent> {
         check(11, "started:test", 620, 3),
         check(11, "success:test", 960, 3),
         review(12, "approved", 640, 22),
-        ev(11, ItemKind::Pr, EventKind::HeadCommit, Some("abc"), 615, 0),
+        head(10, 605),
+        head(11, 615),
     ]);
     events
 }
@@ -428,6 +443,7 @@ fn a_check_run_before_the_pr_opened_does_not_open_it() {
     // CI on a pushed branch runs before the PR exists.
     let events = vec![
         check(30, "started:test", 50, 1),
+        head(30, 60),
         opened(30, ItemKind::Pr, 100),
     ];
     let state = fleet_state(&events, REPO, t(80));
@@ -451,6 +467,8 @@ fn reviews_and_check_runs_at_or_after_the_instant_cannot_change_the_answer() {
         review(10, "changes_requested", 1000, 30),
         review(11, "approved", 5000, 31),
         ev(10, ItemKind::Pr, EventKind::HeadCommit, Some("zzz"), 1000, 0),
+        ev(11, ItemKind::Pr, EventKind::CheckRun, Some("started:x"), 1000, 11)
+            .with_commit(Some("zzz".to_string())),
     ]);
     let mut marker = review(11, "x", 1000, 0);
     marker.label = None;
@@ -475,6 +493,7 @@ fn review_and_check_rows_replay_the_same_in_any_input_order() {
     // order is the content id's, and the answer does not depend on it.
     let same_second = vec![
         opened(40, ItemKind::Pr, 0),
+        head(40, 0),
         check(40, "failure:x", 10, 7),
         check(40, "started:x", 10, 7),
     ];

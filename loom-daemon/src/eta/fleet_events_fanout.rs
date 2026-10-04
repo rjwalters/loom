@@ -13,11 +13,16 @@
 //!   then *settled*: a marker row (the endpoint's event kind, no `label`,
 //!   `seq` 0, stamped at the PR's close time) is appended, and the PR is never
 //!   read again. A PR reopened and closed again has a new close time and is
-//!   read once more. An **open** PR is re-read on every run, page 1
+//!   read once more. An **open** PR is re-read whenever a run reaches it, page 1
 //!   conditional on its cached ETag, so a quiet PR costs a `304`.
 //! - **One page budget per endpoint.** `max_pages` is shared by every PR of
-//!   one endpoint in one run; each PR costs at least one page. Open PRs go
-//!   first (freshness), then unsettled closed PRs newest-numbered first.
+//!   one endpoint in one run; each PR costs at least one page.
+//! - **A rotating start.** Pending PRs (open, and unsettled closed) are
+//!   walked newest-numbered first as a cycle: the endpoint's ledger entry
+//!   records the PR whose walk last completed (`resume_after`), and the next
+//!   run starts after it, wrapping. A run never restarts at the same open PRs,
+//!   so with any budget every pending PR is reached within
+//!   `ceil(pages needed / max_pages)` runs and no PR starves.
 //!
 //! Each PR's walk is an ordinary [`sync`] of the same [`RawEventSource`],
 //! under its own cursor key (`forge:reviews#<n>`,
@@ -36,9 +41,10 @@
 //! # Known limits
 //!
 //! - Only the **last** head commit the pulls listing showed is read for a
-//!   closed PR, so check runs of earlier pushes are not cached. For an instant
-//!   before that head was pushed the cache holds none of its runs, which
-//!   [`super::fleet_state_prs`] reports as unknown, never as "no CI".
+//!   closed PR, so check runs of earlier pushes are not cached. Every row
+//!   names its commit, and [`super::fleet_state_prs`] reads only the head at
+//!   `t`'s runs, so an instant before that head was recorded is unknown,
+//!   never "no CI" and never another head's verdict.
 //! - An open PR's conditional refresh can miss reviews or runs past a full
 //!   first page (over 100); its settle walk after close reads everything.
 //! - A review submitted after the PR closed is read only if it landed before
@@ -188,6 +194,26 @@ pub trait PerPrSource: RawEventSource {
     fn select(&mut self, pr: u32, sha: Option<&str>);
 }
 
+/// The pending PRs of `work` in the order this run visits them: newest-numbered
+/// first, as a cycle that starts after the ledger's `resume_after` (the PR
+/// whose walk last completed) and wraps. A PR interrupted mid-walk is not
+/// passed, so the next run resumes it first; a completed one moves to the
+/// back. Every pending PR is thus reached within a bounded number of runs,
+/// whatever `max_pages` is.
+fn visit_order<'a>(work: &'a [PrWork], kind: PerPrKind, cursor: &EventsCursor) -> Vec<&'a PrWork> {
+    let mut pending: Vec<&PrWork> = work.iter().filter(|w| w.pending(kind)).collect();
+    pending.sort_by_key(|w| std::cmp::Reverse(w.pr));
+    let after = cursor
+        .endpoints
+        .get(&kind.ledger_key())
+        .and_then(|c| c.resume_after);
+    if let Some(after) = after {
+        let start = pending.iter().position(|w| w.pr < after).unwrap_or(0);
+        pending.rotate_left(start);
+    }
+    pending
+}
+
 /// What a [`sync_per_pr`] run did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FanoutReport {
@@ -220,8 +246,7 @@ pub fn sync_per_pr(
     max_pages: u64,
     now: DateTime<Utc>,
 ) -> std::io::Result<FanoutReport> {
-    let mut pending: Vec<&PrWork> = work.iter().filter(|w| w.pending(kind)).collect();
-    pending.sort_by_key(|w| (w.closed_at.is_some(), std::cmp::Reverse(w.pr)));
+    let pending = visit_order(work, kind, cursor);
     let mut remaining = pending.iter().filter(|w| w.closed_at.is_some()).count();
 
     // Drop keys the work list no longer names (settled, or a moved head).
@@ -280,6 +305,11 @@ pub fn sync_per_pr(
             .or_default()
             .pages_fetched += run.pages;
         if run.outcome == SyncOutcome::Complete {
+            cursor
+                .endpoints
+                .entry(kind.ledger_key())
+                .or_default()
+                .resume_after = Some(w.pr);
             if let Some(closed_at) = w.closed_at {
                 let marker = settle_marker(&cursor.repo, w.pr, kind, closed_at, now);
                 report.appended += log.append(&[marker])?;

@@ -113,8 +113,8 @@ pub enum EventKind {
     ClosingRef,
     /// The PR's head commit (`label` = the SHA) as the pulls listing showed
     /// it, stamped at the PR's `updated_at`: a push bumps `updated_at`, so the
-    /// head was this commit by then. The work list of the check-run fetcher;
-    /// [`super::fleet_state`] does not read it.
+    /// head was this commit by then. The work list of the check-run fetcher,
+    /// and the head [`super::fleet_state_prs`] scopes a PR's CI to.
     HeadCommit,
 }
 
@@ -162,6 +162,11 @@ pub struct RawEvent {
     /// field existed keep their ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<u32>,
+    /// The commit a `check_run` row's run ran on (its `head_sha`), so replay
+    /// can scope CI to the PR's head ([`super::fleet_state_prs`]). Absent on
+    /// every other row, and then not part of the id, like `target`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
     /// When it happened on the forge — the knowable-at instant.
     pub event_time: DateTime<Utc>,
     /// Where the row came from ([`SOURCE_FORGE`], later `webhook-mirror`).
@@ -197,6 +202,7 @@ impl RawEvent {
             kind,
             label,
             target: None,
+            commit: None,
             event_time,
             source: source.to_string(),
             seq,
@@ -214,12 +220,21 @@ impl RawEvent {
         self
     }
 
+    /// The same row naming the `commit` its run ran on, id re-derived.
+    #[must_use]
+    pub fn with_commit(mut self, commit: Option<String>) -> Self {
+        self.commit = commit;
+        self.id = self.derive_id();
+        self
+    }
+
     fn derive_id(&self) -> String {
         let repo = self.repo.to_ascii_lowercase();
         let item = self.item.to_string();
         let seq = self.seq.to_string();
         let at = crate::telemetry::trace::instant(self.event_time);
         let target = self.target.map(|t| format!("target={t}"));
+        let commit = self.commit.as_ref().map(|c| format!("commit={c}"));
         let mut parts = vec![
             "loom.eta.fleet.event",
             repo.as_str(),
@@ -233,6 +248,9 @@ impl RawEvent {
         ];
         if let Some(target) = &target {
             parts.push(target.as_str());
+        }
+        if let Some(commit) = &commit {
+            parts.push(commit.as_str());
         }
         crate::telemetry::trace::derived_hex(&parts, 16)
     }
@@ -403,6 +421,11 @@ pub struct EndpointCursor {
     /// write, so a kill before it re-reads nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settle_for: Option<DateTime<Utc>>,
+    /// On a per-PR endpoint's ledger entry: the PR whose walk last completed.
+    /// The next run starts at the PR after it (wrapping), so bounded runs
+    /// visit every pending PR ([`super::fleet_events_fanout`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_after: Option<u32>,
 }
 
 /// The cursor file: per-endpoint resume state for one repo.
