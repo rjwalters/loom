@@ -19,9 +19,15 @@ source; the full both-legs send (inbox + Matrix) stays in
   that is already merged.
 - **Config resolves like the daemon** (#10137): `LOOM_UI_INBOX_URL` /
   `LOOM_UI_INGEST_KEY` win when set; otherwise `loom-daemon forge inbox-config`
-  supplies the URL (origin of the observability endpoint) and the ingest key
-  *file* (`$LOOM_OBSERVABILITY_INGEST_KEY_FILE`, `observability.ingestKeyFile`,
-  `~/.loom/observability/ingest.key`). An older daemon without the subcommand
+  supplies the URL -- the origin of the observability endpoint, but **only** an
+  `https` endpoint whose path is `/ingest` (a daemon exporting straight to the
+  dashboard); an `http`, loopback, collector-port, bare-origin or other-path
+  endpoint leaves it unresolved -- and the ingest key *file*, first of:
+  `$LOOM_UI_INGEST_KEY_FILE`, `~/.config/loom-ui/ingest.key` (preferred: the
+  per-host dashboard key; loom-ui `docs/operator-mail-onboarding.md`), then the
+  telemetry tiers (`$LOOM_OBSERVABILITY_INGEST_KEY_FILE`,
+  `observability.ingestKeyFile`, `~/.loom/observability/ingest.key` -- the
+  dashboard key only on hosts exporting directly to `/ingest`). An older daemon without the subcommand
   gives the env-only behavior. `loom-daemon health` reports an unresolved
   mail-meant host on every run (`inbox_mail` section).
 - **No-op when unconfigured**: neither the env vars nor the daemon resolve a URL and key

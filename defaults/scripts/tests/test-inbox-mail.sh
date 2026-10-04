@@ -157,6 +157,14 @@ out=$(LOOM_UI_INBOX_URL=http://env.test LOOM_UI_INGEST_KEY=envkey MATRIX_POST="$
 unset STUB_CFG
 out=$(MATRIX_POST="$T/post.sh" TO=@op:x BODY=b bash "$T/send.sh" 2>&1); rc=$?
 { [ $rc -eq 2 ] && grep -q 'SEND NOT ATTEMPTED' <<<"$out" && grep -q 'ingest.key' <<<"$out"; } && ok "mail-send: names what is missing (exit 2)" || bad "mail-send missing rc=$rc"
+grep -qF '~/.config/loom-ui/ingest.key' <<<"$out" && ok "mail-send: missing names the dashboard key file first" || bad "mail-send missing location: $out"
+
+# Key-file tier order (#10137 builder caution) is resolved daemon-side (stubbed here);
+# pin the documented order: dashboard tiers before every telemetry tier.
+tiers=$(tr '\n' ' ' <"$DOC" | grep -o 'LOOM_UI_INGEST_KEY_FILE.*observability/ingest\.key' | head -1)
+{ [ -n "$tiers" ] && grep -qF '~/.config/loom-ui/ingest.key' <<<"$tiers" && grep -qF 'LOOM_OBSERVABILITY_INGEST_KEY_FILE' <<<"$tiers"; } \
+  && ok "doc: dashboard key tiers precede telemetry tiers" || bad "doc tier order"
+grep -q 'https.*/ingest' "$DOC" && ok "doc: URL derived only from https /ingest" || bad "doc URL rule"
 
 
 [ "$fails" -eq 0 ] && echo "ALL PASSED" || { echo "$fails failed"; exit 1; }

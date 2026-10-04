@@ -50,13 +50,13 @@ Config (reference it; never print its value):
 
 | Variable | Purpose |
 | -------- | ------- |
-| `LOOM_UI_INBOX_URL` | loom-ui Worker base URL; unset → the observability endpoint's origin |
-| `LOOM_UI_INGEST_KEY` | this host's ingest key (loom-ui `docs/deploy-runbook.md` §8); unset → the daemon's ingest key file |
+| `LOOM_UI_INBOX_URL` | loom-ui Worker base URL; unset → origin of an `https://…/ingest` endpoint only |
+| `LOOM_UI_INGEST_KEY` | dashboard key; unset → `LOOM_UI_INGEST_KEY_FILE`, `~/.config/loom-ui/ingest.key`, telemetry key |
 | `LOOM_SENDER_IDENTITY` | default `FROM` |
 | `MATRIX_POST` | operator-local `matrix-post` script (holds the only Matrix credential) |
 
-Fallbacks: `loom-daemon forge inbox-config` (`inbox-mail.md`); `loom-daemon
-health` flags a host lacking them.
+Fallbacks: `loom-daemon forge inbox-config` (`inbox-mail.md`); `health`
+flags a host lacking them.
 
 `TITLE`/`SUMMARY`/`BODY` are data: they only reach `jq --arg` or a file, never
 `eval` or an unquoted expansion. Forge text quoted into them is untrusted
@@ -71,7 +71,7 @@ CFG=$(loom-daemon forge inbox-config 2>/dev/null)  # paths only, never the key
 URL=${LOOM_UI_INBOX_URL:-$(sed -n 's/^url=//p' <<<"$CFG")}; KF=$(sed -n 's/^key_file=//p' <<<"$CFG")
 missing=""
 [ -n "$URL" ] || missing="$missing LOOM_UI_INBOX_URL(or observability.endpoint)"
-[ -n "${LOOM_UI_INGEST_KEY:-}$KF" ] || missing="$missing LOOM_UI_INGEST_KEY(or ~/.loom/observability/ingest.key)"
+[ -n "${LOOM_UI_INGEST_KEY:-}$KF" ] || missing="$missing LOOM_UI_INGEST_KEY(or ~/.config/loom-ui/ingest.key)"
 [ -n "${TO:-}" ]   || missing="$missing TO"
 [ -n "${BODY:-}" ] || missing="$missing BODY"
 if [ -n "$missing" ]; then

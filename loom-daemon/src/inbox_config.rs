@@ -3,12 +3,21 @@
 //! (#10137), and report when a mail-meant host cannot send.
 //!
 //! Precedence for the URL: `$LOOM_UI_INBOX_URL`, else the origin of the
-//! observability endpoint (`https://<dashboard>/ingest` -> `https://<dashboard>`),
-//! refusing reserved placeholder hosts and loopback (an edge collector is not
-//! the inbox). The key itself is `$LOOM_UI_INGEST_KEY` (honoured by the shell
-//! consumers), else the file [`crate::observability::resolve_ingest_key_file`]
-//! names. **This module never returns or prints the key value** -- it only
-//! checks the file is present, readable and non-empty.
+//! observability endpoint -- but **only** an `https` endpoint whose path is
+//! `/ingest` (`https://<dashboard>/ingest` -> `https://<dashboard>`), i.e. a
+//! daemon exporting straight to the dashboard. Any other endpoint (http, a
+//! collector port, a bare origin, another path), a reserved placeholder host
+//! or loopback is an edge collector, not the inbox, and leaves the URL
+//! unresolved.
+//!
+//! The key itself is `$LOOM_UI_INGEST_KEY` (honoured by the shell consumers),
+//! else the first key *file* of: `$LOOM_UI_INGEST_KEY_FILE`, then
+//! `~/.config/loom-ui/ingest.key` (when it exists) -- the per-host dashboard
+//! key -- and only then the telemetry tiers
+//! [`crate::observability::resolve_ingest_key_file`] names (a telemetry key
+//! is the dashboard key only on hosts exporting directly to `/ingest`).
+//! **This module never returns or prints the key value** -- it only checks
+//! the file is present, readable and non-empty.
 
 use std::path::Path;
 
@@ -24,6 +33,9 @@ use crate::observability::{
 pub const INBOX_URL_ENV: &str = "LOOM_UI_INBOX_URL";
 /// Env var carrying the ingest key itself (wins over the key file).
 pub const INGEST_KEY_ENV: &str = "LOOM_UI_INGEST_KEY";
+/// Env var naming the dashboard ingest-key *file* (wins over the default
+/// `~/.config/loom-ui/ingest.key` and every telemetry tier).
+pub const INGEST_KEY_FILE_ENV: &str = "LOOM_UI_INGEST_KEY_FILE";
 
 /// Raw, already-read inputs; keeps [`resolve_from`] pure.
 #[derive(Debug, Clone, Default)]
@@ -52,8 +64,12 @@ pub struct InboxResolution {
     pub missing: Vec<String>,
 }
 
-/// Origin (`scheme://host[:port]`) of `endpoint`, or `None` when it is not
-/// http(s), has no host, is a reserved placeholder host or is loopback.
+/// Origin (`https://host[:port]`) of `endpoint`, or `None` unless it is an
+/// `https` URL whose path is `/ingest` (trailing slash tolerated) on a host
+/// that is neither a reserved placeholder nor loopback. A schemeless
+/// `host/ingest` is read as `https`. Everything else -- `http`, a collector
+/// port such as `:4318`, a bare origin, any other path -- is a collector
+/// endpoint, not the dashboard, and is refused.
 #[must_use]
 pub fn derive_inbox_url(endpoint: &str) -> Option<String> {
     let url = reqwest::Url::parse(endpoint)
@@ -62,7 +78,10 @@ pub fn derive_inbox_url(endpoint: &str) -> Option<String> {
         .or_else(|| {
             reqwest::Url::parse(&format!("https://{}", endpoint.trim_start_matches("//"))).ok()
         })?;
-    if !matches!(url.scheme(), "http" | "https") {
+    if url.scheme() != "https" || url.path().trim_end_matches('/') != "/ingest" {
+        return None;
+    }
+    if url.query().is_some() || url.fragment().is_some() {
         return None;
     }
     if reserved_placeholder_host(endpoint).is_some() || is_loopback_endpoint(endpoint) {
@@ -70,8 +89,8 @@ pub fn derive_inbox_url(endpoint: &str) -> Option<String> {
     }
     let host = url.host_str()?;
     Some(match url.port() {
-        Some(p) => format!("{}://{}:{}", url.scheme(), host, p),
-        None => format!("{}://{}", url.scheme(), host),
+        Some(p) => format!("https://{host}:{p}"),
+        None => format!("https://{host}"),
     })
 }
 
@@ -90,8 +109,8 @@ pub fn resolve_from(i: &InboxInputs) -> InboxResolution {
     }
     if r.url.is_none() {
         r.missing.push(
-            "inbox URL: set LOOM_UI_INBOX_URL, or configure observability.endpoint \
-             (https://<dashboard>/ingest)"
+            "inbox URL: set LOOM_UI_INBOX_URL (derived only from an https \
+             observability.endpoint ending in /ingest -- never a collector or loopback)"
                 .into(),
         );
     }
@@ -104,13 +123,14 @@ pub fn resolve_from(i: &InboxInputs) -> InboxResolution {
                 r.key_source = Some("file".into());
             }
             (Some(f), Some(Err(why))) => r.missing.push(format!(
-                "ingest key: {f} is {why} -- place this host's key there (mode 600; \
-                 loom-ui docs/deploy-runbook.md section 8)"
+                "ingest key: {f} is {why} -- place this host's dashboard key at \
+                 ~/.config/loom-ui/ingest.key (or point LOOM_UI_INGEST_KEY_FILE at it; \
+                 mode 600; loom-ui docs/operator-mail-onboarding.md)"
             )),
             _ => r.missing.push(
-                "ingest key: set LOOM_UI_INGEST_KEY or place the key at \
-                 ~/.loom/observability/ingest.key (mode 600; loom-ui docs/deploy-runbook.md \
-                 section 8)"
+                "ingest key: place this host's dashboard key at ~/.config/loom-ui/ingest.key \
+                 (or set LOOM_UI_INGEST_KEY_FILE / LOOM_UI_INGEST_KEY; mode 600; \
+                 loom-ui docs/operator-mail-onboarding.md)"
                     .into(),
             ),
         }
@@ -131,11 +151,46 @@ fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
+/// `<home>/.config/loom-ui/ingest.key` when that file exists, else `None`.
+/// Pure over `home`, so unit-testable without touching the real `$HOME`.
+fn ui_key_file_under(home: &Path) -> Option<String> {
+    let p = home.join(".config").join("loom-ui").join("ingest.key");
+    p.exists().then(|| p.to_string_lossy().to_string())
+}
+
+/// The conventional per-host dashboard key file, when present.
+#[cfg(not(test))]
+fn default_ui_key_file() -> Option<String> {
+    dirs::home_dir().and_then(|h| ui_key_file_under(&h))
+}
+
+/// Hermetic under `cfg(test)` for the same reason as
+/// `observability::default_ingest_key_file`: other tests mutate `$HOME`, and
+/// a real ambient key must never leak into a resolution under test.
+#[cfg(test)]
+fn default_ui_key_file() -> Option<String> {
+    None
+}
+
+/// Key-file precedence (env value excluded; that is shell-side):
+/// `$LOOM_UI_INGEST_KEY_FILE`, then `~/.config/loom-ui/ingest.key` (if
+/// present), then the telemetry tiers. `telemetry` is only evaluated when
+/// both dashboard tiers are absent.
+fn pick_key_file(
+    ui_env: Option<String>,
+    ui_default: Option<String>,
+    telemetry: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    ui_env.or(ui_default).or_else(telemetry)
+}
+
 /// Resolve against the real environment and `root`'s resolved config.
 #[must_use]
 pub fn resolve(root: &Path) -> InboxResolution {
     let config: ObservabilityConfig = observability::read_config(root);
-    let key_file = observability::resolve_ingest_key_file(&config);
+    let key_file = pick_key_file(env_nonempty(INGEST_KEY_FILE_ENV), default_ui_key_file(), || {
+        observability::resolve_ingest_key_file(&config)
+    });
     resolve_from(&InboxInputs {
         inbox_url_env: env_nonempty(INBOX_URL_ENV),
         ingest_key_env_set: env_nonempty(INGEST_KEY_ENV).is_some(),
@@ -182,18 +237,17 @@ mod tests {
     }
 
     #[test]
-    fn derives_origin_from_endpoint() {
+    fn derives_origin_only_from_https_ingest_endpoint() {
         for e in [
             "https://dash.acme.dev/ingest",
             "https://dash.acme.dev/ingest/",
-            "https://dash.acme.dev",
             "dash.acme.dev/ingest",
         ] {
             assert_eq!(derive_inbox_url(e).as_deref(), Some("https://dash.acme.dev"), "{e}");
         }
         assert_eq!(
-            derive_inbox_url("http://dash.acme.dev:8443/x").as_deref(),
-            Some("http://dash.acme.dev:8443")
+            derive_inbox_url("https://dash.acme.dev:8443/ingest").as_deref(),
+            Some("https://dash.acme.dev:8443")
         );
     }
 
@@ -201,7 +255,76 @@ mod tests {
     fn refuses_placeholder_loopback_and_non_http() {
         assert_eq!(derive_inbox_url("https://collector.example.com/ingest"), None);
         assert_eq!(derive_inbox_url("http://127.0.0.1:4318"), None);
+        assert_eq!(derive_inbox_url("https://127.0.0.1/ingest"), None);
         assert_eq!(derive_inbox_url("ftp://dash.acme.dev/x"), None);
+    }
+
+    /// The #10137 builder caution: only a direct-to-dashboard `https .../ingest`
+    /// endpoint is the inbox; http, other paths, bare origins and collector
+    /// ports are refused.
+    #[test]
+    fn refuses_http_bare_origin_other_paths_and_collectors() {
+        for e in [
+            "http://dash.acme.dev:8443/x",
+            "http://dash.acme.dev/ingest",
+            "https://dash.acme.dev",
+            "https://dash.acme.dev/",
+            "https://dash.acme.dev/x",
+            "https://dash.acme.dev/v1/traces",
+            "https://dash.acme.dev/ingest/extra",
+            "https://dash.acme.dev/ingest?x=1",
+            "dash.acme.dev",
+            "http://10.1.2.3:4318",
+            "https://10.1.2.3:4318",
+        ] {
+            assert_eq!(derive_inbox_url(e), None, "{e}");
+        }
+        let r = resolve_from(&InboxInputs {
+            endpoint: Some("http://10.1.2.3:4318".into()),
+            ..inputs()
+        });
+        assert_eq!(r.url, None);
+        assert!(r.mail_meant);
+        assert!(r.missing[0].starts_with("inbox URL"), "{:?}", r.missing);
+    }
+
+    #[test]
+    fn dashboard_key_tiers_precede_telemetry_tiers() {
+        let tel = || Some("/telemetry.key".to_string());
+        assert_eq!(
+            pick_key_file(Some("/env.key".into()), Some("/ui.key".into()), tel).as_deref(),
+            Some("/env.key")
+        );
+        assert_eq!(pick_key_file(None, Some("/ui.key".into()), tel).as_deref(), Some("/ui.key"));
+        assert_eq!(pick_key_file(None, None, tel).as_deref(), Some("/telemetry.key"));
+        assert_eq!(pick_key_file(None, None, || None), None);
+        let mut called = false;
+        let _ = pick_key_file(None, Some("/ui.key".into()), || {
+            called = true;
+            None
+        });
+        assert!(!called, "telemetry tiers not consulted when a dashboard tier resolves");
+    }
+
+    #[test]
+    fn ui_key_file_only_when_present() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(ui_key_file_under(d.path()), None);
+        let dir = d.path().join(".config/loom-ui");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ingest.key"), "K\n").unwrap();
+        assert_eq!(ui_key_file_under(d.path()).as_deref(), dir.join("ingest.key").to_str());
+    }
+
+    #[test]
+    fn missing_key_names_the_dashboard_key_location() {
+        let r = resolve_from(&InboxInputs {
+            endpoint: Some("https://dash.acme.dev/ingest".into()),
+            ..Default::default()
+        });
+        assert_eq!(r.missing.len(), 1);
+        assert!(r.missing[0].contains("~/.config/loom-ui/ingest.key"), "{:?}", r.missing);
+        assert!(r.missing[0].contains("LOOM_UI_INGEST_KEY_FILE"), "{:?}", r.missing);
     }
 
     #[test]
@@ -236,7 +359,8 @@ mod tests {
         });
         assert!(r.mail_meant);
         assert_eq!(r.missing.len(), 1);
-        assert!(r.missing[0].contains("/k is missing") && r.missing[0].contains("deploy-runbook"));
+        assert!(r.missing[0].contains("/k is missing"), "{:?}", r.missing);
+        assert!(r.missing[0].contains("~/.config/loom-ui/ingest.key"), "{:?}", r.missing);
         let none = resolve_from(&InboxInputs::default());
         assert!(!none.mail_meant);
         assert_eq!(none.missing.len(), 2);
@@ -252,6 +376,7 @@ mod tests {
         for v in [
             INBOX_URL_ENV,
             INGEST_KEY_ENV,
+            INGEST_KEY_FILE_ENV,
             observability::ENDPOINT_ENV,
             observability::INGEST_KEY_FILE_ENV,
         ] {
@@ -279,6 +404,16 @@ mod tests {
         write_cfg(&gone);
         let h = collect_health(d.path()).expect("mail-meant + unresolved key => health input");
         assert!(h.missing[0].contains(gone.to_str().unwrap()), "{:?}", h.missing);
+
+        // $LOOM_UI_INGEST_KEY_FILE outranks the telemetry config tier.
+        let ui = d.path().join("ui.key");
+        std::fs::write(&ui, "UIKEY\n").unwrap();
+        write_cfg(&key);
+        std::env::set_var(INGEST_KEY_FILE_ENV, &ui);
+        let r = resolve(d.path());
+        std::env::remove_var(INGEST_KEY_FILE_ENV);
+        assert_eq!(r.key_file.as_deref(), ui.to_str());
+        assert!(!render_lines(&r).contains("UIKEY"));
     }
 
     #[test]
