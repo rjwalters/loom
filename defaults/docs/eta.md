@@ -859,34 +859,46 @@ of what is on disk and never needs a refetch.
 - **Files**, beside the snapshots in `.loom/state/eta/fleet/`
   (`LOOM_ETA_FLEET_SNAPSHOT_DIR` overrides): `events-<owner>-<repo>.jsonl`
   (append-only, one `RawEvent` per line: content-derived `id`, `event_time`,
-  `fetched_at`, item kind/number, event kind, label, source, `seq`) and
-  `events-<owner>-<repo>.cursor.json` (next backfill page, refresh ETag,
-  in-progress refresh page). Rows are appended only if their `id` is new;
+  `fetched_at`, item kind/number, event kind, label, closing-ref `target`,
+  source, `seq`) and `events-<owner>-<repo>.cursor.json` (per endpoint: next
+  backfill page, refresh ETag, in-progress refresh page). Rows are appended only if their `id` is new;
   `fetched_at` is excluded from the id, so a re-read adds nothing and the
   event time is never confused with the fetch time. The cursor is written
   atomically *after* a page's rows, so a kill re-reads at most one page and
   the rerun is byte-identical (tested, including a torn trailing line).
-- **Commands.** `eta fleet events backfill|refresh [--max-pages N]
-  [--reserve CALLS]` fetch from `GET repos/{o}/{r}/issues/events` through the
-  shared ETag store. A rate-limit stop, the reserve floor or `--max-pages`
-  exits `75` (`EX_TEMPFAIL`); re-run to resume. `eta fleet state --as-of
-  RFC3339 [--json]` reconstructs the fleet (open issues/PRs, stage and
+- **Commands.** `eta fleet events backfill|refresh [--endpoint
+  issues-events|pulls] [--max-pages N] [--reserve CALLS]` read, through the
+  shared ETag store, `GET repos/{o}/{r}/issues/events` (labels, close, merge)
+  then `GET repos/{o}/{r}/pulls?state=all&sort=created` (PR open/merge/close
+  times, and linkage references parsed from the body with the open-PR guard's
+  own phrase set — closing keywords plus `Part of #N` / `Contributes to #N`,
+  colon/markdown tolerant — each row's `label` naming the family `closes` /
+  `part_of`, stamped at the PR's `created_at`). A merged/closed PR is stored
+  twice by design (the pulls row has `seq` 0, the issue-events row the event
+  id). A pulls refresh reads only the newest pages: closures of older PRs
+  arrive via the issue-events refresh, and body edits on older PRs are not
+  seen. A rate-limit stop, the reserve floor or `--max-pages` (per
+  endpoint) exits `75` (`EX_TEMPFAIL`); re-run to resume. `eta fleet state
+  --as-of RFC3339 [--json]` reconstructs the fleet (open issues/PRs, stage and
   time-in-stage per item, `loom:building` count, operator holds, approved PRs
-  held for a human) from cached events **strictly before** `--as-of`, with no
+  held for a human, open-PR lockout) from cached events **strictly before** `--as-of`, with no
   forge call. `eta fleet agreement --estimates FILE.jsonl [--json]` scores that
   reconstruction against the features logged on `eta.estimate` records
   (a SigNoz export of `eta-explanation/v1` objects, one per line): per-feature
   agreement rate and mean `reconstructed - logged`. Forge-invisible features
   (PR size, model, host pool) are listed, not scored.
-- **Forge-call budget** (op `timeline.read`, 100 events/page): a **backfill**
-  costs `ceil(events / 100)` calls total across however many resumed runs; a
-  **refresh** costs one conditional call (a `304`, which the ETag store does
-  not count against the core pool) on a quiet repo, else
-  `ceil(new events / 100)`. `state` and `agreement` cost zero.
-- **Not yet cached** (follow-up PRs of #10197): PR closing references (so
-  `pr_open_skip_lockout` is `null`), reviews, CI check-run conclusions, and the
-  webhook-mirror source. An item untouched since before the cache window is not
-  reported open.
+- **Forge-call budget** (100 rows/page; ops `timeline.read` and
+  `pr.closing-issue-references`): a **backfill** costs `ceil(events / 100) +
+  ceil(PRs / 100)` calls total across however many resumed runs; a **refresh**
+  costs one conditional call per endpoint (a `304`, not counted against the
+  core pool) on a quiet repo, else `ceil(new rows / 100)` each. `state` and
+  `agreement` cost zero.
+- **Not yet cached** (follow-ups of #10197): reviews, CI check-run conclusions
+  and the webhook-mirror source. `pr_open_skip_lockout` is `null` until a
+  linkage row precedes `--as-of`; during an unfinished pulls backfill it can
+  read `false` rather than unknown (older PRs not yet read link nothing). The
+  guard's PR-author trust filter is not reproduced (can only over-report). An
+  item untouched since before the cache window is not reported open.
 
 `loom eta …` (the machine dispatcher, `scripts/loom`) is a thin passthrough to
 `loom-daemon eta …`.

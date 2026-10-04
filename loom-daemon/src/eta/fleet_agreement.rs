@@ -212,6 +212,12 @@ pub fn agreement(events: &[RawEvent], repo: &str, explanations: &[Explanation]) 
                 }),
         );
         tally(
+            "repo_pr_open_skip",
+            f.repo_pr_open_skip.is_some(),
+            f.repo_pr_open_skip
+                .and_then(|l| state.pr_open_skip_lockout.map(|r| (r == l, None))),
+        );
+        tally(
             "pr_created_at",
             f.pr_created_at.is_some(),
             f.pr_created_at.and_then(|l| {
@@ -329,5 +335,56 @@ mod tests {
         let r = agreement(&events, "o/r", &[ex]);
         assert_eq!(r.features["queue_ready"].agreed, 1);
         assert_eq!(r.features["queue_rank_present"].agreed, 1);
+        // No closing references cached: the lockout is not scored, only
+        // counted as unreconstructed.
+        let ex = explanation(
+            "2026-09-01T00:10:00Z",
+            Features {
+                repo_pr_open_skip: Some(true),
+                ..Features::default()
+            },
+        );
+        let r = agreement(&events, "o/r", &[ex]);
+        assert_eq!(r.features["repo_pr_open_skip"].compared, 0);
+        assert_eq!(r.features["repo_pr_open_skip"].unreconstructed, 1);
+    }
+
+    #[test]
+    fn the_open_pr_lockout_is_scored_once_closing_refs_are_cached() {
+        use crate::eta::fleet_events::SOURCE_FORGE;
+        let at = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ev = |item, kind, what, label: Option<&str>, secs: i64, seq| {
+            RawEvent::new(
+                "o/r",
+                item,
+                kind,
+                what,
+                label.map(str::to_string),
+                at + chrono::Duration::seconds(secs),
+                SOURCE_FORGE,
+                seq,
+                at,
+            )
+        };
+        let events = vec![
+            ev(7, ItemKind::Issue, EventKind::Opened, None, 0, 0),
+            ev(7, ItemKind::Issue, EventKind::LabelAdded, Some("loom:issue"), 20, 2),
+            ev(9, ItemKind::Pr, EventKind::Opened, None, 30, 0),
+            ev(9, ItemKind::Pr, EventKind::ClosingRef, None, 30, 900).with_target(Some(7)),
+        ];
+        let logged = |skip| {
+            explanation(
+                "2026-09-01T00:10:00Z",
+                Features {
+                    repo_pr_open_skip: Some(skip),
+                    ..Features::default()
+                },
+            )
+        };
+        let r = agreement(&events, "o/r", &[logged(true), logged(false)]);
+        let f = &r.features["repo_pr_open_skip"];
+        assert_eq!((f.compared, f.agreed, f.unreconstructed), (2, 1, 0));
     }
 }
