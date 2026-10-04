@@ -22,6 +22,7 @@ mod ready;
 mod recalibrate;
 mod score;
 mod shadow;
+mod shadow_gate;
 mod tracker;
 mod twin_otter_parity;
 

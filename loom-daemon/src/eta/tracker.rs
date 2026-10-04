@@ -30,7 +30,8 @@
 //!   through a replacement PR or a later sweep, so those estimates stay
 //!   pending (`resolve` joins on repo, issue and kind, so the eventual
 //!   landing scores them) until they expire after
-//!   [`PENDING_MAX_AGE_DAYS`].
+//!   [`PENDING_MAX_AGE_DAYS`] — scored first as `censored` when their p90 is
+//!   already behind them (#10233, `tracker_censor.rs`).
 //!
 //! A reopen starts a new series: on resolution every estimate of the series
 //! emitted *after* the outcome instant is dropped unscored, so a second
@@ -77,7 +78,7 @@ use super::{
     AgeSource, CurrentStage, CurrentState, DispatchInput, EstimateInput, Heuristic, Kind,
     NoEstimateReason, Provenance, Registry, Stage, StageSamples, Subject,
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 
 /// Pending estimates older than this are dropped unresolved.
@@ -146,6 +147,8 @@ struct Item {
     /// The last completed phase and when, to drop duplicate publications.
     last_phase: Option<(String, DateTime<Utc>)>,
     emit: BTreeMap<(Kind, String), EmitState>,
+    /// Whether each series' last emission answered (#10233, `tracker_answers.rs`).
+    answered: BTreeMap<(Kind, String), bool>,
     /// On the last dispatch plan as a ready row, not yet dispatched (#9326).
     in_ready_queue: bool,
     /// Its plan position, when the plan gives it one.
@@ -290,6 +293,8 @@ pub struct Tracker {
     /// Latest queue-friction readings (#10193), copied onto every estimate's
     /// features. Filled by the caller's forge reads, never by the tracker.
     pub friction: super::friction::FrictionBook,
+    /// Per-pass answer states, drained by the caller (#10233).
+    answers: Vec<answers::PassAnswers>,
 }
 
 /// What [`Tracker::drain_dropped`] reports.
@@ -323,6 +328,7 @@ impl Tracker {
             cap_dropped: 0,
             context: features::PassContext::default(),
             friction: super::friction::FrictionBook::default(),
+            answers: Vec::new(),
         }
     }
 
@@ -1071,22 +1077,6 @@ impl Tracker {
             .collect()
     }
 
-    /// Drop pending estimates older than [`PENDING_MAX_AGE_DAYS`], and the
-    /// oldest past [`MAX_PENDING`]. Returns how many were dropped.
-    pub fn expire(&mut self, now: DateTime<Utc>) -> usize {
-        let before = self.pending.len();
-        let cutoff = now - Duration::days(PENDING_MAX_AGE_DAYS);
-        self.pending.retain(|p| p.as_of >= cutoff);
-        if self.pending.len() > MAX_PENDING {
-            let excess = self.pending.len() - MAX_PENDING;
-            self.pending.drain(..excess);
-            // The oldest are the long-horizon estimates scoring needs most;
-            // the caller warns when this is non-zero.
-            self.cap_dropped += excess;
-        }
-        before - self.pending.len()
-    }
-
     fn input_for(
         &self,
         key: &ItemKey,
@@ -1214,6 +1204,8 @@ impl Tracker {
                     };
                     let explanation = heuristic.estimate(&input, ctx.history);
                     if let Some(item) = self.items.get_mut(&key) {
+                        item.answered
+                            .insert(series.clone(), explanation.result.is_some());
                         item.emit.entry(series).or_default().record(signature, now);
                     }
                     self.pending.push(EstimateSummary::of(&explanation));
@@ -1223,11 +1215,23 @@ impl Tracker {
                         primary: heuristic.id() == current_id,
                     });
                 }
+                if keys.is_none() {
+                    self.tally_pass(&key, kind);
+                }
             }
         }
         out
     }
 }
+
+#[path = "tracker_censor.rs"]
+mod censor;
+
+#[path = "tracker_answers.rs"]
+mod answers;
+
+pub use answers::PassAnswers;
+pub use censor::{censor, Expired, CENSOR_SOURCE};
 
 #[path = "tracker_ready.rs"]
 mod ready;

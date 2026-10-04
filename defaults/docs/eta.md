@@ -214,14 +214,35 @@ fixture. A behaviour change is a new id registered beside the old one
      the identical replay set. A heuristic that cannot win on history it can
      be re-run against is not judged on a live sample nobody can replay, so a
      failure here means the live gate is not even consulted.
-   - **Live**: at least 50 paired observations, the candidate's paired mean
-     pinball loss no worse than `current`'s, and its p25–p75 coverage inside
-     `[40%, 60%]`.
+   - **Live** (#10233): every figure is read on the **common decidable
+     subset** — a pair counts toward a figure only when *both* sides are
+     decidable for it, so a candidate cannot improve its numbers by refusing
+     the hard cases. All of the following, in this order:
+     - at least 50 paired observations carrying a p90 on both sides, and the
+       candidate's paired mean `pinball4_loss_sec` (q = .25, .5, .75, .9 —
+       the deciding loss) no worse than `current`'s;
+     - no **late surprise** regression: the candidate's `actual > p90` rate,
+       over at least 50 pairs where both sides' late surprise is decided
+       (`censored` outcomes included, see below), at most 2 points
+       (`LATE_SURPRISE_SLACK`) above `current`'s;
+     - no **answer-rate** regression: the candidate's answer rate at most 1
+       point (`ANSWER_RATE_SLACK`) below `current`'s. It is counted
+       **once per tracker pass** per live subject, carrying each heuristic's
+       last emitted state forward — never as answered rows over all rows, because a refusal
+       is emitted once and never refreshed while an answer is refreshed every
+       few minutes;
+     - its p25–p75 coverage inside `[40%, 60%]`;
+     - the win holds **day by day**: pairs are folded by the UTC day of their
+       `as_of`, a day goes to whichever side had the lower mean
+       `pinball4_loss_sec` (ties are left out), and over at least `MIN_FOLDS`
+       (7) decided days the 95% Wilson lower bound of the candidate's per-day
+       win rate must be above 50%. One lucky day cannot carry a pooled mean.
 
    Either gate failing leaves `current` untouched, and `--apply` on a failing
    candidate is a refusal, not an override. Every evaluation writes a
    `eta-promotion-decision/v1` record (`.loom/logs/`) carrying the numbers
-   that decided it, so "why did this flip?" — or "why has it not?" — is
+   that decided it (the #10233 figures and thresholds are additive fields, so
+   the tag is unchanged and an older record still parses), so "why did this flip?" — or "why has it not?" — is
    answered from the record. A flip is written to the **host-local** config
    tier (`.loom-local/local.json`): the evidence is this host's own history
    and pairs (#9343), so rolling a promotion fleet-wide stays an operator
@@ -722,6 +743,7 @@ days, one `.1` generation.
 | `finish` | the sweep's terminal event (exited or crashed) | `finished` |
 | `land` | the in-sweep merge phase, the PR's merge time read when it leaves the review listings, or the issue closing as **completed** | `landed` |
 | `land` | the issue closing as **not planned** | `abandoned` |
+| any | still unresolved when the pending estimate expires (30 days), with its p90 already behind it | `censored` |
 
 Each outcome carries `error_sec` (`actual − p50`), `covered`
 (`p25 ≤ actual ≤ p75`), `pinball_loss_sec`
@@ -743,8 +765,8 @@ would mix three- and four-quantile losses in one sum. Both p90 fields are
 absent on `abandoned` outcomes, on refusals, and on an estimate persisted
 before p90 existed. The outcome row also exports `loom.eta.p25_sec`,
 `loom.eta.p75_sec` and `loom.eta.p90_sec`, so an interval can be read without
-joining the estimate. The promotion gate does not read the p90 fields yet
-(#10233).
+joining the estimate. The promotion gate decides on `pinball4_loss_sec` and
+gates on `above_p90` (#10233; see "Adding a v2, and comparing it").
 
 **Nothing else is an outcome.** A PR closed unmerged and a sweep that ended
 before any PR are *not* abandonments — a replacement PR or a later sweep
@@ -752,6 +774,24 @@ usually lands the same issue — so each queues one `issues/{n}` read and the
 verdict comes from the issue's own `state` / `state_reason`. While the issue
 stays open the estimates stay pending: the join is on `(repo, issue, kind)`,
 so the eventual landing scores them, and only a 30-day expiry drops them.
+
+**Expiry censors, it does not hide** (#10233). The estimates that live 30
+days are exactly the ones whose subject has not landed — the late surprises —
+so dropping them unscored would bias every late-surprise rate down. An
+expiring estimate whose `as_of + p90` is already behind it is a *decided* late
+surprise whatever happens next, and is scored before it goes as a `censored`
+outcome (`outcome_source: pending_expiry`): `above_p90: true`, and nothing
+else — the actual is only a lower bound, so every error and loss field is
+absent. One with no p90, or whose p90 has not passed, is undecided and is
+dropped as before. The shadow ledger counts a censored pair toward the late
+surprise only when both sides were censored at the same `as_of`.
+
+**A failed ledger load is never silent** (#10233). `shadow.json` parses
+with defaults for every field added since it was written, so an upgrade keeps
+its counts. A file that still cannot be read is set aside as
+`shadow.json.unreadable-<UTC stamp>` (never overwritten) and the daemon logs
+an error and starts from an empty ledger; `eta promote` refuses to evaluate
+it at all.
 
 **A reopen starts a new series.** The first outcome stands: when an estimate
 resolves, every estimate of that series emitted *after* the outcome instant
@@ -1031,12 +1071,33 @@ answers, against `signoz_logs.distributed_logs_v2`:
     Q1 and Q2 but contributes no features here. Widen `since` past the longest
     lead time before treating a ranking as complete.
 
-Q1–Q3 group by `(heuristic, revision)` as well as by heuristic, so a daemon
-roll shows as two rows, and all three exclude rows with incomplete
-provenance. Every `loom.eta.*` attribute they read is pinned to the emitted
+- **Q4**: the **late surprise** rate (`actual > p90`) per heuristic,
+  revision and kind, on the **common decidable subset**: an instant
+  `(repo, issue, kind, as_of)` counts only when every heuristic's outcome
+  there has a decided late surprise, so a heuristic that refused (or recorded
+  no p90) removes the instant for all of them. `censored` counts the expired
+  but decided ones. Near 0.10 is calibrated.
+- **Q5**: **stability** — the median and maximum shift of the predicted
+  landing *instant* (`as_of + p50`) between consecutive emissions of one
+  series whose stage and rework count did not change. Measured on the
+  instant, not remaining seconds, which would read a steady ETA as moving.
+  Diagnostic; not a gate.
+- **Q6**: **convergence** — median p25–p75 and p25–p90 widths of scored
+  outcomes per bucket of the actual lead (`lead_bucket`). A converging
+  heuristic narrows as the event nears. `with_p90` counts the rows the p90
+  width is over. Diagnostic; not a gate.
+- **Q7**: the **answer rate**, time-weighted: each emitted state stands until
+  the series' next emission or outcome, so a refusal that is never refreshed
+  weighs as long as it stood rather than once. A series' still-open last state
+  is left out until something follows it.
+
+Every section groups by `(heuristic, revision)` as well as by heuristic, so a
+daemon roll shows as two rows, and the accuracy sections exclude rows with
+incomplete provenance. Every `loom.eta.*` attribute they read is pinned to the emitted
 schema by `loom-daemon/tests/eta_artifacts.rs`, so a renamed or dropped
 attribute fails CI here rather than silently returning empty columns in
 SigNoz. `loom-daemon/tests/signoz_eta_queries.rs` goes further: it executes the
 whole file verbatim against the pinned ClickHouse the SigNoz trial deploys and
 checks the answers, with the mutation of the committed SQL that breaks each one
-run as a counterfactual.
+run as a counterfactual; `loom-daemon/tests/signoz_eta_accuracy_views.rs` does
+the same for Q4–Q7 over its own fixture.

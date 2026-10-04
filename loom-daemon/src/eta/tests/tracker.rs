@@ -525,8 +525,8 @@ fn expire_drops_old_pending() {
     h.tracker
         .on_listing(REPO, &[pr(111, 11, &["loom:pr"], -60)], t(0), 300);
     h.estimate(t(0));
-    assert_eq!(h.tracker.expire(t(3600)), 0);
-    assert_eq!(h.tracker.expire(t(0) + Duration::days(31)), 5);
+    assert_eq!(h.tracker.expire(t(3600)).dropped, 0);
+    assert_eq!(h.tracker.expire(t(0) + Duration::days(31)).dropped, 5);
     assert!(h.tracker.pending().is_empty());
 }
 

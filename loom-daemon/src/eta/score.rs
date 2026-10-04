@@ -34,6 +34,11 @@ pub enum OutcomeKind {
     /// `land`: the issue closed as not planned. Counted, never scored. A PR
     /// closed unmerged is **not** this: the issue decides.
     Abandoned,
+    /// Still unresolved when the pending estimate expired (#10233), with its
+    /// p90 already behind it: a **decided** late surprise. `actual_at` is the
+    /// censoring instant, so `lead_sec` is a lower bound and only
+    /// `above_p90` (`true`) is scored; every loss and error field is absent.
+    Censored,
 }
 
 /// One stage transition the tracker observed for the subject.
@@ -270,7 +275,7 @@ pub fn score(
     let rework_rounds_actual = observed.iter().filter(|o| o.stage == Stage::Doctor).count() as u32;
 
     let scored = match outcome {
-        OutcomeKind::Abandoned => None,
+        OutcomeKind::Abandoned | OutcomeKind::Censored => None,
         OutcomeKind::Started | OutcomeKind::Landed | OutcomeKind::Finished => estimate.quantiles(),
     };
     let age_bucket = estimate.age_sec.map(|a| bucket(a).to_string());
