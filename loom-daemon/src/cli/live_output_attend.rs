@@ -9,6 +9,10 @@
 //! turn a `/loom:<role>` command naming the issue opened; an inline claim by
 //! an operator's main agent is refused with a reason (#10129).
 //!
+//! `--pr <PR>` attends the one issue that PR closes instead, and is what
+//! `pr-worktree.sh` runs for a Judge's checkout (#10120,
+//! `crate::cli::attend_hook`).
+//!
 //! **Always exits 0.** With live output not configured it does nothing and
 //! says why in one stderr line. The logic lives in
 //! `loom_daemon::observability::session_output::attended`.
@@ -22,8 +26,12 @@ use loom_daemon::observability::session_output::attended::{
 #[derive(clap::Args)]
 pub(crate) struct LiveOutputAttendArgs {
     /// The issue this agent is working on.
-    #[arg(long)]
-    issue: u32,
+    #[arg(long, required_unless_present = "pr", conflicts_with = "pr")]
+    issue: Option<u32>,
+    /// Attend the issue this PR closes instead (#10120). A PR that closes
+    /// no issue, or several, starts nothing: the issue is never guessed.
+    #[arg(long, value_name = "PR", conflicts_with = "foreground")]
+    pr: Option<u32>,
     /// The Loom role. Defaults to the subagent's `loom-<role>` type.
     #[arg(long)]
     role: Option<String>,
@@ -57,9 +65,15 @@ pub(crate) struct LiveOutputAttendArgs {
 
 impl LiveOutputAttendArgs {
     pub(crate) async fn run(self) -> anyhow::Result<()> {
+        let Some(issue) = self.issue else {
+            if let Some(pr) = self.pr {
+                crate::cli::attend_hook::attend_pr("live-output-attend", pr, &self.workspace);
+            }
+            return Ok(());
+        };
         let env = AttendEnv::from_process();
         let request = StartRequest {
-            issue: self.issue,
+            issue,
             role: self.role,
             watch_pid: self.watch_pid.or_else(attended::session_pid_from_env),
             workspace: self.workspace,
@@ -73,7 +87,7 @@ impl LiveOutputAttendArgs {
         } else {
             attended::start(&request, &env)
         };
-        eprintln!("live-output-attend: {}", outcome.describe(self.issue));
+        eprintln!("live-output-attend: {}", outcome.describe(issue));
         Ok(())
     }
 }
