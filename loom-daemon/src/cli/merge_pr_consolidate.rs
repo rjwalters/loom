@@ -30,6 +30,8 @@
 
 use anyhow::{bail, Context, Result};
 use loom_daemon::claim_reconciliation::merge_sequence::SEQUENCE_LABEL;
+use loom_daemon::cmd_out::CmdOutcome;
+use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use loom_daemon::merge_pr::consolidate::{
     self as cons, attempt_id, candidate_branch, check_eligibility, fetch_component,
     find_open_candidate, live_marker, mapping_body, parse_mapping, pin_check, push_branch,
@@ -252,30 +254,49 @@ fn scope_repo(flag: Option<&str>) {
     }
 }
 
-/// A `gh` command in `root` with the per-root credential applied (#5401: a
-/// cross-owner managed repo needs its own owner's installation token) — the
-/// same routing `consolidate::gh` and the sequence reads use.
-fn gh_cmd(gh: &std::path::Path, root: &std::path::Path) -> std::process::Command {
-    let mut cmd = std::process::Command::new(gh);
-    cmd.current_dir(root);
-    loom_daemon::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    cmd
+/// Run `gh <args>` in `root` through the facade (#10089): booked in
+/// `forge_call_stats` under `op`, with the per-root credential applied from
+/// `root` (#5401). A command that could not run or timed out is an error, as
+/// the raw `.output()` spawn it replaces was.
+fn gh_out(
+    op: &'static str,
+    intent: AccessIntent,
+    gh: &std::path::Path,
+    root: &std::path::Path,
+    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+) -> Result<std::process::Output> {
+    let inv = GhInvocation::new(
+        Operation::new(op),
+        intent,
+        GhTarget::None,
+        std::time::Duration::from_secs(120),
+    )
+    .program(gh)
+    .args(args)
+    .current_dir(root);
+    match inv.run() {
+        CmdOutcome::Ran(out) => Ok(out),
+        CmdOutcome::Unavailable(u) => bail!("{op}: {u}"),
+    }
 }
 
 fn cons_default_branch(gh: &std::path::Path, root: &std::path::Path) -> Result<String> {
     // consolidate::default_branch is private to the module; this thin
     // wrapper re-reads it through the same public surface the module tests.
-    let out = gh_cmd(gh, root)
-        .args([
+    let out = gh_out(
+        "cli_consolidate.default_branch",
+        AccessIntent::Read,
+        gh,
+        root,
+        [
             "repo",
             "view",
             "--json",
             "defaultBranchRef",
             "--jq",
             ".defaultBranchRef.name",
-        ])
-        .output()
-        .context("gh repo view")?;
+        ],
+    )?;
     if !out.status.success() {
         bail!("reading the default branch: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -283,15 +304,18 @@ fn cons_default_branch(gh: &std::path::Path, root: &std::path::Path) -> Result<S
 }
 
 fn live_base(gh: &std::path::Path, root: &std::path::Path, default_branch: &str) -> Result<String> {
-    let out = gh_cmd(gh, root)
-        .args([
+    let out = gh_out(
+        "cli_consolidate.base_sha",
+        AccessIntent::Read,
+        gh,
+        root,
+        [
             "api",
             &format!("repos/{{owner}}/{{repo}}/commits/{default_branch}"),
             "--jq",
             ".sha",
-        ])
-        .output()
-        .context("gh api commits")?;
+        ],
+    )?;
     if !out.status.success() {
         bail!(
             "reading the default-branch tip: {}",
@@ -350,16 +374,19 @@ fn view_candidate(
     root: &std::path::Path,
     candidate: u32,
 ) -> Result<CandidatePr> {
-    let out = gh_cmd(gh, root)
-        .args([
+    let out = gh_out(
+        "cli_consolidate.candidate",
+        AccessIntent::Read,
+        gh,
+        root,
+        [
             "pr",
             "view",
             &candidate.to_string(),
             "--json",
             "body,state,headRefName,headRefOid",
-        ])
-        .output()
-        .context("gh pr view candidate")?;
+        ],
+    )?;
     if !out.status.success() {
         bail!(
             "reading candidate PR #{candidate}: {}",
@@ -598,18 +625,24 @@ fn backfill_reservations_inner(
             continue;
         }
         let n = c.number.to_string();
-        let out = gh_cmd(gh, root)
-            .args(["pr", "edit", &n, "--add-label", SEQUENCE_LABEL])
-            .output()
-            .context("gh pr edit (reservation label)")?;
+        let out = gh_out(
+            "cli_consolidate.reserve_label",
+            AccessIntent::Write,
+            gh,
+            root,
+            ["pr", "edit", &n, "--add-label", SEQUENCE_LABEL],
+        )?;
         if !out.status.success() {
             bail!("labeling source PR #{n}: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
         let body = reservation_comment_body(&marker, attempt);
-        let out = gh_cmd(gh, root)
-            .args(["pr", "comment", &n, "--body", &body])
-            .output()
-            .context("gh pr comment (reservation)")?;
+        let out = gh_out(
+            "cli_consolidate.reserve_comment",
+            AccessIntent::Write,
+            gh,
+            root,
+            ["pr", "comment", &n, "--body", &body],
+        )?;
         if !out.status.success() {
             bail!("commenting source PR #{n}: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
@@ -631,8 +664,12 @@ fn create_candidate_pr(
     let path = root.join(format!(".loom-consolidate-body-{attempt}.md"));
     std::fs::write(&path, body)?;
     let title = format!("consolidated candidate ({attempt})");
-    let out = gh_cmd(gh, root)
-        .args([
+    let out = gh_out(
+        "cli_consolidate.pr_create",
+        AccessIntent::Write,
+        gh,
+        root,
+        [
             "pr",
             "create",
             "--head",
@@ -643,9 +680,8 @@ fn create_candidate_pr(
             &title,
             "--body-file",
             path.to_str().unwrap_or_default(),
-        ])
-        .output()
-        .context("gh pr create")?;
+        ],
+    )?;
     let _ = std::fs::remove_file(&path);
     if !out.status.success() {
         bail!("gh pr create: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -708,10 +744,13 @@ fn abort(
         // Label first: the label IS the hold. If it cannot come off, the
         // reservation is still live — say so and post no release marker,
         // rather than write a transcript that contradicts the gate.
-        let out = gh_cmd(gh, root)
-            .args(["pr", "edit", &n, "--remove-label", SEQUENCE_LABEL])
-            .output()
-            .context("gh pr edit (release)")?;
+        let out = gh_out(
+            "cli_consolidate.release_label",
+            AccessIntent::Write,
+            gh,
+            root,
+            ["pr", "edit", &n, "--remove-label", SEQUENCE_LABEL],
+        )?;
         if !out.status.success() {
             eprintln!(
                 "consolidate-abort: removing the label from #{n} failed — its reservation is \
@@ -721,10 +760,13 @@ fn abort(
             continue;
         }
         let body = cons::reservation_release_body(&marker, &mapping.attempt);
-        let out = gh_cmd(gh, root)
-            .args(["pr", "comment", &n, "--body", &body])
-            .output()
-            .context("gh pr comment (release)")?;
+        let out = gh_out(
+            "cli_consolidate.release_comment",
+            AccessIntent::Write,
+            gh,
+            root,
+            ["pr", "comment", &n, "--body", &body],
+        )?;
         if !out.status.success() {
             eprintln!("consolidate-abort: release comment on #{n} failed (continuing)");
         }
@@ -734,10 +776,13 @@ fn abort(
     // 3. Close the candidate with the cause recorded (ADR-0023 §7).
     // Idempotent: a closed candidate only gets the comment again on a re-run.
     let comment = cons::abort_comment(&mapping.attempt, reason);
-    let out = gh_cmd(gh, root)
-        .args(["pr", "close", &candidate.to_string(), "--comment", &comment])
-        .output()
-        .context("gh pr close")?;
+    let out = gh_out(
+        "cli_consolidate.pr_close",
+        AccessIntent::Write,
+        gh,
+        root,
+        ["pr", "close", &candidate.to_string(), "--comment", &comment],
+    )?;
     if !out.status.success() {
         eprintln!(
             "consolidate-abort: closing the candidate failed (it may already be closed): {}",
@@ -747,15 +792,18 @@ fn abort(
 
     // 4. Branch cleanup, best-effort (a leftover is cleaned by the reapers;
     // #9372 guards do not apply — consolidated branches have no children).
-    let out = gh_cmd(gh, root)
-        .args([
+    let out = gh_out(
+        "cli_consolidate.delete_ref",
+        AccessIntent::Write,
+        gh,
+        root,
+        [
             "api",
             "-X",
             "DELETE",
             &format!("repos/{{owner}}/{{repo}}/git/refs/heads/{}", c.head_ref_name),
-        ])
-        .output()
-        .context("gh api delete ref")?;
+        ],
+    )?;
     if !out.status.success() {
         eprintln!(
             "consolidate-abort: branch cleanup skipped ({})",
@@ -775,6 +823,31 @@ fn abort(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #10089: the CLI's gh spawns go through the facade, so each is one
+    /// counted `forge_call_stats` row under its operation name.
+    #[test]
+    #[serial_test::serial]
+    fn cli_gh_spawns_are_counted_per_operation() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = tempfile::tempdir().unwrap();
+        let gh = tmp.path().join("gh-stub");
+        std::fs::write(&gh, "#!/bin/sh\necho main\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("LOOM_FORGE_CALL_STATS_DIR", sink.path());
+        let a = cons_default_branch(&gh, tmp.path()).unwrap();
+        let b = live_base(&gh, tmp.path(), "main").unwrap();
+        std::env::remove_var("LOOM_FORGE_CALL_STATS_DIR");
+        assert_eq!((a.as_str(), b.as_str()), ("main", "main"));
+        let mut text = String::new();
+        for e in std::fs::read_dir(sink.path()).unwrap() {
+            text.push_str(&std::fs::read_to_string(e.unwrap().path()).unwrap());
+        }
+        let n = |op: &str| text.lines().filter(|l| l.contains(op)).count();
+        assert_eq!(n("cli_consolidate.default_branch"), 1, "{text}");
+        assert_eq!(n("cli_consolidate.base_sha"), 1, "{text}");
+    }
 
     fn git(dir: &std::path::Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")

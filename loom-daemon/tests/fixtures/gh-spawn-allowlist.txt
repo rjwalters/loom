@@ -11,7 +11,6 @@
 #
 # Empty list == migration complete.
 
-src/cli/merge_pr_consolidate.rs | let mut cmd = std::process::Command::new(gh);
 src/cmd_out.rs | let mut cmd = Command::new(gh);
 src/forge_cmd.rs | pub(crate) fn gh_bin() -> String {
 src/pipeline_snapshot.rs | match Command::new(gh_bin).arg("--version").output() {
