@@ -20,7 +20,7 @@ use super::intents::{self, AppliedIds, StarIntent};
 use super::progress::{self, Tracker, Watched};
 use super::Settings;
 use crate::types::{
-    AskKind, DroppedStarIntent, LandingStage, OperatorAsk, ReadyQueueRow, StarLandingRow,
+    AskKind, CapView, DroppedStarIntent, LandingStage, OperatorAsk, ReadyQueueRow, StarLandingRow,
     StarLivenessReport,
 };
 
@@ -43,6 +43,12 @@ pub struct RepoInput {
     pub tick_rows: Vec<ReadyQueueRow>,
     /// This host's pool exhaustion for the root's pool (its description).
     pub pool: Option<String>,
+    /// The last tick's rows for every repo on this host (#10214), for a
+    /// starred issue's host-wide queue position. Empty falls back to
+    /// [`Self::tick_rows`].
+    pub host_queue: std::sync::Arc<Vec<ReadyQueueRow>>,
+    /// The last tick's cap terms, when recorded (#10214).
+    pub cap: Option<CapView>,
     /// The forge's web origin (`https://github.com` unless this repo's
     /// `origin` remote names another host), so an escalation's Matrix line
     /// carries a clickable link on a Gitea fleet too (#9321).
@@ -179,6 +185,8 @@ impl LivenessState {
                 slug: &repo.slug,
                 host,
                 tick_rows: &repo.tick_rows,
+                host_queue: &repo.host_queue,
+                cap: repo.cap,
                 pool: repo.pool.clone(),
                 managed: &is_managed,
                 recorded_starred_at: &recorded,
@@ -241,9 +249,15 @@ impl LivenessState {
             let issue = e.facts.issue.number;
             live.insert((repo.clone(), issue));
             self.pool_grace(&mut e, now, settings.pools_grace);
-            let obs = self
-                .tracker
-                .observe(&repo, issue, e.landing.stage, &e.fingerprint, now);
+            let position = e
+                .landing
+                .capacity_wait
+                .as_ref()
+                .filter(|w| e.landing.stage == LandingStage::NoCapacity && w.queued())
+                .and_then(|w| w.position);
+            let obs =
+                self.tracker
+                    .observe(&repo, issue, e.landing.stage, &e.fingerprint, position, now);
             let mut ask = e.landing.ask.clone();
             let mut progress_at = obs.progress_at;
             if let (None, Some(root)) = (&ask, &root) {
@@ -290,6 +304,7 @@ impl LivenessState {
                 pr: e.landing.pr,
                 blocked_by: e.landing.blocked_by.clone(),
                 no_capacity: e.landing.no_capacity.clone(),
+                capacity_wait: e.landing.capacity_wait.clone(),
                 ask,
                 inherited_from: e.inherited_from,
                 operator_priority_at: e
@@ -350,6 +365,7 @@ impl LivenessState {
         e.landing.stage = LandingStage::NoCapacity;
         e.landing.next_actor = "work-finder".to_string();
         e.landing.ask = None;
+        e.landing.capacity_wait = None;
         e.landing.no_capacity = Some(format!(
             "token pool exhausted on this host; waiting ~{left} min for a peer host to claim it \
              before asking the operator"
@@ -380,6 +396,7 @@ impl LivenessState {
                     next_actor: &e.landing.next_actor,
                     fingerprint: &e.fingerprint,
                     progress_at: at,
+                    wait: e.landing.capacity_wait.as_ref(),
                 },
                 now,
                 window,
@@ -396,7 +413,13 @@ impl LivenessState {
                 progress::latest_comment_activity(&comments, me.as_deref())
             }
             Err(err) => {
-                log::debug!("star_liveness: reading {repo}#{issue} comments failed: {err}");
+                // Warn, not debug (#10214 root cause 5): a failed read here
+                // means comment activity cannot reset the progress clock, so
+                // the escalation that follows may be spurious.
+                log::warn!(
+                    "star_liveness: reading {repo}#{issue} comments failed ({err}); comment \
+                     activity cannot count as progress this pass"
+                );
                 None
             }
         };
@@ -530,6 +553,13 @@ fn resolve_repos(
 ) -> Vec<RepoInput> {
     let registry = crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let summary = crate::work_finder::last_tick_summary();
+    let host_queue = std::sync::Arc::new(
+        summary
+            .as_ref()
+            .map(|s| s.queue.clone())
+            .unwrap_or_default(),
+    );
+    let cap = summary.as_ref().and_then(|s| s.cap);
     registry
         .effective_roots(workspace_root)
         .into_iter()
@@ -567,6 +597,8 @@ fn resolve_repos(
                 slug,
                 tick_rows,
                 pool,
+                host_queue: host_queue.clone(),
+                cap,
                 web_base: web,
             })
         })

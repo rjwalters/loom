@@ -18,6 +18,7 @@ mod notice_tests;
 mod park_apply_tests;
 mod pass_tests;
 mod propagation_tests;
+mod queue_tests;
 mod replay;
 mod review_fix_tests;
 mod second_review_tests;

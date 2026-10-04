@@ -12,6 +12,9 @@
 //! - [`state::AlertState`] (pure, injected clock) turns condition snapshots
 //!   into `Started` / `Reminder` / `Cleared` transitions: debounced, one alert
 //!   per edge, at most one reminder per interval, persisted across restarts.
+//! - [`capacity`] (pure, #10214) adds the host-level capacity asks: disk or
+//!   RAM headroom holding the cap below `maxConcurrent`, and a starred
+//!   backlog more than 3x the cap.
 //! - [`task`] delivers each transition to independent sinks: the event bus
 //!   (relayed to Matrix by Safehouse) and the loom-ui inbox.
 //!
@@ -27,10 +30,13 @@ use chrono::{DateTime, Utc};
 use crate::health::summarize_role_ticks;
 use crate::types::DaemonStatusReport;
 
+pub mod capacity;
 pub mod causes;
 pub mod state;
 pub mod task;
 
+#[cfg(test)]
+mod capacity_tests;
 #[cfg(test)]
 mod tests;
 
@@ -124,6 +130,11 @@ pub fn classify(
             ),
             fix: fixes.join(" "),
         });
+    }
+
+    // #10214: a resource-limited cap and an outgrown starred backlog.
+    if let Some(tick) = &status.last_work_finder_tick {
+        out.extend(capacity::conditions(tick));
     }
     out
 }

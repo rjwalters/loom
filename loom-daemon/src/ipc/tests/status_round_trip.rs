@@ -137,6 +137,7 @@ fn test_daemon_status_request_response_round_trip() {
                 pr: Some(9276),
                 blocked_by: None,
                 no_capacity: None,
+                capacity_wait: None,
                 ask: Some(crate::types::OperatorAsk {
                     kind: crate::types::AskKind::MergeRefused,
                     key: "merge-refused:pr-9276".to_string(),

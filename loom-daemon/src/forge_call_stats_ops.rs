@@ -69,6 +69,8 @@ pub const GIT_READ_OBJECTS: ForgeOp = ForgeOp::inventoried("git.read-objects");
 /// Git-database / contents / ref writes of the fleet store.
 pub const GIT_WRITE_REFS_AND_CONTENTS: ForgeOp =
     ForgeOp::inventoried("git.write-refs-and-contents");
+/// `GET repos/{o}/{r}/issues/events` (and per-item events / timelines).
+pub const TIMELINE_READ: ForgeOp = ForgeOp::inventoried("timeline.read");
 /// `GET rate_limit` — the free budget probe.
 pub const QUOTA_RATE_LIMIT_READING: ForgeOp = ForgeOp::inventoried("quota.rate-limit-reading");
 
@@ -84,5 +86,6 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     REPO_LIST_FOR_OWNER,
     GIT_READ_OBJECTS,
     GIT_WRITE_REFS_AND_CONTENTS,
+    TIMELINE_READ,
     QUOTA_RATE_LIMIT_READING,
 ];

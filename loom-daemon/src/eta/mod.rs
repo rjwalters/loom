@@ -54,6 +54,13 @@
 //! produced a number. See [`history`] for the trade-offs and [`fleet`] for the
 //! snapshot's determinism and cost properties.
 //!
+//! # Fitted models (#10221)
+//!
+//! [`fit`] is the pure core of the daily point-in-time fit (`eta-fit/v1`):
+//! per-stage exit hazards, a censored log-normal direct model and dwell-path
+//! statistics, written as one content-addressed coefficient file that fitted
+//! heuristics load instead of reading fleet history themselves.
+//!
 //! # Versioning
 //!
 //! A heuristic id (`start-v1`, `finish-v1`, `land-v1`) is immutable once shipped: a
@@ -74,7 +81,12 @@ pub mod calibration_log;
 pub mod config;
 pub mod emit;
 pub mod explanation;
+pub mod fit;
 pub mod fleet;
+pub mod fleet_agreement;
+pub mod fleet_events;
+pub mod fleet_events_forge;
+pub mod fleet_state;
 pub mod grid;
 pub mod heuristics;
 pub mod history;
