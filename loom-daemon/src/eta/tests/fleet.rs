@@ -609,6 +609,7 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ("heuristics/finish_v1.rs", include_str!("../heuristics/finish_v1.rs")),
     ("heuristics/land_v1.rs", include_str!("../heuristics/land_v1.rs")),
     ("heuristics/land_v2.rs", include_str!("../heuristics/land_v2.rs")),
+    ("heuristics/land_v3.rs", include_str!("../heuristics/land_v3.rs")),
 ];
 
 /// The whole point of #9343's "the estimator stays pure over a snapshot": a

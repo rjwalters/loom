@@ -542,6 +542,7 @@ impl Registry {
                 Box::new(heuristics::FinishV1),
                 Box::new(heuristics::LandV1),
                 Box::new(heuristics::LandV2),
+                Box::new(heuristics::LandV3),
             ],
         }
     }

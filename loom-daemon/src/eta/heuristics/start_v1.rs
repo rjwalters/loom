@@ -38,6 +38,7 @@ impl Heuristic for StartV1 {
                 sources: &[SampleSource::StageJournal],
                 always_merge: false,
                 censoring: false,
+                adjust: None,
             },
             input,
             history,
