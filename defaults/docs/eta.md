@@ -19,6 +19,7 @@ host-scoped live list the fleet dashboard reads (#9329,
 
 - [The model](#the-model)
 - [Heuristics and versioning](#heuristics-and-versioning)
+- [Fitted coefficients (`eta-fit/v1`)](#fitted-coefficients-eta-fitv1)
 - [The explanation (`eta-explanation/v1`)](#the-explanation-eta-explanationv1)
 - [Features](#features)
 - [No-estimate reasons](#no-estimate-reasons)
@@ -229,6 +230,84 @@ tracker scored) plus the pending store; `eta backtest` derives the same
 evidence by replaying `land-v2` over the cases, leak-free because the table is
 refitted at each case's own `as_of`. With fewer than 20 landings, even pooled
 across stages, it returns its base estimate unchanged.
+
+## Fitted coefficients (`eta-fit/v1`)
+
+A **fitted** heuristic (the first is `land-2026-10-04-twin-otter`, #10222)
+cannot fit inside the estimator, which may read only its two arguments.
+Fitting is a separate, pure step (`eta::fit`, #10221) whose output — one
+content-addressed JSON file per cutoff `T` — the registry loads. Building the
+training rows from fleet history, the `loom-daemon eta fit` CLI and the daily
+refit are #10245; until it lands nothing writes these files on a live host.
+
+**What is fitted**, on rows knowable before `T` over the 14 days before it:
+
+- **Per-stage exit hazard**: L2 logistic regression of "left the stage within
+  the next 30 minutes" on standardized features. The objective is a sum,
+  `Σ ln(1 + exp(−s(w·z + b))) + ‖w‖²/(2C)` with `C = 0.5` (scikit-learn's
+  `C`), intercept unpenalized. A stage is fitted only with ≥ 200 labelled rows
+  and ≥ 20 exits; otherwise it is listed in `hazard_skipped` with
+  `below_min_rows` or `below_min_exits`.
+- **Direct model**: a pooled log-normal AFT of time-to-merge on stage
+  indicators plus standardized features, per-stage `σ`, censoring-aware, each
+  row weighted `1 / (rows of its PR)`, L2 `1e-3` on the feature coefficients.
+  **Curator's rule:** only stages with ≥ 200 rows and ≥ 20 merge events enter
+  it (a stage whose rows are all censored has no finite optimum); the rest are
+  absent from `aft.stages`, `beta` and `log_sigma`.
+- **Path statistics**: per-stage dwell-time Kaplan–Meier curves with delayed
+  entry (an episode is at risk at `t` iff `entry_h < t ≤ dwell_h`) and
+  next-step probabilities. **Curator's rule:** `Next` and `Merged` ends are
+  events; `Closed` and `Censored` ends are censored, matching #10222's
+  conditioning on eventually merging. `next` tables exclude closes and sum
+  to 1. Each curve is stored with at most 64 exact points: keep index 0, then
+  for each `j = 1 … 62` the smallest index with `s ≤ 1 − j·(1 − sₙ)/63`, then
+  the last index — overstating the full curve by less than `(1 − sₙ)/63`.
+- **`age_p95_sec`**: per stage, the nearest-rank p95 (rank `⌈0.95·n⌉`) of
+  `round(age_h·3600)` over all of the stage's rows, in whole seconds.
+
+The numerics (erfc, the normal tail, AS241 probit, Cholesky, damped Newton)
+are hand-ported; `eta::fit` adds no crate.
+
+**Pinned contracts** (train and serve share them; every coefficient vector is
+positional): stages `review_wait`, `doctor_wait`, `merge_wait`, `merge_hold`
+in that order (`eta::fit::FitStage`, not `eta::Stage`); the 20 features in
+`eta::fit::FEATURES` order — the #10223 fixture's order, which is not the
+order of #10221's feature table; and one transform, `model_features`, that
+both sides call on the raw `ModelInputs`.
+
+**The file**, `.loom/state/eta/fit/fit-<YYYYMMDDTHHMMSSZ>.json` (a sibling of
+`fleet/`, whose every `*.json` is parsed as a snapshot; override:
+`LOOM_ETA_FIT_DIR`):
+
+```json
+{
+  "schema": "eta-fit/v1",
+  "id": "<16 hex>",
+  "as_of": "2026-10-04T00:00:00Z",
+  "window": {"start": "2026-09-20T00:00:00Z", "days": 14, "row_step_sec": 1800, "exit_horizon_sec": 1800, "knowable_lag_sec": 120},
+  "fitter": {"version": "…", "revision": "<full sha>"},
+  "settings": {"hazard_c": 0.5, "aft_l2": 0.001, "std_eps": 1e-9, "min_dur_h": 0.016666666666666666,
+               "min_stage_rows": 200, "min_stage_exits": 20, "km_max_points": 64},
+  "features": ["log_age", "…"],
+  "hazard": {"review_wait": {"mu": [], "sd": [], "coef": [], "intercept": -3.53, "rows": 1500, "exits": 89, "objective": 272.5, "iterations": 9, "converged": true}},
+  "hazard_skipped": {"merge_hold": {"reason": "below_min_exits", "rows": 640, "exits": 12}},
+  "aft": {"stages": ["review_wait", "…"], "mu": [], "sd": [], "beta": [], "log_sigma": [], "objective": 1.45, "converged": true, "rows": 6000, "events": 5798, "groups": 6000, "iterations": 6},
+  "path_stats": {"km": {"review_wait": {"t": [0.0], "s": [1.0], "episodes": 812, "events": 790}}, "next": {"review_wait": {"merge_wait": 0.6}}},
+  "age_p95_sec": {"review_wait": 154081}
+}
+```
+
+- **`id`** is `derived_hex(["loom.eta.fit", <compact JSON with "id": "">], 16)`
+  — content-derived, never random. The file holds no wall-clock time, host id
+  or input-snapshot id (a snapshot id digests facts after `T`).
+- **Deterministic**: the same rows in the same order give a byte-identical
+  file on one build and platform (`ln`/`exp`/`sin` come from the platform
+  libm). Written as pretty JSON plus a newline, through a temp file and a
+  rename.
+- **Reading** refuses an unknown `schema` and does not re-derive the id.
+  `load_latest(root, before)` returns the newest fit whose `as_of` is strictly
+  before `before`.
+- `aft` is `null` when no stage passes its gate.
 
 ## The explanation (`eta-explanation/v1`)
 
