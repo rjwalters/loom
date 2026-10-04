@@ -35,7 +35,7 @@ use super::landing::{
 use super::progress::{fingerprint, short_hash};
 use super::refusal::{self, Detected};
 use crate::forge_listing::RestIssue;
-use crate::types::{AskKind, QueueDisposition, ReadyQueueRow};
+use crate::types::{AskKind, CapView, QueueDisposition, ReadyQueueRow};
 use crate::work_finder::{WorkItem, OPERATOR_PRIORITY_LABEL};
 
 /// PR labels listed to find a starred issue's open PR.
@@ -95,6 +95,12 @@ pub struct RepoContext<'a> {
     pub host: &'a str,
     /// The last work-finder tick's rows for this repo.
     pub tick_rows: &'a [ReadyQueueRow],
+    /// The last tick's rows for every repo on this host, in dispatch order:
+    /// a starred issue's queue position is host-wide, like the cap (#10214).
+    /// Empty falls back to [`Self::tick_rows`].
+    pub host_queue: &'a [ReadyQueueRow],
+    /// The last tick's cap terms, when recorded (#10214).
+    pub cap: Option<CapView>,
     /// This host's pool exhaustion, when any (its description).
     pub pool: Option<String>,
     /// Whether a workspace on this host manages a forge slug (for a
@@ -413,21 +419,11 @@ impl<'a> Evaluator<'a> {
                 detail: detail.clone(),
             };
         }
-        match self.tick_row(n).map(|r| r.disposition) {
-            Some(
-                d @ (QueueDisposition::DeferredCapacity
-                | QueueDisposition::DeferredRampCap
-                | QueueDisposition::DeferredSaturation
-                | QueueDisposition::DeferredBuildBackoff
-                | QueueDisposition::DeferredOutOfSlice
-                | QueueDisposition::DeferredRepoCap
-                | QueueDisposition::HostConstraint
-                | QueueDisposition::HostClassRefused),
-            ) => Capacity::Deferred {
-                reason: d.reason().to_string(),
-            },
-            _ => Capacity::Available,
-        }
+        self.tick_row(n)
+            .and_then(|row| {
+                super::queue::wait(row, self.ctx.host_queue, self.ctx.tick_rows, self.ctx.cap)
+            })
+            .map_or(Capacity::Available, Capacity::Deferred)
     }
 
     fn red_main_fix(&self) -> Option<u32> {

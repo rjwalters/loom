@@ -26,10 +26,11 @@
 //! 8. `loom:building`, a live sweep, or a peer claim → `building`;
 //! 9. this host's token pool is exhausted and no peer claimed it →
 //!    `needs-operator(pools-exhausted)`; a capacity-style deferral →
-//!    `no-capacity`;
+//!    `no-capacity`, carrying the structured [`CapacityWait`] (gate, binding
+//!    cap term, queue position; #10214);
 //! 10. `loom:issue` → `ready`; anything else → `curating`.
 
-use crate::types::{AskKind, LandingStage, OperatorAsk};
+use crate::types::{AskKind, CapacityWait, LandingStage, OperatorAsk};
 
 /// The Champion hold on a PR (merge-risk / critical-file).
 pub const HOLD_LABEL: &str = "loom:operator";
@@ -119,8 +120,10 @@ pub enum Capacity {
     /// this host's hold, so every host and every re-exhaustion of an issue
     /// that has not moved share one key ([`super::collect`]).
     PoolExhausted { detail: String },
-    /// The work finder deferred it on a capacity-style limit.
-    Deferred { reason: String },
+    /// The work finder deferred it on a capacity-style limit: which gate,
+    /// what binds it and where the issue stands in the host's starred queue
+    /// (#10214).
+    Deferred(CapacityWait),
 }
 
 /// Everything the classifier needs about one starred issue.
@@ -158,6 +161,9 @@ pub struct Landing {
     /// first one named (#10012 AC 3).
     pub inherits: Vec<u32>,
     pub no_capacity: Option<String>,
+    /// `NoCapacity` from a work-finder deferral: the structured wait
+    /// (#10214). `None` for the pool-exhaustion grace window.
+    pub capacity_wait: Option<CapacityWait>,
     pub ask: Option<OperatorAsk>,
 }
 
@@ -170,6 +176,7 @@ impl Landing {
             blocked_by: None,
             inherits: Vec::new(),
             no_capacity: None,
+            capacity_wait: None,
             ask: None,
         }
     }
@@ -411,9 +418,10 @@ pub fn classify(f: &StarFacts) -> Landing {
                 None,
             );
         }
-        Capacity::Deferred { reason } => {
+        Capacity::Deferred(wait) => {
             let mut landing = Landing::stage(LandingStage::NoCapacity, "work-finder", None);
-            landing.no_capacity = Some(reason.clone());
+            landing.no_capacity = Some(wait.summary());
+            landing.capacity_wait = Some(wait.clone());
             return landing;
         }
         Capacity::Available => {}

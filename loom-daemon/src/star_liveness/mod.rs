@@ -74,6 +74,7 @@ pub mod inherited_star;
 pub mod intents;
 pub mod landing;
 pub mod progress;
+pub mod queue;
 pub mod refusal;
 pub mod render;
 pub mod task;
