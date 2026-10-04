@@ -304,6 +304,22 @@ impl GhForge {
         format!("repos/{slug}/issues/{issue}")
     }
 
+    /// `open` / `closed` for issue (or PR) `n`, over REST — `park-record
+    /// apply`'s closed-blocker refusal (#10152).
+    pub fn issue_state(&self, n: u64) -> Result<String, String> {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            state: String,
+        }
+        let path = self.issue_path(n);
+        let r = self.gh(AccessIntent::Read, &["api", &path]);
+        let Some(o) = r.ok_output() else {
+            return Err(r.failure_reason(&format!("gh api {path}")));
+        };
+        let raw: Raw = serde_json::from_slice(&o.stdout).map_err(|e| e.to_string())?;
+        Ok(raw.state)
+    }
+
     fn gh(&self, intent: AccessIntent, args: &[&str]) -> CmdOutcome {
         let target = self
             .repo
