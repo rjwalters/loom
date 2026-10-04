@@ -53,7 +53,8 @@ const MERGE_SHA: &str = "c0ffee0000000000000000000000000000000001";
 /// `comments-<n>/*.json` (one comment array per file, concatenated on read —
 /// the paginated listing shape), `pr-<n>.state`, `pr-<n>.body`,
 /// `pr-<n>.head` (live head), `pr-<n>.labels` (one per line),
-/// `issue-<n>.state`, `cand.json`, `branch-gone`. Every invocation is
+/// `issue-<n>.state`, `cand.json`, `branch-gone`; `fail-pr-<n>-<field>` /
+/// `fail-issue-<n>` make that read exit non-zero. Every invocation is
 /// appended to `state/log`.
 const FAKE_GH: &str = r#"#!/usr/bin/env bash
 S="@STATE@"
@@ -67,6 +68,7 @@ record() { # record <pr> <body>
 case "$1 $2" in
   "pr view")
     if [ "$3" = "@CAND@" ]; then cat "$S/cand.json"; exit 0; fi
+    [ -e "$S/fail-pr-$3-$5" ] && exit 1
     case "$5" in
       state) cat "$S/pr-$3.state" ;;
       body) cat "$S/pr-$3.body" ;;
@@ -77,7 +79,7 @@ case "$1 $2" in
   "pr comment") record "$3" "$5"; exit 0 ;;
   "pr edit") exit 0 ;;
   "pr close") echo CLOSED > "$S/pr-$3.state"; record "$3" "$5"; exit 0 ;;
-  "issue view") cat "$S/issue-$3.state"; exit 0 ;;
+  "issue view") [ -e "$S/fail-issue-$3" ] && exit 1; cat "$S/issue-$3.state"; exit 0 ;;
   "issue close") echo CLOSED > "$S/issue-$3.state"; exit 0 ;;
   "api -X")
     if [ -e "$S/branch-gone" ]; then
@@ -476,6 +478,64 @@ fn a_landed_head_that_descends_from_the_recorded_one_reconciles() {
     let report = f.run();
     assert!(report.complete(), "{report:?}");
     assert_eq!(report.closed_prs, 2, "{report:?}");
+}
+
+#[test]
+#[serial(loom_config_env)]
+fn a_candidate_outside_the_namespace_is_refused_without_any_write() {
+    // A mapping marker in an (editable) body does not make a contributor's
+    // branch a candidate: step 7 would otherwise delete it (#9372).
+    let f = Fixture::new();
+    f.seed(&[(10, &f.a), (12, &f.b)]);
+    let mut cand: serde_json::Value = serde_json::from_str(&f.state_of("cand.json")).unwrap();
+    cand["headRefName"] = serde_json::Value::String("feature/issue-10".into());
+    f.put("cand.json", &cand.to_string());
+
+    let err = f.try_run().unwrap_err();
+    assert!(err.to_string().contains("not a consolidation candidate"), "{err}");
+    assert!(f.writes().is_empty(), "{:?}", f.writes());
+}
+
+#[test]
+#[serial(loom_config_env)]
+fn an_unanswered_step5_state_read_is_unread_not_complete() {
+    // #9972: a failed `pr view --json state` must not read as "already closed".
+    let f = Fixture::new();
+    f.seed(&[(10, &f.a), (12, &f.b)]);
+    f.put("fail-pr-10-state", "");
+
+    let first = f.run();
+    assert_eq!(first.unread, vec![10], "{first:?}");
+    assert!(!first.complete(), "{first:?}");
+    assert_eq!(f.state_of("pr-10.state"), "OPEN");
+    assert_eq!(f.state_of("issue-510.state"), "OPEN");
+    assert_eq!(f.state_of("pr-12.state"), "CLOSED");
+
+    // Once the forge answers, a re-run finishes the job.
+    std::fs::remove_file(f.state.join("fail-pr-10-state")).unwrap();
+    let second = f.run();
+    assert!(second.complete(), "{second:?}");
+    assert_eq!(f.state_of("pr-10.state"), "CLOSED");
+    assert_eq!(f.state_of("issue-510.state"), "CLOSED");
+}
+
+#[test]
+#[serial(loom_config_env)]
+fn an_unanswered_step6_read_is_unread_not_complete() {
+    // #9972: a failed body read, or a failed issue-state read, leaves the run
+    // incomplete instead of silently skipping the issue closure.
+    let f = Fixture::new();
+    f.seed(&[(10, &f.a), (12, &f.b)]);
+    f.put("fail-pr-10-body", "");
+    f.put("fail-issue-512", "");
+
+    let report = f.run();
+    let mut unread = report.unread.clone();
+    unread.sort_unstable();
+    assert_eq!(unread, vec![10, 12], "{report:?}");
+    assert!(!report.complete(), "{report:?}");
+    assert_eq!(f.state_of("issue-510.state"), "OPEN");
+    assert_eq!(f.state_of("issue-512.state"), "OPEN");
 }
 
 #[test]

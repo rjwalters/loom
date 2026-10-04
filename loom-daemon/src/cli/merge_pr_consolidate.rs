@@ -266,8 +266,8 @@ impl ConsolidateReconcileArgs {
         }
         if !report.unread.is_empty() {
             eprintln!(
-                "Could not read the transcript or live head (nothing written to them) — re-run \
-                 to retry: {:?}",
+                "A forge read went unanswered (transcript, live head, or a step-5/6 state) — \
+                 not finished; re-run to retry: {:?}",
                 report.unread
             );
         }

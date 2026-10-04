@@ -34,7 +34,7 @@ use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
 use super::{
     component_close_body, inclusion_verified, issue_close_body, parse_mapping, status_comment_body,
-    status_present, untouched_open_body, untouched_status_marker, SEQUENCE_LABEL,
+    status_present, untouched_open_body, untouched_status_marker, BRANCH_NAMESPACE, SEQUENCE_LABEL,
 };
 use crate::merge_pr::sequence::fetch_trusted_bodies;
 
@@ -78,8 +78,9 @@ pub struct ReconcileReport {
     /// Components pushed after the candidate landed: `untouched-open` status,
     /// left open with their issues (ADR-0023 §6.2). An end state, not a failure.
     pub untouched_open: Vec<u32>,
-    /// Components whose transcript or live head could not be read: nothing
-    /// was written to them, and a re-run retries.
+    /// Components with a read that went unanswered — transcript or live head
+    /// (nothing written to them), or a step-5/6 state/body read (#9972) — so
+    /// the run is incomplete and a re-run retries.
     pub unread: Vec<u32>,
     pub closed_prs: usize,
     pub closed_issues: usize,
@@ -219,6 +220,16 @@ pub fn reconcile(git: &str, root: &Path, candidate: u32) -> Result<ReconcileRepo
     let Some(mapping) = parse_mapping(&c.body) else {
         bail!("candidate #{candidate} carries no consolidation mapping — not a candidate PR");
     };
+    // A candidate branch is always Loom-made under BRANCH_NAMESPACE
+    // (`candidate_branch`). Anything else is not a candidate whatever its body
+    // says, and step 7 must never delete a contributor's branch (#9372).
+    if !c.head_ref_name.starts_with(&format!("{BRANCH_NAMESPACE}/")) {
+        bail!(
+            "candidate #{candidate}'s branch {:?} is outside {BRANCH_NAMESPACE}/ — not a \
+             consolidation candidate; nothing reconciled",
+            c.head_ref_name
+        );
+    }
 
     // 1b. The landed head must CONTAIN the recorded one. Steps 1-2 prove each
     // component is an ancestor of the head recorded at prepare time; that
@@ -343,29 +354,39 @@ pub fn reconcile(git: &str, root: &Path, candidate: u32) -> Result<ReconcileRepo
         }
 
         // 5. Close the component PR (idempotent — only an OPEN PR is closed).
-        if read(root, "pr.view", &["pr", "view", &n, "--json", "state", "--jq", ".state"])?
-            .as_deref()
-            == Some("OPEN")
-        {
+        // An unanswered read is `unread`, never "already closed" (#9972).
+        let Some(state) =
+            read(root, "pr.view", &["pr", "view", &n, "--json", "state", "--jq", ".state"])?
+        else {
+            report.unread.push(*number);
+            continue;
+        };
+        if state == "OPEN" {
             let body = component_close_body(candidate, &merge_sha);
             write(root, "pr.close", &["pr", "close", &n, "--comment", &body], "component close")?;
             report.closed_prs += 1;
         }
 
         // 6. Close the issues THIS component declared, idempotent by state.
-        if let Some(pr_body) =
+        // An unanswered body or issue-state read is `unread` too (#9972).
+        let Some(pr_body) =
             read(root, "pr.view", &["pr", "view", &n, "--json", "body", "--jq", ".body"])?
-        {
-            for issue in crate::merge_pr::refs::closing_refs(&pr_body) {
-                let i = issue.to_string();
-                if read(
-                    root,
-                    "issue.view",
-                    &["issue", "view", &i, "--json", "state", "--jq", ".state"],
-                )?
-                .as_deref()
-                    == Some("OPEN")
-                {
+        else {
+            report.unread.push(*number);
+            continue;
+        };
+        let mut issue_unread = false;
+        for issue in crate::merge_pr::refs::closing_refs(&pr_body) {
+            let i = issue.to_string();
+            match read(
+                root,
+                "issue.view",
+                &["issue", "view", &i, "--json", "state", "--jq", ".state"],
+            )?
+            .as_deref()
+            {
+                None => issue_unread = true,
+                Some("OPEN") => {
                     let body = issue_close_body(*number, candidate, &merge_sha);
                     write(
                         root,
@@ -375,7 +396,11 @@ pub fn reconcile(git: &str, root: &Path, candidate: u32) -> Result<ReconcileRepo
                     )?;
                     report.closed_issues += 1;
                 }
+                Some(_) => {}
             }
+        }
+        if issue_unread {
+            report.unread.push(*number);
         }
     }
 
