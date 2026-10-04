@@ -57,7 +57,7 @@ pub fn operator_level_in(table: &[crate::operator_levels::PriorityLevel], row: &
 }
 
 /// The row field [`listing::fetch_queue`] stamps on a starred PR: its
-/// effective star time from [`crate::forge_starred::starred_rows`] (its own
+/// effective star time from [`crate::forge_starred::resolve`] (its own
 /// `labeled` event, or its linked issue's earlier star).
 pub const STAR_AT_FIELD: &str = "operatorPriorityAt";
 
@@ -97,6 +97,18 @@ pub fn ordered_queue(
     prefer: bool,
     trust: &TrustPolicy,
 ) -> Vec<Value> {
+    order(admit(rows, role, prefer, trust), role, prefer, trust)
+}
+
+/// The role's admission filter alone (the first half of [`ordered_queue`]).
+/// [`listing::fetch_queue`] stamps star times between the halves, so it
+/// reads them only for rows the role can actually take (#9975 review).
+pub(crate) fn admit(
+    rows: Vec<Value>,
+    role: PrRole,
+    prefer: bool,
+    trust: &TrustPolicy,
+) -> Vec<Value> {
     let labeled_review = rows.iter().any(|r| has_label(r, "loom:review-requested"));
     let mut candidates: Vec<_> = rows
         .into_iter()
@@ -129,6 +141,17 @@ pub fn ordered_queue(
         }
         PrRole::Champion => has_label(r, "loom:pr"),
     });
+    candidates
+}
+
+/// Order admitted rows and annotate origin/mode/reason (the second half of
+/// [`ordered_queue`]).
+pub(crate) fn order(
+    mut candidates: Vec<Value>,
+    role: PrRole,
+    prefer: bool,
+    trust: &TrustPolicy,
+) -> Vec<Value> {
     // Match existing role tie-breaks: review/repair listing order; approved
     // conflicts before feedback; Champion oldest first. Sorting is stable.
     match role {

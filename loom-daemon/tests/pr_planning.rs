@@ -283,6 +283,118 @@ case "$*" in *page=2*) cat page2;; *) cat page1;; esac
     }
 }
 
+/// #9975 review: star-time ordering must not cost a timeline read per starred
+/// item per call. A counting fake `gh` pins the forge cost: reads happen only
+/// for ADMITTED starred PRs (and a linked starred issue), only when two or
+/// more of them can be reordered, and a repeat call with no new star activity
+/// (unchanged `updated_at`) makes none.
+#[cfg(unix)]
+#[test]
+fn star_time_reads_are_admitted_only_and_cached_by_updated_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join(".loom")).unwrap();
+    let star = serde_json::json!({"name":"loom:operator-priority"});
+    let pr = |n: u64, label: &str, starred: bool, body_extra: &str| {
+        let mut r = row(n, "autonomous", label);
+        r["updated_at"] = serde_json::json!("2026-10-01T00:00:00Z");
+        r["body"] = serde_json::json!(format!("{}{body_extra}", record("autonomous")));
+        if starred {
+            r["labels"].as_array_mut().unwrap().push(star.clone());
+        }
+        r
+    };
+    // #1/#2 starred + reviewable; #3 starred but not Judge's; #4 unstarred.
+    let mut pulls = vec![
+        pr(1, "loom:review-requested", true, ""),
+        pr(2, "loom:review-requested", true, "\nCloses #40"),
+        pr(3, "loom:pr", true, ""),
+        pr(4, "loom:review-requested", false, ""),
+    ];
+    let write_pulls = |pulls: &[serde_json::Value]| {
+        std::fs::write(root.join("pulls.json"), serde_json::to_vec(pulls).unwrap()).unwrap();
+    };
+    write_pulls(&pulls);
+    // The starred listing: the three starred PRs, linked issue #40, and 20
+    // unrelated starred issues that must never cost a read.
+    let mut starred: Vec<_> = [1u64, 2, 3]
+        .iter()
+        .map(|n| serde_json::json!({"number":n,"pull_request":{},"updated_at":"2026-10-01T00:00:00Z","labels":[star.clone()]}))
+        .collect();
+    starred.extend((40..41).chain(100..120).map(|n| {
+        serde_json::json!({"number":n,"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z","labels":[star.clone()]})
+    }));
+    std::fs::write(root.join("starred.json"), serde_json::to_vec(&starred).unwrap()).unwrap();
+    for (n, at) in [
+        (1, "2026-09-20"),
+        (2, "2026-09-25"),
+        (3, "2026-09-01"),
+        (40, "2026-09-10"),
+    ] {
+        std::fs::write(root.join(format!("star-{n}")), format!("L {at}T00:00:00Z\n")).unwrap();
+    }
+    script(
+        &root.join("gh"),
+        r#"
+echo "$*" >> calls.log
+case "$*" in
+ *timeline*) n=$(printf '%s' "$*" | sed -n 's|.*issues/\([0-9]*\)/timeline.*|\1|p'); cat "star-$n" 2>/dev/null; exit 0;;
+ *labels=loom:operator-priority*) printf 'HTTP/2 200 OK\r\n\r\n'; cat starred.json;;
+ *pulls*) printf 'HTTP/2 200 OK\r\n\r\n'; cat pulls.json;;
+ *) echo "unexpected forge call: $*" >&2; exit 1;;
+esac
+"#,
+    );
+    let cache = root.join("cache");
+    let run = |role: &str| {
+        let _ = std::fs::remove_file(root.join("calls.log"));
+        let mut cmd = cli(root);
+        cmd.args(["pr-queue", "--role", role])
+            .env("LOOM_GH_BIN", root.join("gh"))
+            .env("LOOM_LISTING_CACHE_DIR", &cache);
+        let out = output(cmd);
+        let log = std::fs::read_to_string(root.join("calls.log")).unwrap_or_default();
+        let mut reads: Vec<u64> = log
+            .lines()
+            .filter_map(|l| l.split("/issues/").nth(1)?.split('/').next()?.parse().ok())
+            .collect();
+        reads.sort_unstable();
+        let listed_stars = log
+            .lines()
+            .any(|l| l.contains("labels=loom:operator-priority"));
+        let ids: Vec<u64> = out
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["number"].as_u64().unwrap())
+            .collect();
+        (ids, reads, listed_stars, out)
+    };
+
+    // First call: #2 inherits #40's earlier star and leads. Exactly the two
+    // admitted starred PRs and #40 are read: never #3 (not Judge's) or the
+    // 20 unrelated stars.
+    let (ids, reads, listed, out) = run("judge");
+    assert_eq!(ids, vec![2, 1, 4]);
+    assert_eq!(out[0]["operatorPriorityAt"], "2026-09-10T00:00:00Z");
+    assert_eq!((reads, listed), (vec![1, 2, 40], true));
+
+    // Repeat with nothing changed: zero timeline reads, same order.
+    let (ids, reads, _, _) = run("judge");
+    assert_eq!((ids, reads), (vec![2, 1, 4], vec![]));
+
+    // New activity on #1 (its updated_at moved): only #1 is re-read.
+    pulls[0]["updated_at"] = serde_json::json!("2026-10-02T00:00:00Z");
+    write_pulls(&pulls);
+    let (_, reads, _, _) = run("judge");
+    assert_eq!(reads, vec![1]);
+
+    // Champion admits one starred PR (#3): no order among stars to decide,
+    // so neither the starred listing nor any timeline is read.
+    let (ids, reads, listed, _) = run("champion");
+    assert_eq!((ids, reads, listed), (vec![3], vec![], false));
+}
+
 #[test]
 fn actions_capture_is_autonomous_even_under_interactive_environment() {
     let dir = tempfile::tempdir().unwrap();

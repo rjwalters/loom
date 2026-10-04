@@ -62,7 +62,10 @@ use that order, preserving their normal tie-breaks: Judge listing order,
 Doctor approved conflicts before review feedback, Champion oldest first.
 Stars lead, earliest star first (#9974): a PR's star time is its own `labeled`
 event or its linked issue's earlier star (`loom-daemon forge starred`), with a
-`created_at` fallback, and `pr-queue` reports it as `operatorPriorityAt`. With
+`created_at` fallback, and `pr-queue` reports it as `operatorPriorityAt`. Star
+times are read only when two or more of the role's *admitted* rows are starred,
+and are cached on disk keyed by each item's `updated_at`, so an unchanged queue
+costs no timeline read; the role-runner probe never reads them (#9975). With
 preference enabled interactive PRs follow, then ordinary work. Like human
 preference, a star never evicts work already in flight; it takes the next turn.
 Existing emergency recovery of verified-red main remains a separate higher

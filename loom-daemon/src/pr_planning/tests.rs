@@ -322,3 +322,34 @@ fn stamped_inherited_star_time_orders_the_pr() {
     assert_eq!(rows[1][STAR_AT_FIELD], "2026-09-01T00:00:00Z");
     assert_eq!(ids(&ordered_queue(rows, PrRole::Judge, true, &policy())), vec![20, 10]);
 }
+
+/// #9975 review: the role-runner probe only asks `.any()`, so it never pays
+/// for star-time ordering — no starred listing and no timeline read, however
+/// many starred PRs are open. It runs every Judge tick.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn the_interactive_fallback_probe_never_reads_star_times() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".loom")).unwrap();
+    std::fs::write(root.join(".loom/config.json"), r#"{"planning":{"preferHumanPrs":true}}"#)
+        .unwrap();
+    let gh = root.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/sh\necho \"$*\" >> calls.log\nprintf 'HTTP/2 200 OK\\r\\n\\r\\n'\ncat pulls.json\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let star = "loom:operator-priority";
+    let rows: Vec<Value> = (1..=5)
+        .map(|n| pr(n, "autonomous", &["loom:review-requested", star]))
+        .collect();
+    std::fs::write(root.join("pulls.json"), serde_json::to_vec(&rows).unwrap()).unwrap();
+    assert_eq!(has_interactive_fallback(root, &gh).ok(), Some(false));
+    let log = std::fs::read_to_string(root.join("calls.log")).unwrap();
+    assert_eq!(log.lines().count(), 1, "one PR listing only: {log}");
+    assert!(log.contains("pulls?"), "{log}");
+}
