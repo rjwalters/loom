@@ -449,10 +449,9 @@ ISSUE_URL="$(forge_gh_create_issue_rl_safe "$REPO_NWO" "$TITLE" "$BODY" "${LABEL
 echo "$ISSUE_URL"
 
 # --- #10012: native sub-issue link + inherited star, best effort ------------
-if [[ -n "${PARENT:-}" ]]; then
-  loom-daemon forge parent link --parent "$PARENT" --child "$ISSUE_URL" ${REPO_NWO:+--repo "$REPO_NWO"} >&2 \
-    || echo "create-issue.sh: note: --parent #$PARENT follow-up (star / sub-issue link) incomplete; the issue itself is filed and the loom:parent marker is in its body" >&2
-fi
+[[ -z "${PARENT+x}" ]] \
+  || loom-daemon forge parent link --parent "$PARENT" --child "$ISSUE_URL" ${REPO_NWO:+--repo "$REPO_NWO"} >&2 \
+  || echo "create-issue.sh: note: --parent #$PARENT follow-up (star / sub-issue link) incomplete; the issue itself is filed and the loom:parent marker is in its body" >&2
 
 # --- #9774: the filed body ends with the dashboard footer -------------------
 # Best-effort, via the daemon's --patch-created (fetch, footer, PATCH — the
