@@ -308,7 +308,13 @@ mod tests {
             for kv in &log.attributes {
                 assert!(
                     ETA_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
-                        || ["loom.repo", "loom.issue", "loom.pr_number"].contains(&kv.key.as_str()),
+                        || [
+                            "loom.repo",
+                            "loom.issue",
+                            "loom.pr_number",
+                            "loom.record_id"
+                        ]
+                        .contains(&kv.key.as_str()),
                     "{} is not allowlisted",
                     kv.key
                 );

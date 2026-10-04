@@ -100,6 +100,7 @@ pub mod score;
 pub mod shadow;
 pub mod simulate;
 pub mod tracker;
+pub mod twin_otter;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

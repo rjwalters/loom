@@ -21,6 +21,7 @@ mod recalibrate;
 mod score;
 mod shadow;
 mod tracker;
+mod twin_otter_parity;
 
 use super::explanation::Features;
 use super::history::StageSamples;
