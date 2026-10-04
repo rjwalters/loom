@@ -230,7 +230,8 @@ fn registry_resolves_current_per_kind() {
             "land-v2",
             "land-v3",
             "land-2026-10-04-amber-heron",
-            "land-2026-10-04-twin-otter"
+            "land-2026-10-04-twin-otter",
+            "land-2026-10-04-twin-otter-b"
         ]
     );
     assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
@@ -274,7 +275,8 @@ fn for_kind_enumerates_every_registered_heuristic_of_a_kind() {
             "land-v2",
             "land-v3",
             "land-2026-10-04-amber-heron",
-            "land-2026-10-04-twin-otter"
+            "land-2026-10-04-twin-otter",
+            "land-2026-10-04-twin-otter-b"
         ]
     );
     assert_eq!(

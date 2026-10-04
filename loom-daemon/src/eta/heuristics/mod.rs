@@ -10,6 +10,7 @@
 mod finish_v1;
 mod land_amber_heron;
 mod land_twin_otter;
+mod land_twin_otter_b;
 mod land_v1;
 mod land_v2;
 mod land_v3;
@@ -21,6 +22,7 @@ pub(crate) use land_twin_otter::recompute as recompute_twin_otter;
 pub use land_twin_otter::{
     adapt_input, visit_entry, visit_seed, LandTwinOtter, DRAW_ORDER, LAND_TWIN_OTTER, METHOD,
 };
+pub use land_twin_otter_b::{LandTwinOtterB, LAND_TWIN_OTTER_B, PRE_PR_METHOD};
 pub use land_v1::{LandV1, LAND_V1};
 pub use land_v2::{LandV2, LAND_V2};
 pub use land_v3::{

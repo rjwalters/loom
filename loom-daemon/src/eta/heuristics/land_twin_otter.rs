@@ -29,7 +29,7 @@
 //! | condition | reason |
 //! |---|---|
 //! | the resolver refused (`Refused(r)`) | `r` |
-//! | `ready_wait`, `sweep.curator`, `sweep.builder` (the model is PR-level) | `unknown_stage` |
+//! | `ready_wait`, `sweep.curator`, `sweep.builder` (the model is PR-level; `land-2026-10-04-twin-otter-b`, #10244, composes these with `land-v2`) | `unknown_stage` |
 //! | no set loaded, no direct model, cutoff ≥ `as_of`, malformed coefficients | `no_model` |
 //! | the fit skipped the current stage | `insufficient_samples` |
 //! | an out-of-domain input (tracker inputs cannot produce one) | `unknown_stage` |

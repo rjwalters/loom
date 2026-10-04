@@ -40,14 +40,14 @@ fn turnovers(n: usize, base: i64) -> Vec<StageSample> {
 }
 
 /// history-a plus 12 turnovers of 300..=3600 s.
-fn history_ready() -> StageSamples {
+pub(super) fn history_ready() -> StageSamples {
     let mut history = history_a();
     history.stages.extend(turnovers(12, 300));
     history
 }
 
 /// Position 5, four waiting rows ahead, one free slot: four turnovers.
-fn dispatch() -> DispatchInput {
+pub(super) fn dispatch() -> DispatchInput {
     DispatchInput {
         position: 5,
         plan_state: "queued".to_string(),
@@ -61,7 +61,7 @@ fn dispatch() -> DispatchInput {
     }
 }
 
-fn ready_input(dispatch: Option<DispatchInput>) -> EstimateInput {
+pub(super) fn ready_input(dispatch: Option<DispatchInput>) -> EstimateInput {
     let mut input = input_at(Stage::ReadyWait, 600, 0);
     input.subject.pr_number = None;
     input.subject.sweep_id = None;

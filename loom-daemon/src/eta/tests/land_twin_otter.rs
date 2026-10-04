@@ -15,7 +15,8 @@ use crate::eta::fit::{
     PathStats, SkipReason,
 };
 use crate::eta::heuristics::{
-    adapt_input, visit_entry, visit_seed, LandTwinOtter, DRAW_ORDER, LAND_TWIN_OTTER, METHOD,
+    adapt_input, visit_entry, visit_seed, LandTwinOtter, LandTwinOtterB, LandV2, DRAW_ORDER,
+    LAND_TWIN_OTTER, LAND_TWIN_OTTER_B, METHOD, PRE_PR_METHOD,
 };
 use crate::eta::labels::{
     pr_flags, FLAG_BLOCKED, FLAG_CI_FAIL, FLAG_CONFLICT, FLAG_OP_HOLD, FLAG_SEQUENCED, FLAG_STARRED,
@@ -215,10 +216,11 @@ fn hours_to_sec(q: [f64; 4]) -> (i64, i64, i64, i64) {
 fn twin_otter_is_registered_last_as_a_land_shadow_with_or_without_a_fit() {
     let fitted = Registry::with_fit(Some(Arc::new(fixture_fit(fit_as_of()))));
     for registry in [Registry::builtin(), fitted] {
-        assert_eq!(registry.ids().last(), Some(&LAND_TWIN_OTTER));
+        let ids = registry.ids();
+        assert_eq!(ids[ids.len() - 2], LAND_TWIN_OTTER, "-b (#10244) follows it");
         assert_eq!(registry.get(LAND_TWIN_OTTER).map(Heuristic::kind), Some(Kind::Land));
         let land: Vec<&str> = registry.for_kind(Kind::Land).map(Heuristic::id).collect();
-        assert_eq!(land.last(), Some(&LAND_TWIN_OTTER));
+        assert_eq!(land[land.len() - 2], LAND_TWIN_OTTER);
         // Shadow: never the default `current`.
         assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
         assert_eq!(Registry::default_current(Kind::Land), "land-v1");
@@ -766,4 +768,113 @@ fn a_tracker_pass_with_a_fit_adds_a_twin_otter_shadow_and_leaves_the_primary_alo
         serde_json::to_string(&v1_with).unwrap(),
         serde_json::to_string(&v1_without).unwrap()
     );
+}
+
+// ---------------------------------------------------------- twin-otter-b (#10244)
+
+const PRE_PR: [Stage; 3] = [Stage::ReadyWait, Stage::SweepCurator, Stage::SweepBuilder];
+
+fn at_stage(stage: Stage) -> EstimateInput {
+    let mut input = review_input();
+    if let CurrentState::At(current) = &mut input.current {
+        current.stage = stage;
+    }
+    // `ready_wait` needs a dispatch plan, for land-v2 and -b alike.
+    input.dispatch = Some(crate::eta::DispatchInput {
+        position: 1,
+        plan_state: "next".to_string(),
+        gate: None,
+        ahead: 0,
+        free_slots: 1,
+        max_admissions_per_tick: None,
+        tick_interval_secs: 60,
+        saturation_held: false,
+        plan_at: input.as_of,
+    });
+    input
+}
+
+#[test]
+fn twin_otter_b_is_registered_after_twin_otter_as_a_land_shadow() {
+    let fitted = Registry::with_fit(Some(Arc::new(fixture_fit(fit_as_of()))));
+    for registry in [Registry::builtin(), fitted] {
+        assert_eq!(registry.ids().last(), Some(&LAND_TWIN_OTTER_B));
+        let land: Vec<&str> = registry.for_kind(Kind::Land).map(Heuristic::id).collect();
+        assert_eq!(land[land.len() - 2..], [LAND_TWIN_OTTER, LAND_TWIN_OTTER_B]);
+        assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
+    }
+}
+
+#[test]
+fn twin_otter_b_answers_pre_pr_stages_with_a_fit_loaded() {
+    let history = super::ready::history_ready();
+    let b = LandTwinOtterB::new(Some(Arc::new(fixture_fit(fit_as_of()))));
+    let mut ready = super::ready::ready_input(Some(super::ready::dispatch()));
+    ready.features = review_input().features;
+    for (stage, input) in [
+        (Stage::ReadyWait, ready),
+        (Stage::SweepCurator, super::input_at(Stage::SweepCurator, 0, 0)),
+        (Stage::SweepBuilder, super::input_at(Stage::SweepBuilder, 0, 0)),
+    ] {
+        let e = b.estimate(&input, &history);
+        assert_eq!(e.heuristic, LAND_TWIN_OTTER_B);
+        assert_eq!(reason(&e), None, "{stage}: {:?}", e.no_estimate_reason);
+        assert!(e.result.is_some(), "{stage}");
+        // The explanation names land-v2's path as the source, and recomputes.
+        assert_eq!(e.combination.as_ref().unwrap().method, PRE_PR_METHOD);
+        let r = e.result.as_ref().unwrap();
+        let (p25, p50, p75, _) = run_explanation(&e).expect("recomputes");
+        assert_eq!((p25, p50, p75), (r.p25_sec, r.p50_sec, r.p75_sec), "{stage}");
+    }
+}
+
+#[test]
+fn twin_otter_b_answered_ness_on_pre_pr_items_equals_land_v2s() {
+    let fit = Some(Arc::new(fixture_fit(fit_as_of())));
+    let b = LandTwinOtterB::new(fit.clone());
+    let empty = StageSamples::default();
+    let full = history_a();
+    for (name, history) in [("empty", &empty), ("history_a", &full)] {
+        for stage in PRE_PR {
+            let input = at_stage(stage);
+            let v2 = LandV2.estimate(&input, history);
+            let got = b.estimate(&input, history);
+            assert_eq!(got.result.is_some(), v2.result.is_some(), "{name} {stage}");
+            assert_eq!(reason(&got), reason(&v2), "{name} {stage}");
+        }
+    }
+    // A ready_wait item with no dispatch plan is refused identically.
+    let mut no_plan = at_stage(Stage::ReadyWait);
+    no_plan.dispatch = None;
+    assert_eq!(reason(&b.estimate(&no_plan, &full)), reason(&LandV2.estimate(&no_plan, &full)));
+    assert_eq!(reason(&b.estimate(&no_plan, &full)), Some(NoEstimateReason::NoDispatchPlan));
+    // And with no fit at all: pre-PR still answers like land-v2.
+    let nofit = LandTwinOtterB::new(None);
+    for stage in PRE_PR {
+        let input = at_stage(stage);
+        assert_eq!(
+            nofit.estimate(&input, &full).result.is_some(),
+            LandV2.estimate(&input, &full).result.is_some()
+        );
+    }
+}
+
+#[test]
+fn twin_otter_b_leaves_pr_level_stages_and_refusals_to_twin_otter() {
+    let history = history_a();
+    let fit = fixture_fit(fit_as_of());
+    let original = twin_otter(Some(fit.clone()));
+    let b = LandTwinOtterB::new(Some(Arc::new(fit)));
+    for stage in [Stage::ReviewWait, Stage::Doctor, Stage::MergeWait] {
+        let input = at_stage(stage);
+        let a = original.estimate(&input, &history);
+        let c = b.estimate(&input, &history);
+        assert_eq!(c.heuristic, LAND_TWIN_OTTER_B);
+        assert_eq!(c.result, a.result, "{stage}");
+        assert_eq!(c.twin_otter, a.twin_otter, "{stage}");
+        assert_eq!(c.no_estimate_reason, a.no_estimate_reason, "{stage}");
+    }
+    let mut refused = review_input();
+    refused.current = CurrentState::Refused(NoEstimateReason::Blocked);
+    assert_eq!(reason(&b.estimate(&refused, &history)), Some(NoEstimateReason::Blocked));
 }
