@@ -158,7 +158,6 @@ TITLE=""
 BODY=""
 BODY_FILE=""
 REPO_NWO=""
-PARENT=""
 LABELS=()
 HAVE_BODY=false
 # Duplicate backstop (#7971). Env default so a caller that has ALREADY run
@@ -211,22 +210,12 @@ while [[ $# -gt 0 ]]; do
       done
       shift 2
       ;;
-    --repo | -R)
-      REPO_NWO="${2:-}"
-      shift 2
-      ;;
+    --repo | -R) REPO_NWO="${2:-}"; shift 2 ;;
     --force | --skip-duplicate-check)
       SKIP_DUP_CHECK=true
       shift
       ;;
-    --parent)
-      PARENT="${2:-}"
-      if [[ ! "$PARENT" =~ ^[0-9]+$ ]]; then
-        echo "create-issue.sh: --parent takes an issue number: $PARENT" >&2
-        exit 2
-      fi
-      shift 2
-      ;;
+    --parent) PARENT="${2:-}"; shift 2 ;;
     --duplicate-threshold)
       DUP_THRESHOLD="${2:-}"
       if [[ ! "$DUP_THRESHOLD" =~ ^[0-9]+$ ]]; then
@@ -285,20 +274,12 @@ fi
 # duplicate backstop below sees "#N" as cross-referenced and the filed body
 # carries the link from its first revision. No daemon, no --parent: a silent
 # fallback would file a child with no edge.
-PARENT_DAEMON=""
-_parent_repo=()
-if [[ -n "$PARENT" ]]; then
-  PARENT_DAEMON="$(command -v loom-daemon 2>/dev/null || true)"
-  if [[ -z "$PARENT_DAEMON" ]]; then
-    echo "create-issue.sh: --parent needs loom-daemon on PATH (nothing was filed)" >&2
-    exit 1
-  fi
-  _parent_repo=()
-  [[ -n "$REPO_NWO" ]] && _parent_repo=(--repo "$REPO_NWO")
-  BODY="$(printf '%s' "$BODY" | "$PARENT_DAEMON" forge parent body --parent "$PARENT" ${_parent_repo[@]+"${_parent_repo[@]}"})" || {
-    echo "create-issue.sh: could not add the parent marker (nothing was filed)" >&2
-    exit 1
-  }
+# The daemon validates N (a non-number fails here, before anything is filed).
+if [[ -n "${PARENT:-}" ]]; then
+  command -v loom-daemon >/dev/null 2>&1 \
+    || { echo "create-issue.sh: --parent needs loom-daemon on PATH (nothing was filed)" >&2; exit 1; }
+  BODY="$(printf '%s' "$BODY" | loom-daemon forge parent body --parent "$PARENT" ${REPO_NWO:+--repo "$REPO_NWO"})" \
+    || { echo "create-issue.sh: could not add the parent marker (nothing was filed)" >&2; exit 1; }
 fi
 
 # Detection backstop (#6771, deferred from #6714's filing-lock): warn -- never
@@ -467,8 +448,8 @@ ISSUE_URL="$(forge_gh_create_issue_rl_safe "$REPO_NWO" "$TITLE" "$BODY" "${LABEL
 echo "$ISSUE_URL"
 
 # --- #10012: native sub-issue link + inherited star, best effort ------------
-if [[ -n "$PARENT_DAEMON" ]]; then
-  "$PARENT_DAEMON" forge parent link --parent "$PARENT" --child "$ISSUE_URL" ${_parent_repo[@]+"${_parent_repo[@]}"} >&2 \
+if [[ -n "${PARENT:-}" ]]; then
+  loom-daemon forge parent link --parent "$PARENT" --child "$ISSUE_URL" ${REPO_NWO:+--repo "$REPO_NWO"} >&2 \
     || echo "create-issue.sh: note: --parent #$PARENT follow-up (star / sub-issue link) incomplete; the issue itself is filed and the loom:parent marker is in its body" >&2
 fi
 

@@ -644,7 +644,7 @@ Issue #99: "fix the crash bug"
 
 If, during curation, you determine an issue is too large to be a single Builder PR (>6 hours, >8 files, or >400 LOC) and must be split into sub-issues (size each child per "Backlog Rightsizing" below):
 
-1. **Create each sub-issue with `create-issue.sh --parent <N> --label loom:triage`** (writes the `loom:parent` marker and native sub-issue link; a starred parent's star is inherited, #10012). Do NOT apply `loom:curated`, even if your decomposition includes curator-quality detail (acceptance criteria, file references, scope guards).
+1. **Create each sub-issue with `create-issue.sh --parent <N> --label loom:triage`** (writes the parent marker and native sub-issue link; a starred parent's star is inherited, #10012). Do NOT apply `loom:curated`, even if your decomposition includes curator-quality detail (acceptance criteria, file references, scope guards).
 2. **Do NOT apply `loom:issue` at creation**, even to an inherited-star child: step 5's separate pass reviews it first, then the starred exception applies (see "Who promotes `loom:curated` → `loom:issue`" above).
 3. **No "Decomposed sub-issues" prose needed** — `--parent` already gives the parent its machine-readable children.
 4. **Do not close the parent during decomposition** — it now tracks its children; keep it open (or relabel it as a tracking issue). Closing here would orphan the sub-issues. (Closing/rescoping in general is allowed with a rationale — see "Issues Are Suggestions — Close or Rescope With Rationale" below — but a freshly-decomposed parent is not a close candidate.)
