@@ -31,6 +31,9 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+#[path = "support/d1_sqlite.rs"]
+mod d1_sqlite;
+
 fn repo_file(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -168,7 +171,9 @@ fn query(conn: &Connection, statement: &str) -> Vec<Vec<String>> {
 }
 
 fn seeded() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
+    // D1's compound-SELECT ceiling applied, so this engine refuses what D1
+    // refuses (#10066).
+    let conn = d1_sqlite::d1_connection();
     conn.execute_batch(&records_ddl()).unwrap();
     for row in FIXTURE {
         // Written through `json()` so a malformed fixture fails at insert

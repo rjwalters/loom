@@ -196,7 +196,7 @@ pub(super) fn fetch(src: &GhPipelineSource, root: &Path) -> RepoPipelineSnapshot
         snap.queued = rec.take(ctx.count(
             "loom:issue",
             Side::Issue,
-            |r| !has_any(r, PARK_LABELS),
+            |r| !has_any(r, &PARK_LABELS),
             || ctx.graphql_search_count(Side::Issue, &GhPipelineSource::queued_search_query()),
         ));
     }
@@ -231,7 +231,9 @@ pub(super) fn fetch(src: &GhPipelineSource, root: &Path) -> RepoPipelineSnapshot
                 if m.changes_requested_unclaimed {
                     snap.changes_requested_unclaimed = Some(
                         prs.iter()
-                            .filter(|r| !has_any(r, &["loom:treating"]) && !has_any(r, PARK_LABELS))
+                            .filter(|r| {
+                                !has_any(r, &["loom:treating"]) && !has_any(r, &PARK_LABELS)
+                            })
                             .count(),
                     );
                 }

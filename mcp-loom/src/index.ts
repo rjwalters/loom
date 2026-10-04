@@ -15,11 +15,12 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 
 import { handleLogTool, logTools } from "./tools/logs.js";
 import { handleSweepTool, sweepTools } from "./tools/sweeps.js";
+import { handleStatusTool, statusTools } from "./tools/status.js";
 import { handleTerminalTool, terminalTools } from "./tools/terminals.js";
 import { handleUITool, uiTools } from "./tools/ui.js";
 
 // Combine all tools from all modules
-const allTools = [...logTools, ...uiTools, ...terminalTools, ...sweepTools];
+const allTools = [...logTools, ...uiTools, ...terminalTools, ...sweepTools, ...statusTools];
 
 // Create the unified MCP server
 const server = new Server(
@@ -49,6 +50,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const uiToolNames = uiTools.map((t) => t.name);
     const terminalToolNames = terminalTools.map((t) => t.name);
     const sweepToolNames = sweepTools.map((t) => t.name);
+    const statusToolNames = statusTools.map((t) => t.name);
 
     let content: { type: "text"; text: string }[];
 
@@ -60,6 +62,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       content = await handleTerminalTool(name, args as Record<string, unknown>);
     } else if (sweepToolNames.includes(name)) {
       content = await handleSweepTool(name, args as Record<string, unknown>);
+    } else if (statusToolNames.includes(name)) {
+      content = await handleStatusTool(name, args as Record<string, unknown>);
     } else {
       return {
         content: [
@@ -91,7 +95,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Loom MCP server running on stdio (unified: logs + ui + terminals + sweeps)");
+  console.error("Loom MCP server running on stdio (unified: logs + ui + terminals + sweeps + status)");
 }
 
 main().catch((error) => {
