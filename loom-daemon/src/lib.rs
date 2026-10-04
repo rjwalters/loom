@@ -216,6 +216,7 @@ pub mod idle_exit;
 pub mod inflight;
 pub mod init;
 pub mod install_self_check;
+pub mod intake_reconcile;
 pub mod ipc;
 pub mod issue_creation_mutex;
 pub mod jev_merge_risk;
