@@ -160,7 +160,9 @@ fn ready_explanations_recompute_from_their_own_json() {
     ] {
         let json = serde_json::to_string(&explanation).unwrap();
         let parsed: Explanation = serde_json::from_str(&json).unwrap();
-        assert_eq!(run_explanation(&parsed), explanation.quantiles());
+        assert_eq!(run_explanation(&parsed), explanation.quantiles_with_p90());
+        let (p25, p50, p75, p90) = explanation.quantiles_with_p90().expect("p90 recorded");
+        assert!(p25 <= p50 && p50 <= p75 && p75 <= p90, "{}", explanation.heuristic);
         let result = explanation.result.as_ref().unwrap();
         let marks = run_marks(&parsed).unwrap();
         assert_eq!(marks, result.stage_marks);
@@ -198,7 +200,8 @@ fn ready_golden_fixture() {
     );
     for kind in ["start", "land"] {
         let parsed: Explanation = serde_json::from_value(golden[kind].clone()).unwrap();
-        assert_eq!(run_explanation(&parsed), parsed.quantiles(), "{kind} recomputes");
+        assert!(parsed.quantiles_with_p90().is_some(), "{kind} records p90");
+        assert_eq!(run_explanation(&parsed), parsed.quantiles_with_p90(), "{kind} recomputes");
     }
 }
 
@@ -310,6 +313,7 @@ fn row(issue: u32, state: PlanState, position: Option<u32>) -> ReadyRow {
             gate: position.map(|_| PlanGate::Capacity),
             ..RowPlan::default()
         },
+        disposition: crate::types::QueueDisposition::DeferredCapacity,
     }
 }
 
@@ -328,6 +332,7 @@ fn ready_plan(complete: bool) -> ReadyPlan {
             ..DispatchPlanContext::default()
         },
         at: as_of() - Duration::seconds(10),
+        listing_failed: Vec::new(),
     }
 }
 

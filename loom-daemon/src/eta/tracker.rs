@@ -69,7 +69,7 @@
 //!   restart) is counted as having taken one.
 
 use super::emit::{EmitState, Signature, Trigger};
-use super::explanation::{Explanation, FeatureOmitted, Features};
+use super::explanation::Explanation;
 use super::journal::JournalEntry;
 use super::labels::stage_from_pr_labels;
 use super::score::{score, EstimateSummary, OutcomeKind, Score, StageObservation};
@@ -77,7 +77,7 @@ use super::{
     AgeSource, CurrentStage, CurrentState, DispatchInput, EstimateInput, Heuristic, Kind,
     NoEstimateReason, Provenance, Registry, Stage, StageSamples, Subject,
 };
-use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
+use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
 
 /// Pending estimates older than this are dropped unresolved.
@@ -150,10 +150,6 @@ struct Item {
     in_ready_queue: bool,
     /// Its plan position, when the plan gives it one.
     ready: Option<DispatchInput>,
-    /// Ready rows on that plan, for the `queue_ready` feature.
-    queue_ready: Option<u32>,
-    /// The plan's concurrency cap, for the `max_concurrent` feature.
-    max_concurrent: Option<u32>,
 }
 
 /// A PR row from a review-label listing.
@@ -286,6 +282,8 @@ pub struct Tracker {
     orphaned: usize,
     /// Pending estimates dropped by the [`MAX_PENDING`] cap.
     cap_dropped: usize,
+    /// The last pass's fleet view and dispatch plan, for `features` (#10201).
+    context: features::PassContext,
 }
 
 /// What [`Tracker::drain_dropped`] reports.
@@ -317,6 +315,7 @@ impl Tracker {
             loom,
             orphaned: 0,
             cap_dropped: 0,
+            context: features::PassContext::default(),
         }
     }
 
@@ -1122,30 +1121,8 @@ impl Tracker {
             Subject::new(&item.repo, ctx.repo_ids.get(&key.repo).copied(), item.issue);
         subject.pr_number = item.pr_number;
         subject.sweep_id = item.sweep_id.clone().filter(|_| item.sweep_running);
-        let features = Features {
-            labels: (!item.labels.is_empty()).then(|| item.labels.clone()),
-            doctor_cycles_so_far: Some(item.rework_rounds),
-            sweep_internal: Some(item.sweep_running),
-            pr_created_at: item.pr_created_at,
-            hour_utc: Some(now.hour()),
-            weekday_utc: Some(now.weekday().num_days_from_monday()),
-            host_id: ctx.host_id.map(str::to_string),
-            queue_rank: item
-                .ready
-                .as_ref()
-                .map(|r| r.position)
-                .filter(|_| ready_only),
-            queue_ready: item.queue_ready.filter(|_| ready_only),
-            max_concurrent: item.max_concurrent.filter(|_| ready_only),
-            ..Features::default()
-        };
-        let mut omitted = Vec::new();
-        if item.labels.is_empty() {
-            omitted.push(FeatureOmitted {
-                name: "labels".to_string(),
-                reason: "not_listed_yet".to_string(),
-            });
-        }
+        let (features, omitted) =
+            self.features_for(key, item, &current, ready_only, ctx.host_id, now);
         Some(EstimateInput {
             subject,
             as_of: now,
@@ -1238,6 +1215,11 @@ impl Tracker {
 
 #[path = "tracker_ready.rs"]
 mod ready;
+
+#[path = "tracker_features.rs"]
+mod features;
+
+pub use features::{events_from_journal, ListedPr, NOT_LISTED_YET};
 
 pub use ready::{
     ReadyPlan, ReadyRow, READY_FIRST_SEEN, READY_PLAN_MAX_AGE_SECS, SLOT_TURNOVER_REPO,

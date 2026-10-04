@@ -153,9 +153,38 @@ mod tests {
     use std::process::Command;
 
     // `#[serial]` below: a few `release_fetch` tests briefly replace `PATH`
-    // with `<dir>:/usr/bin:/bin` under `#[serial]`. A bare-`gh` spawn in
+    // with `<dir>:/usr/bin:/bin` under `#[serial]`. A bare `gh` looked up in
     // that window would resolve to the real `gh`, so every test here that
-    // reads `PATH` or spawns bare `gh` serialises against them.
+    // reads `PATH` for the guard serialises against them.
+
+    /// Where a bare `gh` resolves on `path`: the first `<dir>/gh` that is an
+    /// executable file, as `execvp` looks it up. The self-tests spawn that
+    /// resolved stand-in by path, after asserting what it is, instead of a raw
+    /// `Command::new("gh")`. #9985's choke-point scan admits no new raw site
+    /// (#10249), and a spawn that checks its target first can never reach the
+    /// real `gh`. Do not "simplify" this back to a bare `gh` spawn.
+    fn resolve_bare(path: &std::ffi::OsStr) -> Option<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        std::env::split_paths(path).map(|d| d.join("gh")).find(|p| {
+            p.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    }
+
+    /// The guard's stand-in, asserted to be what a bare `gh` resolves to now.
+    fn guard_stand_in() -> PathBuf {
+        let resolved = resolve_bare(&std::env::var_os("PATH").unwrap_or_default());
+        let expected = GUARD_DIR
+            .get()
+            .expect("guard installed before main")
+            .join("gh");
+        assert_eq!(
+            resolved.as_deref(),
+            Some(expected.as_path()),
+            "bare gh must resolve to the guard"
+        );
+        expected
+    }
 
     #[test]
     #[serial]
@@ -175,7 +204,8 @@ mod tests {
         // not trip the process-wide exit check.
         let scratch = tempfile::tempdir().unwrap();
         let log = scratch.path().join("calls.log");
-        let out = Command::new("gh")
+        let stand_in = guard_stand_in();
+        let out = Command::new(&stand_in)
             .args(["api", "--paginate", "repos/o/r/pulls"])
             .env(LOG_ENV, &log)
             .output()
@@ -197,7 +227,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = prepend_path(scratch.path(), std::env::var_os("PATH")).unwrap();
-        let out = Command::new("gh").env("PATH", path).output().unwrap();
+        assert_eq!(resolve_bare(&path), Some(fake.clone()));
+        let out = Command::new(&fake).env("PATH", path).output().unwrap();
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout), "fake\n");
     }
@@ -207,7 +238,7 @@ mod tests {
     #[test]
     #[ignore = "fixture: run only by a_leaking_test_fails_its_binary_naming_argv"]
     fn leaking_fixture() {
-        let _ = Command::new("gh")
+        let _ = Command::new(guard_stand_in())
             .args(["api", "repos/o/r/pulls", "--paginate"])
             .output();
     }

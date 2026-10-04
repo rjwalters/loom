@@ -60,6 +60,7 @@ fn summary(
         p25_sec: p50.map(|p| p - 60),
         p50_sec: p50,
         p75_sec: p50.map(|p| p + 60),
+        p90_sec: p50.map(|p| p + 120),
         samples_min: Some(12),
         no_estimate_reason: p50
             .is_none()

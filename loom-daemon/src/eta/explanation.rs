@@ -365,6 +365,16 @@ pub struct EstimateResult {
     pub p50_sec: i64,
     /// Remaining seconds, 75th percentile.
     pub p75_sec: i64,
+    /// Remaining seconds, 90th percentile (#10211): the displayed upper
+    /// bound a late surprise is scored against. Read off the same simulated
+    /// path totals as the quartiles, by the same nearest-rank rule, with no
+    /// new draws.
+    ///
+    /// Always `Some` on a new estimate. `None` only on an explanation
+    /// recorded before the field existed, which still parses: additive, so
+    /// no schema bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p90_sec: Option<i64>,
     /// `as_of + p50`.
     pub eta_p50_at: DateTime<Utc>,
     /// Smallest `n` over the path's distributions.
@@ -392,7 +402,13 @@ pub struct Contributions {
     pub rework_fraction_by_quartile: Vec<f64>,
 }
 
-/// Recorded context. `null` = not measured; no v1 heuristic reads these.
+/// Recorded context. `null` = not measured, with a [`FeatureOmitted`]
+/// reason. No v1 heuristic reads these (`land-v3` reads two).
+///
+/// The fields from `ahead` on (#10201) post-date the first shipped v1
+/// payloads: an explanation recorded before them still parses (a missing
+/// `Option` reads as `None`), so the change is additive and the schema stays
+/// `eta-explanation/v1`. Their definitions are [`super::queue_features`]'s.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Features {
     /// Current labels.
@@ -459,6 +475,51 @@ pub struct Features {
     pub pool_exhausted: Option<bool>,
     /// The repo's first-pass approval rate.
     pub repo_first_pass_approval_rate: Option<f64>,
+    /// Other open PRs in the repo and stage that entered it earlier.
+    #[serde(default)]
+    pub ahead: Option<u32>,
+    /// Other open PRs in the repo and stage.
+    #[serde(default)]
+    pub n_stage_repo: Option<u32>,
+    /// Other open PRs in the stage, fleet scope.
+    #[serde(default)]
+    pub n_stage_fleet: Option<u32>,
+    /// Departures from the stage in the repo, last hour.
+    #[serde(default)]
+    pub exits_repo_1h: Option<u32>,
+    /// Same, last 6 h.
+    #[serde(default)]
+    pub exits_repo_6h: Option<u32>,
+    /// Same, last 24 h.
+    #[serde(default)]
+    pub exits_repo_24h: Option<u32>,
+    /// Departures from the stage, fleet scope, last hour.
+    #[serde(default)]
+    pub exits_fleet_1h: Option<u32>,
+    /// Same, last 6 h.
+    #[serde(default)]
+    pub exits_fleet_6h: Option<u32>,
+    /// Same, last 24 h.
+    #[serde(default)]
+    pub exits_fleet_24h: Option<u32>,
+    /// PR merges in the repo, last 24 h.
+    #[serde(default)]
+    pub merges_repo_24h: Option<u32>,
+    /// PR merges, fleet scope, last 6 h.
+    #[serde(default)]
+    pub merges_fleet_6h: Option<u32>,
+    /// Seconds since the repo's last merge, capped at 168 h.
+    #[serde(default)]
+    pub since_merge_sec: Option<i64>,
+    /// Open PRs under any review label in the repo, the item's own included.
+    #[serde(default)]
+    pub open_prs_repo: Option<u32>,
+    /// Repos the fleet-scope values cover.
+    #[serde(default)]
+    pub fleet_scope_repos: Option<u32>,
+    /// The repo had a `pr-open-skip` row on the last dispatch plan.
+    #[serde(default)]
+    pub repo_pr_open_skip: Option<bool>,
 }
 
 /// Why a feature is null.
@@ -472,7 +533,7 @@ pub struct FeatureOmitted {
 
 impl Features {
     /// Every feature name, in field order.
-    pub const NAMES: [&'static str; 32] = [
+    pub const NAMES: [&'static str; 47] = [
         "labels",
         "complexity_marker",
         "points_marker",
@@ -505,6 +566,21 @@ impl Features {
         "pool_usable_accounts",
         "pool_exhausted",
         "repo_first_pass_approval_rate",
+        "ahead",
+        "n_stage_repo",
+        "n_stage_fleet",
+        "exits_repo_1h",
+        "exits_repo_6h",
+        "exits_repo_24h",
+        "exits_fleet_1h",
+        "exits_fleet_6h",
+        "exits_fleet_24h",
+        "merges_repo_24h",
+        "merges_fleet_6h",
+        "since_merge_sec",
+        "open_prs_repo",
+        "fleet_scope_repos",
+        "repo_pr_open_skip",
     ];
 
     /// `omitted` plus a `reason` entry for every null feature it does not
@@ -536,6 +612,16 @@ impl Explanation {
         self.result
             .as_ref()
             .map(|r| (r.p25_sec, r.p50_sec, r.p75_sec))
+    }
+
+    /// The `(p25, p50, p75, p90)` remaining seconds, when there is an
+    /// estimate that recorded a p90 — what
+    /// [`super::simulate::run_explanation`] recomputes. `None` for a refusal
+    /// and for an explanation recorded before p90 existed (#10211).
+    #[must_use]
+    pub fn quantiles_with_p90(&self) -> Option<(i64, i64, i64, i64)> {
+        let r = self.result.as_ref()?;
+        Some((r.p25_sec, r.p50_sec, r.p75_sec, r.p90_sec?))
     }
 
     /// Serialized size in bytes.
