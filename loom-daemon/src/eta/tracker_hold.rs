@@ -166,10 +166,22 @@ pub(super) fn roster_entry(item: &Item, stage: Stage) -> Option<DateTime<Utc>> {
     }
 }
 
+/// [`roster_entry`] as a hold-aware model's training sees it (#10312): a
+/// tracked `merge_wait` PR released from a hold enters at its release, the
+/// split episode's entry. Every other PR is [`roster_entry`].
+pub(super) fn episode_roster_entry(item: &Item, stage: Stage) -> Option<DateTime<Utc>> {
+    match stage {
+        Stage::MergeWait => episode_entered_at(item).or_else(|| roster_entry(item, stage)),
+        _ => roster_entry(item, stage),
+    }
+}
+
 impl Tracker {
-    /// The modeled view of a held item's `described` input and its series
-    /// signature, when `kind` has a heuristic that models the hold. `None`
-    /// when the item is not held (its input is not `At(MergeHold)`).
+    /// The modeled view of an item's `described` input, when `kind` has a
+    /// heuristic that models the hold, with its series signature: the
+    /// hold's ([`held_signature`]) for a held item, `None` (the item's own)
+    /// for a `merge_wait` item (#10312), whose queue position the episode
+    /// roster and its episode entry give. `None` for any other input.
     pub(super) fn modeled_input(
         &self,
         key: &ItemKey,
@@ -177,17 +189,22 @@ impl Tracker {
         kind: Kind,
         described: &EstimateInput,
         ctx: &EstimateContext<'_>,
-    ) -> Option<(EstimateInput, Signature)> {
-        let CurrentState::At(held) = &described.current else {
+    ) -> Option<(EstimateInput, Option<Signature>)> {
+        let CurrentState::At(current) = &described.current else {
             return None;
         };
-        if held.stage != Stage::MergeHold || !ctx.registry.for_kind(kind).any(|h| h.models_hold()) {
+        let signature = match current.stage {
+            Stage::MergeHold => Some(held_signature(item)),
+            Stage::MergeWait => None,
+            _ => return None,
+        };
+        if !ctx.registry.for_kind(kind).any(|h| h.models_hold()) {
             return None;
         }
         let mut modeled = described.clone();
         (modeled.features, modeled.features_omitted) =
-            self.recorded_features(key, item, &described.current, ctx, described.as_of);
-        Some((modeled, held_signature(item)))
+            self.recorded_features(key, item, &described.current, ctx, described.as_of, true);
+        Some((modeled, signature))
     }
 }
 

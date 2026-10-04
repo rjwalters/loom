@@ -324,3 +324,34 @@ fn a_held_prs_twin_otter_input_is_its_merge_hold_training_row() {
         assert!(imputed.is_empty(), "PR {pr} imputed {imputed:?}");
     }
 }
+
+/// A released PR, and a never-held peer approved before its release (#10312):
+/// serving's twin-otter input equals training's `merge_wait` row.
+///
+/// At 20 h, `merge_wait` in [`REPO`] is 34 (episode entered at its 18 h
+/// release, approval 16 h) and 35 (17 h). Training sorts by the episode, so
+/// 35 is ahead of 34: `ahead` is 1 for 34 and 0 for 35.
+#[test]
+fn a_released_prs_and_its_never_held_peers_input_is_their_merge_wait_training_row() {
+    let specs = specs();
+    let trained = rows::build(&snapshots(&specs), cutoff());
+    let mut tracker = serve(&specs);
+    let registry = fitted();
+    for (pr, ahead, age_h) in [(34, 1.0, 2.0), (35, 0.0, 3.0)] {
+        let spec = specs.iter().find(|s| s.pr == pr).unwrap();
+        let training = row(&trained, REPO, pr, h(AT)).unwrap_or_else(|| panic!("row {pr}"));
+        assert_eq!(training.stage, FitStage::MergeWait, "PR {pr}");
+        let (counts, rest) = trained_fields(&training.inputs);
+        assert_eq!(counts[0], Some(ahead), "PR {pr} trained ahead");
+        assert_eq!(rest, (age_h, 0, 0), "PR {pr} trained");
+
+        let (input, imputed) = served(&mut tracker, &registry, spec);
+        assert_eq!(input.stage, "merge_wait", "PR {pr}");
+        assert_eq!(
+            served_fields(&input),
+            trained_fields(&training.inputs),
+            "PR {pr}: serving differs from training"
+        );
+        assert!(imputed.is_empty(), "PR {pr} imputed {imputed:?}");
+    }
+}

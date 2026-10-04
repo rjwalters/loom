@@ -382,3 +382,51 @@ fn one_hold_visit_keeps_its_seed_and_a_new_one_draws_another() {
     let again = twin(&h.land(&registry, 300, 1800)).clone();
     assert_ne!(seed(&again), seed(&first));
 }
+
+// ------------------------------------------ released and never-held peers
+
+/// #10312: for a `merge_wait` PR the two views differ only in queue
+/// position. The described view (every path engine's) positions a released
+/// PR 34 by its approval (16 h) and so ahead of never-held PR 35 (17 h);
+/// the modeled view by its release (18 h), as training does. Neither view
+/// gains or loses any other feature, and the emission signature of the
+/// hold-aware series is the item's own, never the hold's.
+#[test]
+fn a_merge_wait_pr_is_positioned_by_its_episode_in_the_modeled_view_only() {
+    let specs = specs();
+    let mut tracker = serve(&specs);
+    let registry = fitted();
+    let history = history_a();
+    let repo_ids = BTreeMap::new();
+    let ctx = context(&registry, &history, &repo_ids, 300);
+    let at = super::fit_rows::h(AT);
+    for (pr, described_ahead, modeled_ahead) in [(34, 0, 1), (35, 1, 0)] {
+        let key = specs.iter().find(|s| s.pr == pr).unwrap().key();
+        let described = tracker.land_input(&key, &ctx, at).unwrap();
+        let modeled = tracker.hold_aware_land_input(&key, &ctx, at).unwrap();
+        assert_eq!(described.features.ahead, Some(described_ahead), "PR {pr} described");
+        assert_eq!(modeled.features.ahead, Some(modeled_ahead), "PR {pr} modeled");
+        let mut same = modeled.features.clone();
+        same.ahead = described.features.ahead;
+        assert_eq!(same, described.features, "PR {pr}: only `ahead` differs");
+        assert_eq!(modeled.features_omitted, described.features_omitted, "PR {pr}");
+    }
+
+    // Emissions: the path engines keep the described features; the twin
+    // pair's explanations record the modeled ones, which replay.
+    let emissions =
+        tracker.estimate(Some(&[specs.iter().find(|s| s.pr == 34).unwrap().key()]), &ctx, at);
+    for e in emissions
+        .iter()
+        .filter(|e| e.explanation.kind == Kind::Land)
+    {
+        let ahead = e.explanation.features.as_ref().and_then(|f| f.ahead);
+        let id = e.explanation.heuristic.as_str();
+        let expected = if HOLD_AWARE.contains(&id) {
+            Some(1)
+        } else {
+            Some(0)
+        };
+        assert_eq!(ahead, expected, "{id}");
+    }
+}
