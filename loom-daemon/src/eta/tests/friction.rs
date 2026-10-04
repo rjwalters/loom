@@ -7,6 +7,7 @@ use crate::eta::friction::{
     ci_status, open_pr_count, pr_mergeability, typical_ci_duration, CiStatus, FrictionBook,
     PrFriction, RepoFriction, CI_MIN_RUNS, MAX_READING_AGE_SECS,
 };
+use crate::eta::labels::{pr_flags, FLAG_OP_HOLD};
 use crate::eta::tracker::{EstimateContext, PrView, Tracker};
 use crate::eta::{Kind, Registry};
 use chrono::{DateTime, Duration, Utc};
@@ -116,6 +117,13 @@ fn fresh_readings_are_copied_and_failed_parts_keep_their_reason() {
     let (mut f, mut omitted) = (Features::default(), Vec::new());
     book.apply(REPO, Some(7), Some(&clean), as_of(), &mut f, &mut omitted);
     assert_eq!(f.operator_hold, Some(false));
+
+    // `operator_hold` means any hold, not `pr_flags`' operator hold (#10278).
+    let blocked = vec!["loom:pr".to_string(), "loom:blocked".to_string()];
+    let (mut f, mut omitted) = (Features::default(), Vec::new());
+    book.apply(REPO, Some(7), Some(&blocked), as_of(), &mut f, &mut omitted);
+    assert_eq!(f.operator_hold, Some(true));
+    assert_eq!(pr_flags(&blocked) & FLAG_OP_HOLD, 0);
 }
 
 #[test]
