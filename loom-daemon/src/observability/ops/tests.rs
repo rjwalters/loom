@@ -307,6 +307,14 @@ fn tick_result_precedence() {
         "dispatched"
     );
     assert_eq!(with(|r| r.halted = true), "halted_main_red");
+    // #10113: the same hold, attributed to a billing block, is its own result.
+    let held = TickReport {
+        seen: 3,
+        halted: true,
+        ..TickReport::default()
+    };
+    assert_eq!(super::dispatch::tick_result_with(&held, true), "halted_ci_billing");
+    assert_eq!(super::dispatch::tick_result_with(&held, false), "halted_main_red");
     assert_eq!(with(|r| r.saturation_held = true), "saturation_held");
     assert_eq!(with(|r| r.errors = 1), "error");
     assert_eq!(with(|r| r.deferred_ramp_cap = 2), "capacity_full");

@@ -223,6 +223,17 @@ pub enum GhCompletion {
     Passthrough(ExitStatus),
 }
 
+/// The environment variables `gh` documents as taking precedence over a
+/// `GH_CONFIG_DIR`'s stored credential. [`GhInvocation::without_token_env`]
+/// removes every one, so a reader-only call cannot silently spend a token the
+/// daemon's own environment happens to carry (#10263).
+pub const TOKEN_ENV_VARS: [&str; 4] = [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+];
+
 /// One environment change the facade applies to the child: `Some` sets the
 /// variable, `None` removes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +253,13 @@ pub struct GhInvocation {
     args: Vec<OsString>,
     cwd: Option<PathBuf>,
     program: Option<String>,
+    config_dir: Option<PathBuf>,
+    /// Remove [`TOKEN_ENV_VARS`] from the child (#10263).
+    strip_token_env: bool,
+    /// The #9777 call identity this execution is accounted under (#9831).
+    /// Empty by default: an unmapped site records `operation = "unknown"`
+    /// (see [`accounting`]), visible rather than absent.
+    identity: crate::forge_call_stats::CallIdentity,
 }
 
 impl GhInvocation {
@@ -264,7 +282,39 @@ impl GhInvocation {
             args: Vec::new(),
             cwd: None,
             program: None,
+            config_dir: None,
+            strip_token_env: false,
+            identity: crate::forge_call_stats::CallIdentity::default(),
         }
+    }
+
+    /// Account this execution under an inventoried forge operation (#9831).
+    /// [`Operation`] is the low-cardinality *telemetry* name; this is the
+    /// inventory row (`defaults/forge/operations/*.toml`) the call serves.
+    #[must_use]
+    pub fn forge_op(mut self, op: crate::forge_call_stats::ForgeOp) -> Self {
+        self.identity.operation = crate::forge_call_stats::CallIdentity::for_op(op).operation;
+        self
+    }
+
+    /// The origin host and `owner/repo` the call acts on, for accounting only
+    /// — they change nothing about how the child runs. For a site whose
+    /// [`GhTarget`] is deliberately [`GhTarget::None`] (the credential must
+    /// stay the working directory's) but which still knows its repository.
+    /// `origin` and `repo` stay separate fields: merging them is exactly what
+    /// lets two forges sharing one slug collapse into one row.
+    #[must_use]
+    pub fn identity_scope(mut self, origin: Option<&str>, repo: Option<&str>) -> Self {
+        let id = std::mem::take(&mut self.identity);
+        let id = match origin {
+            Some(o) => id.with_origin(o),
+            None => id,
+        };
+        self.identity = match repo {
+            Some(r) => id.with_repo(r),
+            None => id,
+        };
+        self
     }
 
     /// Append `gh` arguments (the subcommand onward; never the program).
@@ -277,6 +327,12 @@ impl GhInvocation {
         self.args
             .extend(args.into_iter().map(|a| a.as_ref().to_os_string()));
         self
+    }
+
+    /// Append one `gh` argument; see [`GhInvocation::args`].
+    #[must_use]
+    pub fn arg(self, arg: impl AsRef<OsStr>) -> Self {
+        self.args([arg])
     }
 
     /// Run in `dir`. Also keys the cross-owner `GH_CONFIG_DIR` lookup.
@@ -295,6 +351,27 @@ impl GhInvocation {
     pub fn program(mut self, program: impl AsRef<OsStr>) -> Self {
         let program = program.as_ref().to_string_lossy();
         self.program = (program != "gh").then(|| program.into_owned());
+        self
+    }
+
+    /// Run under an explicit `GH_CONFIG_DIR` — a credential the caller chose
+    /// itself (a repo's reader App, a store's writer App, #9537) — instead of
+    /// the facade's working-directory / owner lookup. `None` keeps the lookup.
+    #[must_use]
+    pub fn gh_config_dir(mut self, dir: Option<&Path>) -> Self {
+        self.config_dir = dir.map(Path::to_path_buf);
+        self
+    }
+
+    /// Remove every [`TOKEN_ENV_VARS`] entry from the child's environment, so
+    /// the `GH_CONFIG_DIR` this invocation runs under is the **only**
+    /// credential `gh` can see. For a reader-only read (#10263): `gh` prefers
+    /// an env token over a stored one, so without this a daemon started from
+    /// a shell holding the operator's PAT would spend that PAT on a call the
+    /// caller believes runs as a reader App.
+    #[must_use]
+    pub fn without_token_env(mut self) -> Self {
+        self.strip_token_env = true;
         self
     }
 
@@ -339,7 +416,8 @@ impl GhInvocation {
     /// The environment the child receives, in application order, when its
     /// `traceparent` is `child_context` (see [`telemetry::InvocationSpan`]).
     ///
-    /// - `GH_CONFIG_DIR`: the cross-owner credential registered for the
+    /// - `GH_CONFIG_DIR`: the explicit [`GhInvocation::gh_config_dir`], else
+    ///   the cross-owner credential registered for the
     ///   working directory, else for the target's owner (the
     ///   `credential_preflight::apply_gh_config_for_{root,owner_slug}`
     ///   lookups). Absent ⇒ the child inherits the process-global value.
@@ -349,6 +427,8 @@ impl GhInvocation {
     ///   `child_context` — the invocation's own span when it is exported, so
     ///   the managed launcher (C4) parents its HTTP spans under it — or both
     ///   removed when there is none.
+    /// - [`TOKEN_ENV_VARS`]: removed, only under
+    ///   [`GhInvocation::without_token_env`].
     #[must_use]
     pub fn env_plan(&self, child_context: Option<&TraceContext>) -> Vec<EnvEntry> {
         self.env_plan_with(std::env::var_os("LOOM_REPO"), child_context)
@@ -362,9 +442,13 @@ impl GhInvocation {
         let mut plan = Vec::new();
         let slug = self.target.slug();
         let config_dir = self
-            .cwd
-            .as_deref()
-            .and_then(crate::credential_preflight::gh_config_dir_for_root)
+            .config_dir
+            .clone()
+            .or_else(|| {
+                self.cwd
+                    .as_deref()
+                    .and_then(crate::credential_preflight::gh_config_dir_for_root)
+            })
             .or_else(|| {
                 slug.as_deref()
                     .and_then(crate::credential_preflight::gh_config_dir_for_owner_slug)
@@ -387,6 +471,11 @@ impl GhInvocation {
                 key,
                 value: traceparent.clone(),
             });
+        }
+        if self.strip_token_env {
+            for key in TOKEN_ENV_VARS {
+                plan.push(EnvEntry { key, value: None });
+            }
         }
         plan
     }
@@ -457,3 +546,19 @@ impl GhInvocation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "migrated_sites_tests.rs"]
+mod migrated_sites_tests;
+
+#[cfg(test)]
+#[path = "rest_readers_tests.rs"]
+mod rest_readers_tests;
+
+#[cfg(test)]
+#[path = "migrated_sites_tests_b.rs"]
+mod migrated_sites_tests_b;
+
+#[cfg(test)]
+#[path = "migrated_sites_tests_c.rs"]
+mod migrated_sites_tests_c;

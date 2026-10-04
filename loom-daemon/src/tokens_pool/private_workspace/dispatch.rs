@@ -484,7 +484,8 @@ mod tests {
         )
         .unwrap();
         std::env::set_var(SHARED_ACCOUNTS_ROOT_ENV, shared_root.path());
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
         let logical = logical_repository(ws.path());
         let mut drawn = std::collections::BTreeSet::new();
         for _ in 0..40 {
@@ -499,7 +500,6 @@ mod tests {
             serves_repository(&account.credential_reference, logical.as_deref())
                 && account.id.name.starts_with("agent-1")
         });
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
         std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
         assert!(
             drawn

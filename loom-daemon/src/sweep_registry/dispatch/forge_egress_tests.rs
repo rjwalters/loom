@@ -47,6 +47,8 @@ fn workspace_with_policy(workspace: &Path, api: &str) -> (SweepRegistry, PathBuf
     cfg.gh_bin = Some(fake_gh);
     cfg.spawn_bin = Some(fake_spawn);
     cfg.journal_path = Some(workspace.join("journal.json"));
+    // These tests deliberately exercise the real (env/machine/repo) path.
+    cfg.forge_egress_sources = None;
     (SweepRegistry::new(cfg), gh_marker, spawn_marker)
 }
 
@@ -105,4 +107,39 @@ fn unknown_schema_fails_closed_even_when_it_says_observe_and_observe_admits() {
     // An unconfigured workspace is always admitted.
     let clean = tempdir().unwrap();
     assert!(crate::forge_egress::gate::dispatch_refusal(clean.path()).is_none());
+}
+
+/// #9999: with a `required` policy that yields a finding named by
+/// `$LOOM_FORGE_EGRESS_POLICY`, the injected (default) sources still win — a
+/// registry built by `SweepRegistryConfig::new` under test never consults the
+/// host policy — while the production seam (`None`) does consult it.
+#[test]
+#[serial]
+fn injected_sources_win_over_the_host_policy_env() {
+    let dir = tempdir().unwrap();
+    let policy = dir.path().join("host-policy.json");
+    std::fs::write(
+        &policy,
+        serde_json::json!({"schemaVersion": 99, "enforcement": {"api": "required"}}).to_string(),
+    )
+    .unwrap();
+    let prior = std::env::var_os(crate::forge_egress::policy::POLICY_ENV);
+    std::env::set_var(crate::forge_egress::policy::POLICY_ENV, &policy);
+
+    let hermetic = SweepRegistryConfig::new(dir.path().to_path_buf());
+    let sources = hermetic
+        .forge_egress_sources
+        .as_ref()
+        .expect("pinned under cfg(test)");
+    let hermetic_refusal = crate::forge_egress::gate::dispatch_refusal_with(sources, dir.path());
+    let hermetic_spawn = crate::forge_egress::gate::spawn_refusal_with(sources, dir.path());
+    let production_refusal = crate::forge_egress::gate::dispatch_refusal(dir.path());
+
+    match prior {
+        Some(v) => std::env::set_var(crate::forge_egress::policy::POLICY_ENV, v),
+        None => std::env::remove_var(crate::forge_egress::policy::POLICY_ENV),
+    }
+    assert!(hermetic_refusal.is_none());
+    assert!(hermetic_spawn.is_none());
+    assert!(production_refusal.is_some(), "the env policy must govern the production path");
 }

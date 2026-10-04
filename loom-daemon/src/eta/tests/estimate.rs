@@ -207,7 +207,7 @@ fn doctor_always_counts_at_least_one_rework_round() {
     assert_eq!(zero.quantiles(), one.quantiles());
     assert_eq!(zero.branches, one.branches);
     // And the normalised value is what the explanation recomputes from.
-    assert_eq!(crate::eta::simulate::run_explanation(&zero), zero.quantiles());
+    assert_eq!(crate::eta::simulate::run_explanation(&zero), zero.quantiles_with_p90());
 }
 
 #[test]

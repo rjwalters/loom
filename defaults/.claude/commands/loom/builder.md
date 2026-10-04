@@ -301,15 +301,11 @@ If no argument is provided, use the normal "Finding Work" workflow below.
 | Block issue | `loom:building` | `loom:blocked` |
 | Create PR | - | `loom:review-requested` (on new PR only) |
 
-**IMPORTANT**: `loom:building` and `loom:blocked` are **mutually exclusive** — use atomic transitions:
+**Park only via `park-record apply` (#10152)** — it writes the park record into the issue **body**, then swaps `loom:building` (mutually exclusive) for `loom:blocked`:
 ```bash
-# CORRECT: Atomic transition to blocked state
-gh issue edit <number> --remove-label "loom:building" --add-label "loom:blocked"
-
-# WRONG: Leaves issue in invalid state with both labels
-gh issue edit <number> --add-label "loom:blocked"
+loom-daemon park-record apply --issue <number> --blocked-by <N> --by builder --remove-label loom:building
 ```
-**Record the blocker before the label (#9102).** Before any `--add-label "loom:blocked"`, the issue **body** must declare each **open** blocker — a park record (`loom-daemon park-record render --blocked-by N --by builder`; `.loom/docs/park-record.md`), a `## Dependencies` entry, or a `Blocked by #N` / `Depends on #N` / `Requires #N` line. That is what `check-stale-blocked` (#8927), Guide's unblock sweep and `merge-pr.sh` read; a comment is not enough. Never cite an already-closed item (the unblock sweeps would release it at once). No open numbered blocker? Say so in a comment posted just before the label; never invent one.
+Never a bare label edit: `check-stale-blocked` (#8927), star-liveness, Guide's unblock sweep and `merge-pr.sh` read the body, not comments. It refuses a closed blocker (#9102). No open numbered blocker? Pass `--reason "<why>"` instead; never invent one. See `.loom/docs/park-record.md`.
 
 ### Labels You NEVER Touch
 
@@ -784,11 +780,10 @@ Open the issue and look for:
 
 **If Dependencies section exists:**
 - **All boxes checked** -> Safe to claim
-- **Any boxes unchecked** -> Issue is blocked, mark as `loom:blocked`:
+- **Any boxes unchecked** -> Issue is blocked, park it:
   ```bash
-  gh issue edit <number> --remove-label "loom:issue" --add-label "loom:blocked"
+  loom-daemon park-record apply --issue <number> --blocked-by <dep> --by builder --remove-label loom:issue
   ```
-  Record the unchecked dependency as a park record — see `.loom/docs/park-record.md`.
 
 **If NO Dependencies section:**
 - Issue has no blockers -> Safe to claim
@@ -797,13 +792,12 @@ Open the issue and look for:
 
 If you discover a dependency while working:
 
-1. **Park-record it in the issue body** (or add a Dependencies section) — before step 2, never after
-2. **Mark as blocked** (atomic transition from building to blocked):
+1. **Park it** (body park record, then building -> blocked):
    ```bash
-   gh issue edit <number> --remove-label "loom:building" --add-label "loom:blocked"
+   loom-daemon park-record apply --issue <number> --blocked-by <dep> --by builder --remove-label loom:building
    ```
-3. **Create comment** explaining the dependency
-4. **Wait** for dependency to be resolved, or switch to another issue
+2. **Create comment** explaining the dependency
+3. **Wait** for dependency to be resolved, or switch to another issue
 
 ## Build Verification During Implementation
 
@@ -952,15 +946,15 @@ auditing it for conflicts with rules already in force — see
 - [List what you looked at — files, functions, patterns]
 - [What you tried or considered]
 - [What specifically blocked you or was unclear]
-- No open numbered blocker (if one exists, park-record it first — Label Discipline)
+- No open numbered blocker (if one exists, use `--blocked-by` below)
 
 <!-- loom:builder-note -->
 EOF
 ```
 
-2. **Then mark as blocked** (normal workflow):
+2. **Then park it** (normal workflow):
 ```bash
-gh issue edit <number> --remove-label "loom:building" --add-label "loom:blocked"
+loom-daemon park-record apply --issue <number> --reason "builder could not resolve; see builder note" --by builder --remove-label loom:building
 ```
 
 ### Why This Matters
@@ -1017,9 +1011,10 @@ exactly one sub-kind in the **same** command (additive; filters unchanged):
 | `loom:operator-objective` | The work is determined once the operator states an objective — name the candidate objectives and the answer under each (#5826) |
 
 ```bash
-# Builder parking a claimed issue that turns out to need a human:
-./.loom/scripts/post-comment.sh <number> --body "Routing to the operator: <why a human must act>."
-gh issue edit <number> --remove-label "loom:building" --add-label "loom:operator-only,loom:operator-decision"
+# Builder parking a claimed issue on a decision: 2-4 ranked options, each with
+# a why (.loom/docs/operator-decision.md); a one-option ask is refused:
+loom-daemon operator-decision apply <number> --input d.json \
+  --also-label loom:operator-only --remove-label loom:building
 ```
 
 **Being unsure which sub-kind applies is a sign the analysis is incomplete,
@@ -1039,9 +1034,8 @@ in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
 does not satisfy this — the phrase itself must be present so a later automated
 pass can tell when the blocker clears.
 
-**If you chose `loom:operator-decision`**, the same comment MUST name the
-disagreement axis and state why it is a preference rather than a fact — a bare
-"requires judgement" does not satisfy this.
+**If you chose `loom:operator-decision`**, the options' whys MUST name the
+disagreement axis and why it is a preference, not a fact.
 
 **If you chose `loom:operator-objective`**, the same comment MUST list the
 candidate objectives and the answer under each — not just "needs an

@@ -184,7 +184,12 @@ fn run(queries: &[String], repo: &str) -> Vec<Vec<Row>> {
 /// Every section of the committed file, in order.
 fn sections(repo: &str) -> Vec<Vec<Row>> {
     let committed = statements(QUERIES);
-    assert_eq!(committed.len(), 4, "eta-queries.sql is documented as section 0 plus Q1-Q3");
+    assert_eq!(
+        committed.len(),
+        8,
+        "eta-queries.sql is documented as section 0 plus Q1-Q7 (Q4-Q7 are proven by \
+         signoz_eta_accuracy_views.rs)"
+    );
     run(&committed, repo)
 }
 

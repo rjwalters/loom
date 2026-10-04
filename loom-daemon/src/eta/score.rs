@@ -5,6 +5,14 @@
 //! `ρ_q(u) = u · (q − 1[u < 0])`. Error, coverage and the buckets ride beside
 //! it for readability.
 //!
+//! An estimate that recorded a p90 (#10211) is also scored on it: the late
+//! surprise `above_p90` (`actual > p90`) and `pinball4_loss_sec`, the same sum
+//! over q ∈ {.25, .5, .75, .9}. `pinball_loss_sec` keeps its three-quantile
+//! meaning, because it is emitted, summed into the persisted shadow ledger
+//! and pinned by the backtest golden: redefining it would mix three- and
+//! four-quantile losses inside one sum. An estimate without a p90 (pending
+//! from before #10211) gets neither field.
+//!
 //! An `abandoned` outcome (the issue closed as not planned) is counted but
 //! never scored: its error fields are absent, not zero.
 
@@ -26,6 +34,11 @@ pub enum OutcomeKind {
     /// `land`: the issue closed as not planned. Counted, never scored. A PR
     /// closed unmerged is **not** this: the issue decides.
     Abandoned,
+    /// Still unresolved when the pending estimate expired (#10233), with its
+    /// p90 already behind it: a **decided** late surprise. `actual_at` is the
+    /// censoring instant, so `lead_sec` is a lower bound and only
+    /// `above_p90` (`true`) is scored; every loss and error field is absent.
+    Censored,
 }
 
 /// One stage transition the tracker observed for the subject.
@@ -83,8 +96,17 @@ pub struct Score {
     pub below_p25: Option<bool>,
     /// `actual > p75`.
     pub above_p75: Option<bool>,
+    /// The late surprise, `actual > p90` (strict; #10211). Absent when
+    /// abandoned, refused, or the estimate recorded no p90.
+    #[serde(default)]
+    pub above_p90: Option<bool>,
     /// Summed pinball loss over the three quantiles, seconds.
     pub pinball_loss_sec: Option<f64>,
+    /// Summed pinball loss over q ∈ {.25, .5, .75, .9}, seconds (#10211):
+    /// `pinball_loss_sec + ρ_.9(actual − p90)`. Absent exactly when
+    /// `above_p90` is.
+    #[serde(default)]
+    pub pinball4_loss_sec: Option<f64>,
     /// Bucket of the predicted p50.
     pub horizon_bucket: Option<String>,
     /// Bucket of the current stage's age at the estimate.
@@ -150,6 +172,10 @@ pub struct EstimateSummary {
     pub p50_sec: Option<i64>,
     /// 75th percentile.
     pub p75_sec: Option<i64>,
+    /// 90th percentile (#10211). Absent on a refusal, and on a summary
+    /// persisted before p90 existed, which still parses.
+    #[serde(default)]
+    pub p90_sec: Option<i64>,
     /// Smallest distribution `n`.
     pub samples_min: Option<usize>,
     /// Why there was no estimate.
@@ -191,6 +217,7 @@ impl EstimateSummary {
             p25_sec: quantiles.map(|q| q.0),
             p50_sec: quantiles.map(|q| q.1),
             p75_sec: quantiles.map(|q| q.2),
+            p90_sec: explanation.result.as_ref().and_then(|r| r.p90_sec),
             samples_min: explanation.result.as_ref().map(|r| r.samples_min),
             no_estimate_reason: explanation.no_estimate_reason,
             stage_quartiles: explanation
@@ -248,7 +275,7 @@ pub fn score(
     let rework_rounds_actual = observed.iter().filter(|o| o.stage == Stage::Doctor).count() as u32;
 
     let scored = match outcome {
-        OutcomeKind::Abandoned => None,
+        OutcomeKind::Abandoned | OutcomeKind::Censored => None,
         OutcomeKind::Started | OutcomeKind::Landed | OutcomeKind::Finished => estimate.quantiles(),
     };
     let age_bucket = estimate.age_sec.map(|a| bucket(a).to_string());
@@ -264,7 +291,9 @@ pub fn score(
         covered: None,
         below_p25: None,
         above_p75: None,
+        above_p90: None,
         pinball_loss_sec: None,
+        pinball4_loss_sec: None,
         horizon_bucket: estimate.p50_sec.map(|p50| bucket(p50).to_string()),
         age_bucket,
         stage_at_estimate,
@@ -281,11 +310,15 @@ pub fn score(
         result.below_p25 = Some(actual < p25);
         result.above_p75 = Some(actual > p75);
         let a = actual as f64;
-        result.pinball_loss_sec = Some(
-            pinball(0.25, a - p25 as f64)
-                + pinball(0.5, a - p50 as f64)
-                + pinball(0.75, a - p75 as f64),
-        );
+        let loss = pinball(0.25, a - p25 as f64)
+            + pinball(0.5, a - p50 as f64)
+            + pinball(0.75, a - p75 as f64);
+        result.pinball_loss_sec = Some(loss);
+        // p90 only when the estimate recorded one: absent is never `false`.
+        if let Some(p90) = estimate.p90_sec {
+            result.above_p90 = Some(actual > p90);
+            result.pinball4_loss_sec = Some(loss + pinball(0.9, a - p90 as f64));
+        }
     }
     result
 }

@@ -376,9 +376,9 @@ spotlight, outcome mix, top slow jobs, failed run → logs, run waterfall, the
 per-issue ship breakdown, CI time per trigger reason, and (#9089) job queue
 wait, shard imbalance, step timings, slowest suites, suite-level rebalance and
 dependency wait.
-Sections 1–3 read the `loom.ci.*.duration_ms` histograms (kept 30 days);
-4–10, 14 and 15 read the `ci.run` / `ci.job` / `ci.job.log` records (kept 7
-days); 11–13 read `signoz_traces.signoz_index_v3` (kept 7 days). Bind all five parameters
+Sections 1–3 read the `loom.ci.*.duration_ms` histograms (trial: 30 days);
+4–10, 14 and 15 read the `ci.run` / `ci.job` / `ci.job.log` records (trial: 7
+days); 11–13 read `signoz_traces.signoz_index_v3` (trial: 7 days; live: 10 years). Bind all five parameters
 once:
 
 ```console
@@ -404,7 +404,10 @@ return 0 on every row instead of erroring. Policy and pipeline:
 happened, from the `eta.estimate` / `eta.outcome` **log** records. Section 0 is
 the preflight; Q1 is MAE / 25–75 coverage / bias; Q2 is the mean pinball loss
 that decides a promotion; Q3 ranks the recorded features by how well each
-tracks the error. The model is [`eta.md`](../../docs/eta.md). Bind both
+tracks the error; Q4-Q7 (#10233) are the late-surprise rate on the common
+decidable subset, the stability of the predicted landing instant, interval
+convergence by actual lead, and the time-weighted answer rate (proven by
+`loom-daemon/tests/signoz_eta_accuracy_views.rs`). The model is [`eta.md`](../../docs/eta.md). Bind both
 parameters:
 
 ```console
@@ -490,6 +493,7 @@ data.
 | CI critical path | Logs Explorer: filter `body = 'ci.job' AND loom.ci.run_id = <id>`, add columns `loom.ci.job`, `loom.ci.dependency_wait_ms`, `loom.ci.queued_ms`, `loom.ci.duration_ms`, and sort by `loom.ci.duration_ms` descending — the leg with the largest dependency + queue + running sum is the run's critical path, and the three columns say which of the three set it. The `unexplained_s` residual (run wall time minus the run's own queue and that leg's total) requires a run↔job join and is SQL-only (`ci-queries.sql` 14) |
 | ETA accuracy | Logs Explorer: filter `body = 'eta.outcome' AND loom.eta.error_sec EXISTS`, add columns `loom.eta.heuristic`, `loom.eta.revision`, `loom.eta.kind`, `loom.eta.horizon_bucket`, `loom.eta.error_sec`, `loom.eta.covered`; group by `loom.eta.heuristic`, `loom.eta.revision` — **both**, never heuristic alone, or a daemon roll mid-window averages two builds into one number. The `EXISTS` clause is not optional: an abandoned sweep has no error field, and without it the panel scores the abandonment as a perfect prediction. Coverage, bias and the pinball loss that decides a promotion need `avg()`/`median()` over these and stay SQL-only (`eta-queries.sql` 0, Q1, Q2) |
 | ETA feature ranking | SQL-only (`eta-queries.sql` Q3): it expands the estimate's explanation body with `JSONExtractKeysAndValuesRaw` and correlates each numeric feature with the error, neither of which is an Explorer operation. Read `distinct_values` beside `rank_corr` — a feature that never varied scores 0.5, not 0 — and `n` beside both: the section's `HAVING n >= 20` makes a short window return nothing at all |
+| ETA late surprise, stability, convergence, answer rate | SQL-only (`eta-queries.sql` Q4, Q5, Q6, Q7): Q4 keeps an instant only when every heuristic's late surprise there is decided (an Explorer `avg(loom.eta.above_p90)` would let a heuristic that refuses the hard cases read as better), Q5 needs a window over consecutive emissions, Q6 buckets the actual lead, and Q7 weights each emitted state by how long it stood — counting rows overstates the answer rate because a refusal is never refreshed |
 | CI dependency wait | Logs Explorer: filter `body = 'ci.job' AND loom.ci.dependency_wait_ms EXISTS`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.dependency_wait_ms`, `loom.ci.queued_ms`; group by `loom.ci.job` with **P50**/**P90**, time range 7 days. **Alert when a family's p90 dependency wait exceeds its own p90 queue wait**: it is gated by `needs:`, not capacity-starved, and more runners will not move it. An ungated job measures ~0 by construction — treat sub-2s values as job-creation lag, not a serialized edge (`ci-queries.sql` 15) |
 | CI slowest tests | Trace Explorer: filter `name = 'loom.ci.test'`, group by `loom.ci.test.binary`, `loom.ci.test` with **Sum** (and a second query with **P90**), time range 7 days, sorted descending. Add `loom.ci.test.outcome` as a filter to separate `flaky` (failed then passed — the #7789 signal) from `fail`/`error` from a clean `pass` (`ci-queries.sql` 16). **Only each leg's slow tail is emitted** — tests at or above the 250 ms floor, capped at `MAX_TEST_SPANS_PER_JOB` (512) per leg — so this panel is a ranking, never a test inventory: a test missing from it is fast or outside the cap, not unrun |
 | CI test rebalance | Same filter grouped by `loom.ci.run_id`, `loom.ci.job` with **Sum** — one bar per nextest leg of a run, which is the slow-tail time a `--partition count:k/N` split should equalize. Group by `loom.ci.job` and not by `loom.ci.shard.index` alone: both nextest families shard `1..3`, so index alone merges two unrelated partitions. `argMax(test, duration)` per leg (the named test to move) is SQL-only (`ci-queries.sql` 17). The summed tail time is far **less** than the leg's test-step wall time by design (every sub-floor test is excluded), so compare legs of the same run and the same family, never a leg against its own job span |
@@ -583,6 +587,11 @@ gone through SigNoz's own ingester for this view, which is what #8529's
 real-canary comparison still needs.
 
 ## Retention and operation
+
+> **Trial-only.** This section governs the isolated trial. The live
+> harness-ops store keeps logs 3650 days and traces/metrics 10 years
+> ([#10195](https://github.com/rjwalters/loom/issues/10195)); never apply
+> `retention.sql` there (#8946 item 2 stays held).
 
 Set **seven days for logs and traces and 30 days for metrics** in General
 Settings → Retention (#8826). Metrics outlive raw logs/traces on purpose: the

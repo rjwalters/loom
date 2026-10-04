@@ -155,9 +155,14 @@ pub struct StarLandingRow {
     /// `#N` or `owner/repo#N`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_by: Option<String>,
-    /// `NoCapacity`: why there is no slot.
+    /// `NoCapacity`: why there is no slot, for humans: `queued #88 of 106
+    /// (cap 2, disk-limited)` for a work-finder deferral (#10214).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_capacity: Option<String>,
+    /// `NoCapacity` from a work-finder deferral: the gate, the binding cap
+    /// term and the queue position, structured (#10214).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_wait: Option<super::CapacityWait>,
     /// `NeedsOperator`: the ask.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask: Option<OperatorAsk>,

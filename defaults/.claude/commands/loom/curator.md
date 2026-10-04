@@ -314,11 +314,10 @@ present" for the general form of this check
 and the forge's own view) and why a reported divergence should carry the live
 command output that established it.
 
-### Priority 2: Triage & Unlabeled Issues (Fallback)
+### Priority 2: Triage queue
 
-If no Priority 1 issues exist, find issues awaiting enhancement. The intake label
-`loom:triage` (applied by the issue filer — "New issue awaiting Curator
-enhancement") is the entry point, so **target it first**:
+If no Priority 1 issues exist, find issues awaiting enhancement via the intake
+label `loom:triage` ("New issue awaiting Curator enhancement"):
 
 ```bash
 # Newly filed issues awaiting Curator enhancement
@@ -327,28 +326,9 @@ gh issue list --label="loom:triage" --state=open --limit 500 --json number,title
   --jq "sort_by(.createdAt) | .[] | select($EXCL) | \"#\(.number) \(.title)\""
 ```
 
-If nothing carries `loom:triage`, fall back to any issue that is not already
-in-flight, a proposal awaiting Champion evaluation, approved, blocked, or
-reserved for a human operator, so an autonomous Curator never "curates" an
-issue being built, awaiting evaluation, or outside its authority entirely:
-
-```bash
-EXCL="$(./.loom/scripts/skip-labels.sh --jq-not)"   # #8255 shared source
-gh issue list --state=open --limit 500 --json number,title,labels,createdAt \
-  --jq "sort_by(.createdAt) | .[] | select(
-    ([.labels[].name] | contains([\"loom:curated\"]) | not) and
-    ([.labels[].name] | contains([\"loom:curating\"]) | not) and
-    ([.labels[].name] | contains([\"loom:issue\"]) | not) and
-    ([.labels[].name] | contains([\"loom:building\"]) | not) and
-    ([.labels[].name] | contains([\"loom:architect\"]) | not) and
-    ([.labels[].name] | contains([\"loom:hermit\"]) | not) and
-    ([.labels[].name] | contains([\"loom:auditor\"]) | not) and
-    ([.labels[].name] | contains([\"loom:epic\"]) | not) and
-    ([.labels[].name] | contains([\"loom:blocked\"]) | not) and
-    ([.labels[].name] | contains([\"loom:operator-only\"]) | not) and
-    $EXCL
-  ) | \"#\(.number) \(.title)\""
-```
+The daemon's intake reconcile pass (#10041) applies `loom:triage` to every open
+issue with no `loom:*` label, so this is the single intake queue — there is no
+unlabeled-issue fallback.
 
 Note: `loom:blocked` and `loom:operator-only` stay excluded here, but not from
 Curator's purview (open `loom:decision-malformed` issues are work even with
@@ -562,7 +542,7 @@ Fail closed: `1` (the gate could not run) is handled as `10`, never as `0`.
 | Exit | Instead of enriching |
 |---|---|
 | `10`/`12` | Do the premise check now and post the record its `REASON=`/`EVIDENCE-CANDIDATE=` lines point at; re-run. |
-| `11` | Comment the disagreement axis, then `--add-label "loom:operator-only,loom:operator-decision"` per "Applying `loom:operator-only`" below. |
+| `11` | Route it as a ranked decision via `loom-daemon operator-decision apply` per "Applying `loom:operator-only`" below. |
 | `13` | Premise false — close or rescope per "Issues Are Suggestions" above. |
 
 Record format, scoped population, and why the gate sits one stage before you:
@@ -730,7 +710,7 @@ them into the one you are curating. Never absorb a sibling that has:
 > - Commit + push these files first, then remove the \`loom:blocked\` label, OR
 > - Adjust the Affected Files section to scope down to committed-only changes."
 >   ./.loom/scripts/post-comment.sh "$N" --body "$COMMENT"
->   gh issue edit "$N" --add-label "loom:blocked"
+>   loom-daemon park-record apply --issue "$N" --reason "uncommitted Affected Files" --by curator
 >   # Exit without further state changes — the next curator tick will re-evaluate.
 >   exit 0
 > fi
@@ -932,9 +912,9 @@ Champion's exclusions, the Priority-2 query above) is unchanged:
 | `loom:operator-objective` | Determined once the operator states an objective — list the candidate objectives and the answer under each (#5826); a missing objective is this, not `-decision` |
 
 ```bash
-# Curator routing a genuine PO-level decision:
-./.loom/scripts/post-comment.sh <number> --body "Routing to the operator: <ranked options, each with a why>."
-gh issue edit <number> --add-label "loom:operator-only,loom:operator-decision"
+# Curator routing a genuine PO-level decision: 2-4 ranked options, each with
+# a why (.loom/docs/operator-decision.md); a one-option ask is refused:
+loom-daemon operator-decision apply <number> --input d.json --also-label loom:operator-only
 ```
 
 **Unsure which sub-kind applies means curation is incomplete, not that a
@@ -1011,7 +991,7 @@ fi
 
    # Cannot verify → flag, do not close. Comment FIRST; never cite the merged PR as a blocker:
    ./.loom/scripts/post-comment.sh <number> --body "⚠️ **May Already Be Fixed** — possibly addressed by PR #<pr_number> or commit <sha>. No open blocker: please test and close if no longer reproducible."
-   gh issue edit <number> --add-label "loom:blocked"
+   loom-daemon park-record apply --issue <number> --reason "may already be fixed; verify" --by curator
    ```
 
 **Why**: closing with a **clear, stated rationale** keeps the backlog healthy — the work-finder only polls *open* issues, so this removes the item without a loop. An **unverified** guess should be flagged, not closed; never close an issue that is being actively built (`loom:building`) by another agent (#2084: a curator closed #1981 mid-processing, requiring manual intervention — comment first if an issue is in flight).
@@ -1377,9 +1357,9 @@ If you discover dependencies during curation:
 This issue requires [dependency] to be implemented first.
 ```
 
-Only then add `loom:blocked`. **Record the blocker before the label (#9102):** every `--add-label "loom:blocked"` needs the **body** to declare each **open** blocker — a park record (`.loom/docs/park-record.md`), a `## Dependencies` entry, or a `Blocked by #N` / `Depends on #N` / `Requires #N` line (what `check-stale-blocked`, #8927, the unblock sweep and `merge-pr.sh` read; not comments). Never cite an already-closed item — your re-check below would unblock it. No open numbered blocker? Say so in a comment posted just before the label; never invent one.
+Only then park it with `park-record apply` (#10152): it writes the **body** park record, then adds `loom:blocked` — what `check-stale-blocked` (#8927), star-liveness, the unblock sweep and `merge-pr.sh` read; not comments. It refuses a closed blocker (#9102: your re-check below would unblock it). No open numbered blocker? Pass `--reason "<why>"`; never invent one.
 ```bash
-gh issue edit <number> --add-label "loom:blocked"
+loom-daemon park-record apply --issue <number> --blocked-by <N> --by curator
 ```
 
 ### When Dependencies Complete
@@ -1758,15 +1738,14 @@ with a why), swapping in `loom:decision-malformed` and commenting
 `<!-- loom-ui:decision-bounce -->`. Query `gh issue list --label loom:decision-malformed`; include them even
 with `loom:operator-only`. Read body, escalation comment, and bounce comment, then:
 
-- **Real operator call**: write the block from options already in the thread
-  (never invent options), post `<!-- loom:curator-decision-repair -->`, then
-  `--remove-label loom:decision-malformed --add-label loom:operator-decision`.
+- **Real operator call**: build the decision JSON from options already in the
+  thread (never invent options), post `<!-- loom:curator-decision-repair -->`,
+  then `loom-daemon operator-decision apply <number>` (clears the bounce label).
+  Same for a prose `loom:operator-decision` issue you touch, if faithful.
 - **No real operator call**: remove the label, comment why, and re-route per
   `label-state-machine.md` (normal flow, `loom:operator-objective`, or inbox mail).
 - **No-loop guard**: a decision-bounce comment newer than your repair marker means
   the repair bounced. Comment once and leave it alone.
-
-Render: `loom-daemon operator-decision apply` (`operator-decision.md`).
 
 ## Checking Operator-Only Premises (#6849)
 

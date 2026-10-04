@@ -208,9 +208,15 @@ pub mod forge {
         number: u32,
         #[serde(default)]
         comments: Vec<GhComment>,
+        #[serde(rename = "updatedAt", default)]
+        updated_at: Option<String>,
     }
 
-    fn list_blocked_issues(gh_bin: &Path, root: &Path) -> Result<Vec<BlockedIssue>> {
+    /// Each issue comes with its `updatedAt` stamp (the #10089 read-cache version).
+    fn list_blocked_issues(
+        gh_bin: &Path,
+        root: &Path,
+    ) -> Result<Vec<(BlockedIssue, Option<String>)>> {
         let limit = MAX_ISSUES_PER_WORKSPACE.to_string();
         let out = gh_call::output(
             gh_call::read("quarantine.issue_list", gh_bin, root)
@@ -222,7 +228,7 @@ pub mod forge {
                     "--state",
                     "open",
                 ])
-                .args(["--limit", &limit, "--json", "number,comments"])
+                .args(["--limit", &limit, "--json", "number,comments,updatedAt"])
                 .args(gh_call::loom_repo_flag()),
         )?;
         if !out.status.success() {
@@ -239,7 +245,7 @@ pub mod forge {
                     .iter()
                     .filter(|c| c.body.contains(QUARANTINE_COMMENT_MARKER))
                     .collect();
-                BlockedIssue {
+                let issue = BlockedIssue {
                     number: r.number,
                     has_quarantine_comment: !marker_comments.is_empty(),
                     last_quarantine_comment_at: marker_comments
@@ -251,7 +257,8 @@ pub mod forge {
                     // with no marker comment is `Keep` unconditionally and
                     // never needs the extra `gh` round-trip.
                     last_blocked_labeled_at: None,
-                }
+                };
+                (issue, r.updated_at)
             })
             .collect())
     }
@@ -302,6 +309,24 @@ pub mod forge {
                 })
                 .collect(),
         )
+    }
+
+    /// One uncached read of a marked candidate's `(trusted marker comment
+    /// present, newest marker comment, newest `labeled loom:blocked`)` — the
+    /// legs the pass confirms before it may release (#9548, #4206).
+    fn scan_parts(
+        gh_bin: &Path,
+        root: &Path,
+        issue: u32,
+    ) -> crate::claim_reconciliation::read_cache::QuarantineScan {
+        let trusted = trusted_quarantine_comments(gh_bin, root, issue);
+        let has = trusted.as_ref().is_some_and(|c| !c.is_empty());
+        let last_comment =
+            trusted.and_then(|c| crate::comment_trust::records::max_timestamp(&c, "created_at"));
+        let labeled = has
+            .then(|| fetch_last_blocked_labeled_at(gh_bin, root, issue))
+            .flatten();
+        (has, last_comment, labeled)
     }
 
     /// Parse a `gh --jq` scalar result that is either a bare RFC-3339
@@ -439,23 +464,40 @@ pub mod forge {
         // cannot name an App author, so a candidate is confirmed against the
         // REST listing, and only a trusted author's comment that BEGINS with
         // the marker counts; an unreadable confirmation keeps the issue.
-        let issues: Vec<BlockedIssue> = issues
-            .into_iter()
-            .map(|mut issue| {
-                if issue.has_quarantine_comment {
-                    let trusted = trusted_quarantine_comments(gh_bin, root, issue.number);
-                    issue.has_quarantine_comment = trusted.as_ref().is_some_and(|c| !c.is_empty());
-                    issue.last_quarantine_comment_at = trusted.and_then(|c| {
-                        crate::comment_trust::records::max_timestamp(&c, "created_at")
-                    });
-                }
-                if issue.has_quarantine_comment {
-                    issue.last_blocked_labeled_at =
-                        fetch_last_blocked_labeled_at(gh_bin, root, issue.number);
-                }
-                issue
-            })
-            .collect();
+        let issues: Vec<BlockedIssue> =
+            issues
+                .into_iter()
+                .map(|(mut issue, updated_at)| {
+                    if issue.has_quarantine_comment {
+                        // #10089: the two paginated REST walks below are reused
+                        // while the issue's `updatedAt` holds (a new comment or
+                        // label event bumps it). Stored only when every leg
+                        // answered, so a failed read is retried next pass.
+                        let key = crate::claim_reconciliation::read_cache::key(
+                            root,
+                            issue.number,
+                            "quarantine",
+                            updated_at.as_deref(),
+                        );
+                        let fresh = std::cell::Cell::new(None);
+                        let cached = crate::claim_reconciliation::read_cache::QUARANTINE_SCAN
+                            .get_or(key, || {
+                                let scan = scan_parts(gh_bin, root, issue.number);
+                                fresh.set(Some(scan));
+                                (scan.0 && scan.2.is_some()).then_some(scan)
+                            });
+                        // A miss that did not qualify for the cache still carries
+                        // what it read (no second spend).
+                        let (has, last_comment, labeled) = cached
+                            .or_else(|| fresh.get())
+                            .unwrap_or_else(|| scan_parts(gh_bin, root, issue.number));
+                        issue.has_quarantine_comment = has;
+                        issue.last_quarantine_comment_at = last_comment;
+                        issue.last_blocked_labeled_at = labeled;
+                    }
+                    issue
+                })
+                .collect();
 
         let decisions = plan(&issues);
         let checked = decisions.len();
@@ -767,6 +809,63 @@ exit 0
             gh_calls.contains("issue edit 99 --remove-label loom:blocked --add-label loom:issue"),
             "expected the real label-flip argv; got: {gh_calls:?}"
         );
+    }
+
+    /// #10089: N unchanged passes over a re-parked `loom:blocked` issue cost
+    /// ONE comments walk and ONE timeline walk, not one per pass; the cheap
+    /// listing runs every pass. A new `updatedAt` re-reads.
+    #[test]
+    #[serial]
+    fn unchanged_blocked_issue_is_scanned_once_across_passes() {
+        crate::claim_reconciliation::read_cache::set_test_enabled(true);
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let updated = dir.path().join("updated-at");
+        std::fs::write(&updated, "2026-01-02T00:00:01Z").unwrap();
+        let script = format!(
+            r#"#!/bin/bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
+  echo '[{{"number":99,"updatedAt":"'"$(cat {updated})"'","comments":[{{"body":"Auto-quarantined by loom-daemon (#3939): insta-crashed 3 times"}}]}}]'
+  exit 0
+fi
+case "$*" in
+*/issues/99/comments*)
+  echo '[{{"body":"Auto-quarantined by loom-daemon (#3939): insta-crashed 3 times","created_at":"2026-01-01T00:00:00Z","user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}}}}]'
+  exit 0 ;;
+*/issues/99/timeline*)
+  echo '"2026-01-02T00:00:00Z"'
+  exit 0 ;;
+esac
+exit 0
+"#,
+            log = gh_log.display(),
+            updated = updated.display(),
+        );
+        let fake_gh = write_fake_gh(dir.path(), &script);
+        let ws = WritableRoot::register_with_gh(&repo_root, &fake_gh);
+        let count = |needle: &str| {
+            std::fs::read_to_string(&gh_log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains(needle))
+                .count()
+        };
+        for _ in 0..3 {
+            let (checked, released) = forge::reconcile_workspace(&ws.gh, &repo_root);
+            assert_eq!((checked, released), (1, 0), "a later manual re-park is kept");
+        }
+        assert_eq!(count("issue list"), 3, "the cheap listing runs every pass");
+        assert_eq!(count("/issues/99/comments"), 1, "comments walked once");
+        assert_eq!(count("/issues/99/timeline"), 1, "timeline walked once");
+
+        std::fs::write(&updated, "2026-01-03T00:00:00Z").unwrap();
+        let _ = forge::reconcile_workspace(&ws.gh, &repo_root);
+        assert_eq!(count("/issues/99/comments"), 2, "a new updatedAt re-reads");
+        assert_eq!(count("/issues/99/timeline"), 2);
+        crate::claim_reconciliation::read_cache::set_test_enabled(false);
     }
 
     /// A `loom:blocked` issue with NO daemon quarantine comment (an

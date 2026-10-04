@@ -327,6 +327,9 @@ fn a_non_claude_runtime_with_no_store_reports_the_per_sweep_absence() {
     // claim the Claude-specific `no-usage-store` just because `~/.claude` is
     // missing — that would attribute a Claude fact to a Codex sweep.
     let _store = ClaudeStore::without_store();
+    // Never scan the host's real Codex profile root (#9964).
+    let profiles = tempfile::tempdir().unwrap();
+    let _profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
 
     let usage = resolve(Some("codex"), Path::new("/workspace/none"), 1, recent_window(), None);
 

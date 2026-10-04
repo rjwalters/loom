@@ -16,7 +16,7 @@ use super::ts;
 /// A `HostHealthRecord` with only the captain fields varied — every other
 /// field pinned at the "nothing measured" baseline so a captain assertion
 /// below can never be satisfied by some unrelated field.
-fn host_health_with_captain(
+pub(super) fn host_health_with_captain(
     is_captain: Option<bool>,
     armed_singleton_jobs: Vec<String>,
 ) -> TelemetryRecord {
@@ -41,6 +41,8 @@ fn host_health_with_captain(
         is_captain,
         armed_singleton_jobs,
         captainless_singleton_jobs: Vec::new(),
+        exported_kinds: Vec::new(),
+        exporters: Vec::new(),
         memory: None,
     })
 }

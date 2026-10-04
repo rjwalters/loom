@@ -367,7 +367,9 @@ fn populate(conn: &Connection) {
 /// Build the fixture (through the committed rollup INSERT), run the
 /// committed calibration file verbatim, and return each CAL's rows.
 fn run_calibration(populated: bool) -> BTreeMap<String, CalResult> {
-    let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+    // D1's compound-SELECT ceiling applied, so this engine refuses what D1
+    // refuses (#10066).
+    let conn = super::d1_sqlite::d1_connection();
     conn.execute_batch(RECORDS_DDL).expect("create records");
     if populated {
         populate(&conn);
