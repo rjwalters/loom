@@ -40,10 +40,10 @@ use crate::eta::queue_features::{
     self, is_pr_stage, reason, EventKind, EventLog, QueueFeatures, QueueSubject, RosterEntry,
     StageEvent, SINCE_MERGE_CAP_SEC,
 };
-use crate::eta::{CurrentState, NoEstimateReason};
+use crate::eta::{CurrentState, NoEstimateReason, Stage};
 use crate::types::{PlanState, QueueDisposition};
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Omission reason: no fleet view was observed before `as_of` (no pass yet).
 pub const NOT_LISTED_YET: &str = "not_listed_yet";
@@ -150,9 +150,16 @@ fn omission(name: &str, why: &str) -> FeatureOmitted {
 /// - A row with a `stage` and a `left_at` is a departure from that stage, a
 ///   `pr.resolved` row for a PR closed unmerged included. Only PR stages are
 ///   kept.
-/// - A `pr.resolved` row that is not a close (the tracker's `merged`, or a
-///   backfilled row with no state) and a `sweep.phase` `merge` row are
-///   merges.
+/// - A `pr.resolved` row that is neither a close nor `open` (the tracker's
+///   `merged`, or a backfilled row with no state) and a `sweep.phase`
+///   `merge` row are merges. An `open` row (a held PR that left the listings
+///   still open, #10218) is a departure only.
+/// - A hold's end is counted once (#10218). A PR's `merge_hold` row carries
+///   that departure, and the merge when there was one. A `merge_wait` row at
+///   the same instant is the pooled track's shadow of the same end, so it is
+///   skipped. A hold's entry (`merge_wait` → `merge_hold`) is a `merge_wait`
+///   departure, and a release-then-merge keeps both rows (their instants
+///   differ).
 ///
 /// An event's `at` is the row's `left_at`. `observed_at` is no knowability
 /// stamp: a `pr.resolved` row's `observed_at` is the merge instant even when
@@ -164,6 +171,13 @@ fn omission(name: &str, why: &str) -> FeatureOmitted {
 /// row's instant) is at or before it.
 #[must_use]
 pub fn events_from_journal(rows: &[JournalEntry], known_at: DateTime<Utc>) -> EventLog {
+    let pr_instant =
+        |row: &JournalEntry| Some((row.repo.to_ascii_lowercase(), row.pr_number?, row.left_at?));
+    let hold_ends: BTreeSet<_> = rows
+        .iter()
+        .filter(|row| row.stage == Some(Stage::MergeHold))
+        .filter_map(pr_instant)
+        .collect();
     let mut from: Option<DateTime<Utc>> = None;
     let mut events = Vec::new();
     for row in rows {
@@ -174,8 +188,13 @@ pub fn events_from_journal(rows: &[JournalEntry], known_at: DateTime<Utc>) -> Ev
         let Some(at) = row.left_at else {
             continue;
         };
+        if row.stage == Some(Stage::MergeWait)
+            && pr_instant(row).is_some_and(|end| hold_ends.contains(&end))
+        {
+            continue;
+        }
         let merged = match row.event.as_str() {
-            "pr.resolved" => row.raw["state"] != "closed",
+            "pr.resolved" => !matches!(row.raw["state"].as_str(), Some("closed" | "open")),
             "sweep.phase" => row.raw["phase"] == "merge",
             _ => false,
         };

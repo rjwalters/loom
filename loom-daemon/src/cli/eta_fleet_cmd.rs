@@ -59,7 +59,8 @@ pub(crate) enum FleetCommand {
     /// Top the cached snapshot up with only the PRs that moved since its
     /// cursor.
     Refresh(FleetBuildArgs),
-    /// Print what is cached: id, as-of, cursor, PR census, per-stage counts.
+    /// Print what is cached: id, as-of, cursor, PR census, per-stage sample
+    /// and stage-episode counts.
     Show(FleetShowArgs),
     /// The raw, resumable per-repo event cache (#10197):
     /// `eta fleet events backfill|refresh`.
@@ -286,6 +287,11 @@ fn render(snapshot: &FleetSnapshot, path: &Path) -> String {
     }
     let (verdicts, rejected) = snapshot.verdict_counts();
     let _ = writeln!(out, "  verdicts: {verdicts} ({rejected} changes-requested)");
+    // #10218: the split stage record, `merge_hold` included.
+    let _ = writeln!(out, "  episodes: {}", snapshot.episodes.len());
+    for (stage, (completed, censored)) in snapshot.episode_counts_by_stage() {
+        let _ = writeln!(out, "    {stage:<14} n={completed:<5} censored={censored}");
+    }
     out
 }
 
@@ -370,6 +376,39 @@ mod tests {
         assert!(text.contains("review_wait"), "{text}");
         assert!(text.contains("merge_wait"), "{text}");
         assert!(text.contains("verdicts: 1"), "{text}");
+    }
+
+    #[test]
+    fn render_counts_stage_episodes_by_stage_merge_hold_included() {
+        const HOUR: i64 = 3600;
+        let held = PrHistory::new(
+            13,
+            t(0),
+            PrState::Merged,
+            Some(t(9 * HOUR)),
+            Vec::new(),
+            vec![
+                labeled(REVIEW_REQUESTED, HOUR),
+                PrEvent::Unlabeled {
+                    label: REVIEW_REQUESTED.to_string(),
+                    at: t(2 * HOUR),
+                },
+                labeled(APPROVED, 2 * HOUR),
+                labeled("loom:operator", 3 * HOUR),
+                PrEvent::Unlabeled {
+                    label: "loom:operator".to_string(),
+                    at: t(5 * HOUR),
+                },
+                PrEvent::Merged { at: t(9 * HOUR) },
+            ],
+            true,
+        );
+        let mut snapshot = FleetSnapshot::empty("rjwalters/loom");
+        snapshot.merge(&[held], t(10 * HOUR));
+        let text = render(&snapshot, Path::new("/tmp/fleet-x.json"));
+        assert!(text.contains("episodes: 4"), "{text}");
+        assert!(text.contains("merge_hold     n=1     censored=0"), "{text}");
+        assert!(text.contains("merge_wait     n=2     censored=0"), "{text}");
     }
 
     #[test]

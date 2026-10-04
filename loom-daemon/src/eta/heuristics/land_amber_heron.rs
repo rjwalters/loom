@@ -67,6 +67,7 @@ impl Heuristic for LandAmberHeron {
                 always_merge: true,
                 censoring: true,
                 adjust: None,
+                models_hold: false,
             },
             input,
             history,

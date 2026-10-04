@@ -33,6 +33,7 @@ impl Heuristic for FinishV1 {
                 always_merge: false,
                 censoring: false,
                 adjust: None,
+                models_hold: false,
             },
             input,
             history,

@@ -92,6 +92,10 @@ struct PrRow {
     created_at: DateTime<Utc>,
     #[serde(rename = "mergedAt")]
     merged_at: Option<DateTime<Utc>>,
+    /// When it closed, merged or not: the ETA stage episodes (#10218) end a
+    /// PR closed unmerged here. Same list call, no extra read.
+    #[serde(rename = "closedAt", default)]
+    closed_at: Option<DateTime<Utc>>,
     state: String,
     #[serde(default)]
     labels: Vec<LabelRef>,
@@ -237,7 +241,7 @@ fn list_prs(
     }
     args.extend([
         "--json",
-        "number,createdAt,mergedAt,state,labels",
+        "number,createdAt,mergedAt,closedAt,state,labels",
         "--limit",
         &limit,
     ]);
@@ -271,6 +275,7 @@ fn history_for(row: &PrRow, repo: Option<&str>, root: &Path) -> PrHistory {
         events,
         complete,
     )
+    .with_closed_at(row.closed_at)
 }
 
 fn fetch_timeline(pr: u32, repo: Option<&str>, root: &Path) -> (Vec<PrEvent>, bool) {

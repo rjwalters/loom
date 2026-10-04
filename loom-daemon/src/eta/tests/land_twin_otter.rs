@@ -95,12 +95,13 @@ pub(crate) fn fixture_fit(as_of: DateTime<Utc>) -> CoefficientFile {
     file.with_derived_id()
 }
 
-/// The daemon stage of a fixture stage. `merge_hold` joins with #10218.
+/// The daemon stage of a fixture stage.
 fn daemon_stage(stage: &str) -> Option<Stage> {
     match stage {
         "review_wait" => Some(Stage::ReviewWait),
         "doctor_wait" => Some(Stage::Doctor),
         "merge_wait" => Some(Stage::MergeWait),
+        "merge_hold" => Some(Stage::MergeHold),
         _ => None,
     }
 }
@@ -159,6 +160,7 @@ pub(crate) fn input_for(row: &TwinOtterInput, at: DateTime<Utc>) -> EstimateInpu
             age_sec: (at - entered_at).num_seconds(),
             age_source: AgeSource::LabelEvent,
             rework_rounds: row.rework,
+            episode_entered_at: None,
         }),
         features: Features {
             labels: Some(labels_for(row)),
@@ -372,8 +374,8 @@ fn each_fixture_row_adapts_to_its_own_input() {
     let rows = mapped_rows();
     assert_eq!(
         rows.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
-        vec![2, 3, 4],
-        "merge_wait, review_wait, doctor_wait; the merge_hold rows join with #10218"
+        vec![0, 1, 2, 3, 4],
+        "merge_hold ×2 (#10218), merge_wait, review_wait, doctor_wait"
     );
     for (n, row) in rows {
         let input = input_for(&row, row.as_of);
@@ -620,51 +622,135 @@ fn an_unchanged_input_refresh_moves_the_twin_otter_p50_by_under_5_percent() {
     }
 }
 
+// ---------------------------------------------------------- merge_hold
+
+/// The #10243 / #10246 contract: `merge_hold` (#10218) is the fit's own
+/// stage in the no-wildcard `FitStage::from_stage`, so twin-otter estimates a
+/// held PR where every path-engine heuristic refuses it `blocked`. Without a
+/// usable model it refuses as for any stage, never `blocked`.
+#[test]
+fn a_held_pr_is_estimated_from_the_fits_merge_hold_stage() {
+    assert_eq!(FitStage::from_stage(Stage::MergeHold), Some(FitStage::MergeHold));
+    let history = StageSamples::default();
+    let fit = fixture_fit(fit_as_of());
+    let row = fixture().evaluation.rows.swap_remove(0).input;
+    assert_eq!(row.stage, "merge_hold");
+    let held = input_for(&row, row.as_of);
+    let e = twin_otter(Some(fit.clone())).estimate(&held, &history);
+    assert_eq!(reason(&e), None);
+    assert!(e.result.is_some());
+    assert_eq!(e.current_stage.as_ref().map(|c| c.stage), Some(Stage::MergeHold));
+    let record = e.twin_otter.as_ref().unwrap();
+    assert_eq!(record.input, row);
+    assert_eq!(record.input.op_hold, 1);
+    assert_eq!(run_explanation(&e), e.quantiles_with_p90(), "recomputes from merge_hold");
+
+    let none = twin_otter(None).estimate(&held, &history);
+    assert_eq!(reason(&none), Some(NoEstimateReason::NoModel));
+    let mut skipped = fit;
+    skipped.hazard.remove(&FitStage::MergeHold);
+    skipped.hazard_skipped.insert(
+        FitStage::MergeHold,
+        HazardSkip {
+            reason: SkipReason::BelowMinExits,
+            rows: 300,
+            exits: 4,
+        },
+    );
+    let e = twin_otter(Some(skipped)).estimate(&held, &history);
+    assert_eq!(reason(&e), Some(NoEstimateReason::InsufficientSamples));
+}
+
+/// After a hold is lifted the PR is back in the pooled `merge_wait` (entered
+/// at the approval), but twin-otter's age and seed run from the release
+/// (`episode_entered_at`): the episode #10245 trains on.
+#[test]
+fn after_a_hold_the_age_and_seed_run_from_the_release() {
+    let row = fixture().evaluation.rows.swap_remove(2).input;
+    assert_eq!(row.stage, "merge_wait");
+    let release = entered(&row);
+    let approval = release - Duration::hours(5);
+    let mut input = input_for(&row, row.as_of);
+    if let CurrentState::At(current) = &mut input.current {
+        current.entered_at = Some(approval);
+        current.age_sec = (row.as_of - approval).num_seconds();
+        current.episode_entered_at = Some(release);
+    }
+    let current = the_current(&input).clone();
+    assert_eq!(visit_entry(&current, input.as_of), release);
+    assert_eq!(adapt_input(&input, &current, FitStage::MergeWait), row);
+    assert_eq!(
+        visit_seed(&input, &current, FitStage::MergeWait),
+        seed_for_visit("github:1073994527#9289", "merge_wait", release)
+    );
+}
+
 // ---------------------------------------------------------- the tracker
 
-#[test]
-fn a_tracker_pass_with_a_fit_adds_a_twin_otter_shadow_and_leaves_the_primary_alone() {
+/// One tracker pass at `as_of() + 60 s` over PR #501 carrying `labels`.
+fn tracker_pass(registry: &Registry, labels: &[&str]) -> Vec<crate::eta::tracker::Emission> {
     const REPO: &str = "rjwalters/loom";
     let history = history_a();
     let repo_ids: BTreeMap<String, u64> = [(REPO.to_string(), 1_073_994_527_u64)]
         .into_iter()
         .collect();
-    let pass = |registry: &Registry| {
-        let ctx = EstimateContext {
-            registry,
-            current_start: None,
-            current_finish: None,
-            current_land: None,
-            history: &history,
-            refresh_secs: 300,
-            host_id: Some("host-test"),
-            repo_ids: &repo_ids,
-        };
-        let mut tracker = Tracker::new(provenance());
-        let pr = PrView {
-            number: 501,
-            issue: 50,
-            labels: vec![
-                "loom:review-requested".to_string(),
-                "loom:sequenced".to_string(),
-            ],
-            created_at: Some(as_of() - Duration::hours(2)),
-            updated_at: Some(as_of() - Duration::hours(1)),
-        };
-        tracker.on_listing(REPO, &[pr], as_of(), 300);
-        tracker.estimate(None, &ctx, as_of() + Duration::seconds(60))
+    let ctx = EstimateContext {
+        registry,
+        current_start: None,
+        current_finish: None,
+        current_land: None,
+        history: &history,
+        refresh_secs: 300,
+        host_id: Some("host-test"),
+        repo_ids: &repo_ids,
     };
-    let fitted = Registry::with_fit(Some(Arc::new(fixture_fit(as_of() - Duration::days(1)))));
-    let with_fit = pass(&fitted);
-    let without = pass(&Registry::builtin());
+    let mut tracker = Tracker::new(provenance());
+    let pr = PrView {
+        number: 501,
+        issue: 50,
+        labels: labels.iter().map(|l| (*l).to_string()).collect(),
+        created_at: Some(as_of() - Duration::hours(2)),
+        updated_at: Some(as_of() - Duration::hours(1)),
+    };
+    tracker.on_listing(REPO, &[pr], as_of(), 300);
+    tracker.estimate(None, &ctx, as_of() + Duration::seconds(60))
+}
 
-    let land = |emissions: &[crate::eta::tracker::Emission], id: &str| {
-        emissions
-            .iter()
-            .find(|e| e.explanation.kind == Kind::Land && e.explanation.heuristic == id)
-            .map(|e| (e.primary, e.explanation.clone()))
-            .unwrap_or_else(|| panic!("{id} emitted"))
-    };
+/// `(primary, explanation)` of the `land` emission by `id`.
+fn land_emission(emissions: &[crate::eta::tracker::Emission], id: &str) -> (bool, Explanation) {
+    emissions
+        .iter()
+        .find(|e| e.explanation.kind == Kind::Land && e.explanation.heuristic == id)
+        .map(|e| (e.primary, e.explanation.clone()))
+        .unwrap_or_else(|| panic!("{id} emitted"))
+}
+
+/// End to end: a held approved PR (`loom:pr` + `loom:operator`) gets a
+/// twin-otter shadow answer from `merge_hold`, while the primary `land-v1`
+/// still refuses it `blocked`.
+#[test]
+fn a_tracker_pass_estimates_a_held_pr_with_twin_otter_only() {
+    let fitted = Registry::with_fit(Some(Arc::new(fixture_fit(as_of() - Duration::days(1)))));
+    let emissions = tracker_pass(&fitted, &["loom:pr", "loom:operator"]);
+    let (primary, twin) = land_emission(&emissions, LAND_TWIN_OTTER);
+    assert!(!primary);
+    assert!(twin.result.is_some(), "{:?}", twin.no_estimate_reason);
+    assert_eq!(twin.current_stage.as_ref().map(|c| c.stage), Some(Stage::MergeHold));
+    let input = &twin.twin_otter.as_ref().unwrap().input;
+    assert_eq!((input.stage.as_str(), input.op_hold), ("merge_hold", 1));
+    let (primary, v1) = land_emission(&emissions, "land-v1");
+    assert!(primary);
+    assert_eq!(v1.no_estimate_reason, Some(NoEstimateReason::Blocked));
+}
+
+#[test]
+fn a_tracker_pass_with_a_fit_adds_a_twin_otter_shadow_and_leaves_the_primary_alone() {
+    let labels = ["loom:review-requested", "loom:sequenced"];
+    let fitted = Registry::with_fit(Some(Arc::new(fixture_fit(as_of() - Duration::days(1)))));
+    let with_fit = tracker_pass(&fitted, &labels);
+    let without = tracker_pass(&Registry::builtin(), &labels);
+    let land = land_emission;
+
     let (primary, twin) = land(&with_fit, LAND_TWIN_OTTER);
     assert!(!primary, "a shadow, never the primary");
     assert!(twin.result.is_some(), "{:?}", twin.no_estimate_reason);

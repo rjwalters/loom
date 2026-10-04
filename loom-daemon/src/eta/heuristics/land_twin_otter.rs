@@ -41,8 +41,17 @@
 //!
 //! Both are taken from the current stage **episode** ([`visit_entry`]). The
 //! fit (#10245) trains on #10218's episodes, so serving measures age the same
-//! way. Until #10218 adds the episode instant, the episode entry is the
-//! stage's own `entered_at`.
+//! way: after an operator hold is lifted the episode began at the release
+//! (`episode_entered_at`), not at the approval the pooled `merge_wait` keeps.
+//!
+//! # `merge_hold`
+//!
+//! A held approved PR is estimated from the fit's own `merge_hold` stage,
+//! unlike the path-engine heuristics, which refuse it as `blocked`. Its
+//! `features` are those of that `blocked` refusal (#10218 keeps the shipped
+//! explanations byte-identical), so its stage-dependent counts are `null`
+//! and imputed; and the tracker emits a held PR's estimate at the hold's
+//! entry without refreshing it.
 //!
 //! # Ships as shadow
 //!
@@ -248,12 +257,14 @@ fn at_least_one_in_doctor(stage: Stage, rework: u32) -> u32 {
     }
 }
 
-/// When the current stage episode began: the stage's `entered_at`, or
+/// When the current stage episode began: `episode_entered_at` (the release
+/// of an operator hold, #10218), else the stage's `entered_at`, else
 /// `as_of − age_sec` when the resolver had no instant.
 #[must_use]
 pub fn visit_entry(current: &CurrentStage, as_of: DateTime<Utc>) -> DateTime<Utc> {
     current
-        .entered_at
+        .episode_entered_at
+        .or(current.entered_at)
         .unwrap_or_else(|| as_of - Duration::seconds(current.age_sec.max(0)))
 }
 

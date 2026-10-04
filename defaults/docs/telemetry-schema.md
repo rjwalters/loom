@@ -1933,6 +1933,17 @@ counted and never scored. A PR closed unmerged and a sweep that ended before
 any PR are not outcomes at all — the issue's own state decides, and until it
 closes those estimates stay pending.
 
+**`merge_hold` (#10218).** An approved PR held for a human is the
+`merge_hold` stage, so `merge_hold` is a possible `stage` /
+`stage_at_estimate` value (and a `stage_marks[]` / `stages[]` stage) on
+`eta.estimate` and `eta.outcome`, but **only from a heuristic that models the
+hold**: today the shadow `land-2026-10-04-twin-otter`. Every path-engine
+heuristic refuses it as `blocked`, exactly as before, so it never appears in
+`eta.snapshot` while `current.land` is one of them (those rows carry only
+`current`'s estimate). Once a hold-aware
+heuristic is promoted, consumers must render an unknown `stage` value
+gracefully.
+
 ### `eta.snapshot`
 
 This host's **live** ETA estimate set (Issue #9329) — one row per

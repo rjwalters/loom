@@ -40,6 +40,7 @@ stage it is in now, with one branch at every Judge verdict:
 ```text
 ready_wait → sweep.curator → sweep.builder → review_wait ─┬─ approved ──→ merge_wait → landed
                                                           └─ changes_requested → doctor ─┘ (loop, capped)
+                                       approved + operator hold: merge_hold ⇄ merge_wait (#10218)
 ```
 
 | Stage | Entered when | Left when |
@@ -50,6 +51,7 @@ ready_wait → sweep.curator → sweep.builder → review_wait ─┬─ approve
 | `review_wait` | the PR asks for review | the Judge's verdict |
 | `doctor` | `loom:changes-requested` | the PR asks for review again |
 | `merge_wait` | `loom:pr` | the PR merges |
+| `merge_hold` | `loom:pr` plus `loom:operator`, `loom:operator-only` or `loom:operator-decision` | the hold is lifted (back to `merge_wait`), `loom:changes-requested`, or the PR merges or closes |
 
 **`ready_wait` (#9326).** A ready issue's wait is modelled from its
 [dispatch plan](daemon-reference.md) position on the last work-finder tick,
@@ -74,11 +76,14 @@ below its cap; a repo-cap or out-of-slice deferral is recorded (as the row's
 rides only `blocked` rows, which have no position, so it is refused
 `no_dispatch_plan` rather than turned into a start time.
 
-Human-gated stages (intake, approval, operator holds) are outside the model:
-an issue there has no estimate, with a reason (below). A running sweep gets a
-`land` estimate from `sweep.curator` on; an item in `doctor` always counts at
-least one rework round, because `doctor` is entered only through a
-rejection.
+Human-gated stages (intake, approval) are outside the model: an issue there
+has no estimate, with a reason (below). An approved PR under an operator hold
+is the `merge_hold` stage, but every path-engine heuristic still refuses it
+as `blocked` ([below](#operator-holds-merge_hold-and-stage-episodes-10218));
+only the shadow `land-2026-10-04-twin-otter` estimates it, from its fit.
+A running sweep gets a `land` estimate from `sweep.curator` on; an item in
+`doctor` always counts at least one rework round, because `doctor` is entered
+only through a rejection.
 
 **Distributions.** Each `(repo, stage)` is summarised as a 21-point
 nearest-rank quantile grid (`p0, p5, …, p100`) over the most recent 200
@@ -175,6 +180,80 @@ in-sweep merge share to invent one from.
 at all. Until then `augment` (the default) keeps this host's journals for the
 in-sweep half and takes the forge's word for the human-gated half.
 
+### Operator holds: `merge_hold` and stage episodes (#10218)
+
+An approved PR can be waiting to merge (`loom:pr`, usually over within the
+hour) or held for a human (`loom:pr` plus `loom:operator`,
+`loom:operator-only` or `loom:operator-decision`; `loom:operator-mechanical`
+may accompany them). The second is the `merge_hold` stage. Its one
+definition is `eta::labels::stage_from_pr_labels`; the episode derivation, the
+tracker and every later consumer call it, so the stage a model is trained on
+and the stage it serves cannot drift. `loom:blocked`, `loom:needs-capability`
+and an operator hold on a PR that is not approved are still `blocked`.
+
+**Shipped heuristics do not move.** `start-v1`, `finish-v1`, `land-v1` to
+`land-v3` and `land-2026-10-04-amber-heron` refuse an item in `merge_hold` as
+`blocked` before writing any field, and a held item's `features` are those
+of that refusal (`no_stage`), so their explanations are byte-identical to
+the refusal of a held PR before the stage existed, and no shipped
+`stage_marks` carries a `merge_hold` mark (it is marked only on a path that
+starts there). Their `merge_wait`
+history keeps the **pooled** definition from every source: approval in force
+to merge, hold included. A heuristic opts in to modelling the hold with
+`PathRules::models_hold`; its path from `merge_hold` is the rest of the hold
+(conditioned on its age) and then one `merge_wait`.
+
+**Stage episodes** are the split record a hold-aware heuristic fits
+(`eta::episodes`, #10221's input). One PR's label events are replayed in
+`(at, seq)` order from an empty label set; every event at one instant is
+applied in `seq` order and the stage is resolved once per instant, so two
+labels changed in one edit are one transition and no episode has zero
+length. `seq` is the timeline order for the forge (kept by a stable sort) and
+the delivery order for a future label stream; it decides only between changes
+to the same label at the same instant. Each episode is
+`{repo, pr_number, stage, entered_at, end}`. `stage` is `review_wait`,
+`doctor`, `merge_wait` (split: hold excluded) or `merge_hold`. `end` is
+`left` (with `at` and `next`: a stage, `merged` or `closed`), `unstaged` (the
+labels stopped resolving to any stage) or `open` (censored at its `at`). A
+label re-applied while in force opens nothing. The derivation is causal:
+cut at `T`, every episode that ended before `T` is identical and a running one
+has the same `entered_at`, which is what `StageSamples::select_episodes`
+reconstructs from a stored snapshot. Episodes store the events' own instants;
+each consumer applies its own knowability lag.
+
+**Where the history comes from.** Only label data the daemon already reads:
+the forge PR timelines behind the fleet snapshot (every `labeled` and
+`unlabeled` event, operator labels included) and the tracker's own listings.
+No new forge read; the PR listing gains `closedAt` in the same call, so a PR
+closed unmerged ends its last episode at its close. The webhook label stream
+is not readable by the daemon today; it becomes one more adapter once #10197's
+raw event cache imports it.
+
+- **Fleet snapshot.** `episodes` sits beside `samples` (`serde(default)`, not
+  written when empty), so an older daemon still parses the file and a
+  snapshot without episodes keeps its id. Each `merge_hold` episode is also a
+  `merge_hold` sample (completed, or censored when closed, unstaged or open);
+  split `merge_wait` episodes are not samples. A snapshot written before
+  #10218 gains episodes only as its PRs are re-read: run
+  `eta fleet backfill` (not `refresh`) to rebuild the window. `eta fleet show`
+  prints episode counts by stage.
+- **Tracker.** The hold is an overlay on the pooled `merge_wait` track.
+  Entering it journals a boundary-only `merge_wait` row
+  (`next_stage: merge_hold`, no duration); leaving it journals a `merge_hold`
+  row (with `duration_sec` when its entry was observed), then the pooled track
+  carries on as before. A merge or close while held adds a `merge_hold` row to
+  the unchanged pooled one. The `exits_*` and `merges_*` features count a
+  hold's entry as a `merge_wait` exit. They count its end once, from the
+  `merge_hold` row: the pooled row at the same instant is skipped, and a held
+  PR that leaves the listings still open is not a merge. While held the item
+  is `At(merge_hold)` and still refused `blocked`, so a refusal is emitted
+  once, as before; after a release
+  it is `At(merge_wait)` with the pooled entry, and
+  `CurrentStage.episode_entered_at` carries the release instant.
+  One deliberate change to local samples: `review_wait` approved and held
+  within one listing interval now closes at the approval (verdict `pass`), as
+  the forge measures it, instead of at the release.
+
 ## Heuristics and versioning
 
 | id | kind | reads | an approved path ends |
@@ -185,7 +264,7 @@ in-sweep half and takes the forge's word for the human-gated half.
 | `land-v2` | `land` | the same, with **right-censored** stage samples folded in (Kaplan–Meier grids) | after `merge_wait` |
 | `land-v3` | `land` | `land-v2`'s, with each stage grid calibrated first: widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored (recorded per stage as `distribution.adjustment`; #9970) | after `merge_wait` |
 | `land-2026-10-04-amber-heron` | `land` | `land-v2`'s path, then its p25/p75 recalibrated from `land-v2`'s own track record: the current stage's `ln(actual / p50)` distribution (landed estimates as events, still-open ones as censored lower bounds, recency-weighted) fitted at the estimate's own `as_of`; the median is kept (recorded as `recalibration`; #10207) | after `merge_wait` |
-| `land-2026-10-04-twin-otter` | `land` | no history: the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)). PR stages only (`review_wait`, `doctor`, `merge_wait`); the blend of a stage-by-stage exit-hazard Monte Carlo (256 paths, seeded per stage visit) and a log-normal direct model (recorded as `twin_otter`; #10222, #10243) | at the merge |
+| `land-2026-10-04-twin-otter` | `land` | no history: the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)). PR stages only (`review_wait`, `doctor`, `merge_wait`, `merge_hold`); the blend of a stage-by-stage exit-hazard Monte Carlo (256 paths, seeded per stage visit) and a log-normal direct model (recorded as `twin_otter`; #10222, #10243) | at the merge |
 
 A shipped id is **immutable**: a golden test pins each id's output on a fixed
 fixture. A behaviour change is a new id registered beside the old one
@@ -368,8 +447,8 @@ input onto the model's (train and serve share each definition):
 
 | model input | from |
 |---|---|
-| `stage` | `review_wait`, `doctor` → `doctor_wait`, `merge_wait`; every pre-PR stage refuses `unknown_stage` |
-| `age_h` | whole seconds in the current stage episode (since `entered_at`; `age_sec` when there is none) |
+| `stage` | `review_wait`, `doctor` → `doctor_wait`, `merge_wait`, `merge_hold`; every pre-PR stage refuses `unknown_stage` |
+| `age_h` | whole seconds in the current stage episode (since `episode_entered_at`, the release after a hold; else `entered_at`; else `age_sec`) |
 | `ahead`, `n_stage_repo`, `n_stage_fleet`, `exits_repo_6h`, `exits_repo_24h`, `exits_fleet_6h`, `merges_repo_24h`, `merges_fleet_6h` | the same-named queue features; `null` is imputed at the training mean and named in `twin_otter.imputed` |
 | `since_merge_h` | `since_merge_sec / 3600` |
 | `rework` | `doctor_cycles_so_far` (Judge rejections so far), else the resolver's count; at least 1 in `doctor` |
@@ -381,6 +460,13 @@ an unchanged-input refresh moves p50 by the model's drift, not by a redraw
 (pinned under 5%). A stage the fit skipped refuses `insufficient_samples`; a
 missing, model-less, too-new or malformed file refuses `no_model`. It never
 refuses `beyond_history`.
+
+A held PR (`merge_hold`) is estimated, not refused `blocked`, with two known
+limits: its `features` are those of the path-engine heuristics' `blocked`
+refusal, so its stage-dependent counts (`ahead`, `n_stage_*`, `exits_*`) are
+`null` and imputed where training saw real ones; and its estimate is
+emitted at the hold's entry and not refreshed while it stays held (the item
+keeps `refused = blocked`, so the emit signature never refreshes).
 
 ## The explanation (`eta-explanation/v1`)
 
@@ -731,7 +817,9 @@ every boundary the tracker observes, the moment it observes it, with its raw
 fields: sweep dispatch, phase, repeat and terminal events, label transitions,
 first sightings, verdicts and PR resolutions. A row that completes a stage
 with an observed entry has a `duration_sec`; a row whose entry was only a
-lower bound does not. Rows the sweep-outcome journal already carries are
+lower bound does not. Operator holds add `merge_hold` rows and boundary-only
+`merge_wait → merge_hold` rows ([above](#operator-holds-merge_hold-and-stage-episodes-10218)).
+Rows the sweep-outcome journal already carries are
 marked `in_sweep` and are not read back as history. Rotation: 5 MiB or 30
 days, one `.1` generation.
 

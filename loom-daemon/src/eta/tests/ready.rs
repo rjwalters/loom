@@ -71,6 +71,7 @@ fn ready_input(dispatch: Option<DispatchInput>) -> EstimateInput {
         age_sec: 600,
         age_source: AgeSource::TrackerObserved,
         rework_rounds: 0,
+        episode_entered_at: None,
     });
     input.dispatch = dispatch;
     input
