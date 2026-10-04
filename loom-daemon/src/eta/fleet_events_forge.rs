@@ -1,9 +1,15 @@
 //! The forge [`RawEventSource`]s for the raw fleet event cache (#10197).
 //!
-//! Two paged REST listings, one [`ForgeEndpoint`] each, read by the same
-//! [`ForgeEventSource`]: the issue-events listing (below) and the pulls
-//! listing ([`super::fleet_events_pulls`]: PR open/merge/close times and
-//! closing references, 100 PRs per call, op `pr.closing-issue-references`).
+//! Four paged REST listings, one [`ForgeEndpoint`] each, read by the same
+//! [`ForgeEventSource`]: the issue-events listing (below), the pulls listing
+//! ([`super::fleet_events_pulls`]: PR open/merge/close times, closing
+//! references and head commits, 100 PRs per call, op
+//! `pr.closing-issue-references`), and two per-PR listings walked by
+//! [`super::fleet_events_fanout`] ([`super::fleet_events_reviews`]): a PR's
+//! reviews (op `review.list-formal`) and its head commit's check runs (op
+//! `ci.check-runs-for-sha`). A per-PR read answering `404` / `422` (a deleted
+//! PR, a garbage-collected commit) is an empty last page, so that PR settles
+//! instead of stopping every later run.
 //!
 //! The issue-events endpoint reads the repo-wide issue-events listing,
 //! `GET repos/{owner}/{repo}/issues/events?per_page=100&page=N`, through the
@@ -36,6 +42,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use super::fleet_events::{EventKind, ItemKind, PageFetch, RawEvent, RawEventSource, SOURCE_FORGE};
+use super::fleet_events_fanout::{PerPrKind, PerPrSource};
 
 /// Rows per page — the REST maximum.
 pub const PER_PAGE: u32 = 100;
@@ -51,14 +58,24 @@ pub const PULLS_ENDPOINT: &str = "pulls";
 pub enum ForgeEndpoint {
     /// `GET repos/{o}/{r}/issues/events` — labels, close/reopen/merge.
     IssuesEvents,
-    /// `GET repos/{o}/{r}/pulls?state=all` — PR open/merge/close times and
-    /// closing references.
+    /// `GET repos/{o}/{r}/pulls?state=all` — PR open/merge/close times,
+    /// closing references and head commits.
     Pulls,
+    /// `GET repos/{o}/{r}/pulls/{n}/reviews`, one PR at a time.
+    Reviews,
+    /// `GET repos/{o}/{r}/commits/{sha}/check-runs`, one PR head at a time.
+    CheckRuns,
 }
 
 impl ForgeEndpoint {
-    /// Every endpoint, in the order a full sync reads them.
-    pub const ALL: [ForgeEndpoint; 2] = [ForgeEndpoint::IssuesEvents, ForgeEndpoint::Pulls];
+    /// Every endpoint, in the order a full sync reads them (check runs need
+    /// the head commits the pulls listing records).
+    pub const ALL: [ForgeEndpoint; 4] = [
+        ForgeEndpoint::IssuesEvents,
+        ForgeEndpoint::Pulls,
+        ForgeEndpoint::Reviews,
+        ForgeEndpoint::CheckRuns,
+    ];
 
     /// The endpoint's cursor-key suffix (and CLI name).
     #[must_use]
@@ -66,6 +83,18 @@ impl ForgeEndpoint {
         match self {
             ForgeEndpoint::IssuesEvents => ENDPOINT,
             ForgeEndpoint::Pulls => PULLS_ENDPOINT,
+            ForgeEndpoint::Reviews => PerPrKind::Reviews.name(),
+            ForgeEndpoint::CheckRuns => PerPrKind::CheckRuns.name(),
+        }
+    }
+
+    /// The per-PR walk this endpoint is, if it is one.
+    #[must_use]
+    pub fn per_pr(self) -> Option<PerPrKind> {
+        match self {
+            ForgeEndpoint::Reviews => Some(PerPrKind::Reviews),
+            ForgeEndpoint::CheckRuns => Some(PerPrKind::CheckRuns),
+            ForgeEndpoint::IssuesEvents | ForgeEndpoint::Pulls => None,
         }
     }
 
@@ -75,7 +104,9 @@ impl ForgeEndpoint {
         Self::ALL.into_iter().find(|e| e.name() == name)
     }
 
-    fn url(self, repo: &str, page: u32) -> String {
+    fn url(self, repo: &str, subject: &Subject, page: u32) -> String {
+        let pr = subject.pr;
+        let sha = subject.sha.as_deref().unwrap_or("");
         match self {
             ForgeEndpoint::IssuesEvents => {
                 format!("repos/{repo}/issues/events?per_page={PER_PAGE}&page={page}")
@@ -83,27 +114,55 @@ impl ForgeEndpoint {
             ForgeEndpoint::Pulls => format!(
                 "repos/{repo}/pulls?state=all&sort=created&direction=desc&per_page={PER_PAGE}&page={page}"
             ),
+            ForgeEndpoint::Reviews => {
+                format!("repos/{repo}/pulls/{pr}/reviews?per_page={PER_PAGE}&page={page}")
+            }
+            ForgeEndpoint::CheckRuns => {
+                format!("repos/{repo}/commits/{sha}/check-runs?per_page={PER_PAGE}&page={page}")
+            }
         }
     }
 
     fn op(self) -> crate::forge_call_stats::ForgeOp {
+        use crate::forge_call_stats::ops;
         match self {
-            ForgeEndpoint::IssuesEvents => crate::forge_call_stats::ops::TIMELINE_READ,
-            ForgeEndpoint::Pulls => crate::forge_call_stats::ops::PR_CLOSING_ISSUE_REFERENCES,
+            ForgeEndpoint::IssuesEvents => ops::TIMELINE_READ,
+            ForgeEndpoint::Pulls => ops::PR_CLOSING_ISSUE_REFERENCES,
+            ForgeEndpoint::Reviews => ops::REVIEW_LIST_FORMAL,
+            ForgeEndpoint::CheckRuns => ops::CI_CHECK_RUNS_FOR_SHA,
         }
     }
 
     fn parse(
         self,
         repo: &str,
+        pr: u32,
         body: &str,
         fetched_at: DateTime<Utc>,
     ) -> anyhow::Result<(Vec<RawEvent>, usize)> {
+        use super::fleet_events_reviews::{parse_check_runs, parse_reviews};
         match self {
             ForgeEndpoint::IssuesEvents => parse_issue_events(repo, body, fetched_at),
             ForgeEndpoint::Pulls => super::fleet_events_pulls::parse_pulls(repo, body, fetched_at),
+            ForgeEndpoint::Reviews => parse_reviews(repo, pr, body, fetched_at),
+            ForgeEndpoint::CheckRuns => parse_check_runs(repo, pr, body, fetched_at),
         }
     }
+}
+
+/// A repo-wide listing's request: no PR.
+impl From<ForgeEndpoint> for (ForgeEndpoint, u32) {
+    fn from(endpoint: ForgeEndpoint) -> Self {
+        (endpoint, 0)
+    }
+}
+
+/// The PR (and head commit) a per-PR endpoint is pointed at. Unused by the
+/// repo-wide listings.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Subject {
+    pub pr: u32,
+    pub sha: Option<String>,
 }
 
 /// The facade operation name every call here is recorded under.
@@ -194,6 +253,7 @@ pub fn parse_issue_events(
 /// A forge source: one repo's [`ForgeEndpoint`] listing, read with `gh`.
 pub struct ForgeEventSource {
     endpoint: ForgeEndpoint,
+    subject: Subject,
     repo: String,
     root: PathBuf,
     gh_bin: PathBuf,
@@ -218,6 +278,7 @@ impl ForgeEventSource {
     pub fn new(endpoint: ForgeEndpoint, repo: &str, root: &Path, reserve: u64) -> Self {
         ForgeEventSource {
             endpoint,
+            subject: Subject::default(),
             repo: repo.to_string(),
             root: root.to_path_buf(),
             gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
@@ -267,9 +328,25 @@ impl ForgeEventSource {
     }
 }
 
+impl PerPrSource for ForgeEventSource {
+    fn select(&mut self, pr: u32, sha: Option<&str>) {
+        self.subject = Subject {
+            pr,
+            sha: sha.map(str::to_string),
+        };
+    }
+}
+
 impl RawEventSource for ForgeEventSource {
     fn cursor_key(&self) -> String {
-        format!("{SOURCE_FORGE}:{}", self.endpoint.name())
+        match self.endpoint.per_pr() {
+            Some(kind) => kind.item_key(self.subject.pr, self.subject.sha.as_deref()),
+            None => format!("{SOURCE_FORGE}:{}", self.endpoint.name()),
+        }
+    }
+
+    fn newest_first(&self) -> bool {
+        self.endpoint.per_pr().is_none()
     }
 
     fn fetch_page(&mut self, page: u32, etag: Option<&str>) -> PageFetch {
@@ -286,7 +363,7 @@ impl RawEventSource for ForgeEventSource {
             return PageFetch::Stopped("rate-limit breaker open".to_string());
         }
         let target = crate::forge_etag_store::resolve_target(Some(&self.root), Some(&self.repo));
-        let url = self.endpoint.url(&self.repo, page);
+        let url = self.endpoint.url(&self.repo, &self.subject, page);
         let site = crate::forge_etag_store::ConditionalRead::new(CALLER, self.endpoint.op());
         let fetched_at = Utc::now();
         self.calls += 1;
@@ -332,7 +409,8 @@ impl RawEventSource for ForgeEventSource {
                     Some(withdraw_reader(reader, &self.repo, &url, &response, &stderr));
             }
         }
-        classify(self.endpoint, &self.repo, page, response, &stderr, fetched_at)
+        let request = (self.endpoint, self.subject.pr);
+        classify(request, &self.repo, page, response, &stderr, fetched_at)
     }
 }
 
@@ -382,17 +460,21 @@ fn withdraw_reader(
 
 /// Turn one HTTP answer into a [`PageFetch`]. Pure, so every branch is tested
 /// without a `gh`.
+///
+/// `request` is the endpoint and, for a per-PR one, the PR the rows belong to
+/// (ignored otherwise).
 pub(crate) fn classify(
-    endpoint: ForgeEndpoint,
+    request: impl Into<(ForgeEndpoint, u32)>,
     repo: &str,
     page: u32,
     response: crate::forge_listing::HttpResponse,
     stderr: &str,
     fetched_at: DateTime<Utc>,
 ) -> PageFetch {
+    let (endpoint, pr) = request.into();
     match response.status {
         304 => PageFetch::NotModified,
-        200 => match endpoint.parse(repo, &response.body, fetched_at) {
+        200 => match endpoint.parse(repo, pr, &response.body, fetched_at) {
             Ok((events, rows)) => PageFetch::Page {
                 events,
                 etag: response.etag,
@@ -400,7 +482,13 @@ pub(crate) fn classify(
             },
             Err(e) => PageFetch::Stopped(format!("page {page}: unparseable body: {e}")),
         },
-        // Past the listing's pagination window: nothing older is served.
+        // Past the listing's pagination window: nothing older is served. For
+        // a per-PR read, a PR or commit that is gone: nothing to read.
+        404 if endpoint.per_pr().is_some() => PageFetch::Page {
+            events: Vec::new(),
+            etag: None,
+            last: true,
+        },
         422 => PageFetch::Page {
             events: Vec::new(),
             etag: None,
@@ -544,9 +632,70 @@ mod tests {
         assert_eq!(ForgeEndpoint::from_name("pulls"), Some(ForgeEndpoint::Pulls));
         assert_eq!(ForgeEndpoint::from_name("nope"), None);
         assert!(ForgeEndpoint::Pulls
-            .url("o/r", 4)
+            .url("o/r", &Subject::default(), 4)
             .starts_with("repos/o/r/pulls?state=all&sort=created&direction=desc"));
         let source = ForgeEventSource::new(ForgeEndpoint::Pulls, "o/r", Path::new("."), 1);
         assert_eq!(source.cursor_key(), "forge:pulls");
+        assert!(source.newest_first());
+    }
+
+    #[test]
+    fn per_pr_endpoints_name_their_pr_in_the_url_the_key_and_the_rows() {
+        let subject = Subject {
+            pr: 12,
+            sha: Some("abc".to_string()),
+        };
+        assert_eq!(
+            ForgeEndpoint::Reviews.url("o/r", &subject, 2),
+            "repos/o/r/pulls/12/reviews?per_page=100&page=2"
+        );
+        assert_eq!(
+            ForgeEndpoint::CheckRuns.url("o/r", &subject, 1),
+            "repos/o/r/commits/abc/check-runs?per_page=100&page=1"
+        );
+        let mut source = ForgeEventSource::new(ForgeEndpoint::CheckRuns, "o/r", Path::new("."), 1);
+        source.select(12, Some("abc"));
+        assert_eq!(source.cursor_key(), "forge:check-runs#12@abc");
+        assert!(!source.newest_first());
+        let mut source = ForgeEventSource::new(ForgeEndpoint::Reviews, "o/r", Path::new("."), 1);
+        source.select(12, None);
+        assert_eq!(source.cursor_key(), "forge:reviews#12");
+
+        let reviews = r#"[{"id": 1, "state": "APPROVED", "submitted_at": "2026-10-04T09:00:00Z"}]"#;
+        match classify((ForgeEndpoint::Reviews, 12), "o/r", 1, response(200, reviews), "", now()) {
+            PageFetch::Page { events, last, .. } => {
+                assert!(last);
+                assert_eq!(events.len(), 1);
+                assert_eq!((events[0].item, events[0].kind), (12, EventKind::Review));
+            }
+            other => panic!("{other:?}"),
+        }
+        let checks = r#"{"total_count": 0, "check_runs": []}"#;
+        assert!(matches!(
+            classify((ForgeEndpoint::CheckRuns, 12), "o/r", 1, response(200, checks), "", now()),
+            PageFetch::Page { last: true, ref events, .. } if events.is_empty()
+        ));
+    }
+
+    #[test]
+    fn a_gone_pr_or_commit_settles_but_a_gone_listing_still_stops() {
+        for endpoint in [ForgeEndpoint::Reviews, ForgeEndpoint::CheckRuns] {
+            assert!(matches!(
+                classify((endpoint, 3), "o/r", 1, response(404, "{}"), "", now()),
+                PageFetch::Page { last: true, ref events, .. } if events.is_empty()
+            ));
+            match classify((endpoint, 3), "o/r", 1, response(429, ""), "", now()) {
+                PageFetch::Stopped(why) => assert!(why.contains("rate limited"), "{why}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(matches!(
+            classify(ForgeEndpoint::Pulls, "o/r", 1, response(404, ""), "", now()),
+            PageFetch::Stopped(_)
+        ));
+        assert_eq!(
+            ForgeEndpoint::ALL.map(ForgeEndpoint::name),
+            ["issues-events", "pulls", "reviews", "check-runs"]
+        );
     }
 }

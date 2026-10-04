@@ -40,8 +40,9 @@ pub const MAX_READING_AGE_SECS: i64 = 3_600;
 /// Rows per page of the open-PR listing: a full page is a lower bound only.
 pub const OPEN_PR_PAGE: usize = 100;
 
-/// Check-run conclusions that fail a head.
-const FAILING: [&str; 5] = [
+/// Check-run conclusions that fail a head (also read by
+/// [`super::fleet_state_prs`]).
+pub const FAILING: [&str; 5] = [
     "failure",
     "timed_out",
     "cancelled",

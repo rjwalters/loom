@@ -351,3 +351,133 @@ fn closing_refs_at_or_after_the_instant_cannot_change_the_answer() {
         serde_json::to_string(&fleet_state(&late, REPO, as_of)).unwrap()
     );
 }
+
+fn check(pr: u32, label: &str, secs: i64, run: u64) -> RawEvent {
+    ev(pr, ItemKind::Pr, EventKind::CheckRun, Some(label), secs, run)
+}
+
+fn review(pr: u32, state: &str, secs: i64, id: u64) -> RawEvent {
+    ev(pr, ItemKind::Pr, EventKind::Review, Some(state), secs, id)
+}
+
+/// `fleet()` plus: PR 10's CI failed by 950s and it was approved at 905s;
+/// PR 11's CI passed by 960s; PR 12 (merged at 700s) had a review.
+fn reviewed_fleet() -> Vec<RawEvent> {
+    let mut events = fleet();
+    events.extend([
+        check(10, "started:test", 610, 1),
+        check(10, "started:lint", 611, 2),
+        check(10, "success:lint", 700, 2),
+        check(10, "failure:test", 950, 1),
+        review(10, "approved", 905, 21),
+        check(11, "started:test", 620, 3),
+        check(11, "success:test", 960, 3),
+        review(12, "approved", 640, 22),
+        ev(11, ItemKind::Pr, EventKind::HeadCommit, Some("abc"), 615, 0),
+    ]);
+    events
+}
+
+#[test]
+fn open_prs_carry_ci_and_review_and_the_counts_follow() {
+    let state = fleet_state(&reviewed_fleet(), REPO, t(1000));
+    let pr10 = item(&state, ItemKind::Pr, 10);
+    assert_eq!(
+        (pr10.ci.as_deref(), pr10.review.as_deref()),
+        (Some("failing"), Some("approved"))
+    );
+    let pr11 = item(&state, ItemKind::Pr, 11);
+    assert_eq!((pr11.ci.as_deref(), pr11.review.as_deref()), (Some("passing"), None));
+    assert_eq!(state.open_prs_ci_failing, Some(1));
+    assert_eq!(state.open_prs_ci_passing, Some(1));
+    assert_eq!(state.open_prs_approved, Some(1), "merged PR 12 is not open");
+    // Earlier: PR 10 still running its test, PR 11 too; nobody approved.
+    let state = fleet_state(&reviewed_fleet(), REPO, t(900));
+    assert_eq!(item(&state, ItemKind::Pr, 10).ci.as_deref(), Some("pending"));
+    assert_eq!(state.open_prs_ci_failing, Some(0));
+    assert_eq!(state.open_prs_approved, Some(0));
+    // The rows touch nothing else: same items, stages and labels as without.
+    let bare = fleet_state(&fleet(), REPO, t(1000));
+    let strip = |s: &FleetState| -> Vec<(u32, ItemStage, Vec<String>, DateTime<Utc>)> {
+        s.items
+            .iter()
+            .map(|i| (i.number, i.stage, i.labels.clone(), i.stage_entered_at))
+            .collect()
+    };
+    assert_eq!(strip(&bare), strip(&fleet_state(&reviewed_fleet(), REPO, t(1000))));
+}
+
+#[test]
+fn without_review_or_check_rows_the_counts_are_absent_from_the_json() {
+    let json = serde_json::to_string(&fleet_state(&fleet(), REPO, t(1000))).unwrap();
+    for field in [
+        "open_prs_ci_failing",
+        "open_prs_approved",
+        "\"ci\"",
+        "\"review\"",
+    ] {
+        assert!(!json.contains(field), "{field} in {json}");
+    }
+    // Rows exist but only after the instant: still unknown.
+    let state = fleet_state(&reviewed_fleet(), REPO, t(600));
+    assert_eq!((state.open_prs_ci_failing, state.open_prs_approved), (None, None));
+}
+
+#[test]
+fn a_check_run_before_the_pr_opened_does_not_open_it() {
+    // CI on a pushed branch runs before the PR exists.
+    let events = vec![
+        check(30, "started:test", 50, 1),
+        opened(30, ItemKind::Pr, 100),
+    ];
+    let state = fleet_state(&events, REPO, t(80));
+    assert_eq!(state.open_prs, 0);
+    assert_eq!(state.open_prs_ci_passing, Some(0));
+    let state = fleet_state(&events, REPO, t(200));
+    assert_eq!(item(&state, ItemKind::Pr, 30).opened_at, t(100));
+    assert_eq!(item(&state, ItemKind::Pr, 30).ci.as_deref(), Some("pending"));
+}
+
+#[test]
+fn reviews_and_check_runs_at_or_after_the_instant_cannot_change_the_answer() {
+    let as_of = t(1000);
+    let baseline = serde_json::to_string(&fleet_state(&reviewed_fleet(), REPO, as_of)).unwrap();
+    let mut perturbed = reviewed_fleet();
+    perturbed.extend([
+        // A rerun starting exactly at `as_of`, later conclusions, later reviews.
+        check(10, "started:test", 1000, 9),
+        check(11, "failure:test", 1000, 3),
+        check(11, "started:deploy", 1001, 10),
+        review(10, "changes_requested", 1000, 30),
+        review(11, "approved", 5000, 31),
+        ev(10, ItemKind::Pr, EventKind::HeadCommit, Some("zzz"), 1000, 0),
+    ]);
+    let mut marker = review(11, "x", 1000, 0);
+    marker.label = None;
+    perturbed.push(marker);
+    let after = serde_json::to_string(&fleet_state(&perturbed, REPO, as_of)).unwrap();
+    assert_eq!(baseline, after);
+}
+
+#[test]
+fn review_and_check_rows_replay_the_same_in_any_input_order() {
+    let forward = reviewed_fleet();
+    let mut reversed = forward.clone();
+    reversed.reverse();
+    let mut doubled = forward.clone();
+    doubled.extend(forward.iter().cloned());
+    for at in [t(650), t(900), t(955), t(1000)] {
+        let a = serde_json::to_string(&fleet_state(&forward, REPO, at)).unwrap();
+        assert_eq!(a, serde_json::to_string(&fleet_state(&reversed, REPO, at)).unwrap());
+        assert_eq!(a, serde_json::to_string(&fleet_state(&doubled, REPO, at)).unwrap());
+    }
+    // A run's start and completion at the same second, same `seq`: their
+    // order is the content id's, and the answer does not depend on it.
+    let same_second = vec![
+        opened(40, ItemKind::Pr, 0),
+        check(40, "failure:x", 10, 7),
+        check(40, "started:x", 10, 7),
+    ];
+    let state = fleet_state(&same_second, REPO, t(11));
+    assert_eq!(item(&state, ItemKind::Pr, 40).ci.as_deref(), Some("failing"));
+}

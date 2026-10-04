@@ -67,6 +67,9 @@ path = "loom-daemon/src/main_health_gate.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/merge_pr/stale_checks/fetch.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/eta/fleet_events_forge.rs"
 
 [[operation]]
 id = "ci.workflow-runs-for-sha"

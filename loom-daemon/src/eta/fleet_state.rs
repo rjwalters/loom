@@ -45,12 +45,23 @@
 //!
 //! Items with no event inside the cache's window are invisible: an item
 //! untouched since before the window is not reported as open.
+//!
+//! # Reviews and CI
+//!
+//! From the `review` / `check_run` rows ([`super::fleet_state_prs`]) each open
+//! PR gets `ci` (`passing` / `failing` / `pending`, its head's latest run per
+//! check name) and `review` (the latest `approved` / `changes_requested`),
+//! and the state counts open PRs with a failing / passing CI and an approving
+//! review. Like the lockout, each count is `null` (absent from the JSON) until
+//! a row of its listing precedes `as_of`. These rows never open, label or
+//! stage an item.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::fleet_events::{EventKind, ItemKind, RawEvent};
+use super::fleet_state_prs::PrSignals;
 use super::labels::{check_holds, stage_from_pr_labels, APPROVED, READY_LABEL};
 use super::Stage;
 use crate::work_finder::BUILDING_LABEL;
@@ -182,6 +193,14 @@ pub struct ItemState {
     /// keyword or `Part of` / `Contributes to`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_pr: Option<u32>,
+    /// For a PR: its CI at `as_of` (`passing` / `failing` / `pending`), when
+    /// a run had started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci: Option<String>,
+    /// For a PR: its latest decisive review (`approved` /
+    /// `changes_requested`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<String>,
 }
 
 /// The whole fleet of one repo at one instant.
@@ -207,6 +226,17 @@ pub struct FleetState {
     /// `pr-open-skip` row on the work finder's plan. `null` until the cache
     /// holds closing references from before `as_of`.
     pub pr_open_skip_lockout: Option<bool>,
+    /// Open PRs whose CI was failing. `null` until check runs are cached
+    /// from before `as_of`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_prs_ci_failing: Option<usize>,
+    /// Open PRs whose CI was passing. `null` as above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_prs_ci_passing: Option<usize>,
+    /// Open PRs whose latest decisive review approved. `null` until reviews
+    /// are cached from before `as_of`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_prs_approved: Option<usize>,
     /// Open items per stage name.
     pub stage_counts: BTreeMap<String, usize>,
     /// Every open item, by `(kind, number)`.
@@ -239,7 +269,12 @@ pub fn fleet_state(events: &[RawEvent], repo: &str, as_of: DateTime<Utc>) -> Fle
 
     let mut items: BTreeMap<(ItemKind, u32), Replay> = BTreeMap::new();
     let mut refs_known = false;
+    let mut signals = PrSignals::default();
     for event in &known {
+        if matches!(event.kind, EventKind::Review | EventKind::CheckRun | EventKind::HeadCommit) {
+            signals.observe(event);
+            continue;
+        }
         let item = items.entry((event.item_kind, event.item)).or_default();
         item.kind = Some(event.item_kind);
         if item.first_seen.is_none() {
@@ -266,7 +301,7 @@ pub fn fleet_state(events: &[RawEvent], repo: &str, as_of: DateTime<Utc>) -> Fle
                 refs_known = true;
                 item.closes.extend(event.target);
             }
-            EventKind::Review | EventKind::CheckRun => {}
+            EventKind::Review | EventKind::CheckRun | EventKind::HeadCommit => {}
         }
         let stage = item_stage(event.item_kind, &item.labels);
         if item.stage != Some(stage) || matches!(event.kind, EventKind::Reopened) {
@@ -296,6 +331,9 @@ pub fn fleet_state(events: &[RawEvent], repo: &str, as_of: DateTime<Utc>) -> Fle
         operator_holds: 0,
         held_for_human: 0,
         pr_open_skip_lockout: None,
+        open_prs_ci_failing: None,
+        open_prs_ci_passing: None,
+        open_prs_approved: None,
         stage_counts: BTreeMap::new(),
         items: Vec::new(),
     };
@@ -339,7 +377,23 @@ pub fn fleet_state(events: &[RawEvent], repo: &str, as_of: DateTime<Utc>) -> Fle
                 ItemKind::Issue => closed_by.get(&number).copied(),
                 ItemKind::Pr => None,
             },
+            ci: pr_signal(kind, signals.ci(number)),
+            review: pr_signal(kind, signals.review(number)),
         });
+    }
+    let count = |field: fn(&ItemState) -> Option<&str>, want: &str| {
+        state
+            .items
+            .iter()
+            .filter(|i| field(i) == Some(want))
+            .count()
+    };
+    if signals.checks_read() {
+        state.open_prs_ci_failing = Some(count(|i| i.ci.as_deref(), "failing"));
+        state.open_prs_ci_passing = Some(count(|i| i.ci.as_deref(), "passing"));
+    }
+    if signals.reviews_read() {
+        state.open_prs_approved = Some(count(|i| i.review.as_deref(), "approved"));
     }
     if refs_known {
         state.pr_open_skip_lockout = Some(
@@ -350,6 +404,13 @@ pub fn fleet_state(events: &[RawEvent], repo: &str, as_of: DateTime<Utc>) -> Fle
         );
     }
     state
+}
+
+fn pr_signal(kind: ItemKind, value: Option<&str>) -> Option<String> {
+    (kind == ItemKind::Pr)
+        .then_some(value)
+        .flatten()
+        .map(str::to_string)
 }
 
 #[cfg(test)]

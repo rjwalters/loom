@@ -297,6 +297,9 @@ path = "defaults/scripts/lib/forge-helpers.sh"
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/check-review-feedback.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/eta/fleet_events_forge.rs"
 
 [[operation]]
 id = "review.thread-resolution"
