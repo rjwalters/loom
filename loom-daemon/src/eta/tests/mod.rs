@@ -11,6 +11,7 @@ mod fit;
 mod fit_parity;
 mod fleet;
 mod journal;
+pub(crate) mod land_twin_otter;
 mod land_v3;
 mod primitives;
 mod queue_features;

@@ -6,13 +6,16 @@
 //! [`FeatureOmitted`] reason, never a default; seconds are integers.
 //!
 //! Size: target [`TARGET_BYTES`], hard cap [`MAX_BYTES`] (the trace journal's
-//! entry cap). [`Explanation::enforce_cap`] drops `features` first, then the
-//! stage grids, then the stage marks, and names what it dropped in
-//! `truncated`.
+//! entry cap). [`Explanation::enforce_cap`] drops `features` first, then a
+//! twin-otter model slice, then the stage grids, then the stage marks, and
+//! names what it dropped in `truncated`.
 
+use super::fit::{AftFit, FitStage, HazardFit, PathStats};
+use super::twin_otter::TwinOtterInput;
 use super::{AgeSource, DispatchInput, Kind, NoEstimateReason, Provenance, Stage, Subject};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Hard cap on one serialized explanation.
 pub const MAX_BYTES: usize = 32 * 1024;
@@ -22,6 +25,10 @@ pub const TARGET_BYTES: usize = 8 * 1024;
 
 /// `truncated[]` entry when `features` was dropped.
 pub const TRUNCATED_FEATURES: &str = "features";
+
+/// `truncated[]` entry when a twin-otter record's model slice was dropped
+/// (#10243). Only ever written when the slice was there.
+pub const TRUNCATED_TWIN_OTTER_MODEL: &str = "twin_otter.model";
 
 /// `truncated[]` entry when the stage grids were dropped.
 pub const TRUNCATED_GRIDS: &str = "stages.distribution.grid";
@@ -83,6 +90,59 @@ pub struct Explanation {
     /// every other heuristic, so their explanations are byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recalibration: Option<super::recalibrate::Recalibration>,
+    /// What `land-2026-10-04-twin-otter` (#10243) evaluated: the coefficient
+    /// file, the adapted input, both parts' quantiles and the model slice
+    /// that recomputes them. Absent for every other heuristic and on every
+    /// refusal, so their explanations are byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub twin_otter: Option<TwinOtterRecord>,
+}
+
+/// A twin-otter answer, recorded so it can be recomputed from the
+/// explanation alone ([`super::simulate::run_explanation`]). The master
+/// seed is `combination.seed`; `result` holds the blend.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TwinOtterRecord {
+    /// The coefficient file's content-derived id (16 hex).
+    pub fit_id: String,
+    /// The file's cutoff, strictly before `as_of`.
+    pub fit_as_of: DateTime<Utc>,
+    /// The adapted input, exactly as evaluated.
+    pub input: TwinOtterInput,
+    /// Input fields that were null and imputed at the training mean.
+    pub imputed: Vec<String>,
+    /// Hours per survival step.
+    pub step_h: f64,
+    /// Survival steps.
+    pub steps: usize,
+    /// The cap on every quantile, in hours.
+    pub cap_h: f64,
+    /// Monte Carlo paths.
+    pub paths: usize,
+    /// The age clamp, in hours; `None` = off.
+    pub age_clamp_h: Option<f64>,
+    /// Whether the clamp bound at any step.
+    pub age_clamp_applied: bool,
+    /// The stage-by-stage part's p25/p50/p75/p90, in whole seconds.
+    pub hazard_path_sec: [i64; 4],
+    /// The direct (AFT) part's p25/p50/p75/p90, in whole seconds.
+    pub aft_sec: [i64; 4],
+    /// What the evaluation read. `None` only after
+    /// [`Explanation::enforce_cap`] dropped it, and then nothing recomputes.
+    pub model: Option<TwinOtterModelRecord>,
+}
+
+/// The part of a coefficient file one twin-otter evaluation reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TwinOtterModelRecord {
+    /// Feature names, in coefficient order.
+    pub features: Vec<String>,
+    /// The current stage's exit hazard, and no other stage's.
+    pub hazard: BTreeMap<FitStage, HazardFit>,
+    /// The pooled direct model.
+    pub aft: AftFit,
+    /// Every stage's dwell curve and next-stage table: a path walks them all.
+    pub path_stats: PathStats,
 }
 
 /// The current stage as the estimate saw it.
@@ -637,9 +697,10 @@ impl Explanation {
             .unwrap_or(usize::MAX)
     }
 
-    /// Enforce [`MAX_BYTES`]: drop `features`, then the stage grids, then
-    /// the stage marks, then every remaining list, stopping as soon as the
-    /// record fits, and recording each drop in `truncated`.
+    /// Enforce [`MAX_BYTES`]: drop `features`, then a twin-otter model
+    /// slice (only when there is one), then the stage grids, then the stage
+    /// marks, then every remaining list, stopping as soon as the record fits,
+    /// and recording each drop in `truncated`.
     pub fn enforce_cap(&mut self) {
         if self.size_bytes() <= MAX_BYTES {
             return;
@@ -649,6 +710,17 @@ impl Explanation {
         self.truncated.push(TRUNCATED_FEATURES.to_string());
         if self.size_bytes() <= MAX_BYTES {
             return;
+        }
+        let dropped_model = self
+            .twin_otter
+            .as_mut()
+            .and_then(|record| record.model.take())
+            .is_some();
+        if dropped_model {
+            self.truncated.push(TRUNCATED_TWIN_OTTER_MODEL.to_string());
+            if self.size_bytes() <= MAX_BYTES {
+                return;
+            }
         }
         for entry in &mut self.stages {
             entry.distribution.grid_pct.clear();

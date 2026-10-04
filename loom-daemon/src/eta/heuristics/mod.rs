@@ -3,10 +3,13 @@
 //! ([`estimate_path`]); they differ in which history they read, where the
 //! path ends, (`land-v3`) how each stage's grid is calibrated, and
 //! (`land-2026-10-04-amber-heron`) how the result's interval is recalibrated.
+//! `land-2026-10-04-twin-otter` (#10243) reads no history: it evaluates a
+//! fitted coefficient file handed to it when the registry was built.
 //! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
 mod land_amber_heron;
+mod land_twin_otter;
 mod land_v1;
 mod land_v2;
 mod land_v3;
@@ -14,6 +17,10 @@ mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
 pub use land_amber_heron::{LandAmberHeron, CALIBRATION_BASE, LAND_AMBER_HERON};
+pub(crate) use land_twin_otter::recompute as recompute_twin_otter;
+pub use land_twin_otter::{
+    adapt_input, visit_entry, visit_seed, LandTwinOtter, DRAW_ORDER, LAND_TWIN_OTTER, METHOD,
+};
 pub use land_v1::{LandV1, LAND_V1};
 pub use land_v2::{LandV2, LAND_V2};
 pub use land_v3::{
@@ -77,26 +84,23 @@ fn refuse(mut explanation: Explanation, reason: NoEstimateReason) -> Explanation
     explanation.result = None;
     explanation.contributions = None;
     explanation.combination = None;
+    explanation.twin_otter = None;
     explanation.enforce_cap();
     explanation
 }
 
-/// Estimate `input` along the path `rules` describe.
-pub(crate) fn estimate_path(
-    rules: PathRules,
-    input: &EstimateInput,
-    history: &StageSamples,
-) -> Explanation {
+/// The explanation of `heuristic`'s estimate of `input` before anything is
+/// estimated: identity, provenance, subject and the recorded features.
+fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) -> Explanation {
     let as_of = input.as_of;
-    let id = estimate_id(&input.subject, rules.kind, rules.id, as_of);
     let features_omitted = input
         .features
         .complete_omissions(input.features_omitted.clone(), "not_collected");
-    let mut explanation = Explanation {
+    Explanation {
         schema: EXPLANATION_SCHEMA.to_string(),
-        estimate_id: id,
-        heuristic: rules.id.to_string(),
-        kind: rules.kind,
+        estimate_id: estimate_id(&input.subject, kind, heuristic, as_of),
+        heuristic: heuristic.to_string(),
+        kind,
         loom: input.provenance.clone(),
         as_of,
         subject: input.subject.clone(),
@@ -114,7 +118,18 @@ pub(crate) fn estimate_path(
         no_estimate_reason: None,
         truncated: Vec::new(),
         recalibration: None,
-    };
+        twin_otter: None,
+    }
+}
+
+/// Estimate `input` along the path `rules` describe.
+pub(crate) fn estimate_path(
+    rules: PathRules,
+    input: &EstimateInput,
+    history: &StageSamples,
+) -> Explanation {
+    let as_of = input.as_of;
+    let mut explanation = blank(rules.id, rules.kind, input);
 
     let current = match &input.current {
         CurrentState::Refused(reason) => return refuse(explanation, *reason),

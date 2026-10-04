@@ -619,6 +619,11 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ("twin_otter/mod.rs", include_str!("../twin_otter/mod.rs")),
     ("twin_otter/eval.rs", include_str!("../twin_otter/eval.rs")),
     ("twin_otter/path.rs", include_str!("../twin_otter/path.rs")),
+    // #10243: the adapter, refusal map and explanation over the core above.
+    (
+        "heuristics/land_twin_otter.rs",
+        include_str!("../heuristics/land_twin_otter.rs"),
+    ),
 ];
 
 /// The whole point of #9343's "the estimator stays pure over a snapshot": a

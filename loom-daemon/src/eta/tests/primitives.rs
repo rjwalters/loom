@@ -220,7 +220,8 @@ fn registry_resolves_current_per_kind() {
             "land-v1",
             "land-v2",
             "land-v3",
-            "land-2026-10-04-amber-heron"
+            "land-2026-10-04-amber-heron",
+            "land-2026-10-04-twin-otter"
         ]
     );
     assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
@@ -241,6 +242,14 @@ fn registry_resolves_current_per_kind() {
             .id(),
         "land-2026-10-04-amber-heron"
     );
+    // `land-2026-10-04-twin-otter` (#10243) likewise: registered last, as a
+    // shadow, and refusing `no_model` in `builtin()`, which loads no fit.
+    assert_eq!(
+        registry
+            .current(Kind::Land, Some("land-2026-10-04-twin-otter"))
+            .id(),
+        "land-2026-10-04-twin-otter"
+    );
     assert_eq!(Registry::default_current(Kind::Land), "land-v1");
 }
 
@@ -255,7 +264,8 @@ fn for_kind_enumerates_every_registered_heuristic_of_a_kind() {
             "land-v1",
             "land-v2",
             "land-v3",
-            "land-2026-10-04-amber-heron"
+            "land-2026-10-04-amber-heron",
+            "land-2026-10-04-twin-otter"
         ]
     );
     assert_eq!(
