@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use loom_daemon::cmd_out::Query;
-use loom_daemon::eta::backtest::{self, BacktestReport, Bucket, Comparison, Filter};
+use loom_daemon::eta::backtest::{self, Filter};
 use loom_daemon::eta::config::HistoryScopeMode;
 use loom_daemon::eta::explanation::{Explanation, Features};
 use loom_daemon::eta::fleet;
@@ -420,7 +420,7 @@ impl EtaBacktestArgs {
             if self.json {
                 println!("{}", serde_json::to_string_pretty(&comparison)?);
             } else {
-                print!("{}", render_comparison(&comparison));
+                print!("{}", super::eta_backtest_render::render_comparison(&comparison));
             }
             return Ok(());
         }
@@ -429,7 +429,7 @@ impl EtaBacktestArgs {
         if self.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
-            print!("{}", render_report(&report));
+            print!("{}", super::eta_backtest_render::render_report(&report));
         }
         Ok(())
     }
@@ -1011,51 +1011,6 @@ impl EtaListArgs {
         }
         Ok(())
     }
-}
-
-fn render_bucket(name: &str, b: &Bucket) -> String {
-    format!(
-        "  {name:<28} n={:<5} scored={:<5} refused={:<5} pinball={:>10} coverage={:>7} bias={:>10}\n",
-        b.n,
-        b.scored,
-        b.refused,
-        b.mean_pinball_loss_sec
-            .map(|v| format!("{v:.1}"))
-            .unwrap_or_else(|| "-".to_string()),
-        b.coverage
-            .map(|v| format!("{:.1}%", v * 100.0))
-            .unwrap_or_else(|| "-".to_string()),
-        b.bias_sec
-            .map(|v| format!("{v:.1}"))
-            .unwrap_or_else(|| "-".to_string()),
-    )
-}
-
-fn render_report(r: &BacktestReport) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("ETA backtest: {} ({})\n", r.heuristic, r.kind));
-    out.push_str(&render_bucket("overall", &r.overall));
-    if !r.by_repo.is_empty() {
-        out.push_str("by repo:\n");
-        for (repo, b) in &r.by_repo {
-            out.push_str(&render_bucket(repo, b));
-        }
-    }
-    if !r.by_horizon.is_empty() {
-        out.push_str("by horizon:\n");
-        for (h, b) in &r.by_horizon {
-            out.push_str(&render_bucket(h, b));
-        }
-    }
-    out
-}
-
-fn render_comparison(c: &Comparison) -> String {
-    let mut out = String::new();
-    out.push_str(&render_report(&c.a));
-    out.push_str(&render_report(&c.b));
-    out.push_str(&format!("better: {}\n", c.better.as_deref().unwrap_or("tie / neither scored")));
-    out
 }
 
 #[cfg(test)]
