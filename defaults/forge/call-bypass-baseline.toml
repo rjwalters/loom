@@ -9,7 +9,7 @@
 # Eliminating these entries is the caller-migration issue's job, not this
 # ledger's — see `removal_epic` below and each entry's `removal_issue`.
 #
-# 73 file(s), 213 direct call site(s) at baseline.
+# 78 file(s), 238 direct call site(s) at baseline.
 
 removal_epic = 9769
 
@@ -134,12 +134,6 @@ owner = "role-scripts"
 removal_issue = 9799
 
 [[bypass]]
-path = "defaults/scripts/resolve-tier-model.sh"
-calls = 2
-owner = "role-scripts"
-removal_issue = 9799
-
-[[bypass]]
 path = "defaults/scripts/sweep-lease-fence.sh"
 calls = 1
 owner = "role-scripts"
@@ -218,6 +212,12 @@ owner = "daemon-cli"
 removal_issue = 9799
 
 [[bypass]]
+path = "loom-daemon/src/cli/merge_pr_consolidate.rs"
+calls = 11
+owner = "daemon-cli"
+removal_issue = 9799
+
+[[bypass]]
 path = "loom-daemon/src/cli/notify_cleared_blockers.rs"
 calls = 2
 owner = "daemon-cli"
@@ -233,6 +233,12 @@ removal_issue = 9799
 path = "loom-daemon/src/cli/pr_latency_render.rs"
 calls = 2
 owner = "daemon-cli"
+removal_issue = 9799
+
+[[bypass]]
+path = "loom-daemon/src/codex_sandbox_noop.rs"
+calls = 3
+owner = "daemon-other"
 removal_issue = 9799
 
 [[bypass]]
@@ -263,6 +269,12 @@ removal_issue = 9799
 path = "loom-daemon/src/dep_recheck/forge.rs"
 calls = 9
 owner = "daemon-other"
+removal_issue = 9799
+
+[[bypass]]
+path = "loom-daemon/src/fleet/add_worker/egress.rs"
+calls = 3
+owner = "daemon-fleet"
 removal_issue = 9799
 
 [[bypass]]
@@ -314,6 +326,12 @@ owner = "daemon-other"
 removal_issue = 9799
 
 [[bypass]]
+path = "loom-daemon/src/merge_pr/consolidate.rs"
+calls = 3
+owner = "daemon-landing"
+removal_issue = 9799
+
+[[bypass]]
 path = "loom-daemon/src/merge_pr/head_sync/fetch.rs"
 calls = 1
 owner = "daemon-landing"
@@ -326,6 +344,18 @@ owner = "daemon-landing"
 removal_issue = 9799
 
 [[bypass]]
+path = "loom-daemon/src/observability/session_output/attended_caller.rs"
+calls = 1
+owner = "daemon-other"
+removal_issue = 9799
+
+[[bypass]]
+path = "loom-daemon/src/operator_decision/cli.rs"
+calls = 3
+owner = "daemon-other"
+removal_issue = 9799
+
+[[bypass]]
 path = "loom-daemon/src/pipeline_snapshot.rs"
 calls = 1
 owner = "daemon-other"
@@ -335,6 +365,12 @@ removal_issue = 9799
 path = "loom-daemon/src/quarantine_reconciliation.rs"
 calls = 3
 owner = "daemon-sweep"
+removal_issue = 9799
+
+[[bypass]]
+path = "loom-daemon/src/role_runner/launch/sandbox_noop.rs"
+calls = 1
+owner = "daemon-other"
 removal_issue = 9799
 
 [[bypass]]
@@ -357,7 +393,7 @@ removal_issue = 9799
 
 [[bypass]]
 path = "loom-daemon/src/star_liveness/forge.rs"
-calls = 1
+calls = 4
 owner = "daemon-other"
 removal_issue = 9799
 
@@ -436,12 +472,6 @@ removal_issue = 9799
 [[bypass]]
 path = "scripts/uninstall-loom.sh"
 calls = 4
-owner = "repo-tooling"
-removal_issue = 9799
-
-[[bypass]]
-path = "scripts/worktree.sh"
-calls = 1
 owner = "repo-tooling"
 removal_issue = 9799
 
