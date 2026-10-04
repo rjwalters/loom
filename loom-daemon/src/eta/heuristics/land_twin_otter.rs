@@ -212,6 +212,7 @@ impl Answer<'_> {
             eta_p50_at: as_of + Duration::seconds(p50),
             samples_min: self.model.hazard.get(&self.stage).map_or(0, |h| h.rows),
             stage_marks: Vec::new(),
+            tail_extrapolated: false,
         });
         explanation.twin_otter = Some(TwinOtterRecord {
             fit_id: self.fit.id.clone(),

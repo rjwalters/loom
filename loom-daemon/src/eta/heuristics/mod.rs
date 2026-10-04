@@ -4,7 +4,8 @@
 //! read, where the path ends, (`land-v3`) how each stage's grid is
 //! calibrated, (`land-2026-10-04-amber-heron`) how the result's interval is
 //! recalibrated, and (`land-2026-10-04-fresh-tide`) how samples are weighted
-//! by recency.
+//! by recency; `land-v4` (#10210) is `land-v3` plus whether a stall's term
+//! is applied and an item beyond its history is answered rather than refused.
 //! `land-2026-10-04-twin-otter` (#10243) reads no history: it evaluates a
 //! fitted coefficient file handed to it when the registry was built.
 //! Their ids are immutable: a behaviour change is a new id.
@@ -17,6 +18,7 @@ mod land_twin_otter_b;
 mod land_v1;
 mod land_v2;
 mod land_v3;
+mod land_v4;
 mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
@@ -33,6 +35,7 @@ pub use land_v3::{
     complexity_scale, story_points, LandV3, COMPLEXITY_ELASTICITY, FRICTION_SEC_PER_RUNNING_SWEEP,
     INPUT_MISSING, LAND_V3, LOWER_STRETCH, REFERENCE_POINTS, REVIEW_FLOOR_SEC, UPPER_STRETCH,
 };
+pub use land_v4::{LandV4, LAND_V4};
 pub use start_v1::{StartV1, START_V1};
 
 use super::explanation::{
@@ -40,12 +43,14 @@ use super::explanation::{
     Distribution, EstimateResult, Explanation, Filters, HistoryRecord, HistoryWindow, PathRecord,
     StageAdjustment, StageEntry,
 };
+use super::explanation::{CONDITIONING_RESIDUAL_LIFE, CONDITIONING_TRUNCATE};
 use super::history::{window_from, Level, SampleSource, Selection, StageSamples};
 use super::recency::WeightedSelection;
 use super::simulate::{may_reject, reachable_path, run, spec_from_explanation};
+use super::stall::{self, StallCause};
 use super::{
-    estimate_id, grid, round3, seed_for, CurrentState, EstimateInput, Kind, NoEstimateReason,
-    Stage, DRAWS, EXPLANATION_SCHEMA, MAX_REWORK_ROUNDS, MIN_COND, MIN_SAMPLES,
+    estimate_id, grid, round3, seed_for, CurrentStage, CurrentState, EstimateInput, Kind,
+    NoEstimateReason, Stage, DRAWS, EXPLANATION_SCHEMA, MAX_REWORK_ROUNDS, MIN_COND, MIN_SAMPLES,
 };
 use chrono::Duration;
 use std::collections::BTreeMap;
@@ -85,6 +90,17 @@ pub(crate) struct PathRules {
     /// effective-N fallback ([`crate::eta::recency`]) and summarised by the
     /// weighted grid. `None` for every heuristic that weighs the window flat.
     pub half_life_sec: Option<i64>,
+    /// `true` (#10210): add the binding stall's term to the result
+    /// (`explanation.stalled.applied`), and estimate an operator-held PR from
+    /// the stage underneath its hold ([`EstimateInput::held`]) instead of
+    /// refusing it as `blocked`. `false`: the stall is recorded, never
+    /// applied — every heuristic before `land-v4`.
+    pub stall_term: bool,
+    /// `true` (#10210): an item older than its stage history is answered with
+    /// the residual-life tail (flagged `result.tail_extrapolated`) instead of
+    /// a `beyond_history` refusal. `false`: refuse, as every heuristic before
+    /// `land-v4` does.
+    pub residual_tail: bool,
 }
 
 /// `(stage, input, raw grid) → (grid, what was done)`. Must be pure.
@@ -99,12 +115,43 @@ fn round6(x: f64) -> f64 {
 
 fn refuse(mut explanation: Explanation, reason: NoEstimateReason) -> Explanation {
     explanation.no_estimate_reason = Some(reason);
+    // A refusal has no result for a stall term to be part of.
+    if let Some(stalled) = &mut explanation.stalled {
+        stalled.applied = false;
+    }
     explanation.result = None;
     explanation.contributions = None;
     explanation.combination = None;
     explanation.twin_otter = None;
     explanation.enforce_cap();
     explanation
+}
+
+/// The stage `rules` estimate `input` from, or why there is none.
+///
+/// A stall-aware heuristic (#10210) reads an operator-held PR's underlying
+/// stage ([`EstimateInput::held`]) through its `blocked` refusal, provided
+/// the hold is in fact one of the item's stall signals; the hold's own
+/// stall term then carries the wait. An approved held PR reaches it as
+/// `At(MergeHold)` (#10218) rather than a `blocked` refusal; a stall-aware
+/// heuristic that does not model the hold reads it the same way.
+fn current_of(rules: PathRules, input: &EstimateInput) -> Result<&CurrentStage, NoEstimateReason> {
+    let operator_held = rules.stall_term
+        && !rules.models_hold
+        && input
+            .stalls
+            .iter()
+            .any(|s| s.cause == StallCause::OperatorHold);
+    match (&input.current, &input.held) {
+        (CurrentState::At(current), Some(held))
+            if current.stage == Stage::MergeHold && operator_held =>
+        {
+            Ok(held)
+        }
+        (CurrentState::At(current), _) => Ok(current),
+        (CurrentState::Refused(NoEstimateReason::Blocked), Some(held)) if operator_held => Ok(held),
+        (CurrentState::Refused(reason), _) => Err(*reason),
+    }
 }
 
 /// The explanation of `heuristic`'s estimate of `input` before anything is
@@ -134,6 +181,7 @@ fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) -> Explanat
         features: Some(input.features.clone()),
         features_omitted,
         no_estimate_reason: None,
+        stalled: stall::binding(&input.stalls, as_of),
         truncated: Vec::new(),
         recalibration: None,
         twin_otter: None,
@@ -149,9 +197,9 @@ pub(crate) fn estimate_path(
     let as_of = input.as_of;
     let mut explanation = blank(rules.id, rules.kind, input);
 
-    let current = match &input.current {
-        CurrentState::Refused(reason) => return refuse(explanation, *reason),
-        CurrentState::At(current) => current,
+    let current = match current_of(rules, input) {
+        Ok(current) => current,
+        Err(reason) => return refuse(explanation, reason),
     };
     // #10218: checked before every other refusal and before any field is
     // written, so a heuristic that does not model the hold returns exactly
@@ -312,7 +360,7 @@ fn finish_estimate(
     include_merge: bool,
     p_by_attempt: Vec<f64>,
 ) -> Explanation {
-    let CurrentState::At(current) = &input.current else {
+    let Ok(current) = current_of(rules, input) else {
         unreachable!("refusals return before the path is built")
     };
     let start = current.stage;
@@ -327,6 +375,12 @@ fn finish_estimate(
         .map_or(current.rework_rounds, |c| c.rework_rounds);
     let rejectable = may_reject(&p_by_attempt, rework_rounds, MAX_REWORK_ROUNDS);
     let stop_at_dispatch = rules.kind == Kind::Start;
+    let mut tail_extrapolated = false;
+    // The stall term is applied before the explanation is simulated, so the
+    // simulation (and anyone recomputing it) reads it from the record.
+    if let Some(stalled) = &mut explanation.stalled {
+        stalled.applied = rules.stall_term;
+    }
 
     for stage in reachable_path(start, include_merge, rejectable, stop_at_dispatch) {
         let stage_samples = select_stage(history, rules, repo, stage, as_of);
@@ -374,13 +428,20 @@ fn finish_estimate(
             let n_above = sorted.iter().filter(|&&d| d > age).count()
                 + censored.iter().filter(|&&d| d > age).count();
             let f_age = round6(grid::cdf(&grid_sec, age));
-            let record = Conditioning {
+            let mut record = Conditioning {
                 age_sec: age,
                 f_age,
                 n_above,
-                method: "truncate_inverse_cdf".to_string(),
+                method: CONDITIONING_TRUNCATE.to_string(),
             };
-            if n_above < MIN_COND || f_age >= 1.0 {
+            let beyond = n_above < MIN_COND || f_age >= 1.0;
+            if beyond && rules.residual_tail {
+                // #10210: the item has outlived its history. Answer with the
+                // residual-life tail of its own age, flagged, rather than
+                // refusing exactly the slow tail accuracy most needs to see.
+                record.method = CONDITIONING_RESIDUAL_LIFE.to_string();
+                tail_extrapolated = true;
+            } else if beyond {
                 explanation.stages.push(stage_entry(
                     stage,
                     rules,
@@ -457,6 +518,7 @@ fn finish_estimate(
         eta_p50_at: as_of + Duration::seconds(p50),
         samples_min,
         stage_marks: simulation.stage_marks(as_of),
+        tail_extrapolated,
     });
     explanation.contributions = Some(simulation.contributions);
     explanation.enforce_cap();

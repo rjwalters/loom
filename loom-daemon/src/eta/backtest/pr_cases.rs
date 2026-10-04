@@ -406,6 +406,7 @@ pub fn pr_case_entries(
                 outcome: OutcomeKind::Landed,
                 actual_at: merged_at,
                 dispatch: None,
+                age_sec: 0,
             }),
             Err(reason) => out.refused.push(RefusedEntry { at: as_of, reason }),
         }

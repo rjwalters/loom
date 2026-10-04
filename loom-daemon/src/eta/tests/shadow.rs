@@ -8,7 +8,7 @@ use crate::eta::backtest::{BacktestReport, Bucket, Comparison, Paired};
 use crate::eta::config::{promote, resolve};
 use crate::eta::heuristics::{
     LandV1, LandV2, LAND_AMBER_HERON, LAND_FRESH_TIDE, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B, LAND_V1,
-    LAND_V2, LAND_V3,
+    LAND_V2, LAND_V3, LAND_V4,
 };
 use crate::eta::score::{score, EstimateSummary, OutcomeKind, Score};
 use crate::eta::shadow::{
@@ -35,6 +35,7 @@ fn summary(heuristic: &str, offset: i64, quartiles: (i64, i64, i64)) -> Estimate
         eta_p50_at: explanation.as_of + Duration::seconds(quartiles.1),
         samples_min: 9,
         stage_marks: Vec::new(),
+        tail_extrapolated: false,
     });
     EstimateSummary::of(&explanation)
 }
@@ -88,6 +89,7 @@ pub(super) fn comparison(current_mean: f64, candidate_mean: f64, scored: usize) 
         by_horizon: Default::default(),
         stability: Default::default(),
         convergence: Default::default(),
+        by_tail: Default::default(),
     };
     let better = if scored == 0 {
         None
@@ -195,6 +197,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
         refresh_secs: 300,
         host_id: Some("host-test"),
         repo_ids: &repo_ids,
+        stalls: &crate::eta::stall::StallSnapshot::default(),
     };
     let mut tracker = Tracker::new(provenance());
     tracker.on_dispatch(REPO, 9289, "sweep-issue-9289-1", as_of());
@@ -214,6 +217,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
             LAND_V3,
             LAND_AMBER_HERON,
             LAND_FRESH_TIDE,
+            LAND_V4,
             LAND_TWIN_OTTER,
             LAND_TWIN_OTTER_B
         ]
@@ -233,7 +237,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
         .filter(|e| e.explanation.kind == Kind::Land)
         .map(|e| e.primary)
         .collect();
-    assert_eq!(land_order, vec![true, false, false, false, false, false, false]);
+    assert_eq!(land_order, vec![true, false, false, false, false, false, false, false]);
 
     // The primary's own number is byte-identical to what a registry with no
     // candidate at all would produce: shadow mode is additive, not a change.
@@ -259,6 +263,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
             LAND_V3,
             LAND_AMBER_HERON,
             LAND_FRESH_TIDE,
+            LAND_V4,
             LAND_TWIN_OTTER,
             LAND_TWIN_OTTER_B
         ]

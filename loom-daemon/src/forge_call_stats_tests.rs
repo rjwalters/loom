@@ -369,3 +369,29 @@ fn quota_rate_limit_reading() {
         Some("gitea.example.com")
     );
 }
+
+/// #10210: only a pool read at zero whose reset is still ahead (or, with no
+/// reset, whose reading is fresh) is an exhausted pool.
+#[test]
+fn exhausted_in_keeps_only_live_zero_readings() {
+    let now = 1_000_000;
+    let reading = |remaining, reset_epoch, observed_at| Reading {
+        remaining,
+        used: None,
+        reset_epoch,
+        observed_at,
+    };
+    let mut latest = BTreeMap::new();
+    latest.insert(Pool::Core, reading(0, Some(now + 600), now - 10));
+    latest.insert(Pool::Graphql, reading(0, Some(now - 1), now - 10));
+    latest.insert(Pool::Search, reading(5, Some(now + 600), now - 10));
+    latest.insert(Pool::Other, reading(0, None, now - 10));
+    let exhausted = exhausted_in(&latest, now);
+    assert_eq!(
+        exhausted,
+        vec![(Pool::Core, epoch(now + 600)), (Pool::Other, None)],
+        "graphql already reset; search has budget"
+    );
+    latest.insert(Pool::Other, reading(0, None, now - WINDOW_SECS - 1));
+    assert_eq!(exhausted_in(&latest, now).len(), 1, "a stale unreset reading is no stall");
+}

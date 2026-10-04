@@ -350,6 +350,7 @@ fn estimate(tracker: &mut Tracker, history: &StageSamples) -> Vec<crate::eta::tr
         refresh_secs: 300,
         host_id: Some("host-test"),
         repo_ids: &repo_ids,
+        stalls: &crate::eta::stall::StallSnapshot::default(),
     };
     tracker.estimate(None, &ctx, as_of())
 }

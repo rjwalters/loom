@@ -234,6 +234,8 @@ mod tests {
                 complete: true,
             },
             dispatch: None,
+            stalls: Vec::new(),
+            held: None,
         };
         EtaEstimateRecord {
             trigger: Trigger::Transition,
@@ -304,6 +306,7 @@ mod tests {
             eta_p50_at: answered.explanation.as_of + chrono::Duration::seconds(120),
             samples_min: 9,
             stage_marks: Vec::new(),
+            tail_extrapolated: false,
         });
         let summary = EstimateSummary::of(&estimate.explanation);
         let mut summary_with_numbers = summary.clone();

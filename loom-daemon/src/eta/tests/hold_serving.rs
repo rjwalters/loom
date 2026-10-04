@@ -7,13 +7,14 @@ use super::land_twin_otter::fixture_fit;
 use super::{as_of, history_a, provenance};
 use crate::eta::emit::{Trigger, HOURLY_CAP};
 use crate::eta::explanation::Explanation;
-use crate::eta::heuristics::{LandTwinOtter, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B};
+use crate::eta::heuristics::{LandTwinOtter, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B, LAND_V4};
 use crate::eta::queue_features::{reason, EventLog};
 use crate::eta::simulate::run_explanation;
+use crate::eta::stall::StallCause;
 use crate::eta::tracker::{
     Emission, EstimateContext, ItemKey, ListedPr, PrState, PrView, Tracker, NOT_LISTED_YET,
 };
-use crate::eta::{EstimateInput, Heuristic, Kind, NoEstimateReason, Registry, StageSamples};
+use crate::eta::{EstimateInput, Heuristic, Kind, NoEstimateReason, Registry, Stage, StageSamples};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,6 +24,11 @@ const RR: &str = "loom:review-requested";
 const PR: &str = "loom:pr";
 const OP: &str = "loom:operator";
 const HOLD_AWARE: [&str; 2] = [LAND_TWIN_OTTER, LAND_TWIN_OTTER_B];
+/// Does not model the hold, but answers an operator-held PR from the stage
+/// under it plus the `operator_hold` stall term (#10210), on the described
+/// view: its series keeps the item's `blocked` signature, so it emits at the
+/// hold's transitions and does not refresh while held.
+const STALL_AWARE: [&str; 1] = [LAND_V4];
 
 fn t(secs: i64) -> DateTime<Utc> {
     as_of() + Duration::seconds(secs)
@@ -53,6 +59,7 @@ fn context<'a>(
         refresh_secs,
         host_id: Some("host-test"),
         repo_ids,
+        stalls: &super::NO_STALLS,
     }
 }
 
@@ -212,7 +219,7 @@ fn each_heuristic_reads_its_own_view_of_a_held_pr() {
         .iter()
         .filter(|e| e.explanation.kind == Kind::Land)
         .collect();
-    assert_eq!(land.len(), 7);
+    assert_eq!(land.len(), 8);
     for emission in land {
         let id = emission.explanation.heuristic.as_str();
         let heuristic = registry.get(id).unwrap();
@@ -223,6 +230,13 @@ fn each_heuristic_reads_its_own_view_of_a_held_pr() {
         };
         assert_eq!(heuristic.models_hold(), HOLD_AWARE.contains(&id), "{id}");
         assert_eq!(json(&emission.explanation), json(&heuristic.estimate(view, &history)), "{id}");
+        if STALL_AWARE.contains(&id) {
+            let e = &emission.explanation;
+            assert!(e.result.is_some(), "{id}: answers the hold");
+            assert_eq!(e.stalled.as_ref().map(|s| s.cause), Some(StallCause::OperatorHold));
+            assert_eq!(e.current_stage.as_ref().map(|c| c.stage), Some(Stage::MergeWait));
+            continue;
+        }
         if !heuristic.models_hold() {
             assert_eq!(emission.explanation.no_estimate_reason, Some(NoEstimateReason::Blocked));
             continue;
@@ -266,15 +280,15 @@ fn a_held_twin_otter_series_refreshes_while_the_path_engines_stay_silent() {
     let mut h = Harness::new();
     h.list(&[(501, &[RR], -600)], 0);
     h.list(&[(501, &[PR], 250)], 300);
-    assert_eq!(h.land(&registry, 300, 300).len(), 7);
+    assert_eq!(h.land(&registry, 300, 300).len(), 8);
 
     h.list(&[(501, &[PR, OP], 550)], 600);
     let entry = h.land(&registry, 300, 600);
-    assert_eq!(entry.len(), 7);
+    assert_eq!(entry.len(), 8);
     for e in &entry {
         let id = e.explanation.heuristic.as_str();
         assert_eq!(e.trigger, Trigger::Transition, "{id}");
-        if HOLD_AWARE.contains(&id) {
+        if HOLD_AWARE.contains(&id) || STALL_AWARE.contains(&id) {
             assert!(e.explanation.result.is_some(), "{id}");
         } else {
             assert_eq!(e.explanation.no_estimate_reason, Some(NoEstimateReason::Blocked), "{id}");
@@ -292,7 +306,7 @@ fn a_held_twin_otter_series_refreshes_while_the_path_engines_stay_silent() {
     // Released: every series transitions, the path engines answer again.
     h.list(&[(501, &[PR], 1450)], 1500);
     let released = h.land(&registry, 300, 1500);
-    assert_eq!(released.len(), 7);
+    assert_eq!(released.len(), 8);
     assert!(released.iter().all(|e| e.trigger == Trigger::Transition));
     assert!(released
         .iter()
@@ -300,7 +314,7 @@ fn a_held_twin_otter_series_refreshes_while_the_path_engines_stay_silent() {
 
     // Held again, then merged: no further estimate.
     h.list(&[(501, &[PR, OP], 1750)], 1800);
-    assert_eq!(h.land(&registry, 300, 1800).len(), 7);
+    assert_eq!(h.land(&registry, 300, 1800).len(), 8);
     h.list(&[], 2000);
     h.tracker
         .on_pr_resolved(&key(501), PrState::Merged(t(1950)), t(2000));

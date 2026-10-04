@@ -66,6 +66,8 @@ fn summary(
             .is_none()
             .then_some(NoEstimateReason::InsufficientSamples),
         stage_quartiles: Vec::new(),
+        tail_extrapolated: false,
+        stall_cause: None,
     }
 }
 
@@ -351,6 +353,7 @@ fn rows_are_built_from_the_trackers_own_pending_estimates() {
         refresh_secs: 300,
         host_id: Some("host-test"),
         repo_ids: &repo_ids,
+        stalls: &crate::eta::stall::StallSnapshot::default(),
     };
     tracker.on_dispatch(REPO, 9289, "sweep-issue-9289-1", at);
     let emissions = tracker.estimate(None, &ctx, at);

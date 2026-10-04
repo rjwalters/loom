@@ -248,6 +248,7 @@ fn served(
         refresh_secs: 300,
         host_id: Some("host-test"),
         repo_ids: &repo_ids,
+        stalls: &super::NO_STALLS,
     };
     let emissions = tracker.estimate(Some(&[spec.key()]), &ctx, h(AT));
     let twin = emissions

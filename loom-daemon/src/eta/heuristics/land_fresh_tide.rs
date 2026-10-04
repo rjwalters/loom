@@ -96,6 +96,8 @@ impl Heuristic for LandFreshTide {
                 adjust: None,
                 models_hold: false,
                 half_life_sec: Some(self.half_life_sec),
+                stall_term: false,
+                residual_tail: false,
             },
             input,
             history,

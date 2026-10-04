@@ -185,6 +185,7 @@ fn case_on(day: i64, offset_sec: i64) -> ReplayCase {
         outcome: OutcomeKind::Landed,
         actual_at: t + Duration::seconds(900),
         dispatch: None,
+        age_sec: 0,
     }
 }
 

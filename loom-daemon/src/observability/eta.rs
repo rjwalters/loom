@@ -56,6 +56,7 @@ use crate::eta::queue_features::EventLog;
 use crate::eta::recalibrate::CalibrationObservation;
 use crate::eta::score::EstimateSummary;
 use crate::eta::shadow::{self, ShadowLedger};
+use crate::eta::stall::{self, StallSnapshot};
 use crate::eta::tracker::{
     events_from_journal, DispatchMeta, Effects, Emission, EstimateContext, IssueRow, IssueState,
     ItemKey, ListedPr, PrState, PrView, ReadyPlan, ReadyRow, RegistryMeta, Resolved, Tracker,
@@ -118,6 +119,11 @@ struct State {
     repo_ids: BTreeMap<String, u64>,
     workspace_root: PathBuf,
     host_id: String,
+    /// The token-pool brake and lockout halves of the stall snapshot
+    /// (#10210), refreshed every pass; the forge-quota half is re-read at
+    /// every estimate ([`stalls_now`]).
+    pool_exhausted: bool,
+    locked_repos: BTreeSet<String>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -289,6 +295,7 @@ fn estimate_locked(
     keys: Option<&[ItemKey]>,
     now: DateTime<Utc>,
 ) -> Vec<Emission> {
+    let stalls = stalls_now(state, now);
     let ctx = EstimateContext {
         registry: &state.registry,
         current_start: state.config.current_start.as_deref(),
@@ -298,6 +305,7 @@ fn estimate_locked(
         refresh_secs: state.config.refresh_secs,
         host_id: Some(state.host_id.as_str()),
         repo_ids: &state.repo_ids,
+        stalls: &stalls,
     };
     let emissions = state.tracker.estimate(keys, &ctx, now);
     // A full pass also tallied every live series' answer state (#10233):
@@ -314,6 +322,42 @@ fn estimate_locked(
         }
     }
     emissions
+}
+
+/// The stall snapshot an estimate at `now` reads (#10210): the rate-limit
+/// breaker and the forge-call ledger's last zero readings (in-process, read
+/// fresh), plus the pass's token-pool brake and lockout readings. Read-only:
+/// no stall costs a forge call.
+fn stalls_now(state: &State, now: DateTime<Utc>) -> StallSnapshot {
+    let breaker = crate::rate_limit_breaker::global_snapshot();
+    let pools = crate::forge_call_stats::exhausted_pools(now);
+    let pools: Vec<(&str, Option<DateTime<Utc>>)> = pools
+        .iter()
+        .map(|(pool, reset)| (pool.as_str(), *reset))
+        .collect();
+    StallSnapshot {
+        host: stall::host_signals(breaker.as_ref(), &pools, state.pool_exhausted, now),
+        locked_repos: state.locked_repos.clone(),
+    }
+}
+
+/// Whether any provisioned workspace's empty-pool brake is tripped — the
+/// sweep registry's own reading, never a token probe.
+fn pool_brake_tripped(
+    workspace_pool: &WorkspacePool,
+    roots: &[PathBuf],
+    now: DateTime<Utc>,
+) -> bool {
+    roots.iter().any(|root| {
+        workspace_pool
+            .provisioned_registry_for(root)
+            .is_some_and(|registry| {
+                registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .empty_pool_breaker_tripped(now)
+            })
+    })
 }
 
 fn sink() -> Option<&'static dyn QueueSink> {
@@ -473,6 +517,8 @@ pub fn spawn_task(
         repo_ids: BTreeMap::new(),
         workspace_root: workspace_root.clone(),
         host_id,
+        pool_exhausted: false,
+        locked_repos: BTreeSet::new(),
     });
     let default_root = workspace_root.to_string_lossy().to_string();
     let pool = workspace_pool;
@@ -901,6 +947,7 @@ pub(super) async fn record(
         .collect();
     let book = super::eta_friction::refresh(book, friction_repos, tracked, slug_cache).await;
     let now = Utc::now();
+    let pool_exhausted = pool_brake_tripped(workspace_pool, &roots, now);
     let mut effects = Vec::new();
     let mut checks = Vec::new();
     let mut deferred = 0_usize;
@@ -922,6 +969,11 @@ pub(super) async fn record(
         );
         state.repo_ids.extend(repo_ids);
         state.tracker.friction = book;
+        state.pool_exhausted = pool_exhausted;
+        state.locked_repos = super::ops::lockout::locked_slugs()
+            .into_iter()
+            .map(|slug| slug.to_ascii_lowercase())
+            .collect();
         // Before the listings, so a departed ready item's `issues/{n}` read
         // is offered in this same pass.
         if let Some((rows, plan)) = &ready {

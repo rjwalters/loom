@@ -56,6 +56,7 @@ fn estimate(
         eta_p50_at: as_of + Duration::seconds(p50),
         samples_min: 9,
         stage_marks: Vec::new(),
+        tail_extrapolated: false,
     });
     e
 }

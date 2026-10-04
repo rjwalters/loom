@@ -134,7 +134,7 @@ fn every_shipped_heuristic_refuses_a_held_pr_exactly_as_before() {
         .into_iter()
         .partition(|id| registry.get(id).unwrap().models_hold());
     assert_eq!(models_hold, vec![LAND_TWIN_OTTER, LAND_TWIN_OTTER_B]);
-    assert_eq!(path_engine.len(), 7, "{path_engine:?}");
+    assert_eq!(path_engine.len(), 8, "{path_engine:?}");
     for id in path_engine {
         let heuristic = registry.get(id).unwrap();
         let explanation = heuristic.estimate(&held, &history_a());
@@ -210,6 +210,8 @@ fn hold_rules() -> PathRules {
         adjust: None,
         models_hold: true,
         half_life_sec: None,
+        stall_term: false,
+        residual_tail: false,
     }
 }
 
@@ -274,6 +276,8 @@ fn a_merge_hold_path_spec_walks_hold_then_merge_wait() {
         cap: 2,
         draws: DRAWS,
         seed: 7,
+        residual_life: false,
+        stall_offset_sec: 0,
     };
     let simulation = run(&spec).unwrap();
     assert_eq!(simulation.reached[Stage::MergeHold.index()], 1.0);

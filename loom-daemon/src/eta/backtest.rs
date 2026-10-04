@@ -95,6 +95,11 @@ pub struct ReplayCase {
     /// A `ready_wait` case only (#9326): the dispatch-plan inputs the
     /// tracker read at `as_of`, replayed verbatim.
     pub dispatch: Option<DispatchInput>,
+    /// Seconds already spent in `stage` at `as_of` (#10210). Every case
+    /// derived from a record replays from the stage's entry (`0`); a case
+    /// replayed mid-stage — the only kind that can outlive its history —
+    /// sets it.
+    pub age_sec: i64,
 }
 
 /// Every finish/land replay case one `sweep.outcome` record's own phase
@@ -155,6 +160,7 @@ pub fn cases_from_record(
             outcome: OutcomeKind::Finished,
             actual_at: observed_at,
             dispatch: None,
+            age_sec: 0,
         });
         if landed {
             cases.push(ReplayCase {
@@ -166,6 +172,7 @@ pub fn cases_from_record(
                 outcome: OutcomeKind::Landed,
                 actual_at: observed_at,
                 dispatch: None,
+                age_sec: 0,
             });
         }
         if stage == Stage::Doctor {
@@ -233,6 +240,7 @@ pub fn cases_from_journal(entries: &[JournalEntry]) -> Vec<ReplayCase> {
                 outcome: OutcomeKind::Started,
                 actual_at,
                 dispatch: Some(dispatch),
+                age_sec: 0,
             });
         }
     }
@@ -384,7 +392,19 @@ pub struct BacktestReport {
     /// not a gate.
     #[serde(default)]
     pub convergence: BTreeMap<String, Convergence>,
+    /// Ordinary estimates (`normal`) apart from residual-life tail guesses
+    /// (`tail_extrapolated`, #10210), so a tail guess never hides inside the
+    /// ordinary accuracy. Present only when some case was tail-extrapolated;
+    /// `overall` still counts every case.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_tail: BTreeMap<String, Bucket>,
 }
+
+/// `by_tail` key for an ordinary estimate (or a refusal).
+pub const TAIL_NONE: &str = "normal";
+
+/// `by_tail` key for a residual-life tail estimate (#10210).
+pub const TAIL_EXTRAPOLATED: &str = "tail_extrapolated";
 
 /// Cases [`run`] and [`compare`] accept in addition to `heuristic.kind()`:
 /// narrows the replay set the same way `eta backtest`'s own flags do.
@@ -412,8 +432,8 @@ fn case_input(case: &ReplayCase, loom: &Provenance) -> EstimateInput {
         as_of: case.as_of,
         current: CurrentState::At(CurrentStage {
             stage: case.stage,
-            entered_at: Some(case.as_of),
-            age_sec: 0,
+            entered_at: Some(case.as_of - Duration::seconds(case.age_sec.max(0))),
+            age_sec: case.age_sec.max(0),
             age_source: AgeSource::TrackerObserved,
             rework_rounds: case.rework_rounds,
             episode_entered_at: None,
@@ -422,6 +442,9 @@ fn case_input(case: &ReplayCase, loom: &Provenance) -> EstimateInput {
         features_omitted: Vec::new(),
         provenance: loom.clone(),
         dispatch: case.dispatch.clone(),
+        // No point-in-time stall state is reconstructed for a replay.
+        stalls: Vec::new(),
+        held: None,
     }
 }
 
@@ -478,7 +501,19 @@ fn report_of(heuristic: &dyn Heuristic, replayed: &[Replayed]) -> BacktestReport
 
     let mut by_repo_scores: BTreeMap<String, Vec<&Score>> = BTreeMap::new();
     let mut by_horizon_scores: BTreeMap<String, Vec<&Score>> = BTreeMap::new();
-    for Replayed { case, score: s, .. } in replayed {
+    let mut by_tail_scores: BTreeMap<String, Vec<&Score>> = BTreeMap::new();
+    for Replayed {
+        case,
+        score: s,
+        summary,
+    } in replayed
+    {
+        let key = if summary.tail_extrapolated {
+            TAIL_EXTRAPOLATED
+        } else {
+            TAIL_NONE
+        };
+        by_tail_scores.entry(key.to_string()).or_default().push(s);
         by_repo_scores
             .entry(case.subject.repo.clone())
             .or_default()
@@ -497,6 +532,16 @@ fn report_of(heuristic: &dyn Heuristic, replayed: &[Replayed]) -> BacktestReport
         .into_iter()
         .map(|(k, v)| (k, bucket_of(&v)))
         .collect();
+    // Only a report that has a tail-extrapolated case carries the split, so
+    // every report without one (every pre-#10210 heuristic's) is unchanged.
+    let by_tail = if by_tail_scores.contains_key(TAIL_EXTRAPOLATED) {
+        by_tail_scores
+            .into_iter()
+            .map(|(k, v)| (k, bucket_of(&v)))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
 
     BacktestReport {
         heuristic: heuristic.id().to_string(),
@@ -506,6 +551,7 @@ fn report_of(heuristic: &dyn Heuristic, replayed: &[Replayed]) -> BacktestReport
         by_horizon,
         stability: paired::stability_of(replayed),
         convergence: paired::convergence_of(replayed),
+        by_tail,
     }
 }
 
