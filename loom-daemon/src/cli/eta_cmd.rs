@@ -305,8 +305,12 @@ impl EtaBackfillArgs {
             println!("{}", serde_json::to_string_pretty(&entries)?);
         } else if !entries.is_empty() {
             let path = journal::journal_path(&root);
-            journal::append(&path, &entries)?;
-            println!("[eta backfill] appended to {}", path.display());
+            let written = journal::append_dedup(&path, &entries)?;
+            println!(
+                "[eta backfill] appended {written} new row(s) to {} ({} already journaled)",
+                path.display(),
+                entries.len() - written
+            );
         }
 
         if histories.is_empty() && list_error.is_some() {
