@@ -17,10 +17,15 @@
 //! argument, or the word its `eval` unquotes. A command that merely appears
 //! inside a longer script does not count.
 //!
-//! When the ancestors cannot be read (an unsupported platform, or a process
-//! that has gone), no transcript is bound and nothing is published. The
-//! command text read here is used only for this comparison. It is never
-//! placed on a record.
+//! **It fails closed.** An argv that cannot be read stops the walk: an
+//! unsupported platform, or a process that has exited (a zombie's
+//! `/proc/<pid>/cmdline` is empty, and `KERN_PROCARGS2` refuses one). So does
+//! an empty argv. Nothing is ever inferred from what is missing. A missing
+//! script can only mean "no match", and no match publishes nothing. A
+//! process caught between `fork` and `exec` shows its parent's argv, which is
+//! a copy of this same ancestor chain. So it too can only match the caller's
+//! own command, or nothing. The command text read here is used only for this
+//! comparison. It is never placed on a record.
 
 /// How far up the process tree to look. Claude Code's shell is normally two
 /// or three levels above `lease ensure` (`zsh -c` → `bash worktree.sh` →
@@ -56,7 +61,15 @@ impl Caller {
     /// Why the ancestors could not be read. The caller then publishes
     /// nothing.
     pub fn from_process() -> Result<Self, String> {
-        let argvs = ancestor_argvs();
+        #[cfg(unix)]
+        let argvs = ancestor_argvs(std::os::unix::process::parent_id(), parent_of, argv_of);
+        #[cfg(not(unix))]
+        let argvs: Vec<Vec<String>> = Vec::new();
+        Self::from_ancestors(&argvs)
+    }
+
+    /// [`Self::from_argvs`], refusing when no ancestor could be read at all.
+    fn from_ancestors(argvs: &[Vec<String>]) -> Result<Self, String> {
         if argvs.is_empty() {
             return Err(
                 "this process's parent shells could not be read on this host, so the calling \
@@ -64,7 +77,7 @@ impl Caller {
                     .to_string(),
             );
         }
-        Ok(Self::from_argvs(&argvs))
+        Ok(Self::from_argvs(argvs))
     }
 
     /// Whether `command`, a pending `Bash` call's command text, is exactly
@@ -163,25 +176,28 @@ fn shell_word(text: &str) -> Option<String> {
     any.then_some(out)
 }
 
-/// The argv of each ancestor of this process, nearest first, stopping at the
-/// first one that cannot be read.
-fn ancestor_argvs() -> Vec<Vec<String>> {
+/// The argv of each process from `start` upward, nearest first. The walk
+/// stops at the first argv that cannot be read or is empty, and never skips
+/// past one: an unknown link in the chain ends what counts as an ancestor.
+/// The readers are injected so the fail-closed cases are testable.
+fn ancestor_argvs(
+    start: u32,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    argv_of: impl Fn(u32) -> Option<Vec<String>>,
+) -> Vec<Vec<String>> {
     let mut out = Vec::new();
-    #[cfg(unix)]
-    {
-        let mut pid = std::os::unix::process::parent_id();
-        for _ in 0..MAX_DEPTH {
-            if pid <= 1 {
-                break;
-            }
-            let Some(argv) = argv_of(pid) else {
-                break;
-            };
-            out.push(argv);
-            match parent_of(pid) {
-                Some(parent) if parent != pid => pid = parent,
-                _ => break,
-            }
+    let mut pid = start;
+    for _ in 0..MAX_DEPTH {
+        if pid <= 1 {
+            break;
+        }
+        let Some(argv) = argv_of(pid).filter(|argv| !argv.is_empty()) else {
+            break;
+        };
+        out.push(argv);
+        match parent_of(pid) {
+            Some(parent) if parent != pid => pid = parent,
+            _ => break,
         }
     }
     out
@@ -197,8 +213,15 @@ fn parent_of(pid: u32) -> Option<u32> {
 
 #[cfg(target_os = "linux")]
 fn argv_of(pid: u32) -> Option<Vec<String>> {
-    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let raw = raw.strip_suffix(&[0]).unwrap_or(&raw);
+    parse_cmdline(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)
+}
+
+/// `/proc/<pid>/cmdline`: NUL-separated arguments with a trailing NUL. It is
+/// empty for a process that has exited (a zombie) or a kernel thread. That is
+/// `None`, never an empty argv that could be mistaken for a readable one.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cmdline(raw: &[u8]) -> Option<Vec<String>> {
+    let raw = raw.strip_suffix(&[0]).unwrap_or(raw);
     if raw.is_empty() {
         return None;
     }
@@ -370,28 +393,133 @@ mod tests {
 
     /// The platform readers against a real process tree: a shell that
     /// `eval`s a command is this test's child, and its argv names it.
+    ///
+    /// No timing is involved. The eval'd command prints a line and then
+    /// blocks in the `read` builtin: no fork and no exec, so the shell stays
+    /// alive with the argv it was spawned with until its stdin closes. The
+    /// line can only appear once the shell has parsed and run the command, so
+    /// reading it is the readiness signal. (The previous version eval'd
+    /// `sleep 30; echo it's`, which is not valid shell. dash rejects the whole
+    /// line before running `sleep`, so the child exited at once, and the test
+    /// passed only when it read the argv in the first few milliseconds.)
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_real_child_shell_is_read_and_bound() {
+        use std::io::BufRead as _;
+        let command = r#"echo "it's ready"; read -r line"#;
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg("eval 'sleep 30; echo it'\"'\"'s'")
+            .arg(r#"eval 'echo "it'"'"'s ready"; read -r line'"#)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let pid = child.id();
-        // Until it has exec'd, a forked child still shows this test's argv.
-        let mut caller = Caller::default();
-        for _ in 0..100 {
-            caller = Caller::from_argvs(&[argv_of(pid).unwrap_or_default()]);
-            if caller.runs("sleep 30; echo it's") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        // Read while the shell is provably alive and blocked in `read`.
+        let argv = argv_of(pid);
         let parent = parent_of(pid);
-        let _ = child.kill();
+        drop(child.stdin.take());
         let _ = child.wait();
-        assert!(caller.runs("sleep 30; echo it's"), "{caller:?}");
+        assert_eq!(ready, "it's ready\n", "the shell did not run the eval'd command");
+        let caller = Caller::from_argvs(&[argv.expect("a live shell's argv is readable")]);
+        assert!(caller.runs(command), "{caller:?}");
         assert_eq!(parent, Some(std::process::id()));
+    }
+
+    /// The case CI hit: a child that has exited but is not yet reaped (a
+    /// zombie). Its argv reads as `None` on both platforms, so it can never
+    /// bind. `waitid(WNOWAIT)` waits for the exit without reaping, so the
+    /// zombie state is reached exactly, not by sleeping.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_exited_shells_argv_is_unreadable_and_binds_nothing() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("eval 'exit 0'")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // SAFETY: `info` is a writable `siginfo_t`; `WNOWAIT` leaves the child
+        // unreaped, so `pid` stays this exited child until `wait` below.
+        let rc = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT)
+        };
+        assert_eq!(rc, 0);
+        let argv = argv_of(pid);
+        let _ = child.wait();
+        assert_eq!(argv, None, "an exited process has no readable argv");
+        // So the walk stops there, and the start publishes nothing.
+        let argvs = ancestor_argvs(pid, |_| Some(1), |_| argv.clone());
+        assert!(Caller::from_ancestors(&argvs).is_err());
+    }
+
+    #[test]
+    fn an_empty_cmdline_is_unreadable_not_an_empty_argv() {
+        assert_eq!(parse_cmdline(b""), None);
+        assert_eq!(parse_cmdline(b"\0"), None);
+        assert_eq!(
+            parse_cmdline(b"/bin/sh\0-c\0eval 'x'\0"),
+            Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "eval 'x'".to_string()
+            ])
+        );
+    }
+
+    /// The walk never skips an unreadable link to reach a matching shell
+    /// beyond it, and an empty argv or script never matches anything.
+    #[test]
+    fn an_unreadable_or_empty_ancestor_fails_closed() {
+        let shell = |command: &str| {
+            vec![
+                "/bin/zsh".to_string(),
+                "-c".to_string(),
+                format!("eval '{command}'"),
+            ]
+        };
+        let tree = |unreadable: u32| {
+            move |pid: u32| match pid {
+                _ if pid == unreadable => None,
+                10 => Some(vec!["loom-daemon".to_string(), "lease".to_string()]),
+                11 => Some(Vec::new()),
+                12 => Some(shell("worktree.sh 42")),
+                _ => None,
+            }
+        };
+        let parent = |pid: u32| Some(pid + 1);
+        // The first ancestor is gone: nothing is read, and the start refuses.
+        assert!(Caller::from_ancestors(&ancestor_argvs(10, parent, tree(10))).is_err());
+        // An empty argv (11) ends the walk before the matching shell (12).
+        let argvs = ancestor_argvs(10, parent, tree(0));
+        assert_eq!(argvs.len(), 1);
+        assert!(!Caller::from_ancestors(&argvs)
+            .unwrap()
+            .runs("worktree.sh 42"));
+        // With every link readable, the same shell is found.
+        let argvs = ancestor_argvs(12, parent, tree(0));
+        assert!(Caller::from_ancestors(&argvs)
+            .unwrap()
+            .runs("worktree.sh 42"));
+        // Empty argvs, a `-c` with no script, and an empty script bind nothing.
+        let caller = Caller::from_argvs(&[
+            Vec::new(),
+            vec!["sh".to_string(), "-c".to_string()],
+            vec!["sh".to_string(), "-c".to_string(), String::new()],
+        ]);
+        assert_eq!(caller, Caller::default());
+        assert!(!caller.runs("") && !caller.runs("sh") && !caller.runs("-c"));
+        // An empty eval'd word is dropped; only the whole script remains.
+        let caller = Caller::from_argvs(&[vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "eval ''".to_string(),
+        ]]);
+        assert!(!caller.runs("") && caller.runs("eval ''"));
     }
 }
