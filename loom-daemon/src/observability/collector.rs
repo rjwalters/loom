@@ -994,6 +994,10 @@ async fn sample_snapshots(
     // here (the watch owns the bounded snapshot), so a wedged Docker cannot
     // stall this pass; the WARN lives in the watch and runs without telemetry.
     super::ops::codex_session::record();
+    // In-flight items + open-PR census over OTLP (Issue #10196): a reader of
+    // the tracker state `eta::record` just refreshed. Hourly anchor, deltas
+    // only on change; no forge read of its own.
+    super::fleet_state::record(workspace_pool).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant

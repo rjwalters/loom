@@ -1,8 +1,8 @@
 # Telemetry Replay Contract
 
-Status: contract and emit-side facts only (Issue #10196, slice 1). The
-`fleet.state` kind, `loom-daemon telemetry replay --as-of <t>` and `--check`
-are later slices and do not exist yet.
+Status: contract, emit-side facts (Issue #10196, slice 1) and the
+`fleet.state` record (slice 2). `loom-daemon telemetry replay --as-of <t>` and
+`--check` are later slices and do not exist yet.
 
 The question this contract answers: **what did the fleet look like at instant
 `t`, as a daemon running at `t` could have known it?** ETA backtesting
@@ -83,8 +83,47 @@ as "nothing happened". `host.health` is exported as gauges, so the coverage
 read path for it is the native-HTTPS side until a log form lands in a later
 slice.
 
+## Fleet state (`fleet.state`)
+
+Each host with ETA enabled and an OTLP exporter sends `fleet.state` log
+records on its 5-minute snapshot pass. The field reference is in
+[`telemetry-schema.md`](telemetry-schema.md#fleetstate). Per in-flight
+`(repo, issue)` it carries stage, entered-at, PR, host and slot, and per repo
+the open-PR census. The census counts open PRs under a Loom review label.
+
+- **Anchor** (`loom.fleet.anchor = true`): the host's full state. Sent on the
+  first pass of every daemon process and at least every 3600 s after that.
+- **Delta** (`loom.fleet.anchor = false`): sent between anchors only when
+  something changed. It holds the added or changed rows, the issues that left
+  (`removed`), and the full census of each repo it names. `anchor_as_of` names
+  the anchor the delta belongs to, and `prev_as_of` names the record it applies
+  on top of.
+
+To reconstruct one host's state at `t`:
+
+1. Keep only that host's `fleet.state` records knowable before `t`, deduped on
+   `loom.record_id`.
+2. Take the newest anchor among them, A. Because anchors are hourly, A is at
+   most about 65 minutes before `t` on a healthy host. With no anchor in that
+   window, the host's state at `t` is **unknown**, not empty.
+3. Apply, in `as_of` order, every delta whose `anchor_as_of` equals A's
+   `as_of`. For each repo entry, drop the `removed` issues, upsert the `rows`
+   by issue, and replace the census. A repo left with no rows and no census is
+   dropped.
+4. Check the chain. Each applied delta's `prev_as_of` must equal the `as_of`
+   of the record applied before it. On a break (a delta lost or not yet
+   knowable), the state is exact only up to the break. Report it as partial
+   rather than guess.
+
+The fleet at `t` is the union over covered hosts. Several hosts can report the
+same review-listed PR, so merge rows by `(repo, issue)` and prefer the row
+that has a `host`. That row comes from the host whose sweep holds the item. A
+row without one only says the PR is in review somewhere.
+
+A host restart begins a new chain with a fresh anchor. Records from before the
+restart never chain into it, because their `anchor_as_of` differs.
+
 ## Not yet implemented
 
-- `fleet.state` full-state snapshots with an hourly anchor.
 - `loom-daemon telemetry replay --as-of <t>` and `--check`.
 - The collector-side receive stamp.

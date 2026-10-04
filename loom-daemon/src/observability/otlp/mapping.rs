@@ -5,6 +5,7 @@
 mod auto_update;
 mod ci;
 mod eta;
+mod fleet_state;
 mod metadata;
 mod ops;
 mod pass;
@@ -651,6 +652,15 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // Issue #10212: body is the record's JSON (the ranked candidates).
             let (event_name, severity, at, attributes, body) =
                 pick_decision::log_parts(&envelope.record)?;
+            time_unix_nano = at;
+            body_override = Some(body);
+            (event_name, severity, String::new(), attributes)
+        }
+        TelemetryRecord::FleetState(_) => {
+            // Issue #10196: the body is the record's JSON (rows + census);
+            // anchor/delta scalars ride as `loom.fleet.*` attributes.
+            let (event_name, severity, at, attributes, body) =
+                fleet_state::log_parts(&envelope.record)?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)

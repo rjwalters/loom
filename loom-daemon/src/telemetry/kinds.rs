@@ -128,7 +128,7 @@ impl fmt::Display for TelemetryKindOtlp {
 /// version-level gate (the `ci.job.log` free-text precedent at `9`) pins a
 /// fresh literal in its row and documents the row in
 /// `defaults/docs/telemetry-schema.md`.
-pub const NEW_KIND_SCHEMA_VERSION: u32 = 12;
+pub const NEW_KIND_SCHEMA_VERSION: u32 = 13;
 
 /// One registry row, reflected at runtime — what [`TELEMETRY_KINDS`] is a slice
 /// of. Generated from the same table that generates the enum, so it can never
@@ -189,6 +189,8 @@ pub mod session_output;
 
 /// `token_ranking.refresh` (#10744) — one token-ranking refresh round.
 pub mod token_ranking_refresh;
+/// `fleet.state` (#10196) — in-flight items and open-PR census over OTLP.
+pub mod fleet_state;
 
 /// The export-coverage pair `(exporters, exported_kinds)` for `host.health`
 /// (Issue #10196), derived from the per-exporter status map
@@ -406,6 +408,12 @@ macro_rules! telemetry_kind_table {
             /// and target versions, defer reason, drain state. OTLP-only. See
             /// [`auto_update_tick`].
             AutoUpdateTick = "auto_update.tick" => $crate::telemetry::kinds::auto_update_tick::AutoUpdateTickRecord,
+            /// One host's in-flight items (stage, entered-at, PR, host, slot)
+            /// and per-repo open-PR census (Issue #10196). OTLP-only: the
+            /// replay contract's state record. A full anchor goes out hourly,
+            /// with deltas in between only when something changed. See
+            /// [`fleet_state`].
+            FleetState = "fleet.state" => $crate::telemetry::kinds::fleet_state::FleetStateRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             /// One daily-fit check, whether it fitted or skipped (Issue
