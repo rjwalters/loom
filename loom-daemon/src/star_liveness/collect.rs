@@ -4,8 +4,9 @@
 //!
 //! # Reads per pass (only for a repo with at least one starred issue)
 //!
-//! - the ETag-cached `loom:operator-priority` listing (issues **and** PRs:
-//!   Builder copies the star onto its PR, slice B);
+//! - the ETag-cached listing of each level's operator label
+//!   (`loom:operator-priority`, `loom:operator-high-priority`, #10307; issues
+//!   **and** PRs: Builder copies the star onto its PR, slice B);
 //! - the ETag-cached listings for [`PR_LABELS`], to find each starred
 //!   issue's open PR by its closing / `Part of` reference;
 //! - the comments of a starred issue's **approved** PR, only when that PR's
@@ -594,7 +595,24 @@ impl<'a> Evaluator<'a> {
     /// # Errors
     /// The starred listing itself failed (nothing can be said about the repo).
     pub fn run(&mut self) -> Result<Vec<Evaluated>> {
-        let starred = self.forge.list_open(OPERATOR_PRIORITY_LABEL)?;
+        // Every operator level's label (#10307): level >= 2 counts as
+        // starred, and a level-2 issue need not also carry the star. The
+        // star's own listing failing still fails the repo, as before.
+        let mut by_number: BTreeMap<u32, RestIssue> = BTreeMap::new();
+        for label in crate::operator_levels::operator_labels(crate::operator_levels::table()) {
+            let rows = match self.forge.list_open(label) {
+                Ok(rows) => rows,
+                Err(e) if label == OPERATOR_PRIORITY_LABEL => return Err(e),
+                Err(e) => {
+                    log::debug!("star_liveness: listing {label} in {} failed: {e}", self.ctx.slug);
+                    Vec::new()
+                }
+            };
+            for r in rows {
+                by_number.entry(r.number).or_insert(r);
+            }
+        }
+        let starred: Vec<RestIssue> = by_number.into_values().collect();
         let issues: Vec<RestIssue> = starred
             .iter()
             .filter(|r| !r.is_pull_request)

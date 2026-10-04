@@ -49,7 +49,8 @@ pub const MERGE_HOLD_COMPANION_LABELS: &[&str] = &["loom:operator-mechanical"];
 pub const FLAG_OP_HOLD: u8 = 1;
 /// [`pr_flags`] bit 1: `loom:sequenced`.
 pub const FLAG_SEQUENCED: u8 = 1 << 1;
-/// [`pr_flags`] bit 2: `loom:operator-priority` (the operator's star).
+/// [`pr_flags`] bit 2: starred at any level (`loom:operator-priority`, or a
+/// higher level label, own or inherited: levels nest, #10307).
 pub const FLAG_STARRED: u8 = 1 << 2;
 /// [`pr_flags`] bit 3: `loom:merge-conflict`.
 pub const FLAG_CONFLICT: u8 = 1 << 3;
@@ -78,6 +79,11 @@ pub fn pr_flags(labels: &[String]) -> u8 {
         .iter()
         .filter(|(_, set)| labels.iter().any(|l| set.contains(&l.as_str())))
         .fold(0, |mask, (bit, _)| mask | bit)
+        | if crate::operator_levels::is_starred(labels) {
+            FLAG_STARRED
+        } else {
+            0
+        }
 }
 
 /// Every label that holds or parks an item: the work finder's park and skip

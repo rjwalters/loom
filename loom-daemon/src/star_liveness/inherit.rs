@@ -77,10 +77,7 @@ pub fn current(root: &Path) -> Vec<Inherited> {
 pub fn apply_list(items: &mut Vec<WorkItem>, list: &[Inherited]) {
     for inh in list {
         if let Some(item) = items.iter_mut().find(|i| i.number == inh.number) {
-            let own_star = item
-                .labels
-                .iter()
-                .any(|l| l == crate::work_finder::OPERATOR_PRIORITY_LABEL);
+            let own_star = crate::operator_levels::is_starred(&item.labels);
             if !own_star {
                 item.operator_priority_inherited_from = Some(inh.from);
                 item.operator_priority_at.clone_from(&inh.starred_at);
