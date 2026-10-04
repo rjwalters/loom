@@ -206,7 +206,13 @@ mod tests {
     }
 
     fn parse(extra: &[&str]) -> Result<Cli, clap::Error> {
-        let base = ["eta-offline", "--input", "-", "--now", "2026-10-01T00:00:00Z"];
+        let base = [
+            "eta-offline",
+            "--input",
+            "-",
+            "--now",
+            "2026-10-01T00:00:00Z",
+        ];
         Cli::try_parse_from(base.iter().chain(extra))
     }
 

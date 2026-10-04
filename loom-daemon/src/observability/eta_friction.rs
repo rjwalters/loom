@@ -224,7 +224,11 @@ mod tests {
     #[test]
     fn lockout_reading_tells_unlocked_from_nothing_ready() {
         let tick: Tick = (
-            [("a/locked".to_string(), true), ("a/open".to_string(), false)].into(),
+            [
+                ("a/locked".to_string(), true),
+                ("a/open".to_string(), false),
+            ]
+            .into(),
             ["a/failed".to_string()].into(),
         );
         assert_eq!(lockout_reading(None, "a/open"), Err("no_work_finder_tick"));

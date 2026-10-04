@@ -399,7 +399,16 @@
     "since_merge_sec": null,
     "open_prs_repo": null,
     "fleet_scope_repos": null,
-    "repo_pr_open_skip": null
+    "repo_pr_open_skip": null,
+    "repo_open_prs": null,
+    "repo_pr_open_lockout": null,
+    "repo_ci_typical_duration_sec": null,
+    "repo_friction_observed_at": null,
+    "pr_ci_status": null,
+    "pr_behind_main": null,
+    "pr_merge_conflict": null,
+    "pr_friction_observed_at": null,
+    "operator_hold": null
   },
   "features_omitted": [
     {
@@ -568,6 +577,42 @@
     },
     {
       "name": "repo_pr_open_skip",
+      "reason": "not_collected"
+    },
+    {
+      "name": "repo_open_prs",
+      "reason": "not_collected"
+    },
+    {
+      "name": "repo_pr_open_lockout",
+      "reason": "not_collected"
+    },
+    {
+      "name": "repo_ci_typical_duration_sec",
+      "reason": "not_collected"
+    },
+    {
+      "name": "repo_friction_observed_at",
+      "reason": "not_collected"
+    },
+    {
+      "name": "pr_ci_status",
+      "reason": "not_collected"
+    },
+    {
+      "name": "pr_behind_main",
+      "reason": "not_collected"
+    },
+    {
+      "name": "pr_merge_conflict",
+      "reason": "not_collected"
+    },
+    {
+      "name": "pr_friction_observed_at",
+      "reason": "not_collected"
+    },
+    {
+      "name": "operator_hold",
       "reason": "not_collected"
     }
   ],
