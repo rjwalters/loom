@@ -26,6 +26,9 @@
 //!   cause, and never touches a merged candidate (landing wins;
 //!   reconciliation territory). A released reservation no longer counts
 //!   against eligibility (`live_marker`).
+//! - `consolidate-reconcile` (#9689) finishes a MERGED candidate's
+//!   bookkeeping; it never merges and never releases a reservation (the
+//!   ordering pass is the one releaser on landing, ADR-0023 §4).
 //! - Every `gh` call honors `--repo`/`LOOM_REPO` and the per-root credential.
 
 use anyhow::{bail, Context, Result};
@@ -227,6 +230,58 @@ impl ConsolidateAbortArgs {
             RequestedCause::CiFailure => AbortReason::CiFailure,
         };
         abort(&gh, &root, self.pr, &reason)
+    }
+}
+
+#[derive(clap::Args)]
+pub(crate) struct ConsolidateReconcileArgs {
+    /// The MERGED candidate PR to reconcile.
+    #[arg(long, value_name = "N")]
+    pr: u32,
+
+    /// OWNER/REPO. Omit to let `gh` resolve from the working directory.
+    #[arg(long, value_name = "OWNER/REPO")]
+    repo: Option<String>,
+}
+
+impl ConsolidateReconcileArgs {
+    pub(crate) fn run(self) -> Result<()> {
+        // Same scoping as prepare/abort: reconcile reads through
+        // `{owner}/{repo}` placeholders and `fetch_trusted_bodies`, which
+        // honor GH_REPO, not a `--repo` flag.
+        scope_repo(self.repo.as_deref());
+        let root = std::env::current_dir()?;
+        // The orchestration lives in the library so it runs under test
+        // end-to-end (restart, unverified component, pushed source). It spawns
+        // `gh` through the `gh_invocation` facade, which resolves the program
+        // itself (`loom_daemon::gh_invocation::gh_bin()`'s ladder, #9985).
+        let report = cons::reconcile::reconcile("git", &root, self.pr)?;
+        println!("{}", report.summary());
+        if !report.unverified.is_empty() {
+            eprintln!(
+                "NOT verified as included (left open for human review — never closed on an \
+                 unknown): {:?}",
+                report.unverified
+            );
+        }
+        if !report.unread.is_empty() {
+            eprintln!(
+                "A forge read went unanswered (transcript, live head, or a step-5/6 state) — \
+                 not finished; re-run to retry: {:?}",
+                report.unread
+            );
+        }
+        if !report.untouched_open.is_empty() {
+            eprintln!(
+                "Pushed after landing — left open with an untouched-open status (ADR-0023 §6.2): \
+                 {:?}",
+                report.untouched_open
+            );
+        }
+        if !report.complete() {
+            std::process::exit(1);
+        }
+        Ok(())
     }
 }
 
