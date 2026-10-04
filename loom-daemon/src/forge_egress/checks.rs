@@ -200,11 +200,12 @@ pub fn assert_git_credential_separation(policy: &Value, obs: &Observed) -> Vec<F
         "git's credential is separate from the gh API profile",
     )
     .expected("SSH, or a dedicated git credential (principal.gitCredentialRef)")
-    .observed("credential.helper is `gh auth git-credential`")
+    .observed("a credential helper runs gh's `auth git-credential`")
     .source("git config (credential.helper)")
     .remedy(
-        "unset the gh helper (`gh auth setup-git --disable` is not enough if it was hand-set) \
-         and use SSH or a dedicated git credential",
+        "remove every `credential.*helper` entry that runs gh's `auth git-credential` \
+         (`git config --show-origin --get-regexp 'credential.*helper'` lists them) and use \
+         SSH or a dedicated git credential",
     )
     .section(Section::Git)]
 }
