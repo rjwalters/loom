@@ -1197,7 +1197,9 @@ of what is on disk and never needs a refetch.
   `submitted_at`, `seq` = review id) and `GET
   repos/{o}/{r}/commits/{head}/check-runs` (`check_run` rows, `seq` = run id:
   `started:<name>` at `started_at`, `<conclusion>:<name>` at
-  `completed_at`; each names its run's `head_sha` in `commit`, part of the
+  `completed_at`, and for a run still queued (no `started_at`; the payload
+  has no creation time) `queued:<name>` at the page's `fetched_at` — the
+  only row whose id varies with the read; each names its run's `head_sha` in `commit`, part of the
   id only when present, so older rows keep their ids). A merged/closed PR is stored twice by design (the pulls
   row has `seq` 0, the issue-events row the event id). A pulls refresh reads
   only the newest pages: closures of older PRs arrive via the issue-events
@@ -1246,11 +1248,22 @@ of what is on disk and never needs a refetch.
   since before the cache window is not reported open. A PR's CI at `t` reads
   only runs of its head at `t` (the latest `head_commit` row before `t`); it
   is unknown (never `none`, never an older head's verdict) with no head row,
-  no started run of that head, or a run on a commit no head row before `t`
-  names (a newer push). A closed PR's runs are cached for its **last** head
-  only; rows without `commit` are ignored. A review's state is its current one, so an
-  approval dismissed later reads as dismissed from its submission (can only
-  under-report approvals). The CI and approval counts are absent until a row
+  no started or queued run of that head, or a run on a commit no head row
+  before `t` names (a newer push). A queued run is pending (as
+  `friction::ci_status` reads a run not `completed`), from the read that saw
+  it: a queued rerun supersedes its name's previous verdict only from then,
+  never earlier. A closed PR's runs are cached for its **last** head
+  only; rows without `commit` are ignored. Reviews: the listing gives a
+  review's state when read, never a dismissal time, so per review id a
+  `dismissed` row supersedes the `approved` / `changes_requested` row of
+  an earlier read, from the review's submission on. When the latest
+  decisive-or-dismissed review before `t` is dismissed, `review` is absent
+  (not the verdict before it). This is a leak — a dismissal read after `t`
+  withdraws the review before `t` — but it can only under-report approvals:
+  a dismissed approval is never kept, and an older approval is never
+  surfaced behind a dismissed `changes_requested`. The answer depends on
+  each review's latest read, not on whether it was also read before the
+  dismissal. The CI and approval counts are absent until a row
   of their listing precedes `--as-of`. Not yet cached: the webhook-mirror
   source.
 

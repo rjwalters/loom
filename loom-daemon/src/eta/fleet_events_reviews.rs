@@ -10,7 +10,12 @@
 //!   [`EventKind::CheckRun`] rows per run, both with `seq` = the run id:
 //!   `started:<name>` at `started_at`, and, once the run has completed,
 //!   `<conclusion>:<name>` at `completed_at`. A queued run (no `started_at`)
-//!   yields nothing. Both carry the run's `head_sha` as
+//!   yields one `queued:<name>` row stamped at the page's **`fetched_at`**:
+//!   the payload has no creation time, and the read is the earliest instant
+//!   the run is known to exist, so it is the only honest one (the row is then
+//!   unlike every other in that its id varies with the read: a still-queued
+//!   run re-read on a changed page adds one more `queued` row, saying the
+//!   same thing at a later instant). Every row carries the run's `head_sha` as
 //!   [`RawEvent::commit`] (part of the id), so runs of different heads never
 //!   merge and replay can read only the PR's head's runs. GitHub's default
 //!   `filter=latest` lists only the latest run of each name, which is also how
@@ -31,6 +36,10 @@ use super::fleet_events::{EventKind, ItemKind, RawEvent, SOURCE_FORGE};
 
 /// `label` prefix of a check run's start row.
 pub const STARTED: &str = "started";
+
+/// `label` prefix of the row of a run read while still queued (no
+/// `started_at`), stamped at the read.
+pub const QUEUED: &str = "queued";
 
 #[derive(Deserialize)]
 struct RestReview {
@@ -113,12 +122,13 @@ pub fn parse_check_runs(
     let page: RestCheckRuns = serde_json::from_str(body)?;
     let mut events = Vec::new();
     for run in &page.check_runs {
-        let Some(started) = run.started_at else {
-            continue;
-        };
         let check = |label: String, at: DateTime<Utc>| {
             row(repo, pr, EventKind::CheckRun, label, at, run.id, fetched_at)
                 .with_commit(run.head_sha.clone())
+        };
+        let Some(started) = run.started_at else {
+            events.push(check(format!("{QUEUED}:{}", run.name), fetched_at));
+            continue;
         };
         events.push(check(format!("{STARTED}:{}", run.name), started));
         if run.status.as_deref() == Some("completed") {
@@ -161,7 +171,7 @@ mod tests {
        "started_at": "2026-10-03T10:00:00Z", "completed_at": "2026-10-03T10:05:00Z"},
       {"id": 72, "name": "lint", "head_sha": "abc", "status": "in_progress", "conclusion": null,
        "started_at": "2026-10-03T10:00:30Z", "completed_at": null},
-      {"id": 73, "name": "deploy", "status": "queued", "conclusion": null,
+      {"id": 73, "name": "deploy", "head_sha": "abc", "status": "queued", "conclusion": null,
        "started_at": null, "completed_at": null}
     ]}"#;
 
@@ -199,6 +209,8 @@ mod tests {
                 ("started:test: unit", 71, "2026-10-03T10:00:00+00:00".to_string()),
                 ("failure:test: unit", 71, "2026-10-03T10:05:00+00:00".to_string()),
                 ("started:lint", 72, "2026-10-03T10:00:30+00:00".to_string()),
+                // Queued: no start time, so stamped at the read.
+                ("queued:deploy", 73, "2026-10-04T10:00:00+00:00".to_string()),
             ]
         );
         // The two rows of one run share `seq` but not an id.
@@ -208,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rerun_after_completion_adds_only_the_completion_row() {
+    fn a_rerun_after_completion_adds_the_completion_row_and_a_later_queued_row() {
         let (before, _) = parse_check_runs("o/r", 12, CHECKS, now()).unwrap();
         let later = CHECKS.replace(
             r#""status": "in_progress", "conclusion": null,
@@ -224,7 +236,13 @@ mod tests {
             .filter(|e| !known.contains(e.id.as_str()))
             .map(|e| e.label.as_deref().unwrap())
             .collect();
-        assert_eq!(fresh, vec!["success:lint"]);
+        // The still-queued run says so again, at the later read.
+        assert_eq!(fresh, vec!["success:lint", "queued:deploy"]);
+        // The same read again (a resumed run at the same instant) adds nothing.
+        let (again, _) =
+            parse_check_runs("o/r", 12, &later, now() + chrono::Duration::hours(1)).unwrap();
+        let ids = |v: &[RawEvent]| v.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&after), ids(&again));
     }
 
     #[test]

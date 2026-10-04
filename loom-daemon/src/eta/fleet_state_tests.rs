@@ -647,3 +647,26 @@ fn lifting_the_operator_hold_returns_an_approved_pr_to_merge_wait() {
     assert_eq!((pr.stage, pr.stage_entered_at), (ItemStage::MergeWait, t(30)));
     assert_eq!((lifted.held_for_human, lifted.operator_holds), (0, 0));
 }
+
+#[test]
+fn a_queued_run_and_a_dismissal_reach_the_counts() {
+    // PR 11 passed its test by 960s; a queued lint was read at 970s.
+    // PR 10's approval (review 21) was read again, dismissed.
+    let mut events = reviewed_fleet();
+    events.extend([
+        check(11, "queued:lint", 970, 40),
+        review(10, "dismissed", 905, 21),
+    ]);
+    let before = fleet_state(&events, REPO, t(965));
+    assert_eq!(item(&before, ItemKind::Pr, 11).ci.as_deref(), Some("passing"));
+    let state = fleet_state(&events, REPO, t(1000));
+    assert_eq!(item(&state, ItemKind::Pr, 11).ci.as_deref(), Some("pending"));
+    assert_eq!(state.open_prs_ci_passing, Some(0), "a queued run is not a pass");
+    assert_eq!(item(&state, ItemKind::Pr, 10).review, None);
+    assert_eq!(state.open_prs_approved, Some(0), "a dismissed approval is withdrawn");
+    let reversed: Vec<RawEvent> = events.iter().rev().cloned().collect();
+    assert_eq!(
+        serde_json::to_string(&state).unwrap(),
+        serde_json::to_string(&fleet_state(&reversed, REPO, t(1000))).unwrap()
+    );
+}

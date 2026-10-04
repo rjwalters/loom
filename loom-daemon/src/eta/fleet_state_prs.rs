@@ -19,27 +19,39 @@
 //!   without a commit (written before the field existed) is ignored.
 //! - Over the head's runs it follows [`super::friction::ci_status`], the
 //!   reader behind the logged `pr_ci_status`: per check name, the latest run
-//!   started before `t` (GitHub's `filter=latest`); `failing` if any of those
-//!   had completed before `t` with a failing conclusion
-//!   ([`super::friction::FAILING`]), else `pending` if any had not completed
-//!   by `t`, else `passing`. With no run of the head started before `t` the
-//!   answer is unknown (`None`), never `none` or the previous head's verdict.
-//! - **Review** is the state of the latest `approved` / `changes_requested`
-//!   review submitted before `t`. Known leak, documented in eta.md: the
-//!   listing serves a review's *current* state, so an approval dismissed after
-//!   `t` reads as `dismissed` (ignored here) from its submission on — it can
-//!   only under-report an approval.
+//!   started — or read while queued — before `t` (GitHub's `filter=latest`);
+//!   `failing` if any of those had completed before `t` with a failing
+//!   conclusion ([`super::friction::FAILING`]), else `pending` if any had not
+//!   completed by `t` (a queued run never has), else `passing`. A `queued`
+//!   row is stamped at the read that saw it, so a queued rerun supersedes the
+//!   previous run of its name from that read on — before it, the cache has
+//!   not seen the rerun and still shows the previous verdict. With no run of
+//!   the head before `t` the answer is unknown (`None`), never `none` or the
+//!   previous head's verdict.
+//! - **Review**, per review id (`seq`): a `dismissed` row supersedes the
+//!   id's `approved` / `changes_requested` row whatever order they were
+//!   fetched in. The answer is the state of the latest review submitted
+//!   before `t` that is decisive or dismissed — `None` when that one is
+//!   dismissed. Known leak, documented in eta.md: the listing gives no
+//!   dismissal time, only the review's state when read, stamped at its
+//!   submission, so a dismissal read after `t` withdraws the review from its
+//!   submission on. Answering `None` (not the verdict before it) means the
+//!   leak can only under-report an approval: it never keeps a dismissed
+//!   approval, nor surfaces an older approval behind a dismissed
+//!   `changes_requested`. The answer depends only on the latest read of each
+//!   review, not on whether it was also read before the dismissal.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 
 use super::fleet_events::{EventKind, RawEvent};
-use super::fleet_events_reviews::{split_check_label, STARTED};
+use super::fleet_events_reviews::{split_check_label, QUEUED, STARTED};
 
 #[derive(Default)]
 struct PrRows {
-    /// Per commit, per check name: the latest start, `(started_at, run id)`.
+    /// Per commit, per check name: the latest run, `(started_at, run id)` —
+    /// for a run read while queued, `(read time, run id)`.
     latest_start: BTreeMap<String, BTreeMap<String, (DateTime<Utc>, u64)>>,
     /// Every commit a `head_commit` row before `t` named.
     heads: BTreeSet<String>,
@@ -47,8 +59,9 @@ struct PrRows {
     head: Option<String>,
     /// Per run id: its conclusion, once completed.
     conclusion: BTreeMap<u64, String>,
-    /// The latest decisive review state.
-    review: Option<&'static str>,
+    /// Per review id: `(submitted_at, state)`, `dismissed` superseding a
+    /// decisive state. Only decisive and dismissed reviews are kept.
+    reviews: BTreeMap<u64, (DateTime<Utc>, &'static str)>,
 }
 
 /// What the review and check-run rows before `t` say, per PR.
@@ -81,17 +94,26 @@ impl PrSignals {
         };
         let pr = self.prs.entry(e.item).or_default();
         if e.kind == EventKind::Review {
-            match label {
-                "approved" => pr.review = Some("approved"),
-                "changes_requested" => pr.review = Some("changes_requested"),
-                _ => {}
+            let state = match label {
+                "approved" => "approved",
+                "changes_requested" => "changes_requested",
+                "dismissed" => DISMISSED,
+                _ => return,
+            };
+            let entry = pr.reviews.entry(e.seq).or_insert((e.event_time, state));
+            if state == DISMISSED {
+                *entry = (e.event_time, state);
+            } else if entry.1 != DISMISSED {
+                // Two decisive rows of one id (not a forge state change):
+                // keep the larger, so the answer is order-free.
+                *entry = (*entry).max((e.event_time, state));
             }
             return;
         }
         let (Some((state, name)), Some(commit)) = (split_check_label(label), &e.commit) else {
             return;
         };
-        if state == STARTED {
+        if state == STARTED || state == QUEUED {
             let start = (e.event_time, e.seq);
             let latest = pr
                 .latest_start
@@ -148,12 +170,22 @@ impl PrSignals {
         }
     }
 
-    /// PR `pr`'s latest decisive review state at `t`.
+    /// PR `pr`'s review state at `t`: that of its latest decisive or
+    /// dismissed review, `None` when that one is dismissed.
     #[must_use]
     pub fn review(&self, pr: u32) -> Option<&'static str> {
-        self.prs.get(&pr)?.review
+        let (_, (_, state)) = self
+            .prs
+            .get(&pr)?
+            .reviews
+            .iter()
+            .max_by_key(|(id, (at, _))| (*at, **id))?;
+        (*state != DISMISSED).then_some(*state)
     }
 }
+
+/// A review's state once dismissed.
+const DISMISSED: &str = "dismissed";
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -347,7 +379,95 @@ mod tests {
             row(Review, "dismissed", 40, 4),
         ];
         assert_eq!(signals(&rows[..1]).review(7), Some("changes_requested"));
-        assert_eq!(signals(&rows).review(7), Some("approved"));
-        assert_eq!(signals(&rows[2..]).review(7), None);
+        assert_eq!(signals(&rows[..3]).review(7), Some("approved"));
+        assert_eq!(signals(&rows[2..3]).review(7), None);
+        // A later review read only as dismissed: its verdict, and when it was
+        // dismissed, are unknown, so the earlier approval is not surfaced.
+        assert_eq!(signals(&rows).review(7), None);
+    }
+
+    #[test]
+    fn a_dismissal_withdraws_the_cached_approval_of_the_same_review() {
+        use EventKind::Review;
+        // Review 5 read as approved, then (a later read) as dismissed: both
+        // rows are stamped at its submission and both are kept.
+        let approved = row(Review, "approved", 20, 5);
+        let dismissed = row(Review, "dismissed", 20, 5);
+        assert_ne!(approved.id, dismissed.id);
+        let rows = [approved.clone(), dismissed.clone()];
+        assert_eq!(signals(&rows[..1]).review(7), Some("approved"));
+        for at in [21, 1000] {
+            assert_eq!(replay(&rows, at).review(7), None, "at {at}");
+        }
+        // Whatever order the reads land in.
+        assert_eq!(signals(&[dismissed.clone(), approved.clone()]).review(7), None);
+        // Before the submission, neither row is visible.
+        assert_eq!(replay(&rows, 20).review(7), None);
+        // A dismissed `changes_requested` does not surface the approval
+        // behind it (it may have been dismissed after `t`)...
+        let behind = [
+            row(Review, "approved", 10, 4),
+            row(Review, "changes_requested", 20, 6),
+            row(Review, "dismissed", 20, 6),
+        ];
+        assert_eq!(signals(&behind[..2]).review(7), Some("changes_requested"));
+        assert_eq!(signals(&behind).review(7), None);
+        // ...and a review submitted after the dismissed one decides again.
+        let mut later = rows.to_vec();
+        later.push(row(Review, "approved", 30, 8));
+        assert_eq!(replay(&later, 25).review(7), None);
+        assert_eq!(replay(&later, 31).review(7), Some("approved"));
+    }
+
+    #[test]
+    fn a_queued_run_keeps_the_head_pending_like_the_live_reader() {
+        use EventKind::CheckRun;
+        // Lint passed; test was read at 30 still queued (no start time).
+        let rows = [
+            head("h1", 0),
+            row(CheckRun, "started:lint", 10, 1),
+            row(CheckRun, "success:lint", 20, 1),
+            row(CheckRun, "queued:test", 30, 2),
+        ];
+        // friction::ci_status on that read: a run not `completed` is pending.
+        assert_eq!(replay(&rows, 25).ci(7), Some("passing"), "test not seen yet");
+        assert_eq!(signals(&rows).ci(7), Some("pending"));
+        // It starts, then fails: the same run id carries the verdict.
+        let mut ran = rows.to_vec();
+        ran.extend([
+            row(CheckRun, "started:test", 40, 2),
+            row(CheckRun, "failure:test", 50, 2),
+        ]);
+        assert_eq!(replay(&ran, 45).ci(7), Some("pending"));
+        assert_eq!(replay(&ran, 60).ci(7), Some("failing"));
+        // A still-queued run read twice says the same thing twice.
+        let mut twice = rows.to_vec();
+        twice.push(row(CheckRun, "queued:test", 35, 2));
+        assert_eq!(signals(&twice).ci(7), Some("pending"));
+    }
+
+    #[test]
+    fn a_queued_rerun_supersedes_the_previous_verdict_from_its_read() {
+        use EventKind::CheckRun;
+        for (verdict, before) in [("failure", "failing"), ("success", "passing")] {
+            let rows = [
+                head("h1", 0),
+                row(CheckRun, "started:test", 10, 1),
+                row(CheckRun, &format!("{verdict}:test"), 20, 1),
+                // The rerun, read at 40 while queued.
+                row(CheckRun, "queued:test", 40, 2),
+            ];
+            assert_eq!(replay(&rows, 40).ci(7), Some(before), "{verdict}");
+            assert_eq!(replay(&rows, 41).ci(7), Some("pending"), "{verdict}");
+        }
+        // A queued run of a commit no head row names: a newer push, unknown.
+        let rows = [
+            head("a", 0),
+            run("a", "started:test", 10, 1),
+            run("a", "success:test", 20, 1),
+            run("b", "queued:test", 30, 2),
+        ];
+        assert_eq!(replay(&rows, 25).ci(7), Some("passing"));
+        assert_eq!(replay(&rows, 31).ci(7), None);
     }
 }

@@ -50,7 +50,8 @@
 //!
 //! From the `review` / `check_run` rows ([`super::fleet_state_prs`]) each open
 //! PR gets `ci` (`passing` / `failing` / `pending`, its head's latest run per
-//! check name) and `review` (the latest `approved` / `changes_requested`),
+//! check name, a queued run pending) and `review` (the latest `approved` /
+//! `changes_requested`, absent when the latest review was dismissed),
 //! and the state counts open PRs with a failing / passing CI and an approving
 //! review. Like the lockout, each count is `null` (absent from the JSON) until
 //! a row of its listing precedes `as_of`. These rows never open, label or
@@ -181,11 +182,11 @@ pub struct ItemState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_pr: Option<u32>,
     /// For a PR: its CI at `as_of` (`passing` / `failing` / `pending`), when
-    /// a run had started.
+    /// a run had started or been read queued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci: Option<String>,
     /// For a PR: its latest decisive review (`approved` /
-    /// `changes_requested`).
+    /// `changes_requested`); absent when the latest one was dismissed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<String>,
 }
