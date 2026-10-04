@@ -72,6 +72,8 @@
 //! holds ([`crate::stale_blocked`]). The full convention, including what each
 //! role must write, is `defaults/docs/park-record.md`.
 
+pub mod apply;
+
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::sync::OnceLock;

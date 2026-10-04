@@ -260,6 +260,7 @@ pub mod partial_reset;
 pub mod reconcile;
 pub mod redate;
 pub mod refs;
+pub mod remove_gate;
 pub mod response;
 pub mod sequence;
 pub mod stacked_children;

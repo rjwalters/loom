@@ -363,14 +363,23 @@ fn patch_created_entrypoint(created_ref: &str) -> anyhow::Result<()> {
 /// `gh api <path>` (GET) — the raw response body on success, `gh`'s stderr on
 /// failure. Same no-cache plain-`gh` semantics `forge_get_pr_nocache` uses.
 fn gh_api_get(gh_bin: &str, path: &str) -> Result<String, String> {
-    let out = std::process::Command::new(gh_bin)
-        .arg("api")
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("could not exec gh api: {e}"))?;
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    let outcome = GhInvocation::new(
+        Operation::new("comment.api_get"),
+        AccessIntent::Read,
+        GhTarget::None,
+        std::time::Duration::from_secs(60),
+    )
+    .program(gh_bin)
+    .arg("api")
+    .arg(path)
+    .run();
+    let out = match outcome {
+        crate::cmd_out::CmdOutcome::Ran(o) => o,
+        crate::cmd_out::CmdOutcome::Unavailable(u) => {
+            return Err(format!("could not exec gh api: {u}"));
+        }
+    };
     if !out.status.success() {
         return Err(format!(
             "gh api {path} failed: {}",

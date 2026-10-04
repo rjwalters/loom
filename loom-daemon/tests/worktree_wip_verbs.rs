@@ -586,3 +586,97 @@ fn an_overridden_worktree_root_redirects_snapshots_and_baselines_with_it() {
         "nothing may leak into the default path"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #10122: stash-push must never report "clean" on a dirty tree
+// ---------------------------------------------------------------------------
+
+fn json_doc(o: &Output) -> serde_json::Value {
+    serde_json::from_str(stdout(o).trim())
+        .unwrap_or_else(|e| panic!("bad JSON ({e}): {}", stdout(o)))
+}
+
+#[test]
+fn an_intent_to_add_path_is_refused_not_reported_clean() {
+    // The reproduced bug: `git add -N` makes `git stash create` fail with
+    // empty stdout, which used to read as "already clean", exit 0.
+    let f = Fixture::new("plain");
+    let wt = f.add_worktree(720);
+    std::fs::write(wt.join("tracked.txt"), "tracked file\nedited\n").expect("dirty");
+    std::fs::write(wt.join("new.rs"), "fn main() {}\n").expect("new");
+    git(&wt, &["add", "-N", "new.rs"]);
+
+    let out = f.run_in_repo(&["stash-push", "720", "--json"]);
+    assert_eq!(code(&out), 1, "must refuse: {}", combined(&out));
+    assert!(!combined(&out).contains("already clean"), "{}", combined(&out));
+    assert!(combined(&out).contains("intent-to-add"), "{}", combined(&out));
+    let doc = json_doc(&out);
+    assert_eq!(doc["success"], false);
+    assert_eq!(doc["unshelvedPaths"][0], "new.rs");
+
+    // Untouched: nothing reset, nothing anchored, nothing pending.
+    assert_eq!(
+        std::fs::read_to_string(wt.join("tracked.txt")).expect("read"),
+        "tracked file\nedited\n"
+    );
+    assert!(wt.join("new.rs").is_file());
+    assert!(!ref_exists(&wt, "refs/loom/stash-baseline/issue-720"));
+    assert!(!f.worktree_root().join(".stash-baseline/issue-720").exists());
+}
+
+#[test]
+fn untracked_only_changes_without_the_flag_are_named_not_called_clean() {
+    let f = Fixture::new("plain");
+    let wt = f.add_worktree(721);
+    std::fs::create_dir_all(wt.join("src")).expect("mkdir");
+    std::fs::write(wt.join("src/new.rs"), "fn x() {}\n").expect("new");
+
+    let out = f.run_in_repo(&["stash-push", "721", "--json"]);
+    assert_eq!(code(&out), 0, "{}", combined(&out));
+    assert!(!combined(&out).contains("already clean"), "{}", combined(&out));
+    assert!(combined(&out).contains("NOT shelved"), "{}", combined(&out));
+    assert!(combined(&out).contains("--include-untracked"), "{}", combined(&out));
+    let doc = json_doc(&out);
+    assert_eq!(doc["unshelvedPaths"][0], "src/new.rs");
+    assert!(wt.join("src/new.rs").is_file(), "left in place, as documented");
+    assert_eq!(code(&f.run_in_repo(&["stash-pop", "721"])), 0);
+}
+
+#[test]
+fn a_change_stash_create_cannot_see_fails_the_push_and_pop_still_restores() {
+    // A dirty gitlink: porcelain shows ` M sub` but `git stash create` ignores
+    // it. The tracked edit alongside it is captured; the push must then say
+    // the tree is NOT clean, exit 1, and leave the capture poppable.
+    let f = Fixture::new("plain");
+    let sub = f.repo.join("sub");
+    std::fs::create_dir_all(&sub).expect("mkdir sub");
+    git(&sub, &["init", "-q", "-b", "main"]);
+    std::fs::write(sub.join("f"), "a\n").expect("write");
+    git(&sub, &["add", "f"]);
+    git(&sub, &["commit", "-qm", "s"]);
+    git(&f.repo, &["add", "sub"]);
+    git(&f.repo, &["commit", "-qm", "gitlink"]);
+    std::fs::write(sub.join("f"), "a\nb\n").expect("dirty sub");
+    std::fs::write(f.repo.join("tracked.txt"), "tracked file\nmain wip\n").expect("dirty");
+
+    let out = f.run_in_repo(&["stash-push", "main", "--json"]);
+    assert_eq!(code(&out), 1, "must not claim a clean baseline: {}", combined(&out));
+    assert!(combined(&out).contains("could NOT shelve"), "{}", combined(&out));
+    let doc = json_doc(&out);
+    assert_eq!(doc["success"], false);
+    assert!(
+        doc["unshelvedPaths"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|p| p == "sub"),
+        "{doc}"
+    );
+
+    assert_eq!(code(&f.run_in_repo(&["stash-pop", "main"])), 0);
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join("tracked.txt")).expect("read"),
+        "tracked file\nmain wip\n",
+        "the captured tracked edit must come back"
+    );
+}

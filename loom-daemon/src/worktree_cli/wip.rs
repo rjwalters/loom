@@ -369,6 +369,95 @@ pub fn untracked_files(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// One record of `git status --porcelain=v1 -z`: the two-letter `XY` code and
+/// the (destination) path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusEntry {
+    pub code: String,
+    pub path: String,
+}
+
+impl StatusEntry {
+    #[must_use]
+    pub fn is_untracked(&self) -> bool {
+        self.code == "??"
+    }
+
+    /// `git add -N` (intent-to-add): present in the index as an empty
+    /// placeholder, so porcelain reports ` A`. `git stash create` cannot save
+    /// such an entry — it errors with "Entry '<path>' not uptodate" (#10122).
+    #[must_use]
+    pub fn is_intent_to_add(&self) -> bool {
+        self.code == " A"
+    }
+}
+
+/// Parse `git status --porcelain=v1 -z` output.
+///
+/// `-z` is used so paths with spaces, quotes or newlines arrive verbatim. A
+/// rename/copy record (`R`/`C` in either column) is followed by an extra
+/// NUL-terminated source path, which is consumed and dropped — the
+/// destination is the path that is dirty in the working tree.
+#[must_use]
+pub fn parse_porcelain_z(raw: &[u8]) -> Vec<StatusEntry> {
+    let mut out = Vec::new();
+    let mut fields = raw.split(|b| *b == 0);
+    while let Some(rec) = fields.next() {
+        if rec.len() < 4 {
+            continue;
+        }
+        let code = String::from_utf8_lossy(&rec[..2]).into_owned();
+        let path = String::from_utf8_lossy(&rec[3..]).into_owned();
+        if code.contains('R') || code.contains('C') {
+            let _ = fields.next();
+        }
+        out.push(StatusEntry { code, path });
+    }
+    out
+}
+
+/// Everything `git status` reports as dirty in `dir` (untracked files listed
+/// individually), minus Loom's own runtime markers.
+///
+/// Unlike [`untracked_files`], a git failure is an `Err` carrying git's
+/// stderr, never an empty list: the caller uses this to decide whether a tree
+/// is clean, and "git broke" must never read as "clean" (#10122).
+pub fn worktree_status(dir: &Path) -> Result<Vec<StatusEntry>, String> {
+    let out = git(dir, &["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .ok_or_else(|| "could not execute git".to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(parse_porcelain_z(&out.stdout)
+        .into_iter()
+        .filter(|e| {
+            !(e.is_untracked() && crate::worktree_ops::safety::is_loom_own_untracked_path(&e.path))
+        })
+        .collect())
+}
+
+/// Render paths as a JSON array of strings.
+#[must_use]
+pub fn json_str_array(items: &[String]) -> String {
+    let inner: Vec<String> = items
+        .iter()
+        .map(|s| format!("\"{}\"", json_str(s)))
+        .collect();
+    format!("[{}]", inner.join(", "))
+}
+
+/// Human-readable path list for a message: the first `max` paths, then
+/// "(and N more)", so a tree with thousands of stray files stays one line.
+#[must_use]
+pub fn path_list(paths: &[String], max: usize) -> String {
+    let shown: Vec<&str> = paths.iter().take(max).map(String::as_str).collect();
+    let mut s = shown.join(", ");
+    if paths.len() > max {
+        s.push_str(&format!(" (and {} more)", paths.len() - max));
+    }
+    s
+}
+
 /// Move one file, falling back to copy-then-delete across filesystems.
 ///
 /// `fs::rename` is `rename(2)`, which fails with `EXDEV` when source and

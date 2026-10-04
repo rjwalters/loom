@@ -1,0 +1,58 @@
+# manifest.toml — header of Loom's versioned forge operation inventory.
+#
+# Issue #9777, phase 1 of epic #9769 ("Hosted-first Gitea qualification").
+# The rows live in `operations/*.toml`; this file carries only what is global:
+# the schema version, where the enumeration came from, the commit it was
+# verified against, the provider version floors a `version_support` pin is
+# measured against, and the owner areas a row may name.
+#
+# Read by `loom-daemon forge-inventory {validate,report,probe-manifest,gate}`
+# via `include_str!` — see `loom-daemon/src/forge_inventory/mod.rs`.
+# Nothing here makes a forge call.
+
+schema_version = 1
+inventory_source = "rjwalters/loom#9769"
+
+# The commit epic #9769's source enumeration was verified against. Raise it
+# (and re-verify the rows) when the enumeration is refreshed.
+base_sha = "a1714b187d9c2bca6e435694a3739bb7ec1451c6"
+
+# Provider version floors. A row whose `version_support.<provider>` pin is
+# BELOW the floor is a stale-version validation failure: the pin is evidence
+# about a release this qualification no longer accepts.
+[providers.github]
+floor = "0"
+target = "github.com (cloud, REST 2022-11-28)"
+
+[providers.gitea]
+floor = "1.24"
+target = "Gitea Cloud / 1.24.x hosted"
+
+[providers.forgejo]
+floor = "11.0"
+target = "Forgejo 11.x (qualified independently of Gitea)"
+
+[providers.gitlab]
+floor = "17.0"
+target = "GitLab 17.x (no adapter; recorded for completeness)"
+
+# Owner areas. Every operation's `owner` and every bypass baseline entry's
+# `owner` must name one of these.
+[owners]
+daemon-forge = "loom-daemon forge transport, caching, identity and quota (loom-daemon/src/forge_*, rate_limit_breaker, credential_preflight)"
+daemon-sweep = "sweep dispatch, claims, leases and reconciliation (loom-daemon/src/sweep_registry, claim_reconciliation, work_finder)"
+daemon-landing = "guarded merge and landing safety (loom-daemon/src/merge_pr)"
+daemon-ci-telemetry = "CI run/job/log ingestion (loom-daemon/src/ci_telemetry)"
+daemon-fleet = "fleet state, workers and fleet-config proposals (loom-daemon/src/fleet*, fleet_store)"
+daemon-delivery = "release resolution, artifact fetch and self-update (loom-daemon/src/release_*, auto_update, daemon_update)"
+daemon-cli = "loom-daemon CLI subcommand handlers (loom-daemon/src/cli)"
+daemon-other = "other loom-daemon modules not in a named forge area"
+mcp-server = "the mcp-loom MCP server"
+role-scripts = "maintained role helper scripts (defaults/scripts, defaults/optional)"
+role-prompts = "canonical role prompts (defaults/.claude/commands/loom, defaults/roles)"
+installer = "install-time setup (scripts/install)"
+repo-tooling = "repo maintenance scripts (scripts)"
+ci-workflows = "GitHub Actions workflows (.github)"
+dashboard = "the fleet dashboard and its deep links"
+delivery-images = "container images (docker)"
+unassigned = "no area assigned yet — a validation failure for an operation, tolerated only in the bypass baseline"

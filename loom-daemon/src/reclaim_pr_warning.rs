@@ -90,25 +90,24 @@ pub fn open_pr_warning(issue: u32, pr: u32, root: &Path) -> String {
 /// unparseable output) — this is a diagnostic, so an unanswerable probe simply
 /// produces no warning and never affects the reclaim that already happened.
 fn open_pr_on_issue_branch(gh_bin: &Path, root: &Path, issue: u32) -> Option<u32> {
-    let mut cmd = std::process::Command::new(gh_bin);
-    cmd.arg("pr")
-        .arg("list")
-        .arg("--head")
-        .arg(issue_branch(issue))
-        .arg("--state")
-        .arg("open")
-        .arg("--json")
-        .arg("number")
-        .arg("--limit")
-        .arg("1");
-    cmd.current_dir(root);
-    // #5401: cross-owner managed repo -> its own owner's installation-token
-    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+    // #5401: the facade applies the cross-owner GH_CONFIG_DIR for `root`.
+    let mut inv = crate::gh_invocation::GhInvocation::new(
+        crate::gh_invocation::Operation::new("reclaim.open_pr_probe"),
+        crate::gh_invocation::AccessIntent::Read,
+        crate::gh_invocation::GhTarget::None,
+        std::time::Duration::from_secs(60),
+    )
+    .program(gh_bin)
+    .current_dir(root)
+    .args(["pr", "list", "--head"])
+    .arg(issue_branch(issue))
+    .args(["--state", "open", "--json", "number", "--limit", "1"]);
     if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
+        inv = inv.arg("--repo").arg(repo);
     }
-    let output = cmd.output().ok()?;
+    let crate::cmd_out::CmdOutcome::Ran(output) = inv.run() else {
+        return None;
+    };
     if !output.status.success() {
         return None;
     }

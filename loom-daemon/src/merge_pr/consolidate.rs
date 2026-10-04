@@ -52,6 +52,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::claim_reconciliation::merge_sequence::SEQUENCE_LABEL;
+use crate::cmd_out::CmdOutcome;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::merge_pr::sequence::{html_comment_spans, SequenceMarker};
 
 /// The marker prefix identifying a candidate PR's consolidation mapping.
@@ -552,23 +554,36 @@ pub fn push_branch(
 
 // --- Forge reads ---------------------------------------------------------
 
-/// Run `gh <args…>` in `root` with the per-root credential applied.
-fn gh(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let mut cmd = Command::new(gh_bin);
-    cmd.args(args);
-    cmd.current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+/// Run `gh <args…>` in `root` through the facade (#10089): booked in
+/// `forge_call_stats` under `op`, with the per-root credential applied from
+/// `root`.
+fn gh(op: &'static str, gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let mut inv = GhInvocation::new(
+        Operation::new(op),
+        AccessIntent::Read,
+        GhTarget::None,
+        std::time::Duration::from_secs(120),
+    )
+    .program(gh_bin)
+    .args(args)
+    .current_dir(root);
     if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
+        inv = inv.arg("--repo").arg(repo);
     }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    gh_stdout(inv.run(), gh_bin, root, args.first().copied().unwrap_or_default())
+}
+
+/// Map a facade outcome to stdout, or the same errors the raw spawn gave.
+fn gh_stdout(outcome: CmdOutcome, gh_bin: &Path, root: &Path, what: &str) -> Result<Vec<u8>> {
+    let out = match outcome {
+        CmdOutcome::Ran(o) => o,
+        CmdOutcome::Unavailable(u) => {
+            return Err(anyhow!("failed to invoke {}: {u}", gh_bin.display()));
+        }
+    };
     if !out.status.success() {
         return Err(anyhow!(
-            "gh {} failed in {}: {}",
-            args.first().copied().unwrap_or_default(),
+            "gh {what} failed in {}: {}",
             root.display(),
             String::from_utf8_lossy(&out.stderr).trim()
         ));
@@ -607,28 +622,23 @@ struct GhLabel {
 /// workflow-editing component past it undetected on a component with more
 /// than 100 changed files.
 fn fetch_component_files(gh_bin: &Path, root: &Path, number: u32) -> Result<BTreeSet<String>> {
-    let mut cmd = Command::new(gh_bin);
-    cmd.args([
+    let inv = GhInvocation::new(
+        Operation::new("consolidate.component_files"),
+        AccessIntent::Read,
+        GhTarget::None,
+        std::time::Duration::from_secs(120),
+    )
+    .program(gh_bin)
+    .args([
         "api",
         &format!("repos/{{owner}}/{{repo}}/pulls/{number}/files"),
         "--paginate",
         "--jq",
         ".[].filename",
-    ]);
-    cmd.current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
-    if !out.status.success() {
-        return Err(anyhow!(
-            "gh api pulls/{number}/files failed in {}: {}",
-            root.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
+    ])
+    .current_dir(root);
+    let stdout = gh_stdout(inv.run(), gh_bin, root, &format!("api pulls/{number}/files"))?;
+    Ok(String::from_utf8_lossy(&stdout)
         .lines()
         .filter(|l| !l.is_empty())
         .map(str::to_string)
@@ -642,6 +652,7 @@ fn fetch_component_files(gh_bin: &Path, root: &Path, number: u32) -> Result<BTre
 /// "eligible").
 pub fn fetch_component(gh_bin: &Path, root: &Path, number: u32) -> Result<ComponentState> {
     let stdout = gh(
+        "consolidate.component",
         gh_bin,
         root,
         &[
@@ -677,7 +688,12 @@ pub fn default_branch(gh_bin: &Path, root: &Path) -> Result<String> {
     struct DefaultRef {
         name: String,
     }
-    let stdout = gh(gh_bin, root, &["repo", "view", "--json", "defaultBranchRef"])?;
+    let stdout = gh(
+        "consolidate.default_branch",
+        gh_bin,
+        root,
+        &["repo", "view", "--json", "defaultBranchRef"],
+    )?;
     let r: Ref = serde_json::from_slice(&stdout).context("parse gh repo view JSON")?;
     Ok(r.default_branch_ref.name)
 }
@@ -695,6 +711,7 @@ pub fn live_base_sha(gh_bin: &Path, root: &Path, default_branch: &str) -> Result
         sha: String,
     }
     let stdout = gh(
+        "consolidate.base_sha",
         gh_bin,
         root,
         &[
@@ -730,6 +747,7 @@ pub fn find_open_candidate(gh_bin: &Path, root: &Path, branch: &str) -> Result<O
         author: Option<serde_json::Value>,
     }
     let stdout = gh(
+        "consolidate.candidate",
         gh_bin,
         root,
         &[
