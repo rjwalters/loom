@@ -27,7 +27,8 @@
 //! on which event carried it, so it is stored once.
 //!
 //! [`ForgeEventSource::reader_only`] (#10263) is the daemon's variant: the
-//! same listing read through the reader-only primitive, never the writer.
+//! same listings (issue events and pulls, #10298) read through the
+//! reader-only primitive, never the writer.
 //!
 //! # Known limit
 //!

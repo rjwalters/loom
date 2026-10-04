@@ -1398,8 +1398,9 @@ them with a daemon restart.
   no pass is deleted.
 - **Raw event cache.** After the snapshots, each repo's
   [raw event cache](#raw-event-cache-and-fleet_statet-10197) is synced
-  in-process through a reader-only source, from whatever the matching budget
-  has left, resuming from its own cursor.
+  in-process from the issue-events then the pulls listing (#10298), each
+  through a reader-only source and its own cursor, from whatever the matching
+  shared budget has left. The per-PR reviews/check-runs walks stay CLI-only.
 - **The fit.** The daily refit check (#10245, `refit_if_due`) runs at the end
   of each cycle, in the same blocking call, so it always sees that cycle's
   snapshots; the standalone refit task is then not spawned. It is held while
