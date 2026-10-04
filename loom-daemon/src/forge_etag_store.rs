@@ -201,15 +201,37 @@ pub(crate) fn write_disk_entry(path: &Path, entry: &DiskEntry) {
     }
 }
 
+/// Who issued a conditional read and which inventoried forge operation it
+/// serves (#9831).
+///
+/// Both halves are required: `caller` is the facade's telemetry name (a valid
+/// [`Operation`], lowercase `snake_case` segments) and `op` the inventory row
+/// the read is accounted under. There is no default `op`, so a new conditional
+/// reader cannot land in the `unknown` row by omission — a site that maps to
+/// no inventoried operation says so with
+/// [`crate::forge_call_stats::ForgeOp::uninventoried`] and a reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConditionalRead {
+    pub(crate) caller: &'static str,
+    pub(crate) op: crate::forge_call_stats::ForgeOp,
+}
+
+impl ConditionalRead {
+    #[must_use]
+    pub(crate) const fn new(caller: &'static str, op: crate::forge_call_stats::ForgeOp) -> Self {
+        Self { caller, op }
+    }
+}
+
 /// One `gh api --include <url>` invocation against `target`, optionally
 /// conditional on `etag`,
 /// run in `cwd` under that root's credential (#5401). Every call is recorded
-/// against `caller` in [`crate::forge_call_stats`] (#9251, by the
+/// against `site` in [`crate::forge_call_stats`] (#9251, by the
 /// [`GhInvocation`] facade since #10089) — a local bookkeeping write, never an
-/// extra forge call. `caller` is the facade's operation name, so it must be a
-/// valid [`Operation`] (lowercase `snake_case` segments).
+/// extra forge call — keyed by `site.op` and `target`'s host and repository
+/// (#9831).
 pub(crate) fn fetch_conditional(
-    caller: &'static str,
+    site: ConditionalRead,
     gh_bin: &Path,
     cwd: Option<&Path>,
     target: &Target,
@@ -227,7 +249,7 @@ pub(crate) fn fetch_conditional(
         .as_deref()
         .and_then(|r| crate::forge_identity::read_credential(r, target.host.as_deref()));
     if let Some((dir, app_id)) = reader {
-        let first = run_fetch(caller, gh_bin, cwd, target, url, etag, Some(&dir))?;
+        let first = run_fetch(site, gh_bin, cwd, target, url, etag, Some(&dir))?;
         let (status, response, stderr) = &first;
         let http = response.as_ref().map(|r| r.status);
         let ok = status.success() || matches!(http, Some(200 | 304));
@@ -240,15 +262,15 @@ pub(crate) fn fetch_conditional(
             return Ok(first);
         };
         let repo = target.repo.as_deref().unwrap_or_default();
-        let why = format!("{caller} {url}");
+        let why = format!("{} {url}", site.caller);
         if failure == crate::forge_identity::Failure::App {
             crate::forge_identity::withdraw_after(&app_id, repo, failure, None, &why);
-            return run_fetch(caller, gh_bin, cwd, target, url, etag, None);
+            return run_fetch(site, gh_bin, cwd, target, url, etag, None);
         }
         // A 403/404 is only the READER's coverage gap if the writer can read
         // the same thing; a genuinely missing resource (a deleted issue) 404s
         // for both and must not take the repo's reader offline for an hour.
-        let second = run_fetch(caller, gh_bin, cwd, target, url, etag, None)?;
+        let second = run_fetch(site, gh_bin, cwd, target, url, etag, None)?;
         let writer_ok =
             second.0.success() || matches!(second.1.as_ref().map(|r| r.status), Some(200 | 304));
         if writer_ok {
@@ -256,7 +278,7 @@ pub(crate) fn fetch_conditional(
         }
         return Ok(second);
     }
-    run_fetch(caller, gh_bin, cwd, target, url, etag, None)
+    run_fetch(site, gh_bin, cwd, target, url, etag, None)
 }
 
 /// Deadline for one conditional read (they were unbounded `.output()`s before
@@ -268,13 +290,13 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// process-global).
 ///
 /// Built through [`GhInvocation`] (#10089), which records the call against
-/// `caller` in [`crate::forge_call_stats`] from the `--include` status line
+/// `site` in [`crate::forge_call_stats`] from the `--include` status line
 /// and rate-limit headers — the same [`crate::forge_call_stats::classify`]
 /// the hand-rolled record call here used. [`GhTarget::None`] on purpose: the
 /// writer credential stays the `cwd` root's (#5401) and nothing else, so the
 /// identity a call runs under keeps matching [`credential_scope`]'s cache key.
 fn run_fetch(
-    caller: &'static str,
+    site: ConditionalRead,
     gh_bin: &Path,
     cwd: Option<&Path>,
     target: &Target,
@@ -283,11 +305,14 @@ fn run_fetch(
     reader_dir: Option<&Path>,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
     let mut inv = GhInvocation::new(
-        Operation::new(caller),
+        Operation::new(site.caller),
         AccessIntent::Read,
         GhTarget::None,
         FETCH_TIMEOUT,
     )
+    .forge_op(site.op)
+    // Accounting only (#9831): the resolved host and repo, as two fields.
+    .identity_scope(target.host.as_deref(), target.repo.as_deref())
     .program(gh_bin)
     .args(["api", "--include", url]);
     if let Some(host) = &target.host {
