@@ -407,6 +407,7 @@ pub fn pr_case_entries(
                 actual_at: merged_at,
                 dispatch: None,
                 age_sec: 0,
+                queue: Vec::new(),
             }),
             Err(reason) => out.refused.push(RefusedEntry { at: as_of, reason }),
         }

@@ -88,6 +88,7 @@ pub(super) fn input() -> EstimateInput {
         dispatch: None,
         stalls: Vec::new(),
         held: None,
+        queue: Vec::new(),
     }
 }
 

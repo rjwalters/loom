@@ -111,6 +111,10 @@ pub struct Explanation {
     /// refusal, so their explanations are byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub twin_otter: Option<TwinOtterRecord>,
+    /// What `little-v0` (#10208) computed its queue estimate from. Absent for
+    /// every other heuristic, so their explanations are byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<QueueRecord>,
 }
 
 /// A twin-otter answer, recorded so it can be recomputed from the
@@ -158,6 +162,56 @@ pub struct TwinOtterModelRecord {
     pub aft: AftFit,
     /// Every stage's dwell curve and next-stage table: a path walks them all.
     pub path_stats: PathStats,
+}
+
+/// One later stage's recency-weighted service time in a [`QueueRecord`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceRecord {
+    /// The stage.
+    pub stage: Stage,
+    /// `repo` or `host`: the level the samples came from.
+    pub level: String,
+    /// Samples read.
+    pub n: usize,
+    /// Recency-weighted mean duration, seconds (three decimals).
+    pub mean_sec: f64,
+}
+
+/// The inputs and arithmetic of a `little-v0` estimate: enough to re-derive
+/// `result.p50_sec` as `round(items_ahead / drain_rate_per_hr * 3600) +
+/// round(sum of service[].mean_sec)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueueRecord {
+    /// The stage the item is queued in.
+    pub stage: Stage,
+    /// `repo` or `fleet`.
+    pub scope: String,
+    /// Items ahead in that stage and scope.
+    pub items_ahead: u32,
+    /// Exponentially weighted exits per hour.
+    pub drain_rate_per_hr: f64,
+    /// Half life of the weighting, seconds.
+    pub half_life_sec: i64,
+    /// Window the exits were read from, seconds before `as_of`.
+    pub window_sec: i64,
+    /// Exits observed in the window.
+    pub exits: u32,
+    /// `items_ahead / drain_rate`, whole seconds.
+    pub wait_sec: i64,
+    /// Half life of the service-time weighting, seconds.
+    pub service_half_life_sec: i64,
+    /// One entry per later stage on the path.
+    pub service: Vec<ServiceRecord>,
+    /// Sum of the service means, whole seconds.
+    pub service_total_sec: i64,
+    /// Gamma-posterior draws behind the interval.
+    pub draws: usize,
+    /// Gamma shape (the exit count, capped).
+    pub gamma_shape: u32,
+    /// The seed, `0x…`.
+    pub seed: String,
+    /// `splitmix64`.
+    pub rng: String,
 }
 
 /// The current stage as the estimate saw it.

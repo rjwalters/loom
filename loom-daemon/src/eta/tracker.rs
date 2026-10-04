@@ -1196,6 +1196,7 @@ impl Tracker {
         subject.sweep_id = item.sweep_id.clone().filter(|_| item.sweep_running);
         let (features, omitted) =
             self.recorded_features(key, item, &hold::described(&current), ctx, now, false);
+        let queue = self.stage_queue_for(key, item, &current, now);
         Some(EstimateInput {
             subject,
             as_of: now,
@@ -1206,6 +1207,7 @@ impl Tracker {
             dispatch: item.ready.clone().filter(|_| ready_only),
             stalls,
             held,
+            queue,
         })
     }
 

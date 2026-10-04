@@ -137,6 +137,7 @@ pub mod recency;
 pub mod score;
 pub mod shadow;
 pub mod simulate;
+pub mod stage_queue;
 pub mod stall;
 pub mod stall_features;
 pub mod star;
@@ -609,6 +610,11 @@ pub struct EstimateInput {
     /// heuristic estimates from it (plus the hold's stall term) instead of
     /// refusing; every other heuristic ignores it.
     pub held: Option<CurrentStage>,
+    /// Per-stage queue context (#10208): items ahead and the recent drain
+    /// rate of the stage the item is in, computed by the tracker from events
+    /// observed before `as_of`. Empty when no fleet view was observed yet.
+    /// Only `little-v0` reads it.
+    pub queue: Vec<stage_queue::StageQueue>,
 }
 
 /// A registered estimator. Implementations must be pure.
@@ -661,6 +667,7 @@ impl Registry {
                 Box::new(heuristics::LandCalmPlover),
                 Box::new(heuristics::LandFreshTide::default()),
                 Box::new(heuristics::LandV4),
+                Box::new(heuristics::LittleV0),
                 Box::new(heuristics::LandTwinOtter::new(fit.clone())),
                 Box::new(heuristics::LandTwinOtterB::new(fit.clone())),
             ],

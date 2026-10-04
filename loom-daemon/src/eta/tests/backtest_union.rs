@@ -186,6 +186,7 @@ fn case_on(day: i64, offset_sec: i64) -> ReplayCase {
         actual_at: t + Duration::seconds(900),
         dispatch: None,
         age_sec: 0,
+        queue: Vec::new(),
     }
 }
 

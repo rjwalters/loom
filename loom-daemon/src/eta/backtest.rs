@@ -100,6 +100,13 @@ pub struct ReplayCase {
     /// replayed mid-stage — the only kind that can outlive its history —
     /// sets it.
     pub age_sec: i64,
+    /// The per-stage queue context at `as_of` (#10208), replayed verbatim
+    /// into [`EstimateInput::queue`]. Empty for a case built from a record
+    /// that carries none (every `sweep.outcome`-derived case today); a
+    /// `land` case source (#9579) fills it from the stage journal with
+    /// [`super::stage_queue::stage_queue`], the same function the tracker
+    /// serves from.
+    pub queue: Vec<super::stage_queue::StageQueue>,
 }
 
 /// Every finish/land replay case one `sweep.outcome` record's own phase
@@ -161,6 +168,7 @@ pub fn cases_from_record(
             actual_at: observed_at,
             dispatch: None,
             age_sec: 0,
+            queue: Vec::new(),
         });
         if landed {
             cases.push(ReplayCase {
@@ -173,6 +181,7 @@ pub fn cases_from_record(
                 actual_at: observed_at,
                 dispatch: None,
                 age_sec: 0,
+                queue: Vec::new(),
             });
         }
         if stage == Stage::Doctor {
@@ -241,6 +250,7 @@ pub fn cases_from_journal(entries: &[JournalEntry]) -> Vec<ReplayCase> {
                 actual_at,
                 dispatch: Some(dispatch),
                 age_sec: 0,
+                queue: Vec::new(),
             });
         }
     }
@@ -445,6 +455,7 @@ fn case_input(case: &ReplayCase, loom: &Provenance) -> EstimateInput {
         // No point-in-time stall state is reconstructed for a replay.
         stalls: Vec::new(),
         held: None,
+        queue: case.queue.clone(),
     }
 }
 

@@ -172,6 +172,7 @@ fn merge_wait_history(t: chrono::DateTime<chrono::Utc>) -> StageSamples {
 
 fn one_case(t: chrono::DateTime<chrono::Utc>) -> ReplayCase {
     ReplayCase {
+        queue: Vec::new(),
         subject: subject(),
         as_of: t,
         stage: Stage::MergeWait,

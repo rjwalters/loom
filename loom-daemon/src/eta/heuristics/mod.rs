@@ -18,6 +18,7 @@ mod land_v1;
 mod land_v2;
 mod land_v3;
 mod land_v4;
+mod little_v0;
 mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
@@ -35,6 +36,7 @@ pub use land_v3::{
     INPUT_MISSING, LAND_V3, LOWER_STRETCH, REFERENCE_POINTS, REVIEW_FLOOR_SEC, UPPER_STRETCH,
 };
 pub use land_v4::{LandV4, LAND_V4};
+pub use little_v0::{wait_sec, LittleV0, LITTLE_V0};
 pub use start_v1::{StartV1, START_V1};
 
 /// The heuristic whose track record the calibration log (#10207) records.
@@ -190,6 +192,7 @@ fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) -> Explanat
         recalibration: None,
         calibration: None,
         twin_otter: None,
+        queue: None,
     }
 }
 
