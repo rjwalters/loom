@@ -1,0 +1,53 @@
+# Fixture: suites run on merge_group but test the wrong tree, or can be
+# cancelled / superseded there.
+name: CI
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+concurrency:
+  group: ci-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: true
+jobs:
+  head-checkout:
+    name: Head Checkout
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.head_ref || 'main' }}
+      - run: make test
+
+  matrix-checkout:
+    name: Matrix Checkout
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+      - run: make test
+
+  good-checkouts:
+    name: Good Checkouts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+      - uses: actions/checkout@v4
+        with:
+          repository: other-org/tooling
+          ref: main
+      - run: make test
+
+  deploy-preview:
+    name: Deploy Preview
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy
+      cancel-in-progress: ${{ github.event_name != 'merge_group' }}
+    steps:
+      - run: make preview

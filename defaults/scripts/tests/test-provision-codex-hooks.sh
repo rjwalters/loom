@@ -30,6 +30,9 @@
 #       for every profile/workspace, ready from any workspace, executed the
 #       way Codex runs it (cwd -> main checkout's bridge, fail closed with
 #       exit 2), and private-session pinned entries never replaced
+#   12. trust location: only a trusted_hash keyed to Loom's own entry at the
+#       hooks.json path Codex reads at runtime counts (host vs session
+#       container); spelling variants are covered by codex_hooks_tests.rs
 #
 # Usage: ./defaults/scripts/tests/test-provision-codex-hooks.sh
 
@@ -99,9 +102,22 @@ new_profile() {
     printf '%s' "$dir"
 }
 
-trust_profile() {
-    # Simulate the operator having accepted Codex's hook-trust prompt once.
-    printf 'hooks.state."loom-managed".trusted_hash = "deadbeefcafe"\n' > "$1/config.toml"
+# loom_key <profile> [runtime home]: the hooks.state key Codex records trust
+# for Loom's entry under — `<canonical CODEX_HOME>/hooks.json:pre_tool_use:G:H`.
+loom_key() {
+    local home="${2:-$(cd -P -- "$1" && pwd -P)}" pos="0:0"
+    if [[ -f "$1/hooks.json" ]]; then
+        pos="$(jq -r '(.hooks.PreToolUse // []) | to_entries[] | .key as $g
+            | ((.value.hooks // []) | to_entries[])
+            | select(.value.command | contains("guard-codex-bridge.sh")) | "\($g):\(.key)"' "$1/hooks.json" | head -1)"
+    fi
+    printf '%s/hooks.json:pre_tool_use:%s' "$home" "${pos:-0:0}"
+}
+
+trust_profile() { # <profile> [hash] [runtime home]
+    # Simulate the operator having accepted Codex's hook-trust prompt once, in
+    # the exact shape Codex writes it: keyed by Loom's entry's location.
+    printf '[hooks.state."%s"]\ntrusted_hash = "%s"\n' "$(loom_key "$1" "${3:-}")" "${2:-deadbeefcafe}" > "$1/config.toml"
 }
 
 run_provision() {
@@ -296,7 +312,7 @@ jq -e '.trustSignal == "baseline-diff-no-new-trust"' <<<"$(verify_json "$P8")" >
     || fail "trust-baseline: verify JSON reports trustSignal=baseline-diff-no-new-trust (got $(verify_json "$P8"))"
 # Re-trusting (a NEW hooks.state entry, simulating the operator accepting the
 # prompt again for the changed content) restores readiness.
-printf 'hooks.state."loom-managed".trusted_hash = "deadbeefcafe"\nhooks.state."loom-managed-2".trusted_hash = "freshtrust2"\n' > "$P8/config.toml"
+trust_profile "$P8" freshtrust2
 [[ "$(verify_code "$P8")" == "0" ]] \
     && pass "trust-baseline: a fresh trust decision after a content change restores readiness" \
     || fail "trust-baseline: a fresh trust decision after a content change restores readiness"
@@ -554,6 +570,40 @@ r="$(run_provision install --codex-home "$PP" --workspace /workspace/repo --brid
     && pass "an explicit --bridge still writes the pinned v1 entry" || fail "an explicit --bridge still writes the pinned v1 entry"
 
 echo
+echo "=== trust location: only trust keyed to Loom's entry where Codex runs counts ==="
+PK="$(new_profile keyed)"
+run_provision install --codex-home "$PK" --workspace "$WSA" >/dev/null
+kverify() { bash "$PROVISION" verify --codex-home "$PK" --workspace "$WSA" --json 2>/dev/null; }
+# The robb-studio shape: the only trust in the file is keyed to ANOTHER
+# profile directory's hooks.json. Codex never consults it for this profile.
+printf '[hooks.state."/elsewhere/profiles/r.j.walters/hooks.json:pre_tool_use:0:0"]\ntrusted_hash = "sha256:aa"\n' > "$PK/config.toml"
+v="$(kverify)"
+jq -e '.ready == false and .trusted == false and .trustSignal == "wrong-location"' <<<"$v" >/dev/null 2>&1 \
+    && pass "trust keyed to another profile's hooks.json -> not trusted (wrong-location)" \
+    || fail "trust keyed to another profile's hooks.json -> not trusted (got $v)"
+if grep -q "/elsewhere" <<<"$v"; then fail "verify output names no foreign path"; else pass "verify output names no foreign path"; fi
+trust_profile "$PK"
+jq -e '.ready == true and (.trustLocation | startswith("profile"))' <<<"$(kverify)" >/dev/null 2>&1 \
+    && pass "trust at Loom's own key on this host -> ready" || fail "trust at Loom's own key on this host -> ready"
+# A session-managed profile runs in its container, where CODEX_HOME is the
+# fixed mount point: trust taken on the HOST does not count, and the reverse.
+printf '{}\n' > "$PK/.session-managed.json"
+v="$(kverify)"
+jq -e '.trusted == false and .trustSignal == "wrong-location" and .trustLocation == "the session container"' <<<"$v" >/dev/null 2>&1 \
+    && pass "session-managed profile: host-keyed trust does not count in the container" \
+    || fail "session-managed profile: host-keyed trust does not count (got $v)"
+trust_profile "$PK" deadbeefcafe /home/loom/.codex-profile
+jq -e '.ready == true' <<<"$(kverify)" >/dev/null 2>&1 \
+    && pass "session-managed profile: container-keyed trust -> ready" || fail "session-managed profile: container-keyed trust -> ready"
+# spawn-codex names where it will actually run (LOOM_CODEX_SESSION_EXEC=0 runs an
+# adopted profile on bare metal); the stub must forward that, not re-derive it.
+v="$(bash "$PROVISION" verify --codex-home "$PK" --workspace "$WSA" --runtime-codex-home "$(cd -P "$PK" && pwd -P)" --json 2>/dev/null)"
+jq -e '.ready == false and .trustSignal == "wrong-location" and (.trustLocation | startswith("profile"))' <<<"$v" >/dev/null 2>&1 \
+    && pass "--runtime-codex-home reaches the native verify: container-keyed trust does not count on bare metal" \
+    || fail "--runtime-codex-home reaches the native verify (got $v)"
+mv "$PK/.session-managed.json" "$TMPROOT/session-managed.json.bak"
+
+echo
 echo "=== credential hygiene ==="
 leak=0
 for f in "$P1/hooks.json" "$P1/loom-codex-hooks.json" "$P2/hooks.json"; do
@@ -571,11 +621,12 @@ if grep -q "$FAKE_TOKEN" <<<"$all_out"; then
 else
     pass "no credential material in install/verify output"
 fi
-if grep -nE '(^|[^-A-Za-z])--dangerously-bypass-hook-trust' "$REPO_ROOT/defaults/scripts/spawn-codex.sh" \
-    | grep -vqE '#|log_(error|warn|info)'; then
-    fail "spawn-codex.sh passes --dangerously-bypass-hook-trust"
+waiver="$(grep -nE '(^|[^-A-Za-z])--dangerously-bypass-hook-trust' "$REPO_ROOT/defaults/scripts/spawn-codex.sh" "$PROVISION" \
+    | grep -vE ':[[:space:]]*#|log_(error|warn|info)' || true)"
+if [[ "$(printf '%s\n' "$waiver" | grep -c .)" == "1" && "$waiver" == *'[[ "$_hook_trust_bypass" != "sealed" ]] ||'* ]]; then
+    pass "--dangerously-bypass-hook-trust is passed only behind spawn-codex.sh's sealed verdict (#10102)"
 else
-    pass "spawn-codex.sh never passes --dangerously-bypass-hook-trust"
+    fail "--dangerously-bypass-hook-trust is passed outside the sealed gate: $waiver"
 fi
 # The flag has a config-key equivalent (`-c bypass_hook_trust=true`) in the
 # 0.146.0 binary, so asserting only on the flag spelling would leave the same

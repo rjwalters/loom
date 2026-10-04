@@ -108,6 +108,7 @@ fn side(
     head: &str,
 ) -> Option<Vec<FileIdentity>> {
     let body = super::gh_api(
+        "verdict.patch_compare",
         gh_bin,
         cwd,
         &format!("repos/{{owner}}/{{repo}}/compare/{base_ref}...{head}"),

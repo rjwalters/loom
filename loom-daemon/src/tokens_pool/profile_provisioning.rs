@@ -27,9 +27,10 @@
 //!   opened. Provisioning a profile never opens, copies, parses, or logs it.
 //! - **Hook trust is not established here.** The managed bridge is installed
 //!   per profile by the provider's own bridge script; Codex hook *trust*
-//!   stays a per-profile, operator-attested one-time step, and Loom never
-//!   passes `--dangerously-bypass-hook-trust` (see
-//!   `defaults/docs/guardrail-parity-codex.md`).
+//!   is never copied between profiles. On bare metal it stays a per-profile,
+//!   operator-attested one-time step. In a session container a sealed
+//!   registration replaces it (#10102, `codex_hooks::seal`). See
+//!   `defaults/docs/guardrail-parity-codex.md`.
 //! - **Session-managed profiles are skipped.** Once `accounts session start`
 //!   adopts a profile, its container is the sole process allowed to touch
 //!   that `CODEX_HOME` (issue #6925, ADR-0017 Decision 1). Host-side

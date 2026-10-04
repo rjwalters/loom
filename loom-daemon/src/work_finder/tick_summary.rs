@@ -104,7 +104,30 @@ pub fn tick_summary(
         saturation_held: report.saturation_held,
         build_backoff_held: report.build_backoff_held,
         collisions: report.collisions,
+        cap: None,
     }
+}
+
+/// The latest cap terms the work-finder loop observed (Issue #10214), set by
+/// [`super::CapTerms::observed`] and stamped onto the published summary by
+/// [`publish_tick`], so neither frozen tick loop needs a new parameter.
+static LAST_CAP: OnceLock<Mutex<Option<crate::types::CapView>>> = OnceLock::new();
+
+/// Record this tick's cap terms (Issue #10214).
+pub fn record_cap(cap: crate::types::CapView) {
+    *LAST_CAP
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cap);
+}
+
+/// The latest recorded cap terms, or `None` before the first tick.
+#[must_use]
+pub fn last_cap() -> Option<crate::types::CapView> {
+    *LAST_CAP
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// [`publish_tick_summary_at`] stamped with the current wall clock.
@@ -152,7 +175,8 @@ pub fn publish_tick(
     // the two "this tick completed at" instants are bit-identical rather than
     // two separate `Utc::now()` reads a few lines apart.
     let completed_at = chrono::Utc::now();
-    let summary = tick_summary(report, max_concurrent, completed_at, roots, plan);
+    let mut summary = tick_summary(report, max_concurrent, completed_at, roots, plan);
+    summary.cap = last_cap().filter(|c| c.effective() == max_concurrent);
     crate::observability::ops::queue::record_queue(&summary);
     store_tick_summary(summary);
     crate::observability::ops::dispatch::record_tick(

@@ -707,6 +707,11 @@ means "apply `loom:operator-only` + `loom:operator-decision`, with the
 disagreement-axis comment rule 4 already requires". Contract and design
 rationale: [`premise-gate.md`](premise-gate.md).
 
+**`loom:decision-malformed` (#10057)**: the operator UI bounces a
+`loom:operator-decision` issue without a valid `decision` block into this label.
+Curator repairs it (back to `loom:operator-decision`) or, if no operator call
+exists, removes it and re-routes; a repeat bounce is left alone.
+
 ## `loom:needs-capability` — a narrower claim than `loom:operator-only` (#5817)
 
 A fleet-wide census (example-org/fleet-repo#301) found `loom:operator-only` carrying at
@@ -963,7 +968,7 @@ above. Nothing about the guard changes for any other blocking label.
 
 `defaults/labels.json` is the single source of truth for label semantics: each
 label's name, description, color, `kind`, `applied_by`/`removed_by`, and the
-boolean properties the daemon's hand-listed tables encode (`park`, `skip`,
+boolean properties the daemon's label tables encode (`park`, `skip`,
 `hold`, `operator_gate`, `blocked_colabel`, `hard_exclusion`, `champion_path`,
 `human_gated`, `contradicts_approval`). It is embedded in `loom-daemon`; query
 it with `loom-daemon labels list --property park` / `labels get <name>`
@@ -973,6 +978,7 @@ The Loom block of `.github/labels.yml` and `defaults/.github/labels.yml` is
 generated from it: edit the registry, then run `loom-daemon labels generate
 --write`. The `label_registry` tests fail on registry drift;
 `check-labels-drift.sh` only keeps the two copies byte-identical.
-Slice 1 only: the daemon tables are still hand-listed but are held equal to the
-registry by lockstep tests, so a change to a table's meaning goes in the
-registry. `stale_after_minutes`, `lifecycle` and `propagate` are inert.
+The park, skip, hard-exclusion and champion-path sets are derived from the
+registry; the other daemon tables are still hand-listed, held equal to it by
+lockstep tests. Either way a change to a table's meaning goes in the registry.
+`stale_after_minutes`, `lifecycle` and `propagate` are inert.

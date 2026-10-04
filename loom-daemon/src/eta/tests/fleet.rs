@@ -80,6 +80,7 @@ fn input() -> EstimateInput {
             age_sec: 0,
             age_source: AgeSource::LabelEvent,
             rework_rounds: 0,
+            episode_entered_at: None,
         }),
         features: crate::eta::explanation::Features::default(),
         features_omitted: Vec::new(),
@@ -277,6 +278,7 @@ fn augmenting_a_local_history_reports_fleet_scope_and_both_attributions() {
             age_sec: 0,
             age_source: AgeSource::LabelEvent,
             rework_rounds: 0,
+            episode_entered_at: None,
         }),
         ..input()
     };
@@ -609,6 +611,21 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ("heuristics/finish_v1.rs", include_str!("../heuristics/finish_v1.rs")),
     ("heuristics/land_v1.rs", include_str!("../heuristics/land_v1.rs")),
     ("heuristics/land_v2.rs", include_str!("../heuristics/land_v2.rs")),
+    ("heuristics/land_v3.rs", include_str!("../heuristics/land_v3.rs")),
+    (
+        "heuristics/land_amber_heron.rs",
+        include_str!("../heuristics/land_amber_heron.rs"),
+    ),
+    // #10207: the recalibration fit and transform the heuristic calls.
+    ("recalibrate.rs", include_str!("../recalibrate.rs")),
+    ("twin_otter/mod.rs", include_str!("../twin_otter/mod.rs")),
+    ("twin_otter/eval.rs", include_str!("../twin_otter/eval.rs")),
+    ("twin_otter/path.rs", include_str!("../twin_otter/path.rs")),
+    // #10243: the adapter, refusal map and explanation over the core above.
+    (
+        "heuristics/land_twin_otter.rs",
+        include_str!("../heuristics/land_twin_otter.rs"),
+    ),
 ];
 
 /// The whole point of #9343's "the estimator stays pure over a snapshot": a

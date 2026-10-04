@@ -157,13 +157,24 @@ fn had_ever_succeeded_is_independent_per_role_and_root() {
 /// `LOOM_RUNTIME` (as the `spawn-worker.sh` runtime selector), and
 /// without this guard that ambient value silently outranks the
 /// `runtimes.roles` config precedence this test exercises (#4739).
-struct ClearedLoomRuntimeEnv(Option<String>);
+///
+/// It also points `LOOM_CODEX_PROFILE_ROOT` at an empty tempdir (#9964): a
+/// codex-admitted role resolves the profile root, and these tests must never
+/// read the host's real `~/.loom/codex-profiles`.
+struct ClearedLoomRuntimeEnv(
+    Option<String>,
+    #[allow(dead_code)] crate::tokens_pool::profile_root_env::ProfileRootEnv,
+    #[allow(dead_code)] tempfile::TempDir,
+);
 
 impl ClearedLoomRuntimeEnv {
     fn new() -> Self {
         let prior = std::env::var("LOOM_RUNTIME").ok();
         std::env::remove_var("LOOM_RUNTIME");
-        Self(prior)
+        let profiles = tempfile::tempdir().unwrap();
+        let profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
+        Self(prior, profile_root, profiles)
     }
 }
 

@@ -3,6 +3,12 @@
 //! (5 minutes by default), each with its full explanation. A refusal is
 //! emitted when its reason first appears and is not refreshed. A per-series
 //! hourly cap bounds a flapping item.
+//!
+//! The signature is per series: an item's series share its stage, rework
+//! count and refusal reason, except a hold-aware series of a held item
+//! (#10284), whose signature is `merge_hold` with no reason, so it refreshes
+//! while the item's other series keep its `blocked` refusal unrefreshed
+//! (`tracker_hold.rs`).
 
 use super::{NoEstimateReason, Stage};
 use chrono::{DateTime, Duration, Utc};

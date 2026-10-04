@@ -7,9 +7,15 @@ use super::*;
 use crate::runtime_admission::{AdmissionContext, ContainmentProof};
 use std::fs;
 
-struct Env(Vec<(&'static str, Option<String>)>, tempfile::TempDir);
+/// The third field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964).
+struct Env(
+    Vec<(&'static str, Option<String>)>,
+    tempfile::TempDir,
+    crate::tokens_pool::profile_root_env::ProfileRootLock,
+);
 impl Env {
     fn new() -> Self {
+        let lock = crate::tokens_pool::profile_root_env::lock();
         let keys = [
             "LOOM_RUNTIME",
             "LOOM_RUNTIME_BUILDER",
@@ -29,7 +35,7 @@ impl Env {
         }
         let profiles = tempfile::tempdir().unwrap();
         std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
-        Self(prior, profiles)
+        Self(prior, profiles, lock)
     }
     fn provision_codex_seat(&self) {
         fs::create_dir_all(self.1.path().join("seat")).unwrap();
@@ -229,7 +235,9 @@ fn without_a_preparer_codex_builder_is_still_refused() {
     assert!(!error.reason.contains("containment"), "{}", error.reason);
 }
 
-/// Read roles are admitted statically; the preparer is never asked.
+/// Read roles are admitted statically; the preparer is never asked. (Curator,
+/// not Judge: Judge is a merging role whose Codex availability additionally
+/// needs a guard-ready seat, see `codex_guard`.)
 #[test]
 #[serial_test::serial]
 fn read_roles_never_consult_the_preparer() {
@@ -237,7 +245,7 @@ fn read_roles_never_consult_the_preparer() {
     env.provision_codex_seat();
     let dir = workspace(Some(serde_json::json!(["codex"])));
     let mut preparer = FakePreparer::new(dir.path(), true);
-    let Decision::Preference { resolution, .. } = walk(dir.path(), "judge", &mut preparer) else {
+    let Decision::Preference { resolution, .. } = walk(dir.path(), "curator", &mut preparer) else {
         panic!("expected the preference path");
     };
     let chosen = resolution.chosen.unwrap();

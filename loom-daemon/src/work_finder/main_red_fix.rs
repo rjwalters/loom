@@ -23,11 +23,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::WorkItem;
+use crate::cmd_out::{CmdOutcome, Unavailable};
 use crate::main_health_gate::{MainHealthState, WorkspaceHealthStates};
 
 /// The body marker declaring an issue a fix for a red `main` (#9244).
@@ -148,29 +148,33 @@ pub(super) fn default_branch_for(root: &Path) -> String {
 
 fn probe_ci_main_red(root: &Path) -> bool {
     let branch = default_branch_for(root);
-    let mut cmd = Command::new("gh");
-    cmd.args(["run", "list", "--branch", &branch, "--limit", "30"])
-        .args(["--json", "headSha,status,conclusion,workflowName"])
-        .current_dir(root)
-        .stdin(Stdio::null());
-    crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, Some(root));
+    let probe = crate::gh_invocation::GhInvocation::new(
+        crate::gh_invocation::Operation::new("run.list"),
+        crate::gh_invocation::AccessIntent::Read,
+        crate::gh_invocation::GhTarget::None,
+        Duration::from_secs(30),
+    )
+    .args(["run", "list", "--branch", &branch, "--limit", "30"])
+    .args(["--json", "headSha,status,conclusion,workflowName"])
+    .current_dir(root)
+    .run();
     let unavailable = |why: &str| {
         log::debug!("work_finder: red-main CI fallback unavailable for {} ({why})", root.display());
         false
     };
-    match crate::sweep_registry::reaper::output_with_timeout(cmd, Duration::from_secs(30)) {
-        Ok(Some(out)) if out.status.success() => {
+    match probe {
+        CmdOutcome::Ran(out) if out.status.success() => {
             latest_run_is_failure(&String::from_utf8_lossy(&out.stdout))
         }
-        Ok(Some(out)) => {
+        CmdOutcome::Ran(out) => {
             // Feed the rate-limit breaker like every other forge read, so an
             // exhausted pool trips it instead of being retried every minute.
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             crate::rate_limit_breaker::global_observe_failure(&stderr, "work_finder_main_red_ci");
             unavailable(&stderr)
         }
-        Ok(None) => unavailable("timed out"),
-        Err(e) => unavailable(&e.to_string()),
+        CmdOutcome::Unavailable(Unavailable::TimedOut { .. }) => unavailable("timed out"),
+        CmdOutcome::Unavailable(other) => unavailable(&format!("{other:?}")),
     }
 }
 

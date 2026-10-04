@@ -143,6 +143,7 @@ use chrono::{DateTime, Utc};
 
 use crate::workspace_pool::WorkspacePool;
 
+mod dirty_paths;
 mod failure_digest;
 /// `pub(crate)` rather than private since #8088: `daemon_update::selfrepl`
 /// reuses [`native_probe::running_binary`] rather than re-deriving it. That
@@ -152,6 +153,7 @@ mod failure_digest;
 /// right. Still crate-internal: nothing here is part of the public API.
 pub(crate) mod native_probe;
 mod relaunch_verify_note;
+use dirty_paths::with_dirty_paths;
 mod stale_repo;
 
 use failure_digest::failure_digest;
@@ -275,6 +277,8 @@ pub struct AutoUpdateConfig {
     /// to `None`: `0` would clear a declaration on the tick it was made, which is
     /// #8998's livelock re-entered through the knob.
     pub roll_stall_cooldown_secs: Option<u64>,
+    /// #9132's window knobs (`rollWindowSecs`, `rollWindowOffsetSecs`, `launchdLiveReload`).
+    pub roll_window: roll_window::RollWindowConfig,
 }
 
 /// Read `.loom/config.json → autonomous.autoUpdate` through
@@ -313,6 +317,7 @@ pub fn read_auto_update_config(repo_root: &Path) -> AutoUpdateConfig {
             .get("rollStallCooldownSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
+        roll_window: roll_window::RollWindowConfig::from_block(block),
     }
 }
 
@@ -407,6 +412,8 @@ pub struct AutoUpdateStatusSnapshot {
     pub stale_repo_ticks: u32,
     /// The repo that streak's most recent tick queried.
     pub stale_repo: Option<String>,
+    /// #9132: the roll schedule, or `None` when no window is configured.
+    pub roll_window: Option<roll_window::RollWindowStatus>,
 }
 
 /// Shared, thread-safe handle the loop publishes to and
@@ -577,6 +584,8 @@ pub use drain_trigger::{DrainTrigger, IpcDrainTrigger};
 /// `.loom/docs/file-size-policy.md`'s threshold, and a state machine whose
 /// whole value is that it terminates belongs next to the tests that prove it.
 pub mod roll_stall;
+/// #9132: schedule-driven rolls (window, per-host offset, one arm per window).
+pub mod roll_window;
 /// The loop's resolved knob set, bundled — see the module doc for why a fourth
 /// positional `Duration` was the wrong shape.
 pub mod tuning;
@@ -1213,6 +1222,8 @@ pub struct AutoUpdateState {
     /// newer release, which restarts #6007's paused-dispatch budget) cannot hide
     /// the fact that its wait condition is unreachable.
     roll_stall: roll_stall::RollStallTracker,
+    /// #9132's schedule gate (inert unless `rollWindowSecs` is configured).
+    window: roll_window::WindowGate,
 }
 
 impl AutoUpdateState {
@@ -1738,6 +1749,7 @@ impl AutoUpdateState {
             artifact_published_at,
             stale_repo_ticks: self.stale_repo.ticks(),
             stale_repo: self.stale_repo.repo(),
+            roll_window: self.window.status(),
         }
     }
 }
@@ -1809,26 +1821,6 @@ fn backoff_delay(failures: u32) -> Duration {
     Duration::from_secs(scaled.min(BACKOFF_CEILING.as_secs()))
 }
 
-/// Append the first three `paths` (plus a count of any remainder) to `reason`
-/// (Issue #7608) — e.g. `"<reason> — dirty paths (2): foo.rs, bar.rs"`, or
-/// `"... (5): a, b, c, +2 more"` past three. Returns `reason` unchanged when
-/// `paths` is empty (no path detail available, e.g. the probe couldn't
-/// re-resolve them).
-#[must_use]
-fn with_dirty_paths(reason: &str, paths: Vec<String>) -> String {
-    if paths.is_empty() {
-        return reason.to_string();
-    }
-    let shown: Vec<&str> = paths.iter().take(3).map(String::as_str).collect();
-    let remainder = paths.len().saturating_sub(shown.len());
-    let suffix = if remainder > 0 {
-        format!(", +{remainder} more")
-    } else {
-        String::new()
-    };
-    format!("{reason} — dirty paths ({}): {}{suffix}", paths.len(), shown.join(", "))
-}
-
 // ============================================================================
 // Runtime wiring
 // ============================================================================
@@ -1846,6 +1838,7 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
 ) {
     let now = Instant::now();
     let last_check = Utc::now();
+    let settle = state.window.begin_tick(last_check, trigger, settle);
     // Issue #8998: before either cooperating with an armed roll or arming a new
     // one, ask whether the condition it waits for (in-flight reaches zero) is
     // reachable at all. The in-flight count is read only when there is an
@@ -1908,6 +1901,7 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
             }
             supersede::ArmedRollAction::Supersede { from, to } => {
                 let note = supersede::supersede_note(&from, &to);
+                state.window.allow_retarget();
                 log::warn!("auto_update: {note}");
                 if !trigger.supersede_roll(&from, &to) {
                     // The roll completed or was abandoned between the two reads
@@ -1956,7 +1950,8 @@ fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
         tree_clean,
         in_flight,
     };
-    let note = match state.decide(now, &inputs, settle, defer_deadline) {
+    let decision = state.decide(now, &inputs, settle, defer_deadline);
+    let note = match state.window.gate(last_check, decision) {
         TickDecision::Skip(reason) => {
             // Issue #7608: name the offending paths behind a dirty-tree
             // refusal — the generic reason alone gave no way to tell an
@@ -2101,6 +2096,7 @@ where
         let mut state = AutoUpdateState::new()
             .with_roll_stall_deadlines(tuning.roll_stall_deadlines)
             .with_roll_stall_cooldown(tuning.roll_stall_cooldown);
+        state.window = roll_window::WindowGate::new(tuning.roll_window);
         let mut ticker = tokio::time::interval(tuning.interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

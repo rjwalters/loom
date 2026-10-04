@@ -103,6 +103,7 @@
 
 pub mod availability;
 pub mod ceiling;
+pub mod codex_guard;
 pub mod handoff;
 pub mod resolve;
 pub mod sandbox_hold;

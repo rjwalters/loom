@@ -78,6 +78,7 @@ use serde_json::Value;
 
 use crate::cmd_out::{run_command, CmdOutcome};
 use crate::config_resolver::{get_path, resolve_effective_config};
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
 /// Ceiling for a `git`/`gh` invocation from the forge CLI surface.
 ///
@@ -396,6 +397,13 @@ pub fn gitea_config_from_forge(forge: &Value) -> Result<GiteaConfig> {
 // Command dispatch
 // ---------------------------------------------------------------------------
 
+/// A counted (#10089), bounded facade invocation for the forge subcommands.
+/// `gh` is the (possibly test-injected) program; bare `gh` resolves through
+/// the facade's ladder.
+fn forge_inv(op: &'static str, intent: AccessIntent, gh: &str) -> GhInvocation {
+    GhInvocation::new(Operation::new(op), intent, GhTarget::None, FORGE_CMD_TIMEOUT).program(gh)
+}
+
 /// Resolve the `gh` binary name — delegates to the single resolver (#9985).
 pub(crate) fn gh_bin() -> String {
     crate::gh_invocation::gh_bin()
@@ -445,12 +453,22 @@ fn gh_passthrough(entity: &str, args: &[String]) -> Result<()> {
     // Capturing it would break every one of those, and a deadline is wrong for a
     // command whose whole job is to be interactive for as long as the operator
     // needs. Different lifetime contract, out of scope for the capture layer.
-    let mut command = Command::new(gh_bin());
-    command.arg(entity);
-    command.args(args);
-    let status = command
-        .status()
-        .map_err(|e| anyhow!("failed to exec gh: {e}"))?;
+    //
+    // #10089: it is still a facade invocation (`.passthrough()` = inherited
+    // stdio, no deadline) so the call is counted under `forge.passthrough`.
+    let completion = crate::gh_invocation::GhInvocation::new(
+        crate::gh_invocation::Operation::new("forge.passthrough"),
+        crate::gh_invocation::AccessIntent::Write,
+        crate::gh_invocation::GhTarget::None,
+        FORGE_CMD_TIMEOUT,
+    )
+    .args(std::iter::once(entity).chain(args.iter().map(String::as_str)))
+    .passthrough()
+    .execute()
+    .map_err(|e| anyhow!("failed to exec gh: {e}"))?;
+    let crate::gh_invocation::GhCompletion::Passthrough(status) = completion else {
+        return Err(anyhow!("failed to exec gh: unexpected captured completion"));
+    };
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -495,11 +513,9 @@ fn github_auto_merge(pr: u32, method: &str, expected_head_sha: Option<&str>) -> 
     struct NodeId {
         node_id: String,
     }
-    let mut node_cmd = Command::new(&gh);
-    node_cmd
+    let node_out = forge_inv("forge.pr_node_id", AccessIntent::Read, &gh)
         .args(["api", &format!("repos/{owner}/{repo}/pulls/{pr}")])
-        .stdin(Stdio::null());
-    let node_out = run_command(node_cmd, FORGE_CMD_TIMEOUT);
+        .run();
     let node_id = match crate::cmd_out::decode_json::<NodeId, _>(node_out, |n| n.node_id.is_empty())
     {
         crate::cmd_out::Query::Populated(n) => n.node_id,
@@ -569,9 +585,9 @@ fn github_auto_merge(pr: u32, method: &str, expected_head_sha: Option<&str>) -> 
         args.push(format!("expectedHeadOid={sha}"));
     }
 
-    let mut merge_cmd = Command::new(&gh);
-    merge_cmd.args(&args).stdin(Stdio::null());
-    let result = run_command(merge_cmd, FORGE_CMD_TIMEOUT);
+    let result = forge_inv("forge.auto_merge", AccessIntent::Write, &gh)
+        .args(&args)
+        .run();
     match result {
         ref o if o.succeeded() => {
             println!("Auto-merge enabled for PR #{pr}");
@@ -638,16 +654,18 @@ fn repo_nwo_in(gh: &str, cwd: Option<&Path>) -> Option<String> {
         #[serde(rename = "nameWithOwner")]
         name_with_owner: String,
     }
-    let mut cmd = Command::new(gh);
-    cmd.args(["repo", "view", "--json", "nameWithOwner"]);
-    cmd.stdin(Stdio::null());
+    let mut inv = forge_inv("forge.repo_nwo", AccessIntent::Read, gh).args([
+        "repo",
+        "view",
+        "--json",
+        "nameWithOwner",
+    ]);
     if let Some(dir) = cwd {
-        cmd.current_dir(dir);
+        inv = inv.current_dir(dir);
     }
-    let q =
-        crate::cmd_out::decode_json::<NameWithOwner, _>(run_command(cmd, FORGE_CMD_TIMEOUT), |n| {
-            n.name_with_owner.is_empty()
-        });
+    let q = crate::cmd_out::decode_json::<NameWithOwner, _>(inv.run(), |n| {
+        n.name_with_owner.is_empty()
+    });
     // Populated is the only case that answers; Empty / Malformed / Failed /
     // Unavailable all fall through to the git-remote fallback below, which is
     // what the previous code did for every one of them too — the difference is
@@ -753,8 +771,8 @@ pub enum ForgeCmd {
     /// probe (#9453 Phase 4): does `feature/issue-N` already exist on
     /// `origin`? Implemented in [`crate::forge_check_branch`]; see that
     /// module for the exit-code contract. Zero forge-API calls (`git
-    /// ls-remote`, not `gh`).
-    CheckBranch { issue: u32 },
+    /// ls-remote`, not `gh`) unless `closed_pr_head` is set (#10027).
+    CheckBranch(crate::forge_check_branch::CheckBranchArgs),
     /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]`.
     /// Operator-only (#8427): arms a server-side merge that bypasses Loom's
     /// merge-time gates; never dispatched from a Loom merge path.
@@ -854,7 +872,7 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
         ForgeCmd::CheckClaim { issue, force_claim } => {
             crate::forge_check_claim::handle(issue, force_claim)
         }
-        ForgeCmd::CheckBranch { issue } => crate::forge_check_branch::handle(issue),
+        ForgeCmd::CheckBranch(args) => crate::forge_check_branch::handle(args),
         ForgeCmd::AutoMerge {
             pr,
             method,

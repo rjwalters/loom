@@ -21,7 +21,13 @@
 -- Scored vs counted: `abandoned` outcomes (the issue closed as not planned)
 -- and outcomes of refusals carry no `loom.eta.error_sec`; they are
 -- counted by section 0 and excluded from every error, coverage and loss figure
--- by `mapContains(attributes_number, 'loom.eta.error_sec')`.
+-- by `mapContains(attributes_number, 'loom.eta.error_sec')`. A `censored`
+-- outcome (#10233: expired unresolved, p90 already passed) carries only
+-- `loom.eta.above_p90`, so it is excluded the same way and counted by Q4.
+--
+-- Q4-Q7 (#10233) are the views the promotion gate's live rules mirror: late
+-- surprise on the common decidable subset, stability of the predicted landing
+-- instant, convergence of the interval, and a time-weighted answer rate.
 --
 -- Duplicates: delivery is at least once, so every section de-duplicates
 -- outcomes on `loom.eta.estimate_id` (`LIMIT 1 BY`).
@@ -191,3 +197,212 @@ WHERE value IS NOT NULL
 GROUP BY heuristic, revision, kind, feature
 HAVING n >= 20
 ORDER BY abs(rank_corr) DESC;
+
+-- Q4. Late surprise (#10233): how often the actual lands after p90, per
+--     heuristic, revision and kind, on the COMMON DECIDABLE SUBSET. Every
+--     heuristic of a kind estimates a subject at the same instant, so
+--     `(repo, issue, kind, as_of)` names one comparison. It counts here only
+--     when EVERY heuristic's outcome at that instant has a decided late
+--     surprise (`loom.eta.above_p90` present): a heuristic that refused, or
+--     recorded no p90, removes the instant for all of them, so leaving its
+--     hard cases out cannot make it look better than one that answered them.
+--     `as_of` is not an attribute; it is the record time (`actual_at`) minus
+--     `loom.eta.lead_sec`.
+--
+--     A `censored` outcome is an estimate that expired unresolved with its
+--     p90 already behind it: a decided late surprise, counted here, carrying
+--     no error or loss (so absent from Q1/Q2/Q6). A rate near 0.10 is
+--     calibrated; `censored` says how much of the rate is still-open work.
+WITH decided AS (
+    SELECT attributes_string['loom.eta.estimate_id'] AS estimate_id,
+           attributes_string['loom.eta.heuristic'] AS heuristic,
+           attributes_string['loom.eta.revision'] AS revision,
+           attributes_string['loom.eta.kind'] AS kind,
+           attributes_string['loom.repo'] AS repo,
+           attributes_number['loom.issue'] AS issue,
+           toInt64(intDiv(timestamp, 1000000000))
+               - toInt64(attributes_number['loom.eta.lead_sec']) AS as_of_sec,
+           attributes_string['loom.eta.outcome'] AS outcome,
+           mapContains(attributes_bool, 'loom.eta.above_p90') AS has_p90,
+           attributes_bool['loom.eta.above_p90'] AS above_p90
+    FROM signoz_logs.distributed_logs_v2
+    WHERE mapContains(attributes_string, 'loom.eta.outcome')
+      AND attributes_bool['loom.eta.provenance_complete'] = true
+      AND attributes_bool['loom.eta.outcome_provenance_complete'] = true
+      AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+    LIMIT 1 BY estimate_id
+)
+SELECT heuristic, revision, kind,
+       count() AS decided,
+       countIf(outcome = 'censored') AS censored,
+       round(avg(above_p90), 3) AS late_surprise_rate
+FROM decided
+WHERE has_p90
+  AND (repo, issue, kind, as_of_sec) IN (
+      SELECT repo, issue, kind, as_of_sec
+      FROM decided
+      GROUP BY repo, issue, kind, as_of_sec
+      HAVING min(has_p90) = 1
+  )
+GROUP BY heuristic, revision, kind
+ORDER BY heuristic, revision, kind;
+
+-- Q5. Stability (#10233): how far the predicted landing INSTANT moves
+--     between consecutive emissions of one series while nothing happened.
+--     An `eta.estimate` row predicts landing at `as_of + p50`. A step from
+--     one emission to the next of the same (repo, issue, kind, heuristic,
+--     revision) series counts when both answered and the stage and the rework
+--     count are unchanged — so the move is drift, not news. Measured on the
+--     instant, not on remaining seconds: a perfectly steady ETA loses one
+--     second of remaining time per second, which a remaining-seconds view
+--     would report as movement. Diagnostic only; not a promotion gate.
+SELECT heuristic, revision, kind,
+       count() AS steps,
+       round(median(shift_sec)) AS median_shift_sec,
+       max(shift_sec) AS max_shift_sec
+FROM (
+    SELECT heuristic, revision, kind, abs(landing - prev_landing) AS shift_sec,
+           seq, answered, prev_answered, stage, prev_stage, rework, prev_rework
+    FROM (
+        SELECT heuristic, revision, kind, landing, answered, stage, rework,
+               row_number() OVER w AS seq,
+               lagInFrame(landing) OVER w AS prev_landing,
+               lagInFrame(answered) OVER w AS prev_answered,
+               lagInFrame(stage) OVER w AS prev_stage,
+               lagInFrame(rework) OVER w AS prev_rework
+        FROM (
+            SELECT attributes_string['loom.eta.estimate_id'] AS estimate_id,
+                   attributes_string['loom.repo'] AS repo,
+                   attributes_number['loom.issue'] AS issue,
+                   attributes_string['loom.eta.heuristic'] AS heuristic,
+                   attributes_string['loom.eta.revision'] AS revision,
+                   attributes_string['loom.eta.kind'] AS kind,
+                   attributes_string['loom.eta.stage'] AS stage,
+                   JSONExtractUInt(body, 'current_stage', 'rework_rounds') AS rework,
+                   mapContains(attributes_number, 'loom.eta.p50_sec') AS answered,
+                   toInt64(intDiv(timestamp, 1000000000)) AS as_of_sec,
+                   as_of_sec + toInt64(attributes_number['loom.eta.p50_sec']) AS landing
+            FROM signoz_logs.distributed_logs_v2
+            WHERE mapContains(attributes_string, 'loom.eta.trigger')
+              AND attributes_bool['loom.eta.provenance_complete'] = true
+              AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+              AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+            LIMIT 1 BY estimate_id
+        )
+        WINDOW w AS (PARTITION BY repo, issue, kind, heuristic, revision ORDER BY as_of_sec
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+    )
+)
+WHERE seq > 1 AND answered AND prev_answered AND stage = prev_stage AND rework = prev_rework
+GROUP BY heuristic, revision, kind
+ORDER BY heuristic, revision, kind;
+
+-- Q6. Convergence (#10233): interval width against the time that actually
+--     remained. Per heuristic, revision, kind and bucket of the ACTUAL lead
+--     (`loom.eta.lead_sec`, bucketed like `horizon_bucket`), the median
+--     p25-p75 and p25-p90 widths of scored outcomes. A converging heuristic
+--     narrows as the event nears; one whose width is the same at every lead
+--     is not learning from the stage it is in. Only scored outcomes
+--     (`loom.eta.error_sec` present): a censored outcome's lead is only a
+--     lower bound and an abandonment's is no lead at all. `with_p90` counts
+--     the rows the p25-p90 width is over (an estimate from before #10211
+--     has none). Diagnostic only; not a promotion gate.
+SELECT heuristic, revision, kind, lead_bucket,
+       count() AS scored,
+       round(median(p75 - p25)) AS median_p25_p75_sec,
+       countIf(has_p90) AS with_p90,
+       round(medianIf(p90 - p25, has_p90)) AS median_p25_p90_sec
+FROM (
+    SELECT attributes_string['loom.eta.estimate_id'] AS estimate_id,
+           attributes_string['loom.eta.heuristic'] AS heuristic,
+           attributes_string['loom.eta.revision'] AS revision,
+           attributes_string['loom.eta.kind'] AS kind,
+           multiIf(attributes_number['loom.eta.lead_sec'] < 900, 'lt_15m',
+                   attributes_number['loom.eta.lead_sec'] < 3600, '15m_1h',
+                   attributes_number['loom.eta.lead_sec'] < 14400, '1h_4h',
+                   attributes_number['loom.eta.lead_sec'] < 86400, '4h_24h',
+                   'gt_24h') AS lead_bucket,
+           attributes_number['loom.eta.p25_sec'] AS p25,
+           attributes_number['loom.eta.p75_sec'] AS p75,
+           attributes_number['loom.eta.p90_sec'] AS p90,
+           mapContains(attributes_number, 'loom.eta.p90_sec') AS has_p90
+    FROM signoz_logs.distributed_logs_v2
+    WHERE mapContains(attributes_string, 'loom.eta.outcome')
+      AND mapContains(attributes_number, 'loom.eta.error_sec')
+      AND attributes_bool['loom.eta.provenance_complete'] = true
+      AND attributes_bool['loom.eta.outcome_provenance_complete'] = true
+      AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+    LIMIT 1 BY estimate_id
+)
+GROUP BY heuristic, revision, kind, lead_bucket
+ORDER BY heuristic, revision, kind, lead_bucket;
+
+-- Q7. Answer rate (#10233), time-weighted. A refusal is emitted once, when
+--     its reason first appears, and never refreshed; an answer is refreshed
+--     every few minutes. "Answered rows / all rows" therefore overstates how
+--     often a heuristic answers by however many refreshes its answers earn.
+--     Here each emitted state stands until the series' next record — its
+--     next emission or its outcome — and is weighted by how long it stood
+--     (`stood_sec`). A series' last state with nothing after it in the
+--     window is left out: how long it will stand is not known yet.
+--     `answer_rate` = `answered_sec` / `total_sec`; compare heuristics within
+--     one kind. The daemon's promotion gate counts the same thing once per
+--     tracker pass instead (eta.md, "Adding a v2, and comparing it").
+SELECT heuristic, revision, kind,
+       count() AS states,
+       sum(stood_sec) AS total_sec,
+       sumIf(stood_sec, answered = 1) AS answered_sec,
+       round(sumIf(stood_sec, answered = 1) / sum(stood_sec), 3) AS answer_rate
+FROM (
+    SELECT heuristic, revision, kind, answered, is_estimate, seq, n,
+           next_t - t AS stood_sec
+    FROM (
+        SELECT heuristic, revision, kind, answered, is_estimate, t,
+               leadInFrame(t) OVER w AS next_t,
+               row_number() OVER w AS seq,
+               count() OVER w AS n
+        FROM (
+            SELECT * FROM (
+                SELECT attributes_string['loom.eta.estimate_id'] AS estimate_id,
+                       attributes_string['loom.repo'] AS repo,
+                       attributes_number['loom.issue'] AS issue,
+                       attributes_string['loom.eta.heuristic'] AS heuristic,
+                       attributes_string['loom.eta.revision'] AS revision,
+                       attributes_string['loom.eta.kind'] AS kind,
+                       toUInt8(mapContains(attributes_number, 'loom.eta.p50_sec')) AS answered,
+                       toUInt8(1) AS is_estimate,
+                       toInt64(intDiv(timestamp, 1000000000)) AS t
+                FROM signoz_logs.distributed_logs_v2
+                WHERE mapContains(attributes_string, 'loom.eta.trigger')
+                  AND attributes_bool['loom.eta.provenance_complete'] = true
+                  AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+                  AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+                LIMIT 1 BY estimate_id
+            )
+            UNION ALL
+            SELECT * FROM (
+                SELECT attributes_string['loom.eta.estimate_id'] AS estimate_id,
+                       attributes_string['loom.repo'] AS repo,
+                       attributes_number['loom.issue'] AS issue,
+                       attributes_string['loom.eta.heuristic'] AS heuristic,
+                       attributes_string['loom.eta.revision'] AS revision,
+                       attributes_string['loom.eta.kind'] AS kind,
+                       toUInt8(0) AS answered,
+                       toUInt8(0) AS is_estimate,
+                       toInt64(intDiv(timestamp, 1000000000)) AS t
+                FROM signoz_logs.distributed_logs_v2
+                WHERE mapContains(attributes_string, 'loom.eta.outcome')
+                  AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+                  AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
+                LIMIT 1 BY estimate_id
+            )
+        )
+        WINDOW w AS (PARTITION BY repo, issue, kind, heuristic ORDER BY t, is_estimate
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+    )
+)
+WHERE is_estimate = 1 AND seq < n
+GROUP BY heuristic, revision, kind
+ORDER BY heuristic, revision, kind;

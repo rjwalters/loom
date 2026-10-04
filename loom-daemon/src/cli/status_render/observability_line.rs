@@ -87,7 +87,8 @@ pub fn render(status: Option<&ObservabilityExportStatus>, now: DateTime<Utc>) ->
         ),
         State::Failing => format!(
             "Observability: FAILING — {} consecutive failed flush(es) as host_id={host}, last \
-             success {last_success} → {endpoint}{}",
+             success {last_success} → {endpoint}{} — fix: check this host's OTel egress (edge \
+             collector / tunnel / ingest key); `loom-daemon health` has the verdict (#9950)",
             s.consecutive_failures,
             s.last_failure_detail
                 .as_deref()
@@ -279,6 +280,10 @@ mod tests {
         assert!(line.contains("FAILING"), "{line}");
         assert!(line.contains("HTTP 401"), "{line}");
         assert!(line.contains("2h ago"), "{line}");
+        // #9950: the FAILING line must also say what to do, not only what is
+        // wrong — an operator reading it cold should not need a second run.
+        assert!(line.contains("fix: check this host's OTel egress"), "{line}");
+        assert!(line.contains("loom-daemon health"), "{line}");
     }
 
     #[test]

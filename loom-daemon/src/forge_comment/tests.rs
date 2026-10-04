@@ -109,11 +109,11 @@ fn post_comment_sends_the_footer_through_the_rest_endpoint() {
         "REST endpoint, one number sequence: {recorded}"
     );
     assert!(
-        recorded.contains("--input") && recorded.contains("-"),
-        "JSON on stdin, never -f: {recorded}"
+        recorded.contains("--input") && !recorded.contains(" -f "),
+        "JSON body file, never -f: {recorded}"
     );
-    let payload =
-        std::fs::read_to_string(stub.path().join("gh.stdin")).expect("stub recorded its stdin");
+    let payload = std::fs::read_to_string(stub.path().join("gh.stdin"))
+        .expect("stub recorded the --input body");
     let parsed: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON payload");
     let body = parsed["body"].as_str().expect("body field");
     assert!(
@@ -156,7 +156,7 @@ fn write_stub(dir: &Path, exit_code: u8) {
     let stdin_path = dir.join("gh.stdin");
     let script = dir.join("gh");
     let record = format!(
-        "echo \"$@\" >> {args}\ncat > {stdin}\n",
+        "echo \"$@\" >> {args}\nprev=\nfor a in \"$@\"; do [ \"$prev\" = --input ] && cat \"$a\" > {stdin}; prev=\"$a\"; done\n",
         args = args_path.display(),
         stdin = stdin_path.display(),
     );

@@ -48,10 +48,21 @@ fn profile(dir: &Path, command: &str, baseline: Option<&[&str]>, trusted: &[&str
         receipt["loomManagedHook"]["trustBaselineHashes"] = serde_json::json!(baseline);
     }
     fs::write(profile.join(RECEIPT), receipt.to_string()).unwrap();
+    // Codex keeps one hash per key. Loom's entry (group 1, after the
+    // operator's) carries the LAST, most recent decision; the others are
+    // trust for other hooks.
+    let home = profile.canonicalize().unwrap();
     let config: String = trusted
         .iter()
         .enumerate()
-        .map(|(i, h)| format!("[hooks.state.\"k{i}\"]\ntrusted_hash = \"{h}\"\n"))
+        .map(|(i, h)| {
+            let key = if i + 1 == trusted.len() {
+                format!("{}/hooks.json:pre_tool_use:1:0", home.display())
+            } else {
+                format!("{}/hooks.json:pre_tool_use:0:{i}", home.display())
+            };
+            format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"{h}\"\n")
+        })
         .collect();
     fs::write(profile.join("config.toml"), format!("# trusted_hash = \"comment\"\n{config}"))
         .unwrap();
@@ -71,6 +82,8 @@ fn shared(codex_home: PathBuf, workspace: Option<PathBuf>) -> Check {
         workspace,
         registration: Registration::WorkspaceIndependent,
         fallback_bridge: None,
+        runtime_home: None,
+        sealed: None,
     }
 }
 
@@ -164,6 +177,8 @@ fn a_pinned_check_keeps_the_pre_9390_rules() {
         workspace: None,
         registration: Registration::Pinned { bridge },
         fallback_bridge: None,
+        runtime_home: None,
+        sealed: None,
     };
     let verdict = pinned(bridge).verify();
     assert!(verdict.ready, "{verdict:?}");
@@ -205,4 +220,84 @@ fn verdicts_never_carry_a_credential_or_a_path() {
     let json = serde_json::to_string(&shared(home, Some(workspace(dir.path()))).verify()).unwrap();
     assert!(!json.contains("sk-FAKE-9390"), "{json}");
     assert!(!json.contains(&dir.path().display().to_string()), "{json}");
+}
+
+/// Trust counts only under the key Codex looks Loom's entry up under, at the
+/// CODEX_HOME it runs with (#9390 follow-up).
+#[test]
+fn only_trust_keyed_to_loom_where_codex_runs_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = workspace(dir.path());
+    let home = profile(dir.path(), SHARED_COMMAND, Some(&[]), &[]);
+    let host = home.canonicalize().unwrap().display().to_string();
+    let check = |runtime_home: Option<&str>| {
+        Check {
+            runtime_home: runtime_home.map(PathBuf::from),
+            sealed: None,
+            ..shared(home.clone(), Some(ws.clone()))
+        }
+        .verify()
+    };
+    let write = |body: String| fs::write(home.join("config.toml"), body).unwrap();
+
+    // Another profile's path (the robb-studio shape), and another position.
+    for key in [
+        "/elsewhere/r.j.walters/hooks.json:pre_tool_use:1:0".to_owned(),
+        format!("{host}/hooks.json:pre_tool_use:0:0"),
+    ] {
+        write(format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"h\"\n"));
+        let verdict = check(None);
+        assert!(!verdict.trusted, "{key}: {verdict:?}");
+        assert_eq!(verdict.trust_signal, "wrong-location");
+        assert!(!verdict.reason.contains("/elsewhere"), "{}", verdict.reason);
+    }
+    // Every TOML spelling of the right key.
+    let key = format!("{host}/hooks.json:pre_tool_use:1:0");
+    for body in [
+        format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"h\"\n"),
+        format!("hooks.state.\"{key}\".trusted_hash = \"h\"\n"),
+        format!("[hooks.state]\n\"{key}\" = {{ trusted_hash = \"h\", enabled = true }}\n"),
+        format!("[hooks]\nstate.\"{key}\".trusted_hash = \"h\"\n"),
+    ] {
+        write(body.clone());
+        assert!(check(None).ready, "{body}");
+    }
+    write(format!("# [hooks.state.\"{key}\"]\n# trusted_hash = \"h\"\n"));
+    assert_eq!(check(None).trust_signal, "none");
+    // Codex drops a handler whose state says `enabled = false`, trusted or not.
+    write(format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"h\"\nenabled = false\n"));
+    let verdict = check(None);
+    assert_eq!((verdict.ready, verdict.trust_signal), (false, "disabled"));
+    assert!(verdict.reason.contains("DISABLED"), "{}", verdict.reason);
+
+    // An adopted profile runs in its session container: host-keyed trust
+    // does not count there, container-keyed trust does, and an explicit
+    // runtime home overrides the derivation either way.
+    fs::write(home.join(".session-managed.json"), "{}").unwrap();
+    write(format!("[hooks.state.\"{key}\"]\ntrusted_hash = \"h\"\n"));
+    let verdict = check(None);
+    assert_eq!(
+        (verdict.trusted, verdict.trust_signal, verdict.trust_location.as_str()),
+        (false, "wrong-location", "the session container")
+    );
+    assert!(check(Some(&host)).ready);
+    write(format!(
+        "[hooks.state.\"{SESSION_CODEX_HOME}/hooks.json:pre_tool_use:1:0\"]\ntrusted_hash = \"h\"\n"
+    ));
+    assert!(check(None).ready);
+    assert!(!check(Some(&host)).trusted);
+}
+
+#[test]
+fn a_profile_without_loom_entry_carries_no_loom_trust() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = profile(dir.path(), SHARED_COMMAND, None, &["h"]);
+    fs::write(
+        home.join("hooks.json"),
+        r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"/opt/operator/audit.sh"}]}]}}"#,
+    )
+    .unwrap();
+    let runtime = home.canonicalize().unwrap();
+    assert_eq!(trust_at(&home, &runtime), (false, "wrong-location"));
+    assert!(keyed_trusted_hashes(&home.join("config.toml"), &BTreeSet::new()).is_empty());
 }

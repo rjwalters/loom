@@ -304,8 +304,7 @@ async fn collect(window: Duration) -> HealthReport {
     //    known to fail the same way), and `queues`/`throughput` render the
     //    single fact instead — see `health::assess_queues`/`assess_throughput`.
     let gh_unavailable =
-        pipeline_snapshot::probe_gh_availability(Path::new(pipeline_snapshot::DEFAULT_GH_BIN))
-            .err();
+        pipeline_snapshot::probe_gh_availability(&pipeline_snapshot::default_gh_bin()).err();
     let pipeline = match (&status, &gh_unavailable) {
         (Some(report), None) => {
             let roots = report

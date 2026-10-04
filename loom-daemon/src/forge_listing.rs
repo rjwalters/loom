@@ -150,6 +150,12 @@ fn is_404_error(error_message: &str) -> bool {
     error_message.contains("HTTP 404")
 }
 
+/// Every listing here is `GET repos/{o}/{r}/issues?labels=…`: the inventoried
+/// `issue.list` operation whichever loop asks (#9831).
+fn issue_list(caller: &'static str) -> store::ConditionalRead {
+    store::ConditionalRead::new(caller, crate::forge_call_stats::ops::ISSUE_LIST)
+}
+
 /// One unconditional attempt at the ETag-cached REST listing — the pre-#6171
 /// body of [`list_issues_cached`], split out so the public function can retry
 /// it exactly once after a forced credential refresh.
@@ -182,7 +188,7 @@ fn list_issues_cached_once(
 
     let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
     let (status, response, stderr) =
-        store::fetch_conditional(caller, gh_bin, cwd, &target, &url, sent_etag)?;
+        store::fetch_conditional(issue_list(caller), gh_bin, cwd, &target, &url, sent_etag)?;
     #[cfg(test)]
     tests::run_after_send_hook();
 
@@ -486,7 +492,7 @@ pub fn list_issues_cached_persistent_as(
     let prior_etag = prior.as_ref().map(|e| e.etag.as_str());
 
     let (status, response, stderr) =
-        store::fetch_conditional(caller, gh_bin, cwd, &target, &url, prior_etag)?;
+        store::fetch_conditional(issue_list(caller), gh_bin, cwd, &target, &url, prior_etag)?;
 
     match response {
         Some(ref r) if r.status == 304 => match prior {
@@ -518,7 +524,7 @@ pub fn list_issues_cached_persistent_as(
             {
                 if issues.len() < prior_issues.len() {
                     let confirmed = matches!(
-                        store::fetch_conditional(caller, gh_bin, cwd, &target, &url, None),
+                        store::fetch_conditional(issue_list(caller), gh_bin, cwd, &target, &url, None),
                         Ok((confirm_status, Some(ref cr), _))
                             if confirm_status.success()
                                 && cr.status == 200

@@ -72,11 +72,21 @@ pub fn is_shared_accounts_root(workspace: &Path) -> bool {
 }
 
 /// Machine-level Codex profile root. An explicitly empty override disables it.
+///
+/// Under `cfg(test)` an unset variable **panics** instead of resolving the real
+/// `~/.loom/codex-profiles` (issue #9964): a test fixture once leaked into an
+/// operator's live profile root through exactly that fallback. Tests redirect
+/// the root with the test-only `tokens_pool::profile_root_env::ProfileRootEnv`.
 #[must_use]
 pub fn codex_profile_root() -> Option<PathBuf> {
     match std::env::var(CODEX_PROFILE_ROOT_ENV) {
         Ok(value) if value.trim().is_empty() => None,
         Ok(value) => Some(expand_tilde(value.trim())),
+        #[cfg(test)]
+        Err(_) => panic!(
+            "{CODEX_PROFILE_ROOT_ENV} unset in a test; refusing to resolve the real ~/.loom (issue #9964)"
+        ),
+        #[cfg(not(test))]
         Err(_) => dirs::home_dir().map(|home| home.join(".loom").join("codex-profiles")),
     }
 }

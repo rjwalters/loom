@@ -13,7 +13,7 @@ use super::{Effects, ItemKey, StageTrack, Tracker};
 use crate::eta::labels::ready_row_reason;
 use crate::eta::{AgeSource, DispatchInput, NoEstimateReason, Stage};
 use crate::observability::ops::turnaround::Turnover;
-use crate::types::{DispatchPlanContext, PlanState, RowPlan};
+use crate::types::{DispatchPlanContext, PlanState, QueueDisposition, RowPlan};
 use chrono::{DateTime, Utc};
 
 /// A plan older than this (or three tick intervals, whichever is longer)
@@ -41,6 +41,10 @@ pub struct ReadyRow {
     pub issue: u32,
     /// Its plan fields.
     pub plan: RowPlan,
+    /// What the work finder did with it (`open_pr` is `pr-open-skip`).
+    pub disposition: QueueDisposition,
+    /// The issue's own facts from the queue row (#10231).
+    pub facts: super::IssueRow,
 }
 
 /// The tick a set of [`ReadyRow`]s came from.
@@ -50,6 +54,15 @@ pub struct ReadyPlan {
     pub context: DispatchPlanContext,
     /// When the tick completed.
     pub at: DateTime<Utc>,
+    /// `owner/repo` of each repo whose ready listing failed on the tick.
+    pub listing_failed: Vec<String>,
+}
+
+/// How old a plan may get before it is stale: [`READY_PLAN_MAX_AGE_SECS`],
+/// or three tick intervals when that is longer.
+pub(super) fn plan_max_age_secs(context: &DispatchPlanContext) -> i64 {
+    let tick = i64::try_from(context.tick_interval_secs.unwrap_or(0)).unwrap_or(i64::MAX);
+    READY_PLAN_MAX_AGE_SECS.max(tick.saturating_mul(3))
 }
 
 fn waiting(plan: &RowPlan) -> Option<u32> {
@@ -81,15 +94,19 @@ impl Tracker {
     ) -> Effects {
         let mut effects = Effects::default();
         let tick = plan.context.tick_interval_secs.unwrap_or(0);
-        let max_age = READY_PLAN_MAX_AGE_SECS.max(3 * i64::try_from(tick).unwrap_or(0));
-        let stale = (now - plan.at).num_seconds() > max_age;
+        let stale = (now - plan.at).num_seconds() > plan_max_age_secs(&plan.context);
+        self.context.plan = Some(super::features::PlanView::of(rows, plan));
         let slots = &plan.context.slots;
         let mut positions: Vec<u32> = rows.iter().filter_map(|r| waiting(&r.plan)).collect();
         positions.sort_unstable();
-        let queue_ready = to_u32(rows.len());
         let mut seen = Vec::new();
         for row in rows {
             let key = ItemKey::new(&row.repo, row.issue);
+            // The row's issue facts, observed when the tick completed. Kept
+            // on an item that already exists; a new one takes them below.
+            if let Some(item) = self.items.get_mut(&key) {
+                item.facts.note_issue(&row.facts, plan.at);
+            }
             if row.plan.plan_state == PlanState::Running {
                 // Dispatched: the bus event settles it. Not a departure.
                 seen.push(key);
@@ -133,6 +150,7 @@ impl Tracker {
             let loom = self.loom.clone();
             let dispatch_raw = serde_json::to_value(&ready).unwrap_or(serde_json::Value::Null);
             let item = self.item(&row.repo, row.issue);
+            item.facts.note_issue(&row.facts, plan.at);
             let first_sight = !item.in_ready_queue;
             let changed = first_sight
                 || item.refused != reason
@@ -142,8 +160,6 @@ impl Tracker {
             item.needs_issue_read = false;
             item.refused = reason;
             item.ready = ready;
-            item.queue_ready = Some(queue_ready);
-            item.max_concurrent = Some(to_u32(slots.max_concurrent));
             if first_sight {
                 item.stage = Some(StageTrack {
                     stage: Stage::ReadyWait,

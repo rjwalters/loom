@@ -96,30 +96,62 @@ fn gh_version_command(exe: &Path, empty_config: Option<&Path>) -> Command {
 }
 
 /// Run `cmd` with a timeout; `Some((success, stdout))` when it finished.
+///
+/// Stdout is drained on a reader thread while this thread polls for exit, so
+/// a child writing more than one pipe buffer (~64 KiB) is not mistaken for a
+/// hang. The child runs in its own process group; on timeout the whole group
+/// is killed (so a grandchild such as `curl` under `sh -c` cannot outlive the
+/// probe or hold the pipe open) before the reader is joined.
 fn run_bounded(cmd: &mut Command, timeout: Duration) -> Option<(bool, String)> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .ok()?;
+    let pgid = i32::try_from(child.id()).ok();
+    let reader = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = s.read_to_end(&mut bytes);
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    });
+    let join = |reader: Option<std::thread::JoinHandle<String>>| {
+        reader.and_then(|r| r.join().ok()).unwrap_or_default()
+    };
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut out = String::new();
-                if let Some(mut s) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = s.read_to_string(&mut out);
-                }
-                return Some((status.success(), out));
+                // A grandchild that kept the pipe open would block the join;
+                // the direct child has exited, so reap its group first.
+                kill_group(pgid);
+                return Some((status.success(), join(reader)));
             }
             Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(20)),
             _ => {
+                kill_group(pgid);
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = join(reader);
                 return None;
             }
+        }
+    }
+}
+
+/// SIGKILL the process group led by `pgid` (the probe child).
+fn kill_group(pgid: Option<i32>) {
+    if let Some(pgid) = pgid.filter(|p| *p > 1) {
+        // SAFETY: `kill(2)` with a negative pid signals a process group; no
+        // memory is touched. ESRCH (already gone) is ignored.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
         }
     }
 }
@@ -362,6 +394,47 @@ pub fn observe(doc: &PolicyDoc, workspace: &Path, opts: ProbeOptions) -> Observe
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canary_printing_more_than_a_pipe_buffer_is_open_not_not_run() {
+        let out = run_bounded(
+            Command::new("sh").args(["-c", "head -c 200000 /dev/zero | tr '\\0' a"]),
+            Duration::from_secs(20),
+        )
+        .expect("finished within the bound");
+        assert!(out.0);
+        assert_eq!(out.1.len(), 200_000);
+        assert!(matches!(
+            run_canary("head -c 200000 /dev/zero | tr '\\0' a"),
+            CanaryOutcome::Open
+        ));
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let script = format!("sleep 300 & echo $! > '{}'; wait", pid_file.display());
+        let started = Instant::now();
+        let result = run_bounded(Command::new("sh").args(["-c", &script]), Duration::from_secs(1));
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(30), "reader join hung");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut gone = false;
+        for _ in 0..100 {
+            // SAFETY: signal 0 only probes for existence.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(gone, "grandchild {pid} survived the timeout");
+    }
 
     #[test]
     fn parses_api_host_from_gh_layout_and_never_keeps_the_token() {

@@ -40,10 +40,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::cmd_out::CmdOutcome;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use chrono::{DateTime, Utc};
 
 use crate::forge_listing::RestIssue;
@@ -511,10 +512,17 @@ pub fn stage_points(samples: &[DwellSample], inputs: &[RepoInput]) -> Vec<Metric
 pub struct GhStageFetcher;
 
 fn gh_json(root: &Path, path: &str) -> Option<serde_json::Value> {
-    let mut cmd = Command::new("gh");
-    cmd.arg("api").arg(path).current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, Some(root));
-    let output = crate::sweep_registry::output_with_timeout(cmd, GH_TIMEOUT).ok()??;
+    let CmdOutcome::Ran(output) = GhInvocation::new(
+        Operation::new("api.rest"),
+        AccessIntent::Read,
+        GhTarget::None,
+        GH_TIMEOUT,
+    )
+    .args(["api", path])
+    .current_dir(root)
+    .run() else {
+        return None;
+    };
     if !output.status.success() {
         log::debug!("observability: gh api {path} failed in {}", root.display());
         return None;

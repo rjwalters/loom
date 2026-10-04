@@ -32,6 +32,8 @@ impl Heuristic for FinishV1 {
                 sources: &[SampleSource::SweepOutcome],
                 always_merge: false,
                 censoring: false,
+                adjust: None,
+                models_hold: false,
             },
             input,
             history,

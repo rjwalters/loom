@@ -35,6 +35,9 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{functions::FunctionFlags, Connection};
 
+#[path = "support/d1_sqlite.rs"]
+mod d1_sqlite;
+
 fn repo_file(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -334,9 +337,9 @@ fn landed_size_statements() -> Vec<String> {
 }
 
 /// The connection: the real fact shape, the math seam D1 ships, the committed
-/// views on top.
+/// views on top, on a connection that refuses what D1 refuses (#10066).
 fn seeded() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = d1_sqlite::d1_connection();
     // The bundled build omits SQLite's math functions; D1 ships them. Register
     // the two the view needs with their D1 semantics before anything runs.
     conn.create_scalar_function(

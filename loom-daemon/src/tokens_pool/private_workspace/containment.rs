@@ -54,7 +54,7 @@ pub const POLICY: &str = "clone-isolation+sealed-control-bundle+ro-profile-contr
 pub(super) const UNPREPARED: &str = "exclusive writer: this launch holds no prepared private-clone selection (owned account lease plus durable job identity), so no containment can be proven for it";
 pub(super) const DRIFTED: &str = "exclusive writer and stale-context refusal: the bound private session container was replaced, renamed, stopped or re-attached between preparation and admission; recover the session before dispatch";
 const UNMANAGED: &str = "protected remote operations and Loom lifecycle controls: this private clone ships no Loom hook provisioner, so no managed pre_tool_use bridge is registered for the session; container isolation alone does not prevent an authenticated force-push or a Loom lifecycle mutation";
-const UNTRUSTED: &str = "protected remote operations and Loom lifecycle controls: the account profile has not established Codex hook trust since Loom's managed registration was installed, and an untrusted hook fails OPEN on the pinned CLI; accept the hook-trust prompt once for this profile on the host, then stop and start the session (Loom never passes --dangerously-bypass-hook-trust)";
+const UNTRUSTED: &str = "protected remote operations and Loom lifecycle controls: the account profile has not established Codex hook trust since Loom's managed registration was installed, and an untrusted hook fails OPEN on the pinned CLI; accept the hook-trust prompt once for this profile with CODEX_HOME at the session's mount point (Codex keys trust by that hooks.json path, so trust accepted on the host does not count), then stop and start the session (a private-clone session never uses the trust waiver; #10102 applies to host-mode sessions only)";
 const NOT_IN_CONTAINER: &str = "container identity: this process is not running inside the bound private session container, or the clone's identity record does not match the bound job; refusing to claim containment";
 const NOT_OWNED_CLONE: &str = "host, sibling and peer repository isolation: /workspace/repo is not an owned, independent Git root (missing, symlinked, or carrying object alternates)";
 const MALFORMED: &str = "container identity: the bound container, control identity or base revision is malformed, absent, or predates loom-private-control-v1";
@@ -180,37 +180,15 @@ pub(super) fn enforcing(report: &bundle::Report, profile: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The trust-baseline rule of `provision-codex-hooks.sh verify` (#5005),
-/// evaluated in Rust against the canonical profile.
-///
-/// Codex persists hook trust as `hooks.state."<id>".trusted_hash` in
-/// `config.toml` and exposes no identity string Loom can compute, so the only
-/// observable signal is the SET of trusted hashes. `do_install` snapshots that
-/// set into the receipt's `trustBaselineHashes` at install time; readiness is
-/// therefore "a trusted hash exists that was not already there when Loom's
-/// current registration landed". A receipt with no baseline field at all (an
-/// older Loom provisioned this profile) falls back to the coarse "any trusted
-/// hash present" signal, exactly as the shell does — never punishing an
-/// already-trusted profile for a Loom upgrade.
-///
-/// This deliberately mirrors the shell byte for byte rather than improving on
-/// it: the same profile must not read as ready to one gate and not-ready to
-/// the other. It matches only the double-quoted spelling the shell's
-/// `read_trusted_hashes` matches, and skips `#`-commented lines so a
-/// documentation comment cannot fake an entry.
+/// The trust rule of `provision-codex-hooks.sh verify`
+/// ([`codex_hooks::trust_at`](super::super::codex_hooks::trust_at)), at the
+/// one location a private session runs Codex from: `CODEX_HOME` =
+/// [`PROFILE`], the container's mount point. Only a `trusted_hash` keyed to
+/// Loom's entry under that path counts; trust taken on the host, for another
+/// profile, or for another hook is trust for a hook Codex will not run here.
 fn hook_trust_established(profile: &Path) -> bool {
-    let current = trusted_hashes(&profile.join("config.toml"));
-    if current.is_empty() {
-        return false;
-    }
-    let Some(baseline) = trust_baseline(&profile.join("loom-codex-hooks.json")) else {
-        // Legacy-coarse: no install-time baseline recorded for this profile.
-        return true;
-    };
-    current.difference(&baseline).next().is_some()
+    super::super::codex_hooks::trust_at(profile, Path::new(PROFILE)).0
 }
-
-use super::super::codex_hooks::{trust_baseline, trusted_hashes};
 
 // ---------------------------------------------------------------------------
 // Host side.

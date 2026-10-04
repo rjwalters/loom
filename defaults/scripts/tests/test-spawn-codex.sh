@@ -1127,7 +1127,7 @@ READY_PROFILE="$(mk_hook_profile ready)"
 # copy also exists (see #4787), spuriously reporting hooks=not-ready.
 bash "$PROVISION_SCRIPT" install --codex-home "$READY_PROFILE" \
     --workspace "$LOOM_WORKSPACE" >/dev/null 2>&1
-printf 'hooks.state."loom".trusted_hash = "deadbeef"\n' > "$READY_PROFILE/config.toml"
+printf '[hooks.state."%s/hooks.json:pre_tool_use:0:0"]\ntrusted_hash = "deadbeef"\n' "$(cd -P "$READY_PROFILE" && pwd -P)" > "$READY_PROFILE/config.toml"
 
 BARE_PROFILE="$(mk_hook_profile bare)"
 
@@ -1136,7 +1136,7 @@ run_preflight 0 "builder + ready managed hook -> proceeds" \
     LOOM_ROLE=builder CODEX_HOME="$READY_PROFILE"
 out="$PREFLIGHT_OUT"
 assert_contains "hooks=ready" "$out" "audit line reports hooks=ready"
-assert_contains "trust-bypass=never" "$out" "audit line records that trust is never bypassed"
+assert_contains "trust-bypass=never" "$out" "audit line records that a bare-metal launch never waives trust"
 assert_not_contains "sk-loom-FAKE-4495" "$out" "the audit line leaks no credential material"
 assert_not_contains "auth.json" "$out" "the audit line names no credential file for a ready profile"
 
@@ -1158,7 +1158,7 @@ run_preflight 78 "builder + installed-but-untrusted profile -> exit 78" \
 STALE_PROFILE="$(mk_hook_profile stale)"
 bash "$PROVISION_SCRIPT" install --codex-home "$STALE_PROFILE" \
     --workspace "$LOOM_WORKSPACE" --bridge "$BRIDGE_SCRIPT" >/dev/null 2>&1
-printf 'hooks.state."loom".trusted_hash = "deadbeef"\n' > "$STALE_PROFILE/config.toml"
+printf '[hooks.state."%s/hooks.json:pre_tool_use:0:0"]\ntrusted_hash = "deadbeef"\n' "$(cd -P "$STALE_PROFILE" && pwd -P)" > "$STALE_PROFILE/config.toml"
 jq '(.hooks.PreToolUse[].hooks[] | select(.command | contains("guard-codex-bridge.sh")) | .command) |= (. + " --tampered")' \
     "$STALE_PROFILE/hooks.json" > "$STALE_PROFILE/hooks.tmp" \
     && mv "$STALE_PROFILE/hooks.tmp" "$STALE_PROFILE/hooks.json"
@@ -1182,8 +1182,8 @@ run_preflight 78 "sweep-lifecycle (daemon sweep-child alias) -> exit 78" \
     LOOM_ROLE=sweep-lifecycle CODEX_HOME="$BARE_PROFILE"
 
 # (6) Read-only roles keep the conservative fallback, with an explicit warning.
-run_preflight 0 "judge + unprovisioned profile -> proceeds (read-only role)" \
-    LOOM_ROLE=judge CODEX_HOME="$BARE_PROFILE"
+run_preflight 0 "curator + unprovisioned profile -> proceeds (read-only role)" \
+    LOOM_ROLE=curator CODEX_HOME="$BARE_PROFILE"
 out="$PREFLIGHT_OUT"
 assert_contains "hook parity unavailable" "$out" \
     "a read-only role is told, explicitly, that hook parity is unavailable"
@@ -1199,19 +1199,20 @@ assert_contains "role=unset" "$out" "the audit line reports an unset role"
 # (7) Ambient auth (no CODEX_HOME) is reported as unavailable, not ready.
 out="$(env -u CODEX_HOME -u LOOM_CODEX_HOME -u LOOM_CODEX_PROFILE \
     LOOM_SWEEP_NICE=0 LOOM_CODEX_NO_EXEC=1 LOOM_SPAWN_NO_EXPORT=1 \
-    LOOM_ROLE=judge bash "$SPAWN_CODEX" -p "hi" 2>&1)" || true
+    LOOM_ROLE=curator bash "$SPAWN_CODEX" -p "hi" 2>&1)" || true
 assert_contains "hooks=unavailable" "$out" \
     "ambient Codex login state reports hooks=unavailable"
 
-# (8) The adapter must never pass Codex's hook-trust bypass flag.
+# (8) The adapter passes Codex's hook-trust waiver on exactly ONE line, gated on
+#     the sealed verdict (#10102; behaviour in test-spawn-codex-sealed.sh).
 TESTS_RUN=$((TESTS_RUN + 1))
-if grep -nE '^[^#]*--dangerously-bypass-hook-trust' "$SPAWN_CODEX" \
-    | grep -vqE 'log_(error|warn|info)'; then
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: spawn-codex.sh must never pass --dangerously-bypass-hook-trust"
-else
+waiver="$(grep -nE '^[^#]*--dangerously-bypass-hook-trust' "$SPAWN_CODEX" | grep -vE 'log_(error|warn|info)' || true)"
+if [[ "$(printf '%s\n' "$waiver" | grep -c .)" == "1" && "$waiver" == *'[[ "$_hook_trust_bypass" != "sealed" ]] ||'* ]]; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: spawn-codex.sh never passes --dangerously-bypass-hook-trust"
+    echo -e "  ${GREEN}PASS${NC}: spawn-codex.sh passes --dangerously-bypass-hook-trust only behind the sealed verdict"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: spawn-codex.sh passes --dangerously-bypass-hook-trust outside the sealed gate: $waiver"
 fi
 
 # ...and the config-key spelling of the same waiver (`-c bypass_hook_trust=true`),
@@ -1397,11 +1398,10 @@ echo ""
 echo "Testing spawn-codex.sh session-exec mode (#6926)..."
 
 # A profile adopted by a prior `loom-daemon accounts session start` —
-# marked with the exact sentinel session_lifecycle::mark_session_managed
-# writes.
+# marked with the exact sentinel session_lifecycle::mark_session_managed writes.
 SESSION_PROFILE="$TMPROOT/profiles/session-acct"
 mkdir -p "$SESSION_PROFILE"
-printf '{"token":"stub"}\n' > "$SESSION_PROFILE/auth.json"
+printf '{"token":"stub"}\n' > "$SESSION_PROFILE/auth.json"; printf '{}\n' | tee "$SESSION_PROFILE/hooks.json" "$SESSION_PROFILE/loom-codex-hooks.json" > "$SESSION_PROFILE/config.toml"  # + profile controls (#9979)
 printf '{"schema_version":1,"container_name":"loom-codex-session-session-acct","adopted_at_unix":0}\n' \
     > "$SESSION_PROFILE/.session-managed.json"
 
@@ -1555,7 +1555,12 @@ cat > "$SESSION_DOCKER_BIN/docker" <<DOCKERSHIM
 # the same fake codex shim Section 8 uses via a plain \`exec\`, so stdin/
 # stdout/stderr and the exit code all flow through exactly as they would for
 # a real container.
-case "\$1" in inspect) echo true; exit 0;; exec) shift;; *) exit 1;; esac
+# The #9979 posture probe (loom-daemon session-exec posture) runs
+# docker inspect --type container <c>; answer as a hardened host-mode
+# container would (unprivileged, bridge, CapDrop ALL, no-new-privileges, RO
+# profile controls), and \`exec <c> sha256sum\` with the host profile's hashes.
+[[ "\$1" == exec && "\$3" == sha256sum ]] && { for p in "\${@:5}"; do printf '%s  %s\n' "\$(shasum -a 256 < "\$CODEX_HOME/\${p##*/}" | cut -d' ' -f1)" "\$p"; done; exit 0; }
+case "\$1" in inspect) [[ "\$*" == *"--type container"* ]] && echo '[{"State":{"Running":true},"Config":{"Labels":{"loom.session-posture":"container-boundary-v1"}},"HostConfig":{"Privileged":false,"NetworkMode":"bridge","CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"]},"Mounts":[{"Type":"bind","Destination":"/home/loom/.codex-profile/hooks.json","RW":false},{"Type":"bind","Destination":"/home/loom/.codex-profile/config.toml","RW":false},{"Type":"bind","Destination":"/home/loom/.codex-profile/loom-codex-hooks.json","RW":false}]}]' || echo true; exit 0;; exec) shift;; *) exit 1;; esac
 while [[ "\$1" == -* ]]; do
     case "\$1" in -i) shift;; --workdir) cd "\$2"; shift 2;; *) export "\$2"; shift 2;; esac
 done

@@ -1841,7 +1841,7 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
     let workspace_registry =
         crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
-    let gh_bin = std::path::PathBuf::from("gh");
+    let gh_bin = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
     let pass_kind = if is_startup { "startup" } else { "periodic" };
     let pass_loop::ReconciliationPassStats {
         total_checked,
@@ -2040,11 +2040,17 @@ mod pass_loop;
 /// in the #9251 forge-call accounting.
 mod building_listing;
 
+/// The facade glue every `gh` call below goes through (#10089), and the
+/// version-keyed reuse of its per-PR reads — sibling files per the ratchet.
+pub(crate) mod gh_call;
+pub(crate) mod read_cache;
+
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::work_finder::forge`] / [`crate::epic_supervisor::forge`]) — the
 /// decision logic above is the fully-covered surface; this module is a thin,
 /// best-effort `Command` wrapper.
 pub mod forge {
+    use super::gh_call;
     use super::{
         apply_live_claim_veto, classify_lease_evidence, decide_anchor, decide_verdict,
         extract_latest_verdict_sha, most_recent_claim_activity_at, plan, plan_pr,
@@ -2060,7 +2066,6 @@ pub mod forge {
     use chrono::{DateTime, Utc};
     use serde::Deserialize;
     use std::path::Path;
-    use std::process::{Command, Stdio};
 
     use super::building_listing::list_building_issues;
 
@@ -2076,27 +2081,21 @@ pub mod forge {
     /// where by construction the Builder never completed — so a
     /// branch-name match is sufficient; there is no earlier-attempt PR to miss.
     fn first_open_linked_pr(gh_bin: &Path, root: &Path, issue: u32) -> Option<bool> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("pr")
-            .arg("list")
-            .arg("--state")
-            .arg("open")
-            .arg("--head")
-            .arg(format!("feature/issue-{issue}"))
-            .arg("--json")
-            .arg("number")
-            .arg("--jq")
-            .arg(".[].number")
-            .current_dir(root)
-            .stdin(Stdio::null());
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        let output = cmd.output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let has_open = String::from_utf8_lossy(&output.stdout)
+        let head = format!("feature/issue-{issue}");
+        let stdout =
+            gh_call::ok_stdout(gh_call::read("claim.pr_list_by_head", gh_bin, root).args([
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--head",
+                &head,
+                "--json",
+                "number",
+                "--jq",
+                ".[].number",
+            ]))?;
+        let has_open = String::from_utf8_lossy(&stdout)
             .lines()
             .any(|l| l.trim().parse::<u32>().is_ok());
         Some(has_open)
@@ -2141,31 +2140,16 @@ pub mod forge {
     }
 
     fn reclaim_edit(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("issue")
-            .arg("edit")
-            .arg(issue.to_string())
-            .arg("--remove-label")
-            .arg("loom:building")
-            .arg("--add-label")
-            .arg("loom:issue");
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        let n = issue.to_string();
+        let out = gh_call::output(
+            gh_call::write("claim.issue_reclaim", gh_bin, root)
+                .args(["issue", "edit", &n, "--remove-label", "loom:building"])
+                .args(["--add-label", "loom:issue"])
+                .args(gh_call::loom_repo_flag()),
+        )?;
         if !out.status.success() {
-            return Err(anyhow!(
-                "gh issue edit failed for #{issue} in {}: {}",
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            let (root, err) = (root.display(), gh_call::stderr(&out));
+            return Err(anyhow!("gh issue edit failed for #{issue} in {root}: {err}"));
         }
         Ok(())
     }
@@ -2181,29 +2165,15 @@ pub mod forge {
         struct GhIssueLabels {
             labels: Vec<GhLabel>,
         }
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("issue")
-            .arg("view")
-            .arg(issue.to_string())
-            .arg("--json")
-            .arg("labels");
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        let n = issue.to_string();
+        let out = gh_call::output(
+            gh_call::read("claim.issue_labels", gh_bin, root)
+                .args(["issue", "view", &n, "--json", "labels"])
+                .args(gh_call::loom_repo_flag()),
+        )?;
         if !out.status.success() {
-            return Err(anyhow!(
-                "gh issue view {issue} --json labels failed in {}: {}",
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            let (root, err) = (root.display(), gh_call::stderr(&out));
+            return Err(anyhow!("gh issue view {issue} --json labels failed in {root}: {err}"));
         }
         let parsed: GhIssueLabels =
             serde_json::from_slice(&out.stdout).context("parse gh issue view labels JSON")?;
@@ -2283,28 +2253,17 @@ pub mod forge {
     /// `"open"` — returns `false`, so a transient `gh` hiccup can never
     /// itself suppress a legitimate reclaim.
     pub(crate) fn issue_is_confirmed_closed(gh_bin: &Path, root: &Path, issue: u32) -> bool {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}"))
-            .arg("--jq")
-            .arg(".state");
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        // #8263: `LOOM_REPO` reaches `gh api` as the GH_REPO env var, NEVER as
-        // a `--repo` flag (`gh api` has none and aborts on one).
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let Ok(out) = cmd.output() else {
-            return false;
-        };
-        if !out.status.success() {
-            return false;
-        }
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .eq_ignore_ascii_case("closed")
+        // #8263: `LOOM_REPO` reaches `gh api` as GH_REPO (the facade sets it),
+        // NEVER as a `--repo` flag (`gh api` has none and aborts on one).
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}");
+        gh_call::ok_stdout(
+            gh_call::read("claim.issue_state", gh_bin, root).args(["api", &path, "--jq", ".state"]),
+        )
+        .is_some_and(|out| {
+            String::from_utf8_lossy(&out)
+                .trim()
+                .eq_ignore_ascii_case("closed")
+        })
     }
 
     /// Reconcile stale `loom:building` claims for one registered workspace
@@ -2596,49 +2555,37 @@ pub mod forge {
     }
 
     fn list_prs_with_label(gh_bin: &Path, root: &Path, label: &str) -> Result<Vec<ClaimedPr>> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("pr")
-            .arg("list")
-            .arg("--state")
-            .arg("open")
-            .arg("--label")
-            .arg(label)
-            .arg("--limit")
-            .arg(MAX_ISSUES_PER_WORKSPACE.to_string())
-            .arg("--json")
-            .arg("number,updatedAt,headRefName");
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        let limit = MAX_ISSUES_PER_WORKSPACE.to_string();
+        let out = gh_call::output(
+            gh_call::read("claim.pr_list_claimed", gh_bin, root)
+                .args([
+                    "pr", "list", "--state", "open", "--label", label, "--limit", &limit,
+                ])
+                .args(["--json", "number,updatedAt,headRefName"])
+                .args(gh_call::loom_repo_flag()),
+        )?;
         if !out.status.success() {
-            return Err(anyhow!(
-                "gh pr list --label {label} failed in {}: {}",
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            let (root, err) = (root.display(), gh_call::stderr(&out));
+            return Err(anyhow!("gh pr list --label {label} failed in {root}: {err}"));
         }
         let rows: Vec<GhClaimedPr> =
             serde_json::from_slice(&out.stdout).context("parse gh pr list JSON")?;
         Ok(rows
             .into_iter()
             .map(|r| {
-                let claim_labeled_at = fetch_claim_labeled_at(gh_bin, root, r.number, label);
-                // Issue #4638: only worth fetching when there is a
+                // Issue #4638: activity is only worth fetching when there is a
                 // claim_labeled_at to compare against -- with no anchor at
                 // all, decide_pr falls back to updated_at, which GitHub
                 // already keeps at least as fresh as any comment. (#6523: the
-                // claim-activity marker is keyed on this same timestamp, so
-                // without it there is nothing to match against either.)
+                // claim-activity marker is keyed on this same timestamp.)
+                // #10089: a found answer is reused while `updatedAt` holds.
+                let key = super::read_cache::key(root, r.number, label, r.updated_at.as_deref());
+                let claim_labeled_at = super::read_cache::CLAIM_LABELED
+                    .get_or(key.clone(), || fetch_claim_labeled_at(gh_bin, root, r.number, label));
                 let most_recent_claim_activity_at = claim_labeled_at.and_then(|since| {
-                    fetch_most_recent_claim_activity_at(gh_bin, root, r.number, since)
+                    super::read_cache::CLAIM_ACTIVITY.get_or(key, || {
+                        fetch_most_recent_claim_activity_at(gh_bin, root, r.number, since)
+                    })
                 });
                 ClaimedPr {
                     number: r.number,
@@ -2670,27 +2617,19 @@ pub mod forge {
         pr_number: u32,
         label: &str,
     ) -> Option<DateTime<Utc>> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/timeline"))
-            .arg("--paginate")
-            .arg("--jq")
-            .arg(format!(
-                r#"[.[] | select(.event == "labeled" and .label.name == "{label}") | .created_at] | max // empty"#
-            ));
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        // #8263: `LOOM_REPO` reaches `gh api` as the GH_REPO env var, NEVER as
-        // a `--repo` flag (`gh api` has none and aborts on one).
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let out = cmd.output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        parse_max_timestamp(&out.stdout)
+        // #8263: `LOOM_REPO` reaches `gh api` as GH_REPO (set by the facade).
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/timeline?per_page=100");
+        let jq = format!(
+            r#"[.[] | select(.event == "labeled" and .label.name == "{label}") | .created_at] | max // empty"#
+        );
+        let out = gh_call::ok_stdout(gh_call::read("claim.pr_timeline", gh_bin, root).args([
+            "api",
+            &path,
+            "--paginate",
+            "--jq",
+            &jq,
+        ]))?;
+        parse_max_timestamp(&out)
     }
 
     /// Parse a `gh api --paginate --jq '... | max // empty'` result into the
@@ -2800,32 +2739,26 @@ pub mod forge {
         root: &Path,
         issue_number: u32,
     ) -> LeaseProbe {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue_number}/comments"))
-            .arg("--paginate")
-            .arg("--jq")
-            .arg(format!(
-                r#".[] | select(.body | startswith("{LEASE_MARKER_PREFIX}")) | {{updated_at, {}}}"#,
-                crate::comment_trust::records::AUTHOR_JQ
-            ));
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        // #8263: `LOOM_REPO` reaches `gh api` as the GH_REPO env var, NEVER as
-        // a `--repo` flag (`gh api` has none and aborts on one).
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let Ok(out) = cmd.output() else {
+        // #8263: `LOOM_REPO` reaches `gh api` as GH_REPO (set by the facade).
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{issue_number}/comments?per_page=100");
+        let jq = format!(
+            r#".[] | select(.body | startswith("{LEASE_MARKER_PREFIX}")) | {{updated_at, {}}}"#,
+            crate::comment_trust::records::AUTHOR_JQ
+        );
+        let Some(stdout) =
+            gh_call::ok_stdout(gh_call::read("claim.lease_comments", gh_bin, root).args([
+                "api",
+                &path,
+                "--paginate",
+                "--jq",
+                &jq,
+            ]))
+        else {
             return LeaseProbe::ReadFailed;
         };
-        if !out.status.success() {
-            return LeaseProbe::ReadFailed;
-        }
         // #9548: only a trusted author's lease counts; an outsider's reads as
         // absent (never as a live claim holding the issue).
-        match crate::comment_trust::TrustPolicy::for_root(root).trusted_records(&out.stdout) {
+        match crate::comment_trust::TrustPolicy::for_root(root).trusted_records(&stdout) {
             None => LeaseProbe::ReadFailed,
             Some(leases) => crate::comment_trust::records::max_timestamp(&leases, "updated_at")
                 .map_or(LeaseProbe::NotFound, LeaseProbe::Found),
@@ -2865,27 +2798,24 @@ pub mod forge {
         // misclassify a comment posted in the same second as the claim label.
         // (This is also the exact rendering `claim_activity_marker` embeds.)
         let since_iso = since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/comments"))
-            .arg("--paginate")
-            .arg("--jq")
-            .arg(format!(
-                r#".[] | select(.created_at > "{since_iso}") | {{created_at, body, {}}}"#,
-                crate::comment_trust::records::AUTHOR_JQ
-            ));
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let out = cmd.output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let rows =
-            crate::comment_trust::TrustPolicy::for_root(root).trusted_records(&out.stdout)?;
+        // `since=` lets the forge skip older comments (it filters on
+        // `updated_at`, a superset of the `created_at` filter below).
+        let path = format!(
+            "repos/{{owner}}/{{repo}}/issues/{pr_number}/comments?per_page=100&since={since_iso}"
+        );
+        let jq = format!(
+            r#".[] | select(.created_at > "{since_iso}") | {{created_at, body, {}}}"#,
+            crate::comment_trust::records::AUTHOR_JQ
+        );
+        let out =
+            gh_call::ok_stdout(gh_call::read("claim.pr_activity_comments", gh_bin, root).args([
+                "api",
+                &path,
+                "--paginate",
+                "--jq",
+                &jq,
+            ]))?;
+        let rows = crate::comment_trust::TrustPolicy::for_root(root).trusted_records(&out)?;
         let comments: Vec<PrComment> = rows
             .iter()
             .filter_map(|r| {
@@ -2902,28 +2832,16 @@ pub mod forge {
     }
 
     fn add_label(gh_bin: &Path, root: &Path, pr_number: u32, label: &str) -> Result<()> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("pr")
-            .arg("edit")
-            .arg(pr_number.to_string())
-            .arg("--add-label")
-            .arg(label);
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        let n = pr_number.to_string();
+        let out = gh_call::output(
+            gh_call::write("claim.pr_add_label", gh_bin, root)
+                .args(["pr", "edit", &n, "--add-label", label])
+                .args(gh_call::loom_repo_flag()),
+        )?;
         if !out.status.success() {
+            let (root, err) = (root.display(), gh_call::stderr(&out));
             return Err(anyhow!(
-                "gh pr edit --add-label {label} failed for #{pr_number} in {}: {}",
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
+                "gh pr edit --add-label {label} failed for #{pr_number} in {root}: {err}"
             ));
         }
         Ok(())
@@ -2940,28 +2858,16 @@ pub mod forge {
     /// rather than leaving a PR that might genuinely have no state label
     /// undiscoverable.
     fn reclaim_pr(gh_bin: &Path, root: &Path, pr_number: u32, claim_label: &str) -> Result<()> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("pr")
-            .arg("edit")
-            .arg(pr_number.to_string())
-            .arg("--remove-label")
-            .arg(claim_label);
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        let n = pr_number.to_string();
+        let out = gh_call::output(
+            gh_call::write("claim.pr_reclaim", gh_bin, root)
+                .args(["pr", "edit", &n, "--remove-label", claim_label])
+                .args(gh_call::loom_repo_flag()),
+        )?;
         if !out.status.success() {
+            let (root, err) = (root.display(), gh_call::stderr(&out));
             return Err(anyhow!(
-                "gh pr edit --remove-label {claim_label} failed for #{pr_number} in {}: {}",
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
+                "gh pr edit --remove-label {claim_label} failed for #{pr_number} in {root}: {err}"
             ));
         }
 
@@ -3128,6 +3034,8 @@ pub mod forge {
         number: u32,
         #[serde(rename = "headRefOid", default)]
         head_ref_oid: Option<String>,
+        #[serde(rename = "updatedAt", default)]
+        updated_at: Option<String>,
         #[serde(default)]
         labels: Vec<GhVerdictLabel>,
     }
@@ -3153,50 +3061,28 @@ pub mod forge {
         root: &Path,
         pr_number: u32,
     ) -> Option<Vec<String>> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/comments"))
-            .arg("--paginate");
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let out = cmd.output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        crate::comment_trust::TrustPolicy::for_root(root).trusted_bodies(&out.stdout)
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{pr_number}/comments?per_page=100");
+        let out = gh_call::ok_stdout(gh_call::read("verdict.pr_comments", gh_bin, root).args([
+            "api",
+            &path,
+            "--paginate",
+        ]))?;
+        crate::comment_trust::TrustPolicy::for_root(root).trusted_bodies(&out)
     }
 
     fn list_verdict_prs(gh_bin: &Path, root: &Path, kind: VerdictKind) -> Result<Vec<VerdictPr>> {
-        let label = kind.label();
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("pr")
-            .arg("list")
-            .arg("--state")
-            .arg("open")
-            .arg("--label")
-            .arg(label)
-            .arg("--limit")
-            .arg(MAX_ISSUES_PER_WORKSPACE.to_string())
-            .arg("--json")
-            .arg("number,headRefOid,labels");
-        cmd.current_dir(root);
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        let (label, limit) = (kind.label(), MAX_ISSUES_PER_WORKSPACE.to_string());
+        let out = gh_call::output(
+            gh_call::read("verdict.pr_list", gh_bin, root)
+                .args([
+                    "pr", "list", "--state", "open", "--label", label, "--limit", &limit,
+                ])
+                .args(["--json", "number,headRefOid,labels,updatedAt"])
+                .args(gh_call::loom_repo_flag()),
+        )?;
         if !out.status.success() {
-            return Err(anyhow!(
-                "gh pr list --label {label} failed in {}: {}",
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            let (root, err) = (root.display(), gh_call::stderr(&out));
+            return Err(anyhow!("gh pr list --label {label} failed in {root}: {err}"));
         }
         let rows: Vec<GhVerdictPr> =
             serde_json::from_slice(&out.stdout).context("parse gh pr list JSON")?;
@@ -3220,18 +3106,22 @@ pub mod forge {
                 let (marker_sha, marker_scan_ok, invalidation_recorded) = if on_hold {
                     (None, false, false)
                 } else {
-                    match fetch_comment_bodies(gh_bin, root, r.number) {
-                        Some(bodies) => {
-                            let marker_sha = extract_latest_verdict_sha(&bodies, kind);
-                            let recorded = super::verdict_stale_comment::already_recorded(
-                                &bodies,
-                                marker_sha.as_deref().unwrap_or_default(),
-                                r.head_ref_oid.as_deref().unwrap_or_default(),
-                            );
-                            (marker_sha, true, recorded)
-                        }
-                        None => (None, false, false),
-                    }
+                    // #10089: reused while the PR's `updatedAt` and head hold.
+                    let head = r.head_ref_oid.as_deref().unwrap_or_default();
+                    let what = format!("{label}@{head}");
+                    let key =
+                        super::read_cache::key(root, r.number, &what, r.updated_at.as_deref());
+                    let scan = super::read_cache::VERDICT_SCAN.get_or(key, || {
+                        let bodies = fetch_comment_bodies(gh_bin, root, r.number)?;
+                        let marker_sha = extract_latest_verdict_sha(&bodies, kind);
+                        let recorded = super::verdict_stale_comment::already_recorded(
+                            &bodies,
+                            marker_sha.as_deref().unwrap_or_default(),
+                            head,
+                        );
+                        Some((marker_sha, recorded))
+                    });
+                    scan.map_or((None, false, false), |(sha, recorded)| (sha, true, recorded))
                 };
                 VerdictPr {
                     number: r.number,
@@ -3280,28 +3170,15 @@ pub mod forge {
              *Automated by loom-daemon claim reconciliation (#6319)*"
         );
 
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("pr")
-            .arg("comment")
-            .arg(pr.number.to_string())
-            .arg("--body")
-            .arg(&body);
-        cmd.current_dir(root);
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        let n = pr.number.to_string();
+        let out = gh_call::output(
+            gh_call::write("verdict.anchor_comment", gh_bin, root)
+                .args(["pr", "comment", &n, "--body", &body])
+                .args(gh_call::loom_repo_flag()),
+        )?;
         if !out.status.success() {
-            return Err(anyhow!(
-                "gh pr comment (anchor {label}) failed for #{} in {}: {}",
-                pr.number,
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            let (root, err) = (root.display(), gh_call::stderr(&out));
+            return Err(anyhow!("gh pr comment (anchor {label}) failed for #{n} in {root}: {err}"));
         }
         Ok(())
     }

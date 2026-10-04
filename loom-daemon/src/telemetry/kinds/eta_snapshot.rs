@@ -34,6 +34,8 @@
 //!   No forge free text — no title, no label text, no comment body — is
 //!   carried at all.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -41,7 +43,14 @@ use crate::eta::{Kind, NoEstimateReason, Stage};
 use crate::telemetry::RepoVisibility;
 
 /// Most rows one record carries. Rows past this are counted in
-/// [`EtaSnapshotRecord::rows_truncated`].
+/// [`EtaSnapshotRecord::rows_truncated`] and
+/// [`EtaSnapshotRecord::rows_truncated_by_kind`]; the cut is by priority
+/// (`land` with `p50`, `land` refusals, then `start`/`finish`), not sort order.
+///
+/// Measured (#10052): a serialized row is ~245 bytes for a short slug (~350 with long slugs), so 200 rows is ~50-70 KB.
+/// The record lands as one `eta:<hostId>` dashboard state value, so the cap
+/// is held rather than raised: priority cutting, not a bigger record, is
+/// what keeps every repo's `land` rows in.
 pub const MAX_ROWS: usize = 200;
 
 /// One issue's current estimate for one [`Kind`].
@@ -107,11 +116,16 @@ pub struct EtaSnapshotRecord {
     /// that the exporter stalled.
     pub as_of: DateTime<Utc>,
     /// One row per `(repo, issue, kind)` this host currently estimates, in
-    /// `(repo, issue, kind)` order. At most [`MAX_ROWS`].
+    /// `(repo, issue, kind)` order. At most [`MAX_ROWS`], chosen by priority.
     pub rows: Vec<EtaSnapshotRow>,
     /// Rows dropped by the [`MAX_ROWS`] cap.
     #[serde(default)]
     pub rows_truncated: usize,
+    /// [`Self::rows_truncated`] broken down by [`Kind`], so a truncation that
+    /// dropped `land` rows is visible. Absent when nothing was dropped and
+    /// from older daemons.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rows_truncated_by_kind: BTreeMap<Kind, usize>,
 }
 
 #[cfg(test)]

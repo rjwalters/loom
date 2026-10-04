@@ -247,10 +247,17 @@ pub const DEFAULT_MERGE_WINDOW_HOURS: i64 = 24;
 
 /// The default `gh` binary this module invokes when nothing overrides it —
 /// the single source of truth so [`GhPipelineSource::new`] and
-/// [`probe_gh_availability`]'s caller (`loom-daemon health`'s collector,
-/// #5061) can never drift into checking a different binary than the one that
-/// actually runs the per-repo queries.
-pub const DEFAULT_GH_BIN: &str = "gh";
+/// [`probe_gh_availability`]'s callers (`loom-daemon health`'s collector and
+/// the `serve` dashboard, #5061) can never drift into checking a different
+/// binary than the one that actually runs the per-repo queries.
+///
+/// Resolved through [`crate::gh_invocation::gh_bin`] (`LOOM_GH_BIN`, else
+/// bare `gh` from `PATH`), so a unit-test build gets the loud-failing stub
+/// rather than the operator's real `gh` (#10138).
+#[must_use]
+pub fn default_gh_bin() -> PathBuf {
+    PathBuf::from(crate::gh_invocation::gh_bin())
+}
 
 // ============================================================================
 // `gh` binary availability (Issue #5061)
@@ -411,7 +418,7 @@ impl GhPipelineSource {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            gh_bin: PathBuf::from(DEFAULT_GH_BIN),
+            gh_bin: default_gh_bin(),
             metrics: PipelineMetrics::ALL,
             merge_window: chrono::Duration::hours(DEFAULT_MERGE_WINDOW_HOURS),
         }
@@ -448,13 +455,11 @@ impl GhPipelineSource {
     /// returned JSON array — the count for whatever list query `args`
     /// encodes.
     fn count(&self, root: &Path, args: &[&str]) -> Result<usize> {
-        let mut cmd = Command::new(&self.gh_bin);
-        cmd.args(args).current_dir(root);
-        // #5401: a cross-owner managed repo's count query uses its own owner's
-        // installation-token `GH_CONFIG_DIR` (no-op for single-owner fleets).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        let out = cmd
-            .output()
+        // #10089: counted via the facade (`snapshot.count`); it supplies the
+        // #5401 cross-owner GH_CONFIG_DIR from `root`.
+        let inv = crate::claim_reconciliation::gh_call::read("snapshot.count", &self.gh_bin, root)
+            .args(args);
+        let out = crate::claim_reconciliation::gh_call::output(inv)
             .with_context(|| format!("failed to invoke {}", self.gh_bin.display()))?;
         if !out.status.success() {
             return Err(anyhow!(
@@ -474,8 +479,13 @@ impl GhPipelineSource {
     /// [`Self::count`] — richer per-row shape because those three fields are
     /// all derived from the same row set.
     fn operator_held_rows(&self, root: &Path) -> Result<Vec<OperatorHeldRow>> {
-        let mut cmd = Command::new(&self.gh_bin);
-        cmd.args([
+        // #10089: counted via the facade (`snapshot.operator_held`).
+        let inv = crate::claim_reconciliation::gh_call::read(
+            "snapshot.operator_held",
+            &self.gh_bin,
+            root,
+        )
+        .args([
             "pr",
             "list",
             "--state",
@@ -486,11 +496,8 @@ impl GhPipelineSource {
             "number,mergeable,createdAt",
             "--limit",
             "500",
-        ])
-        .current_dir(root);
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        let out = cmd
-            .output()
+        ]);
+        let out = crate::claim_reconciliation::gh_call::output(inv)
             .with_context(|| format!("failed to invoke {}", self.gh_bin.display()))?;
         if !out.status.success() {
             return Err(anyhow!(
@@ -521,7 +528,7 @@ impl GhPipelineSource {
     /// two definitions can never drift apart again.
     fn queued_search_query() -> String {
         let mut query = "is:open label:loom:issue".to_string();
-        for label in crate::work_finder::PARK_LABELS {
+        for label in crate::work_finder::PARK_LABELS.iter() {
             query.push_str(&format!(" -label:{label}"));
         }
         query
@@ -538,7 +545,7 @@ impl GhPipelineSource {
     fn changes_requested_unclaimed_search_query() -> String {
         let mut query =
             "is:open is:pr label:loom:changes-requested -label:loom:treating".to_string();
-        for label in crate::work_finder::PARK_LABELS {
+        for label in crate::work_finder::PARK_LABELS.iter() {
             query.push_str(&format!(" -label:{label}"));
         }
         query
@@ -1012,7 +1019,7 @@ mod tests {
         let query = GhPipelineSource::queued_search_query();
         assert!(query.contains("is:open"));
         assert!(query.contains("label:loom:issue"));
-        for label in crate::work_finder::PARK_LABELS {
+        for label in crate::work_finder::PARK_LABELS.iter() {
             assert!(
                 query.contains(&format!("-label:{label}")),
                 "expected '-label:{label}' in query: {query}"
@@ -1038,7 +1045,7 @@ mod tests {
             query.contains("-label:loom:treating"),
             "expected '-label:loom:treating' in query: {query}"
         );
-        for label in crate::work_finder::PARK_LABELS {
+        for label in crate::work_finder::PARK_LABELS.iter() {
             assert!(
                 query.contains(&format!("-label:{label}")),
                 "expected '-label:{label}' in query: {query}"

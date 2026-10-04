@@ -134,11 +134,25 @@ pub(crate) enum ForgeAction {
     /// probe could not answer (fail closed — NOT an absence). Zero
     /// forge-API calls: `git ls-remote` is the git wire protocol, so this
     /// works identically on GitHub and Gitea.
+    ///
+    /// `--branch NAME` probes NAME instead of `feature/issue-N` (#10027).
+    /// `--closed-pr-head` adds one forge read on an existing branch and exits
+    /// `6` (closed PR number on stdout) when its tip is the head of a PR
+    /// closed without merging, no open PR heads it, and the issue has no open
+    /// linked PR — a preserved closed head, not a competing PR. Without it,
+    /// zero forge-API calls.
     #[command(name = "check-branch")]
     CheckBranch {
         /// Issue number whose `feature/issue-N` branch you are about to push.
         #[arg(value_name = "ISSUE")]
         issue: u32,
+        /// Branch to probe instead of the default `feature/issue-N`.
+        #[arg(long, value_name = "BRANCH")]
+        branch: Option<String>,
+        /// Exit 6 instead of 0 when the existing branch is a closed-unmerged
+        /// PR's preserved head and the issue has no open linked PR.
+        #[arg(long)]
+        closed_pr_head: bool,
     },
 
     /// OPERATOR-ONLY: arm GitHub's server-side auto-merge for a PR. Not a
@@ -421,6 +435,30 @@ pub(crate) enum ForgeAction {
         gh_shape: bool,
     },
 
+    /// `forge verdict-stale-notice --label L --marker-sha M --head-sha H
+    /// [--source S]` (#9709) — print the stale-verdict audit comment for a
+    /// `M -> H` invalidation, rendered by the SAME template the daemon's pass
+    /// posts. Reads the PR's RAW (unfiltered) REST comment listing on stdin:
+    /// when a marker newer than the newest trusted one was dropped as
+    /// untrusted, the notice names its login and `author_association` and
+    /// points at `forge.trustedCommenters` instead of asserting a head move.
+    /// Unreadable stdin yields the plain wording. Exits 1 on an unknown label.
+    #[command(name = "verdict-stale-notice")]
+    VerdictStaleNotice {
+        /// The verdict label being cleared (`loom:pr` / `loom:changes-requested`).
+        #[arg(long)]
+        label: String,
+        /// The SHA the newest trusted marker records.
+        #[arg(long)]
+        marker_sha: String,
+        /// The PR's current head SHA.
+        #[arg(long)]
+        head_sha: String,
+        /// The attribution footer's source.
+        #[arg(long, default_value = "verdict-staleness-guard.sh")]
+        source: String,
+    },
+
     /// `forge may-write [--repo OWNER/REPO]` (#9548) — may this installation
     /// write (comment, label, merge, lease) to the repository? Yes only when
     /// it is managed here (origin of a registered workspace or of this Loom
@@ -600,6 +638,19 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             let fetch = fetch.map(|n| (n, repo, with_body));
             return super::forge_identity_cmd::trusted_comments(self_login, fetch, gh_shape);
         }
+        ForgeAction::VerdictStaleNotice {
+            label,
+            marker_sha,
+            head_sha,
+            source,
+        } => {
+            return super::forge_identity_cmd::verdict_stale_notice(
+                &label,
+                &marker_sha,
+                &head_sha,
+                &source,
+            );
+        }
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),
@@ -616,7 +667,15 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::CheckClaim { issue, force_claim } => {
             ForgeCmd::CheckClaim { issue, force_claim }
         }
-        ForgeAction::CheckBranch { issue } => ForgeCmd::CheckBranch { issue },
+        ForgeAction::CheckBranch {
+            issue,
+            branch,
+            closed_pr_head,
+        } => ForgeCmd::CheckBranch(loom_daemon::forge_check_branch::CheckBranchArgs {
+            issue,
+            branch,
+            closed_pr_head,
+        }),
         ForgeAction::AutoMerge {
             pr_number,
             method,

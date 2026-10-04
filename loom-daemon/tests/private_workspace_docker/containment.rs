@@ -34,12 +34,25 @@ fn preparer<'a>(root: &std::path::Path, issue: Option<u64>) -> containment::Prep
 /// The operator's one-time Codex hook-trust decision, as a disposable fixture
 /// (see the module header). Written while the session is stopped, because the
 /// live session binds `config.toml` read-only over its own path.
+///
+/// Keyed exactly as Codex keys it: the hooks.json path under the session's
+/// `CODEX_HOME` mount point, plus the position of Loom's managed entry. Trust
+/// under any other key is not trust for Loom's hook, and admission ignores it.
 fn establish_hook_trust(profile: &std::path::Path) {
+    let hooks: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(profile.join("hooks.json")).unwrap()).unwrap();
+    let key = loom_daemon::tokens_pool::codex_hooks::loom_trust_keys(
+        &hooks,
+        std::path::Path::new(loom_daemon::tokens_pool::codex_hooks::SESSION_CODEX_HOME),
+    )
+    .into_iter()
+    .next()
+    .expect("the managed registration is provisioned before trust is established");
     let config = profile.join("config.toml");
     let existing = std::fs::read_to_string(&config).unwrap_or_default();
     std::fs::write(
         &config,
-        format!("{existing}\n[hooks.state.\"fixture-hook-identity\"]\ntrusted_hash = \"fixture-trust-decision\"\n"),
+        format!("{existing}\n[hooks.state.\"{key}\"]\ntrusted_hash = \"fixture-trust-decision\"\n"),
     )
     .unwrap();
 }

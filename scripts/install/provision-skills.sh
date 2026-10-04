@@ -79,6 +79,8 @@ provision_loom_skills() {
     local agents_src="$checkout_dir/defaults/.claude/agents"
     local commands_dest="$claude_dir/commands/loom"
     local agents_dest_dir="$claude_dir/agents"
+    local star_src="$commands_src/star.md"
+    local star_dest="$claude_dir/commands/star.md"
 
     # Publish resolved destinations up front so EVERY return path communicates
     # where things live (the caller gates on the return code). Consumed by
@@ -102,6 +104,13 @@ provision_loom_skills() {
         soft_fail=1
     else
         _pskill_link_dir "$commands_src" "$commands_dest" || soft_fail=1
+    fi
+
+    # ── 1b. `/star` short-form alias (#10154) ─────────────────────────────────
+    # ~/.claude/commands/star.md -> <checkout>/.../loom/star.md so `/star` and
+    # `/loom:star` share ONE body. A real operator star.md is preserved + warned.
+    if [[ -f "$star_src" && -d "$claude_dir/commands" ]]; then
+        _pskill_link_file "$star_src" "$star_dest" || soft_fail=1
     fi
 
     # ── 2. per-file agent links ───────────────────────────────────────────────
@@ -153,6 +162,13 @@ deprovision_loom_skills() {
             && _pskill_ok "removed skills link $commands_dest"
     elif [[ -e "$commands_dest" ]]; then
         _pskill_ok "left $commands_dest as-is (not a link into the checkout)"
+    fi
+
+    local star_src="$commands_src/star.md"
+    local star_dest="$claude_dir/commands/star.md"
+    if _pskill_link_points_into "$star_dest" "$star_src"; then
+        rm -f "$star_dest" 2>/dev/null \
+            && _pskill_ok "removed star alias $star_dest"
     fi
 
     local agent_src agent_dest
@@ -211,7 +227,7 @@ _pskill_link_file() {
         return 0
     fi
     if ln -s "$src" "$dest" 2>/dev/null; then
-        _pskill_ok "linked agent: $(basename "$dest")"
+        _pskill_ok "linked: $(basename "$dest")"
         return 0
     fi
     _pskill_warn "could not create agent link at $dest"
