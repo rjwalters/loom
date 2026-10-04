@@ -1,7 +1,7 @@
 //! The classifier alone: every stage, and every non-agent state's ask.
 
 use crate::star_liveness::landing::{
-    classify, BlockerRef, Capacity, ItemFacts, MergeRefusal, PrFacts, StarFacts,
+    classify, BlockerRef, Capacity, ItemFacts, MergeRefusal, PrFacts, StaleAction, StarFacts,
 };
 use crate::types::{AskKind, LandingStage};
 
@@ -135,7 +135,11 @@ fn every_non_agent_state_is_needs_operator_with_one_concrete_ask() {
     let hold = with_pr(facts(&["loom:building"]), &["loom:pr", "loom:operator"]);
     assert_eq!(ask_kind(&hold), Some(AskKind::MergeRiskHold));
 
-    assert_eq!(ask_kind(&facts(&["loom:blocked"])), Some(AskKind::BlockedUnnamed));
+    // `blocked-unnamed` only once Curator was handed it and it came back
+    // still blocked with nothing named (#10151; before that: `stale_block_tests`).
+    let mut unnamed = facts(&["loom:blocked"]);
+    unnamed.curator_handoff = true;
+    assert_eq!(ask_kind(&unnamed), Some(AskKind::BlockedUnnamed));
 }
 
 #[test]
@@ -160,9 +164,17 @@ fn a_named_open_blocker_is_blocked_by_and_inherits() {
     assert_eq!(l.blocked_by.as_deref(), Some("#6"));
     assert_eq!(l.inherits, vec![6]);
     assert_eq!(l.next_actor, "blocker #6");
-    // All named blockers closed: nobody can unblock it but a human.
+    // All named blockers closed: a stale block the pass clears itself (#10151).
     f.blockers.truncate(1);
-    assert_eq!(classify(&f).ask.map(|a| a.kind), Some(AskKind::BlockedUnnamed));
+    let l = classify(&f);
+    assert_eq!((l.stage, l.ask), (LandingStage::StaleBlock, None));
+    assert_eq!(
+        l.stale,
+        Some(StaleAction::Unblock {
+            cleared: vec!["#5".into()],
+            key: "#5".into()
+        })
+    );
 }
 
 #[test]

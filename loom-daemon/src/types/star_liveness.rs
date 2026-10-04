@@ -39,6 +39,11 @@ pub enum LandingStage {
     Merging,
     /// An open issue blocks it; the blocker inherits its star.
     BlockedBy,
+    /// `loom:blocked`, but no open blocker is named in its body or comments
+    /// (#10151): every cited blocker has closed, or none is cited and Curator
+    /// has not yet looked. The pass unblocks it or hands it to Curator; the
+    /// operator is asked only once a Curator pass failed to name a blocker.
+    StaleBlock,
     /// Only the operator can move it. [`StarLandingRow::ask`] says what to do.
     /// (A watchdog escalation keeps the agent-owned stage and sets `ask`.)
     NeedsOperator,
@@ -62,6 +67,7 @@ impl LandingStage {
             Self::Mergeable => "mergeable",
             Self::Merging => "merging",
             Self::BlockedBy => "blocked-by",
+            Self::StaleBlock => "stale-block",
             Self::NeedsOperator => "needs-operator",
             Self::NoCapacity => "no-capacity",
             Self::Unknown => "unknown",
@@ -89,7 +95,8 @@ pub enum AskKind {
     /// No host this daemon knows of manages the repo (a loom-ui star for a
     /// repo outside this host's workspace registry).
     UnmanagedRepo,
-    /// `loom:blocked` with no open blocking issue named anywhere.
+    /// `loom:blocked` with no open blocking issue named anywhere, after a
+    /// Curator pass failed to name one (#10151).
     BlockedUnnamed,
     /// `loom:blocked` by an issue in another repo, which a star does not
     /// cross (#9244 C review).
@@ -239,6 +246,7 @@ mod tests {
             LandingStage::Mergeable,
             LandingStage::Merging,
             LandingStage::BlockedBy,
+            LandingStage::StaleBlock,
             LandingStage::NeedsOperator,
             LandingStage::NoCapacity,
         ] {

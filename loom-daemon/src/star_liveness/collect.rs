@@ -15,7 +15,10 @@
 //!   the refusal quotes one of the specific forge phrases, one issue search
 //!   for that phrase (repeated each pass only while no open incident is
 //!   known; hits must be trusted-authored and quote it word-bounded);
-//! - one single-issue read per same-repo blocker of a starred issue;
+//! - one single-issue read per same-repo blocker of a starred issue (the
+//!   blocker's state, and its labels when it inherits a star);
+//! - the comments of a `loom:blocked` starred issue whose body names no open
+//!   blocker (#10151): blockers named there, and the stale-block markers;
 //! - the inheritance walk: one single-issue read per same-repo child not
 //!   already read this pass (closed children and PRs included), plus the
 //!   reads of each evaluated child's own same-repo blockers. Together these
@@ -34,6 +37,7 @@ use super::landing::{
 };
 use super::progress::{fingerprint, short_hash};
 use super::refusal::{self, Detected};
+use super::stale::{self, CommentFacts};
 use crate::forge_listing::RestIssue;
 use crate::types::{AskKind, CapView, QueueDisposition, ReadyQueueRow};
 use crate::work_finder::{WorkItem, OPERATOR_PRIORITY_LABEL};
@@ -350,7 +354,7 @@ impl<'a> Evaluator<'a> {
         })
     }
 
-    /// The dependency refs [`Self::blockers`] reads, when `issue` is blocked.
+    /// The dependency refs a `loom:blocked` issue's body names.
     fn dependency_refs(&self, issue: &RestIssue) -> Vec<String> {
         if !issue.labels.iter().any(|l| l == BLOCKED_LABEL) {
             return Vec::new();
@@ -367,8 +371,8 @@ impl<'a> Evaluator<'a> {
             .and_then(|n| n.parse::<u32>().ok())
     }
 
-    /// Forge reads [`Self::blockers`] would make for `issue` (its same-repo
-    /// blockers not read yet this pass).
+    /// Forge reads [`Self::blocked_facts`] would make for `issue` from its
+    /// body (its same-repo blockers not read yet this pass).
     fn pending_blocker_reads(&self, issue: &RestIssue) -> usize {
         self.dependency_refs(issue)
             .iter()
@@ -378,39 +382,77 @@ impl<'a> Evaluator<'a> {
             .len()
     }
 
-    fn blockers(&mut self, issue: &RestIssue) -> Vec<BlockerRef> {
-        self.dependency_refs(issue)
-            .into_iter()
-            .map(|r| {
-                let same = self.same_repo_number(&r);
-                match same {
-                    Some(n) if n != issue.number => {
-                        let open = self.issue(n).map(|b| b.state.eq_ignore_ascii_case("open"));
-                        BlockerRef {
-                            display: format!("#{n}"),
-                            number: Some(n),
-                            open,
-                            cross_repo_managed: None,
-                        }
-                    }
-                    Some(_) => BlockerRef {
-                        display: r,
-                        number: None,
-                        open: Some(false),
-                        cross_repo_managed: None,
-                    },
-                    None => {
-                        let slug = r.split('#').next().unwrap_or_default().to_string();
-                        BlockerRef {
-                            display: r,
-                            number: None,
-                            open: None,
-                            cross_repo_managed: Some((self.ctx.managed)(&slug)),
-                        }
-                    }
+    /// One named ref (`owner/repo#N`) as a [`BlockerRef`], its state read
+    /// when it is in this repo.
+    fn blocker_ref(&mut self, r: String, issue: u32) -> BlockerRef {
+        match self.same_repo_number(&r) {
+            Some(n) if n != issue => {
+                let open = self.issue(n).map(|b| b.state.eq_ignore_ascii_case("open"));
+                BlockerRef {
+                    display: format!("#{n}"),
+                    number: Some(n),
+                    open,
+                    cross_repo_managed: None,
                 }
-            })
-            .collect()
+            }
+            Some(_) => BlockerRef {
+                display: r,
+                number: None,
+                open: Some(false),
+                cross_repo_managed: None,
+            },
+            None => {
+                let slug = r.split('#').next().unwrap_or_default().to_string();
+                BlockerRef {
+                    display: r,
+                    number: None,
+                    open: None,
+                    cross_repo_managed: Some((self.ctx.managed)(&slug)),
+                }
+            }
+        }
+    }
+
+    /// The blockers a `loom:blocked` issue names, and what its comments say
+    /// about the block (#10151). The body is read first; only when it names
+    /// no open blocker are the issue's trusted comments read, both for
+    /// blockers named there and for the pass's own stale-block markers.
+    fn blocked_facts(&mut self, issue: &RestIssue) -> (Vec<BlockerRef>, Option<CommentFacts>) {
+        if !issue.labels.iter().any(|l| l == BLOCKED_LABEL) {
+            return (Vec::new(), Some(CommentFacts::default()));
+        }
+        let mut refs: BTreeSet<String> = self.dependency_refs(issue).into_iter().collect();
+        let mut blockers: Vec<BlockerRef> = refs
+            .clone()
+            .into_iter()
+            .map(|r| self.blocker_ref(r, issue.number))
+            .collect();
+        if blockers.iter().any(|b| b.open != Some(false)) {
+            return (blockers, Some(CommentFacts::default()));
+        }
+        let facts = match self.forge.comments(issue.number) {
+            Ok(comments) => {
+                let me = self.forge.self_login();
+                stale::comment_facts(&comments, me.as_deref())
+            }
+            Err(e) => {
+                log::debug!(
+                    "star_liveness: reading comments of {}#{} failed: {e}",
+                    self.ctx.slug,
+                    issue.number
+                );
+                return (blockers, None);
+            }
+        };
+        for text in &facts.bodies {
+            for r in crate::dep_classify::refs::parse_named_blocker_refs(text, self.ctx.slug) {
+                if refs.insert(r.clone()) {
+                    let b = self.blocker_ref(r, issue.number);
+                    blockers.push(b);
+                }
+            }
+        }
+        (blockers, Some(facts))
     }
 
     fn capacity(&self, n: u32) -> Capacity {
@@ -484,12 +526,18 @@ impl<'a> Evaluator<'a> {
         let row = self.tick_row(n);
         let disposition = row.map(|r| r.disposition);
         let row_starred_at = row.and_then(|r| r.operator_priority_at.clone());
+        let (blockers, comment_facts) = self.blocked_facts(issue);
+        let comments_unread = comment_facts.is_none();
+        let comment_facts = comment_facts.unwrap_or_default();
         let facts = StarFacts {
             repo: self.ctx.slug.to_string(),
             managed: true,
             issue: item_facts(issue),
             pr: pr_facts,
-            blockers: self.blockers(issue),
+            blockers,
+            curator_handoff: comment_facts.handoff,
+            unblocked_before: comment_facts.unblocked,
+            comments_unread,
             red_main_fix: self.red_main_fix(),
             live_sweep: matches!(
                 disposition,

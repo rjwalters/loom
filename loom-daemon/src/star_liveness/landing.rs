@@ -15,10 +15,15 @@
 //!    → `needs-operator(merge-risk-hold)`;
 //! 4. the forge refused the merge of its approved PR →
 //!    `needs-operator(merge-refused)`;
-//! 5. `loom:blocked`: an open same-repo blocker → `blocked-by` (every open
-//!    same-repo blocker inherits the star); only a cross-repo blocker → `needs-operator(blocked-cross-repo)`
-//!    (stars are not inherited across repos, so nothing else would move it);
-//!    none → `needs-operator(blocked-unnamed)`;
+//! 5. `loom:blocked` (blockers named in the body **or** a trusted comment): an
+//!    open same-repo blocker → `blocked-by` (every open same-repo blocker
+//!    inherits the star); only a
+//!    cross-repo blocker → `needs-operator(blocked-cross-repo)` (stars are not
+//!    inherited across repos, so nothing else would move it); otherwise the
+//!    block is stale (#10151) → `stale-block`, which the pass resolves itself
+//!    ([`StaleAction`]): every cited blocker closed → unblock; none cited →
+//!    hand to Curator. Only when that already happened once and the issue is
+//!    blocked again with still no open blocker → `needs-operator(blocked-unnamed)`;
 //! 6. its repo's `main` is red and it has not been dispatched → `blocked-by`
 //!    the red-main fix;
 //! 7. an open PR → `changes-requested` / `mergeable` (`merging` with a live
@@ -135,8 +140,18 @@ pub struct StarFacts {
     pub managed: bool,
     pub issue: ItemFacts,
     pub pr: Option<PrFacts>,
-    /// Blockers named by the issue (read only when it is `loom:blocked`).
+    /// Blockers named by the issue (read only when it is `loom:blocked`): its
+    /// body, plus its trusted comments when the body names no open one.
     pub blockers: Vec<BlockerRef>,
+    /// A trusted [`super::stale::HANDOFF_MARKER`] comment exists: the pass
+    /// already handed this issue to Curator once over an unnamed block.
+    pub curator_handoff: bool,
+    /// The keys of trusted [`super::stale::UNBLOCKED_PREFIX`] comments: the
+    /// cleared-blocker sets the pass already unblocked this issue over.
+    pub unblocked_before: Vec<String>,
+    /// The comments of a blocked issue whose body names no open blocker could
+    /// not be read: nothing about the block is certain, so no write is made.
+    pub comments_unread: bool,
     /// The repo's red-main fix issue, when `main` is verified red.
     pub red_main_fix: Option<u32>,
     /// A live sweep on this host holds the issue.
@@ -146,6 +161,17 @@ pub struct StarFacts {
     pub capacity: Capacity,
     /// This host's id, for the pool-exhaustion ask.
     pub host: String,
+}
+
+/// What the pass does about a `stale-block` row (#10151, [`super::stale`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaleAction {
+    /// Every cited blocker is closed: remove `loom:blocked` and say which.
+    /// `key` is the cleared set (`#5,#6`), the comment marker's dedupe key.
+    Unblock { cleared: Vec<String>, key: String },
+    /// Nothing is cited: hand the issue to Curator to name the blocker or
+    /// release it.
+    CuratorHandoff,
 }
 
 /// The classifier's verdict.
@@ -165,6 +191,10 @@ pub struct Landing {
     /// (#10214). `None` for the pool-exhaustion grace window.
     pub capacity_wait: Option<CapacityWait>,
     pub ask: Option<OperatorAsk>,
+    /// `StaleBlock`: the write the pass makes, or `None` when something else
+    /// holds the issue (its open PR is itself parked, or a Builder holds it),
+    /// so the row only waits on Curator and the watchdog.
+    pub stale: Option<StaleAction>,
 }
 
 impl Landing {
@@ -178,6 +208,7 @@ impl Landing {
             no_capacity: None,
             capacity_wait: None,
             ask: None,
+            stale: None,
         }
     }
 
@@ -357,19 +388,7 @@ pub fn classify(f: &StarFacts) -> Landing {
             landing.blocked_by = Some(d.clone());
             return landing;
         }
-        return Landing::operator(
-            AskKind::BlockedUnnamed,
-            "",
-            format!(
-                "{}#{n} is starred but `loom:blocked` with no open blocking issue named: \
-                 resolve what blocks it and remove `loom:blocked`, or name the blocker so \
-                 it inherits the star — a `Blocked by #N` / `Depends on owner/repo#N` / \
-                 `Requires #N` line anywhere in the body, or an unchecked `- [ ] #N` / \
-                 `- [ ] owner/repo#N` item under `## Dependencies`.",
-                f.repo
-            ),
-            pr_num,
-        );
+        return stale_block(f, pr_num);
     }
 
     let dispatched =
@@ -432,4 +451,90 @@ pub fn classify(f: &StarFacts) -> Landing {
         return Landing::stage(LandingStage::Ready, "work-finder", None);
     }
     Landing::stage(LandingStage::Curating, "curator", None)
+}
+
+/// PR labels under which the issue's own open PR is parked, so clearing the
+/// issue's block would move nothing (the #4492 / #8925 superseding block):
+/// the stale block is then left to Curator, never cleared by the pass.
+const PARKED_PR_LABELS: &[&str] = &[
+    "loom:blocked",
+    "loom:changes-requested",
+    "loom:merge-conflict",
+];
+
+/// The ways to name a blocker so it inherits the star, for the ask.
+const NAMING_FORMS: &str = "a `Blocked by #N` / `Depends on owner/repo#N` / `Requires #N` line \
+     anywhere in the body, or an unchecked `- [ ] #N` / `- [ ] owner/repo#N` item under \
+     `## Dependencies`";
+
+/// Rule 5's tail (#10151): `loom:blocked`, and no open blocker is named in
+/// the body or a trusted comment.
+///
+/// - Every cited same-repo blocker is closed → `stale-block`, unblocked by
+///   the pass ([`StaleAction::Unblock`]).
+/// - Nothing is cited → `stale-block`, handed to Curator
+///   ([`StaleAction::CuratorHandoff`]).
+/// - The pass already did that once (its marker is on the issue) and the
+///   issue is blocked again on the same evidence → an agent pass has failed
+///   to name a blocker: `needs-operator(blocked-unnamed)`. Never a second
+///   unblock, so the pass cannot flip-flop with whoever re-applied the label.
+///
+/// A self-reference is not a blocker, and an unreadable or cross-repo one
+/// (`open != Some(false)`) never gets here: it was treated as open above.
+fn stale_block(f: &StarFacts, pr_num: Option<u32>) -> Landing {
+    let n = f.issue.number;
+    let mut closed: Vec<u32> = f
+        .blockers
+        .iter()
+        .filter(|b| b.open == Some(false))
+        .filter_map(|b| b.number.filter(|m| *m != n))
+        .collect();
+    closed.sort_unstable();
+    closed.dedup();
+    let cleared: Vec<String> = closed.iter().map(|m| format!("#{m}")).collect();
+    let key = cleared.join(",");
+
+    if cleared.is_empty() && f.curator_handoff && !f.comments_unread {
+        return Landing::operator(
+            AskKind::BlockedUnnamed,
+            "",
+            format!(
+                "{}#{n} is starred but `loom:blocked` with no open blocking issue named, and it \
+                 is still blocked after the liveness check handed it to Curator to name one: \
+                 resolve what blocks it and remove `loom:blocked`, or name the blocker so it \
+                 inherits the star — {NAMING_FORMS}.",
+                f.repo
+            ),
+            pr_num,
+        );
+    }
+    if !cleared.is_empty() && f.unblocked_before.contains(&key) {
+        return Landing::operator(
+            AskKind::BlockedUnnamed,
+            &format!("reblocked:{key}"),
+            format!(
+                "{}#{n} is starred and `loom:blocked` again, though every blocker it cites \
+                 ({key}) is closed and the liveness check already unblocked it once: name what \
+                 really blocks it so it inherits the star — {NAMING_FORMS} — or remove \
+                 `loom:blocked`.",
+                f.repo
+            ),
+            pr_num,
+        );
+    }
+
+    let mut landing = Landing::stage(LandingStage::StaleBlock, "curator", pr_num);
+    landing.stale = if f.comments_unread {
+        None
+    } else if cleared.is_empty() {
+        // A PR or a Builder already holds it: nothing for Curator to release.
+        let held = f.pr.is_some() || f.issue.has(crate::work_finder::BUILDING_LABEL);
+        (!held).then_some(StaleAction::CuratorHandoff)
+    } else {
+        let parked =
+            f.pr.as_ref()
+                .is_some_and(|p| PARKED_PR_LABELS.iter().any(|l| p.item.has(l)));
+        (!parked).then_some(StaleAction::Unblock { cleared, key })
+    };
+    landing
 }
