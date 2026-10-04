@@ -58,9 +58,9 @@
 //! # The constants are fixture-derived, not fitted to live data
 //!
 //! [`UPPER_STRETCH`] and [`LOWER_STRETCH`] were chosen on deterministic
-//! correlated-stage fixtures (the one in `eta::tests::land_v3`, plus five
+//! correlated-stage fixtures (the one in `eta::tests::land_v3`, plus six
 //! variants of its stage mix and slowness regimes used while choosing). On
-//! all six, a lower-side stretch of `1.3` moved `land-v2`'s replayed
+//! all seven, a lower-side stretch of `1.3` moved `land-v2`'s replayed
 //! p25–p75 coverage toward 50% **and** lowered mean pinball loss, while
 //! **every** upward stretch tried (1.3–2.0) *raised* pinball loss: on a
 //! stationary fixture `land-v2`'s p75 is not too early, so there is no
