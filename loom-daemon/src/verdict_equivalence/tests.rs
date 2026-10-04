@@ -30,7 +30,7 @@ const HEAD: &str = "2222222222222222222222222222222222222222";
 /// Write a fake `gh` that logs its argv to `log` and answers the first route
 /// whose pattern appears in `"$*"`. An unrouted call exits 1 with nothing on
 /// stdout — the same shape a real `gh` failure has.
-fn fake_gh(dir: &Path, log: &Path, routes: &[(&str, &str)]) -> PathBuf {
+pub(super) fn fake_gh(dir: &Path, log: &Path, routes: &[(&str, &str)]) -> PathBuf {
     let mut cases = String::new();
     for (pattern, body) in routes {
         assert!(!body.contains('\''), "fixture bodies must not contain single quotes");
@@ -58,7 +58,7 @@ exit 1
 }
 
 /// `{"baseRefName": "main"}` — what `gh pr view --json baseRefName` returns.
-const BASE_MAIN: (&str, &str) = ("--json baseRefName", r#"{"baseRefName": "main"}"#);
+pub(super) const BASE_MAIN: (&str, &str) = ("--json baseRefName", r#"{"baseRefName": "main"}"#);
 
 /// A compare response carrying one changed file with the given patch text.
 fn one_file(patch: &str) -> String {
@@ -452,7 +452,7 @@ fn unreadable_compare_responses_are_indeterminate() {
 // ---------------------------------------------------------------------------
 
 /// Run git in `repo`, asserting success.
-fn git_ok(repo: &Path, args: &[&str]) -> String {
+pub(super) fn git_ok(repo: &Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -471,7 +471,7 @@ fn git_ok(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-fn write(repo: &Path, rel: &str, content: &str) {
+pub(super) fn write(repo: &Path, rel: &str, content: &str) {
     std::fs::write(repo.join(rel), content).unwrap();
 }
 
@@ -514,7 +514,7 @@ fn fixture(pr_file: &str, pr_content: &str) -> (TempDir, String, String) {
 
 /// Skip rather than fail on a git with no `merge-tree --write-tree`, the same
 /// floor the two existing callers use.
-fn merge_tree_available(repo: &Path) -> bool {
+pub(super) fn merge_tree_available(repo: &Path) -> bool {
     if super::git_objects::supports_merge_tree(repo) {
         return true;
     }
@@ -523,7 +523,7 @@ fn merge_tree_available(repo: &Path) -> bool {
 }
 
 /// `gh` answering only "yes, that commit is on main".
-fn gh_base_descends(dir: &Path, log: &Path, base_sha: &str) -> PathBuf {
+pub(super) fn gh_base_descends(dir: &Path, log: &Path, base_sha: &str) -> PathBuf {
     fake_gh(
         dir,
         log,

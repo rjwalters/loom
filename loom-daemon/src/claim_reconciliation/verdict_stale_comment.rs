@@ -101,6 +101,21 @@ pub(super) fn body(label: &str, marker_sha: &str, head_sha: &str, disarm_line: &
     attributed_body(label, marker_sha, head_sha, disarm_line, None)
 }
 
+/// The notice's bullet for a clear that happened because the equivalence check
+/// could not be MADE, not because the change provably changed (#10134).
+/// Pre-formatted like `disarm_line` (leading newline) so it rides in the same
+/// slot; empty for `None`, so a clear on a proven content change reads exactly
+/// as it always has.
+pub(super) fn unavailable_line(note: Option<&str>) -> String {
+    note.map(|why| {
+        format!(
+            "\n- **Could not check whether the reviewed change is unchanged — cleared to fail \
+             closed, not because a content change was proven.** Why: {why}"
+        )
+    })
+    .unwrap_or_default()
+}
+
 /// [`body`], naming a newer verdict marker the trust filter dropped when there
 /// is one (#9709) — the template itself lives in
 /// [`crate::verdict_stale_notice::body`], shared with the shell guard.
@@ -223,5 +238,17 @@ mod tests {
     #[test]
     fn an_absent_disarm_contributes_no_line() {
         assert!(!body("loom:pr", SHA_A, SHA_B, "").contains("Disarmed"));
+    }
+
+    /// #10134: a fail-closed clear (no equivalence could be evaluated) must
+    /// say so in the posted notice; a clear on a proven change adds nothing.
+    #[test]
+    fn a_fail_closed_clear_names_why_in_the_notice() {
+        let why = "clean-merge: new head X could not be fetched";
+        let b = body("loom:pr", SHA_A, SHA_B, &unavailable_line(Some(why)));
+        assert!(b.contains("Could not check whether the reviewed change is unchanged"));
+        assert!(b.contains(why));
+        assert!(b.starts_with(VERDICT_STALE_MARKER_PREFIX), "dedup marker must stay first");
+        assert_eq!(unavailable_line(None), "");
     }
 }
