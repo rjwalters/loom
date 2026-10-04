@@ -677,6 +677,137 @@ async fn an_attended_run_starts_from_its_retained_tail_and_says_what_it_skipped(
     assert!(published.iter().all(|r| r.identity.repo.is_none()));
 }
 
+/// Drive one attended run of `issue` claimed at `from` until its session
+/// exits, and return every record it published.
+async fn drive_claim(
+    scratch: &Scratch,
+    transcript: &Path,
+    issue: u32,
+    from: u64,
+    tag: &str,
+) -> Vec<SessionOutputRecord> {
+    let located = Located {
+        from,
+        ..Located::from_path(transcript).unwrap()
+    };
+    let queue = Arc::new(DurableQueue::open(scratch.path(&format!("queue-{tag}.jsonl")), 1_000));
+    let sink = SessionOutputSink::new(vec![queue.clone()], "host-test").unwrap();
+    let live = ResolvedLiveOutput {
+        interval: Duration::from_millis(5),
+        heartbeat: Duration::from_secs(30),
+        max_runs: 1,
+    };
+    let limits = Limits {
+        max_age: Duration::from_secs(60),
+        idle_exit: Duration::from_secs(600),
+    };
+    let mut polls = 0;
+    let watch = Watch {
+        session_alive: move || {
+            polls += 1;
+            polls <= 1
+        },
+        newer_claim: || None,
+    };
+    drive(
+        identity(&located, issue, None, None),
+        &located,
+        &scratch.0,
+        &sink,
+        live,
+        limits,
+        watch,
+    )
+    .await;
+    records(&queue)
+}
+
+fn status_ids(published: &[SessionOutputRecord]) -> Vec<String> {
+    published
+        .iter()
+        .filter(|r| r.stream_id != format!("{SESSION}/agent-ab2"))
+        .map(|r| r.event_id.clone())
+        .collect()
+}
+
+/// #10136: every run on one transcript used to number its status records on
+/// the transcript's sweep id from 0, so a later run reused an earlier run's
+/// `event_id`s and a de-duplicating consumer dropped its coverage records.
+#[tokio::test]
+async fn runs_on_one_transcript_never_share_a_status_event_id() {
+    let scratch = Scratch::new("status-ids");
+    let projects = scratch.path("projects");
+    let session = session(&projects, "-p", &[user_text("hello")]);
+    let lines = [
+        user_text("Build issue #42"),
+        bash_call("toolu_a", "worktree.sh 42"),
+        assistant_text("working on 42"),
+        bash_call("toolu_b", "worktree.sh 43"),
+        assistant_text("working on 43"),
+        bash_call("toolu_c", "worktree.sh 42"),
+        assistant_text("back on 42"),
+    ];
+    let transcript = subagent(&session, "ab2", Some("loom-builder"), &lines);
+    let offset = |n: usize| lines[..n].iter().map(|l| l.len() as u64).sum::<u64>();
+
+    // Issue 42, then 43 taking the transcript over, then 42 claimed again,
+    // plus a claim for another issue at an already-used offset (an explicit
+    // transcript followed from the same end).
+    let runs = [
+        (42, offset(1)),
+        (43, offset(3)),
+        (42, offset(5)),
+        (43, offset(1)),
+    ];
+    let mut seen: Vec<(String, u32)> = Vec::new();
+    for (n, &(issue, from)) in runs.iter().enumerate() {
+        let published = drive_claim(&scratch, &transcript, issue, from, &n.to_string()).await;
+        let ids = status_ids(&published);
+        assert!(ids.len() >= 2, "a run opens and closes its coverage: {published:#?}");
+        for id in &ids {
+            assert!(
+                !seen.iter().any(|(used, _)| used == id),
+                "run {n} (issue {issue}) reused status event_id {id}: {seen:?}"
+            );
+        }
+        seen.extend(ids.into_iter().map(|id| (id, issue)));
+        // Grouping is unchanged: every record still carries the transcript's
+        // sweep id, and content stays keyed by the transcript's own lines.
+        for record in &published {
+            assert_eq!(record.identity.sweep_id.as_deref(), Some("attended-755d0cb5-ab2"));
+        }
+        let status_stream = format!("attended-755d0cb5-ab2@{issue}:{from}");
+        assert!(
+            published
+                .iter()
+                .all(|r| r.stream_id == status_stream
+                    || r.stream_id == format!("{SESSION}/agent-ab2"))
+        );
+    }
+}
+
+/// The status stream is a pure function of transcript and claim, so a
+/// restarted tailer for the same claim reproduces the same ids, which is what
+/// lets a consumer de-duplicate the overlap.
+#[tokio::test]
+async fn a_restarted_tailer_for_the_same_claim_reproduces_its_status_ids() {
+    let scratch = Scratch::new("status-restart");
+    let projects = scratch.path("projects");
+    let session = session(&projects, "-p", &[user_text("hello")]);
+    let lines = [
+        user_text("Build issue #42"),
+        bash_call("toolu_a", "worktree.sh 42"),
+        assistant_text("working on 42"),
+    ];
+    let transcript = subagent(&session, "ab2", Some("loom-builder"), &lines);
+    let from = lines[0].len() as u64;
+    let first = status_ids(&drive_claim(&scratch, &transcript, 42, from, "first").await);
+    let again = status_ids(&drive_claim(&scratch, &transcript, 42, from, "again").await);
+    assert!(!first.is_empty());
+    assert_eq!(first, again);
+    assert_eq!(first[0], format!("attended-755d0cb5-ab2@42:{from}#0"));
+}
+
 /// The whole detached-tailer path against a collector that is not there: it
 /// must finish promptly and quietly, not hang on export.
 #[cfg(feature = "otlp")]

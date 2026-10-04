@@ -49,7 +49,8 @@
 //! |---|---|
 //! | `loom.session.output.launch` | `attended` (a daemon run says `daemon`) |
 //! | `loom.sweep_id` | `attended-<first 8 of session id>[-<agent id>]`, a pure function of the transcript, so a restarted tailer keeps the same attempt |
-//! | `loom.session_id` / `stream_id` | `<session>` or `<session>/agent-<id>`, the same shape [`super::claude::discover`] mints |
+//! | `loom.session_id` / content `stream_id` | `<session>` or `<session>/agent-<id>`, the same shape [`super::claude::discover`] mints |
+//! | status `stream_id` | `<sweep_id>@<issue>:<claim offset>`: unique per run, so two runs on one transcript never share a status `event_id`, and the same for a restarted tailer of the same claim (#10136) |
 //! | `loom.repo` | the claim checkout's `origin` remote, never the transcript's `cwd`, which is the operator session's directory and can be another repo |
 //! | `loom.role` | `--role`, else the subagent's `loom-<role>` type |
 //! | `loom.attempt` | absent. There is no dispatch counter to number attended runs |
@@ -880,6 +881,22 @@ fn identity(
     }
 }
 
+/// The stream an attended run numbers its status records on (#10136):
+/// `<sweep_id>@<issue>:<claim offset>`.
+///
+/// `sweep_id` alone is a function of the transcript, and every run numbers its
+/// status records from 0, so two runs on one transcript (a newer claim taking
+/// it over, the same issue claimed again later) would reuse each other's
+/// `event_id`s. The claim tells runs apart: one line holds one claim call, so
+/// two runs share an offset only when they are the same claim, and the issue
+/// separates claims that share an offset because none was located (an explicit
+/// `--transcript` followed from its current end). It is still a pure function
+/// of transcript and claim, so a restarted tailer for the same claim
+/// reproduces the same ids, which de-duplication relies on.
+fn status_stream(sweep_id: &str, claim: Claim) -> String {
+    format!("{sweep_id}@{}:{}", claim.issue, claim.from)
+}
+
 /// The run's end conditions, in priority order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Limits {
@@ -949,10 +966,13 @@ where
     let root_key = workspace_root.display().to_string();
     let issue = identity.issue.unwrap_or_default();
     let key = (root_key.clone(), issue);
-    let status_stream = identity
-        .sweep_id
-        .clone()
-        .unwrap_or_else(|| located.sweep_id());
+    let status_stream = status_stream(
+        identity.sweep_id.as_deref().unwrap_or(&located.sweep_id()),
+        Claim {
+            issue,
+            from: located.from,
+        },
+    );
     let source = Source::Fixed {
         stream_id: located.stream_id.clone(),
         path: located.path.clone(),

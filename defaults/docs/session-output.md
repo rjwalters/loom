@@ -140,8 +140,14 @@ transcript writes several records inside one millisecond) are still
 distinguishable by `sequence`.
 
 Status records (`heartbeat`, `gap`, `coverage`) are sequenced on their **own**
-stream, separate from any transcript's line numbering, so they can never
-collide with a content record's id.
+stream, separate from any transcript's line numbering, so they never collide
+with a content record's id. Each run numbers its status records from 0, so the
+status stream is unique **per run**, and that keeps them from colliding across
+runs too. A daemon run's status stream is its sweep id, which is unique per
+dispatch (else `issue-<N>-attempt-<M>`). An attended run's is
+`<sweep_id>@<issue>:<claim offset>`, because its sweep id is the same for every
+run on one transcript (#10136). Both are pure functions of the run, so a
+restarted producer for the same run reproduces the same status `event_id`s.
 
 ### Gaps, truncation and loss
 
@@ -467,7 +473,8 @@ resumes only when the agent runs a claim step again.
 |---|---|
 | `loom.session.output.launch` | `attended` |
 | `loom.sweep_id` | `attended-<first 8 chars of the session id>-<agent id>`: a pure function of the transcript, so a restarted tailer keeps the same attempt |
-| `loom.session_id` / `stream_id` | `<session>/agent-<id>`, the same shape the daemon's discovery mints for a subagent |
+| `loom.session_id` / content `stream_id` | `<session>/agent-<id>`, the same shape the daemon's discovery mints for a subagent |
+| status `stream_id` | `<sweep_id>@<issue>:<claim offset>`: unique per run, so a later claim on the same transcript never reuses a status `event_id`; the same for a restarted tailer of the same claim (#10136) |
 | `loom.repo` | the claim checkout's `origin` remote. Never the transcript's `cwd`, which is the operator session's directory and can be another repo. Omitted when there is no remote; no `gh` call is made |
 | `loom.role` | `--role`, else the subagent's `loom-<role>` agent type |
 | `loom.attempt` | absent: no dispatch counter numbers attended runs |
