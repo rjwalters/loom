@@ -1086,6 +1086,7 @@ Workers use a three-level priority system to determine which issues to work on:
 **Step 1: Check for starred issues first**
 
 ```bash
+# level list: keep in sync with operator_levels.rs LEVELS until #10311
 for L in loom:operator-high-priority loom:high-priority-inherited loom:operator-priority; do
 gh issue list --label="loom:issue" --label="$L" --state=open --limit=5; done
 ```

@@ -12,8 +12,34 @@
 //! | 2 | ⭐⭐ | `loom:operator-high-priority` | `loom:high-priority-inherited` | 5 fleet-wide |
 //! | 3 (later) | ⭐⭐⭐ | `loom:operator-top-priority` | `loom:top-priority-inherited` | smaller |
 //!
-//! Level 3 is a new row in [`LEVELS`] (plus its two `labels.json` entries)
-//! and nothing else: every consumer takes the table as data.
+//! **Adding level 3.** Every Rust consumer takes the table as data, so the
+//! daemon half is a new row in [`LEVELS`] plus its two `defaults/labels.json`
+//! entries (then `loom-daemon labels generate --write`). The role prompts
+//! do **not** read the table yet: each hard-codes the level labels and must
+//! be edited by hand for a new level until #10311 makes them table-driven.
+//! Each prompt site below carries a "level list: keep in sync with
+//! operator_levels.rs LEVELS until #10311" note:
+//!
+//! - `defaults/.claude/commands/loom/builder-pr.md`, PR Label Rules: the
+//!   label-copy list a Builder puts on its PR.
+//! - `defaults/.claude/commands/loom/builder.md`, Priority Order and the
+//!   starred-first `for L in …` query.
+//! - `defaults/.claude/commands/loom/curator.md`, Priority 0 `for L in …`.
+//! - `defaults/.claude/commands/loom/champion-pr-merge.md`, the held-PR
+//!   digest's `LVL` jq mapping (level 0/1/2) and its ⭐ / ⭐⭐ glyph `case`.
+//! - `defaults/.claude/commands/loom/champion.md`, Priority 4 epic queue
+//!   `sort_by` (it buckets every `high-priority` label as one level).
+//! - Prose (no sync note) that names the level-2 labels:
+//!   `defaults/docs/label-state-machine.md` (levels bullet) and
+//!   `defaults/docs/pr-planning.md` (Operator star row).
+//!
+//! Three more surfaces name only the star (no level-2 label either):
+//! the `defaults/roles/*.json` interval prompts, the
+//! `defaults/.claude/agents/loom-*.md` one-line descriptions, and Guide's
+//! WORK_PLAN "Operator Priority" query (`guide.md`). They defer to the role
+//! prompts above and are in #10311's scope. Regenerate the
+//! `defaults/.agents/skills/` copies with `loom-daemon generate-agent-skills`;
+//! never edit them by hand.
 //!
 //! # Rules every consumer follows
 //!

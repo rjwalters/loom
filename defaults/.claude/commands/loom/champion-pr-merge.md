@@ -1712,6 +1712,7 @@ DIGEST_ROWS=""
 CONFLICT_SINCE_MARKERS=""
 HELD_ROTTING=0
 # #9244/#10307: starred held PRs sort to the top (level 2 first), marked ⭐ / ⭐⭐.
+# level list: keep in sync with operator_levels.rs LEVELS until #10311 (LVL and STAR)
 LVL='[.labels[].name] | if (index("loom:operator-high-priority") or index("loom:high-priority-inherited")) then 2 elif index("loom:operator-priority") then 1 else 0 end'
 for PR_NUM in $(printf '%s\n' "$HELD_JSON" | jq -r "sort_by(-($LVL)) | .[].number"); do
   ROW=$(printf '%s\n' "$HELD_JSON" | jq -c --argjson n "$PR_NUM" '.[] | select(.number == $n)')

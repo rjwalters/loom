@@ -163,6 +163,7 @@ If no individual proposals need promotion, check for epic proposals:
 
 ```bash
 # Epic proposals, highest priority level first (#9244, #10307)
+# level list: keep in sync with operator_levels.rs LEVELS until #10311
 gh issue list \
   --label="loom:epic" \
   --state=open \

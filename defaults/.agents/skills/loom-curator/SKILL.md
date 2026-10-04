@@ -208,6 +208,7 @@ Use a **priority-based search** to find the highest-value curation opportunity:
 Level 2 (`loom:operator-high-priority`, or daemon-written `loom:high-priority-inherited`) counts as starred and goes first (#10307):
 
 ```bash
+# level list: keep in sync with operator_levels.rs LEVELS until #10311
 for L in loom:operator-high-priority loom:high-priority-inherited loom:operator-priority; do
 gh issue list --label "$L" --state open --json number,title,labels \
   --jq '.[] | select([.labels[].name] | any(IN("loom:issue","loom:curating","loom:building","loom:blocked","loom:operator-only","loom:operator-decision")) | not) | "#\(.number) \(.title)"'

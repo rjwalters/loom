@@ -651,7 +651,8 @@ body. `--signoff` is harmless when not required. See
 **When creating a NEW PR:**
 - Add `loom:review-requested` during creation, plus each priority label the issue
   carries (`loom:operator-priority`, `loom:operator-high-priority`,
-  `loom:high-priority-inherited`; #9244/#10307: the one set a role copies, never invents)
+  `loom:high-priority-inherited`; #9244/#10307: the one set a role copies, never invents;
+  level list: keep in sync with operator_levels.rs LEVELS until #10311)
 - This is the ONLY time you add labels to a PR
 
 **After PR creation:**
