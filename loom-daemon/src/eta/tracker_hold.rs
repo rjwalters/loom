@@ -252,10 +252,15 @@ impl Tracker {
         let sweep_drives = item.sweep_running && pending.is_none();
         let current = item.stage.as_ref().map(|s| s.stage);
         let attempt = item.rework_rounds + 1;
+        if pending.is_none() && !sweep_drives && current == Some(Stage::ReviewWait) {
+            // The external approval below is a Judge verdict: note it in the
+            // item's facts as the pooled path does (#10231).
+            item.facts.note_verdict(attempt, true, now);
+        }
         let mut boundary = true;
         if let Some(since) = pending {
             // The labels settle a pending in-sweep verdict: approved.
-            let mut row = self.settle_verdict(key, Stage::MergeWait, "pass", since, true);
+            let mut row = self.settle_verdict(key, Stage::MergeWait, "pass", since, true, now);
             row.raw = raw.clone();
             effects.journal.push(row);
         } else if !sweep_drives && current != Some(Stage::MergeWait) {

@@ -304,6 +304,12 @@ fn review_wait_approved_and_held_in_one_interval_closes_review_at_the_approval()
     assert_eq!(review.attempt, Some(1));
     assert_eq!(review.next_stage, Some(Stage::MergeHold));
     assert_eq!(h.current(400).entered_at, Some(t(300)));
+    // #10231: the approval the row carries is also a noted verdict.
+    let input = h
+        .tracker
+        .land_input(&Harness::key(), &h.ctx(), t(400))
+        .expect("a land input");
+    assert_eq!(input.features.judge_verdicts_so_far, Some(vec!["pass".to_string()]));
 
     let rows = h.list(&[PR], 850, 900);
     assert_eq!(rows[0].duration_sec, Some(600), "the hold, from the approval");
