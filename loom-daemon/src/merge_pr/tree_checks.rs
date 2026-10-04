@@ -135,6 +135,7 @@ pub fn build_tree(
             "--quiet",
             "--no-tags",
             remote,
+            "--",
             &base_spec,
             &pr_spec,
         ],

@@ -29,6 +29,13 @@ In `.loom/config.json`:
 - The environment is scrubbed to `PATH`, `HOME`, `CI=1` and
   `LOOM_MERGE_TREE_CHECK=1`: no forge tokens reach a check. Commands come from
   the repo's own committed config, trusted like any other config.
+- The command list is read from the **merging checkout's** config
+  (`merge-pr.sh` passes its own `.loom/config.json` to the daemon), never from
+  the PR: a PR cannot turn the gate off by editing its copy. But a check that
+  runs a repo script runs **the merge tree's** copy of it, i.e. the PR's code,
+  on the host doing the merge, with that user's `HOME`. That is the same trust
+  a Judge gives a PR when it runs its tests locally; do not opt in a repo that
+  takes PRs from authors you would not run code from.
 
 ## What happens
 
@@ -43,7 +50,7 @@ checkout and issue worktrees are never touched.
 | all pass | merge proceeds |
 | a check fails | `merge-pr.sh` exits non-zero before the merge API is called, prints the check's real output, and posts a PR comment naming the failing check |
 | tree cannot be built / check cannot run (fetch failure, conflict, head moved, missing or older `loom-daemon`, malformed config) | refused, fail closed |
-| `--allow-red-tree` | warns and records an audit comment, then proceeds (like `--allow-unapproved`) |
+| `--allow-red-tree` | for a **failing** check: warns and records an audit comment, then proceeds (like `--allow-unapproved`). It does not override a gate that cannot run |
 | `--dry-run` | reports the would-block; posts no comment |
 
 ## What belongs in the gate

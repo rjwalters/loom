@@ -72,6 +72,10 @@ LOOM_DAEMON_BIN="$(make_stub clean)" run_guard
 assert_eq 0 "$LAST_RC" "passing tree -> guard passes"
 A="$(cat "$WORK/argv-clean")"
 assert_contains "$A" "merge-pr tree-checks --pr 7 --repo o/r --head-sha deadbeef --base-ref main" "daemon gets PR/repo/head/base operands"
+# The daemon must read the SAME config the guard just consulted (the main
+# checkout's), never the cwd's: run from an issue worktree, the cwd config is
+# the PR branch's own copy, which the PR could edit to declare no checks.
+assert_contains "$A" "--config $WORK/cfg/.loom/config.json" "daemon reads the guard's config, not the cwd's"
 
 # T2: failing tree refused, real output + failing check named, no bypass flag
 LOOM_DAEMON_BIN="$(make_stub red)" run_guard
