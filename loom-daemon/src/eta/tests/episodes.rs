@@ -263,14 +263,13 @@ fn the_input_order_does_not_matter_and_a_reapplied_label_opens_nothing() {
 
 #[test]
 fn episode_exits_serialize_as_names() {
-    let json =
-        serde_json::to_value(&episodes_from_pr_history(&held_then_merged(), REPO, t(10_000)))
-            .unwrap();
+    let episodes = episodes_from_pr_history(&held_then_merged(), REPO, t(10_000));
+    let json = serde_json::to_value(&episodes).unwrap();
     assert_eq!(json[1]["end"]["kind"], "left");
     assert_eq!(json[1]["end"]["next"], "merge_hold");
     assert_eq!(json[3]["end"]["next"], "merged");
     let back: Vec<StageEpisode> = serde_json::from_value(json).unwrap();
-    assert_eq!(back, episodes_from_pr_history(&held_then_merged(), REPO, t(10_000)));
+    assert_eq!(back, episodes);
 }
 
 // -- the cut: leak-freedom ------------------------------------------------------
