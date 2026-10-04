@@ -210,6 +210,13 @@ pub struct StageSamples {
     pub verdicts: Vec<VerdictSample>,
     /// Successful sweep paths.
     pub paths: Vec<SweepPathSample>,
+    /// The base `land` heuristic's past estimates and their landings
+    /// (#10207), read only by the recalibrating heuristic's point-in-time
+    /// [`super::recalibrate::fit_table`]. Built outside the estimator — the
+    /// daemon's ETA pass from its outcome log and pending store, `eta
+    /// backtest` from a replay — and empty everywhere else, so no other
+    /// heuristic's estimate can change by construction.
+    pub calibration: Vec<super::recalibrate::CalibrationObservation>,
     /// Whose history this is (#9343): `Local` when every sample came from
     /// this host's own journals, `Fleet` as soon as one host-independent
     /// (forge-derived) sample is in it. [`Self::merge`] is the only thing that
@@ -321,6 +328,7 @@ impl StageSamples {
         self.censored.extend(other.censored);
         self.verdicts.extend(other.verdicts);
         self.paths.extend(other.paths);
+        self.calibration.extend(other.calibration);
         if other.scope == HistoryScope::Fleet {
             self.scope = HistoryScope::Fleet;
         }

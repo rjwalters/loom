@@ -315,6 +315,26 @@ fn matches(case: &ReplayCase, kind: Kind, filter: Filter<'_>) -> bool {
             .is_none_or(|r| case.subject.repo.eq_ignore_ascii_case(r))
 }
 
+/// The estimator input a replay case describes: its own `as_of`, its stage
+/// entered at that instant, no features.
+fn case_input(case: &ReplayCase, loom: &Provenance) -> EstimateInput {
+    EstimateInput {
+        subject: case.subject.clone(),
+        as_of: case.as_of,
+        current: CurrentState::At(CurrentStage {
+            stage: case.stage,
+            entered_at: Some(case.as_of),
+            age_sec: 0,
+            age_source: AgeSource::TrackerObserved,
+            rework_rounds: case.rework_rounds,
+        }),
+        features: explanation::Features::default(),
+        features_omitted: Vec::new(),
+        provenance: loom.clone(),
+        dispatch: case.dispatch.clone(),
+    }
+}
+
 /// Replay every case matching `heuristic.kind()` and `filter` against
 /// `history`, leak-free: each case's own `as_of` is what
 /// [`super::Heuristic::estimate`] sees, and history excludes anything not
@@ -337,21 +357,7 @@ pub fn run(
         if !matches(case, kind, filter) {
             continue;
         }
-        let input = EstimateInput {
-            subject: case.subject.clone(),
-            as_of: case.as_of,
-            current: CurrentState::At(CurrentStage {
-                stage: case.stage,
-                entered_at: Some(case.as_of),
-                age_sec: 0,
-                age_source: AgeSource::TrackerObserved,
-                rework_rounds: case.rework_rounds,
-            }),
-            features: explanation::Features::default(),
-            features_omitted: Vec::new(),
-            provenance: loom.clone(),
-            dispatch: case.dispatch.clone(),
-        };
+        let input = case_input(case, loom);
         let explanation = heuristic.estimate(&input, history);
         let summary = EstimateSummary::of(&explanation);
         let s = score(&summary, case.outcome, case.actual_at, &[]);
@@ -390,6 +396,35 @@ pub fn run(
         by_repo,
         by_horizon,
     }
+}
+
+/// The calibration observations a replay of `base` over `cases` yields
+/// (#10207): one per `land` case `base` estimated, landing at the case's
+/// `actual_at` and known from that instant on.
+///
+/// This is what lets `eta backtest` score a recalibrating heuristic from the
+/// journals alone, with no live outcome log. It stays leak-free because the
+/// recalibrating heuristic fits its table at each case's own `as_of`
+/// ([`super::recalibrate::fit_table`]): a case's own landing (and every
+/// later one) is known only at or after its `actual_at`, which is never
+/// before its `as_of`, so at most it enters as a censored lower bound.
+#[must_use]
+pub fn calibration_from_replay(
+    base: &dyn Heuristic,
+    history: &StageSamples,
+    cases: &[ReplayCase],
+    loom: &Provenance,
+) -> Vec<super::recalibrate::CalibrationObservation> {
+    cases
+        .iter()
+        .filter(|case| case.kind == Kind::Land && base.kind() == Kind::Land)
+        .filter_map(|case| {
+            let input = case_input(case, loom);
+            let summary = EstimateSummary::of(&base.estimate(&input, history));
+            let s = score(&summary, case.outcome, case.actual_at, &[]);
+            super::recalibrate::CalibrationObservation::from_scored(&summary, &s, case.actual_at)
+        })
+        .collect()
 }
 
 /// A paired comparison of two heuristics on the identical replay set —
