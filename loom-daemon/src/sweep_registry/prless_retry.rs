@@ -577,6 +577,8 @@ impl SweepRegistry {
         // `None` open-PR verdict: this branch never probed, so let the bound
         // run (and memo-serve) its own.
         self.note_prless_terminal_outcome(issue, sweep_id, None, &reason, exit_code);
+        // #10156: a Curator-only stop also feeds the no-op hold.
+        self.note_curator_only_outcome(issue, sweep_id, phase);
     }
 
     /// `reap_once`'s **checkpoint-less exit** call site (Issue #7972) — the
@@ -616,6 +618,8 @@ impl SweepRegistry {
              without a self-reported no-op release (#6670)"
         );
         self.note_prless_terminal_outcome(issue, sweep_id, open_pr, &reason, exit_code);
+        // #10156: a Curator-only stop also feeds the no-op hold.
+        self.note_curator_only_outcome(issue, sweep_id, None);
     }
 
     /// Record one **PR-less release** for `issue` (Issue #7972): a dispatch
