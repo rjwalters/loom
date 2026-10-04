@@ -1,6 +1,11 @@
-//! The forge [`RawEventSource`] for the raw fleet event cache (#10197).
+//! The forge [`RawEventSource`]s for the raw fleet event cache (#10197).
 //!
-//! Reads the repo-wide issue-events listing,
+//! Two paged REST listings, one [`ForgeEndpoint`] each, read by the same
+//! [`ForgeEventSource`]: the issue-events listing (below) and the pulls
+//! listing ([`super::fleet_events_pulls`]: PR open/merge/close times and
+//! closing references, 100 PRs per call, op `pr.closing-issue-references`).
+//!
+//! The issue-events endpoint reads the repo-wide issue-events listing,
 //! `GET repos/{owner}/{repo}/issues/events?per_page=100&page=N`, through the
 //! shared ETag store's conditional read
 //! ([`crate::forge_etag_store::fetch_conditional`]): the same reader-App
@@ -19,7 +24,8 @@
 //!
 //! GitHub serves this listing only to a bounded depth (it answers `422` past
 //! it). A `422` ends the backfill as complete; history older than that window
-//! is the webhook mirror's job (#10197 PR 2).
+//! is the webhook mirror's job (a later #10197 increment). The pulls listing
+//! has no such window.
 
 use std::path::{Path, PathBuf};
 
@@ -31,8 +37,71 @@ use super::fleet_events::{EventKind, ItemKind, PageFetch, RawEvent, RawEventSour
 /// Rows per page — the REST maximum.
 pub const PER_PAGE: u32 = 100;
 
-/// The cursor key of this endpoint.
+/// The cursor key of the issue-events endpoint.
 pub const ENDPOINT: &str = "issues-events";
+
+/// The cursor key of the pulls endpoint.
+pub const PULLS_ENDPOINT: &str = "pulls";
+
+/// Which paged forge listing a [`ForgeEventSource`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeEndpoint {
+    /// `GET repos/{o}/{r}/issues/events` — labels, close/reopen/merge.
+    IssuesEvents,
+    /// `GET repos/{o}/{r}/pulls?state=all` — PR open/merge/close times and
+    /// closing references.
+    Pulls,
+}
+
+impl ForgeEndpoint {
+    /// Every endpoint, in the order a full sync reads them.
+    pub const ALL: [ForgeEndpoint; 2] = [ForgeEndpoint::IssuesEvents, ForgeEndpoint::Pulls];
+
+    /// The endpoint's cursor-key suffix (and CLI name).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            ForgeEndpoint::IssuesEvents => ENDPOINT,
+            ForgeEndpoint::Pulls => PULLS_ENDPOINT,
+        }
+    }
+
+    /// The endpoint named `name`.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|e| e.name() == name)
+    }
+
+    fn url(self, repo: &str, page: u32) -> String {
+        match self {
+            ForgeEndpoint::IssuesEvents => {
+                format!("repos/{repo}/issues/events?per_page={PER_PAGE}&page={page}")
+            }
+            ForgeEndpoint::Pulls => format!(
+                "repos/{repo}/pulls?state=all&sort=created&direction=desc&per_page={PER_PAGE}&page={page}"
+            ),
+        }
+    }
+
+    fn op(self) -> crate::forge_call_stats::ForgeOp {
+        match self {
+            ForgeEndpoint::IssuesEvents => crate::forge_call_stats::ops::TIMELINE_READ,
+            ForgeEndpoint::Pulls => crate::forge_call_stats::ops::PR_CLOSING_ISSUE_REFERENCES,
+        }
+    }
+
+    fn parse(
+        self,
+        repo: &str,
+        body: &str,
+        fetched_at: DateTime<Utc>,
+    ) -> anyhow::Result<(Vec<RawEvent>, usize)> {
+        match self {
+            ForgeEndpoint::IssuesEvents => parse_issue_events(repo, body, fetched_at),
+            ForgeEndpoint::Pulls => super::fleet_events_pulls::parse_pulls(repo, body, fetched_at),
+        }
+    }
+}
 
 /// The facade operation name every call here is recorded under.
 const CALLER: &str = "eta_fleet_events";
@@ -119,8 +188,9 @@ pub fn parse_issue_events(
     Ok((events, rows.len()))
 }
 
-/// The forge source: one repo's issue-events listing, read with `gh`.
-pub struct ForgeIssueEvents {
+/// A forge source: one repo's [`ForgeEndpoint`] listing, read with `gh`.
+pub struct ForgeEventSource {
+    endpoint: ForgeEndpoint,
     repo: String,
     root: PathBuf,
     gh_bin: PathBuf,
@@ -132,12 +202,13 @@ pub struct ForgeIssueEvents {
     below_reserve: bool,
 }
 
-impl ForgeIssueEvents {
-    /// A source for `repo`, running `gh` from `root` under that root's
-    /// credential.
+impl ForgeEventSource {
+    /// A source reading `endpoint` for `repo`, running `gh` from `root` under
+    /// that root's credential.
     #[must_use]
-    pub fn new(repo: &str, root: &Path, reserve: u64) -> Self {
-        ForgeIssueEvents {
+    pub fn new(endpoint: ForgeEndpoint, repo: &str, root: &Path, reserve: u64) -> Self {
+        ForgeEventSource {
+            endpoint,
             repo: repo.to_string(),
             root: root.to_path_buf(),
             gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
@@ -154,9 +225,9 @@ impl ForgeIssueEvents {
     }
 }
 
-impl RawEventSource for ForgeIssueEvents {
+impl RawEventSource for ForgeEventSource {
     fn cursor_key(&self) -> String {
-        format!("{SOURCE_FORGE}:{ENDPOINT}")
+        format!("{SOURCE_FORGE}:{}", self.endpoint.name())
     }
 
     fn fetch_page(&mut self, page: u32, etag: Option<&str>) -> PageFetch {
@@ -167,11 +238,8 @@ impl RawEventSource for ForgeIssueEvents {
             ));
         }
         let target = crate::forge_etag_store::resolve_target(Some(&self.root), Some(&self.repo));
-        let url = format!("repos/{}/issues/events?per_page={PER_PAGE}&page={page}", self.repo);
-        let site = crate::forge_etag_store::ConditionalRead::new(
-            CALLER,
-            crate::forge_call_stats::ops::TIMELINE_READ,
-        );
+        let url = self.endpoint.url(&self.repo, page);
+        let site = crate::forge_etag_store::ConditionalRead::new(CALLER, self.endpoint.op());
         let fetched_at = Utc::now();
         let (status, response, stderr) = match crate::forge_etag_store::fetch_conditional(
             site,
@@ -193,13 +261,14 @@ impl RawEventSource for ForgeIssueEvents {
             .ratelimit
             .remaining
             .is_some_and(|r| r < self.reserve);
-        classify(&self.repo, page, response, &stderr, fetched_at)
+        classify(self.endpoint, &self.repo, page, response, &stderr, fetched_at)
     }
 }
 
 /// Turn one HTTP answer into a [`PageFetch`]. Pure, so every branch is tested
 /// without a `gh`.
 pub(crate) fn classify(
+    endpoint: ForgeEndpoint,
     repo: &str,
     page: u32,
     response: crate::forge_listing::HttpResponse,
@@ -208,7 +277,7 @@ pub(crate) fn classify(
 ) -> PageFetch {
     match response.status {
         304 => PageFetch::NotModified,
-        200 => match parse_issue_events(repo, &response.body, fetched_at) {
+        200 => match endpoint.parse(repo, &response.body, fetched_at) {
             Ok((events, rows)) => PageFetch::Page {
                 events,
                 etag: response.etag,
@@ -302,7 +371,7 @@ mod tests {
 
     #[test]
     fn a_short_page_is_the_last_and_a_full_one_is_not() {
-        match classify("o/r", 1, response(200, BODY), "", now()) {
+        match classify(ForgeEndpoint::IssuesEvents, "o/r", 1, response(200, BODY), "", now()) {
             PageFetch::Page { last, etag, .. } => {
                 assert!(last);
                 assert_eq!(etag.as_deref(), Some("W/\"e1\""));
@@ -313,25 +382,56 @@ mod tests {
                      "issue": {"number": 1, "created_at": "2026-10-01T00:00:00Z"}}"#;
         let full = format!("[{}]", vec![row; PER_PAGE as usize].join(","));
         assert!(matches!(
-            classify("o/r", 1, response(200, &full), "", now()),
+            classify(ForgeEndpoint::IssuesEvents, "o/r", 1, response(200, &full), "", now()),
             PageFetch::Page { last: false, .. }
         ));
     }
 
     #[test]
     fn not_modified_window_end_and_rate_limits_classify() {
-        assert_eq!(classify("o/r", 1, response(304, ""), "", now()), PageFetch::NotModified);
+        assert_eq!(
+            classify(ForgeEndpoint::IssuesEvents, "o/r", 1, response(304, ""), "", now()),
+            PageFetch::NotModified
+        );
         assert!(matches!(
-            classify("o/r", 400, response(422, "{}"), "", now()),
+            classify(ForgeEndpoint::IssuesEvents, "o/r", 400, response(422, "{}"), "", now()),
             PageFetch::Page { last: true, ref events, .. } if events.is_empty()
         ));
-        match classify("o/r", 3, response(403, ""), "API rate limit exceeded", now()) {
+        match classify(
+            ForgeEndpoint::IssuesEvents,
+            "o/r",
+            3,
+            response(403, ""),
+            "API rate limit exceeded",
+            now(),
+        ) {
             PageFetch::Stopped(why) => assert!(why.contains("rate limited"), "{why}"),
             other => panic!("{other:?}"),
         }
         assert!(matches!(
-            classify("o/r", 3, response(200, "not json"), "", now()),
+            classify(ForgeEndpoint::IssuesEvents, "o/r", 3, response(200, "not json"), "", now()),
             PageFetch::Stopped(_)
         ));
+    }
+    #[test]
+    fn the_pulls_endpoint_parses_through_the_same_classifier() {
+        let body = r#"[{"id": 5, "number": 3, "created_at": "2026-10-01T00:00:00Z",
+                        "closed_at": null, "merged_at": null, "body": "Closes #2"}]"#;
+        match classify(ForgeEndpoint::Pulls, "o/r", 1, response(200, body), "", now()) {
+            PageFetch::Page { events, last, .. } => {
+                assert!(last);
+                assert!(events
+                    .iter()
+                    .any(|e| e.kind == EventKind::ClosingRef && e.target == Some(2)));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(ForgeEndpoint::from_name("pulls"), Some(ForgeEndpoint::Pulls));
+        assert_eq!(ForgeEndpoint::from_name("nope"), None);
+        assert!(ForgeEndpoint::Pulls
+            .url("o/r", 4)
+            .starts_with("repos/o/r/pulls?state=all&sort=created&direction=desc"));
+        let source = ForgeEventSource::new(ForgeEndpoint::Pulls, "o/r", Path::new("."), 1);
+        assert_eq!(source.cursor_key(), "forge:pulls");
     }
 }

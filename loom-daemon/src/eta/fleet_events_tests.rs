@@ -388,3 +388,35 @@ fn an_unsupported_only_full_page_does_not_end_backfill_or_refresh() {
         assert_eq!(load_events(&events).len(), 1);
     }
 }
+
+#[test]
+fn a_target_is_part_of_the_id_and_its_absence_keeps_the_original_id() {
+    let row = label(1, "loom:issue", 10, 5);
+    // The pre-`target` formula, pinned: rows already on disk keep their ids.
+    let at = crate::telemetry::trace::instant(row.event_time);
+    let pinned = crate::telemetry::trace::derived_hex(
+        &[
+            "loom.eta.fleet.event",
+            "rjwalters/loom",
+            SOURCE_FORGE,
+            "1",
+            "issue",
+            "label_added",
+            "loom:issue",
+            at.as_str(),
+            "5",
+        ],
+        16,
+    );
+    assert_eq!(row.id, pinned);
+    assert_eq!(row.clone().with_target(None).id, pinned);
+    let a = row.clone().with_target(Some(7));
+    let b = row.with_target(Some(8));
+    assert_ne!(a.id, pinned);
+    assert_ne!(a.id, b.id);
+    // Serialised without the field when absent, with it when present.
+    assert!(!serde_json::to_string(&label(1, "x", 1, 1))
+        .unwrap()
+        .contains("target"));
+    assert!(serde_json::to_string(&a).unwrap().contains("\"target\":7"));
+}

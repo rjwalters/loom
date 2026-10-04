@@ -367,9 +367,72 @@ pub fn open_linked_pr_timeline_args(owner: &str, repo: &str, issue: u32) -> Vec<
 /// treat as a probe failure rather than an absence.
 fn linkage_phrase_regex(issue: u32) -> Option<regex::Regex> {
     regex::Regex::new(&format!(
-        r"(?i)(?:^|[^0-9A-Za-z])(?:clos(?:e|es|ed)|fix(?:es|ed)?|resolv(?:e|es|ed)|part\s+of|contributes\s+to)[*_:\s]*#{issue}(?:[^0-9]|$)"
+        r"(?i)(?:^|[^0-9A-Za-z]){LINKAGE_PHRASE}[*_:\s]*#{issue}(?:[^0-9]|$)"
     ))
     .ok()
+}
+
+/// The two phrase families of [`linkage_phrase_regex`], one alternation per
+/// family. Shared with [`linkage_refs`] so the guard and the ETA cache's
+/// reconstruction of it (#10197) cannot drift apart.
+const LINKAGE_PHRASE: &str =
+    r"(?:(clos(?:e|es|ed)|fix(?:es|ed)?|resolv(?:e|es|ed))|(part\s+of|contributes\s+to))";
+
+/// Which [`linkage_phrase_regex`] family linked a PR to an issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LinkageKind {
+    /// A GitHub closing keyword (`Closes #N`).
+    Closes,
+    /// A partial-increment phrase (`Part of #N` / `Contributes to #N`).
+    PartOf,
+}
+
+impl LinkageKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkageKind::Closes => "closes",
+            LinkageKind::PartOf => "part_of",
+        }
+    }
+}
+
+/// Every issue `body` links with a [`linkage_phrase_regex`] phrase, ascending,
+/// one entry per issue: exactly the set `n` for which
+/// `linkage_phrase_regex(n)` matches `body`. An issue named by both families
+/// is reported as [`LinkageKind::Closes`].
+#[must_use]
+pub fn linkage_refs(body: &str) -> Vec<(u32, LinkageKind)> {
+    static RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
+        // No trailing boundary group: `[0-9]+` is greedy, so the match already
+        // ends at a non-digit or the end, and not consuming it leaves the next
+        // phrase's leading boundary available.
+        regex::Regex::new(&format!(r"(?i)(?:^|[^0-9A-Za-z]){LINKAGE_PHRASE}[*_:\s]*#([0-9]+)")).ok()
+    });
+    let Some(re) = RE.as_ref() else {
+        return Vec::new();
+    };
+    let mut found: std::collections::BTreeMap<u32, LinkageKind> = std::collections::BTreeMap::new();
+    for caps in re.captures_iter(body) {
+        let digits = caps.get(3).map_or("", |m| m.as_str());
+        // `#0123` never matches the per-issue regex for 123.
+        if digits.starts_with('0') {
+            continue;
+        }
+        let Ok(issue) = digits.parse::<u32>() else {
+            continue;
+        };
+        let kind = if caps.get(1).is_some() {
+            LinkageKind::Closes
+        } else {
+            LinkageKind::PartOf
+        };
+        found
+            .entry(issue)
+            .and_modify(|k| *k = (*k).min(kind))
+            .or_insert(kind);
+    }
+    found.into_iter().collect()
 }
 
 /// Classify the raw stdout of the [`open_linked_pr_timeline_args`] query as a
@@ -1027,6 +1090,48 @@ mod tests {
                 "body: {body:?}"
             );
         }
+    }
+
+    /// #10197: the extractor names exactly the issues the per-issue guard regex
+    /// matches, so the ETA cache reconstructs the same lockout the guard saw.
+    #[test]
+    #[allow(clippy::regex_creation_in_loops)] // the per-issue regex is the oracle
+    fn linkage_refs_agrees_with_the_per_issue_regex() {
+        let corpus = [
+            "Closes #8940",
+            "Closes: #8940",
+            "**Part of:** #8940",
+            "_contributes to_ #8940, fixes #12",
+            "Part of #89401",
+            "Prefixes #8940 with a slug",
+            "See #8940; Supersedes #7",
+            "Closes #5\nfixes #7, part of #8. Part of #5",
+            "fixes #0123 and Resolved #44",
+            "closes #1,fixes #2 part of#3",
+        ];
+        // Any issue the guard matches is spelled `#<digits>` in the body.
+        let number = regex::Regex::new(r"#([0-9]+)").unwrap();
+        for body in corpus {
+            let found: Vec<u32> = linkage_refs(body).into_iter().map(|(n, _)| n).collect();
+            let candidates: std::collections::BTreeSet<u32> = number
+                .captures_iter(body)
+                .filter_map(|c| c[1].parse().ok())
+                .collect();
+            let expected: Vec<u32> = candidates
+                .into_iter()
+                .filter(|&n| linkage_phrase_regex(n).unwrap().is_match(body))
+                .collect();
+            assert_eq!(found, expected, "body: {body:?}");
+        }
+        assert_eq!(
+            linkage_refs("Closes #5\nfixes #7, part of #8. Part of #5"),
+            vec![
+                (5, LinkageKind::Closes),
+                (7, LinkageKind::Closes),
+                (8, LinkageKind::PartOf)
+            ]
+        );
+        assert_eq!(linkage_refs("**Part of:** #10197"), vec![(10197, LinkageKind::PartOf)]);
     }
 
     /// Several candidates: only phrase-confirmed ones count, and the verdict is

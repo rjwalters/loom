@@ -237,3 +237,117 @@ fn a_ready_issue_with_a_retained_curated_label_counts_in_ready_wait() {
     assert_eq!(item(&state, Issue, 5).stage, ItemStage::ReadyWait);
     assert_eq!(state.stage_counts.get("ready_wait").copied(), Some(1));
 }
+
+fn closes(pr: u32, issue: Option<u32>, secs: i64, seq: u64) -> RawEvent {
+    let family = issue.map(|_| "closes");
+    ev(pr, ItemKind::Pr, EventKind::ClosingRef, family, secs, seq).with_target(issue)
+}
+
+/// Issue 4 ready from 100s; PR 20 (closes 4) opened at 300s, merged at 2000s;
+/// PR 21 (closes nothing) opened at 310s.
+fn lockout_fleet() -> Vec<RawEvent> {
+    use ItemKind::{Issue, Pr};
+    vec![
+        opened(4, Issue, 0),
+        add(4, Issue, "loom:issue", 100, 1),
+        opened(20, Pr, 300),
+        closes(20, Some(4), 300, 9020),
+        opened(21, Pr, 310),
+        closes(21, None, 310, 9021),
+        ev(20, Pr, EventKind::Merged, None, 2000, 0),
+        ev(20, Pr, EventKind::Closed, None, 2000, 0),
+    ]
+}
+
+#[test]
+fn an_open_pr_closing_a_ready_issue_is_a_lockout() {
+    let state = fleet_state(&lockout_fleet(), REPO, t(1000));
+    assert_eq!(state.pr_open_skip_lockout, Some(true));
+    assert_eq!(item(&state, ItemKind::Issue, 4).open_pr, Some(20));
+    assert_eq!(item(&state, ItemKind::Pr, 20).open_pr, None);
+    // Once the PR has merged it locks nothing.
+    let state = fleet_state(&lockout_fleet(), REPO, t(3000));
+    assert_eq!(state.pr_open_skip_lockout, Some(false));
+    assert_eq!(item(&state, ItemKind::Issue, 4).open_pr, None);
+}
+
+#[test]
+fn an_open_part_of_pr_on_a_ready_issue_is_a_lockout() {
+    // The guard counts `Part of #N` (#8940), so the reconstruction must too:
+    // epic phase PRs are exactly this shape.
+    use ItemKind::{Issue, Pr};
+    let events = vec![
+        opened(4, Issue, 0),
+        add(4, Issue, "loom:issue", 100, 1),
+        opened(30, Pr, 300),
+        ev(30, Pr, EventKind::ClosingRef, Some("part_of"), 300, 9030).with_target(Some(4)),
+    ];
+    let state = fleet_state(&events, REPO, t(1000));
+    assert_eq!(state.pr_open_skip_lockout, Some(true));
+    assert_eq!(item(&state, Issue, 4).open_pr, Some(30));
+    // The `closing_ref` label is a phrase family, not an item label.
+    assert!(item(&state, Pr, 30).labels.is_empty());
+}
+
+#[test]
+fn part_of_and_colon_bodies_parsed_from_the_listing_lock_out() {
+    use super::super::fleet_events_pulls::parse_pulls;
+    for body in ["**Part of:** #4", "Closes: #4", "Part of #4"] {
+        let page = serde_json::json!([{
+            "id": 9040, "number": 40, "created_at": t(300).to_rfc3339(),
+            "closed_at": null, "merged_at": null, "body": body,
+        }])
+        .to_string();
+        let (mut events, _) = parse_pulls(REPO, &page, t(5000)).unwrap();
+        events.push(opened(4, ItemKind::Issue, 0));
+        events.push(add(4, ItemKind::Issue, "loom:issue", 100, 1));
+        let state = fleet_state(&events, REPO, t(1000));
+        assert_eq!(state.pr_open_skip_lockout, Some(true), "body: {body:?}");
+        assert_eq!(item(&state, ItemKind::Issue, 4).open_pr, Some(40), "body: {body:?}");
+    }
+}
+
+#[test]
+fn the_lockout_is_unknown_until_a_closing_ref_precedes_the_instant() {
+    // Before PR 20 existed no closing reference was knowable.
+    let state = fleet_state(&lockout_fleet(), REPO, t(200));
+    assert_eq!(state.pr_open_skip_lockout, None);
+    // A cache that never read the pulls listing cannot say, even later.
+    let issue_events_only: Vec<RawEvent> = lockout_fleet()
+        .into_iter()
+        .filter(|e| e.kind != EventKind::ClosingRef)
+        .collect();
+    let state = fleet_state(&issue_events_only, REPO, t(1000));
+    assert_eq!(state.pr_open_skip_lockout, None);
+}
+
+#[test]
+fn a_building_issue_with_an_open_pr_is_not_a_lockout() {
+    let mut events = lockout_fleet();
+    events.push(remove(4, ItemKind::Issue, "loom:issue", 400, 2));
+    events.push(add(4, ItemKind::Issue, "loom:building", 400, 3));
+    let state = fleet_state(&events, REPO, t(1000));
+    assert_eq!(item(&state, ItemKind::Issue, 4).open_pr, Some(20));
+    assert_eq!(state.pr_open_skip_lockout, Some(false));
+}
+
+#[test]
+fn closing_refs_at_or_after_the_instant_cannot_change_the_answer() {
+    let as_of = t(1000);
+    let baseline = serde_json::to_string(&fleet_state(&lockout_fleet(), REPO, as_of)).unwrap();
+    let mut perturbed = lockout_fleet();
+    perturbed.push(opened(22, ItemKind::Pr, 1000));
+    perturbed.push(closes(22, Some(4), 1000, 9022));
+    perturbed.push(closes(21, Some(4), 1500, 9023));
+    perturbed.push(ev(20, ItemKind::Pr, EventKind::Closed, None, 1000, 77));
+    let after = serde_json::to_string(&fleet_state(&perturbed, REPO, as_of)).unwrap();
+    assert_eq!(baseline, after);
+    // And an issue-events-only cache stays `null` whatever arrives later.
+    let bare: Vec<RawEvent> = fleet();
+    let mut late = fleet();
+    late.push(closes(10, Some(2), 1000, 9100));
+    assert_eq!(
+        serde_json::to_string(&fleet_state(&bare, REPO, as_of)).unwrap(),
+        serde_json::to_string(&fleet_state(&late, REPO, as_of)).unwrap()
+    );
+}
