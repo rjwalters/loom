@@ -28,6 +28,7 @@ documented here.
 - [Who writes one (every claim path — #6320, #8193, #9453)](#who-writes-one-every-claim-path--6320-8193-9453)
 - [When it is written](#when-it-is-written)
 - [What this phase explicitly does not do](#what-this-phase-explicitly-does-not-do)
+- [Renewer ownership, completion and request budget (Issue #10229)](#renewer-ownership-completion-and-request-budget-issue-10229)
 - [For Phase 2 (reclamation) and Phase 3 (fencing)](#for-phase-2-reclamation-and-phase-3-fencing)
 - [Phase 2, dispatch-time half: claim-then-verify-order (#6287)](#phase-2-dispatch-time-half-claim-then-verify-order-6287)
 - [Phase 3 (Issue #6309) has now shipped: sweep-side fencing before push/PR-open](#phase-3-issue-6309-has-now-shipped-sweep-side-fencing-before-pushpr-open)
