@@ -8,7 +8,7 @@
 //! | `sweep_model`, `sweep_effort` | the owning sweep registry's entry, read at the dispatch | the dispatch |
 //! | `attempt` | dispatches of the issue this process observed | the dispatch |
 //! | `judge_verdicts_so_far` | verdicts the tracker settled | the settlement, **not** the verdict's own instant |
-//! | `repo_first_pass_approval_rate` | the `sweep.outcome` history | its `observed_at` |
+//! | `repo_first_pass_approval_rate` | the loaded verdict history ([`StageSamples::verdicts`]) | its `observed_at` |
 //! | `urgent` | none: deprecated | |
 //!
 //! # Point in time
@@ -19,6 +19,17 @@
 //! earlier instant's features, whatever its own event time was: a verdict
 //! recorded at the end of the Judge phase is known when the next phase or
 //! listing settles it, so that settlement is its `known_at`.
+//!
+//! # First-pass population
+//!
+//! [`StageSamples::verdicts`] has three feeders, and the rate counts the
+//! `attempt == 1` verdicts of all of them: in-sweep verdicts from
+//! `sweep.outcome`; external (`in_sweep: false`) Judge verdicts from the ETA
+//! stage journal, i.e. label transitions the tracker saw outside a sweep and
+//! `eta backfill` rows from PR label history; and, under fleet history scope,
+//! the fleet snapshot's verdicts from forge label timelines. No sample carries
+//! a source tag or PR id, so one first verdict can be counted more than once
+//! (see `eta.md` → Item facts).
 //!
 //! # Omission reasons
 //!
@@ -62,9 +73,11 @@ pub mod reason {
     /// default, which is not recorded in process.
     pub const RUNTIME_DEFAULT: &str = "runtime_default";
     /// The Judge's verdicts for this PR happened before this process observed
-    /// the item, so "so far" is unknown rather than empty.
+    /// the item, so "so far" is unknown rather than empty: no dispatch or
+    /// verdict was observed at all, or the first observed dispatch came after
+    /// the PR already existed (a rework re-dispatch after a restart).
     pub const VERDICT_HISTORY_UNOBSERVED: &str = "verdict_history_unobserved";
-    /// No `sweep.outcome` verdict history is loaded at all.
+    /// No verdict of any feeder (any repo) was observed before `as_of`.
     pub const NO_VERDICT_HISTORY: &str = "no_verdict_history";
     /// The repo has no first-attempt verdict observed in the history window
     /// before `as_of`: an empty denominator.
@@ -143,6 +156,9 @@ pub(super) struct ItemFacts {
     issue: Vec<IssueObs>,
     dispatches: Vec<DispatchObs>,
     verdicts: Vec<VerdictObs>,
+    /// The first dispatch observed came after the PR existed, with no verdict
+    /// observed: the verdicts before it are unknown.
+    verdicts_before_unobserved: bool,
 }
 
 fn push_capped<T>(list: &mut Vec<T>, value: T, cap: usize) {
@@ -308,7 +324,8 @@ impl ItemFacts {
         features: &mut Features,
         omitted: &mut Vec<FeatureOmitted>,
     ) {
-        if self.dispatches.is_empty() && self.verdicts.is_empty() && has_pr {
+        let nothing_seen = self.dispatches.is_empty() && self.verdicts.is_empty();
+        if has_pr && (nothing_seen || self.verdicts_before_unobserved) {
             omitted.push(omission("judge_verdicts_so_far", reason::VERDICT_HISTORY_UNOBSERVED));
             return;
         }
@@ -336,7 +353,9 @@ fn write_first_pass_rate(
     omitted: &mut Vec<FeatureOmitted>,
 ) {
     let name = "repo_first_pass_approval_rate";
-    if history.verdicts.is_empty() {
+    // Only samples observed before `as_of` pick the reason, so even the
+    // reason text cannot depend on later data.
+    if !history.verdicts.iter().any(|v| v.observed_at < as_of) {
         omitted.push(omission(name, reason::NO_VERDICT_HISTORY));
         return;
     }
@@ -367,9 +386,14 @@ impl Tracker {
         at: DateTime<Utc>,
     ) {
         let known_at = at;
-        let facts = &mut self.item(repo, issue).facts;
+        let item = self.item(repo, issue);
+        let has_pr = item.pr_number.is_some();
+        let facts = &mut item.facts;
         if facts.dispatches.iter().any(|d| d.sweep_id == sweep_id) {
             return;
+        }
+        if has_pr && facts.dispatches.is_empty() && facts.verdicts.is_empty() {
+            facts.verdicts_before_unobserved = true;
         }
         push_capped(
             &mut facts.dispatches,

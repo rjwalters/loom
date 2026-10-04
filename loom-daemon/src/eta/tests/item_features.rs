@@ -336,6 +336,7 @@ fn the_first_pass_rate_counts_first_verdicts_observed_before_as_of() {
     let mut h = H::new();
     h.history = StageSamples {
         verdicts: vec![
+            verdict(REPO, 2, false, -400),
             verdict(REPO, 1, false, -300),
             verdict(REPO, 1, false, -200),
             verdict(REPO, 1, true, -100),
@@ -355,7 +356,14 @@ fn the_first_pass_rate_counts_first_verdicts_observed_before_as_of() {
             reason(&e, "repo_first_pass_approval_rate").map(str::to_string),
         )
     };
-    // Before any first verdict: an empty denominator.
+    // Before any verdict at all: no history, judged only from samples
+    // observed before `as_of` (the later ones do not pick the reason).
+    for secs in [-500, -400] {
+        let (r, why) = rate(&mut h, secs);
+        assert!(r.is_none());
+        assert_eq!(why.as_deref(), Some("no_verdict_history"), "{secs}");
+    }
+    // A verdict, but no first verdict yet: an empty denominator.
     let (r, why) = rate(&mut h, -301);
     assert!(r.is_none());
     assert_eq!(why.as_deref(), Some("no_first_verdicts_before_as_of"));
@@ -414,4 +422,90 @@ fn an_explanation_recorded_before_the_item_facts_still_parses() {
         old["features"].get("urgent"),
         "urgent keeps its pre-#10231 serialization"
     );
+}
+
+#[test]
+fn the_first_pass_rate_counts_journal_and_fleet_first_verdicts() {
+    use crate::eta::fleet::{FleetSample, FleetSnapshot};
+    use crate::eta::journal::JournalEntry;
+    use crate::eta::Stage;
+    // An external Judge's attempt-1 verdict, from the ETA stage journal.
+    let mut row = JournalEntry::new("label.transition", REPO, t(-200), &provenance());
+    row.issue = Some(1);
+    row.stage = Some(Stage::ReviewWait);
+    row.entered_at = Some(t(-300));
+    row.left_at = Some(t(-200));
+    row.duration_sec = Some(100);
+    row.in_sweep = false;
+    row.verdict = Some("pass".to_string());
+    row.attempt = Some(1);
+    let mut history = StageSamples::default();
+    history.push_journal(&[row], "host-test");
+    assert_eq!(history.first_pass_approval(REPO, t(0)), Some((1, 1)));
+
+    let mut h = H::new();
+    h.history = history.clone();
+    h.tracker.on_dispatch(REPO, 10, "sweep-issue-10-1", t(-400));
+    let e = h.explain(10, Kind::Finish, 0);
+    assert_eq!(feats(&e).repo_first_pass_approval_rate, Some(1.0));
+
+    // A fleet-snapshot verdict (another host's, from the forge timeline)
+    // joins the population under `augment` scope.
+    let mut fleet = FleetSnapshot::empty(REPO);
+    fleet.samples.push(FleetSample {
+        repo: REPO.to_string(),
+        pr_number: 7,
+        stage: Stage::ReviewWait,
+        entered_at: t(-250),
+        observed_at: t(-100),
+        duration_sec: 150,
+        censored: false,
+        verdict: Some("fail".to_string()),
+        attempt: Some(1),
+    });
+    history.merge(fleet.stage_samples());
+    assert_eq!(history.first_pass_approval(REPO, t(0)), Some((2, 1)));
+}
+
+#[test]
+fn a_duplicate_verdict_for_one_attempt_is_dropped() {
+    let mut h = H::new();
+    h.tracker.on_dispatch(REPO, 10, "sweep-issue-10-1", t(0));
+    h.tracker
+        .on_sweep_dispatch(REPO, 10, "sweep-issue-10-1", DispatchMeta::default(), t(0));
+    h.tracker.on_phase(REPO, 10, "builder", Some(50), t(50));
+    let approved = |secs: i64| PrView {
+        labels: vec!["loom:pr".to_string()],
+        updated_at: Some(t(secs - 10)),
+        ..pr_view(50, 10)
+    };
+    // Judge, settled as a pass by the listing at 200; a second Judge pass on
+    // the same attempt settles again at 400 and is dropped.
+    h.tracker.on_phase(REPO, 10, "judge", Some(50), t(100));
+    h.tracker.on_listing(REPO, &[approved(200)], t(200), 300);
+    h.tracker.on_phase(REPO, 10, "judge", Some(50), t(300));
+    h.tracker.on_listing(REPO, &[approved(400)], t(400), 300);
+    for secs in [201, 401, 600] {
+        assert_eq!(
+            feats(&h.explain(10, Kind::Land, secs)).judge_verdicts_so_far,
+            Some(vec!["pass".to_string()]),
+            "{secs}"
+        );
+    }
+}
+
+#[test]
+fn a_rework_dispatch_after_a_restart_does_not_claim_an_empty_history() {
+    let mut h = H::new();
+    // Restart: the PR is first seen already rejected, then its rework sweep
+    // is dispatched. The earlier verdict was never observed here.
+    let mut rejected = pr_view(50, 10);
+    rejected.labels = vec!["loom:changes-requested".to_string()];
+    h.tracker.on_listing(REPO, &[rejected], t(0), 300);
+    h.tracker.on_dispatch(REPO, 10, "sweep-issue-10-2", t(100));
+    h.tracker
+        .on_sweep_dispatch(REPO, 10, "sweep-issue-10-2", DispatchMeta::default(), t(100));
+    let e = h.explain(10, Kind::Land, 200);
+    assert!(feats(&e).judge_verdicts_so_far.is_none());
+    assert_eq!(reason(&e, "judge_verdicts_so_far"), Some("verdict_history_unobserved"));
 }

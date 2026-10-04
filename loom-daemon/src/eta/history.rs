@@ -591,7 +591,11 @@ impl StageSamples {
     /// observed in the window before `as_of`: the numerator of the repo's
     /// first-pass approval rate (#10231). Strictly before `as_of`, by each
     /// verdict's own `observed_at` (when it was recorded), never by when the
-    /// PR merged.
+    /// PR merged. Counts every feeder of [`StageSamples::verdicts`]:
+    /// `sweep.outcome` in-sweep verdicts, external Judge verdicts from the
+    /// stage journal (tracker label transitions and `eta backfill` rows), and
+    /// fleet-snapshot verdicts under fleet history scope. Samples carry no
+    /// source tag, so this cannot (and does not) restrict to one feeder.
     #[must_use]
     pub fn first_pass_approval(&self, repo: &str, as_of: DateTime<Utc>) -> Option<(usize, usize)> {
         let (n, approved) = self

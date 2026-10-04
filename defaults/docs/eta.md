@@ -592,23 +592,32 @@ instant's features. Equality is excluded, as for the queue features.
 | `sweep_model`, `sweep_effort` | the owning sweep registry's entry, read when the dispatch event is handled | the dispatch (not the registry's earlier `started_at`) | what the dispatch requested |
 | `attempt` | dispatches of the issue this process observed | the dispatch | 1-based ordinal of the latest dispatch known before `as_of` |
 | `judge_verdicts_so_far` | verdicts the tracker settled | the **settlement** (the next phase or listing), not the verdict's own instant | `"pass"`/`"fail"` in attempt order, one per attempt (duplicates dropped); `[]` is a real empty list |
-| `repo_first_pass_approval_rate` | `sweep.outcome` history | each verdict's `observed_at` | see below |
+| `repo_first_pass_approval_rate` | the loaded verdict history (`StageSamples::verdicts`: three feeders, below) | each verdict's `observed_at` | see below |
 
 Issue facts are kept when the item leaves the ready queue (ready, building,
 PR stages), keyed by the item, with up to 8 distinct observations so an
 earlier `as_of` sees the value of its own time.
 
 **`repo_first_pass_approval_rate`** = approved first verdicts / first
-verdicts, over the repo's `attempt == 1` Judge verdicts in the `sweep.outcome`
+verdicts, over the repo's `attempt == 1` Judge verdicts in the loaded verdict
 history (`StageSamples::verdicts`) whose `observed_at` is in the history
-window before `as_of`, strictly. The eligible population is one first verdict
-per recorded sweep outcome; a verdict is *approved* unless it is
+window before `as_of`, strictly. A verdict is *approved* unless it is
 `loom:changes-requested` (`fail`); the window is the history window the
-estimators already use. A merge timestamp is never used: only when the verdict
-was recorded. The denominator is not floored, so a rate over one verdict is
-reported as such; a model should weight by its own minimum. Limitation: the
-verdict sample carries no PR id, so a resumed sweep that records attempt 1
-twice counts twice.
+estimators already use. A merge timestamp is never used. The eligible
+population is every first verdict from **all three** feeders of that list, not
+only sweep outcomes:
+
+| Feeder | "First" means | `observed_at` |
+|---|---|---|
+| `sweep.outcome` (in-sweep Judge) | the sweep's attempt-1 verdict | when the outcome recorded it |
+| ETA stage journal, `in_sweep: false` rows (an external Judge's label transition seen by the tracker, and `eta backfill` rows from PR label history) | attempt 1 = the tracker's `rework_rounds + 1` at the transition, or the first `loom:review-requested` lap in the PR's label history | the listing that saw the transition, or the closing label event |
+| fleet snapshot verdicts (`historyScope` `augment`: added to local; `fleet`: replace local) | attempt 1 of the PR's forge label timeline | the label event that closed the stage |
+
+The denominator is not floored, so a rate over one verdict is reported as
+such; a model should weight by its own minimum. Limitations: a verdict sample
+carries no PR id or source tag, so the same first verdict can count more than
+once (a resumed sweep that records attempt 1 twice; a sweep-driven PR also
+backfilled into the journal; local and fleet copies under `augment`).
 
 **Null reasons** (never `not_collected` in a covered state):
 
@@ -625,8 +634,8 @@ twice counts twice.
 | `runtime_not_recorded` | `sweep_runtime` | the dispatch event named no admitted runtime |
 | `registry_unavailable` | `sweep_model`, `sweep_effort` | the owning registry had no entry for the sweep |
 | `runtime_default` | `sweep_model`, `sweep_effort` | the dispatch requested no explicit value, so the runtime's own default applied (not recorded in process; applicability per runtime is not distinguished) |
-| `verdict_history_unobserved` | `judge_verdicts_so_far` | the item has a PR, but this process saw neither its dispatch nor any verdict: earlier verdicts are unknown, not empty |
-| `no_verdict_history` | `repo_first_pass_approval_rate` | no `sweep.outcome` verdict history is loaded |
+| `verdict_history_unobserved` | `judge_verdicts_so_far` | the item has a PR, but this process saw neither its dispatch nor any verdict, or its first observed dispatch came after the PR already existed (a rework re-dispatch after a restart): earlier verdicts are unknown, not empty |
+| `no_verdict_history` | `repo_first_pass_approval_rate` | no verdict (any feeder, any repo) was observed before `as_of` |
 | `no_first_verdicts_before_as_of` | `repo_first_pass_approval_rate` | an empty denominator: the repo has no first verdict in the window before `as_of` |
 
 ### Host and queue context
