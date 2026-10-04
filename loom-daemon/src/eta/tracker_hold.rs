@@ -90,6 +90,21 @@ pub(super) fn episode_entered_at(item: &Item) -> Option<DateTime<Utc>> {
         .filter(|at| pooled.stage == Stage::MergeWait && *at > pooled.entered_at)
 }
 
+#[cfg(test)]
+impl Tracker {
+    /// The `land` input `key` would be estimated from at `now`: what the
+    /// hold tests assert `CurrentState` on.
+    pub(crate) fn land_input(
+        &self,
+        key: &ItemKey,
+        ctx: &super::EstimateContext<'_>,
+        now: DateTime<Utc>,
+    ) -> Option<crate::eta::EstimateInput> {
+        let item = self.items.get(key)?;
+        self.input_for(key, item, crate::eta::Kind::Land, ctx, now)
+    }
+}
+
 impl Tracker {
     /// The listing hook: called for each PR before the pooled stage logic.
     /// Closes the overlay when the labels no longer say `merge_hold`, and
