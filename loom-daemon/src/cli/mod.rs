@@ -48,6 +48,7 @@ pub(crate) mod labels_cmd;
 pub(crate) mod lease_co_occupancy;
 pub(crate) mod lease_ensure;
 pub(crate) mod legacy_script_cmds;
+mod mail_preflight;
 mod merge_pr_check_runs_rollup;
 mod merge_pr_check_runs_streak;
 mod merge_pr_checks_failure;

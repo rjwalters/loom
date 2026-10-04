@@ -77,5 +77,22 @@ inbox_mail() {
 }
 ```
 
+## Operator onboarding
+
+`loom-daemon mail preflight` (run first by `mail-send.md`) refuses with exit 2,
+sending nothing, until the machine has:
+
+- `LOOM_UI_INBOX_URL` — the loom-ui Worker base URL. If only `LOOM_UI_URL`
+  exists (env or `~/.config/loom-ui/prod.env`), export its value under this name.
+- A per-machine ingest key in `LOOM_UI_INGEST_KEY`, or in the file named by
+  `LOOM_UI_INGEST_KEY_FILE` (default `~/.config/loom-ui/ingest.key`, owner-only).
+  Not `~/.loom/observability/ingest.key`: that is the daemon telemetry key and
+  gets 401. An admin mints a per-machine key with `POST /admin/hosts`.
+- An executable `MATRIX_POST` (default `~/.claude/skills/matrix-post/post.sh`).
+
+The preflight probes `POST /api/inbox` with `{}`: 400 = key accepted, 401 = rejected.
+With `--reply-to` it also detects a dashboard build that predates `replyTo`.
+loom-ui's `docs/operator-mail-onboarding.md` has the human steps.
+
 Test: `defaults/scripts/tests/test-inbox-mail.sh` (extracts the fence above and
 drives the loader with the doc missing).

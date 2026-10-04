@@ -53,7 +53,7 @@ Config that must already exist (reference it; never print its value):
 | Variable | Purpose |
 | -------- | ------- |
 | `LOOM_UI_INBOX_URL` | loom-ui Worker base URL (required) |
-| `LOOM_UI_INGEST_KEY` | this host's ingest key (required; loom-ui `docs/deploy-runbook.md` §8 — minted per host, only its hash stored server-side) |
+| `LOOM_UI_INGEST_KEY` / `LOOM_UI_INGEST_KEY_FILE` | per-machine ingest key, or a file holding it (default `~/.config/loom-ui/ingest.key`); not the daemon telemetry key. Setup: `inbox-mail.md` §Operator onboarding |
 | `LOOM_SENDER_IDENTITY` | default `FROM` |
 | `MATRIX_POST` | operator-local `matrix-post` script (holds the only Matrix homeserver credential; default `~/.claude/skills/matrix-post/post.sh`) |
 
@@ -66,14 +66,10 @@ Config that must already exist (reference it; never print its value):
 Run as **one** bash invocation with the inputs already set:
 
 ```bash
-missing=""
-[ -n "${LOOM_UI_INBOX_URL:-}" ]  || missing="$missing LOOM_UI_INBOX_URL"
-[ -n "${LOOM_UI_INGEST_KEY:-}" ] || missing="$missing LOOM_UI_INGEST_KEY"
-[ -n "${TO:-}" ]                 || missing="$missing TO"
-[ -n "${BODY:-}" ]               || missing="$missing BODY"
-if [ -n "$missing" ]; then
-  echo "SEND NOT ATTEMPTED — missing config:$missing (loom-ui docs/deploy-runbook.md §8)"; exit 2
-fi
+[ -n "${TO:-}" ] && [ -n "${BODY:-}" ] || { echo "SEND NOT ATTEMPTED — missing config: TO/BODY"; exit 2; }
+# Preflight (URL, key, MATRIX_POST, key probe) before either leg.
+loom-daemon mail preflight ${REPLY_TO:+--reply-to} || exit 2
+LOOM_UI_INGEST_KEY="${LOOM_UI_INGEST_KEY:-$(tr -d '\r\n' <"${LOOM_UI_INGEST_KEY_FILE:-$HOME/.config/loom-ui/ingest.key}")}"
 H=$(hostname -s)
 FROM="${FROM:-${LOOM_SENDER_IDENTITY:-$H}}"
 SEVERITY="${SEVERITY:-normal}"
@@ -112,14 +108,10 @@ esac
 { echo "[mail from ${FROM} (host ${H}) — mirrored to the loom-ui inbox as ${ADDR}]"
   echo; echo "« ${TITLE:-$(printf '%s' "$BODY" | head -1)} »"; echo; printf '%s\n' "$BODY"; } >"$MF"
 L2=failed; L2_ERR=""; EVENT=""
-if [ ! -x "$POST" ]; then
-  L2_ERR="post script not found at $POST"
-else
-  MOUT=$("$POST" --mention "$TO" "$MF"); RC=$?
-  EVENT=$(printf '%s\n' "$MOUT" | grep -Eo '\$[^[:space:]]+' | tail -1)
-  if [ "$RC" -eq 0 ] && [ -n "$EVENT" ]; then L2=ok
-  else L2_ERR="post.sh exit $RC, event id ${EVENT:-missing}"; fi
-fi
+MOUT=$("$POST" --mention "$TO" "$MF"); RC=$?
+EVENT=$(printf '%s\n' "$MOUT" | grep -Eo '\$[^[:space:]]+' | tail -1)
+if [ "$RC" -eq 0 ] && [ -n "$EVENT" ]; then L2=ok
+else L2_ERR="post.sh exit $RC, event id ${EVENT:-missing}"; fi
 
 echo "loom-ui: $L1${ITEM_ID:+ (thread $ITEM_ID)} $ADDR${L1_ERR:+ — $L1_ERR}"
 echo "matrix:  $L2${EVENT:+ (event $EVENT)}${L2_ERR:+ — $L2_ERR}"
@@ -150,7 +142,7 @@ that succeeded, and echo the printed `[from …]` line + BODY. Recovery:
 - Still failing → hand the echoed content to the sender to relay by hand and
   say which surface already has it.
 
-Exit 2 (missing config) sent nothing: name the missing variable(s) and stop.
+Exit 2 (preflight refusal) sent nothing: relay its diagnosis (incl. a stale replyTo build) and stop.
 
 ## Rules
 

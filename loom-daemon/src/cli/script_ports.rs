@@ -506,6 +506,11 @@ pub(crate) enum ScriptPortCommand {
     /// at zero cost to that file. Makes no forge call.
     #[command(subcommand)]
     ForgeInventory(super::forge_inventory_cmd::ForgeInventoryCommand),
+
+    /// `loom-daemon mail preflight` (#10146): send-time onboarding check for
+    /// `/loom:mail-send`; exit 2 and nothing sent on any misconfiguration.
+    #[command(subcommand)]
+    Mail(super::mail_preflight::MailCommand),
 }
 
 impl ScriptPortCommand {
@@ -552,6 +557,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::DaemonStart(args) => args.run(),
             ScriptPortCommand::DaemonUpdate(args) => args.run(),
             ScriptPortCommand::FleetSend(args) => args.run(),
+            ScriptPortCommand::Mail(cmd) => cmd.run(),
             ScriptPortCommand::SkipLabels(args) => args.run(),
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
             ScriptPortCommand::DuplicateScan(args) => args.run(),
