@@ -25,7 +25,12 @@
 //! 3. this daemon's own identity, compared with the same account kind (the
 //!    user `x` is never the App `x[bot]`); or
 //! 4. an explicit allowlist, `forge.trustedCommenters` (logins, same
-//!    account-kind rule: list `x[bot]` to allow an App).
+//!    account-kind rule: list `x[bot]` to allow an App); or
+//! 5. a fleet admin from the fleet-store roster `fleet/admins.json`
+//!    ([`crate::fleet_store::admins`], user accounts only). It is **unioned**
+//!    with rule 4: neither can remove the other. Fails closed: an unreadable
+//!    roster widens nothing and is reported by
+//!    [`TrustPolicy::sources_consulted`] (#10303).
 //!
 //! # The GraphQL shape cannot name an App
 //!
@@ -46,6 +51,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::dep_recheck::extract::normalise_login;
+use crate::fleet_store::ADMINS_PATH;
 use crate::forge_identity::FleetLogins;
 
 /// `author_association` values that can already write labels.
@@ -181,6 +187,10 @@ pub struct TrustPolicy {
     fleet: FleetLogins,
     self_login: Option<String>,
     allowlist: Vec<String>,
+    /// Fleet admin roster logins (rule 5), empty when unavailable.
+    admins: Vec<String>,
+    /// How the roster resolved (`None`: not consulted, e.g. explicit rules).
+    admins_state: Option<String>,
 }
 
 impl TrustPolicy {
@@ -191,7 +201,29 @@ impl TrustPolicy {
             fleet,
             self_login,
             allowlist,
+            admins: Vec::new(),
+            admins_state: None,
         }
+    }
+
+    /// Add a resolved fleet admin roster (rule 5).
+    #[must_use]
+    pub fn with_admins(mut self, admins: crate::fleet_store::admins::Admins) -> Self {
+        self.admins = admins.logins;
+        self.admins_state = Some(admins.state);
+        self
+    }
+
+    /// The trust sources this policy consults, for the ignored-marker notice
+    /// (#10291): says which rules applied and whether the roster loaded.
+    #[must_use]
+    pub fn sources_consulted(&self) -> String {
+        format!(
+            "author_association (OWNER/MEMBER/COLLABORATOR), fleet Apps, self identity, \
+             forge.trustedCommenters ({} entries), fleet admin roster {ADMINS_PATH} ({})",
+            self.allowlist.len(),
+            self.admins_state.as_deref().unwrap_or("not consulted"),
+        )
     }
 
     /// The rules for the workspace at `root`: its fleet roster, its writer
@@ -209,7 +241,10 @@ impl TrustPolicy {
             fleet: FleetLogins::of(&roster),
             self_login,
             allowlist: allowlist_from_config(&effective),
+            admins: Vec::new(),
+            admins_state: None,
         }
+        .with_admins(crate::fleet_store::admins::resolve(root))
     }
 
     /// Replace the self identity (an explicit `--self-login`).
@@ -224,12 +259,8 @@ impl TrustPolicy {
     /// Whether `author` is believed.
     #[must_use]
     pub fn trusts(&self, author: &Author) -> bool {
-        trusted_by(
-            author,
-            |norm| self.fleet.contains(norm),
-            self.self_login.as_deref(),
-            &self.allowlist,
-        )
+        let allow: Vec<String> = self.allowlist.iter().chain(&self.admins).cloned().collect();
+        trusted_by(author, |norm| self.fleet.contains(norm), self.self_login.as_deref(), &allow)
     }
 
     /// Whether the comment/review object `v` (either shape) is believed.
