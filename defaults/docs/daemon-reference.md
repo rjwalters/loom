@@ -3626,6 +3626,17 @@ cite it as unpromoted); the Champion-side check is what actually resolves the
 trap once it has already occurred, including across a repo boundary this
 supervisor cannot cross.
 
+## Curator intake reconcile (#10041)
+
+Each work-finder listing of a workspace also runs a cadence-gated intake pass
+(`loom-daemon/src/intake_reconcile.rs`): every open **issue** (never a PR) with
+no `loom:*` label gets `loom:triage`, so Curator has one queue. Non-`loom:`
+labels such as `bug` do not count. Issues younger than 2 minutes are skipped (a
+filer may still be labeling), the pass is REST-only, idempotent, and batch-capped.
+`create-issue.sh` also adds `loom:triage` when the caller passes no `loom:*`
+label. Env (default **ON**): `LOOM_INTAKE_RECONCILE=0` disables,
+`LOOM_INTAKE_RECONCILE_INTERVAL_SECS` (300), `LOOM_INTAKE_RECONCILE_MAX_PER_PASS` (50).
+
 ## Autonomous work finder (#3810)
 
 The **work finder** (Phase A of epic #3809,

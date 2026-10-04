@@ -425,6 +425,8 @@ fi
 # Release on every exit path, including a failed create or an interrupt.
 trap 'loom_filing_lock_release' EXIT INT TERM
 
+# Single intake state (#10041): no loom:* label from the caller -> loom:triage.
+case " ${LABELS[*]-} " in *" loom:"*) ;; *) LABELS+=("loom:triage") ;; esac
 ISSUE_URL="$(forge_gh_create_issue_rl_safe "$REPO_NWO" "$TITLE" "$BODY" "${LABELS[@]+"${LABELS[@]}"}")" || exit 1
 echo "$ISSUE_URL"
 
