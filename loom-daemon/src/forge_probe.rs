@@ -219,10 +219,27 @@ pub fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> 
     // The server version stamps every receipt row; a failed version probe
     // marks the whole run Unknown rather than inventing a version.
     let server_version = match http.request("GET", "version", &cfg.writer_token, None) {
-        Ok((200, body)) => serde_json::from_str::<serde_json::Value>(body.trim())
-            .ok()
-            .and_then(|v| v.get("version").and_then(|s| s.as_str()).map(String::from))
-            .unwrap_or_default(),
+        Ok((200, body)) => {
+            match serde_json::from_str::<serde_json::Value>(body.trim())
+                .ok()
+                .and_then(|v| v.get("version").and_then(|s| s.as_str()).map(String::from))
+                .filter(|v| !v.trim().is_empty())
+            {
+                Some(v) => v,
+                // No observed version = no version-qualified evidence: stop
+                // before any case (and any write) runs.
+                None => {
+                    let why = ForgeOutcome::Unknown {
+                        operation: "server.version".into(),
+                        why: format!(
+                            "GET version answered 200 without a usable version: {}",
+                            truncate(&body)
+                        ),
+                    };
+                    return Err(anyhow::anyhow!("{why}"));
+                }
+            }
+        }
         Ok((code, body)) => {
             let _ = body;
             let why = ForgeOutcome::Unknown {
@@ -346,6 +363,9 @@ fn issue_title(cfg: &RunnerConfig, case: &str) -> String {
     format!("loomp-{}: {case}", cfg.run_ns)
 }
 
+const DISPOSABLE_BODY: &str =
+    "disposable probe resource — safe to delete (run receipt carries the number)";
+
 fn issue_create(
     test_id: &str,
     view: &ProbeEntryView,
@@ -356,7 +376,7 @@ fn issue_create(
     let title = issue_title(cfg, "issue-create");
     let body = serde_json::json!({
         "title": title,
-        "body": "disposable probe resource — safe to delete (run receipt carries the number)"
+        "body": DISPOSABLE_BODY
     })
     .to_string();
     let (code, resp) = http
@@ -369,7 +389,8 @@ fn issue_create(
     let number = created
         .as_ref()
         .and_then(|v| v.get("number").and_then(|n| n.as_u64()));
-    let base = |outcome: &str, observed: String| CaseResult {
+    let base = |outcome: &str, observed: String| {
+        CaseResult {
         test_id: test_id.to_string(),
         operation: view.id.clone(),
         risk: view.risk.clone(),
@@ -378,15 +399,38 @@ fn issue_create(
         server_version: server_version.to_string(),
         actor: actor_of(http, &cfg.writer_token),
         at: now_secs(),
-        expected: format!("HTTP 2xx with issue.number (disposable: {title})"),
+        expected: format!("HTTP 2xx with issue.number, read back with matching title and body (disposable: {title})"),
         observed,
         notes: number
             .map(|n| vec![format!("disposable issue number: {n}")])
             .unwrap_or_default(),
+    }
     };
     match (code, number) {
         (200..=299, Some(n)) => {
-            Ok(base(OUTCOME_PASS, format!("issue #{n} created in {}", cfg.repo)))
+            // A 2xx acknowledgement alone proves nothing: read the issue back
+            // and require the number, namespaced title and submitted body.
+            let (rcode, rresp) = http
+                .request("GET", &format!("repos/{}/issues/{n}", cfg.repo), &cfg.writer_token, None)
+                .map_err(|e| ForgeOutcome::Unknown {
+                    operation: view.id.clone(),
+                    why: e,
+                })?;
+            let read = serde_json::from_str::<serde_json::Value>(rresp.trim()).ok();
+            let matches = (200..=299).contains(&rcode)
+                && read.as_ref().is_some_and(|v| {
+                    v.get("number").and_then(|x| x.as_u64()) == Some(n)
+                        && v.get("title").and_then(|x| x.as_str()) == Some(title.as_str())
+                        && v.get("body").and_then(|x| x.as_str()) == Some(DISPOSABLE_BODY)
+                });
+            if matches {
+                Ok(base(OUTCOME_PASS, format!("issue #{n} created in {} and read back", cfg.repo)))
+            } else {
+                Ok(base(
+                    OUTCOME_FAIL,
+                    format!("issue #{n} read-back mismatch (HTTP {rcode}): {}", truncate(&rresp)),
+                ))
+            }
         }
         (403 | 404, _) => Err(ForgeOutcome::InsufficientPermission {
             operation: view.id.clone(),
@@ -653,10 +697,26 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_version_response_stops_the_run_before_any_case() {
+        for body in ["not json", "{}", r#"{"version": 28}"#, r#"{"version": ""}"#] {
+            let mut http = FakeHttp::new();
+            http.push("version", vec![Ok((200, body.into()))]);
+            assert!(run(&cfg(true), &http).is_err(), "{body:?} must not qualify");
+            assert_eq!(http.calls.get(), 1, "{body:?}: only the version probe may run");
+        }
+    }
+
+    #[test]
     fn issue_create_passes_on_2xx_with_a_number_and_records_the_disposable_number() {
         let mut http = FakeHttp::new();
         http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
-        http.push("issues", vec![Ok((201, r#"{"number": 12, "title": "x"}"#.into()))]);
+        http.push(
+            "issues",
+            vec![
+                Ok((201, r#"{"number": 12}"#.into())),
+                Ok((200, issue_json(12, "loomp-loomp-testrun: issue-create", DISPOSABLE_BODY))),
+            ],
+        );
         let mut cfg = cfg(true);
         cfg.only = vec!["issue-create".into()];
         let results = run(&cfg, &http).unwrap();
@@ -667,6 +727,42 @@ mod tests {
         assert_eq!(row.outcome, OUTCOME_PASS);
         assert!(row.notes.iter().any(|n| n.contains("12")));
         assert!(row.observed.contains("#12"));
+    }
+
+    fn issue_json(number: u64, title: &str, body: &str) -> String {
+        serde_json::json!({"number": number, "title": title, "body": body}).to_string()
+    }
+
+    fn issue_create_row(readback: Result<(u16, String), String>) -> CaseResult {
+        let mut http = FakeHttp::new();
+        http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
+        http.push("issues", vec![Ok((201, r#"{"number": 12}"#.into())), readback]);
+        let mut cfg = cfg(true);
+        cfg.only = vec!["issue-create".into()];
+        run(&cfg, &http)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.test_id.contains("issue-create"))
+            .unwrap()
+    }
+
+    #[test]
+    fn issue_create_fails_when_the_readback_is_missing_or_mismatched() {
+        let ns_title = "loomp-loomp-testrun: issue-create";
+        for readback in [
+            Ok((404, r#"{"message":"not found"}"#.into())),
+            Ok((200, "not json".into())),
+            Ok((200, issue_json(13, ns_title, DISPOSABLE_BODY))),
+            Ok((200, issue_json(12, "other title", DISPOSABLE_BODY))),
+            Ok((200, issue_json(12, ns_title, "other body"))),
+        ] {
+            assert_eq!(issue_create_row(readback).outcome, OUTCOME_FAIL);
+        }
+    }
+
+    #[test]
+    fn issue_create_readback_transport_fault_is_unknown() {
+        assert_eq!(issue_create_row(Err("connection reset".into())).outcome, OUTCOME_UNKNOWN);
     }
 
     #[test]
@@ -697,7 +793,7 @@ mod tests {
             "issues",
             vec![
                 Ok((201, r#"{"number": 7}"#.into())),
-                Ok((201, r#"{"number": 7, "body": "probe-1"}"#.into())),
+                Ok((200, issue_json(7, "loomp-loomp-testrun: issue-create", DISPOSABLE_BODY))),
             ],
         );
         // comments GET: marker absent -> FAIL
