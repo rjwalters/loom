@@ -245,6 +245,8 @@ impl FrictionBook {
         omitted: &mut Vec<FeatureOmitted>,
     ) {
         match labels {
+            // Any `labels::hold_labels()` entry (`check_holds`), deliberately
+            // broader than `pr_flags`' `FLAG_OP_HOLD`; see #10278.
             Some(labels) => features.operator_hold = Some(check_holds(labels).is_err()),
             None => omit(omitted, "operator_hold", "labels_not_listed"),
         }
