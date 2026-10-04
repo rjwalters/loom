@@ -1944,6 +1944,41 @@ heuristic refuses it as `blocked`, exactly as before, so it never appears in
 heuristic is promoted, consumers must render an unknown `stage` value
 gracefully.
 
+### `eta.fleet_refresh`
+
+One repo's outcome in one cycle of the daemon's fleet snapshot refresh task
+(Issue #10263; the task is in [`eta.md` → Fleet refresh
+task](eta.md#fleet-refresh-task-autonomousetafleetrefresh-10263)). Envelopes
+carry `schema_version: 12`. **OTLP-only** (native: `false`), one log record per
+repo per cycle, **skipped repos included**, so a repo the task never manages
+to refresh shows up as such. The body is the record's JSON; the scalars ride as
+`loom.repo` plus `loom.eta.fleet.*` attributes (in `ETA_LOG_ATTRIBUTE_KEYS`,
+allowlisted in the collector's `transform/privacy`). The record time is the
+cycle's start. Provenance is required, as for `eta.estimate`: `loom` exports as
+`loom.eta.version` / `revision` / `tree_state` / `provenance_complete`, and a
+record whose provenance does not validate is never emitted.
+
+| Field | Type | Notes |
+|---|---|---|
+| `repo` | string | `owner/repo` (`loom.repo`) |
+| `cycle_id` | string | derived, never random: `derived_hex(["loom.eta.fleet_refresh", host_id, cycle start])`; shared by every repo of one cycle |
+| `started_at` | RFC3339 | the cycle's start |
+| `pass` | string | `backfill`, `refresh`, or `none` (skipped before a pass was chosen) |
+| `stop_reason` | string | `complete`, `not_modified`, `budget`, `reserve`, `rate_limited`, `coverage`, `breaker_open`, `backoff`, `no_reader`, `unsupported_forge`, `forge_error`, `write_error`, `shutdown` |
+| `promoted` | bool | the pass completed and its snapshot was published |
+| `prs_read` | integer | PR timelines read this cycle |
+| `pass_done` | integer | PRs the pass has read in total |
+| `timelines_incomplete` | integer | timelines that did not parse (counted, contribute nothing) |
+| `samples_added` | integer | published samples after minus before |
+| `raw_events_added` | integer? | rows appended to the raw event cache (#10197), when its sync ran |
+| `forge_calls` | integer | requests made, `304`s and failures included |
+| `not_modified_calls` | integer | of which `304`s |
+| `ratelimit_remaining_min` | integer? | the lowest `x-ratelimit-remaining` seen |
+| `reader_app` | string? | the reader App's id (not a secret) |
+| `snapshot_id` / `as_of` | string? / RFC3339? | the published snapshot after the cycle |
+| `duration_ms` | integer | wall time spent on the repo |
+| `loom` | object | the computing daemon's provenance (required) |
+
 ### `eta.snapshot`
 
 This host's **live** ETA estimate set (Issue #9329) — one row per

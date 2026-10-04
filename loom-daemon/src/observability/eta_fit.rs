@@ -13,8 +13,12 @@
 //!   finder's tick.
 //! - **No forge call.** It reads `.loom/state/eta/fleet/*.json`, which the
 //!   ETA pass already reads, and writes one file under the ignored
-//!   `.loom/state/eta/fit/`. Refreshing the snapshots is an operator (or
-//!   cron) step this task does not take.
+//!   `.loom/state/eta/fit/`. It does not refresh the snapshots.
+//! - **Either/or with the fleet refresh (#10263).** When
+//!   `autonomous.eta.fleetRefresh.enabled` is on (the default), this task is
+//!   not spawned: `observability::eta_fleet_refresh` runs the same
+//!   `refit_if_due` at the end of each refresh cycle, right after refreshing
+//!   the snapshots it reads.
 //! - **Config.** `autonomous.eta.fit.enabled` / `LOOM_ETA_FIT_ENABLED`,
 //!   default on, and only with `autonomous.eta.enabled`; read once at spawn.
 //!   Default on because the task generates no work, is CPU-only, and is a

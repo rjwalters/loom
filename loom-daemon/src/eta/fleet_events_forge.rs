@@ -20,6 +20,9 @@
 //! is known without a per-item read. The synthesised row's id does not depend
 //! on which event carried it, so it is stored once.
 //!
+//! [`ForgeEventSource::reader_only`] (#10263) is the daemon's variant: the
+//! same listing read through the reader-only primitive, never the writer.
+//!
 //! # Known limit
 //!
 //! GitHub serves this listing only to a bounded depth (it answers `422` past
@@ -200,6 +203,12 @@ pub struct ForgeEventSource {
     reserve: u64,
     /// The last response reported fewer than `reserve` calls remaining.
     below_reserve: bool,
+    /// `Some` = reader-only ([`ForgeEventSource::reader_only`], #10263).
+    reader: Option<super::fleet_fetch::Reader>,
+    /// Requests issued (every attempt, failures included).
+    calls: u64,
+    /// Why the last [`PageFetch::Stopped`] stopped.
+    last_stop: Option<super::fleet_refresh::StopReason>,
 }
 
 impl ForgeEventSource {
@@ -214,7 +223,40 @@ impl ForgeEventSource {
             gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
             reserve,
             below_reserve: false,
+            reader: None,
+            calls: 0,
+            last_stop: None,
         }
+    }
+
+    /// A **reader-only** source (#10263): every page is read under `reader`
+    /// through [`crate::forge_etag_store::fetch_with_reader`] — no writer
+    /// fallback, no env token — and a credential failure withdraws the reader
+    /// and stops rather than retrying anywhere else. What the daemon's fleet
+    /// refresh task syncs the raw cache with; the CLI keeps [`Self::new`].
+    #[must_use]
+    pub fn reader_only(
+        endpoint: ForgeEndpoint,
+        repo: &str,
+        root: &Path,
+        reserve: u64,
+        reader: super::fleet_fetch::Reader,
+    ) -> Self {
+        let mut source = Self::new(endpoint, repo, root, reserve);
+        source.reader = Some(reader);
+        source
+    }
+
+    /// Requests issued so far, failures included.
+    #[must_use]
+    pub fn calls(&self) -> u64 {
+        self.calls
+    }
+
+    /// Why the last stop happened, when the source stopped.
+    #[must_use]
+    pub fn last_stop(&self) -> Option<super::fleet_refresh::StopReason> {
+        self.last_stop
     }
 
     /// Use `gh_bin` instead of the resolved `gh` (tests).
@@ -231,28 +273,51 @@ impl RawEventSource for ForgeEventSource {
     }
 
     fn fetch_page(&mut self, page: u32, etag: Option<&str>) -> PageFetch {
+        use super::fleet_refresh::StopReason;
         if self.below_reserve {
+            self.last_stop = Some(StopReason::Reserve);
             return PageFetch::Stopped(format!(
                 "fewer than {} core calls remain (reserve floor); re-run after the reset",
                 self.reserve
             ));
         }
+        if self.reader.is_some() && crate::rate_limit_breaker::global_is_suppressed() {
+            self.last_stop = Some(StopReason::BreakerOpen);
+            return PageFetch::Stopped("rate-limit breaker open".to_string());
+        }
         let target = crate::forge_etag_store::resolve_target(Some(&self.root), Some(&self.repo));
         let url = self.endpoint.url(&self.repo, page);
         let site = crate::forge_etag_store::ConditionalRead::new(CALLER, self.endpoint.op());
         let fetched_at = Utc::now();
-        let (status, response, stderr) = match crate::forge_etag_store::fetch_conditional(
-            site,
-            &self.gh_bin,
-            Some(&self.root),
-            &target,
-            &url,
-            etag,
-        ) {
+        self.calls += 1;
+        let answer = match &self.reader {
+            Some(reader) => crate::forge_etag_store::fetch_with_reader(
+                site,
+                &self.gh_bin,
+                Some(&self.root),
+                &target,
+                &url,
+                etag,
+                &reader.dir,
+            ),
+            None => crate::forge_etag_store::fetch_conditional(
+                site,
+                &self.gh_bin,
+                Some(&self.root),
+                &target,
+                &url,
+                etag,
+            ),
+        };
+        let (status, response, stderr) = match answer {
             Ok(answer) => answer,
-            Err(e) => return PageFetch::Stopped(format!("gh failed: {e:#}")),
+            Err(e) => {
+                self.last_stop = Some(StopReason::ForgeError);
+                return PageFetch::Stopped(format!("gh failed: {e:#}"));
+            }
         };
         let Some(response) = response else {
+            self.last_stop = Some(StopReason::ForgeError);
             return PageFetch::Stopped(format!("no HTTP response (exit {status}): {stderr}"));
         };
         // A page already paid for is always kept; the floor stops the *next*
@@ -261,7 +326,57 @@ impl RawEventSource for ForgeEventSource {
             .ratelimit
             .remaining
             .is_some_and(|r| r < self.reserve);
+        if let Some(reader) = &self.reader {
+            if !matches!(response.status, 200 | 304 | 422) {
+                self.last_stop =
+                    Some(withdraw_reader(reader, &self.repo, &url, &response, &stderr));
+            }
+        }
         classify(self.endpoint, &self.repo, page, response, &stderr, fetched_at)
+    }
+}
+
+/// A reader-only read failed: classify it, withdraw the reader when the
+/// failure is the credential's (#9537), and name the stop.
+fn withdraw_reader(
+    reader: &super::fleet_fetch::Reader,
+    repo: &str,
+    url: &str,
+    response: &crate::forge_listing::HttpResponse,
+    stderr: &str,
+) -> super::fleet_refresh::StopReason {
+    use super::fleet_fetch::ReadFailure;
+    use super::fleet_refresh::StopReason;
+    let why = format!("{CALLER} {url}");
+    let failure =
+        super::fleet_fetch::classify(stderr, Some(response.status), response.ratelimit.remaining);
+    match failure {
+        ReadFailure::RateLimited => {
+            let until = response
+                .ratelimit
+                .reset_epoch
+                .and_then(|s| u64::try_from(s).ok())
+                .map(|s| std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s));
+            crate::forge_identity::withdraw_after(
+                &reader.app_id,
+                repo,
+                crate::forge_identity::Failure::App,
+                until,
+                &why,
+            );
+            StopReason::RateLimited
+        }
+        ReadFailure::Coverage => {
+            crate::forge_identity::withdraw_after(
+                &reader.app_id,
+                repo,
+                crate::forge_identity::Failure::Coverage,
+                None,
+                &why,
+            );
+            StopReason::Coverage
+        }
+        ReadFailure::Other => StopReason::ForgeError,
     }
 }
 

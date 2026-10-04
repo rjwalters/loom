@@ -107,6 +107,8 @@ pub mod fleet_agreement;
 pub mod fleet_events;
 pub mod fleet_events_forge;
 pub mod fleet_events_pulls;
+pub mod fleet_fetch;
+pub mod fleet_refresh;
 pub mod fleet_state;
 pub mod friction;
 pub mod grid;

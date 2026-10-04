@@ -6,9 +6,14 @@
 //! Deriving a repo's stage history costs one `gh pr list` plus one
 //! `issues/<n>/timeline` read per PR. Paying that on every daemon tick, on
 //! every host, is exactly the API cost #9343 names as the objection to
-//! forge-sourced history — so the derivation lives here, behind an explicit
-//! backfill, and the daemon only ever *reads* the cached file
-//! ([`loom_daemon::eta::fleet::load_all`]).
+//! forge-sourced history — so no tick derives, and the ETA pass only ever
+//! *reads* the cached file ([`loom_daemon::eta::fleet::load_all`]).
+//!
+//! Since #10263 the daemon keeps the snapshots fresh itself, **off the tick**:
+//! an hourly task (`observability::eta_fleet_refresh`) runs budgeted,
+//! resumable backfills and refreshes through reader Apps only. This command
+//! stays for ad-hoc and non-daemon use; it runs under the ambient `gh`
+//! credential, so it is not what a fleet host should schedule.
 //!
 //! - `backfill` — the once-per-repo full derivation.
 //! - `refresh` — the incremental top-up: only PRs the forge says moved since

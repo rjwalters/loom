@@ -78,3 +78,74 @@ fn env_beats_config_beats_default() {
     assert!(config.dry_run);
     assert_eq!(config.refresh_secs, MIN_REFRESH_SECS, "floored");
 }
+
+// -- autonomous.eta.fleetRefresh (#10263) -----------------------------------
+
+#[test]
+fn fleet_refresh_is_on_by_default_with_the_pinned_budgets() {
+    use crate::eta::config::FleetRefreshConfig;
+    let c = resolve(&json!({}), no_env).fleet_refresh;
+    assert_eq!(
+        c,
+        FleetRefreshConfig {
+            enabled: true,
+            interval_secs: 3600,
+            max_calls_per_cycle: 300,
+            backfill_max_calls_per_cycle: 1500,
+            reserve_calls: 1500,
+            backfill_days: 21,
+        }
+    );
+}
+
+#[test]
+fn fleet_refresh_follows_env_then_config_then_default() {
+    let file = json!({"autonomous": {"eta": {"fleetRefresh": {
+        "enabled": false, "intervalSecs": 1800, "maxCallsPerCycle": 50,
+        "backfillMaxCallsPerCycle": 700, "reserveCalls": 900, "backfillDays": 30
+    }}}});
+    let c = resolve(&file, no_env).fleet_refresh;
+    assert!(!c.enabled);
+    assert_eq!(
+        (c.interval_secs, c.max_calls_per_cycle, c.backfill_max_calls_per_cycle),
+        (1800, 50, 700)
+    );
+    assert_eq!((c.reserve_calls, c.backfill_days), (900, 30));
+
+    let env = |key: &str| {
+        match key {
+            "LOOM_ETA_FLEET_REFRESH_ENABLED" => Some("1"),
+            "LOOM_ETA_FLEET_REFRESH_INTERVAL_SECS" => Some("7200"),
+            "LOOM_ETA_FLEET_REFRESH_MAX_CALLS" => Some("10"),
+            "LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS" => Some("20"),
+            "LOOM_ETA_FLEET_REFRESH_RESERVE" => Some("30"),
+            "LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS" => Some("40"),
+            _ => None,
+        }
+        .map(str::to_string)
+    };
+    let c = resolve(&file, env).fleet_refresh;
+    assert!(c.enabled);
+    assert_eq!(
+        (c.interval_secs, c.max_calls_per_cycle, c.backfill_max_calls_per_cycle),
+        (7200, 10, 20)
+    );
+    assert_eq!((c.reserve_calls, c.backfill_days), (30, 40));
+
+    let off = |key: &str| (key == "LOOM_ETA_FLEET_REFRESH_ENABLED").then(|| "0".to_string());
+    assert!(!resolve(&json!({}), off).fleet_refresh.enabled);
+}
+
+#[test]
+fn fleet_refresh_clamps_the_interval_and_the_backfill_depth() {
+    use crate::eta::config::{MIN_FLEET_REFRESH_BACKFILL_DAYS, MIN_FLEET_REFRESH_INTERVAL_SECS};
+    let file = json!({"autonomous": {"eta": {"fleetRefresh": {
+        "intervalSecs": 5, "backfillDays": 1
+    }}}});
+    let c = resolve(&file, no_env).fleet_refresh;
+    assert_eq!(c.interval_secs, MIN_FLEET_REFRESH_INTERVAL_SECS);
+    assert_eq!(MIN_FLEET_REFRESH_INTERVAL_SECS, 900);
+    assert_eq!(c.backfill_days, MIN_FLEET_REFRESH_BACKFILL_DAYS);
+    assert_eq!(MIN_FLEET_REFRESH_BACKFILL_DAYS, crate::eta::fit::WINDOW_DAYS + 1);
+    assert_eq!(MIN_FLEET_REFRESH_BACKFILL_DAYS, 15);
+}
