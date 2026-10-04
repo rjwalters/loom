@@ -39,6 +39,7 @@ pipeline state already lives.
 - [PR verdict-label mutual exclusion: three independent layers (#8112)](#pr-verdict-label-mutual-exclusion-three-independent-layers-8112)
 - [Follow-up work](#follow-up-work)
 - [Label registry: the source of truth (#10013)](#label-registry-the-source-of-truth-10013)
+- [No-op hold (#10156)](#no-op-hold-10156)
 <!-- toc:end -->
 
 ## Two ways to reach a human (#10000)
