@@ -97,6 +97,11 @@ pub struct Cursor {
     attached: bool,
     /// `thinking` blocks seen in the line being parsed (a count only).
     thinking_seen: u64,
+    /// Byte offset of the first line this cursor may ever report. `0` (the
+    /// daemon's case) is the whole file. An attended run (#10116) sets it to
+    /// its claim line, so lines written before the claim are not its own and
+    /// are never replayed as its backlog.
+    floor: u64,
 }
 
 /// Ceiling on unmatched `tool_use` ids held for pairing. A session that ends
@@ -126,6 +131,22 @@ pub struct Pass {
 }
 
 impl Cursor {
+    /// A cursor whose first reported line is the one starting at byte
+    /// `floor` (#10116). The retained-tail rule still applies from there.
+    #[must_use]
+    pub fn starting_at(floor: u64) -> Self {
+        Cursor {
+            floor,
+            ..Cursor::default()
+        }
+    }
+
+    /// Bytes of the file consumed so far.
+    #[must_use]
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
     /// Read whatever has been appended to `path` since the last pass and map
     /// it to records under `identity`.
     ///
@@ -143,10 +164,27 @@ impl Cursor {
         identity: &RunIdentity,
         now: DateTime<Utc>,
     ) -> Pass {
+        self.advance_within(path, stream_id, identity, now, None)
+    }
+
+    /// [`Self::advance`], never reading past byte `limit` when one is given.
+    /// An attended run (#10116) passes the end of the lines it has checked
+    /// for a boundary, so a line that belongs to the agent's next task is
+    /// never read under this run's identity. `limit` must fall on a line
+    /// boundary.
+    pub fn advance_within(
+        &mut self,
+        path: &Path,
+        stream_id: &str,
+        identity: &RunIdentity,
+        now: DateTime<Utc>,
+        limit: Option<u64>,
+    ) -> Pass {
         let Ok(metadata) = std::fs::metadata(path) else {
             return Pass::default();
         };
-        let len = metadata.len();
+        let file_len = metadata.len();
+        let len = limit.map_or(file_len, |limit| file_len.min(limit));
         let mut pass = Pass::default();
 
         if !self.attached {
@@ -165,9 +203,11 @@ impl Cursor {
                     pass.gap = Some(("backlog_skipped".to_string(), skipped));
                 }
             }
-        } else if len < self.offset {
+        } else if file_len < self.offset {
             // The file shrank: rotated, or rewritten by a resumed session.
-            self.offset = 0;
+            // A cursor with a floor cannot tell which rewritten lines are its
+            // own, so it resumes at the end rather than replaying from 0.
+            self.offset = if self.floor == 0 { 0 } else { len };
             self.pending.clear();
             self.tools.clear();
             pass.gap = Some(("source_truncated".to_string(), 0));
@@ -219,7 +259,8 @@ impl Cursor {
                 Ok(n) => {
                     // A trailing chunk with no newline is an incomplete line:
                     // leave it to `advance`, which will hold it as `pending`.
-                    if raw.last() != Some(&b'\n') {
+                    // Nor is a line past `len`, the caller's read limit.
+                    if raw.last() != Some(&b'\n') || at + n as u64 > len {
                         break;
                     }
                     line_starts.push(at);
@@ -229,10 +270,18 @@ impl Cursor {
             }
         }
         let total = line_starts.len();
-        let keep_from = total.saturating_sub(ATTACH_TAIL_EVENTS);
+        // Lines before the floor are not this cursor's at all: neither kept
+        // nor counted as skipped. Only the run's own lines beyond the
+        // retained tail are a `backlog_skipped` gap.
+        let first_own = line_starts.partition_point(|start| *start < self.floor);
+        let keep_from = total.saturating_sub(ATTACH_TAIL_EVENTS).max(first_own);
         self.next_sequence = keep_from as u64;
-        self.offset = line_starts.get(keep_from).copied().unwrap_or(at);
-        keep_from as u64
+        self.offset = line_starts
+            .get(keep_from)
+            .copied()
+            .unwrap_or(at)
+            .max(self.floor.min(len));
+        (keep_from - first_own) as u64
     }
 
     /// Map one transcript line to zero or more records. Unparseable lines and

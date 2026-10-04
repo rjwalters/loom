@@ -1995,17 +1995,17 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
         "PARK_LABELS must exclude {BUILDING_LABEL}: it is legitimately present on a \
              watchdog / checkpoint-resume re-dispatch of the daemon's own claim"
     );
-    for park in PARK_LABELS {
+    for park in PARK_LABELS.iter() {
         assert!(
             SKIP_LABELS.contains(park),
             "{park} is a park label, so the work-finder query must skip it too"
         );
     }
     let mut expected: Vec<&str> = vec![BUILDING_LABEL];
-    expected.extend_from_slice(PARK_LABELS);
+    expected.extend_from_slice(&PARK_LABELS);
     expected.extend([OPERATOR_HOLD_LABEL, labels::OPERATOR_DECISION_LABEL]);
     assert_eq!(
-        SKIP_LABELS, expected,
+        *SKIP_LABELS, expected,
         "SKIP_LABELS is BUILDING_LABEL + PARK_LABELS + OPERATOR_HOLD_LABEL + the decision sub-kind"
     );
 }
@@ -2032,7 +2032,7 @@ fn test_hard_exclusion_labels_are_disjoint_from_skip_labels() {
     // So assert the two sets stay disjoint. If a future label genuinely
     // belongs in both, that is a deliberate decision that should have to
     // edit this test.
-    for excluded in crate::hard_exclusion::HARD_EXCLUSION_LABELS {
+    for excluded in crate::hard_exclusion::HARD_EXCLUSION_LABELS.iter() {
         assert!(
             !SKIP_LABELS.contains(excluded),
             "{excluded} is a hard exclusion (#7528), counted as `declined-skip`; it must \

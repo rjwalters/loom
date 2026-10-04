@@ -2,7 +2,8 @@
 //!
 //! Each lockstep test asserts one hand-listed daemon label table equals the
 //! registry query for the matching property, so converting the table to a
-//! registry lookup (slice 2) is a pure swap.
+//! registry lookup (slice 2b) is a pure swap. Tables already derived from the
+//! registry (slice 2a) are pinned to the literal they replaced instead.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -49,6 +50,12 @@ fn validation_rejects_bad_registries() {
     assert!(mutate(&|v| v["labels"][1]["name"] = v["labels"][0]["name"].clone()).is_err());
     assert!(mutate(&|v| v["labels"][0]["description"] = "x".repeat(101).into()).is_err());
     assert!(mutate(&|v| v["labels"][0]["requires_base"] = "loom:nope".into()).is_err());
+    // A park label that is not also a skip label (#4444).
+    let park_only = |v: &mut serde_json::Value| {
+        v["labels"][0]["park"] = true.into();
+        v["labels"][0]["skip"] = false.into();
+    };
+    assert!(mutate(&park_only).is_err());
 }
 
 #[test]
@@ -101,47 +108,77 @@ fn queries_answer_and_reject_unknowns() {
     assert_eq!(reg().get("loom:pr").unwrap().kind, "pr-lane");
 }
 
-// --- lockstep: one test per existing hand-listed table -----------------------
+// --- slice 2a: tables derived from the registry ------------------------------
+//
+// These sets are no longer hand-listed, so a lockstep test against the
+// registry would be a tautology. Instead each derived set is pinned to the
+// literal it replaced (#10013 slice 2a: no behavior change). Changing one of
+// these sets is a semantic change: edit `defaults/labels.json` and the pin in
+// the same PR.
 
 #[test]
-fn lockstep_park_labels() {
-    assert_eq!(set(crate::work_finder::PARK_LABELS.iter().copied()), prop("park"));
+fn derived_park_labels_equal_the_previous_literal_in_order() {
+    // Order matters: the park guards report the first match in this order.
+    assert_eq!(*crate::work_finder::PARK_LABELS, ["loom:blocked", "loom:operator-only"]);
 }
 
 #[test]
-fn lockstep_skip_labels_and_hold_decision_labels() {
-    use crate::work_finder::{OPERATOR_HOLD_LABEL, SKIP_LABELS};
-    assert_eq!(set(SKIP_LABELS.iter().copied()), prop("skip"));
-    // OPERATOR_HOLD_LABEL is a skip label but never a park.
-    assert!(prop("skip").contains(OPERATOR_HOLD_LABEL));
-    assert!(!prop("park").contains(OPERATOR_HOLD_LABEL));
-    // OPERATOR_DECISION_LABEL (private const): the one skip label that is
-    // neither claim, park nor the generic hold.
-    let rest: BTreeSet<&str> = prop("skip")
-        .into_iter()
-        .filter(|n| {
-            reg().get(n).unwrap().kind != "claim"
-                && !prop("park").contains(n)
-                && *n != OPERATOR_HOLD_LABEL
-        })
-        .collect();
-    assert_eq!(rest, set(["loom:operator-decision"]));
+fn derived_skip_labels_equal_the_previous_literal_in_order() {
     assert_eq!(
-        set(reg()
-            .with_kind("claim")
-            .into_iter()
-            .filter(|n| prop("skip").contains(n))),
-        set([crate::work_finder::BUILDING_LABEL])
+        *crate::work_finder::SKIP_LABELS,
+        [
+            "loom:building",
+            "loom:blocked",
+            "loom:operator-only",
+            "loom:operator",
+            "loom:operator-decision",
+        ]
     );
 }
 
 #[test]
-fn lockstep_hard_exclusion_labels() {
+fn derived_hard_exclusion_labels_equal_the_previous_literal() {
+    assert_eq!(*crate::hard_exclusion::HARD_EXCLUSION_LABELS, ["external"]);
+}
+
+#[test]
+fn derived_champion_path_labels_equal_the_previous_literal_set() {
+    // The order was never load-bearing (membership only), so compare sets.
     assert_eq!(
-        set(crate::hard_exclusion::HARD_EXCLUSION_LABELS.iter().copied()),
-        prop("hard_exclusion")
+        set(crate::work_finder::operator_priority::CHAMPION_PATH_LABELS
+            .iter()
+            .copied()),
+        set(["loom:epic", "loom:architect", "loom:hermit", "loom:auditor"])
     );
 }
+
+/// The work finder's single-label name constants are identifiers, not sets,
+/// so they stay `const` (usable in const contexts and patterns). Check each
+/// names a registry label with the properties its doc comment claims.
+#[test]
+fn work_finder_name_constants_match_their_registry_properties() {
+    use crate::dep_classify::consts::OPERATOR_DECISION_LABEL;
+    use crate::work_finder::{BUILDING_LABEL, OPERATOR_HOLD_LABEL};
+    let get = |n: &str| {
+        reg()
+            .get(n)
+            .unwrap_or_else(|| panic!("{n} not in registry"))
+    };
+    // The claim: skipped, never a park.
+    let building = get(BUILDING_LABEL);
+    assert!(building.kind == "claim" && building.skip && !building.park);
+    // The generic hold: skipped, never a park (vibesql#6664).
+    let hold = get(OPERATOR_HOLD_LABEL);
+    assert!(hold.hold && hold.skip && !hold.park && hold.requires_base.is_none());
+    // The decision sub-kind (work_finder's private copy is pinned through
+    // SKIP_LABELS by `work_finder::tests`): skipped, not a park, rides on
+    // loom:operator-only.
+    let decision = get(OPERATOR_DECISION_LABEL);
+    assert!(decision.skip && !decision.park);
+    assert_eq!(decision.requires_base.as_deref(), Some("loom:operator-only"));
+}
+
+// --- lockstep: one test per remaining hand-listed table (slice 2b) ------------
 
 #[test]
 fn lockstep_operator_gate_labels() {
@@ -212,14 +249,4 @@ fn lockstep_dep_classify_operator_only_kinds() {
         .map(|l| l.name.as_str())
         .collect();
     assert_eq!(requiring, set(base.remove_with.iter().map(String::as_str)));
-}
-
-#[test]
-fn lockstep_champion_path_labels() {
-    assert_eq!(
-        set(crate::work_finder::operator_priority::CHAMPION_PATH_LABELS
-            .iter()
-            .copied()),
-        prop("champion_path")
-    );
 }

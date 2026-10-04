@@ -34,6 +34,33 @@
 //! [`crate::rate_limit_breaker`]'s budget, which is only probed after a trip.
 //! A GraphQL caller (`gh issue/pr list` without `--cached`) prints no headers
 //! and records its pool statically as [`Pool::Graphql`].
+//!
+//! # Call identity (Issue #9777)
+//!
+//! `caller` alone cannot answer "which inventoried *operation* did we spend
+//! that budget on, against which forge, in which repository?" — and on a mixed
+//! fleet it cannot even tell two forges apart. So each record may carry a
+//! [`CallIdentity`]: the operation ID from
+//! [`crate::forge_inventory`], the provider, the **origin host**, and the
+//! `owner/repo` slug. The origin is what makes `github.com/acme/app#12` and
+//! `gitea.example.com/acme/app#12` two different things rather than one — see
+//! [`CallIdentity::qualified_key`].
+//!
+//! Three rules hold that layer to the epic's evidence constraints:
+//!
+//! 1. **Bounded and sanitized.** Every field goes through [`sanitize`]: one
+//!    line, ASCII-printable, length-capped. Nothing a forge or an operator can
+//!    make arbitrarily long reaches the sink.
+//! 2. **No credentials, no private bodies.** The identity carries an operation
+//!    ID, a provider, a host and a repository slug. Authentication headers,
+//!    tokens and response bodies are never arguments to [`record`], so they
+//!    cannot be recorded by mistake; [`sanitize`] additionally refuses a value
+//!    carrying a credential shape.
+//! 3. **Unknown operations stay visible.** A call whose operation the manifest
+//!    does not know records `operation = "unknown"` rather than nothing, so an
+//!    unmapped caller shows up in the accounting instead of disappearing from
+//!    it. Runtime traces *supplement* the source inventory; they never
+//!    establish exhaustiveness on their own.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -44,7 +71,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::forge_listing::HttpResponse;
-use crate::types::{ForgeBudgetReading, ForgeCallCounts, ForgeCallsStatus};
+use crate::types::{ForgeBudgetReading, ForgeCallCounts, ForgeCallsStatus, ForgeOperationCounts};
 
 /// The rolling window `status` reports (the last hour).
 pub const WINDOW_SECS: i64 = 3600;
@@ -95,6 +122,192 @@ impl Pool {
             Pool::Search => "search",
             Pool::Other => "other",
         }
+    }
+}
+
+/// What is recorded for an operation the inventory does not know. A visible
+/// `unknown` is the point: a silently-dropped row is an invisible bypass.
+pub const UNKNOWN_OPERATION: &str = "unknown";
+
+/// Longest value any identity field may contribute to a sink line.
+const MAX_FIELD_LEN: usize = 96;
+
+/// Reduce an identity field to a bounded, single-line, printable-ASCII token,
+/// or `None` when nothing safe is left.
+///
+/// Rejected outright (not truncated): anything carrying a credential shape.
+/// None of the call sites pass a secret, and that is the real defence — this
+/// is the belt to that braces, so a future caller that wires a header or a URL
+/// with embedded basic-auth into an identity field records nothing rather than
+/// a secret.
+/// The shape check runs **before** any normalization, on every form the
+/// normalization can produce — see [`is_credential_in_any_form`].
+#[must_use]
+pub fn sanitize(value: &str) -> Option<String> {
+    if is_credential_in_any_form(value) {
+        return None;
+    }
+    let one_line: String = value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = one_line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let kept: String = trimmed
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(MAX_FIELD_LEN)
+        .collect();
+    let kept = kept.trim();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.to_string())
+    }
+}
+
+/// [`looks_like_credential`], evaluated on the raw value **and** on each form
+/// [`sanitize`]'s own normalization can turn it into.
+///
+/// A check that only ran after normalization was a real bypass (PR #9832
+/// review): the normalization moves a value across the check in both
+/// directions.
+///
+/// - Folding a control character to a space **splits** a marker:
+///   `ghp\u{0}_…` becomes `ghp _…`, which contains no `ghp_`. The
+///   *graphic-only* form rejoins the halves.
+/// - Dropping a non-graphic character **joins** one: `ghp\u{e9}_…` becomes
+///   `ghp_…`. The raw form contains neither, so the *folded* form is what sees
+///   it.
+/// - A marker that itself contains a space (`bearer `, `private key`) needs the
+///   whitespace a graphic-only form deletes, which is why the raw and folded
+///   forms are checked too.
+///
+/// The length cap is deliberately not applied here: checking the untruncated
+/// forms is strictly stronger than checking what gets recorded.
+fn is_credential_in_any_form(value: &str) -> bool {
+    if looks_like_credential(value) {
+        return true;
+    }
+    let folded: String = value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect();
+    if looks_like_credential(&folded) {
+        return true;
+    }
+    let graphic_only: String = value.chars().filter(char::is_ascii_graphic).collect();
+    looks_like_credential(&graphic_only)
+}
+
+/// Credential shapes an identity field must never carry. Deliberately coarse:
+/// a false positive costs one unrecorded label, a false negative writes a
+/// secret to a file on disk.
+fn looks_like_credential(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "authorization",
+        "bearer ",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "sk-ant-",
+        "xoxb-",
+        "xoxp-",
+        "aws_secret",
+        "akia",
+        "private key",
+        "begin rsa",
+        "begin openssh",
+        "token=",
+        "access_token",
+        "//:@",
+    ];
+    if MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    // `user:secret@host` in a URL-ish value.
+    value.contains("://") && value.split("://").nth(1).is_some_and(|r| r.contains('@'))
+}
+
+/// Who and what a forge call was for, beyond its `caller`.
+///
+/// Every field is optional because the layer lands incrementally: an
+/// un-migrated call site records what it knows and nothing more, which is
+/// strictly better accounting than the `caller`-only row it had before. A
+/// field that cannot be sanitized is dropped, never recorded raw.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallIdentity {
+    /// Inventoried operation ID (`issue.create`), or [`UNKNOWN_OPERATION`].
+    pub operation: Option<String>,
+    /// Provider family: `github`, `gitea`, …
+    pub provider: Option<String>,
+    /// Origin host (`github.com`, `gitea.example.com`) — what distinguishes
+    /// two forges that use the same repository slug.
+    pub origin: Option<String>,
+    /// `owner/repo` slug.
+    pub repo: Option<String>,
+}
+
+impl CallIdentity {
+    /// An identity naming only the operation.
+    #[must_use]
+    pub fn operation(operation: &str) -> Self {
+        Self {
+            operation: sanitize(operation),
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn with_provider(mut self, provider: &str) -> Self {
+        self.provider = sanitize(provider);
+        self
+    }
+
+    #[must_use]
+    pub fn with_origin(mut self, origin: &str) -> Self {
+        self.origin = sanitize(origin);
+        self
+    }
+
+    #[must_use]
+    pub fn with_repo(mut self, repo: &str) -> Self {
+        self.repo = sanitize(repo);
+        self
+    }
+
+    /// Fully-qualified identity of a repository-scoped artifact:
+    /// `<provider>:<origin>/<owner>/<repo>` (plus `#<number>` when given).
+    ///
+    /// Two origins carrying the same slug and the same issue/PR number produce
+    /// two different keys — which is the whole point. An unqualified `#12` is
+    /// ambiguous the moment a second forge exists, and an ambiguous key is how
+    /// a trust or claim decision gets made against the wrong artifact.
+    #[must_use]
+    pub fn qualified_key(&self, number: Option<u64>) -> String {
+        let provider = self.provider.as_deref().unwrap_or("unknown");
+        let origin = self.origin.as_deref().unwrap_or("unknown");
+        let repo = self.repo.as_deref().unwrap_or("unknown");
+        match number {
+            Some(n) => format!("{provider}:{origin}/{repo}#{n}"),
+            None => format!("{provider}:{origin}/{repo}"),
+        }
+    }
+
+    /// Is every field empty? Such an identity contributes nothing to a line.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.operation.is_none()
+            && self.provider.is_none()
+            && self.origin.is_none()
+            && self.repo.is_none()
     }
 }
 
@@ -155,10 +368,36 @@ pub fn record_gh_api(
     record(caller, pool, outcome, response.map(|r| &r.ratelimit));
 }
 
+/// [`record_gh_api`] plus the #9777 call identity.
+pub fn record_gh_api_with_identity(
+    caller: &'static str,
+    identity: &CallIdentity,
+    response: Option<&HttpResponse>,
+    exit_ok: bool,
+    stderr: &str,
+) {
+    let (pool, outcome) = classify(response, exit_ok, stderr);
+    record_with_identity(caller, identity, pool, outcome, response.map(|r| &r.ratelimit));
+}
+
 /// Record one forge call. Never blocks or fails the caller: a poisoned lock
 /// or an unwritable sink is silently skipped.
 pub fn record(
     caller: &'static str,
+    pool: Pool,
+    outcome: Outcome,
+    headers: Option<&RateLimitHeaders>,
+) {
+    record_with_identity(caller, &CallIdentity::default(), pool, outcome, headers);
+}
+
+/// [`record`] plus the #9777 call identity. An identity with no operation is
+/// recorded as [`UNKNOWN_OPERATION`] rather than as an absent field, so an
+/// un-migrated call site is *visible* in the accounting instead of silently
+/// indistinguishable from one that has no operation at all.
+pub fn record_with_identity(
+    caller: &'static str,
+    identity: &CallIdentity,
     pool: Pool,
     outcome: Outcome,
     headers: Option<&RateLimitHeaders>,
@@ -171,6 +410,15 @@ pub fn record(
         rem: headers.and_then(|h| h.remaining),
         usd: headers.and_then(|h| h.used),
         rst: headers.and_then(|h| h.reset_epoch),
+        op: Some(
+            identity
+                .operation
+                .clone()
+                .unwrap_or_else(|| UNKNOWN_OPERATION.to_string()),
+        ),
+        pv: identity.provider.clone(),
+        og: identity.origin.clone(),
+        rp: identity.repo.clone(),
     };
     if let Ok(mut state) = process_state().lock() {
         state.add(&line);
@@ -201,6 +449,18 @@ struct SinkLine {
     usd: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rst: Option<i64>,
+    /// Inventoried operation ID (#9777); `unknown` for an un-migrated caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    op: Option<String>,
+    /// Provider family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pv: Option<String>,
+    /// Origin host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    og: Option<String>,
+    /// `owner/repo` slug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rp: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -209,6 +469,16 @@ struct Counts {
     not_modified: u64,
     rate_limited: u64,
     error: u64,
+}
+
+/// Add one outcome to a counter bucket.
+fn bump(c: &mut Counts, outcome: Outcome) {
+    match outcome {
+        Outcome::Ok => c.ok += 1,
+        Outcome::NotModified => c.not_modified += 1,
+        Outcome::RateLimited => c.rate_limited += 1,
+        Outcome::Error => c.error += 1,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,23 +492,29 @@ struct Reading {
     observed_at: i64,
 }
 
+/// The #9777 call-identity key: operation × provider × origin × repo. Bounded
+/// by the inventory's size times the number of distinct repositories a host
+/// touches, never by call volume.
+type IdentityKey = (String, Option<String>, Option<String>, Option<String>);
+
 /// Counts per `(caller, pool)` plus the newest header reading per pool.
 /// Bounded by the number of distinct callers × pools, never by call volume.
 #[derive(Debug, Default)]
 struct Aggregate {
     started_at: i64,
     counts: BTreeMap<(String, Pool), Counts>,
+    identities: BTreeMap<IdentityKey, Counts>,
     latest: BTreeMap<Pool, Reading>,
 }
 
 impl Aggregate {
     fn add(&mut self, line: &SinkLine) {
         let c = self.counts.entry((line.c.clone(), line.p)).or_default();
-        match line.o {
-            Outcome::Ok => c.ok += 1,
-            Outcome::NotModified => c.not_modified += 1,
-            Outcome::RateLimited => c.rate_limited += 1,
-            Outcome::Error => c.error += 1,
+        bump(c, line.o);
+        if let Some(operation) = line.op.clone() {
+            let key: IdentityKey = (operation, line.pv.clone(), line.og.clone(), line.rp.clone());
+            let i = self.identities.entry(key).or_default();
+            bump(i, line.o);
         }
         if let Some(remaining) = line.rem {
             let newer = self
@@ -276,6 +552,23 @@ impl Aggregate {
             .map(|((caller, pool), c)| ForgeCallCounts {
                 caller: caller.clone(),
                 pool: pool.as_str().to_string(),
+                ok: c.ok,
+                not_modified: c.not_modified,
+                rate_limited: c.rate_limited,
+                error: c.error,
+            })
+            .collect()
+    }
+
+    /// The #9777 identity rows (operation × provider × origin × repo).
+    fn identity_rows(&self) -> Vec<ForgeOperationCounts> {
+        self.identities
+            .iter()
+            .map(|((operation, provider, origin, repo), c)| ForgeOperationCounts {
+                operation: operation.clone(),
+                provider: provider.clone(),
+                origin: origin.clone(),
+                repo: repo.clone(),
                 ok: c.ok,
                 not_modified: c.not_modified,
                 rate_limited: c.rate_limited,
@@ -485,6 +778,7 @@ pub fn status_report(
     }
     ForgeCallsStatus {
         window_secs: WINDOW_SECS.unsigned_abs(),
+        operations: window.as_ref().map(Aggregate::identity_rows),
         host_window: window.map(|w| w.rows()),
         since_start,
         since,

@@ -521,7 +521,7 @@ impl GhPipelineSource {
     /// two definitions can never drift apart again.
     fn queued_search_query() -> String {
         let mut query = "is:open label:loom:issue".to_string();
-        for label in crate::work_finder::PARK_LABELS {
+        for label in crate::work_finder::PARK_LABELS.iter() {
             query.push_str(&format!(" -label:{label}"));
         }
         query
@@ -538,7 +538,7 @@ impl GhPipelineSource {
     fn changes_requested_unclaimed_search_query() -> String {
         let mut query =
             "is:open is:pr label:loom:changes-requested -label:loom:treating".to_string();
-        for label in crate::work_finder::PARK_LABELS {
+        for label in crate::work_finder::PARK_LABELS.iter() {
             query.push_str(&format!(" -label:{label}"));
         }
         query
@@ -1012,7 +1012,7 @@ mod tests {
         let query = GhPipelineSource::queued_search_query();
         assert!(query.contains("is:open"));
         assert!(query.contains("label:loom:issue"));
-        for label in crate::work_finder::PARK_LABELS {
+        for label in crate::work_finder::PARK_LABELS.iter() {
             assert!(
                 query.contains(&format!("-label:{label}")),
                 "expected '-label:{label}' in query: {query}"
@@ -1038,7 +1038,7 @@ mod tests {
             query.contains("-label:loom:treating"),
             "expected '-label:loom:treating' in query: {query}"
         );
-        for label in crate::work_finder::PARK_LABELS {
+        for label in crate::work_finder::PARK_LABELS.iter() {
             assert!(
                 query.contains(&format!("-label:{label}")),
                 "expected '-label:{label}' in query: {query}"

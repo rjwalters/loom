@@ -72,14 +72,16 @@ SELECT 'v1', '1970-01-01T00:00:00Z', NULL;
 -- lines"); files and tokens are cross-checks. These are medians, not
 -- bounds — the class bounds CAL5 needs are DERIVED from them (log-midway
 -- between adjacent medians) so they are never written down twice.
+-- VALUES, not UNION ALL — D1 caps compound SELECT at 5 terms (#10066).
 CREATE VIEW IF NOT EXISTS rubric_classes
     (revision, size_class, hw_lines_median, hw_files_median, tokens_median) AS
-          SELECT 'v1', '1',  12, 1, 14000000
-UNION ALL SELECT 'v1', '2', 110, 2, 19000000
-UNION ALL SELECT 'v1', '3', 285, 4, 30000000
-UNION ALL SELECT 'v1', '5', 610, 6, 50000000
-UNION ALL SELECT 'v1', '8', 1000, 8, 73000000
-UNION ALL SELECT 'v1', '13', 2000, 8, 110000000;
+VALUES
+    ('v1', '1',  12, 1, 14000000),
+    ('v1', '2', 110, 2, 19000000),
+    ('v1', '3', 285, 4, 30000000),
+    ('v1', '5', 610, 6, 50000000),
+    ('v1', '8', 1000, 8, 73000000),
+    ('v1', '13', 2000, 8, 110000000);
 
 -- Every LANDING sweep in the window, sized or not, classified clean vs
 -- churn. The landing predicate mirrors `landed-size.sql`'s `landings` CTE
