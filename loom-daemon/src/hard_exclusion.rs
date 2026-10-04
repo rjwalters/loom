@@ -23,11 +23,14 @@
 //!
 //! # Where the list lives
 //!
-//! [`HARD_EXCLUSION_LABELS`] below is the value the daemon uses. It is a
-//! compile-time const on purpose: this list is consulted once per candidate
-//! per work-finder tick, so it must not shell out, read a file, or depend on a
-//! resolved repo root — all three are costs the pre-#7528 filter did not pay
-//! and all three can fail in ways that would silently *weaken* an exclusion.
+//! [`HARD_EXCLUSION_LABELS`] below is the value the daemon uses. It is derived
+//! from the label registry's `hard_exclusion` property (`defaults/labels.json`,
+//! #10013), which is embedded in the binary at build time on purpose: this
+//! list is consulted once per candidate per work-finder tick, so it must not
+//! shell out, read a file, or depend on a resolved repo root — all three are
+//! costs the pre-#7528 filter did not pay and all three can fail in ways that
+//! would silently *weaken* an exclusion. The embedded registry is parsed once
+//! per process.
 //!
 //! The shell/markdown side reads `defaults/scripts/hard-exclusion-labels.sh`,
 //! which carries the same list in one array plus the `--jq-not` / `--search`
@@ -52,10 +55,12 @@
 /// Labels that exclude an issue from **every** automated role and from
 /// work-finder dispatch, until a maintainer removes the label (Issue #7528).
 ///
+/// Derived from the registry's `hard_exclusion` property, in registry order.
 /// Kept in lockstep with `defaults/scripts/hard-exclusion-labels.sh` by
 /// [`tests::rust_const_matches_shipped_shell_script`]. Edit both (the test
 /// will tell you if you forgot one).
-pub const HARD_EXCLUSION_LABELS: &[&str] = &["external"];
+pub static HARD_EXCLUSION_LABELS: crate::label_registry::LabelSet =
+    crate::label_registry::LabelSet::new(|| crate::label_registry::embedded_set("hard_exclusion"));
 
 /// The first [`HARD_EXCLUSION_LABELS`] entry `labels` carries, or `None` when
 /// the issue carries none of them (the overwhelmingly common case).
@@ -179,7 +184,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("run {} --jq-not: {e}", script.display()));
         assert!(out.status.success(), "--jq-not exited non-zero");
         let rendered = String::from_utf8_lossy(&out.stdout);
-        for label in HARD_EXCLUSION_LABELS {
+        for label in HARD_EXCLUSION_LABELS.iter() {
             assert!(
                 rendered.contains(&format!("contains([\"{label}\"]) | not")),
                 "--jq-not output {rendered:?} does not exclude {label}"

@@ -1141,7 +1141,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         },
         decline_cooldown_config.cooldown.as_secs(),
         decline_cooldown_config.warn_threshold,
-        loom_daemon::hard_exclusion::HARD_EXCLUSION_LABELS
+        loom_daemon::hard_exclusion::HARD_EXCLUSION_LABELS.as_slice()
     );
 
     // PR-less retry bound (#7972): resolve env > config > default for the
