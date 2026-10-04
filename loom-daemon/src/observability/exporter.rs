@@ -616,6 +616,8 @@ mod tests {
                 is_captain: None,
                 armed_singleton_jobs: Vec::new(),
                 captainless_singleton_jobs: Vec::new(),
+                exported_kinds: Vec::new(),
+                exporters: Vec::new(),
                 memory: None,
             }),
         )

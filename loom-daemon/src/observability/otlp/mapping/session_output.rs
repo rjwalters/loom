@@ -660,6 +660,7 @@ mod tests {
             "loom.attempt",
             "loom.runtime",
             "loom.role",
+            "loom.record_id",
         ];
         let mut seen = std::collections::BTreeSet::new();
         for record in records {
