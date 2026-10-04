@@ -32,7 +32,7 @@
 //!   the journal's span is not visible.
 
 use super::ready::plan_max_age_secs;
-use super::{Item, ItemKey, ReadyPlan, ReadyRow, Tracker};
+use super::{EstimateContext, Item, ItemKey, ReadyPlan, ReadyRow, Tracker};
 use crate::eta::explanation::{FeatureOmitted, Features};
 use crate::eta::journal::JournalEntry;
 use crate::eta::labels::stage_from_pr_labels;
@@ -310,7 +310,7 @@ impl Tracker {
         item: &Item,
         current: &CurrentState,
         ready_only: bool,
-        host_id: Option<&str>,
+        ctx: &EstimateContext<'_>,
         now: DateTime<Utc>,
     ) -> (Features, Vec<FeatureOmitted>) {
         let mut features = Features {
@@ -320,7 +320,7 @@ impl Tracker {
             pr_created_at: item.pr_created_at,
             hour_utc: Some(now.hour()),
             weekday_utc: Some(now.weekday().num_days_from_monday()),
-            host_id: host_id.map(str::to_string),
+            host_id: ctx.host_id.map(str::to_string),
             queue_rank: item
                 .ready
                 .as_ref()
@@ -353,6 +353,7 @@ impl Tracker {
         };
         self.queue_features_at(&subject, now)
             .write_to(&mut features, &mut omitted);
+        self.item_features(key, item, ctx.history, now, &mut features, &mut omitted);
         (features, omitted)
     }
 }

@@ -150,6 +150,9 @@ struct Item {
     in_ready_queue: bool,
     /// Its plan position, when the plan gives it one.
     ready: Option<DispatchInput>,
+    /// Issue, sweep and verdict observations, each with its `known_at`
+    /// (#10231).
+    facts: item_facts::ItemFacts,
 }
 
 /// A PR row from a review-label listing.
@@ -551,7 +554,7 @@ impl Tracker {
                 _ => None,
             };
             if let Some((stage, verdict)) = settled {
-                let row = self.settle_verdict(&key, stage, verdict, since, true);
+                let row = self.settle_verdict(&key, stage, verdict, since, true, at);
                 effects.journal.push(row);
             }
         }
@@ -620,6 +623,7 @@ impl Tracker {
         verdict: &str,
         since: DateTime<Utc>,
         in_sweep: bool,
+        known_at: DateTime<Utc>,
     ) -> JournalEntry {
         let item = self
             .items
@@ -627,6 +631,8 @@ impl Tracker {
             .unwrap_or_else(|| unreachable!("caller created it"));
         item.verdict_pending_since = None;
         let attempt = item.rework_rounds + 1;
+        item.facts
+            .note_verdict(attempt, verdict == "pass", known_at);
         if stage == Stage::Doctor {
             item.rework_rounds += 1;
         }
@@ -766,7 +772,7 @@ impl Tracker {
                     _ => None,
                 };
                 if let Some((stage, verdict)) = settled {
-                    let mut row = self.settle_verdict(&key, stage, verdict, since, true);
+                    let mut row = self.settle_verdict(&key, stage, verdict, since, true, now);
                     row.raw = serde_json::json!({"labels": pr.labels});
                     effects.journal.push(row);
                     effects.dirty.push(key);
@@ -790,6 +796,9 @@ impl Tracker {
                 _ => None,
             };
             let attempt = item.rework_rounds + 1;
+            if let Some(verdict) = verdict {
+                item.facts.note_verdict(attempt, verdict == "pass", now);
+            }
             if stage == Stage::Doctor {
                 item.rework_rounds += 1;
             }
@@ -1126,7 +1135,7 @@ impl Tracker {
         subject.pr_number = item.pr_number;
         subject.sweep_id = item.sweep_id.clone().filter(|_| item.sweep_running);
         let (mut features, mut omitted) =
-            self.features_for(key, item, &current, ready_only, ctx.host_id, now);
+            self.features_for(key, item, &current, ready_only, ctx, now);
         let labels = (!item.labels.is_empty()).then_some(item.labels.as_slice());
         self.friction
             .apply(&item.repo, item.pr_number, labels, now, &mut features, &mut omitted);
@@ -1225,6 +1234,11 @@ mod ready;
 
 #[path = "tracker_features.rs"]
 mod features;
+
+#[path = "tracker_item.rs"]
+mod item_facts;
+
+pub use item_facts::{DispatchMeta, IssueRow, RegistryMeta};
 
 pub use features::{events_from_journal, ListedPr, NOT_LISTED_YET};
 
