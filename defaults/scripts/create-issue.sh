@@ -53,7 +53,7 @@
 #                         is linked as a native sub-issue (best effort) and,
 #                         when N carries loom:operator-priority, starred with
 #                         the inherited audit comment. Logic: `loom-daemon
-#                         forge parent`; needs loom-daemon (exit 1 if absent).
+#                         forge parent`; needs loom-daemon (127 if absent; a bad N exits 2).
 #
 # Output: the new issue's URL on stdout (identical to `gh issue create`).
 #
@@ -217,10 +217,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --parent)
       PARENT="${2:-}"
-      if [[ ! "$PARENT" =~ ^[0-9]+$ ]]; then
-        echo "create-issue.sh: --parent takes an issue number (got '${PARENT}'); nothing was filed" >&2
-        exit 2
-      fi
       shift 2
       ;;
     --duplicate-threshold)
@@ -281,12 +277,10 @@ fi
 # duplicate backstop below sees "#N" as cross-referenced and the filed body
 # carries the link from its first revision. No daemon, no --parent: a silent
 # fallback would file a child with no edge.
-# The daemon validates N (a non-number fails here, before anything is filed).
-if [[ -n "${PARENT:-}" ]]; then
-  command -v loom-daemon >/dev/null 2>&1 \
-    || { echo "create-issue.sh: --parent needs loom-daemon on PATH (nothing was filed)" >&2; exit 1; }
-  BODY="$(printf '%s' "$BODY" | loom-daemon forge parent body --parent "$PARENT" ${REPO_NWO:+--repo "$REPO_NWO"})" \
-    || { echo "create-issue.sh: could not add the parent marker (nothing was filed)" >&2; exit 1; }
+# The daemon validates N (clap: a non-number, or an empty `--parent ""`, exits 2
+# here, before anything is filed); `${PARENT+x}` keeps an empty value "present".
+if [[ -n "${PARENT+x}" ]]; then
+  BODY="$(printf '%s' "$BODY" | loom-daemon forge parent body --parent "$PARENT" ${REPO_NWO:+--repo "$REPO_NWO"})" || exit "$?"
 fi
 
 # Detection backstop (#6771, deferred from #6714's filing-lock): warn -- never

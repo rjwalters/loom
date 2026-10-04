@@ -595,7 +595,7 @@ assert_contains "$(cat "$GH_CREATES")" "loom:parent #7" "the parent marker is in
 assert_contains "$(cat "$DAEMON_ARGS")" "forge parent body --parent 7" "forge parent body ran with the parent number"
 assert_contains "$(cat "$DAEMON_ARGS")" "forge parent link --parent 7" "forge parent link ran after filing"
 
-# No daemon on PATH: exit 1, nothing filed.
+# No daemon on PATH: the shell reports it (127), nothing filed.
 NODAEMON_BIN="$WORK/nodaemon-bin"
 mkdir -p "$NODAEMON_BIN"
 cp "$FAKE_BIN/gh" "$NODAEMON_BIN/gh"
@@ -606,17 +606,29 @@ OUT="$(PATH="$NODAEMON_BIN:/usr/bin:/bin" LOOM_FORGE_TYPE=github LOOM_FILING_LOC
     STUB_GH_CREATES="$GH_CREATES" bash "$CREATE_ISSUE" --title "Orphan" --body "Body." --parent 7 2>&1)"
 RC=$?
 FAKE_BIN="$OLD_FAKE_BIN"
-assert_eq "$RC" "1" "--parent with no loom-daemon exits 1"
-assert_contains "$OUT" "needs loom-daemon" "…and says why"
+assert_eq "$RC" "127" "--parent with no loom-daemon exits 127 (command not found)"
+assert_contains "$OUT" "loom-daemon" "…and names the missing binary"
 assert_eq "$(cat "$GH_CREATES")" "" "…and nothing was filed"
 
-# An explicitly empty or non-numeric --parent is an argument error, not "absent".
+# An explicitly empty or non-numeric --parent is an argument error, not "absent":
+# the daemon (clap's u32) rejects it with exit 2 and the script propagates that
+# before filing. The stub mimics clap's rejection of a non-number.
+cat > "$PARENT_BIN/loom-daemon" << 'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "forge" && "${2:-}" == "parent" && "${3:-}" == "body" ]]; then
+    [[ "${5:-}" =~ ^[0-9]+$ ]] || { echo "error: invalid value '${5:-}' for '--parent <PARENT>'" >&2; exit 2; }
+fi
+exit 0
+STUB
+OLD_FAKE_BIN="$FAKE_BIN"
+FAKE_BIN="$PARENT_BIN:$FAKE_BIN"
 for BAD_PARENT in "" "abc"; do
     run_create --title "Bad parent" --body "Body." --parent "$BAD_PARENT"
     assert_eq "$RC" "2" "--parent '$BAD_PARENT' exits 2"
-    assert_contains "$OUT" "--parent takes an issue number" "…and says why"
+    assert_contains "$OUT" "invalid value" "…and says why"
     assert_eq "$(cat "$GH_CREATES")" "" "…and nothing was filed"
 done
+FAKE_BIN="$OLD_FAKE_BIN"
 
 echo
 echo "=== $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed ==="
