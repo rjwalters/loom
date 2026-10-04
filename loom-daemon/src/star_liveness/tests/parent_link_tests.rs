@@ -91,3 +91,32 @@ fn sub_issue_link_uses_the_database_id() {
     assert_eq!(args[3], "repos/o/r/issues/7/sub_issues");
     assert_eq!(args[5], "sub_issue_id=123456");
 }
+
+#[test]
+fn failed_audit_post_rolls_the_star_back_and_a_retry_succeeds() {
+    let world = World::default();
+    world.add(SLUG, issue(7, &[STAR]));
+    world.add(SLUG, issue(8, &[]));
+    let mut f = world.forge(SLUG);
+    world.repo(SLUG).fail_post = true;
+    assert!(star_child(&mut *f, 7, 8, None).is_err());
+    assert!(
+        !world.repo(SLUG).items[&8].labels.iter().any(|l| l == STAR),
+        "no star without its provenance"
+    );
+    world.repo(SLUG).fail_post = false;
+    assert_eq!(star_child(&mut *f, 7, 8, None).unwrap(), StarOutcome::Starred);
+    assert_eq!(world.posted(SLUG).len(), 1);
+}
+
+#[test]
+fn restar_after_unstar_posts_a_fresh_audit_despite_the_old_one() {
+    let world = World::default();
+    world.add(SLUG, issue(7, &[STAR]));
+    world.add(SLUG, issue(8, &[]));
+    let mut f = world.forge(SLUG);
+    assert_eq!(star_child(&mut *f, 7, 8, None).unwrap(), StarOutcome::Starred);
+    f.remove_label(8, STAR).unwrap();
+    assert_eq!(star_child(&mut *f, 7, 8, None).unwrap(), StarOutcome::Starred);
+    assert_eq!(world.posted(SLUG).len(), 2, "one audit per labeling generation");
+}

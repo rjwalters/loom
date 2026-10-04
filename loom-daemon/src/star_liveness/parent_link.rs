@@ -21,8 +21,7 @@
 use anyhow::Result;
 
 use super::forge::StarForge;
-use super::inherited_star::{intent_id, marker};
-use super::intents::INTENT_MARKER_PREFIX;
+use super::inherited_star::marker;
 use crate::work_finder::OPERATOR_PRIORITY_LABEL;
 
 /// The red-main fix marker the work finder reads (at the start of a line).
@@ -77,8 +76,9 @@ pub enum StarOutcome {
 ///
 /// `starred_at` is the **parent's** starred-at (carried as the marker's
 /// `requested_at`, so the child orders at the parent's star time).
-/// Idempotent: the label add is a no-op when present, and the audit comment
-/// is skipped when one with this intent id exists.
+/// Idempotent: a child that already carries the star is left untouched. The
+/// label and its audit comment are written together or not at all: a failed
+/// audit post rolls the label back.
 ///
 /// # Errors
 /// A forge read or write failed.
@@ -103,13 +103,21 @@ pub fn star_child(
         return Ok(StarOutcome::AlreadyStarred);
     }
     forge.add_label(child, OPERATOR_PRIORITY_LABEL)?;
-    let id_marker = format!("{INTENT_MARKER_PREFIX}{} ", intent_id(parent, child));
-    if !forge
-        .comments(child)?
-        .iter()
-        .any(|c| c.body.contains(&id_marker))
-    {
-        forge.post_comment(child, &marker(parent, child, starred_at))?;
+    // The star is ours (it was absent a line ago), so this labeling generation
+    // has no audit yet: always post, never dedupe against an older comment
+    // (a star -> unstar -> re-star cycle leaves the previous generation's
+    // audit behind, and the owner rule would read it as pre-dating the label).
+    if let Err(e) = forge.post_comment(child, &marker(parent, child, starred_at)) {
+        // A star with no provenance would read as the operator's own, and the
+        // next call would see it as `AlreadyStarred` and never repair it. Take
+        // back the label we just wrote so a retry starts clean.
+        return Err(match forge.remove_label(child, OPERATOR_PRIORITY_LABEL) {
+            Ok(()) => e.context(format!("audit comment on #{child} failed; star rolled back")),
+            Err(re) => e.context(format!(
+                "audit comment on #{child} failed and the star could not be rolled back ({re}): \
+                 remove {OPERATOR_PRIORITY_LABEL} from #{child} and retry"
+            )),
+        });
     }
     Ok(StarOutcome::Starred)
 }

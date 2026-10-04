@@ -49,6 +49,21 @@ fn target(repo: Option<String>) -> Result<(PathBuf, String)> {
     Ok((root, slug))
 }
 
+/// The child's issue number, refusing a reference into another repository
+/// (#10012 excludes cross-repo propagation): nothing is written for it.
+fn child_number(child: &str, slug: &str) -> Result<u32> {
+    let (child_slug, number) = loom_daemon::forge_comment::parse_issue_ref(child)
+        .ok_or_else(|| anyhow!("--child: not an issue reference: {child:?}"))?;
+    if let Some(named) = child_slug {
+        if !named.eq_ignore_ascii_case(slug) {
+            return Err(anyhow!(
+                "--child {child:?} names {named}, but the target repo is {slug}: cross-repo parent links are not supported"
+            ));
+        }
+    }
+    Ok(u32::try_from(number)?)
+}
+
 pub fn handle(action: ParentAction) -> Result<()> {
     match action {
         ParentAction::Body { parent, repo } => {
@@ -71,11 +86,8 @@ pub fn handle(action: ParentAction) -> Result<()> {
             child,
             repo,
         } => {
-            let number = loom_daemon::forge_comment::parse_issue_ref(&child)
-                .map(|(_, n)| n)
-                .ok_or_else(|| anyhow!("--child: not an issue reference: {child:?}"))?;
-            let number = u32::try_from(number)?;
             let (root, slug) = target(repo)?;
+            let number = child_number(&child, &slug)?;
             match link_created(&root, &slug, parent, number)? {
                 StarOutcome::Starred => {
                     eprintln!(
@@ -86,5 +98,29 @@ pub fn handle(action: ParentAction) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::child_number;
+
+    #[test]
+    fn bare_and_matching_references_resolve() {
+        assert_eq!(child_number("8", "o/r").unwrap(), 8);
+        assert_eq!(child_number("o/r#8", "o/r").unwrap(), 8);
+        assert_eq!(child_number("O/R#8", "o/r").unwrap(), 8);
+        assert_eq!(child_number("https://github.com/o/r/issues/8", "o/r").unwrap(), 8);
+    }
+
+    #[test]
+    fn another_repository_is_rejected() {
+        assert!(child_number("other/repo#8", "o/r").is_err());
+        assert!(child_number("https://github.com/other/repo/issues/8", "o/r").is_err());
+    }
+
+    #[test]
+    fn a_non_reference_is_rejected() {
+        assert!(child_number("nope", "o/r").is_err());
     }
 }
