@@ -212,7 +212,7 @@ fn provenance_validation_requires_full_sha_and_known_state() {
 #[test]
 fn registry_resolves_current_per_kind() {
     let registry = Registry::builtin();
-    assert_eq!(registry.ids(), vec!["start-v1", "finish-v1", "land-v1", "land-v2"]);
+    assert_eq!(registry.ids(), vec!["start-v1", "finish-v1", "land-v1", "land-v2", "land-v3"]);
     assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
     assert_eq!(registry.current(Kind::Finish, None).id(), "finish-v1");
     // A configured id of the wrong kind, or an unknown one, falls back.
@@ -221,6 +221,9 @@ fn registry_resolves_current_per_kind() {
     // A registered candidate IS selectable as current — that is what the
     // promotion switch flips (#9328).
     assert_eq!(registry.current(Kind::Land, Some("land-v2")).id(), "land-v2");
+    // `land-v3` (#9970) ships registered, not current: the default is
+    // unchanged, and only an explicit config selects it.
+    assert_eq!(registry.current(Kind::Land, Some("land-v3")).id(), "land-v3");
 }
 
 #[test]
@@ -228,7 +231,7 @@ fn for_kind_enumerates_every_registered_heuristic_of_a_kind() {
     let registry = Registry::builtin();
     // The shadow-mode input (#9328): `current` is one of these, not all of it.
     let land: Vec<&str> = registry.for_kind(Kind::Land).map(Heuristic::id).collect();
-    assert_eq!(land, vec!["land-v1", "land-v2"]);
+    assert_eq!(land, vec!["land-v1", "land-v2", "land-v3"]);
     assert_eq!(
         registry
             .for_kind(Kind::Finish)

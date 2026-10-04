@@ -227,6 +227,34 @@ pub struct Distribution {
     pub p75: i64,
     /// 90th percentile.
     pub p90: i64,
+    /// How a calibrating heuristic (`land-v3`, #9970) derived `grid_sec`
+    /// from the raw grid. Absent — and `grid_sec` is the raw grid — for
+    /// every heuristic that draws from history unadjusted, so every earlier
+    /// heuristic's explanation is byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjustment: Option<StageAdjustment>,
+}
+
+/// The transform a calibrating heuristic applied to one stage's raw grid,
+/// in order: stretch about the raw median, scale, offset, floor. Recorded so
+/// the adjusted grid (what the simulation draws from) can be traced back to
+/// the history it came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageAdjustment {
+    /// The raw grid's median, before any adjustment.
+    pub raw_p50: i64,
+    /// Factor applied to each grid point's distance above the raw median.
+    pub upper_stretch: f64,
+    /// Factor applied to each grid point's distance below the raw median.
+    pub lower_stretch: f64,
+    /// Multiplier on every grid point (complexity scaling); `1.0` = none.
+    pub scale: f64,
+    /// What `scale` came from: `points:<n>`, or `none`.
+    pub scale_basis: String,
+    /// Seconds added to every grid point (queue friction); `0` = none.
+    pub offset_sec: i64,
+    /// Lowest value any grid point may take; `0` = none.
+    pub floor_sec: i64,
 }
 
 /// The sample filter a distribution was built with.

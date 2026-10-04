@@ -174,6 +174,7 @@ in-sweep half and takes the forge's word for the human-gated half.
 | `finish-v1` | `finish` | in-sweep phase durations (`sweep-outcome-telemetry.jsonl`) | after the in-sweep merge when at least half of the history's successful sweeps merged themselves, else at the verdict |
 | `land-v1` | `land` | in-sweep phases and the stage-sample journal (turnovers too, for an unstarted issue) | after `merge_wait` |
 | `land-v2` | `land` | the same, with **right-censored** stage samples folded in (Kaplan–Meier grids) | after `merge_wait` |
+| `land-v3` | `land` | `land-v2`'s, with each stage grid calibrated first: widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored (recorded per stage as `distribution.adjustment`; #9970) | after `merge_wait` |
 
 A shipped id is **immutable**: a golden test pins each id's output on a fixed
 fixture. A behaviour change is a new id registered beside the old one
@@ -217,6 +218,8 @@ fixture. A behaviour change is a new id registered beside the old one
 
 `land-v2` ships registered-not-current on purpose, as the worked example of
 all of the above.
+`land-v3` (#9970) ships the same way: its constants are fixture-derived,
+and the live coverage/pinball result is the operator's backtest, not a claim.
 
 ## The explanation (`eta-explanation/v1`)
 

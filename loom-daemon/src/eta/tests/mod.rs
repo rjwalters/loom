@@ -9,6 +9,7 @@ mod estimate;
 mod explanation;
 mod fleet;
 mod journal;
+mod land_v3;
 mod primitives;
 mod ready;
 mod score;

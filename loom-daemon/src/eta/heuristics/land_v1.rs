@@ -38,6 +38,7 @@ impl Heuristic for LandV1 {
                 sources: &[SampleSource::SweepOutcome, SampleSource::StageJournal],
                 always_merge: true,
                 censoring: false,
+                adjust: None,
             },
             input,
             history,

@@ -1,22 +1,28 @@
-//! The shipped heuristics. `start-v1`, `finish-v1` and `land-v1` share one
-//! engine ([`estimate_path`]); they differ in which history they read and
-//! where the path ends. Their ids are immutable: a behaviour change is a new
+//! The shipped heuristics. `start-v1`, `finish-v1`, `land-v1`, `land-v2` and
+//! `land-v3` share one engine ([`estimate_path`]); they differ in which
+//! history they read, where the path ends, and (`land-v3`) how each stage's
+//! grid is calibrated. Their ids are immutable: a behaviour change is a new
 //! id.
 
 mod finish_v1;
 mod land_v1;
 mod land_v2;
+mod land_v3;
 mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
 pub use land_v1::{LandV1, LAND_V1};
 pub use land_v2::{LandV2, LAND_V2};
+pub use land_v3::{
+    complexity_scale, story_points, LandV3, COMPLEXITY_ELASTICITY, FRICTION_SEC_PER_RUNNING_SWEEP,
+    INPUT_MISSING, LAND_V3, LOWER_STRETCH, REFERENCE_POINTS, REVIEW_FLOOR_SEC, UPPER_STRETCH,
+};
 pub use start_v1::{StartV1, START_V1};
 
 use super::explanation::{
     Branches, ChangesRequested, Combination, Conditioning, CurrentStageRecord, DispatchRecord,
     Distribution, EstimateResult, Explanation, Filters, HistoryRecord, HistoryWindow, PathRecord,
-    StageEntry,
+    StageAdjustment, StageEntry,
 };
 use super::history::{window_from, Level, SampleSource, StageSamples};
 use super::simulate::{may_reject, reachable_path, run, spec_from_explanation};
@@ -46,7 +52,16 @@ pub(crate) struct PathRules {
     /// lower bounds (#9328). `false`: the plain nearest-rank grid over the
     /// observed durations alone — every v1 heuristic.
     pub censoring: bool,
+    /// A calibrating heuristic's per-stage grid transform (#9970), applied
+    /// to the raw grid before conditioning and simulation, so the explanation
+    /// records — and recomputes from — the grid actually drawn from. `None`
+    /// for every heuristic that draws from history unadjusted.
+    pub adjust: Option<GridAdjust>,
 }
+
+/// `(stage, input, raw grid) → (grid, what was done)`. Must be pure.
+pub(crate) type GridAdjust =
+    fn(Stage, &EstimateInput, Vec<i64>) -> (Vec<i64>, Option<StageAdjustment>);
 
 /// Round to six decimals — every float the simulation reads is stored
 /// rounded, so the JSON value parses back to the exact `f64` used.
@@ -290,7 +305,10 @@ fn finish_estimate(
         } else {
             Vec::new()
         };
-        let grid_sec = grid::km_grid_of(sorted, &censored);
+        let (grid_sec, adjustment) = match rules.adjust {
+            Some(adjust) => adjust(stage, input, grid::km_grid_of(sorted, &censored)),
+            None => (grid::km_grid_of(sorted, &censored), None),
+        };
         // A queue wait is never age-conditioned (see `simulate`).
         let conditioning = if stage == start && age > 0 && stage != Stage::ReadyWait {
             // A censored sample longer than the age is evidence the stage can
@@ -313,6 +331,7 @@ fn finish_estimate(
                     sorted,
                     &censored,
                     grid_sec,
+                    adjustment,
                     Some(record),
                 ));
                 return refuse(explanation, NoEstimateReason::BeyondHistory);
@@ -329,6 +348,7 @@ fn finish_estimate(
             sorted,
             &censored,
             grid_sec,
+            adjustment,
             conditioning,
         ));
     }
@@ -399,6 +419,7 @@ fn stage_entry(
     sorted: &[i64],
     censored: &[i64],
     grid_sec: Vec<i64>,
+    adjustment: Option<StageAdjustment>,
     conditioning: Option<Conditioning>,
 ) -> StageEntry {
     // The quartiles are read off the same grid the simulation draws from, so
@@ -432,6 +453,7 @@ fn stage_entry(
             p50,
             p75,
             p90,
+            adjustment,
         },
         conditioning,
         reached_with_probability: None,
