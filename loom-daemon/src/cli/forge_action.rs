@@ -435,6 +435,30 @@ pub(crate) enum ForgeAction {
         gh_shape: bool,
     },
 
+    /// `forge verdict-stale-notice --label L --marker-sha M --head-sha H
+    /// [--source S]` (#9709) — print the stale-verdict audit comment for a
+    /// `M -> H` invalidation, rendered by the SAME template the daemon's pass
+    /// posts. Reads the PR's RAW (unfiltered) REST comment listing on stdin:
+    /// when a marker newer than the newest trusted one was dropped as
+    /// untrusted, the notice names its login and `author_association` and
+    /// points at `forge.trustedCommenters` instead of asserting a head move.
+    /// Unreadable stdin yields the plain wording. Exits 1 on an unknown label.
+    #[command(name = "verdict-stale-notice")]
+    VerdictStaleNotice {
+        /// The verdict label being cleared (`loom:pr` / `loom:changes-requested`).
+        #[arg(long)]
+        label: String,
+        /// The SHA the newest trusted marker records.
+        #[arg(long)]
+        marker_sha: String,
+        /// The PR's current head SHA.
+        #[arg(long)]
+        head_sha: String,
+        /// The attribution footer's source.
+        #[arg(long, default_value = "verdict-staleness-guard.sh")]
+        source: String,
+    },
+
     /// `forge may-write [--repo OWNER/REPO]` (#9548) — may this installation
     /// write (comment, label, merge, lease) to the repository? Yes only when
     /// it is managed here (origin of a registered workspace or of this Loom
@@ -613,6 +637,19 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         } => {
             let fetch = fetch.map(|n| (n, repo, with_body));
             return super::forge_identity_cmd::trusted_comments(self_login, fetch, gh_shape);
+        }
+        ForgeAction::VerdictStaleNotice {
+            label,
+            marker_sha,
+            head_sha,
+            source,
+        } => {
+            return super::forge_identity_cmd::verdict_stale_notice(
+                &label,
+                &marker_sha,
+                &head_sha,
+                &source,
+            );
         }
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),

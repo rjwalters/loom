@@ -363,22 +363,13 @@ pub(crate) fn decide(issue: u32, evidence: &ClaimEvidence, force_claim: bool) ->
 /// (`SweepRegistry::classify_preflip_labels` — same `gh issue view --json
 /// labels` call, same fail-closed `Unknown` on any unreadable answer).
 pub(crate) fn read_claim_labels(gh_bin: &Path, root: &Path, issue: u32) -> LabelLeg {
-    let mut cmd = std::process::Command::new(gh_bin);
-    cmd.arg("issue")
-        .arg("view")
-        .arg(issue.to_string())
-        .arg("--json")
-        .arg("labels");
-    cmd.current_dir(root);
-    // #5401: cross-owner managed repo -> its own owner's installation-token
-    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    // Same LOOM_REPO handling as the collision guard's read: `gh issue view`
-    // takes a --repo flag (unlike `gh api`, #8263).
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
-    }
-    let Ok(out) = cmd.output() else {
+    // #10089: counted via the facade (`claim.labels`); it supplies the #5401
+    // cross-owner GH_CONFIG_DIR from `root`. `gh issue view` takes --repo
+    // (unlike `gh api`, #8263).
+    let inv = crate::claim_reconciliation::gh_call::read("claim.labels", gh_bin, root)
+        .args(["issue", "view", &issue.to_string(), "--json", "labels"])
+        .args(crate::claim_reconciliation::gh_call::loom_repo_flag());
+    let Ok(out) = crate::claim_reconciliation::gh_call::output(inv) else {
         return LabelLeg::Unknown;
     };
     if !out.status.success() {
@@ -481,22 +472,20 @@ pub(crate) fn read_freshest_live_lease(
     now: DateTime<Utc>,
     ttl_minutes: f64,
 ) -> LeaseLeg {
-    let mut cmd = std::process::Command::new(gh_bin);
-    cmd.arg("api")
-        .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"))
-        .arg("--paginate")
-        .arg("--jq")
-        .arg(format!(
-            r#".[] | select(.body != null and ((.body | startswith("{LEASE_MARKER_PREFIX}")) or (.body | startswith("{YIELD_MARKER_PREFIX}")))) | {{updated_at: .updated_at, body: .body, {AUTHOR_JQ}}}"#
-        ));
-    cmd.current_dir(root);
-    // #5401: cross-owner managed repo -> its own owner's installation-token
-    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    // #8263: `LOOM_REPO` reaches `gh api` as the GH_REPO env var, NEVER as a
-    // `--repo` flag (`gh api` has none and aborts on one).
-    crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-    let Ok(out) = cmd.output() else {
+    // #10089: counted via the facade (`claim.lease_comments`); it applies the
+    // #5401 GH_CONFIG_DIR and the #8263 `LOOM_REPO` -> GH_REPO env contract.
+    let jq = format!(
+        r#".[] | select(.body != null and ((.body | startswith("{LEASE_MARKER_PREFIX}")) or (.body | startswith("{YIELD_MARKER_PREFIX}")))) | {{updated_at: .updated_at, body: .body, {AUTHOR_JQ}}}"#
+    );
+    let inv = crate::claim_reconciliation::gh_call::read("claim.lease_comments", gh_bin, root)
+        .args([
+            "api",
+            &format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"),
+            "--paginate",
+            "--jq",
+            &jq,
+        ]);
+    let Ok(out) = crate::claim_reconciliation::gh_call::output(inv) else {
         return LeaseLeg::ReadFailed;
     };
     if !out.status.success() {

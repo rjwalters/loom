@@ -442,6 +442,7 @@ mod tests {
             pr: Some(8314),
             blocked_by: None,
             no_capacity: None,
+            capacity_wait: None,
             ask: Some(OperatorAsk {
                 kind: AskKind::OperatorDecision,
                 key: "operator-decision:pr-8314".into(),

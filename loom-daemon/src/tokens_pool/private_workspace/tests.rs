@@ -383,3 +383,47 @@ fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner(
     assert!(lease::read(root.path()).unwrap().is_none());
     assert!(root.path().join("last-job.json").exists());
 }
+
+#[test]
+fn gh_credential_helper_is_refused_on_policy_governed_hosts() {
+    use repository::ensure_gh_helper_allowed;
+    assert!(ensure_gh_helper_allowed(false).is_ok());
+    let err = ensure_gh_helper_allowed(true).unwrap_err().to_string();
+    assert!(err.contains("forbids the gh credential helper"), "{err}");
+}
+
+#[test]
+fn policy_governs_host_resolves_and_fails_closed_on_unreadable_policy() {
+    use crate::forge_egress::policy::PolicySources;
+    use repository::policy_governs_host;
+    let dir = tempfile::tempdir().unwrap();
+    let env = |name: &str, body: Option<&str>| {
+        let path = dir.path().join(name);
+        if let Some(body) = body {
+            std::fs::write(&path, body).unwrap();
+        }
+        PolicySources {
+            env_path: Some(path),
+            machine_path: None,
+            repo_path: None,
+        }
+    };
+    // Absent policy -> not governed (the only "no policy" case).
+    assert!(!policy_governs_host(&PolicySources::default()).unwrap());
+    assert!(
+        policy_governs_host(&env("req.json", Some(r#"{"enforcement":{"api":"required"}}"#)))
+            .unwrap()
+    );
+    assert!(
+        !policy_governs_host(&env("obs.json", Some(r#"{"enforcement":{"api":"observe"}}"#)))
+            .unwrap()
+    );
+    // Corrupt or missing-but-named policy -> error, never "not governed".
+    for sources in [
+        env("bad.json", Some("{not json")),
+        env("missing.json", None),
+    ] {
+        let err = policy_governs_host(&sources).unwrap_err().to_string();
+        assert!(err.contains("unreadable") && err.contains(".json"), "{err}");
+    }
+}

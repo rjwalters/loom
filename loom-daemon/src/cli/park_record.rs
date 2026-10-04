@@ -15,8 +15,9 @@
 //! (`guide.md`'s unblock sweep) that needs the declared blockers without
 //! re-implementing the grammar in `grep`.
 //!
-//! Both are pure — no forge read, no label write. Neither can park or unpark
-//! anything; they only put text into, and take text out of, the canonical shape.
+//! Both are pure — no forge read, no label write. `apply` (#10152) is the one
+//! that parks: it writes the record into the body, then adds `loom:blocked` —
+//! the shared label-apply path, so a park cannot be applied without one.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -37,6 +38,53 @@ pub(crate) enum ParkRecordCommand {
     /// was found, 1 when none was — so a shell caller can branch on "is this
     /// park declared?" without parsing output.
     Parse(ParseArgs),
+
+    /// Park an issue or PR: write the park record into its BODY, then add
+    /// `loom:blocked` (#10152). Refuses (exit 1, nothing changed) with no
+    /// `--blocked-by` and no explicit `--reason`, or with a closed blocker.
+    /// Idempotent. Exit 4 on a forge failure; a failed body write adds no label.
+    Apply(ApplyArgs),
+}
+
+#[derive(clap::Args)]
+pub(crate) struct ApplyArgs {
+    /// The issue to park.
+    #[arg(
+        long,
+        value_name = "N",
+        required_unless_present = "pr",
+        conflicts_with = "pr"
+    )]
+    pub issue: Option<u64>,
+
+    /// The PR to park.
+    #[arg(long, value_name = "N")]
+    pub pr: Option<u64>,
+
+    /// The open blocker(s). Repeatable; comma-separated accepted.
+    #[arg(long = "blocked-by", value_name = "N", num_args = 1.., value_delimiter = ',')]
+    pub blocked_by: Vec<u64>,
+
+    /// Why. Required when no `--blocked-by` is given (e.g. `operator`), so a
+    /// park with no named blocker is a deliberate choice.
+    #[arg(long, value_name = "TEXT")]
+    pub reason: Option<String>,
+
+    /// Who is parking it — a role name or `human`.
+    #[arg(long = "by", value_name = "ROLE")]
+    pub by: Option<String>,
+
+    /// Label to remove once parked (repeatable), e.g. loom:building.
+    #[arg(long = "remove-label", value_name = "LABEL")]
+    pub remove_label: Vec<String>,
+
+    /// Target repository; defaults to the checkout's remote.
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub repo: Option<String>,
+
+    /// Print the planned body and label changes; mutate nothing.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
 }
 
 #[derive(clap::Args)]
@@ -79,6 +127,7 @@ impl ParkRecordCommand {
         match self {
             ParkRecordCommand::Render(args) => args.run(),
             ParkRecordCommand::Parse(args) => args.run(),
+            ParkRecordCommand::Apply(args) => args.run(),
         }
     }
 }
@@ -98,6 +147,26 @@ impl RenderArgs {
             )
         );
         Ok(())
+    }
+}
+
+impl ApplyArgs {
+    /// Never returns: exits with the command's own code.
+    fn run(self) -> Result<()> {
+        use loom_daemon::operator_decision::cli::{default_repo_root, GhForge};
+        use loom_daemon::park_record::apply::{apply, ApplyRequest};
+        let req = ApplyRequest {
+            number: self.issue.or(self.pr).unwrap_or_default(),
+            blocked_by: self.blocked_by,
+            reason: self.reason,
+            by: self.by,
+            at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            remove_labels: self.remove_label,
+            dry_run: self.dry_run,
+        };
+        let mut forge = GhForge::new(default_repo_root(), self.repo);
+        let code = apply(&mut forge, &req, &mut std::io::stdout(), &mut std::io::stderr());
+        std::process::exit(code)
     }
 }
 

@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use super::path_bootstrap;
+mod egress;
 use super::{
     all_succeeded, default_fleet_registry_path, execute_plan, render_checklist, CommandOutput,
     CommandRunner, FleetRegistry, Plan, Step, StepStatus, StepStdin, VerifyResult, WorkerRecord,
@@ -596,6 +597,15 @@ pub fn ensure_supported_platform(runner: &dyn CommandRunner, ssh_host: &str) -> 
 /// `check` phase is what makes a re-run idempotent (AC 2).
 #[must_use]
 pub fn build_plan(config: &AddWorkerConfig, secrets: &Secrets) -> Plan {
+    build_plan_with_policy(config, secrets, None)
+}
+
+#[must_use]
+pub fn build_plan_with_policy(
+    config: &AddWorkerConfig,
+    secrets: &Secrets,
+    egress: Option<&egress::EgressProvisioning>,
+) -> Plan {
     let mut plan = Plan::new();
     let primary_rel = workspace_rel(&config.repos[0]);
 
@@ -636,23 +646,9 @@ pub fn build_plan(config: &AddWorkerConfig, secrets: &Secrets) -> Plan {
         render_claude_code(),
     ));
 
-    // 4. Forge auth via operator-supplied fine-grained PAT (over stdin).
-    match &secrets.pat {
-        Some(pat) => plan.push_step(
-            Step::new(
-                "forge-auth",
-                "authenticate gh with the fine-grained PAT (via stdin) and set up git credential helper",
-                Some("gh auth status >/dev/null 2>&1".to_string()),
-                render_forge_auth(),
-            )
-            .with_stdin(StepStdin { content: pat.clone(), secret: true }),
-        ),
-        None => plan.push_skip(
-            "forge-auth",
-            "authenticate gh with the fine-grained PAT",
-            "no --pat-file supplied",
-        ),
-    }
+    // 4. Forge auth (PAT over stdin; policy-governed hosts store none, #10050).
+    egress::push_forge_auth(&mut plan, secrets.pat.as_ref(), egress);
+    egress.inspect(|p| egress::push_toolchain_steps(&mut plan, p)); // 4b (#10050)
 
     // 5. Token pool: full account pool (#3979 decision — no pinned subsets).
     //    5a. Install accounts.env (secret, over stdin, 0600).
@@ -771,6 +767,8 @@ pub fn build_plan(config: &AddWorkerConfig, secrets: &Secrets) -> Plan {
         None,
         render_verify(&primary_rel, &config.repos),
     ));
+
+    egress.inspect(|_| egress::push_doctor_step(&mut plan, &primary_rel)); // 12 (#10050)
 
     plan
 }
@@ -962,9 +960,10 @@ fn build_worker_record(
 /// before a single `apt-get`/`systemd` step is rendered, let alone run.
 pub fn run(config: &AddWorkerConfig) -> Result<()> {
     let secrets = preflight(config)?;
+    let egress = egress::load_for_operator_from_process()?; // fails closed (#10050)
 
     if config.dry_run {
-        let plan = build_plan(config, &secrets);
+        let plan = build_plan_with_policy(config, &secrets, egress.as_ref());
         print!("{}", plan.render_dry_run("fleet add-worker", &config.ssh_host));
         println!(
             "\n(dry run — no action taken on {}. Re-run without --dry-run to execute.)",
@@ -981,7 +980,7 @@ pub fn run(config: &AddWorkerConfig) -> Result<()> {
     let runner = SshRunner::new(&config.ssh_host);
     ensure_supported_platform(&runner, &config.ssh_host)?;
 
-    let plan = build_plan(config, &secrets);
+    let plan = build_plan_with_policy(config, &secrets, egress.as_ref());
     let reports = execute_plan(&runner, &plan);
     print!("{}", render_checklist("fleet add-worker", &config.ssh_host, &reports));
 
@@ -1108,18 +1107,6 @@ fn render_claude_code() -> String {
 curl -fsSL https://claude.ai/install.sh | bash
 "#
     .to_string()
-}
-
-fn render_forge_auth() -> String {
-    // The PAT arrives on stdin; pipe it straight into `gh auth login` so it
-    // never lands on a command line. `gh` stores it 0600 under ~/.config/gh.
-    let export_line = path_bootstrap::canonical_path_export_line();
-    format!(
-        r#"set -e
-{export_line}gh auth login --with-token
-gh auth setup-git
-"#
-    )
 }
 
 fn render_token_accounts() -> String {

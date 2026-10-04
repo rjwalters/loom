@@ -13,6 +13,7 @@ fn fixed_estimate() -> EstimateSummary {
         p25_sec: 600,
         p50_sec: 1200,
         p75_sec: 2400,
+        p90_sec: Some(3600),
         eta_p50_at: as_of() + Duration::seconds(1200),
         samples_min: 9,
         stage_marks: Vec::new(),
@@ -104,9 +105,97 @@ fn a_refusal_scores_nothing() {
     explanation.p25_sec = None;
     explanation.p50_sec = None;
     explanation.p75_sec = None;
+    // `p90_sec` deliberately left set: a p90 alone never makes a refusal
+    // scored.
     let s = score(&explanation, OutcomeKind::Landed, as_of() + Duration::seconds(60), &[]);
     assert_eq!(s.error_sec, None);
     assert_eq!(s.horizon_bucket, None);
+    assert_eq!(s.above_p90, None);
+    assert_eq!(s.pinball4_loss_sec, None);
+}
+
+// ------------------------------------------------------------ p90 (#10211)
+
+/// `fixed_estimate` scored at `actual` seconds after its `as_of`.
+fn landed_at(actual: i64) -> crate::eta::score::Score {
+    score(&fixed_estimate(), OutcomeKind::Landed, as_of() + Duration::seconds(actual), &[])
+}
+
+#[test]
+fn a_landing_after_p90_is_a_late_surprise() {
+    // p25/p50/p75/p90 = 600/1200/2400/3600; landed at 4200.
+    let s = landed_at(4200);
+    assert_eq!(s.above_p75, Some(true));
+    assert_eq!(s.above_p90, Some(true));
+    // ρ.25(3600) + ρ.5(3000) + ρ.75(1800) = 900 + 1500 + 1350.
+    assert_eq!(s.pinball_loss_sec, Some(3750.0));
+    // … plus ρ.9(600) = 540.
+    assert_eq!(s.pinball4_loss_sec, Some(4290.0));
+    assert_eq!(
+        s.pinball4_loss_sec,
+        Some(s.pinball_loss_sec.unwrap() + pinball(0.9, 4200.0 - 3600.0)),
+        "the four-quantile loss is the three-quantile one plus the p90 term"
+    );
+}
+
+#[test]
+fn landing_exactly_at_p90_is_not_late() {
+    // Strict: `actual > p90`, mirroring `above_p75`.
+    let s = landed_at(3600);
+    assert_eq!(s.above_p90, Some(false));
+    assert_eq!(s.above_p75, Some(true));
+    // ρ.25(3000) + ρ.5(2400) + ρ.75(1200) = 750 + 1200 + 900, and ρ.9(0) = 0.
+    assert_eq!(s.pinball_loss_sec, Some(2850.0));
+    assert_eq!(s.pinball4_loss_sec, Some(2850.0));
+}
+
+#[test]
+fn a_landing_inside_the_band_pays_the_p90_overestimate_term() {
+    let s = landed_at(1800);
+    assert_eq!(s.above_p90, Some(false));
+    assert_eq!(s.pinball_loss_sec, Some(750.0), "the three-quantile loss is unchanged");
+    // ρ.9(1800 − 3600) = −1800 · (0.9 − 1) = 180.
+    assert_eq!(s.pinball4_loss_sec, Some(930.0));
+}
+
+#[test]
+fn p90_scores_are_absent_never_false_when_there_is_nothing_to_score() {
+    // Abandoned: counted, never scored.
+    let abandoned = score(
+        &fixed_estimate(),
+        OutcomeKind::Abandoned,
+        as_of() + Duration::seconds(9999),
+        &[],
+    );
+    assert_eq!((abandoned.above_p90, abandoned.pinball4_loss_sec), (None, None));
+
+    // A summary without a p90 (persisted before #10211): the three-quantile
+    // score is unchanged, the p90 fields are absent rather than `false`/0.
+    let mut old = fixed_estimate();
+    old.p90_sec = None;
+    let s = score(&old, OutcomeKind::Landed, as_of() + Duration::seconds(9999), &[]);
+    assert_eq!(s.above_p75, Some(true));
+    assert!(s.pinball_loss_sec.is_some());
+    assert_eq!((s.above_p90, s.pinball4_loss_sec), (None, None));
+}
+
+#[test]
+fn records_written_before_p90_still_parse() {
+    // A pending-estimate line from before the field existed.
+    let mut line = serde_json::to_value(fixed_estimate()).unwrap();
+    assert!(line.as_object_mut().unwrap().remove("p90_sec").is_some());
+    let old: EstimateSummary = serde_json::from_value(line).unwrap();
+    assert_eq!(old.p90_sec, None);
+    assert_eq!(old.quantiles(), Some((600, 1200, 2400)));
+
+    // A score from before the fields existed (a spooled `eta.outcome`).
+    let mut scored = serde_json::to_value(landed_at(4200)).unwrap();
+    let object = scored.as_object_mut().unwrap();
+    assert!(object.remove("above_p90").is_some());
+    assert!(object.remove("pinball4_loss_sec").is_some());
+    let parsed: crate::eta::score::Score = serde_json::from_value(scored).unwrap();
+    assert_eq!((parsed.above_p90, parsed.pinball4_loss_sec), (None, None));
+    assert_eq!(parsed.pinball_loss_sec, Some(3750.0));
 }
 
 #[test]

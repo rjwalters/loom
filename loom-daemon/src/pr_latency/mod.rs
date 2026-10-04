@@ -35,6 +35,8 @@
 //! - [`segments`] — segment derivation and the live queue view.
 //! - [`report`] — the aggregate over a set of PRs, and the advisory predicates.
 //! - [`stats`] — the percentile summary applied to a set of samples.
+//! - [`timeline`] — the REST `issues/<n>/timeline` parser (pure; shared by the
+//!   CLI and the daemon's fleet snapshot refresh, #10263).
 //!
 //! Forge reads and rendering live in `cli/pr_latency_cmd.rs` /
 //! `cli/pr_latency_render.rs`, so everything in here is testable without `gh`.
@@ -43,6 +45,7 @@ pub mod history;
 pub mod report;
 pub mod segments;
 pub mod stats;
+pub mod timeline;
 
 pub use history::{PrEvent, PrHistory, PrState};
 pub use report::LatencyReport;

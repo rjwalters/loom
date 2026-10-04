@@ -14,7 +14,6 @@
 //!
 //! The failure is logged once per repo per process, not per dispatch.
 use std::collections::{HashMap, HashSet};
-use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -120,23 +119,19 @@ fn warn_once(key: &str) {
     }
 }
 
+/// One `gh api repos/{owner}/{repo}` read through the facade, counted as
+/// `telemetry.repo_identity` (#10089). The typed target keys the cross-owner
+/// `GH_CONFIG_DIR` lookup (#5401); a malformed slug is no identity.
 fn fetch_via_gh(owner_repo: &str) -> Option<RepoIdentity> {
-    let mut cmd = Command::new("gh");
-    cmd.args([
-        "api",
-        &format!("repos/{owner_repo}"),
-        "--jq",
-        r#""\(.id) \(.full_name)""#,
-    ])
-    .stdin(Stdio::null())
-    .stderr(Stdio::null());
-    crate::credential_preflight::apply_gh_config_for_owner_slug(&mut cmd, owner_repo);
-    match crate::proc_exec::run_bounded(cmd, PROBE_TIMEOUT) {
-        Ok(crate::proc_exec::Completion::Exited(out)) if out.status.success() => {
-            parse(&String::from_utf8_lossy(&out.stdout))
-        }
-        _ => None,
-    }
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    let target = GhTarget::repo(owner_repo).ok()?;
+    let path = format!("repos/{owner_repo}");
+    let op = Operation::new("telemetry.repo_identity");
+    let out = GhInvocation::new(op, AccessIntent::Read, target, PROBE_TIMEOUT)
+        .args(["api", &path, "--jq", r#""\(.id) \(.full_name)""#])
+        .run();
+    out.ok_output()
+        .and_then(|out| parse(&String::from_utf8_lossy(&out.stdout)))
 }
 
 /// Parse `"<id> <owner/name>"`. A zero or non-decimal id is no identity.

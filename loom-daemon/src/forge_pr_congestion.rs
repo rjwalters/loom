@@ -53,13 +53,11 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::cmd_out::{run_command, CmdOutcome};
-use crate::credential_preflight::apply_gh_config_for_root;
+use crate::cmd_out::CmdOutcome;
 use crate::forge_cmd::{detect_forge, ForgeType, EX_FORGE_DECLINED, FORGE_CMD_TIMEOUT};
 use crate::worktree_ops::gh::resolve_owner_repo;
 
@@ -424,16 +422,17 @@ const MAX_LINKED: usize = 20;
 /// failing closed on subprocess failure, GraphQL-level `errors`, or a
 /// missing `data`.
 fn gh_graphql_data(root: &Path, query: &str) -> Result<serde_json::Value> {
-    let mut cmd = Command::new("gh");
-    cmd.arg("api")
-        .arg("graphql")
-        .arg("-f")
-        .arg(format!("query={query}"))
-        .current_dir(root)
-        .stdin(Stdio::null());
-    apply_gh_config_for_root(&mut cmd, root);
-
-    let outcome = run_command(cmd, FORGE_CMD_TIMEOUT);
+    // #10089: counted via the facade (`congestion.graphql`); it supplies the
+    // #5401 cross-owner GH_CONFIG_DIR from `root`.
+    let outcome = crate::gh_invocation::GhInvocation::new(
+        crate::gh_invocation::Operation::new("congestion.graphql"),
+        crate::gh_invocation::AccessIntent::Read,
+        crate::gh_invocation::GhTarget::None,
+        FORGE_CMD_TIMEOUT,
+    )
+    .args(["api", "graphql", "-f", &format!("query={query}")])
+    .current_dir(root)
+    .run();
     let stdout = match outcome {
         CmdOutcome::Ran(o) if o.status.success() => o.stdout,
         CmdOutcome::Ran(o) => {

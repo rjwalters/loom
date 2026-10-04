@@ -98,7 +98,7 @@ struct GhIssueLabelsAndBody {
 /// not run this time" and proceeds, exactly as it would with
 /// `--ignore-host-constraint`.
 fn fetch_issue_for_host_check(root: &Path, issue: u32) -> Option<(Vec<String>, Option<String>)> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = Command::new(loom_daemon::gh_invocation::gh_bin());
     cmd.arg("issue")
         .arg("view")
         .arg(issue.to_string())

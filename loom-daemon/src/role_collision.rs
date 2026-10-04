@@ -540,7 +540,7 @@ impl RestQueueSource {
         let gh_bin = std::env::var("LOOM_GH_BIN")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .map_or_else(|| PathBuf::from("gh"), PathBuf::from);
+            .map_or_else(|| PathBuf::from(crate::gh_invocation::gh_bin()), PathBuf::from);
         Self { gh_bin }
     }
 }

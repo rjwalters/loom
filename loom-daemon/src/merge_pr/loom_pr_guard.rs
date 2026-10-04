@@ -31,12 +31,13 @@
 //! merge_pr_loom_pr_guard`) supplies the label set (already fetched into the
 //! shell's `$PR_LABELS`, piped over stdin — a label is forge-controlled text
 //! and belongs on a stream, not in argv) and renders the verdict to
-//! stdout/exit code. The shell side still owns two things this module
+//! stdout/exit code. The shell side still owns one thing this module
 //! deliberately does NOT: the champion:hold-state staleness warning (a
 //! separate, independent check that only fires when `loom:pr` IS present —
-//! see `_check_champion_hold_state_staleness` in `merge-pr.sh`) and the
-//! audit-comment body posted on a real (non-dry-run) override — both are
-//! forge I/O / display plumbing, not the decision itself.
+//! see `_check_champion_hold_state_staleness` in `merge-pr.sh`) — that is
+//! forge I/O, not a decision. [`override_comment`] below is the audit-comment
+//! BODY posted on a real (non-dry-run) override (a later #8191 slice than the
+//! rest of this module); the shell still owns the POST itself.
 
 /// The only stdout a caller may treat as "loom:pr is present, proceed".
 ///
@@ -114,6 +115,36 @@ moved the head) or never applied. Get the PR (re-)reviewed by Judge and re-label
 then re-run this merge.\n\nIf you are deliberately merging without that review signal and take \
 responsibility for it, re-run with --allow-unapproved to bypass this guard.",
         shown(labels)
+    )
+}
+
+/// The `--allow-unapproved` audit-comment BODY (#7419), posted on the PR
+/// after a REAL (non-dry-run) override — byte-frozen from the retired shell's
+/// `_check_loom_pr_label`, a later #8191 slice than [`assess`]/[`Verdict`]
+/// above. See `cli::merge_pr_loom_pr_override_comment` for the stdout
+/// sentinel protocol this is rendered behind, matching
+/// `super::partial_comment`'s `LOOM-MERGE-PR-COMMENT` convention.
+///
+/// `labels` renders EXACTLY as the retired shell's `${PR_LABELS:-<none>}`
+/// did: only an EMPTY string substitutes the placeholder. Deliberately NOT
+/// [`shown`] above, which `.trim()`s for the inline WARNING text — the
+/// retired shell used two different expansions for its two different
+/// strings (a bare `${VAR:-default}` here, versus nothing shown trims for in
+/// `override_message`), and the port keeps that distinction rather than
+/// unifying them under one newer helper that would change this body's bytes
+/// for a whitespace-only label line.
+#[must_use]
+pub fn override_comment(pr_number: &str, head_sha: &str, labels: &str, timestamp: &str) -> String {
+    let labels_shown = if labels.is_empty() { "<none>" } else { labels };
+    format!(
+        "## Merge Proceeded Without `loom:pr` (Override)\n\n\
+PR #{pr_number} was merged via `merge-pr.sh --allow-unapproved` while the `loom:pr` label was \
+absent — no forge-visible Judge review signal existed for the head being merged.\n\n\
+- **Head SHA**: `{head_sha}`\n\
+- **Labels at merge time**: {labels_shown}\n\n\
+The operator running this merge explicitly asserted responsibility for this override (#7419).\n\n\
+---\n\
+*Recorded by merge-pr.sh at {timestamp}*"
     )
 }
 

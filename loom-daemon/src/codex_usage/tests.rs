@@ -736,16 +736,17 @@ fn codex_home_prefers_the_loom_override_then_codex_own_then_the_default() {
 // ---------------------------------------------------------------------------
 
 /// `LOOM_CODEX_PROFILE_ROOT` cleared too, so an injected `home` decides the
-/// profile root and the operator's real pool is never reached.
-fn clear_all_home_env() {
+/// profile root and the operator's real pool is never reached. The returned
+/// guard holds the crate-wide profile-root lock and restores it on drop (#9964).
+fn clear_all_home_env() -> crate::tokens_pool::profile_root_env::ProfileRootEnv {
     clear_home_env();
-    std::env::remove_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV);
+    crate::tokens_pool::profile_root_env::ProfileRootEnv::unset()
 }
 
 #[serial_test::serial(codex_home_env)]
 #[test]
 fn codex_homes_is_the_ambient_home_plus_every_pooled_profile_unless_pinned() {
-    clear_all_home_env();
+    let _profile_root = clear_all_home_env();
     let tmp = tempfile::tempdir().unwrap();
     let profiles = tmp.path().join(".loom/codex-profiles");
     std::fs::create_dir_all(profiles.join("work-b")).unwrap();
@@ -770,17 +771,17 @@ fn codex_homes_is_the_ambient_home_plus_every_pooled_profile_unless_pinned() {
     std::env::set_var(CODEX_HOME_ENV, "/pinned/codex");
     assert_eq!(codex_homes(Some(tmp.path())), vec![PathBuf::from("/pinned/codex")]);
     // An explicitly empty profile root disables the profile scan.
-    clear_all_home_env();
-    std::env::set_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV, "");
+    clear_home_env();
+    let _empty_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::set("");
     assert_eq!(codex_homes(Some(tmp.path())), vec![tmp.path().join(".codex")]);
-    clear_all_home_env();
+    clear_home_env();
 }
 
 #[cfg(unix)]
 #[serial_test::serial(codex_home_env)]
 #[test]
 fn profile_rollouts_are_read_and_a_symlinked_shared_tree_is_counted_once() {
-    clear_all_home_env();
+    let _profile_root = clear_all_home_env();
     let tmp = tempfile::tempdir().unwrap();
     // The default account's home, holding one session.
     let default_home = seed_codex_home(
@@ -817,7 +818,7 @@ fn profile_rollouts_are_read_and_a_symlinked_shared_tree_is_counted_once() {
     assert_eq!(totals[0].input, (1_000 - 400) + 50);
     assert_eq!(totals[0].cache_read, 400);
     assert_eq!(totals[0].output, 105);
-    clear_all_home_env();
+    clear_home_env();
 }
 
 // ---------------------------------------------------------------------------

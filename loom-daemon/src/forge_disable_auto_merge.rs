@@ -53,11 +53,26 @@
 //!   runs a daemon at all.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use anyhow::Result;
 
-use crate::cmd_out::{run_command, CmdOutcome};
+use crate::cmd_out::CmdOutcome;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+
+/// A counted (#10089) facade invocation for one of this module's calls.
+fn inv(op: &'static str, intent: AccessIntent, gh_bin: &Path, cwd: Option<&Path>) -> GhInvocation {
+    let mut inv = GhInvocation::new(
+        Operation::new(op),
+        intent,
+        GhTarget::None,
+        crate::forge_cmd::FORGE_CMD_TIMEOUT,
+    )
+    .program(gh_bin);
+    if let Some(dir) = cwd {
+        inv = inv.current_dir(dir);
+    }
+    inv
+}
 
 /// The mutation, verbatim, and the **only** copy of it in the repo — the shell
 /// guard shells out to this module's CLI verb rather than mirroring it (see
@@ -101,10 +116,10 @@ impl Disarm {
 /// Append `--repo $LOOM_REPO` when the daemon is operating on a repo other
 /// than the one `cwd` belongs to, mirroring
 /// [`crate::claim_reconciliation`]'s own `gh` invocations.
-fn apply_repo_override(cmd: &mut Command) {
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
-    }
+fn repo_override_args() -> Vec<String> {
+    std::env::var("LOOM_REPO")
+        .map(|repo| vec!["--repo".to_string(), repo])
+        .unwrap_or_default()
 }
 
 /// Read the PR's arm state and GraphQL node id in ONE `gh` call.
@@ -134,22 +149,13 @@ fn read_arm_state(gh_bin: &Path, cwd: Option<&Path>, pr: u32) -> Result<Option<S
         auto_merge_request: Option<AutoMergeRequest>,
     }
 
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("pr")
-        .arg("view")
+    // #5401: the facade applies the cross-owner GH_CONFIG_DIR for `cwd`.
+    let out = inv("disarm.arm_state", AccessIntent::Read, gh_bin, cwd)
+        .args(["pr", "view"])
         .arg(pr.to_string())
-        .arg("--json")
-        .arg("id,autoMergeRequest");
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-        // #5401: a cross-owner managed repo needs its own owner's
-        // installation-token GH_CONFIG_DIR (no-op for single-owner fleets).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, dir);
-    }
-    apply_repo_override(&mut cmd);
-    cmd.stdin(Stdio::null());
-
-    let out = run_command(cmd, crate::forge_cmd::FORGE_CMD_TIMEOUT);
+        .args(["--json", "id,autoMergeRequest"])
+        .args(repo_override_args())
+        .run();
     match out {
         ref o if o.succeeded() => {
             let stdout = o.stdout_lossy();
@@ -191,22 +197,14 @@ pub fn disarm_auto_merge(gh_bin: &Path, cwd: Option<&Path>, pr: u32) -> Disarm {
         Err(reason) => return Disarm::Failed(reason),
     };
 
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("api")
-        .arg("graphql")
-        .arg("-f")
-        .arg(format!("query={DISABLE_AUTO_MERGE_MUTATION}"))
-        .arg("-F")
-        .arg(format!("pullRequestId={node_id}"));
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, dir);
-    }
     // NOTE: no `--repo` here. `gh api graphql` has no such flag — the PR is
     // addressed by its global node id, which is repo-independent.
-    cmd.stdin(Stdio::null());
-
-    let out = run_command(cmd, crate::forge_cmd::FORGE_CMD_TIMEOUT);
+    let out = inv("disarm.mutation", AccessIntent::Write, gh_bin, cwd)
+        .args(["api", "graphql", "-f"])
+        .arg(format!("query={DISABLE_AUTO_MERGE_MUTATION}"))
+        .arg("-F")
+        .arg(format!("pullRequestId={node_id}"))
+        .run();
     match out {
         ref o if o.succeeded() => Disarm::Disarmed,
         CmdOutcome::Ran(ref o) => {
@@ -285,15 +283,13 @@ fn post_audit_comment(gh_bin: &Path, pr: u32, outcome: &Disarm, hold: Option<&st
     let Some(body) = audit_comment_body(pr, outcome, hold) else {
         return;
     };
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("pr")
-        .arg("comment")
+    let out = inv("disarm.audit_comment", AccessIntent::Write, gh_bin, None)
+        .args(["pr", "comment"])
         .arg(pr.to_string())
         .arg("--body")
-        .arg(body);
-    apply_repo_override(&mut cmd);
-    cmd.stdin(Stdio::null());
-    let out = run_command(cmd, crate::forge_cmd::FORGE_CMD_TIMEOUT);
+        .arg(body)
+        .args(repo_override_args())
+        .run();
     if !out.succeeded() {
         eprintln!("Warning: could not post the auto-merge audit comment on PR #{pr}: {out:?}");
     }

@@ -172,6 +172,7 @@ fn the_rust_trust_gate_agrees_with_the_shipped_provisioner() {
             // A private session runs Codex with CODEX_HOME at the container's
             // mount point; that is where its trust is keyed.
             runtime_home: Some(PathBuf::from(PROFILE)),
+            sealed: None,
         }
         .verify();
         assert_eq!(verdict.trusted, *expected, "{what}: verify verdict {verdict:?}");

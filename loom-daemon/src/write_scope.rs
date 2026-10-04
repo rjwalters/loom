@@ -200,7 +200,7 @@ fn checkout_root(dir: &Path) -> PathBuf {
 /// same binary, and so the same credential, as the writes it vets.
 #[must_use]
 pub fn default_gh() -> PathBuf {
-    std::env::var_os("LOOM_GH_BIN").map_or_else(|| PathBuf::from("gh"), PathBuf::from)
+    PathBuf::from(crate::gh_invocation::gh_bin())
 }
 
 /// `loom-daemon forge may-write`: may a write from `cwd` go to `repo` (or,

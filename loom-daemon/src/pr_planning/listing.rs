@@ -1,13 +1,14 @@
 //! Paginated conditional REST reads retain author association/type, unlike
 //! the reduced issue listing. Cache keys include repo and credential scope.
 use super::*;
+use crate::forge_call_stats::{ops, ForgeOp};
 use crate::forge_etag_store as store;
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::path::Path;
 use std::process::Command;
 
-fn read(root: &Path, gh: &Path, suffix: &str) -> Result<Value> {
+fn read(root: &Path, gh: &Path, op: ForgeOp, suffix: &str) -> Result<Value> {
     let repo = std::env::var("LOOM_REPO").ok();
     let target = store::resolve_target(Some(root), repo.as_deref());
     let url = format!("repos/{}/{}", target.repo.as_deref().unwrap_or("{owner}/{repo}"), suffix);
@@ -15,7 +16,7 @@ fn read(root: &Path, gh: &Path, suffix: &str) -> Result<Value> {
     let path = store::disk_cache_path(&key);
     let sent = store::read_disk_entry(&path);
     let (status, response, stderr) = store::fetch_conditional(
-        "pr_planning",
+        store::ConditionalRead::new("pr_planning", op),
         gh,
         Some(root),
         &target,
@@ -53,6 +54,10 @@ pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
         let value = read(
             root,
             gh,
+            // `GET pulls?state=open`: the open-PR queue. The inventory's PR
+            // discovery row is by-head only (`pr.list-by-head`), so the full
+            // queue listing has no row yet (#9831).
+            ForgeOp::uninventoried("open-PR queue listing has no inventory row"),
             &format!("pulls?state=open&sort=created&direction=desc&per_page=100&page={page}"),
         )?;
         let batch = value.as_array().context("PR listing must be an array")?;
@@ -75,7 +80,9 @@ pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
                 .any(|l| has_label(row, l))
             {
                 let number = row["number"].as_u64().context("PR number missing")?;
-                row["mergeable"] = read(root, gh, &format!("pulls/{number}"))?["mergeable"].clone();
+                row["mergeable"] = read(root, gh, ops::PR_VIEW_STATE, &format!("pulls/{number}"))?
+                    ["mergeable"]
+                    .clone();
             }
         }
     }
