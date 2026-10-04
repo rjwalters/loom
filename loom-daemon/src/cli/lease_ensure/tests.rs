@@ -288,6 +288,43 @@ fn starting_renewal_returns_before_the_detached_loop_exits() {
     );
 }
 
+/// A renew fake that records which fds above 2 it was handed. It probes each
+/// number with `-e /dev/fd/N` rather than globbing `/dev/fd`, because the glob
+/// opens a directory fd of its own (typically 3) and would report it.
+const RENEW_RECORDS_FDS: &str = r#"#!/usr/bin/env bash
+for ((f = 3; f < 1024; f++)); do [[ -e /dev/fd/$f ]] && echo "$f"; done > renew-fds
+echo 424242
+"#;
+
+/// #10203: `worktree.sh` calls `lease ensure` with its caller's stdout on fd 3,
+/// and an inherited copy in the detached loop held a `worktree.sh N | tail`
+/// pipe open for up to 4h. A non-CLOEXEC pipe open in this process must not
+/// reach the renew script — and must still be open here afterwards.
+#[test]
+fn the_renewal_script_inherits_no_fd_from_the_caller() {
+    let mut pipe_fds = [0 as libc::c_int; 2];
+    // SAFETY: `pipe` writes two fds into the 2-element array it is given.
+    assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+    let dir = checkout(PUBLISH_OK, RENEW_RECORDS_FDS);
+
+    let outcome = args(&dir).ensure(&in_session());
+    assert!(matches!(outcome, Outcome::Renewing { .. }));
+
+    let seen = argv(&dir, "renew-fds").expect("the fake renew script ran");
+    for fd in pipe_fds {
+        assert!(
+            !seen.lines().any(|l| l.trim() == fd.to_string()),
+            "renew script inherited caller fd {fd}; it saw fds: {seen:?}"
+        );
+        // SAFETY: F_GETFD only reads the descriptor flag; close releases an fd
+        // this test opened.
+        unsafe {
+            assert!(libc::fcntl(fd, libc::F_GETFD) >= 0, "fd {fd} must stay open here");
+            libc::close(fd);
+        }
+    }
+}
+
 /// `run()` never fails the caller, whatever it decides — `worktree.sh` calls it
 /// unconditionally and a builder's worktree setup must not hinge on it.
 #[test]

@@ -200,6 +200,7 @@ test-sweep-lease-fence-race.sh
 test-sweep-lease-publish.sh
 test-sweep-lease-renew.sh
 test-sweep-lease-renew-lifecycle.sh
+test-sweep-lease-renew-fd-hygiene.sh
 test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
 test-sync-labels-check.sh

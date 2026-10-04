@@ -970,6 +970,12 @@ cmd_start() {
     local loop_started_at lease_cache_re='lease-cache=([0-9]+@[0-9TZ:-]+)'
     loop_started_at="$(date -u +%s)"
     #
+    # Issue #10203: the loop (and its `sleep` children) must hold no fd it
+    # inherited from the caller except its own log (fd 9), so the closing
+    # redirect below also closes 3-8. An inherited fd 3 -- worktree.sh's saved
+    # stdout, i.e. a `worktree.sh N | tail` pipe -- otherwise kept that pipe
+    # open for the loop's whole 4h lifetime. (`loom-daemon lease ensure` also
+    # marks every inherited fd close-on-exec before it runs `start`.)
     # Issue #10229: one renewer per (repo, host, sweep, issue), and a cycle
     # that ends the loop once the issue is closed, even while the watched
     # interactive parent lives on. The decisions live in `loom-daemon lease
@@ -1015,7 +1021,7 @@ cmd_start() {
             fi
             [[ "$renew_rc" -ne 4 ]] || break
         done
-    ) < /dev/null > /dev/null 2>&1 &
+    ) < /dev/null > /dev/null 2>&1 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- &
     local loop_pid=$! owner_pid=""
     # A live renewer already owns this key: drop the loop just forked (still in
     # its first sleep, no forge call made) and report the owner's pid instead.
