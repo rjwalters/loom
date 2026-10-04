@@ -130,6 +130,11 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> usize {
     {
         return 0;
     }
+    // Forge-write scope (#9548): never label issues in a repo this checkout
+    // may not write to.
+    if !crate::write_scope::gate_root_with(root, gh_bin, "intake reconcile") {
+        return 0;
+    }
     run_once(
         gh_bin,
         root,
