@@ -5,6 +5,7 @@
 use std::cell::RefCell;
 
 use super::*;
+use serial_test::serial;
 
 fn item(n: i64, closed: &str, updated: &str) -> ClosedItem {
     ClosedItem {
@@ -133,11 +134,14 @@ fn knob_is_default_off_with_env_over_config_precedence() {
 // next pass must actually post, and a further pass must not duplicate it.
 // ---------------------------------------------------------------------------
 
-/// `LOOM_GH_BIN` is process-global; serialise the tests that point it at a
-/// fake.
-static GH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Points `LOOM_GH_BIN` at `bin`, restoring the prior value on drop.
+///
+/// `LOOM_GH_BIN` is process-global and other modules' tests set/unset it
+/// under `#[serial(loom_config_env)]`, so every test using this guard must
+/// carry that same crate-wide key; a module-local mutex would not serialise
+/// against them (see `worktree_root.rs`, #5164 / #5133). The lib crate's
+/// `test_stub::GhBinGuard` is `cfg(test)` in the lib, so it is not reachable
+/// from this bin's test build.
 struct GhBin(Option<std::ffi::OsString>);
 
 impl GhBin {
@@ -238,10 +242,8 @@ const SINCE: &str = "2026-10-04T09:00:00Z";
 const LATEST: &str = "2026-10-04T11:00:00Z";
 
 #[test]
+#[serial(loom_config_env)]
 fn failed_candidate_read_holds_cursor_then_retry_posts_once() {
-    let _lock = GH_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let root = tempfile::tempdir().unwrap();
     let gh_dir = tempfile::tempdir().unwrap();
     let _gh = GhBin::set(&fake_gh(gh_dir.path()));
@@ -285,10 +287,8 @@ fn failed_candidate_read_holds_cursor_then_retry_posts_once() {
 }
 
 #[test]
+#[serial(loom_config_env)]
 fn failed_closing_reference_expansion_holds_cursor_then_retry_posts() {
-    let _lock = GH_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let root = tempfile::tempdir().unwrap();
     let gh_dir = tempfile::tempdir().unwrap();
     let _gh = GhBin::set(&fake_gh(gh_dir.path()));
