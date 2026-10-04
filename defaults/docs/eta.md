@@ -40,6 +40,7 @@ stage it is in now, with one branch at every Judge verdict:
 ```text
 ready_wait → sweep.curator → sweep.builder → review_wait ─┬─ approved ──→ merge_wait → landed
                                                           └─ changes_requested → doctor ─┘ (loop, capped)
+                                       approved + operator hold: merge_hold ⇄ merge_wait (#10218)
 ```
 
 | Stage | Entered when | Left when |
@@ -50,6 +51,7 @@ ready_wait → sweep.curator → sweep.builder → review_wait ─┬─ approve
 | `review_wait` | the PR asks for review | the Judge's verdict |
 | `doctor` | `loom:changes-requested` | the PR asks for review again |
 | `merge_wait` | `loom:pr` | the PR merges |
+| `merge_hold` | `loom:pr` plus `loom:operator`, `loom:operator-only` or `loom:operator-decision` | the hold is lifted (back to `merge_wait`), `loom:changes-requested`, or the PR merges or closes |
 
 **`ready_wait` (#9326).** A ready issue's wait is modelled from its
 [dispatch plan](daemon-reference.md) position on the last work-finder tick,
@@ -74,11 +76,13 @@ below its cap; a repo-cap or out-of-slice deferral is recorded (as the row's
 rides only `blocked` rows, which have no position, so it is refused
 `no_dispatch_plan` rather than turned into a start time.
 
-Human-gated stages (intake, approval, operator holds) are outside the model:
-an issue there has no estimate, with a reason (below). A running sweep gets a
-`land` estimate from `sweep.curator` on; an item in `doctor` always counts at
-least one rework round, because `doctor` is entered only through a
-rejection.
+Human-gated stages (intake, approval) are outside the model: an issue there
+has no estimate, with a reason (below). An approved PR under an operator hold
+is the `merge_hold` stage, but every shipped heuristic still refuses it as
+`blocked` ([below](#operator-holds-merge_hold-and-stage-episodes-10218)).
+A running sweep gets a `land` estimate from `sweep.curator` on; an item in
+`doctor` always counts at least one rework round, because `doctor` is entered
+only through a rejection.
 
 **Distributions.** Each `(repo, stage)` is summarised as a 21-point
 nearest-rank quantile grid (`p0, p5, …, p100`) over the most recent 200
@@ -174,6 +178,74 @@ in-sweep merge share to invent one from.
 `sweep.outcome` records in SigNoz, which is blocked on fleet workers exporting
 at all. Until then `augment` (the default) keeps this host's journals for the
 in-sweep half and takes the forge's word for the human-gated half.
+
+### Operator holds: `merge_hold` and stage episodes (#10218)
+
+An approved PR can be waiting to merge (`loom:pr`, usually over within the
+hour) or held for a human (`loom:pr` plus `loom:operator`,
+`loom:operator-only` or `loom:operator-decision`; `loom:operator-mechanical`
+may accompany them). The second is the `merge_hold` stage. Its one
+definition is `eta::labels::stage_from_pr_labels`; the episode derivation, the
+tracker and every later consumer call it, so the stage a model is trained on
+and the stage it serves cannot drift. `loom:blocked`, `loom:needs-capability`
+and an operator hold on a PR that is not approved are still `blocked`.
+
+**Shipped heuristics do not move.** `start-v1`, `finish-v1` and `land-v1`
+to `land-v3` refuse an item in `merge_hold` as `blocked` before writing any
+field, so their explanations are byte-identical to the refusal of a held PR
+before the stage existed, and no shipped `stage_marks` carries a `merge_hold`
+mark (it is marked only on a path that starts there). Their `merge_wait`
+history keeps the **pooled** definition from every source: approval in force
+to merge, hold included. A heuristic opts in to modelling the hold with
+`PathRules::models_hold`; its path from `merge_hold` is the rest of the hold
+(conditioned on its age) and then one `merge_wait`.
+
+**Stage episodes** are the split record a hold-aware heuristic fits
+(`eta::episodes`, #10221's input). One PR's label events are replayed in
+`(at, seq)` order from an empty label set; every event at one instant is
+applied in `seq` order and the stage is resolved once per instant, so two
+labels changed in one edit are one transition and no episode has zero
+length. `seq` is the timeline order for the forge (kept by a stable sort) and
+the delivery order for a future label stream; it decides only between changes
+to the same label at the same instant. Each episode is
+`{repo, pr_number, stage, entered_at, end}`. `stage` is `review_wait`,
+`doctor`, `merge_wait` (split: hold excluded) or `merge_hold`. `end` is
+`left` (with `at` and `next`: a stage, `merged` or `closed`), `unstaged` (the
+labels stopped resolving to any stage) or `open` (censored at its `at`). A
+label re-applied while in force opens nothing. The derivation is causal:
+cut at `T`, every episode that ended before `T` is identical and a running one
+has the same `entered_at`, which is what `StageSamples::select_episodes`
+reconstructs from a stored snapshot. Episodes store the events' own instants;
+each consumer applies its own knowability lag.
+
+**Where the history comes from.** Only label data the daemon already reads:
+the forge PR timelines behind the fleet snapshot (every `labeled` and
+`unlabeled` event, operator labels included) and the tracker's own listings.
+No new forge read; the PR listing gains `closedAt` in the same call, so a PR
+closed unmerged ends its last episode at its close. The webhook label stream
+is not readable by the daemon today; it becomes one more adapter once #10197's
+raw event cache imports it.
+
+- **Fleet snapshot.** `episodes` sits beside `samples` (`serde(default)`, not
+  written when empty), so an older daemon still parses the file and a
+  snapshot without episodes keeps its id. Each `merge_hold` episode is also a
+  `merge_hold` sample (completed, or censored when closed, unstaged or open);
+  split `merge_wait` episodes are not samples. A snapshot written before
+  #10218 gains episodes only as its PRs are re-read: run
+  `eta fleet backfill` (not `refresh`) to rebuild the window. `eta fleet show`
+  prints episode counts by stage.
+- **Tracker.** The hold is an overlay on the pooled `merge_wait` track.
+  Entering it journals a boundary-only `merge_wait` row
+  (`next_stage: merge_hold`, no duration); leaving it journals a `merge_hold`
+  row (with `duration_sec` when its entry was observed), then the pooled track
+  carries on as before. A merge or close while held adds a `merge_hold` row to
+  the unchanged pooled one. While held the item is `At(merge_hold)` and still
+  refused `blocked`, so a refusal is emitted once, as before; after a release
+  it is `At(merge_wait)` with the pooled entry, and
+  `CurrentStage.episode_entered_at` carries the release instant.
+  One deliberate change to local samples: `review_wait` approved and held
+  within one listing interval now closes at the approval (verdict `pass`), as
+  the forge measures it, instead of at the release.
 
 ## Heuristics and versioning
 
@@ -731,7 +803,9 @@ every boundary the tracker observes, the moment it observes it, with its raw
 fields: sweep dispatch, phase, repeat and terminal events, label transitions,
 first sightings, verdicts and PR resolutions. A row that completes a stage
 with an observed entry has a `duration_sec`; a row whose entry was only a
-lower bound does not. Rows the sweep-outcome journal already carries are
+lower bound does not. Operator holds add `merge_hold` rows and boundary-only
+`merge_wait → merge_hold` rows ([above](#operator-holds-merge_hold-and-stage-episodes-10218)).
+Rows the sweep-outcome journal already carries are
 marked `in_sweep` and are not read back as history. Rotation: 5 MiB or 30
 days, one `.1` generation.
 
