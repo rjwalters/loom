@@ -5,16 +5,22 @@ mod censoring;
 mod conditioning;
 mod config;
 mod emit;
+mod episodes;
 mod estimate;
 mod explanation;
 mod fit;
+mod fit_leak;
 mod fit_parity;
+mod fit_rows;
+mod flag_timeline;
 mod fleet;
+mod fleet_refresh;
 mod friction;
 mod item_features;
 mod journal;
 pub(crate) mod land_twin_otter;
 mod land_v3;
+mod merge_hold;
 mod offline;
 mod primitives;
 mod queue_features;
@@ -24,6 +30,7 @@ mod score;
 mod shadow;
 mod shadow_gate;
 mod tracker;
+mod tracker_hold;
 mod twin_otter_parity;
 
 use super::explanation::Features;
@@ -104,6 +111,7 @@ pub(crate) fn input_at(stage: Stage, age_sec: i64, rework_rounds: u32) -> Estima
             age_sec,
             age_source: AgeSource::LabelEvent,
             rework_rounds,
+            episode_entered_at: None,
         }),
         features: Features {
             labels: Some(vec!["loom:review-requested".to_string()]),

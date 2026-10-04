@@ -63,6 +63,7 @@ impl Heuristic for LandV2 {
                 always_merge: true,
                 censoring: true,
                 adjust: None,
+                models_hold: false,
             },
             input,
             history,

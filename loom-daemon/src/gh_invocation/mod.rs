@@ -223,6 +223,17 @@ pub enum GhCompletion {
     Passthrough(ExitStatus),
 }
 
+/// The environment variables `gh` documents as taking precedence over a
+/// `GH_CONFIG_DIR`'s stored credential. [`GhInvocation::without_token_env`]
+/// removes every one, so a reader-only call cannot silently spend a token the
+/// daemon's own environment happens to carry (#10263).
+pub const TOKEN_ENV_VARS: [&str; 4] = [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+];
+
 /// One environment change the facade applies to the child: `Some` sets the
 /// variable, `None` removes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +254,8 @@ pub struct GhInvocation {
     cwd: Option<PathBuf>,
     program: Option<String>,
     config_dir: Option<PathBuf>,
+    /// Remove [`TOKEN_ENV_VARS`] from the child (#10263).
+    strip_token_env: bool,
     /// The #9777 call identity this execution is accounted under (#9831).
     /// Empty by default: an unmapped site records `operation = "unknown"`
     /// (see [`accounting`]), visible rather than absent.
@@ -270,6 +283,7 @@ impl GhInvocation {
             cwd: None,
             program: None,
             config_dir: None,
+            strip_token_env: false,
             identity: crate::forge_call_stats::CallIdentity::default(),
         }
     }
@@ -349,6 +363,18 @@ impl GhInvocation {
         self
     }
 
+    /// Remove every [`TOKEN_ENV_VARS`] entry from the child's environment, so
+    /// the `GH_CONFIG_DIR` this invocation runs under is the **only**
+    /// credential `gh` can see. For a reader-only read (#10263): `gh` prefers
+    /// an env token over a stored one, so without this a daemon started from
+    /// a shell holding the operator's PAT would spend that PAT on a call the
+    /// caller believes runs as a reader App.
+    #[must_use]
+    pub fn without_token_env(mut self) -> Self {
+        self.strip_token_env = true;
+        self
+    }
+
     #[must_use]
     pub fn parent(mut self, parent: ParentContext) -> Self {
         self.parent = parent;
@@ -401,6 +427,8 @@ impl GhInvocation {
     ///   `child_context` — the invocation's own span when it is exported, so
     ///   the managed launcher (C4) parents its HTTP spans under it — or both
     ///   removed when there is none.
+    /// - [`TOKEN_ENV_VARS`]: removed, only under
+    ///   [`GhInvocation::without_token_env`].
     #[must_use]
     pub fn env_plan(&self, child_context: Option<&TraceContext>) -> Vec<EnvEntry> {
         self.env_plan_with(std::env::var_os("LOOM_REPO"), child_context)
@@ -443,6 +471,11 @@ impl GhInvocation {
                 key,
                 value: traceparent.clone(),
             });
+        }
+        if self.strip_token_env {
+            for key in TOKEN_ENV_VARS {
+                plan.push(EnvEntry { key, value: None });
+            }
         }
         plan
     }

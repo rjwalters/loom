@@ -61,6 +61,23 @@ pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.eta.result",
     "loom.eta.provenance_complete",
     "loom.eta.outcome_provenance_complete",
+    // `eta.fleet_refresh` (#10263).
+    "loom.eta.fleet.cycle_id",
+    "loom.eta.fleet.pass",
+    "loom.eta.fleet.stop_reason",
+    "loom.eta.fleet.promoted",
+    "loom.eta.fleet.prs_read",
+    "loom.eta.fleet.pass_done",
+    "loom.eta.fleet.timelines_incomplete",
+    "loom.eta.fleet.samples_added",
+    "loom.eta.fleet.raw_events_added",
+    "loom.eta.fleet.forge_calls",
+    "loom.eta.fleet.not_modified_calls",
+    "loom.eta.fleet.ratelimit_remaining_min",
+    "loom.eta.fleet.reader_app",
+    "loom.eta.fleet.snapshot_id",
+    "loom.eta.fleet.as_of",
+    "loom.eta.fleet.duration_ms",
 ];
 
 /// One estimate, with its full `eta-explanation/v1` record.

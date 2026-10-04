@@ -1,4 +1,5 @@
-//! OTLP mapping for `eta.estimate` / `eta.outcome` (#9289).
+//! OTLP mapping for `eta.estimate` / `eta.outcome` (#9289) and
+//! `eta.fleet_refresh` (#10263).
 //!
 //! Each is one log record. The **body** is the record's JSON — for an
 //! estimate that is the whole `eta-explanation/v1` explanation — so ClickHouse
@@ -151,6 +152,47 @@ pub(super) fn log_parts(
             let body = serde_json::to_string(r).unwrap_or_default();
             Some(("eta.outcome", SeverityNumber::Info, nanos(s.actual_at), attributes, body))
         }
+        TelemetryRecord::EtaFleetRefresh(r) => {
+            // #10263: one repo, one cycle; stamped at the cycle's start so
+            // every repo of a cycle sorts together.
+            let to_i64 = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+            let mut attributes = vec![
+                kv_string("loom.repo", r.repo.clone()),
+                kv_string("loom.eta.fleet.cycle_id", r.cycle_id.clone()),
+                kv_string("loom.eta.fleet.pass", r.pass.clone()),
+                kv_string("loom.eta.fleet.stop_reason", r.stop_reason.clone()),
+                kv_bool("loom.eta.fleet.promoted", r.promoted),
+                kv_int("loom.eta.fleet.prs_read", to_i64(r.prs_read)),
+                kv_int("loom.eta.fleet.pass_done", to_i64(r.pass_done)),
+                kv_int("loom.eta.fleet.timelines_incomplete", to_i64(r.timelines_incomplete)),
+                kv_int("loom.eta.fleet.samples_added", r.samples_added),
+                kv_int("loom.eta.fleet.forge_calls", to_i64(r.forge_calls)),
+                kv_int("loom.eta.fleet.not_modified_calls", to_i64(r.not_modified_calls)),
+                kv_int("loom.eta.fleet.duration_ms", to_i64(r.duration_ms)),
+            ];
+            provenance(&mut attributes, "loom.eta.", &r.loom);
+            opt_int(
+                &mut attributes,
+                "loom.eta.fleet.raw_events_added",
+                r.raw_events_added.map(to_i64),
+            );
+            opt_int(
+                &mut attributes,
+                "loom.eta.fleet.ratelimit_remaining_min",
+                r.ratelimit_remaining_min.map(to_i64),
+            );
+            for (key, value) in [
+                ("loom.eta.fleet.reader_app", r.reader_app.clone()),
+                ("loom.eta.fleet.snapshot_id", r.snapshot_id.clone()),
+                ("loom.eta.fleet.as_of", r.as_of.map(crate::telemetry::trace::instant)),
+            ] {
+                if let Some(value) = value {
+                    attributes.push(kv_string(key, value));
+                }
+            }
+            let body = serde_json::to_string(r).unwrap_or_default();
+            Some(("eta.fleet_refresh", SeverityNumber::Info, nanos(r.started_at), attributes, body))
+        }
         _ => None,
     }
 }
@@ -181,6 +223,7 @@ mod tests {
                 age_sec: 0,
                 age_source: AgeSource::Bus,
                 rework_rounds: 0,
+                episode_entered_at: None,
             }),
             features: Default::default(),
             features_omitted: Vec::new(),
@@ -365,5 +408,62 @@ mod tests {
         ] {
             assert_eq!(attr(&old, key), None, "{key} is absent without a p90");
         }
+    }
+
+    #[test]
+    fn a_fleet_refresh_record_emits_every_fleet_key_and_only_allowlisted_ones() {
+        use crate::telemetry::kinds::eta::ETA_LOG_ATTRIBUTE_KEYS;
+        use crate::telemetry::kinds::eta_fleet_refresh::EtaFleetRefreshRecord;
+        let at = Utc.with_ymd_and_hms(2026, 10, 4, 12, 0, 0).unwrap();
+        let fleet = EtaFleetRefreshRecord {
+            repo: "rjwalters/loom".to_string(),
+            cycle_id: "0123456789abcdef".to_string(),
+            started_at: at,
+            pass: "backfill".to_string(),
+            stop_reason: "complete".to_string(),
+            promoted: true,
+            prs_read: 3,
+            pass_done: 3,
+            timelines_incomplete: 1,
+            samples_added: 9,
+            raw_events_added: Some(4),
+            forge_calls: 5,
+            not_modified_calls: 0,
+            ratelimit_remaining_min: Some(4000),
+            reader_app: Some("7".to_string()),
+            snapshot_id: Some("feedface".to_string()),
+            as_of: Some(at),
+            duration_ms: 12,
+            loom: record().explanation.loom.clone(),
+        };
+        let envelope =
+            TelemetryEnvelope::new("host", TelemetryRecord::EtaFleetRefresh(fleet.clone()));
+        let log = log_record_for(&envelope).unwrap();
+        assert_eq!(log.event_name, "eta.fleet_refresh");
+        assert_eq!(log.time_unix_nano, super::nanos(at));
+        for kv in &log.attributes {
+            assert!(
+                ETA_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
+                    || ["loom.repo", "loom.record_id"].contains(&kv.key.as_str()),
+                "{} is not allowlisted",
+                kv.key
+            );
+        }
+        for key in ETA_LOG_ATTRIBUTE_KEYS
+            .iter()
+            .filter(|k| k.starts_with("loom.eta.fleet."))
+        {
+            assert!(attr(&log, key).is_some(), "{key} is emitted");
+        }
+        assert_eq!(
+            attr(&log, "loom.eta.fleet.stop_reason"),
+            Some(Value::StringValue("complete".into()))
+        );
+        assert_eq!(attr(&log, "loom.eta.fleet.samples_added"), Some(Value::IntValue(9)));
+        let Some(Value::StringValue(body)) = log.body.as_ref().and_then(|b| b.value.clone()) else {
+            panic!("string body");
+        };
+        let parsed: EtaFleetRefreshRecord = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed, fleet);
     }
 }

@@ -281,6 +281,30 @@ pub(crate) fn fetch_conditional(
     run_fetch(site, gh_bin, cwd, target, url, etag, None)
 }
 
+/// One `gh api --include <url>` read under **exactly** the reader App whose
+/// `GH_CONFIG_DIR` is `reader_dir` — the reader-only primitive (#10263).
+///
+/// Unlike [`fetch_conditional`] there is no writer anywhere on this path: a
+/// failed read is returned as-is for the caller to classify (and withdraw the
+/// reader through [`crate::forge_identity::withdraw_after`]), never retried on
+/// the writer, and the child runs
+/// [`GhInvocation::without_token_env`], so an env `GH_TOKEN` / `GITHUB_TOKEN`
+/// cannot outrank the reader dir. A caller that must never spend the
+/// operator's credential — the ETA fleet snapshot refresh — uses this and
+/// nothing else. Call accounting, egress routing and the rate-limit headers
+/// are the same [`GhInvocation`] path every conditional read takes.
+pub(crate) fn fetch_with_reader(
+    site: ConditionalRead,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    target: &Target,
+    url: &str,
+    etag: Option<&str>,
+    reader_dir: &Path,
+) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
+    run_fetch_with(site, gh_bin, cwd, target, url, etag, Some(reader_dir), true)
+}
+
 /// Deadline for one conditional read (they were unbounded `.output()`s before
 /// #10089). A listing is one page, so a minute is generous.
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -304,6 +328,22 @@ fn run_fetch(
     etag: Option<&str>,
     reader_dir: Option<&Path>,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
+    run_fetch_with(site, gh_bin, cwd, target, url, etag, reader_dir, false)
+}
+
+/// [`run_fetch`], optionally with every token env var removed from the child
+/// ([`GhInvocation::without_token_env`]) — set only by [`fetch_with_reader`].
+#[allow(clippy::too_many_arguments)]
+fn run_fetch_with(
+    site: ConditionalRead,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    target: &Target,
+    url: &str,
+    etag: Option<&str>,
+    reader_dir: Option<&Path>,
+    strip_token_env: bool,
+) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
     let mut inv = GhInvocation::new(
         Operation::new(site.caller),
         AccessIntent::Read,
@@ -325,6 +365,9 @@ fn run_fetch(
     }
     if let Some(dir) = cwd {
         inv = inv.current_dir(dir);
+    }
+    if strip_token_env {
+        inv = inv.without_token_env();
     }
     let out = match inv.gh_config_dir(reader_dir).execute() {
         Ok(GhCompletion::Captured(Completion::Exited(out))) => out,

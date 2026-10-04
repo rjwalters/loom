@@ -145,6 +145,7 @@ impl Heuristic for LandV3 {
                 always_merge: true,
                 censoring: true,
                 adjust: Some(adjust),
+                models_hold: false,
             },
             &input,
             history,

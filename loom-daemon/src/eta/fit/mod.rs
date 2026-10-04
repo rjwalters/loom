@@ -19,14 +19,19 @@
 //! quantile functions, Cholesky) — no new crate, since `Cargo.toml` is a
 //! Champion auto-merge veto pattern.
 //!
-//! Building training rows from fleet history, the `eta fit` CLI and the daily
-//! refit are #10245; this module never reads fleet data.
+//! Two modules around that core are #10245's:
+//!
+//! - [`rows`] builds the training rows and dwells from fleet snapshots at a
+//!   cutoff `T` (pure; the point-in-time rules are in its docs);
+//! - [`run`] is the I/O around it: read the snapshots, fit, write and prune
+//!   the coefficient files, and decide when the daily refit is due. The
+//!   `eta fit` CLI and the daemon's daily task both call it.
 //!
 //! # Purity and determinism
 //!
 //! No clock, no globals beyond the [`coeffs::FIT_DIR_ENV`] test seam, no
-//! randomness, and no I/O outside [`coeffs::write`], [`coeffs::read`] and
-//! [`coeffs::load_latest`]. Rows are processed in the order given — canonical
+//! randomness, and no I/O outside [`coeffs::write`], [`coeffs::read`],
+//! [`coeffs::load_latest`] and [`run`]. Rows are processed in the order given — canonical
 //! ordering is the caller's job — so the same input gives a byte-identical
 //! file. Byte identity is per build and platform: `ln`, `exp` and `sin` come
 //! from the platform libm. The file's `id` is derived from its content, never
@@ -41,8 +46,8 @@
 //!
 //! - [`FitStage`]: `review_wait`, `doctor_wait`, `merge_wait`, `merge_hold`,
 //!   in that order (`Ord` follows it). Deliberately not [`super::Stage`]:
-//!   `merge_hold` does not exist there until #10218, and the daemon's `doctor`
-//!   is `doctor_wait` here.
+//!   it has only the PR stages, and the daemon's `doctor` is `doctor_wait`
+//!   here ([`FitStage::from_stage`] maps one onto the other).
 //! - [`FEATURES`]: the 20 model features, in the fixture's
 //!   `generator.features` order (not the order of #10221's feature table).
 //! - [`ModelInputs`], [`model_features`] and [`clock`]: the raw per-instant
@@ -63,6 +68,8 @@ pub mod features;
 pub mod logistic;
 pub mod math;
 pub mod paths;
+pub mod rows;
+pub mod run;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -191,8 +198,8 @@ impl FitStage {
     /// The coefficient-set stage of a daemon stage: the PR stages map, and
     /// every pre-PR stage is `None` (the models are PR-level). The one
     /// definition train (#10245) and serve (#10243) share. The match has no
-    /// wildcard, so a new [`super::Stage`] (`merge_hold`, #10218) does not
-    /// compile until it is mapped here.
+    /// wildcard, so a new [`super::Stage`] does not compile until it is
+    /// mapped here; `merge_hold` (#10218) is its own fit stage.
     #[must_use]
     pub fn from_stage(stage: super::Stage) -> Option<FitStage> {
         use super::Stage;
@@ -200,6 +207,7 @@ impl FitStage {
             Stage::ReviewWait => Some(FitStage::ReviewWait),
             Stage::Doctor => Some(FitStage::DoctorWait),
             Stage::MergeWait => Some(FitStage::MergeWait),
+            Stage::MergeHold => Some(FitStage::MergeHold),
             Stage::ReadyWait | Stage::SweepCurator | Stage::SweepBuilder => None,
         }
     }

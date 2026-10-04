@@ -10,7 +10,18 @@
 //! ```text
 //! ready_wait → sweep.curator → sweep.builder → review_wait ─┬─ approved ──→ merge_wait → landed
 //!                                              └─ changes_requested → doctor ─┘ (loop, capped)
+//!                                                       approved + operator hold: merge_hold ⇄ merge_wait
 //! ```
+//!
+//! `merge_hold` (#10218) is an approved PR held for a human (`loom:pr` plus
+//! `loom:operator`, `loom:operator-only` or `loom:operator-decision`). It
+//! leaves to `merge_wait` when the hold is lifted, or to `doctor`, a merge or
+//! a close. Every path-engine heuristic still refuses it as `blocked` (the
+//! shadow `land-2026-10-04-twin-otter` estimates it from its fit's own
+//! `merge_hold` stage), and the `merge_wait` samples still run from the
+//! approval to the merge, hold
+//! included (the **pooled** definition); the hold-free `merge_wait` and the
+//! hold itself live in [`episodes`], the record a hold-aware heuristic fits.
 //!
 //! `ready_wait` (#9326) is the stage a ready (`loom:issue`) issue spends
 //! waiting for a dispatch slot. Its distribution is the host's empirical
@@ -87,13 +98,17 @@ pub mod backtest;
 pub mod calibration_log;
 pub mod config;
 pub mod emit;
+pub mod episodes;
 pub mod explanation;
 pub mod fit;
+pub mod flag_timeline;
 pub mod fleet;
 pub mod fleet_agreement;
 pub mod fleet_events;
 pub mod fleet_events_forge;
 pub mod fleet_events_pulls;
+pub mod fleet_fetch;
+pub mod fleet_refresh;
 pub mod fleet_state;
 pub mod friction;
 pub mod grid;
@@ -201,16 +216,22 @@ pub enum Stage {
     /// is one slot turnover.
     #[serde(rename = "ready_wait")]
     ReadyWait,
+    /// Approved, held for a human (#10218): `loom:pr` plus an operator hold
+    /// ([`labels::MERGE_HOLD_LABELS`]). Declared last, so the derived `Ord`
+    /// every canonical ordering sorts on is unchanged for the other six.
+    #[serde(rename = "merge_hold")]
+    MergeHold,
 }
 
 /// How many [`Stage`] variants there are: the length of per-stage arrays.
-pub const STAGE_COUNT: usize = 6;
+pub const STAGE_COUNT: usize = 7;
 
 impl Stage {
     /// Every post-dispatch stage, in path order. `ready_wait` precedes them
     /// on an unstarted issue's path but is deliberately not in this list, so
     /// every output built over it before #9326 is unchanged ([`Self::EVERY`]
-    /// has all six).
+    /// has all seven). `merge_hold` (#10218) is not in it either, for the same
+    /// reason: no path-engine heuristic visits it.
     pub const ALL: [Stage; 5] = [
         Stage::SweepCurator,
         Stage::SweepBuilder,
@@ -219,7 +240,8 @@ impl Stage {
         Stage::MergeWait,
     ];
 
-    /// Every stage, in path order, `ready_wait` first.
+    /// Every stage, in path order, `ready_wait` first and `merge_hold` last
+    /// (it is visited only on a path that starts there, before `merge_wait`).
     pub const EVERY: [Stage; STAGE_COUNT] = [
         Stage::ReadyWait,
         Stage::SweepCurator,
@@ -227,6 +249,7 @@ impl Stage {
         Stage::ReviewWait,
         Stage::Doctor,
         Stage::MergeWait,
+        Stage::MergeHold,
     ];
 
     /// The wire name.
@@ -239,6 +262,7 @@ impl Stage {
             Stage::Doctor => "doctor",
             Stage::MergeWait => "merge_wait",
             Stage::ReadyWait => "ready_wait",
+            Stage::MergeHold => "merge_hold",
         }
     }
 
@@ -252,6 +276,7 @@ impl Stage {
             Stage::Doctor => 3,
             Stage::MergeWait => 4,
             Stage::ReadyWait => 5,
+            Stage::MergeHold => 6,
         }
     }
 
@@ -471,6 +496,15 @@ pub struct CurrentStage {
     pub age_source: AgeSource,
     /// Judge rejections this PR has already taken.
     pub rework_rounds: u32,
+    /// When the current **stage episode** began, when it differs from
+    /// `entered_at` (#10218): the instant an operator hold was lifted, for a
+    /// PR back in `merge_wait` after a `merge_hold`. `entered_at` keeps the
+    /// pooled definition (the approval) that every shipped heuristic reads;
+    /// a hold-aware heuristic reads the split age from here. `None` means
+    /// "the same as `entered_at`". Not copied into the explanation's
+    /// `current_stage`, so no shipped explanation changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_entered_at: Option<DateTime<Utc>>,
 }
 
 /// The resolved present of one item: a stage, or the reason it has none.

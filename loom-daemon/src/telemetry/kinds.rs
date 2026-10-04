@@ -161,6 +161,9 @@ pub struct TelemetryKindMeta {
 /// `eta.estimate` / `eta.outcome` (#9289).
 pub mod eta;
 
+/// `eta.fleet_refresh` (#10263).
+pub mod eta_fleet_refresh;
+
 /// `eta.snapshot` (#9329).
 pub mod eta_snapshot;
 
@@ -372,6 +375,12 @@ macro_rules! telemetry_kind_table {
             /// See [`session_output`].
             SessionOutput = "session.output" => $crate::telemetry::kinds::session_output::SessionOutputRecord,
                 gate: 13, otlp: Logs, native: false;
+
+            /// One repo's outcome in one cycle of the daemon's fleet snapshot
+            /// refresh (Issue #10263). OTLP-only, like the other `eta.*` log
+            /// kinds. See [`eta_fleet_refresh`].
+            EtaFleetRefresh = "eta.fleet_refresh" => $crate::telemetry::kinds::eta_fleet_refresh::EtaFleetRefreshRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
             // NEW_KIND_SCHEMA_VERSION). Do not renumber or reorder existing rows —

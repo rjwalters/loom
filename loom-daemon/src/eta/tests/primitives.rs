@@ -117,9 +117,18 @@ fn blocked_labels_return_no_estimate() {
     for hold in required {
         assert!(hold_labels().contains(&hold), "{hold} is a hold label");
         for stage_label in ["loom:review-requested", "loom:changes-requested", "loom:pr"] {
+            // #10218: an operator hold on an approved PR is the `merge_hold`
+            // stage (which every shipped heuristic still refuses `blocked`).
+            let expected = if stage_label == "loom:pr"
+                && crate::eta::labels::MERGE_HOLD_LABELS.contains(&hold)
+            {
+                Ok(Stage::MergeHold)
+            } else {
+                Err(NoEstimateReason::Blocked)
+            };
             assert_eq!(
                 stage_from_pr_labels(&labels(&[stage_label, hold])),
-                Err(NoEstimateReason::Blocked),
+                expected,
                 "{hold} on {stage_label}"
             );
         }

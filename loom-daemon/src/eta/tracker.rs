@@ -16,6 +16,8 @@
 //!   observed at most one pass late.
 //! - An item first seen mid-stage (a daemon restart) has only a lower bound
 //!   on its entry (`updated_at`); the stage it leaves then has no duration.
+//! - An approved PR held for a human (`merge_hold`, #10218) is an overlay on
+//!   its pooled `merge_wait`, never a transition of it (`tracker_hold.rs`).
 //!
 //! # Outcomes
 //!
@@ -156,6 +158,8 @@ struct Item {
     /// Issue, sweep and verdict observations, each with its `known_at`
     /// (#10231).
     facts: item_facts::ItemFacts,
+    /// The operator-hold overlay on a pooled `merge_wait` (#10218).
+    hold: hold::Hold,
 }
 
 /// A PR row from a review-label listing.
@@ -740,6 +744,11 @@ impl Tracker {
             // leaving the listing later re-queues the read.
             item.needs_pr_read = false;
             item.needs_issue_read = false;
+            // #10218: `merge_hold` is an overlay; see `tracker_hold.rs`.
+            if self.hold_listing(&key, pr, is_new, now, resolution_sec, &mut effects) {
+                continue;
+            }
+            let item = self.item(repo, pr.issue);
             let resolved = stage_from_pr_labels(&pr.labels);
             let before = (item.refused, item.stage.as_ref().map(|s| s.stage), item.rework_rounds);
             item.refused = resolved.err();
@@ -872,6 +881,7 @@ impl Tracker {
             return effects;
         }
         let pr = item.pr_number;
+        effects.journal.extend(self.hold_resolved(key, state, now));
         match state {
             PrState::Merged(at) => {
                 let mut row =
@@ -1101,7 +1111,9 @@ impl Tracker {
             // for the answer instead (it is retried every pass).
             return None;
         }
-        let current = if let Some(reason) = item.refused {
+        let current = if let Some(held) = hold::held_stage(item, now) {
+            CurrentState::At(held)
+        } else if let Some(reason) = item.refused {
             CurrentState::Refused(reason)
         } else if item.verdict_pending_since.is_some() {
             // Between a verdict and the event that says which way it went:
@@ -1118,14 +1130,16 @@ impl Tracker {
                 age_sec: (now - stage.entered_at).num_seconds().max(0),
                 age_source: stage.source,
                 rework_rounds: item.rework_rounds,
+                episode_entered_at: hold::episode_entered_at(item),
             })
         };
         let mut subject =
             Subject::new(&item.repo, ctx.repo_ids.get(&key.repo).copied(), item.issue);
         subject.pr_number = item.pr_number;
         subject.sweep_id = item.sweep_id.clone().filter(|_| item.sweep_running);
+        let described = hold::described(&current);
         let (mut features, mut omitted) =
-            self.features_for(key, item, &current, ready_only, ctx, now);
+            self.features_for(key, item, &described, ready_only, ctx, now);
         let labels = (!item.labels.is_empty()).then_some(item.labels.as_slice());
         self.friction
             .apply(&item.repo, item.pr_number, labels, now, &mut features, &mut omitted);
@@ -1245,6 +1259,9 @@ mod item_facts;
 pub use item_facts::{DispatchMeta, IssueRow, RegistryMeta};
 
 pub use features::{events_from_journal, ListedPr, NOT_LISTED_YET};
+
+#[path = "tracker_hold.rs"]
+mod hold;
 
 pub use ready::{
     ReadyPlan, ReadyRow, READY_FIRST_SEEN, READY_PLAN_MAX_AGE_SECS, SLOT_TURNOVER_REPO,

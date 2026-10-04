@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use loom_daemon::cmd_out::Query;
-use loom_daemon::eta::backtest::{self, BacktestReport, Bucket, Comparison, Filter};
+use loom_daemon::eta::backtest::{self, Filter};
 use loom_daemon::eta::config::HistoryScopeMode;
 use loom_daemon::eta::explanation::{Explanation, Features};
 use loom_daemon::eta::fleet;
@@ -78,6 +78,9 @@ pub(crate) enum EtaCommand {
     /// Point-in-time walk-forward evaluation on logged estimate/outcome
     /// pairs (#10193): a heuristic's logged estimates vs a fitted model.
     Offline(super::eta_offline_cmd::EtaOfflineArgs),
+    /// Fit the `eta-fit/v1` coefficient file from the fleet snapshots at a
+    /// cutoff (#10245): `loom-daemon eta fit [--as-of RFC3339] [--dry-run]`.
+    Fit(super::eta_fit_cmd::EtaFitArgs),
 }
 
 impl EtaCommand {
@@ -90,6 +93,7 @@ impl EtaCommand {
             EtaCommand::Promote(args) => args.run(),
             EtaCommand::Fleet { command } => command.run(),
             EtaCommand::Offline(args) => args.run(),
+            EtaCommand::Fit(args) => args.run(),
         }
     }
 }
@@ -420,7 +424,7 @@ impl EtaBacktestArgs {
             if self.json {
                 println!("{}", serde_json::to_string_pretty(&comparison)?);
             } else {
-                print!("{}", render_comparison(&comparison));
+                print!("{}", super::eta_backtest_render::render_comparison(&comparison));
             }
             return Ok(());
         }
@@ -429,7 +433,7 @@ impl EtaBacktestArgs {
         if self.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
-            print!("{}", render_report(&report));
+            print!("{}", super::eta_backtest_render::render_report(&report));
         }
         Ok(())
     }
@@ -663,6 +667,7 @@ fn resolve_current(
                     // least one on its own, so 0 is the honest "unknown"
                     // value everywhere else.
                     rework_rounds: 0,
+                    episode_entered_at: None,
                 })
             }
             Err(reason) => CurrentState::Refused(reason),
@@ -676,6 +681,7 @@ fn resolve_current(
             age_sec,
             age_source: AgeSource::Checkpoint,
             rework_rounds: u32::from(stage == Stage::Doctor),
+            episode_entered_at: None,
         });
     }
     CurrentState::Refused(
@@ -689,11 +695,13 @@ fn resolve_current(
 /// or any open PR under review"): both kinds for a running sweep (the
 /// checkpoint path) or a refusal (so a hold/gate is reported for either kind a
 /// caller asks about), `land` only for an open PR with no known running sweep.
+/// A held PR (`merge_hold`, #10218) is reported like the refusal it was
+/// before the stage existed: every shipped heuristic refuses it `blocked`.
 #[must_use]
 fn eligible_kinds(current: &CurrentState, has_open_pr: bool) -> &'static [Kind] {
     match current {
         CurrentState::Refused(_) => &[Kind::Finish, Kind::Land],
-        CurrentState::At(_) if has_open_pr => &[Kind::Land],
+        CurrentState::At(c) if has_open_pr && c.stage != Stage::MergeHold => &[Kind::Land],
         CurrentState::At(_) => &[Kind::Finish, Kind::Land],
     }
 }
@@ -1009,51 +1017,6 @@ impl EtaListArgs {
     }
 }
 
-fn render_bucket(name: &str, b: &Bucket) -> String {
-    format!(
-        "  {name:<28} n={:<5} scored={:<5} refused={:<5} pinball={:>10} coverage={:>7} bias={:>10}\n",
-        b.n,
-        b.scored,
-        b.refused,
-        b.mean_pinball_loss_sec
-            .map(|v| format!("{v:.1}"))
-            .unwrap_or_else(|| "-".to_string()),
-        b.coverage
-            .map(|v| format!("{:.1}%", v * 100.0))
-            .unwrap_or_else(|| "-".to_string()),
-        b.bias_sec
-            .map(|v| format!("{v:.1}"))
-            .unwrap_or_else(|| "-".to_string()),
-    )
-}
-
-fn render_report(r: &BacktestReport) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("ETA backtest: {} ({})\n", r.heuristic, r.kind));
-    out.push_str(&render_bucket("overall", &r.overall));
-    if !r.by_repo.is_empty() {
-        out.push_str("by repo:\n");
-        for (repo, b) in &r.by_repo {
-            out.push_str(&render_bucket(repo, b));
-        }
-    }
-    if !r.by_horizon.is_empty() {
-        out.push_str("by horizon:\n");
-        for (h, b) in &r.by_horizon {
-            out.push_str(&render_bucket(h, b));
-        }
-    }
-    out
-}
-
-fn render_comparison(c: &Comparison) -> String {
-    let mut out = String::new();
-    out.push_str(&render_report(&c.a));
-    out.push_str(&render_report(&c.b));
-    out.push_str(&format!("better: {}\n", c.better.as_deref().unwrap_or("tie / neither scored")));
-    out
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1120,6 +1083,7 @@ mod tests {
                 age_sec: 0,
                 age_source: AgeSource::UpdatedAtLowerBound,
                 rework_rounds: 0,
+                episode_entered_at: None,
             })
         );
     }
@@ -1248,6 +1212,7 @@ mod tests {
             age_sec: 0,
             age_source: AgeSource::UpdatedAtLowerBound,
             rework_rounds: 0,
+            episode_entered_at: None,
         });
         assert_eq!(eligible_kinds(&current, true), &[Kind::Land]);
     }
