@@ -13,10 +13,6 @@
 #   it. The three `fleet/drain.rs` entries are that pre-existing debt made
 #   visible, not new sites: they set the child's `PATH` (which also steers
 #   program lookup), an env the facade does not carry yet.
-# - The three `live_gh_guard.rs` entries landed on main with #10138 without
-#   an allowlist update (main's ratchet was red). They are `cfg(test)` only
-#   and must spawn the bare name `gh` to prove the PATH stand-in intercepts
-#   it, so they can never route through the facade.
 #
 # Empty list == migration complete.
 
@@ -24,8 +20,5 @@ src/fleet/drain.rs | let mut comment_cmd = Command::new(crate::gh_invocation::gh
 src/fleet/drain.rs | let mut edit_cmd = Command::new(crate::gh_invocation::gh_bin());
 src/fleet/drain.rs | let mut view_cmd = Command::new(crate::gh_invocation::gh_bin());
 src/forge_cmd.rs | pub(crate) fn gh_bin() -> String {
-src/live_gh_guard.rs | let _ = Command::new("gh")
-src/live_gh_guard.rs | let out = Command::new("gh")
-src/live_gh_guard.rs | let out = Command::new("gh").env("PATH", path).output().unwrap();
 src/pipeline_snapshot.rs | match Command::new(gh_bin).arg("--version").output() {
 src/tokens_pool/private_workspace/repository.rs | let mut helper = Command::new("gh").args(["auth", "git-credential", "get"])
