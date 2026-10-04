@@ -215,7 +215,14 @@ while [[ $# -gt 0 ]]; do
       SKIP_DUP_CHECK=true
       shift
       ;;
-    --parent) PARENT="${2:-}"; shift 2 ;;
+    --parent)
+      PARENT="${2:-}"
+      if [[ ! "$PARENT" =~ ^[0-9]+$ ]]; then
+        echo "create-issue.sh: --parent takes an issue number (got '${PARENT}'); nothing was filed" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
     --duplicate-threshold)
       DUP_THRESHOLD="${2:-}"
       if [[ ! "$DUP_THRESHOLD" =~ ^[0-9]+$ ]]; then

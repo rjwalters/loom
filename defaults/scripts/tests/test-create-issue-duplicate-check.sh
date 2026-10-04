@@ -610,6 +610,14 @@ assert_eq "$RC" "1" "--parent with no loom-daemon exits 1"
 assert_contains "$OUT" "needs loom-daemon" "…and says why"
 assert_eq "$(cat "$GH_CREATES")" "" "…and nothing was filed"
 
+# An explicitly empty or non-numeric --parent is an argument error, not "absent".
+for BAD_PARENT in "" "abc"; do
+    run_create --title "Bad parent" --body "Body." --parent "$BAD_PARENT"
+    assert_eq "$RC" "2" "--parent '$BAD_PARENT' exits 2"
+    assert_contains "$OUT" "--parent takes an issue number" "…and says why"
+    assert_eq "$(cat "$GH_CREATES")" "" "…and nothing was filed"
+done
+
 echo
 echo "=== $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed ==="
 [[ "$TESTS_FAILED" -eq 0 ]]
