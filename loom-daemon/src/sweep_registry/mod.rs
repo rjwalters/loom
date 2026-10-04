@@ -113,6 +113,7 @@ pub(crate) mod crash_signals;
 // `generate_sweep_id` lives with the `SweepKind` it names (model.rs) — moved out
 // of this ratcheted file; re-exported for the existing callers.
 pub use model::generate_sweep_id;
+mod config_paths;
 mod decline_cooldown;
 mod dispatch;
 mod guards;
@@ -253,6 +254,10 @@ pub struct SweepRegistryConfig {
     /// [`outcomes_journal_path`](Self::outcomes_journal_path) — see the
     /// `sweep_outcomes` module doc for why the two are kept separate.
     pub outcome_telemetry_path: Option<PathBuf>,
+    /// Forge-egress policy sources for the dispatch gate (#9999). `None`
+    /// means `PolicySources::from_process`; `new` pins the unconfigured
+    /// default under `cfg(test)` so tests never read the host policy.
+    pub forge_egress_sources: Option<crate::forge_egress::policy::PolicySources>,
 }
 
 impl SweepRegistryConfig {
@@ -267,36 +272,12 @@ impl SweepRegistryConfig {
             journal_path: None,
             outcomes_journal_path: None,
             outcome_telemetry_path: None,
+            forge_egress_sources: if cfg!(test) {
+                Some(crate::forge_egress::policy::PolicySources::default())
+            } else {
+                None
+            },
         }
-    }
-
-    /// Resolve the sweep journal path: `journal_path` explicit override, else
-    /// [`sweep_journal::default_journal_path`].
-    pub fn resolve_journal_path(&self) -> Result<PathBuf> {
-        if let Some(ref p) = self.journal_path {
-            return Ok(p.clone());
-        }
-        sweep_journal::default_journal_path()
-    }
-
-    /// Resolve the durable terminal-outcomes journal path (Issue #4644):
-    /// `outcomes_journal_path` explicit override, else
-    /// [`sweep_outcomes::default_outcomes_path`].
-    #[must_use]
-    pub fn resolve_outcomes_journal_path(&self) -> PathBuf {
-        self.outcomes_journal_path
-            .clone()
-            .unwrap_or_else(|| sweep_outcomes::default_outcomes_path(&self.workspace_root))
-    }
-
-    /// Resolve the `sweep.outcome` telemetry journal path (Issue #4704):
-    /// `outcome_telemetry_path` explicit override, else
-    /// [`sweep_outcomes::default_outcome_telemetry_path`].
-    #[must_use]
-    pub fn resolve_outcome_telemetry_path(&self) -> PathBuf {
-        self.outcome_telemetry_path
-            .clone()
-            .unwrap_or_else(|| sweep_outcomes::default_outcome_telemetry_path(&self.workspace_root))
     }
 
     /// Resolve the spawn binary, preferring (in order):
