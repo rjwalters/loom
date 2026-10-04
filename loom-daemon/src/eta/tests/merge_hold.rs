@@ -233,7 +233,7 @@ fn a_hold_aware_explanation_starts_at_merge_hold_and_recomputes_exactly() {
     // Only the serialized JSON crosses this line.
     let parsed: Explanation =
         serde_json::from_str(&serde_json::to_string(&explanation).unwrap()).unwrap();
-    assert_eq!(run_explanation(&parsed), explanation.quantiles());
+    assert_eq!(run_explanation(&parsed), explanation.quantiles_with_p90());
     assert_eq!(run_marks(&parsed).as_ref(), Some(&result.stage_marks));
 }
 
