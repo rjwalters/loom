@@ -34,6 +34,7 @@ use serde_json::Value;
 
 use super::fetch::{Reply, Transport};
 use crate::credential_preflight::{self as cp, GithubAppMinter, GithubAppOutcome};
+use crate::forge_call_stats::{ops, ForgeOp};
 use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
 use crate::proc_exec::Completion;
 
@@ -127,7 +128,7 @@ impl GhTransport {
         etag: Option<&str>,
     ) -> Result<(Option<crate::forge_listing::HttpResponse>, String, bool)> {
         let mut inv = self
-            .invocation("fleet_store", AccessIntent::Read, cred)
+            .invocation("fleet_store", ops::GIT_READ_OBJECTS, AccessIntent::Read, cred)
             .args(["api", "--include", "--method", "GET"]);
         if let Some(a) = accept {
             inv = inv.arg("-H").arg(format!("Accept: {a}"));
@@ -146,9 +147,14 @@ impl GhTransport {
     /// A facade invocation of this transport's `gh` in the workspace, under
     /// `cred` (`Ambient` = the facade's own lookup, which is the process's
     /// credential when no App — hence no per-owner config dir — is set up).
+    ///
+    /// Accounted under `forge_op` against the store repository (#9831). The
+    /// target stays [`GhTarget::None`] — the credential is chosen here, not by
+    /// the facade's owner lookup — so the repo is named for accounting only.
     fn invocation(
         &self,
         op: &'static str,
+        forge_op: ForgeOp,
         intent: AccessIntent,
         cred: &Credential,
     ) -> GhInvocation {
@@ -157,6 +163,8 @@ impl GhTransport {
             Credential::Ambient => None,
         };
         GhInvocation::new(Operation::new(op), intent, GhTarget::None, GH_TIMEOUT)
+            .forge_op(forge_op)
+            .identity_scope(None, Some(&self.repo))
             .program(&self.gh_bin)
             .current_dir(&self.workspace_root)
             .gh_config_dir(dir)
@@ -193,7 +201,12 @@ impl GhTransport {
             .and_then(|()| input.flush())
             .context("writing the gh api request body")?;
         let inv = self
-            .invocation("fleet_store_write", AccessIntent::Write, &cred)
+            .invocation(
+                "fleet_store_write",
+                ops::GIT_WRITE_REFS_AND_CONTENTS,
+                AccessIntent::Write,
+                &cred,
+            )
             .args(["api", "--include", "--method", method, api_path, "--input"])
             .arg(input.path());
         let out = self.output(inv)?;

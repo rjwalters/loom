@@ -8,7 +8,8 @@
 
 use super::GhInvocation;
 use crate::forge_call_stats;
-use crate::forge_etag_store::{fetch_conditional, Target};
+use crate::forge_call_stats::ops;
+use crate::forge_etag_store::{fetch_conditional, ConditionalRead, Target};
 use crate::gh_invocation::{AccessIntent, GhTarget, Operation};
 use crate::types::ForgeCallCounts;
 use serial_test::serial;
@@ -72,9 +73,15 @@ fn etag_store_fetch_is_counted_once_per_call_and_a_304_is_free() {
     let mut statuses = Vec::new();
     let rows = rows_after(|| {
         for etag in [None, Some("W/\"e1\""), Some("W/\"e1\"")] {
-            let (_, response, _) =
-                fetch_conditional("work_finder", &gh, Some(tmp.path()), &target, url, etag)
-                    .unwrap();
+            let (_, response, _) = fetch_conditional(
+                ConditionalRead::new("work_finder", ops::ISSUE_LIST),
+                &gh,
+                Some(tmp.path()),
+                &target,
+                url,
+                etag,
+            )
+            .unwrap();
             statuses.push(response.map(|r| r.status));
         }
     });

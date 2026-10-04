@@ -243,6 +243,10 @@ pub struct GhInvocation {
     cwd: Option<PathBuf>,
     program: Option<String>,
     config_dir: Option<PathBuf>,
+    /// The #9777 call identity this execution is accounted under (#9831).
+    /// Empty by default: an unmapped site records `operation = "unknown"`
+    /// (see [`accounting`]), visible rather than absent.
+    identity: crate::forge_call_stats::CallIdentity,
 }
 
 impl GhInvocation {
@@ -266,7 +270,37 @@ impl GhInvocation {
             cwd: None,
             program: None,
             config_dir: None,
+            identity: crate::forge_call_stats::CallIdentity::default(),
         }
+    }
+
+    /// Account this execution under an inventoried forge operation (#9831).
+    /// [`Operation`] is the low-cardinality *telemetry* name; this is the
+    /// inventory row (`defaults/forge/operations/*.toml`) the call serves.
+    #[must_use]
+    pub fn forge_op(mut self, op: crate::forge_call_stats::ForgeOp) -> Self {
+        self.identity.operation = crate::forge_call_stats::CallIdentity::for_op(op).operation;
+        self
+    }
+
+    /// The origin host and `owner/repo` the call acts on, for accounting only
+    /// — they change nothing about how the child runs. For a site whose
+    /// [`GhTarget`] is deliberately [`GhTarget::None`] (the credential must
+    /// stay the working directory's) but which still knows its repository.
+    /// `origin` and `repo` stay separate fields: merging them is exactly what
+    /// lets two forges sharing one slug collapse into one row.
+    #[must_use]
+    pub fn identity_scope(mut self, origin: Option<&str>, repo: Option<&str>) -> Self {
+        let id = std::mem::take(&mut self.identity);
+        let id = match origin {
+            Some(o) => id.with_origin(o),
+            None => id,
+        };
+        self.identity = match repo {
+            Some(r) => id.with_repo(r),
+            None => id,
+        };
+        self
     }
 
     /// Append `gh` arguments (the subcommand onward; never the program).

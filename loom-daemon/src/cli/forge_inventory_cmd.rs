@@ -11,6 +11,7 @@
 //! | `gate` | no unclassified/grown call site | a bypass appeared or grew | could not run |
 //! | `report` | always (read-only view) | — | could not run |
 //! | `probe-manifest` | always (read-only view) | — | could not run |
+//! | `observed` | always (read-only view of the host call sink) | — | could not run |
 //!
 //! `gate --update` rewrites the baseline instead of judging it, and
 //! `--manifest-dir` points the whole family at a synthetic manifest so a test
@@ -22,7 +23,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use loom_daemon::forge_inventory::{
-    self, gate, model::Profile, probe, report, validate, Inventory,
+    self, gate, model::Profile, observed, probe, report, validate, Inventory,
 };
 
 #[derive(clap::Subcommand)]
@@ -35,6 +36,10 @@ pub(crate) enum ForgeInventoryCommand {
     Report(ReportArgs),
     /// Emit the hosted-probe work list for one or more profiles.
     ProbeManifest(ProbeArgs),
+    /// Diff inventoried operation IDs against those this host's forge call
+    /// sink observed, in both directions. Runtime traces supplement the
+    /// inventory; they never prove it exhaustive.
+    Observed(ObservedArgs),
 }
 
 impl ForgeInventoryCommand {
@@ -44,6 +49,7 @@ impl ForgeInventoryCommand {
             ForgeInventoryCommand::Gate(a) => a.run(),
             ForgeInventoryCommand::Report(a) => a.run(),
             ForgeInventoryCommand::ProbeManifest(a) => a.run(),
+            ForgeInventoryCommand::Observed(a) => a.run(),
         }
     }
 }
@@ -390,6 +396,42 @@ impl ProbeArgs {
                     e.test_id.as_deref().unwrap_or("-")
                 );
             }
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// observed
+// ============================================================================
+
+#[derive(clap::Args)]
+pub(crate) struct ObservedArgs {
+    #[arg(long, value_name = "DIR")]
+    manifest_dir: Option<PathBuf>,
+    /// Read this sink directory instead of the host's
+    /// (`LOOM_FORGE_CALL_STATS_DIR`, else `${TMPDIR:-/tmp}/loom-forge-call-stats`).
+    #[arg(long, value_name = "DIR")]
+    sink_dir: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+}
+
+impl ObservedArgs {
+    pub(crate) fn run(self) -> Result<()> {
+        let inv = load(self.manifest_dir.as_ref())?;
+        let now = chrono::Utc::now();
+        let seen = match self.sink_dir.as_deref() {
+            Some(dir) => loom_daemon::forge_call_stats::observed_operations_in(dir, now),
+            None => loom_daemon::forge_call_stats::observed_operations(now).context(
+                "the forge call sink is disabled (LOOM_FORGE_CALL_STATS_DIR=off): nothing was observed",
+            )?,
+        };
+        let diff = observed::diff(&inv, &seen);
+        if self.json {
+            println!("{}", serde_json::to_string_pretty(&diff)?);
+        } else {
+            print!("{}", observed::render_text(&diff));
         }
         Ok(())
     }
