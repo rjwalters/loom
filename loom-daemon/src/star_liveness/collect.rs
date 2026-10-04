@@ -61,13 +61,28 @@ pub const MAX_INHERIT_DEPTH: usize = 3;
 /// counted here.
 pub const MAX_WALK_READS_PER_PASS: usize = 50;
 
+/// Passes a child found closed (or a PR) is skipped without a read before
+/// the walk looks at it again, in case it was reopened.
+const SETTLED_TTL_PASSES: u64 = 20;
+
 /// Cached refusal detections, keyed by (repo, PR) and valid while the PR's
 /// `updated_at` is unchanged, plus the incident a signature search found
 /// (re-checked open every pass).
+///
+/// Also the inheritance walk's memory across passes, so a capped walk makes
+/// progress instead of restarting the same traversal: children it found
+/// closed (or PRs), which cost no read for [`SETTLED_TTL_PASSES`] passes,
+/// and children the cap deferred, which are walked first next pass.
 #[derive(Debug, Default)]
 pub struct RefusalCache {
     entries: HashMap<(String, u32), (Option<String>, Option<Detected>)>,
     incidents: HashMap<(String, u32), u32>,
+    /// Walk passes started (any repo); the clock for `settled`.
+    walk_pass: u64,
+    /// Children that inherit nothing, with the pass that found them so.
+    settled: HashMap<(String, u32), u64>,
+    /// Children the read cap deferred, not yet evaluated.
+    deferred: BTreeSet<(String, u32)>,
 }
 
 /// Everything about the repo that is not a forge read.
@@ -546,19 +561,36 @@ impl<'a> Evaluator<'a> {
         let walk_start = self.reads;
         let cap = walk_start + MAX_WALK_READS_PER_PASS;
         self.read_cap = Some(cap);
+        let slug = self.ctx.slug.to_string();
+        self.refusals.walk_pass += 1;
+        let now = self.refusals.walk_pass;
+        self.refusals
+            .settled
+            .retain(|_, at| now.saturating_sub(*at) < SETTLED_TTL_PASSES);
         for _ in 0..MAX_INHERIT_DEPTH {
             let mut next = Vec::new();
             for (parent, inherits) in frontier {
-                for edge in self.children(parent, &inherits) {
+                let mut children = self.children(parent, &inherits);
+                // Children the last pass deferred go first (stable sort).
+                children
+                    .sort_by_key(|e| !self.refusals.deferred.contains(&(slug.clone(), e.child)));
+                for edge in children {
                     let child = edge.child;
+                    let key = (slug.clone(), child);
                     graph.push(edge);
                     if !seen.insert(child) {
                         continue;
                     }
+                    if self.refusals.settled.contains_key(&key) {
+                        continue;
+                    }
                     let Some(issue) = self.issue(child) else {
+                        self.refusals.deferred.insert(key);
                         continue;
                     };
                     if issue.is_pull_request || !issue.state.eq_ignore_ascii_case("open") {
+                        self.refusals.deferred.remove(&key);
+                        self.refusals.settled.insert(key, now);
                         continue;
                     }
                     if self.reads + self.pending_blocker_reads(&issue) > cap {
@@ -567,8 +599,10 @@ impl<'a> Evaluator<'a> {
                              this pass; #{child} waits for a later one",
                             self.ctx.slug
                         );
+                        self.refusals.deferred.insert(key);
                         continue;
                     }
+                    self.refusals.deferred.remove(&key);
                     let e = self.evaluate_one(&issue, None, None);
                     next.push((child, e.landing.inherits.clone()));
                     found.push(e);

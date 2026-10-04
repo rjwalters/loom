@@ -179,3 +179,74 @@ fn a_child_whose_blocker_reads_would_cross_the_cap_waits() {
     assert!(inherited(&r).is_empty(), "#200 waits for a later pass");
     assert_eq!(world.repo(slug).issue_reads, MAX_WALK_READS_PER_PASS);
 }
+
+/// Repeated passes over unchanged forge data make progress: closed children
+/// the capped walk already read are not read again, so an open child past
+/// them is reached on a later pass, with its descendants, and every pass
+/// stays within the read cap (#10073 review).
+#[test]
+fn repeated_passes_reach_a_child_behind_a_cap_of_closed_children() {
+    use crate::star_liveness::collect::MAX_WALK_READS_PER_PASS;
+    let world = World::default();
+    let slug = "i/cap3";
+    let mut list = String::new();
+    for n in 100..160 {
+        list.push_str(&format!("- [x] #{n}\n"));
+        let mut c = issue(n, &["loom:issue"]);
+        c.state = "closed".into();
+        world.add(slug, c);
+    }
+    list.push_str("- [ ] #200\n");
+    world.add(slug, issue_with_body(200, &["loom:issue"], "- [ ] #201\n"));
+    world.add(slug, issue(201, &["loom:issue"]));
+    world.add(slug, issue_with_body(1, &[STAR, "loom:issue"], &list));
+    let mut input = repo_input(slug);
+    starred(&mut input, 1, AT);
+    let mut host = Host::new("host-a");
+    let mut reached = None;
+    let mut before = world.repo(slug).issue_reads;
+    for pass in 0..4 {
+        let r = host.pass(&world, &[input.clone()], Vec::new(), t(10, pass));
+        let after = world.repo(slug).issue_reads;
+        assert!(after - before <= MAX_WALK_READS_PER_PASS, "pass {pass} stays within the cap");
+        before = after;
+        let got: Vec<u32> = inherited(&r).into_iter().map(|(n, _, _)| n).collect();
+        if got.contains(&200) {
+            assert!(got.contains(&201), "the deferred child's descendants inherit too");
+            reached = Some(pass);
+            break;
+        }
+    }
+    assert_eq!(reached, Some(1), "#200 inherits on the second pass");
+}
+
+/// A child whose blocker reads do not fit the budget on one pass fits on a
+/// later one, because the closed children before it no longer cost reads.
+#[test]
+fn repeated_passes_reach_a_child_whose_blocker_reads_did_not_fit() {
+    use crate::star_liveness::collect::MAX_WALK_READS_PER_PASS;
+    let world = World::default();
+    let slug = "i/cap4";
+    let mut list = String::new();
+    for n in 100..149 {
+        list.push_str(&format!("- [x] #{n}\n"));
+        let mut c = issue(n, &["loom:issue"]);
+        c.state = "closed".into();
+        world.add(slug, c);
+    }
+    list.push_str("- [ ] #200\n");
+    world.add(slug, issue_with_body(200, &["loom:blocked"], "Blocked by #301 and #302\n"));
+    world.add(slug, issue(301, &["loom:issue"]));
+    world.add(slug, issue(302, &["loom:issue"]));
+    world.add(slug, issue_with_body(1, &[STAR, "loom:issue"], &list));
+    let mut input = repo_input(slug);
+    starred(&mut input, 1, AT);
+    let mut host = Host::new("host-a");
+    let first = host.pass(&world, &[input.clone()], Vec::new(), t(10, 0));
+    assert!(inherited(&first).is_empty(), "#200 waits on the first pass");
+    let before = world.repo(slug).issue_reads;
+    let second = host.pass(&world, &[input], Vec::new(), t(10, 1));
+    assert!(world.repo(slug).issue_reads - before <= MAX_WALK_READS_PER_PASS);
+    let got: Vec<u32> = inherited(&second).into_iter().map(|(n, _, _)| n).collect();
+    assert_eq!(got, vec![200], "#200 inherits once the settled children are free");
+}
