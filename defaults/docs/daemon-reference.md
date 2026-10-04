@@ -2379,6 +2379,46 @@ repo (no enabled `buildGate`), there is no verified-red signal, so the latest
 `main` CI conclusion stands in for key 3: one cached `gh run list` per repo per
 tick, made only when the repo has a marker-bearing candidate.
 
+### Fleet-degraded operator alert (`autonomous.fleetAlert`, #10164)
+
+`loom-daemon health` computes DEGRADED only when a human runs it. With
+`autonomous.fleetAlert.enabled`, a background thread
+(`loom-daemon/src/fleet_alert/`) reads the daemon's own `DaemonStatus` over its
+IPC socket every `intervalSecs` and pushes an alert for any of three
+conditions, each keyed and alerted independently:
+
+| Key | Condition | Cause and fix named in the alert |
+|-----|-----------|----------------------------------|
+| `tokens-zero-healthy` | zero healthy token accounts | `auth_401` (blocked, no `.bad_tokens` history, never self-heals): re-auth / `tokens import-from-monitor` / `tokens unblock`; exhausted: wait or add accounts; empty pool: `tokens bootstrap` |
+| `dispatch-halted` | main-health gate halted, or the last tick halted while tokens are still available | read `health`'s dispatch section |
+| `roles-persistent` | one or more roles with PERSISTENT tick failures | a launch refused for a missing guarded-canary receipt (exit 78) is named as a runtime/version mismatch (`runtimes.default`, opencode version) |
+
+An unreachable status changes nothing (unknown is not healthy). A condition must
+hold `debounceTicks` consecutive ticks before one `Started` alert; one `Cleared`
+alert follows after `debounceTicks` good ticks; a still-held condition re-alerts
+at most once per `reminderHours` (so 24h is `1 + floor(24h / reminder)` alerts).
+Active alerts persist in `.loom/logs/fleet-alert-state.json`, so a restart does
+not re-announce them.
+
+Delivery is two independent sinks (one failing never suppresses the other):
+the event bus (an `operator_priority.escalation` event with issue `0`, which the
+Safehouse sink relays to the team Matrix room) and the loom-ui inbox
+(`LOOM_UI_INBOX_URL` + `LOOM_UI_INGEST_KEY`; keyed
+`mail-<host>-fleet-degraded-<condition>`, `resolve: true` on clear; the key is
+sent only as a Bearer header, never on argv or in logs; unset logs once and
+skips). **No forge call is made anywhere in this path**, so it still delivers
+while `gh` is rate-limited. `loom-daemon health` output and exit codes are
+unchanged.
+
+| Config (`autonomous.fleetAlert.*`) | Env | Default |
+|---|---|---|
+| `enabled` | `LOOM_FLEET_ALERT` | `false` (daemon flags default off) |
+| `reminderHours` | `LOOM_FLEET_ALERT_REMINDER_HOURS` | `6` |
+| `debounceTicks` | `LOOM_FLEET_ALERT_DEBOUNCE_TICKS` | `3` |
+| `intervalSecs` | `LOOM_FLEET_ALERT_INTERVAL_SECS` | `60` |
+
+Precedence is env > config > default.
+
 ### Starred-issue liveness and loom-ui stars (#9244 C)
 
 A starred issue is always either being worked on or escalated to the operator
