@@ -217,6 +217,11 @@ pub struct StageSamples {
     /// backtest` from a replay — and empty everywhere else, so no other
     /// heuristic's estimate can change by construction.
     pub calibration: Vec<super::recalibrate::CalibrationObservation>,
+    /// Stage episodes (#10218): the split stage record a hold-aware heuristic
+    /// fits, `merge_hold` and hold-free `merge_wait` included. Read only
+    /// through [`Self::select_episodes`]; no shipped heuristic reads it, so
+    /// adding it changes no shipped estimate.
+    pub episodes: Vec<super::episodes::StageEpisode>,
     /// Whose history this is (#9343): `Local` when every sample came from
     /// this host's own journals, `Fleet` as soon as one host-independent
     /// (forge-derived) sample is in it. [`Self::merge`] is the only thing that
@@ -329,6 +334,7 @@ impl StageSamples {
         self.verdicts.extend(other.verdicts);
         self.paths.extend(other.paths);
         self.calibration.extend(other.calibration);
+        self.episodes.extend(other.episodes);
         if other.scope == HistoryScope::Fleet {
             self.scope = HistoryScope::Fleet;
         }
@@ -557,6 +563,37 @@ impl StageSamples {
         let mut sorted: Vec<i64> = picked.iter().map(|s| s.duration_sec).collect();
         sorted.sort_unstable();
         sorted
+    }
+
+    /// The stage episodes (#10218) of `stage` for `repo`, as a derivation cut
+    /// at `as_of` would have produced them
+    /// ([`super::episodes::StageEpisode::view_at`]), in canonical order.
+    ///
+    /// The window rule of [`Self::select`], applied to episodes: every
+    /// returned fact was observed strictly before `as_of`. An episode that had
+    /// not started is absent; one that ended before `as_of` is as stored; one
+    /// still running at `as_of` comes back open (censored) at `as_of`, never
+    /// with its later exit. A completed or cut-short episode that ended
+    /// before the window opens is dropped; one still running is kept, however
+    /// old its entry, because it is live evidence at `as_of`.
+    #[must_use]
+    pub fn select_episodes(
+        &self,
+        repo: &str,
+        stage: Stage,
+        as_of: DateTime<Utc>,
+    ) -> Vec<super::episodes::StageEpisode> {
+        let from = window_from(as_of);
+        let mut picked: Vec<super::episodes::StageEpisode> = self
+            .episodes
+            .iter()
+            .filter(|e| e.stage == stage && same_repo(&e.repo, repo))
+            .filter_map(|e| e.view_at(as_of))
+            .filter(|e| e.ended_at().is_none_or(|at| at >= from))
+            .collect();
+        picked.sort_by_key(super::episodes::StageEpisode::key);
+        picked.dedup();
+        picked
     }
 
     /// Verdict counts `(n, rejected)` per attempt `1..=cap` at `level`,

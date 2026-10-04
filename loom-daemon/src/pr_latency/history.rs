@@ -104,6 +104,10 @@ pub struct PrHistory {
     /// request errored). Every segment derived from a partial log is suspect,
     /// so such a PR is reported as *unmeasured*, never as a fast one.
     pub timeline_complete: bool,
+    /// When the PR closed, merged or not (the list's `closedAt`), when the
+    /// source read it. Lets the ETA stage episodes (#10218) end a PR closed
+    /// unmerged at its close; [`PrHistory::new`] leaves it `None`.
+    pub closed_at: Option<DateTime<Utc>>,
 }
 
 impl PrHistory {
@@ -125,7 +129,15 @@ impl PrHistory {
             current_labels,
             events,
             timeline_complete,
+            closed_at: None,
         }
+    }
+
+    /// The same history with [`PrHistory::closed_at`] set.
+    #[must_use]
+    pub fn with_closed_at(mut self, closed_at: Option<DateTime<Utc>>) -> Self {
+        self.closed_at = closed_at;
+        self
     }
 
     /// Time of the first `labeled <label>` event, if any.

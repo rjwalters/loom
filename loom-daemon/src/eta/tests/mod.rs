@@ -104,6 +104,7 @@ pub(crate) fn input_at(stage: Stage, age_sec: i64, rework_rounds: u32) -> Estima
             age_sec,
             age_source: AgeSource::LabelEvent,
             rework_rounds,
+            episode_entered_at: None,
         }),
         features: Features {
             labels: Some(vec!["loom:review-requested".to_string()]),

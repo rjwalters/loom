@@ -39,6 +39,7 @@ impl Heuristic for StartV1 {
                 always_merge: false,
                 censoring: false,
                 adjust: None,
+                models_hold: false,
             },
             input,
             history,

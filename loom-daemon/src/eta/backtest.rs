@@ -327,6 +327,7 @@ fn case_input(case: &ReplayCase, loom: &Provenance) -> EstimateInput {
             age_sec: 0,
             age_source: AgeSource::TrackerObserved,
             rework_rounds: case.rework_rounds,
+            episode_entered_at: None,
         }),
         features: explanation::Features::default(),
         features_omitted: Vec::new(),

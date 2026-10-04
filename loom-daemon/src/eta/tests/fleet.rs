@@ -80,6 +80,7 @@ fn input() -> EstimateInput {
             age_sec: 0,
             age_source: AgeSource::LabelEvent,
             rework_rounds: 0,
+            episode_entered_at: None,
         }),
         features: crate::eta::explanation::Features::default(),
         features_omitted: Vec::new(),
@@ -277,6 +278,7 @@ fn augmenting_a_local_history_reports_fleet_scope_and_both_attributions() {
             age_sec: 0,
             age_source: AgeSource::LabelEvent,
             rework_rounds: 0,
+            episode_entered_at: None,
         }),
         ..input()
     };

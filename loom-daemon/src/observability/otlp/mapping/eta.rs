@@ -181,6 +181,7 @@ mod tests {
                 age_sec: 0,
                 age_source: AgeSource::Bus,
                 rework_rounds: 0,
+                episode_entered_at: None,
             }),
             features: Default::default(),
             features_omitted: Vec::new(),

@@ -663,6 +663,7 @@ fn resolve_current(
                     // least one on its own, so 0 is the honest "unknown"
                     // value everywhere else.
                     rework_rounds: 0,
+                    episode_entered_at: None,
                 })
             }
             Err(reason) => CurrentState::Refused(reason),
@@ -676,6 +677,7 @@ fn resolve_current(
             age_sec,
             age_source: AgeSource::Checkpoint,
             rework_rounds: u32::from(stage == Stage::Doctor),
+            episode_entered_at: None,
         });
     }
     CurrentState::Refused(
@@ -689,11 +691,13 @@ fn resolve_current(
 /// or any open PR under review"): both kinds for a running sweep (the
 /// checkpoint path) or a refusal (so a hold/gate is reported for either kind a
 /// caller asks about), `land` only for an open PR with no known running sweep.
+/// A held PR (`merge_hold`, #10218) is reported like the refusal it was
+/// before the stage existed: every shipped heuristic refuses it `blocked`.
 #[must_use]
 fn eligible_kinds(current: &CurrentState, has_open_pr: bool) -> &'static [Kind] {
     match current {
         CurrentState::Refused(_) => &[Kind::Finish, Kind::Land],
-        CurrentState::At(_) if has_open_pr => &[Kind::Land],
+        CurrentState::At(c) if has_open_pr && c.stage != Stage::MergeHold => &[Kind::Land],
         CurrentState::At(_) => &[Kind::Finish, Kind::Land],
     }
 }
@@ -1120,6 +1124,7 @@ mod tests {
                 age_sec: 0,
                 age_source: AgeSource::UpdatedAtLowerBound,
                 rework_rounds: 0,
+                episode_entered_at: None,
             })
         );
     }
@@ -1248,6 +1253,7 @@ mod tests {
             age_sec: 0,
             age_source: AgeSource::UpdatedAtLowerBound,
             rework_rounds: 0,
+            episode_entered_at: None,
         });
         assert_eq!(eligible_kinds(&current, true), &[Kind::Land]);
     }

@@ -15,6 +15,11 @@
 //! `ready_wait` draws are never age-conditioned: the item's age in the queue
 //! says nothing about the turnover in progress.
 //!
+//! A path from `merge_hold` (#10218) draws the rest of the hold (conditioned
+//! on its age, like any first stage) and then one `merge_wait`; its terminal
+//! is `merge_wait`. No path from any other stage visits `merge_hold`, so
+//! every other draw stream is unchanged.
+//!
 //! The quantiles of the path totals are nearest-rank over the sorted
 //! totals, rounded to whole seconds. p90 (#10211) is read off the same
 //! sorted totals by the same rule, so it costs no draws and leaves p25, p50
@@ -108,13 +113,16 @@ pub struct Simulation {
 impl Simulation {
     /// The explanation's `stage_marks`: one mark per [`Stage::ALL`] stage,
     /// in stage order, projected at wall-clock `as_of` (#9366) — preceded by
-    /// a `ready_wait` mark only when the path starts there (#9326).
+    /// a `ready_wait` mark only when the path starts there (#9326), and
+    /// followed by a `merge_hold` mark only when the path starts there
+    /// (#10218), so no other explanation gains an empty mark.
     #[must_use]
     pub fn stage_marks(&self, as_of: DateTime<Utc>) -> Vec<StageMark> {
         Stage::EVERY
             .iter()
             .filter(|&&stage| {
-                stage != Stage::ReadyWait || self.entry_marks[stage.index()].is_some()
+                !matches!(stage, Stage::ReadyWait | Stage::MergeHold)
+                    || self.entry_marks[stage.index()].is_some()
             })
             .map(|&stage| {
                 let times = self.entry_marks[stage.index()].map(|(p25, p50, p75)| {
@@ -214,6 +222,11 @@ pub fn reachable_path(
             push(Stage::ReviewWait);
         }
         Stage::MergeWait => {
+            push(Stage::MergeWait);
+            return stages;
+        }
+        Stage::MergeHold => {
+            push(Stage::MergeHold);
             push(Stage::MergeWait);
             return stages;
         }
@@ -321,6 +334,7 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
                 }
                 Stage::MergeWait => break,
                 Stage::ReadyWait => Stage::SweepCurator,
+                Stage::MergeHold => Stage::MergeWait,
             };
         }
         for (i, s) in seen.iter().enumerate() {
@@ -343,7 +357,7 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     // so the terminal mark's p50 is the estimate itself, to the second.
     let terminal = if stop {
         Stage::ReadyWait
-    } else if spec.include_merge {
+    } else if spec.include_merge || spec.start == Stage::MergeHold {
         Stage::MergeWait
     } else {
         Stage::ReviewWait

@@ -67,6 +67,12 @@ pub(crate) struct PathRules {
     /// records — and recomputes from — the grid actually drawn from. `None`
     /// for every heuristic that draws from history unadjusted.
     pub adjust: Option<GridAdjust>,
+    /// `true`: an item in `merge_hold` (#10218) is estimated, along
+    /// `merge_hold → merge_wait` (the rest of the hold, conditioned on its
+    /// age, then one merge wait). `false` — every shipped heuristic — refuses
+    /// it as `blocked` before any field is written, so the explanation is
+    /// byte-identical to its refusal of a held PR before the stage existed.
+    pub models_hold: bool,
 }
 
 /// `(stage, input, raw grid) → (grid, what was done)`. Must be pure.
@@ -135,7 +141,15 @@ pub(crate) fn estimate_path(
         CurrentState::Refused(reason) => return refuse(explanation, *reason),
         CurrentState::At(current) => current,
     };
+    // #10218: checked before every other refusal and before any field is
+    // written, so a heuristic that does not model the hold returns exactly
+    // the refusal a held PR got when the hold was a label-level `blocked`.
+    if current.stage == Stage::MergeHold && !rules.models_hold {
+        return refuse(explanation, NoEstimateReason::Blocked);
+    }
     let start = current.stage;
+    // Approved: no verdict ahead, and the path ends with `merge_wait`.
+    let approved = matches!(start, Stage::MergeWait | Stage::MergeHold);
     // `start` exists only for a ready item, and a ready item has no running
     // sweep to `finish`. A ready item with no plan position has no estimate.
     let ready = start == Stage::ReadyWait;
@@ -200,7 +214,7 @@ pub(crate) fn estimate_path(
     }
 
     // Where an approved path ends.
-    let (include_merge, merge_share) = if rules.always_merge || start == Stage::MergeWait {
+    let (include_merge, merge_share) = if rules.always_merge || approved {
         (true, None)
     } else {
         match history.merge_share(repo, as_of) {
@@ -222,9 +236,9 @@ pub(crate) fn estimate_path(
     });
 
     // The Judge branch, when the path still reaches a verdict.
-    let verdict_ahead = start != Stage::MergeWait && rework_rounds < MAX_REWORK_ROUNDS;
+    let verdict_ahead = !approved && rework_rounds < MAX_REWORK_ROUNDS;
     let mut p_by_attempt = Vec::new();
-    if start != Stage::MergeWait {
+    if !approved {
         let level = [Level::Repo, Level::Host].into_iter().find(|level| {
             history
                 .verdict_counts(repo, *level, as_of, MAX_REWORK_ROUNDS)

@@ -46,6 +46,17 @@
 //! The daemon itself never derives: it reads the cached file
 //! ([`load_all`]) and makes no forge call at all.
 //!
+//! # Stage episodes (#10218)
+//!
+//! Next to the samples, a snapshot holds every PR's **stage episodes**
+//! ([`super::episodes`]), derived from the same timelines with no further
+//! forge read: the split stage path (`merge_wait → merge_hold → merge_wait →
+//! merged`) a hold-aware heuristic fits. They are a separate field, never
+//! samples, so an older daemon still parses the file, and the pooled
+//! `merge_wait` samples every shipped heuristic reads are untouched. A snapshot
+//! written before #10218 gains episodes only as its PRs are re-read: run
+//! `eta fleet backfill` (not `refresh`) to rebuild the whole window.
+//!
 //! # Deliberately out of scope
 //!
 //! Fleet-wide **in-sweep** samples (`sweep.curator`, `sweep.builder`) would
@@ -57,6 +68,7 @@
 //! guess.
 
 use super::config::HistoryScopeMode;
+use super::episodes::{episodes_from_pr_history, StageEpisode};
 use super::explanation::HistoryScope;
 use super::history::{SampleSource, StageSample, StageSamples, VerdictSample};
 use super::journal::{censored_from_pr_history, entries_from_pr_history, JournalEntry};
@@ -212,6 +224,16 @@ pub struct FleetSnapshot {
     pub prs: Vec<u32>,
     /// Every sample, in canonical order.
     pub samples: Vec<FleetSample>,
+    /// Every PR's stage episodes (#10218), in canonical order
+    /// ([`StageEpisode::key`]).
+    ///
+    /// Deliberately not samples: an older daemon ignores this unknown field
+    /// and still parses the file, whereas a `merge_hold` [`FleetSample`] would
+    /// be an unknown `stage` and make it refuse the whole snapshot.
+    /// `serde(default)` reads files written before #10218, and an empty list
+    /// is not written, so such a file round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub episodes: Vec<StageEpisode>,
 }
 
 impl FleetSnapshot {
@@ -226,6 +248,7 @@ impl FleetSnapshot {
             cursor: None,
             prs: Vec::new(),
             samples: Vec::new(),
+            episodes: Vec::new(),
         };
         snapshot.seal();
         snapshot
@@ -246,14 +269,18 @@ impl FleetSnapshot {
     /// refuse.
     ///
     /// Samples older than [`RETENTION_DAYS`] before `as_of` are pruned, so the
-    /// cache file does not grow without bound.
+    /// cache file does not grow without bound. Episodes follow the same rules:
+    /// replaced per re-read PR, pruned by the last instant they describe.
     pub fn merge(&mut self, histories: &[PrHistory], as_of: DateTime<Utc>) {
         let usable: Vec<&PrHistory> = histories.iter().filter(|h| h.timeline_complete).collect();
         let replaced: BTreeSet<u32> = usable.iter().map(|h| h.number).collect();
         self.samples.retain(|s| !replaced.contains(&s.pr_number));
+        self.episodes.retain(|e| !replaced.contains(&e.pr_number));
         for h in &usable {
             self.samples
                 .extend(samples_from_pr_history(h, &self.repo, as_of));
+            self.episodes
+                .extend(episodes_from_pr_history(h, &self.repo, as_of));
         }
         self.as_of = self.as_of.max(as_of);
         // `checked_sub_signed`, not `-`: chrono **panics** on overflow, and
@@ -265,6 +292,7 @@ impl FleetSnapshot {
             .checked_sub_signed(Duration::days(RETENTION_DAYS))
         {
             self.samples.retain(|s| s.observed_at >= floor);
+            self.episodes.retain(|e| e.last_at() >= floor);
         }
         let mut prs: BTreeSet<u32> = self.prs.iter().copied().collect();
         prs.extend(replaced);
@@ -272,7 +300,10 @@ impl FleetSnapshot {
         // by this snapshot; keeping it in the census would overstate coverage.
         self.prs = prs
             .into_iter()
-            .filter(|pr| self.samples.iter().any(|s| s.pr_number == *pr))
+            .filter(|pr| {
+                self.samples.iter().any(|s| s.pr_number == *pr)
+                    || self.episodes.iter().any(|e| e.pr_number == *pr)
+            })
             .collect();
         self.seal();
     }
@@ -284,8 +315,18 @@ impl FleetSnapshot {
         self.schema = SNAPSHOT_SCHEMA.to_string();
         self.samples.sort_by_key(FleetSample::key);
         self.samples.dedup();
+        self.episodes.sort_by(|a, b| {
+            a.key()
+                .cmp(&b.key())
+                .then_with(|| a.digest_line().cmp(&b.digest_line()))
+        });
+        self.episodes.dedup();
         self.cursor = self.samples.iter().map(|s| s.observed_at).max();
-        let lines: Vec<String> = self.samples.iter().map(FleetSample::digest_line).collect();
+        let mut lines: Vec<String> = self.samples.iter().map(FleetSample::digest_line).collect();
+        // #10218: episode lines only when there are episodes (each starts
+        // `episode|`, so it cannot read as a sample line), so a snapshot with
+        // none keeps exactly the id it had before episodes existed.
+        lines.extend(self.episodes.iter().map(StageEpisode::digest_line));
         let mut parts: Vec<&str> = vec!["loom.eta.fleet.snapshot"];
         let repo = self.repo.to_ascii_lowercase();
         let at = crate::telemetry::trace::instant(self.as_of);
@@ -306,6 +347,13 @@ impl FleetSnapshot {
     /// sweep-internal fact the forge cannot see, so a fleet-only history has no
     /// merge share and `finish-v1` refuses on it rather than inventing one.
     /// `land-v1`/`land-v2` are unaffected (`always_merge`).
+    ///
+    /// The episodes (#10218) are copied into [`StageSamples::episodes`], and
+    /// each `merge_hold` episode also becomes a `merge_hold` sample (completed
+    /// when it left for a stage or a merge, censored otherwise) so
+    /// `select(repo, MergeHold, …)` answers. The split `merge_wait` episodes
+    /// are deliberately **not** samples: `merge_wait` samples keep the pooled
+    /// definition every shipped heuristic reads.
     #[must_use]
     pub fn stage_samples(&self) -> StageSamples {
         let mut history = StageSamples {
@@ -322,7 +370,43 @@ impl FleetSnapshot {
                 history.verdicts.push(verdict);
             }
         }
+        for episode in self.episodes.iter().filter(|e| e.stage == Stage::MergeHold) {
+            let sample = StageSample {
+                repo: episode.repo.clone(),
+                stage: Stage::MergeHold,
+                duration_sec: episode.duration_sec(),
+                observed_at: episode.last_at(),
+                source: SampleSource::ForgeTimeline,
+                host: FORGE_HOST.to_string(),
+                worked: None,
+            };
+            if episode.completed() {
+                history.stages.push(sample);
+            } else {
+                history.censored.push(sample);
+            }
+        }
+        history.episodes = self.episodes.clone();
         history
+    }
+
+    /// Episode counts per stage name, `(completed, lower bounds)` — the
+    /// `eta fleet show` census of the split stage record (#10218). A lower
+    /// bound is an episode still open, cut short by a close, or unstaged.
+    #[must_use]
+    pub fn episode_counts_by_stage(&self) -> BTreeMap<String, (usize, usize)> {
+        let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for episode in &self.episodes {
+            let entry = counts
+                .entry(episode.stage.as_str().to_string())
+                .or_default();
+            if episode.completed() {
+                entry.0 += 1;
+            } else {
+                entry.1 += 1;
+            }
+        }
+        counts
     }
 
     /// Sample counts per stage name, completed and censored — the `eta fleet
