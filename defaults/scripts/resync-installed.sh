@@ -535,7 +535,7 @@ if [[ -n "$BASE_REF" && -z "$OUTPUT_DIR" ]]; then
     BASE_REF=""
 fi
 
-# #10179: a host that opted out (`loom-daemon host disable`) refuses re-provisioning.
+# requires-daemon: host optional   #10179 opted-out host refuses re-provisioning; absent/older binary (no `host` verb, exit 1/2) proceeds unguarded.
 command -v loom-daemon >/dev/null 2>&1 && { _hc="$(loom-daemon host check --entry-point resync-installed.sh 2>&1)"; [ $? -ne 10 ] || { printf '%s\n' "$_hc" >&2; exit 1; }; } || true  # only exit 10 = disabled; an older binary (1/2 for unknown `host`) proceeds
 
 # ---------- resolve the installed repo root (worktree-safe) ----------
