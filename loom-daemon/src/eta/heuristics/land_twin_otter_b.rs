@@ -81,6 +81,8 @@ impl Heuristic for LandTwinOtterB {
                         always_merge: true,
                         censoring: true,
                         adjust: None,
+                        // land-v2's value; unreachable here (`merge_hold` is a PR stage).
+                        models_hold: false,
                     },
                     input,
                     history,

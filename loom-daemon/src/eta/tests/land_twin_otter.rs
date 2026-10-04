@@ -865,7 +865,12 @@ fn twin_otter_b_leaves_pr_level_stages_and_refusals_to_twin_otter() {
     let fit = fixture_fit(fit_as_of());
     let original = twin_otter(Some(fit.clone()));
     let b = LandTwinOtterB::new(Some(Arc::new(fit)));
-    for stage in [Stage::ReviewWait, Stage::Doctor, Stage::MergeWait] {
+    for stage in [
+        Stage::ReviewWait,
+        Stage::Doctor,
+        Stage::MergeWait,
+        Stage::MergeHold,
+    ] {
         let input = at_stage(stage);
         let a = original.estimate(&input, &history);
         let c = b.estimate(&input, &history);
