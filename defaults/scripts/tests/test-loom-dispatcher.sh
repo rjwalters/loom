@@ -777,15 +777,15 @@ assert_eq "$(git -C "$CK" rev-parse HEAD)" "$before_head" "read-only modes do no
 
 echo "Test 29: rate-limited advisory warning for missing links; silent when healthy; no refetch in-window (#10238)"
 CK=$(make_synced_checkout); H=$(mktemp -d); S=$(mktemp -d)
-out=$(HOME="$H" XDG_STATE_HOME="$S" LOOM_NO_HEALTH_WARN= LOOM_HOME="$CK" PATH="$NODAEMON_PATH" bash "$CK/scripts/loom" sweep 2>&1)
+out=$(HOME="$H" XDG_STATE_HOME="$S" LOOM_NO_HEALTH_WARN='' LOOM_HOME="$CK" PATH="$NODAEMON_PATH" bash "$CK/scripts/loom" sweep 2>&1)
 assert_contains "$out" "user-scope skills not linked" "missing links warn without being asked"
 stamp1="$(cat "$S/loom/fetch-stamp")"; warn1="$(cat "$S/loom/warn-stamp")"
-out=$(HOME="$H" XDG_STATE_HOME="$S" LOOM_NO_HEALTH_WARN= LOOM_HOME="$CK" PATH="$NODAEMON_PATH" bash "$CK/scripts/loom" sweep 2>&1)
+out=$(HOME="$H" XDG_STATE_HOME="$S" LOOM_NO_HEALTH_WARN='' LOOM_HOME="$CK" PATH="$NODAEMON_PATH" bash "$CK/scripts/loom" sweep 2>&1)
 assert_not_contains "$out" "not linked" "second run inside the window is silent"
 assert_eq "$(cat "$S/loom/fetch-stamp")" "$stamp1" "no second background fetch inside the window"
 assert_eq "$(cat "$S/loom/warn-stamp")" "$warn1" "warn stamp not re-armed inside the window"
 HOME="$H" PATH="$NODAEMON_PATH" bash "$CK/scripts/loom" update >/dev/null 2>&1
-out=$(HOME="$H" XDG_STATE_HOME="$(mktemp -d)" LOOM_NO_HEALTH_WARN= LOOM_HOME="$CK" PATH="$NODAEMON_PATH" bash "$CK/scripts/loom" sweep 2>&1)
+out=$(HOME="$H" XDG_STATE_HOME="$(mktemp -d)" LOOM_NO_HEALTH_WARN='' LOOM_HOME="$CK" PATH="$NODAEMON_PATH" bash "$CK/scripts/loom" sweep 2>&1)
 assert_not_contains "$out" "not linked" "healthy machine is silent"
 out=$(HOME="$(mktemp -d)" XDG_STATE_HOME="$(mktemp -d)" LOOM_HOME="$CK" PATH="$NODAEMON_PATH" bash "$CK/scripts/loom" status 2>&1)
 assert_contains "$out" "WARNING" "'loom status' lists the missing links"
