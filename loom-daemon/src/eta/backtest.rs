@@ -36,9 +36,9 @@
 //! different things.
 //!
 //! The second `land` source (#9579) is the merged PR's own forge label
-//! timeline ([`pr_cases::cases_from_pr_history`]): every review / rejection
-//! / approval entry is a replay instant and the PR's `merged_at` its
-//! answer. It is opt-in at the CLI (`eta backtest --pr-history` /
+//! timeline ([`pr_cases::cases_from_pr_history`]): every stage entry the
+//! shared label resolver names (`merge_hold` included, #10305) is a replay
+//! instant and the PR's `merged_at` its answer. It is opt-in at the CLI (`eta backtest --pr-history` /
 //! `--forge-pr-cases`) so a default backtest stays offline, and its own
 //! leak-freedom argument is made in [`pr_cases`] rather than inherited from
 //! the one above. A case both sources answer is counted once
@@ -66,8 +66,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub mod pr_cases;
 pub use pr_cases::{
-    cases_from_pr_history, cases_from_pr_records, parse_pr_records, PrCaseExclusion, PrCaseRecord,
-    PrCaseSummary,
+    cases_from_pr_history, cases_from_pr_records, parse_pr_records, pr_case_entries, PrCaseEntries,
+    PrCaseExclusion, PrCaseRecord, PrCaseSummary, RefusedEntry,
 };
 
 /// Bucket for a record whose `repo` slug was unresolved (Issue #9442),

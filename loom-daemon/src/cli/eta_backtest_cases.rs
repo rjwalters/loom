@@ -273,20 +273,25 @@ pub(crate) fn add_pr_cases(
 }
 
 fn describe(summary: &PrCaseSummary, dropped: usize) -> String {
-    let excluded = if summary.excluded.is_empty() {
-        "none".to_string()
-    } else {
-        summary
-            .excluded
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(" ")
+    let tally = |counts: &std::collections::BTreeMap<String, usize>| {
+        if counts.is_empty() {
+            "none".to_string()
+        } else {
+            counts
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
     };
     format!(
         "[eta backtest] PR-history land cases: {} PR(s) read, {} contributing, {} case(s), \
-         {dropped} already answered by another source; excluded: {excluded}",
-        summary.prs, summary.contributing, summary.cases
+         {dropped} already answered by another source; excluded: {}; refused entries: {}",
+        summary.prs,
+        summary.contributing,
+        summary.cases,
+        tally(&summary.excluded),
+        tally(&summary.refused_entries)
     )
 }
 
@@ -384,6 +389,7 @@ mod tests {
         let note = note.unwrap();
         assert!(note.contains("24 PR(s) read, 20 contributing, 60 case(s)"), "{note}");
         assert!(note.contains("closed_unmerged=1"), "{note}");
+        assert!(note.contains("refused entries: none"), "{note}");
         let filter = Filter {
             since: None,
             repo: a.repo.as_deref(),

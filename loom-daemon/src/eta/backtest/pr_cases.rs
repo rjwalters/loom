@@ -11,11 +11,17 @@
 //! [`PrHistory`] `eta backfill` already reads — carries exactly what a `land`
 //! case needs:
 //!
-//! - **`as_of`**: every stage *entry* the timeline records —
-//!   `loom:review-requested` (`review_wait`), `loom:changes-requested`
-//!   (`doctor`) and `loom:pr` (`merge_wait`) — via
-//!   [`entry_transitions`], so a re-applied label is one entry while a real
-//!   second lap is another;
+//! - **`as_of`**: every stage *entry* the timeline records, where the stage
+//!   is what [`stage_from_pr_labels`] — the one label → stage definition the
+//!   tracker serves from (#10218) — resolves for the labels in force at that
+//!   instant (#10305). The label events are replayed with
+//!   [`super::super::episodes`]' shared traversal: every event at one instant
+//!   is applied in timeline order and the stage resolved once, so a
+//!   `--remove-label --add-label` edit is one transition, a re-applied label
+//!   or an unrelated label is no entry, and a real second lap is another.
+//!   An approved PR that gets an operator hold enters `merge_hold`, and
+//!   re-enters `merge_wait` at the release; an approval landing under a hold
+//!   enters `merge_hold`, never `merge_wait`;
 //! - **`actual_at`**: [`PrHistory::merged_at`];
 //! - **`outcome`**: [`OutcomeKind::Landed`];
 //! - **`subject`**: the PR number from the history, and the issue from the
@@ -31,8 +37,15 @@
 //! [`OutcomeKind::Abandoned`] is decided by the *issue*, which may still land
 //! through another PR), a merged PR with no merge instant, a terminal earlier
 //! than the PR's own creation, a missing or ambiguous issue identity (the PR
-//! number is never substituted for the issue), and a PR with no stage entry
-//! before its merge.
+//! number is never substituted for the issue), a PR with no stage entry
+//! before its merge, and a PR every one of whose entries was refused.
+//!
+//! An entry the resolver refuses — a review lap under a non-merge hold such
+//! as `loom:blocked` (`blocked`), or contradictory review labels
+//! (`unknown_stage`) — yields no case and no guessed stage: it is counted in
+//! [`PrCaseSummary::refused_entries`] by reason, and the PR's other entries
+//! still yield their cases. A rejection lap whose entry was refused still
+//! counts toward later cases' `rework_rounds`: the rework happened.
 //!
 //! # Leak-freedom, re-established for this source
 //!
@@ -48,16 +61,20 @@
 //! through `select`/`select_at` (`observed_at < as_of`), so a PR's own future
 //! segments are excluded by the same structural rule as everything else.
 //! Each case's predictor inputs — `as_of`, `stage`, `rework_rounds` — are
-//! computed only from events at or before its entry, so later labels,
-//! rejections and the final rework count cannot reach them;
+//! computed only from events at or before its entry (the replay is causal:
+//! each instant's resolution reads only the labels in force after it), so
+//! later labels, rejections and the final rework count cannot reach them;
 //! `tests/backtest_pr.rs` pins both properties.
 
 use super::ReplayCase;
-use crate::eta::journal::entry_transitions;
+use crate::eta::episodes::{input_from_pr_history, replay};
+use crate::eta::labels::{
+    hold_labels, stage_from_pr_labels, APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED, TREATING,
+};
 use crate::eta::score::OutcomeKind;
-use crate::eta::{Kind, Stage, Subject};
+use crate::eta::{Kind, NoEstimateReason, Stage, Subject};
 use crate::pr_latency::history::{PrEvent, PrState};
-use crate::pr_latency::{PrHistory, APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED};
+use crate::pr_latency::PrHistory;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -235,6 +252,9 @@ pub enum PrCaseExclusion {
     AmbiguousIdentity,
     /// No stage entry strictly before the merge.
     NoStageEntry,
+    /// Stage entries before the merge, but [`stage_from_pr_labels`] refused
+    /// every one (each is counted in [`PrCaseSummary::refused_entries`]).
+    NoUsableEntry,
 }
 
 impl PrCaseExclusion {
@@ -250,27 +270,43 @@ impl PrCaseExclusion {
             Self::MissingIdentity => "missing_identity",
             Self::AmbiguousIdentity => "ambiguous_identity",
             Self::NoStageEntry => "no_stage_entry",
+            Self::NoUsableEntry => "no_usable_entry",
         }
     }
 }
 
-/// Every `land` replay case one PR's history answers, or why it answers
-/// none. Pure: `closing_issues` is resolved by the caller at the acquisition
-/// boundary.
-///
-/// One case per stage entry strictly before the merge, each replayed from
-/// its entry instant with the rejections already taken *then* (doctor
-/// entries strictly earlier — the same counting [`super::cases_from_record`]
-/// uses, so a `doctor` case carries the rounds before its own).
-///
-/// # Errors
-///
-/// The [`PrCaseExclusion`] that applies, checked in the order listed there.
-pub fn cases_from_pr_history(
-    repo: &str,
+/// One stage entry the shared resolver refused: no case is emitted for it and
+/// no stage is guessed. `reason` is [`stage_from_pr_labels`]'s own refusal —
+/// `blocked` (a review lap under a non-merge hold) or `unknown_stage`
+/// (contradictory review labels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedEntry {
+    /// The instant the labels entered the refused resolution.
+    pub at: DateTime<Utc>,
+    /// Why it has no stage.
+    pub reason: NoEstimateReason,
+}
+
+/// Every stage entry one PR's history answers strictly before its merge: the
+/// usable ones as cases, the refused ones by reason.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PrCaseEntries {
+    /// One `land` case per resolved stage entry, in entry order.
+    pub cases: Vec<ReplayCase>,
+    /// Every refused entry, in entry order.
+    pub refused: Vec<RefusedEntry>,
+}
+
+/// The review labels: a label set carrying none of them names no review
+/// stage at all (a fresh or fully unlabeled PR), which is neither an entry
+/// nor a refusal. Which stage they name is [`stage_from_pr_labels`]' call.
+const REVIEW_LABELS: [&str; 4] = [REVIEW_REQUESTED, CHANGES_REQUESTED, APPROVED, TREATING];
+
+/// The merge instant and closing issue of a PR that can be a `land` case.
+fn land_terminal(
     h: &PrHistory,
     closing_issues: Option<&[u32]>,
-) -> Result<Vec<ReplayCase>, PrCaseExclusion> {
+) -> Result<(DateTime<Utc>, u32), PrCaseExclusion> {
     if !h.timeline_complete {
         return Err(PrCaseExclusion::IncompleteTimeline);
     }
@@ -283,77 +319,123 @@ pub fn cases_from_pr_history(
     if merged_at < h.created_at {
         return Err(PrCaseExclusion::InvalidTerminalOrder);
     }
-    let issue = {
-        let mut issues = closing_issues
-            .ok_or(PrCaseExclusion::MissingIdentity)?
-            .to_vec();
-        issues.sort_unstable();
-        issues.dedup();
-        match issues.as_slice() {
-            [] => return Err(PrCaseExclusion::MissingIdentity),
-            [one] => *one,
-            _ => return Err(PrCaseExclusion::AmbiguousIdentity),
-        }
-    };
-
-    let verdict_clears = |e: &PrEvent| {
-        matches!(e, PrEvent::Labeled { label, .. }
-            if label == APPROVED || label == CHANGES_REQUESTED)
-    };
-    let push_clears = |e: &PrEvent| matches!(e, PrEvent::Pushed { .. });
-    // An approval stops being in force when the PR goes back to review or
-    // is rejected, so a later re-approval is a genuine second `merge_wait`.
-    let approval_clears = |e: &PrEvent| {
-        matches!(e, PrEvent::Labeled { label, .. }
-            if label == REVIEW_REQUESTED || label == CHANGES_REQUESTED)
-    };
-
-    let mut entries: Vec<(DateTime<Utc>, Stage)> = Vec::new();
-    for (label, stage, clears) in [
-        (
-            REVIEW_REQUESTED,
-            Stage::ReviewWait,
-            &verdict_clears as &dyn Fn(&PrEvent) -> bool,
-        ),
-        (CHANGES_REQUESTED, Stage::Doctor, &push_clears),
-        (APPROVED, Stage::MergeWait, &approval_clears),
-    ] {
-        entries.extend(
-            entry_transitions(h, label, clears)
-                .into_iter()
-                .filter(|at| *at < merged_at)
-                .map(|at| (at, stage)),
-        );
+    let mut issues = closing_issues
+        .ok_or(PrCaseExclusion::MissingIdentity)?
+        .to_vec();
+    issues.sort_unstable();
+    issues.dedup();
+    match issues.as_slice() {
+        [] => Err(PrCaseExclusion::MissingIdentity),
+        [one] => Ok((merged_at, *one)),
+        _ => Err(PrCaseExclusion::AmbiguousIdentity),
     }
+}
+
+/// Every stage entry one PR's history answers before its merge — cases and
+/// refusals — or why it answers none. Pure: `closing_issues` is resolved by
+/// the caller at the acquisition boundary.
+///
+/// The label events strictly before the merge are replayed with the episode
+/// derivation's traversal ([`replay`]); at each instant the labels in force
+/// are resolved with [`stage_from_pr_labels`]. An entry is an instant whose
+/// resolution differs from the previous instant's: `Ok(stage)` is a case,
+/// `Err(reason)` a [`RefusedEntry`] (also when a refused lap moves to another
+/// review stage under the same refusal, e.g. `loom:blocked` held through a
+/// rejection). Each case carries the rejections already taken *then* — the
+/// instants the labels, holds ignored, newly named `doctor`, strictly before
+/// its entry — so a rejection lap counts even when its own entry was refused.
+///
+/// # Errors
+///
+/// The [`PrCaseExclusion`] that applies, checked in the order listed there;
+/// [`PrCaseExclusion::NoStageEntry`] when nothing before the merge names a
+/// review stage at all.
+pub fn pr_case_entries(
+    repo: &str,
+    h: &PrHistory,
+    closing_issues: Option<&[u32]>,
+) -> Result<PrCaseEntries, PrCaseExclusion> {
+    let (merged_at, issue) = land_terminal(h, closing_issues)?;
+
+    let holds = hold_labels();
+    let mut entries: Vec<(DateTime<Utc>, Result<Stage, NoEstimateReason>)> = Vec::new();
+    let mut rejections: Vec<DateTime<Utc>> = Vec::new();
+    // `None`: no review label in force (nothing staged yet, or unlabeled).
+    let mut prev_resolved: Option<Result<Stage, NoEstimateReason>> = None;
+    let mut prev_named: Option<Stage> = None;
+    // Cut at the merge: only events strictly before it move a stage.
+    replay(&input_from_pr_history(h, repo), merged_at, |at, present| {
+        let staged = present.iter().any(|l| REVIEW_LABELS.contains(&l.as_str()));
+        let resolved = staged.then(|| stage_from_pr_labels(present));
+        // The review stage the labels name with every hold set aside: what a
+        // refused lap *was*, so a held rejection still counts as rework.
+        let unheld: Vec<String> = present
+            .iter()
+            .filter(|l| !holds.contains(&l.as_str()))
+            .cloned()
+            .collect();
+        let named = stage_from_pr_labels(&unheld).ok();
+        if named == Some(Stage::Doctor) && prev_named != Some(Stage::Doctor) {
+            rejections.push(at);
+        }
+        match resolved {
+            Some(Ok(stage)) if prev_resolved != Some(Ok(stage)) => entries.push((at, Ok(stage))),
+            Some(Err(reason)) if prev_resolved != Some(Err(reason)) || prev_named != named => {
+                entries.push((at, Err(reason)));
+            }
+            _ => {}
+        }
+        prev_resolved = resolved;
+        prev_named = named;
+    });
     if entries.is_empty() {
         return Err(PrCaseExclusion::NoStageEntry);
     }
-    entries.sort();
 
     let mut subject = Subject::new(repo, None, issue);
     subject.pr_number = Some(h.number);
-    let doctor_entries: Vec<DateTime<Utc>> = entries
-        .iter()
-        .filter(|(_, s)| *s == Stage::Doctor)
-        .map(|(at, _)| *at)
-        .collect();
-    Ok(entries
-        .into_iter()
-        .map(|(as_of, stage)| ReplayCase {
-            subject: subject.clone(),
-            as_of,
-            stage,
-            rework_rounds: doctor_entries.iter().filter(|d| **d < as_of).count() as u32,
-            kind: Kind::Land,
-            outcome: OutcomeKind::Landed,
-            actual_at: merged_at,
-            dispatch: None,
-        })
-        .collect())
+    let mut out = PrCaseEntries::default();
+    for (as_of, resolved) in entries {
+        match resolved {
+            Ok(stage) => out.cases.push(ReplayCase {
+                subject: subject.clone(),
+                as_of,
+                stage,
+                rework_rounds: rejections.iter().filter(|r| **r < as_of).count() as u32,
+                kind: Kind::Land,
+                outcome: OutcomeKind::Landed,
+                actual_at: merged_at,
+                dispatch: None,
+            }),
+            Err(reason) => out.refused.push(RefusedEntry { at: as_of, reason }),
+        }
+    }
+    Ok(out)
+}
+
+/// Every `land` replay case one PR's history answers, or why it answers
+/// none: [`pr_case_entries`]' cases, one per resolved stage entry strictly
+/// before the merge.
+///
+/// # Errors
+///
+/// [`pr_case_entries`]' exclusion, or [`PrCaseExclusion::NoUsableEntry`]
+/// when every entry was refused.
+pub fn cases_from_pr_history(
+    repo: &str,
+    h: &PrHistory,
+    closing_issues: Option<&[u32]>,
+) -> Result<Vec<ReplayCase>, PrCaseExclusion> {
+    let entries = pr_case_entries(repo, h, closing_issues)?;
+    if entries.cases.is_empty() {
+        return Err(PrCaseExclusion::NoUsableEntry);
+    }
+    Ok(entries.cases)
 }
 
 /// How a batch of PR records turned into cases: what was read, what
-/// contributed, and every exclusion by reason.
+/// contributed, every PR exclusion by reason, and every refused entry by
+/// reason.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PrCaseSummary {
     /// PR records read.
@@ -364,9 +446,14 @@ pub struct PrCaseSummary {
     pub cases: usize,
     /// Excluded PRs, by [`PrCaseExclusion::as_str`].
     pub excluded: BTreeMap<String, usize>,
+    /// Refused stage *entries* (not PRs), by [`NoEstimateReason::as_str`]:
+    /// counted for contributing PRs too, whose other entries still yield
+    /// their cases.
+    #[serde(default)]
+    pub refused_entries: BTreeMap<String, usize>,
 }
 
-/// [`cases_from_pr_history`] over every record, with the tally.
+/// [`pr_case_entries`] over every record, with the tally.
 #[must_use]
 pub fn cases_from_pr_records(records: &[PrCaseRecord]) -> (Vec<ReplayCase>, PrCaseSummary) {
     let mut summary = PrCaseSummary {
@@ -375,23 +462,33 @@ pub fn cases_from_pr_records(records: &[PrCaseRecord]) -> (Vec<ReplayCase>, PrCa
     };
     let mut cases = Vec::new();
     for record in records {
-        match cases_from_pr_history(
+        let reason = match pr_case_entries(
             &record.repo,
             &record.history(),
             record.closing_issues.as_deref(),
         ) {
             Ok(found) => {
-                summary.contributing += 1;
-                summary.cases += found.len();
-                cases.extend(found);
+                for refused in &found.refused {
+                    *summary
+                        .refused_entries
+                        .entry(refused.reason.as_str().to_string())
+                        .or_insert(0) += 1;
+                }
+                if found.cases.is_empty() {
+                    PrCaseExclusion::NoUsableEntry
+                } else {
+                    summary.contributing += 1;
+                    summary.cases += found.cases.len();
+                    cases.extend(found.cases);
+                    continue;
+                }
             }
-            Err(reason) => {
-                *summary
-                    .excluded
-                    .entry(reason.as_str().to_string())
-                    .or_insert(0) += 1;
-            }
-        }
+            Err(reason) => reason,
+        };
+        *summary
+            .excluded
+            .entry(reason.as_str().to_string())
+            .or_insert(0) += 1;
     }
     (cases, summary)
 }
