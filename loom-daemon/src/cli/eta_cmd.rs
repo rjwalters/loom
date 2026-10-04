@@ -170,7 +170,7 @@ impl EtaPromoteArgs {
         let mut cases = backtest::cases_from_envelopes(&envelopes);
         cases.extend(backtest::cases_from_journal(&journal_entries));
         let loom = Provenance::current();
-        with_replay_calibration(&registry, &mut history, &cases, &loom);
+        super::eta_replay_cmd::with_replay_calibration(&registry, &mut history, &cases, &loom);
         let comparison =
             backtest::compare(current, candidate, &history, &cases, filter, &loom).ok();
 
@@ -402,7 +402,7 @@ impl EtaBacktestArgs {
         let mut cases = backtest::cases_from_envelopes(&envelopes);
         cases.extend(backtest::cases_from_journal(&journal_entries));
         let loom = Provenance::current();
-        with_replay_calibration(&registry, &mut history, &cases, &loom);
+        super::eta_replay_cmd::with_replay_calibration(&registry, &mut history, &cases, &loom);
 
         if let Some(other_id) = &self.compare {
             let Some(other) = registry.get(other_id) else {
@@ -424,23 +424,6 @@ impl EtaBacktestArgs {
             print!("{}", render_report(&report));
         }
         Ok(())
-    }
-}
-
-/// Give the recalibrating `land` heuristic (#10207) its calibration evidence
-/// from the replay itself: the base heuristic's estimate at every `land` case,
-/// landing at the case's own outcome. Leak-free — the recalibrating heuristic
-/// refits at each case's `as_of` ([`backtest::calibration_from_replay`]) — and
-/// inert for every other heuristic, which never reads `calibration`.
-fn with_replay_calibration(
-    registry: &Registry,
-    history: &mut StageSamples,
-    cases: &[backtest::ReplayCase],
-    loom: &Provenance,
-) {
-    if let Some(base) = registry.get(loom_daemon::eta::heuristics::CALIBRATION_BASE) {
-        let replayed = backtest::calibration_from_replay(base, history, cases, loom);
-        history.calibration.extend(replayed);
     }
 }
 
