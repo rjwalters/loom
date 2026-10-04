@@ -19,9 +19,14 @@
 //!
 //! Two gates, **in this order**, both required:
 //!
-//! 1. **Backtest.** The candidate must beat `current` on the phase-2 backtest's
-//!    mean pinball loss for that kind ([`super::backtest::compare`]), over the
-//!    identical replay set. Failing this, the live gate is not even consulted
+//! 1. **Backtest.** The candidate must be the better of the two in the
+//!    phase-2 backtest for that kind ([`super::backtest::compare`]), over the
+//!    identical replay set — judged on the **union** of cases counting
+//!    refusals (#10233): lower paired mean `pinball4_loss_sec` on the cases
+//!    both answered, with no answer-rate or late-surprise regression — and
+//!    the win must hold across the walk-forward daily folds: at least
+//!    [`MIN_FOLDS`] decided days, the 95% Wilson lower bound of the per-day
+//!    win rate above 50%. Failing this, the live gate is not even consulted
 //!    — a heuristic that cannot win on history it can be re-run against has no
 //!    business being judged on a live sample nobody can replay.
 //! 2. **Live** (#10233), every figure on the **common decidable subset** —
@@ -197,6 +202,24 @@ impl DayWins {
                 out.ties += 1;
             }
         }
+        out.with_interval()
+    }
+
+    /// The other side's view of the same days: its wins are this side's
+    /// losses (#10233 — a backtest pairs in argument order, not by role).
+    #[must_use]
+    pub fn swapped(self) -> Self {
+        DayWins {
+            days: self.days,
+            wins: self.days - self.wins,
+            ties: self.ties,
+            ..DayWins::default()
+        }
+        .with_interval()
+    }
+
+    fn with_interval(self) -> Self {
+        let mut out = self;
         if out.days > 0 {
             // Four decimals: the record is logged as JSON and read back, and
             // a 17-digit float does not survive that round trip exactly.
@@ -525,10 +548,35 @@ pub struct BacktestGate {
     pub current_scored: usize,
     /// Cases it scored for the candidate (the same replay set).
     pub candidate_scored: usize,
-    /// `current`'s mean pinball loss over them, seconds.
+    /// `current`'s mean pinball loss over the cases **both** scored
+    /// (#10233; before it, over the cases each scored on its own), seconds.
     pub current_mean_pinball_loss_sec: Option<f64>,
     /// The candidate's.
     pub candidate_mean_pinball_loss_sec: Option<f64>,
+    /// The union of replayed cases (#10233; additive, an older record reads 0).
+    #[serde(default)]
+    pub cases: usize,
+    /// `current`'s answer rate over the union — refusals count against it.
+    #[serde(default)]
+    pub current_answer_rate: Option<f64>,
+    /// The candidate's.
+    #[serde(default)]
+    pub candidate_answer_rate: Option<f64>,
+    /// Cases both scored with a p90: the deciding loss's population.
+    #[serde(default)]
+    pub loss4_pairs: usize,
+    /// `current`'s mean `pinball4_loss_sec` over them — the deciding loss.
+    #[serde(default)]
+    pub current_mean_pinball4_loss_sec: Option<f64>,
+    /// The candidate's.
+    #[serde(default)]
+    pub candidate_mean_pinball4_loss_sec: Option<f64>,
+    /// The candidate's per-day win rate over the walk-forward daily folds.
+    #[serde(default)]
+    pub day_wins: DayWins,
+    /// Decided days the per-day win rate required.
+    #[serde(default)]
+    pub min_folds: usize,
 }
 
 /// The live gate's verdict and the numbers behind it.
@@ -661,6 +709,14 @@ fn backtest_gate(current: &str, candidate: &str, comparison: Option<&Comparison>
         candidate_scored: 0,
         current_mean_pinball_loss_sec: None,
         candidate_mean_pinball_loss_sec: None,
+        cases: 0,
+        current_answer_rate: None,
+        candidate_answer_rate: None,
+        loss4_pairs: 0,
+        current_mean_pinball4_loss_sec: None,
+        candidate_mean_pinball4_loss_sec: None,
+        day_wins: DayWins::default(),
+        min_folds: MIN_FOLDS,
     };
     let Some(comparison) = comparison else {
         return fail("no backtest was run".to_string());
@@ -669,46 +725,107 @@ fn backtest_gate(current: &str, candidate: &str, comparison: Option<&Comparison>
     else {
         return fail(format!("the comparison is not between {current} and {candidate}"));
     };
+    // `paired` names the two sides `a` and `b` in `compare`'s argument
+    // order; read it from `current`'s and the candidate's side. The per-day
+    // wins are `b`'s, so they are the candidate's only when it is `b`.
+    let p = &comparison.paired;
+    let current_is_a = comparison.a.heuristic == current;
+    let side = |a_value: Option<f64>, b_value: Option<f64>, of_current: bool| {
+        if of_current == current_is_a {
+            a_value
+        } else {
+            b_value
+        }
+    };
+    let day_wins = if current_is_a {
+        p.day_wins
+    } else {
+        p.day_wins.swapped()
+    };
+    let current_loss4 = side(p.a_mean_pinball4_loss_sec, p.b_mean_pinball4_loss_sec, true);
+    let candidate_loss4 = side(p.a_mean_pinball4_loss_sec, p.b_mean_pinball4_loss_sec, false);
+    let current_answers = side(p.a_answer_rate, p.b_answer_rate, true);
+    let candidate_answers = side(p.a_answer_rate, p.b_answer_rate, false);
     let gate = |status: GateStatus, detail: String| BacktestGate {
         status,
         detail,
         current_scored: a.overall.scored,
         candidate_scored: b.overall.scored,
-        current_mean_pinball_loss_sec: a.overall.mean_pinball_loss_sec,
-        candidate_mean_pinball_loss_sec: b.overall.mean_pinball_loss_sec,
+        current_mean_pinball_loss_sec: side(
+            p.a_mean_pinball_loss_sec,
+            p.b_mean_pinball_loss_sec,
+            true,
+        ),
+        candidate_mean_pinball_loss_sec: side(
+            p.a_mean_pinball_loss_sec,
+            p.b_mean_pinball_loss_sec,
+            false,
+        ),
+        cases: p.cases,
+        current_answer_rate: current_answers,
+        candidate_answer_rate: candidate_answers,
+        loss4_pairs: p.loss4_pairs,
+        current_mean_pinball4_loss_sec: current_loss4,
+        candidate_mean_pinball4_loss_sec: candidate_loss4,
+        day_wins,
+        min_folds: MIN_FOLDS,
     };
-    if a.overall.scored == 0 || b.overall.scored == 0 {
+    let pct = |rate: Option<f64>| rate.unwrap_or(0.0) * 100.0;
+    if p.loss4_pairs == 0 {
         // #9579: the `land` kind derives zero replay cases on this fleet
         // today. Nothing to rule on is a refusal to promote, not a pass.
         return gate(
             GateStatus::Failed,
             format!(
-                "the replay set scored {} case(s) for {current} and {} for {candidate}: \
-                 nothing to compare",
-                a.overall.scored, b.overall.scored
+                "the replay set scored {} case(s) for {current} and {} for {candidate}, \
+                 {} with a p90 on both: nothing to compare",
+                a.overall.scored, b.overall.scored, p.loss4_pairs
             ),
         );
     }
-    if comparison.better.as_deref() == Some(candidate) {
-        gate(
-            GateStatus::Passed,
-            format!(
-                "{candidate} mean pinball {:.1}s beats {current}'s {:.1}s over {} case(s)",
-                b.overall.mean_pinball_loss_sec.unwrap_or(f64::NAN),
-                a.overall.mean_pinball_loss_sec.unwrap_or(f64::NAN),
-                b.overall.scored
-            ),
-        )
-    } else {
-        gate(
+    let figures = format!(
+        "{candidate} paired mean pinball4 {:.1}s vs {current}'s {:.1}s over {} common case(s), \
+         answer rate {:.1}% vs {:.1}% over {} case(s)",
+        candidate_loss4.unwrap_or(f64::NAN),
+        current_loss4.unwrap_or(f64::NAN),
+        p.loss4_pairs,
+        pct(candidate_answers),
+        pct(current_answers),
+        p.cases
+    );
+    if comparison.better.as_deref() != Some(candidate) {
+        return gate(GateStatus::Failed, format!("{figures}: {candidate} does not win"));
+    }
+    // The win is not one lucky day: walk-forward daily folds, the same rule
+    // as the live gate's.
+    if day_wins.days < MIN_FOLDS {
+        return gate(
+            GateStatus::Failed,
+            format!("{figures}, but {} decided day(s), {MIN_FOLDS} required", day_wins.days),
+        );
+    }
+    let low = day_wins.ci_low.unwrap_or(0.0);
+    if low <= 0.5 {
+        return gate(
             GateStatus::Failed,
             format!(
-                "{candidate} mean pinball {:.1}s does not beat {current}'s {:.1}s",
-                b.overall.mean_pinball_loss_sec.unwrap_or(f64::NAN),
-                a.overall.mean_pinball_loss_sec.unwrap_or(f64::NAN),
+                "{figures}, but the per-day win rate {}/{} has 95% lower bound {:.1}%, \
+                 not above 50%",
+                day_wins.wins,
+                day_wins.days,
+                low * 100.0
             ),
-        )
+        );
     }
+    gate(
+        GateStatus::Passed,
+        format!(
+            "{figures}, won {}/{} day(s) (95% lower bound {:.1}%)",
+            day_wins.wins,
+            day_wins.days,
+            low * 100.0
+        ),
+    )
 }
 
 fn live_gate(stats: &PairedStats) -> LiveGate {

@@ -376,6 +376,14 @@ pub struct BacktestReport {
     /// Per-horizon-bucket breakdown ([`super::score::bucket`] of the
     /// predicted `p50`).
     pub by_horizon: BTreeMap<String, Bucket>,
+    /// How far the predicted landing instant moves between consecutive
+    /// answered cases of one series (#10233). Diagnostic; not a gate.
+    #[serde(default)]
+    pub stability: Stability,
+    /// Interval width per bucket of the actual lead (#10233). Diagnostic;
+    /// not a gate.
+    #[serde(default)]
+    pub convergence: BTreeMap<String, Convergence>,
 }
 
 /// Cases [`run`] and [`compare`] accept in addition to `heuristic.kind()`:
@@ -433,25 +441,44 @@ pub fn run(
     filter: Filter<'_>,
     loom: &Provenance,
 ) -> BacktestReport {
-    let kind = heuristic.kind();
-    let mut scores: Vec<(ReplayCase, Score)> = Vec::new();
-    for case in cases {
-        if !matches(case, kind, filter) {
-            continue;
-        }
-        let input = case_input(case, loom);
-        let explanation = heuristic.estimate(&input, history);
-        let summary = EstimateSummary::of(&explanation);
-        let s = score(&summary, case.outcome, case.actual_at, &[]);
-        scores.push((case.clone(), s));
-    }
+    let replayed = replay(heuristic, history, cases, filter, loom);
+    report_of(heuristic, &replayed)
+}
 
-    let all: Vec<&Score> = scores.iter().map(|(_, s)| s).collect();
+/// Every case matching `heuristic.kind()` and `filter`, replayed and scored,
+/// in `cases` order.
+fn replay(
+    heuristic: &dyn Heuristic,
+    history: &StageSamples,
+    cases: &[ReplayCase],
+    filter: Filter<'_>,
+    loom: &Provenance,
+) -> Vec<Replayed> {
+    let kind = heuristic.kind();
+    cases
+        .iter()
+        .filter(|case| matches(case, kind, filter))
+        .map(|case| {
+            let input = case_input(case, loom);
+            let summary = EstimateSummary::of(&heuristic.estimate(&input, history));
+            let score = score(&summary, case.outcome, case.actual_at, &[]);
+            Replayed {
+                case: case.clone(),
+                summary,
+                score,
+            }
+        })
+        .collect()
+}
+
+fn report_of(heuristic: &dyn Heuristic, replayed: &[Replayed]) -> BacktestReport {
+    let kind = heuristic.kind();
+    let all: Vec<&Score> = replayed.iter().map(|r| &r.score).collect();
     let overall = bucket_of(&all);
 
     let mut by_repo_scores: BTreeMap<String, Vec<&Score>> = BTreeMap::new();
     let mut by_horizon_scores: BTreeMap<String, Vec<&Score>> = BTreeMap::new();
-    for (case, s) in &scores {
+    for Replayed { case, score: s, .. } in replayed {
         by_repo_scores
             .entry(case.subject.repo.clone())
             .or_default()
@@ -477,6 +504,8 @@ pub fn run(
         overall,
         by_repo,
         by_horizon,
+        stability: paired::stability_of(replayed),
+        convergence: paired::convergence_of(replayed),
     }
 }
 
@@ -517,14 +546,27 @@ pub struct Comparison {
     pub a: BacktestReport,
     /// The second heuristic's report.
     pub b: BacktestReport,
-    /// The heuristic id with the lower `overall.mean_pinball_loss_sec`.
-    /// `None` when neither scored anything, or they tie exactly.
+    /// Both on the union of cases, every figure on its common decidable
+    /// subset, with the walk-forward daily folds (#10233).
+    #[serde(default)]
+    pub paired: Paired,
+    /// The better heuristic id on [`Self::paired`] (see
+    /// [`compare`]). `None` when neither may win, nothing was paired, or they
+    /// tie exactly.
     pub better: Option<String>,
 }
 
 /// Backtest `a` and `b` on the same `cases`/`history`/`filter`, and rank
-/// them by overall mean pinball loss — lower is better, the proper scoring
-/// rule this whole module is built on.
+/// them on the **union** of cases, counting refusals (#10233).
+///
+/// Each report's own `overall` bucket is over the cases *that* heuristic
+/// answered, so ranking on it let a heuristic that refuses the slowest cases
+/// win by refusing them. The ranking reads [`Paired`] instead: the deciding
+/// loss (`pinball4_loss_sec`, lower is better — the proper scoring rule this
+/// module is built on) over the cases both scored, and a side may win only
+/// if its answer rate over the union and its late-surprise rate do not
+/// regress on the other's (the live gate's slacks). An exact loss tie goes to
+/// the side that answered more.
 ///
 /// # Errors
 ///
@@ -546,19 +588,24 @@ pub fn compare(
             b: (b.id().to_string(), b.kind()),
         });
     }
-    let ra = run(a, history, cases, filter, loom);
-    let rb = run(b, history, cases, filter, loom);
-    let better = match (ra.overall.mean_pinball_loss_sec, rb.overall.mean_pinball_loss_sec) {
-        (Some(pa), Some(pb)) if pa < pb => Some(ra.heuristic.clone()),
-        (Some(pa), Some(pb)) if pb < pa => Some(rb.heuristic.clone()),
-        _ => None,
-    };
+    let replayed_a = replay(a, history, cases, filter, loom);
+    let replayed_b = replay(b, history, cases, filter, loom);
+    let paired = paired::paired_of(&replayed_a, &replayed_b);
+    let better =
+        paired::better_side(&paired).map(|a_wins| if a_wins { a.id() } else { b.id() }.to_string());
     Ok(Comparison {
-        a: ra,
-        b: rb,
+        a: report_of(a, &replayed_a),
+        b: report_of(b, &replayed_b),
+        paired,
         better,
     })
 }
+
+#[path = "backtest_paired.rs"]
+mod paired;
+
+use paired::Replayed;
+pub use paired::{Convergence, Fold, Paired, Stability};
 
 /// [`compare`] was asked to rank two heuristics that predict different
 /// kinds, whose replay sets do not overlap.
