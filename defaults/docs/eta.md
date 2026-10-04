@@ -151,8 +151,15 @@ verdicts) becomes a sample attributed to source `forge:pr-timeline` and host
   file and makes no forge call at all.
 - **Open segments are censored, not guessed.** A stage that had not closed when
   the snapshot was taken is a lower bound (#9328), kept out of every v1
-  distribution and read only by `land-v2`. When the PR lands, re-reading it
-  replaces the censored row with the real duration.
+  distribution and read only by `land-v2`. `eta backfill` is idempotent
+  (#9750): a row whose `(repo, pr, stage, entered_at)` is already journaled is
+  skipped, and on read a censored row is dropped once a completed row shares
+  its key, so a segment that later completes is counted once. **Backfilled
+  censored rows do not feed the backtest**: they are dated at read time
+  (`observed_at = as_of`), and the leak-free backtest (`eta/backtest.rs`)
+  refuses samples at or after an estimate's `as_of`, so on backfilled history
+  `land-v2` scores equal to `land-v1`. Only open segments the live tracker
+  records at close time help it.
 
 A filter asking for `eta-stage-samples.jsonl` also admits a
 `forge:pr-timeline` sample: they are the same measurement (a stage boundary
