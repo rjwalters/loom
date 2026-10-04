@@ -39,6 +39,13 @@ REAL_HARVEST_LIB="$REPO_ROOT/defaults/scripts/lib/daemon-env-harvest.sh"
 
 # #10238: keep the dispatcher's advisory state out of the real HOME for every case.
 XDG_STATE_HOME="$(mktemp -d)"; export XDG_STATE_HOME
+# #10238: `loom update` skips its daemon half when no loom-daemon is on PATH, so
+# the delegation cases pin inert stubs rather than depend on the host's install
+# (a CI runner has no loom-daemon on PATH; a dev box usually does). node/npm are
+# stubbed too: Test 5b's fresh bundle never runs them, but the refresh probes them.
+DAEMON_STUB_DIR="$(mktemp -d)"
+for _s in loom-daemon node npm; do printf '#!/usr/bin/env bash\nexit 0\n' > "$DAEMON_STUB_DIR/$_s"; chmod +x "$DAEMON_STUB_DIR/$_s"; done
+WITH_DAEMON_PATH="$DAEMON_STUB_DIR:$PATH"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
@@ -212,7 +219,7 @@ assert_contains "$out" "args=[]" "the --machine selector is stripped before dele
 # ── Finding 3: thin update verb ──────────────────────────────────────────────
 echo "Test 5: 'update' is a thin delegator with no rebuild logic of its own (Finding 3)"
 set +e
-out=$(LOOM_HOME="$CHK" bash "$DISPATCHER" update --check 2>&1)
+out=$(LOOM_HOME="$CHK" PATH="$WITH_DAEMON_PATH" bash "$DISPATCHER" update --check 2>&1)
 rc=$?
 set -e 2>/dev/null || true
 assert_eq "$rc" "0" "'loom update' exits 0 via delegation"
@@ -234,7 +241,7 @@ CHK2=$(make_checkout)
 # test hermetic/offline).
 mkdir -p "$CHK2/mcp-loom/dist"; : > "$CHK2/mcp-loom/dist/index.js"
 set +e
-out=$(LOOM_HOME="$CHK2" bash "$DISPATCHER" update 2>&1)
+out=$(LOOM_HOME="$CHK2" PATH="$WITH_DAEMON_PATH" bash "$DISPATCHER" update 2>&1)
 rc=$?
 set -e 2>/dev/null || true
 assert_eq "$rc" "0" "'loom update' exits 0 with an mcp-loom bundle present"
@@ -243,7 +250,7 @@ assert_contains "$out" "STUB_UPDATE" "'update' still delegates the daemon update
 
 echo "Test 5c: 'update --check' does not touch the mcp-loom bundle (#4230)"
 set +e
-out=$(LOOM_HOME="$CHK2" bash "$DISPATCHER" update --check 2>&1)
+out=$(LOOM_HOME="$CHK2" PATH="$WITH_DAEMON_PATH" bash "$DISPATCHER" update --check 2>&1)
 rc=$?
 set -e 2>/dev/null || true
 assert_eq "$rc" "0" "'loom update --check' exits 0"
@@ -336,14 +343,14 @@ assert_contains "$out" "machine_checkout=[$CHK]" "'start --machine' hands the re
 out=$(cd "$CONSUMER" && LOOM_HOME="$CHK" bash "$DISPATCHER" stop --machine 2>&1)
 assert_contains "$out" "machine_checkout=[$CHK]" "'stop --machine' hands the resolved checkout to loom-daemon-stop.sh"
 
-out=$(LOOM_HOME="$CHK" bash "$DISPATCHER" update --check 2>&1)
+out=$(LOOM_HOME="$CHK" PATH="$WITH_DAEMON_PATH" bash "$DISPATCHER" update --check 2>&1)
 assert_contains "$out" "machine_checkout=[$CHK]" "'update' hands the resolved checkout to loom-daemon-update.sh (Gap 1)"
 
 echo "Test 12: 'loom update' hands off the checkout from a NON-REPO directory too (Gap 1 regression)"
-out=$(cd "$NR" && LOOM_HOME="$CHK" bash "$DISPATCHER" update --check 2>&1)
+out=$(cd "$NR" && LOOM_HOME="$CHK" PATH="$WITH_DAEMON_PATH" bash "$DISPATCHER" update --check 2>&1)
 assert_contains "$out" "machine_checkout=[$CHK]" "'update' from a non-repo dir still resolves+hands off the machine checkout"
 rc_check=0
-(cd "$NR" && LOOM_HOME="$CHK" bash "$DISPATCHER" update --check >/dev/null 2>&1) || rc_check=$?
+(cd "$NR" && LOOM_HOME="$CHK" PATH="$WITH_DAEMON_PATH" bash "$DISPATCHER" update --check >/dev/null 2>&1) || rc_check=$?
 assert_eq "0" "$rc_check" "'update --check' from a non-repo dir does not refuse (no 'only works inside a Loom source checkout')"
 
 # ── Phase 3b (#4229): the `restart` verb ─────────────────────────────────────

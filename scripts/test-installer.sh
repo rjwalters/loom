@@ -3301,7 +3301,7 @@ if [[ -f "$DISPATCHER_TEST" ]]; then
     pass "test-loom-dispatcher.sh: all cases passed"
   else
     fail "test-loom-dispatcher.sh failed (rc=$DISPATCHER_TEST_RC)"
-    echo "$DISPATCHER_TEST_OUT" | tail -20
+    echo "$DISPATCHER_TEST_OUT" | grep -E 'FAIL|FATAL|passed,' || echo "$DISPATCHER_TEST_OUT" | tail -20
   fi
 else
   fail "test-loom-dispatcher.sh not found at $DISPATCHER_TEST"
