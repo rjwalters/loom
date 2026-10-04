@@ -639,19 +639,7 @@ impl GhIssueStateLookup {
     }
 
     fn query(&self, issue: u64) -> Option<bool> {
-        let output = Command::new("gh")
-            .args([
-                "issue",
-                "view",
-                &issue.to_string(),
-                "--json",
-                "state",
-                "-q",
-                ".state",
-            ])
-            .current_dir(&self.repo_root)
-            .output()
-            .ok()?;
+        let output = crate::gh_state_probe::issue_state_output(&self.repo_root, issue)?;
         if !output.status.success() {
             return None;
         }

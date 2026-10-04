@@ -270,6 +270,41 @@ pub(crate) enum ForgeAction {
         head: String,
     },
 
+    /// `forge verdict-equivalent <pr> <reviewed> <head>` (#9416) — does a
+    /// verdict rendered against `<reviewed>` still describe `<head>`, and by
+    /// which equivalence? The superset of `tree-unchanged`: it asks that same
+    /// tree-identical test first (#9124/#9576), then the clean-merge-of-base and
+    /// rebase-patch-identical kinds #9416 adds. All three are recomputed from
+    /// the repository — git objects and the forge's own compare endpoint — never
+    /// from a comment or marker, and never from a commit message or the shape of
+    /// a ref update.
+    ///
+    /// Prints `VERDICT_EQUIVALENT=1` plus `EQUIVALENCE_KIND=tree|clean-merge|
+    /// rebase-patch-identical` when the verdict carries, or
+    /// `VERDICT_EQUIVALENT=0` when it provably does not, exiting 0 for both;
+    /// exits 1 with nothing on stdout when it could not be decided. So a caller
+    /// keys on the `EQUIVALENCE_KIND=` line, and every failure mode — absent
+    /// binary, a daemon predating this verb, a `gh` outage, a shallow clone, a
+    /// `merge-tree` conflict, a non-GitHub forge — collapses into the same
+    /// fail-closed "re-review" arm.
+    ///
+    /// Only the REVIEW is ever carried forward. CI re-runs against the new head
+    /// regardless of which kind applied.
+    #[command(name = "verdict-equivalent")]
+    VerdictEquivalent {
+        /// The PR whose base branch the two heads are compared against.
+        #[arg(value_name = "PR")]
+        pr_number: u32,
+
+        /// The commit the verdict was rendered against (7-40 lowercase hex).
+        #[arg(value_name = "REVIEWED")]
+        reviewed: String,
+
+        /// The PR's current head (7-40 lowercase hex).
+        #[arg(value_name = "HEAD")]
+        head: String,
+    },
+
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should use,
     /// replacing its old unconditional `forge_detect_merge_method` call.
@@ -386,6 +421,30 @@ pub(crate) enum ForgeAction {
         gh_shape: bool,
     },
 
+    /// `forge verdict-stale-notice --label L --marker-sha M --head-sha H
+    /// [--source S]` (#9709) — print the stale-verdict audit comment for a
+    /// `M -> H` invalidation, rendered by the SAME template the daemon's pass
+    /// posts. Reads the PR's RAW (unfiltered) REST comment listing on stdin:
+    /// when a marker newer than the newest trusted one was dropped as
+    /// untrusted, the notice names its login and `author_association` and
+    /// points at `forge.trustedCommenters` instead of asserting a head move.
+    /// Unreadable stdin yields the plain wording. Exits 1 on an unknown label.
+    #[command(name = "verdict-stale-notice")]
+    VerdictStaleNotice {
+        /// The verdict label being cleared (`loom:pr` / `loom:changes-requested`).
+        #[arg(long)]
+        label: String,
+        /// The SHA the newest trusted marker records.
+        #[arg(long)]
+        marker_sha: String,
+        /// The PR's current head SHA.
+        #[arg(long)]
+        head_sha: String,
+        /// The attribution footer's source.
+        #[arg(long, default_value = "verdict-staleness-guard.sh")]
+        source: String,
+    },
+
     /// `forge may-write [--repo OWNER/REPO]` (#9548) — may this installation
     /// write (comment, label, merge, lease) to the repository? Yes only when
     /// it is managed here (origin of a registered workspace or of this Loom
@@ -451,6 +510,15 @@ pub(crate) enum ForgeAction {
         patch_created: Option<String>,
     },
 
+    /// `forge egress assert|doctor|policy` (#9984) — will this process's `gh`
+    /// reach the mandated API origin? Exit 0 aligned / 1 findings / 2
+    /// verification incomplete; no policy configured ⇒ 0. Never a `gh`
+    /// passthrough. See `defaults/docs/forge-egress.md`.
+    Egress {
+        #[command(subcommand)]
+        action: super::forge_egress_cmd::EgressAction,
+    },
+
     /// `forge dashboard-link <owner/repo> <number> [--pr]` — print the exact
     /// dashboard footer (#9772) for `number` in `owner/repo`, byte-for-byte
     /// as `forge comment` would append it. The shell twin's format-pinning
@@ -501,6 +569,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             access,
             force,
         } => return super::forge_identity_cmd::token(&repo, &access, force),
+        ForgeAction::Egress { action } => return super::forge_egress_cmd::handle(action),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
         ForgeAction::MayWrite { repo } => return super::forge_identity_cmd::may_write(repo),
@@ -555,6 +624,19 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             let fetch = fetch.map(|n| (n, repo, with_body));
             return super::forge_identity_cmd::trusted_comments(self_login, fetch, gh_shape);
         }
+        ForgeAction::VerdictStaleNotice {
+            label,
+            marker_sha,
+            head_sha,
+            source,
+        } => {
+            return super::forge_identity_cmd::verdict_stale_notice(
+                &label,
+                &marker_sha,
+                &head_sha,
+                &source,
+            );
+        }
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),
@@ -592,6 +674,15 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             hold,
         },
         ForgeAction::TreeUnchanged { base, head } => ForgeCmd::TreeUnchanged { base, head },
+        ForgeAction::VerdictEquivalent {
+            pr_number,
+            reviewed,
+            head,
+        } => ForgeCmd::VerdictEquivalent {
+            pr: pr_number,
+            reviewed,
+            head,
+        },
         ForgeAction::MergeMethod { repo, requested } => ForgeCmd::MergeMethod { repo, requested },
         ForgeAction::MergeConfig {
             repo,

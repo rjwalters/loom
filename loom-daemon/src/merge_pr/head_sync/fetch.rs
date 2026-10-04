@@ -19,20 +19,25 @@
 //! retry, re-queue" — never "assume it was our own sync". A guard that cannot
 //! establish attribution has not established it.
 
-use std::process::Command;
-
-/// The `gh` binary, honoring `LOOM_GH_BIN` — the same seam
-/// `stale_checks::fetch` and `forge_cmd::gh_bin` provide.
-fn gh_bin() -> String {
-    std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string())
-}
+use crate::gh_invocation::gh_bin;
 
 fn gh_api(args: &[&str]) -> Result<String, String> {
-    let out = Command::new(gh_bin())
-        .arg("api")
-        .args(args)
-        .output()
-        .map_err(|e| format!("could not exec gh api: {e}"))?;
+    let out = crate::gh_invocation::GhInvocation::new(
+        crate::gh_invocation::Operation::new("merge_guard.head_sync"),
+        crate::gh_invocation::AccessIntent::Read,
+        crate::gh_invocation::GhTarget::None,
+        std::time::Duration::from_secs(60),
+    )
+    .program(gh_bin())
+    .arg("api")
+    .args(args)
+    .run();
+    let out = match out {
+        crate::cmd_out::CmdOutcome::Ran(o) => o,
+        crate::cmd_out::CmdOutcome::Unavailable(u) => {
+            return Err(format!("could not exec gh api: {u}"));
+        }
+    };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let trimmed = stderr.trim();

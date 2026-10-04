@@ -349,7 +349,7 @@ gh pr create --label "loom:review-requested"
 | Directory | Contents |
 |-----------|----------|
 | [`mcp-loom/`](mcp-loom/README.md) | Unified Loom MCP server for Claude Code integration |
-| [`dashboard/`](dashboard/README.md) | Fleet observability backend (Cloudflare Workers) and web dashboard |
+| `2AMLogic/loom-ui` | Fleet observability backend (Cloudflare Workers) and web dashboard (moved out of this repo) |
 | [`loom-api/`](loom-api/README.md) | REST API server for external access to Loom analytics data |
 | [`examples/`](examples/README.md) | Example Loom workspace configurations |
 | [`quickstarts/`](quickstarts/README.md) | Pre-configured project templates for common use cases |

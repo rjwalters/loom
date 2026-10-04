@@ -128,6 +128,12 @@
 #   `guard-worktree-paths.sh` never run). This adapter therefore defaults to the
 #   most restrictive mode and requires an explicit signal to widen it.
 #   Precedence, highest first:
+#     0. A session-container dispatch (see "Session-exec mode" below) runs
+#        `-s danger-full-access` whatever was requested: bubblewrap cannot
+#        start inside the container, and the operator ruled (2026-10-03,
+#        issue #9979) that the hardened container is the boundary. The
+#        requested mode is still logged. LOOM_CODEX_CONTAINER_SANDBOX=codex
+#        opts back into the requested mode.
 #     1. An explicit `-s`/`--sandbox` in the passthrough args.
 #     2. `LOOM_CODEX_SANDBOX` (read-only|workspace-write|danger-full-access).
 #     3. Loom's runner-neutral `--dangerously-skip-permissions` convention ->
@@ -212,6 +218,15 @@
 #                        Overrides the skip-permissions mapping and the default.
 #   LOOM_CODEX_NETWORK   When 1 and the effective sandbox is workspace-write,
 #                        adds `-c sandbox_workspace_write.network_access=true`.
+#   LOOM_CODEX_CONTAINER_SANDBOX  off (default) | codex. Session-container
+#                        dispatch only: `off` runs Codex with its sandbox off
+#                        because the hardened container is the boundary
+#                        (issue #9979); `codex` keeps the requested sandbox
+#                        (needs a userns-capable container profile).
+#   LOOM_CODEX_SESSION_DOCKER  Docker binary used to read the session
+#                        container's posture labels (test seam; default
+#                        `docker`, and not consulted at all in
+#                        LOOM_CODEX_NO_EXEC preview mode unless set).
 #   LOOM_CODEX_HOME      Pins one CODEX_HOME profile directory (auth tier 1).
 #   CODEX_HOME           Honored verbatim if pre-set (auth tier 2).
 #   LOOM_CODEX_PROFILE   Bare profile/account name resolved under the profile
@@ -400,13 +415,15 @@ while [[ $# -gt 0 ]]; do
             fi
             HAS_SANDBOX_ARG=true
             EXPLICIT_SANDBOX="$2"
-            PASSTHROUGH_ARGS+=("$1" "$2")
+            # Held aside, not forwarded yet: a session-container dispatch
+            # replaces it (issue #9979, see "Session container boundary").
+            SANDBOX_ARGS=("$1" "$2")
             shift 2
             ;;
         -s=*|--sandbox=*)
             HAS_SANDBOX_ARG=true
             EXPLICIT_SANDBOX="${1#*=}"
-            PASSTHROUGH_ARGS+=("$1")
+            SANDBOX_ARGS=("$1")
             shift
             ;;
         --dangerously-bypass-approvals-and-sandbox)
@@ -415,7 +432,7 @@ while [[ $# -gt 0 ]]; do
             # Codex would reject as conflicting).
             HAS_SANDBOX_ARG=true
             EXPLICIT_SANDBOX="danger-full-access"
-            PASSTHROUGH_ARGS+=("$1")
+            SANDBOX_ARGS=("$1")
             shift
             ;;
         --skip-git-repo-check)
@@ -460,6 +477,8 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+# Codex's hook-trust waiver comes only from Loom's sealed-registration vetting (#10102), never from a caller.
+[[ " ${PASSTHROUGH_ARGS[*]-} " != *" --dangerously-bypass-hook-trust"* ]] || { log_error "A caller may not pass Codex's hook-trust waiver; spawn-codex.sh adds it only for a vetted sealed registration (issue #10102)."; exit 78; }
 
 # --- Model selection (mirrors spawn-claude.sh's #3477 precedence) ---
 # Precedence: explicit -m/--model > LOOM_MODEL > LOOM_CODEX_MODEL (the adapter's
@@ -558,17 +577,17 @@ elif [[ -n "${LOOM_CODEX_SANDBOX:-}" ]]; then
         log_error "Valid modes: $VALID_SANDBOX_MODES."
         exit 78  # EX_CONFIG
     fi
-    PASSTHROUGH_ARGS+=(-s "$SANDBOX_MODE")
+    SANDBOX_ARGS=(-s "$SANDBOX_MODE")
 elif [[ "$SKIP_PERMISSIONS" == "true" ]]; then
     # Loom's skip-permissions convention maps to workspace-write, NOT full
     # access — see the header's "DELIBERATE DIVERGENCE FROM THE FORK".
     SANDBOX_MODE="workspace-write"
     SANDBOX_SOURCE="loom-skip-permissions-convention"
-    PASSTHROUGH_ARGS+=(-s "$SANDBOX_MODE")
+    SANDBOX_ARGS=(-s "$SANDBOX_MODE")
 else
     SANDBOX_MODE="read-only"
     SANDBOX_SOURCE="adapter-default"
-    PASSTHROUGH_ARGS+=(-s "$SANDBOX_MODE")
+    SANDBOX_ARGS=(-s "$SANDBOX_MODE")
 fi
 log_info "spawn-codex: sandbox=$SANDBOX_MODE source=$SANDBOX_SOURCE"
 
@@ -767,6 +786,73 @@ if [[ "$CODEX_SESSION_EXEC" == "true" && "$HAS_PROMPT" != "true" ]]; then
     exit 78  # EX_CONFIG
 fi
 
+# --- Session container boundary (issue #9979; operator ruling 2026-10-03) ---
+# Codex's read-only / workspace-write sandbox is bubblewrap, and bubblewrap
+# needs an unprivileged user namespace. A session container cannot create
+# one: Docker's default seccomp profile denies unshare(CLONE_NEWUSER) without
+# CAP_SYS_ADMIN, and on Ubuntu 24.04 hosts
+# (`kernel.apparmor_restrict_unprivileged_userns=1`) AppArmor strips the
+# capabilities bwrap needs inside the namespace even with seccomp disabled.
+# Every shell command a containerized Codex role ran therefore failed with
+# `bwrap: No permissions to create a new namespace`, and the role exited 0
+# having done nothing.
+#
+# The operator ruled that THE CONTAINER IS THE BOUNDARY for Codex: inside a
+# session container Codex runs with its own sandbox off (`-s
+# danger-full-access`), and the container is hardened to carry that weight
+# (`--cap-drop ALL`, `no-new-privileges`, Docker's default seccomp/AppArmor,
+# only the registered repositories mounted, no Claude-pool or personal gh
+# credentials; see session_lifecycle.rs and
+# defaults/docs/guardrail-parity-codex.md § "Session containers").
+#
+# Because the container is now the only boundary, this adapter refuses to drop
+# the sandbox in a container that does not carry that hardening: a host-mode
+# session container must have been created with the
+# `loom.session-posture=container-boundary-v1` label (containers created
+# before this change mounted the whole checkout parent and the Claude token
+# pool, so they exit 78 here until recreated). Private-clone containers
+# (`loom.workspace-mode=private-clone`) were already created with this posture.
+#
+# Escape hatch: LOOM_CODEX_CONTAINER_SANDBOX=codex keeps the requested Codex
+# sandbox inside the container — only useful on a host whose session
+# containers have been given a user-namespace-capable seccomp/AppArmor
+# profile, which no Loom default does.
+#
+# The decision itself — read the container's labels AND its actual HostConfig,
+# refuse (78) an unhardened or drifted container (incl. unfrozen or stale profile
+# controls), decide whether the dispatch's GH_CONFIG_DIR is mounted in it — lives in the daemon
+# (`loom-daemon session-exec posture`, session_exec/posture.rs), which prints
+# `mode=<m> sandbox=<s> gh=<forward|skip>`. In argv-preview mode
+# (LOOM_CODEX_NO_EXEC) docker is never touched unless a test names one through
+# LOOM_CODEX_SESSION_DOCKER; with no docker at all, the binary check below
+# exits 127 and the sandbox is left as requested.
+# requires-daemon: session-exec >= 0.19.316  `posture` arrived with #9979; an older binary fails closed (78).
+SESSION_EXTRA_ENV=()
+if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
+    _posture_docker="${LOOM_CODEX_SESSION_DOCKER:-}"
+    [[ -n "$_posture_docker" || -n "${LOOM_CODEX_NO_EXEC:-}" ]] || _posture_docker="docker"
+    if [[ -z "$_posture_docker" ]]; then
+        _posture="mode=unverified-preview sandbox=danger-full-access gh=forward"
+    elif ! command -v "$_posture_docker" >/dev/null 2>&1; then
+        _posture="mode=docker-unavailable sandbox=$SANDBOX_MODE gh=skip"
+    elif ! _posture="$("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" session-exec posture --docker "$_posture_docker" \
+        --container "$CODEX_SESSION_CONTAINER" --profile "$CODEX_PROFILE_NAME" --codex-home "$CODEX_HOME" --requested "$SANDBOX_MODE")"; then
+        log_error "Refusing to dispatch into $CODEX_SESSION_CONTAINER (see above; a loom-daemon predating #9979 has no 'session-exec posture' — update Loom)."
+        exit 78  # EX_CONFIG
+    fi
+    read -r _posture_mode _posture_sandbox _posture_gh <<< "$_posture"
+    log_info "spawn-codex: container=$CODEX_SESSION_CONTAINER posture=${_posture_mode#mode=}"
+    if [[ "${_posture_sandbox#sandbox=}" != "$SANDBOX_MODE" ]]; then
+        SANDBOX_SOURCE="session-container-boundary requested=$SANDBOX_MODE via $SANDBOX_SOURCE"
+        SANDBOX_MODE="${_posture_sandbox#sandbox=}"
+        SANDBOX_ARGS=(-s "$SANDBOX_MODE")
+        SESSION_BOUNDARY="its session container ($CODEX_SESSION_CONTAINER, issue #9979)"
+        log_info "spawn-codex: sandbox=$SANDBOX_MODE source=$SANDBOX_SOURCE"
+    fi
+    [[ "$_posture_gh" != "gh=forward" || -z "${GH_CONFIG_DIR:-}" ]] || SESSION_EXTRA_ENV=(--env GH_CONFIG_DIR)
+fi
+PASSTHROUGH_ARGS+=(${SANDBOX_ARGS[@]+"${SANDBOX_ARGS[@]}"})
+
 # --- ChatGPT-plan auth-mode guard for a pinned model (issue #5499) ---
 # A Codex profile authenticated via a ChatGPT PLAN (interactive `codex login`)
 # restricts the CLI to the account's own default model — an EXPLICITLY pinned
@@ -832,11 +918,23 @@ fi
 # Roles are therefore split by whether they mutate:
 #
 #   MUTABLE roles (builder, doctor) MUST prove the managed hook is installed at
-#   the expected version, pinned, readable, points at THIS workspace's bridge,
-#   and that the profile has established Codex hook trust. Any failure exits 78
-#   BEFORE the CLI starts. `--dangerously-bypass-hook-trust` is never passed —
-#   #4495's scope guards forbid it, and waiving trust would defeat the very
-#   boundary this preflight exists to prove.
+#   the expected version, pinned, that THIS workspace has a readable bridge for
+#   the workspace-independent entry to run (#9390), and that the profile has
+#   established Codex hook trust. Any failure exits 78
+#   BEFORE the CLI starts.
+#
+#   Trust has exactly one substitute: a SEALED registration (issue #10102).
+#   Inside a hardened session container whose posture is `host` (read-only,
+#   byte-identical profile controls), `verify --allow-sealed` may find that the
+#   only hook source Codex would load is Loom's own entry: nothing else in
+#   hooks.json or config.toml, nothing in the checkout's `.codex/`, nothing in
+#   this launch's argv, and the container's copies are the vetted bytes. Then,
+#   and only then, this adapter passes `--dangerously-bypass-hook-trust` (with
+#   plugins off, since their hooks can't be vetted). That waiver is what #4495
+#   forbade. What changed is that the container is the boundary (#10014), the
+#   controls are sealed read-only binds, and their bytes are proven. The rule
+#   is in tokens_pool/codex_hooks_seal.rs. Anything Loom didn't write means
+#   no waiver, and recorded trust is required as before.
 #
 #   A PRIVATE-CLONE session (issue #8787) is the one case where this host-side
 #   check would inspect the wrong bridge and the wrong workspace; there the
@@ -853,6 +951,14 @@ fi
 # The audit line names the profile DIRECTORY NAME and the readiness verdict
 # only — never a profile path's contents and never a byte of auth.json.
 LOOM_CODEX_MUTABLE_ROLES="builder doctor"
+# GUARDED roles (#9390) do not write the repository, so they keep the read-only
+# sandbox, but they act with merge (champion) or verdict (judge) authority on
+# the forge, which is what Loom's guards police. They need the same proven hook
+# and fail closed the same way. loom-daemon's runtime preference already passes
+# Codex over for them while any shared profile is unready
+# (runtime_preference::codex_guard, which mirrors this list); this is the
+# backstop, not the router.
+LOOM_CODEX_GUARDED_ROLES="champion judge"
 _hook_role="$(printf '%s' "${LOOM_ROLE:-}" | tr '[:upper:]_' '[:lower:]-')"
 case "$_hook_role" in
     development-worker) _hook_role="builder" ;;
@@ -869,10 +975,12 @@ esac
 
 _hook_role_is_mutable=false
 [[ -n "$_hook_role" && " $LOOM_CODEX_MUTABLE_ROLES " == *" $_hook_role "* ]] && _hook_role_is_mutable=true || true
+[[ -n "$_hook_role" && " $LOOM_CODEX_GUARDED_ROLES " == *" $_hook_role "* ]] && _hook_required=true || _hook_required="$_hook_role_is_mutable"
 
 _hook_provisioner="${_SCRIPT_DIR}/provision-codex-hooks.sh"
 _hook_status="unknown"
 _hook_reason=""
+_hook_trust_bypass="never"
 
 if [[ -n "${LOOM_PRIVATE_LEASE_FD:-}" && "$CODEX_SESSION_EXEC" == "true" ]]; then
     # Private-clone session (issue #8787). The managed hook this launch runs
@@ -900,7 +1008,7 @@ if [[ -n "${LOOM_PRIVATE_LEASE_FD:-}" && "$CODEX_SESSION_EXEC" == "true" ]]; the
     #     has established Codex hook trust. That is a strictly stronger form of
     #     exactly the obligation checked below.
     #
-    # `--dangerously-bypass-hook-trust` is passed nowhere, here or there.
+    # The trust waiver (#10102) is never used for a private-clone session.
     _hook_status="verified-in-private-session"; _hook_reason="proven inside the account's private session, against the image-owned bridge for /workspace/repo (#8787)"
 elif [[ ! -x "$_hook_provisioner" && ! -r "$_hook_provisioner" ]]; then
     _hook_status="unavailable"
@@ -912,34 +1020,43 @@ elif [[ -z "${CODEX_HOME:-}" ]]; then
     _hook_reason="ambient Codex login state (no Loom-managed profile selected)"
 else
     _hook_verify_out=""
-    if _hook_verify_out="$(bash "$_hook_provisioner" verify \
-            --codex-home "$CODEX_HOME" --workspace "$WORKSPACE" --json 2>/dev/null)"; then
-        _hook_status="ready"
-    else
-        _hook_status="not-ready"
-    fi
+    # Codex keys hook trust by the hooks.json path under the CODEX_HOME it runs
+    # with, so name where THIS launch runs, never the derived default (#9390).
+    _hook_runtime_home="/home/loom/.codex-profile"
+    [[ "$CODEX_SESSION_EXEC" == "true" ]] || _hook_runtime_home="$(cd -P -- "$CODEX_HOME" 2>/dev/null && pwd -P)" || _hook_runtime_home="$CODEX_HOME"
+    # Sealed registration (#10102): asked for only once posture proved a
+    # hardened host-mode container (so verify can check the container's own
+    # copies), and only with jq to read back whether the waiver is required.
+    _hook_seal=()
+    [[ "$CODEX_SESSION_EXEC" != "true" || "${_posture_mode:-}" != "mode=host" ]] || ! command -v jq >/dev/null 2>&1 \
+        || _hook_seal=(--allow-sealed --cwd "$PWD" --container "$CODEX_SESSION_CONTAINER" --docker "$_posture_docker" -- ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"})
+    _hook_verify() { bash "$_hook_provisioner" verify --codex-home "$CODEX_HOME" --workspace "$WORKSPACE" --runtime-codex-home "$_hook_runtime_home" --json "$@" 2>/dev/null; }
+    _hook_rc=0; _hook_verify_out="$(_hook_verify ${_hook_seal[@]+"${_hook_seal[@]}"})" || _hook_rc=$?
+    # A daemon predating #10102 rejects --allow-sealed (clap exits 2): judge on recorded trust alone.
+    [[ $_hook_rc -ne 2 || ${#_hook_seal[@]} -eq 0 ]] || { _hook_seal=(); _hook_rc=0; _hook_verify_out="$(_hook_verify)" || _hook_rc=$?; }
+    [[ $_hook_rc -eq 0 ]] && _hook_status="ready" || _hook_status="not-ready"
     if [[ -n "$_hook_verify_out" ]] && command -v jq >/dev/null 2>&1; then
         _hook_reason="$(printf '%s' "$_hook_verify_out" | jq -r '.reason // empty' 2>/dev/null)" || _hook_reason=""
     fi
+    # Ready on a seal means ready only WITH the waiver (verify proved the container's copies).
+    [[ "$_hook_status" != "ready" || ${#_hook_seal[@]} -eq 0 || "$(printf '%s' "$_hook_verify_out" | jq -r .bypassHookTrust 2>/dev/null)" != "true" ]] || _hook_trust_bypass="sealed"
 fi
 
-log_info "spawn-codex: hooks=$_hook_status role=${_hook_role:-unset} mutable=$_hook_role_is_mutable trust-bypass=never${_hook_reason:+ reason=\"$_hook_reason\"}"
+log_info "spawn-codex: hooks=$_hook_status role=${_hook_role:-unset} mutable=$_hook_role_is_mutable required=$_hook_required trust-bypass=$_hook_trust_bypass${_hook_reason:+ reason=\"$_hook_reason\"}"
 
-if [[ "$_hook_role_is_mutable" == "true" && "$_hook_status" != "ready" && "$_hook_status" != "verified-in-private-session" ]]; then
-    log_error "Role '$_hook_role' mutates the repository, but Loom's managed Codex pre_tool_use hook is not ready (status=$_hook_status)."
+if [[ "$_hook_required" == "true" && "$_hook_status" != "ready" && "$_hook_status" != "verified-in-private-session" ]]; then
+    log_error "Role '$_hook_role' mutates the repository or merges/issues verdicts, but Loom's managed Codex pre_tool_use hook is not ready (status=$_hook_status)."
     [[ -n "$_hook_reason" ]] && log_error "  reason: $_hook_reason"
-    log_error "Without it a Codex worker runs with NO managed-worktree confinement,"
-    log_error "NO destructive-command blocking, and NO Loom workflow interception."
-    log_error "Provision and trust the profile, then retry:"
+    log_error "Without it a Codex worker runs with NO managed-worktree confinement, NO destructive-command blocking, and NO Loom workflow interception."
+    log_error "Provision the profile, then retry (the trust waiver is used only for a sealed registration in a hardened session container, #10102):"
     log_error "  .loom/scripts/provision-codex-hooks.sh install --all-profiles --workspace $WORKSPACE"
-    log_error "  CODEX_HOME=<profile> codex     # accept the hook-trust prompt once per profile"
+    log_error "  session-managed: restart the session so its read-only binds see the new files (no trust prompt once sealed); bare metal: accept the hook-trust prompt once per profile (guardrail-parity-codex.md)"
     log_error "  .loom/scripts/provision-codex-hooks.sh verify --all-profiles --workspace $WORKSPACE --json"
-    log_error "Loom will not pass --dangerously-bypass-hook-trust (issue #4495)."
     exit 78  # EX_CONFIG
 fi
 
-if [[ "$_hook_role_is_mutable" != "true" && "$_hook_status" != "ready" && "$_hook_status" != "verified-in-private-session" ]]; then
-    log_warn "spawn-codex: hook parity unavailable — this session gets ONLY the Codex sandbox (${SANDBOX_MODE}) as a boundary. Read-only roles may proceed; this session is NOT Builder-capable."
+if [[ "$_hook_required" != "true" && "$_hook_status" != "ready" && "$_hook_status" != "verified-in-private-session" ]]; then
+    log_warn "spawn-codex: hook parity unavailable — this session's only boundary is ${SESSION_BOUNDARY:-the Codex sandbox (${SANDBOX_MODE})}. Read-only roles may proceed; this session is NOT Builder-capable."
 fi
 
 # --- Assemble the codex invocation ---
@@ -949,6 +1066,8 @@ CODEX_ARGS=()
 if [[ "$HAS_PROMPT" == "true" ]]; then
     CODEX_ARGS+=(exec)
 fi
+# Only for a sealed registration whose every hook source was vetted above (#10102).
+[[ "$_hook_trust_bypass" != "sealed" ]] || CODEX_ARGS+=(--dangerously-bypass-hook-trust -c features.plugins=false)
 if [[ "$CODEX_DROP_PINNED_MODEL" == "true" ]]; then
     # Issue #5499: strip the pinned `-m`/`--model` (both the two-token and
     # `=`-joined single-token forms) that the ChatGPT-plan guard above decided
@@ -1007,7 +1126,7 @@ if [[ "$CODEX_SESSION_EXEC" == "true" ]]; then
     # explicitly for the same reason; host HOME/PATH/CODEX_HOME and ambient
     # provider credentials are deliberately NOT forwarded — the container
     # owns its own CODEX_HOME (ADR-0017 Decision 1).
-    CODEX_INVOKE=("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" session-exec host --container "$CODEX_SESSION_CONTAINER" --workdir "$PWD" --env "LOOM_WORKSPACE=$WORKSPACE" --env CARGO_INCREMENTAL=0 --owner-pid "$PPID")
+    CODEX_INVOKE=("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" session-exec host --container "$CODEX_SESSION_CONTAINER" --workdir "$PWD" --env "LOOM_WORKSPACE=$WORKSPACE" --env CARGO_INCREMENTAL=0 ${SESSION_EXTRA_ENV[@]+"${SESSION_EXTRA_ENV[@]}"} --owner-pid "$PPID")
     for _v in LOOM_ROLE LOOM_RUNTIME LOOM_TERMINAL_ID LOOM_SWEEP_ID LOOM_WORKTREE_PATH LOOM_WORKTREE_ROOT LOOM_PROJECT_ROOT LOOM_SWEEP_CLAIM_OWNED LOOM_ACCOUNT_NAME LOOM_ACCOUNT_PROVIDER; do [[ -n "${!_v:-}" ]] && CODEX_INVOKE+=(--env "$_v=${!_v}"); done
     CODEX_INVOKE+=(--)
 fi
@@ -1151,6 +1270,19 @@ if [[ -f "$_classifier_lib" ]]; then
     source "$_classifier_lib"
     _classifier_input="$(tail -c 65536 "$_stderr_file" 2>/dev/null || true)"
     _terminal_category="$(classify_error "$_classifier_input" "$_exit_code" codex)"
+    # #10003: an exit-0 session whose sandbox refused every shell command
+    # did no work, so report SANDBOX_UNAVAILABLE rather than SUCCESS. The
+    # rule is `loom-daemon codex-sandbox-noop`'s. Only its exit 0 plus a line
+    # means a no-op, so an older binary keeps the shared classifier's verdict.
+    # The exit code still passes through unchanged (the adapter contract).
+    if [[ "$_exit_code" -eq 0 && "$_terminal_category" == "SUCCESS" ]] \
+        && declare -F loom_resolve_self_daemon_bin >/dev/null \
+        && _noop_detail="$("$(loom_resolve_self_daemon_bin)" codex-sandbox-noop "$_stderr_file" 2>/dev/null)" \
+        && [[ -n "$_noop_detail" ]]; then
+        _terminal_category="SANDBOX_UNAVAILABLE"
+        log_warn "spawn-codex: exited 0 but the sandbox refused every shell command ($_noop_detail); reporting SANDBOX_UNAVAILABLE (#10003)"
+        printf '# LOOM_RUNTIME_NOOP runtime=codex reason=sandbox-unavailable %s\n' "$_noop_detail" >&2
+    fi
     _terminal_account="${LOOM_ACCOUNT_NAME:-${CODEX_PROFILE_NAME:-unknown}}"
     [[ "$_terminal_account" =~ ^[A-Za-z0-9._-]+$ ]] || _terminal_account="unknown"
     # `none` when nothing was pinned, when the #5499 guard stripped the pin
@@ -1164,7 +1296,7 @@ if [[ -f "$_classifier_lib" ]]; then
         # emits no credit-exhaustion pattern of its own today, so this arm is
         # unreachable for provider=codex — but an allowlist that silently drops
         # a valid category is exactly how terminal feedback goes missing.
-        SUCCESS|TOKEN_EXPIRED|TOKEN_EXHAUSTED|MODEL_CREDITS_EXHAUSTED|RECOVERABLE|TIMEOUT|FATAL|CWD_DELETED|MODEL_REFUSAL|SESSION_LIMIT)
+        SUCCESS|TOKEN_EXPIRED|TOKEN_EXHAUSTED|MODEL_CREDITS_EXHAUSTED|RECOVERABLE|TIMEOUT|FATAL|CWD_DELETED|MODEL_REFUSAL|SESSION_LIMIT|SANDBOX_UNAVAILABLE)
             printf '# LOOM_TERMINAL_RESULT v=2 provider=codex account=%s category=%s exit_code=%s model=%s\n' \
                 "$_terminal_account" "$_terminal_category" "$_exit_code" "$_terminal_model" >&2
             ;;

@@ -210,7 +210,7 @@ fn uname_or_question(flag: &str) -> String {
 }
 
 fn gh_release_view(slug: &str, fields: &str, jq: &str) -> Option<String> {
-    let out = Command::new("gh")
+    let out = Command::new(crate::gh_invocation::gh_bin())
         .args(["release", "view", "--json", fields, "-R", slug, "--jq", jq])
         .stderr(Stdio::null())
         .output()

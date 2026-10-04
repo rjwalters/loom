@@ -554,19 +554,20 @@ pub fn fetch_issue_complexity(gh_bin: &Path, workspace_root: &Path, issue: u32) 
     let repo = std::env::var("LOOM_REPO").ok();
 
     // 1. GraphQL (`gh issue view`) — the same call `resolve-tier-model.sh` tries first.
-    let mut view = Command::new(gh_bin);
-    view.arg("issue")
-        .arg("view")
-        .arg(issue.to_string())
-        .arg("--json")
-        .arg("body")
-        .arg("--jq")
-        .arg(".body");
-    view.current_dir(workspace_root);
-    if let Some(ref r) = repo {
-        view.arg("--repo").arg(r);
-    }
-    if let Ok(Some(out)) = super::reaper::output_with_timeout(view, timeout) {
+    // #10089: both reads are counted via the facade (`model.issue_body*`).
+    use crate::claim_reconciliation::gh_call;
+    let view = gh_call::read_within("model.issue_body", gh_bin, workspace_root, timeout)
+        .args([
+            "issue",
+            "view",
+            &issue.to_string(),
+            "--json",
+            "body",
+            "--jq",
+            ".body",
+        ])
+        .args(repo.iter().flat_map(|r| ["--repo", r.as_str()]));
+    if let Ok(out) = gh_call::output(view) {
         if out.status.success() {
             let body = String::from_utf8_lossy(&out.stdout);
             if let Some(tier) = se::extract_complexity_marker(&body) {
@@ -583,10 +584,9 @@ pub fn fetch_issue_complexity(gh_bin: &Path, workspace_root: &Path, issue: u32) 
         || format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
         |r| format!("repos/{r}/issues/{issue}"),
     );
-    let mut api = Command::new(gh_bin);
-    api.arg("api").arg(&path).arg("--jq").arg(".body");
-    api.current_dir(workspace_root);
-    if let Ok(Some(out)) = super::reaper::output_with_timeout(api, timeout) {
+    let api = gh_call::read_within("model.issue_body_rest", gh_bin, workspace_root, timeout)
+        .args(["api", &path, "--jq", ".body"]);
+    if let Ok(out) = gh_call::output(api) {
         if out.status.success() {
             let body = String::from_utf8_lossy(&out.stdout);
             return se::extract_complexity_marker(&body).map(str::to_owned);

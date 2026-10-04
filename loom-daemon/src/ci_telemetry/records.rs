@@ -268,9 +268,24 @@ pub struct JobJson {
     /// #9089, and on a job that failed before any step ran.
     #[serde(default)]
     pub steps: Vec<StepJson>,
+    /// The runner GitHub assigned. `""` (or absent) on a job that never
+    /// started (#10113).
+    #[serde(default)]
+    pub runner_name: Option<String>,
 }
 
 impl JobJson {
+    /// Shaped like a job GitHub never started: completed `failure`, no
+    /// runner, no steps. Necessary but NOT sufficient for a billing block —
+    /// [`super::billing::classify_job`] confirms via the annotation.
+    #[must_use]
+    pub fn looks_not_started(&self) -> bool {
+        self.is_completed()
+            && self.conclusion.as_deref() == Some("failure")
+            && self.steps.is_empty()
+            && self.runner_name.as_deref().is_none_or(str::is_empty)
+    }
+
     #[must_use]
     pub fn is_completed(&self) -> bool {
         self.status == "completed"
@@ -626,6 +641,41 @@ pub fn suite_context(
     }
 }
 
+/// A test span's context inside its run attempt's trace (#9456). Derived from
+/// `(repo, job_id, sanitized binary id, sanitized test name)`, following the
+/// same determinism rule as the run, job, step and suite contexts: a replayed
+/// or second-host emission of the same test is byte-identical in identity,
+/// which is what lets the journal deduplicate on `span|<span_id>`.
+///
+/// The **stable name** is the identity here, as for a suite and unlike a
+/// step's number, and for a sharper version of the same reason:
+/// `--partition count:k/N` is a hash over the test list, so adding ONE test
+/// reshuffles which leg runs many of the others. An ordinal-derived id would
+/// fork on every suite edit and make "this test's duration over the last week"
+/// unanswerable — the exact question the spans exist for. `classname` (the
+/// nextest binary id) is part of the key because a test path is only unique
+/// within its binary: `tests::smoke` exists in several. (`classname` is
+/// `loom-daemon` for the lib tests and `loom-daemon::<target>` for an
+/// integration binary.)
+///
+/// Both halves are sanitized *before* derivation so the id matches the
+/// attributes that are actually emitted.
+#[must_use]
+pub fn test_context(
+    repo: &str,
+    run_id: u64,
+    attempt: u32,
+    job_id: u64,
+    binary: &str,
+    test: &str,
+) -> TraceContext {
+    let run = run_context(repo, run_id, attempt);
+    TraceContext {
+        span_id: SpanId::derived(&["loom.ci.test", repo, &job_id.to_string(), binary, test]),
+        ..run
+    }
+}
+
 fn span_status(conclusion: Option<&str>) -> SpanStatus {
     match conclusion {
         Some("success") => SpanStatus::Ok,
@@ -757,6 +807,20 @@ pub fn job_envelopes(
     baseline: JobCreationBaseline,
     host_id: &str,
 ) -> Vec<TelemetryEnvelope> {
+    job_envelopes_with_reason(repo, run, job, baseline, host_id, None)
+}
+
+/// [`job_envelopes`] plus the job span's `loom.ci.not_started_reason`
+/// attribute when the job never started (#10113).
+#[must_use]
+pub fn job_envelopes_with_reason(
+    repo: &RepoJson,
+    run: &RunJson,
+    job: &JobJson,
+    baseline: JobCreationBaseline,
+    host_id: &str,
+    not_started: Option<super::billing::NotStartedReason>,
+) -> Vec<TelemetryEnvelope> {
     let started_at = job.started_at.unwrap_or(run.created_at);
     let completed_at = job.completed_at.unwrap_or(started_at).max(started_at);
     let duration = duration_ms(started_at, completed_at);
@@ -827,6 +891,10 @@ pub fn job_envelopes(
             ("loom.ci.shard.index", shard.index.map(|i| i.to_string())),
             ("loom.ci.shard.total", shard.total.map(|t| t.to_string())),
             ("loom.ci.shard.kind", Some(shard.kind.as_str().to_string())),
+            (
+                super::billing::NOT_STARTED_REASON_ATTR,
+                not_started.map(|r| r.as_str().to_string()),
+            ),
         ]),
         events: Vec::new(),
         links: Vec::new(),

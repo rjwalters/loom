@@ -458,3 +458,65 @@ fn native_role_tick_mark_emits_exactly_one_reason_classified_point() {
     assert_eq!(captured.metrics[0].labels["provider"], "loomtest");
     assert_eq!(captured.metrics[0].labels["reason"], "rate_limited");
 }
+
+/// #10003: an exit-0 codex tick whose adapter reports `SANDBOX_UNAVAILABLE`
+/// (every exec refused by bubblewrap) is a failed tick, never `Success`. It
+/// writes no account hold and no `last_success`, because the account is not at
+/// fault, and it arms the host-wide sandbox hold the preference walk falls
+/// through on.
+#[test]
+#[serial]
+fn codex_role_tick_sandbox_no_op_is_a_failure_that_leaves_account_health_alone() {
+    use crate::runtime_preference::sandbox_hold;
+    struct ClearHold;
+    impl Drop for ClearHold {
+        fn drop(&mut self) {
+            sandbox_hold::clear("codex");
+        }
+    }
+    let _clear = ClearHold;
+    sandbox_hold::clear("codex");
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    codex_judge_workspace(workspace.path());
+    write_executable(
+        &workspace.path().join(".loom/scripts/spawn-worker.sh"),
+        "#!/bin/sh\n\
+         echo '# LOOM_ACCOUNT name=alice'\n\
+         echo 'exec'\n\
+         echo ' exited 1 in 0ms:'\n\
+         echo 'bwrap: No permissions to create a new namespace'\n\
+         echo '# LOOM_RUNTIME_NOOP runtime=codex reason=sandbox-unavailable \
+shape=exec-denied execs=1 denied=1 succeeded=0'\n\
+         echo '# LOOM_TERMINAL_RESULT v=2 provider=codex account=alice \
+category=SANDBOX_UNAVAILABLE exit_code=0 model=none'\n\
+         exit 0\n",
+    );
+
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
+    let RoleTickOutcome::Failure(detail) = outcome else {
+        panic!("a sandbox no-op must not be Success, got {outcome:?}");
+    };
+    assert!(
+        detail.starts_with(super::super::launch::sandbox_noop::REASON_PREFIX),
+        "{detail}"
+    );
+    assert!(detail.contains("shape=exec-denied execs=1 denied=1 succeeded=0"), "{detail}");
+
+    let health = tokens_pool::account_health(workspace.path(), &codex_id("alice")).unwrap();
+    assert!(
+        health
+            .as_ref()
+            .is_none_or(|h| h.cooldown_until.is_none() && h.last_success.is_none()),
+        "SANDBOX_UNAVAILABLE must neither hold the account nor stamp a success: {health:?}"
+    );
+    assert!(
+        sandbox_hold::active("codex", epoch_now()).is_some(),
+        "the no-op arms the host-wide sandbox hold"
+    );
+}

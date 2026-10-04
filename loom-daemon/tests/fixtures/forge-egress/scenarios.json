@@ -1,0 +1,1597 @@
+{
+  "description": "Forge-egress validator fixtures shared with 2AMLogic/2am (#9984). Each row is a static validator input; `expected` is what Loom's Rust validator must produce, `upstream` is what 2am's scripts/lib/github_egress.py produces for the same inputs (computed by running it). Rows s00-s17 translate the 17 live-gh scenarios of 2am scripts/tests/test-github-egress-fixtures.py into the configuration each one exercises; u-* rows mirror scripts/tests/test-github-egress.py. Every code in expected but not in upstream must be a Loom-only code (forge_egress::checks::LOOM_ONLY_CODES) or carry a `loom_only_surface` note. No real credentials: profiles are rendered from the shape names below with a placeholder token.",
+  "upstream_validator": {
+    "repo": "2AMLogic/2am",
+    "path": "scripts/lib/github_egress.py",
+    "commit": "8c947aea0026cdb7cda97ea20eea706c4daaf058",
+    "note": "`upstream` re-derived by running this file over every row: 0 mismatches. Every row except u-adapter-block-accepted (the P2 `adapter` schema addition) also matches the P0 commit e61116be. policy.schema.json is vendored byte-identical from this commit."
+  },
+  "base_policies": {
+    "example": "policy.example.json (2am infra/github-proxy, verbatim)",
+    "fixture": "policy.fixture.json"
+  },
+  "profile_shapes": {
+    "routed": "the logical-host entry carries api_host = the policy's expected api_host",
+    "token-only": "Loom's publish_github_app_token shape: oauth_token + user, no api_host",
+    "no-api-host": "a full gh profile without api_host",
+    "wrong-host": "api_host = some-other-proxy.invalid"
+  },
+  "defaults": {
+    "base": "fixture",
+    "policy_patch": {},
+    "gh": {
+      "version": "2.102.0",
+      "path": "launcher",
+      "launcher_exists": true
+    },
+    "env": {
+      "GH_CONFIG_DIR": "{root}/cfg"
+    },
+    "profiles": {
+      "{root}/cfg": "routed",
+      "{root}/home/.config/gh": "routed"
+    },
+    "default_profile": "{root}/home/.config/gh",
+    "loom_owned": [],
+    "git_rewrites": 0,
+    "canary": null,
+    "loom_otlp": true
+  },
+  "rows": [
+    {
+      "id": "s00-below-floor",
+      "summary": "0: gh 2.97.0 with api_host configured -- api_host is a silent no-op",
+      "upstream_scenario": "scenario_00_version_floor",
+      "gh": {
+        "version": "2.97.0"
+      },
+      "expected": {
+        "routing": [
+          "toolchain.below-api-host-floor"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [
+          "toolchain.below-api-host-floor"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "s00-at-pin",
+      "summary": "0: the pinned gh 2.102.0 honours api_host",
+      "upstream_scenario": "scenario_00_version_floor",
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "s01-relative-rest",
+      "summary": "1: relative gh api repos/... Per-request routing is what 2am's live-gh suite asserts; for the static validator the configuration is aligned, and any per-request escape is only provable by the runtime canary (runtime.unverifiable until P4).",
+      "upstream_scenario": "scenario_01_relative_rest",
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "s02-stripped-environment",
+      "summary": "2: only HOME/PATH -- gh reads its default profile, which is routed",
+      "upstream_scenario": "scenario_02_stripped_environment",
+      "env": {},
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "s03-graphql",
+      "summary": "3: gh api graphql -- Per-request routing is what 2am's live-gh suite asserts; for the static validator the configuration is aligned, and any per-request escape is only provable by the runtime canary (runtime.unverifiable until P4).",
+      "upstream_scenario": "scenario_03_graphql",
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "s04-remote-inferred-issue-list",
+      "summary": "4: remote-inferred gh issue list -- Per-request routing is what 2am's live-gh suite asserts; for the static validator the configuration is aligned, and any per-request escape is only provable by the runtime canary (runtime.unverifiable until P4).",
+      "upstream_scenario": "scenario_04_remote_inferred_issue_list",
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "s05-remote-inferred-pr-list",
+      "summary": "5: remote-inferred gh pr list -- Per-request routing is what 2am's live-gh suite asserts; for the static validator the configuration is aligned, and any per-request escape is only provable by the runtime canary (runtime.unverifiable until P4).",
+      "upstream_scenario": "scenario_05_remote_inferred_pr_list",
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "s06-search-issues",
+      "summary": "6: gh search issues -- Per-request routing is what 2am's live-gh suite asserts; for the static validator the configuration is aligned, and any per-request escape is only provable by the runtime canary (runtime.unverifiable until P4).",
+      "upstream_scenario": "scenario_06_search_issues",
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "s07-explicit-hostname",
+      "summary": "7: --hostname github.com names the logical host -- aligned",
+      "upstream_scenario": "scenario_07_explicit_hostname",
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "s08-absolute-canonical-url",
+      "summary": "8: an absolute api.github.com URL bypasses api_host -- invisible to config, runtime boundary only",
+      "upstream_scenario": "scenario_08_absolute_canonical_url",
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "s09-pagination-absolute-link",
+      "summary": "9: --paginate follows a canonical Link -- runtime boundary only",
+      "upstream_scenario": "scenario_09_pagination_absolute_link",
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "s10-redirect-to-canonical",
+      "summary": "10: a 302 to the canonical API -- runtime boundary only",
+      "upstream_scenario": "scenario_10_redirect_to_canonical",
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "s11-gateway-503",
+      "summary": "11: a gateway 503 has no direct fallback -- aligned config",
+      "upstream_scenario": "scenario_11_gateway_503",
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "s12-shadowed-config-dir",
+      "summary": "12: an unenumerated GH_CONFIG_DIR with no api_host shadows the approved profile",
+      "upstream_scenario": "scenario_12_shadowed_config_dir",
+      "env": {
+        "GH_CONFIG_DIR": "{root}/shadow"
+      },
+      "profiles": {
+        "{root}/cfg": "routed",
+        "{root}/home/.config/gh": "routed",
+        "{root}/shadow": "no-api-host"
+      },
+      "expected": {
+        "routing": [
+          "apiconfig.shadowed-profile",
+          "apiconfig.api-host-missing"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [
+          "apiconfig.shadowed-profile"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "s13-traceparent-not-injected",
+      "summary": "13: exported TRACEPARENT -- telemetry, never routing",
+      "upstream_scenario": "scenario_13_traceparent_not_injected",
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "s14-explicit-traceparent-header",
+      "summary": "14: -H traceparent -- telemetry, never routing",
+      "upstream_scenario": "scenario_14_explicit_traceparent_header",
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "s15-gh-host-is-the-ghes-trap",
+      "summary": "15: GH_HOST=<gateway> means Enterprise Server semantics",
+      "upstream_scenario": "scenario_15_gh_host_is_the_ghes_trap",
+      "env": {
+        "GH_CONFIG_DIR": "{root}/cfg",
+        "GH_HOST": "github-proxy.fixture.invalid"
+      },
+      "expected": {
+        "routing": [
+          "ghhost.points-at-gateway"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [
+          "ghhost.points-at-gateway"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "s16-gh-host-breaks-remote-inference",
+      "summary": "16: GH_HOST=<gateway> + a github.com remote refuses",
+      "upstream_scenario": "scenario_16_gh_host_breaks_remote_inference",
+      "env": {
+        "GH_CONFIG_DIR": "{root}/cfg",
+        "GH_HOST": "github-proxy.fixture.invalid"
+      },
+      "expected": {
+        "routing": [
+          "ghhost.points-at-gateway"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [
+          "ghhost.points-at-gateway"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "s17-hosts-yml-republication",
+      "summary": "17: Loom's token-only hosts.yml republication drops api_host (2am cannot see this)",
+      "upstream_scenario": "scenario_17_hosts_yml_republication",
+      "profiles": {
+        "{root}/cfg": "token-only",
+        "{root}/home/.config/gh": "routed"
+      },
+      "expected": {
+        "routing": [
+          "apiconfig.api-host-missing"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "ac-example-gh-2.97",
+      "summary": "AC: policy.example.json + stock gh 2.97.0",
+      "base": "example",
+      "gh": {
+        "version": "2.97.0"
+      },
+      "env": {},
+      "profiles": {
+        "{root}/home/.config/gh": "routed"
+      },
+      "expected": {
+        "routing": [
+          "toolchain.below-api-host-floor"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [
+          "toolchain.below-api-host-floor"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "ac-example-unenumerated-token-only",
+      "summary": "AC: gh 2.100.0 + an unenumerated GH_CONFIG_DIR whose hosts.yml lacks api_host",
+      "base": "example",
+      "gh": {
+        "version": "2.100.0"
+      },
+      "env": {
+        "GH_CONFIG_DIR": "{root}/agent"
+      },
+      "profiles": {
+        "{root}/agent": "token-only"
+      },
+      "expected": {
+        "routing": [
+          "toolchain.unpinned-version",
+          "apiconfig.profile-not-enumerated",
+          "apiconfig.api-host-missing"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [
+          "toolchain.unpinned-version",
+          "apiconfig.profile-not-enumerated"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 2
+      }
+    },
+    {
+      "id": "ac-example-unenumerated-routed",
+      "summary": "AC: gh 2.100.0 + an unenumerated but routed GH_CONFIG_DIR (2am severity: incomplete)",
+      "base": "example",
+      "gh": {
+        "version": "2.100.0"
+      },
+      "env": {
+        "GH_CONFIG_DIR": "{root}/agent"
+      },
+      "profiles": {
+        "{root}/agent": "routed"
+      },
+      "expected": {
+        "routing": [
+          "toolchain.unpinned-version",
+          "apiconfig.profile-not-enumerated"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 2
+      },
+      "upstream": {
+        "routing": [
+          "toolchain.unpinned-version",
+          "apiconfig.profile-not-enumerated"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 2
+      }
+    },
+    {
+      "id": "ac-example-git-unqualified",
+      "summary": "AC: gitOrigin.rollout=unqualified and no rewrite -- git exit 2, routing unaffected",
+      "base": "example",
+      "env": {},
+      "profiles": {
+        "{root}/home/.config/gh": "routed"
+      },
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-ghhost-logical",
+      "summary": "GH_HOST=github.com agrees",
+      "env": {
+        "GH_CONFIG_DIR": "{root}/cfg",
+        "GH_HOST": "github.com"
+      },
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-ghhost-unapproved",
+      "summary": "an unapproved enterprise GH_HOST",
+      "env": {
+        "GH_CONFIG_DIR": "{root}/cfg",
+        "GH_HOST": "ghe.example.com"
+      },
+      "expected": {
+        "routing": [
+          "ghhost.unapproved"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [
+          "ghhost.unapproved"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "u-ghrepo-conflict",
+      "summary": "a host-qualified GH_REPO naming a foreign host",
+      "env": {
+        "GH_CONFIG_DIR": "{root}/cfg",
+        "GH_REPO": "ghe.example.com/2AMLogic/2am"
+      },
+      "expected": {
+        "routing": [
+          "ghrepo.host-qualified-conflict"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [
+          "ghrepo.host-qualified-conflict"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "u-ghrepo-logical",
+      "summary": "GH_REPO qualified with the logical host",
+      "env": {
+        "GH_CONFIG_DIR": "{root}/cfg",
+        "GH_REPO": "github.com/2AMLogic/2am"
+      },
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-unpinned",
+      "summary": "above the floor but not the pin",
+      "gh": {
+        "version": "2.101.0"
+      },
+      "expected": {
+        "routing": [
+          "toolchain.unpinned-version"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 2
+      },
+      "upstream": {
+        "routing": [
+          "toolchain.unpinned-version"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 2
+      }
+    },
+    {
+      "id": "u-gh-unresolvable",
+      "summary": "no identifiable gh",
+      "gh": {
+        "version": null,
+        "path": null
+      },
+      "expected": {
+        "routing": [
+          "toolchain.gh-unresolvable"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 2
+      },
+      "upstream": {
+        "routing": [
+          "toolchain.gh-unresolvable"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 2
+      }
+    },
+    {
+      "id": "u-launcher-not-first",
+      "summary": "the effective gh is not the managed launcher",
+      "gh": {
+        "path": "/opt/unmanaged/bin/gh"
+      },
+      "expected": {
+        "routing": [
+          "toolchain.launcher-not-first"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [
+          "toolchain.launcher-not-first"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "u-launcher-not-provisioned",
+      "summary": "the managed launcher is not provisioned yet",
+      "gh": {
+        "path": "/opt/unmanaged/bin/gh",
+        "launcher_exists": false
+      },
+      "expected": {
+        "routing": [
+          "toolchain.launcher-not-first"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 2
+      },
+      "upstream": {
+        "routing": [
+          "toolchain.launcher-not-first"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 2
+      }
+    },
+    {
+      "id": "u-schema-version",
+      "summary": "an unknown schemaVersion is never aligned",
+      "policy_patch": {
+        "schemaVersion": 99
+      },
+      "expected": {
+        "routing": [
+          "policy.schema-version"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 2
+      },
+      "upstream": {
+        "routing": [
+          "policy.schema-version"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 2
+      }
+    },
+    {
+      "id": "u-schema-unexpected-property",
+      "summary": "an unexpected top-level property",
+      "policy_patch": {
+        "surprise": 1
+      },
+      "expected": {
+        "routing": [
+          "policy.schema"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [
+          "policy.schema"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "u-schema-bad-enum",
+      "summary": "enforcement.api outside the enum",
+      "policy_patch": {
+        "enforcement": {
+          "api": "optional"
+        }
+      },
+      "expected": {
+        "routing": [
+          "policy.schema"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [
+          "policy.schema"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "u-api-origin-port",
+      "summary": "a ported apiOrigin stock gh cannot reach",
+      "policy_patch": {
+        "github": {
+          "apiOrigin": "https://github-proxy.fixture.invalid:8443"
+        }
+      },
+      "expected": {
+        "routing": [
+          "policy.api-origin-port"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [
+          "policy.api-origin-port"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "u-origin-equals-logical",
+      "summary": "apiOrigin equal to the logical host",
+      "policy_patch": {
+        "github": {
+          "apiOrigin": "https://github.com"
+        }
+      },
+      "expected": {
+        "routing": [
+          "policy.origin-equals-logical-host"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [
+          "policy.origin-equals-logical-host"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      }
+    },
+    {
+      "id": "u-api-host-mismatch",
+      "summary": "the profile routes to a different origin",
+      "profiles": {
+        "{root}/cfg": "wrong-host",
+        "{root}/home/.config/gh": "routed"
+      },
+      "expected": {
+        "routing": [
+          "apiconfig.api-host-mismatch"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-loom-owned-unenumerated",
+      "summary": "a Loom-published profile not enumerated in policy",
+      "loom_owned": [
+        "{root}/ws/.loom/gh-config"
+      ],
+      "profiles": {
+        "{root}/cfg": "routed",
+        "{root}/home/.config/gh": "routed",
+        "{root}/ws/.loom/gh-config": "routed"
+      },
+      "loom_only_surface": "Loom-published profiles are a Loom observation; 2am checks the exported GH_CONFIG_DIR only",
+      "expected": {
+        "routing": [
+          "apiconfig.shadowed-profile"
+        ],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 1
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-git-premature-rewrite",
+      "summary": "a rewrite installed before qualification",
+      "git_rewrites": 1,
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.premature-rewrite",
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.premature-rewrite",
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-git-qualified",
+      "summary": "qualified rollout: rewrites optional",
+      "policy_patch": {
+        "github": {
+          "gitOrigin": {
+            "host": "git-proxy.fixture.invalid",
+            "rollout": "qualified"
+          }
+        }
+      },
+      "expected": {
+        "routing": [],
+        "git": [],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-git-enforced-missing",
+      "summary": "enforced rollout with no rewrite",
+      "policy_patch": {
+        "github": {
+          "gitOrigin": {
+            "host": "git-proxy.fixture.invalid",
+            "rollout": "enforced"
+          }
+        }
+      },
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.missing-rewrite"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.missing-rewrite"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-git-enforced-ok",
+      "summary": "enforced rollout with a rewrite",
+      "git_rewrites": 1,
+      "policy_patch": {
+        "github": {
+          "gitOrigin": {
+            "host": "git-proxy.fixture.invalid",
+            "rollout": "enforced"
+          }
+        }
+      },
+      "expected": {
+        "routing": [],
+        "git": [],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-git-enforced-no-host",
+      "summary": "enforced rollout naming no destination",
+      "policy_patch": {
+        "github": {
+          "gitOrigin": {
+            "host": "",
+            "rollout": "enforced"
+          }
+        }
+      },
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.enforced-without-host"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.enforced-without-host"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-runtime-verified-without-canary",
+      "summary": "claiming verified with no canary",
+      "policy_patch": {
+        "enforcement": {
+          "runtimeEgress": "verified"
+        }
+      },
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.verified-without-canary"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.verified-without-canary"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-runtime-canary-blocked",
+      "summary": "a canary whose direct request fails",
+      "canary": "blocked",
+      "policy_patch": {
+        "enforcement": {
+          "negativeCanary": "curl -sS --max-time 5 https://api.github.com/zen"
+        }
+      },
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-runtime-canary-open",
+      "summary": "a canary whose direct request succeeds",
+      "canary": "open",
+      "policy_patch": {
+        "enforcement": {
+          "negativeCanary": "curl -sS --max-time 5 https://api.github.com/zen"
+        }
+      },
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.bypass-open"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-telemetry-unset",
+      "summary": "no telemetry identity or endpoint",
+      "policy_patch": {
+        "telemetry": null
+      },
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [
+          "telemetry.no-identity",
+          "telemetry.no-endpoint"
+        ],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [
+          "telemetry.no-identity",
+          "telemetry.no-endpoint"
+        ],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-telemetry-loom-not-otlp",
+      "summary": "the policy names an OTel edge but Loom exports no otlp",
+      "loom_otlp": false,
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [
+          "telemetry.loom-exporter-not-otlp"
+        ],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    },
+    {
+      "id": "u-adapter-block-accepted",
+      "summary": "2am#1929 P2 added an optional `adapter` object to the v1 schema; it is accepted, not a policy.schema finding",
+      "policy_patch": {
+        "adapter": {
+          "outcomeLog": "/var/log/2am/github-egress/outcomes.jsonl",
+          "requestTimeoutSeconds": 60
+        }
+      },
+      "expected": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      },
+      "upstream": {
+        "routing": [],
+        "git": [
+          "git.unqualified"
+        ],
+        "runtime": [
+          "runtime.unverifiable"
+        ],
+        "telemetry": [],
+        "exit_code": 0
+      }
+    }
+  ]
+}

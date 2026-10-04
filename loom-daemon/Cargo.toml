@@ -16,7 +16,10 @@ uuid = { version = "1.23", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "7.0"
 base64 = "0.23"
-rusqlite = { version = "0.40", features = ["bundled"] }
+# `functions` enables `create_scalar_function`, which the landed-size
+# execution test (`tests/landed_size_sqlite.rs`) uses to provide the `ln`/`exp`
+# math functions D1 ships and the bundled build does not (#9934).
+rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 regex = "1.12"
 clap = { version = "4.6", features = ["derive", "env"] }
 sha2 = "0.11.0"

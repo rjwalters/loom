@@ -103,8 +103,10 @@
 
 pub mod availability;
 pub mod ceiling;
+pub mod codex_guard;
 pub mod handoff;
 pub mod resolve;
+pub mod sandbox_hold;
 
 pub use availability::{availability, Availability, CredentialSource};
 pub use ceiling::{BackstopCeiling, ComplexityTier, Intent, Reservation};
@@ -816,6 +818,9 @@ pub fn resolve_runtime_contained(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod containment_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod sandbox_hold_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;

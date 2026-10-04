@@ -1,0 +1,32 @@
+# Shrink-only allowlist of raw `gh` spawn sites (#9985).
+#
+# Enforced by loom-daemon/tests/gh_spawn_choke_point.rs: the tree's raw sites
+# (`Command::new("gh")`, `Command::new(gh…)`, `fn gh_bin…` outside
+# src/gh_invocation/) must match this list EXACTLY, as a multiset. Format:
+# `<path relative to loom-daemon/> | <trimmed source line>`, byte-sorted.
+#
+# - Never add an entry: build the new site through
+#   `crate::gh_invocation::GhInvocation` instead.
+# - When you migrate a site, delete its line — a stale entry fails the test.
+#
+# Empty list == migration complete.
+
+src/ci_telemetry/api.rs | let mut cmd = Command::new(&self.gh_bin);
+src/ci_telemetry/api.rs | let output = Command::new(&self.gh_bin)
+src/cli/lease_co_occupancy.rs | let mut cmd = Command::new(gh_bin);
+src/cli/merge_pr_consolidate.rs | let mut cmd = std::process::Command::new(gh);
+src/cmd_out.rs | let mut cmd = Command::new(gh);
+src/fleet_store/gh.rs | let mut cmd = Command::new(&self.gh_bin);
+src/fleet_store/gh.rs | let mut cmd = Command::new(&self.gh_bin);
+src/forge_cmd.rs | pub(crate) fn gh_bin() -> String {
+src/forge_comment.rs | let mut child = std::process::Command::new(gh_bin)
+src/forge_comment.rs | let mut cmd = Command::new(gh_bin.as_ref());
+src/forge_etag_store.rs | let mut cmd = Command::new(gh_bin);
+src/pipeline_snapshot.rs | match Command::new(gh_bin).arg("--version").output() {
+src/safehouse.rs | let mut cmd = tokio::process::Command::new(&gh_bin);
+src/safehouse.rs | let mut cmd = tokio::process::Command::new(&gh_bin);
+src/safehouse.rs | let mut cmd = tokio::process::Command::new(gh_bin);
+src/safehouse.rs | let mut cmd = tokio::process::Command::new(gh_bin);
+src/tokens_pool/private_workspace/repository.rs | let mut helper = Command::new("gh").args(["auth", "git-credential", "get"])
+src/worktree_ops/gh.rs | let mut cmd = Command::new(gh_bin());
+src/write_scope/probe.rs | let mut cmd = Command::new(&self.gh);

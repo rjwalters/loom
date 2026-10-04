@@ -2,7 +2,7 @@
 -- The canonical question set IE1..IE5 (Issue #9444).
 --
 -- TARGET: the fleet telemetry **D1** store (`loom-fleet-telemetry`), i.e. the
--- `records` table from `dashboard/migrations/0001_init.sql` — one row per
+-- `records` table from `loom-ui:migrations/0001_init.sql` — one row per
 -- accepted telemetry record, with the record itself in `payload` as JSON.
 -- SQLite dialect, `json_extract` / `json_each`. This is deliberately NOT the
 -- ClickHouse `loom_analytics.*` rollup the CT queries read, and deliberately
@@ -31,7 +31,7 @@
 -- These statements are EXECUTED in CI, not merely text-checked:
 -- `loom-daemon/tests/issue_effort_sqlite.rs` runs this file verbatim on the
 -- bundled SQLite, against the `records` DDL lifted out of
--- `dashboard/migrations/0001_init.sql`, and asserts IE1's split plus the
+-- `loom-ui:migrations/0001_init.sql`, and asserts IE1's split plus the
 -- partition property (clean + substantive + environmental + unattributed ==
 -- the summed attempt durations). Edit a query here and that test is what tells
 -- you whether it still answers.
@@ -44,7 +44,7 @@
 --     -cmd ".param set :top_n 20" \
 --     ".read issue-effort-queries.sql"
 --
---   the D1 HTTP API's `params` array (see dashboard/docs/query-api.md),
+--   the D1 HTTP API's `params` array (see loom-ui:docs/query-api.md),
 --   one statement per request, with :since/:until/:top_n supplied as binds.
 --
 -- Both details in that first recipe are load-bearing, and both were wrong in

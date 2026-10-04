@@ -93,6 +93,44 @@ pub fn parse_dependency_refs(body: &str, default_repo: &str) -> Vec<String> {
     out.into_iter().collect()
 }
 
+/// Every blocker `body` **names**, normalised to `owner/repo#N`, sorted and
+/// deduplicated: the phrase-gated refs of [`parse_dependency_refs`] plus every
+/// **unchecked** item of the body's `## Dependencies` checklist (#10024).
+///
+/// # One definition of "named blocker"
+///
+/// The Curator's dependency re-check (`dep-recheck-fingerprint.sh
+/// named-dependency`, i.e. [`crate::dep_recheck::named`]) treats an unchecked
+/// `- [ ] #N …` / `- [ ] owner/repo#N …` bullet under `## Dependencies` as a
+/// blocker, and Curators write that section by convention. Star-liveness used
+/// to read only the phrase form, so a starred `loom:blocked` issue whose
+/// blocker sat only in the checklist drew a false "name the blocker" ask
+/// (2AMLogic/loom-ui#1016). The checklist half here is that module's own
+/// [`crate::dep_recheck::named::parse_entries`] — reused, not re-spelled — so
+/// the two sides cannot drift apart again. A checked item (`- [x]`) is never a
+/// blocker.
+///
+/// # Why this is not [`parse_dependency_refs`]
+///
+/// That function is also the cycle detector's and the defer classifier's
+/// parser, and its tests pin byte parity with `detect-dependency-cycle.sh`.
+/// Widening it in place would silently change both; this is a separate entry
+/// point used only by star-liveness.
+#[must_use]
+pub fn parse_named_blocker_refs(body: &str, default_repo: &str) -> Vec<String> {
+    let mut out: BTreeSet<String> = parse_dependency_refs(body, default_repo)
+        .into_iter()
+        .collect();
+    for dep in crate::dep_recheck::named::parse_entries(body) {
+        if dep.checked {
+            continue;
+        }
+        let repo = dep.repo.as_deref().unwrap_or(default_repo);
+        out.insert(format!("{repo}#{}", dep.number));
+    }
+    out.into_iter().collect()
+}
+
 /// Every reference in `text`, normalised, sorted and deduplicated — the Rust
 /// port of `classify-dependency-block.sh`'s `_extract_refs`.
 ///

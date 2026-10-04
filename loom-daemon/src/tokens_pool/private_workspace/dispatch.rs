@@ -90,7 +90,7 @@ impl Selection {
             return Ok(None);
         }
         use super::super::account_registry::{
-            account_inventory, select_account, AccountBinding, AccountProvider,
+            account_inventory, select_codex_account_where, AccountBinding, AccountProvider,
         };
         let inventory = account_inventory(root, AccountProvider::Codex)?;
         let explicit = std::env::var("LOOM_CODEX_PROFILE")
@@ -121,7 +121,18 @@ impl Selection {
                 export::check_failover(root, issue, "other-provider")?;
                 return Ok(None);
             }
-            let account = select_account(root, AccountProvider::Codex, model)?;
+            // Only accounts that can serve THIS repository: a shared
+            // (host-mounted) account, or a private-clone account whose clone
+            // is of this repository. A private account bound to another
+            // repository would otherwise be picked at random and the launch
+            // refused below by `verify_repository` — on robb-studio after
+            // agent-1/2 moved to a gf180-parasynth canary (2026-10-02), every
+            // Codex role tick in every other workspace that drew one of them
+            // failed with "private workspace repository differs".
+            let logical = logical_repository(root);
+            let account = select_codex_account_where(root, model, |account| {
+                serves_repository(&account.credential_reference, logical.as_deref())
+            })?;
             let AccountBinding::CodexHome { directory } = account.binding else {
                 unreachable!()
             };
@@ -304,24 +315,51 @@ pub(super) fn inherited_lease(dir: &Path) -> Result<Option<lease::Lease>> {
     Ok(Some(lease::Lease::from_file(file, dir.to_owned())))
 }
 
-fn verify_repository(root: &Path, expected: &str) -> Result<()> {
+/// The workspace's logical repository: its `origin` URL, with an SSH
+/// `git@host:path` remote written as `https://host/path` and any `.git`
+/// suffix dropped. `None` when it cannot be read.
+fn logical_repository(root: &Path) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["remote", "get-url", "origin"])
-        .output()?;
-    let remote = String::from_utf8(output.stdout)?;
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let remote = String::from_utf8(output.stdout).ok()?;
     let remote = remote.trim();
     let normalized = if let Some(ssh) = remote.strip_prefix("git@") {
-        ssh.split_once(':')
-            .map(|(host, path)| format!("https://{host}/{path}"))
+        let (host, path) = ssh.split_once(':')?;
+        format!("https://{host}/{path}")
     } else {
-        Some(remote.to_owned())
+        remote.to_owned()
     };
-    if !output.status.success()
-        || normalized.as_deref().map(|s| s.trim_end_matches(".git"))
-            != Some(expected.trim_end_matches(".git"))
-    {
+    Some(normalized.trim_end_matches(".git").to_owned())
+}
+
+/// Whether the account whose profile is `profile` can serve a launch for the
+/// `logical` repository: any account without private-clone state can (it is a
+/// shared, host-mounted account), and a private-clone account can only when
+/// its clone is of that repository. Unreadable private state, or an
+/// unresolvable workspace repository, never matches a private account: it is
+/// left out of the draw rather than picked and refused.
+fn serves_repository(profile: &Path, logical: Option<&str>) -> bool {
+    let Ok(dir) = state_dir(profile) else {
+        return true;
+    };
+    if !dir.join("workspace.json").exists() {
+        return true;
+    }
+    match (load(&dir), logical) {
+        (Ok(config), Some(logical)) => config.repository.trim_end_matches(".git") == logical,
+        _ => false,
+    }
+}
+
+fn verify_repository(root: &Path, expected: &str) -> Result<()> {
+    if logical_repository(root).as_deref() != Some(expected.trim_end_matches(".git")) {
         bail!("private workspace repository differs from the logical host repository");
     }
     Ok(())
@@ -330,6 +368,147 @@ fn verify_repository(root: &Path, expected: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// A workspace whose `origin` is `remote`.
+    fn workspace_with_origin(remote: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(dir.path(), &["remote", "add", "origin", remote]);
+        dir
+    }
+
+    /// Make `<root>/<name>` a private-clone account profile whose clone is of
+    /// `repository` (the state `lifecycle::start` writes).
+    fn private_profile(root: &Path, name: &str, repository: &str) -> PathBuf {
+        let profile = root.join(name);
+        std::fs::create_dir_all(&profile).unwrap();
+        let dir = state_dir(&profile).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            schema_version: 1,
+            account: name.into(),
+            container: format!("loom-codex-session-{name}"),
+            engine: "engine".into(),
+            docker_desktop: false,
+            repository: repository.into(),
+            base: "main".into(),
+            volume: format!("loom-codex-workspace-{name}"),
+            profile: profile.canonicalize().unwrap(),
+            gh_config: None,
+        };
+        save(&dir.join("workspace.json"), &config).unwrap();
+        profile
+    }
+
+    #[test]
+    fn logical_repository_normalizes_ssh_https_and_dot_git() {
+        for remote in [
+            "git@github.com:2AMLogic/gf180-parasynth.git",
+            "https://github.com/2AMLogic/gf180-parasynth.git",
+            "https://github.com/2AMLogic/gf180-parasynth",
+        ] {
+            let ws = workspace_with_origin(remote);
+            assert_eq!(
+                logical_repository(ws.path()).as_deref(),
+                Some("https://github.com/2AMLogic/gf180-parasynth"),
+                "{remote}"
+            );
+        }
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(logical_repository(bare.path()), None);
+    }
+
+    #[test]
+    fn only_shared_accounts_and_private_clones_of_this_repository_serve_it() {
+        let root = tempfile::tempdir().unwrap();
+        let here = "https://github.com/2AMLogic/gf180-parasynth";
+        let shared = root.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let same = private_profile(root.path(), "same", &format!("{here}.git"));
+        let other = private_profile(root.path(), "other", "https://github.com/2AMLogic/vibesql");
+        assert!(serves_repository(&shared, Some(here)));
+        assert!(serves_repository(&same, Some(here)), ".git suffix is not identity");
+        assert!(!serves_repository(&other, Some(here)));
+        // An unresolvable workspace repository matches no private clone, but
+        // shared accounts still serve it.
+        assert!(serves_repository(&shared, None));
+        assert!(!serves_repository(&same, None));
+        // Unreadable private state is left out, never guessed.
+        let corrupt = private_profile(root.path(), "corrupt", here);
+        std::fs::write(state_dir(&corrupt).unwrap().join("workspace.json"), "{not json").unwrap();
+        assert!(!serves_repository(&corrupt, Some(here)));
+    }
+
+    /// The robb-studio failure (2026-10-02): with one account moved to a
+    /// private clone of another repository, pool selection for this workspace
+    /// drew it at random and the launch died on `verify_repository`. Selection
+    /// now never offers it, and a pool with nothing that serves this
+    /// repository fails as an empty pool rather than widening.
+    #[test]
+    #[serial_test::serial]
+    fn pool_selection_never_draws_a_private_clone_of_another_repository() {
+        use super::super::super::account_registry::select_codex_account_where;
+        use super::super::super::paths::SHARED_ACCOUNTS_ROOT_ENV;
+        let here = "https://github.com/2AMLogic/gf180-parasynth";
+        let ws = workspace_with_origin(&format!("{here}.git"));
+        let shared_root = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        for name in ["agent-3", "agent-4"] {
+            std::fs::create_dir_all(profiles.path().join(name)).unwrap();
+        }
+        private_profile(profiles.path(), "agent-1", "https://github.com/2AMLogic/vibesql");
+        private_profile(profiles.path(), "agent-2", "https://github.com/2AMLogic/vibesql");
+        let accounts = ["agent-1", "agent-2", "agent-3", "agent-4"]
+            .iter()
+            .map(|name| {
+                format!(
+                    r#"{{"provider":"codex","name":"{name}","credential_kind":"codex_home","credential_reference":"{name}","enabled":true}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::create_dir_all(ws.path().join(".loom")).unwrap();
+        std::fs::write(
+            ws.path().join(".loom/accounts.json"),
+            format!(r#"{{"version":1,"accounts":[{accounts}]}}"#),
+        )
+        .unwrap();
+        std::env::set_var(SHARED_ACCOUNTS_ROOT_ENV, shared_root.path());
+        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+        let logical = logical_repository(ws.path());
+        let mut drawn = std::collections::BTreeSet::new();
+        for _ in 0..40 {
+            let account = select_codex_account_where(ws.path(), None, |account| {
+                serves_repository(&account.credential_reference, logical.as_deref())
+            })
+            .unwrap();
+            drawn.insert(account.id.name);
+        }
+        // Nothing but the private clones of another repository: empty pool.
+        let none = select_codex_account_where(ws.path(), None, |account| {
+            serves_repository(&account.credential_reference, logical.as_deref())
+                && account.id.name.starts_with("agent-1")
+        });
+        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
+        std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
+        assert!(
+            drawn
+                .iter()
+                .all(|name| name == "agent-3" || name == "agent-4"),
+            "{drawn:?}"
+        );
+        assert!(none.is_err());
+    }
     fn reservation(dir: &Path) -> Selection {
         let lease = lease::Lease::acquire(dir).unwrap();
         lease

@@ -204,6 +204,13 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // Writes the marker; scans only already-filtered bodies.
         ("claim_reconciliation/verdict_stale_comment.rs", "writer + filtered bodies"),
         ("claim_reconciliation/verdict_invalidation.rs", "writer"),
+        // #9416: owns the re-anchor comment BODY (so it names the marker) and
+        // decides equivalence. It reads no comment at all — every answer comes
+        // from git objects or the forge's own compare endpoint, and its module
+        // doc states outright that a marker is never evidence (#9548). So there
+        // is no unfiltered read here either.
+        ("verdict_equivalence/mod.rs", "writer of the marker body; never reads a comment"),
+        ("verdict_equivalence/tests.rs", "test"),
         // #9772: mentions the marker in its module doc only — forge_comment
         // WRITES comments (and appends the dashboard footer); it never reads
         // comment bodies at all, so there is no unfiltered read to guard.
@@ -216,6 +223,13 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         ("claim_reconciliation/verdict_dedup_tests.rs", "test"),
         ("claim_reconciliation/auto_merge_disarm.rs", "test fixture"),
         ("claim_reconciliation/trusted_comments_tests.rs", "test"),
+        ("claim_reconciliation/read_cache_tests.rs", "test"),
+        // #9709: reads the RAW listing deliberately, but only to NAME the
+        // author of a marker the policy dropped, in the stale-clear notice.
+        // The decision is made upstream from trusted markers only and nothing
+        // here feeds it — attribution, never evidence.
+        ("verdict_stale_notice.rs", "attribution of dropped markers; never control"),
+        ("verdict_stale_notice/tests.rs", "test"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),
     ];

@@ -340,8 +340,10 @@ pub fn classify(f: &StarFacts) -> Landing {
             "",
             format!(
                 "{}#{n} is starred but `loom:blocked` with no open blocking issue named: \
-                 resolve what blocks it and remove `loom:blocked`, or name the blocker \
-                 (`Blocked by #N`) so it inherits the star.",
+                 resolve what blocks it and remove `loom:blocked`, or name the blocker so \
+                 it inherits the star — a `Blocked by #N` / `Depends on owner/repo#N` / \
+                 `Requires #N` line anywhere in the body, or an unchecked `- [ ] #N` / \
+                 `- [ ] owner/repo#N` item under `## Dependencies`.",
                 f.repo
             ),
             pr_num,

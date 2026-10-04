@@ -779,6 +779,72 @@ fn adopt_legacy_queue_file(workspace_root: &Path, per_name: &Path) {
     }
 }
 
+/// The per-exporter policy pass [`spawn_task`] runs before the ingest key is
+/// read (Issue #7815): the endpoint `entry` exports to, or the
+/// `(endpoint, detail)` its `Misconfigured` status reports. Shared with the
+/// attended live-output tailer (#10116) through [`planned_otlp_endpoints`], so
+/// the two cannot disagree about which destination is acceptable.
+fn entry_endpoint(
+    entry: &ExporterEntry,
+    shared_endpoint: Option<&String>,
+) -> Result<String, (Option<String>, String)> {
+    let Some(endpoint) = entry.endpoint.clone().or_else(|| shared_endpoint.cloned()) else {
+        return Err((
+            None,
+            "observability.endpoint not configured \
+             (set observability.endpoint or $LOOM_OBSERVABILITY_ENDPOINT)"
+                .to_string(),
+        ));
+    };
+    if entry.kind == ExporterKind::Otlp && !endpoint_policy::valid_otlp_endpoint(&endpoint) {
+        return Err((
+            Some(endpoint),
+            "invalid OTLP base URL: use HTTP(S) without credentials, query or fragment".into(),
+        ));
+    }
+    // Refuse reserved placeholder domains BEFORE the ingest key is read
+    // (Issue #7815) — a placeholder is "not configured", not a
+    // destination, and the key must never be loaded for one, let alone
+    // sent to it.
+    if let Some(host) = reserved_placeholder_host(&endpoint) {
+        let detail = format!(
+            "observability.endpoint {endpoint} points at the reserved placeholder \
+             domain {host} (RFC 2606/6761) — refusing to export so the ingest key \
+             is never sent there; set a real endpoint via \
+             $LOOM_OBSERVABILITY_ENDPOINT or .loom-local/local.json, or leave \
+             observability.enabled=false"
+        );
+        return Err((Some(endpoint), detail));
+    }
+    #[cfg(not(feature = "otlp"))]
+    if entry.kind == ExporterKind::Otlp {
+        return Err((
+            Some(endpoint),
+            "exporter=otlp requested but this daemon build was not compiled \
+                 with the `otlp` Cargo feature"
+                .to_string(),
+        ));
+    }
+    Ok(endpoint)
+}
+
+/// The OTLP endpoints [`spawn_task`] would start a sender for under `config`,
+/// after the same policy pass, in config order. Empty when observability is
+/// off or no OTLP exporter survives the pass. Reads no ingest key and starts
+/// nothing (#10116: the attended live-output tailer's gate).
+#[must_use]
+pub fn planned_otlp_endpoints(config: &ObservabilityConfig) -> Vec<String> {
+    if !resolve_enabled(config) {
+        return Vec::new();
+    }
+    let shared_endpoint = resolve_endpoint(config);
+    resolve_exporters(config)
+        .iter()
+        .filter(|entry| entry.kind == ExporterKind::Otlp)
+        .filter_map(|entry| entry_endpoint(entry, shared_endpoint.as_ref()).ok())
+        .collect()
+}
+
 /// Spawn the observability subsystem's background tasks (the collector and
 /// the sender — see the module docs) on the shared daemon runtime, or return
 /// `None` when disabled or under-configured. `enabled: false` (or no block)
@@ -835,11 +901,6 @@ pub fn spawn_task(
     // rule — the key must never be loaded for an endpoint export will refuse,
     // and that reasoning now applies per-sink). Entries that fail a check
     // degrade to their own `Misconfigured` status; the rest are planned.
-    let missing_endpoint_detail = || {
-        "observability.endpoint not configured \
-             (set observability.endpoint or $LOOM_OBSERVABILITY_ENDPOINT)"
-            .to_string()
-    };
     let mut planned: Vec<(&ExporterEntry, String)> = Vec::new();
     let mut statuses: std::collections::BTreeMap<String, Arc<ExportStatus>> =
         std::collections::BTreeMap::new();
@@ -853,48 +914,10 @@ pub fn spawn_task(
         statuses.insert(name.to_string(), Arc::new(ExportStatus::misconfigured(endpoint, detail)));
     };
     for entry in &entries {
-        let name = entry.kind.name();
-        let Some(endpoint) = entry.endpoint.clone().or_else(|| shared_endpoint.clone()) else {
-            reject(&mut statuses, name, None, missing_endpoint_detail());
-            continue;
-        };
-        if entry.kind == ExporterKind::Otlp && !endpoint_policy::valid_otlp_endpoint(&endpoint) {
-            reject(
-                &mut statuses,
-                name,
-                Some(endpoint),
-                "invalid OTLP base URL: use HTTP(S) without credentials, query or fragment".into(),
-            );
-            continue;
+        match entry_endpoint(entry, shared_endpoint.as_ref()) {
+            Ok(endpoint) => planned.push((entry, endpoint)),
+            Err((endpoint, detail)) => reject(&mut statuses, entry.kind.name(), endpoint, detail),
         }
-        // Refuse reserved placeholder domains BEFORE the ingest key is read
-        // (Issue #7815) — a placeholder is "not configured", not a
-        // destination, and the key must never be loaded for one, let alone
-        // sent to it.
-        if let Some(host) = reserved_placeholder_host(&endpoint) {
-            let detail = format!(
-                "observability.endpoint {endpoint} points at the reserved placeholder \
-                 domain {host} (RFC 2606/6761) — refusing to export so the ingest key \
-                 is never sent there; set a real endpoint via \
-                 $LOOM_OBSERVABILITY_ENDPOINT or .loom-local/local.json, or leave \
-                 observability.enabled=false"
-            );
-            reject(&mut statuses, name, Some(endpoint), detail);
-            continue;
-        }
-        #[cfg(not(feature = "otlp"))]
-        if entry.kind == ExporterKind::Otlp {
-            reject(
-                &mut statuses,
-                name,
-                Some(endpoint),
-                "exporter=otlp requested but this daemon build was not compiled \
-                     with the `otlp` Cargo feature"
-                    .to_string(),
-            );
-            continue;
-        }
-        planned.push((entry, endpoint));
     }
     if planned.is_empty() {
         register_global_export_statuses(statuses.clone());

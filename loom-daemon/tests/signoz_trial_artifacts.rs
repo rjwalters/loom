@@ -580,9 +580,10 @@ fn ci_queries_read_log_attributes_the_gateway_forwards_from_the_column_the_daemo
     }
 }
 
-/// The trace-reading counterpart (#9089). Step and suite timings live only on
-/// `loom.ci.step` / `loom.ci.suite` spans (there is no log record and no metric
-/// series for either), so sections 11–13 read
+/// The trace-reading counterpart (#9089, extended by #9456). Step, suite and
+/// per-test timings live only on `loom.ci.step` / `loom.ci.suite` /
+/// `loom.ci.test` spans (there is no log record and no metric series for any of
+/// the three), so sections 11–13 and 16–17 read
 /// `signoz_traces.signoz_index_v3`
 /// — a different gateway allowlist (span `keep_keys`) and a different type
 /// rule: every span attribute is exported as an OTLP string, so SigNoz files
@@ -597,8 +598,8 @@ fn ci_queries_read_span_attributes_the_gateway_forwards_from_the_string_column()
     assert!(
         !trace_sql.is_empty(),
         "ci-queries.sql no longer reads signoz_traces.signoz_index_v3; if the step-span and \
-         suite-span sections (#9089) were deliberately removed, remove this guard with them \
-         rather than letting it go vacuous"
+         suite-span sections (#9089) and the test-span sections (#9456) were deliberately \
+         removed, remove this guard with them rather than letting it go vacuous"
     );
     let ci_span_vocabulary: BTreeSet<&str> = CI_SPAN_ATTRIBUTE_KEYS
         .iter()
@@ -635,6 +636,7 @@ fn ci_queries_read_span_attributes_the_gateway_forwards_from_the_string_column()
         SpanName::CiJob,
         SpanName::CiStep,
         SpanName::CiSuite,
+        SpanName::CiTest,
     ]
     .iter()
     .map(|name| name.as_str())

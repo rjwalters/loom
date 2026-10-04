@@ -60,7 +60,7 @@
 //! pass. True idempotency (never double-counted in the backend) is the
 //! backend's job — the `records` table's partial unique index on
 //! `(kind, sweep_id)` for `sweep.completed`/`sweep.outcome` plus
-//! `INSERT OR IGNORE` (see `dashboard/migrations`) — so a re-sent record is
+//! `INSERT OR IGNORE` (see `2AMLogic/loom-ui` `migrations/`) — so a re-sent record is
 //! silently absorbed rather than duplicated, however many times a backfill
 //! pass re-offers it.
 //!

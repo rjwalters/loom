@@ -34,6 +34,11 @@ pub fn capture<T>(f: impl FnOnce() -> T) -> (T, Captured) {
     (value, captured)
 }
 
+/// Whether a [`capture`] is active on this thread.
+pub(super) fn active() -> bool {
+    CAPTURE.with(|slot| slot.borrow().is_some())
+}
+
 /// Record `points` when capturing (returning `None`), else hand them back.
 pub(super) fn metrics(points: Vec<MetricPoint>) -> Option<Vec<MetricPoint>> {
     CAPTURE.with(|slot| match slot.borrow_mut().as_mut() {

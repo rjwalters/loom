@@ -1019,11 +1019,10 @@ gh issue edit <number> --remove-label "loom:building"
 
 #### Applying `loom:operator-only`: a sub-kind label is REQUIRED (#5819)
 
-**Never apply `loom:operator-only` on its own.** Choose exactly one sub-kind and
-apply both labels in the **same** command. This is purely additive — the base
-label is never removed or replaced, so every filter/skip keyed on it (sweep
-pre-flight, `warn-operator-gated.sh`, Champion's promotion-queue exclusions,
-Curator's and Doctor's queue exclusions) behaves exactly as before:
+**Park only for a PO-level decision or a human-hands step (#10001)** — a
+failed attempt or a hard bug is not one; full rule: `curator.md` → "Applying
+`loom:operator-only`". **Never apply `loom:operator-only` on its own**: apply
+exactly one sub-kind in the **same** command (additive; filters unchanged):
 
 | Sub-kind | Apply when |
 |---|---|
@@ -1033,9 +1032,10 @@ Curator's and Doctor's queue exclusions) behaves exactly as before:
 | `loom:operator-objective` | The work is determined once the operator states an objective — name the candidate objectives and the answer under each (#5826) |
 
 ```bash
-# Builder parking a claimed issue that turns out to need a human:
-./.loom/scripts/post-comment.sh <number> --body "Routing to the operator: <why a human must act>."
-gh issue edit <number> --remove-label "loom:building" --add-label "loom:operator-only,loom:operator-decision"
+# Builder parking a claimed issue on a decision: 2-4 ranked options, each with
+# a why (.loom/docs/operator-decision.md); a one-option ask is refused:
+loom-daemon operator-decision apply <number> --input d.json \
+  --also-label loom:operator-only --remove-label loom:building
 ```
 
 **Being unsure which sub-kind applies is a sign the analysis is incomplete,
@@ -1055,9 +1055,8 @@ in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
 does not satisfy this — the phrase itself must be present so a later automated
 pass can tell when the blocker clears.
 
-**If you chose `loom:operator-decision`**, the same comment MUST name the
-disagreement axis and state why it is a preference rather than a fact — a bare
-"requires judgement" does not satisfy this.
+**If you chose `loom:operator-decision`**, the options' whys MUST name the
+disagreement axis and why it is a preference, not a fact.
 
 **If you chose `loom:operator-objective`**, the same comment MUST list the
 candidate objectives and the answer under each — not just "needs an

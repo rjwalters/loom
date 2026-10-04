@@ -291,3 +291,353 @@ fn host_and_admission_attributes_survive_the_span_allowlist() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #9420: loom.attempt.worked — the dwell-conditioning flag
+// ---------------------------------------------------------------------------
+
+/// Every `RoleTickOutcome` shape, and whether its attempt's interval measures
+/// the stage's work. The `false` rows are the population that drags the
+/// unconditioned `loom.role_attempt` median to milliseconds: 80.4% of this
+/// host's 130,657 ticks over the 2026-09-18…10-02 `role_tick.outcome`
+/// journals, 92,869 of them `PoolExhausted`.
+#[test]
+fn an_attempt_that_never_spawned_a_session_closes_as_not_worked() {
+    use crate::role_runner::{CredentialPool, PoolHold, RoleTickOutcome};
+    let exhausted = RoleTickOutcome::PoolExhausted {
+        total: 20,
+        next_clear_at: Utc::now() + chrono::Duration::minutes(15),
+        pool: CredentialPool::ClaudeTokens,
+        hold: PoolHold::SelfHealing,
+    };
+    let cases: Vec<(RoleTickOutcome, &str)> = vec![
+        (RoleTickOutcome::Success, "true"),
+        (RoleTickOutcome::Failure("boom".into()), "true"),
+        (
+            RoleTickOutcome::LoadSkipped {
+                load_per_core: 4.2,
+                detail: "deferred".into(),
+            },
+            "true",
+        ),
+        (exhausted, "false"),
+        (RoleTickOutcome::NoTokenPool, "false"),
+        (RoleTickOutcome::QueueEmpty, "false"),
+    ];
+    for (outcome, expected) in cases {
+        let attrs = admission_attributes(&outcome);
+        assert_eq!(
+            attrs.get(ATTEMPT_WORKED),
+            Some(&expected.to_string()),
+            "{outcome:?} must close with {ATTEMPT_WORKED}={expected}"
+        );
+    }
+}
+
+/// A synthetic completion span is emitted with `started_at == ended_at`, so
+/// its duration measures nothing at all — the shape behind the 0 ms builder
+/// row. It must close `worked=false`; an attempt whose begin Loom itself
+/// recorded closes `worked=true` on the very same code path.
+#[test]
+fn only_an_observed_start_makes_a_checkpoint_completion_count_as_worked() {
+    let dir = tempfile::tempdir().unwrap();
+    for source in SYNTHETIC_TIMING_SOURCES {
+        let journal = Journal::for_context(&dir.path().join(format!("{source}.json")));
+        let root = TraceContext::root(true);
+        checkpoint_observation(
+            &journal,
+            &root,
+            None,
+            9420,
+            "builder-done",
+            Some(1),
+            None,
+            None,
+            source,
+        );
+        let mut spans = Vec::new();
+        journal
+            .drain(|s| {
+                spans.push(s);
+                Ok(())
+            })
+            .unwrap();
+        let attempt = spans
+            .iter()
+            .find(|s| s.name == SpanName::RoleAttempt)
+            .unwrap();
+        assert_eq!(attempt.started_at, attempt.ended_at, "synthetic spans carry no duration");
+        assert_eq!(attempt.attributes[ATTEMPT_WORKED], "false", "{source}");
+        // The parent phase span carries the same verdict, so a phase-level
+        // dwell query conditions identically.
+        let phase = spans.iter().find(|s| s.name == SpanName::Phase).unwrap();
+        assert_eq!(phase.attributes[ATTEMPT_WORKED], "false", "{source}");
+    }
+
+    let journal = Journal::for_context(&dir.path().join("owned.json"));
+    let root = TraceContext::root(true);
+    let attrs = attributes(&[("loom.role", "builder")]);
+    let start = Utc::now() - chrono::Duration::seconds(1450);
+    let phase = journal
+        .start(root.child(), Some(&root), SpanName::Phase, start, attrs.clone())
+        .unwrap();
+    journal
+        .start(
+            phase.record.context.child(),
+            Some(&phase.record.context),
+            SpanName::RoleAttempt,
+            start,
+            attrs,
+        )
+        .unwrap();
+    checkpoint_observation(
+        &journal,
+        &root,
+        None,
+        9420,
+        "builder-done",
+        Some(1),
+        None,
+        None,
+        "checkpoint_write_observed",
+    );
+    let mut spans = Vec::new();
+    journal
+        .drain(|s| {
+            spans.push(s);
+            Ok(())
+        })
+        .unwrap();
+    let attempt = spans
+        .iter()
+        .find(|s| s.name == SpanName::RoleAttempt)
+        .unwrap();
+    assert_eq!(attempt.attributes["loom.timing_source"], "owned_start_checkpoint_completion");
+    assert_eq!(attempt.attributes[ATTEMPT_WORKED], "true");
+    assert!(attempt.ended_at - attempt.started_at >= chrono::Duration::seconds(1450));
+}
+
+/// `finish_attempt` writes the flag onto both the attempt and its phase, and
+/// `None` leaves the key **absent** — the "unknown != zero" half of the
+/// contract. A caller that cannot tell must not publish a guess.
+#[test]
+fn an_undetermined_attempt_leaves_the_worked_key_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    for (worked, expected) in [
+        (None, None),
+        (Some(false), Some("false")),
+        (Some(true), Some("true")),
+    ] {
+        let journal = Journal::for_context(&dir.path().join(format!("{worked:?}.json")));
+        let root = TraceContext::root(true);
+        let attrs = attributes(&[("loom.role", "judge")]);
+        let phase = journal
+            .start(root.child(), Some(&root), SpanName::Phase, Utc::now(), attrs.clone())
+            .unwrap();
+        let attempt = journal
+            .start(
+                phase.record.context.child(),
+                Some(&phase.record.context),
+                SpanName::RoleAttempt,
+                Utc::now(),
+                attrs,
+            )
+            .unwrap();
+        Span {
+            journal: journal.clone(),
+            active: attempt,
+        }
+        .finish_attempt("rejected", SpanStatus::Error, worked);
+        let mut spans = Vec::new();
+        journal
+            .drain(|s| {
+                spans.push(s);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(spans.len(), 2, "attempt and phase both close");
+        for span in &spans {
+            assert_eq!(
+                span.attributes.get(ATTEMPT_WORKED).map(String::as_str),
+                expected,
+                "{:?} on {:?}",
+                worked,
+                span.name
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #9438: a role tick that never launches emits no `loom.role_attempt` span
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "otlp")]
+mod role_tick_spans {
+    use super::*;
+    use crate::role_runner::{CredentialPool, PoolHold, RoleTickOutcome};
+
+    fn traced_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/config.json"),
+            r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    /// Every file under a workspace-relative directory, so "nothing was
+    /// journalled" is asserted against the disk, not just the return value.
+    fn files_under(root: &Path, relative: &str) -> Vec<PathBuf> {
+        std::fs::read_dir(root.join(relative))
+            .map(|dir| {
+                dir.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| !p.file_name().is_some_and(|n| n == ".lock"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn drained(root: &Path, trace: &RoleTrace) -> Vec<crate::telemetry::trace::SpanRecord> {
+        let store = TraceStore::new(root);
+        let journal = Journal::for_context(&store.path(root, &trace.execution));
+        let mut spans = Vec::new();
+        journal
+            .drain(|s| {
+                spans.push(s);
+                Ok(())
+            })
+            .unwrap();
+        spans
+    }
+
+    /// Stand-in for `role_runner::launch`: open the span at the launch, spawn
+    /// a real child, and report its observed exit.
+    fn launch(result: &str) {
+        let mut command = Command::new("true");
+        role_command(&mut command);
+        assert!(
+            command
+                .get_envs()
+                .any(|(k, v)| k == TRACEPARENT_ENV && v.is_some()),
+            "the launch carries the tick's traceparent"
+        );
+        let mut child = command.spawn().unwrap();
+        role_child_spawned(child.id());
+        child.wait().unwrap();
+        role_child_exited(result);
+    }
+
+    /// Every outcome a tick reaches **without launching**: the pre-spawn
+    /// skips, a runtime rejection, and a failure raised before the launch
+    /// (`spawn-bin unresolved`, a preflight error). None may leave a span, a
+    /// trace context, or a join entry behind — and none returns a
+    /// [`RoleTrace`], so the tick's `role_tick.outcome` record carries no
+    /// `trace_context` pointing at a span that was never exported.
+    #[test]
+    #[serial_test::serial] // `loom.repo` resolution reads the process-global `LOOM_REPO`
+    fn a_tick_that_never_launches_emits_no_role_attempt_span() {
+        let skips = vec![
+            RoleTickOutcome::PoolExhausted {
+                total: 20,
+                next_clear_at: Utc::now() + chrono::Duration::minutes(15),
+                pool: CredentialPool::ClaudeTokens,
+                hold: PoolHold::SelfHealing,
+            },
+            RoleTickOutcome::QueueEmpty,
+            RoleTickOutcome::NoTokenPool,
+            RoleTickOutcome::RuntimeRejected(crate::runtime_admission::RuntimeRejection {
+                role: "doctor".into(),
+                runtime: "codex".into(),
+                source: crate::runtime_admission::RuntimeSource::RoleConfig,
+                unmet_capabilities: vec!["isolation".into()],
+                reason: "unmet".into(),
+            }),
+            RoleTickOutcome::ModelRuntimeMismatch(crate::role_runner::ModelRuntimeMismatch {
+                role: "doctor".into(),
+                runtime: "codex".into(),
+                model: "opus".into(),
+                model_source: "default".into(),
+                reason: "family conflict".into(),
+            }),
+            RoleTickOutcome::Failure("spawn-bin unresolved".into()),
+        ];
+        for outcome in skips {
+            let dir = traced_root();
+            let label = format!("{outcome:?}");
+            let (returned, trace) = role_invocation(dir.path(), "doctor", || outcome);
+            assert_eq!(format!("{returned:?}"), label, "the outcome passes through");
+            assert!(trace.is_none(), "{label}: a never-launched tick returns no trace");
+            assert!(
+                files_under(dir.path(), ".loom/logs/trace-context").is_empty(),
+                "{label}: nothing journalled"
+            );
+            assert!(
+                files_under(dir.path(), crate::observability::runtime_usage::join::JOIN_DIR)
+                    .is_empty(),
+                "{label}: no join entry left open"
+            );
+            ROLE_CONTEXT.with(|slot| assert!(slot.borrow().is_none(), "{label}: slot cleared"));
+        }
+    }
+
+    /// A tick that launched keeps its `loom.role_attempt` root, named and
+    /// attributed exactly as before, started at the tick's own instant (so the
+    /// pre-spawn preparation stays inside the interval) — including the
+    /// `LoadSkipped` shape, which is a session that ran to the wall-clock
+    /// ceiling, not a pre-spawn skip.
+    #[test]
+    #[serial_test::serial] // `loom.repo` resolution reads the process-global `LOOM_REPO`
+    fn a_tick_that_launches_keeps_its_role_attempt_span() {
+        let cases = vec![
+            (RoleTickOutcome::Success, "success", "success", SpanStatus::Ok),
+            (
+                RoleTickOutcome::Failure("exit 1".into()),
+                "failure",
+                "failure",
+                SpanStatus::Error,
+            ),
+            (
+                RoleTickOutcome::LoadSkipped {
+                    load_per_core: 4.2,
+                    detail: "deferred".into(),
+                },
+                "failure",
+                "skipped_load",
+                SpanStatus::Error,
+            ),
+        ];
+        for (outcome, child, result, status) in cases {
+            let dir = traced_root();
+            let (_, trace) = role_invocation(dir.path(), "judge", || {
+                launch(child);
+                outcome
+            });
+            let trace = trace.expect("a launched tick returns its trace");
+            assert_eq!(trace.execution, role_execution_id("judge", trace.started_at));
+            let spans = drained(dir.path(), &trace);
+            let roots: Vec<_> = spans
+                .iter()
+                .filter(|s| s.context == trace.context)
+                .collect();
+            assert_eq!(roots.len(), 1, "{result}: exactly one root");
+            let root = roots[0];
+            assert_eq!(root.name, SpanName::RoleAttempt);
+            assert_eq!(root.status, status);
+            assert_eq!(root.started_at, trace.started_at, "starts at the tick, not the launch");
+            assert_eq!(root.attributes["loom.result"], result);
+            assert_eq!(root.attributes["loom.role"], "judge");
+            assert_eq!(root.attributes["loom.sweep_id"], trace.execution);
+            assert_eq!(root.attributes["loom.timing_source"], "owned_boundary");
+            assert_eq!(root.attributes[ATTEMPT_WORKED], "true");
+            assert!(
+                !files_under(dir.path(), crate::observability::runtime_usage::join::JOIN_DIR)
+                    .is_empty(),
+                "{result}: the launched tick's join entry is open for transcript ingest"
+            );
+        }
+    }
+}

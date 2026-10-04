@@ -255,7 +255,7 @@ impl<'a> Evaluator<'a> {
         }
         let body = issue.body.as_deref().unwrap_or_default();
         let prefix = format!("{}#", self.ctx.slug.to_ascii_lowercase());
-        crate::dep_classify::refs::parse_dependency_refs(body, self.ctx.slug)
+        crate::dep_classify::refs::parse_named_blocker_refs(body, self.ctx.slug)
             .into_iter()
             .map(|r| {
                 let same = r

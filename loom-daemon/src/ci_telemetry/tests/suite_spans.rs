@@ -245,8 +245,10 @@ fn suite_windows_are_the_suites_own_and_never_escape_the_jobs_window() {
 // ---------------------------------------------------------------------------
 
 /// The artifacts listing is requested for exactly the one run that has a
-/// not-yet-emitted `shell-suite-shard` job — never for the other five runs,
-/// and never again once that run is emitted.
+/// not-yet-emitted sharded job — never for the other five runs, and never
+/// again once that run is emitted. The suite-timings download is the only one
+/// this module is about; the sibling `ci-test-timings` download that the same
+/// single listing also serves (#9456) is asserted in `super::test_spans`.
 #[test]
 fn only_a_run_with_an_unemitted_shard_leg_costs_an_artifacts_request() {
     let dir = TempDir::new().unwrap();
@@ -256,7 +258,7 @@ fn only_a_run_with_an_unemitted_shard_leg_costs_an_artifacts_request() {
         .requests()
         .into_iter()
         .map(|(p, _)| p)
-        .filter(|p| p.contains("/artifacts"))
+        .filter(|p| p.contains("/artifacts") && !p.contains("ci-test-timings"))
         .collect();
     assert_eq!(
         listings,
@@ -293,10 +295,13 @@ fn artifact_requests_are_counted_in_the_cycles_request_total() {
     assert_eq!(report.summary.requests, api.requests().len());
 }
 
-/// An artifact whose name does not start with the documented prefix is never
-/// downloaded (the fixture's `build-daemon` artifact would be a whole compiled
-/// binary), and neither is an EXPIRED timings artifact — GitHub answers 410 for
-/// those, which would be re-recorded as a failure on every cycle.
+/// An artifact whose name does not start with one of the documented prefixes
+/// is never downloaded (the fixture's `build-daemon` artifact would be a whole
+/// compiled binary), and neither is an EXPIRED timings artifact — GitHub
+/// answers 410 for those, which would be re-recorded as a failure on every
+/// cycle. The fixture's listing holds five artifacts: the two prefix matches
+/// below, the unrelated build output, the expired `ci-suite-timings-9`, and
+/// #9456's `ci-test-timings-…` record.
 #[test]
 fn only_unexpired_prefix_matching_artifacts_are_downloaded() {
     let dir = TempDir::new().unwrap();
@@ -308,8 +313,9 @@ fn only_unexpired_prefix_matching_artifacts_are_downloaded() {
         .map(|(p, _)| p)
         .filter(|p| p.starts_with("download:"))
         .collect();
-    assert_eq!(downloads.len(), 1, "{downloads:?}");
+    assert_eq!(downloads.len(), 2, "{downloads:?}");
     assert!(downloads[0].ends_with("ci-suite-timings-2"), "{downloads:?}");
+    assert!(downloads[1].ends_with("ci-test-timings-rust-unit-tests-2-3"), "{downloads:?}");
 }
 
 // ---------------------------------------------------------------------------

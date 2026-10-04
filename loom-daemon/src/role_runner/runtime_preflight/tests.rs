@@ -832,7 +832,27 @@ fn preference_judge_workspace(
         &root.join(".loom/scripts/spawn-worker.sh"),
         &format!("#!/bin/sh\nprintf '%s' \"$LOOM_RUNTIME\" >'{}'\nexit 0\n", marker.display()),
     );
+    // Judge is a merging role: Codex is available to it only while every
+    // shared seat runs Loom's guard hook (#9390 follow-up). These tests are
+    // about the preference walk, so their seats are guard-ready; the
+    // unguarded case is `an_unguarded_codex_seat_sends_judge_down_the_list`.
+    guard_ready_codex_seats(root);
     (marker, pool)
+}
+
+/// Install a bridge into `root` and make every profile under
+/// `LOOM_CODEX_PROFILE_ROOT` guard-ready for it: Loom's managed registration
+/// plus the operator's one-time trust decision, keyed the way Codex keys it
+/// for a bare-metal run.
+fn guard_ready_codex_seats(root: &Path) {
+    fs::create_dir_all(root.join(".loom/hooks")).unwrap();
+    fs::write(root.join(".loom/hooks/guard-codex-bridge.sh"), "#!/bin/sh\n").unwrap();
+    let profiles = PathBuf::from(std::env::var_os("LOOM_CODEX_PROFILE_ROOT").unwrap());
+    for entry in fs::read_dir(&profiles).unwrap().flatten() {
+        if entry.path().is_dir() {
+            crate::tokens_pool::codex_hooks::test_support::guard_ready(&entry.path(), None);
+        }
+    }
 }
 
 /// The genuine fall-through: `claude` is listed FIRST and admitted, its pool
@@ -973,6 +993,61 @@ fn role_preference_decides_the_tap_even_when_the_static_pool_is_healthy_body() {
         fs::read_to_string(&marker).unwrap_or_default(),
         "codex",
         "a healthy Claude pool must not override the operator's ordering"
+    );
+}
+
+/// The #9390 fallback, end to end through a real role tick: `rolePreference`
+/// puts Codex first for Judge, the Codex seat is healthy, but its guard hook
+/// is not trusted where it runs. Codex is passed over at selection and the
+/// tick launches on the next tap (Claude), instead of selecting Codex and
+/// failing in `spawn-codex.sh`'s own fail-closed check.
+#[test]
+#[serial(loom_shared_tokens_dir_env)]
+fn an_unguarded_codex_seat_sends_judge_down_the_list() {
+    an_unguarded_codex_seat_sends_judge_down_the_list_body();
+}
+
+#[serial]
+fn an_unguarded_codex_seat_sends_judge_down_the_list_body() {
+    if std::process::Command::new("jq")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: jq unavailable");
+        return;
+    }
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let (marker, _pool) = preference_judge_workspace(
+        workspace.path(),
+        &serde_json::json!({"runtimes": {"rolePreference": {"judge": ["codex", "claude"]}}}),
+        false,
+    );
+    // Trust recorded for the host path is not trust inside a session
+    // container: the seat becomes unguarded for the run it would serve.
+    fs::write(profiles.path().join("alice/.session-managed.json"), "{}").unwrap();
+    // ...and an operator hook beside Loom's means the registration cannot be
+    // sealed either (#10102), so nothing stands in for that trust.
+    let hooks = profiles.path().join("alice/hooks.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&hooks).unwrap()).unwrap();
+    value["hooks"]["PostToolUse"] =
+        serde_json::json!([{"hooks": [{"type": "command", "command": "true"}]}]);
+    fs::write(&hooks, value.to_string()).unwrap();
+
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
+
+    assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap_or_default(),
+        "claude",
+        "an unguarded Codex seat must send a merging role to the next tap"
     );
 }
 

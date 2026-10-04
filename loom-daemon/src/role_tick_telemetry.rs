@@ -793,6 +793,17 @@ pub fn result_label(result: RoleTickResult) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// [`RoleTickResult::spawned`] read back off a [`result_label`] string, for
+/// the emit sites that carry the label rather than the enum (the story copies,
+/// #9168). `None` for a label no [`RoleTickResult`] round-trips from — an
+/// unparseable label is "undetermined", never a guessed `false` (#9420).
+#[must_use]
+pub fn label_spawned(label: &str) -> Option<bool> {
+    serde_json::from_value::<RoleTickResult>(serde_json::Value::String(label.to_owned()))
+        .ok()
+        .map(RoleTickResult::spawned)
+}
+
 pub mod story;
 pub mod targets;
 pub mod usage;

@@ -18,6 +18,7 @@ fn identity() -> RunIdentity {
         attempt: Some(1),
         runtime: "claude".to_string(),
         role: Some("builder".to_string()),
+        launch: crate::telemetry::kinds::session_output::Launch::Daemon,
     }
 }
 
@@ -224,7 +225,9 @@ fn collector_keeps_every_session_output_attribute() {
     let log_keep = CONFIG
         .lines()
         .find(|l| {
-            l.contains("keep_keys(attributes, [\"loom.repo\"") && l.contains("loom.ci.chunk_index")
+            l.contains("keep_keys(attributes, [")
+                && l.contains("loom.ci.chunk_index")
+                && l.contains("loom.session.output.event_id")
         })
         .expect("the transform/privacy log keep_keys line");
     for key in SESSION_OUTPUT_LOG_ATTRIBUTE_KEYS {
@@ -284,6 +287,26 @@ fn visibility_is_private_unless_something_proves_otherwise() {
     )
     .unwrap();
     assert_eq!(hostile.visibility, RepoVisibility::Private);
+}
+
+#[test]
+fn launch_spells_its_wire_value_and_old_payloads_decode_as_daemon() {
+    for launch in [Launch::Daemon, Launch::Attended] {
+        assert_eq!(serde_json::to_value(launch).unwrap().as_str(), Some(launch.as_str()));
+    }
+    // Every record queued before #10116 came from the daemon's producer, so
+    // an envelope replayed from an older queue file must still say so.
+    let old: RunIdentity =
+        serde_json::from_value(serde_json::json!({ "runtime": "claude", "issue": 7 })).unwrap();
+    assert_eq!(old.launch, Launch::Daemon);
+    let attended = RunIdentity {
+        runtime: "claude".to_string(),
+        launch: Launch::Attended,
+        ..RunIdentity::default()
+    };
+    let round_trip: RunIdentity =
+        serde_json::from_value(serde_json::to_value(&attended).unwrap()).unwrap();
+    assert_eq!(round_trip.launch, Launch::Attended);
 }
 
 #[test]

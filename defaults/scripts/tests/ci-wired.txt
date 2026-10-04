@@ -119,6 +119,7 @@ test-guide-work-plan-operator-only-exclude.sh
 test-guide-work-plan-ready-open-pr-exclude.sh
 test-hard-exclusion-labels.sh
 test-host-sleep-config.sh
+test-inbox-mail.sh
 test-install-active-session.sh
 test-install-agents-md-reapply.sh
 test-install-full-reinstall-no-target-mutation.sh
@@ -155,7 +156,6 @@ test-operator-only-subkind.sh
 test-post-verdict.sh
 test-pr-worktree-isolation.sh
 test-probe-tokens-fallback.sh
-test-provision-codex-hooks.sh
 test-provision-hooks.sh
 test-provision-skills.sh
 test-random-file.sh
@@ -187,7 +187,7 @@ test-safe-stash-pop.sh
 test-safehoused-service.sh
 test-script-helper-version-floor.sh
 test-session-mode.sh
-test-spawn-codex-session-exec.sh
+test-spawn-codex-sandbox-noop.sh
 test-stale-claim-standdown-suppression.sh
 test-stop-hook-subcommand-skew.sh
 test-sweep-auto-stack.sh
@@ -240,6 +240,10 @@ tests/hooks/test-guard-loom-workflow.sh
 # no network/forge calls) — covers .loom/hooks/post-worktree.sh's redirected-
 # CARGO_TARGET_DIR resolution, wired since #6013.
 tests/hooks/test-post-worktree-target-dir.sh
+# Same hermetic pattern (stubbed PATH, fake cargo/pnpm/loom-daemon, no network)
+# — covers .githooks/pre-commit failing closed on a missing/failing formatter,
+# wired since #10123.
+tests/hooks/test-pre-commit-missing-formatter.sh
 
 # defaults/hooks/tests/ — remaining unwired guard-hook suites, wired since #4451.
 defaults/hooks/tests/test-guard-background-subagents.sh

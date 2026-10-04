@@ -11,6 +11,7 @@ use std::path::Path;
 mod drain_render;
 mod fleet_store_line;
 mod forge_calls_render;
+mod forge_egress_line;
 mod forge_events_line;
 mod holds;
 mod model_class;
@@ -18,6 +19,7 @@ mod observability_line;
 mod operator_priority_line;
 mod peer_claims_line;
 mod pending_restart_line;
+mod telemetry_banner;
 
 use loom_daemon::daemon_install_state;
 use loom_daemon::self_update;
@@ -761,6 +763,12 @@ pub(crate) fn build_status_json_value(
     let pending_restart = pending_restart_line::json(report.daemon_pid);
     if !pending_restart.is_null() {
         value["pending_restart"] = pending_restart;
+    }
+    // Forge egress routing (#9984): fresh assert + the daemon's last doctor;
+    // inserted only when a policy resolves or a cached report exists.
+    let forge_egress = forge_egress_line::json();
+    if !forge_egress.is_null() {
+        value["forge_egress"] = forge_egress;
     }
     value
 }
@@ -2214,6 +2222,18 @@ pub(crate) fn print_status_human(
         observability_line::render(report.observability_export.as_ref(), Utc::now())
     );
 
+    // The loud telemetry banner (#9950): the one-line render above is the
+    // data; when telemetry is demonstrably broken the common-tool rule says
+    // the status surface must COMPLAIN — what is broken, what it means
+    // (records accumulating locally), and what to fix — on every invocation,
+    // for as long as it lasts. The 2026-10-01 store-tunnel outage ran ~15h on
+    // accurate-but-ignorable one-liners. The host-id mismatch has its own
+    // WARNING block further up and is not duplicated here.
+    if let Some(banner) = telemetry_banner::render(report.observability_export.as_ref(), Utc::now())
+    {
+        println!("\n{banner}");
+    }
+
     // Forge event-feed consumer (ADR-0021, #8765). Same block, same reason:
     // "off", "never provisioned", "wrong key", "wrong host" and "quiet feed"
     // are five different answers that would otherwise all render as nothing.
@@ -2228,6 +2248,8 @@ pub(crate) fn print_status_human(
     // render` change this daemon's pid has not yet picked up. Nothing at all
     // once the daemon that saw the drift has restarted (or if none ever did).
     pending_restart_line::print(report.daemon_pid);
+    // Forge egress routing (#9984): nothing at all when no policy is configured.
+    forge_egress_line::print();
 
     // Watchdog protection state (#4354): this daemon is answering, so it is
     // alive — but is anything positioned to notice when it *stops* being? Before

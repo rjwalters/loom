@@ -274,7 +274,9 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         } else {
             "rejected"
         };
-        span.finish_attempt(outcome, SpanStatus::Error);
+        // #9420: the runtime was never reached, so this attempt's interval
+        // measures admission overhead, not the stage's work.
+        span.finish_attempt(outcome, SpanStatus::Error, Some(false));
     }
     result
 }
@@ -308,6 +310,12 @@ fn run_preflight(
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
         return Err(LaunchError::config("invalid runtime name"));
+    }
+    // Forge egress admission (#9984): `spawn-worker.sh` delegates here, so this
+    // is its `forge egress assert`. Under `enforcement.api = required` a routing
+    // finding means no worker is spawned; `observe` logs; no policy is a no-op.
+    if let Some(refusal) = crate::forge_egress::gate::spawn_refusal(root) {
+        return Err(LaunchError::config(refusal));
     }
     let scripts = args.scripts_dir.unwrap_or_else(|| scripts_dir(root));
     let mut log: Box<dyn Write> = Box::new(std::io::stderr());

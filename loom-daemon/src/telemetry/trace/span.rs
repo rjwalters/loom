@@ -37,6 +37,14 @@ pub enum SpanName {
     /// durations out of a finished runner.
     #[serde(rename = "loom.ci.suite")]
     CiSuite,
+    /// One test of a `nextest-partition` leg (Issue #9456), parented to its
+    /// [`Self::CiJob`] span. Built from the JUnit XML
+    /// `.config/nextest.toml`'s `ci` profile writes and `ci.yml` uploads —
+    /// the only surface that carries per-test durations out of a finished
+    /// runner. Emitted for the leg's slow tail only, never one span per test;
+    /// see `ci_telemetry::nextest`.
+    #[serde(rename = "loom.ci.test")]
+    CiTest,
     /// One work-finder tick (Issue #8860) — its own root trace per tick.
     #[serde(rename = "loom.dispatch.tick")]
     DispatchTick,
@@ -57,6 +65,12 @@ pub enum SpanName {
     /// tick's [`Self::DispatchTick`] span when the tick is still known.
     #[serde(rename = "loom.dispatch.disposition")]
     DispatchDisposition,
+    /// One `gh` invocation through the `gh_invocation` facade (Issue #9985):
+    /// the client-side "caller operation" span of the forge egress trace
+    /// tree. A child of the caller's execution when it has one, else its own
+    /// root (`context_source=missing`).
+    #[serde(rename = "invoke github")]
+    GithubInvoke,
 }
 
 impl SpanName {
@@ -73,11 +87,13 @@ impl SpanName {
             Self::CiJob => "loom.ci.job",
             Self::CiStep => "loom.ci.step",
             Self::CiSuite => "loom.ci.suite",
+            Self::CiTest => "loom.ci.test",
             Self::DispatchTick => "loom.dispatch.tick",
             Self::RuntimeUsage => "loom.runtime.usage",
             Self::PoolHold => "loom.pool.hold",
             Self::DispatchAdmission => "loom.dispatch.admission",
             Self::DispatchDisposition => "loom.dispatch.disposition",
+            Self::GithubInvoke => "invoke github",
         }
     }
 }
@@ -140,6 +156,7 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.role"
                     | "loom.phase"
                     | "loom.attempt"
+                    | "loom.attempt.worked"
                     | "loom.runtime"
                     | "loom.provider"
                     | "loom.model"
@@ -170,6 +187,7 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.tool.name"
             ) || crate::telemetry::ci::CI_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
                 || crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
+                || crate::gh_invocation::telemetry::SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
                 || super::provenance::KEYS.contains(&key.as_str()))
                 && value.len() <= 256
                 && !value.chars().any(char::is_control)

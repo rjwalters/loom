@@ -122,11 +122,59 @@ fn both_h2_and_h3_are_recognised_as_the_heading() {
 }
 
 #[test]
-fn a_heading_with_trailing_words_is_not_the_dependencies_section() {
-    // The shell anchors the pattern at end-of-line. `## Dependencies (deferred)`
-    // is a different section, and treating it as this one would read its items
-    // as live prerequisites.
+fn a_deferred_heading_is_not_the_dependencies_section() {
+    // `## Dependencies (deferred)` is a Curator deliberately marking the
+    // section inactive, and treating it as this one would read its items as
+    // live prerequisites. This suffix vocabulary — and only this vocabulary,
+    // see `INACTIVE_HEADING_SUFFIXES` (#9925) — suppresses the section.
     assert_eq!(parse_entries("## Dependencies (deferred)\n- [ ] #3: x"), vec![]);
+    // Casing and surrounding whitespace do not change what the author meant.
+    assert_eq!(parse_entries("### Dependencies  (Deferred)  \n- [ ] #3: x"), vec![]);
+}
+
+#[test]
+fn an_annotated_heading_is_still_an_active_dependencies_section() {
+    // #9925's live repro, byte-for-byte: 2AMLogic/product#135 carried
+    // `### Dependencies (added 2026-09-24, Curator re-check)` while the #151 it
+    // named was genuinely OPEN, and the pre-fix exact-match heading test
+    // treated the whole section as ABSENT — `DEPS=''`, a false
+    // `VERDICT=clear`, and a Builder unparked onto a live blocker.
+    let body = "### Dependencies (added 2026-09-24, Curator re-check)\n\n\
+                - [ ] #151: prerequisite, still open\n";
+    assert_eq!(parse_entries(body), vec![dep(151, false, None)]);
+    assert_eq!(compute(&[dep(151, false, Some("OPEN"))]).verdict, "blocked");
+}
+
+#[test]
+fn an_unrecognised_heading_suffix_defaults_to_active_not_absent() {
+    // The fail-direction this module takes everywhere else: an annotation
+    // nobody taught the parser about must not silently clear a live section.
+    for suffix in [
+        "(re-checked 2026-10-01)",
+        "(updated)",
+        "()",
+        "— see below",
+        "(blocked by upstream)",
+    ] {
+        let body = format!("## Dependencies {suffix}\n- [ ] #3: x\n");
+        assert_eq!(parse_entries(&body), vec![dep(3, false, None)], "{suffix}");
+    }
+}
+
+#[test]
+fn a_bare_dependencies_heading_is_unaffected() {
+    for h in ["## Dependencies", "### Dependencies   ", "##\tDependencies"] {
+        let body = format!("{h}\n- [ ] #3: x\n");
+        assert_eq!(parse_entries(&body), vec![dep(3, false, None)], "{h}");
+    }
+}
+
+#[test]
+fn a_word_glued_to_dependencies_is_not_the_heading() {
+    // The annotation must be whitespace-separated — `## Dependencies-ish` names
+    // some other section, not an annotated version of this one.
+    assert_eq!(parse_entries("## Dependencies-ish\n- [ ] #3: x"), vec![]);
+    assert_eq!(parse_entries("## DependenciesFoo\n- [ ] #3: x"), vec![]);
 }
 
 #[test]

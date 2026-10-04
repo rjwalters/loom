@@ -198,8 +198,23 @@ fn claude(root: &Path) -> Availability {
 /// which is the safe direction for a preference walk (it over-prefers a
 /// paid-for seat rather than over-spending on a metered one), but it does mean
 /// a Codex tier cannot be relied on to fall through until #8443 lands.
+///
+/// **Sandbox hold (#10003).** A healthy pool is not enough: a Codex tick
+/// whose sandbox refused every tool call arms a short host-wide hold
+/// ([`super::sandbox_hold`]), and while it is live this tap is unavailable
+/// whatever the pool says. That is what lets `rolePreference:
+/// ["codex","claude"]` fall through to Claude when Codex can run nothing.
+/// The hold is self-healing (`PoolHold::SelfHealing`): it ages out and the next
+/// tick re-tests the sandbox.
 fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
     let source = CredentialSource::CodexAccounts;
+    if let Some(hold) = super::sandbox_hold::active("codex", now) {
+        return Availability::Exhausted {
+            source,
+            hold: PoolHold::SelfHealing,
+            detail: hold.describe("codex", now),
+        };
+    }
     if !crate::role_runner::runtime_preflight::codex_pool_is_the_wall(root, admitted) {
         return ungated(CredentialSource::Unobservable);
     }
@@ -210,6 +225,29 @@ fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
             hold: PoolHold::Unreadable(*file),
             detail: format!("{} could not be read: {error}", file.as_str()),
         };
+    }
+    // A merging role may draw a Codex seat only when every seat it could draw
+    // runs Loom's guard hook (#9390 follow-up; see `codex_guard`). Otherwise
+    // the walk falls through to the next tap instead of selecting Codex and
+    // failing the tick in spawn-codex.sh's own fail-closed check.
+    if state.spawnable > 0 && super::codex_guard::guarded(&admitted.role) {
+        let unready = super::codex_guard::unready_profiles(root);
+        if unready.as_ref().map_or(true, |names| !names.is_empty()) {
+            return Availability::Exhausted {
+                source,
+                hold: PoolHold::Unprovisioned,
+                detail: match unready {
+                    Ok(names) => format!(
+                        "Loom's guard hook is not ready on Codex profile(s) {} for this \
+                         merging role ({}) — provision-codex-hooks.sh verify --all-profiles \
+                         --workspace <repo>; #9390",
+                        names.join(", "),
+                        admitted.role
+                    ),
+                    Err(reason) => format!("{reason} ({}) — #9390", admitted.role),
+                },
+            };
+        }
     }
     if state.spawnable > 0 {
         return Availability::Spawnable {

@@ -1748,6 +1748,21 @@ impl SweepRegistry {
             }
         }
 
+        // Forge egress admission (#9984): a fresh `forge egress assert`. Under
+        // `enforcement.api = required` a routing finding refuses the dispatch
+        // here, before any claim/label/account/log/spawn side effect, and the
+        // refusal is visible on the bus as `sweep.blocked reason=forge-egress`.
+        // `observe` logs and admits; no policy configured is a no-op.
+        if let Some(refusal) =
+            crate::forge_egress::gate::dispatch_refusal(&self.config.workspace_root)
+        {
+            self.emit_event(Event::Generic {
+                topic: crate::forge_egress::gate::SWEEP_BLOCKED_TOPIC.to_string(),
+                payload: refusal.event_payload(serde_json::to_value(kind).unwrap_or_default()),
+            });
+            return Err(anyhow!(refusal.message()));
+        }
+
         // Runtime admission is the first decision for a new dispatch:
         // before account selection, claim lock, forge mutation,
         // log header, or child spawn. A full sweep remains one runtime and is
@@ -2052,10 +2067,22 @@ impl SweepRegistry {
         //      could re-claim the same issue within the very cooldown window
         //      its last sweep deliberately armed.
         //
-        //      `noop_cooldown_remaining` is a pure in-memory lookup with no
-        //      `gh` dependency — like the 2.8 backoff guard immediately
+        //      `noop_cooldown_dispatch_block` is a pure in-memory lookup with
+        //      no `gh` dependency — like the 2.8 backoff guard immediately
         //      below, this is NOT gated on `skip_label_flip`, and a refusal
         //      costs no lock, no label write, and no forge round trip.
+        //
+        //      Issue #9928: it reads the FLEET-AWARE window (this host's own
+        //      ∪ any live one a peer host broadcast under #7477), not the
+        //      host-local `noop_cooldown_remaining` this guard originally
+        //      called. The work finder's advisory pre-filter has consulted the
+        //      unioned view since #7477, but THIS guard — the one every route
+        //      above funnels through, including the work finder's own — did
+        //      not, so a window armed by host A left every dispatch reaching
+        //      this point on hosts B/C/D free to re-claim the same issue
+        //      inside it: four hosts re-dispatching one unchanged tracker
+        //      issue in ~10 minutes, the exact round-robin #7477 exists to
+        //      stop. See `noop_cooldown_dispatch_block`'s own doc comment.
         //
         //      Placed AFTER the 2.7 park-label guard, deliberately: when an
         //      issue is both parked and mid-cooldown, the park is the more
@@ -2068,11 +2095,12 @@ impl SweepRegistry {
         //      since-crashed) sweep still means "nothing has changed since
         //      that check" and a resume must respect it exactly like a fresh
         //      dispatch would.
-        if let Some(remaining) = self.noop_cooldown_remaining(issue_number, Utc::now()) {
+        if let Some(remaining) = self.noop_cooldown_dispatch_block(issue_number, Utc::now()) {
             log::info!(
                 "sweep_registry: refusing to dispatch issue #{issue_number} — a live no-op \
-                 release cooldown is armed, {}s remaining (#6670/#6917 noop-cooldown guard); \
-                 the last sweep found nothing had changed since its previous check.",
+                 release cooldown is armed on this host or a fleet peer, {}s remaining \
+                 (#6670/#6917/#9928 noop-cooldown guard); the last sweep found nothing had \
+                 changed since its previous check.",
                 remaining.as_secs()
             );
             return Err(NoopCooldownDispatchError {
@@ -3434,3 +3462,14 @@ mod tests;
 // note on this pattern.
 #[cfg(test)]
 mod idempotency_inflight_tests;
+
+// Issue #9928's fleet-aware noop-cooldown guard coverage. A sibling module for
+// the same reason as `idempotency_inflight_tests` above: `dispatch/tests.rs` is
+// over the file-size ratchet threshold.
+#[cfg(test)]
+mod fleet_noop_cooldown_tests;
+
+// Issue #9984's forge-egress dispatch admission coverage — a sibling module
+// for the same reason as the two above.
+#[cfg(test)]
+mod forge_egress_tests;

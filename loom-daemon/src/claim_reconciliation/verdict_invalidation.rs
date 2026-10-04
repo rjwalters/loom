@@ -41,12 +41,12 @@
 //! #9541/#9483 lost verdicts here that the daemon pass would have kept. One
 //! implementation, two callers.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use std::path::Path;
-use std::process::{Command, Stdio};
 
-use super::{VerdictKind, VerdictPr, VerdictReconcileStats};
-use crate::forge_tree_unchanged::tree_unchanged;
+use super::{gh_call, VerdictKind, VerdictPr, VerdictReconcileStats};
+use crate::verdict_equivalence::{self, Equivalence, EquivalenceKind};
+use crate::verdict_stale_notice::UntrustedVerdictMarker;
 
 // The carve-out's kill switch (`LOOM_VERDICT_TREE_CARVEOUT`, nested here inside
 // [`super::VERDICT_STALENESS_ENABLED_ENV`]) moved to the shared module with the
@@ -80,26 +80,47 @@ pub(super) fn handle_invalidate(
     // re-review, so this pass re-anchors instead. `Some(false)` or `None`
     // (comparison unavailable) fall straight through to the ordinary clear,
     // unchanged from before #9124.
+    // #10134: when no equivalence could even be EVALUATED (an unfetchable
+    // commit, a `gh` outage, a shallow clone), the clear below still happens —
+    // fail closed — but it says so, in the log and in the PR comment, instead
+    // of reading exactly like a real content change.
+    let mut unavailable_note = None;
     if tree_carveout {
-        if let Some(true) = tree_unchanged(gh_bin, Some(root), marker_sha, head_sha) {
-            match reanchor_tree_unchanged_verdict(gh_bin, root, pr, marker_sha, head_sha) {
+        let assessment =
+            verdict_equivalence::assess(gh_bin, Some(root), pr.number, marker_sha, head_sha);
+        unavailable_note = assessment.fail_closed_note();
+        if let Some(note) = &unavailable_note {
+            log::warn!(
+                "claim_reconciliation: PR #{} in {}: could not determine whether the head move \
+                 {marker_sha} -> {head_sha} kept the reviewed change — failing closed and \
+                 clearing {} (#10134). Why: {note}",
+                pr.number,
+                root.display(),
+                pr.kind.label(),
+            );
+        }
+        if let Equivalence::Equivalent(kind) = assessment.equivalence {
+            match reanchor_equivalent_verdict(gh_bin, root, pr, marker_sha, head_sha, kind) {
                 Ok(()) => {
                     stats.tree_identical_reanchors += 1;
                     log::info!(
                         "claim_reconciliation: PR #{} in {} carries {} with head moved from \
-                         {marker_sha} to {head_sha}, but the trees are identical — re-anchored \
-                         instead of invalidating (#9124)",
+                         {marker_sha} to {head_sha}, but the reviewed change is unchanged \
+                         (equivalence kind: {}) — re-anchored instead of invalidating (#9124, \
+                         #9416)",
                         pr.number,
                         root.display(),
                         pr.kind.label(),
+                        kind.token(),
                     );
                 }
                 Err(e) => {
                     log::warn!(
-                        "claim_reconciliation: failed to re-anchor PR #{}'s tree-identical {} \
+                        "claim_reconciliation: failed to re-anchor PR #{}'s {}-equivalent {} \
                          verdict in {}: {e} — it stays stale (recorded for {marker_sha}) until \
                          the next tick re-evaluates it",
                         pr.number,
+                        kind.token(),
                         pr.kind.label(),
                         root.display()
                     );
@@ -108,17 +129,19 @@ pub(super) fn handle_invalidate(
             return;
         }
     }
-    match invalidate_verdict(gh_bin, root, pr, marker_sha, head_sha) {
-        Ok(comment_skipped) => {
+    let note = unavailable_note.as_deref();
+    match invalidate_verdict(gh_bin, root, pr, marker_sha, head_sha, note) {
+        Ok((comment_skipped, untrusted)) => {
             stats.invalidated += 1;
             stats.redundant_comments_skipped += usize::from(comment_skipped);
             log::warn!(
                 "claim_reconciliation: cleared stale {} from PR #{} in {} (verdict recorded for \
                  {marker_sha}, head is now {head_sha}) — re-queued as loom:review-requested \
-                 (#5686)",
+                 (#5686){}",
                 pr.kind.label(),
                 pr.number,
                 root.display(),
+                crate::verdict_stale_notice::log_note(untrusted.as_ref()),
             );
         }
         Err(e) => {
@@ -132,46 +155,45 @@ pub(super) fn handle_invalidate(
     }
 }
 
-/// Re-anchor a verdict whose head moved but whose tree did not (Issue #9124):
-/// post an updated `<!-- loom:verdict-sha ... -->` marker for `head_sha` and
-/// leave the verdict label exactly as it is.
+/// Re-anchor a verdict whose head moved but whose reviewed change did not
+/// (Issues #9124, #9416): post an updated `<!-- loom:verdict-sha ... -->`
+/// marker for `head_sha`, plus a `<!-- loom:verdict-equivalence kind=… -->`
+/// marker recording WHICH equivalence carried it, and leave the verdict label
+/// exactly as it is.
 ///
 /// **No label is touched, and nothing is disarmed.** Unlike
-/// [`invalidate_verdict`], this path runs only once GitHub's own compare API
-/// has confirmed `marker_sha` and `head_sha` share the same tree — the
-/// reviewed code is still exactly what is at `head_sha` — so there is nothing
-/// to re-review and nothing unsafe about an auto-merge that was already armed
-/// going on to merge it.
+/// [`invalidate_verdict`], this path runs only once
+/// [`crate::verdict_equivalence::detect`] has proven — from git objects and the
+/// forge's own compare endpoint, never from a marker — that the change at
+/// `head_sha` is the change that was reviewed at `marker_sha`. So there is
+/// nothing to re-review, and nothing unsafe about an auto-merge that was
+/// already armed going on to merge it. CI still re-runs against `head_sha`
+/// either way: this path exempts the review, never a check.
 ///
 /// Idempotent by construction, same as [`super::forge::anchor_verdict`]: the
-/// marker it posts is exactly what [`super::extract_latest_verdict_sha`] scans
-/// for, so the next pass reads the verdict as `Fresh`.
-fn reanchor_tree_unchanged_verdict(
+/// `verdict-sha` marker it posts is exactly what
+/// [`super::extract_latest_verdict_sha`] scans for, so the next pass reads the
+/// verdict as `Fresh`. The body itself lives in
+/// [`crate::verdict_equivalence::reanchor_body`] — with it goes the one rule
+/// that matters for that scan: nothing may be added INSIDE the `verdict-sha`
+/// marker, because both scanners anchor on its trailing ` -->`.
+fn reanchor_equivalent_verdict(
     gh_bin: &Path,
     root: &Path,
     pr: &VerdictPr,
     marker_sha: &str,
     head_sha: &str,
+    kind: EquivalenceKind,
 ) -> Result<()> {
     let label = pr.kind.label();
-    let token = pr.kind.marker_token();
-    let body = format!(
-        "<!-- loom:verdict-sha sha={head_sha} verdict={token} -->\n\
-         **Verdict re-anchored — head moved, but the tree did not**\n\n\
-         This PR's `{label}` verdict was recorded for `{marker_sha}`. The head is now \
-         `{head_sha}`, but comparing the two shows **zero file differences** — the code this \
-         verdict describes is unchanged; only the commit identity moved (commonly the \
-         `#8248` required-check-freshness guard's automated re-date commit, #8508, which \
-         exists only to refresh a merge queue's check timestamps).\n\n\
-         Since the tree is provably identical, clearing `{label}` and sending this PR back \
-         through Judge would buy nothing but another full review of content already \
-         reviewed — exactly the waste #9124 measured. The marker is updated to `{head_sha}` \
-         so a future GENUINE change is still caught by the ordinary staleness check.\n\n\
-         ---\n\
-         *Automated by loom-daemon claim reconciliation (#9124)*"
+    let body = verdict_equivalence::reanchor_body(
+        label,
+        pr.kind.marker_token(),
+        kind,
+        marker_sha,
+        head_sha,
     );
 
-    let mut cmd = Command::new(gh_bin);
     // #9772: the footer's link needs the slug — `LOOM_REPO` when set, else
     // the root's origin remote. An unresolvable slug posts unlinked rather
     // than linking to nowhere.
@@ -179,27 +201,15 @@ fn reanchor_tree_unchanged_verdict(
         crate::worktree_ops::gh::resolve_owner_repo(root).map(|(o, r)| format!("{o}/{r}"))
     });
     let body = crate::forge_comment::footer_or_body(nwo.as_deref(), pr.number, true, &body);
-    cmd.arg("pr")
-        .arg("comment")
-        .arg(pr.number.to_string())
-        .arg("--body")
-        .arg(&body);
-    cmd.current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
-    }
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    let n = pr.number.to_string();
+    let out = gh_call::output(
+        gh_call::write("verdict.reanchor_comment", gh_bin, root)
+            .args(["pr", "comment", &n, "--body", &body])
+            .args(gh_call::loom_repo_flag()),
+    )?;
     if !out.status.success() {
-        return Err(anyhow!(
-            "gh pr comment (reanchor {label}) failed for #{} in {}: {}",
-            pr.number,
-            root.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        let (root, err) = (root.display(), gh_call::stderr(&out));
+        return Err(anyhow!("gh pr comment (reanchor {label}) failed for #{n} in {root}: {err}"));
     }
     Ok(())
 }
@@ -231,14 +241,16 @@ fn reanchor_tree_unchanged_verdict(
 /// on every pass. The label write is deliberately still attempted — retrying
 /// it is the *point*.
 ///
-/// Returns `true` when the comment was skipped as redundant.
+/// Returns `true` when the comment was skipped as redundant, plus the dropped
+/// untrusted marker the posted notice named (#9709; always `None` when skipped).
 fn invalidate_verdict(
     gh_bin: &Path,
     root: &Path,
     pr: &VerdictPr,
     marker_sha: &str,
     head_sha: &str,
-) -> Result<bool> {
+    unavailable_note: Option<&str>,
+) -> Result<(bool, Option<UntrustedVerdictMarker>)> {
     let label = pr.kind.label();
     // `None` (the common case: nothing was armed) contributes no line at
     // all, so the comment never claims a disarm that did not happen.
@@ -251,42 +263,43 @@ fn invalidate_verdict(
     let disarm_line = disarmed
         .as_ref()
         .map(|line| format!("\n{line}"))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        + &super::verdict_stale_comment::unavailable_line(unavailable_note);
     let skipped =
         !super::verdict_stale_comment::should_post(pr.invalidation_recorded, disarmed.is_some());
-    if skipped {
+    let untrusted = if skipped {
         log::info!(
             "claim_reconciliation: PR #{} in {} already records the {marker_sha} -> {head_sha} \
              invalidation — not re-posting the notice, only re-applying the labels (#9124)",
             pr.number,
             root.display(),
         );
+        None
     } else {
-        let body = super::verdict_stale_comment::body(label, marker_sha, head_sha, &disarm_line);
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("pr")
-            .arg("comment")
-            .arg(pr.number.to_string())
-            .arg("--body")
-            .arg(&body);
-        cmd.current_dir(root);
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        // #9709: was a NEWER marker for this verdict dropped as untrusted?
+        // Then the notice (and the caller's log line) must say so rather
+        // than assert a plain head move. Probed only when the notice is
+        // actually posted, so a dedup-skipped pass costs no extra read.
+        let untrusted = probe_untrusted_marker(root, pr);
+        let body = super::verdict_stale_comment::attributed_body(
+            label,
+            marker_sha,
+            head_sha,
+            &disarm_line,
+            untrusted.as_ref(),
+        );
+        let n = pr.number.to_string();
+        let out = gh_call::output(
+            gh_call::write("verdict.stale_comment", gh_bin, root)
+                .args(["pr", "comment", &n, "--body", &body])
+                .args(gh_call::loom_repo_flag()),
+        )?;
         if !out.status.success() {
-            return Err(anyhow!(
-                "gh pr comment failed for #{} in {}: {}",
-                pr.number,
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            let (root, err) = (root.display(), gh_call::stderr(&out));
+            return Err(anyhow!("gh pr comment failed for #{n} in {root}: {err}"));
         }
-    }
+        untrusted
+    };
 
     // `loom:ci-failure` / `loom:merge-conflict` are findings about the OLD
     // tree too — they ride along with the verdict they were applied
@@ -304,36 +317,53 @@ fn invalidate_verdict(
     // pass exists to prevent. `gh pr edit --remove-label` on a label that
     // isn't present is a documented no-op, so requesting removal of both
     // unconditionally is always safe.
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("pr")
-        .arg("edit")
-        .arg(pr.number.to_string())
-        .arg("--remove-label")
-        .arg(VerdictKind::Approved.label())
-        .arg("--remove-label")
-        .arg(VerdictKind::ChangesRequested.label())
-        .arg("--remove-label")
-        .arg("loom:ci-failure")
-        .arg("--remove-label")
-        .arg("loom:merge-conflict")
-        .arg("--add-label")
-        .arg("loom:review-requested");
-    cmd.current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
-    }
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    let n = pr.number.to_string();
+    let out = gh_call::output(
+        gh_call::write("verdict.clear_labels", gh_bin, root)
+            .args(["pr", "edit", &n])
+            .args(["--remove-label", VerdictKind::Approved.label()])
+            .args(["--remove-label", VerdictKind::ChangesRequested.label()])
+            .args(["--remove-label", "loom:ci-failure"])
+            .args(["--remove-label", "loom:merge-conflict"])
+            .args(["--add-label", "loom:review-requested"])
+            .args(gh_call::loom_repo_flag()),
+    )?;
     if !out.status.success() {
-        return Err(anyhow!(
-            "gh pr edit (clear {label}) failed for #{} in {}: {}",
-            pr.number,
-            root.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        let (root, err) = (root.display(), gh_call::stderr(&out));
+        return Err(anyhow!("gh pr edit (clear {label}) failed for #{n} in {root}: {err}"));
     }
-    Ok(skipped)
+    Ok((skipped, untrusted))
+}
+
+/// The newer-than-trusted verdict marker the trust filter dropped on this PR,
+/// if any (#9709) — attribution for the notice, never evidence: the decision
+/// above was already made from trusted markers only, and nothing here can
+/// change it. One extra comment read, on the (rare) posting path only.
+/// `None` on any read failure, which falls back to the plain head-moved wording.
+///
+/// Built through the [`crate::gh_invocation`] choke point (#9985), so the
+/// executable comes from its resolver (`LOOM_GH_BIN` → `PATH`), not the
+/// caller's `gh_bin`.
+fn probe_untrusted_marker(root: &Path, pr: &VerdictPr) -> Option<UntrustedVerdictMarker> {
+    use crate::cmd_out::CmdOutcome;
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    let path = format!("repos/{{owner}}/{{repo}}/issues/{}/comments", pr.number);
+    let outcome = GhInvocation::new(
+        Operation::new("api.rest"),
+        AccessIntent::Read,
+        GhTarget::None,
+        std::time::Duration::from_secs(60),
+    )
+    .args(["api", path.as_str(), "--paginate"])
+    .current_dir(root)
+    .run();
+    let CmdOutcome::Ran(out) = outcome else {
+        return None;
+    };
+    if !out.status.success() {
+        return None;
+    }
+    let items = crate::comment_trust::parse_listing(&out.stdout)?;
+    let policy = crate::comment_trust::TrustPolicy::for_root(root);
+    crate::verdict_stale_notice::untrusted_newer_marker(&policy, &items, pr.kind)
 }

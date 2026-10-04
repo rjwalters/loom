@@ -67,11 +67,14 @@
 //! and turns the `loom-daemon health` `ci_telemetry` section non-green.
 
 pub mod api;
+pub mod artifact_spans;
+pub mod billing;
 pub mod export;
 pub mod feed;
 pub mod journal;
 pub mod ledger;
 pub mod logs;
+pub mod nextest;
 pub mod owners;
 pub mod poll;
 pub mod records;
