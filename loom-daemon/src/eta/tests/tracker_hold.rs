@@ -370,3 +370,53 @@ fn a_held_prs_features_are_those_of_its_blocked_refusal() {
     assert_eq!(without_labels(&held), without_labels(&blocked));
     assert_eq!(held.features_omitted, blocked.features_omitted);
 }
+
+/// #10201's journal-derived drain and merge counts read one event per split
+/// episode end: a hold's entry is a `merge_wait` exit, and its end is counted
+/// once, from the `merge_hold` row, whatever ends it. Each case gives
+/// (merges, `merge_wait` departures, `merge_hold` departures).
+#[test]
+fn journal_events_count_each_hold_end_once() {
+    use crate::eta::queue_features::EventKind;
+    use crate::eta::tracker::events_from_journal;
+
+    let tally = |h: &Harness| {
+        let log = events_from_journal(&h.rows, t(5000));
+        let left = |stage| log.events.iter().filter(|e| e.stage == Some(stage)).count();
+        let merges = log.events.iter().filter(|e| e.kind == EventKind::Merge);
+        (merges.count(), left(Stage::MergeWait), left(Stage::MergeHold))
+    };
+    let held = || {
+        let mut h = approved();
+        h.list(&[PR, OP], 550, 600);
+        h
+    };
+
+    let mut h = approved();
+    h.resolve(PrState::Merged(t(850)), 900);
+    assert_eq!(tally(&h), (1, 1, 0), "merged, no hold");
+
+    let mut h = held();
+    h.list(&[PR], 1450, 1500);
+    h.resolve(PrState::Merged(t(1700)), 1800);
+    assert_eq!(tally(&h), (1, 2, 1), "hold, release, merge");
+
+    let mut h = held();
+    h.resolve(PrState::Merged(t(850)), 900);
+    assert_eq!(tally(&h), (1, 1, 1), "merged while held");
+    let log = events_from_journal(&h.rows, t(5000));
+    let merge = log.events.iter().find(|e| e.kind == EventKind::Merge);
+    assert_eq!(merge.and_then(|e| e.stage), Some(Stage::MergeHold));
+
+    let mut h = held();
+    h.resolve(PrState::Open, 900);
+    assert_eq!(tally(&h), (0, 1, 1), "left the listings while held, still open");
+
+    let mut h = held();
+    h.list(&[CR], 1150, 1200);
+    assert_eq!(tally(&h), (0, 1, 1), "held, then changes-requested");
+
+    let mut h = held();
+    h.resolve(PrState::Closed, 1000);
+    assert_eq!(tally(&h), (0, 1, 1), "closed while held");
+}

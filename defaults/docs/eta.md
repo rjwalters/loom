@@ -241,8 +241,12 @@ raw event cache imports it.
   (`next_stage: merge_hold`, no duration); leaving it journals a `merge_hold`
   row (with `duration_sec` when its entry was observed), then the pooled track
   carries on as before. A merge or close while held adds a `merge_hold` row to
-  the unchanged pooled one. While held the item is `At(merge_hold)` and still
-  refused `blocked`, so a refusal is emitted once, as before; after a release
+  the unchanged pooled one. The `exits_*` and `merges_*` features count a
+  hold's entry as a `merge_wait` exit. They count its end once, from the
+  `merge_hold` row: the pooled row at the same instant is skipped, and a held
+  PR that leaves the listings still open is not a merge. While held the item
+  is `At(merge_hold)` and still refused `blocked`, so a refusal is emitted
+  once, as before; after a release
   it is `At(merge_wait)` with the pooled entry, and
   `CurrentStage.episode_entered_at` carries the release instant.
   One deliberate change to local samples: `review_wait` approved and held

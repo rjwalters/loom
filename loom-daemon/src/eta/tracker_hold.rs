@@ -19,6 +19,11 @@
 //!   nothing, `doctor` closes the pooled `merge_wait` exactly as before.
 //! - **A merge or close while held** writes the pooled row unchanged plus a
 //!   `merge_hold` row: completed at the merge, censored on a close.
+//! - **Journal-derived drain and merge counts** (#10201) read each hold end
+//!   once: the `merge_hold` row is the departure (and the merge), and the
+//!   pooled `merge_wait` row at the same instant (doctor, close, merge) is
+//!   not counted again. A held PR that leaves the listings still open is a
+//!   `merge_hold` departure, never a merge.
 //!
 //! While held the item keeps `refused = blocked`, as it had before #10218,
 //! so the emit signature — and with it when a refusal is emitted and that it
