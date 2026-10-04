@@ -1549,6 +1549,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
         loom_daemon::star_liveness::task::spawn(sweep_workspace.clone(), Some(event_bus.clone()))
     });
 
+    let _fleet_alert = loom_daemon::fleet_alert::task::spawn(
+        sweep_workspace.clone(),
+        socket_path.clone(),
+        Some(event_bus.clone()),
+    ); // #10164
+
     // Idle-edge role triggering (#4364) is inert without the work-finder loop:
     // the work finder is the sole source of the per-root idle signal, so an
     // `autonomous.roleRunner.onIdle` set with no work finder enabled can never
