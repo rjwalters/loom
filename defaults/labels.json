@@ -907,8 +907,10 @@
         "# starts from Curator), and may run one starred sweep over the concurrency",
         "# cap. Skip/park labels still win: a starred issue carrying loom:blocked,",
         "# loom:operator-only, loom:operator-decision or loom:operator is never",
-        "# dispatched. Applied by: humans (directly or via the loom-ui star). Removed",
-        "# by: humans."
+        "# dispatched. Applied by: humans (directly or via the loom-ui star), and, for the",
+        "# children of a starred parent, inherited (#10012: `create-issue.sh --parent`",
+        "# stars a new child; the audit comment names `inherited_from=#P`). Removed by:",
+        "# humans; a star propagation applied goes with the parent's star."
       ]
     },
     {
