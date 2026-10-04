@@ -509,6 +509,45 @@ mod tests {
         }
     }
 
+    /// PR #9966 Judge re-review: step 9's prose told the Doctor to
+    /// `git rebase origin/main` BEFORE "Pin the lease". Rebasing onto a moved
+    /// `main` drops the claim-time head from `HEAD`'s history, so the block's
+    /// ancestry check then STOPs a legitimate push, and a conflict handed the
+    /// Doctor to "PR Has Merge Conflicts" mid-rebase, where its check always
+    /// fails. Step 9 must route the rebase through the Pin block, resolve a
+    /// conflict in place, and the conflicts recipe must exempt a Doctor that
+    /// is already mid-rebase after a passed check.
+    #[test]
+    fn step_9_rebases_only_inside_the_pin_block_after_its_ancestry_check() {
+        let doctor = include_str!("../../../defaults/.claude/commands/loom/doctor.md");
+        let start = doctor.find("9. **Commit and push**").expect("step 9");
+        let len = doctor[start..].find("\n10. ").expect("step 10");
+        let step9 = &doctor[start..start + len];
+        let pin = step9
+            .find("Pin the lease")
+            .expect("step 9 names Pin the lease");
+        let main = step9
+            .find("origin/main")
+            .expect("step 9 names the #7668 rebase");
+        assert!(pin < main, "step 9 must send the Doctor to Pin the lease before any rebase");
+        for line in step9.lines() {
+            if line.contains("origin/main") {
+                assert!(line.contains("Pin the lease"), "standalone rebase in step 9: {line}");
+            }
+            if line.contains("PR Has Merge Conflicts") {
+                assert!(line.contains("git rebase --continue"), "mid-rebase hand-off: {line}");
+            }
+        }
+        let guard = r#"git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD"#;
+        let conflicts = doctor.find("### PR Has Merge Conflicts").expect("recipe");
+        let recipe = &doctor[conflicts..];
+        let at = recipe.find(guard).expect("conflict recipe ancestry check");
+        assert!(
+            recipe[..at].contains("Mid-rebase") && recipe[..at].contains("git rebase --continue"),
+            "the conflict recipe must exempt a Doctor already mid-rebase from its check"
+        );
+    }
+
     #[test]
     fn a_ref_that_does_not_resolve_is_reported_as_such() {
         let (_tmp, _origin, work) = fixture();
