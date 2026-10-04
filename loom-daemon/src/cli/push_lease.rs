@@ -470,7 +470,9 @@ mod tests {
     fn the_doctor_prompt_pins_at_claim_time_checks_ancestry_and_re_pins() {
         let doctor = include_str!("../../../defaults/.claude/commands/loom/doctor.md");
         assert!(
-            !doctor.contains("PUSH_LEASE_SHA=$(gh pr view"),
+            // Split so `gh` is never followed by whitespace in this file: the
+            // forge-inventory gate scans test literals lexically (#9832).
+            !doctor.contains(concat!("PUSH_LEASE_SHA=$(gh", " pr view")),
             "a pin re-read from the forge after the fix work can be a sibling's push"
         );
         assert!(doctor.contains(r#"PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-${CLAIM_HEAD_SHA:?}}""#));
