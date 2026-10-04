@@ -90,6 +90,14 @@ path = "loom-daemon/src/forge_listing.rs"
 kind = "rust"
 path = "loom-daemon/src/eta/fleet_fetch.rs"
 [[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_starred.rs"
+symbol = "list_starred"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/pr_planning/listing.rs"
+symbol = "stamp_star_times"
+[[operation.callers]]
 kind = "role-prompt"
 path = "defaults/.claude/commands/loom/guide.md"
 
@@ -471,6 +479,10 @@ path = "loom-daemon/src/eta/fleet_events_forge.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/eta/fleet_fetch.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_starred.rs"
+symbol = "StarTimes"
 
 # --- epics-relationships -----------------------------------------------------
 
