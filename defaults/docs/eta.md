@@ -816,7 +816,7 @@ an explanation recorded before it still parses.
 
 A feature is `null` when it was not measured, with a `features_omitted`
 reason; never a default ([Features](#features) lists the definitions and
-the reasons). An explanation stays near 8 KiB; over 32 KiB it
+the reasons). An explanation stays near 10 KiB; over 32 KiB it
 drops `features`, then `twin_otter.model` (only when present; then nothing
 recomputes), then the stage grids, then the stage marks, then every
 remaining list (`detail`), stopping as soon as it fits, and names each drop

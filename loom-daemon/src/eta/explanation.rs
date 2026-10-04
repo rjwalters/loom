@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 pub const MAX_BYTES: usize = 32 * 1024;
 
 /// The size an ordinary explanation should stay under.
-pub const TARGET_BYTES: usize = 8 * 1024;
+pub const TARGET_BYTES: usize = 10 * 1024;
 
 /// `truncated[]` entry when `features` was dropped.
 pub const TRUNCATED_FEATURES: &str = "features";
