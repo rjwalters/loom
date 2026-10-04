@@ -25,18 +25,24 @@
 //! would-be-leaking future sample is added to the history it replays
 //! against.
 //!
-//! # Coverage: `land` cases need an in-sweep merge
+//! # Coverage: `land` cases from an in-sweep merge, or from the forge
 //!
-//! A [`Kind::Land`] case exists only where the record's phase sequence ends
-//! with a `merge` — the one place a `sweep.outcome` record witnesses the
-//! landing itself. Where the fleet merges out of sweep (Champion's
-//! auto-merge), no local record ends in `merge` and `land-v1` backtests
-//! against zero cases, even though `eta backfill` gives it plenty of
-//! `merge_wait` *samples* to estimate from. Samples and cases are different
-//! things, and only the latter is missing. Deriving `land` cases from the
-//! same `pr_latency` histories backfill already reads (the real
-//! `review-requested → merged` lead time) is the fix, tracked separately;
-//! it is not a leakage hazard, just a gap in what can be scored.
+//! [`cases_from_record`] yields a [`Kind::Land`] case only where the record's
+//! phase sequence ends with a `merge` — the one place a `sweep.outcome`
+//! record witnesses the landing itself. Where the fleet merges out of sweep
+//! (Champion's auto-merge), no local record ends in `merge`, so that source
+//! alone gives `land-v1` zero cases even though `eta backfill` gives it
+//! plenty of `merge_wait` *samples* to estimate from. Samples and cases are
+//! different things.
+//!
+//! The second `land` source (#9579) is the merged PR's own forge label
+//! timeline ([`pr_cases::cases_from_pr_history`]): every review / rejection
+//! / approval entry is a replay instant and the PR's `merged_at` its
+//! answer. It is opt-in at the CLI (`eta backtest --pr-history` /
+//! `--forge-pr-cases`) so a default backtest stays offline, and its own
+//! leak-freedom argument is made in [`pr_cases`] rather than inherited from
+//! the one above. A case both sources answer is counted once
+//! ([`merge_case_sets`]).
 //!
 //! # `start` cases come from the stage journal (#9326)
 //!
@@ -56,7 +62,13 @@ use super::{
 use crate::telemetry::{SweepOutcomeRecord, SweepResult, TelemetryEnvelope, TelemetryRecord};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+pub mod pr_cases;
+pub use pr_cases::{
+    cases_from_pr_history, cases_from_pr_records, parse_pr_records, PrCaseExclusion, PrCaseRecord,
+    PrCaseSummary,
+};
 
 /// Bucket for a record whose `repo` slug was unresolved (Issue #9442),
 /// mirroring [`super::history`]'s own sentinel.
@@ -227,6 +239,75 @@ pub fn cases_from_journal(entries: &[JournalEntry]) -> Vec<ReplayCase> {
     cases
 }
 
+/// The identity a replay case has whichever source derived it: subject
+/// (repo, case-insensitive, and issue), kind, stage, and which entry of that
+/// stage it is — the *n*-th, by `as_of`, among the subject's cases of that
+/// kind and stage in the same set. Two sources disagree on the exact `as_of`
+/// (a sweep's is reconstructed from phase durations, the forge's is a label
+/// event), so the instant itself cannot be the key; the lap ordinal can.
+type CaseIdentity = (String, u32, Kind, Stage, usize);
+
+fn identities(cases: &[ReplayCase]) -> Vec<CaseIdentity> {
+    let mut groups: BTreeMap<(String, u32, Kind, Stage), Vec<usize>> = BTreeMap::new();
+    for (i, c) in cases.iter().enumerate() {
+        groups
+            .entry((c.subject.repo.to_ascii_lowercase(), c.subject.issue, c.kind, c.stage))
+            .or_default()
+            .push(i);
+    }
+    let mut ids = vec![(String::new(), 0, Kind::Land, Stage::ReviewWait, 0); cases.len()];
+    for ((repo, issue, kind, stage), mut members) in groups {
+        members.sort_by_key(|&i| (cases[i].as_of, i));
+        for (ordinal, i) in members.into_iter().enumerate() {
+            ids[i] = (repo.clone(), issue, kind, stage, ordinal);
+        }
+    }
+    ids
+}
+
+/// `primary` plus every `secondary` case that is not already in it (#9579).
+/// Returns the merged set and how many `secondary` cases were dropped.
+///
+/// Every `primary` case is kept as-is. `secondary` is first reduced to
+/// distinct cases (the same PR read twice — an offline file and a forge
+/// fetch — is the same case, not two), then any case whose
+/// [`CaseIdentity`] `primary` already holds is dropped: a PR merged inside a
+/// sweep is answered by both its `sweep.outcome` record and its forge
+/// timeline, and must be scored once. Genuine second laps keep distinct
+/// ordinals and so are never collapsed.
+#[must_use]
+pub fn merge_case_sets(
+    primary: Vec<ReplayCase>,
+    secondary: Vec<ReplayCase>,
+) -> (Vec<ReplayCase>, usize) {
+    let before = secondary.len();
+    let mut seen_exact = BTreeSet::new();
+    let distinct: Vec<ReplayCase> = secondary
+        .into_iter()
+        .filter(|c| {
+            seen_exact.insert((
+                c.subject.repo.to_ascii_lowercase(),
+                c.subject.issue,
+                c.subject.pr_number,
+                c.kind,
+                c.stage,
+                c.as_of,
+            ))
+        })
+        .collect();
+    let taken: BTreeSet<CaseIdentity> = identities(&primary).into_iter().collect();
+    let ids = identities(&distinct);
+    let mut merged = primary;
+    let mut added = 0_usize;
+    for (case, id) in distinct.into_iter().zip(ids) {
+        if !taken.contains(&id) {
+            merged.push(case);
+            added += 1;
+        }
+    }
+    (merged, before - added)
+}
+
 /// One dimension's aggregate: mean pinball loss, p25-p75 coverage and bias
 /// (mean signed error) over every scored case, plus how many were refused.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -315,6 +396,27 @@ fn matches(case: &ReplayCase, kind: Kind, filter: Filter<'_>) -> bool {
             .is_none_or(|r| case.subject.repo.eq_ignore_ascii_case(r))
 }
 
+/// The estimator input a replay case describes: its own `as_of`, its stage
+/// entered at that instant, no features.
+fn case_input(case: &ReplayCase, loom: &Provenance) -> EstimateInput {
+    EstimateInput {
+        subject: case.subject.clone(),
+        as_of: case.as_of,
+        current: CurrentState::At(CurrentStage {
+            stage: case.stage,
+            entered_at: Some(case.as_of),
+            age_sec: 0,
+            age_source: AgeSource::TrackerObserved,
+            rework_rounds: case.rework_rounds,
+            episode_entered_at: None,
+        }),
+        features: explanation::Features::default(),
+        features_omitted: Vec::new(),
+        provenance: loom.clone(),
+        dispatch: case.dispatch.clone(),
+    }
+}
+
 /// Replay every case matching `heuristic.kind()` and `filter` against
 /// `history`, leak-free: each case's own `as_of` is what
 /// [`super::Heuristic::estimate`] sees, and history excludes anything not
@@ -337,21 +439,7 @@ pub fn run(
         if !matches(case, kind, filter) {
             continue;
         }
-        let input = EstimateInput {
-            subject: case.subject.clone(),
-            as_of: case.as_of,
-            current: CurrentState::At(CurrentStage {
-                stage: case.stage,
-                entered_at: Some(case.as_of),
-                age_sec: 0,
-                age_source: AgeSource::TrackerObserved,
-                rework_rounds: case.rework_rounds,
-            }),
-            features: explanation::Features::default(),
-            features_omitted: Vec::new(),
-            provenance: loom.clone(),
-            dispatch: case.dispatch.clone(),
-        };
+        let input = case_input(case, loom);
         let explanation = heuristic.estimate(&input, history);
         let summary = EstimateSummary::of(&explanation);
         let s = score(&summary, case.outcome, case.actual_at, &[]);
@@ -390,6 +478,35 @@ pub fn run(
         by_repo,
         by_horizon,
     }
+}
+
+/// The calibration observations a replay of `base` over `cases` yields
+/// (#10207): one per `land` case `base` estimated, landing at the case's
+/// `actual_at` and known from that instant on.
+///
+/// This is what lets `eta backtest` score a recalibrating heuristic from the
+/// journals alone, with no live outcome log. It stays leak-free because the
+/// recalibrating heuristic fits its table at each case's own `as_of`
+/// ([`super::recalibrate::fit_table`]): a case's own landing (and every
+/// later one) is known only at or after its `actual_at`, which is never
+/// before its `as_of`, so at most it enters as a censored lower bound.
+#[must_use]
+pub fn calibration_from_replay(
+    base: &dyn Heuristic,
+    history: &StageSamples,
+    cases: &[ReplayCase],
+    loom: &Provenance,
+) -> Vec<super::recalibrate::CalibrationObservation> {
+    cases
+        .iter()
+        .filter(|case| case.kind == Kind::Land && base.kind() == Kind::Land)
+        .filter_map(|case| {
+            let input = case_input(case, loom);
+            let summary = EstimateSummary::of(&base.estimate(&input, history));
+            let s = score(&summary, case.outcome, case.actual_at, &[]);
+            super::recalibrate::CalibrationObservation::from_scored(&summary, &s, case.actual_at)
+        })
+        .collect()
 }
 
 /// A paired comparison of two heuristics on the identical replay set —

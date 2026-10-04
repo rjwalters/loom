@@ -140,6 +140,10 @@ impl Capture {
 // ---------------------------------------------------------------------------
 
 /// Run `stash-push`. Returns the process exit code.
+///
+/// Reports "already clean" only when `git status` is empty: untracked files
+/// it leaves in place are named, and a git error, a `git add -N` entry, or any
+/// change it could not shelve exits 1 instead (#10122).
 #[must_use]
 pub fn push(args: &[String]) -> i32 {
     let parsed = match parse(args, "stash-push", PUSH_USAGE, true) {
@@ -155,12 +159,25 @@ pub fn push(args: &[String]) -> i32 {
     push_inner(&out, &layout, &parsed)
 }
 
-fn push_json(out: &Out, t: &Target, ok: bool, tracked: bool, untracked: u32, r: &str) {
+/// `unshelved` lists the paths still dirty in the tree after the push — empty
+/// on a full capture, the untracked files left in place (`success: true`)
+/// when `--include-untracked` was not given, or what could not be shelved
+/// (`success: false`) on a refusal (#10122).
+fn push_json(
+    out: &Out,
+    t: &Target,
+    ok: bool,
+    tracked: bool,
+    untracked: u32,
+    r: &str,
+    unshelved: &[String],
+) {
     out.json_line(&format!(
-        "{{\"success\": {ok}, \"issueNumber\": {}, \"target\": \"{}\", \"hasTrackedChanges\": {tracked}, \"untrackedCount\": {untracked}, \"ref\": \"{}\"}}",
+        "{{\"success\": {ok}, \"issueNumber\": {}, \"target\": \"{}\", \"hasTrackedChanges\": {tracked}, \"untrackedCount\": {untracked}, \"ref\": \"{}\", \"unshelvedPaths\": {}}}",
         t.json_issue(),
         wip::json_str(&t.label()),
-        wip::json_str(r)
+        wip::json_str(r),
+        wip::json_str_array(unshelved)
     ));
 }
 
@@ -172,12 +189,12 @@ fn push_inner(out: &Out, layout: &Layout, parsed: &Parsed) -> i32 {
 
     if !wt.is_dir() {
         Out::error(&format!("No worktree found at {} — nothing to stash-push", wip::display(wt)));
-        push_json(out, target, false, false, 0, "");
+        push_json(out, target, false, false, 0, "", &[]);
         return 1;
     }
     if !wip::is_git_worktree(wt) {
         Out::error(&format!("{} is not a git working tree", wip::display(wt)));
-        push_json(out, target, false, false, 0, "");
+        push_json(out, target, false, false, 0, "", &[]);
         return 1;
     }
 
@@ -193,13 +210,66 @@ fn push_inner(out: &Out, layout: &Layout, parsed: &Parsed) -> i32 {
             cap.ref_name,
             wip::display(&cap.holding_dir)
         ));
-        push_json(out, target, false, false, 0, "");
+        push_json(out, target, false, false, 0, "", &[]);
+        return 1;
+    }
+
+    // What is dirty BEFORE anything moves (#10122). `git stash create`'s empty
+    // output used to be the only clean signal, so a git error (swallowed into
+    // "") or a change `stash create` cannot see read as "already clean". The
+    // porcelain view is now the ground truth: "clean" is only ever reported
+    // when it is empty, and it is re-checked after the capture below.
+    let before = match wip::worktree_status(wt) {
+        Ok(s) => s,
+        Err(e) => {
+            Out::error(&format!(
+                "Could not read the status of {} ({e}) — refusing to stash-push; nothing was changed",
+                wip::display(wt)
+            ));
+            push_json(out, target, false, false, 0, "", &[]);
+            return 1;
+        }
+    };
+    let dirty_paths: Vec<String> = before.iter().map(|e| e.path.clone()).collect();
+
+    // `git add -N` entries make `git stash create` fail outright ("Entry '<p>'
+    // not uptodate. Cannot merge."). Refuse up front with the fix, rather than
+    // surfacing git's opaque error after the fact.
+    let ita: Vec<String> = before
+        .iter()
+        .filter(|e| e.is_intent_to_add())
+        .map(|e| e.path.clone())
+        .collect();
+    if !ita.is_empty() {
+        Out::error(&format!(
+            "stash-push cannot capture {} intent-to-add path(s) (git add -N) for {label}: {}. Nothing was changed. Stage them fully ('git -C {} add -- <path>') or drop the intent ('git -C {} reset -- <path>'), then retry.",
+            ita.len(),
+            wip::path_list(&ita, 10),
+            wip::display(wt),
+            wip::display(wt)
+        ));
+        push_json(out, target, false, false, 0, "", &ita);
         return 1;
     }
 
     // `stash create` builds the commit object WITHOUT writing refs/stash.
-    // Empty output means the tracked tree was already clean.
-    let stash_commit = wip::git_stdout(wt, &["stash", "create"]).unwrap_or_default();
+    // Empty output from a SUCCESSFUL run means no tracked changes it can
+    // capture; a FAILED run is an error, never "clean".
+    let stash_commit = match wip::git(wt, &["stash", "create"]) {
+        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        other => {
+            let why = other.map_or_else(
+                || "could not execute git".to_string(),
+                |o| String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            );
+            Out::error(&format!(
+                "'git stash create' failed in {} — refusing to stash-push; nothing was changed. git said: {why}",
+                wip::display(wt)
+            ));
+            push_json(out, target, false, false, 0, "", &dirty_paths);
+            return 1;
+        }
+    };
     let has_tracked = !stash_commit.is_empty();
 
     if has_tracked {
@@ -209,7 +279,7 @@ fn push_inner(out: &Out, layout: &Layout, parsed: &Parsed) -> i32 {
             // whereas resetting a tree whose capture is not anchored loses the
             // tree.
             Out::error(&format!("Failed to anchor baseline commit under {}", cap.ref_name));
-            push_json(out, target, false, false, 0, "");
+            push_json(out, target, false, false, 0, "", &[]);
             return 1;
         }
         if !wip::git_ok(wt, &["reset", "--hard", "HEAD"]) {
@@ -218,7 +288,7 @@ fn push_inner(out: &Out, layout: &Layout, parsed: &Parsed) -> i32 {
                 wip::display(wt),
                 cap.ref_name
             ));
-            push_json(out, target, false, true, 0, &cap.ref_name);
+            push_json(out, target, false, true, 0, &cap.ref_name, &[]);
             return 1;
         }
     }
@@ -232,7 +302,7 @@ fn push_inner(out: &Out, layout: &Layout, parsed: &Parsed) -> i32 {
                     "Could not create holding directory: {}",
                     wip::display(&cap.untracked_dir())
                 ));
-                push_json(out, target, false, has_tracked, 0, &cap.ref_name);
+                push_json(out, target, false, has_tracked, 0, &cap.ref_name, &[]);
                 return 1;
             }
             // The manifest is written INCREMENTALLY, one line per file as soon
@@ -248,7 +318,7 @@ fn push_inner(out: &Out, layout: &Layout, parsed: &Parsed) -> i32 {
                     "Could not create the untracked manifest at {}",
                     wip::display(&cap.manifest)
                 ));
-                push_json(out, target, false, has_tracked, 0, &cap.ref_name);
+                push_json(out, target, false, has_tracked, 0, &cap.ref_name, &[]);
                 return 1;
             };
             for f in &untracked {
@@ -280,22 +350,78 @@ fn push_inner(out: &Out, layout: &Layout, parsed: &Parsed) -> i32 {
             "Could not record the pending-push marker at {}",
             wip::display(&cap.pending)
         ));
-        push_json(out, target, false, has_tracked, untracked_count, &cap.ref_name);
+        push_json(out, target, false, has_tracked, untracked_count, &cap.ref_name, &[]);
         return 1;
     }
 
-    if !has_tracked && untracked_count == 0 {
+    // Verify (#10122): every path that was dirty before must now be clean,
+    // except untracked files the caller chose not to move. Anything else —
+    // a dirty submodule `stash create` ignores, an untracked file whose move
+    // failed — was NOT shelved, and saying "captured" would be a lie. Paths
+    // that only appeared during the push (our own holding files, for the
+    // `main` target) are not the caller's WIP and are ignored.
+    let after = match wip::worktree_status(wt) {
+        Ok(s) => s,
+        Err(e) => {
+            Out::error(&format!(
+                "Could not verify {} after capturing ({e}). Whatever was captured is preserved — run 'stash-pop {label}' to restore it.",
+                wip::display(wt)
+            ));
+            push_json(
+                out,
+                target,
+                false,
+                has_tracked,
+                untracked_count,
+                &cap.ref_name,
+                &dirty_paths,
+            );
+            return 1;
+        }
+    };
+    let was_dirty: std::collections::HashSet<&str> =
+        before.iter().map(|e| e.path.as_str()).collect();
+    let (left_untracked, unshelved): (Vec<_>, Vec<_>) = after
+        .iter()
+        .filter(|e| was_dirty.contains(e.path.as_str()))
+        .partition(|e| e.is_untracked() && !parsed.include_untracked);
+    let left_untracked: Vec<String> = left_untracked.into_iter().map(|e| e.path.clone()).collect();
+    let unshelved: Vec<String> = unshelved.into_iter().map(|e| e.path.clone()).collect();
+
+    if !unshelved.is_empty() {
+        let mut still_dirty = unshelved.clone();
+        still_dirty.extend(left_untracked.iter().cloned());
+        Out::error(&format!(
+            "stash-push could NOT shelve {} path(s) for {label} — they are still dirty in {}: {}. The tree is NOT a clean baseline. Whatever was captured (tracked: {has_tracked}, untracked files moved: {untracked_count}) is preserved — run 'stash-pop {label}' to restore it.",
+            unshelved.len(),
+            wip::display(wt),
+            wip::path_list(&unshelved, 10)
+        ));
+        push_json(out, target, false, has_tracked, untracked_count, &cap.ref_name, &still_dirty);
+        return 1;
+    }
+
+    if before.is_empty() {
         out.info(&format!(
             "No uncommitted changes to push for {label} — working tree was already clean"
         ));
-    } else {
+    } else if has_tracked || untracked_count > 0 {
         out.success(&format!(
             "Baseline captured for {label} (tracked: {has_tracked}, untracked files moved: {untracked_count})"
+        ));
+    } else {
+        out.info(&format!("No tracked changes to capture for {label}"));
+    }
+    if !left_untracked.is_empty() {
+        out.warning(&format!(
+            "{} untracked file(s) were NOT shelved and remain in the worktree (pass --include-untracked to move them): {}",
+            left_untracked.len(),
+            wip::path_list(&left_untracked, 10)
         ));
     }
     out.info(&format!("Restore with: ./.loom/scripts/worktree.sh stash-pop {label}"));
 
-    push_json(out, target, true, has_tracked, untracked_count, &cap.ref_name);
+    push_json(out, target, true, has_tracked, untracked_count, &cap.ref_name, &left_untracked);
     0
 }
 

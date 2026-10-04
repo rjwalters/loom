@@ -34,6 +34,7 @@
 - [Stale-claim reconciliation & the sweep journal (#3953, fixed #3975, extended to PR-side claims #4367)](#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367)
 - [Stacked-PR dependency — #3729 (v1), #3747 (v2 item 1)](#stacked-pr-dependency--3729-v1-3747-v2-item-1)
 - [Epic supervisor (#3842)](#epic-supervisor-3842)
+- [Curator intake reconcile (#10041)](#curator-intake-reconcile-10041)
 - [Autonomous work finder (#3810)](#autonomous-work-finder-3810)
 - [Operability — config, start/stop, E2E (Phase D, #3813)](#operability--config-startstop-e2e-phase-d-3813)
 - [Observability exporter (`observability`, #4705, epic #4702 Phase 1)](#observability-exporter-observability-4705-epic-4702-phase-1)
@@ -2378,6 +2379,48 @@ repo (no enabled `buildGate`), there is no verified-red signal, so the latest
 `main` CI conclusion stands in for key 3: one cached `gh run list` per repo per
 tick, made only when the repo has a marker-bearing candidate.
 
+### Fleet-degraded operator alert (`autonomous.fleetAlert`, #10164)
+
+`loom-daemon health` computes DEGRADED only when a human runs it. With
+`autonomous.fleetAlert.enabled`, a background thread
+(`loom-daemon/src/fleet_alert/`) reads the daemon's own `DaemonStatus` over its
+IPC socket every `intervalSecs` and pushes an alert for any of these
+conditions, each keyed and alerted independently:
+
+| Key | Condition | Cause and fix named in the alert |
+|-----|-----------|----------------------------------|
+| `tokens-zero-healthy` | zero healthy token accounts | `auth_401` (blocked by an auth-class `.bad_tokens` entry such as `auth-dead: 401`, or with no `.bad_tokens` history; never self-heals): re-auth / `tokens import-from-monitor` / `tokens unblock`; exhausted: wait or add accounts; empty pool: `tokens bootstrap` |
+| `dispatch-halted` | main-health gate halted, or the last tick halted while tokens are still available | read `health`'s dispatch section |
+| `roles-persistent` | one or more roles with PERSISTENT tick failures | a launch refused for a missing guarded-canary receipt (exit 78) is named as a runtime/version mismatch (`runtimes.default`, opencode version) |
+| `capacity-limited` | disk or RAM headroom holds the effective cap below the configured `maxConcurrent` (#10214; even with nothing starred) | which term, the effective vs. configured cap, how many starred issues wait; free disk / RAM or add capacity |
+| `star-backlog` | more than 3x the effective cap of starred issues waiting on this host (#10214) | the count, the oldest star and a new star's FIFO position; unstar or re-rank, or add capacity |
+
+An unreachable status changes nothing (unknown is not healthy). A condition must
+hold `debounceTicks` consecutive ticks before one `Started` alert; one `Cleared`
+alert follows after `debounceTicks` good ticks; a still-held condition re-alerts
+at most once per `reminderHours` (so 24h is `1 + floor(24h / reminder)` alerts).
+Active alerts persist in `.loom/logs/fleet-alert-state.json`, so a restart does
+not re-announce them.
+
+Delivery is two independent sinks (one failing never suppresses the other):
+the event bus (an `operator_priority.escalation` event with issue `0`, which the
+Safehouse sink relays to the team Matrix room) and the loom-ui inbox
+(`LOOM_UI_INBOX_URL` + `LOOM_UI_INGEST_KEY`; keyed
+`mail-<host>-fleet-degraded-<condition>`, `resolve: true` on clear; the key is
+sent only as a Bearer header, never on argv or in logs; unset logs once and
+skips). **No forge call is made anywhere in this path**, so it still delivers
+while `gh` is rate-limited. `loom-daemon health` output and exit codes are
+unchanged.
+
+| Config (`autonomous.fleetAlert.*`) | Env | Default |
+|---|---|---|
+| `enabled` | `LOOM_FLEET_ALERT` | `false` (daemon flags default off) |
+| `reminderHours` | `LOOM_FLEET_ALERT_REMINDER_HOURS` | `6` |
+| `debounceTicks` | `LOOM_FLEET_ALERT_DEBOUNCE_TICKS` | `3` |
+| `intervalSecs` | `LOOM_FLEET_ALERT_INTERVAL_SECS` | `60` |
+
+Precedence is env > config > default.
+
 ### Starred-issue liveness and loom-ui stars (#9244 C)
 
 A starred issue is always either being worked on or escalated to the operator
@@ -2408,7 +2451,13 @@ starred issue in each managed repo:
   trusted comment on the issue, including the sweep's lease renewal (a long
   Builder phase with a live lease is not a stall on any host). The stall key
   hashes only those facts (never the stage, which host-local capacity can
-  change), so N hosts post one comment.
+  change), so N hosts post one comment. A `no-capacity` row the work finder
+  deferred carries a structured `capacity_wait` (gate, binding cap term,
+  host-wide position among waiting stars) and reads e.g. `queued #88 of 106
+  (cap 2, disk-limited)`; its position moving forward is progress, and a
+  queue that stops moving escalates naming that reason, position and what the
+  operator can do (#10214). The host-level causes are fleet-alert asks
+  (`capacity-limited`, `star-backlog`), not per-issue comments.
 
 An escalation is one comment on the issue, carrying
 `<!-- loom:operator-priority-escalation key=<kind>:<specifics> -->`. Each
@@ -2450,6 +2499,15 @@ commits / Squash merges / Rebase merges are not allowed"; for #9276 that was
 A generic refusal (bare 405, merge method, ruleset) never searches, and
 nothing a later comment mentions ever inherits. With no open incident the ask
 quotes the forge's refusal text instead.
+Every open same-repo blocker inherits, not only the first one named. With
+`propagate` on, a starred issue's children by its own text inherit the same
+way: `<!-- loom:park Blocked by: #C -->` records, `- [ ] #C` task-list entries,
+and the dependency phrases of a `loom:blocked` issue even when it is also held
+for the operator (#10012). Inheritance is transitive to depth 3 (a cycle stops), never crosses
+repos, makes at most 50 walk reads per repo per pass (closed children and
+blocker reads count), and a child of
+several starred issues takes the earliest starred-at. This is the in-memory
+ordering only; the label itself is not written yet.
 
 **loom-ui stars.** The `/ingest` ack may carry `operator_priority_intents`
 (`defaults/docs/telemetry-schema.md`). The pass applies each valid one (the one
@@ -2465,6 +2523,7 @@ default**):
 | `escalate` | `LOOM_OPERATOR_PRIORITY_ESCALATE` | `true` | post escalations and apply loom-ui intents; `false` still computes and shows every landing state |
 | `intervalSecs` | `LOOM_OPERATOR_PRIORITY_INTERVAL_SECS` | `120` | pass interval |
 | `poolsExhaustedGraceMinutes` | `LOOM_OPERATOR_PRIORITY_POOLS_GRACE_MINUTES` | `10` | wait before a `pools-exhausted` ask; `0` asks at once |
+| `propagate` | `LOOM_OPERATOR_PRIORITY_PROPAGATE` | `true` | a star also reaches its children by park record, task list and dependency phrase; `false` keeps only the blocker / incident / red-main inheritance |
 
 ### Ready queue view (`loom-daemon queue`, #8852)
 
@@ -2869,11 +2928,20 @@ rules with `git check-ignore`.
 | `autonomous.eta.enabled` | `LOOM_ETA_ENABLED` | `true` |
 | `autonomous.eta.dryRun` | `LOOM_ETA_DRY_RUN` | `false` (log `eta: would emit …`, enqueue nothing) |
 | `autonomous.eta.refreshSecs` | `LOOM_ETA_REFRESH_SECS` | `300` |
-| `autonomous.eta.historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` — `local` (this host's journals), `augment` (plus the cached fleet snapshot) or `fleet` (the snapshot alone). A no-op until `loom-daemon eta fleet backfill` caches one (#9343) |
+| `autonomous.eta.historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` — `local` (this host's journals), `augment` (plus the cached fleet snapshot) or `fleet` (the snapshot alone). A no-op until a snapshot is cached (#9343); since #10263 the fleet refresh task below caches one by default, so live estimates switch to `scope = fleet` on a host with reader Apps. `local` opts out |
+| `autonomous.eta.fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily coefficient refit (#10245). It checks hourly, fits at most once per UTC day into `.loom/state/eta/fit/`, makes no forge call, and runs only with `autonomous.eta.enabled`. A no-op until a snapshot is cached. With `fleetRefresh.enabled` (below, #10263) the check runs at the end of every fleet refresh cycle instead of on its own task, so it always sees fresh snapshots. Read at start |
 | `autonomous.eta.current.{finish,land}` | none | `finish-v1` / `land-v1` |
+| `autonomous.eta.fleetRefresh.enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | **`true`** — the fleet snapshot backfill/refresh task (#10263). Default-on like `transcriptIngest`, and for the same kind of reason: it generates no work, only reads (reader Apps only, never the operator PAT), and is budgeted with a reserve floor, while default-off would leave the daily fit with no training data. Also requires `autonomous.eta.enabled` and an observability exporter. **Restart required** |
+| `autonomous.eta.fleetRefresh.intervalSecs` | `LOOM_ETA_FLEET_REFRESH_INTERVAL_SECS` | `3600` (floor `900`); first cycle 120 s after start |
+| `autonomous.eta.fleetRefresh.maxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_MAX_CALLS` | `300` forge calls per cycle for refresh passes, host-wide (`304`s and errors count) |
+| `autonomous.eta.fleetRefresh.backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `1500` per cycle for backfill passes, host-wide; a larger backfill resumes next cycle |
+| `autonomous.eta.fleetRefresh.reserveCalls` | `LOOM_ETA_FLEET_REFRESH_RESERVE` | `1500` — below this many remaining core calls, skip the rest of that reader App's repos this cycle |
+| `autonomous.eta.fleetRefresh.backfillDays` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS` | `21` (floor `15`, the fit window + 1) |
 
 Model, heuristics, explanation schema, scoring and queries:
-[`eta.md`](eta.md).
+[`eta.md`](eta.md); the fleet refresh task's passes, resume files, rate-limit
+backoff and calls per refresh: [`eta.md` → Fleet refresh
+task](eta.md#fleet-refresh-task-autonomousetafleetrefresh-10263).
 
 ## Reaper task
 
@@ -3625,6 +3693,20 @@ at the source (a `Done` epic auto-closes before anything downstream can even
 cite it as unpromoted); the Champion-side check is what actually resolves the
 trap once it has already occurred, including across a repo boundary this
 supervisor cannot cross.
+
+## Curator intake reconcile (#10041)
+
+Each work-finder listing of a workspace also runs a cadence-gated intake pass
+(`loom-daemon/src/intake_reconcile.rs`): every open **issue** (never a PR) with
+no `loom:*` label gets `loom:triage`, so Curator has one queue. Non-`loom:`
+labels such as `bug` do not count. Issues younger than 2 minutes are skipped (a
+filer may still be labeling), the pass is REST-only, idempotent, and batch-capped.
+`create-issue.sh` also adds `loom:triage` when the caller passes no `loom:*`
+label. **Requires the work finder**, which is opt-in and off by default
+(`LOOM_WORK_FINDER`, below): without it this pass never runs. When the work
+finder runs, the pass is on unless `LOOM_INTAKE_RECONCILE=0`; also
+`LOOM_INTAKE_RECONCILE_INTERVAL_SECS` (300), `LOOM_INTAKE_RECONCILE_MAX_PER_PASS` (50).
+Writes are gated by `write_scope` (#9548).
 
 ## Autonomous work finder (#3810)
 
@@ -5211,7 +5293,7 @@ knobs not yet audited here.
 | `autonomous.autoUpdate.enabled` | `LOOM_AUTO_UPDATE` | `false` | Autonomous self-update loop on/off (#4055). **Opt-in** (it rebuilds + restarts the daemon process). Exactly one loop per daemon, not a per-workspace fan-out. See [Autonomous self-update loop](#autonomous-self-update-loop-4055) below |
 | `autonomous.autoUpdate.intervalSecs` | `LOOM_AUTO_UPDATE_INTERVAL_SECS` | `900` | Cadence between staleness checks. Zero/invalid → default |
 | `autonomous.autoUpdate.settleSecs` | `LOOM_AUTO_UPDATE_SETTLE_SECS` | `600` | Settle window: wait this long after first observing a stale commit — resetting on every further commit — before rolling, so a burst of merges collapses into one roll. Zero/invalid → default |
-| `autonomous.transcriptIngest.enabled` | `LOOM_TRANSCRIPT_INGEST` | **`true`** | Periodic transcript token/cost ingestion into `~/.loom/activity.db` (#8059, flipped default-on by #8477). **The one `autonomous.*` knob that defaults ON against the FLAGS-OFF convention**, deliberately: it generates no work (a passive, ledgered, idempotent telemetry writer), while default-*off* silently destroyed data — Claude Code deletes transcripts after `cleanupPeriodDays` (default 30), so every host that never hand-set the env var lost its cost history permanently. Env `0`/`false`/`no`/`off` opts out; an unrecognized value falls through to config/default rather than silently disabling. **Restart required** — resolved once before the thread is spawned. See [`transcript-token-ingest.md`](transcript-token-ingest.md) |
+| `autonomous.transcriptIngest.enabled` | `LOOM_TRANSCRIPT_INGEST` | **`true`** | Periodic transcript token/cost ingestion into `~/.loom/activity.db` (#8059, flipped default-on by #8477). **Deliberately defaults ON against FLAGS-OFF**, like the `autonomous.eta.*` writers: it generates no work (a passive, ledgered, idempotent telemetry writer), while default-*off* silently destroyed data — Claude Code deletes transcripts after `cleanupPeriodDays` (default 30), so every host that never hand-set the env var lost its cost history permanently. Env `0`/`false`/`no`/`off` opts out; an unrecognized value falls through to config/default rather than silently disabling. **Restart required** — resolved once before the thread is spawned. See [`transcript-token-ingest.md`](transcript-token-ingest.md) |
 | `autonomous.transcriptIngest.intervalSecs` | `LOOM_TRANSCRIPT_INGEST_INTERVAL` | `900` | Seconds between ingestion passes. Zero/invalid → default. **Restart required** |
 | `autonomous.transcriptIngest.windowHours` | `LOOM_TRANSCRIPT_INGEST_WINDOW_HOURS` | `24` | How far back each pass looks; `0` = full history (the unchanged-file ledger keeps that cheap after the first pass). **Restart required** |
 | `autonomous.transcriptArchive.enabled` | `LOOM_TRANSCRIPT_ARCHIVE_ENABLED` | `false` | Scheduled raw-transcript archive pass (#8758, part 1 of #8714's G2): the daemon runs the existing `archive-transcripts` pass (#8494) on `intervalSecs` cadence, no manual CLI step. FLAGS-OFF like every other `autonomous.*` toggle — the pass consumes real disk and the derived data it backstops is already preserved by `transcriptIngest`. The ledger is keyed per `(transcript, sink)`; existing pre-#8758 rows migrate to `sink='local'` on first open. **Restart required** — resolved once before the thread is spawned. See [`transcript-token-ingest.md`](transcript-token-ingest.md) |
@@ -6178,9 +6260,23 @@ sustain counter, because a rate-limit rejection is unambiguous:
   *not* count against the quota — learns the real reset epoch; the cooldown
   runs to the latest exhausted resource's reset, clamped to `[60s, 3600s]`,
   falling back to `fallbackCooldownSecs` when the probe fails.
+- Reset evidence belongs to the credential that failed (#8997): the trip
+  lands first (no probe storms, no recursion), `X-RateLimit-*` headers from
+  the failing response win when captured, and otherwise the probe runs with
+  the failing call's workspace root / `gh` program / `GH_CONFIG_DIR`. A probe
+  reading *healthy* during a primary-limit failure (ambient user token, or a
+  new installation's false-full `/rate_limit`) or carrying an expired reset
+  is distrusted: the trip takes `fallbackCooldownSecs` and the reading is not
+  shown as the budget.
+- The dispatch path's `loom:building` label flip and lease comment, and
+  safehouse's forge lookups, report rate-limited failures too (#8997), so the
+  first authoritative failure trips the breaker; their probe runs off-thread.
 - While cooling, the work-finder, claim/quarantine reconciliation, epic
-  supervisor, and role-runner ticks **skip entirely** — zero gh calls, zero
-  doomed role spawns. Running sweeps are never touched.
+  supervisor, role-runner ticks and safehouse lookups (title enrichment,
+  merge verification, merge reconciliation) **skip entirely** — zero gh
+  calls, zero doomed role spawns; safehouse keeps narrating with what it has,
+  and an unverified completion is reconciled after release. Running sweeps
+  are never touched.
 - The breaker **releases itself** on the first tick past the reset. Edges are
   logged once each way and published as `daemon.rate_limit_breaker.state`
   events; `loom-daemon status` shows the phase, the tripping loop, the resume

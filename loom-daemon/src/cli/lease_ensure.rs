@@ -53,6 +53,21 @@
 //! fresh, it refuses outright when any *other* sweep holds a fresh lease
 //! (exit 4), and it only ever runs inside an agent session (see
 //! [`SessionEnv`]).
+//!
+//! ## Live output for the same claim (#10116)
+//!
+//! The same blind spot hides the agent's output: the daemon's `session.output`
+//! producer only follows runs it dispatched. So after the lease, `run` also
+//! asks `observability::session_output::attended` to start a tailer for this
+//! agent's own transcript when the agent is a subagent, or a top-level
+//! session running a `/loom:<role>` command that names this issue (an inline
+//! claim by an operator's main agent is refused, with the reason on stderr,
+//! #10129). That call is a few
+//! local file reads and a detached spawn, a silent no-op unless live output
+//! and an OTLP exporter are
+//! configured, and skipped outright for a daemon-dispatched child, whose
+//! output the daemon already publishes. Like the lease, it never fails or
+//! delays the claim.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -281,7 +296,41 @@ impl LeaseEnsureArgs {
     pub(crate) fn run(self) -> Result<()> {
         let outcome = self.ensure(&SessionEnv::from_process());
         eprintln!("lease ensure: {}", outcome.describe(self.issue));
+        self.attend_live_output(&outcome);
         Ok(())
+    }
+
+    /// Start this claim's attended live-output tailer (#10116). Independent
+    /// of whether the lease itself published: a declined publish (another
+    /// lease, a forge outage) says nothing about whether this agent's output
+    /// should be visible.
+    fn attend_live_output(&self, outcome: &Outcome) {
+        use loom_daemon::observability::session_output::attended;
+        // A daemon child is covered by the daemon's own producer, and with no
+        // agent session there is no transcript to follow.
+        if matches!(outcome, Outcome::AlreadyDispatched | Outcome::NoAgentSession) {
+            return;
+        }
+        let Ok(issue) = u32::try_from(self.issue) else {
+            return;
+        };
+        let request = attended::StartRequest {
+            issue,
+            role: None,
+            watch_pid: Some(self.watch_pid),
+            workspace: PathBuf::from(&self.workspace),
+            transcript: None,
+            from_offset: None,
+            // `0` means "unbounded" for the lease loop; a tailer is always capped.
+            max_age_secs: if self.max_age == 0 {
+                attended::DEFAULT_MAX_AGE_SECS
+            } else {
+                self.max_age
+            },
+            idle_exit_secs: attended::DEFAULT_IDLE_EXIT_SECS,
+        };
+        let live = attended::start(&request, &attended::AttendEnv::from_process());
+        eprintln!("lease ensure: live output: {}", live.describe(issue));
     }
 
     /// The whole decision, with the environment injected so it is testable.

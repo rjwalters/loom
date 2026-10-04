@@ -320,12 +320,51 @@ fn credential(operation: &str) -> Result<()> {
             }
         }
     }
+    let sources = crate::forge_egress::policy::PolicySources::from_process(None);
+    ensure_gh_helper_allowed(policy_governs_host(&sources)?)?;
     let mut helper = Command::new("gh").args(["auth", "git-credential", "get"])
         .stdin(Stdio::piped()).stdout(Stdio::inherit()).stderr(Stdio::null()).spawn()
         .context("forge authentication unavailable; provide an external gh profile or supported token environment")?;
     helper.stdin.take().unwrap().write_all(request.as_bytes())?;
     if !helper.wait()?.success() {
         bail!("forge authentication helper failed");
+    }
+    Ok(())
+}
+
+/// True when a forge-egress policy with `enforcement.api = required` governs
+/// this host (#10050): git credentials must then never come from `gh`.
+///
+/// Only an absent policy means "not governed". A present but unreadable or
+/// unparseable policy is an error (fail closed, per the `forge_egress::policy`
+/// contract), so a corrupt policy never re-enables the gh credential helper.
+pub(super) fn policy_governs_host(
+    sources: &crate::forge_egress::policy::PolicySources,
+) -> Result<bool> {
+    use crate::forge_egress::policy::{dig_str, resolve, Resolution};
+    match resolve(sources) {
+        Resolution::Unconfigured => Ok(false),
+        Resolution::Loaded(doc) => Ok(dig_str(&doc.data, &["enforcement", "api"]) == "required"),
+        Resolution::Unreadable {
+            candidate, error, ..
+        } => bail!(
+            "forge-egress policy {} is unreadable ({error}); refusing the gh credential helper \
+             (fail closed). Fix or remove the policy file, or supply GH_TOKEN/GITEA_TOKEN in \
+             the environment",
+            candidate.path.display()
+        ),
+    }
+}
+
+/// Fail closed on a policy-governed host instead of spawning
+/// `gh auth git-credential`.
+pub(super) fn ensure_gh_helper_allowed(governed: bool) -> Result<()> {
+    if governed {
+        bail!(
+            "forge-egress policy (enforcement.api=required) forbids the gh credential helper; \
+             use SSH (gh config git_protocol=ssh once gitOrigin.rollout is qualified) or a \
+             dedicated git credential, or supply GH_TOKEN/GITEA_TOKEN in the environment"
+        );
     }
     Ok(())
 }

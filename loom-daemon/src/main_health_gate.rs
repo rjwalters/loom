@@ -1912,7 +1912,9 @@ fn diff_touches_globs(
     // idempotent fetch. The caller already knows `main` moved, so this is not
     // extra work beyond what a real run would have paid anyway.
     let _ = Command::new("git")
-        .args(["fetch", GATE_REMOTE, GATE_BRANCH])
+        // `--` before the ref operand (#9106 mitigation B, #9479) — both names
+        // are crate constants here, so this is form, not a live exposure.
+        .args(["fetch", GATE_REMOTE, "--", GATE_BRANCH])
         .current_dir(repo_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2457,7 +2459,8 @@ pub fn prepare_workspace_to_origin_main(repo_root: &Path) -> PrepOutcome {
     }
 
     // 3. Fetch origin/main.
-    if let Err(e) = run_git(repo_root, &["fetch", GATE_REMOTE, GATE_BRANCH]) {
+    // `--` before the ref operand (#9106 mitigation B, #9479).
+    if let Err(e) = run_git(repo_root, &["fetch", GATE_REMOTE, "--", GATE_BRANCH]) {
         return PrepOutcome::Skip {
             class: UnevaluatedClass::GitFailure,
             reason: format!(

@@ -1141,7 +1141,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         },
         decline_cooldown_config.cooldown.as_secs(),
         decline_cooldown_config.warn_threshold,
-        loom_daemon::hard_exclusion::HARD_EXCLUSION_LABELS
+        loom_daemon::hard_exclusion::HARD_EXCLUSION_LABELS.as_slice()
     );
 
     // PR-less retry bound (#7972): resolve env > config > default for the
@@ -1548,6 +1548,12 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let _star_liveness = _work_finder_handle.is_some().then(|| {
         loom_daemon::star_liveness::task::spawn(sweep_workspace.clone(), Some(event_bus.clone()))
     });
+
+    let _fleet_alert = loom_daemon::fleet_alert::task::spawn(
+        sweep_workspace.clone(),
+        socket_path.clone(),
+        Some(event_bus.clone()),
+    ); // #10164
 
     // Idle-edge role triggering (#4364) is inert without the work-finder loop:
     // the work finder is the sole source of the per-root idle signal, so an

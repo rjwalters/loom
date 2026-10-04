@@ -19,7 +19,8 @@
 //!
 //! **Purity.** Nothing here touches the forge. [`FleetSnapshot::merge`] takes
 //! already-fetched [`PrHistory`] values, exactly as `pr_latency` does, and the
-//! `gh` reads live in `cli/eta_fleet_cmd.rs`. An estimator therefore still sees
+//! `gh` reads live in `cli/eta_fleet_cmd.rs` and the daemon's
+//! [`super::fleet_fetch`]. An estimator therefore still sees
 //! only `(snapshot, input)` and #9325's backtest harness can replay a fleet
 //! snapshot with no behaviour change to the estimator's core.
 //!
@@ -43,8 +44,30 @@
 //! [`FleetSnapshot::cursor`] bookmarks the newest forge activity already
 //! ingested, so a refresh enumerates only PRs updated since — typically a
 //! handful — and [`FleetSnapshot::merge`] replaces that PR's rows in place.
-//! The daemon itself never derives: it reads the cached file
-//! ([`load_all`]) and makes no forge call at all.
+//! The ETA pass only ever reads the cached file ([`load_all`]) and makes no
+//! forge call. Since #10263 the daemon does derive snapshots, but **off the
+//! tick**: its own hourly task (`observability::eta_fleet_refresh`, driving
+//! [`super::fleet_refresh`]) backfills and refreshes them through reader Apps,
+//! budgeted and resumable.
+//!
+//! # Stage episodes (#10218)
+//!
+//! Next to the samples, a snapshot holds every PR's **stage episodes**
+//! ([`super::episodes`]), derived from the same timelines with no further
+//! forge read: the split stage path (`merge_wait → merge_hold → merge_wait →
+//! merged`) a hold-aware heuristic fits. They are a separate field, never
+//! samples, so an older daemon still parses the file, and the pooled
+//! `merge_wait` samples every shipped heuristic reads are untouched. A snapshot
+//! written before #10218 gains episodes only as its PRs are re-read: run
+//! `eta fleet backfill` (not `refresh`) to rebuild the whole window.
+//!
+//! # Label-flag timeline (#10245)
+//!
+//! Beside the episodes, `flag_changes` records when each PR's six model flags
+//! ([`super::labels::pr_flags`]) changed ([`super::flag_timeline`]), from the
+//! same timelines and the same replay, so a fit reads the flags as they were
+//! at each past instant. Same compatibility rules as the episodes: not written
+//! when empty, so an older file keeps its id; rebuilt by `eta fleet backfill`.
 //!
 //! # Deliberately out of scope
 //!
@@ -57,7 +80,9 @@
 //! guess.
 
 use super::config::HistoryScopeMode;
+use super::episodes::{derive, input_from_pr_history, StageEpisode};
 use super::explanation::HistoryScope;
+use super::flag_timeline::{self, flag_changes_from_input, FlagChange};
 use super::history::{SampleSource, StageSample, StageSamples, VerdictSample};
 use super::journal::{censored_from_pr_history, entries_from_pr_history, JournalEntry};
 use super::{Provenance, Stage, WINDOW_DAYS};
@@ -212,6 +237,22 @@ pub struct FleetSnapshot {
     pub prs: Vec<u32>,
     /// Every sample, in canonical order.
     pub samples: Vec<FleetSample>,
+    /// Every PR's stage episodes (#10218), in canonical order
+    /// ([`StageEpisode::key`]).
+    ///
+    /// Deliberately not samples: an older daemon ignores this unknown field
+    /// and still parses the file, whereas a `merge_hold` [`FleetSample`] would
+    /// be an unknown `stage` and make it refuse the whole snapshot.
+    /// `serde(default)` reads files written before #10218, and an empty list
+    /// is not written, so such a file round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub episodes: Vec<StageEpisode>,
+    /// Every PR's label-flag timeline (#10245), sorted by `(pr_number, at)`:
+    /// an entry at its first label event, then one per change. Same
+    /// compatibility rules as `episodes`: a file without it parses, and an
+    /// empty list is not written, so such a file keeps its id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flag_changes: Vec<FlagChange>,
 }
 
 impl FleetSnapshot {
@@ -226,6 +267,8 @@ impl FleetSnapshot {
             cursor: None,
             prs: Vec::new(),
             samples: Vec::new(),
+            episodes: Vec::new(),
+            flag_changes: Vec::new(),
         };
         snapshot.seal();
         snapshot
@@ -246,14 +289,25 @@ impl FleetSnapshot {
     /// refuse.
     ///
     /// Samples older than [`RETENTION_DAYS`] before `as_of` are pruned, so the
-    /// cache file does not grow without bound.
+    /// cache file does not grow without bound. Episodes follow the same rules:
+    /// replaced per re-read PR, pruned by the last instant they describe. Flag
+    /// changes are replaced per re-read PR too; the prune keeps each PR's last
+    /// change before the floor (the mask in force there), and a PR that left
+    /// the census takes its flags with it.
     pub fn merge(&mut self, histories: &[PrHistory], as_of: DateTime<Utc>) {
         let usable: Vec<&PrHistory> = histories.iter().filter(|h| h.timeline_complete).collect();
         let replaced: BTreeSet<u32> = usable.iter().map(|h| h.number).collect();
         self.samples.retain(|s| !replaced.contains(&s.pr_number));
+        self.episodes.retain(|e| !replaced.contains(&e.pr_number));
+        self.flag_changes
+            .retain(|c| !replaced.contains(&c.pr_number));
         for h in &usable {
             self.samples
                 .extend(samples_from_pr_history(h, &self.repo, as_of));
+            let input = input_from_pr_history(h, &self.repo);
+            self.episodes.extend(derive(&input, as_of));
+            self.flag_changes
+                .extend(flag_changes_from_input(&input, as_of));
         }
         self.as_of = self.as_of.max(as_of);
         // `checked_sub_signed`, not `-`: chrono **panics** on overflow, and
@@ -265,6 +319,8 @@ impl FleetSnapshot {
             .checked_sub_signed(Duration::days(RETENTION_DAYS))
         {
             self.samples.retain(|s| s.observed_at >= floor);
+            self.episodes.retain(|e| e.last_at() >= floor);
+            self.flag_changes = flag_timeline::prune(std::mem::take(&mut self.flag_changes), floor);
         }
         let mut prs: BTreeSet<u32> = self.prs.iter().copied().collect();
         prs.extend(replaced);
@@ -272,8 +328,13 @@ impl FleetSnapshot {
         // by this snapshot; keeping it in the census would overstate coverage.
         self.prs = prs
             .into_iter()
-            .filter(|pr| self.samples.iter().any(|s| s.pr_number == *pr))
+            .filter(|pr| {
+                self.samples.iter().any(|s| s.pr_number == *pr)
+                    || self.episodes.iter().any(|e| e.pr_number == *pr)
+            })
             .collect();
+        let census: BTreeSet<u32> = self.prs.iter().copied().collect();
+        self.flag_changes.retain(|c| census.contains(&c.pr_number));
         self.seal();
     }
 
@@ -284,8 +345,22 @@ impl FleetSnapshot {
         self.schema = SNAPSHOT_SCHEMA.to_string();
         self.samples.sort_by_key(FleetSample::key);
         self.samples.dedup();
+        self.episodes.sort_by(|a, b| {
+            a.key()
+                .cmp(&b.key())
+                .then_with(|| a.digest_line().cmp(&b.digest_line()))
+        });
+        self.episodes.dedup();
+        self.flag_changes.sort();
+        self.flag_changes.dedup();
         self.cursor = self.samples.iter().map(|s| s.observed_at).max();
-        let lines: Vec<String> = self.samples.iter().map(FleetSample::digest_line).collect();
+        let mut lines: Vec<String> = self.samples.iter().map(FleetSample::digest_line).collect();
+        // #10218: episode lines only when there are episodes (each starts
+        // `episode|`, so it cannot read as a sample line), so a snapshot with
+        // none keeps exactly the id it had before episodes existed.
+        lines.extend(self.episodes.iter().map(StageEpisode::digest_line));
+        // #10245: the same rule for flag lines (each starts `flags|`).
+        lines.extend(self.flag_changes.iter().map(FlagChange::digest_line));
         let mut parts: Vec<&str> = vec!["loom.eta.fleet.snapshot"];
         let repo = self.repo.to_ascii_lowercase();
         let at = crate::telemetry::trace::instant(self.as_of);
@@ -306,6 +381,13 @@ impl FleetSnapshot {
     /// sweep-internal fact the forge cannot see, so a fleet-only history has no
     /// merge share and `finish-v1` refuses on it rather than inventing one.
     /// `land-v1`/`land-v2` are unaffected (`always_merge`).
+    ///
+    /// The episodes (#10218) are copied into [`StageSamples::episodes`], and
+    /// each `merge_hold` episode also becomes a `merge_hold` sample (completed
+    /// when it left for a stage or a merge, censored otherwise) so
+    /// `select(repo, MergeHold, …)` answers. The split `merge_wait` episodes
+    /// are deliberately **not** samples: `merge_wait` samples keep the pooled
+    /// definition every shipped heuristic reads.
     #[must_use]
     pub fn stage_samples(&self) -> StageSamples {
         let mut history = StageSamples {
@@ -322,7 +404,43 @@ impl FleetSnapshot {
                 history.verdicts.push(verdict);
             }
         }
+        for episode in self.episodes.iter().filter(|e| e.stage == Stage::MergeHold) {
+            let sample = StageSample {
+                repo: episode.repo.clone(),
+                stage: Stage::MergeHold,
+                duration_sec: episode.duration_sec(),
+                observed_at: episode.last_at(),
+                source: SampleSource::ForgeTimeline,
+                host: FORGE_HOST.to_string(),
+                worked: None,
+            };
+            if episode.completed() {
+                history.stages.push(sample);
+            } else {
+                history.censored.push(sample);
+            }
+        }
+        history.episodes = self.episodes.clone();
         history
+    }
+
+    /// Episode counts per stage name, `(completed, lower bounds)` — the
+    /// `eta fleet show` census of the split stage record (#10218). A lower
+    /// bound is an episode still open, cut short by a close, or unstaged.
+    #[must_use]
+    pub fn episode_counts_by_stage(&self) -> BTreeMap<String, (usize, usize)> {
+        let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for episode in &self.episodes {
+            let entry = counts
+                .entry(episode.stage.as_str().to_string())
+                .or_default();
+            if episode.completed() {
+                entry.0 += 1;
+            } else {
+                entry.1 += 1;
+            }
+        }
+        counts
     }
 
     /// Sample counts per stage name, completed and censored — the `eta fleet

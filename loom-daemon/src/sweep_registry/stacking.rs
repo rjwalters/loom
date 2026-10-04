@@ -171,36 +171,17 @@ impl SweepRegistry {
         if self.config.skip_label_flip {
             return LabelProbe::Absent;
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut cmd = Command::new(&gh);
-        cmd.arg("issue")
-            .arg("view")
-            .arg(issue.to_string())
-            .arg("--json")
-            .arg("labels")
-            .arg("--jq")
-            .arg(format!(r#"[.labels[].name] | index("{label}") != null"#));
-        // Scope the label probe to the registry's workspace so it resolves
-        // against the right repo in a multi-workspace daemon (#3937).
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        // Bounded so a wedged `gh` on the `ListSweeps` / `GetSweepStatus` read
-        // path (this runs inside `reap_liveness`) cannot block the registry read
-        // indefinitely (Issue #3973).
+        // Scoped to the registry's workspace (#3937) and counted as
+        // `stack.label_probe` (#10089); bounded so a wedged `gh` on the
+        // `ListSweeps` / `GetSweepStatus` read path (this runs inside
+        // `reap_liveness`) cannot block the registry read (Issue #3973).
         let timeout = reap_gh_timeout();
-        match output_with_timeout(cmd, timeout) {
+        let jq = format!(r#"[.labels[].name] | index("{label}") != null"#);
+        let issue_arg = issue.to_string();
+        let mut args = vec!["issue", "view", &issue_arg, "--json", "labels", "--jq", &jq];
+        let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();
+        args.extend(repo_flag.iter().map(String::as_str));
+        match self.gh_read("stack.label_probe", args) {
             Ok(Some(out)) if out.status.success() => {
                 if String::from_utf8_lossy(&out.stdout).trim() == "true" {
                     LabelProbe::Present

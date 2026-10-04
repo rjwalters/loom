@@ -1,0 +1,444 @@
+# pull-requests.toml — PR lifecycle, diffs, reviews and closing references.
+#
+# Still the required-coordination profile: Loom's review loop (Builder opens,
+# Judge publishes a comment verdict plus labels, Doctor fixes) is coordination,
+# not landing. The landing half — checks, protection, guarded merge — is in
+# ci-landing.toml.
+#
+# Note on reviews: Loom deliberately does NOT use `gh pr review --approve` /
+# `--request-changes`, because GitHub blocks self-review and Loom agents
+# routinely create and review the same PR. Reading OUTSIDE reviewers' formal
+# reviews and inline threads is still required. A replacement forge must
+# preserve that asymmetry rather than require formal self-approval.
+
+# --- pr-creation-discovery-state ---------------------------------------------
+
+[[operation]]
+id = "pr.create"
+group = "pr-creation-discovery-state"
+summary = "Open a PR for a pushed branch, or adopt the one that already exists."
+profile = "required-coordination"
+disposition = "required"
+class = "write"
+inputs = ["owner", "repo", "head", "base", "title", "body", "draft", "labels"]
+outputs = ["number", "html_url", "head_sha", "draft", "state"]
+required_fields = ["number", "head_sha"]
+actor = "agent"
+permissions = ["pull_requests:write", "contents:read"]
+pagination = "not-paginated"
+consistency = "read-after-write"
+idempotency = "marker-deduped"
+retry = "reread-then-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::pull-requests::pr-create"
+test_status = "declared"
+owner = "role-scripts"
+risk = "normal"
+github = { commands = [
+  "gh pr create",
+], routes = [
+  "POST repos/{owner}/{repo}/pulls",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "the #6074 adoption path: create-pr.sh must treat an already-open PR for the same head as success, which needs a reliable head-branch lookup, not an error-string match",
+]
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/create-pr.sh"
+
+[[operation]]
+id = "pr.list-by-head"
+group = "pr-creation-discovery-state"
+summary = "Find the open PR whose head is a given branch (claim and shadow guards)."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "head_branch", "state"]
+outputs = ["number", "state", "merged", "head_ref", "head_sha", "author"]
+required_fields = ["number", "state", "head_ref"]
+actor = "daemon"
+permissions = ["pull_requests:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::pull-requests::pr-list-by-head"
+test_status = "declared"
+owner = "daemon-sweep"
+risk = "high"
+high_risk_cases = ["competing-claims"]
+github = { commands = [
+  "gh pr list --head",
+], routes = [
+  "GET repos/{owner}/{repo}/pulls",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "an inconclusive read must stay distinguishable from `confirmed no PR` — #7863 regressed exactly by collapsing those two, and the open-PR leg of `forge check-claim` is a claim guard",
+]
+notes = "This is the OPEN_PR leg of the pre-claim guard: a false negative duplicates in-flight work."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_check_open_pr.rs"
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/lib/worktree-forge-pr-check.sh"
+
+[[operation]]
+id = "pr.view-state"
+group = "pr-creation-discovery-state"
+summary = "Read one PR's full decision state: head/base, draft, mergeability, labels."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "number"]
+outputs = [
+  "number",
+  "state",
+  "merged",
+  "draft",
+  "head_ref",
+  "head_sha",
+  "base_ref",
+  "mergeable",
+  "merge_state_status",
+  "labels",
+  "author",
+  "head_repository",
+]
+required_fields = ["number", "state", "head_sha", "mergeable"]
+actor = "daemon"
+permissions = ["pull_requests:read"]
+pagination = "not-paginated"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "reread-then-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::pull-requests::pr-view-state"
+test_status = "declared"
+owner = "daemon-landing"
+risk = "high"
+high_risk_cases = ["expected-head-merge", "cross-origin-identity"]
+github = { commands = [
+  "gh pr view --json",
+], routes = [
+  "GET repos/{owner}/{repo}/pulls/{number}",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "GitHub's mergeStateStatus and a null/stale `mergeable` are GitHub contracts to translate, not fields another forge necessarily exposes (#6104's cached-false recheck depends on the distinction)",
+  "fork/source-repository identity: a PR from a fork and one from a same-named branch in the primary repo must not normalize to the same identity",
+]
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_cmd.rs"
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/merge-pr.sh"
+
+# --- diff-commits-checkout ---------------------------------------------------
+
+[[operation]]
+id = "pr.diff-and-files"
+group = "diff-commits-checkout"
+summary = "Read a PR's complete diff and changed-file list for review."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "number"]
+outputs = ["filename", "status", "additions", "deletions", "patch"]
+required_fields = ["filename", "status"]
+actor = "agent"
+permissions = ["pull_requests:read", "contents:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::pull-requests::pr-diff-and-files"
+test_status = "declared"
+owner = "role-prompts"
+risk = "normal"
+github = { commands = [
+  "gh pr diff",
+], routes = [
+  "GET repos/{owner}/{repo}/pulls/{number}/files",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "truncation: a first-page file list silently hides changed files from a reviewer, which is a correctness failure, not a display one",
+]
+notes = "Native git can implement the diff half once the branch is fetched; the changed-file metadata (status, additions) is the forge-specific part."
+[[operation.callers]]
+kind = "role-prompt"
+path = "defaults/.claude/commands/loom/doctor.md"
+[[operation.callers]]
+kind = "role-prompt"
+path = "defaults/.claude/commands/loom/judge.md"
+
+[[operation]]
+id = "pr.commits-and-compare"
+group = "diff-commits-checkout"
+summary = "Read a PR's commits and compare two refs (tree-unchanged, blame)."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "number", "base", "head"]
+outputs = ["sha", "tree_sha", "message", "author", "ahead_by", "behind_by"]
+required_fields = ["sha"]
+actor = "daemon"
+permissions = ["contents:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::pull-requests::pr-commits-and-compare"
+test_status = "declared"
+owner = "daemon-forge"
+risk = "normal"
+github = { commands = [], routes = [
+  "GET repos/{owner}/{repo}/pulls/{number}/commits",
+  "GET repos/{owner}/{repo}/compare/{base}...{head}",
+  "GET repos/{owner}/{repo}/commits/{sha}/pulls",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "whether commit->PR reverse lookup exists; blame-issue.sh uses it to attribute a landed change to the PR that shipped it",
+]
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_tree_unchanged.rs"
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/blame-issue.sh"
+
+[[operation]]
+id = "git.fetch-branch"
+group = "diff-commits-checkout"
+summary = "Fetch and check out a PR branch into an authorized worktree."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["remote", "ref", "worktree"]
+outputs = ["head_sha"]
+required_fields = ["head_sha"]
+actor = "agent"
+permissions = ["contents:read"]
+pagination = "not-paginated"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::pull-requests::git-fetch-branch"
+test_status = "declared"
+owner = "daemon-sweep"
+risk = "normal"
+github = { commands = [
+  "gh pr checkout",
+  "git fetch",
+], routes = [] }
+platform_support = "documented"
+adapter_coverage = "complete"
+caller_integration = "complete"
+unknowns = []
+notes = "Plain Git over the forge's Git transport; provider-independent once credentials and the fork remote resolve. Recorded so the inventory does not imply every PR-local operation needs an API."
+[[operation.callers]]
+kind = "git-helper"
+path = "defaults/scripts/worktree.sh"
+
+# --- formal-reviews-inline-comments ------------------------------------------
+
+[[operation]]
+id = "review.list-formal"
+group = "formal-reviews-inline-comments"
+summary = "Read outside reviewers' formal reviews (APPROVED / CHANGES_REQUESTED)."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "number"]
+outputs = ["id", "state", "author", "submitted_at", "body"]
+required_fields = ["id", "state", "author", "submitted_at"]
+actor = "daemon"
+permissions = ["pull_requests:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::pull-requests::review-list-formal"
+test_status = "declared"
+owner = "role-scripts"
+risk = "normal"
+github = { commands = [], routes = [
+  "GET repos/{owner}/{repo}/pulls/{number}/reviews",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "whether a Gitea review state maps onto APPROVED/CHANGES_REQUESTED/COMMENTED without loss, and whether a dismissed review is distinguishable from a superseded one",
+]
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/lib/forge-helpers.sh"
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/check-review-feedback.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/eta/fleet_events_forge.rs"
+
+[[operation]]
+id = "review.thread-resolution"
+group = "formal-reviews-inline-comments"
+summary = "Read inline review threads with resolved/outdated state and cursor pagination."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "number", "cursor"]
+outputs = [
+  "thread_id",
+  "is_resolved",
+  "is_outdated",
+  "path",
+  "line",
+  "comments",
+  "author",
+]
+required_fields = ["thread_id", "is_resolved", "is_outdated"]
+actor = "daemon"
+permissions = ["pull_requests:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::pull-requests::review-thread-resolution"
+test_status = "declared"
+owner = "role-scripts"
+risk = "high"
+high_risk_cases = ["review-resolution"]
+github = { commands = [], routes = [
+  "GET repos/{owner}/{repo}/pulls/{number}/comments",
+  "GRAPHQL repository.pullRequest.reviewThreads(isResolved,isOutdated)",
+] }
+platform_support = "unknown"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "thread RESOLUTION state is GraphQL-only on GitHub; whether Gitea exposes resolved-vs-unresolved at all is the single largest known mapping gap (#9769 names it a known Loom thread-state gap)",
+  "cursor pagination semantics for threads, and whether an outdated thread is still returned",
+]
+notes = "Seeded first on purpose: an unresolvable `is this thread still open?` question makes the Doctor loop unable to tell a fixed finding from an unaddressed one."
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/lib/forge-helpers.sh"
+
+[[operation]]
+id = "review.publish-formal-verdict"
+group = "formal-reviews-inline-comments"
+summary = "Submit a formal APPROVE / REQUEST_CHANGES review as the acting identity."
+profile = "required-coordination"
+disposition = "unsupported"
+class = "write"
+inputs = ["owner", "repo", "number", "event", "body"]
+outputs = ["id", "state"]
+required_fields = []
+actor = "operator"
+permissions = ["pull_requests:write"]
+pagination = "not-paginated"
+consistency = "read-after-write"
+idempotency = "not-idempotent"
+retry = "no-auto-retry"
+version_support = { github = "0" }
+test_id = "forge-probe::pull-requests::review-publish-formal-verdict"
+test_status = "declared"
+owner = "role-prompts"
+risk = "normal"
+github = { commands = [
+  "gh pr review --approve",
+  "gh pr review --request-changes",
+], routes = [
+  "POST repos/{owner}/{repo}/pulls/{number}/reviews",
+] }
+platform_support = "unsupported"
+adapter_coverage = "none"
+caller_integration = "none"
+preflight = "fail-closed"
+unknowns = []
+# `formal-reviews-inline-comments` is non-waivable. The *review* requirement is
+# carried by the two required rows below; what is unsupported here is only the
+# formal self-approval API, which Loom deliberately does not use.
+requirement_carried_by = ["review.list-formal", "review.thread-resolution"]
+notes = "Recorded as explicitly UNSUPPORTED-by-design, not missing: GitHub blocks self-review and Loom agents routinely create and review the same PR, so Judge publishes a comment plus labels instead. A replacement forge that only offered formal self-approval would NOT satisfy this row — it must preserve the comment+label path. Classified here so a future adapter cannot `helpfully` wire it up."
+[[operation.callers]]
+kind = "role-prompt"
+path = "defaults/.claude/commands/loom/judge.md"
+
+# --- issue-closing-relationships ---------------------------------------------
+
+[[operation]]
+id = "pr.closing-issue-references"
+group = "issue-closing-relationships"
+summary = "Resolve which issues a PR closes, and which PRs closed an issue."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "number"]
+outputs = ["issue_numbers", "pr_numbers", "source"]
+required_fields = ["issue_numbers"]
+actor = "daemon"
+permissions = ["pull_requests:read", "issues:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::pull-requests::pr-closing-issue-references"
+test_status = "declared"
+owner = "daemon-landing"
+risk = "normal"
+github = { commands = [
+  "gh pr view --json closingIssuesReferences",
+  "gh pr list --json closingIssuesReferences",
+  "gh issue view --json closedByPullRequestsReferences",
+], routes = [
+  "GET repos/{owner}/{repo}/issues/{number}/timeline",
+  "GET repos/{owner}/{repo}/pulls",
+] }
+platform_support = "unknown"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "whether a provider resolves closing keywords server-side at all; #9769 records this as a known Loom gap and merge-pr.sh already carries a body-parsing fallback",
+  "negative and quoted text handling: a body saying `this does NOT close #N` or quoting `Closes #N` inside a code fence must not produce a closing edge",
+]
+notes = "`Part of #N` vs `Closes #N` is how a multi-PR landing keeps its parent issue open; a provider that cannot express the distinction forces the body-parsing fallback to become primary."
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/lib/forge-helpers.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/merge_pr_refs.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/eta/fleet_events_forge.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/eta_backtest_cases.rs"
+[[operation.callers]]
+kind = "role-prompt"
+path = "defaults/.claude/commands/loom/curator.md"

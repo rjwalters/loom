@@ -1,0 +1,61 @@
+# Fixture: merge_group is a trigger, but suites are skipped or unproven on it.
+name: CI
+on:
+  pull_request:
+  merge_group:
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: "backend: ['src/**']"
+
+  pr-gate:
+    name: PR Gate
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - run: make lint
+
+  labelled:
+    name: Labelled Suite
+    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'full-ci')
+    steps:
+      - run: make full
+
+  filtered:
+    name: Filtered Suite
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo test
+
+  pr-only-helper:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - run: echo helper
+
+  dependent:
+    name: Dependent Suite
+    needs: pr-only-helper
+    runs-on: ubuntu-latest
+    steps:
+      - run: make dependent
+
+  steps-gate:
+    name: Steps Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Always runs
+        run: make a
+      - name: Version guard
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        run: ./check --head "${{ github.event.pull_request.head.sha }}"

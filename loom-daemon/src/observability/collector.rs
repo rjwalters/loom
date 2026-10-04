@@ -846,7 +846,7 @@ pub(super) async fn resolve_repo_slug_cached(
 /// timeout, an empty/malformed answer) degrades to `None` — the caller drops
 /// the record rather than emitting a fabricated repo identity.
 async fn fetch_repo_slug(workspace_root: &Path) -> Option<String> {
-    let mut cmd = tokio::process::Command::new("gh");
+    let mut cmd = tokio::process::Command::new(crate::gh_invocation::gh_bin());
     cmd.arg("repo")
         .arg("view")
         .arg("--json")
@@ -1141,6 +1141,14 @@ async fn sample_host_health(
         .await
         .unwrap_or_default();
     let (swap_in_bytes_per_sec, swap_out_bytes_per_sec) = swap_sample_rates(&pressure);
+    // Export coverage (#10196): which exporters this process actually started
+    // and which record kinds those exporters carry, so a replay reader can
+    // tell "this host reported nothing" from "this host was not reporting".
+    // Misconfigured/never-started entries are excluded by `export_coverage`.
+    let (exporters, exported_kinds) = crate::telemetry::export_coverage(
+        &crate::observability::global_export_statuses(),
+        Utc::now(),
+    );
     HostHealthRecord {
         captured_at: Utc::now(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1168,6 +1176,8 @@ async fn sample_host_health(
             workspace_root,
         ),
         captainless_singleton_jobs: crate::fleet_captain::captainless_singleton_job_names(),
+        exported_kinds,
+        exporters,
         // Memory/pressure slice ("deferred vs killed vs timed out"): the
         // whole object is omitted when nothing was measured — never a flat
         // zero — the same absence contract `protection`/`admission_brake`

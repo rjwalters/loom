@@ -49,6 +49,8 @@ struct ClearedRuntimeEnv {
     prior: Vec<(&'static str, Option<String>)>,
     /// Held only so the empty profile root outlives the guard. Never read.
     _profile_root: tempfile::TempDir,
+    /// Crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964); released after `Drop`.
+    _profile_root_lock: crate::tokens_pool::profile_root_env::ProfileRootLock,
 }
 
 const ISOLATED_VARS: [&str; 10] = [
@@ -66,6 +68,7 @@ const ISOLATED_VARS: [&str; 10] = [
 
 impl ClearedRuntimeEnv {
     fn new() -> Self {
+        let profile_root_lock = crate::tokens_pool::profile_root_env::lock();
         let prior = ISOLATED_VARS
             .iter()
             .map(|key| {
@@ -79,6 +82,7 @@ impl ClearedRuntimeEnv {
         Self {
             prior,
             _profile_root: profile_root,
+            _profile_root_lock: profile_root_lock,
         }
     }
 }

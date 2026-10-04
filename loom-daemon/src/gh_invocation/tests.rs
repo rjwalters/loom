@@ -144,6 +144,31 @@ fn env_plan_scopes_gh_config_dir_by_root_then_target_owner() {
     assert_eq!(env_of(&unscoped, "GH_CONFIG_DIR"), None);
 }
 
+/// #10263: a reader-only read removes every token variable `gh` would prefer
+/// over the explicit `GH_CONFIG_DIR`, and leaves that config dir in place.
+#[test]
+fn without_token_env_removes_every_token_variable() {
+    let dir = Path::new("/tmp/reader-app-dir");
+    let plain = read_op(GhTarget::None)
+        .gh_config_dir(Some(dir))
+        .env_plan_with(None, None);
+    for key in TOKEN_ENV_VARS {
+        assert_eq!(env_of(&plain, key), None, "{key} untouched by default");
+    }
+    let stripped = read_op(GhTarget::None)
+        .gh_config_dir(Some(dir))
+        .without_token_env()
+        .env_plan_with(None, None);
+    assert_eq!(TOKEN_ENV_VARS.len(), 4);
+    for key in TOKEN_ENV_VARS {
+        assert_eq!(env_of(&stripped, key), Some(None), "{key} removed");
+    }
+    assert_eq!(
+        env_of(&stripped, "GH_CONFIG_DIR"),
+        Some(Some("/tmp/reader-app-dir".to_string()))
+    );
+}
+
 /// A recording stub `gh`: prints its argv and the facade-owned env.
 fn stub(dir: &Path) -> String {
     let path = dir.join("gh-stub");

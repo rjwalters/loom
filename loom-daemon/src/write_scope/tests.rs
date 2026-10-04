@@ -758,6 +758,7 @@ fn daemon_write_paths_are_scoped() {
         ("claim_reconciliation/verdict_invalidation.rs", Via(PASS, "verdict pass")),
         ("claim_reconciliation/review_conflict.rs", Via(PASS, "conflict pass")),
         ("claim_reconciliation/merge_sequence.rs", Via(PASS, "merge-sequence pass")),
+        ("claim_reconciliation/merge_sequence_stall.rs", Via(PASS, "merge-sequence stall escalation")),
         ("claim_reconciliation/pass_loop/building_heal.rs", Via(PASS, "heal pass")),
         (
             "forge_disable_auto_merge.rs",
@@ -775,6 +776,7 @@ fn daemon_write_paths_are_scoped() {
         ("cli/notify_cleared_blockers.rs", ShellVetted("merge-pr.sh")),
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
+        ("intake_reconcile.rs", Gated),
         (
             "sweep_registry/guards.rs",
             Via(DISPATCH, "claim flip + lease of a dispatched sweep"),
@@ -805,6 +807,7 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("cli/forge_action.rs", Gated),
         ("role_runner/launch.rs", Gated),
+        ("operator_decision/cli.rs", Gated),
         (
             "fleet/drain.rs",
             OperatorOnly("`fleet drain`: the operator's own worker, by name"),
@@ -830,9 +833,17 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("action names; writes go through dep_classify"),
         ),
         ("role_tick_telemetry.rs", NotAWrite("classifies commands, runs none")),
+        (
+            "gh_invocation/accounting.rs",
+            NotAWrite("classifies an invocation's argv for call accounting, runs none"),
+        ),
         ("role_tick_telemetry/targets.rs", NotAWrite("classifies commands, runs none")),
         ("terminal.rs", NotAWrite("tmux flags")),
         ("fleet_store/gh.rs", NotAWrite("store reads: its one method is `--method GET`")),
+        (
+            "merge_group_ci/eligibility.rs",
+            NotAWrite("read-only probe: its only calls are `api --method GET`"),
+        ),
         ("tokens_pool/check.rs", NotAWrite("Anthropic API, not the forge")),
         ("worker_spawn/egress_proxy/server.rs", NotAWrite("HTTP method check in a proxy")),
     ];

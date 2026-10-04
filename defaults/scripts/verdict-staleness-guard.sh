@@ -107,8 +107,9 @@
 # while the daemon did, so PRs #9541 and #9483 lost `loom:pr` here to a re-date
 # commit the daemon pass would have kept, on a host already running #9124.
 #
-# FAIL CLOSED: only a literal `EQUIVALENCE_KIND=<kind>` line suppresses the
-# invalidation. An absent binary, one predating the verb (clap exits non-zero
+# FAIL CLOSED, VISIBLY: only a literal `EQUIVALENCE_KIND=<kind>` line suppresses
+# the invalidation; when the verb could not answer, its one-line `Why:` (e.g. an
+# unfetchable head commit) is carried into the STALE REASON (#10134). An absent binary, one predating the verb (clap exits non-zero
 # with nothing on stdout), a `gh` outage, a non-GitHub forge, a shallow clone, a
 # missing git object, a `merge-tree` conflict, an unparsable compare, or either
 # kill switch all leave the answer empty and the verdict reads STALE exactly as
@@ -467,6 +468,7 @@ COMMENTS_JSON="$(gh api "repos/{owner}/{repo}/issues/$PR/comments" --paginate 2>
 # unauthenticated markers) and --anchor is suppressed, since anchoring an
 # unverified verdict to the current head would itself mint a FRESH marker.
 # requires-daemon: forge optional   Without the `trusted-comments` verb (an absent binary, or one predating #9548: clap exits 2 with nothing on stdout) every marker counts as absent, so the verdict reads UNVERIFIABLE with the cause named in REASON and --anchor does not post. No version floor on purpose: the degraded answer is the fail-safe one.
+RAW_COMMENTS_JSON="$COMMENTS_JSON"
 COMMENTS_JSON="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments <<<"$COMMENTS_JSON" 2>/dev/null)" && TRUSTED=1 || { COMMENTS_JSON='[]'; TRUSTED=0; }
 
 # One "<created_at>\t<sha>" line per matching marker, oldest first (matches
@@ -562,8 +564,8 @@ FRESH_REASON=""
 if [[ "${HEAD_SHA:0:${#MARKER_SHA}}" == "$MARKER_SHA" ]]; then
   FRESH_REASON="verdict $VERDICT_LABEL was rendered against the current head SHA"
 else
-  EQUIV_KIND="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-equivalent "$PR" "$MARKER_SHA" "$HEAD_SHA" 2>/dev/null | sed -n 's/^EQUIVALENCE_KIND=//p')"
-  if [[ -n "$EQUIV_KIND" ]]; then
+  EQUIV_KIND="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-equivalent "$PR" "$MARKER_SHA" "$HEAD_SHA" 2>"$GH_STDERR" | sed -n 's/^EQUIVALENCE_KIND=//p')"
+  EQUIV_WHY="$(sed -n 's/.* Why: //p' "$GH_STDERR" | head -n 1)"; if [[ -n "$EQUIV_KIND" ]]; then
     FRESH_REASON="verdict $VERDICT_LABEL was rendered against $MARKER_SHA and head is now $HEAD_SHA, but the change this PR makes is unchanged across the move (equivalence kind: $EQUIV_KIND) — so the verdict still describes it (#9576, #9416). CI still re-runs against $HEAD_SHA; only the review carries over."
   fi
 fi
@@ -575,7 +577,7 @@ fi
 
 # --- Step 5: STALE — optionally clear + re-queue -----------------------------
 CLEARED=0
-REASON="verdict $VERDICT_LABEL was rendered against $MARKER_SHA but head is now $HEAD_SHA"
+REASON="verdict $VERDICT_LABEL was rendered against $MARKER_SHA but head is now $HEAD_SHA${EQUIV_WHY:+; equivalence could not be checked, failing closed (#10134): $EQUIV_WHY}"
 
 if [[ "$CLEAR" -eq 1 ]]; then
   HOLD_LABEL="$(hold_label)"
@@ -617,18 +619,16 @@ if [[ "$CLEAR" -eq 1 ]]; then
       <<<"$COMMENTS_JSON" 2>/dev/null || echo 0)"
 
     if [[ "${ALREADY_ANNOUNCED:-0}" -eq 0 ]]; then
-      gh pr comment "$PR" --repo "$WRITE_REPO" --body "$STALE_MARKER
-**Stale review verdict cleared — head SHA moved**
-
-This PR's \`$VERDICT_LABEL\` verdict was rendered against \`$MARKER_SHA\`, but the current head is \`$HEAD_SHA\`. A review verdict is a statement about a specific tree, so it does not survive a rebase, a force-push, or new commits.
-
-- Verdict cleared: \`$VERDICT_LABEL\` (recorded for \`$MARKER_SHA\`)
-- Returned to the review queue: \`loom:review-requested\` (current head \`$HEAD_SHA\`)
-
-Judge will re-evaluate the tree that is actually here now. No judgment about the new tree is implied either way — the old verdict simply no longer describes it.
-
----
-*Automated by verdict-staleness-guard.sh (#5686)*" >/dev/null 2>"$GH_STDERR" || {
+      # #9709: the notice is rendered by the daemon's own template (`forge
+      # verdict-stale-notice`), so the two stale-clear paths cannot drift. It is
+      # fed the RAW listing: when a newer marker was dropped as untrusted, the
+      # notice names its login + author_association and forge.trustedCommenters
+      # instead of asserting a head move that may not have happened.
+      # requires-daemon: forge optional   Without the `verdict-stale-notice` verb (a binary predating #9709: clap exits non-zero with nothing on stdout) the one-line fallback below is posted — same stale marker, so dedup holds; only the #9709 attribution is lost. No version floor: the clear itself is unaffected.
+      STALE_BODY="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-stale-notice --label "$VERDICT_LABEL" --marker-sha "$MARKER_SHA" --head-sha "$HEAD_SHA" <<<"$RAW_COMMENTS_JSON" 2>/dev/null)"
+      [[ "$STALE_BODY" == "$STALE_MARKER"* ]] || STALE_BODY="$STALE_MARKER
+**Stale review verdict cleared — head SHA moved**: \`$VERDICT_LABEL\` was rendered against \`$MARKER_SHA\`, head is now \`$HEAD_SHA\`; returned to \`loom:review-requested\`. *Automated by verdict-staleness-guard.sh (#5686)*"
+      gh pr comment "$PR" --repo "$WRITE_REPO" --body "$STALE_BODY" >/dev/null 2>"$GH_STDERR" || {
         echo "ERROR: failed to post stale-verdict comment on PR #$PR: $(cat "$GH_STDERR" 2>/dev/null)" >&2
         emit "STALE" "$REASON; comment failed, labels left untouched" \
           "$HEAD_SHA" "$VERDICT_LABEL" "$MARKER_SHA" 0

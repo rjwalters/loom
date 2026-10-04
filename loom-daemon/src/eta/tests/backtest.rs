@@ -13,7 +13,7 @@ use crate::telemetry::{
 use chrono::Duration;
 use std::collections::BTreeMap;
 
-fn record(
+pub(super) fn record(
     issue: u32,
     repo: &str,
     phases: &[(&str, i64)],
