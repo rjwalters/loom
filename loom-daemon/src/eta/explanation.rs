@@ -525,6 +525,41 @@ pub struct Features {
     /// The repo had a `pr-open-skip` row on the last dispatch plan.
     #[serde(default)]
     pub repo_pr_open_skip: Option<bool>,
+    // Queue friction (#10193). Additive and `serde(default)`, like
+    // `stage_marks`: a payload logged before them still parses (with `None`,
+    // and no omission entry), so `eta-explanation/v1` is not bumped. Each is
+    // read before `as_of` and carries the instant it was read, so an offline
+    // model can check it was knowable at the estimate (#10193 rule 1).
+    /// Open PRs in the repo (every open PR, not only Loom's).
+    #[serde(default)]
+    pub repo_open_prs: Option<u32>,
+    /// Whether the repo's ready backlog is frozen behind the open-PR guard
+    /// (`pr-open-skip`) on the work finder's last tick.
+    #[serde(default)]
+    pub repo_pr_open_lockout: Option<bool>,
+    /// The repo's typical (median) recent pull-request CI run duration, from
+    /// runs that had finished before `as_of`.
+    #[serde(default)]
+    pub repo_ci_typical_duration_sec: Option<i64>,
+    /// When the repo-level friction above was read (at or before `as_of`).
+    #[serde(default)]
+    pub repo_friction_observed_at: Option<DateTime<Utc>>,
+    /// The PR head's CI: `passing`, `failing`, `pending` or `none`.
+    #[serde(default)]
+    pub pr_ci_status: Option<String>,
+    /// Whether the PR is behind its base branch.
+    #[serde(default)]
+    pub pr_behind_main: Option<bool>,
+    /// Whether the PR has merge conflicts.
+    #[serde(default)]
+    pub pr_merge_conflict: Option<bool>,
+    /// When the PR-level friction above was read (at or before `as_of`).
+    #[serde(default)]
+    pub pr_friction_observed_at: Option<DateTime<Utc>>,
+    /// Whether a hold label (an operator / merge-risk hold, `loom:blocked`,
+    /// a park) is on the item: explicit, not only inside `labels`.
+    #[serde(default)]
+    pub operator_hold: Option<bool>,
 }
 
 /// Why a feature is null.
@@ -538,7 +573,7 @@ pub struct FeatureOmitted {
 
 impl Features {
     /// Every feature name, in field order.
-    pub const NAMES: [&'static str; 47] = [
+    pub const NAMES: [&'static str; 56] = [
         "labels",
         "complexity_marker",
         "points_marker",
@@ -586,6 +621,15 @@ impl Features {
         "open_prs_repo",
         "fleet_scope_repos",
         "repo_pr_open_skip",
+        "repo_open_prs",
+        "repo_pr_open_lockout",
+        "repo_ci_typical_duration_sec",
+        "repo_friction_observed_at",
+        "pr_ci_status",
+        "pr_behind_main",
+        "pr_merge_conflict",
+        "pr_friction_observed_at",
+        "operator_hold",
     ];
 
     /// `omitted` plus a `reason` entry for every null feature it does not

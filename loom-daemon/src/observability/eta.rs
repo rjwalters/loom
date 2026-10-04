@@ -781,6 +781,22 @@ pub(super) async fn record(
     .unwrap_or_default();
 
     let ready = ready_rows(slug_cache).await;
+    // Queue friction (#10193), read BEFORE `now`: every reading is then
+    // knowable at the estimates this pass makes.
+    let (book, tracked) = lock()
+        .as_ref()
+        .map(|s| {
+            let repos = s.tracker.item_keys().into_iter().map(|k| k.repo).collect();
+            (s.tracker.friction.clone(), repos)
+        })
+        .unwrap_or_default();
+    let friction_repos = repos
+        .iter()
+        .map(|(root, slug, prs, _)| {
+            (root.clone(), slug.clone(), prs.iter().map(|p| p.number).collect())
+        })
+        .collect();
+    let book = super::eta_friction::refresh(book, friction_repos, tracked, slug_cache).await;
     let now = Utc::now();
     let mut effects = Vec::new();
     let mut checks = Vec::new();
@@ -798,6 +814,7 @@ pub(super) async fn record(
             state.tracker.pending(),
         );
         state.repo_ids.extend(repo_ids);
+        state.tracker.friction = book;
         // Before the listings, so a departed ready item's `issues/{n}` read
         // is offered in this same pass.
         if let Some((rows, plan)) = &ready {

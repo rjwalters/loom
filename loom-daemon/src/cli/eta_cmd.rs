@@ -75,6 +75,9 @@ pub(crate) enum EtaCommand {
         #[command(subcommand)]
         command: super::eta_fleet_cmd::FleetCommand,
     },
+    /// Point-in-time walk-forward evaluation on logged estimate/outcome
+    /// pairs (#10193): a heuristic's logged estimates vs a fitted model.
+    Offline(super::eta_offline_cmd::EtaOfflineArgs),
 }
 
 impl EtaCommand {
@@ -86,6 +89,7 @@ impl EtaCommand {
             EtaCommand::List(args) => args.run(),
             EtaCommand::Promote(args) => args.run(),
             EtaCommand::Fleet { command } => command.run(),
+            EtaCommand::Offline(args) => args.run(),
         }
     }
 }
