@@ -349,9 +349,10 @@ tracker's, which loads the file (below).
 A **fitted** heuristic (the first is `land-2026-10-04-twin-otter`, #10222)
 cannot fit inside the estimator, which may read only its two arguments.
 Fitting is a separate, pure step (`eta::fit`, #10221) whose output — one
-content-addressed JSON file per cutoff `T` — the registry loads. Building the
-training rows from fleet history, the `loom-daemon eta fit` CLI and the daily
-refit are #10245; until it lands nothing writes these files on a live host.
+content-addressed JSON file per cutoff `T` — the registry loads. The training
+rows come from the cached fleet snapshots, and the files are written by
+`loom-daemon eta fit` and by the daemon's daily refit (#10245; see
+[below](#training-rows-the-cli-and-the-daily-refit-10245)).
 
 **What is fitted**, on rows knowable before `T` over the 14 days before it:
 
@@ -421,6 +422,96 @@ both sides call on the raw `ModelInputs`.
   `load_latest(root, before)` returns the newest fit whose `as_of` is strictly
   before `before`.
 - `aft` is `null` when no stage passes its gate.
+- **`window.data_through`** (fleet fits only; absent otherwise) is the data
+  horizon `H` the rows were censored at (below). A value well before `as_of`
+  means the snapshots were stale.
+
+### Training rows, the CLI and the daily refit (#10245)
+
+**Source.** Rows come only from the fleet snapshots
+(`.loom/state/eta/fleet/*.json`): their stage episodes (#10218) and their
+label-flag timeline. The host-local stage journal is not a source, because
+its `observed_at` is not a knowability stamp. The builder is
+`eta::fit::rows::build`. It is pure, and its output does not depend on the
+order of snapshots, episodes or flag changes.
+
+**Knowability and the horizon.**
+
+- A fact at instant `a` is usable at row instant `t` iff `a + 120 s < t`. For
+  an episode, that is `StageEpisode::view_at(t − 120 s)`.
+- Labels are censored at the data horizon `H = min(T − 120 s, oldest
+  snapshot as_of)`, not at `T`. A merge in `[T − 120 s, T)` is not knowable
+  at `T`, and a stale snapshot has observed nothing after its `as_of`.
+
+**Rows.**
+
+- Row instants are `t = W + k·30 min` for `t < H`, with `W = T − 14 d`.
+- The subjects at `t` are the PRs with an episode in `review_wait`, `doctor`,
+  `merge_wait` or `merge_hold` open at `t − 120 s`. The mapping is
+  `FitStage::from_stage`, which serving also uses.
+- **Queue features** come from the one shared `queue_features` call:
+  - The roster is every PR open in an episode, known at entry + 120 s.
+  - The log has one event per episode end, known at end + 120 s. A merge is
+    one `merge` event, never an exit plus a merge. Every other end is an
+    `exit` of the episode's stage, so `merge_wait → merge_hold` counts as a
+    `merge_wait` exit.
+- **`age_h`** is measured within the current (split) episode.
+- **`rework`** counts the PR's entries into `doctor` (Judge rejections)
+  knowable at `t`, including the current one.
+- **Flags** are the last flag change before `t − 120 s`.
+- **Exit label**:
+  - `None` once `t + 30 min ≥ H`;
+  - otherwise whether the open episode ended by `t + 30 min`. An end in
+    `[t − 120 s, t)` counts, as at serve time.
+- **Merge label**, in hours: time to a merge before `H` (an event), else to
+  a close before `H` (censored), else to `H` (censored).
+- Rows are dropped and counted in two cases:
+  - a needed queue feature is missing (`rows_dropped_missing`);
+  - the PR has episodes but no flag timeline (`rows_dropped_no_flags`).
+
+**Dwells.**
+
+- There is one dwell per fit-stage episode that entered before `H` and had
+  not ended before `W`, with delayed entry `max(0, W − entered)`.
+- Ends map as follows:
+  - a `left` for a fit stage is `next`;
+  - a merge is `merged`, and a close is `closed`;
+  - `unstaged`, a `left` for a non-fit stage, and anything still running at
+    `H` are `censored`.
+
+**The label-flag timeline.**
+
+- `FleetSnapshot.flag_changes` stores when each PR's six model flags changed.
+  The flags are defined by `eta::labels::pr_flags`, the one label → flag
+  definition, which serving also uses:
+  - `op_hold`: any `merge_hold` label;
+  - `sequenced`, `starred` (`loom:operator-priority`), `conflict`,
+    `ci_fail` and `blocked`: one label each.
+- It is derived in `merge` by the same `(at, seq)` replay as the episodes.
+- Each PR gets an entry at its first label event, even with no flag set, then
+  one per change.
+- The prune keeps each PR's last change before the floor, so the state in
+  force at the floor survives.
+- It is not written when empty, so an older snapshot keeps its id. **A
+  snapshot written before #10245 has no timeline, so its PRs' rows are
+  dropped. Run `loom-daemon eta fleet backfill` (not `refresh`) for each repo
+  to rebuild it.**
+
+**The daily refit.**
+
+- It is a dedicated daemon task (`observability::eta_fit`) that runs beside
+  the ETA tracker, so it exists only where observability runs.
+- Its first check is 10 min after start, then every hour.
+- It fits at cutoff `T` = today 00:00Z, at most once per UTC day:
+  - when every snapshot is as of `T` or later;
+  - otherwise 6 h after `T`, with whatever is there.
+- Today's file makes later checks a no-op, whichever process wrote it.
+- It makes no forge call and never refreshes the snapshots. Keeping them
+  fresh (`eta fleet refresh`) is an operator or cron step.
+- Failures and panics are logged at `warn` and retried on the next check.
+- Writes go to `.loom/state/eta/fit/fit-<T>.json`, and the directory is
+  pruned to the newest **14** `fit-*.json` files.
+- It is controlled by `autonomous.eta.fit.enabled` ([Configuration](#configuration)).
 
 **Loading and reloading** (#10243). A heuristic may not read a file, so the
 file is loaded when the **registry** is built, and the fitted heuristic holds
@@ -947,12 +1038,12 @@ items which are not in it at all.
 
 ## CLI (`loom-daemon eta`)
 
-Seven subcommands. All are read-only except `eta promote --apply`, which writes
-one config key, and `eta fleet backfill|refresh`, which writes only the
-snapshot cache; nothing here writes an estimate to the journal or telemetry —
-that is the tracker's job, described above. Every subcommand but `offline`
-(which reads only its `--input`) also accepts `--repo-root PATH` (default: the
-current directory).
+Eight subcommands. All are read-only except `eta promote --apply`, which writes
+one config key, `eta fleet backfill|refresh`, which writes only the snapshot
+cache, and `eta fit`, which writes only a coefficient file. Nothing here writes
+an estimate to the journal or telemetry — that is the tracker's job, described
+above. Every subcommand but `offline` (which reads only its `--input`) also
+accepts `--repo-root PATH` (default: the current directory).
 
 - **`loom-daemon eta backfill [--repo OWNER/NAME] [--limit N] [--dry-run]`** —
   seeds `.loom/logs/eta-stage-samples.jsonl` from `pr-latency`'s own
@@ -1020,6 +1111,20 @@ current directory).
     form to hand another host.
   - `--as-of` pins the instant the snapshot describes; two hosts that pass the
     same `--as-of` against the same forge state get byte-identical files.
+- **`loom-daemon eta fit [--as-of RFC3339] [--out PATH] [--dry-run] [--json]`**
+  — fits the `eta-fit/v1` file from the cached fleet snapshots at cutoff
+  `--as-of` (default: today 00:00Z) and writes
+  `.loom/state/eta/fit/fit-<T>.json`, pruning that directory to the newest 14
+  files (#10245). It uses the same runner as the daily refit and makes no
+  forge call.
+  - Two runs at the same cutoff on the same snapshots write a byte-identical
+    file with the same `id`.
+  - `--out` writes elsewhere and prunes nothing.
+  - `--dry-run` fits and reports but writes nothing.
+  - `--json` prints the report: per-stage rows, exits and merge events,
+    `dwells`, `rows_dropped_missing`, `rows_dropped_no_flags`,
+    `data_through`, `id` and `path`.
+  - It fails, naming `eta fleet backfill`, when no snapshot is cached.
 
 - **`loom-daemon eta offline --input PATH --now RFC3339 [--baseline land-v2] [--train-days 14] [--selection-folds 2] [--reported-folds 2] [--margin-secs 120] [--resamples 1000] [--export PATH] [--json]`**
   — the #10193 offline comparison on **logged** `eta.estimate` /
@@ -1106,6 +1211,7 @@ of what is on disk and never needs a refetch.
 | `dryRun` | `LOOM_ETA_DRY_RUN` | `false`: compute, journal and log `eta: would emit …` lines, enqueue nothing |
 | `refreshSecs` | `LOOM_ETA_REFRESH_SECS` | `300` (floor 60) |
 | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
+| `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245). It runs only with `enabled` too, is read at start, and is a no-op until a fleet snapshot is cached |
 | `current.start` / `current.finish` / `current.land` | none | `start-v1` / `finish-v1` / `land-v1` |
 
 `historyScope` is one of:
