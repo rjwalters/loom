@@ -384,6 +384,34 @@ fn no_item_fact_falls_back_to_not_collected() {
     for e in emitted.iter().map(|e| &e.explanation) {
         for name in ITEM_NAMES {
             assert_ne!(reason(e, name), Some("not_collected"), "{name} on {}", e.subject.issue);
+            // One reason per feature: the backstop never adds a second.
+            let n = e.features_omitted.iter().filter(|o| o.name == name).count();
+            assert!(n <= 1, "{name} on {} has {n} reasons", e.subject.issue);
         }
     }
+}
+
+#[test]
+fn an_explanation_recorded_before_the_item_facts_still_parses() {
+    // The golden predates #10231: its item features are null with the
+    // `not_collected` backstop. The new reasons are additive strings, so it
+    // parses and re-serializes unchanged, and a new explanation round-trips.
+    let old: serde_json::Value = serde_json::from_str(super::EXPLANATION_GOLDEN).unwrap();
+    let parsed: Explanation = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(reason(&parsed, "urgent"), Some("not_collected"));
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), old);
+
+    let mut h = H::new();
+    h.queue(row(10, facts(1, Some(stamp(-60)), Some("tier:sonnet"))), -30, 0);
+    let e = h.explain(10, Kind::Start, 60);
+    let json = serde_json::to_string(&e).unwrap();
+    let back: Explanation = serde_json::from_str(&json).unwrap();
+    assert_eq!(reason(&back, "urgent"), Some("deprecated"));
+    assert_eq!(feats(&back).issue_age_sec, Some(120));
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        value["features"].get("urgent"),
+        old["features"].get("urgent"),
+        "urgent keeps its pre-#10231 serialization"
+    );
 }
