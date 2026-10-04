@@ -106,6 +106,7 @@ pub mod collector;
 pub mod daemon_event;
 pub mod endpoint_policy;
 pub mod eta;
+pub mod eta_fit;
 mod eta_friction;
 pub mod eta_snapshot;
 pub mod exporter;
@@ -1148,6 +1149,8 @@ pub fn spawn_task(
         host_id.clone(),
         workspace_pool.clone(),
     ));
+    // The daily ETA refit (#10245): its own task, never the ETA pass's lock.
+    ops_handles.extend(eta_fit::spawn_task(workspace_root.clone()));
     // Live agent output (#9764): `session.output` is OTLP-only too, and
     // additionally opt-in — `spawn_task` returns `None` unless
     // `observability.liveOutput.enabled` is set. Registered over the

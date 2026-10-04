@@ -36,6 +36,7 @@ pub(crate) mod dispatch_backoff;
 mod duplicate_scan;
 mod eta_backtest_render;
 mod eta_cmd;
+mod eta_fit_cmd;
 mod eta_fleet_cmd;
 mod eta_fleet_events_cmd;
 mod eta_offline_cmd;
