@@ -2,9 +2,10 @@
 //!
 //! One log record per tick. The **body** is the record's JSON, so ClickHouse
 //! can `JSONExtract` the ranked candidate list (see `telemetry-schema.md` for
-//! the rank query). The only attribute is `loom.role`, already on the
-//! collector's `keep_keys` allowlist, so no collector change is needed. The
-//! record time is the tick's `ended_at`.
+//! the rank query). The attributes are `loom.kind` (`pick.decision`, the key
+//! the SigNoz queries filter on, #9881) and `loom.role`; both are already on
+//! the collector's `keep_keys` allowlist, so no collector change is needed.
+//! The record time is the tick's `ended_at`.
 
 use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
@@ -20,7 +21,10 @@ pub(super) fn log_parts(
     let TelemetryRecord::PickDecision(r) = record else {
         return None;
     };
-    let attributes = vec![kv_string("loom.role", r.role.clone())];
+    let attributes = vec![
+        kv_string("loom.kind", record.kind().to_string()),
+        kv_string("loom.role", r.role.clone()),
+    ];
     let body = serde_json::to_string(r).unwrap_or_default();
     Some(("pick.decision", SeverityNumber::Info, nanos(r.ended_at), attributes, body))
 }
@@ -64,6 +68,11 @@ mod tests {
         let body = format!("{:?}", log.body);
         assert!(body.contains("candidates_total"), "{body}");
         assert!(log.attributes.iter().any(|a| a.key == "loom.role"));
-        assert!(log.attributes.iter().any(|a| a.key == "loom.kind"));
+        let kind = log
+            .attributes
+            .iter()
+            .find(|a| a.key == "loom.kind")
+            .expect("loom.kind");
+        assert!(format!("{:?}", kind.value).contains("pick.decision"), "{kind:?}");
     }
 }

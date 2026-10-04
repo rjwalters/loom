@@ -8,7 +8,8 @@ of that, and it cannot be reconstructed afterwards.
 
 OTLP-only log record (`otlp: Logs`, `native: false`), envelope
 `schema_version: 12` (`NEW_KIND_SCHEMA_VERSION`). The log **body** is the
-record's JSON; the only attribute is `loom.role` (already on the collector's
+record's JSON; the attributes are `loom.kind` (`pick.decision`, which the
+queries below filter on) and `loom.role` (both already on the collector's
 `keep_keys`, so no collector change). Implementation:
 `telemetry/kinds/pick_decision.rs` (payload, caps, reason set),
 `observability/pick_decision.rs` (builders and emitters),
