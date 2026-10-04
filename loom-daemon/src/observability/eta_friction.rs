@@ -129,19 +129,18 @@ fn read_pr(root: &Path, slug: &str, number: u32) -> PrFriction {
 }
 
 /// Each repo's `pr-open-skip` lockout on the work finder's last tick: locked
-/// when any ready row of it was refused by the open-PR guard. A repo whose
+/// when any ready row of it was held by the open-PR guard. A repo whose
 /// ready listing failed on that tick is unknown, never "unlocked".
 async fn lockouts(slug_cache: &mut HashMap<String, String>) -> Option<Tick> {
     let summary = crate::work_finder::last_tick_summary()?;
-    let mut locked: BTreeMap<String, bool> = BTreeMap::new();
+    let mut rows = Vec::with_capacity(summary.queue.len());
     for row in &summary.queue {
-        let Some(slug) = super::collector::resolve_repo_slug_cached(slug_cache, &row.repo).await
-        else {
-            continue;
-        };
-        *locked.entry(slug.to_ascii_lowercase()).or_default() |=
-            row.disposition == QueueDisposition::OpenPr;
+        if let Some(slug) = super::collector::resolve_repo_slug_cached(slug_cache, &row.repo).await
+        {
+            rows.push((slug, row.disposition));
+        }
     }
+    let locked = fold_lockouts(rows);
     let mut failed = BTreeSet::new();
     for root in &summary.listing_failed {
         if let Some(slug) = super::collector::resolve_repo_slug_cached(slug_cache, root).await {
@@ -149,6 +148,26 @@ async fn lockouts(slug_cache: &mut HashMap<String, String>) -> Option<Tick> {
         }
     }
     Some((locked, failed))
+}
+
+/// Whether a ready row's disposition means the open-PR guard held it: the
+/// refusal itself (`OpenPr`) or the backoff window that refusal arms
+/// (`OpenPrBackoff`) — dispatch stays held through the whole window.
+fn held_by_open_pr_guard(disposition: QueueDisposition) -> bool {
+    matches!(disposition, QueueDisposition::OpenPr | QueueDisposition::OpenPrBackoff)
+}
+
+/// Fold one tick's `(slug, disposition)` ready rows into locked-per-repo
+/// (lowercased slugs): locked when any of the repo's rows was held by the
+/// open-PR guard.
+fn fold_lockouts(
+    rows: impl IntoIterator<Item = (String, QueueDisposition)>,
+) -> BTreeMap<String, bool> {
+    let mut locked: BTreeMap<String, bool> = BTreeMap::new();
+    for (slug, disposition) in rows {
+        *locked.entry(slug.to_ascii_lowercase()).or_default() |= held_by_open_pr_guard(disposition);
+    }
+    locked
 }
 
 /// One work-finder tick's lockouts: locked per repo, and the repos whose
@@ -219,7 +238,24 @@ pub(super) async fn refresh(
 
 #[cfg(test)]
 mod tests {
-    use super::{lockout_reading, Tick};
+    use super::{fold_lockouts, lockout_reading, Tick};
+    use crate::types::QueueDisposition as Qd;
+
+    /// The lockout holds through the open-PR guard's backoff window and
+    /// clears only once the repo's ready rows are genuinely unheld.
+    #[test]
+    fn lockout_holds_through_open_pr_backoff_then_clears() {
+        let reading = |rows: Vec<Qd>| {
+            let locked = fold_lockouts(rows.into_iter().map(|d| ("A/Repo".to_string(), d)));
+            let tick: Tick = (locked, Default::default());
+            lockout_reading(Some(&tick), "a/repo")
+        };
+        assert_eq!(reading(vec![Qd::OpenPr]), Ok(true));
+        assert_eq!(reading(vec![Qd::OpenPrBackoff]), Ok(true));
+        assert_eq!(reading(vec![Qd::Dispatched, Qd::OpenPrBackoff]), Ok(true));
+        assert_eq!(reading(vec![Qd::Dispatched]), Ok(false));
+        assert_eq!(reading(vec![Qd::DispatchBackoff]), Ok(false));
+    }
 
     #[test]
     fn lockout_reading_tells_unlocked_from_nothing_ready() {

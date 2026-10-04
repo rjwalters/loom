@@ -361,7 +361,7 @@ in `truncated`.
 **Queue-friction features (#10193)** are logged on every estimate so a fitted
 model can be tested against the heuristics once ~14 days of them exist:
 `repo_open_prs`, `repo_pr_open_lockout` (the work finder's last tick had a
-`pr-open-skip` row for the repo; `nothing_ready` if it had no ready row), `repo_ci_typical_duration_sec` (median of
+`pr-open-skip` row, or an `open_pr_backoff` row inside the window that skip arms, for the repo; `nothing_ready` if it had no ready row), `repo_ci_typical_duration_sec` (median of
 the repo's PR workflow runs that finished before the read, last 7 days),
 `pr_ci_status` (`passing`/`failing`/`pending`/`none`), `pr_behind_main`,
 `pr_merge_conflict`, `operator_hold`, plus `repo_friction_observed_at` /
