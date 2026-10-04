@@ -18,6 +18,7 @@ use loom_daemon::daemon_heartbeat;
 use loom_daemon::daemon_startup_reconciliation;
 use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
+use loom_daemon::forge_egress::publication as egress;
 use loom_daemon::health_monitor;
 use loom_daemon::host_breaker;
 use loom_daemon::hyperparams;
@@ -450,7 +451,10 @@ pub(crate) async fn run_daemon() -> Result<()> {
     };
     let github_app_script = credential_preflight::resolve_github_app_script(&sweep_workspace);
     let github_app_owner_repo = credential_preflight::nwo_from_git_remote(&sweep_workspace);
+    // #9986: `required` egress host: the gateway owns the GitHub credential.
+    let github_credential_forbidden = egress::github_credential_forbidden(Some(&sweep_workspace));
     let github_app_preflight = match &github_app_script {
+        _ if github_credential_forbidden => credential_preflight::gateway_owned_preflight(),
         Some(script_path) => {
             let minter = credential_preflight::RealGithubAppMinter {
                 script_path: script_path.clone(),
@@ -497,7 +501,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // silently outrank the just-minted app token — the pre-#4458 code
     // achieved the same override by unconditionally overwriting `GH_TOKEN`.
     let github_app_config_dir = credential_preflight::github_app_gh_config_dir(&sweep_workspace);
-    let mut github_app_gh_config_dir_active = false;
+    // #9986: a `required` host activates a token-less profile instead. Its
+    // preflight is `gateway_owned_preflight` (no minted token), so the
+    // publication branch below never runs there.
+    let mut github_app_gh_config_dir_active =
+        github_credential_forbidden && egress::activate_tokenless_profile(&github_app_config_dir);
     if let Some(token) = &github_app_preflight.minted_gh_token {
         match credential_preflight::publish_github_app_token(&github_app_config_dir, token) {
             Ok(()) => {

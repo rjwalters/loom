@@ -175,3 +175,58 @@ fn repo_origin_policies_never_run_the_canary() {
     assert!(!marker.exists(), "a repo-local policy made the validator run a command");
     assert!(report::codes(&r.runtime).contains(&"runtime.unverifiable"));
 }
+
+// ---- #9986: no GitHub credential on `required` hosts ----
+
+fn with_api(mode: &str) -> PolicyDoc {
+    let mut p = example();
+    p["enforcement"]["api"] = mode.into();
+    doc(p)
+}
+
+#[test]
+fn token_in_an_enumerated_profile_is_a_finding_only_under_required() {
+    let mut obs = aligned();
+    obs.token_profiles = vec![PathBuf::from("/w/.loom/gh-config")];
+    let required = evaluate(&with_api("required"), &obs, Mode::Assert);
+    assert!(required
+        .routing_codes()
+        .contains(&"apiconfig.github-token-present".to_string()));
+    let observe = evaluate(&with_api("observe"), &obs, Mode::Assert);
+    assert!(!observe
+        .routing_codes()
+        .contains(&"apiconfig.github-token-present".to_string()));
+}
+
+#[test]
+fn gh_git_credential_helper_is_a_git_finding_only_under_required() {
+    let mut obs = aligned();
+    obs.git_helper_is_gh = true;
+    let required = evaluate(&with_api("required"), &obs, Mode::Doctor);
+    assert!(required
+        .git
+        .iter()
+        .any(|f| f.code == "git.credential-from-api-profile"));
+    let observe = evaluate(&with_api("observe"), &obs, Mode::Doctor);
+    assert!(!observe
+        .git
+        .iter()
+        .any(|f| f.code == "git.credential-from-api-profile"));
+    // The routing verdict (process exit code) is not affected by the git finding.
+    assert!(!required
+        .routing_codes()
+        .contains(&"git.credential-from-api-profile".to_string()));
+    obs.git_helper_is_gh = false;
+    assert!(evaluate(&with_api("required"), &obs, Mode::Doctor)
+        .git
+        .iter()
+        .all(|f| f.code != "git.credential-from-api-profile"));
+}
+
+#[test]
+fn hosts_token_detection_reads_verdict_only() {
+    use super::probe::hosts_text_has_token;
+    assert!(hosts_text_has_token("github.com:\n    oauth_token: ghs_x\n"));
+    assert!(!hosts_text_has_token("github.com:\n    git_protocol: https\n"));
+    assert!(!hosts_text_has_token("github.com:\n    oauth_token: \"\"\n"));
+}
