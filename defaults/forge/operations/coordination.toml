@@ -438,6 +438,7 @@ risk = "normal"
 github = { commands = [], routes = [
   "GET repos/{owner}/{repo}/issues/{number}/timeline",
   "GET repos/{owner}/{repo}/issues/{number}/events",
+  "GET repos/{owner}/{repo}/issues/events",
 ] }
 platform_support = "documented"
 adapter_coverage = "partial"
@@ -455,6 +456,9 @@ path = "defaults/scripts/check-promotion-landed.sh"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/observability/ops/stage_dwell.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/eta/fleet_events_forge.rs"
 
 # --- epics-relationships -----------------------------------------------------
 
