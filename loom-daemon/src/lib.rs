@@ -230,6 +230,10 @@ pub mod launchd_env_drift;
 pub mod launchd_reload;
 pub mod limit_calibration;
 pub mod live_claim;
+/// Test-only: a `gh` stand-in prepended to `PATH` before `main`, failing the
+/// run on any spawn of the real `gh` (#10138).
+#[cfg(test)]
+mod live_gh_guard;
 pub mod main_health_gate;
 pub mod mcp_tool_guard;
 pub mod merge_pr;

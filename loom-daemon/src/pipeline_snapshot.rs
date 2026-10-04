@@ -247,10 +247,17 @@ pub const DEFAULT_MERGE_WINDOW_HOURS: i64 = 24;
 
 /// The default `gh` binary this module invokes when nothing overrides it —
 /// the single source of truth so [`GhPipelineSource::new`] and
-/// [`probe_gh_availability`]'s caller (`loom-daemon health`'s collector,
-/// #5061) can never drift into checking a different binary than the one that
-/// actually runs the per-repo queries.
-pub const DEFAULT_GH_BIN: &str = "gh";
+/// [`probe_gh_availability`]'s callers (`loom-daemon health`'s collector and
+/// the `serve` dashboard, #5061) can never drift into checking a different
+/// binary than the one that actually runs the per-repo queries.
+///
+/// Resolved through [`crate::gh_invocation::gh_bin`] (`LOOM_GH_BIN`, else
+/// bare `gh` from `PATH`), so a unit-test build gets the loud-failing stub
+/// rather than the operator's real `gh` (#10138).
+#[must_use]
+pub fn default_gh_bin() -> PathBuf {
+    PathBuf::from(crate::gh_invocation::gh_bin())
+}
 
 // ============================================================================
 // `gh` binary availability (Issue #5061)
@@ -411,7 +418,7 @@ impl GhPipelineSource {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            gh_bin: PathBuf::from(DEFAULT_GH_BIN),
+            gh_bin: default_gh_bin(),
             metrics: PipelineMetrics::ALL,
             merge_window: chrono::Duration::hours(DEFAULT_MERGE_WINDOW_HOURS),
         }

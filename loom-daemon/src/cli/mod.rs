@@ -6,6 +6,12 @@
 //! (a sibling of this module, not nested under it) owns the daemon's own
 //! bootstrap/service-loop body, which is not a CLI subcommand handler.
 
+// The bin test binary gets the same pre-`main` live-`gh` guard as the lib
+// test binary (#10138). `main.rs` is size-frozen, so it is mounted here.
+#[cfg(test)]
+#[path = "../live_gh_guard.rs"]
+mod live_gh_guard;
+
 pub(crate) mod accounts;
 pub(crate) mod accounts_args;
 pub(crate) mod accounts_session;
