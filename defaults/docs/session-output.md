@@ -426,11 +426,30 @@ match only and never placed on a record. Ancestors are read from `/proc` on
 Linux and `sysctl(KERN_PROCARGS2)` on macOS. On other platforms nothing is
 published.
 
-**Subagents only.** A top-level session's own transcript is refused, with a
-recorded reason. This covers a person typing `/loom:builder 42` directly, and
-an operator's main agent claiming inline. That transcript goes on to carry the
-session's later, unrelated work, so following it would publish that work under
-the issue. Top-level coverage is #10129.
+**Top-level sessions: a slash-command turn only (#10129).** A top-level
+session's transcript is the whole conversation, so it is followed only when
+**both** hold:
+
+1. The caller is bound to that transcript through its parent shells (the
+   binding above, never a text match on the issue number).
+2. The turn holding the claim line was opened by a
+   `<command-name>/loom:<role></command-name>` prompt whose arguments name the
+   issue, as when a person types `/loom:builder 42`.
+
+The run then owns only that turn: it starts at the claim line and ends at the
+turn's next prompt (the same predicate as for subagents), or at a newer claim
+on the transcript (`/loom:builder 43` ends #42's run, and #43's starts at its
+own claim line). An unrelated reply after the next prompt is never published.
+
+Limits. An operator's main agent claiming **inline**, in a turn no `/loom:`
+command opened, is still refused with a recorded reason: one such turn can run
+for hours across many issues, PR checks and other repos with no prompt to end
+it, so a prompt boundary cannot scope it. Naming a top-level transcript with
+`--transcript` is refused too, since a named file carries no binding. Within a
+slash-command turn the run covers everything the turn says until the next
+prompt, including anything the main agent does for other work in that same
+turn. The refusal is one stderr line from `lease ensure` / `live-output-attend`
+naming the issue and the reason.
 
 **Which lines belong to the run.** A run owns its subagent's transcript from
 the claim line up to whichever comes first:
@@ -612,6 +631,7 @@ repository's config → SigNoz):
 | [`observability/session_output/claude.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/claude.rs) | The Claude adapter: incremental tail, content boundary, gap detection |
 | [`observability/session_output/attended.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/attended.rs) | Attended runs (#10116): starting, the detached tailer, end conditions |
 | [`observability/session_output/attended_caller.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/attended_caller.rs) | Proving which agent is calling, through its ancestor shells |
+| [`observability/session_output/attended_turn.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/attended_turn.rs) | Whether a top-level claim sits in a `/loom:<role>` slash-command turn naming the issue |
 | [`observability/session_output/attended_segment.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/attended_segment.rs) | Which transcript lines belong to a run: the next-task boundary and the claim handover |
 | [`observability/session_output/latency.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/latency.rs) | Producer-lag window, percentiles, historical-sample exclusion |
 | [`observability/otlp/mapping/session_output.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/otlp/mapping/session_output.rs) | OTLP log mapping, dual timestamps, severity |

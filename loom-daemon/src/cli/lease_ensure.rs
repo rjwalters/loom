@@ -59,7 +59,10 @@
 //! The same blind spot hides the agent's output: the daemon's `session.output`
 //! producer only follows runs it dispatched. So after the lease, `run` also
 //! asks `observability::session_output::attended` to start a tailer for this
-//! agent's own transcript when the agent is a subagent. That call is a few
+//! agent's own transcript when the agent is a subagent, or a top-level
+//! session running a `/loom:<role>` command that names this issue (an inline
+//! claim by an operator's main agent is refused, with the reason on stderr,
+//! #10129). That call is a few
 //! local file reads and a detached spawn, a silent no-op unless live output
 //! and an OTLP exporter are
 //! configured, and skipped outright for a daemon-dispatched child, whose

@@ -5,7 +5,9 @@
 //! this verb is for any other entry point that knows its issue. Run it from
 //! inside a subagent's own tool call: it finds that agent's transcript by the
 //! running command (through this process's parent shells), detaches a
-//! tailer, and returns at once. A top-level session is refused (#10129).
+//! tailer, and returns at once. A top-level session is followed only for a
+//! turn a `/loom:<role>` command naming the issue opened; an inline claim by
+//! an operator's main agent is refused with a reason (#10129).
 //!
 //! **Always exits 0.** With live output not configured it does nothing and
 //! says why in one stderr line. The logic lives in
@@ -33,7 +35,9 @@ pub(crate) struct LiveOutputAttendArgs {
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
     /// Read this transcript instead of locating the calling agent's own. It
-    /// must be a subagent's.
+    /// should be a subagent's: a top-level transcript is refused unless the
+    /// detached `--foreground` tailer finds its claim turn was opened by a
+    /// `/loom:<role>` command naming the issue.
     #[arg(long)]
     transcript: Option<PathBuf>,
     /// Byte offset in `--transcript` where this issue's lines begin (the
