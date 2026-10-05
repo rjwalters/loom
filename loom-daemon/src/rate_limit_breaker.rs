@@ -675,7 +675,10 @@ pub mod forge {
             PROBE_TIMEOUT,
         )
         .args(args.iter().copied())
-        .gh_config_dir(ctx.config_dir.as_deref());
+        .gh_config_dir(ctx.config_dir.as_deref())
+        // #10089: both legs (REST `rate_limit`, GraphQL `rateLimit`) are
+        // budget readings, never `unknown`.
+        .forge_op(crate::forge_call_stats::ops::QUOTA_RATE_LIMIT_READING);
         if let Some(root) = &ctx.root {
             inv = inv.current_dir(root);
         }

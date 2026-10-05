@@ -66,7 +66,8 @@
 //!   runs, exactly as the verdict-marker scan does.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+
+use crate::claim_reconciliation::gh_call;
 
 /// The only stdout a caller may treat as "the recorded predecessor landed —
 /// releasing the sequencing hold is authorized".
@@ -412,21 +413,20 @@ pub fn verdict_line(verdict: Verdict, marker: &SequenceMarker) -> String {
 /// and the default first page is the oldest 30 — the same pitfall #5455
 /// documented for the fallback-queue scan. `None` on any failure: a read
 /// that did not happen is never an empty comment stream.
+///
+/// #10089: counted through the facade (`sequence.trusted_bodies`), which also
+/// applies the #5401 cross-owner `GH_CONFIG_DIR` from `root`, and bounded by
+/// a deadline; `per_page=100` cuts a long thread's walk to a third of the
+/// requests the default 30-per-page walk cost.
 pub fn fetch_trusted_bodies(bin: &str, root: &Path, nwo: &str, pr: u32) -> Option<Vec<String>> {
-    let mut cmd = Command::new(bin);
-    cmd.arg("api")
-        .arg(format!("repos/{nwo}/issues/{pr}/comments"))
-        .arg("--paginate");
-    cmd.current_dir(root);
-    // #5401: cross-owner managed repo -> its own owner's installation-token
-    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    crate::comment_trust::TrustPolicy::for_root(root).trusted_bodies(&out.stdout)
+    let path = format!("repos/{nwo}/issues/{pr}/comments?per_page=100");
+    let stdout =
+        gh_call::ok_stdout(gh_call::read("sequence.trusted_bodies", Path::new(bin), root).args([
+            "api",
+            &path,
+            "--paginate",
+        ]))?;
+    crate::comment_trust::TrustPolicy::for_root(root).trusted_bodies(&stdout)
 }
 
 /// Fetch the predecessor's live pull-request state. `None` on any failure —
@@ -438,16 +438,11 @@ pub fn fetch_predecessor(
     nwo: &str,
     after: u32,
 ) -> Option<PredecessorState> {
-    let mut cmd = Command::new(bin);
-    cmd.arg("api").arg(format!("repos/{nwo}/pulls/{after}"));
-    cmd.current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    predecessor_from_json(&out.stdout)
+    let path = format!("repos/{nwo}/pulls/{after}");
+    let stdout = gh_call::ok_stdout(
+        gh_call::read("sequence.predecessor", Path::new(bin), root).args(["api", &path]),
+    )?;
+    predecessor_from_json(&stdout)
 }
 
 /// Parse a pulls-API body into a [`PredecessorState`].

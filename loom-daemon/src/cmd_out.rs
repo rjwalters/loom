@@ -111,6 +111,19 @@ impl std::fmt::Display for Unavailable {
 }
 
 impl CmdOutcome {
+    /// The process's output when it ran (any exit status), else why not —
+    /// the `Command::output()` shape, for sites migrated from it.
+    ///
+    /// # Errors
+    ///
+    /// The [`Unavailable`] reason when the command did not run to completion.
+    pub fn into_result(self) -> Result<std::process::Output, Unavailable> {
+        match self {
+            CmdOutcome::Ran(o) => Ok(o),
+            CmdOutcome::Unavailable(u) => Err(u),
+        }
+    }
+
     /// The output of a command that ran **and exited zero**.
     ///
     /// `None` for a non-zero exit and for [`CmdOutcome::Unavailable`] alike —
@@ -339,7 +352,12 @@ where
 /// Callers pass `--json <fields>` and **no `--jq`** — the whole point is that
 /// the structure survives into Rust instead of being flattened to a scalar by a
 /// second interpreter inside the subprocess.
+///
+/// `op` is the stable [`crate::gh_invocation::Operation`] name the read is
+/// counted under: it runs through the `gh` facade (#10089), so it reaches
+/// `forge_call_stats` and gets the facade's credential/`GH_REPO` routing.
 pub fn gh_json<T, F>(
+    op: &'static str,
     gh: &Path,
     args: &[&str],
     dir: &Path,
@@ -350,14 +368,19 @@ where
     T: serde::de::DeserializeOwned,
     F: FnOnce(&T) -> bool,
 {
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     debug_assert!(
         !args.contains(&"--jq"),
         "gh_json decodes in-process; passing --jq flattens the JSON in the subprocess \
          and reintroduces the ambiguity this exists to remove"
     );
-    let mut cmd = Command::new(gh);
-    cmd.args(args).current_dir(dir).stdin(Stdio::null());
-    decode_json(finish(cmd, timeout), is_empty)
+    let outcome =
+        GhInvocation::new(Operation::new(op), AccessIntent::Read, GhTarget::None, timeout)
+            .program(gh)
+            .current_dir(dir)
+            .args(args)
+            .run();
+    decode_json(outcome, is_empty)
 }
 
 #[cfg(test)]

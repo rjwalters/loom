@@ -88,7 +88,7 @@ case "$1 $2" in
     touch "$S/branch-gone"; exit 0 ;;
 esac
 if [ "$1" = "api" ]; then
-  n=${2#*issues/}; n=${n%/comments}
+  n=${2#*issues/}; n=${n%%\?*}; n=${n%/comments}
   if ls "$S/comments-$n"/*.json >/dev/null 2>&1; then cat "$S/comments-$n"/*.json; else echo '[]'; fi
   exit 0
 fi
@@ -307,6 +307,9 @@ fn a_full_run_reconciles_every_step_and_a_restart_writes_nothing() {
 
     let first = f.run();
     assert_eq!((first.statuses, first.closed_prs, first.closed_issues), (2, 2, 2), "{first:?}");
+    // Pin the request shape the stub parses: a query-string change to the
+    // comments read must update FAKE_GH's PR-number extraction too (#10089).
+    assert!(f.log().iter().any(|l| l.contains("/comments?per_page=100")), "{:?}", f.log());
     assert_eq!(first.branch, BranchCleanup::Deleted);
     assert!(first.complete(), "{first:?}");
     assert_eq!(first.holds_pending_release, vec![10, 12], "observed, not released");

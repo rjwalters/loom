@@ -68,6 +68,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::workspace_registry::WorkspaceRegistry;
 
 mod forge_egress_invariant;
@@ -933,20 +934,26 @@ impl GhIssueFiler {
     }
 }
 
+/// A self-check `gh` call through the facade (#10089): counted in
+/// `forge_call_stats`, bounded, and run under `root`'s owner credential.
+fn gh_self_check(op: &'static str, intent: AccessIntent, root: &Path) -> GhInvocation {
+    let timeout = Duration::from_secs(60);
+    GhInvocation::new(Operation::new(op), intent, GhTarget::None, timeout).current_dir(root)
+}
+
 impl ViolationReporter for GhIssueFiler {
     fn has_open_issue(&self, marker: &str) -> Result<bool, String> {
         // `gh issue list --search "<marker>" --state open` — GitHub full-text
         // search matches the hidden HTML comment in the body.
-        let mut cmd = Command::new(crate::gh_invocation::gh_bin());
-        cmd.args([
-            "issue", "list", "--state", "open", "--search", marker, "--json", "number",
-        ])
-        .current_dir(&self.repo_root);
-        // #5431: select the owner-correct credential for a cross-owner repo_root.
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, &self.repo_root);
-        let output = cmd
-            .output()
-            .map_err(|e| format!("could not spawn gh: {e}"))?;
+        // #10089: through the facade, which also selects the owner-correct
+        // credential for a cross-owner repo_root (#5431).
+        let output = gh_self_check("self_check.issue_search", AccessIntent::Read, &self.repo_root)
+            .args([
+                "issue", "list", "--state", "open", "--search", marker, "--json", "number",
+            ])
+            .run()
+            .into_result()
+            .map_err(|e| format!("could not run gh: {e}"))?;
         if !output.status.success() {
             return Err(format!(
                 "gh issue list exited with {}: {}",
@@ -968,32 +975,22 @@ impl ViolationReporter for GhIssueFiler {
             .join(".loom")
             .join("scripts")
             .join("create-issue.sh");
-        let mut cmd = if script.is_file() {
-            let mut c = Command::new(&script);
-            c.args(["--title", title, "--body", body, "--label", "loom:triage"])
-                .current_dir(&self.repo_root);
-            c
+        let fields = ["--title", title, "--body", body, "--label", "loom:triage"];
+        let output = if script.is_file() {
+            let mut cmd = Command::new(&script);
+            cmd.args(fields).current_dir(&self.repo_root);
+            // #5431: the owner-correct credential, inherited by the script's `gh`.
+            crate::credential_preflight::apply_gh_config_for_root(&mut cmd, &self.repo_root);
+            cmd.output().map_err(|e| e.to_string())
         } else {
-            let mut c = Command::new(crate::gh_invocation::gh_bin());
-            c.args([
-                "issue",
-                "create",
-                "--title",
-                title,
-                "--body",
-                body,
-                "--label",
-                "loom:triage",
-            ])
-            .current_dir(&self.repo_root);
-            c
-        };
-        // #5431: select the owner-correct credential for a cross-owner repo_root.
-        // For `create-issue.sh` this is inherited by the `gh` it shells to.
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, &self.repo_root);
-        let output = cmd
-            .output()
-            .map_err(|e| format!("could not spawn issue-create: {e}"))?;
+            gh_self_check("self_check.issue_create", AccessIntent::Write, &self.repo_root)
+                .args(["issue", "create"])
+                .args(fields)
+                .run()
+                .into_result()
+                .map_err(|e| e.to_string())
+        }
+        .map_err(|e| format!("could not spawn issue-create: {e}"))?;
         if !output.status.success() {
             return Err(format!(
                 "issue-create exited with {}: {}",

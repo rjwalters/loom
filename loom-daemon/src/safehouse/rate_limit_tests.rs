@@ -152,7 +152,12 @@ async fn a_trip_in_workspace_a_stops_workspace_b_in_the_same_pass() {
     std::env::remove_var(GH_BIN_ENV);
     let lines = calls(&log);
     assert_eq!(lines.len(), 1, "only workspace A's failing call: {lines:?}");
-    assert!(lines[0].starts_with(&ws_a.to_string_lossy().into_owned()));
+    // The stub logs bash's `$PWD`, which may be the physical path (macOS
+    // `/private/var/…` for a `/var/…` tempdir) depending on how it was spawned.
+    let ran_in = Path::new(lines[0].split('|').next().unwrap())
+        .canonicalize()
+        .unwrap();
+    assert_eq!(ran_in, ws_a.canonicalize().unwrap(), "{lines:?}");
     assert_eq!(probe.calls.load(Ordering::SeqCst), 1, "one probe per trip");
     let seen = probe.seen.lock().unwrap();
     assert_eq!(seen[0].root.as_deref(), Some(ws_a.as_path()), "probe keeps A's root");
