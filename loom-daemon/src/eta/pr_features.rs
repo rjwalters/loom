@@ -8,7 +8,8 @@
 //! # Budget
 //!
 //! At most [`FEATURE_READ_BUDGET`] reads per ETA pass, across `pulls/{n}`,
-//! `commits/{sha}/check-runs` and `issues/{n}`. This budget is separate from
+//! `commits/{sha}/check-runs`, `issues/{n}` and the base branch's
+//! required-context lookup. This budget is separate from
 //! the journal resolver's (`observability::eta::FORGE_READ_BUDGET`): feature
 //! reads never delay an outcome read, and the reverse. Reads that do not fit
 //! are not lost. They stay wanted, and the oldest-attempted (never-attempted
@@ -30,11 +31,24 @@
 //! is `read_stale`. Check runs change without touching the PR's
 //! `updated_at`, so a check read is used only when it happened before
 //! `as_of`, and only for the head commit the PR's own read shows.
+//!
+//! # Required checks only
+//!
+//! `checks_pending` and `checks_failed` count the base branch's **required**
+//! contexts, never every check run: an optional check that fails does not
+//! block a merge. The required set comes from the same lookup `forge
+//! wait-checks` uses ([`crate::forge_wait_checks::reads::required_contexts`]),
+//! read at most once per base branch per [`REQUIRED_REFRESH_SEC`], and the
+//! runs are classified by the same rollup ([`crate::forge_wait_checks::verdict::fold`]).
+//! A required context that failed counts as failed; one still running, or
+//! not yet registered on the head, as pending. While the set is unknown (not
+//! read yet, or its lookup failed with no earlier answer) both features are
+//! null with a reason, never a count over all checks.
 
 use super::explanation::{FeatureOmitted, Features};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Feature reads allowed per ETA pass, across every repo and read kind.
 pub const FEATURE_READ_BUDGET: usize = 12;
@@ -50,6 +64,12 @@ pub const PR_MAX_AGE_SEC: i64 = 60 * 60;
 
 /// The oldest `issues/{n}` answer an estimate may use.
 pub const ISSUE_MAX_AGE_SEC: i64 = 24 * 3600;
+
+/// A base branch's required-context set is re-read once it is this old.
+pub const REQUIRED_REFRESH_SEC: i64 = 60 * 60;
+
+/// The oldest required-context set an estimate may use.
+pub const REQUIRED_MAX_AGE_SEC: i64 = 6 * 3600;
 
 /// The PR-size features, in [`Features`] field order.
 pub const PR_SIZE_FEATURES: [&str; 4] = [
@@ -89,6 +109,12 @@ pub mod reason {
     pub const CHECKS_FOR_OTHER_HEAD: &str = "checks_for_other_head";
     /// The head commit has more check runs than one page returns.
     pub const CHECKS_TRUNCATED: &str = "checks_truncated";
+    /// The base branch's required-context set is not known at `as_of`: no
+    /// lookup has answered yet (not wanted yet, over the budget, or only
+    /// answered at or after `as_of`), or the PR read shows no base branch.
+    pub const REQUIRED_UNKNOWN: &str = "required_unknown";
+    /// The required-context lookup failed, and there is no earlier answer.
+    pub const REQUIRED_LOOKUP_FAILED: &str = "required_lookup_failed";
     /// The issue body has no such marker.
     pub const MARKER_ABSENT: &str = "marker_absent";
     /// The `loom:points` marker is outside the points vocabulary.
@@ -102,6 +128,9 @@ pub enum ReadKind {
     Pull,
     /// `GET repos/{o}/{r}/commits/{sha}/check-runs`.
     Checks,
+    /// The base branch's required status-check contexts (the `forge
+    /// wait-checks` lookup).
+    Required,
     /// `GET repos/{o}/{r}/issues/{n}`.
     Issue,
 }
@@ -113,10 +142,13 @@ pub struct FeatureRead {
     pub repo: String,
     /// Which read.
     pub kind: ReadKind,
-    /// The PR number (`Pull`, `Checks`) or issue number (`Issue`).
+    /// The PR number (`Pull`, `Checks`) or issue number (`Issue`); `0` for
+    /// `Required`, which is per base branch.
     pub number: u32,
     /// The head commit, for `Checks`.
     pub sha: Option<String>,
+    /// The base branch, for `Required`.
+    pub base: Option<String>,
 }
 
 impl FeatureRead {
@@ -131,6 +163,9 @@ impl FeatureRead {
                 "repos/{repo}/commits/{}/check-runs?per_page=100",
                 self.sha.as_deref().unwrap_or_default()
             ),
+            ReadKind::Required => {
+                format!("repos/{repo}/rules/branches/{}", self.base.as_deref().unwrap_or_default())
+            }
         }
     }
 }
@@ -166,23 +201,55 @@ pub struct PullSnapshot {
     pub commits: i64,
     /// `head.sha`.
     pub head_sha: Option<String>,
+    /// `base.ref`.
+    pub base_ref: Option<String>,
     /// `updated_at`.
     pub updated_at: Option<DateTime<Utc>>,
 }
 
-/// What one check-runs read said.
+/// What one check-runs read said, per check name, as the `forge wait-checks`
+/// rollup classifies it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChecksSnapshot {
     /// When the read returned.
     pub read_at: DateTime<Utc>,
     /// The commit read.
     pub sha: String,
-    /// Runs not yet completed.
-    pub pending: u32,
-    /// Runs completed as failed, timed out, cancelled or needing action.
-    pub failed: u32,
+    /// Names with a run not yet completed.
+    pub pending: BTreeSet<String>,
+    /// Names with a run completed other than `success`, `neutral` or
+    /// `skipped`.
+    pub failing: BTreeSet<String>,
+    /// Every name with a run on the commit.
+    pub seen: BTreeSet<String>,
     /// `total_count` exceeded the runs returned.
     pub truncated: bool,
+}
+
+impl ChecksSnapshot {
+    /// `(pending, failed)` over the `required` contexts only. A required
+    /// context that failed is failed; one still running, or with no run on
+    /// the commit yet, is pending. Every other check is ignored, so with
+    /// nothing required both are zero.
+    #[must_use]
+    pub fn required_counts(&self, required: &[String]) -> (u32, u32) {
+        let required: BTreeSet<&String> = required.iter().collect();
+        let failed = required.iter().filter(|c| self.failing.contains(**c));
+        let pending = required.iter().filter(|c| {
+            !self.failing.contains(**c) && (self.pending.contains(**c) || !self.seen.contains(**c))
+        });
+        let n = |c: usize| u32::try_from(c).unwrap_or(u32::MAX);
+        (n(pending.count()), n(failed.count()))
+    }
+}
+
+/// What one required-context lookup said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredSnapshot {
+    /// When the lookup returned.
+    pub read_at: DateTime<Utc>,
+    /// The base branch's required contexts (possibly none).
+    pub contexts: Vec<String>,
 }
 
 /// What one `issues/{n}` read said.
@@ -215,33 +282,37 @@ pub fn parse_pull(body: &Value, read_at: DateTime<Utc>) -> Option<PullSnapshot> 
         changed_files: body["changed_files"].as_i64()?,
         commits: body["commits"].as_i64()?,
         head_sha: body["head"]["sha"].as_str().map(str::to_string),
+        base_ref: body["base"]["ref"].as_str().map(str::to_string),
         updated_at: time(&body["updated_at"]),
     })
 }
 
-/// A check-runs body for `sha`, read at `read_at`.
+/// A check-runs body for `sha`, read at `read_at`, classified by the
+/// `forge wait-checks` rollup. `None` for a body outside that contract.
 #[must_use]
 pub fn parse_checks(body: &Value, sha: &str, read_at: DateTime<Utc>) -> Option<ChecksSnapshot> {
-    let runs = body["check_runs"].as_array()?;
-    let count = |f: &dyn Fn(&Value) -> bool| {
-        u32::try_from(runs.iter().filter(|r| f(r)).count()).unwrap_or(u32::MAX)
-    };
-    let pending = count(&|r| r["status"].as_str() != Some("completed"));
-    let failed = count(&|r| {
-        r["status"].as_str() == Some("completed")
-            && matches!(
-                r["conclusion"].as_str(),
-                Some("failure" | "timed_out" | "cancelled" | "action_required" | "startup_failure")
-            )
-    });
-    let total = body["total_count"].as_u64().unwrap_or(runs.len() as u64);
+    let listed = body["check_runs"].as_array()?.len() as u64;
+    let rollup = crate::forge_wait_checks::verdict::fold(body, &Value::Null).ok()?;
     Some(ChecksSnapshot {
         read_at,
         sha: sha.to_string(),
-        pending,
-        failed,
-        truncated: total > runs.len() as u64,
+        pending: rollup.pending.into_iter().collect(),
+        failing: rollup.failing.into_iter().collect(),
+        seen: rollup.seen,
+        truncated: rollup.total > listed,
     })
+}
+
+/// A required-context answer (`{"required_contexts": [...]}`, as
+/// [`super::pr_features_forge`] builds it), read at `read_at`.
+#[must_use]
+pub fn parse_required(body: &Value, read_at: DateTime<Utc>) -> Option<RequiredSnapshot> {
+    let contexts = body["required_contexts"]
+        .as_array()?
+        .iter()
+        .map(|c| c.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    Some(RequiredSnapshot { read_at, contexts })
 }
 
 /// An `issues/{n}` body, read at `read_at`. The markers use the repo's own
@@ -306,6 +377,9 @@ impl<T> Slot<T> {
 
 type Key = (String, u32);
 
+/// `(repo, base branch)`.
+type BaseKey = (String, String);
+
 /// Every answer so far, per PR and issue. Bounded by the tracked items:
 /// [`PrFeatureStore::plan`] forgets what no item wants any more.
 #[derive(Debug, Clone, Default)]
@@ -313,6 +387,7 @@ pub struct PrFeatureStore {
     pulls: BTreeMap<Key, Slot<PullSnapshot>>,
     checks: BTreeMap<Key, Slot<ChecksSnapshot>>,
     issues: BTreeMap<Key, Slot<IssueSnapshot>>,
+    required: BTreeMap<BaseKey, Slot<RequiredSnapshot>>,
 }
 
 /// One candidate read and its priority: never attempted first, then the
@@ -347,11 +422,18 @@ impl PrFeatureStore {
         self.issues.retain(|k, _| all_issues.contains(k));
         self.pulls.retain(|k, _| all_prs.contains(k));
         self.checks.retain(|k, _| all_prs.contains(k));
+        let all_bases: BTreeSet<BaseKey> = self
+            .pulls
+            .iter()
+            .filter_map(|((repo, _), s)| Some((repo.clone(), s.last.as_ref()?.base_ref.clone()?)))
+            .collect();
+        self.required.retain(|k, _| all_bases.contains(k));
         let readable = wanted.iter().filter(|w| w.readable);
         let issues: Vec<Key> = readable.clone().map(|w| key(w, w.issue)).collect();
         let prs: Vec<Key> = readable.filter_map(|w| Some(key(w, w.pr?))).collect();
 
         let mut candidates = Vec::new();
+        let mut bases = BTreeSet::new();
         for key in &issues {
             let last = self
                 .issues
@@ -366,6 +448,7 @@ impl PrFeatureStore {
                         kind: ReadKind::Issue,
                         number: key.1,
                         sha: None,
+                        base: None,
                     },
                 });
             }
@@ -381,11 +464,16 @@ impl PrFeatureStore {
                         kind: ReadKind::Pull,
                         number: key.1,
                         sha: None,
+                        base: None,
                     },
                 });
             }
             // Checks need the head from a PR read, and only matter while open.
-            let Some(sha) = pull.filter(|p| p.open).and_then(|p| p.head_sha.clone()) else {
+            let open = pull.filter(|p| p.open);
+            if let Some(base) = open.and_then(|p| p.base_ref.clone()) {
+                bases.insert((key.0.clone(), base));
+            }
+            let Some(sha) = open.and_then(|p| p.head_sha.clone()) else {
                 continue;
             };
             let checks = self.checks.get(key).and_then(|s| s.last.as_ref());
@@ -398,6 +486,27 @@ impl PrFeatureStore {
                         kind: ReadKind::Checks,
                         number: key.1,
                         sha: Some(sha),
+                        base: None,
+                    },
+                });
+            }
+        }
+        // One required-context lookup per base branch the open PRs target.
+        for key in bases {
+            let last = self
+                .required
+                .get(&key)
+                .and_then(|s| s.last.as_ref())
+                .map(|s| s.read_at);
+            if due(last, now, REQUIRED_REFRESH_SEC) {
+                candidates.push(Candidate {
+                    tried: tried(self.required.get(&key), last),
+                    read: FeatureRead {
+                        repo: key.0,
+                        kind: ReadKind::Required,
+                        number: 0,
+                        sha: None,
+                        base: Some(key.1),
                     },
                 });
             }
@@ -429,6 +538,9 @@ impl PrFeatureStore {
             ReadKind::Pull => self.pulls.entry(key).or_default().attempt = Attempt::Deferred,
             ReadKind::Checks => self.checks.entry(key).or_default().attempt = Attempt::Deferred,
             ReadKind::Issue => self.issues.entry(key).or_default().attempt = Attempt::Deferred,
+            ReadKind::Required => {
+                self.required.entry(base_key(read)).or_default().attempt = Attempt::Deferred;
+            }
         }
     }
 
@@ -449,6 +561,10 @@ impl PrFeatureStore {
             ReadKind::Issue => {
                 let parsed = body.and_then(|b| parse_issue(b, read_at));
                 settle(self.issues.entry(key).or_default(), parsed, read_at);
+            }
+            ReadKind::Required => {
+                let parsed = body.and_then(|b| parse_required(b, read_at));
+                settle(self.required.entry(base_key(read)).or_default(), parsed, read_at);
             }
         }
     }
@@ -505,6 +621,32 @@ impl PrFeatureStore {
         Ok(snap)
     }
 
+    /// `repo`'s `base` required-context set usable at `as_of`, or why there
+    /// is none. Like check runs, it must have been read before `as_of`.
+    fn required_at(
+        &self,
+        repo: &str,
+        base: Option<&str>,
+        as_of: DateTime<Utc>,
+    ) -> Result<&RequiredSnapshot, &'static str> {
+        let base = base.ok_or(reason::REQUIRED_UNKNOWN)?;
+        let slot = self
+            .required
+            .get(&(repo.to_string(), base.to_string()))
+            .ok_or(reason::REQUIRED_UNKNOWN)?;
+        let snap = slot.last.as_ref().ok_or(match slot.attempt {
+            Attempt::Failed => reason::REQUIRED_LOOKUP_FAILED,
+            _ => reason::REQUIRED_UNKNOWN,
+        })?;
+        if snap.read_at >= as_of {
+            return Err(reason::REQUIRED_UNKNOWN);
+        }
+        if as_of - snap.read_at > Duration::seconds(REQUIRED_MAX_AGE_SEC) {
+            return Err(reason::READ_STALE);
+        }
+        Ok(snap)
+    }
+
     /// The issue snapshot usable at `as_of`, or why there is none.
     fn issue_at(
         &self,
@@ -550,10 +692,15 @@ impl PrFeatureStore {
                 features.pr_deletions = Some(snap.deletions);
                 features.pr_changed_files = Some(snap.changed_files);
                 features.pr_commits = Some(snap.commits);
-                match self.checks_at(repo, pr, as_of) {
-                    Ok(c) => {
-                        features.checks_pending = Some(c.pending);
-                        features.checks_failed = Some(c.failed);
+                let base = snap.base_ref.as_deref();
+                let checks = self.checks_at(repo, pr, as_of).and_then(|c| {
+                    self.required_at(repo, base, as_of)
+                        .map(|r| c.required_counts(&r.contexts))
+                });
+                match checks {
+                    Ok((pending, failed)) => {
+                        features.checks_pending = Some(pending);
+                        features.checks_failed = Some(failed);
                     }
                     Err(why) => omit(omitted, &CHECK_FEATURES, why),
                 }
@@ -588,6 +735,10 @@ impl PrFeatureStore {
             Err(why) => omit(omitted, &ISSUE_FEATURES, why),
         }
     }
+}
+
+fn base_key(read: &FeatureRead) -> BaseKey {
+    (read.repo.clone(), read.base.clone().unwrap_or_default())
 }
 
 /// A failed read keeps the last answer: it is still the newest known value,

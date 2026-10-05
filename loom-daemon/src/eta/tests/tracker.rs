@@ -859,7 +859,9 @@ fn the_tracker_records_read_and_stall_features() {
                     "body": "<!-- loom:points=3 -->", "user": {"login": "octocat"},
                     "updated_at": t(-9000).to_rfc3339(),
                 }),
-                ReadKind::Checks => panic!("no head is known before the first PR read"),
+                ReadKind::Checks | ReadKind::Required => {
+                    panic!("no head or base is known before the first PR read")
+                }
             };
             (r, Some(body), t(30))
         })

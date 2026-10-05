@@ -697,10 +697,12 @@ pub struct Features {
     /// When the breaker's cooldown releases.
     #[serde(default)]
     pub breaker_cooldown_until: Option<DateTime<Utc>>,
-    /// Check runs on the PR's head not yet completed.
+    /// Required contexts on the PR's head not yet completed (or not yet
+    /// registered). Optional checks never count.
     #[serde(default)]
     pub checks_pending: Option<u32>,
-    /// Check runs on the PR's head that failed.
+    /// Required contexts on the PR's head that failed. Optional checks
+    /// never count.
     #[serde(default)]
     pub checks_failed: Option<u32>,
 }

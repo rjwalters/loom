@@ -1082,12 +1082,16 @@ budget is zero.
 | Stored | Read | Applies to |
 |---|---|---|
 | `pr_additions`, `pr_deletions`, `pr_changed_files`, `pr_commits` | `pulls/{n}` | items with a PR |
-| `checks_pending`, `checks_failed` | `commits/{head}/check-runs` for the head the PR read shows: runs not completed; runs concluded `failure`, `timed_out`, `cancelled`, `action_required` or `startup_failure`. Every run on the head counts, not only required ones | items with an open PR |
+| `checks_pending`, `checks_failed` | `commits/{head}/check-runs` for the head the PR read shows, counted over the base branch's **required** contexts only (the `forge wait-checks` lookup and rollup): a required context still running or not yet registered is pending; one concluded other than `success`, `neutral` or `skipped` is failed. Optional checks never count; a branch that requires nothing gives `0`, `0` | items with an open PR |
 | `complexity_marker`, `points_marker`, `author` | `issues/{n}`: the `<!-- loom:complexity=… -->` and `<!-- loom:points=… -->` markers (the work finder's parsers) and `user.login` | every item |
 
 Each pass plans the reads that are due (`pulls` and checks older than
-15 min, `issues` older than 1 h): never-read first, then oldest. The rest
-wait for the next pass.
+15 min, `issues` and each base branch's required-context set older than
+1 h): never-read first, then oldest. The rest wait for the next pass. The
+required set is the lookup `forge wait-checks` uses (rulesets plus classic
+branch protection); it is not a conditional GET, so it is read once per base
+branch, not per PR. Legacy commit statuses are not read, so a required
+context reported only as a status counts as pending.
 
 **Point in time.** A read returns the current value, so a value is used at
 `as_of` only when it was known then: the read happened before `as_of`, or
@@ -1095,8 +1099,9 @@ it happened later but the PR or issue was last updated before `as_of`.
 Check runs change without touching the PR's `updated_at`, so they need a
 read before `as_of`. A PR that was closed or merged when read never records
 a size: its final size is not its size at `as_of`. A failed read keeps the
-previous answer, within the max age (1 h for PR reads, 24 h for issue
-reads).
+previous answer, within the max age (1 h for PR reads, 6 h for the
+required set, 24 h for issue reads). The required set, like check runs,
+needs a read before `as_of`.
 
 | reason | when |
 |---|---|
@@ -1110,6 +1115,8 @@ reads).
 | `checks_read_after_as_of` | the check runs were read at or after `as_of` |
 | `checks_for_other_head` | the check runs read are for another commit than the PR's head |
 | `checks_truncated` | the head has more than 100 check runs |
+| `required_unknown` | check features: the base branch's required set is not known at `as_of` (no lookup has answered before it, or the PR read shows no base) |
+| `required_lookup_failed` | check features: the required-context lookup failed and there is no earlier answer. Never replaced by a count over all checks |
 | `marker_absent` / `marker_invalid` | the body has no such marker / the points value is outside `1, 2, 3, 5, 8, 13` |
 
 A PR feature's null reason is the PR read's reason; a check feature's is the

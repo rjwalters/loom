@@ -18,6 +18,7 @@ fn pull_body(state: &str, merged: bool, additions: i64, sha: &str, updated: i64)
         "merged_at": if merged { json!(t(updated).to_rfc3339()) } else { Value::Null },
         "additions": additions, "deletions": 3, "changed_files": 2, "commits": 1,
         "head": {"sha": sha},
+        "base": {"ref": "main"},
         "updated_at": t(updated).to_rfc3339(),
     })
 }
@@ -26,12 +27,18 @@ fn issue_body(body: &str, updated: i64) -> Value {
     json!({"body": body, "user": {"login": "octocat"}, "updated_at": t(updated).to_rfc3339()})
 }
 
-fn checks_body(runs: &[(&str, Option<&str>)], total: usize) -> Value {
+fn checks_body(runs: &[(&str, &str, Option<&str>)], total: usize) -> Value {
     let runs: Vec<Value> = runs
         .iter()
-        .map(|(status, conclusion)| json!({"status": status, "conclusion": conclusion}))
+        .map(|(name, status, conclusion)| {
+            json!({"name": name, "status": status, "conclusion": conclusion})
+        })
         .collect();
     json!({"total_count": total, "check_runs": runs})
+}
+
+fn required_body(contexts: &[&str]) -> Value {
+    json!({ "required_contexts": contexts })
 }
 
 fn read(kind: ReadKind, number: u32, sha: Option<&str>) -> FeatureRead {
@@ -40,6 +47,17 @@ fn read(kind: ReadKind, number: u32, sha: Option<&str>) -> FeatureRead {
         kind,
         number,
         sha: sha.map(str::to_string),
+        base: None,
+    }
+}
+
+fn required_read(base: &str) -> FeatureRead {
+    FeatureRead {
+        repo: REPO.to_string(),
+        kind: ReadKind::Required,
+        number: 0,
+        sha: None,
+        base: Some(base.to_string()),
     }
 }
 
@@ -70,7 +88,8 @@ fn reason_of<'a>(omitted: &'a [FeatureOmitted], name: &str) -> Option<&'a str> {
         .map(|o| o.reason.as_str())
 }
 
-/// A store with PR #10 (for issue #1) and the issue read at `read_at`.
+/// A store with PR #10 (for issue #1), its checks, its base branch's
+/// required contexts (all three checks) and the issue, read at `read_at`.
 fn answered(read_at: DateTime<Utc>, pull: &Value) -> PrFeatureStore {
     let mut store = PrFeatureStore::default();
     store.answer(&read(ReadKind::Pull, 10, None), Some(pull), read_at);
@@ -86,12 +105,17 @@ fn answered(read_at: DateTime<Utc>, pull: &Value) -> PrFeatureStore {
         &read(ReadKind::Checks, 10, Some("abc")),
         Some(&checks_body(
             &[
-                ("completed", Some("success")),
-                ("in_progress", None),
-                ("completed", Some("failure")),
+                ("build", "completed", Some("success")),
+                ("test", "in_progress", None),
+                ("lint", "completed", Some("failure")),
             ],
             3,
         )),
+        read_at,
+    );
+    store.answer(
+        &required_read("main"),
+        Some(&required_body(&["build", "test", "lint"])),
         read_at,
     );
     store
@@ -189,6 +213,7 @@ fn the_reads_per_pass_never_exceed_the_budget_and_every_item_is_read_in_turn() {
                     issue_body("", -1)
                 }
                 ReadKind::Checks => checks_body(&[], 0),
+                ReadKind::Required => required_body(&[]),
             };
             store.answer(r, Some(&body), now);
         }
@@ -314,4 +339,98 @@ fn every_read_feature_is_a_value_or_has_exactly_one_reason() {
             }
         }
     }
+}
+
+/// #10232 finding 2: only the base branch's required contexts count. An
+/// optional check that fails is not a required failure.
+#[test]
+fn an_optional_check_failing_is_not_counted_as_failed() {
+    let mut store = answered(t(-60), &pull_body("open", false, 40, "abc", -120));
+    store.answer(
+        &read(ReadKind::Checks, 10, Some("abc")),
+        Some(&checks_body(
+            &[
+                ("Backend", "completed", Some("success")),
+                ("lint", "completed", Some("failure")),
+                ("docs", "in_progress", None),
+            ],
+            3,
+        )),
+        t(-60),
+    );
+    let required = |contexts: &[&str]| {
+        let mut store = store.clone();
+        store.answer(&required_read("main"), Some(&required_body(contexts)), t(-60));
+        let (f, omitted) = features_at(&store, Some(10), t(0));
+        assert!(reason_of(&omitted, "checks_failed").is_none(), "{omitted:?}");
+        (f.checks_pending.unwrap(), f.checks_failed.unwrap())
+    };
+    // `lint` failing and `docs` running are optional: nothing required is
+    // pending or failed, although an all-check count would say (1, 1).
+    assert_eq!(required(&["Backend"]), (0, 0));
+    // A required context with no run on the head yet is pending.
+    assert_eq!(required(&["Backend", "Gate"]), (1, 0));
+    // Once `lint` is required, its failure counts.
+    assert_eq!(required(&["Backend", "lint", "docs"]), (1, 1));
+    // A branch that requires nothing has nothing pending or failed.
+    assert_eq!(required(&[]), (0, 0));
+}
+
+/// #10232 finding 2: a failed required-context lookup leaves the check
+/// features null with a reason, never a count over all checks.
+#[test]
+fn a_failed_required_lookup_omits_the_check_features() {
+    let mut store = answered(t(-60), &pull_body("open", false, 40, "abc", -120));
+    store.required.clear();
+    store.answer(&required_read("main"), None, t(-60));
+    let (f, omitted) = features_at(&store, Some(10), t(0));
+    assert_eq!((f.checks_pending, f.checks_failed), (None, None));
+    for name in CHECK_FEATURES {
+        assert_eq!(reason_of(&omitted, name), Some(reason::REQUIRED_LOOKUP_FAILED));
+    }
+    // The PR size is still there: only the check features depend on the set.
+    assert_eq!(f.pr_additions, Some(40));
+
+    // No lookup yet, or one only answered after `as_of`: unknown.
+    store.required.clear();
+    let (f, omitted) = features_at(&store, Some(10), t(0));
+    assert_eq!(f.checks_failed, None);
+    assert_eq!(reason_of(&omitted, "checks_failed"), Some(reason::REQUIRED_UNKNOWN));
+    store.answer(&required_read("main"), Some(&required_body(&["lint"])), t(30));
+    let (f, omitted) = features_at(&store, Some(10), t(0));
+    assert_eq!(f.checks_failed, None);
+    assert_eq!(reason_of(&omitted, "checks_failed"), Some(reason::REQUIRED_UNKNOWN));
+}
+
+#[test]
+fn the_required_set_is_read_once_per_base_branch() {
+    let mut store = PrFeatureStore::default();
+    let items = [wanted(1, Some(10)), wanted(2, Some(11))];
+    for pr in [10, 11] {
+        store.answer(
+            &read(ReadKind::Pull, pr, None),
+            Some(&pull_body("open", false, 1, "abc", -5)),
+            t(0),
+        );
+    }
+    let required: Vec<_> = store
+        .plan(&items, t(1), 20)
+        .into_iter()
+        .filter(|r| r.kind == ReadKind::Required)
+        .collect();
+    assert_eq!(required, vec![required_read("main")]);
+    store.answer(&required[0], Some(&required_body(&["build"])), t(2));
+    let reads = store.plan(&items, t(3), 20);
+    assert!(reads.iter().all(|r| r.kind != ReadKind::Required), "fresh until refresh");
+    let reads = store.plan(&items, t(2 + REQUIRED_REFRESH_SEC), 20);
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|r| r.kind == ReadKind::Required)
+            .count(),
+        1
+    );
+    // The set is forgotten with the last PR that targets the branch.
+    store.plan(&[], t(4), 20);
+    assert!(store.required.is_empty());
 }

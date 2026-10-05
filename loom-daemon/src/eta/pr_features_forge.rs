@@ -7,6 +7,13 @@
 //! Entries are prefixed `eta-feature-` in the shared store directory, and
 //! entries older than [`ENTRY_MAX_AGE`] are pruned after each fresh answer:
 //! check-run entries are keyed by commit, so they would otherwise grow.
+//!
+//! The one read that is not a conditional GET is the base branch's
+//! required-context set: it is the lookup `forge wait-checks` uses
+//! ([`crate::forge_wait_checks::reads::required_contexts`]), so the estimate
+//! and the wait agree about what a branch requires. It is accounted under
+//! that lookup's own caller, and the store plans it at most once per base
+//! branch per hour. A failed lookup is a failed read, never an empty set.
 
 use super::pr_features::{FeatureRead, ReadKind};
 use crate::forge_call_stats::{ops, ForgeOp};
@@ -28,6 +35,8 @@ fn op(kind: ReadKind) -> ForgeOp {
         ReadKind::Pull => ops::PR_VIEW_STATE,
         ReadKind::Issue => ForgeOp::uninventoried("single-issue REST read has no inventory row"),
         ReadKind::Checks => ops::CI_CHECK_RUNS_FOR_SHA,
+        // Never used: `fetch` hands this kind to `fetch_required`.
+        ReadKind::Required => ForgeOp::uninventoried("required-context lookup accounts itself"),
     }
 }
 
@@ -67,6 +76,9 @@ pub fn settle(
 #[must_use]
 pub fn fetch(root: &Path, read: &FeatureRead) -> Option<Value> {
     let gh_bin = std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string());
+    if read.kind == ReadKind::Required {
+        return fetch_required(&gh_bin, read);
+    }
     let target = store::resolve_target(Some(root), Some(&read.repo));
     let url = read.url();
     let dir = store::disk_cache_dir();
@@ -102,6 +114,15 @@ pub fn fetch(root: &Path, read: &FeatureRead) -> Option<Value> {
         }
     };
     serde_json::from_str(&body).ok()
+}
+
+/// The base branch's required contexts as `{"required_contexts": [...]}`,
+/// or `None` when the lookup failed (or the read names no base).
+fn fetch_required(gh_bin: &str, read: &FeatureRead) -> Option<Value> {
+    let base = read.base.as_deref().filter(|b| !b.is_empty())?;
+    let (contexts, _notices) =
+        crate::forge_wait_checks::reads::required_contexts(gh_bin, &read.repo, base).ok()?;
+    Some(serde_json::json!({ "required_contexts": contexts }))
 }
 
 /// Run `reads` in order, each with its repo's root from `roots`, stamping
@@ -193,6 +214,7 @@ mod tests {
             kind,
             number: 7,
             sha: sha.map(str::to_string),
+            base: sha.map(str::to_string),
         };
         assert_eq!(read(ReadKind::Pull, None).url(), "repos/o/r/pulls/7");
         assert_eq!(read(ReadKind::Issue, None).url(), "repos/o/r/issues/7");
@@ -200,6 +222,7 @@ mod tests {
             read(ReadKind::Checks, Some("abc")).url(),
             "repos/o/r/commits/abc/check-runs?per_page=100"
         );
+        assert_eq!(read(ReadKind::Required, Some("main")).url(), "repos/o/r/rules/branches/main");
     }
 
     #[test]
@@ -209,10 +232,24 @@ mod tests {
             kind: ReadKind::Pull,
             number: 1,
             sha: None,
+            base: None,
         };
         let answers = run(vec![read.clone()], &[]);
         assert_eq!(answers.len(), 1);
         assert_eq!(answers[0].0, read);
         assert!(answers[0].1.is_none());
+    }
+
+    #[test]
+    fn a_required_read_with_no_base_fails_without_a_call() {
+        let read = FeatureRead {
+            repo: "o/r".into(),
+            kind: ReadKind::Required,
+            number: 0,
+            sha: None,
+            base: None,
+        };
+        // No base branch: a failed read, before any `gh` is run.
+        assert!(fetch_required("/nonexistent/gh", &read).is_none());
     }
 }
