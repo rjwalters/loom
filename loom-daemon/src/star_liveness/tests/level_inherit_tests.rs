@@ -726,3 +726,70 @@ fn a_level_promoted_row_takes_its_level_sources_starred_at() {
     assert_eq!(promoted.level, 2);
     assert_eq!(promoted.operator_priority_at, source.operator_priority_at);
 }
+
+/// Judge finding (#10315): the two-host ownership guard held at planning but
+/// not at execution. Host B manages only `o/lib`; it plans a write against
+/// the listing, then host A re-owns the marker (`inherited_from=o/app#1`)
+/// before B's write-time read. B must write and remove nothing.
+fn stale_plan_world() -> (World, levels::Key, String) {
+    let world = World::default();
+    let key: levels::Key = ("o/lib".to_string(), 3);
+    let planned_from: levels::Key = ("o/lib".to_string(), 9);
+    let mine = own_marker(&key, &planned_from, 2, "2026-10-05T20:00:00Z");
+    world.add("o/lib", issue_with_body(3, &[INH], &format!("text\n\n{mine}")));
+    // The interleaved write: host A replaced the provenance.
+    let theirs = own_marker(&key, &("o/app".to_string(), 1), 2, "2026-10-05T20:01:00Z");
+    world.repo("o/lib").items.get_mut(&3).unwrap().body = Some(format!("text\n\n{theirs}"));
+    (world, key, theirs)
+}
+
+fn apply_as_lib_only(world: &World, w: &levels::Write) {
+    let managed = HashMap::from([("o/lib".to_string(), "o/lib".to_string())]);
+    let mut reader = levels::ForgeReader::new(managed, 10);
+    reader
+        .forges
+        .insert("o/lib".to_string(), world.forge("o/lib"));
+    levels::apply_write(&mut reader, w).unwrap();
+}
+
+#[test]
+fn a_planned_removal_is_dropped_when_the_marker_changes_owner_before_the_write() {
+    let (world, key, theirs) = stale_plan_world();
+    let before = world.repo("o/lib").body_writes.len();
+    apply_as_lib_only(
+        &world,
+        &levels::Write::Remove {
+            key,
+            label: INH,
+            level: 2,
+            provenance: true,
+        },
+    );
+    assert!(has(&world, "o/lib", 3, INH), "the other host's active label stays");
+    assert!(body(&world, "o/lib", 3).ends_with(&theirs), "its marker stays");
+    assert_eq!(world.repo("o/lib").body_writes.len(), before, "no body write");
+}
+
+#[test]
+fn a_planned_provenance_replacement_never_overwrites_a_newly_foreign_marker() {
+    let (world, key, theirs) = stale_plan_world();
+    let source: levels::Key = ("o/lib".to_string(), 9);
+    let reach = levels::Reach {
+        key,
+        level: 2,
+        source,
+        via: ("o/lib".to_string(), 9),
+        requested_at: None,
+        depth: 1,
+        issue: world.repo("o/lib").items[&3].clone(),
+    };
+    let before = world.repo("o/lib").body_writes.len();
+    apply_as_lib_only(
+        &world,
+        &levels::Write::Provenance {
+            reach: Box::new(reach),
+        },
+    );
+    assert!(body(&world, "o/lib", 3).ends_with(&theirs));
+    assert_eq!(world.repo("o/lib").body_writes.len(), before, "no body write");
+}

@@ -861,7 +861,9 @@ pub fn run_with(
     }
 }
 
-fn apply_write(reader: &mut ForgeReader<'_>, w: &Write) -> anyhow::Result<()> {
+pub(crate) fn apply_write(reader: &mut ForgeReader<'_>, w: &Write) -> anyhow::Result<()> {
+    let managed_slugs = reader.managed.clone();
+    let managed = |slug: &str| managed_slugs.contains_key(&slug.to_ascii_lowercase());
     let slug = match w {
         Write::Add { reach, .. } | Write::Provenance { reach } => &reach.key.0,
         Write::Remove { key, .. } => &key.0,
@@ -879,11 +881,14 @@ fn apply_write(reader: &mut ForgeReader<'_>, w: &Write) -> anyhow::Result<()> {
             // Provenance first: a failed body write skips the label, so the
             // whole add retries next pass.
             if *provenance {
+                // A marker another host's source now owns is left alone; the
+                // label is still wanted, so it is added regardless.
                 set_marker(
                     forge.as_mut(),
                     &reach.key,
                     reach.level,
                     Some(&provenance_marker(reach)),
+                    &managed,
                 )?;
             }
             forge.add_label(reach.key.1, label)?;
@@ -895,17 +900,28 @@ fn apply_write(reader: &mut ForgeReader<'_>, w: &Write) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Write::Provenance { reach } => {
-            set_marker(forge.as_mut(), &reach.key, reach.level, Some(&provenance_marker(reach)))
-        }
+        Write::Provenance { reach } => set_marker(
+            forge.as_mut(),
+            &reach.key,
+            reach.level,
+            Some(&provenance_marker(reach)),
+            &managed,
+        )
+        .map(drop),
         Write::Remove {
             key,
             label,
             level,
             provenance,
         } => {
-            if *provenance {
-                set_marker(forge.as_mut(), key, *level, None)?;
+            if *provenance && !set_marker(forge.as_mut(), key, *level, None, &managed)? {
+                // The marker now names a source this host cannot recompute:
+                // another host owns the label too, so it stays.
+                log::debug!(
+                    "star_liveness: {} is owned by another host; kept {label}",
+                    display(key)
+                );
+                return Ok(());
             }
             forge.remove_label(key.1, label)?;
             log::info!(
@@ -919,23 +935,29 @@ fn apply_write(reader: &mut ForgeReader<'_>, w: &Write) -> anyhow::Result<()> {
 
 /// Read-modify-write `key`'s body so its level-`level` marker is `marker`.
 /// The body is re-read just before the write, and nothing is written when
-/// the marker is already right.
+/// the marker is already right. Ownership is re-checked against that fresh
+/// read, not the listing the plan was made from: returns `false`, writing
+/// nothing, when the marker now names a source in a repo `managed` rejects.
 fn set_marker(
     forge: &mut dyn StarForge,
     key: &Key,
     level: u8,
     marker: Option<&str>,
-) -> anyhow::Result<()> {
+    managed: &dyn Fn(&str) -> bool,
+) -> anyhow::Result<bool> {
     let current = forge
         .issue(key.1)?
         .ok_or_else(|| anyhow::anyhow!("{} is gone", display(key)))?
         .body
         .unwrap_or_default();
+    if !may_override(marker_for(&current, key, level).as_ref(), managed) {
+        return Ok(false);
+    }
     let next = with_marker(&current, key, level, marker);
     if next != current {
         forge.set_body(key.1, &next)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// The liveness row for a blocker reached only by a level: classified from
