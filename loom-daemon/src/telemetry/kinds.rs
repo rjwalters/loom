@@ -400,6 +400,8 @@ macro_rules! telemetry_kind_table {
             /// #10391). OTLP-only, like the other `eta.*` log kinds. See
             /// [`eta_fit`].
             EtaFit = "eta.fit" => $crate::telemetry::kinds::eta_fit::EtaFitRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
             /// One role tick's (or work-finder tick's) pick decision (Issue #10212):
             /// the ranked candidates it considered, what it acted on, and a
             /// closed-set reason per skip. OTLP-only. See [`pick_decision`].
