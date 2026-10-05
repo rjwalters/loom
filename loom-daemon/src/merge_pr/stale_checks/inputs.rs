@@ -608,6 +608,10 @@ pub const SPECS: &[CheckSpec<'static>] = &[
         global: &[
             "scripts/check-shell-allowlist.sh",
             "scripts/shell-allowlist.txt",
+            // The CI Result gate's tests ride in this component's step group
+            // (#10444); the test drives the gate script, so both are inputs.
+            "scripts/test-ci-result-gate.sh",
+            "scripts/ci-result-gate.sh",
             CI_WORKFLOW,
         ],
         scanned: SHELL,

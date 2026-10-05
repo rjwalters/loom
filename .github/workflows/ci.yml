@@ -2650,7 +2650,8 @@ jobs:
   # that never reports blocks every merge. The remedy for a red result is
   # `gh run rerun --failed <run>` -- never cancel a distinct commit's run.
   ci-result:
-    # merge-group-audit: pr-only -- the aggregate must itself run on every event; it reads the other jobs' results and has no path filter of its own
+    # No `merge-group-audit: pr-only` marker: `if: always()` runs this on every
+    # event, merge_group included, so the audit must count it as relied-on.
     name: CI Result
     if: always()
     needs:
