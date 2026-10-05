@@ -171,7 +171,7 @@ impl GhStarForge {
     }
 
     fn api(&self, args: &[&str], context: &str) -> Result<String> {
-        if crate::rate_limit_breaker::global_is_suppressed() {
+        if crate::rate_limit_breaker::global_skip_pass("star_liveness") {
             return Err(anyhow!("rate-limit breaker is suppressing forge calls"));
         }
         // #10089: counted via the facade (`star.api`); it supplies the #5401
@@ -196,7 +196,7 @@ impl GhStarForge {
     /// `Ok(Some(body))` on a `200` or a `304` served from the stored body,
     /// `Ok(None)` on a `404`.
     fn cached_get(&self, op: ForgeOp, url: &str) -> Result<Option<String>> {
-        if crate::rate_limit_breaker::global_is_suppressed() {
+        if crate::rate_limit_breaker::global_skip_pass("star_liveness") {
             return Err(anyhow!("rate-limit breaker is suppressing forge calls"));
         }
         let cwd = Some(self.root.as_path());

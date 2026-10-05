@@ -228,7 +228,7 @@ impl SweepRegistry {
         // suppressing forge polling, a best-effort telemetry read is exactly
         // the kind of call that must stand down — the journal line is still
         // written, just without these two fields.
-        if crate::rate_limit_breaker::global_is_suppressed() {
+        if crate::rate_limit_breaker::global_skip_pass("outcome_journal") {
             log::debug!(
                 "sweep_outcomes: skipping the PR #{pr_number} label-timeline read — the \
                  rate-limit breaker is suppressing forge polling (#8222)"

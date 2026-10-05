@@ -71,6 +71,11 @@ pub enum SpanName {
     /// root (`context_source=missing`).
     #[serde(rename = "invoke github")]
     GithubInvoke,
+    /// One GitHub rate-limit breaker trip (Issue #10022): an instant span,
+    /// its own root trace, carrying the tripping job and the trip-time
+    /// own/external attribution.
+    #[serde(rename = "loom.ratelimit.trip")]
+    RateLimitTrip,
 }
 
 impl SpanName {
@@ -94,6 +99,7 @@ impl SpanName {
             Self::DispatchAdmission => "loom.dispatch.admission",
             Self::DispatchDisposition => "loom.dispatch.disposition",
             Self::GithubInvoke => "invoke github",
+            Self::RateLimitTrip => "loom.ratelimit.trip",
         }
     }
 }

@@ -168,6 +168,9 @@ pub fn report_failure(
             transition.reason,
             provisional.describe()
         );
+        // Authoritative headers, no probe: the trip span carries no
+        // attribution (#10022).
+        super::export_trip(source, now, transition.until, None, || None);
         return Some(Reported {
             transition,
             refine: None,
@@ -175,7 +178,15 @@ pub fn report_failure(
     }
     match handle.mode {
         ProbeMode::Inline => {
-            let until = refine(breaker, handle.probe.as_ref(), error_text, &ctx, now);
+            let until = refine(
+                breaker,
+                handle.probe.as_ref(),
+                error_text,
+                source,
+                transition.until,
+                &ctx,
+                now,
+            );
             let transition = breaker.retitle(transition, until);
             log::warn!("rate_limit_breaker: {} — {}", transition.kind.as_str(), transition.reason);
             Some(Reported {
@@ -192,10 +203,12 @@ pub fn report_failure(
             let breaker = Arc::clone(breaker);
             let probe = Arc::clone(&handle.probe);
             let text = error_text.to_owned();
+            let source = source.to_owned();
+            let provisional_until = transition.until;
             let spawned = std::thread::Builder::new()
                 .name("rate-limit-probe".to_owned())
                 .spawn(move || {
-                    refine(&breaker, probe.as_ref(), &text, &ctx, now);
+                    refine(&breaker, probe.as_ref(), &text, &source, provisional_until, &ctx, now);
                 });
             Some(Reported {
                 transition,
@@ -206,11 +219,15 @@ pub fn report_failure(
 }
 
 /// Probe under `ctx`, select evidence, and narrow/extend the trip started at
-/// `tripped_at`. Returns the resulting release time.
+/// `tripped_at`. Returns the resulting release time. Exports the trip span
+/// with the probe's attribution once the release time is known (#10022) —
+/// the trip's one export, since a re-trip while cooling never reaches here.
 fn refine(
     breaker: &SharedRateLimitBreaker,
     probe: &dyn BudgetProbe,
     error_text: &str,
+    source: &str,
+    provisional_until: Option<DateTime<Utc>>,
     ctx: &FailureContext,
     tripped_at: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
@@ -220,34 +237,12 @@ fn refine(
     if let Some(until) = until {
         log::info!("rate_limit_breaker: cooldown until {until} from {}", ev.describe());
     }
-    if let Some(b) = &budget {
-        log_attribution(b, reading_trusted, tripped_at);
-    }
-    until
-}
-
-/// Trip attribution (Issue #9855): the probe's pool-wide `used` minus this
-/// host's own ledger says whether this daemon exhausted its own pool or an
-/// external client sharing the credential did.
-fn log_attribution(b: &BudgetSnapshot, trusted: bool, now: DateTime<Utc>) {
-    let own = crate::forge_call_stats::consumed_in_window(now);
-    let line = |pool: &str, used: Option<u64>| -> String {
-        match (used, own.as_ref()) {
-            (Some(u), Some(m)) => {
-                let o = m
-                    .iter()
-                    .find(|(p, _)| p.as_str() == pool)
-                    .map_or(0, |(_, v)| *v);
-                format!("used={u} own≈{o} external≈{}", u.saturating_sub(o))
-            }
-            (Some(u), None) => format!("used={u} own=? (sink off) external=?"),
-            (None, _) => "used=? (probe without used)".to_string(),
-        }
-    };
-    log::warn!(
-        "rate_limit_breaker: attribution: core {} · graphql {} — external is other clients of this credential{}",
-        line("core", b.core_used),
-        line("graphql", b.graphql_used),
-        if trusted { "" } else { " (reading untrusted, see #8997)" },
+    super::export_trip(
+        source,
+        tripped_at,
+        until.or(provisional_until),
+        budget.as_ref().map(|b| (b, reading_trusted)),
+        || crate::forge_call_stats::consumed_in_window(tripped_at),
     );
+    until
 }

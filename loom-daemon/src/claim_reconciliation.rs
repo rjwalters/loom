@@ -1832,7 +1832,7 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
     // would fail (and a rate-limited pass is indistinguishable from "nothing
     // to reclaim" in the return values), so skip the whole pass — the next
     // interval tick retries after the window resets.
-    if crate::rate_limit_breaker::global_is_suppressed() {
+    if crate::rate_limit_breaker::global_skip_pass("claim_reconciliation") {
         log::info!(
             "claim_reconciliation: pass skipped — shared GitHub API rate limit exhausted (#4429)"
         );
@@ -3196,7 +3196,7 @@ pub mod forge {
                     // same "protect the rest of the current pass, not just the
                     // next one" shape `run_reconciliation_pass_over_roots`
                     // applies one level up, at per-root granularity.
-                    if crate::rate_limit_breaker::global_is_suppressed() {
+                    if crate::rate_limit_breaker::global_skip_pass("claim_reconciliation") {
                         log::info!(
                             "claim_reconciliation (verdicts): {}: stopping remaining verdict \
                              labels for this root — shared GitHub API rate limit exhausted \

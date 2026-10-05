@@ -133,7 +133,8 @@ pub fn ci_main_red(root: &Path) -> bool {
             return red;
         }
     }
-    let red = !crate::rate_limit_breaker::global_is_suppressed() && probe_ci_main_red(root);
+    let red =
+        !crate::rate_limit_breaker::global_skip_pass("work_finder") && probe_ci_main_red(root);
     if let Ok(mut cache) = ci_cache().lock() {
         cache.insert(root.to_path_buf(), (now, red));
     }

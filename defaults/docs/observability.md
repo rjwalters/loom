@@ -527,6 +527,20 @@ from a slash-command argument (and its `loom.repo` from the workspace's git
 remote, as an `owner/name` slug or not at all). Details are in
 [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
+**GitHub rate limit (#10022).** Each rate-limit breaker trip emits one
+`loom.ratelimit.trip` span (never one per re-trip while cooling), carrying the
+job that tripped it (`loom.ratelimit.source`), the cooldown end and, per pool,
+the probe's `used` split into this host's own share and the external share
+(`github.ratelimit.{core,graphql}.{used,own,external}`) — the `attribution:`
+line from `daemon.log`, now queryable fleet-wide. Every 60 s the collector
+probes `gh api rate_limit` (free: it does not count against the quota) and
+exports `github.ratelimit.{remaining,used,reset}` gauges labelled `resource`
+(`core`|`graphql`) and `account` (`app-<app id>` for the daemon's GitHub App,
+the `gh` login for an ambient credential, else `unknown` — never a token or
+path), and flushes `github.ratelimit.breaker_skips{reason=<job>}`: one per
+pass a job skipped while the breaker suppressed. A host that never enables an
+OTLP exporter exports none of this; its evidence stays in `daemon.log`.
+
 To add a signal, add a `MetricName` or `SpanName` variant. If it needs a new
 label or attribute key, extend `OPS_METRIC_LABEL_KEYS` or
 `OPS_SPAN_ATTRIBUTE_KEYS` and the gateway collector's `keep_keys` in

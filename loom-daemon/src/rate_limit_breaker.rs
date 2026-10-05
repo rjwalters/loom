@@ -33,6 +33,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
+use std::collections::BTreeMap;
+
+use crate::forge_call_stats::Pool;
+pub use crate::observability::ops::ratelimit::{Job, TripAttribution};
 
 pub mod evidence;
 pub mod report;
@@ -431,6 +435,28 @@ impl SharedRateLimitBreaker {
         })
     }
 
+    /// [`Self::is_suppressed`] at a skip site: when suppressed, also counts
+    /// one skipped pass for `job` (`github.ratelimit.breaker_skips`, #10022).
+    /// Call it only where `true` really skips a pass — polling the predicate
+    /// elsewhere would over-count.
+    #[must_use]
+    pub fn skip_if_suppressed(&self, job: &str, now: DateTime<Utc>) -> bool {
+        let suppressed = self.is_suppressed(now);
+        if suppressed {
+            crate::observability::ops::ratelimit::record_skip(Job::from_source(job));
+        }
+        suppressed
+    }
+
+    /// The last budget reading the breaker cached (trip-time probe).
+    #[must_use]
+    pub fn last_budget(&self) -> Option<BudgetSnapshot> {
+        self.inner
+            .lock()
+            .expect("rate-limit breaker mutex poisoned")
+            .last_budget
+    }
+
     /// Re-derive the release time of the window tripped at `tripped_at` from
     /// later `evidence` (a contextual probe, #8997). A fallback keeps the
     /// provisional window; a trusted reset replaces it (clamped from
@@ -578,6 +604,52 @@ pub fn global_snapshot() -> Option<RateLimitSnapshot> {
 /// [`global_observe_failure_ctx`].
 pub fn global_observe_failure(error_text: &str, source: &str) -> Option<Transition> {
     global_observe_failure_ctx(error_text, source, report::FailureContext::default())
+}
+
+/// [`global_is_suppressed`] at a skip site: also counts one skipped pass for
+/// `job` (see [`SharedRateLimitBreaker::skip_if_suppressed`]).
+#[must_use]
+pub fn global_skip_pass(job: &str) -> bool {
+    GLOBAL
+        .get()
+        .is_some_and(|b| b.skip_if_suppressed(job, Utc::now()))
+}
+
+/// Export one fresh trip as a `loom.ratelimit.trip` span (Issue #10022) and,
+/// when a probe reading exists, log its attribution (Issue #9855): the
+/// probe's pool-wide `used` minus this host's own ledger says whether this
+/// daemon exhausted its own pool or an external client sharing the
+/// credential did. `ledger` (`forge_call_stats::consumed_in_window`) is read
+/// only when there is a reading. An untrusted reading (#8997 — possibly
+/// another credential's budget) is logged with a marker but kept off the
+/// span, whose attribution attributes are then omitted rather than wrong.
+pub fn export_trip(
+    source: &str,
+    tripped_at: DateTime<Utc>,
+    cooldown_until: Option<DateTime<Utc>>,
+    reading: Option<(&BudgetSnapshot, bool)>,
+    ledger: impl FnOnce() -> Option<BTreeMap<Pool, u64>>,
+) {
+    let attribution = reading.map_or_else(TripAttribution::default, |(budget, trusted)| {
+        let attribution = TripAttribution::from_budget(Some(budget), ledger().as_ref());
+        log::warn!(
+            "rate_limit_breaker: attribution: core {} · graphql {} — external is other clients of this credential{}",
+            attribution.core.log_text(),
+            attribution.graphql.log_text(),
+            if trusted { "" } else { " (reading untrusted, see #8997)" },
+        );
+        if trusted {
+            attribution
+        } else {
+            TripAttribution::default()
+        }
+    });
+    crate::observability::ops::ratelimit::record_trip(
+        source,
+        tripped_at,
+        cooldown_until,
+        &attribution,
+    );
 }
 
 /// [`global_observe_failure`] with the failing call's context (#8997), so
