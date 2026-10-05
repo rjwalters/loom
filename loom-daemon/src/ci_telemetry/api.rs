@@ -298,44 +298,44 @@ impl GhCliApi {
     /// the reader (until the reported reset, when there is one) and the same
     /// call is retried once on the writer's credential.
     fn run(&self, path: &str, extra: &[&str]) -> Result<ApiResponse, ApiError> {
+        use crate::forge_identity::Failure;
         let nwo = repo_of_path(path);
         let reader = nwo
             .as_deref()
             .and_then(|r| crate::forge_identity::read_credential(r, None));
-        if let (Some((dir, app_id)), Some(nwo)) = (reader, nwo.as_deref()) {
-            let first = self.run_once(path, extra, Some(&dir));
-            let (failure, app_until) = match &first {
-                Err(ApiError::RateLimited { reset_epoch, .. }) => (
-                    Some(crate::forge_identity::Failure::App),
-                    reset_epoch
-                        .and_then(|e| u64::try_from(e).ok())
-                        .map(|e| std::time::UNIX_EPOCH + std::time::Duration::from_secs(e)),
-                ),
-                Err(ApiError::Http { status: 401, .. }) => {
-                    (Some(crate::forge_identity::Failure::App), None)
+        // The shared reader → writer retry (#9872, `reader_then_writer`).
+        let attempt = crate::forge_identity::reader_then_writer(
+            reader.as_ref().map(|(dir, _)| dir.as_path()),
+            |dir, role| Ok::<_, std::convert::Infallible>(self.run_once(path, extra, dir, role)),
+            Result::is_ok,
+            |r| match r {
+                Err(ApiError::RateLimited { .. } | ApiError::Http { status: 401, .. }) => {
+                    Some(Failure::App)
                 }
                 Err(ApiError::Http {
                     status: 403 | 404, ..
-                }) => (Some(crate::forge_identity::Failure::Coverage), None),
-                _ => (None, None),
-            };
-            let Some(failure) = failure else {
-                return first;
-            };
-            let why = format!("ci_telemetry {path}");
-            if failure == crate::forge_identity::Failure::App {
-                crate::forge_identity::withdraw_after(&app_id, nwo, failure, app_until, &why);
-                return self.run_once(path, extra, None);
-            }
-            // Coverage only when the writer CAN read it: a real 404 (a deleted
-            // run) fails on both and must not withdraw the repo's reader.
-            let second = self.run_once(path, extra, None);
-            if second.is_ok() {
-                crate::forge_identity::withdraw_after(&app_id, nwo, failure, None, &why);
-            }
-            return second;
+                }) => Some(Failure::Coverage),
+                _ => None,
+            },
+            |failure, failed| {
+                let (Some((_, app_id)), Some(nwo)) = (&reader, nwo.as_deref()) else {
+                    return;
+                };
+                // A rate limit withdraws the reader until the reported reset.
+                let app_until = match (failure, failed) {
+                    (Failure::App, Err(ApiError::RateLimited { reset_epoch, .. })) => reset_epoch
+                        .and_then(|e| u64::try_from(e).ok())
+                        .map(|e| std::time::UNIX_EPOCH + std::time::Duration::from_secs(e)),
+                    _ => None,
+                };
+                let why = format!("ci_telemetry {path}");
+                crate::forge_identity::withdraw_after(app_id, nwo, failure, app_until, &why);
+            },
+        );
+        match attempt {
+            Ok(result) => result,
+            Err(never) => match never {},
         }
-        self.run_once(path, extra, None)
     }
 
     /// One `gh api --include …` invocation, under `reader_dir`'s credential
@@ -351,6 +351,7 @@ impl GhCliApi {
         path: &str,
         extra: &[&str],
         reader_dir: Option<&std::path::Path>,
+        role: crate::forge_identity::IdentityRole,
     ) -> Result<ApiResponse, ApiError> {
         let inv = GhInvocation::new(
             Operation::new("ci_telemetry"),
@@ -365,7 +366,14 @@ impl GhCliApi {
         .args(["api", "--include"])
         .args(extra)
         .arg(path)
+        .identity_role(role)
         .gh_config_dir(reader_dir);
+        // A reader attempt must not be outranked by an env token (#9872).
+        let inv = if role == crate::forge_identity::IdentityRole::Reader {
+            inv.without_token_env()
+        } else {
+            inv
+        };
         let output = self.captured(inv, &format!("gh api {path}"), API_TIMEOUT)?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);

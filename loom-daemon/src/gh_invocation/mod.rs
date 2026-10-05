@@ -31,12 +31,18 @@
 //!   in [`crate::forge_call_stats`], keyed by its [`Operation`], so
 //!   `loom-daemon status` and the breaker's own-versus-external line count it.
 //!
+//! - [`reader_route`] (#9872) — a captured, repo-scoped [`AccessIntent::Read`]
+//!   runs under the repo's reader App when one is configured and fresh, with
+//!   one writer retry on a credential failure; every row records the identity
+//!   role (`reader` / `writer` / `writer-fallback`).
+//!
 //! `gh-cached` substitution for reads, the async/tokio variant and the Gitea
 //! decline move in with the slices that first need them (see #9985's slicing
 //! plan).
 
 pub mod accounting;
 mod outcome;
+mod reader_route;
 pub mod resolver;
 pub mod telemetry;
 
@@ -265,6 +271,10 @@ pub struct GhInvocation {
     strip_token_env: bool,
     /// The [`OutputContract::CredentialHelper`] request written to stdin.
     stdin_input: Vec<u8>,
+    /// Never route this read to a reader App (#9872).
+    writer_only: bool,
+    /// The identity role the accounting row records; `None` = writer.
+    role: Option<crate::forge_identity::IdentityRole>,
     /// The #9777 call identity this execution is accounted under (#9831).
     /// Empty by default: an unmapped site records `operation = "unknown"`
     /// (see [`accounting`]), visible rather than absent.
@@ -294,6 +304,8 @@ impl GhInvocation {
             config_dir: None,
             strip_token_env: false,
             stdin_input: Vec::new(),
+            writer_only: false,
+            role: None,
             identity: crate::forge_call_stats::CallIdentity::default(),
         }
     }
@@ -382,6 +394,24 @@ impl GhInvocation {
     #[must_use]
     pub fn without_token_env(mut self) -> Self {
         self.strip_token_env = true;
+        self
+    }
+
+    /// Keep this read on the writer credential (#9872): for a read whose
+    /// answer depends on **who** asks — a permission or write-scope probe,
+    /// `viewer`, `/user` — which a reader App would answer for itself.
+    #[must_use]
+    pub fn writer_identity(mut self) -> Self {
+        self.writer_only = true;
+        self
+    }
+
+    /// Record this execution under `role` (#9872) — for a caller that routes
+    /// its own reads (`forge_etag_store`, `ci_telemetry`). The choke point's
+    /// own routing sets it itself.
+    #[must_use]
+    pub fn identity_role(mut self, role: crate::forge_identity::IdentityRole) -> Self {
+        self.role = Some(role);
         self
     }
 
@@ -519,12 +549,24 @@ impl GhInvocation {
     /// under its [`OutputContract`], recording one `invoke github` span (and,
     /// unless it succeeded, a local completion record — [`telemetry`]).
     ///
+    /// An eligible read runs under the repo's reader App first and is retried
+    /// once on the writer after a credential failure ([`reader_route`]); each
+    /// attempt is its own span and accounting row.
+    ///
     /// # Errors
     ///
     /// [`ExecError::Spawn`] when `gh` could not be started;
     /// [`ExecError::Collect`] when it started but its result could not be
     /// collected (side effects may have happened — never retry a write on it).
     pub fn execute(self) -> Result<GhCompletion, ExecError> {
+        self.execute_routed(
+            &|slug, host| crate::forge_identity::read_credential(slug, host),
+            &reader_route::withdraw_reader,
+        )
+    }
+
+    /// Run exactly once under the credential already chosen (no routing).
+    fn execute_direct(self) -> Result<GhCompletion, ExecError> {
         if let Some(program) = self.program.clone() {
             return self.execute_with(&program, GhBinSource::Injected);
         }

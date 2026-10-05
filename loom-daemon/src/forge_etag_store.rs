@@ -241,45 +241,39 @@ pub(crate) fn fetch_conditional(
     // #9537: a listing is a read, so it goes to the repo's reader App when one
     // is usable. On a credential failure the reader is withdrawn and the SAME
     // request is retried once on the writer, so a broken reader costs one
-    // extra call, never a failed poll. The cache key deliberately stays on the
-    // writer's credential scope: reader choice is deterministic per repo, so
-    // keeping the key means no ETag is invalidated when readers come online.
+    // extra call, never a failed poll (the shared shape,
+    // `forge_identity::reader_then_writer`, #9872). The cache key deliberately
+    // stays on the writer's credential scope: reader choice is deterministic
+    // per repo, so keeping the key means no ETag is invalidated when readers
+    // come online.
     let reader = target
         .repo
         .as_deref()
         .and_then(|r| crate::forge_identity::read_credential(r, target.host.as_deref()));
-    if let Some((dir, app_id)) = reader {
-        let first = run_fetch(site, gh_bin, cwd, target, url, etag, Some(&dir))?;
-        let (status, response, stderr) = &first;
-        let http = response.as_ref().map(|r| r.status);
-        let ok = status.success() || matches!(http, Some(200 | 304));
-        let failure = if ok {
-            None
-        } else {
-            crate::forge_identity::classify_failure(stderr, http)
-        };
-        let Some(failure) = failure else {
-            return Ok(first);
-        };
-        let repo = target.repo.as_deref().unwrap_or_default();
-        let why = format!("{} {url}", site.caller);
-        if failure == crate::forge_identity::Failure::App {
-            crate::forge_identity::withdraw_after(&app_id, repo, failure, None, &why);
-            return run_fetch(site, gh_bin, cwd, target, url, etag, None);
-        }
-        // A 403/404 is only the READER's coverage gap if the writer can read
-        // the same thing; a genuinely missing resource (a deleted issue) 404s
-        // for both and must not take the repo's reader offline for an hour.
-        let second = run_fetch(site, gh_bin, cwd, target, url, etag, None)?;
-        let writer_ok =
-            second.0.success() || matches!(second.1.as_ref().map(|r| r.status), Some(200 | 304));
-        if writer_ok {
-            crate::forge_identity::withdraw_after(&app_id, repo, failure, None, &why);
-        }
-        return Ok(second);
-    }
-    run_fetch(site, gh_bin, cwd, target, url, etag, None)
+    let reader_dir = reader.as_ref().map(|(dir, _)| dir.as_path());
+    let http_ok = |r: &FetchResult| {
+        r.0.success() || matches!(r.1.as_ref().map(|h| h.status), Some(200 | 304))
+    };
+    crate::forge_identity::reader_then_writer(
+        reader_dir,
+        // The reader attempt drops env tokens (#9872): `gh` prefers an env
+        // `GH_TOKEN`/`GITHUB_TOKEN` over `GH_CONFIG_DIR`, so without this an
+        // ambient personal token would serve the "reader" read.
+        |dir, role| run_fetch_with(site, gh_bin, cwd, target, url, etag, dir, dir.is_some(), role),
+        http_ok,
+        |r| crate::forge_identity::classify_failure(&r.2, r.1.as_ref().map(|h| h.status)),
+        |failure, _| {
+            if let Some((_, app_id)) = &reader {
+                let repo = target.repo.as_deref().unwrap_or_default();
+                let why = format!("{} {url}", site.caller);
+                crate::forge_identity::withdraw_after(app_id, repo, failure, None, &why);
+            }
+        },
+    )
 }
+
+/// `(exit status, parsed `--include` response, trimmed stderr)` of one fetch.
+type FetchResult = (ExitStatus, Option<HttpResponse>, String);
 
 /// One `gh api --include <url>` read under **exactly** the reader App whose
 /// `GH_CONFIG_DIR` is `reader_dir` — the reader-only primitive (#10263).
@@ -302,7 +296,8 @@ pub(crate) fn fetch_with_reader(
     etag: Option<&str>,
     reader_dir: &Path,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
-    run_fetch_with(site, gh_bin, cwd, target, url, etag, Some(reader_dir), true)
+    let role = crate::forge_identity::IdentityRole::Reader;
+    run_fetch_with(site, gh_bin, cwd, target, url, etag, Some(reader_dir), true, role)
 }
 
 /// Deadline for one conditional read (they were unbounded `.output()`s before
@@ -311,7 +306,9 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One `gh api --include` run. `reader_dir` = `Some` runs it under that
 /// reader's `GH_CONFIG_DIR`; `None` under the writer's (#5401 per-owner, else
-/// process-global).
+/// process-global). `strip_token_env` removes every token env var from the
+/// child ([`GhInvocation::without_token_env`]); `role` is the identity the
+/// accounting row records (#9872).
 ///
 /// Built through [`GhInvocation`] (#10089), which records the call against
 /// `site` in [`crate::forge_call_stats`] from the `--include` status line
@@ -319,20 +316,6 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// the hand-rolled record call here used. [`GhTarget::None`] on purpose: the
 /// writer credential stays the `cwd` root's (#5401) and nothing else, so the
 /// identity a call runs under keeps matching [`credential_scope`]'s cache key.
-fn run_fetch(
-    site: ConditionalRead,
-    gh_bin: &Path,
-    cwd: Option<&Path>,
-    target: &Target,
-    url: &str,
-    etag: Option<&str>,
-    reader_dir: Option<&Path>,
-) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
-    run_fetch_with(site, gh_bin, cwd, target, url, etag, reader_dir, false)
-}
-
-/// [`run_fetch`], optionally with every token env var removed from the child
-/// ([`GhInvocation::without_token_env`]) — set only by [`fetch_with_reader`].
 #[allow(clippy::too_many_arguments)]
 fn run_fetch_with(
     site: ConditionalRead,
@@ -343,7 +326,8 @@ fn run_fetch_with(
     etag: Option<&str>,
     reader_dir: Option<&Path>,
     strip_token_env: bool,
-) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
+    role: crate::forge_identity::IdentityRole,
+) -> Result<FetchResult> {
     let mut inv = GhInvocation::new(
         Operation::new(site.caller),
         AccessIntent::Read,
@@ -354,6 +338,7 @@ fn run_fetch_with(
     // Accounting only (#9831): the resolved host and repo, as two fields.
     .identity_scope(target.host.as_deref(), target.repo.as_deref())
     .program(gh_bin)
+    .identity_role(role)
     .args(["api", "--include", url]);
     if let Some(host) = &target.host {
         // The URL names the remote-resolved repo explicitly, so name its host

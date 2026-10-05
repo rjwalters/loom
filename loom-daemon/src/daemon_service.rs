@@ -526,7 +526,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
             }
         }
     }
-    let credential_preflight = github_app_preflight.report;
+    // #9872: name the rate-limit pool the credential spends (WARN on a
+    // personal one: shared with every PAT/OAuth/`gh` login of that user).
+    let credential_preflight = credential_preflight::attach_pool(github_app_preflight.report);
 
     // Per-owner managed-repo credentials (#5401). The GitHub App mechanism
     // above mints exactly ONE installation token, keyed on this daemon's
