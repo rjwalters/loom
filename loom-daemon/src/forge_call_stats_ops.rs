@@ -83,6 +83,8 @@ pub const QUOTA_RATE_LIMIT_READING: ForgeOp = ForgeOp::inventoried("quota.rate-l
 pub const PR_LIST_BY_HEAD: ForgeOp = ForgeOp::inventoried("pr.list-by-head");
 /// Add / remove labels on one issue or PR (a PR's labels are issue labels).
 pub const ISSUE_EDIT_LABELS: ForgeOp = ForgeOp::inventoried("issue.edit-labels");
+/// `PATCH repos/{o}/{r}/issues/{n}` — replace an issue's (or PR's) body.
+pub const ISSUE_EDIT_BODY: ForgeOp = ForgeOp::inventoried("issue.edit-body");
 /// Post a comment on an issue or PR.
 pub const COMMENT_CREATE: ForgeOp = ForgeOp::inventoried("comment.create");
 /// Edit or delete an existing comment by id.
@@ -111,6 +113,7 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     QUOTA_RATE_LIMIT_READING,
     PR_LIST_BY_HEAD,
     ISSUE_EDIT_LABELS,
+    ISSUE_EDIT_BODY,
     COMMENT_CREATE,
     COMMENT_EDIT_DELETE,
     PR_DIFF_AND_FILES,

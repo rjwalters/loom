@@ -8,17 +8,9 @@
 # - Never add an entry: build the new site through
 #   `crate::gh_invocation::GhInvocation` instead.
 # - When you migrate a site, delete its line — a stale entry fails the test.
-# - #10089 widened the scan to path-qualified resolver calls
-#   (`Command::new(crate::gh_invocation::gh_bin())`), which had slipped past
-#   it. The three `fleet/drain.rs` entries are that pre-existing debt made
-#   visible, not new sites: they set the child's `PATH` (which also steers
-#   program lookup), an env the facade does not carry yet. The
-#   `cli/merge_pr_tree_checks.rs` entry (main's #10026) is the same kind of
-#   debt: it pipes the comment body on stdin, which the facade cannot do yet.
+# - #10089 drained the last entries: `fleet/drain.rs`'s claim resets (now
+#   `GhInvocation::child_path` carries their explicit `PATH`) and
+#   `cli/merge_pr_tree_checks.rs`'s comment (now `forge_comment::post_comment`,
+#   which sends the body as an `--input` file instead of stdin).
 #
 # Empty list == migration complete.
-
-src/cli/merge_pr_tree_checks.rs | let child = Command::new(loom_daemon::gh_invocation::gh_bin())
-src/fleet/drain.rs | let mut comment_cmd = Command::new(crate::gh_invocation::gh_bin());
-src/fleet/drain.rs | let mut edit_cmd = Command::new(crate::gh_invocation::gh_bin());
-src/fleet/drain.rs | let mut view_cmd = Command::new(crate::gh_invocation::gh_bin());

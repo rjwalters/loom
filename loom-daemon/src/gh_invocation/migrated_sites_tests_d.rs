@@ -233,3 +233,19 @@ fn pr_watch_and_base_ref_book_pr_view_state_and_issue_watch_stays_unknown() {
     assert_eq!(op_calls(&operations, "pr.view-state"), 2, "{operations:?}");
     assert_eq!(op_calls(&operations, forge_call_stats::UNKNOWN_OPERATION), 1, "{operations:?}");
 }
+
+/// #10089: the one comment POST (now also the merge tree-checks comment)
+/// books the inventoried `comment.create`, not `unknown`.
+#[test]
+#[serial_test::serial]
+fn comment_post_books_comment_create() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gh = stub(tmp.path(), "gh-post", "echo '{}'");
+    let (rows, operations) = report_after(|| {
+        let posted = crate::forge_comment::post_comment(&gh, None, "o/r", 3, true, "hi");
+        assert!(posted.is_ok(), "{posted:?}");
+    });
+    assert_eq!(calls(&rows, "comment.post"), 1, "{rows:?}");
+    assert_eq!(op_calls(&operations, "comment.create"), 1, "{operations:?}");
+    assert_eq!(op_calls(&operations, forge_call_stats::UNKNOWN_OPERATION), 0, "{operations:?}");
+}

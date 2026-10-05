@@ -269,6 +269,8 @@ pub struct GhInvocation {
     cwd: Option<PathBuf>,
     program: Option<String>,
     config_dir: Option<PathBuf>,
+    /// An explicit child `PATH` ([`GhInvocation::child_path`]).
+    path: Option<OsString>,
     /// Remove [`TOKEN_ENV_VARS`] from the child (#10263).
     strip_token_env: bool,
     /// The [`OutputContract::CredentialHelper`] request written to stdin.
@@ -304,6 +306,7 @@ impl GhInvocation {
             cwd: None,
             program: None,
             config_dir: None,
+            path: None,
             strip_token_env: false,
             stdin_input: Vec::new(),
             writer_only: false,
@@ -384,6 +387,16 @@ impl GhInvocation {
     #[must_use]
     pub fn gh_config_dir(mut self, dir: Option<&Path>) -> Self {
         self.config_dir = dir.map(Path::to_path_buf);
+        self
+    }
+
+    /// Give the child an explicit `PATH` (#10089) — for a site that cannot
+    /// rely on the daemon's inherited one (`fleet::drain`'s claim resets under
+    /// launchd/systemd, #4831). It also steers the lookup of a bare `gh`
+    /// program, exactly as `Command::env("PATH", …)` did at the raw site.
+    #[must_use]
+    pub fn child_path(mut self, path: impl Into<OsString>) -> Self {
+        self.path = Some(path.into());
         self
     }
 
@@ -527,6 +540,12 @@ impl GhInvocation {
             for key in TOKEN_ENV_VARS {
                 plan.push(EnvEntry { key, value: None });
             }
+        }
+        if let Some(path) = &self.path {
+            plan.push(EnvEntry {
+                key: "PATH",
+                value: Some(path.clone()),
+            });
         }
         plan
     }

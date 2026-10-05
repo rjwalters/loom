@@ -115,6 +115,17 @@ fn env_plan_gh_repo_prefers_the_typed_target_over_loom_repo() {
 }
 
 #[test]
+fn env_plan_sets_path_only_under_child_path() {
+    let inherited = read_op(GhTarget::None).env_plan_with(None, None);
+    assert_eq!(env_of(&inherited, "PATH"), None);
+
+    let explicit = read_op(GhTarget::None)
+        .child_path("/opt/gh/bin:/usr/bin")
+        .env_plan_with(None, None);
+    assert_eq!(env_of(&explicit, "PATH"), Some(Some("/opt/gh/bin:/usr/bin".into())));
+}
+
+#[test]
 fn env_plan_scopes_gh_config_dir_by_root_then_target_owner() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("checkout");

@@ -164,6 +164,7 @@ pub fn post_comment(
         gh_bin.as_ref(),
         root,
         "comment.post",
+        crate::forge_call_stats::ops::COMMENT_CREATE,
         &format!("repos/{nwo}/issues/{number}/comments"),
         None,
         &payload,
@@ -371,7 +372,9 @@ fn gh_api_get(gh_bin: &str, path: &str) -> Result<String, String> {
 /// same JSON-body discipline as [`post_comment`] (multi-line markdown never
 /// goes through `-f`).
 fn gh_api_patch(gh_bin: &str, path: &str, json: &str) -> Result<String, String> {
-    gh_api_write_json(OsStr::new(gh_bin), None, "comment.patch", path, Some("PATCH"), json)
+    // Its one caller PATCHes `repos/{o}/{r}/issues/{n}`: an issue-body edit.
+    let op = crate::forge_call_stats::ops::ISSUE_EDIT_BODY;
+    gh_api_write_json(OsStr::new(gh_bin), None, "comment.patch", op, path, Some("PATCH"), json)
         .map_err(|e| e.replace("{what}", &format!("PATCH {path}")))
 }
 
@@ -382,8 +385,9 @@ fn gh_api_patch(gh_bin: &str, path: &str, json: &str) -> Result<String, String> 
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// One counted `gh api <path> [-X <method>] --input <file>` write through the
-/// `gh` facade, booked under `op` (#10089). The JSON body goes through a
-/// private (`0600`) temp file because the facade owns the child's stdin.
+/// `gh` facade, booked under `op` and the inventoried `forge_op` (#10089).
+/// The JSON body goes through a private (`0600`) temp file because the facade
+/// owns the child's stdin.
 /// `root`, when given, selects the cross-owner `GH_CONFIG_DIR` (#5401).
 ///
 /// Error strings carry a `{what}` placeholder the caller fills in, so each
@@ -392,6 +396,7 @@ fn gh_api_write_json(
     gh_bin: &OsStr,
     root: Option<&Path>,
     op: &'static str,
+    forge_op: crate::forge_call_stats::ForgeOp,
     path: &str,
     method: Option<&str>,
     json: &str,
@@ -406,6 +411,7 @@ fn gh_api_write_json(
         .map_err(|e| format!("could not write the gh api request body: {e}"))?;
     let mut inv =
         GhInvocation::new(Operation::new(op), AccessIntent::Write, GhTarget::None, WRITE_TIMEOUT)
+            .forge_op(forge_op)
             .program(gh_bin)
             .arg("api")
             .arg(path);

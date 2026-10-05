@@ -16,8 +16,6 @@ use anyhow::Result;
 use loom_daemon::merge_pr::tree_checks::{
     bypass_comment, evaluate, failure_comment, refusal, Outcome, BYPASSED, CLEAN,
 };
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 #[derive(clap::Args)]
 pub(crate) struct TreeChecksArgs {
@@ -54,25 +52,12 @@ pub(crate) struct TreeChecksArgs {
     dry_run: bool,
 }
 
+/// Post the audit/refusal comment through the one counted comment POST
+/// (`forge_comment::post_comment`, #10089): `gh api --input <file>` under the
+/// `gh` facade, booked as `comment.post` / `comment.create`.
 fn post_comment(repo: &str, pr: &str, body: &str) {
-    let payload = serde_json::json!({ "body": body }).to_string();
-    let child = Command::new(loom_daemon::gh_invocation::gh_bin())
-        .args([
-            "api",
-            &format!("repos/{repo}/issues/{pr}/comments"),
-            "--input",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn();
-    let ok = child.ok().and_then(|mut c| {
-        c.stdin.take()?.write_all(payload.as_bytes()).ok()?;
-        c.wait_with_output().ok()
-    });
-    if !ok.is_some_and(|o| o.status.success()) {
-        eprintln!("Warning: could not post the tree-check comment on PR #{pr}");
+    if let Err(e) = loom_daemon::forge_comment::post_comment("gh", None, repo, pr, true, body) {
+        eprintln!("Warning: could not post the tree-check comment on PR #{pr}: {e}");
     }
 }
 
