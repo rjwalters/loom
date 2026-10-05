@@ -55,7 +55,13 @@ pub(crate) struct ForgeProbeArgs {
     case: Vec<String>,
     /// Per-call HTTP timeout in seconds. Calls are bounded and never
     /// retried — a probe records, it does not fight.
-    #[arg(long, value_name = "SECS", default_value_t = 30)]
+    /// Must be at least 1: curl treats `--max-time 0` as no limit.
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     timeout: u64,
 }
 

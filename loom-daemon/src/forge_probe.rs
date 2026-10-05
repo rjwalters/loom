@@ -155,6 +155,11 @@ impl ProbeHttp for LiveHttp {
         use std::io::Write as _;
         use std::process::{Command, Stdio};
 
+        // curl's `--max-time 0` disables the limit entirely; refuse it
+        // before spawning curl so no call can be unbounded.
+        if self.timeout.is_zero() {
+            return Err("timeout must be positive (0 would disable the per-call bound)".into());
+        }
         let url = format!(
             "{}/api/v1/{}",
             self.origin.trim_end_matches('/'),
@@ -218,6 +223,11 @@ impl ProbeHttp for LiveHttp {
 /// in the manifest's risk-first order, executed where a handler exists and
 /// `unknown` where it does not.
 pub fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> {
+    // curl's `--max-time 0` means "no limit"; the runner's bounded-call
+    // contract forbids that, so refuse before any request is made.
+    if cfg.timeout.is_zero() {
+        anyhow::bail!("timeout must be positive (0 would disable the per-call bound)");
+    }
     let inv = crate::forge_inventory::load_embedded()?;
     let manifest = crate::forge_inventory::probe::build(&inv, &[]);
     let mut results = Vec::new();
@@ -984,5 +994,22 @@ mod tests {
         assert!(head.contains("content-type: application/json"), "headers: {head}");
         let decoded: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(decoded["title"], "loomp-review: issue-create");
+    }
+
+    #[test]
+    fn zero_timeout_is_rejected_before_any_request() {
+        let http = LiveHttp {
+            origin: "http://127.0.0.1:1".into(),
+            timeout: Duration::ZERO,
+        };
+        let err = http.request("GET", "version", "tok", None).unwrap_err();
+        assert!(err.contains("timeout must be positive"), "{err}");
+
+        let mut c = cfg(true);
+        c.timeout = Duration::ZERO;
+        let fake = FakeHttp::new();
+        let err = run(&c, &fake).unwrap_err();
+        assert_eq!(fake.calls.get(), 0, "no request may precede validation");
+        assert!(err.to_string().contains("timeout must be positive"), "{err:#}");
     }
 }
