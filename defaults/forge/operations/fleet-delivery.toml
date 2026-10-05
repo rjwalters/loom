@@ -345,6 +345,9 @@ path = "loom-daemon/src/fleet/add_worker.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/gh_repo_env.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_wait_checks/reads.rs"
 
 [[operation]]
 id = "repo.list-for-owner"

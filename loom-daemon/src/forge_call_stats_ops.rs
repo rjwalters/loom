@@ -55,6 +55,8 @@ pub const ISSUE_SEARCH: ForgeOp = ForgeOp::inventoried("issue.search");
 pub const COMMENT_LIST: ForgeOp = ForgeOp::inventoried("comment.list");
 /// `GET repos/{o}/{r}/pulls/{n}` — one PR's decision state (mergeability…).
 pub const PR_VIEW_STATE: ForgeOp = ForgeOp::inventoried("pr.view-state");
+/// `GET repos/{o}/{r}` — default branch / visibility.
+pub const REPO_VIEW: ForgeOp = ForgeOp::inventoried("repo.view");
 /// The closing-issue references of a batch of PRs (GraphQL).
 pub const PR_CLOSING_ISSUE_REFERENCES: ForgeOp =
     ForgeOp::inventoried("pr.closing-issue-references");
@@ -94,6 +96,7 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     ISSUE_SEARCH,
     COMMENT_LIST,
     PR_VIEW_STATE,
+    REPO_VIEW,
     PR_CLOSING_ISSUE_REFERENCES,
     REVIEW_LIST_FORMAL,
     CI_CHECK_RUNS_FOR_SHA,
