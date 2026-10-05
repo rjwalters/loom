@@ -809,8 +809,8 @@ fn daemon_write_paths_are_scoped() {
         ("role_runner/launch.rs", Gated),
         ("operator_decision/cli.rs", Gated),
         (
-            "fleet/drain.rs",
-            OperatorOnly("`fleet drain`: the operator's own worker, by name"),
+            "fleet/drain_reset.rs",
+            OperatorOnly("`fleet drain`: the operator's own worker, by name (the claim resetter, split out of fleet/drain.rs by #10089)"),
         ),
         (
             "fleet_store/propose/mod.rs",
