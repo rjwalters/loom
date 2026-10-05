@@ -229,6 +229,7 @@ pub mod gh_state_probe;
 pub mod git_parser;
 pub mod git_tmp_reclaim;
 pub mod git_utils;
+pub mod guard_hook;
 pub mod guard_wiring;
 pub mod guards_status;
 pub mod hard_exclusion;

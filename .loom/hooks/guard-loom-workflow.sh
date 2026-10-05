@@ -1663,10 +1663,8 @@ elif [[ -n "$CWD" ]]; then
 fi
 
 # Master opt-out (#10335): guards.enabled:false / LOOM_GUARDS_ENABLED=0 -> allow.
-if declare -F loom_guards_master_enabled >/dev/null 2>&1 \
-   && ! loom_guards_master_enabled "$REPO_ROOT"; then
-    exit 0
-fi
+# Exit 0 means opted out; a missing or older daemon never exits 0 here.
+"${LOOM_DAEMON_SELF_BIN:-loom-daemon}" guard-hook opted-out --root "$REPO_ROOT" </dev/null >/dev/null 2>&1 && exit 0
 
 # Helper: output a deny decision and exit
 #
@@ -1709,57 +1707,14 @@ emit_decision() {
     exit 0
 }
 
-# Issue #10335: mask the BODY of a quoted-delimiter heredoc whose consumer is
-# provably `gh issue|pr create|comment|edit` -- directly (`gh issue create
-# --body-file - <<'EOF'`) or via a single `cat <<'EOF' | gh issue create ...`
-# pipe. `gh` reads its body from stdin and never executes or forwards it, and
-# the quoted delimiter means bash performs no expansion in the body, so the text
-# is inert data. Same fail-safe stance as mask_cat_heredoc_bodies(): the opener
-# must be a whole physical line made only of the `gh` command and
-# metacharacter-free/balanced-quote args, every earlier line must be free of
-# quotes/backslashes/heredoc openers (so the line start is a real command
-# boundary), and the closing delimiter must be found. Anything else masks
-# nothing, so `bash <<'EOF'`, `gh ...; bash <<'EOF'` and a real merge command
-# still deny exactly as before.
+# Issue #10335: blank the BODY of a quoted-delimiter heredoc fed to
+# `gh issue|pr create|comment|edit` (inert data -- gh reads it from stdin and the
+# quoted delimiter disables expansion). The fail-safe matcher lives in
+# `loom-daemon guard-hook mask-gh-body-heredocs` (loom-daemon/src/guard_hook.rs).
+# No `<<` means nothing to mask; a missing/older daemon masks nothing, so the
+# scan below sees the raw command and denies exactly as before.
 mask_gh_body_heredocs() {
-    printf '%s' "$1" | awk '
-    BEGIN {
-        SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); BT = sprintf("%c", 96); BS = sprintf("%c", 92)
-        arg = "([ \t]+([A-Za-z0-9_./:@,+=-]+|" DQ "[^" DQ "$" BT BS BS "]*" DQ "|" SQ "[^" SQ "]*" SQ "))*"
-        ghcmd = "gh[ \t]+(issue|pr)[ \t]+(create|comment|edit)" arg
-        dl = "<<-?[ \t]*(" SQ "[A-Za-z_][A-Za-z0-9_]*" SQ "|" DQ "[A-Za-z_][A-Za-z0-9_]*" DQ ")"
-        re_direct = "^[ \t]*" ghcmd "[ \t]*" dl "[ \t]*$"
-        re_pipe   = "^[ \t]*cat[ \t]*" dl "[ \t]*[|][ \t]*" ghcmd "[ \t]*$"
-        re_taint  = "[" DQ SQ BT BS BS "]"
-        n = 0; tainted = 0
-    }
-    { line[n++] = $0 }
-    END {
-        i = 0
-        while (i < n) {
-            l = line[i]
-            if (!tainted && (l ~ re_direct || l ~ re_pipe)) {
-                d = l; sub(/^.*<<-?[ \t]*/, "", d); sub(/[ \t]*([|].*)?$/, "", d)
-                dash = (l ~ /<<-/)
-                gsub(SQ, "", d); gsub(DQ, "", d)
-                close_at = -1
-                for (j = i + 1; j < n; j++) {
-                    c = line[j]; if (dash) sub(/^\t+/, "", c)
-                    if (c == d) { close_at = j; break }
-                }
-                if (close_at > 0) {
-                    for (j = i + 1; j < close_at; j++) line[j] = ""
-                    i = close_at + 1
-                    continue
-                }
-            }
-            if (l ~ re_taint || l ~ /<</) tainted = 1
-            i++
-        }
-        out = ""
-        for (k = 0; k < n; k++) out = out line[k] (k < n - 1 ? "\n" : "")
-        printf "%s", out
-    }'
+    [[ "$1" == *"<<"* ]] && "${LOOM_DAEMON_SELF_BIN:-loom-daemon}" guard-hook mask-gh-body-heredocs <<<"$1" 2>/dev/null || printf '%s' "$1"
 }
 
 # =============================================================================

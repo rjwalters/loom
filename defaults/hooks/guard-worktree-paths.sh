@@ -487,10 +487,8 @@ WORKTREE_PATH="${LOOM_WORKTREE_PATH:-}"
 INPUT=$(cat 2>/dev/null) || INPUT=""
 
 # Master opt-out (#10335): guards.enabled:false / LOOM_GUARDS_ENABLED=0 -> allow.
-if declare -F loom_guards_master_enabled >/dev/null 2>&1 \
-   && ! loom_guards_master_enabled "$MAIN_ROOT"; then
-    exit 0
-fi
+# Exit 0 means opted out; a missing or older daemon never exits 0 here.
+"${LOOM_DAEMON_SELF_BIN:-loom-daemon}" guard-hook opted-out --root "$MAIN_ROOT" </dev/null >/dev/null 2>&1 && exit 0
 
 # Verify jq is available
 if ! command -v jq &>/dev/null; then

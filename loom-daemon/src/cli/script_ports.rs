@@ -449,6 +449,14 @@ pub(crate) enum ScriptPortCommand {
     /// every `PreToolUse` matcher.
     GuardMcpTools(super::guard_mcp_tools::GuardMcpToolsArgs),
 
+    /// Decisions behind the Bash/Write `PreToolUse` guard hooks (#10335):
+    /// `opted-out` (the `guards.enabled` master switch, exit 0 = guards OFF)
+    /// and `mask-gh-body-heredocs` (blank inert `gh issue|pr` heredoc bodies
+    /// before the merge-command scan). New logic, native per the
+    /// shell-language policy; the hooks keep only the call-site.
+    #[command(subcommand)]
+    GuardHook(super::guard_hook_cmd::GuardHookCommand),
+
     /// The `PreToolUse` matcher-coverage contract for that guard (#9108): the
     /// `mcp__loom__.*` matcher exists in `.claude/settings.json` AND in the
     /// installer's `_PHOOK_*` arrays, its entry routes through
@@ -646,6 +654,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::RuntimeLaunchEnv(args) => args.run(),
             ScriptPortCommand::CheckStaleBlocked(args) => args.run(),
             ScriptPortCommand::GuardMcpTools(args) => args.run(),
+            ScriptPortCommand::GuardHook(cmd) => cmd.run(),
             ScriptPortCommand::CheckGuardWiring(args) => args.run(),
             ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),

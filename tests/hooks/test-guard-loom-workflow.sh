@@ -1756,50 +1756,6 @@ done
 [[ -n "$DLW_DIR" && "$DLW_DIR" != "/" && -d "$DLW_DIR" ]] && rm -rf "$DLW_DIR"
 
 echo ""
-# =========================================================================
-# #10335: heredoc body fed to `gh issue|pr create|comment|edit` is inert
-# =========================================================================
-echo "Testing gh issue/pr body heredocs (#10335)..."
-
-_P10335="gh pr merge"
-assert_allow "#10335: allow quoted heredoc fed to gh issue create --body-file -" \
-    "gh issue create --title 'x' --body-file - <<'EOF'
-Never run $_P10335 directly.
-EOF"
-assert_allow "#10335: allow cat quoted-heredoc piped into gh issue create" \
-    "cat <<'EOF' | gh issue create --title x --body-file -
-Never run $_P10335 directly.
-EOF"
-assert_allow "#10335: allow quoted heredoc fed to gh pr comment" \
-    "gh pr comment 12 --body-file - <<'EOF'
-see $_P10335 rule
-EOF"
-assert_deny "#10335: still deny a real merge invocation" \
-    "$_P10335 123"
-assert_deny "#10335: still deny real merge after the gh issue heredoc" \
-    "gh issue create --title x --body-file - <<'EOF'
-body
-EOF
-$_P10335 123"
-assert_deny "#10335: still deny unquoted-delimiter heredoc to gh issue create" \
-    "gh issue create --title x --body-file - <<EOF
-\$($_P10335 5)
-EOF"
-assert_deny "#10335: still deny interpreter heredoc after a gh issue create" \
-    "gh issue create --title x; bash <<'EOF'
-$_P10335 123
-EOF"
-assert_deny "#10335: still deny cat heredoc piped to gh then bash" \
-    "cat <<'EOF' | gh issue create --title x --body-file - | bash
-$_P10335 123
-EOF"
-assert_deny "#10335: still deny when an earlier quoted line could hide the opener" \
-    "echo \"
-gh issue create --body-file - <<'EOF'
-\"; $_P10335 123
-EOF"
-echo ""
-
 
 # =========================================================================
 # Summary

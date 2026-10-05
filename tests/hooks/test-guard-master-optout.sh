@@ -2,6 +2,11 @@
 # Tests for the guards.enabled master opt-out (issue #10335): with
 # guards.enabled:false in .loom/config.json (or LOOM_GUARDS_ENABLED=0) the three
 # Loom PreToolUse guard hooks allow everything; absent/true keeps them on.
+#
+# The hooks ask `loom-daemon guard-hook opted-out`, so this suite NEEDS A BUILT
+# loom-daemon (pinned via lib/require-daemon-bin.sh, which FAILS rather than
+# SKIPs). It is listed in ci-excluded.txt and wired into the "Native Port
+# Suites" CI job, which downloads the shared debug build.
 set -uo pipefail
 unset LOOM_GUARDS_ENABLED LOOM_GUARD_SQL LOOM_GUARD_WORKTREE_ISOLATION
 
@@ -9,6 +14,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 H="$ROOT/defaults/hooks"
 PASS=0; FAIL=0
+# shellcheck source=../../defaults/scripts/tests/lib/require-daemon-bin.sh
+source "$ROOT/defaults/scripts/tests/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$ROOT/defaults/scripts" "guard-hook"
 
 mk_repo() { # $1 = guards JSON fragment ('' for none)
     local d; d=$(mktemp -d)
@@ -44,6 +52,13 @@ check "destructive: enabled:false allows"        allow "$(bash_in guard-destruct
 check "destructive: LOOM_GUARDS_ENABLED=0 allows" allow "$(LOOM_GUARDS_ENABLED=0 bash_in guard-destructive.sh "$ON" "$SQL_CMD")"
 check "destructive: catastrophic floor also off" allow "$(bash_in guard-destructive.sh "$OFF" 'rm -rf /')"
 check "destructive: floor on when absent"        deny  "$(bash_in guard-destructive.sh "$ON" 'rm -rf /')"
+# Fail closed: with no daemon to ask, the opt-out cannot be confirmed, so the
+# guards stay ON even under an explicit opt-out.
+NO_DAEMON=/nonexistent/loom-daemon
+check "no daemon: enabled:false keeps workflow on" deny \
+    "$(LOOM_DAEMON_SELF_BIN=$NO_DAEMON bash_in guard-loom-workflow.sh "$OFF" "$MERGE_CMD")"
+check "no daemon: LOOM_GUARDS_ENABLED=0 keeps destructive on" deny \
+    "$(LOOM_DAEMON_SELF_BIN=$NO_DAEMON LOOM_GUARDS_ENABLED=0 bash_in guard-destructive.sh "$ON" "$SQL_CMD")"
 
 # guard-worktree-paths.sh: a Write into the main checkout while a managed
 # worktree exists is denied; with the opt-out it is allowed.

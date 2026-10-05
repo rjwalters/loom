@@ -125,7 +125,8 @@ guards (`guard-destructive.sh`, `guard-loom-workflow.sh`, `guard-worktree-paths.
 off wholesale for that repo. **This includes the ungated denial floor below** - it is
 an explicit operator decision, unlike the per-category toggles, which never reach the
 floor. Absent, `true`, or non-boolean means guards stay on. Effects: the hooks
-early-exit allow; `loom-daemon init`/`loom update` and `ensure_project_hook_wiring`
+early-exit allow (each asks `loom-daemon guard-hook opted-out`; with no daemon on
+`PATH`, or one predating this subcommand, the guards stay on); `loom-daemon init`/`loom update` and `ensure_project_hook_wiring`
 neither add nor keep these entries in the repo's `.claude/settings.json` (foreign and
 non-guard Loom hooks are preserved); the user-scope `~/.claude/settings.json` fallback
 wrappers need no change because they exec the hook, which self-gates per repo
