@@ -168,6 +168,11 @@ pub struct PrCaseRecord {
     /// When it merged, if it did.
     #[serde(default)]
     pub merged_at: Option<DateTime<Utc>>,
+    /// When it closed unmerged, if it did and the source read it. Bounds the
+    /// PR's queue occupancy; a closed PR without it has no honest end and
+    /// holds no queue position in the replay.
+    #[serde(default)]
+    pub closed_at: Option<DateTime<Utc>>,
     /// The issues the forge says this PR closes, in this repo. `None` when
     /// the closing reference was never read — distinct from `Some([])`, a
     /// read that found none. Either is an excluded case, never a guess.
@@ -195,6 +200,7 @@ impl PrCaseRecord {
             created_at: h.created_at,
             state: h.state.as_str().to_string(),
             merged_at: h.merged_at,
+            closed_at: h.closed_at,
             closing_issues,
             timeline_complete: h.timeline_complete,
             events: h.events.iter().map(PrEventRecord::from).collect(),
@@ -204,7 +210,7 @@ impl PrCaseRecord {
     /// The [`PrHistory`] this record describes.
     #[must_use]
     pub fn history(&self) -> PrHistory {
-        PrHistory::new(
+        let mut h = PrHistory::new(
             self.number,
             self.created_at,
             PrState::parse(&self.state),
@@ -212,7 +218,9 @@ impl PrCaseRecord {
             Vec::new(),
             self.events.iter().map(PrEvent::from).collect(),
             self.timeline_complete,
-        )
+        );
+        h.closed_at = self.closed_at;
+        h
     }
 }
 
@@ -297,10 +305,6 @@ pub struct PrCaseEntries {
     pub pr: u32,
     /// The merge instant, when the PR has one.
     pub merged_at: Option<DateTime<Utc>>,
-    /// Every stage entry, resolved or refused, with when it ended: the
-    /// interval the PR sat in that stage. What the batch's point-in-time
-    /// roster and exit log are built from.
-    pub stints: Vec<Stint>,
     /// One `land` case per resolved stage entry, in entry order.
     pub cases: Vec<ReplayCase>,
     /// Every refused entry, in entry order.
@@ -308,14 +312,16 @@ pub struct PrCaseEntries {
 }
 
 /// One interval a PR spent in a stage (`None`: its labels resolved to no
-/// stage, a refusal), from its entry to the next entry or the merge.
+/// stage — a refusal, or every review label removed), from its entry to the
+/// next entry or the PR's end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stint {
     /// The stage, `None` for a refused entry.
     pub stage: Option<Stage>,
     /// When the PR entered it.
     pub entered_at: DateTime<Utc>,
-    /// When it left: the next entry, else the merge.
+    /// When it left: the next entry, else the merge or close;
+    /// `DateTime::<Utc>::MAX_UTC` while the PR is still open.
     pub left_at: DateTime<Utc>,
 }
 
@@ -339,22 +345,26 @@ impl<'a> QueueWorld<'a> {
         }
     }
 
-    fn add(&mut self, repo: &'a str, found: &PrCaseEntries) {
+    /// Add one PR's occupancy: every PR whose timeline is readable, whatever
+    /// became of it — an open, closed-unmerged or identity-less neighbour
+    /// held a queue position all the same.
+    fn add(&mut self, repo: &'a str, pr: u32, occupancy: &Occupancy) {
         if !self.scope.iter().any(|r| r.eq_ignore_ascii_case(repo)) {
             self.scope.push(repo.to_string());
         }
-        for (i, stint) in found.stints.iter().enumerate() {
-            self.stints.push((repo, found.pr, *stint));
-            let last = i + 1 == found.stints.len();
+        for (i, stint) in occupancy.stints.iter().enumerate() {
+            self.stints.push((repo, pr, *stint));
+            let last = i + 1 == occupancy.stints.len();
+            let kind = match (last, occupancy.end) {
+                (true, PrEnding::Open) => continue,
+                (true, PrEnding::Merged) => EventKind::Merge,
+                _ => EventKind::Exit,
+            };
             self.log.events.push(StageEvent {
                 repo: repo.to_string(),
-                pr: Some(found.pr),
+                pr: Some(pr),
                 stage: stint.stage,
-                kind: if last && found.merged_at.is_some() {
-                    EventKind::Merge
-                } else {
-                    EventKind::Exit
-                },
+                kind,
                 at: stint.left_at,
                 known_at: stint.left_at,
             });
@@ -430,6 +440,99 @@ fn land_terminal(
     }
 }
 
+/// One instant the PR's resolved stage changed: `None` when its last review
+/// label was removed (a gap in review, not a refusal).
+type LabelEntry = (DateTime<Utc>, Option<Result<Stage, NoEstimateReason>>);
+
+/// The stage transitions of one PR's label timeline strictly before
+/// `cutoff`, gaps included, and the instants of its rejection laps. Shared by
+/// the scored cases ([`pr_case_entries`]) and the queue occupancy
+/// ([`pr_occupancy`]) so the two cannot disagree on where a PR was.
+fn label_entries(
+    repo: &str,
+    h: &PrHistory,
+    cutoff: DateTime<Utc>,
+) -> (Vec<LabelEntry>, Vec<DateTime<Utc>>) {
+    let holds = hold_labels();
+    let mut entries: Vec<LabelEntry> = Vec::new();
+    let mut rejections: Vec<DateTime<Utc>> = Vec::new();
+    // `None`: no review label in force (nothing staged yet, or unlabeled).
+    let mut prev_resolved: Option<Result<Stage, NoEstimateReason>> = None;
+    let mut prev_named: Option<Stage> = None;
+    replay(&input_from_pr_history(h, repo), cutoff, |at, present| {
+        let staged = present.iter().any(|l| REVIEW_LABELS.contains(&l.as_str()));
+        let resolved = staged.then(|| stage_from_pr_labels(present));
+        // The review stage the labels name with every hold set aside: what a
+        // refused lap *was*, so a held rejection still counts as rework.
+        let unheld: Vec<String> = present
+            .iter()
+            .filter(|l| !holds.contains(&l.as_str()))
+            .cloned()
+            .collect();
+        let named = stage_from_pr_labels(&unheld).ok();
+        if named == Some(Stage::Doctor) && prev_named != Some(Stage::Doctor) {
+            rejections.push(at);
+        }
+        match resolved {
+            Some(Ok(stage)) if prev_resolved != Some(Ok(stage)) => {
+                entries.push((at, Some(Ok(stage))));
+            }
+            Some(Err(reason)) if prev_resolved != Some(Err(reason)) || prev_named != named => {
+                entries.push((at, Some(Err(reason))));
+            }
+            None if prev_resolved.is_some() => entries.push((at, None)),
+            _ => {}
+        }
+        prev_resolved = resolved;
+        prev_named = named;
+    });
+    (entries, rejections)
+}
+
+/// How a PR's occupancy ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrEnding {
+    Merged,
+    Closed,
+    Open,
+}
+
+/// Where one PR sat over its life, for the batch's point-in-time queue.
+struct Occupancy {
+    stints: Vec<Stint>,
+    end: PrEnding,
+}
+
+/// Every interval a PR spent in a stage, whatever became of it — merged,
+/// closed unmerged, or still open — or `None` when its end is not honestly
+/// known (an incomplete timeline, a merge or close with no instant, a
+/// terminal before creation). Independent of whether the PR is a scorable
+/// `land` case: occupancy must not be conditioned on the PR's own outcome.
+fn pr_occupancy(repo: &str, h: &PrHistory) -> Option<Occupancy> {
+    if !h.timeline_complete {
+        return None;
+    }
+    let (end, cutoff) = match h.state {
+        PrState::Open => (PrEnding::Open, DateTime::<Utc>::MAX_UTC),
+        PrState::Merged => (PrEnding::Merged, h.merged_at?),
+        PrState::Closed => (PrEnding::Closed, h.closed_at?),
+    };
+    if cutoff < h.created_at {
+        return None;
+    }
+    let (entries, _) = label_entries(repo, h, cutoff);
+    let stints = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (at, resolved))| Stint {
+            stage: resolved.as_ref().and_then(|r| r.as_ref().ok().copied()),
+            entered_at: *at,
+            left_at: entries.get(i + 1).map_or(cutoff, |next| next.0),
+        })
+        .collect();
+    Some(Occupancy { stints, end })
+}
+
 /// Every stage entry one PR's history answers before its merge — cases and
 /// refusals — or why it answers none. Pure: `closing_issues` is resolved by
 /// the caller at the acquisition boundary.
@@ -456,37 +559,7 @@ pub fn pr_case_entries(
 ) -> Result<PrCaseEntries, PrCaseExclusion> {
     let (merged_at, issue) = land_terminal(h, closing_issues)?;
 
-    let holds = hold_labels();
-    let mut entries: Vec<(DateTime<Utc>, Result<Stage, NoEstimateReason>)> = Vec::new();
-    let mut rejections: Vec<DateTime<Utc>> = Vec::new();
-    // `None`: no review label in force (nothing staged yet, or unlabeled).
-    let mut prev_resolved: Option<Result<Stage, NoEstimateReason>> = None;
-    let mut prev_named: Option<Stage> = None;
-    // Cut at the merge: only events strictly before it move a stage.
-    replay(&input_from_pr_history(h, repo), merged_at, |at, present| {
-        let staged = present.iter().any(|l| REVIEW_LABELS.contains(&l.as_str()));
-        let resolved = staged.then(|| stage_from_pr_labels(present));
-        // The review stage the labels name with every hold set aside: what a
-        // refused lap *was*, so a held rejection still counts as rework.
-        let unheld: Vec<String> = present
-            .iter()
-            .filter(|l| !holds.contains(&l.as_str()))
-            .cloned()
-            .collect();
-        let named = stage_from_pr_labels(&unheld).ok();
-        if named == Some(Stage::Doctor) && prev_named != Some(Stage::Doctor) {
-            rejections.push(at);
-        }
-        match resolved {
-            Some(Ok(stage)) if prev_resolved != Some(Ok(stage)) => entries.push((at, Ok(stage))),
-            Some(Err(reason)) if prev_resolved != Some(Err(reason)) || prev_named != named => {
-                entries.push((at, Err(reason)));
-            }
-            _ => {}
-        }
-        prev_resolved = resolved;
-        prev_named = named;
-    });
+    let (entries, rejections) = label_entries(repo, h, merged_at);
     if entries.is_empty() {
         return Err(PrCaseExclusion::NoStageEntry);
     }
@@ -498,16 +571,9 @@ pub fn pr_case_entries(
         merged_at: Some(merged_at),
         ..PrCaseEntries::default()
     };
-    out.stints = entries
-        .iter()
-        .enumerate()
-        .map(|(i, (at, resolved))| Stint {
-            stage: resolved.as_ref().ok().copied(),
-            entered_at: *at,
-            left_at: entries.get(i + 1).map_or(merged_at, |next| next.0),
-        })
-        .collect();
     for (as_of, resolved) in entries {
+        // A gap (every review label removed) is no case and no refusal.
+        let Some(resolved) = resolved else { continue };
         match resolved {
             Ok(stage) => out.cases.push(ReplayCase {
                 subject: subject.clone(),
@@ -577,6 +643,9 @@ pub fn cases_from_pr_records(records: &[PrCaseRecord]) -> (Vec<ReplayCase>, PrCa
     let mut cases = Vec::new();
     let mut world = QueueWorld::new();
     for record in records {
+        if let Some(occupancy) = pr_occupancy(&record.repo, &record.history()) {
+            world.add(&record.repo, record.number, &occupancy);
+        }
         let reason = match pr_case_entries(
             &record.repo,
             &record.history(),
@@ -594,7 +663,6 @@ pub fn cases_from_pr_records(records: &[PrCaseRecord]) -> (Vec<ReplayCase>, PrCa
                 } else {
                     summary.contributing += 1;
                     summary.cases += found.cases.len();
-                    world.add(&record.repo, &found);
                     cases.extend(found.cases);
                     continue;
                 }

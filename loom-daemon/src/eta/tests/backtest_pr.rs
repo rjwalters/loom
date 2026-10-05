@@ -836,3 +836,120 @@ fn the_pr_case_producer_reconstructs_each_cases_point_in_time_queue() {
     );
     assert!(report.overall.scored > 0, "{report:?}");
 }
+
+/// One PR record on 2026-09-01 for the queue-reconstruction tests: `labels`
+/// are `(added, label, "HH:MM")` events; `end` is the state and its instant.
+fn queue_pr(
+    n: u32,
+    closing: &str,
+    end: (&str, Option<&str>),
+    labels: &[(bool, &str, &str)],
+) -> String {
+    let mut events: Vec<String> = labels
+        .iter()
+        .map(|(added, label, at)| {
+            let kind = if *added { "labeled" } else { "unlabeled" };
+            format!(r#"{{"event":"{kind}","label":"{label}","at":"2026-09-01T{at}:00Z"}}"#)
+        })
+        .collect();
+    let (state, at) = end;
+    let mut terminal = String::new();
+    if let Some(at) = at {
+        let key = if state == "merged" {
+            "merged_at"
+        } else {
+            "closed_at"
+        };
+        terminal = format!(r#","{key}":"2026-09-01T{at}:00Z""#);
+        if state == "merged" {
+            events.push(format!(r#"{{"event":"merged","at":"2026-09-01T{at}:00Z"}}"#));
+        }
+    }
+    format!(
+        r#"{{"schema":"eta-pr-case/v1","repo":"{REPO}","number":{n},"created_at":"2026-08-31T23:00:00Z","state":"{state}"{terminal},"closing_issues":{closing},"timeline_complete":true,"events":[{}]}}"#,
+        events.join(",")
+    )
+}
+
+fn queue_of_case(jsonl: &[String], pr: u32, stage: Stage) -> (u32, u32) {
+    let (cases, _) = cases_from_pr_records(&parse_pr_records(&jsonl.join("\n")).unwrap());
+    let case = cases
+        .iter()
+        .find(|c| c.subject.pr_number == Some(pr) && c.stage == stage)
+        .unwrap_or_else(|| panic!("no {stage:?} case for PR {pr}"));
+    (case.queue[0].items_ahead, case.queue[0].exits)
+}
+
+#[test]
+fn a_neighbour_that_is_not_a_scored_case_still_holds_its_queue_position() {
+    let review = [(true, "loom:review-requested", "00:00")];
+    let target = queue_pr(
+        301,
+        "[31]",
+        ("merged", Some("01:00")),
+        &[(true, "loom:review-requested", "00:10")],
+    );
+    let baseline = queue_of_case(
+        &[
+            queue_pr(300, "[30]", ("merged", Some("00:50")), &review),
+            target.clone(),
+        ],
+        301,
+        Stage::ReviewWait,
+    );
+    assert_eq!(baseline, (1, 0));
+
+    // The earlier neighbour stays open, closes unmerged after the target
+    // entered, or has no closing issue: none is a scored case, and none may
+    // change what the target saw ahead of it.
+    for neighbour in [
+        queue_pr(300, "[30]", ("open", None), &review),
+        queue_pr(300, "[30]", ("closed", Some("00:40")), &review),
+        queue_pr(300, "[]", ("merged", Some("00:50")), &review),
+        queue_pr(300, "null", ("merged", Some("00:50")), &review),
+    ] {
+        assert_eq!(
+            queue_of_case(&[neighbour.clone(), target.clone()], 301, Stage::ReviewWait),
+            baseline,
+            "{neighbour}"
+        );
+    }
+
+    // A neighbour that closed unmerged *before* the target entered has
+    // already drained: one exit, nobody ahead.
+    let drained = queue_pr(300, "[30]", ("closed", Some("00:05")), &review);
+    assert_eq!(queue_of_case(&[drained, target], 301, Stage::ReviewWait), (0, 1));
+}
+
+#[test]
+fn removing_the_last_review_label_ends_the_occupancy() {
+    // A: review 00:00, label removed 00:10, merge-wait 00:30. B enters
+    // review at 00:20, after A left review and before A re-entered a stage.
+    let a = queue_pr(
+        310,
+        "[31]",
+        ("merged", Some("00:50")),
+        &[
+            (true, "loom:review-requested", "00:00"),
+            (false, "loom:review-requested", "00:10"),
+            (true, "loom:pr", "00:30"),
+        ],
+    );
+    let b = queue_pr(
+        311,
+        "[32]",
+        ("merged", Some("01:00")),
+        &[(true, "loom:review-requested", "00:20")],
+    );
+    let jsonl = [a, b];
+    assert_eq!(queue_of_case(&jsonl, 311, Stage::ReviewWait), (0, 1));
+    // The gap is no scored case of A's own: its entries are review and
+    // merge-wait only.
+    let (cases, _) = cases_from_pr_records(&parse_pr_records(&jsonl.join("\n")).unwrap());
+    let a_stages: Vec<Stage> = cases
+        .iter()
+        .filter(|c| c.subject.pr_number == Some(310))
+        .map(|c| c.stage)
+        .collect();
+    assert_eq!(a_stages, [Stage::ReviewWait, Stage::MergeWait]);
+}
