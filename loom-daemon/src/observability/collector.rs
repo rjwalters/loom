@@ -853,8 +853,10 @@ pub(super) async fn resolve_repo_slug_cached(
                 cache.insert(workspace_root.to_string(), slug.clone());
                 return Some(slug);
             }
-            Ok(Lookup::Unavailable) => return None,
-            Ok(Lookup::Legacy) | Err(_) => {}
+            // `Unavailable` (a failed verify, or its backoff) keeps the
+            // last-known slug or the legacy lookup rather than dropping
+            // the record.
+            Ok(Lookup::Unavailable | Lookup::Legacy) | Err(_) => {}
         }
     }
     if let Some(slug) = cache.get(workspace_root) {

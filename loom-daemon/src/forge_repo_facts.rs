@@ -31,7 +31,10 @@
 //! the forge first ([`confirm_owner`], at most once per root per
 //! [`PassScope`]); a failed or disagreeing confirm is `Unknown`, never a
 //! negative. An unresolvable fact is [`Lookup::Unavailable`], which every
-//! caller already maps to its fail-closed path.
+//! caller maps to its fail-closed path. Where `None` would fail OPEN instead
+//! (the sweep registry's guard resolver, whose guards skip on a missing
+//! repo) or merely drop data (the telemetry collector), `Unavailable` is
+//! treated like `Legacy`: last-known answer, else the pre-facts call.
 //!
 //! # Kill switch
 //!
@@ -136,7 +139,8 @@ pub(crate) enum Lookup {
     /// no locally resolvable repo, or the root is pinned to legacy.
     Legacy,
     /// The fact cannot be established right now: the site's fail-closed path
-    /// (`None`, `ProbeFailed`, a GraphQL fallback).
+    /// (`None`, `ProbeFailed`, a GraphQL fallback), or — where `None` would
+    /// fail open — the site's last-known answer, else its legacy call.
     Unavailable,
 }
 

@@ -349,3 +349,63 @@ fn sites_ledger_body() {
     }
     assert_eq!(calls(&rows, "repo_facts.verify"), 1, "{rows:?}");
 }
+
+/// The sweep registry's guard resolver never turns `Unavailable` into `None`
+/// (its guards fail OPEN on `None`): once a fact has answered, an expired
+/// record whose verify fails — and the suspect backoff after it — still
+/// resolves to the last-known pair, and a cold start whose verify fails
+/// takes the pre-facts `gh repo view` path.
+#[test]
+#[serial(loom_config_env)]
+fn guard_resolver_keeps_an_answer_when_the_record_is_unavailable() {
+    guard_resolver_unavailable_body();
+}
+
+#[serial]
+fn guard_resolver_unavailable_body() {
+    std::env::remove_var("LOOM_REPO");
+    let acme = Some(("acme".to_string(), "app".to_string()));
+    let registry_for = |root: &Path, forge: &Forge| {
+        let mut config = crate::sweep_registry::SweepRegistryConfig::new(root.to_path_buf());
+        config.gh_bin = Some(forge.gh.clone());
+        crate::sweep_registry::SweepRegistry::new(config)
+    };
+
+    // Warm: a verified record answers, then expires and its verify fails.
+    let env = Env::new(&[]);
+    let root = env.repo("r", &[("origin", "https://github.com/acme/app.git")]);
+    let forge = Forge::new(env.tmp.path(), "acme/app");
+    let registry = registry_for(&root, &forge);
+    with_gh(&forge, || {
+        assert_eq!(registry.resolve_owner_repo(), acme);
+        forge.set("mode", "fail");
+        advance_test_clock(VERIFY_TTL_DEFAULT_SECS + 1);
+        let reads = forge.repo_reads();
+        assert_eq!(registry.resolve_owner_repo(), acme, "expired + failed verify");
+        assert_eq!(forge.repo_reads(), reads + 1, "the expired record was re-read");
+        assert!(suspect("acme/app"));
+        // Inside the suspect backoff: still answered, with no new read.
+        for _ in 0..3 {
+            assert_eq!(registry.resolve_owner_repo(), acme, "during the backoff");
+        }
+        assert_eq!(forge.repo_reads(), reads + 1, "no read during the backoff");
+    });
+
+    // Cold: no record, verify fails — the legacy `gh repo view` answers.
+    let env = Env::new(&[]);
+    let root = env.repo("r", &[("origin", "https://github.com/acme/app.git")]);
+    let forge = Forge::new(env.tmp.path(), "acme/app");
+    forge.set("mode", "fail");
+    let registry = registry_for(&root, &forge);
+    with_gh(&forge, || {
+        assert_eq!(registry.resolve_owner_repo(), acme, "cold start + failed verify");
+        assert!(
+            forge
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("repo view --json owner,name")),
+            "{:?}",
+            forge.calls()
+        );
+    });
+}
