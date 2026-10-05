@@ -523,6 +523,10 @@ struct Aggregate {
     /// Counts per identity role (#9872); a line without one is `unknown`.
     roles: BTreeMap<String, Counts>,
     latest: BTreeMap<Pool, Reading>,
+    /// The newest reading per `(pool, identity role)` (#10232): `latest`
+    /// above collapses every identity, but a reader App and the writer each
+    /// own a separate budget. Only lines that name a role land here.
+    latest_by_role: BTreeMap<(Pool, String), Reading>,
 }
 
 impl Aggregate {
@@ -552,6 +556,22 @@ impl Aggregate {
                     observed_at: line.t,
                 };
                 self.latest.insert(line.p, reading);
+            }
+            if let Some(role) = line.ir.clone() {
+                let key = (line.p, role);
+                if self
+                    .latest_by_role
+                    .get(&key)
+                    .is_none_or(|r| r.observed_at <= line.t)
+                {
+                    let reading = Reading {
+                        remaining,
+                        used: line.usd,
+                        reset_epoch: line.rst,
+                        observed_at: line.t,
+                    };
+                    self.latest_by_role.insert(key, reading);
+                }
             }
         }
     }
@@ -909,6 +929,43 @@ fn exhausted_in(latest: &BTreeMap<Pool, Reading>, now: i64) -> Vec<(Pool, Option
             None => now - r.observed_at <= WINDOW_SECS,
         })
         .map(|(pool, r)| (*pool, r.reset_epoch.and_then(epoch)))
+        .collect()
+}
+
+/// The newest header budget reading of each pool **served by one identity
+/// role** (`reader` / `writer` / `writer-fallback`, #10232). Unlike
+/// [`status_report`]'s `budget` this never mixes identities: a reading whose
+/// line named no role, or another role, is not returned. The role is a
+/// public, non-secret label — never a credential.
+#[must_use]
+pub fn role_readings(now: DateTime<Utc>, role: &str) -> Vec<ForgeBudgetReading> {
+    let window = sink_dir().map(|d| read_window(&d, now.timestamp()));
+    let process = process_state()
+        .lock()
+        .map(|s| s.latest_by_role.clone())
+        .unwrap_or_default();
+    let mut latest = process;
+    for (key, r) in window.iter().flat_map(|w| w.latest_by_role.iter()) {
+        if latest
+            .get(key)
+            .is_none_or(|l| l.observed_at < r.observed_at)
+        {
+            latest.insert(key.clone(), *r);
+        }
+    }
+    latest
+        .into_iter()
+        .filter(|((_, r), _)| r == role)
+        .filter_map(|((pool, _), r)| {
+            Some(ForgeBudgetReading {
+                pool: pool.as_str().to_string(),
+                remaining: r.remaining,
+                used: r.used,
+                reset_at: r.reset_epoch.and_then(epoch),
+                observed_at: epoch(r.observed_at)?,
+                source: "headers".to_string(),
+            })
+        })
         .collect()
 }
 

@@ -7,11 +7,13 @@
 //! breaker's own probe, when newer), the breaker from its in-process state,
 //! the pool from the token directory.
 //!
-//! **Identity.** The sink records readings per pool, not per credential, so
-//! a host that reads through several identities (its `gh` login, reader
-//! Apps) sees the freshest reading of each pool across them. That is the
-//! budget that stalls this host's next read; a per-credential split needs
-//! the sink to key readings by credential.
+//! **Identity.** A reader App and the writer each own a separate rate-limit
+//! budget, so the freshest reading across identities says nothing about the
+//! next read's. The feature reads go through the ETag store's reader
+//! identity, so only that identity's readings ([`READ_IDENTITY`], a public
+//! role label, never a credential) are used. Where the sink holds no fresh
+//! reading attributed to it, the budget features are omitted with
+//! [`reason::NO_IDENTITY_READING`] rather than borrow another identity's.
 
 use super::explanation::{FeatureOmitted, Features};
 use chrono::{DateTime, Duration, Utc};
@@ -19,6 +21,9 @@ use std::path::Path;
 
 /// A snapshot older than this at `as_of` is not used (three passes).
 pub const MAX_AGE_SEC: i64 = 15 * 60;
+
+/// The identity role whose budget the feature reads spend.
+pub const READ_IDENTITY: &str = "reader";
 
 /// A budget reading older than this when the snapshot is taken is not used.
 pub const READING_MAX_AGE_SEC: i64 = 15 * 60;
@@ -43,8 +48,8 @@ pub mod reason {
     pub const STALE_INPUTS: &str = "stale_inputs";
     /// No token pool is provisioned on this host.
     pub const NO_TOKEN_POOL: &str = "no_token_pool";
-    /// No fresh reading of that pool's budget.
-    pub const NO_BUDGET_READING: &str = "no_budget_reading";
+    /// No fresh reading attributed to the identity the feature reads use.
+    pub const NO_IDENTITY_READING: &str = "no_identity_reading";
     /// The reading carried no reset instant (a breaker probe).
     pub const NO_RESET_IN_READING: &str = "no_reset_in_reading";
     /// No rate-limit breaker is registered in this process.
@@ -117,7 +122,7 @@ pub fn reading(
 #[must_use]
 pub fn collect(workspace_root: &Path, now: DateTime<Utc>) -> StallSnapshot {
     let breaker = crate::rate_limit_breaker::global().map(|b| b.snapshot(now));
-    let budget = crate::forge_call_stats::status_report(now, breaker.as_ref()).budget;
+    let budget = crate::forge_call_stats::role_readings(now, READ_IDENTITY);
     let pool = crate::tokens_pool::select::spawnable_pool_state(workspace_root);
     StallSnapshot {
         observed_at: now,
@@ -150,7 +155,7 @@ fn budget_to(
 ) {
     let Some(r) = reading else {
         for name in names {
-            omit(omitted, name, reason::NO_BUDGET_READING);
+            omit(omitted, name, reason::NO_IDENTITY_READING);
         }
         return;
     };

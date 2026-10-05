@@ -75,7 +75,10 @@ fn missing_sources_carry_specific_reasons() {
     let (f, omitted) = write(Some(&snap), t(0));
     assert_eq!(f.pool_exhausted, None);
     assert_eq!(reason_of(&omitted, "pool_exhausted"), Some(reason::NO_TOKEN_POOL));
-    assert_eq!(reason_of(&omitted, "ratelimit_core_remaining"), Some(reason::NO_BUDGET_READING));
+    assert_eq!(
+        reason_of(&omitted, "ratelimit_core_remaining"),
+        Some(reason::NO_IDENTITY_READING)
+    );
     assert_eq!(reason_of(&omitted, "breaker_state"), Some(reason::BREAKER_NOT_REGISTERED));
 
     snap.breaker = Some(BreakerReading {

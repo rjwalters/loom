@@ -243,6 +243,28 @@ fn a_newer_breaker_probe_overrides_an_older_header_reading() {
     assert_eq!((core.used, gql.used), (Some(4993), Some(4992)));
 }
 
+#[test]
+fn readings_of_two_independent_identities_stay_separate() {
+    let with_role = |t: i64, role: Option<&str>, rem: u64| {
+        let mut l: SinkLine =
+            serde_json::from_str(&line(t, "c", Pool::Core, Outcome::Ok, Some(rem))).unwrap();
+        l.ir = role.map(str::to_string);
+        l
+    };
+    let mut agg = Aggregate::default();
+    // Reader exhausted; the writer answers more recently with budget left; a
+    // later line names no identity at all.
+    agg.add(&with_role(100, Some("reader"), 0));
+    agg.add(&with_role(200, Some("writer"), 4000));
+    agg.add(&with_role(300, None, 4999));
+    let reader = agg.latest_by_role[&(Pool::Core, "reader".to_string())];
+    let writer = agg.latest_by_role[&(Pool::Core, "writer".to_string())];
+    assert_eq!((reader.remaining, writer.remaining), (0, 4000));
+    // The unattributed line updates the pool-wide reading only.
+    assert_eq!(agg.latest_by_role.len(), 2);
+    assert_eq!(agg.latest[&Pool::Core].remaining, 4999);
+}
+
 // ===== #9777 call identity =====
 //
 // These two tests are the `test_path` evidence the forge operation inventory's
