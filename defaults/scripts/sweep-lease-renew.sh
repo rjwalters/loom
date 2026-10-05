@@ -984,6 +984,18 @@ cmd_start() {
     # unverified, skip this PATCH; anything else (incl. an older binary) renews.
     local -a owner_args=("$issue" --host "$host" --sweep-id "$sweep_id" --token "$$.${RANDOM}.${loop_started_at}")
     (
+        # Issue #10203 (follow-up): the fixed 3-8 list above misses a caller
+        # that launched `start` with a higher fd open (fd 10+). Close every
+        # remaining inherited fd except 0-2, 9 (the log) and 255 (bash's own
+        # script fd). The directory listing's own transient fd is already
+        # closed by the time its name is used, so closing it is a no-op.
+        for _fd_path in /dev/fd/*; do
+            _fd="${_fd_path##*/}"
+            [[ "$_fd" =~ ^[0-9]+$ ]] || continue
+            case "$_fd" in 0 | 1 | 2 | 9 | 255) continue ;; esac
+            eval "exec ${_fd}>&-" 2> /dev/null || true
+        done
+        unset _fd_path _fd
         cached_lease=""
         while pid_is_live "$watch_pid" "$watch_ident"; do
             if max_age_exceeded "$loop_started_at" "$max_age"; then
