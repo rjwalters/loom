@@ -106,7 +106,8 @@ fn a_hook_request_names_no_role_so_the_subagent_type_does() {
 
 #[test]
 fn a_refusal_that_matters_is_reported_in_one_line() {
-    let line = report("premise-check", 10120, &Outcome::TopLevelSession).unwrap();
+    let outcome = Outcome::TopLevelSession("no /loom:<role> command opened this turn".to_string());
+    let line = report("premise-check", 10120, &outcome).unwrap();
     assert!(line.starts_with("premise-check: live output: issue #10120:"), "{line}");
     assert!(line.contains("#10129") && !line.contains('\n'), "{line}");
 }
@@ -146,6 +147,7 @@ fn a_top_level_session_starts_nothing() {
         ..request(10120, root)
     };
     let outcome = attended::start(&request, &attended_env());
-    assert_eq!(outcome, Outcome::TopLevelSession);
+    // An explicitly named top-level transcript carries no binding (#10129).
+    assert!(matches!(outcome, Outcome::TopLevelSession(_)), "{outcome:?}");
     assert!(report("premise-check", 10120, &outcome).is_some());
 }
