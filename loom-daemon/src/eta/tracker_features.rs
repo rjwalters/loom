@@ -46,8 +46,8 @@ use super::{EstimateContext, Item, ItemKey, ReadyPlan, ReadyRow, Tracker};
 use crate::eta::explanation::{FeatureOmitted, Features};
 use crate::eta::journal::JournalEntry;
 use crate::eta::labels::stage_from_pr_labels;
-use crate::eta::priority_features::{self, PriorityEntry, PriorityFeatures, PriorityState};
 use crate::eta::pr_features::{FeatureRead, PrFeatureStore, Wanted};
+use crate::eta::priority_features::{self, PriorityEntry, PriorityFeatures, PriorityState};
 use crate::eta::queue_features::{
     self, is_pr_stage, reason, EventKind, EventLog, QueueFeatures, QueueSubject, RosterEntry,
     StageEvent, SINCE_MERGE_CAP_SEC,
