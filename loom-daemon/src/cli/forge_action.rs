@@ -94,6 +94,48 @@ pub(crate) enum ForgeAction {
         max_points: u32,
     },
 
+    /// `forge wait-checks <PR|SHA> [--timeout SECS] [--required-only]`
+    /// (#10330) — wait for a PR's (or commit's) CI with ETag'd REST reads
+    /// (an unchanged poll is a free `304`) backing off 30s → 120s.
+    ///
+    /// Prints exactly one sentinel on stdout — `LOOM-CHECKS-GREEN <sha>`,
+    /// `-NONE <sha>`, `-RED <sha> <names>`, `-TIMEOUT <sha> <pending>`,
+    /// `-ERROR <reason>`, `-HEAD-MOVED <old> <new>` — and, on RED, one
+    /// `<name>\t<url>\t<run_id>` line per failing check on stderr. Branch
+    /// on the sentinel, not the exit code (0/1/2/3/4). `--timeout 0` takes
+    /// one snapshot. See `loom_daemon::forge_wait_checks`.
+    #[command(name = "wait-checks")]
+    WaitChecks {
+        /// A PR number, or a commit SHA (7-40 hex).
+        #[arg(value_name = "PR|SHA")]
+        selector: String,
+
+        /// `owner/repo` (default: `LOOM_REPO`, else the `origin` remote).
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Base branch for the required-context lookup in SHA mode
+        /// (default: the repository's default branch).
+        #[arg(long)]
+        base: Option<String>,
+
+        /// Seconds to wait before `LOOM-CHECKS-TIMEOUT`; `0` = one poll.
+        #[arg(long, default_value_t = loom_daemon::forge_wait_checks::DEFAULT_TIMEOUT)]
+        timeout: u64,
+
+        /// Settle on the base branch's required contexts only.
+        #[arg(long)]
+        required_only: bool,
+
+        /// First poll interval, seconds (env `LOOM_WAIT_CHECKS_MIN`, default 30).
+        #[arg(long, value_name = "SECS")]
+        min_interval: Option<u64>,
+
+        /// Poll interval cap, seconds (env `LOOM_WAIT_CHECKS_MAX`, default 120).
+        #[arg(long, value_name = "SECS")]
+        max_interval: Option<u64>,
+    },
+
     /// `forge check-claim <issue> [--force-claim]` — the aggregated
     /// pre-flight claim-CAS probe (#9453 Phase 1): "may I claim issue N
     /// **right now**?" Four legs, cheapest-first, short-circuiting on the
@@ -654,6 +696,25 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),
+        ForgeAction::WaitChecks {
+            selector,
+            repo,
+            base,
+            timeout,
+            required_only,
+            min_interval,
+            max_interval,
+        } => loom_daemon::forge_wait_checks::cli_entrypoint(
+            loom_daemon::forge_wait_checks::WaitArgs {
+                selector,
+                repo,
+                base,
+                timeout,
+                required_only,
+                min_interval,
+                max_interval,
+            },
+        ),
         ForgeAction::CheckOpenPr { issue } => ForgeCmd::CheckOpenPr { issue },
         ForgeAction::PrCongestion {
             json,

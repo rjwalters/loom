@@ -338,8 +338,9 @@ pub fn build_view_url(entity: &str, repo: Option<&str>, number: u32) -> String {
 
 /// `view-{entity}-{number}-{hash}.json`, keeping view entries distinguishable
 /// from the listing store's `listing-{hash}.json` entries sharing the same
-/// directory ([`store::disk_cache_dir`]).
-fn entry_path(dir: &Path, entity: &str, number: u32, cache_key: &str) -> PathBuf {
+/// directory ([`store::disk_cache_dir`]). Shared with
+/// [`crate::forge_wait_checks`]' PR-head read, so the two hold one ETag.
+pub(crate) fn entry_path(dir: &Path, entity: &str, number: u32, cache_key: &str) -> PathBuf {
     store::entry_path_with_prefix(dir, &format!("{VIEW_PREFIX}{entity}-{number}-"), cache_key)
 }
 
