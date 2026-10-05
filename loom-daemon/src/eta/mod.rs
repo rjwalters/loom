@@ -136,8 +136,8 @@ pub mod score;
 pub mod shadow;
 pub mod simulate;
 pub mod stall;
-pub mod star;
 pub mod stall_features;
+pub mod star;
 pub mod tracker;
 pub mod twin_otter;
 
