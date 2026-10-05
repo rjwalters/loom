@@ -113,14 +113,20 @@ pub const MAX_PAGES: u32 = 10;
 /// page is a free `304`), and page 1 is the very URL, and so the very cache
 /// entry, [`list_issues_cached_as`] keeps. Stops at the first short page.
 ///
-/// Pages are read one after another, not atomically: an item that moves
-/// across a page boundary mid-walk can appear twice (callers dedupe) or be
-/// missed for that one call.
+/// Pages are read one after another, not atomically, so after a multi-page
+/// walk pages `1..n-1` are revalidated with the ETags just stored (#10401):
+/// a `304` hands back the same rows, a `200` hands back changed rows, and any
+/// difference means the listing shifted mid-walk, so the walk is an error
+/// rather than a set that may have lost an item across a page boundary. The
+/// last (short) page is not revalidated: a removal on an earlier page shifts
+/// page `n-1`, which is caught. A single-page walk makes no extra request.
+/// The walk is not retried internally; the next call is the retry.
 ///
 /// # Errors
 ///
-/// A page failed, or [`MAX_PAGES`] full pages were read: the set may be
-/// incomplete, and a caller must not read a missing item as absent.
+/// A page failed, [`MAX_PAGES`] full pages were read, or the listing changed
+/// mid-walk: the set may be incomplete, and a caller must not read a missing
+/// item as absent.
 pub fn list_issues_cached_all_as(
     caller: &'static str,
     gh_bin: &Path,
@@ -129,21 +135,27 @@ pub fn list_issues_cached_all_as(
     label: &str,
     state: &str,
 ) -> Result<Vec<RestIssue>> {
-    let mut all = Vec::new();
+    let read = |page: u32| {
+        list_issues_cached_retrying(caller, gh_bin, cwd, repo_override, label, state, Some(page))
+    };
+    let mut pages: Vec<Vec<RestIssue>> = Vec::new();
     for page in 1..=MAX_PAGES {
-        let rows = list_issues_cached_retrying(
-            caller,
-            gh_bin,
-            cwd,
-            repo_override,
-            label,
-            state,
-            Some(page),
-        )?;
+        let rows = read(page)?;
         let full = rows.len() >= PER_PAGE;
-        all.extend(rows);
+        pages.push(rows);
         if !full {
-            return Ok(all);
+            // Revalidate every earlier page (conditional reads: free `304`s
+            // when nothing moved). Nothing to do for a single-page walk.
+            for (i, earlier) in pages[..pages.len() - 1].iter().enumerate() {
+                if read(i as u32 + 1)? != *earlier {
+                    return Err(anyhow!(
+                        "forge_listing: the {label} listing changed mid-walk (page {} moved); \
+                         the set is not a consistent snapshot",
+                        i + 1
+                    ));
+                }
+            }
+            return Ok(pages.into_iter().flatten().collect());
         }
     }
     Err(anyhow!(
