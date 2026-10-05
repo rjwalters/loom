@@ -41,7 +41,25 @@ fn loc() -> StoreLocation {
     }
 }
 
-/// An in-memory contents API: path -> bytes on the `eta-fit` branch.
+/// The fake's key for `path` on `repo`'s `reference`: the bare path for
+/// [`loc`], so most tests read naturally, else `repo@reference:path`.
+fn store_key(repo: &str, reference: &str, path: &str) -> String {
+    if repo == "o/store" && reference == "eta-fit" {
+        path.to_string()
+    } else {
+        format!("{repo}@{reference}:{path}")
+    }
+}
+
+/// `(repo, rest)` of a `repos/<owner>/<name>/<rest>` API path.
+fn split_repo(api_path: &str) -> (String, &str) {
+    let rest = api_path.strip_prefix("repos/").unwrap();
+    let mut parts = rest.splitn(3, '/');
+    let (owner, name, tail) = (parts.next().unwrap(), parts.next().unwrap(), parts.next().unwrap());
+    (format!("{owner}/{name}"), tail)
+}
+
+/// An in-memory contents API: [`store_key`] -> bytes, per repo and branch.
 #[derive(Default)]
 struct Store {
     files: RefCell<BTreeMap<String, Vec<u8>>>,
@@ -83,12 +101,14 @@ impl Transport for Store {
         if api_path.contains("/commits/") {
             return Ok(reply(200, "a".repeat(40)));
         }
-        let path = api_path
-            .split("/contents/")
-            .nth(1)
-            .and_then(|p| p.split('?').next())
+        let (repo, tail) = split_repo(api_path);
+        let (path, query) = tail
+            .strip_prefix("contents/")
             .unwrap()
-            .to_string();
+            .split_once('?')
+            .unwrap();
+        let reference = query.strip_prefix("ref=").unwrap();
+        let path = store_key(&repo, reference, path);
         let files = self.files.borrow();
         let Some(bytes) = files.get(&path) else {
             return Ok(reply(404, ""));
@@ -117,7 +137,12 @@ impl WriteTransport for Store {
             return Ok(reply(201, ""));
         }
         assert_eq!(method, "PUT");
-        let path = api_path.split("/contents/").nth(1).unwrap().to_string();
+        let (repo, tail) = split_repo(api_path);
+        let path = store_key(
+            &repo,
+            body["branch"].as_str().unwrap(),
+            tail.strip_prefix("contents/").unwrap(),
+        );
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         let bytes = STANDARD.decode(body["content"].as_str().unwrap()).unwrap();
         self.files.borrow_mut().insert(path.clone(), bytes);
@@ -301,6 +326,127 @@ fn a_former_captains_publication_is_refused_after_a_captain_change() {
     assert!(installed_ids(host.path()).is_empty());
 }
 
+/// #10395 P1: after a captain failover the new captain must republish the
+/// fit it installed (same fit id and bytes) under its own name, and hosts
+/// configured for it must accept that envelope. A host that was a
+/// non-captain in between and is captain again republishes under its name.
+#[test]
+fn a_captain_failover_republishes_the_installed_fit_under_the_new_captain() {
+    const B: &str = "loom-worker-2";
+    let (a, b, c, d) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let store = Store::default();
+    let now = at(4) + Duration::hours(8);
+    let fit = fit_at(at(4));
+    let envelope =
+        |s: &Store| publish::parse_envelope(s.files.borrow().get(LATEST_PATH).unwrap()).unwrap();
+
+    // A is captain and publishes; B and C install A's fit.
+    captain_publishes(&store, a.path(), &fit, now);
+    assert_eq!(fetch(&store, b.path(), CAPTAIN, now), FetchKind::Installed);
+    assert_eq!(fetch(&store, c.path(), CAPTAIN, now), FetchKind::Installed);
+    assert_eq!(fetch(&store, c.path(), CAPTAIN, now), FetchKind::NotModified);
+
+    // The captain switches to B. Until B republishes, A's envelope is refused
+    // (C keeps the fit it has).
+    assert_eq!(fetch(&store, c.path(), B, now), FetchKind::Refused);
+    assert_eq!(read_status(c.path()).reason.as_deref(), Some("wrong_captain"));
+    assert_eq!(installed_ids(c.path()), vec![fit.id.clone()]);
+
+    // B publishes its newest local fit, the one it installed from A: the
+    // store names the same fit and sha but captain A, so this is a publish,
+    // not `AlreadyPublished`. Only the envelope is written (the bytes match).
+    let writes = store.writes.borrow().len();
+    let kind = publish_newest(&store, &store, &loc(), "main", b.path(), B, now);
+    assert_eq!(kind, Some(PublishKind::Published));
+    assert_eq!(store.writes.borrow()[writes..], [LATEST_PATH.to_string()]);
+    let env = envelope(&store);
+    assert_eq!((env.captain_host.as_str(), env.fit_id.as_str()), (B, fit.id.as_str()));
+    let last = read_status(b.path()).last_published.unwrap();
+    assert_eq!(last, publish::Publication::new(&fit.id, B, &loc()));
+
+    // Hosts configured for B accept B's envelope: C (already has the fit)
+    // and a fresh host D (installs it).
+    assert_eq!(fetch(&store, c.path(), B, now), FetchKind::Current);
+    assert_eq!(read_status(c.path()).captain_host.as_deref(), Some(B));
+    assert_eq!(fetch(&store, d.path(), B, now), FetchKind::Installed);
+    assert_eq!(installed_ids(d.path()), vec![fit.id.clone()]);
+
+    // B's next cycle skips on its own record; without the record, the full
+    // envelope comparison still finds it already published.
+    let writes = store.writes.borrow().len();
+    assert_eq!(publish_newest(&store, &store, &loc(), "main", b.path(), B, now), None);
+    std::fs::remove_file(publish::status_path(b.path())).unwrap();
+    let again = publish_newest(&store, &store, &loc(), "main", b.path(), B, now);
+    assert_eq!(again, Some(PublishKind::AlreadyPublished));
+    assert_eq!(store.writes.borrow().len(), writes);
+
+    // Back to A. A ran as a non-captain under B, which cleared its record, so
+    // it re-checks the store and republishes under its own name.
+    assert_eq!(fetch(&store, a.path(), B, now), FetchKind::Current);
+    assert_eq!(read_status(a.path()).last_published, None);
+    let kind = publish_newest(&store, &store, &loc(), "main", a.path(), CAPTAIN, now);
+    assert_eq!(kind, Some(PublishKind::Published));
+    assert_eq!(envelope(&store).captain_host, CAPTAIN);
+    assert_eq!(fetch(&store, c.path(), CAPTAIN, now), FetchKind::Current);
+}
+
+/// #10395 P1: a new `fleet.repo` or `fleet.etaFitRef` with the same fit and
+/// captain is a new destination, so the captain publishes there.
+#[test]
+fn a_destination_change_republishes_the_same_fit() {
+    let (cap, host) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let store = Store::default();
+    let now = at(4) + Duration::hours(8);
+    let fit = fit_at(at(4));
+    captain_publishes(&store, cap.path(), &fit, now);
+    for (repo, reference) in [("o/store", "eta-fit-2"), ("o/other", "eta-fit")] {
+        let dest = StoreLocation {
+            repo: repo.to_string(),
+            reference: reference.to_string(),
+        };
+        let kind = publish_newest(&store, &store, &dest, "main", cap.path(), CAPTAIN, now);
+        assert_eq!(kind, Some(PublishKind::Published), "{repo}@{reference}");
+        assert_eq!(
+            store.writes.borrow()[store.writes.borrow().len() - 2..],
+            [
+                format!("{repo}@{reference}:eta/fit/{}.json", fit.id),
+                format!("{repo}@{reference}:{LATEST_PATH}"),
+            ]
+        );
+        let got = fetch_and_install(&store, &dest, host.path(), CAPTAIN, now, Duration::days(3));
+        assert!(got.serving_published(), "{repo}@{reference}: {got:?}");
+        assert_eq!(
+            read_status(cap.path()).last_published,
+            Some(publish::Publication::new(&fit.id, CAPTAIN, &dest))
+        );
+    }
+    assert_eq!(installed_ids(host.path()), vec![fit.id.clone()]);
+}
+
+/// A fit file stored under the right name but with other bytes is replaced,
+/// so the envelope (which names this build's sha) never points at bytes a
+/// host would refuse.
+#[test]
+fn a_stored_fit_with_other_bytes_is_rewritten_before_the_envelope() {
+    let (cap, host) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let store = Store::default();
+    let now = at(4) + Duration::hours(8);
+    let fit = fit_at(at(4));
+    let file = format!("eta/fit/{}.json", fit.id);
+    store
+        .files
+        .borrow_mut()
+        .insert(file.clone(), b"{\"other\":true}".to_vec());
+    captain_publishes(&store, cap.path(), &fit, now);
+    assert_eq!(*store.writes.borrow(), vec![file, LATEST_PATH.to_string()]);
+    assert_eq!(fetch(&store, host.path(), CAPTAIN, now), FetchKind::Installed);
+}
+
 #[test]
 fn a_304_is_trusted_only_while_the_captain_and_installed_fit_still_match() {
     let (cap, host) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -439,7 +585,7 @@ fn a_publish_failure_is_recorded_not_fatal() {
     assert_eq!(r, None);
     let status = read_status(cap.path());
     assert!(status.publish_error.unwrap().contains("contents:write"));
-    assert_eq!(status.last_published_id, None);
+    assert_eq!(status.last_published, None);
 }
 
 #[test]

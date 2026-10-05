@@ -345,12 +345,42 @@ pub struct PubStatus {
     /// When it was published.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_at: Option<DateTime<Utc>>,
-    /// Captain side: the fit id last published successfully.
+    /// Captain side: what was last published successfully, and where and as
+    /// whom. Cleared whenever this host runs as a non-captain, so a host that
+    /// regains captaincy re-checks the store instead of trusting it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_published_id: Option<String>,
+    pub last_published: Option<Publication>,
     /// Captain side: the last publish failure, cleared on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publish_error: Option<String>,
+}
+
+/// The identity of one publication: the fit, the captain it was published as,
+/// and the destination. A change in any part (a captain failover, a new
+/// `fleet.repo` or `fleet.etaFitRef`) is a new publication, never a skip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Publication {
+    /// The fit's `id`.
+    pub fit_id: String,
+    /// The captain it was published as.
+    pub captain_host: String,
+    /// The store repo (`fleet.repo`).
+    pub repo: String,
+    /// The publication branch (`fleet.etaFitRef`).
+    pub reference: String,
+}
+
+impl Publication {
+    /// The identity of publishing `fit_id` to `loc` as `captain`.
+    #[must_use]
+    pub fn new(fit_id: &str, captain: &str, loc: &StoreLocation) -> Self {
+        Self {
+            fit_id: fit_id.to_string(),
+            captain_host: captain.to_string(),
+            repo: loc.repo.clone(),
+            reference: loc.reference.clone(),
+        }
+    }
 }
 
 /// `<fit_dir>/../fit-pub/status.json`.
@@ -404,6 +434,10 @@ pub fn fetch_and_install(
     max_age: Duration,
 ) -> FetchKind {
     let mut status = read_status(root);
+    // Running as a non-captain ends any captaincy this host held: forget what
+    // it published, so if it is captain again it re-checks the store (which
+    // may now name another captain) rather than skipping on stale state.
+    status.last_published = None;
     let (kind, reason) = match fetch_inner(transport, loc, root, captain, now, max_age, &mut status)
     {
         Ok(kind) => (kind, None),
@@ -541,7 +575,8 @@ fn fetch_inner(
 pub enum PublishKind {
     /// The fit and envelope were written.
     Published,
-    /// The store already names this fit; nothing written.
+    /// The store already holds this exact publication (same envelope apart
+    /// from `published_at`, same captain, fit bytes present); nothing written.
     AlreadyPublished,
 }
 
@@ -677,10 +712,22 @@ fn refuse_reviewed_branch(loc: &StoreLocation, base_ref: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether `cur` (the store's envelope) is the publication `env` would make:
+/// every field equal (schema, fit, window, **captain**, fitter, file, sha)
+/// except `published_at`. A former captain's envelope for the same fit is
+/// not: the new captain must republish it, or every host would refuse it.
+fn same_publication(cur: &Envelope, env: &Envelope) -> bool {
+    Envelope {
+        published_at: env.published_at,
+        ..cur.clone()
+    } == *env
+}
+
 /// Publish `fit` to `loc` (its `reference` is the publication branch,
-/// created from `base_ref` if missing): the file first, the envelope last.
-/// Idempotent: a store whose envelope already names this fit and sha is left
-/// alone.
+/// created from `base_ref` if missing) as `captain`: the file first (unless
+/// the store already holds these exact bytes), the envelope last.
+/// Idempotent: a store whose envelope is already this publication
+/// ([`same_publication`]) and whose fit bytes are present is left alone.
 ///
 /// # Errors
 ///
@@ -700,17 +747,28 @@ pub fn publish(
     ensure_branch(t, wt, loc, base_ref)?;
 
     let latest = t.get(&contents_path(loc, LATEST_PATH), Some(RAW), None)?;
-    if latest.status == 200 {
-        if let Ok(cur) = serde_json::from_str::<Envelope>(&latest.body) {
-            if cur.fit_id == env.fit_id && cur.sha256 == env.sha256 {
-                return Ok(PublishKind::AlreadyPublished);
-            }
-        }
+    let current = latest.status == 200
+        && parse_envelope(latest.body.as_bytes()).is_ok_and(|cur| same_publication(&cur, &env));
+    let file_path = format!("eta/fit/{}", env.file);
+    let stored = t.get(&contents_path(loc, &file_path), Some(RAW), None)?;
+    let file_ok = match stored.status {
+        200 => sha256_hex(stored.body.as_bytes()) == env.sha256,
+        404 => false,
+        s => bail!("HTTP {s} reading {file_path} in {}", loc.repo),
+    };
+    if current && file_ok {
+        return Ok(PublishKind::AlreadyPublished);
     }
     let msg = format!("eta fit {} (as_of {})", fit.id, fit.as_of.to_rfc3339());
-    let file_path = format!("eta/fit/{}", env.file);
-    if blob_sha(t, loc, &file_path)?.is_none() {
-        put_file(wt, loc, &file_path, &bytes, None, &msg)?;
+    if !file_ok {
+        // Absent, or other bytes under this name: the envelope will name
+        // these bytes' sha, so the store must hold exactly them.
+        let existing = if stored.status == 404 {
+            None
+        } else {
+            blob_sha(t, loc, &file_path)?
+        };
+        put_file(wt, loc, &file_path, &bytes, existing, &msg)?;
     }
     let latest_sha = blob_sha(t, loc, LATEST_PATH)?;
     let env_text = serde_json::to_string_pretty(&env).context("encoding the envelope")? + "\n";
@@ -718,9 +776,10 @@ pub fn publish(
     Ok(PublishKind::Published)
 }
 
-/// Publish the newest local fit unless it is already published. A failure is
-/// logged and recorded, never propagated: it must not fail the fit or the
-/// refresh cycle. Returns the kind on success.
+/// Publish the newest local fit unless this host already published it, as
+/// this captain, to this destination ([`Publication`]). A failure is logged
+/// and recorded, never propagated: it must not fail the fit or the refresh
+/// cycle. Returns the kind on success.
 pub fn publish_newest(
     t: &dyn Transport,
     wt: &dyn WriteTransport,
@@ -732,7 +791,8 @@ pub fn publish_newest(
 ) -> Option<PublishKind> {
     let fit = coeffs::load_latest(root, now + Duration::days(1))?;
     let mut status = read_status(root);
-    if status.last_published_id.as_deref() == Some(fit.id.as_str()) {
+    let publication = Publication::new(&fit.id, captain, loc);
+    if status.last_published.as_ref() == Some(&publication) {
         return None;
     }
     match publish(t, wt, loc, base_ref, &fit, captain, now) {
@@ -743,7 +803,7 @@ pub fn publish_newest(
                 loc.repo,
                 loc.reference
             );
-            status.last_published_id = Some(fit.id);
+            status.last_published = Some(publication);
             status.publish_error = None;
             write_status(root, &status);
             Some(kind)

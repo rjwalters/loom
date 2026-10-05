@@ -1564,6 +1564,11 @@ them with a daemon restart.
     captain's file is refused); same feature set; `as_of` not in the future,
     not older than `fleet.etaFitMaxAgeDays` (default 3), and not older than the
     newest local fit.
+  - **Captain change.** A publication is the fit *and* its captain and
+    destination: after a failover the new captain republishes the fit it
+    installed under its own name (same file, new envelope), and so does a
+    captain publishing to a new `fleet.repo` or `fleet.etaFitRef`. Until it
+    does, hosts refuse the former captain's envelope and keep their fit.
   - **Fallback.** No `fleet.repo`, no branch, a fetch error, a refusal or a
     stale publication: the host keeps its newest local fit (or `no_model`), and,
     when it has fresh snapshots, fits itself as before. A publish failure on
