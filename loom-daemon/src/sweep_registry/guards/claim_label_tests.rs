@@ -231,7 +231,7 @@ fn claim_label_is_live_foreign_ignores_this_dispatchers_own_flip() {
     );
     assert!(
         !claim_label_is_live_foreign(episode_start, episode_start),
-        "the boundary is strict: only an event strictly older than the episode start is foreign"
+        "an event at the episode start is this attempt's own flip, not foreign (older-by-slack is the foreign threshold)"
     );
     assert!(
         claim_label_is_live_foreign(episode_start - chrono::Duration::seconds(2), episode_start),
