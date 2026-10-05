@@ -127,6 +127,7 @@ fn github_merge_method(gh: &str, nwo: &str, requested: Option<&str>) -> i32 {
         GhTarget::None,
         FORGE_CMD_TIMEOUT,
     )
+    .forge_op(crate::forge_call_stats::ops::REPO_VIEW)
     .program(gh)
     .args(["api", &format!("repos/{nwo}")])
     .run();

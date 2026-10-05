@@ -354,6 +354,7 @@ fn probe_untrusted_marker(root: &Path, pr: &VerdictPr) -> Option<UntrustedVerdic
         GhTarget::None,
         std::time::Duration::from_secs(60),
     )
+    .forge_op(crate::forge_call_stats::ops::COMMENT_LIST)
     .args(["api", path.as_str(), "--paginate"])
     .current_dir(root)
     .run();

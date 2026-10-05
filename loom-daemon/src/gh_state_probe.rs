@@ -47,6 +47,7 @@ pub(crate) fn pr_merged_at_output(repo: &str, pr: u32) -> Option<Output> {
         GhTarget::repo(repo).unwrap_or(GhTarget::None),
         PROBE_TIMEOUT,
     )
+    .forge_op(crate::forge_call_stats::ops::PR_VIEW_STATE)
     .args(["pr", "view", &pr, "--repo", repo, "--json", "mergedAt"])
     .run())
 }

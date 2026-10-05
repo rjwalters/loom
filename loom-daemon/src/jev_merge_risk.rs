@@ -329,6 +329,7 @@ fn gather_pr_context(pr: u64) -> Result<PrContext> {
         GhTarget::None,
         DEFAULT_TIMEOUT,
     )
+    .forge_op(crate::forge_call_stats::ops::PR_DIFF_AND_FILES)
     .program(&gh)
     .current_dir(&dir)
     .args(["pr", "diff", &pr_arg]);

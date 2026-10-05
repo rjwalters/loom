@@ -97,6 +97,7 @@ pub(crate) fn open_pr_on_issue_branch(gh_bin: &Path, root: &Path, issue: u32) ->
         crate::gh_invocation::GhTarget::None,
         std::time::Duration::from_secs(60),
     )
+    .forge_op(crate::forge_call_stats::ops::PR_LIST_BY_HEAD)
     .program(gh_bin)
     .current_dir(root)
     .args(["pr", "list", "--head"])

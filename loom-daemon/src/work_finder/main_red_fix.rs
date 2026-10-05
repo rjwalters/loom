@@ -154,6 +154,7 @@ fn probe_ci_main_red(root: &Path) -> bool {
         crate::gh_invocation::GhTarget::None,
         Duration::from_secs(30),
     )
+    .forge_op(crate::forge_call_stats::ops::CI_WORKFLOW_RUNS_FOR_SHA)
     .args(["run", "list", "--branch", &branch, "--limit", "30"])
     .args(["--json", "headSha,status,conclusion,workflowName"])
     .current_dir(root)

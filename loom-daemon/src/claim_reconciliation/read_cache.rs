@@ -79,6 +79,29 @@ pub(crate) static QUARANTINE_SCAN: ReadCache<QuarantineScan> = ReadCache::new(CL
 /// See [`QUARANTINE_SCAN`].
 pub(crate) type QuarantineScan = (bool, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
+/// A mergeable `loom:merge-conflict` PR's "did this pass flag it?" answer
+/// (`review_conflict::flag_is_latest`). Only a `false` outlives the tick —
+/// `true` clears the PR, which moves its `updatedAt` — so a conflict label
+/// some other actor applied stops costing one comments walk per tick.
+/// [`CLAIM_MAX_AGE`]: a comments read lagging our own flag delays the
+/// return to review by at most about one tick (never a wrong write).
+pub(super) static CONFLICT_FLAG_OURS: ReadCache<bool> = ReadCache::new(CLAIM_MAX_AGE);
+/// A sequence holder's newest trusted marker (`None` = a manual hold).
+/// [`CLAIM_MAX_AGE`]: a marker missed by a lagging comments read keeps the
+/// hold in place (fail closed) for at most about one tick.
+pub(super) static HOLD_MARKER: ReadCache<Option<crate::merge_pr::sequence::SequenceMarker>> =
+    ReadCache::new(CLAIM_MAX_AGE);
+/// A held PR's predecessor state, cached ONLY while that predecessor is in
+/// this tick's open listing (keyed on its `updatedAt` + head): a merge drops
+/// it from the next listing, which forces a live read — a release is delayed
+/// by at most one tick, never skipped.
+pub(super) static PREDECESSOR: ReadCache<crate::merge_pr::sequence::PredecessorState> =
+    ReadCache::new(CLAIM_MAX_AGE);
+/// A stalled chain whose head already carries its escalation marker — only
+/// `true` is ever stored (a cached "not yet" could re-post on a lagging
+/// listing), so an escalated chain stops re-walking the head's comments.
+pub(super) static STALL_ESCALATED: ReadCache<bool> = ReadCache::new(MAX_AGE);
+
 /// One process-wide cache of found answers, keyed by [`key`].
 pub(crate) struct ReadCache<V> {
     entries: Mutex<Option<HashMap<String, (Instant, V)>>>,
@@ -181,3 +204,7 @@ pub(crate) fn set_test_enabled(on: bool) {
 #[cfg(test)]
 #[path = "read_cache_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "read_cache_passes_tests.rs"]
+mod passes_tests;

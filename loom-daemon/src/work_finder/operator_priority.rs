@@ -336,6 +336,7 @@ impl StarredAtSource for GhTimelineStarredAt {
             crate::gh_invocation::GhTarget::None,
             crate::claim_reconciliation::gh_call::GH_TIMEOUT,
         )
+        .forge_op(crate::forge_call_stats::ops::TIMELINE_READ)
         .program(&self.gh_bin)
         .args(["api", &format!("repos/{repo}/issues/{issue}/timeline")])
         .args(["--paginate", "--jq", &starred_at_jq()]);

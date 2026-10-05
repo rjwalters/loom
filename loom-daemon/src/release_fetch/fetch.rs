@@ -168,6 +168,7 @@ fn download(repo_root: &Path, repo_slug: &str, tag: &str, patterns: &[&str], des
     // #10089: through the facade, so the download is counted.
     let op = Operation::new("release.download");
     let mut inv = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, DOWNLOAD_TIMEOUT)
+        .forge_op(crate::forge_call_stats::ops::RELEASE_RESOLVE_AND_FETCH)
         .current_dir(repo_root)
         .args(["release", "download", tag, "-R", repo_slug]);
     for p in patterns {

@@ -13,6 +13,7 @@ fn pr(mergeable: Mergeable, labels: &[&str]) -> ConflictPr {
         head_sha: Some(SHA.to_string()),
         mergeable,
         labels: labels.iter().map(ToString::to_string).collect(),
+        updated_at: None,
     }
 }
 
