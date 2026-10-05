@@ -6,14 +6,21 @@
 //! Deriving a repo's stage history costs one `gh pr list` plus one
 //! `issues/<n>/timeline` read per PR. Paying that on every daemon tick, on
 //! every host, is exactly the API cost #9343 names as the objection to
-//! forge-sourced history — so the derivation lives here, behind an explicit
-//! backfill, and the daemon only ever *reads* the cached file
-//! ([`loom_daemon::eta::fleet::load_all`]).
+//! forge-sourced history — so no tick derives, and the ETA pass only ever
+//! *reads* the cached file ([`loom_daemon::eta::fleet::load_all`]).
+//!
+//! Since #10263 the daemon keeps the snapshots fresh itself, **off the tick**:
+//! an hourly task (`observability::eta_fleet_refresh`) runs budgeted,
+//! resumable backfills and refreshes through reader Apps only. This command
+//! stays for ad-hoc and non-daemon use; it runs under the ambient `gh`
+//! credential, so it is not what a fleet host should schedule.
 //!
 //! - `backfill` — the once-per-repo full derivation.
 //! - `refresh` — the incremental top-up: only PRs the forge says moved since
 //!   the cached snapshot's cursor.
 //! - `show` — what is cached, and whether it is enough evidence to estimate.
+//! - `events backfill|refresh`, `state --as-of` — the raw event cache and
+//!   `fleet_state(t)` (#10197); see `eta_fleet_events_cmd.rs`.
 //!
 //! # Sharing a snapshot between hosts
 //!
@@ -57,16 +64,39 @@ pub(crate) enum FleetCommand {
     /// Top the cached snapshot up with only the PRs that moved since its
     /// cursor.
     Refresh(FleetBuildArgs),
-    /// Print what is cached: id, as-of, cursor, PR census, per-stage counts.
+    /// Print what is cached: id, as-of, cursor, PR census, per-stage sample
+    /// and stage-episode counts.
     Show(FleetShowArgs),
+    /// The raw, resumable per-repo event cache (#10197):
+    /// `eta fleet events backfill|refresh`.
+    Events {
+        #[command(subcommand)]
+        command: super::eta_fleet_events_cmd::EventsCommand,
+    },
+    /// Reconstruct the repo's whole fleet at an instant from the raw event
+    /// cache (#10197): `eta fleet state --as-of RFC3339 [--json]`.
+    State(super::eta_fleet_events_cmd::FleetStateArgs),
+    /// Score `fleet_state(as_of)` against logged `eta.estimate` features
+    /// (#10197): `eta fleet agreement --estimates export.jsonl`.
+    Agreement(super::eta_fleet_events_cmd::AgreementArgs),
+    /// The SigNoz in-sweep half of fleet history (#9758):
+    /// `eta fleet signoz refresh|show|query`.
+    Signoz {
+        #[command(subcommand)]
+        command: super::eta_fleet_signoz_cmd::SignozCommand,
+    },
 }
 
 impl FleetCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
+            FleetCommand::Signoz { command } => command.run(),
             FleetCommand::Backfill(args) => args.run(false),
             FleetCommand::Refresh(args) => args.run(true),
             FleetCommand::Show(args) => args.run(),
+            FleetCommand::Events { command } => command.run(),
+            FleetCommand::State(args) => args.run(),
+            FleetCommand::Agreement(args) => args.run(),
         }
     }
 }
@@ -269,10 +299,15 @@ fn render(snapshot: &FleetSnapshot, path: &Path) -> String {
     }
     let (verdicts, rejected) = snapshot.verdict_counts();
     let _ = writeln!(out, "  verdicts: {verdicts} ({rejected} changes-requested)");
+    // #10218: the split stage record, `merge_hold` included.
+    let _ = writeln!(out, "  episodes: {}", snapshot.episodes.len());
+    for (stage, (completed, censored)) in snapshot.episode_counts_by_stage() {
+        let _ = writeln!(out, "    {stage:<14} n={completed:<5} censored={censored}");
+    }
     out
 }
 
-fn resolve_root(repo_root: Option<PathBuf>) -> PathBuf {
+pub(super) fn resolve_root(repo_root: Option<PathBuf>) -> PathBuf {
     repo_root
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
@@ -353,6 +388,39 @@ mod tests {
         assert!(text.contains("review_wait"), "{text}");
         assert!(text.contains("merge_wait"), "{text}");
         assert!(text.contains("verdicts: 1"), "{text}");
+    }
+
+    #[test]
+    fn render_counts_stage_episodes_by_stage_merge_hold_included() {
+        const HOUR: i64 = 3600;
+        let held = PrHistory::new(
+            13,
+            t(0),
+            PrState::Merged,
+            Some(t(9 * HOUR)),
+            Vec::new(),
+            vec![
+                labeled(REVIEW_REQUESTED, HOUR),
+                PrEvent::Unlabeled {
+                    label: REVIEW_REQUESTED.to_string(),
+                    at: t(2 * HOUR),
+                },
+                labeled(APPROVED, 2 * HOUR),
+                labeled("loom:operator", 3 * HOUR),
+                PrEvent::Unlabeled {
+                    label: "loom:operator".to_string(),
+                    at: t(5 * HOUR),
+                },
+                PrEvent::Merged { at: t(9 * HOUR) },
+            ],
+            true,
+        );
+        let mut snapshot = FleetSnapshot::empty("rjwalters/loom");
+        snapshot.merge(&[held], t(10 * HOUR));
+        let text = render(&snapshot, Path::new("/tmp/fleet-x.json"));
+        assert!(text.contains("episodes: 4"), "{text}");
+        assert!(text.contains("merge_hold     n=1     censored=0"), "{text}");
+        assert!(text.contains("merge_wait     n=2     censored=0"), "{text}");
     }
 
     #[test]

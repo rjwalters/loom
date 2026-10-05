@@ -28,6 +28,18 @@ use loom_daemon::types::{ObservabilityExportState as State, ObservabilityExportS
 /// reported as `unknown`, never silently as `disabled`, which would be an
 /// invented fact about a daemon that said nothing.
 pub fn render(status: Option<&ObservabilityExportStatus>, now: DateTime<Utc>) -> String {
+    let line = render_state(status, now);
+    // #10282: a uniform, greppable `telemetry: on|off` token on every line
+    // that reports a state, so "is this daemon exporting at all" never has to
+    // be inferred from prose.
+    match status.map(|s| s.classify(now)) {
+        Some(State::Disabled | State::Misconfigured) => format!("{line} [telemetry: off]"),
+        Some(State::Unrecognized) | None => line,
+        Some(_) => format!("{line} [telemetry: on]"),
+    }
+}
+
+fn render_state(status: Option<&ObservabilityExportStatus>, now: DateTime<Utc>) -> String {
     let Some(s) = status else {
         return "Observability: unknown (older daemon binary — restart to pick up #5083)"
             .to_string();
@@ -87,7 +99,8 @@ pub fn render(status: Option<&ObservabilityExportStatus>, now: DateTime<Utc>) ->
         ),
         State::Failing => format!(
             "Observability: FAILING — {} consecutive failed flush(es) as host_id={host}, last \
-             success {last_success} → {endpoint}{}",
+             success {last_success} → {endpoint}{} — fix: check this host's OTel egress (edge \
+             collector / tunnel / ingest key); `loom-daemon health` has the verdict (#9950)",
             s.consecutive_failures,
             s.last_failure_detail
                 .as_deref()
@@ -279,6 +292,10 @@ mod tests {
         assert!(line.contains("FAILING"), "{line}");
         assert!(line.contains("HTTP 401"), "{line}");
         assert!(line.contains("2h ago"), "{line}");
+        // #9950: the FAILING line must also say what to do, not only what is
+        // wrong — an operator reading it cold should not need a second run.
+        assert!(line.contains("fix: check this host's OTel egress"), "{line}");
+        assert!(line.contains("loom-daemon health"), "{line}");
     }
 
     #[test]
@@ -300,5 +317,15 @@ mod tests {
         let line = render(None, render_now());
         assert!(line.contains("unknown"), "{line}");
         assert!(line.contains("older daemon binary"), "{line}");
+    }
+
+    #[test]
+    fn telemetry_on_off_token_is_present_on_every_known_state() {
+        let off = render(Some(&ObservabilityExportStatus::disabled()), render_now());
+        assert!(off.ends_with("[telemetry: off]"), "{off}");
+        let on = render(Some(&export_status(|_| {})), render_now());
+        assert!(on.ends_with("[telemetry: on]"), "{on}");
+        let unknown = render(None, render_now());
+        assert!(!unknown.contains("telemetry:"), "{unknown}");
     }
 }

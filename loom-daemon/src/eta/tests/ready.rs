@@ -40,14 +40,14 @@ fn turnovers(n: usize, base: i64) -> Vec<StageSample> {
 }
 
 /// history-a plus 12 turnovers of 300..=3600 s.
-fn history_ready() -> StageSamples {
+pub(super) fn history_ready() -> StageSamples {
     let mut history = history_a();
     history.stages.extend(turnovers(12, 300));
     history
 }
 
 /// Position 5, four waiting rows ahead, one free slot: four turnovers.
-fn dispatch() -> DispatchInput {
+pub(super) fn dispatch() -> DispatchInput {
     DispatchInput {
         position: 5,
         plan_state: "queued".to_string(),
@@ -61,7 +61,7 @@ fn dispatch() -> DispatchInput {
     }
 }
 
-fn ready_input(dispatch: Option<DispatchInput>) -> EstimateInput {
+pub(super) fn ready_input(dispatch: Option<DispatchInput>) -> EstimateInput {
     let mut input = input_at(Stage::ReadyWait, 600, 0);
     input.subject.pr_number = None;
     input.subject.sweep_id = None;
@@ -71,6 +71,7 @@ fn ready_input(dispatch: Option<DispatchInput>) -> EstimateInput {
         age_sec: 600,
         age_source: AgeSource::TrackerObserved,
         rework_rounds: 0,
+        episode_entered_at: None,
     });
     input.dispatch = dispatch;
     input
@@ -160,7 +161,9 @@ fn ready_explanations_recompute_from_their_own_json() {
     ] {
         let json = serde_json::to_string(&explanation).unwrap();
         let parsed: Explanation = serde_json::from_str(&json).unwrap();
-        assert_eq!(run_explanation(&parsed), explanation.quantiles());
+        assert_eq!(run_explanation(&parsed), explanation.quantiles_with_p90());
+        let (p25, p50, p75, p90) = explanation.quantiles_with_p90().expect("p90 recorded");
+        assert!(p25 <= p50 && p50 <= p75 && p75 <= p90, "{}", explanation.heuristic);
         let result = explanation.result.as_ref().unwrap();
         let marks = run_marks(&parsed).unwrap();
         assert_eq!(marks, result.stage_marks);
@@ -198,7 +201,8 @@ fn ready_golden_fixture() {
     );
     for kind in ["start", "land"] {
         let parsed: Explanation = serde_json::from_value(golden[kind].clone()).unwrap();
-        assert_eq!(run_explanation(&parsed), parsed.quantiles(), "{kind} recomputes");
+        assert!(parsed.quantiles_with_p90().is_some(), "{kind} records p90");
+        assert_eq!(run_explanation(&parsed), parsed.quantiles_with_p90(), "{kind} recomputes");
     }
 }
 
@@ -310,6 +314,8 @@ fn row(issue: u32, state: PlanState, position: Option<u32>) -> ReadyRow {
             gate: position.map(|_| PlanGate::Capacity),
             ..RowPlan::default()
         },
+        disposition: crate::types::QueueDisposition::DeferredCapacity,
+        facts: crate::eta::tracker::IssueRow::default(),
     }
 }
 
@@ -328,6 +334,7 @@ fn ready_plan(complete: bool) -> ReadyPlan {
             ..DispatchPlanContext::default()
         },
         at: as_of() - Duration::seconds(10),
+        listing_failed: Vec::new(),
     }
 }
 
@@ -343,6 +350,7 @@ fn estimate(tracker: &mut Tracker, history: &StageSamples) -> Vec<crate::eta::tr
         refresh_secs: 300,
         host_id: Some("host-test"),
         repo_ids: &repo_ids,
+        stalls: &crate::eta::stall::StallSnapshot::default(),
     };
     tracker.estimate(None, &ctx, as_of())
 }

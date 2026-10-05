@@ -62,6 +62,7 @@ use crate::types::{Event, SweepKind};
 /// runtime-dispatched per-model token lookup. A sibling module because this
 /// file is over `.loom/docs/file-size-policy.md`'s threshold and frozen.
 mod completion_runtime;
+mod forge_gate;
 
 // ============================================================================
 // Constants
@@ -1587,6 +1588,9 @@ pub fn build_completion_envelope(
 /// `title`/`additions`/`deletions`), so enriching the completion costs **zero**
 /// extra forge round-trips on the happy path.
 async fn fetch_merged_pr(workspace_root: &Path, issue: u32) -> Option<MergedPr> {
+    if forge_gate::suppressed("pr list", workspace_root) {
+        return None;
+    }
     let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
     let branch = crate::worktree_ops::naming::branch_name(issue);
     let mut output =
@@ -1606,7 +1610,7 @@ async fn fetch_merged_pr(workspace_root: &Path, issue: u32) -> Option<MergedPr> 
     if !output.status.success() {
         // #6596: the credential-gap symptom (`Could not resolve to a
         // Repository`) surfaces exactly here, and used to be swallowed whole.
-        log_gh_failure_once("pr list", workspace_root, &stderr_head(&output.stderr));
+        forge_gate::failed("pr list", workspace_root, &gh_bin, &output.stderr);
         return None;
     }
     log_gh_recovery_once("pr list", workspace_root);
@@ -1651,51 +1655,52 @@ async fn run_merged_pr_query(
     fields: &str,
     workspace_root: &Path,
 ) -> Option<std::process::Output> {
-    let mut cmd = tokio::process::Command::new(gh_bin);
-    cmd.arg("pr")
-        .arg("list")
-        .arg("--head")
-        .arg(branch)
-        .arg("--state")
-        .arg("merged")
-        .arg("--json")
-        .arg(fields)
-        .arg("--limit")
-        .arg("1")
-        .current_dir(workspace_root);
-    apply_owner_gh_config(&mut cmd, workspace_root);
-    let run = cmd.output();
-    match tokio::time::timeout(MERGE_CHECK_TIMEOUT, run).await {
-        Ok(Ok(output)) => Some(output),
-        // Neither of these carries a `stderr` to quote: the process either never
-        // started or never finished. Say which, once per workspace (#6596).
-        Ok(Err(err)) => {
-            log_gh_failure_once("pr list", workspace_root, &format!("could not run gh: {err}"));
-            None
-        }
-        Err(_) => {
-            log_gh_failure_once(
-                "pr list",
-                workspace_root,
-                &format!("timed out after {}s", MERGE_CHECK_TIMEOUT.as_secs()),
-            );
-            None
-        }
-    }
+    let args = [
+        "pr", "list", "--head", branch, "--state", "merged", "--json", fields, "--limit", "1",
+    ];
+    run_sink_gh(
+        "pr list",
+        "safehouse.merged_pr",
+        gh_bin,
+        &args,
+        workspace_root,
+        MERGE_CHECK_TIMEOUT,
+    )
+    .await
 }
 
-/// Point a sink-side `gh` child at the credential scoped to `workspace_root`'s
-/// owner (#6596). The daemon process itself runs under the **primary**
-/// installation's `GH_CONFIG_DIR` (#4458), which cannot see a *private* repo
-/// owned by another org — so before this, every lookup in this module
-/// (merge verification, slug/visibility resolution, the reconciliation pass,
-/// the dispatch-line title) failed with `Could not resolve to a Repository` on
-/// exactly those workspaces and, because every failure here is silent by
-/// contract, their completions were permanently and invisibly absent from the
-/// feed. A total no-op for single-owner fleets and the root owner's own repos,
-/// same as the three dispatch paths this mirrors (#5401/#5508/#5522/#6529).
-fn apply_owner_gh_config(cmd: &mut tokio::process::Command, workspace_root: &Path) {
-    crate::credential_preflight::apply_gh_config_for_root_async(cmd, workspace_root);
+/// One sink-side `gh` read through the facade (#10089: counted in
+/// `forge_call_stats` as `op`). The facade runs it in `workspace_root` under
+/// that root's owner credential (#6596 — the daemon's **primary**
+/// `GH_CONFIG_DIR` cannot see another org's *private* repo, and every failure
+/// here is silent by contract, so without it those workspaces' completions
+/// were invisibly absent from the feed). `None` when the process never
+/// started or never finished — neither carries a `stderr` to quote, so which
+/// one is logged once per workspace; a nonzero exit is returned so the caller
+/// can inspect `stderr`.
+async fn run_sink_gh(
+    call: &str,
+    op: &'static str,
+    gh_bin: &str,
+    args: &[&str],
+    workspace_root: &Path,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    use crate::cmd_out::{CmdOutcome, Unavailable};
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    let inv = GhInvocation::new(Operation::new(op), AccessIntent::Read, GhTarget::None, timeout)
+        .program(gh_bin)
+        .current_dir(workspace_root)
+        .args(args);
+    let why = match inv.run_async().await {
+        CmdOutcome::Ran(output) => return Some(output),
+        CmdOutcome::Unavailable(Unavailable::TimedOut { .. }) => {
+            format!("timed out after {}s", timeout.as_secs())
+        }
+        CmdOutcome::Unavailable(u) => format!("could not run gh: {u}"),
+    };
+    log_gh_failure_once(call, workspace_root, &why);
+    None
 }
 
 /// One-per-`(call, workspace)` record of an already-warned forge failure.
@@ -1852,6 +1857,9 @@ const REPO_VIEW_FIELDS_BASE: &str = "nameWithOwner";
 /// (#4201) used for `task_id`/body prefixes, which is a local directory name
 /// with no forge meaning.
 async fn fetch_repo_identity(workspace_root: &Path) -> Option<RepoIdentity> {
+    if forge_gate::suppressed("repo view", workspace_root) {
+        return None;
+    }
     let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
     let mut output = run_repo_view_query(&gh_bin, REPO_VIEW_FIELDS, workspace_root).await?;
     if !output.status.success() && rejects_unknown_json_field(&output.stderr) {
@@ -1866,7 +1874,7 @@ async fn fetch_repo_identity(workspace_root: &Path) -> Option<RepoIdentity> {
         output = run_repo_view_query(&gh_bin, REPO_VIEW_FIELDS_BASE, workspace_root).await?;
     }
     if !output.status.success() {
-        log_gh_failure_once("repo view", workspace_root, &stderr_head(&output.stderr));
+        forge_gate::failed("repo view", workspace_root, &gh_bin, &output.stderr);
         return None;
     }
     log_gh_recovery_once("repo view", workspace_root);
@@ -1899,29 +1907,16 @@ async fn run_repo_view_query(
     fields: &str,
     workspace_root: &Path,
 ) -> Option<std::process::Output> {
-    let mut cmd = tokio::process::Command::new(gh_bin);
-    cmd.arg("repo")
-        .arg("view")
-        .arg("--json")
-        .arg(fields)
-        .current_dir(workspace_root);
-    apply_owner_gh_config(&mut cmd, workspace_root);
-    let run = cmd.output();
-    match tokio::time::timeout(MERGE_CHECK_TIMEOUT, run).await {
-        Ok(Ok(output)) => Some(output),
-        Ok(Err(err)) => {
-            log_gh_failure_once("repo view", workspace_root, &format!("could not run gh: {err}"));
-            None
-        }
-        Err(_) => {
-            log_gh_failure_once(
-                "repo view",
-                workspace_root,
-                &format!("timed out after {}s", MERGE_CHECK_TIMEOUT.as_secs()),
-            );
-            None
-        }
-    }
+    let args = ["repo", "view", "--json", fields];
+    run_sink_gh(
+        "repo view",
+        "safehouse.repo_view",
+        gh_bin,
+        &args,
+        workspace_root,
+        MERGE_CHECK_TIMEOUT,
+    )
+    .await
 }
 
 /// [`fetch_repo_identity`] with a process-lifetime cache keyed by workspace
@@ -2417,42 +2412,32 @@ fn reconcile_max_age() -> chrono::Duration {
 /// degrades that row (or the whole call) to being silently skipped; a
 /// best-effort reconciliation pass must never panic or block the sink.
 async fn fetch_recent_merged_prs(workspace_root: &Path) -> Vec<ReconciledMergedPr> {
+    if forge_gate::suppressed("pr list (reconcile)", workspace_root) {
+        return Vec::new();
+    }
     let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
-    let mut cmd = tokio::process::Command::new(&gh_bin);
-    cmd.arg("pr")
-        .arg("list")
-        .arg("--state")
-        .arg("merged")
-        .arg("--json")
-        .arg(RECONCILE_PR_FIELDS)
-        .arg("--limit")
-        .arg(RECONCILE_PR_LIMIT.to_string())
-        .current_dir(workspace_root);
-    apply_owner_gh_config(&mut cmd, workspace_root);
-    let run = cmd.output();
-    let output = match tokio::time::timeout(MERGE_CHECK_TIMEOUT, run).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(err)) => {
-            log_gh_failure_once(
-                "pr list (reconcile)",
-                workspace_root,
-                &format!("could not run gh: {err}"),
-            );
-            return Vec::new();
-        }
-        Err(_) => {
-            log_gh_failure_once(
-                "pr list (reconcile)",
-                workspace_root,
-                &format!("timed out after {}s", MERGE_CHECK_TIMEOUT.as_secs()),
-            );
-            return Vec::new();
-        }
+    let limit = RECONCILE_PR_LIMIT.to_string();
+    let args = [
+        "pr",
+        "list",
+        "--state",
+        "merged",
+        "--json",
+        RECONCILE_PR_FIELDS,
+        "--limit",
+        &limit,
+    ];
+    let call = "pr list (reconcile)";
+    let op = "safehouse.recent_merged";
+    let Some(output) =
+        run_sink_gh(call, op, &gh_bin, &args, workspace_root, MERGE_CHECK_TIMEOUT).await
+    else {
+        return Vec::new();
     };
     if !output.status.success() {
         // The #6596 symptom for the reconciliation pass — a whole workspace's
         // merges silently absent from the feed, with nothing in the log.
-        log_gh_failure_once("pr list (reconcile)", workspace_root, &stderr_head(&output.stderr));
+        forge_gate::failed("pr list (reconcile)", workspace_root, &gh_bin, &output.stderr);
         return Vec::new();
     }
     log_gh_recovery_once("pr list (reconcile)", workspace_root);
@@ -3028,35 +3013,17 @@ pub fn spawn_sink(
 /// the event describes (the sink is a pure bus subscriber with no back-channel
 /// to dispatch).
 async fn fetch_issue_title(workspace_root: &Path, issue: u32) -> Option<String> {
+    if forge_gate::suppressed("issue view", workspace_root) {
+        return None;
+    }
     let gh_bin = env_nonempty(GH_BIN_ENV).unwrap_or_else(|| "gh".to_owned());
-    let mut cmd = tokio::process::Command::new(&gh_bin);
-    cmd.arg("issue")
-        .arg("view")
-        .arg(issue.to_string())
-        .arg("--json")
-        .arg("title")
-        .arg("--jq")
-        .arg(".title")
-        .current_dir(workspace_root);
-    apply_owner_gh_config(&mut cmd, workspace_root);
-    let run = cmd.output();
-    let output = match tokio::time::timeout(TITLE_FETCH_TIMEOUT, run).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(err)) => {
-            log_gh_failure_once("issue view", workspace_root, &format!("could not run gh: {err}"));
-            return None;
-        }
-        Err(_) => {
-            log_gh_failure_once(
-                "issue view",
-                workspace_root,
-                &format!("timed out after {}s", TITLE_FETCH_TIMEOUT.as_secs()),
-            );
-            return None;
-        }
-    };
+    let n = issue.to_string();
+    let args = ["issue", "view", &n, "--json", "title", "--jq", ".title"];
+    let op = "safehouse.issue_title";
+    let output =
+        run_sink_gh("issue view", op, &gh_bin, &args, workspace_root, TITLE_FETCH_TIMEOUT).await?;
     if !output.status.success() {
-        log_gh_failure_once("issue view", workspace_root, &stderr_head(&output.stderr));
+        forge_gate::failed("issue view", workspace_root, &gh_bin, &output.stderr);
         return None;
     }
     log_gh_recovery_once("issue view", workspace_root);
@@ -3279,8 +3246,11 @@ async fn run_sink(
                 // to trigger the path above. One workspace per tick (see
                 // `reconcile_cursor`'s doc comment).
                 let targets = reconciliation_targets(&known_workspaces);
+                // #8997: while the rate-limit breaker cools, skip the tick
+                // without advancing the cursor or spending a seed-only slot.
                 if let Some(workspace_root) = (!targets.is_empty())
                     .then(|| targets[reconcile_cursor % targets.len()].clone())
+                    .filter(|root| !forge_gate::suppressed("pr list (reconcile)", Path::new(root)))
                 {
                     reconcile_cursor = reconcile_cursor.wrapping_add(1);
                     // Seed-only first pass (#4649): this workspace's very
@@ -3922,3 +3892,7 @@ mod tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod heartbeat_tests;
+
+// Issue #8997: rate-limit breaker gating of the sink's forge lookups.
+#[cfg(test)]
+mod rate_limit_tests;

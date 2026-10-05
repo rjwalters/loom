@@ -111,13 +111,22 @@ impl GhProbe {
         Self { gh, config_dir }
     }
 
+    /// Counted through the `gh` facade as `write_scope.probe` (#10089). The
+    /// explicit `config_dir` is the credential under test, so it overrides
+    /// the facade's working-directory lookup; `None` inherits the process's.
     fn api(&self, args: &[&str]) -> Result<String, String> {
-        let mut cmd = Command::new(&self.gh);
-        cmd.arg("api").args(args).stdin(Stdio::null());
-        if let Some(dir) = &self.config_dir {
-            cmd.env("GH_CONFIG_DIR", dir);
-        }
-        match crate::cmd_out::run_command(cmd, PROBE_TIMEOUT) {
+        use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+        let inv = GhInvocation::new(
+            Operation::new("write_scope.probe"),
+            AccessIntent::Read,
+            GhTarget::None,
+            PROBE_TIMEOUT,
+        )
+        .program(&self.gh)
+        .gh_config_dir(self.config_dir.as_deref())
+        .arg("api")
+        .args(args);
+        match inv.run() {
             crate::cmd_out::CmdOutcome::Ran(o) if o.status.success() => {
                 Ok(String::from_utf8_lossy(&o.stdout).into_owned())
             }

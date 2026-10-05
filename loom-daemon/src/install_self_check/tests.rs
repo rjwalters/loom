@@ -572,7 +572,7 @@ fn test_run_pass_report_only_does_not_repair_or_file() {
     let report = run_pass(
         tmp.path(),
         false, // report-only
-        CheckOptions::default(),
+        CheckOptions::hermetic(),
         &RepairContext::default(),
         &reporter,
     );
@@ -600,7 +600,7 @@ fn test_run_pass_repair_mode_converges_runtimes() {
         file_calls: Arc::new(AtomicUsize::new(0)),
         next_issue: 1,
     };
-    run_pass(tmp.path(), true, CheckOptions::default(), &RepairContext::default(), &reporter);
+    run_pass(tmp.path(), true, CheckOptions::hermetic(), &RepairContext::default(), &reporter);
     std::env::remove_var("LOOM_SHARED_TOKENS_DIR");
     // repair mode converged the runtimes file.
     assert!(tmp

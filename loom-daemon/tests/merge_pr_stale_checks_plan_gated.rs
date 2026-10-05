@@ -112,6 +112,7 @@ fn run(env: &[(&str, &str)]) -> Output {
     ])
     .current_dir(dir.path())
     .env("LOOM_GH_BIN", &gh)
+    .env("LOOM_GH_NO_POLICY_LAUNCHER", "1")
     .env("MOCK_RUNS_OUT", STALE_GREEN_RUNS);
     for (k, v) in env {
         cmd.env(k, v);

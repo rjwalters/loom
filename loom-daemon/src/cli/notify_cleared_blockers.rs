@@ -226,7 +226,12 @@ fn evaluate(
 }
 
 /// The issues a merged PR closed, per the forge's own `closingIssuesReferences`.
-fn pr_close_targets(pr: i64, repo: Option<&str>, root: &Path) -> Result<Vec<i64>, String> {
+/// Also how a Judge's checkout finds its issue (`attend_hook`, #10120).
+pub(super) fn pr_close_targets(
+    pr: i64,
+    repo: Option<&str>,
+    root: &Path,
+) -> Result<Vec<i64>, String> {
     let n = pr.to_string();
     let mut args = vec![
         "pr",

@@ -16,6 +16,8 @@
 //!   observed at most one pass late.
 //! - An item first seen mid-stage (a daemon restart) has only a lower bound
 //!   on its entry (`updated_at`); the stage it leaves then has no duration.
+//! - An approved PR held for a human (`merge_hold`, #10218) is an overlay on
+//!   its pooled `merge_wait`, never a transition of it (`tracker_hold.rs`).
 //!
 //! # Outcomes
 //!
@@ -30,7 +32,8 @@
 //!   through a replacement PR or a later sweep, so those estimates stay
 //!   pending (`resolve` joins on repo, issue and kind, so the eventual
 //!   landing scores them) until they expire after
-//!   [`PENDING_MAX_AGE_DAYS`].
+//!   [`PENDING_MAX_AGE_DAYS`] — scored first as `censored` when their p90 is
+//!   already behind them (#10233, `tracker_censor.rs`).
 //!
 //! A reopen starts a new series: on resolution every estimate of the series
 //! emitted *after* the outcome instant is dropped unscored, so a second
@@ -69,15 +72,16 @@
 //!   restart) is counted as having taken one.
 
 use super::emit::{EmitState, Signature, Trigger};
-use super::explanation::{Explanation, FeatureOmitted, Features};
+use super::explanation::Explanation;
 use super::journal::JournalEntry;
-use super::labels::stage_from_pr_labels;
+use super::labels::{held_only_by_operator, stage_from_pr_labels, stage_ignoring_holds};
 use super::score::{score, EstimateSummary, OutcomeKind, Score, StageObservation};
+use super::stall::StallSnapshot;
 use super::{
     AgeSource, CurrentStage, CurrentState, DispatchInput, EstimateInput, Heuristic, Kind,
     NoEstimateReason, Provenance, Registry, Stage, StageSamples, Subject,
 };
-use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
+use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 
 /// Pending estimates older than this are dropped unresolved.
@@ -146,14 +150,17 @@ struct Item {
     /// The last completed phase and when, to drop duplicate publications.
     last_phase: Option<(String, DateTime<Utc>)>,
     emit: BTreeMap<(Kind, String), EmitState>,
+    /// Whether each series' last emission answered (#10233, `tracker_answers.rs`).
+    answered: BTreeMap<(Kind, String), bool>,
     /// On the last dispatch plan as a ready row, not yet dispatched (#9326).
     in_ready_queue: bool,
     /// Its plan position, when the plan gives it one.
     ready: Option<DispatchInput>,
-    /// Ready rows on that plan, for the `queue_ready` feature.
-    queue_ready: Option<u32>,
-    /// The plan's concurrency cap, for the `max_concurrent` feature.
-    max_concurrent: Option<u32>,
+    /// Issue, sweep and verdict observations, each with its `known_at`
+    /// (#10231).
+    facts: item_facts::ItemFacts,
+    /// The operator-hold overlay on a pooled `merge_wait` (#10218).
+    hold: hold::Hold,
 }
 
 /// A PR row from a review-label listing.
@@ -273,6 +280,9 @@ pub struct EstimateContext<'a> {
     pub host_id: Option<&'a str>,
     /// Resolved repo ids by lowercased slug.
     pub repo_ids: &'a BTreeMap<String, u64>,
+    /// Every stall the daemon observed (#10210), narrowed per item into
+    /// [`EstimateInput::stalls`]. Read-only data assembled by the caller.
+    pub stalls: &'a StallSnapshot,
 }
 
 /// The tracker.
@@ -286,6 +296,15 @@ pub struct Tracker {
     orphaned: usize,
     /// Pending estimates dropped by the [`MAX_PENDING`] cap.
     cap_dropped: usize,
+    /// The last pass's fleet view and dispatch plan, for `features` (#10201).
+    context: features::PassContext,
+    /// Latest queue-friction readings (#10193), copied onto every estimate's
+    /// features. Filled by the caller's forge reads, never by the tracker.
+    pub friction: super::friction::FrictionBook,
+    /// Per-pass answer states, drained by the caller (#10233).
+    answers: Vec<answers::PassAnswers>,
+    /// What passes observed of PR-to-issue links and issue stars (#10372).
+    star: star_book::StarBook,
 }
 
 /// What [`Tracker::drain_dropped`] reports.
@@ -317,6 +336,10 @@ impl Tracker {
             loom,
             orphaned: 0,
             cap_dropped: 0,
+            context: features::PassContext::default(),
+            friction: super::friction::FrictionBook::default(),
+            answers: Vec::new(),
+            star: star_book::StarBook::default(),
         }
     }
 
@@ -548,7 +571,7 @@ impl Tracker {
                 _ => None,
             };
             if let Some((stage, verdict)) = settled {
-                let row = self.settle_verdict(&key, stage, verdict, since, true);
+                let row = self.settle_verdict(&key, stage, verdict, since, true, at);
                 effects.journal.push(row);
             }
         }
@@ -617,6 +640,7 @@ impl Tracker {
         verdict: &str,
         since: DateTime<Utc>,
         in_sweep: bool,
+        known_at: DateTime<Utc>,
     ) -> JournalEntry {
         let item = self
             .items
@@ -624,6 +648,8 @@ impl Tracker {
             .unwrap_or_else(|| unreachable!("caller created it"));
         item.verdict_pending_since = None;
         let attempt = item.rework_rounds + 1;
+        item.facts
+            .note_verdict(attempt, verdict == "pass", known_at);
         if stage == Stage::Doctor {
             item.rework_rounds += 1;
         }
@@ -725,6 +751,11 @@ impl Tracker {
             // leaving the listing later re-queues the read.
             item.needs_pr_read = false;
             item.needs_issue_read = false;
+            // #10218: `merge_hold` is an overlay; see `tracker_hold.rs`.
+            if self.hold_listing(&key, pr, is_new, now, resolution_sec, &mut effects) {
+                continue;
+            }
+            let item = self.item(repo, pr.issue);
             let resolved = stage_from_pr_labels(&pr.labels);
             let before = (item.refused, item.stage.as_ref().map(|s| s.stage), item.rework_rounds);
             item.refused = resolved.err();
@@ -763,7 +794,7 @@ impl Tracker {
                     _ => None,
                 };
                 if let Some((stage, verdict)) = settled {
-                    let mut row = self.settle_verdict(&key, stage, verdict, since, true);
+                    let mut row = self.settle_verdict(&key, stage, verdict, since, true, now);
                     row.raw = serde_json::json!({"labels": pr.labels});
                     effects.journal.push(row);
                     effects.dirty.push(key);
@@ -787,6 +818,9 @@ impl Tracker {
                 _ => None,
             };
             let attempt = item.rework_rounds + 1;
+            if let Some(verdict) = verdict {
+                item.facts.note_verdict(attempt, verdict == "pass", now);
+            }
             if stage == Stage::Doctor {
                 item.rework_rounds += 1;
             }
@@ -854,6 +888,7 @@ impl Tracker {
             return effects;
         }
         let pr = item.pr_number;
+        effects.journal.extend(self.hold_resolved(key, state, now));
         match state {
             PrState::Merged(at) => {
                 let mut row =
@@ -1059,22 +1094,6 @@ impl Tracker {
             .collect()
     }
 
-    /// Drop pending estimates older than [`PENDING_MAX_AGE_DAYS`], and the
-    /// oldest past [`MAX_PENDING`]. Returns how many were dropped.
-    pub fn expire(&mut self, now: DateTime<Utc>) -> usize {
-        let before = self.pending.len();
-        let cutoff = now - Duration::days(PENDING_MAX_AGE_DAYS);
-        self.pending.retain(|p| p.as_of >= cutoff);
-        if self.pending.len() > MAX_PENDING {
-            let excess = self.pending.len() - MAX_PENDING;
-            self.pending.drain(..excess);
-            // The oldest are the long-horizon estimates scoring needs most;
-            // the caller warns when this is non-zero.
-            self.cap_dropped += excess;
-        }
-        before - self.pending.len()
-    }
-
     fn input_for(
         &self,
         key: &ItemKey,
@@ -1086,7 +1105,7 @@ impl Tracker {
         if kind == Kind::Finish && !item.sweep_running {
             return None;
         }
-        let ready_only = item.in_ready_queue && !item.sweep_running && item.pr_number.is_none();
+        let ready_only = features::ready_only(item);
         if kind == Kind::Start && !ready_only {
             return None;
         }
@@ -1099,7 +1118,34 @@ impl Tracker {
             // for the answer instead (it is retried every pass).
             return None;
         }
-        let current = if let Some(reason) = item.refused {
+        // #10210: under an operator hold (and only one), the stage the PR's
+        // review labels still name — the track's own entry when the hold
+        // landed on a stage the tracker already knew, else entered now.
+        let held = (item.refused == Some(NoEstimateReason::Blocked)
+            && held_only_by_operator(&item.labels))
+        .then(|| stage_ignoring_holds(&item.labels).ok())
+        .flatten()
+        .map(|stage| match item.stage.as_ref().filter(|s| s.stage == stage) {
+            Some(track) => CurrentStage {
+                stage,
+                entered_at: Some(track.entered_at),
+                age_sec: (now - track.entered_at).num_seconds().max(0),
+                age_source: track.source,
+                rework_rounds: item.rework_rounds,
+                episode_entered_at: None,
+            },
+            None => CurrentStage {
+                stage,
+                entered_at: Some(now),
+                age_sec: 0,
+                age_source: AgeSource::TrackerObserved,
+                rework_rounds: item.rework_rounds,
+                episode_entered_at: None,
+            },
+        });
+        let current = if let Some(held) = hold::held_stage(item, now) {
+            CurrentState::At(held)
+        } else if let Some(reason) = item.refused {
             CurrentState::Refused(reason)
         } else if item.verdict_pending_since.is_some() {
             // Between a verdict and the event that says which way it went:
@@ -1116,36 +1162,20 @@ impl Tracker {
                 age_sec: (now - stage.entered_at).num_seconds().max(0),
                 age_source: stage.source,
                 rework_rounds: item.rework_rounds,
+                episode_entered_at: hold::episode_entered_at(item),
             })
         };
+        let stage_now = match &current {
+            CurrentState::At(c) => Some(c.stage),
+            CurrentState::Refused(_) => held.as_ref().map(|h| h.stage),
+        };
+        let stalls = ctx.stalls.for_item(&item.repo, stage_now, &item.labels);
         let mut subject =
             Subject::new(&item.repo, ctx.repo_ids.get(&key.repo).copied(), item.issue);
         subject.pr_number = item.pr_number;
         subject.sweep_id = item.sweep_id.clone().filter(|_| item.sweep_running);
-        let features = Features {
-            labels: (!item.labels.is_empty()).then(|| item.labels.clone()),
-            doctor_cycles_so_far: Some(item.rework_rounds),
-            sweep_internal: Some(item.sweep_running),
-            pr_created_at: item.pr_created_at,
-            hour_utc: Some(now.hour()),
-            weekday_utc: Some(now.weekday().num_days_from_monday()),
-            host_id: ctx.host_id.map(str::to_string),
-            queue_rank: item
-                .ready
-                .as_ref()
-                .map(|r| r.position)
-                .filter(|_| ready_only),
-            queue_ready: item.queue_ready.filter(|_| ready_only),
-            max_concurrent: item.max_concurrent.filter(|_| ready_only),
-            ..Features::default()
-        };
-        let mut omitted = Vec::new();
-        if item.labels.is_empty() {
-            omitted.push(FeatureOmitted {
-                name: "labels".to_string(),
-                reason: "not_listed_yet".to_string(),
-            });
-        }
+        let (features, omitted) =
+            self.recorded_features(key, item, &hold::described(&current), ctx, now, false);
         Some(EstimateInput {
             subject,
             as_of: now,
@@ -1154,6 +1184,8 @@ impl Tracker {
             features_omitted: omitted,
             provenance: self.loom.clone(),
             dispatch: item.ready.clone().filter(|_| ready_only),
+            stalls,
+            held,
         })
     }
 
@@ -1174,6 +1206,11 @@ impl Tracker {
     /// estimate's refresh cadence never gates `current`'s, and vice versa; and
     /// each becomes pending, so one outcome scores both sides at the same
     /// `as_of` — the pairing [`super::shadow::ShadowLedger`] reads.
+    ///
+    /// A held item's candidates that [`Heuristic::models_hold`] read its
+    /// modeled view and their own series signature (#10284,
+    /// `tracker_hold.rs`); every other heuristic, `current` included, reads
+    /// the described input under the item's signature, as before.
     pub fn estimate(
         &mut self,
         keys: Option<&[ItemKey]>,
@@ -1204,6 +1241,9 @@ impl Tracker {
                     rework_rounds: item.rework_rounds,
                     reason: item.refused,
                 };
+                // A held item's view for a heuristic that models the hold,
+                // with its own series signature (#10284, `tracker_hold.rs`).
+                let modeled = self.modeled_input(&key, &item, kind, &input, ctx);
                 // `current` first, then every shadow candidate: the primary
                 // estimate is emitted before any candidate can be mistaken for
                 // it, and its ordering in the output is what it always was.
@@ -1214,13 +1254,21 @@ impl Tracker {
                     .chain(ctx.registry.for_kind(kind).filter(|h| h.id() != current_id))
                     .collect();
                 for heuristic in ordered {
+                    let (input, signature) = match &modeled {
+                        Some((view, held)) if heuristic.models_hold() => {
+                            (view, held.unwrap_or(signature))
+                        }
+                        _ => (&input, signature),
+                    };
                     let series = (kind, heuristic.id().to_string());
                     let state = item.emit.get(&series).cloned().unwrap_or_default();
                     let Some(trigger) = state.decide(signature, now, ctx.refresh_secs) else {
                         continue;
                     };
-                    let explanation = heuristic.estimate(&input, ctx.history);
+                    let explanation = heuristic.estimate(input, ctx.history);
                     if let Some(item) = self.items.get_mut(&key) {
+                        item.answered
+                            .insert(series.clone(), explanation.result.is_some());
                         item.emit.entry(series).or_default().record(signature, now);
                     }
                     self.pending.push(EstimateSummary::of(&explanation));
@@ -1230,14 +1278,39 @@ impl Tracker {
                         primary: heuristic.id() == current_id,
                     });
                 }
+                if keys.is_none() {
+                    self.tally_pass(&key, kind);
+                }
             }
         }
         out
     }
 }
 
+#[path = "tracker_censor.rs"]
+mod censor;
+
+#[path = "tracker_answers.rs"]
+mod answers;
+
+pub use answers::PassAnswers;
+pub use censor::{censor, Expired, CENSOR_SOURCE};
+
 #[path = "tracker_ready.rs"]
 mod ready;
+
+#[path = "tracker_features.rs"]
+mod features;
+
+#[path = "tracker_item.rs"]
+mod item_facts;
+
+pub use item_facts::{DispatchMeta, IssueRow, RegistryMeta};
+
+pub use features::{events_from_journal, ListedPr, NOT_LISTED_YET};
+
+#[path = "tracker_hold.rs"]
+mod hold;
 
 pub use ready::{
     ReadyPlan, ReadyRow, READY_FIRST_SEEN, READY_PLAN_MAX_AGE_SECS, SLOT_TURNOVER_REPO,
@@ -1252,3 +1325,6 @@ pub fn merged(all: Vec<Effects>) -> Effects {
     }
     out
 }
+
+#[path = "tracker_star.rs"]
+mod star_book;

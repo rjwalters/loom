@@ -13,8 +13,11 @@
 //!   listing, where an unchanged listing is a free `304`), at most
 //!   [`FORGE_READ_BUDGET`] `pulls/{n}` + `issues/{n}` reads for items whose
 //!   outcome is still unknown, the last work-finder tick's dispatch plan
-//!   ingested as ready items (#9326), history reloaded, and every live item
-//!   re-estimated. An unchanged estimate is refreshed every `refreshSecs`.
+//!   ingested as ready items (#9326), history reloaded, the registry rebuilt
+//!   when a newer coefficient file appeared (#10243), the fleet view (every
+//!   listed PR plus the journal's stage events) handed over for the queue
+//!   features (#10201), and every live item re-estimated. An unchanged
+//!   estimate is refreshed every `refreshSecs`.
 //!
 //! **Reads over the budget, and reads that fail, are not lost.** The tracker
 //! keeps every unanswered check queued and re-offers it on the next pass
@@ -36,21 +39,27 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::cmd_out::CmdOutcome;
 use crate::event_bus::RecvError;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use chrono::{DateTime, Utc};
 
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
+use crate::eta::calibration_log;
 use crate::eta::config::EtaConfig;
+use crate::eta::fit::{self, CoefficientFile};
 use crate::eta::journal::{self, JournalEntry};
+use crate::eta::queue_features::EventLog;
+use crate::eta::recalibrate::CalibrationObservation;
 use crate::eta::score::EstimateSummary;
 use crate::eta::shadow::{self, ShadowLedger};
+use crate::eta::stall::{self, StallSnapshot};
 use crate::eta::tracker::{
-    Effects, Emission, EstimateContext, IssueState, ItemKey, PrState, PrView, ReadyPlan, ReadyRow,
-    Resolved, Tracker,
+    events_from_journal, DispatchMeta, Effects, Emission, EstimateContext, IssueRow, IssueState,
+    ItemKey, ListedPr, PrState, PrView, ReadyPlan, ReadyRow, RegistryMeta, Resolved, Tracker,
 };
 use crate::eta::{Kind, Provenance, Registry, StageSamples};
 use crate::event_bus::EventBus;
@@ -110,6 +119,11 @@ struct State {
     repo_ids: BTreeMap<String, u64>,
     workspace_root: PathBuf,
     host_id: String,
+    /// The token-pool brake and lockout halves of the stall snapshot
+    /// (#10210), refreshed every pass; the forge-quota half is re-read at
+    /// every estimate ([`stalls_now`]).
+    pool_exhausted: bool,
+    locked_repos: BTreeSet<String>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -281,6 +295,7 @@ fn estimate_locked(
     keys: Option<&[ItemKey]>,
     now: DateTime<Utc>,
 ) -> Vec<Emission> {
+    let stalls = stalls_now(state, now);
     let ctx = EstimateContext {
         registry: &state.registry,
         current_start: state.config.current_start.as_deref(),
@@ -290,8 +305,59 @@ fn estimate_locked(
         refresh_secs: state.config.refresh_secs,
         host_id: Some(state.host_id.as_str()),
         repo_ids: &state.repo_ids,
+        stalls: &stalls,
     };
-    state.tracker.estimate(keys, &ctx, now)
+    let emissions = state.tracker.estimate(keys, &ctx, now);
+    // A full pass also tallied every live series' answer state (#10233):
+    // fold it into the ledger as paired answer-rate evidence.
+    let answers = state.tracker.drain_answers();
+    if !answers.is_empty() {
+        let ids = current_ids(state);
+        state
+            .shadow
+            .record_answers(&|kind| ids.get(&kind).cloned().unwrap_or_default(), &answers);
+        let path = shadow::ledger_path(&state.workspace_root);
+        if let Err(error) = shadow::write_ledger(&path, &state.shadow) {
+            log::warn!("eta: persisting the shadow ledger failed: {error}");
+        }
+    }
+    emissions
+}
+
+/// The stall snapshot an estimate at `now` reads (#10210): the rate-limit
+/// breaker and the forge-call ledger's last zero readings (in-process, read
+/// fresh), plus the pass's token-pool brake and lockout readings. Read-only:
+/// no stall costs a forge call.
+fn stalls_now(state: &State, now: DateTime<Utc>) -> StallSnapshot {
+    let breaker = crate::rate_limit_breaker::global_snapshot();
+    let pools = crate::forge_call_stats::exhausted_pools(now);
+    let pools: Vec<(&str, Option<DateTime<Utc>>)> = pools
+        .iter()
+        .map(|(pool, reset)| (pool.as_str(), *reset))
+        .collect();
+    StallSnapshot {
+        host: stall::host_signals(breaker.as_ref(), &pools, state.pool_exhausted, now),
+        locked_repos: state.locked_repos.clone(),
+    }
+}
+
+/// Whether any provisioned workspace's empty-pool brake is tripped — the
+/// sweep registry's own reading, never a token probe.
+fn pool_brake_tripped(
+    workspace_pool: &WorkspacePool,
+    roots: &[PathBuf],
+    now: DateTime<Utc>,
+) -> bool {
+    roots.iter().any(|root| {
+        workspace_pool
+            .provisioned_registry_for(root)
+            .is_some_and(|registry| {
+                registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .empty_pool_breaker_tripped(now)
+            })
+    })
 }
 
 fn sink() -> Option<&'static dyn QueueSink> {
@@ -339,9 +405,31 @@ pub(super) fn snapshot_input() -> Option<(Vec<EstimateSummary>, BTreeMap<Kind, S
 /// are already formed — this only sorts them into `(current, candidate)` runs
 /// and adds them up. Best-effort: a failed persist costs a longer wait for the
 /// 50-pair gate, never a wrong answer.
-fn note_outcomes(state: &mut State, outcomes: &[Resolved]) {
+///
+/// Also the calibration outcome log (#10207): every landed
+/// [`crate::eta::heuristics::CALIBRATION_BASE`] outcome is appended to it and
+/// to the in-memory history, so the recalibrating heuristic's next refit sees
+/// the landing (its point-in-time fit admits it only from `now` on).
+fn note_outcomes(state: &mut State, outcomes: &[Resolved], now: DateTime<Utc>) {
     if outcomes.is_empty() {
         return;
+    }
+    let landed: Vec<CalibrationObservation> = outcomes
+        .iter()
+        .filter(|r| r.estimate.heuristic == crate::eta::heuristics::CALIBRATION_BASE)
+        .filter_map(|r| CalibrationObservation::from_scored(&r.estimate, &r.score, now))
+        .collect();
+    if !landed.is_empty() {
+        let path = calibration_log::path(&state.workspace_root);
+        if let Err(error) = calibration_log::append(&path, &landed) {
+            log::warn!("eta: appending the calibration log failed: {error}");
+        }
+        let resolved: BTreeSet<&str> = landed.iter().map(|r| r.estimate_id.as_str()).collect();
+        state
+            .history
+            .calibration
+            .retain(|r| !resolved.contains(r.estimate_id.as_str()));
+        state.history.calibration.extend(landed);
     }
     let ids = current_ids(state);
     state
@@ -368,7 +456,7 @@ async fn apply_event(effects: Effects, now: DateTime<Utc>) {
     let emissions = estimate_isolated(Some(dirty), now).await;
     append_journal(&root, &effects.journal);
     if let Some(state) = lock().as_mut() {
-        note_outcomes(state, &effects.outcomes);
+        note_outcomes(state, &effects.outcomes, now);
     }
     let loom = Provenance::current();
     deliver(emissions, effects.outcomes, &loom, &host_id, dry_run, sink());
@@ -384,6 +472,7 @@ pub fn spawn_task(
     bus: &EventBus,
     workspace_root: PathBuf,
     host_id: String,
+    workspace_pool: Arc<WorkspacePool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let config = crate::eta::config::read(&workspace_root);
     if !config.enabled {
@@ -409,19 +498,30 @@ pub fn spawn_task(
         config.refresh_secs,
         tracker.pending().len()
     );
-    let shadow = shadow::read_ledger(&shadow::ledger_path(&workspace_root));
+    let (shadow, unreadable) =
+        shadow::load_ledger(&shadow::ledger_path(&workspace_root), Utc::now());
+    if let Some(note) = unreadable {
+        log::error!("eta: {note}");
+    }
+    // #10243: the fitted heuristics' coefficient file, loaded once here and
+    // re-checked on every pass (`record`), never inside an estimate.
+    let registry = Registry::load(&workspace_root, Utc::now());
+    log_fit(None, registry.fit(), &workspace_root);
     *lock() = Some(State {
         tracker,
         turnover: super::ops::turnaround::TurnoverLedger::default(),
         shadow,
         config,
-        registry: Registry::builtin(),
+        registry,
         history: StageSamples::default(),
         repo_ids: BTreeMap::new(),
         workspace_root: workspace_root.clone(),
         host_id,
+        pool_exhausted: false,
+        locked_repos: BTreeSet::new(),
     });
     let default_root = workspace_root.to_string_lossy().to_string();
+    let pool = workspace_pool;
     let mut subscription = bus.subscribe([
         "sweep.global.dispatch",
         "sweep.global.completed",
@@ -464,6 +564,17 @@ pub fn spawn_task(
             let Some(slug) = slug_for(&mut slugs, &root).await else {
                 continue;
             };
+            // What the registry holds for a new sweep (#10231), read before the
+            // tracker lock: its own mutex is never held across ours.
+            let dispatch_meta = match &event {
+                Event::SweepGlobalDispatch {
+                    sweep_id,
+                    kind: SweepKind::Issue(_),
+                    runtime,
+                    ..
+                } => Some(dispatch_meta(&pool, &root, sweep_id, runtime.clone())),
+                _ => None,
+            };
             let effects = {
                 let mut guard = lock();
                 let Some(state) = guard.as_mut() else {
@@ -474,7 +585,15 @@ pub fn spawn_task(
                         sweep_id,
                         kind: SweepKind::Issue(issue),
                         ..
-                    } => state.tracker.on_dispatch(&slug, *issue, sweep_id, now),
+                    } => {
+                        let effects = state.tracker.on_dispatch(&slug, *issue, sweep_id, now);
+                        if let Some(meta) = dispatch_meta {
+                            state
+                                .tracker
+                                .on_sweep_dispatch(&slug, *issue, sweep_id, meta, now);
+                        }
+                        effects
+                    }
                     Event::SweepPhase {
                         issue,
                         phase,
@@ -501,6 +620,31 @@ pub fn spawn_task(
             apply_event(effects, now).await;
         }
     }))
+}
+
+/// The dispatch parameters of `sweep_id` from the registry that owns workspace
+/// `root`: model, effort and spawn time. No forge read. `registry` is `None`
+/// when the workspace has no provisioned registry or no entry for the sweep.
+fn dispatch_meta(
+    pool: &WorkspacePool,
+    root: &str,
+    sweep_id: &str,
+    runtime: Option<String>,
+) -> DispatchMeta {
+    let registry = pool
+        .provisioned_registry_for(std::path::Path::new(root))
+        .and_then(|registry| {
+            registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(sweep_id)
+                .map(|info| RegistryMeta {
+                    model: info.model.clone(),
+                    effort: info.effort.clone(),
+                    started_at: info.started_at,
+                })
+        });
+    DispatchMeta { runtime, registry }
 }
 
 fn parse_time(raw: Option<&str>) -> Option<DateTime<Utc>> {
@@ -537,15 +681,75 @@ pub fn pr_views(listings: &[Vec<RestIssue>]) -> Vec<PrView> {
     views
 }
 
+/// Every listed PR with the issues its body links, by the work finder's rule
+/// (`linkage_refs`: closing keywords and `Part of`), for the star state
+/// (#10372).
+#[must_use]
+pub fn pr_links(listings: &[Vec<RestIssue>]) -> Vec<(u32, Vec<u32>)> {
+    let mut seen = BTreeSet::new();
+    listings
+        .iter()
+        .flatten()
+        .filter(|item| item.is_pull_request && seen.insert(item.number))
+        .map(|item| {
+            (
+                item.number,
+                crate::eta::star::body_links(item.body.as_deref().unwrap_or_default()),
+            )
+        })
+        .collect()
+}
+
+/// The open issues carrying a star label at any level: one ETag-conditional
+/// listing per label, the work finder's own (a `304` costs no rate limit).
+/// `None` if any listing failed.
+async fn starred_issues(root: &Path) -> Option<Vec<u32>> {
+    let mut issues = BTreeSet::new();
+    for label in crate::operator_levels::starred_labels(crate::operator_levels::table()) {
+        let listing = super::queue_blocked::list_open(root.to_path_buf(), label, "eta").await?;
+        issues.extend(
+            listing
+                .iter()
+                .filter(|i| !i.is_pull_request)
+                .map(|i| i.number),
+        );
+    }
+    Some(issues.into_iter().collect())
+}
+
 fn gh_json(root: &Path, path: &str) -> Option<serde_json::Value> {
-    let mut cmd = Command::new("gh");
-    cmd.arg("api").arg(path).current_dir(root);
-    crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, Some(root));
-    let output = crate::sweep_registry::output_with_timeout(cmd, GH_TIMEOUT).ok()??;
+    let CmdOutcome::Ran(output) = GhInvocation::new(
+        Operation::new("api.rest"),
+        AccessIntent::Read,
+        GhTarget::None,
+        GH_TIMEOUT,
+    )
+    .args(["api", path])
+    .current_dir(root)
+    .run() else {
+        return None;
+    };
     if !output.status.success() {
         return None;
     }
     serde_json::from_slice(&output.stdout).ok()
+}
+
+/// Every PR row of a repo's review listings, whatever it closes: the fleet
+/// view's roster (#10201).
+#[must_use]
+pub fn listed_prs(listings: &[Vec<RestIssue>]) -> Vec<ListedPr> {
+    let mut seen = BTreeSet::new();
+    listings
+        .iter()
+        .flatten()
+        .filter(|item| item.is_pull_request && seen.insert(item.number))
+        .map(|item| ListedPr {
+            number: item.number,
+            labels: item.labels.clone(),
+            updated_at: parse_time(item.updated_at.as_deref()),
+        })
+        .collect()
 }
 
 /// How PR `number` ended, from one `pulls/{n}` read. `None` when the read
@@ -626,6 +830,37 @@ async fn estimate_isolated(keys: Option<Vec<ItemKey>>, now: DateTime<Utc>) -> Ve
     .unwrap_or_default()
 }
 
+/// The registry to swap in after a pass loaded `loaded` while the live
+/// registry was built with `registered` (#10243), or `None` to keep it.
+/// Pure, and keyed on the id alone: the same file again swaps nothing; a new
+/// id (the daily refit), or a file appearing or disappearing, rebuilds the
+/// whole registry, which is the same as rebuilding the one fitted heuristic.
+fn swap_fit(registered: Option<&str>, loaded: Option<CoefficientFile>) -> Option<Registry> {
+    if registered == loaded.as_ref().map(|f| f.id.as_str()) {
+        return None;
+    }
+    Some(Registry::with_fit(loaded.map(Arc::new)))
+}
+
+/// Log a change of coefficient file: the new id and cutoff, or one warning
+/// naming the directory when there is none.
+fn log_fit(old: Option<&str>, new: Option<&CoefficientFile>, workspace_root: &Path) {
+    match new {
+        Some(file) => log::info!(
+            "eta: coefficient file {} (as_of {}) loaded for the fitted heuristics, replacing {}",
+            file.id,
+            file.as_of.to_rfc3339(),
+            old.unwrap_or("none")
+        ),
+        None => log::warn!(
+            "eta: no coefficient file under {} (replacing {}); \
+             land-2026-10-04-twin-otter refuses no_model until a fit is written",
+            fit::fit_dir(workspace_root).display(),
+            old.unwrap_or("none")
+        ),
+    }
+}
+
 /// The history one ETA pass estimates from: the `sweep.outcome` journal of
 /// every managed root plus the ETA stage journal, then the configured scope
 /// applied on top (#9343).
@@ -640,7 +875,10 @@ async fn estimate_isolated(keys: Option<Vec<ItemKey>>, now: DateTime<Utc>) -> Ve
 ///
 /// Fetching stays outside the estimator either way: what crosses into
 /// `Heuristic::estimate` is a `StageSamples` value and nothing else.
-fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> StageSamples {
+///
+/// The stage journal's rows also yield the stage events the queue features
+/// count (#10201), each known at this read.
+fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> (StageSamples, EventLog) {
     let mut history = StageSamples::default();
     let mut seen = BTreeSet::new();
     for root in roots {
@@ -651,12 +889,24 @@ fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> StageS
             history.censored.extend(samples.censored);
             history.verdicts.extend(samples.verdicts);
             history.paths.extend(samples.paths);
+            // #9758: what `augment` dedupes the SigNoz half against.
+            history.outcome_keys.extend(samples.outcome_keys);
         }
     }
-    history.push_journal(&journal::read(&journal::journal_path(journal_root)), host_id);
+    let rows = journal::read(&journal::journal_path(journal_root));
+    history.push_journal(&rows, host_id);
+    let events = events_from_journal(&rows, Utc::now());
     let mode = crate::eta::config::read(journal_root).history_scope;
-    crate::eta::fleet::apply_scope(mode, journal_root, history)
+    let mut history = crate::eta::fleet::apply_scope(mode, journal_root, history);
+    // #10207: the calibration outcome log is this host's own scoring record,
+    // whatever the stage-sample scope; the open half joins under the lock.
+    history.calibration = calibration_log::read(&calibration_log::path(journal_root));
+    (history, events)
 }
+
+/// One repo's star observation: slug, each PR's linked issues, and the open
+/// starred issues (`None` when a listing failed or the repo lists no PR).
+type RepoStars = (String, Vec<(u32, Vec<u32>)>, Option<Vec<u32>>);
 
 /// One ETA pass: list, resolve, reload history, estimate, deliver. A no-op
 /// when ETA is disabled.
@@ -673,7 +923,10 @@ pub(super) async fn record(
     if !roots.iter().any(|r| r == workspace_root) {
         roots.push(workspace_root.to_path_buf());
     }
-    let mut repos: Vec<(PathBuf, String, Vec<PrView>)> = Vec::new();
+    let mut repos: Vec<(PathBuf, String, Vec<PrView>, Vec<ListedPr>)> = Vec::new();
+    // #10372: per repo, each listed PR's linked issues and the open starred
+    // issues (`None` when any star listing failed: unknown, not unstarred).
+    let mut stars: Vec<RepoStars> = Vec::new();
     let mut seen = BTreeSet::new();
     for root in &roots {
         let Some(slug) =
@@ -693,18 +946,30 @@ pub(super) async fn record(
         }
         // A partial listing would read as PRs leaving review; skip the repo.
         if listings.len() == REVIEW_LABELS.len() {
-            repos.push((root.clone(), slug, pr_views(&listings)));
+            let links = pr_links(&listings);
+            let listed = listed_prs(&listings);
+            // Only a repo with a tracked PR needs the star listing; `None`
+            // leaves its book untouched (no observation, not "unstarred").
+            let starred = if listed.is_empty() {
+                None
+            } else {
+                starred_issues(root).await
+            };
+            stars.push((slug.clone(), links, starred));
+            repos.push((root.clone(), slug, pr_views(&listings), listed));
         }
     }
+    // Before `now`: the fleet view is known strictly before the estimates.
+    let listed_at = Utc::now();
 
-    let slugs: Vec<String> = repos.iter().map(|(_, slug, _)| slug.clone()).collect();
+    let slugs: Vec<String> = repos.iter().map(|(_, slug, ..)| slug.clone()).collect();
     let journal_root = workspace_root.to_path_buf();
     let history_roots = roots.clone();
     let host = lock()
         .as_ref()
         .map(|state| state.host_id.clone())
         .unwrap_or_default();
-    let (history, repo_ids) = tokio::task::spawn_blocking(move || {
+    let ((history, events), repo_ids, loaded_fit) = tokio::task::spawn_blocking(move || {
         let ids: BTreeMap<String, u64> = slugs
             .iter()
             .filter_map(|slug| {
@@ -712,13 +977,32 @@ pub(super) async fn record(
                     .map(|id| (slug.to_ascii_lowercase(), id.id))
             })
             .collect();
-        (load_history(&history_roots, &journal_root, &host), ids)
+        // #10243: a daily refit reaches the running estimator here.
+        let loaded_fit = fit::load_latest(&journal_root, listed_at);
+        (load_history(&history_roots, &journal_root, &host), ids, loaded_fit)
     })
     .await
     .unwrap_or_default();
 
     let ready = ready_rows(slug_cache).await;
+    // Queue friction (#10193), read BEFORE `now`: every reading is then
+    // knowable at the estimates this pass makes.
+    let (book, tracked) = lock()
+        .as_ref()
+        .map(|s| {
+            let repos = s.tracker.item_keys().into_iter().map(|k| k.repo).collect();
+            (s.tracker.friction.clone(), repos)
+        })
+        .unwrap_or_default();
+    let friction_repos = repos
+        .iter()
+        .map(|(root, slug, prs, _)| {
+            (root.clone(), slug.clone(), prs.iter().map(|p| p.number).collect())
+        })
+        .collect();
+    let book = super::eta_friction::refresh(book, friction_repos, tracked, slug_cache).await;
     let now = Utc::now();
+    let pool_exhausted = pool_brake_tripped(workspace_pool, &roots, now);
     let mut effects = Vec::new();
     let mut checks = Vec::new();
     let mut deferred = 0_usize;
@@ -728,13 +1012,29 @@ pub(super) async fn record(
             return;
         };
         state.history = history;
+        if let Some(registry) = swap_fit(state.registry.fit_id(), loaded_fit) {
+            log_fit(state.registry.fit_id(), registry.fit(), &state.workspace_root);
+            state.registry = registry;
+        }
+        // #10207: every still-pending base estimate is a censored lower bound
+        // for the recalibrating heuristic's point-in-time refit.
+        state.history.calibration = calibration_log::combine(
+            std::mem::take(&mut state.history.calibration),
+            state.tracker.pending(),
+        );
         state.repo_ids.extend(repo_ids);
+        state.tracker.friction = book;
+        state.pool_exhausted = pool_exhausted;
+        state.locked_repos = super::ops::lockout::locked_slugs()
+            .into_iter()
+            .map(|slug| slug.to_ascii_lowercase())
+            .collect();
         // Before the listings, so a departed ready item's `issues/{n}` read
         // is offered in this same pass.
         if let Some((rows, plan)) = &ready {
             effects.push(state.tracker.on_ready_queue(rows, plan, now));
         }
-        for (root, slug, prs) in &repos {
+        for (root, slug, prs, _) in &repos {
             let e = state.tracker.on_listing(slug, prs, now, resolution_sec);
             // Checks the tracker still wants answered: PRs that left review
             // and issues whose outcome only the issue can settle. Anything
@@ -757,6 +1057,16 @@ pub(super) async fn record(
             }
             effects.push(e);
         }
+        let fleet: Vec<(String, Vec<ListedPr>)> = repos
+            .iter()
+            .map(|(_, slug, _, listed)| (slug.clone(), listed.clone()))
+            .collect();
+        for (slug, links, starred) in &stars {
+            state
+                .tracker
+                .on_star_context(slug, links, starred.as_deref(), listed_at);
+        }
+        state.tracker.on_fleet_context(&fleet, events, listed_at);
     }
 
     let answers = tokio::task::spawn_blocking(move || run_checks(checks))
@@ -776,9 +1086,15 @@ pub(super) async fn record(
                 }
             });
         }
+        // A decided late surprise is scored before it expires (#10233).
         let expired = state.tracker.expire(now);
+        effects.push(crate::eta::tracker::Effects {
+            outcomes: expired.censored,
+            ..Default::default()
+        });
+        let expired = expired.dropped;
         let all = crate::eta::tracker::merged(effects);
-        note_outcomes(state, &all.outcomes);
+        note_outcomes(state, &all.outcomes, now);
         (
             all.journal,
             all.outcomes,
@@ -838,13 +1154,26 @@ async fn ready_rows(
             repo: slug,
             issue: row.issue,
             plan: row.plan,
+            disposition: row.disposition,
+            facts: IssueRow {
+                workspace_priority: row.workspace_priority,
+                created_at: row.created_at,
+                tier: row.tier,
+            },
         });
+    }
+    let mut listing_failed = Vec::with_capacity(summary.listing_failed.len());
+    for root in &summary.listing_failed {
+        if let Some(slug) = super::collector::resolve_repo_slug_cached(slug_cache, root).await {
+            listing_failed.push(slug);
+        }
     }
     Some((
         rows,
         ReadyPlan {
             context,
             at: summary.at,
+            listing_failed,
         },
     ))
 }

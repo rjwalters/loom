@@ -94,6 +94,48 @@ pub(crate) enum ForgeAction {
         max_points: u32,
     },
 
+    /// `forge wait-checks <PR|SHA> [--timeout SECS] [--required-only]`
+    /// (#10330) — wait for a PR's (or commit's) CI with ETag'd REST reads
+    /// (an unchanged poll is a free `304`) backing off 30s → 120s.
+    ///
+    /// Prints exactly one sentinel on stdout — `LOOM-CHECKS-GREEN <sha>`,
+    /// `-NONE <sha>`, `-RED <sha> <names>`, `-TIMEOUT <sha> <pending>`,
+    /// `-ERROR <reason>`, `-HEAD-MOVED <old> <new>` — and, on RED, one
+    /// `<name>\t<url>\t<run_id>` line per failing check on stderr. Branch
+    /// on the sentinel, not the exit code (0/1/2/3/4). `--timeout 0` takes
+    /// one snapshot. See `loom_daemon::forge_wait_checks`.
+    #[command(name = "wait-checks")]
+    WaitChecks {
+        /// A PR number, or a commit SHA (7-40 hex).
+        #[arg(value_name = "PR|SHA")]
+        selector: String,
+
+        /// `owner/repo` (default: `LOOM_REPO`, else the `origin` remote).
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Base branch for the required-context lookup in SHA mode
+        /// (default: the repository's default branch).
+        #[arg(long)]
+        base: Option<String>,
+
+        /// Seconds to wait before `LOOM-CHECKS-TIMEOUT`; `0` = one poll.
+        #[arg(long, default_value_t = loom_daemon::forge_wait_checks::DEFAULT_TIMEOUT)]
+        timeout: u64,
+
+        /// Settle on the base branch's required contexts only.
+        #[arg(long)]
+        required_only: bool,
+
+        /// First poll interval, seconds (env `LOOM_WAIT_CHECKS_MIN`, default 30).
+        #[arg(long, value_name = "SECS")]
+        min_interval: Option<u64>,
+
+        /// Poll interval cap, seconds (env `LOOM_WAIT_CHECKS_MAX`, default 120).
+        #[arg(long, value_name = "SECS")]
+        max_interval: Option<u64>,
+    },
+
     /// `forge check-claim <issue> [--force-claim]` — the aggregated
     /// pre-flight claim-CAS probe (#9453 Phase 1): "may I claim issue N
     /// **right now**?" Four legs, cheapest-first, short-circuiting on the
@@ -134,11 +176,25 @@ pub(crate) enum ForgeAction {
     /// probe could not answer (fail closed — NOT an absence). Zero
     /// forge-API calls: `git ls-remote` is the git wire protocol, so this
     /// works identically on GitHub and Gitea.
+    ///
+    /// `--branch NAME` probes NAME instead of `feature/issue-N` (#10027).
+    /// `--closed-pr-head` adds one forge read on an existing branch and exits
+    /// `6` (closed PR number on stdout) when its tip is the head of a PR
+    /// closed without merging, no open PR heads it, and the issue has no open
+    /// linked PR — a preserved closed head, not a competing PR. Without it,
+    /// zero forge-API calls.
     #[command(name = "check-branch")]
     CheckBranch {
         /// Issue number whose `feature/issue-N` branch you are about to push.
         #[arg(value_name = "ISSUE")]
         issue: u32,
+        /// Branch to probe instead of the default `feature/issue-N`.
+        #[arg(long, value_name = "BRANCH")]
+        branch: Option<String>,
+        /// Exit 6 instead of 0 when the existing branch is a closed-unmerged
+        /// PR's preserved head and the issue has no open linked PR.
+        #[arg(long)]
+        closed_pr_head: bool,
     },
 
     /// OPERATOR-ONLY: arm GitHub's server-side auto-merge for a PR. Not a
@@ -421,6 +477,30 @@ pub(crate) enum ForgeAction {
         gh_shape: bool,
     },
 
+    /// `forge verdict-stale-notice --label L --marker-sha M --head-sha H
+    /// [--source S]` (#9709) — print the stale-verdict audit comment for a
+    /// `M -> H` invalidation, rendered by the SAME template the daemon's pass
+    /// posts. Reads the PR's RAW (unfiltered) REST comment listing on stdin:
+    /// when a marker newer than the newest trusted one was dropped as
+    /// untrusted, the notice names its login and `author_association` and
+    /// points at `forge.trustedCommenters` instead of asserting a head move.
+    /// Unreadable stdin yields the plain wording. Exits 1 on an unknown label.
+    #[command(name = "verdict-stale-notice")]
+    VerdictStaleNotice {
+        /// The verdict label being cleared (`loom:pr` / `loom:changes-requested`).
+        #[arg(long)]
+        label: String,
+        /// The SHA the newest trusted marker records.
+        #[arg(long)]
+        marker_sha: String,
+        /// The PR's current head SHA.
+        #[arg(long)]
+        head_sha: String,
+        /// The attribution footer's source.
+        #[arg(long, default_value = "verdict-staleness-guard.sh")]
+        source: String,
+    },
+
     /// `forge may-write [--repo OWNER/REPO]` (#9548) — may this installation
     /// write (comment, label, merge, lease) to the repository? Yes only when
     /// it is managed here (origin of a registered workspace or of this Loom
@@ -600,9 +680,41 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             let fetch = fetch.map(|n| (n, repo, with_body));
             return super::forge_identity_cmd::trusted_comments(self_login, fetch, gh_shape);
         }
+        ForgeAction::VerdictStaleNotice {
+            label,
+            marker_sha,
+            head_sha,
+            source,
+        } => {
+            return super::forge_identity_cmd::verdict_stale_notice(
+                &label,
+                &marker_sha,
+                &head_sha,
+                &source,
+            );
+        }
         ForgeAction::Issue { args } => ForgeCmd::Issue(args),
         ForgeAction::Pr { args } => ForgeCmd::Pr(args),
         ForgeAction::Auth { args } => ForgeCmd::Auth(args),
+        ForgeAction::WaitChecks {
+            selector,
+            repo,
+            base,
+            timeout,
+            required_only,
+            min_interval,
+            max_interval,
+        } => loom_daemon::forge_wait_checks::cli_entrypoint(
+            loom_daemon::forge_wait_checks::WaitArgs {
+                selector,
+                repo,
+                base,
+                timeout,
+                required_only,
+                min_interval,
+                max_interval,
+            },
+        ),
         ForgeAction::CheckOpenPr { issue } => ForgeCmd::CheckOpenPr { issue },
         ForgeAction::PrCongestion {
             json,
@@ -616,7 +728,15 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::CheckClaim { issue, force_claim } => {
             ForgeCmd::CheckClaim { issue, force_claim }
         }
-        ForgeAction::CheckBranch { issue } => ForgeCmd::CheckBranch { issue },
+        ForgeAction::CheckBranch {
+            issue,
+            branch,
+            closed_pr_head,
+        } => ForgeCmd::CheckBranch(loom_daemon::forge_check_branch::CheckBranchArgs {
+            issue,
+            branch,
+            closed_pr_head,
+        }),
         ForgeAction::AutoMerge {
             pr_number,
             method,

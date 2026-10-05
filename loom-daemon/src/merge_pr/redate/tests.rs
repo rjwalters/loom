@@ -237,11 +237,19 @@ pub(super) fn write_stub_gh(
 set -uo pipefail
 shift # drop leading "api"
 # One record per call, terminated by a sentinel line rather than a bare
-# newline — the create-commit call's `message=` argument and every `--input -`
+# newline — the create-commit call's `message=` argument and every `--input`
 # body embed real newlines, so a plain newline-per-record log would miscount.
+# `--input -` reads the body from stdin; `--input <file>` (forge_comment's
+# temp-file path, #10089) reads it from that file. Either way the body is
+# recorded under `STDIN:` so the assertions stay transport-agnostic.
 BODY=""
+prev=""
 for arg in "$@"; do
-  if [ "$arg" = "--input" ]; then BODY="$(cat)"; break; fi
+  if [ "$prev" = "--input" ]; then
+    if [ "$arg" = "-" ]; then BODY="$(cat)"; else BODY="$(cat -- "$arg")"; fi
+    break
+  fi
+  prev="$arg"
 done
 {{ printf '%s\nSTDIN:%s\n<<<REDATE-STUB-CALL-END>>>\n' "$*" "$BODY"; }} >> "{dir}/argv.log"
 

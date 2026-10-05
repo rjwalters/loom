@@ -52,6 +52,16 @@ impl Fixture {
         fs::set_permissions(&profile, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(profile.join("auth.json"), "{\"token\":\"synthetic-test-only\"}").unwrap();
         fs::set_permissions(profile.join("auth.json"), fs::Permissions::from_mode(0o600)).unwrap();
+        // The profile's hook-control files, bound read-only as `accounts
+        // session start` binds them; the posture gate requires the binds and
+        // compares the container's copy with these.
+        for (file, body) in [
+            ("hooks.json", "{\"hooks\":{}}\n"),
+            ("config.toml", ""),
+            ("loom-codex-hooks.json", "{}\n"),
+        ] {
+            fs::write(profile.join(file), body).unwrap();
+        }
         fs::write(
             profile.join(".session-managed.json"),
             serde_json::json!({
@@ -82,6 +92,15 @@ esac
         let mount = format!("{}:{}:ro", root_path.display(), root_path.display());
         let binary_mount = format!("{}:/usr/local/bin/loom-daemon:ro", linux_bin.display());
         let path = format!("PATH={}/bin:/usr/local/bin:/usr/bin:/bin", root_path.display());
+        let controls: Vec<String> = ["hooks.json", "config.toml", "loom-codex-hooks.json"]
+            .iter()
+            .map(|file| {
+                format!(
+                    "type=bind,src={},dst=/home/loom/.codex-profile/{file},readonly",
+                    profile.join(file).display()
+                )
+            })
+            .collect();
         let mut args = vec![
             "run",
             "-d",
@@ -89,6 +108,15 @@ esac
             &name,
             "--network",
             "none",
+            // The host-mode session posture spawn-codex.sh requires before
+            // it dispatches with Codex's sandbox off (issue #9979): the
+            // label AND the HostConfig it stands for.
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--label",
+            "loom.session-posture=container-boundary-v1",
             "--entrypoint",
             "/bin/sh",
             "-v",
@@ -96,6 +124,9 @@ esac
             "-e",
             &path,
         ];
+        for control in &controls {
+            args.extend(["--mount", control.as_str()]);
+        }
         if supervised {
             args.extend(["-v", &binary_mount]);
         }

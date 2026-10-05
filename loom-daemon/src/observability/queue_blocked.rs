@@ -17,7 +17,7 @@
 //! - **Order.** The rows are not in dispatch order, so their `rank` is `0`.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::forge_listing::RestIssue;
 use crate::telemetry::queue_snapshot::{QueueRepoRef, QueueSnapshotRow, MAX_ROWS};
@@ -65,10 +65,7 @@ pub fn blocked_rows(repo: &QueueRepoRef, listing: &[RestIssue]) -> Vec<QueueSnap
                 workspace_priority: crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY,
                 // Deprecated by #9244: always false on the wire.
                 urgent: false,
-                operator_priority: item
-                    .labels
-                    .iter()
-                    .any(|l| l == crate::work_finder::OPERATOR_PRIORITY_LABEL),
+                operator_priority: crate::operator_levels::is_starred(&item.labels),
                 operator_priority_at: None,
                 created_at: item.created_at.clone(),
                 tier: item.labels.iter().find(|l| l.starts_with("tier:")).cloned(),
@@ -147,7 +144,8 @@ pub(super) async fn list_open(
 ) -> Option<Vec<RestIssue>> {
     let shown = root.display().to_string();
     let result = tokio::task::spawn_blocking(move || {
-        let gh = Path::new("gh");
+        let gh_buf = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
+        let gh = gh_buf.as_path();
         crate::forge_listing::list_issues_cached_as(caller, gh, Some(&root), None, label, "open")
     })
     .await;

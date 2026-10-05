@@ -2130,6 +2130,7 @@ fn credential_preflight_ok() -> crate::types::CredentialPreflightReport {
         fingerprint: Some("rjwalters".to_string()),
         message: "authenticated as rjwalters via keyring".to_string(),
         checked_at: now(),
+        pool: None,
     }
 }
 

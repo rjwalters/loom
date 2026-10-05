@@ -132,6 +132,7 @@ fn identity(repo: &str, issue: u32, attempt: u32, sweep: &str) -> RunIdentity {
         attempt: Some(attempt),
         runtime: "claude".to_string(),
         role: Some("builder".to_string()),
+        launch: crate::telemetry::kinds::session_output::Launch::Daemon,
     }
 }
 

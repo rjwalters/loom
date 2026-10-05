@@ -359,22 +359,25 @@ fn oldest_first(a: Option<&String>, b: Option<&String>) -> std::cmp::Ordering {
     }
 }
 
-/// The documented #3946/#9244 lane order, written out independently of
-/// `candidate_keys`: starred first; among starred, starred-at (else
-/// `createdAt`) oldest first; red-main fixes first. The first three
+/// The documented #3946/#9244/#10307 lane order, written out independently of
+/// `candidate_keys`: highest operator level first; starred first; among
+/// starred, starred-at (else `createdAt`) oldest first; red-main fixes
+/// first. The first four
 /// `candidate_keys` — and so `lane_cmp`, which is a slice of them — must
 /// match this exactly.
 fn reference_lane_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let starred_at =
         |c: &PriorityCandidate| c.operator_priority_at.clone().or(c.created_at.clone());
-    let lane = b.operator_priority.cmp(&a.operator_priority).then(
-        if a.operator_priority && b.operator_priority {
+    let lane = b
+        .operator_level
+        .cmp(&a.operator_level)
+        .then(b.operator_priority.cmp(&a.operator_priority))
+        .then(if a.operator_priority && b.operator_priority {
             oldest_first(starred_at(a).as_ref(), starred_at(b).as_ref())
         } else {
             Ordering::Equal
-        },
-    );
+        });
     lane.then(b.main_red_fix.cmp(&a.main_red_fix))
 }
 
@@ -399,13 +402,15 @@ fn candidate_domain() -> Vec<PriorityCandidate> {
     ];
     let mut out = Vec::new();
     for workspace_priority in [0, 100] {
-        for operator_priority in [false, true] {
+        for operator_level in [0u8, 1, 2] {
+            let operator_priority = operator_level >= 1;
             for starred_at in times {
                 for main_red_fix in [false, true] {
                     for created_at in times {
                         for number in [1, 2] {
                             out.push(PriorityCandidate {
                                 workspace_priority,
+                                operator_level,
                                 operator_priority,
                                 operator_priority_at: starred_at.map(str::to_string),
                                 main_red_fix,
@@ -450,6 +455,7 @@ fn candidate_keys_project_to_named_wire_keys() {
     assert_eq!(
         ready_queue::ordering_names(),
         vec![
+            "operator_priority_level",
             "operator_priority",
             "operator_priority_at",
             "main_red_fix",
@@ -460,6 +466,7 @@ fn candidate_keys_project_to_named_wire_keys() {
     );
     let c = PriorityCandidate {
         workspace_priority: 7,
+        operator_level: 2,
         operator_priority: true,
         created_at: Some("2026-01-01T00:00:00Z".into()),
         number: 42,
@@ -473,6 +480,7 @@ fn candidate_keys_project_to_named_wire_keys() {
     assert_eq!(
         values,
         vec![
+            serde_json::json!(2),
             serde_json::json!(true),
             serde_json::json!("2026-01-01T00:00:00Z"),
             serde_json::json!(false),

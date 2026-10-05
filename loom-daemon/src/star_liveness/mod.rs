@@ -33,7 +33,13 @@
 //!    in the work finder and its escalation, and loses both once it stops
 //!    blocking, or once its repo has been unreadable for
 //!    [`task::MAX_FAILED_PASSES`] passes. A cross-repo blocker is an operator
-//!    ask: stars do not cross repos.
+//!    ask: stars do not cross repos. A stale block (no open blocker named in
+//!    the body or comments) is resolved by the pass itself ([`stale`]): an
+//!    all-closed block is removed, an unnamed one is handed to Curator, and
+//!    only a block Curator could not name reaches the operator (#10151). With
+//!    `propagate` on (the default), a starred issue's children by every link
+//!    [`edges`] resolves inherit the same way (#10012), transitively to
+//!    [`collect::MAX_INHERIT_DEPTH`].
 //! 5. **loom-ui star intents** ([`intents`]). The `/ingest` ack may carry
 //!    `operator_priority_intents`; the exporter queues them and this module
 //!    validates and applies them idempotently, with one audit comment whose
@@ -64,14 +70,18 @@ use crate::types::StarLivenessReport;
 pub use crate::types::{AskKind, LandingStage, OperatorAsk, StarLandingRow};
 
 pub mod collect;
+pub mod edges;
 pub mod escalate;
 pub mod forge;
 pub mod inherit;
+pub mod inherited_star;
 pub mod intents;
 pub mod landing;
 pub mod progress;
+pub mod queue;
 pub mod refusal;
 pub mod render;
+pub mod stale;
 pub mod task;
 pub mod trust;
 
@@ -86,6 +96,8 @@ pub const ESCALATE_ENV: &str = "LOOM_OPERATOR_PRIORITY_ESCALATE";
 pub const INTERVAL_SECS_ENV: &str = "LOOM_OPERATOR_PRIORITY_INTERVAL_SECS";
 /// Env override for [`Settings::pools_grace`] (minutes; `0` asks at once).
 pub const POOLS_GRACE_MINUTES_ENV: &str = "LOOM_OPERATOR_PRIORITY_POOLS_GRACE_MINUTES";
+/// Env override for [`Settings::propagate`] (`0`/`false` turns it off).
+pub const PROPAGATE_ENV: &str = "LOOM_OPERATOR_PRIORITY_PROPAGATE";
 
 /// Default watchdog window.
 pub const DEFAULT_NO_PROGRESS_MINUTES: u64 = 30;
@@ -109,6 +121,12 @@ pub struct Settings {
     /// exhausted pool before the `pools-exhausted` ask, so a peer host with
     /// capacity can claim it first.
     pub pools_grace: Duration,
+    /// `propagate`: whether a star reaches a starred issue's children through
+    /// every parent/child link [`edges`] resolves (park records, task lists,
+    /// dependency phrases), not only through the liveness blockers
+    /// (`loom:blocked` blockers, refusal incident, red-main fix), which
+    /// always inherit (#10012).
+    pub propagate: bool,
 }
 
 impl Default for Settings {
@@ -118,6 +136,7 @@ impl Default for Settings {
             escalate: true,
             interval: Duration::from_secs(DEFAULT_INTERVAL_SECS),
             pools_grace: Duration::from_secs(DEFAULT_POOLS_GRACE_MINUTES * 60),
+            propagate: true,
         }
     }
 }
@@ -164,11 +183,15 @@ impl Settings {
         let escalate = env_bool(ESCALATE_ENV)
             .or_else(|| cfg("escalate").and_then(serde_json::Value::as_bool))
             .unwrap_or(d.escalate);
+        let propagate = env_bool(PROPAGATE_ENV)
+            .or_else(|| cfg("propagate").and_then(serde_json::Value::as_bool))
+            .unwrap_or(d.propagate);
         Self {
             no_progress: Duration::from_secs(minutes.saturating_mul(60)),
             escalate,
             interval: Duration::from_secs(interval),
             pools_grace: Duration::from_secs(grace.saturating_mul(60)),
+            propagate,
         }
     }
 

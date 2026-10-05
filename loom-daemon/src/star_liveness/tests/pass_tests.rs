@@ -199,11 +199,17 @@ fn a_blocker_inherits_the_star_and_loses_it_when_it_clears() {
         .is_operator_priority());
 
     // The blocker closes: it loses the star; #10 (still loom:blocked, now
-    // with no open blocker) goes to the operator.
+    // with no open blocker) is a stale block the pass clears, not an
+    // operator ask (#10151).
     world.repo(slug).items.get_mut(&11).unwrap().state = "closed".into();
     let r = host.pass(&world, &repos, Vec::new(), t(10, 5));
     assert_eq!(r.rows.len(), 1);
-    assert_eq!(r.rows[0].ask.as_ref().map(|a| a.kind), Some(AskKind::BlockedUnnamed));
+    assert_eq!(r.rows[0].stage, LandingStage::StaleBlock);
+    assert!(r.rows[0].ask.is_none());
+    assert!(!world.repo(slug).items[&10]
+        .labels
+        .iter()
+        .any(|l| l == "loom:blocked"));
     let mut items = vec![WorkItem::new(11, vec!["loom:issue".into()])];
     inherit::apply(Some(&input.root), &mut items);
     assert!(!items[0].is_operator_priority(), "inheritance cleared");

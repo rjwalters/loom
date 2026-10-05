@@ -23,6 +23,9 @@
 # via two fixture files in `LOOM_TEST_STUB_DIR` (mirroring the gh stub's
 # comments.json/comments-fail convention): `check-branch-rc` (the exit code
 # to return) and `check-branch-stdout` (its stdout, e.g. a timestamp or SHA).
+# Every check-branch argv is appended to `check-branch-args.log` (#10027).
+# `check-branch-legacy-rc`, when present, answers only a flagless call (the
+# fence's old-daemon re-ask).
 
 loom_trust_stub() {
     local dir="${1:?loom_trust_stub: stub dir required}"
@@ -38,8 +41,13 @@ fi
 if [[ "${1:-} ${2:-}" == "forge check-branch" ]]; then
     d="${LOOM_TEST_STUB_DIR:-}"
     rc=1
+    [[ -n "$d" ]] && echo "$*" >> "$d/check-branch-args.log"
     if [[ -n "$d" && -f "$d/check-branch-rc" ]]; then
         rc="$(cat "$d/check-branch-rc")"
+    fi
+    # A pre-#10027 daemon's answer to the flagless legacy re-ask.
+    if [[ -n "$d" && -f "$d/check-branch-legacy-rc" && "$*" != *--closed-pr-head* ]]; then
+        rc="$(cat "$d/check-branch-legacy-rc")"
     fi
     if [[ -n "$d" && -f "$d/check-branch-stdout" ]]; then
         cat "$d/check-branch-stdout"
@@ -53,6 +61,24 @@ if [[ "${1:-} ${2:-}" == "forge may-write" ]]; then
     [[ -n "${WRITE_SCOPE_DAEMON:-}" ]] && exec "$WRITE_SCOPE_DAEMON" "$@"
     echo "error: unrecognized subcommand 'may-write'" >&2
     exit 2
+fi
+# #10229: `lease renewer` goes to a real daemon when LEASE_RENEWER_DAEMON names
+# one; else claim grants --pid (or answers the live peer in `renewer-claim-pid`),
+# check exits `renewer-check-rc` (default 0) and release succeeds. Every argv
+# is appended to `renewer-args.log`.
+if [[ "${1:-} ${2:-}" == "lease renewer" ]]; then
+    [[ -n "${LEASE_RENEWER_DAEMON:-}" ]] && exec "$LEASE_RENEWER_DAEMON" "$@"
+    d="${LOOM_TEST_STUB_DIR:-/dev/null/x}"
+    echo "$*" >> "$d/renewer-args.log" 2> /dev/null
+    case "${3:-}" in
+        claim)
+            [[ ! -f "$d/renewer-claim-pid" ]] || exec cat "$d/renewer-claim-pid"
+            while [[ $# -gt 0 && "$1" != --pid ]]; do shift; done
+            echo "${2:-}"
+            ;;
+        check) exit "$(cat "$d/renewer-check-rc" 2> /dev/null || echo 0)" ;;
+    esac
+    exit 0
 fi
 echo "trust stub: unexpected loom-daemon $*" >&2
 exit 64

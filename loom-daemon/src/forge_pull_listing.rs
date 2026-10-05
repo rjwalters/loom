@@ -1,0 +1,399 @@
+//! ETag-cached REST open-PR listing and per-PR mergeability read (#10349).
+//!
+//! The claim-reconciliation pass family used to list PRs with `gh pr list`
+//! — **GraphQL**, which has no conditional-request mechanism, so every tick
+//! of every workspace billed the shared GraphQL budget even when nothing had
+//! changed (five listings per workspace per pass). This module is the PR
+//! analogue of [`crate::forge_listing`]'s issue listing:
+//!
+//! - `GET repos/{o}/{r}/pulls?state=open` carries everything those listings
+//!   read — number, draft, created/updated timestamps, labels, head ref, head
+//!   sha, base ref — except `mergeable`, which GitHub only returns on a single
+//!   PR's `GET repos/{o}/{r}/pulls/{n}` ([`pull_mergeable_cached_as`]).
+//! - Every request is conditional on the ETag of the last `200` for the same
+//!   resolved key ([`store::daemon_cache_key`], #9252): an unchanged page or
+//!   PR is a `304`, free against the REST rate limit. The ETag and body live
+//!   in the shared disk store (an ETag survives a daemon restart) behind an
+//!   in-memory hot layer, exactly like [`crate::forge_listing`].
+//!
+//! The REST pulls listing has no label filter, so callers filter client-side
+//! — the same shape the review-conflict / merge-sequence passes already used.
+//!
+//! Like the daemon's issue listing this trusts every `200` (no #7451 shrink
+//! guard): a just-relabelled PR must drop out of the next pass's view.
+//!
+//! The listing uses a fixed set of keys (one per page), but the per-PR read
+//! adds one key per distinct PR ever checked. Those entries store only
+//! `{"mergeable": …}` (never the PR description) under their own `pull-`
+//! file prefix, and both layers drop them [`PULL_ENTRY_MAX_AGE`] after their
+//! last `200` — the same bound as `forge_cached_view`'s `prune_stale`.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
+
+use anyhow::{anyhow, Context, Result};
+
+use crate::forge_call_stats::{ops, ForgeOp};
+use crate::forge_etag_store as store;
+
+/// Rows per page — GitHub's REST maximum.
+pub const PER_PAGE: usize = 100;
+
+/// Per-PR mergeable entries whose last `200` is older than this are pruned
+/// (disk and memory) on the next per-PR `200`. Without it both layers grow
+/// by one entry per distinct PR ever read; an evicted entry costs one `200`.
+pub const PULL_ENTRY_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Disk filename prefix of the per-PR entries (the listing uses `listing-`).
+const PULL_PREFIX: &str = "pull-";
+
+/// An open PR as returned by `GET repos/{o}/{r}/pulls`, reduced to the fields
+/// the daemon's reconciliation passes consume.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RestPull {
+    pub number: u32,
+    /// `"open"` / `"closed"` (REST lowercase).
+    pub state: String,
+    pub draft: bool,
+    pub title: Option<String>,
+    /// RFC-3339 creation timestamp. Lexicographic order == chronological.
+    pub created_at: Option<String>,
+    /// RFC-3339 last-update timestamp.
+    pub updated_at: Option<String>,
+    /// Author login (`user.login`).
+    pub author: Option<String>,
+    /// Label names (flattened from the REST label objects).
+    pub labels: Vec<String>,
+    /// `head.ref` — the PR's branch name.
+    pub head_ref: Option<String>,
+    /// `head.sha` — the PR's current head commit.
+    pub head_sha: Option<String>,
+    /// `base.ref` — the branch the PR targets.
+    pub base_ref: Option<String>,
+}
+
+impl RestPull {
+    /// Does this PR carry `label`?
+    #[must_use]
+    pub fn has_label(&self, label: &str) -> bool {
+        self.labels.iter().any(|l| l == label)
+    }
+}
+
+/// The page-`page` URL of the open-PR listing, newest first — the same order
+/// `gh pr list` returns, so a capped listing keeps the newest PRs.
+#[must_use]
+pub fn build_pulls_url(repo: Option<&str>, page: usize) -> String {
+    let repo_path = repo.unwrap_or("{owner}/{repo}");
+    format!(
+        "repos/{repo_path}/pulls?state=open&sort=created&direction=desc&per_page={PER_PAGE}\
+         &page={page}"
+    )
+}
+
+/// `GET pulls?state=open` has no inventory row yet (the inventory's PR
+/// discovery row is by-head only) — the same marking `pr_planning`'s queue
+/// listing uses (#9831).
+const PR_LIST_OPEN: ForgeOp = ForgeOp::uninventoried("open-PR listing has no inventory row");
+
+/// Every open PR of the repo `cwd` resolves to (or `repo_override` /
+/// `LOOM_REPO`), up to `max_pages` pages of [`PER_PAGE`], newest first. Each
+/// page is its own conditional read; paging stops at the first short page.
+/// A capped listing whose last page is full logs a truncation warning.
+///
+/// Every forge call is recorded against `caller` in
+/// [`crate::forge_call_stats`] (#9251). Errors carry the `gh` stderr tail so
+/// [`crate::rate_limit_breaker`]'s classifier sees rate-limit text unchanged.
+pub fn list_open_pulls_cached_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    max_pages: usize,
+) -> Result<Vec<RestPull>> {
+    let target = resolve(cwd, repo_override);
+    let mut rows = Vec::new();
+    for page in 1..=max_pages.max(1) {
+        let url = build_pulls_url(target.repo.as_deref(), page);
+        let site = store::ConditionalRead::new(caller, PR_LIST_OPEN);
+        let body = conditional_get(site, gh_bin, cwd, &target, &url, Kind::Listing)?;
+        let batch =
+            parse_rest_pulls(&body).with_context(|| format!("parse REST pulls JSON from {url}"))?;
+        let full = batch.len() >= PER_PAGE;
+        rows.extend(batch);
+        if !full {
+            return Ok(rows);
+        }
+    }
+    log::warn!(
+        "forge_pull_listing: the open-PR listing filled {max_pages} page(s) of {PER_PAGE}; PRs \
+         beyond them are not seen this poll"
+    );
+    Ok(rows)
+}
+
+/// One PR's REST `mergeable` (`true` / `false`, or `None` while GitHub is
+/// still computing it — "no information"), via a conditional
+/// `GET repos/{o}/{r}/pulls/{number}`. The ETag covers the whole body, so a
+/// recomputed mergeability (e.g. after the base branch moved, which does not
+/// bump `updated_at`) is a fresh `200`, never a stale `304`.
+pub fn pull_mergeable_cached_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    number: u32,
+) -> Result<Option<bool>> {
+    let target = resolve(cwd, repo_override);
+    let repo_path = target.repo.as_deref().unwrap_or("{owner}/{repo}");
+    let url = format!("repos/{repo_path}/pulls/{number}");
+    let site = store::ConditionalRead::new(caller, ops::PR_VIEW_STATE);
+    let body = conditional_get(site, gh_bin, cwd, &target, &url, Kind::Pull)?;
+    parse_mergeable(&body).with_context(|| format!("parse REST pull JSON from {url}"))
+}
+
+/// The `mergeable` field of one `GET pulls/{n}` body (absent or `null` ⇒
+/// `None`).
+///
+/// # Errors
+/// Malformed JSON.
+pub fn parse_mergeable(body: &str) -> Result<Option<bool>> {
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        #[serde(default)]
+        mergeable: Option<bool>,
+    }
+    let raw: Raw = serde_json::from_str(body.trim())?;
+    Ok(raw.mergeable)
+}
+
+/// Parse a REST pulls-listing body. Lenient: a missing `head` / `base` /
+/// `labels` parses to empty values rather than failing the whole listing.
+///
+/// # Errors
+/// Malformed JSON.
+pub fn parse_rest_pulls(body: &str) -> Result<Vec<RestPull>> {
+    #[derive(serde::Deserialize)]
+    struct RawLabel {
+        name: String,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct RawRef {
+        #[serde(default, rename = "ref")]
+        ref_name: Option<String>,
+        #[serde(default)]
+        sha: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawUser {
+        #[serde(default)]
+        login: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RawPull {
+        number: u32,
+        #[serde(default)]
+        state: String,
+        #[serde(default)]
+        draft: Option<bool>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        created_at: Option<String>,
+        #[serde(default)]
+        updated_at: Option<String>,
+        #[serde(default)]
+        user: Option<RawUser>,
+        #[serde(default)]
+        labels: Vec<RawLabel>,
+        #[serde(default)]
+        head: Option<RawRef>,
+        #[serde(default)]
+        base: Option<RawRef>,
+    }
+    let rows: Vec<RawPull> = serde_json::from_str(body.trim())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let head = r.head.unwrap_or_default();
+            RestPull {
+                number: r.number,
+                state: r.state,
+                draft: r.draft.unwrap_or(false),
+                title: r.title,
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+                author: r.user.and_then(|u| u.login),
+                labels: r.labels.into_iter().map(|l| l.name).collect(),
+                head_ref: head.ref_name,
+                head_sha: head.sha,
+                base_ref: r.base.and_then(|b| b.ref_name),
+            }
+        })
+        .collect())
+}
+
+fn resolve(cwd: Option<&Path>, repo_override: Option<&str>) -> store::Target {
+    let env_repo = std::env::var("LOOM_REPO").ok();
+    // #9252: the URL names the SAME resolved repo the key does.
+    store::resolve_target(cwd, repo_override.or(env_repo.as_deref()))
+}
+
+/// Which cache an entry belongs to: the bounded-key listing pages, or the
+/// per-PR reads (reduced body, age-pruned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Listing,
+    Pull,
+}
+
+/// One conditional `GET url`: the body of the last `200` on a `304`, else the
+/// fresh `200` body (cached when it carries an ETag). Mirrors
+/// `forge_listing::list_issues_cached_once`'s flow, including the rule that a
+/// `304` may only serve the body stored with the ETag it validated.
+fn conditional_get(
+    site: store::ConditionalRead,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    target: &store::Target,
+    url: &str,
+    kind: Kind,
+) -> Result<String> {
+    let cache_key = store::daemon_cache_key(cwd, target, url);
+    let disk_dir = store::daemon_store_dir();
+    let disk_path = disk_dir.as_deref().map(|d| match kind {
+        Kind::Listing => store::entry_path_in(d, &cache_key),
+        Kind::Pull => store::entry_path_with_prefix(d, PULL_PREFIX, &cache_key),
+    });
+    let sent = cached_entry(&cache_key, disk_path.as_deref());
+    let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
+    let (status, response, stderr) =
+        store::fetch_conditional(site, gh_bin, cwd, target, url, sent_etag)?;
+    match response {
+        // gh exits 1 on a 304, so this arm precedes any exit-status check.
+        Some(ref r) if r.status == 304 => {
+            if let Some(entry) = sent {
+                log::debug!("forge_pull_listing: 304 cache hit for {url}");
+                return Ok(entry.body.as_ref().clone());
+            }
+            if let Ok(mut guard) = cache().lock() {
+                guard.remove(&cache_key);
+            }
+            if let Some(path) = &disk_path {
+                let _ = std::fs::remove_file(path);
+            }
+            Err(anyhow!("forge_pull_listing: 304 for {url} but the cache entry vanished"))
+        }
+        Some(ref r) if r.status == 200 && status.success() => {
+            if let Some(etag) = r.etag.clone() {
+                // A per-PR entry keeps only what a 304 must reproduce.
+                let stored = match kind {
+                    Kind::Listing => Some(r.body.clone()),
+                    Kind::Pull => parse_mergeable(&r.body)
+                        .ok()
+                        .map(|m| serde_json::json!({ "mergeable": m }).to_string()),
+                };
+                if let Some(stored) = stored {
+                    if let Some(path) = &disk_path {
+                        let entry = store::DiskEntry {
+                            etag: etag.clone(),
+                            body: stored.clone(),
+                        };
+                        store::write_disk_entry(path, &entry);
+                    }
+                    if let Ok(mut guard) = cache().lock() {
+                        let entry = CacheEntry {
+                            etag,
+                            body: Arc::new(stored),
+                            pull_written: (kind == Kind::Pull).then(SystemTime::now),
+                        };
+                        guard.insert(cache_key, entry);
+                    }
+                }
+                if kind == Kind::Pull {
+                    prune_stale_pulls(disk_dir.as_deref(), SystemTime::now());
+                }
+            }
+            Ok(r.body.clone())
+        }
+        _ => Err(anyhow!(
+            "gh api {url} failed{}: {stderr}",
+            cwd.map(|d| format!(" in {}", d.display()))
+                .unwrap_or_default(),
+        )),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    etag: String,
+    body: Arc<String>,
+    /// When a per-PR entry's last `200` was stored (`None` for listing pages,
+    /// which are never pruned).
+    pull_written: Option<SystemTime>,
+}
+
+/// Drop per-PR entries whose last `200` is more than [`PULL_ENTRY_MAX_AGE`]
+/// before `now`: hot-layer entries by their stored time, disk entries (only
+/// `pull-` files — listing pages share the directory) by mtime.
+fn prune_stale_pulls(disk_dir: Option<&Path>, now: SystemTime) {
+    let stale = |t: SystemTime| now.duration_since(t).is_ok_and(|a| a > PULL_ENTRY_MAX_AGE);
+    if let Ok(mut guard) = cache().lock() {
+        guard.retain(|_, e| !e.pull_written.is_some_and(stale));
+    }
+    let Some(Ok(rd)) = disk_dir.map(std::fs::read_dir) else {
+        return;
+    };
+    for entry in rd.filter_map(std::result::Result::ok) {
+        let name = entry.file_name();
+        let is_pull = name
+            .to_str()
+            .is_some_and(|n| n.starts_with(PULL_PREFIX) && n.ends_with(".json"));
+        let old = || entry.metadata().and_then(|m| m.modified()).is_ok_and(stale);
+        if is_pull && old() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The `(etag, body)` pair to present for `key`: the hot layer, else a
+/// read-through of the disk entry (promoted into memory).
+fn cached_entry(key: &str, disk: Option<&Path>) -> Option<CacheEntry> {
+    if let Some(entry) = cache().lock().ok()?.get(key).cloned() {
+        return Some(entry);
+    }
+    let disk = disk?;
+    let disk_entry = store::read_disk_entry(disk)?;
+    let is_pull = disk
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(PULL_PREFIX));
+    // A promoted per-PR entry keeps its disk age, so promotion never resets it.
+    let written = std::fs::metadata(disk).and_then(|m| m.modified()).ok();
+    let entry = CacheEntry {
+        etag: disk_entry.etag,
+        body: Arc::new(disk_entry.body),
+        pull_written: if is_pull {
+            written.or_else(|| Some(SystemTime::now()))
+        } else {
+            None
+        },
+    };
+    if let Ok(mut guard) = cache().lock() {
+        guard.insert(key.to_string(), entry.clone());
+    }
+    Some(entry)
+}
+
+/// Process-global hot layer, keyed like [`crate::forge_listing`]'s.
+fn cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "forge_pull_listing_tests.rs"]
+mod tests;

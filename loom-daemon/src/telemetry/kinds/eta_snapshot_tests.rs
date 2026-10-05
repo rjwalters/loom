@@ -30,6 +30,7 @@ fn record() -> EtaSnapshotRecord {
         as_of: row.as_of,
         rows: vec![row],
         rows_truncated: 0,
+        rows_truncated_by_kind: Default::default(),
     }
 }
 

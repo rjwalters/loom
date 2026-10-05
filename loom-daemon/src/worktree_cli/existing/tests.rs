@@ -412,6 +412,9 @@ fn a_dash_prefixed_branch_is_never_a_git_option() {
     let evil = format!("--upload-pack={}", payload.display());
 
     // Control: the unseparated form really does execute the payload here.
+    // LOOM-REF-SCAN: vector-control — this call site is unseparated ON PURPOSE
+    // (tests/git_ref_operand_scan.rs would otherwise report it); without the
+    // control the guard assertion below would be vacuous.
     let _ = Command::new("git")
         .arg("-C")
         .arg(&wt)

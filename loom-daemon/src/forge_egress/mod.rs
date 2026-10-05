@@ -30,6 +30,7 @@ pub mod checks;
 pub mod gate;
 pub mod policy;
 pub mod probe;
+pub mod publication;
 pub mod report;
 
 use std::path::Path;
@@ -181,7 +182,12 @@ pub fn evaluate(doc: &PolicyDoc, obs: &Observed, mode: Mode) -> Report {
     let (git, runtime, telemetry) = match mode {
         Mode::Assert => (vec![], vec![], vec![]),
         Mode::Doctor => (
-            dedupe(checks::assert_git_routing(policy, obs)),
+            dedupe(
+                checks::assert_git_routing(policy, obs)
+                    .into_iter()
+                    .chain(checks::assert_git_credential_separation(policy, obs))
+                    .collect(),
+            ),
             dedupe(checks::assert_runtime(policy, obs)),
             dedupe(checks::assert_telemetry(policy, obs)),
         ),
@@ -226,6 +232,8 @@ fn observed_json(policy: &Value, obs: &Observed) -> Value {
         "ghVersion": obs.gh.version.map(|(a, b, c)| format!("{a}.{b}.{c}")),
         "ghVersionLine": (!obs.gh.raw.is_empty()).then(|| obs.gh.raw.clone()),
         "ghPath": obs.gh.path.as_ref().map(|p| p.display().to_string()),
+        "pathGhPath": obs.path_gh.as_ref().map(|p| p.display().to_string()),
+        "ghSource": obs.gh_source,
         "apiHostHonoured": api_host_supported(obs.gh.version, policy),
         "expectedApiHost": expected_api_host(policy),
         "logicalHost": dig(policy, &["github", "logicalHost"]).cloned().unwrap_or(Value::Null),

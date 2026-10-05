@@ -151,10 +151,8 @@ fn doc_revision_markers() -> Vec<String> {
 /// The rubric's class table as claimed in the SQL mirror:
 /// class -> (hw_lines_median, hw_files_median, tokens_median).
 fn sql_rubric_classes() -> BTreeMap<String, (u64, u64, u64)> {
-    let row = Regex::new(
-        r"(?m)^\s*(?:UNION ALL )?SELECT '(?:v\d+)', '(\d+)',\s*([\d,]+),\s*(\d+),\s*(\d+)\s*$",
-    )
-    .unwrap();
+    let row = Regex::new(r"(?m)^\s*\('(?:v\d+)', '(\d+)',\s*([\d,]+),\s*(\d+),\s*(\d+)\)[,;]?\s*$")
+        .unwrap();
     row.captures_iter(view_block(QUERIES, "rubric_classes"))
         .map(|capture| {
             (

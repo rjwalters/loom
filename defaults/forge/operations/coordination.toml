@@ -1,0 +1,539 @@
+# coordination.toml — the required-coordination profile.
+#
+# Issues, labels, comments, timeline and epic relationships: the operations the
+# primary forge owns as the coordination authority (ADR-0014). Every row here
+# is `profile = "required-coordination"`; a provider that cannot do one of them
+# cannot be a Loom primary forge, which is why none of these may be waived by a
+# profile reduction.
+#
+# Field semantics: loom-daemon/src/forge_inventory/model.rs.
+
+# --- issue-creation-discovery ------------------------------------------------
+
+[[operation]]
+id = "issue.create"
+group = "issue-creation-discovery"
+summary = "File a new issue with labels applied atomically."
+profile = "required-coordination"
+disposition = "required"
+class = "write"
+inputs = ["owner", "repo", "title", "body", "labels"]
+outputs = ["number", "id", "html_url", "created_at"]
+required_fields = ["number"]
+actor = "agent"
+permissions = ["issues:write"]
+pagination = "not-paginated"
+consistency = "read-after-write"
+idempotency = "not-idempotent"
+retry = "no-auto-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::coordination::issue-create"
+owner = "role-scripts"
+risk = "normal"
+github = { commands = [
+  "gh issue create",
+], routes = [
+  "POST repos/{owner}/{repo}/issues",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "whether Gitea applies labels in the same request or needs a second call (atomicity matters: #5047 exists because a split write left unlabelled issues)",
+]
+notes = "Loom files issues through create-issue.sh, which falls back to one REST POST when the GraphQL pool is exhausted."
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/create-issue.sh"
+[[operation.callers]]
+kind = "role-prompt"
+path = "defaults/.claude/commands/loom/curator.md"
+
+[[operation]]
+id = "issue.list"
+group = "issue-creation-discovery"
+summary = "List open issues filtered by label, state and sort order."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "labels", "state", "sort", "limit"]
+outputs = ["number", "title", "labels", "state", "updated_at", "author"]
+required_fields = ["number", "labels", "state"]
+actor = "daemon"
+permissions = ["issues:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::coordination::issue-list"
+owner = "daemon-sweep"
+risk = "normal"
+github = { commands = [
+  "gh issue list",
+], routes = [
+  "GET repos/{owner}/{repo}/issues",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "Gitea label-filter semantics for multi-label AND queries (gh ANDs --label; a provider that ORs would silently widen every work-finder query)",
+]
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/work_finder/forge.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_listing.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/eta/fleet_fetch.rs"
+[[operation.callers]]
+kind = "role-prompt"
+path = "defaults/.claude/commands/loom/guide.md"
+
+[[operation]]
+id = "issue.search"
+group = "issue-creation-discovery"
+summary = "Cross-repository / qualifier-based issue search for duplicate detection."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["query", "qualifiers", "limit"]
+outputs = ["number", "title", "repository", "updated_at"]
+required_fields = ["number", "title"]
+actor = "agent"
+permissions = ["issues:read"]
+pagination = "first-page-sufficient"
+consistency = "eventual"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::coordination::issue-search"
+owner = "role-scripts"
+risk = "normal"
+github = { commands = [
+  "gh search issues",
+], routes = [
+  "GET search/issues",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "GitHub search qualifier syntax is NOT portable; the normalized operation must take structured filters, not a forwarded query string",
+]
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/check-duplicate.sh"
+
+# --- issue-mutation-lifecycle ------------------------------------------------
+
+[[operation]]
+id = "issue.edit-labels"
+group = "issue-mutation-lifecycle"
+summary = "Add and remove labels on one issue as the claim transition."
+profile = "required-coordination"
+disposition = "required"
+class = "write"
+inputs = ["owner", "repo", "number", "add_labels", "remove_labels"]
+outputs = ["labels"]
+required_fields = ["labels"]
+actor = "agent"
+permissions = ["issues:write"]
+pagination = "not-paginated"
+consistency = "read-after-write"
+idempotency = "idempotent"
+retry = "reread-then-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::coordination::issue-edit-labels"
+owner = "role-scripts"
+risk = "high"
+high_risk_cases = ["competing-claims"]
+github = { commands = [
+  "gh issue edit --add-label --remove-label",
+], routes = [
+  "POST repos/{owner}/{repo}/issues/{number}/labels",
+  "DELETE repos/{owner}/{repo}/issues/{number}/labels/{name}",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "whether a concurrent add/remove pair from two hosts can land in an order that leaves BOTH loom:issue and loom:building set — the competing-claims case",
+  "partial-failure reporting when a batch add succeeds and the paired remove fails",
+]
+notes = "This is the claim primitive. Loom's guarded claim (forge check-claim + lease) assumes the remove/add pair is observable as one transition by the next reader."
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/lib/forge-helpers.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_check_claim.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation.rs"
+
+[[operation]]
+id = "issue.edit-body"
+group = "issue-mutation-lifecycle"
+summary = "Replace an issue's title/body (Curator enhancement, park records)."
+profile = "required-coordination"
+disposition = "required"
+class = "write"
+inputs = ["owner", "repo", "number", "title", "body"]
+outputs = ["body", "updated_at"]
+required_fields = ["body"]
+actor = "agent"
+permissions = ["issues:write"]
+pagination = "not-paginated"
+consistency = "read-after-write"
+idempotency = "idempotent"
+retry = "reread-then-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::coordination::issue-edit-body"
+owner = "role-scripts"
+risk = "normal"
+github = { commands = [
+  "gh issue edit --body-file",
+], routes = [
+  "PATCH repos/{owner}/{repo}/issues/{number}",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "literal-body fidelity: Loom stores machine-readable markers (park records, premise records) in bodies; any provider-side rewriting breaks them",
+]
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/lib/forge-helpers.sh"
+[[operation.callers]]
+kind = "role-prompt"
+path = "defaults/.claude/commands/loom/builder-complexity.md"
+
+[[operation]]
+id = "issue.close-with-reason"
+group = "issue-mutation-lifecycle"
+summary = "Close an issue distinguishing completed from not-planned, and reopen."
+profile = "required-coordination"
+disposition = "required"
+class = "write"
+inputs = ["owner", "repo", "number", "state", "state_reason"]
+outputs = ["state", "state_reason", "closed_at"]
+required_fields = ["state", "state_reason"]
+actor = "agent"
+permissions = ["issues:write"]
+pagination = "not-paginated"
+consistency = "read-after-write"
+idempotency = "idempotent"
+retry = "reread-then-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::coordination::issue-close-with-reason"
+owner = "role-scripts"
+risk = "normal"
+github = { commands = [
+  "gh issue close --reason",
+  "gh issue reopen",
+], routes = [
+  "PATCH repos/{owner}/{repo}/issues/{number}",
+] }
+platform_support = "unknown"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "whether Gitea exposes a not-planned close reason at all; Loom's role-autonomy rules depend on the distinction being durable and readable",
+]
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/lib/forge-helpers.sh"
+
+# --- label-catalogue-transitions ---------------------------------------------
+
+[[operation]]
+id = "label.sync-catalogue"
+group = "label-catalogue-transitions"
+summary = "Create/edit/delete the repository label catalogue to match labels.yml."
+profile = "required-coordination"
+disposition = "required"
+class = "write"
+inputs = ["owner", "repo", "name", "color", "description"]
+outputs = ["name", "id", "color", "description"]
+required_fields = ["name"]
+actor = "installer"
+permissions = ["issues:write", "metadata:read"]
+pagination = "complete-required"
+consistency = "read-after-write"
+idempotency = "idempotent"
+retry = "reread-then-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::coordination::label-sync-catalogue"
+owner = "role-scripts"
+risk = "normal"
+github = { commands = [
+  "gh label list",
+  "gh label create",
+  "gh label edit",
+  "gh label delete",
+], routes = [
+  "GET repos/{owner}/{repo}/labels",
+  "POST repos/{owner}/{repo}/labels",
+  "PATCH repos/{owner}/{repo}/labels/{name}",
+  "DELETE repos/{owner}/{repo}/labels/{name}",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "Gitea addresses labels by numeric id, GitHub by name — the whole label layer needs an id/name translation with a stable mapping",
+  "colon-bearing names (`loom:issue`) and URL encoding on the name-addressed routes",
+]
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/sync-labels.sh"
+[[operation.callers]]
+kind = "installer"
+path = "scripts/install/sync-labels.sh"
+
+# --- issue-pr-conversation ---------------------------------------------------
+
+[[operation]]
+id = "comment.create"
+group = "issue-pr-conversation"
+summary = "Post a comment on an issue or PR, body preserved literally."
+profile = "required-coordination"
+disposition = "required"
+class = "write"
+inputs = ["owner", "repo", "number", "body"]
+outputs = ["id", "body", "author", "created_at", "updated_at"]
+required_fields = ["id", "author", "created_at"]
+actor = "agent"
+permissions = ["issues:write"]
+pagination = "not-paginated"
+consistency = "read-after-write"
+idempotency = "marker-deduped"
+retry = "no-auto-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::coordination::comment-create"
+owner = "role-scripts"
+risk = "high"
+high_risk_cases = ["competing-claims"]
+github = { commands = [
+  "gh issue comment",
+  "gh pr comment",
+], routes = [
+  "POST repos/{owner}/{repo}/issues/{number}/comments",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "lease records are comments whose liveness signal is the FORGE-assigned updated_at, and whose tie-break is forge-assigned comment ORDER; both must be preserved exactly or the claim protocol loses its arbiter",
+]
+notes = "Comments carry leases, verdicts and trusted workflow records — not just prose. Loom's Judge publishes verdicts as comments by design."
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/post-verdict.sh"
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/lib/forge-helpers.sh"
+[[operation.callers]]
+kind = "role-prompt"
+path = "defaults/.claude/commands/loom/champion-common.md"
+
+[[operation]]
+id = "comment.list"
+group = "issue-pr-conversation"
+summary = "Read every comment on an issue/PR in forge-assigned order."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "number"]
+outputs = ["id", "body", "author", "author_association", "created_at", "updated_at"]
+required_fields = ["id", "body", "author", "created_at", "updated_at"]
+actor = "daemon"
+permissions = ["issues:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::coordination::comment-list"
+owner = "daemon-forge"
+risk = "high"
+high_risk_cases = ["competing-claims", "cross-origin-identity"]
+github = { commands = [
+  "gh api --paginate",
+], routes = [
+  "GET repos/{owner}/{repo}/issues/{number}/comments",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "author trust: GitHub's authorAssociation is a GitHub contract to translate, not a field another forge necessarily exposes",
+  "a truncated (first-page) comment read can miss the EARLIEST lease record, which is the tie-break — completeness here is a safety property",
+]
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/comment_trust.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_cached_view.rs"
+
+[[operation]]
+id = "comment.edit-delete"
+group = "issue-pr-conversation"
+summary = "Edit or delete an existing comment by id."
+profile = "required-coordination"
+disposition = "required"
+class = "write"
+inputs = ["owner", "repo", "comment_id", "body"]
+outputs = ["id", "body", "updated_at"]
+required_fields = ["id"]
+actor = "agent"
+permissions = ["issues:write"]
+pagination = "not-paginated"
+consistency = "read-after-write"
+idempotency = "idempotent"
+retry = "reread-then-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::coordination::comment-edit-delete"
+owner = "role-scripts"
+risk = "normal"
+github = { commands = [], routes = [
+  "PATCH repos/{owner}/{repo}/issues/comments/{comment_id}",
+  "DELETE repos/{owner}/{repo}/issues/comments/{comment_id}",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "comment id namespace: Loom's lease renewal re-PATCHes a comment it located by marker; a provider whose comment ids are per-issue rather than per-repo changes the lookup",
+]
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/lib/forge-helpers.sh"
+
+# --- timeline-event-history --------------------------------------------------
+
+[[operation]]
+id = "timeline.read"
+group = "timeline-event-history"
+summary = "Read an issue/PR timeline for label age, promotion and landing evidence."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "number"]
+outputs = ["event", "actor", "label", "created_at", "source", "commit_id"]
+required_fields = ["event", "created_at"]
+actor = "daemon"
+permissions = ["issues:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::coordination::timeline-read"
+owner = "daemon-other"
+risk = "normal"
+github = { commands = [], routes = [
+  "GET repos/{owner}/{repo}/issues/{number}/timeline",
+  "GET repos/{owner}/{repo}/issues/{number}/events",
+  "GET repos/{owner}/{repo}/issues/events",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "Gitea's comments-and-timeline endpoint merges comments with events; label-applied timestamps and cross-reference events must survive that shape",
+  "whether `labeled`/`unlabeled` events are retained indefinitely (stage dwell and staleness checks read them)",
+]
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/check-evaluating-staleness.sh"
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/check-promotion-landed.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/observability/ops/stage_dwell.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/eta/fleet_events_forge.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/eta/fleet_fetch.rs"
+
+# --- epics-relationships -----------------------------------------------------
+
+[[operation]]
+id = "epic.sub-issues"
+group = "epics-relationships"
+summary = "Enumerate an epic's children, with the body/task-list fallback."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "number"]
+outputs = ["number", "title", "state", "labels"]
+required_fields = ["number", "state"]
+actor = "daemon"
+permissions = ["issues:read"]
+pagination = "complete-required"
+consistency = "eventual"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::coordination::epic-sub-issues"
+owner = "daemon-other"
+risk = "normal"
+github = { commands = [], routes = [
+  "GET repos/{owner}/{repo}/issues/{number}/sub_issues",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "containment vs dependency are NOT the same relationship; Gitea exposes issue dependencies, which is a different edge from GitHub sub-issues",
+  "whether the body/task-list fallback must become the primary mechanism on a provider with no containment edge",
+]
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/epic_state.rs"
+[[operation.callers]]
+kind = "role-prompt"
+path = "defaults/.claude/commands/loom/champion-common.md"
+
+[[operation]]
+id = "issue.pin"
+group = "epics-relationships"
+summary = "Pin the operator hold digest to the repository."
+profile = "optional"
+disposition = "optional"
+class = "write"
+inputs = ["owner", "repo", "number"]
+outputs = ["pinned"]
+required_fields = []
+actor = "daemon"
+permissions = ["issues:write"]
+pagination = "not-paginated"
+consistency = "eventual"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::coordination::issue-pin"
+owner = "daemon-other"
+risk = "normal"
+github = { commands = ["gh issue pin"], routes = [
+  "PUT repos/{owner}/{repo}/issues/{number}/pin",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+exclusion_reason = "Pinning is presentation for the #6877 hold digest; the digest issue itself is reachable by label query, so no lifecycle decision depends on the pin."
+preflight = "warn-and-disable"
+unknowns = []
+[[operation.callers]]
+kind = "role-prompt"
+path = "defaults/.claude/commands/loom/champion-common.md"

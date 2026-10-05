@@ -191,47 +191,18 @@ tail -50 "$LOG"; cat "$LOG.rc" 2>/dev/null
 **There are exactly two safe paths:**
 
 1. **Batch mode (you have more work to pick up, or the PR is already handed off): do not wait at all — hand off and continue.** Once the PR exists with `loom:review-requested`, verifying CI is **Judge's** gate, not yours. Push, create the PR, state in your final message that CI was still running at hand-off, and move to the next issue. This is the correct default, not a fallback: a later Judge pass re-evaluates once CI settles.
-2. **Single-invocation and a green-CI confirmation is expected before your turn ends: block-poll in the foreground.** Loop **inside this same turn** — `gh pr checks`, `sleep`, repeat — until the checks resolve or you hit an explicit, bounded cap. This is an ordinary shell loop that returns control to you before you write your final message; nothing about it depends on a future turn.
+2. **Single-invocation and a green-CI confirmation is expected before your turn ends: block-poll in the foreground.** Run `loom-daemon forge wait-checks` **inside this same turn** in the foreground (bounded by `--timeout`). It returns control to you before you write your final message; nothing about it depends on a future turn.
 
-**Empty `gh pr checks` output is NOT proof CI has settled.** `gh pr checks` is
-GraphQL-backed and can return completely empty output (zero rows) during a
-transient forge failure (e.g. an intermittent TLS handshake error) — a state
-indistinguishable from "nothing pending" if your loop condition only greps the
-output for the word "pending" (#6169: a Judge poller on kicad-tools PR #4792
-declared CI "settled" 6 minutes into a ~40-minute run this way). Guard against
-it by asserting a minimum row count before trusting an absence of "pending":
+**Use `loom-daemon forge wait-checks`, not a `gh pr checks` loop.** It reads check-runs through the ETag store (an unchanged poll is a free 304), backs off 30s to 120s, and settles the empty-rollup trap (#6169) itself. Branch on the first **stdout** line (never the exit code; keep stderr separate, it carries the RED detail). `--timeout 0` is one snapshot poll. 
 
 ```bash
-# Foreground block-poll on your own PR's CI — bounded, in-turn.
-# ci_still_pending: true (pending) if any row shows pending/queued/in_progress.
-# A ZERO-ROW read is retried once before being trusted — on a real forge blip
-# the retry almost always returns real rows; only a read that is STILL empty
-# after the retry is treated as "genuinely no checks reported" (not pending).
-ci_still_pending() {
-  local pr="$1" out rows
-  out="$(gh pr checks "$pr" 2>/dev/null)"
-  rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
-  if [[ "$rows" -eq 0 ]]; then
-    sleep 3
-    out="$(gh pr checks "$pr" 2>/dev/null)"
-    rows="$(printf '%s\n' "$out" | grep -c $'\t' || true)"
-    [[ "$rows" -eq 0 ]] && return 1   # confirmed empty on retry -- not pending
-  fi
-  printf '%s\n' "$out" | grep -qE "(pending|queued|in_progress)"
-}
-
-MAX_WAIT=1800   # 30 min cap
-INTERVAL=60
-ELAPSED=0
-while ci_still_pending <PR_NUMBER>; do
-  if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
-    echo "CI still pending after ${MAX_WAIT}s — reporting as unsettled and handing off to Judge."
-    break
-  fi
-  sleep "$INTERVAL"
-  ELAPSED=$((ELAPSED + INTERVAL))
-done
-gh pr checks <PR_NUMBER>
+err="$(mktemp)"; out="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 1800 2>"$err")"; first="${out%%$'\n'*}"
+case "$first" in
+  LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;   # settled green
+  LOOM-CHECKS-RED*) cat "$err" ;;            # <name>\t<url>\t<run_id> per failure; gh run view <run_id> --log-failed
+  LOOM-CHECKS-TIMEOUT*|LOOM-CHECKS-HEAD-MOVED*|LOOM-CHECKS-ERROR*) echo "CI unsettled after the bounded wait" ;;
+  *) gh pr checks <PR_NUMBER> ;;             # no sentinel (older binary / Gitea): one snapshot, no loop
+esac
 ```
 
 **If the cap is reached, do not extend the wait and do not reach for a background watcher instead.** Say plainly in your final message that the run had not settled after the bounded wait, leave the PR labeled `loom:review-requested` so Judge re-evaluates, and finish. **If you have not personally read the result** — a build exit status or a `gh pr checks` output in *this* turn — you have not verified it, and you MUST NOT write a final message implying the build passed or that a result is "in progress elsewhere."
@@ -301,15 +272,11 @@ If no argument is provided, use the normal "Finding Work" workflow below.
 | Block issue | `loom:building` | `loom:blocked` |
 | Create PR | - | `loom:review-requested` (on new PR only) |
 
-**IMPORTANT**: `loom:building` and `loom:blocked` are **mutually exclusive** — use atomic transitions:
+**Park only via `park-record apply` (#10152)** — it writes the park record into the issue **body**, then swaps `loom:building` (mutually exclusive) for `loom:blocked`:
 ```bash
-# CORRECT: Atomic transition to blocked state
-gh issue edit <number> --remove-label "loom:building" --add-label "loom:blocked"
-
-# WRONG: Leaves issue in invalid state with both labels
-gh issue edit <number> --add-label "loom:blocked"
+loom-daemon park-record apply --issue <number> --blocked-by <N> --by builder --remove-label loom:building
 ```
-**Record the blocker before the label (#9102).** Before any `--add-label "loom:blocked"`, the issue **body** must declare each **open** blocker — a park record (`loom-daemon park-record render --blocked-by N --by builder`; `.loom/docs/park-record.md`), a `## Dependencies` entry, or a `Blocked by #N` / `Depends on #N` / `Requires #N` line. That is what `check-stale-blocked` (#8927), Guide's unblock sweep and `merge-pr.sh` read; a comment is not enough. Never cite an already-closed item (the unblock sweeps would release it at once). No open numbered blocker? Say so in a comment posted just before the label; never invent one.
+Never a bare label edit: `check-stale-blocked` (#8927), star-liveness, Guide's unblock sweep and `merge-pr.sh` read the body, not comments. It refuses a closed blocker (#9102). No open numbered blocker? Pass `--reason "<why>"` instead; never invent one. See `.loom/docs/park-record.md`.
 
 ### Labels You NEVER Touch
 
@@ -784,11 +751,10 @@ Open the issue and look for:
 
 **If Dependencies section exists:**
 - **All boxes checked** -> Safe to claim
-- **Any boxes unchecked** -> Issue is blocked, mark as `loom:blocked`:
+- **Any boxes unchecked** -> Issue is blocked, park it:
   ```bash
-  gh issue edit <number> --remove-label "loom:issue" --add-label "loom:blocked"
+  loom-daemon park-record apply --issue <number> --blocked-by <dep> --by builder --remove-label loom:issue
   ```
-  Record the unchecked dependency as a park record — see `.loom/docs/park-record.md`.
 
 **If NO Dependencies section:**
 - Issue has no blockers -> Safe to claim
@@ -797,13 +763,12 @@ Open the issue and look for:
 
 If you discover a dependency while working:
 
-1. **Park-record it in the issue body** (or add a Dependencies section) — before step 2, never after
-2. **Mark as blocked** (atomic transition from building to blocked):
+1. **Park it** (body park record, then building -> blocked):
    ```bash
-   gh issue edit <number> --remove-label "loom:building" --add-label "loom:blocked"
+   loom-daemon park-record apply --issue <number> --blocked-by <dep> --by builder --remove-label loom:building
    ```
-3. **Create comment** explaining the dependency
-4. **Wait** for dependency to be resolved, or switch to another issue
+2. **Create comment** explaining the dependency
+3. **Wait** for dependency to be resolved, or switch to another issue
 
 ## Build Verification During Implementation
 
@@ -952,15 +917,15 @@ auditing it for conflicts with rules already in force — see
 - [List what you looked at — files, functions, patterns]
 - [What you tried or considered]
 - [What specifically blocked you or was unclear]
-- No open numbered blocker (if one exists, park-record it first — Label Discipline)
+- No open numbered blocker (if one exists, use `--blocked-by` below)
 
 <!-- loom:builder-note -->
 EOF
 ```
 
-2. **Then mark as blocked** (normal workflow):
+2. **Then park it** (normal workflow):
 ```bash
-gh issue edit <number> --remove-label "loom:building" --add-label "loom:blocked"
+loom-daemon park-record apply --issue <number> --reason "builder could not resolve; see builder note" --by builder --remove-label loom:building
 ```
 
 ### Why This Matters
@@ -1017,9 +982,10 @@ exactly one sub-kind in the **same** command (additive; filters unchanged):
 | `loom:operator-objective` | The work is determined once the operator states an objective — name the candidate objectives and the answer under each (#5826) |
 
 ```bash
-# Builder parking a claimed issue that turns out to need a human:
-./.loom/scripts/post-comment.sh <number> --body "Routing to the operator: <why a human must act>."
-gh issue edit <number> --remove-label "loom:building" --add-label "loom:operator-only,loom:operator-decision"
+# Builder parking a claimed issue on a decision: 2-4 ranked options, each with
+# a why (.loom/docs/operator-decision.md); a one-option ask is refused:
+loom-daemon operator-decision apply <number> --input d.json \
+  --also-label loom:operator-only --remove-label loom:building
 ```
 
 **Being unsure which sub-kind applies is a sign the analysis is incomplete,
@@ -1039,9 +1005,8 @@ in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
 does not satisfy this — the phrase itself must be present so a later automated
 pass can tell when the blocker clears.
 
-**If you chose `loom:operator-decision`**, the same comment MUST name the
-disagreement axis and state why it is a preference rather than a fact — a bare
-"requires judgement" does not satisfy this.
+**If you chose `loom:operator-decision`**, the options' whys MUST name the
+disagreement axis and why it is a preference, not a fact.
 
 **If you chose `loom:operator-objective`**, the same comment MUST list the
 candidate objectives and the answer under each — not just "needs an
@@ -1068,7 +1033,7 @@ Workers use a three-level priority system to determine which issues to work on:
 
 ### Priority Order
 
-1. **Starred** (`loom:operator-priority`) - The operator wants it landed ASAP (#9244)
+1. **Starred** (`loom:operator-priority`) - The operator wants it landed ASAP (#9244); level 2 (`loom:operator-high-priority` / `loom:high-priority-inherited`) first (#10307)
 2. **Curated** (`loom:issue` + `loom:curated`) - Approved and enhanced issues (highest quality)
 3. **Approved Only** (`loom:issue` without `loom:curated`) - Approved but not yet curated (fallback)
 
@@ -1077,7 +1042,9 @@ Workers use a three-level priority system to determine which issues to work on:
 **Step 1: Check for starred issues first**
 
 ```bash
-gh issue list --label="loom:issue" --label="loom:operator-priority" --state=open --limit=5
+# level list: keep in sync with operator_levels.rs LEVELS until #10311
+for L in loom:operator-high-priority loom:high-priority-inherited loom:operator-priority; do
+gh issue list --label="loom:issue" --label="$L" --state=open --limit=5; done
 ```
 
 If any exist, **claim one immediately**.
@@ -1257,8 +1224,8 @@ restate it here; follow it there.
 ### Creating the PR
 
 **Immediately before `git push` + opening the PR, run the lease fencing
-check** — `./.loom/scripts/sweep-lease-fence.sh check "$N"` — and abort (no
-push, no PR) on exit `3`/`4` (expired / superseded lease). Canonical guidance
+check** — `./.loom/scripts/sweep-lease-fence.sh check "$N" --branch <yours>`
+— and abort (no push, no PR) on any non-zero exit. Canonical guidance
 in **builder-pr.md § "Lease Fencing: Confirm You Still Own the Claim" (Epic
 #6165 Phase 3, #6309)**.
 
@@ -1270,8 +1237,8 @@ work). The canonical body template (Summary / Changes / Acceptance
 Criteria Verification / Test Plan + the `Closes #N` reference) lives in
 **builder-pr.md § "Creating the PR"** — use it verbatim. Do NOT create PRs with
 just `Closes #N`; the body must include the structured sections. Add
-`loom:review-requested` at creation only (plus `loom:operator-priority` if the
-issue carries it, #9244), and never touch PR labels afterward (canonical rules in **builder-pr.md § "PR Label Rules"**). PRs are
+`loom:review-requested` at creation only (plus each priority label the
+issue carries, #9244/#10307), and never touch PR labels afterward (canonical rules in **builder-pr.md § "PR Label Rules"**). PRs are
 merged by Champion using `./.loom/scripts/merge-pr.sh` — never use `gh pr merge`.
 
 ## Working Style
