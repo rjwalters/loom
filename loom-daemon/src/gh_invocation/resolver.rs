@@ -100,7 +100,15 @@ pub fn gh_bin() -> String {
 /// Sources come from [`PolicySources::from_process`] with **no repo root**, so
 /// the repo tier is never consulted; [`launcher_from_sources`] additionally
 /// refuses a repo-origin document, so the rule holds even for injected sources.
+///
+/// In a unit-test build this rung is off: a machine or env policy on the
+/// test host naming a real launcher would otherwise outrank the loud-failing
+/// stub [`env_override`] supplies (#10088) and let `cargo test` reach the real
+/// `gh`. The rung's logic is covered through [`launcher_from_sources`].
 fn policy_launcher_path() -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
     launcher_from_sources(&PolicySources::from_process(None))
 }
 
