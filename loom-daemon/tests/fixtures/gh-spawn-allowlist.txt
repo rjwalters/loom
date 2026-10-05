@@ -12,10 +12,13 @@
 #   (`Command::new(crate::gh_invocation::gh_bin())`), which had slipped past
 #   it. The three `fleet/drain.rs` entries are that pre-existing debt made
 #   visible, not new sites: they set the child's `PATH` (which also steers
-#   program lookup), an env the facade does not carry yet.
+#   program lookup), an env the facade does not carry yet. The
+#   `cli/merge_pr_tree_checks.rs` entry (main's #10026) is the same kind of
+#   debt: it pipes the comment body on stdin, which the facade cannot do yet.
 #
 # Empty list == migration complete.
 
+src/cli/merge_pr_tree_checks.rs | let child = Command::new(loom_daemon::gh_invocation::gh_bin())
 src/fleet/drain.rs | let mut comment_cmd = Command::new(crate::gh_invocation::gh_bin());
 src/fleet/drain.rs | let mut edit_cmd = Command::new(crate::gh_invocation::gh_bin());
 src/fleet/drain.rs | let mut view_cmd = Command::new(crate::gh_invocation::gh_bin());
