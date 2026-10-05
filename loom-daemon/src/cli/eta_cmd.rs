@@ -28,12 +28,10 @@ use loom_daemon::eta::backtest::{self, Filter};
 use loom_daemon::eta::config::HistoryScopeMode;
 use loom_daemon::eta::explanation::{Explanation, Features};
 use loom_daemon::eta::fleet;
-use loom_daemon::eta::heuristics::{LandFreshTide, LAND_FRESH_TIDE};
 use loom_daemon::eta::history::StageSamples;
 use loom_daemon::eta::journal::{self, censored_from_pr_history, entries_from_pr_history};
 use loom_daemon::eta::labels as eta_labels;
 use loom_daemon::eta::shadow;
-use loom_daemon::eta::Heuristic;
 use loom_daemon::eta::{
     AgeSource, CurrentStage, CurrentState, EstimateInput, Kind, NoEstimateReason, Provenance,
     Registry, Stage, Subject,
@@ -395,23 +393,6 @@ pub(crate) struct EtaBacktestArgs {
 }
 
 impl EtaBacktestArgs {
-    /// The fresh-tide instance `--half-life-days` asks for, if any.
-    fn fresh_tide_override(&self) -> Result<Option<LandFreshTide>> {
-        let Some(days) = self.half_life_days else {
-            return Ok(None);
-        };
-        if !days.is_finite() || days <= 0.0 {
-            bail!("invalid --half-life-days {days}: must be a positive number of days");
-        }
-        let names_fresh_tide =
-            self.heuristic == LAND_FRESH_TIDE || self.compare.as_deref() == Some(LAND_FRESH_TIDE);
-        if !names_fresh_tide {
-            bail!("--half-life-days only applies to {LAND_FRESH_TIDE}");
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        Ok(Some(LandFreshTide::with_half_life((days * 86_400.0).round() as i64)))
-    }
-
     pub(crate) fn run(self) -> Result<()> {
         let root = self
             .repo_root
@@ -419,13 +400,12 @@ impl EtaBacktestArgs {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         let registry = Registry::builtin();
-        let half_life = self.fresh_tide_override()?;
-        let pick = |id: &str| -> Option<&dyn Heuristic> {
-            match &half_life {
-                Some(h) if id == LAND_FRESH_TIDE => Some(h as &dyn Heuristic),
-                _ => registry.get(id),
-            }
-        };
+        let half_life = super::eta_half_life::fresh_tide_override(
+            &self.heuristic,
+            self.compare.as_deref(),
+            self.half_life_days,
+        )?;
+        let pick = |id: &str| super::eta_half_life::pick(&registry, half_life.as_ref(), id);
         let Some(heuristic) = pick(&self.heuristic) else {
             bail!(
                 "unknown heuristic id {:?} (known: {})",
@@ -1066,44 +1046,6 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc)
-    }
-
-    // -- --half-life-days (#10325) ---------------------------------------
-
-    fn backtest_args(heuristic: &str, compare: Option<&str>, days: Option<f64>) -> EtaBacktestArgs {
-        EtaBacktestArgs {
-            heuristic: heuristic.to_string(),
-            compare: compare.map(str::to_string),
-            since: None,
-            repo: None,
-            repo_root: None,
-            json: false,
-            half_life_days: days,
-            pr_cases: PrCaseArgs::default(),
-        }
-    }
-
-    #[test]
-    fn half_life_days_builds_the_fresh_tide_variant_on_either_side() {
-        let none = backtest_args(LAND_FRESH_TIDE, None, None);
-        assert!(none.fresh_tide_override().unwrap().is_none());
-        let a = backtest_args(LAND_FRESH_TIDE, Some("land-v2"), Some(7.0));
-        assert_eq!(a.fresh_tide_override().unwrap().unwrap().half_life_sec(), 7 * 86_400);
-        let b = backtest_args("land-v2", Some(LAND_FRESH_TIDE), Some(1.0));
-        assert_eq!(b.fresh_tide_override().unwrap().unwrap().half_life_sec(), 86_400);
-    }
-
-    #[test]
-    fn half_life_days_rejects_bad_values_and_other_heuristics() {
-        assert!(backtest_args(LAND_FRESH_TIDE, None, Some(0.0))
-            .fresh_tide_override()
-            .is_err());
-        assert!(backtest_args(LAND_FRESH_TIDE, None, Some(f64::NAN))
-            .fresh_tide_override()
-            .is_err());
-        assert!(backtest_args("land-v2", None, Some(2.0))
-            .fresh_tide_override()
-            .is_err());
     }
 
     // -- parse_story -----------------------------------------------------
