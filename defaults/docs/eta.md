@@ -561,7 +561,9 @@ order of snapshots, episodes or flag changes.
 - Failures and panics are logged at `warn` and retried on the next check.
 - **Every check emits one `eta.fit` record** (#10391), skips included, from
   both callers (the refresh tick's end-of-cycle check and the standalone
-  task), so the records are the fit loop's heartbeat. `outcome` is `written`,
+  task), so the records are the fit loop's heartbeat. The exception: a
+  non-captain serving the captain's published fit (#10395) runs no check and
+  emits none; `fit-pub/status.json` holds its outcome. `outcome` is `written`,
   `skipped`, `error` or `panic`; a skip's `skip_reason` is one of `disabled`,
   `held`, `today_exists`, `no_snapshots`, `stale_before_grace`. The last record
   is also kept at `.loom/state/eta/health/fit-check.json` (and each refresh
