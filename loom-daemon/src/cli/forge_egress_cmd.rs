@@ -41,6 +41,13 @@ pub(crate) enum EgressAction {
     /// document with anything token-shaped redacted). Always exits 0 unless
     /// the policy is unreadable (2).
     Policy,
+    /// Print the `docker run` arguments (one per line) that carry the managed
+    /// `gh` launcher, upstream `gh`, policy and credential reference into a
+    /// container read-only (#9987). Prints nothing, exit 0, when no
+    /// env/machine policy names an existing launcher: the caller then keeps
+    /// today's behaviour. A non-empty output also means the caller must not
+    /// mount `~/.config/gh` or forward `GH_TOKEN`/`GITHUB_TOKEN`.
+    ContainerArgs,
 }
 
 fn workspace() -> PathBuf {
@@ -129,6 +136,14 @@ fn assert_prints_findings(report: &forge_egress::Report) -> bool {
 
 /// Dispatch one `forge egress` verb; exits the process with the verdict.
 pub(crate) fn handle(action: EgressAction) -> Result<()> {
+    if matches!(action, EgressAction::ContainerArgs) {
+        if let Some(egress) = forge_egress::worker_env::WorkerEgress::from_process() {
+            for arg in egress.docker_args() {
+                println!("{arg}");
+            }
+        }
+        return Ok(());
+    }
     let ws = workspace();
     let code = match action {
         EgressAction::Assert { quiet } => {
@@ -190,6 +205,7 @@ pub(crate) fn handle(action: EgressAction) -> Result<()> {
             }
             report.exit_code()
         }
+        EgressAction::ContainerArgs => 0, // handled above
         EgressAction::Policy => match policy::resolve(&PolicySources::from_process(Some(&ws))) {
             Resolution::Unconfigured => {
                 println!("{}", serde_json::json!({"origin": "unconfigured", "path": null}));

@@ -98,6 +98,11 @@ pub enum Unavailable {
         after: Duration,
         partial_stdout: Vec<u8>,
     },
+    /// The managed `gh` launcher exited `78`: routing is blocked (#9987).
+    /// Not an answer from GitHub, so never retried nor read as "no results".
+    RoutingBlocked(String),
+    /// The managed `gh` launcher exited `69`: its adapter is down (#9987).
+    AdapterUnavailable(String),
 }
 
 impl std::fmt::Display for Unavailable {
@@ -106,6 +111,8 @@ impl std::fmt::Display for Unavailable {
             Unavailable::Spawn(e) => write!(f, "could not start: {e}"),
             Unavailable::Collect(e) => write!(f, "could not collect output: {e}"),
             Unavailable::TimedOut { after, .. } => write!(f, "timed out after {after:?}"),
+            Unavailable::RoutingBlocked(e) => write!(f, "routing_blocked: {e}"),
+            Unavailable::AdapterUnavailable(e) => write!(f, "adapter_unavailable: {e}"),
         }
     }
 }

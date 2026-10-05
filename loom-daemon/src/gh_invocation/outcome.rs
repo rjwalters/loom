@@ -50,7 +50,21 @@ pub(super) fn classify(
     timeout: std::time::Duration,
 ) -> CmdOutcome {
     match result {
-        Ok(GhCompletion::Captured(Completion::Exited(out))) => CmdOutcome::Ran(out),
+        Ok(GhCompletion::Captured(Completion::Exited(out))) => {
+            // The managed launcher's own exit codes (#9987) are routing
+            // outcomes, not forge answers: surface them as unavailable so no
+            // caller retries them or reads them as an empty result.
+            let detail = || String::from_utf8_lossy(&out.stderr).trim().to_string();
+            match out.status.code() {
+                Some(super::telemetry::EXIT_ROUTING_BLOCKED) => {
+                    CmdOutcome::Unavailable(Unavailable::RoutingBlocked(detail()))
+                }
+                Some(super::telemetry::EXIT_ADAPTER_UNAVAILABLE) => {
+                    CmdOutcome::Unavailable(Unavailable::AdapterUnavailable(detail()))
+                }
+                _ => CmdOutcome::Ran(out),
+            }
+        }
         Ok(GhCompletion::Captured(Completion::TimedOut { stdout, .. })) => {
             CmdOutcome::Unavailable(Unavailable::TimedOut {
                 after: timeout,
@@ -110,6 +124,23 @@ mod tests {
         };
         assert_eq!(o.status.code(), Some(4));
         assert_eq!(String::from_utf8_lossy(&o.stderr).trim(), "nope");
+    }
+
+    #[test]
+    fn launcher_exit_78_is_routing_blocked_and_69_is_adapter_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = run_with(inv(TIMEOUT), &stub(tmp.path(), "echo denied >&2; exit 78"));
+        assert!(
+            matches!(&out, CmdOutcome::Unavailable(Unavailable::RoutingBlocked(m)) if m == "denied"),
+            "{out:?}"
+        );
+        assert!(!out.succeeded());
+        assert_eq!(out.stdout_lossy(), "");
+        let out = run_with(inv(TIMEOUT), &stub(tmp.path(), "exit 69"));
+        assert!(matches!(out, CmdOutcome::Unavailable(Unavailable::AdapterUnavailable(_))));
+        // Every other non-zero status is still an ordinary answer.
+        let out = run_with(inv(TIMEOUT), &stub(tmp.path(), "exit 70"));
+        assert!(matches!(out, CmdOutcome::Ran(_)));
     }
 
     #[test]

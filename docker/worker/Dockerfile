@@ -87,6 +87,7 @@ RUN apt-get update -qq \
         ca-certificates \
         gnupg \
         jq \
+        python3 \
         tmux \
         openssh-client \
         unzip \

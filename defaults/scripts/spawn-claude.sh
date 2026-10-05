@@ -759,7 +759,23 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # the env-var form already in this process's environment (passed through
     # by the LOOM_*/CLAUDE_*/GH_*/GITHUB_* sweep below); best-effort read-only
     # bind of ~/.config/gh only when neither token env var is present.
-    if [[ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" && -n "${HOME:-}" && -d "${HOME}/.config/gh" ]]; then
+    #
+    # Forge-egress policy (#9987): on a policy-governed host the container gets
+    # 2am's managed `gh` launcher, the pinned upstream gh, the policy and the
+    # credential REFERENCE file, read-only (all computed by `loom-daemon forge
+    # egress container-args`, which prints nothing without a policy), and holds
+    # neither ~/.config/gh nor GH_TOKEN/GITHUB_TOKEN. With no policy the
+    # array is empty and this block is byte-identical to before.
+    # shellcheck source=lib/locate-daemon-bin.sh
+    source "${_script_dir}/lib/locate-daemon-bin.sh"
+    _containment_managed_gh=()
+    _containment_managed_bin="$(loom_locate_daemon_bin "$WORKSPACE" 2>/dev/null || true)"
+    if [[ -n "$_containment_managed_bin" ]]; then
+        mapfile -t _containment_managed_gh < <("$_containment_managed_bin" forge egress container-args 2>/dev/null || true)
+    fi
+    if [[ ${#_containment_managed_gh[@]} -gt 0 ]]; then
+        _containment_mounts+=("${_containment_managed_gh[@]}")
+    elif [[ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" && -n "${HOME:-}" && -d "${HOME}/.config/gh" ]]; then
         _containment_mounts+=(-v "${HOME}/.config/gh:${HOME}/.config/gh:ro")
     fi
     # Git commit identity (check-git-identity.sh's global user.name/user.email).
@@ -819,7 +835,11 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # same host's bare-metal dispatch worked.
     while IFS='=' read -r _containment_var _; do
         case "$_containment_var" in
-            LOOM_* | CLAUDE_* | SAFEHOUSE* | CODEX_* | GH_TOKEN | GITHUB_TOKEN | TRACEPARENT | OTEL_*)
+            GH_TOKEN | GITHUB_TOKEN)
+                # #9987: never forward a real token into a managed-gh container.
+                [[ ${#_containment_managed_gh[@]} -gt 0 ]] || _containment_env+=(-e "$_containment_var")
+                ;;
+            LOOM_* | CLAUDE_* | SAFEHOUSE* | CODEX_* | TRACEPARENT | OTEL_*)
                 _containment_env+=(-e "$_containment_var")
                 ;;
         esac

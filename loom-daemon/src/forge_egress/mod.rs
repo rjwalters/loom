@@ -35,6 +35,7 @@ pub mod policy;
 pub mod probe;
 pub mod publication;
 pub mod report;
+pub mod worker_env;
 
 use std::path::Path;
 

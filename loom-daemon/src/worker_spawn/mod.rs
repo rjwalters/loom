@@ -312,6 +312,24 @@ fn run_preflight(
     {
         return Err(LaunchError::config("invalid runtime name"));
     }
+    // #9987: on a policy-governed host the managed launcher must be the first
+    // `gh` this worker (and its children) resolve. Its directory goes first on
+    // this process's own PATH so the admission below, the runtime child and
+    // the container re-exec all observe one environment. No policy (or a
+    // repo-origin one) resolves to `None` and nothing changes. Tests inject
+    // `egress_sources` and never mutate the process environment.
+    let worker_egress = egress_sources.map_or_else(
+        crate::forge_egress::worker_env::WorkerEgress::from_process,
+        crate::forge_egress::worker_env::WorkerEgress::from_sources,
+    );
+    if let (None, Some(path)) = (
+        egress_sources,
+        worker_egress
+            .as_ref()
+            .and_then(|e| e.worker_path(std::env::var_os("PATH").as_deref())),
+    ) {
+        std::env::set_var("PATH", path);
+    }
     // Forge egress admission (#9984): `spawn-worker.sh` delegates here, so this
     // is its `forge egress assert`. Under `enforcement.api = required` a routing
     // finding means no worker is spawned; `observe` logs; no policy is a no-op.
@@ -378,7 +396,18 @@ fn run_preflight(
             // forwarding the real value — and returns `None` only when the
             // feature is off or the profile opts out.
             let prepared = egress_proxy::prepare(root, &selection, &config)?;
-            let mut command = containment::docker_command(
+            if worker_egress.as_ref().is_some_and(|e| e.required) {
+                if !containment::image_has_python3(&profile.image) {
+                    return Err(LaunchError::config(
+                        crate::forge_egress::worker_env::refusal_message(
+                            &crate::forge_egress::worker_env::python3_missing_finding(
+                                &profile.image,
+                            ),
+                        ),
+                    ));
+                }
+            }
+            let mut command = containment::docker_command_with(
                 &profile,
                 root,
                 &std::env::current_dir().map_err(|e| LaunchError::config(e.to_string()))?,
@@ -386,6 +415,7 @@ fn run_preflight(
                 &args.args,
                 &credentials,
                 prepared.as_ref().map(|p| &p.injection),
+                worker_egress.as_ref(),
             )?;
             let mut log = attach_log(&mut command, options.log.as_deref())?;
             writeln!(log, "{}", profile.dispatch_marker())
@@ -517,6 +547,26 @@ fn run_preflight(
     // opts out; see defaults/docs/gh-cached.md.
     if let Some(path) = crate::agent_gh::worker_path(std::env::var_os("PATH").as_deref()) {
         command.env("PATH", path);
+    }
+    // #9987: the managed launcher stays ahead of the cache front; under
+    // `enforcement.api = required` a worker whose first `gh` is anything else
+    // is not spawned.
+    if let Some(egress) = &worker_egress {
+        let current = command
+            .get_envs()
+            .find(|(k, _)| *k == "PATH")
+            .and_then(|(_, v)| v.map(std::ffi::OsString::from))
+            .or_else(|| std::env::var_os("PATH"));
+        let path = egress.worker_path(current.as_deref());
+        if let Some(finding) = egress.launcher_first_finding(path.as_deref().or(current.as_deref()))
+        {
+            return Err(LaunchError::config(crate::forge_egress::worker_env::refusal_message(
+                &finding,
+            )));
+        }
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
     }
     // CARGO_INCREMENTAL=0 for every Loom-spawned worker (#8456, parent #8453
     // item 1). Cargo keys a crate's incremental session state by the crate's
