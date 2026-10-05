@@ -43,8 +43,8 @@
 //! Same-second events are common (a sweep flips two labels in one call). The
 //! canonical order is `(event_time, source, seq, id)`: `seq` is the source's own
 //! monotonic sequence — the forge event id for forge rows, the delivery order
-//! for webhook-mirror rows (PR 2) — so replays never depend on the order a
-//! page happened to list rows in.
+//! for webhook-mirror rows (the D1 row id) — so replays never depend on the
+//! order a page happened to list rows in.
 //!
 //! # Sources
 //!
@@ -55,7 +55,8 @@
 //! [`super::fleet_events_pulls`]) and two per-PR listings — formal reviews
 //! and the head commit's check runs ([`super::fleet_events_reviews`]) —
 //! walked one PR at a time by [`super::fleet_events_fanout`]. The
-//! webhook-mirror importer is still to come.
+//! webhook-mirror importer ([`super::fleet_events_webhook`]) appends the
+//! loom-ui `label.transition` export to the same log, not through [`sync`].
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -169,7 +170,8 @@ pub struct RawEvent {
     pub commit: Option<String>,
     /// When it happened on the forge — the knowable-at instant.
     pub event_time: DateTime<Utc>,
-    /// Where the row came from ([`SOURCE_FORGE`], later `webhook-mirror`).
+    /// Where the row came from ([`SOURCE_FORGE`], or
+    /// [`super::fleet_events_webhook::SOURCE_WEBHOOK_MIRROR`]).
     pub source: String,
     /// The source's own monotonic order (forge event id; webhook delivery
     /// order). `0` for a row synthesised from an item's own fields (`opened`).

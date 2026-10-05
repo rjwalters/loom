@@ -229,8 +229,9 @@ the forge PR timelines behind the fleet snapshot (every `labeled` and
 `unlabeled` event, operator labels included) and the tracker's own listings.
 No new forge read; the PR listing gains `closedAt` in the same call, so a PR
 closed unmerged ends its last episode at its close. The webhook label stream
-is not readable by the daemon today; it becomes one more adapter once #10197's
-raw event cache imports it.
+reaches only #10197's raw event cache (`eta fleet events import-webhook`);
+episodes do not read it yet, and the star's training read takes forge rows
+only.
 
 - **Fleet snapshot.** `episodes` sits beside `samples` (`serde(default)`, not
   written when empty), so an older daemon still parses the file and a
@@ -694,7 +695,7 @@ it links whose link **and** star were both known before `cutoff`.
 - **Knowable-at**: a fact at `a` is usable iff `a < cutoff`. An issue's star
   run counts from the later of its labeled-at time and the link's known-at
   time, so a link or star that becomes known after `T` never stars a row at
-  `T`. Training reads issue `label_added` / `label_removed` rows; serving
+  `T`. Training reads forge issue `label_added` / `label_removed` rows; serving
   reads one ETag-conditional listing per star label per pass, for repos with
   at least one tracked PR only (the work finder's URLs), and stamps changes
   at the pass.
@@ -1421,8 +1422,22 @@ of what is on disk and never needs a refetch.
   surfaced behind a dismissed `changes_requested`. The answer depends on
   each review's latest read, not on whether it was also read before the
   dismissal. The CI and approval counts are absent until a row
-  of their listing precedes `--as-of`. Not yet cached: the webhook-mirror
-  source.
+  of their listing precedes `--as-of`.
+- **Webhook mirror.** `eta fleet events import-webhook --from FILE [--repo
+  R | --all-repos]` appends a loom-ui `label.transition` export (D1
+  `records` rows as JSONL, or `wrangler d1 execute --json` output) as
+  `source: "webhook-mirror"` rows: `seq` = the D1 row id (delivery order),
+  `event_time` = the payload's `at` (Worker receipt, seconds after the
+  change, so never early), `fetched_at` = import time. Read-only, no
+  network, zero forge calls; ids ignore `fetched_at`, so re-importing or
+  importing an overlapping later export (after D1 eviction) appends only new
+  rows and removes none. It carries `loom:*` labels and open/close only.
+  `state --source forge|webhook-mirror` replays one source; mixed, a
+  transition seen by both is replayed twice, seconds apart. The per-PR
+  fan-out's work list reads `forge` rows only, so an import never queues a
+  forge read, and so do the star inputs, so an import never moves a star or
+  its coverage. It is a manual verb: the captain-gated refresh cycle never
+  imports, and an import spends no reader budget, so it is not captain-only.
 
 `loom eta …` (the machine dispatcher, `scripts/loom`) is a thin passthrough to
 `loom-daemon eta …`.

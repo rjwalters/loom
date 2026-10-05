@@ -39,7 +39,7 @@
 //! `star_source`. The model's `starred` feature stays PR-only (see
 //! `defaults/docs/eta.md`), so coefficient files are unchanged.
 
-use super::fleet_events::{EventKind, ItemKind, RawEvent};
+use super::fleet_events::{EventKind, ItemKind, RawEvent, SOURCE_FORGE};
 use super::labels::FLAG_STARRED;
 use crate::worktree_ops::gh::linkage_refs;
 use chrono::{DateTime, Utc};
@@ -188,11 +188,13 @@ pub struct RepoStar {
 }
 
 impl RepoStar {
-    /// Read a repo's raw events (any order).
+    /// Read a repo's raw events (any order). Only [`SOURCE_FORGE`] rows count:
+    /// the coverage floors name the forge listings, and an imported
+    /// webhook-mirror row (#10197) would move them and replay a star twice.
     #[must_use]
     pub fn from_events(events: &[RawEvent]) -> Self {
         let mut star = RepoStar::default();
-        for e in events {
+        for e in events.iter().filter(|e| e.source == SOURCE_FORGE) {
             let min = |slot: &mut Option<DateTime<Utc>>| {
                 *slot = Some(slot.map_or(e.event_time, |x| x.min(e.event_time)));
             };

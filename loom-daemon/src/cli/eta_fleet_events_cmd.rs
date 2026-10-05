@@ -12,6 +12,9 @@
 //! - The per-PR endpoints ([`loom_daemon::eta::fleet_events_fanout`]) do the
 //!   same under both verbs: poll every open PR (conditionally), then read each
 //!   closed PR not yet settled, once.
+//! - `events import-webhook --from FILE` appends a loom-ui `label.transition`
+//!   export ([`loom_daemon::eta::fleet_events_webhook`]) to the same cache:
+//!   read-only, no network, idempotent.
 //! - `state --as-of T` replays the cached events strictly before `T`
 //!   ([`loom_daemon::eta::fleet_state::fleet_state`]) and makes no forge call.
 
@@ -24,6 +27,7 @@ use loom_daemon::eta::fleet_agreement;
 use loom_daemon::eta::fleet_events::{self, EventLog, EventsCursor, SyncMode, SyncOutcome};
 use loom_daemon::eta::fleet_events_fanout::{pr_work, sync_per_pr};
 use loom_daemon::eta::fleet_events_forge::{ForgeEndpoint, ForgeEventSource};
+use loom_daemon::eta::fleet_events_webhook::{self, SOURCE_WEBHOOK_MIRROR};
 use loom_daemon::eta::fleet_state::{fleet_state, FleetState};
 
 /// `EX_TEMPFAIL`: the run stopped early and is resumable.
@@ -43,6 +47,9 @@ pub(crate) enum EventsCommand {
     Backfill(EventsSyncArgs),
     /// Top the raw event cache up from the head of the listing.
     Refresh(EventsSyncArgs),
+    /// Append a loom-ui webhook `label.transition` export (D1 `records` rows,
+    /// JSONL or `wrangler d1 execute --json` output) to the cache.
+    ImportWebhook(ImportWebhookArgs),
 }
 
 impl EventsCommand {
@@ -50,6 +57,7 @@ impl EventsCommand {
         match self {
             EventsCommand::Backfill(args) => args.run(SyncMode::Backfill),
             EventsCommand::Refresh(args) => args.run(SyncMode::Refresh),
+            EventsCommand::ImportWebhook(args) => args.run(),
         }
     }
 }
@@ -165,6 +173,61 @@ impl EventsSyncArgs {
     }
 }
 
+#[derive(clap::Args)]
+pub(crate) struct ImportWebhookArgs {
+    /// The export to read (never modified).
+    #[arg(long, value_name = "FILE")]
+    pub from: PathBuf,
+
+    /// Import only this repository's rows, as `owner/name`. Defaults to
+    /// whatever `gh` resolves from `--repo-root`.
+    #[arg(long, value_name = "OWNER/NAME", conflicts_with = "all_repos")]
+    pub repo: Option<String>,
+
+    /// Import every repository in the export, each into its own cache file.
+    #[arg(long)]
+    pub all_repos: bool,
+
+    /// Directory whose `.loom/state/eta/fleet/` to write.
+    #[arg(long, value_name = "PATH")]
+    pub repo_root: Option<PathBuf>,
+}
+
+impl ImportWebhookArgs {
+    fn run(self) -> Result<()> {
+        let root = resolve_root(self.repo_root);
+        let text = std::fs::read_to_string(&self.from)?;
+        let mut parsed = fleet_events_webhook::parse_export(&text, Utc::now());
+        let repos: Vec<String> = if self.all_repos {
+            parsed.by_repo.keys().cloned().collect()
+        } else {
+            vec![resolve_repo(self.repo, &root)?.to_ascii_lowercase()]
+        };
+        let skipped_repos = parsed.by_repo.len()
+            - repos
+                .iter()
+                .filter(|r| parsed.by_repo.contains_key(*r))
+                .count();
+        for repo in &repos {
+            let rows = parsed.by_repo.remove(repo).unwrap_or_default();
+            let events = fleet_events::events_path(&root, repo);
+            let mut log = EventLog::open(&events)?;
+            let appended = log.append(&rows)?;
+            println!(
+                "[eta fleet events] {repo} {SOURCE_WEBHOOK_MIRROR}: {} row(s) read, {appended} appended, {} cached ({})",
+                rows.len(),
+                log.len(),
+                events.display(),
+            );
+        }
+        println!(
+            "[eta fleet events] {SOURCE_WEBHOOK_MIRROR}: skipped {} row(s) of another kind, {} unparseable, {} other repo(s)",
+            parsed.other_kind, parsed.unparseable, skipped_repos
+        );
+        Ok(())
+    }
+}
+
 fn parse_endpoint(name: &str) -> Result<ForgeEndpoint, String> {
     ForgeEndpoint::from_name(name).ok_or_else(|| {
         let known: Vec<&str> = ForgeEndpoint::ALL.iter().map(|e| e.name()).collect();
@@ -191,6 +254,15 @@ pub(crate) struct FleetStateArgs {
     /// Print the whole state as JSON.
     #[arg(long)]
     pub json: bool,
+
+    /// Replay only rows of this source (`forge` or `webhook-mirror`).
+    /// Default: every cached row. Any other value is rejected.
+    #[arg(
+        long,
+        value_name = "SOURCE",
+        value_parser = [fleet_events::SOURCE_FORGE, SOURCE_WEBHOOK_MIRROR]
+    )]
+    pub source: Option<String>,
 }
 
 impl FleetStateArgs {
@@ -207,7 +279,10 @@ impl FleetStateArgs {
                 path.display()
             );
         }
-        let events = fleet_events::load_events(&path);
+        let mut events = fleet_events::load_events(&path);
+        if let Some(source) = &self.source {
+            events.retain(|e| &e.source == source);
+        }
         let state = fleet_state(&events, &repo, as_of);
         if self.json {
             println!("{}", serde_json::to_string_pretty(&state)?);
