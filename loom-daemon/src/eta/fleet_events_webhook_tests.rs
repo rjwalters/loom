@@ -285,6 +285,53 @@ fn pr_work_ignores_imported_webhook_rows() {
     assert_eq!(pr_work(&mixed, REPO), before);
 }
 
+/// The star's training inputs (#10372) read forge rows only: an import moves
+/// neither coverage floor and adds no star change.
+#[test]
+fn star_inputs_ignore_imported_webhook_rows() {
+    use crate::eta::star::RepoStar;
+    const STAR: &str = "loom:operator-priority";
+
+    let forge = |item: u32, item_kind: ItemKind, kind: EventKind, label: Option<&str>, at: &str| {
+        RawEvent::new(
+            REPO,
+            item,
+            item_kind,
+            kind,
+            label.map(str::to_string),
+            t(at),
+            SOURCE_FORGE,
+            0,
+            fetched(),
+        )
+    };
+    let forge_rows = vec![
+        forge(5, ItemKind::Issue, EventKind::Opened, None, "2026-09-05T00:00:00Z"),
+        forge(7, ItemKind::Pr, EventKind::ClosingRef, Some("closes"), "2026-09-05T01:00:00Z")
+            .with_target(Some(5)),
+        forge(5, ItemKind::Issue, EventKind::LabelAdded, Some(STAR), "2026-09-06T00:00:00Z"),
+    ];
+    let webhook = parse_export(
+        &jsonl(&[
+            // Before the forge window, and a duplicate of the forge's star.
+            row(60, "2026-06-01T00:00:00Z", "issue", 5, "labeled", Some(STAR)),
+            row(61, "2026-09-06T00:00:03Z", "issue", 5, "labeled", Some(STAR)),
+            row(62, "2026-09-07T00:00:00Z", "issue", 6, "labeled", Some(STAR)),
+        ]),
+        fetched(),
+    )
+    .by_repo[REPO]
+        .clone();
+    let before = RepoStar::from_events(&forge_rows);
+    let mut mixed = forge_rows;
+    mixed.extend(webhook);
+    let after = RepoStar::from_events(&mixed);
+    assert_eq!(after.issue_events_from, before.issue_events_from);
+    assert_eq!(after.links_from, before.links_from);
+    assert_eq!(after.issue_stars, before.issue_stars);
+    assert_eq!(after.links, before.links);
+}
+
 #[test]
 fn rows_at_or_after_t_do_not_change_fleet_state() {
     let rows = export();
