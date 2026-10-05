@@ -298,6 +298,18 @@ provision_loom_hooks() {
         local htype="${_PHOOK_TYPES[$i]}"
         local matcher="${_PHOOK_MATCHERS[$i]}"
         local name="${_PHOOK_NAMES[$i]}"
+        # guards.enabled master opt-out (#10335). Per-repo `guards.enabled:false`
+        # needs no install-time action here: these user-scope wrappers exec the
+        # hook with LOOM_PROJECT_ROOT, and each guard hook early-exits allow for
+        # an opted-out repo. An install-time LOOM_GUARDS_ENABLED=0 additionally
+        # skips writing the three guard entries into user-scope settings at all.
+        case "${LOOM_GUARDS_ENABLED:-}:$name" in
+            0:guard-destructive.sh|0:guard-loom-workflow.sh|0:guard-worktree-paths.sh|\
+            false:guard-destructive.sh|false:guard-loom-workflow.sh|false:guard-worktree-paths.sh|\
+            no:guard-destructive.sh|no:guard-loom-workflow.sh|no:guard-worktree-paths.sh)
+                _phook_ok "skipped $name (LOOM_GUARDS_ENABLED opt-out)"
+                continue ;;
+        esac
         local cmd
         cmd="$(_phook_cmd "$name")"
         if _phook_merge_one "$settings" "$htype" "$matcher" "defaults/hooks/$name" "$cmd" "" "$_PHOOK_WRAPPER_MARKER"; then
@@ -382,6 +394,27 @@ _phook_merge_one() {
     return 1
 }
 
+# _phook_guards_disabled <repo_root>
+#
+# True (0) only on an EXPLICIT guards opt-out (#10335): LOOM_GUARDS_ENABLED=0|
+# false|no, or boolean `guards.enabled: false` in <repo>/.loom/config.json (the
+# tracked .loom-project/project.json tier, when present, overrides it).
+_phook_guards_disabled() {
+    case "${LOOM_GUARDS_ENABLED:-}" in
+        0|false|no) return 0 ;;
+        1|true|yes) return 1 ;;
+    esac
+    local root="$1" f v=""
+    command -v jq >/dev/null 2>&1 || return 1
+    for f in "$root/.loom/config.json" "$root/.loom-project/project.json"; do
+        [[ -f "$f" ]] || continue
+        local got
+        got=$(jq -r 'try (if .guards.enabled == false then "false" elif .guards.enabled == true then "true" else empty end) catch empty' "$f" 2>/dev/null) || got=""
+        [[ -n "$got" ]] && v="$got"
+    done
+    [[ "$v" == "false" ]]
+}
+
 # ensure_project_hook_wiring <target> [settings_rel]
 #
 # Guarantee that a target repo which still carries per-repo `.loom/hooks/<name>`
@@ -457,9 +490,35 @@ ensure_project_hook_wiring() {
         }
     fi
 
+    # guards.enabled:false master opt-out (#10335): do not (re)add the three
+    # guard entries, and strip ones a previous install wrote (foreign hooks and
+    # non-guard Loom hooks are preserved).
+    local guards_off=false
+    if _phook_guards_disabled "$target"; then
+        guards_off=true
+        local pruned
+        if pruned=$(jq '
+            def isguard: (.command // "") | test("\\.loom/hooks/guard-(destructive|loom-workflow|worktree-paths)\\.sh");
+            if .hooks then
+              .hooks |= (with_entries(.value |= (map(.hooks |= map(select(isguard | not))) | map(select((.hooks // []) | length > 0))))
+                         | with_entries(select(.value | length > 0)))
+              | if (.hooks | length) == 0 then del(.hooks) else . end
+            else . end' "$settings" 2>/dev/null) && [[ -n "$pruned" ]]; then
+            if [[ "$pruned" != "$(jq . "$settings")" ]]; then
+                printf '%s\n' "$pruned" > "$settings" 2>/dev/null || _phook_warn "could not update $settings."
+                _phook_ok "guards.enabled:false — removed Loom guard entries from $settings"
+            fi
+        fi
+    fi
+
     local soft_fail=0 wired=0
     for i in "${!_PHOOK_NAMES[@]}"; do
         local name="${_PHOOK_NAMES[$i]}"
+        if [[ "$guards_off" == "true" ]]; then
+            case "$name" in
+                guard-destructive.sh|guard-loom-workflow.sh|guard-worktree-paths.sh) continue ;;
+            esac
+        fi
         # Only wire a hook whose script is actually present on disk — a missing
         # copy (e.g. the #4041 vendored generic guard the installer deliberately
         # skips) must not get a dangling project-level entry.

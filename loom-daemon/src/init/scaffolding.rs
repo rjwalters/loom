@@ -871,6 +871,65 @@ pub fn remove_loom_hooks(settings: &mut Value) {
     }
 }
 
+/// Hook script basenames governed by the `guards.enabled` master switch
+/// (issue #10335).
+const GUARD_HOOK_SCRIPTS: [&str; 3] = [
+    "guard-destructive.sh",
+    "guard-loom-workflow.sh",
+    "guard-worktree-paths.sh",
+];
+
+/// Remove only the Loom-owned PreToolUse *guard* hooks (the three scripts in
+/// [`GUARD_HOOK_SCRIPTS`]) from a settings.json value, preserving every other
+/// Loom hook and all foreign hooks. Used when a repo sets `guards.enabled:false`.
+pub fn remove_loom_guard_hooks(settings: &mut Value) {
+    let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return;
+    };
+    for matchers in hooks.values_mut().filter_map(|m| m.as_array_mut()) {
+        for entry in matchers.iter_mut() {
+            if let Some(arr) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                arr.retain(|hook| {
+                    let cmd = hook.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                    !(is_loom_hook_command(cmd)
+                        && GUARD_HOOK_SCRIPTS.iter().any(|g| cmd.contains(g)))
+                });
+            }
+        }
+        matchers.retain(|e| {
+            !e.get("hooks")
+                .and_then(|h| h.as_array())
+                .is_some_and(Vec::is_empty)
+        });
+    }
+    hooks.retain(|_, v| !v.as_array().is_some_and(Vec::is_empty));
+    if hooks.is_empty() {
+        if let Some(obj) = settings.as_object_mut() {
+            obj.remove("hooks");
+        }
+    }
+}
+
+/// When `guards.enabled:false`, strip Loom's guard hooks from the project
+/// `.claude/settings.json` that install/upgrade just wrote (issue #10335).
+fn apply_guard_opt_out(workspace_path: &Path, settings_path: &Path) {
+    if !crate::config_resolver::guards_master_disabled(workspace_path) {
+        return;
+    }
+    let Some(mut settings) = read_existing_settings(settings_path) else {
+        return;
+    };
+    let before = settings.clone();
+    remove_loom_guard_hooks(&mut settings);
+    if settings != before {
+        if let Ok(pretty) = serde_json::to_string_pretty(&settings) {
+            if let Err(e) = fs::write(settings_path, pretty) {
+                eprintln!("Warning: Failed to write settings.json after guards opt-out: {e}");
+            }
+        }
+    }
+}
+
 /// Remove Loom-specific permissions from a settings.json value.
 ///
 /// Removes permissions that match Loom's default permission list exactly, plus
@@ -1400,6 +1459,9 @@ pub fn setup_repository_scaffolding(
         }
     }
 
+    // guards.enabled:false opt-out (#10335): never leave Loom guard hooks wired.
+    apply_guard_opt_out(workspace_path, &claude_dst.join("settings.json"));
+
     // Copy .codex/ directory
     copy_directory(
         &defaults_path.join(".codex"),
@@ -1680,6 +1742,11 @@ fn files_not_in(dir: &Path, other: &Path) -> Result<Vec<String>, String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+
+// Sibling module for the `guards.enabled` opt-out (#10335), same ratchet reason.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod guard_opt_out_tests;
 
 // A new sibling module rather than growing `scaffolding/tests.rs` in place —
 // that file sits exactly at its file-size ratchet baseline

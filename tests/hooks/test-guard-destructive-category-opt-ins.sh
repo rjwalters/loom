@@ -47,6 +47,18 @@ assert_deny "SQL malformed-config: block DROP TABLE (fall through to on)" \
 assert_deny "SQL malformed-config: block DELETE FROM without WHERE" \
     "psql -c 'DELETE FROM users;'" "$SQL_BAD_REPO"
 
+# --- #10335: quoted probe text is inert; executed/bare DELETE still blocked ---
+assert_allow "SQL #10335: allow DELETE FROM inside a quoted commit message" \
+    "git commit -m 'probe: DELETE FROM users'" "$SQL_ABSENT_REPO"
+assert_allow "SQL #10335: allow quoted DELETE FROM probe passed to a test runner" \
+    "bash tests/run.sh --case \"DELETE FROM users;\"" "$SQL_ABSENT_REPO"
+assert_deny "SQL #10335: still block bare DELETE FROM" \
+    "DELETE FROM users;" "$SQL_ABSENT_REPO"
+assert_deny "SQL #10335: still block quoted DELETE FROM piped to sqlite3" \
+    "printf 'DELETE FROM users' | sqlite3 db" "$SQL_ABSENT_REPO"
+assert_deny "SQL #10335: still block DELETE FROM after an apostrophe (unbalanced quote)" \
+    "echo it's; DELETE FROM users;" "$SQL_ABSENT_REPO"
+
 # --- Opt-out via config: all five SQL cases pass through as allow ---
 assert_allow "SQL config-off: allow DROP DATABASE" \
     "psql -c 'DROP DATABASE mydb;'" "$SQL_OFF_REPO"

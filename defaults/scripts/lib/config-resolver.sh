@@ -142,3 +142,21 @@ loom_config_get() {
         echo "$value"
     fi
 }
+
+# loom_guards_master_enabled <repo_root>
+#
+# Master switch for Loom's PreToolUse guard hooks (guard-destructive.sh,
+# guard-loom-workflow.sh, guard-worktree-paths.sh) -- issue #10335. Returns 1
+# (guards OFF) only on an EXPLICIT opt-out; returns 0 (guards ON) otherwise.
+#   1. LOOM_GUARDS_ENABLED env: 0/false/no -> off, 1/true/yes -> on
+#   2. guards.enabled in the resolved tier chain: boolean `false` -> off
+#   3. default: on (absent key, non-boolean value, malformed config, no jq)
+# Per-category toggles (guards.sqlDdl, ...) are unaffected when this is on.
+loom_guards_master_enabled() {
+    case "${LOOM_GUARDS_ENABLED:-}" in
+        0|false|no)  return 1 ;;
+        1|true|yes)  return 0 ;;
+    esac
+    [[ -n "${1:-}" ]] || return 0
+    [[ "$(loom_config_get "$1" "guards.enabled" "true" 2>/dev/null)" != "false" ]]
+}

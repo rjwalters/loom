@@ -666,6 +666,34 @@ NONLOOM25=$(mktemp -d); git -C "$NONLOOM25" init -q
 out=$(cd "$NONLOOM25" && LOOM_HOME="$CHK25" LOOM_DAEMON_SELF_BIN="$FAKE25" bash -c "$CMD25" </dev/null 2>&1); rc=$?
 assert_eq "$out|$rc|$(cat "$ARGV25")" "|0|" "non-Loom repo: the wrapper never runs the stub (PATH untouched)"
 
+
+# ── Test 26: guards.enabled:false opt-out (#10335) ────────────────────────────
+echo "Test 26: guards.enabled:false keeps the guard entries out of project settings and strips stale ones (#10335)"
+R26=$(mktemp -d)
+make_transition_repo "$R26"
+mkdir -p "$R26/.loom"
+echo '{"guards":{"enabled":false}}' > "$R26/.loom/config.json"
+cat > "$R26/.claude/settings.json" <<'EOF2'
+{ "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [
+  { "type": "command", "command": "\"${CLAUDE_PROJECT_DIR}/.loom/hooks/guard-destructive.sh\"" },
+  { "type": "command", "command": ".claude/hooks/foreign.sh" }
+] } ] } }
+EOF2
+S26="$R26/.claude/settings.json"
+ensure_project_hook_wiring "$R26" >/dev/null 2>&1
+ensure_project_hook_wiring "$R26" >/dev/null 2>&1
+assert_eq "$(count_project_entry "$S26" guard-destructive.sh)" "0" "stale guard-destructive entry stripped under the opt-out"
+assert_eq "$(count_project_entry "$S26" guard-loom-workflow.sh)" "0" "guard-loom-workflow entry not added under the opt-out"
+assert_eq "$(count_project_entry "$S26" guard-worktree-paths.sh)" "0" "guard-worktree-paths entry not added under the opt-out"
+assert_contains "$(cat "$S26")" ".claude/hooks/foreign.sh" "foreign hook preserved"
+echo '{"guards":{"enabled":true}}' > "$R26/.loom/config.json"
+ensure_project_hook_wiring "$R26" >/dev/null 2>&1
+assert_eq "$(count_project_entry "$S26" guard-destructive.sh)" "1" "guards re-wired once the opt-out is removed"
+HOME26=$(mktemp -d)
+LOOM_GUARDS_ENABLED=0 provision_loom_hooks "$HOME26/.claude" >/dev/null 2>&1
+assert_eq "$(count_marker "$HOME26/.claude/settings.json" guard-destructive.sh)" "0" "LOOM_GUARDS_ENABLED=0 skips the user-scope guard-destructive entry"
+assert_eq "$(count_marker "$HOME26/.claude/settings.json" guard-mcp-tools.sh)" "1" "non-master-switch hooks still wired"
+rm -rf "$R26" "$HOME26"
 echo ""
 echo "======================================"
 echo "test-provision-hooks.sh: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"

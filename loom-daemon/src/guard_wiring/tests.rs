@@ -193,3 +193,14 @@ fn this_repository_satisfies_the_wiring_contract() {
             .join("\n\n")
     );
 }
+
+/// Issue #10335: a repo that opted out of the guards (`guards.enabled:false`)
+/// has no guard wiring to audit, so it must not be reported as missing it.
+#[test]
+fn opted_out_repo_is_not_reported_as_missing_guards() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+    std::fs::write(dir.path().join(".loom/config.json"), r#"{"guards":{"enabled":false}}"#)
+        .unwrap();
+    assert!(check(dir.path()).is_empty());
+}
