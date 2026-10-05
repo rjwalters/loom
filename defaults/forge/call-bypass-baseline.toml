@@ -284,7 +284,7 @@ owner = "daemon-fleet"
 removal_issue = 9799
 
 [[bypass]]
-path = "loom-daemon/src/fleet/drain.rs"
+path = "loom-daemon/src/fleet/drain_gh.rs"
 calls = 5
 owner = "daemon-fleet"
 removal_issue = 9799
