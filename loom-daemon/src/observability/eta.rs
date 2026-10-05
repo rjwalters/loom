@@ -701,12 +701,45 @@ pub fn pr_links(listings: &[Vec<RestIssue>]) -> Vec<(u32, Vec<u32>)> {
 }
 
 /// The open issues carrying a star label at any level: one ETag-conditional
-/// listing per label, the work finder's own (a `304` costs no rate limit).
-/// `None` if any listing failed.
+/// listing per label, the work finder's own URLs (a `304` costs no rate
+/// limit), walked past page 1 (#10389): a repo can have more than one page
+/// of starred items, and an issue past it must not read as unstarred. `None`
+/// if any listing failed or was incomplete: unknown, never unstarred.
 async fn starred_issues(root: &Path) -> Option<Vec<u32>> {
+    let root = root.to_path_buf();
+    let shown = root.display().to_string();
+    let labels = crate::operator_levels::starred_labels(crate::operator_levels::table());
+    let result = tokio::task::spawn_blocking(move || {
+        let gh = PathBuf::from(crate::gh_invocation::gh_bin());
+        read_starred_issues(&gh, &root, &labels)
+    })
+    .await;
+    match result {
+        Ok(Ok(issues)) => Some(issues),
+        Ok(Err(error)) => {
+            log::debug!("eta: starred-issue listing in {shown} failed: {error:#}");
+            None
+        }
+        Err(join_error) => {
+            log::debug!("eta: starred-issue listing in {shown} panicked: {join_error}");
+            None
+        }
+    }
+}
+
+/// [`starred_issues`]' reads: every page of each label's listing, issues
+/// only, deduplicated. An error when any walk is incomplete.
+fn read_starred_issues(gh: &Path, root: &Path, labels: &[&str]) -> anyhow::Result<Vec<u32>> {
     let mut issues = BTreeSet::new();
-    for label in crate::operator_levels::starred_labels(crate::operator_levels::table()) {
-        let listing = super::queue_blocked::list_open(root.to_path_buf(), label, "eta").await?;
+    for label in labels {
+        let listing = crate::forge_listing::list_issues_cached_all_as(
+            "eta",
+            gh,
+            Some(root),
+            None,
+            label,
+            "open",
+        )?;
         issues.extend(
             listing
                 .iter()
@@ -714,7 +747,7 @@ async fn starred_issues(root: &Path) -> Option<Vec<u32>> {
                 .map(|i| i.number),
         );
     }
-    Some(issues.into_iter().collect())
+    Ok(issues.into_iter().collect())
 }
 
 fn gh_json(root: &Path, path: &str) -> Option<serde_json::Value> {

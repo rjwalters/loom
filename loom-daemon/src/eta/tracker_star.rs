@@ -3,11 +3,12 @@
 //! A pass hands the tracker, per repo, the links of every listed PR
 //! (`linkage_refs` of its body, the work finder's rule) and the open issues
 //! carrying a star label (one ETag-conditional listing per star label, the
-//! work finder's own URLs). The book stamps every observation with the
-//! pass's instant and keeps the history: a link is known from the first pass
-//! that saw it, a star from the first pass that listed the issue, an unstar
-//! from the first pass that did not. [`star_state_at`] reads it with
-//! `cutoff = as_of`, so an observation at or after `as_of` is never used.
+//! work finder's own URLs, every page: #10389). The book stamps every
+//! observation with the pass's instant and keeps the history: a link is known
+//! from the first pass that saw it, a star from the first pass that listed the
+//! issue, an unstar from the first pass that did not. [`star_state_at`] reads
+//! it with `cutoff = as_of`, so an observation at or after `as_of` is never
+//! used.
 //!
 //! A repo whose star listing failed on a pass is not updated by it
 //! (`starred = None`): coverage is not falsity. A repo with no successful

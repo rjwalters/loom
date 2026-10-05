@@ -80,6 +80,10 @@ pub struct FitReport {
     /// Rows whose PR-or-issue star is unknown (#10372): no raw event cache
     /// coverage at their cutoff.
     pub rows_star_unknown: usize,
+    /// Rows starred by the PR or a linked issue (#10389).
+    pub rows_starred_any: usize,
+    /// Rows starred only through a linked issue.
+    pub rows_star_issue_only: usize,
     /// Old files removed by retention.
     pub pruned: usize,
 }
@@ -204,6 +208,8 @@ fn fit_loaded(
         rows_dropped_missing: assembled.stats.rows_dropped_missing,
         rows_dropped_no_flags: assembled.stats.rows_dropped_no_flags,
         rows_star_unknown: assembled.stats.rows_star_unknown,
+        rows_starred_any: assembled.stats.rows_starred_any,
+        rows_star_issue_only: assembled.stats.rows_star_issue_only,
         pruned,
     })
 }

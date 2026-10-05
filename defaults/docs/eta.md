@@ -698,7 +698,10 @@ it links whose link **and** star were both known before `cutoff`.
   `T`. Training reads forge issue `label_added` / `label_removed` rows; serving
   reads one ETag-conditional listing per star label per pass, for repos with
   at least one tracked PR only (the work finder's URLs), and stamps changes
-  at the pass.
+  at the pass. The listing walks every page
+  (`forge_listing::list_issues_cached_all_as`, #10389; page 1 is the work
+  finder's own cache entry): a repo can have more than 100 starred items. A
+  failed or incomplete walk records nothing: unknown, not unstarred.
 - **Known skew: closed issues.** Serving lists only *open* starred issues, so
   a linked issue that closes while still labeled reads as an unstar from that
   pass on. Training replays label events only and keeps it starred until a
@@ -706,7 +709,8 @@ it links whose link **and** star were both known before `cutoff`.
   affects the recorded `starred_any` / `star_source`, never the model.
 - **Unknown coverage**: a repo whose raw cache has no pulls (link) or
   issue-events rows before `cutoff` gives an unknown state (`null`, counted in
-  `rows_star_unknown`), never "unstarred". Serving records nothing for a repo
+  `rows_star_unknown`), never "unstarred". `eta fit` also prints
+  `rows_starred_any` and `rows_star_issue_only` (starred only through an issue). Serving records nothing for a repo
   with no star observation within the last hour.
 - **Not a model input.** Twin-otter's `starred` feature is still the PR's own
   flag, and coefficient files are byte-identical. The result is recorded as

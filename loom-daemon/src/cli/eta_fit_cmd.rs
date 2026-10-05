@@ -102,6 +102,11 @@ fn render(report: &FitReport) -> String {
         report.rows_dropped_no_flags,
         report.pruned
     );
+    let _ = writeln!(
+        out,
+        "  star (recorded, not a model input): starred_any={} issue_only={} unknown={}",
+        report.rows_starred_any, report.rows_star_issue_only, report.rows_star_unknown
+    );
     if report.rows_dropped_no_flags > 0 {
         let _ = writeln!(
             out,
@@ -204,5 +209,6 @@ mod tests {
         }
         assert!(text.contains("data_through: 2026-09-20T23:58:00+00:00"), "{text}");
         assert!(text.starts_with("eta fit dry run"), "{text}");
+        assert!(text.contains("star (recorded, not a model input): starred_any="), "{text}");
     }
 }

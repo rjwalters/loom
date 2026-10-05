@@ -177,3 +177,20 @@ fn a_tracker_with_no_star_observation_records_nothing() {
     let (any, source) = served(&mut tracker, &specs[0]);
     assert_eq!((any, source), (None, None));
 }
+
+/// The fit's star row counts (#10389): issue-only rows are counted apart,
+/// and vanish without the issue-star rows; a row is never both known
+/// starred and unknown.
+#[test]
+fn the_fit_counts_starred_and_issue_only_rows() {
+    let specs = specs();
+    let with = trained(&specs, true).stats;
+    assert!(with.rows_star_issue_only > 0, "{with:?}");
+    assert!(with.rows_starred_any > with.rows_star_issue_only, "{with:?}");
+    let without = trained(&specs, false).stats;
+    assert_eq!(without.rows_star_issue_only, 0, "{without:?}");
+    assert!(without.rows_starred_any > 0, "the PR's own stars: {without:?}");
+    let unknown = rows::build_with_star(&snapshots(&specs), cutoff(), Some(&StarInputs::default()));
+    assert_eq!(unknown.stats.rows_starred_any, 0);
+    assert_eq!(unknown.stats.rows_star_issue_only, 0);
+}
