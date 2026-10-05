@@ -21,6 +21,7 @@ fn row() -> EtaSnapshotRow {
         as_of: Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 0).unwrap(),
         stage: Some(Stage::ReviewWait),
         no_estimate_reason: None,
+        alternates: Vec::new(),
     }
 }
 
@@ -152,4 +153,87 @@ fn missing_optional_fields_decode_to_the_safe_default() {
     assert_eq!(decoded.rows[0].visibility, RepoVisibility::Private);
     assert_eq!(decoded.rows[0].kind, Kind::Start);
     assert_eq!(decoded.rows[0].stage, None);
+}
+
+fn alt_estimating() -> EtaSnapshotAlternate {
+    EtaSnapshotAlternate {
+        heuristic: "land-2026-10-04-twin-otter".to_string(),
+        estimate_id: "0a1b2c3d4e5f6071".to_string(),
+        as_of: Utc.with_ymd_and_hms(2026, 9, 30, 12, 5, 0).unwrap(),
+        p25: Some(100),
+        p50: Some(200),
+        p75: Some(300),
+        p90: Some(400),
+        no_estimate_reason: None,
+    }
+}
+
+fn alt_refusing() -> EtaSnapshotAlternate {
+    EtaSnapshotAlternate {
+        p25: None,
+        p50: None,
+        p75: None,
+        p90: None,
+        no_estimate_reason: Some(NoEstimateReason::NoModel),
+        ..alt_estimating()
+    }
+}
+
+fn keys(v: &serde_json::Value) -> Vec<String> {
+    let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+    k.sort();
+    k
+}
+
+/// A row with no alternates serializes with no `alternates` key.
+#[test]
+fn a_row_without_alternates_omits_the_key() {
+    let wire = serde_json::to_value(row()).unwrap();
+    assert!(wire.get("alternates").is_none(), "{wire}");
+}
+
+#[test]
+fn an_alternate_carries_exactly_the_agreed_fields() {
+    let est = serde_json::to_value(alt_estimating()).unwrap();
+    assert_eq!(
+        keys(&est),
+        [
+            "as_of",
+            "estimate_id",
+            "heuristic",
+            "p25",
+            "p50",
+            "p75",
+            "p90"
+        ]
+    );
+    let refusal = serde_json::to_value(alt_refusing()).unwrap();
+    assert_eq!(keys(&refusal), ["as_of", "estimate_id", "heuristic", "no_estimate_reason"]);
+    assert_eq!(refusal["no_estimate_reason"], "no_model");
+}
+
+/// Shape pinned against loom-ui `test/etaState.test.ts`
+/// "normalizeEtaSnapshot alternates (#1669)": integer seconds, RFC 3339
+/// `as_of`, `{heuristic, estimate_id, p25, p50, p75}` / `{..., no_estimate_reason}`.
+#[test]
+fn alternates_round_trip_and_match_the_loom_ui_fixture_shape() {
+    let with = EtaSnapshotRow {
+        alternates: vec![alt_estimating(), alt_refusing()],
+        ..row()
+    };
+    let wire = serde_json::to_value(&with).unwrap();
+    let a = &wire["alternates"];
+    assert!(a[0]["p50"].is_i64());
+    assert_eq!(a[0]["as_of"], "2026-09-30T12:05:00Z");
+    assert_eq!(a[0]["heuristic"], "land-2026-10-04-twin-otter");
+    assert!(a[1].get("p50").is_none());
+    assert_eq!(a[1]["no_estimate_reason"], "no_model");
+    let back: EtaSnapshotRow = serde_json::from_value(wire).unwrap();
+    assert_eq!(back, with);
+
+    // An older row (no `alternates`) decodes to an empty list.
+    let mut old = serde_json::to_value(row()).unwrap();
+    old.as_object_mut().unwrap().remove("alternates");
+    let back: EtaSnapshotRow = serde_json::from_value(old).unwrap();
+    assert!(back.alternates.is_empty());
 }
