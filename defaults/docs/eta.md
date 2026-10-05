@@ -680,6 +680,41 @@ whenever a replayed case was tail-extrapolated, so a tail guess never hides
 inside the ordinary accuracy. Every new field is additive and absent when
 unset: no schema bump.
 
+### Starred at `t`: PR or linked issue (#10372)
+
+`eta::star::star_state_at` is the one definition of "starred" for a PR at an
+instant, used by the fit (`fit/rows.rs`, `cutoff = t - 120 s`) and by serving
+(the tracker, `cutoff = as_of`): the PR's own `pr_flags` star **or** any issue
+it links whose link **and** star were both known before `cutoff`.
+
+- **Link rule**: `worktree_ops::gh::linkage_refs` of the PR body, every linked
+  issue, closing keywords and `Part of` / `Contributes to` (the work finder's
+  rule). Training reads the raw event cache's `closing_ref` rows (known at the
+  PR's `created_at`); serving stamps a link at the first pass that saw it.
+- **Knowable-at**: a fact at `a` is usable iff `a < cutoff`. An issue's star
+  run counts from the later of its labeled-at time and the link's known-at
+  time, so a link or star that becomes known after `T` never stars a row at
+  `T`. Training reads issue `label_added` / `label_removed` rows; serving
+  reads one ETag-conditional listing per star label per pass, for repos with
+  at least one tracked PR only (the work finder's URLs), and stamps changes
+  at the pass.
+- **Known skew: closed issues.** Serving lists only *open* starred issues, so
+  a linked issue that closes while still labeled reads as an unstar from that
+  pass on. Training replays label events only and keeps it starred until a
+  `label_removed`. This is rare while the linking PR is still open; it only
+  affects the recorded `starred_any` / `star_source`, never the model.
+- **Unknown coverage**: a repo whose raw cache has no pulls (link) or
+  issue-events rows before `cutoff` gives an unknown state (`null`, counted in
+  `rows_star_unknown`), never "unstarred". Serving records nothing for a repo
+  with no star observation within the last hour.
+- **Not a model input.** Twin-otter's `starred` feature is still the PR's own
+  flag, and coefficient files are byte-identical. The result is recorded as
+  `starred_any` (bool) and `star_source` (`none` / `pr` / `issue` / `both`) on
+  each training row and in an estimate's `features` (absent when unknown), so
+  the late surprise of issue-starred items can be queried without a new model.
+  Using `starred_any` as the model input changes the coefficient's meaning and
+  needs a new datestamped heuristic (follow-up #10379).
+
 ## The explanation (`eta-explanation/v1`)
 
 The heuristic builds the explanation first and computes the numbers from it,

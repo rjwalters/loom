@@ -9,6 +9,8 @@ use super::fit_rows::{approve, open, snapshot, OPERATOR, OTHER, REPO, STAR};
 use crate::eta::fit::coeffs::{self, Fitter};
 use crate::eta::fit::{fit_dir, path_for, rows, run};
 use crate::eta::fleet::{self, FleetSnapshot};
+use crate::eta::fleet_events::{EventKind, ItemKind, RawEvent, SOURCE_FORGE};
+use crate::eta::star::{RepoStar, StarInputs};
 use crate::eta::Stage;
 use crate::pr_latency::history::fixtures::{labeled, t, unlabeled};
 use crate::pr_latency::history::{PrEvent, PrHistory, PrState};
@@ -459,4 +461,122 @@ fn the_daily_refit_fits_once_per_day() {
         rows::data_horizon(&fleet::load_all(stale.path()), end()),
         end() - Duration::hours(1)
     );
+}
+
+// -- the PR-or-issue star (#10372) ---------------------------------------------
+
+fn raw(
+    item: u32,
+    kind_item: ItemKind,
+    kind: EventKind,
+    label: Option<&str>,
+    at: DateTime<Utc>,
+) -> RawEvent {
+    RawEvent::new(REPO, item, kind_item, kind, label.map(str::to_string), at, SOURCE_FORGE, 1, at)
+}
+
+fn link(pr: u32, issue: u32, at: DateTime<Utc>) -> RawEvent {
+    raw(pr, ItemKind::Pr, EventKind::ClosingRef, Some("closes"), at).with_target(Some(issue))
+}
+
+/// The star scenario: #9001 (open across `T`) links issue 77, starred at
+/// `T − 7 h`; #9002 is open across `T` too and, in the baseline, links nothing.
+fn star_fleet() -> Fleet {
+    let mut fleet = Fleet::baseline();
+    fleet.a.push(open(9002, across_events()));
+    fleet
+}
+
+fn star_events(extra: &[RawEvent]) -> Vec<RawEvent> {
+    let mut events = vec![
+        raw(77, ItemKind::Issue, EventKind::Opened, None, t(0)),
+        link(9001, 77, end() - Duration::hours(9)),
+        raw(
+            77,
+            ItemKind::Issue,
+            EventKind::LabelAdded,
+            Some(STAR),
+            end() - Duration::hours(7),
+        ),
+    ];
+    events.extend_from_slice(extra);
+    events
+}
+
+/// The rows (every column, as `Debug`) with the star inputs read from `events`.
+fn star_rows(events: &[RawEvent]) -> (String, rows::Assembled) {
+    let mut inputs = StarInputs::default();
+    inputs
+        .repos
+        .insert(REPO.to_string(), RepoStar::from_events(events));
+    let a = rows::build_with_star(&star_fleet().snapshots(), end(), Some(&inputs));
+    (format!("{:?}", a.rows), a)
+}
+
+#[test]
+fn the_star_baseline_is_not_vacuous_and_the_file_is_unchanged() {
+    let (_, a) = star_rows(&star_events(&[]));
+    let starred = |pr: u32| {
+        a.rows
+            .iter()
+            .zip(&a.row_keys)
+            .filter(|(_, k)| k.pr == pr && k.repo == REPO)
+            .filter_map(|(r, _)| r.starred_any)
+            .collect::<Vec<_>>()
+    };
+    assert!(starred(9001).iter().any(|s| *s), "the issue star reaches 9001's rows");
+    assert!(starred(9002).iter().all(|s| !*s) && !starred(9002).is_empty());
+    // Recording the star moves no coefficient.
+    let snapshots = star_fleet().snapshots();
+    let mut inputs = StarInputs::default();
+    inputs
+        .repos
+        .insert(REPO.to_string(), RepoStar::from_events(&star_events(&[])));
+    let with = run::fit_snapshots_with_star(&snapshots, end(), &fitter(), Some(&inputs)).0;
+    assert_eq!(coeffs::to_json(&with), bytes(&snapshots));
+}
+
+#[test]
+fn an_issue_starred_at_t_minus_lag_plus_1s_leaves_every_row_byte_identical() {
+    // #9002 links issue 78 at `T − 9 h`; 78 is NOT starred in this baseline, so
+    // a leaked late star would flip 9002's rows (a star on the already-starred
+    // 77 would be a no-op and could not detect the leak).
+    let linked = link(9002, 78, end() - Duration::hours(9));
+    let star78 = |at| raw(78, ItemKind::Issue, EventKind::LabelAdded, Some(STAR), at);
+    let starred_9002 = |a: &rows::Assembled| {
+        a.rows
+            .iter()
+            .zip(&a.row_keys)
+            .any(|(r, k)| k.pr == 9002 && r.starred_any == Some(true))
+    };
+    let (baseline, a) = star_rows(&star_events(std::slice::from_ref(&linked)));
+    assert!(!starred_9002(&a), "78 is unstarred in the baseline");
+    let late = end() - Duration::seconds(119);
+    let (rows, _) = star_rows(&star_events(&[linked.clone(), star78(late)]));
+    assert_eq!(rows, baseline);
+    // Positive control: the same star on the same linked issue, an hour
+    // earlier, changes the later rows.
+    let (rows, a) = star_rows(&star_events(&[linked, star78(end() - Duration::hours(1))]));
+    assert_ne!(rows, baseline);
+    assert!(starred_9002(&a));
+}
+
+#[test]
+fn a_link_from_a_pr_created_at_t_minus_lag_plus_1s_leaves_every_row_byte_identical() {
+    let (baseline, _) = star_rows(&star_events(&[]));
+    let late = end() - Duration::seconds(119);
+    let (rows, _) = star_rows(&star_events(&[link(9002, 77, late)]));
+    assert_eq!(rows, baseline);
+}
+
+#[test]
+fn the_same_link_an_hour_earlier_changes_the_later_rows() {
+    let (baseline, _) = star_rows(&star_events(&[]));
+    let (rows, a) = star_rows(&star_events(&[link(9002, 77, end() - Duration::hours(1))]));
+    assert_ne!(rows, baseline, "positive control");
+    assert!(a
+        .rows
+        .iter()
+        .zip(&a.row_keys)
+        .any(|(r, k)| k.pr == 9002 && r.starred_any == Some(true)));
 }

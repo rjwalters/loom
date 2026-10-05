@@ -36,6 +36,7 @@ mod score;
 mod shadow;
 mod shadow_gate;
 mod stall;
+mod star_parity;
 mod tracker;
 mod tracker_hold;
 mod twin_otter_parity;

@@ -276,6 +276,8 @@ fn meta() -> FitMeta {
 fn rows(stage: FitStage, n: usize, exits: usize) -> Vec<TrainingRow> {
     (0..n)
         .map(|i| TrainingRow {
+            starred_any: None,
+            star_source: None,
             stage,
             group: format!("g#{i}"),
             inputs: ModelInputs {

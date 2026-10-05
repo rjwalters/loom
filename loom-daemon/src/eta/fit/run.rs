@@ -24,6 +24,7 @@ use super::coeffs::{self, CoefficientFile, FitMeta, FitWindow, Fitter};
 use super::rows::{self, Assembled};
 use super::FitStage;
 use crate::eta::fleet::{self, FleetSnapshot};
+use crate::eta::star::StarInputs;
 use crate::eta::Provenance;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, NaiveTime, Utc};
@@ -76,6 +77,9 @@ pub struct FitReport {
     pub rows_dropped_missing: usize,
     /// Rows dropped for want of a flag timeline (snapshot predates #10245).
     pub rows_dropped_no_flags: usize,
+    /// Rows whose PR-or-issue star is unknown (#10372): no raw event cache
+    /// coverage at their cutoff.
+    pub rows_star_unknown: usize,
     /// Old files removed by retention.
     pub pruned: usize,
 }
@@ -104,7 +108,19 @@ pub fn fit_snapshots(
     as_of: DateTime<Utc>,
     fitter: &Fitter,
 ) -> (CoefficientFile, Assembled) {
-    let assembled = rows::build(snapshots, as_of);
+    fit_snapshots_with_star(snapshots, as_of, fitter, None)
+}
+
+/// [`fit_snapshots`], also recording each row's PR-or-issue star (#10372).
+/// The star is a non-model field: the file is the same either way.
+#[must_use]
+pub fn fit_snapshots_with_star(
+    snapshots: &[FleetSnapshot],
+    as_of: DateTime<Utc>,
+    fitter: &Fitter,
+    star: Option<&StarInputs>,
+) -> (CoefficientFile, Assembled) {
+    let assembled = rows::build_with_star(snapshots, as_of, star);
     let mut window = FitWindow::standard(as_of);
     window.data_through = Some(assembled.data_through);
     let meta = FitMeta {
@@ -149,7 +165,9 @@ fn fit_loaded(
             fleet::snapshot_dir(root).display()
         );
     }
-    let (file, assembled) = fit_snapshots(snapshots, as_of, fitter);
+    let repos: Vec<String> = snapshots.iter().map(|s| s.repo.clone()).collect();
+    let star = StarInputs::load(root, &repos);
+    let (file, assembled) = fit_snapshots_with_star(snapshots, as_of, fitter, Some(&star));
     let dir = coeffs::fit_dir(root);
     let path = out.map_or_else(|| dir.join(coeffs::path_for(as_of)), Path::to_path_buf);
     let mut pruned = 0;
@@ -185,6 +203,7 @@ fn fit_loaded(
         dwells: assembled.dwells.len(),
         rows_dropped_missing: assembled.stats.rows_dropped_missing,
         rows_dropped_no_flags: assembled.stats.rows_dropped_no_flags,
+        rows_star_unknown: assembled.stats.rows_star_unknown,
         pruned,
     })
 }

@@ -681,6 +681,42 @@ pub fn pr_views(listings: &[Vec<RestIssue>]) -> Vec<PrView> {
     views
 }
 
+/// Every listed PR with the issues its body links, by the work finder's rule
+/// (`linkage_refs`: closing keywords and `Part of`), for the star state
+/// (#10372).
+#[must_use]
+pub fn pr_links(listings: &[Vec<RestIssue>]) -> Vec<(u32, Vec<u32>)> {
+    let mut seen = BTreeSet::new();
+    listings
+        .iter()
+        .flatten()
+        .filter(|item| item.is_pull_request && seen.insert(item.number))
+        .map(|item| {
+            (
+                item.number,
+                crate::eta::star::body_links(item.body.as_deref().unwrap_or_default()),
+            )
+        })
+        .collect()
+}
+
+/// The open issues carrying a star label at any level: one ETag-conditional
+/// listing per label, the work finder's own (a `304` costs no rate limit).
+/// `None` if any listing failed.
+async fn starred_issues(root: &Path) -> Option<Vec<u32>> {
+    let mut issues = BTreeSet::new();
+    for label in crate::operator_levels::starred_labels(crate::operator_levels::table()) {
+        let listing = super::queue_blocked::list_open(root.to_path_buf(), label, "eta").await?;
+        issues.extend(
+            listing
+                .iter()
+                .filter(|i| !i.is_pull_request)
+                .map(|i| i.number),
+        );
+    }
+    Some(issues.into_iter().collect())
+}
+
 fn gh_json(root: &Path, path: &str) -> Option<serde_json::Value> {
     let CmdOutcome::Ran(output) = GhInvocation::new(
         Operation::new("api.rest"),
@@ -868,6 +904,10 @@ fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> (Stage
     (history, events)
 }
 
+/// One repo's star observation: slug, each PR's linked issues, and the open
+/// starred issues (`None` when a listing failed or the repo lists no PR).
+type RepoStars = (String, Vec<(u32, Vec<u32>)>, Option<Vec<u32>>);
+
 /// One ETA pass: list, resolve, reload history, estimate, deliver. A no-op
 /// when ETA is disabled.
 pub(super) async fn record(
@@ -884,6 +924,9 @@ pub(super) async fn record(
         roots.push(workspace_root.to_path_buf());
     }
     let mut repos: Vec<(PathBuf, String, Vec<PrView>, Vec<ListedPr>)> = Vec::new();
+    // #10372: per repo, each listed PR's linked issues and the open starred
+    // issues (`None` when any star listing failed: unknown, not unstarred).
+    let mut stars: Vec<RepoStars> = Vec::new();
     let mut seen = BTreeSet::new();
     for root in &roots {
         let Some(slug) =
@@ -903,7 +946,17 @@ pub(super) async fn record(
         }
         // A partial listing would read as PRs leaving review; skip the repo.
         if listings.len() == REVIEW_LABELS.len() {
-            repos.push((root.clone(), slug, pr_views(&listings), listed_prs(&listings)));
+            let links = pr_links(&listings);
+            let listed = listed_prs(&listings);
+            // Only a repo with a tracked PR needs the star listing; `None`
+            // leaves its book untouched (no observation, not "unstarred").
+            let starred = if listed.is_empty() {
+                None
+            } else {
+                starred_issues(root).await
+            };
+            stars.push((slug.clone(), links, starred));
+            repos.push((root.clone(), slug, pr_views(&listings), listed));
         }
     }
     // Before `now`: the fleet view is known strictly before the estimates.
@@ -1008,6 +1061,11 @@ pub(super) async fn record(
             .iter()
             .map(|(_, slug, _, listed)| (slug.clone(), listed.clone()))
             .collect();
+        for (slug, links, starred) in &stars {
+            state
+                .tracker
+                .on_star_context(slug, links, starred.as_deref(), listed_at);
+        }
         state.tracker.on_fleet_context(&fleet, events, listed_at);
     }
 

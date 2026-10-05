@@ -303,6 +303,8 @@ pub struct Tracker {
     pub friction: super::friction::FrictionBook,
     /// Per-pass answer states, drained by the caller (#10233).
     answers: Vec<answers::PassAnswers>,
+    /// What passes observed of PR-to-issue links and issue stars (#10372).
+    star: star_book::StarBook,
 }
 
 /// What [`Tracker::drain_dropped`] reports.
@@ -337,6 +339,7 @@ impl Tracker {
             context: features::PassContext::default(),
             friction: super::friction::FrictionBook::default(),
             answers: Vec::new(),
+            star: star_book::StarBook::default(),
         }
     }
 
@@ -1322,3 +1325,6 @@ pub fn merged(all: Vec<Effects>) -> Effects {
     }
     out
 }
+
+#[path = "tracker_star.rs"]
+mod star_book;

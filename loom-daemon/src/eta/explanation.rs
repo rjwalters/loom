@@ -667,6 +667,16 @@ pub struct Features {
     /// than `pr_flags`' `FLAG_OP_HOLD`; see #10278.
     #[serde(default)]
     pub operator_hold: Option<bool>,
+    /// The PR is starred through its own labels **or** a linked issue, as
+    /// [`crate::eta::star::star_state_at`] decides it (#10372). Recorded for
+    /// analysis only: twin-otter's model `starred` is still the PR's own
+    /// flag. Absent when the star state is unknown (no star observation of
+    /// the repo before `as_of`), and then not in [`Features::NAMES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starred_any: Option<bool>,
+    /// Where the star comes from: `none`, `pr`, `issue` or `both`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub star_source: Option<String>,
 }
 
 /// Why a feature is null.

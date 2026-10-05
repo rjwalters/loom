@@ -55,6 +55,12 @@
 //!   merged)`; else a close at `c < H` is `(max(0, c − t), censored)`; else
 //!   `(H − t, censored)`.
 //!
+//! - **Star** (#10372): `starred_any` / `star_source` come from
+//!   [`crate::eta::star::star_state_at`] at `cutoff = t − LAG` (PR or
+//!   linked-issue star). They are recorded, not model inputs: the model's
+//!   `starred` stays the PR's own flag. `None` when no star inputs were
+//!   given or the repo's raw event cache does not cover the cutoff.
+//!
 //! # Dwells
 //!
 //! One per episode in a fit stage that entered before `H` and had not ended
@@ -82,6 +88,7 @@ use crate::eta::labels::{
 use crate::eta::queue_features::{
     queue_features, EventKind, EventLog, QueueFeatures, QueueSubject, RosterEntry, StageEvent,
 };
+use crate::eta::star::StarInputs;
 use crate::eta::Stage;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -95,6 +102,10 @@ pub struct RowStats {
     /// Rows of a PR with episodes but no flag timeline: its snapshot was
     /// written before #10245 (`eta fleet backfill` rebuilds it).
     pub rows_dropped_no_flags: usize,
+    /// Rows kept whose star state is unknown (#10372): the repo's raw event
+    /// cache does not cover the row's cutoff. Their `starred_any` is `None`,
+    /// never `false`. Counted only when star inputs were supplied.
+    pub rows_star_unknown: usize,
 }
 
 /// The PR and instant one row describes (a [`TrainingRow`] carries only its
@@ -357,6 +368,33 @@ fn merge_label(pr: &Pr<'_>, t: DateTime<Utc>, horizon: DateTime<Utc>) -> MergeLa
 /// module docs for every rule).
 #[must_use]
 pub fn build(snapshots: &[FleetSnapshot], as_of: DateTime<Utc>) -> Assembled {
+    build_with_star(snapshots, as_of, None)
+}
+
+/// The start of the PR's current star run before `cutoff`, from its flag
+/// changes (any order): the first change of the trailing run of masks that
+/// carry the star. `None` when the star is not in force.
+fn pr_star_since(flags: &[FlagChange], cutoff: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let mut known: Vec<&FlagChange> = flags.iter().filter(|c| c.at < cutoff).collect();
+    known.sort_by_key(|c| (c.at, c.flags));
+    let mut since = None;
+    for change in known {
+        if change.flags & FLAG_STARRED == 0 {
+            since = None;
+        } else if since.is_none() {
+            since = Some(change.at);
+        }
+    }
+    since
+}
+
+/// [`build`], also recording each row's star state from `star` (#10372).
+#[must_use]
+pub fn build_with_star(
+    snapshots: &[FleetSnapshot],
+    as_of: DateTime<Utc>,
+    star: Option<&StarInputs>,
+) -> Assembled {
     let lag = Duration::seconds(KNOWABLE_LAG_SEC);
     let step = Duration::seconds(ROW_STEP_SEC);
     let exit_horizon = Duration::seconds(EXIT_HORIZON_SEC);
@@ -418,6 +456,18 @@ pub fn build(snapshots: &[FleetSnapshot], as_of: DateTime<Utc>) -> Assembled {
                     pr: Some(pr.number),
                     current: Some((episode.stage, episode.entered_at)),
                 };
+                let (starred_any, star_source) = match star {
+                    None => (None, None),
+                    Some(inputs) => {
+                        let state = inputs.repos.get(&pr.repo).and_then(|r| {
+                            r.state_at(pr.number, flags, pr_star_since(&pr.flags, cutoff), cutoff)
+                        });
+                        if state.is_none() {
+                            stats.rows_star_unknown += 1;
+                        }
+                        (state.map(|s| s.source.starred()), state.map(|s| s.source))
+                    }
+                };
                 let q = queue_features(&subject, &roster, &log, &scope, t);
                 let rework = pr
                     .episodes
@@ -443,6 +493,8 @@ pub fn build(snapshots: &[FleetSnapshot], as_of: DateTime<Utc>) -> Assembled {
                         stage,
                         group: format!("{}#{}", pr.repo, pr.number),
                         inputs,
+                        starred_any,
+                        star_source,
                         exit,
                         merge: merge_label(pr, t, horizon),
                     },

@@ -73,6 +73,8 @@ fn generate() -> Vec<TrainingRow> {
             let t = (aft_mu + dot(&aft_coef) + aft_sigma * z).exp();
             let c = 200.0 * rng.next_f64();
             rows.push(TrainingRow {
+                starred_any: None,
+                star_source: None,
                 stage,
                 group: format!("fixture#{}", rows.len()),
                 inputs,
