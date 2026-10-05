@@ -243,10 +243,50 @@ pub fn alert_title(issue: u32) -> String {
     format!("Red main: main-red-fix #{issue} is still unclaimed")
 }
 
+/// How `create-issue.sh` answered an alert filing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlertOutcome {
+    /// Created, or blocked by this fix's own alert: the alert exists.
+    Exists,
+    /// Blocked by a similar open issue that is not this fix's alert (exit 3):
+    /// nothing exists for this fix yet.
+    BlockedBySimilar,
+    Failed,
+}
+
+/// Classify a `create-issue.sh` run. Exit 3 means a *similar* open issue
+/// blocked creation — alerts for different fixes differ only by number — so it
+/// counts as this fix's alert only when a blocking `#N: <title> (similarity:
+/// X%)` row on `stderr` carries exactly [`alert_title`] for `issue`.
+fn classify_alert_run(code: Option<i32>, stderr: &str, issue: u32) -> AlertOutcome {
+    match code {
+        Some(0) => AlertOutcome::Exists,
+        Some(3) => {
+            let title = alert_title(issue);
+            let own = stderr.lines().any(|l| {
+                l.trim()
+                    .strip_prefix('#')
+                    .and_then(|r| r.split_once(": "))
+                    .is_some_and(|(_, t)| {
+                        t.rsplit_once(" (similarity:").map_or(t, |(t, _)| t) == title
+                    })
+            });
+            if own {
+                AlertOutcome::Exists
+            } else {
+                AlertOutcome::BlockedBySimilar
+            }
+        }
+        _ => AlertOutcome::Failed,
+    }
+}
+
 /// File the alert as a `loom:operator` issue via `create-issue.sh`, the same
-/// path the CI billing alert uses. No `--force`, so the script's duplicate
-/// backstop dedups across daemon restarts and hosts. Returns whether the alert
-/// now exists (created, or the script reported a matching existing one).
+/// path the CI billing alert uses. The script's duplicate backstop dedups
+/// across daemon restarts and hosts, but a similar alert for a *different* fix
+/// can trip it, so a block is accepted only when it names this fix's own alert
+/// (exact title); otherwise the alert is filed with `--force`. Returns whether
+/// this fix's alert now exists.
 fn file_alert(root: &Path, issue: u32, waited: Duration) -> bool {
     let minutes = waited.as_secs() / 60;
     log::error!(
@@ -267,14 +307,30 @@ fn file_alert(root: &Path, issue: u32, waited: Duration) -> bool {
          Filed once per fix by the red-main-fix lane (#10118); threshold: \
          `autonomous.workFinder.redFixEscalateAfterSecs`."
     );
-    let mut cmd = std::process::Command::new(script);
-    cmd.current_dir(root)
-        .args(["--title", &alert_title(issue), "--body", &body])
-        .args(["--label", "loom:operator"]);
-    let ok = crate::sweep_registry::output_with_timeout(cmd, Duration::from_secs(60))
-        .ok()
-        .flatten()
-        .is_some_and(|o| o.status.success() || o.status.code() == Some(3));
+    let run = |force: bool| {
+        let mut cmd = std::process::Command::new(&script);
+        cmd.current_dir(root)
+            .args(["--title", &alert_title(issue), "--body", &body])
+            .args(["--label", "loom:operator"]);
+        if force {
+            cmd.arg("--force");
+        }
+        crate::sweep_registry::output_with_timeout(cmd, Duration::from_secs(60))
+            .ok()
+            .flatten()
+            .map_or(AlertOutcome::Failed, |o| {
+                classify_alert_run(o.status.code(), &String::from_utf8_lossy(&o.stderr), issue)
+            })
+    };
+    let mut outcome = run(false);
+    if outcome == AlertOutcome::BlockedBySimilar {
+        log::warn!(
+            "work_finder: a similar open issue blocked the red-main-fix alert for #{issue}; \
+             filing it anyway (#10118)"
+        );
+        outcome = run(true);
+    }
+    let ok = outcome == AlertOutcome::Exists;
     if !ok {
         log::error!("work_finder: filing the red-main-fix alert for #{issue} failed (#10118)");
     }
@@ -435,4 +491,73 @@ pub fn latest_run_is_failure(stdout: &str) -> bool {
                 Some("failure" | "timed_out" | "startup_failure")
             )
         })
+}
+
+#[cfg(test)]
+mod alert_sink_tests {
+    use super::*;
+
+    const SIMILAR_OTHER: &str = "create-issue.sh: NOT FILED -- this looks like a duplicate of open work:\n  #800: Red main: main-red-fix #7 is still unclaimed (similarity: 90%)\nNothing was created.\n";
+
+    #[test]
+    fn exit_3_is_this_fixs_alert_only_on_an_exact_title_match() {
+        let own = "  #800: Red main: main-red-fix #9 is still unclaimed (similarity: 100%)\n";
+        assert_eq!(classify_alert_run(Some(3), own, 9), AlertOutcome::Exists);
+        assert_eq!(
+            classify_alert_run(Some(3), SIMILAR_OTHER, 9),
+            AlertOutcome::BlockedBySimilar,
+            "another fix's alert must not stand in for this one"
+        );
+        // #9 must not match #90's alert by prefix.
+        let longer = "  #801: Red main: main-red-fix #90 is still unclaimed (similarity: 95%)\n";
+        assert_eq!(classify_alert_run(Some(3), longer, 9), AlertOutcome::BlockedBySimilar);
+        assert_eq!(classify_alert_run(Some(0), "", 9), AlertOutcome::Exists);
+        assert_eq!(classify_alert_run(Some(1), "", 9), AlertOutcome::Failed);
+        assert_eq!(classify_alert_run(None, "", 9), AlertOutcome::Failed);
+    }
+
+    /// Install a stub `create-issue.sh` that records its argv and answers with
+    /// `stderr`/`code` unless `--force` is passed (then it "creates").
+    fn root_with_stub(stderr: &str, code: i32) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = dir.path().join(".loom/scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let log = dir.path().join("calls.log");
+        let script = scripts.join("create-issue.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/bash\nfor a in \"$@\"; do [ \"$a\" = --force ] && f=force; done\necho \"call ${{f:-plain}}\" >> '{}'\nfor a in \"$@\"; do [ \"$a\" = --force ] && exit 0; done\nprintf '%s' '{stderr}' >&2\nexit {code}\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, log)
+    }
+
+    #[test]
+    fn a_similar_alert_for_another_fix_does_not_suppress_this_fixs_alert() {
+        let (dir, log) = root_with_stub(SIMILAR_OTHER, 3);
+        assert!(file_alert(dir.path(), 9, Duration::from_secs(1800)));
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert_eq!(calls.lines().count(), 2, "blocked, then filed with --force: {calls}");
+        assert_eq!(calls.lines().nth(1), Some("call force"));
+    }
+
+    #[test]
+    fn this_fixs_own_existing_alert_is_accepted_without_refiling() {
+        let own = "  #800: Red main: main-red-fix #9 is still unclaimed (similarity: 100%)\n";
+        let (dir, log) = root_with_stub(own, 3);
+        assert!(file_alert(dir.path(), 9, Duration::from_secs(1800)));
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert_eq!(calls.lines().count(), 1, "no --force re-run: {calls}");
+    }
+
+    #[test]
+    fn a_script_failure_is_reported_as_not_filed() {
+        let (dir, _log) = root_with_stub("boom", 1);
+        assert!(!file_alert(dir.path(), 9, Duration::from_secs(1800)));
+    }
 }
