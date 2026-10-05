@@ -37,8 +37,11 @@
 //!   events) and no record, but the fit check still runs, on whatever
 //!   snapshots this host has — the captain's, when `LOOM_ETA_FLEET_SNAPSHOT_DIR`
 //!   points at a directory shared with it; otherwise only this host's own
-//!   older ones, or none (logged when the gate changes). Publishing the
-//!   captain's fit to the other hosts is not this task's job.
+//!   older ones, or none (logged when the gate changes). With `fleet.repo` set
+//!   the host instead fetches, verifies and installs the captain's published fit
+//!   first ([`distribute_fetch`], #10395), and fits itself only when there is
+//!   no usable publication. The captain publishes its newest fit after the
+//!   fit check ([`distribute_publish`]); a publish failure never fails a cycle.
 //! - **No captain declared**: the cycle runs, unarmed — deliberately
 //!   **fail-open**, unlike the gate's fail-closed contract for alerting jobs.
 //!   A duplicate refresh costs budget, never correctness (deterministic
@@ -92,7 +95,7 @@ use super::cycle_guard::{CycleGuard, CycleTick};
 pub use super::eta_fit::FitCheck;
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::eta::config::{EtaConfig, FleetRefreshConfig};
-use crate::eta::fit::{run, Fitter};
+use crate::eta::fit::{publish, run, Fitter};
 use crate::eta::fleet;
 use crate::eta::fleet_events::{self, EventLog, EventsCursor, SyncMode};
 use crate::eta::fleet_events_forge::{ForgeEndpoint, ForgeEventSource};
@@ -454,18 +457,69 @@ fn run_production_cycle(
     }
     crate::eta::health::write_refresh_cycle(root, &cycle_state(&ticked, now, config.interval_secs));
     // After the records: a fit that panics must not cost the cycle's telemetry.
+    // #10395: a non-captain first takes the captain's published fit, and fits
+    // itself only when there is none to serve.
+    let serving_published = match &ticked.gate {
+        RefreshGate::StandDown { captain } => {
+            distribute_fetch(root, captain, Utc::now()).is_some_and(|k| k.serving_published())
+        }
+        _ => false,
+    };
     let fit_started = Utc::now();
     let began = std::time::Instant::now();
-    let check = after_cycle(root, fit_started, ticked.fit_held, fit_enabled, fitter);
-    super::eta_fit::finish(
+    let check =
+        after_cycle(root, fit_started, ticked.fit_held, fit_enabled && !serving_published, fitter);
+    // Serving the captain's fit, no fit check ran: emit no `eta.fit` record
+    // (it would read `disabled`); `fit-pub/status.json` records the outcome.
+    if !serving_published {
+        super::eta_fit::finish(
+            root,
+            sink,
+            host_id,
+            super::eta_fit::Trigger::FleetRefresh,
+            fit_started,
+            began.elapsed(),
+            &check,
+        );
+    }
+    if matches!(ticked.gate, RefreshGate::Captain)
+        && fit_enabled
+        && !matches!(check, FitCheck::Failed(_))
+    {
+        let captain = crate::config_resolver::fleet_captain(root).unwrap_or(gate_host);
+        distribute_publish(root, &captain, Utc::now());
+    }
+}
+
+/// #10395, non-captain: fetch the captain's published fit and install it.
+/// `None` when `fleet.repo` is unset (the feature is off: every host fits
+/// itself, as before). Failures are outcomes, never errors.
+pub fn distribute_fetch(
+    root: &Path,
+    captain: &str,
+    now: DateTime<Utc>,
+) -> Option<publish::FetchKind> {
+    let (loc, _) = publish::publication_location(root)?;
+    let effective = crate::config_resolver::resolve_effective_config(root);
+    let transport = crate::fleet_store::gh::GhTransport::new(root, &loc.repo);
+    Some(publish::fetch_and_install(
+        &transport,
+        &loc,
         root,
-        sink,
-        host_id,
-        super::eta_fit::Trigger::FleetRefresh,
-        fit_started,
-        began.elapsed(),
-        &check,
-    );
+        captain,
+        now,
+        publish::resolve_max_age(&effective),
+    ))
+}
+
+/// #10395, captain: publish the newest local fit unless already published. A
+/// failure is logged and recorded and never fails the cycle.
+pub fn distribute_publish(root: &Path, captain: &str, now: DateTime<Utc>) {
+    let Some((loc, base)) = publish::publication_location(root) else {
+        return;
+    };
+    let transport = crate::fleet_store::gh::GhTransport::new(root, &loc.repo);
+    let _ = publish::publish_newest(&transport, &transport, &loc, &base, root, captain, now);
 }
 
 /// Refresh every repo's SigNoz in-sweep snapshot (#9758) through the

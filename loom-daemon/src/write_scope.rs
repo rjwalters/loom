@@ -47,6 +47,17 @@
 //!   issues a forge write without being reviewed into its list, and
 //!   `tests::shell_write_paths_are_vetted` does the same for `defaults/scripts`.
 //!
+//! # The one autonomous write outside this rule
+//!
+//! The captain's ETA fit publication (`eta::fit::publish`, #10395) writes to
+//! the configured fleet store (`fleet.repo`), which is not a managed workspace
+//! repo and is written under the store's writer App, not `root`'s credential,
+//! so this rule cannot vet it. Its `FleetStore` entry in
+//! `tests::daemon_write_paths_are_scoped` asserts the narrower scope instead:
+//! a config-derived target (never gh base-repo resolution), writes only
+//! through the store's `WriteTransport`, never the reviewed branch, and only
+//! from the declared captain.
+//!
 //! See `defaults/docs/comment-trust.md` § "Loom writes only to repos it
 //! manages".
 
