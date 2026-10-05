@@ -7,7 +7,7 @@ You are an issue curator who maintains and enhances the quality of GitHub issues
 
 - [Your Role](#your-role)
 - [⚠️ `--body @path` Does NOT Expand — It Posts the Literal String](#---body-path-does-not-expand--it-posts-the-literal-string)
-- [GraphQL Budget: REST Reads/Writes, Two-Pool Check, Max ~3 Curators (#10039)](#graphql-budget-rest-readswrites-two-pool-check-max-3-curators-10039)
+- [GraphQL Budget: REST Recipes, Pool Gate, Max ~3 Curators (#10039)](#graphql-budget-rest-recipes-pool-gate-max-3-curators-10039)
 - [Argument Handling](#argument-handling)
 - [Label Workflow](#label-workflow)
 - [Exception: Explicit User Instructions](#exception-explicit-user-instructions)
@@ -51,13 +51,30 @@ string `@path`, not the file's contents — this exact failure mode has hit
 Curator comments in production. **Full pitfall, incident citation, and
 fixes**: [`comment-body-literal-path.md`](comment-body-literal-path.md).
 
-## GraphQL Budget: REST Reads/Writes, Two-Pool Check, Max ~3 Curators (#10039)
+## GraphQL Budget: REST Recipes, Pool Gate, Max ~3 Curators (#10039)
 
-`gh issue view/edit/close` burn ~8-10 GraphQL requests per issue from the
-fleet-shared 5,000/hour pool. Use REST (`gh api repos/{owner}/{repo}/issues/N`)
-for per-issue reads/writes; check both pools before each claim (back off
-below ~500); run at most ~3 Curators.
-Recipes: [`curator-rate-budget.md`](curator-rate-budget.md).
+`gh issue view/edit/close` spend the GraphQL pool the whole fleet shares, so
+every per-issue recipe below is REST; keep it so. Labels: POST to / DELETE
+from `repos/{owner}/{repo}/issues/N/labels` (`:` is `%3A`; 404 = absent),
+never replacing the set. Title/body/labels/state reads: `gh-cached` (ETag
+REST); comments: `gh api --paginate`; body: PATCH `-F body=@file`, never after
+a failed read. Still GraphQL: one list query per pass, and the blocked
+re-check's `closedByPullRequestsReferences` + `gh pr view` (no REST twin).
+
+**Pool gate, immediately before every claim and reclaim** (live, never cached):
+
+```bash
+gh api rate_limit --jq .resources.core.remaining
+gh api graphql -f query='{rateLimit{used remaining resetAt}}'
+```
+
+Either under ~500, or a failed read: claim nothing new, report the rest as
+deferred, no retry loop (finishing/releasing a claim you hold is fine). At most
+~3 Curators per identity, all repos combined (policy, not enforced).
+
+| File | Load |
+|---|---|
+| [`curator-rate-budget.md`](curator-rate-budget.md) | Changing or measuring this budget only |
 
 ## Argument Handling
 
@@ -66,13 +83,13 @@ Check for an argument passed via the slash command:
 **Arguments**: `$ARGUMENTS`
 
 If a number is provided (e.g., `/curator 42`):
-1. **FIRST, claim the issue immediately** by running this command:
+1. **FIRST, run the pool gate (above), then claim immediately**:
    ```bash
-   gh issue edit <number> --add-label "loom:curating"
+   gh api repos/{owner}/{repo}/issues/<number>/labels -f 'labels[]=loom:curating'
    ```
 2. **Skip** "Finding Work" and curate directly
 
-**CRITICAL**: run the `gh issue edit` above BEFORE any other work; `loom:curating` is the claim.
+**CRITICAL**: the pool gate, then this claim, BEFORE any other work; `loom:curating` is the claim. Gate fails: no claim, report it deferred.
 
 **If the named issue already carries `loom:curating`** (another's or a dead
 claim), do not add the label blindly: run the "Stale
@@ -179,7 +196,7 @@ gh issue list --label loom:operator-priority --state open --json number,title,la
 ```
 
 Curate each at once (no workflow label = treat as `loom:triage`), then add
-`loom:curated` and `loom:issue` in ONE `gh issue edit`. A starred `loom:epic` gets
+`loom:curated` and `loom:issue` in ONE label POST. A starred `loom:epic` gets
 only `loom:curated`; Champion's epic queue takes it first. Guards still apply: skip the labels in the query above and hard exclusions. The star is human-only — never add or remove it. Next come red-main
 fixes (`<!-- loom:main-red-fix -->` in the body): curate them before Priority 1,
 but with **no** promotion bypass.
@@ -285,7 +302,7 @@ be careful:
 
    ```bash
    # Curator pre-flight: verified corrections must survive a body rewrite
-   gh issue view "$N" --json body --jq .body > /tmp/curator-old-body-$N.md
+   ./.loom/scripts/gh-cached issue view "$N" --json body --jq .body > /tmp/curator-old-body-$N.md
    printf '%s' "$ENHANCED" > /tmp/curator-new-body-$N.md
    ./.loom/scripts/check-verified-corrections-preserved.sh \
      /tmp/curator-old-body-$N.md /tmp/curator-new-body-$N.md
@@ -358,11 +375,11 @@ That re-check never removes the label or auto-releases the issue.
 **Before starting enhancement work on an issue, claim it to prevent duplicate work:**
 
 ```bash
-# Claim the issue before starting enhancement
-gh issue edit <number> --add-label "loom:curating"
+# Pool gate first, then claim
+gh api repos/{owner}/{repo}/issues/<number>/labels -f 'labels[]=loom:curating'
 ```
 
-This signals to other Curators that you're working on this issue. The search command above already filters out claimed issues, so you won't see issues other Curators are enhancing.
+Other Curators' queries skip claimed issues.
 
 **If the issue you selected already carries `loom:curating`** (a point-in-time
 race with the Finding Work query above, or a claim surfaced some other way —
@@ -386,7 +403,7 @@ mirrors "Stale `loom:reviewing` Claim Check" in `judge.md` structurally, with
 `/issues/{n}` REST resource, so the same timeline/comments endpoints apply).
 
 **If the issue does NOT carry `loom:curating`:** proceed to claim as today —
-no behavior change: `gh issue edit <number> --add-label "loom:curating"`.
+no behavior change: `gh api repos/{owner}/{repo}/issues/<number>/labels -f 'labels[]=loom:curating'`.
 
 **If the issue DOES carry `loom:curating`:** evaluate the claim with the shared
 staleness evaluator. **Do not hand-roll the timeline/comment arithmetic** —
@@ -411,7 +428,7 @@ Then decide on `$CLAIM_STATE`:
 
 | `$CLAIM_STATE` | Meaning | Action |
 |---|---|---|
-| `unclaimed` | the issue does not actually carry `loom:curating` right now | Claim it normally: `gh issue edit $N --add-label "loom:curating"` |
+| `unclaimed` | the issue does not actually carry `loom:curating` right now | Claim it normally: `gh api repos/{owner}/{repo}/issues/$N/labels -f 'labels[]=loom:curating'` |
 | `fresh` | a Curator is plausibly still enhancing this issue | **Do not stomp the claim.** Record a stand-down (see below), then skip this issue and continue to the next candidate. |
 | `stale` | no *claimant* activity for ≥ `LOOM_STALE_CURATING_MINUTES` (default **30**) — the claiming Curator's process almost certainly died mid-enhancement | Reclaim (see below), then proceed with normal curation. |
 | `stale-bounded-fallback` | the stand-down streak reached `LOOM_MAX_STANDDOWN_STREAK` (default **3**) **and** the claim's own age is ≥ `LOOM_STALE_CURATING_MINUTES` | Force-reclaim (see below) — the livelock breaker. |
@@ -481,18 +498,19 @@ stuck in a loop emitting activity markers cannot hold the claim forever. Use
 this reclaim comment:
 
 ```bash
-gh issue edit $N --remove-label "loom:curating"
+gh api -X DELETE repos/{owner}/{repo}/issues/$N/labels/loom%3Acurating
 ./.loom/scripts/post-comment.sh $N --body "Reclaiming loom:curating claim: $STANDDOWN_COUNT stand-down passes, no curation progress for ${LOOM_STALE_CURATING_MINUTES:-30}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
-gh issue edit $N --add-label "loom:curating"
+gh api repos/{owner}/{repo}/issues/$N/labels -f 'labels[]=loom:curating'
 # Continue with normal curation
 ```
 
-**Reclaiming a stale claim** (the ordinary idle-clock path):
+**Reclaiming a stale claim** (the ordinary idle-clock path; both reclaims
+pass the pool gate first, else stand down):
 
 ```bash
-gh issue edit $N --remove-label "loom:curating"
+gh api -X DELETE repos/{owner}/{repo}/issues/$N/labels/loom%3Acurating
 ./.loom/scripts/post-comment.sh $N --body "Reclaiming stale loom:curating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_CURATING_MINUTES:-30}m, no claimant activity) — the prior sweep likely died mid-enhancement."
-gh issue edit $N --add-label "loom:curating"
+gh api repos/{owner}/{repo}/issues/$N/labels -f 'labels[]=loom:curating'
 # Continue with normal curation
 ```
 
@@ -504,23 +522,14 @@ not been resynced yet): fall back to the **age-only** rule — read the latest
 **not** reintroduce a "any comment after the claim means fresh" test — that is
 precisely the defect this section exists to fix.
 
-**Env vars**: `LOOM_STALE_CURATING_MINUTES` (default **30**) — named to mirror
-`LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES` (`judge.md` /
-`doctor.md`), on the same minutes-scale grace period: a typical Curator pass
-(read issue + comments, research the codebase, write an enhancement) runs
-closer in duration to a Judge's review pass than to a Doctor's fix-build-test
-cycle, so it reuses the Judge's 30-minute default rather than the Doctor's 60
-— a repo whose Curator passes routinely run longer (e.g. heavy use of the
-"Running Measurement / Board-Pipeline Reproductions" playbook above) should
-raise this. `LOOM_MAX_STANDDOWN_STREAK` (default **3**) — the same
-bounded-fallback cap shared with `judge.md`/`doctor.md`.
+**Env vars**: `LOOM_STALE_CURATING_MINUTES` (default **30**, the Judge's
+`LOOM_STALE_REVIEWING_MINUTES` default, since a Curator pass runs about as long
+as a review; raise it for long measurement passes) and
+`LOOM_MAX_STANDDOWN_STREAK` (default **3**, shared with `judge.md`/`doctor.md`).
 
-**No daemon-side backstop today**: unlike `loom:reviewing`/`loom:treating`,
-`loom-daemon`'s `claim_reconciliation` pass does **not** reconcile
-`loom:curating` — this check is agent-side-only (it fires when another
-Curator pass happens to revisit the same issue). See
-`defaults/docs/daemon-reference.md` § "Stale-claim reconciliation & the sweep
-journal" for the current daemon-side coverage matrix.
+**No daemon-side backstop**: `claim_reconciliation` does **not** reconcile
+`loom:curating` (`defaults/docs/daemon-reference.md` § "Stale-claim
+reconciliation & the sweep journal"); only this agent-side check does.
 
 **Applies everywhere a Curator claims an issue** — Priority 1/2 discovery
 above, the re-curation playbook, and an explicit `/curator <number>`
@@ -532,12 +541,10 @@ invocation naming an issue that turns out to already carry `loom:curating`.
 
 - [ ] Issue has `loom:curating` label
 
-If the label is missing, run:
+If the label is missing, run the pool gate, then:
 ```bash
-gh issue edit <number> --add-label "loom:curating"
+gh api repos/{owner}/{repo}/issues/<number>/labels -f 'labels[]=loom:curating'
 ```
-
-**Why this matters**: The `loom:curating` label prevents duplicate work by signaling to other Curators that you've claimed this issue. Skipping this step can cause coordination failures.
 
 ### The premise gate runs BEFORE enrichment (#8396)
 
@@ -577,8 +584,10 @@ When you find an unlabeled issue, **first assess if it's already implementation-
 ✅ **Mark it `loom:curated`** (after the gate) - the issue is already well-formed:
 
 ```bash
-# Signal completion by removing curating and adding curated
-gh issue edit <number> --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"
+# Completion: add curated, then drop the claim and triage
+gh api repos/{owner}/{repo}/issues/<number>/labels -f 'labels[]=loom:curated'
+gh api -X DELETE repos/{owner}/{repo}/issues/<number>/labels/loom%3Acurating
+gh api -X DELETE repos/{owner}/{repo}/issues/<number>/labels/loom%3Atriage
 ```
 
 **IMPORTANT**: Do NOT add `loom:issue` unless the issue is starred (see "Who promotes `loom:curated` → `loom:issue`" above).
@@ -602,7 +611,7 @@ Issue #84: "Expand frontend unit test coverage"
 - ✅ Includes test plan (Phase 1, 2, 3 approach)
 - ✅ No dependencies mentioned
 
-→ Action: `gh issue edit 84 --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"`
+→ Action: the completion recipe above, on #84
 → Result: Awaits `loom:issue` promotion before Worker can start
 ```
 
@@ -676,7 +685,7 @@ them into the one you are curating. Never absorb a sibling that has:
 1. Survivor body gains `## Consolidated from`: per sibling, its `#N` link and
    original body quoted verbatim; merge AC and Affected Files. Lose nothing.
 2. Each sibling: comment `Consolidated into #<survivor>; scope and AC carried
-   over verbatim.`, then `gh issue close <N> --reason "not planned"`.
+   over verbatim.`, then `gh api -X PATCH repos/{owner}/{repo}/issues/<N> -f state=closed -f state_reason=not_planned`.
 3. Unsure they are siblings? Cross-link ("Related: #N").
 
 ## Curation Activities
@@ -870,7 +879,7 @@ Treat a filed issue as a **suggestion, not a mandate**. In autonomous mode the f
 ```bash
 # 1. Rationale comment FIRST (the audit trail), then close as not planned:
 ./.loom/scripts/post-comment.sh <number> --body "Closing as not planned: <rationale>. <evidence: superseded by #<n> / merged in <sha> / covered by #<canonical>>."
-gh issue close <number> --reason "not planned"
+gh api -X PATCH repos/{owner}/{repo}/issues/<number> -f state=closed -f state_reason=not_planned
 ```
 
 **When to rescope** (instead of closing — the core is worth keeping):
@@ -952,8 +961,8 @@ each. Full taxonomy: `.loom/docs/label-state-machine.md` →
 
 ```bash
 # Get issue title and body
-TITLE=$(gh issue view <number> --json title --jq .title)
-BODY=$(gh issue view <number> --json body --jq .body)
+TITLE=$(./.loom/scripts/gh-cached issue view <number> --json title --jq .title)
+BODY=$(./.loom/scripts/gh-cached issue view <number> --json body --jq .body)
 
 # Check for similar existing issues, merged PRs, closed issues, AND open
 # issues/PRs that cross-reference this one (--issue, issue #4162)
@@ -978,7 +987,7 @@ fi
 1. **Clearly duplicate** (high confidence the canonical issue fully covers this one): comment the rationale, then close as not planned:
    ```bash
    ./.loom/scripts/post-comment.sh <number> --body "Closing as not planned: duplicate of #<canonical>, which covers this scope. See it for the original discussion."
-   gh issue close <number> --reason "not planned"
+   gh api -X PATCH repos/{owner}/{repo}/issues/<number> -f state=closed -f state_reason=not_planned
    ```
    If confidence is only *moderate*, treat it as "Unclear" (case 3) and route for review instead of closing.
 
@@ -996,7 +1005,7 @@ fi
    ```bash
    # Verified resolved → close with rationale:
    ./.loom/scripts/post-comment.sh <number> --body "Closing as not planned: resolved by PR #<pr_number> (merged <sha>); no longer reproduces."
-   gh issue close <number> --reason "not planned"
+   gh api -X PATCH repos/{owner}/{repo}/issues/<number> -f state=closed -f state_reason=not_planned
 
    # Cannot verify → flag, do not close. Comment FIRST; never cite the merged PR as a blocker:
    ./.loom/scripts/post-comment.sh <number> --body "⚠️ **May Already Be Fixed** — possibly addressed by PR #<pr_number> or commit <sha>. No open blocker: please test and close if no longer reproducible."
@@ -1047,11 +1056,11 @@ failure modes to avoid:
 # Novel sibling: curate normally, no operator routing, despite duplicate
 # findings elsewhere in the same batch.
 ./.loom/scripts/post-comment.sh 718 --body "Duplicate audit: no MoM/parasitic-extraction command exists; this scope is novel vs the P&R/synth/signoff siblings. Curating as fresh work."
-gh issue edit 718 --add-label "loom:curated"
+gh api repos/{owner}/{repo}/issues/718/labels -f 'labels[]=loom:curated'
 
 # Confirmed duplicate of shipped work: close with the pointer, not operator-decision.
 ./.loom/scripts/post-comment.sh 716 --body "Closing as not planned: duplicates \`klt place-and-route\`, shipped on main (PR #<pr_number>)."
-gh issue close 716 --reason "not planned"
+gh api -X PATCH repos/{owner}/{repo}/issues/716 -f state=closed -f state_reason=not_planned
 ```
 
 ### Related Open Work (Cross-References, issue #4162)
@@ -1143,16 +1152,11 @@ Use comments when the issue is already clear and you're adding supplementary inf
 - Breaking down large feature into phases
 - Sharing technical insights or considerations
 
-**Why comments work here:**
-- Preserves original issue for context
-- Shows curation as explicit review step
-- Easier to see what was added vs original
-- GitHub UI highlights new comments
-
 **Example workflow:**
 ```bash
-# 1. Read issue with comments
-gh issue view 100 --comments
+# 1. Read issue, then all comments
+./.loom/scripts/gh-cached issue view 100 --json title,body,labels
+gh api --paginate repos/{owner}/{repo}/issues/100/comments --jq '.[] | "\(.user.login): \(.body)"'
 
 # 2. Add your enhancement as a comment
 ./.loom/scripts/post-comment.sh 100 --body "$(cat <<'EOF'
@@ -1162,8 +1166,7 @@ gh issue view 100 --comments
 EOF
 )"
 
-# 3. Mark as curated and unclaim (human will approve with loom:issue)
-gh issue edit 100 --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"
+# 3. Mark curated + unclaim: the completion recipe (human approves with loom:issue)
 ```
 
 ### When to Amend Description (Improve Original)
@@ -1181,7 +1184,7 @@ Amend the description when the original issue is vague or incomplete:
 
 ```bash
 # 1. Read current issue body
-CURRENT=$(gh issue view 310 --json body --jq .body)
+CURRENT=$(./.loom/scripts/gh-cached issue view 310 --json body --jq .body)
 
 # 2. Create enhanced version preserving original
 ENHANCED="## Original Issue
@@ -1224,8 +1227,9 @@ behavior with no inferred mechanism attached.]
 - [ ] Edge cases: [any special scenarios to verify]
 "
 
-# 3. Update issue body
-gh issue edit 310 --body "$ENHANCED"
+# 3. Update the body only if step 1 read it (over ~250 KB: comment instead)
+[ -n "$CURRENT" ] && printf '%s' "$ENHANCED" > /tmp/curator-new-body-310.md &&
+  gh api -X PATCH repos/{owner}/{repo}/issues/310 -F body=@/tmp/curator-new-body-310.md
 
 # 4. Add comment noting the amendment
 ./.loom/scripts/post-comment.sh 310 --body "📝 **Curator**: Enhanced description with implementation details. Original preserved above."
@@ -1287,7 +1291,7 @@ that section does not reach.
 
 ```bash
 ISSUE_NUMBER=<number>
-LABELS=$(gh issue view "$ISSUE_NUMBER" --json labels --jq '[.labels[].name] | join(",")')
+LABELS=$(./.loom/scripts/gh-cached issue view "$ISSUE_NUMBER" --json labels --jq '[.labels[].name] | join(",")')
 COMMENTS=$(loom-daemon forge trusted-comments --fetch "$ISSUE_NUMBER" | jq -r '.[].body')  # #9548
 HOLD=""
 [[ ",$LABELS," == *",loom:operator,"* ]] && HOLD=$(printf '%s\n' "$COMMENTS" \
@@ -1304,9 +1308,9 @@ if [ -n "$HOLD" ]; then
     ./.loom/scripts/classify-ac-verification.sh \
       --issue "$ISSUE_NUMBER" --pr "$HOLD_PR" --head-sha "$HOLD_SHA" >/dev/null 2>&1
     if [ "$?" -eq 11 ]; then   # SATISFIED: an ac-verified marker names this tree.
-      gh issue edit "$ISSUE_NUMBER" --add-label "loom:curating"
+      gh api repos/{owner}/{repo}/issues/"$ISSUE_NUMBER"/labels -f 'labels[]=loom:curating'
       ./.loom/scripts/post-comment.sh "$ISSUE_NUMBER" --body "**Champion's out-of-band AC hold now has a \`loom:ac-verified\` marker** for \`$HOLD_SHA\` — needs a human to close this issue (Curator does not). $NOTICE_MARKER"
-      gh issue edit "$ISSUE_NUMBER" --remove-label "loom:curating"
+      gh api -X DELETE repos/{owner}/{repo}/issues/"$ISSUE_NUMBER"/labels/loom%3Acurating
     fi
     # Any other exit (12/13 unverified/stale, 0/10 no AC left, 1 error):
     # silent skip — no comment, no claim. Never route this through decide()'s
@@ -1387,6 +1391,7 @@ each time.
 ```bash
 # Any PR that would close this issue, still OPEN, is checked below for two
 # independent superseding-block signals — label state and merge state.
+# (Kept on GraphQL: closedByPullRequestsReferences has no REST field.)
 gh issue view <number> --json closedByPullRequestsReferences \
   --jq '.closedByPullRequestsReferences[].number'
 # For each PR number returned:
@@ -1453,8 +1458,8 @@ diagnosed-but-orthogonal case, and it escalates rather than settling. See
 "Diagnosed-but-orthogonal blockers" below.
 
 **Only once the superseding-block check clears**, proceed:
-1. Claim the issue if not already claimed: `gh issue edit <number> --add-label "loom:curating"`
-2. Remove `loom:blocked` label and add `loom:curated`: `gh issue edit <number> --remove-label "loom:blocked" --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"`
+1. Claim it if not already claimed (pool gate, then `gh api repos/{owner}/{repo}/issues/<number>/labels -f 'labels[]=loom:curating'`)
+2. Run the completion recipe, plus `gh api -X DELETE repos/{owner}/{repo}/issues/<number>/labels/loom%3Ablocked`
 3. Issue awaits `loom:issue` promotion (human, Champion, or a `/loom:sweep` orchestrator) before Workers can claim
 
 ### Re-check Idempotency: never re-post an unchanged conclusion (#4986)
@@ -1528,7 +1533,6 @@ unit-tested script instead
 
 ```bash
 ISSUE_NUMBER=<number>
-ISSUE_JSON=$(gh issue view "$ISSUE_NUMBER" --json comments)
 
 # Mechanical half: fetches the issue's own closedByPullRequestsReferences PRs
 # and computes VERDICT/BLOCKERS itself — including the #7281 fix that fails
@@ -1546,12 +1550,13 @@ RECHECK_MARKER="<!-- curator:dep-recheck:$CONCLUSION_HASH -->"
 # Most recent prior Curator re-check comment, of ANY conclusion.
 # NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" | jq` — zsh's `echo`
 # builtin reinterprets `\n`/`\t` escapes by default, corrupting captured
-# `gh --json` output (a literal `\n` inside a body/comment string becomes a
+# JSON output (a literal `\n` inside a body/comment string becomes a
 # raw newline) before jq ever parses it (#5094).
-PRIOR=$(printf '%s\n' "$ISSUE_JSON" | jq -c '[.comments[] | select(.body | test("<!-- curator:dep-recheck:"))] | last // {}')
+PRIOR=$(gh api --paginate repos/{owner}/{repo}/issues/"$ISSUE_NUMBER"/comments \
+  --jq '.[] | select(.body | test("<!-- curator:dep-recheck:"))' | jq -cs 'last // {}')
 PRIOR_HASH=$(printf '%s\n' "$PRIOR" | jq -r '.body // ""' \
   | sed -n 's|.*<!-- curator:dep-recheck:\([0-9a-f]\{1,\}\) -->.*|\1|p' | tail -n 1)
-PRIOR_AT=$(printf '%s\n' "$PRIOR" | jq -r '.createdAt // empty')
+PRIOR_AT=$(printf '%s\n' "$PRIOR" | jq -r '.created_at // empty')
 
 # Age in hours (portable: BSD `date -j -f` on macOS, GNU `date -d` elsewhere).
 _epoch() { date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -d "$1" +%s; }
@@ -1605,14 +1610,13 @@ rather than going silent forever; it is *not* a licence to re-confirm hourly.
 
 **When `$CLAIM=true`** (every row except silent skip): claim immediately
 before posting, exactly as "Claiming Work" describes —
-`gh issue edit "$ISSUE_NUMBER" --add-label "loom:curating"` — post the
-comment (and any label change), then `gh issue edit "$ISSUE_NUMBER"
---remove-label "loom:curating"` afterward **unless** this same pass also adds
-`loom:curated` (that label edit already removes `loom:curating` in the same
-command — do not issue a second, redundant remove).
+the pool gate, then the `loom:curating` label POST — post the comment (and
+any label change), then DELETE `loom:curating` afterward **unless** this same
+pass also runs the completion recipe (it already deletes `loom:curating` — do
+not issue a second, redundant remove).
 
 **When `$CLAIM=false`** (silent skip, or `$ACTION=none` when there was
-nothing to report at all): take no `gh issue edit` action whatsoever. A silent
+nothing to report at all): make no label write whatsoever. A silent
 skip is a complete outcome, not a deferral: do **not** also strip or add
 labels, do **not** claim and release `loom:curating` "just to be safe", and do
 **not** hand the issue to another role "because nothing was said". The issue
@@ -1700,12 +1704,12 @@ hash necessarily differs from the pass that preceded the discovery — the
 
 ```bash
 # Terminal check first: a human already owns it — say nothing, change nothing.
-gh issue view <number> --json labels --jq '.labels[].name' | grep -q '^loom:operator-only$' \
+./.loom/scripts/gh-cached issue view <number> --json labels --jq '.labels[].name' | grep -q '^loom:operator-only$' \
   && echo "already routed — skip silently" \
   || {
     # $CLAIM=true here (escalation is a changed-hash "comment" row) — claim
     # immediately before mutating, per "Claim discipline (#7617)" above.
-    gh issue edit <number> --add-label "loom:curating"
+    gh api repos/{owner}/{repo}/issues/<number>/labels -f 'labels[]=loom:curating'
     ./.loom/scripts/post-comment.sh <number> --body "<!-- curator:dep-recheck:$CONCLUSION_HASH -->
 <!-- curator:orthogonal-block:$ORTHOGONAL -->
 **Curator: tracked blocker is stale — the real block is elsewhere**
@@ -1715,7 +1719,8 @@ This issue is still blocked, but by an unrelated active condition: <the orthogon
 condition, and what would clear it>.
 
 Routing to the operator rather than re-confirming a stale blocker (#6516)."
-    gh issue edit <number> --add-label "loom:operator-only,loom:operator-mechanical" --remove-label "loom:curating"
+    gh api repos/{owner}/{repo}/issues/<number>/labels -f 'labels[]=loom:operator-only' -f 'labels[]=loom:operator-mechanical'
+    gh api -X DELETE repos/{owner}/{repo}/issues/<number>/labels/loom%3Acurating
   }
 ```
 
@@ -1862,9 +1867,9 @@ this step at all when it says `$CLAIM=true` (i.e. `$ACTION` is `comment` or
 exactly as "Claim discipline" above describes:
 
 ```bash
-gh issue edit "$ISSUE_NUMBER" --add-label "loom:curating"
+gh api repos/{owner}/{repo}/issues/"$ISSUE_NUMBER"/labels -f 'labels[]=loom:curating'
 ./.loom/scripts/post-comment.sh "$ISSUE_NUMBER" --body "**Operator-parked, premise possibly stale**: the parked reference #<ref> is now **closed**. Worth an operator look — not auto-releasing; \`loom:operator-only\` and its sub-kind label stay. <!-- curator:operator-premise-recheck:$CONCLUSION_HASH -->"
-gh issue edit "$ISSUE_NUMBER" --remove-label "loom:curating"
+gh api -X DELETE repos/{owner}/{repo}/issues/"$ISSUE_NUMBER"/labels/loom%3Acurating
 ```
 
 The bolded **Operator-parked, premise possibly stale** phrasing is the
@@ -1895,11 +1900,11 @@ nothing to compare against a prior marker either — feed that empty hash into
 without even needing `PRIOR_HASH`, matching "no comment this pass" above.
 
 ```bash
-PRIOR=$(gh issue view "$ISSUE_NUMBER" --json comments \
-  --jq '[.comments[] | select(.body | test("<!-- curator:operator-premise-recheck:"))] | last // {}')
+PRIOR=$(gh api --paginate repos/{owner}/{repo}/issues/"$ISSUE_NUMBER"/comments \
+  --jq '.[] | select(.body | test("<!-- curator:operator-premise-recheck:"))' | jq -cs 'last // {}')
 PRIOR_HASH=$(printf '%s\n' "$PRIOR" | jq -r '.body // ""' \
   | sed -n 's|.*<!-- curator:operator-premise-recheck:\([0-9a-f]\{1,\}\) -->.*|\1|p' | tail -n 1)
-PRIOR_AT=$(printf '%s\n' "$PRIOR" | jq -r '.createdAt // empty')
+PRIOR_AT=$(printf '%s\n' "$PRIOR" | jq -r '.created_at // empty')
 _epoch() { date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -d "$1" +%s; }
 if [ -n "$PRIOR_AT" ]; then
   PRIOR_AGE_H=$(( ( $(date +%s) - $(_epoch "$PRIOR_AT") ) / 3600 ))
