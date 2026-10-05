@@ -560,6 +560,33 @@ pub fn global_export_status() -> crate::types::ObservabilityExportStatus {
     snapshot
 }
 
+/// Once-per-process warning that telemetry export is off (#10282): the silent
+/// `debug!` this replaces left a daemon with no spans/metrics indistinguishable
+/// from a healthy one. Returns whether this call emitted the warning.
+fn warn_telemetry_off_once() -> bool {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    log::warn!(
+        "observability: telemetry is OFF — no spans or metrics will be exported (set \
+         observability.enabled=true to opt in)"
+    );
+    true
+}
+
+#[cfg(test)]
+mod warn_off_tests {
+    #[test]
+    fn warns_only_once_per_process() {
+        // Other tests may have triggered it already; the invariant is that at
+        // most one call ever returns true, and a repeat call never does.
+        let _ = super::warn_telemetry_off_once();
+        assert!(!super::warn_telemetry_off_once());
+        assert!(!super::warn_telemetry_off_once());
+    }
+}
+
 // ============================================================================
 // Per-exporter status map (Issue #8756)
 // ============================================================================
@@ -893,7 +920,7 @@ pub fn spawn_task(
     workspace_pool: Arc<WorkspacePool>,
 ) -> Option<Vec<tokio::task::JoinHandle<()>>> {
     if !resolve_enabled(config) {
-        log::debug!("observability: disabled (set observability.enabled=true to opt in)");
+        warn_telemetry_off_once();
         return None;
     }
     let entries = resolve_exporters(config);

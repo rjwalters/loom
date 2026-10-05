@@ -269,3 +269,20 @@ fn every_span_attribute_survives_export_bounding() {
         assert!(span.attributes.contains_key(*key), "record() never sets {key}");
     }
 }
+
+#[test]
+fn spans_carry_github_api_rest_or_graphql() {
+    let rest = read_op().args(["api", "repos/acme/widgets/issues"]);
+    let gql = read_op().args(["api", "graphql", "-f", "query=x"]);
+    let porcelain = read_op().args(["pr", "list"]);
+    let run_list = read_op().args(["run", "list"]);
+    for (inv, want) in [
+        (rest, "rest"),
+        (gql, "graphql"),
+        (porcelain, "graphql"),
+        (run_list, "rest"),
+    ] {
+        let (_, spans, _) = run(inv, "echo ok");
+        assert_eq!(attr(&spans[0], "github.api"), Some(want));
+    }
+}

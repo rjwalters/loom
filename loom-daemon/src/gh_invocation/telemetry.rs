@@ -59,6 +59,7 @@ pub const SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "github.exit_code",
     "github.invocation",
     "github.launcher",
+    "github.api",
     "context_source",
 ];
 
@@ -114,6 +115,34 @@ impl Outcome {
         Outcome::CollectFailed,
         Outcome::RoutingRefused,
     ];
+}
+
+/// Which GitHub API surface an invocation uses (#10282): `graphql` for
+/// `gh api graphql` and for the porcelain commands that are GraphQL-backed
+/// (`gh issue|pr|project|label ...`, `gh search`), else `rest`.
+#[must_use]
+pub fn github_api_kind(inv: &GhInvocation) -> &'static str {
+    let args: Vec<String> = inv
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    api_kind_for_args(&args)
+}
+
+fn api_kind_for_args(args: &[String]) -> &'static str {
+    let first = args.first().map(String::as_str);
+    match first {
+        Some("api") => {
+            if args.get(1).map(String::as_str) == Some("graphql") {
+                "graphql"
+            } else {
+                "rest"
+            }
+        }
+        Some("issue" | "pr" | "project" | "label" | "search" | "repo" | "release") => "graphql",
+        _ => "rest",
+    }
 }
 
 /// The `(outcome, exit code)` of a captured run.
@@ -313,6 +342,7 @@ impl InvocationSpan {
             ("github.outcome", outcome.as_str().to_string()),
             ("github.invocation", self.invocation.clone()),
             ("github.launcher", launcher_str(launcher).to_string()),
+            ("github.api", github_api_kind(inv).to_string()),
             ("context_source", inv.context_source().to_string()),
         ]
         .into_iter()
