@@ -49,11 +49,20 @@ impl InstanceOrigin {
     /// scheme + host; the scheme separator's `//` does not count).
     pub fn parse(raw: &str) -> Option<Self> {
         let trimmed = raw.trim().trim_end_matches('/').to_ascii_lowercase();
-        let authority = trimmed
-            .split_once("//")
-            .map(|(_, rest)| rest)
-            .unwrap_or(&trimmed);
-        if authority.is_empty() || authority.contains('/') {
+        // Derive the authority from the scheme split on the *untrimmed*
+        // value so "http://" (scheme, no host) is not mistaken for a bare
+        // host once trailing slashes are stripped (#9924).
+        let lowered = raw.trim().to_ascii_lowercase();
+        let authority = match lowered.split_once("://") {
+            Some((scheme, rest)) => {
+                if scheme.is_empty() {
+                    return None;
+                }
+                rest.trim_end_matches('/')
+            }
+            None => trimmed.as_str(),
+        };
+        if authority.is_empty() || authority.contains('/') || authority.ends_with(':') {
             return None;
         }
         // A bare host ("git.example.com") is an origin too — the scheme is
@@ -344,6 +353,15 @@ impl EvidenceLevel {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origin_rejects_hostless_schemes() {
+        for bad in ["http://", "https://", "https:", "//", "", "https:///"] {
+            assert!(InstanceOrigin::parse(bad).is_none(), "{bad:?}");
+        }
+        assert!(InstanceOrigin::parse("https://git.example.com/").is_some());
+        assert!(InstanceOrigin::parse("git.example.com").is_some());
+    }
 
     fn origin_a() -> InstanceOrigin {
         InstanceOrigin::parse("https://Git.Acme.Dev/").unwrap()
