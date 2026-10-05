@@ -1864,7 +1864,7 @@ pub use dispatch_plan::{
 };
 mod fleet_plan;
 pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};
-mod work_finder_tick;
+pub(crate) mod work_finder_tick;
 pub use work_finder_tick::{CapLimiter, CapView, CapacityWait, WorkFinderTickSummary};
 
 mod star_liveness;

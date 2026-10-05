@@ -2304,6 +2304,24 @@ a key. Only the six keys below order the queue.
    issue that leaves the listing — every `loom:building` claim — is read again
    when it returns. Both affect ordering among starred issues only; see
    `StarredAtCache`'s "Accepted staleness" doc comment.
+
+   **Restart store.** Known starred-ats also persist across a daemon restart or
+   roll, so a roll does not re-read every starred issue's timeline at once. The
+   file is `starred-<sha16(cwd|repo)>.json` in the daemon's private listing-cache
+   dir (`${TMPDIR:-/tmp}/loom-forge-listing-cache`, or `LOOM_LISTING_CACHE_DIR`),
+   one per workspace key, written atomically and deleted after 7 days untouched.
+   It is consulted only on an in-process miss, after a loom-ui intent's
+   `requested_at` (which always wins), and a persisted value is reused only when
+   the issue's level-label set is unchanged and the value was seen within the
+   last 30 minutes (`last_seen`, rewritten at most every 5 minutes). Unknown
+   starred-ats are never persisted, so the 10-minute retry still applies. Every
+   in-process drop is mirrored: an issue that leaves the starred set loses its
+   entry and a nothing-starred tick deletes the file, so an unstar and re-star
+   reads the new time. **`LOOM_STARRED_AT_PERSIST=0`** (also `false`/`off`/`no`)
+   turns the store off: nothing is read or written. `status` shows how lookups
+   were answered under `last_work_finder_tick.starred_at_cache` (`mem_hit`,
+   `disk_hit`, `intent_hit`, `read_known`, `read_none`, `read_err`, cumulative
+   since start); the `read_*` rows are the timeline reads that remain.
 3. **Red-main fixes first**: an issue whose body carries
    `<!-- loom:main-red-fix -->` at the start of a line, **only while its repo's
    `main` is verified red** (`WorkspaceHealthStates::is_halted`). A marker on a
