@@ -1672,6 +1672,17 @@ reports `hold`, not `stop`. `status --json` carries `fleet_store.state`
 (`proceed` / `hold` / `stop`); a transition — never the steady state — is also
 published on the event bus as `fleet.sync.state`.
 
+### ETA fit publication branch (#10395)
+
+Besides the reviewed state on `fleet.ref`, the store carries one machine
+artifact on its own branch, `fleet.etaFitRef` (default `eta-fit`): the fleet
+captain's fitted ETA coefficients (`eta/fit/<fit_id>.json` plus the
+`eta-fit-pub/v1` envelope `eta/fit/latest.json`). The captain's writer App needs
+`contents: write` on the store and the branch must be exempt from the `main`
+ruleset; other hosts read it with the App they already use. `fleet.etaFitMaxAgeDays`
+(default 3) bounds how old a publication may be. Contract, verification and
+fallback: [eta → one refresher](eta.md#fleet-refresh-task-autonomousetafleetrefresh-10263).
+
 ## Fleet model A/B — `sweep-experiment plan` (#8055 phase 1)
 
 `loom-daemon sweep-experiment` already randomizes **per issue**, by parity
