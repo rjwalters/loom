@@ -270,6 +270,7 @@ fn list_issues_cached_once(
     let sent = cached_entry(&cache_key, disk_path.as_deref());
 
     let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
+    let sent_at = chrono::Utc::now().timestamp();
     let (status, response, stderr) =
         store::fetch_conditional(issue_list(caller), gh_bin, cwd, &target, &url, sent_etag)?;
     #[cfg(test)]
@@ -298,6 +299,7 @@ fn list_issues_cached_once(
         Some(ref r) if r.status == 200 && status.success() => {
             let issues = parse_rest_issues(&r.body)
                 .with_context(|| format!("parse REST issues JSON from {url}"))?;
+            observe_listing(&target, &r.body, sent_at);
             if page.is_none() && issues.len() >= PER_PAGE {
                 log::warn!(
                     "forge_listing: {url} returned a full page ({PER_PAGE}); the listing may be \
@@ -325,6 +327,36 @@ fn list_issues_cached_once(
                 .unwrap_or_default(),
         )),
     }
+}
+
+/// Feed a first-hand listing `200` for the explicitly named `target.repo` to
+/// the repo-facts record (W3a): the rows' `repository_url` names the
+/// canonical repo, so an origin == base repo is re-verified by every listing
+/// poll at no extra call. A no-op with repo facts off.
+fn observe_listing(target: &store::Target, body: &str, sent_at: i64) {
+    #[derive(serde::Deserialize)]
+    struct RepoUrlOnly {
+        #[serde(default)]
+        repository_url: Option<String>,
+    }
+    let Some(nwo) = target.repo.as_deref() else {
+        return;
+    };
+    if !crate::forge_repo_facts::enabled() {
+        return;
+    }
+    let Ok(rows) = serde_json::from_str::<Vec<RepoUrlOnly>>(body.trim()) else {
+        return;
+    };
+    let Some(full) = rows
+        .iter()
+        .find_map(|r| r.repository_url.as_deref())
+        .and_then(crate::forge_repo_facts::full_name_from_repository_url)
+    else {
+        return;
+    };
+    let host = target.host.as_deref().unwrap_or("github.com");
+    crate::forge_repo_facts::observe(host, nwo, &full, sent_at);
 }
 
 /// The `(etag, issues)` pair to present for `key`: the in-memory hot layer,

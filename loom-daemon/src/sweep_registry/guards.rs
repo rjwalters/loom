@@ -1151,6 +1151,14 @@ impl SweepRegistry {
                 }
             }
         }
+        // W3a: the repo-facts record (fingerprint-invalidated, `gh repo view`
+        // semantics) answers without a forge call; `Legacy` falls through to
+        // the pre-facts cache + `gh repo view` below, unchanged.
+        match self.owner_repo_fact() {
+            crate::forge_repo_facts::Lookup::Fact(f) => return Some((f.owner, f.name)),
+            crate::forge_repo_facts::Lookup::Unavailable => return None,
+            crate::forge_repo_facts::Lookup::Legacy => {}
+        }
         if let Some(cached) = self
             .owner_repo_cache
             .lock()
