@@ -2039,6 +2039,8 @@ mod pass_loop;
 /// sibling file per the file-size ratchet, attributed to `claim_reconciliation`
 /// in the #9251 forge-call accounting.
 mod building_listing;
+/// The ETag-cached REST open-PR listing the PR-side passes share (#10349).
+pub(crate) mod open_pr_listing;
 
 /// The facade glue every `gh` call below goes through (#10089), and the
 /// version-keyed reuse of its per-PR reads — sibling files per the ratchet.
@@ -2058,8 +2060,7 @@ pub mod forge {
         verdict_anchoring_enabled, verdict_staleness_enabled, AnchorAction, ClaimedPr,
         LeaseEvidence, NoProgressEvidence, PrClaimKind, PrClaimOutcome, PrComment, PrReclaimReason,
         PrReconcileAction, ReclaimReason, ReconcileAction, VerdictAction, VerdictKeepReason,
-        VerdictKind, VerdictPr, VerdictReconcileStats, LEASE_MARKER_PREFIX,
-        MAX_ISSUES_PER_WORKSPACE, VERDICT_HOLD_LABELS,
+        VerdictKind, VerdictPr, VerdictReconcileStats, LEASE_MARKER_PREFIX, VERDICT_HOLD_LABELS,
     };
     use crate::sweep_journal;
     use anyhow::{anyhow, Context, Result};
@@ -2545,31 +2546,9 @@ pub mod forge {
     // PR-side claim labels: loom:reviewing / loom:treating (Issue #4367)
     // ------------------------------------------------------------------
 
-    #[derive(Debug, Deserialize)]
-    struct GhClaimedPr {
-        number: u32,
-        #[serde(rename = "updatedAt", default)]
-        updated_at: Option<String>,
-        #[serde(rename = "headRefName", default)]
-        head_ref_name: Option<String>,
-    }
-
     fn list_prs_with_label(gh_bin: &Path, root: &Path, label: &str) -> Result<Vec<ClaimedPr>> {
-        let limit = MAX_ISSUES_PER_WORKSPACE.to_string();
-        let out = gh_call::output(
-            gh_call::read("claim.pr_list_claimed", gh_bin, root)
-                .args([
-                    "pr", "list", "--state", "open", "--label", label, "--limit", &limit,
-                ])
-                .args(["--json", "number,updatedAt,headRefName"])
-                .args(gh_call::loom_repo_flag()),
-        )?;
-        if !out.status.success() {
-            let (root, err) = (root.display(), gh_call::stderr(&out));
-            return Err(anyhow!("gh pr list --label {label} failed in {root}: {err}"));
-        }
-        let rows: Vec<GhClaimedPr> =
-            serde_json::from_slice(&out.stdout).context("parse gh pr list JSON")?;
+        // #10349: the ETag'd REST listing, filtered here (was GraphQL `gh pr list`).
+        let rows = super::open_pr_listing::list_with_label(gh_bin, root, label)?;
         Ok(rows
             .into_iter()
             .map(|r| {
@@ -2596,7 +2575,7 @@ pub mod forge {
                         .map(|dt| dt.with_timezone(&chrono::Utc)),
                     claim_labeled_at,
                     most_recent_claim_activity_at,
-                    head_ref_name: r.head_ref_name,
+                    head_ref_name: r.head_ref,
                 }
             })
             .collect())
@@ -3029,22 +3008,6 @@ pub mod forge {
     // PR-side verdict labels: loom:pr / loom:changes-requested (Issue #5686)
     // ------------------------------------------------------------------
 
-    #[derive(Debug, Deserialize)]
-    struct GhVerdictPr {
-        number: u32,
-        #[serde(rename = "headRefOid", default)]
-        head_ref_oid: Option<String>,
-        #[serde(rename = "updatedAt", default)]
-        updated_at: Option<String>,
-        #[serde(default)]
-        labels: Vec<GhVerdictLabel>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct GhVerdictLabel {
-        name: String,
-    }
-
     /// Every TRUSTED comment body on `pr_number`, oldest first (#9548: an
     /// outsider's or a foreign fleet's well-formed marker is prose, so it is
     /// dropped here, before any marker is read — see [`crate::comment_trust`]).
@@ -3071,28 +3034,15 @@ pub mod forge {
     }
 
     fn list_verdict_prs(gh_bin: &Path, root: &Path, kind: VerdictKind) -> Result<Vec<VerdictPr>> {
-        let (label, limit) = (kind.label(), MAX_ISSUES_PER_WORKSPACE.to_string());
-        let out = gh_call::output(
-            gh_call::read("verdict.pr_list", gh_bin, root)
-                .args([
-                    "pr", "list", "--state", "open", "--label", label, "--limit", &limit,
-                ])
-                .args(["--json", "number,headRefOid,labels,updatedAt"])
-                .args(gh_call::loom_repo_flag()),
-        )?;
-        if !out.status.success() {
-            let (root, err) = (root.display(), gh_call::stderr(&out));
-            return Err(anyhow!("gh pr list --label {label} failed in {root}: {err}"));
-        }
-        let rows: Vec<GhVerdictPr> =
-            serde_json::from_slice(&out.stdout).context("parse gh pr list JSON")?;
+        let label = kind.label();
+        let rows = super::open_pr_listing::list_with_label(gh_bin, root, label)?;
         Ok(rows
             .into_iter()
             .map(|r| {
                 let on_hold = r
                     .labels
                     .iter()
-                    .any(|l| VERDICT_HOLD_LABELS.contains(&l.name.as_str()));
+                    .any(|l| VERDICT_HOLD_LABELS.contains(&l.as_str()));
                 // A held PR is never invalidated, so skip its comment fetch
                 // entirely — the decision cannot change and the call costs
                 // rate limit for nothing. `marker_scan_ok` records that the
@@ -3107,7 +3057,7 @@ pub mod forge {
                     (None, false, false)
                 } else {
                     // #10089: reused while the PR's `updatedAt` and head hold.
-                    let head = r.head_ref_oid.as_deref().unwrap_or_default();
+                    let head = r.head_sha.as_deref().unwrap_or_default();
                     let what = format!("{label}@{head}");
                     let key =
                         super::read_cache::key(root, r.number, &what, r.updated_at.as_deref());
@@ -3126,7 +3076,7 @@ pub mod forge {
                 VerdictPr {
                     number: r.number,
                     kind,
-                    head_sha: r.head_ref_oid,
+                    head_sha: r.head_sha,
                     marker_sha,
                     marker_scan_ok,
                     on_hold,

@@ -48,10 +48,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use anyhow::{anyhow, Result};
 
-use super::{forge, gh_call, MAX_ISSUES_PER_WORKSPACE, VERDICT_HOLD_LABELS, VERDICT_MARKER_PREFIX};
+use super::open_pr_listing::{self, RestPull};
+use super::{forge, gh_call, VERDICT_HOLD_LABELS, VERDICT_MARKER_PREFIX};
 
 /// Kill switch for this pass (`0`/`false`/`no`/`off` disables). Defaults ON.
 pub const REVIEW_CONFLICT_ENABLED_ENV: &str = "LOOM_REVIEW_CONFLICT_RECONCILE";
@@ -94,6 +94,18 @@ impl Mergeable {
             Some("MERGEABLE") => Self::Mergeable,
             Some("CONFLICTING") => Self::Conflicting,
             _ => Self::Unknown,
+        }
+    }
+
+    /// REST `GET pulls/{n}`'s boolean form (#10349): `null` (still being
+    /// computed) or absent is [`Self::Unknown`], exactly like GraphQL's
+    /// `UNKNOWN`.
+    #[must_use]
+    pub fn from_rest(raw: Option<bool>) -> Self {
+        match raw {
+            Some(true) => Self::Mergeable,
+            Some(false) => Self::Conflicting,
+            None => Self::Unknown,
         }
     }
 }
@@ -209,45 +221,10 @@ pub fn flag_comment_body(head_sha: &str) -> String {
     )
 }
 
-#[derive(Debug, Deserialize)]
-struct GhLabel {
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhConflictPr {
-    number: u32,
-    #[serde(rename = "headRefOid", default)]
-    head_ref_oid: Option<String>,
-    #[serde(default)]
-    mergeable: Option<String>,
-    #[serde(default)]
-    labels: Vec<GhLabel>,
-}
-
-/// Parse one `gh pr list --json number,headRefOid,mergeable,labels` payload.
-///
-/// # Errors
-/// Malformed JSON.
-pub fn parse_pr_list(stdout: &[u8]) -> Result<Vec<ConflictPr>> {
-    let rows: Vec<GhConflictPr> =
-        serde_json::from_slice(stdout).context("parse gh pr list JSON")?;
-    Ok(rows
-        .into_iter()
-        .map(|r| ConflictPr {
-            number: r.number,
-            head_sha: r.head_ref_oid,
-            mergeable: Mergeable::parse(r.mergeable.as_deref()),
-            labels: r.labels.into_iter().map(|l| l.name).collect(),
-        })
-        .collect())
-}
-
 /// Run `gh pr <args…>` in `root` with the per-root credential and `LOOM_REPO`
 /// applied, returning stdout on success.
 fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let inv = match args.first().copied() {
-        Some("list") => gh_call::read("review_conflict.pr_list", gh_bin, root),
         Some("view") => gh_call::read("review_conflict.pr_view", gh_bin, root),
         Some("comment") => gh_call::write("review_conflict.pr_comment", gh_bin, root),
         _ => gh_call::write("review_conflict.pr_edit", gh_bin, root),
@@ -264,55 +241,35 @@ fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// Fields of the one open-PR listing this pass shares with
-/// [`super::merge_sequence`] (#4429 follow-up): the union of what
-/// [`parse_pr_list`] and `merge_sequence::parse_pr_list` read, so the
-/// sequence pass can reuse the same payload instead of re-listing.
-pub(super) const OPEN_PR_FIELDS: &str =
-    "number,createdAt,updatedAt,headRefOid,headRefName,baseRefName,isDraft,labels,mergeable";
-
-/// Page budget of the shared listing. `gh` pages at 100, so a workspace with
-/// at most 100 open PRs still costs exactly one request; the headroom keeps a
-/// busier repo from silently truncating the label subset the two per-label
-/// listings used to fetch (each capped at [`MAX_ISSUES_PER_WORKSPACE`]).
-const OPEN_PR_LIST_LIMIT: u32 = MAX_ISSUES_PER_WORKSPACE * 3;
-
-/// ONE `gh pr list --state open` for the workspace, raw (#4429 follow-up).
-///
-/// This pass used to issue two GraphQL listings per workspace per tick
-/// (`--label loom:review-requested`, `--label loom:merge-conflict`) and the
-/// merge-sequence pass a third (every open PR) right after it. All three are
-/// subsets of this one payload; the label filter now happens client-side in
-/// [`conflict_candidates`].
-fn list_open_prs_raw(gh_bin: &Path, root: &Path) -> Result<Vec<u8>> {
-    let limit = OPEN_PR_LIST_LIMIT.to_string();
-    gh_pr(
-        gh_bin,
-        root,
-        &[
-            "list",
-            "--state",
-            "open",
-            "--limit",
-            &limit,
-            "--json",
-            OPEN_PR_FIELDS,
-        ],
-    )
-}
-
 /// The PRs this pass decides on: those carrying `loom:review-requested` or
-/// `loom:merge-conflict` — exactly what the two former per-label listings
-/// returned, keyed by number (a PR carrying both appears once).
+/// `loom:merge-conflict`, keyed by number (a PR carrying both appears once).
 ///
-/// # Errors
-/// Malformed JSON.
-pub fn conflict_candidates(stdout: &[u8]) -> Result<BTreeMap<u32, ConflictPr>> {
-    Ok(parse_pr_list(stdout)?
-        .into_iter()
-        .filter(|p| p.has(REVIEW_REQUESTED) || p.has(MERGE_CONFLICT))
-        .map(|p| (p.number, p))
-        .collect())
+/// The REST listing has no `mergeable` (#10349), so `mergeable` is asked per
+/// candidate — but only for one whose decision it can change: a held or
+/// in-flight PR is kept whatever GitHub says, so it is never read and stays
+/// [`Mergeable::Unknown`].
+pub fn conflict_candidates(
+    rows: &[RestPull],
+    mut mergeable: impl FnMut(u32) -> Mergeable,
+) -> BTreeMap<u32, ConflictPr> {
+    rows.iter()
+        .filter(|r| r.has_label(REVIEW_REQUESTED) || r.has_label(MERGE_CONFLICT))
+        .map(|r| {
+            let mut pr = ConflictPr {
+                number: r.number,
+                head_sha: r.head_sha.clone(),
+                mergeable: Mergeable::Unknown,
+                labels: r.labels.clone(),
+            };
+            if !matches!(
+                decide_review_conflict(&pr),
+                ConflictAction::Keep(ConflictKeepReason::Held | ConflictKeepReason::InFlight)
+            ) {
+                pr.mergeable = mergeable(r.number);
+            }
+            (r.number, pr)
+        })
+        .collect()
 }
 
 /// Comment first, then relabel — a failed comment aborts before any label is
@@ -387,7 +344,7 @@ pub fn reconcile_review_conflicts(gh_bin: &Path, root: &Path) -> ReviewConflictS
     reconcile_review_conflicts_sharing(gh_bin, root).0
 }
 
-/// [`reconcile_review_conflicts`], also handing back the raw open-PR listing
+/// [`reconcile_review_conflicts`], also handing back the open-PR listing
 /// it read — but only when this pass **attempted no write** on the
 /// workspace, so the listing still describes the forge as it is now. The
 /// caller passes it to [`super::merge_sequence::reconcile_merge_sequences_with`],
@@ -398,14 +355,12 @@ pub fn reconcile_review_conflicts(gh_bin: &Path, root: &Path) -> ReviewConflictS
 pub(super) fn reconcile_review_conflicts_sharing(
     gh_bin: &Path,
     root: &Path,
-) -> (ReviewConflictStats, Option<Vec<u8>>) {
+) -> (ReviewConflictStats, Option<Vec<RestPull>>) {
     let mut stats = ReviewConflictStats::default();
     if !review_conflict_enabled() {
         return (stats, None);
     }
-    let listed = list_open_prs_raw(gh_bin, root)
-        .and_then(|raw| conflict_candidates(&raw).map(|prs| (raw, prs)));
-    let (raw, prs) = match listed {
+    let raw = match open_pr_listing::list_open_prs(gh_bin, root) {
         Ok(v) => v,
         Err(e) => {
             log::warn!("claim_reconciliation (review conflicts): {}: {e}", root.display());
@@ -416,6 +371,7 @@ pub(super) fn reconcile_review_conflicts_sharing(
             return (stats, None);
         }
     };
+    let prs = conflict_candidates(&raw, |n| open_pr_listing::mergeable_of(gh_bin, root, n));
     stats.checked = prs.len();
     let mut attempted_write = false;
 

@@ -54,8 +54,8 @@ pub(super) struct ReconciliationPassStats {
 /// already applied to `work_finder`'s own dispatch-guard chain. Before this,
 /// the breaker was consulted only once before the loop
 /// ([`super::run_reconciliation_pass`]'s own top-of-function check), so a
-/// trip on repo N still let repos N+1..len() each issue their full `gh pr
-/// list` / `gh issue list` fan-out against an already-exhausted shared quota.
+/// trip on repo N still let repos N+1..len() each issue their full listing
+/// fan-out against an already-exhausted shared quota.
 pub(super) fn run_reconciliation_pass_over_roots(
     roots: &[std::path::PathBuf],
     gh_bin: &Path,
@@ -95,8 +95,8 @@ pub(super) fn run_reconciliation_pass_over_roots(
         //
         // #4429 follow-up: the conflict pass reads ONE open-PR listing and
         // hands it on when it wrote nothing, so the sequence pass below does
-        // not list every open PR a second time (2 of this root's per-tick
-        // GraphQL `gh pr list`s saved in the steady state).
+        // not list every open PR a second time. Since #10349 every PR-side
+        // listing here is the ETag'd REST one — no GraphQL `gh pr list`.
         let (_, open_prs) = review_conflict::reconcile_review_conflicts_sharing(gh_bin, root);
         // #9686: after review conflicts, so a repair the conflict pass just
         // deferred (sequenced behind an open predecessor) is recorded by the

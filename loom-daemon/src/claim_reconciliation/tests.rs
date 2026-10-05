@@ -4,6 +4,7 @@ use serial_test::serial;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
 use {super::*, crate::comment_trust::records::TEST_FLEET_AUTHOR as FLEET_AUTHOR};
+use super::open_pr_listing::test_support::{pulls_arm, row};
 
 fn issue(number: u32, updated_at: Option<DateTime<Utc>>) -> BuildingIssue {
     BuildingIssue { number, updated_at }
@@ -2949,17 +2950,14 @@ fn write_fake_gh_pr(
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":{pr_number},"updatedAt":"{updated_at}","headRefName":"{head_ref_name}"}}]'
-  exit 0
-fi
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+{pulls}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   echo '{{"labels":[{labels_json}]}}'
   exit 0
 fi
 exit 0
 "#,
         log = gh_log.display(),
+        pulls = pulls_arm(&[row(pr_number, &["loom:reviewing"]).head(head_ref_name).updated(updated_at)]),
     );
     std::fs::write(&fake_gh, &script).unwrap();
     #[cfg(unix)]
@@ -3471,19 +3469,15 @@ fn write_fake_gh_for_verdict_reconcile(
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":192,"headRefOid":"{sha_b}","labels":[{{"name":"loom:pr"}},{{"name":"loom:changes-requested"}}]}}]'
-  exit 0
-fi
-if [ "$1" = "api" ]; then
+{pulls}if [ "$1" = "api" ]; then
   echo '[{{"user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}},"author_association":"NONE","created_at":"2026-08-23T06:00:00Z","body":"Reviewed.\n\n<!-- loom:verdict-sha sha={sha_a} verdict=approved -->"}}]'
   exit 0
 fi
 exit 0
 "#,
         log = gh_log.display(),
+        pulls = pulls_arm(&[row(192, &["loom:pr", "loom:changes-requested"]).sha(SHA_B)]),
         sha_a = SHA_A,
-        sha_b = SHA_B,
     );
     std::fs::write(&fake_gh, &script).unwrap();
     #[cfg(unix)]

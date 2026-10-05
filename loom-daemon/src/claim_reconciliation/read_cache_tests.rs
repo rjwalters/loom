@@ -4,6 +4,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::*;
+use crate::claim_reconciliation::open_pr_listing::test_support::{
+    listing, pulls_arm, pulls_arm_cmd, row,
+};
 use crate::claim_reconciliation::{forge, merge_sequence, VERDICT_STALENESS_ENABLED_ENV};
 use serial_test::serial;
 use std::cell::Cell;
@@ -117,15 +120,16 @@ fn unchanged_verdict_prs_are_scanned_once_across_passes() {
     std::fs::create_dir_all(&root).unwrap();
     let updated = dir.path().join("updated");
     std::fs::write(&updated, "2026-10-03T10:00:00Z").unwrap();
+    // #10349: the REST listing; `updated_at` is re-read from the file.
+    let listing_at = |at: &str| listing(&[row(42, &["loom:pr"]).sha(SHA).updated(at)]);
+    let (a, b) = (listing_at("2026-10-03T10:00:00Z"), listing_at("2026-10-03T10:05:00Z"));
+    let u = updated.display();
+    let emit = format!("if grep -q 10:05 '{u}'; then echo '{b}'; else echo '{a}'; fi");
     let body = format!(
-        r#"if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  case "$*" in *loom:pr*) echo "[{{\"number\":42,\"headRefOid\":\"{SHA}\",\"updatedAt\":\"$(cat '{u}')\",\"labels\":[{{\"name\":\"loom:pr\"}}]}}]" ;; *) echo '[]' ;; esac
-  exit 0
-fi
-if [ "$1" = "api" ]; then
+        r#"{pulls}if [ "$1" = "api" ]; then
   echo '[{{"user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}},"author_association":"NONE","created_at":"2026-10-03T09:00:00Z","body":"LGTM <!-- loom:verdict-sha sha={SHA} verdict=approved -->"}}]'
 fi"#,
-        u = updated.display()
+        pulls = pulls_arm_cmd(&emit)
     );
     let (gh, log) = fake_gh(dir.path(), &body);
 
@@ -158,12 +162,11 @@ fn unchanged_claimed_prs_read_their_label_timeline_once() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
-    let body = r#"if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  case "$*" in *loom:reviewing*) echo '[{"number":7,"updatedAt":"2026-10-03T10:00:00Z","headRefName":"feature/issue-7"}]' ;; *) echo '[]' ;; esac
-  exit 0
-fi
-case "$*" in *timeline*) echo '"2026-10-03T09:30:00Z"' ;; esac"#;
-    let (gh, log) = fake_gh(dir.path(), body);
+    let pulls = pulls_arm(&[row(7, &["loom:reviewing"]).updated("2026-10-03T10:00:00Z")]);
+    let body = format!(
+        r#"{pulls}case "$*" in *timeline*) echo '"2026-10-03T09:30:00Z"' ;; esac"#
+    );
+    let (gh, log) = fake_gh(dir.path(), &body);
     cached(|| {
         for _ in 0..3 {
             let (checked, _) = forge::reconcile_pr_claims_report(&gh, &root, false);
@@ -184,17 +187,15 @@ fn unchanged_open_prs_read_their_changed_files_once() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
-    let row = |n: u32| {
-        format!(
-            r#"{{"number":{n},"createdAt":"2026-10-0{n}T00:00:00Z","updatedAt":"2026-10-03T00:00:00Z","headRefOid":"{SHA}","headRefName":"b{n}","baseRefName":"main","isDraft":false,"labels":[]}}"#
-        )
+    let seq_row = |n: u32| {
+        row(n, &[])
+            .sha(SHA)
+            .created(&format!("2026-10-0{n}T00:00:00Z"))
+            .updated("2026-10-03T00:00:00Z")
     };
     let body = format!(
-        r#"if [ "$1" = "pr" ] && [ "$2" = "list" ]; then echo '[{},{},{}]'; exit 0; fi
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo '{{"files":[{{"path":"src/a.rs"}}]}}'; fi"#,
-        row(1),
-        row(2),
-        row(3)
+        r#"{}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo '{{"files":[{{"path":"src/a.rs"}}]}}'; fi"#,
+        pulls_arm(&[seq_row(3), seq_row(2), seq_row(1)])
     );
     let (gh, log) = fake_gh(dir.path(), &body);
     cached(|| {

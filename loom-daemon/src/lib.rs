@@ -198,6 +198,7 @@ pub mod forge_merge_config;
 pub mod forge_merge_method;
 pub mod forge_parser;
 pub mod forge_pr_congestion;
+pub mod forge_pull_listing;
 pub mod forge_read_pool;
 pub mod forge_tree_unchanged;
 pub mod forge_wait_checks;

@@ -119,11 +119,7 @@ mod tests {
         let script = format!(
             r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":8694,"headRefOid":"{sha_b}","labels":[{{"name":"loom:pr"}}]}}]'
-  exit 0
-fi
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+{pulls}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   echo '{{"id":"PR_kwDOQAPbH88AAAABEp4dZw","autoMergeRequest":{auto_merge}}}'
   exit 0
 fi
@@ -142,6 +138,7 @@ fi
 exit 0
 "#,
             log = log.display(),
+            pulls = super::super::open_pr_listing::test_support::pulls_arm(&[super::super::open_pr_listing::test_support::row(8694, &["loom:pr"]).sha(SHA_B)]),
             sha_a = SHA_A,
             sha_b = SHA_B,
         );

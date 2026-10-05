@@ -562,25 +562,27 @@ fn a_new_pr_chains_behind_a_held_predecessor() {
 
 // ---- #4429 follow-up: reuse of the review-conflict pass's listing ----
 
-fn listing_json(n: u32) -> String {
-    let rows: Vec<String> = (1..=n)
-        .map(|i| {
-            format!(
-                r#"{{"number":{i},"createdAt":"2026-10-02T00:00:00Z","updatedAt":"2026-10-02T00:00:00Z","headRefOid":"{i:040x}","headRefName":"feature/issue-{i}","baseRefName":"main","isDraft":false,"mergeable":"MERGEABLE","labels":[]}}"#
-            )
-        })
-        .collect();
-    format!("[{}]", rows.join(","))
+/// `n` open REST rows, newest first (as the listing returns them).
+fn rest_rows(n: u32) -> Vec<super::super::open_pr_listing::RestPull> {
+    use super::super::open_pr_listing::test_support::{listing, row};
+    let rows: Vec<_> = (1..=n).rev().map(|i| row(i, &[])).collect();
+    crate::forge_pull_listing::parse_rest_pulls(&listing(&rows)).unwrap()
 }
 
-/// The shared payload (which carries `mergeable` too) parses, and is cut to
-/// the same 100 newest PRs this pass's own `--limit` listing returns.
+/// The planner's cut of the REST listing is the same 100 newest PRs the old
+/// `--limit` listing returned, with every field mapped.
 #[test]
-fn shared_listing_parses_and_truncates_to_own_limit() {
-    let got = shared_open_prs(listing_json(150).as_bytes()).unwrap();
+fn sequence_prs_maps_rows_and_truncates_to_own_limit() {
+    let got = sequence_prs(&rest_rows(150));
     assert_eq!(got.len(), super::super::MAX_ISSUES_PER_WORKSPACE as usize);
-    assert_eq!(got[0].number, 1);
-    assert!(shared_open_prs(b"not json").is_none());
+    assert_eq!(got[0].number, 150, "newest first");
+    assert_eq!(got[0].head_sha.as_deref(), Some(format!("{:040x}", 150).as_str()));
+    assert_eq!(
+        (got[0].head_ref.as_str(), got[0].base_ref.as_str()),
+        ("feature/issue-150", "main")
+    );
+    assert_eq!(got[0].created_at, "2026-10-01T00:00:00Z");
+    assert!(!got[0].draft);
 }
 
 #[cfg(unix)]
@@ -598,30 +600,27 @@ fn logging_gh(dir: &std::path::Path, log: &std::path::Path) -> std::path::PathBu
     bin
 }
 
-/// A shared listing replaces this pass's own `gh pr list`; without one (or
-/// with one that does not parse) the pass lists for itself as before.
+/// A shared listing replaces this pass's own listing read; without one the
+/// pass lists for itself — through the REST listing, never `gh pr list`.
 #[cfg(unix)]
 #[test]
 #[serial_test::serial]
-fn a_shared_listing_saves_the_pass_its_own_pr_list() {
+fn a_shared_listing_saves_the_pass_its_own_listing() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
     let prev = std::env::var(MERGE_SEQUENCE_ENABLED_ENV).ok();
     std::env::remove_var(MERGE_SEQUENCE_ENABLED_ENV);
-    let one = listing_json(1);
-    let cases: [(Option<&[u8]>, bool); 3] = [
-        (Some(one.as_bytes()), false),
-        (None, true),
-        (Some(b"not json"), true),
-    ];
+    let one = rest_rows(1);
+    let cases: [(Option<&[_]>, bool); 2] = [(Some(one.as_slice()), false), (None, true)];
     for (i, (prefetched, expect_list)) in cases.into_iter().enumerate() {
         let log = dir.path().join(format!("gh-{i}.log"));
         std::fs::write(&log, "").unwrap();
         let gh = logging_gh(dir.path(), &log);
         let stats = reconcile_merge_sequences_with(&gh, &root, prefetched);
         let calls = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(calls.contains("pr list"), expect_list, "case {i}: {calls}");
+        assert_eq!(calls.contains("pulls?state=open"), expect_list, "case {i}: {calls}");
+        assert!(!calls.contains("pr list"), "case {i}: {calls}");
         if !expect_list {
             assert_eq!(stats.checked, 1, "case {i}");
         }
@@ -634,20 +633,17 @@ fn a_shared_listing_saves_the_pass_its_own_pr_list() {
 // ---- #10089: Phase 2 reuses Phase 1's holder comment reads ----
 
 /// A listing of `n` open PRs; the numbers in `held` carry the hold label.
-fn listing_with_holds(n: u32, held: &[u32]) -> String {
-    let rows: Vec<String> = (1..=n)
+fn listing_with_holds(n: u32, held: &[u32]) -> Vec<super::super::open_pr_listing::RestPull> {
+    use super::super::open_pr_listing::test_support::{listing, row};
+    let rows: Vec<_> = (1..=n)
         .map(|i| {
-            let labels = if held.contains(&i) {
-                format!(r#"[{{"name":"{SEQUENCE_LABEL}"}}]"#)
-            } else {
-                "[]".to_string()
-            };
-            format!(
-                r#"{{"number":{i},"createdAt":"2026-10-02T00:00:0{i}Z","updatedAt":"2026-10-02T00:00:00Z","headRefOid":"{i:040x}","headRefName":"feature/issue-{i}","baseRefName":"main","isDraft":false,"labels":{labels}}}"#
-            )
+            let labels: &[&str] = if held.contains(&i) { &[SEQUENCE_LABEL] } else { &[] };
+            row(i, labels)
+                .created(&format!("2026-10-02T00:00:0{i}Z"))
+                .updated("2026-10-02T00:00:00Z")
         })
         .collect();
-    format!("[{}]", rows.join(","))
+    crate::forge_pull_listing::parse_rest_pulls(&listing(&rows)).unwrap()
 }
 
 /// Each holder's comments are walked ONCE per tick: Phase 1 reads them to
@@ -667,7 +663,7 @@ fn a_tick_walks_each_holders_comments_once() {
     let gh = logging_gh(dir.path(), &log);
     let listing = listing_with_holds(3, &[2, 3]);
 
-    let stats = reconcile_merge_sequences_with(&gh, &root, Some(listing.as_bytes()));
+    let stats = reconcile_merge_sequences_with(&gh, &root, Some(&listing));
 
     let calls = std::fs::read_to_string(&log).unwrap();
     let walks = |n: u32| {
