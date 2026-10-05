@@ -1064,8 +1064,7 @@ cmd_start() {
     # entirely. Dispatch source: the watched pid is the sweep child, which already
     # bounds the loop, so skip the read and assert "open" to `check` (it still
     # enforces release / supersede). In-session starts keep the read.
-    local have_renewer=1
-    "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer --help > /dev/null 2>&1 || have_renewer=0
+    local have_renewer=1; "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer --help > /dev/null 2>&1 || have_renewer=0
     local cap_msg="sweep-lease-renew: renewal loop for issue #${issue} exiting: reached the ${max_age}s absolute lifetime cap (SWEEP_LEASE_RENEW_MAX_AGE_SECS / --max-age, #7825). The lease now ages out and the claim becomes reclaimable; set the cap to 0 to disable it."
     (
         cached_lease="" misses=0
@@ -1074,8 +1073,7 @@ cmd_start() {
             sleep "$interval"
             pid_is_live "$watch_pid" "$watch_ident" || break
             ! max_age_exceeded "$loop_started_at" "$max_age" || { echo "$cap_msg" >&9; break; }
-            gate_rc=0
-            issue_state="$( ((have_renewer)) && [[ "${LOOM_SWEEP_LEASE_RENEW_SOURCE:-}" != "dispatch" ]] || { echo open; exit 0; }; export LOOM_ROLE=sweep-lease-renew; [[ -z "$sweep_id" ]] || export LOOM_SWEEP_ID="$sweep_id"; lease_gh read api "repos/$(gh_repo_path)/issues/${issue}" --jq .state 2>&9)" || issue_state=""
+            gate_rc=0; issue_state="$( ((have_renewer)) && [[ "${LOOM_SWEEP_LEASE_RENEW_SOURCE:-}" != "dispatch" ]] || { echo open; exit 0; }; export LOOM_ROLE=sweep-lease-renew; [[ -z "$sweep_id" ]] || export LOOM_SWEEP_ID="$sweep_id"; lease_gh read api "repos/$(gh_repo_path)/issues/${issue}" --jq .state 2>&9)" || issue_state=""
             ((have_renewer == 0)) || "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer check "${owner_args[@]}" --issue-state "$issue_state" 2>&9 || gate_rc=$?
             ((gate_rc != 3)) || break
             ((gate_rc != 4)) || continue
