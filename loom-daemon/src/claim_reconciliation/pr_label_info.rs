@@ -96,9 +96,11 @@ fi
 exit 0
 "#,
             log = gh_log.display(),
-            pulls = super::super::open_pr_listing::test_support::pulls_arm(&[super::super::open_pr_listing::test_support::row(pr_number, &["loom:reviewing"])
-                .head(head_ref_name)
-                .updated(updated_at)]),
+            pulls = super::super::open_pr_listing::test_support::pulls_arm(&[
+                super::super::open_pr_listing::test_support::row(pr_number, &["loom:reviewing"])
+                    .head(head_ref_name)
+                    .updated(updated_at)
+            ]),
         );
         std::fs::write(&fake_gh, &script).unwrap();
         let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
@@ -187,9 +189,11 @@ fi
 exit 0
 "#,
             log = gh_log.display(),
-            pulls = super::super::open_pr_listing::test_support::pulls_arm(&[super::super::open_pr_listing::test_support::row(503, &["loom:reviewing"])
-                .head("some-random-branch")
-                .updated(&old)]),
+            pulls = super::super::open_pr_listing::test_support::pulls_arm(&[
+                super::super::open_pr_listing::test_support::row(503, &["loom:reviewing"])
+                    .head("some-random-branch")
+                    .updated(&old)
+            ]),
         );
         std::fs::write(&fake_gh, &script).unwrap();
         let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();

@@ -637,7 +637,11 @@ fn listing_with_holds(n: u32, held: &[u32]) -> Vec<super::super::open_pr_listing
     use super::super::open_pr_listing::test_support::{listing, row};
     let rows: Vec<_> = (1..=n)
         .map(|i| {
-            let labels: &[&str] = if held.contains(&i) { &[SEQUENCE_LABEL] } else { &[] };
+            let labels: &[&str] = if held.contains(&i) {
+                &[SEQUENCE_LABEL]
+            } else {
+                &[]
+            };
             row(i, labels)
                 .created(&format!("2026-10-02T00:00:0{i}Z"))
                 .updated("2026-10-02T00:00:00Z")

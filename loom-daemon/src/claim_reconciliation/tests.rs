@@ -1,10 +1,10 @@
+use super::open_pr_listing::test_support::{pulls_arm, row};
 use chrono::Duration;
 use serial_test::serial;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
 use {super::*, crate::comment_trust::records::TEST_FLEET_AUTHOR as FLEET_AUTHOR};
-use super::open_pr_listing::test_support::{pulls_arm, row};
 
 fn issue(number: u32, updated_at: Option<DateTime<Utc>>) -> BuildingIssue {
     BuildingIssue { number, updated_at }
@@ -2957,7 +2957,9 @@ fi
 exit 0
 "#,
         log = gh_log.display(),
-        pulls = pulls_arm(&[row(pr_number, &["loom:reviewing"]).head(head_ref_name).updated(updated_at)]),
+        pulls = pulls_arm(&[row(pr_number, &["loom:reviewing"])
+            .head(head_ref_name)
+            .updated(updated_at)]),
     );
     std::fs::write(&fake_gh, &script).unwrap();
     #[cfg(unix)]

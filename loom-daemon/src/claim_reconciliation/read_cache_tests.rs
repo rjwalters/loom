@@ -163,9 +163,7 @@ fn unchanged_claimed_prs_read_their_label_timeline_once() {
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
     let pulls = pulls_arm(&[row(7, &["loom:reviewing"]).updated("2026-10-03T10:00:00Z")]);
-    let body = format!(
-        r#"{pulls}case "$*" in *timeline*) echo '"2026-10-03T09:30:00Z"' ;; esac"#
-    );
+    let body = format!(r#"{pulls}case "$*" in *timeline*) echo '"2026-10-03T09:30:00Z"' ;; esac"#);
     let (gh, log) = fake_gh(dir.path(), &body);
     cached(|| {
         for _ in 0..3 {

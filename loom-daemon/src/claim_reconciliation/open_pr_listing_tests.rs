@@ -73,8 +73,7 @@ impl Drop for EnvGuard {
 }
 
 fn run_pass(root: &Path, gh: &Path) {
-    let stats =
-        run_reconciliation_pass_over_roots(&[root.to_path_buf()], gh, false, || false);
+    let stats = run_reconciliation_pass_over_roots(&[root.to_path_buf()], gh, false, || false);
     assert_eq!(stats.roots_processed, 1);
 }
 
@@ -88,15 +87,15 @@ fn a_pass_decides_everything_without_a_graphql_pr_list() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
-    let _journal = EnvGuard::set(
-        crate::sweep_journal::JOURNAL_PATH_ENV,
-        dir.path().join("sweeps.json"),
-    );
+    let _journal =
+        EnvGuard::set(crate::sweep_journal::JOURNAL_PATH_ENV, dir.path().join("sweeps.json"));
     let _stale = EnvGuard::set(STALE_REVIEWING_MINUTES_ENV, "30");
     let log = dir.path().join("gh.log");
     let old = (chrono::Utc::now() - chrono::Duration::minutes(180)).to_rfc3339();
     let rows = [
-        row(500, &["loom:reviewing"]).head("some-random-branch").updated(&old),
+        row(500, &["loom:reviewing"])
+            .head("some-random-branch")
+            .updated(&old),
         row(192, &["loom:pr"]).sha(SHA_B),
         row(300, &["loom:review-requested"]),
     ];
@@ -211,10 +210,8 @@ fn an_unchanged_workspace_costs_only_304s_and_is_accounted() {
     std::fs::create_dir_all(&root).unwrap();
     let store_dir = dir.path().join("etag-store");
     let sink = dir.path().join("sink");
-    let _journal = EnvGuard::set(
-        crate::sweep_journal::JOURNAL_PATH_ENV,
-        dir.path().join("sweeps.json"),
-    );
+    let _journal =
+        EnvGuard::set(crate::sweep_journal::JOURNAL_PATH_ENV, dir.path().join("sweeps.json"));
     let (inner, log, oks) = write_etag_stub(dir.path());
     let ws = WritableRoot::register_with_gh(&root, &inner);
     crate::forge_etag_store::set_test_daemon_store_dir(Some(store_dir));
@@ -274,10 +271,8 @@ fn each_pass_sees_the_current_listing() {
     std::fs::create_dir_all(&root).unwrap();
     let body = dir.path().join("listing.json");
     std::fs::write(&body, listing(&[row(1, &["loom:pr"])])).unwrap();
-    let script = format!(
-        "#!/bin/sh\n{}exit 0\n",
-        pulls_arm_cmd(&format!("cat '{}'", body.display()))
-    );
+    let script =
+        format!("#!/bin/sh\n{}exit 0\n", pulls_arm_cmd(&format!("cat '{}'", body.display())));
     let gh = dir.path().join("fake-gh.sh");
     write_script(&gh, &script);
     let first = list_with_label(&gh, &root, "loom:pr").unwrap();

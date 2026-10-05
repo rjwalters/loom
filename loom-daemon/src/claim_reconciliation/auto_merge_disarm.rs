@@ -138,9 +138,10 @@ fi
 exit 0
 "#,
             log = log.display(),
-            pulls = super::super::open_pr_listing::test_support::pulls_arm(&[super::super::open_pr_listing::test_support::row(8694, &["loom:pr"]).sha(SHA_B)]),
+            pulls = super::super::open_pr_listing::test_support::pulls_arm(&[
+                super::super::open_pr_listing::test_support::row(8694, &["loom:pr"]).sha(SHA_B)
+            ]),
             sha_a = SHA_A,
-            sha_b = SHA_B,
         );
         std::fs::write(&bin, script).unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();

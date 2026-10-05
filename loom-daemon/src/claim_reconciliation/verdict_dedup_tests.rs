@@ -314,7 +314,6 @@ exit 0
             ]),
             dir = dir.display(),
             sha_a = SHA_A,
-            sha_b = SHA_B,
             compare_body = compare_body,
         );
         std::fs::write(&bin, script).unwrap();
