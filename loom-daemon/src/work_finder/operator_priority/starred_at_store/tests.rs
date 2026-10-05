@@ -20,6 +20,11 @@ const T0: &str = "2026-09-01T00:00:00Z";
 const T1: &str = "2026-09-20T00:00:00Z";
 const REQUESTED: &str = "2026-08-15T12:00:00Z";
 const NOW: u64 = 1_800_000_000;
+/// The listed `updated_at` every helper item carries: unchanged across ticks
+/// unless a test moves it.
+const U0: &str = "2026-09-25T00:00:00Z";
+/// A later `updated_at`: something (an unstar + re-star) happened on the issue.
+const U1: &str = "2026-09-25T00:20:00Z";
 
 #[derive(Default)]
 struct Fake {
@@ -46,6 +51,10 @@ fn fake(issue: u32, at: &str) -> Fake {
 }
 
 fn starred(n: u32) -> WorkItem {
+    starred_updated(n, Some(U0))
+}
+
+fn starred_updated(n: u32, updated_at: Option<&str>) -> WorkItem {
     WorkItem::new(
         n,
         vec![
@@ -53,6 +62,7 @@ fn starred(n: u32) -> WorkItem {
             "loom:issue".to_string(),
         ],
     )
+    .with_updated_at(updated_at.map(str::to_string))
 }
 
 fn high(n: u32) -> WorkItem {
@@ -62,6 +72,7 @@ fn high(n: u32) -> WorkItem {
         .map(|r| r.operator_label)
         .unwrap();
     WorkItem::new(n, vec![OPERATOR_PRIORITY_LABEL.to_string(), label.to_string()])
+        .with_updated_at(Some(U0.to_string()))
 }
 
 fn store(dir: &Path, key: &str) -> StarredAtStore {
@@ -380,4 +391,107 @@ fn an_intent_answering_a_level_change_is_not_tallied_as_a_read() {
     assert_eq!((t.intent_hit, t.reads()), (1, 0));
     assert_eq!(src.calls, vec![1]);
     assert_eq!(items[0].operator_priority_at.as_deref(), Some(REQUESTED));
+}
+
+/// Judge, PR #10437: an unstar + re-star made on the forge while the daemon
+/// was down is never seen as a gap, but it advances the issue's `updated_at`.
+/// A persisted value confirmed under an older `updated_at` is not reused.
+#[test]
+fn a_restar_during_downtime_is_read_not_masked_by_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = store(dir.path(), "/ws|downtime");
+    let mut src = fake(1, T0);
+    tick(&mut StarredAtCache::default(), &mut [starred(1)], &mut src, Some(&st), NOW);
+    assert_eq!(st.load()[&1].at, T0);
+
+    // Down; the star is removed and re-added on the forge; restart well
+    // inside the gap with the same level set but a later updated_at.
+    src.answers.insert(1, T1.into());
+    let mut items = [starred_updated(1, Some(U1))];
+    let t = tick(&mut StarredAtCache::default(), &mut items, &mut src, Some(&st), NOW + 600);
+    assert_eq!((t.disk_hit, t.read_known), (0, 1), "exactly one timeline read");
+    assert_eq!(src.calls, vec![1, 1]);
+    assert_eq!(items[0].operator_priority_at.as_deref(), Some(T1), "the NEW time");
+    assert_eq!(st.load()[&1].at, T1, "and it replaces T0 on disk");
+}
+
+/// The matching hit: an issue untouched since its value was confirmed
+/// (`updated_at` equal, or earlier) still reuses the persisted value.
+#[test]
+fn an_unchanged_issue_still_reuses_the_persisted_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = store(dir.path(), "/ws|unchanged");
+    let mut src = fake(1, T0);
+    tick(
+        &mut StarredAtCache::default(),
+        &mut [starred_updated(1, Some(U1))],
+        &mut src,
+        Some(&st),
+        NOW,
+    );
+    src.answers.insert(1, T1.into());
+    for (i, u) in [U1, U0].into_iter().enumerate() {
+        let mut items = [starred_updated(1, Some(u))];
+        let now = NOW + 60 * (i as u64 + 1);
+        let t = tick(&mut StarredAtCache::default(), &mut items, &mut src, Some(&st), now);
+        assert_eq!((t.disk_hit, t.reads()), (1, 0), "updated_at {u} reuses");
+        assert_eq!(items[0].operator_priority_at.as_deref(), Some(T0));
+    }
+    assert_eq!(src.calls, vec![1]);
+}
+
+/// With no (or an unparseable) `updated_at` there is no evidence the issue is
+/// unchanged, so the restart reads the timeline.
+#[test]
+fn a_missing_or_unparseable_updated_at_reads_after_a_restart() {
+    for u in [None, Some("not-a-time")] {
+        let dir = tempfile::tempdir().unwrap();
+        let st = store(dir.path(), "/ws|no-updated");
+        let mut src = fake(1, T0);
+        tick(&mut StarredAtCache::default(), &mut [starred(1)], &mut src, Some(&st), NOW);
+        let mut items = [starred_updated(1, u)];
+        let t = tick(&mut StarredAtCache::default(), &mut items, &mut src, Some(&st), NOW + 60);
+        assert_eq!((t.disk_hit, t.read_known), (0, 1), "updated_at {u:?} reads");
+    }
+}
+
+/// A store file written before `updated` existed parses, and its entries are
+/// read again rather than trusted.
+#[test]
+fn an_entry_without_an_updated_mark_is_read_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = store(dir.path(), "/ws|legacy");
+    let raw = format!(
+        r#"{{"repo_key":"/ws|legacy","entries":{{"1":{{"at":"{T0}","levels":["{OPERATOR_PRIORITY_LABEL}"],"last_seen":{NOW}}}}}}}"#
+    );
+    crate::forge_etag_store::write_private_atomic(st.path(), raw.as_bytes());
+    assert_eq!(st.load()[&1].updated, None);
+    let mut src = fake(1, T1);
+    let mut items = [starred(1)];
+    let t = tick(&mut StarredAtCache::default(), &mut items, &mut src, Some(&st), NOW + 60);
+    assert_eq!((t.disk_hit, t.read_known), (0, 1));
+    assert_eq!(items[0].operator_priority_at.as_deref(), Some(T1));
+}
+
+/// The in-process half: a running daemon that never saw the gap still reads
+/// the new time once the listing shows a later `updated_at`, and an
+/// untouched issue stays a memory hit.
+#[test]
+fn a_running_daemon_rereads_a_known_value_after_the_issue_is_updated() {
+    let mut src = fake(1, T0);
+    let mut cache = StarredAtCache::default();
+    cache.resolve(&mut [starred(1)], &mut src, Instant::now());
+    let t = cache.resolve(&mut [starred(1)], &mut src, Instant::now());
+    assert_eq!((t.mem_hit, t.reads()), (1, 0), "unchanged: no read");
+
+    src.answers.insert(1, T1.into());
+    let mut items = [starred_updated(1, Some(U1))];
+    let t = cache.resolve(&mut items, &mut src, Instant::now());
+    assert_eq!((t.mem_hit, t.read_known), (0, 1));
+    assert_eq!(items[0].operator_priority_at.as_deref(), Some(T1));
+
+    // Confirmed under U1 now: the next tick is a hit again.
+    let t = cache.resolve(&mut [starred_updated(1, Some(U1))], &mut src, Instant::now());
+    assert_eq!((t.mem_hit, t.reads()), (1, 0));
+    assert_eq!(src.calls, vec![1, 1]);
 }

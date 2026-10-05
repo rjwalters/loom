@@ -22,8 +22,13 @@
 //! - **Reuse is narrow.** A disk entry is used only when its level-label set
 //!   equals the issue's current one, its value is known (unknowns are never
 //!   written, so [`super::STARRED_AT_RETRY`] still governs them), and it was
-//!   seen within [`RESTART_GAP_SECS`]. A loom-ui intent's `requested_at` is
-//!   consulted before the disk and always wins over it.
+//!   seen within [`RESTART_GAP_SECS`], and the issue's listed `updated_at` is
+//!   no later than the one the value was confirmed under. Label events advance
+//!   `updated_at`, so an unstar and re-star made while the daemon was down
+//!   (no tick saw the gap) is read, never masked; an untouched issue — most of
+//!   a restart's burst — still hits. A missing or unparseable `updated_at`
+//!   reads. A loom-ui intent's `requested_at` is consulted before the disk and
+//!   always wins over it.
 //! - **Kill switch:** `LOOM_STARRED_AT_PERSIST=0` neither reads nor writes.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,6 +63,11 @@ pub struct PersistedAt {
     pub levels: BTreeSet<String>,
     /// When the in-process cache last held this entry (unix seconds).
     pub last_seen: u64,
+    /// The issue's listed `updated_at` (unix seconds, the forge's clock) when
+    /// the value was read or confirmed. `None` (no timestamp on the listing,
+    /// or a file written before this field) never matches, so it is re-read.
+    #[serde(default)]
+    pub updated: Option<i64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -231,17 +241,22 @@ pub(super) struct DiskMirror {
 
 impl DiskMirror {
     /// A persisted value usable for a starred issue whose level-label set is
-    /// `levels`, at `now_unix`.
+    /// `levels` and whose listed `updated_at` is `updated` (unix seconds), at
+    /// `now_unix`. Reused only when nothing on the issue changed since the
+    /// value was confirmed: a later `updated_at`, or none at all, reads.
     pub(super) fn usable(
         &self,
         issue: u32,
         levels: &BTreeSet<String>,
+        updated: Option<i64>,
         now_unix: u64,
     ) -> Option<&str> {
         self.entries
             .get(&issue)
             .filter(|e| {
-                &e.levels == levels && now_unix.saturating_sub(e.last_seen) <= RESTART_GAP_SECS
+                &e.levels == levels
+                    && now_unix.saturating_sub(e.last_seen) <= RESTART_GAP_SECS
+                    && matches!((updated, e.updated), (Some(c), Some(m)) if c <= m)
             })
             .map(|e| e.at.as_str())
     }

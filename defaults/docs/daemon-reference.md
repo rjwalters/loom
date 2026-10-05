@@ -2312,8 +2312,13 @@ a key. Only the six keys below order the queue.
    one per workspace key, written atomically and deleted after 7 days untouched.
    It is consulted only on an in-process miss, after a loom-ui intent's
    `requested_at` (which always wins), and a persisted value is reused only when
-   the issue's level-label set is unchanged and the value was seen within the
-   last 30 minutes (`last_seen`, rewritten at most every 5 minutes). Unknown
+   the issue's level-label set is unchanged, the value was seen within the
+   last 30 minutes (`last_seen`, rewritten at most every 5 minutes), and the
+   issue's listed `updated_at` is no later than the one the value was confirmed
+   under (a missing `updated_at` reads). Label events advance `updated_at`, so
+   an unstar and re-star made while the daemon was down is read, not masked.
+   The same `updated_at` check applies in process: a known starred-at is read
+   again on the first tick whose listing shows the issue updated. Unknown
    starred-ats are never persisted, so the 10-minute retry still applies. Every
    in-process drop is mirrored: an issue that leaves the starred set loses its
    entry and a nothing-starred tick deletes the file, so an unstar and re-star

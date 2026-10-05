@@ -165,6 +165,33 @@ pub fn level_label_set(item: &WorkItem) -> BTreeSet<String> {
     set
 }
 
+/// An issue's listed `updated_at` as unix seconds; `None` when the listing
+/// row has none or it does not parse.
+#[must_use]
+pub fn updated_unix(item: &WorkItem) -> Option<i64> {
+    item.updated_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+        .map(|t| t.timestamp())
+}
+
+/// Whether a known in-process value confirmed under listed `updated_at`
+/// `mark` still holds for an issue now listed with `current`.
+///
+/// Every label event (an unstar, a re-star) advances the issue's own
+/// `updated_at`, so `current > mark` means something changed since the value
+/// was confirmed — possibly a re-star — and the timeline is read again. Both
+/// sides are the forge's own clock, so daemon clock skew and listing lag do
+/// not matter. With no `current` (a listing without timestamps) the cache
+/// keeps its pre-#10437 behaviour and trusts the entry.
+fn unchanged_since(current: Option<i64>, mark: Option<i64>) -> bool {
+    match (current, mark) {
+        (None, _) => true,
+        (Some(c), Some(m)) => c <= m,
+        (Some(_), None) => false,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CachedAt {
     at: Option<String>,
@@ -172,6 +199,10 @@ struct CachedAt {
     /// The level the value was read at (#10307): a level change re-reads,
     /// so an issue raised to level 2 orders by when it was raised.
     level: u8,
+    /// The issue's listed `updated_at` (unix seconds) when the value was read
+    /// or confirmed. A known value is reused only while the listing shows no
+    /// later update ([`unchanged_since`]).
+    updated: Option<i64>,
 }
 
 /// Per-repo starred-at cache (#9244 §3).
@@ -191,12 +222,15 @@ struct CachedAt {
 /// consequence is at worst two starred issues dispatched in the wrong order,
 /// one tick apart.
 ///
-/// - **A star flipped off and back on entirely between two ticks keeps the
-///   old time.** The cache never saw the gap, so the entry survives the
-///   `retain` and a known value is never re-read. Detecting it would mean
-///   re-reading every starred issue's timeline every tick (the cost this cache
-///   exists to avoid) or watching the label events themselves. Pinned by
-///   `the_starred_at_cache_trades_restar_staleness_for_prompt_eviction`.
+/// - **A star flipped off and back on entirely between two ticks is caught
+///   by `updated_at`.** The cache never saw the gap, but the label events
+///   advanced the issue's listed `updated_at` (already on the ETag-cached
+///   listing row, so free), and a known value is re-read whenever the listing
+///   shows an update after the one it was confirmed under. The price is one
+///   timeline read per starred issue per tick in which *anything* on it
+///   changed. Only a listing row with no `updated_at` keeps the old time
+///   (pinned by
+///   `the_starred_at_cache_trades_restar_staleness_for_prompt_eviction`).
 /// - **A starred issue that leaves the listing loses its entry**, so its
 ///   timeline is read again when it returns — `merge_starred` drops a starred
 ///   row that is `loom:building`/`loom:curating`, which is exactly the common
@@ -216,8 +250,10 @@ struct CachedAt {
 ///
 /// [`Self::resolve_persisted`] adds [`starred_at_store`] underneath: on an
 /// in-process *miss only*, a loom-ui intent answers first, then a persisted
-/// value with the same level-label set seen within
-/// [`starred_at_store::RESTART_GAP_SECS`], then the source. Every eviction
+/// value with the same level-label set, seen within
+/// [`starred_at_store::RESTART_GAP_SECS`], and confirmed under a listed
+/// `updated_at` no older than the issue's current one (so a re-star made
+/// while the daemon was down is read, not masked), then the source. Every eviction
 /// above is mirrored to disk, so the store changes how often a restart reads,
 /// never what a running daemon decides.
 #[derive(Debug, Default)]
@@ -271,10 +307,16 @@ impl StarredAtCache {
         }
         for item in items.iter_mut().filter(|i| i.is_operator_priority()) {
             let level = item.operator_level();
+            let updated = updated_unix(item);
+            // A known value holds until the issue is updated after it was
+            // confirmed; an unknown one is governed by the retry alone.
             let fresh = self.entries.get(&item.number).is_some_and(|e| {
                 e.level == level
-                    && (e.at.is_some()
-                        || now.saturating_duration_since(e.fetched) < STARRED_AT_RETRY)
+                    && if e.at.is_some() {
+                        unchanged_since(updated, e.updated)
+                    } else {
+                        now.saturating_duration_since(e.fetched) < STARRED_AT_RETRY
+                    }
             });
             if fresh {
                 tally.mem_hit += 1;
@@ -285,6 +327,7 @@ impl StarredAtCache {
                     item.number,
                     miss,
                     &levels,
+                    updated,
                     source,
                     store.is_some(),
                     now_unix,
@@ -297,6 +340,7 @@ impl StarredAtCache {
                                 at: at.clone(),
                                 levels,
                                 last_seen: now_unix,
+                                updated,
                             };
                             if mirror.entries.get(&item.number) != Some(&entry) {
                                 mirror.entries.insert(item.number, entry);
@@ -313,6 +357,7 @@ impl StarredAtCache {
                         at,
                         fetched: now,
                         level,
+                        updated,
                     },
                 );
             }
@@ -332,6 +377,7 @@ impl StarredAtCache {
         issue: u32,
         miss: bool,
         levels: &BTreeSet<String>,
+        updated: Option<i64>,
         source: &mut dyn StarredAtSource,
         persisted: bool,
         now_unix: u64,
@@ -345,7 +391,7 @@ impl StarredAtCache {
         }
         if miss {
             let disk = self.disk.as_ref().filter(|_| persisted);
-            if let Some(at) = disk.and_then(|d| d.usable(issue, levels, now_unix)) {
+            if let Some(at) = disk.and_then(|d| d.usable(issue, levels, updated, now_unix)) {
                 tally.disk_hit += 1;
                 return Some(at.to_string());
             }
@@ -384,6 +430,12 @@ impl StarredAtCache {
         if !dirty && !due {
             return;
         }
+        // Only `last_seen` is refreshed here. An entry whose level-label set
+        // changed while its level did not (an inherited level-2 label added
+        // to an issue that already has its own) stays fresh in process but
+        // keeps its old set on disk until it is next read, so after a restart
+        // the sets differ and the issue is read once more. That is the safe
+        // direction (one extra read), so it is left alone.
         let entries = &self.entries;
         mirror.entries.retain(|n, e| {
             entries
