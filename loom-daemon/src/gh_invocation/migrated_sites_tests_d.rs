@@ -200,3 +200,36 @@ echo '{"push":true}'"#,
     assert!(matches!(got, Some(Permission::Write)), "{got:?}");
     assert_eq!(calls(&rows, "write_scope.probe"), 1, "{rows:?}");
 }
+
+/// #10089: a PR watch and the verdict base-ref read book `pr.view-state`; an
+/// issue watch (no inventoried issue-view op) stays an honest `unknown`.
+#[test]
+fn pr_watch_and_base_ref_book_pr_view_state_and_issue_watch_stays_unknown() {
+    use crate::watch_registry::{GhWatchProbe, WatchKind, WatchProbe, WatchSpec};
+    let tmp = tempfile::tempdir().unwrap();
+    let gh = stub(
+        tmp.path(),
+        "gh-json",
+        r#"echo '{"state":"OPEN","labels":[],"baseRefName":"main"}'"#,
+    );
+    let spec = |kind, number| WatchSpec {
+        id: format!("watch-{number}"),
+        kind,
+        number,
+        repo: None,
+        workspace_root: Some(tmp.path().to_string_lossy().into_owned()),
+        note: None,
+        registered_at: chrono::Utc::now(),
+    };
+    let (_rows, operations) = report_after(|| {
+        let probe = GhWatchProbe::new().with_gh_bin(gh.clone());
+        let _ = probe.probe(&spec(WatchKind::Pr, 3));
+        let _ = probe.probe(&spec(WatchKind::Issue, 4));
+        assert_eq!(
+            crate::verdict_equivalence::pr_base_ref(&gh, Some(tmp.path()), 3).as_deref(),
+            Some("main")
+        );
+    });
+    assert_eq!(op_calls(&operations, "pr.view-state"), 2, "{operations:?}");
+    assert_eq!(op_calls(&operations, forge_call_stats::UNKNOWN_OPERATION), 1, "{operations:?}");
+}

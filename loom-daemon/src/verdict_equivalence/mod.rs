@@ -296,12 +296,10 @@ pub(crate) fn pr_base_ref(gh_bin: &Path, cwd: Option<&Path>, pr: u32) -> Option<
     let args = ["pr", "view", pr.as_str(), "--json", "baseRefName"]
         .into_iter()
         .chain(repo_flag.iter().map(String::as_str));
-    let out = crate::claim_reconciliation::gh_call::ok_stdout(optional_cwd(
-        "verdict.pr_base_ref",
-        gh_bin,
-        cwd,
-        args,
-    ))?;
+    let out = crate::claim_reconciliation::gh_call::ok_stdout(
+        optional_cwd("verdict.pr_base_ref", gh_bin, cwd, args)
+            .forge_op(crate::forge_call_stats::ops::PR_VIEW_STATE),
+    )?;
     let parsed: Pr = serde_json::from_slice(&out).ok()?;
     is_safe_ref(&parsed.base_ref_name).then_some(parsed.base_ref_name)
 }
