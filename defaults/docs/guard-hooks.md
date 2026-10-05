@@ -459,6 +459,22 @@ A synthetic fixture that trips it goes in `.loom/secret-scan-allow`, one
 fingerprint per line with a reason. Never list a real credential there: remove
 it, and rotate it, since anything pushed to a public remote is disclosed.
 
+## `loom-daemon guards status` and toggle messages (#10434)
+
+The hook runs as a separate process and reads **Claude Code's** environment (the
+`env` block of a `settings.json`), not the environment of the command it judges.
+An inline `VAR=x cmd` prefix or a shell-rc export therefore does nothing.
+`loom-daemon guards status [--json] [--repo PATH]` prints each guard category's
+effective value and source (Claude Code `env`, `.loom/config.json`, or default),
+hook wiring in repo and `~/.claude` settings, and a per-rule ask/deny summary of
+`.loom/logs/guard-decisions.log`. It warns (stable headlines) on
+`SHELL-RC-ONLY-ENV`, `REPEATED-ASKS-UNCONFIGURED` (>=3 asks in 7 days with the
+toggle unset; the log has no approval outcome, so ask count is the proxy),
+`DOUBLE-WIRED-HOOK`, and `HIGH-UNRESOLVED-VAR-DENY-RATE`. Ask/deny messages of
+toggleable categories end with a `Toggle:` line naming the env var (set under
+Claude Code settings `env`) and the `.loom/config.json` key; ungated-floor
+denials name no toggle.
+
 ## Custom Guard Hooks
 
 Loom ships with several built-in `PreToolUse` guard hooks, registered independently under the `Bash` or `Edit|Write` matcher as noted below:

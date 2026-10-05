@@ -212,6 +212,7 @@ pub mod gh_state_probe;
 pub mod git_parser;
 pub mod git_utils;
 pub mod guard_wiring;
+pub mod guards_status;
 pub mod hard_exclusion;
 pub mod health;
 pub mod health_monitor;
