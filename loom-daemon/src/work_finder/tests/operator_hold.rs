@@ -46,3 +46,14 @@ fn test_operator_hold_skips_candidates_but_is_never_a_park() {
         "a generic `loom:operator` hold vetoes the capability lane (#6893)"
     );
 }
+
+#[test]
+fn test_ops_label_skips_candidates_but_is_never_a_park() {
+    // #10357: an approved forge-state (`loom:ops`) issue has no diff, so a
+    // Builder dispatch would loop PR-less. The work finder must skip it, but
+    // it is not a park: ops executors must still be able to reach it.
+    let item = WorkItem::new(10009, vec!["loom:issue".into(), "loom:ops".into()]);
+    assert!(item.is_skipped(), "`loom:issue` + `loom:ops` must not dispatch to Builder");
+    assert!(SKIP_LABELS.contains(&"loom:ops"));
+    assert!(!PARK_LABELS.contains(&"loom:ops"), "`loom:ops` skips but never parks");
+}

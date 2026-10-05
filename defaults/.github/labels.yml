@@ -252,6 +252,13 @@
   description: "Engine stops work on this item; human is the only transition out. Sweep/shepherd do not skip it."
   color: "EA580C"  # orange-600 - operator-action signal, one shade darker than operator-only
 
+# loom:ops marks an approved issue whose deliverable is forge state, not a diff
+# (see defaults/docs/ops-lane.md). It is a skip label so the work finder never
+# dispatches it to Builder; it is not a park, so ops executors can still reach it.
+- name: loom:ops
+  description: "Forge-state deliverable (labels/comments/closes), no PR. Work finder never dispatches to Builder."
+  color: "0EA5E9"  # sky-500
+
 # loom:operator-priority (#9244) is the operator's "star": land this ASAP,
 # ahead of all other work, fleet-wide. It is NOT loom:operator (the hold
 # above) and it is NOT a hold of any kind -- nothing may treat a

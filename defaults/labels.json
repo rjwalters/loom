@@ -935,6 +935,34 @@
       ]
     },
     {
+      "name": "loom:ops",
+      "description": "Forge-state deliverable (labels/comments/closes), no PR. Work finder never dispatches to Builder.",
+      "color": "0EA5E9",
+      "kind": "structural",
+      "applied_by": "Curator",
+      "removed_by": null,
+      "park": false,
+      "skip": true,
+      "hold": false,
+      "operator_gate": false,
+      "blocked_colabel": false,
+      "hard_exclusion": false,
+      "champion_path": false,
+      "human_gated": false,
+      "contradicts_approval": null,
+      "stale_after_minutes": null,
+      "requires_base": null,
+      "remove_with": [],
+      "lifecycle": "active",
+      "propagate": null,
+      "color_note": "sky-500",
+      "yaml_preamble": [
+        "# loom:ops marks an approved issue whose deliverable is forge state, not a diff",
+        "# (see defaults/docs/ops-lane.md). It is a skip label so the work finder never",
+        "# dispatches it to Builder; it is not a park, so ops executors can still reach it."
+      ]
+    },
+    {
       "name": "loom:operator-priority",
       "description": "Land ASAP, not a hold. Applied by: humans/loom-ui; inherited by a starred parent's children",
       "color": "CA8A04",

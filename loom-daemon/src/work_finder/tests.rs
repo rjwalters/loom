@@ -2003,7 +2003,11 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
     }
     let mut expected: Vec<&str> = vec![BUILDING_LABEL];
     expected.extend_from_slice(&PARK_LABELS);
-    expected.extend([OPERATOR_HOLD_LABEL, labels::OPERATOR_DECISION_LABEL]);
+    expected.extend([
+        OPERATOR_HOLD_LABEL,
+        "loom:ops",
+        labels::OPERATOR_DECISION_LABEL,
+    ]);
     assert_eq!(
         *SKIP_LABELS, expected,
         "SKIP_LABELS is BUILDING_LABEL + PARK_LABELS + OPERATOR_HOLD_LABEL + the decision sub-kind"

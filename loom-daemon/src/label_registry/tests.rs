@@ -173,6 +173,7 @@ fn derived_skip_labels_equal_the_previous_literal_in_order() {
             "loom:blocked",
             "loom:operator-only",
             "loom:operator",
+            "loom:ops",
             "loom:operator-decision",
         ]
     );

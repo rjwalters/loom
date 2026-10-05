@@ -68,6 +68,7 @@ each definition, for the terse version of this same table):
 | `loom:operator-only` | Requires human action or ruling *outside* automation entirely (credentials, infra, hardware, an owner-gated decision) | **Yes** — sweep/shepherd skip it, except the narrow capability-matched `loom:operator-mechanical` case (#6893, see "Dispatch path" below) |
 | `loom:needs-capability` | Blocked on a missing tool/agent capability — not an operator-by-right decision, but automation genuinely cannot proceed without the capability existing first (#5817) | **Yes** — sweep/shepherd skip it, identically to `loom:operator-only` today |
 | `loom:operator` | The engine has stopped on this specific artifact and a human must act, but the item stays live in its normal queue so the engine's own release conditions can still fire | **New-builder skip only** — the work finder does not *start* a fresh `--claim-owned` build on it (vibesql#6664); re-evaluation lanes (Champion/role ticks, watchdog re-dispatch, reaper resume, explicit `loom-daemon dispatch <N>`) still reach it |
+| `loom:ops` | Approved work whose deliverable is forge state (labels/comments/closes), not a diff (#10357, `defaults/docs/ops-lane.md`) | **Yes**, never dispatched to Builder (registry `skip: true`, not a park); closed by Champion when its `## Verification` passes, not on a PR merge |
 
 The distinguishing property of `loom:operator` is that it is **re-evaluable**:
 unlike `loom:operator-only`, applying it must never cause sweep/shepherd
