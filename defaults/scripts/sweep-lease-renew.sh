@@ -303,61 +303,51 @@ source "$SCRIPT_DIR/lib/forge-helpers.sh"
 # personal rung -- GH_TOKEN equal to LOOM_PERSONAL_GH_TOKEN, or unset (the
 # ambient personal login) -- which is attributed ambient.
 # shellcheck disable=SC2016 # expanded by the child bash, per attempt
-LEASE_GH_ATTEMPT='n=1
-while IFS= read -r _; do n=$((n + 1)); done < "$LOOM_LEASE_ATTEMPTS"
+LEASE_GH_ATTEMPT='n=$(($(wc -l < "$LOOM_LEASE_ATTEMPTS") + 1)) c=app-fresh-mint a=ambient
 if ((n == 1)); then c="$LOOM_LEASE_BASE"
-elif [[ -n "${GH_TOKEN:-}" && "$GH_TOKEN" == "${LOOM_PERSONAL_GH_TOKEN:-}" ]]; then c=personal-token
 elif [[ -z "${GH_TOKEN:-}" ]]; then c=personal-ambient
-else c=app-fresh-mint; fi
-case "$c" in app*) a=app ;; *) a=ambient ;; esac
+elif [[ "$GH_TOKEN" == "${LOOM_PERSONAL_GH_TOKEN:-}" ]]; then c=personal-token; fi
+[[ "$c" != app* ]] || a=app
 echo "attempt=$n credential=$c attribution=$a" >> "$LOOM_LEASE_ATTEMPTS"
 LOOM_LEASE_CREDENTIAL=$a exec gh "$@"'
 
 # _lease_gh_ladder <app|ambient> <attempts-file> <gh args...>: forge_gh_perm_safe's
 # ladder (forge_cmd_perm_safe) with every attempt classified by LEASE_GH_ATTEMPT.
 _lease_gh_ladder() {
-    local base="$1" attempts="$2"; shift 2
-    LOOM_LEASE_BASE="$base" LOOM_LEASE_ATTEMPTS="$attempts" LOOM_PERSONAL_GH_TOKEN="${LOOM_PERSONAL_GH_TOKEN:-}" \
-        forge_cmd_perm_safe bash -c "$LEASE_GH_ATTEMPT" lease-gh "$@"
+    LOOM_LEASE_BASE="$1" LOOM_LEASE_ATTEMPTS="$2" LOOM_PERSONAL_GH_TOKEN="${LOOM_PERSONAL_GH_TOKEN:-}" \
+        forge_cmd_perm_safe bash -c "$LEASE_GH_ATTEMPT" lease-gh "${@:3}"
 }
 
 # _lease_gh_attempts <attempts-file>: one stderr line per attempt, only when the
 # ladder escalated (steady state is a single, silent attempt).
 _lease_gh_attempts() {
-    local line lines=()
-    while IFS= read -r line; do lines+=("$line"); done < "$1"
-    ((${#lines[@]} > 1)) || return 0
-    printf 'lease-credential-attempt: %s\n' "${lines[@]}" >&2
+    (($(wc -l < "$1") < 2)) || sed 's/^/lease-credential-attempt: /' "$1" >&2
 }
 
 # requires-daemon: forge optional   Without `forge token` (absent or older binary), or with no App configured, every call runs on the caller's own credential, exactly as before #10229.
 lease_gh() {
-    local access="$1" tok="" out="" rc=0 diag attempts last line; shift
+    local access="$1" tok="" out="" rc=0 diag attempts last; shift
     tok="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge token --repo "${LOOM_REPO:-$(_forge_nwo_from_remote || true)}" --access "$access" 2> /dev/null | jq -r 'select(.status == "ok") | .token // empty' 2> /dev/null)" || tok=""
-    attempts="$(mktemp)"
-    if [[ -n "$tok" ]]; then
-        diag="$(mktemp)"
-        out="$(GH_TOKEN="$tok" _lease_gh_ladder app "$attempts" "$@" 2> "$diag")" || rc=$?
+    attempts="$(mktemp)" diag="$(mktemp)"
+    if [[ -n "$tok" ]] && out="$(GH_TOKEN="$tok" _lease_gh_ladder app "$attempts" "$@" 2> "$diag")"; then
+        # Success: replay the ladder's diagnostics verbatim (none in steady state).
         _lease_gh_attempts "$attempts"
-        last=""
-        while IFS= read -r line; do last="${line#*credential=}"; done < "$attempts"
-        if ((rc == 0)); then
-            # Success: replay the ladder's diagnostics verbatim (none in steady state).
-            [[ ! -s "$diag" ]] || cat "$diag" >&2
-            [[ "$last" != *attribution=ambient ]] || echo "lease-credential=ambient-recovered: the ${access} call was recovered on the personal credential (${last%% *}) after the App credential's permission 403 (#10229)" >&2
-            rm -f "$diag" "$attempts"
-            [[ -z "$out" ]] || printf '%s\n' "$out"
-            return 0
-        fi
+        cat "$diag" >&2
+        last="$(sed -n '$s/.*credential=//p' "$attempts")"
+        [[ "$last" != *attribution=ambient ]] || echo "lease-credential=ambient-recovered: the ${access} call was recovered on the personal credential (${last%% *}) after the App credential's permission 403 (#10229)" >&2
+        rm -f "$diag" "$attempts"
+        [[ -z "$out" ]] || printf '%s\n' "$out"
+        return 0
+    elif [[ -n "$tok" ]]; then
         # Failure: replay only the ladder's own escalation lines. The App attempt's
         # raw gh error is summarised by the tag below; replaying it would let an
         # App-only `HTTP 404` (App not installed) read as the PATCH's own 404.
+        _lease_gh_attempts "$attempts"
         grep '^forge: ' "$diag" >&2 || true
-        rm -f "$diag"
         : > "$attempts"
-        rc=0
         echo "lease-credential=ambient-fallback: the ${access} call failed on the App credential (#10229)" >&2
     fi
+    rm -f "$diag"
     _lease_gh_ladder ambient "$attempts" "$@" || rc=$?
     _lease_gh_attempts "$attempts"
     rm -f "$attempts"
@@ -407,30 +397,15 @@ lease_publish_raw_hostname() {
 }
 
 resolve_host() {
-    if [[ -n "${LOOM_HOST_ID:-}" ]]; then
-        printf '%s' "$LOOM_HOST_ID"
-        return 0
-    fi
-    if [[ -n "${HOSTNAME:-}" ]]; then
-        printf '%s' "$HOSTNAME"
-        return 0
-    fi
-    local h
-    h="$(hostname 2> /dev/null || true)"
-    if [[ -n "$h" ]]; then
-        printf '%s' "$h"
-        return 0
-    fi
-    printf 'unknown-host'
+    local h="${LOOM_HOST_ID:-${HOSTNAME:-}}"
+    [[ -n "$h" ]] || h="$(hostname 2> /dev/null || true)"
+    printf '%s' "${h:-unknown-host}"
 }
 
 resolve_published_host() {
     local raw
     raw="$(resolve_host)"
-    if lease_publish_raw_hostname; then
-        printf '%s' "$raw"
-        return 0
-    fi
+    ! lease_publish_raw_hostname || { printf '%s' "$raw"; return 0; }
     opaque_host_id "$raw" || printf '%s' "$raw"
 }
 
@@ -966,9 +941,7 @@ cmd_start() {
         exit 1
     fi
 
-    if [[ -z "$watch_pid" ]]; then
-        watch_pid="$(resolve_liveness_pid)"
-    fi
+    [[ -n "$watch_pid" ]] || watch_pid="$(resolve_liveness_pid)"
     [[ "$watch_pid" =~ ^[0-9]+$ ]] || {
         echo "ERROR: could not resolve a watch PID" >&2
         exit 1
@@ -983,9 +956,7 @@ cmd_start() {
     # caller capturing its PID and this probe) leaves the token empty and the
     # loop falls back to the pre-#7825 PID-only test -- still bounded by the
     # absolute age cap below, which is why that cap is not optional.
-    if [[ -z "$watch_ident" ]]; then
-        watch_ident="$(pid_start_identity "$watch_pid" 2>/dev/null || true)"
-    fi
+    [[ -n "$watch_ident" ]] || watch_ident="$(pid_start_identity "$watch_pid" 2>/dev/null || true)"
 
     # Default to exact-match targeting of THIS sweep's own lease comment
     # (Issue #6485) when the caller did not explicitly pass --host/--sweep-id
@@ -1002,18 +973,10 @@ cmd_start() {
     # A partial resolution (one but not the other) is discarded rather than
     # passed through -- renew-once requires both --host and --sweep-id
     # together or neither. Explicit --host/--sweep-id flags always win.
-    if [[ -z "$host" && -z "$sweep_id" ]]; then
-        local auto_sweep_id="" auto_host=""
-        if [[ "${LOOM_TERMINAL_ID:-}" == daemon-* ]]; then
-            auto_sweep_id="${LOOM_TERMINAL_ID#daemon-}"
-        fi
-        if [[ -n "$auto_sweep_id" ]]; then
-            auto_host="$(resolve_published_host)"
-        fi
-        if [[ -n "$auto_sweep_id" && -n "$auto_host" ]]; then
-            host="$auto_host"
-            sweep_id="$auto_sweep_id"
-        fi
+    if [[ -z "$host" && -z "$sweep_id" && "${LOOM_TERMINAL_ID:-}" == daemon-?* ]]; then
+        local auto_host
+        auto_host="$(resolve_published_host)"
+        [[ -z "$auto_host" ]] || { host="$auto_host"; sweep_id="${LOOM_TERMINAL_ID#daemon-}"; }
     fi
 
     local -a extra_args=()
