@@ -159,9 +159,42 @@ pub(crate) fn snapshots(specs: &[Spec]) -> Vec<FleetSnapshot> {
         .collect()
 }
 
+/// The fleet listings of `specs` at `at`.
+fn listings_at(specs: &[Spec], at: f64) -> Vec<(String, Vec<ListedPr>)> {
+    [REPO, OTHER]
+        .into_iter()
+        .map(|repo| {
+            let prs = specs
+                .iter()
+                .filter(|s| s.repo == repo && s.listed_at(at))
+                .map(|s| {
+                    let (labels, updated_at) = s.view_at(at);
+                    ListedPr {
+                        number: s.pr,
+                        labels,
+                        updated_at: Some(updated_at),
+                    }
+                })
+                .collect();
+            (repo.to_string(), prs)
+        })
+        .collect()
+}
+
 /// The serving side: a tracker driven through every listing pass of
-/// `specs` up to [`LAST_PASS`], with the pass's fleet context.
+/// `specs` up to [`LAST_PASS`], each with its fleet context, as the daemon's
+/// ETA pass does (the last pass's view is the one an estimate reads).
 pub(crate) fn serve(specs: &[Spec]) -> Tracker {
+    serve_with(specs, &[], |_, _| {})
+}
+
+/// [`serve`] with extra pass instants `extra`, calling `pass(tracker, at)`
+/// on every pass after its listings and before its fleet context.
+pub(crate) fn serve_with(
+    specs: &[Spec],
+    extra: &[f64],
+    mut pass: impl FnMut(&mut Tracker, f64),
+) -> Tracker {
     let mut instants: Vec<f64> = specs
         .iter()
         .flat_map(|s| {
@@ -172,6 +205,7 @@ pub(crate) fn serve(specs: &[Spec]) -> Tracker {
                 .chain(s.touched)
         })
         .chain([LAST_PASS])
+        .chain(extra.iter().copied())
         .collect();
     instants.sort_by(f64::total_cmp);
     instants.dedup();
@@ -202,27 +236,10 @@ pub(crate) fn serve(specs: &[Spec]) -> Tracker {
                 journal.extend(effects.journal);
             }
         }
+        pass(&mut tracker, at);
+        let events = events_from_journal(&journal, h(at));
+        tracker.on_fleet_context(&listings_at(specs, at), events, h(at));
     }
-    let listings: Vec<(String, Vec<ListedPr>)> = [REPO, OTHER]
-        .into_iter()
-        .map(|repo| {
-            let prs = specs
-                .iter()
-                .filter(|s| s.repo == repo && s.listed_at(LAST_PASS))
-                .map(|s| {
-                    let (labels, updated_at) = s.view_at(LAST_PASS);
-                    ListedPr {
-                        number: s.pr,
-                        labels,
-                        updated_at: Some(updated_at),
-                    }
-                })
-                .collect();
-            (repo.to_string(), prs)
-        })
-        .collect();
-    let events = events_from_journal(&journal, h(LAST_PASS));
-    tracker.on_fleet_context(&listings, events, h(LAST_PASS));
     tracker
 }
 

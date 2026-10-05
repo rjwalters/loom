@@ -29,6 +29,7 @@ mod land_v3;
 mod merge_hold;
 mod offline;
 mod primitives;
+mod priority_features;
 mod queue_features;
 mod ready;
 mod recalibrate;

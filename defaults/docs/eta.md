@@ -730,6 +730,41 @@ it links whose link **and** star were both known before `cutoff`.
   Using `starred_any` as the model input changes the coefficient's meaning and
   needs a new datestamped heuristic (follow-up #10379).
 
+### Priority-aware queue features (#10333)
+
+`eta::priority_features` computes candidate inputs for the next model
+version. The fit (`Assembled::priority`, one per training row) and serving
+(`Tracker::priority_features_of`) compute them the same way:
+
+| Feature | Meaning |
+|---------|---------|
+| `ahead_dispatch` | Other PRs in the repo and stage that dispatch order puts first (the dispatch-ordered sibling of FIFO `ahead`) |
+| `ahead_starred` | How many of those are starred |
+| `n_starred_repo` / `n_starred_fleet` | Other starred PRs in the stage, in the repo / fleet scope |
+| `starred_age_sec` | Time since the PR's current level was set (`null` when not starred or the instant is unknown) |
+| `star_changed_in_stage` | Whether the level changed after the PR entered its stage: its own labels, or a linked issue's star turning on or off (one that has since ended still counts) |
+| `priority_level` | Effective level: 0 none, 1 star, 2 `loom:operator-high-priority` (#10307) |
+
+- **One ordering.** Each PR is mapped to a work-finder `PriorityCandidate`
+  and compared on `work_finder::ordering::candidate_keys`
+  (`keyed_cmp` over `ETA_POSITION_KEYS`: level, star, starred-at, age, number).
+  The PR's stage entry stands in for `createdAt`. ETA ignores `main_red_fix`
+  (no point-in-time record) and `workspace_priority` (constant within a repo).
+  These are listed in `ETA_IGNORED_KEYS`.
+- **A PR's level** comes from its own labels (operator or inherited level
+  labels). It is at least 1 while a linked issue is starred, by the
+  #10372 rule above (fit: `build_with_star`; serving: the star book). The fit
+  reads levels from the flag timeline: `pr_flags` bit 6 (`FLAG_LEVEL_2`)
+  records level 2. A level 3 needs one more bit.
+- **Knowable-at.** The fit reads flag changes before `t - 120 s`. Serving
+  dates a level change from the first pass that showed it. A PR that serving
+  first saw already starred has an unknown starred-at, so it orders by age,
+  as dispatch does.
+- **Not a model input.** These features are not in `eta-fit/v1`'s `FEATURES`,
+  so twin-otter rows, coefficient files and explanations are unchanged.
+  Before a new datestamped heuristic adopts them, a walk-forward in
+  2AMLogic/loom-experiments must show they help (item 4 of #10333).
+
 ## The explanation (`eta-explanation/v1`)
 
 The heuristic builds the explanation first and computes the numbers from it,

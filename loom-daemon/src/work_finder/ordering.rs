@@ -208,3 +208,35 @@ pub fn candidate_keys(c: &PriorityCandidate) -> [CandidateKey<'_>; 7] {
         },
     ]
 }
+
+/// The [`candidate_keys`] the ETA queue position uses (#10333), by name:
+/// priority level, star bucket, starred-at, age (the PR's stage entry stands
+/// in for `created_at`), then number.
+pub const ETA_POSITION_KEYS: [&str; 5] = [
+    "operator_priority_level",
+    "operator_priority",
+    "operator_priority_at",
+    "created_at",
+    "number",
+];
+
+/// The [`candidate_keys`] the ETA queue position **ignores** (#10333):
+/// `main_red_fix` (a per-tick, per-repo red-main verdict with no point-in-time
+/// record) and `workspace_priority` (constant inside one repo, and ETA
+/// counts same-repo items only).
+pub const ETA_IGNORED_KEYS: [&str; 2] = ["main_red_fix", "workspace_priority"];
+
+/// Lexicographic compare of `a` and `b` over only the [`candidate_keys`]
+/// named in `names`, in comparator order. [`candidate_cmp`] is this with every
+/// key; the ETA's queue position is this with [`ETA_POSITION_KEYS`], so
+/// there is one ordering and a subset view of it, never a second comparator.
+#[must_use]
+pub fn keyed_cmp(a: &PriorityCandidate, b: &PriorityCandidate, names: &[&str]) -> Ordering {
+    let (ka, kb) = (candidate_keys(a), candidate_keys(b));
+    ka.iter()
+        .zip(kb.iter())
+        .filter(|(x, _)| names.contains(&x.name))
+        .map(|(x, y)| x.value.cmp(&y.value))
+        .find(|o| *o != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+}

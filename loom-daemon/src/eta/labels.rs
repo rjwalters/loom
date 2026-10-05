@@ -58,6 +58,23 @@ pub const FLAG_CONFLICT: u8 = 1 << 3;
 pub const FLAG_CI_FAIL: u8 = 1 << 4;
 /// [`pr_flags`] bit 5: `loom:blocked`.
 pub const FLAG_BLOCKED: u8 = 1 << 5;
+/// [`pr_flags`] bit 6: effective operator priority level 2 or more
+/// (`loom:operator-high-priority`, own or inherited, #10307). Not a model
+/// flag: no shipped heuristic reads it. It puts the level on the flag
+/// timeline so the priority features (#10333) can read it point-in-time;
+/// a level 3 is one more bit.
+pub const FLAG_LEVEL_2: u8 = 1 << 6;
+
+/// The effective operator priority level a [`pr_flags`] mask records: 2 with
+/// [`FLAG_LEVEL_2`], 1 with only [`FLAG_STARRED`], else 0.
+#[must_use]
+pub fn level_from_flags(mask: u8) -> u8 {
+    if mask & FLAG_LEVEL_2 != 0 {
+        2
+    } else {
+        u8::from(mask & FLAG_STARRED != 0)
+    }
+}
 
 /// Each [`pr_flags`] bit and the labels that set it.
 const PR_FLAG_LABELS: [(u8, &[&str]); 6] = [
@@ -70,7 +87,7 @@ const PR_FLAG_LABELS: [(u8, &[&str]); 6] = [
 ];
 
 /// A PR's six model flags as a bit mask ([`FLAG_OP_HOLD`] …
-/// [`FLAG_BLOCKED`]). This is the **one** label → flag definition: the fit's
+/// [`FLAG_BLOCKED`]), plus [`FLAG_LEVEL_2`]. This is the **one** label → flag definition: the fit's
 /// training rows (#10245) and `land-2026-10-04-twin-otter`'s serving input
 /// (#10243) both call it, so train and serve cannot drift.
 #[must_use]
@@ -79,10 +96,10 @@ pub fn pr_flags(labels: &[String]) -> u8 {
         .iter()
         .filter(|(_, set)| labels.iter().any(|l| set.contains(&l.as_str())))
         .fold(0, |mask, (bit, _)| mask | bit)
-        | if crate::operator_levels::is_starred(labels) {
-            FLAG_STARRED
-        } else {
-            0
+        | match crate::operator_levels::level(labels) {
+            0 => 0,
+            1 => FLAG_STARRED,
+            _ => FLAG_STARRED | FLAG_LEVEL_2,
         }
 }
 
