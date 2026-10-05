@@ -3,7 +3,7 @@
 //!
 //! # Why
 //!
-//! `loom-daemon` grew ten hand-rolled `fn gh_bin*` resolvers and well over a
+//! `loom-daemon` grew ten hand-rolled `gh_bin*` resolver functions and well over a
 //! hundred raw `Command::new(gh…)` sites, each deciding for itself whether to
 //! honour `LOOM_GH_BIN`, whether to scope `GH_CONFIG_DIR`, whether to export a
 //! trace context. Nobody can answer "does every daemon `gh` call route the same
@@ -12,7 +12,7 @@
 //! # What lands in slice 1
 //!
 //! - [`resolver`] — the single executable resolver (policy launcher →
-//!   `LOOM_GH_BIN` → `PATH`). `forge_cmd::gh_bin()` delegates to it.
+//!   `LOOM_GH_BIN` → `PATH`). `forge_cmd::gh_bin` re-exports it.
 //! - [`GhInvocation`] — the facade every site will build through: typed
 //!   [`GhTarget`], [`AccessIntent`], a stable [`Operation`] name, a
 //!   [`ParentContext`], and an [`OutputContract`]. It **owns execution**
@@ -212,6 +212,12 @@ pub enum OutputContract {
     Captured { timeout: Duration },
     /// Inherit stdio and wait (the `forge_cmd::gh_passthrough` shape).
     Passthrough,
+    /// A git credential helper (`gh auth git-credential …`): stdin fed from
+    /// the buffer given to [`GhInvocation::credential_helper`], stdout
+    /// inherited (it is git's answer), stderr discarded, no deadline.
+    /// Completes as [`GhCompletion::Passthrough`]; the credential never
+    /// passes through the facade's captured output, telemetry or accounting.
+    CredentialHelper,
 }
 
 /// What [`GhInvocation::execute`] observed, per [`OutputContract`].
@@ -219,7 +225,8 @@ pub enum OutputContract {
 pub enum GhCompletion {
     /// A [`OutputContract::Captured`] run; exit vs timeout stay distinct.
     Captured(Completion),
-    /// A [`OutputContract::Passthrough`] run's exit status.
+    /// A [`OutputContract::Passthrough`] or
+    /// [`OutputContract::CredentialHelper`] run's exit status.
     Passthrough(ExitStatus),
 }
 
@@ -256,6 +263,8 @@ pub struct GhInvocation {
     config_dir: Option<PathBuf>,
     /// Remove [`TOKEN_ENV_VARS`] from the child (#10263).
     strip_token_env: bool,
+    /// The [`OutputContract::CredentialHelper`] request written to stdin.
+    stdin_input: Vec<u8>,
     /// The #9777 call identity this execution is accounted under (#9831).
     /// Empty by default: an unmapped site records `operation = "unknown"`
     /// (see [`accounting`]), visible rather than absent.
@@ -284,6 +293,7 @@ impl GhInvocation {
             program: None,
             config_dir: None,
             strip_token_env: false,
+            stdin_input: Vec::new(),
             identity: crate::forge_call_stats::CallIdentity::default(),
         }
     }
@@ -385,6 +395,15 @@ impl GhInvocation {
     #[must_use]
     pub fn passthrough(mut self) -> Self {
         self.contract = OutputContract::Passthrough;
+        self
+    }
+
+    /// Run as a git credential helper ([`OutputContract::CredentialHelper`]),
+    /// writing `request` to the child's stdin.
+    #[must_use]
+    pub fn credential_helper(mut self, request: impl Into<Vec<u8>>) -> Self {
+        self.contract = OutputContract::CredentialHelper;
+        self.stdin_input = request.into();
         self
     }
 
@@ -538,6 +557,24 @@ impl GhInvocation {
                     .spawn()
                     .map_err(ExecError::Spawn)
                     .and_then(|mut child| child.wait().map_err(ExecError::Collect));
+                let (outcome, code) = telemetry::classify_passthrough(&result);
+                accounting::record(&self, outcome, None);
+                span.finish(&self, source, outcome, code);
+                result.map(GhCompletion::Passthrough)
+            }
+            OutputContract::CredentialHelper => {
+                cmd.stdin(Stdio::piped())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::null());
+                let result = cmd.spawn().map_err(ExecError::Spawn).and_then(|mut child| {
+                    // Always reap the child, even when the request could not
+                    // be written (it exited early, closing the pipe).
+                    let written = child.stdin.take().map_or(Ok(()), |mut stdin| {
+                        std::io::Write::write_all(&mut stdin, &self.stdin_input)
+                    });
+                    let status = child.wait().map_err(ExecError::Collect)?;
+                    written.map_err(ExecError::Collect).map(|()| status)
+                });
                 let (outcome, code) = telemetry::classify_passthrough(&result);
                 accounting::record(&self, outcome, None);
                 span.finish(&self, source, outcome, code);

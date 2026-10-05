@@ -45,7 +45,6 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 mod rest_source;
@@ -309,6 +308,10 @@ pub fn probe_gh_availability(gh_bin: &Path) -> Result<(), GhUnavailable> {
     probe_gh_availability_with_search_path(gh_bin, std::env::var("PATH").ok())
 }
 
+/// Deadline for the `gh --version` availability probe: it never touches the
+/// network, so anything slower is a wedged binary — which still *launched*.
+const GH_AVAILABILITY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// [`probe_gh_availability`] with the `PATH` value to *report* injected rather
 /// than read from the process environment.
 ///
@@ -328,9 +331,21 @@ fn probe_gh_availability_with_search_path(
     gh_bin: &Path,
     search_path: Option<String>,
 ) -> Result<(), GhUnavailable> {
-    match Command::new(gh_bin).arg("--version").output() {
-        Ok(_) => Ok(()),
-        Err(e)
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    use crate::proc_exec::ExecError;
+    let probe = GhInvocation::new(
+        Operation::new("gh.version"),
+        AccessIntent::Read,
+        GhTarget::None,
+        GH_AVAILABILITY_PROBE_TIMEOUT,
+    )
+    .program(gh_bin)
+    .arg("--version")
+    .execute();
+    match probe {
+        // Launched (any exit, or still running at the deadline): available.
+        Ok(_) | Err(ExecError::Collect(_)) => Ok(()),
+        Err(ExecError::Spawn(e))
             if matches!(
                 e.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied

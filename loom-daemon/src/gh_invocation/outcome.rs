@@ -16,7 +16,8 @@ impl GhInvocation {
     /// exited (any status) ⇒ [`CmdOutcome::Ran`]; spawn failure, collect
     /// failure or the deadline ⇒ [`CmdOutcome::Unavailable`].
     ///
-    /// A [`OutputContract::Passthrough`] invocation has no captured output to
+    /// A [`OutputContract::Passthrough`] (or
+    /// [`OutputContract::CredentialHelper`]) invocation has no captured output to
     /// classify; it is **not run** (no side effects) and reported as
     /// [`Unavailable::Spawn`] — passthrough is never silently converted into
     /// captured output, nor the reverse.

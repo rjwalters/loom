@@ -7,7 +7,7 @@
 //!    a stub that always answers `None`; wiring it is a one-function change.
 //! 2. `LOOM_GH_BIN` — the test/override hook every existing resolver honours.
 //!    Read with `std::env::var` semantics, byte-identical to the ten
-//!    hand-rolled `fn gh_bin*` copies this replaces (a set-but-empty value is
+//!    hand-rolled `gh_bin*` resolver copies this replaces (a set-but-empty value is
 //!    returned as-is, a non-UTF-8 value is treated as unset).
 //! 3. Bare `"gh"`, resolved from `PATH` by the OS at spawn time.
 
@@ -74,7 +74,7 @@ pub fn resolve_from(policy: Option<String>, env_override: Option<String>) -> Res
 }
 
 /// The resolved program name, for the legacy `String`-returning call shape
-/// (`forge_cmd::gh_bin()` delegates here).
+/// (`forge_cmd::gh_bin` re-exports it).
 #[must_use]
 pub fn gh_bin() -> String {
     resolve().program
