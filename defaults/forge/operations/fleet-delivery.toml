@@ -68,6 +68,9 @@ path = "loom-daemon/src/forge_identity.rs"
 kind = "rust"
 path = "loom-daemon/src/credential_preflight.rs"
 [[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/credential_preflight/pool.rs"
+[[operation.callers]]
 kind = "installer"
 path = "scripts/install/validate-target.sh"
 
