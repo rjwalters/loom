@@ -16,8 +16,11 @@
 //!   so the file sets read now are the sets the order was recorded against;
 //! - the predecessor is in this tick's open listing (its `head_ref` is
 //!   known), and the follower is not stacked on it (`base_ref != head_ref`);
-//! - BOTH changed-file reads succeeded and the sets are disjoint. A failed
-//!   read is never "no files".
+//! - BOTH changed-file reads succeeded and the sets are disjoint — or they
+//!   share a file but the two heads do not really conflict (#10350: the same
+//!   [`super::conflict`] predicate the planner uses, so the pass never keeps
+//!   a hold it would not create). A failed read is never "no files", and a
+//!   failed conflict check is a conflict.
 //!
 //! [`TickFiles`] is the one per-tick changed-files cache Phase 1 and Phase 2
 //! share, so no PR's files are read twice in a tick.
@@ -25,6 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use super::conflict::Conflicts;
 use super::stall::{hold_action_with_stall, stall_cause, CONSOLIDATION_PLAN_PREFIX};
 use super::{
     evaluate, HoldAction, KeepReason, PredecessorState, SequenceMarker, SequencePr, Verdict,
@@ -108,12 +112,14 @@ pub fn no_overlap_release(
     release_candidate(marker, follower, pred) && ff.is_disjoint(pf)
 }
 
-/// Phase 1's decision with the no-overlap release applied on top of
+/// Phase 1's decision with the no-overlap (or no-conflict) release applied on top of
 /// `action` (the [`hold_action_with_stall`] result). Only `HoldSoft` and
 /// `ReleaseStalled` can become [`HoldAction::ReleaseNoOverlap`] — when both
 /// the stall and the no-overlap release apply, the no-overlap reason is the
 /// accurate one. Every other action keeps precedence unchanged. Files are
-/// read through `files` only when every other condition already holds.
+/// read through `files` only when every other condition already holds; the
+/// `conflicts` predicate is asked only for a pair that shares a file.
+#[allow(clippy::too_many_arguments)]
 pub fn with_no_overlap(
     action: HoldAction,
     marker: &SequenceMarker,
@@ -122,6 +128,7 @@ pub fn with_no_overlap(
     open: &[SequencePr],
     files: &mut TickFiles,
     mut fetch: impl FnMut(&SequencePr) -> Option<BTreeSet<String>>,
+    conflicts: Conflicts<'_>,
 ) -> HoldAction {
     if !matches!(action, HoldAction::HoldSoft | HoldAction::ReleaseStalled) {
         return action;
@@ -140,7 +147,10 @@ pub fn with_no_overlap(
     };
     let follower_files = files.get_or_fetch(follower, &mut fetch).cloned();
     let pred_files = files.get_or_fetch(pred, &mut fetch);
-    if no_overlap_release(marker, follower, Some(pred), follower_files.as_ref(), pred_files) {
+    let clean = || follower_files.is_some() && pred_files.is_some() && !conflicts(pred, follower);
+    if no_overlap_release(marker, follower, Some(pred), follower_files.as_ref(), pred_files)
+        || clean()
+    {
         HoldAction::ReleaseNoOverlap
     } else {
         action
@@ -151,8 +161,8 @@ pub fn with_no_overlap(
 #[must_use]
 pub fn release_reason(marker: &SequenceMarker) -> String {
     format!(
-        "this PR and #{} share no changed files — the recorded order was transitive-only (it \
-         came through a third PR's files, #10077), so no landing order is needed between them",
+        "this PR and #{} share no changed files (a transitive-only order, #10077), or their \
+         shared files merge without conflict (#10350) — no landing order is needed between them",
         marker.after
     )
 }
@@ -165,6 +175,7 @@ pub(super) fn would_release(
     root: &Path,
     open: &[SequencePr],
     files: &mut TickFiles,
+    conflicts: Conflicts<'_>,
 ) -> Vec<(u32, u32)> {
     let bin = gh_bin.to_string_lossy().to_string();
     let (now, bound, max_age) = (chrono::Utc::now(), super::stall_hours(), super::max_age_hours());
@@ -187,7 +198,8 @@ pub(super) fn would_release(
             cause.as_ref(),
         );
         let fetch = |p: &SequencePr| super::changed_files(gh_bin, root, p);
-        let decided = with_no_overlap(action, &marker, pred_state.as_ref(), pr, open, files, fetch);
+        let p = pred_state.as_ref();
+        let decided = with_no_overlap(action, &marker, p, pr, open, files, fetch, conflicts);
         if decided == HoldAction::ReleaseNoOverlap {
             out.push((pr.number, marker.after));
         }

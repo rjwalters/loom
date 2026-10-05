@@ -94,7 +94,9 @@ fn decide(
         calls.set(calls.get() + 1);
         sets.get(&p.number).cloned()
     };
-    let out = with_no_overlap(action, m, pred_state, &c.follower, &c.open, &mut cache, fetch);
+    let conflicts = super::super::conflict::assume_conflict;
+    let (f, open) = (&c.follower, &c.open);
+    let out = with_no_overlap(action, m, pred_state, f, open, &mut cache, fetch, &conflicts);
     (out, calls.get())
 }
 
@@ -415,7 +417,8 @@ fn the_dry_run_lists_disjoint_holds_reads_once_and_writes_nothing() {
     }
     let (gh, log) = fake_gh(d);
     let mut cache = TickFiles::default();
-    let out = would_release(&gh, &root, &open, &mut cache);
+    let conflicts = super::super::conflict::assume_conflict;
+    let out = would_release(&gh, &root, &open, &mut cache, &conflicts);
     assert_eq!(out, vec![(20, 10)]);
     let calls = std::fs::read_to_string(&log).unwrap();
     assert!(!calls.contains("pr edit") && !calls.contains("pr comment"), "{calls}");
