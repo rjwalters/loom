@@ -138,11 +138,22 @@ impl PrWork {
 }
 
 /// Every PR of `repo` in `events`, with what is still to be read.
+///
+/// Only [`SOURCE_FORGE`] rows count: the fan-out reads the forge, so its work
+/// list (which PRs exist, when they closed, which walks are settled) is derived
+/// from forge rows alone. Imported rows from other sources (e.g. the webhook
+/// mirror) carry their own receipt times and PRs outside the forge window;
+/// letting them in would move `closed_at` off the settle markers and queue
+/// PRs the forge never listed (#10197).
 #[must_use]
 pub fn pr_work(events: &[RawEvent], repo: &str) -> Vec<PrWork> {
     let mut rows: Vec<&RawEvent> = events
         .iter()
-        .filter(|e| e.item_kind == ItemKind::Pr && e.repo.eq_ignore_ascii_case(repo))
+        .filter(|e| {
+            e.source == SOURCE_FORGE
+                && e.item_kind == ItemKind::Pr
+                && e.repo.eq_ignore_ascii_case(repo)
+        })
         .collect();
     rows.sort_by(|a, b| a.canonical_key().cmp(&b.canonical_key()));
     let mut prs: BTreeMap<u32, PrWork> = BTreeMap::new();

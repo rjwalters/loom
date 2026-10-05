@@ -1432,7 +1432,9 @@ of what is on disk and never needs a refetch.
   importing an overlapping later export (after D1 eviction) appends only new
   rows and removes none. It carries `loom:*` labels and open/close only.
   `state --source forge|webhook-mirror` replays one source; mixed, a
-  transition seen by both is replayed twice, seconds apart.
+  transition seen by both is replayed twice, seconds apart. The per-PR
+  fan-out's work list reads `forge` rows only, so an import never queues a
+  forge read.
 
 `loom eta …` (the machine dispatcher, `scripts/loom`) is a thin passthrough to
 `loom-daemon eta …`.

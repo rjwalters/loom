@@ -191,6 +191,100 @@ fn same_second_rows_replay_in_delivery_order() {
     assert_eq!(issue.labels, vec!["loom:building".to_string()]);
 }
 
+/// A same-second label then unlabel of the *same* label: only `seq` (the D1
+/// row id) orders them, and the final state depends on that order.
+#[test]
+fn seq_decides_a_same_second_flip_of_one_label() {
+    let replay = |labeled_id: u64, unlabeled_id: u64| {
+        let rows = vec![
+            row(1, "2026-09-01T00:00:00Z", "issue", 5, "opened", None),
+            row(labeled_id, "2026-09-01T01:00:00Z", "issue", 5, "labeled", Some("loom:issue")),
+            row(
+                unlabeled_id,
+                "2026-09-01T01:00:00Z",
+                "issue",
+                5,
+                "unlabeled",
+                Some("loom:issue"),
+            ),
+        ];
+        let events = parse_export(&jsonl(&rows), fetched()).by_repo[REPO].clone();
+        let mut reversed = events.clone();
+        reversed.reverse();
+        let as_of = t("2026-09-01T02:00:00Z");
+        let state = fleet_state(&events, REPO, as_of);
+        assert_eq!(
+            serde_json::to_string(&state).unwrap(),
+            serde_json::to_string(&fleet_state(&reversed, REPO, as_of)).unwrap(),
+            "input order never matters"
+        );
+        state
+            .items
+            .iter()
+            .find(|i| i.number == 5)
+            .unwrap()
+            .labels
+            .clone()
+    };
+    // Delivered label-then-unlabel: the label is gone.
+    assert!(replay(10, 11).is_empty());
+    // Delivered unlabel-then-label: the label stays.
+    assert_eq!(replay(11, 10), vec!["loom:issue".to_string()]);
+}
+
+/// Imported webhook rows never change the forge fan-out's work list: no
+/// webhook-only PR joins it, and a closed PR settled before the import stays
+/// settled although the webhook `closed` row sorts after the forge close.
+#[test]
+fn pr_work_ignores_imported_webhook_rows() {
+    use crate::eta::fleet_events_fanout::{pr_work, settle_marker, PerPrKind};
+
+    let forge = |pr: u32, kind: EventKind, label: Option<&str>, at: &str| {
+        RawEvent::new(
+            REPO,
+            pr,
+            ItemKind::Pr,
+            kind,
+            label.map(str::to_string),
+            t(at),
+            SOURCE_FORGE,
+            0,
+            fetched(),
+        )
+    };
+    let closed_at = t("2026-09-10T00:00:00Z");
+    let forge_rows = vec![
+        forge(7, EventKind::Opened, None, "2026-09-09T00:00:00Z"),
+        forge(7, EventKind::HeadCommit, Some("abc"), "2026-09-09T01:00:00Z"),
+        forge(7, EventKind::Closed, None, "2026-09-10T00:00:00Z"),
+        settle_marker(REPO, 7, PerPrKind::Reviews, closed_at, fetched()),
+        settle_marker(REPO, 7, PerPrKind::CheckRuns, closed_at, fetched()),
+        forge(8, EventKind::Opened, None, "2026-09-11T00:00:00Z"),
+    ];
+    let before = pr_work(&forge_rows, REPO);
+    assert!(before[0].reviews_settled && before[0].checks_settled);
+
+    let webhook = parse_export(
+        &jsonl(&[
+            // Receipt lag: the webhook close lands seconds after the forge's.
+            row(50, "2026-09-10T00:00:04Z", "pr", 7, "closed", None),
+            row(51, "2026-09-10T00:00:05Z", "pr", 7, "reopened", None),
+            row(52, "2026-09-10T00:00:06Z", "pr", 7, "closed", None),
+            // PRs only the mirror has seen, one closed and one never closed.
+            row(53, "2026-06-01T00:00:00Z", "pr", 99, "opened", None),
+            row(54, "2026-06-02T00:00:00Z", "pr", 99, "closed", None),
+            row(55, "2026-06-03T00:00:00Z", "pr", 98, "opened", None),
+            row(56, "2026-09-12T00:00:00Z", "pr", 8, "closed", None),
+        ]),
+        fetched(),
+    )
+    .by_repo[REPO]
+        .clone();
+    let mut mixed = forge_rows;
+    mixed.extend(webhook);
+    assert_eq!(pr_work(&mixed, REPO), before);
+}
+
 #[test]
 fn rows_at_or_after_t_do_not_change_fleet_state() {
     let rows = export();

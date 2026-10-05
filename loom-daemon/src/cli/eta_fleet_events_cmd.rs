@@ -256,8 +256,12 @@ pub(crate) struct FleetStateArgs {
     pub json: bool,
 
     /// Replay only rows of this source (`forge` or `webhook-mirror`).
-    /// Default: every cached row.
-    #[arg(long, value_name = "SOURCE")]
+    /// Default: every cached row. Any other value is rejected.
+    #[arg(
+        long,
+        value_name = "SOURCE",
+        value_parser = [fleet_events::SOURCE_FORGE, SOURCE_WEBHOOK_MIRROR]
+    )]
     pub source: Option<String>,
 }
 
