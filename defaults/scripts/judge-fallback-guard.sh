@@ -180,7 +180,7 @@ if [[ -z "$HEAD_SHA" ]]; then
   exit 1
 fi
 
-# Loom's own GitHub App identities are reported by GitHub as `is_bot: true`
+# Loom's own GitHub App identities are reported by GitHub as `type: Bot`
 # (same as Dependabot/Renovate/github-actions[bot]), but they are NOT external
 # bots outside the Loom label workflow — they are Loom's own PR creation path.
 # Let them through to the cap/dedup checks below like any other Loom-authored
