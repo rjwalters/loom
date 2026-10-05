@@ -17,6 +17,12 @@ fn comment(login: &str, kind: &str, assoc: &str, sha: &str) -> String {
     )
 }
 
+/// The REST open-PR listing (#10349): PR #300 carries `loom:pr` at `SHA_B`.
+fn pulls_300() -> String {
+    use super::open_pr_listing::test_support::{pulls_arm, row};
+    pulls_arm(&[row(300, &["loom:pr"]).sha(SHA_B)])
+}
+
 /// PR #300 carries `loom:pr` at head `SHA_B`; its comment listing is
 /// `comments` (a JSON array).
 fn reconcile(comments: &str) -> VerdictReconcileStats {
@@ -30,16 +36,14 @@ fn reconcile(comments: &str) -> VerdictReconcileStats {
         &gh,
         format!(
             r#"#!/usr/bin/env bash
-case "$*" in
-  "pr list "*"--label loom:pr "*)
-    echo '[{{"number":300,"headRefOid":"{SHA_B}","labels":[{{"name":"loom:pr"}}]}}]' ;;
-  "pr list "*) echo '[]' ;;
+{pulls}case "$*" in
   "api repos/{{owner}}/{{repo}}/issues/300/comments"*) cat "{listing}" ;;
   "api "*compare/*) echo '{{"status":"ahead","files":[{{"filename":"src/lib.rs"}}]}}' ;;
   *) echo '{{}}' ;;
 esac
 "#,
-            listing = listing.display()
+            listing = listing.display(),
+            pulls = pulls_300(),
         ),
     )
     .unwrap();
@@ -176,10 +180,7 @@ fn reconcile_capturing_notice(comments: &str) -> (VerdictReconcileStats, String)
         &gh,
         format!(
             r#"#!/usr/bin/env bash
-case "$*" in
-  "pr list "*"--label loom:pr "*)
-    echo '[{{"number":300,"headRefOid":"{SHA_B}","labels":[{{"name":"loom:pr"}}]}}]' ;;
-  "pr list "*) echo '[]' ;;
+{pulls}case "$*" in
   "pr comment "*) printf '%s\n' "$5" >> "{posted}" ;;
   "api repos/{{owner}}/{{repo}}/issues/300/comments"*) cat "{listing}" ;;
   "api "*compare/*) echo '{{"status":"ahead","files":[{{"filename":"src/lib.rs"}}]}}' ;;
@@ -187,7 +188,8 @@ case "$*" in
 esac
 "#,
             listing = listing.display(),
-            posted = posted.display()
+            posted = posted.display(),
+            pulls = pulls_300(),
         ),
     )
     .unwrap();

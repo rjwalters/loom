@@ -78,7 +78,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -187,50 +187,29 @@ impl SequencePr {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct GhLabel {
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhSequencePr {
-    number: u32,
-    #[serde(rename = "createdAt")]
-    created_at: String,
-    #[serde(rename = "updatedAt")]
-    updated_at: String,
-    #[serde(rename = "headRefOid", default)]
-    head_ref_oid: Option<String>,
-    #[serde(rename = "headRefName", default)]
-    head_ref_name: Option<String>,
-    #[serde(rename = "baseRefName", default)]
-    base_ref_name: Option<String>,
-    #[serde(default)]
-    is_draft: bool,
-    #[serde(default)]
-    labels: Vec<GhLabel>,
-}
-
-/// Parse one `gh pr list --json` payload with the fields the planner needs.
-///
-/// # Errors
-/// Malformed JSON.
-pub fn parse_pr_list(stdout: &[u8]) -> Result<Vec<SequencePr>> {
-    let rows: Vec<GhSequencePr> =
-        serde_json::from_slice(stdout).context("parse gh pr list JSON")?;
-    Ok(rows
-        .into_iter()
-        .map(|r| SequencePr {
+impl From<&super::open_pr_listing::RestPull> for SequencePr {
+    /// One row of the REST open-PR listing (#10349).
+    fn from(r: &super::open_pr_listing::RestPull) -> Self {
+        Self {
             number: r.number,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-            head_sha: r.head_ref_oid,
-            head_ref: r.head_ref_name.unwrap_or_default(),
-            base_ref: r.base_ref_name.unwrap_or_default(),
-            draft: r.is_draft,
-            labels: r.labels.into_iter().map(|l| l.name).collect(),
-        })
-        .collect())
+            created_at: r.created_at.clone().unwrap_or_default(),
+            updated_at: r.updated_at.clone().unwrap_or_default(),
+            head_sha: r.head_sha.clone(),
+            head_ref: r.head_ref.clone().unwrap_or_default(),
+            base_ref: r.base_ref.clone().unwrap_or_default(),
+            draft: r.draft,
+            labels: r.labels.clone(),
+        }
+    }
+}
+
+/// The planner's view of the open-PR listing: the newest
+/// [`super::MAX_ISSUES_PER_WORKSPACE`] rows (the listing is newest first and
+/// pages further, for the review-conflict pass's sake).
+#[must_use]
+pub fn sequence_prs(rows: &[super::open_pr_listing::RestPull]) -> Vec<SequencePr> {
+    let cap = usize::try_from(super::MAX_ISSUES_PER_WORKSPACE).unwrap_or(usize::MAX);
+    rows.iter().take(cap).map(SequencePr::from).collect()
 }
 
 /// Why a component/edge exists — recorded on the plan, consumed by telemetry.
@@ -824,7 +803,6 @@ pub struct MergeSequenceStats {
 /// applied — the same invocation shape as the review-conflict pass.
 fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let inv = match args.first().copied() {
-        Some("list") => gh_call::read("sequence.pr_list", gh_bin, root),
         Some("view") => gh_call::read("sequence.pr_view", gh_bin, root),
         Some("comment") => gh_call::write("sequence.pr_comment", gh_bin, root),
         _ => gh_call::write("sequence.pr_edit", gh_bin, root),
@@ -842,21 +820,7 @@ fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
 }
 
 fn list_open_prs(gh_bin: &Path, root: &Path) -> Result<Vec<SequencePr>> {
-    let limit = super::MAX_ISSUES_PER_WORKSPACE.to_string();
-    let stdout = gh_pr(
-        gh_bin,
-        root,
-        &[
-            "list",
-            "--state",
-            "open",
-            "--limit",
-            &limit,
-            "--json",
-            "number,createdAt,updatedAt,headRefOid,headRefName,baseRefName,isDraft,labels",
-        ],
-    )?;
-    parse_pr_list(&stdout)
+    Ok(sequence_prs(&super::open_pr_listing::list_open_prs(gh_bin, root)?))
 }
 
 /// Changed paths for one PR. `None` on any failure: a failed read shrinks
@@ -1063,34 +1027,22 @@ pub fn reconcile_merge_sequences(gh_bin: &Path, root: &Path) -> MergeSequenceSta
     reconcile_merge_sequences_with(gh_bin, root, None)
 }
 
-/// Parse a listing shared by the review-conflict pass, truncated to the
-/// newest [`super::MAX_ISSUES_PER_WORKSPACE`] rows this pass's own listing
-/// would have returned. `None` when it does not parse (the caller re-lists).
-fn shared_open_prs(raw: &[u8]) -> Option<Vec<SequencePr>> {
-    let mut v = parse_pr_list(raw).ok()?;
-    v.truncate(usize::try_from(super::MAX_ISSUES_PER_WORKSPACE).unwrap_or(usize::MAX));
-    Some(v)
-}
-
 /// [`reconcile_merge_sequences`] with an optional open-PR listing the
 /// review-conflict pass already read on this root this tick and did not
-/// write after (#4429 follow-up). Saves this pass's own `gh pr list` — one
-/// GraphQL request per workspace per tick. `None`, or a payload that does not
-/// parse, lists exactly as before. The shared listing pages further than this
-/// pass's own (see `review_conflict::OPEN_PR_LIST_LIMIT`), so it is truncated
-/// to the same [`super::MAX_ISSUES_PER_WORKSPACE`] newest PRs the pass's own
-/// listing returns: the plan sees the identical input either way.
+/// write after (#4429 follow-up), which saves this pass its own listing read.
+/// `None` lists exactly as before. Either way the plan sees the same
+/// [`sequence_prs`] cut of the one REST listing (#10349).
 pub(super) fn reconcile_merge_sequences_with(
     gh_bin: &Path,
     root: &Path,
-    prefetched: Option<&[u8]>,
+    prefetched: Option<&[super::open_pr_listing::RestPull]>,
 ) -> MergeSequenceStats {
     let mut stats = MergeSequenceStats::default();
     if !merge_sequence_enabled() {
         return stats;
     }
-    let listed = match prefetched.and_then(shared_open_prs) {
-        Some(v) => Ok(v),
+    let listed = match prefetched {
+        Some(rows) => Ok(sequence_prs(rows)),
         None => list_open_prs(gh_bin, root),
     };
     let open = match listed {

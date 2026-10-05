@@ -529,10 +529,8 @@ fn format_result_json_round_trips_totals() {
 /// Install a fake `gh` (via `LOOM_GH_BIN`) that answers every call
 /// [`check_stale_pr_claims`]'s underlying
 /// `claim_reconciliation::forge::reconcile_pr_claims_report` makes for
-/// one PR: `pr list` (any `--label`, mirroring the identical simplifying
-/// assumption `claim_reconciliation.rs`'s own `write_fake_gh_pr` fixture
-/// makes — both the `loom:reviewing` and `loom:treating` passes see the
-/// same fixture PR), `pr view` (labels for the safety-net backfill
+/// one PR: the REST open-PR listing (#10349: the PR carries
+/// `loom:reviewing`), `pr view` (labels for the safety-net backfill
 /// check), and a catch-all `exit 0` for the `api .../timeline` /
 /// `api .../comments` freshness probes (so `decide_pr` falls back to
 /// `updatedAt` — deliberate, keeps this fixture from needing to model
@@ -555,13 +553,17 @@ fn install_fake_gh_pr(
         .map(|l| format!(r#"{{"name":"{l}"}}"#))
         .collect::<Vec<_>>()
         .join(",");
+    // #10349: the claim passes read the REST open-PR listing.
+    let pulls = {
+        use crate::claim_reconciliation::open_pr_listing::test_support::{pulls_arm, row};
+        pulls_arm(&[row(pr_number, &["loom:reviewing"])
+            .head(head_ref_name)
+            .updated(updated_at)])
+    };
     let script = format!(
         "#!/usr/bin/env bash\n\
          printf '%s\\n' \"$*\" >> '{log}'\n\
-         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"list\" ]; then\n\
-         echo '[{{\"number\":{pr_number},\"updatedAt\":\"{updated_at}\",\"headRefName\":\"{head_ref_name}\"}}]'\n\
-         exit 0\n\
-         fi\n\
+         {pulls}\
          if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n\
          echo '{{\"labels\":[{labels_json}]}}'\n\
          exit 0\n\

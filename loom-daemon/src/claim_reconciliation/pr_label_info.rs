@@ -89,17 +89,18 @@ mod tests {
         let script = format!(
             r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":{pr_number},"updatedAt":"{updated_at}","headRefName":"{head_ref_name}"}}]'
-  exit 0
-fi
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+{pulls}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   echo '{{"labels":[{labels_json}],"isDraft":{is_draft}}}'
   exit 0
 fi
 exit 0
 "#,
             log = gh_log.display(),
+            pulls = super::super::open_pr_listing::test_support::pulls_arm(&[
+                super::super::open_pr_listing::test_support::row(pr_number, &["loom:reviewing"])
+                    .head(head_ref_name)
+                    .updated(updated_at)
+            ]),
         );
         std::fs::write(&fake_gh, &script).unwrap();
         let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
@@ -181,17 +182,18 @@ exit 0
         let script = format!(
             r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":503,"updatedAt":"{old}","headRefName":"some-random-branch"}}]'
-  exit 0
-fi
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+{pulls}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   echo '{{"labels":[]}}'
   exit 0
 fi
 exit 0
 "#,
             log = gh_log.display(),
+            pulls = super::super::open_pr_listing::test_support::pulls_arm(&[
+                super::super::open_pr_listing::test_support::row(503, &["loom:reviewing"])
+                    .head("some-random-branch")
+                    .updated(&old)
+            ]),
         );
         std::fs::write(&fake_gh, &script).unwrap();
         let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();

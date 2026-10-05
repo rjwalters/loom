@@ -146,6 +146,9 @@ path = "defaults/scripts/merge-pr.sh"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/forge_wait_checks/reads.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_pull_listing.rs"
 
 # --- diff-commits-checkout ---------------------------------------------------
 
