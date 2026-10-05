@@ -43,7 +43,7 @@
 //! 5. **Priority levels** ([`levels`], #10307). Every open issue that
 //!    blocks a level >= 2 issue (`loom:operator-high-priority`), directly or
 //!    transitively and across managed repos, carries the level's derived
-//!    label (`loom:high-priority-inherited`) with a provenance comment, and
+//!    label (`loom:high-priority-inherited`) with a body provenance marker, and
 //!    loses it once no source reaches it. Over-cap levels and blockers that
 //!    need the operator lead the digest.
 //! 6. **loom-ui star intents** ([`intents`]). The `/ingest` ack may carry

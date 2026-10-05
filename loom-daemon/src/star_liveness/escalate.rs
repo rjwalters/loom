@@ -69,20 +69,17 @@ pub fn comment_body(ask: &OperatorAsk, host: &str, inherited_from: Option<u32>) 
 }
 
 /// [`comment_body`] for a row that may inherit an operator priority level
-/// (#10307): `level_from` names the source (`owner/repo#N`).
+/// (#10307): `level_from` is the source (`owner/repo#N`) and the inherited
+/// label of its level's row, so a new level needs no change here.
 #[must_use]
 pub fn comment_body_for(
     ask: &OperatorAsk,
     host: &str,
     inherited_from: Option<u32>,
-    level_from: Option<&str>,
+    level_from: Option<(&str, &str)>,
 ) -> String {
-    let why = if let Some(src) = level_from {
-        format!(
-            "This issue blocks {src} and inherits its operator priority level \
-             (`{}`)",
-            crate::operator_levels::HIGH_PRIORITY_INHERITED_LABEL
-        )
+    let why = if let Some((src, label)) = level_from {
+        format!("This issue blocks {src} and inherits its operator priority level (`{label}`)")
     } else {
         inherited_from.map_or_else(
             || "This issue is starred (`loom:operator-priority`)".to_string(),
@@ -117,8 +114,8 @@ pub struct Target<'a> {
     /// inheriting blocker.
     pub inherited_from: Option<u32>,
     /// The level >= 2 source this row inherits a level from (#10307), as
-    /// `owner/repo#N`.
-    pub level_from: Option<&'a str>,
+    /// `owner/repo#N`, with the inherited label of that level's row.
+    pub level_from: Option<(&'a str, &'a str)>,
 }
 
 /// One fleet-comms escalation notice (#9321): the event-bus/Matrix half of an

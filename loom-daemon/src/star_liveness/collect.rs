@@ -130,6 +130,8 @@ pub struct Evaluated {
     pub level_inherited_from: Option<String>,
     /// The inherited level, when [`Self::level_inherited_from`] is set.
     pub inherited_level: u8,
+    /// That level's inherited label, from the table the walk used.
+    pub inherited_label: Option<&'static str>,
 }
 
 impl Evaluated {
@@ -605,6 +607,7 @@ impl<'a> Evaluator<'a> {
             item: work_item(issue),
             level_inherited_from: None,
             inherited_level: 0,
+            inherited_label: None,
         }
     }
 
@@ -830,5 +833,6 @@ pub fn unmanaged(slug: &str, number: u32, starred_at: Option<String>) -> Evaluat
         item: WorkItem::new(number, Vec::new()),
         level_inherited_from: None,
         inherited_level: 0,
+        inherited_label: None,
     }
 }

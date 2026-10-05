@@ -18,13 +18,25 @@ fn has(world: &World, slug: &str, n: u32, label: &str) -> bool {
     world.repo(slug).items[&n].labels.iter().any(|l| l == label)
 }
 
+/// The provenance markers in `slug#n`'s body. The daemon never posts a
+/// provenance comment (#10307: loom-ui reads the body).
 fn provenance(world: &World, slug: &str, n: u32) -> Vec<String> {
-    world
-        .posted(slug)
+    assert!(
+        !world
+            .posted(slug)
+            .iter()
+            .any(|(num, body)| *num == n && body.contains("inherited_from=")),
+        "no provenance comment"
+    );
+    let body = world.repo(slug).items[&n].body.clone().unwrap_or_default();
+    levels::body_markers(&body)
         .into_iter()
-        .filter(|(num, body)| *num == n && body.contains("inherited_from="))
-        .map(|(_, body)| body)
+        .map(|m| m.text)
         .collect()
+}
+
+fn body(world: &World, slug: &str, n: u32) -> String {
+    world.repo(slug).items[&n].body.clone().unwrap_or_default()
 }
 
 /// The AC scenario: A (level 2) is blocked by B (same repo) and C (another
@@ -51,9 +63,12 @@ fn a_level_two_issue_hands_its_level_to_every_blocker_across_repos_and_takes_it_
     assert!(has(&world, "o/lib", 3, INH), "cross-repo blocker in a managed repo");
     for (slug, n) in [("o/app", 2), ("o/lib", 3)] {
         let p = provenance(&world, slug, n);
-        assert_eq!(p.len(), 1, "{slug}#{n}: one provenance comment");
-        assert!(p[0].contains("inherited_from=o/app#1 level=2"), "{}", p[0]);
-        assert!(p[0].contains("label=loom:high-priority-inherited"), "{}", p[0]);
+        assert_eq!(p.len(), 1, "{slug}#{n}: one body marker");
+        assert!(
+            p[0].starts_with("<!-- loom:priority-inherited inherited_from=o/app#1 level=2"),
+            "{}",
+            p[0]
+        );
         assert!(!has(&world, slug, n, HIGH), "the operator's label is never copied");
     }
     // A's row: a level-2 cross-repo blocker in a managed repo is an agent wait.
@@ -367,7 +382,34 @@ fn a_level_three_row_is_enough_to_inherit_at_level_three() {
     assert_eq!(out.over_cap.len(), 1, "two level-3 sources over a cap of 1");
     assert_eq!(out.over_cap[0].level, 3);
     let p = provenance(&world, slug, 3);
-    assert!(p[0].contains("level=3") && p[0].contains("⭐⭐⭐"), "{}", p[0]);
+    assert_eq!(p.len(), 1, "one marker for the winning level: {p:?}");
+    assert!(p[0].contains("level=3") && p[0].contains("inherited_from=o/top#1"), "{}", p[0]);
+    // The operator ask names the row's inherited label, not level 2's.
+    let row3 = out.rows.iter().find(|(k, _)| k.1 == 3).unwrap().1.clone();
+    assert_eq!(row3.inherited_label, Some("loom:top-priority-inherited"));
+    let ask = crate::types::OperatorAsk {
+        key: "k".into(),
+        kind: AskKind::OperatorOnly,
+        text: "decide".into(),
+    };
+    let text = crate::star_liveness::escalate::comment_body_for(
+        &ask,
+        "h",
+        None,
+        row3.level_inherited_from
+            .as_deref()
+            .zip(row3.inherited_label),
+    );
+    assert!(text.contains("`loom:top-priority-inherited`"), "{text}");
+    assert!(!text.contains(INH), "{text}");
+}
+
+#[test]
+fn provenance_ids_ignore_the_case_a_host_spells_a_repo_in() {
+    assert_eq!(
+        levels::provenance_id(2, &("o/x".into(), 9), &("2AMLogic/Loom-UI".into(), 1681)),
+        levels::provenance_id(2, &("o/x".into(), 9), &("2amlogic/loom-ui".into(), 1681))
+    );
 }
 
 #[test]
@@ -393,4 +435,172 @@ fn the_native_dependency_answer_keeps_open_issues_in_any_repo() {
         vec![("o/m".to_string(), 7), ("o/n".to_string(), 3)]
     );
     assert!(crate::star_liveness::forge::parse_blocked_by("{\"message\":\"x\"}", "o/n").is_empty());
+}
+
+/// Judge finding 1: host A manages `{o/app, o/lib}` and labels `o/lib#3`
+/// from `o/app#1`. Host B manages only `o/lib`, so it cannot recompute the
+/// label: it must neither remove it nor rewrite its marker. Only A, which
+/// manages the source, removes it once the source drops.
+#[test]
+fn a_host_that_does_not_manage_the_source_never_removes_or_rewrites_its_label() {
+    let world = World::default();
+    world.add("o/app", issue_with_body(1, &[HIGH, "loom:blocked"], "Depends on o/lib#3\n"));
+    world.add("o/lib", issue(3, &["loom:issue"]));
+    let both = vec![repo_input("o/app"), repo_input("o/lib")];
+    let lib_only = vec![repo_input("o/lib")];
+    let mut a = Host::new("host-a");
+    let mut b = Host::new("host-b");
+    a.pass(&world, &both, Vec::new(), t(20, 0));
+    assert!(has(&world, "o/lib", 3, INH));
+    let marked = body(&world, "o/lib", 3);
+    let writes = |w: &World| {
+        let lib = w.repo("o/lib");
+        (lib.label_writes.len(), lib.body_writes.len())
+    };
+    let before = writes(&world);
+    for m in 1..=3 {
+        b.pass(&world, &lib_only, Vec::new(), t(20, m));
+        a.pass(&world, &both, Vec::new(), t(20, m));
+    }
+    assert!(has(&world, "o/lib", 3, INH), "B keeps a label it cannot recompute");
+    assert_eq!(body(&world, "o/lib", 3), marked, "B leaves A's marker alone");
+    assert_eq!(writes(&world), before, "no flapping: no label or body write at all");
+
+    // The source drops: A (which manages it) removes label and marker.
+    world
+        .repo("o/app")
+        .items
+        .get_mut(&1)
+        .unwrap()
+        .labels
+        .retain(|l| l != HIGH);
+    b.pass(&world, &lib_only, Vec::new(), t(21, 0));
+    assert!(has(&world, "o/lib", 3, INH), "B still cannot tell");
+    a.pass(&world, &both, Vec::new(), t(21, 1));
+    assert!(!has(&world, "o/lib", 3, INH));
+    assert!(provenance(&world, "o/lib", 3).is_empty(), "the marker goes with the label");
+}
+
+/// Judge finding 2: a failed native-dependency read (5xx, secondary limit)
+/// makes the walk incomplete, so the label it gave stays.
+#[test]
+fn a_failed_dependency_read_makes_the_walk_incomplete_and_removes_nothing() {
+    let world = World::default();
+    world.add("o/n", issue(1, &[HIGH]));
+    world.add("o/m", issue(7, &[]));
+    world
+        .repo("o/n")
+        .blocked_by
+        .insert(1, vec![("o/m".to_string(), 7)]);
+    let repos = [repo_input("o/n"), repo_input("o/m")];
+    Host::new("h").pass(&world, &repos, Vec::new(), t(20, 0));
+    assert!(has(&world, "o/m", 7, INH));
+    world.repo("o/n").fail_blocked_by = true;
+    Host::new("h").pass(&world, &repos, Vec::new(), t(20, 1));
+    assert!(has(&world, "o/m", 7, INH), "an unreadable dependency is not 'no dependency'");
+    // Readable again and genuinely gone: now it is removed.
+    world.repo("o/n").fail_blocked_by = false;
+    world.repo("o/n").blocked_by.clear();
+    Host::new("h").pass(&world, &repos, Vec::new(), t(20, 2));
+    assert!(!has(&world, "o/m", 7, INH));
+}
+
+/// Judge findings 3 and 4: provenance goes into the body **before** the
+/// label; a failed body write skips the label so the whole add retries; the
+/// marker is replaced in place when the source changes; the rest of the body
+/// is untouched; nothing is written when the marker is already right.
+#[test]
+fn provenance_is_written_to_the_body_first_replaced_in_place_and_removed_with_the_label() {
+    let world = World::default();
+    let slug = "o/p";
+    world.add(slug, issue_with_body(1, &[HIGH, "loom:blocked"], "Blocked by #2\n"));
+    let original = "## Problem\n\nIt breaks.\n<!-- loom:complexity=small -->\n";
+    world.add(slug, issue_with_body(2, &["loom:issue"], original));
+    let repos = [repo_input(slug)];
+    let mut h = Host::new("h");
+
+    world.repo(slug).fail_body_write = true;
+    h.pass(&world, &repos, Vec::new(), t(20, 0));
+    assert!(!has(&world, slug, 2, INH), "no label without its provenance");
+    assert_eq!(body(&world, slug, 2), original);
+
+    world.repo(slug).fail_body_write = false;
+    h.pass(&world, &repos, Vec::new(), t(20, 1));
+    assert!(has(&world, slug, 2, INH), "the add retried whole");
+    let b = body(&world, slug, 2);
+    assert!(b.starts_with(original), "the rest of the body is untouched: {b:?}");
+    assert_eq!(provenance(&world, slug, 2).len(), 1);
+    assert!(b.contains("inherited_from=o/p#1 level=2"), "{b}");
+
+    // Steady state: no body write.
+    let n = world.repo(slug).body_writes.len();
+    h.pass(&world, &repos, Vec::new(), t(20, 2));
+    assert_eq!(world.repo(slug).body_writes.len(), n);
+
+    // A second level-2 source D takes over when A drops: one marker, now D.
+    world.add(slug, issue_with_body(4, &[HIGH, "loom:blocked"], "Blocked by #2\n"));
+    world
+        .repo(slug)
+        .items
+        .get_mut(&1)
+        .unwrap()
+        .labels
+        .retain(|l| l != HIGH);
+    h.pass(&world, &repos, Vec::new(), t(20, 3));
+    let p = provenance(&world, slug, 2);
+    assert_eq!(p.len(), 1, "replaced in place, not appended: {p:?}");
+    assert!(p[0].contains("inherited_from=o/p#4"), "{}", p[0]);
+    assert!(body(&world, slug, 2).starts_with(original));
+
+    // D drops: label and marker go, and the body is back to the original.
+    world
+        .repo(slug)
+        .items
+        .get_mut(&4)
+        .unwrap()
+        .labels
+        .retain(|l| l != HIGH);
+    h.pass(&world, &repos, Vec::new(), t(20, 4));
+    assert!(!has(&world, slug, 2, INH));
+    assert_eq!(body(&world, slug, 2), original);
+}
+
+#[test]
+fn with_marker_replaces_appends_and_removes_without_touching_the_rest() {
+    let m1 = "<!-- loom:priority-inherited inherited_from=o/a#1 level=2 id=x -->";
+    let m2 = "<!-- loom:priority-inherited inherited_from=o/a#9 level=2 id=y -->";
+    let other = "<!-- loom:priority-inherited level=3 inherited_from=#5 -->";
+    assert_eq!(levels::with_marker("", 2, Some(m1)), m1);
+    let body = "Text.\n";
+    let added = levels::with_marker(body, 2, Some(m1));
+    assert_eq!(added, format!("Text.\n\n\n{m1}"));
+    assert_eq!(levels::with_marker(&added, 2, None), body, "removal takes its blank line");
+    let mid = format!("A {m1} B {other} C {m1}");
+    assert_eq!(
+        levels::with_marker(&mid, 2, Some(m2)),
+        format!("A {m2} B {other} C "),
+        "first replaced in place, duplicate dropped, other level kept"
+    );
+    assert_eq!(levels::with_marker(body, 2, None), body);
+    let parsed = levels::marker_for(&mid, 3).unwrap();
+    assert_eq!(parsed.inherited_from.as_deref(), Some("#5"));
+    assert_eq!(parsed.source_repo(), None, "a bare #N is the item's own repo");
+}
+
+#[test]
+fn the_work_finder_orders_an_inherited_blocker_at_its_markers_requested_at() {
+    let table = LEVELS;
+    let body = "x\n\n<!-- loom:priority-inherited inherited_from=o/a#1 level=2 \
+                requested_at=2026-10-01T00:00:00Z id=z -->";
+    let labels = |ls: &[&str]| ls.iter().map(|l| (*l).to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        levels::inherited_requested_at(table, &labels(&[INH]), Some(body)).as_deref(),
+        Some("2026-10-01T00:00:00Z")
+    );
+    assert_eq!(
+        levels::inherited_requested_at(table, &labels(&[INH, HIGH]), Some(body)),
+        None,
+        "its own level 2 orders it by its own time"
+    );
+    assert_eq!(levels::inherited_requested_at(table, &labels(&[STAR]), Some(body)), None);
 }

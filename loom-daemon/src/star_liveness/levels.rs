@@ -26,14 +26,23 @@
 //!    level is lower carries the level's inherited label
 //!    (`loom:high-priority-inherited`), so every reader that queries labels
 //!    (Curator, Builder's `gh issue list`, `pr-queue`, loom-ui) sees it, and
-//!    another repo's daemon does too. The label is added with one provenance
-//!    comment in the loom-ui intent marker shape
-//!    ([`provenance_marker`]: `inherited_from=owner/repo#N level=2
-//!    requested_at=<source's starred-at>`), so the starred-at timeline read
-//!    orders the blocker at its source's time. It is removed once no source
-//!    of that level reaches the issue — but only after a **complete** walk:
-//!    a capped or partly unreadable pass adds and never removes. The
-//!    operator's own label is never copied, so the cap count stays exact.
+//!    another repo's daemon does too. **Provenance lives in the blocker's
+//!    issue body** ([`provenance_marker`]: `<!-- loom:priority-inherited
+//!    inherited_from=owner/repo#N level=2 requested_at=<source's starred-at>
+//!    id=… -->`, the shape loom-ui reads, #10307), one marker per level,
+//!    replaced in place when the source changes ([`with_marker`]). The body
+//!    is written **before** the label, and the label is skipped when that
+//!    write fails, so the `labeled` webhook carries the provenance and a
+//!    failed write retries whole next pass. The work finder orders the
+//!    blocker at the marker's `requested_at` ([`inherited_requested_at`]).
+//!    The label and its marker are removed once no source of that level
+//!    reaches the issue — but only after a **complete** walk (a capped or
+//!    partly unreadable pass, including a failed dependency read, adds and
+//!    never removes), and only by a host that manages the marker's source
+//!    repo: a host with a narrower managed set cannot recompute a
+//!    cross-repo label, so it neither removes it nor rewrites its marker.
+//!    The operator's own label is never copied, so the cap count stays
+//!    exact.
 //! 4. **Cap** ([`over_cap`]). A level over its cap
 //!    (`autonomous.operatorPriority.levelCaps`, default from the table) is
 //!    reported in the digest. Nothing is refused: loom-ui enforces the cap at
@@ -44,7 +53,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use super::edges::{self, Node};
 use super::forge::StarForge;
-use super::intents::{INTENT_MARKER_PREFIX, LABEL_FIELD};
 use super::landing::BLOCKED_LABEL;
 use crate::forge_listing::RestIssue;
 use crate::operator_levels::{self, PriorityLevel};
@@ -231,10 +239,11 @@ pub fn closure(
     out
 }
 
-/// The provenance intent id: safe inside a marker, the same on every host.
+/// The provenance id: safe inside a marker, and the same on every host
+/// whatever case it spells the source repo in.
 #[must_use]
 pub fn provenance_id(level: u8, child: &Key, source: &Key) -> String {
-    let raw = format!("hp{level}-{}-from-{}.{}", child.1, source.0, source.1);
+    let raw = format!("hp{level}-{}-from-{}.{}", child.1, source.0.to_ascii_lowercase(), source.1);
     let mut id: String = raw
         .chars()
         .map(|c| {
@@ -251,52 +260,171 @@ pub fn provenance_id(level: u8, child: &Key, source: &Key) -> String {
     id.chars().take(128).collect()
 }
 
-/// The provenance marker for `reach`, in the loom-ui intent marker shape so
-/// the starred-at timeline read takes the source's `requested_at`.
+/// The token every level provenance marker carries (loom-ui reads it).
+pub const PROVENANCE_TOKEN: &str = "loom:priority-inherited";
+
+/// The body marker for `reach` (#10307): `inherited_from`, `level` and
+/// `requested_at` are the fields loom-ui reads; `id` is stable per (level,
+/// blocker, source).
 #[must_use]
-pub fn provenance_marker(reach: &Reach, inherited_label: &str) -> String {
+pub fn provenance_marker(reach: &Reach) -> String {
     let at = reach
         .requested_at
         .as_deref()
         .map(|t| format!(" requested_at={t}"))
         .unwrap_or_default();
     format!(
-        "{INTENT_MARKER_PREFIX}{} action=star{at} {LABEL_FIELD}{inherited_label} inherited_from={} level={} -->",
-        provenance_id(reach.level, &reach.key, &reach.source),
+        "<!-- {PROVENANCE_TOKEN} inherited_from={} level={}{at} id={} -->",
         display(&reach.source),
-        reach.level
+        reach.level,
+        provenance_id(reach.level, &reach.key, &reach.source)
     )
 }
 
-/// The provenance comment for `reach`.
+/// One provenance marker found in a body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyMarker {
+    /// Byte range of the whole `<!-- … -->` comment.
+    pub range: std::ops::Range<usize>,
+    pub text: String,
+    pub level: Option<u8>,
+    /// `owner/repo#N`, or a bare `#N` meaning the item's own repo.
+    pub inherited_from: Option<String>,
+    pub requested_at: Option<String>,
+}
+
+impl BodyMarker {
+    /// The source's repo, `None` for a bare `#N` (the item's own repo).
+    #[must_use]
+    pub fn source_repo(&self) -> Option<&str> {
+        let from = self.inherited_from.as_deref()?;
+        let (repo, _) = from.split_once('#')?;
+        (!repo.is_empty()).then_some(repo)
+    }
+}
+
+/// Every provenance marker in `body`, in order. Any HTML comment that
+/// carries [`PROVENANCE_TOKEN`] counts; its fields may come in any order.
 #[must_use]
-pub fn provenance_comment(reach: &Reach, row: &PriorityLevel, inherited_label: &str) -> String {
-    let via = if reach.via == reach.source {
-        String::new()
-    } else {
-        format!(" (via {})", display(&reach.via))
-    };
-    format!(
-        "{}\n{} Inherits {} from {}, which it blocks{via}. The daemon removes \
-         `{inherited_label}` once no level-{} issue it blocks remains (#10307).",
-        provenance_marker(reach, inherited_label),
-        row.glyph,
-        row.name,
-        display(&reach.source),
-        reach.level
-    )
+pub fn body_markers(body: &str) -> Vec<BodyMarker> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = body[from..].find("<!--") {
+        let start = from + i;
+        let Some(j) = body[start..].find("-->") else {
+            break;
+        };
+        let end = start + j + 3;
+        let text = &body[start..end];
+        if text.contains(PROVENANCE_TOKEN) {
+            let field = |key: &str| {
+                text.split_whitespace()
+                    .find_map(|w| w.strip_prefix(key))
+                    .map(str::to_string)
+            };
+            out.push(BodyMarker {
+                range: start..end,
+                text: text.to_string(),
+                level: field("level=").and_then(|l| l.parse().ok()),
+                inherited_from: field("inherited_from="),
+                requested_at: field("requested_at="),
+            });
+        }
+        from = end;
+    }
+    out
 }
 
-/// One label write the pass makes.
+/// The provenance marker for `level` in `body`, when there is one.
+#[must_use]
+pub fn marker_for(body: &str, level: u8) -> Option<BodyMarker> {
+    body_markers(body)
+        .into_iter()
+        .find(|m| m.level == Some(level))
+}
+
+/// `body` with `level`'s provenance set to `marker`, or removed when `None`.
+/// The first marker of that level is replaced in place and any duplicates
+/// dropped; with none, the marker is appended after a blank line. Every
+/// other byte is kept, and removing an appended marker takes its blank line
+/// with it.
+#[must_use]
+pub fn with_marker(body: &str, level: u8, marker: Option<&str>) -> String {
+    let mine: Vec<std::ops::Range<usize>> = body_markers(body)
+        .into_iter()
+        .filter(|m| m.level == Some(level))
+        .map(|m| m.range)
+        .collect();
+    let Some(first) = mine.first().cloned() else {
+        return match marker {
+            None => body.to_string(),
+            Some(m) if body.is_empty() => m.to_string(),
+            Some(m) => format!("{body}\n\n{m}"),
+        };
+    };
+    let mut out = body.to_string();
+    for r in mine.iter().rev() {
+        if *r == first {
+            if let Some(m) = marker {
+                out.replace_range(r.clone(), m);
+                continue;
+            }
+        }
+        let at_end = r.end == out.len();
+        let mut start = r.start;
+        if at_end && out[..start].ends_with("\n\n") {
+            start -= 2;
+        }
+        out.replace_range(start..r.end, "");
+    }
+    out
+}
+
+/// The starred-at a blocker inherits through its body marker (#10307): the
+/// `requested_at` of the marker for the level of an inherited label `item`
+/// carries, when that level is above its own. The work finder orders it
+/// there, as it would its source.
+#[must_use]
+pub fn inherited_requested_at(
+    table: &[PriorityLevel],
+    labels: &[String],
+    body: Option<&str>,
+) -> Option<String> {
+    let level = operator_levels::inherited_level_in(table, labels);
+    if level == 0 || operator_levels::own_level_in(table, labels) >= level {
+        return None;
+    }
+    marker_for(body?, level)?.requested_at
+}
+
+/// One write the pass makes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Write {
-    /// Add `label` to `key` with a provenance comment for `reach`.
+    /// Add `label` to `reach.key`. With `provenance`, the body marker is
+    /// written first, and the label is skipped when that write fails.
     Add {
         reach: Box<Reach>,
         label: &'static str,
+        provenance: bool,
     },
-    /// Remove `label` from `key`: no source of its level reaches it.
-    Remove { key: Key, label: &'static str },
+    /// The label is there but its body marker is missing or names a source
+    /// this host manages that no longer wins: rewrite the marker in place.
+    Provenance { reach: Box<Reach> },
+    /// Remove `label` from `key`: no source of its level reaches it. With
+    /// `provenance` (an issue), its body marker for `level` goes first.
+    Remove {
+        key: Key,
+        label: &'static str,
+        level: u8,
+        provenance: bool,
+    },
+}
+
+/// Whether this host may write or remove provenance over `existing`: there
+/// is none, or it names a source in a repo this host manages (a bare `#N`
+/// is the item's own repo, which it does).
+fn may_override(existing: Option<&BodyMarker>, managed: &dyn Fn(&str) -> bool) -> bool {
+    existing.is_none_or(|m| m.source_repo().is_none_or(managed))
 }
 
 /// One open item currently carrying an inherited label.
@@ -307,11 +435,15 @@ pub struct Holder {
     pub item: RestIssue,
 }
 
-/// The writes that bring the inherited labels to `closure`. `holders` are
-/// the open items listed carrying an inherited label (only from listings
-/// that succeeded). With `complete` false nothing is removed. A PR keeps a
-/// label (Builder copies priority labels onto its PR) while an issue it
-/// closes or advances is reached at that level or carries it on its own.
+/// The writes that bring the inherited labels and their body markers to
+/// `closure`. `holders` are the open items listed carrying an inherited
+/// label (only from listings that succeeded). With `complete` false nothing
+/// is removed. `managed` answers whether this host manages a repo: an issue
+/// whose marker names a source in a repo it does not manage keeps its label
+/// and marker (another host can recompute them; this one cannot). A PR
+/// keeps a label (Builder copies priority labels onto its PR) while an
+/// issue it closes or advances is reached at that level, carries it on its
+/// own, or keeps it for that reason.
 #[must_use]
 pub fn plan_writes(
     table: &[PriorityLevel],
@@ -319,6 +451,7 @@ pub fn plan_writes(
     sources: &[Source],
     holders: &[Holder],
     complete: bool,
+    managed: &dyn Fn(&str) -> bool,
 ) -> Vec<Write> {
     let mut writes = Vec::new();
     let has = |item: &RestIssue, label: &str| item.labels.iter().any(|l| l == label);
@@ -327,10 +460,20 @@ pub fn plan_writes(
         else {
             continue;
         };
+        let existing = marker_for(reach.issue.body.as_deref().unwrap_or_default(), reach.level);
+        let stale = existing
+            .as_ref()
+            .is_none_or(|m| m.text != provenance_marker(reach));
+        let provenance = stale && may_override(existing.as_ref(), managed);
         if !has(&reach.issue, label) {
             writes.push(Write::Add {
                 reach: Box::new(reach.clone()),
                 label,
+                provenance,
+            });
+        } else if provenance {
+            writes.push(Write::Provenance {
+                reach: Box::new(reach.clone()),
             });
         }
     }
@@ -345,24 +488,35 @@ pub fn plan_writes(
             .map_or(0, |r| r.level)
             .max(source_level.get(key).copied().unwrap_or(0))
     };
-    for h in holders {
+    // Issues first, so a PR can see which of its issues keep a label.
+    let mut kept: BTreeSet<(Key, &'static str)> = BTreeSet::new();
+    let (issues, prs): (Vec<&Holder>, Vec<&Holder>) =
+        holders.iter().partition(|h| !h.item.is_pull_request);
+    for h in issues.into_iter().chain(prs) {
         let Some(row) = operator_levels::by_inherited_label(table, h.label) else {
             continue;
         };
         let keep = if h.item.is_pull_request {
-            linked_issues(&h.item)
-                .into_iter()
-                .any(|n| level_of(&(h.key.0.clone(), n)) >= row.level)
+            linked_issues(&h.item).into_iter().any(|n| {
+                let issue = (h.key.0.clone(), n);
+                level_of(&issue) >= row.level || kept.contains(&(issue, h.label))
+            })
         } else {
+            let marker = marker_for(h.item.body.as_deref().unwrap_or_default(), row.level);
             closure
                 .reached
                 .get(&h.key)
                 .is_some_and(|r| r.level == row.level)
+                || !may_override(marker.as_ref(), managed)
         };
-        if !keep {
+        if keep {
+            kept.insert((h.key.clone(), h.label));
+        } else {
             writes.push(Write::Remove {
                 key: h.key.clone(),
                 label: h.label,
+                level: row.level,
+                provenance: !h.item.is_pull_request,
             });
         }
     }
@@ -487,14 +641,22 @@ impl Reader for ForgeReader<'_> {
             // endpoint with an error (rather than a 404) would otherwise
             // freeze every stale label forever. Native dependencies are the
             // rarest edge; the body links still count.
+            // A failed read (5xx, secondary limit, the breaker) makes the
+            // walk incomplete, so this pass removes nothing. A forge without
+            // the endpoint answers 404, which `cached_get` already maps to
+            // "no dependencies".
             Some(Err(e)) => {
                 log::debug!(
                     "star_liveness: level walk could not read {}'s dependencies: {e}",
                     display(key)
                 );
+                self.failed = true;
                 Vec::new()
             }
-            None => Vec::new(),
+            None => {
+                self.failed = true;
+                Vec::new()
+            }
         }
     }
 
@@ -626,11 +788,12 @@ pub fn run_with(
 
     let closure = closure(&mut reader, table, &sources, landing, MAX_LEVEL_INHERIT_DEPTH);
     let complete = listings_ok && !reader.incomplete();
-    let planned = plan_writes(table, &closure, &sources, &holders, complete);
+    let is_managed = |slug: &str| reader.managed(slug).is_some();
+    let planned = plan_writes(table, &closure, &sources, &holders, complete, &is_managed);
     let mut writes = 0;
     if write {
         for w in &planned {
-            match apply_write(&mut reader, table, w) {
+            match apply_write(&mut reader, w) {
                 Ok(()) => writes += 1,
                 Err(e) => {
                     log::warn!("star_liveness: level label write failed ({e}); retrying next pass")
@@ -665,17 +828,31 @@ pub fn run_with(
     }
 }
 
-fn apply_write(
-    reader: &mut ForgeReader<'_>,
-    table: &[PriorityLevel],
-    w: &Write,
-) -> anyhow::Result<()> {
+fn apply_write(reader: &mut ForgeReader<'_>, w: &Write) -> anyhow::Result<()> {
+    let slug = match w {
+        Write::Add { reach, .. } | Write::Provenance { reach } => &reach.key.0,
+        Write::Remove { key, .. } => &key.0,
+    };
+    let forge = reader
+        .forges
+        .get_mut(slug)
+        .ok_or_else(|| anyhow::anyhow!("no forge for {slug}"))?;
     match w {
-        Write::Add { reach, label } => {
-            let forge = reader
-                .forges
-                .get_mut(&reach.key.0)
-                .ok_or_else(|| anyhow::anyhow!("no forge for {}", reach.key.0))?;
+        Write::Add {
+            reach,
+            label,
+            provenance,
+        } => {
+            // Provenance first: a failed body write skips the label, so the
+            // whole add retries next pass.
+            if *provenance {
+                set_marker(
+                    forge.as_mut(),
+                    &reach.key,
+                    reach.level,
+                    Some(&provenance_marker(reach)),
+                )?;
+            }
             forge.add_label(reach.key.1, label)?;
             log::info!(
                 "star_liveness: {} inherits level {} from {} ({label})",
@@ -683,28 +860,20 @@ fn apply_write(
                 reach.level,
                 display(&reach.source)
             );
-            let Some(row) = operator_levels::row(table, reach.level) else {
-                return Ok(());
-            };
-            let id_marker = format!(
-                "{INTENT_MARKER_PREFIX}{} ",
-                provenance_id(reach.level, &reach.key, &reach.source)
-            );
-            let comments = forge.comments(reach.key.1)?;
-            let me = forge.self_login();
-            let posted = comments
-                .iter()
-                .any(|c| c.body.contains(&id_marker) && super::trust::trusted(c, me.as_deref()));
-            if !posted {
-                forge.post_comment(reach.key.1, &provenance_comment(reach, row, label))?;
-            }
             Ok(())
         }
-        Write::Remove { key, label } => {
-            let forge = reader
-                .forges
-                .get_mut(&key.0)
-                .ok_or_else(|| anyhow::anyhow!("no forge for {}", key.0))?;
+        Write::Provenance { reach } => {
+            set_marker(forge.as_mut(), &reach.key, reach.level, Some(&provenance_marker(reach)))
+        }
+        Write::Remove {
+            key,
+            label,
+            level,
+            provenance,
+        } => {
+            if *provenance {
+                set_marker(forge.as_mut(), key, *level, None)?;
+            }
             forge.remove_label(key.1, label)?;
             log::info!(
                 "star_liveness: {} no longer blocks a level source; removed {label}",
@@ -713,6 +882,27 @@ fn apply_write(
             Ok(())
         }
     }
+}
+
+/// Read-modify-write `key`'s body so its level-`level` marker is `marker`.
+/// The body is re-read just before the write, and nothing is written when
+/// the marker is already right.
+fn set_marker(
+    forge: &mut dyn StarForge,
+    key: &Key,
+    level: u8,
+    marker: Option<&str>,
+) -> anyhow::Result<()> {
+    let current = forge
+        .issue(key.1)?
+        .ok_or_else(|| anyhow::anyhow!("{} is gone", display(key)))?
+        .body
+        .unwrap_or_default();
+    let next = with_marker(&current, level, marker);
+    if next != current {
+        forge.set_body(key.1, &next)?;
+    }
+    Ok(())
 }
 
 /// The liveness row for a blocker reached only by a level: classified from
@@ -780,5 +970,6 @@ fn row_for(
         item,
         level_inherited_from: Some(display(&reach.source)),
         inherited_level: reach.level,
+        inherited_label: operator_levels::row(table, reach.level).and_then(|r| r.inherited_label),
     }
 }

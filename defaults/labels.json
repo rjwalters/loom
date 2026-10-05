@@ -974,7 +974,7 @@
         "# loom:high-priority-inherited (#10307) is DERIVED, never a human's or a",
         "# role's: the daemon's star-liveness pass writes it on every open issue that",
         "# blocks a loom:operator-high-priority issue, directly or transitively (across",
-        "# managed repos), with a provenance comment naming the source, and removes it",
+        "# managed repos), with a body provenance marker naming the source, and removes it",
         "# once no level-2 source reaches the issue. Every reader treats it exactly",
         "# like level 2. It never counts toward the level-2 cap and is never accepted",
         "# from a loom-ui intent. Applied by / removed by: the loom-daemon",

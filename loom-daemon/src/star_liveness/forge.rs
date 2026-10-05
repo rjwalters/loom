@@ -160,6 +160,12 @@ pub trait StarForge {
     /// # Errors
     /// The write failed.
     fn post_comment(&mut self, number: u32, body: &str) -> Result<()>;
+
+    /// Replace an issue's body (the level provenance marker, #10307).
+    ///
+    /// # Errors
+    /// The write failed.
+    fn set_body(&mut self, number: u32, body: &str) -> Result<()>;
 }
 
 /// [`StarForge`] over `gh api`, for the repo checked out at `root` whose
@@ -396,6 +402,14 @@ impl StarForge for GhStarForge {
         let path = format!("{}/comments", self.issue_path(number));
         let field = format!("body={body}");
         self.api(&["-X", "POST", &path, "-f", &field], &path)
+            .map(|_| ())
+    }
+
+    fn set_body(&mut self, number: u32, body: &str) -> Result<()> {
+        let path = self.issue_path(number);
+        // `-f` is a raw field: a body starting with `@` is never read as a file.
+        let field = format!("body={body}");
+        self.api(&["-X", "PATCH", &path, "-f", &field], &path)
             .map(|_| ())
     }
 }

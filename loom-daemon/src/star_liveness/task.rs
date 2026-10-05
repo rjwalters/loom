@@ -280,7 +280,7 @@ impl LivenessState {
                     stage: e.landing.stage,
                     url: escalate::issue_url(web_base, &repo, issue),
                     inherited_from: e.inherited_from,
-                    level_from: e.level_inherited_from.as_deref(),
+                    level_from: e.level_inherited_from.as_deref().zip(e.inherited_label),
                 };
                 match self.ledger.escalate(forge.as_mut(), &target, a) {
                     Ok(Outcome::Posted) => {
@@ -403,6 +403,7 @@ impl LivenessState {
             if let Some((_, e)) = have {
                 e.level_inherited_from = row.level_inherited_from;
                 e.inherited_level = row.inherited_level;
+                e.inherited_label = row.inherited_label;
             } else {
                 let root = repos.iter().find(|r| r.slug == k.0).map(|r| r.root.clone());
                 evaluated.push((root, row));

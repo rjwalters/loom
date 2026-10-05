@@ -38,6 +38,12 @@ pub struct Repo {
     pub blocked_by: BTreeMap<u32, Vec<(String, u32)>>,
     /// Label writes made through the fake: (number, "+label" / "-label").
     pub label_writes: Vec<(u32, String)>,
+    /// Body writes made through the fake: (number, new body).
+    pub body_writes: Vec<(u32, String)>,
+    /// Every body write fails (#10307 provenance-first).
+    pub fail_body_write: bool,
+    /// Every native dependency read fails (#10307: a 5xx or rate limit).
+    pub fail_blocked_by: bool,
 }
 
 /// A forge world: repos by slug.
@@ -131,6 +137,9 @@ impl StarForge for FakeForge {
     }
 
     fn blocked_by(&mut self, number: u32) -> Result<Vec<(String, u32)>> {
+        if self.world.repo(&self.slug).fail_blocked_by {
+            return Err(anyhow!("HTTP 502 from the dependency endpoint"));
+        }
         Ok(self
             .world
             .repo(&self.slug)
@@ -172,6 +181,20 @@ impl StarForge for FakeForge {
         }
         repo.posted.push((number, body.to_string()));
         repo.comments.entry(number).or_default().push(bot(body));
+        Ok(())
+    }
+
+    fn set_body(&mut self, number: u32, body: &str) -> Result<()> {
+        let mut repo = self.world.repo(&self.slug);
+        if repo.fail_body_write {
+            return Err(anyhow!("HTTP 502 editing #{number}"));
+        }
+        repo.body_writes.push((number, body.to_string()));
+        let item = repo
+            .items
+            .get_mut(&number)
+            .ok_or_else(|| anyhow!("no #{number}"))?;
+        item.body = Some(body.to_string());
         Ok(())
     }
 }
