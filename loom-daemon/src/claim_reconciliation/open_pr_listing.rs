@@ -20,6 +20,7 @@ use anyhow::Result;
 use super::review_conflict::Mergeable;
 use super::MAX_ISSUES_PER_WORKSPACE;
 use crate::forge_pull_listing::{list_open_pulls_cached_as, pull_mergeable_cached_as};
+use crate::rate_limit_breaker::report::{BreakerHandle, FailureContext, ProbeMode};
 
 pub use crate::forge_pull_listing::RestPull;
 
@@ -51,12 +52,29 @@ pub(super) fn with_label(rows: Vec<RestPull>, label: &str) -> Vec<RestPull> {
         .collect()
 }
 
-/// PR `number`'s mergeability via a conditional `GET pulls/{number}`. Any
-/// failure is [`Mergeable::Unknown`] — "no information", the same answer as
-/// GitHub still computing it, so the conflict pass changes nothing and
-/// re-reads next tick. (A rate-limit failure still reaches the breaker
-/// through the facade's own accounting.)
-pub(super) fn mergeable_of(gh_bin: &Path, root: &Path, number: u32) -> Mergeable {
+/// PR `number`'s mergeability via a conditional `GET pulls/{number}`.
+/// `breaker` is the rate-limit breaker the read reports to (production:
+/// [`BreakerHandle::global`], fetched once per pass; `None` = unregistered).
+/// Any failure is [`Mergeable::Unknown`] — "no information", the same answer
+/// as GitHub still computing it, so the conflict pass changes nothing and
+/// re-reads next tick. The facade's accounting only records the call in
+/// forge-call stats; it does not feed the breaker, so a rate-limit failure is
+/// reported here (AC5). While the breaker is suppressing, the read is skipped
+/// outright and answers [`Mergeable::Unknown`], so one trip mid-pass stops
+/// the pass's remaining per-PR reads instead of spending N doomed calls.
+pub(super) fn mergeable_of(
+    gh_bin: &Path,
+    root: &Path,
+    number: u32,
+    breaker: Option<&BreakerHandle>,
+) -> Mergeable {
+    if breaker.is_some_and(BreakerHandle::is_suppressed) {
+        log::debug!(
+            "claim_reconciliation: mergeability of PR #{number} in {} skipped: rate-limit breaker suppressing",
+            root.display()
+        );
+        return Mergeable::Unknown;
+    }
     match pull_mergeable_cached_as(
         "claim_reconciliation.pr_mergeable",
         gh_bin,
@@ -70,6 +88,13 @@ pub(super) fn mergeable_of(gh_bin: &Path, root: &Path, number: u32) -> Mergeable
                 "claim_reconciliation: mergeability of PR #{number} in {} unknown: {e}",
                 root.display()
             );
+            if let Some(handle) = breaker {
+                handle.report(
+                    &e.to_string(),
+                    "claim_reconciliation",
+                    FailureContext::for_root(root, gh_bin.to_string_lossy()),
+                );
+            }
             Mergeable::Unknown
         }
     }

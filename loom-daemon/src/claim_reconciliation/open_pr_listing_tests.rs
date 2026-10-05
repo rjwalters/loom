@@ -283,3 +283,105 @@ fn each_pass_sees_the_current_listing() {
     assert_eq!(first.iter().map(|r| r.number).collect::<Vec<_>>(), vec![1]);
     assert_eq!(second.iter().map(|r| r.number).collect::<Vec<_>>(), vec![2]);
 }
+
+/// A breaker of our own (the process-global singleton is never registered)
+/// with a probe that reads nothing, so a trip takes the fallback cooldown.
+fn injected_breaker() -> crate::rate_limit_breaker::report::BreakerHandle {
+    use crate::rate_limit_breaker::report::{
+        BreakerHandle, BudgetProbe, FailureContext, ProbeMode,
+    };
+    use crate::rate_limit_breaker::{
+        BudgetSnapshot, RateLimitBreakerConfig, SharedRateLimitBreaker,
+    };
+    struct NoProbe;
+    impl BudgetProbe for NoProbe {
+        fn probe(
+            &self,
+            _ctx: &FailureContext,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> Option<BudgetSnapshot> {
+            None
+        }
+    }
+    BreakerHandle {
+        breaker: std::sync::Arc::new(SharedRateLimitBreaker::new(RateLimitBreakerConfig {
+            enabled: true,
+            fallback_cooldown_secs: 900,
+        })),
+        probe: std::sync::Arc::new(NoProbe),
+        mode: ProbeMode::Inline,
+    }
+}
+
+/// A stub whose every single-PR `GET pulls/<n>` fails with `stderr` (exit 1),
+/// logging one line per such read to the returned log.
+fn failing_mergeable_stub(dir: &Path, stderr: &str) -> (PathBuf, PathBuf) {
+    let reads = dir.join("reads.log");
+    let script = format!(
+        "#!/usr/bin/env bash\ncase \"$*\" in api*'/pulls/'[0-9]*)\n  \
+         echo \"$*\" >> '{reads}'\n  echo '{stderr}' 1>&2\n  exit 1 ;;\nesac\nexit 0\n",
+        reads = reads.display(),
+    );
+    let gh = dir.join("fake-gh-ratelimited.sh");
+    write_script(&gh, &script);
+    (gh, reads)
+}
+
+fn read_count(reads: &Path) -> usize {
+    std::fs::read_to_string(reads).unwrap_or_default().lines().count()
+}
+
+/// AC5: a rate-limited per-PR mergeability read trips the breaker, and the
+/// rest of the pass's candidate reads short-circuit instead of making N
+/// doomed calls.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn a_rate_limited_mergeable_read_trips_the_breaker_and_stops_the_pass() {
+    use crate::claim_reconciliation::review_conflict::conflict_candidates;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    crate::forge_etag_store::set_test_daemon_store_dir(Some(dir.path().join("etag-store")));
+    let (gh, reads) = failing_mergeable_stub(
+        dir.path(),
+        "gh: API rate limit exceeded for installation ID 151241294 (HTTP 403)",
+    );
+    let handle = injected_breaker();
+    let rows: Vec<RestPull> = crate::forge_pull_listing::parse_rest_pulls(&listing(&[
+        row(1, &["loom:review-requested"]),
+        row(2, &["loom:review-requested"]),
+        row(3, &["loom:review-requested"]),
+    ]))
+    .unwrap();
+
+    let prs = conflict_candidates(&rows, |n| mergeable_of(&gh, &root, n, Some(&handle)));
+    crate::forge_etag_store::set_test_daemon_store_dir(None);
+
+    assert_eq!(prs.len(), 3);
+    assert!(prs.values().all(|p| p.mergeable == Mergeable::Unknown));
+    assert!(handle.is_suppressed(), "the rate-limit failure reached the breaker");
+    assert_eq!(read_count(&reads), 1, "reads after the trip are skipped");
+}
+
+/// An ordinary (non-rate-limit) failure stays a plain `Unknown`: it neither
+/// trips the breaker nor stops later reads.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn an_ordinary_mergeable_failure_does_not_trip_the_breaker() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    crate::forge_etag_store::set_test_daemon_store_dir(Some(dir.path().join("etag-store")));
+    let (gh, reads) = failing_mergeable_stub(dir.path(), "gh: Not Found (HTTP 404)");
+    let handle = injected_breaker();
+
+    let a = mergeable_of(&gh, &root, 1, Some(&handle));
+    let b = mergeable_of(&gh, &root, 2, Some(&handle));
+    crate::forge_etag_store::set_test_daemon_store_dir(None);
+
+    assert_eq!((a, b), (Mergeable::Unknown, Mergeable::Unknown));
+    assert!(!handle.is_suppressed());
+    assert_eq!(read_count(&reads), 2);
+}

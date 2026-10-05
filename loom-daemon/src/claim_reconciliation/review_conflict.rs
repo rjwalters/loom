@@ -52,6 +52,7 @@ use anyhow::{anyhow, Result};
 
 use super::open_pr_listing::{self, RestPull};
 use super::{forge, gh_call, VERDICT_HOLD_LABELS, VERDICT_MARKER_PREFIX};
+use crate::rate_limit_breaker::report::{BreakerHandle, ProbeMode};
 
 /// Kill switch for this pass (`0`/`false`/`no`/`off` disables). Defaults ON.
 pub const REVIEW_CONFLICT_ENABLED_ENV: &str = "LOOM_REVIEW_CONFLICT_RECONCILE";
@@ -371,7 +372,12 @@ pub(super) fn reconcile_review_conflicts_sharing(
             return (stats, None);
         }
     };
-    let prs = conflict_candidates(&raw, |n| open_pr_listing::mergeable_of(gh_bin, root, n));
+    // One handle for the whole candidate loop: a rate-limit failure on one
+    // per-PR read trips it, and the remaining reads short-circuit (AC5).
+    let breaker = BreakerHandle::global(ProbeMode::Inline);
+    let prs = conflict_candidates(&raw, |n| {
+        open_pr_listing::mergeable_of(gh_bin, root, n, breaker.as_ref())
+    });
     stats.checked = prs.len();
     let mut attempted_write = false;
 
