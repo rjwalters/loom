@@ -136,25 +136,49 @@ pub enum Decision {
     Green,
 }
 
+/// The pending name reported while the base branch's required-context set
+/// is unknown (its lookup failed): the wait cannot know what it still lacks.
+pub const REQUIRED_UNKNOWN: &str = "(required-contexts-unknown)";
+
 /// Decide a non-empty rollup.
 ///
 /// `required` is the base branch's required-context set: `Some` once looked
-/// up, `None` when the lookup failed (default mode only — `--required-only`
-/// refuses to run without it). Default mode settles on every OBSERVED check
-/// and additionally waits for a required context that has not registered yet
-/// (the #6169 class: a fast app check finishing before Actions registers).
-/// `--required-only` settles on the required set alone, via
-/// [`checks_failure::classify`].
+/// up, `None` while the lookup has not succeeded. Default mode settles on
+/// every OBSERVED check and additionally waits for a required context that
+/// has not registered yet (the #6169 class: a fast app check finishing
+/// before Actions registers). `--required-only` settles on the required set
+/// alone, via [`checks_failure::classify`].
+///
+/// Two fail-closed rules (#10351 review) keep `Green` from ever meaning "an
+/// incomplete set was vacuously satisfied":
+///
+/// - **Unknown set** (`None`): never `Green` — a required context may not
+///   have registered yet. Default mode still reports an observed failure as
+///   `Red` (that needs no required set); everything else waits on
+///   [`REQUIRED_UNKNOWN`].
+/// - **Empty set under `--required-only`**: falls back to the default-mode
+///   decision over every observed check. (`gh pr checks --required` errors
+///   with "no required checks reported" here; it never passes.)
 #[must_use]
 pub fn decide(r: &Rollup, required: Option<&[String]>, required_only: bool) -> Decision {
-    let missing: Vec<String> = required
-        .unwrap_or_default()
+    let Some(req) = required else {
+        if !required_only && !r.failing.is_empty() {
+            return Decision::Red(r.failing.clone());
+        }
+        let mut waiting = if required_only {
+            Vec::new()
+        } else {
+            r.pending.clone()
+        };
+        waiting.push(REQUIRED_UNKNOWN.to_string());
+        return Decision::Pending(waiting);
+    };
+    let missing: Vec<String> = req
         .iter()
         .filter(|c| !r.seen.contains(*c))
         .cloned()
         .collect();
-    if required_only {
-        let req = required.unwrap_or_default();
+    if required_only && !req.is_empty() {
         let mut waiting: Vec<String> = r
             .pending
             .iter()
@@ -369,8 +393,41 @@ mod tests {
             fold(&runs(vec![run("labeler", "completed", Some("success"))]), &no_status()).unwrap();
         let req = vec!["Backend".to_string()];
         assert_eq!(decide(&r, Some(req.as_slice()), false), Decision::Pending(req.clone()));
-        // A failed lookup does not block GREEN in default mode.
-        assert_eq!(decide(&r, None, false), Decision::Green);
+        // An unknown required set (failed lookup) is never GREEN (#10351).
+        assert_eq!(decide(&r, None, false), Decision::Pending(vec![REQUIRED_UNKNOWN.into()]));
+        assert_eq!(decide(&r, None, true), Decision::Pending(vec![REQUIRED_UNKNOWN.into()]));
+    }
+
+    #[test]
+    fn an_unknown_required_set_still_reports_observed_failures_and_pendings() {
+        let rows = vec![
+            run("lint", "completed", Some("failure")),
+            run("docs", "in_progress", None),
+        ];
+        let r = fold(&runs(rows), &no_status()).unwrap();
+        assert_eq!(decide(&r, None, false), Decision::Red(vec!["lint".into()]));
+        let r = fold(&runs(vec![run("docs", "in_progress", None)]), &no_status()).unwrap();
+        assert_eq!(
+            decide(&r, None, false),
+            Decision::Pending(vec!["docs".into(), REQUIRED_UNKNOWN.into()])
+        );
+        // --required-only cannot tell an informational failure from a
+        // required one without the set: wait, never RED or GREEN.
+        let r = fold(&runs(vec![run("lint", "completed", Some("failure"))]), &no_status()).unwrap();
+        assert_eq!(decide(&r, None, true), Decision::Pending(vec![REQUIRED_UNKNOWN.into()]));
+    }
+
+    /// #10351 finding 1: an EMPTY required set under `--required-only` must
+    /// not make every failing / pending check vacuously GREEN.
+    #[test]
+    fn required_only_with_no_required_contexts_falls_back_to_every_check() {
+        let none: &[String] = &[];
+        let red = fold(&runs(vec![run("ci", "completed", Some("failure"))]), &no_status()).unwrap();
+        assert_eq!(decide(&red, Some(none), true), Decision::Red(vec!["ci".into()]));
+        let wait = fold(&runs(vec![run("ci", "queued", None)]), &no_status()).unwrap();
+        assert_eq!(decide(&wait, Some(none), true), Decision::Pending(vec!["ci".into()]));
+        let ok = fold(&runs(vec![run("ci", "completed", Some("success"))]), &no_status()).unwrap();
+        assert_eq!(decide(&ok, Some(none), true), Decision::Green);
     }
 
     #[test]

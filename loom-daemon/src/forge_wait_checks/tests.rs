@@ -554,3 +554,129 @@ fn a_second_snapshot_process_revalidates_and_records_under_its_caller() {
     let after = counts();
     assert!(after.0 > before.0 && after.1 > before.1, "{before:?} -> {after:?}");
 }
+
+// ---- #10351 review: no GREEN on an incomplete required set ----------------
+
+impl Forge {
+    /// Make the required-context lookup fail: the rulesets source 404s
+    /// (not plan-gated), as a GraphQL-exhausted classic leg would.
+    fn required_fails(&self) {
+        let rules = key("repos/o/r/rules/branches/main");
+        let _ = std::fs::remove_file(self.dir.path().join(format!("{rules}.out")));
+    }
+
+    fn lookups(&self) -> usize {
+        self.calls()
+            .iter()
+            .filter(|c| c.contains("rules/branches/main"))
+            .count()
+    }
+}
+
+/// Finding 1: `--required-only` on a base branch that requires nothing used
+/// to be a vacuous GREEN while a check was failing or pending.
+#[test]
+fn required_only_with_no_required_contexts_is_never_green_while_checks_fail_or_pend() {
+    let f = Forge::new();
+    let ok = || run("labeler", "completed", Some("success"));
+    let mut o = opts(0);
+    o.required_only = true;
+
+    f.runs(SHA, &[ok(), run("ci", "completed", Some("failure"))]);
+    let red = go(&f, Selector::Pr(42), &o, &mut FakeClock::new());
+    assert_eq!(red.sentinel(), format!("LOOM-CHECKS-RED {SHA} ci"));
+
+    f.runs(SHA, &[ok(), run("ci", "queued", None)]);
+    let pending = go(&f, Selector::Pr(42), &o, &mut FakeClock::new());
+    assert_eq!(
+        pending,
+        Outcome::Timeout {
+            sha: SHA.into(),
+            pending: vec!["ci".into()]
+        }
+    );
+
+    f.runs(SHA, &[ok(), run("ci", "completed", Some("success"))]);
+    let (green, notes) = wait(&mut f.reads(), &Selector::Pr(42), &o, &mut FakeClock::new());
+    assert_eq!(green, Outcome::Green { sha: SHA.into() });
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("requires no status-check contexts")),
+        "{notes:?}"
+    );
+}
+
+/// Finding 2 + the not-yet-created case: a failed lookup is retried (not
+/// cached), the poll it failed on does not settle, and once the set is
+/// known a required check that has not been created yet is pending.
+#[test]
+fn a_failed_required_lookup_is_retried_and_an_uncreated_required_check_is_waited_for() {
+    let f = Forge::new();
+    f.required_fails();
+    let ok = || run("labeler", "completed", Some("success"));
+    f.runs(SHA, &[ok()]);
+    let mut clock = FakeClock::new()
+        .at(20, || f.required(&["Backend"]))
+        .at(60, || f.runs(SHA, &[ok(), run("Backend", "completed", Some("success"))]));
+    let (o, notes) = wait(&mut f.reads(), &Selector::Pr(42), &opts(1800), &mut clock);
+    assert_eq!(o, Outcome::Green { sha: SHA.into() });
+    // t=0 lookup fails → wait; t=30 lookup succeeds, `Backend` absent → wait;
+    // t=75 `Backend` green.
+    assert_eq!(f.polls(), 3);
+    assert_eq!(f.lookups(), 2, "retried once, then cached: {:#?}", f.calls());
+    assert!(notes.iter().any(|n| n.contains("lookup for main failed")), "{notes:?}");
+}
+
+/// Finding 2, bounded: a lookup that keeps failing ends in ERROR, never
+/// GREEN; a snapshot taken while it fails is a TIMEOUT naming the unknown set.
+#[test]
+fn a_required_lookup_that_keeps_failing_is_error_never_green() {
+    let f = Forge::new();
+    f.required_fails();
+    f.runs(SHA, &[run("labeler", "completed", Some("success"))]);
+    let (o, notes) = wait(&mut f.reads(), &Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    assert!(
+        matches!(&o, Outcome::Error(w) if w.starts_with("required-lookup-failed: ")),
+        "{o:?}"
+    );
+    assert_eq!(f.polls(), MAX_LOOKUP_FAILURES as usize);
+    assert_eq!(f.lookups(), MAX_LOOKUP_FAILURES as usize);
+    assert!(!notes.is_empty());
+
+    let snap = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert_eq!(
+        snap,
+        Outcome::Timeout {
+            sha: SHA.into(),
+            pending: vec![verdict::REQUIRED_UNKNOWN.into()]
+        }
+    );
+}
+
+/// `--required-only` waits through a failed lookup (no longer an immediate
+/// ERROR) and then for a required check that has not been created yet,
+/// while an informational failure stays informational.
+#[test]
+fn required_only_waits_for_a_required_check_that_has_not_been_created() {
+    let f = Forge::new();
+    f.required_fails();
+    let base = || {
+        vec![
+            run("lint", "completed", Some("failure")),
+            run("labeler", "completed", Some("success")),
+        ]
+    };
+    f.runs(SHA, &base());
+    let mut clock = FakeClock::new()
+        .at(20, || f.required(&["Gate"]))
+        .at(60, || {
+            let mut rows = base();
+            rows.push(run("Gate", "completed", Some("success")));
+            f.runs(SHA, &rows);
+        });
+    let mut o = opts(1800);
+    o.required_only = true;
+    assert_eq!(go(&f, Selector::Pr(42), &o, &mut clock), Outcome::Green { sha: SHA.into() });
+    assert_eq!(f.polls(), 3);
+}

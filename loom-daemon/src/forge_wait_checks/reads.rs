@@ -15,8 +15,9 @@
 //! The one read that is NOT conditional is the base branch's required-context
 //! lookup — [`crate::merge_pr::stale_checks::fetch::required_contexts_with`],
 //! shared verbatim with the merge guards so all of them agree about what a
-//! branch requires. It runs at most once per wait (and only when a verdict
-//! needs it), and is accounted under that implementation's own caller.
+//! branch requires. It runs only when a verdict needs it, is cached once it
+//! succeeds, is retried on later polls while it fails (#10351), and is
+//! accounted under that implementation's own caller.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

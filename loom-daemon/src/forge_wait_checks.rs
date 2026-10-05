@@ -38,6 +38,18 @@
 //! the wait runs to `TIMEOUT` — never `NONE`. That also covers a fork PR whose
 //! workflow awaits approval (#9257).
 //!
+//! # The required-context set
+//!
+//! Looked up from the base branch only when a verdict needs it, cached once
+//! it succeeds, and RETRIED on every later poll while it fails — a failed
+//! lookup is never cached and never read as "nothing required" (#10351):
+//! while the set is unknown no poll settles `GREEN` (a required context may
+//! not have registered yet), and after [`MAX_LOOKUP_FAILURES`] failed
+//! lookups a poll that would otherwise settle ends in
+//! `ERROR required-lookup-failed: …` instead. Under `--required-only` a base
+//! branch that requires nothing falls back to waiting on every observed
+//! check (`gh pr checks --required` errors there; it never passes).
+//!
 //! # Backoff, and why it does not reset
 //!
 //! The first poll is immediate; then 30s, ×1.5 per poll, capped at 120s
@@ -71,6 +83,10 @@ pub const DEFAULT_MIN_INTERVAL: u64 = 30;
 pub const DEFAULT_MAX_INTERVAL: u64 = 120;
 /// Consecutive transient read failures tolerated before `ERROR`.
 const MAX_TRANSIENT_FAILURES: u32 = 3;
+/// Failed required-context lookups tolerated before a poll that would
+/// otherwise settle ends the wait with `ERROR` instead (#10351). Until then
+/// the wait stays pending and retries the lookup on the next poll.
+const MAX_LOOKUP_FAILURES: u32 = 3;
 
 /// What to wait on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,8 +262,12 @@ enum Poll {
 struct State {
     pinned_head: Option<String>,
     base_ref: Option<String>,
-    /// `None` = not looked up yet; `Some(None)` = the lookup failed.
-    required: Option<Option<Vec<String>>>,
+    /// The required-context set, once a lookup has succeeded. A failed
+    /// lookup leaves this `None`, so the next poll that needs it retries.
+    required: Option<Vec<String>>,
+    /// Failed lookups so far, and the latest reason.
+    lookup_failures: u32,
+    lookup_error: String,
     zero_polls: u64,
     notes: Vec<String>,
 }
@@ -263,6 +283,8 @@ pub fn wait<C: Clock>(
         pinned_head: None,
         base_ref: opts.base.clone(),
         required: None,
+        lookup_failures: 0,
+        lookup_error: String::new(),
         zero_polls: 0,
         notes: Vec::new(),
     };
@@ -373,8 +395,22 @@ fn poll(
     } else {
         Some(Vec::new())
     };
-    if opts.required_only && required.is_none() {
-        return Err(ReadError::Fatal("required-lookup-failed".into()));
+    if required.is_none() && st.lookup_failures >= MAX_LOOKUP_FAILURES {
+        // Never GREEN on an incomplete set; after bounded retries, say so.
+        return Ok(Poll::Done(Outcome::Error(format!(
+            "required-lookup-failed: {}",
+            st.lookup_error
+        ))));
+    }
+    if opts.required_only && required.as_ref().is_some_and(Vec::is_empty) {
+        note(
+            st,
+            format!(
+                "wait-checks: --required-only: {} requires no status-check contexts; \
+                 waiting on every check instead",
+                st.base_ref.as_deref().unwrap_or("the base branch")
+            ),
+        );
     }
     Ok(match verdict::decide(&rollup, required.as_deref(), opts.required_only) {
         Decision::Green => Poll::Done(Outcome::Green { sha }),
@@ -394,29 +430,41 @@ fn poll(
     })
 }
 
-/// The required-context set, looked up once per wait. `Ok(None)` = the
-/// lookup failed (recorded as a note; never read as "nothing required").
+/// The required-context set: `Ok(Some)` once a lookup has succeeded (then
+/// cached for the wait), `Ok(None)` while it keeps failing — each failure is
+/// counted and noted, never cached and never read as "nothing required".
 fn resolve_required(reads: &mut GhReads, st: &mut State) -> Result<Option<Vec<String>>, ReadError> {
-    if st.required.is_none() {
-        let base = match &st.base_ref {
-            Some(b) => b.clone(),
-            None => {
-                let b = reads.default_branch()?;
-                st.base_ref = Some(b.clone());
-                b
-            }
-        };
-        st.required = Some(match reads.required(&base) {
-            Ok((contexts, notices)) => {
-                st.notes.extend(notices);
-                Some(contexts)
-            }
-            Err(why) => {
-                st.notes
-                    .push(format!("wait-checks: required-context lookup for {base} failed: {why}"));
-                None
-            }
-        });
+    if st.required.is_some() {
+        return Ok(st.required.clone());
     }
-    Ok(st.required.clone().flatten())
+    let base = match &st.base_ref {
+        Some(b) => b.clone(),
+        None => {
+            let b = reads.default_branch()?;
+            st.base_ref = Some(b.clone());
+            b
+        }
+    };
+    match reads.required(&base) {
+        Ok((contexts, notices)) => {
+            for n in notices {
+                note(st, n);
+            }
+            st.lookup_failures = 0;
+            st.required = Some(contexts);
+        }
+        Err(why) => {
+            st.lookup_failures += 1;
+            note(st, format!("wait-checks: required-context lookup for {base} failed: {why}"));
+            st.lookup_error = why;
+        }
+    }
+    Ok(st.required.clone())
+}
+
+/// Record a stderr note once (a retried lookup repeats the same reason).
+fn note(st: &mut State, line: String) {
+    if !st.notes.contains(&line) {
+        st.notes.push(line);
+    }
 }
