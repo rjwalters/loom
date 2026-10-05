@@ -439,6 +439,7 @@ impl Tracker {
         self.queue_features_view(&subject, now, episode)
             .write_to(&mut features, &mut omitted);
         self.item_features(key, item, ctx.history, now, &mut features, &mut omitted);
+        self.star_features(key, item, now, &mut features);
         (features, omitted)
     }
 }

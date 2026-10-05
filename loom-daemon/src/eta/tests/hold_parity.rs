@@ -51,7 +51,7 @@ impl Spec {
         ItemKey::new(self.repo, self.issue())
     }
 
-    fn issue(&self) -> u32 {
+    pub(crate) fn issue(&self) -> u32 {
         self.pr + 1000
     }
 

@@ -231,6 +231,15 @@ pub struct TrainingRow {
     pub group: String,
     /// The raw inputs at `t`.
     pub inputs: ModelInputs,
+    /// The PR is starred through its own labels **or** a linked issue
+    /// (#10372). Recorded, never a model input: `inputs.starred` stays the
+    /// PR's own flag, so coefficient files are unchanged. `None` = unknown
+    /// (no star inputs, or the raw event cache does not cover the cutoff).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starred_any: Option<bool>,
+    /// Where the star comes from; see [`crate::eta::star::star_state_at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub star_source: Option<crate::eta::star::StarSource>,
     /// Left the stage within the next 30 min. `None` = not fully observable
     /// before the cutoff; the hazard fit skips the row.
     pub exit: Option<bool>,
