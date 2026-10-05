@@ -4,6 +4,8 @@
 //! unchanged apart from dedenting and the new-module additions.
 
 use super::*;
+
+mod record_id;
 use crate::telemetry::{
     HostHealthRecord, MemoryPressureSummary, PhaseDuration, SweepCompletedRecord, SweepDisposition,
     SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord, TokenAccountState,
@@ -214,6 +216,8 @@ fn host_health_envelope() -> TelemetryEnvelope {
             is_captain: None,
             armed_singleton_jobs: Vec::new(),
             captainless_singleton_jobs: Vec::new(),
+            exported_kinds: Vec::new(),
+            exporters: Vec::new(),
             memory: Some(MemoryPressureSummary {
                 mem_total_bytes: Some(34_359_738_368),
                 mem_available_bytes: Some(4_294_967_296),
@@ -628,6 +632,8 @@ fn unmeasured_optional_fields_produce_no_data_point() {
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
+        exported_kinds: Vec::new(),
+        exporters: Vec::new(),
         memory: None,
     };
     let batch = vec![envelope(

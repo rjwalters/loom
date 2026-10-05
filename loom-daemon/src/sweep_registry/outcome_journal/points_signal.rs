@@ -49,23 +49,10 @@ impl SweepRegistry {
             );
             return None;
         }
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut cmd = Command::new(&gh);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}"))
-            .arg("--jq")
-            .arg(".body");
-        cmd.current_dir(&self.config.workspace_root);
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        let output = match output_with_timeout(cmd, reap_gh_timeout()) {
+        // Counted as `outcome.points_signal` (#10089); the facade applies the
+        // workspace's GH_CONFIG_DIR (#5401) and `LOOM_REPO` as GH_REPO (#8263).
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}");
+        let output = match self.gh_read("outcome.points_signal", ["api", &path, "--jq", ".body"]) {
             Ok(Some(o)) if o.status.success() => o,
             Ok(Some(o)) => {
                 let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
@@ -89,9 +76,8 @@ impl SweepRegistry {
             }
             Err(e) => {
                 log::warn!(
-                    "sweep_outcomes: could not invoke {} for issue #{issue}'s points marker: {e} \
-                     — omitting points (#9056)",
-                    gh.display()
+                    "sweep_outcomes: could not invoke gh for issue #{issue}'s points marker: {e} \
+                     — omitting points (#9056)"
                 );
                 return None;
             }

@@ -29,11 +29,14 @@ fn estimate() -> EtaEstimateRecord {
             age_sec: 0,
             age_source: AgeSource::Bus,
             rework_rounds: 0,
+            episode_entered_at: None,
         }),
         features: Default::default(),
         features_omitted: Vec::new(),
         provenance: provenance(),
         dispatch: None,
+        stalls: Vec::new(),
+        held: None,
     };
     // No history: a refusal, which must carry provenance all the same.
     EtaEstimateRecord {
@@ -62,7 +65,8 @@ fn outcome() -> EtaOutcomeRecord {
 
 #[test]
 fn both_eta_kinds_are_registered_otlp_logs_only() {
-    for kind in ["eta.estimate", "eta.outcome"] {
+    // `eta.fleet_refresh` (#10263) shares the routing.
+    for kind in ["eta.estimate", "eta.outcome", "eta.fleet_refresh"] {
         let meta = TELEMETRY_KINDS
             .iter()
             .find(|m| m.kind == kind)
@@ -212,6 +216,30 @@ fn accuracy_queries_group_by_revision_and_exclude_incomplete_provenance() {
             body.contains("attributes_bool['loom.eta.provenance_complete'] = true")
                 && body.contains("attributes_bool['loom.eta.outcome_provenance_complete'] = true"),
             "{section} excludes incomplete provenance"
+        );
+    } // #10233: Q4 and Q6 read outcome rows, so both builds must be pinned; Q5
+      // and Q7 read estimate rows (Q7's outcome rows only end a series), so the
+      // estimating build must be.
+    for (section, outcome_rows) in [
+        ("-- Q4.", true),
+        ("-- Q5.", false),
+        ("-- Q6.", true),
+        ("-- Q7.", false),
+    ] {
+        let start = QUERIES
+            .find(section)
+            .unwrap_or_else(|| panic!("{section} present"));
+        let rest = &QUERIES[start + section.len()..];
+        let body = &rest[..rest.find("\n-- Q").unwrap_or(rest.len())];
+        assert!(body.contains("revision"), "{section} groups by revision");
+        assert!(
+            body.contains("attributes_bool['loom.eta.provenance_complete'] = true"),
+            "{section} excludes an unpinned estimating build"
+        );
+        assert_eq!(
+            body.contains("attributes_bool['loom.eta.outcome_provenance_complete'] = true"),
+            outcome_rows,
+            "{section}: the observing build's flag exactly where outcome rows are scored"
         );
     }
 }

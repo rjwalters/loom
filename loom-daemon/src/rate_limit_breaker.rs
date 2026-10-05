@@ -17,7 +17,10 @@
 //! - On trip, one `gh api rate_limit` probe (that endpoint does **not** count
 //!   against the quota) learns the real reset epoch; the cooldown runs until
 //!   the latest exhausted resource resets (clamped, with a config fallback
-//!   when the probe itself fails).
+//!   when the probe itself fails). Since #8997 the trip lands *before* the
+//!   probe, the probe runs under the failing call's credential context, and
+//!   a reading that contradicts the failure is distrusted — see [`report`]
+//!   and [`evidence`].
 //! - While cooling, the polling loops skip their tick *entirely* — zero gh
 //!   calls, zero role spawns — and release automatically once the window
 //!   resets ([`SharedRateLimitBreaker::observe_tick`]'s lazy release).
@@ -29,11 +32,16 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 
 use crate::forge_call_stats::Pool;
 pub use crate::observability::ops::ratelimit::{Job, TripAttribution};
+
+pub mod evidence;
+pub mod report;
+#[cfg(test)]
+mod report_tests;
 
 // ============================================================================
 // Configuration (env > config > default)
@@ -201,38 +209,20 @@ pub struct BudgetSnapshot {
     pub probed_at: DateTime<Utc>,
 }
 
-/// Compute when a cooldown started at `now` should release.
-///
-/// With a probed budget: the **latest reset among exhausted resources**
-/// (`remaining == 0`), so a graphql-only exhaustion doesn't wait on core and
-/// vice versa. With no exhausted resource (a secondary limit trips without
-/// zeroing a primary bucket) or no budget at all: `now + fallback_secs`.
-/// Always clamped to `[MIN_COOLDOWN_SECS, MAX_COOLDOWN_SECS]` from `now` so a
-/// stale/absurd reset epoch can neither churn nor park the daemon.
+/// Compute when a cooldown started at `now` should release, from a probed
+/// budget alone: the **latest reset among exhausted resources** whose reset is
+/// still in the future, else `now + fallback_secs` (no budget, a secondary
+/// limit, or a stale/untrustworthy reading — see [`evidence::from_probe`]).
+/// Always clamped to `[MIN_COOLDOWN_SECS, MAX_COOLDOWN_SECS]` from `now`.
 #[must_use]
 pub fn cooldown_until(
     budget: Option<&BudgetSnapshot>,
     now: DateTime<Utc>,
     fallback_secs: u64,
 ) -> DateTime<Utc> {
-    let fallback =
-        now + Duration::seconds(i64::try_from(fallback_secs).unwrap_or(MAX_COOLDOWN_SECS));
-    let candidate = match budget {
-        Some(b) => {
-            let mut exhausted_resets = Vec::new();
-            if b.core_remaining == 0 {
-                exhausted_resets.push(b.core_reset);
-            }
-            if b.graphql_remaining == 0 {
-                exhausted_resets.push(b.graphql_reset);
-            }
-            exhausted_resets.into_iter().max().unwrap_or(fallback)
-        }
-        None => fallback,
-    };
-    let min = now + Duration::seconds(MIN_COOLDOWN_SECS);
-    let max = now + Duration::seconds(MAX_COOLDOWN_SECS);
-    candidate.clamp(min, max)
+    evidence::from_probe("", budget, now)
+        .0
+        .cooldown_until(now, fallback_secs)
 }
 
 // ============================================================================
@@ -394,18 +384,44 @@ impl SharedRateLimitBreaker {
         if !self.config.enabled || !indicates_rate_limit(error_text) {
             return None;
         }
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("rate-limit breaker mutex poisoned");
-        if let Some(b) = budget {
-            guard.last_budget = Some(b);
+        // Only THIS trip's reading counts (#8997): a previous trip's cached
+        // budget carries a long-past reset and must never set a new window.
+        let (ev, reading_trusted) = evidence::from_probe(error_text, budget.as_ref(), now);
+        if let Some(b) = budget.filter(|_| reading_trusted) {
+            self.lock().last_budget = Some(b);
         }
-        if guard.cooldown.is_some() {
+        self.trip(source, &ev, now)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BreakerRuntime> {
+        self.inner
+            .lock()
+            .expect("rate-limit breaker mutex poisoned")
+    }
+
+    fn trip_reason(source: &str, until: DateTime<Utc>, trips: u64) -> String {
+        format!(
+            "{source} hit the shared API rate limit — suppressing forge polling until {until} \
+             (trip #{trips})"
+        )
+    }
+
+    /// Closed → Cooldown with the release time `evidence` yields. `None` when
+    /// disabled or already cooling (the running window covers the repeat).
+    pub fn trip(
+        &self,
+        source: &str,
+        evidence: &evidence::ResetEvidence,
+        now: DateTime<Utc>,
+    ) -> Option<Transition> {
+        if !self.config.enabled {
             return None;
         }
-        let until =
-            cooldown_until(guard.last_budget.as_ref(), now, self.config.fallback_cooldown_secs);
+        let mut guard = self.lock();
+        if guard.cooldown.as_ref().is_some_and(|w| now < w.until) {
+            return None;
+        }
+        let until = evidence.cooldown_until(now, self.config.fallback_cooldown_secs);
         guard.cooldown = Some(CooldownWindow {
             until,
             tripped_at: now,
@@ -414,38 +430,9 @@ impl SharedRateLimitBreaker {
         guard.trips_total += 1;
         Some(Transition {
             kind: TransitionKind::Tripped,
-            reason: format!(
-                "{source} hit the shared API rate limit — suppressing forge polling until {until} \
-                 (trip #{})",
-                guard.trips_total
-            ),
+            reason: Self::trip_reason(source, until, guard.trips_total),
             until: Some(until),
         })
-    }
-
-    /// [`Self::observe_failure`], exporting a fresh trip as one
-    /// `loom.ratelimit.trip` span (Issue #10022). `ledger` (this host's
-    /// forge-call counts, `forge_call_stats::consumed_in_window`) is read
-    /// only for a fresh trip; a re-trip while cooling exports nothing.
-    pub fn observe_failure_exported(
-        &self,
-        error_text: &str,
-        source: &str,
-        budget: Option<BudgetSnapshot>,
-        ledger: impl FnOnce() -> Option<BTreeMap<Pool, u64>>,
-        now: DateTime<Utc>,
-    ) -> Option<Transition> {
-        let transition = self.observe_failure(error_text, source, budget, now)?;
-        log::warn!("rate_limit_breaker: {} — {}", transition.kind.as_str(), transition.reason);
-        let attribution = TripAttribution::from_budget(budget.as_ref(), ledger().as_ref());
-        crate::observability::ops::ratelimit::record_trip(
-            source,
-            now,
-            transition.until,
-            &attribution,
-        );
-        log_attribution(budget.is_some(), &attribution);
-        Some(transition)
     }
 
     /// [`Self::is_suppressed`] at a skip site: when suppressed, also counts
@@ -468,6 +455,45 @@ impl SharedRateLimitBreaker {
             .lock()
             .expect("rate-limit breaker mutex poisoned")
             .last_budget
+    }
+
+    /// Re-derive the release time of the window tripped at `tripped_at` from
+    /// later `evidence` (a contextual probe, #8997). A fallback keeps the
+    /// provisional window; a trusted reset replaces it (clamped from
+    /// `tripped_at`). `reading` is cached for status only when trusted.
+    /// Returns the window's release time, or `None` when that window is no
+    /// longer the current one (released or superseded).
+    pub fn refine(
+        &self,
+        tripped_at: DateTime<Utc>,
+        evidence: &evidence::ResetEvidence,
+        reading: Option<BudgetSnapshot>,
+    ) -> Option<DateTime<Utc>> {
+        let mut guard = self.lock();
+        if let Some(b) = reading {
+            guard.last_budget = Some(b);
+        }
+        let fallback = self.config.fallback_cooldown_secs;
+        let window = guard
+            .cooldown
+            .as_mut()
+            .filter(|w| w.tripped_at == tripped_at)?;
+        if evidence.is_trusted() {
+            window.until = evidence.cooldown_until(tripped_at, fallback);
+        }
+        Some(window.until)
+    }
+
+    /// `transition` with its release time (and reason) updated to `until`.
+    #[must_use]
+    pub fn retitle(&self, mut transition: Transition, until: Option<DateTime<Utc>>) -> Transition {
+        if let Some(until) = until {
+            let guard = self.lock();
+            let source = guard.cooldown.as_ref().map_or("?", |w| w.source.as_str());
+            transition.reason = Self::trip_reason(source, until, guard.trips_total);
+            transition.until = Some(until);
+        }
+        transition
     }
 
     /// Lazy release: called by polling loops each tick; returns the
@@ -570,34 +596,14 @@ pub fn global_snapshot() -> Option<RateLimitSnapshot> {
 }
 
 /// One-call hook for gh error arms: classify `error_text`, and on a
-/// rate-limit signature probe the real reset epoch and trip the global
-/// breaker. Logs the trip (`warn`) itself so sync call sites without an event
-/// bus need nothing else; returns the transition so bus-holding callers can
-/// additionally emit [`emit_transition_event`].
-///
-/// The probe runs at most once per trip (re-trips while cooling return before
-/// probing), so this adds zero API load in the steady state — and
-/// `gh api rate_limit` itself does not count against the quota.
+/// rate-limit signature trip the global breaker, then probe the real reset
+/// epoch in the caller ([`report::ProbeMode::Inline`]). Logs the trip (`warn`)
+/// itself so sync call sites without an event bus need nothing else; returns
+/// the transition so bus-holding callers can additionally emit
+/// [`emit_transition_event`]. The pre-#8997 ambient-context form of
+/// [`global_observe_failure_ctx`].
 pub fn global_observe_failure(error_text: &str, source: &str) -> Option<Transition> {
-    let breaker = GLOBAL.get()?;
-    if !breaker.config().enabled || !indicates_rate_limit(error_text) {
-        return None;
-    }
-    let now = Utc::now();
-    // Cheap pre-check so the probe runs only for a genuinely fresh trip.
-    if breaker.is_suppressed(now) {
-        return None;
-    }
-    let budget = forge::probe_budget(now);
-    // Trip attribution (Issue #9855) is logged and — with an ops sink —
-    // exported as a `loom.ratelimit.trip` span (Issue #10022).
-    breaker.observe_failure_exported(
-        error_text,
-        source,
-        budget,
-        || crate::forge_call_stats::consumed_in_window(now),
-        now,
-    )
+    global_observe_failure_ctx(error_text, source, report::FailureContext::default())
 }
 
 /// [`global_is_suppressed`] at a skip site: also counts one skipped pass for
@@ -609,17 +615,56 @@ pub fn global_skip_pass(job: &str) -> bool {
         .is_some_and(|b| b.skip_if_suppressed(job, Utc::now()))
 }
 
-/// Log the trip and its attribution: the probe's pool-wide `used` minus this
-/// host's own ledger says whether this daemon exhausted its own pool or an
-/// external client sharing the credential did.
-fn log_attribution(probed: bool, attribution: &TripAttribution) {
-    if probed {
+/// Export one fresh trip as a `loom.ratelimit.trip` span (Issue #10022) and,
+/// when a probe reading exists, log its attribution (Issue #9855): the
+/// probe's pool-wide `used` minus this host's own ledger says whether this
+/// daemon exhausted its own pool or an external client sharing the
+/// credential did. `ledger` (`forge_call_stats::consumed_in_window`) is read
+/// only when there is a reading. An untrusted reading (#8997 — possibly
+/// another credential's budget) is logged with a marker but kept off the
+/// span, whose attribution attributes are then omitted rather than wrong.
+pub fn export_trip(
+    source: &str,
+    tripped_at: DateTime<Utc>,
+    cooldown_until: Option<DateTime<Utc>>,
+    reading: Option<(&BudgetSnapshot, bool)>,
+    ledger: impl FnOnce() -> Option<BTreeMap<Pool, u64>>,
+) {
+    let attribution = reading.map_or_else(TripAttribution::default, |(budget, trusted)| {
+        let attribution = TripAttribution::from_budget(Some(budget), ledger().as_ref());
         log::warn!(
-            "rate_limit_breaker: attribution: core {} · graphql {} — external is other clients of this credential",
+            "rate_limit_breaker: attribution: core {} · graphql {} — external is other clients of this credential{}",
             attribution.core.log_text(),
             attribution.graphql.log_text(),
+            if trusted { "" } else { " (reading untrusted, see #8997)" },
         );
-    }
+        if trusted {
+            attribution
+        } else {
+            TripAttribution::default()
+        }
+    });
+    crate::observability::ops::ratelimit::record_trip(
+        source,
+        tripped_at,
+        cooldown_until,
+        &attribution,
+    );
+}
+
+/// [`global_observe_failure`] with the failing call's context (#8997), so
+/// the probe reads the credential that was actually refused. The probe runs
+/// at most once per trip (the trip lands first; repeats while cooling return
+/// before probing), so this adds zero API load in the steady state.
+pub fn global_observe_failure_ctx(
+    error_text: &str,
+    source: &str,
+    ctx: report::FailureContext,
+) -> Option<Transition> {
+    let handle = report::BreakerHandle::global(report::ProbeMode::Inline)?;
+    handle
+        .report(error_text, source, ctx)
+        .map(|reported| reported.transition)
 }
 
 /// Emit the state-change `daemon.rate_limit_breaker.state` event for a
@@ -646,6 +691,7 @@ pub fn emit_transition_event(event_bus: &Arc<crate::event_bus::EventBus>, transi
 /// `gh api rate_limit` glue. Not unit-tested directly (mirrors the other
 /// `forge` modules); the parse half is the tested [`parse_budget`].
 pub mod forge {
+    use super::report::FailureContext;
     use super::{parse_budget, parse_graphql_probe, BudgetSnapshot, GRAPHQL_PROBE_QUERY};
     use crate::cmd_out::CmdOutcome;
     use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
@@ -664,13 +710,23 @@ pub mod forge {
     /// *during* exhaustion.
     #[must_use]
     pub fn probe_budget(now: DateTime<Utc>) -> Option<BudgetSnapshot> {
-        let core_body = run_probe("api.rate_limit", &["api", "rate_limit"], false)?;
+        probe_budget_ctx(&FailureContext::default(), now)
+    }
+
+    /// [`probe_budget`] under the failing call's context (#8997): same
+    /// working directory (→ per-owner `GH_CONFIG_DIR`), same `gh` program,
+    /// same explicit credential dir — so an exhausted App installation is
+    /// measured instead of the host's ambient (often healthy user) token.
+    #[must_use]
+    pub fn probe_budget_ctx(ctx: &FailureContext, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
+        let core_body = run_probe(ctx, "api.rate_limit", &["api", "rate_limit"], false)?;
         // `/rate_limit`'s `.resources.graphql` can disagree with the bucket
         // the GraphQL endpoint actually enforces (#10038), so the graphql
         // figure comes from the GraphQL endpoint itself (`-i` for the
         // `X-RateLimit-*` fallback). A refused query still prints headers on
         // stdout, so a non-zero exit is tolerated here.
         let gql_out = run_probe(
+            ctx,
             "api.graphql_rate_limit",
             &["api", "-i", "graphql", "-f", GRAPHQL_PROBE_QUERY],
             true,
@@ -678,15 +734,30 @@ pub mod forge {
         parse_budget(&core_body, parse_graphql_probe(&gql_out, now), now)
     }
 
-    fn run_probe(op: &'static str, args: &[&str], tolerate_failure: bool) -> Option<String> {
-        let outcome = GhInvocation::new(
+    fn run_probe(
+        ctx: &FailureContext,
+        op: &'static str,
+        args: &[&str],
+        tolerate_failure: bool,
+    ) -> Option<String> {
+        let mut inv = GhInvocation::new(
             Operation::new(op),
             AccessIntent::Read,
             GhTarget::None,
             PROBE_TIMEOUT,
         )
         .args(args.iter().copied())
-        .run();
+        .gh_config_dir(ctx.config_dir.as_deref())
+        // #10089: both legs (REST `rate_limit`, GraphQL `rateLimit`) are
+        // budget readings, never `unknown`.
+        .forge_op(crate::forge_call_stats::ops::QUOTA_RATE_LIMIT_READING);
+        if let Some(root) = &ctx.root {
+            inv = inv.current_dir(root);
+        }
+        if let Some(program) = &ctx.program {
+            inv = inv.program(program);
+        }
+        let outcome = inv.run();
         let CmdOutcome::Ran(output) = outcome else {
             return None;
         };
@@ -860,9 +931,10 @@ mod tests {
         assert_eq!(cooldown_until(None, t(0), 900), t(900));
         // Below the floor → clamped up.
         assert_eq!(cooldown_until(None, t(0), 5), t(MIN_COOLDOWN_SECS));
-        // A reset epoch in the past → clamped up to the floor, not instant.
+        // A reset epoch in the past is a stale reading (#8997) → the
+        // configured fallback, never an instant or floor-length release.
         let b = budget(0, -100, 4000, 0);
-        assert_eq!(cooldown_until(Some(&b), t(0), 900), t(MIN_COOLDOWN_SECS));
+        assert_eq!(cooldown_until(Some(&b), t(0), 900), t(900));
         // An absurdly far reset → clamped to the ceiling.
         let b = budget(0, 90_000, 4000, 0);
         assert_eq!(cooldown_until(Some(&b), t(0), 900), t(MAX_COOLDOWN_SECS));

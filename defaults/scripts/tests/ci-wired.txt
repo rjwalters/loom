@@ -76,6 +76,7 @@ test-config-resolver.sh
 test-config-tiers-cli-migration.sh
 test-cpu-budget.sh
 test-create-pr-provenance.sh
+test-create-pr-rate-limit-fallback.sh
 test-create-pr-review-gate.sh
 test-create-pr-superseded-issue.sh
 test-create-pr-version-check.sh
@@ -151,6 +152,7 @@ test-merge-pr-daemon-version-floor.sh
 test-merge-pr-help.sh
 test-merge-pr-merge-method.sh
 test-merge-pr-rate-limit-fallback.sh
+test-merge-pr-tree-checks.sh
 test-nextest-daemon-guard.sh
 test-operator-only-subkind.sh
 test-post-verdict.sh
@@ -188,7 +190,6 @@ test-safehoused-service.sh
 test-script-helper-version-floor.sh
 test-session-mode.sh
 test-spawn-codex-sandbox-noop.sh
-test-spawn-codex-session-exec.sh
 test-stale-claim-standdown-suppression.sh
 test-stop-hook-subcommand-skew.sh
 test-sweep-auto-stack.sh
@@ -198,6 +199,7 @@ test-sweep-lease-fence.sh
 test-sweep-lease-fence-race.sh
 test-sweep-lease-publish.sh
 test-sweep-lease-renew.sh
+test-sweep-lease-renew-lifecycle.sh
 test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
 test-sync-labels-check.sh
@@ -214,6 +216,7 @@ test-warn-out-of-set-deps.sh
 test-write-scope.sh
 test-worktree-forge-pr-check.sh
 test-worktree-hookspath.sh
+test-worktree-refused-claim-no-lease.sh
 test-worktree-root-override.sh
 test-worktree-sentinel.sh
 
@@ -241,6 +244,10 @@ tests/hooks/test-guard-loom-workflow.sh
 # no network/forge calls) — covers .loom/hooks/post-worktree.sh's redirected-
 # CARGO_TARGET_DIR resolution, wired since #6013.
 tests/hooks/test-post-worktree-target-dir.sh
+# Same hermetic pattern (stubbed PATH, fake cargo/pnpm/loom-daemon, no network)
+# — covers .githooks/pre-commit failing closed on a missing/failing formatter,
+# wired since #10123.
+tests/hooks/test-pre-commit-missing-formatter.sh
 
 # defaults/hooks/tests/ — remaining unwired guard-hook suites, wired since #4451.
 defaults/hooks/tests/test-guard-background-subagents.sh

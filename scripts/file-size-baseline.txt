@@ -25,7 +25,7 @@
 1598 loom-daemon/src/agent_session/spawn.rs
 1178 loom-daemon/src/auto_update.rs
 1427 loom-daemon/src/auto_update/tests.rs
-1753 loom-daemon/src/claim_reconciliation.rs
+1565 loom-daemon/src/claim_reconciliation.rs
 2606 loom-daemon/src/claim_reconciliation/tests.rs
 3655 loom-daemon/src/cli/status_render.rs
 1913 loom-daemon/src/credential_preflight.rs

@@ -19,20 +19,27 @@
 //! 3. **Ambient `gh` auth** — when no GitHub App is configured at all (a
 //!    standalone install), the same fallback every daemon `gh` call has.
 //!
-//! Every call is recorded in [`crate::forge_call_stats`] under
-//! `fleet_store`, like the daemon's other conditional reads.
+//! Every call runs through [`crate::gh_invocation::GhInvocation`] (#10089),
+//! which records it in [`crate::forge_call_stats`] under `fleet_store` /
+//! `fleet_store_write`, like the daemon's other conditional reads.
 
 use std::cell::RefCell;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::process::Output;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 
 use super::fetch::{Reply, Transport};
 use crate::credential_preflight::{self as cp, GithubAppMinter, GithubAppOutcome};
+use crate::forge_call_stats::{ops, ForgeOp};
+use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
+use crate::proc_exec::Completion;
+
+/// Deadline for one store request (#10089: they were unbounded).
+const GH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Which credential a request ran under, for messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,87 +127,92 @@ impl GhTransport {
         accept: Option<&str>,
         etag: Option<&str>,
     ) -> Result<(Option<crate::forge_listing::HttpResponse>, String, bool)> {
-        let mut cmd = Command::new(&self.gh_bin);
-        cmd.arg("api").arg("--include").arg("--method").arg("GET");
+        let mut inv = self
+            .invocation("fleet_store", ops::GIT_READ_OBJECTS, AccessIntent::Read, cred)
+            .args(["api", "--include", "--method", "GET"]);
         if let Some(a) = accept {
-            cmd.arg("-H").arg(format!("Accept: {a}"));
+            inv = inv.arg("-H").arg(format!("Accept: {a}"));
         }
         if let Some(e) = etag {
-            cmd.arg("-H").arg(format!("If-None-Match: {e}"));
+            inv = inv.arg("-H").arg(format!("If-None-Match: {e}"));
         }
-        cmd.arg(api_path);
-        if let Credential::ConfigDir { dir, .. } = cred {
-            cmd.env("GH_CONFIG_DIR", dir);
-        }
-        cmd.current_dir(&self.workspace_root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", self.gh_bin))?;
+        let out = self.output(inv.arg(api_path))?;
         let response =
             crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout));
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        crate::forge_call_stats::record_gh_api(
-            "fleet_store",
-            response.as_ref(),
-            out.status.success(),
-            &stderr,
-        );
         *self.last_used.borrow_mut() = Some(cred.clone());
         Ok((response, stderr, out.status.success()))
     }
 
-    /// One write call (`gh api --method POST/PUT … --input -`), always under
-    /// the writer credential — never the reader, which is never granted
+    /// A facade invocation of this transport's `gh` in the workspace, under
+    /// `cred` (`Ambient` = the facade's own lookup, which is the process's
+    /// credential when no App — hence no per-owner config dir — is set up).
+    ///
+    /// Accounted under `forge_op` against the store repository (#9831). The
+    /// target stays [`GhTarget::None`] — the credential is chosen here, not by
+    /// the facade's owner lookup — so the repo is named for accounting only.
+    fn invocation(
+        &self,
+        op: &'static str,
+        forge_op: ForgeOp,
+        intent: AccessIntent,
+        cred: &Credential,
+    ) -> GhInvocation {
+        let dir = match cred {
+            Credential::ConfigDir { dir, .. } => Some(dir.as_path()),
+            Credential::Ambient => None,
+        };
+        GhInvocation::new(Operation::new(op), intent, GhTarget::None, GH_TIMEOUT)
+            .forge_op(forge_op)
+            .identity_scope(None, Some(&self.repo))
+            .program(&self.gh_bin)
+            .current_dir(&self.workspace_root)
+            .gh_config_dir(dir)
+    }
+
+    /// Run `inv` to an exit (any status); a spawn failure or timeout is `Err`.
+    /// A timed-out write may still have been applied — the error says so.
+    fn output(&self, inv: GhInvocation) -> Result<Output> {
+        match inv.execute() {
+            Ok(GhCompletion::Captured(Completion::Exited(out))) => Ok(out),
+            Ok(_) => anyhow::bail!(
+                "{} timed out after {}s (a write may still have been applied)",
+                self.gh_bin,
+                GH_TIMEOUT.as_secs()
+            ),
+            Err(e) => Err(e).with_context(|| format!("failed to invoke {}", self.gh_bin)),
+        }
+    }
+
+    /// One write call (`gh api --method POST/PUT … --input <file>`), always
+    /// under the writer credential — never the reader, which is never granted
     /// write scope on the store (see the module docs). Any HTTP status,
     /// including a 403/404 that means the writer app's installation lacks
     /// `contents: write` / `pull_requests: write`, comes back as `Ok`; only a
     /// request `gh` itself could not complete at all is `Err`.
     pub(crate) fn write_raw(&self, method: &str, api_path: &str, body: &Value) -> Result<Reply> {
         let cred = self.writer();
-        let mut cmd = Command::new(&self.gh_bin);
-        cmd.arg("api")
-            .arg("--include")
-            .arg("--method")
-            .arg(method)
-            .arg(api_path)
-            .arg("--input")
-            .arg("-");
-        if let Credential::ConfigDir { dir, .. } = &cred {
-            cmd.env("GH_CONFIG_DIR", dir);
-        }
-        cmd.current_dir(&self.workspace_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("failed to invoke {}", self.gh_bin))?;
-        {
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("gh api stdin was not piped"))?;
-            let payload =
-                serde_json::to_string(body).context("encoding the gh api request body")?;
-            stdin
-                .write_all(payload.as_bytes())
-                .context("writing the gh api request body")?;
-        }
-        let out = child
-            .wait_with_output()
-            .with_context(|| format!("reading {} output", self.gh_bin))?;
+        // The facade owns the child's stdin, so the body goes through a
+        // private (`0600`) temp file rather than `--input -`.
+        let mut input = tempfile::NamedTempFile::new().context("creating the gh api body file")?;
+        let payload = serde_json::to_string(body).context("encoding the gh api request body")?;
+        input
+            .write_all(payload.as_bytes())
+            .and_then(|()| input.flush())
+            .context("writing the gh api request body")?;
+        let inv = self
+            .invocation(
+                "fleet_store_write",
+                ops::GIT_WRITE_REFS_AND_CONTENTS,
+                AccessIntent::Write,
+                &cred,
+            )
+            .args(["api", "--include", "--method", method, api_path, "--input"])
+            .arg(input.path());
+        let out = self.output(inv)?;
         let response =
             crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout));
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        crate::forge_call_stats::record_gh_api(
-            "fleet_store_write",
-            response.as_ref(),
-            out.status.success(),
-            &stderr,
-        );
         *self.last_used.borrow_mut() = Some(cred.clone());
         let response = response.ok_or_else(|| {
             anyhow::anyhow!(

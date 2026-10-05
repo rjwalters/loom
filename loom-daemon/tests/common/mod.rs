@@ -76,6 +76,7 @@ pub fn daemon_bin() -> PathBuf {
 /// pre-seeding is required.
 #[allow(dead_code)]
 pub fn isolate_daemon_state(cmd: &mut Command, fixture: &Path) {
+    deny_real_gh(cmd);
     cmd.current_dir(fixture)
         .env("LOOM_WORKSPACES_PATH", fixture.join("workspaces.json"))
         .env("LOOM_SWEEPS_JOURNAL_PATH", fixture.join("sweeps.json"))
@@ -84,6 +85,40 @@ pub fn isolate_daemon_state(cmd: &mut Command, fixture: &Path) {
         // #9588: a then-exit drain moves the autonomy-desired marker aside —
         // never let a test daemon reach an inherited/real marker path.
         .env("LOOM_AUTONOMY_MARKER", fixture.join("autonomy-desired"));
+}
+
+/// Process-wide loud-failing `gh` stub (#10088): prints its args to stderr,
+/// appends them to `$LOOM_GH_STUB_LOG` when set, exits 127. Written once per
+/// test binary into a leaked temp dir.
+#[allow(dead_code)]
+pub fn gh_stub_path() -> &'static Path {
+    static STUB: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    STUB.get_or_init(|| {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("stub tempdir").keep();
+        let p = dir.join("gh");
+        std::fs::write(
+            &p,
+            "#!/bin/sh\necho \"loom-daemon test reached the real gh: $*\" >&2\n\
+             [ -n \"$LOOM_GH_STUB_LOG\" ] && echo \"$*\" >> \"$LOOM_GH_STUB_LOG\"\nexit 127\n",
+        )
+        .expect("write stub");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        p
+    })
+}
+
+/// Point a spawned daemon's `LOOM_GH_BIN` at [`gh_stub_path`] so it can never
+/// reach the real `gh` (#10088). A later `.env("LOOM_GH_BIN", ..)` on the same
+/// command overrides it, as does a caller-set value in the parent environment.
+/// Always declines the forge-egress policy-launcher rung (#9995), which would
+/// otherwise outrank `LOOM_GH_BIN` on a host carrying an egress policy.
+#[allow(dead_code)]
+pub fn deny_real_gh(cmd: &mut Command) {
+    cmd.env("LOOM_GH_NO_POLICY_LAUNCHER", "1");
+    if std::env::var_os("LOOM_GH_BIN").is_none() {
+        cmd.env("LOOM_GH_BIN", gh_stub_path());
+    }
 }
 
 /// Test daemon instance that cleans up on drop
@@ -111,6 +146,7 @@ impl TestDaemon {
         let worktree_root = temp_dir.path().join("worktrees");
 
         let mut cmd = Command::new(daemon_bin());
+        deny_real_gh(&mut cmd);
         cmd.env("LOOM_SOCKET_PATH", &socket_path)
             .env("RUST_LOG", "debug")
             // Disable restore_from_tmux() to prevent cross-test-binary contamination

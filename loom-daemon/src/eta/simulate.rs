@@ -15,17 +15,42 @@
 //! `ready_wait` draws are never age-conditioned: the item's age in the queue
 //! says nothing about the turnover in progress.
 //!
+//! A path from `merge_hold` (#10218) draws the rest of the hold (conditioned
+//! on its age, like any first stage) and then one `merge_wait`; its terminal
+//! is `merge_wait`. No path from any other stage visits `merge_hold`, so
+//! every other draw stream is unchanged.
+//!
 //! The quantiles of the path totals are nearest-rank over the sorted
-//! totals, rounded to whole seconds.
+//! totals, rounded to whole seconds. p90 (#10211) is read off the same
+//! sorted totals by the same rule, so it costs no draws and leaves p25, p50
+//! and p75 exactly as they were.
 //!
 //! [`run_explanation`] rebuilds the whole simulation from an explanation's
 //! fields alone, which is what makes an estimate recomputable offline.
+//!
+//! # Stalls and the residual-life tail (#10210)
+//!
+//! An applied stall (`explanation.stalled.applied`) adds its deterministic
+//! `term_sec` to every path before the first stage resumes, so every stage
+//! mark — the current stage's included, which then marks when service
+//! resumes — and every quantile moves by exactly the term. It consumes no
+//! uniform: the draw stream is byte-identical with or without it.
+//!
+//! A first stage conditioned by the residual-life tail
+//! ([`super::explanation::CONDITIONING_RESIDUAL_LIFE`]) draws its remaining
+//! time as `age · u / (1 − u)` with `u` capped at
+//! [`super::explanation::RESIDUAL_LIFE_U_CAP`] — one uniform, as before.
 
-use super::explanation::{Contributions, Explanation, StageMark};
+use super::explanation::{
+    Contributions, Explanation, StageMark, CONDITIONING_RESIDUAL_LIFE, RESIDUAL_LIFE_U_CAP,
+};
 use super::grid;
 use super::{round3, Stage, STAGE_COUNT};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
+
+/// `contributions.p50_share` key for an applied stall's term (#10210).
+pub const STALLED_SHARE_KEY: &str = "stalled";
 
 /// SplitMix64: small, fast, and fully specified, so anyone can reproduce a
 /// draw sequence from the seed (`rand` is not a dependency of this crate).
@@ -73,6 +98,11 @@ pub struct PathSpec {
     pub stop_at_dispatch: bool,
     /// `(f_age, age_sec)` for the first stage.
     pub conditioning: Option<(f64, i64)>,
+    /// The first stage outlived its history: its remaining time is drawn
+    /// from the residual-life tail of `conditioning`'s age, not the grid.
+    pub residual_life: bool,
+    /// An applied stall's term, added to every path before it resumes.
+    pub stall_offset_sec: i64,
     /// `P(reject | attempt k)` for `k = 1..=cap`.
     pub p_by_attempt: Vec<f64>,
     /// Most rework rounds per path.
@@ -86,8 +116,8 @@ pub struct PathSpec {
 /// The outcome of a simulation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Simulation {
-    /// Remaining seconds, `(p25, p50, p75)`.
-    pub quantiles: (i64, i64, i64),
+    /// Remaining seconds, `(p25, p50, p75, p90)`.
+    pub quantiles: (i64, i64, i64, i64),
     /// Per-stage cumulative entry-time seconds, `(p25, p50, p75)`, over the
     /// paths that visit the stage (#9366); `None` for a stage no path
     /// visits. The terminal stage's samples are the path completion times,
@@ -106,13 +136,16 @@ pub struct Simulation {
 impl Simulation {
     /// The explanation's `stage_marks`: one mark per [`Stage::ALL`] stage,
     /// in stage order, projected at wall-clock `as_of` (#9366) — preceded by
-    /// a `ready_wait` mark only when the path starts there (#9326).
+    /// a `ready_wait` mark only when the path starts there (#9326), and
+    /// followed by a `merge_hold` mark only when the path starts there
+    /// (#10218), so no other explanation gains an empty mark.
     #[must_use]
     pub fn stage_marks(&self, as_of: DateTime<Utc>) -> Vec<StageMark> {
         Stage::EVERY
             .iter()
             .filter(|&&stage| {
-                stage != Stage::ReadyWait || self.entry_marks[stage.index()].is_some()
+                !matches!(stage, Stage::ReadyWait | Stage::MergeHold)
+                    || self.entry_marks[stage.index()].is_some()
             })
             .map(|&stage| {
                 let times = self.entry_marks[stage.index()].map(|(p25, p50, p75)| {
@@ -215,6 +248,11 @@ pub fn reachable_path(
             push(Stage::MergeWait);
             return stages;
         }
+        Stage::MergeHold => {
+            push(Stage::MergeHold);
+            push(Stage::MergeWait);
+            return stages;
+        }
     }
     if may_reject {
         push(Stage::Doctor);
@@ -252,7 +290,7 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
         let mut stage = spec.start;
         let mut rework = spec.start_rework;
         let mut first = true;
-        let mut total = 0.0;
+        let mut total = spec.stall_offset_sec.max(0) as f64;
         let mut times = [0.0_f64; STAGE_COUNT];
         let mut seen = [false; STAGE_COUNT];
         if stage == Stage::ReadyWait {
@@ -262,7 +300,7 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
             let grid = spec.grids[i]
                 .as_deref()
                 .unwrap_or_else(|| unreachable!("checked above"));
-            entries[i].push((0.0, path));
+            entries[i].push((total, path));
             let mut wait = spec.ready_offset_sec.max(0) as f64;
             for _ in 0..spec.ready_visits {
                 wait += grid::inv_cdf(grid, rng.next_f64());
@@ -283,6 +321,10 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
                 .unwrap_or_else(|| unreachable!("checked above"));
             let u = rng.next_f64();
             let duration = match (first, spec.conditioning) {
+                (true, Some((_, age))) if spec.residual_life => {
+                    let u = u.min(RESIDUAL_LIFE_U_CAP);
+                    age.max(0) as f64 * u / (1.0 - u)
+                }
                 (true, Some((f_age, age))) => {
                     (grid::inv_cdf(grid, f_age + u * (1.0 - f_age)) - age as f64).max(0.0)
                 }
@@ -319,6 +361,7 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
                 }
                 Stage::MergeWait => break,
                 Stage::ReadyWait => Stage::SweepCurator,
+                Stage::MergeHold => Stage::MergeWait,
             };
         }
         for (i, s) in seen.iter().enumerate() {
@@ -332,7 +375,8 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     }
 
     totals.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    let quantiles = nearest_rank3(&totals);
+    let (p25, p50, p75) = nearest_rank3(&totals);
+    let quantiles = (p25, p50, p75, nearest_rank(&totals, 90));
 
     // The stage every path ends on: the approving verdict when the path
     // stops there, else `merge_wait`. Its mark is the path completion time —
@@ -340,7 +384,7 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     // so the terminal mark's p50 is the estimate itself, to the second.
     let terminal = if stop {
         Stage::ReadyWait
-    } else if spec.include_merge {
+    } else if spec.include_merge || spec.start == Stage::MergeHold {
         Stage::MergeWait
     } else {
         Stage::ReviewWait
@@ -368,7 +412,18 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     }
     let expected_rework_rounds = round3(reworks.iter().map(|&r| f64::from(r)).sum::<f64>() / draws);
 
-    let contributions = contributions(&totals, &per_stage, &reworks);
+    let mut contributions = contributions(&totals, &per_stage, &reworks);
+    if spec.stall_offset_sec > 0 {
+        // The stall is every path's first, fixed component: its share of
+        // the p40–p60 band, beside the stages' own.
+        let (_, mid_total) = band_means(&totals, &per_stage, 0.4, 0.6);
+        if mid_total > 0.0 {
+            contributions.p50_share.insert(
+                STALLED_SHARE_KEY.to_string(),
+                round3(spec.stall_offset_sec as f64 / mid_total),
+            );
+        }
+    }
     Ok(Simulation {
         quantiles,
         entry_marks,
@@ -379,16 +434,19 @@ pub fn run(spec: &PathSpec) -> Result<Simulation, SpecError> {
     })
 }
 
-/// Nearest-rank `(p25, p50, p75)` over sorted `(value, path)` samples,
-/// rounded to whole seconds — the one quantile discipline for the path
-/// totals and the stage-entry marks alike.
+/// Nearest-rank `(p25, p50, p75)` over sorted `(value, path)` samples, by
+/// [`nearest_rank`].
 fn nearest_rank3(samples: &[(f64, usize)]) -> (i64, i64, i64) {
+    (nearest_rank(samples, 25), nearest_rank(samples, 50), nearest_rank(samples, 75))
+}
+
+/// The nearest-rank `pct`th percentile of sorted `(value, path)` samples,
+/// rounded to whole seconds — the one quantile discipline for the path
+/// totals (p25 to p90) and the stage-entry marks alike.
+fn nearest_rank(samples: &[(f64, usize)], pct: usize) -> i64 {
     let k = samples.len();
-    let q = |pct: usize| -> i64 {
-        let rank = (pct * k).div_ceil(100).clamp(1, k);
-        samples[rank - 1].0.round() as i64
-    };
-    (q(25), q(50), q(75))
+    let rank = (pct * k).div_ceil(100).clamp(1, k);
+    samples[rank - 1].0.round() as i64
 }
 
 /// Mean per-stage time over the paths ranked in `[lo, hi)` (fractions of K).
@@ -488,11 +546,17 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
         }
         grids[entry.stage.index()] = Some(entry.distribution.grid_sec.clone());
     }
-    let conditioning = explanation
+    let first = explanation
         .stages
         .first()
-        .and_then(|e| e.conditioning.as_ref())
-        .map(|c| (c.f_age, c.age_sec));
+        .and_then(|e| e.conditioning.as_ref());
+    let conditioning = first.map(|c| (c.f_age, c.age_sec));
+    let residual_life = first.is_some_and(|c| c.method == CONDITIONING_RESIDUAL_LIFE);
+    let stall_offset_sec = explanation
+        .stalled
+        .as_ref()
+        .filter(|s| s.applied)
+        .map_or(0, |s| s.term_sec.max(0));
     let (p_by_attempt, cap) = match &explanation.branches {
         Some(b) => (b.changes_requested.p_by_attempt.clone(), b.changes_requested.cap),
         None => (Vec::new(), 0),
@@ -511,6 +575,8 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
         ready_offset_sec,
         stop_at_dispatch: path.terminal == Stage::ReadyWait,
         conditioning,
+        residual_life,
+        stall_offset_sec,
         p_by_attempt,
         cap,
         draws: combination.draws,
@@ -518,11 +584,28 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
     })
 }
 
-/// Recompute an explanation's quantiles from its own fields.
+/// Recompute an explanation's `(p25, p50, p75, p90)` from its own fields;
+/// compare with [`Explanation::quantiles_with_p90`].
 #[must_use]
-pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64)> {
+///
+/// A recalibrated explanation (#10207) recomputes through its recorded
+/// [`super::recalibrate::Recalibration`]: the simulation reproduces the base
+/// quantiles, and the recorded ratio distribution moves them exactly as the
+/// heuristic did.
+///
+/// A twin-otter explanation (#10243) has no stage grids: it recomputes
+/// through its own `twin_otter` record (the adapted input, the config and
+/// the model slice) with the seed in `combination`.
+pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)> {
+    if let Some(record) = &explanation.twin_otter {
+        return super::heuristics::recompute_twin_otter(explanation, record);
+    }
     let spec = spec_from_explanation(explanation)?;
-    run(&spec).ok().map(|s| s.quantiles)
+    let simulated = run(&spec).ok().map(|s| s.quantiles)?;
+    Some(match &explanation.recalibration {
+        Some(r) => super::recalibrate::apply(simulated.1, &r.ratios, r.mode),
+        None => simulated,
+    })
 }
 
 /// Recompute an explanation's stage marks (#9366) from the same fields

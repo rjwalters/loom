@@ -40,8 +40,8 @@ use super::ledger::{Ledger, PendingUnit, UnitDraft, UnitKey, COMPACT_THRESHOLD_B
 use super::logs::{self, LogTarget};
 use super::owners::{discover, resolve_kind, KindCache, Owner, OwnerStatus};
 use super::records::{
-    envelope_identity, job_envelopes, run_envelopes, JobCreationBaselines, JobJson, JobsPage,
-    RepoJson, RunJson, RunsPage,
+    envelope_identity, job_envelopes_with_reason, run_envelopes, JobCreationBaselines, JobJson,
+    JobsPage, RepoJson, RunJson, RunsPage,
 };
 use super::state::{self, CycleLock, CycleSummary, PollStatus};
 use super::story::{self, RepoIdentityFn, RepoStories, Stitch};
@@ -883,10 +883,31 @@ fn record_run(
     // `job.run_attempt`, the same per-job attempt `UnitKey::job` uses —
     // not `run.run_attempt`, which is only the newest.
     let baselines = JobCreationBaselines::of_listing(&jobs);
+    // #10113: a job GitHub refused to start for billing/spending-limit reasons
+    // is its own condition, not a red build — classify it, alert once.
+    let mut not_started = std::collections::HashMap::new();
+    for job in &jobs {
+        if ledger.is_seen(&UnitKey::job(full, run.id, job.id, job.run_attempt)) {
+            continue;
+        }
+        if let Some(reason) =
+            super::billing::classify_job(api, full, job, &mut report.summary.requests)?
+        {
+            super::billing::observe_global(ctx.root, full, run.id, job.id);
+            not_started.insert(job.id, reason);
+        }
+    }
     let mut drafts: Vec<UnitDraft> = jobs
         .iter()
         .map(|job| {
-            let mut envelopes = job_envelopes(repo, run, job, baselines.for_job(job), &ctx.host_id);
+            let mut envelopes = job_envelopes_with_reason(
+                repo,
+                run,
+                job,
+                baselines.for_job(job),
+                &ctx.host_id,
+                not_started.get(&job.id).copied(),
+            );
             if let Some(story) = story {
                 story::stitch_job(&mut envelopes, story, run, job);
             }

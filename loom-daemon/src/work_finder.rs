@@ -2652,7 +2652,7 @@ where
             match tick_with_lanes(
                 &mut source,
                 &mut dispatcher,
-                (CapTerms::new(configured_max, disk, ram), max_admissions_per_tick),
+                (CapTerms::observed(configured_max, disk, ram), max_admissions_per_tick),
                 halted,
                 saturation_held,
                 lane,
@@ -3284,7 +3284,7 @@ pub fn spawn_multi_work_finder_task(
             let report = tick_multi_with_build_backoff(
                 &mut pairs,
                 &priorities,
-                CapTerms::new(configured_max, disk, ram),
+                CapTerms::observed(configured_max, disk, ram),
                 &halted,
                 Some(&halt_causes),
                 max_admissions_per_tick,

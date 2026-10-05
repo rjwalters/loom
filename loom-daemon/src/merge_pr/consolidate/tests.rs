@@ -34,14 +34,14 @@ fn comp(number: u32, head: &str, files: &[&str]) -> ComponentState {
     }
 }
 
-const H1: &str = "a111111111111111111111111111111111111111";
-const H2: &str = "b222222222222222222222222222222222222222";
-
-/// The component with the `loom:sequenced` hold label on it.
+/// The component carries the live `loom:sequenced` gate label.
 fn sequenced(mut c: ComponentState) -> ComponentState {
     c.labels.push(SEQUENCE_LABEL.to_string());
     c
 }
+
+const H1: &str = "a111111111111111111111111111111111111111";
+const H2: &str = "b222222222222222222222222222222222222222";
 
 fn clean_markers() -> std::collections::BTreeMap<u32, SequenceMarker> {
     std::collections::BTreeMap::new()
@@ -281,6 +281,51 @@ fn an_out_of_group_ordering_predecessor_rejects_but_an_in_group_one_does_not() {
     .is_empty());
 }
 
+#[test]
+fn a_released_reservation_does_not_block_a_later_consolidation() {
+    // #9745 review: a source that went through a completed (landed or
+    // aborted) attempt keeps the old reservation marker in its history
+    // forever. Neither the history nor a stale marker may make it
+    // "AlreadyReserved" / "SequencedOutsideGroup" once the gate is gone.
+    let group = [comp(1, H1, &["shared.rs"]), comp(2, H2, &["shared.rs"])];
+    let old = SequenceMarker {
+        after: 99,
+        pred_head: H1.to_string(),
+        follower_head: H1.to_string(),
+        plan: "cons-deadbeef".into(),
+        source: Some("pass".into()),
+    };
+    let bounds = Bounds {
+        max_components: 4,
+        max_diff_lines: 800,
+    };
+    // (a) The history ends in the landing release (the ordering pass's
+    // `CLEAR` release — the one releaser on landing, ADR-0023 §4):
+    // parse_live drops it, so the caller never even hands check_eligibility a
+    // marker.
+    let history = vec![
+        reservation_comment_body(&old, "cons-deadbeef"),
+        crate::claim_reconciliation::merge_sequence::release_comment_body(
+            &old,
+            crate::claim_reconciliation::merge_sequence::HoldAction::Release,
+        ),
+    ];
+    assert_eq!(crate::merge_pr::sequence::parse_live(&history), None);
+    let abort_history = vec![
+        reservation_comment_body(&old, "cons-deadbeef"),
+        reservation_release_body(&old, "cons-deadbeef"),
+    ];
+    assert_eq!(crate::merge_pr::sequence::parse_live(&abort_history), None);
+    // (b) Belt and braces: even a live-looking marker is inert without the
+    // gate label (released or removed by hand).
+    let mut markers = clean_markers();
+    markers.insert(1, old);
+    assert!(
+        check_eligibility(&group, &markers, "main", "reason", &bounds).is_empty(),
+        "an unlabeled PR is not reserved"
+    );
+}
+
 // --- Mapping markers ----------------------------------------------------
 
 #[test]
@@ -417,6 +462,111 @@ fn a_construction_conflict_aborts_naming_the_component() {
     assert_eq!(err.number, 12, "the SECOND pin is the one that fails to merge");
     assert!(!worktree.exists(), "the scratch worktree is cleaned up on abort");
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// --- Landing reconciliation (#9689) -------------------------------------
+
+#[test]
+fn status_presence_is_keyed_to_candidate_and_component() {
+    let recorded = status_comment_body(12, 99, "deadbeef", "cons-a");
+    let bodies = [recorded];
+    assert!(status_present(&bodies, 99, 12));
+    assert!(!status_present(&bodies, 99, 13), "a different component is not recorded");
+    assert!(!status_present(&bodies, 100, 12), "a different candidate is not recorded");
+    assert!(!status_present(&[], 99, 12));
+}
+
+#[test]
+fn the_status_names_the_fate_precisely() {
+    let body = status_comment_body(12, 99, "deadbeef", "cons-a");
+    assert!(body.contains("merged-into #99"), "{body}");
+    assert!(body.contains("deadbeef"), "{body}");
+    assert!(
+        body.contains("never as an independent merge"),
+        "GitHub's 'closed' must not be reported as a merge: {body}"
+    );
+}
+
+#[test]
+fn closure_and_issue_comments_carry_the_exact_merge_sha() {
+    let close = component_close_body(99, "deadbeef");
+    assert!(close.contains("merged-into #99") && close.contains("deadbeef"), "{close}");
+    let issue = issue_close_body(12, 99, "deadbeef");
+    assert!(
+        issue.contains("#12") && issue.contains("#99") && issue.contains("deadbeef"),
+        "{issue}"
+    );
+    assert!(
+        issue.contains("reopen with the gap named"),
+        "closure must stay challengeable: {issue}"
+    );
+}
+
+#[test]
+fn inclusion_verification_uses_real_ancestry() {
+    let tmp = std::env::temp_dir().join(format!("incl-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&tmp)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(tmp.join("base.txt"), "base\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "base"]);
+    let base = git(&["rev-parse", "HEAD"]);
+    git(&["checkout", "-qb", "a"]);
+    std::fs::write(tmp.join("a.txt"), "a\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "a"]);
+    let a = git(&["rev-parse", "HEAD"]);
+    git(&["checkout", "-qb", "b", &base]);
+    std::fs::write(tmp.join("b.txt"), "b\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "b"]);
+    let b = git(&["rev-parse", "HEAD"]);
+
+    let worktree = tmp.join("scratch");
+    let candidate_head = construct("git", &tmp, &worktree, &base, &[(10, &a), (12, &b)]).unwrap();
+    assert!(
+        inclusion_verified("git", &tmp, &a, &candidate_head),
+        "a merged pin is an ancestor"
+    );
+    assert!(inclusion_verified("git", &tmp, &b, &candidate_head));
+    // The negative case: an UNMERGED head (created after construction) is
+    // not an ancestor — the guard that keeps an unincluded component open
+    // (ADR-0023 §6.2).
+    git(&["checkout", "-qb", "unmerged", &base]);
+    std::fs::write(tmp.join("late.txt"), "late\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "late"]);
+    let late = git(&["rev-parse", "HEAD"]);
+    assert!(!inclusion_verified("git", &tmp, &late, &candidate_head));
+    remove_worktree("git", &tmp, &worktree);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn an_untouched_open_status_names_the_landed_pin_and_keeps_its_own_ledger_marker() {
+    let body = untouched_open_body(12, 99, "c0ffee", H2, "cons-a");
+    assert!(body.contains(H2), "names the pinned head that landed: {body}");
+    assert!(body.contains("c0ffee"), "{body}");
+    assert!(body.contains("`untouched-open`"), "{body}");
+    assert!(!body.contains("merged-into #"), "never recorded as merged-into: {body}");
+    // Distinct from the merged-into ledger entry, in both directions.
+    assert!(!status_present(std::slice::from_ref(&body), 99, 12));
+    assert!(body.contains(&untouched_status_marker(99, 12)));
+    assert!(
+        !status_comment_body(12, 99, "c0ffee", "cons-a").contains(&untouched_status_marker(99, 12))
+    );
 }
 
 // --- Reservations -------------------------------------------------------

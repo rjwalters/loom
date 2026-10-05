@@ -11,6 +11,7 @@
 //! `ttl` instead of acting on a stale ring.
 
 use super::*;
+use crate::claim_reconciliation::gh_call;
 
 /// Resolve this host's `serves` digest set: the [`crate::role_shard::hash_key`]
 /// digest of every registered workspace's resolved shard key, for every
@@ -68,28 +69,20 @@ fn read_roster_comments(
     repo: &str,
     issue: u32,
 ) -> Option<Vec<crate::role_shard::roster::RosterComment>> {
-    let mut cmd = Command::new(gh);
-    cmd.arg("api")
-        .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))
-        .arg("--paginate")
-        .arg("--jq")
-        .arg(format!(
-            r#".[] | select(.body | startswith("{prefix}")) | {{id: .id, created_at: .created_at, updated_at: .updated_at, body: .body, {author}}}"#,
-            prefix = crate::role_shard::roster::ROSTER_MARKER_PREFIX,
-            author = crate::comment_trust::records::AUTHOR_JQ,
-        ));
-    cmd.current_dir(cwd);
-    // #5401: cross-owner managed repo -> its own owner's installation-token
-    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, cwd);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let output = cmd.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let jq = format!(
+        r#".[] | select(.body | startswith("{prefix}")) | {{id: .id, created_at: .created_at, updated_at: .updated_at, body: .body, {author}}}"#,
+        prefix = crate::role_shard::roster::ROSTER_MARKER_PREFIX,
+        author = crate::comment_trust::records::AUTHOR_JQ,
+    );
+    // Counted as `roster.comments` (#10089); the facade applies the cross-owner
+    // GH_CONFIG_DIR for `cwd` (#5401). `per_page=100`: the roster issue
+    // accumulates one comment per host, read every heartbeat.
+    let path = format!("repos/{owner}/{repo}/issues/{issue}/comments?per_page=100");
+    let args = ["api", path.as_str(), "--paginate", "--jq", jq.as_str()];
+    let stdout = gh_call::ok_stdout(gh_call::read("roster.comments", gh, cwd).args(args))?;
     // #9548: a roster record from an untrusted author is prose; it must not
     // join the ring and shard this fleet's work away from its own hosts.
-    let trusted = crate::comment_trust::TrustPolicy::for_root(cwd).trusted_ndjson(&output.stdout);
+    let trusted = crate::comment_trust::TrustPolicy::for_root(cwd).trusted_ndjson(&stdout);
     Some(crate::role_shard::roster::parse_roster_comments_json(&trusted))
 }
 
@@ -128,15 +121,9 @@ fn create_roster_comment(
 /// failure; the caller then keeps the old record and retries next cycle
 /// rather than leaving two records for one host.
 fn delete_roster_comment(gh: &Path, cwd: &Path, owner: &str, repo: &str, comment_id: u64) -> bool {
-    let mut cmd = Command::new(gh);
-    cmd.arg("api")
-        .arg(format!("repos/{owner}/{repo}/issues/comments/{comment_id}"))
-        .arg("--method")
-        .arg("DELETE");
-    cmd.current_dir(cwd);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, cwd);
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    match cmd.output() {
+    let path = format!("repos/{owner}/{repo}/issues/comments/{comment_id}");
+    let inv = gh_call::write("roster.delete", gh, cwd).args(["api", &path, "--method", "DELETE"]);
+    match gh_call::output(inv) {
         Ok(out) if out.status.success() => true,
         Ok(out) => {
             log::warn!(
@@ -167,17 +154,11 @@ fn patch_roster_comment(
     comment_id: u64,
     body: &str,
 ) -> bool {
-    let mut cmd = Command::new(gh);
-    cmd.arg("api")
-        .arg(format!("repos/{owner}/{repo}/issues/comments/{comment_id}"))
-        .arg("--method")
-        .arg("PATCH")
-        .arg("-f")
-        .arg(format!("body={body}"));
-    cmd.current_dir(cwd);
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, cwd);
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    match cmd.output() {
+    let path = format!("repos/{owner}/{repo}/issues/comments/{comment_id}");
+    let field = format!("body={body}");
+    let inv = gh_call::write("roster.patch", gh, cwd)
+        .args(["api", &path, "--method", "PATCH", "-f", &field]);
+    match gh_call::output(inv) {
         Ok(out) if out.status.success() => true,
         Ok(out) => {
             log::warn!(
@@ -208,7 +189,8 @@ fn roster_heartbeat_once(
     ttl_secs: u64,
     settle_secs: u64,
 ) {
-    let gh = Path::new("gh");
+    let gh_buf = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
+    let gh = gh_buf.as_path();
     let host = roster_host_id();
     let serves = resolve_this_host_serves(fallback_root);
 

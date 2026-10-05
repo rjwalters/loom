@@ -251,3 +251,82 @@ fn a_path_with_spaces_and_shell_metacharacters_moves_intact() {
         assert!(!src.exists(), "{name:?} must not remain at the source");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Porcelain status — the ground truth stash-push's "clean" now rests on
+// (#10122)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn porcelain_z_parses_codes_paths_and_drops_rename_sources() {
+    let raw =
+        b" M tracked.txt\0?? new dir/file.rs\0 A ita.rs\0R  new.txt\0old.txt\0M  staged.txt\0";
+    let got = parse_porcelain_z(raw);
+    let pairs: Vec<(&str, &str)> = got
+        .iter()
+        .map(|e| (e.code.as_str(), e.path.as_str()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            (" M", "tracked.txt"),
+            ("??", "new dir/file.rs"),
+            (" A", "ita.rs"),
+            ("R ", "new.txt"),
+            ("M ", "staged.txt"),
+        ]
+    );
+    assert!(got[1].is_untracked());
+    assert!(got[2].is_intent_to_add());
+    assert!(!got[0].is_intent_to_add() && !got[0].is_untracked());
+    assert!(parse_porcelain_z(b"").is_empty());
+}
+
+#[test]
+fn worktree_status_sees_intent_to_add_and_untracked_but_not_loom_markers() {
+    // The #10122 repro: `git add -N` makes `git stash create` fail with no
+    // stdout, which the old code read as "clean". The status view must report
+    // it, and report untracked work, while still ignoring Loom's markers.
+    let d = tempfile::tempdir().expect("tempdir");
+    repo_with_markers(d.path(), &["new.rs", "ita.rs"]);
+    let ok = std::process::Command::new("git")
+        .arg("-C")
+        .arg(d.path())
+        .args(["add", "-N", "ita.rs"])
+        .status()
+        .expect("git runs")
+        .success();
+    assert!(ok, "git add -N must succeed");
+
+    let mut seen: Vec<(String, String)> = worktree_status(d.path())
+        .expect("status succeeds")
+        .into_iter()
+        .map(|e| (e.code, e.path))
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            (" A".to_string(), "ita.rs".to_string()),
+            ("??".to_string(), "new.rs".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn worktree_status_is_an_error_not_clean_outside_a_repo() {
+    // A git failure must never collapse to an empty (= clean) list.
+    let d = tempfile::tempdir().expect("tempdir");
+    assert!(worktree_status(d.path()).is_err());
+}
+
+#[test]
+fn path_lists_are_truncated_and_json_arrays_escaped() {
+    let paths: Vec<String> = (0..5).map(|i| format!("f{i}")).collect();
+    assert_eq!(path_list(&paths, 3), "f0, f1, f2 (and 2 more)");
+    assert_eq!(path_list(&paths[..2], 3), "f0, f1");
+    let doc = format!("{{\"p\": {}}}", json_str_array(&["a \"b\"".to_string(), "c".to_string()]));
+    let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
+    assert_eq!(v["p"][0], "a \"b\"");
+    assert_eq!(json_str_array(&[]), "[]");
+}

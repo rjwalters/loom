@@ -7,6 +7,7 @@
 //! exists, is documented on [`loom_daemon::premise_check`].
 
 use anyhow::Result;
+use loom_daemon::observability::session_output::attended::StartRequest;
 use loom_daemon::premise_check::cli;
 use std::path::PathBuf;
 
@@ -60,6 +61,9 @@ impl PremiseCheckArgs {
     /// Never returns: exits with the gate's own code, which role prompts and
     /// the sweep orchestrator branch on.
     pub(crate) fn run(self) -> Result<()> {
+        if let Some(request) = self.attend_request() {
+            super::attend_hook::attend("premise-check", &request);
+        }
         cli::run(&cli::Options {
             issue: self.issue,
             repo: self.repo,
@@ -72,5 +76,56 @@ impl PremiseCheckArgs {
             scan_limit: self.scan_limit,
             no_cache: self.no_cache,
         })
+    }
+
+    /// The attended live-output request for a forge-mode gate (#10120): the
+    /// first per-issue call a Curator makes, so it is where an attended
+    /// Curator's output starts publishing. Local only, before any network
+    /// work; it changes neither stdout nor the exit code. Hermetic mode has no
+    /// issue and attends nothing.
+    fn attend_request(&self) -> Option<StartRequest> {
+        let issue = u32::try_from(self.issue?).ok()?;
+        let workspace = self.repo_root.clone().unwrap_or_else(|| PathBuf::from("."));
+        Some(super::attend_hook::request(issue, workspace))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: PremiseCheckArgs,
+    }
+
+    fn parse(argv: &[&str]) -> PremiseCheckArgs {
+        Cli::try_parse_from(std::iter::once("premise-check").chain(argv.iter().copied()))
+            .unwrap()
+            .args
+    }
+
+    #[test]
+    fn a_forge_mode_gate_attends_its_issue_under_the_agents_own_role() {
+        let request = parse(&["--issue", "10120"]).attend_request().unwrap();
+        assert_eq!(request.issue, 10120);
+        // Hermit, Architect and Auditor run this gate too, so the role comes
+        // from the subagent's `loom-<role>` type, never a hardcoded "curator".
+        assert_eq!(request.role, None);
+        assert_eq!(request.transcript, None);
+        assert_eq!(request.workspace, PathBuf::from("."));
+        let rooted = parse(&["--issue", "7", "--repo-root", "/x"])
+            .attend_request()
+            .unwrap();
+        assert_eq!(rooted.workspace, PathBuf::from("/x"));
+    }
+
+    #[test]
+    fn a_hermetic_gate_attends_nothing() {
+        let args = parse(&["--body-file", "/dev/null"]);
+        assert!(args.attend_request().is_none());
+        assert!(parse(&["--issue=-3"]).attend_request().is_none());
     }
 }

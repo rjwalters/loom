@@ -32,6 +32,7 @@ fn test_credential_preflight() -> CredentialPreflightReport {
         fingerprint: None,
         message: "test fixture — not a real preflight".to_string(),
         checked_at: Utc::now(),
+        pool: None,
     }
 }
 

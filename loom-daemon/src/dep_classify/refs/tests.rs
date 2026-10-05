@@ -230,6 +230,57 @@ fn the_exclusion_is_per_line_so_an_unbalanced_paren_cannot_swallow_later_bullets
 }
 
 // ---------------------------------------------------------------------------
+// parse_named_blocker_refs — the star-liveness "named blocker" (#10024)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_checklist_only_same_repo_blocker_is_named() {
+    let body = "Intro.\n\n## Dependencies\n\n- [ ] #5: the prerequisite\n";
+    assert_eq!(parse_named_blocker_refs(body, REPO), vec!["o/r#5"]);
+}
+
+#[test]
+fn a_checklist_only_cross_repo_blocker_is_named() {
+    // The live shape from 2AMLogic/loom-ui#1016.
+    let body = "## Dependencies\n\n- [ ] 2AMLogic/2am#1911 P1/P2 — upstream fix\n";
+    assert_eq!(parse_named_blocker_refs(body, "2AMLogic/loom-ui"), vec!["2AMLogic/2am#1911"]);
+}
+
+#[test]
+fn a_mixed_body_yields_the_sorted_deduplicated_union() {
+    let body = "Blocked by #3\n\n## Dependencies\n\n- [ ] #3: same as above\n\
+                * [ ] other/repo#9: upstream\n- [ ] Depends on PR #7: phrased item\n";
+    assert_eq!(parse_named_blocker_refs(body, REPO), vec!["o/r#3", "o/r#7", "other/repo#9"]);
+}
+
+#[test]
+fn a_checked_item_is_never_a_blocker() {
+    let body = "## Dependencies\n\n- [x] #5: done\n- [X] other/repo#6: done\n";
+    assert!(parse_named_blocker_refs(body, REPO).is_empty());
+}
+
+#[test]
+fn a_star_bullet_is_accepted() {
+    let body = "### Dependencies\n\n* [ ] #8: prerequisite\n";
+    assert_eq!(parse_named_blocker_refs(body, REPO), vec!["o/r#8"]);
+}
+
+#[test]
+fn a_bullet_outside_the_dependencies_section_is_not_a_blocker() {
+    let body = "## Tasks\n\n- [ ] #5: unrelated task\n\n## Dependencies\n\nNone.\n\n\
+                ## Notes\n\n- [ ] #6: after the section\n";
+    assert!(parse_named_blocker_refs(body, REPO).is_empty());
+}
+
+#[test]
+fn parse_dependency_refs_itself_still_ignores_the_checklist() {
+    // Cycle detection and defer classification read this parser; #10024 must
+    // not widen it.
+    let body = "## Dependencies\n\n- [ ] #5: the prerequisite\n- [ ] other/repo#9: upstream\n";
+    assert!(parse_dependency_refs(body, REPO).is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // The differential tests that used to live here (epic #7810, PR 3)
 // ---------------------------------------------------------------------------
 //

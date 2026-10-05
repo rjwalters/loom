@@ -1422,6 +1422,11 @@ pub struct DaemonStatusReport {
     /// wire data compatible.
     #[serde(default)]
     pub auto_update_stale_repo: Option<String>,
+    /// The roll schedule (Issue #9132): next window, target, dispatch-paused flag and
+    /// deferral reason. `None` when no `rollWindowSecs` is configured, or from a
+    /// pre-#9132 daemon. `#[serde(default)]` keeps older wire data compatible.
+    #[serde(default)]
+    pub auto_update_roll_window: Option<crate::auto_update::roll_window::RollWindowStatus>,
     /// Host-distress circuit-breaker state (Issue #4235). `Some` when a breaker
     /// has been registered this process (the work-finder loop is running and the
     /// breaker is enabled); `None` when no breaker is active — which the status
@@ -1856,7 +1861,7 @@ pub use dispatch_plan::{
 mod fleet_plan;
 pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};
 mod work_finder_tick;
-pub use work_finder_tick::WorkFinderTickSummary;
+pub use work_finder_tick::{CapLimiter, CapView, CapacityWait, WorkFinderTickSummary};
 
 mod star_liveness;
 pub use star_liveness::{
@@ -2285,6 +2290,55 @@ pub struct ForgeCallsStatus {
     /// as `host_window`.
     #[serde(default)]
     pub own_window: Option<Vec<ForgePoolSpend>>,
+    /// Host-wide counts over the window keyed by the #9777 **call identity**
+    /// (operation × provider × origin × repo) rather than by caller. `None`
+    /// for a pre-#9777 wire payload from an older daemon binary that never
+    /// computed one; empty when the sink carries no identity-bearing lines yet.
+    #[serde(default)]
+    pub operations: Option<Vec<ForgeOperationCounts>>,
+    /// Host-wide counts over the window per **identity role** (#9872):
+    /// `reader` (a reader App's own pool), `writer`, `writer-fallback` (a
+    /// read a reader failed on, re-run on the writer) and `unknown` (a line
+    /// from an older binary or a call recorded outside the `gh` facade).
+    /// `None` when the sink is disabled, or from an older daemon.
+    #[serde(default)]
+    pub identity_roles: Option<Vec<ForgeIdentityRoleCounts>>,
+}
+
+/// One identity-role row of [`ForgeCallsStatus`] (#9872).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeIdentityRoleCounts {
+    /// `reader`, `writer`, `writer-fallback` or `unknown`.
+    pub role: String,
+    pub ok: u64,
+    pub not_modified: u64,
+    pub rate_limited: u64,
+    pub error: u64,
+}
+
+/// One call-identity row of [`ForgeCallsStatus`] (Issue #9777).
+///
+/// `origin` is a separate field from `repo` on purpose: two forges can carry
+/// the same `owner/repo` slug, and an accounting row that merged them would
+/// attribute one provider's spend to the other on a mixed fleet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeOperationCounts {
+    /// Inventoried operation ID (`issue.create`), or `unknown` for a call site
+    /// not yet mapped to one — visible by design, never dropped.
+    pub operation: String,
+    /// Provider family (`github`, `gitea`), when known.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Origin host (`github.com`, `gitea.example.com`), when known.
+    #[serde(default)]
+    pub origin: Option<String>,
+    /// `owner/repo` slug, when known.
+    #[serde(default)]
+    pub repo: Option<String>,
+    pub ok: u64,
+    pub not_modified: u64,
+    pub rate_limited: u64,
+    pub error: u64,
 }
 
 /// One caller × pool row of [`ForgeCallsStatus`].
@@ -2854,6 +2908,28 @@ pub struct CredentialPreflightReport {
     pub message: String,
     /// Wall-clock time this snapshot was taken (daemon startup).
     pub checked_at: DateTime<Utc>,
+    /// Which GitHub rate-limit pool the credential spends (#9872). `None`
+    /// when no credential resolved, the gateway owns it, or the report came
+    /// from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<CredentialPool>,
+}
+
+/// The rate-limit pool a resolved writer credential spends (#9872).
+///
+/// Every personal access token (classic and fine-grained), OAuth token and
+/// `gh` login of one user shares that user's single pool; only a GitHub App
+/// installation token (or another account) has its own. Never a token value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialPool {
+    /// `installation` (a GitHub App installation token) or `user`.
+    pub kind: String,
+    /// The account login, for `user` (resolved once with `gh api user`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    /// The account's numeric id, for `user`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<u64>,
 }
 
 // ========================================================================

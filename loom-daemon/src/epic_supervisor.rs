@@ -1275,7 +1275,7 @@ pub mod forge {
         #[must_use]
         pub fn new() -> Self {
             Self {
-                gh_bin: PathBuf::from("gh"),
+                gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
                 repo: std::env::var("LOOM_REPO").ok(),
                 cwd: None,
             }
@@ -1290,7 +1290,7 @@ pub mod forge {
         #[must_use]
         pub fn for_root(root: &std::path::Path) -> Self {
             Self {
-                gh_bin: PathBuf::from("gh"),
+                gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
                 repo: std::env::var("LOOM_REPO").ok(),
                 cwd: Some(root.to_path_buf()),
             }

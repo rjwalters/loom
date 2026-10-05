@@ -151,19 +151,27 @@ pub fn sync_with_origin(repo_root: &Path, args: &Args, state: &mut SyncState) ->
     // Bounded, best-effort fetch — a failure/timeout must NOT make this script
     // network-dependent: warn and proceed with local HEAD as-is (the behind
     // count stays unknown, not "known stale").
+    //
+    // `--` ends git's option parsing before the ref operand (#9106 mitigation
+    // B, #9479). `--quiet` therefore has to move AHEAD of the separator — past
+    // it, it would be read as a refspec, not a switch. `branch` here is the
+    // locally resolved default branch (git config / `origin/HEAD`), not a
+    // forge-supplied `headRefName`, so this is the separator half of the
+    // mitigation only: form kept uniform across every sink so a future reader
+    // does not have to re-derive which argvs are exposed.
     let fetch_ok = if util::have("timeout") {
         Command::new("timeout")
             .arg("5")
             .arg("git")
             .arg("-C")
             .arg(repo_root)
-            .args(["fetch", "origin", &branch, "--quiet"])
+            .args(["fetch", "--quiet", "origin", "--", &branch])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|s| s.success())
     } else {
-        util::git_ok(repo_root, &["fetch", "origin", &branch, "--quiet"])
+        util::git_ok(repo_root, &["fetch", "--quiet", "origin", "--", &branch])
     };
     if !fetch_ok {
         out::warn(&format!(

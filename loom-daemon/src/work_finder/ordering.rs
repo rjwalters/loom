@@ -23,8 +23,12 @@ pub struct PriorityCandidate {
     pub workspace_idx: usize,
     /// The owning workspace's priority tier (lower = higher priority).
     pub workspace_priority: u32,
-    /// Whether the issue carries `loom:operator-priority` (#9244): the
-    /// operator starred it, so it sorts ahead of everything else, fleet-wide.
+    /// The issue's effective operator priority level (#10307): 0 unstarred,
+    /// 1 the star, 2 `loom:operator-high-priority` (own or inherited), and so
+    /// on up the level table. Higher levels sort first, fleet-wide.
+    pub operator_level: u8,
+    /// Whether the issue is starred at any level (#9244): the operator
+    /// starred it, so it sorts ahead of everything unstarred, fleet-wide.
     pub operator_priority: bool,
     /// When the issue was starred (the `labeled` timeline event for
     /// `loom:operator-priority`), when known. Orders starred issues among
@@ -45,9 +49,11 @@ pub struct PriorityCandidate {
     pub complexity: Option<String>,
 }
 
-/// Total ordering over dispatch candidates (#3946, #9244):
+/// Total ordering over dispatch candidates (#3946, #9244, #10307):
 ///
-/// 1. starred (`loom:operator-priority`) first;
+/// 0. effective operator priority level, highest first (level 2 before the
+///    plain star, #10307);
+/// 1. starred (`loom:operator-priority`, any level) first;
 /// 2. among starred issues, starred-at ascending — the issue starred first
 ///    lands first — with a missing starred-at falling back to `createdAt`;
 /// 3. red-main fixes first (set only while that repo's `main` is verified red);
@@ -56,7 +62,7 @@ pub struct PriorityCandidate {
 /// 5. `createdAt` oldest first (a dated issue sorts before an undated one);
 /// 6. issue number ascending, so the order is fully deterministic.
 ///
-/// Keys 1-3 are [`lane_cmp`]; the single-workspace tick sorts by those alone
+/// Keys 0-3 are [`lane_cmp`]; the single-workspace tick sorts by those alone
 /// so its listing order is untouched when nothing is starred or red.
 ///
 /// The keys themselves live in [`candidate_keys`] (Issue #9288), the one seam
@@ -68,10 +74,10 @@ pub fn candidate_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> Ordering {
 }
 
 /// How many leading [`candidate_keys`] are the #9244 lane keys.
-const LANE_KEYS: usize = 3;
+const LANE_KEYS: usize = 4;
 
-/// Keys 1-3 of [`candidate_cmp`]: starred first, then starred-at among
-/// starred issues, then red-main fixes. Two unstarred, non-fix candidates
+/// Keys 0-3 of [`candidate_cmp`]: level, starred first, then starred-at
+/// among starred issues, then red-main fixes. Two unstarred, non-fix candidates
 /// compare equal, which is what lets a stable sort by this comparator leave
 /// ordinary work in its existing order.
 #[must_use]
@@ -85,6 +91,9 @@ pub fn lane_cmp(a: &PriorityCandidate, b: &PriorityCandidate) -> Ordering {
 pub enum KeyValue<'a> {
     /// Ascending unsigned value (workspace priority, issue number).
     Asc(u64),
+    /// Descending unsigned value: the highest sorts first (the operator
+    /// priority level, #10307).
+    Desc(u64),
     /// A flag that sorts `true` first (starred, red-main fix).
     TrueFirst(bool),
     /// Oldest-first ISO-8601 timestamp: a dated issue (`Some`) sorts before
@@ -97,6 +106,7 @@ impl Ord for KeyValue<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Self::Asc(a), Self::Asc(b)) => a.cmp(b),
+            (Self::Desc(a), Self::Desc(b)) => b.cmp(a),
             (Self::TrueFirst(a), Self::TrueFirst(b)) => b.cmp(a),
             (Self::OldestFirst(a), Self::OldestFirst(b)) => match (a, b) {
                 (Some(x), Some(y)) => x.cmp(y),
@@ -123,6 +133,7 @@ impl KeyValue<'_> {
             Self::Asc(_) => 0,
             Self::TrueFirst(_) => 1,
             Self::OldestFirst(_) => 2,
+            Self::Desc(_) => 3,
         }
     }
 
@@ -130,7 +141,7 @@ impl KeyValue<'_> {
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         match self {
-            Self::Asc(n) => serde_json::Value::from(*n),
+            Self::Asc(n) | Self::Desc(n) => serde_json::Value::from(*n),
             Self::TrueFirst(b) => serde_json::Value::Bool(*b),
             Self::OldestFirst(t) => t.map_or(serde_json::Value::Null, serde_json::Value::from),
         }
@@ -158,7 +169,7 @@ pub struct CandidateKey<'a> {
 /// candidate, and a starred one falls back to `createdAt` when its starred-at
 /// is unknown.
 #[must_use]
-pub fn candidate_keys(c: &PriorityCandidate) -> [CandidateKey<'_>; 6] {
+pub fn candidate_keys(c: &PriorityCandidate) -> [CandidateKey<'_>; 7] {
     let starred_at = if !c.operator_priority {
         None
     } else if c.operator_priority_at.is_some() {
@@ -167,6 +178,10 @@ pub fn candidate_keys(c: &PriorityCandidate) -> [CandidateKey<'_>; 6] {
         c.created_at.as_deref()
     };
     [
+        CandidateKey {
+            name: "operator_priority_level",
+            value: KeyValue::Desc(u64::from(c.operator_level)),
+        },
         CandidateKey {
             name: "operator_priority",
             value: KeyValue::TrueFirst(c.operator_priority),

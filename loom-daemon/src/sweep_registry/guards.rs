@@ -4,6 +4,7 @@
 use super::*;
 use crate::claim_reconciliation::forge::parse_max_timestamp;
 use crate::comment_trust::records;
+use crate::gh_invocation::AccessIntent;
 
 /// The pure pre-flip label predicate behind [`CollisionClass`] (Issue #7873).
 /// Declared here rather than in `sweep_registry::mod` because it is this
@@ -19,6 +20,12 @@ pub(crate) mod preflip_labels;
 /// `pub(crate)` so the dispatch-level yield tests can name the identity
 /// constants the leaseless leg reports rather than re-spelling them.
 pub(crate) mod claim_label;
+
+/// The registry's facade `gh` helpers, shared by every `sweep_registry` module.
+mod gh_exec;
+mod rate_limit_report;
+#[cfg(test)]
+mod rate_limit_report_tests;
 
 /// Three-state result of the open-linked-PR probe (Issue #4452).
 ///
@@ -332,26 +339,17 @@ impl SweepRegistry {
     /// missing `loom:issue` is unpromoted, not peer-claimed).
     pub(crate) fn classify_preflip_labels(&self, issue: u32) -> CollisionClass {
         let gh = self.resolved_gh();
-        let mut cmd = Command::new(&gh);
-        cmd.arg("issue")
+        let mut cmd = self.gh_inv("guard.preflip_labels", AccessIntent::Read, &gh);
+        cmd = cmd
+            .arg("issue")
             .arg("view")
             .arg(issue.to_string())
             .arg("--json")
             .arg("labels");
         // Same workspace/repo scoping as the flip (#3937): resolve the issue
         // against *this* registry's repo, not the daemon's cwd repo.
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        let timeout = reap_gh_timeout();
-        let output = match output_with_timeout(cmd, timeout) {
+        cmd = cmd.args(crate::claim_reconciliation::gh_call::loom_repo_flag());
+        let output = match self.run_counted(cmd) {
             Ok(Some(o)) if o.status.success() => o,
             Ok(Some(_)) => return CollisionClass::Unknown, // non-zero exit
             Ok(None) => return CollisionClass::Unknown,    // timed out + killed
@@ -492,21 +490,15 @@ impl SweepRegistry {
         // open) when the repo cannot be resolved.
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
-        let mut cmd = Command::new(&gh);
-        cmd.arg("api")
+        let mut cmd = self.gh_inv("guard.issue_state", AccessIntent::Read, &gh);
+        cmd = cmd
+            .arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
             .arg("--jq")
             .arg("{state, is_pr: (.pull_request != null)}");
         // Resolve against this registry's own workspace, matching the label-flip
         // helpers and the other dispatch-path probes (#3937).
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        let output = self.run_counted(cmd).ok()??;
         if !output.status.success() {
             return None;
         }
@@ -808,21 +800,15 @@ impl SweepRegistry {
     fn pull_request_is_open(&self, pr: u32) -> Option<bool> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
-        let mut cmd = Command::new(&gh);
-        cmd.arg("api")
+        let mut cmd = self.gh_inv("guard.pr_state", AccessIntent::Read, &gh);
+        cmd = cmd
+            .arg("api")
             .arg(format!("repos/{owner}/{repo}/pulls/{pr}"))
             .arg("--jq")
             .arg(".state");
         // Resolve against this registry's own workspace, matching every other
         // dispatch-path probe (#3937).
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        let output = self.run_counted(cmd).ok()??;
         if !output.status.success() {
             return None;
         }
@@ -871,19 +857,12 @@ impl SweepRegistry {
             return OpenPrProbe::ProbeFailed;
         };
         let gh = self.resolved_gh();
-        let mut cmd = Command::new(&gh);
-        cmd.args(crate::worktree_ops::gh::open_linked_pr_args(&owner, &repo, issue));
+        let mut cmd = self.gh_inv("guard.open_pr_graphql", AccessIntent::Read, &gh);
+        cmd = cmd.args(crate::worktree_ops::gh::open_linked_pr_args(&owner, &repo, issue));
         // Resolve against this registry's own workspace, matching the label-flip
         // helpers and `issue_is_closed_or_pr` (#3937).
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
         // A spawn error or timeout is a PROBE FAILURE (#4452).
-        let Some(output) = output_with_timeout(cmd, reap_gh_timeout()).ok().flatten() else {
+        let Some(output) = self.run_counted(cmd).ok().flatten() else {
             return OpenPrProbe::ProbeFailed;
         };
         // A non-zero `gh` exit (rate limit, auth failure, transient forge error)
@@ -933,14 +912,9 @@ impl SweepRegistry {
             return OpenPrProbe::ProbeFailed;
         };
         let gh = self.resolved_gh();
-        let mut cmd = Command::new(&gh);
-        cmd.args(crate::worktree_ops::gh::open_linked_pr_timeline_args(&owner, &repo, issue));
-        cmd.current_dir(&self.config.workspace_root);
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        let Some(output) = output_with_timeout(cmd, reap_gh_timeout()).ok().flatten() else {
+        let mut cmd = self.gh_inv("guard.open_pr_timeline", AccessIntent::Read, &gh);
+        cmd = cmd.args(crate::worktree_ops::gh::open_linked_pr_timeline_args(&owner, &repo, issue));
+        let Some(output) = self.run_counted(cmd).ok().flatten() else {
             return OpenPrProbe::ProbeFailed;
         };
         if !output.status.success() {
@@ -970,21 +944,15 @@ impl SweepRegistry {
     pub(crate) fn issue_is_pull_request(&self, issue: u32) -> Option<bool> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
-        let mut cmd = Command::new(&gh);
-        cmd.arg("api")
+        let mut cmd = self.gh_inv("guard.issue_is_pr", AccessIntent::Read, &gh);
+        cmd = cmd
+            .arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
             .arg("--jq")
             .arg(".pull_request != null");
         // Resolve against this registry's own workspace, matching the other
         // dispatch-path probes (#3937).
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        let output = self.run_counted(cmd).ok()??;
         if !output.status.success() {
             return None;
         }
@@ -1114,17 +1082,13 @@ impl SweepRegistry {
     pub(crate) fn issue_body_via_rest(&self, issue: u32) -> Option<String> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
-        let mut cmd = Command::new(&gh);
-        cmd.arg("api")
+        let mut cmd = self.gh_inv("guard.issue_body", AccessIntent::Read, &gh);
+        cmd = cmd
+            .arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
             .arg("--jq")
             .arg(format!("{{body: (.body // \"\"), {}}}", records::AUTHOR_JQ));
-        cmd.current_dir(&self.config.workspace_root);
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        let output = self.run_counted(cmd).ok()??;
         if !output.status.success() {
             return None;
         }
@@ -1140,21 +1104,15 @@ impl SweepRegistry {
     pub(crate) fn current_labels_via_rest(&self, issue: u32) -> Option<Vec<String>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
-        let mut cmd = Command::new(&gh);
-        cmd.arg("api")
+        let mut cmd = self.gh_inv("guard.issue_labels", AccessIntent::Read, &gh);
+        cmd = cmd
+            .arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
             .arg("--jq")
             .arg(".labels[].name");
         // Resolve against this registry's own workspace, matching the label-flip
         // helpers and the other dispatch-path probes (#3937).
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        let output = self.run_counted(cmd).ok()??;
         if !output.status.success() {
             return None;
         }
@@ -1202,21 +1160,15 @@ impl SweepRegistry {
             return Some(cached);
         }
         let gh = self.resolved_gh();
-        let mut cmd = Command::new(&gh);
-        cmd.arg("repo")
+        let mut cmd = self.gh_inv("guard.repo_nwo", AccessIntent::Read, &gh);
+        cmd = cmd
+            .arg("repo")
             .arg("view")
             .arg("--json")
             .arg("owner,name")
             .arg("--jq")
             .arg(".owner.login + \"/\" + .name");
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        let output = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
+        let output = self.run_counted(cmd).ok()??;
         if !output.status.success() {
             return None;
         }
@@ -1239,8 +1191,9 @@ impl SweepRegistry {
 
     pub(crate) fn flip_label_to_building(&self, issue: u32) -> Result<()> {
         let gh = self.resolved_gh();
-        let mut cmd = Command::new(&gh);
-        cmd.arg("issue")
+        let mut cmd = self.gh_inv("guard.flip_building", AccessIntent::Write, &gh);
+        cmd = cmd
+            .arg("issue")
             .arg("edit")
             .arg(issue.to_string())
             .arg("--remove-label")
@@ -1252,25 +1205,18 @@ impl SweepRegistry {
         // a multi-workspace daemon (#3928) flips labels against the wrong repo
         // (`GraphQL: Could not resolve to an issue ...`) — see #3937. The
         // process-global LOOM_REPO override still wins when set.
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
+        cmd = cmd.args(crate::claim_reconciliation::gh_call::loom_repo_flag());
         // Bounded so a wedged `gh` can never block the dispatch/read path
         // indefinitely (Issue #3973); stdio piping is forced by the helper.
         let timeout = reap_gh_timeout();
-        match output_with_timeout(cmd, timeout)
+        match self
+            .run_counted(cmd)
             .with_context(|| format!("failed to invoke {} for issue #{issue}", gh.display()))?
         {
             Some(output) if output.status.success() => Ok(()),
             Some(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
+                self.report_forge_failure(&stderr, "sweep_dispatch (label flip)");
                 Err(anyhow!("gh issue edit failed for #{issue}: {}", stderr.trim()))
             }
             None => Err(anyhow!(
@@ -1334,6 +1280,15 @@ impl SweepRegistry {
         opaque
     }
 
+    /// `body` for an issue comment with the #9772 dashboard footer appended —
+    /// the slug resolves like every forge mutation here (`resolve_owner_repo`
+    /// honors `LOOM_REPO`), and an unresolvable one leaves the body unlinked
+    /// rather than linking to nowhere.
+    fn dashboard_comment_body(&self, issue: u32, body: &str) -> String {
+        let nwo = self.resolve_owner_repo().map(|(o, r)| format!("{o}/{r}"));
+        crate::forge_comment::footer_or_body(nwo.as_deref(), issue, false, body)
+    }
+
     /// Write a lease record (Issue #6179, Epic #6165 Phase 1) — a best-effort
     /// forge comment posted at the moment a dispatch successfully flips
     /// `loom:building`, so the claim gains a liveness dimension (a lease)
@@ -1352,25 +1307,6 @@ impl SweepRegistry {
     /// `post_watchdog_gaveup_comment`: a `gh` failure here only logs (at
     /// `warn`) and never propagates — posting a lease record must never fail
     /// dispatch or undo the claim it documents.
-    /// The configured `gh` binary, or the crate's single resolver
-    /// ([`crate::gh_invocation::gh_bin`]: policy launcher -> `LOOM_GH_BIN` ->
-    /// `PATH`) when no override is configured (#9985).
-    fn resolved_gh(&self) -> PathBuf {
-        self.config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(crate::gh_invocation::gh_bin()))
-    }
-
-    /// `body` for an issue comment with the #9772 dashboard footer appended —
-    /// the slug resolves like every forge mutation here (`resolve_owner_repo`
-    /// honors `LOOM_REPO`), and an unresolvable one leaves the body unlinked
-    /// rather than linking to nowhere.
-    fn dashboard_comment_body(&self, issue: u32, body: &str) -> String {
-        let nwo = self.resolve_owner_repo().map(|(o, r)| format!("{o}/{r}"));
-        crate::forge_comment::footer_or_body(nwo.as_deref(), issue, false, body)
-    }
-
     pub(crate) fn write_lease_comment(&self, issue: u32, sweep_id: &str) {
         if self.config.skip_label_flip {
             return;
@@ -1392,8 +1328,8 @@ impl SweepRegistry {
             sweep_id = sweep_id,
             ts = Utc::now().to_rfc3339(),
         );
-        let mut comment = Command::new(&gh);
-        comment
+        let mut comment = self.gh_inv("guard.lease_comment", AccessIntent::Write, &gh);
+        comment = comment
             .arg("issue")
             .arg("comment")
             .arg(issue.to_string())
@@ -1402,26 +1338,21 @@ impl SweepRegistry {
         // Run in the registry's own workspace so the issue number resolves
         // against *this* repo in a multi-workspace daemon (#3928/#3937),
         // mirroring every other forge mutation in this file.
-        comment.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut comment,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            comment.arg("--repo").arg(repo);
-        }
+        comment = comment.args(crate::claim_reconciliation::gh_call::loom_repo_flag());
         // Bounded so a wedged `gh` can never block the dispatch path (#3973),
         // exactly like the label flip this immediately follows.
         let timeout = reap_gh_timeout();
-        match output_with_timeout(comment, timeout) {
+        match self.run_counted(comment) {
             Ok(Some(output)) if output.status.success() => {}
-            Ok(Some(output)) => log::warn!(
-                "lease comment for #{issue} exited {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
+            Ok(Some(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                self.report_forge_failure(&stderr, "sweep_dispatch (lease comment)");
+                log::warn!(
+                    "lease comment for #{issue} exited {:?}: {}",
+                    output.status.code(),
+                    stderr.trim()
+                );
+            }
             Ok(None) => log::warn!(
                 "lease comment for #{issue} exceeded {}s, killed (#3973)",
                 timeout.as_secs()
@@ -1567,8 +1498,8 @@ impl SweepRegistry {
     pub(crate) fn read_lease_comments(&self, issue: u32) -> Option<Vec<LeaseComment>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
-        let mut cmd = Command::new(&gh);
-        cmd.arg("api")
+        let mut cmd = self.gh_inv("guard.lease_comments", AccessIntent::Read, &gh);
+        cmd = cmd.arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))
             .arg("--paginate")
             .arg("--jq")
@@ -1577,15 +1508,7 @@ impl SweepRegistry {
                 prefix = LEASE_MARKER_PREFIX,
                 author = records::AUTHOR_JQ,
             ));
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        let timeout = reap_gh_timeout();
-        let output = output_with_timeout(cmd, timeout).ok().flatten()?;
+        let output = self.run_counted(cmd).ok().flatten()?;
         if !output.status.success() {
             return None;
         }
@@ -1913,25 +1836,16 @@ impl SweepRegistry {
              claim-then-verify-order tie-break). The `loom:building` label is left untouched — it \
              is already correct, protecting the earlier claimant's own winning lease.",
         );
-        let mut comment = Command::new(&gh);
-        comment
+        let mut comment = self.gh_inv("guard.lease_yield_comment", AccessIntent::Write, &gh);
+        comment = comment
             .arg("issue")
             .arg("comment")
             .arg(issue.to_string())
             .arg("--body")
             .arg(self.dashboard_comment_body(issue, &body));
-        comment.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut comment,
-            &self.config.workspace_root,
-        );
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            comment.arg("--repo").arg(repo);
-        }
+        comment = comment.args(crate::claim_reconciliation::gh_call::loom_repo_flag());
         let timeout = reap_gh_timeout();
-        match output_with_timeout(comment, timeout) {
+        match self.run_counted(comment) {
             Ok(Some(output)) if output.status.success() => {}
             Ok(Some(output)) => log::warn!(
                 "lease-yield comment for #{issue} exited {:?}: {}",

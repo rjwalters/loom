@@ -45,6 +45,7 @@
 //! 5 s, leaving ~3 s for the gateway, the backend and a consumer's polling
 //! cache. See `defaults/docs/session-output.md`.
 
+pub mod attended;
 pub mod claude;
 pub mod latency;
 
@@ -245,11 +246,35 @@ pub fn global_sink() -> Option<&'static SessionOutputSink> {
 // Run tracking
 // ============================================================================
 
+/// Where a run's transcripts come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Source {
+    /// A daemon-dispatched sweep: every `/loom:sweep <issue>` session under the
+    /// workspace's project directory ([`claude::discover`]), with identity
+    /// filled in from each transcript on first sight.
+    Discover,
+    /// An attended run (#10116): the one transcript the attending agent
+    /// writes, located once when the tailer started. Its identity is complete
+    /// at open time and is never re-derived from the transcript, whose `cwd`
+    /// is the operator session's directory and can name a different repo.
+    ///
+    /// The run owns only a segment of that transcript: from its claim line
+    /// (`from`, a byte offset) up to `until`, the end of the lines the tailer
+    /// has checked for the agent's next task. Nothing outside it is read.
+    Fixed {
+        stream_id: String,
+        path: PathBuf,
+        from: u64,
+        until: u64,
+    },
+}
+
 /// One tracked in-flight run.
 #[derive(Debug)]
 struct Run {
     identity: RunIdentity,
     workspace_root: PathBuf,
+    source: Source,
     /// Per-transcript cursors, keyed by `stream_id`.
     cursors: HashMap<String, (PathBuf, claude::Cursor)>,
     /// Sequence counter for this run's producer-authored status stream, which
@@ -272,6 +297,29 @@ struct Run {
 }
 
 impl Run {
+    /// A freshly opened run: nothing read yet, watching from `now`.
+    fn new(
+        identity: RunIdentity,
+        workspace_root: PathBuf,
+        source: Source,
+        status_stream: String,
+        now: DateTime<Utc>,
+    ) -> Self {
+        Run {
+            identity,
+            workspace_root,
+            source,
+            cursors: HashMap::new(),
+            status_sequence: 0,
+            status_stream,
+            last_content_at: now,
+            ever_covered: false,
+            dropped_events: 0,
+            watch_since: now,
+            lag: latency::LagWindow::default(),
+        }
+    }
+
     fn supported(&self) -> bool {
         SUPPORTED_RUNTIMES.contains(&self.identity.runtime.as_str())
     }
@@ -348,38 +396,46 @@ impl Tracker {
         let status_stream = sweep_id
             .clone()
             .unwrap_or_else(|| format!("issue-{issue}-attempt-{attempt}"));
-        let run = Run {
-            identity: RunIdentity {
-                // Resolved asynchronously on the first tick: the bus event
-                // carries a filesystem path, never a forge slug, and a
-                // basename would be a fabricated identity.
-                repo: None,
-                // Fail-closed: this producer never asks the forge, so a row
-                // never claims `public` on its own authority.
-                visibility: crate::telemetry::RepoVisibility::Private,
-                issue: Some(issue),
-                // A dispatched sweep names its issue by construction. Resolved
-                // again from the transcript on first stream sight, which is
-                // what covers a role attempt and an unattributed session.
-                session_kind: Some(crate::telemetry::SessionKind::Sweep),
-                sweep_id,
-                session_id: None,
-                attempt: Some(attempt),
-                runtime,
-                role: None,
-            },
-            workspace_root: PathBuf::from(workspace_root),
-            cursors: HashMap::new(),
-            status_sequence: 0,
-            status_stream,
-            last_content_at: now,
-            ever_covered: false,
-            dropped_events: 0,
-            watch_since: now,
-            lag: latency::LagWindow::default(),
+        let identity = RunIdentity {
+            // Resolved asynchronously on the first tick: the bus event
+            // carries a filesystem path, never a forge slug, and a
+            // basename would be a fabricated identity.
+            repo: None,
+            // Fail-closed: this producer never asks the forge, so a row
+            // never claims `public` on its own authority.
+            visibility: crate::telemetry::RepoVisibility::Private,
+            issue: Some(issue),
+            // A dispatched sweep names its issue by construction. Resolved
+            // again from the transcript on first stream sight, which is
+            // what covers a role attempt and an unattributed session.
+            session_kind: Some(crate::telemetry::SessionKind::Sweep),
+            sweep_id,
+            session_id: None,
+            attempt: Some(attempt),
+            runtime,
+            role: None,
+            // This producer only ever opens runs for sweeps the daemon
+            // dispatched (`sweep.global.dispatch`).
+            launch: crate::telemetry::kinds::session_output::Launch::Daemon,
         };
+        let run =
+            Run::new(identity, PathBuf::from(workspace_root), Source::Discover, status_stream, now);
         self.runs.insert(key.clone(), run);
         self.runs.get_mut(&key)
+    }
+
+    /// Track an already-built run under `(workspace_root, issue)` — the
+    /// attended tailer's way in, which opens exactly one run per process and
+    /// so needs neither the attempt counter nor the run ceiling.
+    fn insert(&mut self, workspace_root: &str, issue: u32, run: Run) -> &mut Run {
+        use std::collections::hash_map::Entry;
+        match self.runs.entry((workspace_root.to_string(), issue)) {
+            Entry::Occupied(mut slot) => {
+                slot.insert(run);
+                slot.into_mut()
+            }
+            Entry::Vacant(slot) => slot.insert(run),
+        }
     }
 
     fn close(&mut self, workspace_root: &str, issue: u32) -> Option<Run> {
@@ -504,11 +560,14 @@ async fn tick(
     tracker.last_dropped_total = dropped_total;
 
     // Canonical repo resolution: one bounded `gh` call per unseen workspace
-    // root, memoized for the process. Never a directory basename.
+    // root, memoized for the process. Never a directory basename. An attended
+    // run resolved its repo from the claim's `origin` remote at open time and
+    // makes no forge call here: an unresolvable one stays unscoped rather than
+    // retrying `gh` every tick from an operator's laptop.
     let unresolved: Vec<String> = tracker
         .runs
         .values()
-        .filter(|run| run.identity.repo.is_none())
+        .filter(|run| run.identity.repo.is_none() && run.source == Source::Discover)
         .map(|run| run.workspace_root.display().to_string())
         .collect();
     for root in unresolved {
@@ -537,10 +596,14 @@ async fn tick(
             // never read, and it never heartbeats as if it were live.
             continue;
         }
-        let Some(projects) = projects.as_deref() else {
-            continue;
+        let projects_dir = match (&run.source, projects.as_deref()) {
+            (_, Some(dir)) => dir,
+            // A fixed source names its own transcript and needs no projects
+            // directory to discover it from.
+            (Source::Fixed { .. }, None) => Path::new(""),
+            (Source::Discover, None) => continue,
         };
-        records.extend(advance_run(run, projects, now));
+        records.extend(advance_run(run, projects_dir, now));
         if now
             .signed_duration_since(run.last_content_at)
             .to_std()
@@ -569,7 +632,13 @@ fn advance_run(run: &mut Run, projects_dir: &Path, now: DateTime<Utc>) -> Vec<Se
         return Vec::new();
     };
     let mut out = Vec::new();
-    let streams = claude::discover(projects_dir, &run.workspace_root, issue);
+    let streams = match &run.source {
+        Source::Discover => claude::discover(projects_dir, &run.workspace_root, issue),
+        Source::Fixed {
+            stream_id, path, ..
+        } if path.is_file() => vec![(stream_id.clone(), path.clone())],
+        Source::Fixed { .. } => Vec::new(),
+    };
     if !streams.is_empty() {
         // A source was located: coverage is `live` from here on, even across
         // a quiet interval. Until then heartbeats stay `degraded`, so "we
@@ -578,40 +647,59 @@ fn advance_run(run: &mut Run, projects_dir: &Path, now: DateTime<Utc>) -> Vec<Se
     }
     for (stream_id, path) in streams {
         if !run.cursors.contains_key(&stream_id) {
-            // First sight of this stream — the one place the (relatively
-            // expensive) whole-transcript parse runs. Identity comes from
-            // #9445's own resolver, so this producer and `session.summary`
-            // cannot disagree about whose session this is.
-            let context = claude::context_of(&path, now);
             if run.identity.session_id.is_none() {
                 run.identity.session_id = Some(stream_id.clone());
             }
-            if run.identity.role.is_none() {
-                run.identity.role = context.role;
+            // First sight of a discovered stream — the one place the
+            // (relatively expensive) whole-transcript parse runs. Identity
+            // comes from #9445's own resolver, so this producer and
+            // `session.summary` cannot disagree about whose session this is.
+            // An attended run's identity is already complete and is not
+            // re-derived: its transcript's `cwd` is the operator session's
+            // directory, which can be a different repo from the claim's.
+            if run.source == Source::Discover {
+                let context = claude::context_of(&path, now);
+                if run.identity.role.is_none() {
+                    run.identity.role = context.role;
+                }
+                // The transcript's own resolved slug wins over the tick's `gh`
+                // lookup: it is the canonical #9472 path, and it is already
+                // here. Neither is ever a directory basename.
+                if run.identity.repo.is_none() {
+                    run.identity.repo = context.repo;
+                }
+                if run.identity.session_kind.is_none() {
+                    run.identity.session_kind = context.session_kind;
+                }
             }
-            // The transcript's own resolved slug wins over the tick's `gh`
-            // lookup: it is the canonical #9472 path, and it is already here.
-            // Neither is ever a directory basename.
-            if run.identity.repo.is_none() {
-                run.identity.repo = context.repo;
-            }
-            if run.identity.session_kind.is_none() {
-                run.identity.session_kind = context.session_kind;
-            }
-            run.cursors
-                .insert(stream_id.clone(), (path, claude::Cursor::default()));
+            let cursor = match &run.source {
+                Source::Fixed { from, .. } => claude::Cursor::starting_at(*from),
+                Source::Discover => claude::Cursor::default(),
+            };
+            run.cursors.insert(stream_id.clone(), (path, cursor));
         }
         let identity = run.identity.clone();
+        let limit = match &run.source {
+            Source::Fixed { until, .. } => Some(*until),
+            Source::Discover => None,
+        };
         let Some((path, cursor)) = run.cursors.get_mut(&stream_id) else {
             continue;
         };
         let path = path.clone();
-        let pass = cursor.advance(&path, &stream_id, &identity, now);
+        let pass = cursor.advance_within(&path, &stream_id, &identity, now, limit);
         if let Some((reason, dropped)) = pass.gap {
             run.dropped_events = run.dropped_events.saturating_add(dropped);
             let record = run
                 .status(OutputCategory::Gap, now, Coverage::Degraded, RunState::Running)
                 .with_gap(reason, run.dropped_events);
+            out.push(record);
+        }
+        if pass.thinking_withheld > 0 {
+            run.dropped_events = run.dropped_events.saturating_add(pass.thinking_withheld);
+            let record = run
+                .status(OutputCategory::Gap, now, Coverage::Degraded, RunState::Running)
+                .with_gap(claude::THINKING_WITHHELD_REASON, run.dropped_events);
             out.push(record);
         }
         if !pass.records.is_empty() {

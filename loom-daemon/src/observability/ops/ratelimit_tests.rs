@@ -1,6 +1,7 @@
 //! Tests for rate-limit trips, quota gauges and breaker skips (#10022).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -8,6 +9,9 @@ use chrono::DateTime;
 
 use super::*;
 use crate::observability::ops::capture::capture;
+use crate::rate_limit_breaker::report::{
+    report_failure, BreakerHandle, BudgetProbe, FailureContext, ProbeMode,
+};
 use crate::rate_limit_breaker::{RateLimitBreakerConfig, SharedRateLimitBreaker};
 use crate::telemetry::ops::{
     MetricKind, MetricValue, OPS_METRIC_LABEL_KEYS, OPS_SPAN_ATTRIBUTE_KEYS,
@@ -79,17 +83,15 @@ fn jobs_are_a_closed_set_and_sources_classify_into_it() {
 
 #[test]
 fn a_trip_emits_one_span_with_source_cooldown_and_attribution() {
-    let b = breaker();
-    let (transition, captured) = capture(|| {
-        b.observe_failure_exported(
-            RL,
+    let ((), captured) = capture(|| {
+        crate::rate_limit_breaker::export_trip(
             "claim_reconciliation",
-            Some(budget(Some(5000), Some(28))),
-            || Some(ledger(98, 5)),
             t(0),
-        )
+            Some(t(1800)),
+            Some((&budget(Some(5000), Some(28)), true)),
+            || Some(ledger(98, 5)),
+        );
     });
-    let transition = transition.unwrap();
     assert_eq!(captured.spans.len(), 1);
     assert!(captured.metrics.is_empty());
     let span = &captured.spans[0];
@@ -97,7 +99,6 @@ fn a_trip_emits_one_span_with_source_cooldown_and_attribution() {
     let a = &span.attributes;
     assert_eq!(a["loom.ratelimit.source"], "claim_reconciliation");
     assert_eq!(a["loom.ratelimit.cooldown_until"], "2026-07-29T19:36:40Z");
-    assert_eq!(transition.until, Some(t(1800)));
     assert_eq!(a["github.ratelimit.core.used"], "5000");
     assert_eq!(a["github.ratelimit.core.own"], "98");
     assert_eq!(a["github.ratelimit.core.external"], "4902");
@@ -113,22 +114,71 @@ fn a_trip_emits_one_span_with_source_cooldown_and_attribution() {
     assert_eq!(span.clone().bounded().attributes, span.attributes, "survives export policy");
 }
 
+/// A probe that always answers `reading` (the #8997 report path's seam).
+struct FixedProbe(Option<BudgetSnapshot>);
+
+impl BudgetProbe for FixedProbe {
+    fn probe(&self, _ctx: &FailureContext, _now: DateTime<Utc>) -> Option<BudgetSnapshot> {
+        self.0
+    }
+}
+
+fn handle(reading: Option<BudgetSnapshot>) -> BreakerHandle {
+    BreakerHandle {
+        breaker: Arc::new(breaker()),
+        probe: Arc::new(FixedProbe(reading)),
+        mode: ProbeMode::Inline,
+    }
+}
+
 #[test]
-fn a_retrip_while_cooling_emits_no_second_span_and_reads_no_ledger() {
-    let b = breaker();
-    let ((), captured) = capture(|| {
-        b.observe_failure_exported(RL, "work_finder", None, || None, t(0))
-            .unwrap();
-        let again = b.observe_failure_exported(
-            RL,
-            "role_runner",
-            None,
-            || panic!("the ledger is read only for a fresh trip"),
-            t(10),
-        );
+fn a_reported_trip_exports_one_span_with_the_refined_cooldown() {
+    let h = handle(Some(budget(Some(5000), Some(28))));
+    let (transition, captured) = capture(|| {
+        let first = report_failure(&h, RL, "claim_reconciliation", FailureContext::default(), t(0))
+            .unwrap()
+            .transition;
+        // A re-trip while cooling is absorbed before any probe or export.
+        let again = report_failure(&h, RL, "role_runner", FailureContext::default(), t(10));
         assert!(again.is_none());
+        first
+    });
+    assert_eq!(transition.until, Some(t(1800)));
+    assert_eq!(captured.spans.len(), 1);
+    let a = &captured.spans[0].attributes;
+    assert_eq!(a["loom.ratelimit.source"], "claim_reconciliation");
+    assert_eq!(a["loom.ratelimit.cooldown_until"], "2026-07-29T19:36:40Z");
+    assert_eq!(a["github.ratelimit.core.used"], "5000");
+    assert_eq!(a["github.ratelimit.graphql.used"], "28");
+}
+
+#[test]
+fn an_untrusted_reading_exports_the_trip_without_attribution() {
+    // A primary rate-limit failure while the probe reads a non-exhausted
+    // budget: the reading is untrusted (#8997, likely another credential).
+    let mut reading = budget(Some(10), Some(28));
+    reading.core_remaining = 4990;
+    let h = handle(Some(reading));
+    let (reported, captured) = capture(|| {
+        report_failure(&h, RL, "work_finder", FailureContext::default(), t(0))
+    });
+    assert!(reported.is_some());
+    assert_eq!(captured.spans.len(), 1);
+    let a = &captured.spans[0].attributes;
+    assert_eq!(a["loom.ratelimit.source"], "work_finder");
+    assert!(a.contains_key("loom.ratelimit.cooldown_until"));
+    assert!(!a.keys().any(|k| k.starts_with("github.ratelimit.")), "{a:?}");
+}
+
+#[test]
+fn a_probe_without_a_reading_still_exports_the_trip() {
+    let h = handle(None);
+    let ((), captured) = capture(|| {
+        report_failure(&h, RL, "work_finder", FailureContext::default(), t(0)).unwrap();
     });
     assert_eq!(captured.spans.len(), 1);
+    let a = &captured.spans[0].attributes;
+    assert!(!a.keys().any(|k| k.starts_with("github.ratelimit.")), "{a:?}");
 }
 
 #[test]

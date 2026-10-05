@@ -1,0 +1,753 @@
+# fleet-delivery.toml — identity, quota, bootstrap and delivery profiles.
+#
+# The cross-cutting rows: who Loom is and what it may do (identity-authentication,
+# a NON-waivable group), how it measures and conserves quota, how a host or
+# worker repo gets bootstrapped, how fleet-config proposals and CI repairs write
+# git objects, how CI is diagnosed, and how releases/artifacts/images are
+# published and fetched.
+#
+# Delivery is deliberately a SEPARATE profile from landing: a delayed artifact
+# publication must never become a required merge check (#9769).
+
+# --- identity-authentication -------------------------------------------------
+
+[[operation]]
+id = "identity.viewer"
+group = "identity-authentication"
+summary = "Who am I, and what may I do in this repository?"
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["host"]
+# `provider` + `origin` are NOT decoration. A bare `login` is ambiguous the
+# moment a second forge exists — the same name can be two different accounts on
+# github.com and on a hosted Gitea — and an ambiguous identity is how a trust or
+# claim decision gets made against the wrong actor. The qualified identity is
+# (provider, origin, login), so both are required fields, not optional outputs.
+outputs = [
+  "provider",
+  "origin",
+  "login",
+  "id",
+  "account_type",
+  "viewer_permission",
+  "token_scopes",
+]
+required_fields = ["provider", "origin", "login", "viewer_permission"]
+actor = "daemon"
+permissions = ["metadata:read"]
+pagination = "not-paginated"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::identity-viewer"
+test_status = "declared"
+owner = "daemon-forge"
+risk = "high"
+high_risk_cases = ["revoked-permissions", "cross-origin-identity"]
+github = { commands = [
+  "gh auth status",
+  "gh repo view --json viewerPermission",
+], routes = [
+  "GET user",
+  "GET repos/{owner}/{repo}",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "a permission probe that FAILS must not read as `permitted`; #9769 states explicitly that unavailable permission/state is not an affirmative answer",
+  "whether a revoked write scope is reported at probe time or only at first write",
+]
+notes = "The qualified identity (provider + origin host + login) is what distinguishes two accounts with the same slug on different forges."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_identity.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/credential_preflight.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/credential_preflight/pool.rs"
+[[operation.callers]]
+kind = "installer"
+path = "scripts/install/validate-target.sh"
+
+[[operation]]
+id = "identity.actor-trust"
+group = "identity-authentication"
+summary = "Is this comment/verdict author a trusted actor for this repository?"
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "login"]
+outputs = ["login", "author_association", "permission", "is_bot"]
+required_fields = ["login", "permission"]
+actor = "daemon"
+permissions = ["metadata:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::identity-actor-trust"
+test_status = "declared"
+owner = "daemon-forge"
+risk = "high"
+high_risk_cases = ["cross-origin-identity", "revoked-permissions"]
+github = { commands = [], routes = [
+  "GET repos/{owner}/{repo}/collaborators/{login}/permission",
+  "GET users/{login}",
+] }
+platform_support = "unknown"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "GitHub authorAssociation is a GitHub contract to translate; a provider with a different role model changes who counts as trusted for an `ac-verified` or verdict marker",
+  "the same login string on two origins is NOT the same actor — trust decisions must key on provider+origin+login, never the bare slug",
+]
+notes = "comment_trust gates which markers Loom believes. A trust decision made on an unqualified login is exactly the cross-origin-identity failure."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/comment_trust.rs"
+
+[[operation]]
+id = "identity.app-installation-token"
+group = "identity-authentication"
+summary = "Mint a short-lived installation access token for a repository."
+profile = "optional"
+disposition = "optional"
+class = "write"
+inputs = ["app_id", "installation_id", "private_key_ref"]
+outputs = ["token", "expires_at", "permissions"]
+required_fields = []
+actor = "operator"
+permissions = ["app:installation"]
+pagination = "not-paginated"
+consistency = "read-after-write"
+idempotency = "not-idempotent"
+retry = "no-auto-retry"
+version_support = { github = "0" }
+test_id = "forge-probe::fleet-delivery::identity-app-installation-token"
+test_status = "declared"
+owner = "role-scripts"
+risk = "normal"
+github = { commands = [], routes = [
+  "GET repos/{owner}/{repo}/installation",
+  "POST app/installations/{id}/access_tokens",
+] }
+platform_support = "unsupported"
+adapter_coverage = "partial"
+caller_integration = "partial"
+exclusion_reason = "GitHub-App token minting is GitHub-specific (epic #4432's rate-limit protection). An alternate provider supplies scoped credentials by another mechanism; the REQUIREMENT it serves is `identity.viewer` + `identity.actor-trust`, which are required rows in their own right."
+preflight = "warn-and-disable"
+# `identity-authentication` is non-waivable. Declining App-token minting is
+# allowed only because the identity/trust requirement itself is carried by two
+# required rows — stated as data so the validator can check it, not just prose.
+requirement_carried_by = ["identity.viewer", "identity.actor-trust"]
+unknowns = [
+  "the equivalent short-lived-credential mechanism on a replacement provider, and whether its quota is pooled or per-credential",
+]
+notes = "Never record a token value in evidence. The accounting layer records provider/origin/repo identifiers only — see loom-daemon/src/forge_call_stats.rs."
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/lib/github-app-token.sh"
+
+# --- quota-caching-errors ----------------------------------------------------
+
+[[operation]]
+id = "quota.rate-limit-reading"
+group = "quota-caching-errors"
+summary = "Read the remaining budget and reset time for each rate-limit pool."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["host"]
+outputs = ["resource", "remaining", "limit", "reset_epoch"]
+required_fields = ["resource", "remaining"]
+actor = "daemon"
+permissions = ["metadata:read"]
+pagination = "not-paginated"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0" }
+test_id = "forge-probe::fleet-delivery::quota-rate-limit-reading"
+test_status = "implemented"
+test_path = "loom-daemon/src/forge_call_stats_tests.rs"
+owner = "daemon-forge"
+risk = "normal"
+github = { commands = [], routes = [
+  "GET rate_limit",
+  "HEADER x-ratelimit-resource/-remaining/-reset",
+] }
+platform_support = "documented"
+adapter_coverage = "complete"
+caller_integration = "complete"
+unknowns = [
+  "whether a provider exposes per-pool budget at all; a provider with no quota headers makes the breaker's probe the only signal, and a mixed fleet must keep the two providers' budgets isolated",
+]
+notes = "Free: the headers ride along on every REST response including 304s, so reading them costs no extra call."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/rate_limit_breaker.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_call_stats.rs"
+
+[[operation]]
+id = "quota.conditional-read"
+group = "quota-caching-errors"
+summary = "Conditional GET with If-None-Match, so an unchanged listing costs no budget."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["route", "etag"]
+outputs = ["status", "etag", "body"]
+required_fields = ["status", "etag"]
+actor = "daemon"
+permissions = ["metadata:read"]
+pagination = "complete-required"
+consistency = "eventual"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::quota-conditional-read"
+test_status = "declared"
+owner = "daemon-forge"
+risk = "normal"
+github = { commands = [
+  "gh api --include",
+], routes = [
+  "GET <any REST route> with If-None-Match",
+] }
+platform_support = "unknown"
+adapter_coverage = "complete"
+caller_integration = "partial"
+unknowns = [
+  "whether a provider emits stable ETags and honours If-None-Match with a free 304; without it the whole poll-reduction design degrades to full reads",
+  "`gh` exits non-zero on a 304, so the STATUS LINE and not the exit code must decide — any new transport has to preserve that distinction",
+]
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_etag_store.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_listing.rs"
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/gh-cached"
+
+[[operation]]
+id = "quota.error-classification"
+group = "quota-caching-errors"
+summary = "Distinguish rate-limited, unauthorized, not-found, conflict and transient failures."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["status", "headers", "stderr", "exit_code"]
+outputs = ["class"]
+required_fields = ["class"]
+actor = "daemon"
+permissions = []
+pagination = "not-paginated"
+consistency = "eventual"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::quota-error-classification"
+test_status = "declared"
+owner = "daemon-forge"
+risk = "high"
+high_risk_cases = ["revoked-permissions"]
+github = { commands = [], routes = [] }
+platform_support = "documented"
+adapter_coverage = "complete"
+caller_integration = "partial"
+unknowns = [
+  "unknown vs empty, authorization-failure vs not-found, complete vs truncated, conflict vs transient — #9769 requires all four distinctions preserved; a provider that returns 404 for `no permission` makes a revoked scope look like a deleted issue",
+]
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/rate_limit_breaker.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_parser.rs"
+
+[[operation]]
+id = "telemetry.call-accounting"
+group = "quota-caching-errors"
+summary = "Record one forge call's operation, provider, origin, repo and caller — sanitized."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["operation", "provider", "origin", "repo", "caller", "pool", "outcome"]
+outputs = ["counts_by_caller_pool", "latest_budget_reading"]
+required_fields = ["caller", "pool", "outcome"]
+actor = "daemon"
+permissions = []
+pagination = "not-paginated"
+consistency = "eventual"
+idempotency = "idempotent"
+retry = "no-auto-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::telemetry-call-accounting"
+test_status = "implemented"
+test_path = "loom-daemon/src/forge_call_stats_tests.rs"
+owner = "daemon-forge"
+risk = "high"
+high_risk_cases = ["cross-origin-identity"]
+github = { commands = [], routes = [] }
+platform_support = "documented"
+adapter_coverage = "complete"
+caller_integration = "partial"
+unknowns = [
+  "runtime traces SUPPLEMENT the source inventory; a call never exercised in a trace is still an inventoried operation, so traces alone cannot establish exhaustiveness",
+]
+notes = "Makes no forge call itself. Records bounded, sanitized metadata plus status/completeness — never authentication headers and never private response bodies. An operation the manifest does not know is recorded as `unknown` rather than dropped, so an unmapped caller is visible instead of invisible."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_call_stats.rs"
+
+# --- repository-discovery-creation -------------------------------------------
+
+[[operation]]
+id = "repo.view"
+group = "repository-discovery-creation"
+summary = "Read a repository's visibility, default branch and viewer permission."
+profile = "fleet-bootstrap"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo"]
+outputs = ["full_name", "visibility", "default_branch", "viewer_permission", "archived"]
+required_fields = ["full_name", "default_branch"]
+actor = "daemon"
+permissions = ["metadata:read"]
+pagination = "not-paginated"
+consistency = "eventual"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::repo-view"
+test_status = "declared"
+owner = "daemon-fleet"
+risk = "normal"
+github = { commands = [
+  "gh repo view",
+], routes = [
+  "GET repos/{owner}/{repo}",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = []
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/fleet/add_worker.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/gh_repo_env.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_wait_checks/reads.rs"
+
+[[operation]]
+id = "repo.list-for-owner"
+group = "repository-discovery-creation"
+summary = "List an org's or user's repositories for CI telemetry and fleet onboarding."
+profile = "fleet-bootstrap"
+disposition = "required"
+class = "read"
+inputs = ["owner", "owner_type"]
+outputs = ["full_name", "archived", "default_branch"]
+required_fields = ["full_name"]
+actor = "daemon"
+permissions = ["metadata:read"]
+pagination = "complete-required"
+consistency = "eventual"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::repo-list-for-owner"
+test_status = "declared"
+owner = "daemon-ci-telemetry"
+risk = "normal"
+github = { commands = [], routes = [
+  "GET users/{owner}/repos",
+  "GET orgs/{owner}/repos",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "an org vs user owner needs different routes on GitHub; a provider that unifies them (or does not distinguish orgs) changes the discovery call",
+]
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/ci_telemetry/owners.rs"
+
+[[operation]]
+id = "repo.create-and-clone"
+group = "repository-discovery-creation"
+summary = "Create a repository and clone it during bootstrap."
+profile = "fleet-bootstrap"
+disposition = "optional"
+class = "write"
+inputs = ["owner", "name", "visibility"]
+outputs = ["full_name", "clone_url"]
+required_fields = []
+actor = "operator"
+permissions = ["administration:write"]
+pagination = "not-paginated"
+consistency = "read-after-write"
+idempotency = "idempotent"
+retry = "no-auto-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::repo-create-and-clone"
+test_status = "declared"
+owner = "installer"
+risk = "normal"
+github = { commands = [
+  "gh repo create",
+  "gh repo clone",
+], routes = [
+  "POST user/repos",
+  "POST orgs/{owner}/repos",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+exclusion_reason = "Creating a brand-new repository is a bootstrap convenience; qualification targets Loom running on an EXISTING repository, and an operator can create one by hand."
+preflight = "warn-and-disable"
+unknowns = []
+[[operation.callers]]
+kind = "installer"
+path = "scripts/install-loom.sh"
+[[operation.callers]]
+kind = "role-prompt"
+path = "defaults/.claude/commands/loom/imagine.md"
+
+# --- git-objects-remote-writes -----------------------------------------------
+
+[[operation]]
+id = "git.read-objects"
+group = "git-objects-remote-writes"
+summary = "Read a commit, ref, tree, blob or file content via the forge API."
+profile = "fleet-bootstrap"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "ref", "path"]
+outputs = ["sha", "tree_sha", "content", "encoding", "committed_at"]
+required_fields = ["sha"]
+actor = "daemon"
+permissions = ["contents:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::git-read-objects"
+test_status = "declared"
+owner = "daemon-fleet"
+risk = "normal"
+github = { commands = [], routes = [
+  "GET repos/{owner}/{repo}/commits/{ref}",
+  "GET repos/{owner}/{repo}/git/ref/{ref}",
+  "GET repos/{owner}/{repo}/git/trees/{sha}",
+  "GET repos/{owner}/{repo}/contents/{path}",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "base64 content encoding and size limits; fleet_store reads config blobs this way rather than cloning",
+]
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/fleet_store/fetch.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/fleet_store/gh.rs"
+
+[[operation]]
+id = "git.write-refs-and-contents"
+group = "git-objects-remote-writes"
+summary = "Create a ref/commit or PUT file content remotely, guarded by a known base SHA."
+profile = "fleet-bootstrap"
+disposition = "required"
+class = "write"
+inputs = ["owner", "repo", "branch", "base_sha", "path", "content", "message"]
+outputs = ["commit_sha", "ref"]
+required_fields = ["commit_sha"]
+actor = "daemon"
+permissions = ["contents:write"]
+pagination = "not-paginated"
+consistency = "read-after-write"
+idempotency = "expected-head-guarded"
+retry = "reread-then-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::git-write-refs-and-contents"
+test_status = "declared"
+owner = "daemon-fleet"
+risk = "high"
+high_risk_cases = ["expected-head-merge"]
+github = { commands = [], routes = [
+  "POST repos/{owner}/{repo}/git/refs",
+  "POST repos/{owner}/{repo}/git/commits",
+  "PATCH repos/{owner}/{repo}/git/refs/heads/{branch}",
+  "PUT repos/{owner}/{repo}/contents/{path}",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "whether a ref update can be made non-fast-forward-safe only with an expected-SHA precondition; redate and fleet-config propose both rely on losing a race rather than overwriting",
+]
+notes = "Native Git can replace these, but only if the branch/SHA guards are preserved — an unguarded push is not an equivalent implementation."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/fleet_store/propose/mod.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/merge_pr/redate.rs"
+
+# --- ci-diagnostics-remediation ----------------------------------------------
+
+[[operation]]
+id = "ci.run-logs-and-artifacts"
+group = "ci-diagnostics-remediation"
+summary = "Download failed-job logs and artifacts for CI diagnosis."
+profile = "optional"
+disposition = "optional"
+class = "read"
+inputs = ["owner", "repo", "run_id", "job_id"]
+outputs = ["log_text", "artifact_name", "artifact_bytes"]
+required_fields = []
+actor = "daemon"
+permissions = ["actions:read"]
+pagination = "complete-required"
+consistency = "eventual"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::ci-run-logs-and-artifacts"
+test_status = "declared"
+owner = "daemon-ci-telemetry"
+risk = "normal"
+github = { commands = [
+  "gh run view --log-failed",
+  "gh run download",
+], routes = [
+  "GET repos/{owner}/{repo}/actions/runs/{id}/logs",
+  "GET repos/{owner}/{repo}/actions/artifacts",
+] }
+platform_support = "unknown"
+adapter_coverage = "partial"
+caller_integration = "partial"
+exclusion_reason = "Log and artifact retrieval improves CI diagnosis (ci_telemetry, Doctor's failure reading) but no lifecycle decision blocks on it: the pass/fail verdict comes from `ci.check-runs-for-sha`."
+preflight = "warn-and-disable"
+unknowns = [
+  "log retention and whether a failed job's log is reachable after the run expires",
+]
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/ci_telemetry/logs.rs"
+
+[[operation]]
+id = "ci.rerun"
+group = "ci-diagnostics-remediation"
+summary = "Re-run a failed workflow run."
+profile = "optional"
+disposition = "optional"
+class = "write"
+inputs = ["owner", "repo", "run_id"]
+outputs = ["run_id", "status"]
+required_fields = []
+actor = "daemon"
+permissions = ["actions:write"]
+pagination = "not-paginated"
+consistency = "read-after-write"
+idempotency = "not-idempotent"
+retry = "no-auto-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::ci-rerun"
+test_status = "declared"
+owner = "daemon-ci-telemetry"
+risk = "normal"
+github = { commands = [
+  "gh run rerun",
+], routes = [
+  "POST repos/{owner}/{repo}/actions/runs/{id}/rerun",
+] }
+platform_support = "unknown"
+adapter_coverage = "none"
+caller_integration = "none"
+exclusion_reason = "Re-running CI is remediation, not a lifecycle requirement; Loom's CI policy is explicitly conservative (never cancel a distinct commit's run) and a rerun is an operator or Doctor action."
+preflight = "warn-and-disable"
+unknowns = []
+notes = "An observed `run cancel` in CI YAML is workflow-level concurrency policy, NOT general agent permission to cancel runs — see .loom/docs/ci-principles.md."
+[[operation.callers]]
+kind = "workflow"
+path = ".github/workflows/ci.yml"
+
+# --- releases-distribution ---------------------------------------------------
+
+[[operation]]
+id = "release.resolve-and-fetch"
+group = "releases-distribution"
+summary = "Resolve the latest release for a target and download/verify its artifact."
+profile = "delivery"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "tag", "asset_name"]
+outputs = ["tag_name", "published_at", "assets", "asset_digest"]
+required_fields = ["tag_name", "assets"]
+actor = "daemon"
+permissions = ["contents:read"]
+pagination = "complete-required"
+consistency = "eventual"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::release-resolve-and-fetch"
+test_status = "declared"
+owner = "daemon-delivery"
+risk = "normal"
+github = { commands = [
+  "gh release view",
+  "gh release download",
+], routes = [
+  "GET repos/{owner}/{repo}/releases/latest",
+  "GET repos/{owner}/{repo}/releases/tags/{tag}",
+  "GET repos/{owner}/{repo}/releases/assets/{id}",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "whether asset digests are exposed; self-update verifies the artifact before replacing a running binary, so a provider with no digest forces a different verification path",
+]
+notes = "Delivery profile on purpose: a delayed publication must never become a required merge check."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/release_resolve/resolve.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/release_fetch/fetch.rs"
+
+[[operation]]
+id = "release.publish"
+group = "releases-distribution"
+summary = "Create/edit a release and upload its assets; publish the container image."
+profile = "delivery"
+disposition = "required"
+class = "write"
+inputs = ["owner", "repo", "tag", "notes", "assets", "image_ref"]
+outputs = ["release_id", "html_url", "asset_ids"]
+required_fields = ["release_id"]
+actor = "ci-token"
+permissions = ["contents:write", "packages:write"]
+pagination = "not-paginated"
+consistency = "read-after-write"
+idempotency = "idempotent"
+retry = "no-auto-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::release-publish"
+test_status = "declared"
+owner = "ci-workflows"
+risk = "normal"
+github = { commands = [
+  "gh release create",
+  "gh release edit",
+  "gh release upload",
+], routes = [
+  "POST repos/{owner}/{repo}/releases",
+  "POST uploads/repos/{owner}/{repo}/releases/{id}/assets",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "container-registry publication (GHCR) is a separate service from the release API; a replacement forge's registry, auth and image-ref shape must be audited independently of its API coordination",
+]
+[[operation.callers]]
+kind = "workflow"
+path = ".github/workflows/release.yml"
+
+# --- optional-actions-roles-settings -----------------------------------------
+
+[[operation]]
+id = "actions.scheduled-role-workflows"
+group = "optional-actions-roles-settings"
+summary = "Run Loom's periodic support roles on provider-hosted cron workflows."
+profile = "optional"
+disposition = "optional"
+class = "write"
+inputs = ["workflow", "schedule", "token_permissions"]
+outputs = ["run_id"]
+required_fields = []
+actor = "ci-token"
+permissions = ["actions:write", "issues:write", "pull_requests:write"]
+pagination = "not-paginated"
+consistency = "eventual"
+idempotency = "not-idempotent"
+retry = "no-auto-retry"
+version_support = { github = "0" }
+test_id = "forge-probe::fleet-delivery::actions-scheduled-role-workflows"
+test_status = "declared"
+owner = "ci-workflows"
+risk = "normal"
+github = { commands = [], routes = [
+  "SCHEDULE .github/workflows/loom-*.yml",
+] }
+platform_support = "unknown"
+adapter_coverage = "none"
+caller_integration = "none"
+exclusion_reason = "Required role scheduling is satisfied by the daemon-native role runner (autonomous.roleRunner), which is provider-independent and is the preferred path anyway. The Actions cron workflows are disabled by default."
+preflight = "warn-and-disable"
+unknowns = [
+  "a provider whose scheduled workflows do not fire reliably (or at all) must not silently become the only scheduler for a required role",
+]
+[[operation.callers]]
+kind = "workflow"
+path = "defaults/optional/github-workflows/label-external-issues.yml"
+
+[[operation]]
+id = "settings.secrets-and-variables"
+group = "optional-actions-roles-settings"
+summary = "List repository secrets and variables for CI diagnostics."
+profile = "optional"
+disposition = "optional"
+class = "read"
+inputs = ["owner", "repo"]
+outputs = ["name", "updated_at"]
+required_fields = []
+actor = "operator"
+permissions = ["secrets:read", "actions:read"]
+pagination = "complete-required"
+consistency = "eventual"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::fleet-delivery::settings-secrets-and-variables"
+test_status = "declared"
+owner = "role-prompts"
+risk = "normal"
+github = { commands = [
+  "gh secret list",
+  "gh variable list",
+], routes = [
+  "GET repos/{owner}/{repo}/actions/secrets",
+  "GET repos/{owner}/{repo}/actions/variables",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+exclusion_reason = "Names-only listing used by Judge as a diagnostic when a workflow fails for a missing secret. No lifecycle decision depends on it, and VALUES are never read."
+preflight = "warn-and-disable"
+unknowns = []
+notes = "Lists NAMES only. A secret value must never appear in evidence, a log, or an issue/PR body."
+[[operation.callers]]
+kind = "role-prompt"
+path = "defaults/.claude/commands/loom/judge.md"

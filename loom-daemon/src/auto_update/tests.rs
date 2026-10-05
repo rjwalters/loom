@@ -96,6 +96,7 @@ fn test_config_reads_all_fields() {
             defer_deadline_secs: Some(7200),
             roll_stall_deadlines: Some(5),
             roll_stall_cooldown_secs: Some(10_800),
+            roll_window: roll_window::RollWindowConfig::default(),
         }
     );
 }
@@ -209,12 +210,9 @@ fn test_resolve_interval_and_settle_precedence() {
 
     // Config alone.
     let cfg = AutoUpdateConfig {
-        enabled: None,
         interval_secs: Some(300),
         settle_secs: Some(45),
-        defer_deadline_secs: None,
-        roll_stall_deadlines: None,
-        roll_stall_cooldown_secs: None,
+        ..AutoUpdateConfig::default()
     };
     assert_eq!(resolve_interval(&cfg), Duration::from_secs(300));
     assert_eq!(resolve_settle(&cfg), Duration::from_secs(45));
@@ -1094,6 +1092,7 @@ mod in_flight_gate;
 mod supersede_tick;
 // Unsatisfiable-drain detection (#8998) — same reason, same fixtures.
 mod roll_stall;
+mod roll_window_tick;
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

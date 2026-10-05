@@ -10,7 +10,19 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Output;
+use std::time::Duration;
+
+use crate::forge_call_stats::{ops, ForgeOp};
+use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
+use crate::proc_exec::Completion;
+
+/// Deadline for one `gh api` read (#10089: they were unbounded `.output()`s).
+/// Generous because a job-log document can be several MB.
+const API_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Deadline for one `gh run download` (redirect + blob fetch + unzip).
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A successful (2xx) or not-modified (304) response.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -227,6 +239,41 @@ fn repo_of_path(path: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
+/// The inventoried forge operation one poller request serves (#9831).
+///
+/// [`ApiClient`] is a path-level trait, so the operation is read off the route
+/// the request names — the same route strings the inventory rows list under
+/// `github.routes` (`defaults/forge/operations/*.toml`), not a guess about the
+/// caller. A route the inventory has no row for records `unknown`, with the
+/// reason next to it.
+fn ci_operation(path: &str) -> ForgeOp {
+    let path = path.trim_start_matches('/');
+    let route = path.split(['?', '#']).next().unwrap_or_default();
+    let segs: Vec<&str> = route.split('/').collect();
+    match segs.as_slice() {
+        // The poller's only GraphQL query is `story.rs`'s batched
+        // closing-issue-references lookup.
+        ["graphql"] => ops::PR_CLOSING_ISSUE_REFERENCES,
+        ["orgs" | "users", _, "repos"] => ops::REPO_LIST_FOR_OWNER,
+        // The run listing and the jobs of one run: the run-state reads the
+        // `ci.workflow-runs-for-sha` row covers (its callers list names this
+        // file).
+        ["repos", _, _, "actions", "runs"] | ["repos", _, _, "actions", "runs", _, "jobs"] => {
+            ops::CI_WORKFLOW_RUNS_FOR_SHA
+        }
+        ["repos", _, _, "actions", "jobs", _, "logs"]
+        | ["repos", _, _, "actions", "runs", _, "artifacts"]
+        | ["repos", _, _, "actions", "artifacts", ..] => ops::CI_RUN_LOGS_AND_ARTIFACTS,
+        ["users", _] => ForgeOp::uninventoried(
+            "owner-kind probe (org vs user) has no inventory row; repo.list-for-owner names the listing only",
+        ),
+        ["repos", _, _, "check-runs", _, "annotations"] => {
+            ForgeOp::uninventoried("check-run annotations have no inventory row")
+        }
+        _ => ForgeOp::uninventoried("route not mapped to an inventory row"),
+    }
+}
+
 /// Production client: one `gh api --include` subprocess per request.
 pub struct GhCliApi {
     gh_bin: PathBuf,
@@ -251,72 +298,85 @@ impl GhCliApi {
     /// the reader (until the reported reset, when there is one) and the same
     /// call is retried once on the writer's credential.
     fn run(&self, path: &str, extra: &[&str]) -> Result<ApiResponse, ApiError> {
+        use crate::forge_identity::Failure;
         let nwo = repo_of_path(path);
         let reader = nwo
             .as_deref()
             .and_then(|r| crate::forge_identity::read_credential(r, None));
-        if let (Some((dir, app_id)), Some(nwo)) = (reader, nwo.as_deref()) {
-            let first = self.run_once(path, extra, Some(&dir));
-            let (failure, app_until) = match &first {
-                Err(ApiError::RateLimited { reset_epoch, .. }) => (
-                    Some(crate::forge_identity::Failure::App),
-                    reset_epoch
-                        .and_then(|e| u64::try_from(e).ok())
-                        .map(|e| std::time::UNIX_EPOCH + std::time::Duration::from_secs(e)),
-                ),
-                Err(ApiError::Http { status: 401, .. }) => {
-                    (Some(crate::forge_identity::Failure::App), None)
+        // The shared reader → writer retry (#9872, `reader_then_writer`).
+        let attempt = crate::forge_identity::reader_then_writer(
+            reader.as_ref().map(|(dir, _)| dir.as_path()),
+            |dir, role| Ok::<_, std::convert::Infallible>(self.run_once(path, extra, dir, role)),
+            Result::is_ok,
+            |r| match r {
+                Err(ApiError::RateLimited { .. } | ApiError::Http { status: 401, .. }) => {
+                    Some(Failure::App)
                 }
                 Err(ApiError::Http {
                     status: 403 | 404, ..
-                }) => (Some(crate::forge_identity::Failure::Coverage), None),
-                _ => (None, None),
-            };
-            let Some(failure) = failure else {
-                return first;
-            };
-            let why = format!("ci_telemetry {path}");
-            if failure == crate::forge_identity::Failure::App {
-                crate::forge_identity::withdraw_after(&app_id, nwo, failure, app_until, &why);
-                return self.run_once(path, extra, None);
-            }
-            // Coverage only when the writer CAN read it: a real 404 (a deleted
-            // run) fails on both and must not withdraw the repo's reader.
-            let second = self.run_once(path, extra, None);
-            if second.is_ok() {
-                crate::forge_identity::withdraw_after(&app_id, nwo, failure, None, &why);
-            }
-            return second;
+                }) => Some(Failure::Coverage),
+                _ => None,
+            },
+            |failure, failed| {
+                let (Some((_, app_id)), Some(nwo)) = (&reader, nwo.as_deref()) else {
+                    return;
+                };
+                // A rate limit withdraws the reader until the reported reset.
+                let app_until = match (failure, failed) {
+                    (Failure::App, Err(ApiError::RateLimited { reset_epoch, .. })) => reset_epoch
+                        .and_then(|e| u64::try_from(e).ok())
+                        .map(|e| std::time::UNIX_EPOCH + std::time::Duration::from_secs(e)),
+                    _ => None,
+                };
+                let why = format!("ci_telemetry {path}");
+                crate::forge_identity::withdraw_after(app_id, nwo, failure, app_until, &why);
+            },
+        );
+        match attempt {
+            Ok(result) => result,
+            Err(never) => match never {},
         }
-        self.run_once(path, extra, None)
     }
 
     /// One `gh api --include …` invocation, under `reader_dir`'s credential
     /// when given, else the process's own.
+    ///
+    /// Built through [`GhInvocation`] (#10089): the facade records the call
+    /// under `ci_telemetry` in [`crate::forge_call_stats`] from the
+    /// `--include` status line and headers (the same
+    /// [`crate::forge_call_stats::classify`] the hand-rolled record call it
+    /// replaced used).
     fn run_once(
         &self,
         path: &str,
         extra: &[&str],
         reader_dir: Option<&std::path::Path>,
+        role: crate::forge_identity::IdentityRole,
     ) -> Result<ApiResponse, ApiError> {
-        let mut cmd = Command::new(&self.gh_bin);
-        cmd.arg("api").arg("--include");
-        for argument in extra {
-            cmd.arg(argument);
-        }
-        if let Some(dir) = reader_dir {
-            cmd.env("GH_CONFIG_DIR", dir);
-        }
-        cmd.arg(path).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let output = cmd.output().map_err(|e| {
-            ApiError::Transport(format!("could not run {}: {e}", self.gh_bin.display()))
-        })?;
+        let inv = GhInvocation::new(
+            Operation::new("ci_telemetry"),
+            AccessIntent::Read,
+            GhTarget::None,
+            API_TIMEOUT,
+        )
+        .forge_op(ci_operation(path))
+        // Accounting only: the repo the route names (never the credential).
+        .identity_scope(None, repo_of_path(path).as_deref())
+        .program(&self.gh_bin)
+        .args(["api", "--include"])
+        .args(extra)
+        .arg(path)
+        .identity_role(role)
+        .gh_config_dir(reader_dir);
+        // A reader attempt must not be outranked by an env token (#9872).
+        let inv = if role == crate::forge_identity::IdentityRole::Reader {
+            inv.without_token_env()
+        } else {
+            inv
+        };
+        let output = self.captured(inv, &format!("gh api {path}"), API_TIMEOUT)?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // #9251: per-caller accounting (a local write, never a forge call).
-        let base = crate::forge_listing::parse_http_response(&stdout);
-        let exit_ok = output.status.success();
-        crate::forge_call_stats::record_gh_api("ci_telemetry", base.as_ref(), exit_ok, &stderr);
         match parse_raw(&stdout) {
             Some(response) => classify(response, path),
             None if crate::rate_limit_breaker::indicates_rate_limit(&stderr) => {
@@ -330,6 +390,25 @@ impl GhCliApi {
                 "gh api {path} produced no HTTP response: {}",
                 bounded(&stderr)
             ))),
+        }
+    }
+
+    /// Execute `inv`: its output when `gh` ran to an exit (any status), else
+    /// a transport error naming `what` (could not start, or timed out).
+    fn captured(
+        &self,
+        inv: GhInvocation,
+        what: &str,
+        timeout: Duration,
+    ) -> Result<Output, ApiError> {
+        match inv.execute() {
+            Ok(GhCompletion::Captured(Completion::Exited(output))) => Ok(output),
+            Ok(_) => {
+                Err(ApiError::Transport(format!("{what} timed out after {}s", timeout.as_secs())))
+            }
+            Err(e) => {
+                Err(ApiError::Transport(format!("could not run {}: {e}", self.gh_bin.display())))
+            }
         }
     }
 }
@@ -386,22 +465,26 @@ terminal escapes will be refused by gh rather than captured (upgrade gh to captu
         name: &str,
         dest: &std::path::Path,
     ) -> Result<(), ApiError> {
-        let output = Command::new(&self.gh_bin)
-            .arg("run")
-            .arg("download")
-            .arg(run_id.to_string())
-            .arg("--repo")
-            .arg(repo)
-            .arg("--name")
-            .arg(name)
-            .arg("--dir")
-            .arg(dest)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| {
-                ApiError::Transport(format!("could not run {}: {e}", self.gh_bin.display()))
-            })?;
+        let inv = GhInvocation::new(
+            Operation::new("ci_telemetry.download"),
+            AccessIntent::Read,
+            // Not `GhTarget::repo`: that would switch the download onto the
+            // owner's registered credential; it keeps the ambient one.
+            GhTarget::None,
+            DOWNLOAD_TIMEOUT,
+        )
+        .forge_op(ops::CI_RUN_LOGS_AND_ARTIFACTS)
+        .identity_scope(None, Some(repo))
+        .program(&self.gh_bin)
+        .args(["run", "download"])
+        .arg(run_id.to_string())
+        .arg("--repo")
+        .arg(repo)
+        .arg("--name")
+        .arg(name)
+        .arg("--dir")
+        .arg(dest);
+        let output = self.captured(inv, &format!("gh run download {run_id}"), DOWNLOAD_TIMEOUT)?;
         if output.status.success() {
             return Ok(());
         }
@@ -422,7 +505,34 @@ terminal escapes will be refused by gh rather than captured (upgrade gh to captu
 
 #[cfg(test)]
 mod repo_of_path_tests {
-    use super::repo_of_path;
+    use super::{ci_operation, ops, repo_of_path};
+
+    #[test]
+    fn poller_routes_map_to_their_inventoried_operation() {
+        let cases = [
+            ("graphql", ops::PR_CLOSING_ISSUE_REFERENCES),
+            ("orgs/acme/repos?per_page=100&type=all", ops::REPO_LIST_FOR_OWNER),
+            ("users/me/repos?per_page=100", ops::REPO_LIST_FOR_OWNER),
+            (
+                "repos/o/r/actions/runs?per_page=100&created=%3E%3D1",
+                ops::CI_WORKFLOW_RUNS_FOR_SHA,
+            ),
+            ("repos/o/r/actions/runs/7/jobs?filter=all", ops::CI_WORKFLOW_RUNS_FOR_SHA),
+            ("repos/o/r/actions/jobs/9/logs", ops::CI_RUN_LOGS_AND_ARTIFACTS),
+            (
+                "/repos/o/r/actions/runs/7/artifacts?per_page=100",
+                ops::CI_RUN_LOGS_AND_ARTIFACTS,
+            ),
+            ("repos/o/r/actions/artifacts/3/zip", ops::CI_RUN_LOGS_AND_ARTIFACTS),
+        ];
+        for (path, op) in cases {
+            assert_eq!(ci_operation(path), op, "{path}");
+        }
+        // Deliberately unmapped routes stay `unknown`, never a wrong row.
+        for path in ["users/me", "repos/o/r/check-runs/5/annotations", "meta"] {
+            assert_eq!(ci_operation(path).id(), None, "{path}");
+        }
+    }
 
     #[test]
     fn repo_scoped_paths_name_their_repo_and_others_do_not() {

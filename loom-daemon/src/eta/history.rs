@@ -45,14 +45,21 @@
 //! leak-free ([`StageSamples::select`] enforces the second half by refusing
 //! every sample observed at or after `as_of`).
 //!
-//! The remaining half of #9343 — fleet-wide *in-sweep* (`sweep.curator`,
-//! `sweep.builder`) samples from SigNoz — is blocked on fleet workers
-//! exporting at all (harness-ops#249) and is deliberately not attempted here.
+//! The fleet-wide *in-sweep* half (#9758) is a second fleet producer,
+//! [`super::fleet_signoz`]: the fleet's own `sweep.outcome` records, pulled
+//! from SigNoz into a cached snapshot outside the estimator and handed in
+//! through [`StageSamples::push_outcome_facts`] — the same conversion the local
+//! journal uses — attributed to [`SampleSource::SignozOutcome`] and to the host
+//! that actually recorded each sweep.
 
 use super::{Stage, MAX_SAMPLES, MIN_SAMPLES, WINDOW_DAYS};
-use crate::telemetry::{SweepOutcomeRecord, SweepResult, TelemetryEnvelope, TelemetryRecord};
+use crate::telemetry::{
+    JudgeVerdict, PhaseDuration, SweepOutcomeRecord, SweepResult, TelemetryEnvelope,
+    TelemetryRecord,
+};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Bucket a sweep-outcome sample lands in when the record's `repo` slug was
@@ -77,6 +84,12 @@ pub enum SampleSource {
     /// watch. See [`SampleSource::admits`] for why that distinction is
     /// recorded without changing which samples a shipped heuristic accepts.
     ForgeTimeline,
+    /// The fleet's `sweep.outcome` records, read back from SigNoz (#9758).
+    ///
+    /// The same measurement as [`SampleSource::SweepOutcome`] — one sweep's
+    /// phase durations and whether it merged itself — recorded by whichever
+    /// host ran the sweep rather than only this one.
+    SignozOutcome,
 }
 
 impl SampleSource {
@@ -87,6 +100,7 @@ impl SampleSource {
             SampleSource::SweepOutcome => "sweep-outcome-telemetry.jsonl",
             SampleSource::StageJournal => "eta-stage-samples.jsonl",
             SampleSource::ForgeTimeline => "forge:pr-timeline",
+            SampleSource::SignozOutcome => "signoz:sweep.outcome",
         }
     }
 
@@ -107,11 +121,40 @@ impl SampleSource {
     /// never contains a [`Self::ForgeTimeline`] sample, so every local estimate
     /// is byte-identical to before. What changed is the history handed in, not
     /// the function — the property `eta` depends on for backtests.
+    ///
+    /// The second equivalence (#9758) is the in-sweep twin of the first: a
+    /// filter that asks for [`Self::SweepOutcome`] also accepts
+    /// [`Self::SignozOutcome`], because a fleet host's exported `sweep.outcome`
+    /// is the very record this host's own journal holds for its own sweeps. It
+    /// is deliberately one-directional and deliberately **not** extended to
+    /// [`Self::StageJournal`]: a stage-journal filter (`start-v1`) asks for
+    /// tracker-observed label transitions, and a sweep's phase durations are
+    /// not that measurement.
     #[must_use]
     pub fn admits(self, source: SampleSource) -> bool {
         self == source
             || (self == SampleSource::StageJournal && source == SampleSource::ForgeTimeline)
+            || (self == SampleSource::SweepOutcome && source == SampleSource::SignozOutcome)
     }
+}
+
+/// The facts of one `sweep.outcome` that become history, independent of where
+/// the record was read from (#9758): this host's journal
+/// ([`StageSamples::push_outcome`]) or the fleet's SigNoz export
+/// ([`super::fleet_signoz`]). One conversion, so the two producers cannot
+/// drift on which phases count, the whole-sweep fallback, or the worked rule.
+#[derive(Debug, Clone, Copy)]
+pub struct OutcomeFacts<'a> {
+    /// `owner/repo`, `None` when the slug was unresolved.
+    pub repo: Option<&'a str>,
+    /// The sweep's result.
+    pub result: SweepResult,
+    /// Whole-sweep seconds.
+    pub total_duration_sec: i64,
+    /// Per-phase durations.
+    pub phase_durations: &'a [PhaseDuration],
+    /// Judge verdicts to record, or `None` to record none.
+    pub judge_verdicts: Option<&'a [JudgeVerdict]>,
 }
 
 /// One observed stage duration. A sample in [`StageSamples::censored`] is the
@@ -210,11 +253,29 @@ pub struct StageSamples {
     pub verdicts: Vec<VerdictSample>,
     /// Successful sweep paths.
     pub paths: Vec<SweepPathSample>,
+    /// The base `land` heuristic's past estimates and their landings
+    /// (#10207), read only by the recalibrating heuristic's point-in-time
+    /// [`super::recalibrate::fit_table`]. Built outside the estimator — the
+    /// daemon's ETA pass from its outcome log and pending store, `eta
+    /// backtest` from a replay — and empty everywhere else, so no other
+    /// heuristic's estimate can change by construction.
+    pub calibration: Vec<super::recalibrate::CalibrationObservation>,
+    /// Stage episodes (#10218): the split stage record a hold-aware heuristic
+    /// fits, `merge_hold` and hold-free `merge_wait` included. Read only
+    /// through [`Self::select_episodes`]; no shipped heuristic reads it, so
+    /// adding it changes no shipped estimate.
+    pub episodes: Vec<super::episodes::StageEpisode>,
     /// Whose history this is (#9343): `Local` when every sample came from
     /// this host's own journals, `Fleet` as soon as one host-independent
     /// (forge-derived) sample is in it. [`Self::merge`] is the only thing that
     /// ever raises it, and it never lowers it.
     pub scope: super::explanation::HistoryScope,
+    /// `(host_id, sweep_id)` of every local `sweep.outcome` folded in by
+    /// [`Self::push_outcome`] (#9758). Not read by any estimator: it is how
+    /// `historyScope = augment` keeps a sweep this host journalled **and** the
+    /// fleet exported to SigNoz from contributing twice
+    /// ([`super::fleet::apply_scope`]).
+    pub outcome_keys: BTreeSet<(String, String)>,
 }
 
 /// Which level a selection was made at.
@@ -269,6 +330,30 @@ fn in_window(observed_at: DateTime<Utc>, as_of: DateTime<Utc>) -> bool {
     observed_at < as_of && observed_at >= window_from(as_of)
 }
 
+/// The [`Selection`] over `picked`, whose durations (ascending) are `sorted`.
+pub(super) fn selection_of(
+    level: Level,
+    sorted: Vec<i64>,
+    picked: &[&StageSample],
+    excluded_unworked: usize,
+) -> Selection {
+    let mut by_source = std::collections::BTreeMap::new();
+    let mut by_host = std::collections::BTreeMap::new();
+    for sample in picked {
+        *by_source
+            .entry(sample.source.journal().to_string())
+            .or_insert(0) += 1;
+        *by_host.entry(sample.host.clone()).or_insert(0) += 1;
+    }
+    Selection {
+        level,
+        sorted,
+        by_source,
+        by_host,
+        excluded_unworked,
+    }
+}
+
 fn same_repo(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
@@ -321,6 +406,9 @@ impl StageSamples {
         self.censored.extend(other.censored);
         self.verdicts.extend(other.verdicts);
         self.paths.extend(other.paths);
+        self.calibration.extend(other.calibration);
+        self.episodes.extend(other.episodes);
+        self.outcome_keys.extend(other.outcome_keys);
         if other.scope == HistoryScope::Fleet {
             self.scope = HistoryScope::Fleet;
         }
@@ -340,19 +428,41 @@ impl StageSamples {
         observed_at: DateTime<Utc>,
         host: &str,
     ) {
-        let fallback = record.phase_durations.len() == 1
-            && record.phase_durations[0].duration_sec == record.total_duration_sec
-            && record.total_duration_sec > 0;
+        self.outcome_keys
+            .insert((host.to_string(), record.sweep_id.clone()));
+        let facts = OutcomeFacts {
+            repo: record.repo.as_deref(),
+            result: record.result,
+            total_duration_sec: record.total_duration_sec,
+            phase_durations: &record.phase_durations,
+            judge_verdicts: record.judge_verdicts.as_deref(),
+        };
+        self.push_outcome_facts(&facts, observed_at, host, SampleSource::SweepOutcome);
+    }
+
+    /// Add every sample one outcome's `facts` carry, observed at
+    /// `observed_at`, recorded by `host`, attributed to `source` — the one
+    /// conversion both outcome producers share (#9758).
+    pub fn push_outcome_facts(
+        &mut self,
+        facts: &OutcomeFacts<'_>,
+        observed_at: DateTime<Utc>,
+        host: &str,
+        source: SampleSource,
+    ) {
+        let phases = facts.phase_durations;
+        let fallback = phases.len() == 1
+            && phases[0].duration_sec == facts.total_duration_sec
+            && facts.total_duration_sec > 0;
         // Issue #9442: a record whose slug could not be resolved carries no
         // `repo`. The ETA samples condition per-repo, so they bucket under one
         // shared sentinel — strictly better than the pre-#9442 behavior, where
         // the leaked workspace PATH made every host its own pseudo-repo.
-        let repo = record
+        let repo = facts
             .repo
-            .clone()
-            .unwrap_or_else(|| UNRESOLVED_REPO_BUCKET.to_string());
+            .map_or_else(|| UNRESOLVED_REPO_BUCKET.to_string(), str::to_string);
         if !fallback {
-            for phase in &record.phase_durations {
+            for phase in phases {
                 if let Some(stage) = Stage::from_sweep_phase(&phase.phase) {
                     if phase.duration_sec >= 0 {
                         self.stages.push(StageSample {
@@ -360,7 +470,7 @@ impl StageSamples {
                             stage,
                             duration_sec: phase.duration_sec,
                             observed_at,
-                            source: SampleSource::SweepOutcome,
+                            source,
                             host: host.to_string(),
                             worked: worked_phase(stage, phase.duration_sec),
                         });
@@ -368,7 +478,7 @@ impl StageSamples {
                 }
             }
         }
-        for verdict in record.judge_verdicts.iter().flatten() {
+        for verdict in facts.judge_verdicts.into_iter().flatten() {
             let rejected = match verdict.verdict.as_str() {
                 "fail" => true,
                 "pass" => false,
@@ -381,10 +491,10 @@ impl StageSamples {
                 observed_at,
             });
         }
-        if record.result == SweepResult::Success {
+        if facts.result == SweepResult::Success {
             self.paths.push(SweepPathSample {
                 repo,
-                merged_in_sweep: record.phase_durations.iter().any(|p| p.phase == "merge"),
+                merged_in_sweep: phases.iter().any(|p| p.phase == "merge"),
                 observed_at,
             });
         }
@@ -459,6 +569,26 @@ impl StageSamples {
         sources: &[SampleSource],
         min_samples: usize,
     ) -> Option<Selection> {
+        let (level, picked, excluded_unworked) =
+            self.pick_observed(repo, stage, as_of, sources, min_samples)?;
+        let mut sorted: Vec<i64> = picked.iter().map(|s| s.duration_sec).collect();
+        sorted.sort_unstable();
+        Some(selection_of(level, sorted, &picked, excluded_unworked))
+    }
+
+    /// The observed samples [`Self::select_at`] summarises, before they are
+    /// reduced to durations: the level they resolved at, the picked samples
+    /// (most recent first, capped at [`MAX_SAMPLES`]) and the unworked count.
+    /// Shared with the recency-weighted selection (#10209), which needs each
+    /// sample's `observed_at` to weigh it.
+    pub(super) fn pick_observed(
+        &self,
+        repo: &str,
+        stage: Stage,
+        as_of: DateTime<Utc>,
+        sources: &[SampleSource],
+        min_samples: usize,
+    ) -> Option<(Level, Vec<&StageSample>, usize)> {
         for level in [Level::Repo, Level::Host] {
             let in_scope = |s: &&StageSample| {
                 s.stage == stage
@@ -486,23 +616,7 @@ impl StageSamples {
                     .then(a.duration_sec.cmp(&b.duration_sec))
             });
             picked.truncate(MAX_SAMPLES);
-            let mut sorted: Vec<i64> = picked.iter().map(|s| s.duration_sec).collect();
-            sorted.sort_unstable();
-            let mut by_source = std::collections::BTreeMap::new();
-            let mut by_host = std::collections::BTreeMap::new();
-            for sample in &picked {
-                *by_source
-                    .entry(sample.source.journal().to_string())
-                    .or_insert(0) += 1;
-                *by_host.entry(sample.host.clone()).or_insert(0) += 1;
-            }
-            return Some(Selection {
-                level,
-                sorted,
-                by_source,
-                by_host,
-                excluded_unworked,
-            });
+            return Some((level, picked, excluded_unworked));
         }
         None
     }
@@ -527,6 +641,22 @@ impl StageSamples {
         sources: &[SampleSource],
         level: Level,
     ) -> Vec<i64> {
+        let picked = self.pick_censored(repo, stage, as_of, sources, level);
+        let mut sorted: Vec<i64> = picked.iter().map(|s| s.duration_sec).collect();
+        sorted.sort_unstable();
+        sorted
+    }
+
+    /// The censored samples [`Self::select_censored`] summarises, most recent
+    /// first and capped, before they are reduced to durations.
+    pub(super) fn pick_censored(
+        &self,
+        repo: &str,
+        stage: Stage,
+        as_of: DateTime<Utc>,
+        sources: &[SampleSource],
+        level: Level,
+    ) -> Vec<&StageSample> {
         let mut picked: Vec<&StageSample> = self
             .censored
             .iter()
@@ -546,9 +676,38 @@ impl StageSamples {
                 .then(a.duration_sec.cmp(&b.duration_sec))
         });
         picked.truncate(MAX_SAMPLES);
-        let mut sorted: Vec<i64> = picked.iter().map(|s| s.duration_sec).collect();
-        sorted.sort_unstable();
-        sorted
+        picked
+    }
+
+    /// The stage episodes (#10218) of `stage` for `repo`, as a derivation cut
+    /// at `as_of` would have produced them
+    /// ([`super::episodes::StageEpisode::view_at`]), in canonical order.
+    ///
+    /// The window rule of [`Self::select`], applied to episodes: every
+    /// returned fact was observed strictly before `as_of`. An episode that had
+    /// not started is absent; one that ended before `as_of` is as stored; one
+    /// still running at `as_of` comes back open (censored) at `as_of`, never
+    /// with its later exit. A completed or cut-short episode that ended
+    /// before the window opens is dropped; one still running is kept, however
+    /// old its entry, because it is live evidence at `as_of`.
+    #[must_use]
+    pub fn select_episodes(
+        &self,
+        repo: &str,
+        stage: Stage,
+        as_of: DateTime<Utc>,
+    ) -> Vec<super::episodes::StageEpisode> {
+        let from = window_from(as_of);
+        let mut picked: Vec<super::episodes::StageEpisode> = self
+            .episodes
+            .iter()
+            .filter(|e| e.stage == stage && same_repo(&e.repo, repo))
+            .filter_map(|e| e.view_at(as_of))
+            .filter(|e| e.ended_at().is_none_or(|at| at >= from))
+            .collect();
+        picked.sort_by_key(super::episodes::StageEpisode::key);
+        picked.dedup();
+        picked
     }
 
     /// Verdict counts `(n, rejected)` per attempt `1..=cap` at `level`,
@@ -577,6 +736,27 @@ impl StageSamples {
             }
         }
         counts
+    }
+
+    /// `(n, approved)` over the first Judge verdicts (attempt 1) of `repo`
+    /// observed in the window before `as_of`: the numerator of the repo's
+    /// first-pass approval rate (#10231). Strictly before `as_of`, by each
+    /// verdict's own `observed_at` (when it was recorded), never by when the
+    /// PR merged. Counts every feeder of [`StageSamples::verdicts`]:
+    /// `sweep.outcome` in-sweep verdicts, external Judge verdicts from the
+    /// stage journal (tracker label transitions and `eta backfill` rows), and
+    /// fleet-snapshot verdicts under fleet history scope. Samples carry no
+    /// source tag, so this cannot (and does not) restrict to one feeder.
+    #[must_use]
+    pub fn first_pass_approval(&self, repo: &str, as_of: DateTime<Utc>) -> Option<(usize, usize)> {
+        let (n, approved) = self
+            .verdicts
+            .iter()
+            .filter(|v| {
+                v.attempt == 1 && same_repo(&v.repo, repo) && in_window(v.observed_at, as_of)
+            })
+            .fold((0_usize, 0_usize), |(n, ok), v| (n + 1, ok + usize::from(!v.rejected)));
+        (n > 0).then_some((n, approved))
     }
 
     /// `(merged-in-sweep share, n)` of the successful sweeps observed in the

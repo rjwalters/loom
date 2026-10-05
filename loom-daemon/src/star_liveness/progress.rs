@@ -12,6 +12,11 @@
 //!   which a push, a review or a CI-driven relabel moves; a push moving the
 //!   head SHA always moves `updated_at` too);
 //! - a stage change;
+//! - for a `no-capacity` row the work finder queued (#10214), its position in
+//!   the host's starred queue moving forward: work ahead was dispatched (or
+//!   unstarred), so the queue is draining, not stalled. A queued row that does
+//!   escalate names its deferral reason, its position, the cap and what limits
+//!   the cap, never just "the work-finder";
 //! - a trusted comment on the issue, including the sweep's lease comment,
 //!   whose forge-assigned `updated_at` a live sweep renews every ~5 minutes
 //!   ([`latest_comment_activity`]). So a long Builder phase with a live lease
@@ -39,7 +44,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::types::{AskKind, LandingStage, OperatorAsk};
+use crate::types::{AskKind, CapacityWait, LandingStage, OperatorAsk};
 
 /// A progress fingerprint: the forge-visible state of the issue and its PR,
 /// flattened. Identical on every host that reads the same forge.
@@ -96,6 +101,8 @@ struct Entry {
     stage_since: DateTime<Utc>,
     fingerprint: String,
     progress_at: DateTime<Utc>,
+    /// The queue position last seen (#10214), for a queued row.
+    position: Option<u32>,
 }
 
 /// What [`Tracker::observe`] returns for one row.
@@ -112,13 +119,16 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    /// Record this pass's stage and fingerprint for (`repo`, `issue`).
+    /// Record this pass's stage, fingerprint and (for a queued row) queue
+    /// position for (`repo`, `issue`). A position that moved forward is
+    /// progress (#10214).
     pub fn observe(
         &mut self,
         repo: &str,
         issue: u32,
         stage: LandingStage,
         fingerprint: &str,
+        position: Option<u32>,
         now: DateTime<Utc>,
     ) -> Observation {
         let e = self
@@ -129,6 +139,7 @@ impl Tracker {
                 stage_since: now,
                 fingerprint: fingerprint.to_string(),
                 progress_at: now,
+                position,
             });
         if e.stage != stage {
             e.stage = stage;
@@ -139,6 +150,12 @@ impl Tracker {
             e.fingerprint = fingerprint.to_string();
             e.progress_at = now;
         }
+        if let (Some(was), Some(is)) = (e.position, position) {
+            if is < was {
+                e.progress_at = now;
+            }
+        }
+        e.position = position;
         Observation {
             stage_since: e.stage_since,
             progress_at: e.progress_at,
@@ -178,6 +195,8 @@ pub struct Watched<'a> {
     pub next_actor: &'a str,
     pub fingerprint: &'a str,
     pub progress_at: DateTime<Utc>,
+    /// A `no-capacity` row's structured wait (#10214).
+    pub wait: Option<&'a CapacityWait>,
 }
 
 /// The watchdog verdict for one row: an escalation when an agent-owned
@@ -193,16 +212,37 @@ pub fn watchdog(w: &Watched<'_>, now: DateTime<Utc>, window: Duration) -> Option
     }
     let minutes = idle.as_secs() / 60;
     let (repo, issue, actor) = (w.repo, w.issue, w.next_actor);
+    let key = format!("{}:{}", AskKind::NoProgress.as_str(), short_hash(w.fingerprint));
+    let since = w
+        .progress_at
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    if let Some(wait) = w.wait.filter(|_| w.stage == LandingStage::NoCapacity) {
+        let moving = if wait.queued() {
+            format!("the queue ahead of it has not advanced since {since}")
+        } else {
+            format!("no host has taken it since {since}")
+        };
+        return Some(OperatorAsk {
+            kind: AskKind::NoProgress,
+            key,
+            text: format!(
+                "{repo}#{issue} is starred but has waited {minutes} min for a slot: it is {} (deferred: {}), and {moving}. {} (last seen: {}).",
+                wait.summary(),
+                wait.limit_phrase(),
+                super::queue::advice(wait),
+                w.fingerprint,
+            ),
+        });
+    }
     Some(OperatorAsk {
         kind: AskKind::NoProgress,
-        key: format!("{}:{}", AskKind::NoProgress.as_str(), short_hash(w.fingerprint)),
+        key,
         text: format!(
             "{repo}#{issue} is starred but has made no forward progress for {minutes} min: it \
              has been `{}` since {} (next actor: {actor}; last seen: {}). Check why the \
              {actor} is not moving it.",
             w.stage.as_str(),
-            w.progress_at
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            since,
             w.fingerprint,
         ),
     })

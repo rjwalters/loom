@@ -54,8 +54,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use loom_daemon::merge_pr::stacked_children::{
-    blocked_message, children_json, decide, discover_open_children, establish_pin, parse_children,
-    pinned_message, Child, Inputs, Outcome,
+    blocked_message, children_json, decide, discover_open_children, invalid_ref_message,
+    parse_children, pinned_message, try_establish_pin, Child, Inputs, Outcome, PinRefusal,
 };
 
 #[derive(clap::Args)]
@@ -141,13 +141,26 @@ impl StackedChildrenArgs {
                 Ok(())
             }
             Outcome::NeedsPin => {
-                if establish_pin(&self.repo_root, &self.branch, &self.head_sha) {
-                    println!("PIN-WRITTEN");
-                    print!("{}", render("WARNING", &pinned_message(&inputs)));
-                    Ok(())
-                } else {
-                    print!("{}", render("BLOCK", &blocked_message(&inputs)));
-                    std::process::exit(1);
+                match try_establish_pin(&self.repo_root, &self.branch, &self.head_sha) {
+                    Ok(()) => {
+                        println!("PIN-WRITTEN");
+                        print!("{}", render("WARNING", &pinned_message(&inputs)));
+                        Ok(())
+                    }
+                    // #9106/#9479. Both arms BLOCK and exit 1 — the behaviour
+                    // the boolean `establish_pin` already had — but an unsafe
+                    // ref operand gets its own text: `blocked_message` would
+                    // send the operator to reconcile the children or reach for
+                    // --allow-stacked-children, and neither can fix a name git
+                    // would re-parse as a switch.
+                    Err(PinRefusal::InvalidRef(e)) => {
+                        print!("{}", render("BLOCK", &invalid_ref_message(&self.pr, &e)));
+                        std::process::exit(1);
+                    }
+                    Err(_) => {
+                        print!("{}", render("BLOCK", &blocked_message(&inputs)));
+                        std::process::exit(1);
+                    }
                 }
             }
         }

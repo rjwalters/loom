@@ -1324,8 +1324,6 @@ impl ForgeCiStatus for GhForgeCi {
     fn conclusion_for(&self, repo_root: &Path, sha: &str) -> CiVerdict {
         let limit = CI_PROBE_RUN_LIMIT.to_string();
         let args = [
-            "run",
-            "list",
             "--branch",
             GATE_BRANCH,
             "--limit",
@@ -1333,13 +1331,14 @@ impl ForgeCiStatus for GhForgeCi {
             "--json",
             "headSha,status,conclusion,workflowName",
         ];
-        let stdout = match run_capture_with_timeout("gh", &args, repo_root, CI_PROBE_TIMEOUT) {
-            Ok(s) => s,
-            Err(e) => {
-                log::debug!("main_health_gate: forge CI probe unavailable ({e})");
-                return CiVerdict::Unknown;
-            }
-        };
+        let stdout =
+            match crate::gh_state_probe::run_list_stdout(repo_root, &args, CI_PROBE_TIMEOUT) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::debug!("main_health_gate: forge CI probe unavailable ({e})");
+                    return CiVerdict::Unknown;
+                }
+            };
         parse_gh_run_list(&stdout, sha, self.ci_workflow.as_deref())
     }
 }
@@ -1912,7 +1911,9 @@ fn diff_touches_globs(
     // idempotent fetch. The caller already knows `main` moved, so this is not
     // extra work beyond what a real run would have paid anyway.
     let _ = Command::new("git")
-        .args(["fetch", GATE_REMOTE, GATE_BRANCH])
+        // `--` before the ref operand (#9106 mitigation B, #9479) — both names
+        // are crate constants here, so this is form, not a live exposure.
+        .args(["fetch", GATE_REMOTE, "--", GATE_BRANCH])
         .current_dir(repo_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2457,7 +2458,8 @@ pub fn prepare_workspace_to_origin_main(repo_root: &Path) -> PrepOutcome {
     }
 
     // 3. Fetch origin/main.
-    if let Err(e) = run_git(repo_root, &["fetch", GATE_REMOTE, GATE_BRANCH]) {
+    // `--` before the ref operand (#9106 mitigation B, #9479).
+    if let Err(e) = run_git(repo_root, &["fetch", GATE_REMOTE, "--", GATE_BRANCH]) {
         return PrepOutcome::Skip {
             class: UnevaluatedClass::GitFailure,
             reason: format!(

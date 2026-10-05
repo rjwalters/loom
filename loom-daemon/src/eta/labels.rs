@@ -1,6 +1,7 @@
 //! Stage resolution from forge labels (pure). An issue or PR whose labels say
 //! it is held, gated on a human, or in two stages at once gets a refusal
-//! reason, never a guessed stage.
+//! reason, never a guessed stage. The one hold that is a stage is an approved
+//! PR held for a human, `merge_hold` (#10218), defined here and nowhere else.
 
 use super::{NoEstimateReason, Stage};
 use crate::observability::queue_blocked::{BLOCKED_LABEL, HOLD_LABELS};
@@ -21,6 +22,69 @@ pub const HUMAN_GATED_LABELS: &[&str] = &["loom:triage", "loom:curating", "loom:
 
 /// The ready label: approved, not yet dispatched.
 pub const READY_LABEL: &str = "loom:issue";
+
+/// The operator holds that make an approved PR's wait a
+/// [`Stage::MergeHold`] (#10218) instead of a refusal: experiment v2's
+/// (#10193) "held for a human".
+///
+/// Read through [`stage_from_pr_labels`], this is the **only** definition of
+/// the held stage. The episode derivation, the tracker and every later
+/// consumer (roster counts, fleet-state reconstruction) call that function,
+/// so the stage a model is trained on and the stage it is served cannot
+/// drift apart. Every entry is also a [`hold_labels`] entry (tested), so a
+/// label-registry rename fails loudly instead of silently un-holding a PR.
+/// It is also the set behind [`pr_flags`]' [`FLAG_OP_HOLD`].
+pub const MERGE_HOLD_LABELS: &[&str] = &[
+    "loom:operator",
+    "loom:operator-only",
+    "loom:operator-decision",
+];
+
+/// Hold labels that may accompany a [`MERGE_HOLD_LABELS`] entry without
+/// turning the hold into a refusal: `loom:operator-mechanical` is a
+/// `loom:operator-only` sub-kind and never stands alone.
+pub const MERGE_HOLD_COMPANION_LABELS: &[&str] = &["loom:operator-mechanical"];
+
+/// [`pr_flags`] bit 0: an operator hold (any of [`MERGE_HOLD_LABELS`]).
+pub const FLAG_OP_HOLD: u8 = 1;
+/// [`pr_flags`] bit 1: `loom:sequenced`.
+pub const FLAG_SEQUENCED: u8 = 1 << 1;
+/// [`pr_flags`] bit 2: starred at any level (`loom:operator-priority`, or a
+/// higher level label, own or inherited: levels nest, #10307).
+pub const FLAG_STARRED: u8 = 1 << 2;
+/// [`pr_flags`] bit 3: `loom:merge-conflict`.
+pub const FLAG_CONFLICT: u8 = 1 << 3;
+/// [`pr_flags`] bit 4: `loom:ci-failure`.
+pub const FLAG_CI_FAIL: u8 = 1 << 4;
+/// [`pr_flags`] bit 5: `loom:blocked`.
+pub const FLAG_BLOCKED: u8 = 1 << 5;
+
+/// Each [`pr_flags`] bit and the labels that set it.
+const PR_FLAG_LABELS: [(u8, &[&str]); 6] = [
+    (FLAG_OP_HOLD, MERGE_HOLD_LABELS),
+    (FLAG_SEQUENCED, &["loom:sequenced"]),
+    (FLAG_STARRED, &["loom:operator-priority"]),
+    (FLAG_CONFLICT, &["loom:merge-conflict"]),
+    (FLAG_CI_FAIL, &["loom:ci-failure"]),
+    (FLAG_BLOCKED, &[BLOCKED_LABEL]),
+];
+
+/// A PR's six model flags as a bit mask ([`FLAG_OP_HOLD`] …
+/// [`FLAG_BLOCKED`]). This is the **one** label → flag definition: the fit's
+/// training rows (#10245) and `land-2026-10-04-twin-otter`'s serving input
+/// (#10243) both call it, so train and serve cannot drift.
+#[must_use]
+pub fn pr_flags(labels: &[String]) -> u8 {
+    PR_FLAG_LABELS
+        .iter()
+        .filter(|(_, set)| labels.iter().any(|l| set.contains(&l.as_str())))
+        .fold(0, |mask, (bit, _)| mask | bit)
+        | if crate::operator_levels::is_starred(labels) {
+            FLAG_STARRED
+        } else {
+            0
+        }
+}
 
 /// Every label that holds or parks an item: the work finder's park and skip
 /// sets (minus its own claim label, which is not a hold) and the blocked
@@ -53,10 +117,80 @@ pub fn check_holds(labels: &[String]) -> Result<(), NoEstimateReason> {
     }
 }
 
+/// The operator hold labels (#10210): a human is needed before the item moves.
+/// A subset of [`hold_labels`]; `loom:operator-priority` is the operator's
+/// star, never a hold, and is deliberately absent.
+pub const OPERATOR_HOLD_LABELS: &[&str] = &[
+    "loom:operator",
+    "loom:operator-only",
+    "loom:operator-decision",
+    "loom:operator-mechanical",
+];
+
+/// The first operator hold label on the item, when it has one.
+#[must_use]
+pub fn operator_hold_label(labels: &[String]) -> Option<&'static str> {
+    OPERATOR_HOLD_LABELS
+        .iter()
+        .copied()
+        .find(|h| has(labels, h))
+}
+
+/// Whether every hold on the item is an operator hold (and there is at least
+/// one): the one hold whose stall a stall-aware heuristic can model (#10210).
+/// `loom:blocked`, a park label or `loom:needs-capability` alongside it keeps
+/// the plain `blocked` refusal.
+#[must_use]
+pub fn held_only_by_operator(labels: &[String]) -> bool {
+    operator_hold_label(labels).is_some()
+        && hold_labels()
+            .iter()
+            .filter(|h| has(labels, h))
+            .all(|h| OPERATOR_HOLD_LABELS.contains(h))
+}
+
 /// The post-sweep stage of an open PR from its labels: exactly one of
-/// review-requested, changes-requested and approved, and no hold.
+/// review-requested, changes-requested and approved, and no hold — or
+/// [`Stage::MergeHold`] (#10218) for an approved PR whose only holds are
+/// operator holds ([`MERGE_HOLD_LABELS`], optionally with
+/// [`MERGE_HOLD_COMPANION_LABELS`]).
+///
+/// Every other hold is still `Err(Blocked)`: `loom:blocked`,
+/// `loom:needs-capability`, and an operator hold on a PR that is not
+/// approved. Shipped heuristics refuse `merge_hold` as `blocked` too, so
+/// their output is unchanged.
 pub fn stage_from_pr_labels(labels: &[String]) -> Result<Stage, NoEstimateReason> {
-    check_holds(labels)?;
+    if check_holds(labels).is_err() {
+        return if is_merge_hold(labels) {
+            Ok(Stage::MergeHold)
+        } else {
+            Err(NoEstimateReason::Blocked)
+        };
+    }
+    verdict_stage(labels)
+}
+
+/// Whether `labels` are an approved PR held only by operator holds.
+fn is_merge_hold(labels: &[String]) -> bool {
+    let held: Vec<&str> = hold_labels()
+        .into_iter()
+        .filter(|h| has(labels, h))
+        .collect();
+    held.iter().any(|h| MERGE_HOLD_LABELS.contains(h))
+        && held
+            .iter()
+            .all(|h| MERGE_HOLD_LABELS.contains(h) || MERGE_HOLD_COMPANION_LABELS.contains(h))
+        && verdict_stage(labels) == Ok(Stage::MergeWait)
+}
+
+/// The stage a held PR's review labels name underneath its hold (#10210) —
+/// [`stage_from_pr_labels`] without the hold check.
+pub fn stage_ignoring_holds(labels: &[String]) -> Result<Stage, NoEstimateReason> {
+    verdict_stage(labels)
+}
+
+/// The stage the review labels alone name, ignoring holds.
+fn verdict_stage(labels: &[String]) -> Result<Stage, NoEstimateReason> {
     let stages: Vec<Stage> = [
         (REVIEW_REQUESTED, Stage::ReviewWait),
         (CHANGES_REQUESTED, Stage::Doctor),

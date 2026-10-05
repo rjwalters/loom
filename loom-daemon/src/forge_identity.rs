@@ -451,6 +451,17 @@ pub fn reader_for_at<'a>(
     owner_repo: &str,
     now: SystemTime,
 ) -> Option<&'a Identity> {
+    // #9986: the gateway owns the pool on a `required` egress host.
+    // `workspace_root()` is `None` when `WORKSPACE_ROOT` was never registered
+    // (CLI subcommands, not the daemon). Then only the env/machine policy tiers
+    // are consulted, so a repo-tier-only `required` policy is not honoured
+    // here — a deliberate fail-open for the repo tier alone: the daemon (which
+    // mints and publishes) registers its workspace at startup via
+    // `forge_identity::spawn_reader_refresh`, and
+    // env/machine `required` policies still apply.
+    if crate::forge_egress::publication::github_credential_forbidden(workspace_root()) {
+        return None;
+    }
     let n = roster.readers.len();
     let start = forge_read_pool::assignment_index(owner_repo, n)?;
     (0..n)
@@ -624,12 +635,85 @@ pub fn classify_failure(stderr: &str, http_status: Option<u16>) -> Option<Failur
     }
     if matches!(http_status, Some(403 | 404))
         || s.contains("resource not accessible by integration")
+        // GraphQL (`gh pr view`, `gh issue view`) has no HTTP status for a
+        // repo outside the installation: it says it cannot resolve the repo
+        // (#9872 routes those reads too).
+        || s.contains("could not resolve to a repository")
         || s.contains("http 403")
         || s.contains("http 404")
     {
         return Some(Failure::Coverage);
     }
     None
+}
+
+/// Which identity served one attempt of a read (#9872): recorded on the
+/// accounting row so `loom-daemon status` can show reads by pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityRole {
+    /// A reader App's own installation pool.
+    Reader,
+    /// The writer credential, chosen up front (no usable reader, a write, or
+    /// a read pinned with `GhInvocation::writer_identity`).
+    Writer,
+    /// The writer, re-running a read a reader failed on.
+    WriterFallback,
+}
+
+impl IdentityRole {
+    /// The accounting value: `reader` / `writer` / `writer-fallback`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdentityRole::Reader => "reader",
+            IdentityRole::Writer => "writer",
+            IdentityRole::WriterFallback => "writer-fallback",
+        }
+    }
+}
+
+/// The one reader-then-writer retry shape (#9537, shared since #9872 by
+/// `forge_etag_store::fetch_conditional` and the `GhInvocation` choke point).
+///
+/// With no `reader_dir`, `run` is called once on the writer. Otherwise it runs
+/// on the reader first; a success, or a failure that is not the credential's
+/// (`failure_of` → `None`), is returned as-is. On [`Failure::App`] the reader
+/// is withdrawn (`withdraw`, handed the reader's failed result) and the read
+/// re-runs once on the writer. On a
+/// 403/404 ([`Failure::Coverage`]) the read re-runs on the writer and the
+/// reader is withdrawn **only if the writer succeeds**: a resource missing for
+/// everyone must not take the repo's reader offline.
+///
+/// # Errors
+///
+/// Whatever `run` returns; an `Err` from the reader attempt is not retried
+/// (it means the call could not be made, not that the reader was refused).
+pub fn reader_then_writer<T, E>(
+    reader_dir: Option<&Path>,
+    mut run: impl FnMut(Option<&Path>, IdentityRole) -> Result<T, E>,
+    succeeded: impl Fn(&T) -> bool,
+    failure_of: impl Fn(&T) -> Option<Failure>,
+    withdraw: impl FnOnce(Failure, &T),
+) -> Result<T, E> {
+    let Some(dir) = reader_dir else {
+        return run(None, IdentityRole::Writer);
+    };
+    let first = run(Some(dir), IdentityRole::Reader)?;
+    if succeeded(&first) {
+        return Ok(first);
+    }
+    let Some(failure) = failure_of(&first) else {
+        return Ok(first);
+    };
+    if failure == Failure::App {
+        withdraw(failure, &first);
+        return run(None, IdentityRole::WriterFallback);
+    }
+    let second = run(None, IdentityRole::WriterFallback)?;
+    if succeeded(&second) {
+        withdraw(failure, &first);
+    }
+    Ok(second)
 }
 
 /// Whether a failed read is the credential's fault (see [`classify_failure`]).

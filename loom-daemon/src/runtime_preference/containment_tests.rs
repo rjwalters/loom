@@ -7,9 +7,15 @@ use super::*;
 use crate::runtime_admission::{AdmissionContext, ContainmentProof};
 use std::fs;
 
-struct Env(Vec<(&'static str, Option<String>)>, tempfile::TempDir);
+/// The third field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964).
+struct Env(
+    Vec<(&'static str, Option<String>)>,
+    tempfile::TempDir,
+    crate::tokens_pool::profile_root_env::ProfileRootLock,
+);
 impl Env {
     fn new() -> Self {
+        let lock = crate::tokens_pool::profile_root_env::lock();
         let keys = [
             "LOOM_RUNTIME",
             "LOOM_RUNTIME_BUILDER",
@@ -29,7 +35,7 @@ impl Env {
         }
         let profiles = tempfile::tempdir().unwrap();
         std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
-        Self(prior, profiles)
+        Self(prior, profiles, lock)
     }
     fn provision_codex_seat(&self) {
         fs::create_dir_all(self.1.path().join("seat")).unwrap();

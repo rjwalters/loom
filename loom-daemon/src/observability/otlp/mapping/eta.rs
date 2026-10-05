@@ -1,4 +1,5 @@
-//! OTLP mapping for `eta.estimate` / `eta.outcome` (#9289).
+//! OTLP mapping for `eta.estimate` / `eta.outcome` (#9289) and
+//! `eta.fleet_refresh` (#10263).
 //!
 //! Each is one log record. The **body** is the record's JSON — for an
 //! estimate that is the whole `eta-explanation/v1` explanation — so ClickHouse
@@ -80,6 +81,7 @@ pub(super) fn log_parts(
                 attributes.push(kv_int("loom.eta.p25_sec", result.p25_sec));
                 attributes.push(kv_int("loom.eta.p50_sec", result.p50_sec));
                 attributes.push(kv_int("loom.eta.p75_sec", result.p75_sec));
+                opt_int(&mut attributes, "loom.eta.p90_sec", result.p90_sec);
                 attributes.push(kv_int("loom.eta.samples_min", result.samples_min as i64));
                 attributes.push(kv_string(
                     "loom.eta.horizon_bucket",
@@ -115,7 +117,12 @@ pub(super) fn log_parts(
             provenance(&mut attributes, "loom.eta.", &e.loom);
             provenance(&mut attributes, "loom.eta.outcome_", &r.loom);
             opt_int(&mut attributes, "loom.pr_number", e.pr_number.map(i64::from));
+            // All four quantiles ride on the outcome row (#10211), so the
+            // accuracy views read an interval without joining the estimate.
+            opt_int(&mut attributes, "loom.eta.p25_sec", e.p25_sec);
             opt_int(&mut attributes, "loom.eta.p50_sec", e.p50_sec);
+            opt_int(&mut attributes, "loom.eta.p75_sec", e.p75_sec);
+            opt_int(&mut attributes, "loom.eta.p90_sec", e.p90_sec);
             opt_int(&mut attributes, "loom.eta.error_sec", s.error_sec);
             opt_int(&mut attributes, "loom.eta.abs_error_sec", s.abs_error_sec);
             opt_int(&mut attributes, "loom.eta.outcome_resolution_sec", r.outcome_resolution_sec);
@@ -125,6 +132,12 @@ pub(super) fn log_parts(
             }
             if let Some(loss) = s.pinball_loss_sec {
                 attributes.push(kv_double("loom.eta.pinball_loss_sec", loss));
+            }
+            if let Some(late) = s.above_p90 {
+                attributes.push(kv_bool("loom.eta.above_p90", late));
+            }
+            if let Some(loss) = s.pinball4_loss_sec {
+                attributes.push(kv_double("loom.eta.pinball4_loss_sec", loss));
             }
             for (key, value) in [
                 ("loom.eta.horizon_bucket", s.horizon_bucket.as_deref()),
@@ -138,6 +151,47 @@ pub(super) fn log_parts(
             }
             let body = serde_json::to_string(r).unwrap_or_default();
             Some(("eta.outcome", SeverityNumber::Info, nanos(s.actual_at), attributes, body))
+        }
+        TelemetryRecord::EtaFleetRefresh(r) => {
+            // #10263: one repo, one cycle; stamped at the cycle's start so
+            // every repo of a cycle sorts together.
+            let to_i64 = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+            let mut attributes = vec![
+                kv_string("loom.repo", r.repo.clone()),
+                kv_string("loom.eta.fleet.cycle_id", r.cycle_id.clone()),
+                kv_string("loom.eta.fleet.pass", r.pass.clone()),
+                kv_string("loom.eta.fleet.stop_reason", r.stop_reason.clone()),
+                kv_bool("loom.eta.fleet.promoted", r.promoted),
+                kv_int("loom.eta.fleet.prs_read", to_i64(r.prs_read)),
+                kv_int("loom.eta.fleet.pass_done", to_i64(r.pass_done)),
+                kv_int("loom.eta.fleet.timelines_incomplete", to_i64(r.timelines_incomplete)),
+                kv_int("loom.eta.fleet.samples_added", r.samples_added),
+                kv_int("loom.eta.fleet.forge_calls", to_i64(r.forge_calls)),
+                kv_int("loom.eta.fleet.not_modified_calls", to_i64(r.not_modified_calls)),
+                kv_int("loom.eta.fleet.duration_ms", to_i64(r.duration_ms)),
+            ];
+            provenance(&mut attributes, "loom.eta.", &r.loom);
+            opt_int(
+                &mut attributes,
+                "loom.eta.fleet.raw_events_added",
+                r.raw_events_added.map(to_i64),
+            );
+            opt_int(
+                &mut attributes,
+                "loom.eta.fleet.ratelimit_remaining_min",
+                r.ratelimit_remaining_min.map(to_i64),
+            );
+            for (key, value) in [
+                ("loom.eta.fleet.reader_app", r.reader_app.clone()),
+                ("loom.eta.fleet.snapshot_id", r.snapshot_id.clone()),
+                ("loom.eta.fleet.as_of", r.as_of.map(crate::telemetry::trace::instant)),
+            ] {
+                if let Some(value) = value {
+                    attributes.push(kv_string(key, value));
+                }
+            }
+            let body = serde_json::to_string(r).unwrap_or_default();
+            Some(("eta.fleet_refresh", SeverityNumber::Info, nanos(r.started_at), attributes, body))
         }
         _ => None,
     }
@@ -169,6 +223,7 @@ mod tests {
                 age_sec: 0,
                 age_source: AgeSource::Bus,
                 rework_rounds: 0,
+                episode_entered_at: None,
             }),
             features: Default::default(),
             features_omitted: Vec::new(),
@@ -179,6 +234,8 @@ mod tests {
                 complete: true,
             },
             dispatch: None,
+            stalls: Vec::new(),
+            held: None,
         };
         EtaEstimateRecord {
             trigger: Trigger::Transition,
@@ -234,14 +291,29 @@ mod tests {
 
     #[test]
     fn every_eta_attribute_is_allowlisted() {
+        use crate::eta::explanation::EstimateResult;
         use crate::eta::score::{score, EstimateSummary, OutcomeKind};
         use crate::telemetry::kinds::eta::{EtaOutcomeRecord, ETA_LOG_ATTRIBUTE_KEYS};
+        // The fixture estimate is a refusal (no history); a copy with a
+        // result exercises the quantile keys an answer adds.
         let estimate = record();
+        let mut answered = estimate.clone();
+        answered.explanation.result = Some(EstimateResult {
+            p25_sec: 60,
+            p50_sec: 120,
+            p75_sec: 240,
+            p90_sec: Some(300),
+            eta_p50_at: answered.explanation.as_of + chrono::Duration::seconds(120),
+            samples_min: 9,
+            stage_marks: Vec::new(),
+            tail_extrapolated: false,
+        });
         let summary = EstimateSummary::of(&estimate.explanation);
         let mut summary_with_numbers = summary.clone();
         summary_with_numbers.p25_sec = Some(60);
         summary_with_numbers.p50_sec = Some(120);
         summary_with_numbers.p75_sec = Some(240);
+        summary_with_numbers.p90_sec = Some(300);
         summary_with_numbers.pr_number = Some(9301);
         let at = summary.as_of + chrono::Duration::seconds(100);
         let outcome = EtaOutcomeRecord {
@@ -252,19 +324,149 @@ mod tests {
             outcome_resolution_sec: Some(0),
             result: Some("exited".to_string()),
         };
+        // The keys #10211 added are actually emitted, so the allowlist check
+        // below is not vacuous for them.
+        let expected: [(&TelemetryRecord, &[&str]); 2] = [
+            (&TelemetryRecord::EtaEstimate(answered.clone()), &["loom.eta.p90_sec"]),
+            (
+                &TelemetryRecord::EtaOutcome(outcome.clone()),
+                &[
+                    "loom.eta.p25_sec",
+                    "loom.eta.p75_sec",
+                    "loom.eta.p90_sec",
+                    "loom.eta.above_p90",
+                    "loom.eta.pinball4_loss_sec",
+                ],
+            ),
+        ];
+        for (record, keys) in expected {
+            let log = log_record_for(&TelemetryEnvelope::new("host", record.clone())).unwrap();
+            for key in keys {
+                assert!(attr(&log, key).is_some(), "{key} is emitted");
+            }
+        }
         for record in [
             TelemetryRecord::EtaEstimate(estimate),
+            TelemetryRecord::EtaEstimate(answered),
             TelemetryRecord::EtaOutcome(outcome),
         ] {
             let log = log_record_for(&TelemetryEnvelope::new("host", record)).unwrap();
             for kv in &log.attributes {
                 assert!(
                     ETA_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
-                        || ["loom.repo", "loom.issue", "loom.pr_number"].contains(&kv.key.as_str()),
+                        || [
+                            "loom.repo",
+                            "loom.issue",
+                            "loom.pr_number",
+                            "loom.record_id"
+                        ]
+                        .contains(&kv.key.as_str()),
                     "{} is not allowlisted",
                     kv.key
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_outcome_row_carries_the_late_surprise_and_the_four_quantile_loss() {
+        use crate::eta::score::{score, EstimateSummary, OutcomeKind};
+        use crate::telemetry::kinds::eta::EtaOutcomeRecord;
+        let estimate = record();
+        let mut summary = EstimateSummary::of(&estimate.explanation);
+        (summary.p25_sec, summary.p50_sec, summary.p75_sec) = (Some(600), Some(1200), Some(2400));
+        let outcome = |p90: Option<i64>, actual: i64| {
+            let mut summary = summary.clone();
+            summary.p90_sec = p90;
+            let at = summary.as_of + chrono::Duration::seconds(actual);
+            let record = EtaOutcomeRecord {
+                score: score(&summary, OutcomeKind::Landed, at, &[]),
+                estimate: summary,
+                loom: estimate.explanation.loom.clone(),
+                outcome_source: "pulls_read".to_string(),
+                outcome_resolution_sec: Some(0),
+                result: None,
+            };
+            log_record_for(&TelemetryEnvelope::new("host", TelemetryRecord::EtaOutcome(record)))
+                .unwrap()
+        };
+        // Landed at 3600 s, after p90 = 3000: a late surprise. The
+        // three-quantile loss is ρ.25(3000) + ρ.5(2400) + ρ.75(1200)
+        // = 750 + 1200 + 900 = 2850, and ρ.9(600) = 540 makes 3390.
+        let late = outcome(Some(3000), 3600);
+        assert_eq!(attr(&late, "loom.eta.p90_sec"), Some(Value::IntValue(3000)));
+        assert_eq!(attr(&late, "loom.eta.above_p90"), Some(Value::BoolValue(true)));
+        assert_eq!(attr(&late, "loom.eta.pinball_loss_sec"), Some(Value::DoubleValue(2850.0)));
+        assert_eq!(attr(&late, "loom.eta.pinball4_loss_sec"), Some(Value::DoubleValue(3390.0)));
+        assert_eq!(attr(&late, "loom.eta.p25_sec"), Some(Value::IntValue(600)));
+        assert_eq!(attr(&late, "loom.eta.p75_sec"), Some(Value::IntValue(2400)));
+        // A summary from before p90 existed: the three-quantile score still
+        // rides, the p90 keys are absent (never `false`, never 0).
+        let old = outcome(None, 3600);
+        assert_eq!(attr(&old, "loom.eta.pinball_loss_sec"), Some(Value::DoubleValue(2850.0)));
+        for key in [
+            "loom.eta.p90_sec",
+            "loom.eta.above_p90",
+            "loom.eta.pinball4_loss_sec",
+        ] {
+            assert_eq!(attr(&old, key), None, "{key} is absent without a p90");
+        }
+    }
+
+    #[test]
+    fn a_fleet_refresh_record_emits_every_fleet_key_and_only_allowlisted_ones() {
+        use crate::telemetry::kinds::eta::ETA_LOG_ATTRIBUTE_KEYS;
+        use crate::telemetry::kinds::eta_fleet_refresh::EtaFleetRefreshRecord;
+        let at = Utc.with_ymd_and_hms(2026, 10, 4, 12, 0, 0).unwrap();
+        let fleet = EtaFleetRefreshRecord {
+            repo: "rjwalters/loom".to_string(),
+            cycle_id: "0123456789abcdef".to_string(),
+            started_at: at,
+            pass: "backfill".to_string(),
+            stop_reason: "complete".to_string(),
+            promoted: true,
+            prs_read: 3,
+            pass_done: 3,
+            timelines_incomplete: 1,
+            samples_added: 9,
+            raw_events_added: Some(4),
+            forge_calls: 5,
+            not_modified_calls: 0,
+            ratelimit_remaining_min: Some(4000),
+            reader_app: Some("7".to_string()),
+            snapshot_id: Some("feedface".to_string()),
+            as_of: Some(at),
+            duration_ms: 12,
+            loom: record().explanation.loom.clone(),
+        };
+        let envelope =
+            TelemetryEnvelope::new("host", TelemetryRecord::EtaFleetRefresh(fleet.clone()));
+        let log = log_record_for(&envelope).unwrap();
+        assert_eq!(log.event_name, "eta.fleet_refresh");
+        assert_eq!(log.time_unix_nano, super::nanos(at));
+        for kv in &log.attributes {
+            assert!(
+                ETA_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
+                    || ["loom.repo", "loom.record_id"].contains(&kv.key.as_str()),
+                "{} is not allowlisted",
+                kv.key
+            );
+        }
+        for key in ETA_LOG_ATTRIBUTE_KEYS
+            .iter()
+            .filter(|k| k.starts_with("loom.eta.fleet."))
+        {
+            assert!(attr(&log, key).is_some(), "{key} is emitted");
+        }
+        assert_eq!(
+            attr(&log, "loom.eta.fleet.stop_reason"),
+            Some(Value::StringValue("complete".into()))
+        );
+        assert_eq!(attr(&log, "loom.eta.fleet.samples_added"), Some(Value::IntValue(9)));
+        let Some(Value::StringValue(body)) = log.body.as_ref().and_then(|b| b.value.clone()) else {
+            panic!("string body");
+        };
+        let parsed: EtaFleetRefreshRecord = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed, fleet);
     }
 }

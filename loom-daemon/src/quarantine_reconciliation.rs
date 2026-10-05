@@ -188,12 +188,12 @@ pub fn plan(issues: &[BlockedIssue]) -> Vec<(u32, ReconcileAction)> {
 /// thin, best-effort `Command` wrapper.
 pub mod forge {
     use super::{decide, plan, BlockedIssue, ReconcileAction, MAX_ISSUES_PER_WORKSPACE};
-    use crate::sweep_registry::{output_with_timeout, reap_gh_timeout, QUARANTINE_COMMENT_MARKER};
+    use crate::claim_reconciliation::gh_call;
+    use crate::sweep_registry::{reap_gh_timeout, QUARANTINE_COMMENT_MARKER};
     use anyhow::{anyhow, Context, Result};
     use chrono::{DateTime, Utc};
     use serde::Deserialize;
     use std::path::Path;
-    use std::process::{Command, Stdio};
 
     #[derive(Debug, Deserialize)]
     struct GhComment {
@@ -208,37 +208,32 @@ pub mod forge {
         number: u32,
         #[serde(default)]
         comments: Vec<GhComment>,
+        #[serde(rename = "updatedAt", default)]
+        updated_at: Option<String>,
     }
 
-    fn list_blocked_issues(gh_bin: &Path, root: &Path) -> Result<Vec<BlockedIssue>> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("issue")
-            .arg("list")
-            .arg("--label")
-            .arg("loom:blocked")
-            .arg("--state")
-            .arg("open")
-            .arg("--limit")
-            .arg(MAX_ISSUES_PER_WORKSPACE.to_string())
-            .arg("--json")
-            .arg("number,comments");
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    /// Each issue comes with its `updatedAt` stamp (the #10089 read-cache version).
+    fn list_blocked_issues(
+        gh_bin: &Path,
+        root: &Path,
+    ) -> Result<Vec<(BlockedIssue, Option<String>)>> {
+        let limit = MAX_ISSUES_PER_WORKSPACE.to_string();
+        let out = gh_call::output(
+            gh_call::read("quarantine.issue_list", gh_bin, root)
+                .args([
+                    "issue",
+                    "list",
+                    "--label",
+                    "loom:blocked",
+                    "--state",
+                    "open",
+                ])
+                .args(["--limit", &limit, "--json", "number,comments,updatedAt"])
+                .args(gh_call::loom_repo_flag()),
+        )?;
         if !out.status.success() {
-            return Err(anyhow!(
-                "gh issue list --label loom:blocked failed in {}: {}",
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            let (root, err) = (root.display(), gh_call::stderr(&out));
+            return Err(anyhow!("gh issue list --label loom:blocked failed in {root}: {err}"));
         }
         let rows: Vec<GhBlockedIssue> =
             serde_json::from_slice(&out.stdout).context("parse gh issue list JSON")?;
@@ -250,7 +245,7 @@ pub mod forge {
                     .iter()
                     .filter(|c| c.body.contains(QUARANTINE_COMMENT_MARKER))
                     .collect();
-                BlockedIssue {
+                let issue = BlockedIssue {
                     number: r.number,
                     has_quarantine_comment: !marker_comments.is_empty(),
                     last_quarantine_comment_at: marker_comments
@@ -262,7 +257,8 @@ pub mod forge {
                     // with no marker comment is `Keep` unconditionally and
                     // never needs the extra `gh` round-trip.
                     last_blocked_labeled_at: None,
-                }
+                };
+                (issue, r.updated_at)
             })
             .collect())
     }
@@ -278,26 +274,14 @@ pub mod forge {
         root: &Path,
         issue: u32,
     ) -> Option<DateTime<Utc>> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline"))
-            .arg("--paginate")
-            .arg("--jq")
-            .arg(
-                r#"[.[] | select(.event == "labeled" and .label.name == "loom:blocked") | .created_at] | max // empty"#,
-            );
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        // #8263: `LOOM_REPO` reaches `gh api` as the GH_REPO env var, NEVER as
-        // a `--repo` flag (`gh api` has none and aborts on one).
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        let out = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
-        if !out.status.success() {
-            return None;
-        }
-        parse_timestamp(&out.stdout)
+        // #8263: `LOOM_REPO` reaches `gh api` as GH_REPO (set by the facade).
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline?per_page=100");
+        let jq = r#"[.[] | select(.event == "labeled" and .label.name == "loom:blocked") | .created_at] | max // empty"#;
+        let out = gh_call::ok_stdout(
+            gh_call::read_within("quarantine.issue_timeline", gh_bin, root, reap_gh_timeout())
+                .args(["api", &path, "--paginate", "--jq", jq]),
+        )?;
+        parse_timestamp(&out)
     }
 
     /// The trusted comments on `issue` that begin with
@@ -308,19 +292,12 @@ pub mod forge {
         root: &Path,
         issue: u32,
     ) -> Option<Vec<serde_json::Value>> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"))
-            .arg("--paginate");
-        cmd.current_dir(root);
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        let out = output_with_timeout(cmd, reap_gh_timeout()).ok()??;
-        if !out.status.success() {
-            return None;
-        }
-        let comments =
-            crate::comment_trust::TrustPolicy::for_root(root).trusted_records(&out.stdout)?;
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments?per_page=100");
+        let out = gh_call::ok_stdout(
+            gh_call::read_within("quarantine.issue_comments", gh_bin, root, reap_gh_timeout())
+                .args(["api", &path, "--paginate"]),
+        )?;
+        let comments = crate::comment_trust::TrustPolicy::for_root(root).trusted_records(&out)?;
         Some(
             comments
                 .into_iter()
@@ -332,6 +309,24 @@ pub mod forge {
                 })
                 .collect(),
         )
+    }
+
+    /// One uncached read of a marked candidate's `(trusted marker comment
+    /// present, newest marker comment, newest `labeled loom:blocked`)` — the
+    /// legs the pass confirms before it may release (#9548, #4206).
+    fn scan_parts(
+        gh_bin: &Path,
+        root: &Path,
+        issue: u32,
+    ) -> crate::claim_reconciliation::read_cache::QuarantineScan {
+        let trusted = trusted_quarantine_comments(gh_bin, root, issue);
+        let has = trusted.as_ref().is_some_and(|c| !c.is_empty());
+        let last_comment =
+            trusted.and_then(|c| crate::comment_trust::records::max_timestamp(&c, "created_at"));
+        let labeled = has
+            .then(|| fetch_last_blocked_labeled_at(gh_bin, root, issue))
+            .flatten();
+        (has, last_comment, labeled)
     }
 
     /// Parse a `gh --jq` scalar result that is either a bare RFC-3339
@@ -406,31 +401,16 @@ pub mod forge {
     }
 
     fn release(gh_bin: &Path, root: &Path, issue: u32) -> Result<()> {
-        let mut cmd = Command::new(gh_bin);
-        cmd.arg("issue")
-            .arg("edit")
-            .arg(issue.to_string())
-            .arg("--remove-label")
-            .arg("loom:blocked")
-            .arg("--add-label")
-            .arg("loom:issue");
-        cmd.current_dir(root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        if let Ok(repo) = std::env::var("LOOM_REPO") {
-            cmd.arg("--repo").arg(repo);
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-        let out = cmd
-            .output()
-            .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+        let n = issue.to_string();
+        let out = gh_call::output(
+            gh_call::write("quarantine.issue_release", gh_bin, root)
+                .args(["issue", "edit", &n, "--remove-label", "loom:blocked"])
+                .args(["--add-label", "loom:issue"])
+                .args(gh_call::loom_repo_flag()),
+        )?;
         if !out.status.success() {
-            return Err(anyhow!(
-                "gh issue edit failed for #{issue} in {}: {}",
-                root.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            let (root, err) = (root.display(), gh_call::stderr(&out));
+            return Err(anyhow!("gh issue edit failed for #{issue} in {root}: {err}"));
         }
         Ok(())
     }
@@ -484,23 +464,40 @@ pub mod forge {
         // cannot name an App author, so a candidate is confirmed against the
         // REST listing, and only a trusted author's comment that BEGINS with
         // the marker counts; an unreadable confirmation keeps the issue.
-        let issues: Vec<BlockedIssue> = issues
-            .into_iter()
-            .map(|mut issue| {
-                if issue.has_quarantine_comment {
-                    let trusted = trusted_quarantine_comments(gh_bin, root, issue.number);
-                    issue.has_quarantine_comment = trusted.as_ref().is_some_and(|c| !c.is_empty());
-                    issue.last_quarantine_comment_at = trusted.and_then(|c| {
-                        crate::comment_trust::records::max_timestamp(&c, "created_at")
-                    });
-                }
-                if issue.has_quarantine_comment {
-                    issue.last_blocked_labeled_at =
-                        fetch_last_blocked_labeled_at(gh_bin, root, issue.number);
-                }
-                issue
-            })
-            .collect();
+        let issues: Vec<BlockedIssue> =
+            issues
+                .into_iter()
+                .map(|(mut issue, updated_at)| {
+                    if issue.has_quarantine_comment {
+                        // #10089: the two paginated REST walks below are reused
+                        // while the issue's `updatedAt` holds (a new comment or
+                        // label event bumps it). Stored only when every leg
+                        // answered, so a failed read is retried next pass.
+                        let key = crate::claim_reconciliation::read_cache::key(
+                            root,
+                            issue.number,
+                            "quarantine",
+                            updated_at.as_deref(),
+                        );
+                        let fresh = std::cell::Cell::new(None);
+                        let cached = crate::claim_reconciliation::read_cache::QUARANTINE_SCAN
+                            .get_or(key, || {
+                                let scan = scan_parts(gh_bin, root, issue.number);
+                                fresh.set(Some(scan));
+                                (scan.0 && scan.2.is_some()).then_some(scan)
+                            });
+                        // A miss that did not qualify for the cache still carries
+                        // what it read (no second spend).
+                        let (has, last_comment, labeled) = cached
+                            .or_else(|| fresh.get())
+                            .unwrap_or_else(|| scan_parts(gh_bin, root, issue.number));
+                        issue.has_quarantine_comment = has;
+                        issue.last_quarantine_comment_at = last_comment;
+                        issue.last_blocked_labeled_at = labeled;
+                    }
+                    issue
+                })
+                .collect();
 
         let decisions = plan(&issues);
         let checked = decisions.len();
@@ -812,6 +809,63 @@ exit 0
             gh_calls.contains("issue edit 99 --remove-label loom:blocked --add-label loom:issue"),
             "expected the real label-flip argv; got: {gh_calls:?}"
         );
+    }
+
+    /// #10089: N unchanged passes over a re-parked `loom:blocked` issue cost
+    /// ONE comments walk and ONE timeline walk, not one per pass; the cheap
+    /// listing runs every pass. A new `updatedAt` re-reads.
+    #[test]
+    #[serial]
+    fn unchanged_blocked_issue_is_scanned_once_across_passes() {
+        crate::claim_reconciliation::read_cache::set_test_enabled(true);
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let updated = dir.path().join("updated-at");
+        std::fs::write(&updated, "2026-01-02T00:00:01Z").unwrap();
+        let script = format!(
+            r#"#!/bin/bash
+printf '%s\n' "$*" >> "{log}"
+if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
+  echo '[{{"number":99,"updatedAt":"'"$(cat {updated})"'","comments":[{{"body":"Auto-quarantined by loom-daemon (#3939): insta-crashed 3 times"}}]}}]'
+  exit 0
+fi
+case "$*" in
+*/issues/99/comments*)
+  echo '[{{"body":"Auto-quarantined by loom-daemon (#3939): insta-crashed 3 times","created_at":"2026-01-01T00:00:00Z","user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}}}}]'
+  exit 0 ;;
+*/issues/99/timeline*)
+  echo '"2026-01-02T00:00:00Z"'
+  exit 0 ;;
+esac
+exit 0
+"#,
+            log = gh_log.display(),
+            updated = updated.display(),
+        );
+        let fake_gh = write_fake_gh(dir.path(), &script);
+        let ws = WritableRoot::register_with_gh(&repo_root, &fake_gh);
+        let count = |needle: &str| {
+            std::fs::read_to_string(&gh_log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains(needle))
+                .count()
+        };
+        for _ in 0..3 {
+            let (checked, released) = forge::reconcile_workspace(&ws.gh, &repo_root);
+            assert_eq!((checked, released), (1, 0), "a later manual re-park is kept");
+        }
+        assert_eq!(count("issue list"), 3, "the cheap listing runs every pass");
+        assert_eq!(count("/issues/99/comments"), 1, "comments walked once");
+        assert_eq!(count("/issues/99/timeline"), 1, "timeline walked once");
+
+        std::fs::write(&updated, "2026-01-03T00:00:00Z").unwrap();
+        let _ = forge::reconcile_workspace(&ws.gh, &repo_root);
+        assert_eq!(count("/issues/99/comments"), 2, "a new updatedAt re-reads");
+        assert_eq!(count("/issues/99/timeline"), 2);
+        crate::claim_reconciliation::read_cache::set_test_enabled(false);
     }
 
     /// A `loom:blocked` issue with NO daemon quarantine comment (an

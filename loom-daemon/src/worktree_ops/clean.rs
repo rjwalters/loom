@@ -290,12 +290,7 @@ struct PrRow {
 }
 
 fn gh_pr_list(repo_root: &Path, args: &[&str]) -> Option<Vec<PrRow>> {
-    let mut cmd = Command::new("gh");
-    cmd.args(args).current_dir(repo_root);
-    // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
-    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
-    let out = gh::bounded_output(cmd, gh::GH_PROBE_TIMEOUT)?;
+    let out = gh::bounded_counted("clean.pr_list", repo_root, args)?;
     if !out.status.success() {
         return None;
     }
@@ -447,13 +442,11 @@ struct PrHeadRest {
 /// GraphQL-backed [`check_pr_merged`].
 #[must_use]
 pub fn repo_owner_rest(repo_root: &Path) -> Option<String> {
-    let mut cmd = Command::new("gh");
-    cmd.args(["api", "repos/{owner}/{repo}", "--jq", ".owner.login"])
-        .current_dir(repo_root);
-    // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
-    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
-    let out = gh::bounded_output(cmd, gh::GH_PROBE_TIMEOUT)?;
+    let out = gh::bounded_counted(
+        "clean.repo_owner",
+        repo_root,
+        ["api", "repos/{owner}/{repo}", "--jq", ".owner.login"],
+    )?;
     if !out.status.success() {
         return None;
     }
@@ -498,12 +491,7 @@ pub fn check_pr_merged_rest(repo_root: &Path, owner: &str, issue_num: u32) -> Pr
 pub fn check_pr_status_for_branch_rest(repo_root: &Path, owner: &str, branch: &str) -> PrStatus {
     let path =
         format!("repos/{{owner}}/{{repo}}/pulls?state=all&head={owner}:{branch}&per_page=30");
-    let mut cmd = Command::new("gh");
-    cmd.args(["api", &path]).current_dir(repo_root);
-    // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
-    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
-    let Some(out) = gh::bounded_output(cmd, gh::GH_PROBE_TIMEOUT) else {
+    let Some(out) = gh::bounded_counted("clean.pr_status_rest", repo_root, ["api", &path]) else {
         return PrStatus::Unknown;
     };
     if !out.status.success() {
@@ -587,13 +575,11 @@ impl PrProbe {
 /// both the eligibility status and the head SHA.
 #[must_use]
 pub fn check_pr_by_number_rest(repo_root: &Path, pr_num: u32) -> PrProbe {
-    let mut cmd = Command::new("gh");
-    cmd.args(["api", &format!("repos/{{owner}}/{{repo}}/pulls/{pr_num}")])
-        .current_dir(repo_root);
-    // #5401/#5431: cross-owner managed repo -> its own owner's installation-token
-    // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, repo_root);
-    let Some(out) = gh::bounded_output(cmd, gh::GH_PROBE_TIMEOUT) else {
+    let Some(out) = gh::bounded_counted(
+        "clean.pr_by_number_rest",
+        repo_root,
+        ["api", &format!("repos/{{owner}}/{{repo}}/pulls/{pr_num}")],
+    ) else {
         return PrProbe::unknown();
     };
     if !out.status.success() {

@@ -174,6 +174,53 @@ adopted by `session start`, it refuses further host-direct `CODEX_HOME` use
 (`accounts reauth`/`status` on that profile) — the container is the sole
 process allowed to touch the volume from then on.
 
+## Security posture of a host-mode session container (issue #9979)
+
+Codex runs with its own sandbox off inside a session container
+(`spawn-codex.sh` emits `-s danger-full-access`). Codex's bubblewrap sandbox
+can't create a user namespace under Docker's default seccomp profile, nor
+under Ubuntu's AppArmor userns restriction. The operator ruled on 2026-10-03
+that the container is the boundary. `loom-daemon accounts session start`
+therefore creates the container with:
+
+- `--cap-drop ALL --security-opt no-new-privileges`, with Docker's default
+  seccomp/AppArmor left in force;
+- the account profile read-write at `CODEX_HOME`, **except** its
+  `hooks.json`, `config.toml` and `loom-codex-hooks.json`. Each of those is
+  bound read-only over its own path, as private-clone sessions bind them, and
+  is created as an inert placeholder first if missing. With the sandbox off, a
+  session could otherwise rewrite its own hook registration or trust state.
+  The next session would then read as guard-ready while Codex skipped Loom's
+  hook;
+- **only the registered repositories** (`~/.loom/workspaces.json`) under
+  `--mount-workspace`, read-write at path parity, not the whole parent;
+- never `/`, the home directory or its ancestors, nor anything overlapping a
+  `firewall: true` repository in the cached fleet roster (explicit deny);
+- the daemon's GitHub App token dirs, read-only (overlaid read-only even
+  inside a mounted repository);
+- the label `loom.session-posture=container-boundary-v1`. `spawn-codex.sh`
+  won't dispatch into a host-mode container without it, and also checks the
+  container's actual `HostConfig` (no privileged mode, host namespaces, added
+  caps, `unconfined` or docker.sock; `CapDrop ALL` and `no-new-privileges`
+  present).
+- The gate also requires the three profile control files to be read-only
+  binds. In host mode it requires the container's copy of each to hash the
+  same as the host file (`docker exec … sha256sum`).
+
+A file bind does not follow a host-side replace: after `provision-codex-hooks.sh
+install` or accepting hook trust, the container sees the old file, or (Docker
+Desktop) no file. So after either step, **restart the session**:
+`accounts session stop` and then `start`. Until then dispatch exits 78. Codex
+0.160 runs normally with these files frozen. The exception is its interactive
+TUI, which cannot save a folder-trust or hook-trust decision. For now, take
+those decisions in a throwaway container with the profile writable (see
+`guardrail-parity-codex.md`, "Procedure").
+
+The Claude token pool and the operator's `~/.config/gh` are no longer mounted.
+[`defaults/docs/guardrail-parity-codex.md`](../../defaults/docs/guardrail-parity-codex.md#session-containers-the-container-is-the-boundary-issue-9979)
+has the full reach audit, the residual exposures (cloud metadata, host
+services) and the rollout steps.
+
 ## Re-authenticating a session-managed account (the ownership rule, issue #7389)
 
 Once `session start` adopts a profile (writes its

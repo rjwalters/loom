@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use loom_daemon::cmd_out::Query;
-use loom_daemon::eta::backtest::{self, BacktestReport, Bucket, Comparison, Filter};
+use loom_daemon::eta::backtest::{self, Filter};
 use loom_daemon::eta::config::HistoryScopeMode;
 use loom_daemon::eta::explanation::{Explanation, Features};
 use loom_daemon::eta::fleet;
@@ -42,6 +42,7 @@ use loom_daemon::worktree_ops::gh::{
     open_linked_pr_args, parse_open_linked_pr_trusted, OpenPrProbe,
 };
 
+use super::eta_backtest_cases::{GhFetcher, PrCaseArgs};
 use super::pr_latency_cmd::fetch_histories;
 
 /// PRs examined per `eta backfill` run, absent `--limit` — generous, since
@@ -57,7 +58,9 @@ pub(crate) enum EtaCommand {
     Backfill(EtaBackfillArgs),
     /// Leak-free replay of a heuristic against real `sweep.outcome` history:
     /// mean pinball loss, p25-p75 coverage and bias, optionally paired
-    /// against a second heuristic id on the identical replay set.
+    /// against a second heuristic id on the identical replay set. `land`
+    /// cases from merged PRs' label timelines are opt-in (`--pr-history`,
+    /// `--forge-pr-cases`, #9579); by default no forge call is made.
     Backtest(EtaBacktestArgs),
     /// The current estimate(s) for one issue (#9327, Phase 4 of #9289):
     /// `loom-daemon eta view owner/repo#123 [--explain] [--json]`.
@@ -75,6 +78,12 @@ pub(crate) enum EtaCommand {
         #[command(subcommand)]
         command: super::eta_fleet_cmd::FleetCommand,
     },
+    /// Point-in-time walk-forward evaluation on logged estimate/outcome
+    /// pairs (#10193): a heuristic's logged estimates vs a fitted model.
+    Offline(super::eta_offline_cmd::EtaOfflineArgs),
+    /// Fit the `eta-fit/v1` coefficient file from the fleet snapshots at a
+    /// cutoff (#10245): `loom-daemon eta fit [--as-of RFC3339] [--dry-run]`.
+    Fit(super::eta_fit_cmd::EtaFitArgs),
 }
 
 impl EtaCommand {
@@ -86,6 +95,8 @@ impl EtaCommand {
             EtaCommand::List(args) => args.run(),
             EtaCommand::Promote(args) => args.run(),
             EtaCommand::Fleet { command } => command.run(),
+            EtaCommand::Offline(args) => args.run(),
+            EtaCommand::Fit(args) => args.run(),
         }
     }
 }
@@ -170,11 +181,12 @@ impl EtaPromoteArgs {
         let mut cases = backtest::cases_from_envelopes(&envelopes);
         cases.extend(backtest::cases_from_journal(&journal_entries));
         let loom = Provenance::current();
+        super::eta_replay_cmd::with_replay_calibration(&registry, &mut history, &cases, &loom);
         let comparison =
             backtest::compare(current, candidate, &history, &cases, filter, &loom).ok();
 
         let ledger_path = shadow::ledger_path(&root);
-        let mut ledger = shadow::read_ledger(&ledger_path);
+        let mut ledger = shadow::read_ledger(&ledger_path)?;
         let now = Utc::now();
         let config_path = loom_daemon::eta::config::promotion_config_path(&root);
         let decision = if self.apply {
@@ -304,8 +316,12 @@ impl EtaBackfillArgs {
             println!("{}", serde_json::to_string_pretty(&entries)?);
         } else if !entries.is_empty() {
             let path = journal::journal_path(&root);
-            journal::append(&path, &entries)?;
-            println!("[eta backfill] appended to {}", path.display());
+            let written = journal::append_dedup(&path, &entries)?;
+            println!(
+                "[eta backfill] appended {written} new row(s) to {} ({} already journaled)",
+                path.display(),
+                entries.len() - written
+            );
         }
 
         if histories.is_empty() && list_error.is_some() {
@@ -363,6 +379,10 @@ pub(crate) struct EtaBacktestArgs {
     /// Emit one JSON document on stdout instead of the human report.
     #[arg(long)]
     pub json: bool,
+
+    /// Opt-in `land` cases from merged PRs' label timelines (#9579).
+    #[command(flatten)]
+    pub pr_cases: PrCaseArgs,
 }
 
 impl EtaBacktestArgs {
@@ -393,14 +413,12 @@ impl EtaBacktestArgs {
             repo: self.repo.as_deref(),
         };
 
-        let envelopes = load_outcome_envelopes(&root);
-        let mut history = StageSamples::default();
-        history.push_envelopes(&envelopes);
-        let journal_entries = journal::read(&journal::journal_path(&root));
-        history.push_journal(&journal_entries, "local");
-        let mut cases = backtest::cases_from_envelopes(&envelopes);
-        cases.extend(backtest::cases_from_journal(&journal_entries));
+        let (mut history, cases, note) = self.replay_inputs(&root, &GhFetcher)?;
+        if let Some(note) = note {
+            eprintln!("{note}");
+        }
         let loom = Provenance::current();
+        super::eta_replay_cmd::with_replay_calibration(&registry, &mut history, &cases, &loom);
 
         if let Some(other_id) = &self.compare {
             let Some(other) = registry.get(other_id) else {
@@ -410,7 +428,7 @@ impl EtaBacktestArgs {
             if self.json {
                 println!("{}", serde_json::to_string_pretty(&comparison)?);
             } else {
-                print!("{}", render_comparison(&comparison));
+                print!("{}", super::eta_backtest_render::render_comparison(&comparison));
             }
             return Ok(());
         }
@@ -419,7 +437,7 @@ impl EtaBacktestArgs {
         if self.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
-            print!("{}", render_report(&report));
+            print!("{}", super::eta_backtest_render::render_report(&report));
         }
         Ok(())
     }
@@ -427,7 +445,7 @@ impl EtaBacktestArgs {
 
 /// Both generations of `sweep-outcome-telemetry.jsonl`, rotated first — the
 /// same order [`StageSamples::load_outcome_journal`] reads them in.
-fn load_outcome_envelopes(root: &Path) -> Vec<TelemetryEnvelope> {
+pub(crate) fn load_outcome_envelopes(root: &Path) -> Vec<TelemetryEnvelope> {
     let path = root
         .join(".loom")
         .join("logs")
@@ -458,7 +476,11 @@ fn load_history(root: &Path, scope: HistoryScopeMode) -> StageSamples {
     history.push_envelopes(&envelopes);
     let journal_entries = journal::read(&journal::journal_path(root));
     history.push_journal(&journal_entries, "local");
-    fleet::apply_scope(scope, root, history)
+    let mut history = fleet::apply_scope(scope, root, history);
+    // #10207: the daemon's calibration log and pending store, so `eta view`
+    // shows the recalibrated interval the daemon would.
+    history.calibration = loom_daemon::eta::calibration_log::load(root);
+    history
 }
 
 /// The scope a `--scope` flag asks for: the flag when given, else the
@@ -649,6 +671,7 @@ fn resolve_current(
                     // least one on its own, so 0 is the honest "unknown"
                     // value everywhere else.
                     rework_rounds: 0,
+                    episode_entered_at: None,
                 })
             }
             Err(reason) => CurrentState::Refused(reason),
@@ -662,6 +685,7 @@ fn resolve_current(
             age_sec,
             age_source: AgeSource::Checkpoint,
             rework_rounds: u32::from(stage == Stage::Doctor),
+            episode_entered_at: None,
         });
     }
     CurrentState::Refused(
@@ -675,11 +699,13 @@ fn resolve_current(
 /// or any open PR under review"): both kinds for a running sweep (the
 /// checkpoint path) or a refusal (so a hold/gate is reported for either kind a
 /// caller asks about), `land` only for an open PR with no known running sweep.
+/// A held PR (`merge_hold`, #10218) is reported like the refusal it was
+/// before the stage existed: every shipped heuristic refuses it `blocked`.
 #[must_use]
 fn eligible_kinds(current: &CurrentState, has_open_pr: bool) -> &'static [Kind] {
     match current {
         CurrentState::Refused(_) => &[Kind::Finish, Kind::Land],
-        CurrentState::At(_) if has_open_pr => &[Kind::Land],
+        CurrentState::At(c) if has_open_pr && c.stage != Stage::MergeHold => &[Kind::Land],
         CurrentState::At(_) => &[Kind::Finish, Kind::Land],
     }
 }
@@ -707,6 +733,8 @@ fn build_input(
         features_omitted: Vec::new(),
         provenance: Provenance::current(),
         dispatch: None,
+        stalls: Vec::new(),
+        held: None,
     }
 }
 
@@ -995,51 +1023,6 @@ impl EtaListArgs {
     }
 }
 
-fn render_bucket(name: &str, b: &Bucket) -> String {
-    format!(
-        "  {name:<28} n={:<5} scored={:<5} refused={:<5} pinball={:>10} coverage={:>7} bias={:>10}\n",
-        b.n,
-        b.scored,
-        b.refused,
-        b.mean_pinball_loss_sec
-            .map(|v| format!("{v:.1}"))
-            .unwrap_or_else(|| "-".to_string()),
-        b.coverage
-            .map(|v| format!("{:.1}%", v * 100.0))
-            .unwrap_or_else(|| "-".to_string()),
-        b.bias_sec
-            .map(|v| format!("{v:.1}"))
-            .unwrap_or_else(|| "-".to_string()),
-    )
-}
-
-fn render_report(r: &BacktestReport) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("ETA backtest: {} ({})\n", r.heuristic, r.kind));
-    out.push_str(&render_bucket("overall", &r.overall));
-    if !r.by_repo.is_empty() {
-        out.push_str("by repo:\n");
-        for (repo, b) in &r.by_repo {
-            out.push_str(&render_bucket(repo, b));
-        }
-    }
-    if !r.by_horizon.is_empty() {
-        out.push_str("by horizon:\n");
-        for (h, b) in &r.by_horizon {
-            out.push_str(&render_bucket(h, b));
-        }
-    }
-    out
-}
-
-fn render_comparison(c: &Comparison) -> String {
-    let mut out = String::new();
-    out.push_str(&render_report(&c.a));
-    out.push_str(&render_report(&c.b));
-    out.push_str(&format!("better: {}\n", c.better.as_deref().unwrap_or("tie / neither scored")));
-    out
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1106,6 +1089,7 @@ mod tests {
                 age_sec: 0,
                 age_source: AgeSource::UpdatedAtLowerBound,
                 rework_rounds: 0,
+                episode_entered_at: None,
             })
         );
     }
@@ -1234,6 +1218,7 @@ mod tests {
             age_sec: 0,
             age_source: AgeSource::UpdatedAtLowerBound,
             rework_rounds: 0,
+            episode_entered_at: None,
         });
         assert_eq!(eligible_kinds(&current, true), &[Kind::Land]);
     }

@@ -466,10 +466,9 @@ fn two_account_workspace() -> (tempfile::TempDir, tempfile::TempDir) {
 fn a_host_with_no_codex_profiles_reports_an_empty_report() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
-    std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+    let _profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
     let (report, effects) =
         run_check(workspace.path(), CheckOptions::default(), at(1_000)).unwrap();
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     assert!(report.accounts.is_empty());
     assert_eq!(effects.ranking_written, None);
 }
@@ -488,7 +487,7 @@ fn ranking_mode_writes_the_provider_namespaced_file_in_the_shared_format() {
         "rollout-b.jsonl",
         &[rollout_line("2026-09-21T10:00:00Z", 100.0, 100.0)],
     );
-    std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+    let _profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
     let now = at(1_789_984_860); // one minute after the readings above
     let (report, effects) = run_check(
         workspace.path(),
@@ -499,7 +498,6 @@ fn ranking_mode_writes_the_provider_namespaced_file_in_the_shared_format() {
         now,
     )
     .unwrap();
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 
     assert_eq!(effects.ranking_written, Some(ranking_path(workspace.path())));
     let text = fs::read_to_string(ranking_path(workspace.path())).unwrap();
@@ -531,7 +529,7 @@ fn selection_lands_on_the_healthy_account_after_the_probe_marks_the_other() {
         "rollout-b.jsonl",
         &[rollout_line("2026-09-21T10:00:00Z", 100.0, 100.0)],
     );
-    std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+    let _profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
     let now = at(1_789_984_860);
     run_check(
         workspace.path(),
@@ -556,7 +554,6 @@ fn selection_lands_on_the_healthy_account_after_the_probe_marks_the_other() {
         .unwrap();
         assert_eq!(chosen.id.name, "alpha");
     }
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }
 
 #[test]
@@ -570,7 +567,7 @@ fn both_accounts_exhausted_produces_the_codex_scoped_refusal() {
             &[rollout_line("2026-09-21T10:00:00Z", 100.0, 100.0)],
         );
     }
-    std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+    let _profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
     let now = at(1_789_984_860);
     run_check(
         workspace.path(),
@@ -590,7 +587,6 @@ fn both_accounts_exhausted_produces_the_codex_scoped_refusal() {
         u64::try_from(now.timestamp()).unwrap(),
     )
     .unwrap_err();
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     let rendered = format!("{error:#}");
     assert!(rendered.contains("Codex"), "{rendered}");
     assert!(!rendered.contains(".loom/tokens"), "{rendered}");
@@ -605,10 +601,9 @@ fn a_bare_check_writes_nothing() {
         "rollout-b.jsonl",
         &[rollout_line("2026-09-21T10:00:00Z", 100.0, 100.0)],
     );
-    std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+    let _profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
     let (report, effects) =
         run_check(workspace.path(), CheckOptions::default(), at(1_789_984_860)).unwrap();
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     assert_eq!(report.accounts.len(), 2);
     assert!(effects.marked_exhausted.is_empty());
     assert!(!ranking_path(workspace.path()).exists());

@@ -29,13 +29,35 @@ pub struct ProbeOptions {
 }
 
 /// The `gh` Loom will actually exec: the program the spawn choke point's
-/// resolver picks ([`crate::gh_invocation::resolver::resolve`] —
-/// `$LOOM_GH_BIN`, else `gh`), resolved on `PATH` when bare. Not
-/// `command -v gh` in some other shell. Single-sourced so the validator and
-/// every facade spawn agree by construction.
+/// resolver picks ([`crate::gh_invocation::resolver::resolve`] — the policy
+/// launcher, else `$LOOM_GH_BIN`, else `gh`), resolved on `PATH` when bare.
+/// Not `command -v gh` in some other shell. Single-sourced so the validator
+/// and every facade spawn agree by construction. Feeds the version floor.
 #[must_use]
 pub fn effective_gh_path() -> Option<PathBuf> {
-    let name = PathBuf::from(crate::gh_invocation::resolver::resolve().program);
+    which(&crate::gh_invocation::resolver::resolve().program)
+}
+
+/// [`effective_gh_path`] plus the rung that produced it, from ONE resolution
+/// so the two can never disagree.
+fn effective_gh() -> (Option<PathBuf>, &'static str) {
+    let resolved = crate::gh_invocation::resolver::resolve();
+    (which(&resolved.program), resolved.source.as_str())
+}
+
+/// The `gh` an agent's plain `gh` resolves to: bare `gh` on `PATH`, never the
+/// resolver (no policy launcher, no `$LOOM_GH_BIN`). Feeds
+/// `toolchain.launcher-not-first`, which asks whether PATH puts the managed
+/// launcher first — a question the daemon's own exec target cannot answer.
+#[must_use]
+pub fn path_gh_path() -> Option<PathBuf> {
+    which("gh")
+}
+
+/// `program` as an existing file: a path with a directory component is
+/// checked as-is; a bare name is looked up on `PATH`.
+fn which(program: &str) -> Option<PathBuf> {
+    let name = PathBuf::from(program);
     if name.as_os_str().is_empty() {
         return None;
     }
@@ -96,30 +118,62 @@ fn gh_version_command(exe: &Path, empty_config: Option<&Path>) -> Command {
 }
 
 /// Run `cmd` with a timeout; `Some((success, stdout))` when it finished.
+///
+/// Stdout is drained on a reader thread while this thread polls for exit, so
+/// a child writing more than one pipe buffer (~64 KiB) is not mistaken for a
+/// hang. The child runs in its own process group; on timeout the whole group
+/// is killed (so a grandchild such as `curl` under `sh -c` cannot outlive the
+/// probe or hold the pipe open) before the reader is joined.
 fn run_bounded(cmd: &mut Command, timeout: Duration) -> Option<(bool, String)> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .ok()?;
+    let pgid = i32::try_from(child.id()).ok();
+    let reader = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = s.read_to_end(&mut bytes);
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    });
+    let join = |reader: Option<std::thread::JoinHandle<String>>| {
+        reader.and_then(|r| r.join().ok()).unwrap_or_default()
+    };
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let mut out = String::new();
-                if let Some(mut s) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = s.read_to_string(&mut out);
-                }
-                return Some((status.success(), out));
+                // A grandchild that kept the pipe open would block the join;
+                // the direct child has exited, so reap its group first.
+                kill_group(pgid);
+                return Some((status.success(), join(reader)));
             }
             Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(20)),
             _ => {
+                kill_group(pgid);
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = join(reader);
                 return None;
             }
+        }
+    }
+}
+
+/// SIGKILL the process group led by `pgid` (the probe child).
+fn kill_group(pgid: Option<i32>) {
+    if let Some(pgid) = pgid.filter(|p| *p > 1) {
+        // SAFETY: `kill(2)` with a negative pid signals a process group; no
+        // memory is touched. ESRCH (already gone) is ignored.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
         }
     }
 }
@@ -222,6 +276,36 @@ pub fn loom_owned_profile_dirs(workspace: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Does `<dir>/hosts.yml` carry a non-empty `oauth_token` for any host? Only
+/// the verdict is returned; the token is never retained.
+#[must_use]
+pub fn profile_holds_token(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("hosts.yml")).is_ok_and(|t| hosts_text_has_token(&t))
+}
+
+/// See [`profile_holds_token`].
+#[must_use]
+pub fn hosts_text_has_token(text: &str) -> bool {
+    text.lines().any(|l| {
+        l.trim_start()
+            .strip_prefix("oauth_token:")
+            .is_some_and(|v| !unquote(v.split(" #").next().unwrap_or("")).is_empty())
+    })
+}
+
+/// Is the effective git credential helper `gh auth git-credential`?
+fn git_helper_is_gh(cwd: &Path) -> bool {
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "config",
+        "--get-regexp",
+        r"^credential\..*helper$|^credential\.helper$",
+    ])
+    .current_dir(cwd);
+    run_bounded(&mut cmd, Duration::from_secs(10))
+        .is_some_and(|(_, out)| out.lines().any(|l| l.contains("auth git-credential")))
+}
+
 /// Count `insteadOf`/`pushInsteadOf` rewrites whose matched prefix names the
 /// logical host. Counts only — never URLs (they can embed credentials).
 fn git_rewrites(cwd: &Path, logical: &str) -> usize {
@@ -308,11 +392,21 @@ pub fn observe(doc: &PolicyDoc, workspace: &Path, opts: ProbeOptions) -> Observe
         Some(cmd) => Some(run_canary(cmd)),
         None => None,
     };
+    let token_profiles = profiles
+        .iter()
+        .filter(|p| profile_holds_token(&p.path))
+        .map(|p| p.path.clone())
+        .collect();
+    let (exec_gh, gh_source) = effective_gh();
     Observed {
+        token_profiles,
+        git_helper_is_gh: git_helper_is_gh(workspace),
         gh_host: env_nonempty("GH_HOST"),
         gh_repo: env_nonempty("GH_REPO"),
         gh_config_dir,
-        gh: gh_build(effective_gh_path()),
+        gh: gh_build(exec_gh),
+        path_gh: path_gh_path(),
+        gh_source: Some(gh_source),
         launcher_exists: !launcher.is_empty() && Path::new(launcher).exists(),
         profiles,
         git_rewrites: git_rewrites(workspace, logical),
@@ -325,6 +419,47 @@ pub fn observe(doc: &PolicyDoc, workspace: &Path, opts: ProbeOptions) -> Observe
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canary_printing_more_than_a_pipe_buffer_is_open_not_not_run() {
+        let out = run_bounded(
+            Command::new("sh").args(["-c", "head -c 200000 /dev/zero | tr '\\0' a"]),
+            Duration::from_secs(20),
+        )
+        .expect("finished within the bound");
+        assert!(out.0);
+        assert_eq!(out.1.len(), 200_000);
+        assert!(matches!(
+            run_canary("head -c 200000 /dev/zero | tr '\\0' a"),
+            CanaryOutcome::Open
+        ));
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let script = format!("sleep 300 & echo $! > '{}'; wait", pid_file.display());
+        let started = Instant::now();
+        let result = run_bounded(Command::new("sh").args(["-c", &script]), Duration::from_secs(1));
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(30), "reader join hung");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut gone = false;
+        for _ in 0..100 {
+            // SAFETY: signal 0 only probes for existence.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(gone, "grandchild {pid} survived the timeout");
+    }
 
     #[test]
     fn parses_api_host_from_gh_layout_and_never_keeps_the_token() {

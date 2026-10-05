@@ -40,7 +40,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -68,6 +67,33 @@ fn cache() -> &'static Mutex<HashMap<String, VisibilityEntry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Process-global negative cache (#10087): per `owner/repo`, the instant before
+/// which a failed probe must not be retried. Without it, "a failed probe is
+/// never cached as an *answer*" (#6039) degenerated into "every telemetry
+/// emission re-spawns `gh`", which during a rate-limit outage meant thousands of
+/// doomed `gh api` calls. This stores only a retry deadline, never a visibility,
+/// so the fail-closed rule is untouched.
+fn next_probe_after() -> &'static Mutex<HashMap<String, Instant>> {
+    static NEXT: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    NEXT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// How long to back off after `failure`. A rate limit waits for the breaker's
+/// reported cooldown end when one is known; everything else (and a rate limit
+/// with no known reset) waits at least [`VISIBILITY_CACHE_TTL`].
+fn backoff_for(failure: ProbeFailure) -> Duration {
+    if failure == ProbeFailure::RateLimited {
+        if let Some(until) =
+            crate::rate_limit_breaker::global_snapshot().and_then(|s| s.cooldown_until)
+        {
+            if let Ok(d) = (until - chrono::Utc::now()).to_std() {
+                return d.max(Duration::from_secs(1));
+            }
+        }
+    }
+    VISIBILITY_CACHE_TTL
+}
+
 /// The cached visibility for `owner_repo`, or `None` when nothing has been cached
 /// yet. Never shells out — a pure cache read, safe to call on the hot path (the
 /// analogue of [`crate::cpu_headroom::cached_cpu_idle_fraction`]). Note it does
@@ -90,7 +116,11 @@ pub fn cached_visibility(owner_repo: &str) -> Option<RepoVisibility> {
 /// **Blocks** (spawns `gh`) when it does probe; on the daemon's async runtime,
 /// call it from `spawn_blocking`, mirroring `cpu_headroom`'s guidance.
 pub fn refresh_visibility_cache(owner_repo: &str) {
-    refresh_visibility_cache_with(owner_repo, fetch_visibility_via_gh);
+    refresh_visibility_cache_with(
+        owner_repo,
+        fetch_visibility_via_gh,
+        crate::rate_limit_breaker::global_is_suppressed,
+    );
 }
 
 /// Testable core of [`refresh_visibility_cache`]: the TTL/caching logic with the
@@ -98,11 +128,13 @@ pub fn refresh_visibility_cache(owner_repo: &str) {
 /// fake for the real `gh` subprocess (the seam `cpu_headroom`'s tests achieve by
 /// stubbing the data source). `fetch` returns `Err(ProbeFailure)` when the
 /// repo's visibility could not be determined; a failure is not cached, so a
-/// later call re-probes — and **is not silent**: [`note_probe_failed`] logs the
+/// later call is *backed off* (#10087, see [`next_probe_after`]) rather than
+/// re-probed per call — and **is not silent**: [`note_probe_failed`] logs the
 /// first failure of a streak, [`note_probe_recovered`] logs the recovery.
-fn refresh_visibility_cache_with<F>(owner_repo: &str, fetch: F)
+fn refresh_visibility_cache_with<F, S>(owner_repo: &str, fetch: F, is_suppressed: S)
 where
     F: FnOnce(&str) -> Result<RepoVisibility, ProbeFailure>,
+    S: FnOnce() -> bool,
 {
     let mut guard = cache()
         .lock()
@@ -112,6 +144,25 @@ where
             // Fresh — do not re-probe. This is the cache hit the Test Plan pins.
             return;
         }
+    }
+    // Negative cache (#10087): a recent failure suppresses re-probing, for a
+    // cold entry and a stale one alike.
+    {
+        let mut next = next_probe_after()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match next.get(owner_repo) {
+            Some(deadline) if Instant::now() < *deadline => return,
+            Some(_) => {
+                next.remove(owner_repo);
+            }
+            None => {}
+        }
+    }
+    // Never spawn `gh` while the shared rate-limit breaker is suppressing the
+    // forge (#10087). Not recorded as a failure: the breaker owns that window.
+    if is_suppressed() {
+        return;
     }
     // Absent or stale: probe. Hold the lock across the probe (as `cpu_headroom`
     // holds its lock across the ~1s `iostat`); the per-repo answer is cheap to
@@ -135,8 +186,20 @@ where
     }
     drop(guard);
     match result {
-        Ok(_) => note_probe_recovered(owner_repo),
-        Err(failure) => note_probe_failed(owner_repo, failure),
+        Ok(_) => {
+            next_probe_after()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(owner_repo);
+            note_probe_recovered(owner_repo);
+        }
+        Err(failure) => {
+            next_probe_after()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(owner_repo.to_string(), Instant::now() + backoff_for(failure));
+            note_probe_failed(owner_repo, failure);
+        }
     }
 }
 
@@ -163,6 +226,8 @@ enum ProbeFailure {
     SpawnFailed,
     /// `gh` ran but exited non-zero (API error, rate limit, auth failure, forge outage, ...).
     NonZeroExit,
+    /// `gh` exited non-zero and its stderr carried a rate-limit signature (#10087).
+    RateLimited,
     /// `gh` exited `0` but the `.private` output was not a bare `true`/`false`.
     UnparseableOutput,
 }
@@ -172,6 +237,7 @@ impl fmt::Display for ProbeFailure {
         f.write_str(match self {
             ProbeFailure::SpawnFailed => "gh failed to spawn",
             ProbeFailure::NonZeroExit => "gh exited non-zero",
+            ProbeFailure::RateLimited => "gh was rate limited",
             ProbeFailure::UnparseableOutput => "gh returned unparseable output",
         })
     }
@@ -184,20 +250,48 @@ impl fmt::Display for ProbeFailure {
 /// default rather than caching a guess — and so the caller can name the
 /// failure mode in its log line instead of it being swallowed.
 fn fetch_visibility_via_gh(owner_repo: &str) -> Result<RepoVisibility, ProbeFailure> {
-    let mut cmd = Command::new("gh");
-    cmd.args(["api", &format!("repos/{owner_repo}"), "--jq", ".private"])
-        .stderr(Stdio::null());
+    use crate::cmd_out::{CmdOutcome, Unavailable};
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     // #5431: this probe carries `owner/repo` in the API path but no
-    // checkout-root `current_dir`, so key the token off the owner slug. Without
-    // it a cross-owner *private* repo 404s under the root owner's token and is
-    // (safely) reported Private even when the owner's own token could read it.
-    crate::credential_preflight::apply_gh_config_for_owner_slug(&mut cmd, owner_repo);
-    let output = cmd.output().map_err(|_| ProbeFailure::SpawnFailed)?;
+    // checkout-root `current_dir`, so the facade keys the token off the typed
+    // target's owner. Without it a cross-owner *private* repo 404s under the
+    // root owner's token and is (safely) reported Private even when the
+    // owner's own token could read it. #10089: through the facade, so every
+    // probe — including the failed-probe retries #10087 tracks — is counted
+    // under `visibility.repo`.
+    let target = GhTarget::repo(owner_repo).unwrap_or(GhTarget::None);
+    let path = format!("repos/{owner_repo}");
+    let output = match GhInvocation::new(
+        Operation::new("visibility.repo"),
+        AccessIntent::Read,
+        target,
+        Duration::from_secs(30),
+    )
+    .forge_op(crate::forge_call_stats::ops::REPO_VIEW)
+    .args(["api", &path, "--jq", ".private"])
+    .run()
+    {
+        CmdOutcome::Ran(output) => output,
+        CmdOutcome::Unavailable(Unavailable::Spawn(_)) => return Err(ProbeFailure::SpawnFailed),
+        CmdOutcome::Unavailable(_) => return Err(ProbeFailure::NonZeroExit),
+    };
     if !output.status.success() {
-        return Err(ProbeFailure::NonZeroExit);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(classify_failure(&stderr));
     }
     parse_gh_private(&String::from_utf8_lossy(&output.stdout))
         .ok_or(ProbeFailure::UnparseableOutput)
+}
+
+/// Classify a non-zero `gh` exit from its stderr. On a rate-limit signature,
+/// also trip the shared breaker so it supplies the real reset time (#10087).
+fn classify_failure(stderr: &str) -> ProbeFailure {
+    if crate::rate_limit_breaker::indicates_rate_limit(stderr) {
+        let _ = crate::rate_limit_breaker::global_observe_failure(stderr, "telemetry_visibility");
+        ProbeFailure::RateLimited
+    } else {
+        ProbeFailure::NonZeroExit
+    }
 }
 
 /// Parse the `--jq .private` output (`"true"`/`"false"`) into a visibility.
@@ -321,12 +415,12 @@ mod tests {
         };
 
         // Cold cache: the first refresh probes exactly once.
-        refresh_visibility_cache_with(key, fetch);
+        refresh_visibility_cache_with(key, fetch, || false);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "cold cache should probe once");
         assert_eq!(cached_visibility(key), Some(RepoVisibility::Public));
 
         // Warm cache within the TTL: the second refresh must NOT probe again.
-        refresh_visibility_cache_with(key, fetch);
+        refresh_visibility_cache_with(key, fetch, || false);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -336,24 +430,97 @@ mod tests {
     }
 
     #[test]
-    fn probe_failure_is_not_cached_and_reprobes() {
+    fn probe_failure_is_not_cached_as_an_answer() {
         let key = "test-owner/uncacheable-repo";
+        let fetch = |_repo: &str| -> Result<RepoVisibility, ProbeFailure> {
+            Err(ProbeFailure::NonZeroExit)
+        };
+        refresh_visibility_cache_with(key, fetch, || false);
+        // No visibility is ever stamped on failure (#6039 fail-closed).
+        assert_eq!(cached_visibility(key), None);
+    }
+
+    #[test]
+    fn failed_probes_in_backoff_window_cause_one_spawn() {
+        let key = "test-owner/backoff-window-repo";
         let calls = AtomicUsize::new(0);
         let fetch = |_repo: &str| -> Result<RepoVisibility, ProbeFailure> {
             calls.fetch_add(1, Ordering::SeqCst);
-            Err(ProbeFailure::NonZeroExit) // e.g. gh failed / unparseable
+            Err(ProbeFailure::RateLimited)
         };
-
-        refresh_visibility_cache_with(key, fetch);
-        // Nothing cached, so the hot-path read is still empty…
+        for _ in 0..50 {
+            refresh_visibility_cache_with(key, fetch, || false);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "N emissions => one probe");
         assert_eq!(cached_visibility(key), None);
-        // …and a second refresh re-probes (a failed probe is not memoized).
-        refresh_visibility_cache_with(key, fetch);
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "a probe that failed must not be cached; the next call re-probes"
+    }
+
+    #[test]
+    fn stale_entry_is_probed_once_per_backoff_and_value_kept() {
+        let key = "test-owner/stale-backoff-repo";
+        cache().lock().unwrap().insert(
+            key.to_string(),
+            VisibilityEntry {
+                visibility: RepoVisibility::Public,
+                updated_at: Instant::now() - VISIBILITY_CACHE_TTL - Duration::from_secs(1),
+            },
         );
+        let calls = AtomicUsize::new(0);
+        let fetch = |_repo: &str| -> Result<RepoVisibility, ProbeFailure> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(ProbeFailure::NonZeroExit)
+        };
+        for _ in 0..10 {
+            refresh_visibility_cache_with(key, fetch, || false);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cached_visibility(key), Some(RepoVisibility::Public));
+    }
+
+    #[test]
+    fn probe_resumes_after_backoff_deadline_and_success_clears_it() {
+        let key = "test-owner/backoff-expiry-repo";
+        let calls = AtomicUsize::new(0);
+        let failing = |_repo: &str| -> Result<RepoVisibility, ProbeFailure> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(ProbeFailure::NonZeroExit)
+        };
+        refresh_visibility_cache_with(key, failing, || false);
+        // Force the deadline into the past.
+        next_probe_after()
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), Instant::now() - Duration::from_secs(1));
+        let ok = |_repo: &str| -> Result<RepoVisibility, ProbeFailure> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RepoVisibility::Public)
+        };
+        refresh_visibility_cache_with(key, ok, || false);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(cached_visibility(key), Some(RepoVisibility::Public));
+        assert!(!next_probe_after().lock().unwrap().contains_key(key));
+    }
+
+    #[test]
+    fn suppressed_breaker_prevents_any_spawn() {
+        let key = "test-owner/suppressed-repo";
+        let calls = AtomicUsize::new(0);
+        let fetch = |_repo: &str| -> Result<RepoVisibility, ProbeFailure> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RepoVisibility::Public)
+        };
+        refresh_visibility_cache_with(key, fetch, || true);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cached_visibility(key), None);
+    }
+
+    #[test]
+    fn classify_failure_detects_rate_limit() {
+        assert_eq!(
+            classify_failure("gh: API rate limit exceeded for user ID 1 (HTTP 403)"),
+            ProbeFailure::RateLimited
+        );
+        assert_eq!(classify_failure("gh: Not Found (HTTP 404)"), ProbeFailure::NonZeroExit);
     }
 
     // ------------------------------------------------------------------
@@ -386,7 +553,7 @@ mod tests {
         };
 
         // The entry is stale, so this attempts a re-probe...
-        refresh_visibility_cache_with(key, failing_fetch);
+        refresh_visibility_cache_with(key, failing_fetch, || false);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -413,7 +580,7 @@ mod tests {
         // nothing cached, so the public entry point must resolve to Private —
         // never leak-by-default.
         let key = "test-owner/never-probed-repo";
-        refresh_visibility_cache_with(key, |_r| Err(ProbeFailure::NonZeroExit));
+        refresh_visibility_cache_with(key, |_r| Err(ProbeFailure::NonZeroExit), || false);
         assert_eq!(cached_visibility(key), None);
         // derive_visibility layers the real gh probe on top; for a repo that
         // does not exist under the test's `gh`, that probe also fails, so the
@@ -481,6 +648,7 @@ mod tests {
     fn probe_failure_display_names_each_mode() {
         assert_eq!(ProbeFailure::SpawnFailed.to_string(), "gh failed to spawn");
         assert_eq!(ProbeFailure::NonZeroExit.to_string(), "gh exited non-zero");
+        assert_eq!(ProbeFailure::RateLimited.to_string(), "gh was rate limited");
         assert_eq!(ProbeFailure::UnparseableOutput.to_string(), "gh returned unparseable output");
     }
 }

@@ -13,7 +13,7 @@ use crate::telemetry::{
 use chrono::Duration;
 use std::collections::BTreeMap;
 
-fn record(
+pub(super) fn record(
     issue: u32,
     repo: &str,
     phases: &[(&str, i64)],
@@ -180,6 +180,7 @@ fn one_case(t: chrono::DateTime<chrono::Utc>) -> ReplayCase {
         outcome: OutcomeKind::Landed,
         actual_at: t + Duration::seconds(900),
         dispatch: None,
+        age_sec: 0,
     }
 }
 

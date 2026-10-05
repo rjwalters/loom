@@ -6,7 +6,8 @@ use serial_test::serial;
 struct RegistryFixture {
     workspace: tempfile::TempDir,
     _profiles: tempfile::TempDir,
-    previous_profile_root: Option<std::ffi::OsString>,
+    /// RAII redirect of `LOOM_CODEX_PROFILE_ROOT` (crate-wide lock, #9964).
+    _profile_root: crate::tokens_pool::profile_root_env::ProfileRootEnv,
 }
 
 impl RegistryFixture {
@@ -30,23 +31,12 @@ impl RegistryFixture {
             serde_json::to_vec(&serde_json::json!({"version": 1, "accounts": accounts})).unwrap(),
         )
         .unwrap();
-        let previous_profile_root =
-            std::env::var_os(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV);
-        std::env::set_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV, profiles.path());
+        let profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
         Self {
             workspace,
             _profiles: profiles,
-            previous_profile_root,
-        }
-    }
-}
-
-impl Drop for RegistryFixture {
-    fn drop(&mut self) {
-        let key = crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV;
-        match &self.previous_profile_root {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
+            _profile_root: profile_root,
         }
     }
 }

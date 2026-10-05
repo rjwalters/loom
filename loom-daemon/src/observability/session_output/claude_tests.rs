@@ -60,6 +60,7 @@ fn identity() -> RunIdentity {
         attempt: Some(1),
         runtime: "claude".to_string(),
         role: Some("builder".to_string()),
+        launch: crate::telemetry::kinds::session_output::Launch::Daemon,
     }
 }
 
@@ -426,4 +427,57 @@ fn discovery_is_unaffected_by_the_worktree_directory_name() {
 fn a_missing_projects_directory_yields_no_streams() {
     let scratch = Scratch::new("no-projects");
     assert!(discover(&scratch.file("nope"), &scratch.file("ws"), 9764).is_empty());
+}
+
+// ---- #10124: narration filed as `thinking` ----------------------------------
+//
+// Real-shaped (sanitized) fixtures. In Claude Code 2.1.288 transcripts every
+// `thinking` block has exactly `type`, `thinking` (empty) and `signature`
+// (populated), whether the turn ends in `tool_use` or `end_turn`. Nothing
+// distinguishes narration from reasoning, so none is emitted; the loss is
+// counted instead.
+
+fn real_shaped_thinking(stop_reason: &str, thinking: &str) -> String {
+    format!(
+        r#"{{"type":"assistant","timestamp":"2026-09-30T11:59:58.000Z","message":{{"stop_reason":"{stop_reason}","content":[{{"type":"thinking","thinking":{},"signature":"EqQBCkYIARgCKkD0c2lnbmF0dXJl"}}]}}}}"#,
+        serde_json::to_string(thinking).unwrap()
+    ) + "\n"
+}
+
+#[test]
+fn narration_shaped_and_reasoning_shaped_thinking_are_both_withheld_and_counted() {
+    let scratch = Scratch::new("thinking-withheld");
+    let path = scratch.file("t.jsonl");
+    // Narration-as-thinking: the text a user would have seen before a tool call.
+    append(
+        &path,
+        &real_shaped_thinking("tool_use", "NARRATION-MARKER I will read the config next."),
+    );
+    append(&path, &assistant_tool_use("tu_1", "Read", "x"));
+    // Genuine reasoning, plus the empty-with-signature shape real transcripts carry.
+    append(&path, &real_shaped_thinking("end_turn", "REASONING-MARKER weighing options."));
+    append(&path, &real_shaped_thinking("end_turn", ""));
+
+    let mut cursor = Cursor::default();
+    let pass = cursor.advance(&path, "sess", &identity(), now());
+
+    assert_eq!(pass.thinking_withheld, 3);
+    let categories: Vec<_> = pass.records.iter().map(|r| r.category).collect();
+    assert_eq!(categories, vec![OutputCategory::ToolStart]);
+    let dump = format!("{:?}", pass.records);
+    assert!(!dump.contains("NARRATION-MARKER"));
+    assert!(!dump.contains("REASONING-MARKER"));
+}
+
+#[test]
+fn no_thinking_means_no_coverage_gap_signal() {
+    let scratch = Scratch::new("no-thinking");
+    let path = scratch.file("t.jsonl");
+    append(&path, &assistant_text("Reading the file now."));
+    append(&path, &assistant_tool_use("tu_1", "Read", "x"));
+
+    let mut cursor = Cursor::default();
+    let pass = cursor.advance(&path, "sess", &identity(), now());
+    assert_eq!(pass.thinking_withheld, 0);
+    assert_eq!(pass.records.len(), 2);
 }

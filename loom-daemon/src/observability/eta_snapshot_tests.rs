@@ -60,11 +60,14 @@ fn summary(
         p25_sec: p50.map(|p| p - 60),
         p50_sec: p50,
         p75_sec: p50.map(|p| p + 60),
+        p90_sec: p50.map(|p| p + 120),
         samples_min: Some(12),
         no_estimate_reason: p50
             .is_none()
             .then_some(NoEstimateReason::InsufficientSamples),
         stage_quartiles: Vec::new(),
+        tail_extrapolated: false,
+        stall_cause: None,
     }
 }
 
@@ -350,6 +353,7 @@ fn rows_are_built_from_the_trackers_own_pending_estimates() {
         refresh_secs: 300,
         host_id: Some("host-test"),
         repo_ids: &repo_ids,
+        stalls: &crate::eta::stall::StallSnapshot::default(),
     };
     tracker.on_dispatch(REPO, 9289, "sweep-issue-9289-1", at);
     let emissions = tracker.estimate(None, &ctx, at);
@@ -377,4 +381,75 @@ fn rows_are_built_from_the_trackers_own_pending_estimates() {
     let mut kinds: Vec<Kind> = record.rows.iter().map(|r| r.kind).collect();
     kinds.dedup();
     assert_eq!(kinds.len(), record.rows.len(), "one row per (item, kind)");
+}
+
+#[test]
+fn the_cap_keeps_land_rows_of_every_repo_and_drops_start_finish_first() {
+    let cap = u32::try_from(super::MAX_ROWS).unwrap();
+    let mut pending = Vec::new();
+    // An early-sorting repo floods the cap with start refusals and finish rows.
+    for i in 0..cap {
+        pending.push(summary("a/early", i, Kind::Start, "start-v1", 0, None));
+        pending.push(summary("a/early", i, Kind::Finish, "finish-v1", 0, Some(60)));
+    }
+    pending.push(summary("a/early", 0, Kind::Land, "land-v1", 0, None));
+    // A last-sorting repo with land estimates.
+    for i in 0..10 {
+        pending.push(summary("z/late", i, Kind::Land, "land-v1", 0, Some(600)));
+    }
+    let selected = select_current(&pending, &current());
+    let record = build_record(&selected, &visibility());
+    assert_eq!(record.rows.len(), super::MAX_ROWS);
+    assert_eq!(
+        record
+            .rows
+            .iter()
+            .filter(|r| r.repo == "z/late" && r.kind == Kind::Land && r.p50.is_some())
+            .count(),
+        10
+    );
+    // The land refusal outranks every start/finish row.
+    assert!(record
+        .rows
+        .iter()
+        .any(|r| r.repo == "a/early" && r.kind == Kind::Land && r.p50.is_none()));
+    // Re-sorted by (repo, issue, kind) after the cut.
+    let keys: Vec<_> = record
+        .rows
+        .iter()
+        .map(|r| (r.repo.clone(), r.issue, r.kind))
+        .collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted);
+    // Dropped counts: start/finish only, no land.
+    assert_eq!(record.rows_truncated, selected.len() - super::MAX_ROWS);
+    assert_eq!(record.rows_truncated_by_kind.get(&Kind::Land), None);
+    assert_eq!(record.rows_truncated_by_kind.values().sum::<usize>(), record.rows_truncated);
+    assert!(record.rows_truncated_by_kind.contains_key(&Kind::Start));
+}
+
+#[test]
+fn no_truncation_means_no_per_kind_counts() {
+    let pending = vec![summary(REPO, 1, Kind::Land, "land-v1", 0, Some(60))];
+    let selected = select_current(&pending, &current());
+    let record = build_record(&selected, &visibility());
+    assert!(record.rows_truncated_by_kind.is_empty());
+}
+
+#[test]
+fn a_serialized_row_stays_within_the_measured_budget() {
+    let pending = vec![summary(
+        "rjwalters/loom",
+        10052,
+        Kind::Land,
+        "land-v1",
+        0,
+        Some(600),
+    )];
+    let selected = select_current(&pending, &current());
+    let record = build_record(&selected, &visibility());
+    let bytes = serde_json::to_vec(&record.rows[0]).unwrap().len();
+    // MAX_ROWS is sized on ~250-350 B/row (~50-70 KB/record); see its doc comment.
+    assert!(bytes < 500, "row grew to {bytes} bytes");
 }

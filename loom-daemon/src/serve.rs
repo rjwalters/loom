@@ -605,8 +605,8 @@ async fn handle_health(
     // working), so this mostly guards a `gh` that has gone missing since —
     // but the check is symmetric with the CLI collector so this route's
     // `queues`/`throughput` never regress to the pre-#5061 per-repo noise.
-    let gh_bin = Path::new(pipeline_snapshot::DEFAULT_GH_BIN);
-    let gh_unavailable = pipeline_snapshot::probe_gh_availability(gh_bin).err();
+    let gh_bin = pipeline_snapshot::default_gh_bin();
+    let gh_unavailable = pipeline_snapshot::probe_gh_availability(&gh_bin).err();
     let pipeline = match (&report, &gh_unavailable) {
         (Some(r), None) => {
             let roots: Vec<PathBuf> = r.per_repo.iter().map(|repo| repo.root.clone()).collect();

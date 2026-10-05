@@ -8,19 +8,27 @@
 //! indeterminate arm, which [`super::detect`] turns into "invalidate as
 //! before" — never into an assumed equivalence.
 //!
-//! # Read-only, and deliberately network-free
+//! # One bounded fetch, and nothing else touches the network (#10134)
 //!
-//! Nothing here fetches. An earlier draft of #9416 did a best-effort
-//! `git fetch origin <sha>` to bring an absent head in, and that was wrong on
-//! two counts: it made an evidence function reach the network as a side effect
-//! on a path whose whole job is to answer a question, and it bought nothing —
-//! when the objects are absent, [`super::patch_identity`] (which asks the
-//! forge, not the object store) already answers the clean-merge shape too,
-//! because a clean merge of the base leaves the PR's own merge-base-relative
-//! patch untouched. So an absent object is simply
-//! [`super::Evidence::Indeterminate`] here and the next kind takes over. The
-//! only write any of this makes is `merge-tree --write-tree`'s inert loose
-//! tree object (see [`merge_tree`]).
+//! #9416 shipped this module network-free on the theory that an absent object
+//! cost nothing, because [`super::patch_identity`] (which asks the forge)
+//! "answers the clean-merge shape too". It does not, whenever the base moved a
+//! file the PR also touches: the PR's patch context and resulting blob ids
+//! legitimately change, `patch_identity` refutes, and the ONLY kind that can
+//! carry the verdict is the clean-merge one — which then answered
+//! `Indeterminate` on every host whose clone had not yet seen the brand-new
+//! update-branch merge commit. That is exactly the 2am#2150/#2090/#2173/#2121
+//! incident (2026-10-03): `loom:pr` stripped from four byte-identical reviewed
+//! changes within a minute of `gh pr update-branch`.
+//!
+//! So [`ensure_commit`] now brings an absent commit in with ONE bounded
+//! `git fetch origin -- <sha>` (falling back to the PR's `refs/pull/<n>/head`).
+//! It writes objects only — `--no-write-fetch-head`, no refspec destination,
+//! no tags — so no ref, no index and no working tree moves. Every other
+//! function here stays read-only; the only other write is `merge-tree
+//! --write-tree`'s inert loose tree object (see [`merge_tree`]). A fetch that
+//! fails or times out is still `Indeterminate` (fail closed), but it now comes
+//! back with a reason the caller surfaces instead of swallowing.
 //!
 //! The git-version floor (`>= 2.38`, where `merge-tree --write-tree` exists)
 //! and the exit-code reading (`0` clean, `1` conflict, anything else a
@@ -84,6 +92,85 @@ pub(super) fn has_commit(repo: &Path, sha: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Hang ceiling for [`ensure_commit`]'s fetch. A fetch of one PR head into an
+/// up-to-date clone takes well under a second; this bounds a wedged remote.
+pub(super) const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Make sure `sha` is present locally as a commit, fetching it from `origin`
+/// when it is not (Issue #10134). `Ok(())` once it is present; `Err(reason)`
+/// — redacted, one line, for a log or a PR comment — when it could not be
+/// brought in.
+///
+/// Tried in order: `git fetch origin -- <sha>` (GitHub serves any reachable commit
+/// by id), then `refs/pull/<pr>/head` when the PR number is known (a commit the
+/// forge only reaches through the PR ref). Both fetch objects only — no ref,
+/// no `FETCH_HEAD`, no tags — and both run with prompting disabled and stdin
+/// nulled under [`FETCH_TIMEOUT`], so a credential prompt can never wedge the
+/// daemon pass.
+pub(super) fn ensure_commit(repo: &Path, pr: Option<u32>, sha: &str) -> Result<(), String> {
+    if has_commit(repo, sha) {
+        return Ok(());
+    }
+    let mut specs = vec![sha.to_string()];
+    if let Some(pr) = pr {
+        specs.push(format!("refs/pull/{pr}/head"));
+    }
+    let mut failures = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(repo)
+            .args([
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "origin",
+                "--",
+                spec,
+            ])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null());
+        let outcome = crate::cmd_out::run_command(cmd, FETCH_TIMEOUT);
+        if outcome.succeeded() && has_commit(repo, sha) {
+            return Ok(());
+        }
+        failures.push(if outcome.succeeded() {
+            format!("`git fetch origin -- {spec}` succeeded but {sha} is still absent")
+        } else {
+            outcome.failure_reason(&format!("git fetch origin -- {spec}"))
+        });
+    }
+    Err(redact(&failures.join("; ")))
+}
+
+/// Make a git diagnostic safe and compact enough for a log line or a public PR
+/// comment: credentials embedded in a URL (`https://user:token@host`) are
+/// masked, whitespace is collapsed to one line, and the result is capped.
+pub(super) fn redact(s: &str) -> String {
+    const CAP: usize = 400;
+    let words: Vec<String> = s
+        .split_whitespace()
+        .map(|w| {
+            let Some(scheme) = w.find("://") else {
+                return w.to_string();
+            };
+            let rest = &w[scheme + 3..];
+            let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
+            match authority.rfind('@') {
+                Some(at) => format!("{}://***{}", &w[..scheme], &rest[at..]),
+                None => w.to_string(),
+            }
+        })
+        .collect();
+    let line = words.join(" ");
+    if line.chars().count() <= CAP {
+        line
+    } else {
+        format!("{}…", line.chars().take(CAP).collect::<String>())
+    }
 }
 
 /// `git rev-parse --verify <rev>` — resolve a rev to a full 40-hex OID.
