@@ -52,5 +52,36 @@
       "coverage": null,
       "bias_sec": null
     }
+  },
+  "stability": {
+    "steps": 85,
+    "median_shift_sec": 1004.0,
+    "max_shift_sec": 99526
+  },
+  "convergence": {
+    "15m_1h": {
+      "scored": 31,
+      "median_p25_p75_sec": 2577.0,
+      "with_p90": 31,
+      "median_p25_p90_sec": 5139.0
+    },
+    "1h_4h": {
+      "scored": 38,
+      "median_p25_p75_sec": 3752.0,
+      "with_p90": 38,
+      "median_p25_p90_sec": 5428.5
+    },
+    "gt_24h": {
+      "scored": 4,
+      "median_p25_p75_sec": 3166.5,
+      "with_p90": 4,
+      "median_p25_p90_sec": 4794.5
+    },
+    "lt_15m": {
+      "scored": 37,
+      "median_p25_p75_sec": 525.0,
+      "with_p90": 37,
+      "median_p25_p90_sec": 2676.0
+    }
   }
 }

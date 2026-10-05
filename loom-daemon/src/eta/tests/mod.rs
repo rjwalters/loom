@@ -2,6 +2,7 @@
 
 mod backtest;
 mod backtest_pr;
+mod backtest_union;
 mod censoring;
 mod conditioning;
 mod config;

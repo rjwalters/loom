@@ -4,7 +4,7 @@
 //! defects that would have silently reset or biased all of it.
 
 use super::{as_of, history_a, input_at, provenance};
-use crate::eta::backtest::{BacktestReport, Bucket, Comparison};
+use crate::eta::backtest::Comparison;
 use crate::eta::heuristics::{LandV1, LAND_V1, LAND_V2};
 use crate::eta::history::{SampleSource, StageSample};
 use crate::eta::score::{score, EstimateSummary, OutcomeKind};
@@ -111,27 +111,9 @@ fn winning(i: usize) -> (Side, Side) {
     (side(100.0, true, false), side(60.0, i.is_multiple_of(2), false))
 }
 
-/// A backtest the candidate wins.
+/// A backtest the candidate wins, on every walk-forward fold.
 fn won_backtest() -> Comparison {
-    let report = |heuristic: &str, mean: f64| BacktestReport {
-        heuristic: heuristic.to_string(),
-        kind: Kind::Land,
-        overall: Bucket {
-            n: 40,
-            scored: 40,
-            refused: 0,
-            mean_pinball_loss_sec: Some(mean),
-            coverage: Some(0.5),
-            bias_sec: Some(0.0),
-        },
-        by_repo: Default::default(),
-        by_horizon: Default::default(),
-    };
-    Comparison {
-        a: report(LAND_V1, 1000.0),
-        b: report(LAND_V2, 800.0),
-        better: Some(LAND_V2.to_string()),
-    }
+    super::shadow::comparison(1000.0, 800.0, 40)
 }
 
 fn decide(ledger: &ShadowLedger) -> PromotionDecision {

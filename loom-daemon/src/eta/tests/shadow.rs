@@ -4,7 +4,7 @@
 //! written and read back, which is the point of the persistence test.
 
 use super::{as_of, history_a, input_at, provenance, subject};
-use crate::eta::backtest::{BacktestReport, Bucket, Comparison};
+use crate::eta::backtest::{BacktestReport, Bucket, Comparison, Paired};
 use crate::eta::config::{promote, resolve};
 use crate::eta::heuristics::{
     LandV1, LandV2, LAND_AMBER_HERON, LAND_FRESH_TIDE, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B, LAND_V1,
@@ -12,7 +12,8 @@ use crate::eta::heuristics::{
 };
 use crate::eta::score::{score, EstimateSummary, OutcomeKind, Score};
 use crate::eta::shadow::{
-    self, GateStatus, PairedStats, ShadowLedger, COVERAGE_MAX, COVERAGE_MIN, MIN_LIVE_PAIRS,
+    self, DaySums, DayWins, GateStatus, PairedStats, ShadowLedger, COVERAGE_MAX, COVERAGE_MIN,
+    MIN_LIVE_PAIRS,
 };
 use crate::eta::tracker::{PassAnswers, Resolved};
 use crate::eta::{explanation::EstimateResult, Heuristic, Kind, Stage};
@@ -67,8 +68,11 @@ fn current_land(_: Kind) -> String {
     LAND_V1.to_string()
 }
 
-/// A backtest comparison where `better` names `winner` (or nobody).
-fn comparison(current_mean: f64, candidate_mean: f64, scored: usize) -> Comparison {
+/// A backtest comparison of `current` (`a`) and the candidate (`b`): both
+/// answer all `scored` cases, spread evenly over [`LEDGER_DAYS`] walk-forward
+/// daily folds, each side's loss (three- and four-quantile alike) uniformly
+/// its given mean — so `better` and every day go to the lower mean.
+pub(super) fn comparison(current_mean: f64, candidate_mean: f64, scored: usize) -> Comparison {
     let report = |heuristic: &str, mean: f64| BacktestReport {
         heuristic: heuristic.to_string(),
         kind: Kind::Land,
@@ -82,6 +86,8 @@ fn comparison(current_mean: f64, candidate_mean: f64, scored: usize) -> Comparis
         },
         by_repo: Default::default(),
         by_horizon: Default::default(),
+        stability: Default::default(),
+        convergence: Default::default(),
     };
     let better = if scored == 0 {
         None
@@ -92,9 +98,35 @@ fn comparison(current_mean: f64, candidate_mean: f64, scored: usize) -> Comparis
     } else {
         None
     };
+    let mut days = std::collections::BTreeMap::new();
+    for i in 0..scored {
+        let day: &mut DaySums = days
+            .entry(format!("2026-09-{:02}", 1 + i % LEDGER_DAYS as usize))
+            .or_default();
+        day.pairs += 1;
+        day.current_loss4_sec += current_mean;
+        day.candidate_loss4_sec += candidate_mean;
+    }
+    let mean = |m: f64| (scored > 0).then_some(m);
+    let paired = Paired {
+        cases: scored,
+        a_answered: scored,
+        b_answered: scored,
+        a_answer_rate: mean(1.0),
+        b_answer_rate: mean(1.0),
+        common: scored,
+        a_mean_pinball_loss_sec: mean(current_mean),
+        b_mean_pinball_loss_sec: mean(candidate_mean),
+        loss4_pairs: scored,
+        a_mean_pinball4_loss_sec: mean(current_mean),
+        b_mean_pinball4_loss_sec: mean(candidate_mean),
+        day_wins: DayWins::of(&days),
+        ..Paired::default()
+    };
     Comparison {
         a: report(LAND_V1, current_mean),
         b: report(LAND_V2, candidate_mean),
+        paired,
         better,
     }
 }
