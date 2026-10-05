@@ -121,6 +121,12 @@ pub(crate) enum LeaseCommand {
     /// (rjwalters/kicad-tools#5783). Fails open (exit `0`) on any read error.
     /// See `cli::lease_co_occupancy`.
     CoOccupancy(super::lease_co_occupancy::LeaseCoOccupancyArgs),
+
+    /// Single-owner bookkeeping and the per-cycle completion gate for
+    /// `sweep-lease-renew.sh`'s renewal loops (#10229). See
+    /// `cli::lease_renewer`.
+    #[command(subcommand)]
+    Renewer(super::lease_renewer::RenewerAction),
 }
 
 impl LeaseCommand {
@@ -128,6 +134,7 @@ impl LeaseCommand {
         match self {
             LeaseCommand::Ensure(args) => args.run(),
             LeaseCommand::CoOccupancy(args) => args.run(),
+            LeaseCommand::Renewer(action) => action.run(),
         }
     }
 }
