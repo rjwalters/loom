@@ -46,6 +46,11 @@
 //! - **Flags**: the last [`FlagChange`] before `t − LAG`. A PR with episodes
 //!   but no flag timeline (its snapshot predates #10245) is dropped and
 //!   counted in [`RowStats::rows_dropped_no_flags`], never zero-flagged.
+//! - **Priority features** (#10333, [`Assembled::priority`], not model
+//!   inputs): `priority_features` over the same roster, each PR's level
+//!   timeline read from its flag changes before `t − LAG`
+//!   ([`PriorityState::from_flags`]), plus the linked-issue star run
+//!   (#10372) when star inputs are given.
 //! - A row whose needed queue feature is `None` is dropped and counted in
 //!   [`RowStats::rows_dropped_missing`].
 //! - **Exit label**: `Some` iff `t + `[`EXIT_HORIZON_SEC`]` < H`; then whether
@@ -84,6 +89,9 @@ use crate::eta::flag_timeline::{flags_before, FlagChange};
 use crate::eta::fleet::FleetSnapshot;
 use crate::eta::labels::{
     FLAG_BLOCKED, FLAG_CI_FAIL, FLAG_CONFLICT, FLAG_OP_HOLD, FLAG_SEQUENCED, FLAG_STARRED,
+};
+use crate::eta::priority_features::{
+    priority_features, PriorityEntry, PriorityFeatures, PriorityState,
 };
 use crate::eta::queue_features::{
     queue_features, EventKind, EventLog, QueueFeatures, QueueSubject, RosterEntry, StageEvent,
@@ -135,6 +143,10 @@ pub struct Assembled {
     pub row_keys: Vec<RowKey>,
     /// The dwells, in canonical order.
     pub dwells: Vec<DwellRow>,
+    /// `priority[i]` is the priority-aware feature set of `rows[i]` (#10333):
+    /// candidate inputs for the next model version, not read by the current
+    /// fit, so the coefficient file is unchanged.
+    pub priority: Vec<PriorityFeatures>,
     /// What was dropped.
     pub stats: RowStats,
     /// The data horizon `H` (see the module docs).
@@ -394,6 +406,21 @@ fn pr_star_since(flags: &[FlagChange], cutoff: DateTime<Utc>) -> Option<DateTime
     since
 }
 
+/// The start of `pr`'s linked-issue star run known before `cutoff` (#10372),
+/// for the priority features (#10333): `None` when no linked issue is
+/// starred, or no star inputs were given or they do not cover `cutoff`.
+fn linked_star_since(
+    star: Option<&StarInputs>,
+    pr: &Pr<'_>,
+    cutoff: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let state = star?
+        .repos
+        .get(&pr.repo)?
+        .state_at(pr.number, 0, None, cutoff)?;
+    state.source.starred().then_some(state.since).flatten()
+}
+
 /// [`build`], also recording each row's star state from `star` (#10372).
 #[must_use]
 pub fn build_with_star(
@@ -429,7 +456,7 @@ pub fn build_with_star(
     let events = Events::new(&prs, horizon, from);
 
     let mut stats = RowStats::default();
-    let mut keyed: Vec<((RowKey, FitStage), TrainingRow)> = Vec::new();
+    let mut keyed: Vec<((RowKey, FitStage), (TrainingRow, PriorityFeatures))> = Vec::new();
     let mut t = window_start;
     while t < horizon {
         let cutoff = t - lag;
@@ -446,6 +473,19 @@ pub fn build_with_star(
                     stage: Some(e.stage),
                     entered_at: e.entered_at,
                     known_at: e.entered_at + lag,
+                })
+                .collect();
+            let priority_roster: Vec<PriorityEntry> = open
+                .iter()
+                .map(|(pr, e)| PriorityEntry {
+                    repo: pr.repo.clone(),
+                    pr: pr.number,
+                    stage: Some(e.stage),
+                    entered_at: e.entered_at,
+                    known_at: e.entered_at + lag,
+                    star: PriorityState::from_flags(&pr.flags, cutoff)
+                        .unwrap_or_default()
+                        .with_linked(linked_star_since(star, pr, cutoff)),
                 })
                 .collect();
             let log = events.at(t);
@@ -482,6 +522,12 @@ pub fn build_with_star(
                     }
                 };
                 let q = queue_features(&subject, &roster, &log, &scope, t);
+                let own = priority_roster
+                    .iter()
+                    .find(|e| e.pr == pr.number && e.repo == pr.repo)
+                    .map(|e| e.star.clone())
+                    .unwrap_or_default();
+                let prio = priority_features(&subject, &own, &priority_roster, &scope, t);
                 let rework = pr
                     .episodes
                     .iter()
@@ -502,27 +548,38 @@ pub fn build_with_star(
                 };
                 keyed.push((
                     (key, stage),
-                    TrainingRow {
-                        stage,
-                        group: format!("{}#{}", pr.repo, pr.number),
-                        inputs,
-                        starred_any,
-                        star_source,
-                        exit,
-                        merge: merge_label(pr, t, horizon),
-                    },
+                    (
+                        TrainingRow {
+                            stage,
+                            group: format!("{}#{}", pr.repo, pr.number),
+                            inputs,
+                            starred_any,
+                            star_source,
+                            exit,
+                            merge: merge_label(pr, t, horizon),
+                        },
+                        prio,
+                    ),
                 ));
             }
         }
         t += step;
     }
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
-    let (row_keys, rows) = keyed.into_iter().map(|((key, _), row)| (key, row)).unzip();
+    let mut row_keys = Vec::with_capacity(keyed.len());
+    let mut rows = Vec::with_capacity(keyed.len());
+    let mut priority = Vec::with_capacity(keyed.len());
+    for ((key, _), (row, prio)) in keyed {
+        row_keys.push(key);
+        rows.push(row);
+        priority.push(prio);
+    }
 
     Assembled {
         rows,
         row_keys,
         dwells: dwells(&prs, window_start, horizon),
+        priority,
         stats,
         data_through: horizon,
     }

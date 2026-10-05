@@ -123,6 +123,7 @@ pub mod history;
 pub mod journal;
 pub mod labels;
 pub mod offline;
+pub mod priority_features;
 pub mod queue_features;
 pub mod recalibrate;
 pub mod recency;

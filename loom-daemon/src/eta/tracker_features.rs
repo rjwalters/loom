@@ -35,6 +35,10 @@
 //!   close an issue. Departures and merges of other PRs are not counted.
 //! - The log's `from` is the journal's oldest row. Daemon downtime inside
 //!   the journal's span is not visible.
+//! - Priority levels (#10333) are observed pass by pass: a level change
+//!   dates from the first pass that showed it, and a PR already starred on
+//!   the tracker's first pass of its repo has an unknown star instant (it
+//!   orders by age, as dispatch does without a starred-at).
 
 use super::hold;
 use super::ready::plan_max_age_secs;
@@ -42,6 +46,7 @@ use super::{EstimateContext, Item, ItemKey, ReadyPlan, ReadyRow, Tracker};
 use crate::eta::explanation::{FeatureOmitted, Features};
 use crate::eta::journal::JournalEntry;
 use crate::eta::labels::stage_from_pr_labels;
+use crate::eta::priority_features::{self, PriorityEntry, PriorityFeatures, PriorityState};
 use crate::eta::queue_features::{
     self, is_pr_stage, reason, EventKind, EventLog, QueueFeatures, QueueSubject, RosterEntry,
     StageEvent, SINCE_MERGE_CAP_SEC,
@@ -81,6 +86,8 @@ struct FleetView {
     /// tracked released `merge_wait` PR enters at its release. Captured with
     /// `roster`, from the tracker's state at the same observation.
     episode_roster: Vec<RosterEntry>,
+    /// The modeled roster with each PR's star from its labels (#10333).
+    priority_roster: Vec<PriorityEntry>,
     events: EventLog,
     scope: Vec<String>,
     observed_at: DateTime<Utc>,
@@ -151,6 +158,12 @@ impl PlanView {
 pub(super) struct PassContext {
     fleet: Option<FleetView>,
     pub(super) plan: Option<PlanView>,
+    /// Each listed PR's star timeline as the passes observed it (#10333),
+    /// carried from pass to pass; a PR that leaves the listings drops out.
+    stars: BTreeMap<(String, u32), PriorityState>,
+    /// The repos a pass has listed: a PR new to one of these was opened (or
+    /// entered review) since, so a star it carries is about that new.
+    star_repos: BTreeSet<String>,
 }
 
 fn omission(name: &str, why: &str) -> FeatureOmitted {
@@ -257,10 +270,19 @@ impl Tracker {
             .collect();
         let mut roster = Vec::new();
         let mut episode_roster = Vec::new();
+        let mut priority_roster = Vec::new();
         let mut scope = Vec::new();
+        let mut stars = BTreeMap::new();
         for (repo, prs) in listings {
             let repo = repo.to_ascii_lowercase();
+            let repo_seen = self.context.star_repos.contains(&repo);
             for pr in prs {
+                let star = PriorityState::observe(
+                    self.context.stars.get(&(repo.clone(), pr.number)),
+                    &pr.labels,
+                    observed_at,
+                    repo_seen,
+                );
                 let stage = stage_from_pr_labels(&pr.labels).ok();
                 let item = tracked.get(&(repo.as_str(), pr.number));
                 let entry = |followed: Option<DateTime<Utc>>| RosterEntry {
@@ -282,13 +304,26 @@ impl Tracker {
                     }
                 };
                 roster.push(entry(followed(false)));
-                episode_roster.push(entry(followed(true)));
+                let modeled = entry(followed(true));
+                priority_roster.push(PriorityEntry {
+                    repo: modeled.repo.clone(),
+                    pr: modeled.pr,
+                    stage: modeled.stage,
+                    entered_at: modeled.entered_at,
+                    known_at: modeled.known_at,
+                    star: star.clone(),
+                });
+                episode_roster.push(modeled);
+                stars.insert((repo.clone(), pr.number), star);
             }
             scope.push(repo);
         }
+        self.context.star_repos.extend(scope.iter().cloned());
+        self.context.stars = stars;
         self.context.fleet = Some(FleetView {
             roster,
             episode_roster,
+            priority_roster,
             events,
             scope,
             observed_at,
@@ -324,6 +359,82 @@ impl Tracker {
             ),
             _ => QueueFeatures::unavailable(NOT_LISTED_YET),
         }
+    }
+
+    /// The priority-aware features (#10333) of `subject` at `as_of`, from the
+    /// last fleet view observed before `as_of`, over the modeled (episode)
+    /// roster, with the subject's star from the same view. Not part of
+    /// [`Features`]: no shipped heuristic reads it (see
+    /// [`priority_features`]'s module docs).
+    ///
+    /// Serving's star instants are the passes that first showed a change, so
+    /// they trail the label event by at most one pass; a PR already starred
+    /// on the tracker's first pass of its repo has an unknown star instant
+    /// (ordered by age, no `starred_age_sec`), as a first-seen PR's stage
+    /// entry is a lower bound.
+    #[must_use]
+    pub fn priority_features_at(
+        &self,
+        subject: &QueueSubject,
+        as_of: DateTime<Utc>,
+    ) -> PriorityFeatures {
+        let Some(view) = self
+            .context
+            .fleet
+            .as_ref()
+            .filter(|v| v.observed_at < as_of)
+        else {
+            return PriorityFeatures::default();
+        };
+        // Each entry's linked-issue star (#10372) as of `as_of`.
+        let roster: Vec<PriorityEntry> = view
+            .priority_roster
+            .iter()
+            .map(|e| {
+                let linked = self.linked_star_since(&e.repo, e.pr, as_of);
+                PriorityEntry {
+                    star: e.star.clone().with_linked(linked),
+                    ..e.clone()
+                }
+            })
+            .collect();
+        let star = subject
+            .pr
+            .and_then(|pr| {
+                roster
+                    .iter()
+                    .find(|e| e.pr == pr && e.repo.eq_ignore_ascii_case(&subject.repo))
+            })
+            .map(|e| e.star.clone())
+            .unwrap_or_default();
+        priority_features::priority_features(subject, &star, &roster, &view.scope, as_of)
+    }
+
+    /// [`Self::priority_features_at`] for listed PR `pr` of `repo`, its stage
+    /// and entry from the view's modeled roster; `None` when the last view
+    /// before `as_of` does not list it.
+    #[must_use]
+    pub fn priority_features_of(
+        &self,
+        repo: &str,
+        pr: u32,
+        as_of: DateTime<Utc>,
+    ) -> Option<PriorityFeatures> {
+        let view = self
+            .context
+            .fleet
+            .as_ref()
+            .filter(|v| v.observed_at < as_of)?;
+        let entry = view
+            .priority_roster
+            .iter()
+            .find(|e| e.pr == pr && e.repo.eq_ignore_ascii_case(repo))?;
+        let subject = QueueSubject {
+            repo: entry.repo.clone(),
+            pr: Some(pr),
+            current: entry.stage.map(|s| (s, entry.entered_at)),
+        };
+        Some(self.priority_features_at(&subject, as_of))
     }
 
     /// The host-level plan features for an item of `repo` at `now`.

@@ -122,15 +122,43 @@ impl Tracker {
         let Some(pr) = item.pr_number.filter(|_| !item.labels.is_empty()) else {
             return;
         };
-        let Some(book) = self.star.repos.get(&key.repo) else {
+        let Some((links, changes)) = self.star_inputs(&key.repo, pr, now) else {
             return;
         };
+        let state = star_state_at(Some(pr_flags(&item.labels)), None, &links, &changes, now);
+        features.starred_any = Some(state.source.starred());
+        features.star_source = Some(state.source.as_str().to_string());
+    }
+
+    /// The start of `pr`'s linked-issue star run at `now`, for the priority
+    /// features (#10333): `None` when no linked issue is starred or the repo
+    /// has no fresh observation before `now`.
+    pub(super) fn linked_star_since(
+        &self,
+        repo: &str,
+        pr: u32,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let (links, changes) = self.star_inputs(repo, pr, now)?;
+        let state = star_state_at(Some(0), None, &links, &changes, now);
+        state.source.starred().then_some(state.since).flatten()
+    }
+
+    /// `pr`'s links and every star change of `repo` (lowercased), when the
+    /// repo has a fresh observation before `now`.
+    fn star_inputs(
+        &self,
+        repo: &str,
+        pr: u32,
+        now: DateTime<Utc>,
+    ) -> Option<(Vec<StarLink>, Vec<IssueStarChange>)> {
+        let book = self.star.repos.get(repo)?;
         let fresh = book.first_at.is_some_and(|f| f < now)
             && book
                 .last_at
                 .is_some_and(|l| (now - l).num_seconds() <= STAR_MAX_AGE_SEC);
         if !fresh {
-            return;
+            return None;
         }
         let links: Vec<StarLink> = book
             .links
@@ -143,8 +171,6 @@ impl Tracker {
             })
             .collect();
         let changes: Vec<IssueStarChange> = book.changes.values().flatten().copied().collect();
-        let state = star_state_at(Some(pr_flags(&item.labels)), None, &links, &changes, now);
-        features.starred_any = Some(state.source.starred());
-        features.star_source = Some(state.source.as_str().to_string());
+        Some((links, changes))
     }
 }
