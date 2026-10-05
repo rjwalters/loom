@@ -100,7 +100,7 @@ fn a_pass_decides_everything_without_a_graphql_pr_list() {
         row(300, &["loom:review-requested"]),
     ];
     let comments = format!(
-        r#"[{{"user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}},"author_association":"NONE","created_at":"2026-08-23T06:00:00Z","body":"Reviewed.\n\n<!-- loom:verdict-sha sha={SHA_A} verdict=approved -->"}}]"#
+        r#"[{{"user":{{"login":"maintainer","type":"User"}},"author_association":"COLLABORATOR","created_at":"2026-08-23T06:00:00Z","body":"Reviewed.\n\n<!-- loom:verdict-sha sha={SHA_A} verdict=approved -->"}}]"#
     );
     let script = format!(
         r#"#!/bin/sh
