@@ -1582,6 +1582,22 @@ baseline, so a restart never replays history. Every host managing a repo
 samples it: sums scale with the host count, means do not. Completed sweeps'
 own phase durations remain the cycle-time rollup's (#8692).
 
+Merge-chain re-date pressure (Issue #10163, `observability/ops/redate_chain.rs`).
+These are `Gauge`s over a trailing 24 h window, sampled on the `host.health`
+cadence from local `git log` only, with no forge call. They are never labelled
+by PR or repo. Read them with `max` across hosts:
+
+| Metric | Unit | Labels | Meaning |
+|---|---|---|---|
+| `loom.merge.redate_prs` | `{pull_request}` | `state` ∈ `landed`, `pending`, `stuck` | PRs with at least one #8508 re-date commit. `stuck` is the subset of `pending` that has spent at least the default re-date budget (3). |
+| `loom.merge.redates_max` | `{redate}` | `state` ∈ `landed`, `pending` | the most re-dates any one PR took |
+| `loom.merge.time_to_land_max` | `s` | none | longest time from a PR's first re-date to its landing merge. Omitted when nothing landed. |
+
+`redate_prs` and `redates_max` are emitted every sample, zeros included. The
+per-PR rows are in `loom-daemon merge-pr redate-report --json` (`chains`); see
+[`daemon-reference.md`](daemon-reference.md) §"Re-dates per PR and time to
+land".
+
 The dwell names (#8856) are `loom.queue.oldest_wait`, `loom.queue.starved`,
 `loom.queue.starved.by_reason` and `loom.queue.dispatch_wait[.samples]`. They
 measure how long ready-queue issues have waited; for depth, use

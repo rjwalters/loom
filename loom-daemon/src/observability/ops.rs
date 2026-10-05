@@ -26,8 +26,10 @@
 //! span per pool dispatch hold. [`turnaround`] (#8929) covers slot turnaround
 //! and idle slots per host, [`stage_dwell`] forge label-stage dwell, and
 //! [`disposition`] (#9222) one span per ready-queue row's disposition, on
-//! transition or periodic refresh. A new emitter adds a `MetricName`/
-//! `SpanName` variant and calls the same two functions.
+//! transition or periodic refresh. [`redate_chain`] (#10163) exports #8508
+//! re-date pressure (re-dated PRs, re-dates per PR, time to land). A new
+//! emitter adds a `MetricName`/`SpanName` variant and calls the same two
+//! functions.
 //!
 //! Tests observe what a seam emitted through the global functions with
 //! [`capture::capture`], a per-thread recorder (test builds only).
@@ -42,6 +44,7 @@ pub mod lockout;
 pub mod pool_marks;
 pub mod queue;
 pub mod quota;
+pub mod redate_chain;
 pub mod stage_dwell;
 pub mod turnaround;
 
