@@ -199,6 +199,10 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // Reads: `fetch_comment_bodies` returns trusted bodies only.
         ("claim_reconciliation.rs", "reader via forge::fetch_comment_bodies"),
         (
+            "claim_reconciliation/liveness.rs",
+            "reader via TrustPolicy::trusted_records (#10235)",
+        ),
+        (
             "claim_reconciliation/review_conflict.rs",
             "reader via forge::fetch_comment_bodies",
         ),

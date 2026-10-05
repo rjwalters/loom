@@ -2529,14 +2529,6 @@ fn decide_pr_reclaims_when_old_claim_labeled_at_and_only_standdown_comments_sinc
 // defaults/scripts/claim-staleness.sh)
 // ------------------------------------------------------------------
 
-/// The claim timestamp used by the marker fixtures below, rendered exactly
-/// as the forge emits a `labeled` event's `created_at`.
-fn fixture_claimed_at() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-08-19T08:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc)
-}
-
 fn comment(created_at: DateTime<Utc>, body: &str) -> PrComment {
     PrComment {
         created_at,
