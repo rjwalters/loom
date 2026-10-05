@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # check-labels-drift.sh - Fail if the two label registries drift apart.
-# requires-daemon: labels optional        probes `labels --help`; degrades to the plain diff check when absent
+# requires-daemon: labels optional        probes `labels --help`; degrades to the plain diff check when absent (fatal under GITHUB_ACTIONS)
 #
 # Why (#3896): Loom ships the label registry in TWO places —
 #   - <root>/.github/labels.yml          (this repo's live label registry)
@@ -72,13 +72,28 @@ fi
 # #10013: both copies are GENERATED from defaults/labels.json. When a
 # loom-daemon binary is available, also fail if the Loom block differs from the
 # registry (a label added only to labels.yml, or an edit that skipped
-# `loom-daemon labels generate --write`). The label_registry unit tests assert
-# the same, so a missing binary is not a gap in CI.
-if [[ -f "$ROOT/defaults/labels.json" ]] && command -v loom-daemon >/dev/null 2>&1 \
-  && loom-daemon labels --help >/dev/null 2>&1; then
-  if ! loom-daemon labels check --root "$ROOT" >&2; then
-    echo "check-labels-drift: FAIL — labels.yml differs from defaults/labels.json." >&2
+# `loom-daemon labels generate --write`). Resolution goes through
+# loom_resolve_self_daemon_bin ($LOOM_DAEMON_SELF_BIN, then this checkout's
+# target/{release,debug} build, then PATH), so CI's downloaded
+# target/debug/loom-daemon is found without being on PATH. The Rust
+# label_registry tests do NOT cover this at PR time (backend-tests is not
+# path-triggered by labels.yml/labels.json), so under GitHub Actions a missing
+# or `labels`-less binary is a hard failure, never a silent skip (PR #10053).
+if [[ -f "$ROOT/defaults/labels.json" ]]; then
+  # shellcheck source=lib/locate-daemon-bin.sh
+  source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"
+  LABELS_BIN="$(loom_resolve_self_daemon_bin 2>/dev/null || true)"
+  if [[ -n "$LABELS_BIN" ]] && "$LABELS_BIN" labels --help >/dev/null 2>&1; then
+    echo "check-labels-drift: registry check via $LABELS_BIN"
+    if ! "$LABELS_BIN" labels check --root "$ROOT" >&2; then
+      echo "check-labels-drift: FAIL — labels.yml differs from defaults/labels.json." >&2
+      exit 1
+    fi
+  elif [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "check-labels-drift: FAIL — no loom-daemon with \`labels\` resolved; the registry check cannot be skipped in CI." >&2
     exit 1
+  else
+    echo "check-labels-drift: note — no loom-daemon with \`labels\` found; skipped the defaults/labels.json comparison." >&2
   fi
 fi
 
