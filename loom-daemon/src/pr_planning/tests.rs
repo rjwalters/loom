@@ -308,6 +308,7 @@ fn stamped_inherited_star_time_orders_the_pr() {
     let starred = |n: u32, at: &str, from: Option<u32>| StarredRow {
         number: n,
         kind: Kind::Pr,
+        level: 1,
         created_at: None,
         starred_at: Some(at.into()),
         inherited_from: from,

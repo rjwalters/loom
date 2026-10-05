@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 
 use crate::forge_cmd::{detect_forge, ForgeType, EX_FORGE_DECLINED};
+use crate::operator_levels;
 use crate::star_liveness::forge::{GhStarForge, StarForge};
 use crate::star_liveness::intents::{self, Action, ValidIntent};
 use crate::work_finder::OPERATOR_PRIORITY_LABEL;
@@ -145,12 +146,17 @@ pub fn handle(args: StarArgs) -> Result<()> {
         resolve_owner_repo(&root).context("could not resolve owner/repo from the git remotes")?;
     let now = chrono::Utc::now();
     let action = if unstar { Action::Unstar } else { Action::Star };
+    // This verb only ever toggles the star (level 1); higher levels are the
+    // operator's, applied through loom-ui intents (#10307).
+    let level = *operator_levels::row(operator_levels::table(), 1)
+        .context("the priority level table has no level-1 (star) row")?;
     let intent = ValidIntent {
         id: format!("agent-{number}-{}", now.timestamp()),
         repo: format!("{owner}/{repo}"),
         root: PathBuf::from(&root),
         number,
         action,
+        level,
         requested_at: Some(now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         requested_by: actor(by),
     };
@@ -223,6 +229,7 @@ mod tests {
             root: PathBuf::from("/tmp"),
             number: 7,
             action,
+            level: operator_levels::LEVELS[0],
             requested_at: Some("2026-10-02T23:00:00Z".into()),
             requested_by: "builder".into(),
         }
@@ -236,7 +243,7 @@ mod tests {
         assert_eq!(f.labels, vec![OPERATOR_PRIORITY_LABEL.to_string()]);
         let c = &f.posted[0];
         assert!(c.starts_with(
-            "<!-- loom:operator-priority-intent=agent-7-1790000000 action=star requested_at=2026-10-02T23:00:00Z -->"
+            "<!-- loom:operator-priority-intent=agent-7-1790000000 action=star requested_at=2026-10-02T23:00:00Z label=loom:operator-priority -->"
         ));
         assert!(c.contains("by `builder` on operator direction: \"star #7\"."));
         // The timeline reader takes the comment's requested_at as starred-at.

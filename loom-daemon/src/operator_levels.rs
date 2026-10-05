@@ -22,13 +22,11 @@
 //!
 //! - `defaults/.claude/commands/loom/builder-pr.md`, PR Label Rules: the
 //!   label-copy list a Builder puts on its PR.
-//! - `defaults/.claude/commands/loom/builder.md`, Priority Order and the
-//!   starred-first `for L in …` query.
-//! - `defaults/.claude/commands/loom/curator.md`, Priority 0 `for L in …`.
 //! - `defaults/.claude/commands/loom/champion-pr-merge.md`, the held-PR
 //!   digest's `LVL` jq mapping (level 0/1/2) and its ⭐ / ⭐⭐ glyph `case`.
-//! - `defaults/.claude/commands/loom/champion.md`, Priority 4 epic queue
-//!   `sort_by` (it buckets every `high-priority` label as one level).
+//! - Builder's starred-first query, Curator's Priority 0 and Champion's
+//!   Priority 4 epic queue call `loom-daemon forge starred`, which reads the
+//!   table ([`starred_labels`]) and orders by level, then star time (#9974).
 //! - Prose (no sync note) that names the level-2 labels:
 //!   `defaults/docs/label-state-machine.md` (levels bullet) and
 //!   `defaults/docs/pr-planning.md` (Operator star row).

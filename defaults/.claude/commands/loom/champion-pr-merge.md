@@ -3197,7 +3197,7 @@ line into the pass summary — measurement only, never a merge-order input.
 Full policy: `.loom/docs/pr-congestion-signal.md`.
 
 **Starred PRs first (`loom:operator-priority`, #9244; level 2 before the star, #10307).** The shared queue puts stars
-first (level 2 first, then earliest star first, #9974), then interactive, then ordinary work (oldest
+first (level 2, then earliest star, #9974), then interactive, then ordinary work (oldest
 first per class). It never evicts work in flight and changes order only: all 6
 Safety Criteria, the Verdict-State Janitor, and every hold (merge-risk,
 critical-file, `loom:operator-only`, `loom:blocked`) apply unchanged. A starred

@@ -41,8 +41,9 @@ use crate::forge_cmd::{detect_forge, ForgeType, EX_FORGE_DECLINED, FORGE_CMD_TIM
 use crate::forge_etag_store as store;
 use crate::forge_pr_congestion::link_issue_number;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::operator_levels;
 use crate::work_finder::operator_priority::GhTimelineStarredAt;
-use crate::work_finder::{candidate_cmp, PriorityCandidate, OPERATOR_PRIORITY_LABEL};
+use crate::work_finder::{candidate_cmp, PriorityCandidate};
 use crate::worktree_ops::gh::resolve_owner_repo;
 
 mod cache;
@@ -65,6 +66,9 @@ pub enum Kind {
 pub struct StarredRow {
     pub number: u32,
     pub kind: Kind,
+    /// Effective operator priority level (#10307): 1 the star, 2 and up the
+    /// higher levels, own or daemon-inherited. Orders before star time.
+    pub level: u8,
     #[serde(skip)]
     pub created_at: Option<String>,
     /// Effective star time (`None` when the timeline had no event).
@@ -82,6 +86,7 @@ pub fn order_starred(mut rows: Vec<StarredRow>) -> Vec<StarredRow> {
 
 fn candidate(r: &StarredRow) -> PriorityCandidate {
     PriorityCandidate {
+        operator_level: r.level,
         operator_priority: true,
         operator_priority_at: r.starred_at.clone(),
         created_at: r.created_at.clone(),
@@ -134,23 +139,25 @@ impl Listed {
     pub fn from_rest(v: &Value, is_pr: bool) -> Option<Self> {
         let number = u32::try_from(v["number"].as_u64()?).ok()?;
         let text = |k: &str| v[k].as_str().map(str::to_string);
+        let labels: Vec<String> = v["labels"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|l| l.as_str().or_else(|| l["name"].as_str()))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
         Some(Self {
             row: StarredRow {
                 number,
                 kind: if is_pr { Kind::Pr } else { Kind::Issue },
+                level: operator_levels::level(&labels).max(1),
                 created_at: text("created_at"),
                 starred_at: None,
                 inherited_from: None,
             },
-            labels: v["labels"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|l| l.as_str().or_else(|| l["name"].as_str()))
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            labels,
             link: if is_pr {
                 link_issue_number("", v["body"].as_str().unwrap_or(""))
             } else {
@@ -161,10 +168,24 @@ impl Listed {
     }
 }
 
+/// Every open item carrying any starred label (the star, level 2 and the
+/// daemon-written inherited labels, #10307), deduped by number: a listing is
+/// one label's, and an item can carry several.
 fn list_starred(root: &Path, owner: &str, repo: &str) -> Result<Vec<Listed>> {
-    let path = format!(
-        "repos/{owner}/{repo}/issues?labels={OPERATOR_PRIORITY_LABEL}&state=open&per_page=100"
-    );
+    let mut out: Vec<Listed> = Vec::new();
+    let mut seen = HashSet::new();
+    for label in operator_levels::starred_labels(operator_levels::table()) {
+        for l in list_label(root, owner, repo, label)? {
+            if seen.insert(l.row.number) {
+                out.push(l);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn list_label(root: &Path, owner: &str, repo: &str, label: &str) -> Result<Vec<Listed>> {
+    let path = format!("repos/{owner}/{repo}/issues?labels={label}&state=open&per_page=100");
     let jq = r#".[] | {number, created_at, updated_at, pr: (.pull_request != null), body: (.body // ""), labels: [.labels[].name]}"#;
     // Spawned through the #9985 facade: it resolves `gh` (LOOM_GH_BIN, else
     // PATH), keys GH_CONFIG_DIR off `root`, and closes stdin.
@@ -395,6 +416,7 @@ mod tests {
         StarredRow {
             number: n,
             kind,
+            level: 1,
             created_at: Some(created.into()),
             starred_at: at.map(str::to_string),
             inherited_from: None,
@@ -417,6 +439,29 @@ mod tests {
         let b = row(6, Kind::Issue, "2026-09-01T00:00:00Z", Some("2026-09-03T00:00:00Z"));
         let order: Vec<u32> = order_starred(vec![b, a]).iter().map(|r| r.number).collect();
         assert_eq!(order, vec![5, 6]);
+    }
+
+    /// #10307: level outranks star time, and an item carrying only a level
+    /// label (no `loom:operator-priority`) still counts, own or inherited.
+    #[test]
+    fn higher_level_outranks_an_earlier_star() {
+        let star = row(1, Kind::Issue, "2026-09-01T00:00:00Z", Some("2026-09-02T00:00:00Z"));
+        let mut high = row(2, Kind::Issue, "2026-09-05T00:00:00Z", None);
+        high.level = 2;
+        let order: Vec<u32> = order_starred(vec![star, high])
+            .iter()
+            .map(|r| r.number)
+            .collect();
+        assert_eq!(order, vec![2, 1]);
+        for labels in [
+            ["loom:operator-high-priority"],
+            ["loom:high-priority-inherited"],
+        ] {
+            let v = serde_json::json!({"number": 9, "labels": labels});
+            assert_eq!(Listed::from_rest(&v, false).unwrap().row.level, 2, "{labels:?}");
+        }
+        let v = serde_json::json!({"number": 9, "labels": ["loom:operator-priority"]});
+        assert_eq!(Listed::from_rest(&v, false).unwrap().row.level, 1);
     }
 
     #[test]

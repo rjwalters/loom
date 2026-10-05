@@ -75,12 +75,8 @@ fn fetch(root: &Path, gh: &Path, role: PrRole, stamp_stars: bool) -> Result<Vec<
     // discovery row is by-head only (`pr.list-by-head`), so the full
     // queue listing has no row yet (#9831).
     let queue_op = ForgeOp::uninventoried("open-PR queue listing has no inventory row");
-    let mut rows = read_all(
-        root,
-        gh,
-        queue_op,
-        "pulls?state=open&sort=created&direction=desc&per_page=100",
-    )?;
+    let mut rows =
+        read_all(root, gh, queue_op, "pulls?state=open&sort=created&direction=desc&per_page=100")?;
     if role == PrRole::Doctor {
         for row in &mut rows {
             if has_label(row, "loom:pr")
@@ -165,19 +161,18 @@ fn stamp_star_times(root: &Path, gh: &Path, rows: &mut [Value]) {
     if wanted.len() < 2 {
         return;
     }
-    let listing =
-        match read_all(
-            root,
-            gh,
-            ops::ISSUE_LIST,
-            "issues?labels=loom:operator-priority&state=open&per_page=100",
-        ) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("pr-queue: star-time read failed ({e:#}); ordering stars by created_at");
-                return;
-            }
-        };
+    let listing = match read_all(
+        root,
+        gh,
+        ops::ISSUE_LIST,
+        "issues?labels=loom:operator-priority&state=open&per_page=100",
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("pr-queue: star-time read failed ({e:#}); ordering stars by created_at");
+            return;
+        }
+    };
     let starred: HashSet<u32> = listing
         .iter()
         .filter_map(|v| v["number"].as_u64().and_then(|n| u32::try_from(n).ok()))

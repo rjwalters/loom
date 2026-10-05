@@ -84,8 +84,8 @@ child issues.
 **Escape-hatch / status labels**: `loom:blocked` (needs help),
 `loom:operator-only` (human action outside automation: credentials, infra,
 hardware; dispatch skips it), `loom:abort` (abort in-flight work, returns to
-`loom:issue`). `loom:operator-priority`: the operator's star, land it first;
-operator-set, not a hold. Priority axis: `tier:goal-advancing` /
+`loom:issue`). `loom:operator-priority`: the operator's star, land it first, not a hold.
+Priority axis: `tier:goal-advancing` /
 `tier:goal-supporting` / `tier:maintenance`.
 
 ### REST vs GraphQL for forge queries
