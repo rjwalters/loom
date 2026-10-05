@@ -1623,9 +1623,9 @@ Never an issue number, sha or path.
 | `loom.eta.health.fit_age_seconds` | `s` | none | now minus the loaded file's cutoff. Omitted when none is loaded |
 | `loom.eta.health.fit_check_age_seconds` | `s` | `reason` (the last fit check's outcome or skip reason) | time since the last fit check. Omitted until one has run in this process |
 | `loom.eta.health.snapshot_age_seconds` | `s` | `repo` | now minus each cached fleet snapshot's `as_of` |
-| `loom.eta.health.refresh_gate` | `1` | `state` ∈ `captain`, `no_captain`, `stand_down`, `disabled` | `1` for the current gate state. Before the first tick it is the state the read-only captain resolver reports (`disabled` when the loop does not run) |
+| `loom.eta.health.refresh_gate` | `1` | `state` ∈ `captain`, `no_captain`, `stand_down`, `disabled` | `1` for the current gate state, `0` for the other three. Before the first tick it is the state the read-only captain resolver reports (`disabled` when the loop does not run) |
 | `loom.eta.health.refresh_last_cycle_age_seconds` | `s` | none | time since the last refresh tick (stand-down ticks count). Omitted before the first tick; keeps growing if the loop stalls |
-| `loom.eta.health.refresh_repos` | `{repository}` | `reason` (a fleet-refresh stop reason) | repos per stop reason in the last tick that refreshed |
+| `loom.eta.health.refresh_repos` | `{repository}` | `reason` (a fleet-refresh stop reason) | repos per stop reason in the last tick that refreshed; a reason that drops out is exported once as `0` |
 | `loom.eta.health.snapshot_rows` | `{row}` | none | rows in the last `eta.snapshot` this process built. Omitted until one was built |
 | `loom.eta.health.snapshot_alternates_rows` | `{row}` | none | of those, rows with non-empty `alternates` (#10390) |
 

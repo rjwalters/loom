@@ -1,6 +1,6 @@
 //! ETA health gauge tests (Issue #10391, slice 2).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{Duration, TimeZone, Utc};
 
@@ -112,6 +112,7 @@ fn full_fixture_emits_every_gauge_with_its_labels_and_values() {
         last_tick: Some(now() - Duration::minutes(5)),
         refresh_repos: BTreeMap::from([("no_reader".to_string(), 2)]),
         snapshot_rows: Some((7, 3)),
+        ..Facts::default()
     };
     let p = points(&facts);
     let items = find(&p, MetricName::EtaHealthItems, Some(("reason", "answered")));
@@ -187,8 +188,9 @@ fn a_host_whose_refresh_never_ticked_emits_the_gate_but_no_age() {
     let dir = tempfile::tempdir().unwrap();
     let (_, c) = capture(|| export(dir.path(), "test-host", now(), &mut health));
     let gate = find(&c.metrics, MetricName::EtaHealthRefreshGate, None);
-    assert_eq!(gate.len(), 1);
-    assert_eq!(gate[0].labels.get("state").map(String::as_str), Some("no_captain"));
+    let on: Vec<_> = gate.iter().filter(|p| value(p) == 1).collect();
+    assert_eq!(on.len(), 1);
+    assert_eq!(on[0].labels.get("state").map(String::as_str), Some("no_captain"));
     assert!(find(&c.metrics, MetricName::EtaHealthRefreshLastCycleAgeSeconds, None).is_empty());
     assert!(find(&c.metrics, MetricName::EtaHealthRefreshRepos, None).is_empty());
 }
@@ -237,4 +239,86 @@ fn fit_check_and_snapshot_notes_surface_and_cached_snapshots_age() {
     );
     assert_eq!(value(check[0]), 1200);
     assert_eq!(value(find(&c.metrics, MetricName::EtaHealthSnapshotAlternatesRows, None)[0]), 1);
+}
+
+fn items_key(h: &str, r: &str) -> ItemKey {
+    ("land".to_string(), h.to_string(), r.to_string())
+}
+
+fn item_value(p: &[MetricPoint], reason: &str) -> Option<i64> {
+    find(p, MetricName::EtaHealthItems, Some(("reason", reason)))
+        .first()
+        .map(|x| value(x))
+}
+
+#[test]
+fn a_refusal_bucket_that_answers_is_zeroed() {
+    let prev = BTreeSet::from([items_key("land-v1", "no_model")]);
+    let items = buckets(&[est(1, Kind::Land, "land-v1", 0, false)]);
+    let p = points(&Facts {
+        now: now(),
+        items: Some(items),
+        prev_items: prev,
+        ..Facts::default()
+    });
+    assert_eq!(item_value(&p, "answered"), Some(1));
+    assert_eq!(item_value(&p, "no_model"), Some(0));
+}
+
+#[test]
+fn a_nonempty_items_set_that_empties_is_zeroed_and_unknown_is_not() {
+    let prev = BTreeSet::from([items_key("land-v1", "answered")]);
+    let empty = points(&Facts {
+        now: now(),
+        items: Some(BTreeMap::new()),
+        prev_items: prev.clone(),
+        ..Facts::default()
+    });
+    assert_eq!(item_value(&empty, "answered"), Some(0));
+    let unknown = points(&Facts {
+        now: now(),
+        items: None,
+        prev_items: prev,
+        ..Facts::default()
+    });
+    assert_eq!(item_value(&unknown, "answered"), None);
+}
+
+#[test]
+fn a_gate_transition_zeroes_the_previous_state() {
+    for (now_gate, was) in [("stand_down", "captain"), ("captain", "stand_down")] {
+        let p = points(&Facts {
+            now: now(),
+            gate: Some(now_gate.into()),
+            ..Facts::default()
+        });
+        let g = find(&p, MetricName::EtaHealthRefreshGate, None);
+        assert_eq!(g.len(), GATE_STATES.len());
+        let state = |s: &str| {
+            g.iter()
+                .find(|p| p.labels.get("state").is_some_and(|x| x == s))
+                .map(|p| value(p))
+        };
+        assert_eq!(state(now_gate), Some(1));
+        assert_eq!(state(was), Some(0));
+        assert_eq!(g.iter().filter(|p| value(p) == 1).count(), 1);
+    }
+}
+
+#[test]
+fn a_refresh_stop_reason_that_disappears_is_zeroed() {
+    let mut health = EtaHealth::default();
+    let dir = tempfile::tempdir().unwrap();
+    health.tick(&tick("captain", now(), &[("no_reader", 2)]));
+    let (_, first) = capture(|| export(dir.path(), "test-host", now(), &mut health));
+    health.tick(&tick("captain", now(), &[("complete", 3)]));
+    let (_, second) = capture(|| export(dir.path(), "test-host", now(), &mut health));
+    let at = |c: &crate::observability::ops::capture::Captured, r| {
+        find(&c.metrics, MetricName::EtaHealthRefreshRepos, Some(("reason", r)))
+            .first()
+            .map(|p| value(p))
+    };
+    assert_eq!(at(&first, "no_reader"), Some(2));
+    assert_eq!(at(&second, "complete"), Some(3));
+    assert_eq!(at(&second, "no_reader"), Some(0));
 }

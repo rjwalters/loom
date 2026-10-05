@@ -17,7 +17,7 @@
 //! hands it a snapshot of the one global, tests build their own and never
 //! touch the global (other modules' tests write it through the `note_*` seams).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
@@ -42,7 +42,18 @@ pub struct EtaHealth {
     snapshot_rows: Option<(u64, u64)>,
     /// Cached fleet snapshot `as_of`, keyed by file, re-read on an mtime change.
     ages: BTreeMap<PathBuf, (SystemTime, String, DateTime<Utc>)>,
+    /// Series keys already exported, so a bucket that empties is zeroed
+    /// rather than left at its last nonzero value on the backend.
+    emitted_items: BTreeSet<ItemKey>,
+    emitted_reasons: BTreeSet<String>,
 }
+
+/// `(kind, heuristic, reason)` of one items bucket.
+type ItemKey = (String, String, String);
+
+/// The closed refresh-gate vocabulary: every state is emitted each pass
+/// (one at 1, the rest at 0) so a transition never leaves two states active.
+const GATE_STATES: [&str; 4] = ["captain", "stand_down", "no_captain", "disabled"];
 
 static HEALTH: Mutex<Option<EtaHealth>> = Mutex::new(None);
 
@@ -126,6 +137,10 @@ pub struct Facts {
     pub last_tick: Option<DateTime<Utc>>,
     pub refresh_repos: BTreeMap<String, u64>,
     pub snapshot_rows: Option<(u64, u64)>,
+    /// Items bucket keys exported on earlier passes; zeroed when absent now.
+    pub prev_items: BTreeSet<ItemKey>,
+    /// Refresh stop reasons exported on earlier passes; zeroed when absent now.
+    pub prev_reasons: BTreeSet<String>,
 }
 
 fn age(now: DateTime<Utc>, then: DateTime<Utc>) -> i64 {
@@ -140,13 +155,19 @@ fn count(n: u64) -> i64 {
 #[must_use]
 pub fn points(facts: &Facts) -> Vec<MetricPoint> {
     let mut out = Vec::new();
-    for ((kind, heuristic, reason), n) in facts.items.iter().flatten() {
-        out.push(
-            MetricPoint::int(MetricName::EtaHealthItems, count(*n))
-                .label("kind", kind)
-                .label("heuristic", heuristic)
-                .label("reason", reason),
-        );
+    // A measured pass (`items` is `Some`) zeroes every previously exported
+    // bucket it no longer holds; an unknown pass (`None`) emits nothing.
+    if let Some(items) = &facts.items {
+        let zeroed = facts.prev_items.iter().filter(|k| !items.contains_key(*k));
+        let zeroed = zeroed.map(|k| (k, 0));
+        for ((kind, heuristic, reason), n) in items.iter().map(|(k, n)| (k, *n)).chain(zeroed) {
+            out.push(
+                MetricPoint::int(MetricName::EtaHealthItems, count(n))
+                    .label("kind", kind)
+                    .label("heuristic", heuristic)
+                    .label("reason", reason),
+            );
+        }
     }
     out.push(MetricPoint::int(
         MetricName::EtaHealthFitLoaded,
@@ -168,7 +189,11 @@ pub fn points(facts: &Facts) -> Vec<MetricPoint> {
         );
     }
     if let Some(gate) = &facts.gate {
-        out.push(MetricPoint::int(MetricName::EtaHealthRefreshGate, 1).label("state", gate));
+        let others = GATE_STATES.iter().copied().filter(|s| s != gate);
+        for state in std::iter::once(gate.as_str()).chain(others) {
+            let on = i64::from(state == gate);
+            out.push(MetricPoint::int(MetricName::EtaHealthRefreshGate, on).label("state", state));
+        }
     }
     if let Some(at) = facts.last_tick {
         out.push(MetricPoint::int(
@@ -176,9 +201,18 @@ pub fn points(facts: &Facts) -> Vec<MetricPoint> {
             age(facts.now, at),
         ));
     }
-    for (reason, n) in &facts.refresh_repos {
+    let gone = facts
+        .prev_reasons
+        .iter()
+        .filter(|r| !facts.refresh_repos.contains_key(*r));
+    let reasons = facts
+        .refresh_repos
+        .iter()
+        .map(|(r, n)| (r, *n))
+        .chain(gone.map(|r| (r, 0)));
+    for (reason, n) in reasons {
         out.push(
-            MetricPoint::int(MetricName::EtaHealthRefreshRepos, count(*n)).label("reason", reason),
+            MetricPoint::int(MetricName::EtaHealthRefreshRepos, count(n)).label("reason", reason),
         );
     }
     if let Some((rows, alternates)) = facts.snapshot_rows {
@@ -259,13 +293,23 @@ fn gather(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth
         last_tick: tick.map(|(at, _)| at),
         refresh_repos: repos,
         snapshot_rows,
+        prev_items: health.emitted_items.clone(),
+        prev_reasons: health.emitted_reasons.clone(),
     }
 }
 
 /// Gather the facts from `health` and emit the gauges through the global
 /// path (so a test can [`super::capture::capture`] them). Blocking (file reads).
 fn export(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth) {
-    super::emit_metrics(points(&gather(root, host_id, now, health)));
+    let facts = gather(root, host_id, now, health);
+    let out = points(&facts);
+    // Remember what this pass exported; an unknown reading keeps the memory
+    // so the series is still zeroed once it is measurable again.
+    if let Some(items) = facts.items {
+        health.emitted_items = items.into_keys().collect();
+    }
+    health.emitted_reasons = facts.refresh_repos.into_keys().collect();
+    super::emit_metrics(out);
 }
 
 /// One collector pass over the global state: snapshot it (taking the `as_of`
@@ -278,7 +322,11 @@ fn export_global(root: &Path, host_id: &str, now: DateTime<Utc>) {
         EtaHealth { ages, ..h.clone() }
     });
     export(root, host_id, now, &mut health);
-    with(|h| h.ages = health.ages);
+    with(|h| {
+        h.ages = health.ages;
+        h.emitted_items = health.emitted_items;
+        h.emitted_reasons = health.emitted_reasons;
+    });
 }
 
 /// Gather and export the gauges, when an ops sink is registered.
