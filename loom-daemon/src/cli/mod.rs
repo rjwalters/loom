@@ -59,6 +59,7 @@ mod label_duplicates;
 pub(crate) mod labels_cmd;
 pub(crate) mod lease_co_occupancy;
 pub(crate) mod lease_ensure;
+pub(crate) mod lease_renewer;
 pub(crate) mod legacy_script_cmds;
 pub(crate) mod merge_group_ci_cmd;
 mod merge_pr_check_runs_rollup;

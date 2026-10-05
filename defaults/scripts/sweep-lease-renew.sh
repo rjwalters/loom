@@ -218,12 +218,13 @@
 #     an error, a normal stand-down outcome).
 #
 #   sweep-lease-renew.sh release <issue> [--host HOST] [--sweep-id ID]
-#     End the renewer owning this (repo, host, sweep, issue) key (#10229).
-#     `start` is single-owner per that key (record under
-#     ~/.loom/lease-renew, LOOM_LEASE_RENEW_STATE_DIR); each loop cycle also
-#     reads `issue-state <issue>` and exits when the issue is closed, skipping
-#     the PATCH when the state cannot be read. Budget: 3 requests per cycle
-#     (36/h at 300 s); SWEEP_LEASE_RENEW_STATE_CHECK_EVERY=N checks every Nth.
+#     End the renewer owning this (repo, host, sweep, issue) key now (#10229);
+#     idempotent, and a peer's key is never touched. `start` is single-owner
+#     per that key, and each cycle also reads the issue's state and stops for
+#     good once it is closed (an unreadable state skips that cycle's PATCH).
+#     All three live in `loom-daemon lease renewer` (claim / check / release);
+#     records sit under ~/.loom/lease-renew ($LOOM_LEASE_RENEW_STATE_DIR).
+#     Budget: 3 requests per cycle, 36/h per held lease at 300 s.
 #
 #   sweep-lease-renew.sh stop <PID>
 #     Best-effort kill of a loop PID returned by `start`. NOT required for
@@ -243,6 +244,8 @@
 #   .loom/scripts/sweep-lease-renew.sh start 6180
 #   .loom/scripts/sweep-lease-renew.sh renew-once 6180
 #   .loom/scripts/sweep-lease-renew.sh stop 12345
+
+# requires-daemon: lease optional   `lease renewer` (#10229): any exit but 3 (stop) / 4 (skip) from a binary predating it renews exactly as before.
 
 set -euo pipefail
 
@@ -611,138 +614,6 @@ max_age_exceeded() {
     ((now - started >= cap))
 }
 
-# --- Single-owner arbitration (Issue #10229) -----------------------------
-#
-# At most one live renewer per (repo, host, sweep, issue). Ownership is a
-# small record file in the machine's loom state directory (never in a
-# worktree), written under a short-lived mkdir mutex so concurrent identical
-# `start`s serialize. The record holds the loop's pid, its start-time identity
-# and a per-start token, so a dead owner or a recycled pid is recoverable while
-# a live owner is never evicted. Different repos / issues / sweeps hash to
-# different keys and never collide.
-LEASE_RENEW_STATE_DIR="${LOOM_LEASE_RENEW_STATE_DIR:-${HOME:-/tmp}/.loom/lease-renew}"
-
-owner_key() {
-    local issue="$1" host="$2" sweep_id="$3" repo
-    repo="${LOOM_REPO:-}"
-    [[ -n "$repo" ]] || repo="$(git remote get-url origin 2> /dev/null || git rev-parse --show-toplevel 2> /dev/null || pwd)"
-    printf '%s\n' "${repo}|${host}|${sweep_id}|${issue}" | sha256_hex_stdin | cut -c1-32
-}
-
-owner_file() { printf '%s/%s.owner' "$LEASE_RENEW_STATE_DIR" "$1"; }
-
-# `with_owner_mutex <key> <fn> [args...]` runs <fn> with the per-key mutex held.
-with_owner_mutex() {
-    local key="$1" fn="$2" lock tries=0 rc=0
-    shift 2
-    mkdir -p "$LEASE_RENEW_STATE_DIR" 2> /dev/null || return 1
-    lock="$LEASE_RENEW_STATE_DIR/${key}.lock"
-    until mkdir "$lock" 2> /dev/null; do
-        tries=$((tries + 1))
-        if ((tries > 50)); then
-            # A holder that died inside the (network-free, sub-second) critical
-            # section: break its mutex once and retry.
-            rmdir "$lock" 2> /dev/null || true
-            mkdir "$lock" 2> /dev/null || return 1
-            break
-        fi
-        sleep 0.1
-    done
-    "$fn" "$@" || rc=$?
-    rmdir "$lock" 2> /dev/null || true
-    return "$rc"
-}
-
-# Prints the pid of a LIVE owner of key `$1` and returns 0; else returns 1.
-live_owner() {
-    local pid="" ident="" tok=""
-    [[ -f "$(owner_file "$1")" ]] || return 1
-    IFS=$'\t' read -r pid ident tok < "$(owner_file "$1")" || true
-    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    pid_is_live "$pid" "$ident" || return 1
-    printf '%s' "$pid"
-}
-
-# Does key `$1`'s owner record still carry token `$2`?
-owner_token_is() {
-    local pid="" ident="" tok=""
-    [[ -f "$(owner_file "$1")" ]] || return 1
-    IFS=$'\t' read -r pid ident tok < "$(owner_file "$1")" || true
-    [[ "$tok" == "$2" ]]
-}
-
-# Resolve --host/--sweep-id the way `start` always has: explicit wins, else
-# derive from $LOOM_TERMINAL_ID=daemon-<id>; a partial auto pair is discarded.
-# Sets RESOLVED_HOST / RESOLVED_SWEEP.
-resolve_pair() {
-    RESOLVED_HOST="$1"
-    RESOLVED_SWEEP="$2"
-    if [[ -z "$RESOLVED_HOST" && -z "$RESOLVED_SWEEP" && "${LOOM_TERMINAL_ID:-}" == daemon-* ]]; then
-        local auto_host
-        auto_host="$(resolve_published_host)"
-        if [[ -n "$auto_host" ]]; then
-            RESOLVED_HOST="$auto_host"
-            RESOLVED_SWEEP="${LOOM_TERMINAL_ID#daemon-}"
-        fi
-    fi
-}
-
-# --- issue-state -----------------------------------------------------------
-# `issue-state <issue>`: prints the issue's state (open|closed) from an explicit
-# issue read -- the comments endpoint carries no issue state. Exit 1 on any
-# read/parse failure, so a transient error is never mistaken for completion.
-cmd_issue_state() {
-    local issue="${1:-}" sweep_id=""
-    shift || true
-    [[ "$issue" =~ ^[0-9]+$ ]] || { echo "ERROR: issue-state requires an issue number" >&2; exit 1; }
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --sweep-id) sweep_id="${2:-}"; shift 2 ;;
-            *) echo "ERROR: issue-state: unknown flag '$1'" >&2; exit 1 ;;
-        esac
-    done
-    [[ -z "$sweep_id" ]] || export LOOM_SWEEP_ID="$sweep_id"
-    export LOOM_ROLE="sweep-lease-renew"
-    local json state
-    json="$(forge_gh_perm_safe api "repos/$(gh_repo_path)/issues/${issue}")" || { echo "ERROR: issue state read failed for #${issue}" >&2; exit 1; }
-    state="$(jq -r '.state // empty' <<< "$json" 2> /dev/null || true)"
-    case "$state" in
-        open | closed) printf '%s\n' "$state" ;;
-        *) echo "ERROR: issue #${issue} state unreadable/malformed" >&2; exit 1 ;;
-    esac
-}
-
-# --- release ---------------------------------------------------------------
-# `release <issue> [--host H --sweep-id S]`: end THIS (repo, host, sweep,
-# issue) renewer now. Only the recorded owner of this exact key is signalled --
-# a peer's loop (other sweep/issue/repo) has a different key and is untouched.
-# Idempotent: nothing to release is success.
-release_locked() {
-    local key="$1" pid
-    if pid="$(live_owner "$key")"; then
-        kill "$pid" 2> /dev/null || true
-    fi
-    rm -f "$LEASE_RENEW_STATE_DIR/${key}.owner"
-}
-
-cmd_release() {
-    local issue="${1:-}" host="" sweep_id=""
-    shift || true
-    [[ "$issue" =~ ^[0-9]+$ ]] || { echo "ERROR: release requires an issue number" >&2; exit 1; }
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --host) host="${2:-}"; shift 2 ;;
-            --sweep-id) sweep_id="${2:-}"; shift 2 ;;
-            *) echo "ERROR: release: unknown flag '$1'" >&2; exit 1 ;;
-        esac
-    done
-    resolve_pair "$host" "$sweep_id"
-    local key
-    key="$(owner_key "$issue" "$RESOLVED_HOST" "$RESOLVED_SWEEP")" || exit 1
-    with_owner_mutex "$key" release_locked "$key" || true
-    echo "released renewal for issue #${issue}" >&2
-}
-
 # --- renew-once --------------------------------------------------------
 
 cmd_renew_once() {
@@ -791,9 +662,9 @@ cmd_renew_once() {
     export LOOM_ROLE="sweep-lease-renew"
     # The cache-miss path: the same invocation minus the cache, i.e. today's
     # full paginated lookup. `exec` (not a call) so it can never recurse twice.
-    # Cache-fallback reason, telemetry only (#10229): `initial` for the first
-    # uncached lookup, else full-window / missing-comment / patch-404 below.
-    [[ -n "$cached" ]] || export LOOM_LEASE_FALLBACK_REASON="${LOOM_LEASE_FALLBACK_REASON:-initial}"
+    # Each re-list exports its reason as LOOM_LEASE_FALLBACK_REASON (#10229,
+    # gh-shim telemetry: full-window / missing-comment / patch-404); an uncached
+    # call without one is an initial lookup.
     local -a relist=("$SELF" renew-once "$issue" ${host:+--host "$host" --sweep-id "$sweep_id"})
 
     # Routed through forge_gh_perm_safe (Issue #6541) so a GitHub
@@ -823,8 +694,7 @@ cmd_renew_once() {
     fi
     if [[ -n "$cached" && "$(jq 'if type == "array" then length else 100 end' <<< "$comments_json" 2> /dev/null || echo 100)" -ge 100 ]]; then
         echo "cached lease comment window for issue #${issue} is a full page; re-listing all comments (#10021) lease-fallback=full-window" >&2
-        export LOOM_LEASE_FALLBACK_REASON="full-window"
-        exec "${relist[@]}"
+        LOOM_LEASE_FALLBACK_REASON=full-window exec "${relist[@]}"
     fi
     # #9548: renew only a TRUSTED author's lease, and honour only a trusted
     # yield record; an outsider's copy of either is prose.
@@ -845,8 +715,7 @@ cmd_renew_once() {
 
     if [[ -z "$candidate_id" && -n "$cached" ]]; then
         echo "cached lease comment ${cached%%@*} is gone from issue #${issue} (deleted or no longer matching); re-listing all comments (#10021) lease-fallback=missing-comment" >&2
-        export LOOM_LEASE_FALLBACK_REASON="missing-comment"
-        exec "${relist[@]}"
+        LOOM_LEASE_FALLBACK_REASON=missing-comment exec "${relist[@]}"
     elif [[ -z "$candidate_id" ]]; then
         echo "no lease comment found for issue #${issue} (marker=${LEASE_MARKER_PREFIX}...${exact:+, exact=$exact}); nothing to renew (#6180)" >&2
         exit 2
@@ -921,8 +790,7 @@ cmd_renew_once() {
     [[ -z "$patch_err" ]] || printf '%s\n' "$patch_err" >&2
     if ((patch_rc != 0)) && [[ -n "$cached" && "$patch_err" == *"HTTP 404"* ]]; then
         echo "cached lease comment ${candidate_id} on issue #${issue} returned 404; re-listing all comments (#10021) lease-fallback=patch-404" >&2
-        export LOOM_LEASE_FALLBACK_REASON="patch-404"
-        exec "${relist[@]}"
+        LOOM_LEASE_FALLBACK_REASON=patch-404 exec "${relist[@]}"
     elif ((patch_rc != 0)); then
         echo "ERROR: PATCH of lease comment ${candidate_id} on issue #${issue} failed" >&2
         exit 1
@@ -1037,9 +905,19 @@ cmd_start() {
     # A partial resolution (one but not the other) is discarded rather than
     # passed through -- renew-once requires both --host and --sweep-id
     # together or neither. Explicit --host/--sweep-id flags always win.
-    resolve_pair "$host" "$sweep_id"
-    host="$RESOLVED_HOST"
-    sweep_id="$RESOLVED_SWEEP"
+    if [[ -z "$host" && -z "$sweep_id" ]]; then
+        local auto_sweep_id="" auto_host=""
+        if [[ "${LOOM_TERMINAL_ID:-}" == daemon-* ]]; then
+            auto_sweep_id="${LOOM_TERMINAL_ID#daemon-}"
+        fi
+        if [[ -n "$auto_sweep_id" ]]; then
+            auto_host="$(resolve_published_host)"
+        fi
+        if [[ -n "$auto_sweep_id" && -n "$auto_host" ]]; then
+            host="$auto_host"
+            sweep_id="$auto_sweep_id"
+        fi
+    fi
 
     local -a extra_args=()
     [[ -n "$host" ]] && extra_args+=(--host "$host")
@@ -1091,96 +969,59 @@ cmd_start() {
     # cycle keeps the cache; exit 2 (no lease) clears it.
     local loop_started_at lease_cache_re='lease-cache=([0-9]+@[0-9TZ:-]+)'
     loop_started_at="$(date -u +%s)"
-
-    # Single-owner arbitration (Issue #10229): at most one live renewer per
-    # (repo, host, sweep, issue), enforced here rather than by caller
-    # discipline. A live owner short-circuits to "report its pid, fork nothing".
-    local owner_key_v="" owner_token loop_pid=""
-    owner_key_v="$(owner_key "$issue" "$host" "$sweep_id")" || owner_key_v=""
-    owner_token="$$.${RANDOM}.$(date -u +%s)"
-    local state_every="${SWEEP_LEASE_RENEW_STATE_CHECK_EVERY:-1}"
-    [[ "$state_every" =~ ^[1-9][0-9]*$ ]] || state_every=1
-
-    start_loop() {
-        local existing
-        if [[ -n "$owner_key_v" ]] && existing="$(live_owner "$owner_key_v")"; then
-            echo "sweep-lease-renew: a renewer (pid ${existing}) already owns issue #${issue}; not starting a duplicate (#10229)" >&9
-            printf '%s\n' "$existing"
-            return 10
-        fi
-        (
-            cached_lease=""
-            cycle=0
-            # Drop our ownership record on any exit, but only if it is still ours.
-            trap '[[ -z "$owner_key_v" ]] || ! owner_token_is "$owner_key_v" "$owner_token" || rm -f "$LEASE_RENEW_STATE_DIR/${owner_key_v}.owner"' EXIT
-            while pid_is_live "$watch_pid" "$watch_ident"; do
-                if max_age_exceeded "$loop_started_at" "$max_age"; then
-                    echo "sweep-lease-renew: renewal loop for issue #${issue} exiting: reached the ${max_age}s absolute lifetime cap (SWEEP_LEASE_RENEW_MAX_AGE_SECS / --max-age, #7825). The lease now ages out and the claim becomes reclaimable; set the cap to 0 to disable it." >&9
-                    break
-                fi
-                sleep "$interval"
-                pid_is_live "$watch_pid" "$watch_ident" || break
-                if max_age_exceeded "$loop_started_at" "$max_age"; then
-                    echo "sweep-lease-renew: renewal loop for issue #${issue} exiting: reached the ${max_age}s absolute lifetime cap (SWEEP_LEASE_RENEW_MAX_AGE_SECS / --max-age, #7825). The lease now ages out and the claim becomes reclaimable; set the cap to 0 to disable it." >&9
-                    break
-                fi
-                # Ownership lost (released, or taken over after we were judged
-                # dead): stop rather than run as an unrecorded duplicate.
-                if [[ -n "$owner_key_v" ]] && ! owner_token_is "$owner_key_v" "$owner_token"; then
-                    echo "sweep-lease-renew: renewal loop for issue #${issue} exiting: ownership record released or replaced (#10229)." >&9
-                    break
-                fi
-                # Completion check (#10229): an explicit issue-state read (the
-                # comments response has no state). Closed -> stop for good, even
-                # though the interactive parent is still alive. Unreadable ->
-                # transient: skip THIS cycle's PATCH (never renew an unverified
-                # target) but keep the loop and the claim.
-                cycle=$((cycle + 1))
-                if ((cycle % state_every == 0)); then
-                    state_rc=0
-                    issue_state="$("$SELF" issue-state "$issue" ${sweep_id:+--sweep-id "$sweep_id"} 2>&1)" || state_rc=$?
-                    if ((state_rc == 0)) && [[ "$issue_state" == "closed" ]]; then
-                        echo "sweep-lease-renew: renewal loop for issue #${issue} exiting: issue is closed (#10229)." >&9
-                        break
-                    elif ((state_rc != 0)); then
-                        echo "sweep-lease-renew: issue #${issue} state unverified this cycle (${issue_state}); skipping renewal (#10229)" >&9
-                        continue
-                    fi
-                fi
-                renew_rc=0
-                # The `${arr[@]+...}` guard below is mandatory -- NOT an
-                # unguarded expansion (Issue #8333, same defect class as #8281):
-                # under bash 3.2 (stock macOS /bin/bash) + `set -u`, expanding an
-                # EMPTY array dies with "extra_args[@]: unbound variable".
-                renew_err="$("$SELF" renew-once "$issue" "${extra_args[@]+"${extra_args[@]}"}" ${cached_lease:+--cached-lease "$cached_lease"} 2>&1 > /dev/null)" || renew_rc=$?
-                if [[ "$renew_rc" -eq 0 || "$renew_rc" -eq 2 ]]; then
-                    cached_lease=""
-                    if [[ "$renew_rc" -eq 0 && "$renew_err" =~ $lease_cache_re ]]; then cached_lease="${BASH_REMATCH[1]}"; fi
-                elif [[ "$renew_rc" -ne 4 ]]; then
-                    echo "sweep-lease-renew: renewal cycle for issue #${issue} FAILED (renew-once exit ${renew_rc}): ${renew_err}" >&9
-                fi
-                [[ "$renew_rc" -ne 4 ]] || break
-            done
-        ) < /dev/null > /dev/null 2>&1 &
-        loop_pid=$!
-        if [[ -n "$owner_key_v" ]]; then
-            printf '%s\t%s\t%s\n' "$loop_pid" "$(pid_start_identity "$loop_pid" 2> /dev/null || true)" "$owner_token" \
-                > "$(owner_file "$owner_key_v")"
-        fi
-    }
-
-    local start_rc=0
-    if [[ -n "$owner_key_v" ]]; then
-        with_owner_mutex "$owner_key_v" start_loop || start_rc=$?
-    else
-        start_loop || start_rc=$?
-    fi
-    if ((start_rc == 10)); then
-        exec 9>&-
-        return 0
-    fi
+    #
+    # Issue #10229: one renewer per (repo, host, sweep, issue), and a cycle
+    # that ends the loop once the issue is closed, even while the watched
+    # interactive parent lives on. The decisions live in `loom-daemon lease
+    # renewer`; the state read stays here, on forge_gh_perm_safe's credentials.
+    # check: 3 = stop for good (closed / released / superseded), 4 = state
+    # unverified, skip this PATCH; anything else (incl. an older binary) renews.
+    local -a owner_args=("$issue" --host "$host" --sweep-id "$sweep_id" --token "$$.${RANDOM}.${loop_started_at}")
+    (
+        cached_lease=""
+        while pid_is_live "$watch_pid" "$watch_ident"; do
+            if max_age_exceeded "$loop_started_at" "$max_age"; then
+                echo "sweep-lease-renew: renewal loop for issue #${issue} exiting: reached the ${max_age}s absolute lifetime cap (SWEEP_LEASE_RENEW_MAX_AGE_SECS / --max-age, #7825). The lease now ages out and the claim becomes reclaimable; set the cap to 0 to disable it." >&9
+                break
+            fi
+            sleep "$interval"
+            pid_is_live "$watch_pid" "$watch_ident" || break
+            if max_age_exceeded "$loop_started_at" "$max_age"; then
+                echo "sweep-lease-renew: renewal loop for issue #${issue} exiting: reached the ${max_age}s absolute lifetime cap (SWEEP_LEASE_RENEW_MAX_AGE_SECS / --max-age, #7825). The lease now ages out and the claim becomes reclaimable; set the cap to 0 to disable it." >&9
+                break
+            fi
+            gate_rc=0
+            issue_state="$(export LOOM_ROLE=sweep-lease-renew; [[ -z "$sweep_id" ]] || export LOOM_SWEEP_ID="$sweep_id"; forge_gh_perm_safe api "repos/$(gh_repo_path)/issues/${issue}" --jq .state 2> /dev/null)" || issue_state=""
+            "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer check "${owner_args[@]}" --issue-state "$issue_state" 2>&9 || gate_rc=$?
+            ((gate_rc != 3)) || break
+            ((gate_rc != 4)) || continue
+            renew_rc=0
+            # The `${arr[@]+...}` guard below is mandatory -- NOT an
+            # unguarded expansion (Issue #8333, same defect class as #8281):
+            # under bash 3.2 (stock macOS /bin/bash) + `set -u`, expanding an
+            # EMPTY array dies with "extra_args[@]: unbound variable". The
+            # array is empty on every legal invocation that passed neither
+            # --host nor --sweep-id AND could not auto-resolve them above
+            # (any $LOOM_TERMINAL_ID without a `daemon-` prefix), so on those
+            # hosts each cycle's command substitution died and the lease was
+            # never actually renewed -- silently, since `|| renew_rc=$?`
+            # catches it and only a generic FAILED line reached fd 9.
+            renew_err="$("$SELF" renew-once "$issue" "${extra_args[@]+"${extra_args[@]}"}" ${cached_lease:+--cached-lease "$cached_lease"} 2>&1 > /dev/null)" || renew_rc=$?
+            if [[ "$renew_rc" -eq 0 || "$renew_rc" -eq 2 ]]; then
+                cached_lease=""
+                if [[ "$renew_rc" -eq 0 && "$renew_err" =~ $lease_cache_re ]]; then cached_lease="${BASH_REMATCH[1]}"; fi
+            elif [[ "$renew_rc" -ne 4 ]]; then
+                echo "sweep-lease-renew: renewal cycle for issue #${issue} FAILED (renew-once exit ${renew_rc}): ${renew_err}" >&9
+            fi
+            [[ "$renew_rc" -ne 4 ]] || break
+        done
+    ) < /dev/null > /dev/null 2>&1 &
+    local loop_pid=$! owner_pid=""
+    # A live renewer already owns this key: drop the loop just forked (still in
+    # its first sleep, no forge call made) and report the owner's pid instead.
+    owner_pid="$("${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer claim "${owner_args[@]}" --pid "$loop_pid" 2>&9)" || owner_pid=""
+    [[ ! "$owner_pid" =~ ^[0-9]+$ || "$owner_pid" == "$loop_pid" ]] || { kill "$loop_pid" 2> /dev/null || true; loop_pid="$owner_pid"; }
     exec 9>&-
-    [[ -n "$loop_pid" ]] || { echo "ERROR: could not start renewal loop" >&2; exit 1; }
     disown "$loop_pid" 2> /dev/null || true
     echo "$loop_pid"
 }
@@ -1201,8 +1042,7 @@ main() {
         start) cmd_start "$@" ;;
         renew-once) cmd_renew_once "$@" ;;
         stop) cmd_stop "$@" ;;
-        release) cmd_release "$@" ;;
-        issue-state) cmd_issue_state "$@" ;;
+        release) exec "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer release "$@" ;;
         -h | --help | "") usage ;;
         *)
             echo "ERROR: unknown command '$cmd'" >&2

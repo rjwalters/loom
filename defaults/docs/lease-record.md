@@ -277,19 +277,22 @@ future reclamation decision's evidence, not the claim's own validity.
 ## Renewer ownership, completion and request budget (Issue #10229)
 
 - **One renewer per (repo, host, sweep, issue).** `sweep-lease-renew.sh start`
-  records the loop's pid, start-time identity and a token under
-  `~/.loom/lease-renew/` (`LOOM_LEASE_RENEW_STATE_DIR`), behind a `mkdir`
-  mutex. A repeated start with a live owner prints that pid and forks nothing;
-  a dead owner or recycled pid is recovered; other keys never collide.
-- **Completion.** Each cycle first reads the issue (`issue-state`, an explicit
-  `GET issues/N`; the comments response has no state). `closed` ends the loop
+  hands the forked loop to `loom-daemon lease renewer claim`, which records its
+  pid, start-time identity and a per-start token under `~/.loom/lease-renew/`
+  (`LOOM_LEASE_RENEW_STATE_DIR`) behind an exclusive `flock`. A repeated start
+  with a live owner prints that pid and drops its own loop; a dead owner or
+  recycled pid is recovered; other keys never collide.
+- **Completion.** Each cycle reads the issue (an explicit `GET issues/N` via
+  `forge_gh_perm_safe`; the comments response has no state) and asks
+  `lease renewer check`: `closed`, a release or a newer owner ends the loop
   even while the interactive parent lives; an unreadable state skips that
   cycle's PATCH and keeps the loop. `release <issue>` ends that key's loop
-  explicitly (idempotent). A remote authenticated release marker is not defined.
+  explicitly (idempotent). A daemon predating the verb renews as before. A
+  remote authenticated release marker is not defined.
 - **Budget.** Steady state is three requests per cycle (state read, one
   non-paginated `?since=` window, one PATCH): 36/h per held lease at the
-  default 300 s, up from 24/h. `SWEEP_LEASE_RENEW_STATE_CHECK_EVERY=N` reads
-  state every Nth cycle. Fallback reasons (`initial`, `full-window`,
+  default 300 s, up from 24/h, while loops for closed issues stop instead of
+  renewing until the 4 h / 24 h age cap. Re-list reasons (`full-window`,
   `missing-comment`, `patch-404`) are logged and exported as
   `LOOM_LEASE_FALLBACK_REASON` for gh-shim telemetry.
 
