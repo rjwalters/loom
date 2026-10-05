@@ -860,11 +860,10 @@ pub fn nwo_from_git_remote(cwd: &Path) -> Option<String> {
         // HTTPS: https://host/owner/repo
         let (_host, p) = rest.split_once('/')?;
         p
-    } else if let Some(rest) = stripped.strip_prefix("http://") {
+    } else {
+        let rest = stripped.strip_prefix("http://")?;
         let (_host, p) = rest.split_once('/')?;
         p
-    } else {
-        return None;
     };
 
     let trimmed = path.trim_matches('/');
