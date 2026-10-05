@@ -2,6 +2,7 @@
 
 use super::*;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 const FULL_ROW: &str = r#"[{
   "number": 502, "state": "open", "draft": true, "title": "t",
@@ -173,8 +174,83 @@ fn errors_carry_stderr_for_the_rate_limit_classifier() {
         Some(dir.path()),
         &store::resolve_target(Some(dir.path()), Some("o/r")),
         "repos/o/r/other",
+        Kind::Listing,
     )
     .unwrap_err()
     .to_string();
     assert!(err.contains("HTTP 502"), "{err}");
+}
+
+/// Clears this thread's opted-in daemon store on drop, even on a panic.
+struct StoreGuard;
+impl Drop for StoreGuard {
+    fn drop(&mut self) {
+        store::set_test_daemon_store_dir(None);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_per_pr_entry_stores_only_mergeable_and_stale_ones_are_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("store");
+    std::fs::create_dir(&store_dir).unwrap();
+    store::set_test_daemon_store_dir(Some(store_dir.clone()));
+    let _guard = StoreGuard;
+    let (gh, _) = write_fake_gh(dir.path(), 0);
+    let old = SystemTime::now() - PULL_ENTRY_MAX_AGE - Duration::from_secs(60);
+
+    // A closed PR's leftovers, last written beyond the max age: one on disk,
+    // one only in the hot layer. Plus a fresh per-PR file and an old listing
+    // page, neither of which may be touched.
+    let stale_disk = store_dir.join(format!("{PULL_PREFIX}00000000deadbeef.json"));
+    let fresh_disk = store_dir.join(format!("{PULL_PREFIX}00000000cafef00d.json"));
+    let old_listing = store_dir.join("listing-00000000feedface.json");
+    for p in [&stale_disk, &fresh_disk, &old_listing] {
+        std::fs::write(p, r#"{"etag":"W/\"x\"","body":"{}"}"#).unwrap();
+    }
+    for p in [&stale_disk, &old_listing] {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    let hot_key = format!("stale-hot-{}", dir.path().display());
+    let listing_key = format!("old-listing-hot-{}", dir.path().display());
+    {
+        let mut guard = cache().lock().unwrap();
+        let entry = |pull_written| CacheEntry {
+            etag: "W/\"x\"".to_string(),
+            body: Arc::new("{}".to_string()),
+            pull_written,
+        };
+        guard.insert(hot_key.clone(), entry(Some(old)));
+        guard.insert(listing_key.clone(), entry(None));
+    }
+
+    let m = pull_mergeable_cached_as("test", &gh, Some(dir.path()), None, 42).unwrap();
+    assert_eq!(m, Some(false));
+
+    assert!(!stale_disk.exists(), "a per-PR file past the max age is pruned");
+    assert!(fresh_disk.exists(), "a fresh per-PR file survives");
+    assert!(old_listing.exists(), "listing pages are never age-pruned");
+    let guard = cache().lock().unwrap();
+    assert!(!guard.contains_key(&hot_key), "a stale hot per-PR entry is pruned");
+    assert!(guard.contains_key(&listing_key), "a hot listing entry is not");
+    drop(guard);
+
+    // The new entry holds only the mergeable value, never the full PR body.
+    let written: Vec<_> = std::fs::read_dir(&store_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p != &fresh_disk && p != &old_listing)
+        .collect();
+    assert_eq!(written.len(), 1, "{written:?}");
+    let entry = store::read_disk_entry(&written[0]).unwrap();
+    assert_eq!(entry.body, r#"{"mergeable":false}"#);
+    cache().lock().unwrap().remove(&hot_key);
+    cache().lock().unwrap().remove(&listing_key);
 }

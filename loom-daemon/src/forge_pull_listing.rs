@@ -21,10 +21,17 @@
 //!
 //! Like the daemon's issue listing this trusts every `200` (no #7451 shrink
 //! guard): a just-relabelled PR must drop out of the next pass's view.
+//!
+//! The listing uses a fixed set of keys (one per page), but the per-PR read
+//! adds one key per distinct PR ever checked. Those entries store only
+//! `{"mergeable": …}` (never the PR description) under their own `pull-`
+//! file prefix, and both layers drop them [`PULL_ENTRY_MAX_AGE`] after their
+//! last `200` — the same bound as `forge_cached_view`'s `prune_stale`.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -33,6 +40,14 @@ use crate::forge_etag_store as store;
 
 /// Rows per page — GitHub's REST maximum.
 pub const PER_PAGE: usize = 100;
+
+/// Per-PR mergeable entries whose last `200` is older than this are pruned
+/// (disk and memory) on the next per-PR `200`. Without it both layers grow
+/// by one entry per distinct PR ever read; an evicted entry costs one `200`.
+pub const PULL_ENTRY_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Disk filename prefix of the per-PR entries (the listing uses `listing-`).
+const PULL_PREFIX: &str = "pull-";
 
 /// An open PR as returned by `GET repos/{o}/{r}/pulls`, reduced to the fields
 /// the daemon's reconciliation passes consume.
@@ -103,7 +118,7 @@ pub fn list_open_pulls_cached_as(
     for page in 1..=max_pages.max(1) {
         let url = build_pulls_url(target.repo.as_deref(), page);
         let site = store::ConditionalRead::new(caller, PR_LIST_OPEN);
-        let body = conditional_get(site, gh_bin, cwd, &target, &url)?;
+        let body = conditional_get(site, gh_bin, cwd, &target, &url, Kind::Listing)?;
         let batch =
             parse_rest_pulls(&body).with_context(|| format!("parse REST pulls JSON from {url}"))?;
         let full = batch.len() >= PER_PAGE;
@@ -135,7 +150,7 @@ pub fn pull_mergeable_cached_as(
     let repo_path = target.repo.as_deref().unwrap_or("{owner}/{repo}");
     let url = format!("repos/{repo_path}/pulls/{number}");
     let site = store::ConditionalRead::new(caller, ops::PR_VIEW_STATE);
-    let body = conditional_get(site, gh_bin, cwd, &target, &url)?;
+    let body = conditional_get(site, gh_bin, cwd, &target, &url, Kind::Pull)?;
     parse_mergeable(&body).with_context(|| format!("parse REST pull JSON from {url}"))
 }
 
@@ -226,6 +241,14 @@ fn resolve(cwd: Option<&Path>, repo_override: Option<&str>) -> store::Target {
     store::resolve_target(cwd, repo_override.or(env_repo.as_deref()))
 }
 
+/// Which cache an entry belongs to: the bounded-key listing pages, or the
+/// per-PR reads (reduced body, age-pruned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Listing,
+    Pull,
+}
+
 /// One conditional `GET url`: the body of the last `200` on a `304`, else the
 /// fresh `200` body (cached when it carries an ETag). Mirrors
 /// `forge_listing::list_issues_cached_once`'s flow, including the rule that a
@@ -236,9 +259,14 @@ fn conditional_get(
     cwd: Option<&Path>,
     target: &store::Target,
     url: &str,
+    kind: Kind,
 ) -> Result<String> {
     let cache_key = store::daemon_cache_key(cwd, target, url);
-    let disk_path = store::daemon_store_dir().map(|d| store::entry_path_in(&d, &cache_key));
+    let disk_dir = store::daemon_store_dir();
+    let disk_path = disk_dir.as_deref().map(|d| match kind {
+        Kind::Listing => store::entry_path_in(d, &cache_key),
+        Kind::Pull => store::entry_path_with_prefix(d, PULL_PREFIX, &cache_key),
+    });
     let sent = cached_entry(&cache_key, disk_path.as_deref());
     let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
     let (status, response, stderr) =
@@ -260,16 +288,32 @@ fn conditional_get(
         }
         Some(ref r) if r.status == 200 && status.success() => {
             if let Some(etag) = r.etag.clone() {
-                if let Some(path) = &disk_path {
-                    let entry = store::DiskEntry {
-                        etag: etag.clone(),
-                        body: r.body.clone(),
-                    };
-                    store::write_disk_entry(path, &entry);
+                // A per-PR entry keeps only what a 304 must reproduce.
+                let stored = match kind {
+                    Kind::Listing => Some(r.body.clone()),
+                    Kind::Pull => parse_mergeable(&r.body)
+                        .ok()
+                        .map(|m| serde_json::json!({ "mergeable": m }).to_string()),
+                };
+                if let Some(stored) = stored {
+                    if let Some(path) = &disk_path {
+                        let entry = store::DiskEntry {
+                            etag: etag.clone(),
+                            body: stored.clone(),
+                        };
+                        store::write_disk_entry(path, &entry);
+                    }
+                    if let Ok(mut guard) = cache().lock() {
+                        let entry = CacheEntry {
+                            etag,
+                            body: Arc::new(stored),
+                            pull_written: (kind == Kind::Pull).then(SystemTime::now),
+                        };
+                        guard.insert(cache_key, entry);
+                    }
                 }
-                if let Ok(mut guard) = cache().lock() {
-                    let body = Arc::new(r.body.clone());
-                    guard.insert(cache_key, CacheEntry { etag, body });
+                if kind == Kind::Pull {
+                    prune_stale_pulls(disk_dir.as_deref(), SystemTime::now());
                 }
             }
             Ok(r.body.clone())
@@ -286,6 +330,32 @@ fn conditional_get(
 struct CacheEntry {
     etag: String,
     body: Arc<String>,
+    /// When a per-PR entry's last `200` was stored (`None` for listing pages,
+    /// which are never pruned).
+    pull_written: Option<SystemTime>,
+}
+
+/// Drop per-PR entries whose last `200` is more than [`PULL_ENTRY_MAX_AGE`]
+/// before `now`: hot-layer entries by their stored time, disk entries (only
+/// `pull-` files — listing pages share the directory) by mtime.
+fn prune_stale_pulls(disk_dir: Option<&Path>, now: SystemTime) {
+    let stale = |t: SystemTime| now.duration_since(t).is_ok_and(|a| a > PULL_ENTRY_MAX_AGE);
+    if let Ok(mut guard) = cache().lock() {
+        guard.retain(|_, e| !e.pull_written.is_some_and(stale));
+    }
+    let Some(Ok(rd)) = disk_dir.map(std::fs::read_dir) else {
+        return;
+    };
+    for entry in rd.filter_map(std::result::Result::ok) {
+        let name = entry.file_name();
+        let is_pull = name
+            .to_str()
+            .is_some_and(|n| n.starts_with(PULL_PREFIX) && n.ends_with(".json"));
+        let old = || entry.metadata().and_then(|m| m.modified()).is_ok_and(stale);
+        if is_pull && old() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// The `(etag, body)` pair to present for `key`: the hot layer, else a
@@ -294,10 +364,22 @@ fn cached_entry(key: &str, disk: Option<&Path>) -> Option<CacheEntry> {
     if let Some(entry) = cache().lock().ok()?.get(key).cloned() {
         return Some(entry);
     }
-    let disk_entry = store::read_disk_entry(disk?)?;
+    let disk = disk?;
+    let disk_entry = store::read_disk_entry(disk)?;
+    let is_pull = disk
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(PULL_PREFIX));
+    // A promoted per-PR entry keeps its disk age, so promotion never resets it.
+    let written = std::fs::metadata(disk).and_then(|m| m.modified()).ok();
     let entry = CacheEntry {
         etag: disk_entry.etag,
         body: Arc::new(disk_entry.body),
+        pull_written: if is_pull {
+            written.or_else(|| Some(SystemTime::now()))
+        } else {
+            None
+        },
     };
     if let Ok(mut guard) = cache().lock() {
         guard.insert(key.to_string(), entry.clone());

@@ -3190,7 +3190,7 @@ pub mod forge {
                     );
                     // #8953: if THAT failure was the rate-limit signature that
                     // just tripped the shared breaker, the next `VerdictKind`'s
-                    // `gh pr list` in this same loop is a doomed call against an
+                    // open-PR listing in this same loop is a doomed call against an
                     // already-exhausted quota. Stop the remaining verdict labels
                     // for this root rather than `continue`-ing into them — the
                     // same "protect the rest of the current pass, not just the
