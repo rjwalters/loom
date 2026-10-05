@@ -9,8 +9,11 @@
 //! from a 600 s base (#9590; env `LOOM_REDATE_BUDGET` / `LOOM_REDATE_BACKOFF_SECS`
 //! beat config `champion.redateBudget` / `champion.redateBackoffSecs`, which beat
 //! the defaults). Once the chain has spent the budget and
-//! the guard STILL blocks, nothing automated is making progress, so the PR is
-//! escalated to a durable `loom:operator` hold instead of re-pushing forever.
+//! the guard STILL blocks, no-op commits are making no progress, so the PR is
+//! handed to Doctor for a real rebase (`loom:pr` → `loom:changes-requested`,
+//! #10388; env `LOOM_REDATE_DOCTOR_HANDOFFS` / config
+//! `champion.redateDoctorHandoffs`, default 2, `0` = none), and only after those
+//! handoffs are spent escalated to a durable `loom:operator` hold.
 //!
 //! | outcome | stdout | exit |
 //! |---|---|---|
@@ -18,7 +21,8 @@
 //! | inside the backoff window; nothing written | `LOOM-REDATE-DEFERRED …` | 0 |
 //! | could not read/write the forge state needed | the reason | 1 |
 //! | branch already moved past `--expected-head-sha` | the reason | 3 |
-//! | bound reached; escalated to `loom:operator` | `LOOM-REDATE-ESCALATED …` | 4 |
+//! | bound reached; handed off to a Doctor rebase (#10388) | `LOOM-REDATE-HANDED-OFF …` | 4 |
+//! | bound reached and Doctor handoffs spent; escalated to `loom:operator` | `LOOM-REDATE-ESCALATED …` | 4 |
 //!
 //! # Why the in-place re-run is gone (#8919)
 //!
@@ -62,7 +66,7 @@
 //! module header).
 
 use anyhow::Result;
-use loom_daemon::merge_pr::redate::{remedy, RemedyOutcome, HOLD_LABEL};
+use loom_daemon::merge_pr::redate::{handoff, remedy, RemedyOutcome, HOLD_LABEL};
 
 #[derive(clap::Args)]
 pub(crate) struct RedateChecksArgs {
@@ -143,6 +147,27 @@ that time.",
                     self.pr
                 );
                 std::process::exit(0);
+            }
+            RemedyOutcome::HandedOff {
+                notice_posted,
+                n,
+                max,
+                spent,
+                budget,
+            } => {
+                println!(
+                    "LOOM-REDATE-HANDED-OFF pr={} head={} label={} handoff={n}/{max} notice={} spent={spent} budget={budget}\n\
+PR #{}'s #8248 block survived {spent} of {budget} automated re-dates in this chain (#9590), so it \
+was handed to Doctor for a real rebase onto the current base (#10388, handoff {n} of {max}): \
+loom:pr -> {}. A rebase is a new tree, which starts a fresh re-date chain.",
+                    self.pr,
+                    self.expected_head_sha,
+                    handoff::DOCTOR_LABEL,
+                    if notice_posted { "posted" } else { "already-present" },
+                    self.pr,
+                    handoff::DOCTOR_LABEL,
+                );
+                std::process::exit(4);
             }
             RemedyOutcome::Escalated {
                 notice_posted,

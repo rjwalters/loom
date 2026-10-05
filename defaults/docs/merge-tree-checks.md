@@ -72,3 +72,51 @@ fails, and the merge is refused.
 Because the gate is opt-in per repo, there is no daemon version floor for repos
 that do not set `merge.treeChecks`; once set, a host whose `loom-daemon`
 predates the `tree-checks` verb refuses merges until it is rolled.
+
+## Stale cheap checks evaluated locally (#10388)
+
+This is a separate mechanism from `merge.treeChecks` and is always on. It uses
+the same merge-tree machinery to satisfy the required-check freshness guard
+(#8248) without a CI round trip.
+
+When `loom-daemon merge-pr stale-checks` finds required checks stale, and
+**every** stale component of every stale context is on the cheap allowlist
+(`local_eval::CHEAP_CHECKS`), it does the following:
+
+- Builds the merge tree of the **base tip it judged** and the PR head. If the
+  fetched base has moved since, the result is no-verdict.
+- Checks that tree out into a temporary git repository (objects borrowed via
+  `alternates`, so `git ls-files` works as it does in CI).
+- Runs each component's steps as read from **that tree's own `ci.yml`**, under
+  the component's `# component:` marker. Each step runs as
+  `bash --noprofile --norc -eo pipefail <file>`.
+
+The allowlist covers toolchain-free gates that finish in seconds: Conflict
+Marker Check, File Size Ratchet, Markdown Token Ratchet, Role Prompt Prefix
+Ratchet, Docs/Defaults Parity Check, Doc Table-of-Contents Freshness, Vendored
+Private-Reference Scrub, and Dangling Link Check (needs `lychee` on `PATH`).
+
+| Result | Behaviour |
+|---|---|
+| all pass | `LOOM-STALE-CHECKS-CLEAN`; a `LOOM-STALE-CHECKS-LOCAL-EVAL … verdict=pass` line (head, base, tree, per-component result) on stderr, which is the merge log; a PR comment with the same facts; no re-date |
+| a step fails | the #8248 refusal stands; the failure is printed and posted |
+| no verdict: a PR that edits `ci.yml` or any `*.sh` (only check code already on the base ever runs on the merging host), a stale non-allowlisted component (anything needing cargo), a time-rule or unknown verdict, a repo-declared spec, a missing script or tool, a step the reader cannot run faithfully (`uses:`, `env:`, `${{ }}`, a non-trivial `if:`), a merge conflict, a moved base or head, a timeout | the refusal stands, and `--redate-stale-checks` runs as before |
+
+- `LOOM_STALE_CHECKS_LOCAL_EVAL=0` turns it off.
+- `merge-pr.sh --dry-run` posts no comment.
+- An older `loom-daemon` simply never evaluates locally. That is the
+  pre-#10388 behaviour, so there is no version floor.
+
+### Re-date budget exhaustion goes to Doctor first
+
+When a re-date chain spends its budget (#9590), `merge-pr redate-checks` first
+hands the PR to Doctor for a **real rebase**. A rebase is a new tree, so it
+starts a fresh chain and CI tests the latest base. The handoff:
+
+- moves `loom:pr` to `loom:changes-requested`;
+- posts a `loom:stale-check-doctor-handoff` notice;
+- exits 4 with `LOOM-REDATE-HANDED-OFF`.
+
+Only after `champion.redateDoctorHandoffs` handoffs (env
+`LOOM_REDATE_DOCTOR_HANDOFFS`, default 2, `0` = none) end exhausted again does
+the PR get the `loom:operator` hold. The two labels are never applied together.
