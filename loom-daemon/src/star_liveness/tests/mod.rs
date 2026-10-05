@@ -22,4 +22,5 @@ mod queue_tests;
 mod replay;
 mod review_fix_tests;
 mod second_review_tests;
+mod stale_block_tests;
 mod suppression_tests;

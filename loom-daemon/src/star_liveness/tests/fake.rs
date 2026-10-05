@@ -30,6 +30,8 @@ pub struct Repo {
     /// `author_association` of each issue's author (absent: `NONE`).
     pub associations: BTreeMap<u32, String>,
     pub fail_listing: bool,
+    /// Labels whose removal fails (write-failure injection).
+    pub fail_remove: Vec<String>,
 }
 
 /// A forge world: repos by slug.
@@ -136,6 +138,9 @@ impl StarForge for FakeForge {
 
     fn remove_label(&mut self, number: u32, label: &str) -> Result<()> {
         let mut repo = self.world.repo(&self.slug);
+        if repo.fail_remove.iter().any(|l| l == label) {
+            return Err(anyhow!("removing {label} from #{number} failed"));
+        }
         if let Some(item) = repo.items.get_mut(&number) {
             item.labels.retain(|l| l != label);
         }

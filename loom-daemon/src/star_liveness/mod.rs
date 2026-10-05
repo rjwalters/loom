@@ -33,9 +33,13 @@
 //!    in the work finder and its escalation, and loses both once it stops
 //!    blocking, or once its repo has been unreadable for
 //!    [`task::MAX_FAILED_PASSES`] passes. A cross-repo blocker is an operator
-//!    ask: stars do not cross repos. With `propagate` on (the default), a
-//!    starred issue's children by every link [`edges`] resolves inherit the
-//!    same way (#10012), transitively to [`collect::MAX_INHERIT_DEPTH`].
+//!    ask: stars do not cross repos. A stale block (no open blocker named in
+//!    the body or comments) is resolved by the pass itself ([`stale`]): an
+//!    all-closed block is removed, an unnamed one is handed to Curator, and
+//!    only a block Curator could not name reaches the operator (#10151). With
+//!    `propagate` on (the default), a starred issue's children by every link
+//!    [`edges`] resolves inherit the same way (#10012), transitively to
+//!    [`collect::MAX_INHERIT_DEPTH`].
 //! 5. **loom-ui star intents** ([`intents`]). The `/ingest` ack may carry
 //!    `operator_priority_intents`; the exporter queues them and this module
 //!    validates and applies them idempotently, with one audit comment whose
@@ -77,6 +81,7 @@ pub mod progress;
 pub mod queue;
 pub mod refusal;
 pub mod render;
+pub mod stale;
 pub mod task;
 pub mod trust;
 

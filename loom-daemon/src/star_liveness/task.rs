@@ -18,6 +18,7 @@ use super::forge::{GhStarForge, StarForge};
 use super::inherit::{self, Inherited};
 use super::intents::{self, AppliedIds, StarIntent};
 use super::progress::{self, Tracker, Watched};
+use super::stale;
 use super::Settings;
 use crate::types::{
     AskKind, CapView, DroppedStarIntent, LandingStage, OperatorAsk, ReadyQueueRow, StarLandingRow,
@@ -289,6 +290,24 @@ impl LivenessState {
                     Ok(_) => {}
                     Err(err) => log::warn!(
                         "star_liveness: posting the escalation for {repo}#{issue} failed ({err}); \
+                         retrying next pass"
+                    ),
+                }
+            }
+            // #10151: a stale `loom:blocked` is resolved here, not escalated.
+            if let (Some(action), Some(root), true) = (&e.landing.stale, &root, settings.escalate) {
+                let mut forge = forges(root, &repo);
+                match stale::apply(
+                    forge.as_mut(),
+                    issue,
+                    &e.facts.issue.labels,
+                    action,
+                    host,
+                    e.inherited_from,
+                ) {
+                    Ok(()) => log::info!("star_liveness: resolved the stale block on {repo}#{issue}: {action:?}"),
+                    Err(err) => log::warn!(
+                        "star_liveness: resolving the stale block on {repo}#{issue} failed ({err}); \
                          retrying next pass"
                     ),
                 }
