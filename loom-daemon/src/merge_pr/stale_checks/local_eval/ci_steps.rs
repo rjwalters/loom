@@ -5,10 +5,48 @@
 //! (plain scalar or `|` block) with no `${{ }}` expression. Anything else
 //! (`uses`, `with`, `env`, `shell`, `working-directory`, another `if`, a quoted
 //! or folded scalar) is an error, which the caller turns into "no verdict".
+//!
+//! A step that would run a [`DENIED_COMMANDS`] entry (or anything under
+//! `target/`) is an error too. The pin test only covers the `ci.yml` the
+//! daemon was built with, and a deployed daemon reads whatever `ci.yml` the
+//! merge tree carries, so this is checked on every read: a renamed install
+//! step must never turn into a `curl … | sudo install` on the merging host,
+//! and a step that runs the host's own toolchain or daemon would stand in for
+//! the merge tree's build (a false pass).
 
 /// The only step condition accepted: it means "run unless the job was
 /// cancelled", which is always true for a local run.
 const NOT_CANCELLED: &str = "${{ !cancelled() }}";
+
+/// Commands a locally run step must never invoke: network fetches,
+/// privilege escalation, package managers, and toolchains/binaries whose HOST
+/// copy would stand in for the merge tree's own build. Matched against whole
+/// shell words (and a path's last component), so `pipefail` is not `pip`.
+pub const DENIED_COMMANDS: &[&str] = &[
+    "curl",
+    "wget",
+    "sudo",
+    "doas",
+    "gh",
+    "cargo",
+    "rustc",
+    "rustup",
+    "loom-daemon",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "node",
+    "pip",
+    "pip3",
+    "apt",
+    "apt-get",
+    "brew",
+];
+
+/// A path fragment no locally run step may reference: build output is the
+/// host's, not the merge tree's.
+pub const DENIED_PATH: &str = "target/";
 
 #[derive(Default)]
 struct Step {
@@ -23,6 +61,73 @@ fn indent_of(line: &str) -> usize {
 /// The `run:` bodies of `component`'s steps in `ci_yml`, in order, minus the
 /// steps named in `skip`.
 pub fn ci_steps(ci_yml: &str, component: &str, skip: &[&str]) -> Result<Vec<String>, String> {
+    let marker = format!("# component: {component}");
+    let mut out = Vec::new();
+    for s in parse_steps(ci_yml, component)? {
+        let name = s.name.unwrap_or_default();
+        if skip.contains(&name.as_str()) {
+            continue;
+        }
+        let run = s
+            .run
+            .ok_or_else(|| format!("step `{name}` has no `run:`"))?;
+        if run.contains("${{") {
+            return Err(format!("step `{name}` uses a `${{{{ }}}}` expression"));
+        }
+        if let Some(cmd) = denied_command(&run) {
+            return Err(format!(
+                "step `{name}` runs `{cmd}`, which a local evaluation must never execute"
+            ));
+        }
+        out.push(run);
+    }
+    if out.is_empty() {
+        return Err(format!("no runnable steps under `{marker}`"));
+    }
+    Ok(out)
+}
+
+/// The `run:` body of the step named `step` under `component` — e.g. a
+/// skipped install step, to read the tool version CI pins.
+pub fn step_run(ci_yml: &str, component: &str, step: &str) -> Result<String, String> {
+    parse_steps(ci_yml, component)?
+        .into_iter()
+        .find(|s| s.name.as_deref() == Some(step))
+        .and_then(|s| s.run)
+        .ok_or_else(|| format!("ci.yml has no `{step}` step with a `run:` under `{component}`"))
+}
+
+/// The value of a `VAR=value` assignment line in a step body (quotes
+/// stripped), e.g. `VER=v0.24.2` ⇒ `v0.24.2`.
+#[must_use]
+pub fn assigned_value(run: &str, var: &str) -> Option<String> {
+    run.lines().find_map(|l| {
+        let v = l.trim().strip_prefix(var)?.strip_prefix('=')?;
+        let v = v.trim().trim_matches(['"', '\'']);
+        (!v.is_empty()).then(|| v.to_string())
+    })
+}
+
+/// The first [`DENIED_COMMANDS`] word (or [`DENIED_PATH`] reference) in a
+/// step body, ignoring full-line `#` comments.
+#[must_use]
+pub fn denied_command(run: &str) -> Option<String> {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || "._/+-".contains(c);
+    for line in run.lines().filter(|l| !l.trim_start().starts_with('#')) {
+        for word in line.split(|c: char| !is_word(c)).filter(|w| !w.is_empty()) {
+            if word.contains(DENIED_PATH) {
+                return Some(word.to_string());
+            }
+            let cmd = word.rsplit('/').next().unwrap_or(word);
+            if DENIED_COMMANDS.contains(&cmd) {
+                return Some(cmd.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_steps(ci_yml: &str, component: &str) -> Result<Vec<Step>, String> {
     let lines: Vec<&str> = ci_yml.lines().collect();
     let marker = format!("# component: {component}");
     let start = lines
@@ -108,24 +213,7 @@ pub fn ci_steps(ci_yml: &str, component: &str, skip: &[&str]) -> Result<Vec<Stri
         i += 1;
     }
 
-    let mut out = Vec::new();
-    for s in steps {
-        let name = s.name.unwrap_or_default();
-        if skip.contains(&name.as_str()) {
-            continue;
-        }
-        let run = s
-            .run
-            .ok_or_else(|| format!("step `{name}` has no `run:`"))?;
-        if run.contains("${{") {
-            return Err(format!("step `{name}` uses a `${{{{ }}}}` expression"));
-        }
-        out.push(run);
-    }
-    if out.is_empty() {
-        return Err(format!("no runnable steps under `{marker}`"));
-    }
-    Ok(out)
+    Ok(steps)
 }
 
 #[cfg(test)]

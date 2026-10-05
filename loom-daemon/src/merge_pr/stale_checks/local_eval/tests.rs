@@ -218,12 +218,14 @@ const FIXTURE: &[CheapCheck] = &[
         script: "check.sh",
         requires: &["sh", "git"],
         skip_steps: &[],
+        pins: &[],
     },
     CheapCheck {
         component: "Slow",
         script: "check.sh",
         requires: &["sleep"],
         skip_steps: &[],
+        pins: &[],
     },
 ];
 
@@ -238,6 +240,11 @@ struct Fixture {
 /// The PR grows `items` to 3 lines (limit 3). `main` then moves with
 /// `base_move` — e.g. tightening `limit` to 2, the #8248 incident in small.
 fn fixture(base_move: &dyn Fn(&Path)) -> Fixture {
+    fixture_pr(base_move, &|_: &Path| {})
+}
+
+/// [`fixture`] whose PR commit also applies `pr_extra`.
+fn fixture_pr(base_move: &dyn Fn(&Path), pr_extra: &dyn Fn(&Path)) -> Fixture {
     let t = tempfile::tempdir().unwrap();
     let origin = t.path().join("origin.git");
     let work = t.path().join("work");
@@ -264,7 +271,9 @@ fn fixture(base_move: &dyn Fn(&Path)) -> Fixture {
     git_ok(&work, &["commit", "-qm", "base"]);
     git_ok(&work, &["checkout", "-qb", "pr"]);
     std::fs::write(work.join("items"), "a\nb\nc\n").unwrap();
-    git_ok(&work, &["commit", "-qam", "pr"]);
+    pr_extra(&work);
+    git_ok(&work, &["add", "-A"]);
+    git_ok(&work, &["commit", "-qm", "pr"]);
     let head = rev(&work, "HEAD");
     git_ok(&work, &["checkout", "-q", "main"]);
     base_move(&work);
@@ -329,13 +338,15 @@ fn a_cheap_check_passing_on_the_merge_tree_satisfies_the_guard() {
             assert_eq!(r.base_sha, f.base);
             assert_eq!(r.head_sha, f.head);
             assert_eq!(r.tree_sha.len(), 40);
-            assert_eq!(
-                r.results,
-                vec![ComponentResult {
-                    component: "Conflict Marker Check".to_string(),
-                    passed: true
-                }]
-            );
+            let got: Vec<(&str, bool)> = r
+                .results
+                .iter()
+                .map(|c| (c.component.as_str(), c.passed))
+                .collect();
+            assert_eq!(got, vec![("Conflict Marker Check", true)]);
+            assert_eq!(r.results[0].steps.len(), 1);
+            assert_eq!(r.results[0].steps[0].command, "sh check.sh");
+            assert_eq!(r.results[0].steps[0].exit, Some(0));
             let line = log_line("7", "pass", &r);
             for needle in [
                 f.base.as_str(),
@@ -346,10 +357,12 @@ fn a_cheap_check_passing_on_the_merge_tree_satisfies_the_guard() {
                 assert!(line.contains(needle), "{line}");
             }
             let c = comment_body(&r, None);
-            assert!(
-                c.contains(&r.tree_sha) && c.contains(&f.base) && c.contains("| pass |"),
-                "{c}"
+            let m = format!(
+                "<!-- loom:merge-tree-reverify base={} head={} tree={} -->",
+                f.base, f.head, r.tree_sha
             );
+            assert!(c.starts_with(&m), "{c}");
+            assert!(c.contains("`sh check.sh` | 0 |") && c.contains("| pass |"), "{c}");
         }
         o => panic!("{o:?}"),
     }
@@ -452,16 +465,286 @@ fn a_component_off_the_allowlist_is_unknown() {
     assert!(matches!(o, Outcome::Unknown(_)), "{o:?}");
 }
 
+// --- Opt-in: env > config > default (off) ----------------------------------
+
 #[test]
-fn the_opt_out_env_disables_local_evaluation() {
-    for (v, want) in [
-        (Some("0"), false),
-        (Some(" off "), false),
-        (Some("no"), false),
+fn reverification_is_off_unless_the_repository_opts_in() {
+    use serde_json::json;
+    let none = json!({});
+    let on = json!({"merge": {"reverifyStaleChecks": true}});
+    let off = json!({"merge": {"reverifyStaleChecks": false}});
+    // Default: off.
+    assert!(!resolve_enabled(None, &none));
+    assert!(!resolve_enabled(None, &json!({"merge": {"treeChecks": ["x"]}})));
+    // Config opts in or out.
+    assert!(resolve_enabled(None, &on));
+    assert!(!resolve_enabled(None, &off));
+    assert!(resolve_enabled(None, &json!({"merge": {"reverifyStaleChecks": "true"}})));
+    // Env beats config, both ways.
+    for v in ["1", "true", " on ", "YES"] {
+        assert!(resolve_enabled(Some(v), &off), "{v}");
+        assert!(resolve_enabled(Some(v), &none), "{v}");
+    }
+    for v in ["0", "false", "off", "no"] {
+        assert!(!resolve_enabled(Some(v), &on), "{v}");
+    }
+    // An unparseable env value falls through to config, then the default.
+    assert!(resolve_enabled(Some("maybe"), &on));
+    assert!(!resolve_enabled(Some(""), &none));
+    assert_eq!(CONFIG_KEY, "merge.reverifyStaleChecks");
+    assert_eq!(ENABLE_ENV, "LOOM_MERGE_REVERIFY_STALE_CHECKS");
+}
+
+#[test]
+fn enabled_for_root_reads_the_repository_config() {
+    if std::env::var_os(ENABLE_ENV).is_some() {
+        return; // the env tier would decide; covered by resolve_enabled above
+    }
+    let t = tempfile::tempdir().unwrap();
+    assert!(!enabled_for_root(t.path()), "no config: off");
+    std::fs::create_dir_all(t.path().join(".loom")).unwrap();
+    std::fs::write(
+        t.path().join(".loom/config.json"),
+        r#"{"merge": {"reverifyStaleChecks": true}}"#,
+    )
+    .unwrap();
+    assert!(enabled_for_root(t.path()));
+}
+
+// --- Trust boundary: the merge tree, not the forge's file list --------------
+
+#[test]
+fn a_pr_script_edit_missing_from_the_api_delta_is_still_never_run() {
+    // The forge's file list caps at 3000 entries without saying so: model a
+    // PR whose API delta shows docs only while it actually rewrites the
+    // checker. evaluate() is never given the delta; it diffs the trees.
+    let t = tempfile::tempdir().unwrap();
+    let pwned = t.path().join("pwned");
+    let evil = format!("touch '{}'\n", pwned.display());
+    let f = fixture_pr(&unrelated, &|w: &Path| std::fs::write(w.join("check.sh"), &evil).unwrap());
+    let ev = evidence(&["defaults/docs/eta.md"], vec![(STRUCT, mv(&["defaults/docs/eta.md"]))]);
+    assert!(
+        locally_evaluable(tip(), &req(&[STRUCT]), &[green(STRUCT)], Some(&ev)).is_some(),
+        "fixture: the truncated API delta passes the fast-path screen"
+    );
+    let o = eval(&f, &f.base, FIXTURE, 30);
+    assert!(matches!(o, Outcome::Unknown(ref w) if w.contains("check.sh")), "{o:?}");
+    assert!(!pwned.exists(), "the PR's checker must never execute");
+
+    // ci.yml is check code too.
+    let f = fixture_pr(&unrelated, &|w: &Path| {
+        let ci = w.join(".github/workflows/ci.yml");
+        let text = std::fs::read_to_string(&ci).unwrap() + "# edited by the PR\n";
+        std::fs::write(ci, text).unwrap();
+    });
+    let o = eval(&f, &f.base, FIXTURE, 30);
+    assert!(matches!(o, Outcome::Unknown(ref w) if w.contains("ci.yml")), "{o:?}");
+
+    // A base-side-only script change is the base's own reviewed code: fine.
+    let f = fixture(&|w: &Path| {
+        std::fs::write(w.join("check.sh"), format!("{RATCHET}true\n")).unwrap();
+    });
+    assert!(matches!(eval(&f, &f.base, FIXTURE, 30), Outcome::Passed(_)));
+}
+
+#[test]
+fn an_unreadable_merge_tree_diff_fails_closed() {
+    let f = fixture(&unrelated);
+    let bogus = "1111111111111111111111111111111111111111";
+    assert!(tree_check_code_changes(&f.work, &f.base, bogus).is_err());
+    assert!(tree_check_code_changes(&f.work, bogus, &f.base).is_err());
+    assert_eq!(tree_check_code_changes(&f.work, &f.base, &f.base), Ok(vec![]));
+}
+
+// --- (g) the primary repository is untouched; (h) temp dirs are removed -----
+
+/// Everything a run could plausibly disturb in the primary clone: refs
+/// (including HEAD and pseudo-refs such as FETCH_HEAD), the index bytes,
+/// `git worktree list`, and the work tree's status. Read without optional
+/// locks, so taking the snapshot cannot itself refresh the index.
+fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let git_dir = dir.join(".git");
+    let mut out = vec![("index".to_string(), std::fs::read(git_dir.join("index")).unwrap())];
+    for name in ["HEAD", "FETCH_HEAD", "ORIG_HEAD", "packed-refs", "config"] {
+        out.push((name.to_string(), std::fs::read(git_dir.join(name)).unwrap_or_default()));
+    }
+    for args in [
+        &["for-each-ref", "--format=%(refname) %(objectname)"][..],
+        &["worktree", "list", "--porcelain"][..],
+        &["status", "--porcelain", "--untracked-files=all"][..],
+        &["stash", "list"][..],
     ] {
-        assert_eq!(enabled_from(v), want, "{v:?}");
+        let o = Command::new("git")
+            .current_dir(dir)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "git {args:?}");
+        out.push((args.join(" "), o.stdout));
     }
-    for v in [None, Some("1"), Some(""), Some("yes")] {
-        assert!(enabled_from(v), "{v:?}");
+    out
+}
+
+#[test]
+fn the_primary_repository_is_byte_identical_after_an_evaluation() {
+    for (base_move, label) in [
+        (&unrelated as &dyn Fn(&Path), "pass"),
+        (&tighten as &dyn Fn(&Path), "fail"),
+    ] {
+        let f = fixture(base_move);
+        let before = snapshot(&f.work);
+        let tmp = tempfile::tempdir().unwrap();
+        let o = evaluate_in(
+            tmp.path(),
+            &target(&f, &f.base),
+            &["Conflict Marker Check"],
+            FIXTURE,
+            Duration::from_secs(30),
+        );
+        match (label, &o) {
+            ("pass", Outcome::Passed(_)) | ("fail", Outcome::Failed { .. }) => {}
+            _ => panic!("{label}: {o:?}"),
+        }
+        let after = snapshot(&f.work);
+        for ((name, a), (_, b)) in before.iter().zip(&after) {
+            assert_eq!(
+                String::from_utf8_lossy(a),
+                String::from_utf8_lossy(b),
+                "{label}: primary repo's `{name}` changed"
+            );
+        }
     }
+}
+
+fn target<'a>(f: &'a Fixture, expected_base: &'a str) -> Target<'a> {
+    Target {
+        repo_root: &f.work,
+        remote: "origin",
+        pr: "7",
+        base_ref: "main",
+        head_sha: &f.head,
+        expected_base,
+    }
+}
+
+#[test]
+fn every_temp_dir_is_removed_on_every_path() {
+    let evil = |w: &Path| std::fs::write(w.join("check.sh"), "exit 0\n").unwrap();
+    let cases: Vec<(Fixture, &[&str], &str)> = vec![
+        (fixture(&unrelated), &["Conflict Marker Check"][..], "pass"),
+        (fixture(&tighten), &["Conflict Marker Check"][..], "fail"),
+        (fixture(&unrelated), &["Slow"][..], "timeout"),
+        (fixture_pr(&unrelated, &evil), &["Conflict Marker Check"][..], "check code"),
+    ];
+    for (f, components, label) in &cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let o = evaluate_in(
+            tmp.path(),
+            &target(f, &f.base),
+            components,
+            FIXTURE,
+            Duration::from_secs(2),
+        );
+        let ok = match *label {
+            "pass" => matches!(o, Outcome::Passed(_)),
+            "fail" => matches!(o, Outcome::Failed { .. }),
+            _ => matches!(o, Outcome::Unknown(_)),
+        };
+        assert!(ok, "{label}: {o:?}");
+        let left: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(left.is_empty(), "{label}: left behind {left:?}");
+    }
+}
+
+// --- Host-environment failures are no verdict, not "Merge blocked" ---------
+
+const ENV_CI: &str = "jobs:
+  structural-checks:
+    steps:
+      # component: Conflict Marker Check
+      - name: Self-test
+        run: sh check.sh --self-test
+      - name: Check
+        run: sh check.sh
+";
+
+#[test]
+fn environment_failures_are_unknown_not_a_failing_check() {
+    for (script, why) in [
+        ("exit 78\n", "78"),
+        ("no-such-command-10388\n", "127"),
+        ("[ \"$1\" != --self-test ] || exit 1\n", "self-test"),
+    ] {
+        // A base-side change: the checker is the base's own code, not the PR's.
+        let f = fixture(&|w: &Path| {
+            std::fs::write(w.join("check.sh"), script).unwrap();
+            std::fs::write(w.join(".github/workflows/ci.yml"), ENV_CI).unwrap();
+        });
+        let o = eval(&f, &f.base, FIXTURE, 30);
+        assert!(matches!(o, Outcome::Unknown(ref w) if w.contains(why)), "{why}: {o:?}");
+    }
+}
+
+#[test]
+fn exit_status_parses_the_run_checks_trailer() {
+    assert_eq!(exit_status("x\n(terminated by exit 78)"), Some(Ok(78)));
+    assert_eq!(exit_status("x\n(terminated by exit 1)\n"), Some(Ok(1)));
+    assert_eq!(exit_status("\n(terminated by a signal)"), Some(Err(())));
+    assert_eq!(exit_status("no trailer"), None);
+    assert_eq!(environment_failure("sh check.sh", Some(Ok(1))), None);
+    assert!(environment_failure("sh check.sh --self-test", Some(Ok(1))).is_some());
+}
+
+// --- Pinned tool versions ---------------------------------------------------
+
+#[test]
+fn a_pinned_tool_must_match_cis_version_exactly() {
+    assert!(version_matches("lychee 0.24.2", "v0.24.2"));
+    assert!(version_matches("lychee v0.24.2", "0.24.2"));
+    assert!(!version_matches("lychee 0.24.20", "v0.24.2"));
+    assert!(!version_matches("lychee 0.23.0", "v0.24.2"));
+    assert!(!version_matches("", "v0.24.2"));
+    assert!(!version_matches("lychee 0.24.2", ""));
+}
+
+#[test]
+fn a_pinned_tool_at_another_version_is_unknown() {
+    // `git` stands in for the pinned tool: its `--version` never prints
+    // "999.0.0", so the pin cannot hold.
+    let ci = "jobs:
+  s:
+    steps:
+      # component: Conflict Marker Check
+      - name: Install sh
+        run: |
+          VER=v999.0.0
+          echo install
+      - name: Check
+        run: sh check.sh
+";
+    let f = fixture(&|w: &Path| std::fs::write(w.join(".github/workflows/ci.yml"), ci).unwrap());
+    let pinned = [CheapCheck {
+        skip_steps: &["Install sh"],
+        pins: &[ToolPin {
+            tool: "git",
+            step: "Install sh",
+            var: "VER",
+        }],
+        ..FIXTURE[0]
+    }];
+    let o = eval(&f, &f.base, &pinned, 30);
+    assert!(matches!(o, Outcome::Unknown(ref w) if w.contains("999.0.0")), "{o:?}");
+}
+
+#[test]
+fn only_conflict_markers_go_stale_when_both_sides_edit_a_plain_file() {
+    // The shape the CLI-level test (tests/merge_pr_stale_checks_reverify.rs)
+    // relies on: one allowlisted component, needing no lychee.
+    let ev = evidence(&["notes/plan.txt"], vec![(STRUCT, mv(&["notes/plan.txt"]))]);
+    let got = locally_evaluable(tip(), &req(&[STRUCT]), &[green(STRUCT)], Some(&ev));
+    assert_eq!(got, Some(vec!["Conflict Marker Check"]));
 }

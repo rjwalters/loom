@@ -94,11 +94,9 @@ use crate::gh_invocation::gh_bin;
 pub mod attribution;
 pub mod budget;
 pub mod chain_telemetry;
-pub mod handoff;
 pub mod report;
 pub use attribution::Attribution;
 pub use budget::{BudgetConfig, BudgetDecision};
-pub use handoff::{HandoffConfig, HandoffDecision};
 
 /// `gh api …`, parameterized on the binary — the injection seam this module's
 /// tests use so a stub `gh` can be passed as a plain function argument instead
@@ -281,8 +279,7 @@ this PR to cycle back through `loom:review-requested` once CI on `{short}` compl
 then merge normally once re-approved.\n\n\
 The #8248 guard itself is unchanged and still applies to the next merge attempt. This is \
 re-date {n} of a budget of {budget} for this chain of tree-identical heads (#9590); once the \
-budget is spent, a further block hands off to a Doctor rebase (#10388), then escalates to \
-`{HOLD_LABEL}`.",
+budget is spent, a further block escalates to `{HOLD_LABEL}`.",
         redate_marker(new_sha),
         budget::attempt_marker(new_sha, n)
     )
@@ -323,16 +320,6 @@ pub enum RemedyOutcome {
         spent: u32,
         budget: u32,
     },
-    /// The chain spent its budget and the PR was routed to Doctor for a real
-    /// rebase (#10388): handoff `n` of `max`. `notice_posted` is false when
-    /// this head's handoff notice already existed (labels re-asserted only).
-    HandedOff {
-        notice_posted: bool,
-        n: u32,
-        max: u32,
-        spent: u32,
-        budget: u32,
-    },
     /// Budget remains, but the backoff after re-date `spent` has not elapsed
     /// (#9590). Nothing was written; retry the merge after `retry_after`.
     Deferred {
@@ -358,11 +345,8 @@ pub enum RemedyOutcome {
 /// happen. A recompute failure is reported on stderr and the generic body is
 /// written instead; it never blocks the remedy.
 pub fn remedy(nwo: &str, branch: &str, expected_head_sha: &str, pr: &str) -> RemedyOutcome {
-    let root = repo_root();
-    let cfg = BudgetConfig::for_root(&root);
-    let handoffs = HandoffConfig::for_root(&root);
-    let head = expected_head_sha;
-    remedy_full(&gh_bin(), nwo, branch, head, pr, cfg, handoffs, chrono::Utc::now(), || {
+    let cfg = BudgetConfig::for_root(&repo_root());
+    remedy_with(&gh_bin(), nwo, branch, expected_head_sha, pr, cfg, chrono::Utc::now(), || {
         match attribution::recompute(nwo, pr, expected_head_sha) {
             Ok(a) => Some(a),
             Err(why) => {
@@ -398,9 +382,11 @@ fn remedy_generic_with(
     remedy_with(gh, nwo, branch, expected_head_sha, pr, cfg, now, || None)
 }
 
-/// [`remedy_full`] with no Doctor handoffs — the pre-#10388 "exhausted ⇒
-/// `loom:operator`" path the older tests pin.
-#[cfg(test)]
+/// [`remedy`]'s implementation, parameterized on the `gh` binary — the
+/// injection seam the test suite drives directly (see [`gh_api_with`]) — plus
+/// the #9746 attribution. `attribute` is called at most once, and only once a
+/// push has been decided on (never for a head move, deferral or escalation);
+/// `None` means "write the generic body".
 #[allow(clippy::too_many_arguments)]
 fn remedy_with(
     gh: &str,
@@ -409,27 +395,6 @@ fn remedy_with(
     expected_head_sha: &str,
     pr: &str,
     cfg: BudgetConfig,
-    now: chrono::DateTime<chrono::Utc>,
-    attribute: impl FnOnce() -> Option<Attribution>,
-) -> RemedyOutcome {
-    let none = HandoffConfig { max: 0 };
-    remedy_full(gh, nwo, branch, expected_head_sha, pr, cfg, none, now, attribute)
-}
-
-/// [`remedy`]'s implementation, parameterized on the `gh` binary — the
-/// injection seam the test suite drives directly (see [`gh_api_with`]) — plus
-/// the #9746 attribution. `attribute` is called at most once, and only once a
-/// push has been decided on (never for a head move, deferral or escalation);
-/// `None` means "write the generic body".
-#[allow(clippy::too_many_arguments)]
-fn remedy_full(
-    gh: &str,
-    nwo: &str,
-    branch: &str,
-    expected_head_sha: &str,
-    pr: &str,
-    cfg: BudgetConfig,
-    handoffs: HandoffConfig,
     now: chrono::DateTime<chrono::Utc>,
     attribute: impl FnOnce() -> Option<Attribution>,
 ) -> RemedyOutcome {
@@ -477,20 +442,7 @@ fn remedy_full(
         }
         BudgetDecision::Exhausted { spent } => {
             let bodies = crate::comment_trust::records::bodies(&trusted).join("\n");
-            let st = handoff::state(&bodies, &current);
-            let ctx = Exhaustion {
-                gh,
-                nwo,
-                pr,
-                head: &current,
-                spent,
-                budget: cfg.budget,
-            };
-            return match handoff::decide(&st, &handoffs) {
-                HandoffDecision::HandOff { n } => hand_off(&ctx, n, true, &handoffs),
-                HandoffDecision::Reassert { n } => hand_off(&ctx, n, false, &handoffs),
-                HandoffDecision::Escalate { done } => escalate(&ctx, &bodies, done),
-            };
+            return escalate(gh, nwo, pr, &current, &bodies, spent, cfg.budget);
         }
     };
 
@@ -570,28 +522,20 @@ re-run once the forge is writable, or post {} by hand",
 /// even when the notice was already present — the label is what actually
 /// parks the PR, and a hand-removed label with an unresolved block would
 /// otherwise never come back.
-fn escalate(x: &Exhaustion<'_>, comments: &str, handoffs_done: u32) -> RemedyOutcome {
-    let Exhaustion {
-        gh,
-        nwo,
-        pr,
-        head,
-        spent,
-        budget,
-    } = *x;
-    let doctor = if handoffs_done > 0 {
-        format!(
-            "; {handoffs_done} Doctor rebase handoff(s) (#10388) have also been spent on this PR \
-and it is exhausted again"
-        )
-    } else {
-        String::new()
-    };
+fn escalate(
+    gh: &str,
+    nwo: &str,
+    pr: &str,
+    head: &str,
+    comments: &str,
+    spent: u32,
+    budget: u32,
+) -> RemedyOutcome {
     let reason = format!(
         "the re-date budget is exhausted (#9590): {spent} of {budget} automated re-date commits \
 were pushed for this chain of tree-identical heads, CI ran on each, and the guard still reports \
 the required checks stale — the base branch is moving faster than CI can re-date them, so another \
-no-op commit would not help{doctor}"
+no-op commit would not help"
     );
     let notice_posted = if hold_already_posted(comments, head) {
         false
@@ -612,57 +556,6 @@ no-op commit would not help{doctor}"
         notice_posted,
         spent,
         budget,
-    }
-}
-
-/// What an exhausted chain's handlers share.
-#[derive(Clone, Copy)]
-struct Exhaustion<'a> {
-    gh: &'a str,
-    nwo: &'a str,
-    pr: &'a str,
-    head: &'a str,
-    spent: u32,
-    budget: u32,
-}
-
-/// Route the PR to Doctor for a real rebase (#10388): the notice (when
-/// `post`), then `loom:changes-requested`, then withdraw `loom:pr`. Never
-/// `loom:operator` — Doctor stands down on it.
-fn hand_off(x: &Exhaustion<'_>, n: u32, post: bool, cfg: &HandoffConfig) -> RemedyOutcome {
-    if post {
-        let body = handoff::comment_body(x.pr, x.head, n, cfg, x.spent, x.budget);
-        if let Err(e) = post_comment(x.gh, x.nwo, x.pr, &body) {
-            return RemedyOutcome::Failed(format!("could not post the #10388 Doctor handoff: {e}"));
-        }
-    }
-    if let Err(e) = gh_api_body(
-        x.gh,
-        &[&format!("repos/{}/issues/{}/labels", x.nwo, x.pr)],
-        Some(&format!("{{\"labels\":[\"{}\"]}}", handoff::DOCTOR_LABEL)),
-    ) {
-        return RemedyOutcome::Failed(format!(
-            "could not apply {} to PR #{}: {e}",
-            handoff::DOCTOR_LABEL,
-            x.pr
-        ));
-    }
-    // Best effort: absent is fine (404), and `loom:changes-requested` alone
-    // already keeps merge-pr.sh from merging.
-    let _ = gh_api_with(
-        x.gh,
-        &[
-            "-X",
-            "DELETE",
-            &format!("repos/{}/issues/{}/labels/{}", x.nwo, x.pr, handoff::APPROVED_LABEL),
-        ],
-    );
-    RemedyOutcome::HandedOff {
-        notice_posted: post,
-        n,
-        max: cfg.max,
-        spent: x.spent,
-        budget: x.budget,
     }
 }
 

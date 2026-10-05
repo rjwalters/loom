@@ -1084,15 +1084,13 @@ _check_verdict_label_contradiction
 # 22-hour exposure this guard exists to close; #8410 also removed the
 # server-side queued path this note used to describe.
 #
-# LOCAL MERGE-TREE EVALUATION (#10388): when EVERY stale component is a cheap,
-# deterministic tree check (conflict markers, size/prompt/markdown ratchets,
-# docs parity, dangling links — local_eval::CHEAP_CHECKS, pinned to ci.yml's
-# own steps), the daemon runs those steps on the merge tree of the judged base
-# tip + this head and, on a pass, returns CLEAN with a LOOM-STALE-CHECKS-LOCAL-
-# EVAL line on stderr and a PR comment — no re-date, no CI round trip. Any
-# stale expensive component, failure, or no-verdict keeps the refusal below.
-# Dry runs post no comment (LOOM_STALE_CHECKS_DRY_RUN); opt out with
-# LOOM_STALE_CHECKS_LOCAL_EVAL=0. See defaults/docs/merge-tree-checks.md.
+# MERGE-TREE RE-VERIFICATION (#10388, OPT-IN: merge.reverifyStaleChecks, env
+# LOOM_MERGE_REVERIFY_STALE_CHECKS; default off = unchanged): when EVERY stale
+# component is a cheap tree check, the daemon runs its ci.yml steps on the merge
+# tree of the judged base tip + this head; a pass returns CLEAN (a
+# LOOM-MERGE-TREE-REVERIFY line on stderr + a PR comment), anything else keeps
+# the refusal below. Dry runs post no comment (LOOM_STALE_CHECKS_DRY_RUN). See
+# defaults/docs/merge-tree-checks.md.
 #
 # PLAN-GATED REPOSITORIES (#8844): on a PRIVATE repo owned by a GitHub Free
 # account or org, `GET /repos/{nwo}/rules/branches/{branch}` answers "HTTP 403:

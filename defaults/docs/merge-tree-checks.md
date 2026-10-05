@@ -73,20 +73,37 @@ Because the gate is opt-in per repo, there is no daemon version floor for repos
 that do not set `merge.treeChecks`; once set, a host whose `loom-daemon`
 predates the `tree-checks` verb refuses merges until it is rolled.
 
-## Stale cheap checks evaluated locally (#10388)
+## Stale cheap checks re-verified on the merge tree (#10388)
 
-This is a separate mechanism from `merge.treeChecks` and is always on. It uses
-the same merge-tree machinery to satisfy the required-check freshness guard
-(#8248) without a CI round trip.
+This is a separate mechanism from `merge.treeChecks`. It uses the same
+merge-tree machinery to satisfy the required-check freshness guard (#8248)
+without a CI round trip. It is **off by default**: a repository opts in.
 
-When `loom-daemon merge-pr stale-checks` finds required checks stale, and
-**every** stale component of every stale context is on the cheap allowlist
-(`local_eval::CHEAP_CHECKS`), it does the following:
+| Setting | Values | Default |
+|---|---|---|
+| env `LOOM_MERGE_REVERIFY_STALE_CHECKS` | `1`/`true`/`yes`/`on`, `0`/`false`/`no`/`off` | — (falls through) |
+| config `merge.reverifyStaleChecks` | `true` / `false` | `false` |
+
+Precedence is env > config > default. An unparseable value falls through to
+the next tier. When the flag is off, `stale-checks` behaves exactly as before:
+no fetch, no temp dir, no extra output.
+
+When it is on, `loom-daemon merge-pr stale-checks` finds required checks
+stale, and **every** stale component of every stale context is on the cheap
+allowlist (`local_eval::CHEAP_CHECKS`), it does the following:
 
 - Builds the merge tree of the **base tip it judged** and the PR head. If the
-  fetched base has moved since, the result is no-verdict.
+  fetched base has moved since, the result is no-verdict. The fetch writes no
+  `FETCH_HEAD`, and its private refs are deleted again. The primary clone's
+  refs, index and worktrees are left as they were.
+- Diffs that merge tree against the base tip (`git diff <base> <tree>`). If
+  it changes `ci.yml` or any `*.sh`, the result is no-verdict. Only check code
+  already on the base ever runs on the merging host. This diff comes from git
+  objects, not the forge's file list, which GitHub caps at 3000 files without
+  signalling truncation.
 - Checks that tree out into a temporary git repository (objects borrowed via
-  `alternates`, so `git ls-files` works as it does in CI).
+  `alternates`, so `git ls-files` works as it does in CI). It is removed on
+  every path.
 - Runs each component's steps as read from **that tree's own `ci.yml`**, under
   the component's `# component:` marker. Each step runs as
   `bash --noprofile --norc -eo pipefail <file>`.
@@ -94,29 +111,38 @@ When `loom-daemon merge-pr stale-checks` finds required checks stale, and
 The allowlist covers toolchain-free gates that finish in seconds: Conflict
 Marker Check, File Size Ratchet, Markdown Token Ratchet, Role Prompt Prefix
 Ratchet, Docs/Defaults Parity Check, Doc Table-of-Contents Freshness, Vendored
-Private-Reference Scrub, and Dangling Link Check (needs `lychee` on `PATH`).
+Private-Reference Scrub, and Dangling Link Check. Dangling Link Check needs
+`lychee` on `PATH` at **exactly** the version `ci.yml`'s install step pins
+(`VER=`); any other version is no-verdict.
 
 | Result | Behaviour |
 |---|---|
-| all pass | `LOOM-STALE-CHECKS-CLEAN`; a `LOOM-STALE-CHECKS-LOCAL-EVAL … verdict=pass` line (head, base, tree, per-component result) on stderr, which is the merge log; a PR comment with the same facts; no re-date |
+| all pass | `LOOM-STALE-CHECKS-CLEAN`; a `LOOM-MERGE-TREE-REVERIFY … verdict=pass` line (base, head, tree, per-component result) on stderr, which is the merge log; a PR comment marked `<!-- loom:merge-tree-reverify base=… head=… tree=… -->` listing each step's command, exit code and duration; no re-date |
 | a step fails | the #8248 refusal stands; the failure is printed and posted |
-| no verdict: a PR that edits `ci.yml` or any `*.sh` (only check code already on the base ever runs on the merging host), a stale non-allowlisted component (anything needing cargo), a time-rule or unknown verdict, a repo-declared spec, a missing script or tool, a step the reader cannot run faithfully (`uses:`, `env:`, `${{ }}`, a non-trivial `if:`), a merge conflict, a moved base or head, a timeout | the refusal stands, and `--redate-stale-checks` runs as before |
+| no verdict | the refusal stands, and `--redate-stale-checks` runs as before; a `Warning:` on stderr names the reason, and no comment is posted |
 
-- `LOOM_STALE_CHECKS_LOCAL_EVAL=0` turns it off.
+No verdict covers:
+
+- a merge tree that changes `ci.yml` or any `*.sh`;
+- a stale non-allowlisted component (anything needing cargo), a time-rule or
+  unknown verdict, or a repo-declared spec;
+- a missing script or tool, or a pinned tool at another version;
+- a step the reader cannot run faithfully: `uses:`, `env:`, `${{ }}`, a
+  non-trivial `if:`, or a denied command (`curl`, `wget`, `sudo`, `gh`,
+  `cargo`, `loom-daemon`, `npm`/`pnpm`/`node`, `pip`, anything under
+  `target/`, …), checked on every read of the merge tree's `ci.yml`;
+- a merge conflict, a moved base or head, or a timeout;
+- a host-environment failure: exit 78 or 127, a signal, or a failing
+  `--self-test` step. These are the host, not the PR, so they never post
+  "Merge blocked".
+
+Also:
+
 - `merge-pr.sh --dry-run` posts no comment.
-- An older `loom-daemon` simply never evaluates locally. That is the
-  pre-#10388 behaviour, so there is no version floor.
-
-### Re-date budget exhaustion goes to Doctor first
-
-When a re-date chain spends its budget (#9590), `merge-pr redate-checks` first
-hands the PR to Doctor for a **real rebase**. A rebase is a new tree, so it
-starts a fresh chain and CI tests the latest base. The handoff:
-
-- moves `loom:pr` to `loom:changes-requested`;
-- posts a `loom:stale-check-doctor-handoff` notice;
-- exits 4 with `LOOM-REDATE-HANDED-OFF`.
-
-Only after `champion.redateDoctorHandoffs` handoffs (env
-`LOOM_REDATE_DOCTOR_HANDOFFS`, default 2, `0` = none) end exhausted again does
-the PR get the `loom:operator` hold. The two labels are never applied together.
+- `--from-stdin` re-verifies only when the payload carries `"reverify": true`
+  (still subject to the opt-in). It posts no comment and prints the one it
+  would post to stderr.
+- An older `loom-daemon` simply never re-verifies. That is the pre-#10388
+  behaviour, so there is no version floor.
+- Re-date budget exhaustion is unchanged: it still escalates to
+  `loom:operator` (#9590).

@@ -127,7 +127,7 @@ pub struct MergeTree {
 
 /// Fetch `<remote>/<base_ref>` and PR `pr`'s head, verify the head is
 /// `head_sha`, and write their merge tree. Shared by [`build_tree`] and
-/// [`build_checkout`]. Any conflict is an error (fail closed).
+/// the stale-check local evaluation. Any conflict is an error (fail closed).
 pub fn merge_tree(
     repo_root: &Path,
     remote: &str,
@@ -135,25 +135,33 @@ pub fn merge_tree(
     base_ref: &str,
     head_sha: &str,
 ) -> Result<MergeTree, String> {
+    merge_tree_with(repo_root, remote, pr, base_ref, head_sha, true)
+}
+
+/// [`merge_tree`], optionally without touching `FETCH_HEAD`
+/// (`--no-write-fetch-head`, git >= 2.29; an older git fails the fetch, which
+/// is an error, i.e. fail closed).
+pub fn merge_tree_with(
+    repo_root: &Path,
+    remote: &str,
+    pr: &str,
+    base_ref: &str,
+    head_sha: &str,
+    write_fetch_head: bool,
+) -> Result<MergeTree, String> {
     // Fetch both tips into private refs and resolve them from what was actually
     // fetched (no second `ls-remote` round trip that could see a newer base).
     let base_local = format!("refs/loom/tree-checks/{pr}/base");
     let pr_local = format!("refs/loom/tree-checks/{pr}/head");
     let base_spec = format!("+refs/heads/{base_ref}:{base_local}");
     let pr_spec = format!("+refs/pull/{pr}/head:{pr_local}");
-    let fetched = git(
-        repo_root,
-        &[
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            remote,
-            "--",
-            &base_spec,
-            &pr_spec,
-        ],
-    )
-    .map_err(|e| format!("could not fetch the base and PR head: {e}"));
+    let mut fetch = vec!["fetch", "--quiet", "--no-tags"];
+    if !write_fetch_head {
+        fetch.push("--no-write-fetch-head");
+    }
+    fetch.extend([remote, "--", base_spec.as_str(), pr_spec.as_str()]);
+    let fetched =
+        git(repo_root, &fetch).map_err(|e| format!("could not fetch the base and PR head: {e}"));
     let resolve = |r: &str| {
         git(
             repo_root,

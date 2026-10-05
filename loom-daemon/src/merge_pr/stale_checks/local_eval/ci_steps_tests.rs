@@ -96,3 +96,78 @@ fn every_allowlisted_component_is_runnable_from_the_real_ci_yml() {
         }
     }
 }
+
+#[test]
+fn denied_commands_fail_closed_at_read_time() {
+    // The lychee install step, renamed so `skip_steps` no longer matches it:
+    // it must never run on the merging host.
+    let y = "      # component: X\n      - name: Install lychee (renamed)\n        run: |\n          curl -fsSL https://example.invalid/l.tgz -o /tmp/l.tgz\n          sudo install -m 0755 /tmp/l /usr/local/bin/l\n";
+    let e = ci_steps(y, "X", &["Install lychee (pinned, checksum-verified)"]).unwrap_err();
+    assert!(e.contains("curl"), "{e}");
+    for (body, want) in [
+        ("wget https://example.invalid/x", "wget"),
+        ("cargo test -p loom-daemon", "cargo"),
+        ("./target/debug/loom-daemon secret-scan", "./target/debug/loom-daemon"),
+        ("loom-daemon shell-budget --check", "loom-daemon"),
+        ("/usr/bin/sudo true", "sudo"),
+        ("x=$(npm run lint)", "npm"),
+        ("pnpm check:ci", "pnpm"),
+        ("node scripts/x.js", "node"),
+        ("pip install foo", "pip"),
+        ("gh api repos/x/y", "gh"),
+    ] {
+        assert_eq!(denied_command(body).as_deref(), Some(want), "{body}");
+        let y = format!("      # component: X\n      - name: a\n        run: {body}\n");
+        assert!(ci_steps(&y, "X", &[]).is_err(), "{body}");
+    }
+}
+
+#[test]
+fn the_denylist_matches_whole_words_only() {
+    for body in [
+        "set -euo pipefail",
+        "bash scripts/check-node-ids.sh",
+        "echo curly",
+        "# a comment naming cargo and curl is not a command",
+        "grep -c target_dir x",
+    ] {
+        assert_eq!(denied_command(body), None, "{body}");
+    }
+}
+
+#[test]
+fn step_run_and_assigned_value_read_a_skipped_install_step() {
+    let y = "      # component: X\n      - name: Install t\n        run: |\n          set -e\n          VER=\"v1.2.3\"\n          curl -o t https://example.invalid/t-${VER}\n      - name: Use t\n        run: t --check\n";
+    let body = step_run(y, "X", "Install t").unwrap();
+    assert_eq!(assigned_value(&body, "VER").as_deref(), Some("v1.2.3"));
+    assert_eq!(assigned_value(&body, "SHA"), None);
+    assert!(step_run(y, "X", "No such step").is_err());
+}
+
+#[test]
+fn the_real_ci_yml_pins_a_lychee_version_the_local_run_can_read() {
+    for k in CHEAP_CHECKS {
+        for pin in k.pins {
+            let body = step_run(CI_YML, k.component, pin.step)
+                .unwrap_or_else(|e| panic!("{}: {e}", k.component));
+            let ver = assigned_value(&body, pin.var)
+                .unwrap_or_else(|| panic!("{}: no {}= in `{}`", k.component, pin.var, pin.step));
+            assert!(
+                ver.trim_start_matches('v').split('.').count() >= 2,
+                "{}: `{ver}` is not a version",
+                k.component
+            );
+            assert!(
+                k.skip_steps.contains(&pin.step),
+                "{}: a pinned install step must be skipped, never run",
+                k.component
+            );
+        }
+    }
+    assert!(
+        CHEAP_CHECKS
+            .iter()
+            .any(|k| k.pins.iter().any(|p| p.tool == "lychee")),
+        "Dangling Link Check's lychee must be version-pinned"
+    );
+}
