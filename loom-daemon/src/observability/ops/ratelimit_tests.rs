@@ -71,6 +71,7 @@ fn jobs_are_a_closed_set_and_sources_classify_into_it() {
         ("work_finder_starred_at", Job::WorkFinder),
         ("work_finder_main_red_ci", Job::WorkFinder),
         ("claim_reconciliation", Job::ClaimReconciliation),
+        ("quarantine_release", Job::QuarantineReconciliation),
         ("sweep_outcome_points_signal", Job::OutcomeJournal),
         ("ci_telemetry", Job::CiTelemetry),
         ("star_liveness", Job::StarLiveness),
@@ -355,4 +356,47 @@ fn each_suppressed_skip_site_counts_once_per_pass_by_job() {
     );
     // Drained: the next flush is empty.
     assert!(drain_skip_points().is_empty());
+}
+
+#[test]
+fn an_unknown_account_is_cached_and_retried_at_most_every_unknown_retry() {
+    let mut cache = None;
+    let calls = std::cell::Cell::new(0);
+    let resolve = |label: &'static str| {
+        calls.set(calls.get() + 1);
+        label.to_string()
+    };
+    assert_eq!(cached_account(&mut cache, t(0), false, || resolve("unknown")), "unknown");
+    // Every 60 s tick inside the retry window reuses the negative result.
+    for tick in 1..20 {
+        let label = cached_account(&mut cache, t(tick * 60), false, || resolve("octocat"));
+        assert_eq!(label, "unknown");
+    }
+    assert_eq!(calls.get(), 1);
+    // After the window, a suppressing breaker still blocks the call.
+    let later = t(UNKNOWN_RETRY.num_seconds());
+    assert_eq!(cached_account(&mut cache, later, true, || resolve("octocat")), "unknown");
+    assert_eq!(calls.get(), 1);
+    // Breaker closed: one retry, and a known label is then kept for good.
+    assert_eq!(cached_account(&mut cache, later, false, || resolve("octocat")), "octocat");
+    assert_eq!(calls.get(), 2);
+    let much_later = t(10 * UNKNOWN_RETRY.num_seconds());
+    assert_eq!(cached_account(&mut cache, much_later, false, || resolve("x")), "octocat");
+    assert_eq!(calls.get(), 2);
+}
+
+#[test]
+fn a_suppressing_breaker_blocks_the_first_account_lookup() {
+    let mut cache = None;
+    let label = cached_account(&mut cache, t(0), true, || panic!("no gh api user while cooling"));
+    assert_eq!(label, "unknown");
+    assert!(cache.is_none(), "a skipped lookup is retried on the next open tick");
+}
+
+#[test]
+fn the_gauge_fallback_drops_a_reading_whose_window_has_reset() {
+    let b = budget(Some(5000), Some(28)); // core resets t(1800), graphql t(2400)
+    assert_eq!(fresh_fallback(Some(b), t(60)), Some(b));
+    assert_eq!(fresh_fallback(Some(b), t(1800)), None);
+    assert_eq!(fresh_fallback(None, t(0)), None);
 }

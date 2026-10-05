@@ -252,6 +252,20 @@ pub enum MetricName {
     /// `observability::ops::ratelimit::Job`).
     #[serde(rename = "github.ratelimit.breaker_skips")]
     GithubRateLimitBreakerSkips,
+    // ---- Merge-chain re-date pressure (Issue #10163) ----------------------
+    /// PRs with at least one #8508 re-date commit in the trailing window,
+    /// labelled `state` = `landed` / `pending` / `stuck` (pending with at
+    /// least the default re-date budget spent). Never labelled by PR.
+    #[serde(rename = "loom.merge.redate_prs")]
+    MergeRedatePrs,
+    /// Most re-dates any one PR took in the trailing window, labelled `state`
+    /// = `landed` / `pending`.
+    #[serde(rename = "loom.merge.redates_max")]
+    MergeRedatesMax,
+    /// Longest first-re-date-to-landing time among PRs that landed in the
+    /// trailing window.
+    #[serde(rename = "loom.merge.time_to_land_max")]
+    MergeTimeToLandMax,
 }
 
 impl MetricName {
@@ -297,6 +311,9 @@ impl MetricName {
             Self::GithubRateLimitUsed => "github.ratelimit.used",
             Self::GithubRateLimitReset => "github.ratelimit.reset",
             Self::GithubRateLimitBreakerSkips => "github.ratelimit.breaker_skips",
+            Self::MergeRedatePrs => "loom.merge.redate_prs",
+            Self::MergeRedatesMax => "loom.merge.redates_max",
+            Self::MergeTimeToLandMax => "loom.merge.time_to_land_max",
         }
     }
 
@@ -356,6 +373,9 @@ impl MetricName {
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
             Self::GithubRateLimitReset => "s",
             Self::GithubRateLimitBreakerSkips => "{pass}",
+            Self::MergeRedatePrs => "{pull_request}",
+            Self::MergeRedatesMax => "{redate}",
+            Self::MergeTimeToLandMax => "s",
             _ => "By",
         }
     }
@@ -411,6 +431,11 @@ impl MetricName {
             Self::GithubRateLimitReset => "GitHub rate-limit window reset, Unix epoch seconds.",
             Self::GithubRateLimitBreakerSkips => {
                 "Job passes skipped by the rate-limit breaker, by job."
+            }
+            Self::MergeRedatePrs => "PRs re-dated in the trailing window, by landing state.",
+            Self::MergeRedatesMax => "Most re-dates on one PR in the trailing window, by state.",
+            Self::MergeTimeToLandMax => {
+                "Longest first-re-date-to-landing time of a PR landed in the window."
             }
         }
     }

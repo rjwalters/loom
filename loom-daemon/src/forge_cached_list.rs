@@ -137,6 +137,21 @@ fn default_fetcher(labels: &str, state: &str, repo: Option<&str>) -> Option<Cach
         .ok()
 }
 
+/// [`build_output`] against an explicit `gh`, recorded against `caller` in
+/// `forge_call_stats` — the agent `gh` front's in-process entry (#10331).
+#[must_use]
+pub fn build_output_via(
+    caller: &'static str,
+    entity: &str,
+    args: &[String],
+    gh_bin: &Path,
+) -> Option<String> {
+    let cwd = std::env::current_dir().ok();
+    build_output(entity, args, &|labels, state, repo| {
+        list_issues_cached_persistent_as(caller, gh_bin, cwd.as_deref(), repo, labels, state).ok()
+    })
+}
+
 /// Core, side-effect-free (given the `fetch` closure) pipeline: parse → fetch →
 /// filter → project → optional jq. Returns `None` to decline.
 pub fn build_output(entity: &str, args: &[String], fetch: &Fetcher) -> Option<String> {

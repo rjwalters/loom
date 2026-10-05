@@ -1582,6 +1582,22 @@ baseline, so a restart never replays history. Every host managing a repo
 samples it: sums scale with the host count, means do not. Completed sweeps'
 own phase durations remain the cycle-time rollup's (#8692).
 
+Merge-chain re-date pressure (Issue #10163, `observability/ops/redate_chain.rs`).
+These are `Gauge`s over a trailing 24 h window, sampled on the `host.health`
+cadence from local `git log` only, with no forge call. They are never labelled
+by PR or repo. Read them with `max` across hosts:
+
+| Metric | Unit | Labels | Meaning |
+|---|---|---|---|
+| `loom.merge.redate_prs` | `{pull_request}` | `state` ∈ `landed`, `pending`, `stuck` | PRs with at least one #8508 re-date commit. `stuck` is the subset of `pending` that has spent at least the default re-date budget (3). |
+| `loom.merge.redates_max` | `{redate}` | `state` ∈ `landed`, `pending` | the most re-dates any one PR took |
+| `loom.merge.time_to_land_max` | `s` | none | longest time from a PR's first re-date to its landing merge. Omitted when nothing landed. |
+
+`redate_prs` and `redates_max` are emitted every sample, zeros included. The
+per-PR rows are in `loom-daemon merge-pr redate-report --json` (`chains`); see
+[`daemon-reference.md`](daemon-reference.md) §"Re-dates per PR and time to
+land".
+
 The dwell names (#8856) are `loom.queue.oldest_wait`, `loom.queue.starved`,
 `loom.queue.starved.by_reason` and `loom.queue.dispatch_wait[.samples]`. They
 measure how long ready-queue issues have waited; for depth, use
@@ -1696,8 +1712,8 @@ GitHub rate limit (Issue #10022):
 
 | Signal | Kind | Unit / attributes | Meaning |
 |---|---|---|---|
-| `loom.ratelimit.trip` span | instant span, own root trace (derived from `loom.ratelimit.source` + trip instant) | `loom.ratelimit.source` (the tripping job), `loom.ratelimit.cooldown_until` (RFC 3339), `github.ratelimit.core.used`, `.core.own`, `.core.external`, and the same three for `graphql` | one per rate-limit breaker trip; a re-trip while cooling emits nothing. `used` is the trip-time probe's pool-wide count, `own` this host's forge-call ledger for the window, `external` = `used − own`. Each is **omitted** (not 0) when unknown: no `used` in the probe, or the ledger sink off |
-| `github.ratelimit.remaining` | `Gauge` | `{request}`; labels `resource`, `account` | requests left in the pool, from a `gh api rate_limit` probe every 60 s (falling back to the breaker's last trip-time reading when the probe fails) |
+| `loom.ratelimit.trip` span | instant span, own root trace (derived from `loom.ratelimit.source` + trip instant) | `loom.ratelimit.source` (the tripping job), `loom.ratelimit.cooldown_until` (RFC 3339), `github.ratelimit.core.used`, `.core.own`, `.core.external`, and the same three for `graphql` | one per rate-limit breaker trip; a re-trip while cooling emits nothing. `used` is the trip-time probe's pool-wide count, `own` this host's forge-call ledger for the window, `external` = `used − own`. Each is **omitted** (not 0) when unknown: no `used` in the probe, an untrusted probe reading (#8997), or the ledger sink off |
+| `github.ratelimit.remaining` | `Gauge` | `{request}`; labels `resource`, `account` | requests left in the pool, from a `gh api rate_limit` probe every 60 s (falling back to the breaker's last trip-time reading when the probe fails, only while that reading's reset windows are still open). An unresolvable `account` stays `unknown` and is retried at most every 20 min, never while the breaker is suppressing |
 | `github.ratelimit.used` | `Gauge` | `{request}`; labels `resource`, `account` | requests spent this window; absent when the response carried no `used` |
 | `github.ratelimit.reset` | `Gauge` | `s` (Unix epoch seconds); labels `resource`, `account` | when the pool's window resets |
 | `github.ratelimit.breaker_skips` | delta `Sum` | `{pass}`; label `reason` | job passes skipped because the breaker was suppressing, flushed on the 60 s tick |

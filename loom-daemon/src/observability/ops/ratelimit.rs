@@ -96,7 +96,7 @@ impl Job {
             Self::RoleRunner
         } else if prefixed("epic_supervisor") {
             Self::EpicSupervisor
-        } else if prefixed("quarantine_reconciliation") {
+        } else if prefixed("quarantine_reconciliation") || prefixed("quarantine_release") {
             Self::QuarantineReconciliation
         } else if prefixed("ci_telemetry") {
             Self::CiTelemetry
@@ -325,9 +325,20 @@ pub fn quota_points(budget: &BudgetSnapshot, account: &str) -> Vec<MetricPoint> 
 /// one skip-counter flush per interval.
 pub const TICK: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The credential identity the probe runs as, resolved once (re-tried while
-/// it resolves to `unknown`).
-static ACCOUNT: Mutex<Option<String>> = Mutex::new(None);
+/// The credential identity the probe runs as: resolved once when known;
+/// an `unknown` result is cached for [`UNKNOWN_RETRY`] (#10061 review) so a
+/// credential that cannot read `/user` does not spend a core call per tick.
+static ACCOUNT: Mutex<Option<AccountCache>> = Mutex::new(None);
+
+/// How long an `unknown` account label is reused before re-resolving.
+pub const UNKNOWN_RETRY: chrono::Duration = chrono::Duration::minutes(20);
+
+/// The cached account label and when it was last resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountCache {
+    pub label: String,
+    pub resolved_at: DateTime<Utc>,
+}
 
 fn resolve_account(workspace_root: &Path) -> String {
     let app_dir = crate::credential_preflight::github_app_gh_config_dir(workspace_root);
@@ -340,14 +351,46 @@ fn resolve_account(workspace_root: &Path) -> String {
     forge::viewer_login().map_or_else(|| "unknown".to_string(), |l| login_account_label(&l))
 }
 
-fn account(workspace_root: &Path) -> String {
-    let mut guard = ACCOUNT.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(known) = guard.as_ref().filter(|a| a.as_str() != "unknown") {
-        return known.clone();
+/// The account label from `cache`, resolving (via `resolve`, which may cost
+/// one core call) only when nothing is cached, or when a cached `unknown`
+/// is older than [`UNKNOWN_RETRY`] and the rate-limit breaker is not
+/// `suppressed`. A known label is never re-resolved.
+pub fn cached_account(
+    cache: &mut Option<AccountCache>,
+    now: DateTime<Utc>,
+    suppressed: bool,
+    resolve: impl FnOnce() -> String,
+) -> String {
+    if let Some(c) = cache.as_ref() {
+        if c.label != "unknown" || now - c.resolved_at < UNKNOWN_RETRY {
+            return c.label.clone();
+        }
     }
-    let resolved = resolve_account(workspace_root);
-    *guard = Some(resolved.clone());
-    resolved
+    if suppressed {
+        return cache
+            .as_ref()
+            .map_or_else(|| "unknown".to_string(), |c| c.label.clone());
+    }
+    let label = resolve();
+    *cache = Some(AccountCache {
+        label: label.clone(),
+        resolved_at: now,
+    });
+    label
+}
+
+fn account(workspace_root: &Path, now: DateTime<Utc>) -> String {
+    let mut guard = ACCOUNT.lock().unwrap_or_else(PoisonError::into_inner);
+    let suppressed = crate::rate_limit_breaker::global_is_suppressed();
+    cached_account(&mut guard, now, suppressed, || resolve_account(workspace_root))
+}
+
+/// The breaker's trip-time reading as a gauge fallback, only while every
+/// window it describes is still open — a passed reset means its
+/// `remaining` (often 0) is stale and must not be re-exported.
+#[must_use]
+pub fn fresh_fallback(budget: Option<BudgetSnapshot>, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
+    budget.filter(|b| b.core_reset.min(b.graphql_reset) > now)
 }
 
 /// One rate-limit tick: flush the skip counter, probe the budget (falling
@@ -365,9 +408,13 @@ pub async fn record(workspace_root: &Path) {
     sink.emit_metrics_since(drain_skip_points(), since);
     let root = workspace_root.to_path_buf();
     let sampled = tokio::task::spawn_blocking(move || {
-        let budget = crate::rate_limit_breaker::forge::probe_budget(now)
-            .or_else(|| crate::rate_limit_breaker::global().and_then(|b| b.last_budget()))?;
-        Some(quota_points(&budget, &account(&root)))
+        let budget = crate::rate_limit_breaker::forge::probe_budget(now).or_else(|| {
+            fresh_fallback(
+                crate::rate_limit_breaker::global().and_then(|b| b.last_budget()),
+                now,
+            )
+        })?;
+        Some(quota_points(&budget, &account(&root, now)))
     })
     .await;
     if let Ok(Some(points)) = sampled {

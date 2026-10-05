@@ -457,6 +457,14 @@ and review requested → merged. It reads ETag-cached stage listings every 5
 minutes plus at most 8 per-item reads per sample, never per tick. Details are
 in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
+**Merge-chain re-date pressure (#10163).** Three gauges track the #8508
+re-date remedy over a trailing 24 h: `loom.merge.redate_prs{state}`
+(`landed`, `pending`, `stuck`), `loom.merge.redates_max{state}` and
+`loom.merge.time_to_land_max`. They are read from local `git log` on the
+`host.health` cadence, with no forge call. A non-zero `stuck` series is a
+merge-chain head that `main` keeps moving under. Details are in
+[`telemetry-schema.md`](telemetry-schema.md#metricpoints).
+
 **Per-issue dispatch disposition (#9222).** `loom.dispatch.admission` only
 covers candidates that reached a `dispatch()` attempt — a candidate filtered
 out earlier (`workspace_halted`, `parked`, `deferred_saturation`,

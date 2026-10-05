@@ -370,7 +370,7 @@ fn run_fetch_with(
 
 /// `(host, owner/repo)` parsed from a git remote URL (`git@host:o/r(.git)`,
 /// `ssh://git@host/o/r`, `https://host/o/r`, `http://host/o/r`).
-fn parse_remote_url(url: &str) -> Option<(String, String)> {
+pub(crate) fn parse_remote_url(url: &str) -> Option<(String, String)> {
     let url = url.trim();
     let stripped = url.strip_suffix(".git").unwrap_or(url);
     let (host, path) = if let Some(rest) = stripped.strip_prefix("git@") {
