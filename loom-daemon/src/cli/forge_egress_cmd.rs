@@ -120,13 +120,20 @@ fn post_install_verdict(report: &forge_egress::Report) -> Result<()> {
     )
 }
 
+/// Whether non-quiet `assert` prints its findings. Only a failing verdict
+/// does: the `policy.unconfigured` notice rides every generic install and
+/// exits 0, and `assert` stays silent there (sweep-run-hygiene contract).
+fn assert_prints_findings(report: &forge_egress::Report) -> bool {
+    report.exit_code() != 0 && !report.routing.is_empty()
+}
+
 /// Dispatch one `forge egress` verb; exits the process with the verdict.
 pub(crate) fn handle(action: EgressAction) -> Result<()> {
     let ws = workspace();
     let code = match action {
         EgressAction::Assert { quiet } => {
             let report = forge_egress::assert_for(&ws);
-            if !quiet && !report.routing.is_empty() {
+            if !quiet && assert_prints_findings(&report) {
                 eprintln!("forge-egress: managed routing admission failed");
                 print_findings(&report.routing, "  ");
             }
@@ -255,6 +262,15 @@ mod tests {
             ..Observed::default()
         };
         evaluate(&doc, &obs, Mode::Assert)
+    }
+
+    #[test]
+    fn assert_is_silent_when_unconfigured_and_prints_on_failure() {
+        let r = run_with(&PolicySources::default(), std::path::Path::new("/x"), Mode::Assert);
+        assert_eq!(r.exit_code(), 0);
+        assert!(!assert_prints_findings(&r), "{:?}", r.routing_codes());
+        let failing = report_for("required", "2.97.0");
+        assert!(assert_prints_findings(&failing));
     }
 
     #[test]

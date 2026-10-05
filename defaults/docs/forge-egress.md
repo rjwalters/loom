@@ -142,8 +142,6 @@ versions, counts and remedies only. Token-shaped strings are redacted.
 `enforcement.api = observe` logs the same findings and proceeds. An unreadable
 policy, or one with an unknown `schemaVersion`, is never treated as observe-only.
 
-Not wired yet: post-publication `assert` + rollback (C3, #9986).
-
 ## Lockstep with 2am
 
 `loom-daemon/tests/fixtures/forge-egress/scenarios.json` is shared data. Each
