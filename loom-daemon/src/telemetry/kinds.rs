@@ -408,6 +408,8 @@ macro_rules! telemetry_kind_table {
             /// and target versions, defer reason, drain state. OTLP-only. See
             /// [`auto_update_tick`].
             AutoUpdateTick = "auto_update.tick" => $crate::telemetry::kinds::auto_update_tick::AutoUpdateTickRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
             /// One host's in-flight items (stage, entered-at, PR, host, slot)
             /// and per-repo open-PR census (Issue #10196). OTLP-only: the
             /// replay contract's state record. A full anchor goes out hourly,
