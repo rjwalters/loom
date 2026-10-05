@@ -54,18 +54,18 @@ fixes**: [`comment-body-literal-path.md`](comment-body-literal-path.md).
 ## GraphQL Budget: REST Recipes, Pool Gate, Max ~3 Curators (#10039)
 
 `gh issue view/edit/close` spend the GraphQL pool the whole fleet shares, so
-every per-issue recipe below is REST; keep it so. Labels: POST to / DELETE
-from `repos/{owner}/{repo}/issues/N/labels` (`:` is `%3A`; 404 = absent),
-never replacing the set. Title/body/labels/state reads: `gh-cached` (ETag
-REST); comments: `gh api --paginate`; body: PATCH `-F body=@file`, never after
+every per-issue recipe below is REST except closes; keep it so. Labels: POST
+to / DELETE from `repos/{owner}/{repo}/issues/N/labels` (`:` is `%3A`; 404 =
+absent), never replacing the set. Title/body/labels/state reads: `gh-cached`
+(ETag REST); comments: `gh api --paginate`; body: PATCH `-F body=@file`, never after
 a failed read. Still GraphQL: one list query per pass, and the blocked
-re-check's `closedByPullRequestsReferences` + `gh pr view` (no REST twin).
+re-check's `closedByPullRequestsReferences` + `gh pr view` (no REST twin), and
+`gh issue close` (so `guards.reversibleGh` still asks; never PATCH around it).
 
 **Pool gate, immediately before every claim and reclaim** (live, never cached):
 
 ```bash
-gh api rate_limit --jq .resources.core.remaining
-gh api graphql -f query='{rateLimit{used remaining resetAt}}'
+gh api rate_limit --jq '[.resources.core.remaining, .resources.graphql.remaining] | min'
 ```
 
 Either under ~500, or a failed read: claim nothing new, report the rest as
@@ -685,7 +685,7 @@ them into the one you are curating. Never absorb a sibling that has:
 1. Survivor body gains `## Consolidated from`: per sibling, its `#N` link and
    original body quoted verbatim; merge AC and Affected Files. Lose nothing.
 2. Each sibling: comment `Consolidated into #<survivor>; scope and AC carried
-   over verbatim.`, then `gh api -X PATCH repos/{owner}/{repo}/issues/<N> -f state=closed -f state_reason=not_planned`.
+   over verbatim.`, then `gh issue close <N> --reason "not planned"`.
 3. Unsure they are siblings? Cross-link ("Related: #N").
 
 ## Curation Activities
@@ -879,7 +879,7 @@ Treat a filed issue as a **suggestion, not a mandate**. In autonomous mode the f
 ```bash
 # 1. Rationale comment FIRST (the audit trail), then close as not planned:
 ./.loom/scripts/post-comment.sh <number> --body "Closing as not planned: <rationale>. <evidence: superseded by #<n> / merged in <sha> / covered by #<canonical>>."
-gh api -X PATCH repos/{owner}/{repo}/issues/<number> -f state=closed -f state_reason=not_planned
+gh issue close <number> --reason "not planned"
 ```
 
 **When to rescope** (instead of closing — the core is worth keeping):
@@ -987,7 +987,7 @@ fi
 1. **Clearly duplicate** (high confidence the canonical issue fully covers this one): comment the rationale, then close as not planned:
    ```bash
    ./.loom/scripts/post-comment.sh <number> --body "Closing as not planned: duplicate of #<canonical>, which covers this scope. See it for the original discussion."
-   gh api -X PATCH repos/{owner}/{repo}/issues/<number> -f state=closed -f state_reason=not_planned
+   gh issue close <number> --reason "not planned"
    ```
    If confidence is only *moderate*, treat it as "Unclear" (case 3) and route for review instead of closing.
 
@@ -1005,7 +1005,7 @@ fi
    ```bash
    # Verified resolved → close with rationale:
    ./.loom/scripts/post-comment.sh <number> --body "Closing as not planned: resolved by PR #<pr_number> (merged <sha>); no longer reproduces."
-   gh api -X PATCH repos/{owner}/{repo}/issues/<number> -f state=closed -f state_reason=not_planned
+   gh issue close <number> --reason "not planned"
 
    # Cannot verify → flag, do not close. Comment FIRST; never cite the merged PR as a blocker:
    ./.loom/scripts/post-comment.sh <number> --body "⚠️ **May Already Be Fixed** — possibly addressed by PR #<pr_number> or commit <sha>. No open blocker: please test and close if no longer reproducible."
@@ -1060,7 +1060,7 @@ gh api repos/{owner}/{repo}/issues/718/labels -f 'labels[]=loom:curated'
 
 # Confirmed duplicate of shipped work: close with the pointer, not operator-decision.
 ./.loom/scripts/post-comment.sh 716 --body "Closing as not planned: duplicates \`klt place-and-route\`, shipped on main (PR #<pr_number>)."
-gh api -X PATCH repos/{owner}/{repo}/issues/716 -f state=closed -f state_reason=not_planned
+gh issue close 716 --reason "not planned"
 ```
 
 ### Related Open Work (Cross-References, issue #4162)

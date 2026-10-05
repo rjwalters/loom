@@ -109,7 +109,7 @@ fi
 expect "preserves original content verbatim"          "$RS" "quoted verbatim"
 expect "preserves links (Consolidated from)"          "$RS" "## Consolidated from"
 expect "cross-links the closed sibling"               "$RS" "Consolidated into #<survivor>"
-expect "closes with the duplicate convention"         "$RS" "gh api -X PATCH repos/{owner}/{repo}/issues/<N> -f state=closed -f state_reason=not_planned"
+expect "closes with the duplicate convention"         "$RS" "gh issue close <N> --reason \"not planned\""
 expect "ambiguity falls back to a cross-link"         "$RS" "Related: #N"
 
 echo ""
