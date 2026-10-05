@@ -77,6 +77,8 @@ struct Fake {
     repos: BTreeMap<String, Vec<Row>>,
     gets: Vec<String>,
     remaining: Option<u64>,
+    /// `remaining` for one repo owner's installation instead (#10329).
+    remaining_by_owner: BTreeMap<String, u64>,
     /// Fail the call with this 0-based index.
     fail_at: Option<(usize, ReadFailure, Option<i64>)>,
     breaker: bool,
@@ -131,11 +133,17 @@ impl ForgeRead for Fake {
     ) -> Read {
         let index = self.gets.len();
         self.gets.push(url.to_string());
+        let owner = target.repo.split('/').next().unwrap_or_default();
+        let remaining = self
+            .remaining_by_owner
+            .get(owner)
+            .copied()
+            .or(self.remaining);
         if let Some((at, failure, reset_epoch)) = self.fail_at {
             if at == index {
                 return Read::Failed {
                     failure,
-                    remaining: self.remaining,
+                    remaining,
                     reset_epoch,
                     detail: "fake failure".to_string(),
                 };
@@ -147,7 +155,7 @@ impl ForgeRead for Fake {
             status,
             etag,
             body,
-            remaining: self.remaining,
+            remaining,
         };
         if let Some(rest) = url
             .split("/issues/")
@@ -427,6 +435,35 @@ fn the_reserve_keeps_the_page_and_skips_the_rest_of_that_reader() {
         run_cycle(root, &targets, &mut fake, budgets(300, 1500), now() + Duration::hours(1));
     assert!(report.repos.iter().all(|r| r.stop == StopReason::Complete), "{report:?}");
     assert_eq!(published(root, A).unwrap().as_of, now(), "A resumed its pass at L");
+}
+
+/// The reserve is per installation (App and owner, #10329): a low bucket for
+/// (App 1, acme) skips acme's other repos on App 1, never another owner's.
+#[test]
+fn the_reserve_skips_that_installation_not_the_apps_other_owners() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut fake = Fake::with(&[(A, prs(3)), (B, prs(3)), (C, prs(2))]);
+    fake.remaining = Some(4000);
+    fake.remaining_by_owner.insert("acme".to_string(), 100);
+    let targets = [
+        target(root, A, "1"),
+        target(root, B, "1"),
+        target(root, C, "1"),
+    ];
+    let report = run_cycle(root, &targets, &mut fake, budgets(300, 1500), now());
+    let by = |repo: &str| {
+        report
+            .repos
+            .iter()
+            .find(|r| r.repo == repo)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!((by(A).stop, by(A).forge_calls), (StopReason::Reserve, 1));
+    assert_eq!((by(B).stop, by(B).forge_calls), (StopReason::Reserve, 0), "(1, acme)");
+    assert_eq!(by(C).stop, StopReason::Complete, "(1, other) is another bucket");
+    assert!(by(C).forge_calls > 0);
 }
 
 #[test]

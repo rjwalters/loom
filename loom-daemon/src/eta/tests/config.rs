@@ -91,7 +91,7 @@ fn fleet_refresh_is_on_by_default_with_the_pinned_budgets() {
             enabled: true,
             interval_secs: 3600,
             max_calls_per_cycle: 300,
-            backfill_max_calls_per_cycle: 1500,
+            backfill_max_calls_per_cycle: 600,
             reserve_calls: 1500,
             backfill_days: 21,
             signoz: crate::eta::config::FleetSignozConfig::default(),
