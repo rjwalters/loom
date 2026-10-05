@@ -208,15 +208,7 @@ pub fn report_failure(
             let spawned = std::thread::Builder::new()
                 .name("rate-limit-probe".to_owned())
                 .spawn(move || {
-                    refine(
-                        &breaker,
-                        probe.as_ref(),
-                        &text,
-                        &source,
-                        provisional_until,
-                        &ctx,
-                        now,
-                    );
+                    refine(&breaker, probe.as_ref(), &text, &source, provisional_until, &ctx, now);
                 });
             Some(Reported {
                 transition,

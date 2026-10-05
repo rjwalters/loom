@@ -159,9 +159,8 @@ fn an_untrusted_reading_exports_the_trip_without_attribution() {
     let mut reading = budget(Some(10), Some(28));
     reading.core_remaining = 4990;
     let h = handle(Some(reading));
-    let (reported, captured) = capture(|| {
-        report_failure(&h, RL, "work_finder", FailureContext::default(), t(0))
-    });
+    let (reported, captured) =
+        capture(|| report_failure(&h, RL, "work_finder", FailureContext::default(), t(0)));
     assert!(reported.is_some());
     assert_eq!(captured.spans.len(), 1);
     let a = &captured.spans[0].attributes;
