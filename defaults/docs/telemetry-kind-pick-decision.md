@@ -6,6 +6,12 @@ it ranked it, what it acted on, and why it skipped the rest. A queue-aware ETA
 needs an item's position *as the serving role sees it*; this is the only record
 of that, and it cannot be reconstructed afterwards.
 
+> **Scope (gate-observation slice of #10212).** For **role** ticks this record
+> observes the daemon's admission-gate listing, not the queue the role agent
+> consumes through `pr-queue`, and it records no acted items and no Curator
+> candidates. Work-finder ticks are fully covered. The remaining acceptance
+> work is tracked in a follow-up issue linked from PR #10268.
+
 OTLP-only log record (`otlp: Logs`, `native: false`), envelope
 `schema_version: 12` (`NEW_KIND_SCHEMA_VERSION`). The log **body** is the
 record's JSON; the attributes are `loom.kind` (`pick.decision`, which the
@@ -78,6 +84,10 @@ the demand ledger). Nothing is emitted when no OTLP exporter runs.
 there.
 
 ## Rank of an item in each role's latest candidate list
+
+For role ticks this is the rank in the gate's **listing order**, which can
+differ from the role's `pr-queue` order (operator priority, interactive
+preference, fallback admission); do not read it as the serving role's rank.
 
 Run against `signoz_logs.distributed_logs_v2` (ClickHouse). Substitute the repo,
 number and instant. `rank = 0` means the item was **not** in that role's latest
