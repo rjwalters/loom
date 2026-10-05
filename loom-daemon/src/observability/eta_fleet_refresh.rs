@@ -31,9 +31,11 @@
 //!    a due backfill is recorded as in progress, so it holds the fit (#10292).
 //! 3. **Snapshots**: [`crate::eta::fleet_refresh::run_cycle`] under the two
 //!    budgets and the reserve floor.
-//! 4. **Raw events** (#10250): each repo's issue-events cache is synced
-//!    in-process through a reader-only source, from what the matching budget
-//!    has left. After the snapshots, and never ahead of the fit.
+//! 4. **Raw events** (#10250, #10298): each repo's raw cache is synced
+//!    in-process from every repo-wide listing ([`event_endpoints`]: issue
+//!    events, then pulls), each through its own reader-only source and its own
+//!    cursor, from what the matching shared budget has left. After the
+//!    snapshots, and never ahead of the fit.
 //! 5. **Fit** ([`after_cycle`]): #10245's daily fit check, in the same blocking
 //!    call, so the fit always sees this cycle's snapshots. It is held while a
 //!    backfill younger than six hours is in progress, and skipped when
@@ -186,8 +188,12 @@ fn run_production_cycle(
         },
     );
     let mut forge = ReaderForge::new();
-    let mut events = |target: &RepoTarget, reader: &Reader, left: u64, mode: SyncMode| {
-        sync_events(root, target, reader, left, mode, config.reserve_calls)
+    let mut events = |target: &RepoTarget,
+                      reader: &Reader,
+                      endpoint: ForgeEndpoint,
+                      left: u64,
+                      mode: SyncMode| {
+        sync_events(root, target, reader, endpoint, left, mode, config.reserve_calls)
     };
     let outcome = cycle(root, &targets, &mut forge, &mut events, config, task, Utc::now());
     let loom = Provenance::current();
@@ -257,10 +263,19 @@ pub struct CycleOutcome {
     pub fit_held: bool,
 }
 
-/// The raw-event sync seam: `(target, reader, calls left, mode)` →
+/// The raw-event sync seam: `(target, reader, endpoint, calls left, mode)` →
 /// `(rows appended, calls spent, stop)`. Production is [`sync_events`].
-pub type EventsSync<'a> =
-    dyn FnMut(&RepoTarget, &Reader, u64, SyncMode) -> (u64, u64, Option<StopReason>) + 'a;
+pub type EventsSync<'a> = dyn FnMut(&RepoTarget, &Reader, ForgeEndpoint, u64, SyncMode) -> (u64, u64, Option<StopReason>)
+    + 'a;
+
+/// The listings the daemon syncs, in [`ForgeEndpoint::ALL`]'s order: every
+/// repo-wide one (issue events, then pulls — #10298). The per-PR walks
+/// (reviews, check runs) are not cursor-complete listings and stay CLI-only.
+pub fn event_endpoints() -> impl Iterator<Item = ForgeEndpoint> {
+    ForgeEndpoint::ALL
+        .into_iter()
+        .filter(|e| e.per_pr().is_none())
+}
 
 /// One cycle over `targets`: gates, snapshots, raw events. Testable with a
 /// fake forge and events seam; the fit call and the record emission are the
@@ -366,9 +381,12 @@ fn gated(root: &Path, target: &RepoTarget, stop: StopReason) -> RepoReport {
     r
 }
 
-/// Sync each repo's raw event cache from what the matching budget has left.
-/// Skipped for a repo whose snapshot pass hit the reserve, a coverage gap or a
-/// rate limit, and for every repo once one sync is rate limited.
+/// Sync each repo's raw event cache, one [`event_endpoints`] listing at a
+/// time, from what the matching budget has left. Each endpoint picks refresh or
+/// backfill from its own cursor key; the budgets are shared by every endpoint
+/// and repo. Skipped for a repo whose snapshot pass hit a coverage gap, for
+/// every repo on a reader App that hit the reserve, and for everything left
+/// once one sync is rate limited or meets the open breaker.
 fn sync_all_events(
     root: &Path,
     targets: &[RepoTarget],
@@ -389,69 +407,92 @@ fn sync_all_events(
         .collect();
     for target in targets {
         let Ok(reader) = &target.reader else { continue };
-        if reserve_apps.contains(&reader.app_id) {
-            continue;
-        }
         let Some(repo_report) = report.repos.iter_mut().find(|r| r.repo == target.repo) else {
             continue;
         };
         if repo_report.stop == StopReason::Coverage {
             continue;
         }
-        let cursor =
-            EventsCursor::read(&fleet_events::cursor_path(root, &target.repo), &target.repo);
-        let complete = cursor
-            .endpoints
-            .get(&format!(
-                "{}:{}",
-                fleet_events::SOURCE_FORGE,
-                crate::eta::fleet_events_forge::ENDPOINT
-            ))
-            .is_some_and(|e| e.backfill_complete);
-        let (mode, left) = if complete {
-            (SyncMode::Refresh, &mut report.remaining.0)
-        } else {
-            (SyncMode::Backfill, &mut report.remaining.1)
-        };
-        if *left == 0 {
-            continue;
-        }
-        let (appended, spent, stop) = events(target, reader, *left, mode);
-        *left = left.saturating_sub(spent);
-        repo_report.raw_events_added = Some(appended);
-        repo_report.forge_calls += spent;
-        match stop {
-            Some(StopReason::RateLimited) => {
-                // Same consequence as a snapshot read: end the cycle, back off.
-                report.rate_limited = Some(None);
-                return;
+        let cursor_file = fleet_events::cursor_path(root, &target.repo);
+        for endpoint in event_endpoints() {
+            if reserve_apps.contains(&reader.app_id) {
+                break;
             }
-            Some(StopReason::BreakerOpen) => return,
-            Some(StopReason::Reserve) => {
-                reserve_apps.insert(reader.app_id.clone());
+            // Re-read per endpoint: never infer one listing's completeness
+            // from another's (#10298).
+            let complete = EventsCursor::read(&cursor_file, &target.repo)
+                .endpoints
+                .get(&format!("{}:{}", fleet_events::SOURCE_FORGE, endpoint.name()))
+                .is_some_and(|e| e.backfill_complete);
+            let (mode, left) = if complete {
+                (SyncMode::Refresh, &mut report.remaining.0)
+            } else {
+                (SyncMode::Backfill, &mut report.remaining.1)
+            };
+            if *left == 0 {
+                continue;
             }
-            _ => {}
+            let (appended, spent, stop) = events(target, reader, endpoint, *left, mode);
+            *left = left.saturating_sub(spent);
+            repo_report.raw_events_added =
+                Some(repo_report.raw_events_added.unwrap_or(0) + appended);
+            repo_report.forge_calls += spent;
+            match stop {
+                Some(StopReason::RateLimited) => {
+                    // Same consequence as a snapshot read: end the cycle, back off.
+                    report.rate_limited = Some(None);
+                    return;
+                }
+                Some(StopReason::BreakerOpen) => return,
+                Some(StopReason::Reserve) => {
+                    reserve_apps.insert(reader.app_id.clone());
+                }
+                // The reader was withdrawn for this repo: its other listings
+                // would only fail the same way.
+                Some(StopReason::Coverage) => break,
+                _ => {}
+            }
         }
     }
 }
 
-/// Production raw-event sync for one repo (#10250's resumable cache), through
-/// a reader-only source. Returns `(rows appended, calls spent, stop)`.
+/// Production raw-event sync of one repo's `endpoint` listing (#10250's
+/// resumable cache), through a reader-only source.
+/// Returns `(rows appended, calls spent, stop)`.
 fn sync_events(
     root: &Path,
     target: &RepoTarget,
     reader: &Reader,
+    endpoint: ForgeEndpoint,
     left: u64,
     mode: SyncMode,
     reserve: u64,
 ) -> (u64, u64, Option<StopReason>) {
-    let mut source = ForgeEventSource::reader_only(
-        ForgeEndpoint::IssuesEvents,
-        &target.repo,
-        &target.cwd,
-        reserve,
-        reader.clone(),
-    );
+    let source = reader_source(target, reader, endpoint, reserve);
+    sync_events_from(root, target, source, left, mode)
+}
+
+/// The daemon's source for one listing: reader-only, for every endpoint —
+/// [`crate::forge_etag_store::fetch_with_reader`], never the writer-falling-back
+/// `fetch_conditional` the CLI's [`ForgeEventSource::new`] uses.
+fn reader_source(
+    target: &RepoTarget,
+    reader: &Reader,
+    endpoint: ForgeEndpoint,
+    reserve: u64,
+) -> ForgeEventSource {
+    ForgeEventSource::reader_only(endpoint, &target.repo, &target.cwd, reserve, reader.clone())
+}
+
+/// [`sync_events`] over an already-built source (tests point it at a stub
+/// `gh`).
+fn sync_events_from(
+    root: &Path,
+    target: &RepoTarget,
+    mut source: ForgeEventSource,
+    left: u64,
+    mode: SyncMode,
+) -> (u64, u64, Option<StopReason>) {
     let cursor_file = fleet_events::cursor_path(root, &target.repo);
     let mut cursor = EventsCursor::read(&cursor_file, &target.repo);
     let mut log = match EventLog::open(&fleet_events::events_path(root, &target.repo)) {
@@ -461,6 +502,7 @@ fn sync_events(
             return (0, 0, Some(StopReason::WriteError));
         }
     };
+    let key = fleet_events::RawEventSource::cursor_key(&source);
     let result = fleet_events::sync(&mut source, &mut log, &mut cursor, &cursor_file, mode, left);
     let calls = source.calls();
     match result {
@@ -469,14 +511,14 @@ fn sync_events(
                 fleet_events::SyncOutcome::Complete => None,
                 fleet_events::SyncOutcome::PageBudget => Some(StopReason::Budget),
                 fleet_events::SyncOutcome::Stopped(why) => {
-                    log::info!("eta fleet refresh: {}: event sync stopped: {why}", target.repo);
+                    log::info!("eta fleet refresh: {}: {key} sync stopped: {why}", target.repo);
                     Some(source.last_stop().unwrap_or(StopReason::ForgeError))
                 }
             };
             (report.appended as u64, calls, stop)
         }
         Err(e) => {
-            log::warn!("eta fleet refresh: {}: event sync write failed: {e}", target.repo);
+            log::warn!("eta fleet refresh: {}: {key} sync write failed: {e}", target.repo);
             (0, calls, Some(StopReason::WriteError))
         }
     }
