@@ -77,8 +77,6 @@ pub const GIT_WRITE_REFS_AND_CONTENTS: ForgeOp =
 pub const TIMELINE_READ: ForgeOp = ForgeOp::inventoried("timeline.read");
 /// `GET rate_limit` — the free budget probe.
 pub const QUOTA_RATE_LIMIT_READING: ForgeOp = ForgeOp::inventoried("quota.rate-limit-reading");
-/// `GET repos/{o}/{r}/issues/{n}/timeline` — label age / claim evidence.
-pub const TIMELINE_READ: ForgeOp = ForgeOp::inventoried("timeline.read");
 /// The open PR whose head is a given branch.
 pub const PR_LIST_BY_HEAD: ForgeOp = ForgeOp::inventoried("pr.list-by-head");
 /// Add / remove labels on one issue or PR (a PR's labels are issue labels).
@@ -106,7 +104,6 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     GIT_WRITE_REFS_AND_CONTENTS,
     TIMELINE_READ,
     QUOTA_RATE_LIMIT_READING,
-    TIMELINE_READ,
     PR_LIST_BY_HEAD,
     ISSUE_EDIT_LABELS,
     COMMENT_CREATE,
