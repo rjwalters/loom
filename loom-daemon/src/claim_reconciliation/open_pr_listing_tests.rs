@@ -103,7 +103,7 @@ fn a_pass_decides_everything_without_a_graphql_pr_list() {
         r#"[{{"user":{{"login":"maintainer","type":"User"}},"author_association":"COLLABORATOR","created_at":"2026-08-23T06:00:00Z","body":"Reviewed.\n\n<!-- loom:verdict-sha sha={SHA_A} verdict=approved -->"}}]"#
     );
     let script = format!(
-        r#"#!/bin/sh
+        r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> '{log}'
 case "$*" in "pr list"*)
   echo 'GraphQL pr list is forbidden on the periodic path' 1>&2
@@ -163,7 +163,7 @@ fn write_etag_stub(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
         row(12, &["loom:reviewing"]).updated(&now),
     ];
     let script = format!(
-        r#"#!/bin/sh
+        r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> '{log}'
 case "$*" in *'If-None-Match'*)
   printf 'HTTP/2.0 304 Not Modified\r\n\r\n'
@@ -272,7 +272,7 @@ fn each_pass_sees_the_current_listing() {
     let body = dir.path().join("listing.json");
     std::fs::write(&body, listing(&[row(1, &["loom:pr"])])).unwrap();
     let script =
-        format!("#!/bin/sh\n{}exit 0\n", pulls_arm_cmd(&format!("cat '{}'", body.display())));
+        format!("#!/usr/bin/env bash\n{}exit 0\n", pulls_arm_cmd(&format!("cat '{}'", body.display())));
     let gh = dir.path().join("fake-gh.sh");
     write_script(&gh, &script);
     let first = list_with_label(&gh, &root, "loom:pr").unwrap();
