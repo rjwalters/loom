@@ -397,22 +397,29 @@ _phook_merge_one() {
 # _phook_guards_disabled <repo_root>
 #
 # True (0) only on an EXPLICIT guards opt-out (#10335): LOOM_GUARDS_ENABLED=0|
-# false|no, or boolean `guards.enabled: false` in <repo>/.loom/config.json (the
-# tracked .loom-project/project.json tier, when present, overrides it).
+# false|no, or a boolean `guards.enabled: false` in the EFFECTIVE config. Mirrors
+# `config_resolver::guards_master_disabled`: deep-merge, lowest to highest
+# precedence, machine defaults ($LOOM_CONFIG_DEFAULTS_FILE, else
+# ~/.local/share/loom/config/defaults.json), <repo>/.loom/config.json,
+# .loom-project/project.json, .loom-local/local.json; a missing/malformed/
+# non-object tier contributes nothing; a higher-tier non-boolean (or null)
+# REPLACES a lower tier's boolean, so guards stay ON.
 _phook_guards_disabled() {
     case "${LOOM_GUARDS_ENABLED:-}" in
         0|false|no) return 0 ;;
         1|true|yes) return 1 ;;
     esac
-    local root="$1" f v=""
+    local root="$1" f
     command -v jq >/dev/null 2>&1 || return 1
-    for f in "$root/.loom/config.json" "$root/.loom-project/project.json"; do
-        [[ -f "$f" ]] || continue
-        local got
-        got=$(jq -r 'try (if .guards.enabled == false then "false" elif .guards.enabled == true then "true" else empty end) catch empty' "$f" 2>/dev/null) || got=""
-        [[ -n "$got" ]] && v="$got"
+    local defaults="${LOOM_CONFIG_DEFAULTS_FILE-$HOME/.local/share/loom/config/defaults.json}"
+    local tiers=()
+    for f in "$defaults" "$root/.loom/config.json" "$root/.loom-project/project.json" "$root/.loom-local/local.json"; do
+        [[ -n "$f" && -f "$f" ]] || continue
+        jq -e 'type == "object"' "$f" >/dev/null 2>&1 || continue
+        tiers+=("$f")
     done
-    [[ "$v" == "false" ]]
+    [[ ${#tiers[@]} -gt 0 ]] || return 1
+    [[ "$(jq -rs 'reduce .[] as $o ({}; . * $o) | if .guards.enabled == false then "false" else "other" end' "${tiers[@]}" 2>/dev/null)" == "false" ]]
 }
 
 # ensure_project_hook_wiring <target> [settings_rel]

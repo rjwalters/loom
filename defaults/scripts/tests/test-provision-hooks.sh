@@ -694,6 +694,35 @@ LOOM_GUARDS_ENABLED=0 provision_loom_hooks "$HOME26/.claude" >/dev/null 2>&1
 assert_eq "$(count_marker "$HOME26/.claude/settings.json" guard-destructive.sh)" "0" "LOOM_GUARDS_ENABLED=0 skips the user-scope guard-destructive entry"
 assert_eq "$(count_marker "$HOME26/.claude/settings.json" guard-mcp-tools.sh)" "1" "non-master-switch hooks still wired"
 rm -rf "$R26" "$HOME26"
+
+# Effective-config parity with config_resolver::guards_master_disabled (#10359)
+echo "Test 27: installer merges all config tiers like the Rust resolver (#10359)"
+R27=$(mktemp -d)
+make_transition_repo "$R27"
+mkdir -p "$R27/.loom" "$R27/.loom-project" "$R27/.loom-local"
+S27="$R27/.claude/settings.json"
+export LOOM_CONFIG_DEFAULTS_FILE=""
+echo '{"guards":{"enabled":false}}' > "$R27/.loom/config.json"
+echo '{"guards":{"enabled":"false"}}' > "$R27/.loom-project/project.json"
+ensure_project_hook_wiring "$R27" >/dev/null 2>&1
+assert_eq "$(count_project_entry "$S27" guard-destructive.sh)" "1" "non-boolean project tier overrides legacy false -> guards wired"
+echo '{}' > "$R27/.loom-project/project.json"
+echo '{"guards":{"enabled":true}}' > "$R27/.loom-local/local.json"
+echo '{}' > "$S27"
+ensure_project_hook_wiring "$R27" >/dev/null 2>&1
+assert_eq "$(count_project_entry "$S27" guard-destructive.sh)" "1" "local-tier enable overrides legacy false -> guards wired"
+echo '{"guards":{"enabled":false}}' > "$R27/.loom-local/local.json"
+echo '{"guards":{"enabled":true}}' > "$R27/.loom/config.json"
+ensure_project_hook_wiring "$R27" >/dev/null 2>&1
+assert_eq "$(count_project_entry "$S27" guard-destructive.sh)" "0" "local-tier false overrides legacy true -> guards stripped"
+echo '{}' > "$R27/.loom-local/local.json"
+echo '{}' > "$R27/.loom/config.json"
+echo '{"guards":{"enabled":false}}' > "$R27/defaults.json"
+echo '{}' > "$S27"
+LOOM_CONFIG_DEFAULTS_FILE="$R27/defaults.json" ensure_project_hook_wiring "$R27" >/dev/null 2>&1
+assert_eq "$(count_project_entry "$S27" guard-destructive.sh)" "0" "machine-defaults tier false disables guards"
+unset LOOM_CONFIG_DEFAULTS_FILE
+rm -rf "$R27"
 echo ""
 echo "======================================"
 echo "test-provision-hooks.sh: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"
