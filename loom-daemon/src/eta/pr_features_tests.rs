@@ -197,6 +197,30 @@ fn the_reads_per_pass_never_exceed_the_budget_and_every_item_is_read_in_turn() {
 }
 
 #[test]
+fn reads_that_keep_failing_do_not_starve_healthy_reads() {
+    let mut store = PrFeatureStore::default();
+    // 12 PRs whose pull reads always fail, plus 3 healthy issues without a PR.
+    let mut items: Vec<Wanted> = (1..=12).map(|i| wanted(i, Some(100 + i))).collect();
+    items.extend((20..=22).map(|i| wanted(i, None)));
+    let mut read_issues = std::collections::BTreeSet::new();
+    for pass in 0..4 {
+        let now = t(pass * 300);
+        let reads = store.plan(&items, now, 12);
+        for r in &reads {
+            match r.kind {
+                ReadKind::Pull => store.answer(r, None, now),
+                ReadKind::Issue if r.number >= 20 => {
+                    read_issues.insert(r.number);
+                    store.answer(r, Some(&issue_body("", -1)), now);
+                }
+                _ => store.answer(r, None, now),
+            }
+        }
+    }
+    assert_eq!(read_issues.len(), 3, "healthy reads are attempted despite failing ones");
+}
+
+#[test]
 fn unreadable_items_keep_their_answers_but_plan_nothing() {
     let mut store = answered(t(-60), &pull_body("open", false, 40, "abc", -120));
     let mut item = wanted(1, Some(10));

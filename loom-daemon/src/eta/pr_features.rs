@@ -11,9 +11,10 @@
 //! `commits/{sha}/check-runs` and `issues/{n}`. This budget is separate from
 //! the journal resolver's (`observability::eta::FORGE_READ_BUDGET`): feature
 //! reads never delay an outcome read, and the reverse. Reads that do not fit
-//! are not lost. They stay wanted, and the oldest-read (never-read first) go
-//! first next pass. An item whose wanted read was deferred, and that has no
-//! earlier answer, records `budget_exhausted`.
+//! are not lost. They stay wanted, and the oldest-attempted (never-attempted
+//! first, failed attempts included) go first next pass, so a read that keeps
+//! failing cannot starve the others. An item whose wanted read was deferred,
+//! and that has no earlier answer, records `budget_exhausted`.
 //!
 //! # Point in time
 //!
@@ -276,6 +277,10 @@ enum Attempt {
 struct Slot<T> {
     last: Option<T>,
     attempt: Attempt,
+    /// When a read last returned, answered or failed. Scheduling priority
+    /// uses it, so a read that keeps failing cannot hold its place at the
+    /// front of the queue and starve healthy reads behind it.
+    tried_at: Option<DateTime<Utc>>,
 }
 
 impl<T> Default for Slot<T> {
@@ -283,6 +288,7 @@ impl<T> Default for Slot<T> {
         Slot {
             last: None,
             attempt: Attempt::None,
+            tried_at: None,
         }
     }
 }
@@ -309,10 +315,17 @@ pub struct PrFeatureStore {
     issues: BTreeMap<Key, Slot<IssueSnapshot>>,
 }
 
-/// One candidate read and its priority: never read first, then oldest.
+/// One candidate read and its priority: never attempted first, then the
+/// oldest attempt, whether it answered or failed.
 struct Candidate {
-    last: Option<DateTime<Utc>>,
+    /// When the read was last attempted (answered or failed), for ordering.
+    tried: Option<DateTime<Utc>>,
     read: FeatureRead,
+}
+
+/// The later of the last answer and the last attempt.
+fn tried<T>(slot: Option<&Slot<T>>, answered: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    answered.max(slot.and_then(|s| s.tried_at))
 }
 
 fn due(last: Option<DateTime<Utc>>, now: DateTime<Utc>, refresh_sec: i64) -> bool {
@@ -347,7 +360,7 @@ impl PrFeatureStore {
                 .map(|s| s.read_at);
             if due(last, now, ISSUE_REFRESH_SEC) {
                 candidates.push(Candidate {
-                    last,
+                    tried: tried(self.issues.get(key), last),
                     read: FeatureRead {
                         repo: key.0.clone(),
                         kind: ReadKind::Issue,
@@ -362,7 +375,7 @@ impl PrFeatureStore {
             let last = pull.map(|s| s.read_at);
             if due(last, now, PR_REFRESH_SEC) {
                 candidates.push(Candidate {
-                    last,
+                    tried: tried(self.pulls.get(key), last),
                     read: FeatureRead {
                         repo: key.0.clone(),
                         kind: ReadKind::Pull,
@@ -379,7 +392,7 @@ impl PrFeatureStore {
             let last = checks.filter(|c| c.sha == sha).map(|c| c.read_at);
             if due(last, now, PR_REFRESH_SEC) {
                 candidates.push(Candidate {
-                    last,
+                    tried: tried(self.checks.get(key), last),
                     read: FeatureRead {
                         repo: key.0.clone(),
                         kind: ReadKind::Checks,
@@ -390,9 +403,9 @@ impl PrFeatureStore {
             }
         }
         candidates.sort_by(|a, b| {
-            (a.last.is_some(), a.last, a.read.kind, &a.read.repo, a.read.number).cmp(&(
-                b.last.is_some(),
-                b.last,
+            (a.tried.is_some(), a.tried, a.read.kind, &a.read.repo, a.read.number).cmp(&(
+                b.tried.is_some(),
+                b.tried,
                 b.read.kind,
                 &b.read.repo,
                 b.read.number,
@@ -426,16 +439,16 @@ impl PrFeatureStore {
         match read.kind {
             ReadKind::Pull => {
                 let parsed = body.and_then(|b| parse_pull(b, read_at));
-                settle(self.pulls.entry(key).or_default(), parsed);
+                settle(self.pulls.entry(key).or_default(), parsed, read_at);
             }
             ReadKind::Checks => {
                 let sha = read.sha.as_deref().unwrap_or_default();
                 let parsed = body.and_then(|b| parse_checks(b, sha, read_at));
-                settle(self.checks.entry(key).or_default(), parsed);
+                settle(self.checks.entry(key).or_default(), parsed, read_at);
             }
             ReadKind::Issue => {
                 let parsed = body.and_then(|b| parse_issue(b, read_at));
-                settle(self.issues.entry(key).or_default(), parsed);
+                settle(self.issues.entry(key).or_default(), parsed, read_at);
             }
         }
     }
@@ -578,8 +591,10 @@ impl PrFeatureStore {
 }
 
 /// A failed read keeps the last answer: it is still the newest known value,
-/// and the max age bounds how long it is used.
-fn settle<T>(slot: &mut Slot<T>, parsed: Option<T>) {
+/// and the max age bounds how long it is used. The attempt time is recorded
+/// either way, so a failing read moves behind the reads not yet attempted.
+fn settle<T>(slot: &mut Slot<T>, parsed: Option<T>, read_at: DateTime<Utc>) {
+    slot.tried_at = Some(read_at);
     match parsed {
         Some(snap) => {
             slot.last = Some(snap);
