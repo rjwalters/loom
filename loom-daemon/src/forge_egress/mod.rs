@@ -17,8 +17,11 @@
 //! (both 1 and 2 fail admission). The process exit code is the **routing**
 //! verdict only; git/runtime/telemetry carry their own codes.
 //!
-//! **Unconfigured is a no-op**: no policy anywhere ⇒ every entry point
-//! returns 0 and changes nothing (upstream users, Gitea deployments).
+//! **Unconfigured is non-fatal**: no policy anywhere ⇒ nothing is enforced and
+//! every entry point exits 0, but the report carries a visible
+//! `policy.unconfigured` notice (#10168). On a host that declares itself managed
+//! (`LOOM_FORGE_EGRESS_MANAGED=1` or `/etc/loom/forge-egress/managed`) the same
+//! finding is exit 2.
 //!
 //! Entry points wired in this module's [`gate`]: daemon startup + periodic
 //! drift ([`gate::start`]), sweep dispatch ([`gate::dispatch_refusal`]),
@@ -245,8 +248,40 @@ fn observed_json(policy: &Value, obs: &Observed) -> Value {
     })
 }
 
+/// `policy.unconfigured`: visible always, fatal (exit 2, like 2am's doctor)
+/// only on a host that declares itself managed.
+fn unconfigured_finding(managed: bool) -> Finding {
+    let f = Finding::new(
+        "policy.unconfigured",
+        "GitHub routing is neither enforced nor validated on this host",
+    )
+    .expected(format!(
+        "a machine policy at {} or {} (or {})",
+        policy::MACHINE_POLICY_PATH,
+        policy::DEPLOYMENT_POLICY_PATH,
+        policy::POLICY_ENV
+    ))
+    .observed(if managed {
+        "no policy resolves on a host declared managed"
+    } else {
+        "no policy resolves"
+    })
+    .source("policy resolution")
+    .remedy(format!(
+        "install a machine policy at {} (or {}) or set {}",
+        policy::MACHINE_POLICY_PATH,
+        policy::DEPLOYMENT_POLICY_PATH,
+        policy::POLICY_ENV
+    ));
+    if managed {
+        f.incomplete()
+    } else {
+        f.notice()
+    }
+}
+
 /// A report for an unconfigured or unreadable resolution.
-fn non_loaded(resolution: Resolution, mode: Mode) -> Report {
+fn non_loaded(resolution: Resolution, mode: Mode, managed: bool) -> Report {
     let (policy, ignored, routing) = match resolution {
         Resolution::Unreadable {
             candidate,
@@ -274,7 +309,7 @@ fn non_loaded(resolution: Resolution, mode: Mode) -> Report {
                 vec![finding],
             )
         }
-        _ => (PolicyState::Unconfigured, vec![], vec![]),
+        _ => (PolicyState::Unconfigured, vec![], vec![unconfigured_finding(managed)]),
     };
     Report {
         policy,
@@ -299,7 +334,7 @@ pub fn run_with(sources: &PolicySources, workspace: &Path, mode: Mode) -> Report
             let obs = probe::observe(&doc, workspace, opts);
             evaluate(&doc, &obs, mode)
         }
-        other => non_loaded(other, mode),
+        other => non_loaded(other, mode, sources.managed),
     }
 }
 

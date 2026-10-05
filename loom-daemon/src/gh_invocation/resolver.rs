@@ -319,6 +319,7 @@ mod tests {
             env_path: Some(f.policy("env.json", &other)),
             machine_path: Some(f.policy("machine.json", &f.launcher())),
             repo_path: None,
+            ..PolicySources::default()
         };
         assert_eq!(launcher_from_sources(&sources), Some(other.display().to_string()));
     }

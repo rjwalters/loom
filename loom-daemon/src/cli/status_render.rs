@@ -770,7 +770,7 @@ pub(crate) fn build_status_json_value(
         value["pending_restart"] = pending_restart;
     }
     // Forge egress routing (#9984): fresh assert + the daemon's last doctor;
-    // inserted only when a policy resolves or a cached report exists.
+    // always present; unconfigured hosts carry the policy.unconfigured notice.
     let forge_egress = forge_egress_line::json();
     if !forge_egress.is_null() {
         value["forge_egress"] = forge_egress;
@@ -2253,7 +2253,7 @@ pub(crate) fn print_status_human(
     // render` change this daemon's pid has not yet picked up. Nothing at all
     // once the daemon that saw the drift has restarted (or if none ever did).
     pending_restart_line::print(report.daemon_pid);
-    // Forge egress routing (#9984): nothing at all when no policy is configured.
+    // Forge egress routing (#9984): an unconfigured host prints the notice (#10168).
     forge_egress_line::print();
 
     // Watchdog protection state (#4354): this daemon is answering, so it is
