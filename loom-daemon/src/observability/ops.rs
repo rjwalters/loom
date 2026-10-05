@@ -41,6 +41,7 @@ pub mod dispatch;
 pub mod disposition;
 pub mod dwell;
 pub mod host;
+pub mod liveness;
 pub mod lockout;
 pub mod pool_marks;
 pub mod queue;
@@ -122,6 +123,19 @@ impl OpsSink {
         ));
     }
 
+    /// The host id this sink stamps on every envelope.
+    #[must_use]
+    pub fn host_id(&self) -> &str {
+        &self.host_id
+    }
+
+    /// Enqueue one OTLP-only log record (Issue #10414: `auto_update.tick`),
+    /// for a loop that has no sink of its own.
+    pub fn emit_record(&self, record: TelemetryRecord) {
+        self.queue
+            .offer(TelemetryEnvelope::new(self.host_id.clone(), record));
+    }
+
     /// Enqueue one completed span, carrying its own context so logs can join
     /// it. Unsampled or invalid spans are not enqueued.
     pub fn emit_span(&self, span: SpanRecord) {
@@ -179,6 +193,18 @@ pub fn emit_metrics(points: Vec<MetricPoint>) {
     };
     if let Some(sink) = global_ops_sink() {
         sink.emit_metrics(points);
+    }
+}
+
+/// Emit one OTLP-only log record through the global sink; a no-op when none
+/// is registered (Issue #10414).
+pub fn emit_record(record: TelemetryRecord) {
+    #[cfg(test)]
+    let Some(record) = capture::record(record) else {
+        return;
+    };
+    if let Some(sink) = global_ops_sink() {
+        sink.emit_record(record);
     }
 }
 

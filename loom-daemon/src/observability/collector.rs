@@ -957,6 +957,8 @@ async fn sample_snapshots(
     // ETA (Issue #9289): review listings, outcome checks and re-estimates,
     // after `stage_dwell` so the ETag-cached listings are warm.
     super::eta::record(workspace_root, workspace_pool, slug_cache).await;
+    // #10414: the ETA pass finished; a no-op unless ETA registered it.
+    crate::task_liveness::beat_if_registered(crate::task_liveness::ETA_PASS);
     // This host's live estimate set (Issue #9329) — native HTTPS only, and
     // only when the set changed. After `eta::record` so it carries this
     // pass's estimates rather than the previous pass's.

@@ -1573,13 +1573,12 @@ pub fn build_daemon_status(
             // `resolve_posture`'s, so this is byte-identical to pre-#7691.
             let decision = crate::role_shard::decide(fallback_root);
             let posture = decision.posture;
-            let roster = roster_status::roster_status(&decision.roster);
             Some(crate::types::RoleRunnerShardPosture {
                 index: posture.index(),
                 count: posture.count(),
                 summary: posture.describe(),
                 configured: posture.is_configured(),
-                roster,
+                roster: roster_status::roster_status(&decision.roster),
             })
         },
         // Resolved once at daemon startup (#4005), threaded in read-only —
@@ -1612,6 +1611,9 @@ pub fn build_daemon_status(
         auto_update_stale_repo_ticks: au.stale_repo_ticks,
         auto_update_stale_repo: au.stale_repo,
         auto_update_roll_window: au.roll_window,
+        // Long-running task liveness (#10414): every registered loop's
+        // last beat and whether it is inside its staleness window.
+        task_liveness: crate::task_liveness::snapshot(),
         // Host-distress circuit breaker (#4235) — read from the process-global
         // handle the work-finder loop registers/updates each tick, mirroring the
         // auto-update global-snapshot pattern above. `None` (no breaker

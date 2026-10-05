@@ -1427,6 +1427,10 @@ pub struct DaemonStatusReport {
     /// pre-#9132 daemon. `#[serde(default)]` keeps older wire data compatible.
     #[serde(default)]
     pub auto_update_roll_window: Option<crate::auto_update::roll_window::RollWindowStatus>,
+    /// Every long-running daemon loop's liveness (Issue #10414): last beat,
+    /// staleness window, alive/dead. Empty from a pre-#10414 daemon.
+    #[serde(default)]
+    pub task_liveness: Vec<crate::task_liveness::TaskLivenessEntry>,
     /// Host-distress circuit-breaker state (Issue #4235). `Some` when a breaker
     /// has been registered this process (the work-finder loop is running and the
     /// breaker is enabled); `None` when no breaker is active — which the status

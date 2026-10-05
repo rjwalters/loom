@@ -753,10 +753,11 @@ async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
     // Issue #9289: the ETA tracker's bus subscriber (on by default).
     // Issue #10245/#10263: the fleet refresh task, which owns the daily refit
     // (either/or with the standalone refit task, so one handle).
+    // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
     assert_eq!(
         handles.len(),
-        7,
-        "collector + daemon_event + eta + turnaround + two senders + eta fleet refresh owning the refit (#10263)"
+        8,
+        "collector + daemon_event + eta + turnaround + two senders + eta fleet refresh owning the refit (#10263) + task-liveness sampler (#10414)"
     );
     let statuses = global_export_statuses();
     assert_eq!(
@@ -907,10 +908,11 @@ async fn spawn_task_otlp_exporter_spawns_three_tasks() {
     let handles =
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
     let handles = handles.expect("fully configured otlp exporter ⇒ spawn_task must return Some");
+    // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
     assert_eq!(
         handles.len(),
-        6,
-        "collector + daemon_event + eta (#9289) + turnaround (#8929) + sender + eta fleet refresh owning the refit (#10263)"
+        7,
+        "collector + daemon_event + eta (#9289) + turnaround (#8929) + sender + eta fleet refresh owning the refit (#10263) + task-liveness sampler (#10414)"
     );
     for handle in handles {
         handle.abort();

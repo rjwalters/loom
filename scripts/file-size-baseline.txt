@@ -23,7 +23,6 @@
 1125 defaults/scripts/tests/test-spawn-codex.sh
 1365 install.sh
 1598 loom-daemon/src/agent_session/spawn.rs
-1178 loom-daemon/src/auto_update.rs
 1427 loom-daemon/src/auto_update/tests.rs
 1565 loom-daemon/src/claim_reconciliation.rs
 2606 loom-daemon/src/claim_reconciliation/tests.rs

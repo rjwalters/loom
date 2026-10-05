@@ -2,6 +2,7 @@
 //! parent module's doc comment for the mapping table this file implements;
 //! this module is the field-by-field implementation plus its unit tests.
 
+mod auto_update;
 mod ci;
 mod eta;
 mod metadata;
@@ -620,6 +621,15 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // Issue #9289: the body is the record's JSON (an estimate's whole
             // explanation); scalars ride as `loom.eta.*` attributes.
             let (event_name, severity, at, attributes, body) = eta::log_parts(&envelope.record)?;
+            time_unix_nano = at;
+            body_override = Some(body);
+            (event_name, severity, String::new(), attributes)
+        }
+        TelemetryRecord::AutoUpdateTick(_) => {
+            // Issue #10414: one self-update decision, stamped at the tick's
+            // start; the body is the record's JSON.
+            let (event_name, severity, at, attributes, body) =
+                auto_update::log_parts(&envelope.record)?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)

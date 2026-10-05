@@ -18,6 +18,8 @@ use crate::telemetry::trace::SpanRecord;
 pub struct Captured {
     pub metrics: Vec<MetricPoint>,
     pub spans: Vec<SpanRecord>,
+    /// Log records given to [`super::emit_record`] (Issue #10414).
+    pub records: Vec<crate::telemetry::TelemetryRecord>,
 }
 
 thread_local! {
@@ -58,5 +60,18 @@ pub(super) fn span(span: SpanRecord) -> Option<SpanRecord> {
             None
         }
         None => Some(span),
+    })
+}
+
+/// Record `record` when capturing (returning `None`), else hand it back.
+pub(super) fn record(
+    record: crate::telemetry::TelemetryRecord,
+) -> Option<crate::telemetry::TelemetryRecord> {
+    CAPTURE.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(captured) => {
+            captured.records.push(record);
+            None
+        }
+        None => Some(record),
     })
 }
