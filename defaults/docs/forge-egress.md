@@ -122,14 +122,13 @@ versions, counts and remedies only. Token-shaped strings are redacted.
 | worker spawn (`spawn-worker.sh` → `loom-daemon spawn-worker`) | `assert` | does not spawn (exit 78) |
 | `install_self_check` (`forge-egress-aligned`) | `assert` | files an issue naming the codes, refreshes it when the codes change, and closes it once aligned or once no policy is configured |
 | `loom-daemon init` (`install-loom.sh`, `loom update`) | `doctor` | prints the findings; non-zero exit |
+| `resync-installed.sh` | `doctor` | prints the findings after the sync completes; exits with the doctor's code (non-zero only under `required`); `--dry-run` never runs it and never fails; a daemon without `forge egress` warns |
 | `/loom:sweep` pre-wave hygiene | `assert` | advisory text in the summary |
 
 `enforcement.api = observe` logs the same findings and proceeds. An unreadable
 policy, or one with an unknown `schemaVersion`, is never treated as observe-only.
 
-Not wired yet: post-publication `assert` + rollback (C3, #9986) and
-`resync-installed.sh` (#9996; run `loom-daemon forge egress doctor` after a
-resync by hand).
+Not wired yet: post-publication `assert` + rollback (C3, #9986).
 
 ## Lockstep with 2am
 
