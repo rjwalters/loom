@@ -55,6 +55,13 @@ use chrono::Duration;
 /// The id. Immutable once shipped.
 pub const LITTLE_V0: &str = "little-v0";
 
+/// Whether `id` is a floor baseline that only ever runs in shadow: it is never
+/// selectable as `current` and never promotable.
+#[must_use]
+pub fn is_shadow_only(id: &str) -> bool {
+    id == LITTLE_V0
+}
+
 /// Gamma-posterior draws behind the interval.
 pub const DRAWS: usize = 400;
 

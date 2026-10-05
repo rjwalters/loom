@@ -741,10 +741,12 @@ impl Registry {
     }
 
     /// The current heuristic for `kind`: `configured` when it names a
-    /// registered heuristic of that kind, else the default.
+    /// registered heuristic of that kind that is not shadow-only (`little-v0`
+    /// is never current), else the default.
     #[must_use]
     pub fn current(&self, kind: Kind, configured: Option<&str>) -> &dyn Heuristic {
         configured
+            .filter(|id| !heuristics::is_shadow_only(id))
             .and_then(|id| self.get(id))
             .filter(|h| h.kind() == kind)
             .or_else(|| self.get(Self::default_current(kind)))

@@ -71,7 +71,9 @@ use crate::eta::episodes::{input_from_pr_history, replay};
 use crate::eta::labels::{
     hold_labels, stage_from_pr_labels, APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED, TREATING,
 };
+use crate::eta::queue_features::{EventKind, EventLog, RosterEntry, StageEvent};
 use crate::eta::score::OutcomeKind;
+use crate::eta::stage_queue::stage_queue;
 use crate::eta::{Kind, NoEstimateReason, Stage, Subject};
 use crate::pr_latency::history::{PrEvent, PrState};
 use crate::pr_latency::PrHistory;
@@ -291,10 +293,107 @@ pub struct RefusedEntry {
 /// usable ones as cases, the refused ones by reason.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PrCaseEntries {
+    /// The PR's number.
+    pub pr: u32,
+    /// The merge instant, when the PR has one.
+    pub merged_at: Option<DateTime<Utc>>,
+    /// Every stage entry, resolved or refused, with when it ended: the
+    /// interval the PR sat in that stage. What the batch's point-in-time
+    /// roster and exit log are built from.
+    pub stints: Vec<Stint>,
     /// One `land` case per resolved stage entry, in entry order.
     pub cases: Vec<ReplayCase>,
     /// Every refused entry, in entry order.
     pub refused: Vec<RefusedEntry>,
+}
+
+/// One interval a PR spent in a stage (`None`: its labels resolved to no
+/// stage, a refusal), from its entry to the next entry or the merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stint {
+    /// The stage, `None` for a refused entry.
+    pub stage: Option<Stage>,
+    /// When the PR entered it.
+    pub entered_at: DateTime<Utc>,
+    /// When it left: the next entry, else the merge.
+    pub left_at: DateTime<Utc>,
+}
+
+/// A batch's stage intervals, from which each case's point-in-time queue is
+/// reconstructed.
+struct QueueWorld<'a> {
+    /// `(repo, pr, stint)` of every PR in the batch.
+    stints: Vec<(&'a str, u32, Stint)>,
+    /// Every stage departure; the last stint of a merged PR is a merge.
+    log: EventLog,
+    /// The repos whose roster and events the batch holds in full.
+    scope: Vec<String>,
+}
+
+impl<'a> QueueWorld<'a> {
+    fn new() -> Self {
+        QueueWorld {
+            stints: Vec::new(),
+            log: EventLog::default(),
+            scope: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, repo: &'a str, found: &PrCaseEntries) {
+        if !self.scope.iter().any(|r| r.eq_ignore_ascii_case(repo)) {
+            self.scope.push(repo.to_string());
+        }
+        for (i, stint) in found.stints.iter().enumerate() {
+            self.stints.push((repo, found.pr, *stint));
+            let last = i + 1 == found.stints.len();
+            self.log.events.push(StageEvent {
+                repo: repo.to_string(),
+                pr: Some(found.pr),
+                stage: stint.stage,
+                kind: if last && found.merged_at.is_some() {
+                    EventKind::Merge
+                } else {
+                    EventKind::Exit
+                },
+                at: stint.left_at,
+                known_at: stint.left_at,
+            });
+        }
+    }
+
+    /// The queue the case's PR faced entering its stage: the roster as it
+    /// stood at `as_of` and the exits before it, through the same
+    /// [`stage_queue`] the live tracker calls.
+    fn fill(&self, case: &mut ReplayCase) {
+        let Some(pr) = case.subject.pr_number else {
+            return;
+        };
+        let as_of = case.as_of;
+        let roster: Vec<RosterEntry> = self
+            .stints
+            .iter()
+            .filter(|(_, _, s)| s.entered_at <= as_of && as_of < s.left_at)
+            .map(|(repo, pr, s)| RosterEntry {
+                repo: (*repo).to_string(),
+                pr: *pr,
+                stage: s.stage,
+                entered_at: s.entered_at,
+                known_at: s.entered_at,
+            })
+            .collect();
+        case.queue = stage_queue(
+            &case.subject.repo,
+            pr,
+            case.stage,
+            as_of,
+            &roster,
+            &self.log,
+            &self.scope,
+            as_of,
+        )
+        .into_iter()
+        .collect();
+    }
 }
 
 /// The review labels: a label set carrying none of them names no review
@@ -394,7 +493,20 @@ pub fn pr_case_entries(
 
     let mut subject = Subject::new(repo, None, issue);
     subject.pr_number = Some(h.number);
-    let mut out = PrCaseEntries::default();
+    let mut out = PrCaseEntries {
+        pr: h.number,
+        merged_at: Some(merged_at),
+        ..PrCaseEntries::default()
+    };
+    out.stints = entries
+        .iter()
+        .enumerate()
+        .map(|(i, (at, resolved))| Stint {
+            stage: resolved.as_ref().ok().copied(),
+            entered_at: *at,
+            left_at: entries.get(i + 1).map_or(merged_at, |next| next.0),
+        })
+        .collect();
     for (as_of, resolved) in entries {
         match resolved {
             Ok(stage) => out.cases.push(ReplayCase {
@@ -463,6 +575,7 @@ pub fn cases_from_pr_records(records: &[PrCaseRecord]) -> (Vec<ReplayCase>, PrCa
         ..PrCaseSummary::default()
     };
     let mut cases = Vec::new();
+    let mut world = QueueWorld::new();
     for record in records {
         let reason = match pr_case_entries(
             &record.repo,
@@ -481,6 +594,7 @@ pub fn cases_from_pr_records(records: &[PrCaseRecord]) -> (Vec<ReplayCase>, PrCa
                 } else {
                     summary.contributing += 1;
                     summary.cases += found.cases.len();
+                    world.add(&record.repo, &found);
                     cases.extend(found.cases);
                     continue;
                 }
@@ -491,6 +605,9 @@ pub fn cases_from_pr_records(records: &[PrCaseRecord]) -> (Vec<ReplayCase>, PrCa
             .excluded
             .entry(reason.as_str().to_string())
             .or_insert(0) += 1;
+    }
+    for case in &mut cases {
+        world.fill(case);
     }
     (cases, summary)
 }

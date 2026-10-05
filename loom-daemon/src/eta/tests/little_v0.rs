@@ -279,3 +279,40 @@ fn registered_beside_land_v2_never_current_and_listed_by_backtest_compare() {
     assert_eq!(cmp.b.heuristic, LITTLE_V0);
     assert_eq!(cmp.b.overall.scored, 1, "the queue reaches the estimate through the case");
 }
+
+#[test]
+fn an_explicit_little_v0_configuration_never_selects_it_as_current() {
+    let registry = Registry::builtin();
+    assert_eq!(
+        registry.current(Kind::Land, Some(LITTLE_V0)).id(),
+        Registry::default_current(Kind::Land)
+    );
+}
+
+#[test]
+fn little_v0_is_never_promoted_even_when_both_gates_pass() {
+    use super::shadow::{comparison, ledger_with};
+    use crate::eta::heuristics::{LAND_V1, LAND_V2};
+    use crate::eta::shadow::{self, GateStatus, MIN_LIVE_PAIRS};
+
+    let stats = ledger_with(MIN_LIVE_PAIRS, 100.0, 60.0, MIN_LIVE_PAIRS / 2).stats(
+        Kind::Land,
+        LAND_V1,
+        LAND_V2,
+    );
+    let passing = comparison(1000.0, 800.0, 40);
+
+    // Control: the same evidence promotes an ordinary candidate.
+    let control = shadow::evaluate(Kind::Land, LAND_V1, LAND_V2, Some(&passing), &stats, as_of());
+    assert!(control.promote, "{}", control.reason);
+
+    // Relabel the candidate side as little-v0: both numerical gates still pass.
+    let mut floor = passing;
+    floor.b.heuristic = LITTLE_V0.to_string();
+    floor.better = Some(LITTLE_V0.to_string());
+    let decision = shadow::evaluate(Kind::Land, LAND_V1, LITTLE_V0, Some(&floor), &stats, as_of());
+    assert_eq!(decision.backtest.status, GateStatus::Passed, "{}", decision.backtest.detail);
+    assert_eq!(decision.live.status, GateStatus::Passed);
+    assert!(!decision.promote);
+    assert!(decision.reason.contains("shadow-only"), "{}", decision.reason);
+}

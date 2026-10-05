@@ -142,7 +142,7 @@ pub(super) const LEDGER_DAYS: i64 = 10;
 /// `candidate_loss`, `current`'s is `current_loss`, the candidate covers
 /// `covered` of them, nobody is late, and `pairs` tracker passes saw both
 /// sides answering.
-fn ledger_with(
+pub(super) fn ledger_with(
     pairs: usize,
     current_loss: f64,
     candidate_loss: f64,

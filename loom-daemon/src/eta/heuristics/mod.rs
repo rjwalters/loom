@@ -36,7 +36,7 @@ pub use land_v3::{
     INPUT_MISSING, LAND_V3, LOWER_STRETCH, REFERENCE_POINTS, REVIEW_FLOOR_SEC, UPPER_STRETCH,
 };
 pub use land_v4::{LandV4, LAND_V4};
-pub use little_v0::{wait_sec, LittleV0, LITTLE_V0};
+pub use little_v0::{is_shadow_only, wait_sec, LittleV0, LITTLE_V0};
 pub use start_v1::{StartV1, START_V1};
 
 /// The heuristic whose track record the calibration log (#10207) records.
