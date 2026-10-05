@@ -81,8 +81,11 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
         refresh_cycle: health::read_refresh_cycle(root),
     };
 
-    let latest =
-        fit::coeffs::load_latest(root, now + chrono::Duration::days(1)).map(|f| (f.id, f.as_of));
+    // Cut off at `now`, the same point-in-time rule the estimator's serving
+    // path applies (`fit::load_latest(.., listed_at)`): a fit dated in the
+    // future is one the estimator cannot serve yet, so the doctor must not
+    // report it (#10407 review).
+    let latest = fit::coeffs::load_latest(root, now).map(|f| (f.id, f.as_of));
     let today = fit::run::midnight(now);
     let fit_facts = FitFacts {
         latest,
@@ -94,7 +97,7 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
     };
 
     let pending = read_pending(root);
-    let registry = Registry::load(root, now + chrono::Duration::days(1));
+    let registry = Registry::load(root, now);
     let mut shadows = Vec::new();
     let mut tallies = Vec::new();
     for kind in [Kind::Start, Kind::Finish, Kind::Land] {

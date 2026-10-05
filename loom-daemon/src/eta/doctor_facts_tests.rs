@@ -58,6 +58,73 @@ fn gather_resolves_a_fresh_reader_under_the_doctors_own_root() {
     );
 }
 
+/// Write a minimal coefficient file cut off at `as_of`; returns its id.
+fn fit_file(root: &Path, as_of: DateTime<Utc>) -> String {
+    let meta = fit::FitMeta {
+        as_of,
+        window: fit::FitWindow::standard(as_of),
+        fitter: fit::Fitter {
+            version: "0.0.0".to_string(),
+            revision: "0".repeat(40),
+        },
+    };
+    let file = fit::CoefficientFile::empty(&meta).with_derived_id();
+    let path = fit::coeffs::fit_dir(root).join(fit::coeffs::path_for(as_of));
+    fit::coeffs::write(&path, &file).unwrap();
+    file.id
+}
+
+fn status_of(facts: &Facts, link: &str, check: &str) -> super::super::doctor::Status {
+    super::super::doctor::evaluate(facts)
+        .into_iter()
+        .find(|c| c.link == link && c.check == check)
+        .unwrap_or_else(|| panic!("no {link}.{check} check"))
+        .status
+}
+
+/// Regression (#10407 review): a fit cut off after `now` is one the
+/// estimator cannot serve yet (`fit::load_latest(.., listed_at)`), so the
+/// doctor must not select it either.
+#[test]
+fn gather_ignores_a_future_only_fit() {
+    use super::super::doctor::Status;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let now = Utc::now();
+    fit_file(root, now + chrono::Duration::hours(1));
+
+    let facts = gather(root, "host-a", now);
+    assert_eq!(facts.fit.latest, None);
+    assert!(!facts.serving.fit_loaded);
+    assert_ne!(status_of(&facts, "serving", "twin_otter_model"), Status::Ok);
+    assert_ne!(status_of(&facts, "fit", "coefficient_file"), Status::Ok);
+}
+
+/// Regression (#10407 review): beside a newer future-dated fit, the doctor
+/// selects the old eligible one, so `fit.coefficient_file` reports its real
+/// age instead of hiding it behind the future file.
+#[test]
+fn gather_selects_the_old_eligible_fit_over_a_future_one() {
+    use super::super::doctor::Status;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let now = Utc::now();
+    let old_as_of = now - chrono::Duration::days(5);
+    let old_id = fit_file(root, old_as_of);
+    let future_id = fit_file(root, now + chrono::Duration::hours(1));
+    assert_ne!(old_id, future_id);
+
+    let facts = gather(root, "host-a", now);
+    assert_eq!(facts.fit.latest, Some((old_id.clone(), old_as_of)));
+    assert!(facts.serving.fit_loaded);
+    assert_eq!(status_of(&facts, "serving", "twin_otter_model"), Status::Ok);
+    assert_eq!(
+        status_of(&facts, "fit", "coefficient_file"),
+        Status::Fail,
+        "a 5-day-old fit is stale; the future file must not mask it"
+    );
+}
+
 #[test]
 fn a_non_github_host_resolves_no_reader() {
     let tmp = tempfile::tempdir().unwrap();
