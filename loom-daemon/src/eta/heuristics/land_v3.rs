@@ -130,13 +130,7 @@ impl Heuristic for LandV3 {
     }
 
     fn estimate(&self, input: &EstimateInput, history: &StageSamples) -> Explanation {
-        let mut input = input.clone();
-        if story_points(&input.features).is_none() {
-            note_missing(&mut input.features_omitted, "points_marker");
-        }
-        if input.features.queue_running.is_none() {
-            note_missing(&mut input.features_omitted, "queue_running");
-        }
+        let input = with_missing_inputs_noted(input);
         estimate_path(
             PathRules {
                 id: LAND_V3,
@@ -147,11 +141,26 @@ impl Heuristic for LandV3 {
                 adjust: Some(adjust),
                 models_hold: false,
                 half_life_sec: None,
+                stall_term: false,
+                residual_tail: false,
             },
             &input,
             history,
         )
     }
+}
+
+/// `input` with every calibration input it lacks named in
+/// `features_omitted` — shared with `land-v4`, which calibrates identically.
+pub(super) fn with_missing_inputs_noted(input: &EstimateInput) -> EstimateInput {
+    let mut input = input.clone();
+    if story_points(&input.features).is_none() {
+        note_missing(&mut input.features_omitted, "points_marker");
+    }
+    if input.features.queue_running.is_none() {
+        note_missing(&mut input.features_omitted, "queue_running");
+    }
+    input
 }
 
 fn note_missing(omitted: &mut Vec<FeatureOmitted>, name: &str) {
@@ -186,8 +195,8 @@ pub fn complexity_scale(points: u32) -> f64 {
 }
 
 /// `land-v3`'s per-stage grid transform. Pure: reads `stage`, the input's
-/// features and the raw grid, nothing else.
-fn adjust(
+/// features and the raw grid, nothing else. `land-v4` reuses it unchanged.
+pub(super) fn adjust(
     stage: Stage,
     input: &EstimateInput,
     raw: Vec<i64>,

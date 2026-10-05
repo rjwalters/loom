@@ -69,6 +69,8 @@ impl Heuristic for LandAmberHeron {
                 adjust: None,
                 models_hold: false,
                 half_life_sec: None,
+                stall_term: false,
+                residual_tail: false,
             },
             input,
             history,

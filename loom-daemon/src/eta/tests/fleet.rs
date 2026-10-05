@@ -86,6 +86,8 @@ pub(super) fn input() -> EstimateInput {
         features_omitted: Vec::new(),
         provenance: provenance(),
         dispatch: None,
+        stalls: Vec::new(),
+        held: None,
     }
 }
 

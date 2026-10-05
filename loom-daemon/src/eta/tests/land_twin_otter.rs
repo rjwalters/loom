@@ -180,6 +180,8 @@ pub(crate) fn input_for(row: &TwinOtterInput, at: DateTime<Utc>) -> EstimateInpu
         features_omitted: Vec::new(),
         provenance: provenance(),
         dispatch: None,
+        stalls: Vec::new(),
+        held: None,
     }
 }
 
@@ -705,6 +707,7 @@ fn tracker_pass(registry: &Registry, labels: &[&str]) -> Vec<crate::eta::tracker
         refresh_secs: 300,
         host_id: Some("host-test"),
         repo_ids: &repo_ids,
+        stalls: &super::NO_STALLS,
     };
     let mut tracker = Tracker::new(provenance());
     let pr = PrView {

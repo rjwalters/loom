@@ -231,6 +231,7 @@ fn registry_resolves_current_per_kind() {
             "land-v3",
             "land-2026-10-04-amber-heron",
             "land-2026-10-04-fresh-tide",
+            "land-v4",
             "land-2026-10-04-twin-otter",
             "land-2026-10-04-twin-otter-b"
         ]
@@ -268,6 +269,8 @@ fn registry_resolves_current_per_kind() {
             .id(),
         "land-2026-10-04-twin-otter"
     );
+    // `land-v4` (#10210) likewise.
+    assert_eq!(registry.current(Kind::Land, Some("land-v4")).id(), "land-v4");
     assert_eq!(Registry::default_current(Kind::Land), "land-v1");
 }
 
@@ -284,6 +287,7 @@ fn for_kind_enumerates_every_registered_heuristic_of_a_kind() {
             "land-v3",
             "land-2026-10-04-amber-heron",
             "land-2026-10-04-fresh-tide",
+            "land-v4",
             "land-2026-10-04-twin-otter",
             "land-2026-10-04-twin-otter-b"
         ]

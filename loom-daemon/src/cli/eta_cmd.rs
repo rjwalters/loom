@@ -733,6 +733,8 @@ fn build_input(
         features_omitted: Vec::new(),
         provenance: Provenance::current(),
         dispatch: None,
+        stalls: Vec::new(),
+        held: None,
     }
 }
 

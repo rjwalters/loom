@@ -180,6 +180,7 @@ fn one_case(t: chrono::DateTime<chrono::Utc>) -> ReplayCase {
         outcome: OutcomeKind::Landed,
         actual_at: t + Duration::seconds(900),
         dispatch: None,
+        age_sec: 0,
     }
 }
 

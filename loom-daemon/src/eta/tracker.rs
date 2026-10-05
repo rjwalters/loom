@@ -74,8 +74,9 @@
 use super::emit::{EmitState, Signature, Trigger};
 use super::explanation::Explanation;
 use super::journal::JournalEntry;
-use super::labels::stage_from_pr_labels;
+use super::labels::{held_only_by_operator, stage_from_pr_labels, stage_ignoring_holds};
 use super::score::{score, EstimateSummary, OutcomeKind, Score, StageObservation};
+use super::stall::StallSnapshot;
 use super::{
     AgeSource, CurrentStage, CurrentState, DispatchInput, EstimateInput, Heuristic, Kind,
     NoEstimateReason, Provenance, Registry, Stage, StageSamples, Subject,
@@ -279,6 +280,9 @@ pub struct EstimateContext<'a> {
     pub host_id: Option<&'a str>,
     /// Resolved repo ids by lowercased slug.
     pub repo_ids: &'a BTreeMap<String, u64>,
+    /// Every stall the daemon observed (#10210), narrowed per item into
+    /// [`EstimateInput::stalls`]. Read-only data assembled by the caller.
+    pub stalls: &'a StallSnapshot,
 }
 
 /// The tracker.
@@ -1111,6 +1115,31 @@ impl Tracker {
             // for the answer instead (it is retried every pass).
             return None;
         }
+        // #10210: under an operator hold (and only one), the stage the PR's
+        // review labels still name — the track's own entry when the hold
+        // landed on a stage the tracker already knew, else entered now.
+        let held = (item.refused == Some(NoEstimateReason::Blocked)
+            && held_only_by_operator(&item.labels))
+        .then(|| stage_ignoring_holds(&item.labels).ok())
+        .flatten()
+        .map(|stage| match item.stage.as_ref().filter(|s| s.stage == stage) {
+            Some(track) => CurrentStage {
+                stage,
+                entered_at: Some(track.entered_at),
+                age_sec: (now - track.entered_at).num_seconds().max(0),
+                age_source: track.source,
+                rework_rounds: item.rework_rounds,
+                episode_entered_at: None,
+            },
+            None => CurrentStage {
+                stage,
+                entered_at: Some(now),
+                age_sec: 0,
+                age_source: AgeSource::TrackerObserved,
+                rework_rounds: item.rework_rounds,
+                episode_entered_at: None,
+            },
+        });
         let current = if let Some(held) = hold::held_stage(item, now) {
             CurrentState::At(held)
         } else if let Some(reason) = item.refused {
@@ -1133,6 +1162,11 @@ impl Tracker {
                 episode_entered_at: hold::episode_entered_at(item),
             })
         };
+        let stage_now = match &current {
+            CurrentState::At(c) => Some(c.stage),
+            CurrentState::Refused(_) => held.as_ref().map(|h| h.stage),
+        };
+        let stalls = ctx.stalls.for_item(&item.repo, stage_now, &item.labels);
         let mut subject =
             Subject::new(&item.repo, ctx.repo_ids.get(&key.repo).copied(), item.issue);
         subject.pr_number = item.pr_number;
@@ -1147,6 +1181,8 @@ impl Tracker {
             features_omitted: omitted,
             provenance: self.loom.clone(),
             dispatch: item.ready.clone().filter(|_| ready_only),
+            stalls,
+            held,
         })
     }
 

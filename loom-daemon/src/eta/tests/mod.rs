@@ -35,6 +35,7 @@ mod recency;
 mod score;
 mod shadow;
 mod shadow_gate;
+mod stall;
 mod tracker;
 mod tracker_hold;
 mod twin_otter_parity;
@@ -65,6 +66,13 @@ pub(crate) const TWIN_OTTER_PARITY: &str = include_str!("../fixtures/twin_otter_
 /// could see it, would change the answer — and which every replay instant in
 /// the fixture predates.
 pub(crate) const LEAKAGE: &str = include_str!("../fixtures/leakage.jsonl");
+
+/// No stall signals (#10210): the `stalls` of a test [`super::tracker::EstimateContext`]
+/// that has to outlive a temporary (a helper returning the context).
+pub(crate) static NO_STALLS: super::stall::StallSnapshot = super::stall::StallSnapshot {
+    host: Vec::new(),
+    locked_repos: std::collections::BTreeSet::new(),
+};
 
 /// The instant every fixture estimate is made at.
 pub(crate) fn as_of() -> DateTime<Utc> {
@@ -130,5 +138,7 @@ pub(crate) fn input_at(stage: Stage, age_sec: i64, rework_rounds: u32) -> Estima
         features_omitted: Vec::new(),
         provenance: provenance(),
         dispatch: None,
+        stalls: Vec::new(),
+        held: None,
     }
 }

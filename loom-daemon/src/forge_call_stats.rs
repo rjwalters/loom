@@ -884,6 +884,34 @@ pub fn status_report(
     }
 }
 
+/// The rate-limit pools this process last read at **zero remaining** and
+/// that have not reset yet at `now`, each with its reset instant when the
+/// header carried one (#10210, the ETA's `rate_limit_quota` stall).
+///
+/// Read-only and in-process: the newest free `x-ratelimit-*` reading per pool
+/// this daemon already absorbed — no file read, no forge call. A reading
+/// older than [`WINDOW_SECS`] with no reset is too stale to call a stall.
+#[must_use]
+pub fn exhausted_pools(now: DateTime<Utc>) -> Vec<(Pool, Option<DateTime<Utc>>)> {
+    match process_state().lock() {
+        Ok(state) => exhausted_in(&state.latest, now.timestamp()),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// [`exhausted_pools`] over an explicit reading map. Pure.
+fn exhausted_in(latest: &BTreeMap<Pool, Reading>, now: i64) -> Vec<(Pool, Option<DateTime<Utc>>)> {
+    latest
+        .iter()
+        .filter(|(_, r)| r.remaining == 0)
+        .filter(|(_, r)| match r.reset_epoch {
+            Some(reset) => reset > now,
+            None => now - r.observed_at <= WINDOW_SECS,
+        })
+        .map(|(pool, r)| (*pool, r.reset_epoch.and_then(epoch)))
+        .collect()
+}
+
 /// This host's budget-costing forge calls per pool over the last window —
 /// `ok` + `error` outcomes, host-wide from the sink (Issue #9855). The
 /// breaker's trip-time attribution log divides a pool's `used` by this to

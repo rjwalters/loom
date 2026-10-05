@@ -94,7 +94,8 @@ fewer than 8 there too the estimate is refused.
 **Conditioning.** The current stage's draw is conditioned on the time already
 spent in it: draws come from the grid's `[F(age), 1]` range and the age is
 subtracted. Fewer than 5 samples longer than the age means the item has
-outlived its own history (`beyond_history`).
+outlived its own history (`beyond_history`). `land-v4` answers that case
+instead of refusing it — see "Stalls and the residual-life tail" below.
 
 **Combination.** A deterministic Monte Carlo of 4000 paths draws every stage
 a path visits from its grid, and a verdict at every `review_wait`
@@ -267,6 +268,7 @@ raw event cache imports it.
 | `land-v3` | `land` | `land-v2`'s, with each stage grid calibrated first: widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored (recorded per stage as `distribution.adjustment`; #9970) | after `merge_wait` |
 | `land-2026-10-04-amber-heron` | `land` | `land-v2`'s path, then its p25/p75 recalibrated from `land-v2`'s own track record: the current stage's `ln(actual / p50)` distribution (landed estimates as events, still-open ones as censored lower bounds, recency-weighted) fitted at the estimate's own `as_of`; the median is kept (recorded as `recalibration`; #10207) | after `merge_wait` |
 | `land-2026-10-04-fresh-tide` | `land` | `land-v2`'s, with every stage sample (observed and censored) weighted `exp(−age / half_life)`, half-life 2 days, and the grid built from the weighted samples; when the effective N `(Σw)²/Σw²` falls below 8 the half-life doubles (up to 6 times, then flat). Records `distribution.half_life_sec` (absent when flat) and `distribution.effective_n` per stage (#10209) | after `merge_wait` |
+| `land-v4` | `land` | `land-v3`'s, plus the binding stall's term added to every path, operator-held PRs estimated from the stage under the hold, and no `beyond_history` refusal (a flagged residual-life tail instead; #10210) | after `merge_wait` |
 | `land-2026-10-04-twin-otter` | `land` | no history: the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)). PR stages only (`review_wait`, `doctor`, `merge_wait`, `merge_hold`); the blend of a stage-by-stage exit-hazard Monte Carlo (256 paths, seeded per stage visit) and a log-normal direct model (recorded as `twin_otter`; #10222, #10243) | at the merge |
 | `land-2026-10-04-twin-otter-b` | `land` | the pre-PR/PR composition of twin-otter (#10244): `ready_wait`, `sweep.curator` and `sweep.builder` are answered with `land-v2`'s path rules (same refusals, so its answer rate there equals `land-v2`'s; `combination.method` is `land_v2_path_prefix`); `review_wait`, `doctor`, `merge_wait` and `merge_hold` are `land-2026-10-04-twin-otter`'s own answer, unchanged | at the merge |
 
@@ -384,6 +386,7 @@ tracker's, which loads the file (below).
 constructor parameter (`LandFreshTide::with_half_life`), so a 1/2/7-day
 comparison needs no extra registered ids; only the 2-day default is
 registered and shadowed.
+`land-v4` (#10210) ships the same way.
 
 ## Fitted coefficients (`eta-fit/v1`)
 
@@ -635,6 +638,47 @@ the `updated_at` lower bound; an unavailable or stale fleet view stays
 omitted and imputed; and a later release never rewrites an earlier
 observation. The six path-engine heuristics keep the described input, so
 their `features` are byte-identical to before.
+
+### Stalls and the residual-life tail (#10210)
+
+The worst `land` misses are **stopped** service, not slow service. The
+daemon assembles a read-only stall snapshot (no forge call) from what it
+already holds, and narrows it per item:
+
+| `stalled.cause` | signal | applies to | `resume_at` |
+|---|---|---|---|
+| `rate_limit_quota` | breaker cooldown with a pool at zero, or the forge-call ledger's last header reading at zero | every item | the cooldown end / the pool's reset |
+| `breaker_cooldown` | breaker cooldown with budget left (a secondary limit) | every item | the cooldown end |
+| `token_pool_exhausted` | a workspace's empty-pool brake is tripped | every item | unknown |
+| `operator_hold` | `loom:operator`, `-only`, `-decision`, `-mechanical` on the item | that item | unknown (the hold model is #10218) |
+| `pr_open_lockout` | the repo's ready backlog is frozen by the open-PR guard | a `ready_wait` item | unknown |
+
+Every heuristic records the binding stall — the one with the longest term —
+as `stalled { cause, resume_at, term_sec, term_basis, applied, detail?,
+also? }`. `term_sec` is `resume_at − as_of`, or with no `resume_at` the
+cause's documented default (`eta::stall::default_term_sec`: quota 1 h,
+breaker 15 min, pool 5 h, operator hold 1 day, lockout 4 h — priors, not
+measurements). Only `land-v4` applies it (`applied: true`): the term is
+added to every simulated path before service resumes, consuming no draw, so
+with a known `resume_at = T` every quantile is exactly `T − as_of` above the
+unstalled one; the stall pauses the stage clock, so the normal term is
+conditioned on today's age. Its share of the median band is
+`contributions.p50_share.stalled`. A PR whose only holds are operator holds
+is estimated by `land-v4` from the stage its review labels name under the
+hold, plus the `operator_hold` term; every other hold still refuses. An
+approved PR so held reaches the estimator as `merge_hold` (#10218); `land-v4`
+does not declare `models_hold`, so it reads the `merge_wait` underneath plus
+the term rather than the fitted hold model.
+
+When the item has outlived its stage history, `land-v4` draws the remaining
+in-stage time from the residual-life tail `P(R ≤ x) = x / (x + age)`
+(`conditioning.method = "residual_life_tail"`; median = the age, capped at
+`19 × age`) and sets `result.tail_extrapolated: true`. The flag is carried
+into `eta.outcome`'s `estimate.tail_extrapolated` (with `estimate.stall_cause`),
+and `eta backtest` reports `by_tail` (`normal` / `tail_extrapolated`)
+whenever a replayed case was tail-extrapolated, so a tail guess never hides
+inside the ordinary accuracy. Every new field is additive and absent when
+unset: no schema bump.
 
 ## The explanation (`eta-explanation/v1`)
 
@@ -943,10 +987,10 @@ Omission reasons are free-form strings.
 
 | reason | when |
 |---|---|
-| `blocked` | a hold or park label: `loom:blocked`, `loom:operator`, `loom:operator-only`, `loom:operator-decision`, `loom:operator-mechanical`, `loom:needs-capability` |
+| `blocked` | a hold or park label: `loom:blocked`, `loom:operator`, `loom:operator-only`, `loom:operator-decision`, `loom:operator-mechanical`, `loom:needs-capability` (`land-v4` estimates a PR held by operator labels alone) |
 | `human_gated` | intake or approval (`loom:triage`, `loom:curating`, `loom:curated`) |
 | `insufficient_samples` | a needed stage or the verdict history is under the sample floor |
-| `beyond_history` | the item has been in its stage longer than all but 5 samples |
+| `beyond_history` | the item has been in its stage longer than all but 5 samples (never `land-v4`, which answers with a flagged tail estimate) |
 | `no_dispatch_plan` | not started, and the dispatch plan gives it no position (blocked, or no plan on this host) |
 | `unknown_stage` | no stage label, or contradictory ones |
 | `stale_inputs` | a ready item whose dispatch plan is older than 15 minutes (or three ticks) |

@@ -17,6 +17,7 @@
 //! never scored: its error fields are absent, not zero.
 
 use super::explanation::Explanation;
+use super::stall::StallCause;
 use super::{Kind, NoEstimateReason, Provenance, Stage};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -182,6 +183,15 @@ pub struct EstimateSummary {
     pub no_estimate_reason: Option<NoEstimateReason>,
     /// Each path stage's `(p25, p50, p75)` duration.
     pub stage_quartiles: Vec<StageQuartiles>,
+    /// The estimate answered an item older than its history with the
+    /// residual-life tail (#10210). Accuracy queries and the backtest keep
+    /// these apart from ordinary estimates. Absent (`false`) otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tail_extrapolated: bool,
+    /// The binding stall's cause, when one was active at the estimate
+    /// (#10210) — whether or not the heuristic applied its term.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_cause: Option<StallCause>,
 }
 
 /// One stage's predicted duration quartiles.
@@ -230,6 +240,11 @@ impl EstimateSummary {
                     p75: e.distribution.p75,
                 })
                 .collect(),
+            tail_extrapolated: explanation
+                .result
+                .as_ref()
+                .is_some_and(|r| r.tail_extrapolated),
+            stall_cause: explanation.stalled.as_ref().map(|s| s.cause),
         }
     }
 

@@ -117,6 +117,38 @@ pub fn check_holds(labels: &[String]) -> Result<(), NoEstimateReason> {
     }
 }
 
+/// The operator hold labels (#10210): a human is needed before the item moves.
+/// A subset of [`hold_labels`]; `loom:operator-priority` is the operator's
+/// star, never a hold, and is deliberately absent.
+pub const OPERATOR_HOLD_LABELS: &[&str] = &[
+    "loom:operator",
+    "loom:operator-only",
+    "loom:operator-decision",
+    "loom:operator-mechanical",
+];
+
+/// The first operator hold label on the item, when it has one.
+#[must_use]
+pub fn operator_hold_label(labels: &[String]) -> Option<&'static str> {
+    OPERATOR_HOLD_LABELS
+        .iter()
+        .copied()
+        .find(|h| has(labels, h))
+}
+
+/// Whether every hold on the item is an operator hold (and there is at least
+/// one): the one hold whose stall a stall-aware heuristic can model (#10210).
+/// `loom:blocked`, a park label or `loom:needs-capability` alongside it keeps
+/// the plain `blocked` refusal.
+#[must_use]
+pub fn held_only_by_operator(labels: &[String]) -> bool {
+    operator_hold_label(labels).is_some()
+        && hold_labels()
+            .iter()
+            .filter(|h| has(labels, h))
+            .all(|h| OPERATOR_HOLD_LABELS.contains(h))
+}
+
 /// The post-sweep stage of an open PR from its labels: exactly one of
 /// review-requested, changes-requested and approved, and no hold — or
 /// [`Stage::MergeHold`] (#10218) for an approved PR whose only holds are
@@ -149,6 +181,12 @@ fn is_merge_hold(labels: &[String]) -> bool {
             .iter()
             .all(|h| MERGE_HOLD_LABELS.contains(h) || MERGE_HOLD_COMPANION_LABELS.contains(h))
         && verdict_stage(labels) == Ok(Stage::MergeWait)
+}
+
+/// The stage a held PR's review labels name underneath its hold (#10210) —
+/// [`stage_from_pr_labels`] without the hold check.
+pub fn stage_ignoring_holds(labels: &[String]) -> Result<Stage, NoEstimateReason> {
+    verdict_stage(labels)
 }
 
 /// The stage the review labels alone name, ignoring holds.

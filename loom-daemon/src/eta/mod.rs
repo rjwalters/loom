@@ -128,6 +128,7 @@ pub mod recency;
 pub mod score;
 pub mod shadow;
 pub mod simulate;
+pub mod stall;
 pub mod tracker;
 pub mod twin_otter;
 
@@ -587,6 +588,16 @@ pub struct EstimateInput {
     /// The dispatch plan's view of a ready item; `None` for every started
     /// one.
     pub dispatch: Option<DispatchInput>,
+    /// The stall signals that stop this item now (#10210), already narrowed
+    /// to it ([`stall::StallSnapshot::for_item`]). Every heuristic records
+    /// the binding one; only a stall-aware heuristic adds its term.
+    pub stalls: Vec<stall::StallSignal>,
+    /// The stage underneath an operator hold (#10210): set only when
+    /// `current` is a `blocked` refusal whose every hold is an operator
+    /// hold and whose review labels still name a stage. A stall-aware
+    /// heuristic estimates from it (plus the hold's stall term) instead of
+    /// refusing; every other heuristic ignores it.
+    pub held: Option<CurrentStage>,
 }
 
 /// A registered estimator. Implementations must be pure.
@@ -639,6 +650,7 @@ impl Registry {
                 Box::new(heuristics::LandV3),
                 Box::new(heuristics::LandAmberHeron),
                 Box::new(heuristics::LandFreshTide::default()),
+                Box::new(heuristics::LandV4),
                 Box::new(heuristics::LandTwinOtter::new(fit.clone())),
                 Box::new(heuristics::LandTwinOtterB::new(fit.clone())),
             ],

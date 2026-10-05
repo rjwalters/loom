@@ -486,6 +486,7 @@ fn answer_rates_are_counted_once_per_pass_not_once_per_emitted_row() {
         refresh_secs: 300,
         host_id: Some("host-test"),
         repo_ids: &repo_ids,
+        stalls: &super::NO_STALLS,
     };
     let mut tracker = Tracker::new(provenance());
     // Issue 10 is answerable; issue 12 has no plan position, so it is refused

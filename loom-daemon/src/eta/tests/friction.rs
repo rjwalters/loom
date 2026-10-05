@@ -251,6 +251,7 @@ fn every_tracker_estimate_accounts_for_every_friction_feature() {
         refresh_secs: 300,
         host_id: Some("host-test"),
         repo_ids: &repo_ids,
+        stalls: &super::NO_STALLS,
     };
     let emissions = tracker.estimate(None, &ctx, at);
     assert!(emissions.iter().any(|e| e.explanation.kind == Kind::Land));

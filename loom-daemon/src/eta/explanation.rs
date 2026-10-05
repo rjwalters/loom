@@ -11,6 +11,7 @@
 //! names what it dropped in `truncated`.
 
 use super::fit::{AftFit, FitStage, HazardFit, PathStats};
+pub use super::stall::Stalled;
 use super::twin_otter::TwinOtterInput;
 use super::{AgeSource, DispatchInput, Kind, NoEstimateReason, Provenance, Stage, Subject};
 use chrono::{DateTime, Utc};
@@ -83,6 +84,13 @@ pub struct Explanation {
     pub features_omitted: Vec<FeatureOmitted>,
     /// Why there is no estimate. `None` when there is one.
     pub no_estimate_reason: Option<NoEstimateReason>,
+    /// The binding stall when a stall signal is active (#10210): the cause,
+    /// when it resumes, and whether this heuristic added its term to the
+    /// result. Absent when nothing stalls the item — so every explanation
+    /// made without a stall is byte-identical to one made before the field
+    /// existed (additive, no schema bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled: Option<Stalled>,
     /// What [`Explanation::enforce_cap`] dropped, in drop order.
     pub truncated: Vec<String>,
     /// How a recalibrating heuristic (#10207) moved the simulated quantiles
@@ -359,9 +367,24 @@ pub struct Conditioning {
     pub f_age: f64,
     /// Samples longer than the age.
     pub n_above: usize,
-    /// Always `truncate_inverse_cdf`.
+    /// [`CONDITIONING_TRUNCATE`], or — a stall-aware heuristic's answer for an
+    /// item older than its history (#10210) — [`CONDITIONING_RESIDUAL_LIFE`].
     pub method: String,
 }
+
+/// `conditioning.method`: draws come from the grid above the age.
+pub const CONDITIONING_TRUNCATE: &str = "truncate_inverse_cdf";
+
+/// `conditioning.method` when the item has outlived its stage history
+/// (#10210): the remaining time in the stage is drawn from the residual-life
+/// tail `P(R ≤ x) = x / (x + age)` (the item is as likely to be at any point
+/// of its total duration), not from the grid, so its median is the age
+/// itself. Draws are capped at the tail's p95 point, `19 × age`. The result
+/// carries `tail_extrapolated: true`.
+pub const CONDITIONING_RESIDUAL_LIFE: &str = "residual_life_tail";
+
+/// The highest uniform a residual-life draw reads: the `19 × age` cap.
+pub const RESIDUAL_LIFE_U_CAP: f64 = 0.95;
 
 /// Branch probabilities.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -467,6 +490,13 @@ pub struct EstimateResult {
     /// schema bump.
     #[serde(default)]
     pub stage_marks: Vec<StageMark>,
+    /// The current stage outlived its history and was answered with the
+    /// residual-life tail ([`CONDITIONING_RESIDUAL_LIFE`]) instead of a
+    /// `beyond_history` refusal (#10210). Scoring and the backtest bucket
+    /// these apart, so a tail guess never hides inside the ordinary accuracy
+    /// numbers. Absent (`false`) on every other estimate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tail_extrapolated: bool,
 }
 
 /// What dominates the result, per stage.

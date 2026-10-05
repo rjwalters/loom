@@ -35,6 +35,8 @@ fn estimate() -> EtaEstimateRecord {
         features_omitted: Vec::new(),
         provenance: provenance(),
         dispatch: None,
+        stalls: Vec::new(),
+        held: None,
     };
     // No history: a refusal, which must carry provenance all the same.
     EtaEstimateRecord {

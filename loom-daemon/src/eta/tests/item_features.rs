@@ -50,6 +50,7 @@ impl H {
             refresh_secs: 0,
             host_id: Some("host-test"),
             repo_ids: &self.repo_ids,
+            stalls: &super::NO_STALLS,
         };
         self.tracker
             .estimate(None, &ctx, t(secs))
