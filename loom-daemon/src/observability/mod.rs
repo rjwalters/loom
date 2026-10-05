@@ -1197,7 +1197,11 @@ pub fn spawn_task(
             host_id.clone(),
         ));
     } else {
-        ops_handles.extend(eta_fit::spawn_task(workspace_root.clone()));
+        ops_handles.extend(eta_fit::spawn_task(
+            workspace_root.clone(),
+            otlp_queues.clone(),
+            host_id.clone(),
+        ));
     }
     // Live agent output (#9764): `session.output` is OTLP-only too, and
     // additionally opt-in — `spawn_task` returns `None` unless

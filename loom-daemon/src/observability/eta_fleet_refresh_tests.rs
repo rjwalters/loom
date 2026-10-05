@@ -933,19 +933,20 @@ fn a_fresh_hosts_first_cycle_feeds_todays_fit() {
     assert_eq!(outcome.report.repos[0].stop, StopReason::Complete);
     assert!(!outcome.fit_held);
     let fitter = run::current_fitter();
-    let FitCheck::Wrote(path) = after_cycle(root, now(), outcome.fit_held, true, &fitter) else {
+    let FitCheck::Wrote(report) = after_cycle(root, now(), outcome.fit_held, true, &fitter) else {
         panic!("today's fit is due on a snapshot as of now");
     };
+    let path = report.path.clone();
     assert!(path.exists());
     assert_eq!(
         path,
         crate::eta::fit::coeffs::fit_dir(root)
             .join(crate::eta::fit::coeffs::path_for(run::midnight(now())))
     );
-    assert_eq!(
+    assert!(matches!(
         after_cycle(root, now() + Span::hours(1), false, true, &fitter),
-        FitCheck::NotDue
-    );
+        FitCheck::Skipped(crate::eta::fit::run::FitSkip::TodayExists { .. })
+    ));
 }
 
 #[test]

@@ -164,6 +164,8 @@ pub mod auto_update_tick;
 /// `eta.estimate` / `eta.outcome` (#9289).
 pub mod eta;
 
+/// `eta.fit` (#10391).
+pub mod eta_fit;
 /// `eta.fleet_refresh` (#10263).
 pub mod eta_fleet_refresh;
 
@@ -389,6 +391,12 @@ macro_rules! telemetry_kind_table {
             /// and target versions, defer reason, drain state. OTLP-only. See
             /// [`auto_update_tick`].
             AutoUpdateTick = "auto_update.tick" => $crate::telemetry::kinds::auto_update_tick::AutoUpdateTickRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One daily-fit check, whether it fitted or skipped (Issue
+            /// #10391). OTLP-only, like the other `eta.*` log kinds. See
+            /// [`eta_fit`].
+            EtaFit = "eta.fit" => $crate::telemetry::kinds::eta_fit::EtaFitRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

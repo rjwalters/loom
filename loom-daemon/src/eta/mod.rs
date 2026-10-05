@@ -97,6 +97,8 @@
 pub mod backtest;
 pub mod calibration_log;
 pub mod config;
+pub mod doctor;
+pub mod doctor_facts;
 pub mod emit;
 pub mod episodes;
 pub mod explanation;
@@ -118,6 +120,7 @@ pub mod fleet_state;
 pub mod fleet_state_prs;
 pub mod friction;
 pub mod grid;
+pub mod health;
 pub mod heuristics;
 pub mod history;
 pub mod journal;

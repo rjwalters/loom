@@ -46,6 +46,8 @@ pub struct StageReport {
     pub rows: usize,
     /// Rows whose exit label is `true`.
     pub exits: usize,
+    /// Rows whose exit label is censored (`exit == None`, #10391).
+    pub exit_censored: usize,
     /// Rows whose merge label is an observed merge.
     pub merge_events: usize,
     /// The stage has a fitted exit hazard.
@@ -63,6 +65,16 @@ pub struct FitReport {
     pub as_of: DateTime<Utc>,
     /// The data horizon `H` (`window.data_through`).
     pub data_through: DateTime<Utc>,
+    /// The training window's start (`window.start`, #10391).
+    pub window_start: DateTime<Utc>,
+    /// The training window's length in days (#10391).
+    pub window_days: i64,
+    /// Each snapshot's repo and `as_of` (#10391).
+    pub snapshot_as_of: BTreeMap<String, DateTime<Utc>>,
+    /// Size in bytes of the coefficient file as serialized (#10391).
+    pub coeff_bytes: usize,
+    /// Lowercase hex sha256 of those bytes (#10391).
+    pub coeff_sha256: String,
     /// Where the file was (or, on a dry run, would have been) written.
     pub path: PathBuf,
     /// Whether it was written.
@@ -190,16 +202,26 @@ fn fit_loaded(
         let stage = stages.entry(row.stage).or_default();
         stage.rows += 1;
         stage.exits += usize::from(row.exit == Some(true));
+        stage.exit_censored += usize::from(row.exit.is_none());
         stage.merge_events += usize::from(row.merge.merged);
     }
     for (stage, report) in &mut stages {
         report.hazard = file.hazard.contains_key(stage);
         report.aft = file.aft.as_ref().is_some_and(|a| a.stages.contains(stage));
     }
+    let bytes = coeffs::to_json(&file);
     Ok(FitReport {
         id: file.id.clone(),
         as_of,
         data_through: assembled.data_through,
+        window_start: file.window.start,
+        window_days: file.window.days,
+        snapshot_as_of: snapshots
+            .iter()
+            .map(|s| (s.repo.clone(), s.as_of))
+            .collect(),
+        coeff_bytes: bytes.len(),
+        coeff_sha256: sha256_hex(bytes.as_bytes()),
         path,
         written: !dry_run,
         snapshots: snapshots.len(),
@@ -259,17 +281,94 @@ pub fn due(
     (*oldest >= today || now >= today + Duration::hours(STALE_GRACE_HOURS)).then_some(today)
 }
 
-/// The daily refit: fit and write today's file when [`due`], else `None`.
+/// Lowercase hex sha256 of `bytes`.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Why a fit check did not fit (#10391). The closed vocabulary's
+/// `disabled` and `held` belong to the callers that know them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FitSkip {
+    /// Today's coefficient file already exists.
+    TodayExists {
+        /// Its content id.
+        fit_id: String,
+    },
+    /// No fleet snapshot under the root.
+    NoSnapshots,
+    /// The snapshots are stale and the grace period is not over.
+    StaleBeforeGrace {
+        /// The oldest snapshot's `as_of`.
+        oldest_as_of: DateTime<Utc>,
+        /// The newest snapshot's `as_of`.
+        newest_as_of: DateTime<Utc>,
+        /// When the grace period ends and the fit runs anyway.
+        grace_at: DateTime<Utc>,
+        /// Snapshots read.
+        snapshots: usize,
+    },
+}
+
+impl FitSkip {
+    /// The closed-vocabulary reason string.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            FitSkip::TodayExists { .. } => "today_exists",
+            FitSkip::NoSnapshots => "no_snapshots",
+            FitSkip::StaleBeforeGrace { .. } => "stale_before_grace",
+        }
+    }
+}
+
+/// What one fit check did (#10391).
+#[derive(Debug)]
+pub enum FitCheckOutcome {
+    /// Today's file was written.
+    Wrote(Box<FitReport>),
+    /// The fit failed.
+    Failed(anyhow::Error),
+    /// Nothing to do, and why.
+    Skipped(FitSkip),
+}
+
+/// The daily fit check with its outcome told apart: [`refit_if_due`]'s logic,
+/// naming each of the three ways it can do nothing.
 #[must_use]
-pub fn refit_if_due(root: &Path, now: DateTime<Utc>, fitter: &Fitter) -> Option<Result<FitReport>> {
+pub fn refit_check(root: &Path, now: DateTime<Utc>, fitter: &Fitter) -> FitCheckOutcome {
     let today = midnight(now);
-    let today_exists = coeffs::read(&coeffs::fit_dir(root).join(coeffs::path_for(today))).is_some();
-    if today_exists {
+    if let Some(file) = coeffs::read(&coeffs::fit_dir(root).join(coeffs::path_for(today))) {
         // Skip reading the snapshots at all.
-        return None;
+        return FitCheckOutcome::Skipped(FitSkip::TodayExists { fit_id: file.id });
     }
     let snapshots = fleet::load_all(root);
     let as_ofs: Vec<DateTime<Utc>> = snapshots.iter().map(|s| s.as_of).collect();
-    let at = due(now, today_exists, &as_ofs)?;
-    Some(fit_loaded(root, &snapshots, at, None, false, fitter))
+    let (Some(oldest), Some(newest)) = (as_ofs.iter().min().copied(), as_ofs.iter().max().copied())
+    else {
+        return FitCheckOutcome::Skipped(FitSkip::NoSnapshots);
+    };
+    let Some(at) = due(now, false, &as_ofs) else {
+        return FitCheckOutcome::Skipped(FitSkip::StaleBeforeGrace {
+            oldest_as_of: oldest,
+            newest_as_of: newest,
+            grace_at: today + Duration::hours(STALE_GRACE_HOURS),
+            snapshots: snapshots.len(),
+        });
+    };
+    match fit_loaded(root, &snapshots, at, None, false, fitter) {
+        Ok(report) => FitCheckOutcome::Wrote(Box::new(report)),
+        Err(e) => FitCheckOutcome::Failed(e),
+    }
+}
+
+/// The daily refit: fit and write today's file when [`due`], else `None`.
+#[must_use]
+pub fn refit_if_due(root: &Path, now: DateTime<Utc>, fitter: &Fitter) -> Option<Result<FitReport>> {
+    match refit_check(root, now, fitter) {
+        FitCheckOutcome::Wrote(report) => Some(Ok(*report)),
+        FitCheckOutcome::Failed(e) => Some(Err(e)),
+        FitCheckOutcome::Skipped(_) => None,
+    }
 }

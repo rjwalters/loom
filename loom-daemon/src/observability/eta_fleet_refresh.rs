@@ -89,6 +89,7 @@ use std::time::Duration;
 use chrono::{DateTime, TimeZone, Utc};
 
 use super::cycle_guard::{CycleGuard, CycleTick};
+pub use super::eta_fit::FitCheck;
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::eta::config::{EtaConfig, FleetRefreshConfig};
 use crate::eta::fit::{run, Fitter};
@@ -451,8 +452,20 @@ fn run_production_cycle(
         let repos: Vec<String> = targets.iter().map(|t| t.repo.clone()).collect();
         signoz_cycle(root, &repos, &config.signoz, Utc::now());
     }
+    crate::eta::health::write_refresh_cycle(root, &cycle_state(&ticked, now, config.interval_secs));
     // After the records: a fit that panics must not cost the cycle's telemetry.
-    after_cycle(root, Utc::now(), ticked.fit_held, fit_enabled, fitter);
+    let fit_started = Utc::now();
+    let began = std::time::Instant::now();
+    let check = after_cycle(root, fit_started, ticked.fit_held, fit_enabled, fitter);
+    super::eta_fit::finish(
+        root,
+        sink,
+        host_id,
+        super::eta_fit::Trigger::FleetRefresh,
+        fit_started,
+        began.elapsed(),
+        &check,
+    );
 }
 
 /// Refresh every repo's SigNoz in-sweep snapshot (#9758) through the
@@ -804,28 +817,12 @@ fn sync_events_from(
     }
 }
 
-/// What the end-of-cycle fit check did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FitCheck {
-    /// `autonomous.eta.fit.enabled` is off.
-    Disabled,
-    /// A backfill is in progress and younger than
-    /// [`fleet_refresh::FIT_HOLD_HOURS`] ([`fleet_refresh::fit_held`]).
-    Held,
-    /// `refit_if_due` had nothing to do (today's file exists, no snapshot, or
-    /// stale snapshots before the grace).
-    NotDue,
-    /// Today's coefficient file was written.
-    Wrote(PathBuf),
-    /// The fit failed; the next cycle retries.
-    Failed(String),
-}
-
-/// The daily fit check (#10245's [`run::refit_if_due`]), run at the end of
+/// The daily fit check (#10245's [`run::refit_check`]), run at the end of
 /// every cycle in the same blocking call, so the fit always sees this cycle's
 /// snapshots. With fleet refresh on this replaces #10245's standalone refit
-/// task ([`owns_fit`]); `refit_if_due`'s own `due` gate still decides whether
-/// today's file is written.
+/// task ([`owns_fit`]); `refit_check`'s own `due` gate still decides whether
+/// today's file is written. The caller turns the outcome into the cycle's one
+/// `eta.fit` record ([`super::eta_fit::finish`], #10391).
 pub fn after_cycle(
     workspace_root: &Path,
     now: DateTime<Utc>,
@@ -843,25 +840,60 @@ pub fn after_cycle(
         );
         return FitCheck::Held;
     }
-    match run::refit_if_due(workspace_root, now, fitter) {
-        None => FitCheck::NotDue,
-        Some(Ok(report)) => {
-            log::info!(
-                "eta fit: wrote {} (id={}, data_through={}, dwells={}, dropped missing={} \
-                 no_flags={}) after a fleet refresh cycle",
-                report.path.display(),
-                report.id,
-                report.data_through.to_rfc3339(),
-                report.dwells,
-                report.rows_dropped_missing,
-                report.rows_dropped_no_flags
-            );
-            FitCheck::Wrote(report.path)
+    let check = super::eta_fit::run_check(workspace_root, now, fitter);
+    match &check {
+        FitCheck::Wrote(report) => log::info!(
+            "eta fit: wrote {} (id={}, data_through={}, dwells={}, dropped missing={} \
+             no_flags={}) after a fleet refresh cycle",
+            report.path.display(),
+            report.id,
+            report.data_through.to_rfc3339(),
+            report.dwells,
+            report.rows_dropped_missing,
+            report.rows_dropped_no_flags
+        ),
+        FitCheck::Failed(e) => log::warn!("eta fit: daily refit failed, retrying next cycle: {e}"),
+        FitCheck::Panicked => {
+            log::warn!("eta fit: daily refit panicked, retrying next cycle (ETA fit only)");
         }
-        Some(Err(e)) => {
-            log::warn!("eta fit: daily refit failed, retrying next cycle: {e:#}");
-            FitCheck::Failed(format!("{e:#}"))
+        _ => {}
+    }
+    check
+}
+
+/// The tick's `refresh-cycle.json` state (#10391): written on every tick,
+/// stand-down included.
+#[must_use]
+pub fn cycle_state(
+    ticked: &Tick,
+    started_at: DateTime<Utc>,
+    interval_secs: u64,
+) -> crate::eta::health::RefreshCycleState {
+    use crate::eta::health::{RefreshCycleState, RefreshRepo};
+    let (gate, captain) = match &ticked.gate {
+        RefreshGate::Captain => ("captain", None),
+        RefreshGate::NoCaptain => ("no_captain", None),
+        RefreshGate::StandDown { captain } => ("stand_down", Some(captain.clone())),
+    };
+    let mut stop_reasons: BTreeMap<String, u64> = BTreeMap::new();
+    let mut repos = Vec::new();
+    if let Some(outcome) = &ticked.outcome {
+        for r in &outcome.report.repos {
+            *stop_reasons.entry(r.stop.as_str().to_string()).or_default() += 1;
+            repos.push(RefreshRepo {
+                repo: r.repo.clone(),
+                stop_reason: r.stop.as_str().to_string(),
+                as_of: r.as_of,
+            });
         }
+    }
+    RefreshCycleState {
+        started_at,
+        gate: gate.to_string(),
+        captain,
+        interval_secs,
+        stop_reasons,
+        repos,
     }
 }
 

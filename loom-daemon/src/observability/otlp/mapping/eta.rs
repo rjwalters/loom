@@ -1,5 +1,5 @@
 //! OTLP mapping for `eta.estimate` / `eta.outcome` (#9289) and
-//! `eta.fleet_refresh` (#10263).
+//! `eta.fleet_refresh` (#10263) and `eta.fit` (#10391).
 //!
 //! Each is one log record. The **body** is the record's JSON — for an
 //! estimate that is the whole `eta-explanation/v1` explanation — so ClickHouse
@@ -192,6 +192,50 @@ pub(super) fn log_parts(
             }
             let body = serde_json::to_string(r).unwrap_or_default();
             Some(("eta.fleet_refresh", SeverityNumber::Info, nanos(r.started_at), attributes, body))
+        }
+        TelemetryRecord::EtaFit(r) => {
+            // #10391: one fit check; stamped at its start.
+            let to_i64 = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+            let instant = crate::telemetry::trace::instant;
+            let mut attributes = vec![
+                kv_string("loom.eta.fit.check_id", r.check_id.clone()),
+                kv_string("loom.eta.fit.trigger", r.trigger.clone()),
+                kv_string("loom.eta.fit.outcome", r.outcome.clone()),
+                kv_int("loom.eta.fit.snapshots", to_i64(r.snapshots)),
+                kv_int("loom.eta.fit.duration_ms", to_i64(r.duration_ms)),
+            ];
+            provenance(&mut attributes, "loom.eta.", &r.loom);
+            for (key, value) in [
+                ("loom.eta.fit.skip_reason", r.skip_reason.clone()),
+                ("loom.eta.fit.error", r.error.clone()),
+                ("loom.eta.fit.fit_id", r.fit_id.clone()),
+                ("loom.eta.fit.cutoff", r.cutoff.map(instant)),
+                ("loom.eta.fit.window_start", r.window_start.map(instant)),
+                ("loom.eta.fit.data_through", r.data_through.map(instant)),
+                ("loom.eta.fit.snapshot_oldest_as_of", r.snapshot_oldest_as_of.map(instant)),
+                ("loom.eta.fit.snapshot_newest_as_of", r.snapshot_newest_as_of.map(instant)),
+                ("loom.eta.fit.coeff_file", r.coeff_file.clone()),
+                ("loom.eta.fit.coeff_sha256", r.coeff_sha256.clone()),
+            ] {
+                if let Some(value) = value {
+                    attributes.push(kv_string(key, value));
+                }
+            }
+            for (key, value) in [
+                ("loom.eta.fit.window_days", r.window_days),
+                ("loom.eta.fit.rows_total", r.rows_total.map(to_i64)),
+                ("loom.eta.fit.rows_censored", r.rows_censored.map(to_i64)),
+                ("loom.eta.fit.rows_dropped_missing", r.rows_dropped_missing.map(to_i64)),
+                ("loom.eta.fit.rows_dropped_no_flags", r.rows_dropped_no_flags.map(to_i64)),
+                ("loom.eta.fit.rows_star_unknown", r.rows_star_unknown.map(to_i64)),
+                ("loom.eta.fit.dwells", r.dwells.map(to_i64)),
+                ("loom.eta.fit.pruned", r.pruned.map(to_i64)),
+                ("loom.eta.fit.coeff_bytes", r.coeff_bytes.map(to_i64)),
+            ] {
+                opt_int(&mut attributes, key, value);
+            }
+            let body = serde_json::to_string(r).unwrap_or_default();
+            Some(("eta.fit", SeverityNumber::Info, nanos(r.started_at), attributes, body))
         }
         _ => None,
     }
@@ -468,5 +512,78 @@ mod tests {
         };
         let parsed: EtaFleetRefreshRecord = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed, fleet);
+    }
+
+    #[test]
+    fn an_eta_fit_record_emits_every_fit_key_and_only_allowlisted_ones() {
+        use crate::telemetry::kinds::eta::ETA_LOG_ATTRIBUTE_KEYS;
+        use crate::telemetry::kinds::eta_fit::{EtaFitRecord, EtaFitStage};
+        let at = Utc.with_ymd_and_hms(2026, 10, 5, 1, 0, 0).unwrap();
+        let fit = EtaFitRecord {
+            check_id: "0123456789abcdef".to_string(),
+            trigger: "fleet_refresh".to_string(),
+            started_at: at,
+            outcome: "written".to_string(),
+            skip_reason: Some("none-but-present-for-the-test".to_string()),
+            error: Some("boom".to_string()),
+            fit_id: Some("feedface".to_string()),
+            cutoff: Some(at),
+            window_start: Some(at),
+            window_days: Some(28),
+            data_through: Some(at),
+            snapshots: 2,
+            snapshot_oldest_as_of: Some(at),
+            snapshot_newest_as_of: Some(at),
+            snapshot_as_of: [("rjwalters/loom".to_string(), at)].into(),
+            stages: [(
+                "review_wait".to_string(),
+                EtaFitStage {
+                    rows: 5,
+                    exits: 2,
+                    exit_censored: 1,
+                    merge_events: 3,
+                    merge_censored: 2,
+                    hazard: true,
+                    aft: false,
+                },
+            )]
+            .into(),
+            rows_total: Some(5),
+            rows_censored: Some(1),
+            rows_dropped_missing: Some(0),
+            rows_dropped_no_flags: Some(0),
+            rows_star_unknown: Some(0),
+            dwells: Some(4),
+            pruned: Some(0),
+            coeff_file: Some("fit-20261005T000000Z.json".to_string()),
+            coeff_bytes: Some(1234),
+            coeff_sha256: Some("ab".repeat(32)),
+            duration_ms: 12,
+            loom: record().explanation.loom.clone(),
+        };
+        let envelope = TelemetryEnvelope::new("host", TelemetryRecord::EtaFit(fit.clone()));
+        let log = log_record_for(&envelope).unwrap();
+        assert_eq!(log.event_name, "eta.fit");
+        assert_eq!(log.time_unix_nano, super::nanos(at));
+        for kv in &log.attributes {
+            assert!(
+                ETA_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
+                    || ["loom.repo", "loom.record_id"].contains(&kv.key.as_str()),
+                "{} is not allowlisted",
+                kv.key
+            );
+        }
+        for key in ETA_LOG_ATTRIBUTE_KEYS
+            .iter()
+            .filter(|k| k.starts_with("loom.eta.fit."))
+        {
+            assert!(attr(&log, key).is_some(), "{key} is emitted");
+        }
+        assert_eq!(attr(&log, "loom.eta.fit.rows_total"), Some(Value::IntValue(5)));
+        let Some(Value::StringValue(body)) = log.body.as_ref().and_then(|b| b.value.clone()) else {
+            panic!("string body");
+        };
+        let parsed: EtaFitRecord = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed, fit);
     }
 }

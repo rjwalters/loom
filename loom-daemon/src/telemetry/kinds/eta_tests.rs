@@ -66,7 +66,12 @@ fn outcome() -> EtaOutcomeRecord {
 #[test]
 fn both_eta_kinds_are_registered_otlp_logs_only() {
     // `eta.fleet_refresh` (#10263) shares the routing.
-    for kind in ["eta.estimate", "eta.outcome", "eta.fleet_refresh"] {
+    for kind in [
+        "eta.estimate",
+        "eta.outcome",
+        "eta.fleet_refresh",
+        "eta.fit",
+    ] {
         let meta = TELEMETRY_KINDS
             .iter()
             .find(|m| m.kind == kind)

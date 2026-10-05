@@ -38,6 +38,7 @@ mod duplicate_scan;
 mod eta_backtest_cases;
 mod eta_backtest_render;
 mod eta_cmd;
+mod eta_doctor_cmd;
 mod eta_fit_cmd;
 mod eta_fleet_cmd;
 mod eta_fleet_events_cmd;
