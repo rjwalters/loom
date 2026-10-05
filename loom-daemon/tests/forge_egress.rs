@@ -149,6 +149,10 @@ fn run_row(
         gh_host: env_get("GH_HOST"),
         gh_repo: env_get("GH_REPO"),
         gh_config_dir,
+        // The fixture's single `gh.path` is 2am's one observed `gh` — the
+        // PATH `gh`, which in 2am is also what runs. Loom splits the two
+        // (#9995); a fixture row describes a host where they coincide.
+        path_gh: gh_path.clone(),
         gh: GhBuild {
             path: gh_path,
             version,
@@ -284,6 +288,10 @@ impl Sandbox {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // PATH's `gh` (what `toolchain.launcher-not-first` measures) is
+            // the same fake, so the verdict never depends on this host's PATH.
+            std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+            std::os::unix::fs::symlink(&gh, dir.path().join("bin/gh")).unwrap();
         }
         Self { dir }
     }
@@ -298,11 +306,20 @@ impl Sandbox {
             .args(args)
             .current_dir(self.path())
             .env_clear();
-        c.env("PATH", std::env::var("PATH").unwrap_or_default())
+        c.env("PATH", self.path_env())
             .env("HOME", self.path().join("home"))
             .env("LOOM_GH_BIN", self.path().join("gh"))
+            // A host machine policy's launcher must never outrank the fake.
+            .env("LOOM_GH_NO_POLICY_LAUNCHER", "1")
             .env("LOOM_SOCKET_PATH", self.path().join("loom-daemon.sock"));
         c
+    }
+
+    /// `PATH` with the sandbox's `bin/` first.
+    fn path_env(&self) -> std::ffi::OsString {
+        let mut dirs = vec![self.path().join("bin")];
+        dirs.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+        std::env::join_paths(dirs).unwrap()
     }
 
     fn policy(&self, mutate: impl FnOnce(&mut Value)) -> PathBuf {
@@ -479,4 +496,89 @@ fn spawn_worker_refuses_on_a_failing_assert_under_required() {
     assert!(stderr.contains("forge-egress"), "{stderr}");
     assert!(stderr.contains("policy.schema-version"), "{stderr}");
     assert!(!spawned.exists(), "no worker may be spawned");
+}
+
+/// #9995: once the daemon execs the policy launcher itself, the version floor
+/// measures that launcher while `toolchain.launcher-not-first` still measures
+/// the `gh` agents get from PATH.
+#[test]
+#[cfg(unix)]
+fn launcher_not_first_measures_path_even_when_the_daemon_execs_the_launcher() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new();
+    // PATH's gh: an unmanaged, below-floor build that is NOT the launcher.
+    let unmanaged = sb.path().join("bin/gh");
+    std::fs::remove_file(&unmanaged).unwrap();
+    std::fs::write(&unmanaged, "#!/bin/sh\necho 'gh version 2.97.0 (unmanaged)'\n").unwrap();
+    std::fs::set_permissions(&unmanaged, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = sb.policy(|_| {});
+    let out = sb
+        .cmd(&["doctor", "--json"])
+        // No override: the exec target can only come from the policy rung.
+        .env_remove("LOOM_GH_BIN")
+        .env_remove("LOOM_GH_NO_POLICY_LAUNCHER")
+        .env("LOOM_FORGE_EGRESS_POLICY", &path)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let routing = report["routing"]["findings"].to_string();
+    assert!(routing.contains("toolchain.launcher-not-first"), "{report:#}");
+    assert!(
+        !routing.contains("toolchain.below-api-host-floor"),
+        "the floor measures the exec target (the launcher), not PATH's gh: {report:#}"
+    );
+    let launcher = sb.path().join("gh").display().to_string();
+    assert_eq!(report["observed"]["ghPath"], launcher.as_str(), "{report:#}");
+    assert_eq!(report["observed"]["ghVersion"], "2.102.0");
+    assert_eq!(report["observed"]["pathGhPath"], unmanaged.display().to_string().as_str());
+    assert_eq!(out.status.code(), Some(1));
+}
+
+/// #9995 review: `LOOM_GH_NO_POLICY_LAUNCHER=1` — the seam every gh-stubbing
+/// harness sets — makes `LOOM_GH_BIN` win over an existing policy launcher.
+/// The daemon really execs the winner (`gh --version`), so the reported version
+/// proves which binary ran.
+#[test]
+#[cfg(unix)]
+fn no_policy_launcher_opt_out_makes_the_stub_win_over_the_launcher() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new();
+    let stub = sb.path().join("stub-gh");
+    std::fs::write(&stub, "#!/bin/sh\necho 'gh version 2.99.0 (stub)'\n").unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The policy's launcherPath is the sandbox's `gh` (2.102.0), and it exists.
+    let path = sb.policy(|_| {});
+    let launcher = sb.path().join("gh").display().to_string();
+    let observed = |opt_out: Option<&str>| {
+        let mut c = sb.cmd(&["doctor", "--json"]);
+        c.env("LOOM_GH_BIN", &stub)
+            .env("LOOM_FORGE_EGRESS_POLICY", &path);
+        match opt_out {
+            Some(v) => c.env("LOOM_GH_NO_POLICY_LAUNCHER", v),
+            None => c.env_remove("LOOM_GH_NO_POLICY_LAUNCHER"),
+        };
+        let out = c.output().unwrap();
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let routing = report["routing"]["findings"].to_string();
+        (report["observed"].clone(), routing)
+    };
+    let declined = "toolchain.policy-launcher-declined";
+
+    let (o, routing) = observed(Some("1"));
+    assert_eq!(o["ghPath"], stub.display().to_string().as_str(), "{o:#}");
+    assert_eq!(o["ghVersion"], "2.99.0", "the stub is what ran: {o:#}");
+    assert_eq!(o["ghSource"], "env_override", "{o:#}");
+    // PATH's gh is the launcher, so only the exec-target finding can see this.
+    assert!(routing.contains(declined), "the declined rung is reported: {routing}");
+    assert!(!routing.contains("toolchain.launcher-not-first"), "{routing}");
+
+    // Without the opt-out (or with any value but `1`) the launcher outranks
+    // LOOM_GH_BIN.
+    for opt_out in [None, Some("0")] {
+        let (o, routing) = observed(opt_out);
+        assert!(!routing.contains(declined), "{opt_out:?}: {routing}");
+        assert_eq!(o["ghPath"], launcher.as_str(), "{opt_out:?}: {o:#}");
+        assert_eq!(o["ghVersion"], "2.102.0", "{opt_out:?}: {o:#}");
+        assert_eq!(o["ghSource"], "policy", "{opt_out:?}: {o:#}");
+    }
 }

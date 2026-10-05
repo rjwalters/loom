@@ -111,8 +111,11 @@ pub fn gh_stub_path() -> &'static Path {
 /// Point a spawned daemon's `LOOM_GH_BIN` at [`gh_stub_path`] so it can never
 /// reach the real `gh` (#10088). A later `.env("LOOM_GH_BIN", ..)` on the same
 /// command overrides it, as does a caller-set value in the parent environment.
+/// Always declines the forge-egress policy-launcher rung (#9995), which would
+/// otherwise outrank `LOOM_GH_BIN` on a host carrying an egress policy.
 #[allow(dead_code)]
 pub fn deny_real_gh(cmd: &mut Command) {
+    cmd.env("LOOM_GH_NO_POLICY_LAUNCHER", "1");
     if std::env::var_os("LOOM_GH_BIN").is_none() {
         cmd.env("LOOM_GH_BIN", gh_stub_path());
     }

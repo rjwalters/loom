@@ -29,13 +29,35 @@ pub struct ProbeOptions {
 }
 
 /// The `gh` Loom will actually exec: the program the spawn choke point's
-/// resolver picks ([`crate::gh_invocation::resolver::resolve`] —
-/// `$LOOM_GH_BIN`, else `gh`), resolved on `PATH` when bare. Not
-/// `command -v gh` in some other shell. Single-sourced so the validator and
-/// every facade spawn agree by construction.
+/// resolver picks ([`crate::gh_invocation::resolver::resolve`] — the policy
+/// launcher, else `$LOOM_GH_BIN`, else `gh`), resolved on `PATH` when bare.
+/// Not `command -v gh` in some other shell. Single-sourced so the validator
+/// and every facade spawn agree by construction. Feeds the version floor.
 #[must_use]
 pub fn effective_gh_path() -> Option<PathBuf> {
-    let name = PathBuf::from(crate::gh_invocation::resolver::resolve().program);
+    which(&crate::gh_invocation::resolver::resolve().program)
+}
+
+/// [`effective_gh_path`] plus the rung that produced it, from ONE resolution
+/// so the two can never disagree.
+fn effective_gh() -> (Option<PathBuf>, &'static str) {
+    let resolved = crate::gh_invocation::resolver::resolve();
+    (which(&resolved.program), resolved.source.as_str())
+}
+
+/// The `gh` an agent's plain `gh` resolves to: bare `gh` on `PATH`, never the
+/// resolver (no policy launcher, no `$LOOM_GH_BIN`). Feeds
+/// `toolchain.launcher-not-first`, which asks whether PATH puts the managed
+/// launcher first — a question the daemon's own exec target cannot answer.
+#[must_use]
+pub fn path_gh_path() -> Option<PathBuf> {
+    which("gh")
+}
+
+/// `program` as an existing file: a path with a directory component is
+/// checked as-is; a bare name is looked up on `PATH`.
+fn which(program: &str) -> Option<PathBuf> {
+    let name = PathBuf::from(program);
     if name.as_os_str().is_empty() {
         return None;
     }
@@ -375,13 +397,16 @@ pub fn observe(doc: &PolicyDoc, workspace: &Path, opts: ProbeOptions) -> Observe
         .filter(|p| profile_holds_token(&p.path))
         .map(|p| p.path.clone())
         .collect();
+    let (exec_gh, gh_source) = effective_gh();
     Observed {
         token_profiles,
         git_helper_is_gh: git_helper_is_gh(workspace),
         gh_host: env_nonempty("GH_HOST"),
         gh_repo: env_nonempty("GH_REPO"),
         gh_config_dir,
-        gh: gh_build(effective_gh_path()),
+        gh: gh_build(exec_gh),
+        path_gh: path_gh_path(),
+        gh_source: Some(gh_source),
         launcher_exists: !launcher.is_empty() && Path::new(launcher).exists(),
         profiles,
         git_rewrites: git_rewrites(workspace, logical),

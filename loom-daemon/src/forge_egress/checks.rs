@@ -34,6 +34,7 @@ pub const LOOM_ONLY_CODES: &[&str] = &[
     "apiconfig.github-token-present",
     "git.credential-from-api-profile",
     "runtime.bypass-open",
+    "toolchain.policy-launcher-declined",
     "telemetry.loom-exporter-not-otlp",
 ];
 
@@ -61,7 +62,8 @@ pub fn api_host_supported(version: Option<Version>, policy: &Value) -> bool {
 /// The effective `gh` build — the binary Loom will actually exec.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GhBuild {
-    /// Resolved path (`$LOOM_GH_BIN`, else `gh` on `PATH`), if any.
+    /// Resolved exec target (the `gh_invocation` resolver's ladder: policy
+    /// launcher, else `$LOOM_GH_BIN`, else `gh` on `PATH`), if any.
     pub path: Option<PathBuf>,
     pub version: Option<Version>,
     /// The first line of `gh --version` (non-secret).
@@ -134,7 +136,18 @@ pub struct Observed {
     pub gh_repo: Option<String>,
     /// The exported `GH_CONFIG_DIR`, if any.
     pub gh_config_dir: Option<PathBuf>,
+    /// The `gh` Loom itself execs — what the version floor measures.
     pub gh: GhBuild,
+    /// The `gh` an agent's plain `gh` resolves to: bare `gh` on `PATH`,
+    /// bypassing the resolver. What `toolchain.launcher-not-first` measures
+    /// (2am semantics) — kept apart from [`Self::gh`] because once the daemon
+    /// execs the policy launcher directly (#9995), the exec target says
+    /// nothing about what agents' shells run.
+    pub path_gh: Option<PathBuf>,
+    /// Which resolver rung produced [`Self::gh`] (`policy`, `env_override`,
+    /// `path`) — report-only, so a declined policy rung
+    /// (`LOOM_GH_NO_POLICY_LAUNCHER`) is visible.
+    pub gh_source: Option<&'static str>,
     /// Whether `toolchain.launcherPath` exists on this host.
     pub launcher_exists: bool,
     /// Every active profile, in check order (env/default first).
@@ -322,7 +335,7 @@ pub fn assert_toolchain(policy: &Value, obs: &Observed) -> Vec<Finding> {
     }
     let launcher = dig_str(policy, &["toolchain", "launcherPath"]);
     if !launcher.is_empty() {
-        if let Some(resolved) = &obs.gh.path {
+        if let Some(resolved) = &obs.path_gh {
             if !same_path(resolved, Path::new(launcher)) {
                 let f = Finding::new(
                     "toolchain.launcher-not-first",
@@ -342,8 +355,47 @@ pub fn assert_toolchain(policy: &Value, obs: &Observed) -> Vec<Finding> {
                 });
             }
         }
+        if let Some(f) = policy_launcher_declined(launcher, obs) {
+            findings.push(f);
+        }
     }
     findings
+}
+
+/// `toolchain.policy-launcher-declined` (#9995, Loom-only): the managed
+/// launcher exists, yet the `gh` the daemon itself execs is something else
+/// that `toolchain.launcher-not-first` does not see — typically `$LOOM_GH_BIN`
+/// with the policy rung declined (`LOOM_GH_NO_POLICY_LAUNCHER=1`) or with a
+/// policy whose origin may not choose the executable. When the exec target IS
+/// PATH's `gh`, `launcher-not-first` already reports it, so this stays quiet
+/// (which also keeps the 2am lockstep rows, where the two coincide, unchanged).
+fn policy_launcher_declined(launcher: &str, obs: &Observed) -> Option<Finding> {
+    if !obs.launcher_exists {
+        return None;
+    }
+    let exec = obs.gh.path.as_ref()?;
+    if same_path(exec, Path::new(launcher))
+        || obs.path_gh.as_ref().is_some_and(|p| same_path(exec, p))
+    {
+        return None;
+    }
+    Some(
+        Finding::new(
+            "toolchain.policy-launcher-declined",
+            "the gh the daemon execs is the managed launcher",
+        )
+        .expected(launcher)
+        .observed(format!(
+            "{} (resolver rung: {})",
+            exec.display(),
+            obs.gh_source.unwrap_or("unknown")
+        ))
+        .source("gh_invocation resolver")
+        .remedy(
+            "unset LOOM_GH_NO_POLICY_LAUNCHER / LOOM_GH_BIN in the daemon's environment so the \
+             policy launcher is the exec target (both are test seams, not production knobs)",
+        ),
+    )
 }
 
 /// The EFFECTIVE config profiles — enumeration (2am) plus the routing setting
