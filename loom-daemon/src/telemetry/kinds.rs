@@ -391,6 +391,8 @@ macro_rules! telemetry_kind_table {
             /// and target versions, defer reason, drain state. OTLP-only. See
             /// [`auto_update_tick`].
             AutoUpdateTick = "auto_update.tick" => $crate::telemetry::kinds::auto_update_tick::AutoUpdateTickRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
             /// One daily-fit check, whether it fitted or skipped (Issue
             /// #10391). OTLP-only, like the other `eta.*` log kinds. See
             /// [`eta_fit`].
