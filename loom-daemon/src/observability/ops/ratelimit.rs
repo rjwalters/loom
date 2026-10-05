@@ -389,7 +389,10 @@ fn account(workspace_root: &Path, now: DateTime<Utc>) -> String {
 /// window it describes is still open — a passed reset means its
 /// `remaining` (often 0) is stale and must not be re-exported.
 #[must_use]
-pub fn fresh_fallback(budget: Option<BudgetSnapshot>, now: DateTime<Utc>) -> Option<BudgetSnapshot> {
+pub fn fresh_fallback(
+    budget: Option<BudgetSnapshot>,
+    now: DateTime<Utc>,
+) -> Option<BudgetSnapshot> {
     budget.filter(|b| b.core_reset.min(b.graphql_reset) > now)
 }
 
@@ -409,10 +412,7 @@ pub async fn record(workspace_root: &Path) {
     let root = workspace_root.to_path_buf();
     let sampled = tokio::task::spawn_blocking(move || {
         let budget = crate::rate_limit_breaker::forge::probe_budget(now).or_else(|| {
-            fresh_fallback(
-                crate::rate_limit_breaker::global().and_then(|b| b.last_budget()),
-                now,
-            )
+            fresh_fallback(crate::rate_limit_breaker::global().and_then(|b| b.last_budget()), now)
         })?;
         Some(quota_points(&budget, &account(&root, now)))
     })
