@@ -287,12 +287,15 @@ future reclamation decision's evidence, not the claim's own validity.
   `lease renewer check`: `closed`, a release or a newer owner ends the loop
   even while the interactive parent lives; an unreadable state skips that
   cycle's PATCH and keeps the loop. `release <issue>` ends that key's loop
-  explicitly (idempotent). A daemon predating the verb renews as before. A
+  explicitly (idempotent). A daemon predating the verb renews as before (`start` probes `lease renewer --help` once and then skips the state read, `check` and `claim`, #10348). A daemon-dispatched start (`LOOM_SWEEP_LEASE_RENEW_SOURCE=dispatch`, set by `run_lease_renewal_start`) also skips the state read and passes `--issue-state open`: its watched pid is the sweep child, which already bounds the loop. A
   remote authenticated release marker is not defined.
-- **Budget.** Steady state is three requests per cycle (state read, one
-  non-paginated `?since=` window, one PATCH): 36/h per held lease at the
-  default 300 s, up from 24/h, while loops for closed issues stop instead of
-  renewing until the 4 h / 24 h age cap. Re-list reasons (`full-window`,
+- **Budget.** Per path at the default 300 s (#10348): daemon-dispatched and
+  verb-absent loops make two requests per cycle (one non-paginated `?since=`
+  window, one PATCH), 24/h per held lease. In-session loops with the verb add
+  the state read, three requests per cycle, 36/h, which buys the closed-issue
+  stop on long-lived interactive pids instead of renewing until the 4 h / 24 h
+  age cap. The #10229 SigNoz target is therefore <= 24/h dispatched and
+  verb-absent, 36/h in-session. Re-list reasons (`full-window`,
   `missing-comment`, `patch-404`) are logged and exported as
   `LOOM_LEASE_FALLBACK_REASON` for gh-shim telemetry.
 - **Whose bucket.** Each call asks `loom-daemon forge token` for the host's
