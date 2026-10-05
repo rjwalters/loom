@@ -307,7 +307,9 @@ echo 403 > "$STUB_DIR/app-fail-PATCH"
 OUT="$("$SCRIPT" renew-once 10229 --host y-host --sweep-id y-sweep 2>&1)"
 RC=$?
 assert_eq "0" "$RC" "(z3) a 403 on the App PATCH recovers through the ladder"
-assert_eq "false" "$([[ "$OUT" == *"lease-credential=ambient-fallback"* ]] && echo true || echo false)" "(z3) no wrapper fallback was needed"
+assert_eq "true" "$([[ "$OUT" == *"lease-credential=ambient-fallback"* ]] && echo true || echo false)" "(z3) personal recovery is reported as an ambient fallback"
+assert_eq "PATCH tok=<unset> cred=ambient" "$(grep '^PATCH' "$STUB_DIR/cred.log" | tail -n1 | sed 's/ repos[^ ]*//')" "(z3) the recovered attempt ran on the personal credential, tagged ambient"
+assert_eq "true" "$(grep '^PATCH' "$STUB_DIR/cred.log" | head -n1 | grep -q 'tok=ghs_app.* cred=app' && echo true || echo false)" "(z3) the first attempt ran on the App credential"
 assert_eq "1" "$(patch_n)" "(z3) exactly one PATCH landed"
 
 # (z4) a deleted comment 404s on BOTH credentials -> still recognised as a

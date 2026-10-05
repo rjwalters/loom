@@ -293,11 +293,23 @@ source "$SCRIPT_DIR/lib/forge-helpers.sh"
 lease_gh() {
     local access="$1" tok="" out; shift
     tok="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge token --repo "${LOOM_REPO:-$(_forge_nwo_from_remote || true)}" --access "$access" 2> /dev/null | jq -r 'select(.status == "ok") | .token // empty' 2> /dev/null)" || tok=""
-    if [[ -n "$tok" ]] && out="$(GH_TOKEN="$tok" LOOM_LEASE_CREDENTIAL=app forge_gh_perm_safe "$@" 2> /dev/null)"; then
-        [[ -z "$out" ]] || printf '%s\n' "$out"
-        return 0
+    if [[ -n "$tok" ]]; then
+        local lg_err
+        lg_err="$(mktemp)"
+        if out="$(GH_TOKEN="$tok" LOOM_LEASE_CREDENTIAL=app forge_gh_perm_safe "$@" 2> "$lg_err")"; then
+            # The ladder's personal rungs run (and are tagged) as ambient: a call
+            # that recovered there did not spend the App bucket, so say so.
+            if grep -q 'falling back to' "$lg_err"; then
+                cat "$lg_err" >&2
+                echo "lease-credential=ambient-fallback: the ${access} call recovered on a personal credential after the App attempt (#10229)" >&2
+            fi
+            rm -f "$lg_err"
+            [[ -z "$out" ]] || printf '%s\n' "$out"
+            return 0
+        fi
+        rm -f "$lg_err"
+        echo "lease-credential=ambient-fallback: the ${access} call failed on the App credential (#10229)" >&2
     fi
-    [[ -z "$tok" ]] || echo "lease-credential=ambient-fallback: the ${access} call failed on the App credential (#10229)" >&2
     LOOM_LEASE_CREDENTIAL=ambient forge_gh_perm_safe "$@"
 }
 
@@ -1028,7 +1040,11 @@ cmd_start() {
             pid_is_live "$watch_pid" "$watch_ident" || break
             ! max_age_exceeded "$loop_started_at" "$max_age" || { echo "$cap_msg" >&9; break; }
             gate_rc=0
-            issue_state="$(export LOOM_ROLE=sweep-lease-renew; [[ -z "$sweep_id" ]] || export LOOM_SWEEP_ID="$sweep_id"; lease_gh read api "repos/$(gh_repo_path)/issues/${issue}" --jq .state 2> /dev/null)" || issue_state=""
+            state_err="$(mktemp)"
+            issue_state="$(export LOOM_ROLE=sweep-lease-renew; [[ -z "$sweep_id" ]] || export LOOM_SWEEP_ID="$sweep_id"; lease_gh read api "repos/$(gh_repo_path)/issues/${issue}" --jq .state 2> "$state_err")" || issue_state=""
+            # Keep only the credential-attribution lines of the state read's stderr (#10229).
+            { grep '^lease-credential=' "$state_err" >&2; } 2> /dev/null || true
+            rm -f "$state_err"
             "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer check "${owner_args[@]}" --issue-state "$issue_state" 2>&9 || gate_rc=$?
             ((gate_rc != 3)) || break
             ((gate_rc != 4)) || continue
