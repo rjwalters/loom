@@ -50,3 +50,28 @@ pub(crate) fn pr_merged_at_output(repo: &str, pr: u32) -> Option<Output> {
     .args(["pr", "view", &pr, "--repo", repo, "--json", "mergedAt"])
     .run())
 }
+
+/// `gh run list ...` run from `repo_root` through the facade (#10282), so the
+/// main-health-gate CI probe emits an `invoke github` span. `Ok(stdout)` only
+/// on a zero exit; anything else is `Err(reason)` (the caller maps it to
+/// "unknown", never to a verdict).
+pub(crate) fn run_list_stdout(
+    repo_root: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    let outcome =
+        GhInvocation::new(Operation::new("run.list"), AccessIntent::Read, GhTarget::None, timeout)
+            .args(
+                std::iter::once("run")
+                    .chain(std::iter::once("list"))
+                    .chain(args.iter().copied()),
+            )
+            .current_dir(repo_root)
+            .run();
+    match ran(outcome) {
+        Some(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Some(out) => Err(format!("`gh run list` exited {:?}", out.status.code())),
+        None => Err("`gh run list` did not run (spawn failure or timeout)".to_string()),
+    }
+}

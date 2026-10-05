@@ -1324,8 +1324,6 @@ impl ForgeCiStatus for GhForgeCi {
     fn conclusion_for(&self, repo_root: &Path, sha: &str) -> CiVerdict {
         let limit = CI_PROBE_RUN_LIMIT.to_string();
         let args = [
-            "run",
-            "list",
             "--branch",
             GATE_BRANCH,
             "--limit",
@@ -1333,13 +1331,14 @@ impl ForgeCiStatus for GhForgeCi {
             "--json",
             "headSha,status,conclusion,workflowName",
         ];
-        let stdout = match run_capture_with_timeout("gh", &args, repo_root, CI_PROBE_TIMEOUT) {
-            Ok(s) => s,
-            Err(e) => {
-                log::debug!("main_health_gate: forge CI probe unavailable ({e})");
-                return CiVerdict::Unknown;
-            }
-        };
+        let stdout =
+            match crate::gh_state_probe::run_list_stdout(repo_root, &args, CI_PROBE_TIMEOUT) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::debug!("main_health_gate: forge CI probe unavailable ({e})");
+                    return CiVerdict::Unknown;
+                }
+            };
         parse_gh_run_list(&stdout, sha, self.ci_workflow.as_deref())
     }
 }

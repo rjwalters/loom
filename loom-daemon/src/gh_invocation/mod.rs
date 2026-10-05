@@ -41,6 +41,7 @@
 //! plan).
 
 pub mod accounting;
+pub mod api_kind;
 mod outcome;
 mod reader_route;
 pub mod resolver;

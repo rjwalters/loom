@@ -115,6 +115,9 @@ path = "loom-daemon/src/ci_telemetry/api.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/ci_telemetry/suites.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/gh_state_probe.rs"
 
 [[operation]]
 id = "ci.stale-check-freshness"

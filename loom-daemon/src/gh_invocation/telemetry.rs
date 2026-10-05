@@ -59,6 +59,7 @@ pub const SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "github.exit_code",
     "github.invocation",
     "github.launcher",
+    "github.api",
     "context_source",
 ];
 
@@ -114,6 +115,19 @@ impl Outcome {
         Outcome::CollectFailed,
         Outcome::RoutingRefused,
     ];
+}
+
+/// Which GitHub API surface an invocation uses (#10282): `rest`, `graphql`,
+/// `mixed` (known to use both) or `unknown` — classified per subcommand by
+/// [`super::api_kind::classify`].
+#[must_use]
+pub fn github_api_kind(inv: &GhInvocation) -> &'static str {
+    let args: Vec<String> = inv
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    super::api_kind::classify(&args).as_str()
 }
 
 /// The `(outcome, exit code)` of a captured run.
@@ -313,6 +327,7 @@ impl InvocationSpan {
             ("github.outcome", outcome.as_str().to_string()),
             ("github.invocation", self.invocation.clone()),
             ("github.launcher", launcher_str(launcher).to_string()),
+            ("github.api", github_api_kind(inv).to_string()),
             ("context_source", inv.context_source().to_string()),
         ]
         .into_iter()
