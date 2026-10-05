@@ -128,6 +128,7 @@ the checks without re-testing the current base; only a new push does that. Going
         }
         match remedy(&self.repo, &self.branch, &self.expected_head_sha, &self.pr) {
             RemedyOutcome::Pushed { new_sha } => {
+                record_chain_lock(&self.repo, &self.pr, &new_sha);
                 println!("LOOM-REDATE-PUSHED sha={new_sha}");
                 std::process::exit(0);
             }
@@ -188,6 +189,26 @@ PR fresh next pass.",
                 std::process::exit(1);
             }
         }
+    }
+}
+
+/// #10167: a fresh-verdict re-date just landed, so take the chain-head merge
+/// lock — one trusted comment holding every other merge onto this PR's base
+/// until its required checks report (bounded by the cap). A separate comment
+/// from the #9590 attempt record, so the budget is untouched. Best-effort: a
+/// failure leaves today's behaviour (no lock) and is named on stderr; the
+/// re-date itself already succeeded and is still reported as such.
+fn record_chain_lock(repo: &str, pr: &str, new_sha: &str) {
+    use loom_daemon::merge_pr::chain_lock;
+    let root = loom_daemon::repo_root::find_repo_root_from_cwd()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let gh = loom_daemon::gh_invocation::gh_bin();
+    let cap = chain_lock::cap_for_root(&root);
+    if let Err(why) =
+        chain_lock::record_lock(&gh, &root, repo, pr, new_sha, cap, chrono::Utc::now())
+    {
+        eprintln!("Note: PR #{pr} was re-dated but took no chain-head merge lock (#10167): {why}");
     }
 }
 

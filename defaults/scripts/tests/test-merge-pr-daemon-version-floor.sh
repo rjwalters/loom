@@ -282,6 +282,7 @@ echo "Testing the merge-pr floor covers every fail-closed sub-subcommand (#8967)
 # opted-in repo on an older binary is refused (fail closed) and told to roll the host.
 MERGE_PR_VERB_TABLE="verdict-contradiction closed 0.19.172
 tree-checks open -
+chain-lock open -
 stale-checks closed 0.19.221
 loom-pr-guard closed 0.19.375
 classify-response closed 0.19.456
