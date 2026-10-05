@@ -300,17 +300,59 @@ assert_eq "PATCH tok=<unset> cred=ambient" "$(grep '^PATCH' "$STUB_DIR/cred.log"
 assert_eq "1" "$(patch_n)" "(z2) exactly one PATCH landed"
 
 # (z3) an App permission-scope 403 still climbs forge_gh_perm_safe's ladder
-# under the App attempt (rung 3 recovers), with no wrapper-level fallback.
+# under the App attempt (the personal rung recovers), with no wrapper-level
+# fallback -- but the recovering attempt is attributed ambient, not app, and the
+# recovery is visible on stderr although the call succeeded.
+z3_patches() { grep '^PATCH' "$STUB_DIR/cred.log" | sed 's/ repos[^ ]*//'; }
+z3_attempts() { printf '%s\n' "$OUT" | sed -n 's/^lease-credential-attempt: //p'; }
 reset_state
 echo ghs_app > "$STUB_DIR/app-token"
 echo 403 > "$STUB_DIR/app-fail-PATCH"
 OUT="$("$SCRIPT" renew-once 10229 --host y-host --sweep-id y-sweep 2>&1)"
 RC=$?
 assert_eq "0" "$RC" "(z3) a 403 on the App PATCH recovers through the ladder"
-assert_eq "true" "$([[ "$OUT" == *"lease-credential=ambient-fallback"* ]] && echo true || echo false)" "(z3) personal recovery is reported as an ambient fallback"
-assert_eq "PATCH tok=<unset> cred=ambient" "$(grep '^PATCH' "$STUB_DIR/cred.log" | tail -n1 | sed 's/ repos[^ ]*//')" "(z3) the recovered attempt ran on the personal credential, tagged ambient"
-assert_eq "true" "$(grep '^PATCH' "$STUB_DIR/cred.log" | head -n1 | grep -q 'tok=ghs_app.* cred=app' && echo true || echo false)" "(z3) the first attempt ran on the App credential"
+assert_eq "false" "$([[ "$OUT" == *"lease-credential=ambient-fallback"* ]] && echo true || echo false)" "(z3) no wrapper fallback was needed"
 assert_eq "1" "$(patch_n)" "(z3) exactly one PATCH landed"
+assert_eq "PATCH tok=ghs_app-write cred=app
+PATCH tok=<unset> cred=ambient" "$(z3_patches)" "(z3) the App attempt is app; the ambient personal login's recovery is ambient"
+assert_eq "attempt=1 credential=app attribution=app
+attempt=2 credential=personal-ambient attribution=ambient" "$(z3_attempts)" "(z3) every attempt's credential and attribution is on stderr"
+assert_eq "true" "$([[ "$OUT" == *"lease-credential=ambient-recovered: the write call was recovered on the personal credential (personal-ambient)"* ]] && echo true || echo false)" "(z3) the personal recovery is tagged although the call succeeded"
+assert_eq "true" "$([[ "$OUT" == *"forge: still 403 after a fresh mint"* ]] && echo true || echo false)" "(z3) the ladder's own diagnostics are no longer discarded"
+assert_eq "" "$(grep -v '^PATCH' "$STUB_DIR/cred.log" | grep -v 'cred=app$')" "(z3) the reads stayed on the App"
+
+# (z3b) LOOM_PERSONAL_GH_TOKEN is the personal rung: also ambient.
+reset_state
+echo ghs_app > "$STUB_DIR/app-token"
+echo 403 > "$STUB_DIR/app-fail-PATCH"
+OUT="$(LOOM_PERSONAL_GH_TOKEN=ghp_personal "$SCRIPT" renew-once 10229 --host y-host --sweep-id y-sweep 2>&1)"
+assert_eq "0" "$?" "(z3b) the personal-token rung recovers the App 403"
+assert_eq "PATCH tok=ghs_app-write cred=app
+PATCH tok=ghp_personal cred=ambient" "$(z3_patches)" "(z3b) the LOOM_PERSONAL_GH_TOKEN attempt is attributed ambient"
+assert_eq "attempt=1 credential=app attribution=app
+attempt=2 credential=personal-token attribution=ambient" "$(z3_attempts)" "(z3b) every attempt's credential and attribution is on stderr"
+assert_eq "true" "$([[ "$OUT" == *"lease-credential=ambient-recovered: the write call was recovered on the personal credential (personal-token)"* ]] && echo true || echo false)" "(z3b) the personal recovery is tagged"
+
+# (z3c) the fresh-mint rung stays app; only the personal rung after it is ambient.
+reset_state
+echo ghs_app > "$STUB_DIR/app-token"
+echo 403 > "$STUB_DIR/app-fail-PATCH"
+printf '#!/usr/bin/env bash\necho %s\n' "'{\"status\":\"ok\",\"token\":\"ghs_app-fresh\"}'" > "$STUB_DIR/github-app-token-ok.sh"
+OUT="$(LOOM_GITHUB_APP_SCRIPT="$STUB_DIR/github-app-token-ok.sh" "$SCRIPT" renew-once 10229 --host y-host --sweep-id y-sweep 2>&1)"
+assert_eq "0" "$?" "(z3c) the ladder recovers after a fresh mint still 403s"
+assert_eq "PATCH tok=ghs_app-write cred=app
+PATCH tok=ghs_app-fresh cred=app
+PATCH tok=<unset> cred=ambient" "$(z3_patches)" "(z3c) App, fresh-mint App, then the ambient personal login"
+assert_eq "attempt=1 credential=app attribution=app
+attempt=2 credential=app-fresh-mint attribution=app
+attempt=3 credential=personal-ambient attribution=ambient" "$(z3_attempts)" "(z3c) every attempt's credential and attribution is on stderr"
+rm -f "$STUB_DIR/github-app-token-ok.sh"
+
+# (z3d) a clean App call stays silent: no attempt lines, no recovery tag.
+reset_state
+echo ghs_app > "$STUB_DIR/app-token"
+OUT="$("$SCRIPT" renew-once 10229 --host y-host --sweep-id y-sweep 2>&1)"
+assert_eq "false" "$([[ "$OUT" == *"lease-credential"* ]] && echo true || echo false)" "(z3d) steady state prints no credential diagnostics"
 
 # (z4) a deleted comment 404s on BOTH credentials -> still recognised as a
 # PATCH 404, so the cached path re-lists (#10021) instead of failing.

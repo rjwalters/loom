@@ -288,29 +288,80 @@ source "$SCRIPT_DIR/lib/forge-helpers.sh"
 # ladder still runs under the App token. With no App configured, or when the App
 # attempt fails for any reason, the call re-runs exactly as before on the
 # caller's own credential, tagged `lease-credential=ambient-fallback` on stderr.
-# LOOM_LEASE_CREDENTIAL (app / ambient) rides along for gh-shim telemetry.
+#
+# Attribution is per ATTEMPT, not per call: the ladder's personal rungs
+# (LOOM_PERSONAL_GH_TOKEN, then the ambient personal login) can recover an App
+# 403 inside the App attempt, so each `gh` exec goes through LEASE_GH_ATTEMPT,
+# which classifies the credential it is actually about to run on and exports
+# LOOM_LEASE_CREDENTIAL (app / ambient) for gh-shim telemetry accordingly. A
+# ladder that escalated prints one `lease-credential-attempt:` line per attempt,
+# and an App call recovered on a personal rung is tagged
+# `lease-credential=ambient-recovered` -- both on stderr, even on success.
+#
+# One ladder attempt: attempt 1 is the call's base credential (LOOM_LEASE_BASE:
+# app / ambient); a later one is the fresh installation-token mint (app), or a
+# personal rung -- GH_TOKEN equal to LOOM_PERSONAL_GH_TOKEN, or unset (the
+# ambient personal login) -- which is attributed ambient.
+# shellcheck disable=SC2016 # expanded by the child bash, per attempt
+LEASE_GH_ATTEMPT='n=1
+while IFS= read -r _; do n=$((n + 1)); done < "$LOOM_LEASE_ATTEMPTS"
+if ((n == 1)); then c="$LOOM_LEASE_BASE"
+elif [[ -n "${GH_TOKEN:-}" && "$GH_TOKEN" == "${LOOM_PERSONAL_GH_TOKEN:-}" ]]; then c=personal-token
+elif [[ -z "${GH_TOKEN:-}" ]]; then c=personal-ambient
+else c=app-fresh-mint; fi
+case "$c" in app*) a=app ;; *) a=ambient ;; esac
+echo "attempt=$n credential=$c attribution=$a" >> "$LOOM_LEASE_ATTEMPTS"
+LOOM_LEASE_CREDENTIAL=$a exec gh "$@"'
+
+# _lease_gh_ladder <app|ambient> <attempts-file> <gh args...>: forge_gh_perm_safe's
+# ladder (forge_cmd_perm_safe) with every attempt classified by LEASE_GH_ATTEMPT.
+_lease_gh_ladder() {
+    local base="$1" attempts="$2"; shift 2
+    LOOM_LEASE_BASE="$base" LOOM_LEASE_ATTEMPTS="$attempts" LOOM_PERSONAL_GH_TOKEN="${LOOM_PERSONAL_GH_TOKEN:-}" \
+        forge_cmd_perm_safe bash -c "$LEASE_GH_ATTEMPT" lease-gh "$@"
+}
+
+# _lease_gh_attempts <attempts-file>: one stderr line per attempt, only when the
+# ladder escalated (steady state is a single, silent attempt).
+_lease_gh_attempts() {
+    local line lines=()
+    while IFS= read -r line; do lines+=("$line"); done < "$1"
+    ((${#lines[@]} > 1)) || return 0
+    printf 'lease-credential-attempt: %s\n' "${lines[@]}" >&2
+}
+
 # requires-daemon: forge optional   Without `forge token` (absent or older binary), or with no App configured, every call runs on the caller's own credential, exactly as before #10229.
 lease_gh() {
-    local access="$1" tok="" out; shift
+    local access="$1" tok="" out="" rc=0 diag attempts last line; shift
     tok="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge token --repo "${LOOM_REPO:-$(_forge_nwo_from_remote || true)}" --access "$access" 2> /dev/null | jq -r 'select(.status == "ok") | .token // empty' 2> /dev/null)" || tok=""
+    attempts="$(mktemp)"
     if [[ -n "$tok" ]]; then
-        local lg_err
-        lg_err="$(mktemp)"
-        if out="$(GH_TOKEN="$tok" LOOM_LEASE_CREDENTIAL=app forge_gh_perm_safe "$@" 2> "$lg_err")"; then
-            # The ladder's personal rungs run (and are tagged) as ambient: a call
-            # that recovered there did not spend the App bucket, so say so.
-            if grep -q 'falling back to' "$lg_err"; then
-                cat "$lg_err" >&2
-                echo "lease-credential=ambient-fallback: the ${access} call recovered on a personal credential after the App attempt (#10229)" >&2
-            fi
-            rm -f "$lg_err"
+        diag="$(mktemp)"
+        out="$(GH_TOKEN="$tok" _lease_gh_ladder app "$attempts" "$@" 2> "$diag")" || rc=$?
+        _lease_gh_attempts "$attempts"
+        last=""
+        while IFS= read -r line; do last="${line#*credential=}"; done < "$attempts"
+        if ((rc == 0)); then
+            # Success: replay the ladder's diagnostics verbatim (none in steady state).
+            [[ ! -s "$diag" ]] || cat "$diag" >&2
+            [[ "$last" != *attribution=ambient ]] || echo "lease-credential=ambient-recovered: the ${access} call was recovered on the personal credential (${last%% *}) after the App credential's permission 403 (#10229)" >&2
+            rm -f "$diag" "$attempts"
             [[ -z "$out" ]] || printf '%s\n' "$out"
             return 0
         fi
-        rm -f "$lg_err"
+        # Failure: replay only the ladder's own escalation lines. The App attempt's
+        # raw gh error is summarised by the tag below; replaying it would let an
+        # App-only `HTTP 404` (App not installed) read as the PATCH's own 404.
+        grep '^forge: ' "$diag" >&2 || true
+        rm -f "$diag"
+        : > "$attempts"
+        rc=0
         echo "lease-credential=ambient-fallback: the ${access} call failed on the App credential (#10229)" >&2
     fi
-    LOOM_LEASE_CREDENTIAL=ambient forge_gh_perm_safe "$@"
+    _lease_gh_ladder ambient "$attempts" "$@" || rc=$?
+    _lease_gh_attempts "$attempts"
+    rm -f "$attempts"
+    return "$rc"
 }
 
 usage() {
@@ -1019,7 +1070,9 @@ cmd_start() {
     # Issue #10229: one renewer per (repo, host, sweep, issue), and a cycle
     # that ends the loop once the issue is closed, even while the watched
     # interactive parent lives on. The decisions live in `loom-daemon lease
-    # renewer`; the state read stays here, on forge_gh_perm_safe's credentials.
+    # renewer`; the state read stays here, on lease_gh's credentials. Its stderr
+    # (credential fallback/recovery tags, ladder lines, errors) goes to fd 9 like
+    # the other two calls' diagnostics, never /dev/null.
     # check: 3 = stop for good (closed / released / superseded), 4 = state
     # unverified, skip this PATCH; anything else (incl. an older binary) renews.
     local -a owner_args=("$issue" --host "$host" --sweep-id "$sweep_id" --token "$$.${RANDOM}.${loop_started_at}")
@@ -1040,11 +1093,7 @@ cmd_start() {
             pid_is_live "$watch_pid" "$watch_ident" || break
             ! max_age_exceeded "$loop_started_at" "$max_age" || { echo "$cap_msg" >&9; break; }
             gate_rc=0
-            state_err="$(mktemp)"
-            issue_state="$(export LOOM_ROLE=sweep-lease-renew; [[ -z "$sweep_id" ]] || export LOOM_SWEEP_ID="$sweep_id"; lease_gh read api "repos/$(gh_repo_path)/issues/${issue}" --jq .state 2> "$state_err")" || issue_state=""
-            # Keep only the credential-attribution lines of the state read's stderr (#10229).
-            { grep '^lease-credential=' "$state_err" >&2; } 2> /dev/null || true
-            rm -f "$state_err"
+            issue_state="$(export LOOM_ROLE=sweep-lease-renew; [[ -z "$sweep_id" ]] || export LOOM_SWEEP_ID="$sweep_id"; lease_gh read api "repos/$(gh_repo_path)/issues/${issue}" --jq .state 2>&9)" || issue_state=""
             "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer check "${owner_args[@]}" --issue-state "$issue_state" 2>&9 || gate_rc=$?
             ((gate_rc != 3)) || break
             ((gate_rc != 4)) || continue

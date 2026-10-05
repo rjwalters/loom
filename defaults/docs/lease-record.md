@@ -301,7 +301,12 @@ future reclamation decision's evidence, not the claim's own validity.
   A host with no App, or an App attempt that fails for any reason, re-runs
   the call on the caller's own credential, exactly as before, and tags it
   `lease-credential=ambient-fallback` on stderr. `LOOM_LEASE_CREDENTIAL`
-  (`app` or `ambient`) is exported for gh-shim telemetry. On a host with an
+  (`app` or `ambient`) is exported for gh-shim telemetry per attempt, not per
+  call: when the ladder recovers an App 403 on a personal rung
+  (`LOOM_PERSONAL_GH_TOKEN` or the ambient personal login), that attempt is
+  `ambient`, an escalated ladder prints one `lease-credential-attempt:` line
+  per attempt, and the call is tagged `lease-credential=ambient-recovered`,
+  even though it succeeded. On a host with an
   App, a held lease therefore costs the personal login nothing in steady
   state. The 36/h lands on the App buckets instead.
 - **Why `--paginate` recurred.** A full listing is meant to happen once per

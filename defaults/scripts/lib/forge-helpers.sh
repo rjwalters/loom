@@ -1182,11 +1182,6 @@ _forge_cmd_attempt() {
   local mode="$1" token="$2" out_file="$3" err_file="$4"
   shift 4
   local rc=0
-  # A personal rung is never the App credential a caller tagged its call with
-  # (#10229): when LOOM_LEASE_CREDENTIAL rides along, re-tag it `ambient` so the
-  # attempt's credential classification stays truthful. Unset => no change.
-  local cred_tag=()
-  [[ -z "${LOOM_LEASE_CREDENTIAL:-}" ]] || cred_tag=(LOOM_LEASE_CREDENTIAL=ambient)
   case "$mode" in
     ambient)
       "$@" >"$out_file" 2>"$err_file" || rc=$?
@@ -1195,10 +1190,10 @@ _forge_cmd_attempt() {
       env GH_TOKEN="$token" "$@" >"$out_file" 2>"$err_file" || rc=$?
       ;;
     personal-token)
-      env -u GITHUB_TOKEN -u GH_CONFIG_DIR GH_TOKEN="$token" ${cred_tag[@]+"${cred_tag[@]}"} "$@" >"$out_file" 2>"$err_file" || rc=$?
+      env -u GITHUB_TOKEN -u GH_CONFIG_DIR GH_TOKEN="$token" "$@" >"$out_file" 2>"$err_file" || rc=$?
       ;;
     personal-ambient)
-      env -u GH_TOKEN -u GITHUB_TOKEN -u GH_CONFIG_DIR ${cred_tag[@]+"${cred_tag[@]}"} "$@" >"$out_file" 2>"$err_file" || rc=$?
+      env -u GH_TOKEN -u GITHUB_TOKEN -u GH_CONFIG_DIR "$@" >"$out_file" 2>"$err_file" || rc=$?
       ;;
     owner-config)
       # `token` carries a directory path here, not a token -- points `gh` at
