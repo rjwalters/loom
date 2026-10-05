@@ -41,9 +41,10 @@ pub const CURATING_LABEL: &str = "loom:curating";
 
 /// Labels that route an issue through Champion rather than the Builder: an
 /// epic, and the three proposal kinds. A star on one of these is not a
-/// dispatch request, so the starred listing skips it.
-pub const CHAMPION_PATH_LABELS: [&str; 4] =
-    ["loom:epic", "loom:architect", "loom:hermit", "loom:auditor"];
+/// dispatch request, so the starred listing skips it. Derived from the label
+/// registry's `champion_path` property (#10013).
+pub static CHAMPION_PATH_LABELS: crate::label_registry::LabelSet =
+    crate::label_registry::LabelSet::new(|| crate::label_registry::embedded_set("champion_path"));
 
 /// How long an *unknown* starred-at (the timeline read failed or found no
 /// event) is trusted before it is read again. A known starred-at is kept
@@ -343,6 +344,19 @@ impl CapTerms {
             configured,
             headroom: disk_headroom.min(ram_headroom),
         }
+    }
+
+    /// [`Self::new`] for a production tick: also records the raw terms for
+    /// the published tick summary (Issue #10214), so the liveness pass and
+    /// the fleet alert can say which term holds the cap down.
+    #[must_use]
+    pub fn observed(configured: usize, disk_headroom: usize, ram_headroom: usize) -> Self {
+        super::tick_summary::record_cap(crate::types::CapView::from_terms(
+            configured,
+            disk_headroom,
+            ram_headroom,
+        ));
+        Self::new(configured, disk_headroom, ram_headroom)
     }
 
     /// The effective cap every non-overflow admission is held to.

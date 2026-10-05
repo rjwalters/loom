@@ -49,6 +49,17 @@ Every record is transmitted inside a versioned envelope:
 | `host_id`        | string            | Stable identifier for the emitting host. Opaque to the schema. |
 | `record`         | object            | The record payload, internally tagged on `kind` (see below). |
 
+### Event time vs knowable-at, and `loom.record_id` (Issue #10196)
+
+On OTLP log records, `timestamp` (`time_unix_nano`) is **event time** and
+`observed_timestamp` (`observed_time_unix_nano`) is **knowable-at**. **Replay
+filters on knowable-at**, never event time. The exporter currently sets
+`observed_timestamp` to `emitted_at` (a producer-side copy, only a lower bound);
+a true ingest-side value needs a collector-side receive stamp, a recorded design
+decision. Every log record also carries `loom.record_id`, a content-derived
+dedupe id (`derived_hex(["loom.record", kind, host_id, emitted_at, record JSON],
+16)`). Full contract: [`telemetry-replay.md`](telemetry-replay.md).
+
 ### `schema_version` semantics
 
 `schema_version` is a **plain integer**, not a semver string, deliberately: a
@@ -1846,14 +1857,14 @@ Each entry:
 | `repo` | string | forge `owner/repo` |
 | `visibility` | `public` / `private` | per entry; missing or unknown decodes to `private` |
 | `issue` | integer | issue number |
-| `stage` | string | `curating`, `ready`, `building`, `in-review`, `changes-requested`, `mergeable`, `merging`, `blocked-by`, `needs-operator`, `no-capacity` (unknown values are forward-compatible) |
+| `stage` | string | `curating`, `ready`, `building`, `in-review`, `changes-requested`, `mergeable`, `merging`, `blocked-by`, `stale-block` (`loom:blocked` with no open blocker named; the daemon unblocks it or hands it to Curator, #10151), `needs-operator`, `no-capacity` (unknown values are forward-compatible) |
 | `next_actor` | string | `curator`, `builder`, `judge`, `doctor`, `champion`, `work-finder`, `operator`, or `blocker #N` |
 | `stage_since` | RFC 3339, optional | when this host first saw it in `stage` |
 | `time_in_stage_secs` | integer | seconds in `stage` |
 | `pr` | integer, optional | its open PR |
 | `blocked_by` | string, optional | `blocked-by`: `#N`, or `owner/repo#N` across repos |
 | `no_capacity` | string, optional | `no-capacity`: the work finder's fixed reason text, or the pools-exhausted grace note |
-| `ask` | object, optional | set when the operator has been asked: `{kind, key, text}`. `kind` is `operator-only`, `operator-decision`, `merge-risk-hold`, `merge-refused`, `pools-exhausted`, `unmanaged-repo`, `blocked-unnamed`, `blocked-cross-repo` or `no-progress`. `key` is the dedupe key (`<kind>:<specifics>`), identical on every host for the same cause. `text` is the one concrete ask, templated by the daemon; the only forge text it can quote is a `merge-refused` ask with no open incident, which carries the refusal line bounded to 300 characters, stripped of backticks and angle brackets, inside a code span. A `no-progress` ask keeps the agent-owned `stage` |
+| `ask` | object, optional | set when the operator has been asked: `{kind, key, text}`. `kind` is `operator-only`, `operator-decision`, `merge-risk-hold`, `merge-refused`, `pools-exhausted`, `unmanaged-repo`, `blocked-unnamed` (only after a Curator handoff or an earlier unblock), `blocked-cross-repo` or `no-progress`. `key` is the dedupe key (`<kind>:<specifics>`), identical on every host for the same cause. `text` is the one concrete ask, templated by the daemon; the only forge text it can quote is a `merge-refused` ask with no open incident, which carries the refusal line bounded to 300 characters, stripped of backticks and angle brackets, inside a code span. A `no-progress` ask keeps the agent-owned `stage` |
 | `inherited_from` | integer, optional | this entry is a blocker inheriting the star of that issue |
 | `operator_priority_at` | RFC 3339, optional | the starred-at it sorts by (its own, the inheriting star's, or `created_at`) |
 | `last_progress_at` | RFC 3339, optional | when forward progress was last seen |
@@ -1915,7 +1926,7 @@ carries **both** the estimating build (`estimate.loom`, exported as
 | Field | Type | Notes |
 |---|---|---|
 | `trigger` | string | `first`, `transition` (stage, rework or refusal changed) or `refresh` (every `refreshSecs`, default 300) |
-| `explanation` | object | the `eta-explanation/v1` record: `estimate_id`, `heuristic`, `kind`, `loom` (required), `as_of`, `subject`, `current_stage`, `history` (`scope`: `local` until #9343 adds `fleet`; per-source and per-host sample counts), `stages[]`, `branches`, `combination`, `result` (with `stage_marks`, #9366), `contributions`, `features`, `features_omitted`, `no_estimate_reason`, `truncated` |
+| `explanation` | object | the `eta-explanation/v1` record: `estimate_id`, `heuristic`, `kind`, `loom` (required), `as_of`, `subject`, `current_stage`, `history` (`scope`: `local` until #9343 adds `fleet`; per-source and per-host sample counts), `stages[]`, `branches`, `combination`, `result` (with `p90_sec`, #10211, and `stage_marks`, #9366), `contributions`, `features` (including the queue, drain and friction group, #10201: `ahead`, `n_stage_repo`/`_fleet`, `exits_repo_*`/`exits_fleet_*`, `merges_repo_24h`, `merges_fleet_6h`, `since_merge_sec`, `open_prs_repo`, `fleet_scope_repos`, `repo_pr_open_skip`; and the item facts, #10231: `tier`, `workspace_priority`, `issue_created_at`, `issue_age_sec`, `sweep_runtime`, `sweep_model`, `sweep_effort`, `attempt`, `judge_verdicts_so_far`, `repo_first_pass_approval_rate`, with `urgent` deprecated and always null; additive, the schema stays v1, omission reasons are free-form strings; see [`eta.md` → Features](eta.md#features)), `features_omitted`, `no_estimate_reason`, `truncated` |
 
 A refusal is an estimate too: `explanation.result` is absent (never zero) and
 `no_estimate_reason` names why. Refusals are emitted when the reason first
@@ -1925,10 +1936,10 @@ appears and are not refreshed.
 
 | Field | Type | Notes |
 |---|---|---|
-| `estimate` | object | the estimate as emitted: `estimate_id`, `kind`, `heuristic`, `loom` (required), `repo`, `repo_id`, `issue`, `pr_number`, `as_of`, `stage`, `age_sec`, `p25_sec`/`p50_sec`/`p75_sec` (absent on a refusal), `samples_min`, `no_estimate_reason`, `stage_quartiles[]` |
+| `estimate` | object | the estimate as emitted: `estimate_id`, `kind`, `heuristic`, `loom` (required), `repo`, `repo_id`, `issue`, `pr_number`, `as_of`, `stage`, `age_sec`, `p25_sec`/`p50_sec`/`p75_sec`/`p90_sec` (absent on a refusal; `p90_sec` also absent on an estimate from before #10211), `samples_min`, `no_estimate_reason`, `stage_quartiles[]` |
 | `loom` | object | the observing daemon's provenance (required) |
-| `score` | object | `outcome` (`started` (#9326), `landed`, `finished`, `abandoned`), `actual_at`, `lead_sec`, `error_sec` (`actual − p50`), `abs_error_sec`, `covered` (`p25 ≤ actual ≤ p75`), `below_p25`, `above_p75`, `pinball_loss_sec`, `horizon_bucket`, `age_bucket`, `stage_at_estimate`, `samples_min`, `stages_actual[]`, `rework_rounds_actual` |
-| `outcome_source` | string | `bus` (in-sweep merge), `pulls_read` (the PR's merge time), `issues_read` (the issue's close state), `sweep_terminal` |
+| `score` | object | `outcome` (`started` (#9326), `landed`, `finished`, `abandoned`, `censored` (#10233: expired unresolved with p90 already passed — `actual_at` is the censoring instant and only `above_p90` is set)), `actual_at`, `lead_sec`, `error_sec` (`actual − p50`), `abs_error_sec`, `covered` (`p25 ≤ actual ≤ p75`), `below_p25`, `above_p75`, `above_p90` (the late surprise, `actual > p90`, #10211), `pinball_loss_sec` (q = .25, .5, .75), `pinball4_loss_sec` (q = .25, .5, .75, .9, #10211), `horizon_bucket`, `age_bucket`, `stage_at_estimate`, `samples_min`, `stages_actual[]`, `rework_rounds_actual` |
+| `outcome_source` | string | `bus` (in-sweep merge), `pulls_read` (the PR's merge time), `issues_read` (the issue's close state), `sweep_terminal`, `pending_expiry` (a `censored` outcome, #10233) |
 | `outcome_resolution_sec` | integer? | how late the resolution may be |
 | `result` | string? | `finish`: the sweep's terminal class, `exited` or `crashed` |
 
@@ -1937,6 +1948,52 @@ planned**) and outcomes of refusals carry no error fields at all, so they are
 counted and never scored. A PR closed unmerged and a sweep that ended before
 any PR are not outcomes at all — the issue's own state decides, and until it
 closes those estimates stay pending.
+
+**`merge_hold` (#10218).** An approved PR held for a human is the
+`merge_hold` stage, so `merge_hold` is a possible `stage` /
+`stage_at_estimate` value (and a `stage_marks[]` / `stages[]` stage) on
+`eta.estimate` and `eta.outcome`, but **only from a heuristic that models the
+hold**: today the shadow `land-2026-10-04-twin-otter`. Every path-engine
+heuristic refuses it as `blocked`, exactly as before, so it never appears in
+`eta.snapshot` while `current.land` is one of them (those rows carry only
+`current`'s estimate). Once a hold-aware
+heuristic is promoted, consumers must render an unknown `stage` value
+gracefully.
+
+### `eta.fleet_refresh`
+
+One repo's outcome in one cycle of the daemon's fleet snapshot refresh task
+(Issue #10263; the task is in [`eta.md` → Fleet refresh
+task](eta.md#fleet-refresh-task-autonomousetafleetrefresh-10263)). Envelopes
+carry `schema_version: 12`. **OTLP-only** (native: `false`), one log record per
+repo per cycle, **skipped repos included**, so a repo the task never manages
+to refresh shows up as such. The body is the record's JSON; the scalars ride as
+`loom.repo` plus `loom.eta.fleet.*` attributes (in `ETA_LOG_ATTRIBUTE_KEYS`,
+allowlisted in the collector's `transform/privacy`). The record time is the
+cycle's start. Provenance is required, as for `eta.estimate`: `loom` exports as
+`loom.eta.version` / `revision` / `tree_state` / `provenance_complete`, and a
+record whose provenance does not validate is never emitted.
+
+| Field | Type | Notes |
+|---|---|---|
+| `repo` | string | `owner/repo` (`loom.repo`) |
+| `cycle_id` | string | derived, never random: `derived_hex(["loom.eta.fleet_refresh", host_id, cycle start])`; shared by every repo of one cycle |
+| `started_at` | RFC3339 | the cycle's start |
+| `pass` | string | `backfill`, `refresh`, or `none` (skipped before a pass was chosen) |
+| `stop_reason` | string | `complete`, `not_modified`, `budget`, `reserve`, `rate_limited`, `coverage`, `breaker_open`, `backoff`, `no_reader`, `unsupported_forge`, `forge_error`, `write_error`, `shutdown` |
+| `promoted` | bool | the pass completed and its snapshot was published |
+| `prs_read` | integer | PR timelines read this cycle |
+| `pass_done` | integer | PRs the pass has read in total |
+| `timelines_incomplete` | integer | timelines that did not parse (counted, contribute nothing) |
+| `samples_added` | integer | published samples after minus before |
+| `raw_events_added` | integer? | rows appended to the raw event cache (#10197), when its sync ran |
+| `forge_calls` | integer | requests made, `304`s and failures included |
+| `not_modified_calls` | integer | of which `304`s |
+| `ratelimit_remaining_min` | integer? | the lowest `x-ratelimit-remaining` seen |
+| `reader_app` | string? | the reader App's id (not a secret) |
+| `snapshot_id` / `as_of` | string? / RFC3339? | the published snapshot after the cycle |
+| `duration_ms` | integer | wall time spent on the repo |
+| `loom` | object | the computing daemon's provenance (required) |
 
 ### `eta.snapshot`
 
@@ -2292,6 +2349,12 @@ in `daemon-reference.md` for the full design:
   call resolved `Armed` here). Omitted/empty on a host that is not the
   captain, on a host with no declared singleton jobs at all, and on a record
   from a pre-#8848 daemon.
+- `exporters` / `exported_kinds` (#10196) — export coverage: the exporter names
+  that actually started in the emitting process (misconfigured, never-started
+  entries excluded) and the sorted record `kind` tags they carry (from the kind
+  registry). Omitted when empty; **empty means unknown** (pre-#10196 daemon or
+  no exporter started), never "exports nothing".
+  See [`telemetry-replay.md`](telemetry-replay.md).
 - `captainless_singleton_jobs` (#9014) — in-daemon singleton-job names whose
   most recent gate check was refused because **no** `fleet.captain` is
   declared at all, so the job runs on no host (e.g. `["ci-telemetry-poll"]`

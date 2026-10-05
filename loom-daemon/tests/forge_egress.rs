@@ -167,6 +167,7 @@ fn run_row(
             Some(other) => panic!("unknown canary outcome {other}"),
         },
         loom_otlp_exporter: eff(row, defaults, "loom_otlp").as_bool().unwrap(),
+        ..Observed::default()
     };
     let doc = PolicyDoc {
         data: policy,

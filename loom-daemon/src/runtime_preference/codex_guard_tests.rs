@@ -24,10 +24,13 @@ struct Fixture {
     profiles: tempfile::TempDir,
     _shared: tempfile::TempDir,
     prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    /// Crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964); released after `Drop`.
+    _profile_root_lock: crate::tokens_pool::profile_root_env::ProfileRootLock,
 }
 
 impl Fixture {
     fn new() -> Self {
+        let profile_root_lock = crate::tokens_pool::profile_root_env::lock();
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let root = tempfile::tempdir().unwrap();
         let profiles = tempfile::tempdir().unwrap();
@@ -88,6 +91,7 @@ impl Fixture {
             profiles,
             _shared: shared,
             prior,
+            _profile_root_lock: profile_root_lock,
         };
         guard_ready(&fixture.profile("ready"), None);
         // Installed, but its only trust was taken somewhere Codex won't look.

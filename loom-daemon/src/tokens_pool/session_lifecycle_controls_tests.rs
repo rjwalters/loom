@@ -45,12 +45,11 @@ fn ensure_profile_controls_creates_only_missing_placeholders() {
 #[test]
 #[serial]
 fn start_creates_the_profile_controls_before_the_container() {
-    let (workspace, root) = setup();
+    let (workspace, root, _env) = setup();
     import_account(workspace.path(), root.path(), "alice");
     let lifecycle = SessionLifecycle::new(workspace.path(), FakeRunner::default(), None);
     lifecycle.start("alice").unwrap();
     for name in PROFILE_CONTROLS {
         assert!(root.path().join("alice").join(name).is_file(), "{name}");
     }
-    std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
 }

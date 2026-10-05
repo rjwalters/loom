@@ -432,6 +432,11 @@ impl RealGithubAppMinter {
     /// [`GithubAppMinter::mint_forced`] (#6171) — the only difference between
     /// the two is whether `--force` is passed to the shell helper.
     fn mint_with_force(&self, owner_repo: &str, force: bool) -> GithubAppOutcome {
+        // #9986: on a `required` host the gateway owns the credential — no
+        // JWT is signed and nothing is requested from api.github.com.
+        if crate::forge_egress::publication::github_credential_forbidden(Some(&self.cwd)) {
+            return GithubAppOutcome::NotConfigured;
+        }
         let script_path_str = self.script_path.to_string_lossy().to_string();
         let timeout = resolve_github_app_mint_timeout(&self.cwd);
         let mut args: Vec<&str> = vec![script_path_str.as_str(), "get-token"];
@@ -935,6 +940,8 @@ pub struct GithubAppPreflight {
     pub minted_gh_token: Option<String>,
 }
 
+pub use crate::forge_egress::publication::gateway_owned_preflight;
+
 /// Runs the full #4430 preflight: attempt a GitHub App mint first (when
 /// `owner_repo` resolved at all); fall through to the byte-identical
 /// pre-#4430 [`run`] (ambient `gh` auth) whenever the app mechanism is
@@ -1060,21 +1067,11 @@ pub fn github_app_gh_config_dir(workspace_root: &Path) -> PathBuf {
 /// Static `config.yml` companion `hosts.yml` needs so `gh` skips its
 /// one-time multi-account migration (see module doc above for why that
 /// migration is fatal for a GitHub-App-only credential).
-const GH_CONFIG_YAML: &str = "version: 1\ngit_protocol: https\n";
-
-/// Build the `hosts.yml` content `gh` expects for `token` on `github.com`.
-/// Split from the file I/O so it is unit-testable without touching disk
-/// (mirrors [`parse_github_app_response`]). `user` is set to
-/// `x-access-token` — the conventional placeholder for a GitHub App
-/// installation token (not a real user account); `gh` does not validate it
-/// against the API, it only uses `oauth_token` for authentication.
-fn gh_hosts_yaml(token: &str) -> String {
-    format!("github.com:\n    oauth_token: {token}\n    user: x-access-token\n    git_protocol: https\n")
-}
+pub(crate) const GH_CONFIG_YAML: &str = "version: 1\ngit_protocol: https\n";
 
 /// Set `mode` on `path`, a no-op on non-unix targets (the daemon is
 /// unix-only in practice, but this keeps the crate cross-platform-buildable).
-fn set_private_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+pub(crate) fn set_private_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1095,22 +1092,15 @@ fn set_private_mode(path: &Path, mode: u32) -> std::io::Result<()> {
 /// the refresh tick in `main.rs` calls this in place of the old
 /// `std::env::set_var("GH_TOKEN", …)`.
 pub fn publish_github_app_token(config_dir: &Path, token: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(config_dir)?;
-    set_private_mode(config_dir, 0o700)?;
-
-    let config_path = config_dir.join("config.yml");
-    if !config_path.exists() {
-        std::fs::write(&config_path, GH_CONFIG_YAML)?;
-        set_private_mode(&config_path, 0o600)?;
-    }
-
-    let hosts_path = config_dir.join("hosts.yml");
-    let tmp_path = config_dir.join("hosts.yml.tmp");
-    std::fs::write(&tmp_path, gh_hosts_yaml(token))?;
-    set_private_mode(&tmp_path, 0o600)?;
-    std::fs::rename(&tmp_path, &hosts_path)?;
-    Ok(())
+    use crate::forge_egress::publication as egress_pub;
+    let workspace = egress_pub::workspace_of_profile_dir(config_dir);
+    let stance = egress_pub::stance_for(workspace.as_deref());
+    publish_hosts_with_stance(config_dir, token, &stance, workspace.as_deref(), &|w| {
+        crate::forge_egress::assert_for(w).routing
+    })
 }
+
+pub use crate::forge_egress::publication::publish_hosts_with_stance;
 
 // ============================================================================
 // Per-owner credential delivery (#5401)
@@ -1647,6 +1637,9 @@ pub fn force_refresh_owner_credential(repo_root: &Path) -> bool {
     };
     force_refresh_owner_credential_with(workspace_root, repo_root, &minter)
 }
+
+#[cfg(test)]
+mod egress_publication_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2409,7 +2402,10 @@ mod tests {
         // #4458: the format must include `oauth_token` (auth) and
         // `git_protocol` (gh reads this without a network call); `user` is
         // an unvalidated placeholder for a GitHub App token.
-        let yaml = gh_hosts_yaml("ghs_example_token");
+        let yaml = crate::forge_egress::publication::render_hosts_yaml(
+            "ghs_example_token",
+            &crate::forge_egress::publication::Stance::Unconfigured,
+        );
         assert!(yaml.contains("oauth_token: ghs_example_token"));
         assert!(yaml.contains("user: x-access-token"));
         assert!(yaml.contains("git_protocol: https"));

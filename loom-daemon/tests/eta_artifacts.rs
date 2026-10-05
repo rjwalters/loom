@@ -181,10 +181,19 @@ fn the_query_file_and_the_doc_describe_the_same_question_set() {
     let sections = sections(QUERIES);
     assert_eq!(
         sections,
-        vec!["0", "Q1", "Q2", "Q3"],
+        vec!["0", "Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7"],
         "eta-queries.sql's sections changed; update the Queries section of eta.md with them"
     );
-    for id in ["**Section 0**", "**Q1**", "**Q2**", "**Q3**"] {
+    for id in [
+        "**Section 0**",
+        "**Q1**",
+        "**Q2**",
+        "**Q3**",
+        "**Q4**",
+        "**Q5**",
+        "**Q6**",
+        "**Q7**",
+    ] {
         assert!(ETA_DOC.contains(id), "eta.md's Queries section does not describe {id}");
     }
     assert!(
@@ -381,4 +390,41 @@ fn the_doc_no_longer_defers_the_live_list_to_a_later_phase() {
     );
     // Both halves of the promotion gate, since either alone is not the rule.
     assert!(ETA_DOC.contains("50 paired observations") && ETA_DOC.contains("[40%, 60%]"));
+}
+
+/// The four #10233 views each guard one specific misreading; the clause that
+/// does it is pinned here, in ordinary CI, beside the Docker-gated proof in
+/// `signoz_eta_accuracy_views.rs`.
+#[test]
+fn the_late_surprise_stability_convergence_and_answer_rate_views_keep_their_guards() {
+    // Q4: the common decidable subset, and censored outcomes counted.
+    assert!(
+        QUERIES.contains("HAVING min(has_p90) = 1"),
+        "Q4 must keep an instant only when EVERY heuristic decided its late surprise"
+    );
+    assert!(QUERIES.contains("mapContains(attributes_bool, 'loom.eta.above_p90')"));
+    assert!(QUERIES.contains("countIf(outcome = 'censored') AS censored"));
+    // Q5: the landing instant, between unchanged emissions only.
+    assert!(
+        QUERIES.contains("as_of_sec + toInt64(attributes_number['loom.eta.p50_sec']) AS landing"),
+        "Q5 measures the predicted landing INSTANT, not remaining seconds"
+    );
+    assert!(QUERIES.contains("stage = prev_stage AND rework = prev_rework"));
+    // Q6: scored outcomes only, bucketed by the actual lead.
+    assert!(QUERIES.contains("'loom.eta.lead_sec'] < 900, 'lt_15m'"));
+    // Q7: time-weighted, never row-counted.
+    assert!(
+        QUERIES.contains("next_t - t AS stood_sec"),
+        "Q7 weights each state by how long it stood; counting rows inflates the \
+         answer rate because refusals are never refreshed"
+    );
+    // The daemon's own gate, documented beside them.
+    for claim in [
+        "MIN_FOLDS",
+        "late surprise",
+        "once per tracker pass",
+        "censored",
+    ] {
+        assert!(ETA_DOC.contains(claim), "eta.md must describe `{claim}`");
+    }
 }

@@ -273,6 +273,79 @@ pub fn parse(bodies: &[String]) -> Option<SequenceMarker> {
     newest
 }
 
+/// The release tombstone every hold-releasing writer emits
+/// (`<!-- loom:sequence released plan=<plan> -->`): the #9686 pass on
+/// clear/dissolve/expiry, `consolidate-abort` (#9688), and
+/// `consolidate-reconcile` (#9689). Rendered here so the writers and
+/// [`parse_live`] cannot drift.
+#[must_use]
+pub fn release_marker_text(plan: &str) -> String {
+    format!("<!-- {MARKER_PREFIX} released plan={plan} -->")
+}
+
+/// A span that ends a hold rather than stating one.
+enum Tombstone {
+    /// `loom:sequence released plan=<plan>` — the hold for `plan` was released.
+    Released(String),
+    /// `loom:sequence replanned` — the pass voided the hold (a pin moved).
+    Replanned,
+}
+
+fn parse_tombstone(span: &str) -> Option<Tombstone> {
+    let rest = span.trim().strip_prefix(MARKER_PREFIX)?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut fields = rest.split_whitespace();
+    match (fields.next()?, fields.next(), fields.next()) {
+        ("replanned", None, None) => Some(Tombstone::Replanned),
+        ("released", Some(plan), None) => plan
+            .strip_prefix("plan=")
+            .filter(|p| is_plan_id(p))
+            .map(|p| Tombstone::Released(p.to_string())),
+        _ => None,
+    }
+}
+
+/// The hold the marker history says is STILL IN FORCE: the newest valid
+/// marker, unless a later tombstone ended it.
+///
+/// [`parse`] answers "what did the newest marker say" and is what the gate
+/// evaluation reads (the label is the gate there, so a stale marker on an
+/// unlabeled PR is inert). Callers that decide from marker history alone —
+/// "is this PR still reserved?", "is this reservation still ours to
+/// release?" — must use this instead, or a released hold reads as live
+/// forever (#9745 review: the release comment carries no pins, so [`parse`]
+/// skips it and the old reservation keeps winning).
+///
+/// A `released` tombstone ends the hold only when its `plan=` names the
+/// current marker's plan — a late release of an older plan must not void a
+/// newer hold. `replanned` carries no plan and voids whatever precedes it.
+#[must_use]
+pub fn parse_live(bodies: &[String]) -> Option<SequenceMarker> {
+    let mut newest: Option<SequenceMarker> = None;
+    for body in bodies {
+        for line in body.lines() {
+            for span in html_comment_spans(line) {
+                if let Some(marker) = parse_span(span) {
+                    newest = Some(marker);
+                    continue;
+                }
+                match parse_tombstone(span) {
+                    Some(Tombstone::Replanned) => newest = None,
+                    Some(Tombstone::Released(plan))
+                        if newest.as_ref().is_some_and(|m| m.plan == plan) =>
+                    {
+                        newest = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    newest
+}
+
 /// Evaluate one sequencing hold against live forge state.
 ///
 /// Order of checks is load-bearing: the follower's own head is checked first

@@ -321,6 +321,21 @@ pub fn blocked_message(inputs: &Inputs<'_>) -> String {
     )
 }
 
+/// The refusal for a branch [`crate::refname::check_refname`] rejects
+/// (#9106/#9479), as distinct from [`blocked_message`].
+///
+/// Both block the merge, so this is a diagnosability fix, not a safety one —
+/// but `blocked_message` attributes the failure to "a detached or unreadable
+/// parent", which for an unsafe ref operand is the wrong instruction: no
+/// amount of reconciling the children will help, and no `--allow-stacked-
+/// children` bypass should be reached for. The branch has to be renamed.
+#[must_use]
+pub fn invalid_ref_message(pr_number: &str, err: &crate::refname::RefnameError) -> String {
+    format!(
+        "Merge blocked: PR #{pr_number} carries a git ref operand the stacked-children guard refuses to run git on (#9106/#9479).\n\n{err}\n\nNothing was fetched and no pin ref was written, so --allow-stacked-children will not help: the branch must be renamed to match ^[A-Za-z0-9][A-Za-z0-9._/-]*$ before Loom can merge it."
+    )
+}
+
 /// `gh pr list --repo <repo> --base <branch> --state open --json
 /// number,headRefName`, as raw stdout.
 ///
@@ -372,17 +387,84 @@ pub fn discover_open_children(gh: &str, repo: &str, branch: &str) -> String {
 /// postcondition that in fact holds.
 ///
 /// `true` iff the ref now names the commit.
+///
+/// The boolean form the CLI consumes; [`try_establish_pin`] is the same
+/// decision with the reason attached.
 pub fn establish_pin(repo_root: &Path, branch: &str, head_sha: &str) -> bool {
+    try_establish_pin(repo_root, branch, head_sha).is_ok()
+}
+
+/// Why a pin could not be established. Named rather than a bare `false` so a
+/// refusal is distinguishable from an absent object in a test and in a log —
+/// mirroring [`crate::reconcile_stack::Prerequisite`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinRefusal {
+    /// `branch` is not a safe git ref operand (#9106/#9479): refused **before
+    /// any git process started**, so nothing was fetched and no ref written.
+    InvalidRef(crate::refname::RefnameError),
+    /// `head_sha` is not a readable commit here, even after one fetch — a
+    /// detached or unreachable parent head.
+    ObjectUnreadable,
+    /// The object is present but `git update-ref` failed.
+    RefWriteFailed,
+}
+
+impl PinRefusal {
+    /// A short, greppable token, in the style of
+    /// `reconcile_stack::Prerequisite::token`.
+    #[must_use]
+    pub fn token(&self) -> &'static str {
+        match self {
+            PinRefusal::InvalidRef(_) => "INVALID-REF",
+            PinRefusal::ObjectUnreadable => "OBJECT-UNREADABLE",
+            PinRefusal::RefWriteFailed => "REF-WRITE-FAILED",
+        }
+    }
+}
+
+impl std::fmt::Display for PinRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PinRefusal::InvalidRef(e) => {
+                write!(f, "INVALID-REF: {e} Nothing was fetched and no pin ref was written.")
+            }
+            PinRefusal::ObjectUnreadable => {
+                write!(f, "OBJECT-UNREADABLE: the parent head is not a readable commit here")
+            }
+            PinRefusal::RefWriteFailed => write!(f, "REF-WRITE-FAILED: git update-ref failed"),
+        }
+    }
+}
+
+/// [`establish_pin`] with the refusal named.
+///
+/// # Errors
+///
+/// [`PinRefusal`], whose `InvalidRef` arm is returned before any git process
+/// is spawned.
+pub fn try_establish_pin(repo_root: &Path, branch: &str, head_sha: &str) -> Result<(), PinRefusal> {
+    // #9106/#9479: `branch` is a PR author's `headRefName` and becomes a bare
+    // ref operand of `git fetch` below. `merge-pr.sh` validates it since
+    // #9474, but an installed shell predating that release paired with a newer
+    // daemon would not, so this side fails closed on its own. First statement
+    // in the function on purpose: an INVALID-REF refusal means no git ran.
+    crate::refname::check_refname(branch).map_err(PinRefusal::InvalidRef)?;
+
     if !has_commit(repo_root, head_sha) {
         // Best-effort single fetch, exactly as the retired shell's
         // `git fetch --quiet origin "$PR_BRANCH"`: its failure is not
         // interesting on its own, only whether the object is present after it.
-        let _ = git(repo_root, &["fetch", "--quiet", "origin", branch]);
+        // `--` ends option parsing before the ref operand (#9106 mitigation B).
+        let _ = git(repo_root, &["fetch", "--quiet", "origin", "--", branch]);
         if !has_commit(repo_root, head_sha) {
-            return false;
+            return Err(PinRefusal::ObjectUnreadable);
         }
     }
-    git(repo_root, &["update-ref", &pin_ref(branch), head_sha])
+    if git(repo_root, &["update-ref", &pin_ref(branch), head_sha]) {
+        Ok(())
+    } else {
+        Err(PinRefusal::RefWriteFailed)
+    }
 }
 
 fn has_commit(repo_root: &Path, sha: &str) -> bool {

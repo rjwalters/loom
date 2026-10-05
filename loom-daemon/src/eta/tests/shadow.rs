@@ -6,13 +6,15 @@
 use super::{as_of, history_a, input_at, provenance, subject};
 use crate::eta::backtest::{BacktestReport, Bucket, Comparison};
 use crate::eta::config::{promote, resolve};
-use crate::eta::heuristics::{LandV1, LandV2, LAND_V1, LAND_V2};
+use crate::eta::heuristics::{
+    LandV1, LandV2, LAND_AMBER_HERON, LAND_FRESH_TIDE, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B, LAND_V1,
+    LAND_V2, LAND_V3,
+};
 use crate::eta::score::{score, EstimateSummary, OutcomeKind, Score};
 use crate::eta::shadow::{
-    self, GateStatus, PairKey, PairedStats, ShadowLedger, COVERAGE_MAX, COVERAGE_MIN,
-    MIN_LIVE_PAIRS,
+    self, GateStatus, PairedStats, ShadowLedger, COVERAGE_MAX, COVERAGE_MIN, MIN_LIVE_PAIRS,
 };
-use crate::eta::tracker::Resolved;
+use crate::eta::tracker::{PassAnswers, Resolved};
 use crate::eta::{explanation::EstimateResult, Heuristic, Kind, Stage};
 use chrono::{DateTime, Duration, Utc};
 
@@ -28,6 +30,7 @@ fn summary(heuristic: &str, offset: i64, quartiles: (i64, i64, i64)) -> Estimate
         p25_sec: quartiles.0,
         p50_sec: quartiles.1,
         p75_sec: quartiles.2,
+        p90_sec: Some(quartiles.2 * 2),
         eta_p50_at: explanation.as_of + Duration::seconds(quartiles.1),
         samples_min: 9,
         stage_marks: Vec::new(),
@@ -96,9 +99,15 @@ fn comparison(current_mean: f64, candidate_mean: f64, scored: usize) -> Comparis
     }
 }
 
-/// A ledger with `pairs` identical observations: the candidate's paired loss
-/// is `candidate_loss`, `current`'s is `current_loss`, and the candidate
-/// covers `covered` of them.
+/// The UTC days [`ledger_with`] spreads its pairs over — more than
+/// [`shadow::MIN_FOLDS`], so a uniform win is a significant one.
+pub(super) const LEDGER_DAYS: i64 = 10;
+
+/// A ledger with `pairs` identical observations spread over [`LEDGER_DAYS`]
+/// days: the candidate's paired loss (three- and four-quantile alike) is
+/// `candidate_loss`, `current`'s is `current_loss`, the candidate covers
+/// `covered` of them, nobody is late, and `pairs` tracker passes saw both
+/// sides answering.
 fn ledger_with(
     pairs: usize,
     current_loss: f64,
@@ -109,7 +118,7 @@ fn ledger_with(
     for i in 0..pairs {
         // Each pair is one resolved group at its own `as_of`, so nothing is
         // accidentally merged across pairs.
-        let offset = i as i64 * 10;
+        let offset = (i as i64 % LEDGER_DAYS) * 86_400 + i as i64 * 10;
         let mut group = pair(offset, (0, 0, 0), (0, 0, 0), 0);
         // Overwrite the scores directly: this test is about the ledger's
         // arithmetic, not about re-deriving pinball loss.
@@ -117,11 +126,18 @@ fn ledger_with(
         set_score(&mut group[1], candidate_loss, i < covered);
         ledger.record(&current_land, &group);
     }
+    let both_answering = PassAnswers {
+        kind: Kind::Land,
+        states: vec![(LAND_V1.to_string(), true), (LAND_V2.to_string(), true)],
+    };
+    ledger.record_answers(&current_land, &vec![both_answering; pairs]);
     ledger
 }
 
 fn set_score(r: &mut Resolved, loss: f64, covered: bool) {
     r.score.pinball_loss_sec = Some(loss);
+    r.score.pinball4_loss_sec = Some(loss);
+    r.score.above_p90 = Some(false);
     r.score.covered = Some(covered);
 }
 
@@ -157,7 +173,19 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
         .iter()
         .map(|e| e.explanation.heuristic.as_str())
         .collect();
-    assert_eq!(ids, vec!["finish-v1", LAND_V1, LAND_V2]);
+    assert_eq!(
+        ids,
+        vec![
+            "finish-v1",
+            LAND_V1,
+            LAND_V2,
+            LAND_V3,
+            LAND_AMBER_HERON,
+            LAND_FRESH_TIDE,
+            LAND_TWIN_OTTER,
+            LAND_TWIN_OTTER_B
+        ]
+    );
 
     // Exactly one primary per kind, and it is `current`.
     let primaries: Vec<&str> = emissions
@@ -173,7 +201,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
         .filter(|e| e.explanation.kind == Kind::Land)
         .map(|e| e.primary)
         .collect();
-    assert_eq!(land_order, vec![true, false]);
+    assert_eq!(land_order, vec![true, false, false, false, false, false, false]);
 
     // The primary's own number is byte-identical to what a registry with no
     // candidate at all would produce: shadow mode is additive, not a change.
@@ -191,7 +219,18 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
         .filter(|p| p.kind == Kind::Land)
         .map(|p| p.heuristic.as_str())
         .collect();
-    assert_eq!(pending, vec![LAND_V1, LAND_V2]);
+    assert_eq!(
+        pending,
+        vec![
+            LAND_V1,
+            LAND_V2,
+            LAND_V3,
+            LAND_AMBER_HERON,
+            LAND_FRESH_TIDE,
+            LAND_TWIN_OTTER,
+            LAND_TWIN_OTTER_B
+        ]
+    );
 }
 
 // ------------------------------------------------------ the paired ledger
@@ -227,11 +266,14 @@ fn the_ledger_pairs_only_same_subject_same_kind_same_instant() {
     let mut group = pair(0, (100, 200, 300), (150, 250, 350), 240);
     group[1].score = Score {
         pinball_loss_sec: None,
+        pinball4_loss_sec: None,
+        above_p90: None,
         covered: None,
         ..group[1].score.clone()
     };
     abandoned.record(&current_land, &group);
     assert_eq!(abandoned.stats(Kind::Land, LAND_V1, LAND_V2).pairs, 0);
+    assert!(abandoned.all().is_empty(), "nothing decidable, so no comparison at all");
 }
 
 #[test]
@@ -255,31 +297,23 @@ fn the_ledger_round_trips_through_its_persisted_form() {
     let dir = tempfile::tempdir().unwrap();
     let path = shadow::ledger_path(dir.path());
     shadow::write_ledger(&path, &ledger).unwrap();
-    assert_eq!(shadow::read_ledger(&path), ledger, "a restart keeps the count");
-    // An absent or malformed file is an empty ledger, never a failure.
-    assert_eq!(shadow::read_ledger(&dir.path().join("nope.json")), ShadowLedger::default());
+    assert_eq!(shadow::read_ledger(&path).unwrap(), ledger, "a restart keeps the count");
+    // An absent file is an empty ledger: nothing has been paired yet.
+    assert_eq!(
+        shadow::read_ledger(&dir.path().join("nope.json")).unwrap(),
+        ShadowLedger::default()
+    );
+    // A malformed one is an error, never a silent empty ledger (#10233) —
+    // see `shadow_gate.rs` for what the daemon does with it.
     std::fs::write(&path, "{ not json").unwrap();
-    assert_eq!(shadow::read_ledger(&path), ShadowLedger::default());
+    assert!(shadow::read_ledger(&path).is_err());
 }
 
 // ------------------------------------------------------- the gate, in order
 
 /// Live evidence that would pass the live gate on its own.
 fn passing_live() -> PairedStats {
-    PairedStats::of(
-        PairKey {
-            kind: Kind::Land,
-            current: LAND_V1.to_string(),
-            candidate: LAND_V2.to_string(),
-        },
-        crate::eta::shadow::PairSums {
-            pairs: MIN_LIVE_PAIRS,
-            current_loss_sec: 100.0 * MIN_LIVE_PAIRS as f64,
-            candidate_loss_sec: 60.0 * MIN_LIVE_PAIRS as f64,
-            current_covered: MIN_LIVE_PAIRS / 2,
-            candidate_covered: MIN_LIVE_PAIRS / 2,
-        },
-    )
+    ledger_with(MIN_LIVE_PAIRS, 100.0, 60.0, MIN_LIVE_PAIRS / 2).stats(Kind::Land, LAND_V1, LAND_V2)
 }
 
 #[test]
@@ -357,15 +391,11 @@ fn a_backtest_that_could_not_run_is_a_failure_not_a_pass() {
 
 #[test]
 fn a_passing_backtest_still_needs_fifty_live_pairs() {
-    let mut stats = passing_live();
-    let sums = crate::eta::shadow::PairSums {
-        pairs: MIN_LIVE_PAIRS - 1,
-        current_loss_sec: 100.0 * (MIN_LIVE_PAIRS - 1) as f64,
-        candidate_loss_sec: 60.0 * (MIN_LIVE_PAIRS - 1) as f64,
-        current_covered: (MIN_LIVE_PAIRS - 1) / 2,
-        candidate_covered: (MIN_LIVE_PAIRS - 1) / 2,
-    };
-    stats = PairedStats::of(stats.key.clone(), sums);
+    let stats = ledger_with(MIN_LIVE_PAIRS - 1, 100.0, 60.0, (MIN_LIVE_PAIRS - 1) / 2).stats(
+        Kind::Land,
+        LAND_V1,
+        LAND_V2,
+    );
     let decision = shadow::evaluate(
         Kind::Land,
         LAND_V1,
@@ -382,17 +412,11 @@ fn a_passing_backtest_still_needs_fifty_live_pairs() {
 
 #[test]
 fn a_candidate_worse_live_or_outside_the_coverage_band_is_not_promoted() {
-    let key = passing_live().key;
     let stats = |candidate_loss: f64, covered: usize| {
-        PairedStats::of(
-            key.clone(),
-            crate::eta::shadow::PairSums {
-                pairs: MIN_LIVE_PAIRS,
-                current_loss_sec: 100.0 * MIN_LIVE_PAIRS as f64,
-                candidate_loss_sec: candidate_loss * MIN_LIVE_PAIRS as f64,
-                current_covered: MIN_LIVE_PAIRS / 2,
-                candidate_covered: covered,
-            },
+        ledger_with(MIN_LIVE_PAIRS, 100.0, candidate_loss, covered).stats(
+            Kind::Land,
+            LAND_V1,
+            LAND_V2,
         )
     };
     let decide = |s: &PairedStats| {
@@ -412,8 +436,12 @@ fn a_candidate_worse_live_or_outside_the_coverage_band_is_not_promoted() {
     assert!(!worse.promote);
     assert!(worse.live.detail.contains("worse"), "{}", worse.live.detail);
 
-    // Equal is "not worse", which the rule accepts.
-    assert!(decide(&stats(100.0, MIN_LIVE_PAIRS / 2)).promote);
+    // Equal is "not worse", which the loss rule accepts — but a candidate
+    // that never once beats `current` has won no day, so the per-day win rate
+    // (#10233) still holds it back.
+    let equal = decide(&stats(100.0, MIN_LIVE_PAIRS / 2));
+    assert!(!equal.promote);
+    assert!(equal.live.detail.contains("0 decided day"), "{}", equal.live.detail);
 
     // Coverage below the band (over-wide intervals would read as coverage
     // ABOVE it; below means the intervals are too narrow).

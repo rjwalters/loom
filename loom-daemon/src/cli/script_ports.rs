@@ -494,6 +494,26 @@ pub(crate) enum ScriptPortCommand {
     /// bypasses `lib/script-helper.sh`, whose missing-daemon path is a loud
     /// error: silence IS this entry point's interface.)
     FleetSend(super::fleet_send::FleetSendArgs),
+
+    /// The versioned forge **operation inventory** and its accounting (#9777,
+    /// phase 1 of epic #9769): the coverage validator, the unclassified-call
+    /// change gate, the four-axis coverage report and the hosted-probe
+    /// manifest. Not a port: brand-new logic, native from the start per the
+    /// shell-language policy — and native specifically so the gate can be a
+    /// real ratchet rather than a grep in a `contract`-category script. It
+    /// lives in this flattened enum for the same frozen-`main.rs` reason as
+    /// `shell-budget`, which keeps `forge-inventory` a real nested subcommand
+    /// at zero cost to that file. Makes no forge call.
+    #[command(subcommand)]
+    ForgeInventory(super::forge_inventory_cmd::ForgeInventoryCommand),
+
+    /// Combined-tree CI qualification for the merge queue (#10257): `audit`
+    /// reports relied-on suites that do not validate the merge-group commit;
+    /// `eligibility` decides whether a repository may pilot queue mode.
+    /// Read-only. Lives here for the same frozen-`main.rs` reason as
+    /// `shell-budget`.
+    #[command(subcommand)]
+    MergeGroupCi(super::merge_group_ci_cmd::MergeGroupCiCommand),
 }
 
 impl ScriptPortCommand {
@@ -560,6 +580,8 @@ impl ScriptPortCommand {
             ScriptPortCommand::SecretScan(args) => args.run(),
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
             ScriptPortCommand::LabelDuplicates(args) => args.run(),
+            ScriptPortCommand::ForgeInventory(cmd) => cmd.run(),
+            ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),
         }
     }
 }
@@ -577,6 +599,12 @@ pub(crate) enum MergePrCommand {
     /// tree that no longer exists. Exit 0+CLEAN = fresh, 1 = stale, 2 =
     /// could not determine (must also refuse).
     StaleChecks(super::merge_pr_stale_checks::StaleChecksArgs),
+
+    /// Run the repo's `merge.treeChecks` against the merge tree (base + PR
+    /// head) in a temp dir (#10026). Exit 0+CLEAN = pass/none declared (or
+    /// BYPASSED under --allow-red-tree), 1 = a check failed (comment posted),
+    /// 2 = could not run (must also refuse).
+    TreeChecks(super::merge_pr_tree_checks::TreeChecksArgs),
 
     /// The stale-cached-mergeable recheck decision (#6104): once REST
     /// `.mergeable` has read `false`, classify the backoff re-reads plus the
@@ -664,6 +692,17 @@ pub(crate) enum MergePrCommand {
     /// are preserved untouched. A merged candidate cannot be aborted —
     /// landing wins and #9689's reconcile owns the aftermath.
     ConsolidateAbort(super::merge_pr_consolidate::ConsolidateAbortArgs),
+
+    /// Reconcile a MERGED consolidation candidate (#9689, ADR-0023 §6):
+    /// verify each component's inclusion by ancestry against the recorded
+    /// candidate tree, post per-component merged-into status (or
+    /// `untouched-open` for a source pushed after landing), close component
+    /// PRs with the exact combined merge SHA, close their declared
+    /// closing-reference issues through the existing refs analysis, and clean
+    /// the candidate branch — every step idempotent, so a crash anywhere
+    /// resumes. Never merges, and never releases a reservation: the ordering
+    /// pass is the one releaser on landing (ADR-0023 §4).
+    ConsolidateReconcile(super::merge_pr_consolidate::ConsolidateReconcileArgs),
 
     /// The async-close-race worktree-cleanup gate (#4186): whether a merged
     /// PR's issue is actually finished, so a partial-increment worktree the
@@ -843,6 +882,15 @@ pub(crate) enum MergePrCommand {
     /// 2 = the resolved root cannot be framed unambiguously. The seam fails
     /// OPEN (no targets, clean up nothing) — see `cli::merge_pr_cleanup_paths`.
     CleanupPaths(super::merge_pr_cleanup_paths::CleanupPathsArgs),
+
+    /// The identity/ownership gate in front of `_remove_loom_worktree` (#8191
+    /// slice): the #3710 primary-worktree hard guard, then the
+    /// `.loom-managed` sentinel guard with its `--worktree-path` bypass.
+    /// `git worktree list --porcelain` on stdin; first line
+    /// `LOOM-REMOVE-GATE PROCEED|REFUSE` then `LEVEL<TAB>message` records.
+    /// The shell treats anything else as REFUSE — see
+    /// `cli::merge_pr_remove_gate`.
+    RemoveGate(super::merge_pr_remove_gate::RemoveGateArgs),
 }
 
 impl MergePrCommand {
@@ -851,6 +899,7 @@ impl MergePrCommand {
             MergePrCommand::VerdictContradiction(args) => args.run(),
             MergePrCommand::MergeableRecheck(args) => args.run(),
             MergePrCommand::StaleChecks(args) => args.run(),
+            MergePrCommand::TreeChecks(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::RedateReport(args) => args.run(),
@@ -861,6 +910,7 @@ impl MergePrCommand {
             MergePrCommand::SequencePlan(args) => args.run(),
             MergePrCommand::ConsolidatePrepare(args) => args.run(),
             MergePrCommand::ConsolidateAbort(args) => args.run(),
+            MergePrCommand::ConsolidateReconcile(args) => args.run(),
             MergePrCommand::IssueCloseGate(args) => args.run(),
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),
@@ -882,6 +932,7 @@ impl MergePrCommand {
             MergePrCommand::ReconcileChild(args) => args.run(),
             MergePrCommand::ChecksFailure(args) => args.run(),
             MergePrCommand::WorktreePreserve(args) => args.run(),
+            MergePrCommand::RemoveGate(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
         }
     }

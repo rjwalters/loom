@@ -129,6 +129,9 @@ fn shell_answers(corpus_path: &std::path::Path) -> Vec<String> {
 
     // Still guarded rather than a bare `.`: a fixture whose function was
     // renamed must fail loudly instead of silently comparing nothing.
+    // `pipefail` is safe here, unlike the response oracle (#10189): `read -r`
+    // strips the newline and the corpus forbids embedded `\n`, so the ladder's
+    // `echo "$1" | grep -q` is a single write that grep cannot cut short.
     let program = r#"set -euo pipefail
 . "$1"
 declare -F _is_head_mismatch_response >/dev/null || { echo "FIXTURE MISSING _is_head_mismatch_response" >&2; exit 2; }

@@ -6,6 +6,8 @@
 
 use std::path::Path;
 
+use crate::forge_egress::policy::PolicySources;
+use crate::forge_egress::Mode;
 use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
 use crate::proc_exec::Completion;
 
@@ -17,7 +19,12 @@ const CODES_MARKER_PREFIX: &str = "<!-- loom:forge-egress-codes:";
 /// Check: `Skipped` when no policy is configured, `Ok` when routing is
 /// aligned, else a `Violation` naming the codes and the first remedy.
 pub(super) fn check(repo_root: &Path) -> InvariantStatus {
-    let report = crate::forge_egress::assert_for(repo_root);
+    check_with(&PolicySources::from_process(Some(repo_root)), repo_root)
+}
+
+/// [`check`] against explicit `sources` (hermetic tests; #9999).
+pub(super) fn check_with(sources: &PolicySources, repo_root: &Path) -> InvariantStatus {
+    let report = crate::forge_egress::run_with(sources, repo_root, Mode::Assert);
     if !report.is_configured() {
         return InvariantStatus::Skipped("no forge egress policy configured".to_string());
     }
@@ -315,11 +322,10 @@ mod tests {
     #[test]
     fn an_unconfigured_repo_is_skipped() {
         let tmp = tempfile::tempdir().unwrap();
-        if Path::new(crate::forge_egress::policy::MACHINE_POLICY_PATH).exists()
-            || std::env::var_os(crate::forge_egress::policy::POLICY_ENV).is_some()
-        {
-            return;
-        }
-        assert!(matches!(check(tmp.path()), InvariantStatus::Skipped(_)));
+        // Hermetic (#9999): injected sources, never the host policy.
+        assert!(matches!(
+            check_with(&PolicySources::default(), tmp.path()),
+            InvariantStatus::Skipped(_)
+        ));
     }
 }

@@ -17,8 +17,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
+use crate::forge_call_stats::{ops, ForgeOp};
 use crate::forge_etag_store as store;
 use crate::forge_listing::RestIssue;
+
+/// Every star-liveness read is recorded under caller `star_liveness`; the
+/// operation is the caller's, per URL (#9831).
+fn site(op: ForgeOp) -> store::ConditionalRead {
+    store::ConditionalRead::new("star_liveness", op)
+}
 
 /// One issue comment: its body, when it was posted and last edited, and who
 /// wrote it (for [`super::trust`]).
@@ -185,9 +192,10 @@ impl GhStarForge {
         format!("repos/{}/issues/{number}", self.slug)
     }
 
-    /// Conditional GET of `url` (a REST path): `Ok(Some(body))` on a `200` or
-    /// a `304` served from the stored body, `Ok(None)` on a `404`.
-    fn cached_get(&self, url: &str) -> Result<Option<String>> {
+    /// Conditional GET of `url` (a REST path), accounted under `op` (#9831):
+    /// `Ok(Some(body))` on a `200` or a `304` served from the stored body,
+    /// `Ok(None)` on a `404`.
+    fn cached_get(&self, op: ForgeOp, url: &str) -> Result<Option<String>> {
         if crate::rate_limit_breaker::global_is_suppressed() {
             return Err(anyhow!("rate-limit breaker is suppressing forge calls"));
         }
@@ -206,7 +214,7 @@ impl GhStarForge {
             });
         let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
         let (status, response, stderr) =
-            store::fetch_conditional("star_liveness", &self.gh_bin, cwd, &target, url, sent_etag)?;
+            store::fetch_conditional(site(op), &self.gh_bin, cwd, &target, url, sent_etag)?;
         match response {
             Some(r) if r.status == 304 => match sent {
                 Some(e) => Ok(Some(e.body.clone())),
@@ -296,7 +304,12 @@ impl StarForge for GhStarForge {
     }
 
     fn issue(&mut self, number: u32) -> Result<Option<RestIssue>> {
-        let Some(body) = self.cached_get(&self.issue_path(number))? else {
+        let Some(body) = self.cached_get(
+            // A single-issue read: no inventory row exists for it (#9831).
+            ForgeOp::uninventoried("single-issue REST read has no inventory row"),
+            &self.issue_path(number),
+        )?
+        else {
             return Ok(None);
         };
         Ok(crate::forge_listing::parse_rest_issues(&format!("[{body}]"))?
@@ -309,7 +322,7 @@ impl StarForge for GhStarForge {
         for page in 1..=COMMENT_MAX_PAGES {
             let url =
                 format!("{}/comments?per_page={COMMENT_PAGE}&page={page}", self.issue_path(number));
-            let Some(body) = self.cached_get(&url)? else {
+            let Some(body) = self.cached_get(ops::COMMENT_LIST, &url)? else {
                 return Err(anyhow!("gh api {url} failed: HTTP 404"));
             };
             let raw: Vec<RawComment> = serde_json::from_str(&body)
@@ -333,7 +346,7 @@ impl StarForge for GhStarForge {
         let clean: String = phrase.chars().filter(|c| *c != '"').collect();
         let q = format!("\"{clean}\" repo:{} is:issue is:open in:title,body", self.slug);
         let url = format!("search/issues?q={}&per_page=20", url_encode(&q));
-        let Some(body) = self.cached_get(&url)? else {
+        let Some(body) = self.cached_get(ops::ISSUE_SEARCH, &url)? else {
             return Ok(Vec::new());
         };
         let items = serde_json::from_str::<serde_json::Value>(&body)

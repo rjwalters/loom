@@ -15,13 +15,21 @@
 //!   the refusal quotes one of the specific forge phrases, one issue search
 //!   for that phrase (repeated each pass only while no open incident is
 //!   known; hits must be trusted-authored and quote it word-bounded);
-//! - one single-issue read per same-repo blocker (the blocker's state, and
-//!   its labels when it inherits a star).
+//! - one single-issue read per same-repo blocker of a starred issue (the
+//!   blocker's state, and its labels when it inherits a star);
+//! - the comments of a `loom:blocked` starred issue whose body names no open
+//!   blocker (#10151): blockers named there, and the stale-block markers;
+//! - the inheritance walk: one single-issue read per same-repo child not
+//!   already read this pass (closed children and PRs included), plus the
+//!   reads of each evaluated child's own same-repo blockers. Together these
+//!   are at most [`MAX_WALK_READS_PER_PASS`] per repo per pass, counted as
+//!   forge reads (cache misses), not as open children found.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::Result;
 
+use super::edges::{self, Edge, EdgeSource, Node, Root};
 use super::forge::StarForge;
 use super::landing::{
     classify, BlockerRef, Capacity, ItemFacts, Landing, MergeRefusal, PrFacts, StarFacts,
@@ -29,8 +37,9 @@ use super::landing::{
 };
 use super::progress::{fingerprint, short_hash};
 use super::refusal::{self, Detected};
+use super::stale::{self, CommentFacts};
 use crate::forge_listing::RestIssue;
-use crate::types::{AskKind, QueueDisposition, ReadyQueueRow};
+use crate::types::{AskKind, CapView, QueueDisposition, ReadyQueueRow};
 use crate::work_finder::{WorkItem, OPERATOR_PRIORITY_LABEL};
 
 /// PR labels listed to find a starred issue's open PR.
@@ -48,13 +57,38 @@ pub const PR_LABELS: &[&str] = &[
 /// How deep inheritance follows a chain of blockers.
 pub const MAX_INHERIT_DEPTH: usize = 3;
 
+/// Most single-issue forge reads (cache misses) the inheritance walk makes
+/// per repo per pass: every child it reads, open or closed, issue or PR,
+/// plus every blocker read made to evaluate an open child. A child whose
+/// read, or whose blockers' reads, would exceed it waits for a later pass.
+/// The starred issues' own blocker reads are outside the walk and not
+/// counted here.
+pub const MAX_WALK_READS_PER_PASS: usize = 50;
+
+/// Passes a child found closed (or a PR) is skipped without a read before
+/// the walk looks at it again, in case it was reopened.
+const SETTLED_TTL_PASSES: u64 = 20;
+
 /// Cached refusal detections, keyed by (repo, PR) and valid while the PR's
 /// `updated_at` is unchanged, plus the incident a signature search found
 /// (re-checked open every pass).
+///
+/// Also the inheritance walk's memory across passes, so a capped walk makes
+/// progress instead of restarting the same traversal: children it found
+/// closed (or PRs), which cost no read for [`SETTLED_TTL_PASSES`] passes,
+/// and children the cap deferred, which are resumed first next pass, from
+/// the path that reached them, whatever their depth or root.
 #[derive(Debug, Default)]
 pub struct RefusalCache {
     entries: HashMap<(String, u32), (Option<String>, Option<Detected>)>,
     incidents: HashMap<(String, u32), u32>,
+    /// Walk passes started (any repo); the clock for `settled`.
+    walk_pass: u64,
+    /// Children that inherit nothing, with the pass that found them so.
+    settled: HashMap<(String, u32), u64>,
+    /// Children the read cap deferred, not yet evaluated, each with the edges
+    /// from its starred root down to it.
+    deferred: BTreeMap<(String, u32), Vec<Edge>>,
 }
 
 /// Everything about the repo that is not a forge read.
@@ -65,6 +99,12 @@ pub struct RepoContext<'a> {
     pub host: &'a str,
     /// The last work-finder tick's rows for this repo.
     pub tick_rows: &'a [ReadyQueueRow],
+    /// The last tick's rows for every repo on this host, in dispatch order:
+    /// a starred issue's queue position is host-wide, like the cap (#10214).
+    /// Empty falls back to [`Self::tick_rows`].
+    pub host_queue: &'a [ReadyQueueRow],
+    /// The last tick's cap terms, when recorded (#10214).
+    pub cap: Option<CapView>,
     /// This host's pool exhaustion, when any (its description).
     pub pool: Option<String>,
     /// Whether a workspace on this host manages a forge slug (for a
@@ -115,6 +155,19 @@ fn linked_issues(pr: &RestIssue) -> Vec<u32> {
         .collect()
 }
 
+/// What [`Evaluator::visit`] found at a child.
+enum Visit {
+    /// Closed, a PR, or recently found so: it inherits nothing.
+    Settled,
+    /// The read cap did not leave room for it.
+    Deferred,
+    Open(Box<Evaluated>),
+}
+
+/// A node the walk will expand: its number, what its landing says inherits,
+/// and the edges from its starred root down to it (its depth is their count).
+type Pending = (u32, Vec<u32>, Vec<Edge>);
+
 /// The per-pass evaluator for one repo.
 pub struct Evaluator<'a> {
     pub forge: &'a mut dyn StarForge,
@@ -122,6 +175,11 @@ pub struct Evaluator<'a> {
     pub refusals: &'a mut RefusalCache,
     issues: HashMap<u32, Option<RestIssue>>,
     prs_by_issue: BTreeMap<u32, RestIssue>,
+    propagate: bool,
+    /// Single-issue forge reads (cache misses) made so far.
+    reads: usize,
+    /// While set, no read past this count reaches the forge (the walk).
+    read_cap: Option<usize>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -137,7 +195,46 @@ impl<'a> Evaluator<'a> {
             refusals,
             issues: HashMap::new(),
             prs_by_issue: BTreeMap::new(),
+            propagate: true,
+            reads: 0,
+            read_cap: None,
         }
+    }
+
+    /// Whether a star also reaches the children [`edges::child_edges`]
+    /// resolves (`autonomous.operatorPriority.propagate`), beyond the
+    /// liveness blockers. On by default.
+    #[must_use]
+    pub fn with_propagate(mut self, propagate: bool) -> Self {
+        self.propagate = propagate;
+        self
+    }
+
+    /// The children of `parent`: the issues its landing says inherit
+    /// (blockers, refusal incident, red-main fix), plus, with `propagate`,
+    /// every child its own text links ([`edges::child_edges`]).
+    fn children(&self, parent: u32, landing_inherits: &[u32]) -> Vec<Edge> {
+        let mut out: Vec<Edge> = landing_inherits
+            .iter()
+            .map(|&child| Edge {
+                parent,
+                child,
+                source: EdgeSource::LandingBlocker,
+            })
+            .collect();
+        if self.propagate {
+            if let Some(Some(issue)) = self.issues.get(&parent) {
+                let node = Node {
+                    number: issue.number,
+                    title: issue.title.as_deref().unwrap_or_default(),
+                    body: issue.body.as_deref().unwrap_or_default(),
+                    labels: &issue.labels,
+                    is_pull_request: issue.is_pull_request,
+                };
+                out.extend(edges::child_edges(self.ctx.slug, &node));
+            }
+        }
+        out
     }
 
     fn tick_row(&self, n: u32) -> Option<&ReadyQueueRow> {
@@ -148,6 +245,14 @@ impl<'a> Evaluator<'a> {
         if let Some(cached) = self.issues.get(&n) {
             return cached.clone();
         }
+        if self.read_cap.is_some_and(|cap| self.reads >= cap) {
+            log::debug!(
+                "star_liveness: {} reached its read cap this pass; #{n} not read",
+                self.ctx.slug
+            );
+            return None;
+        }
+        self.reads += 1;
         let read = self.forge.issue(n).unwrap_or_else(|e| {
             log::debug!("star_liveness: reading {}#{n} failed: {e}", self.ctx.slug);
             None
@@ -249,47 +354,117 @@ impl<'a> Evaluator<'a> {
         })
     }
 
-    fn blockers(&mut self, issue: &RestIssue) -> Vec<BlockerRef> {
+    /// The dependency refs a `loom:blocked` issue's body names.
+    fn dependency_refs(&self, issue: &RestIssue) -> Vec<String> {
         if !issue.labels.iter().any(|l| l == BLOCKED_LABEL) {
             return Vec::new();
         }
         let body = issue.body.as_deref().unwrap_or_default();
-        let prefix = format!("{}#", self.ctx.slug.to_ascii_lowercase());
         crate::dep_classify::refs::parse_named_blocker_refs(body, self.ctx.slug)
-            .into_iter()
-            .map(|r| {
-                let same = r
-                    .to_ascii_lowercase()
-                    .strip_prefix(&prefix)
-                    .and_then(|n| n.parse::<u32>().ok());
-                match same {
-                    Some(n) if n != issue.number => {
-                        let open = self.issue(n).map(|b| b.state.eq_ignore_ascii_case("open"));
-                        BlockerRef {
-                            display: format!("#{n}"),
-                            number: Some(n),
-                            open,
-                            cross_repo_managed: None,
-                        }
-                    }
-                    Some(_) => BlockerRef {
-                        display: r,
-                        number: None,
-                        open: Some(false),
-                        cross_repo_managed: None,
-                    },
-                    None => {
-                        let slug = r.split('#').next().unwrap_or_default().to_string();
-                        BlockerRef {
-                            display: r,
-                            number: None,
-                            open: None,
-                            cross_repo_managed: Some((self.ctx.managed)(&slug)),
-                        }
-                    }
+    }
+
+    /// `r`'s number when it names an issue in this repo.
+    fn same_repo_number(&self, r: &str) -> Option<u32> {
+        let prefix = format!("{}#", self.ctx.slug.to_ascii_lowercase());
+        r.to_ascii_lowercase()
+            .strip_prefix(&prefix)
+            .and_then(|n| n.parse::<u32>().ok())
+    }
+
+    /// Forge reads [`Self::blocked_facts`] would make for `issue` from its
+    /// body (its same-repo blockers not read yet this pass).
+    fn pending_blocker_reads(&self, issue: &RestIssue) -> usize {
+        self.dependency_refs(issue)
+            .iter()
+            .filter_map(|r| self.same_repo_number(r))
+            .filter(|n| *n != issue.number && !self.issues.contains_key(n))
+            .collect::<BTreeSet<u32>>()
+            .len()
+    }
+
+    /// One named ref (`owner/repo#N`) as a [`BlockerRef`], its state read
+    /// when it is in this repo.
+    fn blocker_ref(&mut self, r: String, issue: u32) -> BlockerRef {
+        match self.same_repo_number(&r) {
+            Some(n) if n != issue => {
+                let open = self.issue(n).map(|b| b.state.eq_ignore_ascii_case("open"));
+                BlockerRef {
+                    display: format!("#{n}"),
+                    number: Some(n),
+                    open,
+                    cross_repo_managed: None,
                 }
-            })
-            .collect()
+            }
+            Some(_) => BlockerRef {
+                display: r,
+                number: None,
+                open: Some(false),
+                cross_repo_managed: None,
+            },
+            None => {
+                let slug = r.split('#').next().unwrap_or_default().to_string();
+                BlockerRef {
+                    display: r,
+                    number: None,
+                    open: None,
+                    cross_repo_managed: Some((self.ctx.managed)(&slug)),
+                }
+            }
+        }
+    }
+
+    /// The blockers a `loom:blocked` issue names, and what its comments say
+    /// about the block (#10151). The body is read first; only when it names
+    /// no open blocker are the issue's trusted comments read, both for
+    /// blockers named there and for the pass's own stale-block markers.
+    fn blocked_facts(&mut self, issue: &RestIssue) -> (Vec<BlockerRef>, Option<CommentFacts>) {
+        if !issue.labels.iter().any(|l| l == BLOCKED_LABEL) {
+            return (Vec::new(), Some(CommentFacts::default()));
+        }
+        let mut refs: BTreeSet<String> = self.dependency_refs(issue).into_iter().collect();
+        let mut blockers: Vec<BlockerRef> = refs
+            .clone()
+            .into_iter()
+            .map(|r| self.blocker_ref(r, issue.number))
+            .collect();
+        if blockers.iter().any(|b| b.open != Some(false)) {
+            return (blockers, Some(CommentFacts::default()));
+        }
+        // The comments read counts against the walk's read cap like any other
+        // single-issue read; past the cap it is not made, which reads as
+        // "comments unread" (no write this pass).
+        if self.read_cap.is_some_and(|cap| self.reads >= cap) {
+            log::debug!(
+                "star_liveness: {} reached its read cap this pass; comments of #{} not read",
+                self.ctx.slug,
+                issue.number
+            );
+            return (blockers, None);
+        }
+        self.reads += 1;
+        let facts = match self.forge.comments(issue.number) {
+            Ok(comments) => {
+                let me = self.forge.self_login();
+                stale::comment_facts(&comments, me.as_deref())
+            }
+            Err(e) => {
+                log::debug!(
+                    "star_liveness: reading comments of {}#{} failed: {e}",
+                    self.ctx.slug,
+                    issue.number
+                );
+                return (blockers, None);
+            }
+        };
+        for text in &facts.bodies {
+            for r in crate::dep_classify::refs::parse_named_blocker_refs(text, self.ctx.slug) {
+                if refs.insert(r.clone()) {
+                    let b = self.blocker_ref(r, issue.number);
+                    blockers.push(b);
+                }
+            }
+        }
+        (blockers, Some(facts))
     }
 
     fn capacity(&self, n: u32) -> Capacity {
@@ -298,21 +473,11 @@ impl<'a> Evaluator<'a> {
                 detail: detail.clone(),
             };
         }
-        match self.tick_row(n).map(|r| r.disposition) {
-            Some(
-                d @ (QueueDisposition::DeferredCapacity
-                | QueueDisposition::DeferredRampCap
-                | QueueDisposition::DeferredSaturation
-                | QueueDisposition::DeferredBuildBackoff
-                | QueueDisposition::DeferredOutOfSlice
-                | QueueDisposition::DeferredRepoCap
-                | QueueDisposition::HostConstraint
-                | QueueDisposition::HostClassRefused),
-            ) => Capacity::Deferred {
-                reason: d.reason().to_string(),
-            },
-            _ => Capacity::Available,
-        }
+        self.tick_row(n)
+            .and_then(|row| {
+                super::queue::wait(row, self.ctx.host_queue, self.ctx.tick_rows, self.ctx.cap)
+            })
+            .map_or(Capacity::Available, Capacity::Deferred)
     }
 
     fn red_main_fix(&self) -> Option<u32> {
@@ -322,6 +487,33 @@ impl<'a> Evaluator<'a> {
             .filter(|r| r.main_red_fix)
             .map(|r| r.issue)
             .min()
+    }
+
+    /// One step of the walk onto `child`: skip it when it is known to
+    /// inherit nothing, defer it when the cap is reached, else evaluate it.
+    fn visit(&mut self, child: u32, cap: usize, now: u64) -> Visit {
+        let key = (self.ctx.slug.to_string(), child);
+        if self.refusals.settled.contains_key(&key) {
+            return Visit::Settled;
+        }
+        let Some(issue) = self.issue(child) else {
+            return Visit::Deferred;
+        };
+        if issue.is_pull_request || !issue.state.eq_ignore_ascii_case("open") {
+            self.refusals.deferred.remove(&key);
+            self.refusals.settled.insert(key, now);
+            return Visit::Settled;
+        }
+        if self.reads + self.pending_blocker_reads(&issue) > cap {
+            log::debug!(
+                "star_liveness: {} reached {MAX_WALK_READS_PER_PASS} walk reads \
+                 this pass; #{child} waits for a later one",
+                self.ctx.slug
+            );
+            return Visit::Deferred;
+        }
+        self.refusals.deferred.remove(&key);
+        Visit::Open(Box::new(self.evaluate_one(&issue, None, None)))
     }
 
     fn evaluate_one(
@@ -346,12 +538,18 @@ impl<'a> Evaluator<'a> {
         let row = self.tick_row(n);
         let disposition = row.map(|r| r.disposition);
         let row_starred_at = row.and_then(|r| r.operator_priority_at.clone());
+        let (blockers, comment_facts) = self.blocked_facts(issue);
+        let comments_unread = comment_facts.is_none();
+        let comment_facts = comment_facts.unwrap_or_default();
         let facts = StarFacts {
             repo: self.ctx.slug.to_string(),
             managed: true,
             issue: item_facts(issue),
             pr: pr_facts,
-            blockers: self.blockers(issue),
+            blockers,
+            curator_handoff: comment_facts.handoff,
+            unblocked_before: comment_facts.unblocked,
+            comments_unread,
             red_main_fix: self.red_main_fix(),
             live_sweep: matches!(
                 disposition,
@@ -436,37 +634,136 @@ impl<'a> Evaluator<'a> {
             .iter()
             .map(|i| self.evaluate_one(i, None, None))
             .collect();
-        let mut seen: BTreeSet<u32> = issues.iter().map(|i| i.number).collect();
-        let mut frontier: Vec<(u32, u32, Option<String>)> = out
+        let roots: Vec<Root> = out
             .iter()
-            .filter_map(|e| {
-                e.landing
-                    .inherits
-                    .map(|b| (b, e.facts.issue.number, e.starred_at.clone()))
+            .map(|e| Root {
+                number: e.facts.issue.number,
+                starred_at: e.starred_at.clone(),
             })
             .collect();
-        for _ in 0..MAX_INHERIT_DEPTH {
-            let mut next = Vec::new();
-            for (blocker, from, at) in frontier {
-                if !seen.insert(blocker) {
+
+        // Explore breadth-first from every root at once, so each issue is
+        // expanded at its shallowest depth; then [`edges::descendants`]
+        // decides, per child, which starred ancestor it inherits from
+        // (earliest starred-at). Every open child inherits, not only the
+        // first one named (#10012).
+        let mut seen: BTreeSet<u32> = issues.iter().map(|i| i.number).collect();
+        let mut found: Vec<Evaluated> = Vec::new();
+        let mut graph: Vec<Edge> = Vec::new();
+        // Nodes to expand, by depth: a deferred child resumed below joins its
+        // own depth's list, so it is not starved by shallower siblings.
+        let mut levels: Vec<Vec<Pending>> = vec![Vec::new(); MAX_INHERIT_DEPTH + 1];
+        levels[0] = out
+            .iter()
+            .map(|e| (e.facts.issue.number, e.landing.inherits.clone(), Vec::new()))
+            .collect();
+        // Count the walk's forge reads, not the open children it finds: a
+        // closed child or a PR costs a read too (#10073 review).
+        let walk_start = self.reads;
+        let cap = walk_start + MAX_WALK_READS_PER_PASS;
+        self.read_cap = Some(cap);
+        let slug = self.ctx.slug.to_string();
+        self.refusals.walk_pass += 1;
+        let now = self.refusals.walk_pass;
+        self.refusals
+            .settled
+            .retain(|_, at| now.saturating_sub(*at) < SETTLED_TTL_PASSES);
+
+        // Resume what the cap deferred last pass before anything else, down
+        // its recorded path (an ancestor not evaluated yet is evaluated
+        // first), so a deep child is not starved by a full shallow frontier
+        // or by an earlier root. A path the forge text no longer supports is
+        // dropped.
+        let mut inherits_of: HashMap<u32, Vec<u32>> = levels[0]
+            .iter()
+            .map(|(n, inh, _)| (*n, inh.clone()))
+            .collect();
+        let resumable: Vec<(u32, Vec<Edge>)> = self
+            .refusals
+            .deferred
+            .iter()
+            .filter(|((s, _), _)| *s == slug)
+            .map(|((_, child), path)| (*child, path.clone()))
+            .collect();
+        for (target, path) in resumable {
+            let key = (slug.clone(), target);
+            for (i, recorded) in path.iter().enumerate() {
+                let still_linked = inherits_of.get(&recorded.parent).is_some_and(|inh| {
+                    self.children(recorded.parent, inh)
+                        .iter()
+                        .any(|e| e.child == recorded.child)
+                });
+                if !still_linked {
+                    self.refusals.deferred.remove(&key);
+                    break;
+                }
+                let child = recorded.child;
+                if seen.contains(&child) {
                     continue;
                 }
-                let Some(issue) = self.issue(blocker) else {
-                    continue;
-                };
-                if issue.is_pull_request || !issue.state.eq_ignore_ascii_case("open") {
-                    continue;
+                match self.visit(child, cap, now) {
+                    Visit::Settled => {
+                        self.refusals.deferred.remove(&key);
+                        break;
+                    }
+                    Visit::Deferred => break,
+                    Visit::Open(e) => {
+                        seen.insert(child);
+                        inherits_of.insert(child, e.landing.inherits.clone());
+                        levels[i + 1].push((
+                            child,
+                            e.landing.inherits.clone(),
+                            path[..=i].to_vec(),
+                        ));
+                        found.push(*e);
+                    }
                 }
-                let e = self.evaluate_one(&issue, Some(from), at);
-                if let Some(b) = e.landing.inherits {
-                    next.push((b, blocker, e.starred_at.clone()));
-                }
-                out.push(e);
             }
-            if next.is_empty() {
-                break;
+        }
+
+        // Explore breadth-first from every root at once, so each issue is
+        // expanded at its shallowest depth; then [`edges::descendants`]
+        // decides, per child, which starred ancestor it inherits from
+        // (earliest starred-at). Every open child inherits, not only the
+        // first one named (#10012).
+        for depth in 0..MAX_INHERIT_DEPTH {
+            let frontier = std::mem::take(&mut levels[depth]);
+            for (parent, inherits, path) in frontier {
+                for edge in self.children(parent, &inherits) {
+                    let child = edge.child;
+                    graph.push(edge);
+                    if !seen.insert(child) {
+                        continue;
+                    }
+                    let mut child_path = path.clone();
+                    child_path.push(edge);
+                    match self.visit(child, cap, now) {
+                        Visit::Settled => {}
+                        Visit::Deferred => {
+                            self.refusals
+                                .deferred
+                                .insert((slug.clone(), child), child_path);
+                        }
+                        Visit::Open(e) => {
+                            levels[depth + 1].push((child, e.landing.inherits.clone(), child_path));
+                            found.push(*e);
+                        }
+                    }
+                }
             }
-            frontier = next;
+        }
+        self.read_cap = None;
+        let open: BTreeSet<u32> = found.iter().map(|e| e.facts.issue.number).collect();
+        graph.retain(|e| open.contains(&e.child));
+        let inherited = edges::descendants(&roots, &graph, MAX_INHERIT_DEPTH);
+        for mut e in found {
+            let Some(inh) = inherited.get(&e.facts.issue.number) else {
+                continue;
+            };
+            e.inherited_from = Some(inh.via);
+            e.starred_at = inh.starred_at.clone().or(e.starred_at);
+            super::landing::withhold_inherited_handoff(&e.facts, &mut e.landing, inh.via, inh.root);
+            out.push(e);
         }
         Ok(out)
     }

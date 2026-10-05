@@ -21,8 +21,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use super::policy::PolicySources;
 use super::report::Finding;
-use super::{Report, Section};
+use super::{Mode, Report, Section};
 use crate::event_bus::EventBus;
 
 /// Event topic for a dispatch refused by the gate.
@@ -173,14 +174,26 @@ fn admit(context: &str, report: &Report) -> Option<Refusal> {
 /// [`Refusal::event_payload`].
 #[must_use]
 pub fn dispatch_refusal(workspace: &Path) -> Option<Refusal> {
-    admit("dispatch", &super::assert_for(workspace))
+    dispatch_refusal_with(&PolicySources::from_process(Some(workspace)), workspace)
+}
+
+/// [`dispatch_refusal`] against explicit `sources` (hermetic tests; #9999).
+#[must_use]
+pub fn dispatch_refusal_with(sources: &PolicySources, workspace: &Path) -> Option<Refusal> {
+    admit("dispatch", &super::run_with(sources, workspace, Mode::Assert))
 }
 
 /// Worker spawn admission (`loom-daemon spawn-worker`, i.e.
 /// `spawn-worker.sh`): `Some(message)` ⇒ do not exec the runtime.
 #[must_use]
 pub fn spawn_refusal(workspace: &Path) -> Option<String> {
-    admit("spawn-worker", &super::assert_for(workspace)).map(|r| r.message())
+    spawn_refusal_with(&PolicySources::from_process(Some(workspace)), workspace)
+}
+
+/// [`spawn_refusal`] against explicit `sources` (hermetic tests; #9999).
+#[must_use]
+pub fn spawn_refusal_with(sources: &PolicySources, workspace: &Path) -> Option<String> {
+    admit("spawn-worker", &super::run_with(sources, workspace, Mode::Assert)).map(|r| r.message())
 }
 
 /// `<loom_dir>`: the parent of `LOOM_SOCKET_PATH` when set, else `~/.loom`

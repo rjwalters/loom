@@ -33,21 +33,21 @@
 //! if you change the format here, that test breaks on the shell side too.
 //! Change both or neither.
 //!
-//! # Why `--input -` JSON, not `-f body=…`
+//! # Why `--input <file>` JSON, not `-f body=…`
 //!
-//! Writes go to `gh api --input -` as `{"body": …}` JSON rather than
+//! Writes go to `gh api --input <file>` as `{"body": …}` JSON rather than
 //! repeated `-f key=value` flags: every body here is multi-line markdown,
 //! and `-f`'s shell-adjacent quoting has already corrupted comment bodies
 //! elsewhere in this repo (`merge_pr/redate.rs` documents the same choice).
-//! `serde_json` escaping is the only encoder in the path.
+//! `serde_json` escaping is the only encoder in the path. The JSON goes
+//! through a private (`0600`) temp file rather than `--input -` because the
+//! `gh` facade (`crate::gh_invocation`, which counts every call — #10089)
+//! owns the child's stdin.
 
 use std::ffi::OsStr;
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
-
-use crate::credential_preflight::apply_gh_config_for_root;
 
 /// The production dashboard origin, used when `LOOM_DASHBOARD_URL` is unset.
 pub const DEFAULT_DASHBOARD_BASE_URL: &str = "https://dashboard.2amlogic.com";
@@ -138,7 +138,7 @@ pub fn footer_or_body(
 
 /// The one comment POST. Appends the dashboard footer (nothing can skip it)
 /// and POSTs `{"body": …}` to `repos/{nwo}/issues/{number}/comments` via
-/// `gh api --input -` — a PR *is* an issue for comments, so one endpoint
+/// `gh api --input <file>` — a PR *is* an issue for comments, so one endpoint
 /// serves both. `root`, when given, selects the owner-partitioned
 /// `GH_CONFIG_DIR` for cross-owner managed repos (#5401 — a no-op for
 /// single-owner fleets). Returns the response body (the comment JSON, whose
@@ -160,37 +160,15 @@ pub fn post_comment(
     let full_body = append_dashboard_footer(nwo, &number, is_pr, body);
     let payload = serde_json::json!({ "body": full_body }).to_string();
 
-    let mut cmd = Command::new(gh_bin.as_ref());
-    cmd.arg("api")
-        .arg(format!("repos/{nwo}/issues/{number}/comments"))
-        .arg("--input")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(root) = root {
-        apply_gh_config_for_root(&mut cmd, root);
-    }
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("could not exec gh api (comment): {e}"))?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| "gh api stdin was not piped".to_string())?
-        .write_all(payload.as_bytes())
-        .map_err(|e| format!("could not write the comment request body: {e}"))?;
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("gh api (comment) failed: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "gh api (comment on {nwo}#{number}) failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    String::from_utf8(out.stdout).map_err(|e| format!("gh api (comment) output was not UTF-8: {e}"))
+    gh_api_write_json(
+        gh_bin.as_ref(),
+        root,
+        "comment.post",
+        &format!("repos/{nwo}/issues/{number}/comments"),
+        None,
+        &payload,
+    )
+    .map_err(|e| e.replace("{what}", &format!("comment on {nwo}#{number}")))
 }
 
 /// Parse a forge issue reference into `(owner/repo, number)`, where the slug
@@ -389,38 +367,67 @@ fn gh_api_get(gh_bin: &str, path: &str) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|e| format!("gh api {path} output was not UTF-8: {e}"))
 }
 
-/// `gh api <path> -X PATCH --input -` with a JSON request body — the same
-/// stdin-JSON discipline as [`post_comment`] (multi-line markdown never goes
-/// through `-f`).
+/// `gh api <path> -X PATCH --input <file>` with a JSON request body — the
+/// same JSON-body discipline as [`post_comment`] (multi-line markdown never
+/// goes through `-f`).
 fn gh_api_patch(gh_bin: &str, path: &str, json: &str) -> Result<String, String> {
-    let mut child = std::process::Command::new(gh_bin)
-        .arg("api")
-        .arg(path)
-        .arg("-X")
-        .arg("PATCH")
-        .arg("--input")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not exec gh api: {e}"))?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| "gh api stdin was not piped".to_string())?
+    gh_api_write_json(OsStr::new(gh_bin), None, "comment.patch", path, Some("PATCH"), json)
+        .map_err(|e| e.replace("{what}", &format!("PATCH {path}")))
+}
+
+/// Deadline for a comment write (#10089: the facade bounds every child; these
+/// writes were unbounded). Generous so only a wedged forge — not a slow one —
+/// trips it; a write that times out may still have landed, so callers treat
+/// the error as "unknown", exactly as a mid-flight transport death before.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// One counted `gh api <path> [-X <method>] --input <file>` write through the
+/// `gh` facade, booked under `op` (#10089). The JSON body goes through a
+/// private (`0600`) temp file because the facade owns the child's stdin.
+/// `root`, when given, selects the cross-owner `GH_CONFIG_DIR` (#5401).
+///
+/// Error strings carry a `{what}` placeholder the caller fills in, so each
+/// public entry point keeps its existing error wording.
+fn gh_api_write_json(
+    gh_bin: &OsStr,
+    root: Option<&Path>,
+    op: &'static str,
+    path: &str,
+    method: Option<&str>,
+    json: &str,
+) -> Result<String, String> {
+    use crate::cmd_out::CmdOutcome;
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    let mut input = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("could not create the gh api request body file: {e}"))?;
+    input
         .write_all(json.as_bytes())
+        .and_then(|()| input.flush())
         .map_err(|e| format!("could not write the gh api request body: {e}"))?;
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("gh api (PATCH {path}) failed: {e}"))?;
+    let mut inv =
+        GhInvocation::new(Operation::new(op), AccessIntent::Write, GhTarget::None, WRITE_TIMEOUT)
+            .program(gh_bin)
+            .arg("api")
+            .arg(path);
+    if let Some(method) = method {
+        inv = inv.arg("-X").arg(method);
+    }
+    inv = inv.arg("--input").arg(input.path());
+    if let Some(root) = root {
+        inv = inv.current_dir(root);
+    }
+    let out = match inv.run() {
+        CmdOutcome::Ran(out) => out,
+        CmdOutcome::Unavailable(u) => return Err(format!("gh api ({{what}}) failed: {u}")),
+    };
     if !out.status.success() {
         return Err(format!(
-            "gh api (PATCH {path}) failed: {}",
+            "gh api ({{what}}) failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    String::from_utf8(out.stdout).map_err(|e| format!("gh api output was not UTF-8: {e}"))
+    String::from_utf8(out.stdout)
+        .map_err(|e| format!("gh api ({{what}}) output was not UTF-8: {e}"))
 }
 
 #[cfg(test)]
