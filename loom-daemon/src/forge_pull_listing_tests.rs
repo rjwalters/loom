@@ -198,7 +198,10 @@ fn a_per_pr_entry_stores_only_mergeable_and_stale_ones_are_pruned() {
     // (a umask-002 host would otherwise wipe the seeded files).
     {
         use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(0o700).create(&store_dir).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&store_dir)
+            .unwrap();
     }
     store::set_test_daemon_store_dir(Some(store_dir.clone()));
     let _guard = StoreGuard;
