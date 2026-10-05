@@ -128,6 +128,8 @@ fn hostname_arg(args: &[OsString]) -> Option<String> {
 ///   `github.com` (`gh`'s own default host resolution, in that order).
 /// - repo: the site's, else the typed [`super::GhTarget`], else `LOOM_REPO`
 ///   (the same `GH_REPO` fallback [`GhInvocation::env_plan`] hands the child).
+/// - role (#9872): `reader` / `writer` / `writer-fallback` — which identity,
+///   so which rate-limit pool, served the call.
 ///
 /// Never a credential, a header or a body: only these four short tokens, and
 /// each still goes through [`forge_call_stats::sanitize`].
@@ -156,7 +158,7 @@ fn resolved_identity_with(
             id = id.with_repo(&repo);
         }
     }
-    id
+    id.with_role(super::reader_route::role_of(inv).as_str())
 }
 
 /// Record one completed invocation (see the module docs for what is skipped).

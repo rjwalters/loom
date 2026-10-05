@@ -169,30 +169,25 @@ fn resolve(
     let stdout = match probe {
         Ok(stdout) => stdout,
         Err(e) => {
-            return CredentialPreflightReport {
-                ok: false,
-                mechanism: "unknown".to_string(),
-                fingerprint: None,
-                message: format!(
+            return CredentialPreflightReport::new(
+                false,
+                "unknown",
+                None,
+                format!(
                     "could not determine gh authentication state ({e}) — forge calls may fail \
                      silently. Export GH_TOKEN before starting the daemon (see \
                      loom-daemon-start.sh), or unlock the login keychain from a GUI session."
                 ),
                 checked_at,
-            };
+            );
         }
     };
 
     let parsed: serde_json::Value = match serde_json::from_str(&stdout) {
         Ok(v) => v,
         Err(e) => {
-            return CredentialPreflightReport {
-                ok: false,
-                mechanism: "unknown".to_string(),
-                fingerprint: None,
-                message: format!("could not parse `gh auth status --json hosts` output ({e})"),
-                checked_at,
-            };
+            let m = format!("could not parse `gh auth status --json hosts` output ({e})");
+            return CredentialPreflightReport::new(false, "unknown", None, m, checked_at);
         }
     };
 
@@ -209,16 +204,10 @@ fn resolve(
         .find(|entry| entry.get("active").and_then(serde_json::Value::as_bool) == Some(true));
 
     let Some(active) = active else {
-        return CredentialPreflightReport {
-            ok: false,
-            mechanism: "none".to_string(),
-            fingerprint: None,
-            message: "no usable gh credential found — not logged into any GitHub host. Export \
-                      GH_TOKEN before starting the daemon (see loom-daemon-start.sh), or run \
-                      `gh auth login` / unlock the login keychain from a GUI session."
-                .to_string(),
-            checked_at,
-        };
+        let m = "no usable gh credential found — not logged into any GitHub host. Export \
+                 GH_TOKEN before starting the daemon (see loom-daemon-start.sh), or run \
+                 `gh auth login` / unlock the login keychain from a GUI session.";
+        return CredentialPreflightReport::new(false, "none", None, m.to_string(), checked_at);
     };
 
     let token_source = active
@@ -235,17 +224,12 @@ fn resolve(
         .filter(|s| !s.is_empty());
 
     if state != "success" {
-        return CredentialPreflightReport {
-            ok: false,
-            mechanism: token_source.to_string(),
-            fingerprint: None,
-            message: format!(
-                "gh reports the active credential ({token_source}) as unusable — forge calls \
-                 will 401. Export a valid GH_TOKEN before starting the daemon, or unlock the \
-                 login keychain from a GUI session."
-            ),
-            checked_at,
-        };
+        let m = format!(
+            "gh reports the active credential ({token_source}) as unusable — forge calls \
+             will 401. Export a valid GH_TOKEN before starting the daemon, or unlock the \
+             login keychain from a GUI session."
+        );
+        return CredentialPreflightReport::new(false, token_source, None, m, checked_at);
     }
 
     let fingerprint = match token_source {
@@ -254,16 +238,11 @@ fn resolve(
         _ => login.map(str::to_string),
     };
 
-    CredentialPreflightReport {
-        ok: true,
-        mechanism: token_source.to_string(),
-        fingerprint,
-        message: match login {
-            Some(l) => format!("authenticated via {token_source} (account {l})"),
-            None => format!("authenticated via {token_source}"),
-        },
-        checked_at,
-    }
+    let message = match login {
+        Some(l) => format!("authenticated via {token_source} (account {l})"),
+        None => format!("authenticated via {token_source}"),
+    };
+    CredentialPreflightReport::new(true, token_source, fingerprint, message, checked_at)
 }
 
 /// Run the startup preflight and log the outcome (#4005 AC1/AC2): `info!` on
@@ -982,15 +961,15 @@ pub fn run_with_github_app(
                 "credential_preflight: forge credential resolved via github-app ({fingerprint}) — #4430"
             );
             GithubAppPreflight {
-                report: CredentialPreflightReport {
-                    ok: true,
-                    mechanism: "github-app".to_string(),
-                    fingerprint: Some(fingerprint),
-                    message: format!(
+                report: CredentialPreflightReport::new(
+                    true,
+                    "github-app",
+                    Some(fingerprint),
+                    format!(
                         "authenticated via github-app (app {app_id}, installation {installation_id})"
                     ),
-                    checked_at: Utc::now(),
-                },
+                    Utc::now(),
+                ),
                 minted_gh_token: Some(token),
             }
         }
@@ -1626,6 +1605,9 @@ pub fn force_refresh_owner_credential(repo_root: &Path) -> bool {
     };
     force_refresh_owner_credential_with(workspace_root, repo_root, &minter)
 }
+
+pub mod pool;
+pub use pool::attach as attach_pool;
 
 #[cfg(test)]
 mod egress_publication_tests;

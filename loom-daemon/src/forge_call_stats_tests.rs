@@ -18,6 +18,7 @@ fn line(t: i64, caller: &str, p: Pool, o: Outcome, rem: Option<u64>) -> String {
         pv: None,
         og: None,
         rp: None,
+        ir: None,
     })
     .unwrap()
 }
@@ -41,6 +42,7 @@ fn id_line(t: i64, caller: &str, o: Outcome, identity: &CallIdentity) -> String 
         pv: identity.provider.clone(),
         og: identity.origin.clone(),
         rp: identity.repo.clone(),
+        ir: identity.role.clone(),
     })
     .unwrap()
 }

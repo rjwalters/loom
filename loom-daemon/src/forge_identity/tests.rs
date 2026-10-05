@@ -334,6 +334,12 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         "observability/eta_fleet_refresh.rs",
         "ci_telemetry/api.rs", // repos/<o>/<r>/actions/... GETs
         "fleet_store/gh.rs",   // fleet-config: commit/tree/blob GETs (`--method GET`)
+        // #9872: the `GhInvocation` choke point. Only `AccessIntent::Read` +
+        // `Captured` + an explicit repo target, never `.writer_identity()`
+        // (`reader_route::reader_slug` is the gate, `reader_route_tests`
+        // pins it).
+        "gh_invocation/mod.rs",
+        "gh_invocation/reader_route.rs",
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let re = regex::Regex::new(r"\b(read_credential|read_credential_in|apply_read_credential)\b")

@@ -2296,6 +2296,24 @@ pub struct ForgeCallsStatus {
     /// computed one; empty when the sink carries no identity-bearing lines yet.
     #[serde(default)]
     pub operations: Option<Vec<ForgeOperationCounts>>,
+    /// Host-wide counts over the window per **identity role** (#9872):
+    /// `reader` (a reader App's own pool), `writer`, `writer-fallback` (a
+    /// read a reader failed on, re-run on the writer) and `unknown` (a line
+    /// from an older binary or a call recorded outside the `gh` facade).
+    /// `None` when the sink is disabled, or from an older daemon.
+    #[serde(default)]
+    pub identity_roles: Option<Vec<ForgeIdentityRoleCounts>>,
+}
+
+/// One identity-role row of [`ForgeCallsStatus`] (#9872).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeIdentityRoleCounts {
+    /// `reader`, `writer`, `writer-fallback` or `unknown`.
+    pub role: String,
+    pub ok: u64,
+    pub not_modified: u64,
+    pub rate_limited: u64,
+    pub error: u64,
 }
 
 /// One call-identity row of [`ForgeCallsStatus`] (Issue #9777).
@@ -2890,6 +2908,28 @@ pub struct CredentialPreflightReport {
     pub message: String,
     /// Wall-clock time this snapshot was taken (daemon startup).
     pub checked_at: DateTime<Utc>,
+    /// Which GitHub rate-limit pool the credential spends (#9872). `None`
+    /// when no credential resolved, the gateway owns it, or the report came
+    /// from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<CredentialPool>,
+}
+
+/// The rate-limit pool a resolved writer credential spends (#9872).
+///
+/// Every personal access token (classic and fine-grained), OAuth token and
+/// `gh` login of one user shares that user's single pool; only a GitHub App
+/// installation token (or another account) has its own. Never a token value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialPool {
+    /// `installation` (a GitHub App installation token) or `user`.
+    pub kind: String,
+    /// The account login, for `user` (resolved once with `gh api user`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    /// The account's numeric id, for `user`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<u64>,
 }
 
 // ========================================================================

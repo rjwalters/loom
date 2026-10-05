@@ -58,6 +58,7 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
             fingerprint: None,
             message: "test fixture — not a real preflight".to_string(),
             checked_at: Utc::now(),
+            pool: None,
         }),
         draining: false,
         drain_deadline: None,

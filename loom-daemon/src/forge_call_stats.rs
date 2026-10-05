@@ -257,6 +257,10 @@ pub struct CallIdentity {
     pub origin: Option<String>,
     /// `owner/repo` slug.
     pub repo: Option<String>,
+    /// Which identity served the call (#9872): `reader`, `writer` or
+    /// `writer-fallback` — the rate-limit pool it spent. Set by the
+    /// `GhInvocation` facade; `None` for a caller recording outside it.
+    pub role: Option<String>,
 }
 
 impl CallIdentity {
@@ -291,6 +295,12 @@ impl CallIdentity {
     #[must_use]
     pub fn with_repo(mut self, repo: &str) -> Self {
         self.repo = sanitize(repo);
+        self
+    }
+
+    #[must_use]
+    pub fn with_role(mut self, role: &str) -> Self {
+        self.role = sanitize(role);
         self
     }
 
@@ -421,6 +431,7 @@ pub fn record_with_identity(
         pv: identity.provider.clone(),
         og: identity.origin.clone(),
         rp: identity.repo.clone(),
+        ir: identity.role.clone(),
     };
     if let Ok(mut state) = process_state().lock() {
         state.add(&line);
@@ -463,6 +474,9 @@ struct SinkLine {
     /// `owner/repo` slug.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rp: Option<String>,
+    /// Identity role (#9872); absent on pre-#9872 lines and non-facade calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ir: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -506,6 +520,8 @@ struct Aggregate {
     started_at: i64,
     counts: BTreeMap<(String, Pool), Counts>,
     identities: BTreeMap<IdentityKey, Counts>,
+    /// Counts per identity role (#9872); a line without one is `unknown`.
+    roles: BTreeMap<String, Counts>,
     latest: BTreeMap<Pool, Reading>,
 }
 
@@ -513,6 +529,8 @@ impl Aggregate {
     fn add(&mut self, line: &SinkLine) {
         let c = self.counts.entry((line.c.clone(), line.p)).or_default();
         bump(c, line.o);
+        let role = line.ir.as_deref().unwrap_or(UNKNOWN_OPERATION);
+        bump(self.roles.entry(role.to_string()).or_default(), line.o);
         if let Some(operation) = line.op.clone() {
             let key: IdentityKey = (operation, line.pv.clone(), line.og.clone(), line.rp.clone());
             let i = self.identities.entry(key).or_default();
@@ -554,6 +572,20 @@ impl Aggregate {
             .map(|((caller, pool), c)| ForgeCallCounts {
                 caller: caller.clone(),
                 pool: pool.as_str().to_string(),
+                ok: c.ok,
+                not_modified: c.not_modified,
+                rate_limited: c.rate_limited,
+                error: c.error,
+            })
+            .collect()
+    }
+
+    /// The #9872 per-identity-role rows.
+    fn role_rows(&self) -> Vec<crate::types::ForgeIdentityRoleCounts> {
+        self.roles
+            .iter()
+            .map(|(role, c)| crate::types::ForgeIdentityRoleCounts {
+                role: role.clone(),
                 ok: c.ok,
                 not_modified: c.not_modified,
                 rate_limited: c.rate_limited,
@@ -843,6 +875,7 @@ pub fn status_report(
     ForgeCallsStatus {
         window_secs: WINDOW_SECS.unsigned_abs(),
         operations: window.as_ref().map(Aggregate::identity_rows),
+        identity_roles: window.as_ref().map(Aggregate::role_rows),
         host_window: window.map(|w| w.rows()),
         since_start,
         since,
