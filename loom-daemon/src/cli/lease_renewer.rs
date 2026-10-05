@@ -118,6 +118,21 @@ pub(crate) enum RenewerAction {
         #[command(flatten)]
         key: KeyArgs,
     },
+    /// Mark every inherited fd above 2 close-on-exec, then exec `CMD` (#10203).
+    ///
+    /// `sweep-lease-renew.sh start` re-enters itself through this so its
+    /// detached loop holds no descriptor of the caller's (fd 3's saved stdout,
+    /// an fd 10+ pipe, ...), which would otherwise keep a `worktree.sh N | tail`
+    /// pipe open for the loop's whole lifetime. `--check` only proves this
+    /// binary has the subcommand (exit 0), so an older daemon stays fail-open.
+    SanitizeExec {
+        /// Exit 0 without exec'ing anything.
+        #[arg(long)]
+        check: bool,
+        /// The command to exec, after `--`.
+        #[arg(last = true, value_name = "CMD")]
+        cmd: Vec<String>,
+    },
 }
 
 /// One renewer's ownership record.
@@ -399,6 +414,19 @@ fn owner_is_live(pid: u32, ident: &str) -> bool {
 
 impl RenewerAction {
     pub(crate) fn run(self) -> Result<()> {
+        if let Self::SanitizeExec { check, cmd } = &self {
+            if *check {
+                return Ok(());
+            }
+            let Some((program, rest)) = cmd.split_first() else {
+                anyhow::bail!("sanitize-exec: no command given after `--`");
+            };
+            super::lease_ensure::mark_inherited_fds_cloexec();
+            let err = std::os::unix::process::CommandExt::exec(
+                std::process::Command::new(program).args(rest),
+            );
+            anyhow::bail!("sanitize-exec: cannot exec {program}: {err}");
+        }
         let store = Store::from_env();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let repo = repo_identity(std::env::var("LOOM_REPO").ok().as_deref(), &cwd);
@@ -433,6 +461,7 @@ impl RenewerAction {
                 }
                 std::process::exit(code)
             }
+            Self::SanitizeExec { .. } => unreachable!("handled before the store is opened"),
             Self::Release { key } => {
                 let sweep = key.sweep_id.clone().unwrap_or_else(|| {
                     std::env::var("LOOM_TERMINAL_ID")

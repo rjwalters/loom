@@ -804,6 +804,10 @@ cmd_renew_once() {
 # --- start ---------------------------------------------------------------
 
 cmd_start() {
+    # Issue #10203: re-enter once through the daemon, which marks every fd the
+    # caller leaked (above 2) close-on-exec before exec'ing us again. Skipped
+    # when the binary predates `sanitize-exec` (--check) so `start` stays fail-open.
+    [[ -n "${LOOM_RENEW_FDS_CLEAN:-}" ]] || ! "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer sanitize-exec --check > /dev/null 2>&1 || LOOM_RENEW_FDS_CLEAN=1 exec "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer sanitize-exec -- "$SELF" start "$@"
     local issue="${1:-}"
     shift || true
     [[ "$issue" =~ ^[0-9]+$ ]] || {
@@ -974,8 +978,9 @@ cmd_start() {
     # inherited from the caller except its own log (fd 9), so the closing
     # redirect below also closes 3-8. An inherited fd 3 -- worktree.sh's saved
     # stdout, i.e. a `worktree.sh N | tail` pipe -- otherwise kept that pipe
-    # open for the loop's whole 4h lifetime. (`loom-daemon lease ensure` also
-    # marks every inherited fd close-on-exec before it runs `start`.)
+    # open for the loop's whole 4h lifetime. `cmd_start` re-enters itself
+    # through `loom-daemon lease renewer sanitize-exec` so fds 10+ are
+    # closed too; `loom-daemon lease ensure` does the same marking before `start`.
     # Issue #10229: one renewer per (repo, host, sweep, issue), and a cycle
     # that ends the loop once the issue is closed, even while the watched
     # interactive parent lives on. The decisions live in `loom-daemon lease
@@ -984,18 +989,6 @@ cmd_start() {
     # unverified, skip this PATCH; anything else (incl. an older binary) renews.
     local -a owner_args=("$issue" --host "$host" --sweep-id "$sweep_id" --token "$$.${RANDOM}.${loop_started_at}")
     (
-        # Issue #10203 (follow-up): the fixed 3-8 list above misses a caller
-        # that launched `start` with a higher fd open (fd 10+). Close every
-        # remaining inherited fd except 0-2, 9 (the log) and 255 (bash's own
-        # script fd). The directory listing's own transient fd is already
-        # closed by the time its name is used, so closing it is a no-op.
-        for _fd_path in /dev/fd/*; do
-            _fd="${_fd_path##*/}"
-            [[ "$_fd" =~ ^[0-9]+$ ]] || continue
-            case "$_fd" in 0 | 1 | 2 | 9 | 255) continue ;; esac
-            eval "exec ${_fd}>&-" 2> /dev/null || true
-        done
-        unset _fd_path _fd
         cached_lease=""
         while pid_is_live "$watch_pid" "$watch_ident"; do
             if max_age_exceeded "$loop_started_at" "$max_age"; then

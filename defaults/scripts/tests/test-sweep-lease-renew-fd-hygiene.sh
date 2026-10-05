@@ -10,8 +10,8 @@
 #   (1) a pipe handed to `start` on fds 3 and 7 closes as soon as `start`
 #       returns -- pre-fix, `cat` waits out the loop's first 8s sleep
 #   (2) the loop is still running once the pipe has closed
-#   (3) none of fds 3-8 or 10-12 (above 9, #10203 follow-up) is open in the loop or its `sleep` child once it has
-#       parked in that sleep (fd 9 is its own log)
+#   (3) none of fds 3-8 or 10-12 is open in the loop or its `sleep` child once
+#       it has parked in that sleep (fd 9 is its own log)
 #
 # Bounded: a regression fails in ~8s instead of hanging. The watched PID dies
 # (4s) before the loop's first wake-up (8s), so the loop exits without ever
@@ -19,13 +19,22 @@
 # test-sweep-lease-renew.sh, which sits at the file-size threshold
 # (.loom/docs/file-size-policy.md).
 #
+# Needs a built loom-daemon (CI: the daemon-built job, not the hermetic loop).
+#
 # Usage:
 #   ./.loom/scripts/tests/test-sweep-lease-renew-fd-hygiene.sh
 
 set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT="$(cd "$TEST_DIR/.." && pwd)/sweep-lease-renew.sh"
+SCRIPTS_DIR="$(cd "$TEST_DIR/.." && pwd)"
+SCRIPT="$SCRIPTS_DIR/sweep-lease-renew.sh"
+
+# fds 10+ are closed by `loom-daemon lease renewer sanitize-exec`, which `start`
+# re-enters through. Pin the built binary (FAILS rather than skips without one).
+# shellcheck source=lib/require-daemon-bin.sh
+source "$TEST_DIR/lib/require-daemon-bin.sh"
+loom_test_require_daemon_bin "$SCRIPTS_DIR" "lease renewer sanitize-exec"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

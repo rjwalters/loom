@@ -465,7 +465,7 @@ impl LeaseEnsureArgs {
 /// here, they just stop crossing `exec`. Done in the parent rather than in
 /// `pre_exec` because enumerating `/dev/fd` allocates, which is not safe
 /// between fork and exec.
-fn mark_inherited_fds_cloexec() {
+pub(crate) fn mark_inherited_fds_cloexec() {
     let Ok(entries) = std::fs::read_dir("/dev/fd") else {
         return;
     };
