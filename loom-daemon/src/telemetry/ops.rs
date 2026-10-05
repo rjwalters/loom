@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 /// construction — never an issue number, sha, sweep id or path. The gateway
 /// collector's datapoint `keep_keys` must include every key (contract-tested).
 pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
-    "reason", "provider", "account", "model", "state", "resource",
+    "reason", "provider", "account", "model", "state", "resource", "task",
 ];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
@@ -266,6 +266,16 @@ pub enum MetricName {
     /// trailing window.
     #[serde(rename = "loom.merge.time_to_land_max")]
     MergeTimeToLandMax,
+    // ---- Long-running task liveness (Issue #10414) -----------------------
+    /// 1 while a long-running daemon loop beat within its staleness window,
+    /// 0 once it went silent or marked itself dead, labelled `task`
+    /// (`crate::task_liveness`). Never labelled by repo or issue.
+    #[serde(rename = "loom.daemon.task_alive")]
+    DaemonTaskAlive,
+    /// Faults a long-running loop survived or died of since the previous
+    /// point, labelled `task` and `reason` = `panic` / `overrun` / `exit`.
+    #[serde(rename = "loom.daemon.task_faults")]
+    DaemonTaskFaults,
 }
 
 impl MetricName {
@@ -314,6 +324,8 @@ impl MetricName {
             Self::MergeRedatePrs => "loom.merge.redate_prs",
             Self::MergeRedatesMax => "loom.merge.redates_max",
             Self::MergeTimeToLandMax => "loom.merge.time_to_land_max",
+            Self::DaemonTaskAlive => "loom.daemon.task_alive",
+            Self::DaemonTaskFaults => "loom.daemon.task_faults",
         }
     }
 
@@ -338,7 +350,8 @@ impl MetricName {
             | Self::ForgeStageDwell
             | Self::ForgeStageDwellSamples
             | Self::QueueDispositionRowsDropped
-            | Self::GithubRateLimitBreakerSkips => MetricKind::DeltaCounter,
+            | Self::GithubRateLimitBreakerSkips
+            | Self::DaemonTaskFaults => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
     }
@@ -376,6 +389,8 @@ impl MetricName {
             Self::MergeRedatePrs => "{pull_request}",
             Self::MergeRedatesMax => "{redate}",
             Self::MergeTimeToLandMax => "s",
+            Self::DaemonTaskAlive => "1",
+            Self::DaemonTaskFaults => "{fault}",
             _ => "By",
         }
     }
@@ -437,6 +452,8 @@ impl MetricName {
             Self::MergeTimeToLandMax => {
                 "Longest first-re-date-to-landing time of a PR landed in the window."
             }
+            Self::DaemonTaskAlive => "1 while a long-running daemon loop is beating, by task.",
+            Self::DaemonTaskFaults => "Faults of a long-running daemon loop, by task and reason.",
         }
     }
 }

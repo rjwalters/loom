@@ -15,6 +15,12 @@
 //! `tokio::time::interval` (`intervalSecs`, first cycle [`FIRST_CYCLE_DELAY`]
 //! after spawn, missed ticks skipped), each cycle one `spawn_blocking` call
 //! under `catch_unwind`, so a panic is a `warn` and the next tick retries.
+//! Since #10414 each cycle is awaited for at most one interval
+//! ([`super::cycle_guard`]). A cycle that runs longer is logged and counted as a
+//! `loom.daemon.task_faults{reason=overrun}` fault. No second cycle starts while
+//! it is still running. Every finished cycle beats the
+//! `task_alive{task=eta_fleet_refresh}` liveness gauge, so a wedged cycle shows
+//! as a `0`.
 //!
 //! # One refresher: the fleet captain (#10329)
 //!
@@ -82,6 +88,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 
+use super::cycle_guard::{CycleGuard, CycleTick};
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::eta::config::{EtaConfig, FleetRefreshConfig};
 use crate::eta::fit::{run, Fitter};
@@ -91,6 +98,7 @@ use crate::eta::fleet_events_forge::{ForgeEndpoint, ForgeEventSource};
 use crate::eta::fleet_fetch::{ForgeRead, Installation, NoReader, Reader, ReaderForge, RepoTarget};
 use crate::eta::fleet_refresh::{self, Budgets, CycleReport, PassKind, RepoReport, StopReason};
 use crate::eta::Provenance;
+use crate::task_liveness::ETA_FLEET_REFRESH;
 use crate::telemetry::kinds::eta_fleet_refresh::EtaFleetRefreshRecord;
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 use crate::workspace_pool::WorkspacePool;
@@ -296,10 +304,21 @@ pub fn spawn_task(
         config.backfill_days
     );
     let task = Arc::new(Mutex::new(TaskState::default()));
+    let every = Duration::from_secs(config.interval_secs);
+    // #10414: liveness beats once per finished cycle; the first lands after
+    // FIRST_CYCLE_DELAY, and a cycle may take up to one interval.
+    crate::task_liveness::register(
+        ETA_FLEET_REFRESH,
+        every,
+        crate::task_liveness::default_stale_after(every).saturating_add(FIRST_CYCLE_DELAY),
+    );
     Some(tokio::spawn(async move {
         tokio::time::sleep(FIRST_CYCLE_DELAY).await;
-        let mut interval = tokio::time::interval(Duration::from_secs(config.interval_secs));
+        let mut interval = tokio::time::interval(every);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // #10414: a cycle that runs past one interval is reported, and never
+        // gets a second cycle stacked beside it on the same `task` lock.
+        let mut guard = CycleGuard::new(cycle_bound(every));
         loop {
             interval.tick().await;
             let mut roots = super::collector::provisioned_roots(&workspace_pool);
@@ -312,32 +331,68 @@ pub fn spawn_task(
                 task.clone(),
                 fitter.clone(),
             );
-            let joined = tokio::task::spawn_blocking(move || {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut task = task
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    run_production_cycle(
-                        &root,
-                        &roots,
-                        &config,
-                        &host_id,
-                        sink.as_deref(),
-                        &mut task,
-                        (fit_enabled, &fitter),
-                    );
-                }))
-            })
-            .await;
-            match joined {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => log::warn!("eta fleet refresh: cycle panicked; retrying next tick"),
-                Err(e) => {
-                    log::warn!("eta fleet refresh: cycle failed to run: {e}; retrying next tick")
-                }
-            }
+            let start = move || {
+                tokio::task::spawn_blocking(move || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut task = task
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        run_production_cycle(
+                            &root,
+                            &roots,
+                            &config,
+                            &host_id,
+                            sink.as_deref(),
+                            &mut task,
+                            (fit_enabled, &fitter),
+                        );
+                    }))
+                    .is_ok()
+                })
+            };
+            report_tick(guard.tick(start).await);
         }
     }))
+}
+
+/// How long one cycle may run before it counts as an overrun: one interval.
+#[must_use]
+pub fn cycle_bound(interval: Duration) -> Duration {
+    interval
+}
+
+/// Log one guarded tick, count its faults, and beat liveness when a cycle
+/// finished (#10414). A wedged cycle beats nothing, so `task_alive` drops.
+pub fn report_tick(tick: CycleTick<bool>) {
+    use super::ops::liveness::{fault, Fault};
+    match tick {
+        CycleTick::Finished(Ok(true)) => {
+            crate::task_liveness::beat_if_registered(ETA_FLEET_REFRESH)
+        }
+        CycleTick::Finished(Ok(false)) => {
+            log::warn!("eta fleet refresh: cycle panicked; retrying next tick");
+            fault(ETA_FLEET_REFRESH, Fault::Panic);
+            crate::task_liveness::beat_if_registered(ETA_FLEET_REFRESH);
+        }
+        CycleTick::Finished(Err(e)) => {
+            log::warn!("eta fleet refresh: cycle failed to run: {e}; retrying next tick");
+            fault(ETA_FLEET_REFRESH, Fault::Panic);
+        }
+        CycleTick::Overran { running_for } => {
+            log::warn!(
+                "eta fleet refresh: cycle still running after {}s (past its one-interval bound) \
+                 — likely stuck in a forge read, the SigNoz walk or a lock; no new cycle starts \
+                 until it returns (#10414)",
+                running_for.as_secs()
+            );
+            fault(ETA_FLEET_REFRESH, Fault::Overrun);
+        }
+        CycleTick::StillRunning { running_for } => log::warn!(
+            "eta fleet refresh: skipping this tick — the cycle started {}s ago is still running \
+             (#10414)",
+            running_for.as_secs()
+        ),
+    }
 }
 
 /// One production tick: the captain gate ([`tick`]), then the cycle over the
@@ -875,3 +930,7 @@ mod tests;
 #[cfg(test)]
 #[path = "eta_fleet_refresh_gate_tests.rs"]
 mod gate_tests;
+
+#[cfg(test)]
+#[path = "eta_fleet_refresh_watchdog_tests.rs"]
+mod watchdog_tests;

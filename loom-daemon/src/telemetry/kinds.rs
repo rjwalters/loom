@@ -158,6 +158,9 @@ pub struct TelemetryKindMeta {
 // `telemetry/mod.rs`; moving them would churn every in-flight PR that touches
 // them for no schema benefit.)
 
+/// `auto_update.tick` (#10414).
+pub mod auto_update_tick;
+
 /// `eta.estimate` / `eta.outcome` (#9289).
 pub mod eta;
 
@@ -380,6 +383,12 @@ macro_rules! telemetry_kind_table {
             /// refresh (Issue #10263). OTLP-only, like the other `eta.*` log
             /// kinds. See [`eta_fleet_refresh`].
             EtaFleetRefresh = "eta.fleet_refresh" => $crate::telemetry::kinds::eta_fleet_refresh::EtaFleetRefreshRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One self-update loop decision (Issue #10414): decision, installed
+            /// and target versions, defer reason, drain state. OTLP-only. See
+            /// [`auto_update_tick`].
+            AutoUpdateTick = "auto_update.tick" => $crate::telemetry::kinds::auto_update_tick::AutoUpdateTickRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

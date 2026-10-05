@@ -20,6 +20,7 @@ mod operator_priority_line;
 mod peer_claims_line;
 mod pending_restart_line;
 mod roll_window_line;
+mod task_liveness_line;
 mod telemetry_banner;
 
 use loom_daemon::daemon_install_state;
@@ -577,6 +578,8 @@ pub(crate) fn build_status_json_value(
         },
         // Autonomous self-update loop state (#4055) — daemon-side loop status
         // (distinct from the client-side `self_update` staleness read above).
+        // Long-running task liveness (#10414): one entry per registered loop.
+        "task_liveness": report.task_liveness,
         "auto_update": {
             "enabled": report.auto_update_enabled,
             "last_check": report.auto_update_last_check,
@@ -2787,6 +2790,7 @@ pub(crate) fn print_status_human(
         println!();
         roll_window_line::print_tail(report);
     }
+    task_liveness_line::print(&report.task_liveness);
 
     println!();
 }

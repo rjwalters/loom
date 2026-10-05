@@ -262,6 +262,8 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::MergeRedatePrs,
         MetricName::MergeRedatesMax,
         MetricName::MergeTimeToLandMax,
+        MetricName::DaemonTaskAlive,
+        MetricName::DaemonTaskFaults,
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }

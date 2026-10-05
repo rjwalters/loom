@@ -103,6 +103,7 @@
 pub mod backfill;
 pub mod claude_code_telemetry;
 pub mod collector;
+pub mod cycle_guard;
 pub mod daemon_event;
 pub mod endpoint_policy;
 pub mod eta;
@@ -1171,12 +1172,18 @@ pub fn spawn_task(
     // ETA (#9289): `eta.estimate` / `eta.outcome` are OTLP-only too; the
     // tracker and its bus subscriber run (and journal) even without them.
     eta::register_sink(otlp_queues.clone(), &host_id);
-    ops_handles.extend(eta::spawn_task(
-        bus,
-        workspace_root.clone(),
-        host_id.clone(),
-        workspace_pool.clone(),
-    ));
+    let eta_handle =
+        eta::spawn_task(bus, workspace_root.clone(), host_id.clone(), workspace_pool.clone());
+    // #10414: the ETA pass runs inside the collector's 5-minute pass, which
+    // beats it after each `eta::record`; registered only when ETA is on.
+    if eta_handle.is_some() {
+        crate::task_liveness::register(
+            crate::task_liveness::ETA_PASS,
+            SNAPSHOT_INTERVAL,
+            crate::task_liveness::default_stale_after(SNAPSHOT_INTERVAL),
+        );
+    }
+    ops_handles.extend(eta_handle);
     // The daily ETA refit (#10245) and the fleet snapshot refresh (#10263):
     // either/or. With fleet refresh on, the refit check runs at the end of
     // every refresh cycle (`eta_fleet_refresh::owns_fit`), so it always sees
@@ -1203,6 +1210,9 @@ pub fn spawn_task(
         ops::register_global_ops_sink(sink);
         // Slot turnaround (#8929): a bus subscriber, OTLP-only like the sink.
         ops_handles.push(ops::turnaround::spawn_task(bus));
+        // Long-running task liveness gauges (#10414), on their own ticker so
+        // a stuck collector pass cannot hide another loop's death.
+        ops_handles.push(ops::liveness::spawn_task());
     }
     // `queue.snapshot` (Issue #8852, phase 2): the reverse split — native
     // HTTPS queues only, sampled by the collector below.

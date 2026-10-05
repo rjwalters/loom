@@ -337,6 +337,9 @@ pub mod sweep_registry;
 pub mod sweep_usage;
 pub mod tap_usage;
 pub mod target_dir_gc;
+/// Per-task liveness heartbeats for the daemon's long-running loops (Issue
+/// #10414): the `loom.daemon.task_alive` gauge and `Task liveness:` in status.
+pub mod task_liveness;
 pub mod telemetry;
 pub mod terminal;
 pub mod terminal_restore;
