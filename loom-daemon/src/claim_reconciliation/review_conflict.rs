@@ -264,6 +264,7 @@ pub fn conflict_candidates(
                 head_sha: r.head_sha.clone(),
                 mergeable: Mergeable::Unknown,
                 labels: r.labels.clone(),
+                updated_at: r.updated_at.clone(),
             };
             if !matches!(
                 decide_review_conflict(&pr),

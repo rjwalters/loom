@@ -8,6 +8,9 @@ use super::*;
 use crate::claim_reconciliation::merge_sequence::{
     reconcile_merge_sequences, MERGE_SEQUENCE_ENABLED_ENV, SEQUENCE_LABEL,
 };
+use crate::claim_reconciliation::open_pr_listing::test_support::{
+    listing, mergeable_arm, pulls_arm_cmd, row,
+};
 use crate::claim_reconciliation::review_conflict::{
     reconcile_review_conflicts, REVIEW_CONFLICT_ENABLED_ENV,
 };
@@ -68,13 +71,21 @@ fn a_foreign_conflict_label_is_scanned_once_per_version() {
     let updated = dir.path().join("updated");
     std::fs::write(&updated, "2026-10-03T10:00:00Z").unwrap();
     let comments = trusted_comment("<!-- loom:verdict-sha sha=abc verdict=changes-requested -->");
-    let body = format!(
-        r#"if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  echo "[{{\"number\":9,\"headRefOid\":\"abc\",\"mergeable\":\"MERGEABLE\",\"updatedAt\":\"$(cat '{u}')\",\"labels\":[{{\"name\":\"loom:merge-conflict\"}},{{\"name\":\"loom:changes-requested\"}}]}}]"
-  exit 0
-fi
-if [ "$1" = "api" ]; then echo '{comments}'; fi"#,
+    // #10349: the REST listing; `updated_at` is re-read from the file.
+    let listing_at = |at: &str| {
+        listing(&[row(9, &["loom:merge-conflict", "loom:changes-requested"])
+            .sha("abc")
+            .updated(at)])
+    };
+    let (a, b) = (listing_at("2026-10-03T10:00:00Z"), listing_at("2026-10-03T10:05:00Z"));
+    let emit = format!(
+        "if grep -q 10:05 '{u}'; then echo '{b}'; else echo '{a}'; fi",
         u = updated.display()
+    );
+    let body = format!(
+        r#"{pulls}{mergeable}if [ "$1" = "api" ]; then echo '{comments}'; fi"#,
+        pulls = pulls_arm_cmd(&emit),
+        mergeable = mergeable_arm("true"),
     );
     let (gh, log) = fake_gh(dir.path(), &body);
 
@@ -105,30 +116,36 @@ fn an_unchanged_hold_reads_its_marker_and_predecessor_once() {
     let sha = |n: u32| format!("{n:040x}");
     let updated = dir.path().join("updated");
     std::fs::write(&updated, "2026-10-04T00:00:00Z").unwrap();
-    let row = |n: u32, labels: &str| {
-        format!(
-            r#"{{\"number\":{n},\"createdAt\":\"2026-10-0{n}T00:00:00Z\",\"updatedAt\":\"$(cat '{u}')\",\"headRefOid\":\"{s}\",\"headRefName\":\"feature/issue-{n}\",\"baseRefName\":\"main\",\"isDraft\":false,\"labels\":{labels}}}"#,
-            u = updated.display(),
-            s = sha(n)
-        )
+    // #10349: REST listing rows; `updated_at` is re-read from the file.
+    let rows_at = |at: &str| {
+        listing(&[
+            row(1, &["loom:pr"])
+                .created("2026-10-01T00:00:00Z")
+                .updated(at),
+            row(2, &[SEQUENCE_LABEL])
+                .created("2026-10-02T00:00:00Z")
+                .updated(at),
+            row(3, &[]).created("2026-10-03T00:00:00Z").updated(at),
+        ])
     };
-    let held = format!(r#"[{{\"name\":\"{SEQUENCE_LABEL}\"}}]"#);
+    let (ra, rb) = (rows_at("2026-10-04T00:00:00Z"), rows_at("2026-10-04T00:05:00Z"));
+    let emit = format!(
+        "if grep -q T00:05 '{u}'; then echo '{rb}'; else echo '{ra}'; fi",
+        u = updated.display()
+    );
     let marker = format!(
         "<!-- loom:sequence after=1 pred_head={} follower_head={} plan=p1 source=pass -->",
         sha(1),
         sha(2)
     );
     let body = format!(
-        r#"if [ "$1" = "pr" ] && [ "$2" = "list" ]; then echo "[{r1},{r2},{r3}]"; exit 0; fi
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo '{{"files":[{{"path":"src/a.rs"}}]}}'; exit 0; fi
+        r#"{pulls}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo '{{"files":[{{"path":"src/a.rs"}}]}}'; exit 0; fi
 case "$*" in
   *issues/2/comments*) echo '{c2}' ;;
   *pulls/1*) echo '{{"state":"open","merged":false,"head":{{"sha":"{s1}"}}}}' ;;
   *api*) echo '[]' ;;
 esac"#,
-        r1 = row(1, "[]"),
-        r2 = row(2, &held),
-        r3 = row(3, "[]"),
+        pulls = pulls_arm_cmd(&emit),
         c2 = trusted_comment(&marker),
         s1 = sha(1),
     );
@@ -163,13 +180,19 @@ fn a_predecessor_outside_the_listing_is_never_served_from_cache() {
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
     let sha = |n: u32| format!("{n:040x}");
-    let row = |n: u32, labels: &str| {
-        format!(
-            r#"{{\"number\":{n},\"createdAt\":\"2026-10-0{n}T00:00:00Z\",\"updatedAt\":\"2026-10-04T00:00:00Z\",\"headRefOid\":\"{s}\",\"headRefName\":\"feature/issue-{n}\",\"baseRefName\":\"main\",\"isDraft\":false,\"labels\":{labels}}}"#,
-            s = sha(n)
-        )
+    let day = |n: u32| format!("2026-10-0{n}T00:00:00Z");
+    let r = |n: u32, labels: &[&str]| {
+        row(n, labels)
+            .created(&day(n))
+            .updated("2026-10-04T00:00:00Z")
     };
-    let held = format!(r#"[{{\"name\":\"{SEQUENCE_LABEL}\"}}]"#);
+    let with_pred = listing(&[
+        r(1, &["loom:pr"]),
+        r(2, &[SEQUENCE_LABEL]),
+        r(3, &[]),
+        r(4, &[]),
+    ]);
+    let without_pred = listing(&[r(2, &[SEQUENCE_LABEL]), r(3, &[]), r(4, &[])]);
     let marker = format!(
         "<!-- loom:sequence after=1 pred_head={} follower_head={} plan=p1 source=pass -->",
         sha(1),
@@ -177,12 +200,12 @@ fn a_predecessor_outside_the_listing_is_never_served_from_cache() {
     );
     // PR 1 is in the listing only while `$DIR/listed` exists; `pulls/1`
     // answers merged only while `$DIR/merged` exists (open otherwise).
+    let emit = format!(
+        "if [ -f '{d}/listed' ]; then echo '{with_pred}'; else echo '{without_pred}'; fi",
+        d = dir.path().display()
+    );
     let body = format!(
-        r#"if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
-  if [ -f '{d}/listed' ]; then echo "[{r1},{r2},{r3},{r4}]"; else echo "[{r2},{r3},{r4}]"; fi
-  exit 0
-fi
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo '{{"files":[{{"path":"src/a.rs"}}]}}'; exit 0; fi
+        r#"{pulls}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo '{{"files":[{{"path":"src/a.rs"}}]}}'; exit 0; fi
 case "$*" in
   *issues/2/comments*) echo '{c2}' ;;
   *pulls/1*)
@@ -190,11 +213,8 @@ case "$*" in
     else echo '{{"state":"open","merged":false,"head":{{"sha":"{s1}"}}}}'; fi ;;
   *api*) echo '[]' ;;
 esac"#,
+        pulls = pulls_arm_cmd(&emit),
         d = dir.path().display(),
-        r1 = row(1, "[]"),
-        r2 = row(2, &held),
-        r3 = row(3, "[]"),
-        r4 = row(4, "[]"),
         c2 = trusted_comment(&marker),
         s1 = sha(1),
     );
