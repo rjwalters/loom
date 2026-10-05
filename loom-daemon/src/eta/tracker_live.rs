@@ -3,7 +3,11 @@
 //! A read-only view. It clones what the tracker already holds in memory and
 //! never touches the estimation path, the forge or the clock, so the
 //! `fleet.state` emitter is a reader of tracker state and not a second tick
-//! loop. An item is live when it has a current stage and has not landed.
+//! loop. An item is live when it has a current stage, has not landed, and is
+//! still a member of the fleet's in-flight work: a running sweep, a PR in a
+//! review listing, or a ready-queue row. An item that only awaits an outcome
+//! read (its sweep ended, or its PR left the listing) keeps its stage for
+//! the pending ETA outcomes but is not current state, so it is not exported.
 
 use super::Tracker;
 use crate::eta::{AgeSource, Stage};
@@ -34,7 +38,10 @@ impl Tracker {
     pub fn live_items(&self) -> Vec<LiveItem> {
         self.items
             .iter()
-            .filter(|(_, item)| !item.landed)
+            .filter(|(_, item)| {
+                !item.landed
+                    && (item.sweep_running || item.in_review_listing || item.in_ready_queue)
+            })
             .filter_map(|(key, item)| {
                 let track = item.stage.as_ref()?;
                 Some(LiveItem {
