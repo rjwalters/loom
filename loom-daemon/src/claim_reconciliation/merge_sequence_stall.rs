@@ -53,7 +53,7 @@ const APPROVED_LABEL: &str = "loom:pr";
 
 /// Plan-id prefix of consolidation reservations (ADR-0023 §1). Their release
 /// contract is the 72 h expiry only; the stall release never touches them.
-const CONSOLIDATION_PLAN_PREFIX: &str = "cons-";
+pub const CONSOLIDATION_PLAN_PREFIX: &str = "cons-";
 
 /// The stall bound, in hours. See [`MERGE_SEQUENCE_STALL_ENV`].
 #[must_use]

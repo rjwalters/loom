@@ -15,10 +15,17 @@
 //!    → `needs-operator(merge-risk-hold)`;
 //! 4. the forge refused the merge of its approved PR →
 //!    `needs-operator(merge-refused)`;
-//! 5. `loom:blocked`: an open same-repo blocker → `blocked-by` (it inherits
-//!    the star); only a cross-repo blocker → `needs-operator(blocked-cross-repo)`
-//!    (stars are not inherited across repos, so nothing else would move it);
-//!    none → `needs-operator(blocked-unnamed)`;
+//! 5. `loom:blocked` (blockers named in the body **or** a trusted comment): an
+//!    open same-repo blocker → `blocked-by` (every open same-repo blocker
+//!    inherits the star); only a
+//!    cross-repo blocker → `needs-operator(blocked-cross-repo)` (stars are not
+//!    inherited across repos, so nothing else would move it); otherwise the
+//!    block is stale (#10151) → `stale-block`, which the pass resolves itself
+//!    ([`StaleAction`]): every cited blocker closed → unblock; none cited →
+//!    hand to Curator. Only when that already happened once and the issue is
+//!    blocked again with still no open blocker → `needs-operator(blocked-unnamed)`.
+//!    An inherited row is never handed to Curator: the walk turns that into
+//!    `needs-operator(blocked-unnamed)` at once ([`withhold_inherited_handoff`]);
 //! 6. its repo's `main` is red and it has not been dispatched → `blocked-by`
 //!    the red-main fix;
 //! 7. an open PR → `changes-requested` / `mergeable` (`merging` with a live
@@ -26,10 +33,11 @@
 //! 8. `loom:building`, a live sweep, or a peer claim → `building`;
 //! 9. this host's token pool is exhausted and no peer claimed it →
 //!    `needs-operator(pools-exhausted)`; a capacity-style deferral →
-//!    `no-capacity`;
+//!    `no-capacity`, carrying the structured [`CapacityWait`] (gate, binding
+//!    cap term, queue position; #10214);
 //! 10. `loom:issue` → `ready`; anything else → `curating`.
 
-use crate::types::{AskKind, LandingStage, OperatorAsk};
+use crate::types::{AskKind, CapacityWait, LandingStage, OperatorAsk};
 
 /// The Champion hold on a PR (merge-risk / critical-file).
 pub const HOLD_LABEL: &str = "loom:operator";
@@ -119,8 +127,10 @@ pub enum Capacity {
     /// this host's hold, so every host and every re-exhaustion of an issue
     /// that has not moved share one key ([`super::collect`]).
     PoolExhausted { detail: String },
-    /// The work finder deferred it on a capacity-style limit.
-    Deferred { reason: String },
+    /// The work finder deferred it on a capacity-style limit: which gate,
+    /// what binds it and where the issue stands in the host's starred queue
+    /// (#10214).
+    Deferred(CapacityWait),
 }
 
 /// Everything the classifier needs about one starred issue.
@@ -132,8 +142,18 @@ pub struct StarFacts {
     pub managed: bool,
     pub issue: ItemFacts,
     pub pr: Option<PrFacts>,
-    /// Blockers named by the issue (read only when it is `loom:blocked`).
+    /// Blockers named by the issue (read only when it is `loom:blocked`): its
+    /// body, plus its trusted comments when the body names no open one.
     pub blockers: Vec<BlockerRef>,
+    /// A trusted [`super::stale::HANDOFF_MARKER`] comment exists: the pass
+    /// already handed this issue to Curator once over an unnamed block.
+    pub curator_handoff: bool,
+    /// The keys of trusted [`super::stale::UNBLOCKED_PREFIX`] comments: the
+    /// cleared-blocker sets the pass already unblocked this issue over.
+    pub unblocked_before: Vec<String>,
+    /// The comments of a blocked issue whose body names no open blocker could
+    /// not be read: nothing about the block is certain, so no write is made.
+    pub comments_unread: bool,
     /// The repo's red-main fix issue, when `main` is verified red.
     pub red_main_fix: Option<u32>,
     /// A live sweep on this host holds the issue.
@@ -145,6 +165,17 @@ pub struct StarFacts {
     pub host: String,
 }
 
+/// What the pass does about a `stale-block` row (#10151, [`super::stale`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaleAction {
+    /// Every cited blocker is closed: remove `loom:blocked` and say which.
+    /// `key` is the cleared set (`#5,#6`), the comment marker's dedupe key.
+    Unblock { cleared: Vec<String>, key: String },
+    /// Nothing is cited: hand the issue to Curator to name the blocker or
+    /// release it.
+    CuratorHandoff,
+}
+
 /// The classifier's verdict.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Landing {
@@ -153,11 +184,19 @@ pub struct Landing {
     pub pr: Option<u32>,
     /// `BlockedBy`: the blocker as shown.
     pub blocked_by: Option<String>,
-    /// `BlockedBy` / `MergeRefused`: the same-repo issue that inherits the
-    /// star, when there is one.
-    pub inherits: Option<u32>,
+    /// `BlockedBy` / `MergeRefused`: the same-repo issues that inherit the
+    /// star, ascending. Every open same-repo blocker inherits, not only the
+    /// first one named (#10012 AC 3).
+    pub inherits: Vec<u32>,
     pub no_capacity: Option<String>,
+    /// `NoCapacity` from a work-finder deferral: the structured wait
+    /// (#10214). `None` for the pool-exhaustion grace window.
+    pub capacity_wait: Option<CapacityWait>,
     pub ask: Option<OperatorAsk>,
+    /// `StaleBlock`: the write the pass makes, or `None` when something else
+    /// holds the issue (its open PR is itself parked, or a Builder holds it),
+    /// so the row only waits on Curator and the watchdog.
+    pub stale: Option<StaleAction>,
 }
 
 impl Landing {
@@ -167,9 +206,11 @@ impl Landing {
             next_actor: next_actor.to_string(),
             pr,
             blocked_by: None,
-            inherits: None,
+            inherits: Vec::new(),
             no_capacity: None,
+            capacity_wait: None,
             ask: None,
+            stale: None,
         }
     }
 
@@ -294,7 +335,11 @@ pub fn classify(f: &StarFacts) -> Landing {
                 ),
                 Some(p),
             );
-            landing.inherits = refusal.incident.filter(|i| *i != n && *i != p);
+            landing.inherits = refusal
+                .incident
+                .filter(|i| *i != n && *i != p)
+                .into_iter()
+                .collect();
             return landing;
         }
     }
@@ -311,7 +356,17 @@ pub fn classify(f: &StarFacts) -> Landing {
             let mut landing =
                 Landing::stage(LandingStage::BlockedBy, &format!("blocker {}", b.display), pr_num);
             landing.blocked_by = Some(b.display.clone());
-            landing.inherits = b.number.filter(|m| *m != n);
+            let mut inherits: Vec<u32> = f
+                .blockers
+                .iter()
+                .filter(open)
+                .filter(|b| b.cross_repo_managed.is_none())
+                .filter_map(|b| b.number)
+                .filter(|m| *m != n)
+                .collect();
+            inherits.sort_unstable();
+            inherits.dedup();
+            landing.inherits = inherits;
             return landing;
         }
         if let Some(b) = f.blockers.iter().find(open) {
@@ -335,19 +390,7 @@ pub fn classify(f: &StarFacts) -> Landing {
             landing.blocked_by = Some(d.clone());
             return landing;
         }
-        return Landing::operator(
-            AskKind::BlockedUnnamed,
-            "",
-            format!(
-                "{}#{n} is starred but `loom:blocked` with no open blocking issue named: \
-                 resolve what blocks it and remove `loom:blocked`, or name the blocker so \
-                 it inherits the star — a `Blocked by #N` / `Depends on owner/repo#N` / \
-                 `Requires #N` line anywhere in the body, or an unchecked `- [ ] #N` / \
-                 `- [ ] owner/repo#N` item under `## Dependencies`.",
-                f.repo
-            ),
-            pr_num,
-        );
+        return stale_block(f, pr_num);
     }
 
     let dispatched =
@@ -357,7 +400,7 @@ pub fn classify(f: &StarFacts) -> Landing {
     if let Some(fix) = f.red_main_fix.filter(|fix| *fix != n && !dispatched) {
         let mut landing = Landing::stage(LandingStage::BlockedBy, &format!("blocker #{fix}"), None);
         landing.blocked_by = Some(format!("#{fix}"));
-        landing.inherits = Some(fix);
+        landing.inherits = vec![fix];
         return landing;
     }
 
@@ -396,9 +439,10 @@ pub fn classify(f: &StarFacts) -> Landing {
                 None,
             );
         }
-        Capacity::Deferred { reason } => {
+        Capacity::Deferred(wait) => {
             let mut landing = Landing::stage(LandingStage::NoCapacity, "work-finder", None);
-            landing.no_capacity = Some(reason.clone());
+            landing.no_capacity = Some(wait.summary());
+            landing.capacity_wait = Some(wait.clone());
             return landing;
         }
         Capacity::Available => {}
@@ -409,4 +453,123 @@ pub fn classify(f: &StarFacts) -> Landing {
         return Landing::stage(LandingStage::Ready, "work-finder", None);
     }
     Landing::stage(LandingStage::Curating, "curator", None)
+}
+
+/// PR labels under which the issue's own open PR is parked, so clearing the
+/// issue's block would move nothing (the #4492 / #8925 superseding block):
+/// the stale block is then left to Curator, never cleared by the pass.
+const PARKED_PR_LABELS: &[&str] = &[
+    "loom:blocked",
+    "loom:changes-requested",
+    "loom:merge-conflict",
+];
+
+/// The ways to name a blocker so it inherits the star, for the ask.
+const NAMING_FORMS: &str = "a `Blocked by #N` / `Depends on owner/repo#N` / `Requires #N` line \
+     anywhere in the body, or an unchecked `- [ ] #N` / `- [ ] owner/repo#N` item under \
+     `## Dependencies`";
+
+/// Rule 5's tail (#10151): `loom:blocked`, and no open blocker is named in
+/// the body or a trusted comment.
+///
+/// - Every cited same-repo blocker is closed → `stale-block`, unblocked by
+///   the pass ([`StaleAction::Unblock`]).
+/// - Nothing is cited → `stale-block`, handed to Curator
+///   ([`StaleAction::CuratorHandoff`]).
+/// - The pass already did that once (its marker is on the issue) and the
+///   issue is blocked again on the same evidence → an agent pass has failed
+///   to name a blocker: `needs-operator(blocked-unnamed)`. Never a second
+///   unblock, so the pass cannot flip-flop with whoever re-applied the label.
+///
+/// A self-reference is not a blocker, and an unreadable or cross-repo one
+/// (`open != Some(false)`) never gets here: it was treated as open above.
+fn stale_block(f: &StarFacts, pr_num: Option<u32>) -> Landing {
+    let n = f.issue.number;
+    let mut closed: Vec<u32> = f
+        .blockers
+        .iter()
+        .filter(|b| b.open == Some(false))
+        .filter_map(|b| b.number.filter(|m| *m != n))
+        .collect();
+    closed.sort_unstable();
+    closed.dedup();
+    let cleared: Vec<String> = closed.iter().map(|m| format!("#{m}")).collect();
+    let key = cleared.join(",");
+
+    if cleared.is_empty() && f.curator_handoff && !f.comments_unread {
+        return Landing::operator(
+            AskKind::BlockedUnnamed,
+            "",
+            format!(
+                "{}#{n} is starred but `loom:blocked` with no open blocking issue named, and it \
+                 is still blocked after the liveness check handed it to Curator to name one: \
+                 resolve what blocks it and remove `loom:blocked`, or name the blocker so it \
+                 inherits the star — {NAMING_FORMS}.",
+                f.repo
+            ),
+            pr_num,
+        );
+    }
+    if !cleared.is_empty() && f.unblocked_before.contains(&key) {
+        return Landing::operator(
+            AskKind::BlockedUnnamed,
+            &format!("reblocked:{key}"),
+            format!(
+                "{}#{n} is starred and `loom:blocked` again, though every blocker it cites \
+                 ({key}) is closed and the liveness check already unblocked it once: name what \
+                 really blocks it so it inherits the star — {NAMING_FORMS} — or remove \
+                 `loom:blocked`.",
+                f.repo
+            ),
+            pr_num,
+        );
+    }
+
+    let mut landing = Landing::stage(LandingStage::StaleBlock, "curator", pr_num);
+    landing.stale = if f.comments_unread {
+        None
+    } else if cleared.is_empty() {
+        // A PR or a Builder already holds it: nothing for Curator to release.
+        let held = f.pr.is_some() || f.issue.has(crate::work_finder::BUILDING_LABEL);
+        (!held).then_some(StaleAction::CuratorHandoff)
+    } else {
+        let parked =
+            f.pr.as_ref()
+                .is_some_and(|p| PARKED_PR_LABELS.iter().any(|l| p.item.has(l)));
+        (!parked).then_some(StaleAction::Unblock { cleared, key })
+    };
+    landing
+}
+
+/// An inherited row never gets a [`StaleAction::CuratorHandoff`] (#10162
+/// review; see [`super::stale`]'s module doc): `classify` cannot tell an
+/// inherited row from a starred one, so the walk calls this once it knows
+/// the row inherits through `via` from the starred `root`.
+///
+/// A handoff becomes the `blocked-unnamed` operator ask — what every
+/// unnamed block got before #10151, and still the only actor that can move
+/// an unstarred blocker no agent will touch. An [`StaleAction::Unblock`]
+/// (or no action) is kept as it is.
+pub fn withhold_inherited_handoff(f: &StarFacts, landing: &mut Landing, via: u32, root: u32) {
+    if landing.stale != Some(StaleAction::CuratorHandoff) {
+        return;
+    }
+    let n = f.issue.number;
+    let through = if via == root {
+        String::new()
+    } else {
+        format!(" through #{via}")
+    };
+    *landing = Landing::operator(
+        AskKind::BlockedUnnamed,
+        "",
+        format!(
+            "{}#{n} blocks starred #{root}{through}, so it inherits that star, but it is \
+             `loom:blocked` with no open blocking issue named: resolve what blocks it and \
+             remove `loom:blocked`, or name the blocker so the star passes on to it — \
+             {NAMING_FORMS}.",
+            f.repo
+        ),
+        landing.pr,
+    );
 }

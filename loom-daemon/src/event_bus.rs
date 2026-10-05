@@ -40,7 +40,7 @@
 //! | `daemon.dispatch.headroom_advisory` | Daemon (IPC, `dispatch_sweep`) | `{repo_root, low_headroom, occupancy, dynamic_cap, disk_headroom, ram_headroom, token_axis_limit, message}` |
 //! | `daemon.preflight.advisory` | Daemon reaper (`SweepRegistry`) | `{workspace_root, consecutive_deaths, marker, message}` |
 //! | `forge.event` | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
-//! | `operator_priority.escalation` | Star-liveness pass (#9321) | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
+//! | `operator_priority.escalation` | Star-liveness pass (#9321); `fleet_alert` (#10164) | `{slug, issue, key, kind, stage, text, url, host, inherited_from?, resolved}` |
 //!
 //! New topics require a follow-up issue — the taxonomy is intentionally
 //! pinned. The four `epic.issue.{N}.*` topics were authorized by **#3873**
@@ -123,6 +123,9 @@
 //! second event with `resolved: true` fires once when the key's ask clears
 //! (emitted by the host that announced it; a host that restarts in between
 //! simply does not narrate the recovery, which loses a nicety, never an ask).
+//! A second publisher, [`crate::fleet_alert`] (#10164), emits fleet-DEGRADED
+//! alerts with `issue: 0` and no forge comment: its dedupe is per-host
+//! (debounced, persisted alert state), not the forge-marker lock above.
 //!
 //! **`Generic`-topic rule.** A `Generic` topic is allowed only while it (a) is
 //! listed in this inventory, (b) carries a `source` field naming its producing

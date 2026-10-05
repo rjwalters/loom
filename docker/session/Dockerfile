@@ -49,10 +49,12 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 # Pinned, already-verified Codex CLI version — NOT floating `@latest`, so a
 # future upstream Codex release cannot silently change this image's behavior
-# out from under an unrelated rebuild. CODEX_MIN_VERSION is the
+# out from under an unrelated rebuild. The pin itself tracks upstream latest:
+# .github/workflows/harness-pins.yml bumps it in a PR whose CI runs
+# test-image.sh, including the real-engine hook check, against the new CLI. CODEX_MIN_VERSION is the
 # runtime-adapter floor this build enforces regardless of which version is
 # pinned above it; bump both deliberately together when the floor moves.
-ARG CODEX_VERSION=0.149.1
+ARG CODEX_VERSION=0.160.0
 ARG CODEX_MIN_VERSION=0.146.0
 
 # Node.js LTS release, pinned + checksum-verified below — Codex CLI's only

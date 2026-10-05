@@ -776,6 +776,7 @@ fn daemon_write_paths_are_scoped() {
         ("cli/notify_cleared_blockers.rs", ShellVetted("merge-pr.sh")),
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
+        ("intake_reconcile.rs", Gated),
         (
             "sweep_registry/guards.rs",
             Via(DISPATCH, "claim flip + lease of a dispatched sweep"),
@@ -817,11 +818,11 @@ fn daemon_write_paths_are_scoped() {
         ),
         (
             "cli/merge_pr_consolidate.rs",
-            OperatorOnly(
-                "`merge-pr consolidate-prepare`/`consolidate-abort` (#9688): an explicit, \
-                 operator-named group; no autonomous caller exists yet (#9689 wires \
-                 reconciliation)",
-            ),
+            OperatorOnly("`merge-pr consolidate-prepare|abort|reconcile`: run by hand against an explicit candidate PR; #9839 is the automated caller"),
+        ),
+        (
+            "merge_pr/consolidate/reconcile.rs",
+            OperatorOnly("library half of `consolidate-reconcile`, reached only via the CLI verb above"),
         ),
         (
             "watchdog/peer_coord.rs",
@@ -839,6 +840,10 @@ fn daemon_write_paths_are_scoped() {
         ("role_tick_telemetry/targets.rs", NotAWrite("classifies commands, runs none")),
         ("terminal.rs", NotAWrite("tmux flags")),
         ("fleet_store/gh.rs", NotAWrite("store reads: its one method is `--method GET`")),
+        (
+            "merge_group_ci/eligibility.rs",
+            NotAWrite("read-only probe: its only calls are `api --method GET`"),
+        ),
         ("tokens_pool/check.rs", NotAWrite("Anthropic API, not the forge")),
         ("worker_spawn/egress_proxy/server.rs", NotAWrite("HTTP method check in a proxy")),
     ];

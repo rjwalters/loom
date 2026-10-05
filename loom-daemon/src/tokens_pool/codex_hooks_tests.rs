@@ -83,6 +83,7 @@ fn shared(codex_home: PathBuf, workspace: Option<PathBuf>) -> Check {
         registration: Registration::WorkspaceIndependent,
         fallback_bridge: None,
         runtime_home: None,
+        sealed: None,
     }
 }
 
@@ -177,6 +178,7 @@ fn a_pinned_check_keeps_the_pre_9390_rules() {
         registration: Registration::Pinned { bridge },
         fallback_bridge: None,
         runtime_home: None,
+        sealed: None,
     };
     let verdict = pinned(bridge).verify();
     assert!(verdict.ready, "{verdict:?}");
@@ -231,6 +233,7 @@ fn only_trust_keyed_to_loom_where_codex_runs_counts() {
     let check = |runtime_home: Option<&str>| {
         Check {
             runtime_home: runtime_home.map(PathBuf::from),
+            sealed: None,
             ..shared(home.clone(), Some(ws.clone()))
         }
         .verify()

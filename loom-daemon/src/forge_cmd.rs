@@ -404,10 +404,9 @@ fn forge_inv(op: &'static str, intent: AccessIntent, gh: &str) -> GhInvocation {
     GhInvocation::new(Operation::new(op), intent, GhTarget::None, FORGE_CMD_TIMEOUT).program(gh)
 }
 
-/// Resolve the `gh` binary name — delegates to the single resolver (#9985).
-pub(crate) fn gh_bin() -> String {
-    crate::gh_invocation::gh_bin()
-}
+/// Resolve the `gh` binary name: a re-export of the single resolver (#9985),
+/// so `forge_cmd::gh_bin` callers and the facade can never disagree.
+pub(crate) use crate::gh_invocation::gh_bin;
 
 /// Passthrough the given `gh` args (entity prepended), inheriting stdio and
 /// propagating the exit code. On GitHub this is byte-identical to the scripts'
@@ -771,8 +770,8 @@ pub enum ForgeCmd {
     /// probe (#9453 Phase 4): does `feature/issue-N` already exist on
     /// `origin`? Implemented in [`crate::forge_check_branch`]; see that
     /// module for the exit-code contract. Zero forge-API calls (`git
-    /// ls-remote`, not `gh`).
-    CheckBranch { issue: u32 },
+    /// ls-remote`, not `gh`) unless `closed_pr_head` is set (#10027).
+    CheckBranch(crate::forge_check_branch::CheckBranchArgs),
     /// `forge auto-merge <pr> [--method M] [--expected-head-sha SHA]`.
     /// Operator-only (#8427): arms a server-side merge that bypasses Loom's
     /// merge-time gates; never dispatched from a Loom merge path.
@@ -872,7 +871,7 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
         ForgeCmd::CheckClaim { issue, force_claim } => {
             crate::forge_check_claim::handle(issue, force_claim)
         }
-        ForgeCmd::CheckBranch { issue } => crate::forge_check_branch::handle(issue),
+        ForgeCmd::CheckBranch(args) => crate::forge_check_branch::handle(args),
         ForgeCmd::AutoMerge {
             pr,
             method,

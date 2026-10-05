@@ -8,6 +8,7 @@ use super::*;
 mod admission_brake;
 mod complexity;
 mod daemon_event;
+mod export_coverage;
 mod fleet_captain;
 mod host_health_omissions;
 mod kind_registry;
@@ -184,6 +185,8 @@ fn host_health() -> TelemetryRecord {
         is_captain: None,
         armed_singleton_jobs: Vec::new(),
         captainless_singleton_jobs: Vec::new(),
+        exported_kinds: Vec::new(),
+        exporters: Vec::new(),
         memory: None,
     })
 }

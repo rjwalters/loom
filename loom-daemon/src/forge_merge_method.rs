@@ -27,12 +27,10 @@
 //! (Gitea repo-settings probing has no native Rust path yet anywhere in this
 //! module group), not a silently-dropped one: the shell caller logs it.
 
-use std::process::{Command, Stdio};
-
 use anyhow::Result;
 
-use crate::cmd_out::run_command;
 use crate::forge_cmd::{detect_forge, gh_bin, ForgeType, EX_FORGE_DECLINED, FORGE_CMD_TIMEOUT};
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
 /// Which of a repo's three merge strategies are actually enabled — the
 /// GitHub/Gitea `allow_squash_merge` / `allow_merge_commit(s)` /
@@ -123,13 +121,16 @@ pub(crate) fn resolve_merge_method(
 /// open to merge: silently ignoring an explicit, unverifiable request would
 /// reproduce the exact bug #8845 reports.
 fn github_merge_method(gh: &str, nwo: &str, requested: Option<&str>) -> i32 {
-    let mut cmd = Command::new(gh);
-    cmd.args(["api", &format!("repos/{nwo}")])
-        .stdin(Stdio::null());
-    let query = crate::cmd_out::decode_json::<RepoMergeFlags, _>(
-        run_command(cmd, FORGE_CMD_TIMEOUT),
-        |_| false,
-    );
+    let outcome = GhInvocation::new(
+        Operation::new("merge_method.repo"),
+        AccessIntent::Read,
+        GhTarget::None,
+        FORGE_CMD_TIMEOUT,
+    )
+    .program(gh)
+    .args(["api", &format!("repos/{nwo}")])
+    .run();
+    let query = crate::cmd_out::decode_json::<RepoMergeFlags, _>(outcome, |_| false);
     let flags = match query {
         crate::cmd_out::Query::Populated(f) => f,
         // A struct with every field `#[serde(default)]` can never legitimately

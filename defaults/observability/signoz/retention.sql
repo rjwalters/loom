@@ -1,4 +1,6 @@
 -- Local-trial retention split (#8826): logs and traces 7 days, metrics 30 days.
+-- TRIAL-ONLY (#10195): NEVER run this against the live harness-ops store, which
+-- keeps logs 3650 days and traces/metrics 10 years. #8946 item 2 stays held.
 -- Run AFTER setting the same split in SigNoz General Settings -> Retention
 -- (logs 7 days, traces 7 days, metrics 30 days). The application API owns the
 -- active signal tables and standard rollups; it leaves these existing

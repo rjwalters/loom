@@ -1,19 +1,42 @@
 //! ETA core tests (#9289). Pure: no daemon, no network, no clock.
 
 mod backtest;
+mod backtest_pr;
+mod backtest_union;
 mod censoring;
 mod conditioning;
 mod config;
 mod emit;
+mod episodes;
 mod estimate;
 mod explanation;
+mod fit;
+mod fit_leak;
+mod fit_parity;
+mod fit_rows;
+mod flag_timeline;
 mod fleet;
+mod fleet_refresh;
+mod friction;
+mod hold_parity;
+mod hold_serving;
+mod item_features;
 mod journal;
+pub(crate) mod land_twin_otter;
+mod land_v3;
+mod merge_hold;
+mod offline;
 mod primitives;
+mod queue_features;
 mod ready;
+mod recalibrate;
+mod recency;
 mod score;
 mod shadow;
+mod shadow_gate;
 mod tracker;
+mod tracker_hold;
+mod twin_otter_parity;
 
 use super::explanation::Features;
 use super::history::StageSamples;
@@ -32,6 +55,10 @@ pub(crate) const READY_GOLDEN: &str = include_str!("../fixtures/ready-golden.jso
 
 /// The golden backtest report (`land-v1` replayed over history-a, #9325).
 pub(crate) const BACKTEST_GOLDEN: &str = include_str!("../fixtures/backtest-golden.json");
+
+/// The twin-otter parity fixture (#10223): the generator spec, the fitted
+/// reference coefficients and the evaluation rows for #10221 and #10222.
+pub(crate) const TWIN_OTTER_PARITY: &str = include_str!("../fixtures/twin_otter_parity.json");
 
 /// The leakage fixture (#9325): a history whose LAST record, if the replay
 /// could see it, would change the answer — and which every replay instant in
@@ -89,6 +116,7 @@ pub(crate) fn input_at(stage: Stage, age_sec: i64, rework_rounds: u32) -> Estima
             age_sec,
             age_source: AgeSource::LabelEvent,
             rework_rounds,
+            episode_entered_at: None,
         }),
         features: Features {
             labels: Some(vec!["loom:review-requested".to_string()]),

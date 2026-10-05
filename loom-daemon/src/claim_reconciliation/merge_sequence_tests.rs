@@ -630,3 +630,62 @@ fn a_shared_listing_saves_the_pass_its_own_pr_list() {
         std::env::set_var(MERGE_SEQUENCE_ENABLED_ENV, v);
     }
 }
+
+// ---- #10089: Phase 2 reuses Phase 1's holder comment reads ----
+
+/// A listing of `n` open PRs; the numbers in `held` carry the hold label.
+fn listing_with_holds(n: u32, held: &[u32]) -> String {
+    let rows: Vec<String> = (1..=n)
+        .map(|i| {
+            let labels = if held.contains(&i) {
+                format!(r#"[{{"name":"{SEQUENCE_LABEL}"}}]"#)
+            } else {
+                "[]".to_string()
+            };
+            format!(
+                r#"{{"number":{i},"createdAt":"2026-10-02T00:00:0{i}Z","updatedAt":"2026-10-02T00:00:00Z","headRefOid":"{i:040x}","headRefName":"feature/issue-{i}","baseRefName":"main","isDraft":false,"labels":{labels}}}"#
+            )
+        })
+        .collect();
+    format!("[{}]", rows.join(","))
+}
+
+/// Each holder's comments are walked ONCE per tick: Phase 1 reads them to
+/// evaluate the hold and Phase 2's marker scan reuses that read instead of
+/// re-walking every holder (previously two paginated walks per holder).
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn a_tick_walks_each_holders_comments_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let prev = std::env::var(MERGE_SEQUENCE_ENABLED_ENV).ok();
+    std::env::remove_var(MERGE_SEQUENCE_ENABLED_ENV);
+    let log = dir.path().join("gh.log");
+    std::fs::write(&log, "").unwrap();
+    let gh = logging_gh(dir.path(), &log);
+    let listing = listing_with_holds(3, &[2, 3]);
+
+    let stats = reconcile_merge_sequences_with(&gh, &root, Some(listing.as_bytes()));
+
+    let calls = std::fs::read_to_string(&log).unwrap();
+    let walks = |n: u32| {
+        calls
+            .lines()
+            .filter(|l| l.contains(&format!("issues/{n}/comments")))
+            .count()
+    };
+    assert_eq!(stats.checked, 3, "{calls}");
+    assert_eq!((walks(2), walks(3)), (1, 1), "one comments walk per holder:\n{calls}");
+    assert_eq!(walks(1), 0, "a non-holder's comments are never walked:\n{calls}");
+    assert!(
+        calls
+            .lines()
+            .all(|l| !l.contains("/comments") || l.contains("per_page=100")),
+        "every comments walk pages at 100:\n{calls}"
+    );
+    if let Some(v) = prev {
+        std::env::set_var(MERGE_SEQUENCE_ENABLED_ENV, v);
+    }
+}

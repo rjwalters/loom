@@ -148,13 +148,13 @@ out=$(cd "$T" && bash -c '. ./l1.sh; inbox_mail chore issue 1 x; echo "rc=$?"; i
 (cd "$T/repo" && bash -c '. ../l1.sh; type inbox_mail | grep -q resolve-closed') && ok "one-line loader evals the fence" || bad "one-line loader with doc"
 
 # (a) every doc site that applies loom:operator-mechanical sends the chore mail within 3 lines.
-mech_lint() { awk 'FNR==1{p=0} /--add-label[ =]*"[^"]*loom:operator-mechanical/ {p=FNR; f=FILENAME}
+mech_lint() { awk 'FNR==1{p=0} /(--add-label[ =]*"[^"]*|labels\[\]=)loom:operator-mechanical/ {p=FNR; f=FILENAME}
   p && /inbox_mail chore/ && FNR-p<=3 {p=0} p && FNR-p==3 {print f ":" p; p=0} END{if (p) print f ":" p}' "$@"; }
 printf 'gh issue edit 1 --add-label "loom:operator-only,loom:operator-mechanical"\n' >"$T/bad.md"
 [ -n "$(mech_lint "$T/bad.md")" ] && ok "mechanical lint flags an unmailed application" || bad "mechanical lint vacuous"
 miss=$(mech_lint "$CMD"/*.md)
 [ -z "$miss" ] && ok "every operator-mechanical application sends a chore mail" || bad "no chore mail after: $miss"
-[ "$(grep -lE -- '--add-label[ =]*"[^"]*loom:operator-mechanical' "$CMD"/*.md | wc -l | tr -d ' ')" -ge 4 ] \
+[ "$(grep -lE -- '(--add-label[ =]*"[^"]*|labels\[\]=)loom:operator-mechanical' "$CMD"/*.md | wc -l | tr -d ' ')" -ge 4 ] \
   && ok "lint is not vacuous (>=4 application sites)" || bad "too few mechanical sites found"
 grep -q 'routed to loom:operator-only,loom:operator-mechanical' "$ROOT/defaults/scripts/check-promotion-landed.sh" \
   && grep -A1 "routed to loom:operator-only,loom:operator-mechanical' <<<" "$CMD/champion-issue-promo.md" | grep -q 'inbox_mail chore issue' \

@@ -72,31 +72,15 @@ impl SweepRegistry {
     /// ([`classify_preflip_labels`](Self::classify_preflip_labels),
     /// [`issue_is_closed_or_pr`](Self::issue_is_closed_or_pr)).
     pub(crate) fn fetch_claim_labeled_at(&self, issue: u32) -> Option<DateTime<Utc>> {
-        let gh = self
-            .config
-            .gh_bin
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("gh"));
-        let mut cmd = Command::new(&gh);
-        cmd.arg("api")
-            .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline"))
-            .arg("--paginate")
-            .arg("--jq")
-            .arg(
-                r#"[.[] | select(.event == "labeled" and .label.name == "loom:building") | .created_at] | max // empty"#,
-            );
-        cmd.current_dir(&self.config.workspace_root);
-        // #5401: cross-owner managed repo -> its own owner's installation-token
-        // GH_CONFIG_DIR (no-op for single-owner fleets / the root owner).
-        crate::credential_preflight::apply_gh_config_for_root(
-            &mut cmd,
-            &self.config.workspace_root,
-        );
-        // #8263: `LOOM_REPO` reaches `gh api` as the GH_REPO env var, NEVER as
-        // a `--repo` flag (`gh api` has none and aborts on one).
-        crate::gh_repo_env::apply_loom_repo_override(&mut cmd);
-        let timeout = reap_gh_timeout();
-        let output = output_with_timeout(cmd, timeout).ok().flatten()?;
+        // Counted as `guard.claim_timeline` (#10089); the facade applies the
+        // cross-owner GH_CONFIG_DIR (#5401) and `LOOM_REPO` as GH_REPO (#8263 —
+        // `gh api` has no `--repo` flag).
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline");
+        let jq = r#"[.[] | select(.event == "labeled" and .label.name == "loom:building") | .created_at] | max // empty"#;
+        let output = self
+            .gh_read("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
+            .ok()
+            .flatten()?;
         if !output.status.success() {
             return None;
         }

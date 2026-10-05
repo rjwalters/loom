@@ -362,7 +362,7 @@ impl ClaimResetter for GhClaimResetter {
         // owner's installation token; without it, the label edit/comment below
         // (writes) would silently 404 under the root owner's token. A no-op for
         // a single-owner fleet or the root owner's own repos.
-        let mut view_cmd = Command::new("gh");
+        let mut view_cmd = Command::new(crate::gh_invocation::gh_bin());
         view_cmd
             .env("PATH", &gh_path)
             .args([
@@ -395,7 +395,7 @@ impl ClaimResetter for GhClaimResetter {
             return Ok(false);
         }
 
-        let mut edit_cmd = Command::new("gh");
+        let mut edit_cmd = Command::new(crate::gh_invocation::gh_bin());
         edit_cmd
             .env("PATH", &gh_path)
             .args([
@@ -424,7 +424,7 @@ impl ClaimResetter for GhClaimResetter {
 
         // Best-effort comment — never fails the reset itself (mirrors the
         // rest of Loom's "a forge comment is advisory" posture).
-        let mut comment_cmd = Command::new("gh");
+        let mut comment_cmd = Command::new(crate::gh_invocation::gh_bin());
         comment_cmd
             .env("PATH", &gh_path)
             .args([
@@ -1843,7 +1843,7 @@ mod tests {
     /// for [`GhClaimResetter::reset_claim`] to exercise its full parse/branch
     /// logic against a *resolved-via-PATH* binary rather than a mocked trait.
     #[cfg(unix)]
-    fn write_stub_gh(dir: &std::path::Path, has_building_label: bool) {
+    fn write_stub_gh(dir: &std::path::Path, has_building_label: bool) -> impl Drop {
         use std::os::unix::fs::PermissionsExt;
         let script = format!(
             r#"#!/bin/sh
@@ -1864,9 +1864,10 @@ exit 0
         );
         let gh_path = dir.join("gh");
         std::fs::write(&gh_path, script).unwrap();
-        let mut perms = std::fs::metadata(&gh_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&gh_path, perms).unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // #10088: `gh` resolves through `LOOM_GH_BIN` (a loud-failing stub in
+        // test builds), so point it at this stub for the caller's scope.
+        crate::gh_invocation::resolver::test_stub::GhBinGuard::set(&gh_path)
     }
 
     /// [`GhClaimResetter`] must resolve `gh` via the canonical PATH built by
@@ -1883,7 +1884,7 @@ exit 0
         let fake_home = tempfile::tempdir().unwrap();
         let local_bin = fake_home.path().join(".local/bin");
         std::fs::create_dir_all(&local_bin).unwrap();
-        write_stub_gh(&local_bin, true);
+        let _gh = write_stub_gh(&local_bin, true);
 
         let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", fake_home.path());
@@ -1916,7 +1917,7 @@ exit 0
         let fake_home = tempfile::tempdir().unwrap();
         let local_bin = fake_home.path().join(".local/bin");
         std::fs::create_dir_all(&local_bin).unwrap();
-        write_stub_gh(&local_bin, false);
+        let _gh = write_stub_gh(&local_bin, false);
 
         let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", fake_home.path());

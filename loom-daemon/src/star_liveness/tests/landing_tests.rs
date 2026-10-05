@@ -1,7 +1,7 @@
 //! The classifier alone: every stage, and every non-agent state's ask.
 
 use crate::star_liveness::landing::{
-    classify, BlockerRef, Capacity, ItemFacts, MergeRefusal, PrFacts, StarFacts,
+    classify, BlockerRef, Capacity, ItemFacts, MergeRefusal, PrFacts, StaleAction, StarFacts,
 };
 use crate::types::{AskKind, LandingStage};
 
@@ -70,12 +70,18 @@ fn agent_stages_have_owners_and_no_ask() {
     merging.live_sweep = true;
     assert_eq!(classify(&merging).stage, LandingStage::Merging);
     let mut deferred = facts(&["loom:issue"]);
-    deferred.capacity = Capacity::Deferred {
-        reason: "waiting: concurrency cap full".into(),
-    };
+    deferred.capacity = Capacity::Deferred(crate::types::CapacityWait {
+        gate: "capacity".into(),
+        limiter: None,
+        position: None,
+        total: None,
+        cap: None,
+        configured_cap: None,
+    });
     let l = classify(&deferred);
     assert_eq!(l.stage, LandingStage::NoCapacity);
-    assert_eq!(l.no_capacity.as_deref(), Some("waiting: concurrency cap full"));
+    assert_eq!(l.no_capacity.as_deref(), Some("waiting (concurrency cap full)"));
+    assert!(l.capacity_wait.is_some());
 }
 
 #[test]
@@ -98,7 +104,7 @@ fn every_non_agent_state_is_needs_operator_with_one_concrete_ask() {
     let l = classify(&refused);
     assert_eq!(l.ask.as_ref().map(|a| a.kind), Some(AskKind::MergeRefused));
     assert!(l.ask.as_ref().unwrap().text.contains("Tracked in #30"));
-    assert_eq!(l.inherits, Some(30), "the incident inherits the star");
+    assert_eq!(l.inherits, vec![30], "the incident inherits the star");
     // No open incident: still an ask, now carrying the forge's own words.
     refused
         .pr
@@ -112,7 +118,7 @@ fn every_non_agent_state_is_needs_operator_with_one_concrete_ask() {
     let text = &l.ask.as_ref().unwrap().text;
     assert!(text.contains("No open incident issue tracks it"), "{text}");
     assert!(text.contains(&format!("`{raw}`")), "{text}");
-    assert_eq!(l.inherits, None);
+    assert!(l.inherits.is_empty());
 
     let mut pool = facts(&["loom:issue"]);
     pool.capacity = Capacity::PoolExhausted {
@@ -129,7 +135,11 @@ fn every_non_agent_state_is_needs_operator_with_one_concrete_ask() {
     let hold = with_pr(facts(&["loom:building"]), &["loom:pr", "loom:operator"]);
     assert_eq!(ask_kind(&hold), Some(AskKind::MergeRiskHold));
 
-    assert_eq!(ask_kind(&facts(&["loom:blocked"])), Some(AskKind::BlockedUnnamed));
+    // `blocked-unnamed` only once Curator was handed it and it came back
+    // still blocked with nothing named (#10151; before that: `stale_block_tests`).
+    let mut unnamed = facts(&["loom:blocked"]);
+    unnamed.curator_handoff = true;
+    assert_eq!(ask_kind(&unnamed), Some(AskKind::BlockedUnnamed));
 }
 
 #[test]
@@ -152,11 +162,19 @@ fn a_named_open_blocker_is_blocked_by_and_inherits() {
     let l = classify(&f);
     assert_eq!(l.stage, LandingStage::BlockedBy);
     assert_eq!(l.blocked_by.as_deref(), Some("#6"));
-    assert_eq!(l.inherits, Some(6));
+    assert_eq!(l.inherits, vec![6]);
     assert_eq!(l.next_actor, "blocker #6");
-    // All named blockers closed: nobody can unblock it but a human.
+    // All named blockers closed: a stale block the pass clears itself (#10151).
     f.blockers.truncate(1);
-    assert_eq!(classify(&f).ask.map(|a| a.kind), Some(AskKind::BlockedUnnamed));
+    let l = classify(&f);
+    assert_eq!((l.stage, l.ask), (LandingStage::StaleBlock, None));
+    assert_eq!(
+        l.stale,
+        Some(StaleAction::Unblock {
+            cleared: vec!["#5".into()],
+            key: "#5".into()
+        })
+    );
 }
 
 #[test]
@@ -164,7 +182,7 @@ fn red_main_blocks_only_undispatched_work_and_the_fix_inherits() {
     let mut f = facts(&["loom:issue"]);
     f.red_main_fix = Some(99);
     let l = classify(&f);
-    assert_eq!((l.stage, l.inherits), (LandingStage::BlockedBy, Some(99)));
+    assert_eq!((l.stage, l.inherits), (LandingStage::BlockedBy, vec![99]));
     let mut building = facts(&["loom:building"]);
     building.red_main_fix = Some(99);
     assert_eq!(classify(&building).stage, LandingStage::Building);
@@ -200,7 +218,7 @@ fn a_cross_repo_blocker_is_an_operator_ask_never_a_silent_state() {
     assert_eq!(ask.key, "blocked-cross-repo:other/repo#7");
     assert!(ask.text.contains("in a repo this host can't act on"), "{}", ask.text);
     assert_eq!(l.blocked_by.as_deref(), Some("other/repo#7"));
-    assert_eq!(l.inherits, None);
+    assert!(l.inherits.is_empty());
 
     f.blockers = vec![cross(true)];
     let ask = classify(&f).ask.unwrap();
@@ -214,5 +232,22 @@ fn a_cross_repo_blocker_is_an_operator_ask_never_a_silent_state() {
         cross_repo_managed: None,
     });
     let l = classify(&f);
-    assert_eq!((l.stage, l.inherits), (LandingStage::BlockedBy, Some(8)));
+    assert_eq!((l.stage, l.inherits), (LandingStage::BlockedBy, vec![8]));
+}
+
+/// #10012 AC 3: every open same-repo blocker inherits, not only the first
+/// one named. `#20` sorts before `#9` as text; neither may be dropped.
+#[test]
+fn every_open_same_repo_blocker_inherits_not_only_the_first() {
+    let blocker = |n: u32, open: bool| BlockerRef {
+        display: format!("#{n}"),
+        number: Some(n),
+        open: Some(open),
+        cross_repo_managed: None,
+    };
+    let mut f = facts(&["loom:curated", "loom:blocked"]);
+    f.blockers = vec![blocker(20, true), blocker(9, true), blocker(21, false)];
+    let l = classify(&f);
+    assert_eq!(l.stage, LandingStage::BlockedBy);
+    assert_eq!(l.inherits, vec![9, 20], "both open blockers inherit; the closed one does not");
 }

@@ -196,6 +196,19 @@ pub fn select_for_repo_at<'a>(
     owner_repo: &str,
     now: SystemTime,
 ) -> Option<&'a PoolMember> {
+    // #9986: the gateway owns the pool on a `required` egress host.
+    // `workspace_root()` is `None` when `WORKSPACE_ROOT` was never registered
+    // (CLI subcommands, not the daemon). Then only the env/machine policy tiers
+    // are consulted, so a repo-tier-only `required` policy is not honoured
+    // here — a deliberate fail-open for the repo tier alone: the daemon (which
+    // mints and publishes) registers its workspace at startup via
+    // `forge_identity::spawn_reader_refresh`, and
+    // env/machine `required` policies still apply.
+    if crate::forge_egress::publication::github_credential_forbidden(
+        crate::forge_identity::workspace_root(),
+    ) {
+        return None;
+    }
     let start = assignment_index(owner_repo, pool.len())?;
     (0..pool.len()).find_map(|offset| {
         let member = &pool[(start + offset) % pool.len()];

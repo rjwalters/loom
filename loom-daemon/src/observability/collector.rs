@@ -846,29 +846,23 @@ pub(super) async fn resolve_repo_slug_cached(
 /// timeout, an empty/malformed answer) degrades to `None` — the caller drops
 /// the record rather than emitting a fabricated repo identity.
 async fn fetch_repo_slug(workspace_root: &Path) -> Option<String> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.arg("repo")
-        .arg("view")
-        .arg("--json")
-        .arg("nameWithOwner")
-        .arg("--jq")
-        .arg(".nameWithOwner")
-        .current_dir(workspace_root);
-    // #5431: point this child at the owner-correct credential when
-    // `workspace_root` is a cross-owner managed repo (the root-keyed helper
-    // takes a `std::process::Command`, so set the env directly here for tokio's
-    // command type). A no-op for a single-owner fleet or the root owner's repos.
-    if let Some(dir) = crate::credential_preflight::gh_config_dir_for_root(workspace_root) {
-        cmd.env("GH_CONFIG_DIR", dir);
-    }
-    let run = cmd.output();
-    let output = tokio::time::timeout(SLUG_FETCH_TIMEOUT, run)
-        .await
-        .ok()?
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    // #10089: through the facade (counted, bounded); it also points the child
+    // at the owner-correct credential for a cross-owner managed repo (#5431).
+    let op = Operation::new("collector.repo_slug");
+    let outcome = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, SLUG_FETCH_TIMEOUT)
+        .current_dir(workspace_root)
+        .args([
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+        ])
+        .run_async()
+        .await;
+    let output = outcome.ok_output()?;
     let slug = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!slug.is_empty() && slug.contains('/')).then_some(slug)
 }
@@ -1141,6 +1135,14 @@ async fn sample_host_health(
         .await
         .unwrap_or_default();
     let (swap_in_bytes_per_sec, swap_out_bytes_per_sec) = swap_sample_rates(&pressure);
+    // Export coverage (#10196): which exporters this process actually started
+    // and which record kinds those exporters carry, so a replay reader can
+    // tell "this host reported nothing" from "this host was not reporting".
+    // Misconfigured/never-started entries are excluded by `export_coverage`.
+    let (exporters, exported_kinds) = crate::telemetry::export_coverage(
+        &crate::observability::global_export_statuses(),
+        Utc::now(),
+    );
     HostHealthRecord {
         captured_at: Utc::now(),
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1168,6 +1170,8 @@ async fn sample_host_health(
             workspace_root,
         ),
         captainless_singleton_jobs: crate::fleet_captain::captainless_singleton_job_names(),
+        exported_kinds,
+        exporters,
         // Memory/pressure slice ("deferred vs killed vs timed out"): the
         // whole object is omitted when nothing was measured — never a flat
         // zero — the same absence contract `protection`/`admission_brake`

@@ -30,6 +30,7 @@ pub mod checks;
 pub mod gate;
 pub mod policy;
 pub mod probe;
+pub mod publication;
 pub mod report;
 
 use std::path::Path;
@@ -181,7 +182,12 @@ pub fn evaluate(doc: &PolicyDoc, obs: &Observed, mode: Mode) -> Report {
     let (git, runtime, telemetry) = match mode {
         Mode::Assert => (vec![], vec![], vec![]),
         Mode::Doctor => (
-            dedupe(checks::assert_git_routing(policy, obs)),
+            dedupe(
+                checks::assert_git_routing(policy, obs)
+                    .into_iter()
+                    .chain(checks::assert_git_credential_separation(policy, obs))
+                    .collect(),
+            ),
             dedupe(checks::assert_runtime(policy, obs)),
             dedupe(checks::assert_telemetry(policy, obs)),
         ),

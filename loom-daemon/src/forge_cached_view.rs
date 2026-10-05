@@ -338,8 +338,9 @@ pub fn build_view_url(entity: &str, repo: Option<&str>, number: u32) -> String {
 
 /// `view-{entity}-{number}-{hash}.json`, keeping view entries distinguishable
 /// from the listing store's `listing-{hash}.json` entries sharing the same
-/// directory ([`store::disk_cache_dir`]).
-fn entry_path(dir: &Path, entity: &str, number: u32, cache_key: &str) -> PathBuf {
+/// directory ([`store::disk_cache_dir`]). Shared with
+/// [`crate::forge_wait_checks`]' PR-head read, so the two hold one ETag.
+pub(crate) fn entry_path(dir: &Path, entity: &str, number: u32, cache_key: &str) -> PathBuf {
     store::entry_path_with_prefix(dir, &format!("{VIEW_PREFIX}{entity}-{number}-"), cache_key)
 }
 
@@ -385,6 +386,20 @@ fn prune_stale(dir: &Path) {
     }
 }
 
+/// The inventoried operation a single-entity view serves (#9831).
+fn view_op(entity: &str) -> crate::forge_call_stats::ForgeOp {
+    if entity == "pr" {
+        crate::forge_call_stats::ops::PR_VIEW_STATE
+    } else {
+        // `GET repos/{o}/{r}/issues/{n}`: the inventory has no single-issue
+        // read row (`issue.list` is the label listing, `comment.list` the
+        // conversation) — recorded as `unknown` until one is inventoried.
+        crate::forge_call_stats::ForgeOp::uninventoried(
+            "single-issue REST read has no inventory row",
+        )
+    }
+}
+
 /// One conditional `gh api --include` GET via the shared
 /// [`store::fetch_conditional`] (recorded against caller `"forge_cached_view"`
 /// in `forge_call_stats`). Returns the body to serve (fresh on `200`, the
@@ -408,9 +423,9 @@ fn fetch_conditional(
     let prior = store::read_disk_entry(&path);
     let prior_etag = prior.as_ref().map(|p| p.etag.as_str());
 
+    let site = store::ConditionalRead::new("forge_cached_view", view_op(entity));
     let (status, response, _stderr) =
-        store::fetch_conditional("forge_cached_view", gh_bin, cwd, &target, &url, prior_etag)
-            .ok()?;
+        store::fetch_conditional(site, gh_bin, cwd, &target, &url, prior_etag).ok()?;
 
     match response {
         Some(r) if r.status == 304 => match prior {

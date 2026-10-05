@@ -1841,7 +1841,7 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
     let workspace_registry =
         crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let roots = workspace_registry.effective_roots(fallback_root);
-    let gh_bin = std::path::PathBuf::from("gh");
+    let gh_bin = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
     let pass_kind = if is_startup { "startup" } else { "periodic" };
     let pass_loop::ReconciliationPassStats {
         total_checked,
@@ -2043,7 +2043,7 @@ mod building_listing;
 /// The facade glue every `gh` call below goes through (#10089), and the
 /// version-keyed reuse of its per-PR reads — sibling files per the ratchet.
 pub(crate) mod gh_call;
-mod read_cache;
+pub(crate) mod read_cache;
 
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::work_finder::forge`] / [`crate::epic_supervisor::forge`]) — the

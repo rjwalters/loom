@@ -52,15 +52,18 @@
 -- a legal `story_points` value either (telemetry-schema.md §`story_points`),
 -- so on the forecast side a non-NULL estimate that misses this table is an
 -- out-of-vocabulary emitter defect, which SF8 counts rather than hides.
+--
+-- VALUES, not UNION ALL — D1 caps compound SELECT at 5 terms (#10066).
 -- ---------------------------------------------------------------------------
 CREATE VIEW IF NOT EXISTS measured_point_values
     (size_class, measured_point_tokens, measured_point_lines) AS
-          SELECT '1',  1.0,   1.0
-UNION ALL SELECT '2',  1.3,   8.5
-UNION ALL SELECT '3',  2.2,  21.0
-UNION ALL SELECT '5',  3.4,  47.0
-UNION ALL SELECT '8',  5.1,  82.0
-UNION ALL SELECT '13', 8.2, 197.0;
+VALUES
+    ('1',  1.0,   1.0),
+    ('2',  1.3,   8.5),
+    ('3',  2.2,  21.0),
+    ('5',  3.4,  47.0),
+    ('8',  5.1,  82.0),
+    ('13', 8.2, 197.0);
 
 CREATE VIEW IF NOT EXISTS issue_landed_size AS
 WITH
@@ -121,13 +124,17 @@ WITH
     -- literal `models_used[0]` the fleet records when attribution failed;
     -- those sweeps' tokens are real readings, normalized by their own
     -- geometric mean like any other model's.
+    -- VALUES, not UNION ALL — D1 caps compound SELECT at 5 terms (#10066);
+    -- `fit-landed-size.mjs` emits this exact shape, so a refit with more
+    -- models cannot reintroduce the limit.
     model_token_factors(model, factor) AS (
-        SELECT '<unattributed>',    30339879.008721
-        UNION ALL SELECT 'claude-opus-5',   20869614.457459
-        UNION ALL SELECT 'claude-opus-5-5',  5417277.931668
-        UNION ALL SELECT 'claude-sonnet-5', 18208672.096412
-        UNION ALL SELECT 'claude-sonnet-5-5', 2745672.191940
-        UNION ALL SELECT 'glm-5.3',        30857811.255173
+        VALUES
+            ('<unattributed>',    30339879.008721),
+            ('claude-opus-5',     20869614.457459),
+            ('claude-opus-5-5',    5417277.931668),
+            ('claude-sonnet-5',   18208672.096412),
+            ('claude-sonnet-5-5',  2745672.191940),
+            ('glm-5.3',           30857811.255173)
     ),
     -- Measured point values per class — read from the `measured_point_values`
     -- view above, which is the single definition of those bucket ratios

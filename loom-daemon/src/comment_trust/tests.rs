@@ -271,3 +271,45 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         "fetch_comment_bodies must return trusted bodies only"
     );
 }
+
+fn roster(logins: &[&str]) -> crate::fleet_store::admins::Admins {
+    crate::fleet_store::admins::Admins {
+        logins: logins.iter().map(|s| (*s).to_string()).collect(),
+        state: format!("loaded {}", logins.len()),
+    }
+}
+
+#[test]
+fn fleet_admin_is_trusted_even_as_contributor() {
+    let p = policy(&[]).with_admins(roster(&["turian"]));
+    assert!(p.trusts_json(&rest("turian", "User", "CONTRIBUTOR")));
+    assert!(p.trusts_json(&graphql("Turian", "NONE")));
+    assert!(!p.trusts_json(&rest("mallory", "User", "CONTRIBUTOR")));
+}
+
+#[test]
+fn fleet_admin_matches_account_kind() {
+    let p = policy(&[]).with_admins(roster(&["turian"]));
+    assert!(!p.trusts_json(&rest("turian[bot]", "Bot", "NONE")));
+    // An App-spelled roster entry is dropped by the parser, so only the
+    // user account is ever on the roster; the kind rule still holds if one
+    // is injected directly.
+    let p = policy(&[]).with_admins(roster(&["turian[bot]"]));
+    assert!(!p.trusts_json(&rest("turian", "User", "NONE")));
+}
+
+#[test]
+fn roster_and_repo_allowlist_union() {
+    let p = policy(&["rjwalters"]).with_admins(roster(&["turian"]));
+    assert!(p.trusts_json(&rest("turian", "User", "NONE")));
+    assert!(p.trusts_json(&rest("rjwalters", "User", "NONE")));
+}
+
+#[test]
+fn unavailable_roster_widens_nothing_and_is_reported() {
+    let p = policy(&[]).with_admins(crate::fleet_store::admins::Admins::unavailable("no file"));
+    assert!(!p.trusts_json(&rest("turian", "User", "CONTRIBUTOR")));
+    let s = p.sources_consulted();
+    assert!(s.contains("unavailable: no file") && s.contains("fleet/admins.json"), "{s}");
+    assert!(policy(&[]).sources_consulted().contains("not consulted"));
+}
