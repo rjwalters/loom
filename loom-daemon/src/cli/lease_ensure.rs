@@ -315,19 +315,14 @@ impl LeaseEnsureArgs {
             return;
         };
         let request = attended::StartRequest {
-            issue,
-            role: None,
             watch_pid: Some(self.watch_pid),
-            workspace: PathBuf::from(&self.workspace),
-            transcript: None,
-            from_offset: None,
             // `0` means "unbounded" for the lease loop; a tailer is always capped.
             max_age_secs: if self.max_age == 0 {
                 attended::DEFAULT_MAX_AGE_SECS
             } else {
                 self.max_age
             },
-            idle_exit_secs: attended::DEFAULT_IDLE_EXIT_SECS,
+            ..super::attend_hook::request(issue, PathBuf::from(&self.workspace))
         };
         let live = attended::start(&request, &attended::AttendEnv::from_process());
         eprintln!("lease ensure: live output: {}", live.describe(issue));

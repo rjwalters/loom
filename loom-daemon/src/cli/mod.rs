@@ -17,6 +17,7 @@ pub(crate) mod accounts_args;
 pub(crate) mod accounts_session;
 mod agent_skills;
 pub(crate) mod api_keys;
+pub(crate) mod attend_hook;
 pub(crate) mod cancel;
 pub(crate) mod cargo_target_dir;
 mod check_guard_wiring;
