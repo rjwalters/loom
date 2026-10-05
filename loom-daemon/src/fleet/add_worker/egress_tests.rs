@@ -148,6 +148,7 @@ fn load_for_operator_reads_policy_and_fails_closed_when_unreadable() {
             env_path: Some(path),
             machine_path: None,
             repo_path: None,
+            ..PolicySources::default()
         }
     };
     // Absent policy -> legacy plan (the only "no policy" case).

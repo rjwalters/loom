@@ -47,6 +47,7 @@ fn policy_sources(ws: &Path, api: &str, dirs: &[PathBuf]) -> PolicySources {
         env_path: Some(policy_path),
         machine_path: None,
         repo_path: None,
+        ..PolicySources::default()
     }
 }
 
@@ -177,6 +178,7 @@ fn required_stance_resolves_from_policy_and_unreadable_fails_closed() {
         env_path: Some(bad),
         machine_path: None,
         repo_path: None,
+        ..PolicySources::default()
     };
     assert!(matches!(egress_pub::stance_from(&sources), Stance::Required { .. }));
     assert_eq!(egress_pub::stance_from(&PolicySources::default()), Stance::Unconfigured);
@@ -197,6 +199,7 @@ fn repo_sources(ws: &Path, api: &str) -> PolicySources {
         env_path: None,
         machine_path: None,
         repo_path: env.env_path,
+        ..PolicySources::default()
     }
 }
 
@@ -215,6 +218,7 @@ fn repo_origin_observe_policy_never_emits_api_host() {
         env_path: None,
         machine_path: None,
         repo_path: Some(path),
+        ..PolicySources::default()
     };
     let stance = egress_pub::stance_from(&sources);
     assert_eq!(stance, Stance::Unconfigured);
@@ -250,6 +254,7 @@ fn schema_invalid_observe_policy_is_never_actuated_even_from_a_trusted_origin() 
         env_path: Some(path),
         machine_path: None,
         repo_path: None,
+        ..PolicySources::default()
     };
     assert!(!crate::forge_egress::policy::assert_policy_shape(&data).is_empty());
     assert_eq!(egress_pub::stance_from(&sources), Stance::Unconfigured);
