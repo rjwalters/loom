@@ -695,8 +695,14 @@ it links whose link **and** star were both known before `cutoff`.
   run counts from the later of its labeled-at time and the link's known-at
   time, so a link or star that becomes known after `T` never stars a row at
   `T`. Training reads issue `label_added` / `label_removed` rows; serving
-  reads one ETag-conditional listing per star label per repo per pass (the
-  work finder's URLs) and stamps changes at the pass.
+  reads one ETag-conditional listing per star label per pass, for repos with
+  at least one tracked PR only (the work finder's URLs), and stamps changes
+  at the pass.
+- **Known skew: closed issues.** Serving lists only *open* starred issues, so
+  a linked issue that closes while still labeled reads as an unstar from that
+  pass on. Training replays label events only and keeps it starred until a
+  `label_removed`. This is rare while the linking PR is still open; it only
+  affects the recorded `starred_any` / `star_source`, never the model.
 - **Unknown coverage**: a repo whose raw cache has no pulls (link) or
   issue-events rows before `cutoff` gives an unknown state (`null`, counted in
   `rows_star_unknown`), never "unstarred". Serving records nothing for a repo

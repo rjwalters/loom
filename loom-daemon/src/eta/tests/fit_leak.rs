@@ -538,34 +538,27 @@ fn the_star_baseline_is_not_vacuous_and_the_file_is_unchanged() {
 
 #[test]
 fn an_issue_starred_at_t_minus_lag_plus_1s_leaves_every_row_byte_identical() {
-    let (baseline, _) = star_rows(&star_events(&[]));
+    // #9002 links issue 78 at `T − 9 h`; 78 is NOT starred in this baseline, so
+    // a leaked late star would flip 9002's rows (a star on the already-starred
+    // 77 would be a no-op and could not detect the leak).
+    let linked = link(9002, 78, end() - Duration::hours(9));
+    let star78 = |at| raw(78, ItemKind::Issue, EventKind::LabelAdded, Some(STAR), at);
+    let starred_9002 = |a: &rows::Assembled| {
+        a.rows
+            .iter()
+            .zip(&a.row_keys)
+            .any(|(r, k)| k.pr == 9002 && r.starred_any == Some(true))
+    };
+    let (baseline, a) = star_rows(&star_events(std::slice::from_ref(&linked)));
+    assert!(!starred_9002(&a), "78 is unstarred in the baseline");
     let late = end() - Duration::seconds(119);
-    let (rows, _) = star_rows(&star_events(&[raw(
-        77,
-        ItemKind::Issue,
-        EventKind::LabelAdded,
-        Some(STAR),
-        late,
-    )]));
+    let (rows, _) = star_rows(&star_events(&[linked.clone(), star78(late)]));
     assert_eq!(rows, baseline);
-    // Positive control: the same star an hour earlier, on a linked issue,
-    // changes the later rows.
-    let (rows, a) = star_rows(&star_events(&[
-        link(9002, 78, end() - Duration::hours(9)),
-        raw(
-            78,
-            ItemKind::Issue,
-            EventKind::LabelAdded,
-            Some(STAR),
-            end() - Duration::hours(1),
-        ),
-    ]));
+    // Positive control: the same star on the same linked issue, an hour
+    // earlier, changes the later rows.
+    let (rows, a) = star_rows(&star_events(&[linked, star78(end() - Duration::hours(1))]));
     assert_ne!(rows, baseline);
-    assert!(a
-        .rows
-        .iter()
-        .zip(&a.row_keys)
-        .any(|(r, k)| k.pr == 9002 && r.starred_any == Some(true)));
+    assert!(starred_9002(&a));
 }
 
 #[test]

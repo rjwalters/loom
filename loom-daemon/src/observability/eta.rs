@@ -905,7 +905,7 @@ fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> (Stage
 }
 
 /// One repo's star observation: slug, each PR's linked issues, and the open
-/// starred issues (`None` when a listing failed).
+/// starred issues (`None` when a listing failed or the repo lists no PR).
 type RepoStars = (String, Vec<(u32, Vec<u32>)>, Option<Vec<u32>>);
 
 /// One ETA pass: list, resolve, reload history, estimate, deliver. A no-op
@@ -947,9 +947,16 @@ pub(super) async fn record(
         // A partial listing would read as PRs leaving review; skip the repo.
         if listings.len() == REVIEW_LABELS.len() {
             let links = pr_links(&listings);
-            let starred = starred_issues(root).await;
+            let listed = listed_prs(&listings);
+            // Only a repo with a tracked PR needs the star listing; `None`
+            // leaves its book untouched (no observation, not "unstarred").
+            let starred = if listed.is_empty() {
+                None
+            } else {
+                starred_issues(root).await
+            };
             stars.push((slug.clone(), links, starred));
-            repos.push((root.clone(), slug, pr_views(&listings), listed_prs(&listings)));
+            repos.push((root.clone(), slug, pr_views(&listings), listed));
         }
     }
     // Before `now`: the fleet view is known strictly before the estimates.
