@@ -20,16 +20,19 @@
 //!   overlap, never proof of semantic compatibility — the pass only orders,
 //!   it never merges, vouches, or combines. Within a component, existing
 //!   trusted `loom:sequence` markers and base-branch stacking are
-//!   authoritative constraints; everything else orders oldest-first (stable
-//!   tiebreak on PR number), except that a starred (`loom:operator-priority`)
-//!   placeable PR goes before an unstarred one and a stalled no-verdict PR
-//!   goes last (#10060). A constraint cycle skips the whole component
-//!   for that tick — a half-rewritten order is worse than a deferred one.
+//!   authoritative constraints; everything else orders ready-first (#10371,
+//!   [`ready`]: approved PRs ahead of non-approved ones), then oldest-first
+//!   within a tier (stable tiebreak on PR number), except that a starred
+//!   (`loom:operator-priority`) placeable PR goes before an unstarred one of
+//!   its tier and a stalled no-verdict PR goes last (#10060). A constraint
+//!   cycle skips the whole component for that tick — a half-rewritten order
+//!   is worse than a deferred one.
 //! - **Apply.** Edges are a DAG over DIRECT overlap (#10060): a follower
 //!   waits only for its nearest earlier member that shares a changed file
 //!   with it (or that it is stacked on), never for a PR it reaches only
 //!   through a third PR — so the marker's "changes files #N also changes" is
-//!   always true. The follower gets `loom:sequenced` (#9378's durable gate)
+//!   always true. No edge is written behind a predecessor that is not ready
+//!   to land (#10371). The follower gets `loom:sequenced` (#9378's durable gate)
 //!   and a trusted `source=pass` marker pinning both heads and the plan id.
 //!   Followers that already carry a trusted marker are never re-planned —
 //!   a human's or another pass's "after" wins over the computed order.
@@ -49,6 +52,9 @@
 //!   soft holds on approved followers behind it release early, and the chain
 //!   is escalated once ("operator needed" on the head PR, naming the action
 //!   and the approved PRs it holds). Hard holds still never release.
+//! - **Not-ready release (#10371, [`ready`]).** A soft hold whose predecessor
+//!   loses `loom:pr`, or gains `loom:changes-requested` / `loom:ci-failure` /
+//!   `loom:blocked`, is released on the next tick; hard holds never are.
 //! - **No-overlap release (#10077, [`overlap`]).** A soft in-flight hold
 //!   whose two PRs share no changed file (a transitive-only edge recorded
 //!   before #10060) is released; any failed read or unknown keeps it.
@@ -110,6 +116,10 @@ pub use stall::{stall_hours, MERGE_SEQUENCE_STALL_ENV};
 // per-tick changed-files cache both phases share (#10077).
 #[path = "merge_sequence_overlap.rs"]
 pub mod overlap;
+
+// Ready-first ordering and the not-ready release (#10371).
+#[path = "merge_sequence_ready.rs"]
+pub mod ready;
 
 /// The durable hold label this pass applies (defined by #9378).
 pub const SEQUENCE_LABEL: &str = "loom:sequenced";
@@ -341,11 +351,12 @@ pub fn order_component(members: &[&SequencePr], constraints: &[(u32, u32)]) -> O
     order_component_with(members, constraints, &BTreeSet::new())
 }
 
-/// [`order_component`] with the #10060 placeable-set ranking: among members
-/// that are placeable right now (no unplaced constraint predecessor), a
-/// `stalled` member goes last and a starred one goes first, then
-/// oldest-first. A rank never overrides a constraint edge; with no star and
-/// no stall the order is exactly the oldest-first one.
+/// [`order_component`] with the placeable-set ranking: among members that
+/// are placeable right now (no unplaced constraint predecessor), ready
+/// members go first (#10371, [`ready::tier`]); within a tier a `stalled`
+/// member goes last and a starred one goes first (#10060), then
+/// oldest-first. A rank never overrides a constraint edge; with every member
+/// in one tier, no star and no stall the order is exactly the oldest-first one.
 #[must_use]
 pub fn order_component_with(
     members: &[&SequencePr],
@@ -369,10 +380,11 @@ pub fn order_component_with(
         .collect();
     let mut ordered = Vec::with_capacity(members.len());
     while !ready.is_empty() {
-        // Among the currently placeable: not-stalled before stalled, starred
-        // before unstarred, then oldest-first — a stable total order
-        // independent of the input listing's order.
-        let rank = |p: &SequencePr| (stalled.contains(&p.number), !stall::starred(p));
+        // Among the currently placeable: ready before not ready, then
+        // not-stalled before stalled, starred before unstarred, then
+        // oldest-first — a stable total order independent of listing order.
+        let rank =
+            |p: &SequencePr| (ready::tier(p), stalled.contains(&p.number), !stall::starred(p));
         ready.sort_by(|a, b| {
             let (pa, pb) = (by_number[a], by_number[b]);
             (rank(pa), &pa.created_at, pa.number).cmp(&(rank(pb), &pb.created_at, pb.number))
@@ -525,7 +537,9 @@ pub fn plan_repo_with(
             })
             .collect();
         let id = plan_id(&member_pins);
-        groups.push(plan_group(&id, &order, &by_number, files));
+        let mut group = plan_group(&id, &order, &by_number, files);
+        ready::drop_edges_behind_unready(&mut group, &by_number);
+        groups.push(group);
     }
     groups
 }
@@ -568,6 +582,10 @@ pub enum HoldAction {
     /// Soft hold between two PRs that share no changed file (a transitive-only
     /// edge from before #10060): release. Decided by [`overlap::with_no_overlap`].
     ReleaseNoOverlap,
+    /// Soft hold whose predecessor is not ready to land (no `loom:pr`, or a
+    /// changes-requested / ci-failure / blocked label): release (#10371).
+    /// Decided by [`ready::with_readiness`].
+    ReleaseNotReady,
 }
 
 /// Pure Phase-1 decision for one hold.
@@ -687,6 +705,7 @@ pub fn release_comment_body(marker: &SequenceMarker, action: HoldAction) -> Stri
             marker.after
         ),
         HoldAction::ReleaseNoOverlap => overlap::release_reason(marker),
+        HoldAction::ReleaseNotReady => ready::release_reason(marker),
         _ => "released".to_string(),
     };
     format!(
@@ -813,6 +832,8 @@ pub struct MergeSequenceStats {
     pub stall_released: usize,
     /// Soft holds released because the two PRs share no file (#10077).
     pub overlap_released: usize,
+    /// Soft holds released because the predecessor is not ready (#10371).
+    pub not_ready_released: usize,
     /// Stalled-chain escalations posted this tick (#10060).
     pub escalated: usize,
     pub held: usize,
@@ -1175,6 +1196,10 @@ pub(super) fn reconcile_merge_sequences_with(
                 stalls.record(h, c, quiet, pr.number, action == HoldAction::ReleaseStalled);
             }
         }
+        // #10371: a soft hold behind a predecessor that is not ready to land
+        // (as this tick's listing shows it) is released.
+        let action =
+            ready::with_readiness(action, &marker, pred.as_ref(), pr.head_sha.as_deref(), head);
         // #10077: a soft hold between PRs sharing no file is released.
         let fetch = |p: &SequencePr| changed_files(gh_bin, root, p);
         let action =
@@ -1184,7 +1209,8 @@ pub(super) fn reconcile_merge_sequences_with(
             | HoldAction::ReleaseDissolved
             | HoldAction::Expire
             | HoldAction::ReleaseStalled
-            | HoldAction::ReleaseNoOverlap => {
+            | HoldAction::ReleaseNoOverlap
+            | HoldAction::ReleaseNotReady => {
                 release_hold(gh_bin, root, pr.number, &release_comment_body(&marker, action))
                     .map(|_| action)
             }
@@ -1199,6 +1225,7 @@ pub(super) fn reconcile_merge_sequences_with(
             Ok(HoldAction::Expire) => stats.expired += 1,
             Ok(HoldAction::ReleaseStalled) => stats.stall_released += 1,
             Ok(HoldAction::ReleaseNoOverlap) => stats.overlap_released += 1,
+            Ok(HoldAction::ReleaseNotReady) => stats.not_ready_released += 1,
             Ok(HoldAction::VoidAndReplan) => stats.voided += 1,
             Ok(_) => stats.held += 1,
             Err(e) => {

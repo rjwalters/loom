@@ -308,8 +308,8 @@ fn re_planning_after_a_release_never_re_creates_the_released_edge() {
     // planned afresh: it may wait for a PR it really overlaps (#10060), never
     // for the disjoint one again.
     let prs = [
-        pr(1, "2026-10-01T00:00:00Z", &[]),
-        pr(2, "2026-10-01T01:00:00Z", &[]),
+        pr(1, "2026-10-01T00:00:00Z", &["loom:pr"]),
+        pr(2, "2026-10-01T01:00:00Z", &["loom:pr"]),
         pr(3, "2026-10-01T02:00:00Z", &["loom:pr"]),
     ];
     let files = BTreeMap::from([
@@ -499,6 +499,9 @@ fn check(
                 return Err(format!("self-predecessor {e:?}"));
             }
             let (f, p) = (by[&e.follower], by[&e.after]);
+            if !super::super::ready::ready(p) {
+                return Err(format!("edge behind a non-ready predecessor {e:?} (#10371)"));
+            }
             match e.reason {
                 EdgeReason::SharedFiles => {
                     let shared = files
