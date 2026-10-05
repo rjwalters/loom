@@ -414,6 +414,36 @@ fn fetch_conditional(
     number: u32,
     repo_override: Option<&str>,
 ) -> Option<String> {
+    fetch_conditional_as("forge_cached_view", gh_bin, cwd, dir, entity, number, repo_override)
+}
+
+/// [`build_output`] against an explicit `gh`, recorded against `caller` in
+/// `forge_call_stats` — the agent `gh` front's in-process entry (#10331),
+/// whose bare `gh` on `PATH` is the front itself.
+#[must_use]
+pub fn build_output_via(
+    caller: &'static str,
+    entity: &str,
+    args: &[String],
+    gh_bin: &Path,
+) -> Option<String> {
+    let cwd = std::env::current_dir().ok();
+    let dir = store::disk_cache_dir();
+    build_output(entity, args, &|e, n, r| {
+        fetch_conditional_as(caller, gh_bin, cwd.as_deref(), &dir, e, n, r)
+    })
+}
+
+/// [`fetch_conditional`] recorded against an explicit `caller`.
+fn fetch_conditional_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    dir: &Path,
+    entity: &str,
+    number: u32,
+    repo_override: Option<&str>,
+) -> Option<String> {
     let env_repo = std::env::var("LOOM_REPO").ok().filter(|s| !s.is_empty());
     let repo = repo_override.or(env_repo.as_deref());
     let target = store::resolve_target(cwd, repo);
@@ -423,7 +453,7 @@ fn fetch_conditional(
     let prior = store::read_disk_entry(&path);
     let prior_etag = prior.as_ref().map(|p| p.etag.as_str());
 
-    let site = store::ConditionalRead::new("forge_cached_view", view_op(entity));
+    let site = store::ConditionalRead::new(caller, view_op(entity));
     let (status, response, _stderr) =
         store::fetch_conditional(site, gh_bin, cwd, &target, &url, prior_etag).ok()?;
 

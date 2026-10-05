@@ -511,6 +511,13 @@ fn run_preflight(
         selection.apply(&mut command);
     }
     command.env("LOOM_RUNTIME", &runtime);
+    // #10331: plain `gh` in the worker reaches the agent `gh` front first, so
+    // its `issue|pr view|list --json` reads are ETag-revalidated (never stale)
+    // and everything else execs the next `gh` untouched. `LOOM_GH_SHIM=0`
+    // opts out; see defaults/docs/gh-cached.md.
+    if let Some(path) = crate::agent_gh::worker_path(std::env::var_os("PATH").as_deref()) {
+        command.env("PATH", path);
+    }
     // CARGO_INCREMENTAL=0 for every Loom-spawned worker (#8456, parent #8453
     // item 1). Cargo keys a crate's incremental session state by the crate's
     // ABSOLUTE source path, and every Loom worktree is a new path — so state

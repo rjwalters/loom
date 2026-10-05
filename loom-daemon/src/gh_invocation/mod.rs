@@ -46,6 +46,7 @@ mod outcome;
 mod reader_route;
 pub mod resolver;
 pub mod telemetry;
+pub mod transparent;
 
 #[cfg(test)]
 mod tests;
