@@ -111,6 +111,8 @@ pub mod fleet_events_pulls;
 pub mod fleet_events_reviews;
 pub mod fleet_fetch;
 pub mod fleet_refresh;
+pub mod fleet_signoz;
+pub mod fleet_signoz_refresh;
 pub mod fleet_state;
 pub mod fleet_state_prs;
 pub mod friction;

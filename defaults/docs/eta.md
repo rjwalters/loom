@@ -1366,6 +1366,7 @@ of what is on disk and never needs a refetch.
 | `fleetRefresh.backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `1500` |
 | `fleetRefresh.reserveCalls` | `LOOM_ETA_FLEET_REFRESH_RESERVE` | `1500` |
 | `fleetRefresh.backfillDays` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS` | `21` (floor 15: the fit window + 1) |
+| `fleetRefresh.signoz.enabled` | `LOOM_ETA_FLEET_SIGNOZ_ENABLED` | `false` (#9758; see [SigNoz in-sweep half](#signoz-in-sweep-half-fleetrefreshsignoz-9758)) |
 
 `historyScope` is one of:
 
@@ -1475,6 +1476,50 @@ them with a daemon restart.
   host: every writer replaces whole files atomically, and the last writer
   wins. A `LOOM_ETA_FLEET_SNAPSHOT_DIR` shared between hosts works, but enable
   the task on only one of them.
+
+### SigNoz in-sweep half (`fleetRefresh.signoz`, #9758)
+
+The forge snapshot cannot see inside a sweep, so `finish` refuses at `scope =
+fleet` on it alone. The SigNoz half caches the fleet's own exported
+`sweep.outcome` records per repo under `<snapshot dir>/signoz/<slug>.json`
+(schema `eta-fleet-signoz-snapshot/v1`), and the fleet history folds both kinds
+of snapshot together.
+
+- **Source.** `SampleSource::SignozOutcome` (`signoz:sweep.outcome` in
+  `samples_by_source`), admitted by a `SweepOutcome` filter and **not** by a
+  `StageJournal` one. Each sample keeps the host that recorded the sweep in
+  `samples_by_host`. Phase durations and the merge share are taken; Judge
+  verdicts are not, because the forge snapshot already carries them. The
+  `judge`/`doctor`/`merge` phases land in `review_wait`/`doctor`/`merge_wait`
+  beside the forge's samples of the same stages — the overlap `augment`
+  already has between this host's journal and the forge, now fleet-wide.
+- **Identity.** Deduplicated by `loom.record_id` (a redelivery), then by
+  `(host.id, loom.sweep_id)` keeping the first to become knowable. Under
+  `augment`, a sweep in this host's own journal is read from the journal, never
+  twice.
+- **Knowable-at.** A sample is observed at the row's `observed_timestamp`,
+  never its event time. That column is still a producer-side lower bound
+  ([telemetry-replay](telemetry-replay.md)), so a replay is point-in-time
+  correct only up to the export latency. A row with no knowable-at, or one
+  earlier than its event time, is rejected.
+- **Rejections.** A malformed record (no record id, host, sweep id or knowable
+  time, another repo, an unknown result, absent or invalid
+  `loom.phase_durations`) is counted by reason and skipped. An unavailable
+  backend, a failed page, an unparseable response or the page ceiling stops the
+  walk and keeps the last valid snapshot; a partial window is never published.
+- **Refresh.** Each refresh re-reads the whole retention window (120 days),
+  because a late-delivered record carries an old `observed_timestamp` that an
+  incremental cursor would skip.
+- **Settings.** Off by default. Set `endpoint` (ClickHouse HTTP of the
+  telemetry store), `user`, and `credentialFile` (the path of an owner-only
+  password file outside every repository, never the secret). Environment
+  overrides: `LOOM_ETA_FLEET_SIGNOZ_ENABLED`, `…_ENDPOINT`, `…_USER`,
+  `…_CREDENTIAL_FILE`, `…_PAGE_SIZE` (500), `…_MAX_PAGES` (200). It runs in the
+  fleet refresh task's cycle, so it also needs `fleetRefresh.enabled`.
+- **CLI.** `loom-daemon eta fleet signoz refresh --repo R [--endpoint URL
+  --credential-file PATH | --from-file export.jsonl] [--as-of T] [--dry-run]`,
+  `… signoz show`, and `… signoz query` (the SQL, for a manual
+  `clickhouse-client --format JSONEachRow` export).
 
 ## Queries
 

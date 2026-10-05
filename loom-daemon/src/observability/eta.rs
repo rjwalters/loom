@@ -807,6 +807,8 @@ fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> (Stage
             history.censored.extend(samples.censored);
             history.verdicts.extend(samples.verdicts);
             history.paths.extend(samples.paths);
+            // #9758: what `augment` dedupes the SigNoz half against.
+            history.outcome_keys.extend(samples.outcome_keys);
         }
     }
     let rows = journal::read(&journal::journal_path(journal_root));

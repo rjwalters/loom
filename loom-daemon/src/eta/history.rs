@@ -45,14 +45,21 @@
 //! leak-free ([`StageSamples::select`] enforces the second half by refusing
 //! every sample observed at or after `as_of`).
 //!
-//! The remaining half of #9343 — fleet-wide *in-sweep* (`sweep.curator`,
-//! `sweep.builder`) samples from SigNoz — is blocked on fleet workers
-//! exporting at all (harness-ops#249) and is deliberately not attempted here.
+//! The fleet-wide *in-sweep* half (#9758) is a second fleet producer,
+//! [`super::fleet_signoz`]: the fleet's own `sweep.outcome` records, pulled
+//! from SigNoz into a cached snapshot outside the estimator and handed in
+//! through [`StageSamples::push_outcome_facts`] — the same conversion the local
+//! journal uses — attributed to [`SampleSource::SignozOutcome`] and to the host
+//! that actually recorded each sweep.
 
 use super::{Stage, MAX_SAMPLES, MIN_SAMPLES, WINDOW_DAYS};
-use crate::telemetry::{SweepOutcomeRecord, SweepResult, TelemetryEnvelope, TelemetryRecord};
+use crate::telemetry::{
+    JudgeVerdict, PhaseDuration, SweepOutcomeRecord, SweepResult, TelemetryEnvelope,
+    TelemetryRecord,
+};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Bucket a sweep-outcome sample lands in when the record's `repo` slug was
@@ -77,6 +84,12 @@ pub enum SampleSource {
     /// watch. See [`SampleSource::admits`] for why that distinction is
     /// recorded without changing which samples a shipped heuristic accepts.
     ForgeTimeline,
+    /// The fleet's `sweep.outcome` records, read back from SigNoz (#9758).
+    ///
+    /// The same measurement as [`SampleSource::SweepOutcome`] — one sweep's
+    /// phase durations and whether it merged itself — recorded by whichever
+    /// host ran the sweep rather than only this one.
+    SignozOutcome,
 }
 
 impl SampleSource {
@@ -87,6 +100,7 @@ impl SampleSource {
             SampleSource::SweepOutcome => "sweep-outcome-telemetry.jsonl",
             SampleSource::StageJournal => "eta-stage-samples.jsonl",
             SampleSource::ForgeTimeline => "forge:pr-timeline",
+            SampleSource::SignozOutcome => "signoz:sweep.outcome",
         }
     }
 
@@ -107,11 +121,40 @@ impl SampleSource {
     /// never contains a [`Self::ForgeTimeline`] sample, so every local estimate
     /// is byte-identical to before. What changed is the history handed in, not
     /// the function — the property `eta` depends on for backtests.
+    ///
+    /// The second equivalence (#9758) is the in-sweep twin of the first: a
+    /// filter that asks for [`Self::SweepOutcome`] also accepts
+    /// [`Self::SignozOutcome`], because a fleet host's exported `sweep.outcome`
+    /// is the very record this host's own journal holds for its own sweeps. It
+    /// is deliberately one-directional and deliberately **not** extended to
+    /// [`Self::StageJournal`]: a stage-journal filter (`start-v1`) asks for
+    /// tracker-observed label transitions, and a sweep's phase durations are
+    /// not that measurement.
     #[must_use]
     pub fn admits(self, source: SampleSource) -> bool {
         self == source
             || (self == SampleSource::StageJournal && source == SampleSource::ForgeTimeline)
+            || (self == SampleSource::SweepOutcome && source == SampleSource::SignozOutcome)
     }
+}
+
+/// The facts of one `sweep.outcome` that become history, independent of where
+/// the record was read from (#9758): this host's journal
+/// ([`StageSamples::push_outcome`]) or the fleet's SigNoz export
+/// ([`super::fleet_signoz`]). One conversion, so the two producers cannot
+/// drift on which phases count, the whole-sweep fallback, or the worked rule.
+#[derive(Debug, Clone, Copy)]
+pub struct OutcomeFacts<'a> {
+    /// `owner/repo`, `None` when the slug was unresolved.
+    pub repo: Option<&'a str>,
+    /// The sweep's result.
+    pub result: SweepResult,
+    /// Whole-sweep seconds.
+    pub total_duration_sec: i64,
+    /// Per-phase durations.
+    pub phase_durations: &'a [PhaseDuration],
+    /// Judge verdicts to record, or `None` to record none.
+    pub judge_verdicts: Option<&'a [JudgeVerdict]>,
 }
 
 /// One observed stage duration. A sample in [`StageSamples::censored`] is the
@@ -227,6 +270,12 @@ pub struct StageSamples {
     /// (forge-derived) sample is in it. [`Self::merge`] is the only thing that
     /// ever raises it, and it never lowers it.
     pub scope: super::explanation::HistoryScope,
+    /// `(host_id, sweep_id)` of every local `sweep.outcome` folded in by
+    /// [`Self::push_outcome`] (#9758). Not read by any estimator: it is how
+    /// `historyScope = augment` keeps a sweep this host journalled **and** the
+    /// fleet exported to SigNoz from contributing twice
+    /// ([`super::fleet::apply_scope`]).
+    pub outcome_keys: BTreeSet<(String, String)>,
 }
 
 /// Which level a selection was made at.
@@ -359,6 +408,7 @@ impl StageSamples {
         self.paths.extend(other.paths);
         self.calibration.extend(other.calibration);
         self.episodes.extend(other.episodes);
+        self.outcome_keys.extend(other.outcome_keys);
         if other.scope == HistoryScope::Fleet {
             self.scope = HistoryScope::Fleet;
         }
@@ -378,19 +428,41 @@ impl StageSamples {
         observed_at: DateTime<Utc>,
         host: &str,
     ) {
-        let fallback = record.phase_durations.len() == 1
-            && record.phase_durations[0].duration_sec == record.total_duration_sec
-            && record.total_duration_sec > 0;
+        self.outcome_keys
+            .insert((host.to_string(), record.sweep_id.clone()));
+        let facts = OutcomeFacts {
+            repo: record.repo.as_deref(),
+            result: record.result,
+            total_duration_sec: record.total_duration_sec,
+            phase_durations: &record.phase_durations,
+            judge_verdicts: record.judge_verdicts.as_deref(),
+        };
+        self.push_outcome_facts(&facts, observed_at, host, SampleSource::SweepOutcome);
+    }
+
+    /// Add every sample one outcome's `facts` carry, observed at
+    /// `observed_at`, recorded by `host`, attributed to `source` — the one
+    /// conversion both outcome producers share (#9758).
+    pub fn push_outcome_facts(
+        &mut self,
+        facts: &OutcomeFacts<'_>,
+        observed_at: DateTime<Utc>,
+        host: &str,
+        source: SampleSource,
+    ) {
+        let phases = facts.phase_durations;
+        let fallback = phases.len() == 1
+            && phases[0].duration_sec == facts.total_duration_sec
+            && facts.total_duration_sec > 0;
         // Issue #9442: a record whose slug could not be resolved carries no
         // `repo`. The ETA samples condition per-repo, so they bucket under one
         // shared sentinel — strictly better than the pre-#9442 behavior, where
         // the leaked workspace PATH made every host its own pseudo-repo.
-        let repo = record
+        let repo = facts
             .repo
-            .clone()
-            .unwrap_or_else(|| UNRESOLVED_REPO_BUCKET.to_string());
+            .map_or_else(|| UNRESOLVED_REPO_BUCKET.to_string(), str::to_string);
         if !fallback {
-            for phase in &record.phase_durations {
+            for phase in phases {
                 if let Some(stage) = Stage::from_sweep_phase(&phase.phase) {
                     if phase.duration_sec >= 0 {
                         self.stages.push(StageSample {
@@ -398,7 +470,7 @@ impl StageSamples {
                             stage,
                             duration_sec: phase.duration_sec,
                             observed_at,
-                            source: SampleSource::SweepOutcome,
+                            source,
                             host: host.to_string(),
                             worked: worked_phase(stage, phase.duration_sec),
                         });
@@ -406,7 +478,7 @@ impl StageSamples {
                 }
             }
         }
-        for verdict in record.judge_verdicts.iter().flatten() {
+        for verdict in facts.judge_verdicts.into_iter().flatten() {
             let rejected = match verdict.verdict.as_str() {
                 "fail" => true,
                 "pass" => false,
@@ -419,10 +491,10 @@ impl StageSamples {
                 observed_at,
             });
         }
-        if record.result == SweepResult::Success {
+        if facts.result == SweepResult::Success {
             self.paths.push(SweepPathSample {
                 repo,
-                merged_in_sweep: record.phase_durations.iter().any(|p| p.phase == "merge"),
+                merged_in_sweep: phases.iter().any(|p| p.phase == "merge"),
                 observed_at,
             });
         }
