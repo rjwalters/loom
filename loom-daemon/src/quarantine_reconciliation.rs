@@ -182,86 +182,19 @@ pub fn plan(issues: &[BlockedIssue]) -> Vec<(u32, ReconcileAction)> {
         .collect()
 }
 
+mod listing;
+
 /// `gh`/label-flip glue. Not unit-tested directly (mirrors
 /// [`crate::claim_reconciliation::forge`] / [`crate::work_finder::forge`]) —
 /// the decision logic above is the fully-covered surface; this module is a
 /// thin, best-effort `Command` wrapper.
 pub mod forge {
-    use super::{decide, plan, BlockedIssue, ReconcileAction, MAX_ISSUES_PER_WORKSPACE};
+    use super::{decide, plan, BlockedIssue, ReconcileAction};
     use crate::claim_reconciliation::gh_call;
     use crate::sweep_registry::{reap_gh_timeout, QUARANTINE_COMMENT_MARKER};
-    use anyhow::{anyhow, Context, Result};
+    use anyhow::{anyhow, Result};
     use chrono::{DateTime, Utc};
-    use serde::Deserialize;
     use std::path::Path;
-
-    #[derive(Debug, Deserialize)]
-    struct GhComment {
-        #[serde(default)]
-        body: String,
-        #[serde(default, rename = "createdAt")]
-        created_at: Option<DateTime<Utc>>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct GhBlockedIssue {
-        number: u32,
-        #[serde(default)]
-        comments: Vec<GhComment>,
-        #[serde(rename = "updatedAt", default)]
-        updated_at: Option<String>,
-    }
-
-    /// Each issue comes with its `updatedAt` stamp (the #10089 read-cache version).
-    fn list_blocked_issues(
-        gh_bin: &Path,
-        root: &Path,
-    ) -> Result<Vec<(BlockedIssue, Option<String>)>> {
-        let limit = MAX_ISSUES_PER_WORKSPACE.to_string();
-        let out = gh_call::output(
-            gh_call::read("quarantine.issue_list", gh_bin, root)
-                .args([
-                    "issue",
-                    "list",
-                    "--label",
-                    "loom:blocked",
-                    "--state",
-                    "open",
-                ])
-                .args(["--limit", &limit, "--json", "number,comments,updatedAt"])
-                .args(gh_call::loom_repo_flag()),
-        )?;
-        if !out.status.success() {
-            let (root, err) = (root.display(), gh_call::stderr(&out));
-            return Err(anyhow!("gh issue list --label loom:blocked failed in {root}: {err}"));
-        }
-        let rows: Vec<GhBlockedIssue> =
-            serde_json::from_slice(&out.stdout).context("parse gh issue list JSON")?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                let marker_comments: Vec<&GhComment> = r
-                    .comments
-                    .iter()
-                    .filter(|c| c.body.contains(QUARANTINE_COMMENT_MARKER))
-                    .collect();
-                let issue = BlockedIssue {
-                    number: r.number,
-                    has_quarantine_comment: !marker_comments.is_empty(),
-                    last_quarantine_comment_at: marker_comments
-                        .iter()
-                        .filter_map(|c| c.created_at)
-                        .max(),
-                    // Filled in by the caller (Issue #4206) only for
-                    // candidates that could actually be released — an issue
-                    // with no marker comment is `Keep` unconditionally and
-                    // never needs the extra `gh` round-trip.
-                    last_blocked_labeled_at: None,
-                };
-                (issue, r.updated_at)
-            })
-            .collect())
-    }
 
     /// Best-effort fetch of the most recent `labeled loom:blocked` timeline
     /// event for `issue` (Issue #4206), used to distinguish the daemon's own
@@ -311,24 +244,6 @@ pub mod forge {
         )
     }
 
-    /// One uncached read of a marked candidate's `(trusted marker comment
-    /// present, newest marker comment, newest `labeled loom:blocked`)` — the
-    /// legs the pass confirms before it may release (#9548, #4206).
-    fn scan_parts(
-        gh_bin: &Path,
-        root: &Path,
-        issue: u32,
-    ) -> crate::claim_reconciliation::read_cache::QuarantineScan {
-        let trusted = trusted_quarantine_comments(gh_bin, root, issue);
-        let has = trusted.as_ref().is_some_and(|c| !c.is_empty());
-        let last_comment =
-            trusted.and_then(|c| crate::comment_trust::records::max_timestamp(&c, "created_at"));
-        let labeled = has
-            .then(|| fetch_last_blocked_labeled_at(gh_bin, root, issue))
-            .flatten();
-        (has, last_comment, labeled)
-    }
-
     /// Parse a `gh --jq` scalar result that is either a bare RFC-3339
     /// timestamp or a JSON-quoted one, tolerating an empty/`null` result
     /// (no match). Also tolerates multi-line output: `gh api --paginate`
@@ -338,9 +253,8 @@ pub mod forge {
     /// [`fetch_last_blocked_labeled_at`] queries) yields one `max`-per-page
     /// line rather than a single overall max (Issue #4637). Each
     /// non-empty/non-`null` line is parsed independently and the maximum
-    /// across all lines is returned; a single-line result (e.g. from
-    /// [`list_blocked_issues`]'s non-paginated `gh issue list --json
-    /// comments`) is handled identically to before.
+    /// across all lines is returned; a single-line result is handled
+    /// identically to before.
     pub(crate) fn parse_timestamp(stdout: &[u8]) -> Option<DateTime<Utc>> {
         let raw = String::from_utf8_lossy(stdout);
         raw.lines()
@@ -440,7 +354,7 @@ pub mod forge {
         if !crate::write_scope::gate_root_with(root, gh_bin, "quarantine reconciliation") {
             return (0, 0);
         }
-        let issues = match list_blocked_issues(gh_bin, root) {
+        let listed = match super::listing::list_blocked(gh_bin, root) {
             Ok(v) => v,
             Err(e) => {
                 log::warn!("quarantine_reconciliation: {}: {e}", root.display());
@@ -451,53 +365,25 @@ pub mod forge {
                 return (0, 0);
             }
         };
-        if issues.is_empty() {
+        if listed.is_empty() {
             return (0, 0);
         }
 
         // Issue #4206: augment with the timeline recency signal, but only
-        // for candidates that might actually be released (a marker comment
-        // exists) — an issue with no marker comment is `Keep` unconditionally
-        // and never needs the extra `gh` round-trip.
+        // for candidates that might actually be released (a trusted marker
+        // comment exists) — an unmarked issue is `Keep` unconditionally.
         //
-        // #9548: the listing only shortlists. Its `--json comments` shape
-        // cannot name an App author, so a candidate is confirmed against the
-        // REST listing, and only a trusted author's comment that BEGINS with
-        // the marker counts; an unreadable confirmation keeps the issue.
-        let issues: Vec<BlockedIssue> =
-            issues
-                .into_iter()
-                .map(|(mut issue, updated_at)| {
-                    if issue.has_quarantine_comment {
-                        // #10089: the two paginated REST walks below are reused
-                        // while the issue's `updatedAt` holds (a new comment or
-                        // label event bumps it). Stored only when every leg
-                        // answered, so a failed read is retried next pass.
-                        let key = crate::claim_reconciliation::read_cache::key(
-                            root,
-                            issue.number,
-                            "quarantine",
-                            updated_at.as_deref(),
-                        );
-                        let fresh = std::cell::Cell::new(None);
-                        let cached = crate::claim_reconciliation::read_cache::QUARANTINE_SCAN
-                            .get_or(key, || {
-                                let scan = scan_parts(gh_bin, root, issue.number);
-                                fresh.set(Some(scan));
-                                (scan.0 && scan.2.is_some()).then_some(scan)
-                            });
-                        // A miss that did not qualify for the cache still carries
-                        // what it read (no second spend).
-                        let (has, last_comment, labeled) = cached
-                            .or_else(|| fresh.get())
-                            .unwrap_or_else(|| scan_parts(gh_bin, root, issue.number));
-                        issue.has_quarantine_comment = has;
-                        issue.last_quarantine_comment_at = last_comment;
-                        issue.last_blocked_labeled_at = labeled;
-                    }
-                    issue
-                })
-                .collect();
+        // #9548: only a trusted author's comment that BEGINS with the marker
+        // counts; an unreadable confirmation keeps the issue.
+        //
+        // #9243: the listing is REST and carries no comments, so each issue
+        // is scanned over REST, reused while its `updatedAt` holds (#10089).
+        let issues: Vec<BlockedIssue> = listed
+            .into_iter()
+            .map(|(number, updated_at)| {
+                super::listing::scan_issue(gh_bin, root, number, updated_at.as_deref())
+            })
+            .collect();
 
         let decisions = plan(&issues);
         let checked = decisions.len();
@@ -785,10 +671,10 @@ exit 1
         let script = format!(
             r#"#!/bin/bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":99,"comments":[{{"body":"Auto-quarantined by loom-daemon (#3939): insta-crashed 3 times"}}]}}]'
-  exit 0
-fi
+case "$*" in *issues?labels=loom:blocked*)
+  printf 'HTTP/2.0 200 OK\r\n\r\n'
+  echo '[{{"number":99,"state":"open","updated_at":"2026-01-01T00:00:00Z","labels":[{{"name":"loom:blocked"}}]}}]'
+  exit 0 ;; esac
 case "$*" in */issues/99/comments*)
   echo '[{{"body":"Auto-quarantined by loom-daemon (#3939): insta-crashed 3 times","user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}}}}]'
   exit 0 ;;
@@ -827,10 +713,10 @@ exit 0
         let script = format!(
             r#"#!/bin/bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":99,"updatedAt":"'"$(cat {updated})"'","comments":[{{"body":"Auto-quarantined by loom-daemon (#3939): insta-crashed 3 times"}}]}}]'
-  exit 0
-fi
+case "$*" in *issues?labels=loom:blocked*)
+  printf 'HTTP/2.0 200 OK\r\n\r\n'
+  echo '[{{"number":99,"state":"open","updated_at":"'"$(cat {updated})"'","labels":[{{"name":"loom:blocked"}}]}}]'
+  exit 0 ;; esac
 case "$*" in
 */issues/99/comments*)
   echo '[{{"body":"Auto-quarantined by loom-daemon (#3939): insta-crashed 3 times","created_at":"2026-01-01T00:00:00Z","user":{{"login":"loom-fleet-dispatch[bot]","type":"Bot"}}}}]'
@@ -857,7 +743,7 @@ exit 0
             let (checked, released) = forge::reconcile_workspace(&ws.gh, &repo_root);
             assert_eq!((checked, released), (1, 0), "a later manual re-park is kept");
         }
-        assert_eq!(count("issue list"), 3, "the cheap listing runs every pass");
+        assert_eq!(count("issues?labels=loom:blocked"), 3, "the cheap listing runs every pass");
         assert_eq!(count("/issues/99/comments"), 1, "comments walked once");
         assert_eq!(count("/issues/99/timeline"), 1, "timeline walked once");
 
@@ -884,10 +770,10 @@ exit 0
         let script = format!(
             r#"#!/bin/bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":77,"comments":[{{"body":"Blocked manually pending a human decision"}}]}}]'
-  exit 0
-fi
+case "$*" in *issues?labels=loom:blocked*)
+  printf 'HTTP/2.0 200 OK\r\n\r\n'
+  echo '[{{"number":77,"state":"open","updated_at":"2026-01-01T00:00:00Z","labels":[{{"name":"loom:blocked"}}]}}]'
+  exit 0 ;; esac
 exit 0
 "#,
             log = gh_log.display(),
@@ -923,10 +809,10 @@ exit 0
             let script = format!(
                 r#"#!/bin/bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":99,"comments":[{{"body":"Auto-quarantined by loom-daemon (#3939)"}}]}}]'
-  exit 0
-fi
+case "$*" in *issues?labels=loom:blocked*)
+  printf 'HTTP/2.0 200 OK\r\n\r\n'
+  echo '[{{"number":99,"state":"open","updated_at":"2026-01-01T00:00:00Z","labels":[{{"name":"loom:blocked"}}]}}]'
+  exit 0 ;; esac
 case "$*" in */issues/99/comments*) echo '{rest}'; exit 0 ;; esac
 exit 0
 "#,
@@ -941,17 +827,11 @@ exit 0
         }
     }
 
-    /// The per-workspace cap is passed through to `gh issue list --limit`, so
-    /// an unexpectedly huge backlog cannot turn startup into an API storm.
-    ///
-    /// `#[serial]` is load-bearing (#4547): `std::env::set_var`/`remove_var`
-    /// (used by `disk_headroom.rs`'s PATH-mutating tests) race any
-    /// concurrently-running thread that reads the process environment —
-    /// including the implicit env read inside `std::process::Command`'s
-    /// child-spawn plumbing below, not just literal `PATH` lookups.
+    /// The listing is the REST `loom:blocked` issues listing (#9243), never the
+    /// GraphQL `gh issue list`, and the per-workspace cap bounds what is scanned.
     #[test]
     #[serial]
-    fn reconcile_workspace_passes_issue_cap_to_gh_list() {
+    fn reconcile_workspace_lists_blocked_issues_over_rest() {
         let dir = tempdir().unwrap();
         let repo_root = dir.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
@@ -959,6 +839,7 @@ exit 0
         let script = format!(
             r#"#!/bin/bash
 printf '%s\n' "$*" >> "{log}"
+printf 'HTTP/2.0 200 OK\r\n\r\n'
 echo '[]'
 exit 0
 "#,
@@ -968,33 +849,82 @@ exit 0
 
         let ws = WritableRoot::register_with_gh(&repo_root, &fake_gh);
         let (checked, released) = forge::reconcile_workspace(&ws.gh, &repo_root);
-        assert_eq!(checked, 0);
-        assert_eq!(released, 0);
+        assert_eq!((checked, released), (0, 0));
 
         let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
-        assert!(
-            gh_calls.contains(&format!("--limit {MAX_ISSUES_PER_WORKSPACE}")),
-            "expected the issue-cap limit in the gh invocation; got: {gh_calls:?}"
-        );
+        assert!(gh_calls.contains("issues?labels=loom:blocked"), "{gh_calls:?}");
+        assert!(!gh_calls.contains("issue list"), "no GraphQL listing: {gh_calls:?}");
     }
 
-    /// A `gh issue list` failure is absorbed (logged, not propagated) so one
-    /// repo's forge hiccup never blocks startup.
-    ///
-    /// `#[serial]` is load-bearing (#4547) for the same reason as
-    /// `reconcile_workspace_passes_issue_cap_to_gh_list` above.
+    /// #9243: a REST listing failure is absorbed as `(0, 0)` and its error text
+    /// is what `global_observe_failure` classifies, so a rate-limit refusal
+    /// trips the breaker.
     #[test]
     #[serial]
-    fn reconcile_workspace_absorbs_gh_list_failure() {
+    fn reconcile_workspace_absorbs_rest_listing_failure_and_feeds_breaker() {
         let dir = tempdir().unwrap();
         let repo_root = dir.path().join("repo");
         std::fs::create_dir_all(&repo_root).unwrap();
-        let fake_gh = write_fake_gh(dir.path(), "#!/bin/bash\necho 'boom' >&2\nexit 1\n");
+        let fake_gh = write_fake_gh(
+            dir.path(),
+            "#!/bin/bash\necho 'gh: API rate limit exceeded (HTTP 403)' >&2\nexit 1\n",
+        );
 
         let ws = WritableRoot::register_with_gh(&repo_root, &fake_gh);
+        let err = listing::list_blocked(&ws.gh, &repo_root)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            crate::rate_limit_breaker::indicates_rate_limit(&err),
+            "the breaker classifier must see the rate-limit text: {err}"
+        );
         let (checked, released) = forge::reconcile_workspace(&ws.gh, &repo_root);
-        assert_eq!(checked, 0);
-        assert_eq!(released, 0);
+        assert_eq!((checked, released), (0, 0));
+    }
+
+    /// #9243: an unchanged `loom:blocked` set (same `updatedAt`) costs ZERO
+    /// comment fetches on the second pass, for a manual block as well as a
+    /// daemon quarantine.
+    #[test]
+    #[serial]
+    fn unchanged_blocked_set_makes_no_comment_fetch_on_second_pass() {
+        crate::claim_reconciliation::read_cache::set_test_enabled(true);
+        let dir = tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let gh_log = dir.path().join("gh-invocations.log");
+        let script = format!(
+            r#"#!/bin/bash
+printf '%s\n' "$*" >> "{log}"
+case "$*" in
+*issues?labels=loom:blocked*)
+  printf 'HTTP/2.0 200 OK\r\n\r\n'
+  echo '[{{"number":77,"state":"open","updated_at":"2026-02-01T00:00:00Z","labels":[{{"name":"loom:blocked"}}]}},{{"number":78,"state":"open","updated_at":"2026-02-01T00:00:00Z","labels":[{{"name":"loom:blocked"}}],"pull_request":{{"url":"x"}}}}]'
+  exit 0 ;;
+*/issues/77/comments*)
+  echo '[{{"body":"Blocked manually","user":{{"login":"rjwalters"}},"author_association":"OWNER"}}]'
+  exit 0 ;;
+esac
+exit 0
+"#,
+            log = gh_log.display(),
+        );
+        let fake_gh = write_fake_gh(dir.path(), &script);
+        let ws = WritableRoot::register_with_gh(&repo_root, &fake_gh);
+        let count = |needle: &str| {
+            std::fs::read_to_string(&gh_log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains(needle))
+                .count()
+        };
+        for _ in 0..2 {
+            assert_eq!(forge::reconcile_workspace(&ws.gh, &repo_root), (1, 0));
+        }
+        assert_eq!(count("issues?labels=loom:blocked"), 2, "the REST listing runs each pass");
+        assert_eq!(count("/issues/77/comments"), 1, "comments fetched once, not on pass 2");
+        assert_eq!(count("/issues/78/"), 0, "a pull request row is never scanned");
+        crate::claim_reconciliation::read_cache::set_test_enabled(false);
     }
 
     /// #9548 negative control: the same fixture as
@@ -1011,10 +941,10 @@ exit 0
         let script = format!(
             r#"#!/bin/bash
 printf '%s\n' "$*" >> "{log}"
-if [ "$1" = "issue" ] && [ "$2" = "list" ]; then
-  echo '[{{"number":99,"comments":[{{"body":"Auto-quarantined by loom-daemon (#3939)"}}]}}]'
-  exit 0
-fi
+case "$*" in *issues?labels=loom:blocked*)
+  printf 'HTTP/2.0 200 OK\r\n\r\n'
+  echo '[{{"number":99,"state":"open","updated_at":"2026-01-01T00:00:00Z","labels":[{{"name":"loom:blocked"}}]}}]'
+  exit 0 ;; esac
 exit 0
 "#,
             log = gh_log.display(),
@@ -1034,8 +964,7 @@ exit 0
     // query yields one line per page (>100 events) rather than a single
     // overall max. `parse_timestamp` must resolve the true max across every
     // line, while still handling the single-line result a non-paginated
-    // query (e.g. `list_blocked_issues`'s bulk `gh issue list --json
-    // comments`) always produces.
+    // query (e.g. a single-line `gh --jq` result) always produces.
 
     #[test]
     fn parse_timestamp_single_line_bare() {

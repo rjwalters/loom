@@ -454,7 +454,7 @@ pub const MERGE_HOLD_LABELS: [&str; 3] = ["loom:blocked", "loom:operator", "loom
 ///   falls in this set. `loom:treating` is a live Doctor claim, not a park,
 ///   so it stays counted.
 /// - Review: none. `judge.md`'s queue has no label exclusions.
-fn axis_park_labels(axis: DebtAxis) -> &'static [&'static str] {
+pub(crate) fn axis_park_labels(axis: DebtAxis) -> &'static [&'static str] {
     match axis {
         DebtAxis::Merge => &MERGE_HOLD_LABELS,
         DebtAxis::Changes => &crate::work_finder::PARK_LABELS,
@@ -510,7 +510,15 @@ pub fn forge_merge_probe() -> DemandProbe {
             DebtAxis::Merge.label(),
             "open",
         )
-        .map(|rows| count_axis_rows(DebtAxis::Merge, &rows))
+        .map(|rows| {
+            // #10212: the same rows, kept for the champion tick's `pick.decision`.
+            crate::observability::pick_decision::record_gate_listing(
+                root,
+                DebtAxis::Merge.label(),
+                &rows,
+            );
+            count_axis_rows(DebtAxis::Merge, &rows)
+        })
         .map_err(|e| e.to_string())
     })
 }

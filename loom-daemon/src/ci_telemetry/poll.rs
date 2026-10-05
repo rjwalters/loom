@@ -647,12 +647,21 @@ fn recover(ledger: &mut Ledger, journal: &Journal) -> io::Result<usize> {
 }
 
 /// Follow `rel="next"` from `first`, collecting each page's parsed items.
+///
+/// Every page is read for `repo` (else the repo `first` names): GitHub spells
+/// page 2+ of a repo listing as `repositories/<id>/…`, which names no repo,
+/// so without it those pages would leave the repo's reader App for the
+/// writer and be accounted under no repo.
 pub(super) fn paginate<T>(
     api: &dyn GithubApi,
+    repo: Option<&str>,
     first: String,
     requests: &mut usize,
     parse: impl Fn(&str) -> Result<Vec<T>, serde_json::Error>,
 ) -> Result<Vec<T>, ApiError> {
+    let repo = repo
+        .map(str::to_string)
+        .or_else(|| super::api::repo_of_path(&first));
     let mut items = Vec::new();
     let mut visited = HashSet::new();
     let mut next = Some(first);
@@ -661,7 +670,7 @@ pub(super) fn paginate<T>(
             break;
         }
         *requests += 1;
-        let response = api.get(&path, None)?;
+        let response = api.get_in(repo.as_deref(), &path, None)?;
         items.extend(parse(&response.body).map_err(|e| ApiError::Parse {
             path: path.clone(),
             detail: e.to_string(),
@@ -758,7 +767,7 @@ fn poll_repo(
     let watermark = recorded.unwrap_or(ctx.now - ctx.initial_lookback);
     let floor = runs_floor(recorded, ctx.now, ctx.initial_lookback, ctx.rescan_window);
     let mut runs: Vec<RunJson> =
-        paginate(api, runs_path(full, floor), &mut report.summary.requests, |body| {
+        paginate(api, Some(full), runs_path(full, floor), &mut report.summary.requests, |body| {
             serde_json::from_str::<RunsPage>(body).map(|p| p.workflow_runs)
         })?;
     runs.sort_by_key(|r| (r.created_at, r.id));
@@ -852,7 +861,7 @@ fn record_run(
         return Ok(RunOutcome::Seen);
     }
     let jobs: Vec<JobJson> =
-        paginate(api, jobs_path(full, run.id), &mut report.summary.requests, |body| {
+        paginate(api, Some(full), jobs_path(full, run.id), &mut report.summary.requests, |body| {
             serde_json::from_str::<JobsPage>(body).map(|p| p.jobs)
         })?;
     if jobs.iter().any(|job| !job.is_completed()) {

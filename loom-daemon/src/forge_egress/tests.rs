@@ -43,15 +43,36 @@ fn aligned() -> Observed {
 }
 
 #[test]
-fn unconfigured_is_exit_zero_with_the_documented_json() {
+fn unconfigured_is_exit_zero_with_a_visible_notice() {
     let r = run_with(&PolicySources::default(), Path::new("/nonexistent"), Mode::Doctor);
     assert!(!r.is_configured());
     let j = r.to_json();
     assert_eq!(j["policy"]["origin"], "unconfigured");
     assert_eq!(j["exit_code"], 0);
+    assert_eq!(r.routing_codes(), ["policy.unconfigured"]);
+    assert_eq!(j["routing"]["findings"][0]["code"], "policy.unconfigured");
+    assert_eq!(j["routing"]["findings"][0]["severity"], "notice");
     for s in ["routing", "git", "runtime", "telemetry"] {
         assert_eq!(j[s]["exit_code"], 0, "{s}");
     }
+    assert_eq!(admission_for(&r), Admission::Unconfigured);
+}
+
+#[test]
+fn unconfigured_on_a_managed_host_is_exit_two() {
+    let sources = PolicySources {
+        managed: true,
+        ..PolicySources::default()
+    };
+    let r = run_with(&sources, Path::new("/nonexistent"), Mode::Doctor);
+    assert!(!r.is_configured());
+    assert_eq!(r.exit_code(), 2);
+    let j = r.to_json();
+    assert_eq!(j["exit_code"], 2);
+    assert_eq!(j["policy"]["origin"], "unconfigured");
+    assert_eq!(j["routing"]["findings"][0]["code"], "policy.unconfigured");
+    assert_eq!(j["routing"]["findings"][0]["severity"], "incomplete");
+    // The daemon gate still admits: an unconfigured host is never refused.
     assert_eq!(admission_for(&r), Admission::Unconfigured);
 }
 

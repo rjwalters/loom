@@ -175,14 +175,21 @@ pub(crate) fn create_private_file(path: &Path) -> std::io::Result<std::fs::File>
 /// the same host never observes a half-written file. Best-effort: any failure
 /// just means the next call re-fetches.
 pub(crate) fn write_disk_entry(path: &Path, entry: &DiskEntry) {
+    let Ok(serialized) = serde_json::to_string(entry) else {
+        return;
+    };
+    write_private_atomic(path, serialized.as_bytes());
+}
+
+/// Write `bytes` to `path` atomically (temp file + rename), owner-only, and
+/// only inside a [`private_dir`]. Best-effort, like [`write_disk_entry`]:
+/// any failure leaves the previous file (or none) in place.
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) {
     use std::io::Write;
     let Some(dir) = path.parent() else { return };
     if !private_dir(dir, true) {
         return;
     }
-    let Ok(serialized) = serde_json::to_string(entry) else {
-        return;
-    };
     let tmp = dir.join(format!(
         ".tmp-{}-{}",
         std::process::id(),
@@ -194,7 +201,7 @@ pub(crate) fn write_disk_entry(path: &Path, entry: &DiskEntry) {
         create_private_file(&tmp)
     });
     let Ok(mut file) = file else { return };
-    if file.write_all(serialized.as_bytes()).is_ok() {
+    if file.write_all(bytes).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     } else {
         let _ = std::fs::remove_file(&tmp);

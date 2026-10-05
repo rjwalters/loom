@@ -427,6 +427,11 @@ impl StarredAtSource for IntentStarredAt<'_> {
         }
         self.inner.starred_at(issue)
     }
+
+    /// The intent's `requested_at` outranks the restart store (#9244 C).
+    fn authoritative(&mut self, issue: u32) -> Option<String> {
+        self.root.and_then(|r| recorded_starred_at(r, issue))
+    }
 }
 
 /// The starred-at from a timeline read that yields one line per relevant

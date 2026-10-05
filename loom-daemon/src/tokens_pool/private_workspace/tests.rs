@@ -406,6 +406,7 @@ fn policy_governs_host_resolves_and_fails_closed_on_unreadable_policy() {
             env_path: Some(path),
             machine_path: None,
             repo_path: None,
+            ..PolicySources::default()
         }
     };
     // Absent policy -> not governed (the only "no policy" case).

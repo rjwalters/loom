@@ -2184,6 +2184,15 @@ as "no such issue" instead. No field carries forge free text (no title, no
 label text, no comment body): every value is an enum, a number, or a
 daemon-derived id.
 
+### `pick.decision`
+
+One OTLP-only log record per role tick and per work-finder tick (Issue #10212):
+the ranked candidate list (capped at 50, with `candidates_total`), the items
+acted on, and a closed-set reason code per skipped candidate. Empty ticks still
+emit, so per-host service cadence is measurable. Full field reference, the
+SigNoz rank-at-instant query and the rows/day volume:
+[`telemetry-kind-pick-decision.md`](telemetry-kind-pick-decision.md).
+
 ### `tokens.snapshot`
 
 A point-in-time view of the multi-account token pool (host-level — no `repo` /

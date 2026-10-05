@@ -175,7 +175,8 @@ fn validate_repo(repo: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_ref(reference: &str) -> Result<()> {
+/// Whether `reference` is safe to splice into a store request path or query.
+pub(crate) fn validate_ref(reference: &str) -> Result<()> {
     let ok = !reference.is_empty()
         && !reference.contains("..")
         && !reference.starts_with('/')
