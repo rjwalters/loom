@@ -254,6 +254,14 @@ pub fn emit_for_tick_correlated(
     resolved: Option<ResolvedLaunch>,
     trace: Option<crate::observability::lifecycle::RoleTrace>,
 ) {
+    // #10212: the gate listing this tick read, as a ranked `pick.decision`.
+    crate::observability::pick_decision::emit_role_tick(
+        root,
+        role,
+        started_at,
+        outcome,
+        trace.as_ref().map(|t| t.execution.clone()),
+    );
     let (result, detail) = classify(outcome);
     let (model, effort) = match &resolved {
         Some(resolved) => (Some(resolved.model.clone()), Some(resolved.effort.clone())),

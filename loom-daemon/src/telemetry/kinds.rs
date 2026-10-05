@@ -172,6 +172,9 @@ pub mod eta_fleet_refresh;
 /// `eta.snapshot` (#9329).
 pub mod eta_snapshot;
 
+/// `pick.decision` (#10212) — what a role / the work finder looked at per tick.
+pub mod pick_decision;
+
 /// `session.output` (#9764) — the live, redacted agent-output feed.
 pub mod session_output;
 
@@ -397,6 +400,12 @@ macro_rules! telemetry_kind_table {
             /// #10391). OTLP-only, like the other `eta.*` log kinds. See
             /// [`eta_fit`].
             EtaFit = "eta.fit" => $crate::telemetry::kinds::eta_fit::EtaFitRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One role tick's (or work-finder tick's) pick decision (Issue #10212):
+            /// the ranked candidates it considered, what it acted on, and a
+            /// closed-set reason per skip. OTLP-only. See [`pick_decision`].
+            PickDecision = "pick.decision" => $crate::telemetry::kinds::pick_decision::PickDecisionRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

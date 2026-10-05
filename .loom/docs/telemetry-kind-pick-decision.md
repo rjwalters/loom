@@ -1,0 +1,1 @@
+../../defaults/docs/telemetry-kind-pick-decision.md
