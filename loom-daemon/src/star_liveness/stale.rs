@@ -13,15 +13,31 @@
 //! - [`StaleAction::Unblock`] — every cited blocker is closed: remove
 //!   `loom:blocked` and post one comment naming the closed blockers. The issue
 //!   re-enters its normal lane: `ready` when it already carries `loom:issue`,
-//!   otherwise Curator's starred queue (Curator Priority 0 skips only
-//!   `loom:blocked` and the claim/park labels), which re-checks and promotes.
+//!   otherwise Curator — its starred queue for a starred issue (Curator
+//!   Priority 0 skips only `loom:blocked` and the claim/park labels), its
+//!   usual queue for an inherited row, which carries no star label.
 //! - [`StaleAction::CuratorHandoff`] — nothing is cited anywhere: remove
-//!   `loom:blocked` **and** `loom:issue` (so a Builder cannot take an issue
-//!   whose block may be real but undocumented) and post a handoff comment.
+//!   `loom:issue` (so a Builder cannot take an issue whose block may be real
+//!   but undocumented) and then `loom:blocked`, and post a handoff comment.
 //!   Curator's starred queue picks it up and either names the blocker and
 //!   re-blocks it (it then lands `blocked-by`), re-blocks it with none named
 //!   (now the operator is asked: a Curator pass failed to name a blocker), or
 //!   curates and re-promotes it (the star is the approval).
+//!
+//! # Starred rows only hand off
+//!
+//! The handoff is for a **directly starred** issue only. An inherited row (a
+//! blocker or child the walk reached, carrying no `loom:operator-priority`)
+//! is never handed off: Curator's Priority 0 query is label-based, so it would
+//! never reach the starred queue the comment promises, and Curator may not
+//! re-add `loom:issue` to an unstarred issue — the handoff would just withdraw
+//! a human's approval from an issue nobody starred. The walk turns such a row
+//! back into the `blocked-unnamed` operator ask instead
+//! ([`super::landing::withhold_inherited_handoff`]), and [`apply`] refuses
+//! the handoff for it as a backstop. An inherited row may still be
+//! **unblocked** (that only removes a `loom:blocked` every cited blocker of
+//! which is closed), and its comment says it inherits the star rather than
+//! calling it starred.
 //!
 //! # Never touched
 //!
@@ -32,11 +48,17 @@
 //!
 //! # Idempotence
 //!
-//! The label write is first and is a no-op when repeated; the comment is
+//! The label writes come first and are no-ops when repeated; the comment is
 //! posted only when no trusted comment already carries its marker, so two
 //! hosts racing one pass cost at most one duplicate. The markers are also
 //! the gate's memory: once present, a repeat of the same stale block is an
 //! operator ask, never a second unblock (see [`super::landing`]).
+//!
+//! `loom:blocked` is always the **last** label removed, because removing it is
+//! what ends the pass's retries (rule 5 no longer matches). Any failure before
+//! it leaves the issue blocked, so the next pass rebuilds the same action and
+//! finishes it; the handoff's `loom:issue` removal comes first so a failure
+//! never leaves the issue unblocked **and** still approved.
 
 use anyhow::Result;
 
@@ -104,16 +126,28 @@ pub fn comment_facts(comments: &[ForgeComment], self_login: Option<&str>) -> Com
     out
 }
 
-/// The unblock comment.
+/// The unblock comment. `inherited_via` is the parent an inherited row
+/// takes its star through (`None` for a directly starred issue): an
+/// inherited row is never called starred, nor promised the starred queue.
 #[must_use]
-pub fn unblock_comment(cleared: &[String], key: &str, host: &str, approved: bool) -> String {
-    let next = if approved {
-        "It keeps `loom:issue`, so it is ready for a Builder again."
-    } else {
-        "Curator re-checks it next (starred issues come first) and promotes it."
+pub fn unblock_comment(
+    cleared: &[String],
+    key: &str,
+    host: &str,
+    approved: bool,
+    inherited_via: Option<u32>,
+) -> String {
+    let next = match (approved, inherited_via) {
+        (true, _) => "It keeps `loom:issue`, so it is ready for a Builder again.",
+        (false, None) => "Curator re-checks it next (starred issues come first) and promotes it.",
+        (false, Some(_)) => "It goes back through Curator's usual queue.",
     };
+    let what = inherited_via.map_or_else(
+        || "this starred issue".to_string(),
+        |via| format!("this issue (not starred itself; it inherits the star through #{via})"),
+    );
     format!(
-        "{}\n**Unblocked** — this starred issue carried `loom:blocked`, but every blocker it \
+        "{}\n**Unblocked** — {what} carried `loom:blocked`, but every blocker it \
          cites is now closed ({}), so the liveness check removed the label. {next}\n\n\
          If something else still holds it, name that blocker in the body and re-apply \
          `loom:blocked`; the check will then ask the operator instead of unblocking it again.\n\n\
@@ -140,28 +174,51 @@ pub fn handoff_comment(host: &str) -> String {
 }
 
 /// Carry out `action` on `issue` (whose current labels are `labels`).
+/// `inherited_via` is `Some(parent)` for an inherited row, which is never
+/// handed off (see the module doc): a [`StaleAction::CuratorHandoff`] for one
+/// is refused with no write.
 ///
 /// # Errors
-/// A forge read or write failed; the next pass retries (the issue is still
-/// `loom:blocked` if the label write failed, and the comment is deduped by
-/// its marker if only the comment failed).
+/// A forge read or write failed. What the next pass does depends on which:
+/// - A label write failed: `loom:blocked` is removed last, so the issue is
+///   still blocked, the next pass rebuilds the same action and retries. A
+///   handoff that removed `loom:issue` and then failed on `loom:blocked`
+///   leaves the issue blocked and unapproved — never unblocked and approved.
+/// - Every label write succeeded but reading or posting the comment failed:
+///   **no retry** — `loom:blocked` is gone, so rule 5 no longer matches and
+///   the action is never rebuilt. The issue is already in its intended lane;
+///   only the explanation and the marker (the gate's memory) are missing, so
+///   if it is re-blocked on the same evidence the pass treats it as new and
+///   runs at most one extra unblock or handoff cycle before it asks.
 pub fn apply(
     forge: &mut dyn StarForge,
     issue: u32,
     labels: &[String],
     action: &StaleAction,
     host: &str,
+    inherited_via: Option<u32>,
 ) -> Result<()> {
     let has = |l: &str| labels.iter().any(|x| x == l);
-    forge.remove_label(issue, BLOCKED_LABEL)?;
     let (marker, body) = match action {
         StaleAction::Unblock { cleared, key } => {
-            (unblocked_marker(key), unblock_comment(cleared, key, host, has(ISSUE_LABEL)))
+            forge.remove_label(issue, BLOCKED_LABEL)?;
+            let body = unblock_comment(cleared, key, host, has(ISSUE_LABEL), inherited_via);
+            (unblocked_marker(key), body)
         }
         StaleAction::CuratorHandoff => {
+            if inherited_via.is_some() {
+                log::warn!(
+                    "star_liveness: refusing a Curator handoff for inherited #{issue}; \
+                     only a starred issue is handed off"
+                );
+                return Ok(());
+            }
+            // `loom:issue` first: a failure between the two writes must leave
+            // the issue blocked, not unblocked and still approved.
             if has(ISSUE_LABEL) {
                 forge.remove_label(issue, ISSUE_LABEL)?;
             }
+            forge.remove_label(issue, BLOCKED_LABEL)?;
             (HANDOFF_MARKER.to_string(), handoff_comment(host))
         }
     };

@@ -356,8 +356,8 @@ fn applying_twice_posts_one_comment() {
         },
         StaleAction::CuratorHandoff,
     ] {
-        stale::apply(forge.as_mut(), 10, &current, &action, "host-a").unwrap();
-        stale::apply(forge.as_mut(), 10, &current, &action, "host-b").unwrap();
+        stale::apply(forge.as_mut(), 10, &current, &action, "host-a", None).unwrap();
+        stale::apply(forge.as_mut(), 10, &current, &action, "host-b", None).unwrap();
     }
     assert_eq!(world.posted(slug).len(), 2, "one per marker");
     assert_eq!(labels(&world, slug, 10), vec![STAR.to_string()]);
@@ -367,4 +367,130 @@ fn applying_twice_posts_one_comment() {
     assert!(facts.handoff);
     assert_eq!(facts.unblocked, vec!["#5".to_string()]);
     assert!(facts.bodies.is_empty(), "the pass's own comments name no blocker");
+}
+
+// ---------------------------------------------------------------------------
+// Inherited rows and write order (#10162 review)
+// ---------------------------------------------------------------------------
+
+/// Starred #10 is blocked by #11; #11 is blocked, approved, and names no
+/// blocker. #11 inherits the star but nobody starred it: it must not be
+/// handed off (that would strip a human's `loom:issue` from an issue
+/// Curator's label-based starred queue never sees). It gets the pre-#10151
+/// operator ask instead.
+#[test]
+fn an_inherited_unnamed_block_keeps_its_approval_and_gets_no_handoff() {
+    let world = World::default();
+    let slug = "s/inherited";
+    world.add(slug, issue_with_body(10, &[STAR, BLOCKED], "Blocked by #11\n"));
+    world.add(
+        slug,
+        issue_with_body(11, &["loom:curated", "loom:issue", BLOCKED], "Needs a resync.\n"),
+    );
+    let repos = vec![repo_input(slug)];
+    let mut host = Host::new("host-a");
+
+    for minute in [0, 2] {
+        let r = host.pass(&world, &repos, Vec::new(), t(10, minute));
+        let starred = r.rows.iter().find(|row| row.issue == 10).unwrap();
+        assert_eq!(starred.stage, LandingStage::BlockedBy);
+        let row = r
+            .rows
+            .iter()
+            .find(|row| row.issue == 11)
+            .expect("#11 inherits");
+        assert_eq!(row.inherited_from, Some(10));
+        assert_eq!(row.stage, LandingStage::NeedsOperator);
+        let ask = row.ask.as_ref().expect("the operator is asked instead");
+        assert_eq!(ask.kind, AskKind::BlockedUnnamed);
+        assert!(ask.text.contains("blocks starred #10"), "{}", ask.text);
+        assert!(!ask.text.contains("is starred"), "#11 is not starred: {}", ask.text);
+        assert_eq!(
+            labels(&world, slug, 11),
+            vec!["loom:curated", "loom:issue", BLOCKED],
+            "approval and block both kept (minute {minute})"
+        );
+    }
+    assert!(
+        world
+            .posted(slug)
+            .iter()
+            .all(|(_, body)| !body.contains(HANDOFF_MARKER)),
+        "no handoff comment anywhere: {:?}",
+        world.posted(slug)
+    );
+}
+
+/// An inherited row may still be unblocked when every blocker it cites is
+/// closed, but the comment does not call it starred or promise it the
+/// starred queue.
+#[test]
+fn an_inherited_all_closed_block_is_unblocked_without_calling_it_starred() {
+    let world = World::default();
+    let slug = "s/inherited-closed";
+    world.add(slug, issue_with_body(10, &[STAR, BLOCKED], "Blocked by #11\n"));
+    world.add(slug, issue_with_body(11, &["loom:curated", BLOCKED], "Blocked by #12\n"));
+    let mut b12 = issue(12, &[]);
+    b12.state = "closed".into();
+    world.add(slug, b12);
+    Host::new("host-a").pass(&world, &[repo_input(slug)], Vec::new(), t(10, 0));
+    assert_eq!(labels(&world, slug, 11), vec!["loom:curated"]);
+    let posted = world.posted(slug);
+    let body = &posted
+        .iter()
+        .find(|(n, _)| *n == 11)
+        .expect("one unblock comment")
+        .1;
+    assert!(body.contains(&stale::unblocked_marker("#12")), "{body}");
+    assert!(body.contains("inherits the star through #10"), "{body}");
+    assert!(!body.contains("starred issue"), "{body}");
+    assert!(!body.contains("starred issues come first"), "{body}");
+}
+
+/// The backstop: `apply` itself refuses a handoff for an inherited row.
+#[test]
+fn apply_refuses_a_handoff_for_an_inherited_row() {
+    let world = World::default();
+    let slug = "s/backstop";
+    world.add(slug, issue(11, &["loom:issue", BLOCKED]));
+    let current = labels(&world, slug, 11);
+    let mut forge = world.forge(slug);
+    stale::apply(forge.as_mut(), 11, &current, &StaleAction::CuratorHandoff, "host-a", Some(10))
+        .unwrap();
+    assert_eq!(labels(&world, slug, 11), vec!["loom:issue", BLOCKED]);
+    assert!(world.posted(slug).is_empty());
+}
+
+/// The handoff removes `loom:issue` before `loom:blocked`: when the second
+/// write fails, the issue is left blocked and unapproved — never unblocked
+/// and still approved — and the next pass finishes the handoff.
+#[test]
+fn a_failed_second_label_write_never_leaves_the_issue_unblocked_and_approved() {
+    let world = World::default();
+    let slug = "s/half";
+    world.add(
+        slug,
+        issue_with_body(10, &[STAR, "loom:curated", "loom:issue", BLOCKED], "Needs a resync.\n"),
+    );
+    let repos = vec![repo_input(slug)];
+    let mut host = Host::new("host-a");
+
+    world.repo(slug).fail_remove = vec![BLOCKED.into()];
+    let r = host.pass(&world, &repos, Vec::new(), t(10, 0));
+    assert_eq!(r.rows[0].stage, LandingStage::StaleBlock);
+    assert_eq!(
+        labels(&world, slug, 10),
+        vec![STAR, "loom:curated", BLOCKED],
+        "approval withdrawn first, block kept"
+    );
+    assert!(world.posted(slug).is_empty(), "no marker until the labels land");
+
+    // The issue is still blocked, so the next pass rebuilds the handoff.
+    world.repo(slug).fail_remove.clear();
+    let r = host.pass(&world, &repos, Vec::new(), t(10, 2));
+    assert_eq!((r.rows[0].stage, r.rows[0].ask.clone()), (LandingStage::StaleBlock, None));
+    assert_eq!(labels(&world, slug, 10), vec![STAR, "loom:curated"]);
+    let posted = world.posted(slug);
+    assert_eq!(posted.len(), 1);
+    assert!(posted[0].1.contains(HANDOFF_MARKER));
 }

@@ -23,7 +23,9 @@
 //!    block is stale (#10151) → `stale-block`, which the pass resolves itself
 //!    ([`StaleAction`]): every cited blocker closed → unblock; none cited →
 //!    hand to Curator. Only when that already happened once and the issue is
-//!    blocked again with still no open blocker → `needs-operator(blocked-unnamed)`;
+//!    blocked again with still no open blocker → `needs-operator(blocked-unnamed)`.
+//!    An inherited row is never handed to Curator: the walk turns that into
+//!    `needs-operator(blocked-unnamed)` at once ([`withhold_inherited_handoff`]);
 //! 6. its repo's `main` is red and it has not been dispatched → `blocked-by`
 //!    the red-main fix;
 //! 7. an open PR → `changes-requested` / `mergeable` (`merging` with a live
@@ -537,4 +539,37 @@ fn stale_block(f: &StarFacts, pr_num: Option<u32>) -> Landing {
         (!parked).then_some(StaleAction::Unblock { cleared, key })
     };
     landing
+}
+
+/// An inherited row never gets a [`StaleAction::CuratorHandoff`] (#10162
+/// review; see [`super::stale`]'s module doc): `classify` cannot tell an
+/// inherited row from a starred one, so the walk calls this once it knows
+/// the row inherits through `via` from the starred `root`.
+///
+/// A handoff becomes the `blocked-unnamed` operator ask — what every
+/// unnamed block got before #10151, and still the only actor that can move
+/// an unstarred blocker no agent will touch. An [`StaleAction::Unblock`]
+/// (or no action) is kept as it is.
+pub fn withhold_inherited_handoff(f: &StarFacts, landing: &mut Landing, via: u32, root: u32) {
+    if landing.stale != Some(StaleAction::CuratorHandoff) {
+        return;
+    }
+    let n = f.issue.number;
+    let through = if via == root {
+        String::new()
+    } else {
+        format!(" through #{via}")
+    };
+    *landing = Landing::operator(
+        AskKind::BlockedUnnamed,
+        "",
+        format!(
+            "{}#{n} blocks starred #{root}{through}, so it inherits that star, but it is \
+             `loom:blocked` with no open blocking issue named: resolve what blocks it and \
+             remove `loom:blocked`, or name the blocker so the star passes on to it — \
+             {NAMING_FORMS}.",
+            f.repo
+        ),
+        landing.pr,
+    );
 }

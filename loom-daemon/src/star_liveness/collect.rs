@@ -430,6 +430,18 @@ impl<'a> Evaluator<'a> {
         if blockers.iter().any(|b| b.open != Some(false)) {
             return (blockers, Some(CommentFacts::default()));
         }
+        // The comments read counts against the walk's read cap like any other
+        // single-issue read; past the cap it is not made, which reads as
+        // "comments unread" (no write this pass).
+        if self.read_cap.is_some_and(|cap| self.reads >= cap) {
+            log::debug!(
+                "star_liveness: {} reached its read cap this pass; comments of #{} not read",
+                self.ctx.slug,
+                issue.number
+            );
+            return (blockers, None);
+        }
+        self.reads += 1;
         let facts = match self.forge.comments(issue.number) {
             Ok(comments) => {
                 let me = self.forge.self_login();
@@ -750,6 +762,7 @@ impl<'a> Evaluator<'a> {
             };
             e.inherited_from = Some(inh.via);
             e.starred_at = inh.starred_at.clone().or(e.starred_at);
+            super::landing::withhold_inherited_handoff(&e.facts, &mut e.landing, inh.via, inh.root);
             out.push(e);
         }
         Ok(out)
