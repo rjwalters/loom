@@ -98,6 +98,50 @@ fn an_unrelated_readme_move_does_not_refuse_the_aggregate() {
 }
 
 #[test]
+fn a_work_plan_move_refuses_the_aggregate_when_a_suite_reading_it_changes() {
+    // `test-guide-operator-attention-fold.sh` (Test 3) and
+    // `test-docs-worktree.sh` (Test 6) read the committed root `WORK_PLAN.md`
+    // and run only under `shell-suite-tests`, which only `CI Result` reports.
+    let d = set(&["WORK_PLAN.md"]);
+    for pr in [
+        "defaults/scripts/tests/test-guide-operator-attention-fold.sh",
+        "defaults/scripts/tests/test-docs-worktree.sh",
+        "defaults/.claude/commands/loom/guide.md",
+    ] {
+        let (component, reason) =
+            composite_stale_reason(&ci_result(), &d, &set(&[pr]), &CiScopes::unscoped())
+                .unwrap_or_else(|| panic!("WORK_PLAN.md move under {pr} must refuse CI Result"));
+        assert_eq!(component, "CI Result", "{pr}: {reason:?}");
+        assert_eq!(reason.base_path.as_deref(), Some("WORK_PLAN.md"), "{pr}: {reason:?}");
+    }
+    // The other direction: a Guide PR touching `WORK_PLAN.md` under a code
+    // move on `main` refuses too.
+    let (component, _) = composite_stale_reason(
+        &ci_result(),
+        &set(&["defaults/scripts/lib/common.sh"]),
+        &set(&["WORK_PLAN.md"]),
+        &CiScopes::unscoped(),
+    )
+    .expect("a WORK_PLAN.md PR under a global move on main must refuse");
+    assert_eq!(component, "CI Result");
+    // It is coupled, not global: a Guide docs refresh on `main` does not
+    // refuse a PR that touches neither `WORK_PLAN.md` nor a global input.
+    let own = ci_result()
+        .into_iter()
+        .find(|s| s.context == "CI Result")
+        .expect("own component");
+    assert_eq!(
+        stale_reason(
+            own,
+            &set(&["WORK_PLAN.md", "WORK_LOG.md", "README.md"]),
+            &set(&["docs/guides/unrelated.md"]),
+        ),
+        None,
+        "a WORK_PLAN.md move must not refuse CI Result's own component under an unrelated PR"
+    );
+}
+
+#[test]
 fn a_rust_move_under_a_rust_pr_refuses_the_aggregate_on_its_own_component() {
     // The inputs the granular contexts do NOT model: backend-tests compiles
     // the whole workspace, so two disjoint Rust edits can still conflict.

@@ -929,13 +929,22 @@ pub const SPECS: &[CheckSpec<'static>] = &[
     // every job it `needs:` that no other required context runs — the Rust
     // build/lint/test jobs, `node-packages`, the installer/codex/dep suites,
     // `shell-suite-tests`, `install-surface-checks`, `repo-hygiene` and the
-    // image smokes. All global: a Rust or shell suite's verdict can hinge on
-    // any file it compiles or reads, so any interaction refuses.
+    // image smokes. Global: a Rust or shell suite's verdict can hinge on any
+    // file it compiles or reads, so any interaction refuses.
+    //
+    // `WORK_PLAN.md` is coupled, not global: two CI-wired shell suites
+    // (`test-guide-operator-attention-fold.sh` Test 3, `test-docs-worktree.sh`
+    // Test 6) assert on the committed root file, and `shell-suite-tests` only
+    // reaches a verdict through this aggregate. Coupled puts it in clauses
+    // 1-2's `any` set: a `WORK_PLAN.md` move on `main` refuses a PR that
+    // touches a global input (those suites, `guide.md`), and a PR touching
+    // `WORK_PLAN.md` refuses under a global move on `main`. A Guide docs
+    // refresh on `main` alone still does not refuse an unrelated PR.
     CheckSpec {
         context: "CI Result",
         global: CI_RESULT_GLOBAL,
         scanned: &[],
-        coupled: &[],
+        coupled: &["WORK_PLAN.md"],
         removal_sensitive: false,
     },
 ];
@@ -946,8 +955,10 @@ pub const SPECS: &[CheckSpec<'static>] = &[
 /// suite reads (`CLAUDE.md` via the premise-false suite, `VERSION`).
 ///
 /// Deliberately absent, because no aggregated job reads them: `README.md`,
-/// `CONTRIBUTING.md`, `SECURITY.md`, `LICENSE`, `WORK_LOG.md`, `WORK_PLAN.md`,
-/// `docs/**`, `assets/**`, `.vscode/**` and the editor/bot dotfiles. The
+/// `CONTRIBUTING.md`, `SECURITY.md`, `LICENSE`, `WORK_LOG.md`, `docs/**`,
+/// `assets/**`, `.vscode/**` and the editor/bot dotfiles. (`WORK_PLAN.md` IS
+/// read — by two `shell-suite-tests` suites — and is in the spec's `coupled`
+/// set rather than here; see the `CI Result` `CheckSpec`.) The
 /// markdown among them is still judged by the `Structural Checks` components
 /// (`Dangling Link Check`, `Conflict Marker Check`, …) this aggregate composes.
 /// So an edit to `README.md` on `main` does not, on its own, refuse every PR.
