@@ -224,3 +224,33 @@ fn passthrough_contract_is_preserved_and_returns_the_exit_status() {
     };
     assert_eq!(status.code(), Some(7));
 }
+
+#[test]
+fn credential_helper_contract_feeds_stdin_and_reports_the_exit_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let seen = tmp.path().join("request");
+    let helper = tmp.path().join("gh-helper");
+    std::fs::write(
+        &helper,
+        format!("#!/bin/sh\ncat > '{}'\necho noise >&2\nexit 3\n", seen.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let inv = read_op(GhTarget::None)
+        .args(["auth", "git-credential", "get"])
+        .credential_helper("protocol=https\nhost=github.com\n\n");
+    assert_eq!(inv.contract(), OutputContract::CredentialHelper);
+    let GhCompletion::Passthrough(status) = inv
+        .execute_with(&helper.to_string_lossy(), GhBinSource::EnvOverride)
+        .unwrap()
+    else {
+        panic!("expected a passthrough completion");
+    };
+    assert_eq!(status.code(), Some(3), "a failed helper is reported, not hidden");
+    assert_eq!(std::fs::read_to_string(&seen).unwrap(), "protocol=https\nhost=github.com\n\n");
+    // Never classified as a captured outcome.
+    assert!(matches!(
+        read_op(GhTarget::None).credential_helper("x").run(),
+        crate::cmd_out::CmdOutcome::Unavailable(_)
+    ));
+}

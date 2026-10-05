@@ -404,10 +404,9 @@ fn forge_inv(op: &'static str, intent: AccessIntent, gh: &str) -> GhInvocation {
     GhInvocation::new(Operation::new(op), intent, GhTarget::None, FORGE_CMD_TIMEOUT).program(gh)
 }
 
-/// Resolve the `gh` binary name — delegates to the single resolver (#9985).
-pub(crate) fn gh_bin() -> String {
-    crate::gh_invocation::gh_bin()
-}
+/// Resolve the `gh` binary name: a re-export of the single resolver (#9985),
+/// so `forge_cmd::gh_bin` callers and the facade can never disagree.
+pub(crate) use crate::gh_invocation::gh_bin;
 
 /// Passthrough the given `gh` args (entity prepended), inheriting stdio and
 /// propagating the exit code. On GitHub this is byte-identical to the scripts'
