@@ -309,6 +309,8 @@ impl Sandbox {
         c.env("PATH", self.path_env())
             .env("HOME", self.path().join("home"))
             .env("LOOM_GH_BIN", self.path().join("gh"))
+            // A host machine policy's launcher must never outrank the fake.
+            .env("LOOM_GH_NO_POLICY_LAUNCHER", "1")
             .env("LOOM_SOCKET_PATH", self.path().join("loom-daemon.sock"));
         c
     }
@@ -514,6 +516,7 @@ fn launcher_not_first_measures_path_even_when_the_daemon_execs_the_launcher() {
         .cmd(&["doctor", "--json"])
         // No override: the exec target can only come from the policy rung.
         .env_remove("LOOM_GH_BIN")
+        .env_remove("LOOM_GH_NO_POLICY_LAUNCHER")
         .env("LOOM_FORGE_EGRESS_POLICY", &path)
         .output()
         .unwrap();
@@ -529,4 +532,47 @@ fn launcher_not_first_measures_path_even_when_the_daemon_execs_the_launcher() {
     assert_eq!(report["observed"]["ghVersion"], "2.102.0");
     assert_eq!(report["observed"]["pathGhPath"], unmanaged.display().to_string().as_str());
     assert_eq!(out.status.code(), Some(1));
+}
+
+/// #9995 review: `LOOM_GH_NO_POLICY_LAUNCHER=1` — the seam every gh-stubbing
+/// harness sets — makes `LOOM_GH_BIN` win over an existing policy launcher.
+/// The daemon really execs the winner (`gh --version`), so the reported version
+/// proves which binary ran.
+#[test]
+#[cfg(unix)]
+fn no_policy_launcher_opt_out_makes_the_stub_win_over_the_launcher() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new();
+    let stub = sb.path().join("stub-gh");
+    std::fs::write(&stub, "#!/bin/sh\necho 'gh version 2.99.0 (stub)'\n").unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The policy's launcherPath is the sandbox's `gh` (2.102.0), and it exists.
+    let path = sb.policy(|_| {});
+    let launcher = sb.path().join("gh").display().to_string();
+    let observed = |opt_out: Option<&str>| {
+        let mut c = sb.cmd(&["doctor", "--json"]);
+        c.env("LOOM_GH_BIN", &stub)
+            .env("LOOM_FORGE_EGRESS_POLICY", &path);
+        match opt_out {
+            Some(v) => c.env("LOOM_GH_NO_POLICY_LAUNCHER", v),
+            None => c.env_remove("LOOM_GH_NO_POLICY_LAUNCHER"),
+        };
+        let out = c.output().unwrap();
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        report["observed"].clone()
+    };
+
+    let o = observed(Some("1"));
+    assert_eq!(o["ghPath"], stub.display().to_string().as_str(), "{o:#}");
+    assert_eq!(o["ghVersion"], "2.99.0", "the stub is what ran: {o:#}");
+    assert_eq!(o["ghSource"], "env_override", "{o:#}");
+
+    // Without the opt-out (or with any value but `1`) the launcher outranks
+    // LOOM_GH_BIN.
+    for opt_out in [None, Some("0")] {
+        let o = observed(opt_out);
+        assert_eq!(o["ghPath"], launcher.as_str(), "{opt_out:?}: {o:#}");
+        assert_eq!(o["ghVersion"], "2.102.0", "{opt_out:?}: {o:#}");
+        assert_eq!(o["ghSource"], "policy", "{opt_out:?}: {o:#}");
+    }
 }

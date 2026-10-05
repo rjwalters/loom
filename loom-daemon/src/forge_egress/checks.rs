@@ -143,6 +143,10 @@ pub struct Observed {
     /// execs the policy launcher directly (#9995), the exec target says
     /// nothing about what agents' shells run.
     pub path_gh: Option<PathBuf>,
+    /// Which resolver rung produced [`Self::gh`] (`policy`, `env_override`,
+    /// `path`) — report-only, so a declined policy rung
+    /// (`LOOM_GH_NO_POLICY_LAUNCHER`) is visible.
+    pub gh_source: Option<&'static str>,
     /// Whether `toolchain.launcherPath` exists on this host.
     pub launcher_exists: bool,
     /// Every active profile, in check order (env/default first).

@@ -8,7 +8,10 @@
 //!    rule as the negative canary, [`may_choose_executable`](crate::forge_egress::policy::Origin::may_choose_executable)) — and
 //!    only when the launcher exists on disk. Anything else (unconfigured,
 //!    unreadable, repo-origin, no `launcherPath`, launcher missing) falls
-//!    through to the next rung.
+//!    through to the next rung. `LOOM_GH_NO_POLICY_LAUNCHER=1`
+//!    ([`NO_POLICY_LAUNCHER_ENV`]) declines this rung outright — the seam every
+//!    test harness that stubs `gh` sets, so a host's policy launcher can never
+//!    outrank the stub.
 //! 2. `LOOM_GH_BIN` — the test/override hook every existing resolver honours.
 //!    Read with `std::env::var` semantics, byte-identical to the ten
 //!    hand-rolled `gh_bin*` resolver copies this replaces (a set-but-empty value is
@@ -26,6 +29,30 @@ use std::path::Path;
 
 use crate::forge_egress::policy::{self, PolicySources, Resolution};
 
+/// Set to `1` to decline the policy-launcher rung, so `LOOM_GH_BIN` (else bare
+/// `gh` on `PATH`) wins even when an env/machine forge-egress policy names an
+/// existing `toolchain.launcherPath`.
+///
+/// For test harnesses that hand the daemon a fake `gh` (`LOOM_GH_BIN` or a
+/// stub on `PATH`): without it, a host carrying an egress policy would exec the
+/// real managed `gh` instead of the stub (the #10088 hazard, out of process).
+/// It is not a policy bypass: env is already the most-trusted policy origin
+/// (`LOOM_FORGE_EGRESS_POLICY` outranks the machine policy wholesale), and the
+/// forge-egress validator measures whatever `gh` the resolver actually picks —
+/// the version floor reads the exec target and `toolchain.launcher-not-first`
+/// reads `PATH`'s `gh` — so under `enforcement.api = required` a declined rung
+/// that lands on an unmanaged or below-floor `gh` still fails `assert`. The
+/// report's `observed.ghSource` names the rung that won.
+pub const NO_POLICY_LAUNCHER_ENV: &str = "LOOM_GH_NO_POLICY_LAUNCHER";
+
+/// Whether `value` (of [`NO_POLICY_LAUNCHER_ENV`]) declines the policy rung.
+/// Only the exact value `1` does; unset, empty, `0` or anything else leaves the
+/// rung on, so a typo fails toward the policy.
+#[must_use]
+pub fn policy_rung_declined(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
 /// Which rung of the precedence ladder produced the program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GhBinSource {
@@ -38,6 +65,20 @@ pub enum GhBinSource {
     /// A program the call site injected ([`super::GhInvocation::program`]) —
     /// a test stub handed down a `gh_bin: &Path` argument (#10089).
     Injected,
+}
+
+impl GhBinSource {
+    /// Stable lowercase name (telemetry `launcher` attribute, egress report
+    /// `observed.ghSource`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Policy => "policy",
+            Self::EnvOverride => "env_override",
+            Self::Path => "path",
+            Self::Injected => "injected",
+        }
+    }
 }
 
 /// The executable a `gh` invocation will run, and why.
@@ -105,8 +146,10 @@ pub fn gh_bin() -> String {
 /// test host naming a real launcher would otherwise outrank the loud-failing
 /// stub [`env_override`] supplies (#10088) and let `cargo test` reach the real
 /// `gh`. The rung's logic is covered through [`launcher_from_sources`].
+/// Out-of-process harnesses (integration tests, shell suites) have no
+/// `cfg(test)`; they set [`NO_POLICY_LAUNCHER_ENV`] instead.
 fn policy_launcher_path() -> Option<String> {
-    if cfg!(test) {
+    if cfg!(test) || policy_rung_declined(std::env::var_os(NO_POLICY_LAUNCHER_ENV).as_deref()) {
         return None;
     }
     launcher_from_sources(&PolicySources::from_process(None))
@@ -253,6 +296,16 @@ mod tests {
         assert_eq!(ladder(&unparseable, None).source, GhBinSource::Path);
         // No candidate at all.
         assert_eq!(ladder(&PolicySources::default(), None).source, GhBinSource::Path);
+    }
+
+    #[test]
+    fn only_the_exact_value_1_declines_the_policy_rung() {
+        use std::ffi::OsStr;
+        assert!(policy_rung_declined(Some(OsStr::new("1"))));
+        for v in ["", "0", "true", "yes", " 1", "11"] {
+            assert!(!policy_rung_declined(Some(OsStr::new(v))), "{v:?}");
+        }
+        assert!(!policy_rung_declined(None));
     }
 
     #[test]

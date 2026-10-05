@@ -398,6 +398,7 @@ pub fn observe(doc: &PolicyDoc, workspace: &Path, opts: ProbeOptions) -> Observe
         gh_config_dir,
         gh: gh_build(effective_gh_path()),
         path_gh: path_gh_path(),
+        gh_source: Some(crate::gh_invocation::resolver::resolve().source.as_str()),
         launcher_exists: !launcher.is_empty() && Path::new(launcher).exists(),
         profiles,
         git_rewrites: git_rewrites(workspace, logical),

@@ -365,12 +365,7 @@ impl InvocationSpan {
 }
 
 fn launcher_str(source: super::GhBinSource) -> &'static str {
-    match source {
-        super::GhBinSource::Policy => "policy",
-        super::GhBinSource::EnvOverride => "env_override",
-        super::GhBinSource::Path => "path",
-        super::GhBinSource::Injected => "injected",
-    }
+    source.as_str()
 }
 
 /// One local completion record (a failed invocation).

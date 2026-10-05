@@ -233,6 +233,7 @@ fn observed_json(policy: &Value, obs: &Observed) -> Value {
         "ghVersionLine": (!obs.gh.raw.is_empty()).then(|| obs.gh.raw.clone()),
         "ghPath": obs.gh.path.as_ref().map(|p| p.display().to_string()),
         "pathGhPath": obs.path_gh.as_ref().map(|p| p.display().to_string()),
+        "ghSource": obs.gh_source,
         "apiHostHonoured": api_host_supported(obs.gh.version, policy),
         "expectedApiHost": expected_api_host(policy),
         "logicalHost": dig(policy, &["github", "logicalHost"]).cloned().unwrap_or(Value::Null),

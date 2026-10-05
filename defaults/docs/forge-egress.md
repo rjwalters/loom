@@ -78,9 +78,28 @@ Loom-only codes cover surfaces that 2am's validator cannot see
 The checked profiles are the process's `GH_CONFIG_DIR` (or `gh`'s default
 directory when none is exported), plus every profile Loom publishes:
 `.loom/gh-config` and `.loom/gh-config-by-owner/<owner>`. The effective `gh`
-is `$LOOM_GH_BIN`, else `gh` on `PATH`, meaning the binary Loom will exec.
-`gh --version` is probed with no token variables and an empty config
-directory, because `gh` can make a live call even for `--version`.
+is the binary Loom will exec, picked by the `gh_invocation` resolver (first
+hit wins):
+
+1. `toolchain.launcherPath`, only from an **env**- or **machine**-origin
+   policy (a repo-local policy never chooses the executable), and only when
+   that file exists (#9995);
+2. `$LOOM_GH_BIN`;
+3. `gh` on `PATH`.
+
+`LOOM_GH_NO_POLICY_LAUNCHER=1` declines rung 1. Every test harness that stubs
+`gh` sets it, so a host's policy launcher never outranks the stub. It is not
+a policy bypass: env already outranks the machine policy, and the checks
+measure whatever `gh` the resolver picks. Under `enforcement.api = required`,
+a declined rung that lands on an unmanaged or below-floor `gh` still fails
+`assert`.
+
+The version floor measures that effective `gh` (`observed.ghPath`; the rung
+that won is `observed.ghSource`). `toolchain.launcher-not-first` measures the
+`gh` an agent's plain `gh` resolves to: bare `gh` on `PATH`, never the
+resolver (`observed.pathGhPath`). `gh --version` is probed with no token
+variables and an empty config directory, because `gh` can make a live call
+even for `--version`.
 
 **Never in any output:** `hosts.yml` contents, tokens, credential-helper
 output, git rewrite URLs or the environment. Reports carry paths, hosts,
@@ -103,7 +122,7 @@ policy, or one with an unknown `schemaVersion`, is never treated as observe-only
 
 Not wired yet: post-publication `assert` + rollback (C3, #9986) and
 `resync-installed.sh` (#9996; run `loom-daemon forge egress doctor` after a
-resync by hand). The facade resolver's policy-launcher rung is #9995.
+resync by hand).
 
 ## Lockstep with 2am
 

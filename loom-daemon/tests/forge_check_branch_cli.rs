@@ -88,6 +88,7 @@ fn run(args: &[&str], env: &[(&str, &str)]) -> Run {
         .env("MOCK_DIR", dir.path())
         .env("LOOM_GIT_BIN", &git)
         .env("LOOM_GH_BIN", &gh)
+        .env("LOOM_GH_NO_POLICY_LAUNCHER", "1")
         .env("LOOM_FORGE_TYPE", "github")
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
         .env("LOOM_WORKSPACES_PATH", dir.path().join("workspaces.json"))

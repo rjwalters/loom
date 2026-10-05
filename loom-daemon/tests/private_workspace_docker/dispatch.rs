@@ -205,9 +205,10 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
     ] {
         copy_tree(&defaults.join(src), &root.join(dest));
     }
-    let [gh_bin, write_scope_cache] = f.write_scope_env();
+    let [gh_bin, no_policy_launcher, write_scope_cache] = f.write_scope_env();
     let _environment = Environment::set(&[
         gh_bin,
+        no_policy_launcher,
         write_scope_cache,
         ("LOOM_WORKSPACE", Some(root.clone().into_os_string())),
         ("LOOM_CODEX_PROFILE_ROOT", Some(f.root.path().join("profiles").into_os_string())),
@@ -518,7 +519,7 @@ impl Fixture {
     /// (#9548). The disposable forge serves Git, not the REST API, so the
     /// host's permission probe runs through a `gh` that reports push on the
     /// fixture's `github/repo` and hands every other call to the real `gh`.
-    pub(super) fn write_scope_env(&self) -> [(&'static str, Option<std::ffi::OsString>); 2] {
+    pub(super) fn write_scope_env(&self) -> [(&'static str, Option<std::ffi::OsString>); 3] {
         let real = Command::new("sh")
             .args(["-c", "command -v gh"])
             .output()
@@ -535,6 +536,9 @@ impl Fixture {
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         [
             ("LOOM_GH_BIN", Some(gh.into_os_string())),
+            // Keep a host egress policy's launcher from outranking the
+            // wrapper (#9995).
+            ("LOOM_GH_NO_POLICY_LAUNCHER", Some("1".into())),
             (
                 "LOOM_WRITE_SCOPE_CACHE_DIR",
                 Some(self.root.path().join("write-scope-cache").into_os_string()),
