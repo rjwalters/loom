@@ -516,6 +516,11 @@ pub(crate) enum ForgeAction {
         repo: Option<String>,
     },
 
+    /// `forge calls [--since 1h|3h] [--by bucket|caller|role|repo]` (W1) —
+    /// this host's forge-call sink per billed GitHub bucket (or caller, role,
+    /// repo) beside the bucket book's readings. Reads local files only.
+    Calls(super::forge_calls_cmd::CallsArgs),
+
     /// `forge identities [--json]` (#9537) — the resolved roster (writer,
     /// readers, legacy logins) and, per reader, each published token's owner
     /// and expiry.
@@ -628,6 +633,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         ForgeAction::Egress { action } => return super::forge_egress_cmd::handle(action),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
+        ForgeAction::Calls(args) => return super::forge_calls_cmd::handle(args),
         ForgeAction::MayWrite { repo } => return super::forge_identity_cmd::may_write(repo),
         ForgeAction::DashboardLink {
             repo,

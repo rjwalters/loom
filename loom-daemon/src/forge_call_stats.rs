@@ -72,6 +72,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::forge_listing::HttpResponse;
 
+#[path = "forge_call_stats_buckets.rs"]
+pub mod buckets;
 #[path = "forge_call_stats_ops.rs"]
 pub mod ops;
 use crate::types::{ForgeBudgetReading, ForgeCallCounts, ForgeCallsStatus, ForgeOperationCounts};
@@ -342,6 +344,8 @@ pub struct RateLimitHeaders {
     /// vs external consumption.
     pub used: Option<u64>,
     pub reset_epoch: Option<i64>,
+    /// The pool's size this window (`x-ratelimit-limit`).
+    pub limit: Option<u64>,
 }
 
 impl RateLimitHeaders {
@@ -353,6 +357,7 @@ impl RateLimitHeaders {
             "x-ratelimit-remaining" => self.remaining = value.parse().ok(),
             "x-ratelimit-used" => self.used = value.parse().ok(),
             "x-ratelimit-reset" => self.reset_epoch = value.parse().ok(),
+            "x-ratelimit-limit" => self.limit = value.parse().ok(),
             _ => {}
         }
     }
@@ -414,6 +419,20 @@ pub fn record_with_identity(
     outcome: Outcome,
     headers: Option<&RateLimitHeaders>,
 ) {
+    record_attributed(caller, identity, pool, outcome, headers, &CallAttribution::default());
+}
+
+/// [`record_with_identity`] plus the W1 bucket attribution the `gh` facade
+/// knows ([`CallAttribution`]): which credential, which billed bucket, how
+/// many pages. Same guarantees: never blocks or fails the caller.
+pub fn record_attributed(
+    caller: &'static str,
+    identity: &CallIdentity,
+    pool: Pool,
+    outcome: Outcome,
+    headers: Option<&RateLimitHeaders>,
+    attribution: &CallAttribution,
+) {
     let line = SinkLine {
         t: Utc::now().timestamp(),
         c: caller.to_string(),
@@ -432,6 +451,7 @@ pub fn record_with_identity(
         og: identity.origin.clone(),
         rp: identity.repo.clone(),
         ir: identity.role.clone(),
+        at: attribution.clone(),
     };
     if let Ok(mut state) = process_state().lock() {
         state.add(&line);
@@ -477,6 +497,47 @@ struct SinkLine {
     /// Identity role (#9872); absent on pre-#9872 lines and non-facade calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ir: Option<String>,
+    /// The W1 bucket attribution, flattened into the same short-key line.
+    /// Every key is optional, so a pre-W1 line parses with all of them
+    /// absent and a pre-W1 reader ignores them.
+    #[serde(flatten, default)]
+    at: CallAttribution,
+}
+
+/// Which credential and which billed bucket one row spent (W1). Recorded by
+/// the `gh` facade; every field is a short token — never a path, a token or
+/// a header body — and absent rather than guessed when unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallAttribution {
+    /// Where the row's `rp` came from: `site`, `target`, `loom_repo`,
+    /// `remote` (the working directory's `origin`) or `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ro: Option<String>,
+    /// The credential's account label: `app-<id>`, `app-unknown`,
+    /// `env-token` or `ambient`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
+    /// The owner the credential is an installation for (lowercased).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub co: Option<String>,
+    /// Credential kind: `reader`, `writer`, `env` or `ambient`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tk: Option<String>,
+    /// The billed resource: `x-ratelimit-resource` when headers were seen,
+    /// else the pool the argv implies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rr: Option<String>,
+    /// Requests the row stands for when more than one is known
+    /// (`--paginate --include` status blocks, `run download`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pg: Option<u32>,
+    /// `--paginate` without `--include`: the page count is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pu: Option<bool>,
+    /// The `origin`-derived repo disagrees with the repo `gh` itself would
+    /// resolve from the same checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rd: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -668,6 +729,13 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_test_sink_dir(dir: Option<PathBuf>) {
     TEST_SINK_DIR.with(|d| *d.borrow_mut() = dir);
+}
+
+/// This host's sink directory (`None` when disabled), for readers outside
+/// this module: the `forge calls` CLI and the bucket book's snapshot.
+#[must_use]
+pub fn host_sink_dir() -> Option<PathBuf> {
+    sink_dir()
 }
 
 fn sink_file(dir: &Path, hour: i64) -> PathBuf {
@@ -876,6 +944,7 @@ pub fn status_report(
         window_secs: WINDOW_SECS.unsigned_abs(),
         operations: window.as_ref().map(Aggregate::identity_rows),
         identity_roles: window.as_ref().map(Aggregate::role_rows),
+        buckets: sink_dir().map(|d| buckets::status_rows(&d, now_ts)),
         host_window: window.map(|w| w.rows()),
         since_start,
         since,

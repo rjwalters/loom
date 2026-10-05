@@ -180,6 +180,7 @@ pub mod fleet_state;
 pub mod fleet_store;
 pub mod fleet_sync;
 pub mod foreign_load;
+pub mod forge_bucket_book;
 pub mod forge_cached_list;
 pub mod forge_cached_view;
 pub mod forge_call_stats;

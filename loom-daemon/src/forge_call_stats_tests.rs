@@ -19,6 +19,7 @@ fn line(t: i64, caller: &str, p: Pool, o: Outcome, rem: Option<u64>) -> String {
         og: None,
         rp: None,
         ir: None,
+        at: CallAttribution::default(),
     })
     .unwrap()
 }
@@ -43,6 +44,7 @@ fn id_line(t: i64, caller: &str, o: Outcome, identity: &CallIdentity) -> String 
         og: identity.origin.clone(),
         rp: identity.repo.clone(),
         ir: identity.role.clone(),
+        at: CallAttribution::default(),
     })
     .unwrap()
 }
@@ -179,6 +181,7 @@ fn sink_round_trips_prunes_old_hours_and_feeds_status() {
         remaining: Some(4321),
         used: Some(679),
         reset_epoch: Some(now + 900),
+        limit: None,
     };
     record("test_sink_caller", Pool::Core, Outcome::NotModified, Some(&headers));
     record("test_sink_caller", Pool::Core, Outcome::Ok, None);

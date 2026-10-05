@@ -8,7 +8,9 @@
 
 use chrono::{DateTime, Utc};
 use loom_daemon::health::format_window;
-use loom_daemon::types::{DaemonStatusReport, ForgeBudgetReading, ForgeCallCounts};
+use loom_daemon::types::{
+    DaemonStatusReport, ForgeBucketStatus, ForgeBudgetReading, ForgeCallCounts,
+};
 
 /// Every line of the section; empty for a pre-#9251 daemon (no field).
 pub fn render_forge_calls_lines(report: &DaemonStatusReport, now: DateTime<Utc>) -> Vec<String> {
@@ -60,6 +62,48 @@ pub fn render_forge_calls_lines(report: &DaemonStatusReport, now: DateTime<Utc>)
             .map(|b| render_budget(b, own(&b.pool), now))
             .collect();
         lines.push(format!("  budget: {}", readings.join(" · ")));
+    }
+    lines.extend(render_bucket_block(fc.buckets.as_deref().unwrap_or_default(), now));
+    lines
+}
+
+/// Most bucket rows the compact block shows; the rest are summarised.
+const MAX_BUCKET_ROWS: usize = 12;
+
+/// The W1 per-bucket block: one line per billed bucket, busiest first —
+/// what this host charged it over the window and its newest reading.
+/// `loom-daemon forge calls --by bucket` has the full table.
+fn render_bucket_block(buckets: &[ForgeBucketStatus], now: DateTime<Utc>) -> Vec<String> {
+    if buckets.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<&ForgeBucketStatus> = buckets.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.charged
+            .cmp(&a.charged)
+            .then_with(|| a.account.cmp(&b.account))
+    });
+    let mut lines = vec!["  buckets (charged · 304 · limited · used/limit):".to_string()];
+    for b in sorted.iter().take(MAX_BUCKET_ROWS) {
+        let reading = match (b.used, b.limit) {
+            (Some(used), Some(limit)) => format!("{used}/{limit}"),
+            (Some(used), None) => format!("{used}/?"),
+            _ => "-".to_string(),
+        };
+        let resets = b
+            .reset_at
+            .map(|r| format!(", resets in {}", ago((r - now).num_seconds())))
+            .unwrap_or_default();
+        lines.push(format!(
+            "    {} {} {}: {} · {} · {} · {reading}{resets}",
+            b.account, b.cred_owner, b.resource, b.charged, b.not_modified, b.rate_limited
+        ));
+    }
+    if sorted.len() > MAX_BUCKET_ROWS {
+        lines.push(format!(
+            "    … {} more — loom-daemon forge calls --by bucket",
+            sorted.len() - MAX_BUCKET_ROWS
+        ));
     }
     lines
 }
@@ -159,6 +203,7 @@ mod tests {
             // this renderer must keep rendering unchanged.
             operations: None,
             identity_roles: None,
+            buckets: None,
         };
         let lines = render_forge_calls_lines(&report(Some(fc)), now);
         let text = lines.join("\n");
@@ -218,6 +263,30 @@ mod tests {
         let lines = render_forge_calls_lines(&report(Some(fc)), now);
         let budget = lines.iter().find(|l| l.contains("budget:")).unwrap();
         assert!(budget.contains("used 4960 (own n/a — sink off)"), "{budget}");
+    }
+
+    #[test]
+    fn the_bucket_block_lists_each_bucket_busiest_first() {
+        let now = Utc::now();
+        let bucket = |account: &str, charged, used| ForgeBucketStatus {
+            account: account.into(),
+            cred_owner: "acme".into(),
+            resource: "core".into(),
+            charged,
+            used,
+            limit: used.map(|_| 5000),
+            reset_at: Some(now + chrono::Duration::minutes(20)),
+            ..Default::default()
+        };
+        let fc = ForgeCallsStatus {
+            window_secs: 3600,
+            buckets: Some(vec![bucket("app-7", 3, None), bucket("app-42", 120, Some(900))]),
+            ..Default::default()
+        };
+        let lines = render_forge_calls_lines(&report(Some(fc)), now);
+        let at = lines.iter().position(|l| l.contains("buckets (")).unwrap();
+        assert!(lines[at + 1].contains("app-42 acme core: 120 · 0 · 0 · 900/5000, resets in 20m"));
+        assert!(lines[at + 2].contains("app-7 acme core: 3 · 0 · 0 · -"), "{lines:?}");
     }
 
     #[test]

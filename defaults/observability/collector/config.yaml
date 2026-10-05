@@ -401,7 +401,10 @@ processors:
           # stops stripping the existing loom.tokens.* per-provider label.
           # github.ratelimit.* (#10022) adds resource (core|graphql).
           # loom.daemon.task_* (#10414) adds task (a fixed daemon loop name).
-          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task"])
+          # W1 adds owner (per-bucket github.ratelimit.* gauges) and
+          # loom.forge.calls' caller, op, role, cred_owner, target_owner and
+          # outcome — operation names and owners, never a repo number or path.
+          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome"])
 exporters:
   otlp_http/clickstack:
     endpoint: http://clickstack-collector:4318
