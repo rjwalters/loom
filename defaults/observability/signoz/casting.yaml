@@ -27,8 +27,8 @@ spec:
   telemetrystore:
     kind: clickhouse
     spec:
-      version: 25.12.5
-      image: clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a
+      version: 25.12.11
+      image: clickhouse/clickhouse-server:25.12.11@sha256:8a790dd3468db22b1d4e7b18a176f378ff5ff6053b9c48dd4ea1fa71a24c5ba6
   telemetrykeeper:
     kind: clickhousekeeper
     spec:
