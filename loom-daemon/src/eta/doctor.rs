@@ -389,7 +389,7 @@ fn data(f: &Facts) -> Vec<Check> {
                 &name,
                 Status::Fail,
                 "no_reader: no reader App resolves for this repo, so it is never refreshed here",
-                "install a reader App for the repo (2AMLogic/2am#2489), or declare `fleet.captain` on a host that has readers and share its snapshot dir via LOOM_ETA_FLEET_SNAPSHOT_DIR",
+                "install a reader App for the repo (the fleet reader-App provisioning step), or declare `fleet.captain` on a host that has readers and share its snapshot dir via LOOM_ETA_FLEET_SNAPSHOT_DIR",
             ));
             continue;
         }

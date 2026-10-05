@@ -1301,7 +1301,7 @@ accepts `--repo-root PATH` (default: the current directory).
   read-only: prints one `OK|WARN|FAIL|SKIP <link>.<check>: <detail>` line per
   check, walking the pipeline `config` -> `data` -> `fit` -> `serving` ->
   `snapshot_feed` -> `outcomes`, with an indented `remedy:` line on every WARN
-  and FAIL (for example `no_reader` -> install a reader App, 2AMLogic/2am#2489,
+  and FAIL (for example `no_reader` -> install a reader App via the fleet reader-App provisioning step,
   or declare `fleet.captain` and share its snapshot dir through
   `LOOM_ETA_FLEET_SNAPSHOT_DIR`). It makes no forge call, arms nothing and
   writes nothing. Exit `0`: no FAIL; `1`: at least one FAIL; `2`: not a Loom

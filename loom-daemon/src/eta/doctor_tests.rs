@@ -136,7 +136,7 @@ fn each_broken_fact_gets_its_status_and_remedy() {
             "data",
             "repo acme/alpha",
             Status::Fail,
-            "2AMLogic/2am#2489",
+            "fleet reader-App provisioning step",
         ),
         (
             "unsupported_forge is not told to install a reader App",
