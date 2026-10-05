@@ -88,7 +88,7 @@ use crate::eta::labels::{
 use crate::eta::queue_features::{
     queue_features, EventKind, EventLog, QueueFeatures, QueueSubject, RosterEntry, StageEvent,
 };
-use crate::eta::star::StarInputs;
+use crate::eta::star::{StarInputs, StarSource};
 use crate::eta::Stage;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -106,6 +106,12 @@ pub struct RowStats {
     /// cache does not cover the row's cutoff. Their `starred_any` is `None`,
     /// never `false`. Counted only when star inputs were supplied.
     pub rows_star_unknown: usize,
+    /// Rows kept whose star state is known and starred, by either source
+    /// (#10389). Counted only when star inputs were supplied.
+    pub rows_starred_any: usize,
+    /// Of those, rows starred only through a linked issue (`StarSource::Issue`):
+    /// the rows the model's PR-only `starred` misses.
+    pub rows_star_issue_only: usize,
 }
 
 /// The PR and instant one row describes (a [`TrainingRow`] carries only its
@@ -462,8 +468,15 @@ pub fn build_with_star(
                         let state = inputs.repos.get(&pr.repo).and_then(|r| {
                             r.state_at(pr.number, flags, pr_star_since(&pr.flags, cutoff), cutoff)
                         });
-                        if state.is_none() {
-                            stats.rows_star_unknown += 1;
+                        match state.map(|s| s.source) {
+                            None => stats.rows_star_unknown += 1,
+                            Some(StarSource::None) => {}
+                            Some(source) => {
+                                stats.rows_starred_any += 1;
+                                if source == StarSource::Issue {
+                                    stats.rows_star_issue_only += 1;
+                                }
+                            }
                         }
                         (state.map(|s| s.source.starred()), state.map(|s| s.source))
                     }

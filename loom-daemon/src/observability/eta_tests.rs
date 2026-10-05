@@ -299,3 +299,60 @@ fn a_pass_hot_reloads_a_newer_fit_and_ignores_an_unchanged_one() {
     fit::write(&fit::fit_dir(root).join(fit::path_for(future.as_of)), &future).unwrap();
     assert!(!reload(&mut registry), "a future fit is invisible at `now`");
 }
+
+/// A `gh` stub for the starred-issue reads (#10389): page 1 of any label is
+/// a full page (issues 1..=99 plus PR 100), `&page=2` is issues 101..=104,
+/// failing instead when `fail2` exists.
+fn starred_stub(dir: &std::path::Path) -> PathBuf {
+    let row = |n: u32, pr: bool| {
+        let pr = if pr { r#", "pull_request": {}"# } else { "" };
+        format!(r#"{{"number": {n}, "state": "open", "labels": []{pr}}}"#)
+    };
+    let page = |rows: Vec<String>| format!("[{}]\n", rows.join(","));
+    let p1: Vec<String> = (1..=100).map(|n| row(n, n == 100)).collect();
+    std::fs::write(dir.join("p1.json"), page(p1)).unwrap();
+    std::fs::write(dir.join("p2.json"), page((101..=104).map(|n| row(n, false)).collect()))
+        .unwrap();
+    let path = dir.join("fake-gh-star.sh");
+    std::fs::write(
+        &path,
+        format!(
+            r#"#!/bin/sh
+d={dir}
+case "$*" in
+  *'&page=2'*)
+    if [ -f "$d/fail2" ]; then echo 'gh: Server Error (HTTP 502)' 1>&2; exit 1; fi
+    printf 'HTTP/2.0 200 OK\r\n\r\n'; cat "$d/p2.json" ;;
+  *) printf 'HTTP/2.0 200 OK\r\n\r\n'; cat "$d/p1.json" ;;
+esac
+"#,
+            dir = dir.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+/// More than 100 starred items: an issue past page 1 is starred, PRs are
+/// left out, and labels' listings are merged once each. An incomplete walk
+/// is `Err`, which `starred_issues` turns into `None` (unknown).
+#[test]
+fn starred_issues_read_every_page_and_an_incomplete_walk_is_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = starred_stub(dir.path());
+    let pid = std::process::id();
+    let (a, b) = (format!("test:star-a-{pid}"), format!("test:star-b-{pid}"));
+    let labels = [a.as_str(), b.as_str()];
+
+    let issues = read_starred_issues(&gh, dir.path(), &labels).unwrap();
+    let want: Vec<u32> = (1..=99).chain(101..=104).collect();
+    assert_eq!(issues, want, "issue 104 is past page 1; PR 100 is not an issue");
+
+    std::fs::write(dir.path().join("fail2"), "").unwrap();
+    assert!(read_starred_issues(&gh, dir.path(), &labels).is_err());
+}

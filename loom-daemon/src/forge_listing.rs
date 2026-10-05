@@ -102,7 +102,69 @@ pub fn list_issues_cached_as(
     label: &str,
     state: &str,
 ) -> Result<Vec<RestIssue>> {
-    match list_issues_cached_once(caller, gh_bin, cwd, repo_override, label, state) {
+    list_issues_cached_retrying(caller, gh_bin, cwd, repo_override, label, state, None)
+}
+
+/// Most pages [`list_issues_cached_all_as`] reads.
+pub const MAX_PAGES: u32 = 10;
+
+/// Every item carrying `label` in `state`, page by page through the same
+/// ETag cache (#10389): each page is its own conditional read (an unchanged
+/// page is a free `304`), and page 1 is the very URL, and so the very cache
+/// entry, [`list_issues_cached_as`] keeps. Stops at the first short page.
+///
+/// Pages are read one after another, not atomically: an item that moves
+/// across a page boundary mid-walk can appear twice (callers dedupe) or be
+/// missed for that one call.
+///
+/// # Errors
+///
+/// A page failed, or [`MAX_PAGES`] full pages were read: the set may be
+/// incomplete, and a caller must not read a missing item as absent.
+pub fn list_issues_cached_all_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    label: &str,
+    state: &str,
+) -> Result<Vec<RestIssue>> {
+    let mut all = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let rows = list_issues_cached_retrying(
+            caller,
+            gh_bin,
+            cwd,
+            repo_override,
+            label,
+            state,
+            Some(page),
+        )?;
+        let full = rows.len() >= PER_PAGE;
+        all.extend(rows);
+        if !full {
+            return Ok(all);
+        }
+    }
+    Err(anyhow!(
+        "forge_listing: more than {} {label} items; the listing is incomplete",
+        MAX_PAGES as usize * PER_PAGE
+    ))
+}
+
+/// [`list_issues_cached_once`], retried exactly once after a forced
+/// credential refresh on a registered workspace's 404 (#6171). `page` as
+/// there.
+fn list_issues_cached_retrying(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    label: &str,
+    state: &str,
+    page: Option<u32>,
+) -> Result<Vec<RestIssue>> {
+    match list_issues_cached_once(caller, gh_bin, cwd, repo_override, label, state, page) {
         Ok(issues) => Ok(issues),
         Err(e) => {
             // #6171: a 404 from a *registered* workspace (a `Some(cwd)` — an
@@ -131,6 +193,7 @@ pub fn list_issues_cached_as(
                         repo_override,
                         label,
                         state,
+                        page,
                     );
                 }
             }
@@ -165,6 +228,10 @@ fn issue_list(caller: &'static str) -> store::ConditionalRead {
 /// agent path this trusts every `200` (no #7451 shrink guard): each claim
 /// shrinks the `loom:issue` listing, and re-serving the larger prior listing
 /// could re-offer a just-claimed issue.
+///
+/// `page`: `None` is the single-page listing (a full page warns); `Some(n)`
+/// is page `n` of [`list_issues_cached_all_as`]'s walk, page 1 under the
+/// single-page URL (one cache entry).
 fn list_issues_cached_once(
     caller: &'static str,
     gh_bin: &Path,
@@ -172,13 +239,17 @@ fn list_issues_cached_once(
     repo_override: Option<&str>,
     label: &str,
     state: &str,
+    page: Option<u32>,
 ) -> Result<Vec<RestIssue>> {
     let env_repo = std::env::var("LOOM_REPO").ok();
     let repo = repo_override.or(env_repo.as_deref());
     // #9252: the URL names the SAME resolved repo the key does (never gh's
     // own placeholder remote choice), so key and request cannot disagree.
     let target = store::resolve_target(cwd, repo);
-    let url = build_issues_url(target.repo.as_deref(), label, state);
+    let mut url = build_issues_url(target.repo.as_deref(), label, state);
+    if let Some(n) = page.filter(|n| *n > 1) {
+        url.push_str(&format!("&page={n}"));
+    }
     let cache_key = store::daemon_cache_key(cwd, &target, &url);
     let disk_path = store::daemon_store_dir().map(|d| store::entry_path_in(&d, &cache_key));
     // Snapshot the (etag, issues) PAIR before the request: a 304 validates
@@ -215,7 +286,7 @@ fn list_issues_cached_once(
         Some(ref r) if r.status == 200 && status.success() => {
             let issues = parse_rest_issues(&r.body)
                 .with_context(|| format!("parse REST issues JSON from {url}"))?;
-            if issues.len() >= PER_PAGE {
+            if page.is_none() && issues.len() >= PER_PAGE {
                 log::warn!(
                     "forge_listing: {url} returned a full page ({PER_PAGE}); the listing may be \
                      truncated — items beyond the first page are not seen this poll"
