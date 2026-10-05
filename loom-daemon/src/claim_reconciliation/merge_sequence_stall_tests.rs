@@ -7,6 +7,7 @@ use super::super::{
     hold_action, plan_group, plan_repo_with, EdgeReason, SequenceGroup, SEQUENCE_LABEL,
 };
 use super::*;
+use crate::work_finder::OPERATOR_PRIORITY_LABEL;
 
 const NOW: &str = "2026-10-03T12:00:00Z";
 const BOUND: f64 = 12.0;

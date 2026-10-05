@@ -1077,7 +1077,7 @@ Workers use a three-level priority system to determine which issues to work on:
 
 ### Priority Order
 
-1. **Starred** (`loom:operator-priority`) - The operator wants it landed ASAP (#9244)
+1. **Starred** (`loom:operator-priority`) - The operator wants it landed ASAP (#9244); level 2 (`loom:operator-high-priority` / `loom:high-priority-inherited`) first (#10307)
 2. **Curated** (`loom:issue` + `loom:curated`) - Approved and enhanced issues (highest quality)
 3. **Approved Only** (`loom:issue` without `loom:curated`) - Approved but not yet curated (fallback)
 
@@ -1086,7 +1086,9 @@ Workers use a three-level priority system to determine which issues to work on:
 **Step 1: Check for starred issues first**
 
 ```bash
-gh issue list --label="loom:issue" --label="loom:operator-priority" --state=open --limit=5
+# level list: keep in sync with operator_levels.rs LEVELS until #10311
+for L in loom:operator-high-priority loom:high-priority-inherited loom:operator-priority; do
+gh issue list --label="loom:issue" --label="$L" --state=open --limit=5; done
 ```
 
 If any exist, **claim one immediately**.
@@ -1279,8 +1281,8 @@ work). The canonical body template (Summary / Changes / Acceptance
 Criteria Verification / Test Plan + the `Closes #N` reference) lives in
 **builder-pr.md § "Creating the PR"** — use it verbatim. Do NOT create PRs with
 just `Closes #N`; the body must include the structured sections. Add
-`loom:review-requested` at creation only (plus `loom:operator-priority` if the
-issue carries it, #9244), and never touch PR labels afterward (canonical rules in **builder-pr.md § "PR Label Rules"**). PRs are
+`loom:review-requested` at creation only (plus each priority label the
+issue carries, #9244/#10307), and never touch PR labels afterward (canonical rules in **builder-pr.md § "PR Label Rules"**). PRs are
 merged by Champion using `./.loom/scripts/merge-pr.sh` — never use `gh pr merge`.
 
 ## Working Style

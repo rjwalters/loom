@@ -39,7 +39,6 @@ use super::{
 };
 use crate::merge_pr::sequence::fetch_trusted_bodies;
 use crate::star_liveness::escalate::marker as escalation_marker;
-use crate::work_finder::operator_priority::OPERATOR_PRIORITY_LABEL;
 
 /// How long a chain head may sit quiet on a human hold, or without a
 /// verdict, before soft holds behind it are released and the chain is
@@ -65,10 +64,11 @@ pub fn stall_hours() -> f64 {
         .unwrap_or(DEFAULT_STALL_HOURS)
 }
 
-/// Is this PR starred (`loom:operator-priority`)?
+/// Is this PR starred (`loom:operator-priority`, or any higher level,
+/// #10307)?
 #[must_use]
 pub fn starred(pr: &SequencePr) -> bool {
-    pr.has(OPERATOR_PRIORITY_LABEL)
+    crate::operator_levels::is_starred(&pr.labels)
 }
 
 /// Why a chain head is stalled.

@@ -510,3 +510,113 @@ fn overflow_never_passes_disk_or_ram_headroom() {
     let report = tick(&mut FakeSource::once(vec![starred(1, &[])]), &mut dispatcher, 0, false);
     assert_eq!(report.unwrap().dispatched, 0);
 }
+
+// ---- Operator priority levels (#10307) -----------------------------------
+
+fn at_level(n: u32, label: &str, extra: &[&str]) -> WorkItem {
+    let mut labels = vec![label.to_string()];
+    labels.extend(extra.iter().map(|l| (*l).to_string()));
+    WorkItem::new(n, labels)
+}
+
+#[test]
+fn level_two_drains_before_the_star_on_both_tick_paths() {
+    // Listing order puts the star first; the level key must win anyway.
+    let rows = || {
+        vec![
+            starred(1, &["loom:issue"]),
+            issue(2),
+            at_level(3, "loom:operator-high-priority", &["loom:issue"]),
+            at_level(4, "loom:high-priority-inherited", &["loom:issue"]),
+        ]
+    };
+    let mut dispatcher = RecordingDispatcher::default();
+    tick(&mut FakeSource::once(rows()), &mut dispatcher, 10, false).unwrap();
+    assert_eq!(dispatcher.dispatched, vec![3, 4, 1, 2]);
+
+    let mut multi = vec![(FakeSource::once(rows()), RecordingDispatcher::default())];
+    tick_multi(&mut multi, &[100], 10, &[false]);
+    assert_eq!(multi[0].1.dispatched, vec![3, 4, 1, 2]);
+}
+
+#[test]
+fn a_level_two_issue_without_the_star_counts_as_starred() {
+    let item = at_level(7, "loom:operator-high-priority", &["loom:triage"]);
+    assert!(item.is_operator_priority(), "levels nest");
+    assert_eq!(item.operator_level(), 2);
+    let inherited = WorkItem {
+        operator_priority_inherited_from: Some(9),
+        ..issue(8)
+    };
+    assert_eq!(inherited.operator_level(), 1, "the in-memory star is level 1");
+    // The starred listing keeps it like a star (it is not loom:issue yet).
+    let merged = merge_starred(vec![], vec![item]);
+    assert_eq!(merged.len(), 1);
+}
+
+#[test]
+fn a_level_change_re_reads_the_starred_at_so_level_two_orders_by_when_it_was_raised() {
+    let mut src = FakeTimeline::default();
+    src.answers.insert(1, "2026-09-01T00:00:00Z".into());
+    let mut cache = StarredAtCache::default();
+    let now = Instant::now();
+    cache.resolve(&mut [starred(1, &[])], &mut src, now);
+    assert_eq!(src.calls, vec![1]);
+    // Raised to level 2 (the star stays): read again, the new time wins.
+    src.answers.insert(1, "2026-10-04T00:00:00Z".into());
+    let mut items = [starred(1, &["loom:operator-high-priority"])];
+    cache.resolve(&mut items, &mut src, now);
+    assert_eq!(src.calls, vec![1, 1]);
+    assert_eq!(items[0].operator_priority_at.as_deref(), Some("2026-10-04T00:00:00Z"));
+    // Same level next tick: no read.
+    cache.resolve(&mut items, &mut src, now);
+    assert_eq!(src.calls, vec![1, 1]);
+}
+
+#[test]
+fn the_starred_at_timeline_program_reads_every_level_label() {
+    let jq = crate::work_finder::operator_priority::starred_at_jq();
+    for label in crate::operator_levels::starred_labels(crate::operator_levels::table()) {
+        assert!(jq.contains(&format!(".label.name == \"{label}\"")), "{label}: {jq}");
+    }
+    assert!(jq.contains("loom:operator-priority-intent="));
+}
+
+/// #10307 AC: adding a level-3 row to the table is enough to order at level
+/// 3. The comparator's level key is generic; the level comes from the table.
+#[test]
+fn a_level_three_row_is_enough_to_order_above_level_two() {
+    use crate::operator_levels::{PriorityLevel, LEVELS};
+    use crate::work_finder::ordering::{candidate_cmp, PriorityCandidate};
+    let mut table = LEVELS.to_vec();
+    table.push(PriorityLevel {
+        level: 3,
+        glyph: "⭐⭐⭐",
+        name: "operator top priority",
+        operator_label: "loom:operator-top-priority",
+        inherited_label: Some("loom:top-priority-inherited"),
+        default_cap: Some(2),
+    });
+    let items = [
+        issue(1),
+        starred(2, &[]),
+        at_level(3, "loom:operator-high-priority", &[]),
+        at_level(4, "loom:top-priority-inherited", &[]),
+        at_level(5, "loom:operator-top-priority", &[]),
+    ];
+    let mut keys: Vec<PriorityCandidate> = items
+        .iter()
+        .map(|i| {
+            let level = i.operator_level_in(&table);
+            PriorityCandidate {
+                operator_level: level,
+                operator_priority: level >= 1,
+                number: i.number,
+                ..PriorityCandidate::default()
+            }
+        })
+        .collect();
+    keys.sort_by(candidate_cmp);
+    let order: Vec<u32> = keys.iter().map(|k| k.number).collect();
+    assert_eq!(order, vec![4, 5, 3, 2, 1]);
+}

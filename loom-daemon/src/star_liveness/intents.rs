@@ -6,15 +6,21 @@
 //! ([`parse_ack_intents`]) and pushes them onto the process-global
 //! [`IntentQueue`]; the liveness pass drains the queue and, per intent:
 //!
-//! 1. **Validates** ([`validate`]): only `label == "loom:operator-priority"`,
-//!    only `action` `star` / `unstar`, only a repo this host's workspace
-//!    registry manages, and a non-empty `requested_by`. Anything else is
-//!    dropped and logged. A compromised dashboard can at most toggle this one
-//!    label on repos this host manages.
-//! 2. **Applies** ([`apply`]) idempotently: add or remove the label if needed,
-//!    then post one audit comment carrying
-//!    `<!-- loom:operator-priority-intent=<id> action=<a> requested_at=<ts> -->`
-//!    unless a comment with that intent id already exists. The backend keeps
+//! 1. **Validates** ([`validate`]): only a `label` that is an **operator**
+//!    label in the level table ([`crate::operator_levels`]: the star
+//!    `loom:operator-priority`, or a higher level such as
+//!    `loom:operator-high-priority`, #10307), only `action` `star` / `unstar`,
+//!    only a repo this host's workspace registry manages, and a non-empty
+//!    `requested_by`. An inherited label (`loom:high-priority-inherited`) is
+//!    daemon-written and never accepted. Anything else is dropped and logged.
+//!    A compromised dashboard can at most toggle the operator labels on repos
+//!    this host manages.
+//! 2. **Applies** ([`apply`]) idempotently: add or remove exactly that label
+//!    if needed (a level-2 intent never touches the star: levels nest), then
+//!    post one audit comment carrying
+//!    `<!-- loom:operator-priority-intent=<id> action=<a> requested_at=<ts> label=<label> -->`
+//!    unless a comment with that intent id already exists. A marker with no
+//!    `label=` (written before #10307) means `loom:operator-priority`. The backend keeps
 //!    returning an intent until it sees the label change, and several hosts
 //!    may manage the repo, so every step must be safe to repeat.
 //! 3. **Records starred-at**: `requested_at` becomes the issue's starred-at
@@ -33,6 +39,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde::Deserialize;
 
 use super::forge::StarForge;
+use crate::operator_levels::{self, PriorityLevel};
 use crate::types::DroppedStarIntent;
 use crate::work_finder::operator_priority::StarredAtSource;
 use crate::work_finder::OPERATOR_PRIORITY_LABEL;
@@ -43,6 +50,19 @@ pub const MAX_QUEUED: usize = 500;
 
 /// The audit-comment marker prefix.
 pub const INTENT_MARKER_PREFIX: &str = "<!-- loom:operator-priority-intent=";
+
+/// The marker field naming the label an intent applied (#10307). Absent
+/// means [`OPERATOR_PRIORITY_LABEL`].
+pub const LABEL_FIELD: &str = "label=";
+
+/// The label a marker names: its `label=` field, else the star.
+#[must_use]
+pub fn marker_label(marker: &str) -> &str {
+    marker
+        .split_whitespace()
+        .find_map(|f| f.strip_prefix(LABEL_FIELD))
+        .map_or(OPERATOR_PRIORITY_LABEL, |l| l.trim_end_matches("-->"))
+}
 
 /// One intent as loom-ui ships it. Every field defaults so a partial object
 /// still parses and is then dropped by [`validate`] with a reason.
@@ -187,6 +207,8 @@ pub struct ValidIntent {
     pub root: PathBuf,
     pub number: u32,
     pub action: Action,
+    /// The operator label the intent toggles, from the level table.
+    pub level: PriorityLevel,
     /// RFC 3339, normalized to UTC seconds; `None` when absent or invalid.
     pub requested_at: Option<String>,
     /// Sanitized for display.
@@ -245,9 +267,12 @@ pub fn validate(
     if !safe_id(&intent.id) || intent.number == 0 || intent.repo.trim().is_empty() {
         return Err(drop("malformed"));
     }
-    if intent.label != OPERATOR_PRIORITY_LABEL {
+    // An operator label of any level; never an inherited (daemon-written)
+    // label, and never anything else (#10307).
+    let Some(level) = operator_levels::by_operator_label(operator_levels::table(), &intent.label)
+    else {
         return Err(drop("wrong-label"));
-    }
+    };
     let action = match intent.action.as_str() {
         "star" => Action::Star,
         "unstar" => Action::Unstar,
@@ -265,6 +290,7 @@ pub fn validate(
         root: root.clone(),
         number: intent.number,
         action,
+        level: *level,
         requested_at: normalize_ts(intent.requested_at.as_deref()),
         requested_by,
     })
@@ -278,17 +304,32 @@ pub fn marker(intent: &ValidIntent) -> String {
         .as_deref()
         .map(|t| format!(" requested_at={t}"))
         .unwrap_or_default();
-    format!("{INTENT_MARKER_PREFIX}{} action={}{at} -->", intent.id, intent.action.as_str())
+    format!(
+        "{INTENT_MARKER_PREFIX}{} action={}{at} {LABEL_FIELD}{} -->",
+        intent.id,
+        intent.action.as_str(),
+        intent.level.operator_label
+    )
 }
 
 /// The audit comment for `intent`.
 #[must_use]
 pub fn audit_comment(intent: &ValidIntent) -> String {
-    let verb = match intent.action {
-        Action::Star => "⭐ Starred for operator priority",
-        Action::Unstar => "Unstarred (operator priority removed)",
+    let l = &intent.level;
+    let verb = match (intent.action, l.level) {
+        (Action::Star, 1) => "⭐ Starred for operator priority".to_string(),
+        (Action::Unstar, 1) => "Unstarred (operator priority removed)".to_string(),
+        (Action::Star, _) => format!("{} Raised to {} (`{}`)", l.glyph, l.name, l.operator_label),
+        (Action::Unstar, _) => format!("{} removed (`{}`)", capitalize(l.name), l.operator_label),
     };
     format!("{}\n{verb} by `{}` via loom-ui.", marker(intent), intent.requested_by)
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 /// What [`apply`] did.
@@ -309,14 +350,16 @@ pub fn apply(forge: &mut dyn StarForge, intent: &ValidIntent) -> anyhow::Result<
     let Some(issue) = forge.issue(intent.number)? else {
         anyhow::bail!("{}#{} does not exist", intent.repo, intent.number);
     };
-    let has = issue.labels.iter().any(|l| l == OPERATOR_PRIORITY_LABEL);
+    // Exactly the intent's label: a level-2 intent leaves the star alone.
+    let label = intent.level.operator_label;
+    let has = issue.labels.iter().any(|l| l == label);
     match intent.action {
         Action::Star if !has => {
-            forge.add_label(intent.number, OPERATOR_PRIORITY_LABEL)?;
+            forge.add_label(intent.number, label)?;
             applied.label_changed = true;
         }
         Action::Unstar if has => {
-            forge.remove_label(intent.number, OPERATOR_PRIORITY_LABEL)?;
+            forge.remove_label(intent.number, label)?;
             applied.label_changed = true;
         }
         _ => {}

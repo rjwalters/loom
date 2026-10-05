@@ -38,7 +38,7 @@ fn a_star_is_applied_once_with_one_audit_comment_across_passes_and_hosts() {
     let posted = world.posted(slug);
     assert_eq!(posted.len(), 1);
     assert!(posted[0].1.contains(
-        "<!-- loom:operator-priority-intent=i-1 action=star requested_at=2026-09-28T08:15:00Z -->"
+        "<!-- loom:operator-priority-intent=i-1 action=star requested_at=2026-09-28T08:15:00Z label=loom:operator-priority -->"
     ));
     assert!(posted[0].1.contains("by `joseph` via loom-ui"));
     // The same pass already sees the star it applied.

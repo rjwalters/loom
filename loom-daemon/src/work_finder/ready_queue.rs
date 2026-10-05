@@ -78,6 +78,7 @@ pub fn key_of(
     PriorityCandidate {
         workspace_idx: idx,
         workspace_priority,
+        operator_level: item.operator_level(),
         operator_priority: item.is_operator_priority(),
         operator_priority_at: item.operator_priority_at.clone(),
         main_red_fix: repo_red && item.is_main_red_fix(),

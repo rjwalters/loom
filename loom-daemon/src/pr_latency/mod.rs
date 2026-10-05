@@ -112,9 +112,10 @@ pub fn is_parked<S: AsRef<str>>(labels: &[S]) -> bool {
 /// Every operator-gate / park label present, for the detail column.
 ///
 /// The `loom:operator-` prefix catches the operator-only sub-kinds, but
-/// `loom:operator-priority` (#9244, "starred") shares the prefix and is the
-/// opposite of a hold — the operator wants the item landed ASAP — so it is
-/// excluded by name.
+/// `loom:operator-priority` (#9244, "starred") and every other priority
+/// level label (`loom:operator-high-priority`, #10307) share the prefix and
+/// are the opposite of a hold — the operator wants the item landed ASAP — so
+/// they are excluded by name ([`crate::operator_levels::is_level_label`]).
 pub fn hold_labels<S: AsRef<str>>(labels: &[S]) -> Vec<String> {
     labels
         .iter()
@@ -122,8 +123,7 @@ pub fn hold_labels<S: AsRef<str>>(labels: &[S]) -> Vec<String> {
         .filter(|l| {
             OPERATOR_GATE_LABELS.contains(l)
                 || crate::work_finder::PARK_LABELS.contains(l)
-                || (l.starts_with("loom:operator-")
-                    && *l != crate::work_finder::OPERATOR_PRIORITY_LABEL)
+                || (l.starts_with("loom:operator-") && !crate::operator_levels::is_level_label(l))
         })
         .map(str::to_string)
         .collect()
@@ -174,6 +174,7 @@ mod tests {
         // #9244: `loom:operator-priority` shares the `loom:operator-` prefix
         // but is a priority signal, never a hold.
         assert!(hold_labels(&["loom:pr", "loom:operator-priority"]).is_empty());
+        assert!(hold_labels(&["loom:operator-high-priority"]).is_empty(), "#10307");
         assert!(!is_operator_gated(&["loom:pr", "loom:operator-priority"]));
         assert!(!is_parked(&["loom:operator-priority"]));
         assert_eq!(

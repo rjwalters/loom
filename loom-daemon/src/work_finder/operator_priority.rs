@@ -52,13 +52,28 @@ pub static CHAMPION_PATH_LABELS: crate::label_registry::LabelSet =
 pub const STARRED_AT_RETRY: Duration = Duration::from_secs(600);
 
 impl WorkItem {
-    /// True when the issue carries [`OPERATOR_PRIORITY_LABEL`] (#9244), or
-    /// blocks a starred issue and inherits its star (#9244 C). Dispatch
-    /// treats both alike: an inherited star must land before the star can.
+    /// True when the issue is starred at any level (#9244, #10307): it
+    /// carries a level label ([`crate::operator_levels`], own or inherited),
+    /// or blocks a starred issue and inherits its star (#9244 C). Dispatch
+    /// treats them alike: an inherited star must land before the star can.
     #[must_use]
     pub fn is_operator_priority(&self) -> bool {
-        self.operator_priority_inherited_from.is_some()
-            || self.labels.iter().any(|l| l == OPERATOR_PRIORITY_LABEL)
+        self.operator_level() >= 1
+    }
+
+    /// The issue's effective operator priority level (#10307): the highest
+    /// of its own level labels, its inherited level labels, and the
+    /// in-memory inherited star (level 1). 0 = not starred.
+    #[must_use]
+    pub fn operator_level(&self) -> u8 {
+        self.operator_level_in(crate::operator_levels::table())
+    }
+
+    /// [`Self::operator_level`] against an explicit level `table`.
+    #[must_use]
+    pub fn operator_level_in(&self, table: &[crate::operator_levels::PriorityLevel]) -> u8 {
+        let in_memory = u8::from(self.operator_priority_inherited_from.is_some());
+        crate::operator_levels::level_in(table, &self.labels).max(in_memory)
     }
 
     /// Builder-style setter for the starred-at timestamp (#9244).
@@ -122,6 +137,9 @@ pub trait StarredAtSource {
 struct CachedAt {
     at: Option<String>,
     fetched: Instant,
+    /// The level the value was read at (#10307): a level change re-reads,
+    /// so an issue raised to level 2 orders by when it was raised.
+    level: u8,
 }
 
 /// Per-repo starred-at cache (#9244 §3).
@@ -182,8 +200,11 @@ impl StarredAtCache {
             .collect();
         self.entries.retain(|n, _| starred.contains(n));
         for item in items.iter_mut().filter(|i| i.is_operator_priority()) {
+            let level = item.operator_level();
             let fresh = self.entries.get(&item.number).is_some_and(|e| {
-                e.at.is_some() || now.saturating_duration_since(e.fetched) < STARRED_AT_RETRY
+                e.level == level
+                    && (e.at.is_some()
+                        || now.saturating_duration_since(e.fetched) < STARRED_AT_RETRY)
             });
             if !fresh {
                 let at = source.starred_at(item.number).unwrap_or_else(|e| {
@@ -194,8 +215,14 @@ impl StarredAtCache {
                     );
                     None
                 });
-                self.entries
-                    .insert(item.number, CachedAt { at, fetched: now });
+                self.entries.insert(
+                    item.number,
+                    CachedAt {
+                        at,
+                        fetched: now,
+                        level,
+                    },
+                );
             }
             item.operator_priority_at = self.entries.get(&item.number).and_then(|e| e.at.clone());
         }
@@ -245,12 +272,28 @@ pub fn resolve_starred_at(
 }
 
 /// The `--jq` program for [`GhTimelineStarredAt`]: `L <created_at>` per
-/// `labeled` event for [`OPERATOR_PRIORITY_LABEL`], and
-/// `C <created_at> <requested_at> <author_association> <login>` per loom-ui
-/// star-intent audit comment (#9244 C), whose `requested_at` is the
-/// authoritative starred-at when its author is trusted. Parsed by
+/// `labeled` event for any level label ([`crate::operator_levels`], #10307),
+/// and `C <created_at> <requested_at> <author_association> <login>` per
+/// loom-ui star-intent audit comment (#9244 C, any level), whose
+/// `requested_at` is the authoritative starred-at when its author is
+/// trusted. Parsed by
 /// [`crate::star_liveness::intents::starred_at_from_timeline`].
-const STARRED_AT_JQ: &str = r#".[] | if (.event == "labeled" and .label.name == "loom:operator-priority") then "L \(.created_at)" elif (.event == "commented" and ((.body // "") | contains("loom:operator-priority-intent=") and contains("action=star"))) then "C \(.created_at) \((.body | capture("requested_at=(?<t>[^ >]+)") | .t) // "-") \(.author_association // "-") \(.actor.login // .user.login // "-")" else empty end"#;
+///
+/// The starred-at is therefore when the issue last *reached* a level, and
+/// the cache re-reads it when the level changes: a level-2 issue orders
+/// among level-2 issues by when it was raised. A demotion back to the star
+/// keeps the later (level-2) time, which only orders it later among stars.
+#[must_use]
+pub fn starred_at_jq() -> String {
+    let labels = crate::operator_levels::starred_labels(crate::operator_levels::table())
+        .iter()
+        .map(|l| format!(".label.name == \"{l}\""))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    format!(
+        r#".[] | if (.event == "labeled" and ({labels})) then "L \(.created_at)" elif (.event == "commented" and ((.body // "") | contains("loom:operator-priority-intent=") and contains("action=star"))) then "C \(.created_at) \((.body | capture("requested_at=(?<t>[^ >]+)") | .t) // "-") \(.author_association // "-") \(.actor.login // .user.login // "-")" else empty end"#
+    )
+}
 
 /// The latest RFC-3339 timestamp in `stdout` (one per line), i.e. the most
 /// recent time the label was applied. Unparseable lines are skipped.
@@ -295,7 +338,7 @@ impl StarredAtSource for GhTimelineStarredAt {
         )
         .program(&self.gh_bin)
         .args(["api", &format!("repos/{repo}/issues/{issue}/timeline")])
-        .args(["--paginate", "--jq", STARRED_AT_JQ]);
+        .args(["--paginate", "--jq", &starred_at_jq()]);
         if let Some(dir) = self.cwd.as_deref() {
             inv = inv.current_dir(dir);
         }

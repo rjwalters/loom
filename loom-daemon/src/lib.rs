@@ -243,6 +243,7 @@ pub mod metrics_collector;
 pub mod observability;
 pub mod opencode_usage;
 pub mod operator_decision;
+pub mod operator_levels;
 pub mod operator_stop;
 pub mod orphan_process_reaper;
 pub mod overlap_replay;
