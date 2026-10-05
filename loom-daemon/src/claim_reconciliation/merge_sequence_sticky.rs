@@ -21,8 +21,9 @@
 //!    marker still names the tree it holds, which is the whole reason a moved
 //!    head voids a hold.
 //! 2. **An operator's release sticks.** When the newest `loom:sequenced` label
-//!    event on a PR is a removal by a non-fleet actor while the PR's newest
-//!    marker is still live (no pass tombstone after it), the pass records a
+//!    event on a PR is a removal by a non-fleet actor, made after the comment
+//!    that wrote the PR's newest marker, while that marker is still live (no
+//!    pass tombstone after it), the pass records a
 //!    sticky release for that (PR, predecessor) pair and plans no edge for
 //!    the pair again until the PR's tree changes. A pass-made release always
 //!    writes a tombstone and is never read as an operator release, so it
@@ -33,8 +34,8 @@
 //!
 //! Every unknown keeps today's behavior: an unanswered or negative tree
 //! comparison voids/re-plans exactly as before, and an unreadable label
-//! history, an event with no actor, or a fleet actor records no sticky
-//! release. Nothing here weakens the `merge-pr.sh` gate
+//! history, an event with no actor, a fleet actor, or a removal not provably
+//! newer than the live marker's comment records no sticky release. Nothing here weakens the `merge-pr.sh` gate
 //! (`merge_pr::labels`): the label is still the only thing the merge path
 //! reads, and this module only decides whether the pass puts it back.
 
@@ -44,7 +45,9 @@ use std::path::Path;
 use super::{gh_pr, SequenceEdge, SequenceMarker, SequencePr, SEQUENCE_LABEL};
 use crate::claim_reconciliation::gh_call;
 use crate::forge_tree_unchanged::{tree_unchanged, verdict_tree_carveout_enabled};
-use crate::merge_pr::sequence::{html_comment_spans, is_full_sha, parse_live, states_or_ends_hold};
+use crate::merge_pr::sequence::{
+    html_comment_spans, is_full_sha, parse, parse_live, states_or_ends_hold,
+};
 
 /// The record prefix: `<!-- loom:sequence operator-released after=N
 /// follower_head=<40-hex> -->`. Not a marker and not a tombstone to
@@ -138,12 +141,37 @@ pub fn parse_record_in_force(bodies: &[String]) -> Option<(u32, String)> {
     record
 }
 
+/// Does `body` carry `marker` in one of its single-line HTML comments?
+fn carries_marker(body: &str, marker: &SequenceMarker) -> bool {
+    body.lines().any(|line| {
+        html_comment_spans(line)
+            .into_iter()
+            .any(|span| parse(&[format!("<!--{span}-->")]).as_ref() == Some(marker))
+    })
+}
+
+fn timestamp(v: &serde_json::Value) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(v.pointer("/created_at")?.as_str()?).ok()
+}
+
 /// Is the newest `loom:sequenced` label event in `events` (a paginated
-/// issue-timeline body) a removal by an actor `is_fleet` does not claim?
-/// `Some(false)` for no such event, a newest `labeled`, or a fleet actor;
-/// `None` when the body does not parse or the newest event names no actor —
-/// unknown never makes a release sticky.
-pub fn operator_unlabeled(events: &[u8], is_fleet: impl Fn(&str) -> bool) -> Option<bool> {
+/// issue-timeline body) a removal by an actor `is_fleet` does not claim,
+/// made AFTER the comment that wrote `marker`?
+///
+/// `Some(false)` for no such event, a newest `labeled`, a fleet actor, or a
+/// removal no newer than the marker comment (it released an earlier hold,
+/// not this one: e.g. the pass wrote this marker but its `--add-label`
+/// failed, so the newest label event is a stale removal). `None` when the
+/// body does not parse, the newest event names no actor, or either timestamp
+/// is missing or unparseable (including a marker comment absent from the
+/// timeline) — unknown never makes a release sticky. When several timeline
+/// comments carry the marker the newest one counts; the timeline is not
+/// trust-filtered, so a copied marker can only move the bar later.
+pub fn operator_unlabeled(
+    events: &[u8],
+    marker: &SequenceMarker,
+    is_fleet: impl Fn(&str) -> bool,
+) -> Option<bool> {
     let mut rows: Vec<serde_json::Value> = Vec::new();
     for page in serde_json::Deserializer::from_slice(events).into_iter::<serde_json::Value>() {
         match page.ok()? {
@@ -169,7 +197,20 @@ pub fn operator_unlabeled(events: &[u8], is_fleet: impl Fn(&str) -> bool) -> Opt
         return Some(false);
     }
     let actor = str_at(newest, "/actor/login").filter(|l| !l.trim().is_empty())?;
-    Some(!is_fleet(&actor))
+    if is_fleet(&actor) {
+        return Some(false);
+    }
+    let removed_at = timestamp(newest)?;
+    let mut marker_at = None;
+    for c in rows.iter().filter(|e| {
+        str_at(e, "/event").as_deref() == Some("commented")
+            && str_at(e, "/body").is_some_and(|b| carries_marker(&b, marker))
+    }) {
+        // Any carrying comment with an unreadable timestamp is an unknown.
+        let at = timestamp(c)?;
+        marker_at = Some(marker_at.map_or(at, |m: chrono::DateTime<_>| m.max(at)));
+    }
+    Some(removed_at > marker_at?)
 }
 
 /// What the sticky-release check found for one planned edge.
@@ -194,7 +235,7 @@ pub fn decide(
     follower: &SequencePr,
     bodies: &[String],
     same_tree: impl Fn(&str, &str) -> bool,
-    operator_unlabeled_now: impl FnOnce() -> Option<bool>,
+    operator_unlabeled_now: impl FnOnce(&SequenceMarker) -> Option<bool>,
 ) -> OperatorRelease {
     let Some(live) = follower.head_sha.as_deref().filter(|h| !h.is_empty()) else {
         return OperatorRelease::None;
@@ -216,7 +257,7 @@ pub fn decide(
     if marker.after != edge.after || !same_tree(&marker.follower_head, live) {
         return OperatorRelease::None;
     }
-    match operator_unlabeled_now() {
+    match operator_unlabeled_now(&marker) {
         Some(true) => OperatorRelease::Detected(marker.follower_head),
         _ => OperatorRelease::None,
     }
@@ -249,9 +290,10 @@ pub fn check(
         follower,
         bodies,
         |pinned, live| forge_same_tree(gh_bin, root, pinned, live),
-        || {
+        |marker| {
             let fleet = crate::forge_identity::FleetLogins::for_root(root);
-            operator_unlabeled(&fetch_timeline(gh_bin, root, edge.follower)?, |l| fleet.contains(l))
+            let events = fetch_timeline(gh_bin, root, edge.follower)?;
+            operator_unlabeled(&events, marker, |l| fleet.contains(l))
         },
     )
 }

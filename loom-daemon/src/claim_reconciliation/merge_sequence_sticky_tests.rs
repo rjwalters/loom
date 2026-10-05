@@ -66,6 +66,16 @@ fn label_event(event: &str, actor: Option<&str>, at: &str) -> serde_json::Value 
     e
 }
 
+/// The timeline row of the comment that wrote `marker` at `at`.
+fn marker_comment(marker: &SequenceMarker, at: &str) -> serde_json::Value {
+    serde_json::json!({
+        "event": "commented",
+        "created_at": at,
+        "body": format!("Landing order recorded\n{}", marker_text(marker)),
+        "actor": {"login": "loom-fleet-dispatch[bot]"},
+    })
+}
+
 fn timeline(events: &[serde_json::Value]) -> Vec<u8> {
     serde_json::Value::Array(events.to_vec())
         .to_string()
@@ -151,7 +161,13 @@ fn a_later_marker_or_tombstone_supersedes_the_record() {
 #[test]
 fn only_a_newest_non_fleet_removal_is_an_operator_release() {
     let bot = "loom-fleet-dispatch[bot]";
-    let t = |e: &[serde_json::Value]| operator_unlabeled(&timeline(e), fleet);
+    let m = marker_2_after_1();
+    let wrote = marker_comment(&m, "2026-10-05T07:30:00Z");
+    let t = |e: &[serde_json::Value]| {
+        let mut rows = vec![wrote.clone()];
+        rows.extend_from_slice(e);
+        operator_unlabeled(&timeline(&rows), &m, fleet)
+    };
     let added = label_event("labeled", Some(bot), "2026-10-05T08:00:00Z");
     let by_op = label_event("unlabeled", Some("rjwalters"), "2026-10-05T08:47:00Z");
     let by_bot = label_event("unlabeled", Some(bot), "2026-10-05T08:47:00Z");
@@ -166,11 +182,51 @@ fn only_a_newest_non_fleet_removal_is_an_operator_release() {
     // Unknowns: no actor, unparseable body.
     let anon = label_event("unlabeled", None, "2026-10-05T08:47:00Z");
     assert_eq!(t(&[added.clone(), anon]), None);
-    assert_eq!(operator_unlabeled(b"not json", fleet), None);
+    assert_eq!(operator_unlabeled(b"not json", &m, fleet), None);
     // `--paginate` concatenates pages.
-    let mut paged = timeline(&[added]);
-    paged.extend(timeline(&[by_op]));
-    assert_eq!(operator_unlabeled(&paged, fleet), Some(true));
+    let mut paged = timeline(&[wrote.clone(), added.clone()]);
+    paged.extend(timeline(std::slice::from_ref(&by_op)));
+    assert_eq!(operator_unlabeled(&paged, &m, fleet), Some(true));
+}
+
+/// Judge finding on PR #10408: an operator removal OLDER than the comment
+/// that wrote the live marker released an earlier hold, not this one (e.g.
+/// the pass re-wrote the marker but its `--add-label` failed). It must not
+/// become a sticky release; a missing or unreadable timestamp fails closed.
+#[test]
+fn an_operator_removal_older_than_the_live_marker_is_not_a_release() {
+    let m = marker_2_after_1();
+    let old_removal = label_event("unlabeled", Some("rjwalters"), "2026-10-05T06:00:00Z");
+    let wrote = marker_comment(&m, "2026-10-05T07:30:00Z");
+    let ev = |e: &[serde_json::Value]| operator_unlabeled(&timeline(e), &m, fleet);
+    assert_eq!(ev(&[old_removal.clone(), wrote.clone()]), Some(false));
+    // Same second: not provably after, so no release.
+    let same_second = label_event("unlabeled", Some("rjwalters"), "2026-10-05T07:30:00Z");
+    assert_eq!(ev(&[wrote.clone(), same_second]), Some(false));
+    // The newest carrying comment sets the bar (a re-posted marker).
+    let between = label_event("unlabeled", Some("rjwalters"), "2026-10-05T08:00:00Z");
+    let reposted = marker_comment(&m, "2026-10-05T09:00:00Z");
+    assert_eq!(ev(&[wrote.clone(), between, reposted]), Some(false));
+    // A removal after the marker is a release.
+    let after = label_event("unlabeled", Some("rjwalters"), "2026-10-05T08:47:00Z");
+    assert_eq!(ev(&[wrote.clone(), after.clone()]), Some(true));
+    // Fail closed: the marker comment absent from the timeline, or either
+    // timestamp missing / unparseable.
+    assert_eq!(ev(std::slice::from_ref(&after)), None);
+    let mut undated = wrote.clone();
+    undated["created_at"] = serde_json::json!("yesterday");
+    assert_eq!(ev(&[undated, after.clone()]), None);
+    let mut no_ts = wrote.clone();
+    no_ts.as_object_mut().unwrap().remove("created_at");
+    assert_eq!(ev(&[no_ts, after.clone()]), None);
+    let mut bad_removal = after;
+    bad_removal["created_at"] = serde_json::json!("not-a-time");
+    assert_eq!(ev(&[wrote.clone(), bad_removal]), None);
+    // A comment carrying a DIFFERENT marker does not set the bar.
+    let mut other = m.clone();
+    other.plan = "seq-cccc2222".to_string();
+    let late = label_event("unlabeled", Some("rjwalters"), "2026-10-05T08:47:00Z");
+    assert_eq!(ev(&[marker_comment(&other, "2026-10-05T07:00:00Z"), late]), None);
 }
 
 #[test]
@@ -180,34 +236,34 @@ fn the_decision_is_scoped_to_the_pair_and_the_tree() {
     let same = |a: &str, b: &str| a == b || (a == sha(2) && b == redated());
     let edge = edge_2_after_1(&redated());
     assert_eq!(
-        decide(&edge, &live, &bodies, same, || Some(true)),
+        decide(&edge, &live, &bodies, same, |_| Some(true)),
         OperatorRelease::Detected(sha(2))
     );
     // A fleet removal / unknown history / a pass tombstone: no sticky release.
-    assert_eq!(decide(&edge, &live, &bodies, same, || Some(false)), OperatorRelease::None);
-    assert_eq!(decide(&edge, &live, &bodies, same, || None), OperatorRelease::None);
+    assert_eq!(decide(&edge, &live, &bodies, same, |_| Some(false)), OperatorRelease::None);
+    assert_eq!(decide(&edge, &live, &bodies, same, |_| None), OperatorRelease::None);
     let mut released = bodies.clone();
     released.push(release_marker_text("seq-aaaa0000"));
     assert_eq!(
-        decide(&edge, &live, &released, same, || panic!("not read")),
+        decide(&edge, &live, &released, same, |_| panic!("not read")),
         OperatorRelease::None
     );
     // A different predecessor (e.g. a consolidation reservation) is unaffected.
     let mut other = edge.clone();
     other.after = 7;
-    assert_eq!(decide(&other, &live, &bodies, same, || Some(true)), OperatorRelease::None);
+    assert_eq!(decide(&other, &live, &bodies, same, |_| Some(true)), OperatorRelease::None);
     // A changed tree ends it.
     let changed = |a: &str, b: &str| a == b;
-    assert_eq!(decide(&edge, &live, &bodies, changed, || Some(true)), OperatorRelease::None);
+    assert_eq!(decide(&edge, &live, &bodies, changed, |_| Some(true)), OperatorRelease::None);
     // Once recorded, the record answers without a history read.
     let mut recorded = bodies.clone();
     recorded.push(record_comment_body(1, &sha(2)));
     assert_eq!(
-        decide(&edge, &live, &recorded, same, || panic!("not read")),
+        decide(&edge, &live, &recorded, same, |_| panic!("not read")),
         OperatorRelease::Recorded
     );
     assert_eq!(
-        decide(&edge, &live, &recorded, changed, || panic!("not read")),
+        decide(&edge, &live, &recorded, changed, |_| panic!("not read")),
         OperatorRelease::None,
         "the release ends when the PR's tree changes"
     );
@@ -326,7 +382,8 @@ fn tick(
 #[cfg(unix)]
 fn operator_removed(d: &std::path::Path, actor: &str) {
     let events = [
-        label_event("labeled", Some("loom-fleet-dispatch[bot]"), "2026-10-05T07:00:00Z"),
+        marker_comment(&marker_2_after_1(), "2026-10-05T07:00:00Z"),
+        label_event("labeled", Some("loom-fleet-dispatch[bot]"), "2026-10-05T07:00:01Z"),
         label_event("unlabeled", Some(actor), "2026-10-05T08:47:00Z"),
     ];
     write(d, "timeline-2.json", &serde_json::Value::Array(events.to_vec()));
@@ -384,6 +441,29 @@ fn a_fleet_removal_a_changed_tree_or_an_unknown_history_re_sequences() {
         assert!(calls.contains("pr edit 2 --add-label loom:sequenced"), "{case}:\n{calls}");
         assert!(!calls.contains("operator-released"), "{case}:\n{calls}");
     }
+}
+
+/// Judge finding on PR #10408, whole pass: an old operator removal, then a
+/// re-written marker whose `--add-label` failed (newest label event is the
+/// stale removal). The next tick heals the label instead of recording a
+/// release nobody made.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn a_stale_operator_removal_before_the_live_marker_re_sequences() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let listing = setup(d, &redated(), &["loom:pr"], 0);
+    let events = [
+        label_event("labeled", Some("loom-fleet-dispatch[bot]"), "2026-10-04T07:00:00Z"),
+        label_event("unlabeled", Some("rjwalters"), "2026-10-04T08:47:00Z"),
+        marker_comment(&marker_2_after_1(), "2026-10-05T07:00:00Z"),
+    ];
+    write(d, "timeline-2.json", &serde_json::Value::Array(events.to_vec()));
+    let (stats, calls) = tick(d, &listing);
+    assert_eq!(stats.applied, 1, "{calls}");
+    assert!(calls.contains("pr edit 2 --add-label loom:sequenced"), "{calls}");
+    assert!(!calls.contains("operator-released"), "{calls}");
 }
 
 /// Acceptance 2: a tree-identical re-date of a held PR keeps its existing

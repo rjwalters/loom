@@ -23,7 +23,7 @@ across a re-date), the pass keeps the PR's sequencing state as it is:
 
 - a held PR keeps its hold, its plan and its `pred_head`, and gets no replan
   note and no new "Landing order recorded" comment;
-- a released PR stays released.
+- a PR an operator released (see the next section) stays released.
 
 A failed or negative comparison keeps the old behavior (void and re-plan).
 `LOOM_VERDICT_TREE_CARVEOUT=0` turns the comparison off for this pass and for
@@ -40,10 +40,15 @@ content change does, and from then on the order is re-derived as usual.
 
 The release is detected only on positive evidence: the newest
 `loom:sequenced` label event on the PR is a removal, by an actor that is not
-one of the fleet's identities, and the PR's newest sequence marker has no
-release or replan note after it. A release made by the pass itself always
-writes such a note, so it keeps its existing behavior. An unreadable label
-history, an event with no actor, or a fleet actor records no sticky release.
+one of the fleet's identities, made strictly after the comment that wrote the
+PR's newest sequence marker, and that marker has no release or replan note
+after it. A release made by the pass itself always writes such a note, so it
+keeps its existing behavior. An unreadable label history, an event with no
+actor, a fleet actor, a removal older than the marker's comment (it released
+an earlier hold), or a missing timestamp records no sticky release. Fleet
+identity comes from the host's fleet login roster: a daemon acting under a
+login the roster does not list can have its own removal read as an
+operator's.
 
 The release is scoped to the (PR, predecessor) pair. An edge to a different
 predecessor, such as an ADR-0023 consolidation reservation, is unaffected.
