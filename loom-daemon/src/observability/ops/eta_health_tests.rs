@@ -1,7 +1,6 @@
 //! ETA health gauge tests (Issue #10391, slice 2).
 
 use std::collections::BTreeMap;
-use std::sync::Mutex as StdMutex;
 
 use chrono::{Duration, TimeZone, Utc};
 
@@ -11,8 +10,9 @@ use crate::eta::{Kind, NoEstimateReason, Provenance, Stage};
 use crate::observability::ops::capture::capture;
 use crate::telemetry::ops::{MetricValue, OPS_METRIC_LABEL_KEYS};
 
-/// The health state is process-global: tests that touch it run one at a time.
-static SERIAL: StdMutex<()> = StdMutex::new(());
+// Every test builds its own `EtaHealth` and hands it to `export`: the
+// process-global is written by other modules' tests (via `note_fit_check`
+// and friends), so reading it here would race them.
 
 fn now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap()
@@ -157,18 +157,16 @@ fn unknown_is_not_zero() {
 
 #[test]
 fn stand_down_host_keeps_its_gate_and_a_growing_age() {
-    let _guard = SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reset();
+    let mut health = EtaHealth::default();
     let dir = tempfile::tempdir().unwrap();
     // A refreshing tick first, then stand-down ticks: the repo counts of the
     // last refreshing tick survive; the gate and the age follow the stand-down.
-    note_tick(&tick("captain", now() - Duration::hours(3), &[("complete", 1)]));
+    health.tick(&tick("captain", now() - Duration::hours(3), &[("complete", 1)]));
     let started = now() - Duration::hours(1);
-    note_tick(&tick("stand_down", started, &[]));
-    let (_, early) = capture(|| export(dir.path(), "test-host", now()));
-    let (_, late) = capture(|| export(dir.path(), "test-host", now() + Duration::hours(2)));
+    health.tick(&tick("stand_down", started, &[]));
+    let (_, early) = capture(|| export(dir.path(), "test-host", now(), &mut health));
+    let (_, late) =
+        capture(|| export(dir.path(), "test-host", now() + Duration::hours(2), &mut health));
     let at =
         |c: &crate::observability::ops::capture::Captured, n| value(find(&c.metrics, n, None)[0]);
     let gate =
@@ -179,19 +177,15 @@ fn stand_down_host_keeps_its_gate_and_a_growing_age() {
     let repos =
         find(&late.metrics, MetricName::EtaHealthRefreshRepos, Some(("reason", "complete")));
     assert_eq!(value(repos[0]), 1);
-    reset();
 }
 
 #[test]
 fn a_host_whose_refresh_never_ticked_emits_the_gate_but_no_age() {
-    let _guard = SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reset();
+    let mut health = EtaHealth::default();
     // Fleet refresh is enabled by default and no captain is declared in an
     // empty workspace: the gate is `no_captain`, and there is no tick to age.
     let dir = tempfile::tempdir().unwrap();
-    let (_, c) = capture(|| export(dir.path(), "test-host", now()));
+    let (_, c) = capture(|| export(dir.path(), "test-host", now(), &mut health));
     let gate = find(&c.metrics, MetricName::EtaHealthRefreshGate, None);
     assert_eq!(gate.len(), 1);
     assert_eq!(gate[0].labels.get("state").map(String::as_str), Some("no_captain"));
@@ -201,12 +195,9 @@ fn a_host_whose_refresh_never_ticked_emits_the_gate_but_no_age() {
 
 #[test]
 fn no_coefficient_file_means_fit_not_loaded_and_no_fit_age() {
-    let _guard = SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reset();
+    let mut health = EtaHealth::default();
     let dir = tempfile::tempdir().unwrap();
-    let (_, c) = capture(|| export(dir.path(), "test-host", now()));
+    let (_, c) = capture(|| export(dir.path(), "test-host", now(), &mut health));
     assert_eq!(value(find(&c.metrics, MetricName::EtaHealthFitLoaded, None)[0]), 0);
     assert!(find(&c.metrics, MetricName::EtaHealthFitAgeSeconds, None).is_empty());
     assert!(find(&c.metrics, MetricName::EtaHealthFitCheckAgeSeconds, None).is_empty());
@@ -215,10 +206,7 @@ fn no_coefficient_file_means_fit_not_loaded_and_no_fit_age() {
 
 #[test]
 fn fit_check_and_snapshot_notes_surface_and_cached_snapshots_age() {
-    let _guard = SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    reset();
+    let mut health = EtaHealth::default();
     let dir = tempfile::tempdir().unwrap();
     let mut snap = crate::eta::fleet::FleetSnapshot::empty("rjwalters/loom");
     snap.as_of = now() - Duration::minutes(90);
@@ -227,12 +215,14 @@ fn fit_check_and_snapshot_notes_surface_and_cached_snapshots_age() {
         &snap,
     )
     .unwrap();
-    note_fit_check(now() - Duration::minutes(20), "no_snapshots");
-    note_snapshot(4, 1);
+    health.fit_check(now() - Duration::minutes(20), "no_snapshots");
+    health.snapshot(4, 1);
     let (_, c) = capture(|| {
-        export(dir.path(), "test-host", now());
-        export(dir.path(), "test-host", now()); // second pass reuses the mtime cache
+        export(dir.path(), "test-host", now(), &mut health);
+        // The second pass reuses the mtime cache.
+        export(dir.path(), "test-host", now(), &mut health);
     });
+    assert_eq!(health.ages.len(), 1);
     let ages = find(
         &c.metrics,
         MetricName::EtaHealthSnapshotAgeSeconds,
@@ -247,5 +237,4 @@ fn fit_check_and_snapshot_notes_surface_and_cached_snapshots_age() {
     );
     assert_eq!(value(check[0]), 1200);
     assert_eq!(value(find(&c.metrics, MetricName::EtaHealthSnapshotAlternatesRows, None)[0]), 1);
-    reset();
 }

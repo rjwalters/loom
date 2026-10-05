@@ -13,6 +13,9 @@
 //! plus `repo` on the per-snapshot age. Never an issue number, sha or path.
 //!
 //! [`points`] is pure over [`Facts`]; [`record`] gathers the facts and emits.
+//! The gather/export path takes the health state as a parameter: production
+//! hands it a snapshot of the one global, tests build their own and never
+//! touch the global (other modules' tests write it through the `note_*` seams).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,7 +30,7 @@ use crate::telemetry::ops::{MetricName, MetricPoint};
 /// What the long-running tasks last reported. Updated by the refresh task
 /// ([`note_tick`]), the fit check ([`note_fit_check`]) and the snapshot
 /// builder ([`note_snapshot`]); read by [`record`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct EtaHealth {
     /// The last refresh tick: when it started and its gate state.
     tick: Option<(DateTime<Utc>, String)>,
@@ -50,25 +53,41 @@ fn with<T>(f: impl FnOnce(&mut EtaHealth) -> T) -> T {
     f(guard.get_or_insert_with(EtaHealth::default))
 }
 
-/// Record a refresh tick (stand-down ticks included). The per-reason repo
-/// counts are kept from the last tick that actually refreshed.
-pub fn note_tick(state: &crate::eta::health::RefreshCycleState) {
-    with(|h| {
-        h.tick = Some((state.started_at, state.gate.clone()));
+impl EtaHealth {
+    /// Record a refresh tick (stand-down ticks included). The per-reason repo
+    /// counts are kept from the last tick that actually refreshed.
+    pub fn tick(&mut self, state: &crate::eta::health::RefreshCycleState) {
+        self.tick = Some((state.started_at, state.gate.clone()));
         if state.gate != "stand_down" {
-            h.refresh_repos = state.stop_reasons.clone();
+            self.refresh_repos = state.stop_reasons.clone();
         }
-    });
+    }
+
+    /// Record a fit check: its start and its outcome (or skip reason).
+    pub fn fit_check(&mut self, started_at: DateTime<Utc>, reason: &str) {
+        self.fit_check = Some((started_at, reason.to_string()));
+    }
+
+    /// Record the last built `eta.snapshot`: its rows and those with alternates.
+    pub fn snapshot(&mut self, rows: u64, alternates_rows: u64) {
+        self.snapshot_rows = Some((rows, alternates_rows));
+    }
 }
 
-/// Record a fit check: its start and its outcome (or skip reason).
+/// Record a refresh tick in the global state ([`EtaHealth::tick`]).
+pub fn note_tick(state: &crate::eta::health::RefreshCycleState) {
+    with(|h| h.tick(state));
+}
+
+/// Record a fit check in the global state ([`EtaHealth::fit_check`]).
 pub fn note_fit_check(started_at: DateTime<Utc>, reason: &str) {
-    with(|h| h.fit_check = Some((started_at, reason.to_string())));
+    with(|h| h.fit_check(started_at, reason));
 }
 
-/// Record the last built `eta.snapshot`: its rows and those with alternates.
+/// Record the last built `eta.snapshot` in the global state
+/// ([`EtaHealth::snapshot`]).
 pub fn note_snapshot(rows: u64, alternates_rows: u64) {
-    with(|h| h.snapshot_rows = Some((rows, alternates_rows)));
+    with(|h| h.snapshot(rows, alternates_rows));
 }
 
 /// Live items per `(kind, heuristic, reason)`: the newest estimate per
@@ -206,14 +225,17 @@ fn snapshot_ages(
         .collect()
 }
 
-/// Gather the facts for `root` as of `now`. Blocking (file reads).
-fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
+/// Gather the facts for `root` as of `now` from `health` (whose snapshot
+/// `as_of` cache this pass refreshes). Blocking (file reads).
+fn gather(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth) -> Facts {
     let eta = crate::eta::config::read(root);
-    let mut cache = with(|h| std::mem::take(&mut h.ages));
-    let snapshots = snapshot_ages(root, &mut cache);
-    with(|h| h.ages = cache);
-    let (tick, repos, fit_check, snapshot_rows) =
-        with(|h| (h.tick.clone(), h.refresh_repos.clone(), h.fit_check.clone(), h.snapshot_rows));
+    let snapshots = snapshot_ages(root, &mut health.ages);
+    let (tick, repos, fit_check, snapshot_rows) = (
+        health.tick.clone(),
+        health.refresh_repos.clone(),
+        health.fit_check.clone(),
+        health.snapshot_rows,
+    );
     // Before the first tick the gate is what the read-only resolver says it
     // would be (it never arms the singleton job), or `disabled` when the
     // task does not run at all.
@@ -240,10 +262,23 @@ fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
     }
 }
 
-/// Gather the facts and emit the gauges through the global path (so a test
-/// can [`super::capture::capture`] them). Blocking (file reads).
-fn export(root: &Path, host_id: &str, now: DateTime<Utc>) {
-    super::emit_metrics(points(&gather(root, host_id, now)));
+/// Gather the facts from `health` and emit the gauges through the global
+/// path (so a test can [`super::capture::capture`] them). Blocking (file reads).
+fn export(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth) {
+    super::emit_metrics(points(&gather(root, host_id, now, health)));
+}
+
+/// One collector pass over the global state: snapshot it (taking the `as_of`
+/// cache rather than cloning it), export outside the lock, then hand the
+/// refreshed cache back. A writer landing mid-pass is kept; only the cache
+/// slot is replaced.
+fn export_global(root: &Path, host_id: &str, now: DateTime<Utc>) {
+    let mut health = with(|h| {
+        let ages = std::mem::take(&mut h.ages);
+        EtaHealth { ages, ..h.clone() }
+    });
+    export(root, host_id, now, &mut health);
+    with(|h| h.ages = health.ages);
 }
 
 /// Gather and export the gauges, when an ops sink is registered.
@@ -254,13 +289,7 @@ pub async fn record(root: &Path) {
     // The same identity the refresh tick's captain gate resolves against, so
     // the pre-first-tick gate matches what the first tick will report.
     let (root, host_id) = (root.to_path_buf(), crate::sweep_registry::host_identity());
-    let _ = tokio::task::spawn_blocking(move || export(&root, &host_id, Utc::now())).await;
-}
-
-/// Forget everything the tasks reported (tests share the process-global).
-#[cfg(test)]
-fn reset() {
-    with(|h| *h = EtaHealth::default());
+    let _ = tokio::task::spawn_blocking(move || export_global(&root, &host_id, Utc::now())).await;
 }
 
 #[cfg(test)]
