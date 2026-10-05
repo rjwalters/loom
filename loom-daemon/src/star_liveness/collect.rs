@@ -132,6 +132,9 @@ pub struct Evaluated {
     pub inherited_level: u8,
     /// That level's inherited label, from the table the walk used.
     pub inherited_label: Option<&'static str>,
+    /// The level source's starred-at, when [`Self::level_inherited_from`]
+    /// is set: a row promoted to that level sorts by it (#10307).
+    pub level_requested_at: Option<String>,
 }
 
 impl Evaluated {
@@ -607,6 +610,7 @@ impl<'a> Evaluator<'a> {
             item: work_item(issue),
             level_inherited_from: None,
             inherited_level: 0,
+            level_requested_at: None,
             inherited_label: None,
         }
     }
@@ -833,6 +837,7 @@ pub fn unmanaged(slug: &str, number: u32, starred_at: Option<String>) -> Evaluat
         item: WorkItem::new(number, Vec::new()),
         level_inherited_from: None,
         inherited_level: 0,
+        level_requested_at: None,
         inherited_label: None,
     }
 }

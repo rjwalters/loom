@@ -52,7 +52,9 @@ pub struct World(pub Rc<RefCell<BTreeMap<String, Repo>>>);
 
 impl World {
     pub fn repo(&self, slug: &str) -> std::cell::RefMut<'_, Repo> {
-        std::cell::RefMut::map(self.0.borrow_mut(), |m| m.entry(slug.to_string()).or_default())
+        std::cell::RefMut::map(self.0.borrow_mut(), |m| {
+            m.entry(slug.to_ascii_lowercase()).or_default()
+        })
     }
 
     pub fn add(&self, slug: &str, item: RestIssue) {

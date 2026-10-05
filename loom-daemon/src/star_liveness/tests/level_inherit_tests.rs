@@ -8,8 +8,9 @@ use std::path::Path;
 use super::fake::{issue, issue_with_body, pr, repo_input, settings, t, Host, World, STAR};
 use crate::operator_levels::{PriorityLevel, LEVELS};
 use crate::star_liveness::levels::{self, Key};
+use crate::star_liveness::task::order_rows;
 use crate::star_liveness::{inherit, render, Settings};
-use crate::types::{AskKind, LandingStage};
+use crate::types::{AskKind, LandingStage, StarLandingRow};
 
 const HIGH: &str = "loom:operator-high-priority";
 const INH: &str = "loom:high-priority-inherited";
@@ -29,7 +30,7 @@ fn provenance(world: &World, slug: &str, n: u32) -> Vec<String> {
         "no provenance comment"
     );
     let body = world.repo(slug).items[&n].body.clone().unwrap_or_default();
-    levels::body_markers(&body)
+    levels::body_markers(&body, &(slug.to_string(), n))
         .into_iter()
         .map(|m| m.text)
         .collect()
@@ -565,42 +566,163 @@ fn provenance_is_written_to_the_body_first_replaced_in_place_and_removed_with_th
     assert_eq!(body(&world, slug, 2), original);
 }
 
+fn own_marker(item: &levels::Key, from: &levels::Key, level: u8, at: &str) -> String {
+    format!(
+        "<!-- loom:priority-inherited inherited_from={}#{} level={level} requested_at={at} id={} -->",
+        from.0,
+        from.1,
+        levels::provenance_id(level, item, from)
+    )
+}
+
 #[test]
 fn with_marker_replaces_appends_and_removes_without_touching_the_rest() {
-    let m1 = "<!-- loom:priority-inherited inherited_from=o/a#1 level=2 id=x -->";
-    let m2 = "<!-- loom:priority-inherited inherited_from=o/a#9 level=2 id=y -->";
-    let other = "<!-- loom:priority-inherited level=3 inherited_from=#5 -->";
-    assert_eq!(levels::with_marker("", 2, Some(m1)), m1);
+    let item: levels::Key = ("o/b".to_string(), 7);
+    let a1: levels::Key = ("o/a".to_string(), 1);
+    let a9: levels::Key = ("o/a".to_string(), 9);
+    let m1 = own_marker(&item, &a1, 2, "2026-10-01T00:00:00Z");
+    let m2 = own_marker(&item, &a9, 2, "2026-10-01T00:00:00Z");
+    let other = "<!-- loom:priority-inherited level=3 inherited_from=#5 id=hp3-7-from-o\
+                 .b.5 -->";
+    let other = other
+        .replace("hp3-7-from-o.b.5", &levels::provenance_id(3, &item, &("o/b".to_string(), 5)));
+    assert_eq!(levels::with_marker("", &item, 2, Some(&m1)), m1);
     let body = "Text.\n";
-    let added = levels::with_marker(body, 2, Some(m1));
+    let added = levels::with_marker(body, &item, 2, Some(&m1));
     assert_eq!(added, format!("Text.\n\n\n{m1}"));
-    assert_eq!(levels::with_marker(&added, 2, None), body, "removal takes its blank line");
+    assert_eq!(
+        levels::with_marker(&added, &item, 2, None),
+        body,
+        "removal takes its blank line"
+    );
     let mid = format!("A {m1} B {other} C {m1}");
     assert_eq!(
-        levels::with_marker(&mid, 2, Some(m2)),
+        levels::with_marker(&mid, &item, 2, Some(&m2)),
         format!("A {m2} B {other} C "),
         "first replaced in place, duplicate dropped, other level kept"
     );
-    assert_eq!(levels::with_marker(body, 2, None), body);
-    let parsed = levels::marker_for(&mid, 3).unwrap();
+    assert_eq!(levels::with_marker(body, &item, 2, None), body);
+    let parsed = levels::marker_for(&mid, &item, 3).unwrap();
     assert_eq!(parsed.inherited_from.as_deref(), Some("#5"));
     assert_eq!(parsed.source_repo(), None, "a bare #N is the item's own repo");
 }
 
 #[test]
+fn a_quoted_or_foreign_marker_is_human_text_not_the_daemons() {
+    let item: levels::Key = ("o/b".to_string(), 7);
+    let src: levels::Key = ("o/a".to_string(), 1);
+    let quoted =
+        "The daemon writes `<!-- loom:priority-inherited inherited_from=#5 level=2 -->` here.";
+    assert!(levels::body_markers(quoted, &item).is_empty(), "no id: human text");
+    assert_eq!(levels::with_marker(quoted, &item, 2, None), quoted, "never deleted");
+    let appended = levels::with_marker(quoted, &item, 2, Some(&own_marker(&item, &src, 2, "t")));
+    assert!(appended.starts_with(quoted), "the example is kept and the real marker appended");
+    let for_other = own_marker(&("o/b".to_string(), 8), &src, 2, "t");
+    assert!(levels::body_markers(&for_other, &item).is_empty(), "minted for another item");
+    assert_eq!(levels::body_markers(&appended, &item).len(), 1);
+}
+
+#[test]
 fn the_work_finder_orders_an_inherited_blocker_at_its_markers_requested_at() {
     let table = LEVELS;
-    let body = "x\n\n<!-- loom:priority-inherited inherited_from=o/a#1 level=2 \
-                requested_at=2026-10-01T00:00:00Z id=z -->";
+    let item: levels::Key = ("o/b".to_string(), 7);
+    let body =
+        format!("x\n\n{}", own_marker(&item, &("o/a".to_string(), 1), 2, "2026-10-01T00:00:00Z"));
+    let body = body.as_str();
     let labels = |ls: &[&str]| ls.iter().map(|l| (*l).to_string()).collect::<Vec<_>>();
     assert_eq!(
-        levels::inherited_requested_at(table, &labels(&[INH]), Some(body)).as_deref(),
+        levels::inherited_requested_at(table, &item, &labels(&[INH]), Some(body)).as_deref(),
         Some("2026-10-01T00:00:00Z")
     );
     assert_eq!(
-        levels::inherited_requested_at(table, &labels(&[INH, HIGH]), Some(body)),
+        levels::inherited_requested_at(table, &item, &labels(&[INH, HIGH]), Some(body)),
         None,
         "its own level 2 orders it by its own time"
     );
-    assert_eq!(levels::inherited_requested_at(table, &labels(&[STAR]), Some(body)), None);
+    assert_eq!(levels::inherited_requested_at(table, &item, &labels(&[STAR]), Some(body)), None);
+}
+
+/// Judge A: two hosts that spell the source repo differently must not
+/// rewrite the body marker back and forth.
+#[test]
+fn hosts_spelling_a_source_repo_differently_do_not_rewrite_the_marker() {
+    let world = World::default();
+    world.add("o/app", issue_with_body(1, &[HIGH, "loom:blocked"], "Depends on o/lib#3\n"));
+    world.add("o/lib", issue(3, &["loom:issue"]));
+    let a_repos = vec![repo_input("o/app"), repo_input("o/lib")];
+    let b_repos = vec![repo_input("O/App"), repo_input("o/lib")];
+    let mut a = Host::new("host-a");
+    let mut b = Host::new("host-b");
+    a.pass(&world, &a_repos, Vec::new(), t(20, 0));
+    let writes = |w: &World| {
+        let lib = w.repo("o/lib");
+        (lib.label_writes.len(), lib.body_writes.len())
+    };
+    let before = writes(&world);
+    for m in 1..=4 {
+        b.pass(&world, &b_repos, Vec::new(), t(20, m));
+        a.pass(&world, &a_repos, Vec::new(), t(20, m));
+    }
+    assert_eq!(writes(&world), before, "no body or label write after the first pass");
+}
+
+fn landing_row(issue: u32, level: u8, at: &str, inherited_from: Option<u32>) -> StarLandingRow {
+    StarLandingRow {
+        repo: "o/r".to_string(),
+        issue,
+        stage: LandingStage::Ready,
+        next_actor: "builder".to_string(),
+        stage_since: None,
+        time_in_stage_secs: 0,
+        pr: None,
+        blocked_by: None,
+        no_capacity: None,
+        capacity_wait: None,
+        ask: None,
+        inherited_from,
+        operator_priority_at: Some(at.to_string()),
+        last_progress_at: None,
+        level,
+        level_inherited_from: None,
+    }
+}
+
+/// Fleet-Judge P2: level is the primary key for every row. A plain-star
+/// child nests under its parent only at the parent's level.
+#[test]
+fn level_is_the_primary_digest_key_for_children_too() {
+    // #1 level 2 with a containment-only (level 1) child #2; unrelated #3
+    // level 2 starred later; plain-star #4.
+    let rows = vec![
+        landing_row(4, 1, "2026-01-01", None),
+        landing_row(2, 1, "2026-02-01", Some(1)),
+        landing_row(3, 2, "2026-03-01", None),
+        landing_row(1, 2, "2026-02-01", None),
+    ];
+    let order: Vec<u32> = order_rows(rows).iter().map(|r| r.issue).collect();
+    assert_eq!(order, vec![1, 3, 4, 2], "level 2 rows first, then level 1 by starred-at");
+    // A child at its parent's level still nests directly under it.
+    let rows = vec![
+        landing_row(1, 2, "2026-02-01", None),
+        landing_row(3, 2, "2026-03-01", None),
+        landing_row(2, 2, "2026-04-01", Some(1)),
+    ];
+    let order: Vec<u32> = order_rows(rows).iter().map(|r| r.issue).collect();
+    assert_eq!(order, vec![1, 2, 3]);
+}
+
+/// Fleet-Judge P2, converse: a level-promoted blocker of an older plain-star
+/// parent sorts by its level source's starred-at, not the parent's.
+#[test]
+fn a_level_promoted_row_takes_its_level_sources_starred_at() {
+    let world = World::default();
+    let slug = "o/pr";
+    world.add(slug, issue(1, &[STAR, "loom:issue"]));
+    world.add(slug, issue_with_body(5, &[HIGH, "loom:blocked"], "Blocked by #2\n"));
+    world.add(slug, issue(2, &["loom:issue"]));
+    let r = Host::new("h").pass(&world, &[repo_input(slug)], Vec::new(), t(20, 0));
+    let promoted = r.rows.iter().find(|r| r.issue == 2).unwrap();
+    let source = r.rows.iter().find(|r| r.issue == 5).unwrap();
+    assert_eq!(promoted.level, 2);
+    assert_eq!(promoted.operator_priority_at, source.operator_priority_at);
 }

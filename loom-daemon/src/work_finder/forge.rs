@@ -128,8 +128,10 @@ impl WorkSource for GhWorkSource {
         // already returned the body).
         let table = crate::operator_levels::table();
         for item in &mut items {
+            let item_key = (self.repo.clone().unwrap_or_default(), item.number);
             if let Some(at) = crate::star_liveness::levels::inherited_requested_at(
                 table,
+                &item_key,
                 &item.labels,
                 item.body.as_deref(),
             ) {

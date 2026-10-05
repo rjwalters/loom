@@ -329,9 +329,8 @@ impl LivenessState {
                 capacity_wait: e.landing.capacity_wait.clone(),
                 ask,
                 inherited_from: e.inherited_from,
-                operator_priority_at: e
-                    .starred_at
-                    .clone()
+                operator_priority_at: promoted_at(&e)
+                    .or_else(|| e.starred_at.clone())
                     .or_else(|| e.facts.issue.created_at.clone()),
                 last_progress_at: Some(progress_at),
                 level: e.level(),
@@ -380,7 +379,14 @@ impl LivenessState {
             .map(|(_, e)| (key(e), e.landing.inherits.clone()))
             .collect();
         let starred_at: HashMap<levels::Key, Option<String>> = managed_rows()
-            .map(|(_, e)| (key(e), e.starred_at.clone()))
+            // The time the source's own row sorts by, so a promoted blocker
+            // sorts exactly where its source does.
+            .map(|(_, e)| {
+                (
+                    key(e),
+                    e.starred_at.clone().or_else(|| e.facts.issue.created_at.clone()),
+                )
+            })
             .collect();
         let refs: Vec<levels::RepoRef> = repos
             .iter()
@@ -404,6 +410,7 @@ impl LivenessState {
                 e.level_inherited_from = row.level_inherited_from;
                 e.inherited_level = row.inherited_level;
                 e.inherited_label = row.inherited_label;
+                e.level_requested_at = row.level_requested_at;
             } else {
                 let root = repos.iter().find(|r| r.slug == k.0).map(|r| r.root.clone());
                 evaluated.push((root, row));
@@ -518,14 +525,31 @@ impl LivenessState {
     }
 }
 
+/// The starred-at a row promoted to a level by `e`'s level source sorts by:
+/// the source's, not the plain star it also inherits.
+fn promoted_at(e: &Evaluated) -> Option<String> {
+    (e.level_inherited_from.is_some() && e.inherited_level > e.item.operator_level())
+        .then(|| e.level_requested_at.clone())
+        .flatten()
+}
+
 /// Starred rows by level (highest first, #10307), then starred-at (then
 /// repo, issue); each inheriting blocker right after the issue it inherits
 /// from. A blocker that inherits a level and needs the operator
 /// (`loom:operator-only` / `loom:operator-decision`) leads the digest:
 /// often what blocks the operator's top issue is the operator.
 pub(crate) fn order_rows(rows: Vec<StarLandingRow>) -> Vec<StarLandingRow> {
-    let (mut roots, children): (Vec<_>, Vec<_>) =
-        rows.into_iter().partition(|r| r.inherited_from.is_none());
+    // Level is the primary key for every row: a child nests under the issue
+    // it inherits the plain star from only at that parent's level, else it
+    // is a root of its own level.
+    let levels: HashMap<(String, u32), u8> = rows
+        .iter()
+        .map(|r| ((r.repo.clone(), r.issue), r.level))
+        .collect();
+    let (children, mut roots): (Vec<_>, Vec<_>) = rows.into_iter().partition(|r| {
+        r.inherited_from
+            .is_some_and(|p| levels.get(&(r.repo.clone(), p)) == Some(&r.level))
+    });
     roots.sort_by(|a, b| {
         (std::cmp::Reverse(a.level), &a.operator_priority_at, &a.repo, a.issue).cmp(&(
             std::cmp::Reverse(b.level),

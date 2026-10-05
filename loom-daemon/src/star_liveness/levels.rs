@@ -291,6 +291,7 @@ pub struct BodyMarker {
     /// `owner/repo#N`, or a bare `#N` meaning the item's own repo.
     pub inherited_from: Option<String>,
     pub requested_at: Option<String>,
+    pub id: Option<String>,
 }
 
 impl BodyMarker {
@@ -301,12 +302,38 @@ impl BodyMarker {
         let (repo, _) = from.split_once('#')?;
         (!repo.is_empty()).then_some(repo)
     }
+
+    /// Whether the daemon wrote this marker for `item`: its `id=` is the
+    /// one [`provenance_id`] derives from the marker's own level and source.
+    fn is_own(&self, item: &Key) -> bool {
+        let (Some(level), Some(from), Some(id)) =
+            (self.level, self.inherited_from.as_deref(), self.id.as_deref())
+        else {
+            return false;
+        };
+        let Some((repo, n)) = from.split_once('#') else {
+            return false;
+        };
+        let Ok(n) = n.parse::<u32>() else {
+            return false;
+        };
+        let repo = if repo.is_empty() {
+            item.0.as_str()
+        } else {
+            repo
+        };
+        provenance_id(level, item, &(repo.to_string(), n)) == id
+    }
 }
 
-/// Every provenance marker in `body`, in order. Any HTML comment that
-/// carries [`PROVENANCE_TOKEN`] counts; its fields may come in any order.
+/// Every provenance marker in `body` that is the daemon's own for `item`, in
+/// order. Any HTML comment that carries [`PROVENANCE_TOKEN`] with an `id=`
+/// equal to the [`provenance_id`] recomputed from its own `level=`,
+/// `inherited_from=` and the item's number counts; its fields may come in any
+/// order. Anything else (a marker quoted in prose, hand-written, or minted
+/// for another item) is human text: never replaced, deleted or obeyed.
 #[must_use]
-pub fn body_markers(body: &str) -> Vec<BodyMarker> {
+pub fn body_markers(body: &str, item: &Key) -> Vec<BodyMarker> {
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(i) = body[from..].find("<!--") {
@@ -322,13 +349,17 @@ pub fn body_markers(body: &str) -> Vec<BodyMarker> {
                     .find_map(|w| w.strip_prefix(key))
                     .map(str::to_string)
             };
-            out.push(BodyMarker {
+            let marker = BodyMarker {
                 range: start..end,
                 text: text.to_string(),
                 level: field("level=").and_then(|l| l.parse().ok()),
                 inherited_from: field("inherited_from="),
                 requested_at: field("requested_at="),
-            });
+                id: field("id=").map(|i| i.trim_end_matches("-->").to_string()),
+            };
+            if marker.is_own(item) {
+                out.push(marker);
+            }
         }
         from = end;
     }
@@ -337,8 +368,8 @@ pub fn body_markers(body: &str) -> Vec<BodyMarker> {
 
 /// The provenance marker for `level` in `body`, when there is one.
 #[must_use]
-pub fn marker_for(body: &str, level: u8) -> Option<BodyMarker> {
-    body_markers(body)
+pub fn marker_for(body: &str, item: &Key, level: u8) -> Option<BodyMarker> {
+    body_markers(body, item)
         .into_iter()
         .find(|m| m.level == Some(level))
 }
@@ -349,8 +380,8 @@ pub fn marker_for(body: &str, level: u8) -> Option<BodyMarker> {
 /// other byte is kept, and removing an appended marker takes its blank line
 /// with it.
 #[must_use]
-pub fn with_marker(body: &str, level: u8, marker: Option<&str>) -> String {
-    let mine: Vec<std::ops::Range<usize>> = body_markers(body)
+pub fn with_marker(body: &str, item: &Key, level: u8, marker: Option<&str>) -> String {
+    let mine: Vec<std::ops::Range<usize>> = body_markers(body, item)
         .into_iter()
         .filter(|m| m.level == Some(level))
         .map(|m| m.range)
@@ -387,6 +418,7 @@ pub fn with_marker(body: &str, level: u8, marker: Option<&str>) -> String {
 #[must_use]
 pub fn inherited_requested_at(
     table: &[PriorityLevel],
+    item: &Key,
     labels: &[String],
     body: Option<&str>,
 ) -> Option<String> {
@@ -394,7 +426,7 @@ pub fn inherited_requested_at(
     if level == 0 || operator_levels::own_level_in(table, labels) >= level {
         return None;
     }
-    marker_for(body?, level)?.requested_at
+    marker_for(body?, item, level)?.requested_at
 }
 
 /// One write the pass makes.
@@ -460,10 +492,11 @@ pub fn plan_writes(
         else {
             continue;
         };
-        let existing = marker_for(reach.issue.body.as_deref().unwrap_or_default(), reach.level);
+        let existing =
+            marker_for(reach.issue.body.as_deref().unwrap_or_default(), &reach.key, reach.level);
         let stale = existing
             .as_ref()
-            .is_none_or(|m| m.text != provenance_marker(reach));
+            .is_none_or(|m| !m.text.eq_ignore_ascii_case(&provenance_marker(reach)));
         let provenance = stale && may_override(existing.as_ref(), managed);
         if !has(&reach.issue, label) {
             writes.push(Write::Add {
@@ -502,7 +535,7 @@ pub fn plan_writes(
                 level_of(&issue) >= row.level || kept.contains(&(issue, h.label))
             })
         } else {
-            let marker = marker_for(h.item.body.as_deref().unwrap_or_default(), row.level);
+            let marker = marker_for(h.item.body.as_deref().unwrap_or_default(), &h.key, row.level);
             closure
                 .reached
                 .get(&h.key)
@@ -898,7 +931,7 @@ fn set_marker(
         .ok_or_else(|| anyhow::anyhow!("{} is gone", display(key)))?
         .body
         .unwrap_or_default();
-    let next = with_marker(&current, level, marker);
+    let next = with_marker(&current, key, level, marker);
     if next != current {
         forge.set_body(key.1, &next)?;
     }
@@ -971,5 +1004,6 @@ fn row_for(
         level_inherited_from: Some(display(&reach.source)),
         inherited_level: reach.level,
         inherited_label: operator_levels::row(table, reach.level).and_then(|r| r.inherited_label),
+        level_requested_at: reach.requested_at.clone(),
     }
 }

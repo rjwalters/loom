@@ -19,8 +19,8 @@
 //!    open same-repo blocker → `blocked-by` (every open same-repo blocker
 //!    inherits the star); only a
 //!    cross-repo blocker → `needs-operator(blocked-cross-repo)` (stars are not
-//!    inherited across repos, so nothing else would move it), except at level
-//!    >= 2 into a managed repo → `blocked-by` (#10307: the blocker inherits
+//!    inherited across repos, so nothing else would move it), except, at level 2
+//!    or above, into a managed repo → `blocked-by` (#10307: the blocker inherits
 //!    the level there); otherwise the
 //!    block is stale (#10151) → `stale-block`, which the pass resolves itself
 //!    ([`StaleAction`]): every cited blocker closed → unblock; none cited →
