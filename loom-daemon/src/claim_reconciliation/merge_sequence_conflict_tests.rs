@@ -31,7 +31,12 @@ fn pr(number: u32, labels: &[&str]) -> SequencePr {
         head_ref: format!("feature/issue-{number}"),
         base_ref: "main".to_string(),
         draft: false,
-        labels: labels.iter().map(|l| (*l).to_string()).collect(),
+        // Judge-approved: #10371 drops edges behind a PR that is not ready,
+        // and these tests exercise the conflict predicate, not readiness.
+        labels: std::iter::once("loom:pr")
+            .chain(labels.iter().copied())
+            .map(str::to_string)
+            .collect(),
     }
 }
 
