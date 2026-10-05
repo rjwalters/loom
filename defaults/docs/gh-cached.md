@@ -226,7 +226,7 @@ current and costs no primary quota, so it is **never stale** and the
 gating carve-outs above stay correct. There is deliberately no identical-call
 TTL in the front; the TTL stays opt-in via `gh-cached`. Everything else
 (mutations, `api`, `run`, `pr diff|checks`, `repo view`, unknown or
-ambiguous argv, a TTY on stdout, non-github.com hosts) execs the next `gh`
+ambiguous argv, a TTY on stdout, hosts other than GitHub) execs the next `gh`
 with argv, streams and exit status untouched. The next `gh` is `LOOM_GH_BIN`,
 else the next `gh` on `PATH` (the managed launcher, #9987, when installed), so
 its policy and telemetry are composed with, not replaced. Any cache error
@@ -237,7 +237,7 @@ degrades to that real `gh`.
 - **Opt out of the shim**: `LOOM_GH_SHIM=0` at worker spawn.
 - **Reader App**: reads route to a configured reader App through
   `forge_etag_store::fetch_conditional` (#9537); with none configured nothing
-  changes. Passthrough reads are covered by 2AMLogic/2am#2263.
+  changes. Passthrough reads are tracked as follow-up work.
 - **Telemetry**: served reads are recorded under caller `agent_gh_front` in
   `forge_call_stats`; set `GH_CACHE_OUTCOME_LOG` for `x-loom-cache`
   `revalidated`/`bypass` records. Measure the 304 share, not process counts.
