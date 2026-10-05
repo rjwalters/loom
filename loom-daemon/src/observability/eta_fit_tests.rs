@@ -50,6 +50,7 @@ fn record(check: &FitCheck) -> EtaFitRecord {
 fn every_outcome_maps_to_the_closed_vocabulary() {
     let stale = FitSkip::StaleBeforeGrace {
         oldest_as_of: at(4, 20),
+        newest_as_of: at(4, 22),
         grace_at: at(5, 6),
         snapshots: 3,
     };
@@ -96,10 +97,12 @@ fn every_outcome_maps_to_the_closed_vocabulary() {
     assert_eq!(none.snapshot_oldest_as_of, None, "absent is never zero");
     let stale = record(&FitCheck::Skipped(FitSkip::StaleBeforeGrace {
         oldest_as_of: at(4, 20),
+        newest_as_of: at(4, 22),
         grace_at: at(5, 6),
         snapshots: 3,
     }));
     assert_eq!((stale.snapshots, stale.snapshot_oldest_as_of), (3, Some(at(4, 20))));
+    assert_eq!(stale.snapshot_newest_as_of, Some(at(4, 22)), "stale record is self-describing");
 }
 
 #[test]

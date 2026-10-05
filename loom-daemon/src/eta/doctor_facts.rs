@@ -3,6 +3,17 @@
 //! files and snapshots and nothing else. It never makes a forge call, never
 //! spawns a process of its own, never arms the captain's singleton job and
 //! never creates or alters a file (a source test pins this).
+//!
+//! It does spawn one local process indirectly: resolving each repo's identity
+//! goes through `forge_etag_store::remote_identity`, which runs the read-only
+//! `git remote get-url origin`. That is why the source test says "of its own";
+//! do not tighten it to forbid the transitive `git` read.
+//!
+//! Reader Apps are resolved against this `root` directly
+//! ([`crate::forge_identity::read_credential_in`]), never through
+//! `forge_identity::read_credential`: that one needs the workspace root the
+//! daemon registers at startup, which a CLI subcommand never has, so it would
+//! report `no_reader` for every repo.
 
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
@@ -46,16 +57,17 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
         root,
         &[],
         |r| crate::forge_etag_store::remote_identity(r),
-        |repo, host| {
-            crate::forge_identity::read_credential(repo, host)
-                .map(|(dir, app_id)| crate::eta::fleet_fetch::Reader { app_id, dir })
-        },
+        |repo, host| reader_in(root, repo, host),
     );
     let repos = targets
         .iter()
         .map(|t| RepoFacts {
             repo: t.repo.clone(),
             has_reader: t.reader.is_ok(),
+            unsupported_forge: matches!(
+                t.reader,
+                Err(crate::eta::fleet_fetch::NoReader::UnsupportedForge)
+            ),
             snapshot_as_of: fleet::read(&fleet::snapshot_path(root, &t.repo)).map(|s| s.as_of),
             backfill_since: fleet_refresh::read_state(&fleet_refresh::state_path(root, &t.repo))
                 .and_then(|s| s.pass)
@@ -154,6 +166,22 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
     }
 }
 
+/// The reader App for `repo` on `host`, resolved read-only against `root`
+/// (the sidecar and token files only): the same answer the daemon's
+/// `forge_identity::read_credential` gives, without its registered root.
+fn reader_in(
+    root: &Path,
+    repo: &str,
+    host: Option<&str>,
+) -> Option<crate::eta::fleet_fetch::Reader> {
+    if host.is_some_and(|h| !h.eq_ignore_ascii_case("github.com")) {
+        return None;
+    }
+    let roster = crate::forge_identity::cached(root);
+    crate::forge_identity::read_credential_in(root, &roster, repo, std::time::SystemTime::now())
+        .map(|(dir, app_id)| crate::eta::fleet_fetch::Reader { app_id, dir })
+}
+
 fn read_pending(root: &Path) -> Vec<EstimateSummary> {
     std::fs::read_to_string(observability::eta::pending_path(root))
         .map(|text| {
@@ -163,3 +191,7 @@ fn read_pending(root: &Path) -> Vec<EstimateSummary> {
         })
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+#[path = "doctor_facts_tests.rs"]
+mod tests;

@@ -30,6 +30,7 @@ fn healthy() -> Facts {
             repos: vec![RepoFacts {
                 repo: "acme/alpha".into(),
                 has_reader: true,
+                unsupported_forge: false,
                 snapshot_as_of: Some(now() - Duration::minutes(20)),
                 backfill_since: None,
             }],
@@ -136,6 +137,17 @@ fn each_broken_fact_gets_its_status_and_remedy() {
             "repo acme/alpha",
             Status::Fail,
             "2AMLogic/2am#2489",
+        ),
+        (
+            "unsupported_forge is not told to install a reader App",
+            |f| {
+                f.data.repos[0].has_reader = false;
+                f.data.repos[0].unsupported_forge = true;
+            },
+            "data",
+            "repo acme/alpha",
+            Status::Warn,
+            "github.com repos only",
         ),
         (
             "stand_down with 0 snapshots",

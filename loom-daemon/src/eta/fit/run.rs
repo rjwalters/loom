@@ -302,6 +302,8 @@ pub enum FitSkip {
     StaleBeforeGrace {
         /// The oldest snapshot's `as_of`.
         oldest_as_of: DateTime<Utc>,
+        /// The newest snapshot's `as_of`.
+        newest_as_of: DateTime<Utc>,
         /// When the grace period ends and the fit runs anyway.
         grace_at: DateTime<Utc>,
         /// Snapshots read.
@@ -343,12 +345,14 @@ pub fn refit_check(root: &Path, now: DateTime<Utc>, fitter: &Fitter) -> FitCheck
     }
     let snapshots = fleet::load_all(root);
     let as_ofs: Vec<DateTime<Utc>> = snapshots.iter().map(|s| s.as_of).collect();
-    let Some(oldest) = as_ofs.iter().min().copied() else {
+    let (Some(oldest), Some(newest)) = (as_ofs.iter().min().copied(), as_ofs.iter().max().copied())
+    else {
         return FitCheckOutcome::Skipped(FitSkip::NoSnapshots);
     };
     let Some(at) = due(now, false, &as_ofs) else {
         return FitCheckOutcome::Skipped(FitSkip::StaleBeforeGrace {
             oldest_as_of: oldest,
+            newest_as_of: newest,
             grace_at: today + Duration::hours(STALE_GRACE_HOURS),
             snapshots: snapshots.len(),
         });

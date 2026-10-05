@@ -151,6 +151,9 @@ pub struct RepoFacts {
     pub repo: String,
     /// A reader App resolves for it.
     pub has_reader: bool,
+    /// Its forge has no reader-App path (not github.com), so `has_reader`
+    /// is false for a reason a reader App cannot fix.
+    pub unsupported_forge: bool,
     /// Its published snapshot's `as_of`.
     pub snapshot_as_of: Option<DateTime<Utc>>,
     /// An in-progress backfill's start.
@@ -370,6 +373,16 @@ fn data(f: &Facts) -> Vec<Check> {
     });
     for r in &d.repos {
         let name = format!("repo {}", r.repo);
+        if refreshes && !r.has_reader && r.unsupported_forge {
+            out.push(Check::bad(
+                "data",
+                &name,
+                Status::Warn,
+                "unsupported_forge: this repo's forge is not github.com, so the fleet refresh does not read it",
+                "nothing to install: the ETA fleet refresh reads github.com repos only; drop the repo from this host's set if its ETA matters",
+            ));
+            continue;
+        }
         if refreshes && !r.has_reader {
             out.push(Check::bad(
                 "data",

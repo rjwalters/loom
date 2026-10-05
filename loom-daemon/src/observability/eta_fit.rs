@@ -179,11 +179,13 @@ pub fn record_for(
                 }
                 FitCheck::Skipped(FitSkip::StaleBeforeGrace {
                     oldest_as_of,
+                    newest_as_of,
                     snapshots,
                     ..
                 }) => {
                     record.snapshots = count(*snapshots);
                     record.snapshot_oldest_as_of = Some(*oldest_as_of);
+                    record.snapshot_newest_as_of = Some(*newest_as_of);
                 }
                 _ => {}
             }

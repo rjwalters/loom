@@ -340,6 +340,9 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         // pins it).
         "gh_invocation/mod.rs",
         "gh_invocation/reader_route.rs",
+        // #10391: `eta doctor` resolves (never uses) a reader per repo to say
+        // whether one exists; it makes no forge call at all.
+        "eta/doctor_facts.rs",
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let re = regex::Regex::new(r"\b(read_credential|read_credential_in|apply_read_credential)\b")
