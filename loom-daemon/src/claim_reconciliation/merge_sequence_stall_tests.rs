@@ -61,9 +61,9 @@ fn transitive_only_members_get_no_edge() {
     // A–B share x.rs, B–C share y.rs, A and C share nothing. One component,
     // but C waits only for B, and nothing links A and C directly.
     let prs = [
-        fresh(1, "2026-10-01T00:00:00Z", &[]),
-        fresh(2, "2026-10-01T01:00:00Z", &[]),
-        fresh(3, "2026-10-01T02:00:00Z", &[]),
+        fresh(1, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]),
+        fresh(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL]),
+        fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL]),
     ];
     let f = files(&[(1, &["x.rs"]), (2, &["x.rs", "y.rs"]), (3, &["y.rs"])]);
     let groups = plan_repo_with(&prs, &f, &NONE, &BTreeSet::new());
@@ -78,9 +78,9 @@ fn disjoint_members_of_one_component_are_never_ordered_against_each_other() {
     // share none. #56 must wait for the hub, not for #53, and no
     // `SharedFiles` edge may join two PRs with disjoint file sets.
     let prs = [
-        fresh(10, "2026-10-01T00:00:00Z", &[]),
-        fresh(53, "2026-10-02T00:00:00Z", &[]),
-        fresh(56, "2026-10-02T01:00:00Z", &[]),
+        fresh(10, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]),
+        fresh(53, "2026-10-02T00:00:00Z", &[APPROVED_LABEL]),
+        fresh(56, "2026-10-02T01:00:00Z", &[APPROVED_LABEL]),
     ];
     let f = files(&[
         (
@@ -181,9 +181,10 @@ fn a_ready_group_with_no_stalled_head_is_unchanged() {
 
 #[test]
 fn a_starred_pr_is_ordered_ahead_of_an_unstarred_predecessor() {
-    let old = fresh(1, "2026-10-01T00:00:00Z", &[]);
-    let mid = fresh(2, "2026-10-01T01:00:00Z", &[]);
-    let star = fresh(3, "2026-10-01T02:00:00Z", &[OPERATOR_PRIORITY_LABEL]);
+    // All approved: one readiness tier (#10371), so only the star reorders.
+    let old = fresh(1, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]);
+    let mid = fresh(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL]);
+    let star = fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL, OPERATOR_PRIORITY_LABEL]);
     let f = files(&[(1, &["s"]), (2, &["s"]), (3, &["s"])]);
     let prs = [old.clone(), mid.clone(), star.clone()];
     let g = &plan_repo_with(&prs, &f, &NONE, &BTreeSet::new())[0];
@@ -194,7 +195,7 @@ fn a_starred_pr_is_ordered_ahead_of_an_unstarred_predecessor() {
     let plain = [
         old.clone(),
         mid.clone(),
-        fresh(3, "2026-10-01T02:00:00Z", &[]),
+        fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL]),
     ];
     assert_eq!(plan_repo_with(&plain, &f, &NONE, &BTreeSet::new())[0].order, vec![1, 2, 3]);
 
@@ -206,10 +207,10 @@ fn a_starred_pr_is_ordered_ahead_of_an_unstarred_predecessor() {
 
 #[test]
 fn a_stacked_base_beats_the_star() {
-    let base = fresh(1, "2026-10-01T00:00:00Z", &[]);
-    let mut stacked = fresh(2, "2026-10-01T01:00:00Z", &[OPERATOR_PRIORITY_LABEL]);
+    let base = fresh(1, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]);
+    let mut stacked = fresh(2, "2026-10-01T01:00:00Z", &[APPROVED_LABEL, OPERATOR_PRIORITY_LABEL]);
     stacked.base_ref = base.head_ref.clone();
-    let other = fresh(3, "2026-10-01T02:00:00Z", &[]);
+    let other = fresh(3, "2026-10-01T02:00:00Z", &[APPROVED_LABEL]);
     let f = files(&[(1, &["s"]), (2, &["s"]), (3, &["s"])]);
     let g = &plan_repo_with(&[base, stacked, other], &f, &NONE, &BTreeSet::new())[0];
     assert_eq!(g.order, vec![1, 2, 3]);
@@ -332,7 +333,9 @@ fn a_stalled_no_verdict_member_is_planned_last_so_released_work_lands_first() {
     assert_eq!(stalled, BTreeSet::from([7]));
     let g = &plan_repo_with(&prs, &f, &NONE, &stalled)[0];
     assert_eq!(g.order, vec![8, 9, 7]);
-    assert_eq!(edges(g), vec![(9, 8), (7, 9)]);
+    // #10371: #7 would wait for the nearest earlier member, #9, which has no
+    // verdict — no hold is written behind a non-ready predecessor.
+    assert_eq!(edges(g), vec![(9, 8)]);
 }
 
 #[test]

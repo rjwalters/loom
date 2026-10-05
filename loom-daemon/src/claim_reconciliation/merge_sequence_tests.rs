@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// An open, Judge-approved PR. Approved by default: these fixtures exercise
+/// grouping and constraints, and since #10371 no hold is planned behind a
+/// predecessor without `loom:pr` (`merge_sequence_ready_tests.rs` covers that).
 fn pr(number: u32, created: &str) -> SequencePr {
     SequencePr {
         number,
@@ -11,7 +14,7 @@ fn pr(number: u32, created: &str) -> SequencePr {
         head_ref: format!("feature/issue-{number}"),
         base_ref: "main".to_string(),
         draft: false,
-        labels: vec![],
+        labels: vec!["loom:pr".to_string()],
     }
 }
 
