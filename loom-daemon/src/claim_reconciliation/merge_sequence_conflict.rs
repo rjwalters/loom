@@ -210,8 +210,7 @@ pub fn live(root: &Path) -> PairChecker<impl Fn(&SequencePr, &SequencePr) -> Opt
 }
 
 /// Make `pr`'s pinned head commit available locally: already present, or
-/// fetched from `refs/pull/<n>/head` into a private ref that is deleted again
-/// (the objects stay). `false` when the pinned SHA still does not resolve —
+/// fetched from `refs/pull/<n>/head` (into `FETCH_HEAD`; no ref is created). `false` when the pinned SHA still does not resolve —
 /// including when the PR head moved past the listing's SHA.
 fn ensure_head(root: &Path, pr: &SequencePr, deadline: &Deadline) -> bool {
     let Some(sha) = pr.head_sha.as_deref().filter(|s| !s.is_empty()) else {
@@ -222,13 +221,12 @@ fn ensure_head(root: &Path, pr: &SequencePr, deadline: &Deadline) -> bool {
     if has() {
         return true;
     }
-    let local = format!("refs/loom/merge-sequence/{}", pr.number);
-    let spec = format!("+refs/pull/{}/head:{local}", pr.number);
+    // Fetch to FETCH_HEAD rather than a private ref: the objects land either
+    // way, and there is no ref to delete afterwards, so no git command can start
+    // after the deadline has expired.
+    let spec = format!("refs/pull/{}/head", pr.number);
     let fetch = ["fetch", "--quiet", "--no-tags", REMOTE, "--", &spec];
     let fetched = git_code(root, &fetch, FETCH_TIMEOUT, deadline) == Some(0);
-    // Cleanup of our private ref is not clamped: it is quick, and skipping it
-    // would leave a stray ref behind.
-    let _ = git_code(root, &["update-ref", "-d", &local], GIT_TIMEOUT, &Deadline::unbounded());
     fetched && has()
 }
 

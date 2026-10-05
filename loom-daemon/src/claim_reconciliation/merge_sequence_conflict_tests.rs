@@ -288,6 +288,41 @@ fn a_spent_deadline_launches_no_git_and_clamps_the_timeout() {
     assert_eq!(nearly.remaining(), Duration::from_millis(1));
 }
 
+#[test]
+fn fetch_that_spends_the_deadline_launches_no_further_git() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin");
+    let clone = tmp.path().join("clone");
+    std::fs::create_dir_all(&origin).unwrap();
+    std::fs::create_dir_all(&clone).unwrap();
+    git(&origin, &["init", "-q", "-b", "main"]);
+    std::fs::write(origin.join("lib.rs"), "pub mod a;\n").unwrap();
+    git(&origin, &["add", "."]);
+    git(&origin, &["commit", "-q", "-m", "base"]);
+    let head = git(&origin, &["rev-parse", "HEAD"]);
+    git(&origin, &["update-ref", "refs/pull/1/head", &head]);
+    git(&clone, &["init", "-q", "-b", "main"]);
+    git(&clone, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    // Every git launch consults the deadline exactly once. The clock reads
+    // "fresh" for the cat-file and the fetch, then "spent" from then on.
+    let reads = Rc::new(Cell::new(0));
+    let r = Rc::clone(&reads);
+    let deadline = Deadline::with_clock(Duration::from_secs(100), move || {
+        r.set(r.get() + 1);
+        if r.get() <= 2 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(200)
+        }
+    });
+    let mut p = pr(1, &[]);
+    p.head_sha = Some(head);
+    assert!(!ensure_head(&clone, &p, &deadline), "post-fetch check fails closed");
+    assert_eq!(reads.get(), 3, "cat-file, fetch, then the spent re-check; nothing after");
+    let refs = git(&clone, &["for-each-ref", "refs/loom"]);
+    assert!(refs.is_empty(), "no private ref is left behind: {refs}");
+}
+
 // --- Real git --------------------------------------------------------------
 
 fn git(dir: &Path, args: &[&str]) -> String {
