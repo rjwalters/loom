@@ -11,9 +11,16 @@
 //! warning.
 //!
 //! Resolution order mirrors the hook: env (Claude Code settings `env`) beats
-//! `.loom-project/project.json` / `.loom/config.json` `guards.*`, which beats the
-//! default. Keep [`CATEGORIES`] in sync with `toggle_hint_for_tag()` in
-//! `defaults/hooks/guard-destructive-generic.sh`.
+//! config `guards.*`, which beats the default. "Config" is read exactly the way
+//! each hook reads it ([`Tiers`]): most categories go through the shared
+//! four-tier resolver ([`crate::config_resolver`], last wins: private defaults,
+//! `.loom/config.json`, `.loom-project/project.json`, `.loom-local/local.json`),
+//! and the tier file that supplied the value is reported. Accepted values are
+//! the hook's `case` arms verbatim (case-sensitive, per category and per tier);
+//! anything else is ignored and falls through, as in the hook. Keep
+//! [`CATEGORIES`] in sync with `toggle_hint_for_tag()` in
+//! `defaults/hooks/guard-destructive-generic.sh` and the toggle readers in
+//! `guard-worktree-paths.sh` / `guard-background-subagents.sh`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -22,6 +29,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
+
+use crate::config_resolver;
 
 /// Default number of asks in the window before the "set the toggle" warning.
 pub const DEFAULT_ASK_THRESHOLD: usize = 3;
@@ -33,16 +42,42 @@ pub const UNRESOLVED_VAR_SHARE: f64 = 0.25;
 /// ...provided at least this many decisions were logged in the window.
 pub const UNRESOLVED_VAR_MIN_SAMPLE: usize = 10;
 
-/// How a category's value is shaped.
+/// How a category's value is shaped, and which values each tier accepts.
 #[derive(Clone, Copy)]
 enum Kind {
+    /// Env: `0|false|no` / `1|true|yes` (plus `off`/`on` when `env_on_off`).
+    /// Config: a JSON boolean; when `config_str` the hook reads the key via
+    /// `jq -r`, so the strings `"true"`/`"false"` are equivalent.
     Bool {
         default: bool,
+        env_on_off: bool,
+        config_str: bool,
     },
-    Enum {
-        default: &'static str,
-        allowed: &'static [&'static str],
-    },
+    /// `rm_scope_repo_enabled()`. Env: `repo` / `off|0|no|permissive`.
+    /// Config: `off|permissive` => off, anything else => repo.
+    RmScope,
+    /// `force_scope_mode()`. Env: `all|protected|off`.
+    /// Config: `protected|off`, anything else => all.
+    ForceScope,
+}
+
+const fn tiered_bool(default: bool) -> Kind {
+    Kind::Bool {
+        default,
+        env_on_off: false,
+        config_str: true,
+    }
+}
+
+/// Which config files the category's hook reader consults.
+#[derive(Clone, Copy)]
+enum Tiers {
+    /// `loom_config_get` / `loom_resolve_config`: all four tiers merged.
+    All,
+    /// `_fastpath_tiered_get`: `.loom-project/project.json`, else `.loom/config.json`.
+    ProjectThenLegacy,
+    /// `guard-background-subagents.sh`: `.loom/config.json` only.
+    LegacyOnly,
 }
 
 struct Category {
@@ -50,6 +85,7 @@ struct Category {
     key: &'static str,
     env: &'static str,
     kind: Kind,
+    tiers: Tiers,
     /// Decision-log rule-tag prefixes that belong to this category.
     tags: &'static [&'static str],
 }
@@ -58,79 +94,104 @@ const CATEGORIES: &[Category] = &[
     Category {
         key: "sqlDdl",
         env: "LOOM_GUARD_SQL",
-        kind: Kind::Bool { default: true },
+        kind: tiered_bool(true),
+        tiers: Tiers::All,
         tags: &["sql-ddl", "sql-delete-no-where"],
     },
     Category {
         key: "cloudCli",
         env: "LOOM_GUARD_CLOUD",
-        kind: Kind::Bool { default: true },
+        kind: tiered_bool(true),
+        tiers: Tiers::All,
         tags: &["cloud-cli:"],
     },
     Category {
         key: "cargoCleanScope",
         env: "LOOM_GUARD_CARGO_CLEAN",
-        kind: Kind::Bool { default: true },
+        kind: tiered_bool(true),
+        tiers: Tiers::All,
         tags: &["cargo-clean-scope"],
     },
     Category {
         key: "reversibleGh",
         env: "LOOM_GUARD_REVERSIBLE_GH",
-        kind: Kind::Bool { default: false },
+        kind: tiered_bool(false),
+        tiers: Tiers::All,
         tags: &["reversible-gh:"],
     },
     Category {
         key: "decisionLog",
         env: "LOOM_GUARD_DECISION_LOG",
-        kind: Kind::Bool { default: false },
+        kind: Kind::Bool {
+            default: false,
+            env_on_off: true,
+            config_str: true,
+        },
+        tiers: Tiers::All,
         tags: &[],
     },
     Category {
         key: "readOnlyFastPath",
         env: "LOOM_GUARD_READONLY_FASTPATH",
-        kind: Kind::Bool { default: true },
+        kind: tiered_bool(true),
+        tiers: Tiers::ProjectThenLegacy,
         tags: &[],
     },
     Category {
         key: "worktreeIsolation",
         env: "LOOM_GUARD_WORKTREE_ISOLATION",
-        kind: Kind::Bool { default: true },
+        // Two readers: the Bash path (loom_config_get, string "false" counts)
+        // and the Edit/Write path (`== false`, JSON boolean only). Report the
+        // strict reading both agree on.
+        kind: Kind::Bool {
+            default: true,
+            env_on_off: false,
+            config_str: false,
+        },
+        tiers: Tiers::All,
         tags: &["worktree-write-confinement"],
     },
     Category {
         key: "stashScope",
         env: "LOOM_GUARD_STASH_SCOPE",
-        kind: Kind::Bool { default: true },
+        kind: tiered_bool(true),
+        tiers: Tiers::All,
         tags: &["stash-scope:"],
     },
     Category {
         key: "backgroundSubagents",
         env: "LOOM_GUARD_BACKGROUND_SUBAGENTS",
-        kind: Kind::Bool { default: true },
+        kind: Kind::Bool {
+            default: true,
+            env_on_off: false,
+            config_str: false,
+        },
+        tiers: Tiers::LegacyOnly,
         tags: &[],
     },
     Category {
         key: "installedFileWrites",
         env: "LOOM_GUARD_INSTALLED_FILE_WRITES",
-        kind: Kind::Bool { default: true },
+        kind: Kind::Bool {
+            default: true,
+            env_on_off: false,
+            config_str: false,
+        },
+        tiers: Tiers::All,
         tags: &[],
     },
     Category {
         key: "rmScope",
         env: "LOOM_RM_SCOPE",
-        kind: Kind::Enum {
-            default: "repo",
-            allowed: &["repo", "off", "permissive"],
-        },
+        kind: Kind::RmScope,
+        tiers: Tiers::All,
         tags: &["rm-scope-"],
     },
     Category {
         key: "forceScope",
         env: "LOOM_FORCE_SCOPE",
-        kind: Kind::Enum {
-            default: "all",
-            allowed: &["all", "protected", "off"],
-        },
+        kind: Kind::ForceScope,
+        tiers: Tiers::All,
         tags: &["force-op:"],
     },
 ];
@@ -156,7 +217,7 @@ impl Source {
     fn label(self) -> &'static str {
         match self {
             Source::Env => "env (Claude Code settings.json env)",
-            Source::Config => ".loom/config.json",
+            Source::Config => "config",
             Source::Default => "default",
         }
     }
@@ -168,7 +229,8 @@ pub struct CategoryStatus {
     pub env_var: String,
     pub value: String,
     pub source: Source,
-    /// Which settings file supplied the env value, when `source == Env`.
+    /// Which file supplied the value: the Claude Code settings file when
+    /// `source == Env`, the config tier file when `source == Config`.
     pub origin: Option<String>,
 }
 
@@ -257,44 +319,90 @@ fn wiring(path: &Path) -> Wiring {
     }
 }
 
-/// Normalise a raw env/config value for a category; `None` = unrecognised
-/// (the hook ignores it and falls through to the next tier).
-fn normalise(kind: Kind, raw: &str) -> Option<String> {
-    let r = raw.trim().to_ascii_lowercase();
-    match kind {
-        Kind::Bool { .. } => match r.as_str() {
-            "0" | "false" | "no" => Some("false".into()),
-            "1" | "true" | "yes" => Some("true".into()),
-            _ => None,
+/// The value the hook takes from an env var, or `None` when the hook's `case`
+/// statement does not match it (the hook ignores it and falls through).
+/// Case-sensitive and untrimmed, exactly like the shell `case` arms.
+fn env_value(kind: Kind, raw: &str) -> Option<String> {
+    let v = match kind {
+        Kind::Bool { env_on_off, .. } => match raw {
+            "0" | "false" | "no" => "false",
+            "1" | "true" | "yes" => "true",
+            "off" if env_on_off => "false",
+            "on" if env_on_off => "true",
+            _ => return None,
         },
-        Kind::Enum { allowed, .. } => {
-            let r = if matches!(r.as_str(), "0" | "no") {
-                "off".to_string()
+        Kind::RmScope => match raw {
+            "repo" => "repo",
+            "off" | "0" | "no" | "permissive" => "off",
+            _ => return None,
+        },
+        Kind::ForceScope => match raw {
+            "all" | "protected" | "off" => raw,
+            _ => return None,
+        },
+    };
+    Some(v.to_string())
+}
+
+/// The value the hook takes from a config key, or `None` when the hook treats
+/// it as unset (it then behaves exactly as the default).
+fn config_value(kind: Kind, v: &Value) -> Option<String> {
+    let v = match (kind, v) {
+        (Kind::Bool { .. }, Value::Bool(b)) => {
+            if *b {
+                "true"
             } else {
-                r
-            };
-            allowed.contains(&r.as_str()).then_some(r)
+                "false"
+            }
         }
+        (
+            Kind::Bool {
+                config_str: true, ..
+            },
+            Value::String(s),
+        ) if s == "true" || s == "false" => s.as_str(),
+        (Kind::RmScope, Value::String(s)) if s == "off" || s == "permissive" => "off",
+        (Kind::ForceScope, Value::String(s)) if s == "protected" || s == "off" => s.as_str(),
+        _ => return None,
+    };
+    Some(v.to_string())
+}
+
+/// `guards.<key>` as the category's hook reads it, with the file it came from.
+fn config_lookup(repo_root: &Path, cat: &Category) -> Option<(Value, PathBuf)> {
+    let dotted = format!("guards.{}", cat.key);
+    let first_of = |rels: &[&str]| {
+        rels.iter().find_map(|rel| {
+            let path = repo_root.join(rel);
+            let v = config_resolver::get_path(&read_json(&path)?, &dotted)?.clone();
+            (!v.is_null()).then_some((v, path))
+        })
+    };
+    match cat.tiers {
+        Tiers::All => {
+            let effective = config_resolver::resolve_effective_config(repo_root);
+            let v = config_resolver::get_path(&effective, &dotted)?.clone();
+            if v.is_null() {
+                return None;
+            }
+            Some((v, config_resolver::source_of(repo_root, &dotted)?))
+        }
+        Tiers::ProjectThenLegacy => first_of(&[".loom-project/project.json", ".loom/config.json"]),
+        Tiers::LegacyOnly => first_of(&[".loom/config.json"]),
     }
 }
 
-fn config_raw(repo_root: &Path, key: &str) -> Option<String> {
-    for rel in [".loom-project/project.json", ".loom/config.json"] {
-        let found =
-            read_json(&repo_root.join(rel)).and_then(|v| v.get("guards")?.get(key).cloned());
-        match found {
-            Some(Value::Bool(b)) => return Some(b.to_string()),
-            Some(Value::String(s)) => return Some(s),
-            _ => {}
-        }
-    }
-    None
+/// Display a tier path relative to the repo when it lives inside it.
+fn display_path(repo_root: &Path, p: &Path) -> String {
+    p.strip_prefix(repo_root)
+        .map_or_else(|_| p.display().to_string(), |r| r.display().to_string())
 }
 
 fn default_of(kind: Kind) -> String {
     match kind {
-        Kind::Bool { default } => default.to_string(),
-        Kind::Enum { default, .. } => default.to_string(),
+        Kind::Bool { default, .. } => default.to_string(),
+        Kind::RmScope => "repo".into(),
+        Kind::ForceScope => "all".into(),
     }
 }
 
@@ -305,35 +413,26 @@ fn resolve_categories(
     CATEGORIES
         .iter()
         .map(|c| {
-            let from_env = env_layers.iter().find_map(|(origin, m)| {
-                let v = normalise(c.kind, m.get(c.env)?)?;
-                Some((v, origin.clone()))
-            });
-            if let Some((value, origin)) = from_env {
-                return CategoryStatus {
-                    key: c.key.into(),
-                    env_var: c.env.into(),
-                    value,
-                    source: Source::Env,
-                    origin: Some(origin),
-                };
-            }
-            if let Some(value) = config_raw(repo_root, c.key).and_then(|r| normalise(c.kind, &r)) {
-                return CategoryStatus {
-                    key: c.key.into(),
-                    env_var: c.env.into(),
-                    value,
-                    source: Source::Config,
-                    origin: None,
-                };
-            }
-            CategoryStatus {
+            let status = |value: String, source: Source, origin: Option<String>| CategoryStatus {
                 key: c.key.into(),
                 env_var: c.env.into(),
-                value: default_of(c.kind),
-                source: Source::Default,
-                origin: None,
+                value,
+                source,
+                origin,
+            };
+            // Claude Code merges the settings files, so only the
+            // highest-precedence layer that sets the variable reaches the hook.
+            if let Some((origin, m)) = env_layers.iter().find(|(_, m)| m.contains_key(c.env)) {
+                if let Some(v) = env_value(c.kind, &m[c.env]) {
+                    return status(v, Source::Env, Some(origin.clone()));
+                }
             }
+            if let Some((raw, path)) = config_lookup(repo_root, c) {
+                if let Some(v) = config_value(c.kind, &raw) {
+                    return status(v, Source::Config, Some(display_path(repo_root, &path)));
+                }
+            }
+            status(default_of(c.kind), Source::Default, None)
         })
         .collect()
 }
@@ -472,7 +571,7 @@ pub fn collect(inputs: &Inputs) -> Report {
                 warnings.push(Warning {
                     headline: "SHELL-RC-ONLY-ENV".into(),
                     detail: format!(
-                        "{var} is set in ~/{rc} but not in the Claude Code settings \"env\" block. The guard hook reads Claude Code's environment, so this has no effect. Set it under \"env\" in ~/.claude/settings.json (or .claude/settings.json), or use the .loom/config.json guards key."
+                        "{var} is set in ~/{rc} but not in the Claude Code settings \"env\" block. The guard hook reads Claude Code's environment, so this may have no effect: it applies only if Claude Code is launched from a shell that sources ~/{rc}. Set it under \"env\" in ~/.claude/settings.json (or .claude/settings.json) to make it reliable, or use the guards config key."
                     ),
                 });
             }
@@ -493,7 +592,7 @@ pub fn collect(inputs: &Inputs) -> Report {
             warnings.push(Warning {
                 headline: "REPEATED-ASKS-UNCONFIGURED".into(),
                 detail: format!(
-                    "{n} asks for guards.{cat} in the last {WINDOW_DAYS} days and the toggle is unset. The decision log records no approval outcome, so ask count is used as the proxy for \"all approved\". If you approve these every time, set guards.{cat} in .loom/config.json or {env} in Claude Code settings \"env\" (an inline env prefix on the command does not work)."
+                    "{n} asks for guards.{cat} in the last {WINDOW_DAYS} days and the toggle is unset. The decision log records no approval outcome, so ask count is used as the proxy for \"all approved\". If you approve these every time, set guards.{cat} in .loom/config.json (or .loom-local/local.json for this host only) or {env} in Claude Code settings \"env\" (an inline env prefix on the command does not work)."
                 ),
             });
         }
@@ -680,6 +779,113 @@ mod tests {
         put(repo.path(), ".claude/settings.json", r#"{"env":{"LOOM_GUARD_CLOUD":"maybe"}}"#);
         let r = collect(&inputs(repo.path(), home.path()));
         assert_eq!(find(&r, "cloudCli").source, Source::Config);
+    }
+
+    #[test]
+    fn local_tier_wins_and_is_reported_as_source() {
+        // Judge repro on PR #10436: a toggle set only in the gitignored
+        // per-host tier must be seen, and must silence the "set the toggle" nag.
+        let (repo, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        put(
+            repo.path(),
+            ".loom/config.json",
+            r#"{"guards":{"cloudCli":true,"sqlDdl":false}}"#,
+        );
+        put(repo.path(), ".loom-project/project.json", r#"{"guards":{"stashScope":false}}"#);
+        put(repo.path(), ".loom-local/local.json", r#"{"guards":{"cloudCli":false}}"#);
+        let log: String = (0..3)
+            .map(|_| ask_line("cloud-cli:aws", "2026-10-04T00:00:00Z"))
+            .collect();
+        put(repo.path(), ".loom/logs/guard-decisions.log", &log);
+        let r = collect(&inputs(repo.path(), home.path()));
+        let cloud = find(&r, "cloudCli");
+        assert_eq!((cloud.value.as_str(), cloud.source), ("false", Source::Config));
+        assert_eq!(cloud.origin.as_deref(), Some(".loom-local/local.json"));
+        let stash = find(&r, "stashScope");
+        assert_eq!(stash.origin.as_deref(), Some(".loom-project/project.json"));
+        let sql = find(&r, "sqlDdl");
+        assert_eq!(sql.origin.as_deref(), Some(".loom/config.json"));
+        assert!(r
+            .warnings
+            .iter()
+            .all(|w| w.headline != "REPEATED-ASKS-UNCONFIGURED"));
+        assert!(render(&r).contains(".loom-local/local.json"));
+    }
+
+    #[test]
+    fn narrower_hook_readers_ignore_tiers_they_do_not_read() {
+        let (repo, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        put(
+            repo.path(),
+            ".loom-local/local.json",
+            r#"{"guards":{"backgroundSubagents":false,"readOnlyFastPath":false}}"#,
+        );
+        let r = collect(&inputs(repo.path(), home.path()));
+        assert_eq!(find(&r, "backgroundSubagents").source, Source::Default);
+        assert_eq!(find(&r, "readOnlyFastPath").source, Source::Default);
+        put(
+            repo.path(),
+            ".loom-project/project.json",
+            r#"{"guards":{"readOnlyFastPath":false}}"#,
+        );
+        let r = collect(&inputs(repo.path(), home.path()));
+        assert_eq!(find(&r, "readOnlyFastPath").value, "false");
+    }
+
+    #[test]
+    fn values_the_hook_ignores_fall_through() {
+        let (repo, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        put(
+            repo.path(),
+            ".loom/config.json",
+            r#"{"guards":{"rmScope":"0","forceScope":"no","worktreeIsolation":"false","sqlDdl":"false"}}"#,
+        );
+        put(
+            repo.path(),
+            ".claude/settings.json",
+            r#"{"env":{"LOOM_GUARD_CLOUD":"FALSE","LOOM_FORCE_SCOPE":"0","LOOM_GUARD_STASH_SCOPE":" 0","LOOM_GUARD_DECISION_LOG":"on","LOOM_GUARD_REVERSIBLE_GH":"on"}}"#,
+        );
+        let r = collect(&inputs(repo.path(), home.path()));
+        let v = |k: &str| {
+            let c = find(&r, k);
+            (c.value.clone(), c.source)
+        };
+        // Case-sensitive bool env: FALSE is ignored, guard stays ON.
+        assert_eq!(v("cloudCli"), ("true".into(), Source::Default));
+        // Untrimmed: " 0" is not "0".
+        assert_eq!(v("stashScope"), ("true".into(), Source::Default));
+        // LOOM_FORCE_SCOPE takes only all|protected|off; config forceScope has no 0/no alias.
+        assert_eq!(v("forceScope"), ("all".into(), Source::Default));
+        // Config rmScope has no 0/no alias.
+        assert_eq!(v("rmScope"), ("repo".into(), Source::Default));
+        // on/off is a decisionLog-only env alias.
+        assert_eq!(v("decisionLog"), ("true".into(), Source::Env));
+        assert_eq!(v("reversibleGh"), ("false".into(), Source::Default));
+        // String "false" counts for loom_config_get readers, not for `== false` ones.
+        assert_eq!(v("sqlDdl"), ("false".into(), Source::Config));
+        assert_eq!(v("worktreeIsolation"), ("true".into(), Source::Default));
+
+        // LOOM_RM_SCOPE env is the one place 0/no means off.
+        put(repo.path(), ".claude/settings.json", r#"{"env":{"LOOM_RM_SCOPE":"no"}}"#);
+        let r = collect(&inputs(repo.path(), home.path()));
+        let rm = find(&r, "rmScope");
+        assert_eq!((rm.value.as_str(), rm.source), ("off", Source::Env));
+    }
+
+    #[test]
+    fn higher_settings_layer_masks_lower_even_when_ignored() {
+        // Claude Code merges settings files, so the hook only ever sees the
+        // highest layer's value; an ignored value there does not reveal a
+        // valid one in a lower layer.
+        let (repo, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        put(home.path(), ".claude/settings.json", r#"{"env":{"LOOM_GUARD_CLOUD":"0"}}"#);
+        put(
+            repo.path(),
+            ".claude/settings.local.json",
+            r#"{"env":{"LOOM_GUARD_CLOUD":"maybe"}}"#,
+        );
+        let r = collect(&inputs(repo.path(), home.path()));
+        assert_eq!(find(&r, "cloudCli").source, Source::Default);
     }
 
     #[test]
