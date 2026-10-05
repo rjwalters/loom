@@ -1663,7 +1663,7 @@ elif [[ -n "$CWD" ]]; then
 fi
 
 # Master opt-out (#10335): guards.enabled:false / LOOM_GUARDS_ENABLED=0 -> allow.
-# Exit 0 means opted out; a missing or older daemon never exits 0 here.
+# requires-daemon: guard-hook optional   exit 0 means opted out; a missing or older daemon (127/2) never exits 0, so the guard stays ON (#10335)
 "${LOOM_DAEMON_SELF_BIN:-loom-daemon}" guard-hook opted-out --root "$REPO_ROOT" </dev/null >/dev/null 2>&1 && exit 0
 
 # Helper: output a deny decision and exit

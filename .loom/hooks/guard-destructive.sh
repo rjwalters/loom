@@ -178,7 +178,7 @@ BODY_LITERAL_AT_MARKER='gh-comment-body-literal-at'
 
 # Master opt-out (#10335): guards.enabled:false in .loom/config.json (or
 # LOOM_GUARDS_ENABLED=0) turns the whole PreToolUse guard off for this repo.
-# Exit 0 means opted out; a missing or older daemon never exits 0 here.
+# requires-daemon: guard-hook optional   exit 0 means opted out; a missing or older daemon (127/2) never exits 0, so the guard stays ON (#10335)
 "${LOOM_DAEMON_SELF_BIN:-loom-daemon}" guard-hook opted-out --root "$CANONICAL_ROOT" </dev/null >/dev/null 2>&1 && exit 0
 
 # Prefer the canonical guard ONLY when it carries the rjwalters/repo#29 fix

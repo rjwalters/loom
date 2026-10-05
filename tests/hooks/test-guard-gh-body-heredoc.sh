@@ -25,8 +25,9 @@ run_guard() { # cmd -> hook stdout
         | "$GUARD" 2>/dev/null
 }
 check() { # desc expect(deny|allow) cmd
-    local got=allow
-    run_guard "$3" | grep -q '"permissionDecision": *"deny"' && got=deny
+    local got=allow out
+    out=$(run_guard "$3")
+    [[ "$(jq -r '.hookSpecificOutput.permissionDecision // empty' <<<"$out" 2>/dev/null)" == deny ]] && got=deny
     if [[ "$got" == "$2" ]]; then PASS=$((PASS+1)); echo "  PASS: $1"; else FAIL=$((FAIL+1)); echo "  FAIL: $1 (expected $2, got $got)"; fi
 }
 
