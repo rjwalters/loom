@@ -72,6 +72,11 @@ Loom-only codes cover surfaces that 2am's validator cannot see
   requires, or names a different host. This covers Loom's token-only republication (scenario 17,
   #9986).
 - `runtime.bypass-open`: the canary's direct request succeeded.
+- `toolchain.policy-launcher-declined`: the policy's `launcherPath` exists,
+  but the `gh` the daemon itself execs is neither that launcher nor `PATH`'s
+  `gh` (which `toolchain.launcher-not-first` covers). Typically
+  `$LOOM_GH_BIN` with `LOOM_GH_NO_POLICY_LAUNCHER=1`, or with a policy whose
+  origin may not choose the executable (#9995).
 - `telemetry.loom-exporter-not-otlp`: Loom's own observability config has no
   `otlp` exporter.
 
@@ -89,10 +94,12 @@ hit wins):
 
 `LOOM_GH_NO_POLICY_LAUNCHER=1` declines rung 1. Every test harness that stubs
 `gh` sets it, so a host's policy launcher never outranks the stub. It is not
-a policy bypass: env already outranks the machine policy, and the checks
-measure whatever `gh` the resolver picks. Under `enforcement.api = required`,
-a declined rung that lands on an unmanaged or below-floor `gh` still fails
-`assert`.
+a silent bypass: env already outranks the machine policy, and the checks
+report where a declined rung lands. The version floor measures the exec
+target. A landing on bare `gh` is `toolchain.launcher-not-first`. A landing
+on `$LOOM_GH_BIN`, or on anything else that is neither the existing launcher
+nor `PATH`'s `gh`, is `toolchain.policy-launcher-declined`. All three are
+routing findings, so under `enforcement.api = required` `assert` fails.
 
 The version floor measures that effective `gh` (`observed.ghPath`; the rung
 that won is `observed.ghSource`). `toolchain.launcher-not-first` measures the

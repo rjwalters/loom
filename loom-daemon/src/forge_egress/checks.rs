@@ -34,6 +34,7 @@ pub const LOOM_ONLY_CODES: &[&str] = &[
     "apiconfig.github-token-present",
     "git.credential-from-api-profile",
     "runtime.bypass-open",
+    "toolchain.policy-launcher-declined",
     "telemetry.loom-exporter-not-otlp",
 ];
 
@@ -354,8 +355,47 @@ pub fn assert_toolchain(policy: &Value, obs: &Observed) -> Vec<Finding> {
                 });
             }
         }
+        if let Some(f) = policy_launcher_declined(launcher, obs) {
+            findings.push(f);
+        }
     }
     findings
+}
+
+/// `toolchain.policy-launcher-declined` (#9995, Loom-only): the managed
+/// launcher exists, yet the `gh` the daemon itself execs is something else
+/// that `toolchain.launcher-not-first` does not see — typically `$LOOM_GH_BIN`
+/// with the policy rung declined (`LOOM_GH_NO_POLICY_LAUNCHER=1`) or with a
+/// policy whose origin may not choose the executable. When the exec target IS
+/// PATH's `gh`, `launcher-not-first` already reports it, so this stays quiet
+/// (which also keeps the 2am lockstep rows, where the two coincide, unchanged).
+fn policy_launcher_declined(launcher: &str, obs: &Observed) -> Option<Finding> {
+    if !obs.launcher_exists {
+        return None;
+    }
+    let exec = obs.gh.path.as_ref()?;
+    if same_path(exec, Path::new(launcher))
+        || obs.path_gh.as_ref().is_some_and(|p| same_path(exec, p))
+    {
+        return None;
+    }
+    Some(
+        Finding::new(
+            "toolchain.policy-launcher-declined",
+            "the gh the daemon execs is the managed launcher",
+        )
+        .expected(launcher)
+        .observed(format!(
+            "{} (resolver rung: {})",
+            exec.display(),
+            obs.gh_source.unwrap_or("unknown")
+        ))
+        .source("gh_invocation resolver")
+        .remedy(
+            "unset LOOM_GH_NO_POLICY_LAUNCHER / LOOM_GH_BIN in the daemon's environment so the \
+             policy launcher is the exec target (both are test seams, not production knobs)",
+        ),
+    )
 }
 
 /// The EFFECTIVE config profiles — enumeration (2am) plus the routing setting

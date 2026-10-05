@@ -38,6 +38,13 @@ pub fn effective_gh_path() -> Option<PathBuf> {
     which(&crate::gh_invocation::resolver::resolve().program)
 }
 
+/// [`effective_gh_path`] plus the rung that produced it, from ONE resolution
+/// so the two can never disagree.
+fn effective_gh() -> (Option<PathBuf>, &'static str) {
+    let resolved = crate::gh_invocation::resolver::resolve();
+    (which(&resolved.program), resolved.source.as_str())
+}
+
 /// The `gh` an agent's plain `gh` resolves to: bare `gh` on `PATH`, never the
 /// resolver (no policy launcher, no `$LOOM_GH_BIN`). Feeds
 /// `toolchain.launcher-not-first`, which asks whether PATH puts the managed
@@ -390,15 +397,16 @@ pub fn observe(doc: &PolicyDoc, workspace: &Path, opts: ProbeOptions) -> Observe
         .filter(|p| profile_holds_token(&p.path))
         .map(|p| p.path.clone())
         .collect();
+    let (exec_gh, gh_source) = effective_gh();
     Observed {
         token_profiles,
         git_helper_is_gh: git_helper_is_gh(workspace),
         gh_host: env_nonempty("GH_HOST"),
         gh_repo: env_nonempty("GH_REPO"),
         gh_config_dir,
-        gh: gh_build(effective_gh_path()),
+        gh: gh_build(exec_gh),
         path_gh: path_gh_path(),
-        gh_source: Some(crate::gh_invocation::resolver::resolve().source.as_str()),
+        gh_source: Some(gh_source),
         launcher_exists: !launcher.is_empty() && Path::new(launcher).exists(),
         profiles,
         git_rewrites: git_rewrites(workspace, logical),

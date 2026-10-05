@@ -559,18 +559,24 @@ fn no_policy_launcher_opt_out_makes_the_stub_win_over_the_launcher() {
         };
         let out = c.output().unwrap();
         let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-        report["observed"].clone()
+        let routing = report["routing"]["findings"].to_string();
+        (report["observed"].clone(), routing)
     };
+    let declined = "toolchain.policy-launcher-declined";
 
-    let o = observed(Some("1"));
+    let (o, routing) = observed(Some("1"));
     assert_eq!(o["ghPath"], stub.display().to_string().as_str(), "{o:#}");
     assert_eq!(o["ghVersion"], "2.99.0", "the stub is what ran: {o:#}");
     assert_eq!(o["ghSource"], "env_override", "{o:#}");
+    // PATH's gh is the launcher, so only the exec-target finding can see this.
+    assert!(routing.contains(declined), "the declined rung is reported: {routing}");
+    assert!(!routing.contains("toolchain.launcher-not-first"), "{routing}");
 
     // Without the opt-out (or with any value but `1`) the launcher outranks
     // LOOM_GH_BIN.
     for opt_out in [None, Some("0")] {
-        let o = observed(opt_out);
+        let (o, routing) = observed(opt_out);
+        assert!(!routing.contains(declined), "{opt_out:?}: {routing}");
         assert_eq!(o["ghPath"], launcher.as_str(), "{opt_out:?}: {o:#}");
         assert_eq!(o["ghVersion"], "2.102.0", "{opt_out:?}: {o:#}");
         assert_eq!(o["ghSource"], "policy", "{opt_out:?}: {o:#}");

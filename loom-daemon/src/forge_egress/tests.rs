@@ -255,3 +255,29 @@ fn launcher_not_first_and_the_floor_measure_different_gh() {
     let r = evaluate(&doc(example()), &obs, Mode::Doctor);
     assert_eq!(r.routing_codes(), vec!["toolchain.below-api-host-floor".to_string()]);
 }
+
+/// #9995 review: an exec target that is neither the existing launcher nor
+/// PATH's `gh` (`LOOM_GH_BIN` with the policy rung declined) is a routing
+/// finding, even though PATH is correct and the version clears the floor.
+#[test]
+fn exec_target_off_the_launcher_and_off_path_is_policy_launcher_declined() {
+    let code = "toolchain.policy-launcher-declined".to_string();
+    let mut obs = aligned();
+    obs.gh.path = Some(PathBuf::from("/opt/unmanaged/bin/gh"));
+    obs.gh_source = Some("env_override");
+    let r = evaluate(&doc(example()), &obs, Mode::Assert);
+    assert_eq!(r.routing_codes(), vec![code.clone()]);
+    assert!(super::checks::LOOM_ONLY_CODES.contains(&code.as_str()));
+
+    // Exec target == PATH's gh: launcher-not-first alone covers it.
+    obs.path_gh = obs.gh.path.clone();
+    let r = evaluate(&doc(example()), &obs, Mode::Assert);
+    assert_eq!(r.routing_codes(), vec!["toolchain.launcher-not-first".to_string()]);
+
+    // Launcher absent on this host: the rung could not have won; no finding.
+    let mut obs = aligned();
+    obs.gh.path = Some(PathBuf::from("/opt/unmanaged/bin/gh"));
+    obs.launcher_exists = false;
+    let r = evaluate(&doc(example()), &obs, Mode::Assert);
+    assert!(!r.routing_codes().contains(&code), "{:?}", r.routing_codes());
+}

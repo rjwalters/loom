@@ -36,13 +36,15 @@ use crate::forge_egress::policy::{self, PolicySources, Resolution};
 /// For test harnesses that hand the daemon a fake `gh` (`LOOM_GH_BIN` or a
 /// stub on `PATH`): without it, a host carrying an egress policy would exec the
 /// real managed `gh` instead of the stub (the #10088 hazard, out of process).
-/// It is not a policy bypass: env is already the most-trusted policy origin
-/// (`LOOM_FORGE_EGRESS_POLICY` outranks the machine policy wholesale), and the
-/// forge-egress validator measures whatever `gh` the resolver actually picks —
-/// the version floor reads the exec target and `toolchain.launcher-not-first`
-/// reads `PATH`'s `gh` — so under `enforcement.api = required` a declined rung
-/// that lands on an unmanaged or below-floor `gh` still fails `assert`. The
-/// report's `observed.ghSource` names the rung that won.
+/// It is not a silent policy bypass: env is already the most-trusted policy
+/// origin (`LOOM_FORGE_EGRESS_POLICY` outranks the machine policy wholesale),
+/// and the forge-egress validator reports where a declined rung lands. The
+/// version floor reads the exec target; a landing on bare `gh` is what
+/// `toolchain.launcher-not-first` measures; a landing on `LOOM_GH_BIN` (or any
+/// exec target that is neither the existing launcher nor `PATH`'s `gh`) raises
+/// `toolchain.policy-launcher-declined`. All three are routing findings, so
+/// under `enforcement.api = required` `assert` fails. The report's
+/// `observed.ghSource` names the rung that won.
 pub const NO_POLICY_LAUNCHER_ENV: &str = "LOOM_GH_NO_POLICY_LAUNCHER";
 
 /// Whether `value` (of [`NO_POLICY_LAUNCHER_ENV`]) declines the policy rung.
