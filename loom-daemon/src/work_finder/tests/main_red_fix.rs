@@ -420,6 +420,7 @@ fn the_watch_alerts_once_per_fix_past_the_threshold() {
     assert!(watch.observe(at(29), true, &[9], after).is_empty());
     let due = watch.observe(at(30), true, &[9], after);
     assert_eq!(due.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![9]);
+    watch.record_attempt(at(30), 9, true);
     assert!(watch.observe(at(45), true, &[9], after).is_empty(), "once");
 
     // Claimed (left the waiting set), then released again: the clock restarts.
@@ -427,6 +428,7 @@ fn the_watch_alerts_once_per_fix_past_the_threshold() {
     assert!(watch.observe(at(47), true, &[9], after).is_empty());
     assert!(watch.observe(at(76), true, &[9], after).is_empty());
     assert_eq!(watch.observe(at(77), true, &[9], after).len(), 1);
+    watch.record_attempt(at(77), 9, true);
 
     // A green tick resets everything; a green repo never alerts.
     let mut watch = RedFixWatch::default();
@@ -434,6 +436,27 @@ fn the_watch_alerts_once_per_fix_past_the_threshold() {
     assert!(watch.observe(at(20), false, &[9], after).is_empty());
     assert!(watch.observe(at(40), true, &[9], after).is_empty(), "clock restarted at 40");
     assert!(watch.observe(at(100), false, &[9], after).is_empty());
+}
+
+#[test]
+fn a_failed_alert_filing_is_retried_with_backoff_until_it_succeeds() {
+    let after = std::time::Duration::from_secs(30 * 60);
+    let t0 = std::time::Instant::now();
+    let at = |secs: u64| t0 + std::time::Duration::from_secs(secs);
+    let mut watch = RedFixWatch::default();
+    assert!(watch.observe(at(0), true, &[9], after).is_empty());
+    assert_eq!(watch.observe(at(1800), true, &[9], after).len(), 1);
+    watch.record_attempt(at(1800), 9, false); // sink failed once
+
+    assert!(watch.observe(at(1830), true, &[9], after).is_empty(), "backing off 60s");
+    assert_eq!(watch.observe(at(1860), true, &[9], after).len(), 1, "retried");
+    watch.record_attempt(at(1860), 9, false); // failed again: 120s
+    assert!(watch.observe(at(1950), true, &[9], after).is_empty());
+    assert_eq!(watch.observe(at(1980), true, &[9], after).len(), 1);
+    watch.record_attempt(at(1980), 9, true); // finally filed
+
+    assert!(watch.observe(at(2100), true, &[9], after).is_empty(), "no refile after success");
+    assert!(watch.observe(at(9000), true, &[9], after).is_empty());
 }
 
 /// A dispatcher recording the escalation calls the tick makes.

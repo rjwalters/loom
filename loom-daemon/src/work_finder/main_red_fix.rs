@@ -132,13 +132,22 @@ pub fn evaluate<D: WorkDispatcher + ?Sized>(
 pub struct RedFixWatch {
     first_seen: HashMap<u32, Instant>,
     alerted: HashSet<u32>,
+    /// Fixes whose alert filing failed: consecutive failures and the earliest
+    /// next attempt, so a transient forge failure is retried with backoff.
+    retry: HashMap<u32, (u32, Instant)>,
 }
+
+/// First retry delay after a failed alert filing; doubles per failure.
+const ALERT_RETRY_BASE: Duration = Duration::from_secs(60);
+/// Ceiling on the alert retry delay.
+const ALERT_RETRY_MAX: Duration = Duration::from_secs(3600);
 
 impl RedFixWatch {
     /// Record this tick's waiting fixes and return the ones due an alert now,
     /// with how long each has waited. A fix is due once, when it has waited
-    /// at least `after`. A green tick, or a fix leaving the waiting set (it
-    /// was claimed), resets its clock.
+    /// at least `after` and keeps being due until [`Self::record_attempt`]
+    /// reports a successful filing (failed attempts back off). A green tick,
+    /// or a fix leaving the waiting set (it was claimed), resets its clock.
     pub fn observe(
         &mut self,
         now: Instant,
@@ -153,14 +162,32 @@ impl RedFixWatch {
         };
         self.first_seen.retain(|n, _| keep.contains(n));
         self.alerted.retain(|n| keep.contains(n));
+        self.retry.retain(|n, _| keep.contains(n));
         let mut due = Vec::new();
         for &n in waiting.iter().filter(|n| keep.contains(n)) {
             let waited = now.saturating_duration_since(*self.first_seen.entry(n).or_insert(now));
-            if waited >= after && self.alerted.insert(n) {
+            let backed_off = self.retry.get(&n).is_some_and(|(_, at)| now < *at);
+            if waited >= after && !self.alerted.contains(&n) && !backed_off {
                 due.push((n, waited));
             }
         }
         due
+    }
+
+    /// Record the outcome of filing `n`'s alert: success acknowledges it (no
+    /// later tick files again); failure schedules a retry with doubling
+    /// backoff, capped at [`ALERT_RETRY_MAX`].
+    pub fn record_attempt(&mut self, now: Instant, n: u32, filed: bool) {
+        if filed {
+            self.retry.remove(&n);
+            self.alerted.insert(n);
+            return;
+        }
+        let failures = self.retry.get(&n).map_or(0, |(f, _)| *f).saturating_add(1);
+        let delay = ALERT_RETRY_BASE
+            .saturating_mul(1u32 << (failures - 1).min(16))
+            .min(ALERT_RETRY_MAX);
+        self.retry.insert(n, (failures, now + delay));
     }
 }
 
@@ -200,7 +227,13 @@ pub fn escalate_global(root: &Path, red: bool, waiting: &[u32]) {
             .observe(Instant::now(), red, waiting, after)
     };
     for (issue, waited) in due {
-        file_alert(root, issue, waited);
+        let filed = file_alert(root, issue, waited);
+        watches()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(root.to_path_buf())
+            .or_default()
+            .record_attempt(Instant::now(), issue, filed);
     }
 }
 
@@ -212,8 +245,9 @@ pub fn alert_title(issue: u32) -> String {
 
 /// File the alert as a `loom:operator` issue via `create-issue.sh`, the same
 /// path the CI billing alert uses. No `--force`, so the script's duplicate
-/// backstop dedups across daemon restarts and hosts.
-fn file_alert(root: &Path, issue: u32, waited: Duration) {
+/// backstop dedups across daemon restarts and hosts. Returns whether the alert
+/// now exists (created, or the script reported a matching existing one).
+fn file_alert(root: &Path, issue: u32, waited: Duration) -> bool {
     let minutes = waited.as_secs() / 60;
     log::error!(
         "work_finder: main of {} has been red with main-red-fix #{issue} unclaimed for \
@@ -223,7 +257,7 @@ fn file_alert(root: &Path, issue: u32, waited: Duration) {
     let Some(script) = crate::watchdog::escalate::resolve_issue_script(Some(root), root, None)
     else {
         log::error!("work_finder: no create-issue.sh to alert with for #{issue} (#10118)");
-        return;
+        return false;
     };
     let body = format!(
         "`main` is verified red and #{issue} (carrying `{MAIN_RED_FIX_MARKER}`) has waited \
@@ -244,6 +278,7 @@ fn file_alert(root: &Path, issue: u32, waited: Duration) {
     if !ok {
         log::error!("work_finder: filing the red-main-fix alert for #{issue} failed (#10118)");
     }
+    ok
 }
 
 /// One repo's inputs to the red-main-fix lane, resolved once per tick.
