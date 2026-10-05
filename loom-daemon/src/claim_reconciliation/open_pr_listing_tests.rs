@@ -328,7 +328,10 @@ fn failing_mergeable_stub(dir: &Path, stderr: &str) -> (PathBuf, PathBuf) {
 }
 
 fn read_count(reads: &Path) -> usize {
-    std::fs::read_to_string(reads).unwrap_or_default().lines().count()
+    std::fs::read_to_string(reads)
+        .unwrap_or_default()
+        .lines()
+        .count()
 }
 
 /// AC5: a rate-limited per-PR mergeability read trips the breaker, and the

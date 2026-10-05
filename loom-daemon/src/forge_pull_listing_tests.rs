@@ -194,7 +194,12 @@ impl Drop for StoreGuard {
 fn a_per_pr_entry_stores_only_mergeable_and_stale_ones_are_pruned() {
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("store");
-    std::fs::create_dir(&store_dir).unwrap();
+    // 0700 regardless of umask: the store purges a dir others could write
+    // (a umask-002 host would otherwise wipe the seeded files).
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&store_dir).unwrap();
+    }
     store::set_test_daemon_store_dir(Some(store_dir.clone()));
     let _guard = StoreGuard;
     let (gh, _) = write_fake_gh(dir.path(), 0);

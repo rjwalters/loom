@@ -20,7 +20,7 @@ use anyhow::Result;
 use super::review_conflict::Mergeable;
 use super::MAX_ISSUES_PER_WORKSPACE;
 use crate::forge_pull_listing::{list_open_pulls_cached_as, pull_mergeable_cached_as};
-use crate::rate_limit_breaker::report::{BreakerHandle, FailureContext, ProbeMode};
+use crate::rate_limit_breaker::report::{BreakerHandle, FailureContext};
 
 pub use crate::forge_pull_listing::RestPull;
 
