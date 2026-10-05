@@ -50,6 +50,20 @@ pub struct Reader {
     pub dir: PathBuf,
 }
 
+/// One reader installation — the rate-limit bucket a read spends from (#10329):
+/// `(App id, lowercase repo owner)`. A reader App's budget is per installation,
+/// not per App, so one owner's low bucket says nothing about another's.
+pub type Installation = (String, String);
+
+impl Reader {
+    /// The [`Installation`] `repo`'s (`owner/repo`) reads spend from.
+    #[must_use]
+    pub fn installation(&self, repo: &str) -> Installation {
+        let owner = repo.split_once('/').map_or(repo, |(owner, _)| owner);
+        (self.app_id.clone(), owner.to_ascii_lowercase())
+    }
+}
+
 /// Why a repo has no usable reader this cycle. Either way it costs zero calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoReader {

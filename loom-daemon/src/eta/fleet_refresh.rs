@@ -43,8 +43,9 @@
 //!
 //! Every request counts, `304`s and errors included, against the host-wide
 //! budget of its pass kind. A response reporting fewer than `reserve` core
-//! calls remaining is kept, then every further repo on that reader App is
-//! skipped (`reserve`). A rate limit ends the cycle; a coverage gap or other
+//! calls remaining is kept, then every further repo on that reader
+//! installation — App and repo owner, the bucket the header reports (#10329)
+//! — is skipped (`reserve`). A rate limit ends the cycle; a coverage gap or other
 //! forge error ends that repo; an open breaker or a shutdown ends the cycle
 //! before the next call. A due backfill skipped before its first call is
 //! recorded as in progress from that cycle ([`pend_backfill`], #10292), so it
@@ -58,8 +59,8 @@ use serde::{Deserialize, Serialize};
 
 use super::fleet::{self, FleetSnapshot};
 use super::fleet_fetch::{
-    history, listing_url, parse_listing, timeline_url, ForgeRead, NoReader, Read, ReadFailure,
-    Reader, RepoTarget, PER_PAGE,
+    history, listing_url, parse_listing, timeline_url, ForgeRead, Installation, NoReader, Read,
+    ReadFailure, Reader, RepoTarget, PER_PAGE,
 };
 use crate::forge_call_stats::ops::{ISSUE_LIST, TIMELINE_READ};
 use crate::forge_call_stats::ForgeOp;
@@ -424,7 +425,7 @@ pub fn run_cycle(
         ..CycleReport::default()
     };
     let mut halted: Option<StopReason> = None;
-    let mut reserve_apps: BTreeSet<String> = BTreeSet::new();
+    let mut reserve_installs: BTreeSet<Installation> = BTreeSet::new();
     for p in planned {
         let repo = &p.target.repo;
         // A skipped repo still reports the snapshot it is left with, so a
@@ -449,8 +450,8 @@ pub fn run_cycle(
             }
         };
         let skip = halted.or_else(|| {
-            reserve_apps
-                .contains(&reader.app_id)
+            reserve_installs
+                .contains(&reader.installation(repo))
                 .then_some(StopReason::Reserve)
         });
         let remaining = match p.kind {
@@ -511,7 +512,7 @@ pub fn run_cycle(
             _ => {}
         }
         if below_reserve || stop == StopReason::Reserve {
-            reserve_apps.insert(reader.app_id.clone());
+            reserve_installs.insert(reader.installation(repo));
         }
         report.repos.push(r);
     }

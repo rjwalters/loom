@@ -16,6 +16,33 @@
 //! after spawn, missed ticks skipped), each cycle one `spawn_blocking` call
 //! under `catch_unwind`, so a panic is a `warn` and the next tick retries.
 //!
+//! # One refresher: the fleet captain (#10329)
+//!
+//! The snapshots and raw caches are byte-deterministic and host-independent,
+//! and every host resolves the same reader installations, so N refreshers buy
+//! nothing and spend N times the shared reader budgets. Each tick therefore
+//! passes the `fleet.captain` gate (#8848) first ([`gate_tick`], re-read every
+//! tick, so an edit needs no restart):
+//!
+//! - **This host is the captain**: `eta-fleet-refresh` is armed
+//!   ([`SINGLETON_JOB_NAME`], `host.health.armed_singleton_jobs`) and the
+//!   cycle runs.
+//! - **Another host is**: no forge call at all (snapshots, backfill, raw
+//!   events) and no record, but the fit check still runs, on whatever
+//!   snapshots this host has — the captain's, when `LOOM_ETA_FLEET_SNAPSHOT_DIR`
+//!   points at a directory shared with it; otherwise only this host's own
+//!   older ones, or none (logged when the gate changes). Publishing the
+//!   captain's fit to the other hosts is not this task's job.
+//! - **No captain declared**: the cycle runs, unarmed — deliberately
+//!   **fail-open**, unlike the gate's fail-closed contract for alerting jobs.
+//!   A duplicate refresh costs budget, never correctness (deterministic
+//!   output, atomic last-writer-wins), and the task is on by default: a
+//!   single-host install must not lose its fit for want of a captain. Logged
+//!   once, with the hint to declare one.
+//!
+//! `should_spawn` / `owns_fit` stay config-only, so the fit's owner never
+//! flips with the gate.
+//!
 //! # One cycle
 //!
 //! 1. **Repo set** ([`repo_targets`]): every provisioned root and the daemon's
@@ -61,8 +88,8 @@ use crate::eta::fit::{run, Fitter};
 use crate::eta::fleet;
 use crate::eta::fleet_events::{self, EventLog, EventsCursor, SyncMode};
 use crate::eta::fleet_events_forge::{ForgeEndpoint, ForgeEventSource};
-use crate::eta::fleet_fetch::{ForgeRead, NoReader, Reader, ReaderForge, RepoTarget};
-use crate::eta::fleet_refresh::{self, Budgets, CycleReport, RepoReport, StopReason};
+use crate::eta::fleet_fetch::{ForgeRead, Installation, NoReader, Reader, ReaderForge, RepoTarget};
+use crate::eta::fleet_refresh::{self, Budgets, CycleReport, PassKind, RepoReport, StopReason};
 use crate::eta::Provenance;
 use crate::telemetry::kinds::eta_fleet_refresh::EtaFleetRefreshRecord;
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
@@ -95,6 +122,147 @@ pub struct TaskState {
     pub backoff_until: Option<DateTime<Utc>>,
     /// Repos already warned about having no usable reader.
     warned: BTreeSet<String>,
+    /// The last tick's captain gate, so a change is logged once (#10329).
+    gate: Option<RefreshGate>,
+}
+
+/// The singleton job name this task arms under `fleet.captain` (#10329).
+pub const SINGLETON_JOB_NAME: &str = "eta-fleet-refresh";
+
+/// One tick's fleet-captain decision (#10329; see the module doc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshGate {
+    /// This host is the declared captain: armed, and it refreshes.
+    Captain,
+    /// No `fleet.captain` declared: it refreshes, unarmed (fail-open).
+    NoCaptain,
+    /// Another host is the captain: no forge call, no record; the fit runs.
+    StandDown { captain: String },
+}
+
+impl RefreshGate {
+    /// Whether this tick makes the cycle's forge calls.
+    #[must_use]
+    pub fn refreshes(&self) -> bool {
+        !matches!(self, Self::StandDown { .. })
+    }
+}
+
+/// Resolve this tick's [`RefreshGate`] from `root`'s `fleet.captain`, keep the
+/// armed-singleton registry in step, and log the gate when it changes.
+pub fn gate_tick(root: &Path, host_id: &str, task: &mut TaskState) -> RefreshGate {
+    use crate::fleet_captain::{self as captain, CaptainGate};
+    let gate = match captain::resolve_gate_for_root(root, host_id) {
+        CaptainGate::Armed { captain: name } => {
+            match captain::arm_singleton_job(SINGLETON_JOB_NAME, root, host_id) {
+                Ok(()) => RefreshGate::Captain,
+                // `fleet.captain` changed between the two reads: sit this tick
+                // out; the next one re-reads it.
+                Err(_) => RefreshGate::StandDown { captain: name },
+            }
+        }
+        CaptainGate::Refused { captain: name, .. } => {
+            captain::disarm_singleton_job(SINGLETON_JOB_NAME);
+            RefreshGate::StandDown { captain: name }
+        }
+        // Not `arm_singleton_job`: that would list the job as captainless
+        // (stopped for want of a captain), and this one fails open instead.
+        CaptainGate::NoCaptainDeclared => {
+            captain::disarm_singleton_job(SINGLETON_JOB_NAME);
+            RefreshGate::NoCaptain
+        }
+    };
+    if task.gate.as_ref() != Some(&gate) {
+        log_gate(root, host_id, &gate);
+        task.gate = Some(gate.clone());
+    }
+    gate
+}
+
+fn log_gate(root: &Path, host_id: &str, gate: &RefreshGate) {
+    match gate {
+        RefreshGate::Captain => log::info!(
+            "eta fleet refresh: this host ({host_id}) is the fleet captain — it refreshes the \
+             fleet snapshots for every host (#10329)"
+        ),
+        RefreshGate::NoCaptain => log::info!(
+            "eta fleet refresh: no fleet.captain declared; every host with a reader refreshes. \
+             Declare one on a multi-host fleet (`fleet.captain` in .loom/config.json) so only \
+             one host spends the shared reader budgets (#10329)"
+        ),
+        RefreshGate::StandDown { captain } => {
+            let dir = fleet::snapshot_dir(root);
+            let present = fleet::load_all(root).len();
+            log::info!(
+                "eta fleet refresh: standing down — the fleet captain is {captain}, this host is \
+                 {host_id}: no forge calls and no eta.fleet_refresh records here (#10329). The \
+                 daily fit still runs on the {present} snapshot(s) under {}{}",
+                dir.display(),
+                if present == 0 {
+                    ": none, so nothing to fit until the captain's snapshots are shared here \
+                     (LOOM_ETA_FLEET_SNAPSHOT_DIR)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+}
+
+/// What one tick did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tick {
+    pub gate: RefreshGate,
+    /// The cycle, or `None` when the host stood down (no call, no record).
+    pub outcome: Option<CycleOutcome>,
+    /// The hold for this tick's [`after_cycle`].
+    pub fit_held: bool,
+}
+
+/// One tick: the captain gate, then `run` (the cycle) only when this host
+/// refreshes. A standing-down host still computes the fit hold, from the
+/// refresh state beside its snapshots ([`backfill_in_progress_since`]), so a
+/// host sharing the captain's snapshot directory honours its backfill hold.
+pub fn tick(
+    root: &Path,
+    host_id: &str,
+    task: &mut TaskState,
+    now: DateTime<Utc>,
+    run: impl FnOnce(&mut TaskState) -> CycleOutcome,
+) -> Tick {
+    let gate = gate_tick(root, host_id, task);
+    if gate.refreshes() {
+        let outcome = run(task);
+        Tick {
+            gate,
+            fit_held: outcome.fit_held,
+            outcome: Some(outcome),
+        }
+    } else {
+        Tick {
+            gate,
+            outcome: None,
+            fit_held: fleet_refresh::fit_held(backfill_in_progress_since(root), now),
+        }
+    }
+}
+
+/// The oldest in-progress backfill among every refresh state under `root`'s
+/// snapshot directory — [`fleet_refresh::backfill_since`] without a repo set.
+#[must_use]
+pub fn backfill_in_progress_since(root: &Path) -> Option<DateTime<Utc>> {
+    let entries = std::fs::read_dir(fleet_refresh::refresh_dir(root)).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.ends_with(".json") && !name.ends_with(".staging.json")
+        })
+        .filter_map(|p| fleet_refresh::read_state(&p)?.pass)
+        .filter(|pass| pass.kind == PassKind::Backfill)
+        .map(|pass| pass.listed_at)
+        .min()
 }
 
 /// Start the task. `None` when it is configured off.
@@ -172,7 +340,8 @@ pub fn spawn_task(
     }))
 }
 
-/// One production cycle: the real repo set, reader resolution and forge.
+/// One production tick: the captain gate ([`tick`]), then the cycle over the
+/// real repo set, reader resolution and forge, then the fit check.
 fn run_production_cycle(
     root: &Path,
     roots: &[PathBuf],
@@ -182,6 +351,12 @@ fn run_production_cycle(
     task: &mut TaskState,
     (fit_enabled, fitter): (bool, &Fitter),
 ) {
+    let now = Utc::now();
+    // Re-resolved every tick, like `ci_telemetry`'s gate: a host-identity
+    // change takes effect on the next tick too (#8848).
+    let gate_host = crate::sweep_registry::host_identity();
+    // Local only (git remotes, reader token files): no forge call, so the
+    // repo set is resolved on every host, for the SigNoz half below too.
     let targets = repo_targets(
         root,
         roots,
@@ -191,17 +366,20 @@ fn run_production_cycle(
                 .map(|(dir, app_id)| Reader { app_id, dir })
         },
     );
-    let mut forge = ReaderForge::new();
-    let mut events = |target: &RepoTarget,
-                      reader: &Reader,
-                      endpoint: ForgeEndpoint,
-                      left: u64,
-                      mode: SyncMode| {
-        sync_events(root, target, reader, endpoint, left, mode, config.reserve_calls)
-    };
-    let outcome = cycle(root, &targets, &mut forge, &mut events, config, task, Utc::now());
+    let ticked = tick(root, &gate_host, task, now, |task| {
+        let mut forge = ReaderForge::new();
+        let mut events = |target: &RepoTarget,
+                          reader: &Reader,
+                          endpoint: ForgeEndpoint,
+                          left: u64,
+                          mode: SyncMode| {
+            sync_events(root, target, reader, endpoint, left, mode, config.reserve_calls)
+        };
+        cycle(root, &targets, &mut forge, &mut events, config, task, now)
+    });
     let loom = Provenance::current();
-    for record in records(&outcome.report, host_id, outcome.started_at, &loom) {
+    let report = ticked.outcome.as_ref().map(|o| (&o.report, o.started_at));
+    for record in report.map_or_else(Vec::new, |(r, at)| records(r, host_id, at, &loom)) {
         if !record.has_provenance() {
             log::warn!("eta fleet refresh: dropped record for {}: invalid provenance", record.repo);
             continue;
@@ -211,13 +389,15 @@ fn run_production_cycle(
         }
     }
     // #9758: the SigNoz in-sweep half, same cadence, its own backend. Before
-    // the fit only by position; the fit reads forge snapshots alone.
+    // the fit only by position; the fit reads forge snapshots alone. Not
+    // captain-gated (#10329): it spends no reader budget, and it is a
+    // per-host opt-in with its own credential.
     if config.signoz.enabled {
         let repos: Vec<String> = targets.iter().map(|t| t.repo.clone()).collect();
         signoz_cycle(root, &repos, &config.signoz, Utc::now());
     }
     // After the records: a fit that panics must not cost the cycle's telemetry.
-    after_cycle(root, Utc::now(), outcome.fit_held, fit_enabled, fitter);
+    after_cycle(root, Utc::now(), ticked.fit_held, fit_enabled, fitter);
 }
 
 /// Refresh every repo's SigNoz in-sweep snapshot (#9758) through the
@@ -425,7 +605,8 @@ fn gated(root: &Path, target: &RepoTarget, stop: StopReason) -> RepoReport {
 /// time, from what the matching budget has left. Each endpoint picks refresh or
 /// backfill from its own cursor key; the budgets are shared by every endpoint
 /// and repo. Skipped for a repo whose snapshot pass hit a coverage gap, for
-/// every repo on a reader App that hit the reserve, and for everything left
+/// every repo on a reader installation (App and owner, #10329) that hit the
+/// reserve, and for everything left
 /// once one sync is rate limited or meets the open breaker.
 fn sync_all_events(
     root: &Path,
@@ -439,11 +620,15 @@ fn sync_all_events(
     if halted {
         return;
     }
-    let mut reserve_apps: BTreeSet<String> = report
-        .repos
+    let mut reserve_installs: BTreeSet<Installation> = targets
         .iter()
-        .filter(|r| r.stop == StopReason::Reserve)
-        .filter_map(|r| r.reader_app.clone())
+        .filter(|t| {
+            report
+                .repos
+                .iter()
+                .any(|r| r.repo == t.repo && r.stop == StopReason::Reserve)
+        })
+        .filter_map(|t| t.reader.as_ref().ok().map(|r| r.installation(&t.repo)))
         .collect();
     for target in targets {
         let Ok(reader) = &target.reader else { continue };
@@ -455,7 +640,7 @@ fn sync_all_events(
         }
         let cursor_file = fleet_events::cursor_path(root, &target.repo);
         for endpoint in event_endpoints() {
-            if reserve_apps.contains(&reader.app_id) {
+            if reserve_installs.contains(&reader.installation(&target.repo)) {
                 break;
             }
             // Re-read per endpoint: never infer one listing's completeness
@@ -485,7 +670,7 @@ fn sync_all_events(
                 }
                 Some(StopReason::BreakerOpen) => return,
                 Some(StopReason::Reserve) => {
-                    reserve_apps.insert(reader.app_id.clone());
+                    reserve_installs.insert(reader.installation(&target.repo));
                 }
                 // The reader was withdrawn for this repo: its other listings
                 // would only fail the same way.
@@ -686,3 +871,7 @@ fn log_summary(report: &CycleReport) {
 #[cfg(test)]
 #[path = "eta_fleet_refresh_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "eta_fleet_refresh_gate_tests.rs"]
+mod gate_tests;

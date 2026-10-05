@@ -11,14 +11,15 @@
 //!
 //! `autonomous.eta.fleetRefresh.*` (#10263) — the daemon task that backfills
 //! and refreshes the fleet snapshots (`observability::eta_fleet_refresh`).
-//! Resolved once at spawn, so a change needs a daemon restart.
+//! Resolved once at spawn, so a change needs a daemon restart. Which host
+//! runs it is `fleet.captain`'s call, re-read every tick (#10329).
 //!
 //! | key | env | default |
 //! |---|---|---|
 //! | `enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | `true` |
 //! | `intervalSecs` | `LOOM_ETA_FLEET_REFRESH_INTERVAL_SECS` | `3600` (min `900`) |
 //! | `maxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_MAX_CALLS` | `300` |
-//! | `backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `1500` |
+//! | `backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `600` (#10329) |
 //! | `reserveCalls` | `LOOM_ETA_FLEET_REFRESH_RESERVE` | `1500` |
 //! | `backfillDays` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS` | `21` (min `fit::WINDOW_DAYS + 1`) |
 
@@ -89,11 +90,15 @@ pub const MIN_FLEET_REFRESH_INTERVAL_SECS: u64 = 900;
 /// Default per-cycle forge-call budget for refresh passes.
 pub const DEFAULT_FLEET_REFRESH_MAX_CALLS: u64 = 300;
 
-/// Default per-cycle forge-call budget for backfill passes.
-pub const DEFAULT_FLEET_REFRESH_BACKFILL_MAX_CALLS: u64 = 1500;
+/// Default per-cycle forge-call budget for backfill passes. 600, not the
+/// original 1500 (#10329): 1500 a cycle was most of a 5,000/h reader
+/// installation on its own. Loom's own 21-day first backfill (~1,300 calls)
+/// still finishes in three cycles, inside the fit's six-hour backfill hold.
+pub const DEFAULT_FLEET_REFRESH_BACKFILL_MAX_CALLS: u64 = 600;
 
-/// Default reserve floor: stop a reader App's repos for the cycle once a
-/// response reports fewer core calls than this remaining.
+/// Default reserve floor: stop a reader installation's repos (App and owner,
+/// #10329) for the cycle once a response reports fewer core calls than this
+/// remaining.
 pub const DEFAULT_FLEET_REFRESH_RESERVE: u64 = 1500;
 
 /// Default backfill depth, in days.
