@@ -16,14 +16,28 @@
 //!    still applies (stalled last, stars first, then oldest-first), and a
 //!    constraint edge (trusted marker, stacked base) still beats any rank.
 //! 2. **No new holds behind a non-ready head** ([`drop_edges_behind_unready`]):
-//!    the planner never emits a `source=pass` edge whose predecessor is not
-//!    [`ready`].
+//!    the planner never emits a shared-files `source=pass` edge whose
+//!    predecessor is not [`ready`].
 //! 3. **Release when the head stops being ready** ([`with_readiness`]): an
 //!    existing SOFT hold whose predecessor, as this tick's listing shows it,
 //!    is no longer ready is released ([`HoldAction::ReleaseNotReady`]). This
 //!    is the verdict-change re-plan: the release happens on the first tick
 //!    that sees the flip, and the next tick's plan re-derives the order from
 //!    the new readiness (rule 1), so the follower is not put back behind it.
+//!
+//! **Stacked bases are exempt from rules 2 and 3.** A follower whose base
+//! branch is the predecessor's head branch ([`EdgeReason::StackedBase`])
+//! depends on it, and the hold is what stops it merging into an unready
+//! branch; readiness only governs rebase-saving (shared-files) order. Rule 3
+//! mirrors the #10077 no-overlap check: it releases only when the pair is
+//! provably not stacked, and an empty branch name is unknown, so it keeps the
+//! hold (fail closed).
+//!
+//! **One-tick gap for non-ready followers.** When a follower's nearest
+//! overlapping predecessor is not ready, its edge is dropped and the follower
+//! is not re-attached to a farther ready member. That is harmless while the
+//! follower itself is not ready (nothing is about to land), and once it gets
+//! `loom:pr` the next tick re-plans it against the ready members.
 //!
 //! What it never touches: HARD holds (no `source=`, the human-authored shape)
 //! stay [`HoldAction::HoldHard`] and never auto-expire; consolidation
@@ -41,8 +55,8 @@ use std::collections::BTreeMap;
 
 use super::stall::CONSOLIDATION_PLAN_PREFIX;
 use super::{
-    evaluate, HoldAction, KeepReason, PredecessorState, SequenceGroup, SequenceMarker, SequencePr,
-    Verdict, SOURCE_PASS,
+    evaluate, EdgeReason, HoldAction, KeepReason, PredecessorState, SequenceGroup, SequenceMarker,
+    SequencePr, Verdict, SOURCE_PASS,
 };
 
 /// The verdict label an approved PR carries.
@@ -66,13 +80,21 @@ pub fn tier(pr: &SequencePr) -> u8 {
     u8::from(!ready(pr))
 }
 
-/// Remove every planned edge whose predecessor is not [`ready`]. A
-/// predecessor absent from `by_number` is treated as not ready: no hold is
-/// ever written against a PR whose state this tick did not read.
+/// Remove every planned shared-files edge whose predecessor is not
+/// [`ready`]. A predecessor absent from `by_number` is treated as not ready:
+/// no such hold is ever written against a PR whose state this tick did not
+/// read. [`EdgeReason::StackedBase`] edges are always kept — a stacked
+/// follower depends on its base, whatever the base's readiness.
 pub fn drop_edges_behind_unready(group: &mut SequenceGroup, by_number: &BTreeMap<u32, SequencePr>) {
-    group
-        .edges
-        .retain(|e| by_number.get(&e.after).is_some_and(ready));
+    group.edges.retain(|e| {
+        e.reason == EdgeReason::StackedBase || by_number.get(&e.after).is_some_and(ready)
+    });
+}
+
+/// Is `follower` provably not stacked on `head`? Both branch names must be
+/// known (non-empty) and differ — the #10077 `release_candidate` rule.
+fn provably_unstacked(follower: &SequencePr, head: &SequencePr) -> bool {
+    !follower.base_ref.is_empty() && !head.head_ref.is_empty() && follower.base_ref != head.head_ref
 }
 
 /// Phase 1's decision for one hold, plus the not-ready release: a SOFT hold
@@ -82,24 +104,33 @@ pub fn drop_edges_behind_unready(group: &mut SequenceGroup, by_number: &BTreeMap
 ///
 /// `head` is the predecessor's row in this tick's listing; `None` (outside
 /// the listing) keeps the decision unchanged, as do an unreadable
-/// predecessor (`pred: None`) and an unknown follower head — every release
-/// needs a positive signal (the #9378 asymmetry). Hard holds and
-/// consolidation reservations are never touched.
+/// predecessor (`pred: None`), an unknown follower head, and a follower that
+/// is not provably unstacked from `head` (stacked, or either branch name
+/// unknown) — every release needs a positive signal (the #9378 asymmetry).
+/// Hard holds and consolidation reservations are never touched.
 #[must_use]
 pub fn with_readiness(
     action: HoldAction,
     marker: &SequenceMarker,
     pred: Option<&PredecessorState>,
-    follower_head: Option<&str>,
+    follower: &SequencePr,
     head: Option<&SequencePr>,
 ) -> HoldAction {
     let soft = marker.source.as_deref() == Some(SOURCE_PASS)
         && !marker.plan.starts_with(CONSOLIDATION_PLAN_PREFIX);
-    let in_flight = pred.zip(follower_head).is_some_and(|(p, fh)| {
-        matches!(evaluate(marker, p, fh), Verdict::Keep(KeepReason::InFlight))
-    });
+    let in_flight = pred
+        .zip(follower.head_sha.as_deref())
+        .is_some_and(|(p, fh)| {
+            matches!(evaluate(marker, p, fh), Verdict::Keep(KeepReason::InFlight))
+        });
     match head {
-        Some(h) if action == HoldAction::HoldSoft && soft && in_flight && !ready(h) => {
+        Some(h)
+            if action == HoldAction::HoldSoft
+                && soft
+                && in_flight
+                && provably_unstacked(follower, h)
+                && !ready(h) =>
+        {
             HoldAction::ReleaseNotReady
         }
         _ => action,

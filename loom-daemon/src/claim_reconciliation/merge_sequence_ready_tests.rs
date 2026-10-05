@@ -81,7 +81,7 @@ fn decide(m: &SequenceMarker, follower: &SequencePr, listing: &[SequencePr]) -> 
     let fh = follower.head_sha.as_deref();
     let base = hold_action(m, Some(&p), fh, follower.has(APPROVED_LABEL), 72.0);
     let head = listing.iter().find(|h| h.number == m.after);
-    with_readiness(base, m, Some(&p), fh, head)
+    with_readiness(base, m, Some(&p), follower, head)
 }
 
 const CR: &str = "loom:changes-requested";
@@ -269,7 +269,7 @@ fn hard_markers_never_release_or_expire_behind_a_non_ready_head() {
     assert_eq!(base, HoldAction::HoldHard);
     let head = pr(10, "2020-01-01T00:00:00Z", &[CR]);
     assert_eq!(
-        with_readiness(base, &hard, Some(&ancient), Some(&sha(20)), Some(&head)),
+        with_readiness(base, &hard, Some(&ancient), &follower, Some(&head)),
         HoldAction::HoldHard
     );
     // A non-`pass` source is also hard.
@@ -294,14 +294,17 @@ fn reservations_and_every_other_decision_are_left_alone() {
     // Unreadable predecessor or unknown follower head: fail closed.
     let m = soft(20, 10);
     let p = open_at_pin(10, &Utc::now().to_rfc3339());
-    let fh = Some(sha(20));
-    let fh = fh.as_deref();
+    let fh = &follower;
     assert_eq!(
         with_readiness(HoldAction::HoldSoft, &m, None, fh, Some(&head)),
         HoldAction::HoldSoft
     );
+    let headless = SequencePr {
+        head_sha: None,
+        ..follower.clone()
+    };
     assert_eq!(
-        with_readiness(HoldAction::HoldSoft, &m, Some(&p), None, Some(&head)),
+        with_readiness(HoldAction::HoldSoft, &m, Some(&p), &headless, Some(&head)),
         HoldAction::HoldSoft
     );
     // A moved predecessor head is the void path, not this one.
@@ -362,8 +365,42 @@ fn a_constraint_edge_still_beats_readiness() {
     let prs = [base, stacked, pr(6, "2026-10-01T02:00:00Z", &[])];
     let groups = plan_repo_with(&prs, &all_share(&[4, 5, 6]), &BTreeMap::new(), &BTreeSet::new());
     assert_eq!(groups[0].order, vec![4, 5, 6]);
-    // No hold is written behind the non-ready base either.
-    assert!(groups[0].edges.iter().all(|e| e.after != 4));
+    // The stacked edge is a dependency, not a rebase-saving preference: it is
+    // kept behind the non-ready base, so the approved #5 cannot land into an
+    // unready branch. No shared-files edge is written behind #4.
+    let planned: Vec<(u32, u32, EdgeReason)> = groups[0]
+        .edges
+        .iter()
+        .map(|e| (e.follower, e.after, e.reason))
+        .collect();
+    assert!(planned.contains(&(5, 4, EdgeReason::StackedBase)), "{planned:?}");
+    assert!(
+        planned
+            .iter()
+            .all(|(_, a, r)| *a != 4 || *r == EdgeReason::StackedBase),
+        "{planned:?}"
+    );
+}
+
+#[test]
+fn a_stacked_soft_hold_stays_held_behind_a_non_ready_base() {
+    let base = pr(10, "2026-10-01T00:00:00Z", &[CR]);
+    let mut stacked = pr(20, "2026-10-02T00:00:00Z", &[APPROVED_LABEL, SEQUENCE_LABEL]);
+    stacked.base_ref = base.head_ref.clone();
+    let m = soft(20, 10);
+    let listing = [base.clone(), stacked.clone()];
+    assert_eq!(decide(&m, &stacked, &listing), HoldAction::HoldSoft);
+    // Unknown branch names cannot prove the pair is unstacked: fail closed,
+    // exactly as the #10077 no-overlap release does.
+    let mut unknown_base = stacked.clone();
+    unknown_base.base_ref = String::new();
+    assert_eq!(decide(&m, &unknown_base, &listing), HoldAction::HoldSoft);
+    let mut nameless = base.clone();
+    nameless.head_ref = String::new();
+    let follower = pr(20, "2026-10-02T00:00:00Z", &[APPROVED_LABEL, SEQUENCE_LABEL]);
+    assert_eq!(decide(&m, &follower, &[nameless, follower.clone()]), HoldAction::HoldSoft);
+    // The same pair, unstacked, is released (the control).
+    assert_eq!(decide(&m, &follower, &[base, follower.clone()]), HoldAction::ReleaseNotReady);
 }
 
 #[test]

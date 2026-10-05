@@ -1198,8 +1198,7 @@ pub(super) fn reconcile_merge_sequences_with(
         }
         // #10371: a soft hold behind a predecessor that is not ready to land
         // (as this tick's listing shows it) is released.
-        let action =
-            ready::with_readiness(action, &marker, pred.as_ref(), pr.head_sha.as_deref(), head);
+        let action = ready::with_readiness(action, &marker, pred.as_ref(), pr, head);
         // #10077: a soft hold between PRs sharing no file is released.
         let fetch = |p: &SequencePr| changed_files(gh_bin, root, p);
         let action =

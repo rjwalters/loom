@@ -499,7 +499,7 @@ fn check(
                 return Err(format!("self-predecessor {e:?}"));
             }
             let (f, p) = (by[&e.follower], by[&e.after]);
-            if !super::super::ready::ready(p) {
+            if e.reason != EdgeReason::StackedBase && !super::super::ready::ready(p) {
                 return Err(format!("edge behind a non-ready predecessor {e:?} (#10371)"));
             }
             match e.reason {
