@@ -644,6 +644,9 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ("heuristics/land_v4.rs", include_str!("../heuristics/land_v4.rs")),
     // #10259: the stall detector the heuristics call.
     ("stall.rs", include_str!("../stall.rs")),
+    // #10208: the zero-parameter queue floor and the queue context it reads.
+    ("heuristics/little_v0.rs", include_str!("../heuristics/little_v0.rs")),
+    ("stage_queue.rs", include_str!("../stage_queue.rs")),
 ];
 
 /// `HEURISTIC_SOURCES` is hand-written, so a new heuristic file could silently
