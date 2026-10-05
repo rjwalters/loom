@@ -38,9 +38,10 @@ pub(super) async fn run(
         .unwrap_or_default();
     let count = crate::eta::pr_features::total_cost(&reads);
     let root = workspace_root.to_path_buf();
+    let slugs = readable.clone();
     let Ok((answers, stall)) = tokio::task::spawn_blocking(move || {
         let answers = crate::eta::pr_features_forge::run(reads, &roots);
-        (answers, crate::eta::stall_features::collect(&root, Utc::now()))
+        (answers, crate::eta::stall_features::collect(&root, &slugs, Utc::now()))
     })
     .await
     else {

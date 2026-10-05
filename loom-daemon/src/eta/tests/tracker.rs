@@ -870,8 +870,7 @@ fn the_tracker_records_read_and_stall_features() {
     h.tracker.on_feature_reads(&answers);
     h.tracker.on_stall_snapshot(StallSnapshot {
         observed_at: t(30),
-        core: None,
-        graphql: None,
+        budgets: std::collections::BTreeMap::new(),
         breaker: None,
         pool: PoolReading {
             usable: 2,

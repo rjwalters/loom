@@ -1134,17 +1134,22 @@ in-process state, the pool from the token directory.
 
 | Stored | Definition |
 |---|---|
-| `ratelimit_core_remaining`, `ratelimit_core_reset_at` | the freshest REST budget reading (≤ 15 min old) and its reset |
+| `ratelimit_core_remaining`, `ratelimit_core_reset_at` | the item's reader App's freshest REST budget reading (≤ 15 min old) and its reset |
 | `ratelimit_graphql_remaining`, `ratelimit_graphql_reset_at` | the same for GraphQL |
 | `breaker_state`, `breaker_cooldown_until` | the rate-limit breaker: `closed` or `cooldown`, and when an active cooldown releases |
 | `pool_usable_accounts`, `pool_exhausted` | spawnable accounts in the pool the workspace resolves to (neither bad-marked nor hard-excluded), and whether that is zero |
 
-The sink keeps readings per pool, not per credential, so on a host that
-reads through several identities (its `gh` login, reader Apps) the reading
-is the freshest one of that pool across them.
+The sink keeps each reader's readings under a public bucket label
+(`reader:<app id>@<owner>`, never a credential), because two reader Apps
+share the `reader` role but not a budget. An item's budget is the reading of
+the reader App that serves its repo; the writer's and any other reader's
+readings are never borrowed. A repo with no reader App (it reads on the
+writer) has no budget features, and neither does a reader with no fresh
+reading.
 
 Null reasons: `no_stall_snapshot` (no snapshot taken before `as_of`),
-`stale_inputs` (the snapshot is over 15 min old), `no_budget_reading`,
+`stale_inputs` (the snapshot is over 15 min old), `no_reader_for_repo`,
+`no_identity_reading` (the serving reader has no fresh reading),
 `no_reset_in_reading` (a breaker probe carries none), `breaker_not_registered`,
 `breaker_closed` (`breaker_cooldown_until` only) and `no_token_pool`.
 

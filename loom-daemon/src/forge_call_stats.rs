@@ -261,6 +261,12 @@ pub struct CallIdentity {
     /// `writer-fallback` — the rate-limit pool it spent. Set by the
     /// `GhInvocation` facade; `None` for a caller recording outside it.
     pub role: Option<String>,
+    /// The rate-limit bucket a *reader* call spent (#10232): the reader
+    /// App's id plus the owner whose installation it ran under — public,
+    /// non-secret labels. Two readers share the `reader` role but not a
+    /// budget, so budget readings are kept per bucket. `None` for the
+    /// writer and for a caller that does not know its reader.
+    pub bucket: Option<String>,
 }
 
 impl CallIdentity {
@@ -301,6 +307,12 @@ impl CallIdentity {
     #[must_use]
     pub fn with_role(mut self, role: &str) -> Self {
         self.role = sanitize(role);
+        self
+    }
+
+    #[must_use]
+    pub fn with_bucket(mut self, bucket: &str) -> Self {
+        self.bucket = sanitize(bucket);
         self
     }
 
@@ -432,6 +444,7 @@ pub fn record_with_identity(
         og: identity.origin.clone(),
         rp: identity.repo.clone(),
         ir: identity.role.clone(),
+        ib: identity.bucket.clone(),
     };
     if let Ok(mut state) = process_state().lock() {
         state.add(&line);
@@ -477,6 +490,10 @@ struct SinkLine {
     /// Identity role (#9872); absent on pre-#9872 lines and non-facade calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ir: Option<String>,
+    /// Reader rate-limit bucket (#10232); absent for the writer and on
+    /// older lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ib: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -523,10 +540,11 @@ struct Aggregate {
     /// Counts per identity role (#9872); a line without one is `unknown`.
     roles: BTreeMap<String, Counts>,
     latest: BTreeMap<Pool, Reading>,
-    /// The newest reading per `(pool, identity role)` (#10232): `latest`
-    /// above collapses every identity, but a reader App and the writer each
-    /// own a separate budget. Only lines that name a role land here.
-    latest_by_role: BTreeMap<(Pool, String), Reading>,
+    /// The newest reading per `(pool, reader bucket)` (#10232): `latest`
+    /// above collapses every identity, but each reader App installation owns
+    /// a separate budget (two readers share the `reader` role, so the role
+    /// is not a key). Only lines that name a bucket land here.
+    latest_by_bucket: BTreeMap<(Pool, String), Reading>,
 }
 
 impl Aggregate {
@@ -557,10 +575,10 @@ impl Aggregate {
                 };
                 self.latest.insert(line.p, reading);
             }
-            if let Some(role) = line.ir.clone() {
-                let key = (line.p, role);
+            if let Some(bucket) = line.ib.clone() {
+                let key = (line.p, bucket);
                 if self
-                    .latest_by_role
+                    .latest_by_bucket
                     .get(&key)
                     .is_none_or(|r| r.observed_at <= line.t)
                 {
@@ -570,7 +588,7 @@ impl Aggregate {
                         reset_epoch: line.rst,
                         observed_at: line.t,
                     };
-                    self.latest_by_role.insert(key, reading);
+                    self.latest_by_bucket.insert(key, reading);
                 }
             }
         }
@@ -932,20 +950,21 @@ fn exhausted_in(latest: &BTreeMap<Pool, Reading>, now: i64) -> Vec<(Pool, Option
         .collect()
 }
 
-/// The newest header budget reading of each pool **served by one identity
-/// role** (`reader` / `writer` / `writer-fallback`, #10232). Unlike
-/// [`status_report`]'s `budget` this never mixes identities: a reading whose
-/// line named no role, or another role, is not returned. The role is a
-/// public, non-secret label — never a credential.
+/// The newest header budget reading of each pool, per **reader rate-limit
+/// bucket** (#10232), keyed by the public bucket label
+/// ([`crate::forge_identity::reader_bucket`]). Unlike [`status_report`]'s
+/// `budget` this never mixes identities: two readers of the same role are
+/// separate buckets, and a line that named no bucket (the writer, an
+/// unattributed call) is not returned at all. Never a credential.
 #[must_use]
-pub fn role_readings(now: DateTime<Utc>, role: &str) -> Vec<ForgeBudgetReading> {
+pub fn bucket_readings(now: DateTime<Utc>) -> BTreeMap<String, Vec<ForgeBudgetReading>> {
     let window = sink_dir().map(|d| read_window(&d, now.timestamp()));
     let process = process_state()
         .lock()
-        .map(|s| s.latest_by_role.clone())
+        .map(|s| s.latest_by_bucket.clone())
         .unwrap_or_default();
     let mut latest = process;
-    for (key, r) in window.iter().flat_map(|w| w.latest_by_role.iter()) {
+    for (key, r) in window.iter().flat_map(|w| w.latest_by_bucket.iter()) {
         if latest
             .get(key)
             .is_none_or(|l| l.observed_at < r.observed_at)
@@ -953,20 +972,21 @@ pub fn role_readings(now: DateTime<Utc>, role: &str) -> Vec<ForgeBudgetReading> 
             latest.insert(key.clone(), *r);
         }
     }
-    latest
-        .into_iter()
-        .filter(|((_, r), _)| r == role)
-        .filter_map(|((pool, _), r)| {
-            Some(ForgeBudgetReading {
-                pool: pool.as_str().to_string(),
-                remaining: r.remaining,
-                used: r.used,
-                reset_at: r.reset_epoch.and_then(epoch),
-                observed_at: epoch(r.observed_at)?,
-                source: "headers".to_string(),
-            })
-        })
-        .collect()
+    let mut out: BTreeMap<String, Vec<ForgeBudgetReading>> = BTreeMap::new();
+    for ((pool, bucket), r) in latest {
+        let Some(observed_at) = epoch(r.observed_at) else {
+            continue;
+        };
+        out.entry(bucket).or_default().push(ForgeBudgetReading {
+            pool: pool.as_str().to_string(),
+            remaining: r.remaining,
+            used: r.used,
+            reset_at: r.reset_epoch.and_then(epoch),
+            observed_at,
+            source: "headers".to_string(),
+        });
+    }
+    out
 }
 
 /// This host's budget-costing forge calls per pool over the last window —

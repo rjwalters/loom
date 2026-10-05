@@ -601,7 +601,13 @@ impl Tracker {
         self.context
             .reads
             .write_to(&key.repo, key.issue, pr, now, &mut features, &mut omitted);
-        stall_features::write_to(self.context.stall.as_ref(), now, &mut features, &mut omitted);
+        stall_features::write_to(
+            self.context.stall.as_ref(),
+            &key.repo,
+            now,
+            &mut features,
+            &mut omitted,
+        );
         (features, omitted)
     }
 }
