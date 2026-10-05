@@ -457,8 +457,16 @@ fn fetch_inner(
     max_age: Duration,
     status: &mut PubStatus,
 ) -> Result<FetchKind, FetchFail> {
+    let local = coeffs::load_latest(root, now + Duration::days(36_500));
+    // A 304 means "still serving the last good fetch", which holds only while
+    // that fetch's captain is still the declared one and its fit is still the
+    // newest local file. Otherwise fetch in full, so `verify` runs again.
+    let still_serving = status.captain_host.as_deref() == Some(captain)
+        && status.fit_id.is_some()
+        && local.as_ref().map(|f| f.id.as_str()) == status.fit_id.as_deref();
+    let etag = status.etag.as_deref().filter(|_| still_serving);
     let reply = transport
-        .get(&contents_path(loc, LATEST_PATH), Some(RAW), status.etag.as_deref())
+        .get(&contents_path(loc, LATEST_PATH), Some(RAW), etag)
         .context("reading the published envelope")?;
     match reply.status {
         304 => {
@@ -490,7 +498,6 @@ fn fetch_inner(
         );
     }
     let bytes = file_reply.body.into_bytes();
-    let local = coeffs::load_latest(root, now + Duration::days(36_500));
     let ctx = VerifyCtx {
         captain,
         now,
@@ -613,6 +620,22 @@ fn ensure_branch(
     ensure_ok(&reply, "creating the publication branch", &loc.repo)
 }
 
+/// This autonomous write may land only on the dedicated publication branch,
+/// never on the store's reviewed branch (`fleet.ref`) or `main`: that is part
+/// of how `write_scope::tests::daemon_write_paths_are_scoped` scopes this file
+/// (`FleetStore`), so it is enforced here rather than left to the ruleset.
+fn refuse_reviewed_branch(loc: &StoreLocation, base_ref: &str) -> Result<()> {
+    let r = loc.reference.trim();
+    if r == base_ref.trim() || r == "main" {
+        bail!(
+            "refusing to publish the eta fit to `{r}` in {}: `{REF_KEY}` must name a dedicated \
+             branch, not the store's reviewed branch",
+            loc.repo
+        );
+    }
+    Ok(())
+}
+
 /// Publish `fit` to `loc` (its `reference` is the publication branch,
 /// created from `base_ref` if missing): the file first, the envelope last.
 /// Idempotent: a store whose envelope already names this fit and sha is left
@@ -630,6 +653,7 @@ pub fn publish(
     captain: &str,
     now: DateTime<Utc>,
 ) -> Result<PublishKind> {
+    refuse_reviewed_branch(loc, base_ref)?;
     let bytes = coeffs::to_json(fit).into_bytes();
     let env = envelope_for(fit, &bytes, captain, now);
     ensure_branch(t, wt, loc, base_ref)?;

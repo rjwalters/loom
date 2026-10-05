@@ -1546,7 +1546,8 @@ them with a daemon restart.
   cannot learn the fit and drift to `no_model`: do not declare a captain
   there. On a single host, or with no captain, nothing changes.
   - **Branch.** `fleet.etaFitRef` (default `eta-fit`), created from `fleet.ref`
-    on first publish. Files: `eta/fit/<fit_id>.json` (the coefficient file, byte
+    on first publish; a `fleet.etaFitRef` equal to `fleet.ref` or `main` is
+    refused, never written. Files: `eta/fit/<fit_id>.json` (the coefficient file, byte
     for byte) and `eta/fit/latest.json` (the `eta-fit-pub/v1` envelope:
     `schema`, `fit_id`, `as_of`, `window{start,end}`, `captain_host`, `fitter`,
     `file`, `sha256`, `published_at`), written last. Commit history is the audit

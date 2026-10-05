@@ -162,6 +162,12 @@ fn publish_then_fetch_installs_the_same_fit_and_is_idempotent() {
     captain_publishes(&store, cap.path(), &fit, now);
     assert!(store.files.borrow().contains_key(LATEST_PATH));
     assert!(*store.branch.borrow());
+    // The fit file first, the envelope last, so the envelope never names a
+    // file that is not there yet.
+    assert_eq!(
+        *store.writes.borrow(),
+        vec![format!("eta/fit/{}.json", fit.id), LATEST_PATH.to_string()]
+    );
 
     assert_eq!(fetch(&store, host.path(), CAPTAIN, now), FetchKind::Installed);
     assert_eq!(installed_ids(host.path()), vec![fit.id.clone()]);
@@ -293,6 +299,45 @@ fn a_former_captains_publication_is_refused_after_a_captain_change() {
     captain_publishes(&store, cap.path(), &fit_at(at(4)), now);
     assert_eq!(fetch(&store, host.path(), "loom-worker-2", now), FetchKind::Refused);
     assert!(installed_ids(host.path()).is_empty());
+}
+
+#[test]
+fn a_304_is_trusted_only_while_the_captain_and_installed_fit_still_match() {
+    let (cap, host) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let store = Store::default();
+    let now = at(4) + Duration::hours(8);
+    let fit = fit_at(at(4));
+    captain_publishes(&store, cap.path(), &fit, now);
+    assert_eq!(fetch(&store, host.path(), CAPTAIN, now), FetchKind::Installed);
+    assert_eq!(fetch(&store, host.path(), CAPTAIN, now), FetchKind::NotModified);
+
+    // The installed fit went missing: no 304, the fit is fetched and installed again.
+    std::fs::remove_file(coeffs::fit_dir(host.path()).join(coeffs::path_for(fit.as_of))).unwrap();
+    assert_eq!(fetch(&store, host.path(), CAPTAIN, now), FetchKind::Installed);
+    assert_eq!(installed_ids(host.path()), vec![fit.id.clone()]);
+
+    // The declared captain changed while the old envelope is unchanged: the
+    // former captain's publication is re-verified and refused, not served.
+    assert_eq!(fetch(&store, host.path(), "loom-worker-2", now), FetchKind::Refused);
+    assert_eq!(read_status(host.path()).reason.as_deref(), Some("wrong_captain"));
+}
+
+#[test]
+fn the_captain_never_publishes_to_the_reviewed_branch() {
+    let cap = tempfile::tempdir().unwrap();
+    let store = Store::default();
+    let fit = fit_at(at(4));
+    coeffs::write(&coeffs::fit_dir(cap.path()).join(coeffs::path_for(fit.as_of)), &fit).unwrap();
+    for (reference, base) in [("main", "release"), ("stable", "stable")] {
+        let loc = StoreLocation {
+            repo: "o/store".to_string(),
+            reference: reference.to_string(),
+        };
+        let r = publish::publish(&store, &store, &loc, base, &fit, CAPTAIN, at(4));
+        assert!(r.unwrap_err().to_string().contains("dedicated"), "{reference}");
+    }
+    assert!(store.writes.borrow().is_empty());
+    assert!(!*store.branch.borrow());
 }
 
 #[test]
