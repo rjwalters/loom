@@ -89,6 +89,8 @@ pub const COMMENT_CREATE: ForgeOp = ForgeOp::inventoried("comment.create");
 pub const COMMENT_EDIT_DELETE: ForgeOp = ForgeOp::inventoried("comment.edit-delete");
 /// A PR's changed-file list.
 pub const PR_DIFF_AND_FILES: ForgeOp = ForgeOp::inventoried("pr.diff-and-files");
+/// Resolve a release and download its artifact (`gh release view|download`).
+pub const RELEASE_RESOLVE_AND_FETCH: ForgeOp = ForgeOp::inventoried("release.resolve-and-fetch");
 
 /// Every inventoried constant above — the set the inventory test checks.
 pub const ALL_INVENTORIED: &[ForgeOp] = &[
@@ -112,4 +114,5 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     COMMENT_CREATE,
     COMMENT_EDIT_DELETE,
     PR_DIFF_AND_FILES,
+    RELEASE_RESOLVE_AND_FETCH,
 ];

@@ -224,6 +224,7 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         ("claim_reconciliation/auto_merge_disarm.rs", "test fixture"),
         ("claim_reconciliation/trusted_comments_tests.rs", "test"),
         ("claim_reconciliation/read_cache_tests.rs", "test"),
+        ("claim_reconciliation/read_cache_passes_tests.rs", "test"),
         ("claim_reconciliation/open_pr_listing_tests.rs", "test"),
         // #9709: reads the RAW listing deliberately, but only to NAME the
         // author of a marker the policy dropped, in the stale-clear notice.

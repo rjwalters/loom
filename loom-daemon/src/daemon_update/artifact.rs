@@ -215,6 +215,7 @@ fn gh_release_view(slug: &str, fields: &str, jq: &str) -> Option<String> {
     let op = Operation::new("release.view");
     let timeout = std::time::Duration::from_secs(60);
     let outcome = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, timeout)
+        .forge_op(crate::forge_call_stats::ops::RELEASE_RESOLVE_AND_FETCH)
         .args(["release", "view", "--json", fields, "-R", slug, "--jq", jq])
         .run();
     let ran = outcome.ok_output()?;

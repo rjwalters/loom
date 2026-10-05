@@ -119,6 +119,9 @@ pub struct ConflictPr {
     pub head_sha: Option<String>,
     pub mergeable: Mergeable,
     pub labels: Vec<String>,
+    /// The listing's `updatedAt` — the version stamp the `ClearIfOurs`
+    /// comment scan is cached under (#10089).
+    pub updated_at: Option<String>,
 }
 
 impl ConflictPr {
@@ -261,6 +264,7 @@ pub fn conflict_candidates(
                 head_sha: r.head_sha.clone(),
                 mergeable: Mergeable::Unknown,
                 labels: r.labels.clone(),
+                updated_at: r.updated_at.clone(),
             };
             if !matches!(
                 decide_review_conflict(&pr),
@@ -451,9 +455,20 @@ pub(super) fn reconcile_review_conflicts_sharing(
                 }
             }
             ConflictAction::ClearIfOurs => {
-                // A failed fetch is "unknown", never "ours".
-                let ours = forge::fetch_comment_bodies(gh_bin, root, pr.number)
-                    .is_some_and(|bodies| flag_is_latest(&bodies));
+                // A failed fetch is "unknown", never "ours". #10089: a
+                // "not ours" answer is reused until `updatedAt` moves.
+                let key = super::read_cache::key(
+                    root,
+                    pr.number,
+                    "conflict-flag",
+                    pr.updated_at.as_deref(),
+                );
+                let ours = super::read_cache::CONFLICT_FLAG_OURS
+                    .get_or(key, || {
+                        forge::fetch_comment_bodies(gh_bin, root, pr.number)
+                            .map(|bodies| flag_is_latest(&bodies))
+                    })
+                    .unwrap_or(false);
                 if !ours {
                     continue;
                 }

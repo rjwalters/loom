@@ -851,6 +851,7 @@ async fn fetch_repo_slug(workspace_root: &Path) -> Option<String> {
     // at the owner-correct credential for a cross-owner managed repo (#5431).
     let op = Operation::new("collector.repo_slug");
     let outcome = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, SLUG_FETCH_TIMEOUT)
+        .forge_op(crate::forge_call_stats::ops::REPO_VIEW)
         .current_dir(workspace_root)
         .args([
             "repo",

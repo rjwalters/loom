@@ -230,3 +230,22 @@ fn a_call_site_never_writes_a_body_or_credential_to_the_sink() {
         assert!(!written.contains(leaked), "{leaked:?} reached the sink: {written}");
     }
 }
+
+/// #10089: sites migrated onto the facade earlier but still booking
+/// `unknown` now name their inventoried operation — driven through the real
+/// site functions (a stub `gh` that answers with a non-zero exit still ran,
+/// so it is counted).
+#[test]
+fn migrated_daemon_sites_name_their_operation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gh = stub_gh(tmp.path());
+    let rows = operations_after(|| {
+        let _ = crate::reclaim_pr_warning::open_pr_on_issue_branch(&gh, tmp.path(), 7);
+        let _ = crate::gh_state_probe::pr_merged_at_output("acme/named-sites", 7);
+    });
+    let ops: Vec<&str> = rows.iter().map(|r| r.operation.as_str()).collect();
+    for want in ["pr.list-by-head", "pr.view-state"] {
+        assert!(ops.contains(&want), "{want} not recorded: {rows:?}");
+    }
+    assert!(!ops.contains(&UNKNOWN_OPERATION), "{rows:?}");
+}

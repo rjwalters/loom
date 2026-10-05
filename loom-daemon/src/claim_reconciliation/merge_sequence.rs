@@ -868,6 +868,33 @@ fn fetch_changed_files(gh_bin: &Path, root: &Path, number: u32) -> Option<BTreeS
     Some(parsed.files.into_iter().map(|Row { path }| path).collect())
 }
 
+/// A holder's newest trusted marker (`Some(None)`: a manual hold), `None`
+/// when the comments read failed. #10089: reused until the holder's
+/// `updatedAt` moves — a new marker comment or label event bumps it.
+fn holder_marker(bin: &str, root: &Path, pr: &SequencePr) -> Option<Option<SequenceMarker>> {
+    let key = super::read_cache::key(root, pr.number, "hold-marker", Some(&pr.updated_at));
+    super::read_cache::HOLD_MARKER.get_or(key, || {
+        fetch_trusted_bodies(bin, root, "{owner}/{repo}", pr.number).map(|b| parse(&b))
+    })
+}
+
+/// The predecessor's live state. #10089: while it is in this tick's open
+/// listing, reused until its `updatedAt` or head moves; once it leaves the
+/// listing (merged or closed) there is no key, so the read is always live.
+fn predecessor(
+    bin: &str,
+    root: &Path,
+    open: &[SequencePr],
+    after: u32,
+) -> Option<PredecessorState> {
+    let key = open.iter().find(|p| p.number == after).and_then(|p| {
+        let version = format!("{}@{}", p.updated_at, p.head_sha.as_deref()?);
+        super::read_cache::key(root, after, "predecessor", Some(&version))
+    });
+    super::read_cache::PREDECESSOR
+        .get_or(key, || fetch_predecessor(bin, root, "{owner}/{repo}", after))
+}
+
 /// The newest trusted marker per PR, for PRs carrying the hold label.
 ///
 /// `known` holds this tick's already-completed reads (#10089): Phase 1 walks
@@ -1098,8 +1125,8 @@ pub(super) fn reconcile_merge_sequences_with(
     // Each holder's completed marker read, reused by Phase 2 (#10089).
     let mut read_markers: BTreeMap<u32, Option<SequenceMarker>> = BTreeMap::new();
     for pr in &holders {
-        let bodies = match fetch_trusted_bodies(&bin, root, "{owner}/{repo}", pr.number) {
-            Some(b) => b,
+        let parsed = match holder_marker(&bin, root, pr) {
+            Some(m) => m,
             None => {
                 // The label gates merges regardless (#9378); a failed read
                 // never releases anything.
@@ -1113,7 +1140,6 @@ pub(super) fn reconcile_merge_sequences_with(
                 continue;
             }
         };
-        let parsed = parse(&bodies);
         read_markers.insert(pr.number, parsed.clone());
         let Some(marker) = parsed else {
             // A label with no trusted marker is an operator-held PR (the
@@ -1128,7 +1154,7 @@ pub(super) fn reconcile_merge_sequences_with(
             stats.held += 1;
             continue;
         };
-        let pred = fetch_predecessor(&bin, root, "{owner}/{repo}", marker.after);
+        let pred = predecessor(&bin, root, &open, marker.after);
         // The head's labels and freshness come from this tick's listing; a
         // predecessor outside it is never treated as stalled (fail closed).
         let head = open.iter().find(|p| p.number == marker.after);

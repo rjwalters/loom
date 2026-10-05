@@ -152,6 +152,9 @@ pub fn hold_action_with_stall(
 pub struct StalledChain {
     pub head: u32,
     pub head_sha: String,
+    /// The head's listing `updatedAt` — the escalation-dedupe cache's version
+    /// stamp (#10089): posting the escalation moves it.
+    pub head_updated_at: String,
     pub cause: StallCause,
     pub quiet_hours: f64,
     /// Approved followers whose soft holds were released this tick.
@@ -266,6 +269,7 @@ impl StallLedger {
                 self.chains.push(StalledChain {
                     head: head.number,
                     head_sha,
+                    head_updated_at: head.updated_at.clone(),
                     cause: cause.clone(),
                     quiet_hours: quiet,
                     released: Vec::new(),
@@ -304,10 +308,25 @@ pub(super) fn escalate(
     bound_hours: f64,
 ) -> anyhow::Result<bool> {
     let bin = gh_bin.to_string_lossy().to_string();
-    let Some(bodies) = fetch_trusted_bodies(&bin, root, "{owner}/{repo}", chain.head) else {
+    // #10089: an already-escalated chain re-walked the head's comments every
+    // tick. Only a FOUND marker is cached (until the head's `updatedAt`
+    // moves): a cached "not yet" could re-post if a listing lagged the post.
+    let key =
+        super::super::read_cache::key(root, chain.head, &chain.key(), Some(&chain.head_updated_at));
+    let mut read_failed = false;
+    let escalated = super::super::read_cache::STALL_ESCALATED.get_or(key, || {
+        match fetch_trusted_bodies(&bin, root, "{owner}/{repo}", chain.head) {
+            Some(bodies) => already_escalated(&bodies, chain).then_some(true),
+            None => {
+                read_failed = true;
+                None
+            }
+        }
+    });
+    if read_failed {
         anyhow::bail!("could not read trusted comments on PR #{}", chain.head);
-    };
-    if already_escalated(&bodies, chain) {
+    }
+    if escalated.is_some() {
         return Ok(false);
     }
     let n = chain.head.to_string();
