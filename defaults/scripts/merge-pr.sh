@@ -2593,10 +2593,28 @@ DELETE_BRANCH_ON_MERGE=$(forge_check_auto_delete "$REPO_NWO" "$GH")
 if [[ "$DELETE_BRANCH_ON_MERGE" == "true" ]]; then
   info "Skipping remote branch deletion (auto-delete is enabled)"
 else
-  info "Deleting remote branch: $PR_BRANCH"
-  forge_delete_branch "$REPO_NWO" "$PR_BRANCH" && \
-    success "Remote branch '$PR_BRANCH' deleted" || \
-    warning "Could not delete remote branch '$PR_BRANCH' (may already be deleted)"
+  # #9372: a bare ref delete makes GitHub CLOSE (unrecoverably) every open PR
+  # based on this branch. Retarget open stacked children onto this PR's base
+  # first; keep the branch on ANY uncertainty. Only exit 0 authorizes the delete
+  # (a binary predating the verb exits 2 => keep). Independent of the #9259
+  # reconcile defer and of --allow-stacked-children.
+  _RC_OUT=""; _RC_RC=0
+  _RC_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr retarget-children --repo "$REPO_NWO" --parent-branch "$PR_BRANCH" --base "$(echo "$PR_JSON" | jq -r '.base.ref // empty' 2>/dev/null)" 2>/dev/null)" || _RC_RC=$?
+  while IFS=$'\t' read -r _RC_LVL _RC_MSG; do
+    case "$_RC_LVL" in
+      INFO) info "$_RC_MSG" ;;
+      WARNING) warning "$_RC_MSG" ;;
+    esac
+  done <<< "$_RC_OUT"
+  if [[ $_RC_RC -ne 0 ]]; then
+    warning "Skipping remote branch deletion of '$PR_BRANCH' (stacked-child safety, #9372; retarget-children exit $_RC_RC)"
+  else
+    info "Deleting remote branch: $PR_BRANCH"
+    forge_delete_branch "$REPO_NWO" "$PR_BRANCH" && \
+      success "Remote branch '$PR_BRANCH' deleted" || \
+      warning "Could not delete remote branch '$PR_BRANCH' (may already be deleted)"
+  fi
+  unset _RC_OUT _RC_RC _RC_LVL _RC_MSG
 fi
 
 # Cleanup worktree if requested.

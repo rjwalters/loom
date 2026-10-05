@@ -235,6 +235,12 @@
 //! `branch_has_landed`'s verdict (#7812) are both already answered by the
 //! caller and passed in; this module owns only the two-input decision and its
 //! byte-frozen message text, consolidating three copies into one.
+//!
+//! [`retarget_children`] is not a port — it is #9372's gate in front of the
+//! post-merge remote-branch delete: a bare ref delete makes GitHub CLOSE every
+//! open PR based on that branch (unrecoverably), so each open child is
+//! retargeted onto the parent's base first, and the branch is kept whenever
+//! that cannot be confirmed.
 
 pub mod chain_lock;
 pub mod check_runs_rollup;
@@ -259,6 +265,7 @@ pub mod redate;
 pub mod refs;
 pub mod remove_gate;
 pub mod response;
+pub mod retarget_children;
 pub mod sequence;
 pub mod stacked_children;
 pub mod stale_checks;

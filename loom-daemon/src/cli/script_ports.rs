@@ -894,6 +894,14 @@ pub(crate) enum MergePrCommand {
     /// `cli::merge_pr_reconcile`.
     ReconcileChild(super::merge_pr_reconcile::ReconcileChildArgs),
 
+    /// The gate in front of the post-merge remote-branch delete (#9372): a
+    /// FRESH query for open PRs based on the merged parent's branch, a
+    /// `gh pr edit --base <parent's base>` for each, and a re-check. Exit 0 =
+    /// nothing targets the branch any more (delete may proceed); 1 = keep it
+    /// (`LEVEL<TAB>message` lines say why). A bare ref delete makes GitHub
+    /// CLOSE such children unrecoverably — see `cli::merge_pr_retarget_children`.
+    RetargetChildren(super::merge_pr_retarget_children::RetargetChildrenArgs),
+
     /// The #6694/#6264 remove-vs-preserve decision for post-merge worktree
     /// cleanup, shared across the three call sites (the Loom-convention path,
     /// the porcelain discovery fallback, and a co-existing Judge/Doctor review
@@ -963,6 +971,7 @@ impl MergePrCommand {
             MergePrCommand::ClosedBuilding(args) => args.run(),
             MergePrCommand::ReconcilePlan(args) => args.run(),
             MergePrCommand::ReconcileChild(args) => args.run(),
+            MergePrCommand::RetargetChildren(args) => args.run(),
             MergePrCommand::ChecksFailure(args) => args.run(),
             MergePrCommand::WorktreePreserve(args) => args.run(),
             MergePrCommand::RemoveGate(args) => args.run(),
