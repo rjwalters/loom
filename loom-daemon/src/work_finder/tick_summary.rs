@@ -105,6 +105,7 @@ pub fn tick_summary(
         build_backoff_held: report.build_backoff_held,
         collisions: report.collisions,
         cap: None,
+        starred_at_cache: None,
     }
 }
 
@@ -177,6 +178,9 @@ pub fn publish_tick(
     let completed_at = chrono::Utc::now();
     let mut summary = tick_summary(report, max_concurrent, completed_at, roots, plan);
     summary.cap = last_cap().filter(|c| c.effective() == max_concurrent);
+    // The starred-at lookup tally (cumulative since start), so `status` shows
+    // how many timeline reads remain and whether unknowns dominate them.
+    summary.starred_at_cache = Some(super::operator_priority::starred_at_tally());
     crate::observability::ops::queue::record_queue(&summary);
     // #10212: the ranked candidates and what the tick did with each.
     crate::observability::pick_decision::emit_work_finder(&summary, started_at, completed_at);
