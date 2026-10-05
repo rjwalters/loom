@@ -120,12 +120,6 @@ impl Violation {
 pub fn check(root: &Path) -> Vec<Violation> {
     let mut out = Vec::new();
 
-    // A repo that opted out of the guards wholesale (`guards.enabled:false`,
-    // #10335) has intentionally no guard wiring — nothing to audit.
-    if crate::config_resolver::guards_master_disabled(root) {
-        return out;
-    }
-
     let settings_path = root.join(SETTINGS_PATH);
     let Ok(settings) = std::fs::read_to_string(&settings_path) else {
         out.push(Violation::new(

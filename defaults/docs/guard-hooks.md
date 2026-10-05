@@ -131,7 +131,7 @@ neither add nor keep these entries in the repo's `.claude/settings.json` (foreig
 non-guard Loom hooks are preserved); the user-scope `~/.claude/settings.json` fallback
 wrappers need no change because they exec the hook, which self-gates per repo
 (`LOOM_GUARDS_ENABLED=0` at install time additionally skips writing those entries);
-`check-guard-wiring` skips an opted-out repo. `guard-mcp-tools.sh`,
+`check-guard-wiring` still audits an opted-out repo's MCP wiring (the MCP guard is not covered by the opt-out). `guard-mcp-tools.sh`,
 `guard-background-subagents.sh`, and `guard-codex-bridge.sh` are out of scope.
 
 ## The Ungated Denial Floor
