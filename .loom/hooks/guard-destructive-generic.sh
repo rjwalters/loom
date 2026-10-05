@@ -10045,8 +10045,30 @@ fi
 # guards.sqlDdl:false or LOOM_GUARD_SQL=0. sql_guard_enabled() is consulted only
 # after the DELETE-FROM-without-WHERE match, keeping the config read off the hot
 # path for non-SQL commands.
+# #10335: a DELETE FROM that appears ONLY inside a quoted string (an echo/commit
+# message/test-probe argument) and where no SQL client is named anywhere in the
+# command is inert data, not an executed statement. Bare (unquoted) text, or any
+# command naming a SQL client (psql/mysql/sqlite3/...), still denies. An
+# unbalanced quote disables the blanking (fail closed to the old behaviour).
+_sql_delete_executable() {
+    local masked
+    if printf '%s' "$COMMAND_NO_COMMENT" | grep -qiE '(^|[^[:alnum:]_.-])(psql|pgcli|mysql|mycli|mariadb|sqlite3?|litecli|sqlcmd|sqlplus|isql|usql|duckdb|clickhouse(-client)?|cockroach|bq|dbt|prisma|sqlx|diesel|mongosh?|redis-cli|cqlsh|snowsql|trino|presto)([^[:alnum:]_-]|$)'; then
+        return 0
+    fi
+    masked=$(printf '%s' "$COMMAND_NO_COMMENT" | awk '
+        BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); q = ""; out = "" }
+        { if (NR > 1) { out = out "\n" } line = $0
+          for (i = 1; i <= length(line); i++) { c = substr(line, i, 1)
+            if (q == "") { if (c == SQ || c == DQ) { q = c; out = out c } else out = out c }
+            else if (c == q) { q = ""; out = out c }
+            else if (q == DQ && c == "\\") { i++ }
+            else { out = out " " } } }
+        END { if (q != "") exit 1; printf "%s", out }') || masked="$COMMAND_NO_COMMENT"
+    printf '%s' "$masked" | grep -qiE 'DELETE[[:space:]]+FROM[[:space:]]+'
+}
 if echo "$COMMAND_NO_COMMENT" | grep -qiE 'DELETE[[:space:]]+FROM[[:space:]]+' && \
-   ! echo "$COMMAND_NO_COMMENT" | grep -qiE 'WHERE[[:space:]]+'; then
+   ! echo "$COMMAND_NO_COMMENT" | grep -qiE 'WHERE[[:space:]]+' && \
+   _sql_delete_executable; then
     sql_guard_enabled && deny "BLOCKED: DELETE FROM without WHERE clause" "sql-delete-no-where"  # scan-reads: COMMAND_NO_COMMENT
 fi
 

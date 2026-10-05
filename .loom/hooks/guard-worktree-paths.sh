@@ -486,6 +486,12 @@ WORKTREE_PATH="${LOOM_WORKTREE_PATH:-}"
 # Read stdin (needed by both mechanisms below)
 INPUT=$(cat 2>/dev/null) || INPUT=""
 
+# Master opt-out (#10335): guards.enabled:false / LOOM_GUARDS_ENABLED=0 -> allow.
+if declare -F loom_guards_master_enabled >/dev/null 2>&1 \
+   && ! loom_guards_master_enabled "$MAIN_ROOT"; then
+    exit 0
+fi
+
 # Verify jq is available
 if ! command -v jq &>/dev/null; then
     log_hook_error "jq not found in PATH — allowing (cannot parse input)"

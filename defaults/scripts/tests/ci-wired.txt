@@ -250,6 +250,7 @@ tests/hooks/test-guard-destructive-session-scratch.sh
 tests/hooks/test-guard-destructive-stash-scope.sh
 tests/hooks/test-guard-destructive-write-confinement.sh
 tests/hooks/test-guard-loom-workflow.sh
+tests/hooks/test-guard-master-optout.sh
 # Not a Claude-path guard, but the same repo-root tests/hooks/ location and
 # hermetic-fixture pattern (throwaway `git worktree add` trees, fake binaries,
 # no network/forge calls) — covers .loom/hooks/post-worktree.sh's redirected-
