@@ -21,7 +21,7 @@
 use super::{Item, ItemKey, Tracker};
 use crate::eta::explanation::Features;
 use crate::eta::labels::pr_flags;
-use crate::eta::star::{star_state_at, IssueStarChange, StarLink};
+use crate::eta::star::{linked_star_at, star_state_at, IssueStarChange, LinkedStar, StarLink};
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -130,18 +130,13 @@ impl Tracker {
         features.star_source = Some(state.source.as_str().to_string());
     }
 
-    /// The start of `pr`'s linked-issue star run at `now`, for the priority
-    /// features (#10333): `None` when no linked issue is starred or the repo
-    /// has no fresh observation before `now`.
-    pub(super) fn linked_star_since(
-        &self,
-        repo: &str,
-        pr: u32,
-        now: DateTime<Utc>,
-    ) -> Option<DateTime<Utc>> {
-        let (links, changes) = self.star_inputs(repo, pr, now)?;
-        let state = star_state_at(Some(0), None, &links, &changes, now);
-        state.source.starred().then_some(state.since).flatten()
+    /// `pr`'s linked-issue star at `now`, for the priority features (#10333):
+    /// its current run and on/off instants. Empty when the repo has no fresh
+    /// observation before `now`.
+    pub(super) fn linked_star(&self, repo: &str, pr: u32, now: DateTime<Utc>) -> LinkedStar {
+        self.star_inputs(repo, pr, now)
+            .map(|(links, changes)| linked_star_at(&links, &changes, now))
+            .unwrap_or_default()
     }
 
     /// `pr`'s links and every star change of `repo` (lowercased), when the

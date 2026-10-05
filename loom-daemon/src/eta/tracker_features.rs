@@ -391,7 +391,7 @@ impl Tracker {
             .priority_roster
             .iter()
             .map(|e| {
-                let linked = self.linked_star_since(&e.repo, e.pr, as_of);
+                let linked = self.linked_star(&e.repo, e.pr, as_of);
                 PriorityEntry {
                     star: e.star.clone().with_linked(linked),
                     ..e.clone()

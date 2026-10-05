@@ -30,7 +30,9 @@
 //! operator labels or their `*-inherited` twins), raised to at least the star
 //! while an issue it links is starred ([`PriorityState::linked_since`], from
 //! the one PR-or-linked-issue star rule of [`super::star`], #10372): the
-//! operator usually stars the issue, not the PR. A PR's age key is its stage
+//! operator usually stars the issue, not the PR. The linked star's on/off
+//! instants ([`PriorityState::linked_changes`]) are kept too, so a linked
+//! star that ended still counts for `star_changed_in_stage`. A PR's age key is its stage
 //! entry, the analogue of `createdAt`.
 //!
 //! # Levels
@@ -55,6 +57,7 @@
 use super::flag_timeline::FlagChange;
 use super::labels::{level_from_flags, pr_flags};
 use super::queue_features::{is_pr_stage, QueueSubject};
+use super::star::LinkedStar;
 use super::Stage;
 use crate::work_finder::ready_queue::{keyed_cmp, ETA_POSITION_KEYS};
 use crate::work_finder::PriorityCandidate;
@@ -95,6 +98,11 @@ pub struct PriorityState {
     /// starred.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linked_since: Option<DateTime<Utc>>,
+    /// Each instant the linked-issue star turned on or off, ascending, as
+    /// known at the caller's cutoff ([`LinkedStar::changes`]). It outlives
+    /// an unstar, which empties `linked_since`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_changes: Vec<DateTime<Utc>>,
 }
 
 impl PriorityState {
@@ -155,10 +163,12 @@ impl PriorityState {
         out
     }
 
-    /// This state with a linked issue's star run start (#10372).
+    /// This state with its linked issues' star (#10372): the current run's
+    /// start and every on/off instant.
     #[must_use]
-    pub fn with_linked(mut self, linked_since: Option<DateTime<Utc>>) -> Self {
-        self.linked_since = linked_since;
+    pub fn with_linked(mut self, linked: LinkedStar) -> Self {
+        self.linked_since = linked.since;
+        self.linked_changes = linked.changes;
         self
     }
 
@@ -208,10 +218,12 @@ impl PriorityState {
     }
 
     /// Whether its level changed after `entered_at`: its own, or a linked
-    /// star that began then.
+    /// star that began or ended then (one that ended is gone from
+    /// `linked_since` but not from `linked_changes`).
     fn changed_after(&self, entered_at: DateTime<Utc>) -> bool {
         self.changes.iter().any(|c| c.0 > entered_at)
             || self.linked_since.is_some_and(|at| at > entered_at)
+            || self.linked_changes.iter().any(|at| *at > entered_at)
     }
 
     /// This state as knowable strictly before `as_of`.
@@ -226,6 +238,12 @@ impl PriorityState {
                 .filter(|c| c.0 < as_of)
                 .collect(),
             linked_since: self.linked_since.filter(|at| *at < as_of),
+            linked_changes: self
+                .linked_changes
+                .iter()
+                .copied()
+                .filter(|at| *at < as_of)
+                .collect(),
         }
     }
 }

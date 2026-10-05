@@ -9,7 +9,7 @@ use crate::eta::priority_features::{
     priority_features, PriorityEntry, PriorityFeatures, PriorityState,
 };
 use crate::eta::queue_features::QueueSubject;
-use crate::eta::star::{IssueStarChange, RepoStar, StarInputs, StarLink};
+use crate::eta::star::{IssueStarChange, LinkedStar, RepoStar, StarInputs, StarLink};
 use crate::eta::Stage;
 use crate::operator_levels::OPERATOR_HIGH_PRIORITY_LABEL;
 use crate::pr_latency::history::fixtures::labeled;
@@ -372,17 +372,25 @@ fn a_level_two_row_leads_dispatch_and_leaves_the_model_inputs_alone() {
     assert_eq!(two.rows, one.rows, "twin-otter rows are level-blind");
 }
 
+/// A linked-issue star run that began at `at` and is still on.
+fn linked_from(at: DateTime<Utc>) -> LinkedStar {
+    LinkedStar {
+        since: Some(at),
+        changes: vec![at],
+    }
+}
+
 #[test]
 fn a_linked_issue_star_raises_the_level_and_dates_the_star() {
-    let linked = PriorityState::default().with_linked(Some(ago_h(3)));
+    let linked = PriorityState::default().with_linked(linked_from(ago_h(3)));
     assert_eq!((linked.level(), linked.starred_at()), (1, Some(ago_h(3))));
     // The earlier of the PR's own star and the issue's.
-    assert_eq!(star(6).with_linked(Some(ago_h(3))).starred_at(), Some(ago_h(6)));
+    assert_eq!(star(6).with_linked(linked_from(ago_h(3))).starred_at(), Some(ago_h(6)));
     // A double star keeps its level and its own instant.
-    let high = leveled(2, 1).with_linked(Some(ago_h(3)));
+    let high = leveled(2, 1).with_linked(linked_from(ago_h(3)));
     assert_eq!((high.level(), high.starred_at()), (2, Some(ago_h(1))));
     // Not knowable at or after `as_of`.
-    let late = PriorityState::default().with_linked(Some(now()));
+    let late = PriorityState::default().with_linked(linked_from(now()));
     assert_eq!(late.known(now()).level(), 0);
     let roster = vec![entry(REPO, 1, 40, PriorityState::default())];
     let f = compute(7, 5, &linked, &roster);
@@ -393,6 +401,13 @@ fn a_linked_issue_star_raises_the_level_and_dates_the_star() {
 
 /// Star inputs linking PR 1 to issue 501, starred at `starred` (seconds).
 fn issue_star(starred: Option<i64>) -> StarInputs {
+    let stars: Vec<(i64, bool)> = starred.map(|at| (at, true)).into_iter().collect();
+    issue_star_changes(h(1.0), &stars)
+}
+
+/// Star inputs linking PR 1 to issue 501 from `link_at`, with the issue's
+/// star `changes` (seconds, starred).
+fn issue_star_changes(link_at: DateTime<Utc>, changes: &[(i64, bool)]) -> StarInputs {
     let mut repo = RepoStar {
         links_from: Some(h(0.0)),
         issue_events_from: Some(h(0.0)),
@@ -402,14 +417,14 @@ fn issue_star(starred: Option<i64>) -> StarInputs {
         1,
         vec![StarLink {
             issue: 501,
-            known_at: h(1.0),
+            known_at: link_at,
         }],
     );
-    if let Some(at) = starred {
+    for (at, starred) in changes {
         repo.issue_stars.push(IssueStarChange {
             issue: 501,
-            at: h(0.0) + Duration::seconds(at),
-            starred: true,
+            at: h(0.0) + Duration::seconds(*at),
+            starred: *starred,
         });
     }
     let mut inputs = StarInputs::default();
@@ -432,6 +447,76 @@ fn a_linked_issue_star_after_the_cutoff_t_changes_no_row_at_t() {
     let one = at_row(&moved, 1, t);
     assert_eq!((one.priority_level, one.ahead_dispatch), (1, Some(1)));
     assert_eq!(at_row(&moved, 2, t).ahead_dispatch, Some(2));
+}
+
+/// A linked-issue star that ended (Judge P2 on #10402): the unstar empties
+/// the current run, but the star still changed in the stage.
+#[test]
+fn a_linked_issue_star_that_ended_still_changed_in_stage() {
+    // Starred 4 h ago, unstarred 2 h ago, both after entry 5 h ago.
+    let both = PriorityState::default().with_linked(LinkedStar {
+        since: None,
+        changes: vec![ago_h(4), ago_h(2)],
+    });
+    let f = compute(7, 5, &both, &[]);
+    assert_eq!((f.priority_level, f.starred_age_sec), (0, None));
+    assert_eq!(f.star_changed_in_stage, Some(true));
+    // Starred before entry, unstarred in the stage.
+    let ended = PriorityState::default().with_linked(LinkedStar {
+        since: None,
+        changes: vec![ago_h(30), ago_h(2)],
+    });
+    assert_eq!(compute(7, 5, &ended, &[]).star_changed_in_stage, Some(true));
+    // Both before entry: no change in the stage.
+    let old = PriorityState::default().with_linked(LinkedStar {
+        since: None,
+        changes: vec![ago_h(30), ago_h(20)],
+    });
+    assert_eq!(compute(7, 5, &old, &[]).star_changed_in_stage, Some(false));
+    // An unstar at or after `as_of` is not yet known.
+    let late = PriorityState::default().with_linked(LinkedStar {
+        since: Some(ago_h(30)),
+        changes: vec![ago_h(30), now()],
+    });
+    assert_eq!(late.known(now()).linked_changes, vec![ago_h(30)]);
+    assert_eq!(compute(7, 5, &late, &[]).star_changed_in_stage, Some(false));
+}
+
+/// The fit row for the same: PR 1 (review from 1 h) links issue 501. Row at
+/// `t = 10 h`, lag 120 s.
+#[test]
+fn fit_rows_see_a_linked_issue_star_that_ended() {
+    let t = h(10.0);
+    let st = secs(t);
+    let build = |link_at, changes: &[(i64, bool)]| {
+        rows::build_with_star(&fleet(&[]), cutoff(), Some(&issue_star_changes(link_at, changes)))
+    };
+    // Starred and unstarred in the stage.
+    let a = build(h(1.0), &[(st - 4 * 3600, true), (st - 2 * 3600, false)]);
+    let one = at_row(&a, 1, t);
+    assert_eq!((one.priority_level, one.starred_age_sec), (0, None));
+    assert_eq!(one.star_changed_in_stage, Some(true));
+    // Starred before the stage (link known 0.5 h, star 0.75 h), unstarred in
+    // it.
+    let b = build(h(0.5), &[(secs(h(0.75)), true), (st - 2 * 3600, false)]);
+    let one = at_row(&b, 1, t);
+    assert_eq!(one.priority_level, 0);
+    assert_eq!(one.star_changed_in_stage, Some(true));
+    // Control: starred before the stage and still starred: no change.
+    let kept = build(h(0.5), &[(secs(h(0.75)), true)]);
+    let one = at_row(&kept, 1, t);
+    assert_eq!(one.priority_level, 1);
+    assert_eq!(one.star_changed_in_stage, Some(false));
+    // Lag boundaries for the removal: an unstar inside the lag (t - 60 s), at
+    // t or after t changes no row at t.
+    let before = rows_through(&kept, t);
+    for late in [st - 60, st, st + 3600] {
+        let unstarred = build(h(0.5), &[(secs(h(0.75)), true), (late, false)]);
+        assert_eq!(before, rows_through(&unstarred, t), "late={late}");
+    }
+    // Positive control: one just outside the lag (t - 121 s) does.
+    let out = build(h(0.5), &[(secs(h(0.75)), true), (st - 121, false)]);
+    assert_eq!(at_row(&out, 1, t).star_changed_in_stage, Some(true));
 }
 
 #[test]
@@ -651,6 +736,86 @@ mod serving {
             (52, want(2, 2, 2, Some(4), true)),
             (55, want(3, 3, 3, None, true)),
             (51, want(4, 3, 3, None, false)),
+        ];
+        for (pr, expected) in by_hand {
+            let i = trained
+                .row_keys
+                .iter()
+                .position(|k| k.at == h(AT) && k.pr == pr && k.repo == REPO)
+                .unwrap_or_else(|| panic!("row for #{pr}"));
+            assert_eq!(trained.priority[i], expected, "PR {pr} trained");
+            let served = tracker
+                .priority_features_of(REPO, pr, h(AT))
+                .unwrap_or_else(|| panic!("PR {pr} not listed"));
+            assert_eq!(served, trained.priority[i], "PR {pr}: serving differs from training");
+        }
+    }
+
+    /// The issue PR 51 links in [`linked_unstar_parity`].
+    const ISSUE_51: u32 = 951;
+
+    /// Linked-issue stars that end before [`AT`] (Judge P2 on #10402):
+    ///
+    /// - 52's issue [`ISSUE`] is starred at 14 h and unstarred at 16 h, both
+    ///   inside its stage (entered 11 h);
+    /// - 51's issue [`ISSUE_51`] is starred at 8 h, before 51 opens at 10 h
+    ///   (the link is known from then), and unstarred at 15 h.
+    ///
+    /// Neither is starred at 20 h, but both changed in the stage. Order: 54,
+    /// 53 (starred), then by age 55, 51, 52.
+    #[test]
+    fn linked_unstar_parity() {
+        let specs = specs();
+        let mut repo = RepoStar {
+            links_from: Some(h(0.0)),
+            issue_events_from: Some(h(0.0)),
+            ..RepoStar::default()
+        };
+        let link = |issue, at| StarLink {
+            issue,
+            known_at: h(at),
+        };
+        repo.links.insert(52, vec![link(ISSUE, 11.0)]);
+        repo.links.insert(51, vec![link(ISSUE_51, 10.0)]);
+        for (issue, at, starred) in [
+            (ISSUE, 14.0, true),
+            (ISSUE, 16.0, false),
+            (ISSUE_51, 8.0, true),
+            (ISSUE_51, 15.0, false),
+        ] {
+            repo.issue_stars.push(IssueStarChange {
+                issue,
+                at: h(at),
+                starred,
+            });
+        }
+        let mut inputs = StarInputs::default();
+        inputs.repos.insert(REPO.to_string(), repo);
+        let trained = rows::build_with_star(&snapshots(&specs), cutoff(), Some(&inputs));
+        let tracker = serve_with(&specs, &[8.0, 16.0], |tracker, at| {
+            let mut links: Vec<(u32, Vec<u32>)> = Vec::new();
+            if at >= 10.0 {
+                links.push((51, vec![ISSUE_51]));
+            }
+            if at >= 11.0 {
+                links.push((52, vec![ISSUE]));
+            }
+            let mut starred: Vec<u32> = Vec::new();
+            if (14.0..16.0).contains(&at) {
+                starred.push(ISSUE);
+            }
+            if (8.0..15.0).contains(&at) {
+                starred.push(ISSUE_51);
+            }
+            tracker.on_star_context(REPO, &links, Some(&starred), h(at));
+            tracker.on_star_context(OTHER, &[], Some(&[]), h(at));
+        });
+        let by_hand = [
+            (54, want(0, 0, 1, Some(7), false)),
+            (53, want(1, 1, 1, Some(5), true)),
+            (55, want(2, 2, 2, None, true)),
+            (51, want(3, 2, 2, None, true)),
+            (52, want(4, 2, 2, None, true)),
         ];
         for (pr, expected) in by_hand {
             let i = trained

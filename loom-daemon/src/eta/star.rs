@@ -174,6 +174,62 @@ pub fn star_state_at(
     StarState { source, since }
 }
 
+/// A PR's linked-issue star strictly before a cutoff (#10333): the current
+/// run and its history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkedStar {
+    /// Start of the current linked-issue star run, as [`star_state_at`] gives
+    /// it for the issues alone; `None` when no linked issue is starred.
+    pub since: Option<DateTime<Utc>>,
+    /// Every instant the verdict "a linked issue stars the PR" turned on or
+    /// off, ascending. An unstar ends the run and leaves `since` empty, so
+    /// this is the only record that a run started and ended.
+    pub changes: Vec<DateTime<Utc>>,
+}
+
+/// [`star_state_at`] for a PR's linked issues alone, with the instants its
+/// verdict flipped (#10333). Each flip is read off [`star_state_at`] itself,
+/// just after each fact instant, so it uses the same link and run rules.
+#[must_use]
+pub fn linked_star_at(
+    links: &[StarLink],
+    issue_stars: &[IssueStarChange],
+    cutoff: DateTime<Utc>,
+) -> LinkedStar {
+    let state = |c: DateTime<Utc>| star_state_at(Some(0), None, links, issue_stars, c);
+    let known: Vec<&StarLink> = links.iter().filter(|l| l.known_at < cutoff).collect();
+    let mut instants: Vec<DateTime<Utc>> = known
+        .iter()
+        .map(|l| l.known_at)
+        .chain(
+            issue_stars
+                .iter()
+                .filter(|c| c.at < cutoff && known.iter().any(|l| l.issue == c.issue))
+                .map(|c| c.at),
+        )
+        .collect();
+    instants.sort();
+    instants.dedup();
+    let mut on = false;
+    let mut changes = Vec::new();
+    for at in instants {
+        // Facts at `at` are known strictly before `at + 1ns`, which is never
+        // past `cutoff`.
+        let now_on = state(at + chrono::Duration::nanoseconds(1))
+            .source
+            .starred();
+        if now_on != on {
+            changes.push(at);
+            on = now_on;
+        }
+    }
+    let current = state(cutoff);
+    LinkedStar {
+        since: current.source.starred().then_some(current.since).flatten(),
+        changes,
+    }
+}
+
 /// One repo's star inputs for the fit, read from its raw event cache.
 #[derive(Debug, Clone, Default)]
 pub struct RepoStar {
@@ -238,12 +294,25 @@ impl RepoStar {
         pr_since: Option<DateTime<Utc>>,
         cutoff: DateTime<Utc>,
     ) -> Option<StarState> {
+        let links = self.covered_links(pr, cutoff)?;
+        Some(star_state_at(Some(pr_mask), pr_since, links, &self.issue_stars, cutoff))
+    }
+
+    /// [`linked_star_at`] for `pr`, or `None` when the cache does not cover
+    /// `cutoff`.
+    #[must_use]
+    pub fn linked_at(&self, pr: u32, cutoff: DateTime<Utc>) -> Option<LinkedStar> {
+        let links = self.covered_links(pr, cutoff)?;
+        Some(linked_star_at(links, &self.issue_stars, cutoff))
+    }
+
+    /// `pr`'s links, when both listings cover `cutoff`.
+    fn covered_links(&self, pr: u32, cutoff: DateTime<Utc>) -> Option<&[StarLink]> {
         let covered = |from: Option<DateTime<Utc>>| from.is_some_and(|f| f < cutoff);
         if !covered(self.links_from) || !covered(self.issue_events_from) {
             return None;
         }
-        let links = self.links.get(&pr).map_or(&[][..], Vec::as_slice);
-        Some(star_state_at(Some(pr_mask), pr_since, links, &self.issue_stars, cutoff))
+        Some(self.links.get(&pr).map_or(&[][..], Vec::as_slice))
     }
 }
 
@@ -425,6 +494,42 @@ mod tests {
             state(Some(0), None, &[link(7, 10)], &[change(8, 20, true)]).source,
             StarSource::None
         );
+    }
+
+    #[test]
+    fn linked_star_keeps_the_on_off_instants() {
+        let links = [link(7, 10)];
+        // Starred and unstarred: no current run, both instants kept.
+        let ended = [change(7, 20, true), change(7, 30, false)];
+        assert_eq!(
+            linked_star_at(&links, &ended, at(CUT)),
+            LinkedStar {
+                since: None,
+                changes: vec![at(20), at(30)]
+            }
+        );
+        // A star older than the link turns on when the link is known.
+        let early = [change(7, 5, true), change(7, 30, false)];
+        assert_eq!(linked_star_at(&links, &early, at(CUT)).changes, vec![at(10), at(30)]);
+        // Overlapping issues: the verdict stays on across the hand-off.
+        let two = [link(7, 10), link(8, 10)];
+        let stars = [
+            change(7, 20, true),
+            change(8, 25, true),
+            change(7, 30, false),
+        ];
+        let s = linked_star_at(&two, &stars, at(CUT));
+        assert_eq!((s.since, s.changes), (Some(at(25)), vec![at(20)]));
+        // An unstar at the cutoff is not yet known; an unlinked issue is nothing.
+        let at_cut = [change(7, 20, true), change(7, CUT, false)];
+        assert_eq!(
+            linked_star_at(&links, &at_cut, at(CUT)),
+            LinkedStar {
+                since: Some(at(20)),
+                changes: vec![at(20)]
+            }
+        );
+        assert_eq!(linked_star_at(&[link(9, 10)], &ended, at(CUT)), LinkedStar::default());
     }
 
     #[test]

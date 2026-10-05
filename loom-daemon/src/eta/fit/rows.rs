@@ -96,7 +96,7 @@ use crate::eta::priority_features::{
 use crate::eta::queue_features::{
     queue_features, EventKind, EventLog, QueueFeatures, QueueSubject, RosterEntry, StageEvent,
 };
-use crate::eta::star::{StarInputs, StarSource};
+use crate::eta::star::{LinkedStar, StarInputs, StarSource};
 use crate::eta::Stage;
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -406,19 +406,13 @@ fn pr_star_since(flags: &[FlagChange], cutoff: DateTime<Utc>) -> Option<DateTime
     since
 }
 
-/// The start of `pr`'s linked-issue star run known before `cutoff` (#10372),
-/// for the priority features (#10333): `None` when no linked issue is
-/// starred, or no star inputs were given or they do not cover `cutoff`.
-fn linked_star_since(
-    star: Option<&StarInputs>,
-    pr: &Pr<'_>,
-    cutoff: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
-    let state = star?
-        .repos
-        .get(&pr.repo)?
-        .state_at(pr.number, 0, None, cutoff)?;
-    state.source.starred().then_some(state.since).flatten()
+/// `pr`'s linked-issue star known before `cutoff` (#10372), for the priority
+/// features (#10333): its current run and on/off instants. Empty when no
+/// star inputs were given or they do not cover `cutoff`.
+fn linked_star(star: Option<&StarInputs>, pr: &Pr<'_>, cutoff: DateTime<Utc>) -> LinkedStar {
+    star.and_then(|s| s.repos.get(&pr.repo))
+        .and_then(|r| r.linked_at(pr.number, cutoff))
+        .unwrap_or_default()
 }
 
 /// [`build`], also recording each row's star state from `star` (#10372).
@@ -485,7 +479,7 @@ pub fn build_with_star(
                     known_at: e.entered_at + lag,
                     star: PriorityState::from_flags(&pr.flags, cutoff)
                         .unwrap_or_default()
-                        .with_linked(linked_star_since(star, pr, cutoff)),
+                        .with_linked(linked_star(star, pr, cutoff)),
                 })
                 .collect();
             let log = events.at(t);

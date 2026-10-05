@@ -732,7 +732,7 @@ version. The fit (`Assembled::priority`, one per training row) and serving
 | `ahead_starred` | How many of those are starred |
 | `n_starred_repo` / `n_starred_fleet` | Other starred PRs in the stage, in the repo / fleet scope |
 | `starred_age_sec` | Time since the PR's current level was set (`null` when not starred or the instant is unknown) |
-| `star_changed_in_stage` | Whether the level changed after the PR entered its stage |
+| `star_changed_in_stage` | Whether the level changed after the PR entered its stage: its own labels, or a linked issue's star turning on or off (one that has since ended still counts) |
 | `priority_level` | Effective level: 0 none, 1 star, 2 `loom:operator-high-priority` (#10307) |
 
 - **One ordering.** Each PR is mapped to a work-finder `PriorityCandidate`
