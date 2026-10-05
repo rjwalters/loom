@@ -685,6 +685,9 @@ jobs:
       - name: Check every tracked .sh is accounted for
         if: ${{ !cancelled() }}
         run: bash scripts/check-shell-allowlist.sh
+      - name: Test the CI Result aggregate gate (#10444)
+        if: ${{ !cancelled() }}
+        run: bash scripts/test-ci-result-gate.sh
 
       # component: Markdown Token Ratchet
       # Same ratchet as File Size Ratchet above, applied to agent-facing
@@ -2633,3 +2636,51 @@ jobs:
             -t loom-worker-native:ci-smoke .
       - name: Run the smoke test
         run: ./docker/native/test-image.sh loom-worker-native:ci-smoke
+
+  # Aggregate gate (#10444). A cancelled / never-acquired `Detect Changes`
+  # skips every path-filtered job behind it, and the three always-run required
+  # contexts stay green, so #10403 merged with no Rust lint or tests run.
+  # This job runs `if: always()`, needs EVERY other job, and fails when
+  # `Detect Changes` is not `success` on a PR, when any job failed/cancelled,
+  # or when a job was skipped only because its upstream did not succeed. A
+  # skip the path filter actually decided stays a pass. Rule + tests:
+  # scripts/ci-result-gate.sh, scripts/test-ci-result-gate.sh. Making it a
+  # REQUIRED context is a ruleset change applied by an operator AFTER this job
+  # has reported on `main` (setup-branch-protection.sh); a required context
+  # that never reports blocks every merge. The remedy for a red result is
+  # `gh run rerun --failed <run>` -- never cancel a distinct commit's run.
+  ci-result:
+    # merge-group-audit: pr-only -- the aggregate must itself run on every event; it reads the other jobs' results and has no path filter of its own
+    name: CI Result
+    if: always()
+    needs:
+      - changes
+      - build-daemon
+      - release-build
+      - node-packages
+      - backend-lint-and-check
+      - backend-tests
+      - backend-otlp-feature
+      - backend-otlp-tests
+      - structural-checks
+      - daemon-checks
+      - install-surface-checks
+      - repo-hygiene
+      - shell-syntax
+      - dep-classification-suites
+      - native-port-daemon-lifecycle
+      - installer-tests
+      - codex-adapter-smoke
+      - shell-suite-tests
+      - worker-image-smoke
+      - session-image-smoke
+      - native-image-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Aggregate every job's result
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: scripts/ci-result-gate.sh

@@ -47,11 +47,12 @@
     "decisionLog": true
   },
   "branchProtection": {
-    "_comment": "Read by scripts/install/setup-branch-protection.sh (#8103). These are the check-run names of every ci.yml job that ALWAYS runs and can actually fail — no job behind `needs: changes` (a skipped path-filtered job that never reports would block merges), and not the advisory drift check. Names are the job's `name:` with matrix values substituted, verified against live check-runs on main.",
+    "_comment": "Read by scripts/install/setup-branch-protection.sh (#8103). These are the check-run names of every ci.yml job that ALWAYS runs and can actually fail — no job behind `needs: changes` (a skipped path-filtered job that never reports would block merges), and not the advisory drift check. `CI Result` (#10444) is the always-run aggregate that fails when Detect Changes is cancelled; it is listed here but must NOT be applied to the live ruleset until it has reported on main (a required context that never reports blocks every merge) — rerun setup-branch-protection.sh as an operator step after that. Names are the job's `name:` with matrix values substituted, verified against live check-runs on main.",
     "requiredStatusChecks": [
       "Structural Checks",
       "Shell Syntax (macos-latest)",
-      "Daemon Checks"
+      "Daemon Checks",
+      "CI Result"
     ],
     "strictRequiredStatusChecks": false
   },
