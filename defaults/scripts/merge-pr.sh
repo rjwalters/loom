@@ -2288,6 +2288,9 @@ _revalidate_merge_guards() {
   PR_LABELS="$(echo "$fresh" | jq -r '.labels[]?.name // empty' 2>/dev/null || true)"
   _check_loom_pr_label
   _check_verdict_label_contradiction
+  # #10167: a chain head may have taken its lock while --auto waited. Nothing
+  # forge-side has been written yet, so exit 6 here still writes nothing.
+  _check_chain_lock
 }
 
 if [[ "$AUTO_MERGE" == "true" ]]; then

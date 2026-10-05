@@ -43,12 +43,20 @@ source "$FUNCS"
 
 # The call must sit BEFORE every write the script can make (the stacked-
 # children ref pin, the #8508 re-date, comments, the merge itself).
-guard_line="$(grep -n '; _check_chain_lock$' "$MERGE_PR_SRC" | head -1 | cut -d: -f1)"
-first_write="$(grep -n '^_check_no_open_stacked_children$' "$MERGE_PR_SRC" | head -1 | cut -d: -f1)"
+guard_line="$(awk '/; _check_chain_lock$/ { print NR; exit }' "$MERGE_PR_SRC")"
+first_write="$(awk '/^_check_no_open_stacked_children$/ { print NR; exit }' "$MERGE_PR_SRC")"
 if [[ -n "$guard_line" && -n "$first_write" && "$guard_line" -lt "$first_write" ]]; then
     ok "guard runs before the first writing step"
 else
     fail "guard runs before the first writing step" "guard=$guard_line first_write=$first_write"
+fi
+
+# --auto waits for checks before merging; a lock taken during that wait must be
+# honored, so the post-wait revalidation re-runs the guard too.
+if awk '/^_revalidate_merge_guards\(\) \{/ { inf=1 } inf && /^  _check_chain_lock$/ { found=1 } inf && /^\}/ { exit } END { exit !found }' "$MERGE_PR_SRC"; then
+    ok "post-wait revalidation re-runs the guard"
+else
+    fail "post-wait revalidation re-runs the guard" "_check_chain_lock not called inside _revalidate_merge_guards"
 fi
 
 # Stub daemon: records argv, then emits the canned outcome.
