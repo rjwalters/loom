@@ -533,6 +533,12 @@ impl GhWatchProbe {
             "--json",
             "state,labels",
         ]);
+        // A PR watch is the inventoried `pr.view-state` read; there is no
+        // inventoried issue-view operation, so an issue watch stays
+        // `unknown` rather than being mislabelled (#10089).
+        if matches!(spec.kind, WatchKind::Pr) {
+            inv = inv.forge_op(crate::forge_call_stats::ops::PR_VIEW_STATE);
+        }
         if let Some(ref repo) = spec.repo {
             inv = inv.args(["--repo", repo]);
         }
