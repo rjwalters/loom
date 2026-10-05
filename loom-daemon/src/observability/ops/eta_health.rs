@@ -1,0 +1,268 @@
+//! Per-host ETA pipeline health gauges (Issue #10391, slice 2).
+//!
+//! The fit loop and the fleet refresh loop each run on their own task and can
+//! go silent without a log line (a stood-down worker, a stalled cycle, a dead
+//! export path). The collector's 5-minute pass therefore reads a small
+//! process-global [`EtaHealth`] that those tasks update, plus the local fit
+//! and snapshot files, and exports `loom.eta.health.*` gauges through
+//! `metric.points`. The gauges stay alive when no `eta.fleet_refresh` record
+//! is emitted, which is exactly the stand-down case.
+//!
+//! Rules: an unmeasurable reading emits **no point** (unknown is not zero);
+//! labels are closed vocabularies (`kind`, `heuristic`, `reason`, `state`)
+//! plus `repo` on the per-snapshot age. Never an issue number, sha or path.
+//!
+//! [`points`] is pure over [`Facts`]; [`record`] gathers the facts and emits.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
+
+use chrono::{DateTime, Utc};
+
+use crate::eta::score::EstimateSummary;
+use crate::telemetry::ops::{MetricName, MetricPoint};
+
+/// What the long-running tasks last reported. Updated by the refresh task
+/// ([`note_tick`]), the fit check ([`note_fit_check`]) and the snapshot
+/// builder ([`note_snapshot`]); read by [`record`].
+#[derive(Debug, Default)]
+pub struct EtaHealth {
+    /// The last refresh tick: when it started and its gate state.
+    tick: Option<(DateTime<Utc>, String)>,
+    /// Repos per stop reason in the last tick that refreshed.
+    refresh_repos: BTreeMap<String, u64>,
+    /// The last fit check: when it started and its outcome or skip reason.
+    fit_check: Option<(DateTime<Utc>, String)>,
+    /// Rows, and rows with alternates, of the last built `eta.snapshot`.
+    snapshot_rows: Option<(u64, u64)>,
+    /// Cached fleet snapshot `as_of`, keyed by file, re-read on an mtime change.
+    ages: BTreeMap<PathBuf, (SystemTime, String, DateTime<Utc>)>,
+}
+
+static HEALTH: Mutex<Option<EtaHealth>> = Mutex::new(None);
+
+fn with<T>(f: impl FnOnce(&mut EtaHealth) -> T) -> T {
+    let mut guard = HEALTH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(guard.get_or_insert_with(EtaHealth::default))
+}
+
+/// Record a refresh tick (stand-down ticks included). The per-reason repo
+/// counts are kept from the last tick that actually refreshed.
+pub fn note_tick(state: &crate::eta::health::RefreshCycleState) {
+    with(|h| {
+        h.tick = Some((state.started_at, state.gate.clone()));
+        if state.gate != "stand_down" {
+            h.refresh_repos = state.stop_reasons.clone();
+        }
+    });
+}
+
+/// Record a fit check: its start and its outcome (or skip reason).
+pub fn note_fit_check(started_at: DateTime<Utc>, reason: &str) {
+    with(|h| h.fit_check = Some((started_at, reason.to_string())));
+}
+
+/// Record the last built `eta.snapshot`: its rows and those with alternates.
+pub fn note_snapshot(rows: u64, alternates_rows: u64) {
+    with(|h| h.snapshot_rows = Some((rows, alternates_rows)));
+}
+
+/// Live items per `(kind, heuristic, reason)`: the newest estimate per
+/// `(repo, issue, kind, heuristic)`, `reason` being `answered` or its
+/// `no_estimate_reason`. Pure.
+#[must_use]
+pub fn buckets(pending: &[EstimateSummary]) -> BTreeMap<(String, String, String), u64> {
+    let mut newest: BTreeMap<(&str, u32, &str, &str), &EstimateSummary> = BTreeMap::new();
+    for p in pending {
+        let key = (p.repo.as_str(), p.issue, p.kind.as_str(), p.heuristic.as_str());
+        if newest.get(&key).is_none_or(|n| n.as_of < p.as_of) {
+            newest.insert(key, p);
+        }
+    }
+    let mut out = BTreeMap::new();
+    for p in newest.into_values() {
+        let reason = p.no_estimate_reason.map_or("answered", |r| r.as_str());
+        *out.entry((p.kind.as_str().to_string(), p.heuristic.clone(), reason.to_string()))
+            .or_default() += 1;
+    }
+    out
+}
+
+/// Everything one pass reads. `None` / empty = unmeasurable.
+#[derive(Debug, Default)]
+pub struct Facts {
+    pub now: DateTime<Utc>,
+    /// `None` when ETA is disabled (no tracker).
+    pub items: Option<BTreeMap<(String, String, String), u64>>,
+    /// The loaded coefficient file's cutoff, when one is loaded.
+    pub fit_cutoff: Option<DateTime<Utc>>,
+    pub fit_check: Option<(DateTime<Utc>, String)>,
+    pub snapshots: Vec<(String, DateTime<Utc>)>,
+    /// The refresh gate state, when known.
+    pub gate: Option<String>,
+    pub last_tick: Option<DateTime<Utc>>,
+    pub refresh_repos: BTreeMap<String, u64>,
+    pub snapshot_rows: Option<(u64, u64)>,
+}
+
+fn age(now: DateTime<Utc>, then: DateTime<Utc>) -> i64 {
+    (now - then).num_seconds().max(0)
+}
+
+fn count(n: u64) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
+}
+
+/// The gauges for `facts`. Pure.
+#[must_use]
+pub fn points(facts: &Facts) -> Vec<MetricPoint> {
+    let mut out = Vec::new();
+    for ((kind, heuristic, reason), n) in facts.items.iter().flatten() {
+        out.push(
+            MetricPoint::int(MetricName::EtaHealthItems, count(*n))
+                .label("kind", kind)
+                .label("heuristic", heuristic)
+                .label("reason", reason),
+        );
+    }
+    out.push(MetricPoint::int(
+        MetricName::EtaHealthFitLoaded,
+        i64::from(facts.fit_cutoff.is_some()),
+    ));
+    if let Some(cutoff) = facts.fit_cutoff {
+        out.push(MetricPoint::int(MetricName::EtaHealthFitAgeSeconds, age(facts.now, cutoff)));
+    }
+    if let Some((at, reason)) = &facts.fit_check {
+        out.push(
+            MetricPoint::int(MetricName::EtaHealthFitCheckAgeSeconds, age(facts.now, *at))
+                .label("reason", reason),
+        );
+    }
+    for (repo, as_of) in &facts.snapshots {
+        out.push(
+            MetricPoint::int(MetricName::EtaHealthSnapshotAgeSeconds, age(facts.now, *as_of))
+                .label("repo", repo),
+        );
+    }
+    if let Some(gate) = &facts.gate {
+        out.push(MetricPoint::int(MetricName::EtaHealthRefreshGate, 1).label("state", gate));
+    }
+    if let Some(at) = facts.last_tick {
+        out.push(MetricPoint::int(
+            MetricName::EtaHealthRefreshLastCycleAgeSeconds,
+            age(facts.now, at),
+        ));
+    }
+    for (reason, n) in &facts.refresh_repos {
+        out.push(
+            MetricPoint::int(MetricName::EtaHealthRefreshRepos, count(*n)).label("reason", reason),
+        );
+    }
+    if let Some((rows, alternates)) = facts.snapshot_rows {
+        out.push(MetricPoint::int(MetricName::EtaHealthSnapshotRows, count(rows)));
+        out.push(MetricPoint::int(MetricName::EtaHealthSnapshotAlternatesRows, count(alternates)));
+    }
+    out
+}
+
+/// `as_of` of every fleet snapshot file, re-parsing only a file whose mtime
+/// changed since the last pass (the files carry whole sample sets).
+fn snapshot_ages(
+    root: &Path,
+    cache: &mut BTreeMap<PathBuf, (SystemTime, String, DateTime<Utc>)>,
+) -> Vec<(String, DateTime<Utc>)> {
+    let dir = crate::eta::fleet::snapshot_dir(root);
+    let mut seen = Vec::new();
+    let paths = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"));
+    for path in paths {
+        let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+            continue;
+        };
+        if cache.get(&path).is_none_or(|(t, _, _)| *t != mtime) {
+            match crate::eta::fleet::read(&path) {
+                Some(s) => {
+                    cache.insert(path.clone(), (mtime, s.repo, s.as_of));
+                }
+                None => {
+                    cache.remove(&path);
+                }
+            }
+        }
+        seen.push(path);
+    }
+    cache.retain(|p, _| seen.contains(p));
+    cache
+        .values()
+        .map(|(_, repo, as_of)| (repo.clone(), *as_of))
+        .collect()
+}
+
+/// Gather the facts for `root` as of `now`. Blocking (file reads).
+fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
+    let eta = crate::eta::config::read(root);
+    let mut cache = with(|h| std::mem::take(&mut h.ages));
+    let snapshots = snapshot_ages(root, &mut cache);
+    with(|h| h.ages = cache);
+    let (tick, repos, fit_check, snapshot_rows) =
+        with(|h| (h.tick.clone(), h.refresh_repos.clone(), h.fit_check.clone(), h.snapshot_rows));
+    // Before the first tick the gate is what the read-only resolver says it
+    // would be (it never arms the singleton job), or `disabled` when the
+    // task does not run at all.
+    let gate = match &tick {
+        Some((_, gate)) => gate.clone(),
+        None if !super::super::eta_fleet_refresh::should_spawn(&eta) => "disabled".into(),
+        None => match crate::fleet_captain::resolve_gate_for_root(root, host_id) {
+            crate::fleet_captain::CaptainGate::Armed { .. } => "captain",
+            crate::fleet_captain::CaptainGate::Refused { .. } => "stand_down",
+            crate::fleet_captain::CaptainGate::NoCaptainDeclared => "no_captain",
+        }
+        .into(),
+    };
+    Facts {
+        now,
+        items: super::super::eta::health_items(),
+        fit_cutoff: crate::eta::fit::coeffs::load_latest(root, now).map(|f| f.as_of),
+        fit_check,
+        snapshots,
+        gate: Some(gate),
+        last_tick: tick.map(|(at, _)| at),
+        refresh_repos: repos,
+        snapshot_rows,
+    }
+}
+
+/// Gather the facts and emit the gauges through the global path (so a test
+/// can [`super::capture::capture`] them). Blocking (file reads).
+fn export(root: &Path, host_id: &str, now: DateTime<Utc>) {
+    super::emit_metrics(points(&gather(root, host_id, now)));
+}
+
+/// Gather and export the gauges, when an ops sink is registered.
+pub async fn record(root: &Path) {
+    if super::global_ops_sink().is_none() {
+        return;
+    }
+    // The same identity the refresh tick's captain gate resolves against, so
+    // the pre-first-tick gate matches what the first tick will report.
+    let (root, host_id) = (root.to_path_buf(), crate::sweep_registry::host_identity());
+    let _ = tokio::task::spawn_blocking(move || export(&root, &host_id, Utc::now())).await;
+}
+
+/// Forget everything the tasks reported (tests share the process-global).
+#[cfg(test)]
+fn reset() {
+    with(|h| *h = EtaHealth::default());
+}
+
+#[cfg(test)]
+#[path = "eta_health_tests.rs"]
+mod tests;

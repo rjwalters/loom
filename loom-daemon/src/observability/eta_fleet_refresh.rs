@@ -452,7 +452,9 @@ fn run_production_cycle(
         let repos: Vec<String> = targets.iter().map(|t| t.repo.clone()).collect();
         signoz_cycle(root, &repos, &config.signoz, Utc::now());
     }
-    crate::eta::health::write_refresh_cycle(root, &cycle_state(&ticked, now, config.interval_secs));
+    let cycle = cycle_state(&ticked, now, config.interval_secs);
+    crate::eta::health::write_refresh_cycle(root, &cycle);
+    super::ops::eta_health::note_tick(&cycle);
     // After the records: a fit that panics must not cost the cycle's telemetry.
     let fit_started = Utc::now();
     let began = std::time::Instant::now();
