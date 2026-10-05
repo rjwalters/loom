@@ -4,6 +4,8 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
+use std::rc::Rc;
+use std::time::Duration;
 
 use super::super::overlap::{with_no_overlap, TickFiles};
 use super::super::{
@@ -228,6 +230,57 @@ fn within_a_tick_a_pair_is_evaluated_once_even_with_the_cache_off() {
         assert!(!checker.conflicts(&pr(1, &[]), &pr(2, &[])));
     }
     assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn no_evaluation_starts_after_the_shared_deadline_and_holds_are_retained() {
+    let root = Path::new("/nonexistent/loom-10350-deadline");
+    let now = Rc::new(Cell::new(Duration::ZERO));
+    let clock = Rc::clone(&now);
+    let deadline = Deadline::with_clock(Duration::from_secs(100), move || clock.get());
+    let calls = Cell::new(0);
+    // Each evaluation "takes" 40s of the injected clock and finds a clean merge.
+    let eval = |_: &SequencePr, _: &SequencePr| {
+        calls.set(calls.get() + 1);
+        now.set(now.get() + Duration::from_secs(40));
+        Some(false)
+    };
+    let checker = PairChecker::with_deadline(root, 256, deadline, eval);
+    assert!(!checker.conflicts(&pr(1, &[]), &pr(2, &[])), "t=0");
+    assert!(!checker.conflicts(&pr(1, &[]), &pr(3, &[])), "t=40");
+    assert!(!checker.conflicts(&pr(1, &[]), &pr(4, &[])), "t=80, still inside");
+    // t=120: spent. Later pairs launch nothing and keep their edge/hold.
+    assert!(checker.conflicts(&pr(1, &[]), &pr(5, &[])), "past the deadline ⇒ conflict");
+    assert!(checker.conflicts(&pr(2, &[]), &pr(3, &[])), "past the deadline ⇒ conflict");
+    assert_eq!(calls.get(), 3, "no evaluation after the deadline");
+    // An answer already in hand is still served after the deadline.
+    assert!(!checker.conflicts(&pr(4, &[]), &pr(1, &[])));
+    assert_eq!(calls.get(), 3);
+}
+
+#[test]
+fn a_spent_deadline_launches_no_git_and_clamps_the_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("lib.rs"), "pub mod a;\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "base"]);
+    let head = git(dir, &["rev-parse", "HEAD"]);
+    let spent = Deadline::with_clock(Duration::from_secs(1), || Duration::from_secs(5));
+    assert!(spent.expired());
+    // Present locally, yet a spent deadline answers "not available" without
+    // running even `git cat-file`.
+    let mut p = pr(1, &[]);
+    p.head_sha = Some(head.clone());
+    assert!(!ensure_head(dir, &p, &spent));
+    assert!(ensure_head(dir, &p, &Deadline::unbounded()));
+    assert_eq!(merge_tree_within(dir, &head, &head, &spent), None);
+    // A nearly-spent deadline clamps the timeout to what is left.
+    let nearly = Deadline::with_clock(Duration::from_secs(30), || {
+        Duration::from_secs(30) - Duration::from_millis(1)
+    });
+    assert_eq!(nearly.remaining(), Duration::from_millis(1));
 }
 
 // --- Real git --------------------------------------------------------------
