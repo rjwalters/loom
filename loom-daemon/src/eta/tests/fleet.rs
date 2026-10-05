@@ -634,7 +634,38 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
         "heuristics/land_twin_otter.rs",
         include_str!("../heuristics/land_twin_otter.rs"),
     ),
+    (
+        "heuristics/land_twin_otter_b.rs",
+        include_str!("../heuristics/land_twin_otter_b.rs"),
+    ),
+    ("heuristics/land_v4.rs", include_str!("../heuristics/land_v4.rs")),
+    // #10259: the stall detector the heuristics call.
+    ("stall.rs", include_str!("../stall.rs")),
 ];
+
+/// `HEURISTIC_SOURCES` is hand-written, so a new heuristic file could silently
+/// escape the purity scan. Every `*.rs` under `heuristics/` and `twin_otter/`
+/// must therefore have an entry. (Helper modules elsewhere in `eta/` cannot be
+/// discovered by directory and stay an explicit list above.)
+#[test]
+fn every_heuristic_source_file_is_scanned_for_purity() {
+    for dir in ["heuristics", "twin_otter"] {
+        let path = format!("{}/src/eta/{dir}", env!("CARGO_MANIFEST_DIR"));
+        for entry in std::fs::read_dir(&path).unwrap_or_else(|e| panic!("read {path}: {e}")) {
+            let entry = entry.expect("dir entry");
+            let file = entry.file_name().to_string_lossy().into_owned();
+            if !file.ends_with(".rs") {
+                continue;
+            }
+            let key = format!("{dir}/{file}");
+            assert!(
+                HEURISTIC_SOURCES.iter().any(|(name, _)| *name == key),
+                "{key} exists on disk but has no entry in HEURISTIC_SOURCES: add \
+                 `(\"{key}\", include_str!(\"../{key}\"))` so the purity scan covers it.",
+            );
+        }
+    }
+}
 
 /// The whole point of #9343's "the estimator stays pure over a snapshot": a
 /// heuristic may read `(input, history)` and nothing else. If it could reach
