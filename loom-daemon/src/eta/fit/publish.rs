@@ -620,13 +620,54 @@ fn ensure_branch(
     ensure_ok(&reply, "creating the publication branch", &loc.repo)
 }
 
+/// `fleet.etaFitRef` is spliced into store request paths, a query string and
+/// the PUT `branch` field, so it must pass the same check as `fleet.ref`
+/// ([`crate::fleet_store::validate_ref`]) and be a bare branch name: no
+/// `refs/` or `heads/` prefix and no empty or dot-led segment (so no trailing
+/// `/`). A non-canonical spelling would make the written branch ambiguous.
+///
+/// # Errors
+///
+/// When `reference` is not a plain, canonical branch name.
+pub fn validate_publication_ref(reference: &str) -> Result<()> {
+    crate::fleet_store::validate_ref(reference)
+        .with_context(|| format!("`{REF_KEY}` `{reference}` is invalid"))?;
+    if reference.starts_with("refs/")
+        || reference.starts_with("heads/")
+        || reference
+            .split('/')
+            .any(|seg| seg.is_empty() || seg.starts_with('.'))
+    {
+        bail!(
+            "`{REF_KEY}` `{reference}` must be a bare branch name \
+             (no `refs/` or `heads/` prefix, no empty or dot-led segment)"
+        );
+    }
+    Ok(())
+}
+
+/// The branch `reference` names, for comparison only: trimmed, without a
+/// leading `refs/heads/` or `heads/`, without trailing `/`.
+fn branch_name(reference: &str) -> &str {
+    let r = reference.trim();
+    r.strip_prefix("refs/heads/")
+        .or_else(|| r.strip_prefix("heads/"))
+        .unwrap_or(r)
+        .trim_end_matches('/')
+}
+
 /// This autonomous write may land only on the dedicated publication branch,
 /// never on the store's reviewed branch (`fleet.ref`) or `main`: that is part
 /// of how `write_scope::tests::daemon_write_paths_are_scoped` scopes this file
 /// (`FleetStore`), so it is enforced here rather than left to the ruleset.
+/// The publication branch must be valid and canonical
+/// ([`validate_publication_ref`]); both sides are normalized
+/// ([`branch_name`]) and compared case-insensitively, so `refs/heads/main`,
+/// `Main` or `fleet.ref = refs/heads/stable` against `stable` are refused.
 fn refuse_reviewed_branch(loc: &StoreLocation, base_ref: &str) -> Result<()> {
-    let r = loc.reference.trim();
-    if r == base_ref.trim() || r == "main" {
+    validate_publication_ref(&loc.reference)?;
+    let r = branch_name(&loc.reference);
+    if r.eq_ignore_ascii_case(branch_name(base_ref)) || r.eq_ignore_ascii_case("main") {
         bail!(
             "refusing to publish the eta fit to `{r}` in {}: `{REF_KEY}` must name a dedicated \
              branch, not the store's reviewed branch",
@@ -741,10 +782,25 @@ pub fn resolve_max_age(effective_config: &Value) -> Duration {
 #[must_use]
 pub fn publication_location(root: &Path) -> Option<(StoreLocation, String)> {
     let effective = crate::config_resolver::resolve_effective_config(root);
-    let base = crate::fleet_store::resolve_location(&effective, &|k| std::env::var(k).ok())
+    location_for(&effective, &|k| std::env::var(k).ok())
+}
+
+/// [`publication_location`] for an already-resolved config: `None` when
+/// `fleet.repo` is unset, or when `fleet.repo`/`fleet.ref` or `fleet.etaFitRef`
+/// is invalid (logged; nothing is fetched or written).
+#[must_use]
+pub fn location_for(
+    effective: &Value,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<(StoreLocation, String)> {
+    let base = crate::fleet_store::resolve_location(effective, env)
         .map_err(|e| log::warn!("eta fit publish: fleet store misconfigured: {e:#}"))
         .ok()??;
-    let eta_ref = resolve_ref(&effective);
+    let eta_ref = resolve_ref(effective);
+    if let Err(e) = validate_publication_ref(&eta_ref) {
+        log::warn!("eta fit publish: disabled, {e:#}");
+        return None;
+    }
     Some((
         StoreLocation {
             repo: base.repo,

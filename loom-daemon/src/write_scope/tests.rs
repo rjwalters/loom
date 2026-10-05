@@ -891,6 +891,7 @@ fn daemon_write_paths_are_scoped() {
             || rel.contains("test_support")
     };
     let mut unreviewed = Vec::new();
+    let mut sources: Vec<(String, String)> = Vec::new();
     let mut stack = vec![src.clone()];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).unwrap().flatten() {
@@ -908,6 +909,9 @@ fn daemon_write_paths_are_scoped() {
                 .to_string_lossy()
                 .replace('\\', "/");
             let text = std::fs::read_to_string(&path).unwrap_or_default();
+            if !is_test(&rel) {
+                sources.push((rel.clone(), text.clone()));
+            }
             if !is_test(&rel) && writes.is_match(&text) && !reviewed.iter().any(|(f, _)| *f == rel)
             {
                 unreviewed.push(rel);
@@ -959,10 +963,20 @@ fn daemon_write_paths_are_scoped() {
             FleetStore { caller, call, why } => {
                 let text = std::fs::read_to_string(src.join(file)).unwrap_or_default();
                 assert!(matches(file), "stale entry: {file} ({why}) no longer writes");
+                // The guard is the first statement of `publish`, not merely defined.
+                let guarded = text.find("pub fn publish(").is_some_and(|f| {
+                    text[f..]
+                        .find(") -> Result<PublishKind> {")
+                        .map(|b| text[f + b..].trim_start_matches(") -> Result<PublishKind> {"))
+                        .is_some_and(|body| {
+                            body.trim_start()
+                                .starts_with("refuse_reviewed_branch(loc, base_ref)?;")
+                        })
+                });
                 assert!(
                     text.contains("fleet_store::resolve_location(")
                         && text.contains("WriteTransport")
-                        && text.contains("refuse_reviewed_branch(")
+                        && guarded
                         && !text.contains("Command::new"),
                     "{file} ({why}) must take its target from fleet_store::resolve_location, \
                      write only through WriteTransport and refuse the reviewed branch"
@@ -974,6 +988,16 @@ fn daemon_write_paths_are_scoped() {
                     gate.is_some() && at.is_some() && gate < at,
                     "{file} ({why}): {caller} must reach `{call}` only under RefreshGate::Captain"
                 );
+                let name = call.split('(').next().unwrap_or(call);
+                let callers: Vec<&str> = sources
+                    .iter()
+                    .filter(|(_, t)| {
+                        t.replace(&format!("fn {name}("), "")
+                            .contains(&format!("{name}("))
+                    })
+                    .map(|(rel, _)| rel.as_str())
+                    .collect();
+                assert_eq!(callers, [*caller], "{file} ({why}): only {caller} may call `{name}`");
             }
             OperatorOnly(why) | NotAWrite(why) => {
                 assert!(matches(file), "stale entry: {file} ({why})");

@@ -328,16 +328,61 @@ fn the_captain_never_publishes_to_the_reviewed_branch() {
     let store = Store::default();
     let fit = fit_at(at(4));
     coeffs::write(&coeffs::fit_dir(cap.path()).join(coeffs::path_for(fit.as_of)), &fit).unwrap();
-    for (reference, base) in [("main", "release"), ("stable", "stable")] {
+    let try_publish = |reference: &str, base: &str| {
         let loc = StoreLocation {
             repo: "o/store".to_string(),
             reference: reference.to_string(),
         };
-        let r = publish::publish(&store, &store, &loc, base, &fit, CAPTAIN, at(4));
-        assert!(r.unwrap_err().to_string().contains("dedicated"), "{reference}");
+        format!(
+            "{:#}",
+            publish::publish(&store, &store, &loc, base, &fit, CAPTAIN, at(4)).unwrap_err()
+        )
+    };
+    // The reviewed branch or `main`, however `fleet.ref` spells it.
+    for (reference, base) in [
+        ("main", "release"),
+        ("stable", "stable"),
+        ("Main", "release"),
+        ("MAIN", "release"),
+        ("stable", "refs/heads/stable"),
+        ("stable", "heads/stable"),
+        ("stable", "stable/"),
+        ("Stable", "stable"),
+    ] {
+        assert!(try_publish(reference, base).contains("dedicated"), "{reference} vs {base}");
+    }
+    // Non-canonical or unsafe publication refs never reach the store, whether
+    // or not they would alias the reviewed branch.
+    for reference in [
+        "refs/heads/main",
+        "heads/main",
+        "main/",
+        "refs/heads/eta-fit",
+        "?x=1",
+        "a&b",
+        "a b",
+        "a#b",
+        "../x",
+        "x/../y",
+        "a//b",
+        ".hidden",
+        "",
+    ] {
+        assert!(try_publish(reference, "stable").contains(publish::REF_KEY), "{reference:?}");
     }
     assert!(store.writes.borrow().is_empty());
     assert!(!*store.branch.borrow());
+}
+
+#[test]
+fn an_invalid_publication_ref_disables_the_location() {
+    let env = |_: &str| None;
+    let cfg = |eta_ref: &str| serde_json::json!({"fleet": {"repo": "o/store", "ref": "stable", "etaFitRef": eta_ref}});
+    let (loc, base) = publish::location_for(&cfg("eta-fit"), &env).unwrap();
+    assert_eq!((loc.reference.as_str(), base.as_str()), ("eta-fit", "stable"));
+    for bad in ["?x=1", "a&b", "a b", "../x", "refs/heads/main", "main/"] {
+        assert!(publish::location_for(&cfg(bad), &env).is_none(), "{bad:?}");
+    }
 }
 
 #[test]
