@@ -171,12 +171,12 @@
 #     <<<"$LEASE_IDENT"`, which behaves identically in bash and zsh.
 #
 #   sweep-lease-renew.sh renew-once <issue> [--host HOST] [--sweep-id ID]
-#                                            [--cached-lease ID@CREATED_AT]
+#                                            [--cached-lease ID@SINCE]
 #     Perform exactly one renewal cycle synchronously (used internally by
 #     `start`'s loop; also directly testable). With --cached-lease (Issue
 #     #10021; `start`'s loop passes the value the previous successful cycle
-#     reported as `lease-cache=<id>@<created_at>` on stderr), the lookup is ONE
-#     non-paginated page of the comments updated since CREATED_AT -- never a
+#     reported as `lease-cache=<id>@<since>` on stderr), the lookup is ONE
+#     non-paginated page of the comments updated since SINCE -- never a
 #     `--paginate` listing -- and the cached comment is renewed with a single
 #     PATCH. It falls back to the full paginated lookup below (re-exec without
 #     the cache) only when that comment is missing from the window (deleted,
@@ -200,7 +200,7 @@
 #     from the caller's --host/--sweep-id) is checked against every
 #     `<!-- loom:lease-yield host=... sweep=... earliest_host=... -->`
 #     comment already present in the same fetched batch (with --cached-lease,
-#     the since-lease-creation window, which holds every yield record posted
+#     the since-SINCE window, which holds every yield record posted
 #     after the lease). If a yield record
 #     names the SAME (host, sweep) pair as the candidate lease, that
 #     dispatcher has already stood down for this issue (Issue #6287's
@@ -224,7 +224,11 @@
 #     good once it is closed (an unreadable state skips that cycle's PATCH).
 #     All three live in `loom-daemon lease renewer` (claim / check / release);
 #     records sit under ~/.loom/lease-renew ($LOOM_LEASE_RENEW_STATE_DIR).
-#     Budget: 3 requests per cycle, 36/h per held lease at 300 s.
+#     Budget: 3 requests per cycle, 36/h per held lease at 300 s, spent on the
+#     host's GitHub App installation when one is configured (`lease_gh`), so
+#     the personal login pays nothing in steady state. A loop with no lease
+#     to renew stops after two consecutive misses; the window read slides with
+#     the lease's own updated_at. See defaults/docs/lease-record.md.
 #
 #   sweep-lease-renew.sh stop <PID>
 #     Best-effort kill of a loop PID returned by `start`. NOT required for
@@ -276,6 +280,26 @@ SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 # of failing closed for the sweep's entire lease lifetime.
 # shellcheck source=./lib/forge-helpers.sh
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
+
+# lease_gh <read|write> <gh args...> (#10229): run one forge call on this host's
+# GitHub App installation -- `loom-daemon forge token` picks a reader App for the
+# GETs and the writer App for the PATCH -- so renewal spends an App bucket, not
+# the personal login an interactive session inherits. forge_gh_perm_safe's
+# ladder still runs under the App token. With no App configured, or when the App
+# attempt fails for any reason, the call re-runs exactly as before on the
+# caller's own credential, tagged `lease-credential=ambient-fallback` on stderr.
+# LOOM_LEASE_CREDENTIAL (app / ambient) rides along for gh-shim telemetry.
+# requires-daemon: forge optional   Without `forge token` (absent or older binary), or with no App configured, every call runs on the caller's own credential, exactly as before #10229.
+lease_gh() {
+    local access="$1" tok="" out; shift
+    tok="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge token --repo "${LOOM_REPO:-$(_forge_nwo_from_remote || true)}" --access "$access" 2> /dev/null | jq -r 'select(.status == "ok") | .token // empty' 2> /dev/null)" || tok=""
+    if [[ -n "$tok" ]] && out="$(GH_TOKEN="$tok" LOOM_LEASE_CREDENTIAL=app forge_gh_perm_safe "$@" 2> /dev/null)"; then
+        [[ -z "$out" ]] || printf '%s\n' "$out"
+        return 0
+    fi
+    [[ -z "$tok" ]] || echo "lease-credential=ambient-fallback: the ${access} call failed on the App credential (#10229)" >&2
+    LOOM_LEASE_CREDENTIAL=ambient forge_gh_perm_safe "$@"
+}
 
 usage() {
     awk 'NR < 3 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
@@ -644,10 +668,10 @@ cmd_renew_once() {
         echo "ERROR: renew-once: --host and --sweep-id must both be given, or neither" >&2
         exit 1
     fi
-    # --cached-lease ID@CREATED_AT (Issue #10021): the loop's remembered lease
-    # comment. Validated strictly because CREATED_AT is spliced into a URL.
+    # --cached-lease ID@SINCE (Issue #10021; SINCE is a cursor, #10229): the loop's remembered lease
+    # comment. Validated strictly because SINCE is spliced into a URL.
     if [[ -n "$cached" && ! "$cached" =~ ^[0-9]+@[0-9TZ:-]+$ ]]; then
-        echo "ERROR: renew-once: --cached-lease must be <comment-id>@<created_at> (got: '$cached')" >&2
+        echo "ERROR: renew-once: --cached-lease must be <comment-id>@<since> (got: '$cached')" >&2
         exit 1
     fi
     # gh-call attribution (Issue #10139): the detached renewer is reparented
@@ -680,15 +704,23 @@ cmd_renew_once() {
     # policy, #9953): lease comments drive own-yield/fence decisions (CAS-style
     # claim), so a 30s-stale read could renew a lease that was just yielded.
     # Steady state (Issue #10021): with --cached-lease, ONE non-paginated page
-    # of the comments updated since the lease comment was created replaces the
+    # of the comments updated since the cursor (below) replaces the
     # `--paginate` listing of the whole issue. That window always contains the
     # lease comment itself (its updated_at only moves forward) and every
     # `loom:lease-yield` record posted after it, so the own-yield guard below
     # sees exactly what it would in the full listing. A full page (100) means
     # the window may be truncated, so it is treated as a cache miss.
+    #
+    # Sliding window (#10229): the cached cursor is the lease comment's
+    # updated_at AS LISTED by the previous cycle -- i.e. that cycle's view of
+    # the PATCH before it -- not its created_at. Every comment created after
+    # the previous listing has a later updated_at, so the own-yield guard still
+    # sees every new yield record, while the window holds about two intervals of
+    # activity instead of everything since the claim, and no longer fills a
+    # page (the `full-window` fallback) on a long-lived, busy issue.
     local comments_json endpoint="repos/${repo_path}/issues/${issue}/comments" paginate="--paginate"
     [[ -z "$cached" ]] || { endpoint+="?since=${cached#*@}&per_page=100"; paginate=""; }
-    if ! comments_json="$(forge_gh_perm_safe api "$endpoint" ${paginate:+"$paginate"})"; then
+    if ! comments_json="$(lease_gh read api "$endpoint" ${paginate:+"$paginate"})"; then
         echo "ERROR: 'gh api .../issues/${issue}/comments${paginate:+ $paginate}' failed (escalation ladder exhausted)" >&2
         exit 1
     fi
@@ -702,14 +734,16 @@ cmd_renew_once() {
     comments_json="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments <<< "$comments_json" 2> /dev/null)" \
         || { echo "ERROR: lease comments on issue #${issue} could not be authenticated (loom-daemon forge trusted-comments unavailable)" >&2; exit 1; }
 
-    # Prints "<id>@<created_at>". A cached id must still pass every filter
-    # (trusted, marker, exact match) -- a comment that stopped matching is stale.
+    # Prints "<id>@<updated_at as listed>" (the next window's cursor, #10229;
+    # created_at for a shape without updated_at). A cached id must still pass
+    # every filter (trusted, marker, exact match) -- one that stopped matching
+    # is stale.
     local candidate candidate_id
     candidate="$(jq -r --arg marker "$LEASE_MARKER_PREFIX" --arg exact "$exact" --arg cid "${cached%%@*}" '
         [ .[] | select(.body != null and (.body | startswith($marker)))
               | select($exact == "" or (.body | startswith($exact)))
               | select($cid == "" or (.id | tostring) == $cid) ]
-        | sort_by(.id) | reverse | .[0] // empty | "\(.id)@\(.created_at)"
+        | sort_by(.id) | reverse | .[0] // empty | "\(.id)@\(.updated_at // .created_at)"
     ' <<< "$comments_json" 2>/dev/null || true)"
     candidate_id="${candidate%%@*}"
 
@@ -784,7 +818,7 @@ cmd_renew_once() {
     write_repo="$(loom_write_repo "${LOOM_REPO:-}")" || { echo "ERROR: not renewing lease comment ${candidate_id} on issue #${issue}: loom-daemon forge may-write refused the repo (#9548)" >&2; exit 1; }
     patch_body_file="$(mktemp)"
     printf '%s' "$new_body" > "$patch_body_file"
-    patch_err="$(forge_gh_perm_safe api --method PATCH "repos/${write_repo}/issues/comments/${candidate_id}" \
+    patch_err="$(lease_gh write api --method PATCH "repos/${write_repo}/issues/comments/${candidate_id}" \
         -F "body=@${patch_body_file}" 2>&1 > /dev/null)" || patch_rc=$?
     rm -f "$patch_body_file"
     [[ -z "$patch_err" ]] || printf '%s\n' "$patch_err" >&2
@@ -796,7 +830,7 @@ cmd_renew_once() {
         exit 1
     fi
 
-    # `lease-cache=<id>@<created_at>` is the token `start`'s loop parses to
+    # `lease-cache=<id>@<since>` is the token `start`'s loop parses to
     # pass --cached-lease on its next cycle (Issue #10021).
     echo "renewed lease comment ${candidate_id} for issue #${issue} at ${now_iso} lease-cache=${candidate}" >&2
 }
@@ -962,7 +996,7 @@ cmd_start() {
     #     immortal target, never comes).
     #
     # Issue #10021: the loop REMEMBERS its lease comment. A successful cycle
-    # reports `lease-cache=<id>@<created_at>` on stderr; the next cycle passes
+    # reports `lease-cache=<id>@<since>` on stderr; the next cycle passes
     # it back as --cached-lease, so steady state is one non-paginated read plus
     # one PATCH instead of a `--paginate` listing of every comment. renew-once
     # itself falls back to the full listing on a miss or a PATCH 404. A failed
@@ -977,21 +1011,24 @@ cmd_start() {
     # check: 3 = stop for good (closed / released / superseded), 4 = state
     # unverified, skip this PATCH; anything else (incl. an older binary) renews.
     local -a owner_args=("$issue" --host "$host" --sweep-id "$sweep_id" --token "$$.${RANDOM}.${loop_started_at}")
+    #
+    # A cycle whose authenticated listing finds no lease comment (renew-once
+    # exit 2) re-lists with --paginate next time, because there is nothing to
+    # cache. Before #10229 such a loop paid a full listing every interval for
+    # its whole life -- the recurring `--paginate` share in the gh-shim data. The
+    # lease is published before `start` on every path, so two consecutive
+    # misses (one interval apart, any success in between resets the count) mean
+    # there is nothing this loop can ever renew: it stops.
+    local cap_msg="sweep-lease-renew: renewal loop for issue #${issue} exiting: reached the ${max_age}s absolute lifetime cap (SWEEP_LEASE_RENEW_MAX_AGE_SECS / --max-age, #7825). The lease now ages out and the claim becomes reclaimable; set the cap to 0 to disable it."
     (
-        cached_lease=""
+        cached_lease="" misses=0
         while pid_is_live "$watch_pid" "$watch_ident"; do
-            if max_age_exceeded "$loop_started_at" "$max_age"; then
-                echo "sweep-lease-renew: renewal loop for issue #${issue} exiting: reached the ${max_age}s absolute lifetime cap (SWEEP_LEASE_RENEW_MAX_AGE_SECS / --max-age, #7825). The lease now ages out and the claim becomes reclaimable; set the cap to 0 to disable it." >&9
-                break
-            fi
+            ! max_age_exceeded "$loop_started_at" "$max_age" || { echo "$cap_msg" >&9; break; }
             sleep "$interval"
             pid_is_live "$watch_pid" "$watch_ident" || break
-            if max_age_exceeded "$loop_started_at" "$max_age"; then
-                echo "sweep-lease-renew: renewal loop for issue #${issue} exiting: reached the ${max_age}s absolute lifetime cap (SWEEP_LEASE_RENEW_MAX_AGE_SECS / --max-age, #7825). The lease now ages out and the claim becomes reclaimable; set the cap to 0 to disable it." >&9
-                break
-            fi
+            ! max_age_exceeded "$loop_started_at" "$max_age" || { echo "$cap_msg" >&9; break; }
             gate_rc=0
-            issue_state="$(export LOOM_ROLE=sweep-lease-renew; [[ -z "$sweep_id" ]] || export LOOM_SWEEP_ID="$sweep_id"; forge_gh_perm_safe api "repos/$(gh_repo_path)/issues/${issue}" --jq .state 2> /dev/null)" || issue_state=""
+            issue_state="$(export LOOM_ROLE=sweep-lease-renew; [[ -z "$sweep_id" ]] || export LOOM_SWEEP_ID="$sweep_id"; lease_gh read api "repos/$(gh_repo_path)/issues/${issue}" --jq .state 2> /dev/null)" || issue_state=""
             "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer check "${owner_args[@]}" --issue-state "$issue_state" 2>&9 || gate_rc=$?
             ((gate_rc != 3)) || break
             ((gate_rc != 4)) || continue
@@ -1014,6 +1051,8 @@ cmd_start() {
                 echo "sweep-lease-renew: renewal cycle for issue #${issue} FAILED (renew-once exit ${renew_rc}): ${renew_err}" >&9
             fi
             [[ "$renew_rc" -ne 4 ]] || break
+            case "$renew_rc" in 0) misses=0 ;; 2) misses=$((misses + 1)) ;; esac
+            ((misses < 2)) || { echo "sweep-lease-renew: renewal loop for issue #${issue} exiting: no lease comment to renew on two consecutive cycles (#10229)" >&9; break; }
         done
     ) < /dev/null > /dev/null 2>&1 &
     local loop_pid=$! owner_pid=""
