@@ -36,7 +36,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::eta::score::EstimateSummary;
 use crate::eta::Kind;
-use crate::telemetry::kinds::eta_snapshot::{EtaSnapshotRecord, EtaSnapshotRow, MAX_ROWS};
+use crate::telemetry::kinds::eta_snapshot::{
+    EtaSnapshotAlternate, EtaSnapshotRecord, EtaSnapshotRow, MAX_ALTERNATES, MAX_ROWS,
+};
 use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
 
 /// Offers `eta.snapshot` envelopes, stamped with this daemon's host id, to
@@ -119,6 +121,59 @@ pub fn select_current(
     newest.into_values().cloned().collect()
 }
 
+/// A row's identity: `(lower-cased repo, issue, kind)`.
+pub type RowKey = (String, u32, Kind);
+
+/// The registered heuristic ids of each kind (`Registry::for_kind`).
+pub type RegisteredIds = BTreeMap<Kind, Vec<String>>;
+
+/// Shadow estimates per row, newest per heuristic, sorted by heuristic id.
+pub type Alternates = BTreeMap<RowKey, Vec<EstimateSummary>>;
+
+/// The shadow candidates' estimates for each `(repo, issue, kind)` (#10390):
+/// from `pending`, every estimate whose heuristic is registered for its kind
+/// and is not the kind's `current`, the newest `as_of` per heuristic, sorted
+/// by heuristic id and cut at [`MAX_ALTERNATES`]. Matched by item, never by
+/// equal `as_of` (each series emits on its own schedule). Only attached to a
+/// row by [`build_record_with`]; this never creates one. Pure.
+#[must_use]
+pub fn select_alternates(
+    pending: &[EstimateSummary],
+    current: &BTreeMap<Kind, String>,
+    registered: &RegisteredIds,
+) -> Alternates {
+    let mut newest: BTreeMap<(RowKey, String), &EstimateSummary> = BTreeMap::new();
+    for estimate in pending {
+        if current.get(&estimate.kind) == Some(&estimate.heuristic) {
+            continue;
+        }
+        let is_registered = registered
+            .get(&estimate.kind)
+            .is_some_and(|ids| ids.contains(&estimate.heuristic));
+        if !is_registered {
+            continue;
+        }
+        let key = (estimate.repo.to_ascii_lowercase(), estimate.issue, estimate.kind);
+        newest
+            .entry((key, estimate.heuristic.clone()))
+            .and_modify(|held| {
+                if estimate.as_of > held.as_of {
+                    *held = estimate;
+                }
+            })
+            .or_insert(estimate);
+    }
+    let mut out: Alternates = BTreeMap::new();
+    // BTreeMap order is (row, heuristic id): already sorted by id per row.
+    for ((key, _), estimate) in newest {
+        let list = out.entry(key).or_default();
+        if list.len() < MAX_ALTERNATES {
+            list.push(estimate.clone());
+        }
+    }
+    out
+}
+
 /// A stable digest of the selected estimate set — what "changed since the
 /// last emission" compares. Over each row's identity and its `estimate_id`,
 /// which is derived from `(repo, issue, kind, heuristic, as_of)`: a new
@@ -126,12 +181,24 @@ pub fn select_current(
 /// never does. Visibility is not part of it (a tag, not an estimate). Pure.
 #[must_use]
 pub fn fingerprint(selected: &[EstimateSummary]) -> u64 {
+    fingerprint_with(selected, &Alternates::new())
+}
+
+/// [`fingerprint`] that also covers every row's alternates' `estimate_id`s
+/// (#10390), so a shadow-only refresh yields a new snapshot. With no
+/// alternates it equals [`fingerprint`]. Pure.
+#[must_use]
+pub fn fingerprint_with(selected: &[EstimateSummary], alternates: &Alternates) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for estimate in selected {
         estimate.repo.to_ascii_lowercase().hash(&mut hasher);
         estimate.issue.hash(&mut hasher);
         estimate.kind.hash(&mut hasher);
         estimate.estimate_id.hash(&mut hasher);
+        let key = (estimate.repo.to_ascii_lowercase(), estimate.issue, estimate.kind);
+        for alt in alternates.get(&key).into_iter().flatten() {
+            alt.estimate_id.hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -166,6 +233,17 @@ fn cap_rank(estimate: &EstimateSummary) -> u8 {
 #[must_use]
 pub fn build_record(
     selected: &[EstimateSummary],
+    visibility: &HashMap<String, RepoVisibility>,
+) -> EtaSnapshotRecord {
+    build_record_with(selected, &Alternates::new(), visibility)
+}
+
+/// [`build_record`] with each row's shadow `alternates` attached (#10390).
+/// Alternates never count as rows: a row cut by the cap takes them with it.
+#[must_use]
+pub fn build_record_with(
+    selected: &[EstimateSummary],
+    alternates: &Alternates,
     visibility: &HashMap<String, RepoVisibility>,
 ) -> EtaSnapshotRecord {
     let as_of = selected
@@ -203,6 +281,21 @@ pub fn build_record(
             as_of: estimate.as_of,
             stage: estimate.stage,
             no_estimate_reason: estimate.no_estimate_reason,
+            alternates: alternates
+                .get(&(estimate.repo.to_ascii_lowercase(), estimate.issue, estimate.kind))
+                .into_iter()
+                .flatten()
+                .map(|alt| EtaSnapshotAlternate {
+                    heuristic: alt.heuristic.clone(),
+                    estimate_id: alt.estimate_id.clone(),
+                    as_of: alt.as_of,
+                    p25: alt.p25_sec,
+                    p50: alt.p50_sec,
+                    p75: alt.p75_sec,
+                    p90: alt.p90_sec,
+                    no_estimate_reason: alt.no_estimate_reason,
+                })
+                .collect(),
         })
         .collect();
     EtaSnapshotRecord {
@@ -227,17 +320,22 @@ pub fn build_record(
 /// - the set is byte-for-byte the one already emitted.
 #[must_use]
 pub fn decide(
-    input: Option<(Vec<EstimateSummary>, BTreeMap<Kind, String>)>,
+    input: Option<SnapshotInput>,
     last: Option<u64>,
-) -> Option<(Vec<EstimateSummary>, u64)> {
-    let (pending, current) = input?;
+) -> Option<(Vec<EstimateSummary>, Alternates, u64)> {
+    let (pending, current, registered) = input?;
     let selected = select_current(&pending, &current);
     if selected.is_empty() {
         return None;
     }
-    let digest = fingerprint(&selected);
-    is_changed(digest, last).then_some((selected, digest))
+    let alternates = select_alternates(&pending, &current, &registered);
+    let digest = fingerprint_with(&selected, &alternates);
+    is_changed(digest, last).then_some((selected, alternates, digest))
 }
+
+/// [`super::eta::snapshot_input`]'s answer: pending estimates, each kind's
+/// `current` heuristic id, and each kind's registered heuristic ids.
+pub type SnapshotInput = (Vec<EstimateSummary>, BTreeMap<Kind, String>, RegisteredIds);
 
 /// Emit this host's current estimate set when a native sink is registered,
 /// ETA is enabled, the tracker holds at least one current estimate, and that
@@ -249,7 +347,7 @@ pub(super) async fn record() {
     let last = *LAST_EMITTED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some((selected, digest)) = decide(super::eta::snapshot_input(), last) else {
+    let Some((selected, alternates, digest)) = decide(super::eta::snapshot_input(), last) else {
         return;
     };
     // Only after the decision: a pass with nothing new costs no visibility
@@ -261,7 +359,7 @@ pub(super) async fn record() {
             visibility.insert(estimate.repo.clone(), tag);
         }
     }
-    let record = build_record(&selected, &visibility);
+    let record = build_record_with(&selected, &alternates, &visibility);
     log::debug!(
         "eta.snapshot: {} row(s) ({} truncated: {:?}), as_of={}",
         record.rows.len(),

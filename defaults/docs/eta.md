@@ -1177,9 +1177,12 @@ reference: [`telemetry-schema.md`](telemetry-schema.md).
 - **No explanation rides along.** The dashboard's "why this ETA?" fetches the
   full `eta-explanation/v1` record from SigNoz on demand by `estimate_id`, and
   the accuracy panel queries `eta.outcome` there.
-- **Only `current`'s estimate.** A shadow candidate's estimate (above) is
-  never the subject's answer, and a superseded refresh is not current: exactly
-  one row survives per `(repo, issue, kind)`.
+- **One row per item, shadows as `alternates[]`.** A shadow candidate's
+  estimate (above) is never the subject's answer, and a superseded refresh is
+  not current: exactly one row survives per `(repo, issue, kind)`. Each row
+  carries the newest estimate or refusal of every registered shadow heuristic
+  under `alternates[]` (#10390), from tracker state only; `schema_version`
+  stays 12.
 - **A refusal is a row.** An issue with a `no_estimate_reason` and no
   quantiles is carried, not dropped: that it *cannot* be estimated, and why,
   is the answer.

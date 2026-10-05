@@ -317,6 +317,18 @@ fn every_eta_snapshot_field_is_documented_in_the_schema_reference() {
         as_of: chrono::Utc::now(),
         stage: Some(loom_daemon::eta::Stage::ReviewWait),
         no_estimate_reason: None,
+        alternates: vec![
+            loom_daemon::telemetry::kinds::eta_snapshot::EtaSnapshotAlternate {
+                heuristic: "land-2026-10-04-twin-otter".to_string(),
+                estimate_id: "0a1b2c3d4e5f6071".to_string(),
+                as_of: chrono::Utc::now(),
+                p25: Some(1),
+                p50: Some(2),
+                p75: Some(3),
+                p90: Some(4),
+                no_estimate_reason: Some(loom_daemon::eta::NoEstimateReason::NoModel),
+            },
+        ],
     };
     let record = EtaSnapshotRecord {
         as_of: row.as_of,
@@ -357,6 +369,17 @@ fn every_eta_snapshot_field_is_documented_in_the_schema_reference() {
         assert!(
             documented(field),
             "the eta.snapshot row's `{field}` is not documented in telemetry-schema.md"
+        );
+    }
+    for field in serde_json::to_value(&row.alternates[0])
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .keys()
+    {
+        assert!(
+            documented(field),
+            "the eta.snapshot alternate's `{field}` is not documented in telemetry-schema.md"
         );
     }
     // The routing decision, which is the one thing a dashboard cannot infer

@@ -1954,9 +1954,9 @@ closes those estimates stay pending.
 `stage_at_estimate` value (and a `stage_marks[]` / `stages[]` stage) on
 `eta.estimate` and `eta.outcome`, but **only from a heuristic that models the
 hold**: today the shadow `land-2026-10-04-twin-otter`. Every path-engine
-heuristic refuses it as `blocked`, exactly as before, so it never appears in
-`eta.snapshot` while `current.land` is one of them (those rows carry only
-`current`'s estimate). Once a hold-aware
+heuristic refuses it as `blocked`, exactly as before. In `eta.snapshot` it
+never becomes a row's `stage` while `current.land` is one of them; a shadow's
+estimate appears only under the row's `alternates[]` (stage-less, #10390). Once a hold-aware
 heuristic is promoted, consumers must render an unknown `stage` value
 gracefully.
 
@@ -2040,11 +2040,31 @@ Each row:
 | `pr` | integer, optional | the PR the work is in, when one is known |
 | `kind` | string | `start`, `finish` or `land` |
 | `p25` / `p50` / `p75` | integer, optional | **remaining seconds** from `as_of`, not an instant. All three absent on a refusal |
-| `heuristic` | string | the heuristic that made it — always the kind's **`current`** one. A shadow candidate's estimate (#9328) is never shown as the ETA and never appears here |
+| `heuristic` | string | the heuristic that made it — always the kind's **`current`** one. A shadow candidate's estimate (#9328) is never shown as the ETA; it appears only under `alternates[]` |
 | `estimate_id` | string | the derived id of the `eta.estimate` record in SigNoz: the join key for "why this ETA?" |
 | `as_of` | RFC 3339 | the instant this estimate describes |
 | `stage` | string, optional | the stage the item was in (`ready_wait`, `sweep.curator`, …) |
 | `no_estimate_reason` | string, optional | why there is no estimate (`blocked`, `human_gated`, `insufficient_samples`, …), present exactly when the quantiles are absent |
+| `alternates[]` | array, optional | shadow heuristics' estimates for the same item (#10390); omitted when empty, so `start`/`finish` rows and hosts without shadows are unchanged |
+
+**`alternates[]` (#10390)** is additive: `schema_version` stays 12 and older
+readers ignore it. One entry per registered non-current heuristic of the row's
+kind that has a pending estimate for the item — the newest per heuristic
+(matched by item, never by equal `as_of`), sorted by `heuristic`, at most 8
+(loom-ui slices at 8). Built only from estimates the tracker already holds; an
+alternate never creates a row, and a row cut by the 200-row cap takes its
+alternates with it. A change to a shadow estimate alone triggers a new
+snapshot. Each alternate:
+
+| Field | Type | Notes |
+|---|---|---|
+| `heuristic` | string | e.g. `land-2026-10-04-twin-otter` |
+| `estimate_id` | string | that heuristic's own `eta.estimate` id, for "why this ETA?" |
+| `as_of` | RFC 3339 | the alternate's own `as_of`, which may differ from the row's; the ETA anchor for `p50` |
+| `p25` / `p50` / `p75` / `p90` | integer, optional | remaining seconds from the alternate's `as_of`. Absent on a refusal (the `p25`/`p50`/`p75` triple is all-or-nothing) |
+| `no_estimate_reason` | string, optional | why the shadow refused (`no_model`, `blocked`, …) |
+
+There is no `stage` on an alternate; consumers use the row's.
 
 **Absent is never zero**, and a refusal is a row. An issue the model cannot
 estimate is carried with its `no_estimate_reason` and no quantiles: that it

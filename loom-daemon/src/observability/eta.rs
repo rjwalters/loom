@@ -392,10 +392,23 @@ fn current_ids(state: &State) -> BTreeMap<Kind, String> {
 /// Read under the one tracker lock and cloned out, so the snapshot builder
 /// runs no tracker code and holds no lock: it is a reader of state the
 /// tracker already keeps in memory, never a second tick loop.
-pub(super) fn snapshot_input() -> Option<(Vec<EstimateSummary>, BTreeMap<Kind, String>)> {
+pub(super) fn snapshot_input() -> Option<super::eta_snapshot::SnapshotInput> {
     let guard = lock();
     let state = guard.as_ref()?;
-    Some((state.tracker.pending().to_vec(), current_ids(state)))
+    let registered = [Kind::Start, Kind::Finish, Kind::Land]
+        .into_iter()
+        .map(|k| {
+            (
+                k,
+                state
+                    .registry
+                    .for_kind(k)
+                    .map(|h| h.id().to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    Some((state.tracker.pending().to_vec(), current_ids(state), registered))
 }
 
 /// Fold `outcomes` into the shadow ledger and persist it (#9328).
