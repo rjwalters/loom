@@ -852,9 +852,10 @@ pub const SPECS: &[CheckSpec<'static>] = &[
     // `loom_daemon::init::update_gitignore` (`init/post_init.rs`, which owns
     // EPHEMERAL_PATTERNS). The whole `init` module tree is listed, plus the
     // modules its production code reaches (`agent_skills`, `install_compat`,
-    // `proc_exec`, `release_provenance`, `self_update`), and the dispatch chain.
-    // MUST grow if the checker starts using another module —
-    // `daemon_surface_tests.rs` fails until it does. The script also runs
+    // `proc_exec`, `release_provenance`, `self_update`, and `config_resolver`
+    // for the `guards.enabled` opt-out in `init/scaffolding.rs`, #10335), and
+    // the dispatch chain. MUST grow if the checker starts using another module
+    // — `daemon_surface_tests.rs` fails until it does. The script also runs
     // `scripts/cargo-target-dir.sh`.
     CheckSpec {
         context: ".gitignore Convergence Check",
@@ -869,6 +870,7 @@ pub const SPECS: &[CheckSpec<'static>] = &[
             "loom-daemon/src/proc_exec.rs",
             "loom-daemon/src/release_provenance.rs",
             "loom-daemon/src/self_update.rs",
+            "loom-daemon/src/config_resolver.rs",
             "loom-daemon/src/main.rs",
             "loom-daemon/src/daemon_service.rs",
             "Cargo.toml",
@@ -924,8 +926,8 @@ pub const SPECS: &[CheckSpec<'static>] = &[
     // deleting the hook file is one of the four violations.
     //
     // Rust surface: the handler (`cli/check_guard_wiring.rs`), the
-    // self-contained `guard_wiring` module, and the dispatch chain through
-    // `cli/script_ports.rs`. MUST grow if the checker starts using another
+    // `guard_wiring` module, `config_resolver` (its `guards.enabled` opt-out
+    // skip, #10335), and the dispatch chain through `cli/script_ports.rs`. MUST grow if the checker starts using another
     // module — `daemon_surface_tests.rs` fails until it does.
     CheckSpec {
         context: "MCP Guard Wiring Contract",
@@ -933,6 +935,7 @@ pub const SPECS: &[CheckSpec<'static>] = &[
             "loom-daemon/src/cli/check_guard_wiring.rs",
             "loom-daemon/src/guard_wiring.rs",
             "loom-daemon/src/guard_wiring/**",
+            "loom-daemon/src/config_resolver.rs",
             "loom-daemon/src/main.rs",
             "loom-daemon/src/daemon_service.rs",
             "loom-daemon/src/cli/script_ports.rs",

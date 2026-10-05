@@ -307,8 +307,7 @@ pub fn get_path<'a>(config: &'a Value, dotted: &str) -> Option<&'a Value> {
 /// `true` only on an EXPLICIT opt-out: `LOOM_GUARDS_ENABLED=0|false|no`, or a
 /// boolean `guards.enabled: false` in the effective config. An absent key, a
 /// non-boolean value, or malformed config all mean guards stay ON. The hooks
-/// reach it through `loom-daemon guard-hook opted-out` (see
-/// [`crate::guard_hook::opted_out`]).
+/// reach it through `loom-daemon guard-hook opted-out` (`guard_hook.rs`).
 #[must_use]
 pub fn guards_master_disabled(repo_root: &Path) -> bool {
     match std::env::var("LOOM_GUARDS_ENABLED").as_deref() {
