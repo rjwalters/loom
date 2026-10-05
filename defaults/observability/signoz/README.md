@@ -36,7 +36,7 @@ After any render, run `cargo test --test signoz_deployment_contract`: it re-read
 the committed `pours/` output and fails if a regenerated deployment stops matching
 what this README promises — see [Rendered-deployment contract](#rendered-deployment-contract).
 All component images pin multi-platform index digests in the casting: SigNoz
-**v0.142.1**, its collector **v0.144.10**, ClickHouse **25.12.11**, Keeper **25.12.5**,
+**v0.142.1**, its collector **v0.144.10**, ClickHouse **25.12.11**, Keeper **25.12.11**,
 and PostgreSQL **16**. Each index includes Linux amd64 and arm64. The upstream
 histogram helper **v0.0.1** init command is patched declaratively to verify SHA-256
 before extraction and reject unsupported architectures. Independent downloads
