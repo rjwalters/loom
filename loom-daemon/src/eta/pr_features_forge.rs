@@ -72,27 +72,39 @@ pub fn settle(
 }
 
 /// Run one read from `root` (the repo's checkout, whose credential it uses).
-/// The parsed body, or `None` when it failed.
+/// The parsed body, or `None` when it failed. A `Checks` read is two calls:
+/// the check runs, and the head's combined legacy status filed under
+/// `status`. Either failing fails the read, so a required context reported
+/// only as a commit status is never inferred pending.
 #[must_use]
 pub fn fetch(root: &Path, read: &FeatureRead) -> Option<Value> {
     let gh_bin = std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".to_string());
     if read.kind == ReadKind::Required {
         return fetch_required(&gh_bin, read);
     }
+    let mut body = get(&gh_bin, root, read, &read.url(), op(read.kind))?;
+    if read.kind == ReadKind::Checks {
+        let status = get(&gh_bin, root, read, &read.status_url(), op(read.kind))?;
+        body.as_object_mut()?.insert("status".to_string(), status);
+    }
+    Some(body)
+}
+
+/// One conditional GET of `url` for `read`'s repo.
+fn get(gh_bin: &str, root: &Path, read: &FeatureRead, url: &str, op: ForgeOp) -> Option<Value> {
     let target = store::resolve_target(Some(root), Some(&read.repo));
-    let url = read.url();
     let dir = store::disk_cache_dir();
     let path =
-        store::entry_path_with_prefix(&dir, PREFIX, &store::cache_key(Some(root), &target, &url));
+        store::entry_path_with_prefix(&dir, PREFIX, &store::cache_key(Some(root), &target, url));
     let prior = store::read_disk_entry(&path);
-    let site = ConditionalRead::new("eta_feature_read", op(read.kind));
+    let site = ConditionalRead::new("eta_feature_read", op);
     let etag = prior.as_ref().map(|p| p.etag.clone());
     let (status, response, _) = store::fetch_conditional(
         site,
-        Path::new(&gh_bin),
+        Path::new(gh_bin),
         Some(root),
         &target,
-        &url,
+        url,
         etag.as_deref(),
     )
     .ok()?;
@@ -251,5 +263,41 @@ mod tests {
         };
         // No base branch: a failed read, before any `gh` is run.
         assert!(fetch_required("/nonexistent/gh", &read).is_none());
+    }
+
+    /// Review of #10281, finding 1: count the real `gh` invocations a
+    /// required lookup makes. It never exceeds what the budget charges.
+    #[cfg(unix)]
+    #[test]
+    fn a_required_lookup_makes_no_more_calls_than_it_is_charged() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("eta-stub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("calls");
+        let stub = dir.join("gh");
+        let write = |body: &str| {
+            std::fs::write(&stub, format!("#!/bin/sh\necho \"$1\" >> {}\n{body}\n", log.display()))
+                .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_file(&log);
+        };
+        let calls = || std::fs::read_to_string(&log).map_or(0, |s| s.lines().count());
+        let read = FeatureRead {
+            repo: "o/r".into(),
+            kind: ReadKind::Required,
+            number: 0,
+            sha: None,
+            base: Some("main".into()),
+        };
+        let charged = ReadKind::Required.cost();
+        // Both sources answer: a ruleset REST call and a GraphQL call.
+        write("echo build");
+        assert!(fetch_required(stub.to_str().unwrap(), &read).is_some());
+        assert_eq!(calls(), charged);
+        // The ruleset call fails: the lookup fails, within the same charge.
+        write("echo boom >&2; exit 1");
+        assert!(fetch_required(stub.to_str().unwrap(), &read).is_none());
+        assert!(calls() <= charged);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

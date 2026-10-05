@@ -434,3 +434,68 @@ fn the_required_set_is_read_once_per_base_branch() {
     store.plan(&[], t(4), 20);
     assert!(store.required.is_empty());
 }
+
+/// Review of #10281, finding 1: the budget counts forge calls, so a pass can
+/// never plan more than `budget` of them.
+#[test]
+fn the_budget_charges_each_forge_call_not_each_read() {
+    let mut store = PrFeatureStore::default();
+    let items: Vec<Wanted> = (1..=4).map(|i| wanted(i, Some(100 + i))).collect();
+    for pr in 101..=104 {
+        store.answer(
+            &read(ReadKind::Pull, pr, None),
+            Some(&pull_body("open", false, 1, &format!("sha{pr}"), -5)),
+            t(0),
+        );
+    }
+    for budget in 0..=14 {
+        let mut fresh = store.clone();
+        let reads = fresh.plan(&items, t(1), budget);
+        assert!(total_cost(&reads) <= budget, "budget {budget}: {reads:?}");
+    }
+    // One slot is not enough for a two-call read; it is deferred whole.
+    assert!(store
+        .clone()
+        .plan(&items, t(1), 1)
+        .iter()
+        .all(|r| r.kind.cost() == 1));
+    assert_eq!(ReadKind::Required.cost(), 2);
+    assert_eq!(ReadKind::Checks.cost(), 2);
+}
+
+fn status_body(sha: &str, statuses: &[(&str, &str)]) -> Value {
+    let rows: Vec<Value> = statuses
+        .iter()
+        .map(|(context, state)| json!({"context": context, "state": state}))
+        .collect();
+    json!({"sha": sha, "total_count": rows.len(), "statuses": rows})
+}
+
+/// Review of #10281, finding 2: a required legacy commit status counts by its
+/// state, rather than staying pending because no check run carries its name.
+#[test]
+fn legacy_statuses_count_toward_the_required_rollup() {
+    let counts = |statuses: &[(&str, &str)]| {
+        let mut body = checks_body(&[("Backend", "completed", Some("success"))], 1);
+        body["status"] = status_body("abc", statuses);
+        let snap = parse_checks(&body, "abc", t(0)).unwrap();
+        assert!(!snap.truncated);
+        snap.required_counts(&["Backend".to_string(), "ci/legacy".to_string()])
+    };
+    assert_eq!(counts(&[("ci/legacy", "success")]), (0, 0));
+    assert_eq!(counts(&[("ci/legacy", "failure")]), (0, 1));
+    assert_eq!(counts(&[("ci/legacy", "error")]), (0, 1));
+    assert_eq!(counts(&[("ci/legacy", "pending")]), (1, 0));
+    // No status reported at all: still pending, as before.
+    assert_eq!(counts(&[]), (1, 0));
+}
+
+#[test]
+fn a_status_for_another_commit_or_a_truncated_one_is_not_trusted() {
+    let mut body = checks_body(&[], 0);
+    body["status"] = status_body("other", &[("ci/legacy", "success")]);
+    assert!(parse_checks(&body, "abc", t(0)).is_none());
+    let mut body = checks_body(&[], 0);
+    body["status"] = json!({"sha": "abc", "total_count": 150, "statuses": []});
+    assert!(parse_checks(&body, "abc", t(0)).unwrap().truncated);
+}

@@ -1191,7 +1191,8 @@ pub(super) async fn record(
 /// GETs through the ETag store, a budget separate from the outcome reads',
 /// and the host's stall snapshot (no forge call). Both run before the pass's
 /// `now`, so its estimates may use them. While the rate-limit breaker
-/// suppresses polling the budget is zero. Returns how many reads ran.
+/// suppresses polling the budget is zero. Returns how many forge calls the
+/// planned reads make (a check or required-context read is two).
 async fn feature_reads(
     repos: &[(PathBuf, String, Vec<PrView>, Vec<ListedPr>)],
     workspace_root: &Path,
@@ -1214,7 +1215,7 @@ async fn feature_reads(
                 .plan_feature_reads(&readable, Utc::now(), budget)
         })
         .unwrap_or_default();
-    let count = reads.len();
+    let count = crate::eta::pr_features::total_cost(&reads);
     let root = workspace_root.to_path_buf();
     let Ok((answers, stall)) = tokio::task::spawn_blocking(move || {
         let answers = crate::eta::pr_features_forge::run(reads, &roots);

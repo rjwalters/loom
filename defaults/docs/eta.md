@@ -1071,18 +1071,21 @@ Omission reasons are free-form strings.
 ### Read features: PR size, checks, issue markers (#10232)
 
 These need their own forge reads, so they have their own budget: at most
-**12 feature reads per pass** (`eta::pr_features::FEATURE_READ_BUDGET`),
+**12 feature forge calls per pass** (`eta::pr_features::FEATURE_READ_BUDGET`),
 separate from the 8 outcome reads, so neither delays the other. Each read
 is a conditional GET through the shared ETag store (an unchanged answer is
 a free `304` that reuses the stored body), under the repo's reader App when
 one is usable, and counted in the forge-call accounting (caller
 `eta_feature_read`). While the rate-limit breaker suppresses polling the
-budget is zero.
+budget is zero. The budget is charged per forge call: a checks read is two
+(check runs plus the head's combined legacy status) and a required-context
+lookup is two (ruleset plus classic protection), charged in full even if the
+first call fails.
 
 | Stored | Read | Applies to |
 |---|---|---|
 | `pr_additions`, `pr_deletions`, `pr_changed_files`, `pr_commits` | `pulls/{n}` | items with a PR |
-| `checks_pending`, `checks_failed` | `commits/{head}/check-runs` for the head the PR read shows, counted over the base branch's **required** contexts only (the `forge wait-checks` lookup and rollup): a required context still running or not yet registered is pending; one concluded other than `success`, `neutral` or `skipped` is failed. Optional checks never count; a branch that requires nothing gives `0`, `0` | items with an open PR |
+| `checks_pending`, `checks_failed` | `commits/{head}/check-runs` and `commits/{head}/status` (legacy statuses; if either read fails the features are omitted as `read_failed`) for the head the PR read shows, counted over the base branch's **required** contexts only (the `forge wait-checks` lookup and rollup): a required context still running or not yet registered is pending; one concluded other than `success`, `neutral` or `skipped` is failed. Optional checks never count; a branch that requires nothing gives `0`, `0` | items with an open PR |
 | `complexity_marker`, `points_marker`, `author` | `issues/{n}`: the `<!-- loom:complexity=… -->` and `<!-- loom:points=… -->` markers (the work finder's parsers) and `user.login` | every item |
 
 Each pass plans the reads that are due (`pulls` and checks older than

@@ -7,9 +7,11 @@
 //!
 //! # Budget
 //!
-//! At most [`FEATURE_READ_BUDGET`] reads per ETA pass, across `pulls/{n}`,
-//! `commits/{sha}/check-runs`, `issues/{n}` and the base branch's
-//! required-context lookup. This budget is separate from
+//! At most [`FEATURE_READ_BUDGET`] forge calls per ETA pass, across
+//! `pulls/{n}`, `commits/{sha}/check-runs` and `commits/{sha}/status`,
+//! `issues/{n}` and the base branch's required-context lookup (a ruleset call
+//! and a classic branch-protection call). The budget is charged per call
+//! ([`ReadKind::cost`]), not per planned read. This budget is separate from
 //! the journal resolver's (`observability::eta::FORGE_READ_BUDGET`): feature
 //! reads never delay an outcome read, and the reverse. Reads that do not fit
 //! are not lost. They stay wanted, and the oldest-attempted (never-attempted
@@ -135,6 +137,27 @@ pub enum ReadKind {
     Issue,
 }
 
+impl ReadKind {
+    /// Forge calls one read of this kind makes, which is what the budget
+    /// charges: a `Checks` read is the check-runs call plus the combined
+    /// legacy-status call, and a `Required` lookup is the ruleset REST call
+    /// plus the classic-protection GraphQL call. Charged in full even when
+    /// the first call fails and the second never runs.
+    #[must_use]
+    pub const fn cost(self) -> usize {
+        match self {
+            Self::Checks | Self::Required => 2,
+            Self::Pull | Self::Issue => 1,
+        }
+    }
+}
+
+/// Forge calls `reads` make in all: what counts against the budget.
+#[must_use]
+pub fn total_cost(reads: &[FeatureRead]) -> usize {
+    reads.iter().map(|r| r.kind.cost()).sum()
+}
+
 /// One planned read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeatureRead {
@@ -167,6 +190,16 @@ impl FeatureRead {
                 format!("repos/{repo}/rules/branches/{}", self.base.as_deref().unwrap_or_default())
             }
         }
+    }
+
+    /// The combined legacy-status path for a `Checks` read's head.
+    #[must_use]
+    pub fn status_url(&self) -> String {
+        format!(
+            "repos/{}/commits/{}/status?per_page=100",
+            self.repo,
+            self.sha.as_deref().unwrap_or_default()
+        )
     }
 }
 
@@ -288,18 +321,32 @@ pub fn parse_pull(body: &Value, read_at: DateTime<Utc>) -> Option<PullSnapshot> 
 }
 
 /// A check-runs body for `sha`, read at `read_at`, classified by the
-/// `forge wait-checks` rollup. `None` for a body outside that contract.
+/// `forge wait-checks` rollup. The body is the check-runs payload with the
+/// head's combined legacy-status payload under `status` (as
+/// [`super::pr_features_forge`] builds it), so a required context reported
+/// as a commit status is seen like one reported as a check run. `None` for a
+/// body outside that contract, or a status payload for another commit.
 #[must_use]
 pub fn parse_checks(body: &Value, sha: &str, read_at: DateTime<Utc>) -> Option<ChecksSnapshot> {
     let listed = body["check_runs"].as_array()?.len() as u64;
-    let rollup = crate::forge_wait_checks::verdict::fold(body, &Value::Null).ok()?;
+    let status = body.get("status").unwrap_or(&Value::Null);
+    if status
+        .get("sha")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s != sha)
+    {
+        return None;
+    }
+    let statuses = status["statuses"].as_array().map_or(0, Vec::len) as u64;
+    let status_total = status["total_count"].as_u64().unwrap_or(statuses);
+    let rollup = crate::forge_wait_checks::verdict::fold(body, status).ok()?;
     Some(ChecksSnapshot {
         read_at,
         sha: sha.to_string(),
         pending: rollup.pending.into_iter().collect(),
         failing: rollup.failing.into_iter().collect(),
         seen: rollup.seen,
-        truncated: rollup.total > listed,
+        truncated: rollup.total > listed + statuses || status_total > statuses,
     })
 }
 
@@ -521,8 +568,11 @@ impl PrFeatureStore {
             ))
         });
         let mut reads = Vec::new();
-        for (i, c) in candidates.into_iter().enumerate() {
-            if i < budget {
+        let mut spent = 0;
+        for c in candidates {
+            let cost = c.read.kind.cost();
+            if spent + cost <= budget {
+                spent += cost;
                 reads.push(c.read);
             } else {
                 self.defer(&c.read);
