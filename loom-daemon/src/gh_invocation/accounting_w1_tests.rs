@@ -304,6 +304,34 @@ fn a_rate_limit_probe_is_booked_other_whatever_its_headers_say() {
     );
 }
 
+/// A probe of a credential whose core bucket is spent must not become the
+/// host's `other` budget reading: that would surface as a host-wide
+/// `rate_limit_quota` stall in the ETA for a bucket unrelated to the work.
+#[test]
+fn an_exhausted_rate_limit_probe_never_reads_as_an_exhausted_other_pool() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reset = chrono::Utc::now().timestamp() + 3600;
+    let gh = stub(
+        tmp.path(),
+        "gh-rl-zero",
+        &format!(
+            "printf 'HTTP/2.0 200 OK\\r\\nX-Ratelimit-Resource: core\\r\\n\
+             X-Ratelimit-Limit: 5000\\r\\nX-Ratelimit-Remaining: 0\\r\\n\
+             X-Ratelimit-Used: 5000\\r\\nX-Ratelimit-Reset: {reset}\\r\\n\\r\\n{{}}'"
+        ),
+    );
+    let lines = raw_lines_after(|| {
+        let _ = inv("api.rate_limit", &["api", "--include", "rate_limit"], &gh).run();
+    });
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0]["p"].as_str(), Some("other"));
+    for key in ["rem", "usd", "rst"] {
+        assert!(lines[0].get(key).is_none_or(serde_json::Value::is_null), "{key}: {lines:?}");
+    }
+    let exhausted = crate::forge_call_stats::exhausted_pools(chrono::Utc::now());
+    assert!(!exhausted.iter().any(|(p, _)| *p == Pool::Other), "{exhausted:?}");
+}
+
 // ===== 6. loom.forge.calls =====
 
 #[test]

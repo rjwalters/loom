@@ -241,7 +241,12 @@ pub(super) fn record(inv: &GhInvocation, outcome: InvokeOutcome, captured: Optio
             Some(r) if !probe => Pool::from_resource(r),
             _ => static_p,
         };
-        (pool, classified, Some(&resp.ratelimit))
+        // A probe's headers describe whichever bucket the probed credential
+        // last spent from, not this call: keep them off the row so they never
+        // become the host's `other` budget reading (a zero there would read
+        // as a host-wide `rate_limit_quota` stall). `parse_probe` books the
+        // probe's readings into the bucket book on its own path.
+        (pool, classified, Some(&resp.ratelimit).filter(|_| !probe))
     } else {
         let classified = match outcome {
             InvokeOutcome::Ok => Outcome::Ok,
@@ -258,7 +263,6 @@ pub(super) fn record(inv: &GhInvocation, outcome: InvokeOutcome, captured: Optio
     let cred = cred_of(inv);
     let resource = headers
         .and_then(|h| h.resource.clone())
-        .filter(|_| !probe)
         .map_or_else(|| pool.as_str().to_string(), |r| r.trim().to_ascii_lowercase());
     let (pg, pu) = pages(&inv.args, include, captured.map(|(out, _)| out));
     let rd = match (ro, inv.cwd.as_deref(), identity.repo.as_deref()) {
@@ -280,7 +284,7 @@ pub(super) fn record(inv: &GhInvocation, outcome: InvokeOutcome, captured: Optio
     };
     forge_call_stats::record_attributed(caller, &identity, pool, classified, headers, &attribution);
 
-    if let (Some(h), Some(owner), false) = (headers, cred.owner.as_deref(), probe) {
+    if let (Some(h), Some(owner)) = (headers, cred.owner.as_deref()) {
         let bucket = h
             .resource
             .as_deref()
