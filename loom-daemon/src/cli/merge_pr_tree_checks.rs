@@ -16,8 +16,6 @@ use anyhow::Result;
 use loom_daemon::merge_pr::tree_checks::{
     bypass_comment, evaluate, failure_comment, refusal, Outcome, BYPASSED, CLEAN,
 };
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 #[derive(clap::Args)]
 pub(crate) struct TreeChecksArgs {
@@ -55,23 +53,33 @@ pub(crate) struct TreeChecksArgs {
 }
 
 fn post_comment(repo: &str, pr: &str, body: &str) {
-    let payload = serde_json::json!({ "body": body }).to_string();
-    let child = Command::new(loom_daemon::gh_invocation::gh_bin())
+    use loom_daemon::gh_invocation::{
+        AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation,
+    };
+    use loom_daemon::proc_exec::Completion;
+    // `-f` sends `body` as a string field (never read as a file, unlike `-F`),
+    // so the comment travels as an argument rather than on stdin.
+    let ok = GhTarget::repo(repo).ok().and_then(|target| {
+        GhInvocation::new(
+            Operation::new("pr.tree_check_comment"),
+            AccessIntent::Write,
+            target,
+            std::time::Duration::from_secs(60),
+        )
         .args([
             "api",
             &format!("repos/{repo}/issues/{pr}/comments"),
-            "--input",
-            "-",
+            "-f",
+            &format!("body={body}"),
         ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn();
-    let ok = child.ok().and_then(|mut c| {
-        c.stdin.take()?.write_all(payload.as_bytes()).ok()?;
-        c.wait_with_output().ok()
+        .execute()
+        .ok()
     });
-    if !ok.is_some_and(|o| o.status.success()) {
+    let success = matches!(
+        ok,
+        Some(GhCompletion::Captured(Completion::Exited(ref o))) if o.status.success()
+    );
+    if !success {
         eprintln!("Warning: could not post the tree-check comment on PR #{pr}");
     }
 }

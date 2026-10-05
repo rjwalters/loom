@@ -34,7 +34,7 @@
 1575 loom-daemon/src/epic_supervisor.rs
 1108 loom-daemon/src/fleet/add_worker.rs
 1362 loom-daemon/src/fleet/add_worker/tests.rs
-1384 loom-daemon/src/fleet/drain.rs
+1300 loom-daemon/src/fleet/drain.rs
 1118 loom-daemon/src/fleet/status.rs
 1703 loom-daemon/src/health.rs
 2400 loom-daemon/src/health/tests.rs

@@ -55,9 +55,8 @@
 //!   verified (see [`flush_safehouse`]) — teardown is **not** certified safe
 //!   for room-key continuity even though the roster entry was removed.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::{default_fleet_registry_path, CommandRunner, FleetRegistry, WorkerRecord};
@@ -341,113 +340,9 @@ pub trait ClaimResetter {
     fn reset_claim(&self, repo: &str, issue: u32, host: &str) -> Result<bool>;
 }
 
-/// The production [`ClaimResetter`]: `gh issue view` to check the current
-/// label set, then `gh issue edit` + `gh issue comment` to flip it — run
-/// **locally** (never over SSH; the forge is global).
-///
-/// Each `gh` invocation is given an explicit `PATH` env (via
-/// [`super::path_bootstrap::local_gh_path_env`]) rather than relying on this
-/// process's inherited environment (#4831): a `loom-daemon` launched
-/// non-interactively (launchd/systemd) may not have `gh`/Homebrew on its
-/// inherited PATH even though an interactive login shell on the same host
-/// would.
-pub struct GhClaimResetter;
-
-impl ClaimResetter for GhClaimResetter {
-    fn reset_claim(&self, repo: &str, issue: u32, host: &str) -> Result<bool> {
-        let gh_path = super::path_bootstrap::local_gh_path_env();
-        // #5431: this resetter targets an arbitrary fleet repo by `--repo
-        // <owner/repo>` with no checkout-root `current_dir`, so key the
-        // credential off the owner slug. For a cross-owner repo this picks that
-        // owner's installation token; without it, the label edit/comment below
-        // (writes) would silently 404 under the root owner's token. A no-op for
-        // a single-owner fleet or the root owner's own repos.
-        let mut view_cmd = Command::new(crate::gh_invocation::gh_bin());
-        view_cmd
-            .env("PATH", &gh_path)
-            .args([
-                "issue",
-                "view",
-                &issue.to_string(),
-                "--repo",
-                repo,
-                "--json",
-                "labels",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        crate::credential_preflight::apply_gh_config_for_owner_slug(&mut view_cmd, repo);
-        let view = view_cmd
-            .output()
-            .with_context(|| format!("gh issue view #{issue} in {repo}"))?;
-        if !view.status.success() {
-            anyhow::bail!(
-                "gh issue view #{issue} in {repo} failed: {}",
-                String::from_utf8_lossy(&view.stderr).trim()
-            );
-        }
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&view.stdout).context("parsing gh issue view --json labels")?;
-        let has_building = parsed["labels"]
-            .as_array()
-            .is_some_and(|labels| labels.iter().any(|l| l["name"] == "loom:building"));
-        if !has_building {
-            return Ok(false);
-        }
-
-        let mut edit_cmd = Command::new(crate::gh_invocation::gh_bin());
-        edit_cmd
-            .env("PATH", &gh_path)
-            .args([
-                "issue",
-                "edit",
-                &issue.to_string(),
-                "--repo",
-                repo,
-                "--remove-label",
-                "loom:building",
-                "--add-label",
-                "loom:issue",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        crate::credential_preflight::apply_gh_config_for_owner_slug(&mut edit_cmd, repo);
-        let edit = edit_cmd
-            .output()
-            .with_context(|| format!("gh issue edit #{issue} in {repo}"))?;
-        if !edit.status.success() {
-            anyhow::bail!(
-                "gh issue edit #{issue} in {repo} failed: {}",
-                String::from_utf8_lossy(&edit.stderr).trim()
-            );
-        }
-
-        // Best-effort comment — never fails the reset itself (mirrors the
-        // rest of Loom's "a forge comment is advisory" posture).
-        let mut comment_cmd = Command::new(crate::gh_invocation::gh_bin());
-        comment_cmd
-            .env("PATH", &gh_path)
-            .args([
-                "issue",
-                "comment",
-                &issue.to_string(),
-                "--repo",
-                repo,
-                "--body",
-                &format!(
-                    "🔧 **fleet drain**: host `{host}` was drained/retired while this issue was \
-                     claimed; `loom:building` reset to `loom:issue` so it is not stranded (see \
-                     epic #4340, #4343)."
-                ),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        crate::credential_preflight::apply_gh_config_for_owner_slug(&mut comment_cmd, repo);
-        let _ = comment_cmd.output();
-
-        Ok(true)
-    }
-}
+#[path = "drain_gh.rs"]
+mod drain_gh;
+pub use drain_gh::GhClaimResetter;
 
 #[path = "drain_probe.rs"]
 mod drain_probe;
@@ -1879,7 +1774,7 @@ exit 0
     /// whatever PATH the daemon process happened to inherit.
     #[test]
     #[cfg(unix)]
-    #[serial_test::serial(env_home_path)]
+    #[serial_test::serial(env_home_path, loom_config_env)]
     fn gh_claim_resetter_resolves_gh_via_canonical_home_local_bin() {
         let fake_home = tempfile::tempdir().unwrap();
         let local_bin = fake_home.path().join(".local/bin");
@@ -1912,7 +1807,7 @@ exit 0
     /// to `Ok(false)` without attempting `issue edit`/`issue comment`.
     #[test]
     #[cfg(unix)]
-    #[serial_test::serial(env_home_path)]
+    #[serial_test::serial(env_home_path, loom_config_env)]
     fn gh_claim_resetter_no_op_when_label_absent() {
         let fake_home = tempfile::tempdir().unwrap();
         let local_bin = fake_home.path().join(".local/bin");

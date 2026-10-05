@@ -169,6 +169,17 @@ fn without_token_env_removes_every_token_variable() {
     );
 }
 
+/// #4831: an explicit child `PATH` is carried only when asked for.
+#[test]
+fn path_env_is_set_only_when_requested() {
+    let plain = read_op(GhTarget::None).env_plan_with(None, None);
+    assert_eq!(env_of(&plain, "PATH"), None);
+    let set = read_op(GhTarget::None)
+        .path_env("/opt/homebrew/bin:/usr/bin")
+        .env_plan_with(None, None);
+    assert_eq!(env_of(&set, "PATH"), Some(Some("/opt/homebrew/bin:/usr/bin".to_string())));
+}
+
 /// A recording stub `gh`: prints its argv and the facade-owned env.
 fn stub(dir: &Path) -> String {
     let path = dir.join("gh-stub");

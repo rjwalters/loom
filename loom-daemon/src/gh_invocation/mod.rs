@@ -271,6 +271,9 @@ pub struct GhInvocation {
     config_dir: Option<PathBuf>,
     /// Remove [`TOKEN_ENV_VARS`] from the child (#10263).
     strip_token_env: bool,
+    /// An explicit child `PATH` (also steers program lookup), for a daemon
+    /// launched non-interactively whose inherited `PATH` may lack `gh`.
+    path_env: Option<OsString>,
     /// The [`OutputContract::CredentialHelper`] request written to stdin.
     stdin_input: Vec<u8>,
     /// Never route this read to a reader App (#9872).
@@ -305,6 +308,7 @@ impl GhInvocation {
             program: None,
             config_dir: None,
             strip_token_env: false,
+            path_env: None,
             stdin_input: Vec::new(),
             writer_only: false,
             role: None,
@@ -384,6 +388,13 @@ impl GhInvocation {
     #[must_use]
     pub fn gh_config_dir(mut self, dir: Option<&Path>) -> Self {
         self.config_dir = dir.map(Path::to_path_buf);
+        self
+    }
+
+    /// Run with an explicit `PATH` instead of the inherited one (#4831).
+    #[must_use]
+    pub fn path_env(mut self, path: impl Into<OsString>) -> Self {
+        self.path_env = Some(path.into());
         self
     }
 
@@ -478,6 +489,7 @@ impl GhInvocation {
     ///   `child_context` — the invocation's own span when it is exported, so
     ///   the managed launcher (C4) parents its HTTP spans under it — or both
     ///   removed when there is none.
+    /// - `PATH`: set only under [`GhInvocation::path_env`].
     /// - [`TOKEN_ENV_VARS`]: removed, only under
     ///   [`GhInvocation::without_token_env`].
     #[must_use]
@@ -521,6 +533,12 @@ impl GhInvocation {
             plan.push(EnvEntry {
                 key,
                 value: traceparent.clone(),
+            });
+        }
+        if let Some(path) = &self.path_env {
+            plan.push(EnvEntry {
+                key: "PATH",
+                value: Some(path.clone()),
             });
         }
         if self.strip_token_env {
