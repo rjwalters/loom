@@ -1,6 +1,10 @@
-//! `loom.forge.calls` (W1): the requests this process's `gh` facade spent,
+//! `loom.forge.calls` (W1): the requests this process's `gh` facade sent,
 //! by caller, operation, identity role, credential bucket, target owner and
-//! outcome, as a delta counter.
+//! outcome, as a delta counter. It counts request *observations*: the free
+//! `gh api rate_limit` probe is a request too and is counted under
+//! `resource = "other"`, which is never a billed GitHub bucket. What a bucket
+//! was *charged* is the forge-call sink's rollup
+//! ([`crate::forge_call_stats::buckets`]), which excludes known-free rows.
 //!
 //! The facade's accounting adds to an in-process map ([`record`]); the
 //! collector's rate-limit tick drains it ([`drain_points`]) the same way it
@@ -16,9 +20,14 @@ use std::collections::BTreeMap;
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
 
-/// Distinct label sets held between drains; a new set past this is folded
-/// into `caller = "overflow"` so the point count stays bounded.
+/// Distinct label sets held between drains. A new set past this is folded
+/// into the fixed [`OVERFLOW`] labels — only `outcome` survives, a closed
+/// five-value enum — so a drain is never more than `MAX_SERIES + 5` points
+/// whatever the labels vary in, and the folded counts keep the total.
 const MAX_SERIES: usize = 2048;
+
+/// The value of every string label of a folded (over-cap) series.
+const OVERFLOW: &str = "overflow";
 
 /// How a call ended, as the `outcome` label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +77,7 @@ pub struct CallLabels {
 type Series = BTreeMap<(String, String, String, String, String, String, String, &'static str), u64>;
 
 fn add(store: &mut Series, labels: CallLabels, value: u64) {
-    let mut key = (
+    let key = (
         labels.caller,
         labels.op,
         labels.role,
@@ -78,9 +87,12 @@ fn add(store: &mut Series, labels: CallLabels, value: u64) {
         labels.resource,
         labels.outcome.as_str(),
     );
-    if store.len() >= MAX_SERIES && !store.contains_key(&key) {
-        key.0 = "overflow".to_string();
-    }
+    let key = if store.len() >= MAX_SERIES && !store.contains_key(&key) {
+        let o = || OVERFLOW.to_string();
+        (o(), o(), o(), o(), o(), o(), o(), key.7)
+    } else {
+        key
+    };
     let slot = store.entry(key).or_default();
     *slot = slot.saturating_add(value);
 }
@@ -131,4 +143,68 @@ pub fn drain_points() -> Vec<MetricPoint> {
             },
         )
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn labels(i: usize, outcome: CallOutcome) -> CallLabels {
+        // Every label but `caller` varies, so only a fully fixed overflow
+        // key bounds the store.
+        CallLabels {
+            caller: "issue.view".to_string(),
+            op: format!("op-{}", i % 7),
+            role: format!("role-{}", i % 3),
+            account: format!("app-{i}"),
+            cred_owner: format!("owner-{i}"),
+            target_owner: format!("target-{i}"),
+            resource: format!("res-{}", i % 5),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn varying_non_caller_labels_past_the_cap_stays_bounded_and_keeps_the_total() {
+        let outcomes = [
+            CallOutcome::Ok,
+            CallOutcome::NotModified,
+            CallOutcome::RateLimited,
+            CallOutcome::Error,
+            CallOutcome::Shed,
+        ];
+        let mut store = Series::new();
+        let n = MAX_SERIES * 3;
+        for i in 0..n {
+            add(&mut store, labels(i, outcomes[i % outcomes.len()]), 2);
+        }
+        assert!(store.len() <= MAX_SERIES + outcomes.len(), "{} series", store.len());
+        assert_eq!(store.values().sum::<u64>(), 2 * n as u64, "no count is lost");
+
+        let folded: Vec<_> = store.iter().filter(|(k, _)| k.0 == OVERFLOW).collect();
+        assert_eq!(folded.len(), outcomes.len(), "one overflow series per outcome");
+        for (k, _) in &folded {
+            for v in [&k.0, &k.1, &k.2, &k.3, &k.4, &k.5, &k.6] {
+                assert_eq!(v, OVERFLOW, "{k:?}");
+            }
+        }
+
+        // A series admitted before the cap keeps accumulating under its own key.
+        let first = labels(0, CallOutcome::Ok);
+        let before = store.len();
+        add(&mut store, first.clone(), 5);
+        assert_eq!(store.len(), before);
+        let key = (
+            first.caller,
+            first.op,
+            first.role,
+            first.account,
+            first.cred_owner,
+            first.target_owner,
+            first.resource,
+            first.outcome.as_str(),
+        );
+        assert_eq!(store.get(&key).copied(), Some(2 + 5));
+    }
 }

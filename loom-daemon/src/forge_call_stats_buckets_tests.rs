@@ -62,6 +62,7 @@ fn attributed(pg: Option<u32>) -> CallAttribution {
         pg,
         pu: None,
         rd: Some(true),
+        fr: None,
     }
 }
 
@@ -129,4 +130,30 @@ fn group_by_parses_only_its_four_values() {
         assert_eq!(GroupBy::parse(v), Ok(want));
     }
     assert!(GroupBy::parse("owner").is_err());
+}
+
+#[test]
+fn a_known_free_row_is_observed_but_never_charged() {
+    let free = CallAttribution {
+        rr: Some("other".into()),
+        fr: Some(true),
+        ..attributed(None)
+    };
+    let lines = [
+        w1_line(1_900_000_000, "api.rate_limit", Outcome::Ok, free.clone()),
+        w1_line(1_900_000_001, "api.rate_limit", Outcome::Ok, free),
+        w1_line(1_900_000_002, "issue.view", Outcome::Ok, attributed(None)),
+    ];
+    for by in [
+        GroupBy::Bucket,
+        GroupBy::Caller,
+        GroupBy::Role,
+        GroupBy::Repo,
+    ] {
+        let agg = aggregate_lines(lines.iter().map(String::as_str), 0, by);
+        let rows: u64 = agg.groups.iter().map(|g| g.rows).sum();
+        let charged: u64 = agg.groups.iter().map(|g| g.charged).sum();
+        let free: u64 = agg.groups.iter().map(|g| g.free).sum();
+        assert_eq!((rows, charged, free), (3, 1, 2), "{by:?}: {agg:?}");
+    }
 }

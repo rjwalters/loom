@@ -281,6 +281,7 @@ pub(super) fn record(inv: &GhInvocation, outcome: InvokeOutcome, captured: Optio
         pg,
         pu,
         rd,
+        fr: probe.then_some(true),
     };
     forge_call_stats::record_attributed(caller, &identity, pool, classified, headers, &attribution);
 

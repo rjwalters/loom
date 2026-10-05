@@ -304,6 +304,54 @@ fn a_rate_limit_probe_is_booked_other_whatever_its_headers_say() {
     );
 }
 
+/// The probe is a request (one row) but never a charged one: run through the
+/// facade and then the per-bucket aggregation, it adds nothing to CHARGED in
+/// any grouping, while a real call beside it still does.
+#[test]
+fn a_rate_limit_probe_through_the_facade_is_never_charged() {
+    use crate::forge_call_stats::buckets::{aggregate_since, GroupBy, GroupRow};
+    let tmp = tempfile::tempdir().unwrap();
+    let rl = stub(
+        tmp.path(),
+        "gh-rl-agg",
+        "printf 'HTTP/2.0 200 OK\\r\\nX-Ratelimit-Resource: core\\r\\n\\r\\n{}'",
+    );
+    let real = stub(
+        tmp.path(),
+        "gh-real-agg",
+        "printf 'HTTP/2.0 200 OK\\r\\nX-Ratelimit-Resource: core\\r\\n\\r\\n{}'",
+    );
+    let sink = tempfile::tempdir().unwrap();
+    crate::forge_call_stats::set_test_sink_dir(Some(sink.path().to_path_buf()));
+    let _ = inv("api.rate_limit", &["api", "--include", "rate_limit"], &rl).run();
+    let _ = inv("api.rate_limit", &["api", "--include", "/rate_limit"], &rl).run();
+    let _ = inv("issue.get", &["api", "--include", "repos/o/r/issues/1"], &real).run();
+    crate::forge_call_stats::set_test_sink_dir(None);
+
+    let now = chrono::Utc::now().timestamp();
+    for by in [
+        GroupBy::Bucket,
+        GroupBy::Caller,
+        GroupBy::Role,
+        GroupBy::Repo,
+    ] {
+        let agg = aggregate_since(sink.path(), now - 60, now + 1, by);
+        let sum = |f: fn(&GroupRow) -> u64| agg.groups.iter().map(f).sum::<u64>();
+        assert_eq!(
+            (sum(|g| g.rows), sum(|g| g.charged), sum(|g| g.free)),
+            (3, 1, 2),
+            "{by:?}: {agg:?}"
+        );
+    }
+    let by_caller = aggregate_since(sink.path(), now - 60, now + 1, GroupBy::Caller);
+    let probe = by_caller
+        .groups
+        .iter()
+        .find(|g| g.key == ["api.rate_limit".to_string()])
+        .unwrap();
+    assert_eq!((probe.rows, probe.charged, probe.free), (2, 0, 2));
+}
+
 /// A probe of a credential whose core bucket is spent must not become the
 /// host's `other` budget reading: that would surface as a host-wide
 /// `rate_limit_quota` stall in the ETA for a bucket unrelated to the work.

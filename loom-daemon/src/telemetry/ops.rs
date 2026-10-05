@@ -471,7 +471,7 @@ impl MetricName {
                 "Job passes skipped by the rate-limit breaker, by job."
             }
             Self::ForgeCalls => {
-                "GitHub requests spent by the gh facade, by caller, bucket and outcome."
+                "GitHub requests sent by the gh facade, by caller, bucket and outcome."
             }
             Self::MergeRedatePrs => "PRs re-dated in the trailing window, by landing state.",
             Self::MergeRedatesMax => "Most re-dates on one PR in the trailing window, by state.",

@@ -538,6 +538,10 @@ pub struct CallAttribution {
     /// resolve from the same checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rd: Option<bool>,
+    /// A request GitHub does not charge (the `gh api rate_limit` probe): it
+    /// is still a row — a request was sent — but never a charged one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fr: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

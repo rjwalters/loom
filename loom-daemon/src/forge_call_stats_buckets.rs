@@ -8,8 +8,9 @@
 //! the window (`rst`) — or by caller, identity role or repository.
 //!
 //! **Charged** is what a row cost GitHub: `ok` rows × `max(pages, 1)`. A
-//! `304` is free, a rate-limited call spent nothing, and an error is counted
-//! separately (it may or may not have been billed). A `--paginate` row
+//! `304` is free, a rate-limited call spent nothing, a known-free request
+//! (`fr`, the `gh api rate_limit` probe) is counted under `free` instead, and
+//! an error is counted separately (it may or may not have been billed). A `--paginate` row
 //! without `--include` cannot know its pages and counts as one (`pu`); the
 //! rollup reports how many such rows it saw, so the lower bound is visible.
 //!
@@ -100,8 +101,12 @@ pub struct GroupRow {
     pub key: Vec<String>,
     /// Sink rows in the group.
     pub rows: u64,
-    /// Requests GitHub charged: `ok` rows × `max(pages, 1)`.
+    /// Requests GitHub charged: `ok` rows × `max(pages, 1)`, known-free
+    /// requests excluded.
     pub charged: u64,
+    /// Rows for a request GitHub does not charge (`fr`): sent, observed in
+    /// `rows`, never in `charged`.
+    pub free: u64,
     pub not_modified: u64,
     pub rate_limited: u64,
     pub error: u64,
@@ -126,7 +131,7 @@ pub struct CallsAggregate {
 
 /// What one line cost GitHub (see the module docs).
 pub(super) fn charged(line: &SinkLine) -> u64 {
-    if line.o == Outcome::Ok {
+    if line.o == Outcome::Ok && line.at.fr != Some(true) {
         u64::from(line.at.pg.unwrap_or(1).max(1))
     } else {
         0
@@ -179,6 +184,7 @@ pub fn aggregate_lines<'a>(
         });
         g.rows += 1;
         g.charged += charged(&line);
+        g.free += u64::from(line.at.fr == Some(true));
         match line.o {
             Outcome::Ok => {}
             Outcome::NotModified => g.not_modified += 1,

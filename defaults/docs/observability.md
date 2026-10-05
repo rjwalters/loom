@@ -548,9 +548,11 @@ reading of every `(account, owner, resource)` pool it spends, from the free
 `gh api rate_limit` probe per published credential directory after every
 reader-refresh pass. Each believed reading is exported as the same
 `github.ratelimit.{remaining,used,reset}` gauges with an extra `owner` label.
-`loom.forge.calls` is a delta counter of the requests the `gh` facade spent,
+`loom.forge.calls` is a delta counter of the requests the `gh` facade sent,
 labelled by caller, inventoried operation, identity role, credential bucket
-(`account`, `cred_owner`, `resource`), `target_owner` and `outcome`. On a host
+(`account`, `cred_owner`, `resource`), `target_owner` and `outcome`; the free
+`rate_limit` probe appears under `resource="other"` and is never charged to a
+bucket. On a host
 without an exporter, `loom-daemon forge calls --by bucket` shows the same
 picture from the local forge-call sink.
 

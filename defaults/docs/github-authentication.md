@@ -276,7 +276,8 @@ exploration) starves the daemon.
 - Calls by billed bucket (W1): `loom-daemon forge calls --by bucket` (or
   `--by caller|role|repo`, `--since 90m|3h`) rolls up this host's forge-call
   sink per `(account, cred_owner, resource, reset)`. Each row shows what this
-  host was charged (`ok` rows × pages), its `304`s and its rate-limited calls,
+  host was charged (`ok` rows × pages; the free `rate_limit` probe is counted
+  as `free`, never charged), its `304`s and its rate-limited calls,
   and the table is followed by the bucket book's newest `used`/`limit`/reset
   per App installation. The credential is classified by its `GH_CONFIG_DIR`
   shape alone (`gh-config` / `gh-config-by-owner/<owner>` = the writer,
