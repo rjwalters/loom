@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests scripts/ci-result-gate.sh and the ci.yml wiring of `CI Result` (#10444).
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 G=scripts/ci-result-gate.sh
 fail=0
 run() { # name expected_rc event needs_json [grep-pattern]
