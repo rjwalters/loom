@@ -451,6 +451,11 @@ fn issue_comment_readback(
     // Create the disposable issue, comment on it, read the comment back:
     // a write is only proven when the read sees it (read-after-write).
     let create = issue_create(test_id, view, cfg, http, server_version)?;
+    // Ownership of the disposable issue is proven only by a passing create
+    // (number + title + body read back). Anything else must not be written to.
+    if create.outcome != OUTCOME_PASS {
+        return Ok(create);
+    }
     let number: u64 = create
         .notes
         .iter()
@@ -612,6 +617,7 @@ mod tests {
     struct FakeHttp {
         routes: Vec<(&'static str, std::cell::RefCell<Queue>)>,
         calls: std::cell::Cell<u32>,
+        log: std::cell::RefCell<Vec<(String, String)>>,
     }
 
     struct Queue {
@@ -624,6 +630,7 @@ mod tests {
             Self {
                 routes: Vec::new(),
                 calls: std::cell::Cell::new(0),
+                log: std::cell::RefCell::new(Vec::new()),
             }
         }
         fn push(&mut self, path_part: &'static str, responses: Vec<Result<(u16, String), String>>) {
@@ -640,12 +647,15 @@ mod tests {
     impl ProbeHttp for FakeHttp {
         fn request(
             &self,
-            _method: &str,
+            method: &str,
             path: &str,
             _token: &str,
             _body: Option<&str>,
         ) -> Result<(u16, String), String> {
             self.calls.set(self.calls.get() + 1);
+            self.log
+                .borrow_mut()
+                .push((method.to_string(), path.to_string()));
             let best = self
                 .routes
                 .iter()
@@ -789,6 +799,36 @@ mod tests {
         ] {
             assert_eq!(issue_create_row(readback).outcome, OUTCOME_FAIL);
         }
+    }
+
+    #[test]
+    fn comment_create_never_writes_when_the_issue_create_readback_mismatches() {
+        let mut http = FakeHttp::new();
+        http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
+        http.push(
+            "issues",
+            vec![
+                Ok((201, r#"{"number": 12}"#.into())),
+                Ok((200, issue_json(12, "someone else's issue", "not ours"))),
+            ],
+        );
+        http.push("user", vec![Ok((200, r#"{"login":"probe-writer"}"#.into()))]);
+        let mut cfg = cfg(true);
+        cfg.only = vec!["comment-create".into()];
+        let results = run(&cfg, &http).unwrap();
+        let row = results
+            .iter()
+            .find(|r| r.test_id.contains("comment-create"))
+            .unwrap();
+        assert_eq!(row.outcome, OUTCOME_FAIL);
+        assert!(
+            !http
+                .log
+                .borrow()
+                .iter()
+                .any(|(m, p)| m == "POST" && p.ends_with("/comments")),
+            "no comment POST may follow an unproven disposable issue"
+        );
     }
 
     #[test]
