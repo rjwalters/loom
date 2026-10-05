@@ -80,9 +80,11 @@ pub(crate) static QUARANTINE_SCAN: ReadCache<QuarantineScan> = ReadCache::new(CL
 pub(crate) type QuarantineScan = (bool, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
 /// A mergeable `loom:merge-conflict` PR's "did this pass flag it?" answer
-/// (`review_conflict::flag_is_latest`). Only a `false` outlives the tick —
-/// `true` clears the PR, which moves its `updatedAt` — so a conflict label
-/// some other actor applied stops costing one comments walk per tick.
+/// (`review_conflict::flag_is_latest`). Both answers are stored, keyed by the
+/// PR's `updatedAt`: a `true` is followed by a clear that moves `updatedAt`
+/// (and a failed clear that re-hits a cached `true` just retries the correct
+/// clear), so a conflict label some other actor applied stops costing one
+/// comments walk per tick.
 /// [`CLAIM_MAX_AGE`]: a comments read lagging our own flag delays the
 /// return to review by at most about one tick (never a wrong write).
 pub(super) static CONFLICT_FLAG_OURS: ReadCache<bool> = ReadCache::new(CLAIM_MAX_AGE);

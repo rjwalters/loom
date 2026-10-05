@@ -409,3 +409,85 @@ fn the_second_tick_posts_nothing() {
     // A held PR label alone never counts as an escalation.
     assert!(!already_escalated(&[SEQUENCE_LABEL.to_string()], chain));
 }
+
+/// A fake `gh` for the #10089 dedupe test: `api` reads answer from the
+/// `marker` / `fail` flag files; every call is logged as `"$1 $2"`.
+#[cfg(unix)]
+fn flagged_gh(dir: &std::path::Path, marker: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let log = dir.join("flagged.log");
+    let bin = dir.join("fake-gh-flagged.sh");
+    let script = format!(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$1 $2\" >> \"{log}\"\n\
+         if [ \"$1\" = api ]; then\n  [ -f \"{d}/fail\" ] && exit 1\n  \
+         if [ -f \"{d}/marker\" ]; then\n    \
+         echo '[{{\"body\":\"{marker}\",\"author_association\":\"OWNER\",\"user\":{{\"login\":\"op\",\"type\":\"User\"}}}}]'\n  \
+         else echo '[]'; fi\nfi\n",
+        log = log.display(),
+        d = dir.display(),
+    );
+    std::fs::write(&bin, script).unwrap();
+    let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&bin, perms).unwrap();
+    (bin, log)
+}
+
+/// #10089: with the read cache on, "not yet escalated" is never cached (a
+/// lagging listing must not suppress the first post), a failed read neither
+/// posts nor caches, and a found marker stops further comment reads.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn escalation_dedupe_never_suppresses_the_first_post_and_never_reposts() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let head = pr(5, "2026-09-30T00:00:00Z", "2026-10-01T00:00:00Z", &["loom:operator"]);
+    let mut ledger = StallLedger::default();
+    ledger.record(&head, &StallCause::HumanHold("loom:operator".into()), 36.0, 11, false);
+    let chain = &ledger.chains[0];
+    let (gh, log) = flagged_gh(dir.path(), &escalation_marker(&chain.key()));
+    let count = |needle: &str| {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(needle))
+            .count()
+    };
+    let flag = |name: &str, on: bool| {
+        let p = dir.path().join(name);
+        if on {
+            std::fs::write(p, "").unwrap();
+        } else {
+            let _ = std::fs::remove_file(p);
+        }
+    };
+
+    crate::claim_reconciliation::read_cache::set_test_enabled(true);
+
+    // (a) No marker: every call re-reads the comments and posts.
+    for n in 1..=2 {
+        assert!(escalate(&gh, &root, chain, BOUND).unwrap(), "call {n} posts");
+        assert_eq!(count("api"), n, "call {n} re-reads comments");
+        assert_eq!(count("pr comment"), n);
+    }
+
+    // (c) A failed read: Err, no post, nothing cached.
+    flag("fail", true);
+    assert!(escalate(&gh, &root, chain, BOUND).is_err());
+    assert_eq!((count("api"), count("pr comment")), (3, 2), "failed read never posts");
+    flag("fail", false);
+    assert!(escalate(&gh, &root, chain, BOUND).unwrap(), "the failure cached nothing");
+    assert_eq!((count("api"), count("pr comment")), (4, 3));
+
+    // (b) Marker present: one read, then none; never a post.
+    flag("marker", true);
+    for _ in 0..4 {
+        assert!(!escalate(&gh, &root, chain, BOUND).unwrap(), "already escalated");
+    }
+    assert_eq!(count("api"), 5, "one read, then served from cache");
+    assert_eq!(count("pr comment"), 3, "no post once the marker is found");
+
+    crate::claim_reconciliation::read_cache::set_test_enabled(false);
+}
