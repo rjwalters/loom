@@ -129,8 +129,14 @@ pub fn classify(args: &[String]) -> ApiKind {
         },
         Some("repo") => match sub {
             Some("view" | "list") => ApiKind::Graphql,
-            Some(_) => ApiKind::Mixed,
-            None => ApiKind::Unknown,
+            // The remaining real `gh repo` subcommands mix REST and GraphQL;
+            // a name `gh` does not have is `unknown`, not a guess.
+            Some(
+                "archive" | "unarchive" | "clone" | "create" | "delete" | "edit" | "fork"
+                | "rename" | "sync" | "set-default" | "autolink" | "deploy-key" | "gitignore"
+                | "license",
+            ) => ApiKind::Mixed,
+            _ => ApiKind::Unknown,
         },
         _ => ApiKind::Unknown,
     }
@@ -224,6 +230,8 @@ mod tests {
         assert_eq!(kind(&["auth", "status"]), "unknown");
         assert_eq!(kind(&["release"]), "unknown");
         assert_eq!(kind(&["release", "create", "v1"]), "unknown");
+        assert_eq!(kind(&["repo"]), "unknown");
+        assert_eq!(kind(&["repo", "no-such-subcommand"]), "unknown");
     }
 
     #[test]
