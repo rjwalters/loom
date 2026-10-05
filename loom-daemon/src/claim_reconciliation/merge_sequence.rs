@@ -40,9 +40,12 @@
 //!   [`evaluate`]: predecessor landed at the recorded head ⇒ release;
 //!   predecessor closed unmerged ⇒ release with that reason; any moved head
 //!   ⇒ the stale hold is voided (label off, replan note) and the next tick
-//!   re-derives a fresh, correctly-pinned plan. Soft (`source=pass`) holds
-//!   on approved followers expire when the predecessor has been quiet for
-//!   `LOOM_MERGE_SEQUENCE_MAX_AGE_HOURS` (default 72) — a scheduling
+//!   re-derives a fresh, correctly-pinned plan — except a follower head move
+//!   the forge proves tree-identical (a re-date), which keeps the hold as is;
+//!   and an operator's removal of the label is a sticky release for that
+//!   pair until the PR's tree changes (#10398, [`sticky`]). Soft
+//!   (`source=pass`) holds on approved followers expire when the predecessor
+//!   has been quiet for `LOOM_MERGE_SEQUENCE_MAX_AGE_HOURS` (default 72) — a scheduling
 //!   preference must not starve mergeable work. Hard holds (no `source=`,
 //!   the human-authored shape) never auto-expire: expiring a semantic
 //!   dependency into merge permission is exactly the failure #9063 forbids.
@@ -120,6 +123,10 @@ pub mod overlap;
 // Ready-first ordering and the not-ready release (#10371).
 #[path = "merge_sequence_ready.rs"]
 pub mod ready;
+
+// Tree-identical re-dates keep a hold; operator releases stick (#10398).
+#[path = "merge_sequence_sticky.rs"]
+pub mod sticky;
 
 /// The durable hold label this pass applies (defined by #9378).
 pub const SEQUENCE_LABEL: &str = "loom:sequenced";
@@ -935,9 +942,9 @@ pub struct PlanReport {
     pub already_planned: usize,
     pub holders: usize,
     /// Edges suppressed because the follower already carries an ordering
-    /// state (trusted marker or hold label) — reported so the dry-run's
-    /// "what would the pass write" matches the live pass edge for edge
-    /// (Judge re-review of #9707).
+    /// state (trusted marker or hold label) or a sticky operator release
+    /// (#10398) — reported so the dry-run's "what would the pass write"
+    /// matches the live pass edge for edge (Judge re-review of #9707).
     pub skipped_held: usize,
     /// Existing holds Phase 1 would release as no-overlap (#10077):
     /// `(follower, predecessor)`.
@@ -975,9 +982,18 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
     let files = cache.known(eligible.iter().map(|p| p.number));
     let markers = fetch_markers(gh_bin, root, &eligible, &BTreeMap::new());
     report.groups = plan_repo(&open, &files, &markers);
+    let bin = gh_bin.to_string_lossy().to_string();
     for g in &mut report.groups {
         g.edges.retain(|e| {
             if markers.contains_key(&e.follower) || holder_numbers.contains(&e.follower) {
+                report.skipped_held += 1;
+                return false;
+            }
+            // #10398: a sticky operator release is skipped (read-only here).
+            let bodies = fetch_trusted_bodies(&bin, root, "{owner}/{repo}", e.follower);
+            if sticky::check(gh_bin, root, e, &open, &bodies.unwrap_or_default())
+                != sticky::OperatorRelease::None
+            {
                 report.skipped_held += 1;
                 return false;
             }
@@ -1046,10 +1062,8 @@ fn apply_edge(
     root: &Path,
     edge: &SequenceEdge,
     marker: &SequenceMarker,
+    bodies: &[String],
 ) -> Result<bool> {
-    let bin = gh_bin.to_string_lossy().to_string();
-    let bodies =
-        fetch_trusted_bodies(&bin, root, "{owner}/{repo}", edge.follower).unwrap_or_default();
     let marker_present = bodies.iter().any(|b| b.contains(&marker_text(marker)));
     let label_present = has_sequence_label(gh_bin, root, edge.follower)?;
     if marker_present && label_present {
@@ -1154,6 +1168,11 @@ pub(super) fn reconcile_merge_sequences_with(
             stats.held += 1;
             continue;
         };
+        // #10398: a tree-identical re-date is evaluated at the pinned head.
+        let held = sticky::effective_follower(&marker, pr, |pinned, live| {
+            sticky::forge_same_tree(gh_bin, root, pinned, live)
+        });
+        let pr: &SequencePr = &held;
         let pred = predecessor(&bin, root, &open, marker.after);
         // The head's labels and freshness come from this tick's listing; a
         // predecessor outside it is never treated as stalled (fail closed).
@@ -1261,8 +1280,26 @@ pub(super) fn reconcile_merge_sequences_with(
             if markers.contains_key(&edge.follower) || holder_numbers.contains(&edge.follower) {
                 continue;
             }
+            let bodies = fetch_trusted_bodies(&bin, root, "{owner}/{repo}", edge.follower)
+                .unwrap_or_default();
+            // #10398: an operator's release of this pair sticks while the tree holds.
+            match sticky::check(gh_bin, root, &edge, &open, &bodies) {
+                sticky::OperatorRelease::None => {}
+                found => {
+                    if let sticky::OperatorRelease::Detected(head) = &found {
+                        if let Err(e) = sticky::record(gh_bin, root, &edge, head, &bodies) {
+                            log::warn!(
+                                "claim_reconciliation (merge sequence): PR #{}: {e}",
+                                edge.follower
+                            );
+                        }
+                    }
+                    stats.held += 1;
+                    continue;
+                }
+            }
             let marker = edge_marker(&edge);
-            match apply_edge(gh_bin, root, &edge, &marker) {
+            match apply_edge(gh_bin, root, &edge, &marker, &bodies) {
                 Ok(true) => {
                     stats.applied += 1;
                     log::info!(

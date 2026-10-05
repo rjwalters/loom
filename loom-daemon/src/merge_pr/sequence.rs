@@ -203,7 +203,7 @@ pub(crate) fn html_comment_spans(line: &str) -> Vec<&str> {
 ///
 /// Full SHA or nothing — see the module docs. The 40-char width is the forge's
 /// own rendering; anything else is a hand-typed approximation.
-fn is_full_sha(s: &str) -> bool {
+pub(crate) fn is_full_sha(s: &str) -> bool {
     s.len() == 40
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -306,6 +306,14 @@ fn parse_tombstone(span: &str) -> Option<Tombstone> {
             .map(|p| Tombstone::Released(p.to_string())),
         _ => None,
     }
+}
+
+/// Does `span` state a hold (a valid marker) or end one (a `released` /
+/// `replanned` tombstone)? Used by readers of later records on the same
+/// thread (#10398's operator-release record) to tell whether the sequencing
+/// history moved on after them.
+pub(crate) fn states_or_ends_hold(span: &str) -> bool {
+    parse_span(span).is_some() || parse_tombstone(span).is_some()
 }
 
 /// The hold the marker history says is STILL IN FORCE: the newest valid
