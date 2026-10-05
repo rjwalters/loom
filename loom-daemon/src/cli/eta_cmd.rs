@@ -84,6 +84,10 @@ pub(crate) enum EtaCommand {
     /// Fit the `eta-fit/v1` coefficient file from the fleet snapshots at a
     /// cutoff (#10245): `loom-daemon eta fit [--as-of RFC3339] [--dry-run]`.
     Fit(super::eta_fit_cmd::EtaFitArgs),
+    /// Read-only health check of every link of the ETA pipeline on this host
+    /// (#10391), with the remedy for each failure:
+    /// `loom-daemon eta doctor [--repo-root PATH] [--json]`.
+    Doctor(super::eta_doctor_cmd::EtaDoctorArgs),
 }
 
 impl EtaCommand {
@@ -97,6 +101,7 @@ impl EtaCommand {
             EtaCommand::Fleet { command } => command.run(),
             EtaCommand::Offline(args) => args.run(),
             EtaCommand::Fit(args) => args.run(),
+            EtaCommand::Doctor(args) => args.run(),
         }
     }
 }
