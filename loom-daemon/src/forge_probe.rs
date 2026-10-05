@@ -390,14 +390,15 @@ fn issue_create(
         .as_ref()
         .and_then(|v| v.get("number").and_then(|n| n.as_u64()));
     let base = |outcome: &str, observed: String| {
+        let (outcome, observed, actor) = with_actor(http, &cfg.writer_token, outcome, observed);
         CaseResult {
         test_id: test_id.to_string(),
         operation: view.id.clone(),
         risk: view.risk.clone(),
         disposition: view.disposition.clone(),
-        outcome: outcome.into(),
+        outcome,
         server_version: server_version.to_string(),
-        actor: actor_of(http, &cfg.writer_token),
+        actor,
         at: now_secs(),
         expected: format!("HTTP 2xx with issue.number, read back with matching title and body (disposable: {title})"),
         observed,
@@ -498,27 +499,55 @@ fn issue_comment_readback(
             })
         })
         .unwrap_or(false);
+    let (outcome, observed, actor) = with_actor(
+        http,
+        &cfg.writer_token,
+        if seen && (200..=299).contains(&rcode) {
+            OUTCOME_PASS
+        } else {
+            OUTCOME_FAIL
+        },
+        if seen {
+            "read-after-write confirmed".into()
+        } else {
+            "marker not found on read-back".into()
+        },
+    );
     Ok(CaseResult {
         test_id: test_id.to_string(),
         operation: view.id.clone(),
         risk: view.risk.clone(),
         disposition: view.disposition.clone(),
-        outcome: if seen && (200..=299).contains(&rcode) {
-            OUTCOME_PASS.into()
-        } else {
-            OUTCOME_FAIL.into()
-        },
+        outcome,
         server_version: server_version.to_string(),
-        actor: actor_of(http, &cfg.writer_token),
+        actor,
         at: now_secs(),
         expected: format!("comment read-back contains {marker:?}"),
-        observed: if seen {
-            "read-after-write confirmed".into()
-        } else {
-            "marker not found on read-back".into()
-        },
+        observed,
         notes: vec![format!("disposable issue number: {number}")],
     })
+}
+
+/// Resolve the acting principal for a case. Each required operation must carry
+/// actor evidence, so an otherwise-passing case whose actor cannot be resolved
+/// fails closed rather than recording a PASS with no actor.
+fn with_actor(
+    http: &dyn ProbeHttp,
+    token: &str,
+    outcome: &str,
+    observed: String,
+) -> (String, String, Option<String>) {
+    let actor = actor_of(http, token);
+    if outcome == OUTCOME_PASS && actor.is_none() {
+        return (
+            OUTCOME_FAIL.into(),
+            format!(
+                "{observed}; actor evidence unavailable (GET user failed or returned no login)"
+            ),
+            None,
+        );
+    }
+    (outcome.into(), observed, actor)
 }
 
 fn actor_of(http: &dyn ProbeHttp, token: &str) -> Option<String> {
@@ -717,6 +746,7 @@ mod tests {
                 Ok((200, issue_json(12, "loomp-loomp-testrun: issue-create", DISPOSABLE_BODY))),
             ],
         );
+        http.push("user", vec![Ok((200, r#"{"login":"probe-writer"}"#.into()))]);
         let mut cfg = cfg(true);
         cfg.only = vec!["issue-create".into()];
         let results = run(&cfg, &http).unwrap();
@@ -725,6 +755,7 @@ mod tests {
             .find(|r| r.test_id.contains("issue-create"))
             .unwrap();
         assert_eq!(row.outcome, OUTCOME_PASS);
+        assert_eq!(row.actor.as_deref(), Some("probe-writer"));
         assert!(row.notes.iter().any(|n| n.contains("12")));
         assert!(row.observed.contains("#12"));
     }
@@ -758,6 +789,48 @@ mod tests {
         ] {
             assert_eq!(issue_create_row(readback).outcome, OUTCOME_FAIL);
         }
+    }
+
+    #[test]
+    fn a_passing_case_without_actor_evidence_fails_closed() {
+        for user in [
+            Err("connection reset".into()),
+            Ok((401, r#"{"message":"bad token"}"#.into())),
+            Ok((200, "not json".into())),
+            Ok((200, "{}".into())),
+        ] {
+            let mut http = FakeHttp::new();
+            http.push("version", vec![Ok((200, r#"{"version":"28.0.0"}"#.into()))]);
+            http.push(
+                "issues",
+                vec![
+                    Ok((201, r#"{"number": 12}"#.into())),
+                    Ok((200, issue_json(12, "loomp-loomp-testrun: issue-create", DISPOSABLE_BODY))),
+                ],
+            );
+            http.push("user", vec![user]);
+            let mut cfg = cfg(true);
+            cfg.only = vec!["issue-create".into()];
+            let row = run(&cfg, &http)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.test_id.contains("issue-create"))
+                .unwrap();
+            assert_eq!(row.outcome, OUTCOME_FAIL);
+            assert!(row.actor.is_none());
+            assert!(row.observed.contains("actor evidence unavailable"));
+        }
+    }
+
+    #[test]
+    fn with_actor_keeps_a_non_pass_outcome_and_a_resolved_actor() {
+        let mut http = FakeHttp::new();
+        http.push("user", vec![Ok((200, r#"{"login":"w"}"#.into()))]);
+        let (o, _, a) = with_actor(&http, "t", OUTCOME_PASS, "ok".into());
+        assert_eq!((o.as_str(), a.as_deref()), (OUTCOME_PASS, Some("w")));
+        let down = FakeHttp::new();
+        let (o, obs, a) = with_actor(&down, "t", OUTCOME_FAIL, "bad".into());
+        assert_eq!((o.as_str(), obs.as_str(), a), (OUTCOME_FAIL, "bad", None));
     }
 
     #[test]
