@@ -98,6 +98,8 @@ mod gh_token_guard_tests;
 /// in the IPC accept loop (which only returns on a startup failure — a running
 /// daemon leaves via one of the `std::process::exit` paths instead).
 pub(crate) async fn run_daemon() -> Result<()> {
+    // #10331: started as `gh`, or `loom-daemon gh|gh-shim …` — before clap.
+    loom_daemon::agent_gh::dispatch_if_front();
     let cli = Cli::parse();
 
     // Handle CLI commands (init mode)

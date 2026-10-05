@@ -39,6 +39,7 @@ pub mod accounting;
 mod outcome;
 pub mod resolver;
 pub mod telemetry;
+pub mod transparent;
 
 #[cfg(test)]
 mod tests;
