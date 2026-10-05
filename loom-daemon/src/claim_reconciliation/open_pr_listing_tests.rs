@@ -271,8 +271,10 @@ fn each_pass_sees_the_current_listing() {
     std::fs::create_dir_all(&root).unwrap();
     let body = dir.path().join("listing.json");
     std::fs::write(&body, listing(&[row(1, &["loom:pr"])])).unwrap();
-    let script =
-        format!("#!/usr/bin/env bash\n{}exit 0\n", pulls_arm_cmd(&format!("cat '{}'", body.display())));
+    let script = format!(
+        "#!/usr/bin/env bash\n{}exit 0\n",
+        pulls_arm_cmd(&format!("cat '{}'", body.display()))
+    );
     let gh = dir.path().join("fake-gh.sh");
     write_script(&gh, &script);
     let first = list_with_label(&gh, &root, "loom:pr").unwrap();
