@@ -1106,6 +1106,31 @@ _loom_account_provider_for_runtime() {
 
 # --- Token selection ---
 if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+    # --- Ambient Anthropic credential scrub (#10413) ---
+    # Reached only when Loom itself is about to choose the child's credential
+    # (no LOOM_SPAWN_NO_EXPORT, no caller-set CLAUDE_CODE_OAUTH_TOKEN): the
+    # pool token SELECTED AND EXPORTED by this block is authoritative for the
+    # spawned session. Claude Code's credential precedence is API-key env var
+    # > OAuth-token env var > keychain, so an ANTHROPIC_API_KEY or
+    # ANTHROPIC_AUTH_TOKEN inherited from the spawning shell (e.g. a
+    # machine-level rc file pinning a console key) would silently shadow the
+    # selected account and the session would run — and die on quota errors —
+    # on a key nobody chose (the 2026-10-04 incident, #10413: a zero-credit
+    # console key leaked into every spawned session, and no subscription
+    # switch ever reached any of them). Unset the ambient names when present,
+    # loud and secret-free: the warning names the variables, never their
+    # values. Explicit-credential callers (the branch above) keep their
+    # environment byte-identical; the containerized path is unaffected
+    # (ANTHROPIC_* never crosses the docker boundary by name).
+    _ambient_scrub=()
+    [[ -n "${ANTHROPIC_API_KEY:-}" ]] && _ambient_scrub+=(ANTHROPIC_API_KEY)
+    [[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]] && _ambient_scrub+=(ANTHROPIC_AUTH_TOKEN)
+    if [[ ${#_ambient_scrub[@]} -gt 0 ]]; then
+        log_warn "spawn-claude: unsetting ambient ${_ambient_scrub[*]} — they would shadow the pool token this spawn selects (Claude Code precedence: API-key env > OAuth-token env > keychain; #10413)"
+        unset "${_ambient_scrub[@]}"
+    fi
+    unset _ambient_scrub
+
     _daemon_bin="$(loom_locate_daemon_bin "$WORKSPACE")"
     if [[ -z "$_daemon_bin" ]] || ! "$_daemon_bin" tokens select --help >/dev/null 2>&1; then
         log_error "No loom-daemon binary supporting 'tokens select' was found."
