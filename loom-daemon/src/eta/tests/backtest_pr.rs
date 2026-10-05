@@ -3,19 +3,22 @@
 use super::provenance;
 use crate::eta::backtest::{
     self, cases_from_pr_history, cases_from_pr_records, cases_from_record, merge_case_sets,
-    parse_pr_records, BacktestReport, Filter, PrCaseExclusion, PrCaseRecord, ReplayCase,
+    parse_pr_records, pr_case_entries, BacktestReport, Filter, PrCaseExclusion, PrCaseRecord,
+    RefusedEntry, ReplayCase,
 };
+use crate::eta::episodes::episodes_from_pr_history;
 use crate::eta::heuristics::LandV1;
 use crate::eta::history::StageSamples;
 use crate::eta::journal::{entries_from_pr_history, JournalEntry};
+use crate::eta::labels::stage_from_pr_labels;
 use crate::eta::score::OutcomeKind;
-use crate::eta::{EstimateInput, Explanation, Heuristic, Kind, Stage};
+use crate::eta::{EstimateInput, Explanation, Heuristic, Kind, NoEstimateReason, Stage};
 use crate::pr_latency::history::fixtures::{labeled, merged, open, pushed, t, unlabeled};
-use crate::pr_latency::history::{PrHistory, PrState};
+use crate::pr_latency::history::{PrEvent, PrHistory, PrState};
 use crate::pr_latency::{APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED};
 use crate::telemetry::{SweepOutcomeRecord, SweepResult};
 use chrono::Duration;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 20 merged-out-of-sweep PRs (every odd one with a rejection lap, #9703
 /// with a concurrent re-application of `loom:review-requested`), then one
@@ -104,12 +107,17 @@ fn a_duplicate_labeling_is_one_entry_and_a_second_lap_carries_its_rework() {
     );
 }
 
-fn two_lap_pr(number: u32, extra_later: Vec<crate::pr_latency::PrEvent>) -> PrHistory {
+/// Review, rejection, review, approval — each verdict a real
+/// `--remove-label --add-label` edit, so every instant names one stage.
+fn two_lap_pr(number: u32, extra_later: Vec<PrEvent>) -> PrHistory {
     let mut events = vec![
         labeled(REVIEW_REQUESTED, 100),
+        unlabeled(REVIEW_REQUESTED, 400),
         labeled(CHANGES_REQUESTED, 400),
         pushed(700),
+        unlabeled(CHANGES_REQUESTED, 710),
         labeled(REVIEW_REQUESTED, 710),
+        unlabeled(REVIEW_REQUESTED, 1000),
         labeled(APPROVED, 1000),
     ];
     events.extend(extra_later);
@@ -129,7 +137,9 @@ fn later_events_never_move_an_earlier_cases_predictor_inputs() {
                 unlabeled(APPROVED, 1100),
                 labeled(CHANGES_REQUESTED, 1200),
                 pushed(1500),
+                unlabeled(CHANGES_REQUESTED, 1600),
                 labeled(REVIEW_REQUESTED, 1600),
+                unlabeled(REVIEW_REQUESTED, 2000),
                 labeled(APPROVED, 2000),
             ],
         ),
@@ -390,4 +400,373 @@ fn a_record_round_trips_through_its_offline_form() {
     let array = serde_json::to_string(&vec![record]).unwrap();
     assert_eq!(parse_pr_records(&array).unwrap().len(), 1);
     assert!(parse_pr_records("{not json}\n").is_err());
+}
+
+// ── Hold-aware entries through the shared resolver (#10305) ──────────────
+
+const OPERATOR: &str = "loom:operator";
+const OPERATOR_ONLY: &str = "loom:operator-only";
+const BLOCKED: &str = "loom:blocked";
+
+/// The labels in force at `as_of` (every event at or before it, in timeline
+/// order), rebuilt independently of the replay under test.
+fn labels_at(h: &PrHistory, as_of: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+    let mut labels = BTreeSet::new();
+    for event in h.events.iter().filter(|e| e.at() <= as_of) {
+        match event {
+            PrEvent::Labeled { label, .. } => {
+                labels.insert(label.clone());
+            }
+            PrEvent::Unlabeled { label, .. } => {
+                labels.remove(label);
+            }
+            PrEvent::Pushed { .. } | PrEvent::Merged { .. } => {}
+        }
+    }
+    labels.into_iter().collect()
+}
+
+/// The train/serve parity check: every emitted case's stage is what the
+/// tracker's resolver serves for the labels in force at its `as_of`, every
+/// refused entry is that resolver's refusal, and the cases are exactly the
+/// shared episode derivation's entries before the merge.
+fn assert_parity(h: &PrHistory) {
+    let Ok(found) = pr_case_entries(REPO, h, Some(&[11])) else {
+        return;
+    };
+    for case in &found.cases {
+        assert_eq!(
+            stage_from_pr_labels(&labels_at(h, case.as_of)),
+            Ok(case.stage),
+            "PR {} at {}",
+            h.number,
+            case.as_of
+        );
+    }
+    for refused in &found.refused {
+        assert_eq!(stage_from_pr_labels(&labels_at(h, refused.at)), Err(refused.reason));
+    }
+    let merged_at = h.merged_at.unwrap();
+    let episodes: Vec<_> = episodes_from_pr_history(h, REPO, merged_at)
+        .into_iter()
+        .map(|e| (e.entered_at, e.stage))
+        .collect();
+    let cases: Vec<_> = found.cases.iter().map(|c| (c.as_of, c.stage)).collect();
+    assert_eq!(cases, episodes, "PR {}: cases drifted from the episode derivation", h.number);
+}
+
+fn stages(cases: &[ReplayCase]) -> Vec<(i64, Stage, u32)> {
+    cases
+        .iter()
+        .map(|c| ((c.as_of - t(0)).num_seconds(), c.stage, c.rework_rounds))
+        .collect()
+}
+
+/// Review, then an approval at 400 (one edit).
+fn approved_at_400(mut later: Vec<PrEvent>) -> Vec<PrEvent> {
+    let mut events = vec![
+        labeled(REVIEW_REQUESTED, 100),
+        unlabeled(REVIEW_REQUESTED, 400),
+        labeled(APPROVED, 400),
+    ];
+    events.append(&mut later);
+    events
+}
+
+fn hold_histories() -> Vec<PrHistory> {
+    vec![
+        // Approval → operator hold → release.
+        merged(
+            21,
+            2000,
+            approved_at_400(vec![labeled(OPERATOR, 600), unlabeled(OPERATOR, 900)]),
+        ),
+        // The hold precedes the approval.
+        merged(
+            22,
+            2000,
+            vec![
+                labeled(REVIEW_REQUESTED, 100),
+                labeled(OPERATOR, 200),
+                unlabeled(REVIEW_REQUESTED, 400),
+                labeled(APPROVED, 400),
+                unlabeled(OPERATOR, 900),
+            ],
+        ),
+        // Repeated and overlapping operator holds: released only when the
+        // last one clears.
+        merged(
+            23,
+            2000,
+            approved_at_400(vec![
+                labeled(OPERATOR, 600),
+                labeled(OPERATOR, 650),
+                labeled(OPERATOR_ONLY, 700),
+                unlabeled(OPERATOR, 800),
+                labeled("loom:operator-priority", 850),
+                unlabeled(OPERATOR_ONLY, 900),
+            ]),
+        ),
+        // An operator hold joined by `loom:blocked`.
+        merged(
+            24,
+            2000,
+            approved_at_400(vec![
+                labeled(OPERATOR, 600),
+                labeled(BLOCKED, 700),
+                unlabeled(BLOCKED, 800),
+            ]),
+        ),
+        // A whole rejection lap under `loom:blocked`.
+        blocked_lap_pr(),
+        // Contradictory verdict labels (no removals).
+        merged(
+            26,
+            5000,
+            vec![
+                labeled(REVIEW_REQUESTED, 100),
+                labeled(CHANGES_REQUESTED, 400),
+                pushed(700),
+                labeled(REVIEW_REQUESTED, 710),
+                labeled(APPROVED, 1000),
+            ],
+        ),
+        // Hold applied exactly at the merge, and one second before it.
+        merged(27, 2000, approved_at_400(vec![labeled(OPERATOR, 2000)])),
+        merged(28, 2000, approved_at_400(vec![labeled(OPERATOR, 1999)])),
+    ]
+}
+
+fn blocked_lap_pr() -> PrHistory {
+    merged(
+        25,
+        3000,
+        vec![
+            labeled(REVIEW_REQUESTED, 100),
+            labeled(BLOCKED, 150),
+            unlabeled(REVIEW_REQUESTED, 400),
+            labeled(CHANGES_REQUESTED, 400),
+            pushed(500),
+            unlabeled(CHANGES_REQUESTED, 600),
+            labeled(REVIEW_REQUESTED, 600),
+            unlabeled(BLOCKED, 700),
+            unlabeled(REVIEW_REQUESTED, 900),
+            labeled(APPROVED, 900),
+        ],
+    )
+}
+
+fn entries_of(number: u32) -> crate::eta::backtest::PrCaseEntries {
+    let h = hold_histories()
+        .into_iter()
+        .find(|h| h.number == number)
+        .unwrap();
+    pr_case_entries(REPO, &h, Some(&[11])).unwrap()
+}
+
+#[test]
+fn an_operator_hold_after_approval_replays_as_merge_hold_then_merge_wait() {
+    let found = entries_of(21);
+    assert_eq!(
+        stages(&found.cases),
+        vec![
+            (100, Stage::ReviewWait, 0),
+            (400, Stage::MergeWait, 0),
+            (600, Stage::MergeHold, 0),
+            (900, Stage::MergeWait, 0),
+        ]
+    );
+    assert!(found.cases.iter().all(|c| c.actual_at == t(2000)));
+    assert!(found.refused.is_empty());
+}
+
+#[test]
+fn a_hold_in_force_at_approval_replays_as_merge_hold_not_merge_wait() {
+    let found = entries_of(22);
+    assert_eq!(
+        stages(&found.cases),
+        vec![
+            (100, Stage::ReviewWait, 0),
+            (400, Stage::MergeHold, 0),
+            (900, Stage::MergeWait, 0),
+        ]
+    );
+    // The review lap under an operator hold is not an approved PR's hold:
+    // the resolver refuses it, and so does the replay.
+    assert_eq!(
+        found.refused,
+        vec![RefusedEntry {
+            at: t(200),
+            reason: NoEstimateReason::Blocked
+        }]
+    );
+}
+
+#[test]
+fn repeated_and_overlapping_holds_are_one_hold_released_by_the_last() {
+    assert_eq!(
+        stages(&entries_of(23).cases),
+        vec![
+            (100, Stage::ReviewWait, 0),
+            (400, Stage::MergeWait, 0),
+            (600, Stage::MergeHold, 0),
+            (900, Stage::MergeWait, 0),
+        ]
+    );
+}
+
+#[test]
+fn a_blocked_operator_hold_is_refused_and_re_enters_on_unblock() {
+    let found = entries_of(24);
+    assert_eq!(
+        stages(&found.cases),
+        vec![
+            (100, Stage::ReviewWait, 0),
+            (400, Stage::MergeWait, 0),
+            (600, Stage::MergeHold, 0),
+            (800, Stage::MergeHold, 0),
+        ]
+    );
+    assert_eq!(
+        found.refused,
+        vec![RefusedEntry {
+            at: t(700),
+            reason: NoEstimateReason::Blocked
+        }]
+    );
+}
+
+#[test]
+fn a_blocked_rejection_lap_yields_no_case_but_still_counts_as_rework() {
+    let found = entries_of(25);
+    assert_eq!(
+        stages(&found.cases),
+        vec![
+            (100, Stage::ReviewWait, 0),
+            (700, Stage::ReviewWait, 1),
+            (900, Stage::MergeWait, 1),
+        ]
+    );
+    // Each lap entered under the hold is one named refusal.
+    let at: Vec<i64> = found
+        .refused
+        .iter()
+        .map(|r| (r.at - t(0)).num_seconds())
+        .collect();
+    assert_eq!(at, vec![150, 400, 600]);
+    assert!(found
+        .refused
+        .iter()
+        .all(|r| r.reason == NoEstimateReason::Blocked));
+}
+
+#[test]
+fn contradictory_verdict_labels_are_refused_not_normalized() {
+    let found = entries_of(26);
+    assert_eq!(stages(&found.cases), vec![(100, Stage::ReviewWait, 0)]);
+    assert_eq!(
+        found.refused,
+        vec![RefusedEntry {
+            at: t(400),
+            reason: NoEstimateReason::UnknownStage
+        }]
+    );
+}
+
+#[test]
+fn a_hold_at_the_merge_instant_is_no_entry() {
+    let at_merge = stages(&entries_of(27).cases);
+    assert_eq!(at_merge, vec![(100, Stage::ReviewWait, 0), (400, Stage::MergeWait, 0)]);
+    let before = stages(&entries_of(28).cases);
+    assert_eq!(before.last(), Some(&(1999, Stage::MergeHold, 0)));
+}
+
+#[test]
+fn a_same_instant_edit_is_one_transition_in_either_order() {
+    // The approval's add listed before the removal: still one `merge_wait`
+    // entry, never a contradictory `review-requested` + `pr` instant.
+    let h = merged(
+        29,
+        2000,
+        vec![
+            labeled(REVIEW_REQUESTED, 100),
+            labeled(APPROVED, 400),
+            unlabeled(REVIEW_REQUESTED, 400),
+            labeled(APPROVED, 500),
+            labeled("loom:sequenced", 600),
+        ],
+    );
+    let found = pr_case_entries(REPO, &h, Some(&[11])).unwrap();
+    assert_eq!(
+        stages(&found.cases),
+        vec![(100, Stage::ReviewWait, 0), (400, Stage::MergeWait, 0)]
+    );
+    assert!(found.refused.is_empty());
+}
+
+#[test]
+fn every_case_is_staged_as_the_tracker_would_serve_it() {
+    let mut histories = hold_histories();
+    histories.extend(records().iter().map(PrCaseRecord::history));
+    histories.push(two_lap_pr(30, Vec::new()));
+    for h in &histories {
+        assert_parity(h);
+    }
+}
+
+#[test]
+fn refused_entries_are_reported_by_reason_without_losing_usable_cases() {
+    let mut records: Vec<PrCaseRecord> = hold_histories()
+        .iter()
+        .map(|h| PrCaseRecord::from_history(REPO, h, Some(vec![11])))
+        .collect();
+    // Every entry refused: an excluded PR, its refusal still counted.
+    records.push(PrCaseRecord::from_history(
+        REPO,
+        &merged(31, 2000, vec![labeled(BLOCKED, 100), labeled(REVIEW_REQUESTED, 100)]),
+        Some(vec![11]),
+    ));
+    let (cases, summary) = cases_from_pr_records(&records);
+    assert_eq!(summary.prs, 9);
+    assert_eq!(summary.contributing, 8);
+    assert_eq!(summary.cases, cases.len());
+    let excluded: BTreeMap<String, usize> =
+        [("no_usable_entry".to_string(), 1)].into_iter().collect();
+    assert_eq!(summary.excluded, excluded);
+    // #22: 1, #24: 1, #25: 3, #31: 1 blocked; #26: 1 unknown_stage.
+    let refused: BTreeMap<String, usize> = [("blocked", 6), ("unknown_stage", 1)]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    assert_eq!(summary.refused_entries, refused);
+    assert_eq!(
+        cases_from_pr_history(REPO, &records[8].history(), Some(&[11])),
+        Err(PrCaseExclusion::NoUsableEntry)
+    );
+}
+
+#[test]
+fn later_events_never_move_an_earlier_hold_cases_inputs() {
+    let base = pr_case_entries(REPO, &blocked_lap_pr(), Some(&[11])).unwrap();
+    let mut h = blocked_lap_pr();
+    // A hold, a release and a second rejection, all after t(950).
+    let mut events = h.events.clone();
+    events.retain(|e| !matches!(e, PrEvent::Merged { .. }));
+    events.extend([
+        labeled(OPERATOR, 1000),
+        unlabeled(OPERATOR, 1200),
+        unlabeled(APPROVED, 1300),
+        labeled(CHANGES_REQUESTED, 1300),
+    ]);
+    h = merged(h.number, 3000, events);
+    let perturbed = pr_case_entries(REPO, &h, Some(&[11])).unwrap();
+    for case in base.cases.iter().filter(|c| c.as_of < t(950)) {
+        assert!(perturbed.cases.contains(case), "{case:?} moved");
+    }
+    for refused in &base.refused {
+        assert!(perturbed.refused.contains(refused), "{refused:?} moved");
+    }
+    let last = perturbed.cases.last().unwrap();
+    assert_eq!((last.stage, last.rework_rounds), (Stage::Doctor, 1));
+    assert!(perturbed.cases.iter().all(|c| c.as_of < c.actual_at));
 }

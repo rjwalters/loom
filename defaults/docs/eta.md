@@ -1137,8 +1137,12 @@ accepts `--repo-root PATH` (default: the current directory).
   [--pr-limit N] [--save-pr-history PATH]` adds `land` cases from merged PRs'
   label timelines, deduplicated against sweep-derived ones, with excluded PRs
   (open, closed unmerged, incomplete timeline, missing/ambiguous closing
-  issue) reported by reason on stderr (#9579). Without either flag the
-  backtest makes no forge call.
+  issue) reported by reason on stderr (#9579). Each case's stage is
+  `stage_from_pr_labels` over the labels in force at its entry, so an
+  operator-held approval replays as `merge_hold` and its release as
+  `merge_wait`; entries the resolver refuses (`blocked`, `unknown_stage`)
+  yield no case and are reported as refused entries (#10305). Without either
+  flag the backtest makes no forge call.
 - **`loom-daemon eta view OWNER/NAME#ISSUE [--explain] [--json]`** — the
   current estimate(s) for one issue (#9327). State resolution, in order:
   1. An **open linked PR**: its review labels
