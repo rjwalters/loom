@@ -36,6 +36,7 @@
 //! plan).
 
 pub mod accounting;
+pub mod api_kind;
 mod outcome;
 pub mod resolver;
 pub mod telemetry;

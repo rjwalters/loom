@@ -117,9 +117,9 @@ impl Outcome {
     ];
 }
 
-/// Which GitHub API surface an invocation uses (#10282): `graphql` for
-/// `gh api graphql` and for the porcelain commands that are GraphQL-backed
-/// (`gh issue|pr|project|label ...`, `gh search`), else `rest`.
+/// Which GitHub API surface an invocation uses (#10282): `rest`, `graphql`,
+/// `mixed` (known to use both) or `unknown` — classified per subcommand by
+/// [`super::api_kind::classify`].
 #[must_use]
 pub fn github_api_kind(inv: &GhInvocation) -> &'static str {
     let args: Vec<String> = inv
@@ -127,22 +127,7 @@ pub fn github_api_kind(inv: &GhInvocation) -> &'static str {
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    api_kind_for_args(&args)
-}
-
-fn api_kind_for_args(args: &[String]) -> &'static str {
-    let first = args.first().map(String::as_str);
-    match first {
-        Some("api") => {
-            if args.get(1).map(String::as_str) == Some("graphql") {
-                "graphql"
-            } else {
-                "rest"
-            }
-        }
-        Some("issue" | "pr" | "project" | "label" | "search" | "repo" | "release") => "graphql",
-        _ => "rest",
-    }
+    super::api_kind::classify(&args).as_str()
 }
 
 /// The `(outcome, exit code)` of a captured run.

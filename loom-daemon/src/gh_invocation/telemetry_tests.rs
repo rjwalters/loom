@@ -271,16 +271,23 @@ fn every_span_attribute_survives_export_bounding() {
 }
 
 #[test]
-fn spans_carry_github_api_rest_or_graphql() {
+fn spans_carry_github_api_kind() {
     let rest = read_op().args(["api", "repos/acme/widgets/issues"]);
     let gql = read_op().args(["api", "graphql", "-f", "query=x"]);
     let porcelain = read_op().args(["pr", "list"]);
     let run_list = read_op().args(["run", "list"]);
+    // #10344 review: REST porcelain that was mislabelled `graphql`.
+    let latest_release = read_op().args(["release", "view", "--json", "tagName"]);
+    let search = read_op().args(["search", "prs", "is:open"]);
+    let tagged_release = read_op().args(["release", "view", "v1.0.0"]);
     for (inv, want) in [
         (rest, "rest"),
         (gql, "graphql"),
         (porcelain, "graphql"),
         (run_list, "rest"),
+        (latest_release, "rest"),
+        (search, "rest"),
+        (tagged_release, "mixed"),
     ] {
         let (_, spans, _) = run(inv, "echo ok");
         assert_eq!(attr(&spans[0], "github.api"), Some(want));
