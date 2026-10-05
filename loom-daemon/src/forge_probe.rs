@@ -184,7 +184,13 @@ impl ProbeHttp for LiveHttp {
         }
         let mut child = cmd.spawn().map_err(|e| format!("spawn curl: {e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(format!("Authorization: token {token}\n").as_bytes());
+            let mut headers = format!("Authorization: token {token}\n");
+            if body.is_some() {
+                // curl's --data-binary defaults to form-urlencoded, which
+                // Gitea's binder routes to the form decoder, not JSON.
+                headers.push_str("Content-Type: application/json\n");
+            }
+            let _ = stdin.write_all(headers.as_bytes());
         }
         let output = child
             .wait_with_output()
@@ -926,5 +932,57 @@ mod tests {
         let cfg = cfg(true);
         assert!(issue_title(&cfg, "issue-create").starts_with("loomp-loomp-testrun:"));
         assert!(issue_title(&cfg, "issue-create").contains("issue-create"));
+    }
+
+    #[test]
+    fn live_http_sends_json_bodies_with_a_json_content_type() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = conn.read(&mut chunk).unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let want = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= want || n == 0 {
+                        break;
+                    }
+                } else if n == 0 {
+                    break;
+                }
+            }
+            conn.write_all(
+                b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .unwrap();
+            String::from_utf8_lossy(&buf).to_string()
+        });
+        let http = LiveHttp {
+            origin: format!("http://127.0.0.1:{port}"),
+            timeout: Duration::from_secs(5),
+        };
+        let payload = r#"{"title":"loomp-review: issue-create","body":"disposable"}"#;
+        let (code, _) = http
+            .request("POST", "repos/o/r/issues", "faketoken", Some(payload))
+            .unwrap();
+        assert_eq!(code, 201);
+        let raw = server.join().unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        let head = head.to_ascii_lowercase();
+        assert!(head.contains("content-type: application/json"), "headers: {head}");
+        let decoded: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(decoded["title"], "loomp-review: issue-create");
     }
 }
