@@ -413,10 +413,30 @@ pub fn spec_for(component: &str) -> Option<&'static CheckSpec<'static>> {
 /// [`unknown_check_reason`] then turns into a refusal (fail closed).
 #[must_use]
 pub fn specs_for(context: &str) -> Option<Vec<&'static CheckSpec<'static>>> {
-    match REQUIRED_CHECKS.iter().find(|r| r.context == context) {
-        Some(req) => req.components.iter().map(|c| spec_for(c)).collect(),
+    match required_check(context) {
+        Some(req) => {
+            // An aggregate (#10444) is its own components plus every component
+            // of each context it aggregates — the OR of the verdicts it folds.
+            let mut specs: Vec<&'static CheckSpec<'static>> = req
+                .components
+                .iter()
+                .map(|c| spec_for(c))
+                .collect::<Option<_>>()?;
+            for agg in req.aggregates {
+                for c in required_check(agg)?.components {
+                    specs.push(spec_for(c)?);
+                }
+            }
+            Some(specs)
+        }
         None => spec_for(context).map(|s| vec![s]),
     }
+}
+
+/// The [`REQUIRED_CHECKS`] entry for `context`, or `None`.
+#[must_use]
+pub fn required_check(context: &str) -> Option<&'static RequiredCheck> {
+    REQUIRED_CHECKS.iter().find(|r| r.context == context)
 }
 
 /// [`stale_reason_scoped`] for a required context made of `components`: the
@@ -480,6 +500,7 @@ pub const REQUIRED_CONTEXTS: &[&str] = &[
     "Structural Checks",
     "Shell Syntax (macos-latest)",
     "Daemon Checks",
+    "CI Result",
 ];
 
 /// One required context and the component checks its job runs as steps.
@@ -502,6 +523,13 @@ pub struct RequiredCheck {
     pub context: &'static str,
     /// The [`CheckSpec::context`] names of the gates this job runs.
     pub components: &'static [&'static str],
+    /// Other required contexts whose jobs this one aggregates through
+    /// `needs:` (#10444's `CI Result`). Their components are judged as part of
+    /// this context too ([`specs_for`]) — the aggregate's verdict is theirs
+    /// OR'd with its own components' — and their jobs' `ci.yml` blocks stay
+    /// attributed to those components rather than to this context's own
+    /// ([`super::workflow_scope`]). Empty for an ordinary job.
+    pub aggregates: &'static [&'static str],
 }
 
 /// Required context → component gates. See [`RequiredCheck`].
@@ -526,10 +554,12 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
             "PRs Must Not Hand-Edit Version-Bearing Files",
             "Shell Syntax (ubuntu-latest)",
         ],
+        aggregates: &[],
     },
     RequiredCheck {
         context: "Shell Syntax (macos-latest)",
         components: &["Shell Syntax (macos-latest)"],
+        aggregates: &[],
     },
     RequiredCheck {
         context: "Daemon Checks",
@@ -538,6 +568,20 @@ pub const REQUIRED_CHECKS: &[RequiredCheck] = &[
             ".gitignore Convergence Check",
             "Secret Scan",
             "MCP Guard Wiring Contract",
+        ],
+        aggregates: &[],
+    },
+    // The always-run aggregate (#10444): it fails when any job it `needs:`
+    // failed or was cancelled. Its own component covers the gate script and
+    // every job no other required context runs; the three required contexts
+    // it also aggregates contribute their components unchanged.
+    RequiredCheck {
+        context: "CI Result",
+        components: &["CI Result"],
+        aggregates: &[
+            "Structural Checks",
+            "Shell Syntax (macos-latest)",
+            "Daemon Checks",
         ],
     },
 ];
@@ -881,6 +925,77 @@ pub const SPECS: &[CheckSpec<'static>] = &[
         coupled: &[],
         removal_sensitive: false,
     },
+    // `CI Result`'s own component (#10444): the gate script plus the inputs of
+    // every job it `needs:` that no other required context runs — the Rust
+    // build/lint/test jobs, `node-packages`, the installer/codex/dep suites,
+    // `shell-suite-tests`, `install-surface-checks`, `repo-hygiene` and the
+    // image smokes. All global: a Rust or shell suite's verdict can hinge on
+    // any file it compiles or reads, so any interaction refuses.
+    CheckSpec {
+        context: "CI Result",
+        global: CI_RESULT_GLOBAL,
+        scanned: &[],
+        coupled: &[],
+        removal_sensitive: false,
+    },
+];
+
+/// `CI Result`'s own `G`: the union of `ci.yml`'s `changes` path filters
+/// (`backend`, `mcp`, `docker`, `scripts` — the paths those jobs are declared
+/// to read) widened to every tracked code/config tree, plus the root files a
+/// suite reads (`CLAUDE.md` via the premise-false suite, `VERSION`).
+///
+/// Deliberately absent, because no aggregated job reads them: `README.md`,
+/// `CONTRIBUTING.md`, `SECURITY.md`, `LICENSE`, `WORK_LOG.md`, `WORK_PLAN.md`,
+/// `docs/**`, `assets/**`, `.vscode/**` and the editor/bot dotfiles. The
+/// markdown among them is still judged by the `Structural Checks` components
+/// (`Dangling Link Check`, `Conflict Marker Check`, …) this aggregate composes.
+/// So an edit to `README.md` on `main` does not, on its own, refuse every PR.
+const CI_RESULT_GLOBAL: &[&str] = &[
+    "scripts/ci-result-gate.sh",
+    CI_WORKFLOW,
+    ".github/**",
+    // backend
+    "loom-daemon/**",
+    "loom-api/**",
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    "rustfmt.toml",
+    "deny.toml",
+    ".cargo/**",
+    ".config/**",
+    // mcp / node
+    "mcp-loom/**",
+    "package.json",
+    "pnpm-lock.yaml",
+    "**/package.json",
+    // docker
+    "docker/**",
+    ".dockerignore",
+    // scripts, installer, install surface, shell suites
+    "scripts/**",
+    "defaults/**",
+    "tests/**",
+    "install.sh",
+    ".loom/**",
+    ".claude/**",
+    ".agents/**",
+    ".githooks/**",
+    ".repo/**",
+    "quickstarts/**",
+    "examples/**",
+    "**/*.sh",
+    "**/*.rs",
+    "**/*.ts",
+    "VERSION",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    ".gitignore",
+    ".gitattributes",
+    ".shellcheckrc",
+    ".env.example",
 ];
 
 /// Shared by both `Shell Syntax` matrix legs, which run identical steps.
@@ -952,3 +1067,6 @@ mod tests;
 
 #[cfg(test)]
 mod daemon_surface_tests;
+
+#[cfg(test)]
+mod aggregate_tests;
