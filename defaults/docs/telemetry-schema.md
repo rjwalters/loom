@@ -2546,10 +2546,12 @@ truthfully says "nothing in flight here".
 **Anchors and deltas.** The first pass of a daemon process sends a full
 **anchor** (`anchor: true`, every row), and so does any pass at which the last
 anchor is at least 3600 s old. Between anchors a pass sends a **delta**
-(`anchor: false`) only if rows, a census or the plan slots changed. A delta
+(`anchor: false`) only if rows, a census, the plan slots or `rows_truncated`
+changed. A delta
 holds the added or changed rows, the issues that left (`removed`), and the
 **full** census of each repo it names. A pass with no change sends nothing. The
-change test ignores `census_at` and `rows_truncated`.
+change test ignores `census_at`. A delta sent only because `rows_truncated`
+moved has an empty `repos`.
 
 | Field | Type | Notes |
 |---|---|---|

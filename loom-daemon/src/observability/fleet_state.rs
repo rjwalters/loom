@@ -181,9 +181,10 @@ fn repo_entry(repo: &str, census: Option<FleetPrCensus>) -> FleetStateRepo {
 /// `None` when nothing changed and no anchor is due. Every repo is tagged
 /// [`RepoVisibility::Private`] until the caller resolves it. Pure.
 ///
-/// The change test ignores `census_at`, which advances every pass, and
-/// `rows_truncated`, which is a count rather than state. Both are still
-/// carried on every record that is sent.
+/// The change test ignores `census_at`, which advances every pass; it is
+/// still carried on every record that is sent. A change in `rows_truncated`
+/// does count: it distinguishes complete from partial state on replay, so a
+/// delta (possibly with an empty `repos`) is sent when it moves.
 #[must_use]
 pub fn decide(
     view: &FleetView,
@@ -243,7 +244,10 @@ pub fn decide(
             ..repo_entry(repo, now_state.census.clone())
         });
     }
-    if repos.is_empty() && view.slots == last.view.slots {
+    if repos.is_empty()
+        && view.slots == last.view.slots
+        && view.rows_truncated == last.view.rows_truncated
+    {
         return None;
     }
     Some(header(false, last.anchor_as_of, Some(last.as_of), repos))

@@ -192,6 +192,38 @@ fn a_slot_change_alone_sends_a_delta() {
     assert_eq!(record.slots.unwrap().occupancy, Some(2));
 }
 
+fn ready_rows(count: u32) -> FleetInput {
+    let items = (0..count)
+        .map(|n| item(OTHER, n, Stage::ReadyWait, None))
+        .collect();
+    input(items, Vec::new())
+}
+
+#[test]
+fn crossing_the_cap_sends_a_delta_even_though_the_retained_rows_are_unchanged() {
+    let last = emitted(&ready_rows(MAX_ROWS as u32), t0(), t0());
+    let next = build_view(&ready_rows(MAX_ROWS as u32 + 1), &BTreeSet::new());
+    let record = decide(&next, Some(&last), t0() + Duration::minutes(5)).unwrap();
+    assert!(!record.anchor && record.repos.is_empty());
+    assert_eq!(record.rows_truncated, 1);
+}
+
+#[test]
+fn dropping_back_under_the_cap_sends_a_delta_clearing_the_truncation() {
+    let last = emitted(&ready_rows(MAX_ROWS as u32 + 1), t0(), t0());
+    let next = build_view(&ready_rows(MAX_ROWS as u32), &BTreeSet::new());
+    let record = decide(&next, Some(&last), t0() + Duration::minutes(5)).unwrap();
+    assert!(!record.anchor && record.repos.is_empty());
+    assert_eq!(record.rows_truncated, 0);
+}
+
+#[test]
+fn an_unchanged_truncation_count_still_sends_nothing() {
+    let last = emitted(&ready_rows(MAX_ROWS as u32 + 1), t0(), t0());
+    let next = build_view(&ready_rows(MAX_ROWS as u32 + 1), &BTreeSet::new());
+    assert!(decide(&next, Some(&last), t0() + Duration::minutes(5)).is_none());
+}
+
 #[test]
 fn a_repo_that_vanishes_is_removed_whole() {
     let last = emitted(&base(), t0(), t0());
