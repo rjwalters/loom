@@ -178,12 +178,22 @@ pub(crate) fn is_sole_claimant(in_window: &[&LeaseComment], host: &str, sweep_id
         .all(|c| c.host == host && c.sweep_id == sweep_id)
 }
 
+/// Slack (Issue #10337) absorbing the resolution mismatch between GitHub's
+/// 1-second timeline `created_at` and this dispatcher's sub-second local
+/// `episode_start`, plus small host-vs-forge clock skew. A label event younger
+/// than this relative to `episode_start` is treated as this dispatcher's own
+/// flip, never as a foreign claim. Without it, an own flip landing in the same
+/// wall-second as `episode_start` reads as `labeled_at < episode_start` and the
+/// dispatcher yields to itself, orphaning the issue at `loom:building`.
+pub(crate) const OWN_FLIP_CLOCK_SLACK_SECS: i64 = 2;
+
 /// Whether a `labeled loom:building` event at `labeled_at` is a **live foreign**
 /// claim relative to a dispatch attempt whose episode began at `episode_start`
 /// (Issue #9453 Phase 3.1). Pure, so the two properties it encodes can be
 /// pinned without a `gh` fixture:
 ///
-/// - **Foreign**: strictly OLDER than `episode_start`. This dispatcher captures
+/// - **Foreign**: OLDER than `episode_start` by at least
+///   [`OWN_FLIP_CLOCK_SLACK_SECS`] (#10337: the forge truncates to whole seconds). This dispatcher captures
 ///   `episode_start` immediately *before* its own label flip, so the event its
 ///   own flip creates is always newer — without this leg every uncontested
 ///   dispatch would yield to itself. (When the label was already present, the
@@ -197,8 +207,9 @@ pub(crate) fn claim_label_is_live_foreign(
     labeled_at: DateTime<Utc>,
     episode_start: DateTime<Utc>,
 ) -> bool {
-    labeled_at < episode_start
-        && episode_start - labeled_at <= chrono::Duration::seconds(LEASELESS_CLAIM_LABEL_GRACE_SECS)
+    let age = episode_start - labeled_at;
+    age >= chrono::Duration::seconds(OWN_FLIP_CLOCK_SLACK_SECS)
+        && age <= chrono::Duration::seconds(LEASELESS_CLAIM_LABEL_GRACE_SECS)
 }
 
 impl LeaseOrderDecision {

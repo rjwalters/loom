@@ -231,10 +231,10 @@ fn claim_label_is_live_foreign_ignores_this_dispatchers_own_flip() {
     );
     assert!(
         !claim_label_is_live_foreign(episode_start, episode_start),
-        "the boundary is strict: only an event strictly older than the episode start is foreign"
+        "an event at the episode start is this attempt's own flip, not foreign (older-by-slack is the foreign threshold)"
     );
     assert!(
-        claim_label_is_live_foreign(episode_start - chrono::Duration::seconds(1), episode_start),
+        claim_label_is_live_foreign(episode_start - chrono::Duration::seconds(2), episode_start),
         "an event predating the episode start, inside the grace, is a live foreign claim"
     );
     assert!(
@@ -296,5 +296,28 @@ fn yield_identity_maps_each_variant_onto_the_dispatch_shape() {
         }
         .yield_identity(),
         Some(("peer-host".to_string(), "sweep-peer".to_string()))
+    );
+}
+
+/// Issue #10337 regression: the forge reports `created_at` truncated to whole
+/// seconds while `episode_start` is sub-second, so this dispatcher's own flip
+/// in the same wall-second read as "older" and it yielded to itself.
+#[test]
+fn claim_label_is_live_foreign_ignores_same_second_truncated_own_flip() {
+    use chrono::TimeZone;
+    let episode_start =
+        Utc.with_ymd_and_hms(2026, 10, 5, 0, 40, 26).unwrap() + chrono::Duration::milliseconds(800);
+    let truncated = Utc.with_ymd_and_hms(2026, 10, 5, 0, 40, 26).unwrap();
+    assert!(
+        !claim_label_is_live_foreign(truncated, episode_start),
+        "own flip truncated to the same second must not be foreign"
+    );
+    assert!(
+        !claim_label_is_live_foreign(truncated - chrono::Duration::seconds(1), episode_start),
+        "within clock slack is still own"
+    );
+    assert!(
+        claim_label_is_live_foreign(truncated - chrono::Duration::seconds(5), episode_start),
+        "a genuinely older young label is still foreign"
     );
 }

@@ -273,6 +273,12 @@ fn set_preflip_labels(ws: &Path, labels: &[&str]) {
 /// on). Patched in place for the same reason `set_preflip_labels` is — keeping
 /// `test_support.rs`, which is over the file-size ratchet, untouched.
 fn set_claim_labeled_at(ws: &Path, secs_ago: i64) {
+    set_claim_labeled_at_ts(ws, Utc::now() - chrono::Duration::seconds(secs_ago));
+}
+
+/// [`set_claim_labeled_at`] with an explicit event timestamp, for cases that
+/// must control the sub-second part (the forge truncates to whole seconds).
+fn set_claim_labeled_at_ts(ws: &Path, labeled_at: chrono::DateTime<Utc>) {
     let fake_gh = ws.join("fake-gh.sh");
     let script = std::fs::read_to_string(&fake_gh).unwrap();
     let generic = "if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then";
@@ -286,7 +292,7 @@ fn set_claim_labeled_at(ws: &Path, secs_ago: i64) {
          exit 0\n\
          fi\n\
          {generic}",
-        ts = (Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339(),
+        ts = labeled_at.to_rfc3339(),
     );
     std::fs::write(&fake_gh, script.replacen(generic, &arm, 1)).unwrap();
 }
@@ -394,6 +400,39 @@ fn dispatch_proceeds_past_a_leaseless_building_label_older_than_the_grace() {
     assert!(
         !gh_calls.contains("loom:lease-yield"),
         "no standdown may be posted for a claim label past the grace; gh log: {gh_calls}"
+    );
+}
+
+/// **The #10337 regression, end to end.** This dispatcher flips `loom:building`
+/// itself and holds no prior lease; the forge's timeline reports that flip
+/// truncated to the whole second, so it reads as up to a second OLDER than the
+/// lease episode that began just before it. That must not be mistaken for a
+/// foreign claim: dispatch has to spawn the builder, keep a live sweep, and
+/// post no lease yield. The genuine-foreign case stays covered by
+/// [`dispatch_yields_to_a_young_leaseless_foreign_building_claim`].
+#[test]
+#[serial]
+fn dispatch_proceeds_past_its_own_same_second_truncated_building_flip() {
+    use chrono::Timelike;
+    let dir = tempdir().unwrap();
+    let (mut registry, gh_log, spawn_log, _store) = lease_order_dispatch_registry(dir.path(), &[]);
+    let now = Utc::now();
+    let truncated = now.with_nanosecond(0).unwrap();
+    set_claim_labeled_at_ts(dir.path(), truncated);
+
+    let outcome = registry
+        .dispatch(&SweepKind::Issue(10337), None, None, None, None)
+        .expect("this dispatcher's own same-second `loom:building` flip must not refuse it");
+    assert!(outcome.was_new);
+    assert!(
+        wait_for_contents(&spawn_log, "spawned", FIXTURE_CHILD_WAIT_MS),
+        "the builder must spawn when the only label event is this dispatcher's own flip"
+    );
+    assert_eq!(registry.len(), 1, "the dispatched sweep must be retained as live");
+    let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(
+        !gh_calls.contains("loom:lease-yield"),
+        "no lease yield may be emitted for this dispatcher's own flip; gh log: {gh_calls}"
     );
 }
 
