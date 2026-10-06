@@ -1,17 +1,21 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! W5: every daemon `--paginate` site is page-counted, or is listed here
-//! with the reason it is not.
+//! W5: every daemon `--paginate` site is walkable when the switch is on,
+//! or is listed here with the reason it is not.
 //!
-//! `gh api --paginate` is one process but one request **per page**. The
-//! facade walks a REST `--paginate` read page by page (`super::paged`), one
-//! ledger row each — but only for an argv it fully understands, and only for
-//! a call that goes through the facade at all. This lint reads every
-//! `"--paginate"` literal in the daemon's non-test source and fails on one
-//! that is neither:
+//! `gh api --paginate` is one process but one request **per page**. With
+//! `LOOM_GH_PAGE_WALK=1` the facade walks a REST `--paginate` read page by
+//! page (`super::paged`), one ledger row each — but only for an argv it
+//! fully understands, and only for a call that goes through the facade at
+//! all. The walk is **off by default**, so this lint does not say a site's
+//! pages are counted today: it says they *would be* the moment the switch is
+//! on, which is what makes the one-host validation of the switch cover every
+//! site. It reads every `"--paginate"` literal in the daemon's non-test
+//! source and fails on one that is neither:
 //!
-//! - **walked** — in a file that builds through the facade, in a statement
-//!   whose flags are all ones the walk carries (or `--include`, whose own
-//!   status blocks are counted), with no `graphql` endpoint and no raw spawn;
+//! - **walkable when the switch is on** — in a file that builds through the
+//!   facade, in a statement whose flags are all ones the walk carries (or
+//!   `--include`, whose own status blocks are counted with or without the
+//!   switch), with no `graphql` endpoint and no raw spawn;
 //! - **listed** in [`UNCOUNTED`] with a reason and the exact number of
 //!   literals the file holds, so a second site in a listed file is a failure
 //!   too, and an entry that no longer matches must be removed.
@@ -25,9 +29,10 @@ use crate::types::ForgeCallCounts;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-/// `(file, "--paginate" literals in it, why they are not page-counted)`.
-/// Adding an entry is a decision to leave pages uncounted: prefer routing
-/// the read through `GhInvocation` with a walkable argv.
+/// `(file, "--paginate" literals in it, why they are not walkable)`.
+/// Adding an entry is a decision to leave pages uncounted even with the
+/// switch on: prefer routing the read through `GhInvocation` with a
+/// walkable argv.
 const UNCOUNTED: &[(&str, usize, &str)] = &[
     (
         "premise_check/cli.rs",
@@ -111,7 +116,8 @@ fn code_lines(text: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Why the `--paginate` literal on line `n` is not a walked site, if it is not.
+/// Why the `--paginate` literal on line `n` is not a site the walk takes
+/// when the switch is on, if it is not.
 fn site_problem(lines: &[&str], n: usize, facade: bool) -> Option<String> {
     // The statement: back to the line naming the `api` subcommand, forward
     // to the end of the statement, each at most 8 lines away.
@@ -207,15 +213,16 @@ fn daemon_sources() -> Vec<(String, String)> {
 }
 
 #[test]
-fn every_daemon_paginate_site_is_page_counted_or_listed_with_a_reason() {
+fn every_daemon_paginate_site_is_walkable_when_the_switch_is_on_or_listed_with_a_reason() {
     let files = daemon_sources();
     assert!(files.len() > 100, "the scan found only {} files", files.len());
     let problems = lint(&files, UNCOUNTED);
     assert!(
         problems.is_empty(),
-        "a `gh api --paginate` call is charged one request per page (W5). Route it through \
-         `GhInvocation` with an argv the page walk takes (see `gh_invocation/paged.rs`), or list \
-         it in UNCOUNTED with the reason its pages cannot be counted:\n  {}",
+        "a `--paginate` read is charged one request per page (W5). Route it through \
+         `GhInvocation` with an argv the page walk takes when `LOOM_GH_PAGE_WALK=1` (see \
+         `gh_invocation/paged.rs`), or list it in UNCOUNTED with the reason its pages cannot be \
+         counted:\n  {}",
         problems.join("\n  ")
     );
 }
@@ -283,7 +290,7 @@ fn listing(root: &Path) -> CmdOutcome {
     assert!(problems.len() == 1 && problems[0].contains("gh facade"), "{problems:?}");
 
     // A comment is not a site.
-    let prose = "// `gh api --paginate` and \"--paginate\" in prose\nfn f() {}\n";
+    let prose = "// a `--paginate` read and \"--paginate\" in prose\nfn f() {}\n";
     assert_eq!(lint(&file("new/prose.rs", prose), &[]), Vec::<String>::new());
 }
 
@@ -309,7 +316,8 @@ fn the_allowlist_is_exact_and_cannot_go_stale() {
     assert!(problems.len() == 1 && problems[0].contains("real reason"), "{problems:?}");
 }
 
-// ---- a migrated site end to end: one row per page ----
+// ---- a migrated site end to end: one row per page with the switch on,
+// ---- one row with it off ----
 
 fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
@@ -318,37 +326,64 @@ fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
-fn rows_after(body: impl FnOnce()) -> Vec<ForgeCallCounts> {
+fn rows_after(switch: Option<&str>, body: impl FnOnce()) -> Vec<ForgeCallCounts> {
     let sink = tempfile::tempdir().unwrap();
     forge_call_stats::set_test_sink_dir(Some(sink.path().to_path_buf()));
+    super::paged::set_test_walk(switch);
     body();
+    super::paged::set_test_walk(None);
     let report = forge_call_stats::status_report(chrono::Utc::now(), None);
     forge_call_stats::set_test_sink_dir(None);
     report.host_window.unwrap_or_default()
 }
 
-#[test]
-#[serial_test::serial]
-fn a_two_page_comment_read_is_two_counted_rows() {
+/// `fetch_trusted_bodies` against a two-page listing; returns the bodies it
+/// read, the `sequence.trusted_bodies` calls booked, and every argv.
+fn two_page_comment_read(switch: Option<&str>) -> (Option<Vec<String>>, u64, String) {
     use crate::merge_pr::sequence::fetch_trusted_bodies;
     let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("argv.log");
     let gh = stub(
         tmp.path(),
         "gh-two",
-        "case \"$*\" in\n\
-         *'page=2'*) printf 'HTTP/2.0 200 OK\\r\\n\\r\\n[]' ;;\n\
-         *) printf 'HTTP/2.0 200 OK\\r\\nLink: <https://api.github.com/repositories/1/issues/7/comments?per_page=100&page=2>; rel=\"next\"\\r\\n\\r\\n[]' ;;\n\
-         esac",
+        &format!(
+            "printf '%s\\n' \"$*\" >> '{}'\n\
+             case \"$*\" in\n\
+             *--paginate*) printf '[]' ;;\n\
+             *'page=2'*) printf 'HTTP/2.0 200 OK\\r\\n\\r\\n[]' ;;\n\
+             *) printf 'HTTP/2.0 200 OK\\r\\nLink: <https://api.github.com/repositories/1/issues/7/comments?per_page=100&page=2>; rel=\"next\"\\r\\n\\r\\n[]' ;;\n\
+             esac",
+            log.display()
+        ),
     );
     let mut bodies = None;
-    let rows = rows_after(|| {
-        bodies = Some(fetch_trusted_bodies(&gh.to_string_lossy(), tmp.path(), "o/r", 7));
+    let rows = rows_after(switch, || {
+        bodies = fetch_trusted_bodies(&gh.to_string_lossy(), tmp.path(), "o/r", 7);
     });
-    assert_eq!(bodies, Some(Some(vec![])), "two empty pages merge into one empty listing");
     let calls: u64 = rows
         .iter()
         .filter(|r| r.caller == "sequence.trusted_bodies")
         .map(|r| r.ok + r.error)
         .sum();
-    assert_eq!(calls, 2, "{rows:?}");
+    (bodies, calls, std::fs::read_to_string(&log).unwrap_or_default())
+}
+
+#[test]
+#[serial_test::serial]
+fn a_two_page_comment_read_is_two_counted_rows_with_the_switch_on() {
+    let (bodies, calls, argv) = two_page_comment_read(Some("1"));
+    assert_eq!(bodies, Some(vec![]), "two empty pages merge into one empty listing");
+    assert_eq!(calls, 2, "{argv}");
+    assert_eq!(argv.lines().count(), 2, "{argv}");
+    assert!(argv.lines().all(|l| l.contains("--include")), "{argv}");
+}
+
+#[test]
+#[serial_test::serial]
+fn the_same_read_is_one_paginate_call_by_default() {
+    let (bodies, calls, argv) = two_page_comment_read(None);
+    assert_eq!(bodies, Some(vec![]));
+    assert_eq!(calls, 1, "{argv}");
+    assert_eq!(argv.lines().count(), 1, "{argv}");
+    assert!(argv.contains("--paginate") && !argv.contains("--include"), "{argv}");
 }

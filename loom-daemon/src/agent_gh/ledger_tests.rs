@@ -242,3 +242,52 @@ fn a_booked_row_rolls_up_by_bucket_and_by_role() {
     let callers = by(GroupBy::Caller);
     assert_eq!(charged(&callers, &["agent.gh.pr"]), Some(1), "{callers:?}");
 }
+
+// ===== the checkout read is bounded =====
+
+fn fake_git(dir: &Path, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("git");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn the_remote_read_names_the_origin_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = fake_git(
+        tmp.path(),
+        "[ \"$*\" = 'remote get-url origin' ] && echo 'git@github.com:acme/app.git'",
+    );
+    assert_eq!(
+        bounded_remote(&git, tmp.path(), Duration::from_secs(20)).as_deref(),
+        Some("acme/app")
+    );
+    // No origin, an unparseable URL, no git at all: no repository, no error.
+    let none = fake_git(tmp.path(), "exit 2");
+    assert_eq!(bounded_remote(&none, tmp.path(), Duration::from_secs(20)), None);
+    let odd = fake_git(tmp.path(), "echo 'not a url'");
+    assert_eq!(bounded_remote(&odd, tmp.path(), Duration::from_secs(20)), None);
+    let missing = tmp.path().join("no-such-git");
+    assert_eq!(
+        bounded_remote(&missing.to_string_lossy(), tmp.path(), Duration::from_secs(20)),
+        None
+    );
+}
+
+#[test]
+fn a_git_that_never_answers_costs_the_budget_and_no_more() {
+    // The front is about to exec the agent's real `gh`: a wedged checkout
+    // may cost the row its repository, never the call its time.
+    let tmp = tempfile::tempdir().unwrap();
+    let git = fake_git(tmp.path(), "sleep 600");
+    let started = std::time::Instant::now();
+    assert_eq!(bounded_remote(&git, tmp.path(), Duration::from_millis(200)), None);
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the read was not bounded: {:?}",
+        started.elapsed()
+    );
+    assert!(REMOTE_BUDGET <= Duration::from_secs(1), "the production budget stays tight");
+}

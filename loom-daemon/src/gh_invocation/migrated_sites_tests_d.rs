@@ -83,6 +83,8 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "review_conflict.pr_comment",
         "roster.delete",
         "roster.patch",
+        "sequence.comment_patch",
+        "sequence.comment_delete",
         "guard.open_pr_timeline",
         "outcome.label_timeline",
         "guard.open_pr_graphql",
@@ -148,9 +150,8 @@ fn sequence_hold_reads_are_counted_and_page_at_100() {
     assert_eq!(op_calls(&operations, "comment.list"), 1, "{operations:?}");
     assert_eq!(op_calls(&operations, "pr.view-state"), 1, "{operations:?}");
     let argv = std::fs::read_to_string(&log).unwrap();
-    // W5: page 1 of the facade's page walk (`--paginate` at the site).
     assert!(
-        argv.contains("api repos/o/r/issues/7/comments?per_page=100 --include"),
+        argv.contains("api repos/o/r/issues/7/comments?per_page=100 --paginate"),
         "{argv}"
     );
 }

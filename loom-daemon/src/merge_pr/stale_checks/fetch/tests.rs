@@ -130,9 +130,7 @@ fn the_check_runs_request_asks_for_pagination_not_just_a_bigger_page() {
     fetch_check_runs(gh.to_str().unwrap(), "o/r", "deadbeef").unwrap();
     let argv = argv_of(dir.path());
     assert!(argv.contains("per_page=100"), "{argv}");
-    // W5: a `--paginate` site is walked page by page by the facade, whose
-    // page 1 is `api … --include`; a site without it would be a bare `api …`.
-    assert!(argv.contains(" --include"), "per_page alone only moves the cap: {argv}");
+    assert!(argv.contains("--paginate"), "per_page alone only moves the cap: {argv}");
     assert!(
         argv.contains("total_count"),
         "the projection must keep total_count so a short read is detectable: {argv}"

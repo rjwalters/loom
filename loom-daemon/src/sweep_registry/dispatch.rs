@@ -1895,19 +1895,21 @@ impl SweepRegistry {
         //     `WorkDispatcher::backed_off` before `dispatch()` (and this
         //     REST call) is even attempted again — see that method's doc
         //     comment for the full rationale.
+        //
+        //     W9: a resume never consults the memo (`dispatch_open_pr_memo`,
+        //     see `guards/refusal_memo.rs`), and the probe below is a
+        //     conditional read whose verdict comes from the body it serves.
         if !self.config.skip_label_flip {
-            if let Some(memo) = self.fresh_open_pr_memo(issue_number, Utc::now()) {
-                if resume_bypass_pr != Some(memo.pr) {
-                    self.record_open_pr_guard_backoff(issue_number);
-                    return Err(OpenPrDispatchError {
-                        issue: issue_number,
-                        pr: memo.pr,
-                    }
-                    .into());
+            if let Some(memo) = self.dispatch_open_pr_memo(issue_number, resume_bypass_pr) {
+                self.record_open_pr_guard_backoff(issue_number);
+                return Err(OpenPrDispatchError {
+                    issue: issue_number,
+                    pr: memo.pr,
                 }
+                .into());
             }
 
-            if self.issue_is_closed_or_pr(issue_number) == Some(true) {
+            if self.guard_closed_or_pr(issue_number) == Some(true) {
                 return Err(anyhow!(
                     "refusing to dispatch issue #{issue_number}: it is closed on the forge, or \
                      the number resolves to a pull request rather than an open issue (#4088/#4504 \
@@ -1963,7 +1965,9 @@ impl SweepRegistry {
             // Fail-open (#4452): only a VERIFIED `Open(pr)` blocks; both
             // `NoneOpen` and `ProbeFailed` fall through and proceed, so a forge
             // outage can never wedge dispatch (unchanged pre-#4452 behavior).
-            if let OpenPrProbe::Open(pr) = self.probe_open_linked_pr(issue_number) {
+            // W9: live (memo-free) for a resume — see `dispatch_open_pr_probe`.
+            let probe = self.dispatch_open_pr_probe(issue_number, resume_bypass_pr);
+            if let OpenPrProbe::Open(pr) = probe {
                 if resume_bypass_pr != Some(pr) {
                     // Issue #7606: a verified refusal here is exactly the
                     // same event the 2.5-position memo short-circuit above
@@ -2026,7 +2030,7 @@ impl SweepRegistry {
         let dispatch_labels = if self.config.skip_label_flip {
             None
         } else {
-            self.current_labels_via_rest(issue_number)
+            self.guard_issue_labels(issue_number)
         };
         if let Some(labels) = dispatch_labels.as_deref() {
             if let Some(label) = self.first_park_label_in(issue_number, labels) {

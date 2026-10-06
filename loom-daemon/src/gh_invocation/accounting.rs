@@ -13,12 +13,18 @@
 //!
 //! - A **spawn failure** and a **launcher routing refusal** are not recorded:
 //!   neither sent a request, so neither spent budget.
-//! - Every other completion is one row. A REST `--paginate` read is walked
-//!   page by page by the facade (W5, [`super::paged`]), so it is one row per
-//!   page. A `--paginate` execution the walk does not take (GraphQL, or
-//!   `LOOM_GH_PAGE_WALK=0`) is still one row although it may have issued
-//!   several requests: it carries its page count when `--include` exposes
-//!   it (`pg`), or flags it unknown (`pu`).
+//! - Every other completion is one row. A `--paginate` execution is still
+//!   one row although it may have issued several requests: it carries its
+//!   page count when `--include` exposes it (`pg`), or flags it unknown
+//!   (`pu`). That is the default. With the opt-in page walk on
+//!   (`LOOM_GH_PAGE_WALK=1`, W5, [`super::paged`] — off by default) the
+//!   facade walks a REST `--paginate` read page by page instead, so it is
+//!   one row per page, each carrying that page's status and `x-ratelimit-*`
+//!   reading (which also feeds [`crate::forge_bucket_book::observe`], as
+//!   every `--include` row's does); GraphQL cursor pagination stays one
+//!   `pu` row either way. To validate the walk on one host, compare the
+//!   per-site `gh` spawn counts and each bucket's `x-ratelimit-used` delta
+//!   against what the ledger charged.
 //! - `gh api rate_limit` is free on GitHub's side and is booked to
 //!   [`Pool::Other`] so it never inflates the core pool's "own" figure.
 //!

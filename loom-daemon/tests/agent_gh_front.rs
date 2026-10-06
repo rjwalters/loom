@@ -696,3 +696,82 @@ fn a_passthrough_is_one_ledger_row_under_the_sessions_role_and_bucket() {
     assert_eq!(bucket("core").as_deref(), Some("1"), "{by_bucket}");
     assert!(report("caller").contains("agent.gh.pr"));
 }
+
+/// W5: a session's `TMPDIR` is its own `<CLAUDE_CONFIG_DIR>/tmp`, which would
+/// move the default sink somewhere no host rollup reads. The spawner exports
+/// the host sink as `LOOM_FORGE_CALL_STATS_DIR`; with it, the front's row
+/// lands where the daemon's own `forge calls` finds it by default.
+#[test]
+fn a_session_row_lands_in_the_host_sink_not_under_the_session_tmpdir() {
+    let s = Sandbox::new();
+    // The daemon's world: its TMPDIR, and the sink that resolves from it.
+    let host_tmp = s.p("host-tmp");
+    let host_sink = host_tmp.join("loom-forge-call-stats");
+    // The session's world, as both spawn paths set it up.
+    let session_tmp = s.p("work/.loom/claude-config/builder-1/tmp");
+    std::fs::create_dir_all(&host_tmp).unwrap();
+    std::fs::create_dir_all(&session_tmp).unwrap();
+    let (host_tmp, host_sink_s, session_tmp_s) = (
+        host_tmp.display().to_string(),
+        host_sink.display().to_string(),
+        session_tmp.display().to_string(),
+    );
+    let rows_in = |dir: &Path| -> Vec<serde_json::Value> {
+        let mut rows = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if entry.file_name().to_string_lossy().starts_with("calls-") {
+                let text = std::fs::read_to_string(entry.path()).unwrap();
+                rows.extend(text.lines().map(|l| serde_json::from_str(l).unwrap()));
+            }
+        }
+        rows
+    };
+    let session_sink = session_tmp.join("loom-forge-call-stats");
+
+    // What the spawner exports: the host sink, and a BLANK booked marker —
+    // which must not stop a real agent call from being booked.
+    let exported = [
+        ("TMPDIR", session_tmp_s.as_str()),
+        ("LOOM_FORGE_CALL_STATS_DIR", host_sink_s.as_str()),
+        ("LOOM_GH_BOOKED", ""),
+        ("LOOM_ROLE", "builder"),
+        ("GH_TOKEN", ""),
+        ("GITHUB_TOKEN", ""),
+    ];
+    let out = s.gh(&["issue", "close", "1", "-R", "o/r"], &exported);
+    assert!(out.status.success(), "{out:?}");
+    let rows = rows_in(&host_sink);
+    assert_eq!(rows.len(), 1, "the row is in the host sink: {rows:?}");
+    assert_eq!(rows[0]["c"], "agent.gh.issue");
+    assert_eq!(rows[0]["ir"], "agent-builder");
+    assert!(rows_in(&session_sink).is_empty(), "nothing is written under the session TMPDIR");
+
+    // The host rollup, run as the daemon runs it — the daemon's TMPDIR, no
+    // override, no --sink-dir — counts it.
+    let mut report = s.command(
+        Path::new(env!("CARGO_BIN_EXE_loom-daemon")),
+        &["forge", "calls", "--since", "1h", "--by", "role"],
+        &[("TMPDIR", host_tmp.as_str())],
+    );
+    report.env_remove("LOOM_FORGE_CALL_STATS_DIR");
+    let report = report.output().unwrap();
+    assert!(report.status.success(), "{report:?}");
+    let text = stdout(&report);
+    let line = text
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some("agent-builder"))
+        .unwrap_or_else(|| panic!("no agent-builder row in the host rollup:\n{text}"));
+    assert_eq!(line.split_whitespace().nth(1), Some("1"), "{text}");
+
+    // The gap this closes: without the export the same call is booked under
+    // the session's private tmp, where that rollup never looks.
+    let mut bare = s.command(
+        &s.p("bin/gh"),
+        &["issue", "close", "2", "-R", "o/r"],
+        &[("TMPDIR", session_tmp_s.as_str()), ("LOOM_ROLE", "builder")],
+    );
+    bare.env_remove("LOOM_FORGE_CALL_STATS_DIR");
+    assert!(bare.output().unwrap().status.success());
+    assert_eq!(rows_in(&session_sink).len(), 1, "the unexported default follows TMPDIR");
+    assert_eq!(rows_in(&host_sink).len(), 1, "and the host sink did not see it");
+}

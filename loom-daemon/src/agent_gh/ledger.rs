@@ -29,18 +29,31 @@
 //!   path shape exactly as the facade reads its own
 //!   ([`crate::gh_invocation::accounting::cred_of_with`]).
 //!
-//! Booking is local I/O only (a memoised `git` remote read at most, one sink
-//! append) and can never fail or block the agent's call: the sink swallows
-//! its own errors and a panic here is caught.
+//! Booking is local I/O only and can never fail or hold up the agent's
+//! call: one sink append, and — only when neither the argv nor `GH_REPO`
+//! names the repository — one local `git remote get-url origin`, killed
+//! after [`REMOTE_BUDGET`] ([`bounded_remote`]). This process is about to be
+//! replaced by the real `gh`, so nothing is memoised and nothing may wait: a
+//! `git` that does not answer in time leaves the row without a repository,
+//! never the agent without its call. The sink swallows its own errors and a
+//! panic here is caught.
+//!
+//! The row goes to the **host** sink, not the session's: the spawner exports
+//! the directory it resolved as `LOOM_FORGE_CALL_STATS_DIR`
+//! ([`crate::agent_session::isolation`]), because the session's private
+//! `TMPDIR` would otherwise move the default somewhere no rollup reads.
 //!
 //! A call the facade already booked ([`crate::gh_invocation::BOOKED_ENV`] —
 //! a `loom-daemon` command run inside the session, whose `gh` resolves to
-//! this front) is not booked again. Commands that never reach the API
+//! this front) is not booked again; the spawner blanks that marker in the
+//! session's own environment, so only a facade child ever carries it. Commands that never reach the API
 //! (`gh auth` — the git credential helper —, `gh config`, help, version,
 //! completion, aliases, extensions) are not booked.
 
 use std::ffi::OsString;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use super::classify::is_slug;
 use crate::forge_call_stats::{self, CallAttribution, CallIdentity, Outcome, Pool};
@@ -51,6 +64,28 @@ const NO_ROLE: &str = "session";
 
 /// Longest role kept in a label.
 const ROLE_MAX: usize = 32;
+
+/// Longest the front waits for the local `git` read of `origin`. A healthy
+/// read takes a few milliseconds.
+const REMOTE_BUDGET: Duration = Duration::from_millis(500);
+
+/// `cwd`'s `origin` remote as `owner/repo`, read with `git` under `budget`:
+/// the child (and its process group) is killed at the deadline and the
+/// answer is `None`. Local only — never a forge call.
+fn bounded_remote(git: &str, cwd: &Path, budget: Duration) -> Option<String> {
+    let mut cmd = Command::new(git);
+    cmd.args(["remote", "get-url", "origin"])
+        .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null());
+    match crate::proc_exec::run_bounded(cmd, budget) {
+        Ok(crate::proc_exec::Completion::Exited(out)) if out.status.success() => {
+            crate::forge_etag_store::parse_remote_url(&String::from_utf8_lossy(&out.stdout))
+                .map(|(_, nwo)| nwo)
+        }
+        _ => None,
+    }
+}
 
 /// The ledger `caller` for a `gh <command> …`, or `None` for a command that
 /// never spends API budget. Fixed names only: an unlisted command (an alias,
@@ -227,7 +262,7 @@ pub fn book(args: &[OsString], cwd: Option<&Path>) {
             .iter()
             .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
         let cred = accounting::cred_of_with(dir.as_deref(), env_token);
-        let remote = || cwd.and_then(accounting::remote_repo);
+        let remote = || cwd.and_then(|dir| bounded_remote("git", dir, REMOTE_BUDGET));
         if let Some(row) = plan(args, &session, &cred, remote) {
             forge_call_stats::record_attributed(
                 row.caller,

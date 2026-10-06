@@ -36,9 +36,10 @@
 //!   one writer retry on a credential failure; every row records the identity
 //!   role (`reader` / `writer` / `writer-fallback`).
 //!
-//! - [`paged`] (W5) — a REST `gh api --paginate` read is walked page by page,
-//!   each page its own execution and accounting row, so the ledger charges
-//!   what GitHub charges.
+//! - [`paged`] (W5) — opt-in, off by default (`LOOM_GH_PAGE_WALK=1`): a
+//!   REST `gh api --paginate` read is walked page by page, each page its own
+//!   execution and accounting row, so the ledger charges what GitHub
+//!   charges.
 //!
 //! `gh-cached` substitution for reads, the async/tokio variant and the Gitea
 //! decline move in with the slices that first need them (see #9985's slicing
@@ -50,6 +51,7 @@ pub mod api_kind;
 pub mod billing;
 pub(crate) mod cwd_route;
 mod outcome;
+pub(crate) mod own_writes;
 mod paged;
 mod reader_route;
 pub mod resolver;
@@ -58,7 +60,7 @@ pub mod transparent;
 
 pub use crate::forge_identity::ReadClass;
 pub use affinity::{affinity_key, url_affinity_key};
-pub use paged::WALK_ENV as PAGE_WALK_ENV;
+pub use paged::{walk_enabled as page_walk_enabled, WALK_ENV as PAGE_WALK_ENV};
 pub use reader_route::{READ_SHED_ENV, SHED_MARKER};
 
 #[cfg(test)]
@@ -689,6 +691,11 @@ impl GhInvocation {
     /// [`ExecError::Collect`] when it started but its result could not be
     /// collected (side effects may have happened — never retry a write on it).
     pub fn execute(self) -> Result<GhCompletion, ExecError> {
+        // W9: every write makes the next guard reads of its (repo, number)
+        // unconditional (see `own_writes`).
+        if self.intent == AccessIntent::Write {
+            own_writes::note(&self.args, self.target.slug().as_deref());
+        }
         #[cfg(test)]
         if let Some(routed) = test_routing::run(&self) {
             return routed;
@@ -718,8 +725,9 @@ impl GhInvocation {
     }
 
     fn execute_with(self, program: &str, source: GhBinSource) -> Result<GhCompletion, ExecError> {
-        // W5: a REST `--paginate` read is walked page by page, each page one
-        // ordinary execution (span + accounting row) — see [`paged`].
+        // W5, opt-in (`LOOM_GH_PAGE_WALK=1`; off by default): a REST
+        // `--paginate` read is walked page by page, each page one ordinary
+        // execution (span + accounting row) — see [`paged`].
         if let (OutputContract::Captured { timeout }, Some(endpoint)) =
             (self.contract, paged::plan(&self))
         {

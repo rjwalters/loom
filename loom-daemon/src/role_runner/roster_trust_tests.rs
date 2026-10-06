@@ -100,8 +100,7 @@ fn a_roster_read_is_one_counted_100_per_page_walk() {
     assert_eq!(read.map(|c| c.len()), Some(0));
     let argv = std::fs::read_to_string(&log).unwrap();
     assert_eq!(argv.lines().count(), 1, "{argv}");
-    // W5: page 1 of the facade's page walk (`--paginate` at the site).
-    assert!(argv.contains("repos/o/r/issues/1/comments?per_page=100 --include"), "{argv}");
+    assert!(argv.contains("repos/o/r/issues/1/comments?per_page=100 --paginate"), "{argv}");
     let rows = report.host_window.unwrap_or_default();
     let counted: u64 = rows
         .iter()
