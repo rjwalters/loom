@@ -18,6 +18,8 @@
 //! | inside the backoff window; nothing written | `LOOM-REDATE-DEFERRED …` | 0 |
 //! | could not read/write the forge state needed | the reason | 1 |
 //! | branch already moved past `--expected-head-sha` | the reason | 3 |
+//! | budget spent; base merged via update-branch (#10388) | `LOOM-REDATE-SYNCED …` | 0 |
+//! | budget spent; base sync conflicts, `loom:merge-conflict` applied | `LOOM-REDATE-SYNC-CONFLICT …` | 0 |
 //! | bound reached; escalated to `loom:operator` | `LOOM-REDATE-ESCALATED …` | 4 |
 //!
 //! # Why the in-place re-run is gone (#8919)
@@ -171,6 +173,32 @@ commit against the current base, re-runs every required check, and starts a fres
                     }
                 );
                 std::process::exit(4);
+            }
+            RemedyOutcome::SyncedBase { head, n, max } => {
+                println!(
+                    "LOOM-REDATE-SYNCED pr={} head={head} n={n} max={max}\n\
+PR #{}'s re-date budget is exhausted (#9590); merged the base branch into it via \
+update-branch (sync {n} of {max}, #10388) instead of holding it. The new head starts a fresh \
+re-date chain. Not merged this pass; retry on a later pass.",
+                    self.pr, self.pr
+                );
+                std::process::exit(0);
+            }
+            RemedyOutcome::SyncConflict { notice_posted } => {
+                println!(
+                    "LOOM-REDATE-SYNC-CONFLICT pr={} head={} label=loom:merge-conflict notice={}\n\
+PR #{}'s re-date budget is exhausted and merging the base branch conflicts (#10388): applied \
+loom:merge-conflict so Doctor rebases it. No operator hold. Not merged this pass.",
+                    self.pr,
+                    self.expected_head_sha,
+                    if notice_posted {
+                        "posted"
+                    } else {
+                        "already-present"
+                    },
+                    self.pr
+                );
+                std::process::exit(0);
             }
             RemedyOutcome::HeadMoved { current } => {
                 println!(
