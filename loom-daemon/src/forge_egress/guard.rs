@@ -374,7 +374,7 @@ fn basename(word: &str) -> &str {
 /// (heredoc bodies fed to a shell) end a command.
 fn segments(text: &str) -> Vec<Vec<String>> {
     let text = text.replace("\\\n", " ").replace('\\', "");
-    text.split(|c| matches!(c, ';' | '&' | '|' | '(' | ')' | '\n' | '`'))
+    text.split([';', '&', '|', '(', ')', '\n', '`'])
         .map(|s| {
             s.split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"'))
                 .filter(|t| !t.is_empty())

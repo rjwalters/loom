@@ -1762,10 +1762,11 @@ fi
 
 # =============================================================================
 # LOOM: Deny typed bypasses of the managed gh launcher (issue #9989, C6 of
-# epic #9983) — `curl api.github.com`, `gh api https://…`, `GH_HOST=`,
-# `GH_CONFIG_DIR=`, `--hostname`, `gh config set api_host`, `gh auth
-# login|setup-git|refresh`, `env -i … gh`, a path-qualified gh other than the
-# launcher, SDK installs/imports. Classification, policy resolution and the
+# epic #9983) — raw HTTP to the GitHub API host, `gh api` with an absolute
+# URL, GH_HOST / GH_CONFIG_DIR overrides, gh's hostname flag or api-host
+# config key, `gh auth login|setup-git|refresh`, gh under an emptied `env`,
+# a path-qualified gh other than the launcher, SDK installs/imports (full list
+# in guard.rs's `Bypass` enum, not repeated here). Classification, policy resolution and the
 # guards.forgeEgress / LOOM_GUARD_FORGE_EGRESS toggle all live in
 # `loom-daemon forge egress guard` (loom-daemon/src/forge_egress/guard.rs);
 # this block only passes it the same masked text the merge redirect scans and

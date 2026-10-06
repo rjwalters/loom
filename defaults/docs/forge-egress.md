@@ -96,8 +96,8 @@ Loom-only codes cover surfaces that 2am's validator cannot see
 - `telemetry.loom-exporter-not-otlp`: Loom's own observability config has no
   `otlp` exporter.
 - `routing.denied-by-guard`: the `loom:forge-egress` `PreToolUse` rule denied
-  a typed bypass of the managed launcher (`curl api.github.com`, `GH_HOST=`,
-  `gh auth login`, a path-qualified `gh`, an SDK install, …). A denial code,
+  a typed bypass of the managed launcher (raw HTTP to the GitHub API host, a `GH_HOST`
+  override, `gh auth login`, a path-qualified `gh`, an SDK install, …). A denial code,
   never a report finding; see `guard-hooks.md` "Forge Egress Guard" (#9989).
 
 The checked profiles are the process's `GH_CONFIG_DIR` (or `gh`'s default
