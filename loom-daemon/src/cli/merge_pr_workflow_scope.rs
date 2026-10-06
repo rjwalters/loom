@@ -27,7 +27,10 @@ impl WorkflowScopeArgs {
         if std::env::var(SKIP_ENV).is_ok_and(|v| v == "1") {
             return Ok(());
         }
-        let cwd = std::env::current_dir()?;
+        // Fail open: `?` here would exit 1, which merge-pr.sh reads as "block".
+        let Ok(cwd) = std::env::current_dir() else {
+            return Ok(());
+        };
         let endpoint = format!("repos/{}/pulls/{}/files", self.repo, self.pr);
         let files = run_gh(&["api", &endpoint, "--paginate", "--jq", ".[].filename"], &cwd, false);
         let Some(files) = files.ok_stdout_trimmed() else {
