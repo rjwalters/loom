@@ -26,17 +26,25 @@
 //! newest observations into gauge points: it never calls docker, so a wedged
 //! Docker cannot stall the collector.
 //!
-//! **Fail open.** When docker cannot be queried ([`Snapshot::Unavailable`])
-//! the tracker holds every account's last state (no WARN, no reminder), the
-//! gauge emits nothing, and one INFO line notes the transition (and one more
-//! when docker answers again). An unqueryable docker says nothing about any
-//! container, so it must never read as `missing`.
+//! **Fail open, but loudly.** When docker cannot be queried
+//! ([`Snapshot::Unavailable`]) the tracker holds every account's last state
+//! and the gauge emits nothing: an unqueryable docker says nothing about any
+//! container, so it must never read as `missing`. It is still a host-wide
+//! Codex outage for a host that has session-managed accounts (spawn refuses
+//! those ticks as `SESSION_DOWN`), so it gets its own WARN on entry, the same
+//! [`REMINDER_SECS`] reminder while it lasts, and a WARN when docker answers
+//! again.
+//!
+//! Passes never overlap: a tick is skipped while the previous pass is still
+//! running, and the tracker lock is taken only after the snapshot, to fold
+//! it.
 //!
 //! Only session-managed, enabled Codex accounts are read; a pool with none
 //! costs zero docker calls. [`Tracker::observe`] and [`points`] are pure.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -59,25 +67,37 @@ const FRESH_FOR: Duration = Duration::from_secs(3 * 60);
 #[derive(Debug, Default)]
 pub struct Tracker {
     seen: HashMap<String, (SessionState, u64)>,
-    unqueryable: bool,
+    /// While docker is unqueryable: when that was last warned about.
+    unqueryable_warned: Option<u64>,
 }
 
 impl Tracker {
-    /// Docker could not be queried this pass. Every account's state is held;
-    /// returns a note only on the transition into this condition.
-    pub fn unqueryable(&mut self, reason: &str) -> Option<String> {
-        (!std::mem::replace(&mut self.unqueryable, true)).then(|| {
-            format!(
-                "Codex session containers cannot be observed ({reason}); holding the last \
-                 known state until docker answers"
-            )
-        })
+    /// Docker could not be queried this pass. Every account's state is held.
+    /// Returns the WARN text on entering this condition and as a reminder
+    /// every [`REMINDER_SECS`] while it lasts.
+    pub fn unqueryable(&mut self, reason: &str, now: u64) -> Option<String> {
+        let message = match self.unqueryable_warned {
+            None => format!(
+                "Codex session containers cannot be observed ({reason}): Codex ticks on this \
+                 host's session-managed accounts will be refused until docker answers; is the \
+                 Docker daemon running?"
+            ),
+            Some(at) if now.saturating_sub(at) >= REMINDER_SECS => format!(
+                "Codex session containers still cannot be observed ({reason}; reminder every {} \
+                 min)",
+                REMINDER_SECS / 60
+            ),
+            Some(_) => return None,
+        };
+        self.unqueryable_warned = Some(now);
+        Some(message)
     }
 
-    /// Docker answered this pass; a note when it had not before.
+    /// Docker answered this pass; the WARN text when it had not before.
     pub fn queryable(&mut self) -> Option<String> {
-        std::mem::replace(&mut self.unqueryable, false)
-            .then(|| "Codex session containers are observable again".to_string())
+        self.unqueryable_warned
+            .take()
+            .map(|_| "Codex session containers are observable again (docker answers)".to_string())
     }
 
     /// Forget accounts no longer in the inventory (removed or disabled), so a
@@ -169,12 +189,11 @@ fn now_secs() -> u64 {
 }
 
 /// What one pass decided: the observations to export (`None`: export
-/// nothing) and the log lines (`warn`, `info`).
+/// nothing) and the WARN lines.
 #[derive(Debug, Default, PartialEq)]
 pub struct Pass {
     pub observed: Option<Observations>,
     pub warn: Vec<String>,
-    pub info: Vec<String>,
 }
 
 /// Fold one snapshot into the tracker for `accounts` (`(account, container)`).
@@ -189,10 +208,12 @@ pub fn fold(
     tracker.retain(&names);
     let mut pass = Pass::default();
     if let Snapshot::Unavailable(reason) = snapshot {
-        pass.info.extend(tracker.unqueryable(reason));
+        if !accounts.is_empty() {
+            pass.warn.extend(tracker.unqueryable(reason, now));
+        }
         return pass;
     }
-    pass.info.extend(tracker.queryable());
+    pass.warn.extend(tracker.queryable());
     let observed: Observations = accounts
         .iter()
         .map(|(account, container)| {
@@ -226,15 +247,28 @@ fn session_accounts(root: &Path) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// One watch pass (blocking): snapshot, WARN, keep the observations.
+/// Set while a watch pass runs, so a slow pass is never joined by another.
+static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Clears [`IN_FLIGHT`] when the pass ends, however it ends.
+struct InFlight;
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// One watch pass (blocking): snapshot, then fold it under the tracker lock,
+/// WARN, and keep the observations.
 fn watch_pass(root: &Path) {
     let accounts = session_accounts(root);
-    let mut guard = TRACKER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let tracker = guard.get_or_insert_with(Tracker::default);
     if accounts.is_empty() {
-        tracker.retain(&[]);
+        TRACKER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(Tracker::default)
+            .retain(&[]);
         *LAST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -247,39 +281,53 @@ fn watch_pass(root: &Path) {
         .ok()
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| "docker".to_string());
+    // The docker call runs without the tracker lock held.
+    let started = Instant::now();
     let snapshot =
         Arc::new(session_state::snapshot(&docker, &registered, session_state::SNAPSHOT_DEADLINE));
-    session_state::publish(Arc::clone(&snapshot));
-    let pass = fold(tracker, &accounts, &snapshot, now_secs());
+    session_state::publish(Arc::clone(&snapshot), started);
+    let pass = {
+        let mut guard = TRACKER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fold(guard.get_or_insert_with(Tracker::default), &accounts, &snapshot, now_secs())
+    };
     for message in &pass.warn {
         log::warn!("session: {message}");
     }
-    for message in &pass.info {
-        log::info!("session: {message}");
-    }
     *LAST
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = pass
-        .observed
-        .map(|observed| (Instant::now(), Arc::new(observed)));
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        pass.observed.map(|observed| (started, Arc::new(observed)));
 }
 
 /// Start the always-on watch for `workspace_root`'s account pool. Runs
-/// whether or not telemetry is configured; each pass is bounded by the
-/// snapshot deadline and runs off the async runtime.
+/// whether or not telemetry is configured; each pass runs off the async
+/// runtime, its docker calls are killed at the snapshot deadline, and a tick
+/// is skipped while the previous pass is still running.
 pub fn spawn_watch(workspace_root: PathBuf) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(WATCH_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            if IN_FLIGHT.swap(true, Ordering::AcqRel) {
+                log::info!(
+                    "session: previous Codex session watch pass still running; tick skipped"
+                );
+                continue;
+            }
             let root = workspace_root.clone();
-            let pass = tokio::task::spawn_blocking(move || watch_pass(&root));
-            // The snapshot kills docker at its own deadline; this outer bound
-            // only covers the filesystem reads around it.
+            let pass = tokio::task::spawn_blocking(move || {
+                let _in_flight = InFlight;
+                watch_pass(&root);
+            });
+            // This only stops *waiting*: a blocking pass cannot be cancelled.
+            // `IN_FLIGHT` is what keeps an overrunning pass from being joined
+            // by more.
             let bound = session_state::SNAPSHOT_DEADLINE + Duration::from_secs(10);
             if tokio::time::timeout(bound, pass).await.is_err() {
-                log::info!("session: Codex session watch pass overran {bound:?}; skipped");
+                log::info!("session: Codex session watch pass overran {bound:?}; not waiting");
             }
         }
     })
@@ -417,14 +465,32 @@ mod tests {
         let gone = Snapshot::Unavailable("Cannot connect to the Docker daemon".into());
         let first = fold(&mut t, &accounts, &gone, 60);
         assert_eq!(first.observed, None, "no gauge, never `missing`");
-        assert!(first.warn.is_empty());
-        assert_eq!(first.info.len(), 1, "one note on the transition");
-        let again = fold(&mut t, &accounts, &gone, 60 + REMINDER_SECS);
-        assert!(again.warn.is_empty() && again.info.is_empty(), "no storm");
-        // Docker answers again and the container is still up: no state change.
+        assert_eq!(first.warn.len(), 1, "a host-wide outage WARNs on entry");
+        assert!(first.warn[0].contains("cannot be observed"));
+        let quiet = fold(&mut t, &accounts, &gone, 60 + REMINDER_SECS - 1);
+        assert!(quiet.warn.is_empty(), "no storm inside the reminder window");
+        let reminder = fold(&mut t, &accounts, &gone, 60 + REMINDER_SECS);
+        assert_eq!(reminder.warn.len(), 1, "bounded reminder");
+        assert!(reminder.warn[0].contains("still"));
+        // Docker answers again and the container is still up: no container
+        // state change, only the "observable again" line.
         let back = fold(&mut t, &accounts, &available(&[(C, SessionState::Running)]), 2_000);
-        assert!(back.warn.is_empty());
-        assert_eq!(back.info.len(), 1);
+        assert_eq!(back.warn.len(), 1);
+        assert!(back.warn[0].contains("observable again"));
+        let steady = fold(&mut t, &accounts, &available(&[(C, SessionState::Running)]), 2_060);
+        assert!(steady.warn.is_empty());
+    }
+
+    #[test]
+    fn an_unqueryable_docker_with_no_session_accounts_is_silent() {
+        let mut t = Tracker::default();
+        let gone = Snapshot::Unavailable("Cannot connect".into());
+        assert!(fold(&mut t, &[], &gone, 0).warn.is_empty());
+    }
+
+    #[test]
+    fn the_selection_ceiling_is_two_watch_intervals() {
+        assert_eq!(session_state::LATEST_MAX_AGE, 2 * WATCH_INTERVAL);
     }
 
     #[test]

@@ -60,6 +60,13 @@ pub const CONTAINER_PREFIX: &str = "loom-codex-session-";
 /// the docker child is killed and the snapshot is [`Snapshot::Unavailable`].
 pub const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(8);
 
+/// The recommended `max_age` ceiling for [`latest`]: two watch intervals
+/// (the watch, `observability::ops::codex_session::WATCH_INTERVAL`, takes a
+/// snapshot every 60 s). A reader on the dispatch-selection path (#10454)
+/// should pass this, not a longer window; an older or absent snapshot is
+/// "cannot observe" (Ungated).
+pub const LATEST_MAX_AGE: Duration = Duration::from_secs(2 * 60);
+
 /// Upper bound on the bytes read from one docker call's stdout.
 const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -247,7 +254,9 @@ pub fn snapshot(docker: &str, registered: &[PathBuf], deadline: Duration) -> Sna
         until,
     ) {
         Ok(ran) if ran.success => ran,
-        Ok(ran) => return Snapshot::Unavailable(format!("docker ps failed: {}", ran.stderr)),
+        Ok(ran) => {
+            return Snapshot::Unavailable(format!("docker ps failed: {}", first_line(&ran.stderr)))
+        }
         Err(reason) => return Snapshot::Unavailable(reason),
     };
     let names = parse_ps_names(&String::from_utf8_lossy(&ps.stdout));
@@ -257,14 +266,48 @@ pub fn snapshot(docker: &str, registered: &[PathBuf], deadline: Duration) -> Sna
     let mut args = vec!["inspect", "--type", "container", "--"];
     args.extend(names.iter().map(String::as_str));
     match run_bounded(docker, &args, until) {
-        // A non-zero exit with a parseable array is a container removed
-        // between the two calls: the rest are still valid, it reads missing.
+        // A non-zero exit is only trusted when every error is "not found": a
+        // container removed between the two calls, which then reads missing
+        // while the rest stay valid. Any other failure (notably the Docker
+        // daemon going away between the calls, where the CLI still prints
+        // `[]` on stdout and exits 1) says nothing about any container.
+        Ok(ran) if !ran.success && !only_not_found(&ran.stderr) => {
+            Snapshot::Unavailable(format!("docker inspect failed: {}", first_line(&ran.stderr)))
+        }
         Ok(ran) => parse_inspect_array(&ran.stdout, registered).map_or_else(
-            || Snapshot::Unavailable(format!("docker inspect failed: {}", ran.stderr)),
+            || {
+                Snapshot::Unavailable(format!(
+                    "docker inspect output did not parse: {}",
+                    first_line(&ran.stderr)
+                ))
+            },
             Snapshot::Available,
         ),
         Err(reason) => Snapshot::Unavailable(reason),
     }
+}
+
+/// Whether a failed `docker inspect`'s stderr reports only names that do not
+/// exist (and reports something). Pure.
+#[must_use]
+pub fn only_not_found(stderr: &str) -> bool {
+    let mut lines = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .peekable();
+    lines.peek().is_some()
+        && lines.all(|line| {
+            let line = line.to_ascii_lowercase();
+            line.starts_with("error: no such object")
+                || line.starts_with("error: no such container")
+                || line.starts_with("error response from daemon: no such container")
+                || line.starts_with("error response from daemon: no such object")
+        })
+}
+
+fn first_line(text: &str) -> &str {
+    text.trim().lines().next().unwrap_or("")
 }
 
 struct Ran {
@@ -310,7 +353,11 @@ fn run_bounded(docker: &str, args: &[&str], until: Instant) -> Result<Ran, Strin
                 return Err(format!("docker {} timed out", args.first().unwrap_or(&"")));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(error) => return Err(format!("waiting on docker: {error}")),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("waiting on docker: {error}"));
+            }
         }
     };
     let remaining = until.saturating_duration_since(Instant::now()) + Duration::from_millis(500);
@@ -323,24 +370,26 @@ fn run_bounded(docker: &str, args: &[&str], until: Instant) -> Result<Ran, Strin
     Ok(Ran {
         success: status.success(),
         stdout,
-        stderr: stderr.trim().lines().next().unwrap_or("").to_string(),
+        stderr,
     })
 }
 
 static LATEST: Mutex<Option<(Instant, Arc<Snapshot>)>> = Mutex::new(None);
 
 /// Record `snapshot` as the newest one (the daemon's watch loop does this once
-/// per pass).
-pub fn publish(snapshot: Arc<Snapshot>) {
+/// per pass). `started` is when the snapshot began, so [`latest`]'s age is
+/// never understated by the time docker took to answer.
+pub fn publish(snapshot: Arc<Snapshot>, started: Instant) {
     *LATEST
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Instant::now(), snapshot));
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((started, snapshot));
 }
 
 /// The newest published snapshot, if it is younger than `max_age`. `None`
 /// (none yet, or too old) means "cannot observe", the same as
 /// [`Snapshot::Unavailable`]. The cache is a single slot refreshed by the
 /// watch loop; a reader that needs fresher data calls [`snapshot`] itself.
+/// Use [`LATEST_MAX_AGE`] unless there is a reason to be stricter.
 #[must_use]
 pub fn latest(max_age: Duration) -> Option<Arc<Snapshot>> {
     let guard = LATEST
@@ -462,9 +511,20 @@ mod tests {
     }
 
     #[test]
+    fn only_not_found_errors_are_trusted() {
+        assert!(only_not_found("Error: No such object: loom-codex-session-x\n"));
+        assert!(only_not_found(
+            "Error response from daemon: No such container: a\nError: No such object: b"
+        ));
+        assert!(!only_not_found(""));
+        assert!(!only_not_found("failed to connect to the docker API at unix:///x"));
+        assert!(!only_not_found("Error: No such object: a\nCannot connect to the Docker daemon"));
+    }
+
+    #[test]
     fn latest_honours_max_age() {
-        publish(Arc::new(Snapshot::Available(BTreeMap::new())));
-        assert!(latest(Duration::from_secs(60)).is_some());
+        publish(Arc::new(Snapshot::Available(BTreeMap::new())), Instant::now());
+        assert!(latest(LATEST_MAX_AGE).is_some());
         std::thread::sleep(Duration::from_millis(20));
         assert!(latest(Duration::from_millis(1)).is_none(), "too old to use");
     }
@@ -500,6 +560,26 @@ esac"#,
             assert_eq!(snap.state_of("loom-codex-session-a"), Some(SessionState::Restarting));
             assert_eq!(snap.state_of("loom-codex-session-gone"), Some(SessionState::Missing));
             assert_eq!(std::fs::read_to_string(calls).unwrap(), "ps\ninspect\n");
+        }
+
+        #[test]
+        fn docker_lost_between_ps_and_inspect_is_unavailable_not_all_missing() {
+            // The real CLI against an unreachable daemon: `[]` on stdout, a
+            // connection error on stderr, exit 1.
+            let dir = tempfile::tempdir().unwrap();
+            let docker = fake(
+                dir.path(),
+                r#"case "$1" in
+  ps) echo loom-codex-session-a ;;
+  inspect) echo '[]'; echo 'failed to connect to the docker API at unix:///var/run/docker.sock' >&2; exit 1 ;;
+esac"#,
+            );
+            let snap = snapshot(&docker, &[], Duration::from_secs(5));
+            assert!(
+                matches!(&snap, Snapshot::Unavailable(r) if r.contains("failed to connect")),
+                "{snap:?}"
+            );
+            assert_eq!(snap.state_of("loom-codex-session-a"), None);
         }
 
         #[test]
