@@ -454,8 +454,12 @@ waited (`loom.dispatch.idle_slot_seconds`). Forge label-stage dwell
 (`loom.forge.stage_dwell{state}` / `.samples`, `loom.forge.stage_items{state}`)
 covers created → curated, curated → `loom:issue`, building → review requested
 and review requested → merged. It reads ETag-cached stage listings every 5
-minutes plus at most 8 per-item reads per sample, never per tick. Details are
-in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
+minutes plus at most 8 per-item reads per sample, never per tick. With
+`fleet.captainGauges` configured, the fleet captain samples for the fleet and
+dispatchers stand down while its published data is fresh
+(`loom.captain.gauge_age_seconds`, `loom.captain.gauge_fallback`; see
+[`daemon-reference.md`](daemon-reference.md#fleet-gauges-produced-by-the-captain-w12)).
+Details are in [`telemetry-schema.md`](telemetry-schema.md#metricpoints).
 
 **Merge-chain re-date pressure (#10163).** Three gauges track the #8508
 re-date remedy over a trailing 24 h: `loom.merge.redate_prs{state}`

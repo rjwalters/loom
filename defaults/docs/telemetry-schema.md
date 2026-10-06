@@ -1579,8 +1579,11 @@ warm-up only spends the remainder; work over the budget waits, uncounted, for
 the next sample. Only the first events page (100 events) is read. The reads
 run off the collector loop, so a slow forge never stalls it. The first sample after start is a
 baseline, so a restart never replays history. Every host managing a repo
-samples it: sums scale with the host count, means do not. Completed sweeps'
-own phase durations remain the cycle-time rollup's (#8692).
+samples it: sums scale with the host count, means do not. With
+`fleet.captainGauges` configured (W12), only the fleet captain samples a repo
+while its published data is fresh, and a dispatcher samples it again only when
+that data goes stale (see "Fleet gauges produced by the captain" below).
+Completed sweeps' own phase durations remain the cycle-time rollup's (#8692).
 
 Merge-chain re-date pressure (Issue #10163, `observability/ops/redate_chain.rs`).
 These are `Gauge`s over a trailing 24 h window, sampled on the `host.health`
@@ -1629,6 +1632,18 @@ Never an issue number, sha or path.
 | `loom.eta.health.snapshot_rows` | `{row}` | none | rows in the last `eta.snapshot` this process built. Omitted until one was built |
 | `loom.eta.health.snapshot_alternates_rows` | `{row}` | none | of those, rows with non-empty `alternates` (#10390) |
 | `loom.eta.health.pending_over_cap` | `{estimate}` | none | cumulative pending estimates evicted by the `MAX_PENDING` cap since process start (#10496). Omitted before the first ETA pass; a rising value means refreshes are being thinned (redundant middles, then pairs to their earliest). Whole series are evicted only when distinct series alone exceed the cap; the daemon log's `whole series lost` count reports those |
+
+Fleet gauges produced by the captain (W12, `observability/captain_gauges.rs`).
+Gauges on the collector pass, emitted only on a host that is the armed captain
+or a dispatcher with `fleet.captainGauges.standDown`. `task` is the singleton job
+name (`stage-dwell`), the same label key the task-liveness gauges use; never a
+repo or issue. Configuration is in
+[`daemon-reference.md`](daemon-reference.md#fleet-gauges-produced-by-the-captain-w12).
+
+| Metric | Unit | Labels | Meaning |
+|---|---|---|---|
+| `loom.captain.gauge_age_seconds` | `s` | `task` | on the captain, the age of its own last finished pass of the job; on a dispatcher, the age of the captain's published `as_of` as last read. Omitted while unknown. Past `fleet.captainGauges.maxAgeSecs` the captain has stopped producing |
+| `loom.captain.gauge_fallback` | `1` | `task` | dispatchers only: `1` while the captain's data for the job is stale or absent and this host produces it locally, `0` while it stands down |
 
 The dwell names (#8856) are `loom.queue.oldest_wait`, `loom.queue.starved`,
 `loom.queue.starved.by_reason` and `loom.queue.dispatch_wait[.samples]`. They
