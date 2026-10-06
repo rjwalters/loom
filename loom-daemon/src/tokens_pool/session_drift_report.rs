@@ -80,8 +80,10 @@ pub fn drifted<'a>(
 }
 
 /// Operator-facing lines for `drifted`; empty when nothing drifted. Pure.
+/// `private_clones` says whether the host has any private-clone session
+/// container: only then is the warning not to recreate those this way printed.
 #[must_use]
-pub fn report_lines(drifted: &[DriftedSession]) -> Vec<String> {
+pub fn report_lines(drifted: &[DriftedSession], private_clones: bool) -> Vec<String> {
     if drifted.is_empty() {
         return Vec::new();
     }
@@ -119,11 +121,13 @@ pub fn report_lines(drifted: &[DriftedSession]) -> Vec<String> {
             session.workspace.display()
         ));
     }
-    lines.push(
-        "  Private-clone accounts are not listed and must not be recreated this way: re-run \
-         `accounts session start <account> --private-clone <URL> --base <BRANCH>` for those."
-            .into(),
-    );
+    if private_clones {
+        lines.push(
+            "  Private-clone accounts are not listed and must not be recreated this way: re-run \
+             `accounts session start <account> --private-clone <URL> --base <BRANCH>` for those."
+                .into(),
+        );
+    }
     lines
 }
 
@@ -131,9 +135,11 @@ pub fn report_lines(drifted: &[DriftedSession]) -> Vec<String> {
 #[must_use]
 pub fn report_from(snapshot: &Snapshot, registered: &[PathBuf]) -> Vec<String> {
     match snapshot {
-        Snapshot::Available(map) => {
-            report_lines(&drifted(map.values().map(|observed| &observed.inspect), registered))
-        }
+        Snapshot::Available(map) => report_lines(
+            &drifted(map.values().map(|observed| &observed.inspect), registered),
+            map.values()
+                .any(|observed| session_state::is_private_clone(&observed.inspect)),
+        ),
         Snapshot::Unavailable(reason) => vec![format!(
             "  Codex session containers were not checked for mount drift: docker could not be \
              queried ({reason}). Check them with `loom-daemon accounts session status <account>`."
@@ -304,8 +310,14 @@ mod tests {
         assert_eq!(found[0].account, "agent-1");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].drift.extra, vec![ws.join("gone")]);
-        let text = report_lines(&found).join("\n");
+        // No private-clone container on this host: no advice about them.
+        let text = report_lines(&found, false).join("\n");
         assert!(text.contains("no longer registered"), "{text}");
+        assert!(!text.contains("--private-clone"), "{text}");
+        assert!(report_lines(&found, true)
+            .join("\n")
+            .contains("--private-clone"));
+        assert!(report_lines(&[], true).is_empty(), "no drift, no report");
     }
 
     #[test]
