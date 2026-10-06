@@ -137,6 +137,21 @@ pub fn max_attempts(worktree: &Path) -> u32 {
         .unwrap_or(DEFAULT_MAX_ATTEMPTS)
 }
 
+/// SIGKILL the gate's whole process group (it leads its own, see
+/// [`run_command`]) and reap the shell, so nothing from this attempt outlives
+/// it to overlap a retry or a re-dispatched Builder.
+fn kill_gate_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: plain syscall; negative pid targets the group we created.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Run `command` via `sh -c`; `Ok(())` on exit 0, else `Err(tail)`.
 fn run_command(command: &str, cwd: &Path, timeout: Duration) -> Result<(), String> {
     let log = std::env::temp_dir().join(format!("loom-preflight-{}.log", uuid::Uuid::new_v4()));
@@ -144,13 +159,21 @@ fn run_command(command: &str, cwd: &Path, timeout: Duration) -> Result<(), Strin
     let err = out
         .try_clone()
         .map_err(|e| format!("cannot clone output file: {e}"))?;
-    let mut child = Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
+        .stderr(Stdio::from(err));
+    // Own process group, so a timeout can kill the whole gate subtree (the
+    // shell's compiler/test descendants), not just `sh`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn '{command}': {e}"))?;
     let start = Instant::now();
@@ -162,12 +185,14 @@ fn run_command(command: &str, cwd: &Path, timeout: Duration) -> Result<(), Strin
             }
             Ok(Some(s)) => break format!("command exited with {s}"),
             Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_gate_tree(&mut child);
                 break format!("command timed out after {}s and was killed", timeout.as_secs());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(200)),
-            Err(e) => break format!("failed to poll command: {e}"),
+            Err(e) => {
+                kill_gate_tree(&mut child);
+                break format!("failed to poll command: {e}");
+            }
         }
     };
     let bytes = std::fs::read(&log).unwrap_or_default();
@@ -388,6 +413,18 @@ mod tests {
         // A new dispatch into the same worktree starts a fresh budget.
         assert_eq!(run_in_episode(d.path(), "e2"), Verdict::Pass);
         assert!(check(d.path()));
+    }
+
+    #[test]
+    fn timeout_kills_nested_descendants() {
+        let d = repo(Some(
+            r#"{"enabled":true,"command":"sh -c 'sleep 2; echo survived > marker' & wait","timeoutSeconds":1,"preflightMaxAttempts":1}"#,
+        ));
+        let t = Instant::now();
+        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Unresolved { .. }));
+        assert!(t.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(!d.path().join("marker").exists(), "descendant outlived the timeout");
     }
 
     mod release {
