@@ -73,6 +73,11 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "#10556 hold/idempotency reader: comments from ReleaseForge, trusted via policy.trusts_json",
     ),
     (
+        "stale_blocked/unnamed.rs",
+        "#10558 queue veto: legacy PR-less/quarantine markers from ReleaseForge comments, \
+         trusted via policy.trusts_json (permanent-block veto reads any comment: fail-safe)",
+    ),
+    (
         "sweep_registry/guards.rs",
         "writer; reader in read_lease_comments (FETCH_SITES)",
     ),

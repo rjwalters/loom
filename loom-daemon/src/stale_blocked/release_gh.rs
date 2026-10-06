@@ -440,14 +440,28 @@ impl ReleaseForge for GhReleaseForge {
 
     fn last_labeled_at(&mut self, number: u64, label: &str) -> Result<Option<String>, String> {
         let base = format!("repos/{}/issues/{number}/events", self.slug);
-        Ok(self
-            .pages(ops::TIMELINE_READ, &base)?
-            .iter()
-            .filter(|e| e.get("event").and_then(Value::as_str) == Some("labeled"))
-            .filter(|e| e.pointer("/label/name").and_then(Value::as_str) == Some(label))
-            .filter_map(|e| e.get("created_at").and_then(Value::as_str))
-            .next_back()
-            .map(str::to_string))
+        // The newest by parsed time, not by list position: the events API
+        // returns oldest-first today, but nothing here depends on that. A
+        // timestamp that will not parse fails the read (the caller counts the
+        // issue unevaluated and writes nothing) rather than being ignored.
+        let mut newest: Option<(chrono::DateTime<chrono::FixedOffset>, String)> = None;
+        for e in self.pages(ops::TIMELINE_READ, &base)? {
+            if e.get("event").and_then(Value::as_str) != Some("labeled")
+                || e.pointer("/label/name").and_then(Value::as_str) != Some(label)
+            {
+                continue;
+            }
+            let raw = e
+                .get("created_at")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("a {label} labeled event has no created_at"))?;
+            let at = chrono::DateTime::parse_from_rfc3339(raw.trim())
+                .map_err(|err| format!("unparseable {label} labeled time {raw:?}: {err}"))?;
+            if newest.as_ref().is_none_or(|(best, _)| at >= *best) {
+                newest = Some((at, raw.to_string()));
+            }
+        }
+        Ok(newest.map(|(_, raw)| raw))
     }
 
     fn post_comment(&mut self, number: u64, is_pr: bool, body: &str) -> Result<(), String> {
