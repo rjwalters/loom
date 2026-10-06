@@ -428,6 +428,9 @@ path = "loom-daemon/src/comment_trust.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/forge_cached_view.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/stale_blocked/release_gh.rs"
 
 [[operation]]
 id = "comment.edit-delete"
@@ -512,6 +515,9 @@ path = "loom-daemon/src/eta/fleet_events_forge.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/eta/fleet_fetch.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/stale_blocked/release_gh.rs"
 
 # --- epics-relationships -----------------------------------------------------
 
