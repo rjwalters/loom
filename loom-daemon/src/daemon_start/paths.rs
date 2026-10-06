@@ -284,8 +284,28 @@ pub fn canonical_daemon_path() -> String {
 /// The line goes to **stderr** so `--print-plist`'s stdout stays pipeable and
 /// diffable; moving it to stdout would corrupt every `--print-plist > file`
 /// caller, including this suite's own fixture installs.
+///
+/// On a forge-egress-policy-governed host the managed `gh` launcher's
+/// directory is put first on whichever of the three values is chosen —
+/// including a `LOOM_DAEMON_PATH` full override, since the policy is
+/// machine-owned and the daemon's children (scripts, hooks, role prompts)
+/// must resolve the launcher as their `gh` (#9987). No policy: unchanged.
 #[must_use]
 pub fn resolve_plist_path() -> String {
+    let base = resolve_plist_path_base();
+    let Some(dir) = crate::fleet::path_bootstrap::managed_launcher_dir() else {
+        return base;
+    };
+    let managed = crate::fleet::path_bootstrap::with_managed_launcher_dir(base, Some(&dir));
+    out::say_err(&format!(
+        "Rendered plist PATH: managed gh launcher directory first (forge egress policy \
+         toolchain.launcherPath) -> {managed}"
+    ));
+    managed
+}
+
+/// [`resolve_plist_path`] before the managed-launcher prefix.
+fn resolve_plist_path_base() -> String {
     let canonical = canonical_daemon_path();
     if let Some(full) = non_empty("LOOM_DAEMON_PATH") {
         out::say_err(&format!("Rendered plist PATH: full override via LOOM_DAEMON_PATH -> {full}"));

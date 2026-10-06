@@ -732,3 +732,47 @@ fn spawn_worker_ignores_the_no_policy_launcher_opt_out() {
         assert!(!seen.exists(), "no worker may be spawned");
     }
 }
+
+/// #9987 scope item 1: `daemon-start` puts the policy's managed launcher
+/// directory first on the PATH it bakes into the systemd unit (and launchd
+/// plist), so everything the daemon runs resolves the launcher as `gh`. With
+/// no policy the rendered PATH is the canonical one, unchanged.
+#[test]
+#[cfg(unix)]
+fn daemon_start_renders_the_launcher_dir_first_on_the_unit_path() {
+    let sb = Sandbox::new();
+    let home = sb.path().join("home");
+    let repo = sb.path().join("repo");
+    std::fs::create_dir_all(repo.join(".loom")).unwrap();
+    let render = |policy: Option<&Path>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+        c.args(["daemon-start", "--print-unit"])
+            .current_dir(&repo)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("HOME", &home)
+            .env("TMPDIR", sb.path())
+            .env("LOOM_SOCKET_PATH", sb.path().join("loom-daemon.sock"))
+            .env("LOOM_DAEMON_BIN", sb.path().join("gh"));
+        if let Some(p) = policy {
+            c.env("LOOM_FORGE_EGRESS_POLICY", p);
+        }
+        let out = c.output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        let unit = String::from_utf8_lossy(&out.stdout).into_owned();
+        unit.lines()
+            .find_map(|l| l.strip_prefix("Environment=PATH="))
+            .unwrap_or_else(|| panic!("no Environment=PATH= line:\n{unit}"))
+            .to_string()
+    };
+    let canonical = format!("{}/.local/bin:", home.display());
+    if !machine_policy_present() {
+        let path = render(None);
+        assert!(path.starts_with(&canonical), "no policy: canonical PATH only: {path}");
+    }
+    let policy = sb.policy(|_| {});
+    let path = render(Some(&policy));
+    let (first, rest) = path.split_once(':').unwrap();
+    assert_eq!(Path::new(first), sb.path(), "launcher dir first: {path}");
+    assert!(rest.starts_with(&canonical), "the canonical set follows: {path}");
+}

@@ -97,9 +97,45 @@ fn canonical_path_expanded(home: &str) -> String {
 /// minimal inherited PATH) prepended onto whatever PATH this process actually
 /// inherited (so an operator's deliberately customized PATH is only widened,
 /// never narrowed out).
+///
+/// On a forge-egress-policy-governed host the managed `gh` launcher's
+/// directory goes first (#9987, see [`with_managed_launcher_dir`]).
 #[must_use]
 pub fn local_gh_path_env() -> String {
-    local_gh_path_env_in(std::env::var("PATH").ok().as_deref())
+    with_managed_launcher_dir(
+        local_gh_path_env_in(std::env::var("PATH").ok().as_deref()),
+        managed_launcher_dir().as_deref(),
+    )
+}
+
+/// The directory of the managed `gh` launcher (`toolchain.launcherPath`)
+/// named by this host's env- or machine-origin forge egress policy (#9987,
+/// C4 of epic #9983). `None` with no policy, a repo-origin one, a launcher
+/// that does not exist, and always in a unit-test build
+/// ([`crate::forge_egress::worker_env::WorkerEgress::from_process`]), so a
+/// policy on the test host cannot alter a golden PATH.
+///
+/// Loom does not provision the launcher; it only puts it first on every
+/// `PATH` it renders from [`CANONICAL_PATH_DIRS`]. The directory comes from
+/// the policy and is never hard-coded into the constant.
+#[must_use]
+pub fn managed_launcher_dir() -> Option<std::path::PathBuf> {
+    crate::forge_egress::worker_env::WorkerEgress::from_process()?
+        .launcher_dir()
+        .map(std::path::Path::to_path_buf)
+}
+
+/// `path` (a colon-joined `PATH` value) with `launcher_dir` first and not
+/// repeated later. `None` returns `path` byte-for-byte unchanged — the
+/// no-policy contract every render site relies on (#9987).
+#[must_use]
+pub fn with_managed_launcher_dir(path: String, launcher_dir: Option<&std::path::Path>) -> String {
+    let Some(dir) = launcher_dir else {
+        return path;
+    };
+    crate::agent_gh::prepend_path(dir, Some(std::ffi::OsStr::new(&path)))
+        .and_then(|joined| joined.into_string().ok())
+        .unwrap_or(path)
 }
 
 /// [`local_gh_path_env`] with the inherited `PATH` value injected rather than
@@ -160,6 +196,36 @@ mod tests {
              defaults/scripts/lib/canonical-daemon-path.sh::canonical_daemon_path() -- keep \
              both definitions byte-for-byte equal (#4831)"
         );
+    }
+
+    #[test]
+    fn no_managed_launcher_leaves_path_byte_identical() {
+        let path = "/a/bin:/b/bin:/b/bin".to_string();
+        assert_eq!(with_managed_launcher_dir(path.clone(), None), path);
+        // A unit-test build never resolves a policy, so the live helpers stay
+        // golden on a policy-governed test host.
+        assert_eq!(managed_launcher_dir(), None);
+    }
+
+    #[test]
+    fn managed_launcher_dir_goes_first_and_is_not_repeated() {
+        let dir = std::path::Path::new("/opt/managed-gh/bin");
+        assert_eq!(
+            with_managed_launcher_dir("/usr/bin:/bin".to_string(), Some(dir)),
+            "/opt/managed-gh/bin:/usr/bin:/bin"
+        );
+        assert_eq!(
+            with_managed_launcher_dir("/usr/bin:/opt/managed-gh/bin:/bin".to_string(), Some(dir)),
+            "/opt/managed-gh/bin:/usr/bin:/bin"
+        );
+    }
+
+    #[test]
+    fn managed_launcher_dir_precedes_the_canonical_set() {
+        let dir = std::path::Path::new("/opt/managed-gh/bin");
+        let path = with_managed_launcher_dir(local_gh_path_env_in(Some("/x")), Some(dir));
+        assert!(path.starts_with("/opt/managed-gh/bin:"), "{path}");
+        assert!(path.ends_with(":/x"), "{path}");
     }
 
     #[test]
