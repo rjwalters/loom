@@ -139,6 +139,7 @@ pub mod priority_inputs;
 pub mod queue_features;
 pub mod recalibrate;
 pub mod recency;
+pub mod regime;
 pub mod repo_priority;
 pub mod score;
 pub mod shadow;

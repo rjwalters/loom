@@ -115,6 +115,41 @@ pub struct Explanation {
     /// every other heuristic, so their explanations are byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<QueueRecord>,
+    /// The latent-regime residual adjustment applied to a stage (#10528).
+    /// Absent when no adjustment applied (below the row floor, or the recent
+    /// residuals are noise), so every such explanation is byte-identical to
+    /// one made before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime_adjustment: Option<RegimeAdjustment>,
+}
+
+/// A stage's latent-regime adjustment ([`super::regime::adjust`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegimeAdjustment {
+    /// The adjusted stage's wire name.
+    pub stage: String,
+    /// Multiplier on the stage's served duration.
+    pub factor: f64,
+    /// Residuals inside the window.
+    pub n_recent: u64,
+    /// The residual weight half-life, seconds.
+    pub half_life: i64,
+}
+
+impl RegimeAdjustment {
+    /// The record for `adjustment`; `None` when it is the identity.
+    #[must_use]
+    pub fn of(adjustment: &super::regime::Adjustment) -> Option<Self> {
+        if adjustment.is_identity() {
+            return None;
+        }
+        Some(Self {
+            stage: adjustment.stage.as_str().to_string(),
+            factor: adjustment.factor,
+            n_recent: u64::try_from(adjustment.n_recent).unwrap_or(u64::MAX),
+            half_life: adjustment.half_life_sec,
+        })
+    }
 }
 
 /// A twin-otter answer, recorded so it can be recomputed from the

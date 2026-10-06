@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use crate::eta::fit::publish::{FetchKind, PubStatus};
 use crate::eta::fit::run;
 use crate::eta::health::RefreshCycleState;
+use crate::eta::regime::DriftState;
 use crate::telemetry::kinds::eta_fit::EtaFitRecord;
 
 /// A snapshot older than this is a FAIL.
@@ -249,6 +250,24 @@ pub struct OutcomeFacts {
     pub oldest_pending: Option<DateTime<Utc>>,
     /// Pending estimates.
     pub pending: u64,
+    /// Per-stage drift verdicts over the last 6 h of scored outcomes
+    /// (#10528), one per stage that has any recent outcome.
+    pub drift: Vec<DriftFacts>,
+}
+
+/// One stage's drift verdict ([`super::regime::drift`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftFacts {
+    /// The stage's wire name.
+    pub stage: String,
+    /// The one heuristic whose scored outcomes were checked (the serving
+    /// `land` heuristic when the calibration log records it, else the
+    /// calibration base); heuristics are never pooled.
+    pub heuristic: String,
+    /// Scored outcomes in the last 6 h.
+    pub n_recent: u64,
+    /// The tri-state verdict: `Unknown` below the sample floor.
+    pub state: DriftState,
 }
 
 /// Everything the doctor reads.
@@ -883,6 +902,43 @@ fn outcomes(f: &Facts) -> Vec<Check> {
             &format!("pairs {}", p.key),
             format!("{} paired outcome(s); a promotion gate needs 50", p.pairs),
         ));
+    }
+    if o.drift.is_empty() {
+        out.push(Check::skip(
+            "outcomes",
+            "drift",
+            "no scored outcome in the last 6h: nothing to check for regime drift",
+        ));
+    }
+    for d in &o.drift {
+        let name = format!("drift {}", d.stage);
+        out.push(match d.state {
+            DriftState::Drifted => Check::bad(
+                "outcomes",
+                &name,
+                Status::Warn,
+                format!(
+                    "{} scored {} outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served ETAs are NOT adjusted for it yet (serving-path application is deferred, #10528)",
+                    d.n_recent, d.heuristic
+                ),
+                "expect this stage's served ETAs to be biased until the next refit on current-regime rows",
+            ),
+            DriftState::Unknown => Check::ok(
+                "outcomes",
+                &name,
+                format!(
+                    "{} scored {} outcome(s) in 6h: drift unknown (below the {}-outcome floor)",
+                    d.n_recent,
+                    d.heuristic,
+                    super::MIN_SAMPLES
+                ),
+            ),
+            DriftState::Stable => Check::ok(
+                "outcomes",
+                &name,
+                format!("{} scored {} outcome(s) in 6h, no drift", d.n_recent, d.heuristic),
+            ),
+        });
     }
     out.push(match o.oldest_pending {
         None => Check::skip("outcomes", "oldest_pending", "no pending estimates"),

@@ -20,10 +20,14 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::doctor::{
-    AuthorityFacts, ConfigFacts, DataFacts, FitFacts, Gate, HeuristicTally, OutcomeFacts,
-    PairFacts, RepoFacts, ServingFacts,
+    AuthorityFacts, ConfigFacts, DataFacts, DriftFacts, FitFacts, Gate, HeuristicTally,
+    OutcomeFacts, PairFacts, RepoFacts, ServingFacts,
 };
-use super::{calibration_log, config, fit, fleet, fleet_refresh, health, shadow, Kind, Registry};
+use super::heuristics::{CALIBRATION_BASE, CALIBRATION_BASES};
+use super::{
+    calibration_log, config, fit, fleet, fleet_refresh, health, regime, shadow, Kind, Registry,
+    Stage,
+};
 use crate::eta::doctor::Facts;
 use crate::eta::score::EstimateSummary;
 use crate::observability::{self, ExporterKind};
@@ -153,11 +157,37 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
     };
 
     let ledger = shadow::read_ledger(&shadow::ledger_path(root)).unwrap_or_default();
-    let outcomes = OutcomeFacts {
-        calibration_newest: calibration_log::read(&calibration_log::path(root))
+    let calibration = calibration_log::read(&calibration_log::path(root));
+    // Drift is checked on one heuristic's track only (#10563 review): pooling
+    // every logged heuristic would let a change in the *mix* of heuristics
+    // trip the CUSUM with no real regime change. That track is the serving
+    // `land` heuristic's when the log records it, else the calibration base.
+    let serving_land = registry.current(Kind::Land, eta.current(Kind::Land)).id();
+    let drift_heuristic = if CALIBRATION_BASES.contains(&serving_land) {
+        serving_land
+    } else {
+        CALIBRATION_BASE
+    };
+    let scored = regime::residuals(
+        &calibration
             .iter()
-            .map(|o| o.as_of)
-            .max(),
+            .filter(|o| o.heuristic == drift_heuristic)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    let drift = Stage::EVERY
+        .iter()
+        .map(|&stage| regime::drift(&scored, stage, now))
+        .filter(|d| d.n_recent > 0)
+        .map(|d| DriftFacts {
+            stage: d.stage.as_str().to_string(),
+            heuristic: drift_heuristic.to_string(),
+            n_recent: u64::try_from(d.n_recent).unwrap_or(u64::MAX),
+            state: d.state(),
+        })
+        .collect();
+    let outcomes = OutcomeFacts {
+        calibration_newest: calibration.iter().map(|o| o.as_of).max(),
         pairs: ledger
             .pairs
             .iter()
@@ -168,6 +198,7 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
             .collect(),
         oldest_pending: pending.iter().map(|p| p.as_of).min(),
         pending: u64::try_from(pending.len()).unwrap_or(u64::MAX),
+        drift,
     };
 
     Facts {
