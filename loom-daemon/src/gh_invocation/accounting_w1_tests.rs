@@ -260,7 +260,9 @@ fn paginated_include_rows_count_their_pages_and_bare_paginate_is_unknown() {
     crate::forge_call_stats::set_test_sink_dir(Some(sink.path().to_path_buf()));
     let _ =
         inv("list.comments", &["api", "--paginate", "--include", "repos/o/r/issues"], &three).run();
-    let _ = inv("list.plain", &["api", "--paginate", "repos/o/r/issues"], &plain).run();
+    // A REST `--paginate` read is walked page by page (W5); cursor
+    // pagination is not, so its page count stays unknown.
+    let _ = inv("list.plain", &["api", "graphql", "--paginate", "-f", "query=q"], &plain).run();
     crate::forge_call_stats::set_test_sink_dir(None);
 
     let now = chrono::Utc::now().timestamp();

@@ -987,6 +987,10 @@ fn write_fake_gh_with_closed_race(
 printf '%s\n' "$*" >> "{log}"
 if [ "$1" = "api" ]; then
   case "$*" in
+    */comments*)
+      true # no lease comment -- empty stdout
+      exit 0
+      ;;
     *--include*)
       printf 'HTTP/2.0 200 OK\r\n\r\n'
       echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{updated_at}"}}]'
@@ -994,10 +998,6 @@ if [ "$1" = "api" ]; then
       ;;
     *"issues/{issue_number} --jq .state"*)
       echo "closed"
-      exit 0
-      ;;
-    */comments*)
-      true # no lease comment -- empty stdout
       exit 0
       ;;
   esac
@@ -1523,13 +1523,13 @@ fn write_fake_gh_with_lease(
 printf '%s\n' "$*" >> "{log}"
 if [ "$1" = "api" ]; then
   case "$*" in
+    */comments*)
+      {lease_stdout}
+      exit 0
+      ;;
     *--include*)
       printf 'HTTP/2.0 200 OK\r\n\r\n'
       echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{label_updated_at}"}}]'
-      exit 0
-      ;;
-    */comments*)
-      {lease_stdout}
       exit 0
       ;;
   esac
@@ -1718,14 +1718,14 @@ fn write_fake_gh_with_failing_lease_probe(
 printf '%s\n' "$*" >> "{log}"
 if [ "$1" = "api" ]; then
   case "$*" in
+    */comments*)
+      echo "simulated transient gh api failure (rate limit / timeout)" >&2
+      exit 1
+      ;;
     *--include*)
       printf 'HTTP/2.0 200 OK\r\n\r\n'
       echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{label_updated_at}"}}]'
       exit 0
-      ;;
-    */comments*)
-      echo "simulated transient gh api failure (rate limit / timeout)" >&2
-      exit 1
       ;;
   esac
   exit 0

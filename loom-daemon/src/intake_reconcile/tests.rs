@@ -55,7 +55,7 @@ fn run_once_labels_only_unlabeled_and_skips_prs() {
         r#"#!/bin/bash
 case "$*" in
   *"-X POST"*) echo "$*" >> {d}/posts.log ;;
-  *--paginate*) printf '1\t2026-09-01T00:00:00Z\t\n2\t2026-09-01T00:00:00Z\tbug\n3\t2026-09-01T00:00:00Z\tloom:curated\n' ;;
+  *"issues?state=open"*) printf '1\t2026-09-01T00:00:00Z\t\n2\t2026-09-01T00:00:00Z\tbug\n3\t2026-09-01T00:00:00Z\tloom:curated\n' ;;
   *) exit 1 ;;
 esac
 "#

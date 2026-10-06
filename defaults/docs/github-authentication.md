@@ -284,6 +284,19 @@ exploration) starves the daemon.
   `gh-config-by-owner/<owner>/<app-id>` = a reader); an env token is booked
   `env-token` and anything else `ambient`. It reads local files only, so it
   is safe to run on a rate-limited host.
+- Pages and agent sessions (W5): GitHub charges a `gh api --paginate` read
+  one request per page, so the `gh` facade walks a REST `--paginate` read
+  itself, one `gh api --include` execution and one ledger row per page
+  (`LOOM_GH_PAGE_WALK=0` restores the single call, booked "pages unknown").
+  A paginated call it cannot walk — GraphQL cursor pagination — is still one
+  row flagged `pu`, and the report's `unattributed` line counts those. An
+  agent session's own `gh` calls are rows too: the `gh` front books each
+  passthrough before it execs the real `gh`, as caller `agent.gh.<command>`
+  (never the argv), under the session's credential bucket, with the role
+  `agent-<LOOM_ROLE>` (`agent-session` outside a role) — so
+  `forge calls --by role` lists agent spend beside `reader` / `writer`.
+  Those rows are booked on intent (the exec replaces the process), so they
+  always count as charged, and a paginated agent call is `pu`.
 
 ## GitHub App identity (#4430)
 

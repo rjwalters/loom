@@ -13,10 +13,12 @@
 //!
 //! - A **spawn failure** and a **launcher routing refusal** are not recorded:
 //!   neither sent a request, so neither spent budget.
-//! - Every other completion is one row. A `--paginate` execution is still one
-//!   row although it may have issued several requests; since W1 the row
-//!   carries its page count when `--include` exposes it (`pg`), or flags it
-//!   unknown (`pu`), so the per-bucket "charged" figure can count pages.
+//! - Every other completion is one row. A REST `--paginate` read is walked
+//!   page by page by the facade (W5, [`super::paged`]), so it is one row per
+//!   page. A `--paginate` execution the walk does not take (GraphQL, or
+//!   `LOOM_GH_PAGE_WALK=0`) is still one row although it may have issued
+//!   several requests: it carries its page count when `--include` exposes
+//!   it (`pg`), or flags it unknown (`pu`).
 //! - `gh api rate_limit` is free on GitHub's side and is booked to
 //!   [`Pool::Other`] so it never inflates the core pool's "own" figure.
 //!

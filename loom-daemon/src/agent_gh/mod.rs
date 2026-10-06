@@ -31,11 +31,15 @@
 //!
 //! Reads served here are recorded against caller [`STATS_CALLER`] in
 //! `forge_call_stats` (`loom-daemon status` forge-calls row), so the `304`
-//! share is measurable. `forge_etag_store::fetch_conditional` already routes
-//! them to a repo's reader App when one is configured (#9537).
+//! share is measurable. Every passthrough is one row too ([`ledger`], W5):
+//! `agent.gh.<command>`, with the session's role and credential, so agent
+//! spend lands in the same per-bucket rollup (`loom-daemon forge calls`).
+//! `forge_etag_store::fetch_conditional` already routes served reads to a
+//! repo's reader App when one is configured (#9537).
 
 pub mod classify;
 pub mod go_sort;
+pub mod ledger;
 pub mod next_gh;
 pub mod pr_checks;
 pub mod session_env;
@@ -182,6 +186,9 @@ pub fn run(raw: &[OsString]) -> i32 {
             return out.code;
         }
         record("bypass", raw);
+        // W5: one ledger row per passthrough, written before the exec that
+        // replaces this process. It can never fail or delay the call.
+        ledger::book(raw, std::env::current_dir().ok().as_deref());
     }
     let err = crate::gh_invocation::transparent::exec(
         &next,

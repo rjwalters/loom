@@ -36,6 +36,10 @@
 //!   one writer retry on a credential failure; every row records the identity
 //!   role (`reader` / `writer` / `writer-fallback`).
 //!
+//! - [`paged`] (W5) — a REST `gh api --paginate` read is walked page by page,
+//!   each page its own execution and accounting row, so the ledger charges
+//!   what GitHub charges.
+//!
 //! `gh-cached` substitution for reads, the async/tokio variant and the Gitea
 //! decline move in with the slices that first need them (see #9985's slicing
 //! plan).
@@ -46,6 +50,7 @@ pub mod api_kind;
 pub mod billing;
 pub(crate) mod cwd_route;
 mod outcome;
+mod paged;
 mod reader_route;
 pub mod resolver;
 pub mod telemetry;
@@ -53,6 +58,7 @@ pub mod transparent;
 
 pub use crate::forge_identity::ReadClass;
 pub use affinity::{affinity_key, url_affinity_key};
+pub use paged::WALK_ENV as PAGE_WALK_ENV;
 pub use reader_route::{READ_SHED_ENV, SHED_MARKER};
 
 #[cfg(test)]
@@ -255,6 +261,13 @@ pub enum GhCompletion {
         until: std::time::SystemTime,
     },
 }
+
+/// Set to `1` on every child the facade spawns (W5): this execution is
+/// already a ledger row. The agent `gh` front ([`crate::agent_gh`]) books
+/// its own row per passthrough and skips one that carries this, so a
+/// `loom-daemon` command run inside an agent session — whose `gh` resolves
+/// to the front — is counted once, not twice.
+pub const BOOKED_ENV: &str = "LOOM_GH_BOOKED";
 
 /// The environment variables `gh` documents as taking precedence over a
 /// `GH_CONFIG_DIR`'s stored credential. [`GhInvocation::without_token_env`]
@@ -574,6 +587,10 @@ impl GhInvocation {
     /// - [`TOKEN_ENV_VARS`]: removed, only under
     ///   [`GhInvocation::without_token_env`].
     /// - Each [`GhInvocation::strip_env`] key: removed, last.
+    ///
+    /// The child also always carries [`BOOKED_ENV`] (set when the command is
+    /// assembled; it is a ledger marker, not routing, so it is not a plan
+    /// entry).
     #[must_use]
     pub fn env_plan(&self, child_context: Option<&TraceContext>) -> Vec<EnvEntry> {
         self.env_plan_with(std::env::var_os("LOOM_REPO"), child_context)
@@ -645,6 +662,7 @@ impl GhInvocation {
     fn command(&self, program: &str, child_context: Option<&TraceContext>) -> Command {
         let mut cmd = Command::new(program);
         cmd.args(&self.args);
+        cmd.env(BOOKED_ENV, "1");
         if let Some(dir) = &self.cwd {
             cmd.current_dir(dir);
         }
@@ -700,6 +718,24 @@ impl GhInvocation {
     }
 
     fn execute_with(self, program: &str, source: GhBinSource) -> Result<GhCompletion, ExecError> {
+        // W5: a REST `--paginate` read is walked page by page, each page one
+        // ordinary execution (span + accounting row) — see [`paged`].
+        if let (OutputContract::Captured { timeout }, Some(endpoint)) =
+            (self.contract, paged::plan(&self))
+        {
+            let run_page = |page: GhInvocation| match page.execute_once(program, source)? {
+                GhCompletion::Captured(completion) => Ok(completion),
+                _ => Err(ExecError::Collect(std::io::Error::other(
+                    "a captured page did not capture",
+                ))),
+            };
+            return paged::walk(&self, endpoint, timeout, run_page).map(GhCompletion::Captured);
+        }
+        self.execute_once(program, source)
+    }
+
+    /// Run this argv exactly once under its [`OutputContract`].
+    fn execute_once(self, program: &str, source: GhBinSource) -> Result<GhCompletion, ExecError> {
         let span = telemetry::InvocationSpan::open(&self);
         let mut cmd = self.command(program, span.child_context(&self.parent));
         match self.contract {
@@ -778,3 +814,7 @@ mod migrated_sites_tests_c;
 #[cfg(test)]
 #[path = "migrated_sites_tests_d.rs"]
 mod migrated_sites_tests_d;
+
+#[cfg(test)]
+#[path = "migrated_sites_tests_e.rs"]
+mod migrated_sites_tests_e;

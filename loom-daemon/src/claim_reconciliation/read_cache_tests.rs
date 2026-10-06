@@ -148,11 +148,12 @@ fi"#,
         assert_eq!(calls_matching(&log, "issues/42/comments"), 2);
     });
     std::env::remove_var(VERDICT_STALENESS_ENABLED_ENV);
+    // W5: the facade walks the pages itself, so the child sees page 1 as
+    // `api <path> --include` rather than one `--paginate` call.
+    let argv = std::fs::read_to_string(&log).unwrap();
     assert!(
-        std::fs::read_to_string(&log)
-            .unwrap()
-            .contains("comments?per_page=100 --paginate"),
-        "the paginated walk asks for 100 per page"
+        argv.contains("comments?per_page=100 --include"),
+        "the paginated walk asks for 100 per page: {argv}"
     );
 }
 

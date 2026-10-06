@@ -10,9 +10,15 @@
 //! **Charged** is what a row cost GitHub: `ok` rows × `max(pages, 1)`. A
 //! `304` is free, a rate-limited call spent nothing, a known-free request
 //! (`fr`, the `gh api rate_limit` probe) is counted under `free` instead, and
-//! an error is counted separately (it may or may not have been billed). A `--paginate` row
-//! without `--include` cannot know its pages and counts as one (`pu`); the
-//! rollup reports how many such rows it saw, so the lower bound is visible.
+//! an error is counted separately (it may or may not have been billed). A
+//! REST `--paginate` read is one row per page (W5: the facade walks the pages
+//! itself); a `--paginate` call it cannot walk — GraphQL, an agent session's
+//! own call — cannot know its pages and counts as one (`pu`), and the rollup
+//! reports how many such rows it saw, so the lower bound is visible.
+//!
+//! Agent sessions' `gh` passthroughs are rows too (W5,
+//! [`crate::agent_gh::ledger`]): booked before the exec, so always as
+//! charged, under the session's credential and `agent-<role>`.
 //!
 //! Reads only: a sink file read, no forge call. Lines written by an older
 //! binary carry no attribution and roll up under `unknown`.
@@ -51,7 +57,8 @@ pub enum GroupBy {
     Bucket,
     /// The facade operation name (`caller`).
     Caller,
-    /// The identity role (`reader` / `writer` / `writer-fallback`).
+    /// The identity role (`reader` / `writer` / `writer-fallback`), or
+    /// `agent-<LOOM_ROLE>` for a row the agent `gh` front booked (W5).
     Role,
     /// The `owner/repo` the row was for.
     Repo,

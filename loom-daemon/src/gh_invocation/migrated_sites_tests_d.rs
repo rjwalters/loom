@@ -148,8 +148,9 @@ fn sequence_hold_reads_are_counted_and_page_at_100() {
     assert_eq!(op_calls(&operations, "comment.list"), 1, "{operations:?}");
     assert_eq!(op_calls(&operations, "pr.view-state"), 1, "{operations:?}");
     let argv = std::fs::read_to_string(&log).unwrap();
+    // W5: page 1 of the facade's page walk (`--paginate` at the site).
     assert!(
-        argv.contains("api repos/o/r/issues/7/comments?per_page=100 --paginate"),
+        argv.contains("api repos/o/r/issues/7/comments?per_page=100 --include"),
         "{argv}"
     );
 }

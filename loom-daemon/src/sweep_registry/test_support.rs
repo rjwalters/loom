@@ -2212,7 +2212,7 @@ pub(crate) fn safehouse_down_combined_registry(
              printf '{{\"user\":{{\"login\":\"loom-fleet-dispatch[bot]\",\"type\":\"Bot\"}},\"id\":%d,\"created_at\":\"%s\",\"updated_at\":\"%s\",\"body\":\"%s\"}}\\n' \"$id\" \"$now\" \"$now\" \"$esc\" >> \"{store}\"\n\
              exit 0\n\
              fi\n\
-             if [[ \"$1\" == \"api\" && \"$*\" == *\"--include\"* ]]; then\n\
+             if [[ \"$1\" == \"api\" && \"$*\" == *\"--include\"* && \"$*\" != *\"/comments\"* ]]; then\n\
              printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'\n\
              printf '[{{\"number\":{issue},\"state\":\"open\",\"labels\":[{{\"name\":\"loom:building\"}}],\"updated_at\":\"{label_ts}\"}}]\\n'\n\
              exit 0\n\
