@@ -19,6 +19,7 @@ mod fit;
 mod fit_leak;
 mod fit_parity;
 mod fit_publish;
+mod fit_publish_v2;
 mod fit_rows;
 mod flag_timeline;
 mod fleet;
