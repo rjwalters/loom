@@ -330,3 +330,18 @@ fn a_closed_cross_repo_blocker_is_refused() {
     assert!(err.contains("o/r#3"), "{err}");
     assert!(f.mutations().is_empty());
 }
+
+/// #10161: a released daemon hold leaves its `(unstated)` record in the body.
+/// A later operator park must still write its own record, not be swallowed by
+/// the daemon's.
+#[test]
+fn a_leftover_daemon_hold_record_does_not_swallow_an_operator_park() {
+    let leftover = render_park(&[], Some("daemon"), Some(AT), Some("insta-crash quarantine"));
+    let mut f = Fake::new(&format!("Body.\n\n{leftover}\n"), &["loom:issue"]);
+    assert_eq!(run(&mut f, &req(&[], Some("operator"))).0, exit::OK);
+    let reasons: Vec<_> = parse(&f.state.body)
+        .into_iter()
+        .filter_map(|r| r.reason)
+        .collect();
+    assert_eq!(reasons, vec!["insta-crash quarantine", "operator"]);
+}

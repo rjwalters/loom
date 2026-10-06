@@ -99,6 +99,9 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "watchdog.stale_comment",
         "outcome.writeback_comment",
         "prless.comment",
+        "park_hold.issue_view",
+        "park_hold.issue_body",
+        "park_hold.issue_labels",
     ];
     for name in mapped {
         let op = gh_call::forge_op_for(name).unwrap_or_else(|| panic!("{name} is unmapped"));
