@@ -131,6 +131,14 @@
 #       on any repo whose suites outrun the default 600s (this one's `Shell
 #       Test Suites (hermetic)` alone takes ~10 minutes), and especially on
 #       the pass right after an exit-4 --redate-stale-checks re-run.
+#   6 = deferred behind another PR's chain-head merge lock (#10167): a PR on
+#       the same base was just re-dated and its required checks have not
+#       reported, so merging now would move the base under it again (the
+#       #10163 livelock). Checked only under --auto or LOOM_CHAIN_LOCK_GUARD=1,
+#       before anything is written; nothing merged, nothing failed. Bounded
+#       by LOOM_CHAIN_LOCK_CAP_SECS (default 1200, max 3600);
+#       LOOM_CHAIN_LOCK_OVERRIDE=1 bypasses it. Same caller contract as exits
+#       3/4/5 — re-queue, never a failure comment.
 
 set -euo pipefail
 
@@ -361,10 +369,10 @@ Precedence (highest wins):
   4. default: .loom/worktrees/issue-N or pr-N + sentinel guard
 
 Exit codes:
-  0 = merged (or --help)
-  1 = failed
+  0 = merged (or --help) · 1 = failed
   3 = PR head moved past the SHA this attempt gated on (#5579) · 5 = --auto's bounded settle-wait expired before CI finished (#8896) — neither is a failure; retry later
   4 = stale required checks re-running in place (#8914) or re-dated by a push (#8508) under --redate-stale-checks — not a failure; retry later
+  6 = deferred behind another PR's chain-head merge lock (#10167; --auto or LOOM_CHAIN_LOCK_GUARD=1; LOOM_CHAIN_LOCK_OVERRIDE=1 bypasses) — nothing written; retry later
 
 Examples:
   ./.loom/scripts/merge-pr.sh 123
@@ -644,10 +652,20 @@ if [[ "$PR_MERGED" == "true" ]]; then
   exit 0
 fi
 
-# Check if closed (not merged)
-if [[ "$PR_STATE" == "closed" ]]; then
-  error "PR #$PR_NUMBER is closed (not merged)"
-fi
+# Check if closed (not merged). One line: the code-line offset for the
+# chain-head merge lock guard below (verbatim, behavior-preserving join).
+[[ "$PR_STATE" != "closed" ]] || error "PR #$PR_NUMBER is closed (not merged)"
+
+# Chain-head merge lock (#10167): while ANOTHER PR on this base is a re-dating
+# chain head whose required checks have not reported, defer with exit 6 BEFORE
+# anything below writes (ref pins, re-dates, comments, the merge). The decision
+# is `loom-daemon merge-pr chain-lock` (loom-daemon/src/merge_pr/chain_lock.rs):
+# trusted marker, capped at LOOM_CHAIN_LOCK_CAP_SECS, unreadable state defers
+# only within the cap. Runs under --auto (Champion) or LOOM_CHAIN_LOCK_GUARD=1,
+# so a plain hand-merge is not held; LOOM_CHAIN_LOCK_OVERRIDE=1 bypasses it.
+# Any exit other than 0/6 (an older daemon without the verb) proceeds with a
+# warning: the lock only orders merges, it never judges a tree.
+_check_chain_lock() { [[ "$FORGE_TYPE" == "github" ]] && [[ "$AUTO_MERGE" == "true" || "${LOOM_CHAIN_LOCK_GUARD:-0}" == "1" ]] || return 0; local msg rc=0 base_ref; base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"; msg="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr chain-lock --pr "$PR_NUMBER" --repo "$REPO_NWO" --base-ref "${base_ref:-${DEFAULT_BRANCH_NAME:-main}}" --repo-root "${REPO_ROOT:-.}")" || rc=$?; if [[ $rc -eq 0 ]]; then [[ "$msg" == "LOOM-CHAIN-LOCK-CLEAR" ]] || warning "$msg"; return 0; fi; if [[ $rc -ne 6 ]]; then warning "Chain-head merge lock (#10167) did not run ('merge-pr chain-lock' exited $rc${msg:+: $msg}); proceeding. Roll loom-daemon to restore it."; return 0; fi; if [[ "$DRY_RUN" == "true" ]]; then warning "[dry-run] Would DEFER merge of PR #$PR_NUMBER (exit 6): $msg"; return 0; fi; warning "$msg" >&2; warning "Exiting 6: merge deferred behind a re-dating chain head (#10167); nothing was written. Re-attempt on a later pass." >&2; exit 6; }; _check_chain_lock
 
 # ---------------------------------------------------------------------------
 # Pre-merge merge-ordering guard (#3747, stacked-PR v2 item 2; reshaped by
@@ -2278,6 +2296,9 @@ _revalidate_merge_guards() {
   PR_LABELS="$(echo "$fresh" | jq -r '.labels[]?.name // empty' 2>/dev/null || true)"
   _check_loom_pr_label
   _check_verdict_label_contradiction
+  # #10167: a chain head may have taken its lock while --auto waited. Nothing
+  # forge-side has been written yet, so exit 6 here still writes nothing.
+  _check_chain_lock
 }
 
 if [[ "$AUTO_MERGE" == "true" ]]; then
