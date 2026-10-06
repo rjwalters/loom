@@ -112,6 +112,8 @@ pub(crate) fn handle_session_command(
                     "running"
                 } else if status.restarting {
                     "restarting"
+                } else if status.held {
+                    "stopped, held (operator stop)"
                 } else {
                     "stopped"
                 },

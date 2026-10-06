@@ -73,6 +73,7 @@ pub mod codex_check;
 pub mod codex_hooks;
 pub mod codex_probe;
 pub mod codex_reset;
+pub mod docker_cli;
 pub mod failure_counts;
 pub mod health;
 pub mod locking;
@@ -92,6 +93,7 @@ pub mod ranking_weekly;
 pub mod rng;
 pub mod rotation;
 pub mod select;
+pub mod session_hold;
 pub mod session_lifecycle;
 pub mod status_order;
 

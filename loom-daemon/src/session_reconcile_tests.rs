@@ -11,6 +11,7 @@ use super::*;
 use crate::tokens_pool::account_lifecycle::{AccountLifecycle, ProcessCodexRunner};
 use crate::tokens_pool::account_registry::account_inventory;
 use crate::tokens_pool::profile_root_env::ProfileRootEnv;
+use crate::tokens_pool::session_hold;
 use crate::tokens_pool::session_lifecycle::{mark_session_managed, parse_inspect_line, ExecOutput};
 
 #[derive(Default)]
@@ -22,6 +23,15 @@ struct Fake {
     /// `(container, image, workspace)` per `create`.
     creates: Mutex<Vec<(String, String, PathBuf)>>,
     fail_create: Mutex<bool>,
+    /// `docker inspect` fails with this error (Docker down / timed out).
+    fail_inspect: Mutex<Option<String>>,
+    /// A started/created container exits at once: `Some(true)` leaves it
+    /// `Restarting`, `Some(false)` stopped.
+    dies_after_start: Mutex<Option<bool>>,
+    /// On the Nth `inspect` call (1-based), act like a concurrent
+    /// `accounts session stop`: write the hold into this profile, then
+    /// `docker stop` the container (still present, not yet `rm`ed).
+    stop_on_inspect: Mutex<Option<(usize, PathBuf)>>,
 }
 
 impl Fake {
@@ -59,7 +69,21 @@ impl Fake {
 impl ContainerRunner for Fake {
     fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
         self.log("inspect");
-        Ok(self.containers.lock().unwrap().get(container).cloned())
+        if let Some(error) = self.fail_inspect.lock().unwrap().clone() {
+            bail!("docker inspect {container} failed: {error}");
+        }
+        let n = self.count("inspect");
+        let mut containers = self.containers.lock().unwrap();
+        if let Some((at, profile)) = self.stop_on_inspect.lock().unwrap().clone() {
+            if n == at {
+                session_hold::write_hold(&profile, session_hold::now_unix_ms()).unwrap();
+                if let Some(state) = containers.get_mut(container) {
+                    state.running = false;
+                    state.restarting = false;
+                }
+            }
+        }
+        Ok(containers.get(container).cloned())
     }
     fn create(
         &self,
@@ -78,16 +102,19 @@ impl ContainerRunner for Fake {
             image.into(),
             workspace.to_path_buf(),
         ));
-        self.seed(container, true, false, Some(workspace));
+        let dies = *self.dies_after_start.lock().unwrap();
+        self.seed(container, dies.is_none(), dies == Some(true), Some(workspace));
         Ok(())
     }
     fn start_existing(&self, container: &str) -> Result<()> {
         self.log("start_existing");
+        let dies = *self.dies_after_start.lock().unwrap();
         let mut containers = self.containers.lock().unwrap();
         let state = containers
             .get_mut(container)
             .ok_or_else(|| anyhow!("no such container"))?;
-        state.running = true;
+        state.running = dies.is_none();
+        state.restarting = dies == Some(true);
         Ok(())
     }
     fn has_active_exec(&self, container: &str) -> Result<bool> {
@@ -105,7 +132,13 @@ impl ContainerRunner for Fake {
     }
     fn exec_capture(&self, _c: &str, _argv: &[&str], _t: Duration) -> Result<ExecOutput> {
         self.log("exec_capture");
-        bail!("not used")
+        Ok(ExecOutput {
+            success: true,
+            unavailable: false,
+            timed_out: false,
+            exit_code: Some(0),
+            output: "Logged in using ChatGPT".into(),
+        })
     }
     fn window_exists(&self, _c: &str, _s: &str, _w: &str) -> Result<bool> {
         self.log("window_exists");
@@ -167,7 +200,22 @@ fn pass(
     state: &mut ReconcileState,
     now: u64,
 ) -> Vec<Outcome> {
-    reconcile_accounts(lifecycle, &env.accounts, private, Path::new("/srv/checkouts"), state, now)
+    pass_with(lifecycle, &env.accounts, &[], private, Path::new("/srv/checkouts"), state, now)
+}
+
+/// One pass over `accounts`, with `other_roots` contributing to the
+/// cross-root [`AccountIndex`] only.
+fn pass_with(
+    lifecycle: &mut SessionLifecycle<Fake>,
+    accounts: &[AccountDescriptor],
+    other_roots: &[AccountDescriptor],
+    private: &dyn Fn(&AccountDescriptor) -> anyhow::Result<bool>,
+    fallback: &Path,
+    state: &mut ReconcileState,
+    now: u64,
+) -> Vec<Outcome> {
+    let index = AccountIndex::from_inventories(&[accounts, other_roots]);
+    reconcile_accounts(lifecycle, accounts, &index, private, fallback, state, now)
         .into_iter()
         .map(|o| o.outcome)
         .collect()
@@ -484,4 +532,233 @@ fn a_failing_start_backs_off_instead_of_rerunning_every_interval() {
     let out = pass(&mut lifecycle, &env, &host, &mut state, 10_000);
     assert!(out[0].started(), "{out:?}");
     assert_eq!(pass(&mut lifecycle, &env, &host, &mut state, 10_060), vec![Outcome::Running]);
+}
+
+// ---- operator hold (verdict blocker 1) --------------------------------------
+
+fn profile(env: &Env, name: &str) -> PathBuf {
+    env.accounts
+        .iter()
+        .find(|a| a.id.name == name)
+        .unwrap()
+        .credential_reference
+        .clone()
+}
+
+#[test]
+#[serial]
+fn a_stopped_session_stays_down_and_costs_no_docker_call() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    lifecycle
+        .runner()
+        .seed(&container_name("alice"), true, false, Some(Path::new("/w")));
+    let status = lifecycle.stop("alice", false).unwrap();
+    assert!(status.held && !status.running);
+    let calls_after_stop = lifecycle.runner().calls().len();
+    let mut state = ReconcileState::default();
+    for now in [0, 60, 600, 6_000] {
+        assert_eq!(pass(&mut lifecycle, &env, &host, &mut state, now), vec![Outcome::Held]);
+    }
+    assert_eq!(lifecycle.runner().calls().len(), calls_after_stop, "no docker call while held");
+    assert_eq!(lifecycle.runner().count("create"), 0);
+    assert_eq!(lifecycle.runner().count("start_existing"), 0);
+}
+
+#[test]
+#[serial]
+fn an_operator_start_lifts_the_hold_and_its_workspace_survives_a_daemon_restart() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    lifecycle.stop("alice", false).unwrap();
+    let started = lifecycle
+        .start_with_workspace("alice", Some(Path::new("/home/u/GitHub")))
+        .unwrap();
+    assert!(!started.held);
+    let mut state = ReconcileState::default();
+    assert_eq!(pass(&mut lifecycle, &env, &host, &mut state, 0), vec![Outcome::Running]);
+    // The container disappears and the daemon restarts (fresh in-memory state):
+    // it comes back on the operator's workspace and image, not the guess.
+    lifecycle.runner().containers.lock().unwrap().clear();
+    let mut state = ReconcileState::default();
+    assert_eq!(
+        pass(&mut lifecycle, &env, &host, &mut state, 60),
+        vec![Outcome::Recreated {
+            workspace: "/home/u/GitHub".into()
+        }]
+    );
+    let creates = lifecycle.runner().creates.lock().unwrap().clone();
+    assert_eq!(creates.len(), 2);
+    assert_eq!(creates[1].1, "example/session:pinned");
+    assert_eq!(creates[1].2, Path::new("/home/u/GitHub"));
+}
+
+#[test]
+#[serial]
+fn a_pass_inspecting_between_stops_hold_and_rm_never_starts_the_container() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    lifecycle
+        .runner()
+        .seed(&container_name("alice"), true, false, Some(Path::new("/w")));
+    // `stop` writes its hold and `docker stop`s while the pass inspects.
+    *lifecycle.runner().stop_on_inspect.lock().unwrap() = Some((1, profile(&env, "alice")));
+    let mut state = ReconcileState::default();
+    assert_eq!(pass(&mut lifecycle, &env, &host, &mut state, 0), vec![Outcome::Held]);
+    assert_eq!(lifecycle.runner().mutations(), Vec::<String>::new());
+}
+
+#[test]
+#[serial]
+fn a_hold_written_during_the_reconcile_start_still_blocks_docker_start() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    // Crashed (stopped) container; the pass decides to resume it, and `stop`
+    // lands between that decision and the start's own inspect.
+    lifecycle
+        .runner()
+        .seed(&container_name("alice"), false, false, Some(Path::new("/w")));
+    *lifecycle.runner().stop_on_inspect.lock().unwrap() = Some((2, profile(&env, "alice")));
+    let mut state = ReconcileState::default();
+    assert_eq!(pass(&mut lifecycle, &env, &host, &mut state, 0), vec![Outcome::Held]);
+    assert_eq!(lifecycle.runner().mutations(), Vec::<String>::new());
+    // The hold-respecting recreate path refuses outright, before any docker call.
+    let calls = lifecycle.runner().calls().len();
+    let error =
+        recreate_container(&mut lifecycle, "alice", Path::new("/w"), None, &|| true).unwrap_err();
+    assert!(error.downcast_ref::<OperatorHeld>().is_some(), "{error:#}");
+    assert_eq!(lifecycle.runner().calls().len(), calls);
+}
+
+#[test]
+#[serial]
+fn a_hold_or_disable_in_any_root_holds_the_account_everywhere() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    let mut state = ReconcileState::default();
+    let fallback = Path::new("/srv/checkouts");
+    // Another root lists alice disabled.
+    let mut disabled = env.accounts.clone();
+    disabled.iter_mut().for_each(|a| a.enabled = false);
+    let out = pass_with(&mut lifecycle, &env.accounts, &disabled, &host, fallback, &mut state, 0);
+    assert!(out.is_empty(), "{out:?}");
+    // Another root resolves alice to a different profile directory holding a stop.
+    let other = tempfile::tempdir().unwrap();
+    session_hold::write_hold(other.path(), session_hold::now_unix_ms()).unwrap();
+    let mut elsewhere = env.accounts.clone();
+    elsewhere
+        .iter_mut()
+        .for_each(|a| a.credential_reference = other.path().to_path_buf());
+    let out = pass_with(&mut lifecycle, &env.accounts, &elsewhere, &host, fallback, &mut state, 60);
+    assert_eq!(out, vec![Outcome::Held]);
+    assert_eq!(lifecycle.runner().calls(), Vec::<String>::new());
+}
+
+// ---- a start that does not stick (verdict blocker 2) -------------------------
+
+#[test]
+#[serial]
+fn a_container_that_dies_after_every_start_is_restarted_on_the_backoff_schedule() {
+    for restarting in [false, true] {
+        let env = setup(&["alice"], &["alice"]);
+        let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+        lifecycle
+            .runner()
+            .seed(&container_name("alice"), false, false, Some(Path::new("/w")));
+        *lifecycle.runner().dies_after_start.lock().unwrap() = Some(restarting);
+        let mut state = ReconcileState::default();
+        let passes = 20;
+        let mut outcomes = Vec::new();
+        for tick in 0..passes {
+            let now = tick * DEFAULT_SESSION_RECONCILE_INTERVAL_SECS;
+            outcomes.extend(pass(&mut lifecycle, &env, &host, &mut state, now));
+        }
+        let starts = lifecycle.runner().count("start_existing");
+        // Stopped: starts at t=0, 180, 480, 1020 (backoff 120, 240, 480 after
+        // each dead start). Restarting: Docker owns the retries after the
+        // first failed confirmation, so only the first start is ours.
+        assert_eq!(starts, if restarting { 1 } else { 4 }, "{outcomes:?}");
+        assert!(matches!(outcomes[1], Outcome::Failed { retry_at: 180, .. }), "{outcomes:?}");
+        assert!(outcomes
+            .iter()
+            .any(|o| matches!(o, Outcome::BackingOff { .. })));
+    }
+}
+
+// ---- Docker unavailable (verdict 8) -----------------------------------------
+
+#[test]
+#[serial]
+fn docker_unavailable_skips_the_whole_pass_and_backs_off_the_pass_not_the_accounts() {
+    let env = setup(&["alice", "bob"], &["alice", "bob"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    for name in ["alice", "bob"] {
+        lifecycle
+            .runner()
+            .seed(&container_name(name), false, false, Some(Path::new("/w")));
+    }
+    *lifecycle.runner().fail_inspect.lock().unwrap() =
+        Some("Cannot connect to the Docker daemon".into());
+    let mut state = ReconcileState::default();
+    let mut passes = Vec::new();
+    for tick in 0..10 {
+        passes.push(pass(&mut lifecycle, &env, &host, &mut state, tick * 60));
+    }
+    // The first read fails: that pass stops there (bob is never inspected).
+    assert!(
+        matches!(passes[0][..], [Outcome::DockerUnavailable { retry_at: 120, .. }]),
+        "{passes:?}"
+    );
+    assert!(passes[1]
+        .iter()
+        .all(|o| matches!(o, Outcome::BackingOff { retry_at: 120 })));
+    assert_eq!(lifecycle.runner().mutations(), Vec::<String>::new());
+    // Pass-level backoff: reads at t=0, 120, 360 only, one per pass.
+    assert_eq!(lifecycle.runner().count("inspect"), 3);
+    // Docker comes back: no per-account failure was counted, so both
+    // stopped containers are resumed on the very next pass.
+    *lifecycle.runner().fail_inspect.lock().unwrap() = None;
+    assert_eq!(
+        pass(&mut lifecycle, &env, &host, &mut state, 1_000),
+        vec![Outcome::Resumed, Outcome::Resumed]
+    );
+}
+
+// ---- workspace guess (verdict 3) --------------------------------------------
+
+#[test]
+#[serial]
+fn a_guessed_workspace_of_root_is_refused_not_mounted() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    let mut state = ReconcileState::default();
+    let out = pass_with(&mut lifecycle, &env.accounts, &[], &host, Path::new("/"), &mut state, 0);
+    let Outcome::Failed { error, .. } = &out[0] else {
+        panic!("{out:?}")
+    };
+    assert!(error.contains("whole filesystem"), "{error}");
+    assert_eq!(lifecycle.runner().count("create"), 0);
+}
+
+// ---- after-start probe bypasses the cache (verdict 5) ------------------------
+
+#[test]
+#[serial]
+fn the_after_start_probe_ignores_a_recent_cached_probe() {
+    use crate::tokens_pool::health::{record_probe_at, ProbeOutcome};
+    let env = setup(&["alice"], &["alice"]);
+    let lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    lifecycle
+        .runner()
+        .seed(&container_name("alice"), true, false, Some(Path::new("/w")));
+    let id = &env.accounts[0].id;
+    record_probe_at(env.workspace.path(), id, ProbeOutcome::LoggedIn, "test", 1_000).unwrap();
+    let cached = lifecycle.refresh_health_at(&env.accounts, 1_010).unwrap();
+    assert_eq!(cached[0].effect, None);
+    assert_eq!(lifecycle.runner().count("exec_capture"), 0);
+    let fresh = lifecycle
+        .refresh_health_with_ttl(&env.accounts, 1_010, 0)
+        .unwrap();
+    assert!(fresh[0].effect.is_some(), "{fresh:?}");
+    assert_eq!(lifecycle.runner().count("exec_capture"), 1);
 }
