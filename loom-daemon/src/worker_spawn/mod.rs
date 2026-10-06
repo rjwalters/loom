@@ -316,14 +316,18 @@ fn run_preflight(
     // `gh` this worker (and its children) resolve. Its directory goes first on
     // this process's own PATH so the admission below, the runtime child and
     // the container re-exec all observe one environment. No policy (or a
-    // repo-origin one) resolves to `None` and nothing changes. Tests inject
-    // `egress_sources` and never mutate the process environment.
-    let worker_egress = egress_sources
+    // repo-origin one) resolves to `None` and nothing changes; an invalid one
+    // refuses, `observe` logs. Tests inject `egress_sources`, never the env.
+    let admission = egress_sources
         .map_or_else(
-            crate::forge_egress::worker_env::WorkerEgress::try_from_process,
-            crate::forge_egress::worker_env::WorkerEgress::try_from_sources,
+            crate::forge_egress::worker_env::WorkerEgress::admit_process,
+            crate::forge_egress::worker_env::WorkerEgress::admit,
         )
         .map_err(|f| LaunchError::config(crate::forge_egress::worker_env::refusal_message(&f)))?;
+    for warning in &admission.warnings {
+        log::warn!("{}", crate::forge_egress::worker_env::observe_message(warning));
+    }
+    let worker_egress = admission.egress;
     if let (None, Some(path)) = (
         egress_sources,
         worker_egress

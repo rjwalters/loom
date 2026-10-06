@@ -42,6 +42,35 @@ pub struct WorkerEgress {
     pub required: bool,
 }
 
+/// The outcome of [`WorkerEgress::admit`] for a spawn that may proceed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Admission {
+    /// An env/machine policy was loaded. `false` is the only state in which a
+    /// caller may keep the legacy `~/.config/gh` / `GH_TOKEN` credentials
+    /// without logging why.
+    pub configured: bool,
+    /// The managed launcher to install; `None` with `configured` only under a
+    /// valid `observe` policy whose launcher is unusable (see `warnings`).
+    pub egress: Option<WorkerEgress>,
+    /// `observe` findings: logged by the caller, never a refusal.
+    pub warnings: Vec<Finding>,
+}
+
+impl Admission {
+    /// The one-line status `forge egress container-args` prints first, so the
+    /// shell never reads "no output" as "no policy": `unconfigured`,
+    /// `managed` (the docker arguments follow), or `observe-unmanaged`
+    /// (a valid observe policy whose launcher is unusable: logged, legacy).
+    #[must_use]
+    pub fn status(&self) -> &'static str {
+        match (&self.egress, self.configured) {
+            (Some(_), _) => "managed",
+            (None, true) => "observe-unmanaged",
+            (None, false) => "unconfigured",
+        }
+    }
+}
+
 impl WorkerEgress {
     /// Resolve from injected `sources` (hermetic tests never touch `/etc`).
     /// `Some` only for a loaded env/machine policy whose
@@ -54,17 +83,30 @@ impl WorkerEgress {
     }
 
     /// [`Self::from_sources`] that keeps a *configured* policy distinguishable
-    /// from an absent one. `Ok(None)` is only a genuinely unconfigured host (no
-    /// policy, a repo-origin one, or no `toolchain.launcherPath` named); `Err`
-    /// is a named refusal: an unreadable/invalid policy, or — under
-    /// `enforcement.api = required` — a launcher that is not an existing
-    /// absolute path. Never fall back to host credentials on `Err` (#9987).
+    /// from an absent one: [`Self::admit`] without its `observe` warnings.
     ///
     /// # Errors
     /// The [`Finding`] naming the policy or launcher failure.
     pub fn try_from_sources(sources: &PolicySources) -> Result<Option<Self>, Box<Finding>> {
+        Self::admit(sources).map(|a| a.egress)
+    }
+
+    /// Resolve `sources` into an [`Admission`]. `Ok` with `configured: false`
+    /// is only a genuinely unconfigured host (no policy, or a repo-origin one,
+    /// which may not choose an executable). An env/machine policy is validated
+    /// (schema version, schema, [`policy::assert_policy_shape`]) BEFORE any
+    /// routing result is returned, and `Err` is a named refusal: an
+    /// unreadable policy, an unsupported `schemaVersion` (fail closed, never
+    /// observe-only), or — unless the policy is a valid `observe` one — any
+    /// shape finding or a launcher that is not an existing absolute path.
+    /// Under `observe` those are [`Admission::warnings`] and the spawn
+    /// proceeds. Never fall back to host credentials on `Err` (#9987).
+    ///
+    /// # Errors
+    /// The [`Finding`] naming the policy or launcher failure.
+    pub fn admit(sources: &PolicySources) -> Result<Admission, Box<Finding>> {
         let doc = match policy::resolve(sources) {
-            Resolution::Unconfigured if !sources.managed => return Ok(None),
+            Resolution::Unconfigured if !sources.managed => return Ok(Admission::default()),
             Resolution::Unconfigured => {
                 return Err(Box::new(
                     Finding::new(
@@ -96,41 +138,61 @@ impl WorkerEgress {
             Resolution::Loaded(doc) => doc,
         };
         if !doc.origin.may_choose_executable() {
-            return Ok(None);
+            return Ok(Admission::default());
         }
-        let required = dig_str(&doc.data, &["enforcement", "api"]) == "required";
-        let configured = dig_str(&doc.data, &["toolchain", "launcherPath"]);
-        if configured.is_empty() {
-            return Ok(None);
-        }
-        let launcher = Path::new(configured);
-        if !launcher.is_absolute() || !launcher.exists() {
-            if !required {
-                return Ok(None);
+        // `false` for an unknown schemaVersion or a missing/out-of-enum
+        // `enforcement.api`: those fail closed as `required`.
+        let observe = policy::is_observe_only(&doc.data);
+        let source = doc.path.display().to_string();
+        let mut warnings = Vec::new();
+        for mut finding in policy::assert_policy_shape(&doc.data) {
+            finding.source = format!("{} ({source})", finding.source);
+            if !observe {
+                return Err(Box::new(finding));
             }
-            return Err(Box::new(
-                Finding::new(
-                    "toolchain.launcher-missing",
-                    "toolchain.launcherPath is an existing absolute path",
-                )
-                .expected("an existing absolute path")
-                .observed(configured.to_string())
-                .source(doc.path.display().to_string())
-                .remedy("provision the managed gh launcher at toolchain.launcherPath"),
-            ));
+            warnings.push(finding);
+        }
+        let configured = dig_str(&doc.data, &["toolchain", "launcherPath"]);
+        let launcher = Path::new(configured);
+        if configured.is_empty() || !launcher.is_absolute() || !launcher.exists() {
+            let finding = Finding::new(
+                "toolchain.launcher-missing",
+                "toolchain.launcherPath is an existing absolute path",
+            )
+            .expected("an existing absolute path")
+            .observed(if configured.is_empty() {
+                "(empty or absent)"
+            } else {
+                configured
+            })
+            .source(source)
+            .remedy("provision the managed gh launcher at toolchain.launcherPath");
+            if !observe {
+                return Err(Box::new(finding));
+            }
+            warnings.push(finding);
+            return Ok(Admission {
+                configured: true,
+                egress: None,
+                warnings,
+            });
         }
         let upstream = dig_str(&doc.data, &["toolchain", "upstreamGhPath"]);
         let credential = dig_str(&doc.data, &["principal", "credentialRef"])
             .strip_prefix("file:")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute());
-        Ok(Some(Self {
-            launcher: launcher.to_path_buf(),
-            upstream_gh: Some(PathBuf::from(upstream)).filter(|p| p.is_absolute()),
-            policy_file: doc.path.clone(),
-            credential_file: credential,
-            required,
-        }))
+        Ok(Admission {
+            configured: true,
+            egress: Some(Self {
+                launcher: launcher.to_path_buf(),
+                upstream_gh: Some(PathBuf::from(upstream)).filter(|p| p.is_absolute()),
+                policy_file: doc.path.clone(),
+                credential_file: credential,
+                required: !observe,
+            }),
+            warnings,
+        })
     }
 
     /// Resolve from the live process. Off in a unit-test build and under
@@ -147,11 +209,21 @@ impl WorkerEgress {
     /// # Errors
     /// The [`Finding`] naming the policy or launcher failure.
     pub fn try_from_process() -> Result<Option<Self>, Box<Finding>> {
+        Self::admit_process().map(|a| a.egress)
+    }
+
+    /// [`Self::admit`] against the live process (off, i.e. unconfigured, in a
+    /// unit-test build and under the resolver's opt-out, like
+    /// [`Self::from_process`]).
+    ///
+    /// # Errors
+    /// The [`Finding`] naming the policy or launcher failure.
+    pub fn admit_process() -> Result<Admission, Box<Finding>> {
         use crate::gh_invocation::resolver::{policy_rung_declined, NO_POLICY_LAUNCHER_ENV};
         if cfg!(test) || policy_rung_declined(std::env::var_os(NO_POLICY_LAUNCHER_ENV).as_deref()) {
-            return Ok(None);
+            return Ok(Admission::default());
         }
-        Self::try_from_sources(&PolicySources::from_process(None))
+        Self::admit(&PolicySources::from_process(None))
     }
 
     #[must_use]
@@ -251,6 +323,16 @@ impl WorkerEgress {
 pub fn refusal_message(finding: &Finding) -> String {
     format!(
         "forge-egress: worker spawn refused (enforcement.api=required): [{}] expected {}, \
+         observed {} — {}",
+        finding.code, finding.expected, finding.observed, finding.remedy
+    )
+}
+
+/// The log line for an `observe` finding that did not refuse the spawn.
+#[must_use]
+pub fn observe_message(finding: &Finding) -> String {
+    format!(
+        "forge-egress: observe (enforcement.api=observe, spawn proceeds): [{}] expected {}, \
          observed {} — {}",
         finding.code, finding.expected, finding.observed, finding.remedy
     )

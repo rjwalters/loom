@@ -582,3 +582,50 @@ fn no_policy_launcher_opt_out_makes_the_stub_win_over_the_launcher() {
         assert_eq!(o["ghSource"], "policy", "{opt_out:?}: {o:#}");
     }
 }
+
+/// #9987: `container-args` never lets "no output" mean "no policy". The status
+/// line is explicit, and a configured policy that cannot be honoured exits 78
+/// with no status (so `spawn-claude.sh` cannot restore ambient credentials).
+#[test]
+fn container_args_status_is_explicit_and_a_bad_configured_policy_refuses() {
+    let sb = Sandbox::new();
+    let run = |policy: Option<&Path>| {
+        let mut c = sb.cmd(&["container-args"]);
+        c.env_remove("LOOM_GH_NO_POLICY_LAUNCHER");
+        if let Some(p) = policy {
+            c.env("LOOM_FORGE_EGRESS_POLICY", p);
+        }
+        c.output().unwrap()
+    };
+    if !machine_policy_present() {
+        let out = run(None);
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "loom-forge-egress: unconfigured\n");
+    }
+    let cases: [(&str, Box<dyn Fn(&mut Value)>); 3] = [
+        (
+            "policy.schema",
+            Box::new(|p| {
+                p["toolchain"].as_object_mut().unwrap().remove("launcherPath");
+            }),
+        ),
+        ("policy.schema", Box::new(|p| p["toolchain"]["launcherPath"] = "".into())),
+        ("policy.schema-version", Box::new(|p| p["schemaVersion"] = 2.into())),
+    ];
+    for (code, mutate) in cases {
+        let path = sb.policy(|p| {
+            p["enforcement"]["api"] = "required".into();
+            mutate(p);
+        });
+        let out = run(Some(&path));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{code}: {stderr}");
+        assert!(out.stdout.is_empty(), "{code}: no status, no args");
+        assert!(stderr.contains(code), "{code}: {stderr}");
+    }
+    let path = sb.policy(|p| p["enforcement"]["api"] = "required".into());
+    let out = run(Some(&path));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.starts_with("loom-forge-egress: managed\n-v\n"), "{stdout}");
+}

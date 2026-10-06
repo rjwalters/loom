@@ -3,6 +3,13 @@ use super::*;
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 
+/// The vendored example policy: schema-valid, so only the field a test
+/// changes can produce a finding.
+fn example() -> serde_json::Value {
+    serde_json::from_str(include_str!("../../tests/fixtures/forge-egress/policy.example.json"))
+        .unwrap()
+}
+
 struct Fx {
     dir: tempfile::TempDir,
 }
@@ -19,15 +26,11 @@ impl Fx {
         std::fs::write(&cred, "k").unwrap();
         let upstream = dir.path().join("upstream-gh");
         std::fs::write(&upstream, "x").unwrap();
-        let doc = json!({
-            "schemaVersion": 1,
-            "toolchain": {
-                "launcherPath": launcher.display().to_string(),
-                "upstreamGhPath": upstream.display().to_string(),
-            },
-            "principal": {"credentialRef": format!("file:{}", cred.display())},
-            "enforcement": {"api": api},
-        });
+        let mut doc = example();
+        doc["toolchain"]["launcherPath"] = json!(launcher.display().to_string());
+        doc["toolchain"]["upstreamGhPath"] = json!(upstream.display().to_string());
+        doc["principal"]["credentialRef"] = json!(format!("file:{}", cred.display()));
+        doc["enforcement"]["api"] = json!(api);
         let policy = dir.path().join("policy.json");
         std::fs::write(&policy, doc.to_string()).unwrap();
         let sources = PolicySources {
@@ -155,24 +158,91 @@ fn absent_policy_is_ok_none() {
     assert_eq!(WorkerEgress::try_from_sources(&none), Ok(None));
 }
 
+/// `example()` with `edit` applied, written as the env-tier policy.
+fn admit_with(edit: impl FnOnce(&mut serde_json::Value)) -> Result<Admission, Box<Finding>> {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("policy.json");
+    let mut doc = example();
+    doc["toolchain"]["launcherPath"] = json!(dir.path().join("nope/gh").display().to_string());
+    edit(&mut doc);
+    std::fs::write(&policy, doc.to_string()).unwrap();
+    WorkerEgress::admit(&env_sources(policy))
+}
+
 #[test]
-fn missing_launcher_refuses_under_required_only() {
-    for (api, refuses) in [("required", true), ("observe", false)] {
-        let dir = tempfile::tempdir().unwrap();
-        let policy = dir.path().join("policy.json");
-        let doc = json!({
-            "schemaVersion": 1,
-            "toolchain": {"launcherPath": dir.path().join("nope/gh").display().to_string()},
-            "enforcement": {"api": api},
-        });
-        std::fs::write(&policy, doc.to_string()).unwrap();
-        let got = WorkerEgress::try_from_sources(&env_sources(policy));
-        if refuses {
-            assert_eq!(got.unwrap_err().code, "toolchain.launcher-missing");
-        } else {
-            assert_eq!(got, Ok(None));
-        }
+fn missing_launcher_refuses_under_required_and_is_logged_under_observe() {
+    let f = admit_with(|d| d["enforcement"]["api"] = json!("required")).unwrap_err();
+    assert_eq!(f.code, "toolchain.launcher-missing");
+    let a = admit_with(|d| d["enforcement"]["api"] = json!("observe")).unwrap();
+    assert!(a.configured && a.egress.is_none());
+    assert_eq!(a.status(), "observe-unmanaged");
+    assert_eq!(a.warnings[0].code, "toolchain.launcher-missing");
+    assert!(observe_message(&a.warnings[0]).contains("spawn proceeds"));
+}
+
+#[test]
+fn required_policy_without_launcher_path_refuses_never_none() {
+    // Absent: schema `required`; the configured policy must not read as none.
+    let f = admit_with(|d| {
+        d["enforcement"]["api"] = json!("required");
+        d["toolchain"].as_object_mut().unwrap().remove("launcherPath");
+    })
+    .unwrap_err();
+    assert_eq!(f.code, "policy.schema");
+    assert!(f.observed.contains("launcherPath"), "{f:?}");
+    // Empty: fails the schema's `^/` pattern.
+    let f = admit_with(|d| {
+        d["enforcement"]["api"] = json!("required");
+        d["toolchain"]["launcherPath"] = json!("");
+    })
+    .unwrap_err();
+    assert_eq!(f.code, "policy.schema");
+    assert!(f.observed.contains("launcherPath"), "{f:?}");
+}
+
+#[test]
+fn unsupported_schema_version_refuses_even_when_it_says_observe() {
+    for api in ["required", "observe"] {
+        let f = admit_with(|d| {
+            d["schemaVersion"] = json!(2);
+            d["enforcement"]["api"] = json!(api);
+        })
+        .unwrap_err();
+        assert_eq!(f.code, "policy.schema-version", "{api}");
+        assert!(refusal_message(&f).contains("policy.schema-version"));
     }
+}
+
+#[test]
+fn missing_or_unknown_enforcement_fails_closed_as_required() {
+    let f = admit_with(|d| {
+        d["enforcement"].as_object_mut().unwrap().remove("api");
+    })
+    .unwrap_err();
+    assert!(f.code.starts_with("policy.schema"), "{f:?}");
+}
+
+#[test]
+fn observe_logs_an_invalid_policy_and_proceeds_without_a_launcher() {
+    let a = admit_with(|d| {
+        d["enforcement"]["api"] = json!("observe");
+        d["toolchain"]["launcherPath"] = json!("");
+    })
+    .unwrap();
+    assert_eq!(a.status(), "observe-unmanaged");
+    let codes: Vec<_> = a.warnings.iter().map(|f| f.code).collect();
+    assert_eq!(codes, ["policy.schema", "toolchain.launcher-missing"]);
+}
+
+#[test]
+fn admission_status_is_explicit_for_every_outcome() {
+    let none = PolicySources::default();
+    assert_eq!(WorkerEgress::admit(&none).unwrap().status(), "unconfigured");
+    let (fx, _) = Fx::new("required");
+    let a = WorkerEgress::admit(&env_sources(fx.dir.path().join("policy.json"))).unwrap();
+    assert_eq!(a.status(), "managed");
+    assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+    assert!(a.egress.unwrap().required);
 }
 
 #[test]

@@ -41,14 +41,19 @@ pub(crate) enum EgressAction {
     /// document with anything token-shaped redacted). Always exits 0 unless
     /// the policy is unreadable (2).
     Policy,
-    /// Print the `docker run` arguments (one per line) that carry the managed
-    /// `gh` launcher, upstream `gh`, policy and credential reference into a
-    /// container read-only (#9987). Prints nothing, exit 0, when no
-    /// env/machine policy names an existing launcher: the caller then keeps
-    /// today's behaviour. A configured policy that cannot be honoured (unreadable,
-    /// or under `required` a missing launcher) exits 78 with the refusal on
-    /// stderr instead. A non-empty output also means the caller must not
-    /// mount `~/.config/gh` or forward `GH_TOKEN`/`GITHUB_TOKEN`.
+    /// Print the container `gh` admission (#9987). The first stdout line is
+    /// always an explicit status — never empty-means-none:
+    /// `loom-forge-egress: unconfigured` (no env/machine policy; the caller
+    /// keeps today's behaviour), `loom-forge-egress: observe-unmanaged` (a
+    /// valid `observe` policy whose launcher is unusable; the findings are on
+    /// stderr and the caller proceeds as before), or `loom-forge-egress:
+    /// managed` followed by the `docker run` arguments (one per line) that
+    /// carry the managed launcher, upstream `gh`, policy and credential
+    /// reference read-only — the caller must then not mount `~/.config/gh`
+    /// or forward `GH_TOKEN`/`GITHUB_TOKEN`. A configured policy that cannot
+    /// be honoured (unreadable, unsupported `schemaVersion`, invalid under
+    /// `required`, or a missing/empty launcher under `required`) prints no
+    /// status and exits 78 with the named refusal on stderr.
     ContainerArgs,
     /// Admit `image` for a containerised worker under the managed launcher
     /// (#9987): under `enforcement.api = required`, refuse (exit 78) an image
@@ -144,6 +149,10 @@ fn assert_prints_findings(report: &forge_egress::Report) -> bool {
     report.exit_code() != 0 && !report.routing.is_empty()
 }
 
+/// The first line `forge egress container-args` prints, before the status
+/// (`spawn-claude.sh` matches it literally).
+const CONTAINER_ARGS_STATUS_PREFIX: &str = "loom-forge-egress: ";
+
 /// Print the refusal for `finding` and exit 78 (`EX_CONFIG`).
 fn refuse(finding: &Finding) -> ! {
     eprintln!("{}", forge_egress::worker_env::refusal_message(finding));
@@ -156,11 +165,17 @@ pub(crate) fn handle(action: EgressAction) -> Result<()> {
         // A configured-but-failing policy is a named refusal (exit 78), never
         // the empty output of an absent one: the caller treats empty output as
         // leave to restore ambient credentials (#9987).
-        let egress = match forge_egress::worker_env::WorkerEgress::try_from_process() {
-            Ok(egress) => egress,
+        let admission = match forge_egress::worker_env::WorkerEgress::admit_process() {
+            Ok(admission) => admission,
             Err(finding) => refuse(&finding),
         };
-        match (action, egress) {
+        for warning in &admission.warnings {
+            eprintln!("{}", forge_egress::worker_env::observe_message(warning));
+        }
+        if matches!(action, EgressAction::ContainerArgs) {
+            println!("{CONTAINER_ARGS_STATUS_PREFIX}{}", admission.status());
+        }
+        match (action, admission.egress) {
             (EgressAction::ContainerArgs, Some(egress)) => {
                 for arg in egress.docker_args() {
                     println!("{arg}");
