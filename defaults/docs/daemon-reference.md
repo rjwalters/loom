@@ -4622,7 +4622,7 @@ supervisor cannot cross.
 comment on every open `loom:blocked` issue/PR that cites a just-closed number,
 but `merge-pr.sh` was its only caller, so a merge made in the GitHub UI, with
 the gh CLI, or by hand never fired it. The daemon now polls recently closed
-items and feeds them to the same core (one `list_blocked` scan per tick).
+items and feeds them to the same core (one batched `loom:blocked` read per tick).
 `merge-pr.sh`'s call stays as the fast path; the per-artifact
 `<!-- loom:blocker-cleared:#N -->` marker dedupes the two paths.
 
@@ -4636,10 +4636,10 @@ Precedence is env > config > default. The poll is REST
 primary workspace, and persists a cursor (max `updated_at` seen) in
 `.loom/closed-watch-cursor.json`. The first run looks back 24h and a pass reads
 at most 5 pages of 100. The cursor advances only when every read answered (the
-listing, each merged PR's closing references, both enumerations, every
-candidate's body/evidence read) and every owed comment posted; otherwise the
+listing, each merged PR's closing references, the `loom:blocked` listing,
+every candidate's text/evidence read) and every owed comment posted; otherwise the
 tick retries, and the marker keeps the retry from re-posting. With nothing
-newly closed no `list_blocked` call is made.
+newly closed no `loom:blocked` read is made.
 It never edits labels, and failures are logged, never fatal. Two hosts polling
 one repo may both post in the check-then-post window; the duplicate is harmless
 and accepted. Source: `loom-daemon/src/cli/closed_watch.rs`.

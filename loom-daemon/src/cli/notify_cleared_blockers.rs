@@ -56,8 +56,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use loom_daemon::cmd_out::CmdOutcome;
-use loom_daemon::script_helpers::run_gh;
 use loom_daemon::forge_identity::FleetLogins;
+use loom_daemon::script_helpers::run_gh;
 use loom_daemon::stale_blocked::batch::StaleBlockedForge;
 use loom_daemon::stale_blocked::notify::{self, marker_for};
 use loom_daemon::stale_blocked::{batch, budget, classify, Artifact, Verdict};
@@ -173,11 +173,13 @@ pub(crate) fn scan_cleared(closed: &[i64], opts: &ScanOptions<'_>) -> ScanReport
         gather,
         closed,
         opts.dry_run,
-        &mut |kind, number, cited, reasons| {
-            post_comment(kind, number, cited, reasons, repo, root)
-        },
+        &mut |kind, number, cited, reasons| post_comment(kind, number, cited, reasons, repo, root),
     )
 }
+
+/// Posts one notice: `(kind, number, cited, reasons)` in, whether `gh`
+/// reported success out.
+pub(crate) type PostNotice<'a> = dyn FnMut(Artifact, i64, &[i64], &[String]) -> bool + 'a;
 
 /// [`scan_cleared`] against an injected forge and comment poster, so the
 /// closed-item poll's tests drive the real gather -> classify -> post path.
@@ -187,7 +189,7 @@ pub(crate) fn scan_cleared_with(
     gather: batch::Options,
     closed: &[i64],
     dry_run: bool,
-    post: &mut dyn FnMut(Artifact, i64, &[i64], &[String]) -> bool,
+    post: &mut PostNotice<'_>,
 ) -> ScanReport {
     let mut unread: Vec<String> = Vec::new();
     let notify::CitedGathering {
@@ -334,7 +336,7 @@ fn unticked_reason(resolved_refs: &[String], unparsed: usize) -> String {
 }
 
 /// The notification comment. Pure, so the wording is unit-tested.
-fn comment_body(kind: Artifact, cited: &[i64], reasons: &[String]) -> String {
+pub(super) fn comment_body(kind: Artifact, cited: &[i64], reasons: &[String]) -> String {
     let refs: Vec<String> = cited.iter().map(|n| format!("#{n}")).collect();
     let mut body = format!(
         "**Cited blocker cleared**: {} just closed, and this {}'s `loom:blocked` cites it. \

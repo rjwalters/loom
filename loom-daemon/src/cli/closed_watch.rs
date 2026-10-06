@@ -17,11 +17,11 @@
 //!   most [`MAX_PAGES`] pages.
 //! * The cursor advances only after a successful scan, so a failed tick
 //!   retries. "Successful" means every required read answered: the listing,
-//!   each merged PR's closing references, both `loom:blocked` enumerations,
-//!   every candidate's body/evidence read, and every owed comment post. Any
+//!   each merged PR's closing references, the `loom:blocked` listing,
+//!   every candidate's text/evidence read, and every owed comment post. Any
 //!   one unanswered holds the cursor; the marker keeps the retry from
 //!   re-posting what this pass already posted. With nothing newly closed
-//!   there is no `list_blocked` call.
+//!   there is no `loom:blocked` read at all.
 //! * Two hosts polling one repo can both post in the check-then-post window;
 //!   a duplicate notice is harmless and accepted by design.
 //! * Never edits a label; every failure is logged, never fatal.
@@ -39,7 +39,7 @@ use serde::Deserialize;
 use loom_daemon::cmd_out::CmdOutcome;
 use loom_daemon::script_helpers::run_gh;
 
-use super::notify_cleared_blockers::{expand_pr, scan_cleared, ScanOptions};
+use super::notify_cleared_blockers::{pr_close_targets, scan_cleared, ScanOptions, ScanReport};
 use super::stale_blocked::DEFAULT_LIMIT;
 
 pub(crate) const ENABLE_ENV: &str = "LOOM_CLOSED_WATCH";
@@ -269,49 +269,64 @@ pub(crate) fn poll_once(root: &Path) -> PollOutcome {
         Utc::now(),
         |since| list_closed_rest(root, repo, since),
         |fresh| {
-            let mut unread = Vec::new();
-            let mut closed: Vec<i64> = Vec::new();
-            for it in fresh {
-                if it.merged_pr {
-                    closed.extend(expand_pr(it.number, repo, root, &mut unread));
-                } else {
-                    closed.push(it.number);
-                }
-            }
-            closed.sort_unstable();
-            closed.dedup();
-            let opts = ScanOptions {
-                repo,
-                root,
-                limit: DEFAULT_LIMIT,
-                no_prs: false,
-                dry_run: false,
-            };
-            let rep = scan_cleared(&closed, &opts);
-            for u in unread.iter().chain(rep.unread.iter()) {
-                log::warn!("closed_watch: not evaluated (unknown, not clear): {u}");
-            }
-            if rep.posted() > 0 {
-                log::info!("closed_watch: posted {} cleared-blocker notice(s)", rep.posted());
-            }
-            // Any unanswered read holds the cursor: an unexpanded merged PR may
-            // have closed an issue someone cites, and an unread candidate may
-            // cite a closed number. Advancing past either would drop that
-            // close event for good (`closed_at < since` on every later tick).
-            if !unread.is_empty() || rep.needs_retry(false) {
-                Err(format!(
-                    "{} read(s) unanswered or a comment post failed",
-                    unread.len() + rep.unread.len()
-                ))
-            } else {
-                Ok(())
-            }
+            scan_fresh(fresh, &mut |pr| pr_close_targets(pr, repo, root), |closed| {
+                let opts = ScanOptions {
+                    repo,
+                    root,
+                    limit: DEFAULT_LIMIT,
+                    no_prs: false,
+                    dry_run: false,
+                };
+                scan_cleared(closed, &opts)
+            })
         },
     );
     if let PollOutcome::Failed(why) = &outcome {
         log::warn!("closed_watch: poll failed, cursor held for retry: {why}");
     }
     outcome
+}
+
+/// The re-check for one batch of fresh closes: expand each merged PR to the
+/// issues it closed (`close_targets`), run `scan` once over the whole closed
+/// set, and return `Err` when the cursor must hold.
+pub(crate) fn scan_fresh(
+    fresh: &[ClosedItem],
+    close_targets: &mut dyn FnMut(i64) -> Result<Vec<i64>, String>,
+    scan: impl FnOnce(&[i64]) -> ScanReport,
+) -> Result<(), String> {
+    let mut unread = Vec::new();
+    let mut closed: Vec<i64> = Vec::new();
+    for it in fresh {
+        closed.push(it.number);
+        if it.merged_pr {
+            match close_targets(it.number) {
+                Ok(targets) => closed.extend(targets),
+                Err(why) => unread.push(format!("PR #{} closing references: {why}", it.number)),
+            }
+        }
+    }
+    closed.sort_unstable();
+    closed.dedup();
+    let rep = scan(&closed);
+    for u in unread.iter().chain(rep.unread.iter()) {
+        log::warn!("closed_watch: not evaluated (unknown, not clear): {u}");
+    }
+    if rep.posted() > 0 {
+        log::info!("closed_watch: posted {} cleared-blocker notice(s)", rep.posted());
+    }
+    // Any unanswered read holds the cursor: an unexpanded merged PR may have
+    // closed an issue someone cites, and an unread candidate may cite a
+    // closed number. Advancing past either would drop that close event for
+    // good (`closed_at < since` on every later tick).
+    if !unread.is_empty() || rep.needs_retry(false) {
+        Err(format!(
+            "{} read(s) unanswered or a comment post failed",
+            unread.len() + rep.unread.len()
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

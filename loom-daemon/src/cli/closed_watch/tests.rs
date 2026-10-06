@@ -1,11 +1,21 @@
 //! Tests for the closed-item poll (#10150). The `gh` calls are behind the
-//! `list`/`scan` seams of `poll_with`; the scan core's idempotency is covered
-//! in `notify_cleared_blockers/tests.rs`.
+//! `list`/`scan` seams of `poll_with`, and the real-path tests below drive
+//! `scan_fresh` -> `scan_cleared_with` (the batched gatherer, `classify`, and
+//! the post) against a fake forge.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
+use anyhow::anyhow;
+use loom_daemon::dep_recheck::extract;
+use loom_daemon::forge_identity::FleetLogins;
+use loom_daemon::forge_listing::RestIssue;
+use loom_daemon::stale_blocked::batch::{self, ClosingRef, RefState, StaleBlockedForge};
+use loom_daemon::stale_blocked::budget::{Budget, Floor, Meter};
+use loom_daemon::stale_blocked::Artifact;
+
+use super::super::notify_cleared_blockers::scan_cleared_with;
 use super::*;
-use serial_test::serial;
 
 fn item(n: i64, closed: &str, updated: &str) -> ClosedItem {
     ClosedItem {
@@ -55,7 +65,7 @@ fn cursor_persists_across_polls_and_idle_tick_never_scans() {
             assert_eq!(since, "2026-10-04T10:00:00Z");
             Ok(vec![])
         },
-        |_| panic!("scan (list_blocked) must not run when nothing closed"),
+        |_| panic!("the loom:blocked scan must not run when nothing closed"),
     );
     assert_eq!(out, PollOutcome::Idle);
 }
@@ -129,196 +139,240 @@ fn knob_is_default_off_with_env_over_config_precedence() {
 }
 
 // ---------------------------------------------------------------------------
-// Real poll -> scan path against a fake `gh` (Judge P1 on PR #10180): a failed
-// candidate read or closing-reference expansion must hold the cursor, the
-// next pass must actually post, and a further pass must not duplicate it.
+// Real poll -> scan path against a fake forge (Judge P1 on PR #10180): a
+// failed candidate read or closing-reference expansion must hold the cursor,
+// the next pass must actually post, and a further pass must not duplicate it.
 // ---------------------------------------------------------------------------
 
-/// Points `LOOM_GH_BIN` at `bin`, restoring the prior value on drop.
-///
-/// `LOOM_GH_BIN` is process-global and other modules' tests set/unset it
-/// under `#[serial(loom_config_env)]`, so every test using this guard must
-/// carry that same crate-wide key; a module-local mutex would not serialise
-/// against them (see `worktree_root.rs`, #5164 / #5133). The lib crate's
-/// `test_stub::GhBinGuard` is `cfg(test)` in the lib, so it is not reachable
-/// from this bin's test build.
-struct GhBin(Option<std::ffi::OsString>);
-
-impl GhBin {
-    fn set(bin: &Path) -> Self {
-        let prior = std::env::var_os("LOOM_GH_BIN");
-        std::env::set_var("LOOM_GH_BIN", bin);
-        Self(prior)
-    }
+/// A forge holding open `loom:blocked` #201 ("Blocked by #200"), with #200
+/// closed. `comments_fail` makes #201's comment read fail (a transient read
+/// failure); `posted` records each notice, which then shows up as a comment.
+#[derive(Default)]
+struct World {
+    comments_fail: bool,
+    comments: Vec<extract::Comment>,
+    posted: Vec<(i64, String)>,
 }
 
-impl Drop for GhBin {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(v) => std::env::set_var("LOOM_GH_BIN", v),
-            None => std::env::remove_var("LOOM_GH_BIN"),
+impl StaleBlockedForge for World {
+    fn list_blocked(&mut self) -> anyhow::Result<Vec<RestIssue>> {
+        Ok(vec![RestIssue {
+            number: 201,
+            title: Some("Waits on 200".into()),
+            labels: vec!["loom:blocked".into()],
+            created_at: None,
+            updated_at: None,
+            closed_at: None,
+            state: "open".into(),
+            body: Some("Blocked by #200: needs that first.".into()),
+            author: None,
+            is_pull_request: false,
+            comments: 1 + u32::try_from(self.comments.len()).unwrap(),
+        }])
+    }
+
+    fn comments(&mut self, number: u32) -> anyhow::Result<Vec<extract::Comment>> {
+        assert_eq!(number, 201);
+        if self.comments_fail {
+            return Err(anyhow!("transient read failure"));
         }
+        let mut all = vec![extract::Comment {
+            author: extract::Author {
+                login: "a-human".into(),
+            },
+            body: "still waiting on it".into(),
+        }];
+        all.extend(self.comments.iter().cloned());
+        Ok(all)
+    }
+
+    fn ref_state(&mut self, _repo: Option<&str>, number: i64) -> anyhow::Result<Option<RefState>> {
+        Ok((number == 200).then(|| RefState {
+            state: "CLOSED".into(),
+            labels: Vec::new(),
+            is_pr: false,
+        }))
+    }
+
+    fn pr_merge_state(&mut self, number: u32) -> anyhow::Result<(String, String)> {
+        Err(anyhow!("no PR #{number} in this world"))
+    }
+
+    fn closing_refs_batch(
+        &mut self,
+        issues: &[u32],
+    ) -> anyhow::Result<HashMap<u32, Vec<ClosingRef>>> {
+        Ok(issues.iter().map(|n| (*n, Vec::new())).collect())
+    }
+
+    fn budget(&mut self) -> Option<Budget> {
+        Some(Budget {
+            core_remaining: 5000,
+            graphql_remaining: 5000,
+        })
+    }
+
+    fn breaker_open(&mut self) -> bool {
+        false
+    }
+
+    fn meter(&self) -> Meter {
+        Meter::default()
     }
 }
 
-/// A fake `gh` serving fixtures from `dir`:
-/// `api ...` -> `closed.json`; `issue list` -> `issue-list.json`; `pr list`
-/// -> `[]`; `<issue|pr> view N` -> `<entity>-N.json` (`{}` if absent) unless
-/// `fail-<entity>-N` exists, which makes it exit 1 (a transient read
-/// failure); `<issue|pr> comment N --body B` -> logs `<entity> comment N` to
-/// `calls.log` and writes B to `body-<entity>-N.txt`.
-fn fake_gh(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let d = dir.display();
-    let script = format!(
-        r#"#!/bin/sh
-D='{d}'
-entity="$1"; verb="$2"; num="$3"
-case "$entity:$verb" in
-  api:*) cat "$D/closed.json"; exit 0 ;;
-  issue:list) cat "$D/issue-list.json" 2>/dev/null || echo '[]'; exit 0 ;;
-  pr:list) echo '[]'; exit 0 ;;
-  issue:view|pr:view)
-    if [ -e "$D/fail-$entity-$num" ]; then echo "transient read failure" >&2; exit 1; fi
-    cat "$D/$entity-$num.json" 2>/dev/null || echo '{{}}'
-    exit 0 ;;
-  issue:comment|pr:comment)
-    echo "$entity comment $num" >> "$D/calls.log"
-    shift 3
-    while [ $# -gt 0 ]; do
-      if [ "$1" = "--body" ]; then shift; printf '%s' "$1" > "$D/body-$entity-$num.txt"; fi
-      shift
-    done
-    exit 0 ;;
-esac
-echo "fake gh: unhandled: $*" >&2
-exit 3
-"#
-    );
-    let p = dir.join("gh");
-    std::fs::write(&p, script).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-    p
+impl World {
+    /// One poll through the real `scan_fresh` -> `scan_cleared_with` path.
+    /// `listing` is the closed-items page; `fail_expansion` names merged PRs
+    /// whose closing-reference read fails; `close_targets` answers the rest.
+    fn poll(
+        &mut self,
+        root: &Path,
+        listing: Vec<ClosedItem>,
+        fail_expansion: &HashSet<i64>,
+        close_targets: &HashMap<i64, Vec<i64>>,
+    ) -> PollOutcome {
+        let fleet = FleetLogins::single(extract::DEFAULT_BOT_LOGIN);
+        let gather = batch::Options {
+            limit: DEFAULT_LIMIT,
+            no_prs: false,
+            floor: Floor::default(),
+        };
+        poll_with(
+            root,
+            now(),
+            |_| Ok(listing),
+            |fresh| {
+                scan_fresh(
+                    fresh,
+                    &mut |pr| {
+                        if fail_expansion.contains(&pr) {
+                            Err("transient read failure".into())
+                        } else {
+                            Ok(close_targets.get(&pr).cloned().unwrap_or_default())
+                        }
+                    },
+                    |closed| {
+                        let mut posted = Vec::new();
+                        let rep = scan_cleared_with(
+                            &mut *self,
+                            &fleet,
+                            gather,
+                            closed,
+                            false,
+                            &mut |kind, number, cited, reasons| {
+                                assert_eq!(kind, Artifact::Issue);
+                                let body = super::super::notify_cleared_blockers::comment_body(
+                                    kind, cited, reasons,
+                                );
+                                posted.push((number, body));
+                                true
+                            },
+                        );
+                        // The forge now shows the posted notice as a comment.
+                        for (number, body) in posted {
+                            self.comments.push(extract::Comment {
+                                author: extract::Author {
+                                    login: extract::DEFAULT_BOT_LOGIN.into(),
+                                },
+                                body: body.clone(),
+                            });
+                            self.posted.push((number, body));
+                        }
+                        rep
+                    },
+                )
+            },
+        )
+    }
 }
 
-fn write(dir: &Path, name: &str, body: &str) {
-    std::fs::write(dir.join(name), body).unwrap();
-}
-
-fn comment_calls(dir: &Path) -> Vec<String> {
-    std::fs::read_to_string(dir.join("calls.log"))
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_string)
-        .collect()
-}
-
-/// Simulate the forge: the comment the fake `gh` just recorded on #201 now
-/// shows up in #201's comment list (so the marker is visible to a re-read).
-fn reflect_posted_comment_on_201(gh_dir: &Path) {
-    let posted = std::fs::read_to_string(gh_dir.join("body-issue-201.txt")).unwrap();
-    let view = serde_json::json!({
-        "body": "Blocked by #200: needs that first.",
-        "comments": [{"author": {"login": "loom-fleet-dispatch"}, "body": posted}],
-        "closedByPullRequestsReferences": []
-    });
-    write(gh_dir, "issue-201.json", &view.to_string());
-}
-
-/// The shared population: open `loom:blocked` #201 cites #200, which is
-/// closed. #300 is an unrelated close updated later in the same window, so a
-/// wrongly-advanced cursor would land on 11:00, past #200's 10:00 close.
-fn seed_population(gh_dir: &Path) {
-    write(gh_dir, "issue-list.json", r#"[{"number":201,"title":"Waits on 200"}]"#);
-    write(gh_dir, "issue-200.json", r#"{"state":"CLOSED"}"#);
-    write(
-        gh_dir,
-        "issue-201.json",
-        r#"{"body":"Blocked by #200: needs that first.","comments":[],"closedByPullRequestsReferences":[]}"#,
-    );
+fn merged(n: i64, closed: &str, updated: &str) -> ClosedItem {
+    ClosedItem {
+        merged_pr: true,
+        ..item(n, closed, updated)
+    }
 }
 
 const SINCE: &str = "2026-10-04T09:00:00Z";
 const LATEST: &str = "2026-10-04T11:00:00Z";
 
 #[test]
-#[serial(loom_config_env)]
 fn failed_candidate_read_holds_cursor_then_retry_posts_once() {
     let root = tempfile::tempdir().unwrap();
-    let gh_dir = tempfile::tempdir().unwrap();
-    let _gh = GhBin::set(&fake_gh(gh_dir.path()));
-    let g = gh_dir.path();
-    seed_population(g);
-    write(
-        g,
-        "closed.json",
-        r#"[{"number":200,"closed_at":"2026-10-04T10:00:00Z","updated_at":"2026-10-04T10:00:00Z"},
-            {"number":300,"closed_at":"2026-10-04T10:30:00Z","updated_at":"2026-10-04T11:00:00Z"}]"#,
-    );
+    let (none, targets) = (HashSet::new(), HashMap::new());
+    // #300 is an unrelated close updated later in the same window, so a
+    // wrongly-advanced cursor would land on 11:00, past #200's 10:00 close.
+    let listing = || {
+        vec![
+            item(200, "2026-10-04T10:00:00Z", "2026-10-04T10:00:00Z"),
+            item(300, "2026-10-04T10:30:00Z", LATEST),
+        ]
+    };
     save_cursor(root.path(), SINCE).unwrap();
+    let mut world = World {
+        comments_fail: true,
+        ..World::default()
+    };
 
-    // Pass 1: #201's body/comments read fails transiently.
-    write(g, "fail-issue-201", "");
-    assert!(matches!(poll_once(root.path()), PollOutcome::Failed(_)));
+    // Pass 1: #201's comment read fails transiently.
+    let out = world.poll(root.path(), listing(), &none, &targets);
+    assert!(matches!(out, PollOutcome::Failed(_)), "{out:?}");
     assert_eq!(load_cursor(root.path()).as_deref(), Some(SINCE), "cursor must hold");
-    assert!(comment_calls(g).is_empty());
+    assert!(world.posted.is_empty());
 
     // Pass 2: the read recovers; the notice is actually posted.
-    std::fs::remove_file(g.join("fail-issue-201")).unwrap();
-    assert_eq!(poll_once(root.path()), PollOutcome::Scanned { closed: 2 });
-    assert_eq!(comment_calls(g), vec!["issue comment 201".to_string()]);
-    let body = std::fs::read_to_string(g.join("body-issue-201.txt")).unwrap();
-    assert!(body.contains("<!-- loom:blocker-cleared:#200 -->"));
+    world.comments_fail = false;
+    let out = world.poll(root.path(), listing(), &none, &targets);
+    assert_eq!(out, PollOutcome::Scanned { closed: 2 });
+    assert_eq!(world.posted.len(), 1);
+    assert_eq!(world.posted[0].0, 201);
+    assert!(world.posted[0]
+        .1
+        .contains("<!-- loom:blocker-cleared:#200 -->"));
     assert_eq!(load_cursor(root.path()).as_deref(), Some(LATEST));
 
     // Pass 3: the same listing again. #200's close is now behind the cursor.
-    reflect_posted_comment_on_201(g);
-    assert_eq!(poll_once(root.path()), PollOutcome::Idle);
+    let out = world.poll(root.path(), listing(), &none, &targets);
+    assert_eq!(out, PollOutcome::Idle);
 
     // Pass 4: #200 re-listed as a fresh close (reopened and re-closed): the
     // scan runs, but the marker on #201 makes it a no-op.
-    write(
-        g,
-        "closed.json",
-        r#"[{"number":200,"closed_at":"2026-10-04T11:30:00Z","updated_at":"2026-10-04T11:30:00Z"}]"#,
-    );
-    assert_eq!(poll_once(root.path()), PollOutcome::Scanned { closed: 1 });
-    assert_eq!(comment_calls(g).len(), 1, "no duplicate notice");
+    let relisted = vec![item(200, "2026-10-04T11:30:00Z", "2026-10-04T11:30:00Z")];
+    let out = world.poll(root.path(), relisted, &none, &targets);
+    assert_eq!(out, PollOutcome::Scanned { closed: 1 });
+    assert_eq!(world.posted.len(), 1, "no duplicate notice");
 }
 
 #[test]
-#[serial(loom_config_env)]
 fn failed_closing_reference_expansion_holds_cursor_then_retry_posts() {
     let root = tempfile::tempdir().unwrap();
-    let gh_dir = tempfile::tempdir().unwrap();
-    let _gh = GhBin::set(&fake_gh(gh_dir.path()));
-    let g = gh_dir.path();
-    seed_population(g);
     // Merged PR #400 closed #200; only the expansion names #200 here.
-    write(
-        g,
-        "closed.json",
-        r#"[{"number":400,"closed_at":"2026-10-04T10:00:00Z","updated_at":"2026-10-04T10:00:00Z",
-             "pull_request":{"merged_at":"2026-10-04T10:00:00Z"}},
-            {"number":300,"closed_at":"2026-10-04T10:30:00Z","updated_at":"2026-10-04T11:00:00Z"}]"#,
-    );
-    write(g, "pr-400.json", r#"{"closingIssuesReferences":[{"number":200}]}"#);
+    let targets = HashMap::from([(400, vec![200])]);
+    let listing = || {
+        vec![
+            merged(400, "2026-10-04T10:00:00Z", "2026-10-04T10:00:00Z"),
+            item(300, "2026-10-04T10:30:00Z", LATEST),
+        ]
+    };
     save_cursor(root.path(), SINCE).unwrap();
+    let mut world = World::default();
 
-    // Pass 1: `gh pr view 400 --json closingIssuesReferences` fails.
-    write(g, "fail-pr-400", "");
-    assert!(matches!(poll_once(root.path()), PollOutcome::Failed(_)));
+    // Pass 1: PR #400's closing-reference read fails.
+    let out = world.poll(root.path(), listing(), &HashSet::from([400]), &targets);
+    assert!(matches!(out, PollOutcome::Failed(_)), "{out:?}");
     assert_eq!(load_cursor(root.path()).as_deref(), Some(SINCE), "cursor must hold");
-    assert!(comment_calls(g).is_empty());
+    assert!(world.posted.is_empty());
 
     // Pass 2: expansion recovers; #201 is notified about #200.
-    std::fs::remove_file(g.join("fail-pr-400")).unwrap();
-    assert_eq!(poll_once(root.path()), PollOutcome::Scanned { closed: 2 });
-    assert_eq!(comment_calls(g), vec!["issue comment 201".to_string()]);
+    let out = world.poll(root.path(), listing(), &HashSet::new(), &targets);
+    assert_eq!(out, PollOutcome::Scanned { closed: 2 });
+    assert_eq!(world.posted.len(), 1);
+    assert_eq!(world.posted[0].0, 201);
     assert_eq!(load_cursor(root.path()).as_deref(), Some(LATEST));
 
     // Pass 3: nothing new; no duplicate.
-    reflect_posted_comment_on_201(g);
-    assert_eq!(poll_once(root.path()), PollOutcome::Idle);
-    assert_eq!(comment_calls(g).len(), 1, "no duplicate notice");
+    let out = world.poll(root.path(), listing(), &HashSet::new(), &targets);
+    assert_eq!(out, PollOutcome::Idle);
+    assert_eq!(world.posted.len(), 1, "no duplicate notice");
 }
