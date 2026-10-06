@@ -195,8 +195,8 @@ fn a_held_repo_defers_only_its_own_candidates() {
 }
 
 #[test]
-fn a_short_or_empty_hold_slice_holds_nothing() {
-    for held in [&[][..], &[false][..]] {
+fn an_empty_or_all_false_hold_slice_holds_nothing() {
+    for held in [&[][..], &[false, false][..]] {
         let mut multi = vec![
             (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
@@ -205,4 +205,43 @@ fn a_short_or_empty_hold_slice_holds_nothing() {
         assert_eq!((report.dispatched, report.deferred_build_backoff), (2, 0), "{held:?}");
         assert!(!report.build_backoff_held);
     }
+}
+
+/// A short slice breaks the parallel-slice contract: caught in debug builds
+/// (release fails open through `build_backoff::defers`' `.get()`).
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "build_backoff_held has 1 flags for 2 workspaces")]
+fn a_short_hold_slice_is_a_caller_bug_in_debug_builds() {
+    let mut multi = vec![
+        (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
+        (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
+    ];
+    let _ = run(&mut multi, 10, None, &[], &[false]);
+}
+
+/// #10624: a held repo with nothing to defer does not tag the tick, so the
+/// health line and the tick result do not report a hold on every idle tick.
+#[test]
+fn a_held_repo_with_no_candidates_does_not_tag_the_tick() {
+    let mut multi = vec![
+        (FakeSource::once(vec![]), RecordingDispatcher::default()),
+        (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
+    ];
+    let report = run(&mut multi, 10, None, &[], &[true, false]);
+    assert_eq!((report.dispatched, report.deferred_build_backoff), (1, 0));
+    assert!(report.build_backoff_held, "the repo is still held");
+    let summary = tick_summary(&report, 10, chrono::Utc::now(), &[], None);
+    assert!(!summary.reason_summary().contains("BUILD-BACKOFF-HELD"));
+    assert_eq!(crate::observability::ops::dispatch::tick_result(&report), "dispatched");
+
+    // Same hold, the other repo at capacity: the result is `capacity_full`.
+    let mut multi = vec![
+        (FakeSource::once(vec![]), RecordingDispatcher::default()),
+        (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
+    ];
+    let report = run(&mut multi, 0, None, &[], &[true, false]);
+    assert_eq!(report.deferred_build_backoff, 0);
+    assert!(report.deferred_capacity > 0, "{report:?}");
+    assert_eq!(crate::observability::ops::dispatch::tick_result(&report), "capacity_full");
 }

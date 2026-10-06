@@ -4507,9 +4507,17 @@ adds no PR dispatch path of its own.
   `+ host ceiling`). Deferred issues show as `deferred_build_backoff` in
   `loom-daemon queue` (each row names its repo), the tick summary carries
   `deferred_build_backoff` and `build_backoff_held` (true when any repo is
-  held; `BUILD-BACKOFF-HELD` in `loom-daemon health`), the decisions metric
-  uses reason `build_backoff`, and the tick result is `build_backoff_held`
-  when nothing was dispatched.
+  held), and the decisions metric uses reason `build_backoff`. The
+  `BUILD-BACKOFF-HELD` tag in `loom-daemon health` and the tick result
+  `build_backoff_held` both need `deferred_build_backoff > 0`: a repo that is
+  held but has no candidates does not mark the tick, so a repo that stays
+  engaged for days cannot turn every idle or capacity-full tick into a hold.
+  The tick result is `build_backoff_held` when nothing was dispatched, no
+  dispatch failed (`error` ranks first) and the back-off deferred at least one
+  candidate (#10624).
+- **Sharded fleets.** The ledger holds debt only for repos whose role runner
+  runs on this host, so the per-repo limit binds on the repo's owner host. On
+  a non-owner host the repo has no fresh entry and fails open (#10654).
 
 | Config (under `autonomous.workFinder.buildBackoff`) | Default | Validation |
 |---|---|---|

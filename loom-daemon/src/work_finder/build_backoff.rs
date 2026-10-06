@@ -564,6 +564,22 @@ impl BuildBackoffs {
     }
 }
 
+/// Whether any workspace is held this tick (`TickReport::build_backoff_held`).
+///
+/// `held` is parallel to the tick's workspaces; empty means "no back-off". A
+/// short slice fails open in release ([`defers`] uses `.get()`), but a caller
+/// that breaks the parallel-slice contract is a bug, so debug builds assert it.
+#[must_use]
+pub fn any_held(held: &[bool], workspaces: usize) -> bool {
+    debug_assert!(
+        held.is_empty() || held.len() == workspaces,
+        "build_backoff_held has {} flags for {} workspaces",
+        held.len(),
+        workspaces
+    );
+    held.contains(&true)
+}
+
 /// Whether pass 2 defers `cand`: its workspace is held (by its own repo's
 /// debt or the host ceiling) and it is neither starred nor a verified
 /// red-main fix — the two bypasses #9410 defined. `held` is parallel to the

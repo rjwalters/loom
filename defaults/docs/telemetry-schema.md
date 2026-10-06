@@ -1661,8 +1661,8 @@ An unmeasurable host reading produces no point, never a `0`. Each work-finder
 tick also emits one `loom.dispatch.tick` span. It is a new root trace per tick
 that covers candidate evaluation and dispatch. Its attributes are
 `loom.dispatch.result` (`dispatched`, `halted_main_red`, `halted_ci_billing` (#10113), `saturation_held`,
-`build_backoff_held` (#9410), `error`, `no_eligible_work`, `capacity_full`, `all_skipped`, first match
-wins), `loom.dispatch.seen`, `loom.dispatch.dispatched`,
+`error`, `build_backoff_held` (#9410; only when the back-off deferred at least one candidate, #10624),
+`no_eligible_work`, `capacity_full`, `all_skipped`, first match wins), `loom.dispatch.seen`, `loom.dispatch.dispatched`,
 `loom.dispatch.errors` and `loom.dispatch.max_concurrent`. Each `dispatch()` attempt in the
 tick is one `loom.dispatch.admission` child span (#8907), with the tick's trace
 id and the tick span as its parent. Its attributes are `loom.issue`,

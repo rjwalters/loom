@@ -1641,7 +1641,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
 
     let mut report = TickReport::for_tick(saturation_held, max_admissions_per_tick);
-    report.build_backoff_held = build_backoff_held.contains(&true);
+    report.build_backoff_held = build_backoff::any_held(build_backoff_held, workspaces.len());
 
     // Snapshot per-workspace in-flight sets *first* (immutable borrow) so the
     // dedup filtering below always has the full in-flight view.
