@@ -8,6 +8,10 @@ use super::*;
 
 pub(super) mod child_env_markers;
 
+// Issue #10348: the dispatched `sweep-lease-renew.sh start` command.
+mod lease_renewal_start;
+use lease_renewal_start::lease_renewal_start_command;
+
 /// Issue #3943: print-mode background-task wait ceiling (milliseconds). A
 /// daemon-spawned sweep child is a headless `claude -p` session; in print mode
 /// the harness reaps still-running background tasks (the sweep's Builder/Judge
@@ -3189,46 +3193,6 @@ impl SweepRegistry {
     }
 }
 
-/// Builds the `sweep-lease-renew.sh start` command for a dispatched sweep.
-fn lease_renewal_start_command(
-    script: &Path,
-    issue: u32,
-    sweep_id: &str,
-    child_pid: u32,
-    host: &str,
-    workspace_root: &Path,
-) -> Command {
-    let mut cmd = Command::new(script);
-    cmd.arg("start")
-        .arg(issue.to_string())
-        .arg("--watch-pid")
-        .arg(child_pid.to_string())
-        // Exact-match targeting (#6485): without BOTH of these the loop
-        // falls back to "newest lease wins" and can spend the sweep
-        // renewing a PEER dispatcher's lease comment while this claim's
-        // own `updated_at` never advances. The daemon knows both values
-        // exactly — it published them itself in `write_lease_comment`.
-        .arg("--host")
-        .arg(host)
-        .arg("--sweep-id")
-        .arg(sweep_id)
-        // Same workspace every other forge mutation in this registry runs
-        // in, so `gh` resolves this repo in a multi-workspace daemon
-        // (#3928/#3937).
-        // #10348: marks a daemon-dispatched start. Its watched pid is the
-        // sweep child, which already bounds the loop, so the loop skips the
-        // per-cycle issue-state read (+12 calls/h per lease).
-        .env("LOOM_SWEEP_LEASE_RENEW_SOURCE", "dispatch")
-        .current_dir(workspace_root)
-        .stdin(Stdio::null())
-        // Piped and read below purely to capture the loop pid `start`
-        // prints. Safe to read to EOF: the detached loop redirects its OWN
-        // stdout to /dev/null, so nothing holds this pipe open past
-        // `start`'s return.
-        .stdout(Stdio::piped());
-    cmd
-}
-
 /// The blocking half of [`SweepRegistry::start_lease_renewal_loop`]: spawn
 /// `sweep-lease-renew.sh start` and wait (bounded by
 /// [`LEASE_RENEW_START_TIMEOUT`]) for its one-shot handshake to return the
@@ -3534,7 +3498,3 @@ mod forge_egress_tests;
 // Issue #8997's rate-limited label-flip breaker coverage (same reason).
 #[cfg(test)]
 mod rate_limit_tests;
-
-// Issue #10348: dispatched lease-renewal start marker.
-#[cfg(test)]
-mod lease_renewal_start_tests;
