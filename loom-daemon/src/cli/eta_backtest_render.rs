@@ -92,6 +92,21 @@ pub(super) fn render_comparison(c: &Comparison) -> String {
         pct(p.b_late_rate),
         p.late_pairs
     ));
+    for (label, d) in [
+        ("pinball", p.delta_pinball_loss_sec),
+        ("pinball4", p.delta_pinball4_loss_sec),
+    ] {
+        if let Some(d) = d {
+            out.push_str(&format!(
+                "  {:<19} ({b} − {a})={} 95% issue-bootstrap CI [{}, {}] over {} case(s)\n",
+                format!("delta {label}"),
+                secs(d.value),
+                secs(d.lo),
+                secs(d.hi),
+                d.n
+            ));
+        }
+    }
     for f in &p.folds {
         out.push_str(&format!(
             "  fold {}  cases={:<5} common={:<5} {a}={:>10} {b}={:>10}\n",

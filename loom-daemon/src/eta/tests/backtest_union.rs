@@ -418,3 +418,32 @@ fn a_comparison_of_two_finish_heuristics_still_folds() {
     assert_eq!(c.paired.day_wins.days, 0, "a heuristic ties itself on every day");
     assert_eq!(c.better, None);
 }
+
+#[test]
+fn the_paired_loss_deltas_carry_a_deterministic_issue_bootstrap_interval() {
+    // #10489: "pinball no worse" is read on the paired `b − a` delta with
+    // its issue-bootstrap 95% interval, whole issues resampled.
+    let c = compare_on_history_a(&LandV1, &Shifted(1800));
+    let p = &c.paired;
+    let d = p.delta_pinball_loss_sec.expect("cases in common");
+    let d4 = p.delta_pinball4_loss_sec.expect("p90 pairs in common");
+    assert_eq!(d.n, p.common);
+    assert_eq!(d4.n, p.loss4_pairs);
+    let close = |x: f64, y: f64| (x - y).abs() < 1e-6 * (1.0 + y.abs());
+    let point = p.b_mean_pinball_loss_sec.unwrap() - p.a_mean_pinball_loss_sec.unwrap();
+    assert!(close(d.value.unwrap(), point), "{d:?} vs {point}");
+    let point4 = p.b_mean_pinball4_loss_sec.unwrap() - p.a_mean_pinball4_loss_sec.unwrap();
+    assert!(close(d4.value.unwrap(), point4), "{d4:?} vs {point4}");
+    for e in [d, d4] {
+        let (lo, hi) = (e.lo.unwrap(), e.hi.unwrap());
+        assert!(lo <= hi, "{e:?}");
+    }
+    // Seeded: the same replay yields the same interval.
+    let again = compare_on_history_a(&LandV1, &Shifted(1800));
+    assert_eq!(again.paired.delta_pinball4_loss_sec, p.delta_pinball4_loss_sec);
+
+    // A heuristic against itself: a zero delta with a zero-width interval.
+    let same = compare_on_history_a(&LandV1, &LandV1);
+    let z = same.paired.delta_pinball4_loss_sec.unwrap();
+    assert_eq!((z.value, z.lo, z.hi), (Some(0.0), Some(0.0), Some(0.0)));
+}

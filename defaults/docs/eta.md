@@ -418,8 +418,11 @@ has 20 landings in the window, else the stage, else all stages, else nothing
 (the base estimate is returned unchanged with no `calibration`; rows logged
 before observations carried the base's p25/p75/p90 and age are not evidence).
 A still-open base estimate is a **lower bound** `ln(elapsed / q_τ)` entering a
-Kaplan–Meier estimate with the landings; an unresolvable tail clamps to the
-largest bound. The change of every shift is limited to `ln 1.2` per day: the
+Kaplan–Meier estimate with the landings. When the landings cannot reach the
+level because the tail past the last landing is all still open, those bounds
+are read as landing at their bound, so the shift is the matching order
+statistic of the open bounds, never the single largest one (that clamp made
+the backtest's p90 days wide). The change of every shift is limited to `ln 1.2` per day: the
 shift is replayed day by day (on `as_of`'s own day lattice) from the oldest
 usable base estimate, each day's raw fit clamped to one step of the day
 before. The anchor is fixed by the evidence, not by `as_of`, so two estimates
@@ -453,6 +456,16 @@ Calm-plover scores each quantile against itself (`ln(actual / q_τ)`), moves
 the median too, conditions on the age bucket, and rate-limits the adjustment.
 That it fixes those defects is the hypothesis the shadow evidence and the
 #10233 gate test; it is not claimed here.
+
+*Backtest* (2026-10-06, `eta backtest --heuristic land-2026-10-06-calm-plover
+--compare land-v2` over 600 merged-PR label timelines of `rjwalters/loom`,
+1,247 common `land` cases, 10 walk-forward daily folds). p25–p75 coverage is
+47.1% (`land-v2`: 36.8%) and late surprise is 5.9% (`land-v2`: 24.1%). The
+three-quantile pinball delta is +336 s, with a 95% issue-bootstrap CI of
+[−632, +1,184] s, so it is not distinguishable from `land-v2`. But `pinball4`,
+the gate's deciding loss, is worse by 23,460 s [17,304, 29,266]: the wider
+p90 costs more than it saves. So the backtest does not make calm-plover a
+promotion candidate. The PR for #10489 records the full report.
 
 `land-2026-10-06-quick-tern` (#10524) ships the same way: registered, not
 current, tier `candidate`, shadowed into `alternates`, and promoted only
@@ -1070,6 +1083,38 @@ for a fit or backtest to report.
   #10508: the fleet-store history reader, the v2 fit and its
   schema-dispatched loading, the new heuristic and its pre-PR composition,
   and shadow registration on the ETA authority.
+
+### Friction predictors and cumulative stage age (#10521)
+
+The error analysis of `land-2026-10-04-twin-otter-b`'s misses found that
+most late surprises come from events after the estimate. `eta::loop_features`
+computes the point-in-time predictors that explain part of that. The fit
+(`Assembled::loops`, one per training row, at `t - 120 s`) and serving
+(`Tracker::loop_features_of`, over the same fleet snapshots' label timeline
+at `now - 120 s`, #10500) both call the one builder `loop_features`:
+
+| # | Feature (`LOOP_FEATURES`) | Meaning | Source |
+|---|---------------------------|---------|--------|
+| 1 | `log_overlap_prs`, `log_overlap_files`, `overlap_known` | Other open PRs in the repo whose changed files share a path with this PR's, and how many of this PR's paths they touch | Each PR's file list **as known at `as_of`**: the latest head-commit list read before `as_of`, never the final diff. If this PR's list or **any** open peer's list is not known before `as_of`, both counts are unknown (`overlap_known = 0`): a partly observed roster never reads as zero overlap. Not logged yet, so `overlap_known = 0` everywhere today |
+| 2 | `log_review_requests`, `log_approvals_lost` | `review_wait` entries so far; approvals lost (`merge_wait`/`merge_hold` left for `review_wait`, a stale-main re-review) | Stage episodes |
+| 3 | `own_ci_failed`, `ci_known` | Whether the PR's last CI run that finished before `as_of` failed | SigNoz `ci.run` first, forge only to fill gaps (#10511). Not logged yet, so `ci_known = 0` today |
+| 4 | `judge_reject_rate_7d`, `judge_rate_known` | Share of the repo's Judge verdicts (`review_wait` exits to `doctor` vs to `merge_wait`/`merge_hold`) in the trailing 7 days that sent the PR to Doctor; unknown under 5 verdicts | Stage episodes |
+| - | `log_cum_stage`, `stage_looped` | Hours in the current stage summed over every visit, as `ln(1 + h)`; whether the stage was visited before | Stage episodes |
+
+- **The stage-age fix.** `age_h` restarts at every loop, so a PR on its
+  fourth approval looks minutes old, and a linear age term over-predicts old
+  items. `log_cum_stage` is cumulative time in the stage across loops, logged
+  so the hazard flattens with age. `age_h` keeps its `eta-fit/v1` meaning.
+- **Knowable-at.** An episode counts once entered before `as_of` and as ended
+  only if it ended before `as_of`. A file list or CI run read at or after
+  `as_of` is ignored. A missing source is `null` with its `*_known` indicator
+  0, never a default that reads as "no overlap" or "CI green".
+- **No fleet-wide signals.** CI queue depth, cancellations, host version
+  spread, quota exhaustion and operator activity were shown not to help.
+- **Not a model input yet.** None of these is in `eta-fit/v1`'s `FEATURES`
+  (or `eta-fit/v2`'s `FEATURES_V2`), so twin-otter rows, coefficient files and explanations are unchanged. A new
+  datestamped shadow heuristic adopts them under its own schema version once
+  the loom-experiments walk-forward backtest passes (#10521).
 
 ## The explanation (`eta-explanation/v1`)
 
@@ -1706,7 +1751,9 @@ accepts `--repo-root PATH` (default: the current directory).
   instant and convergence of the interval. With `--compare` it pairs a second
   heuristic on the identical replay set (#9325): the union of cases counting
   refusals, and the walk-forward daily folds with the `--compare` side's
-  per-day win rate and its 95% Wilson interval (#10233). The fleet merges out
+  per-day win rate and its 95% Wilson interval (#10233), plus the paired
+  `compare − heuristic` pinball and `pinball4` deltas with 95% issue-bootstrap
+  intervals (whole issues resampled, fixed seed; #10489). The fleet merges out
   of sweep, so local records rarely carry a `land` case; `--pr-history PATH`
   (offline `eta-pr-case/v1` records) or the opt-in `--forge-pr-cases
   [--pr-limit N] [--save-pr-history PATH]` adds `land` cases from merged PRs'
