@@ -698,3 +698,131 @@ fn latest_run_picks_max_started_at() {
     let green = run("J", "completed", Some("success"), Some("2026-09-16T00:00:00Z"));
     assert_eq!(latest_run(&[queued, green.clone()], "J"), Some(&green));
 }
+
+// --- Role Prompt Prefix Ratchet inside the full structural composite (#9748) --
+
+/// Evidence for the "Structural Checks" composite: every component tested the
+/// same base, so one `BaseMove` per component context is not needed — the
+/// composite is keyed on the required context.
+fn structural_evidence(base: &[&str], pr: &[&str]) -> ScopedEvidence {
+    ScopedEvidence {
+        pr_delta: fset(pr),
+        pr_ci_scope: CiScope::Unscoped,
+        base_moves: [(
+            "Structural Checks".to_string(),
+            BaseMove {
+                tested_base: "803f0c7d".to_string(),
+                files: fset(base),
+                ci_scope: CiScope::Unscoped,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        fallbacks: std::collections::BTreeMap::new(),
+        repo_specs: repo_specs::RepoSpecs::Absent,
+    }
+}
+
+fn structural_verdict(base: &[&str], pr: &[&str]) -> Verdict {
+    let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
+    // Green and re-dated after the tip: only the input predicate can refuse.
+    let runs = vec![run(
+        "Structural Checks",
+        "completed",
+        Some("success"),
+        Some("2026-09-18T20:00:00Z"),
+    )];
+    let ev = structural_evidence(base, pr);
+    let (verdict, warnings) =
+        assess_scoped(base_tip, &ctx(&["Structural Checks"]), &runs, Some(&ev));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    verdict
+}
+
+#[test]
+fn role_prefix_false_coupling_no_longer_stales_the_structural_composite() {
+    // Measured tuple: base daemon-reference vs PR eta docs, and ETA docs vs the
+    // Judge prompt, plus the installed mirror. No component reads these jointly.
+    for (base, pr) in [
+        (&["defaults/docs/daemon-reference.md"][..], &["defaults/docs/eta.md"][..]),
+        (&["defaults/docs/eta.md"][..], &["defaults/.claude/commands/loom/judge.md"][..]),
+        (&[".loom/docs/eta.md"][..], &["defaults/.claude/commands/loom/judge.md"][..]),
+        (&["defaults/docs/eta.md"][..], &["CLAUDE.md"][..]),
+    ] {
+        let v = structural_verdict(base, pr);
+        // Another component may legitimately couple some of these pairs
+        // (e.g. a link/parity check); assert only that the REASON is not the
+        // role-prefix component.
+        if let Verdict::StaleInputs { check, .. } = &v {
+            assert_ne!(check, "Role Prompt Prefix Ratchet", "{base:?} vs {pr:?}");
+        }
+    }
+}
+
+#[test]
+fn a_genuinely_interacting_role_prompt_pair_still_stales_the_composite() {
+    let v = structural_verdict(
+        &["defaults/.claude/commands/loom/builder.md"],
+        &["defaults/.claude/commands/loom/judge.md"],
+    );
+    assert!(matches!(v, Verdict::StaleInputs { .. }), "{v:?}");
+}
+
+#[test]
+fn clearing_the_role_prefix_false_component_does_not_clear_another_stale_one() {
+    // `defaults/docs/eta.md` on both sides is (a) no longer a Role Prefix
+    // coupling but (b) the same file for Conflict Marker Check, which scans
+    // every file per-file: the same-file pair must stay stale.
+    let v = structural_verdict(&["defaults/docs/eta.md"], &["defaults/docs/eta.md"]);
+    match v {
+        Verdict::StaleInputs { check, reason, .. } => {
+            assert_ne!(check, "Role Prompt Prefix Ratchet");
+            assert!(reason.clause.contains("same scanned file"), "{reason:?}");
+        }
+        v => panic!("a same-file pair must stay stale, got {v:?}"),
+    }
+    // Same for a same-file daemon-reference pair.
+    let v = structural_verdict(
+        &["defaults/docs/daemon-reference.md"],
+        &["defaults/docs/daemon-reference.md"],
+    );
+    assert!(matches!(v, Verdict::StaleInputs { .. }), "{v:?}");
+
+    // Mixed: the role-prefix false pair is cleared, yet an unrelated genuine
+    // coupling in the same delta (shell allowlist vs a script) still refuses.
+    let v = structural_verdict(
+        &[
+            "defaults/docs/daemon-reference.md",
+            "scripts/shell-allowlist.txt",
+        ],
+        &["defaults/docs/eta.md", "scripts/new-helper.sh"],
+    );
+    match v {
+        Verdict::StaleInputs { check, .. } => assert_ne!(check, "Role Prompt Prefix Ratchet"),
+        v => panic!("another stale component must still refuse, got {v:?}"),
+    }
+}
+
+#[test]
+fn role_prefix_missing_evidence_and_red_ci_still_fail_closed() {
+    let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
+    // No evidence: the time rule applies and a pre-tip run is stale.
+    let old = vec![run(
+        "Structural Checks",
+        "completed",
+        Some("success"),
+        Some(INCIDENT_RUN_STARTED),
+    )];
+    let (v, _) = assess_scoped(base_tip, &ctx(&["Structural Checks"]), &old, None);
+    assert!(matches!(v, Verdict::Stale { .. }), "{v:?}");
+    // A red run is never accepted as evidence (left to the forge): not Fresh-by-scope.
+    let red = vec![run(
+        "Structural Checks",
+        "completed",
+        Some("failure"),
+        Some("2026-09-18T20:00:00Z"),
+    )];
+    let ev = structural_evidence(&["defaults/docs/eta.md"], &["CLAUDE.md"]);
+    let (v, _) = assess_scoped(base_tip, &ctx(&["Structural Checks"]), &red, Some(&ev));
+    assert_eq!(v, Verdict::Fresh, "failing runs are ignored here and refused by the forge");
+}
