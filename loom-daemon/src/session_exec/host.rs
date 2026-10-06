@@ -43,7 +43,40 @@ pub(super) fn forward_stderr(
     }
 }
 
-fn probe(args: &[&str], parent: i32) -> Result<Option<String>> {
+/// How a bounded docker probe ended.
+#[derive(Debug, PartialEq)]
+pub(super) enum Probed {
+    /// Docker exited zero; its trimmed stdout.
+    Answered(String),
+    /// Docker exited non-zero (for `inspect`: no such container, or it could
+    /// not be inspected).
+    Failed,
+    /// The probe was given up on: its deadline, a host signal, or the
+    /// launcher going away. It says nothing about the container.
+    Abandoned,
+}
+
+impl Probed {
+    fn answer(&self) -> Option<&str> {
+        match self {
+            Self::Answered(text) => Some(text),
+            Self::Failed | Self::Abandoned => None,
+        }
+    }
+
+    /// For the running-probe: whether docker actually said the container
+    /// cannot take a dispatch, which is what `SESSION_DOWN` means (#10455).
+    /// An abandoned probe did not say so, and stays a generic refusal.
+    pub(super) fn says_not_running(&self) -> bool {
+        match self {
+            Self::Answered(state) => state != "true",
+            Self::Failed => true,
+            Self::Abandoned => false,
+        }
+    }
+}
+
+fn probe(args: &[&str], parent: i32) -> Result<Probed> {
     let mut child = Command::new("docker")
         .args(args)
         .stdin(Stdio::null())
@@ -56,7 +89,11 @@ fn probe(args: &[&str], parent: i32) -> Result<Option<String>> {
         if let Some(status) = child.try_wait()? {
             let mut text = String::new();
             child.stdout.take().unwrap().read_to_string(&mut text)?;
-            return Ok(status.success().then(|| text.trim().to_string()));
+            return Ok(if status.success() {
+                Probed::Answered(text.trim().to_string())
+            } else {
+                Probed::Failed
+            });
         }
         if started.elapsed() >= Duration::from_secs(3)
             || SIGNAL.load(Ordering::Relaxed) != 0
@@ -75,7 +112,7 @@ fn probe(args: &[&str], parent: i32) -> Result<Option<String>> {
             );
             child.kill()?;
             child.wait()?;
-            return Ok(None);
+            return Ok(Probed::Abandoned);
         }
         std::thread::sleep(POLL);
     }
@@ -125,10 +162,14 @@ pub fn run(args: HostArgs) -> Result<i32> {
             eprintln!("session-exec: 'docker' command not found in PATH");
             return Ok(127);
         }
-        Ok(Some(state)) if state == "true" => {}
-        _ => {
-            // #10455: name the cause for the daemon's terminal-record parser.
-            refusal::announce(crate::tokens_pool::health::TerminalClassification::SessionDown);
+        Ok(Probed::Answered(state)) if state == "true" => {}
+        probed => {
+            // #10455: name the cause for the daemon's terminal-record parser,
+            // but only when docker said so. An abandoned probe (or one that
+            // could not be run) refuses exactly as before, unnamed.
+            if probed.as_ref().is_ok_and(Probed::says_not_running) {
+                refusal::announce(crate::tokens_pool::health::TerminalClassification::SessionDown);
+            }
             bail!("Session container '{}' is not running. Start it with: loom-daemon accounts session start {}", args.container, args.container.trim_start_matches("loom-codex-session-"))
         }
     }
@@ -142,7 +183,7 @@ pub fn run(args: HostArgs) -> Result<i32> {
         ],
         parent,
     )?
-    .as_deref()
+    .answer()
         != Some(PROTOCOL)
     {
         bail!("session container '{}' requires loom-daemon session-exec protocol {PROTOCOL}; update/recreate the session image before dispatch (no unsupervised fallback)", args.container);

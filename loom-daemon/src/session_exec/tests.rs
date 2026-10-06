@@ -50,3 +50,16 @@ fn another_invocation_cannot_acknowledge_cleanup() {
     assert_eq!(result, other);
     assert!(!clean.load(Ordering::Acquire));
 }
+
+/// #10455: `SESSION_DOWN` is announced only when docker answered the
+/// running-probe. A probe that was abandoned (deadline, signal, launcher gone)
+/// says nothing about the container.
+#[test]
+fn only_an_answered_or_failed_running_probe_says_not_running() {
+    use host::Probed;
+    assert!(!Probed::Answered("true".into()).says_not_running());
+    assert!(Probed::Answered("false".into()).says_not_running());
+    assert!(Probed::Answered(String::new()).says_not_running());
+    assert!(Probed::Failed.says_not_running(), "no such container");
+    assert!(!Probed::Abandoned.says_not_running(), "the container may be running");
+}

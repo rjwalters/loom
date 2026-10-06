@@ -10,9 +10,11 @@
 # pass-through: keep exit 78, carry the announcement to its stderr untouched,
 # and report its classifier's own category without a per-cause arm.
 #
-# Hermetic: a fake daemon stands in for loom-daemon for the adapter cases;
-# docker is never run. The last case runs the real `loom-daemon` when one is
-# on PATH, against a fake docker, to pin the announcement's exact text.
+# Hermetic: a fake daemon stands in for loom-daemon and docker is never run,
+# so this suite needs no build. That the REAL `loom-daemon session-exec host`
+# prints this exact announcement (and stays silent for an abandoned probe) is
+# asserted in test-spawn-codex-session-exec.sh, which requires the built
+# binary and fails, never skips, without one.
 #
 # Usage:
 #   ./.loom/scripts/tests/test-spawn-codex-session-down.sh
@@ -107,24 +109,6 @@ run_spawn "mode=host sandbox=danger-full-access gh=skip" 78
 assert_eq "78" "$SPAWN_RC" "exit code passes through"
 assert_eq "0" "$(markers)" "the adapter never invents a refusal announcement"
 assert_eq "RECOVERABLE" "$(category)" "the classifier's RECOVERABLE verdict is kept"
-
-echo "--- the real daemon announces SESSION_DOWN for a container that is not running ---"
-if command -v loom-daemon >/dev/null 2>&1 \
-    && loom-daemon session-exec host --help 2>/dev/null | grep -q -- '--container'; then
-    printf '#!/usr/bin/env bash\necho false\n' >"$WORK/bin/docker"
-    REAL_ERR="$(PATH="$WORK/bin:$PATH" loom-daemon session-exec host \
-        --container loom-codex-session-acct --workdir "$WORK/ws" -- true 2>&1 >/dev/null)"
-    REAL_RC=$?
-    if printf '%s\n' "$REAL_ERR" | grep -qxF "$MARKER"; then
-        assert_eq "78" "$REAL_RC" "session-exec host refuses with 78 and announces SESSION_DOWN"
-    elif [[ "$REAL_RC" -eq 78 ]]; then
-        echo "  SKIP: the loom-daemon on PATH predates the refusal announcement"
-    else
-        assert_eq "78" "$REAL_RC" "session-exec host refuses a not-running container"
-    fi
-else
-    echo "  SKIP: no loom-daemon on PATH"
-fi
 
 echo ""
 echo "========================================"
