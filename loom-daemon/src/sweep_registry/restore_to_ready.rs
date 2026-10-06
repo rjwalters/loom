@@ -107,10 +107,10 @@ impl SweepRegistry {
                      and was killed (#3973)",
                     timeout.as_secs()
                 );
-                anyhow::bail!("gh issue edit #{issue} timed out after {}s", timeout.as_secs());
+                anyhow::bail!("label restore for #{issue} timed out after {}s", timeout.as_secs());
             }
             Some(out) if !out.status.success() => anyhow::bail!(
-                "gh issue edit #{issue} failed ({}): {}",
+                "label restore for #{issue} failed ({}): {}",
                 out.status,
                 String::from_utf8_lossy(&out.stderr).trim()
             ),
