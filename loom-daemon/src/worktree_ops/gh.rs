@@ -712,7 +712,6 @@ pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
         "worktree.linked_pr_listing",
         Path::new(&gh),
         repo_root,
-        Some(&nwo),
         (&nwo, issue),
         None,
     );

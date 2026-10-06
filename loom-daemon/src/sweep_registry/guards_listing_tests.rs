@@ -155,3 +155,39 @@ fn total_failure_is_probe_failed_and_the_memo_recheck_still_holds() {
     reg.seed_open_pr_memo(80, 801, Utc::now() - chrono::Duration::hours(2));
     assert_eq!(reg.probe_open_linked_pr(80), OpenPrProbe::Open(801));
 }
+
+/// #10514 review: in a fork clone `origin` is the fork, but the guard asks
+/// about the repo `gh` resolves (`rjwalters/loom`). The listing must be read
+/// for THAT repo: the fork's empty listing would read as a false "no PR" and,
+/// being a successful read, would also skip the GraphQL/timeline fallback.
+#[test]
+fn a_fork_clone_lists_the_resolved_repo_not_origin() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(ws)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["remote", "add", "origin", "https://github.com/outsider/loom.git"]);
+    let upstream = listing(&[ours(901).body("Closes #90")]);
+    let arm = format!(
+        "case \"$*\" in\n  \
+         api*'repos/outsider/loom/pulls?state=open'*)\n    \
+         printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'; echo '[]'; exit 0 ;;\n  \
+         api*'repos/{REPO}/pulls?state=open'*)\n    \
+         printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'; echo '{upstream}'; exit 0 ;;\nesac\n"
+    );
+    let (reg, log) = registry(ws, &arm, None, "");
+    assert_eq!(reg.probe_open_linked_pr_transports(90), OpenPrProbe::Open(901));
+    let calls = calls(&log);
+    assert!(calls.contains("repos/rjwalters/loom/pulls?state=open"), "{calls}");
+    assert!(!calls.contains("repos/outsider/loom/pulls"), "{calls}");
+    assert_listing_only(&log);
+}

@@ -844,8 +844,8 @@ impl SweepRegistry {
     }
 
     /// One round of [`probe_open_linked_pr`]. Leg 0 (#10514): the cached REST
-    /// open-PR listing, shared (one ETag) with the claim-reconciliation passes
-    /// — when it reads, its verdict is final. Only a listing that could not be
+    /// open-PR listing of the repo resolved here (never `origin`'s, which a
+    /// fork clone points elsewhere) — when it reads, its verdict is final. Only a listing that could not be
     /// read falls back to the GraphQL/REST union: a closing PR is decisive; an
     /// empty closes-graph still needs the timeline (#7757). Extracted so the
     /// #6058 retry loop above can invoke it more than once.
@@ -860,7 +860,7 @@ impl SweepRegistry {
         let (caller, bound) = ("guard.open_pr_listing", Some(reap_gh_timeout()));
         let target = (nwo.as_str(), issue);
         let listed =
-            crate::worktree_ops::linked_pr_listing::probe(caller, &gh, root, None, target, bound);
+            crate::worktree_ops::linked_pr_listing::probe(caller, &gh, root, target, bound);
         if let Some(verdict) = listed {
             return verdict;
         }

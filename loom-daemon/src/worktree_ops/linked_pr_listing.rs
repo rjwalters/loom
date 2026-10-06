@@ -61,18 +61,22 @@ use super::naming::branch_name;
 /// `Some(NoneOpen)` from a listing that was read, `None` when it could not be
 /// read (the caller then runs its GraphQL-then-timeline fallback).
 ///
-/// `repo_override` is passed through to the listing: the registry guard
-/// passes `None` (the listing then resolves `LOOM_REPO` / `root`'s remote
-/// exactly like the reconciliation passes, sharing their ETag); the
-/// `worktree_ops` probe passes its own resolved repo because it must never
-/// answer from a `LOOM_REPO` that names a different repo (#5511).
-/// `timeout` bounds each page read (`None` = the conditional-read default);
-/// the registry guard passes its `reap_gh_timeout`, like its other legs.
+/// The listing is always read for `owner_repo` — the repo the caller resolved
+/// and asks its fallback legs about — never re-resolved from `root`'s
+/// `origin` or `LOOM_REPO`. In a fork clone (or after `gh repo set-default`)
+/// `origin` names a different repo than the closes-graph is asked about, and
+/// a successful read of the fork's (empty) listing would be a false "no PR"
+/// that also skips the fallback (#10514 review). For the usual clone, where
+/// `origin` is that same repo on github.com, the cache key and URL equal the
+/// claim-reconciliation passes', so the ETag is still shared. The
+/// `worktree_ops` probe's repo additionally never comes from `LOOM_REPO`
+/// (#5511). `timeout` bounds each page read (`None` = the conditional-read
+/// default); the registry guard passes its `reap_gh_timeout`, like its other
+/// legs.
 pub(crate) fn probe(
     caller: &'static str,
     gh_bin: &Path,
     root: &Path,
-    repo_override: Option<&str>,
     (owner_repo, issue): (&str, u32),
     timeout: Option<Duration>,
 ) -> Option<OpenPrProbe> {
@@ -83,7 +87,7 @@ pub(crate) fn probe(
         caller,
         gh_bin,
         Some(root),
-        repo_override,
+        Some(owner_repo),
         MAX_PAGES,
         timeout,
     );
