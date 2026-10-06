@@ -152,9 +152,9 @@ fn describe(account: &str, container: &str, state: SessionState) -> String {
         SessionState::StaleMounts => format!(
             "Codex session container for account {account} ({container}) is running but its \
              workspace mounts no longer match the registry (stale_mounts: a registered root is \
-             not mounted, or a deregistered one still is, #10364); the session reconciler \
-             recreates it once idle (by hand: `loom-daemon accounts session stop {account}` then \
-             `session start`)"
+             not mounted, or a deregistered one still is, #10364); when the session reconciler is \
+             enabled it recreates the container once idle, otherwise recreate it by hand: \
+             `loom-daemon accounts session stop {account}` then `session start`"
         ),
         SessionState::Running => {
             format!("Codex session container for account {account} ({container}) is running")

@@ -18,7 +18,9 @@
 //! | running, mounts match the registry | nothing |
 //! | running, mount drift, idle | stop + rm, then recreate ([`recreate_container`]) with the current registry roots (#10364; see [`drift`]) |
 //! | running, mount drift, in-flight exec | defer and re-check next pass — never killed |
-//! | running, mounts something no longer allowed, idle, and no start would be allowed | stop + rm, not recreated (fails closed) |
+//! | running, mounts a positively denied path, idle, and no start would be accepted | stop + rm, not recreated, recorded on disk; never repeated (fails closed) |
+//! | running, drift that cannot be decided (registry unreadable or empty under its workspace, a root's directory missing, roster unreadable) | nothing — missing information is never a reason to stop a container |
+//! | missing, and a recorded denial removal still stands | nothing until the denial is over or an operator starts it |
 //! | restarting (1st pass) | nothing — Docker's `unless-stopped` policy is already retrying |
 //! | restarting (2nd+ consecutive pass) | WARN once as a **crash loop**; never reused, never stopped |
 //! | stopped, host-mounted | resume via [`SessionLifecycle::start_with_workspace`] (the `accounts session start` path) |
@@ -35,9 +37,10 @@
 //! * **Never interrupts work.** The `docker` mutations are `docker start` of
 //!   a *stopped* container, `docker run` of a *missing* one, and, for mount
 //!   drift only, a graceful `docker stop` + `rm` + `run` of a *running*
-//!   container that `docker top` shows idle at that moment ([`drift`]). A
-//!   container with an in-flight `docker exec` (the #5119 contract) is never
-//!   stopped. A restarting container is not touched either: `stop` without
+//!   container that `docker top` shows idle and whose dispatch lock no
+//!   dispatch holds ([`drift`], [`session_dispatch_lock`]). A container with
+//!   an in-flight `docker exec` (the #5119 contract), or a dispatch that is
+//!   only starting, is never stopped. A restarting container is not touched either: `stop` without
 //!   `--force` cannot judge one (its `docker top` in-flight check fails while
 //!   Docker is between restarts).
 //! * **Operator hold:** `loom-daemon accounts session stop <name>` writes
@@ -96,9 +99,11 @@
 //!
 //! A running host-mode container whose workspace mounts differ from what the
 //! **current** registry says ([`session_state::mount_drift`]) is recreated
-//! when idle; see [`drift`] for the ordering (`extra` first), the busy
-//! deferral and the not-achievable backoff. Private-clone containers are
-//! never drift-recreated.
+//! when idle; see [`drift`] for its safety rules (no action on missing
+//! information, one acceptance check shared with `create`, a removal never
+//! repeated, the dispatch lock), the ordering (`extra` first, across roots)
+//! and the busy deferral. Private-clone containers are never
+//! drift-recreated.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -116,6 +121,7 @@ use crate::tokens_pool::session_lifecycle::{
     SESSION_POSTURE_LABEL,
 };
 use crate::tokens_pool::session_state::{self, MountDrift, Snapshot};
+use crate::tokens_pool::{session_dispatch_lock, session_mount_gate};
 use crate::workspace_registry::WorkspaceRegistry;
 use serde_json::Value;
 
@@ -325,6 +331,9 @@ pub enum Outcome {
     DriftRemoved {
         drift: MountDrift,
     },
+    /// Missing, and a recorded [`Outcome::DriftRemoved`] still stands (the
+    /// denial applies, or cannot be re-checked): not recreated.
+    DriftRemovalStands,
     /// Skipped without any `docker` call until `retry_at` (unix secs).
     BackingOff {
         retry_at: u64,
@@ -382,6 +391,8 @@ struct AccountMemory {
 #[derive(Debug, Default)]
 pub struct ReconcileState {
     accounts: HashMap<String, AccountMemory>,
+    /// The registry read error already WARNed about, and when to repeat it.
+    registry_error: Option<(String, u32, u64)>,
     /// Pass-level backoff while Docker is unavailable (never per account).
     docker_failures: u32,
     docker_retry_at: u64,
@@ -463,12 +474,24 @@ pub struct PassInputs<'a> {
     /// The guessed workspace for a missing container with no recorded start.
     pub fallback_workspace: &'a Path,
     /// The workspace registry's roots **now**: what a drifted container's
-    /// mounts are compared against (#10364).
-    pub registered: &'a [PathBuf],
-    /// What `session start` refuses to mount whatever the registry says: the
-    /// home directory and the `firewall: true` repositories. A running
-    /// container that mounts one has `extra` drift.
-    pub denials: &'a drift::Denials,
+    /// mounts are compared against (#10364). `None` when the registry could
+    /// not be read: no drift decision is made this pass.
+    pub registered: Option<&'a [PathBuf]>,
+    /// What `session start --mount-workspace <workspace>` refuses to mount
+    /// whatever the registry says (home, `firewall: true` repositories). A
+    /// running container that mounts one has `extra` drift. `Err`: cannot
+    /// be decided, which is neither "denied" nor "allowed".
+    pub denials_for: &'a dyn Fn(&Path) -> anyhow::Result<drift::Denials>,
+    /// Whether `create` would accept a container for this workspace now —
+    /// in production the very function `create` calls
+    /// ([`session_mount_gate::create_roots`]).
+    pub would_create_accept: &'a dyn Fn(&Path) -> anyhow::Result<()>,
+    /// Where the per-container dispatch locks live
+    /// ([`session_dispatch_lock`]); `None`: unknown, so nothing is stopped.
+    pub dispatch_locks: Option<&'a Path>,
+    /// Act only on accounts of this [`drift::priority`] class (`run_tick`
+    /// walks the classes in order across every root); `None`: all, sorted.
+    pub class: Option<u8>,
 }
 
 /// The pass's single container read: one [`Snapshot`] from `take`, taken on
@@ -529,9 +552,17 @@ pub fn reconcile_accounts<R: ContainerRunner>(
         .any(|a| will_read(state, index, &a.id.name, now))
     {
         let snapshot = observe.get();
-        // Stable: accounts without drift keep their registry order.
-        eligible
-            .sort_by_cached_key(|a| drift::priority(snapshot, &container_name(&a.id.name), inputs));
+        let class =
+            |a: &&AccountDescriptor| drift::priority(snapshot, &container_name(&a.id.name), inputs);
+        match inputs.class {
+            Some(only) => eligible.retain(|a| class(a) == only),
+            // Stable: accounts without drift keep their registry order.
+            None => eligible.sort_by_cached_key(class),
+        }
+    } else if inputs.class.is_some_and(|only| only != drift::LAST_CLASS) {
+        // Nothing will be read, so nothing is classified: report these
+        // accounts once, with the last class.
+        eligible.clear();
     }
     let mut out = Vec::new();
     for account in eligible {
@@ -850,6 +881,9 @@ fn reconcile_one<R: ContainerRunner>(
             Outcome::Resumed
         }
         Decision::Recreate { workspace } => {
+            if let Some(stands) = drift::removal_stands(name, &workspace, ctx, mem) {
+                return Ok(stands);
+            }
             if guessed {
                 log::warn!(
                     "session_reconcile: {container}: no operator start is recorded for {name}; \
@@ -874,12 +908,40 @@ fn reconcile_one<R: ContainerRunner>(
 // Runtime wiring
 // ============================================================================
 
+/// The registry could not be read: say so (WARN, repeated on the backoff
+/// schedule while the same error lasts) and make no drift decision.
+fn registry_unreadable(state: &mut ReconcileState, error: &str, now: u64) {
+    let (failures, warn_at) = match &state.registry_error {
+        Some((last, failures, warn_at)) if last == error => (*failures, *warn_at),
+        _ => (0, 0),
+    };
+    if now < warn_at {
+        log::debug!("session_reconcile: workspace registry still unreadable: {error}");
+        return;
+    }
+    let again = backoff_secs(failures + 1);
+    log::warn!(
+        "session_reconcile: the workspace registry cannot be read ({error}); no mount-drift \
+         decision is made (no container is stopped, removed or recreated for drift) until it \
+         can. Next reminder in {again}s"
+    );
+    state.registry_error = Some((error.to_string(), failures + 1, now + again));
+}
+
 /// One production pass over every registered root's Codex accounts.
 pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> Vec<AccountOutcome> {
-    let registry = WorkspaceRegistry::load_default().unwrap_or_else(|e| {
-        log::warn!("session_reconcile: could not load workspace registry ({e}); using fallback");
-        WorkspaceRegistry::default()
-    });
+    let (registry, readable) = match WorkspaceRegistry::load_default() {
+        Ok(registry) => {
+            if state.registry_error.take().is_some() {
+                log::info!("session_reconcile: workspace registry readable again");
+            }
+            (registry, true)
+        }
+        Err(error) => {
+            registry_unreadable(state, &format!("{error:#}"), now);
+            (WorkspaceRegistry::default(), false)
+        }
+    };
     let registered = registry.roots();
     let fallback_workspace = default_mount_workspace(&registered, fallback_root);
     let inventories: Vec<(PathBuf, Vec<AccountDescriptor>)> = registry
@@ -898,48 +960,72 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             .collect::<Vec<_>>(),
     );
     // One container read for the whole pass (every root), taken lazily.
-    let denials = drift::Denials::load(fallback_root);
     let mut take =
         || session_state::snapshot("docker", &registered, session_state::SNAPSHOT_DEADLINE);
     let mut observe = PassSnapshot::new(&mut take);
+    let dispatch_locks = session_dispatch_lock::lock_dir();
     let mut seen = HashSet::new();
-    let mut all = Vec::new();
-    for (root, inventory) in inventories {
-        let accounts: Vec<AccountDescriptor> = inventory
-            .into_iter()
-            .filter(|a| {
-                a.enabled
-                    && is_session_managed(&a.credential_reference)
-                    && seen.insert(a.id.name.clone())
-            })
-            .collect();
-        if accounts.is_empty() {
-            continue;
+    let roots: Vec<(PathBuf, Vec<AccountDescriptor>)> = inventories
+        .into_iter()
+        .map(|(root, inventory)| {
+            let accounts = inventory
+                .into_iter()
+                .filter(|a| {
+                    a.enabled
+                        && is_session_managed(&a.credential_reference)
+                        && seen.insert(a.id.name.clone())
+                })
+                .collect();
+            (root, accounts)
+        })
+        .collect();
+    let mut all: Vec<AccountOutcome> = Vec::new();
+    // `extra` drift first, then missing-only, then the rest — across every
+    // root, not root by root.
+    let mut done: HashSet<String> = HashSet::new();
+    for class in 0..=drift::LAST_CLASS {
+        for (root, accounts) in &roots {
+            // Each account is acted on (and reported) once per pass.
+            let accounts: Vec<AccountDescriptor> = accounts
+                .iter()
+                .filter(|a| !done.contains(&a.id.name))
+                .cloned()
+                .collect();
+            if accounts.is_empty() {
+                continue;
+            }
+            let mut lifecycle = SessionLifecycle::new(root.clone(), ProcessContainerRunner, None);
+            let is_private_clone =
+                |a: &AccountDescriptor| private_workspace::configured(root, &a.id.name);
+            let inputs = PassInputs {
+                index: &index,
+                is_private_clone: &is_private_clone,
+                fallback_workspace: &fallback_workspace,
+                registered: readable.then_some(registered.as_slice()),
+                denials_for: &drift::Denials::load,
+                would_create_accept: &|workspace| {
+                    session_mount_gate::create_roots(workspace).map(drop)
+                },
+                dispatch_locks: dispatch_locks.as_deref(),
+                class: Some(class),
+            };
+            let outcomes =
+                reconcile_accounts(&mut lifecycle, &accounts, &inputs, &mut observe, state, now);
+            done.extend(outcomes.iter().map(|o| o.name.clone()));
+            let started: Vec<AccountDescriptor> = accounts
+                .iter()
+                .filter(|a| {
+                    outcomes
+                        .iter()
+                        .any(|o| o.name == a.id.name && o.outcome.started())
+                })
+                .cloned()
+                .collect();
+            if !started.is_empty() {
+                refresh_session_health_uncached(root, &started, now);
+            }
+            all.extend(outcomes);
         }
-        let mut lifecycle = SessionLifecycle::new(root.clone(), ProcessContainerRunner, None);
-        let is_private_clone =
-            |a: &AccountDescriptor| private_workspace::configured(&root, &a.id.name);
-        let inputs = PassInputs {
-            index: &index,
-            is_private_clone: &is_private_clone,
-            fallback_workspace: &fallback_workspace,
-            registered: &registered,
-            denials: &denials,
-        };
-        let outcomes =
-            reconcile_accounts(&mut lifecycle, &accounts, &inputs, &mut observe, state, now);
-        let started: Vec<AccountDescriptor> = accounts
-            .into_iter()
-            .filter(|a| {
-                outcomes
-                    .iter()
-                    .any(|o| o.name == a.id.name && o.outcome.started())
-            })
-            .collect();
-        if !started.is_empty() {
-            refresh_session_health_uncached(&root, &started, now);
-        }
-        all.extend(outcomes);
     }
     all
 }

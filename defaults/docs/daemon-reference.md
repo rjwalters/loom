@@ -8710,11 +8710,15 @@ across the registered roots:
 | missing, host-mounted | recreated with the workspace and image of the last operator `session start`; otherwise the label last seen on it; otherwise the registered roots' common parent, logged as a guess. Never `/`: that is refused and reported |
 | stopped or missing, private-clone | skipped with one WARN; never recreated host-mounted |
 | running, workspace mounts drifted, idle | stopped, removed and recreated with the current registry (#10364, below) |
-| running, workspace mounts drifted, in-flight exec | deferred and re-checked next pass; never stopped |
+| running, workspace mounts drifted, in-flight exec or a dispatch starting | deferred and re-checked next pass; never stopped |
+| running, drift that cannot be decided | left running (rule 1 below) |
+| missing after a recorded denial removal | not recreated while the denial stands (rule 3 below) |
 
-- The pass never stops or removes a container except to recreate an **idle**
-  one whose mounts drifted. A container with an in-flight `docker exec` is
-  never stopped (#5119).
+- The pass never stops or removes a container except an **idle** one whose
+  mounts drifted: to recreate it, or, when it mounts a positively denied path
+  and nothing would be accepted in its place, to remove it. A container with
+  an in-flight `docker exec`, or a dispatch that is only starting, is never
+  stopped (#5119).
 - The pass reads every container once: one bounded `docker ps -a` plus one
   `docker inspect`, taken fresh on the first account that needs it.
 - After a resume or recreate, the account is re-probed at once, bypassing the
@@ -8775,37 +8779,87 @@ compares every running container's mounts with what `accounts session start
 
 - Containers that still mount something they may no longer mount (`extra`, a
   containment gap, logged at WARN with the container and path) are handled
-  before those that only lack a new one (`missing`). `extra` is a mounted
-  path that left the registry, **or** one `session start` would refuse today
-  even though it is still registered: the home directory, or anything
-  overlapping a `firewall: true` repository in the cached fleet roster. A
-  container started with `--mount-workspace <one git checkout>` is not
-  `extra` just because that checkout is unregistered: `session start` accepts
-  that as an explicit operator grant.
+  before those that only lack a new one (`missing`), across every registered
+  root. `extra` is a mounted path that left the registry, **or** one
+  `session start` would refuse today even though it is still registered: the
+  home directory, or anything overlapping a `firewall: true` repository in
+  the cached fleet roster.
 - An idle one is stopped (graceful, 15 s), removed and recreated against the
   workspace and image of the last operator `session start`
   (`.session-last-start.json`, so a daemon restart does not lose it),
-  otherwise its own `loom.workspace` label. No hold is written. A busy one
-  (`docker top` shows an exec) is left running and re-checked next pass.
-- Before stopping anything, the pass re-checks the hold, re-inspects the
-  container (it must be the same container, still running), and checks that
-  the recreate would be allowed (not `/`, the home directory or a `firewall:
-  true` overlap, and at least one registered root under the workspace). If it
-  would be refused and the container only lacks mounts, nothing is stopped.
-  If it would be refused and the container has `extra` mounts, the idle
-  container is still stopped and removed, with a WARN, and nothing replaces
-  it: no container may run with mounts `session start` would refuse. The
-  missing-container row above then retries the start on its backoff, and
-  succeeds once the registry or roster allows one. Until then Codex ticks for
-  that account fall through to the next `rolePreference` runtime.
-- If a freshly recreated container still drifts, or the recreate would be
-  refused, the pass WARNs once and leaves it alone until the drift changes
-  (or the daemon restarts) instead of recreating it every interval. A failed
-  stop or recreate takes the per-account backoff above; a timed-out one ends
-  the pass like any other timeout.
+  otherwise its own `loom.workspace` label. No hold is written. A busy one is
+  left running and re-checked next pass.
 - Held, disabled, private-clone (`loom.workspace-mode=private-clone`, or
-  configured under `.private-sessions`) and non-session-managed accounts are
-  never drift-recreated.
+  configured under `.private-sessions`, or a mode that cannot be read, which
+  WARNs once) and non-session-managed accounts are never drift-recreated.
+- A freshly recreated container that still drifts is WARNed about once and
+  left alone until the drift changes, instead of being recreated every
+  interval. A failed stop or recreate takes the per-account backoff above; a
+  timed-out one ends the pass like any other timeout.
+
+The drift path follows four safety rules:
+
+1. **Missing information means no action.** A container is stopped with
+   nothing put in its place only for a *positively established denial*: a
+   specific mounted path that is the home directory or overlaps a `firewall:
+   true` repository, read from a roster that parsed. Anything that cannot be
+   decided leaves the container running:
+   - the workspace registry cannot be read or parsed: no drift decision for
+     the whole pass, one WARN, repeated on the backoff schedule;
+   - the registry is readable but lists nothing under the container's
+     workspace (an emptied or truncated file): deferred with a WARN. "Nothing
+     is intended" never removes a container;
+   - a registered root under the workspace is not a directory right now (an
+     unmounted volume): deferred with a WARN;
+   - the fleet roster cannot be read: no mount counts as denied, and no
+     recreate counts as accepted, so nothing is torn down;
+   - a recreate that would be refused, with no mounted path positively
+     denied: WARN once, left running.
+2. **One acceptance check.** Before stopping anything the pass asks whether
+   the recreate would be accepted, using the same function `session start`'s
+   `docker run` path uses, with the same workspace
+   (`tokens_pool/session_mount_gate.rs`). There is no second implementation.
+3. **A removal is recorded, never repeated, and never undone by the pass.**
+   When an idle container mounts a positively denied path and no start would
+   be accepted, it is stopped and removed, with a WARN naming the container
+   and the path, and `.session-drift-removed.json` is written in the account's
+   profile directory first (if that write fails, nothing is removed). While
+   the record stands the pass does not recreate the container, across daemon
+   restarts, and a container that reappears with the denied mount is WARNed
+   about but not removed a second time. The record is cleared when the denial
+   positively no longer applies (the repository was deregistered, or the
+   roster no longer marks it), or by an operator `accounts session start`.
+   It is not an operator hold: `session status` does not show the account as
+   held, and the pass never writes or lifts `.session-hold.json`. Until it
+   clears, Codex ticks for that account fall through to the next
+   `rolePreference` runtime.
+4. **A dispatch is never stopped, including one that is only starting.**
+   `docker top` cannot see a dispatch between its preflight inspect and its
+   worker exec. `session-exec host` therefore holds a per-container advisory
+   lock (a shared `flock` on `~/.loom/session-locks/<container>.lock`;
+   `LOOM_SESSION_LOCK_DIR` overrides the directory) from before its first
+   inspect until its worker exec has exited. The drift teardown takes it
+   exclusively, without blocking, right before `docker stop`, and keeps it
+   until the container is recreated. If a dispatch holds it the teardown is
+   deferred to the next pass; if the lock file cannot be created or opened
+   the teardown is deferred too. A dispatch that finds a teardown in progress
+   waits up to 30 s for it, and proceeds unlocked if the lock is unusable.
+   `accounts session stop` without `--force` takes the same lock and refuses
+   while a dispatch holds it. The `docker top` check remains as the second
+   line.
+
+**Known gap: a session started on one checkout.** A container started with
+`--mount-workspace <one git checkout>` is not `extra` when that checkout is
+unregistered: `session start` accepts an unregistered checkout as an explicit
+operator grant, and a recreate would mount it again. So `loom-daemon
+workspace remove <repo>` does **not** unmount that repository from a
+container started on it; it stays mounted until an operator runs
+`loom-daemon accounts session stop <acct>`. The `workspace remove` report
+names each such container and that command.
+
+A drifted container keeps taking dispatches for the repositories it does
+mount until it is recreated: selection (#10454) checks only that a container
+is running.
 
 `loom-daemon workspace add`/`remove` lists the containers the change left
 drifted, says the reconciler will recreate them, and prints the manual

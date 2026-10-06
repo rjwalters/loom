@@ -24,6 +24,8 @@ use crate::tokens_pool::session_state::{classify_inspect, Observed};
 
 #[path = "session_reconcile_drift_tests.rs"]
 mod drift_tests;
+#[path = "session_reconcile_safety_tests.rs"]
+mod safety_tests;
 
 /// Shared so a pass can snapshot it while the lifecycle owns it.
 #[derive(Default, Clone)]
@@ -43,8 +45,21 @@ struct FakeState {
     mounts: Mutex<HashMap<String, Vec<PathBuf>>>,
     /// The workspace registry the pass and `create` see.
     registered: Mutex<Vec<PathBuf>>,
-    /// `firewall: true` paths the pass and `create` see.
+    /// `firewall: true` paths the pass's pre-check sees (and `create`, unless
+    /// `create_firewalled` says otherwise).
     firewalled: Mutex<Vec<PathBuf>>,
+    /// What `create` sees instead, when the two disagree.
+    create_firewalled: Mutex<Option<Vec<PathBuf>>>,
+    /// Runs right after `has_active_exec` answers: a dispatch that starts in
+    /// the gap `docker top` cannot see.
+    after_top: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// The firewall roster cannot be read: denials are unknown and `create`
+    /// (and its pre-check) fail closed.
+    roster_unreadable: Mutex<bool>,
+    /// Where this fake's dispatch locks live (a tempdir, made on first use).
+    lock_dir: Mutex<Option<PathBuf>>,
+    /// The pass sees no readable registry.
+    registry_unreadable: Mutex<bool>,
     /// `create` mounts exactly these instead of what the registry implies
     /// (intended ≠ achievable).
     create_mounts: Mutex<Option<Vec<PathBuf>>>,
@@ -92,6 +107,23 @@ impl FakeState {
             home: None,
             firewalled: self.firewalled.lock().unwrap().clone(),
         }
+    }
+    fn lock_dir(&self) -> PathBuf {
+        self.lock_dir
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| tempfile::tempdir().unwrap().keep())
+            .clone()
+    }
+    /// What `create` accepts: its own view of the roster.
+    fn create_accepts(&self, workspace: &Path, walls: &[PathBuf]) -> Result<Vec<PathBuf>> {
+        if *self.roster_unreadable.lock().unwrap() {
+            bail!("fleet roster (firewall input): unreadable");
+        }
+        let registered = self.registered.lock().unwrap().clone();
+        let intended = workspace_mount_roots(workspace, &registered).unwrap_or_default();
+        check_mount_denials(&intended, None, walls)?;
+        Ok(intended)
     }
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
@@ -199,9 +231,9 @@ impl ContainerRunner for Fake {
         // Like `docker run` behind `session start`: a firewalled root is
         // refused. (An unregistered workspace is not refused here, so the
         // #10453 tests can use paths that do not exist.)
-        let registered = self.registered.lock().unwrap().clone();
-        let intended = workspace_mount_roots(workspace, &registered).unwrap_or_default();
-        check_mount_denials(&intended, None, &self.firewalled.lock().unwrap())?;
+        let walls = self.create_firewalled.lock().unwrap().clone();
+        let walls = walls.unwrap_or_else(|| self.firewalled.lock().unwrap().clone());
+        let intended = self.create_accepts(workspace, &walls)?;
         let dies = *self.dies_after_start.lock().unwrap();
         self.seed(container, dies.is_none(), dies == Some(true), Some(workspace));
         let mounts = self
@@ -233,7 +265,11 @@ impl ContainerRunner for Fake {
     }
     fn has_active_exec(&self, container: &str) -> Result<bool> {
         self.log("has_active_exec");
-        Ok(*self.busy.lock().unwrap().get(container).unwrap_or(&false))
+        let busy = *self.busy.lock().unwrap().get(container).unwrap_or(&false);
+        if let Some(hook) = self.after_top.lock().unwrap().as_ref() {
+            hook();
+        }
+        Ok(busy)
     }
     fn stop_and_remove(&self, container: &str, _grace: Duration) -> Result<()> {
         self.log("stop_and_remove");
@@ -353,6 +389,26 @@ fn pass_with(
         .collect()
 }
 
+/// The inputs that do not depend on the fake's roster or registry state.
+fn fake_inputs<'a>(
+    fake: &Fake,
+    index: &'a AccountIndex,
+    private: &'a dyn Fn(&AccountDescriptor) -> anyhow::Result<bool>,
+    fallback: &'a Path,
+    registered: &'a [PathBuf],
+) -> PassInputs<'a> {
+    PassInputs {
+        index,
+        is_private_clone: private,
+        fallback_workspace: fallback,
+        registered: Some(registered),
+        denials_for: &|_| Ok(drift::Denials::default()),
+        would_create_accept: &|_| Ok(()),
+        dispatch_locks: Some(Box::leak(fake.lock_dir().into_boxed_path())),
+        class: None,
+    }
+}
+
 /// [`pass_with`], keeping each outcome's account.
 fn pass_named(
     lifecycle: &mut SessionLifecycle<Fake>,
@@ -366,15 +422,23 @@ fn pass_named(
     let index = AccountIndex::from_inventories(&[accounts, other_roots]);
     let fake = lifecycle.runner().clone();
     let registered = fake.registered.lock().unwrap().clone();
-    let denials = fake.denials();
     let mut take = || fake.snapshot(&registered);
     let mut observe = PassSnapshot::new(&mut take);
+    let inputs = fake_inputs(&fake, &index, private, fallback, &registered);
     let inputs = PassInputs {
-        index: &index,
-        is_private_clone: private,
-        fallback_workspace: fallback,
-        registered: &registered,
-        denials: &denials,
+        registered: (!*fake.registry_unreadable.lock().unwrap()).then_some(&registered[..]),
+        denials_for: &|_| {
+            if *fake.roster_unreadable.lock().unwrap() {
+                bail!("fleet roster (firewall input): unreadable");
+            }
+            Ok(fake.denials())
+        },
+        // The pre-check's view of the roster; `create` may be given another.
+        would_create_accept: &|workspace| {
+            let walls = fake.firewalled.lock().unwrap().clone();
+            fake.create_accepts(workspace, &walls).map(drop)
+        },
+        ..inputs
     };
     reconcile_accounts(lifecycle, accounts, &inputs, &mut observe, state, now)
 }

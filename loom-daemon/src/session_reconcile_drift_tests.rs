@@ -330,25 +330,32 @@ fn a_still_registered_repo_that_became_firewalled_is_extra_and_recreated_first()
     let snapshot = fake.snapshot(&ws.roots(&["a", "new", "walled"]));
     let bob = snapshot.inspect_of(&container_name("bob")).unwrap();
     let registered = ws.roots(&["a", "new", "walled"]);
-    assert!(drift::effective_drift(bob, &registered, &fake.denials()).is_empty());
+    let assess =
+        |inspect: &Value, fake: &Fake| drift::assess(inspect, &registered, Some(&fake.denials()));
+    assert_eq!(assess(bob, &fake), drift::Assessed::default());
     *fake.firewalled.lock().unwrap() = ws.roots(&["walled"]);
     assert_eq!(
-        drift::effective_drift(bob, &registered, &fake.denials()),
-        MountDrift {
-            missing: Vec::new(),
-            extra: ws.roots(&["walled"]),
+        assess(bob, &fake),
+        drift::Assessed {
+            drift: MountDrift {
+                missing: Vec::new(),
+                extra: ws.roots(&["walled"]),
+            },
+            denied: ws.roots(&["walled"]),
         }
     );
+    // An unreadable roster denies nothing (and, separately, accepts nothing).
+    assert_eq!(drift::assess(bob, &registered, None), drift::Assessed::default());
     // A single unregistered checkout is an explicit grant, not drift.
     let solo = inspect_json(
         "loom-codex-session-solo",
         &st(true, false, Some(single.p("repo").to_str().unwrap())),
         &single.roots(&["repo"]),
     );
-    assert!(drift::effective_drift(&solo, &registered, &fake.denials()).is_empty());
+    assert_eq!(assess(&solo, &fake), drift::Assessed::default());
     // The roster marks `walled` but the registry still lists it: no start is
     // accepted, so both idle containers that mount it are removed, not
-    // recreated, and the start is retried on the ordinary backoff.
+    // recreated, and they stay down while that denial stands.
     let mut state = ReconcileState::default();
     let out = pass(&mut lifecycle, &env, &host, &mut state, 0);
     assert!(
@@ -362,8 +369,13 @@ fn a_still_registered_repo_that_became_firewalled_is_extra_and_recreated_first()
         assert_eq!(drift.extra, ws.roots(&["walled"]), "names the denied path");
     }
     assert_eq!(lifecycle.runner().mutations(), ["stop_and_remove", "stop_and_remove"]);
-    let out = pass(&mut lifecycle, &env, &host, &mut state, 60);
-    assert!(matches!(out[..], [Outcome::Failed { .. }, Outcome::Failed { .. }]), "{out:?}");
+    for now in [60, 120, 180] {
+        assert_eq!(
+            pass(&mut lifecycle, &env, &host, &mut state, now),
+            vec![Outcome::DriftRemovalStands, Outcome::DriftRemovalStands]
+        );
+    }
+    assert_eq!(lifecycle.runner().count("create"), 0, "never recreated meanwhile");
     assert!(lifecycle.runner().containers.lock().unwrap().is_empty());
     // The operator deregisters it: both come back without it.
     register(&lifecycle, &ws, &["a", "new"]);
@@ -374,15 +386,13 @@ fn a_still_registered_repo_that_became_firewalled_is_extra_and_recreated_first()
 
 #[test]
 #[serial]
-fn extra_drift_with_nothing_allowed_in_its_place_is_removed_only_when_idle() {
+fn a_denied_mount_with_nothing_accepted_in_its_place_is_removed_only_when_idle() {
     let env = setup(&["alice"], &["alice"]);
-    let ws = Ws::new(&["a", "gone"]);
+    let ws = Ws::new(&["a", "walled"]);
     let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
-    // Every repository under its workspace was deregistered: all its mounts
-    // are `extra`, and `session start` would refuse the workspace outright.
-    seed_running(&lifecycle, "alice", &ws, &["a", "gone"]);
-    let elsewhere = Ws::new(&["c"]);
-    register(&lifecycle, &elsewhere, &["c"]);
+    seed_running(&lifecycle, "alice", &ws, &["a", "walled"]);
+    register(&lifecycle, &ws, &["a", "walled"]);
+    *lifecycle.runner().firewalled.lock().unwrap() = ws.roots(&["walled"]);
     let container = container_name("alice");
     lifecycle
         .runner()
@@ -404,14 +414,13 @@ fn extra_drift_with_nothing_allowed_in_its_place_is_removed_only_when_idle() {
         .lock()
         .unwrap()
         .insert(container, false);
-    // The outcome (and the WARN built from it) names every path it may no
-    // longer mount.
+    // The outcome (and the WARN built from the same list) names the path.
     assert_eq!(
         pass(&mut lifecycle, &env, &host, &mut state, 60),
         vec![Outcome::DriftRemoved {
             drift: MountDrift {
                 missing: Vec::new(),
-                extra: ws.roots(&["a", "gone"]),
+                extra: ws.roots(&["walled"]),
             },
         }]
     );
@@ -472,13 +481,7 @@ fn a_container_replaced_since_the_snapshot_is_left_for_the_next_pass() {
     let registered = fake.registered.lock().unwrap().clone();
     let mut take = || snapshot.clone();
     let mut observe = PassSnapshot::new(&mut take);
-    let inputs = PassInputs {
-        index: &index,
-        is_private_clone: &host,
-        fallback_workspace: Path::new("/srv/checkouts"),
-        registered: &registered,
-        denials: &drift::Denials::default(),
-    };
+    let inputs = fake_inputs(&fake, &index, &host, Path::new("/srv/checkouts"), &registered);
     let mut state = ReconcileState::default();
     let out =
         reconcile_accounts(&mut lifecycle, &env.accounts, &inputs, &mut observe, &mut state, 0);

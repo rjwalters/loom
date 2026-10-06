@@ -205,8 +205,17 @@ pub(crate) fn handle_session_command(
                 return print_private(&private::stop(&workspace, &name, force)?, json);
             }
             let peers = peer_roots(&workspace);
+            let lock = loom_daemon::tokens_pool::session_dispatch_lock::for_operator_stop;
             let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
                 .with_peer_roots(peers);
+            // A dispatch that is only starting is invisible to `docker top`;
+            // it holds this lock (#10364). Kept until the stop is done.
+            let _no_dispatch = if force {
+                None
+            } else {
+                // The lock is keyed by the resolved account's container.
+                Some(lock(&lifecycle.status(&name)?.container_name)?)
+            };
             print_session_status(&lifecycle.stop(&name, force)?, json)
         }
         SessionAction::Status { name, json } => {

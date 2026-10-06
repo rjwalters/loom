@@ -27,7 +27,9 @@ pub(super) fn reason_in(contents: &str, tick_anchor: &str) -> Option<String> {
     (result.category == TerminalClassification::SessionMountStale).then(|| {
         format!(
             "{REASON_PREFIX}: the Codex session container for account {} does not mount this \
-             repository; the session reconciler recreates it once idle (#10364)",
+             repository; when the session reconciler is enabled it recreates the container once \
+             idle, otherwise run `loom-daemon accounts session stop` then `session start` for \
+             that account (#10364)",
             result.account
         )
     })

@@ -174,9 +174,10 @@ pub(super) fn mount_stale_line(
         .map_or_else(|| "<checkout parent>".to_string(), |w| w.display().to_string());
     format!(
         "session-exec: {workdir} is not mounted in {container}, which was created before this \
-         repository was registered (#10364); the daemon's session reconciler recreates it once \
-         idle (by hand: loom-daemon accounts session stop {account} && loom-daemon accounts \
-         session start {account} --mount-workspace {workspace})"
+         repository was registered (#10364); when the daemon's session reconciler is enabled it \
+         recreates the container once idle, otherwise run: loom-daemon accounts session stop \
+         {account} && loom-daemon accounts session start {account} --mount-workspace \
+         {workspace}"
     )
 }
 
@@ -212,6 +213,13 @@ pub fn run(args: HostArgs) -> Result<i32> {
             bail!("session launcher died before supervision started");
         }
     }
+    // Held (shared) from before the first inspect until this function
+    // returns, i.e. past the worker exec: a teardown of the container takes
+    // it exclusively and defers while any dispatch holds it, including in
+    // the gaps `docker top` cannot see (#10364). `None` (lock unusable, or a
+    // teardown still running after the wait): dispatch proceeds as before.
+    let _dispatch_lock =
+        crate::tokens_pool::session_dispatch_lock::shared_for_dispatch(&args.container);
     // One inspect answers both pre-exec questions: is the container running
     // (#10455), and does it mount this tick's working directory (#10364)? A
     // host-mode container mounts each registered repo separately, fixed at
