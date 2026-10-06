@@ -166,8 +166,14 @@ What Loom does with `launcherPath` (all no-ops with no policy):
   `LOOM_FORGE_EGRESS_POLICY` / `GITHUB_EGRESS_POLICY` name the policy. `~/.config/gh`
   is not mounted and `GH_TOKEN` / `GITHUB_TOKEN` are not forwarded. The launcher
   is Python 3: under `required`, an image without `python3` is refused
-  (`toolchain.launcher-python3-missing`). `loom-daemon forge egress container-args`
-  prints the docker arguments.
+  (`toolchain.launcher-python3-missing`) and so is one whose `gh` does not
+  resolve to the launcher (`toolchain.launcher-not-first`) — on both container
+  paths (`spawn-worker` and `spawn-claude.sh`, the latter via `loom-daemon forge
+  egress container-check <image>`, exit 78). A configured policy that cannot be
+  honoured (unreadable, or a missing launcher under `required`) is refused with
+  exit 78 and never falls back to `~/.config/gh` / `GH_TOKEN`; only a host with
+  no policy keeps those. `loom-daemon forge egress container-args` prints the
+  docker arguments.
 - **Exit codes** — a launcher exit of `78` is `outcome=routing_blocked` and `69`
   is `outcome=adapter_unavailable`. Neither is a forge answer: the invocation
   surfaces as unavailable (never an empty result) and is not retried.

@@ -34,6 +34,7 @@ impl Fx {
             env_path: Some(policy),
             machine_path: None,
             repo_path: None,
+            ..PolicySources::default()
         };
         let egress = WorkerEgress::from_sources(&sources).unwrap();
         (Self { dir }, egress)
@@ -46,6 +47,7 @@ fn no_policy_or_repo_policy_is_none() {
         env_path: None,
         machine_path: None,
         repo_path: None,
+        ..PolicySources::default()
     };
     assert!(WorkerEgress::from_sources(&none).is_none());
     // Production resolution is off in a unit-test build.
@@ -55,6 +57,7 @@ fn no_policy_or_repo_policy_is_none() {
         env_path: None,
         machine_path: None,
         repo_path: Some(fx.dir.path().join("policy.json")),
+        ..PolicySources::default()
     };
     assert!(WorkerEgress::from_sources(&repo).is_none());
 }
@@ -118,4 +121,70 @@ fn python3_finding_is_named() {
     let f = python3_missing_finding("img:1");
     assert_eq!(f.code, "toolchain.launcher-python3-missing");
     assert!(f.source.contains("img:1"));
+}
+
+fn env_sources(policy: std::path::PathBuf) -> PolicySources {
+    PolicySources {
+        env_path: Some(policy),
+        machine_path: None,
+        repo_path: None,
+        ..PolicySources::default()
+    }
+}
+
+#[test]
+fn unreadable_or_invalid_policy_is_a_named_refusal_not_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = env_sources(dir.path().join("absent.json"));
+    let f = WorkerEgress::try_from_sources(&missing).unwrap_err();
+    assert_eq!(f.code, "policy.unreadable");
+    let bad = dir.path().join("bad.json");
+    std::fs::write(&bad, "{not json").unwrap();
+    let f = WorkerEgress::try_from_sources(&env_sources(bad)).unwrap_err();
+    assert_eq!(f.code, "policy.unreadable");
+}
+
+#[test]
+fn absent_policy_is_ok_none() {
+    let none = PolicySources {
+        env_path: None,
+        machine_path: None,
+        repo_path: None,
+        ..PolicySources::default()
+    };
+    assert_eq!(WorkerEgress::try_from_sources(&none), Ok(None));
+}
+
+#[test]
+fn missing_launcher_refuses_under_required_only() {
+    for (api, refuses) in [("required", true), ("observe", false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("policy.json");
+        let doc = json!({
+            "schemaVersion": 1,
+            "toolchain": {"launcherPath": dir.path().join("nope/gh").display().to_string()},
+            "enforcement": {"api": api},
+        });
+        std::fs::write(&policy, doc.to_string()).unwrap();
+        let got = WorkerEgress::try_from_sources(&env_sources(policy));
+        if refuses {
+            assert_eq!(got.unwrap_err().code, "toolchain.launcher-missing");
+        } else {
+            assert_eq!(got, Ok(None));
+        }
+    }
+}
+
+#[test]
+fn container_launcher_must_resolve_to_the_launcher() {
+    let (_fx, egress) = Fx::new("required");
+    let launcher = egress.launcher.display().to_string();
+    assert!(container_launcher_finding(&egress, "img", Some(&launcher)).is_none());
+    assert!(container_launcher_finding(&egress, "img", None).is_none());
+    let f = container_launcher_finding(&egress, "img", Some("/usr/bin/gh")).unwrap();
+    assert_eq!(f.code, "toolchain.launcher-not-first");
+    let f = container_launcher_finding(&egress, "img", Some("")).unwrap();
+    assert_eq!(f.observed, "(none on PATH)");
+    let (_fx, observe) = Fx::new("observe");
+    assert!(container_launcher_finding(&observe, "img", Some("/usr/bin/gh")).is_none());
 }

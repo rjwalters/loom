@@ -604,6 +604,28 @@ pub fn image_has_python3(image: &str) -> bool {
     }
 }
 
+/// What `command -v gh` resolves to inside `image` with `egress`'s mounts and
+/// launcher directory first on `PATH` (#9987). `None` when the probe could not
+/// run (no docker, no image, no `sh`) — that is not a verdict on the launcher.
+pub fn image_resolved_gh(
+    image: &str,
+    egress: &crate::forge_egress::worker_env::WorkerEgress,
+) -> Option<String> {
+    let dir = egress.launcher_dir()?;
+    let out = Command::new("docker")
+        .args(["run", "--rm", "--entrypoint", "sh"])
+        .args(egress.docker_args())
+        .arg(image)
+        .args(["-c", "PATH=\"$1:$PATH\"; command -v gh", "sh"])
+        .arg(dir)
+        .output()
+        .ok()?;
+    match out.status.code() {
+        Some(0 | 1) => Some(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+        _ => None,
+    }
+}
+
 fn mount(host: &Path, container: &str, read_only: bool) -> OsString {
     let mut spec = OsString::from(host);
     spec.push(":");

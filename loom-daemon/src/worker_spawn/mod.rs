@@ -318,10 +318,12 @@ fn run_preflight(
     // the container re-exec all observe one environment. No policy (or a
     // repo-origin one) resolves to `None` and nothing changes. Tests inject
     // `egress_sources` and never mutate the process environment.
-    let worker_egress = egress_sources.map_or_else(
-        crate::forge_egress::worker_env::WorkerEgress::from_process,
-        crate::forge_egress::worker_env::WorkerEgress::from_sources,
-    );
+    let worker_egress = egress_sources
+        .map_or_else(
+            crate::forge_egress::worker_env::WorkerEgress::try_from_process,
+            crate::forge_egress::worker_env::WorkerEgress::try_from_sources,
+        )
+        .map_err(|f| LaunchError::config(crate::forge_egress::worker_env::refusal_message(&f)))?;
     if let (None, Some(path)) = (
         egress_sources,
         worker_egress
@@ -396,16 +398,12 @@ fn run_preflight(
             // forwarding the real value — and returns `None` only when the
             // feature is off or the profile opts out.
             let prepared = egress_proxy::prepare(root, &selection, &config)?;
-            if worker_egress.as_ref().is_some_and(|e| e.required) {
-                if !containment::image_has_python3(&profile.image) {
-                    return Err(LaunchError::config(
-                        crate::forge_egress::worker_env::refusal_message(
-                            &crate::forge_egress::worker_env::python3_missing_finding(
-                                &profile.image,
-                            ),
-                        ),
-                    ));
-                }
+            if worker_egress.as_ref().is_some_and(|e| e.required)
+                && !containment::image_has_python3(&profile.image)
+            {
+                return Err(LaunchError::config(crate::forge_egress::worker_env::refusal_message(
+                    &crate::forge_egress::worker_env::python3_missing_finding(&profile.image),
+                )));
             }
             let mut command = containment::docker_command_with(
                 &profile,

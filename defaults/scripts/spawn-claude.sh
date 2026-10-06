@@ -766,12 +766,39 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # egress container-args`, which prints nothing without a policy), and holds
     # neither ~/.config/gh nor GH_TOKEN/GITHUB_TOKEN. With no policy the
     # array is empty and this block is byte-identical to before.
+    # A configured policy is never the same as an absent one: an unreadable
+    # policy, a missing launcher under `required`, or a daemon too old to answer
+    # REFUSES (exit 78) rather than restoring ~/.config/gh / GH_TOKEN. Only a
+    # genuinely unconfigured host keeps the legacy credentials.
+    # requires-daemon: forge >= 0.19.743   #9987 — `forge egress container-args` / `container-check`, declared at this repo's VERSION because they land WITH this marker (the first release carrying them is the post-merge bump). Hard on a host with a forge-egress policy (this block refuses, exit 78, below the floor); a host with no policy never needs it and keeps today's behaviour.
     # shellcheck source=lib/locate-daemon-bin.sh
     source "${_script_dir}/lib/locate-daemon-bin.sh"
     _containment_managed_gh=()
     _containment_managed_bin="$(loom_locate_daemon_bin "$WORKSPACE" 2>/dev/null || true)"
-    if [[ -n "$_containment_managed_bin" ]]; then
-        mapfile -t _containment_managed_gh < <("$_containment_managed_bin" forge egress container-args 2>/dev/null || true)
+    _containment_policy_present=0
+    if [[ -n "${LOOM_FORGE_EGRESS_POLICY:-}" || -e /etc/loom/forge-egress/policy.json || -e /etc/2am/github-egress/policy.json ]]; then
+        _containment_policy_present=1
+    fi
+    if [[ -n "$_containment_managed_bin" ]] && "$_containment_managed_bin" forge egress container-args --help >/dev/null 2>&1; then
+        if _containment_managed_out="$("$_containment_managed_bin" forge egress container-args 2>/dev/null)"; then
+            # Bash 3.2 has no mapfile: read one argument per line.
+            while IFS= read -r _containment_managed_line; do
+                [[ -n "$_containment_managed_line" ]] && _containment_managed_gh+=("$_containment_managed_line")
+            done <<<"$_containment_managed_out"
+            if [[ ${#_containment_managed_gh[@]} -gt 0 ]]; then
+                if ! _containment_managed_msg="$("$_containment_managed_bin" forge egress container-check "$_containment_image" 2>&1)"; then
+                    log_error "spawn-claude: ${_containment_managed_msg}"
+                    exit 78 # EX_CONFIG
+                fi
+            fi
+        else
+            _containment_managed_msg="$("$_containment_managed_bin" forge egress container-args 2>&1 >/dev/null || true)"
+            log_error "spawn-claude: ${_containment_managed_msg} — refusing to restore ambient gh credentials (#9987)."
+            exit 78 # EX_CONFIG
+        fi
+    elif [[ "$_containment_policy_present" == "1" ]]; then
+        log_error "spawn-claude: a forge egress policy is configured but no loom-daemon binary supporting 'forge egress container-args' was found (#9987). Refusing to mount ~/.config/gh or forward GH_TOKEN into the container. Update loom-daemon."
+        exit 78 # EX_CONFIG
     fi
     if [[ ${#_containment_managed_gh[@]} -gt 0 ]]; then
         _containment_mounts+=("${_containment_managed_gh[@]}")
