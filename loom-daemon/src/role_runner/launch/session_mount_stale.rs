@@ -5,9 +5,10 @@
 //! separately, and that set is fixed when the container is created. A repo
 //! registered afterwards is not inside it, so `docker exec --workdir <repo>`
 //! fails with `chdir to cwd … no such file or directory`. `session-exec host`
-//! now checks the mounts before exec and refuses with exit 78 and a marker;
-//! `spawn-codex.sh` turns that into `category=SESSION_MOUNT_STALE`. This module
-//! turns the tick's own terminal record into a failure reason with a stable
+//! now checks the mounts before exec, refuses with exit 78 and announces the
+//! cause, which the terminal-record parser applies as
+//! `category=SESSION_MOUNT_STALE` (`session_exec::refusal`). This
+//! module turns the tick's own terminal record into a failure reason with a stable
 //! [`REASON_PREFIX`], which `observability::lifecycle::admission_attributes`
 //! projects to `loom.admission.reason = "session-mount-stale"`. The account
 //! records no hold: see `TerminalClassification::SessionMountStale`.

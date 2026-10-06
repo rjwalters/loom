@@ -185,10 +185,11 @@ fn print_report(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use crate::cli::whole_cli_parse::try_parse_cli;
 
+    /// The whole `Cli`, parsed on an 8 MiB thread like the binary's (#10616).
     fn parse(args: &[&str]) -> crate::Commands {
-        crate::Cli::try_parse_from(args)
+        try_parse_cli(args)
             .expect("parse")
             .command
             .expect("a subcommand")

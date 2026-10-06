@@ -113,10 +113,11 @@ pub enum TerminalClassification {
     SessionDown,
     /// The account's Codex session container was running but did not mount
     /// the tick's working directory (#10364): a repository registered after
-    /// the container was created. Produced by `spawn-codex.sh` from
-    /// `session-exec host`'s pre-exec mount check. Like `SessionDown` it
-    /// records **no** account hold and is not a success: the container is
-    /// stale, the account is fine.
+    /// the container was created. Announced by `session-exec host`'s
+    /// pre-exec mount check and applied by the terminal-record parser
+    /// (`session_exec::refusal`), never written by the adapter script. Like
+    /// `SessionDown` it records **no** account hold and is not a success: the
+    /// container is stale, the account is fine.
     SessionMountStale,
 }
 
