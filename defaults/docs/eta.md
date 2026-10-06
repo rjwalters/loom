@@ -1084,6 +1084,38 @@ for a fit or backtest to report.
   schema-dispatched loading, the new heuristic and its pre-PR composition,
   and shadow registration on the ETA authority.
 
+### Friction predictors and cumulative stage age (#10521)
+
+The error analysis of `land-2026-10-04-twin-otter-b`'s misses found that
+most late surprises come from events after the estimate. `eta::loop_features`
+computes the point-in-time predictors that explain part of that. The fit
+(`Assembled::loops`, one per training row, at `t - 120 s`) and serving
+(`Tracker::loop_features_of`, over the same fleet snapshots' label timeline
+at `now - 120 s`, #10500) both call the one builder `loop_features`:
+
+| # | Feature (`LOOP_FEATURES`) | Meaning | Source |
+|---|---------------------------|---------|--------|
+| 1 | `log_overlap_prs`, `log_overlap_files`, `overlap_known` | Other open PRs in the repo whose changed files share a path with this PR's, and how many of this PR's paths they touch | Each PR's file list **as known at `as_of`**: the latest head-commit list read before `as_of`, never the final diff. If this PR's list or **any** open peer's list is not known before `as_of`, both counts are unknown (`overlap_known = 0`): a partly observed roster never reads as zero overlap. Not logged yet, so `overlap_known = 0` everywhere today |
+| 2 | `log_review_requests`, `log_approvals_lost` | `review_wait` entries so far; approvals lost (`merge_wait`/`merge_hold` left for `review_wait`, a stale-main re-review) | Stage episodes |
+| 3 | `own_ci_failed`, `ci_known` | Whether the PR's last CI run that finished before `as_of` failed | SigNoz `ci.run` first, forge only to fill gaps (#10511). Not logged yet, so `ci_known = 0` today |
+| 4 | `judge_reject_rate_7d`, `judge_rate_known` | Share of the repo's Judge verdicts (`review_wait` exits to `doctor` vs to `merge_wait`/`merge_hold`) in the trailing 7 days that sent the PR to Doctor; unknown under 5 verdicts | Stage episodes |
+| - | `log_cum_stage`, `stage_looped` | Hours in the current stage summed over every visit, as `ln(1 + h)`; whether the stage was visited before | Stage episodes |
+
+- **The stage-age fix.** `age_h` restarts at every loop, so a PR on its
+  fourth approval looks minutes old, and a linear age term over-predicts old
+  items. `log_cum_stage` is cumulative time in the stage across loops, logged
+  so the hazard flattens with age. `age_h` keeps its `eta-fit/v1` meaning.
+- **Knowable-at.** An episode counts once entered before `as_of` and as ended
+  only if it ended before `as_of`. A file list or CI run read at or after
+  `as_of` is ignored. A missing source is `null` with its `*_known` indicator
+  0, never a default that reads as "no overlap" or "CI green".
+- **No fleet-wide signals.** CI queue depth, cancellations, host version
+  spread, quota exhaustion and operator activity were shown not to help.
+- **Not a model input yet.** None of these is in `eta-fit/v1`'s `FEATURES`
+  (or `eta-fit/v2`'s `FEATURES_V2`), so twin-otter rows, coefficient files and explanations are unchanged. A new
+  datestamped shadow heuristic adopts them under its own schema version once
+  the loom-experiments walk-forward backtest passes (#10521).
+
 ## The explanation (`eta-explanation/v1`)
 
 The heuristic builds the explanation first and computes the numbers from it,

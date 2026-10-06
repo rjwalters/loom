@@ -55,6 +55,9 @@
 //!   subject's own flag timeline, its linked-issue star at `t − LAG` (`None`
 //!   when the cache does not cover it) and the fleet roster history given to
 //!   [`build_with_context`] (`None` = every roster-derived input unknown).
+//! - **Friction predictors** (#10521, [`Assembled::loops`], not model
+//!   inputs): `loop_features` at `t − LAG` over the repo's episodes, the same
+//!   builder serving calls. Files and CI are not logged, so those are `None`.
 //! - A row whose needed queue feature is `None` is dropped and counted in
 //!   [`RowStats::rows_dropped_missing`].
 //! - **Exit label**: `Some` iff `t + `[`EXIT_HORIZON_SEC`]` < H`; then whether
@@ -96,6 +99,7 @@ use crate::eta::fleet_log::{one_per_repo, SnapshotLog};
 use crate::eta::labels::{
     FLAG_BLOCKED, FLAG_CI_FAIL, FLAG_CONFLICT, FLAG_OP_HOLD, FLAG_SEQUENCED, FLAG_STARRED,
 };
+use crate::eta::loop_features::{loop_features, repo_context, LoopFeatures, LoopInputs};
 use crate::eta::priority_features::{
     priority_features, PriorityEntry, PriorityFeatures, PriorityState,
 };
@@ -157,6 +161,11 @@ pub struct Assembled {
     /// `rows[i]` (#10508), from the builder serving shares. Not read by the
     /// v1 fit, so the coefficient file is unchanged.
     pub priority_inputs: Vec<PriorityInputs>,
+    /// `loops[i]` is the friction-predictor set of `rows[i]` (#10521): the
+    /// review-loop history, repo Judge rejection rate and cumulative stage
+    /// age, from the one builder serving also calls. File overlap and own-CI
+    /// are `None` (not logged yet). Not read by the current fit.
+    pub loops: Vec<LoopFeatures>,
     /// What was dropped.
     pub stats: RowStats,
     /// The data horizon `H` (see the module docs).
@@ -374,6 +383,13 @@ pub fn build_with_context(
     scope.dedup();
     // #10500: the one event-log definition, shared with serving.
     let events = SnapshotLog::new(&chosen, horizon);
+    let mut repo_episodes: BTreeMap<&str, Vec<&StageEpisode>> = BTreeMap::new();
+    for pr in &prs {
+        repo_episodes
+            .entry(pr.repo.as_str())
+            .or_default()
+            .extend(pr.episodes.iter().copied());
+    }
 
     let mut stats = RowStats::default();
     let mut keyed: Vec<KeyedRow> = Vec::new();
@@ -409,6 +425,11 @@ pub fn build_with_context(
                 })
                 .collect();
             let log = events.at(t);
+            // The repo-level slice of the friction predictors, once per tick.
+            let context: BTreeMap<&str, Vec<&StageEpisode>> = repo_episodes
+                .iter()
+                .map(|(repo, eps)| (*repo, repo_context(eps, cutoff)))
+                .collect();
             for (pr, episode) in &open {
                 let Some(stage) = FitStage::from_stage(episode.stage) else {
                     continue;
@@ -458,6 +479,17 @@ pub fn build_with_context(
                     .and_then(|r| r.linked_at(pr.number, cutoff));
                 let own_flags = PriorityState::from_flags(&pr.flags, cutoff).unwrap_or_default();
                 let prio_v2 = priority_inputs(&subject, &own_flags, linked.as_ref(), &ctx, t);
+                let loops = loop_features(
+                    &LoopInputs {
+                        repo: &pr.repo,
+                        pr: pr.number,
+                        own: &pr.episodes,
+                        repo_episodes: context.get(pr.repo.as_str()).map_or(&[], Vec::as_slice),
+                        files: None,
+                        ci: None,
+                    },
+                    cutoff,
+                );
                 let rework = pr
                     .episodes
                     .iter()
@@ -490,6 +522,7 @@ pub fn build_with_context(
                         },
                         prio,
                         prio_v2,
+                        loops,
                     ),
                 ));
             }
@@ -501,11 +534,13 @@ pub fn build_with_context(
     let mut rows = Vec::with_capacity(keyed.len());
     let mut priority = Vec::with_capacity(keyed.len());
     let mut priority_inputs = Vec::with_capacity(keyed.len());
-    for ((key, _), (row, prio, prio_v2)) in keyed {
+    let mut loops = Vec::with_capacity(keyed.len());
+    for ((key, _), (row, prio, prio_v2, lp)) in keyed {
         row_keys.push(key);
         rows.push(row);
         priority.push(prio);
         priority_inputs.push(prio_v2);
+        loops.push(lp);
     }
 
     Assembled {
@@ -514,6 +549,7 @@ pub fn build_with_context(
         dwells: dwells(&prs, window_start, horizon),
         priority,
         priority_inputs,
+        loops,
         stats,
         data_through: horizon,
     }
@@ -522,8 +558,12 @@ pub fn build_with_context(
 /// A dwell's canonical sort key: `(stage, repo, pr, entered_at)`.
 type DwellKey<'a> = (FitStage, &'a str, u32, DateTime<Utc>);
 
-/// One assembled row with its sort key, v1 priority candidates and v2 inputs.
-type KeyedRow = ((RowKey, FitStage), (TrainingRow, PriorityFeatures, PriorityInputs));
+/// One assembled row with its sort key, v1 priority candidates, v2 inputs and
+/// friction predictors (#10521).
+type KeyedRow = (
+    (RowKey, FitStage),
+    (TrainingRow, PriorityFeatures, PriorityInputs, LoopFeatures),
+);
 
 /// The dwells, in canonical order (see the module docs).
 fn dwells(prs: &[Pr<'_>], window_start: DateTime<Utc>, horizon: DateTime<Utc>) -> Vec<DwellRow> {
