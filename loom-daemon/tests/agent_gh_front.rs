@@ -235,7 +235,10 @@ fn pr_checks_is_served_from_rest_and_a_repeat_is_304_only() {
     let json = s.gh(&["pr", "checks", "42", "-R", "o/r", "--json", "name,bucket"], &[]);
     assert_eq!(
         (stdout(&json).as_str(), json.status.code()),
-        ("[{\"bucket\":\"fail\",\"name\":\"lint\"},{\"bucket\":\"pass\",\"name\":\"build\"}]\n", Some(0))
+        (
+            "[{\"bucket\":\"fail\",\"name\":\"lint\"},{\"bucket\":\"pass\",\"name\":\"build\"}]\n",
+            Some(0)
+        )
     );
 }
 
@@ -244,7 +247,15 @@ fn pr_checks_with_no_checks_prints_gh_empty_read_signature() {
     let s = Sandbox::new();
     for args in [
         &["pr", "checks", "43", "--repo", "o/r"][..],
-        &["pr", "checks", "43", "--repo", "o/r", "--json", "bucket,name"][..],
+        &[
+            "pr",
+            "checks",
+            "43",
+            "--repo",
+            "o/r",
+            "--json",
+            "bucket,name",
+        ][..],
     ] {
         let out = s.gh(args, &[]);
         assert_eq!(out.status.code(), Some(1), "{out:?}");

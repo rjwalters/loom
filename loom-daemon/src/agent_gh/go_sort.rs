@@ -59,12 +59,7 @@ fn insertion_sort<T, F: Fn(&T, &T) -> bool>(d: &mut Data<'_, T, F>, a: isize, b:
     }
 }
 
-fn sift_down<T, F: Fn(&T, &T) -> bool>(
-    d: &mut Data<'_, T, F>,
-    lo: isize,
-    hi: isize,
-    first: isize,
-) {
+fn sift_down<T, F: Fn(&T, &T) -> bool>(d: &mut Data<'_, T, F>, lo: isize, hi: isize, first: isize) {
     let mut root = lo;
     loop {
         let mut child = 2 * root + 1;
@@ -262,7 +257,11 @@ fn partial_insertion_sort<T, F: Fn(&T, &T) -> bool>(
     false
 }
 
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation
+)]
 fn break_patterns<T, F: Fn(&T, &T) -> bool>(d: &mut Data<'_, T, F>, a: isize, b: isize) {
     let length = b - a;
     if length >= 8 {

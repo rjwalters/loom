@@ -165,14 +165,17 @@ impl Row {
             (Some((s, _)), Some((c, _))) if c > s => go_duration(c - s),
             _ => "0".to_string(),
         };
-        let bucket = if self.bucket == "cancel" { "fail" } else { self.bucket };
+        let bucket = if self.bucket == "cancel" {
+            "fail"
+        } else {
+            self.bucket
+        };
         format!("{}\t{bucket}\t{elapsed}\t{}\t{}\n", self.name, self.link, self.description)
     }
 
     fn json_object(&self, fields: &[String]) -> Option<String> {
-        let time = |t: &Option<(i64, String)>| {
-            t.as_ref().map_or(ZERO_TIME.to_string(), |t| t.1.clone())
-        };
+        let time =
+            |t: &Option<(i64, String)>| t.as_ref().map_or(ZERO_TIME.to_string(), |t| t.1.clone());
         let mut out = String::from("{");
         for (n, f) in fields.iter().enumerate() {
             let v = match f.as_str() {
@@ -197,7 +200,12 @@ impl Row {
 
 /// Render `gh pr checks` from REST payloads. `None` declines.
 #[must_use]
-pub fn render(json: Option<&[String]>, head_ref: &str, runs: &Value, status: &Value) -> Option<Served> {
+pub fn render(
+    json: Option<&[String]>,
+    head_ref: &str,
+    runs: &Value,
+    status: &Value,
+) -> Option<Served> {
     let rows = rows(runs, status)?;
     if rows.is_empty() {
         return Some(Served {
@@ -358,7 +366,9 @@ pub fn go_duration(secs: i64) -> String {
 /// — or `None` where its escaping is not reproduced here (control
 /// characters, U+2028/U+2029).
 fn json_string(s: &str) -> Option<String> {
-    if s.chars().any(|c| c < ' ' || c == '\u{2028}' || c == '\u{2029}') {
+    if s.chars()
+        .any(|c| c < ' ' || c == '\u{2028}' || c == '\u{2029}')
+    {
         return None;
     }
     Some(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
@@ -482,7 +492,10 @@ fn permutations(items: &[usize]) -> Vec<Vec<usize>> {
         let Some(i) = (1..rank.len()).rev().find(|&i| rank[i - 1] < rank[i]) else {
             return out;
         };
-        let j = (i..rank.len()).rev().find(|&j| rank[j] > rank[i - 1]).unwrap_or(i);
+        let j = (i..rank.len())
+            .rev()
+            .find(|&j| rank[j] > rank[i - 1])
+            .unwrap_or(i);
         rank.swap(i - 1, j);
         rank[i..].reverse();
         cur.clear();

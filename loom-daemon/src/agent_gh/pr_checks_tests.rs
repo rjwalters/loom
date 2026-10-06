@@ -77,8 +77,10 @@ impl Case {
         let fields = parse_fields(json).unwrap();
         let mut out = Vec::new();
         for_each_order(rows.len(), &tie_groups(&rows), &mut |order| {
-            let objs: Vec<String> =
-                order.iter().map(|&i| rows[i].json_object(&fields).unwrap()).collect();
+            let objs: Vec<String> = order
+                .iter()
+                .map(|&i| rows[i].json_object(&fields).unwrap())
+                .collect();
             let s = format!("[{}]\n", objs.join(","));
             if !out.contains(&s) {
                 out.push(s);
@@ -215,19 +217,35 @@ fn shapes_outside_the_contract_decline() {
     };
     // gh dedups by name/workflow/event; REST cannot tell those apart.
     assert!(declines(
-        runs(vec![run("a", "completed", Some("success"), t), run("a", "queued", None, t)]),
+        runs(vec![
+            run("a", "completed", Some("success"), t),
+            run("a", "queued", None, t)
+        ]),
         None
     ));
     assert!(declines(
-        runs(vec![run("a", "completed", Some("success"), ("2026-10-01T00:00:00.5Z", None))]),
+        runs(vec![run(
+            "a",
+            "completed",
+            Some("success"),
+            ("2026-10-01T00:00:00.5Z", None)
+        )]),
         None
     ));
     assert!(declines(
-        runs(vec![run("a", "completed", Some("success"), ("2026-10-01T00:00:00+00:00", None))]),
+        runs(vec![run(
+            "a",
+            "completed",
+            Some("success"),
+            ("2026-10-01T00:00:00+00:00", None)
+        )]),
         None
     ));
     assert!(declines(runs(vec![run("a", "completed", None, t)]), None));
-    assert!(declines(runs(vec![run("a\u{1}", "completed", Some("success"), t)]), Some("name")));
+    assert!(declines(
+        runs(vec![run("a\u{1}", "completed", Some("success"), t)]),
+        Some("name")
+    ));
     assert!(declines(json!({"check_runs": "x"}), None));
 }
 
@@ -261,7 +279,13 @@ fn parse_serves_only_the_reproduced_shapes() {
             json: Some(vec!["bucket".into(), "name".into()]),
         }
     );
-    for ok in ["42", "42 -R o/r", "--repo=o/r 42", "42 --json=state", "7 --json link,description"] {
+    for ok in [
+        "42",
+        "42 -R o/r",
+        "--repo=o/r 42",
+        "42 --json=state",
+        "7 --json link,description",
+    ] {
         assert!(parse(&argv(ok)).is_some(), "{ok}");
     }
     for no in [
