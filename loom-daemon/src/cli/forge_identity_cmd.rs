@@ -250,6 +250,26 @@ pub(crate) fn trusted_comments(
     }
 }
 
+/// `forge claim-liveness` (#10235): the daemon's extra liveness evidence for a
+/// PR claim, as one RFC3339 timestamp (or nothing) — see
+/// [`loom_daemon::claim_reconciliation::extra_liveness_at`]. Exits 1 only on an
+/// unparseable `--claimed-at`; a failed forge read prints nothing (fail-safe).
+pub(crate) fn claim_liveness(number: u32, label: &str, claimed_at: &str) -> Result<()> {
+    let Ok(since) = chrono::DateTime::parse_from_rfc3339(claimed_at) else {
+        eprintln!("forge claim-liveness: --claimed-at {claimed_at:?} is not RFC3339");
+        std::process::exit(1)
+    };
+    if let Some(at) = loom_daemon::claim_reconciliation::extra_liveness_at(
+        &workspace(),
+        number,
+        label,
+        since.with_timezone(&chrono::Utc),
+    ) {
+        println!("{}", at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    }
+    Ok(())
+}
+
 /// `forge verdict-stale-notice` (#9709): the stale-verdict notice for the
 /// shell guard, from the template the daemon pass uses, attributed against the
 /// raw comment listing on stdin under this workspace's trust policy.

@@ -152,6 +152,8 @@ echo '#!/usr/bin/env bash' >"$STUB_DIR/loom-daemon"
 # one (lib/write-scope-fixture.sh), else answers as a pre-verb binary.
 write_scope_stub_verb_snippet >>"$STUB_DIR/loom-daemon"
 cat >>"$STUB_DIR/loom-daemon" <<'STUB'
+# #10235: `forge claim-liveness` is the daemon's extra liveness evidence.
+[[ "$1 $2" == "forge claim-liveness" ]] && { printf '%s' "${LOOM_TEST_EXTRA_LIVENESS:-}"; exit 0; }
 [[ "$1 $2" == "forge trusted-comments" ]] || { echo "stub loom-daemon: $*" >&2; exit 64; }
 [[ "${LOOM_TEST_NO_TRUST_VERB:-}" == "1" ]] && exit 2
 exec jq -c '[.[] | select(((.author_association // "") | IN("OWNER","MEMBER","COLLABORATOR"))
@@ -199,7 +201,7 @@ set_comments() { # reads a JSON array on stdin; an item without `user` is the fl
 
 reset() {
     : >"$STUB_DIR/gh-calls.log"
-    unset LOOM_TEST_MUTATION_FAILS LOOM_TEST_ISSUE_READ_FAILS LOOM_TEST_NO_TRUST_VERB
+    unset LOOM_TEST_MUTATION_FAILS LOOM_TEST_ISSUE_READ_FAILS LOOM_TEST_NO_TRUST_VERB LOOM_TEST_EXTRA_LIVENESS
     set_labels "loom:reviewing"
     echo '[]' >"$STUB_DIR/comments.json"
 }
@@ -500,6 +502,21 @@ assert_eq "stale" "$(field "$out" CLAIM_STATE)" "T20a: outsider / bare-slug acti
 assert_eq "0" "$(field "$out" ACTIVITY_COUNT)" "T20b: neither is counted as claimant activity"
 out="$(LOOM_TEST_NO_TRUST_VERB=1 "$TARGET_SCRIPT" check --repo owner/repo --number 6513 --label loom:reviewing)"
 assert_eq "unknown" "$(field "$out" CLAIM_STATE)" "T20c: no trust filter -> unknown (fail safe, never stomp)"
+
+# --- T21: the daemon's extra liveness evidence keeps a claim fresh (#10235) --
+# A Judge-progress comment / claimant force-push after the claim (what
+# `loom-daemon forge claim-liveness` reports) resets the idle clock, exactly as
+# the daemon's own anchor does; with none, the same claim is stale.
+reset
+set_claim loom:reviewing "$(ago 40)"
+out="$("$TARGET_SCRIPT" check --repo owner/repo --number 6513 --label loom:reviewing)"
+assert_eq "stale" "$(field "$out" CLAIM_STATE)" "T21a: no extra evidence -> a 40m-old claim is stale"
+out="$(LOOM_TEST_EXTRA_LIVENESS="$(ago 5)" "$TARGET_SCRIPT" check --repo owner/repo --number 6513 --label loom:reviewing)"
+assert_eq "fresh" "$(field "$out" CLAIM_STATE)" "T21b: a recent Judge-progress/force-push signal keeps it fresh"
+assert_eq "5" "$(field "$out" IDLE_MINUTES)" "T21c: the idle clock anchors on that signal"
+assert_eq "0" "$(field "$out" ACTIVITY_COUNT)" "T21d: it is not counted as a claim-activity marker"
+out="$(LOOM_TEST_EXTRA_LIVENESS="not a timestamp" "$TARGET_SCRIPT" check --repo owner/repo --number 6513 --label loom:reviewing)"
+assert_eq "stale" "$(field "$out" CLAIM_STATE)" "T21e: a malformed daemon answer is ignored"
 
 # --- Summary ---
 echo ""

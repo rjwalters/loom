@@ -352,3 +352,25 @@ pub(crate) fn fetch_most_recent_head_push_at(
         .collect();
     most_recent_head_push_at(&events, since)
 }
+
+/// The newest liveness evidence the daemon honors *beyond* the claim-activity
+/// marker, for the in-session evaluator (`claim-staleness.sh`, via
+/// `loom-daemon forge claim-liveness`): a trusted Judge-progress comment (only
+/// for a `loom:reviewing` claim) or a claimant head force-push, whichever is
+/// newer, after `claimed_at`. Runs the exact fetch+predicate pairs
+/// `decide_pr`'s anchor uses, so the shell and the daemon cannot disagree on
+/// what keeps a claim alive (Issue #10235). `None` when neither exists or a
+/// read failed — the caller then keeps the marker-only age.
+#[must_use]
+pub fn extra_liveness_at(
+    root: &Path,
+    pr_number: u32,
+    label: &str,
+    claimed_at: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let gh_bin = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
+    let judge = (label == "loom:reviewing")
+        .then(|| fetch_most_recent_judge_activity_at(&gh_bin, root, pr_number, claimed_at))
+        .flatten();
+    judge.max(fetch_most_recent_head_push_at(&gh_bin, root, pr_number, label, claimed_at))
+}

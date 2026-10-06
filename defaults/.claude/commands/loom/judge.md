@@ -601,9 +601,9 @@ routine Builder post-push note used to pin a claim "fresh" forever). Claimant ac
 the idle clock**, so a genuine heartbeat buys another
 `LOOM_STALE_REVIEWING_MINUTES`.
 
-The daemon's reconciliation backstop (#10235) additionally counts a trusted Judge-progress comment
-(`loom:ac-verified`, `loom:verdict-sha`, ...) and your own force-push of the PR head; this script does
-not, so for the in-session check the marker below is what counts.
+The script also asks the daemon (`forge claim-liveness`, #10235) for a trusted Judge-progress comment
+(`loom:ac-verified`, `loom:verdict-sha`, ...) or your own force-push of the PR head, so both sides agree;
+without that verb only the marker below counts.
 
 **If your review runs long** (esp. before a CI wait), post a progress comment ending
 with that marker so the next pass can see you are alive. The script prints the

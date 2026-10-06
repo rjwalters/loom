@@ -577,6 +577,24 @@ pub(crate) enum ForgeAction {
         gh_shape: bool,
     },
 
+    /// `forge claim-liveness --number N --label L --claimed-at TS` (#10235) —
+    /// print the newest liveness evidence the claim reconciler honors beyond the
+    /// claim-activity marker (trusted Judge-progress comment for
+    /// `loom:reviewing`, claimant head force-push), as an RFC3339 `...Z`
+    /// timestamp after `TS`; prints nothing when there is none or a read
+    /// failed. `claim-staleness.sh` folds it into its idle clock so the
+    /// in-session evaluator agrees with the daemon.
+    #[command(name = "claim-liveness")]
+    ClaimLiveness {
+        #[arg(long, value_name = "N")]
+        number: u32,
+        #[arg(long, value_name = "LABEL")]
+        label: String,
+        /// The claim's own `labeled` event time (RFC3339, `...Z`).
+        #[arg(long, value_name = "TS")]
+        claimed_at: String,
+    },
+
     /// `forge verdict-stale-notice --label L --marker-sha M --head-sha H
     /// [--source S]` (#9709) — print the stale-verdict audit comment for a
     /// `M -> H` invalidation, rendered by the SAME template the daemon's pass
@@ -948,6 +966,13 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         }
         ForgeAction::VerdictLabels { pr, repo, verdict } => {
             return super::forge_verdict_cmd::verdict_labels(pr, &repo, &verdict);
+        }
+        ForgeAction::ClaimLiveness {
+            number,
+            label,
+            claimed_at,
+        } => {
+            return super::forge_identity_cmd::claim_liveness(number, &label, &claimed_at);
         }
         ForgeAction::VerdictStaleNotice {
             label,

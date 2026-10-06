@@ -790,8 +790,8 @@ clock**, so a genuine heartbeat buys another `LOOM_STALE_TREATING_MINUTES`.
 
 **A Doctor's fix cycle routinely runs long and silent** (assess → fix → verify
 locally → push → re-verify remotely), so post a progress comment ending with
-that marker whenever you cross a long step (esp. before a CI wait); the daemon's reconciliation
-backstop (#10235) also counts your own force-push of the PR head, but this script does not. The script prints the marker for the
+that marker whenever you cross a long step (esp. before a CI wait); the script also counts your own
+force-push of the PR head via the daemon (`forge claim-liveness`, #10235). The script prints the marker for the
 live claim, so you never hand-assemble it:
 
 ```bash
