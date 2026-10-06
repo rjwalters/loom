@@ -196,9 +196,7 @@ fn list_open_pulls_at(
     let target = resolve(cwd, repo_override);
     let read = |page: usize| -> Result<Vec<RestPull>> {
         let url = build_pulls_url(target.repo.as_deref(), page);
-        let get = || {
-            conditional_get(site, gh_bin, cwd, &target, &url, Kind::Listing)
-        };
+        let get = || conditional_get(site, gh_bin, cwd, &target, &url, Kind::Listing);
         let body = retry_404_once(cwd, &url, refresh, get)?;
         parse_rest_pulls(&body).with_context(|| format!("parse REST pulls JSON from {url}"))
     };

@@ -138,6 +138,10 @@ fn a_failed_listing_falls_back_to_graphql() {
     let (reg, log) = registry(dir.path(), FAILING_PULLS_ARM, Some(nodes), "");
     assert_eq!(reg.probe_open_linked_pr_transports(70), OpenPrProbe::Open(701));
     assert!(calls(&log).contains("api graphql"), "{}", calls(&log));
+    // The failed listing is not re-read on every probe: it backs off.
+    assert_eq!(reg.probe_open_linked_pr_transports(70), OpenPrProbe::Open(701));
+    let listings = calls(&log).matches("pulls?state=open").count();
+    assert_eq!(listings, 1, "{}", calls(&log));
 }
 
 /// Every transport failing is `ProbeFailed` — never `NoneOpen` (#7863) — and

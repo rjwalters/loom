@@ -41,10 +41,14 @@
 //! Only a successfully read listing is a verdict. A failed read (forge error,
 //! breaker, more than [`MAX_PAGES`] pages, a listing that moved mid-walk) is
 //! `None`, and the caller falls back to the legacy union — never a "no PR"
-//! (#7863).
+//! (#7863). After a failed read the listing is skipped for that root for
+//! [`LISTING_RETRY_AFTER`], so an outage or a wedged `gh` costs one extra
+//! bounded call, not one per probe on top of the fallback's own.
 
-use std::path::Path;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::claim_reconciliation::open_pr_listing::MAX_PAGES;
 use crate::comment_trust::TrustPolicy;
@@ -72,14 +76,25 @@ pub(crate) fn probe(
     (owner_repo, issue): (&str, u32),
     timeout: Option<Duration>,
 ) -> Option<OpenPrProbe> {
-    let listed =
-        list_open_pulls_cached_within(caller, gh_bin, Some(root), repo_override, MAX_PAGES, timeout);
+    if listing_down(root) {
+        return None;
+    }
+    let listed = list_open_pulls_cached_within(
+        caller,
+        gh_bin,
+        Some(root),
+        repo_override,
+        MAX_PAGES,
+        timeout,
+    );
+    mark_listing(root, listed.is_ok());
     let rows = match listed {
         Ok(rows) => rows,
         Err(e) => {
             log::debug!(
                 "issue #{issue}: open-PR listing unavailable ({e:#}); falling back to the \
-                 closes-graph + timeline union (#10514)"
+                 closes-graph + timeline union for {}s (#10514)",
+                LISTING_RETRY_AFTER.as_secs()
             );
             return None;
         }
@@ -88,6 +103,33 @@ pub(crate) fn probe(
     match classify_open_linked_pr_rows(&rows, issue, owner_repo, &policy) {
         OpenPrProbe::ProbeFailed => None,
         verdict => Some(verdict),
+    }
+}
+
+/// How long a failed listing read keeps leg 0 off for its root.
+pub(crate) const LISTING_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// Roots whose last listing read failed, and when.
+fn failed_reads() -> &'static Mutex<HashMap<PathBuf, Instant>> {
+    static FAILED: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+    FAILED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The listing failed for `root` less than [`LISTING_RETRY_AFTER`] ago.
+fn listing_down(root: &Path) -> bool {
+    let guard = failed_reads().lock().unwrap_or_else(|p| p.into_inner());
+    guard
+        .get(root)
+        .is_some_and(|at| at.elapsed() < LISTING_RETRY_AFTER)
+}
+
+/// Record the outcome of a listing read for `root`.
+fn mark_listing(root: &Path, ok: bool) {
+    let mut guard = failed_reads().lock().unwrap_or_else(|p| p.into_inner());
+    if ok {
+        guard.remove(root);
+    } else {
+        guard.insert(root.to_path_buf(), Instant::now());
     }
 }
 
