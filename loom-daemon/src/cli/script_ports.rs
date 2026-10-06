@@ -20,6 +20,8 @@ use anyhow::Result;
 pub(crate) enum ScriptPortCommand {
     /// Ordered PR work for Judge, Doctor and Champion.
     PrQueue(super::pr_queue::PrQueueArgs),
+    /// Bounded in-session pre-PR gate running `buildGate.command` (#10476).
+    Preflight(super::preflight::PreflightArgs),
     /// Supervised persistent-container transport backing spawn-codex.sh.
     #[command(subcommand)]
     SessionExec(loom_daemon::session_exec::SessionExecCommand),
@@ -528,6 +530,7 @@ impl ScriptPortCommand {
     pub(crate) fn run(self) -> Result<()> {
         match self {
             ScriptPortCommand::PrQueue(args) => args.run(),
+            ScriptPortCommand::Preflight(args) => args.run(),
             ScriptPortCommand::SessionExec(args) => args.run(),
             ScriptPortCommand::PrivateWorkspace(args) => args.run(),
             ScriptPortCommand::SweepCheckpoint(args) => args.run(),
