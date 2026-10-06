@@ -355,6 +355,12 @@ fn a_still_registered_repo_that_became_firewalled_is_extra_and_recreated_first()
         matches!(out[..], [Outcome::DriftRemoved { .. }, Outcome::DriftRemoved { .. }]),
         "{out:?}"
     );
+    for removed in &out {
+        let Outcome::DriftRemoved { drift } = removed else {
+            unreachable!()
+        };
+        assert_eq!(drift.extra, ws.roots(&["walled"]), "names the denied path");
+    }
     assert_eq!(lifecycle.runner().mutations(), ["stop_and_remove", "stop_and_remove"]);
     let out = pass(&mut lifecycle, &env, &host, &mut state, 60);
     assert!(matches!(out[..], [Outcome::Failed { .. }, Outcome::Failed { .. }]), "{out:?}");
@@ -398,8 +404,17 @@ fn extra_drift_with_nothing_allowed_in_its_place_is_removed_only_when_idle() {
         .lock()
         .unwrap()
         .insert(container, false);
-    let out = pass(&mut lifecycle, &env, &host, &mut state, 60);
-    assert!(matches!(out[..], [Outcome::DriftRemoved { .. }]), "{out:?}");
+    // The outcome (and the WARN built from it) names every path it may no
+    // longer mount.
+    assert_eq!(
+        pass(&mut lifecycle, &env, &host, &mut state, 60),
+        vec![Outcome::DriftRemoved {
+            drift: MountDrift {
+                missing: Vec::new(),
+                extra: ws.roots(&["a", "gone"]),
+            },
+        }]
+    );
     assert_eq!(lifecycle.runner().mutations(), ["stop_and_remove"]);
 }
 
