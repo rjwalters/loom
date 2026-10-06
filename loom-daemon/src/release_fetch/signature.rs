@@ -171,6 +171,35 @@ pub struct VerifyResult {
     /// downgrade). `None` off-darwin: there is no destination-signature
     /// comparison there.
     pub had_authority: Option<bool>,
+    /// Which verifier actually succeeded, and what it actually checked
+    /// (#10470). `Some` exactly where `outcome` is [`Outcome::Verified`]
+    /// because a verifier RAN and passed; `None` on every skip, failure and
+    /// on the unrecognized-target pass-through (nothing was verified there).
+    /// The required-mode evidence line is built from this alone, so it can
+    /// never report an identity no verifier checked.
+    pub verified_by: Option<VerifiedBy>,
+}
+
+/// What a successful verification actually established (#10470).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedBy {
+    /// macOS `codesign --verify --strict` passed. No signer, team or GitHub
+    /// workflow identity was established by this check.
+    Codesign,
+    /// `cosign verify-blob --key` passed against a public key. No signer or
+    /// GitHub workflow identity was established -- only possession of the key.
+    CosignKey,
+    /// Keyless, against one exact certificate identity
+    /// (`--certificate-identity`).
+    KeylessExactIdentity { identity: String, issuer: String },
+    /// Keyless, against a certificate-identity regexp
+    /// (`--certificate-identity-regexp`). `workflow_pinned` is true only when
+    /// an approved-workflow pin was folded into `regexp` and so enforced.
+    KeylessIdentityRegexp {
+        regexp: String,
+        issuer: String,
+        workflow_pinned: bool,
+    },
 }
 
 /// Inputs to one verification.
@@ -215,6 +244,7 @@ pub fn verify_with_workflow(
         state: Some(SignatureState::Skipped),
         message: String::new(),
         had_authority: None,
+        verified_by: None,
     }
 }
 
@@ -251,6 +281,7 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
                 ),
             },
             had_authority: None,
+            verified_by: None,
         };
     }
 
@@ -280,6 +311,7 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
                       (checksum is unconditional; signature is optional)."
                 .to_string(),
             had_authority: Some(had_authority),
+            verified_by: None,
         };
     }
 
@@ -302,6 +334,7 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
             state: Some(SignatureState::Verified),
             message: format!("macOS codesign verification passed for {name}."),
             had_authority: Some(had_authority),
+            verified_by: Some(VerifiedBy::Codesign),
         },
         // Ran to completion and reported a bad signature: tamper evidence,
         // still a hard block.
@@ -314,6 +347,7 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
                  evidence."
             ),
             had_authority: Some(had_authority),
+            verified_by: None,
         },
         // Never answered (timed out, or its output could not be collected):
         // UNKNOWN. A loud skip like absent tooling — never a block, and never
@@ -327,6 +361,7 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
                  verified)."
             ),
             had_authority: Some(had_authority),
+            verified_by: None,
         },
     }
 }
@@ -352,6 +387,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>, approved_workflow: Option<&str>) -> V
             state: Some(SignatureState::Skipped),
             message: String::new(),
             had_authority: None,
+            verified_by: None,
         };
     };
     let sig_name = file_name(sig_path);
@@ -366,6 +402,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>, approved_workflow: Option<&str>) -> V
                  already verified)."
             ),
             had_authority: None,
+            verified_by: None,
         };
     }
 
@@ -393,6 +430,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>, approved_workflow: Option<&str>) -> V
                              a block; checksum already verified)."
                         ),
                             had_authority: None,
+                            verified_by: None,
                         };
                     }
                 },
@@ -420,6 +458,18 @@ fn verify_linux(inputs: &VerifyInputs<'_>, approved_workflow: Option<&str>) -> V
                      {identity_desc}, issuer {issuer})."
                 ),
                 had_authority: None,
+                verified_by: Some(if identity_flag == "--certificate-identity" {
+                    VerifiedBy::KeylessExactIdentity {
+                        identity: identity_desc,
+                        issuer,
+                    }
+                } else {
+                    VerifiedBy::KeylessIdentityRegexp {
+                        regexp: identity_desc,
+                        issuer,
+                        workflow_pinned: approved_workflow.is_some_and(|w| !w.trim().is_empty()),
+                    }
+                }),
             }
         } else {
             VerifyResult {
@@ -431,6 +481,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>, approved_workflow: Option<&str>) -> V
                      {issuer})."
                 ),
                 had_authority: None,
+                verified_by: None,
             }
         };
     }
@@ -447,6 +498,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>, approved_workflow: Option<&str>) -> V
                  block; checksum already verified)."
             ),
             had_authority: None,
+            verified_by: None,
         };
     };
 
@@ -465,6 +517,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>, approved_workflow: Option<&str>) -> V
             state: Some(SignatureState::Verified),
             message: format!("cosign signature verification passed for {name}."),
             had_authority: None,
+            verified_by: Some(VerifiedBy::CosignKey),
         }
     } else {
         VerifyResult {
@@ -476,6 +529,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>, approved_workflow: Option<&str>) -> V
                 pubkey.display()
             ),
             had_authority: None,
+            verified_by: None,
         }
     }
 }

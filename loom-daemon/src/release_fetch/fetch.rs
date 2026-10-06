@@ -39,7 +39,7 @@
 //! the next tick retries); accepting would hand an unverified binary the right
 //! to replace it.
 
-use super::{checksum, cosign, glibc, signature};
+use super::{checksum, glibc, signature};
 use crate::cmd_out::{self, CmdOutcome};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -120,22 +120,60 @@ impl SignaturePolicy {
 }
 
 /// The sanitized, machine-readable evidence line emitted in required mode:
-/// tag, asset sha256, signature state, policy revision and the verified
-/// identity regexp. Contains no secrets -- only public release facts.
+/// tag, asset sha256, signature state, and what the verifier that actually
+/// succeeded checked. Contains no secrets -- only public release facts.
+///
+/// Built from the successful verification's own [`signature::VerifiedBy`], never
+/// from policy or inputs, so it cannot claim a check that did not run:
+/// `identity` / `identity_regexp` / `oidc_issuer` are populated only for the
+/// keyless verifier that checked them and are `null` for `codesign` and
+/// cosign public-key verification (neither establishes a GitHub workflow
+/// identity, a codesign team, or a key fingerprint, and none is invented).
+/// `configured_workflow` is the policy pin as configured;
+/// `configured_workflow_applied` says whether it was enforced by this
+/// verification (true only for a keyless regexp that embeds it).
 #[must_use]
 pub fn evidence_line(
     tag: &str,
     asset_sha256: &str,
     state: signature::SignatureState,
-    policy_revision: Option<&str>,
-    identity_regexp: Option<&str>,
+    configured_workflow: Option<&str>,
+    verified_by: Option<&signature::VerifiedBy>,
 ) -> String {
+    use signature::VerifiedBy;
+    let (method, identity, identity_regexp, issuer, applied) = match verified_by {
+        Some(VerifiedBy::Codesign) => (Some("codesign"), None, None, None, false),
+        Some(VerifiedBy::CosignKey) => (Some("cosign-key"), None, None, None, false),
+        Some(VerifiedBy::KeylessExactIdentity { identity, issuer }) => (
+            Some("cosign-keyless-identity"),
+            Some(identity.as_str()),
+            None,
+            Some(issuer.as_str()),
+            false,
+        ),
+        Some(VerifiedBy::KeylessIdentityRegexp {
+            regexp,
+            issuer,
+            workflow_pinned,
+        }) => (
+            Some("cosign-keyless-identity-regexp"),
+            None,
+            Some(regexp.as_str()),
+            Some(issuer.as_str()),
+            *workflow_pinned,
+        ),
+        None => (None, None, None, None, false),
+    };
     let record = serde_json::json!({
         "tag": tag,
         "asset_sha256": asset_sha256,
         "signature_state": state.as_str(),
-        "policy_revision": policy_revision,
+        "verification_method": method,
+        "identity": identity,
         "identity_regexp": identity_regexp,
+        "oidc_issuer": issuer,
+        "configured_workflow": configured_workflow,
+        "configured_workflow_applied": applied,
     });
     format!("LOOM_SIGNATURE_EVIDENCE {record}")
 }
@@ -570,17 +608,6 @@ pub fn fetch_and_verify_with_policy(
     let mut signature_line = sig_result.message;
     if policy.require_signature {
         let sha = crate::release_resolve::host::sha256_file(&bin_path).unwrap_or_default();
-        let identity = inputs
-            .cosign_identity_env
-            .clone()
-            .filter(|v| !v.is_empty())
-            .or_else(|| {
-                cosign::identity_regexp_pinned(
-                    inputs.repo_slug,
-                    inputs.tag,
-                    policy.approved_workflow.as_deref(),
-                )
-            });
         if !signature_line.is_empty() {
             signature_line.push('\n');
         }
@@ -589,7 +616,7 @@ pub fn fetch_and_verify_with_policy(
             &sha,
             signature_state,
             policy.approved_workflow.as_deref(),
-            identity.as_deref(),
+            sig_result.verified_by.as_ref(),
         ));
     }
     let glibc_line = glibc_result.message;

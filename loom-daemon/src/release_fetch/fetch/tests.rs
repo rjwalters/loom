@@ -689,19 +689,10 @@ fn required_mode_leaves_an_invalid_signature_classified_as_invalid() {
     );
 }
 
-#[test]
-#[serial]
-fn required_mode_passes_a_verified_signature_and_emits_sanitized_evidence() {
-    let dir = tempdir();
-    let assets = signed_assets(&dir, BIN, true);
-    let fakebin = tempdir();
-    write_fake_gh(&fakebin, &assets);
-    write_script(&fakebin, "cosign", "exit 0\n");
-    let policy = SignaturePolicy {
-        require_signature: true,
-        approved_workflow: Some("release.yml".to_string()),
-    };
-    match run_with(&fakebin, &linux_inputs(&dir), &policy) {
+/// Run a required-mode fetch that must verify, and return the parsed
+/// `LOOM_SIGNATURE_EVIDENCE` record (cleaning up the persisted scratch dir).
+fn verified_evidence(outcome: FetchOutcome) -> serde_json::Value {
+    match outcome {
         FetchOutcome::Verified {
             artifact,
             signature_state,
@@ -712,22 +703,145 @@ fn required_mode_passes_a_verified_signature_and_emits_sanitized_evidence() {
             let ev = signature_line
                 .lines()
                 .find(|l| l.starts_with("LOOM_SIGNATURE_EVIDENCE "))
-                .unwrap_or_else(|| panic!("no evidence line: {signature_line}"));
-            let v: serde_json::Value =
-                serde_json::from_str(ev.trim_start_matches("LOOM_SIGNATURE_EVIDENCE ")).unwrap();
-            assert_eq!(v["tag"], "v0.16.0");
-            assert_eq!(v["signature_state"], "verified");
-            assert_eq!(v["policy_revision"], "release.yml");
-            assert_eq!(v["asset_sha256"], sha256_hex(b"fake artifact bytes"));
-            assert!(v["identity_regexp"]
-                .as_str()
-                .unwrap()
-                .contains(r"workflows/release\.yml@"));
+                .unwrap_or_else(|| panic!("no evidence line: {signature_line}"))
+                .to_string();
             let _ = std::fs::remove_dir_all(&artifact.tmp_dir);
+            serde_json::from_str(ev.trim_start_matches("LOOM_SIGNATURE_EVIDENCE ")).unwrap()
         }
         FetchOutcome::VerificationFailed { lines } => panic!("expected Verified: {lines:?}"),
         FetchOutcome::DownloadFailed(m) => panic!("expected Verified: {m}"),
     }
+}
+
+#[test]
+#[serial]
+fn required_mode_keyless_derived_pinned_regexp_evidence() {
+    let dir = tempdir();
+    let assets = signed_assets(&dir, BIN, true);
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    write_script(&fakebin, "cosign", "exit 0\n");
+    let policy = SignaturePolicy {
+        require_signature: true,
+        approved_workflow: Some("release.yml".to_string()),
+    };
+    let v = verified_evidence(run_with(&fakebin, &linux_inputs(&dir), &policy));
+    assert_eq!(v["tag"], "v0.16.0");
+    assert_eq!(v["signature_state"], "verified");
+    assert_eq!(v["asset_sha256"], sha256_hex(b"fake artifact bytes"));
+    assert_eq!(v["verification_method"], "cosign-keyless-identity-regexp");
+    assert!(v["identity"].is_null(), "{v}");
+    assert!(v["identity_regexp"]
+        .as_str()
+        .unwrap()
+        .contains(r"workflows/release\.yml@"));
+    assert_eq!(v["oidc_issuer"], "https://token.actions.githubusercontent.com");
+    assert_eq!(v["configured_workflow"], "release.yml");
+    assert_eq!(v["configured_workflow_applied"], true);
+}
+
+#[test]
+#[serial]
+fn required_mode_keyless_derived_unpinned_regexp_evidence_does_not_claim_a_pin() {
+    let dir = tempdir();
+    let assets = signed_assets(&dir, BIN, true);
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    write_script(&fakebin, "cosign", "exit 0\n");
+    let v = verified_evidence(run_with(&fakebin, &linux_inputs(&dir), &required()));
+    assert_eq!(v["verification_method"], "cosign-keyless-identity-regexp");
+    assert!(v["identity_regexp"]
+        .as_str()
+        .unwrap()
+        .contains("workflows/[^@]+@"));
+    assert!(v["configured_workflow"].is_null(), "{v}");
+    assert_eq!(v["configured_workflow_applied"], false);
+}
+
+#[test]
+#[serial]
+fn required_mode_keyless_exact_identity_override_evidence() {
+    let dir = tempdir();
+    let assets = signed_assets(&dir, BIN, true);
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    write_script(&fakebin, "cosign", "exit 0\n");
+    let mut inputs = linux_inputs(&dir);
+    inputs.cosign_identity_env = Some("https://example.test/exact-identity".to_string());
+    // A configured pin is ignored when an exact identity is supplied: the
+    // evidence must say it was configured but NOT applied.
+    let policy = SignaturePolicy {
+        require_signature: true,
+        approved_workflow: Some("release.yml".to_string()),
+    };
+    let v = verified_evidence(run_with(&fakebin, &inputs, &policy));
+    assert_eq!(v["verification_method"], "cosign-keyless-identity");
+    assert_eq!(v["identity"], "https://example.test/exact-identity");
+    assert!(v["identity_regexp"].is_null(), "{v}");
+    assert_eq!(v["configured_workflow"], "release.yml");
+    assert_eq!(v["configured_workflow_applied"], false);
+}
+
+/// A bare `.sig` verified with a public key establishes no GitHub workflow
+/// identity: none may be reported, and the configured pin was not applied.
+#[test]
+#[serial]
+fn required_mode_linux_key_mode_evidence_has_no_workflow_identity() {
+    let dir = tempdir();
+    let assets = signed_assets(&dir, BIN, false);
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    write_script(&fakebin, "cosign", "exit 0\n");
+    let pubkey = dir.join("test-cosign.pub");
+    std::fs::write(&pubkey, b"fake pubkey").unwrap();
+    let mut inputs = linux_inputs(&dir);
+    inputs.cosign_pubkey_env = Some(pubkey.to_string_lossy().into_owned());
+    let policy = SignaturePolicy {
+        require_signature: true,
+        approved_workflow: Some("release.yml".to_string()),
+    };
+    let v = verified_evidence(run_with(&fakebin, &inputs, &policy));
+    assert_eq!(v["verification_method"], "cosign-key");
+    assert!(v["identity"].is_null(), "{v}");
+    assert!(v["identity_regexp"].is_null(), "{v}");
+    assert!(v["oidc_issuer"].is_null(), "{v}");
+    assert_eq!(v["configured_workflow"], "release.yml");
+    assert_eq!(v["configured_workflow_applied"], false);
+}
+
+/// Darwin codesign establishes no GitHub workflow identity either, and no
+/// codesign team is invented.
+#[test]
+#[serial]
+fn required_mode_darwin_codesign_evidence_has_no_workflow_identity() {
+    let dir = tempdir();
+    let bin_name = "loom-daemon-aarch64-apple-darwin";
+    let assets = write_checksummed_assets(&dir, bin_name);
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    write_script(
+        &fakebin,
+        "codesign",
+        r#"if [[ "$1" == "-dv" ]]; then
+  echo "Authority=Developer ID Application: Test Authority (TESTTEAM)" >&2
+  exit 0
+fi
+exit 0
+"#,
+    );
+    let mut inputs = linux_inputs(&dir);
+    inputs.target = "aarch64-apple-darwin";
+    let policy = SignaturePolicy {
+        require_signature: true,
+        approved_workflow: Some("release.yml".to_string()),
+    };
+    let v = verified_evidence(run_with(&fakebin, &inputs, &policy));
+    assert_eq!(v["verification_method"], "codesign");
+    assert!(v["identity"].is_null(), "{v}");
+    assert!(v["identity_regexp"].is_null(), "{v}");
+    assert!(v["oidc_issuer"].is_null(), "{v}");
+    assert!(!v.to_string().contains("TESTTEAM"), "{v}");
+    assert_eq!(v["configured_workflow_applied"], false);
 }
 
 /// A valid signature from a workflow that is not the approved one is refused:
