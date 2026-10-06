@@ -49,6 +49,11 @@ impl ForgeOp {
 
 /// `GET repos/{o}/{r}/issues?labels=…` — the ETag-cached issue listings.
 pub const ISSUE_LIST: ForgeOp = ForgeOp::inventoried("issue.list");
+/// `GET repos/{o}/{r}/issues/{n}` — one issue's (or PR's) state and labels.
+pub const ISSUE_VIEW_STATE: ForgeOp = ForgeOp::inventoried("issue.view-state");
+/// The PRs that close a batch of issues (GraphQL `closedByPullRequestsReferences`).
+pub const ISSUE_CLOSED_BY_PULL_REQUESTS: ForgeOp =
+    ForgeOp::inventoried("issue.closed-by-pull-requests");
 /// `GET search/issues` — duplicate/phrase searches.
 pub const ISSUE_SEARCH: ForgeOp = ForgeOp::inventoried("issue.search");
 /// `GET repos/{o}/{r}/issues/{n}/comments`.
@@ -97,6 +102,8 @@ pub const RELEASE_RESOLVE_AND_FETCH: ForgeOp = ForgeOp::inventoried("release.res
 /// Every inventoried constant above — the set the inventory test checks.
 pub const ALL_INVENTORIED: &[ForgeOp] = &[
     ISSUE_LIST,
+    ISSUE_VIEW_STATE,
+    ISSUE_CLOSED_BY_PULL_REQUESTS,
     ISSUE_SEARCH,
     COMMENT_LIST,
     PR_VIEW_STATE,

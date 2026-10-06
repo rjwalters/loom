@@ -20,6 +20,7 @@ fn refused(slug: &str, error: &str, incident_body: &str, author: &str, associati
     world.add(
         slug,
         RestIssue {
+            comments: 0,
             author: Some(author.into()),
             ..issue_with_body(30, &["loom:triage"], incident_body)
         },
@@ -138,6 +139,7 @@ fn the_newest_trusted_matching_issue_is_the_incident() {
     let error = "Merge commits are not allowed on this repository. (HTTP 405)";
     let quote = "Merges fail: merge commits are not allowed on this repository.";
     let dated = |number: u32, created: &str| RestIssue {
+        comments: 0,
         author: Some("turian".into()),
         created_at: Some(created.into()),
         ..issue_with_body(number, &["loom:triage"], quote)

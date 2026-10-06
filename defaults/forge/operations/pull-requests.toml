@@ -397,6 +397,42 @@ path = "defaults/.claude/commands/loom/judge.md"
 # --- issue-closing-relationships ---------------------------------------------
 
 [[operation]]
+id = "issue.closed-by-pull-requests"
+group = "issue-closing-relationships"
+summary = "Resolve, for a batch of issues, which PRs are declared to close each one (number and state)."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "issue_numbers"]
+outputs = ["pr_numbers", "pr_states", "total_count"]
+required_fields = ["pr_numbers", "total_count"]
+actor = "daemon"
+permissions = ["pull_requests:read", "issues:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::pull-requests::issue-closed-by-pull-requests"
+test_status = "declared"
+owner = "daemon-landing"
+risk = "normal"
+github = { commands = [
+  "gh api graphql (issue.closedByPullRequestsReferences, aliased per issue)",
+] }
+platform_support = "unknown"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "REST has no equivalent: timeline cross-referenced events do not say whether a closing keyword was used, so this read is GraphQL-only on GitHub",
+  "whether another forge exposes the issue-to-closing-PR direction at all, rather than only the PR-to-issue one (pr.closing-issue-references)",
+]
+notes = "The opposite direction of pr.closing-issue-references. Batched as one aliased query per 100 issues with gh's own arguments (first: 100, closed-unmerged PRs excluded) so the verdicts match `gh issue view --json closedByPullRequestsReferences`."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/stale_blocked/batch.rs"
+
+[[operation]]
 id = "pr.closing-issue-references"
 group = "issue-closing-relationships"
 summary = "Resolve which issues a PR closes, and which PRs closed an issue."

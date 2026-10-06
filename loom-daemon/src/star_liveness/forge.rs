@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -194,68 +194,17 @@ impl GhStarForge {
 
     /// Conditional GET of `url` (a REST path), accounted under `op` (#9831):
     /// `Ok(Some(body))` on a `200` or a `304` served from the stored body,
-    /// `Ok(None)` on a `404`.
+    /// `Ok(None)` on a `404`. The shared [`store::cached_get`] (#10480).
     fn cached_get(&self, op: ForgeOp, url: &str) -> Result<Option<String>> {
-        if crate::rate_limit_breaker::global_skip_pass("star_liveness") {
-            return Err(anyhow!("rate-limit breaker is suppressing forge calls"));
-        }
-        let cwd = Some(self.root.as_path());
-        let target = store::resolve_target(cwd, Some(&self.slug));
-        let key = store::daemon_cache_key(cwd, &target, url);
-        let disk =
-            store::daemon_store_dir().map(|d| store::entry_path_with_prefix(&d, "star-", &key));
-        let sent = mem_cache()
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&key).cloned())
-            .or_else(|| {
-                let e = store::read_disk_entry(disk.as_deref()?)?;
-                Some(Arc::new(e))
-            });
-        let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
-        let (status, response, stderr) =
-            store::fetch_conditional(site(op), &self.gh_bin, cwd, &target, url, sent_etag)?;
-        match response {
-            Some(r) if r.status == 304 => match sent {
-                Some(e) => Ok(Some(e.body.clone())),
-                None => {
-                    // A 304 with nothing sent is anomalous: drop and re-fetch.
-                    if let Ok(mut m) = mem_cache().lock() {
-                        m.remove(&key);
-                    }
-                    if let Some(p) = &disk {
-                        let _ = std::fs::remove_file(p);
-                    }
-                    Err(anyhow!("gh api {url}: 304 but the cache entry vanished"))
-                }
-            },
-            Some(r) if r.status == 200 && status.success() => {
-                if let Some(etag) = r.etag.clone() {
-                    let entry = store::DiskEntry {
-                        etag,
-                        body: r.body.clone(),
-                    };
-                    if let Some(p) = &disk {
-                        store::write_disk_entry(p, &entry);
-                    }
-                    if let Ok(mut m) = mem_cache().lock() {
-                        m.insert(key, Arc::new(entry));
-                    }
-                }
-                Ok(Some(r.body))
-            }
-            Some(r) if r.status == 404 => Ok(None),
-            _ => {
-                crate::rate_limit_breaker::global_observe_failure(&stderr, "star_liveness");
-                Err(anyhow!("gh api {url} failed: {stderr}"))
-            }
-        }
+        store::cached_get(
+            site(op),
+            &self.gh_bin,
+            Some(self.root.as_path()),
+            Some(&self.slug),
+            url,
+            "star-",
+        )
     }
-}
-
-fn mem_cache() -> &'static Mutex<HashMap<String, Arc<store::DiskEntry>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<store::DiskEntry>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Percent-encode a query value (unreserved characters pass through).
@@ -304,12 +253,7 @@ impl StarForge for GhStarForge {
     }
 
     fn issue(&mut self, number: u32) -> Result<Option<RestIssue>> {
-        let Some(body) = self.cached_get(
-            // A single-issue read: no inventory row exists for it (#9831).
-            ForgeOp::uninventoried("single-issue REST read has no inventory row"),
-            &self.issue_path(number),
-        )?
-        else {
+        let Some(body) = self.cached_get(ops::ISSUE_VIEW_STATE, &self.issue_path(number))? else {
             return Ok(None);
         };
         Ok(crate::forge_listing::parse_rest_issues(&format!("[{body}]"))?
