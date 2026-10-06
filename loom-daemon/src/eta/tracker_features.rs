@@ -188,6 +188,9 @@ pub(super) struct PassContext {
     stall: Option<StallSnapshot>,
     /// Each PR's label-transition timeline from the fleet snapshots (#10500).
     timeline: Timeline,
+    /// The fleet roster's revisions, oldest first (#10508), for the
+    /// roster-derived `eta-fit/v2` inputs; `None` leaves them unknown.
+    fleet_history: Option<Vec<RosterRevision>>,
 }
 
 impl PassContext {
@@ -523,6 +526,13 @@ impl Tracker {
         Some(self.priority_features_at(&subject, as_of))
     }
 
+    /// Hand the tracker the fleet roster's revisions, oldest first (#10508):
+    /// what every later estimate's roster-derived `eta-fit/v2` inputs read
+    /// (`None`: unknown). Never today's `repos.yml` standing in for history.
+    pub fn set_fleet_history(&mut self, history: Option<Vec<RosterRevision>>) {
+        self.context.fleet_history = history;
+    }
+
     /// The `eta-fit/v2` priority inputs (#10508) of listed PR `pr` of `repo`
     /// at `as_of`, from the last fleet view observed before `as_of`, through
     /// the one builder the fit calls ([`priority_inputs`]): the PR's own
@@ -530,8 +540,8 @@ impl Tracker {
     /// observation), the modeled roster with each entry's linked star, and
     /// `fleet_history` (the fleet roster's revisions, oldest first; `None`
     /// leaves the roster-derived inputs unknown). `None` when the view does
-    /// not list the PR. Not part of [`Features`]: no shipped heuristic reads
-    /// it.
+    /// not list the PR. Recorded as [`Features::priority`];
+    /// `land-2026-10-06-keen-wren` reads it.
     #[must_use]
     pub fn priority_inputs_of(
         &self,
@@ -763,6 +773,11 @@ impl Tracker {
             .write_to(&mut features, &mut omitted);
         self.item_features(key, item, ctx.history, now, &mut features, &mut omitted);
         self.star_features(key, item, now, &mut features);
+        // #10508: the v2 priority inputs, through the builder the fit calls.
+        if let Some(pr) = item.pr_number {
+            features.priority =
+                self.priority_inputs_of(&key.repo, pr, now, self.context.fleet_history.as_deref());
+        }
         let pr = item.pr_number.ok_or(reason::NO_PR_YET);
         self.context
             .reads

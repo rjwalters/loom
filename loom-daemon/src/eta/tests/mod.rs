@@ -28,6 +28,7 @@ mod hold_parity;
 mod hold_serving;
 mod item_features;
 mod journal;
+mod keen_wren;
 pub(crate) mod land_twin_otter;
 mod land_v3;
 mod little_v0;

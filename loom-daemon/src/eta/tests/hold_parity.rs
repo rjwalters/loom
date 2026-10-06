@@ -263,7 +263,12 @@ pub(crate) fn serve_with(
 
 /// The registry with the parity fixture's fit, cut off before the scenario.
 pub(crate) fn fitted() -> Registry {
-    Registry::with_fit(Some(Arc::new(fixture_fit(t(0) - Duration::days(1)))))
+    let at = t(0) - Duration::days(1);
+    // Both fits, so `land-2026-10-06-keen-wren` (#10508) answers too.
+    Registry::with_fits(
+        Some(Arc::new(fixture_fit(at))),
+        Some(Arc::new(super::keen_wren::v2_fixture(at, 0.0, 0.0))),
+    )
 }
 
 /// The twin-otter record of `spec`'s first `land` estimate at [`AT`].

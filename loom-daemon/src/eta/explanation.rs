@@ -784,6 +784,12 @@ pub struct Features {
     /// Where the star comes from: `none`, `pr`, `issue` or `both`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub star_source: Option<String>,
+    /// The `eta-fit/v2` priority inputs (#10508), built by the one builder
+    /// the fit calls ([`crate::eta::priority_inputs`]). Read only by
+    /// `land-2026-10-06-keen-wren`; absent when the item has no PR listed
+    /// in a fleet view before `as_of`, and then not in [`Features::NAMES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<crate::eta::fit::features_v2::PriorityInputs>,
     /// The host's REST (`core`) rate-limit calls left (#10232).
     #[serde(default)]
     pub ratelimit_core_remaining: Option<u32>,

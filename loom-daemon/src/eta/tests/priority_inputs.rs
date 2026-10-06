@@ -10,6 +10,7 @@ use crate::eta::fit::features_v2::{
     SCHEMA_V2, STARRED_INDEX,
 };
 use crate::eta::fit::rows::{self, Assembled};
+use crate::eta::fit::v2;
 use crate::eta::fit::{model_features, ModelInputs, FEATURES, N_FEATURES, SCHEMA};
 use crate::eta::fleet_events::{EventKind, ItemKind, RawEvent, SOURCE_FORGE};
 use crate::eta::priority_features::{PriorityEntry, PriorityState};
@@ -671,4 +672,24 @@ fn a_roster_edit_after_the_row_changes_no_row_at_t() {
     for pr in [51, 55, 56] {
         assert_eq!(trained_at(&base, REPO, pr), trained_at(&with_edit, REPO, pr), "PR {pr}");
     }
+}
+
+/// The leak test at the fit's input (#10508): a roster edit knowable only at
+/// or after the cutoff (committed before it but first observed at it, or
+/// committed after it) leaves every row's `eta-fit/v2` feature vector, and
+/// so the v2 fit, unchanged. The same edit observed early does move them,
+/// so the test cannot pass vacuously.
+#[test]
+fn the_v2_features_ignore_roster_edits_knowable_at_or_after_the_cutoff() {
+    let specs = specs();
+    let base = trained(&specs, Some(&fleet_history()));
+    let xs = |a: &Assembled| v2::features_v2(&a.rows, &a.priority_inputs);
+    let edit = vec![member(REPO, 0), member(OTHER, 500)];
+    let mut late = fleet_history();
+    late.push(revision(h(2.0), Some(cutoff()), edit.clone()));
+    late.push(revision(cutoff() + Duration::hours(1), None, edit.clone()));
+    assert_eq!(xs(&trained(&specs, Some(&late))), xs(&base));
+    let mut early = fleet_history();
+    early.push(revision(h(2.0), Some(h(2.0)), edit));
+    assert_ne!(xs(&trained(&specs, Some(&early))), xs(&base));
 }
