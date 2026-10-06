@@ -490,10 +490,16 @@ const PROMPT_SURFACE: &[&str] = &[
 /// per-role graph). A test runs the real checker's `--files` and fails if its
 /// read surface outgrows this set (ci-principles rule 9: refine what a result
 /// covers from the checker's own source; the check still runs on every PR).
+///
+/// Role discovery is `defaults/roles/**/*.json`, not `*.json`: a git pathspec
+/// without `:(glob)` magic matches `*` across `/`, so the checker also
+/// discovers a role from a JSON in a subdirectory. A one-segment glob would
+/// silently drop that read — narrowing on a surface the checker does not
+/// actually have, which rule 9 forbids.
 const ROLE_PROMPT_PREFIX_READS: &[&str] = &[
     "CLAUDE.md",
     "defaults/.loom/CLAUDE.md",
-    "defaults/roles/*.json",
+    "defaults/roles/**/*.json",
     "defaults/.claude/commands/loom/*.md",
 ];
 
@@ -692,11 +698,17 @@ pub const SPECS: &[CheckSpec<'static>] = &[
     },
     // An AGGREGATE over each role's whole prompt file set — split a file in two
     // and every per-file number drops while this one rises. Purely coupled.
+    //
+    // `ci.yml` runs `--self-test` first, which executes
+    // `check-markdown-token-budget.sh --list` on the REAL tree and fails the
+    // step when its estimator disagrees with this one — so that script is a
+    // global input too.
     CheckSpec {
         context: "Role Prompt Prefix Ratchet",
         global: &[
             "scripts/check-role-prompt-budget.sh",
             "scripts/role-prompt-budget.txt",
+            "scripts/check-markdown-token-budget.sh",
             CI_WORKFLOW,
         ],
         scanned: &[],
