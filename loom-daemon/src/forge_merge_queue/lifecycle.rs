@@ -314,6 +314,10 @@ pub enum HandoffFailure {
     AuthzCheckNotRequired { required: Vec<String> },
     /// The authorization protocol refused or rolled back.
     Authz(HandoffError),
+    /// The `Enqueued` record could not be written. `sweep` finds queued PRs
+    /// only through it, so an unrecorded entry would be invisible to drop
+    /// reconciliation; the handoff was revoked and dequeued (fail closed).
+    Telemetry { error: String, revoked: Revocation },
 }
 
 impl std::fmt::Display for HandoffFailure {
@@ -333,6 +337,20 @@ impl std::fmt::Display for HandoffFailure {
                 }
             ),
             HandoffFailure::Authz(e) => write!(f, "[AUTHZ_REFUSED] {e:?}"),
+            HandoffFailure::Telemetry { error, revoked } => write!(
+                f,
+                "[TELEMETRY_UNRECORDED] could not record the enqueue ({error}), so the daemon \
+                 could not reconcile this PR; the grant was {} and the dequeue {}",
+                if revoked.grant_revoked.is_ok() {
+                    "revoked"
+                } else {
+                    "NOT confirmed revoked"
+                },
+                match &revoked.dequeue {
+                    Ok(_) => "confirmed".to_string(),
+                    Err(e) => format!("NOT confirmed ({e:?})"),
+                },
+            ),
         }
     }
 }
@@ -369,7 +387,7 @@ pub fn handoff(
     )
     .map_err(HandoffFailure::Authz)?;
     if let Ok(GrantRecord::Live { sha, nonce, at }) = store.record(pr) {
-        ctx.emit(&QueueEvent {
+        let ev = QueueEvent {
             kind: EventKind::Enqueued,
             pr,
             nonce,
@@ -380,7 +398,14 @@ pub fn handoff(
             at,
             enqueue_to_event_secs: Some(0),
             merged_after_revocation: false,
-        });
+        };
+        if let Err(error) = ctx.events.record(&ev) {
+            log::warn!("merge-queue: could not record {} telemetry: {error}", ev.key());
+            // `sweep` discovers queued PRs only through this record: fail closed.
+            let revoked =
+                revoke_then_dequeue(ctx.mode, ctx.execution_enabled, ctx.queue, &store, pr);
+            return Err(HandoffFailure::Telemetry { error, revoked });
+        }
     }
     Ok(out)
 }

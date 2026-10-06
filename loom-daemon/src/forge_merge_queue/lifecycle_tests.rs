@@ -687,3 +687,66 @@ fn parses_github_shapes() {
     assert_eq!(r.len(), 2);
     assert_eq!(r[1].reason, None);
 }
+
+fn root_with_mode(mode: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+    std::fs::write(
+        dir.path().join(".loom/config.json"),
+        format!(r#"{{"champion":{{"mergeMode":"{mode}"}}}}"#),
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn revoke_for_root_is_silent_only_in_confirmed_direct_mode() {
+    use super::gh_lifecycle::revoke_for_root;
+    let gh = std::path::Path::new("/nonexistent/gh");
+    let direct = root_with_mode("direct");
+    assert!(revoke_for_root(gh, direct.path(), PR, "stale-verdict").is_none());
+}
+
+#[test]
+fn revoke_for_root_reports_unresolved_state_instead_of_looking_direct() {
+    use super::gh_lifecycle::revoke_for_root;
+    let gh = std::path::Path::new("/nonexistent/gh");
+    // Queue mode, but the repository cannot be resolved (no usable gh).
+    let queue = root_with_mode("queue");
+    let line = revoke_for_root(gh, queue.path(), PR, "stale-verdict").expect("must not be silent");
+    assert!(line.contains("NOT confirmed"), "{line}");
+    // An unreadable mode is unknown, not direct.
+    let bad = root_with_mode("bogus");
+    let line = revoke_for_root(gh, bad.path(), PR, "stale-verdict").expect("must not be silent");
+    assert!(line.contains("NOT confirmed") && line.contains("merge mode"), "{line}");
+}
+
+struct FailingSink;
+impl EventSink for FailingSink {
+    fn record(&self, _ev: &QueueEvent) -> Result<bool, String> {
+        Err("disk full".into())
+    }
+    fn pending(&self) -> Result<Vec<u32>, String> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn handoff_fails_closed_when_the_enqueued_record_cannot_be_written() {
+    let gh = Gh::new();
+    let r = hand(&gh, &FailingSink);
+    match &r {
+        Err(HandoffFailure::Telemetry { error, revoked }) => {
+            assert!(error.contains("disk full"));
+            assert!(revoked.safe_to_transition(), "grant must be revoked: {revoked:?}");
+        }
+        other => panic!("expected Telemetry failure, got {other:?}"),
+    }
+    assert!(r
+        .as_ref()
+        .unwrap_err()
+        .to_string()
+        .contains("TELEMETRY_UNRECORDED"));
+    // The grant is revoked, so the live check denies a merge.
+    assert!(!gh.github_merge(), "an unrecorded handoff must not be mergeable");
+}

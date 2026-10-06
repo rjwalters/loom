@@ -270,28 +270,37 @@ fn nwo_at(gh: &str, root: &Path) -> Option<String> {
     (out.succeeded() && nwo.contains('/')).then_some(nwo)
 }
 
-/// Build the live seams for `root` and run `f`. `None` in direct mode
-/// (nothing read beyond config) or when the repository cannot be resolved.
-fn with_live<R>(gh: &Path, root: &Path, f: impl FnOnce(&Ctx<'_>) -> R) -> Option<R> {
+/// Outcome of resolving the live seams for a checkout.
+enum Live<R> {
+    /// Direct mode: nothing read beyond config, no forge call.
+    Direct,
+    /// Not confirmed direct, yet the live seams could not be built (mode,
+    /// repository or client unresolved). Unknown facts: callers fail closed.
+    Unresolved(String),
+    Ran(R),
+}
+
+/// Build the live seams for `root` and run `f`.
+fn with_live<R>(gh: &Path, root: &Path, f: impl FnOnce(&Ctx<'_>) -> R) -> Live<R> {
     let mode = match resolve_merge_mode(root) {
         Ok(m) => m.mode,
         Err(e) => {
             log::warn!("merge-queue: {}: {e}", root.display());
-            return None;
+            return Live::Unresolved(format!("merge mode unresolvable: {e}"));
         }
     };
     if mode == MergeMode::Direct {
-        return None;
+        return Live::Direct;
     }
     let gh = gh.to_string_lossy().to_string();
     let Some(nwo) = nwo_at(&gh, root) else {
         log::warn!("merge-queue: could not resolve the repository at {}", root.display());
-        return None;
+        return Live::Unresolved("repository unresolvable".to_string());
     };
     let (Ok(queue), Ok(forge)) =
         (GhQueueApi::new(&gh, &nwo), GhLifecycleForge::new(&gh, root, &nwo))
     else {
-        return None;
+        return Live::Unresolved("forge client could not be built".to_string());
     };
     let events = FileEventSink::for_root(root);
     let ctx = Ctx {
@@ -302,13 +311,13 @@ fn with_live<R>(gh: &Path, root: &Path, f: impl FnOnce(&Ctx<'_>) -> R) -> Option
         events: &events,
         now: chrono::Utc::now(),
     };
-    Some(f(&ctx))
+    Live::Ran(f(&ctx))
 }
 
 /// The daemon's periodic pass: reconcile every pending queued PR so a drop or
 /// a merge is seen within one successful tick. No-op in direct mode.
 pub fn daemon_tick(gh: &Path, root: &Path) {
-    let Some(res) = with_live(gh, root, sweep) else {
+    let Live::Ran(res) = with_live(gh, root, sweep) else {
         return;
     };
     match res {
@@ -326,12 +335,26 @@ pub fn daemon_tick(gh: &Path, root: &Path) {
     }
 }
 
+/// Audit line used when queue mode could not be ruled out but the revocation
+/// could not be attempted. Never silent: the caller's comment carries it.
+#[must_use]
+pub fn unresolved_line(why: &str) -> String {
+    format!(
+        "- **Merge-queue revocation NOT confirmed** ({why}): this repository is not confirmed to \
+         be in direct mode, so a queued entry may remain. The label flip still denies the \
+         `loom/merge-authorization` check, but the queue entry was not revoked or dequeued."
+    )
+}
+
 /// Revoke + dequeue before a Loom-owned transition on `pr` in `root`.
-/// Returns the audit line, `None` in direct mode.
+/// Returns the audit line; `None` only when direct mode is confirmed.
 #[must_use]
 pub fn revoke_for_root(gh: &Path, root: &Path, pr: u32, reason: &str) -> Option<String> {
-    with_live(gh, root, |ctx| {
+    match with_live(gh, root, |ctx| {
         revoke_for_transition(ctx, pr, reason).map(|rev| transition_line(&rev))
-    })
-    .flatten()
+    }) {
+        Live::Direct => None,
+        Live::Unresolved(why) => Some(unresolved_line(&why)),
+        Live::Ran(line) => line,
+    }
 }
