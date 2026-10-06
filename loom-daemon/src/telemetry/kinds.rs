@@ -419,6 +419,8 @@ macro_rules! telemetry_kind_table {
             /// already journals, so no new forge read. OTLP-only. See
             /// [`pr_resolved`].
             PrResolved = "pr.resolved" => $crate::telemetry::kinds::pr_resolved::PrResolvedRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
             /// One heuristic's nightly walk-forward fold for one UTC day (Issue
             /// #10492). OTLP-only. See [`eta_backtest`].
             EtaBacktestFold = "eta.backtest.fold" => $crate::telemetry::kinds::eta_backtest::EtaBacktestFoldRecord,
