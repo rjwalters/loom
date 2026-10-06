@@ -199,6 +199,11 @@ pub(crate) fn record_hold<F: BoundedParkForge + ?Sized>(
 /// Every call is scoped to the registry's workspace (#5401), counted under a
 /// `park_hold.*` op (#10089), and bounded by [`reap_gh_timeout`] (#3973). Once
 /// one call times out, every later call is refused without spawning `gh`.
+///
+/// Write scope (#9548): like the quarantine and hold label edits it precedes,
+/// it only acts on an issue whose sweep was dispatched, and dispatch refuses a
+/// workspace `write_scope` denies (`private_dispatch.rs`), so it inherits that
+/// gate rather than re-checking per call.
 pub(crate) struct RegistryParkForge<'a> {
     reg: &'a SweepRegistry,
     timed_out: bool,
