@@ -465,7 +465,7 @@ fn a_component_off_the_allowlist_is_unknown() {
     assert!(matches!(o, Outcome::Unknown(_)), "{o:?}");
 }
 
-// --- Opt-in: env > config > default (off) ----------------------------------
+// --- Enablement: env > config > default (on, #10465) -----------------------
 
 #[test]
 fn reverification_is_on_unless_disabled() {
@@ -493,6 +493,10 @@ fn reverification_is_on_unless_disabled() {
     assert!(resolve_enabled(Some(""), &none));
     assert!(!resolve_enabled(Some("maybe"), &off));
     assert!(!resolve_enabled(None, &json!({"merge": {"reverifyStaleChecks": "off"}})));
+    // Numeric config: `0` is off, any other number on (as merge-pr.sh reads it).
+    assert!(!resolve_enabled(None, &json!({"merge": {"reverifyStaleChecks": 0}})));
+    assert!(resolve_enabled(None, &json!({"merge": {"reverifyStaleChecks": 1}})));
+    assert!(resolve_enabled(Some("1"), &json!({"merge": {"reverifyStaleChecks": 0}})));
     assert_eq!(CONFIG_KEY, "merge.reverifyStaleChecks");
     assert_eq!(ENABLE_ENV, "LOOM_MERGE_REVERIFY_STALE_CHECKS");
 }

@@ -188,13 +188,18 @@ pub fn enabled_for_root(root: &Path) -> bool {
 }
 
 /// [`enabled_for_root`] over explicit inputs. An unparseable value at either
-/// tier falls through to the next one.
+/// tier falls through to the next one. A numeric config value is off only
+/// when it is `0` (any other number is on), matching `merge-pr.sh`'s
+/// `_mp_warn_reverify_floor`, whose `jq tostring` makes `0` read as `"0"`.
 #[must_use]
 pub fn resolve_enabled(env: Option<&str>, config: &serde_json::Value) -> bool {
     env.and_then(parse_flag)
         .or_else(|| {
-            crate::config_resolver::get_path(config, CONFIG_KEY)
-                .and_then(|v| v.as_bool().or_else(|| v.as_str().and_then(parse_flag)))
+            crate::config_resolver::get_path(config, CONFIG_KEY).and_then(|v| {
+                v.as_bool()
+                    .or_else(|| v.as_str().and_then(parse_flag))
+                    .or_else(|| v.as_f64().map(|n| n != 0.0))
+            })
         })
         .unwrap_or(true)
 }
