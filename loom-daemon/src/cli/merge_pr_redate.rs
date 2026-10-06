@@ -194,7 +194,7 @@ PR fresh next pass.",
 
 /// #10167: a fresh-verdict re-date just landed, so take the chain-head merge
 /// lock — one trusted comment holding every other merge onto this PR's base
-/// until its required checks report (bounded by the cap). A separate comment
+/// until it lands or a required check fails (bounded by the cap, #10448). A separate comment
 /// from the #9590 attempt record, so the budget is untouched. Best-effort: a
 /// failure leaves today's behaviour (no lock) and is named on stderr; the
 /// re-date itself already succeeded and is still reported as such.
