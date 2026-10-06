@@ -836,10 +836,29 @@ fn terminal_records(
 /// [`fetch_repo_slug`] with a process-lifetime cache keyed by workspace root
 /// path (a repo's slug does not change while the daemon runs — same
 /// rationale as [`crate::safehouse`]'s own `slug_cache`).
+///
+/// With repo facts on (W3a) the slug comes from the fingerprint-invalidated
+/// repo-facts record instead (`gh repo view` semantics, no forge call when
+/// warm), so a moved remote is seen; `Legacy` keeps the path below.
 pub(super) async fn resolve_repo_slug_cached(
     cache: &mut HashMap<String, String>,
     workspace_root: &str,
 ) -> Option<String> {
+    if crate::forge_repo_facts::enabled() {
+        use crate::forge_repo_facts::{canonical, GhRepoEnv, Lookup};
+        let root = std::path::PathBuf::from(workspace_root);
+        match tokio::task::spawn_blocking(move || canonical(&root, GhRepoEnv::Ignore)).await {
+            Ok(Lookup::Fact(f)) => {
+                let slug = f.full_name();
+                cache.insert(workspace_root.to_string(), slug.clone());
+                return Some(slug);
+            }
+            // `Unavailable` (a failed verify, or its backoff) keeps the
+            // last-known slug or the legacy lookup rather than dropping
+            // the record.
+            Ok(Lookup::Unavailable | Lookup::Legacy) | Err(_) => {}
+        }
+    }
     if let Some(slug) = cache.get(workspace_root) {
         return Some(slug.clone());
     }
@@ -963,6 +982,10 @@ async fn sample_snapshots(
     // only when the set changed. After `eta::record` so it carries this
     // pass's estimates rather than the previous pass's.
     super::eta_snapshot::record().await;
+    // ETA pipeline health gauges (Issue #10391), OTLP-only: local state and
+    // file reads, no forge call; a no-op without the ops sink. After the
+    // snapshot so it reports this pass's built snapshot.
+    super::ops::eta_health::record(workspace_root).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant

@@ -36,6 +36,16 @@ pub const NOT_RECONSTRUCTABLE: &[&str] = &[
     "max_concurrent",
     "sweep_model",
     "sweep_runtime",
+    "checks_pending",
+    "checks_failed",
+    "pool_usable_accounts (host-local)",
+    "pool_exhausted (host-local)",
+    "ratelimit_core_remaining (host-local)",
+    "ratelimit_core_reset_at (host-local)",
+    "ratelimit_graphql_remaining (host-local)",
+    "ratelimit_graphql_reset_at (host-local)",
+    "breaker_state (host-local)",
+    "breaker_cooldown_until (host-local)",
 ];
 
 /// One feature's tally.

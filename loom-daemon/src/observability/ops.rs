@@ -30,8 +30,10 @@
 //! rate-limit breaker trips, quota gauges (per bucket since W1) and breaker
 //! skips, [`forge_calls`] (W1) the facade's `loom.forge.calls` counter, and
 //! [`redate_chain`] (#10163) #8508 re-date pressure (re-dated PRs, re-dates
-//! per PR, time to land), and [`reader_withdrawal`] (W4-A) one
-//! `forge.reader.withdrawn` span per reader withdrawal. A new emitter adds a `MetricName`/`SpanName`
+//! per PR, time to land), [`eta_health`] (#10391) the per-host ETA
+//! pipeline health gauges, and [`reader_withdrawal`] (W4-A) one
+//! `forge.reader.withdrawn` span per reader withdrawal. A new emitter adds a
+//! `MetricName`/`SpanName`
 //! variant and calls the same two functions.
 //!
 //! Tests observe what a seam emitted through the global functions with
@@ -42,6 +44,7 @@ pub mod capture;
 pub mod dispatch;
 pub mod disposition;
 pub mod dwell;
+pub mod eta_health;
 pub mod forge_calls;
 pub mod host;
 pub mod liveness;

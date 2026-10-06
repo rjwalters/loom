@@ -74,6 +74,8 @@ use crate::forge_listing::HttpResponse;
 
 #[path = "forge_call_stats_buckets.rs"]
 pub mod buckets;
+#[path = "forge_call_stats_counters.rs"]
+pub mod counters;
 #[path = "forge_call_stats_ops.rs"]
 pub mod ops;
 use crate::types::{ForgeBudgetReading, ForgeCallCounts, ForgeCallsStatus, ForgeOperationCounts};
@@ -263,6 +265,12 @@ pub struct CallIdentity {
     /// `writer-fallback` — the rate-limit pool it spent. Set by the
     /// `GhInvocation` facade; `None` for a caller recording outside it.
     pub role: Option<String>,
+    /// The rate-limit bucket a *reader* call spent (#10232): the reader
+    /// App's id plus the owner whose installation it ran under — public,
+    /// non-secret labels. Two readers share the `reader` role but not a
+    /// budget, so budget readings are kept per bucket. `None` for the
+    /// writer and for a caller that does not know its reader.
+    pub bucket: Option<String>,
 }
 
 impl CallIdentity {
@@ -303,6 +311,12 @@ impl CallIdentity {
     #[must_use]
     pub fn with_role(mut self, role: &str) -> Self {
         self.role = sanitize(role);
+        self
+    }
+
+    #[must_use]
+    pub fn with_bucket(mut self, bucket: &str) -> Self {
+        self.bucket = sanitize(bucket);
         self
     }
 
@@ -454,6 +468,7 @@ pub fn record_attributed(
         og: identity.origin.clone(),
         rp: identity.repo.clone(),
         ir: identity.role.clone(),
+        ib: identity.bucket.clone(),
         at: attribution.clone(),
     };
     if let Ok(mut state) = process_state().lock() {
@@ -500,6 +515,10 @@ struct SinkLine {
     /// Identity role (#9872); absent on pre-#9872 lines and non-facade calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ir: Option<String>,
+    /// Reader rate-limit bucket (#10232); absent for the writer and on
+    /// older lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ib: Option<String>,
     /// The W1 bucket attribution, flattened into the same short-key line.
     /// Every key is optional, so a pre-W1 line parses with all of them
     /// absent and a pre-W1 reader ignores them.
@@ -591,6 +610,11 @@ struct Aggregate {
     /// Counts per identity role (#9872); a line without one is `unknown`.
     roles: BTreeMap<String, Counts>,
     latest: BTreeMap<Pool, Reading>,
+    /// The newest reading per `(pool, reader bucket)` (#10232): `latest`
+    /// above collapses every identity, but each reader App installation owns
+    /// a separate budget (two readers share the `reader` role, so the role
+    /// is not a key). Only lines that name a bucket land here.
+    latest_by_bucket: BTreeMap<(Pool, String), Reading>,
 }
 
 impl Aggregate {
@@ -620,6 +644,22 @@ impl Aggregate {
                     observed_at: line.t,
                 };
                 self.latest.insert(line.p, reading);
+            }
+            if let Some(bucket) = line.ib.clone() {
+                let key = (line.p, bucket);
+                if self
+                    .latest_by_bucket
+                    .get(&key)
+                    .is_none_or(|r| r.observed_at <= line.t)
+                {
+                    let reading = Reading {
+                        remaining,
+                        used: line.usd,
+                        reset_epoch: line.rst,
+                        observed_at: line.t,
+                    };
+                    self.latest_by_bucket.insert(key, reading);
+                }
             }
         }
     }
@@ -1000,6 +1040,45 @@ fn exhausted_in(latest: &BTreeMap<Pool, Reading>, now: i64) -> Vec<(Pool, Option
         })
         .map(|(pool, r)| (*pool, r.reset_epoch.and_then(epoch)))
         .collect()
+}
+
+/// The newest header budget reading of each pool, per **reader rate-limit
+/// bucket** (#10232), keyed by the public bucket label
+/// ([`crate::forge_identity::reader_bucket`]). Unlike [`status_report`]'s
+/// `budget` this never mixes identities: two readers of the same role are
+/// separate buckets, and a line that named no bucket (the writer, an
+/// unattributed call) is not returned at all. Never a credential.
+#[must_use]
+pub fn bucket_readings(now: DateTime<Utc>) -> BTreeMap<String, Vec<ForgeBudgetReading>> {
+    let window = sink_dir().map(|d| read_window(&d, now.timestamp()));
+    let process = process_state()
+        .lock()
+        .map(|s| s.latest_by_bucket.clone())
+        .unwrap_or_default();
+    let mut latest = process;
+    for (key, r) in window.iter().flat_map(|w| w.latest_by_bucket.iter()) {
+        if latest
+            .get(key)
+            .is_none_or(|l| l.observed_at < r.observed_at)
+        {
+            latest.insert(key.clone(), *r);
+        }
+    }
+    let mut out: BTreeMap<String, Vec<ForgeBudgetReading>> = BTreeMap::new();
+    for ((pool, bucket), r) in latest {
+        let Some(observed_at) = epoch(r.observed_at) else {
+            continue;
+        };
+        out.entry(bucket).or_default().push(ForgeBudgetReading {
+            pool: pool.as_str().to_string(),
+            remaining: r.remaining,
+            used: r.used,
+            reset_at: r.reset_epoch.and_then(epoch),
+            observed_at,
+            source: "headers".to_string(),
+        });
+    }
+    out
 }
 
 /// This host's budget-costing forge calls per pool over the last window —

@@ -499,3 +499,58 @@ fn a_tree_identical_re_date_keeps_the_hold_and_its_pins() {
     assert!(calls.contains("pr edit 2 --remove-label loom:sequenced"), "{calls}");
     assert!(calls.contains("loom:sequence replanned"), "{calls}");
 }
+
+// --- #10465: predecessor head moves --------------------------------------------
+
+fn pred_at(head: &str) -> PredecessorState {
+    PredecessorState {
+        open: true,
+        merged: false,
+        head_sha: Some(head.to_string()),
+        updated_at: None,
+    }
+}
+
+#[test]
+fn a_tree_identical_predecessor_redate_reanchors_pass_and_human_markers() {
+    let live = sha(0x901);
+    for source in [Some("pass".to_string()), None] {
+        let m = SequenceMarker {
+            source: source.clone(),
+            ..marker_2_after_1()
+        };
+        let p = pred_at(&live);
+        // Without re-anchoring the hold would void.
+        assert_eq!(
+            hold_action(&m, Some(&p), Some(&sha(2)), false, 72.0),
+            HoldAction::VoidAndReplan
+        );
+        let anchored = reanchor_predecessor(&m, Some(&p), |_, l| l == live).expect("re-anchored");
+        assert_eq!(anchored.pred_head, live);
+        assert_eq!((anchored.after, &anchored.plan, &anchored.source), (1, &m.plan, &source));
+        assert_ne!(
+            hold_action(&anchored, Some(&p), Some(&sha(2)), false, 72.0),
+            HoldAction::VoidAndReplan
+        );
+    }
+}
+
+#[test]
+fn a_changed_or_unanswered_predecessor_comparison_still_voids() {
+    let m = marker_2_after_1();
+    let p = pred_at(&sha(0x901));
+    assert_eq!(reanchor_predecessor(&m, Some(&p), |_, _| false), None);
+    assert_eq!(reanchor_predecessor(&m, None, |_, _| true), None);
+    // An unmoved head, a closed predecessor, and a merged one need nothing.
+    assert_eq!(reanchor_predecessor(&m, Some(&pred_at(&sha(1))), |_, _| true), None);
+    let closed = PredecessorState {
+        open: false,
+        ..pred_at(&sha(0x901))
+    };
+    assert_eq!(reanchor_predecessor(&m, Some(&closed), |_, _| true), None);
+    let merged = PredecessorState {
+        merged: true,
+        ..pred_at(&sha(0x901))
+    };
+    assert_eq!(reanchor_predecessor(&m, Some(&merged), |_, _| true), None);
+}

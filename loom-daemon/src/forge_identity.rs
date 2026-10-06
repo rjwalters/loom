@@ -707,6 +707,16 @@ impl IdentityRole {
     }
 }
 
+/// The public rate-limit bucket label of a reader App serving `owner_repo`
+/// (#10232): `reader:<app id>@<owner>`. A reader's budget is per App
+/// installation, so the App id and the owner name the bucket; the role alone
+/// (`reader`) does not. Never a credential.
+#[must_use]
+pub fn reader_bucket(app_id: &str, owner_repo: &str) -> String {
+    let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
+    format!("reader:{app_id}@{}", owner.to_ascii_lowercase())
+}
+
 /// The one reader-then-writer retry shape (#9537, shared since #9872 by
 /// `forge_etag_store::fetch_conditional` and the `GhInvocation` choke point).
 ///

@@ -332,6 +332,10 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         // #10263: the ETA fleet refresh's repo set — issue listings and PR
         // timelines, GETs only, through `fetch_with_reader`.
         "observability/eta_fleet_refresh.rs",
+        // #10232: resolves which reader serves a repo only to derive the public
+        // `reader:<app id>@<owner>` bucket label; the credential is discarded
+        // and no request is made with it.
+        "eta/stall_features.rs",
         "ci_telemetry/api.rs", // repos/<o>/<r>/actions/... GETs
         "fleet_store/gh.rs",   // fleet-config: commit/tree/blob GETs (`--method GET`)
         // #9872: the `GhInvocation` choke point. Only `AccessIntent::Read` +

@@ -13,7 +13,9 @@
 //!   listing, where an unchanged listing is a free `304`), at most
 //!   [`FORGE_READ_BUDGET`] `pulls/{n}` + `issues/{n}` reads for items whose
 //!   outcome is still unknown, the last work-finder tick's dispatch plan
-//!   ingested as ready items (#9326), history reloaded, the registry rebuilt
+//!   ingested as ready items (#9326), at most
+//!   [`crate::eta::pr_features::FEATURE_READ_BUDGET`] feature reads plus the
+//!   stall snapshot (#10232), history reloaded, the registry rebuilt
 //!   when a newer coefficient file appeared (#10243), the fleet view (every
 //!   listed PR plus the journal's stage events) handed over for the queue
 //!   features (#10201), and every live item re-estimated. An unchanged
@@ -409,6 +411,14 @@ pub(super) fn snapshot_input() -> Option<super::eta_snapshot::SnapshotInput> {
         })
         .collect();
     Some((state.tracker.pending().to_vec(), current_ids(state), registered))
+}
+
+/// Live ETA items per `(kind, heuristic, reason)` for the health gauges
+/// (#10391), counted under the tracker lock without cloning the pending set.
+/// `None` when ETA is disabled.
+pub(super) fn health_items() -> Option<std::collections::BTreeMap<(String, String, String), u64>> {
+    let guard = lock();
+    Some(super::ops::eta_health::buckets(guard.as_ref()?.tracker.pending()))
 }
 
 /// Fold `outcomes` into the shadow ledger and persist it (#9328).
@@ -1007,6 +1017,7 @@ pub(super) async fn record(
     }
     // Before `now`: the fleet view is known strictly before the estimates.
     let listed_at = Utc::now();
+    let feature_reads = feature_pass::run(&repos, workspace_root).await;
 
     let slugs: Vec<String> = repos.iter().map(|(_, slug, ..)| slug.clone()).collect();
     let journal_root = workspace_root.to_path_buf();
@@ -1168,7 +1179,7 @@ pub(super) async fn record(
     }
     log::info!(
         "eta: pass emitted={} refused={} outcomes={} journaled={} pending={} expired={} \
-         invalid={} reads={} deferred_reads={} orphaned={}",
+         invalid={} reads={} deferred_reads={} feature_reads={} orphaned={}",
         delivered.emitted,
         delivered.refused,
         delivered.outcomes,
@@ -1178,6 +1189,7 @@ pub(super) async fn record(
         delivered.invalid,
         reads_answered(&rows),
         deferred,
+        feature_reads,
         dropped.orphaned
     );
 }
@@ -1230,6 +1242,9 @@ fn reads_answered(rows: &[JournalEntry]) -> usize {
         .filter(|row| row.event == "pr.resolved" || row.event == "issue.resolved")
         .count()
 }
+
+#[path = "eta_feature_pass.rs"]
+mod feature_pass;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

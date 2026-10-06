@@ -478,6 +478,9 @@ pub fn plan_repo_with(
     if open_prs.len() <= TRIGGER_OPEN_PRS {
         return Vec::new();
     }
+    // #10465: readiness is transitive across the recorded holds.
+    let demoted = ready::demote_unlandable(open_prs, markers);
+    let open_prs = demoted.as_slice();
     let eligible: Vec<&SequencePr> = open_prs
         .iter()
         .filter(|p| p.eligible_for_ordering() && p.pinnable())
@@ -1138,8 +1141,19 @@ pub(super) fn reconcile_merge_sequences_with(
     let bin = gh_bin.to_string_lossy().to_string();
     // Each holder's completed marker read, reused by Phase 2 (#10089).
     let mut read_markers: BTreeMap<u32, Option<SequenceMarker>> = BTreeMap::new();
+    // #10465: readiness is transitive across the recorded holds, so every
+    // holder's marker is read up front (once; the loop below reuses it).
+    let holder_reads: BTreeMap<u32, Option<Option<SequenceMarker>>> = holders
+        .iter()
+        .map(|p| (p.number, holder_marker(&bin, root, p)))
+        .collect();
+    let held_markers: BTreeMap<u32, SequenceMarker> = holder_reads
+        .iter()
+        .filter_map(|(n, m)| Some((*n, m.clone()??)))
+        .collect();
+    let open_ready = ready::demote_unlandable(&open, &held_markers);
     for pr in &holders {
-        let parsed = match holder_marker(&bin, root, pr) {
+        let parsed = match holder_reads.get(&pr.number).cloned().flatten() {
             Some(m) => m,
             None => {
                 // The label gates merges regardless (#9378); a failed read
@@ -1174,6 +1188,12 @@ pub(super) fn reconcile_merge_sequences_with(
         });
         let pr: &SequencePr = &held;
         let pred = predecessor(&bin, root, &open, marker.after);
+        // #10465: a predecessor head that moved by a tree-identical commit is
+        // re-anchored, not voided; the hold is evaluated at the new head.
+        let reanchored = sticky::reanchor_predecessor(&marker, pred.as_ref(), |pinned, live| {
+            sticky::forge_same_tree(gh_bin, root, pinned, live)
+        });
+        let marker = reanchored.clone().unwrap_or(marker);
         // The head's labels and freshness come from this tick's listing; a
         // predecessor outside it is never treated as stalled (fail closed).
         let head = open.iter().find(|p| p.number == marker.after);
@@ -1195,7 +1215,8 @@ pub(super) fn reconcile_merge_sequences_with(
         }
         // #10371: a soft hold behind a predecessor that is not ready to land
         // (as this tick's listing shows it) is released.
-        let action = ready::with_readiness(action, &marker, pred.as_ref(), pr, head);
+        let ready_head = open_ready.iter().find(|p| p.number == marker.after);
+        let action = ready::with_readiness(action, &marker, pred.as_ref(), pr, ready_head);
         // #10077: a soft hold between PRs sharing no file is released.
         let fetch = |p: &SequencePr| changed_files(gh_bin, root, p);
         let action =
@@ -1213,7 +1234,10 @@ pub(super) fn reconcile_merge_sequences_with(
             HoldAction::VoidAndReplan => {
                 release_hold(gh_bin, root, pr.number, REPLAN_NOTE_BODY).map(|_| action)
             }
-            HoldAction::HoldSoft | HoldAction::HoldHard => Ok(action),
+            HoldAction::HoldSoft | HoldAction::HoldHard => match reanchored.as_ref() {
+                Some(m) => sticky::record_reanchor(gh_bin, root, pr.number, m).map(|_| action),
+                None => Ok(action),
+            },
         };
         match result {
             Ok(HoldAction::Release) => stats.released += 1,

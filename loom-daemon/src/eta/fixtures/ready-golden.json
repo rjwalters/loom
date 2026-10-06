@@ -267,7 +267,15 @@
       "pr_behind_main": null,
       "pr_merge_conflict": null,
       "pr_friction_observed_at": null,
-      "operator_hold": null
+      "operator_hold": null,
+      "ratelimit_core_remaining": null,
+      "ratelimit_core_reset_at": null,
+      "ratelimit_graphql_remaining": null,
+      "ratelimit_graphql_reset_at": null,
+      "breaker_state": null,
+      "breaker_cooldown_until": null,
+      "checks_pending": null,
+      "checks_failed": null
     },
     "features_omitted": [
       {
@@ -472,6 +480,38 @@
       },
       {
         "name": "operator_hold",
+        "reason": "not_collected"
+      },
+      {
+        "name": "ratelimit_core_remaining",
+        "reason": "not_collected"
+      },
+      {
+        "name": "ratelimit_core_reset_at",
+        "reason": "not_collected"
+      },
+      {
+        "name": "ratelimit_graphql_remaining",
+        "reason": "not_collected"
+      },
+      {
+        "name": "ratelimit_graphql_reset_at",
+        "reason": "not_collected"
+      },
+      {
+        "name": "breaker_state",
+        "reason": "not_collected"
+      },
+      {
+        "name": "breaker_cooldown_until",
+        "reason": "not_collected"
+      },
+      {
+        "name": "checks_pending",
+        "reason": "not_collected"
+      },
+      {
+        "name": "checks_failed",
         "reason": "not_collected"
       }
     ],
@@ -1120,7 +1160,15 @@
       "pr_behind_main": null,
       "pr_merge_conflict": null,
       "pr_friction_observed_at": null,
-      "operator_hold": null
+      "operator_hold": null,
+      "ratelimit_core_remaining": null,
+      "ratelimit_core_reset_at": null,
+      "ratelimit_graphql_remaining": null,
+      "ratelimit_graphql_reset_at": null,
+      "breaker_state": null,
+      "breaker_cooldown_until": null,
+      "checks_pending": null,
+      "checks_failed": null
     },
     "features_omitted": [
       {
@@ -1325,6 +1373,38 @@
       },
       {
         "name": "operator_hold",
+        "reason": "not_collected"
+      },
+      {
+        "name": "ratelimit_core_remaining",
+        "reason": "not_collected"
+      },
+      {
+        "name": "ratelimit_core_reset_at",
+        "reason": "not_collected"
+      },
+      {
+        "name": "ratelimit_graphql_remaining",
+        "reason": "not_collected"
+      },
+      {
+        "name": "ratelimit_graphql_reset_at",
+        "reason": "not_collected"
+      },
+      {
+        "name": "breaker_state",
+        "reason": "not_collected"
+      },
+      {
+        "name": "breaker_cooldown_until",
+        "reason": "not_collected"
+      },
+      {
+        "name": "checks_pending",
+        "reason": "not_collected"
+      },
+      {
+        "name": "checks_failed",
         "reason": "not_collected"
       }
     ],

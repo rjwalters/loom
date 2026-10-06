@@ -542,10 +542,14 @@ pub fn reap_repo(repo_root: &Path, config: &PrimaryCheckoutReaperConfig) -> Prim
     let default_branch = || clean::default_branch(repo_root);
     let dirty = || is_primary_checkout_dirty(repo_root);
 
-    // Resolved once per pass (one REST call), not once per gate.
-    let owner = clean::repo_owner_rest(repo_root);
-    let pr_status = |branch: &str| match owner.as_deref() {
-        Some(owner) => clean::check_pr_status_for_branch_rest(repo_root, owner, branch),
+    // Resolved once per pass, not once per gate (repo-facts record, else one
+    // REST call); a `NoPr` is owner-confirmed at most once per pass (W3a).
+    let _facts_pass = crate::forge_repo_facts::PassScope::enter();
+    let owner = crate::worktree_ops::clean_owner::repo_owner(repo_root);
+    let pr_status = |branch: &str| match owner.as_ref() {
+        Some(owner) => {
+            crate::worktree_ops::clean_owner::pr_status_confirmed(repo_root, owner, branch)
+        }
         // No owner ⇒ no REST head filter is constructible; fall back to the
         // GraphQL-backed probe rather than silently reporting Unknown forever.
         None => clean::check_pr_status_for_branch(repo_root, branch),

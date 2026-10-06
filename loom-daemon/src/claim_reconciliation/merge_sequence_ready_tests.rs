@@ -413,3 +413,46 @@ fn an_all_ready_group_orders_exactly_oldest_first() {
     assert_eq!(order(&prs), vec![1, 2, 3]);
     assert_eq!(edges(&prs, &BTreeMap::new()), vec![(2, 1), (3, 2)]);
 }
+
+// --- #10465: readiness is transitive ----------------------------------------
+
+#[test]
+fn a_ready_pr_is_never_held_behind_an_approved_but_sequenced_pr() {
+    // A (ready) overlaps B (`loom:pr`, sequenced behind C); C has no verdict.
+    let c = pr(3, "2026-10-01T00:00:00Z", &[]);
+    let b = pr(2, "2026-10-02T00:00:00Z", &[APPROVED_LABEL, SEQUENCE_LABEL]);
+    let a = pr(1, "2026-10-03T00:00:00Z", &[APPROVED_LABEL]);
+    let prs = [c, b, a];
+    let nums = [1, 2, 3];
+    let markers = BTreeMap::from([(2, soft(2, 3))]);
+    let groups = plan_repo_with(&prs, &all_share(&nums), &markers, &BTreeSet::new());
+    assert!(
+        groups.iter().all(|g| g.edges.iter().all(|e| e.after != 2)),
+        "no hold behind B: {groups:?}"
+    );
+    // Control: with C ready, B is landable and A may queue behind it.
+    let c_ready = pr(3, "2026-10-01T00:00:00Z", &[APPROVED_LABEL]);
+    let prs = [c_ready, prs[1].clone(), prs[2].clone()];
+    let groups = plan_repo_with(&prs, &all_share(&nums), &markers, &BTreeSet::new());
+    assert!(groups.iter().any(|g| g.edges.iter().any(|e| e.after == 2)), "{groups:?}");
+}
+
+#[test]
+fn a_soft_hold_behind_a_sequenced_non_landable_pr_is_released_but_a_pin_is_kept() {
+    let c = pr(3, "2026-10-01T00:00:00Z", &[]);
+    let b = pr(2, "2026-10-02T00:00:00Z", &[APPROVED_LABEL, SEQUENCE_LABEL]);
+    let a = pr(1, "2026-10-03T00:00:00Z", &[APPROVED_LABEL, SEQUENCE_LABEL]);
+    let markers = BTreeMap::from([(2, soft(2, 3))]);
+    let listing = demote_unlandable(&[c, b, a.clone()], &markers);
+    assert!(listing[1].has(NOT_LANDABLE_LABEL));
+    assert_eq!(decide(&soft(1, 2), &a, &listing), HoldAction::ReleaseNotReady);
+    // A human `after=` pin (no `source=pass`) is still honored.
+    let pin = marker(1, 2, None, "seq-c0ffee00");
+    assert_eq!(decide(&pin, &a, &listing), HoldAction::HoldHard);
+}
+
+#[test]
+fn operator_parked_predecessors_are_not_ready() {
+    let t = "2026-10-01T00:00:00Z";
+    assert!(!ready(&pr(1, t, &[APPROVED_LABEL, "loom:operator"])));
+}

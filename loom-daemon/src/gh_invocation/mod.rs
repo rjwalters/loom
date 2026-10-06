@@ -273,6 +273,9 @@ pub struct GhInvocation {
     path: Option<OsString>,
     /// Remove [`TOKEN_ENV_VARS`] from the child (#10263).
     strip_token_env: bool,
+    /// Further variables removed from the child, applied last
+    /// ([`GhInvocation::strip_env`]).
+    stripped_env: Vec<&'static str>,
     /// The [`OutputContract::CredentialHelper`] request written to stdin.
     stdin_input: Vec<u8>,
     /// Never route this read to a reader App (#9872).
@@ -308,6 +311,7 @@ impl GhInvocation {
             config_dir: None,
             path: None,
             strip_token_env: false,
+            stripped_env: Vec::new(),
             stdin_input: Vec::new(),
             writer_only: false,
             role: None,
@@ -412,6 +416,17 @@ impl GhInvocation {
         self
     }
 
+    /// Remove `key` from the child's environment, after everything else the
+    /// facade sets — so `strip_env("GH_REPO")` wins over the `LOOM_REPO`
+    /// mapping. For a site that must reproduce a `gh` command which itself
+    /// ignores the variable (`gh repo view` and `GH_REPO`), so the child sees
+    /// exactly what that command would have resolved from.
+    #[must_use]
+    pub fn strip_env(mut self, key: &'static str) -> Self {
+        self.stripped_env.push(key);
+        self
+    }
+
     /// Keep this read on the writer credential (#9872): for a read whose
     /// answer depends on **who** asks — a permission or write-scope probe,
     /// `viewer`, `/user` — which a reader App would answer for itself.
@@ -427,6 +442,15 @@ impl GhInvocation {
     #[must_use]
     pub fn identity_role(mut self, role: crate::forge_identity::IdentityRole) -> Self {
         self.role = Some(role);
+        self
+    }
+
+    /// Record the reader rate-limit bucket this execution spent (#10232), for
+    /// a caller that routes its own reads; see
+    /// [`crate::forge_identity::reader_bucket`].
+    #[must_use]
+    pub fn identity_bucket(mut self, bucket: &str) -> Self {
+        self.identity = std::mem::take(&mut self.identity).with_bucket(bucket);
         self
     }
 
@@ -493,6 +517,7 @@ impl GhInvocation {
     ///   removed when there is none.
     /// - [`TOKEN_ENV_VARS`]: removed, only under
     ///   [`GhInvocation::without_token_env`].
+    /// - Each [`GhInvocation::strip_env`] key: removed, last.
     #[must_use]
     pub fn env_plan(&self, child_context: Option<&TraceContext>) -> Vec<EnvEntry> {
         self.env_plan_with(std::env::var_os("LOOM_REPO"), child_context)
@@ -546,6 +571,9 @@ impl GhInvocation {
                 key: "PATH",
                 value: Some(path.clone()),
             });
+        }
+        for key in &self.stripped_env {
+            plan.push(EnvEntry { key, value: None });
         }
         plan
     }
