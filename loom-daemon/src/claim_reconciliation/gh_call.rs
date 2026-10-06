@@ -108,6 +108,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "quarantine.release"
         | "restore.label"
         | "prless.hold_label" => ops::ISSUE_EDIT_LABELS,
+        "park.body" => ops::ISSUE_EDIT_BODY,
         "verdict.anchor_comment"
         | "verdict.reanchor_comment"
         | "verdict.stale_comment"

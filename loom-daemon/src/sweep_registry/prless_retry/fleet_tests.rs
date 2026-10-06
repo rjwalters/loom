@@ -182,6 +182,7 @@ fn write_fake_gh(path: &Path, gh_log: &Path) {
     let script = format!(
         "#!/usr/bin/env bash\n\
          printf '%s\\n' \"$*\" >> \"{log}\"\n\
+         {park_view}\
          {timeline}\
          {gql}\
          if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
@@ -194,6 +195,7 @@ fn write_fake_gh(path: &Path, gh_log: &Path) {
          fi\n\
          exit 0\n",
         log = gh_log.display(),
+        park_view = crate::sweep_registry::test_support::fake_gh_park_view_arm(),
         timeline = fake_gh_timeline_rest_arm("", 0),
         gql = fake_gh_graphql_arm("", 0),
         state = state_probe_json("open", false),
@@ -470,7 +472,7 @@ fn only_the_threshold_crossing_host_flips_the_label() {
     let edits: Vec<String> = std::fs::read_to_string(fleet.gh_log.as_ref().unwrap())
         .unwrap()
         .lines()
-        .filter(|l| l.starts_with("issue edit "))
+        .filter(|l| l.starts_with("issue edit ") && l.contains("--add-label"))
         .map(std::string::ToString::to_string)
         .collect();
     assert_eq!(edits.len(), 1, "exactly one label flip across the fleet, got: {edits:?}");
