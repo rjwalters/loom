@@ -262,32 +262,3 @@ pub fn fetch_body_and_comments(
         ))),
     }
 }
-
-/// A **pull request's** body and comments, in `extract-refs`'s shape (#8925).
-///
-/// Needed as its own function rather than pointing [`fetch_body_and_comments`]
-/// at a PR number: `gh issue view <pr>` exits non-zero for a pull request, which
-/// is exactly the failure [`fetch_state`]'s issue→pr ladder relies on. A park on
-/// a PR is unreachable without this read — the whole of #8925's defect 1.
-///
-/// # Errors
-///
-/// [`ReadError`] if the pull request could not be read.
-pub fn fetch_pr_body_and_comments(
-    pr: i64,
-    repo: Option<&str>,
-    repo_root: &Path,
-) -> Result<extract::Input, ReadError> {
-    let n = pr.to_string();
-    let mut args = vec!["pr", "view", &n];
-    args.extend(repo_args(repo));
-    args.extend(["--json", "body,comments"]);
-    let q: Query<extract::Input> = gh_query(&args, repo_root, false, |_: &extract::Input| false);
-    match q {
-        Query::Populated(v) => Ok(v),
-        _ => Err(ReadError(format!(
-            "gh pr view {pr} failed — cannot assess a park from a failed read \
-             (fail safe: never guess 'no refs' on missing data)"
-        ))),
-    }
-}

@@ -104,12 +104,7 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         let op = gh_call::forge_op_for(name).unwrap_or_else(|| panic!("{name} is unmapped"));
         assert!(ops::ALL_INVENTORIED.contains(&op), "{name} -> {op:?} not inventoried");
     }
-    for deliberate in [
-        "claim.issue_state",
-        "claim.issue_labels",
-        "star.api",
-        "sequence.pr_view",
-    ] {
+    for deliberate in ["claim.issue_state", "claim.issue_labels", "star.api"] {
         assert_eq!(gh_call::forge_op_for(deliberate), None, "{deliberate}");
     }
 }

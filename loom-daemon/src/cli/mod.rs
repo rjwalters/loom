@@ -116,6 +116,7 @@ pub(crate) mod pi_usage_cli;
 mod points_marker_check;
 mod pr_latency_cmd;
 mod pr_latency_render;
+pub(crate) mod preflight;
 pub(crate) mod premise_check;
 pub(crate) mod provenance;
 pub(crate) mod quarantine;

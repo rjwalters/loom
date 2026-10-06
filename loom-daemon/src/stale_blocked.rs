@@ -63,6 +63,7 @@ use crate::dep_recheck::{extract, named, premise, recheck};
 
 pub mod batch;
 pub mod budget;
+pub mod notify;
 
 /// Which kind of artifact a finding is about.
 ///
@@ -70,7 +71,7 @@ pub mod budget;
 /// enumerations (`gh issue list` / `gh pr list`) and the remedy differs — an
 /// unparked issue re-enters the curation/approval flow, an unparked PR re-enters
 /// the review lane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Artifact {
     Issue,
     Pr,
@@ -376,3 +377,6 @@ mod batch_tests;
 
 #[cfg(test)]
 mod budget_tests;
+
+#[cfg(test)]
+mod notify_tests;
