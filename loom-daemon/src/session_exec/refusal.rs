@@ -20,10 +20,20 @@
 //! variant and its `FromStr` arm, add one arm to [`wire`], and call
 //! [`announce`] where `session-exec` refuses.
 //!
-//! The override is narrow on purpose. It applies only to a record whose exit
-//! code is the refusal code ([`REFUSAL_EXIT_CODE`]) and which is not a
-//! success, and only for categories [`wire`] lists, so a stray or forged line
-//! cannot relabel a real run.
+//! The override is narrow on purpose. It applies only to a record that is
+//! exactly what a refusal looks like from the script's side: the generic
+//! `RECOVERABLE` category with the refusal exit code ([`REFUSAL_EXIT_CODE`]).
+//! And it can only produce a category [`wire`] lists.
+//!
+//! **What a forged line can do.** The tick log does not separate
+//! `session-exec`'s stderr from the agent's output, so a process inside the
+//! session can print the marker. If that run then genuinely ends as
+//! `RECOVERABLE`/78, it is recorded as the announced category instead: for
+//! `SESSION_DOWN` that means no transient back-off on the account and a
+//! `session-down` label on the span. That is the worst case. It cannot touch
+//! a success, a record with any other exit code, or any other category, so it
+//! can never erase an account hold (`TOKEN_EXHAUSTED`, `TOKEN_EXPIRED`,
+//! `SESSION_LIMIT`, …).
 
 use crate::tokens_pool::health::TerminalClassification;
 
@@ -83,7 +93,7 @@ pub fn apply(
     category: TerminalClassification,
     exit_code: i32,
 ) -> TerminalClassification {
-    if exit_code != REFUSAL_EXIT_CODE || category == TerminalClassification::Success {
+    if exit_code != REFUSAL_EXIT_CODE || category != TerminalClassification::Recoverable {
         return category;
     }
     announced(region).unwrap_or(category)
@@ -105,7 +115,10 @@ pub fn category_of(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use TerminalClassification::{Fatal, Recoverable, SessionDown, SessionMountStale, Success};
+    use TerminalClassification::{
+        Fatal, Recoverable, SessionDown, SessionLimit, SessionMountStale, Success, TokenExhausted,
+        TokenExpired,
+    };
 
     #[test]
     fn the_marker_round_trips_through_the_parser() {
@@ -126,12 +139,10 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_relabels_only_a_78_non_success_record() {
+    fn a_refusal_relabels_only_a_recoverable_78_record() {
         let log = "noise\n# LOOM_SESSION_REFUSAL v=1 category=SESSION_DOWN\nmore\n";
         assert_eq!(apply(log, Recoverable, 78), SessionDown);
-        assert_eq!(apply(log, Fatal, 78), SessionDown);
         assert_eq!(apply(log, Recoverable, 1), Recoverable);
-        assert_eq!(apply(log, Success, 78), Success);
         assert_eq!(apply("no marker", Recoverable, 78), Recoverable);
     }
 
@@ -145,6 +156,19 @@ mod tests {
         assert_eq!(apply(&line, Recoverable, 1), Recoverable);
         let both = format!("{}\n{line}\n", marker_line(SessionDown).unwrap());
         assert_eq!(apply(&both, Recoverable, 78), SessionMountStale);
+    }
+
+    #[test]
+    fn a_marker_never_erases_an_account_hold_or_any_other_verdict() {
+        let log = "# LOOM_SESSION_REFUSAL v=1 category=SESSION_DOWN\n";
+        let stale = "# LOOM_SESSION_REFUSAL v=1 category=SESSION_MOUNT_STALE\n";
+        for kept in [TokenExhausted, TokenExpired, SessionLimit, Fatal, Success] {
+            assert_eq!(apply(log, kept, 78), kept, "{kept:?} at exit 78 stays as reported");
+            assert_eq!(apply(stale, kept, 78), kept, "{kept:?} at exit 78 stays as reported");
+        }
+        let fields =
+            std::collections::HashMap::from([("category", "TOKEN_EXHAUSTED"), ("exit_code", "78")]);
+        assert_eq!(category_of(log, &fields), Some(TokenExhausted));
     }
 
     #[test]

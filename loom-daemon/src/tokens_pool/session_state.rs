@@ -1,11 +1,17 @@
 //! The state of every account's Codex session container, as the daemon sees
 //! it (#10455; Epic #10452).
 //!
-//! One read shared by every consumer of "is this account's container usable":
+//! The read behind "is this account's container usable". Today it is used by
 //! the SigNoz gauge and WARN tracker (`observability::ops::codex_session`,
-//! #10455), the spawn-time posture check (`session_exec::posture::classify`),
-//! and, by design, the reconciler (#10453), liveness-aware selection (#10454)
-//! and mount-drift detection (#10364). It has two layers:
+//! #10455), and its running rule by the spawn-time posture check
+//! (`session_exec::posture::classify`) and `session-exec host`.
+//!
+//! It is built so the other readers can share it, but they do not yet: the
+//! reconciler (#10453, `session_reconcile.rs`) inspects each account itself,
+//! and liveness-aware selection (#10454, `session_lifecycle/liveness.rs`)
+//! keeps its own cached `docker ps`. Moving both, and mount-drift detection
+//! (#10364), onto [`snapshot`] / [`latest`] is a tracked follow-up, so there
+//! are three docker read paths until then. It has two layers:
 //!
 //! * [`classify_inspect`] and [`container_running`] are **pure** over one
 //!   `docker inspect` object, so every caller classifies the same way.
