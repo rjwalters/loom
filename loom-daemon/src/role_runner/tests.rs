@@ -3207,7 +3207,7 @@ async fn test_interval_loop_skips_while_guard_held() {
     in_progress
         .lock()
         .unwrap()
-        .insert((root.clone(), "champion"));
+        .insert((root.clone(), "champion", 0));
     let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let handle = spawn_role_task(
         runner,
@@ -3227,7 +3227,7 @@ async fn test_interval_loop_skips_while_guard_held() {
     );
 
     // Release the guard — dispatch resumes, proving the gate (not a dead loop).
-    in_progress.lock().unwrap().remove(&(root, "champion"));
+    in_progress.lock().unwrap().remove(&(root, "champion", 0));
     wait_for_calls(&calls, 1, Duration::from_secs(2)).await;
 
     handle.abort();
