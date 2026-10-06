@@ -1007,7 +1007,7 @@ pub(super) async fn record(
         .as_ref()
         .map(|state| state.host_id.clone())
         .unwrap_or_default();
-    let ((history, events), repo_ids, loaded_fit, snapshots) =
+    let ((history, events), repo_ids, (loaded_fit, roster), snapshots) =
         tokio::task::spawn_blocking(move || {
             let ids: BTreeMap<String, u64> = slugs
                 .iter()
@@ -1021,9 +1021,16 @@ pub(super) async fn record(
                 fit::load_latest(&journal_root, listed_at),
                 fit::v2::load_latest_v2(&journal_root, listed_at),
             );
+            // #10586: the roster history the fit read, from the same cache.
+            let roster = crate::eta::roster_history::load_for(&journal_root, listed_at).0;
             // #10500: the label timeline serving dates first-seen PRs from.
             let snapshots = crate::eta::fleet::load_all(&journal_root);
-            (load_history(&history_roots, &journal_root, &host), ids, loaded_fit, snapshots)
+            (
+                load_history(&history_roots, &journal_root, &host),
+                ids,
+                (loaded_fit, roster),
+                snapshots,
+            )
         })
         .await
         .unwrap_or_default();
@@ -1069,6 +1076,7 @@ pub(super) async fn record(
         );
         state.repo_ids.extend(repo_ids);
         state.tracker.on_fleet_snapshots(&snapshots, listed_at);
+        state.tracker.set_fleet_history(roster);
         state.tracker.friction = book;
         state.tracker.dependencies = dependencies;
         state.pool_exhausted = pool_exhausted;

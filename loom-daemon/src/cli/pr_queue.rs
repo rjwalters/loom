@@ -31,7 +31,11 @@ impl PrQueueArgs {
         } else {
             let gh =
                 std::env::var_os("LOOM_GH_BIN").map_or_else(|| PathBuf::from("gh"), PathBuf::from);
-            pr_planning::fetch_queue(&self.repo_root, &gh, self.role)?
+            let rows = pr_planning::fetch_queue(&self.repo_root, &gh, self.role)?;
+            // #10432: the serving queue, journaled for this role tick's
+            // `pick.decision` (a no-op outside a role tick).
+            loom_daemon::observability::pick_journal::record_pr_queue(self.role.as_str(), &rows);
+            rows
         };
         let rows: Vec<_> = rows
             .into_iter()

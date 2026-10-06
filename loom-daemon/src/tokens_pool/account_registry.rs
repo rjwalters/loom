@@ -811,8 +811,19 @@ pub fn select_codex_account_where(
     // account has been adopted by `accounts session start`, and never fatal —
     // see `refresh_session_health`.
     let _ = super::session_lifecycle::refresh_session_health(workspace, &inventory, now);
-    let descriptor =
-        super::health::select_healthy_for_model_at(workspace, provider, &inventory, model, now)?;
+    // #10454: try the accounts whose session container is running first, so a
+    // down session is passed over rather than selected and refused (exit 78).
+    // Falls back to the full inventory — today's behaviour — when nothing live
+    // is selectable or Docker cannot be queried (fail open).
+    let live = super::session_lifecycle::liveness::live_preferred(&inventory).and_then(|live| {
+        super::health::select_healthy_for_model_at(workspace, provider, &live, model, now).ok()
+    });
+    let descriptor = match live {
+        Some(descriptor) => descriptor,
+        None => {
+            super::health::select_healthy_for_model_at(workspace, provider, &inventory, model, now)?
+        }
+    };
     Ok(SelectedAccount {
         id: descriptor.id,
         binding: AccountBinding::CodexHome {

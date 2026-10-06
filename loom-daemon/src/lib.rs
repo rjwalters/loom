@@ -312,6 +312,7 @@ pub mod script_helpers;
 pub mod secret_scan;
 pub mod self_update;
 pub mod serve;
+pub mod session_reconcile;
 pub mod shell_budget;
 pub mod short_hash;
 pub mod stale_blocked;

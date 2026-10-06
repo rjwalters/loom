@@ -5,16 +5,17 @@
 //!
 //! **No forge calls are added.** The work-finder side reads the
 //! [`WorkFinderTickSummary`] the tick already published. The role side reads
-//! the queue listing the role's own gate probe (`forge_queue_probe` /
-//! `forge_merge_probe`) already fetched, stashed in a thread-local by
-//! [`record_gate_listing`]: the probe and the end-of-tick emit run on the same
-//! blocking thread, and [`emit_role_tick`] drains the stash, so a tick can never
-//! see a previous tick's listing.
+//! the agent's pick journal ([`super::pick_journal`], #10432: the serving
+//! queue `pr-queue` printed, the listings the agent `gh` front served, the
+//! writes the agent issued) and, as a fallback, the queue listing the role's
+//! own gate probe (`forge_queue_probe` / `forge_merge_probe`) already fetched,
+//! stashed in a thread-local by [`record_gate_listing`]. The probe, the launch
+//! and the end-of-tick emit run on the same blocking thread, and
+//! [`emit_role_tick`] drains both, so a tick can never see a previous tick's.
 //!
-//! Role candidates are in **forge listing order**: the daemon gates on the
-//! queue but does not itself choose among its items — the role agent does,
-//! per its prompt. Roles with no gate listing (curator) emit an empty candidate
-//! list; the record still marks the tick.
+//! The daemon gates on a role's queue but the role agent chooses among its
+//! items, so role candidates and decisions come from the journal whenever one
+//! was written; `candidate_source` / `decisions_observed` say what was seen.
 //!
 //! Records go to the OTLP exporters' queues through the ops sink; with no OTLP
 //! exporter nothing is built.
@@ -26,11 +27,14 @@ use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 
+use super::pick_journal::{
+    known_action, skip_reason_for_labels, Journal, JournalEntry, JournalRow,
+};
 use crate::forge_listing::RestIssue;
 use crate::role_runner::RoleTickOutcome;
 use crate::telemetry::kinds::pick_decision::{
-    PickCandidate, PickDecisionRecord, PickSkipReason, PickSortKey, PickTick, PickVerdict,
-    WORK_FINDER_ROLE,
+    source, PickAction, PickCandidate, PickDecisionRecord, PickSkipReason, PickSortKey, PickTick,
+    PickVerdict, WORK_FINDER_ROLE,
 };
 use crate::telemetry::{RoleTickResult, TelemetryRecord};
 use crate::types::WorkFinderTickSummary;
@@ -70,6 +74,7 @@ pub fn record_gate_listing(root: &Path, label: &str, rows: &[RestIssue]) {
 /// Drop anything stashed by an earlier tick on this (reused) blocking thread.
 pub fn clear_gate_listings() {
     GATE_LISTINGS.with(|s| s.borrow_mut().clear());
+    super::pick_journal::discard();
 }
 
 fn take_gate_listings(root: &Path) -> Vec<(String, Vec<GateRow>)> {
@@ -175,6 +180,7 @@ pub fn work_finder_record(
         },
         ranked,
     )
+    .with_source(source::READY_QUEUE, true)
 }
 
 /// Emit the work finder's decision for a completed tick (a no-op with no OTLP
@@ -217,43 +223,152 @@ fn tick_skip_reason(result: RoleTickResult) -> Option<PickSkipReason> {
     }
 }
 
-/// A role tick's decision from the listings its gate read.
+/// What a role tick saw and did: the journal its agent wrote (when one was
+/// attached) and the gate listings the daemon itself read.
+#[derive(Debug, Clone, Default)]
+pub struct RoleObservation {
+    /// The agent's pick journal; `None` when none was attached.
+    pub journal: Option<Journal>,
+    /// The admission gate's listings, in read order.
+    pub gate: Vec<(String, Vec<GateRow>)>,
+}
+
+/// Rows deduplicated by number, first occurrence (its first rank) kept.
+fn dedup(rows: impl IntoIterator<Item = JournalRow>) -> Vec<JournalRow> {
+    let mut seen = std::collections::HashSet::new();
+    rows.into_iter().filter(|r| seen.insert(r.number)).collect()
+}
+
+/// A role tick's decision (#10212, #10432).
+///
+/// Candidates come from the agent's **serving queue** (the latest `pr-queue`
+/// snapshot) when it read one, else from the listings it read through the agent `gh` front
+/// (Curator), else from the daemon's gate listing. A candidate the agent wrote
+/// to is *acted*; the rest are *skipped* with a label-derived reason or
+/// `not_selected` when the agent's writes were observed, and otherwise
+/// undecided (only a hold label then names a reason).
 #[must_use]
 pub fn role_record(
     tick: PickTick,
     result: RoleTickResult,
-    listings: Vec<(String, Vec<GateRow>)>,
+    observed: RoleObservation,
     repo: &str,
     holds: &[&str],
 ) -> PickDecisionRecord {
     let skip_all = tick_skip_reason(result);
-    let mut rank = 0u32;
-    let mut ranked = Vec::new();
-    for (stage, rows) in listings {
-        for row in rows {
-            rank += 1;
-            let held = row.labels.iter().any(|l| holds.contains(&l.as_str()));
-            let verdict = if held {
-                PickVerdict::Skipped(PickSkipReason::OperatorHold)
-            } else {
-                skip_all.map_or(PickVerdict::Undecided, PickVerdict::Skipped)
-            };
-            ranked.push((
-                PickCandidate {
-                    rank,
-                    repo: repo.to_string(),
+    let attached = observed.journal.is_some();
+    let journal = observed.journal.unwrap_or_default();
+    let mut queue: Option<(DateTime<Utc>, usize, Vec<JournalRow>)> = None;
+    let mut listing: Option<Vec<JournalRow>> = None;
+    let mut acts = Vec::new();
+    let mut queue_acts_observable = true;
+    for entry in journal.entries {
+        match entry {
+            JournalEntry::Queue {
+                at,
+                acts_observable,
+                total,
+                rows,
+                ..
+            } => {
+                queue_acts_observable &= acts_observable;
+                // The latest snapshot is the queue the role last served: an
+                // earlier one may rank differently or hold items since gone.
+                if queue.as_ref().is_none_or(|(prev, ..)| at >= *prev) {
+                    queue = Some((at, total.max(rows.len()), rows));
+                }
+            }
+            JournalEntry::Listing { rows, .. } => {
+                listing.get_or_insert_with(Vec::new).extend(rows);
+            }
+            JournalEntry::Act { number, action, .. } => {
+                if let Some(action) = known_action(&action) {
+                    acts.push((number, action));
+                }
+            }
+        }
+    }
+    // Decisions are observed when the agent ran with a journal that was read
+    // (a missing or unreadable one observed nothing) and its `gh`
+    // writes reach the front: expected at launch, or proven by the front's own
+    // entries, and not contradicted by `pr-queue`'s PATH check.
+    let front_active = journal.front_expected || listing.is_some() || !acts.is_empty();
+    let decisions_observed =
+        attached && journal.read && skip_all.is_none() && front_active && queue_acts_observable;
+    let mut total = 0;
+    let (source, rows) = if let Some((_, queue_total, rows)) = queue {
+        total = queue_total;
+        (source::SERVING_QUEUE, dedup(rows))
+    } else if let Some(rows) = listing {
+        (source::LISTING, dedup(rows))
+    } else {
+        let mut rank = 0u32;
+        let rows: Vec<JournalRow> = observed
+            .gate
+            .into_iter()
+            .flat_map(|(stage, rows)| rows.into_iter().map(move |r| (stage.clone(), r)))
+            .map(|(stage, row)| {
+                rank += 1;
+                JournalRow {
                     number: row.number,
-                    stage: stage.clone(),
+                    stage,
+                    labels: row.labels,
                     sort_key: Some(PickSortKey {
                         name: "listing_order".to_string(),
                         value: rank.to_string(),
                     }),
+                }
+            })
+            .collect();
+        let rows = dedup(rows);
+        (
+            if rows.is_empty() {
+                source::NONE
+            } else {
+                source::GATE_LISTING
+            },
+            rows,
+        )
+    };
+    let ranked = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let held = row.labels.iter().any(|l| holds.contains(&l.as_str()));
+            let verdict = if let Some(reason) = skip_all {
+                PickVerdict::Skipped(reason)
+            } else if let Some((_, action)) = acts.iter().find(|(n, _)| *n == row.number) {
+                PickVerdict::Acted(action)
+            } else if held {
+                PickVerdict::Skipped(PickSkipReason::OperatorHold)
+            } else if decisions_observed {
+                PickVerdict::Skipped(
+                    skip_reason_for_labels(&row.labels).unwrap_or(PickSkipReason::NotSelected),
+                )
+            } else {
+                PickVerdict::Undecided
+            };
+            (
+                PickCandidate {
+                    rank: u32::try_from(i + 1).unwrap_or(u32::MAX),
+                    repo: repo.to_string(),
+                    number: row.number,
+                    stage: row.stage,
+                    sort_key: row.sort_key,
                 },
                 verdict,
-            ));
-        }
-    }
-    PickDecisionRecord::build(tick, ranked)
+            )
+        })
+        .collect();
+    let mut record =
+        PickDecisionRecord::build(tick, ranked).with_source(source, decisions_observed);
+    record.raise_candidates_total(total);
+    record.add_actions(acts.into_iter().map(|(number, action)| PickAction {
+        repo: repo.to_string(),
+        number,
+        action: action.to_string(),
+    }));
+    record
 }
 
 /// Emit one role tick's decision. Always drains this thread's stashed
@@ -265,7 +380,8 @@ pub fn emit_role_tick(
     outcome: &RoleTickOutcome,
     tick_id: Option<String>,
 ) {
-    let listings = take_gate_listings(root);
+    let gate = take_gate_listings(root);
+    let journal = super::pick_journal::take(root);
     if !exporting() {
         return;
     }
@@ -280,7 +396,8 @@ pub fn emit_role_tick(
     };
     let holds: &[&str] = crate::role_runner::demand::DebtAxis::for_role(role)
         .map_or(&[], crate::role_runner::demand::axis_park_labels);
-    emit(role_record(tick, result, listings, &repo_label(root), holds));
+    let observed = RoleObservation { journal, gate };
+    emit(role_record(tick, result, observed, &repo_label(root), holds));
 }
 
 #[cfg(test)]

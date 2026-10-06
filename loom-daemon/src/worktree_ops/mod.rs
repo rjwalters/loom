@@ -40,6 +40,9 @@ pub mod cargo_target;
 pub mod claim_file;
 pub mod clean;
 pub(crate) mod clean_owner;
+/// The hygiene read path (W6): issue and PR state, fresh and conditional,
+/// for every reaping and cleaning consumer.
+pub(crate) mod forge_state;
 pub mod gh;
 pub mod landed;
 /// Leg 0 of both open-linked-PR probes: the cached open-PR listing (#10514).

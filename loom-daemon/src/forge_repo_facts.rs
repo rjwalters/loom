@@ -135,6 +135,9 @@ pub(crate) struct Fact {
     /// The post-redirect owner login — what `.owner.login` returned.
     pub(crate) owner: String,
     pub(crate) name: String,
+    /// The forge's numeric repository id, when the record carries one: the
+    /// rename-proof identity a response's `base.repo.id` is checked against.
+    pub(crate) repo_id: Option<u64>,
     pub(crate) verified_at: i64,
     /// Read from the forge during this lookup (not remembered).
     pub(crate) fresh: bool,
@@ -194,6 +197,7 @@ pub(crate) fn canonical_with(gh: &Path, root: &Path, env: GhRepoEnv) -> Lookup {
         configured_nwo: base.nwo.clone(),
         owner: rec.canonical_owner.clone(),
         name: rec.canonical_name.clone(),
+        repo_id: rec.repo_id,
         verified_at: rec.verified_at,
         fresh,
     };

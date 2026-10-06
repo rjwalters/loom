@@ -101,6 +101,7 @@
 //! host (#5336).
 
 pub mod backfill;
+pub mod captain_gauges;
 pub mod claude_code_telemetry;
 pub mod collector;
 pub mod cycle_guard;
@@ -120,6 +121,7 @@ pub mod otlp;
 pub mod outcome;
 pub mod overhead;
 pub mod pick_decision;
+pub mod pick_journal;
 pub mod queue;
 pub mod queue_blocked;
 pub mod queue_snapshot;
