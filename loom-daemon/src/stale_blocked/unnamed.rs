@@ -18,9 +18,19 @@
 //! - **Clear**: remove [`UNNAMED_LABEL`] from any issue that is no longer
 //!   `loom:blocked` or no longer `Undocumented`.
 //!
+//! # Only the current hold's record counts
+//!
+//! Park records are append-only, so a reason record documents the block only
+//! when it is not older than the latest `loom:blocked` application
+//! ([`super::hold::documents_current_block`]). An issue once held with a reason
+//! and later re-blocked bare is undocumented again and is queued. A current
+//! daemon hold record ([`is_daemon_hold`], #10161) is skipped as
+//! [`Skip::DaemonHold`]; the legacy comment marker is honoured only when the
+//! body carries no daemon record (a hold written before #10161).
+//!
 //! # Skips — counted, never written
 //!
-//! See [`Skip`]: legacy daemon-hold comments (pre-#10161), operator-ruled
+//! See [`Skip`]: daemon holds (body record, or pre-#10161 comment), operator-ruled
 //! permanent blocks (#8742), human-held labels, an active claim, a concurrent
 //! edit, the per-pass cap. An archived repository, a refused breaker, and any
 //! unevaluated read (a failed read is never treated as "undocumented") write
@@ -40,11 +50,12 @@ use super::budget::Floor;
 use super::release::{
     has_operator_hold, same_body, Config, ReleaseForge, Unread, PERMANENT_BLOCK_MARKER,
 };
-use super::{classify, Artifact, Verdict};
+use super::{classify, Artifact, Evidence, Verdict};
 use crate::comment_trust::TrustPolicy;
 use crate::forge_identity::FleetLogins;
 use crate::park_record::apply::{ParkForge, BLOCKED_LABEL};
-use crate::park_record::blockers;
+use crate::park_record::{blockers, parse, ParkRecord};
+use crate::sweep_registry::park_hold::is_daemon_hold;
 use crate::sweep_registry::{PRLESS_HOLD_COMMENT_MARKER, QUARANTINE_COMMENT_MARKER};
 
 /// The queue label: applied here, removed by Curator or by [`run`].
@@ -57,8 +68,9 @@ const CLAIM_LABELS: [&str; 2] = ["loom:curating", "loom:building"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Skip {
-    /// A trusted PR-less-retry or quarantine hold comment (written before
-    /// #10161's body record).
+    /// The current hold is a daemon body record (#10161), or a trusted
+    /// PR-less-retry / quarantine comment on an issue with no such record
+    /// (a hold written before #10161).
     DaemonHold,
     /// `<!-- loom:permanent-block` in the body or any comment (#8742).
     Permanent,
@@ -270,8 +282,14 @@ pub fn run(
 
     for (queued, row) in candidates {
         let n = u64::from(row.number);
-        let verdict = match evidence.get(&n) {
-            Some(Ok(ev)) => classify(ev),
+        let doc = match evidence.get(&n) {
+            Some(Ok(ev)) => match documentation(extra, n, ev) {
+                Ok(d) => d,
+                Err(why) => {
+                    report.unread(n, why);
+                    continue;
+                }
+            },
             Some(Err(why)) => {
                 report.unread(n, why.clone());
                 continue;
@@ -281,12 +299,12 @@ pub fn run(
                 continue;
             }
         };
-        let undocumented = verdict == Verdict::Undocumented;
-        match (queued, undocumented) {
-            (true, true) => report.already_queued += 1,
-            (true, false) => clear(park, n, cfg.dry_run, &mut cap, &mut report),
-            (false, false) => {}
-            (false, true) => {
+        match (queued, doc) {
+            (true, Doc::Undocumented) => report.already_queued += 1,
+            (true, _) => clear(park, n, cfg.dry_run, &mut cap, &mut report),
+            (false, Doc::Documented) => {}
+            (false, Doc::DaemonHold) => report.skip(Skip::DaemonHold),
+            (false, Doc::Undocumented) => {
                 let planned = row.body.as_deref().unwrap_or_default();
                 let evidence_body = bodies.get(&i64::from(row.number));
                 if !evidence_body.is_some_and(|b| same_body(b, planned)) {
@@ -298,6 +316,47 @@ pub fn run(
         }
     }
     report
+}
+
+/// What documents the current block, after the currency check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Doc {
+    Undocumented,
+    Documented,
+    DaemonHold,
+}
+
+/// [`classify`], then: a `HeldWithReason` record older than the latest
+/// `loom:blocked` application belongs to an earlier hold, so the current one
+/// is undocumented; a current daemon record is its own skip. One events read,
+/// only for `HeldWithReason`.
+fn documentation(extra: &mut dyn ReleaseForge, n: u64, ev: &Evidence) -> Result<Doc, String> {
+    match classify(ev) {
+        Verdict::Undocumented => Ok(Doc::Undocumented),
+        Verdict::HeldWithReason { .. } => {
+            let Some(held) = ev.held.as_ref() else {
+                return Ok(Doc::Documented);
+            };
+            let labeled_at = extra
+                .last_labeled_at(n, BLOCKED_LABEL)
+                .map_err(|e| format!("label-event read failed: {e}"))?;
+            if !super::hold::documents_current_block(held.at.as_deref(), labeled_at.as_deref()) {
+                return Ok(Doc::Undocumented);
+            }
+            let record = ParkRecord {
+                blocker: None,
+                by: held.by.clone(),
+                at: held.at.clone(),
+                reason: Some(held.reason.clone()),
+            };
+            Ok(if is_daemon_hold(&record) {
+                Doc::DaemonHold
+            } else {
+                Doc::Documented
+            })
+        }
+        _ => Ok(Doc::Documented),
+    }
 }
 
 /// The per-pass write budget: queueing and clearing each get `max`.
@@ -389,10 +448,14 @@ fn queue(
         report.skip(Skip::Permanent);
         return;
     }
-    if comments.iter().filter(|c| policy.trusts_json(c)).any(|c| {
-        let b = body_of(c);
-        b.contains(PRLESS_HOLD_COMMENT_MARKER) || b.contains(QUARANTINE_COMMENT_MARKER)
-    }) {
+    // Legacy comment marker: only for a pre-#10161 hold, i.e. no body record.
+    let body_record = parse(&fresh.body).iter().any(is_daemon_hold);
+    if !body_record
+        && comments.iter().filter(|c| policy.trusts_json(c)).any(|c| {
+            let b = body_of(c);
+            b.contains(PRLESS_HOLD_COMMENT_MARKER) || b.contains(QUARANTINE_COMMENT_MARKER)
+        })
+    {
         report.skip(Skip::DaemonHold);
         return;
     }

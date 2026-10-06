@@ -438,6 +438,18 @@ impl ReleaseForge for GhReleaseForge {
             .collect())
     }
 
+    fn last_labeled_at(&mut self, number: u64, label: &str) -> Result<Option<String>, String> {
+        let base = format!("repos/{}/issues/{number}/events", self.slug);
+        Ok(self
+            .pages(ops::TIMELINE_READ, &base)?
+            .iter()
+            .filter(|e| e.get("event").and_then(Value::as_str) == Some("labeled"))
+            .filter(|e| e.pointer("/label/name").and_then(Value::as_str) == Some(label))
+            .filter_map(|e| e.get("created_at").and_then(Value::as_str))
+            .next_back()
+            .map(str::to_string))
+    }
+
     fn post_comment(&mut self, number: u64, is_pr: bool, body: &str) -> Result<(), String> {
         let (root, repo) = (&self.root, self.repo.as_deref());
         self.write_ok

@@ -57,6 +57,8 @@ impl ParkForge for Park {
 struct Extra {
     archived: bool,
     comments: HashMap<u64, Vec<Value>>,
+    /// `created_at` of the newest `loom:blocked` labeled event.
+    blocked_at: HashMap<u64, String>,
 }
 
 impl ReleaseForge for Extra {
@@ -68,6 +70,10 @@ impl ReleaseForge for Extra {
     }
     fn labeled_events(&mut self, _: u64) -> Result<Vec<String>, String> {
         panic!("never read")
+    }
+    fn last_labeled_at(&mut self, number: u64, label: &str) -> Result<Option<String>, String> {
+        assert_eq!(label, "loom:blocked");
+        Ok(self.blocked_at.get(&number).cloned())
     }
     fn post_comment(&mut self, _: u64, _: bool, _: &str) -> Result<(), String> {
         panic!("the queue pass never comments")
@@ -296,4 +302,68 @@ fn prs_are_never_queued() {
     w.gather.rows.push(row(8, "x", 0, true, &["loom:blocked"]));
     let r = w.run();
     assert!(r.queued.is_empty());
+}
+
+/// Judge (#10602): park records are append-only. A reason record older than
+/// the latest `loom:blocked` application belongs to an earlier hold, so a bare
+/// re-block is undocumented again and is queued; a current one is not.
+#[test]
+fn a_stale_reason_record_does_not_document_a_bare_re_block() {
+    let mut w = World::new();
+    let old = crate::park_record::render_park(
+        &[],
+        Some("curator"),
+        Some("2026-01-01T00:00:00Z"),
+        Some("waiting on a ruling"),
+    );
+    w.add(1, &old, &[]);
+    w.extra.blocked_at.insert(1, "2026-10-06T00:00:00Z".into());
+    // Same record, written seconds before its own label write: current.
+    let cur = crate::park_record::render_park(
+        &[],
+        Some("curator"),
+        Some("2026-10-06T00:00:00Z"),
+        Some("waiting on a ruling"),
+    );
+    w.add(2, &cur, &[]);
+    w.extra.blocked_at.insert(2, "2026-10-06T00:00:20Z".into());
+    // Already queued and still stale: kept, not cleared.
+    w.add(3, &old, &[UNNAMED_LABEL]);
+    w.extra.blocked_at.insert(3, "2026-10-06T00:00:00Z".into());
+    let r = w.run();
+    assert_eq!(r.queued, vec![1]);
+    assert_eq!(r.already_queued, 1);
+    assert!(r.cleared.is_empty());
+    assert_eq!(w.park.writes, vec![format!("add #1 {UNNAMED_LABEL}")]);
+}
+
+/// #10161: a current body daemon-hold record is skipped structurally; a
+/// released one (older than the label) is not, and once a body record exists
+/// its legacy comment no longer vetoes either.
+#[test]
+fn only_a_current_body_daemon_hold_is_skipped() {
+    use crate::sweep_registry::park_hold::{render_hold_record, PRLESS_HOLD_REASON};
+    let mut w = World::new();
+    w.add(1, &render_hold_record(PRLESS_HOLD_REASON, "2026-10-06T00:00:00Z"), &[]);
+    w.extra.blocked_at.insert(1, "2026-10-06T00:00:05Z".into());
+    w.add(2, &render_hold_record(PRLESS_HOLD_REASON, "2026-01-01T00:00:00Z"), &[]);
+    w.extra.blocked_at.insert(2, "2026-10-06T00:00:00Z".into());
+    w.extra
+        .comments
+        .insert(2, vec![trusted(&format!("{PRLESS_HOLD_COMMENT_MARKER}\nheld"))]);
+    let r = w.run();
+    assert_eq!(skipped(&r, "daemon-hold"), 1);
+    assert_eq!(r.queued, vec![2]);
+}
+
+/// #9274: an unticked `## Dependencies` checklist (even all-unparseable) is
+/// `Unticked`, a cited dependency, never queued as unnamed.
+#[test]
+fn an_unticked_checklist_issue_is_not_queued_as_unnamed() {
+    let mut w = World::new();
+    w.add(1, "## Dependencies\n\n- [ ] vendor sign-off on the pinout\n", &[]);
+    w.add(2, "## Dependencies\n\n- [ ] vendor sign-off on the pinout\n", &[UNNAMED_LABEL]);
+    let r = w.run();
+    assert!(r.queued.is_empty());
+    assert_eq!(r.cleared, vec![2]);
 }

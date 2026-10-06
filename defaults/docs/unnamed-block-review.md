@@ -13,9 +13,14 @@ drains it.
 
 The tick never labels an issue that carries: a `loom:operator`,
 `loom:operator-only` or other operator-hold label; `loom:curating` or
-`loom:building`; a `<!-- loom:permanent-block` marker (#8742); or a trusted
-legacy PR-less-retry / quarantine hold comment. It removes the label once the
-issue is no longer `loom:blocked` or no longer Undocumented.
+`loom:building`; a `<!-- loom:permanent-block` marker (#8742); a current
+daemon-hold body record (#10161); or, with no such record, a trusted legacy
+PR-less-retry / quarantine hold comment. It removes the label once the issue is
+no longer `loom:blocked` or no longer Undocumented.
+
+Park records are append-only, so only the **current** hold's record counts: a
+reason record whose `at=` is older than the latest `loom:blocked` application
+belongs to an earlier hold, and a bare re-block is queued again.
 
 ## Drain procedure
 
@@ -32,7 +37,7 @@ Then do **exactly one** of:
 | Finding | Action |
 |---|---|
 | **An open blocker exists** (issue or PR, often named only in a comment) | `loom-daemon park-record apply <n> --blocked-by <ref> --by curator`. A cross-repo blocker goes in `--reason` until `OWNER/REPO#N` refs are supported. Outcome `named`. |
-| **A real hold with no numbered blocker** (human step, ruling, external event) | `loom-daemon park-record apply <n> --reason "<why>" --by curator`. The stated reason makes the issue `HeldWithReason`, so the tick never re-queues it. A genuine human ask is routed per the operator-label rules in `label-state-machine.md` instead of parked. Outcome `kept`. |
+| **A real hold with no numbered blocker** (human step, ruling, external event) | `loom-daemon park-record apply <n> --reason "<why>" --by curator`. The stated reason makes the issue `HeldWithReason`, so the tick does not re-queue it while that hold stands. A genuine human ask is routed per the operator-label rules in `label-state-machine.md` instead of parked. Outcome `kept`. |
 | **Nothing blocks it** | Remove `loom:blocked` and post an evidence comment (what you checked, and what is closed). **Never add `loom:issue`.** If label history shows `loom:issue` was applied before the block, say so and add `loom:curated` so Champion's normal promotion lane can re-approve it. Outcome `released`. |
 
 In every case remove `loom:blocked-unnamed` and post **one** comment carrying

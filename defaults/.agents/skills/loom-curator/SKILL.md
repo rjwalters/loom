@@ -1785,8 +1785,8 @@ with `loom:operator-only`. Read body, escalation comment, and bounce comment, th
   Same for a prose `loom:operator-decision` issue you touch, if faithful.
 - **No real operator call**: remove the label, comment why, and re-route per
   `label-state-machine.md` (normal flow, `loom:operator-objective`, or inbox mail).
-- **No-loop guard**: a decision-bounce comment newer than your repair marker means
-  the repair bounced. Comment once and leave it alone.
+- **No-loop guard**: a decision-bounce newer than your repair marker means the
+  repair bounced. Comment once and leave it.
 
 ## Revising `loom:needs-revision` (#10753)
 
@@ -1815,10 +1815,9 @@ never edit. Bounds: `.loom/docs/promotion-throughput.md`.
 
 ## Draining `loom:blocked-unnamed` (#10558)
 
-The daemon tick labels an open `loom:blocked` issue naming no blocker and stating
-no reason `loom:blocked-unnamed`; nothing else re-examines it. Query
-`gh issue list --label loom:blocked-unnamed` oldest first, at most **3 per pass**.
-Procedure and the three outcomes (named, kept, released):
+The daemon labels `loom:blocked-unnamed` a `loom:blocked` issue naming no blocker
+or reason. Query `gh issue list --label loom:blocked-unnamed` oldest first, at
+most **3 per pass**; procedure and outcomes (named, kept, released):
 `.loom/docs/unnamed-block-review.md`. Never add `loom:issue`.
 
 ## Checking Operator-Only Premises (#6849)

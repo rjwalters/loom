@@ -406,13 +406,12 @@ fn read_text(
         .collect();
     // The park record is read from the BODY only (#8925).
     p.declared = crate::park_record::blockers(&p.body);
-    p.held = crate::park_record::parse(&p.body)
-        .into_iter()
-        .find(|r| r.blocker.is_none() && r.reason.as_deref().is_some_and(|x| !x.trim().is_empty()))
-        .map(|r| super::Held {
-            by: r.by,
-            reason: r.reason.unwrap_or_default().trim().to_string(),
-        });
+    // Records are append-only: the newest reason-only one, not the first (#10558).
+    p.held = super::hold::latest_reasoned(&p.body).map(|r| super::Held {
+        by: r.by,
+        reason: r.reason.unwrap_or_default().trim().to_string(),
+        at: r.at,
+    });
     if kind == Artifact::Issue {
         p.named = named::parse_entries(&p.body);
         p.unparsed_unchecked = super::unchecked_lines(&p.body)

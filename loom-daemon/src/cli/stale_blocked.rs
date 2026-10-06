@@ -624,6 +624,7 @@ mod tests {
             superseded: &[],
             unticked: &f,
             undocumented: &[],
+            held: &[],
             prose_only: &[],
             unevaluated: &uneval,
             enumerate_error: None,

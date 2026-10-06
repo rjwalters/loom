@@ -556,7 +556,26 @@ fn held(by: &str, reason: &str) -> Option<Held> {
     Some(Held {
         by: Some(by.to_string()),
         reason: reason.to_string(),
+        at: None,
     })
+}
+
+/// #9274 x #10558: an all-unparseable unticked checklist is a cited (if
+/// unreadable) dependency, so it stays `Unticked` even beside a reason record.
+#[test]
+fn an_unparseable_checklist_beside_a_reason_record_stays_unticked() {
+    let e = Evidence {
+        held: held("curator", "waiting"),
+        unparsed_unchecked: 1,
+        ..Evidence::default()
+    };
+    assert_eq!(
+        classify(&e),
+        Verdict::Unticked {
+            resolved_refs: vec![],
+            unparsed: 1
+        }
+    );
 }
 
 #[test]

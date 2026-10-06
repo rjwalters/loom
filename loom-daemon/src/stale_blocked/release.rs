@@ -60,6 +60,7 @@ use crate::forge_identity::FleetLogins;
 use crate::forge_listing::RestIssue;
 use crate::park_record::apply::{ParkForge, BLOCKED_LABEL};
 use crate::park_record::{blockers, drop_blockers, has_qualified_ref, parse, BlockerRef};
+use crate::sweep_registry::park_hold::is_daemon_hold;
 use crate::sweep_registry::{PRLESS_HOLD_COMMENT_MARKER, QUARANTINE_COMMENT_MARKER};
 
 /// The release audit comment's idempotency marker prefix:
@@ -111,6 +112,13 @@ pub trait ReleaseForge {
     /// The read failed.
     fn labeled_events(&mut self, number: u64) -> Result<Vec<String>, String>;
 
+    /// `created_at` of the newest `labeled` event for `label`, if any
+    /// (#10558: which park record documents the current hold).
+    ///
+    /// # Errors
+    /// The read failed.
+    fn last_labeled_at(&mut self, number: u64, label: &str) -> Result<Option<String>, String>;
+
     /// Post one comment.
     ///
     /// # Errors
@@ -148,7 +156,8 @@ pub enum Skip {
     OperatorHold,
     /// `<!-- loom:permanent-block` in the body or any comment (#8742).
     Permanent,
-    /// A fleet PR-less-retry hold or quarantine comment (#10161).
+    /// The newest body record is a daemon hold (#10161, `is_daemon_hold`), or,
+    /// for a hold written before #10161, its trusted comment.
     DaemonHold,
     /// The artifact changed between the plan and the write: its body differs
     /// from the one the plan and its evidence were read from, its park record
@@ -305,7 +314,13 @@ pub(super) fn has_operator_hold(labels: &[String]) -> bool {
 fn body_skip(body: &str, labels: &[String]) -> Option<Skip> {
     let records = parse(body);
     if records.iter().any(|r| r.blocker.is_none()) {
-        return Some(Skip::Unstated);
+        // #10161: a current daemon hold is counted as one, structurally.
+        let daemon = super::hold::latest(&records).is_some_and(is_daemon_hold);
+        return Some(if daemon {
+            Skip::DaemonHold
+        } else {
+            Skip::Unstated
+        });
     }
     if records.is_empty() {
         return Some(Skip::NoParkRecord);
@@ -727,6 +742,9 @@ fn execute(
         .filter(|c| policy.trusts_json(c))
         .map(body_of)
         .collect();
+    // Legacy daemon-hold comment: only reachable for a hold written before
+    // #10161, since `body_skip` (re-run on the fresh body above) already
+    // vetoes any body carrying a daemon record.
     if trusted
         .iter()
         .any(|b| b.contains(PRLESS_HOLD_COMMENT_MARKER) || b.contains(QUARANTINE_COMMENT_MARKER))
