@@ -34,7 +34,7 @@
 //!
 //! | field | filled by |
 //! |---|---|
-//! | `source_revision` | #10473 (adopted source revision / tag ancestry) |
+//! | `source_revision` | #10473 (adopted source revision / tag ancestry); filled when the required-mode source gate ran |
 //! | `policy_revision` | #10472 (recorded assurance policy) |
 //! | `approval_provenance` | #10472 (provider authority map) |
 //! | `root_domain_scope` | #10472 (provider authority map) |
@@ -49,6 +49,7 @@
 
 use super::fetch::{self, FetchInputs, FetchOutcome, SignaturePolicy};
 use super::signature::{SignatureState, VerifiedBy};
+use super::source::SourceReport;
 use crate::eta::Provenance;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -129,6 +130,8 @@ impl EvidenceOutcome {
 pub enum FieldStatus {
     /// The value is `null` because nothing in this build establishes it.
     NotAvailable,
+    /// The value was established by a check that ran (#10473).
+    Available,
 }
 
 /// Facts the verifier records as it goes; the record is built from these, never
@@ -139,6 +142,9 @@ pub struct EvidenceFacts {
     pub asset_sha256: Option<String>,
     pub signature_state: Option<SignatureState>,
     pub verified_by: Option<VerifiedBy>,
+    /// What the source-revision / tag-movement gate established (#10473);
+    /// `None` when it did not run (present-only mode, earlier failure).
+    pub source: Option<SourceReport>,
 }
 
 impl Default for EvidenceFacts {
@@ -148,6 +154,7 @@ impl Default for EvidenceFacts {
             asset_sha256: None,
             signature_state: None,
             verified_by: None,
+            source: None,
         }
     }
 }
@@ -178,12 +185,24 @@ pub struct SignatureEvidence {
     // ---- blocked on siblings: always null + not_available today ----
     pub source_revision: Option<String>,
     pub source_revision_status: FieldStatus,
+    // ---- source gate detail (#10473); null when the gate did not run ----
+    #[serde(default)]
+    pub source_anchor: Option<String>,
+    #[serde(default)]
+    pub source_check: Option<String>,
+    #[serde(default)]
+    pub adoption_record: Option<String>,
     pub policy_revision: Option<String>,
     pub policy_revision_status: FieldStatus,
     pub approval_provenance: Option<String>,
     pub approval_provenance_status: FieldStatus,
     pub root_domain_scope: Option<String>,
     pub root_domain_scope_status: FieldStatus,
+}
+
+/// A full 40-hex commit SHA.
+fn is_commit_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// `Some(s)` only for text safe to publish: non-empty, bounded, no control
@@ -313,6 +332,11 @@ impl SignatureEvidence {
             ),
             None => (None, None, None, None, false),
         };
+        let source_commit = facts
+            .source
+            .as_ref()
+            .and_then(|r| r.source_commit.clone())
+            .filter(|c| is_commit_sha(c));
         Self {
             schema_version: EVIDENCE_SCHEMA_VERSION,
             recorded_at,
@@ -334,8 +358,19 @@ impl SignatureEvidence {
             oidc_issuer: issuer.and_then(public_identity),
             configured_workflow: policy.approved_workflow.as_deref().and_then(public_text),
             configured_workflow_applied: applied,
-            source_revision: None,
-            source_revision_status: FieldStatus::NotAvailable,
+            source_revision: source_commit.clone(),
+            source_revision_status: if source_commit.is_some() {
+                FieldStatus::Available
+            } else {
+                FieldStatus::NotAvailable
+            },
+            source_anchor: facts
+                .source
+                .as_ref()
+                .and_then(|r| r.source_anchor.clone())
+                .filter(|a| is_commit_sha(a)),
+            source_check: facts.source.as_ref().map(|r| r.source_check.to_string()),
+            adoption_record: facts.source.as_ref().map(|r| r.adoption.to_string()),
             policy_revision: None,
             policy_revision_status: FieldStatus::NotAvailable,
             approval_provenance: None,
