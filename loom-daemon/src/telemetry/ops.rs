@@ -558,8 +558,8 @@ impl MetricName {
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
             }
-            Self::GithubRateLimitRemaining => "GitHub API requests left, by resource and account.",
-            Self::GithubRateLimitUsed => "GitHub API requests spent this window, by resource.",
+            Self::GithubRateLimitRemaining => "GitHub API requests left, per bucket.",
+            Self::GithubRateLimitUsed => "GitHub API requests spent this window, per bucket.",
             Self::GithubRateLimitReset => "GitHub rate-limit window reset, Unix epoch seconds.",
             Self::GithubRateLimitBreakerSkips => {
                 "Job passes skipped by the rate-limit breaker, by job."

@@ -57,6 +57,10 @@ const QUEUE_DWELL: &str = include_str!("../../defaults/observability/signoz/queu
 /// `tokens_metric_names`), which are not a `MetricName` variant.
 const QUOTA_UTILIZATION: &str =
     include_str!("../../defaults/observability/signoz/quota-utilization.sql");
+/// The GitHub shadow-spend reconciliation queries (#10343). Governed by the
+/// `github.ratelimit.used` / `loom.forge.calls` `MetricName`s and the
+/// `invoke github` span's attribute keys.
+const GITHUB_SHADOW: &str = include_str!("../../defaults/observability/signoz/github-shadow.sql");
 /// The queue-starvation alert rule (#8856): a saved SigNoz alert definition,
 /// not a `.sql` file, but its embedded `query` field is real ClickHouse SQL
 /// subject to the same drift.
@@ -273,6 +277,8 @@ fn saved_queries_only_reference_forwarded_attribute_and_resource_keys() {
         // see `queue_dwell_queries_match_the_ops_metric_vocabulary` below for
         // those.
         ("queue-dwell.sql", QUEUE_DWELL),
+        // Query 4 reads `invoke github` span attributes (#10343).
+        ("github-shadow.sql", GITHUB_SHADOW),
     ] {
         for container in ["attributes_string", "attributes_number", "attributes_bool"] {
             for key in referenced_attribute_keys(sql, container) {
@@ -1169,5 +1175,62 @@ fn queue_starvation_alert_matches_the_ops_metric_vocabulary() {
         QUEUE_STARVATION_ALERT.contains("= 'ready'"),
         "alerts/queue-starvation.json must filter state = 'ready', matching its \"Loom ready \
          queue starved\" name"
+    );
+}
+
+// ============================================================================
+// github-shadow.sql (#10343): the GitHub bucket reconciliation drift guard
+// ============================================================================
+
+#[test]
+fn github_shadow_queries_match_the_ratelimit_and_forge_calls_vocabulary() {
+    let datapoint_keys = &keep_keys_by_context()["datapoint"];
+    let expected: BTreeSet<String> = [
+        MetricName::GithubRateLimitUsed,
+        MetricName::GithubRateLimitReset,
+        MetricName::ForgeCalls,
+    ]
+    .iter()
+    .map(|name| name.as_str().to_owned())
+    .collect();
+    assert_eq!(
+        all_metric_name_literals(GITHUB_SHADOW),
+        expected,
+        "github-shadow.sql must read exactly github.ratelimit.{{used,reset}} and loom.forge.calls"
+    );
+
+    let labels = metric_label_keys(GITHUB_SHADOW);
+    for label in [
+        "account",
+        "owner",
+        "resource",
+        "cred_owner",
+        "outcome",
+        "op",
+    ] {
+        assert!(labels.contains(label), "github-shadow.sql no longer reads label '{label}'");
+    }
+    for label in &labels {
+        assert_ops_metric_label_is_forwarded("github-shadow.sql", label, datapoint_keys);
+    }
+
+    let span_keys = referenced_attribute_keys(GITHUB_SHADOW, "attributes_string");
+    for key in [
+        "github.account",
+        "github.cred_owner",
+        "github.resource",
+        "github.billing",
+        "github.http.requests",
+    ] {
+        assert!(span_keys.contains(key), "github-shadow.sql query 4 no longer reads {key}");
+    }
+    let span_name = SpanName::GithubInvoke.as_str();
+    assert!(
+        GITHUB_SHADOW.contains(&format!("name = '{span_name}'")),
+        "github-shadow.sql query 4 must filter the `{span_name}` span"
+    );
+    assert!(
+        SIGNOZ_README.contains("github-shadow.sql"),
+        "the SigNoz README no longer documents github-shadow.sql"
     );
 }
