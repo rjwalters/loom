@@ -274,6 +274,7 @@ only.
 | `little-v0` | `land` | **floor baseline, never promoted** (#10208): Little's law. For a PR in `review_wait` / `doctor` / `merge_wait`, `items_ahead / drain_rate` for the current stage plus the recency-weighted mean duration of each later stage; interval from a Gamma posterior on the rate (shape = observed exits, 400 seeded draws). Refuses with a zero drain rate and items ahead, or with no queue context; a held PR (`merge_hold`) is refused `blocked`, as by every heuristic that does not model the hold | after `merge_wait` |
 | `land-2026-10-04-twin-otter` | `land` | no history: the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)). PR stages only (`review_wait`, `doctor`, `merge_wait`, `merge_hold`); the blend of a stage-by-stage exit-hazard Monte Carlo (256 paths, seeded per stage visit) and a log-normal direct model (recorded as `twin_otter`; #10222, #10243) | at the merge |
 | `land-2026-10-04-twin-otter-b` | `land` | the pre-PR/PR composition of twin-otter (#10244): `ready_wait`, `sweep.curator` and `sweep.builder` are answered with `land-v2`'s path rules (same refusals, so its answer rate there equals `land-v2`'s; `combination.method` is `land_v2_path_prefix`); `review_wait`, `doctor`, `merge_wait` and `merge_hold` are `land-2026-10-04-twin-otter`'s own answer, unchanged | at the merge |
+| `land-2026-10-06-tandem-wren` | `land` | `land-2026-10-04-twin-otter-b` composed over the dependency graph (#10510, [Dependency-aware ETAs](#dependency-aware-etas-10510)): a blocked or parked item starts after its parents land, a stacked or sequenced PR merges after its parent. An item with no parent that applies at `as_of` gets twin-otter-b's own explanation, bit for bit (re-identified) | at the merge |
 
 ### Retired heuristics
 
@@ -621,7 +622,8 @@ past 13 also needs the alternates cap raised on both sides (loom-ui's
 **Wrappers are explicit compositions.** A calibration, conformal or
 dependency wrapper over a base is registered as its own id
 (`land-2026-10-06-calm-plover` is calibration over `land-v2`;
-`land-2026-10-06-quick-tern` is IPCW calibration over
+`land-2026-10-06-quick-tern` is IPCW calibration over, and
+`land-2026-10-06-tandem-wren` the dependency wrapper over,
 `land-2026-10-04-twin-otter-b`). It is never
 an automatic cross product of wrappers × bases, so each one spends budget
 deliberately.
@@ -1115,6 +1117,116 @@ at `now - 120 s`, #10500) both call the one builder `loop_features`:
   datestamped shadow heuristic adopts them under its own schema version once
   the loom-experiments walk-forward backtest passes (#10521).
 
+### Dependency-aware ETAs (#10510)
+
+A blocked item used to get no estimate (`blocked`, `no_dispatch_plan`), and
+a stacked or sequenced PR got one that ignored its parent.
+`eta::dependency` is a composition layer over **any** base `land`
+heuristic that reports p25/p50/p75/p90. It ships as the shadow
+`land-2026-10-06-tandem-wren`, over `land-2026-10-04-twin-otter-b`.
+
+**Edge sources.** Each edge names a child, a parent and a `known_at`:
+
+| source (`sources[]`) | kind | meaning |
+|---|---|---|
+| `park_record` | start | `<!-- loom:park Blocked by: #N -->` on a parked item (same repo) |
+| `native_dependency` | start | a forge-native "blocked by" issue dependency (any repo) |
+| `sub_issue` | start | a sub-issue of an epic |
+| `epic_phase` | start | `loom:epic-phase` order: phase k+1 after phase k |
+| `stacked_pr` | merge | a PR based on another PR's head branch |
+| `sequence` | merge | a merge-sequencing marker, `<!-- loom:sequence after=N -->` (#9686); soft or hard, it bounds only the merge |
+
+A **start** edge means the child cannot start before the parent lands. It
+applies only to an item that has not started (refused `blocked` or
+`no_dispatch_plan`, or in `ready_wait`), and is dropped once the item has
+started. A **merge** edge means the child cannot merge before the parent
+merges. It applies at every stage, but never answers an item the base
+refuses.
+
+**Point in time.** An edge is used only when its `known_at` is strictly
+before `as_of`, so a replay never sees an edge filed after its own instant
+and leaves no trace of it. The live `known_at` is the instant the daemon
+first read the edge. A parent counts as landed only when it closed before
+`as_of`.
+
+**Composition.** Each node draws one uniform per Monte Carlo draw (4000),
+from its own seed, derived from `(heuristic, as_of, node)`. A node's land
+draw is the base's four quantiles read as a quantile function. The function
+is linear between p25, p50, p75 and p90. Below p25 it follows the p25–p50
+slope, floored at zero. Above p90 it is the exponential tail matched to the
+p75–p90 rise. Per draw:
+
+```text
+land[s] = max( own[s],                            if the base answers the item
+               max over start parents of land_p[s] + path[s],
+               max over merge parents of land_p[s] )
+```
+
+`path` is the base's estimate of the item from dispatch (`sweep.curator`,
+age 0), drawn from the same uniform as `own`. This is the max of the item's
+own ready time and its parents' land times, plus the path. It is not the max
+of medians, since E[max] is larger than the max of the medians. Because a
+node has one draw per sample, an ancestor shared by two parents (a diamond)
+contributes the same time to both: **common random numbers**, so it is not
+double counted. The DAG is resolved recursively, with each node estimated
+once per estimate. The result is the nearest-rank p25/p50/p75/p90 of the
+totals.
+
+**Refusals carry the reason upward.** These apply in order:
+- An item the base refuses for a reason a start edge does not explain keeps
+  its own reason.
+- An item on a cycle is refused `dependency_cycle`.
+- An item whose parent is not in the graph is refused
+  `blocked_by_unknown`.
+- An item whose parent has no estimate is refused `blocked_by`, and
+  `dependencies.blocked_by` names the parent and its reason, nested along the
+  chain: `blocked_by:owner/repo#2 (blocked_by:owner/repo#1 (blocked))`. The
+  dashboard can say "waiting on #2, which waits on #1, held".
+- A closure past 64 nodes is refused `blocked_by` (`graph_too_large`).
+
+**Explanation.** A composed or refused estimate carries `dependencies`.
+Absent means the item had no parent that applies, and then the explanation
+is the base's own.
+- `parents[]`: each parent with `edge`, `sources`, `known_at` and `status`
+  (`estimated` / `landed` / `refused` / `unknown`). Also its own `reason`,
+  `p50_sec`, `p90_sec` and `binding_share` (the share of draws in which it set
+  the max).
+- `binding_parent` / `binding_share`: the parent that most often set the max,
+  absent when the item's own path did more often. This is what "why this
+  ETA?" reports as what the item is waiting on. A landed parent never binds.
+- `nodes[]`: every node read, subject first, each with its seed and its
+  `own_sec` / `path_sec` quantiles and parents. `simulate::run_explanation`
+  recomputes the result from these alone. `enforce_cap` drops them
+  (`truncated: ["dependencies.nodes"]`) before the stage grids.
+
+`combination.method` is `dependency_max_over_parents_crn`. `result.stage_marks`
+is empty, because the base's marks describe its own path, not the composed
+one.
+
+**Where the edges come from (live).** Only the ETA authority (#10498) runs
+the pass, so it is the one host that reads edges. Before each pass's `as_of`
+it makes at most 8 `(item, source)` reads, never-read and oldest first, each
+at most every 15 minutes (`observability::eta_dependency`):
+- A **parked** tracked item (unstarted, refused `blocked` or
+  `no_dispatch_plan`, no PR): `issues/{n}` for its park records, and
+  `issues/{n}/dependencies/blocked_by` for the native ones with their state.
+  It also reads `issues/{N}` once for each park-record parent the tracker
+  does not hold open, to learn whether and when it closed.
+- A tracked PR under **`loom:sequenced`**: its trusted comment bodies for the
+  newest live sequence marker. The predecessor PR maps to the tracked issue
+  it closes, and one the tracker does not hold is skipped.
+
+A failed read keeps the edges already observed. `sub_issue`, `epic_phase`
+and `stacked_pr` are understood by the composition, but the live pass does
+not read them yet. A parent's node is its tracked `land` input (the modeled
+view for a base that models the hold, #10284). An open parent the tracker
+does not track is unknown.
+
+**Acceptance still pending (post-merge).** The loom-experiments walk-forward
+backtest must show, on items with at least one dependency, a pinball and
+answer-rate win over twin-otter-b with point-in-time edges, and no change on
+dependency-free items. The loom-ui ETA chooser entry is loom-ui#2031.
+
 ## The explanation (`eta-explanation/v1`)
 
 The heuristic builds the explanation first and computes the numbers from it,
@@ -1562,6 +1674,9 @@ ORDER BY share;
 | `unknown_stage` | no stage label, or contradictory ones |
 | `stale_inputs` | a ready item whose dispatch plan is older than 15 minutes (or three ticks) |
 | `no_model` | a fitted heuristic (`land-2026-10-04-twin-otter`) has no usable coefficient file: none loaded (always, in the CLI), no direct model, a cutoff at or after `as_of`, or malformed coefficients |
+| `dependency_cycle` | a dependency composition (`land-2026-10-06-tandem-wren`): the item is on a dependency cycle (#10510) |
+| `blocked_by_unknown` | a dependency composition: a parent is not in the graph; `dependencies.blocked_by` names it |
+| `blocked_by` | a dependency composition: a parent has no estimate; `dependencies.blocked_by` names it and its reason, e.g. `blocked_by:owner/repo#N (blocked)` |
 
 A refusal is emitted as an `eta.estimate` with no `result`, when its reason
 first appears.

@@ -748,6 +748,7 @@ fn build_input(
         stalls: Vec::new(),
         held: None,
         queue: Vec::new(),
+        dependencies: None,
     }
 }
 

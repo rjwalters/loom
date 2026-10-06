@@ -107,6 +107,7 @@ pub mod cycle_guard;
 pub mod daemon_event;
 pub mod endpoint_policy;
 pub mod eta;
+mod eta_dependency;
 pub mod eta_fit;
 pub mod eta_fleet_refresh;
 mod eta_friction;

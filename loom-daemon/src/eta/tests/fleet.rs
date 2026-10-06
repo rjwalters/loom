@@ -89,6 +89,7 @@ pub(super) fn input() -> EstimateInput {
         stalls: Vec::new(),
         held: None,
         queue: Vec::new(),
+        dependencies: None,
     }
 }
 
@@ -644,6 +645,12 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
         include_str!("../heuristics/land_twin_otter_b.rs"),
     ),
     ("heuristics/land_v4.rs", include_str!("../heuristics/land_v4.rs")),
+    // #10510: the dependency wrapper and the composition it calls.
+    (
+        "heuristics/land_dependency.rs",
+        include_str!("../heuristics/land_dependency.rs"),
+    ),
+    ("dependency.rs", include_str!("../dependency.rs")),
     // #10259: the stall detector the heuristics call.
     ("stall.rs", include_str!("../stall.rs")),
     // #10208: the zero-parameter queue floor and the queue context it reads.

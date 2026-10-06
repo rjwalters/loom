@@ -456,6 +456,8 @@ fn case_input(case: &ReplayCase, loom: &Provenance) -> EstimateInput {
         stalls: Vec::new(),
         held: None,
         queue: case.queue.clone(),
+        // No point-in-time dependency graph is reconstructed here (#10510).
+        dependencies: None,
     }
 }
 

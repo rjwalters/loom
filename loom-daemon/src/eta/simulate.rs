@@ -599,6 +599,14 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
 /// (`land-2026-10-06-quick-tern`, #10524) then applies its recorded shift
 /// like any other.
 pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)> {
+    // A dependency composition (#10510) recomputes from its node records.
+    if let Some(record) = explanation
+        .dependencies
+        .as_ref()
+        .filter(|d| !d.nodes.is_empty())
+    {
+        return super::dependency::recompute(record);
+    }
     let simulated = match &explanation.twin_otter {
         Some(record) => super::heuristics::recompute_twin_otter(explanation, record)?,
         None => {

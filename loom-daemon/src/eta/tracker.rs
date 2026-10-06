@@ -307,6 +307,9 @@ pub struct Tracker {
     answers: Vec<answers::PassAnswers>,
     /// What passes observed of PR-to-issue links and issue stars (#10372).
     star: star_book::StarBook,
+    /// Dependency edges and parent landings (#10510), filled by the
+    /// caller's forge reads, never by the tracker (`tracker_dependency.rs`).
+    pub dependencies: super::dependency::DependencyBook,
 }
 
 /// What [`Tracker::drain_dropped`] reports.
@@ -346,6 +349,7 @@ impl Tracker {
             friction: super::friction::FrictionBook::default(),
             answers: Vec::new(),
             star: star_book::StarBook::default(),
+            dependencies: super::dependency::DependencyBook::default(),
         }
     }
 
@@ -1199,6 +1203,7 @@ impl Tracker {
             stalls,
             held,
             queue,
+            dependencies: None,
         })
     }
 
@@ -1235,6 +1240,8 @@ impl Tracker {
             None => self.items.keys().cloned().collect(),
         };
         let mut out = Vec::new();
+        // #10510: one graph per call, `None` unless an edge was observed.
+        let graph = self.dependency_graph(ctx, now);
         for key in targets {
             // #10500: the item as the model reads it, reconciled against the
             // label timeline (`tracker_timeline.rs`); the tracked item itself
@@ -1243,9 +1250,12 @@ impl Tracker {
                 continue;
             };
             for kind in [Kind::Start, Kind::Finish, Kind::Land] {
-                let Some(input) = self.input_for(&key, &item, kind, ctx, now) else {
+                let Some(mut input) = self.input_for(&key, &item, kind, ctx, now) else {
                     continue;
                 };
+                if kind == Kind::Land {
+                    input.dependencies.clone_from(&graph);
+                }
                 let configured = match kind {
                     Kind::Start => ctx.current_start,
                     Kind::Finish => ctx.current_finish,
@@ -1347,3 +1357,8 @@ pub fn merged(all: Vec<Effects>) -> Effects {
 
 #[path = "tracker_star.rs"]
 mod star_book;
+
+#[path = "tracker_dependency.rs"]
+mod dependency_graph;
+
+pub use dependency_graph::DependencyCandidate;

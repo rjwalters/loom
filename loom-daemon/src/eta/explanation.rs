@@ -31,6 +31,10 @@ pub const TRUNCATED_FEATURES: &str = "features";
 /// (#10243). Only ever written when the slice was there.
 pub const TRUNCATED_TWIN_OTTER_MODEL: &str = "twin_otter.model";
 
+/// `truncated[]` entry when a dependency composition's node records were
+/// dropped (#10510). Only ever written when they were there.
+pub const TRUNCATED_DEPENDENCY_NODES: &str = "dependencies.nodes";
+
 /// `truncated[]` entry when the stage grids were dropped.
 pub const TRUNCATED_GRIDS: &str = "stages.distribution.grid";
 
@@ -115,6 +119,12 @@ pub struct Explanation {
     /// every other heuristic, so their explanations are byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<QueueRecord>,
+    /// How a dependency composition (#10510) composed, or refused, the
+    /// estimate over the item's parents. Absent for every other heuristic
+    /// and for an item with no parent, so their explanations are
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependencies: Option<super::dependency::DependencyRecord>,
     /// The latent-regime residual adjustment applied to a stage (#10528).
     /// Absent when no adjustment applied (below the row floor, or the recent
     /// residuals are noise), so every such explanation is byte-identical to
@@ -980,6 +990,16 @@ impl Explanation {
             .is_some();
         if dropped_model {
             self.truncated.push(TRUNCATED_TWIN_OTTER_MODEL.to_string());
+            if self.size_bytes() <= MAX_BYTES {
+                return;
+            }
+        }
+        let dropped_nodes = self
+            .dependencies
+            .as_mut()
+            .is_some_and(|d| !std::mem::take(&mut d.nodes).is_empty());
+        if dropped_nodes {
+            self.truncated.push(TRUNCATED_DEPENDENCY_NODES.to_string());
             if self.size_bytes() <= MAX_BYTES {
                 return;
             }
