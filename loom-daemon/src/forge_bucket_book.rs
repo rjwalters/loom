@@ -34,8 +34,8 @@ use crate::forge_call_stats::RateLimitHeaders;
 
 mod probe;
 pub use probe::{
-    parse_probe, probe_all, probe_all_with, probe_invocation, probe_targets, ProbeTarget,
-    PROBE_OPERATION,
+    parse_probe, probe_all, probe_all_with, probe_invocation, probe_one, probe_one_with,
+    probe_targets, ProbeTarget, PROBE_ONE_INTERVAL_SECS, PROBE_OPERATION,
 };
 
 /// A reading older than this is not believed, whatever its reset says.
@@ -79,6 +79,19 @@ impl Resource {
             Self::Search => "search",
         }
     }
+
+    /// The bucket a call booked to `pool` spends: [`crate::forge_call_stats::
+    /// Pool::Other`] (an uncharged or unclassified call) is read as `core`,
+    /// the pool every REST call falls in.
+    #[must_use]
+    pub fn of_pool(pool: crate::forge_call_stats::Pool) -> Self {
+        use crate::forge_call_stats::Pool;
+        match pool {
+            Pool::Graphql => Self::Graphql,
+            Pool::Search => Self::Search,
+            Pool::Core | Pool::Other => Self::Core,
+        }
+    }
 }
 
 /// One billed bucket.
@@ -111,6 +124,9 @@ pub enum Source {
     Header,
     /// A `gh api rate_limit` probe.
     Probe,
+    /// A rate-limit refusal of a real call ([`mark_exhausted`], W4-A): the
+    /// bucket answered "no budget left" until its reset.
+    Refusal,
 }
 
 impl Source {
@@ -119,6 +135,7 @@ impl Source {
         match self {
             Self::Header => "header",
             Self::Probe => "probe",
+            Self::Refusal => "refusal",
         }
     }
 }
@@ -191,6 +208,79 @@ pub fn observe_at(key: BucketKey, headers: &RateLimitHeaders, source: Source, no
             source,
         },
     );
+}
+
+/// Book `key` as exhausted until `reset_epoch` (W4-A): a call it served was
+/// refused with a primary rate limit. `limit` is kept from the held reading
+/// when one exists, so the projection reads it as 100 % used.
+pub fn mark_exhausted(key: BucketKey, reset_epoch: i64) {
+    mark_exhausted_at(key, reset_epoch, chrono::Utc::now().timestamp());
+}
+
+/// [`mark_exhausted`] at an explicit instant.
+pub fn mark_exhausted_at(key: BucketKey, reset_epoch: i64, now: i64) {
+    if reset_epoch <= now {
+        return;
+    }
+    let limit = book().lock().ok().and_then(|b| {
+        b.get(&key)
+            .and_then(|r| r.limit.or_else(|| Some(r.used? + r.remaining?)))
+    });
+    insert(
+        key,
+        Reading {
+            limit,
+            remaining: Some(0),
+            used: limit,
+            reset_epoch,
+            observed_at: now,
+            source: Source::Refusal,
+        },
+    );
+}
+
+/// GitHub's primary rate-limit window, in seconds.
+const WINDOW_SECS: f64 = 3600.0;
+
+/// How long into the window a projection is withheld while the bucket is
+/// still mostly full: an early burst extrapolated over a few minutes would
+/// read as a projected exhaustion it is not.
+const PROJECTION_WARMUP_SECS: f64 = 600.0;
+
+/// `key`'s projected use at the window's end, as a percentage of its limit
+/// (W4-A): `used / max(elapsed_fraction, 1/6) × 100`, where
+/// `elapsed_fraction = 1 − (reset − now) / 3600`, and `used` is the fraction
+/// of the limit spent. `None` when the reading is unknown (no believed
+/// reading, or no limit to measure against), or when less than 10 minutes of
+/// the window have elapsed and more than half the limit remains.
+#[must_use]
+pub fn projected_used_pct(key: &BucketKey, now: i64) -> Option<f64> {
+    projected_pct_of(&reading(key, now)?, now)
+}
+
+/// The projection of one reading (see [`projected_used_pct`]).
+#[must_use]
+pub fn projected_pct_of(r: &Reading, now: i64) -> Option<f64> {
+    let limit = r
+        .limit
+        .or_else(|| Some(r.used? + r.remaining?))
+        .filter(|&l| l > 0)?;
+    let used = r
+        .used
+        .or_else(|| r.remaining.map(|rem| limit.saturating_sub(rem)))?;
+    let remaining = r.remaining.unwrap_or_else(|| limit.saturating_sub(used));
+    #[allow(clippy::cast_precision_loss)]
+    let (used_frac, remaining_frac, left) = (
+        used as f64 / limit as f64,
+        remaining as f64 / limit as f64,
+        (r.reset_epoch - now) as f64,
+    );
+    let elapsed_secs = (WINDOW_SECS - left).clamp(0.0, WINDOW_SECS);
+    if elapsed_secs < PROJECTION_WARMUP_SECS && remaining_frac > 0.5 {
+        return None;
+    }
+    let elapsed_fraction = elapsed_secs / WINDOW_SECS;
+    Some(used_frac / elapsed_fraction.max(1.0 / 6.0) * 100.0)
 }
 
 /// `key`'s reading, when one is believed at `now` ([`Reading::is_fresh`]).

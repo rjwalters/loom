@@ -64,7 +64,7 @@ impl Stub {
             Box::new(move |repo| {
                 (with_reader && repo == REPO).then(|| (reader.clone(), APP.to_string()))
             }),
-            Box::new(move |app, repo, failure, _until, _why| {
+            Box::new(move |app, repo, failure, _why| {
                 sink.lock()
                     .unwrap()
                     .push((app.to_string(), repo.to_string(), failure));
@@ -289,7 +289,7 @@ fn a_download_outside_the_readers_installation_falls_back_and_withdraws_for_the_
 }
 
 #[test]
-fn a_rate_limited_reader_download_falls_back_and_withdraws_the_app() {
+fn a_rate_limited_reader_download_falls_back_and_withdraws_the_reader() {
     let stub = Stub::new(RATE_LIMITED, OK);
     let (result, rows, withdrawn) = download(&stub, true);
     assert!(result.is_ok(), "{result:?}");
@@ -297,7 +297,11 @@ fn a_rate_limited_reader_download_falls_back_and_withdraws_the_app() {
     assert_eq!(roles(&rows), vec!["reader", "writer-fallback"]);
     assert_eq!(
         *withdrawn.lock().unwrap(),
-        vec![(APP.to_string(), REPO.to_string(), Failure::App)]
+        vec![(
+            APP.to_string(),
+            REPO.to_string(),
+            Failure::rate_limited(crate::forge_bucket_book::Resource::Core)
+        )]
     );
 }
 

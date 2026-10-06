@@ -360,6 +360,8 @@ pub struct RateLimitHeaders {
     pub reset_epoch: Option<i64>,
     /// The pool's size this window (`x-ratelimit-limit`).
     pub limit: Option<u64>,
+    /// `retry-after` seconds, sent with a secondary rate limit (W4-A).
+    pub retry_after_secs: Option<u64>,
 }
 
 impl RateLimitHeaders {
@@ -372,6 +374,7 @@ impl RateLimitHeaders {
             "x-ratelimit-used" => self.used = value.parse().ok(),
             "x-ratelimit-reset" => self.reset_epoch = value.parse().ok(),
             "x-ratelimit-limit" => self.limit = value.parse().ok(),
+            "retry-after" => self.retry_after_secs = value.parse().ok(),
             _ => {}
         }
     }
@@ -989,12 +992,26 @@ pub fn status_report(
         operations: window.as_ref().map(Aggregate::identity_rows),
         identity_roles: window.as_ref().map(Aggregate::role_rows),
         buckets: sink_dir().map(|d| buckets::status_rows(&d, now_ts)),
+        reader_withdrawals: reader_withdrawal_rows(now),
         host_window: window.map(|w| w.rows()),
         since_start,
         since,
         budget: budget.into_values().collect(),
         own_window,
     }
+}
+
+/// This process's live scoped reader withdrawals (W4-A), for `status`.
+fn reader_withdrawal_rows(now: DateTime<Utc>) -> Vec<crate::types::ReaderWithdrawalStatus> {
+    crate::forge_read_pool::live_scoped_withdrawals(now.into())
+        .into_iter()
+        .map(|(app, owner, scope, until)| crate::types::ReaderWithdrawalStatus {
+            account: crate::observability::ops::ratelimit::app_account_label(&app),
+            owner,
+            resource: scope.as_str().to_string(),
+            until: until.into(),
+        })
+        .collect()
 }
 
 /// The rate-limit pools this process last read at **zero remaining** and

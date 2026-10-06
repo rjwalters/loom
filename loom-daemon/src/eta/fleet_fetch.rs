@@ -27,7 +27,6 @@
 //! can spend the operator's credential; that is the point of this module.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -250,14 +249,62 @@ pub fn history(number: u32, pr: &ListedPr, events: Vec<PrEvent>, complete: bool)
 /// even when `gh`'s message is terse.
 #[must_use]
 pub fn classify(stderr: &str, http: Option<u16>, remaining: Option<u64>) -> ReadFailure {
-    if http == Some(403) && remaining == Some(0) {
-        return ReadFailure::RateLimited;
+    let headers = crate::forge_call_stats::RateLimitHeaders {
+        remaining,
+        ..Default::default()
+    };
+    ReadFailure::of(reader_failure(stderr, http, Some(&headers)))
+}
+
+impl ReadFailure {
+    /// The stop a credential [`crate::forge_identity::Failure`] (or none)
+    /// means for a reader-only read: a refused credential is reported as a
+    /// rate limit, as before W4-A.
+    #[must_use]
+    pub fn of(failure: Option<crate::forge_identity::Failure>) -> Self {
+        use crate::forge_identity::Failure;
+        match failure {
+            Some(Failure::RateLimited { .. } | Failure::Credential) => ReadFailure::RateLimited,
+            Some(Failure::Coverage) => ReadFailure::Coverage,
+            None => ReadFailure::Other,
+        }
     }
-    match crate::forge_identity::classify_failure(stderr, http) {
-        Some(crate::forge_identity::Failure::App) => ReadFailure::RateLimited,
-        Some(crate::forge_identity::Failure::Coverage) => ReadFailure::Coverage,
-        None => ReadFailure::Other,
+}
+
+/// What a failed reader-only read says about the reader, with the response's
+/// own rate-limit headers (W4-A): the refused pool and its reset ride on the
+/// failure, so the withdrawal covers only that `(owner, resource)` bucket,
+/// until it resets.
+#[must_use]
+pub fn reader_failure(
+    stderr: &str,
+    http: Option<u16>,
+    headers: Option<&crate::forge_call_stats::RateLimitHeaders>,
+) -> Option<crate::forge_identity::Failure> {
+    use crate::forge_bucket_book::Resource;
+    use crate::forge_identity::{epoch_time, Failure};
+    let reset = headers.and_then(|h| h.reset_epoch).and_then(epoch_time);
+    if http == Some(403) && headers.is_some_and(|h| h.remaining == Some(0)) {
+        let resource = headers
+            .and_then(|h| h.resource.as_deref())
+            .and_then(Resource::parse)
+            .unwrap_or(Resource::Core);
+        return Some(Failure::rate_limited(resource).with_reset(reset));
     }
+    let failure = crate::forge_identity::classify_failure(stderr, http, headers, Resource::Core);
+    // Legacy mode (`LOOM_READ_ROUTING=legacy`): before W4-A this site
+    // withdrew App-wide until the response's reset for a refused credential
+    // too, so a 401 keeps that reset rather than the flat default.
+    let failure = match failure {
+        Some(Failure::Credential)
+            if crate::forge_identity::RoutingMode::current()
+                == crate::forge_identity::RoutingMode::Legacy =>
+        {
+            Some(Failure::rate_limited(Resource::Core))
+        }
+        other => other,
+    };
+    failure.map(|f| f.with_reset(reset))
 }
 
 /// The production [`ForgeRead`]: `gh api --include` under the repo's reader,
@@ -328,6 +375,7 @@ impl ForgeRead for ReaderForge {
             }
         };
         let http = response.as_ref().map(|r| r.status);
+        let headers = response.as_ref().map(|r| r.ratelimit.clone());
         let remaining = response.as_ref().and_then(|r| r.ratelimit.remaining);
         let reset_epoch = response.as_ref().and_then(|r| r.ratelimit.reset_epoch);
         if let Some(r) = response.filter(|r| matches!(r.status, 200 | 304)) {
@@ -338,29 +386,11 @@ impl ForgeRead for ReaderForge {
                 remaining,
             };
         }
-        let failure = classify(&stderr, http, remaining);
-        let why = format!("{CALLER} {url}");
-        match failure {
-            ReadFailure::RateLimited => {
-                let until = reset_epoch
-                    .and_then(|s| u64::try_from(s).ok())
-                    .map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s));
-                crate::forge_identity::withdraw_after(
-                    &reader.app_id,
-                    &target.repo,
-                    crate::forge_identity::Failure::App,
-                    until,
-                    &why,
-                );
-            }
-            ReadFailure::Coverage => crate::forge_identity::withdraw_after(
-                &reader.app_id,
-                &target.repo,
-                crate::forge_identity::Failure::Coverage,
-                None,
-                &why,
-            ),
-            ReadFailure::Other => {}
+        let credential_failure = reader_failure(&stderr, http, headers.as_ref());
+        let failure = ReadFailure::of(credential_failure);
+        if let Some(f) = credential_failure {
+            let why = format!("{CALLER} {url}");
+            crate::forge_identity::withdraw_after(&reader.app_id, &target.repo, f, &why);
         }
         let http = http.map_or_else(|| "no HTTP response".to_string(), |s| format!("HTTP {s}"));
         Read::Failed {

@@ -76,6 +76,10 @@ pub enum SpanName {
     /// own/external attribution.
     #[serde(rename = "loom.ratelimit.trip")]
     RateLimitTrip,
+    /// One reader App withdrawal (W4-A): an instant span, its own root
+    /// trace, naming the App, owner, resource, end and reset source.
+    #[serde(rename = "forge.reader.withdrawn")]
+    ForgeReaderWithdrawn,
 }
 
 impl SpanName {
@@ -100,6 +104,7 @@ impl SpanName {
             Self::DispatchDisposition => "loom.dispatch.disposition",
             Self::GithubInvoke => "invoke github",
             Self::RateLimitTrip => "loom.ratelimit.trip",
+            Self::ForgeReaderWithdrawn => "forge.reader.withdrawn",
         }
     }
 }

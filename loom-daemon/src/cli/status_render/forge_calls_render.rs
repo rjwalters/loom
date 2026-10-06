@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use loom_daemon::health::format_window;
 use loom_daemon::types::{
     DaemonStatusReport, ForgeBucketStatus, ForgeBudgetReading, ForgeCallCounts,
+    ReaderWithdrawalStatus,
 };
 
 /// Every line of the section; empty for a pre-#9251 daemon (no field).
@@ -64,6 +65,26 @@ pub fn render_forge_calls_lines(report: &DaemonStatusReport, now: DateTime<Utc>)
         lines.push(format!("  budget: {}", readings.join(" · ")));
     }
     lines.extend(render_bucket_block(fc.buckets.as_deref().unwrap_or_default(), now));
+    lines.extend(render_withdrawals(&fc.reader_withdrawals, now));
+    lines
+}
+
+/// W4-A: each reader currently withdrawn from one `(owner, resource)`
+/// bucket — the rest of its owners and resources keep serving.
+fn render_withdrawals(rows: &[ReaderWithdrawalStatus], now: DateTime<Utc>) -> Vec<String> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["  reader withdrawals (scoped):".to_string()];
+    lines.extend(rows.iter().map(|w| {
+        format!(
+            "    {} {} {}: back in {}",
+            w.account,
+            w.owner,
+            w.resource,
+            ago((w.until - now).num_seconds())
+        )
+    }));
     lines
 }
 
@@ -204,6 +225,7 @@ mod tests {
             operations: None,
             identity_roles: None,
             buckets: None,
+            reader_withdrawals: Vec::new(),
         };
         let lines = render_forge_calls_lines(&report(Some(fc)), now);
         let text = lines.join("\n");
@@ -287,6 +309,27 @@ mod tests {
         let at = lines.iter().position(|l| l.contains("buckets (")).unwrap();
         assert!(lines[at + 1].contains("app-42 acme core: 120 · 0 · 0 · 900/5000, resets in 20m"));
         assert!(lines[at + 2].contains("app-7 acme core: 3 · 0 · 0 · -"), "{lines:?}");
+    }
+
+    #[test]
+    fn live_scoped_reader_withdrawals_are_listed() {
+        let now = Utc::now();
+        let fc = ForgeCallsStatus {
+            window_secs: 3600,
+            reader_withdrawals: vec![ReaderWithdrawalStatus {
+                account: "app-7".into(),
+                owner: "acme".into(),
+                resource: "core".into(),
+                until: now + chrono::Duration::minutes(12),
+            }],
+            ..Default::default()
+        };
+        let lines = render_forge_calls_lines(&report(Some(fc)), now);
+        let at = lines
+            .iter()
+            .position(|l| l.contains("reader withdrawals"))
+            .unwrap();
+        assert!(lines[at + 1].contains("app-7 acme core: back in 1"), "{lines:?}");
     }
 
     #[test]

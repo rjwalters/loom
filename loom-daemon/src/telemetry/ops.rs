@@ -118,6 +118,14 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "github.ratelimit.graphql.used",
     "github.ratelimit.graphql.own",
     "github.ratelimit.graphql.external",
+    // `forge.reader.withdrawn` spans (W4-A): which reader App left which
+    // (owner, resource) bucket, until when, and where that end came from.
+    "forge.reader.app",
+    "forge.reader.owner",
+    "forge.reader.resource",
+    "forge.reader.until",
+    "forge.reader.source",
+    "forge.reader.secondary",
 ];
 
 /// Longest label value kept, in bytes.

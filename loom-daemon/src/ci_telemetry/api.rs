@@ -302,10 +302,9 @@ fn ci_operation(path: &str) -> ForgeOp {
 /// writer. Production: [`crate::forge_identity::read_credential`].
 pub(crate) type ReaderLookup = dyn Fn(&str) -> Option<(PathBuf, String)> + Send + Sync;
 
-/// `(app id, owner/repo, failure, App-wide withdrawal end, why)`.
-/// Production: [`crate::forge_identity::withdraw_after`].
-pub(crate) type ReaderWithdraw =
-    dyn Fn(&str, &str, Failure, Option<std::time::SystemTime>, &str) + Send + Sync;
+/// `(app id, owner/repo, failure, why)`. A rate limit carries its own reset
+/// in the [`Failure`] (W4-A). Production: [`crate::forge_identity::withdraw_after`].
+pub(crate) type ReaderWithdraw = dyn Fn(&str, &str, Failure, &str) + Send + Sync;
 
 /// Production client: one `gh api --include` subprocess per request.
 pub struct GhCliApi {
@@ -338,6 +337,37 @@ impl GhCliApi {
             reader_for,
             withdraw,
         }
+    }
+}
+
+/// What a failed `ci_telemetry` read says about the reader that served it.
+/// A rate limit carries its response's reset and `Retry-After` (W4-A): a
+/// secondary limit withdraws every resource briefly, a primary one only the
+/// `core` pool, until its reset.
+pub(crate) fn api_failure(
+    r: &Result<ApiResponse, ApiError>,
+) -> Option<crate::forge_identity::Failure> {
+    use crate::forge_identity::Failure;
+    match r {
+        Err(ApiError::RateLimited {
+            retry_after_secs,
+            reset_epoch,
+            detail,
+        }) => {
+            let secondary = retry_after_secs.is_some()
+                || crate::rate_limit_breaker::evidence::is_secondary_limit(detail);
+            Some(Failure::RateLimited {
+                resource: crate::forge_bucket_book::Resource::Core,
+                reset: reset_epoch.and_then(crate::forge_identity::epoch_time),
+                secondary,
+                retry_after: retry_after_secs.map(Duration::from_secs),
+            })
+        }
+        Err(ApiError::Http { status: 401, .. }) => Some(Failure::Credential),
+        Err(ApiError::Http {
+            status: 403 | 404, ..
+        }) => Some(Failure::Coverage),
+        _ => None,
     }
 }
 
@@ -376,28 +406,13 @@ impl GhCliApi {
                 ))
             },
             Result::is_ok,
-            |r| match r {
-                Err(ApiError::RateLimited { .. } | ApiError::Http { status: 401, .. }) => {
-                    Some(Failure::App)
-                }
-                Err(ApiError::Http {
-                    status: 403 | 404, ..
-                }) => Some(Failure::Coverage),
-                _ => None,
-            },
-            |failure, failed| {
+            api_failure,
+            |failure, _| {
                 let (Some((_, app_id)), Some(nwo)) = (&reader, nwo.as_deref()) else {
                     return;
                 };
-                // A rate limit withdraws the reader until the reported reset.
-                let app_until = match (failure, failed) {
-                    (Failure::App, Err(ApiError::RateLimited { reset_epoch, .. })) => reset_epoch
-                        .and_then(|e| u64::try_from(e).ok())
-                        .map(|e| std::time::UNIX_EPOCH + std::time::Duration::from_secs(e)),
-                    _ => None,
-                };
                 let why = format!("ci_telemetry {path}");
-                (self.withdraw)(app_id, nwo, failure, app_until, &why);
+                (self.withdraw)(app_id, nwo, failure, &why);
             },
         );
         match attempt {
@@ -554,7 +569,7 @@ terminal escapes will be refused by gh rather than captured (upgrade gh to captu
     /// It runs under `repo`'s reader App first when one is usable (readers
     /// carry `actions: read`), through the same reader → writer retry as
     /// every other poller read: a rate limit or bad credential withdraws the
-    /// reader App-wide and retries on the writer; a 403/404 retries on the
+    /// reader from `repo`'s owner (W4-A scope) and retries on the writer; a 403/404 retries on the
     /// writer and withdraws the reader for `repo` only if the writer
     /// succeeds; anything else (a 5xx, a timeout) is not retried.
     ///
@@ -580,15 +595,19 @@ terminal escapes will be refused by gh rather than captured (upgrade gh to captu
             },
             |r| matches!(r, Ok(output) if output.status.success()),
             |r| match r {
+                // `gh run download` prints no headers: classify on stderr,
+                // booked against `core` (the pool a download spends).
                 Ok(output) if !output.status.success() => crate::forge_identity::classify_failure(
                     &String::from_utf8_lossy(&output.stderr),
                     None,
+                    None,
+                    crate::forge_bucket_book::Resource::Core,
                 ),
                 _ => None,
             },
             |failure, _| {
                 if let Some((_, app_id)) = &reader {
-                    (self.withdraw)(app_id, repo, failure, None, "ci_telemetry download");
+                    (self.withdraw)(app_id, repo, failure, "ci_telemetry download");
                 }
             },
         );

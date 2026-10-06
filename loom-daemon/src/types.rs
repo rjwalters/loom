@@ -2312,6 +2312,22 @@ pub struct ForgeCallsStatus {
     /// from an older daemon.
     #[serde(default)]
     pub buckets: Option<Vec<ForgeBucketStatus>>,
+    /// Reader Apps withdrawn from one `(owner, resource)` bucket right now
+    /// (W4-A), from this daemon's routing table. Empty when none are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reader_withdrawals: Vec<ReaderWithdrawalStatus>,
+}
+
+/// One live scoped reader withdrawal of [`ForgeCallsStatus`] (W4-A).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReaderWithdrawalStatus {
+    /// `app-<id>`.
+    pub account: String,
+    /// The owner, lowercased.
+    pub owner: String,
+    /// `core`, `graphql`, `search` or `all`.
+    pub resource: String,
+    pub until: DateTime<Utc>,
 }
 
 /// One billed GitHub rate-limit bucket of [`ForgeCallsStatus`] (W1):
