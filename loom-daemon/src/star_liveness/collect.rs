@@ -716,14 +716,18 @@ impl<'a> Evaluator<'a> {
             .filter(|r| !r.is_pull_request)
             .cloned()
             .collect();
-        if issues.is_empty() {
+        // Starred open PRs: never roots, but the pass stars the PR of a
+        // starred issue and takes back an inherited PR star (#10591).
+        let starred_prs: Vec<RestIssue> = starred
+            .iter()
+            .filter(|r| r.is_pull_request)
+            .cloned()
+            .collect();
+        if issues.is_empty() && !(self.propagate && !starred_prs.is_empty()) {
             return Ok(Vec::new());
         }
-        let mut prs: BTreeMap<u32, RestIssue> = starred
-            .into_iter()
-            .filter(|r| r.is_pull_request)
-            .map(|r| (r.number, r))
-            .collect();
+        let mut prs: BTreeMap<u32, RestIssue> =
+            starred_prs.iter().map(|r| (r.number, r.clone())).collect();
         for label in PR_LABELS {
             match self.forge.list_open(label) {
                 Ok(rows) => prs.extend(
@@ -747,7 +751,8 @@ impl<'a> Evaluator<'a> {
         }
         // An inherited star is walked as a child of its root, not as a root
         // of its own (#10012 §3).
-        let classified = self.classify(&issues);
+        let owned: Vec<RestIssue> = issues.iter().chain(&starred_prs).cloned().collect();
+        let classified = self.classify(&owned);
 
         let mut out: Vec<Evaluated> = issues
             .iter()
@@ -890,12 +895,26 @@ impl<'a> Evaluator<'a> {
             .collect();
         let materialized = edges::descendants(&roots, &structural, MAX_INHERIT_DEPTH);
         let mut unreached: BTreeMap<u32, Evaluated> = BTreeMap::new();
+        // (issue, root, starred_at) for each starred issue the pass reaches
+        // by a recorded link: its open PR inherits the star too.
+        let mut pr_targets: Vec<(u32, u32, Option<String>)> = Vec::new();
+        for r in &roots {
+            let carries = issues.iter().any(|i| {
+                i.number == r.number && i.labels.iter().any(|l| l == OPERATOR_PRIORITY_LABEL)
+            });
+            if carries {
+                pr_targets.push((r.number, r.number, r.starred_at.clone()));
+            }
+        }
         for mut e in found {
             let n = e.facts.issue.number;
             let Some(inh) = inherited.get(&n) else {
                 unreached.insert(n, e);
                 continue;
             };
+            if let Some(m) = materialized.get(&n) {
+                pr_targets.push((n, m.root, m.starred_at.clone()));
+            }
             if let Some(m) = materialized.get(&n).filter(|_| {
                 self.propagate
                     && !e
@@ -915,6 +934,24 @@ impl<'a> Evaluator<'a> {
             e.starred_at = inh.starred_at.clone().or(e.starred_at);
             super::landing::withhold_inherited_handoff(&e.facts, &mut e.landing, inh.via, inh.root);
             out.push(e);
+        }
+        if self.propagate {
+            let mut planned: BTreeSet<u32> = BTreeSet::new();
+            for (n, root, starred_at) in pr_targets {
+                let Some(pr) = self.prs_by_issue.get(&n) else {
+                    continue;
+                };
+                if pr.labels.iter().any(|l| l == OPERATOR_PRIORITY_LABEL)
+                    || !planned.insert(pr.number)
+                {
+                    continue;
+                }
+                self.plan.adds.push(materialize::Add {
+                    child: pr.number,
+                    root,
+                    starred_at,
+                });
+            }
         }
         self.plan.adds.sort_by_key(|a| a.child);
         // An inherited star nothing reaches: removed when its root lost its
@@ -938,6 +975,27 @@ impl<'a> Evaluator<'a> {
                 None => self.evaluate_one(i, None, None),
             };
             out.push(e);
+        }
+        // An inherited PR star whose root lost its star, whose linked issue
+        // is neither starred nor inherited (an issue this pass is taking the
+        // star off counts as neither), after a complete walk. A star the
+        // operator owns (or whose owner is unread) is never touched.
+        if walk_complete {
+            let removed: BTreeSet<u32> = self.plan.removes.iter().map(|r| r.child).collect();
+            for pr in &starred_prs {
+                let Some(&root) = classified.orphaned.get(&pr.number) else {
+                    continue;
+                };
+                let alive = linked_issues(pr).into_iter().any(|n| {
+                    inherited.contains_key(&n) || (listed.contains(&n) && !removed.contains(&n))
+                });
+                if !alive {
+                    self.plan.removes.push(materialize::Remove {
+                        child: pr.number,
+                        root,
+                    });
+                }
+            }
         }
         Ok(out)
     }

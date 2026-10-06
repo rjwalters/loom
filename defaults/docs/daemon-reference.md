@@ -2612,7 +2612,14 @@ breaker, and only repos passing `write_scope::gate_root` are visited. Links
 written on the child's side (`<!-- loom:parent #P -->`, `Part of #P`, epic
 phase markers, the `[Parent #P]` title prefix, native sub-issues) are not
 walked by the pass; `create-issue.sh --parent` stars such a child at creation.
-PRs are not starred by the pass yet (Builder copies the star at creation).
+The open PR linked to a starred or inherited-star issue (`Closes #N` / `Part of
+#N`) is starred the same way (marker naming the root; for a directly starred
+issue, that issue), and loses the star on the complete pass after its root is
+unstarred, unless its linked issue is still starred or inherited. Known gap
+(accepted): the creation-time copy (Builder, `create-pr.sh`) writes the label
+without an inherited marker, so that star reads as the operator's and is not
+auto-removed on unstar (it fails safe). Closing it needs a `loom-daemon`
+subcommand posting the marker, tracked in #10592.
 
 **What travels to children (#10012 §6).** One table in code
 (`star_liveness::propagation_rules`) says which labels go from a parent to

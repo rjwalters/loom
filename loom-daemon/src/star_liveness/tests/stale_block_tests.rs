@@ -317,7 +317,8 @@ fn building_priority_and_held_rows_are_never_touched() {
     b31.state = "closed".into();
     world.add(slug, b31);
     world.add(slug, pr(32, 30, &["loom:changes-requested"]));
-    let r = Host::new("host-a").pass(&world, &[repo_input(slug)], Vec::new(), t(10, 0));
+    let r =
+        Host::without_propagation("host-a").pass(&world, &[repo_input(slug)], Vec::new(), t(10, 0));
     for n in [10, 30] {
         let row = r.rows.iter().find(|row| row.issue == n).unwrap();
         assert_eq!((row.stage, row.ask.clone()), (LandingStage::StaleBlock, None), "#{n}");

@@ -367,6 +367,10 @@ pub struct Host {
     /// Every fleet-comms notice this host's passes produced (#9321), in order
     /// — the test-side stand-in for the event-bus publish `task::spawn` does.
     pub notices: Vec<crate::star_liveness::escalate::Notice>,
+    /// `propagate` for [`Host::pass`]. Tests about escalation and the
+    /// watchdog turn it off so a starred PR's label write (which moves the
+    /// PR's fingerprint and posts a marker) does not mix into what they count.
+    pub propagate: bool,
 }
 
 impl Host {
@@ -375,6 +379,15 @@ impl Host {
             id: id.to_string(),
             state: LivenessState::default(),
             notices: Vec::new(),
+            propagate: true,
+        }
+    }
+
+    /// A host whose passes do not propagate the star (see [`Host::propagate`]).
+    pub fn without_propagation(id: &str) -> Self {
+        Self {
+            propagate: false,
+            ..Self::new(id)
         }
     }
 
@@ -396,7 +409,11 @@ impl Host {
         intents: Vec<crate::star_liveness::intents::StarIntent>,
         now: DateTime<Utc>,
     ) -> StarLivenessReport {
-        self.pass_with(world, repos, intents, now, settings())
+        let settings = Settings {
+            propagate: self.propagate,
+            ..settings()
+        };
+        self.pass_with(world, repos, intents, now, settings)
     }
 
     pub fn pass_with(
