@@ -29,7 +29,7 @@
 
 use std::io::Write;
 
-use super::{blockers, parse, render_park};
+use super::{blockers, parse, render_park, BlockerRef};
 use crate::operator_decision::cli::{Forge as DecisionForge, GhForge, IssueState};
 
 /// The label this command exists to apply.
@@ -49,8 +49,9 @@ pub mod exit {
 pub trait ParkForge {
     /// The artifact's body and labels, read fresh.
     fn view(&mut self, number: u64) -> Result<IssueState, String>;
-    /// `open` / `closed` for an issue or PR number.
-    fn state(&mut self, number: u64) -> Result<String, String>;
+    /// `open` / `closed` for an issue or PR number, in `repo` (`None` = the
+    /// forge's own repo) — a cross-repo blocker is read in its own repo (#10443).
+    fn state(&mut self, repo: Option<&str>, number: u64) -> Result<String, String>;
     fn set_body(&mut self, number: u64, body: &str) -> Result<(), String>;
     fn add_labels(&mut self, number: u64, labels: &[String]) -> Result<(), String>;
     fn remove_label(&mut self, number: u64, label: &str) -> Result<(), String>;
@@ -60,8 +61,11 @@ impl ParkForge for GhForge {
     fn view(&mut self, number: u64) -> Result<IssueState, String> {
         DecisionForge::view(self, number)
     }
-    fn state(&mut self, number: u64) -> Result<String, String> {
-        self.issue_state(number)
+    fn state(&mut self, repo: Option<&str>, number: u64) -> Result<String, String> {
+        match repo {
+            Some(r) => self.issue_state_in(r, number),
+            None => self.issue_state(number),
+        }
     }
     fn set_body(&mut self, number: u64, body: &str) -> Result<(), String> {
         DecisionForge::set_body(self, number, body)
@@ -79,8 +83,11 @@ impl ParkForge for GhForge {
 pub struct ApplyRequest {
     /// The issue or PR being parked.
     pub number: u64,
+    /// `OWNER/REPO` of the artifact being parked, when known. Lets a qualified
+    /// blocker naming this same repo and number be recognised as a self-block.
+    pub repo: Option<String>,
     /// The declared blockers. Empty only with an explicit [`Self::reason`].
-    pub blocked_by: Vec<u64>,
+    pub blocked_by: Vec<BlockerRef>,
     /// Why — required when there is no blocker.
     pub reason: Option<String>,
     /// `by=` provenance.
@@ -104,7 +111,11 @@ pub fn precheck(req: &ApplyRequest) -> Option<String> {
                 .to_string(),
         );
     }
-    if req.blocked_by.contains(&req.number) {
+    if req
+        .blocked_by
+        .iter()
+        .any(|b| b.number == req.number && b.is_local(req.repo.as_deref()))
+    {
         return Some(format!("#{} cannot block itself", req.number));
     }
     None
@@ -118,7 +129,7 @@ pub fn precheck(req: &ApplyRequest) -> Option<String> {
 #[must_use]
 pub fn compose_body(
     body: &str,
-    blocked_by: &[u64],
+    blocked_by: &[BlockerRef],
     by: Option<&str>,
     at: &str,
     reason: Option<&str>,
@@ -130,10 +141,10 @@ pub fn compose_body(
         render_park(&[], by, Some(at), reason)
     } else {
         let declared = blockers(body);
-        let missing: Vec<u64> = blocked_by
+        let missing: Vec<BlockerRef> = blocked_by
             .iter()
-            .copied()
-            .filter(|n| !declared.contains(n))
+            .filter(|b| !declared.contains(b))
+            .cloned()
             .collect();
         if missing.is_empty() {
             return None;
@@ -173,11 +184,11 @@ pub fn apply(
 
     let mut closed = Vec::new();
     for b in &req.blocked_by {
-        match forge.state(*b) {
+        match forge.state(b.repo.as_deref(), b.number) {
             Ok(s) if s.eq_ignore_ascii_case("open") => {}
-            Ok(_) => closed.push(format!("#{b}")),
+            Ok(_) => closed.push(b.to_string()),
             Err(e) => {
-                let _ = writeln!(err, "park-record apply: could not read blocker #{b}: {e}");
+                let _ = writeln!(err, "park-record apply: could not read blocker {b}: {e}");
                 return exit::FORGE;
             }
         }

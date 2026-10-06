@@ -307,12 +307,22 @@ impl GhForge {
     /// `open` / `closed` for issue (or PR) `n`, over REST — `park-record
     /// apply`'s closed-blocker refusal (#10152).
     pub fn issue_state(&self, n: u64) -> Result<String, String> {
+        self.read_state(self.repo.as_deref(), &self.issue_path(n))
+    }
+
+    /// Like [`Self::issue_state`], for an issue/PR in another repository
+    /// (`OWNER/REPO`) — a cross-repo park blocker is read in its own repo
+    /// (#10443).
+    pub fn issue_state_in(&self, repo: &str, n: u64) -> Result<String, String> {
+        self.read_state(Some(repo), &format!("repos/{repo}/issues/{n}"))
+    }
+
+    fn read_state(&self, repo: Option<&str>, path: &str) -> Result<String, String> {
         #[derive(serde::Deserialize)]
         struct Raw {
             state: String,
         }
-        let path = self.issue_path(n);
-        let r = self.gh(AccessIntent::Read, &["api", &path]);
+        let r = self.gh_for(repo, AccessIntent::Read, &["api", path]);
         let Some(o) = r.ok_output() else {
             return Err(r.failure_reason(&format!("gh api {path}")));
         };
@@ -321,9 +331,11 @@ impl GhForge {
     }
 
     fn gh(&self, intent: AccessIntent, args: &[&str]) -> CmdOutcome {
-        let target = self
-            .repo
-            .as_deref()
+        self.gh_for(self.repo.as_deref(), intent, args)
+    }
+
+    fn gh_for(&self, repo: Option<&str>, intent: AccessIntent, args: &[&str]) -> CmdOutcome {
+        let target = repo
             .and_then(|r| GhTarget::repo(r).ok())
             .unwrap_or(GhTarget::None);
         GhInvocation::new(Operation::new("api.rest"), intent, target, GH_TIMEOUT)

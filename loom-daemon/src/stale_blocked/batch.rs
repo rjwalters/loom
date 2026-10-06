@@ -50,7 +50,7 @@ use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
 use super::budget::{self, Budget, Floor, ForgeCost, Guard, Meter};
-use super::{classify, park_self_block, Artifact, Evidence, Verdict};
+use super::{classify, park_self_block, Artifact, Evidence, RemoteRef, Verdict};
 use crate::dep_recheck::{extract, named, premise, recheck};
 use crate::forge_call_stats::{ops, ForgeOp};
 use crate::forge_etag_store as store;
@@ -175,7 +175,7 @@ struct Pending {
     body: String,
     prose: Vec<i64>,
     named: Vec<named::Dep>,
-    declared: Vec<u64>,
+    declared: Vec<crate::park_record::BlockerRef>,
     closing: Vec<ClosingRef>,
     failed: Option<String>,
 }
@@ -325,7 +325,13 @@ fn read_text(
         }
     };
     let input = extract::Input { body, comments };
-    p.prose = extract::extract_with(&input, fleet)
+    // A qualified park-record blocker is read in its own repo via `declared`,
+    // never as a local `#N` (#10443).
+    let masked = extract::Input {
+        body: crate::park_record::mask_qualified(&input.body),
+        comments: input.comments.clone(),
+    };
+    p.prose = extract::extract_with(&masked, fleet)
         .split_whitespace()
         .filter_map(|t| t.parse().ok())
         .collect();
@@ -405,6 +411,12 @@ fn read_states(
     for p in pending.iter().filter(|p| p.failed.is_none()) {
         keys.extend(p.prose.iter().map(|n| (None, *n)));
         keys.extend(
+            p.declared
+                .iter()
+                .filter_map(|b| Some((b.repo.clone()?, i64::try_from(b.number).ok()?)))
+                .map(|(r, n)| (Some(r), n)),
+        );
+        keys.extend(
             p.named
                 .iter()
                 .filter(|d| !d.checked)
@@ -472,6 +484,19 @@ fn evidence_for(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let remote =
+        p.declared
+            .iter()
+            .filter_map(|b| Some((b.repo.clone()?, i64::try_from(b.number).ok()?)))
+            .map(|(repo, number)| {
+                lookup((Some(repo.clone()), number), format!("cross-repo blocker {repo}#{number}"))
+                    .map(|s| RemoteRef {
+                        repo,
+                        number,
+                        state: s.state,
+                    })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
     let named = p
         .named
         .iter()
@@ -515,6 +540,7 @@ fn evidence_for(
         prose,
         closing,
         declared: p.declared.clone(),
+        remote,
         self_block: None,
     };
     if p.kind == Artifact::Pr && matches!(classify(&evidence), Verdict::Stale(_)) {
