@@ -644,7 +644,8 @@ fn container_args_ignores_the_no_policy_launcher_opt_out() {
     let sb = Sandbox::new();
     let run = |envs: &[(&str, &std::ffi::OsStr)]| {
         let mut c = sb.cmd(&["container-args"]);
-        c.env("LOOM_GH_NO_POLICY_LAUNCHER", "1").env("GH_TOKEN", "ghp_must_not_leak");
+        c.env("LOOM_GH_NO_POLICY_LAUNCHER", "1")
+            .env("GH_TOKEN", "ghp_must_not_leak");
         for (k, v) in envs {
             c.env(k, v);
         }
@@ -697,7 +698,8 @@ fn spawn_worker_ignores_the_no_policy_launcher_opt_out() {
             .current_dir(sb.path())
             .env_clear()
             .env("PATH", sb.path_env())
-            .env("HOME", sb.path().join("home"))
+            // No hosts.yml token: `required` publishes none (#9986).
+            .env("HOME", sb.path().join("home-required"))
             .env("LOOM_WORKSPACE", sb.path())
             .env("LOOM_RUNTIME", "claude")
             .env("LOOM_GH_NO_POLICY_LAUNCHER", "1");
