@@ -97,11 +97,86 @@ pub const RENDERED_PHRASE: &str = "Blocked by:";
 /// extracts a reference from it, which is correct — there is none.
 pub const UNSTATED: &str = "(unstated)";
 
+/// A declared blocker: an issue/PR number, optionally qualified with the
+/// repository it lives in (#10443).
+///
+/// `repo: None` means the repo the record was written in. A *qualified*
+/// reference is never resolved against the local repo: `2AMLogic/2am#1088` and
+/// local `#1088` are different artifacts. Accepted shapes: `N`, `#N`,
+/// `OWNER/REPO#N`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BlockerRef {
+    /// `OWNER/REPO`, or `None` for the local repo.
+    pub repo: Option<String>,
+    pub number: u64,
+}
+
+impl BlockerRef {
+    /// A local-repo reference.
+    #[must_use]
+    pub fn local(number: u64) -> Self {
+        Self { repo: None, number }
+    }
+
+    /// Whether this names `number` in the local repo, given the local repo's
+    /// slug if known. A qualified ref matches only when its repo equals
+    /// `current_repo` (case-insensitively).
+    #[must_use]
+    pub fn is_local(&self, current_repo: Option<&str>) -> bool {
+        match (&self.repo, current_repo) {
+            (None, _) => true,
+            (Some(r), Some(cur)) => r.eq_ignore_ascii_case(cur),
+            (Some(_), None) => false,
+        }
+    }
+}
+
+impl std::fmt::Display for BlockerRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.repo {
+            Some(r) => write!(f, "{r}#{}", self.number),
+            None => write!(f, "#{}", self.number),
+        }
+    }
+}
+
+impl std::str::FromStr for BlockerRef {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let t = s.trim();
+        let bad = || format!("invalid blocker `{s}`: expected N, #N, or OWNER/REPO#N");
+        let (repo, num) = match t.split_once('#') {
+            Some((r, n)) => (r, n),
+            None => ("", t),
+        };
+        let number: u64 = num.parse().map_err(|_| bad())?;
+        if repo.is_empty() {
+            return Ok(Self::local(number));
+        }
+        let well_formed = repo.split_once('/').is_some_and(|(o, r)| {
+            let ok = |x: &str| {
+                !x.is_empty()
+                    && x.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+            };
+            ok(o) && ok(r)
+        });
+        if !well_formed {
+            return Err(bad());
+        }
+        Ok(Self {
+            repo: Some(repo.to_string()),
+            number,
+        })
+    }
+}
+
 /// One park record: one declared blocker, with the provenance of the park.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParkRecord {
     /// The declared blocker. `None` is an explicit "blocker unstated".
-    pub blocker: Option<u64>,
+    pub blocker: Option<BlockerRef>,
     /// `by=` — the role or identity that applied the park.
     pub by: Option<String>,
     /// `at=` — when, as written. Never re-derived: a timestamp inside text is
@@ -137,10 +212,14 @@ fn attr_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"\b(by|at)=([^\s]+)").expect("static park-attr pattern"))
 }
 
-/// Every `#N`.
+/// Every `#N`, optionally qualified as `OWNER/REPO#N` (#10443). A bare `#N`
+/// captures no repo, so records written before qualification parse unchanged.
 fn ref_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"#([0-9]+)").expect("static park-ref pattern"))
+    RE.get_or_init(|| {
+        Regex::new(r"(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#([0-9]+)")
+            .expect("static park-ref pattern")
+    })
 }
 
 /// Whether `text` carries at least one park record.
@@ -193,9 +272,14 @@ fn parse_inner(inner: &str) -> Vec<ParkRecord> {
         }
     }
 
-    let refs: Vec<u64> = ref_re()
+    let refs: Vec<BlockerRef> = ref_re()
         .captures_iter(&without_reason)
-        .filter_map(|c| c.get(1)?.as_str().parse().ok())
+        .filter_map(|c| {
+            Some(BlockerRef {
+                repo: c.get(1).map(|m| m.as_str().to_string()),
+                number: c.get(2)?.as_str().parse().ok()?,
+            })
+        })
         .collect();
 
     let template = ParkRecord {
@@ -213,26 +297,47 @@ fn parse_inner(inner: &str) -> Vec<ParkRecord> {
     // hand-written `#9, #9` does not become two records.
     let mut seen = BTreeSet::new();
     refs.into_iter()
-        .filter(|n| seen.insert(*n))
-        .map(|n| ParkRecord {
-            blocker: Some(n),
+        .filter(|r| seen.insert(r.clone()))
+        .map(|r| ParkRecord {
+            blocker: Some(r),
             ..template.clone()
         })
         .collect()
 }
 
-/// The union of every record's declared blockers, ascending and deduplicated.
+/// `text` with every qualified `OWNER/REPO#N` inside a park marker's blocker
+/// span reduced to nothing, so prose extractors that only understand `#N`
+/// cannot resolve a cross-repo blocker against the local repo (#10443).
+/// Text outside park markers is untouched.
 #[must_use]
-pub fn blockers(text: &str) -> Vec<u64> {
-    let set: BTreeSet<u64> = parse(text).into_iter().filter_map(|r| r.blocker).collect();
+pub fn mask_qualified(text: &str) -> String {
+    marker_re()
+        .replace_all(text, |c: &regex::Captures<'_>| {
+            let whole = c.get(0).map_or("", |m| m.as_str());
+            let masked = ref_re().replace_all(whole, |r: &regex::Captures<'_>| {
+                if r.get(1).is_some() {
+                    String::new()
+                } else {
+                    r.get(0).map_or(String::new(), |m| m.as_str().to_string())
+                }
+            });
+            masked.into_owned()
+        })
+        .into_owned()
+}
+
+/// The union of every record's declared blockers, sorted and deduplicated.
+#[must_use]
+pub fn blockers(text: &str) -> Vec<BlockerRef> {
+    let set: BTreeSet<BlockerRef> = parse(text).into_iter().filter_map(|r| r.blocker).collect();
     set.into_iter().collect()
 }
 
 /// Render one park record as the one line a role writes into the artifact body.
 #[must_use]
 pub fn render(record: &ParkRecord) -> String {
-    let reference = match record.blocker {
-        Some(n) => format!("#{n}"),
+    let reference = match &record.blocker {
+        Some(b) => b.to_string(),
         None => UNSTATED.to_string(),
     };
 
@@ -257,7 +362,7 @@ pub fn render(record: &ParkRecord) -> String {
 /// newline. An empty `blockers` list renders the single `(unstated)` record.
 #[must_use]
 pub fn render_park(
-    blockers: &[u64],
+    blockers: &[BlockerRef],
     by: Option<&str>,
     at: Option<&str>,
     reason: Option<&str>,
@@ -274,10 +379,10 @@ pub fn render_park(
     let mut seen = BTreeSet::new();
     blockers
         .iter()
-        .filter(|n| seen.insert(**n))
-        .map(|n| {
+        .filter(|b| seen.insert((*b).clone()))
+        .map(|b| {
             render(&ParkRecord {
-                blocker: Some(*n),
+                blocker: Some(b.clone()),
                 ..template.clone()
             })
         })

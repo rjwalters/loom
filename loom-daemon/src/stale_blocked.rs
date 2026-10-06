@@ -132,11 +132,33 @@ pub struct Evidence {
     /// its blockers already arrive in [`Evidence::prose`] via the existing
     /// extractor. This field records *how* they were declared, which is the only
     /// way to tell a machine-readable park from a prose mention.
-    pub declared: Vec<u64>,
+    pub declared: Vec<crate::park_record::BlockerRef>,
+    /// The park-record blockers that name **another repository**
+    /// (`OWNER/REPO#N`, #10443), each with its state read in its own repo.
+    /// Kept apart from [`Evidence::prose`] because that list is numbers-only and
+    /// is resolved against the local repo — a cross-repo number there would be
+    /// read as a different local artifact.
+    pub remote: Vec<RemoteRef>,
     /// For a parked **PR**: its own superseding block, if any
     /// ([`park_self_block`]). Always `None` for an issue, whose superseding-block
     /// question is answered by [`Evidence::closing`] instead.
     pub self_block: Option<String>,
+}
+
+/// A cross-repo park-record blocker with its live state (#10443).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteRef {
+    /// `OWNER/REPO`.
+    pub repo: String,
+    pub number: i64,
+    /// `OPEN` / `CLOSED` / `MERGED`.
+    pub state: String,
+}
+
+impl RemoteRef {
+    fn render(&self) -> String {
+        format!("{}#{}:{}", self.repo, self.number, self.state)
+    }
 }
 
 /// Whether this artifact's park is documented only in prose.
@@ -151,7 +173,8 @@ pub struct Evidence {
 /// own.
 #[must_use]
 pub fn undeclared(e: &Evidence) -> bool {
-    let has_reference = !e.named.is_empty() || !e.prose.is_empty() || !e.closing.is_empty();
+    let has_reference =
+        !e.named.is_empty() || !e.prose.is_empty() || !e.closing.is_empty() || !e.remote.is_empty();
     has_reference && e.declared.is_empty()
 }
 
@@ -256,8 +279,9 @@ pub fn classify(e: &Evidence) -> Verdict {
     let has_named = !e.named.is_empty();
     let has_prose = !e.prose.is_empty();
     let has_closing = !e.closing.is_empty();
+    let has_remote = !e.remote.is_empty();
 
-    if !has_named && !has_prose && !has_closing {
+    if !has_named && !has_prose && !has_closing && !has_remote {
         return Verdict::Undocumented;
     }
 
@@ -291,6 +315,13 @@ pub fn classify(e: &Evidence) -> Verdict {
             "every linked closing PR is merged or closed: {}",
             one_line(&recheck::blockers(&e.closing))
         ));
+    }
+
+    // (b') Park-record blockers in another repo (#10443), judged by their own
+    // repo's state — same "any no longer open" rule as (b).
+    if has_remote && e.remote.iter().any(|r| resolved(&r.state)) {
+        let lines: Vec<String> = e.remote.iter().map(RemoteRef::render).collect();
+        reasons.push(format!("a cited cross-repo blocker is no longer open: {}", lines.join(", ")));
     }
 
     if reasons.is_empty() {
@@ -334,8 +365,14 @@ pub fn classify(e: &Evidence) -> Verdict {
 /// as its own blocker".
 #[must_use]
 pub fn cited_among(kind: Artifact, input: &extract::Input, closed: &[i64]) -> Vec<i64> {
+    // A qualified park-record blocker is another repo's artifact; mask it so
+    // its number can never match a local closed number (#10443).
+    let masked = extract::Input {
+        body: crate::park_record::mask_qualified(&input.body),
+        comments: input.comments.clone(),
+    };
     let mut refs: Vec<i64> =
-        extract::extract_with(input, &crate::forge_identity::FleetLogins::current())
+        extract::extract_with(&masked, &crate::forge_identity::FleetLogins::current())
             .split_whitespace()
             .filter_map(|t| t.parse().ok())
             .collect();
