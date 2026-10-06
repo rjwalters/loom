@@ -5321,6 +5321,7 @@ knobs not yet audited here.
 | `autonomous.workFinder.prlessRetry.maxBackoffSecs` | `LOOM_WORK_FINDER_PRLESS_RETRY_MAX_BACKOFF_SECS` | `3600` | Ceiling on the doubling — also the idle window after which a cold streak restarts at zero, and the in-memory TTL of a hold (whose durable half is the `loom:blocked` label). The fleet-wide streak clock (#9292) is the shipped 3600 s regardless of this value, since a receiving host reads its peers' releases rather than their config. Zero/invalid → default; clamped up to `backoffSecs` |
 | `autonomous.workFinder.extraSkipLabels` | `LOOM_WORK_FINDER_EXTRA_SKIP_LABELS` (comma-separated) | `[]` | Per-workspace/per-repo **additional** label names (#6685) the work-finder treats as a skip/park signal, beyond the hardcoded `loom:blocked` / `loom:operator-only` (`PARK_LABELS`) — e.g. a repo-local `blocked-upstream` label that will never be renamed to a `loom:*` name. Purely additive to `SKIP_LABELS`' candidate-query filter (`WorkItem::is_skipped_with_extra`); it does **not** extend the separate dispatch()-level park-label guard (#4444) above, which stays keyed on `PARK_LABELS` only. Env replaces config entirely when set (even to an empty string); resolved once per workspace, live on the next tick (a cheap `.loom/config.json` read, no daemon restart needed). **`loom:building` can never be added to the resolved list** — filtered out defensively even if named explicitly in config/env, so a misconfiguration can never re-introduce the "an in-flight claim is treated as a park" regression `SKIP_LABELS`' own doc comment warns against |
 | *(env only)* | `LOOM_OPEN_PR_MEMO` | `true` | Verified-open-PR memo for the #4123 open-PR dispatch guard (#6788). Falsy (`0`/`false`/`no`/`off`) disables; anything else (including unset) enables. When on, the guard (a) reuses a verified "issue #N has open linked PR #M" answer for 15 minutes instead of re-running the closes-graph query on every work-finder tick, and (b) when **both** the GraphQL probe and its #5911 REST fallback fail, re-verifies that one known PR over a single `GET repos/{owner}/{repo}/pulls/{M}` before conceding. The documented fail-open contract is unchanged: with no memo, or if that recheck also cannot answer, the guard still proceeds. In-memory only — a daemon restart clears it. Disable only to restore the exact pre-#6788 probe |
+| *(env only)* | `LOOM_GUARD_ISSUE_SNAPSHOT` | `true` | Conditional (ETag) issue reads for the 2.5 closed-issue and 2.7 park-label dispatch guards (W9). Falsy (`0`/`false`/`no`/`off`) restores the unconditional `guard.issue_state` / `guard.issue_labels` reads. When on, 2.5 reads `repos/{owner}/{repo}/issues/{N}` reader-first (`guard.issue_view`) and 2.7 reads it on the writer (`guard.issue_labels_view`), each with `If-None-Match` from its own store entry, so a re-attempted, unchanged candidate costs a free `304`. The verdict is always taken from the body the read serves. For 10 minutes after this daemon writes issue N of the repo (keyed by repo and number; a write whose repo is unknown, including a `{owner}/{repo}` placeholder path with no explicit target, is a wildcard that pins N in every repo; the parse is deliberately loose, so any numeric argument of a `gh issue|pr` write may be pinned, and a mis-parse can only add a pin, never drop one), both reads of N are sent without an ETag and keep their identity: 2.5 stays reader-first, 2.7 stays on the writer. Any failure falls back to the unconditional read |
 | *(env only)* | `LOOM_EMPTY_POOL_BREAKER_THRESHOLD` | `3` | How many **distinct** sources must hit an unsatisfiable token selection (exit 78) inside the window below before new dispatch to that workspace is paused (#6614). A source is an issue dispatch, or — since #7607 — a `(workspace, role)` role tick whose pre-spawn pool preflight found zero spawnable accounts. Distinct *sources*, not raw failures: one issue cycling through its own `dispatchBackoff`, or one role looping on one workspace, can never trip it. Crossing it trips the existing pre-flight advisory (#4386) + half-open dispatch gate (#5030) — one loud `ERROR` plus a `daemon.preflight.advisory` event — and the first dispatch that gets past token selection clears it. Zero/invalid → default |
 | *(env only)* | `LOOM_EMPTY_POOL_BREAKER_WINDOW_SECS` | `1800` | Trailing window over which those distinct sources are counted (#6614) — twice the `dispatchBackoff.maxSecs` plateau, so a systemic fault always accumulates while isolated failures spaced further apart never do. Zero/invalid → default |
 | `autonomous.hostBreaker.enabled` | `LOOM_HOST_BREAKER` | `true` | Host-distress circuit breaker on/off (#4235). A safety backstop — **defaults on**. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. **Restart required** — resolved once at startup and registered as a process-global handle (#5963). See [Host-distress circuit breaker](#host-distress-circuit-breaker-4235) below |
@@ -6068,6 +6069,26 @@ The fail-open contract is unchanged: with no memo (a first probe, or any probe
 after a daemon restart), or if the recheck itself cannot answer, or if the PR is
 no longer open, the probe still concedes and dispatch still proceeds — a genuine
 forge outage can never wedge the daemon. Disable with `LOOM_OPEN_PR_MEMO=0`.
+
+**The memo only refuses (W9).** A memo answer is never renewed and never
+outlives 15 minutes; past that, the next attempt probes live, and leg 0 of that
+probe (the ETag'd open-PR listing, #10514) is a free `304` on an unchanged
+repo. A crash resume (#4256) is the one decision where an `Open(pr)` answer
+*permits* a dispatch, so it never consults the fresh memo: the reaper's
+resume-eligibility probe and the resume's own 2.6 check probe the forge, and
+the 2.5 memo short circuit is skipped for a resume. One caveat: when every
+probe transport fails, the #6788 known-PR backstop still takes its PR number
+from a memo entry of any age, and only that PR's openness is checked live, so
+the link itself is not re-verified on that path. The other memo readers (the
+#4366 no-progress exemption, the PR-less retry tally and its hold veto) keep the
+fresh-only memo. Every open-PR refusal bumps `guard.open_pr.refused_memo` (the 2.5 short
+circuit) or `guard.open_pr.refused_probed` (the 2.6 probe; for an ordinary
+dispatch that probe can itself be served from the memo, when an entry became
+fresh after the 2.5 check, and it still counts here), and the first refusal of an `(issue, PR)` pair
+in a workspace each UTC hour also bumps `guard.open_pr.refused_distinct`
+(`loom.forge.facade.events`), so distinct versus repeated refusals are visible
+per hour. The 2.5/2.7 issue reads themselves are conditional; see
+`LOOM_GUARD_ISSUE_SNAPSHOT`.
 
 **Note on #6740.** `noop_cooldown` above is *dispatcher-armed*: it only takes
 effect once a completed sweep pass self-reports "no actionable delta this
@@ -7540,7 +7561,8 @@ with no working directory derives only from steps 1 and 2 (the argv names
 the repo). Reads that verify the daemon's own just-made write are pinned to
 the writer, since a reader may lag it: the dispatch guard's lease read-back
 (`guard.lease_comments`, behind the claim tie-break and the sole-claim
-confirmation), post-flip label read (`guard.issue_labels`) and claim
+confirmation), post-flip label read (`guard.issue_labels`, and its conditional form
+`guard.issue_labels_view`) and claim
 timeline reads (`guard.claim_timeline`, behind the leaseless-claim yield
 and the phantom-claim revert), the claim check's `claim.labels` /
 `claim.lease_comments`, the reclaim verification (`claim.issue_labels`),

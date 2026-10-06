@@ -550,6 +550,10 @@ fn daemon_write_paths_are_scoped() {
             "gh_invocation/api_kind.rs",
             NotAWrite("classifies an invocation's argv for the github.api span attribute, runs none"),
         ),
+        (
+            "gh_invocation/own_writes.rs",
+            NotAWrite("names the label flags to parse a write argv for the numbers it pins, runs none"),
+        ),
         ("role_tick_telemetry/targets.rs", NotAWrite("classifies commands, runs none")),
         (
             "observability/pick_journal.rs",
