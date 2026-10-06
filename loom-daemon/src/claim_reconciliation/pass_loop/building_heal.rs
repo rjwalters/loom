@@ -114,23 +114,45 @@ pub fn heal_missing_building_labels(gh_bin: &Path, root: &Path) -> BuildingHealS
     stats
 }
 
-/// `(state, labels)` for one issue, best-effort — `None` on any `gh` failure.
+/// `(state, labels)` for one issue, best-effort — `None` on any `gh` failure
+/// or a `404`.
+///
+/// #10507: an ETag'd REST `issues/{n}` read (was GraphQL `gh issue view
+/// --json state,labels`). An unchanged issue answers a free `304` from the
+/// shared [`crate::forge_etag_store`] cache; this pass's own
+/// `heal.issue_add_label` write moves the ETag, so the next tick re-reads a
+/// fresh `200` (read-after-write holds across ticks). `LOOM_REPO`, when set,
+/// names the repo — the old `gh issue view` passed no `--repo`.
 fn read_issue_state_and_labels(
     gh_bin: &Path,
     root: &Path,
     issue: u32,
 ) -> Option<(String, Vec<String>)> {
-    let n = issue.to_string();
-    let stdout = crate::claim_reconciliation::gh_call::ok_stdout(
-        crate::claim_reconciliation::gh_call::read("heal.issue_view", gh_bin, root).args([
-            "issue",
-            "view",
-            &n,
-            "--json",
-            "state,labels",
-        ]),
-    )?;
-    let value: serde_json::Value = serde_json::from_slice(&stdout).ok()?;
+    use crate::forge_etag_store as store;
+    let loom_repo = std::env::var("LOOM_REPO").ok().filter(|r| !r.is_empty());
+    let target = store::resolve_target(Some(root), loom_repo.as_deref());
+    let slug = target.repo.as_deref().unwrap_or("{owner}/{repo}");
+    let url = format!("repos/{slug}/issues/{issue}");
+    let site = store::ConditionalRead::new(
+        "heal.issue_view",
+        crate::forge_call_stats::ops::ISSUE_VIEW_STATE,
+    );
+    let body = match store::cached_get(site, gh_bin, Some(root), loom_repo.as_deref(), &url, "heal-")
+    {
+        Ok(Some(body)) => body,
+        Ok(None) => return None,
+        Err(error) => {
+            log::debug!("building_heal: issue #{issue}: {error}");
+            return None;
+        }
+    };
+    parse_issue_state_and_labels(body.as_bytes())
+}
+
+/// `(state, labels[].name)` from a REST `issues/{n}` body (`state` is
+/// lowercase there; the caller lowercases either way).
+fn parse_issue_state_and_labels(body: &[u8]) -> Option<(String, Vec<String>)> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let state = value.get("state")?.as_str()?.to_string();
     let labels = value
         .get("labels")?
@@ -167,28 +189,37 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// A fake `gh` whose `issue view` reports `{"state":…,"labels":[…]}` in
-    /// the real response shape (`labels` is an array of `{name}` objects)
-    /// and which records every invocation, so the heal path can be driven
-    /// end-to-end without the forge.
+    /// A fake `gh` whose REST `issues/{n}` read (`gh api --include …`)
+    /// reports `{"state":…,"labels":[…]}` in the real response shape
+    /// (`labels` is an array of `{name}` objects) and which records every
+    /// invocation, so the heal path can be driven end-to-end without the
+    /// forge. The retired GraphQL `issue view` is refused (exit 97, logging
+    /// `FORBIDDEN`), so a regression back to it fails the pass (#10507).
     fn fake_gh(
         dir: &Path,
         state: &str,
         labels: &[&str],
     ) -> (std::path::PathBuf, std::path::PathBuf) {
-        let fake_gh = dir.join("fake-gh.sh");
-        let gh_log = dir.join("gh-calls.log");
         let labels_json = serde_json::json!(labels
             .iter()
             .map(|name| serde_json::json!({ "name": name }))
             .collect::<Vec<_>>())
         .to_string();
+        let body = format!(r#"{{"state":"{state}","labels":{labels_json}}}"#);
+        rest_fake_gh(dir, &format!("printf 'HTTP/2.0 200 OK\\r\\n\\r\\n%s' '{body}'"))
+    }
+
+    /// A fake `gh` answering the REST issue read with the shell `issue_arm`.
+    fn rest_fake_gh(dir: &Path, issue_arm: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let fake_gh = dir.join("fake-gh.sh");
+        let gh_log = dir.join("gh-calls.log");
         let script = format!(
-            "#!/bin/sh\necho \"$@\" >> {}\n\
-             if [ \"$1\" = \"issue\" ] && [ \"$2\" = \"view\" ]; then\n\
-             printf '%s' '{{\"state\":\"{state}\",\"labels\":{labels_json}}}'\n\
-             exit 0\nfi\nexit 0\n",
-            gh_log.display()
+            "#!/bin/sh\necho \"$@\" >> {log}\n\
+             case \"$*\" in\n\
+             'issue view'*) echo FORBIDDEN >> {log}; exit 97 ;;\n\
+             'api --include '*/issues/*) {issue_arm} ;;\n\
+             esac\nexit 0\n",
+            log = gh_log.display()
         );
         std::fs::write(&fake_gh, script).unwrap();
         std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -279,5 +310,51 @@ mod tests {
         assert_eq!(stats.healed, 0);
         let calls = std::fs::read_to_string(&gh_log).unwrap();
         assert!(!calls.contains("issue edit"), "{calls}");
+    }
+
+    /// #10507 acceptance: the heal read is GraphQL-free and ETag'd — the
+    /// first pass gets a `200` + `ETag`, the second presents it and is served
+    /// a `304` from the cache, and still decides correctly.
+    #[test]
+    #[serial_test::serial]
+    fn a_second_pass_is_served_by_a_304_and_still_decides() {
+        let journal_path_dir = tempfile::tempdir().unwrap();
+        let journal_path = journal_path_dir.path().join("sweeps.json");
+        std::env::set_var(crate::sweep_journal::JOURNAL_PATH_ENV, &journal_path);
+
+        let dir = tempfile::tempdir().unwrap();
+        seed_live_sweep(&journal_path, dir.path(), 10507);
+        let body = r#"{"state":"open","labels":[{"name":"loom:building"}]}"#;
+        let arm = format!(
+            "case \"$*\" in *If-None-Match*) printf 'HTTP/2.0 304 Not Modified\\r\\n\\r\\n'; \
+             echo 'gh: Not Modified (HTTP 304)' 1>&2; exit 1 ;; \
+             *) printf 'HTTP/2.0 200 OK\\r\\nEtag: W/\"h1\"\\r\\n\\r\\n%s' '{body}' ;; esac"
+        );
+        let (fake_gh, gh_log) = rest_fake_gh(dir.path(), &arm);
+
+        let first = heal_missing_building_labels(&fake_gh, dir.path());
+        let second = heal_missing_building_labels(&fake_gh, dir.path());
+
+        std::env::remove_var(crate::sweep_journal::JOURNAL_PATH_ENV);
+
+        let calls = std::fs::read_to_string(&gh_log).unwrap();
+        assert!(!calls.contains("FORBIDDEN"), "a GraphQL read was attempted:\n{calls}");
+        let reads: Vec<&str> = calls.lines().filter(|l| l.contains("/issues/10507")).collect();
+        assert_eq!(reads.len(), 2, "{calls}");
+        assert!(!reads[0].contains("If-None-Match"), "{calls}");
+        assert!(reads[1].contains(r#"If-None-Match: W/"h1""#), "{calls}");
+        for stats in [first, second] {
+            assert_eq!((stats.checked, stats.healed), (1, 0), "{calls}");
+        }
+        assert!(!calls.contains("issue edit"), "{calls}");
+    }
+
+    #[test]
+    fn the_rest_issue_body_parses_state_and_label_names() {
+        let body = br#"{"state":"closed","labels":[{"name":"a"},{"name":"loom:building"}]}"#;
+        let (state, labels) = parse_issue_state_and_labels(body).unwrap();
+        assert_eq!(state, "closed");
+        assert_eq!(labels, vec!["a", "loom:building"]);
+        assert!(parse_issue_state_and_labels(b"{}").is_none());
     }
 }

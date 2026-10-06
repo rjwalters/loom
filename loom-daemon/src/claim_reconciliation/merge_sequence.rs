@@ -829,11 +829,12 @@ pub struct MergeSequenceStats {
 
 // --- Forge reads --------------------------------------------------------
 
-/// Run `gh pr <args…>` in `root` with the per-root credential and `LOOM_REPO`
-/// applied — the same invocation shape as the review-conflict pass.
+/// Run a `gh pr <comment|edit…>` write in `root` with the per-root credential
+/// and `LOOM_REPO` applied — the same invocation shape as the review-conflict
+/// pass. There is no read arm: the label side of [`apply_edge`] comes from the
+/// tick-start REST listing (#10507), so this pass spends no GraphQL read here.
 fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let inv = match args.first().copied() {
-        Some("view") => gh_call::read("sequence.pr_view", gh_bin, root),
         Some("comment") => gh_call::write("sequence.pr_comment", gh_bin, root),
         _ => gh_call::write("sequence.pr_edit", gh_bin, root),
     };
@@ -1019,26 +1020,6 @@ fn release_hold(gh_bin: &Path, root: &Path, number: u32, body: &str) -> Result<(
     Ok(())
 }
 
-/// Does the PR carry the sequencing label right now? Live read — the label
-/// and the marker are checked independently so a partial write is healed
-/// per-side on the next tick.
-fn has_sequence_label(gh_bin: &Path, root: &Path, number: u32) -> Result<bool> {
-    let stdout = gh_pr(
-        gh_bin,
-        root,
-        &[
-            "view",
-            &number.to_string(),
-            "--json",
-            "labels",
-            "--jq",
-            ".labels[].name",
-        ],
-    )?;
-    let text = String::from_utf8_lossy(&stdout);
-    Ok(text.lines().any(|l| l.trim() == SEQUENCE_LABEL))
-}
-
 /// Apply one planned edge: marker comment + label, idempotent PER SIDE.
 /// Returns `Ok(false)` only when both sides already agree — the convergence
 /// guard that makes competing daemons settle without duplicate comments.
@@ -1051,15 +1032,25 @@ fn has_sequence_label(gh_bin: &Path, root: &Path, number: u32) -> Result<bool> {
 /// un-gated for at most one tick and is healed here on the next run: each
 /// side is checked independently, so the follow-up adds the missing label
 /// without re-posting the comment.
+///
+/// The two sides are read differently (#10507). The marker side — the one
+/// that guards against duplicate comments — stays LIVE: `bodies` is this
+/// follower's fresh trusted-comment read. The label side comes from the
+/// tick-start REST listing (`label_present`), not a per-follower
+/// `gh pr view` (GraphQL, ~284/h): the caller only reaches here for
+/// followers that were NOT holders in that listing, so a live read almost
+/// always said "absent" anyway. The one race — another daemon adds the label
+/// between the listing and this write — costs one redundant `--add-label`,
+/// which the forge no-ops for a label already present.
 fn apply_edge(
     gh_bin: &Path,
     root: &Path,
     edge: &SequenceEdge,
     marker: &SequenceMarker,
     bodies: &[String],
+    label_present: bool,
 ) -> Result<bool> {
     let marker_present = bodies.iter().any(|b| b.contains(&marker_text(marker)));
-    let label_present = has_sequence_label(gh_bin, root, edge.follower)?;
     if marker_present && label_present {
         return Ok(false);
     }
@@ -1314,7 +1305,11 @@ pub(super) fn reconcile_merge_sequences_with(
                 }
             }
             let marker = edge_marker(&edge);
-            match apply_edge(gh_bin, root, &edge, &marker, &bodies) {
+            // Label side from the tick-start listing (#10507); see `apply_edge`.
+            let label_present = open
+                .iter()
+                .any(|p| p.number == edge.follower && p.has(SEQUENCE_LABEL));
+            match apply_edge(gh_bin, root, &edge, &marker, &bodies, label_present) {
                 Ok(true) => {
                     stats.applied += 1;
                     log::info!(
