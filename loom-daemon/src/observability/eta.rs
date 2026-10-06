@@ -513,30 +513,30 @@ pub fn spawn_task(
             loom.tree_state
         );
     }
-    let mut tracker = Tracker::new(loom);
-    tracker.restore_pending(read_pending(&pending_path(&workspace_root)));
-    // The registry is loaded before the pending store is trusted: an estimate
-    // for a retired heuristic must not resolve into a ledger pair or an
-    // `eta.outcome` after the roll.
+    // #10243: the fitted heuristics' coefficient file, loaded once here and
+    // re-checked on every pass (`record`), never inside an estimate. Loaded
+    // before the pending store, which it filters (#10484).
     let registry = Registry::load(&workspace_root, Utc::now());
-    let retired = tracker.drop_unregistered(&registry);
-    if retired > 0 {
-        log::info!("eta: dropped {retired} pending estimate(s) for retired heuristics");
-    }
+    log_fit(None, registry.fit(), &workspace_root);
+    let mut tracker = Tracker::new(loom);
+    // #10484: a pending estimate whose heuristic is no longer registered (a
+    // retired id) is dropped here, so it never scores into the shadow ledger
+    // or an `eta.outcome`.
+    let unregistered =
+        tracker.restore_pending(read_pending(&pending_path(&workspace_root)), &registry);
     log::info!(
-        "eta: enabled (dry_run={}, refresh={}s, {} pending restored)",
+        "eta: enabled (dry_run={}, refresh={}s, {} pending restored, \
+         {} dropped for an unregistered heuristic)",
         config.dry_run,
         config.refresh_secs,
-        tracker.pending().len()
+        tracker.pending().len(),
+        unregistered
     );
     let (shadow, unreadable) =
         shadow::load_ledger(&shadow::ledger_path(&workspace_root), Utc::now());
     if let Some(note) = unreadable {
         log::error!("eta: {note}");
     }
-    // #10243: the fitted heuristics' coefficient file, loaded once here and
-    // re-checked on every pass (`record`), never inside an estimate.
-    log_fit(None, registry.fit(), &workspace_root);
     *lock() = Some(State {
         tracker,
         turnover: super::ops::turnaround::TurnoverLedger::default(),

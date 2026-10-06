@@ -276,11 +276,14 @@ only.
 
 A retired id is **not registered**: it produces no `eta.estimate`, no
 `eta.snapshot` `alternates[]` entry and no shadow-ledger pairs, and
-`eta backtest --heuristic` / `eta promote` reject it as an unknown id. Entries
-for it in an older `shadow.json` load without error and are ignored; pending-store
-entries are dropped at restore, so a landing never scores them and no `eta.outcome`
-or ledger pair is written for them. A host whose config names a retired id as
-`current` falls back to `land-v1`. The ids stay immutable and are never reused. Historical outcomes remain
+`eta backtest --heuristic` / `eta promote` reject it as an unknown id. Pairs
+for it in an older `shadow.json` load without error and are never added to.
+Pending-store entries for it are dropped when the daemon restores the store
+(the startup log counts them), so they are never scored: no `eta.outcome` and
+no ledger pair when the item lands or is censored at expiry. A config that
+names a retired id as `autonomous.eta.current` falls back to the kind's
+default (`land-v1`), as any unregistered id does. The ids stay immutable and are
+never reused. Historical outcomes remain
 in the outcome journals for audit; replay is not retained (a replay-only
 registry would be a second mechanism for dominated heuristics).
 
@@ -383,7 +386,10 @@ all of the above.
 `land-v3` (#9970) and `land-2026-10-04-amber-heron` (#10207) shipped the same way and
 were retired on 2026-10-06 (see [Retired heuristics](#retired-heuristics)).
 The calibration log (`.loom/state/eta/calibration.jsonl`, every landed
-`land-v2` outcome the tracker scored) and the recalibration machinery stay.
+`land-v2` outcome the tracker scored) and the recalibration machinery stay in
+the daemon; the CLI no longer loads the log or rebuilds it by replay in
+`eta view`, `eta backtest` or `eta promote`, since no registered heuristic
+reads it.
 `land-2026-10-04-twin-otter` (#10243) ships the same way; `land-2026-10-04-twin-otter-b`
 (#10244) follows it. Twin-otter's model is PR-level, so on its own it refuses every
 pre-PR item (`unknown_stage`) and could never pass the answer-rate gate against
@@ -1229,7 +1235,8 @@ triggers:
 An unchanged estimate is refreshed every `refreshSecs` (300); a changed stage,
 rework count or refusal reason emits at once; a series is capped at 20
 emissions per rolling hour. Every emitted estimate waits for its outcome in
-`.loom/state/eta/pending.jsonl`, which survives a restart. It is per-host
+`.loom/state/eta/pending.jsonl`, which survives a restart (an entry whose
+heuristic is no longer registered is dropped on restore). It is per-host
 runtime state and is never git-tracked (the managed gitignore block ignores
 all of `.loom/state/*`, #9592).
 

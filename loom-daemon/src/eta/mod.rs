@@ -694,6 +694,13 @@ impl Registry {
             .map(|h| h.as_ref())
     }
 
+    /// Whether `id` is a registered heuristic predicting `kind`. A persisted
+    /// estimate naming anything else (a retired id, #10484) is not scored.
+    #[must_use]
+    pub fn registers(&self, kind: Kind, id: &str) -> bool {
+        self.get(id).is_some_and(|h| h.kind() == kind)
+    }
+
     /// Every registered id.
     #[must_use]
     pub fn ids(&self) -> Vec<&'static str> {

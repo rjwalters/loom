@@ -508,12 +508,14 @@ fn pending_survives_a_restart() {
 
     // A new process: items are gone, pending comes back from disk.
     let mut restarted = Tracker::new(provenance());
-    restarted.restore_pending(
+    let dropped = restarted.restore_pending(
         persisted
             .iter()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect(),
+        &Registry::builtin(),
     );
+    assert_eq!(dropped, 0, "every heuristic that estimated is still registered");
     restarted.on_listing(REPO, &[pr(901, 90, &["loom:pr"], 100)], t(400), 300);
     restarted.on_listing(REPO, &[], t(700), 300);
     let merged = restarted.on_pr_resolved(&ItemKey::new(REPO, 90), PrState::Merged(t(650)), t(700));

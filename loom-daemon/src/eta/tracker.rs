@@ -357,20 +357,22 @@ impl Tracker {
         &self.pending
     }
 
-    /// Restore pending estimates persisted by an earlier process.
-    pub fn restore_pending(&mut self, pending: Vec<EstimateSummary>) {
-        self.pending = pending;
-        self.pending.sort_by_key(|p| p.as_of);
-    }
-
-    /// Drop pending estimates whose heuristic is not registered for its kind
-    /// (a retired id restored from a store persisted by an earlier build), so
-    /// a landing or an expiry never scores them or feeds the shadow ledger.
+    /// Restore pending estimates persisted by an earlier process, keeping
+    /// only those whose heuristic `registry` still registers for their kind.
     /// Returns how many were dropped.
-    pub fn drop_unregistered(&mut self, registry: &Registry) -> usize {
-        let before = self.pending.len();
-        self.pending
-            .retain(|p| registry.for_kind(p.kind).any(|h| h.id() == p.heuristic));
+    ///
+    /// A retired heuristic (#10484) must produce no live output, and a pending
+    /// estimate is live output deferred: left in place, its landing or p90
+    /// censoring would score it, write shadow-ledger pairs and emit an
+    /// `eta.outcome` under the retired id for up to [`PENDING_MAX_AGE_DAYS`].
+    /// Dropping it here, before anything can score it, is the one gate.
+    pub fn restore_pending(&mut self, pending: Vec<EstimateSummary>, registry: &Registry) -> usize {
+        let before = pending.len();
+        self.pending = pending
+            .into_iter()
+            .filter(|p| registry.registers(p.kind, &p.heuristic))
+            .collect();
+        self.pending.sort_by_key(|p| p.as_of);
         before - self.pending.len()
     }
 

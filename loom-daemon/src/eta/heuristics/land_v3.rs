@@ -72,10 +72,13 @@
 //! promotion decision are the operator's steps after this ships. The other
 //! constants are the documented priors above.
 //!
-//! # It does not get to skip the gate
+//! # Retired (#10484)
 //!
-//! `land-v3` is **retired**: it is no longer registered and emits nothing. The
-//! module is kept only because land-v4 reuses its grid step.
+//! `land-v3` is **not registered** since 2026-10-06: it was dominated in live
+//! outcomes and emits nothing. The module stays only because its grid step
+//! (`adjust`, `with_missing_inputs_noted`) is `land-v4`'s; `land-v4` is this
+//! heuristic plus the stall, hold and tail fixes. The `LandV3` type is kept
+//! so its tests keep pinning that step. The id is immutable and never reused.
 
 use super::{estimate_path, PathRules};
 use crate::eta::explanation::{FeatureOmitted, Features, StageAdjustment};
