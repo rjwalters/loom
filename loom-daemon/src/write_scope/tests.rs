@@ -825,6 +825,15 @@ fn daemon_write_paths_are_scoped() {
             "forge_comment.rs",
             Via("cli/forge_action.rs", "the `forge comment` verb is vetted via write_target; the internal `post_comment` sites are pre-vetted by their own callers"),
         ),
+        (
+            "forge_merge_queue/github.rs",
+            Via(
+                "cli/forge_action.rs",
+                "enqueue/dequeue mutations (#10255) run only from `forge merge-queue \
+                 enqueue|dequeue`, vetted via write_target before dispatch; dormant \
+                 behind QUEUE_EXECUTION_ENABLED=false",
+            ),
+        ),
         ("cli/forge_action.rs", Gated),
         ("role_runner/launch.rs", Gated),
         ("operator_decision/cli.rs", Gated),

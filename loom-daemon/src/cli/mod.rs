@@ -55,6 +55,7 @@ mod forge_calls_cmd;
 mod forge_egress_cmd;
 mod forge_identity_cmd;
 pub(crate) mod forge_inventory_cmd;
+mod forge_merge_queue_cmd;
 mod git_blob_lines;
 mod guard_mcp_tools;
 mod guards_status;
