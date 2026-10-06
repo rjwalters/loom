@@ -507,6 +507,23 @@ fn replay(
         .collect()
 }
 
+/// Every case matching `heuristic.kind()` and `filter`, replayed and scored,
+/// in `cases` order, leak-free exactly as [`run`] is. For callers that
+/// aggregate the scores themselves (the nightly folds, #10492).
+#[must_use]
+pub fn replay_scored(
+    heuristic: &dyn Heuristic,
+    history: &StageSamples,
+    cases: &[ReplayCase],
+    filter: Filter<'_>,
+    loom: &Provenance,
+) -> Vec<Score> {
+    replay(heuristic, history, cases, filter, loom)
+        .into_iter()
+        .map(|r| r.score)
+        .collect()
+}
+
 fn report_of(heuristic: &dyn Heuristic, replayed: &[Replayed]) -> BacktestReport {
     let kind = heuristic.kind();
     let all: Vec<&Score> = replayed.iter().map(|r| &r.score).collect();

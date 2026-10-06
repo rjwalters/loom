@@ -1,0 +1,302 @@
+//! The nightly ETA backtest folds (#10492): a daily task on the declared fleet
+//! captain that folds yesterday's walk-forward backtest for every registered
+//! `land` heuristic and emits `eta.backtest.fold` / `eta.backtest.summary`.
+//!
+//! - **Cadence.** First check [`FIRST_CHECK_DELAY`] after start, then every
+//!   [`CHECK_INTERVAL`] (missed ticks skipped). A check does work only when a
+//!   day is due ([`crate::eta::nightly_folds::due_days`]: after 00:30 UTC, not
+//!   already folded), so it folds once per UTC day; a restart does not repeat a
+//!   day, and a few missed days are caught up, oldest first.
+//! - **Captain-gated.** Each check passes the `fleet.captain` gate first
+//!   ([`gate_tick`], re-read every tick). The captain arms the
+//!   [`SINGLETON_JOB_NAME`] singleton job and folds; any other host stands down
+//!   and emits nothing. With no captain declared **no host folds** (fail-closed,
+//!   exactly like ci-telemetry's singleton gate): `fleet.captain` must name a
+//!   host for the scoreboard to exist, and the refusal is logged at `warn`.
+//! - **Isolation.** The fold runs in `spawn_blocking`; a failure or panic is
+//!   logged at `warn` and retried on the next check. It never takes the ETA
+//!   tracker's state lock.
+//! - **No forge call.** It reads this host's journals, the cached fleet
+//!   snapshots and, when present, an offline merged-PR cache. See
+//!   [`crate::eta::nightly_folds`].
+//! - **Config.** `autonomous.eta.nightlyFolds.enabled` /
+//!   `LOOM_ETA_NIGHTLY_FOLDS_ENABLED`, default on (and only with
+//!   `autonomous.eta.enabled`); read at spawn. Default on because the gate
+//!   makes it a captain-only, CPU-only task: "default on for the captain".
+
+use super::queue::{DurableQueue, FanoutQueue, QueueSink};
+use crate::eta::config::EtaConfig;
+use crate::eta::nightly_folds::{self, DayRecords, SINGLETON_JOB_NAME};
+use crate::eta::Provenance;
+use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
+use chrono::Utc;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Delay before the first check, so a daemon start does not fold at once.
+pub const FIRST_CHECK_DELAY: Duration = Duration::from_secs(15 * 60);
+
+/// Interval between checks.
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Whether the nightly folds run under `config`.
+#[must_use]
+pub fn should_run(config: &EtaConfig) -> bool {
+    config.enabled && config.nightly_folds_enabled
+}
+
+/// One check's fleet-captain decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FoldGate {
+    /// This host is the declared captain: armed, and it folds.
+    Captain,
+    /// No `fleet.captain` declared: no fold (fail-closed, like ci-telemetry).
+    NoCaptain,
+    /// Another host is the captain: no fold, no record.
+    StandDown { captain: String },
+}
+
+impl FoldGate {
+    /// Whether this check folds.
+    #[must_use]
+    pub fn folds(&self) -> bool {
+        matches!(self, Self::Captain)
+    }
+}
+
+/// Resolve this check's [`FoldGate`] and keep the armed-singleton registry in
+/// step. Logs when the gate changes from `last`.
+pub fn gate_tick(root: &Path, host_id: &str, last: &mut Option<FoldGate>) -> FoldGate {
+    use crate::fleet_captain::{self as captain, CaptainGate};
+    let gate = match captain::resolve_gate_for_root(root, host_id) {
+        CaptainGate::Armed { captain: name } => {
+            match captain::arm_singleton_job(SINGLETON_JOB_NAME, root, host_id) {
+                Ok(()) => FoldGate::Captain,
+                // `fleet.captain` changed between the two reads: sit this
+                // check out; the next one re-reads it.
+                Err(_) => FoldGate::StandDown { captain: name },
+            }
+        }
+        CaptainGate::Refused { captain: name, .. } => {
+            captain::disarm_singleton_job(SINGLETON_JOB_NAME);
+            FoldGate::StandDown { captain: name }
+        }
+        CaptainGate::NoCaptainDeclared => {
+            captain::disarm_singleton_job(SINGLETON_JOB_NAME);
+            FoldGate::NoCaptain
+        }
+    };
+    if last.as_ref() != Some(&gate) {
+        match &gate {
+            FoldGate::Captain => log::info!(
+                "eta nightly folds: this host ({host_id}) is the fleet captain — it folds the \
+                 nightly backtest (#10492)"
+            ),
+            FoldGate::NoCaptain => log::warn!(
+                "eta nightly folds: no fleet.captain declared — no host folds the nightly \
+                 backtest. Set `fleet.captain` in .loom/config.json to the host that should \
+                 emit eta.backtest.* (#10492)"
+            ),
+            FoldGate::StandDown { captain } => log::info!(
+                "eta nightly folds: standing down — the fleet captain is {captain}, this host is \
+                 {host_id}: no folds and no eta.backtest.* records here (#10492)"
+            ),
+        }
+        *last = Some(gate.clone());
+    }
+    gate
+}
+
+/// Offer every record of `days` to `sink`, oldest day first, a record whose
+/// provenance does not validate dropped. Returns how many were offered.
+pub fn emit(sink: Option<&dyn QueueSink>, host_id: &str, days: &[DayRecords]) -> usize {
+    let Some(sink) = sink else {
+        return 0;
+    };
+    let mut offered = 0;
+    for day in days {
+        for fold in &day.folds {
+            if !fold.has_provenance() {
+                log::warn!("eta nightly folds: dropped eta.backtest.fold: invalid provenance");
+                continue;
+            }
+            sink.offer(TelemetryEnvelope::new(
+                host_id,
+                TelemetryRecord::EtaBacktestFold(fold.clone()),
+            ));
+            offered += 1;
+        }
+        for summary in &day.summaries {
+            if !summary.has_provenance() {
+                log::warn!("eta nightly folds: dropped eta.backtest.summary: invalid provenance");
+                continue;
+            }
+            sink.offer(TelemetryEnvelope::new(
+                host_id,
+                TelemetryRecord::EtaBacktestSummary(summary.clone()),
+            ));
+            offered += 1;
+        }
+    }
+    offered
+}
+
+/// Fold whatever is due for `root`, with the production registry and the
+/// configured `historyScope`.
+#[must_use]
+pub fn fold_due(root: &Path) -> Vec<DayRecords> {
+    let eta = crate::eta::config::read(root);
+    let scope = eta.history_scope;
+    nightly_folds::run_due(
+        root,
+        Utc::now(),
+        eta.current_land.as_deref(),
+        &|local| crate::eta::fleet::apply_scope(scope, root, local),
+        &|before| nightly_folds::registry_before(root, before),
+        &Provenance::current(),
+    )
+}
+
+/// Start the nightly folds for `workspace_root`. `None` when disabled.
+pub fn spawn_task(
+    workspace_root: PathBuf,
+    otlp_queues: Vec<Arc<DurableQueue>>,
+    host_id: String,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let config = crate::eta::config::read(&workspace_root);
+    if !should_run(&config) {
+        log::info!(
+            "eta nightly folds: disabled (autonomous.eta.enabled={}, \
+             autonomous.eta.nightlyFolds.enabled={})",
+            config.enabled,
+            config.nightly_folds_enabled
+        );
+        return None;
+    }
+    let sink: Option<Arc<dyn QueueSink>> = (!otlp_queues.is_empty())
+        .then(|| Arc::new(FanoutQueue::new(otlp_queues)) as Arc<dyn QueueSink>);
+    Some(tokio::spawn(async move {
+        tokio::time::sleep(FIRST_CHECK_DELAY).await;
+        let mut interval = tokio::time::interval(CHECK_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_gate = None;
+        loop {
+            interval.tick().await;
+            if !gate_tick(&workspace_root, &host_id, &mut last_gate).folds() {
+                continue;
+            }
+            let root = workspace_root.clone();
+            match tokio::task::spawn_blocking(move || fold_due(&root)).await {
+                Ok(days) => {
+                    for day in &days {
+                        log::info!(
+                            "eta nightly folds: folded {} ({} heuristic(s), {} challenger(s))",
+                            day.day,
+                            day.folds.len(),
+                            day.summaries.len()
+                        );
+                    }
+                    emit(sink.as_deref(), &host_id, &days);
+                }
+                Err(_) => {
+                    log::warn!("eta nightly folds: the fold panicked, retrying next check");
+                }
+            }
+        }
+    }))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::eta::config::resolve;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Collect(Mutex<Vec<TelemetryEnvelope>>);
+
+    impl QueueSink for Collect {
+        fn offer(&self, envelope: TelemetryEnvelope) {
+            self.0.lock().unwrap().push(envelope);
+        }
+
+        fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
+            self.offer(envelope);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_task_runs_by_default_and_each_switch_turns_it_off() {
+        let no_env = |_: &str| None;
+        assert!(should_run(&resolve(&json!({}), no_env)), "default on");
+
+        let off = json!({"autonomous": {"eta": {"nightlyFolds": {"enabled": false}}}});
+        assert!(!should_run(&resolve(&off, no_env)));
+
+        let env_off =
+            |key: &str| (key == "LOOM_ETA_NIGHTLY_FOLDS_ENABLED").then(|| "0".to_string());
+        assert!(!should_run(&resolve(&json!({}), env_off)), "env beats the default");
+        let env_on = |key: &str| (key == "LOOM_ETA_NIGHTLY_FOLDS_ENABLED").then(|| "1".to_string());
+        assert!(should_run(&resolve(&off, env_on)), "env beats config");
+
+        let eta_off = json!({"autonomous": {"eta": {"enabled": false}}});
+        assert!(!should_run(&resolve(&eta_off, no_env)), "needs autonomous.eta.enabled");
+    }
+
+    #[test]
+    fn only_the_captain_folds() {
+        assert!(FoldGate::Captain.folds());
+        assert!(!FoldGate::NoCaptain.folds(), "fail-closed, like ci-telemetry");
+        assert!(!FoldGate::StandDown {
+            captain: "other".into()
+        }
+        .folds());
+    }
+
+    #[test]
+    fn emit_offers_every_fold_then_summary_and_nothing_without_a_sink() {
+        let root = tempfile::tempdir().unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
+        let inputs = nightly_folds::Inputs::default();
+        let records = nightly_folds::run_day(
+            &inputs,
+            day,
+            None,
+            &|h| h,
+            &|_| crate::eta::Registry::builtin(),
+            &Provenance {
+                version: "0.0.0".into(),
+                revision: "a".repeat(40),
+                tree_state: "clean".into(),
+                complete: true,
+            },
+        );
+        let sink = Collect::default();
+        let offered = emit(Some(&sink), "host", std::slice::from_ref(&records));
+        assert_eq!(offered, records.folds.len() + records.summaries.len());
+        let kinds: Vec<&str> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.record.kind())
+            .collect();
+        assert_eq!(
+            kinds.iter().filter(|k| **k == "eta.backtest.fold").count(),
+            records.folds.len()
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| **k == "eta.backtest.summary")
+                .count(),
+            records.summaries.len()
+        );
+        assert_eq!(emit(None, "host", std::slice::from_ref(&records)), 0);
+        drop(root);
+    }
+}

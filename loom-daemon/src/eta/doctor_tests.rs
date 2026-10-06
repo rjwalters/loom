@@ -77,6 +77,7 @@ fn healthy() -> Facts {
             pending: 4,
             drift: Vec::new(),
         },
+        backtest: BacktestFacts::default(),
     }
 }
 
@@ -128,7 +129,8 @@ fn a_healthy_host_has_no_fail_or_warn_and_every_bad_status_has_a_remedy() {
             "fit",
             "serving",
             "snapshot_feed",
-            "outcomes"
+            "outcomes",
+            "backtest"
         ]
     );
 }
@@ -420,4 +422,72 @@ fn drift_shows_the_tri_state_and_never_claims_serving_is_adjusted() {
     // Slice 1 does not apply the factor to served ETAs (#10563 review).
     assert!(drifted.detail.contains("NOT adjusted"), "{}", drifted.detail);
     assert!(!drifted.detail.contains("are scaled"), "{}", drifted.detail);
+}
+
+fn summary(ready: bool) -> crate::telemetry::kinds::eta_backtest::EtaBacktestSummaryRecord {
+    crate::telemetry::kinds::eta_backtest::EtaBacktestSummaryRecord {
+        summary_id: "s".into(),
+        heuristic: "land-v4".into(),
+        kind: "land".into(),
+        compared_to: "land-v1".into(),
+        as_of_day: "2026-10-04".into(),
+        cutoff: now(),
+        cases: 40,
+        days: 8,
+        wins: 7,
+        ties: 0,
+        win_rate: Some(0.875),
+        ci_low: Some(0.529),
+        ci_high: Some(0.978),
+        min_folds: 7,
+        gate_ready: ready,
+        gate_detail: "land-v4 wins".into(),
+        fit_id: None,
+        loom: crate::eta::Provenance {
+            version: "0.0.0".into(),
+            revision: "0".repeat(40),
+            tree_state: "clean".into(),
+            complete: true,
+        },
+    }
+}
+
+#[test]
+fn the_backtest_scoreboard_lists_each_challenger_and_warns_when_stale() {
+    let mut f = healthy();
+    f.backtest = BacktestFacts {
+        enabled: true,
+        state: Some(crate::eta::nightly_folds::State {
+            written_at: hours_ago(5),
+            day: "2026-10-04".into(),
+            summaries: vec![summary(true)],
+        }),
+    };
+    let checks = evaluate(&f);
+    assert_eq!(find(&checks, "backtest", "nightly_folds").status, Status::Ok);
+    let row = find(&checks, "backtest", "scoreboard land-v4");
+    assert_eq!(row.status, Status::Ok);
+    assert!(
+        row.detail.contains("won 7/8") && row.detail.contains("READY"),
+        "{}",
+        row.render()
+    );
+
+    f.backtest.state.as_mut().unwrap().written_at = hours_ago(24 * 5);
+    let checks = evaluate(&f);
+    let c = find(&checks, "backtest", "nightly_folds");
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.remedy.as_deref().unwrap().contains("fleet.captain"), "{}", c.render());
+
+    f.backtest = BacktestFacts {
+        enabled: true,
+        state: None,
+    };
+    f.data.gate = Gate::StandDown {
+        captain: "cap".into(),
+    };
+    let c = evaluate(&f);
+    let c = find(&c, "backtest", "nightly_folds");
+    assert_eq!(c.status, Status::Skip);
+    assert!(c.detail.contains("cap"), "{}", c.render());
 }

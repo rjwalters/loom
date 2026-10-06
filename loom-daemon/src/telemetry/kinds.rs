@@ -164,6 +164,9 @@ pub mod auto_update_tick;
 /// `eta.estimate` / `eta.outcome` (#9289).
 pub mod eta;
 
+/// `eta.backtest.fold` / `eta.backtest.summary` (#10492).
+pub mod eta_backtest;
+
 /// `eta.fit` (#10391).
 pub mod eta_fit;
 /// `eta.fleet_refresh` (#10263).
@@ -416,6 +419,14 @@ macro_rules! telemetry_kind_table {
             /// already journals, so no new forge read. OTLP-only. See
             /// [`pr_resolved`].
             PrResolved = "pr.resolved" => $crate::telemetry::kinds::pr_resolved::PrResolvedRecord,
+            /// One heuristic's nightly walk-forward fold for one UTC day (Issue
+            /// #10492). OTLP-only. See [`eta_backtest`].
+            EtaBacktestFold = "eta.backtest.fold" => $crate::telemetry::kinds::eta_backtest::EtaBacktestFoldRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One challenger's rolling backtest standing against `current`
+            /// (Issue #10492). OTLP-only. See [`eta_backtest`].
+            EtaBacktestSummary = "eta.backtest.summary" => $crate::telemetry::kinds::eta_backtest::EtaBacktestSummaryRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
