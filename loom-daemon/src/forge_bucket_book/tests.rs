@@ -95,7 +95,7 @@ fn a_snapshot_round_trips_through_the_sink_dir() {
 }
 
 #[test]
-fn bucket_gauges_carry_an_owner_label_and_quota_points_do_not() {
+fn every_gauge_carries_an_owner_and_role_label() {
     use crate::observability::ops::ratelimit::{bucket_points, quota_points};
     use crate::telemetry::ops::MetricName;
     let reading = Reading {
@@ -106,10 +106,13 @@ fn bucket_gauges_carry_an_owner_label_and_quota_points_do_not() {
         observed_at: 1_900_000_000,
         source: Source::Probe,
     };
-    let points = bucket_points(&[
-        (BucketKey::new("app-1", "acme", Resource::Core), reading),
-        (BucketKey::new("app-2", "beta", Resource::Graphql), reading),
-    ]);
+    let points = bucket_points(
+        &[
+            (BucketKey::new("app-1", "acme", Resource::Core), reading),
+            (BucketKey::new("app-2", "beta", Resource::Graphql), reading),
+        ],
+        "app-1",
+    );
     assert_eq!(points.len(), 6);
     for p in &points {
         assert!(matches!(
@@ -118,12 +121,21 @@ fn bucket_gauges_carry_an_owner_label_and_quota_points_do_not() {
                 | MetricName::GithubRateLimitUsed
                 | MetricName::GithubRateLimitReset
         ));
-        assert_eq!(p.labels.len(), 3, "{p:?}");
-        assert!(p.labels.contains_key("owner"));
+        let keys: Vec<&str> = p.labels.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["account", "owner", "resource", "role"], "{p:?}");
     }
     assert!(points
         .iter()
         .any(|p| p.labels["owner"] == "beta" && p.labels["resource"] == "graphql"));
+    // #10343: the writer App's buckets are `writer`, any other App `reader`.
+    for p in &points {
+        let want = if p.labels["account"] == "app-1" {
+            "writer"
+        } else {
+            "reader"
+        };
+        assert_eq!(p.labels["role"], want, "{p:?}");
+    }
 
     let budget = crate::rate_limit_breaker::BudgetSnapshot {
         core_remaining: 1,
@@ -134,9 +146,10 @@ fn bucket_gauges_carry_an_owner_label_and_quota_points_do_not() {
         graphql_reset: chrono::Utc::now(),
         probed_at: chrono::Utc::now(),
     };
-    for p in quota_points(&budget, "app-1") {
+    for p in quota_points(&budget, "octocat", "-", "ambient") {
         let keys: Vec<&str> = p.labels.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["account", "resource"], "unchanged account-only points");
+        assert_eq!(keys, ["account", "owner", "resource", "role"], "{p:?}");
+        assert_eq!((p.labels["owner"].as_str(), p.labels["role"].as_str()), ("-", "ambient"));
     }
 }
 

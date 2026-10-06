@@ -244,7 +244,7 @@ fn the_log_line_rendering_is_unchanged() {
 
 #[test]
 fn a_gauge_tick_emits_remaining_used_and_reset_per_resource() {
-    let points = quota_points(&budget(Some(5000), Some(28)), "app-12345");
+    let points = quota_points(&budget(Some(5000), Some(28)), "octocat", AMBIENT_OWNER, AMBIENT_ROLE);
     let mut seen: Vec<(&str, &str, MetricValue)> = points
         .iter()
         .map(|p| (p.name.as_str(), p.labels["resource"].as_str(), p.value))
@@ -263,14 +263,16 @@ fn a_gauge_tick_emits_remaining_used_and_reset_per_resource() {
     );
     for point in &points {
         assert_eq!(point.name.kind(), MetricKind::Gauge);
-        assert_eq!(point.labels["account"], "app-12345");
+        assert_eq!(point.labels["account"], "octocat");
+        assert_eq!(point.labels["owner"], "-");
+        assert_eq!(point.labels["role"], "ambient");
         assert!(point
             .labels
             .keys()
             .all(|k| OPS_METRIC_LABEL_KEYS.contains(&k.as_str())));
     }
     // A probe without `used` drops only the `used` gauges.
-    assert_eq!(quota_points(&budget(None, None), "unknown").len(), 4);
+    assert_eq!(quota_points(&budget(None, None), "unknown", "-", "ambient").len(), 4);
 }
 
 #[tokio::test]
@@ -311,6 +313,13 @@ fn account_labels_never_carry_a_token_hash_or_path() {
     }
     for hostile in ["", "abc", "12/34", "ghs_123", "1234567890123456789012345"] {
         assert_eq!(app_account_label(hostile), "unknown", "{hostile:?}");
+    }
+    // #10343: the ambient owner/role labels are fixed short tokens.
+    for fixed in [AMBIENT_OWNER, AMBIENT_ROLE] {
+        assert!(
+            fixed.len() <= 8 && fixed.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
+            "{fixed:?}"
+        );
     }
 }
 
@@ -399,4 +408,95 @@ fn the_gauge_fallback_drops_a_reading_whose_window_has_reset() {
     assert_eq!(fresh_fallback(Some(b), t(60)), Some(b));
     assert_eq!(fresh_fallback(Some(b), t(1800)), None);
     assert_eq!(fresh_fallback(None, t(0)), None);
+}
+
+/// A probe reading whose windows are open now (the bucket book only believes
+/// a reading younger than `MAX_AGE_SECS` with an open window).
+fn live_budget(core_used: u64) -> BudgetSnapshot {
+    let now = Utc::now();
+    BudgetSnapshot {
+        core_remaining: 5000 - core_used,
+        core_reset: now + chrono::Duration::minutes(30),
+        graphql_remaining: 4900,
+        graphql_reset: now + chrono::Duration::minutes(40),
+        core_used: Some(core_used),
+        graphql_used: Some(100),
+        probed_at: now,
+    }
+}
+
+#[test]
+fn an_app_host_books_its_probe_and_emits_no_owner_less_point() {
+    use crate::forge_bucket_book::{snapshot, Source};
+    let host = ProbeHost::App {
+        account: "app-1034301".to_string(),
+        owner: "acme-10343".to_string(),
+    };
+    let points = probe_points(
+        &host,
+        Some(live_budget(1200)),
+        || panic!("an App host never reads the breaker fallback"),
+        || panic!("an App host never resolves a login"),
+    );
+    assert!(points.is_empty(), "the probe leaves only through the bucket book: {points:?}");
+
+    let book: Vec<_> = snapshot(Utc::now().timestamp())
+        .into_iter()
+        .filter(|(k, _)| k.account == "app-1034301")
+        .collect();
+    let booked: Vec<(&str, &str, Option<u64>, Source)> = book
+        .iter()
+        .map(|(k, r)| (k.owner.as_str(), k.resource.as_str(), r.used, r.source))
+        .collect();
+    assert_eq!(
+        booked,
+        [
+            ("acme-10343", "core", Some(1200), Source::Probe),
+            ("acme-10343", "graphql", Some(100), Source::Probe),
+        ]
+    );
+    let exported = bucket_points(&book, "app-1034301");
+    assert_eq!(exported.len(), 6);
+    for p in &exported {
+        let keys: Vec<&str> = p.labels.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["account", "owner", "resource", "role"], "{p:?}");
+        assert_eq!(p.labels["role"], "writer");
+        assert_eq!(p.labels["owner"], "acme-10343");
+    }
+}
+
+#[test]
+fn an_app_host_never_books_the_breakers_fallback_reading() {
+    use crate::forge_bucket_book::snapshot;
+    let host = ProbeHost::App {
+        account: "app-1034302".to_string(),
+        owner: "acme".to_string(),
+    };
+    let points = probe_points(&host, None, || Some(live_budget(4999)), || "x".to_string());
+    assert!(points.is_empty());
+    assert!(
+        snapshot(Utc::now().timestamp())
+            .iter()
+            .all(|(k, _)| k.account != "app-1034302"),
+        "a failed probe books nothing"
+    );
+}
+
+#[test]
+fn an_ambient_host_exports_its_probe_or_fallback_as_owner_dash_role_ambient() {
+    let probed = probe_points(&ProbeHost::Ambient, Some(live_budget(7)), || None, || {
+        "octocat".to_string()
+    });
+    let fallback = probe_points(&ProbeHost::Ambient, None, || Some(live_budget(9)), || {
+        "octocat".to_string()
+    });
+    assert_eq!(probed.len(), 6);
+    assert_eq!(fallback.len(), 6);
+    for p in probed.iter().chain(&fallback) {
+        assert_eq!(p.labels["account"], "octocat");
+        assert_eq!(p.labels["owner"], AMBIENT_OWNER);
+        assert_eq!(p.labels["role"], AMBIENT_ROLE);
+        assert!(p.labels.contains_key("resource"));
+    }
+    assert!(probe_points(&ProbeHost::Ambient, None, || None, || "x".to_string()).is_empty());
 }
