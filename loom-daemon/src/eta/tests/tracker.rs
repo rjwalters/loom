@@ -871,6 +871,7 @@ fn the_tracker_records_read_and_stall_features() {
     h.tracker.on_stall_snapshot(StallSnapshot {
         observed_at: t(30),
         budgets: std::collections::BTreeMap::new(),
+        writers: Default::default(),
         breaker: None,
         pool: PoolReading {
             usable: 2,
@@ -891,6 +892,7 @@ fn the_tracker_records_read_and_stall_features() {
     let names = crate::eta::pr_features::PR_SIZE_FEATURES
         .iter()
         .chain(&crate::eta::pr_features::CHECK_FEATURES)
+        .chain(&crate::eta::pr_features::ALL_CHECK_FEATURES)
         .chain(&crate::eta::pr_features::ISSUE_FEATURES)
         .chain(&crate::eta::stall_features::NAMES);
     for name in names {

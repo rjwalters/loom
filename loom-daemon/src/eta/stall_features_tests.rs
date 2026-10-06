@@ -26,6 +26,7 @@ fn snapshot() -> StallSnapshot {
                 }),
             },
         )]),
+        writers: BTreeMap::new(),
         breaker: Some(BreakerReading {
             state: "cooldown".to_string(),
             cooldown_until: Some(t(1800)),
@@ -67,7 +68,12 @@ fn each_source_is_recorded() {
     // Breaker.
     assert_eq!(f.breaker_state.as_deref(), Some("cooldown"));
     assert_eq!(f.breaker_cooldown_until, Some(t(1800)));
-    assert_eq!(omitted.len(), 1, "{omitted:?}");
+    // The writer has no reading in this snapshot (#10334).
+    assert_eq!(
+        reason_of(&omitted, "ratelimit_writer_core_remaining"),
+        Some(reason::NO_WRITER_READING)
+    );
+    assert_eq!(omitted.len(), 3, "{omitted:?}");
 }
 
 #[test]
@@ -209,4 +215,154 @@ fn two_readers_of_one_role_and_a_writer_fallback_are_never_mixed() {
         remaining(&snap, "org-a/w"),
         (None, Some(reason::NO_IDENTITY_READING.to_string()))
     );
+}
+
+/// The writer bucket of `owner`, for building fixtures.
+fn wb(owner: &str) -> String {
+    crate::forge_identity::writer_bucket(owner).unwrap()
+}
+
+/// `writers` for `repos`, every repo served by `owner`'s writer.
+fn writers_of(
+    repos: &[String],
+    owner: &str,
+    buckets: &BTreeMap<String, Vec<ForgeBudgetReading>>,
+) -> BTreeMap<String, RepoBudget> {
+    repo_budgets(repos, |_| Some(wb(owner)), buckets, t(0))
+}
+
+/// #10334: a healthy reader cannot mask an exhausted writer.
+#[test]
+fn an_exhausted_writer_shows_through_a_healthy_reader() {
+    let buckets = BTreeMap::from([
+        (
+            "reader:1@org".to_string(),
+            vec![reading_of(4000, "core"), reading_of(5000, "graphql")],
+        ),
+        (wb("org"), vec![reading_of(0, "core"), reading_of(900, "graphql")]),
+    ]);
+    let repos = vec![REPO.to_string()];
+    let mut snap = snapshot();
+    snap.budgets = repo_budgets(&repos, |_| Some("reader:1@org".to_string()), &buckets, t(0));
+    snap.writers = writers_of(&repos, "org", &buckets);
+    let (f, omitted) = write(Some(&snap), t(0));
+    assert_eq!(f.ratelimit_core_remaining, Some(4000));
+    assert_eq!(f.ratelimit_writer_core_remaining, Some(0));
+    assert_eq!(f.ratelimit_writer_graphql_remaining, Some(900));
+    assert_eq!(f.ratelimit_min_remaining, Some(0));
+    assert_eq!(f.ratelimit_exhausted, Some(true));
+    assert!(reason_of(&omitted, "ratelimit_exhausted").is_none());
+
+    // Both healthy: not exhausted, the minimum is the writer's GraphQL.
+    let healthy = BTreeMap::from([
+        ("reader:1@org".to_string(), vec![reading_of(4000, "core")]),
+        (wb("org"), vec![reading_of(3000, "core"), reading_of(900, "graphql")]),
+    ]);
+    snap.budgets = repo_budgets(&repos, |_| Some("reader:1@org".to_string()), &healthy, t(0));
+    snap.writers = writers_of(&repos, "org", &healthy);
+    let (f, _) = write(Some(&snap), t(0));
+    assert_eq!((f.ratelimit_min_remaining, f.ratelimit_exhausted), (Some(900), Some(false)));
+
+    // A zero reading whose reset has passed constrains nothing.
+    let mut reset = reading_of(0, "core");
+    reset.reset_at = Some(t(-1));
+    snap.writers = writers_of(&repos, "org", &BTreeMap::from([(wb("org"), vec![reset])]));
+    snap.budgets.clear();
+    let (f, _) = write(Some(&snap), t(0));
+    assert_eq!(f.ratelimit_exhausted, None);
+    assert_eq!(
+        reason_of(&write(Some(&snap), t(0)).1, "ratelimit_exhausted"),
+        Some(reason::NO_BUDGET_READING)
+    );
+}
+
+/// #10334 (Judge P2): a multi-owner fleet holds one writer per owner. Owner
+/// A's writer is exhausted; owner B's writer answers later with budget left.
+/// Through the sink and the per-repo writer selection, A's repo keeps its own
+/// exhausted signal and B's repo its own healthy one — neither writer stands
+/// in for the other, and no label is credential-shaped.
+#[test]
+fn two_owners_writers_each_keep_their_own_budget() {
+    use crate::forge_identity::serving_writer_bucket;
+    let at_time = |secs: i64, rem: u64| ForgeBudgetReading {
+        observed_at: t(secs),
+        ..reading_of(rem, "core")
+    };
+    // Readings as the sink returns them: A exhausted (older), B healthy (newer).
+    let (a_bucket, b_bucket) = (wb("Org-A"), wb("org-b"));
+    let (a, b) = (at_time(-30, 0), at_time(-5, 4000));
+    assert_ne!(a_bucket, b_bucket);
+    let buckets = BTreeMap::from([(a_bucket.clone(), vec![a]), (b_bucket.clone(), vec![b])]);
+    let repos = vec!["org-a/x".to_string(), "org-b/y".to_string()];
+    // Both owners have their own registered writer; the primary is org-a.
+    let writers = repo_budgets(
+        &repos,
+        |repo| serving_writer_bucket(repo, true, Some("org-a")),
+        &buckets,
+        t(0),
+    );
+    let mut snap = snapshot();
+    snap.budgets.clear();
+    snap.writers = writers;
+    let at = |repo: &str| {
+        let mut features = Features::default();
+        let mut omitted = Vec::new();
+        write_to(Some(&snap), repo, t(0), &mut features, &mut omitted);
+        (features, omitted)
+    };
+    let (fa, oa) = at("org-a/x");
+    assert_eq!(fa.ratelimit_writer_core_remaining, Some(0));
+    assert_eq!((fa.ratelimit_min_remaining, fa.ratelimit_exhausted), (Some(0), Some(true)));
+    let (fb, _) = at("org-b/y");
+    assert_eq!(fb.ratelimit_writer_core_remaining, Some(4000));
+    assert_eq!(fb.ratelimit_exhausted, Some(false));
+
+    // A repo of an owner with no writer of its own is served by the primary
+    // writer (org-a here), so it inherits A's exhaustion, not B's health.
+    assert_eq!(serving_writer_bucket("org-c/z", false, Some("org-a")), Some(a_bucket.clone()));
+
+    // Nothing carried or keyed is credential-shaped.
+    let text = format!(
+        "{a_bucket}{b_bucket}{}{}{}",
+        serde_json::to_string(&fa).unwrap(),
+        serde_json::to_string(&fb).unwrap(),
+        serde_json::to_string(&oa.iter().map(|o| o.reason.clone()).collect::<Vec<_>>()).unwrap(),
+    );
+    assert_no_credential_shape(&text);
+}
+
+fn assert_no_credential_shape(text: &str) {
+    for shape in [
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "ghu_",
+        "github_pat_",
+        "Bearer ",
+        "-----BEGIN",
+    ] {
+        assert!(!text.contains(shape), "{shape} in {text}");
+    }
+}
+
+/// #10334: nothing recorded or carried is credential-shaped, and a
+/// credential-shaped or invalid "owner" never becomes a writer label.
+#[test]
+fn no_credential_shaped_string_is_carried() {
+    let buckets = BTreeMap::from([(wb("org"), vec![reading_of(5, "core")])]);
+    let mut snap = snapshot();
+    snap.writers = writers_of(&[REPO.to_string()], "org", &buckets);
+    let (f, omitted) = write(Some(&snap), t(0));
+    let text = format!(
+        "{}{}{}",
+        serde_json::to_string(&f).unwrap(),
+        serde_json::to_string(&omitted.iter().map(|o| o.reason.clone()).collect::<Vec<_>>())
+            .unwrap(),
+        wb("org"),
+    );
+    assert_no_credential_shape(&text);
+    assert_eq!(wb("Org"), "writer@org");
+    for bad in ["ghp_abc123", "github_pat_x", "Bearer x", "", "-org", "a/b"] {
+        assert_eq!(crate::forge_identity::writer_bucket(bad), None, "{bad}");
+    }
 }

@@ -38,6 +38,8 @@ pub const NOT_RECONSTRUCTABLE: &[&str] = &[
     "sweep_runtime",
     "checks_pending",
     "checks_failed",
+    "checks_all_pending",
+    "checks_all_failed",
     "pool_usable_accounts (host-local)",
     "pool_exhausted (host-local)",
     "ratelimit_core_remaining (host-local)",
@@ -46,6 +48,10 @@ pub const NOT_RECONSTRUCTABLE: &[&str] = &[
     "ratelimit_graphql_reset_at (host-local)",
     "breaker_state (host-local)",
     "breaker_cooldown_until (host-local)",
+    "ratelimit_writer_core_remaining (host-local)",
+    "ratelimit_writer_graphql_remaining (host-local)",
+    "ratelimit_min_remaining (host-local)",
+    "ratelimit_exhausted (host-local)",
 ];
 
 /// One feature's tally.

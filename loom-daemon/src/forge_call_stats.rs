@@ -515,8 +515,8 @@ struct SinkLine {
     /// Identity role (#9872); absent on pre-#9872 lines and non-facade calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ir: Option<String>,
-    /// Reader rate-limit bucket (#10232); absent for the writer and on
-    /// older lines.
+    /// Reader rate-limit bucket (#10232); absent for the writer (whose
+    /// bucket is derived from its owner, #10334) and on older lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ib: Option<String>,
     /// The W1 bucket attribution, flattened into the same short-key line.
@@ -610,11 +610,27 @@ struct Aggregate {
     /// Counts per identity role (#9872); a line without one is `unknown`.
     roles: BTreeMap<String, Counts>,
     latest: BTreeMap<Pool, Reading>,
-    /// The newest reading per `(pool, reader bucket)` (#10232): `latest`
-    /// above collapses every identity, but each reader App installation owns
-    /// a separate budget (two readers share the `reader` role, so the role
-    /// is not a key). Only lines that name a bucket land here.
+    /// The newest reading per `(pool, identity bucket)` (#10232, #10334):
+    /// `latest` above collapses every identity, but each reader App
+    /// installation and each owner's writer own separate budgets (two
+    /// readers, or two owners' writers, share a role, so the role is not a
+    /// key). Only lines that name a bucket, or ran as an owner's writer, land
+    /// here.
     latest_by_bucket: BTreeMap<(Pool, String), Reading>,
+}
+
+/// The owner whose writer a writer-role `line` spent (#10334): the owner its
+/// credential is installed for (`co`, booked by the `gh` facade), else the
+/// owner of the repo it served (`rp`) — the owner the serving writer is
+/// selected by. `None` when the line names neither.
+fn writer_owner(line: &SinkLine) -> Option<String> {
+    line.at.co.clone().or_else(|| {
+        line.rp
+            .as_deref()
+            .map(crate::credential_preflight::owner_of_nwo)
+            .filter(|o| !o.is_empty())
+            .map(str::to_string)
+    })
 }
 
 impl Aggregate {
@@ -645,7 +661,19 @@ impl Aggregate {
                 };
                 self.latest.insert(line.p, reading);
             }
-            if let Some(bucket) = line.ib.clone() {
+            // A reader names its bucket; a writer (or writer-fallback) line
+            // lands under its own owner's writer label (#10334): the owner the
+            // credential is installed for, else the owner of the repo it
+            // served. So neither a healthy reader nor another owner's healthy
+            // writer can stand in for an exhausted writer; a writer line with
+            // no owner at all lands in no bucket.
+            let bucket = line.ib.clone().or_else(|| {
+                matches!(line.ir.as_deref(), Some("writer" | "writer-fallback"))
+                    .then(|| writer_owner(line))
+                    .flatten()
+                    .and_then(|owner| crate::forge_identity::writer_bucket(&owner))
+            });
+            if let Some(bucket) = bucket {
                 let key = (line.p, bucket);
                 if self
                     .latest_by_bucket
@@ -1058,11 +1086,13 @@ fn exhausted_in(latest: &BTreeMap<Pool, Reading>, now: i64) -> Vec<(Pool, Option
 }
 
 /// The newest header budget reading of each pool, per **reader rate-limit
-/// bucket** (#10232), keyed by the public bucket label
-/// ([`crate::forge_identity::reader_bucket`]). Unlike [`status_report`]'s
-/// `budget` this never mixes identities: two readers of the same role are
-/// separate buckets, and a line that named no bucket (the writer, an
-/// unattributed call) is not returned at all. Never a credential.
+/// identity bucket** (#10232, #10334), keyed by the public bucket label
+/// ([`crate::forge_identity::reader_bucket`], or
+/// [`crate::forge_identity::writer_bucket`] — `writer@<owner>` — for an
+/// owner's writer and its fallback). Unlike [`status_report`]'s `budget` this
+/// never mixes identities: two readers of the same role, or two owners'
+/// writers, are separate buckets, and an unattributed call is not returned at
+/// all. Never a credential.
 #[must_use]
 pub fn bucket_readings(now: DateTime<Utc>) -> BTreeMap<String, Vec<ForgeBudgetReading>> {
     let window = sink_dir().map(|d| read_window(&d, now.timestamp()));
