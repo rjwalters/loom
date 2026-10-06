@@ -163,6 +163,8 @@ check_and_unblock_prs() {
     local body=$(printf '%s\n' "$pr_row" | jq -r '.body')
     local title=$(printf '%s\n' "$pr_row" | jq -r '.title')
 
+    [ "$(has_permanent_block "$number")" = "true" ] && continue  # #8742, guide.md
+
     local deps=$(parse_dependencies "$body")
 
     if [ -z "$deps" ]; then
@@ -259,9 +261,9 @@ itself.
 previous_review_label() {
   local number="$1"
   local label
-  label=$(gh api "repos/{owner}/{repo}/issues/${number}/events" --jq \
-    'map(select(.event == "labeled" and (.label.name == "loom:review-requested" or .label.name == "loom:changes-requested"))) | last | .label.name' \
-    2>/dev/null)
+  label=$(gh api --paginate "repos/{owner}/{repo}/issues/events?per_page=100" --jq \
+    ".[] | select(.issue.number == ${number} and .event == \"labeled\" and (.label.name == \"loom:review-requested\" or .label.name == \"loom:changes-requested\")) | .label.name" \
+    2>/dev/null | head -1)  # newest-first: first match is the latest; ends pagination
   if [ "$label" = "loom:changes-requested" ]; then
     echo "loom:changes-requested"
   else
