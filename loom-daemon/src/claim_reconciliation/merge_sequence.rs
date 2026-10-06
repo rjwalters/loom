@@ -1003,10 +1003,11 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
     }
     for g in &report.groups {
         for e in &g.edges {
-            if markers
-                .get(&e.follower)
-                .is_some_and(|m| marker_text(m) == marker_text(&edge_marker(e)))
-            {
+            // #10634: the order key, not the plan id — the live pass keeps a
+            // comment whose key matches, whatever plan id it carries.
+            if markers.get(&e.follower).is_some_and(|m| {
+                landing::LandingKey::of(m) == landing::LandingKey::of(&edge_marker(e))
+            }) {
                 report.already_planned += 1;
             }
         }
@@ -1086,16 +1087,23 @@ pub(super) fn reconcile_merge_sequences_with(
     root: &Path,
     prefetched: Option<&[super::open_pr_listing::RestPull]>,
 ) -> MergeSequenceStats {
-    // #10634: one host per workspace runs the pass — the role-runner shard
+    // #10634: one host per workspace plans and posts — the role-runner shard
     // (#6374/#6704) that already makes one host of a sharded fleet own a
     // workspace's other forge-writing passes (`stale_blocked`). Unsharded
-    // hosts own everything, so a lone daemon is unaffected.
+    // hosts own everything, so a lone daemon is unaffected. Releasing an
+    // existing hold is not gated (see `reconcile_merge_sequences_gated`).
     let owned = cfg!(test) || crate::role_shard::decide(root).admits_role_tick();
     reconcile_merge_sequences_gated(gh_bin, root, prefetched, owned)
 }
 
-/// [`reconcile_merge_sequences_with`] with the shard verdict supplied: a host
-/// that does not own `root` makes no forge call at all (#10634).
+/// [`reconcile_merge_sequences_with`] with the shard verdict supplied
+/// (#10634). A host that does not own `root` still runs Phase 1's releases —
+/// they are idempotent, and a slice with no live owner (its static-shard host
+/// down, a roster yielding everywhere, the owner skipped by write scope) must
+/// not keep `loom:sequenced` on PRs that `merge-pr.sh` then refuses (Judge,
+/// PR #10651). It does not plan or post: no new landing-order comment, no
+/// re-anchor record, no stall escalation. With no hold in the listing it
+/// makes no forge call beyond the listing.
 pub(super) fn reconcile_merge_sequences_gated(
     gh_bin: &Path,
     root: &Path,
@@ -1104,14 +1112,6 @@ pub(super) fn reconcile_merge_sequences_gated(
 ) -> MergeSequenceStats {
     let mut stats = MergeSequenceStats::default();
     if !merge_sequence_enabled() {
-        return stats;
-    }
-    if !owned {
-        log::debug!(
-            "claim_reconciliation (merge sequence): {} is owned by another host's shard — \
-             skipped (#10634)",
-            root.display()
-        );
         return stats;
     }
     let listed = match prefetched {
@@ -1243,8 +1243,11 @@ pub(super) fn reconcile_merge_sequences_gated(
                 release_hold(gh_bin, root, pr.number, REPLAN_NOTE_BODY).map(|_| action)
             }
             HoldAction::HoldSoft | HoldAction::HoldHard => match reanchored.as_ref() {
-                Some(m) => sticky::record_reanchor(gh_bin, root, pr.number, m).map(|_| action),
-                None => Ok(action),
+                // Re-anchor records are posting: the owner writes them.
+                Some(m) if owned => {
+                    sticky::record_reanchor(gh_bin, root, pr.number, m).map(|_| action)
+                }
+                _ => Ok(action),
             },
         };
         match result {
@@ -1265,6 +1268,16 @@ pub(super) fn reconcile_merge_sequences_gated(
                 );
             }
         }
+    }
+
+    // #10634: everything below plans or posts — the workspace's owner only.
+    if !owned {
+        log::debug!(
+            "claim_reconciliation (merge sequence): {} is owned by another host's shard — \
+             holds evaluated, planning skipped (#10634)",
+            root.display()
+        );
+        return stats;
     }
 
     // Phase 1b: one escalation per stalled chain (#10060), deduped on the

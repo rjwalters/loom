@@ -188,7 +188,8 @@ fn fake_gh(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
          case \"$1 $2\" in\n\
          'api '*/issues/comments/*) exit 0 ;;\n\
          'api '*/issues/*/comments*) n=\"${{2#*/issues/}}\"; n=\"${{n%%/*}}\"; cat \"{d}/comments-$n.json\" 2>/dev/null || echo '[]' ;;\n\
-         'api '*/issues/*/timeline*) exit 1 ;;\n\
+         'api '*/issues/*/timeline*) n=\"${{2#*/issues/}}\"; n=\"${{n%%/*}}\"; cat \"{d}/timeline-$n.json\" 2>/dev/null || exit 1 ;;\n\
+         'api '*/compare/*) cat \"{d}/compare.json\" 2>/dev/null || exit 1 ;;\n\
          'api '*/pulls/*) cat \"{d}/pull-${{2##*/}}.json\" || exit 1 ;;\n\
          'api --include') n=\"${{3%/files*}}\"; n=\"${{n##*/}}\"; [ -f \"{d}/files-$n.json\" ] || exit 1;\
            printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'; cat \"{d}/files-$n.json\" ;;\n\
@@ -211,13 +212,24 @@ fn setup(
     head2: &str,
     thread: &[ThreadComment],
 ) -> Vec<super::super::super::open_pr_listing::RestPull> {
+    setup_labeled(d, head2, &[], thread)
+}
+
+/// [`setup`] with `labels2` on #2.
+#[cfg(unix)]
+fn setup_labeled(
+    d: &std::path::Path,
+    head2: &str,
+    labels2: &[&str],
+    thread: &[ThreadComment],
+) -> Vec<super::super::super::open_pr_listing::RestPull> {
     use super::super::super::open_pr_listing::test_support::{listing, row};
     let now = chrono::Utc::now().to_rfc3339();
     let rows = vec![
         row(1, &["loom:pr"])
             .created("2026-10-02T00:00:01Z")
             .updated(&now),
-        row(2, &[])
+        row(2, labels2)
             .sha(head2)
             .created("2026-10-02T00:00:02Z")
             .updated(&now),
@@ -334,7 +346,8 @@ fn a_duplicate_marker_is_cleaned_up() {
     assert_eq!(count(&calls, "pr comment"), 0, "{calls}");
 }
 
-/// Single writer: a host outside the workspace's shard makes no forge call.
+/// Single writer: a host outside the workspace's shard does not plan, so
+/// with no hold to evaluate it makes no forge call.
 #[cfg(unix)]
 #[test]
 #[serial_test::serial]
@@ -344,7 +357,13 @@ fn a_host_that_does_not_own_the_workspace_stays_silent() {
     let listing = setup(d, &sha(2), &[]);
     let (stats, calls) = tick(d, &listing, false);
     assert!(calls.is_empty(), "{calls}");
-    assert_eq!(stats, MergeSequenceStats::default());
+    assert_eq!(
+        stats,
+        MergeSequenceStats {
+            checked: 3,
+            ..MergeSequenceStats::default()
+        }
+    );
 }
 
 /// An unreadable thread is not an empty one: no post on a failed read.
@@ -360,4 +379,97 @@ fn a_failed_comments_read_skips_the_edge() {
     assert_eq!(count(&calls, "pr comment"), 0, "{calls}");
     assert_eq!(count(&calls, "pr edit"), 0, "{calls}");
     assert_eq!(stats.applied, 0);
+}
+
+/// A non-owner still releases a hold whose predecessor landed: a slice with
+/// no live owner must not keep `loom:sequenced` on a PR `merge-pr.sh` would
+/// then refuse (Judge, PR #10651). It plans and posts nothing else.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn a_host_that_does_not_own_the_workspace_still_releases_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let m = marker(&sha(2), "seq-00000000");
+    let listing = setup_labeled(d, &sha(2), &["loom:sequenced"], &[keyed(10, &m)]);
+    std::fs::write(
+        d.join("pull-1.json"),
+        serde_json::json!({"state": "closed", "merged": true, "head": {"sha": sha(1)},
+                           "updated_at": chrono::Utc::now().to_rfc3339()})
+        .to_string(),
+    )
+    .unwrap();
+    let (stats, calls) = tick(d, &listing, false);
+    assert_eq!(stats.released, 1, "{calls}");
+    assert_eq!(count(&calls, "pr edit 2 --remove-label loom:sequenced"), 1, "{calls}");
+    assert_eq!(count(&calls, "--add-label"), 0, "{calls}");
+    assert_eq!(count(&calls, "issues/comments/"), 0, "{calls}");
+    assert!(!calls.contains("loom:landing-order"), "no landing comment:\n{calls}");
+}
+
+/// Judge finding on PR #10651 (#10398 meets the in-place edit), the whole
+/// sequence: (1) an operator removes `loom:sequenced`; (2) the follower gets
+/// a real push, so no release is recorded; (3) the pass edits its landing
+/// comment in place to the new head, and the label add fails; (4) the next
+/// tick must NOT read the old removal as a release of the edited marker.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn an_in_place_edit_after_an_operator_removal_is_not_an_operator_release() {
+    use super::super::sticky::OPERATOR_RELEASE_PREFIX;
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let write = |name: &str, v: serde_json::Value| {
+        std::fs::write(d.join(name), v.to_string()).unwrap();
+    };
+    let label = |event: &str, actor: &str, at: &str| {
+        serde_json::json!({"event": event, "created_at": at,
+                           "label": {"name": "loom:sequenced"}, "actor": {"login": actor}})
+    };
+    // Comment 10 was posted at 07:00 and the label added at 07:00:01.
+    let timeline = |body: String, updated_at: &str| {
+        serde_json::json!([
+            {"event": "commented", "created_at": "2026-10-05T07:00:00Z",
+             "updated_at": updated_at, "body": body, "actor": {"login": BOT}},
+            label("labeled", BOT, "2026-10-05T07:00:01Z"),
+            // (1) The operator's removal, at 08:00.
+            label("unlabeled", "rjwalters", "2026-10-05T08:00:00Z"),
+        ])
+    };
+    let m1 = marker(&sha(2), "seq-00000000");
+    let pushed = sha(0x902);
+
+    // (2) #2 was pushed with a tree change: no release is recorded, and
+    // (3) the pass edits comment 10 in place.
+    let listing = setup(d, &pushed, &[keyed(10, &m1)]);
+    write(
+        "timeline-2.json",
+        timeline(landing_comment_body(&m1, EdgeReason::SharedFiles), "2026-10-05T07:00:00Z"),
+    );
+    write(
+        "compare.json",
+        serde_json::json!({"status": "ahead", "files": [{"filename": "lib.rs"}]}),
+    );
+    let (_, calls) = tick(d, &listing, true);
+    assert!(!calls.contains(OPERATOR_RELEASE_PREFIX), "{calls}");
+    assert_eq!(count(&calls, "issues/comments/10 --method PATCH"), 1, "{calls}");
+    assert_eq!(count(&calls, "pr comment"), 0, "{calls}");
+
+    // The edit landed at 09:00; the label add failed, so the next listing
+    // still has no `loom:sequenced` on #2.
+    let m2 = marker(&pushed, "seq-11111111");
+    let listing = setup(d, &pushed, &[keyed(10, &m2)]);
+    write(
+        "timeline-2.json",
+        timeline(landing_comment_body(&m2, EdgeReason::SharedFiles), "2026-10-05T09:00:00Z"),
+    );
+
+    // (4) The 08:00 removal predates the marker: heal the label, record nothing.
+    let (stats, calls) = tick(d, &listing, true);
+    assert!(calls.contains("issues/2/timeline"), "the sticky reader ran:\n{calls}");
+    assert!(!calls.contains(OPERATOR_RELEASE_PREFIX), "no false release:\n{calls}");
+    assert!(!calls.contains("Sequencing release kept"), "{calls}");
+    assert_eq!(count(&calls, "pr edit 2 --add-label loom:sequenced"), 1, "{calls}");
+    assert_eq!(count(&calls, "issues/comments/"), 0, "the key is unchanged:\n{calls}");
+    assert_eq!(stats.applied, 1, "{calls}");
 }
