@@ -89,6 +89,49 @@ path = "loom-daemon/src/forge_check_open_pr.rs"
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/lib/worktree-forge-pr-check.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_pull_listing.rs"
+
+[[operation]]
+id = "pr.list-open"
+group = "pr-creation-discovery-state"
+summary = "List every open PR of a repo (the daemon's PR-side reconciliation passes, client-side label filter)."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "state"]
+outputs = ["number", "state", "draft", "labels", "head_ref", "head_sha", "base_ref", "updated_at"]
+required_fields = ["number", "state", "labels", "head_ref"]
+actor = "daemon"
+permissions = ["pull_requests:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::pull-requests::pr-list-open"
+test_status = "declared"
+owner = "daemon-sweep"
+risk = "normal"
+github = { commands = [
+  "gh pr list",
+], routes = [
+  "GET repos/{owner}/{repo}/pulls",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+notes = "ETag'd REST pages (#10349); an unchanged repo answers with free 304s. A truncated listing is a completeness bug, not a display one."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_pull_listing.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/pr_planning/listing.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/observability/eta_friction.rs"
 
 [[operation]]
 id = "pr.view-state"
@@ -191,6 +234,9 @@ path = "defaults/.claude/commands/loom/doctor.md"
 [[operation.callers]]
 kind = "role-prompt"
 path = "defaults/.claude/commands/loom/judge.md"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_pull_listing.rs"
 
 [[operation]]
 id = "pr.commits-and-compare"

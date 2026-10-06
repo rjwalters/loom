@@ -285,7 +285,9 @@ fn fake_gh(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
          'api '*/issues/*/timeline*) n=\"${{2#*/issues/}}\"; n=\"${{n%%/*}}\"; cat \"{d}/timeline-$n.json\" || exit 1 ;;\n\
          'api '*/compare/*) cat \"{d}/compare.json\" || exit 1 ;;\n\
          'api '*/pulls/*) cat \"{d}/pull-${{2##*/}}.json\" || exit 1 ;;\n\
-         'pr view') if [ \"$5\" = files ]; then cat \"{d}/files-$3.json\" || exit 1; else cat \"{d}/labels-$3.txt\" 2>/dev/null || true; fi ;;\n\
+         'api --include') n=\"${{3%/files*}}\"; n=\"${{n##*/}}\"; [ -f \"{d}/files-$n.json\" ] || exit 1;\
+           printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'; cat \"{d}/files-$n.json\" ;;\n\
+         'pr view') cat \"{d}/labels-$3.txt\" 2>/dev/null || true ;;\n\
          'pr comment'|'pr edit') exit 0 ;;\n\
          *) exit 1 ;;\nesac\n",
         log = log.display(),
@@ -347,7 +349,7 @@ fn setup(
         &serde_json::json!({"state": "open", "merged": false, "head": {"sha": sha(1)}, "updated_at": now}),
     );
     for (n, path) in [(1, "lib.rs"), (2, "lib.rs"), (3, "other.rs")] {
-        write(d, &format!("files-{n}.json"), &serde_json::json!({"files": [{"path": path}]}));
+        write(d, &format!("files-{n}.json"), &serde_json::json!([{"filename": path}]));
     }
     let files: Vec<_> = (0..compare_files)
         .map(|i| serde_json::json!({"filename": format!("f{i}.rs")}))

@@ -2082,24 +2082,10 @@ pub mod forge {
     /// where by construction the Builder never completed — so a
     /// branch-name match is sufficient; there is no earlier-attempt PR to miss.
     fn first_open_linked_pr(gh_bin: &Path, root: &Path, issue: u32) -> Option<bool> {
-        let head = format!("feature/issue-{issue}");
-        let stdout =
-            gh_call::ok_stdout(gh_call::read("claim.pr_list_by_head", gh_bin, root).args([
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--head",
-                &head,
-                "--json",
-                "number",
-                "--jq",
-                ".[].number",
-            ]))?;
-        let has_open = String::from_utf8_lossy(&stdout)
-            .lines()
-            .any(|l| l.trim().parse::<u32>().is_ok());
-        Some(has_open)
+        // #10382: REST `pulls?head=` (was GraphQL `gh pr list --head`).
+        let caller = "claim.pr_list_by_head";
+        let prs = crate::reclaim_pr_warning::open_prs_on_issue_branch(caller, gh_bin, root, issue);
+        prs.ok().map(|v| !v.is_empty())
     }
 
     /// Flip an issue's claim label from `loom:building` back to
@@ -3297,3 +3283,7 @@ mod verdict_dedup_tests;
 // #9548: only trusted authors' verdict markers count.
 #[cfg(test)]
 mod trusted_comments_tests;
+
+// #10382: the pass family's files / by-head reads are REST-only.
+#[cfg(test)]
+mod rest_only_tests;

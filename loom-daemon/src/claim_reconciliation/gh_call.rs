@@ -91,7 +91,6 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "chain_lock.comments"
         | "roster.comments" => ops::COMMENT_LIST,
         "claim.pr_labels" | "sequence.predecessor" | "chain_lock.pr_base" => ops::PR_VIEW_STATE,
-        "claim.pr_list_by_head" => ops::PR_LIST_BY_HEAD,
         "intake.list_open" | "quarantine.issue_list" => ops::ISSUE_LIST,
         "claim.issue_reclaim"
         | "claim.pr_add_label"

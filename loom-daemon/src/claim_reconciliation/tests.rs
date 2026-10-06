@@ -1289,14 +1289,14 @@ fn write_fake_gh(
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
+if [[ "$*" == *'pulls?head='* ]]; then
+  # REST by-head read (#10382): no open linked PR by default (the
+  # Issue #4462 no-progress path treats `[]` as "no PR").
+  printf 'HTTP/2.0 200 OK\r\n\r\n'; echo '[]'; exit 0
+fi
 if [ "$1" = "api" ] && [[ "$*" != */comments* ]]; then
   printf 'HTTP/2.0 200 OK\r\n\r\n'
   echo '[{{"number":{issue_number},"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{updated_at}"}}]'
-  exit 0
-fi
-if [ "$1" = "pr" ]; then
-  # `pr list --head feature/issue-N ...`: no open linked PR by default
-  # (the Issue #4462 no-progress path treats empty stdout as "no PR").
   exit 0
 fi
 exit 0
@@ -2201,20 +2201,20 @@ fn reconcile_workspace_no_fast_reclaim_when_open_pr_exists() {
 
     seed_checkpoint_phase(&repo_root, 82, "curator-done");
 
-    // Fake gh that reports an OPEN PR for `pr list` (so no_progress=false).
+    // Fake gh that reports an OPEN PR for the by-head read (so no_progress=false).
     let gh_log = dir.path().join("gh-invocations.log");
     let now = Utc::now().to_rfc3339();
     let fake_gh = dir.path().join("fake-gh-with-pr.sh");
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
+if [[ "$*" == *'pulls?head='* ]]; then
+  printf 'HTTP/2.0 200 OK\r\n\r\n'; echo '[{{"number":4242,"state":"open","head":{{"ref":"feature/issue-82"}}}}]'
+  exit 0
+fi
 if [ "$1" = "api" ] && [[ "$*" != */comments* ]]; then
   printf 'HTTP/2.0 200 OK\r\n\r\n'
   echo '[{{"number":82,"state":"open","labels":[{{"name":"loom:building"}}],"updated_at":"{now}"}}]'
-  exit 0
-fi
-if [ "$1" = "pr" ]; then
-  echo 4242
   exit 0
 fi
 exit 0

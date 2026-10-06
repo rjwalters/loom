@@ -89,7 +89,6 @@ use std::path::Path;
 
 use anyhow::Result;
 use chrono::Utc;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::gh_call;
@@ -860,19 +859,11 @@ fn changed_files(gh_bin: &Path, root: &Path, pr: &SequencePr) -> Option<BTreeSet
     super::read_cache::CHANGED_FILES.get_or(key, || fetch_changed_files(gh_bin, root, pr.number))
 }
 
+/// #10382: ETag'd REST `pulls/{n}/files` (was GraphQL `gh pr view --json
+/// files`), so a re-read after `CHANGED_FILES` expires is a free `304`.
 fn fetch_changed_files(gh_bin: &Path, root: &Path, number: u32) -> Option<BTreeSet<String>> {
-    #[derive(Debug, Deserialize)]
-    struct Row {
-        path: String,
-    }
-    #[derive(Debug, Deserialize)]
-    struct Files {
-        #[serde(default)]
-        files: Vec<Row>,
-    }
-    let stdout = gh_pr(gh_bin, root, &["view", &number.to_string(), "--json", "files"]).ok()?;
-    let parsed: Files = serde_json::from_slice(&stdout).ok()?;
-    Some(parsed.files.into_iter().map(|Row { path }| path).collect())
+    let caller = "claim_reconciliation.pr_files";
+    crate::forge_pull_listing::pull_files_cached_as(caller, gh_bin, Some(root), None, number).ok()
 }
 
 /// A holder's newest trusted marker (`Some(None)`: a manual hold), `None`
