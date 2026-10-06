@@ -396,6 +396,58 @@ pub fn withdraw_scoped_until(
     *held
 }
 
+/// The scoped withdrawals that are about **budget** (a primary or secondary
+/// rate limit), as opposed to a refused credential. Same key and end as the
+/// entry [`withdraw_scoped_budget_until`] also writes to the scoped table.
+fn budget_withdrawals() -> &'static Mutex<HashMap<ScopedKey, SystemTime>> {
+    static BUDGET: OnceLock<Mutex<HashMap<ScopedKey, SystemTime>>> = OnceLock::new();
+    BUDGET.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// [`withdraw_scoped_until`] for a rate limit: the reader is out of
+/// **budget** for `owner`'s `scope`, which is the one reason a deferrable
+/// read may be shed (W4-C) rather than sent to the writer. Returns the
+/// instant the scoped withdrawal now ends.
+pub fn withdraw_scoped_budget_until(
+    app_id: &str,
+    owner: &str,
+    scope: ResourceScope,
+    until: SystemTime,
+) -> SystemTime {
+    let held = withdraw_scoped_until(app_id, owner, scope, until);
+    if let Ok(mut map) = budget_withdrawals().lock() {
+        let slot = map
+            .entry((app_id.to_string(), owner.to_ascii_lowercase(), scope))
+            .or_insert(held);
+        if held > *slot {
+            *slot = held;
+        }
+    }
+    held
+}
+
+/// Whether reader `app_id` is withdrawn from `owner`'s `resource` at `now`
+/// because of a rate limit (that resource's or [`ResourceScope::All`]'s) —
+/// not a credential failure, a coverage miss or a stale token.
+#[must_use]
+pub fn is_budget_withdrawn_at(
+    app_id: &str,
+    owner: &str,
+    resource: Resource,
+    now: SystemTime,
+) -> bool {
+    let Ok(map) = budget_withdrawals().lock() else {
+        return false; // unknown cause: never shed on it
+    };
+    let owner = owner.to_ascii_lowercase();
+    [ResourceScope::of(resource), ResourceScope::All]
+        .into_iter()
+        .any(|scope| {
+            map.get(&(app_id.to_string(), owner.clone(), scope))
+                .is_some_and(|&until| now < until)
+        })
+}
+
 /// Whether reader `app_id` is withdrawn from `owner`'s `resource` at `now`,
 /// by a withdrawal of that resource or of [`ResourceScope::All`].
 #[must_use]

@@ -291,7 +291,7 @@ struct PrRow {
 }
 
 fn gh_pr_list(repo_root: &Path, args: &[&str]) -> Option<Vec<PrRow>> {
-    let out = gh::bounded_counted("clean.pr_list", repo_root, args)?;
+    let out = gh::bounded_hygiene("clean.pr_list", repo_root, args)?;
     if !out.status.success() {
         return None;
     }
@@ -546,7 +546,7 @@ impl PrProbe {
 /// both the eligibility status and the head SHA.
 #[must_use]
 pub fn check_pr_by_number_rest(repo_root: &Path, pr_num: u32) -> PrProbe {
-    let Some(out) = gh::bounded_counted(
+    let Some(out) = gh::bounded_hygiene(
         "clean.pr_by_number_rest",
         repo_root,
         ["api", &format!("repos/{{owner}}/{{repo}}/pulls/{pr_num}")],

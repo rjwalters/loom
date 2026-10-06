@@ -307,6 +307,7 @@ fn an_exhausted_route_runs_on_the_writer() {
     let lookup = |_: &crate::forge_identity::RouteRequest<'_>| {
         crate::forge_identity::RouteDecision::Exhausted {
             until: std::time::SystemTime::now(),
+            cause: crate::forge_identity::ExhaustCause::Budget,
         }
     };
     let withdraw = |_: &str, _: &str, _: Failure, _: &str| {};

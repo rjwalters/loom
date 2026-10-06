@@ -43,13 +43,16 @@
 pub mod accounting;
 mod affinity;
 pub mod api_kind;
+pub(crate) mod cwd_route;
 mod outcome;
 mod reader_route;
 pub mod resolver;
 pub mod telemetry;
 pub mod transparent;
 
+pub use crate::forge_identity::ReadClass;
 pub use affinity::{affinity_key, url_affinity_key};
+pub use reader_route::{READ_SHED_ENV, SHED_MARKER};
 
 #[cfg(test)]
 mod tests;
@@ -239,6 +242,17 @@ pub enum GhCompletion {
     /// A [`OutputContract::Passthrough`] or
     /// [`OutputContract::CredentialHelper`] run's exit status.
     Passthrough(ExitStatus),
+    /// Not run (W4-C): a [`ReadClass::Hygiene`] or
+    /// [`ReadClass::Observability`] read whose readers for `owner`'s
+    /// `resource` were all withdrawn, deferred instead of spending the
+    /// writer's bucket. No request was sent. Classified as
+    /// [`crate::cmd_out::Unavailable::Shed`] — "no answer", never a
+    /// negative one.
+    Shed {
+        owner: String,
+        resource: crate::forge_bucket_book::Resource,
+        until: std::time::SystemTime,
+    },
 }
 
 /// The environment variables `gh` documents as taking precedence over a
@@ -289,6 +303,18 @@ pub struct GhInvocation {
     /// Empty by default: an unmapped site records `operation = "unknown"`
     /// (see [`accounting`]), visible rather than absent.
     identity: crate::forge_call_stats::CallIdentity,
+    /// The repository the facade derived for an untargeted read (W4-C,
+    /// [`cwd_route`]). It steers only the **reader** attempt (its slug, its
+    /// `GH_REPO`) and the accounting row; `target` is never changed, so the
+    /// writer attempt's environment is exactly the pre-W4-C one.
+    route_slug: Option<String>,
+    /// How this read may be treated when its readers run dry (W4-C).
+    /// [`ReadClass::Gate`] — the default — is never shed.
+    read_class: ReadClass,
+    /// The derivation already counted this call's local repo disagreement
+    /// (`facade.cwd_route.disagree`), so its accounting row must not count
+    /// it again (one counter, one count per call).
+    disagree_counted: bool,
 }
 
 impl GhInvocation {
@@ -319,6 +345,9 @@ impl GhInvocation {
             writer_only: false,
             role: None,
             identity: crate::forge_call_stats::CallIdentity::default(),
+            route_slug: None,
+            read_class: ReadClass::Gate,
+            disagree_counted: false,
         }
     }
 
@@ -439,6 +468,26 @@ impl GhInvocation {
         self
     }
 
+    /// Classify this read for reader exhaustion (W4-C). The default,
+    /// [`ReadClass::Gate`], keeps today's writer fallback; a
+    /// [`ReadClass::Hygiene`] or [`ReadClass::Observability`] read is shed
+    /// ([`GhCompletion::Shed`]) instead of spending the writer's bucket when
+    /// every reader for its owner and resource is withdrawn. Mark a read
+    /// non-`Gate` only when its consumer maps "no answer" to skip / unknown
+    /// and nothing it decides (a dispatch, claim, merge, reap, label flip)
+    /// rests on it.
+    #[must_use]
+    pub fn read_class(mut self, class: ReadClass) -> Self {
+        self.read_class = class;
+        self
+    }
+
+    /// This read's [`ReadClass`].
+    #[must_use]
+    pub fn class(&self) -> ReadClass {
+        self.read_class
+    }
+
     /// Record this execution under `role` (#9872) — for a caller that routes
     /// its own reads (`forge_etag_store`, `ci_telemetry`). The choke point's
     /// own routing sets it itself.
@@ -512,8 +561,11 @@ impl GhInvocation {
     ///   working directory, else for the target's owner (the
     ///   `credential_preflight::apply_gh_config_for_{root,owner_slug}`
     ///   lookups). Absent ⇒ the child inherits the process-global value.
-    /// - `GH_REPO`: the typed target, else the machine-global `LOOM_REPO`
-    ///   override (`gh_repo_env::apply_loom_repo_override`'s contract).
+    /// - `GH_REPO`: the typed target, else — on the **reader** attempt of a
+    ///   derived route only (W4-C, [`cwd_route`]) — the derived repo, else
+    ///   the machine-global `LOOM_REPO` override
+    ///   (`gh_repo_env::apply_loom_repo_override`'s contract). A writer
+    ///   attempt never sees the derived repo.
     /// - `LOOM_TRACEPARENT` / `TRACEPARENT`: set together from
     ///   `child_context` — the invocation's own span when it is exported, so
     ///   the managed launcher (C4) parents its HTTP spans under it — or both
@@ -551,7 +603,14 @@ impl GhInvocation {
                 value: Some(dir.into_os_string()),
             });
         }
-        if let Some(repo) = slug.map(OsString::from).or(loom_repo) {
+        // W4-C: only the reader attempt of a derived route names its repo;
+        // every writer attempt keeps the `LOOM_REPO` mapping exactly.
+        let reader_route = self
+            .route_slug
+            .as_ref()
+            .filter(|_| self.role == Some(crate::forge_identity::IdentityRole::Reader))
+            .map(OsString::from);
+        if let Some(repo) = slug.map(OsString::from).or(reader_route).or(loom_repo) {
             plan.push(EnvEntry {
                 key: "GH_REPO",
                 value: Some(repo),
@@ -611,10 +670,23 @@ impl GhInvocation {
     /// [`ExecError::Collect`] when it started but its result could not be
     /// collected (side effects may have happened — never retry a write on it).
     pub fn execute(self) -> Result<GhCompletion, ExecError> {
-        self.execute_routed(
-            &|req| crate::forge_identity::route_read(req, std::time::SystemTime::now()),
-            &reader_route::withdraw_reader,
-        )
+        #[cfg(test)]
+        if let Some(routed) = test_routing::run(&self) {
+            return routed;
+        }
+        let lookup = |req: &crate::forge_identity::RouteRequest<'_>| {
+            crate::forge_identity::route_read(req, std::time::SystemTime::now())
+        };
+        // `LOOM_READ_ROUTING=legacy`: the pre-W4-C path exactly — no
+        // derivation, no read class, the unconditional writer fallback.
+        if crate::forge_identity::RoutingMode::current()
+            == crate::forge_identity::RoutingMode::Legacy
+        {
+            return self.execute_routed(&lookup, &reader_route::withdraw_reader);
+        }
+        let policy = reader_route::ShedPolicy::current();
+        self.with_derived_route()
+            .execute_routed_v2(&lookup, &reader_route::withdraw_reader, policy)
     }
 
     /// Run exactly once under the credential already chosen (no routing).
@@ -677,6 +749,14 @@ impl GhInvocation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "test_routing.rs"]
+pub(crate) mod test_routing;
+
+#[cfg(test)]
+#[path = "w4c_sites_tests.rs"]
+mod w4c_sites_tests;
 
 #[cfg(test)]
 #[path = "migrated_sites_tests.rs"]

@@ -85,6 +85,11 @@ pub enum SpanName {
     /// and release instant.
     #[serde(rename = "forge.reader.spill")]
     ForgeReaderSpill,
+    /// One read a reader route deferred (W4-C): an instant span, its own
+    /// root trace, naming the operation, class, reader, owner, resource and
+    /// until.
+    #[serde(rename = "forge.read.shed")]
+    ForgeReadShed,
 }
 
 impl SpanName {
@@ -111,6 +116,7 @@ impl SpanName {
             Self::RateLimitTrip => "loom.ratelimit.trip",
             Self::ForgeReaderWithdrawn => "forge.reader.withdrawn",
             Self::ForgeReaderSpill => "forge.reader.spill",
+            Self::ForgeReadShed => "forge.read.shed",
         }
     }
 }

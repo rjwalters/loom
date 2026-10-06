@@ -449,6 +449,7 @@ pub async fn record(workspace_root: &Path) {
         .replace(now);
     sink.emit_metrics_since(drain_skip_points(), since);
     emit_chunked(sink, super::forge_calls::drain_points(), since);
+    sink.emit_metrics_since(super::forge_calls::drain_event_points(), since);
     let book = crate::forge_bucket_book::snapshot(now.timestamp());
     emit_chunked(sink, bucket_points(&book), None);
     let root = workspace_root.to_path_buf();
@@ -479,6 +480,8 @@ mod forge {
             GhTarget::None,
             Duration::from_secs(30),
         )
+        // Asker-dependent: `/user` is whoever asks (W4-C writer_only).
+        .writer_identity()
         .args(["api", "user", "--jq", ".login"])
         .run();
         let CmdOutcome::Ran(output) = outcome else {

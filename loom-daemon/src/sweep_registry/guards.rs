@@ -1104,8 +1104,11 @@ impl SweepRegistry {
     pub(crate) fn current_labels_via_rest(&self, issue: u32) -> Option<Vec<String>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
+        // W4-C: read back after this daemon's own flip, so the writer that
+        // made it answers (a reader may lag the write).
         let mut cmd = self.gh_inv("guard.issue_labels", AccessIntent::Read, &gh);
         cmd = cmd
+            .writer_identity()
             .arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}"))
             .arg("--jq")
@@ -1518,8 +1521,10 @@ impl SweepRegistry {
     pub(crate) fn read_lease_comments(&self, issue: u32) -> Option<Vec<LeaseComment>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
+        // W4-C: verifies this daemon's own just-written lease (and its
+        // callers fail open after a few retries), so the writer reads it.
         let mut cmd = self.gh_inv("guard.lease_comments", AccessIntent::Read, &gh);
-        cmd = cmd.arg("api")
+        cmd = cmd.writer_identity().arg("api")
             .arg(format!("repos/{owner}/{repo}/issues/{issue}/comments"))
             .arg("--paginate")
             .arg("--jq")

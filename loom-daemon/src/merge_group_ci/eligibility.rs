@@ -245,7 +245,9 @@ impl Perms {
     }
 }
 
-/// One counted, read-only `GET` through the gh facade.
+/// One counted, read-only `GET` through the gh facade. Pinned to the
+/// writer (W4-C): a repository's `permissions` and merge settings depend on
+/// who asks, and these reads decide whether the writer can act.
 fn get(gh: &str, path: &str) -> crate::cmd_out::CmdOutcome {
     GhInvocation::new(
         Operation::new("merge_group_ci.read"),
@@ -253,6 +255,7 @@ fn get(gh: &str, path: &str) -> crate::cmd_out::CmdOutcome {
         GhTarget::None,
         PROBE_TIMEOUT,
     )
+    .writer_identity()
     .program(gh)
     .args(["api", "--method", "GET", path])
     .run()

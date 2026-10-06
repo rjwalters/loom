@@ -78,7 +78,7 @@ impl SweepRegistry {
         let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline");
         let jq = r#"[.[] | select(.event == "labeled" and .label.name == "loom:building") | .created_at] | max // empty"#;
         let output = self
-            .gh_read("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
+            .gh_read_own_write("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
             .ok()
             .flatten()?;
         if !output.status.success() {
@@ -250,7 +250,7 @@ impl SweepRegistry {
         let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline");
         let jq = r#"[.[] | select(.event == "labeled" and .label.name == "loom:building")] | max_by(.created_at) | select(. != null) | "\(.actor.login // "")\t\(.created_at)""#;
         let output = self
-            .gh_read("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
+            .gh_read_own_write("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
             .ok()
             .flatten()?;
         if !output.status.success() {

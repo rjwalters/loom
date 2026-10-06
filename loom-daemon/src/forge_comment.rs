@@ -482,6 +482,9 @@ fn gh_api_get(gh_bin: &str, path: &str) -> Result<String, String> {
         GhTarget::None,
         std::time::Duration::from_secs(60),
     )
+    // W4-C: reads back an object this process just created, then patches
+    // it: the writer that created it answers (a reader may lag).
+    .writer_identity()
     .program(gh_bin)
     .arg("api")
     .arg(path)

@@ -879,6 +879,10 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("derives a read's routing key from argv; only its tests name `--method`"),
         ),
         (
+            "gh_invocation/cwd_route.rs",
+            NotAWrite("classifies an invocation's argv to refuse mutations a reader route, runs none"),
+        ),
+        (
             "gh_invocation/api_kind.rs",
             NotAWrite("classifies an invocation's argv for the github.api span attribute, runs none"),
         ),
