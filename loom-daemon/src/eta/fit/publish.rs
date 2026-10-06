@@ -415,11 +415,11 @@ fn write_status(root: &Path, status: &PubStatus) {
 // Fetch (non-captain)
 // ---------------------------------------------------------------------------
 
-fn contents_path(loc: &StoreLocation, path: &str) -> String {
+pub(crate) fn contents_path(loc: &StoreLocation, path: &str) -> String {
     format!("repos/{}/contents/{path}?ref={}", loc.repo, loc.reference)
 }
 
-const RAW: &str = "application/vnd.github.raw+json";
+pub(crate) const RAW: &str = "application/vnd.github.raw+json";
 
 /// Fetch the captain's newest publication, verify it and install it into
 /// `fit_dir`. Never panics and never leaves a half-written file: an error of
@@ -580,7 +580,11 @@ pub enum PublishKind {
     AlreadyPublished,
 }
 
-fn ensure_ok(reply: &crate::fleet_store::fetch::Reply, what: &str, repo: &str) -> Result<()> {
+pub(crate) fn ensure_ok(
+    reply: &crate::fleet_store::fetch::Reply,
+    what: &str,
+    repo: &str,
+) -> Result<()> {
     if (200..300).contains(&reply.status) {
         return Ok(());
     }
@@ -594,7 +598,11 @@ fn ensure_ok(reply: &crate::fleet_store::fetch::Reply, what: &str, repo: &str) -
 }
 
 /// The blob sha of `path` on the branch, or `None` when absent.
-fn blob_sha(t: &dyn Transport, loc: &StoreLocation, path: &str) -> Result<Option<String>> {
+pub(crate) fn blob_sha(
+    t: &dyn Transport,
+    loc: &StoreLocation,
+    path: &str,
+) -> Result<Option<String>> {
     let r = t.get(&contents_path(loc, path), None, None)?;
     match r.status {
         200 => {
@@ -627,7 +635,7 @@ fn put_file(
 }
 
 /// Create the publication branch from `base_ref` when it does not exist.
-fn ensure_branch(
+pub(crate) fn ensure_branch(
     t: &dyn Transport,
     wt: &dyn WriteTransport,
     loc: &StoreLocation,
@@ -665,8 +673,19 @@ fn ensure_branch(
 ///
 /// When `reference` is not a plain, canonical branch name.
 pub fn validate_publication_ref(reference: &str) -> Result<()> {
+    validate_branch_for(REF_KEY, reference)
+}
+
+/// [`validate_publication_ref`] for the publication branch configured under
+/// `key` — shared with the captain gauges heartbeat
+/// (`observability::captain_gauges::store`), which publishes beside the fit.
+///
+/// # Errors
+///
+/// When `reference` is not a plain, canonical branch name.
+pub(crate) fn validate_branch_for(key: &str, reference: &str) -> Result<()> {
     crate::fleet_store::validate_ref(reference)
-        .with_context(|| format!("`{REF_KEY}` `{reference}` is invalid"))?;
+        .with_context(|| format!("`{key}` `{reference}` is invalid"))?;
     if reference.starts_with("refs/")
         || reference.starts_with("heads/")
         || reference
@@ -674,7 +693,7 @@ pub fn validate_publication_ref(reference: &str) -> Result<()> {
             .any(|seg| seg.is_empty() || seg.starts_with('.'))
     {
         bail!(
-            "`{REF_KEY}` `{reference}` must be a bare branch name \
+            "`{key}` `{reference}` must be a bare branch name \
              (no `refs/` or `heads/` prefix, no empty or dot-led segment)"
         );
     }
@@ -700,11 +719,27 @@ fn branch_name(reference: &str) -> &str {
 /// ([`branch_name`]) and compared case-insensitively, so `refs/heads/main`,
 /// `Main` or `fleet.ref = refs/heads/stable` against `stable` are refused.
 fn refuse_reviewed_branch(loc: &StoreLocation, base_ref: &str) -> Result<()> {
-    validate_publication_ref(&loc.reference)?;
+    refuse_reviewed_branch_for(REF_KEY, "the eta fit", loc, base_ref)
+}
+
+/// [`refuse_reviewed_branch`] for an artifact `what` whose branch is
+/// configured under `key`: the same validation and the same refusal of the
+/// store's reviewed branch and `main`.
+///
+/// # Errors
+///
+/// When `loc.reference` is invalid or names the reviewed branch or `main`.
+pub(crate) fn refuse_reviewed_branch_for(
+    key: &str,
+    what: &str,
+    loc: &StoreLocation,
+    base_ref: &str,
+) -> Result<()> {
+    validate_branch_for(key, &loc.reference)?;
     let r = branch_name(&loc.reference);
     if r.eq_ignore_ascii_case(branch_name(base_ref)) || r.eq_ignore_ascii_case("main") {
         bail!(
-            "refusing to publish the eta fit to `{r}` in {}: `{REF_KEY}` must name a dedicated \
+            "refusing to publish {what} to `{r}` in {}: `{key}` must name a dedicated \
              branch, not the store's reviewed branch",
             loc.repo
         );

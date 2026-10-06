@@ -45,7 +45,9 @@
 //!    --foreground` process. It closes the run with `coverage = ended` at the
 //!    end of its segment, when the watched session process exits, when the
 //!    transcript has been idle for [`DEFAULT_IDLE_EXIT_SECS`], or at
-//!    [`DEFAULT_MAX_AGE_SECS`] (the lease renewer's own cap).
+//!    [`DEFAULT_MAX_AGE_SECS`] (the lease renewer's own cap). A foreground
+//!    subagent's run also ends once its parent records its result
+//!    ([`returned`], #10125).
 //!
 //! # Identity
 //!
@@ -62,7 +64,9 @@
 //! # Nothing changes when nothing is configured
 //!
 //! Starting is a handful of local file reads and never touches the network.
-//! It stops at the first missing piece and reports which one: an agent the
+//! Its one write is the outcome line in `last-start.log` ([`upkeep`]), since
+//! the claim step's stderr is discarded. It stops at the first missing piece
+//! and reports which one: an agent the
 //! daemon launched, observability off, live output off, no usable OTLP
 //! exporter, no session id, or no identifiable transcript. Reading the
 //! process tree comes last, after export is known to be on. The detached tailer
@@ -89,10 +93,14 @@ use serde_json::Value;
 
 #[path = "attended_caller.rs"]
 pub mod caller;
+#[path = "attended_return.rs"]
+pub mod returned;
 #[path = "attended_segment.rs"]
 pub mod segment;
 #[path = "attended_turn.rs"]
 pub mod turn;
+#[path = "attended_upkeep.rs"]
+pub mod upkeep;
 
 use caller::Caller;
 use segment::{Claim, Segment};
@@ -538,6 +546,11 @@ struct StreamLock {
 impl StreamLock {
     /// `Ok(None)` when another tailer holds it.
     fn try_acquire(path: &Path) -> std::io::Result<Option<Self>> {
+        Self::try_acquire_at(path, 2)
+    }
+
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    fn try_acquire_at(path: &Path, retries_left: u32) -> std::io::Result<Option<Self>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -553,6 +566,17 @@ impl StreamLock {
             let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if rc != 0 {
                 return Ok(None);
+            }
+            // The path may have been removed (by a holder releasing it, or a
+            // sweep) between the open and the lock. A lock on that unlinked
+            // file excludes nobody, so take the one now at the path instead.
+            if !same_file(&file, path) {
+                drop(file);
+                return if retries_left == 0 {
+                    Ok(None)
+                } else {
+                    Self::try_acquire_at(path, retries_left - 1)
+                };
             }
         }
         Ok(Some(StreamLock {
@@ -585,6 +609,16 @@ impl StreamLock {
     /// draining by then.
     fn release(self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Whether the open `file` is still the file at `path`.
+#[cfg(unix)]
+fn same_file(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(open), Ok(named)) => open.dev() == named.dev() && open.ino() == named.ino(),
+        _ => false,
     }
 }
 
@@ -644,6 +678,8 @@ pub enum EndReason {
     NextTask,
     /// A newer claim took the transcript over at its own line.
     Superseded,
+    /// The parent session recorded this foreground subagent's result.
+    Returned,
 }
 
 impl EndReason {
@@ -656,6 +692,7 @@ impl EndReason {
             EndReason::TranscriptGone => "the transcript disappeared",
             EndReason::NextTask => "a new prompt started the agent's next task",
             EndReason::Superseded => "a newer claim took the transcript over",
+            EndReason::Returned => "the subagent returned its result to its parent",
         }
     }
 }
@@ -735,11 +772,14 @@ fn root_of(request: &StartRequest) -> Result<PathBuf, Outcome> {
 }
 
 /// Decide, locate, and detach a tailer. Returns at once; never touches the
-/// network.
+/// network. The outcome is also recorded in `last-start.log` ([`upkeep`]).
 #[must_use]
 pub fn start(request: &StartRequest, env: &AttendEnv) -> Outcome {
     let projects = crate::transcript_tokens::claude_projects_dir();
-    start_with(request, env, projects.as_deref(), Caller::from_process, spawn_detached)
+    let outcome =
+        start_with(request, env, projects.as_deref(), Caller::from_process, spawn_detached);
+    upkeep::record_start(&request.workspace, request.issue, &outcome);
+    outcome
 }
 
 /// [`start`] with the projects directory, the caller's process tree and the
@@ -761,6 +801,7 @@ fn start_with(
     if let Err(why) = export_plan(&root) {
         return Outcome::NotConfigured(why);
     }
+    upkeep::sweep_stale(&state_dir(&root));
     let located = match &request.transcript {
         Some(path) => match Located::from_path(path) {
             // An explicit transcript is followed from the request's offset,
@@ -812,19 +853,30 @@ fn start_with(
     // tailer runs is a no-op. Any other claim is recorded as the newest, and
     // the tailer it starts takes the transcript over from the older one at
     // the new claim's line.
+    //
+    // The probe is held until the spawn is decided: a failed start removes the
+    // lock file it created, and a started tailer takes the lock over within
+    // one handover poll.
+    let mut probe = None;
     if segment::read_claim(&claim_file) == Some(claim) {
         match StreamLock::try_acquire(&lock_path(&root, &located)) {
-            Ok(Some(probe)) => drop(probe),
+            Ok(Some(held)) => probe = Some(held),
             Ok(None) => return Outcome::AlreadyRunning,
             Err(error) => return Outcome::SpawnFailed(error.to_string()),
         }
     }
+    let failed = |probe: Option<StreamLock>, why: String| {
+        if let Some(probe) = probe {
+            probe.release();
+        }
+        Outcome::SpawnFailed(why)
+    };
     if let Err(error) = segment::write_claim(&claim_file, claim) {
-        return Outcome::SpawnFailed(format!("{}: {error}", claim_file.display()));
+        return failed(probe, format!("{}: {error}", claim_file.display()));
     }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
-        Err(error) => return Outcome::SpawnFailed(error.to_string()),
+        Err(error) => return failed(probe, error.to_string()),
     };
     let mut command = Command::new(exe);
     command
@@ -850,13 +902,16 @@ fn start_with(
     }
     command.current_dir(&root);
     match spawn(command) {
-        Ok(pid) => Outcome::Started {
-            pid,
-            sweep_id: located.sweep_id(),
-        },
+        Ok(pid) => {
+            drop(probe);
+            Outcome::Started {
+                pid,
+                sweep_id: located.sweep_id(),
+            }
+        }
         // The claim stays recorded even so: an older run on this transcript
         // still has to end at this line, because the agent has moved on.
-        Err(error) => Outcome::SpawnFailed(error.to_string()),
+        Err(error) => failed(probe, error.to_string()),
     }
 }
 
@@ -1003,6 +1058,7 @@ where
     sink.push(run.status(OutputCategory::Coverage, started, Coverage::Degraded, RunState::Running));
 
     let mut segment = Segment::starting_at(located.from);
+    let mut returns = returned::ReturnWatch::attach(&located.path);
     let mut slug_cache: HashMap<String, String> = HashMap::new();
     let mut ticker = tokio::time::interval(live.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1010,6 +1066,14 @@ where
         ticker.tick().await;
         if let Some(at) = (watch.newer_claim)() {
             segment.supersede(at);
+        }
+        // Checked before the scan: everything the subagent wrote is on disk
+        // by the time its parent holds the result, so the run reads to here.
+        if returns.as_mut().is_some_and(returned::ReturnWatch::poll) {
+            returns = None;
+            if let Ok(meta) = std::fs::metadata(&located.path) {
+                segment.returned(meta.len());
+            }
         }
         // Check the new lines before the cursor may read them.
         segment.scan(&located.path);

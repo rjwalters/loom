@@ -747,11 +747,12 @@ enum Scope {
     /// write goes only through the store's `WriteTransport` (the writer App,
     /// `GhTransport::write_raw`), never a `gh` child of its own; the file
     /// refuses the store's reviewed branch (`refuse_reviewed_branch`); and the
-    /// named caller reaches the named call only under `RefreshGate::Captain`,
-    /// so only the declared captain writes.
+    /// named caller reaches the named call only under its captain `gate`
+    /// (e.g. `RefreshGate::Captain`), so only the declared captain writes.
     FleetStore {
         caller: &'static str,
         call: &'static str,
+        gate: &'static str,
         why: &'static str,
     },
     /// Matches the pattern but is not a forge write.
@@ -826,6 +827,7 @@ fn daemon_write_paths_are_scoped() {
             Via(DISPATCH, "runs inside a dispatched sweep"),
         ),
         ("merge_pr/redate.rs", ShellVetted("merge-pr.sh")),
+        ("merge_pr/redate/sync_handoff.rs", ShellVetted("merge-pr.sh")),
         (
             "forge_cmd.rs",
             Via("cli/forge_action.rs", "every writing forge verb is vetted first"),
@@ -875,7 +877,17 @@ fn daemon_write_paths_are_scoped() {
             FleetStore {
                 caller: "observability/eta_fleet_refresh.rs",
                 call: "distribute_publish(root, &captain",
+                gate: "RefreshGate::Captain)",
                 why: "the captain publishes its ETA fit to `fleet.etaFitRef` every refresh cycle (#10395)",
+            },
+        ),
+        (
+            "observability/captain_gauges/store.rs",
+            FleetStore {
+                caller: "observability/captain_gauges.rs",
+                call: "publish_heartbeat(root, loc",
+                gate: "Role::Captain { captain } => {",
+                why: "the armed captain publishes its fleet-gauge heartbeat (W12)",
             },
         ),
         (
@@ -912,6 +924,10 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("classifies an invocation's argv for the github.api span attribute, runs none"),
         ),
         ("role_tick_telemetry/targets.rs", NotAWrite("classifies commands, runs none")),
+        (
+            "observability/pick_journal.rs",
+            NotAWrite("classifies an agent gh argv for pick.decision, runs none"),
+        ),
         ("terminal.rs", NotAWrite("tmux flags")),
         ("fleet_store/gh.rs", NotAWrite("store reads: its one method is `--method GET`")),
         (
@@ -1002,14 +1018,19 @@ fn daemon_write_paths_are_scoped() {
                     "{file} relies on {resolver} resolving origin before any gh repo view"
                 );
             }
-            FleetStore { caller, call, why } => {
+            FleetStore {
+                caller,
+                call,
+                gate,
+                why,
+            } => {
                 let text = std::fs::read_to_string(src.join(file)).unwrap_or_default();
                 assert!(matches(file), "stale entry: {file} ({why}) no longer writes");
                 // The guard is the first statement of `publish`, not merely defined.
                 let guarded = text.find("pub fn publish(").is_some_and(|f| {
-                    text[f..]
-                        .find(") -> Result<PublishKind> {")
-                        .map(|b| text[f + b..].trim_start_matches(") -> Result<PublishKind> {"))
+                    let sig = &text[f..];
+                    sig.find(") -> Result<")
+                        .and_then(|b| sig[b..].find(" {\n").map(|o| &sig[b + o + 3..]))
                         .is_some_and(|body| {
                             body.trim_start()
                                 .starts_with("refuse_reviewed_branch(loc, base_ref)?;")
@@ -1024,11 +1045,11 @@ fn daemon_write_paths_are_scoped() {
                      write only through WriteTransport and refuse the reviewed branch"
                 );
                 let caller_text = std::fs::read_to_string(src.join(caller)).unwrap_or_default();
-                let gate = caller_text.find("RefreshGate::Captain)");
+                let gated_at = caller_text.find(gate);
                 let at = caller_text.find(call);
                 assert!(
-                    gate.is_some() && at.is_some() && gate < at,
-                    "{file} ({why}): {caller} must reach `{call}` only under RefreshGate::Captain"
+                    gated_at.is_some() && at.is_some() && gated_at < at,
+                    "{file} ({why}): {caller} must reach `{call}` only under {gate}"
                 );
                 let name = call.split('(').next().unwrap_or(call);
                 let callers: Vec<&str> = sources

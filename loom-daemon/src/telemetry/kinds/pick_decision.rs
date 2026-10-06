@@ -21,13 +21,42 @@ use crate::types::QueueDisposition;
 
 /// Payload version carried in the record's own `schema_version` field
 /// (distinct from the envelope's gate, which is `NEW_KIND_SCHEMA_VERSION`).
-pub const PICK_DECISION_SCHEMA_VERSION: u32 = 1;
+pub const PICK_DECISION_SCHEMA_VERSION: u32 = 2;
 
 /// Candidate / acted / skipped lists are capped at this many entries.
 pub const MAX_PICK_CANDIDATES: usize = 50;
 
 /// `role` value for work-finder dispatch decisions.
 pub const WORK_FINDER_ROLE: &str = "work_finder";
+
+/// The closed set of `acted[].action` values a role tick can carry (#10432).
+/// Each is a forge write the role agent issued through the agent `gh` front.
+pub const ROLE_ACTIONS: [&str; 9] = [
+    "claimed",
+    "approved",
+    "changes_requested",
+    "merged",
+    "curated",
+    "promoted",
+    "blocked",
+    "escalated",
+    "labeled",
+];
+
+/// Where a record's `candidates` came from (`candidate_source`).
+pub mod source {
+    /// The work finder's ready queue, in dispatch order.
+    pub const READY_QUEUE: &str = "ready_queue";
+    /// The queue the role agent consumed through `loom-daemon pr-queue`.
+    pub const SERVING_QUEUE: &str = "serving_queue";
+    /// The issue/PR listings the role agent read through the agent `gh` front.
+    pub const LISTING: &str = "listing";
+    /// The daemon's own admission-gate listing (the agent's queue was not
+    /// observed).
+    pub const GATE_LISTING: &str = "gate_listing";
+    /// Nothing observed.
+    pub const NONE: &str = "none";
+}
 
 /// Why a candidate was not acted on. A **closed** set: a new reason is a new
 /// variant here and a row in `telemetry-kind-pick-decision.md`, never a free
@@ -59,11 +88,14 @@ pub enum PickSkipReason {
     Error,
     /// The tick itself did not run the role (load, pool, queue gate, ...).
     TickSkipped,
+    /// The role ran, its actions were observed, and it did not act on this
+    /// candidate (and no label explains why).
+    NotSelected,
 }
 
 impl PickSkipReason {
     /// Every reason, in declaration order (pinned by a test against the docs).
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::OverlapChain,
         Self::PrOpenSkip,
         Self::OperatorHold,
@@ -76,6 +108,7 @@ impl PickSkipReason {
         Self::Blocked,
         Self::Error,
         Self::TickSkipped,
+        Self::NotSelected,
     ];
 
     /// The snake_case wire name (identical to the serde form).
@@ -94,6 +127,7 @@ impl PickSkipReason {
             Self::Blocked => "blocked",
             Self::Error => "error",
             Self::TickSkipped => "tick_skipped",
+            Self::NotSelected => "not_selected",
         }
     }
 
@@ -161,7 +195,8 @@ pub struct PickCandidate {
 pub struct PickAction {
     pub repo: String,
     pub number: u32,
-    /// What was done (`dispatched`).
+    /// What was done: `dispatched` (work finder) or one of the role actions in
+    /// [`ROLE_ACTIONS`].
     pub action: String,
 }
 
@@ -210,6 +245,14 @@ pub struct PickDecisionRecord {
     pub acted: Vec<PickAction>,
     /// Skipped candidates among [`Self::candidates`], with their reasons.
     pub skipped: Vec<PickSkip>,
+    /// Where `candidates` came from: one of the [`source`] constants.
+    #[serde(default)]
+    pub candidate_source: String,
+    /// `true` when what the tick acted on was observed, so a candidate with no
+    /// action is a real skip; `false` when only the ranking was seen (every
+    /// unexplained candidate is then neither acted nor skipped).
+    #[serde(default)]
+    pub decisions_observed: bool,
 }
 
 /// Identity of the tick a record describes.
@@ -267,6 +310,36 @@ impl PickDecisionRecord {
             candidates,
             acted,
             skipped,
+            candidate_source: source::NONE.to_string(),
+            decisions_observed: false,
+        }
+    }
+
+    /// Raise `candidates_total` to `total` when the source held more rows than
+    /// it handed over (a capped serving queue); never lowers it.
+    pub fn raise_candidates_total(&mut self, total: usize) {
+        self.candidates_total = self.candidates_total.max(total);
+    }
+
+    /// Stamp where the candidates came from and whether decisions were seen.
+    #[must_use]
+    pub fn with_source(mut self, candidate_source: &str, decisions_observed: bool) -> Self {
+        self.candidate_source = candidate_source.to_string();
+        self.decisions_observed = decisions_observed;
+        self
+    }
+
+    /// Append observed actions not already in [`Self::acted`] (an action on an
+    /// item outside the candidate list, or a second action on one), up to
+    /// [`MAX_PICK_CANDIDATES`].
+    pub fn add_actions(&mut self, actions: impl IntoIterator<Item = PickAction>) {
+        for action in actions {
+            if self.acted.len() >= MAX_PICK_CANDIDATES {
+                break;
+            }
+            if !self.acted.contains(&action) {
+                self.acted.push(action);
+            }
         }
     }
 }

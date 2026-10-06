@@ -129,3 +129,48 @@ fn reason_wire_names_match_serde_and_are_unique() {
         assert!(seen.contains(name), "{name}");
     }
 }
+
+#[test]
+fn pick_decision_record_size_is_bounded() {
+    let empty =
+        PickDecisionRecord::build(tick("judge"), Vec::new()).with_source(source::NONE, false);
+    let empty_len = serde_json::to_string(&empty).unwrap().len();
+    assert!(empty_len < 400, "empty tick is {empty_len} bytes");
+    // Worst case: every list at the cap, long sort keys, plus extra actions.
+    let ranked: Vec<_> = (1..=200)
+        .map(|n| {
+            let mut c = candidate(n, 100_000 + n);
+            c.repo = "some-organisation/some-repository".to_string();
+            c.sort_key = Some(PickSortKey {
+                name: "pr_queue".to_string(),
+                value: "level=2,reason=operator-priority,origin=interactive,mode=workflow"
+                    .to_string(),
+            });
+            let verdict = if n % 2 == 0 {
+                PickVerdict::Acted("changes_requested")
+            } else {
+                PickVerdict::Skipped(PickSkipReason::NotSelected)
+            };
+            (c, verdict)
+        })
+        .collect();
+    let mut full =
+        PickDecisionRecord::build(tick("judge"), ranked).with_source(source::SERVING_QUEUE, true);
+    full.add_actions((0..100).map(|n| PickAction {
+        repo: "some-organisation/some-repository".to_string(),
+        number: 200_000 + n,
+        action: "claimed".to_string(),
+    }));
+    assert_eq!(full.acted.len(), MAX_PICK_CANDIDATES);
+    let full_len = serde_json::to_string(&full).unwrap().len();
+    assert!(full_len < 20_000, "a full record is {full_len} bytes");
+}
+
+#[test]
+fn role_actions_are_unique_wire_names() {
+    let mut seen = std::collections::HashSet::new();
+    for action in ROLE_ACTIONS {
+        assert!(seen.insert(action), "duplicate {action}");
+    }
+    assert!(!seen.contains("dispatched"), "the work finder's action is separate");
+}

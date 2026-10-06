@@ -20,6 +20,18 @@ pub enum PrRole {
     Champion,
 }
 
+impl PrRole {
+    /// The role's name, as the role runner spells it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Judge => "judge",
+            Self::Doctor => "doctor",
+            Self::Champion => "champion",
+        }
+    }
+}
+
 pub fn prefer_human_prs(root: &Path) -> bool {
     preference(&crate::config_resolver::resolve_effective_config(root))
 }
