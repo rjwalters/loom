@@ -363,21 +363,6 @@ pub(super) fn health_items() -> Option<std::collections::BTreeMap<(String, Strin
     Some(super::ops::eta_health::buckets(guard.as_ref()?.tracker.pending()))
 }
 
-/// What [`super::fleet_state`] needs (#10196): the tracker's live items, the
-/// last pass's open-PR census and plan slots, and this host's id. `None` when
-/// ETA is disabled. It is cloned out under the one tracker lock, like
-/// [`snapshot_input`], so the emitter runs no tracker code.
-pub(super) fn fleet_state_input() -> Option<super::fleet_state::FleetInput> {
-    let guard = lock();
-    let state = guard.as_ref()?;
-    Some(super::fleet_state::FleetInput {
-        host_id: state.host_id.clone(),
-        items: state.tracker.live_items(),
-        census: state.tracker.pr_census(),
-        slots: state.tracker.plan_slots(),
-    })
-}
-
 /// Fold `outcomes` into the shadow ledger and persist it (#9328).
 ///
 /// Every heuristic of a kind estimated the same subject at the same `as_of`,
@@ -1226,6 +1211,9 @@ mod feature_pass;
 mod fit_swap;
 mod pr_resolved;
 use fit_swap::{log_fit, log_fit_v2, log_fit_v3, swap_fit};
+#[path = "eta_fleet_input.rs"]
+mod fleet_input;
+pub(super) use fleet_input::fleet_state_input;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
