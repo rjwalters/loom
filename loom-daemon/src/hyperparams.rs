@@ -139,12 +139,13 @@ pub struct LifecycleParams {
 /// PR debt (issue #9410).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct ReworkParams {
-    /// Engage the back-off when PR debt (review + changes + merge) rises
-    /// strictly above this. Source: `build_backoff::DEFAULT_HIGH` (40).
+    /// Engage a repo's back-off when its own PR debt (review + changes +
+    /// merge) rises strictly above this (per repo since #10624). Source:
+    /// `build_backoff::DEFAULT_HIGH` (40).
     /// Legacy: `autonomous.workFinder.buildBackoff.high`. Range `[1, 100000]`.
     pub build_backoff_high: usize,
-    /// Release the back-off when PR debt falls strictly below this. Source:
-    /// `build_backoff::DEFAULT_LOW` (25). Legacy:
+    /// Release a repo's back-off when its PR debt falls strictly below this.
+    /// Source: `build_backoff::DEFAULT_LOW` (25). Legacy:
     /// `autonomous.workFinder.buildBackoff.low`. Range `[0, 100000)`, and
     /// always `< build_backoff_high` — a crossed pair is a startup error from
     /// this surface (the legacy tier keeps its soft fallback to 40/25).

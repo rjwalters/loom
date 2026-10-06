@@ -4427,13 +4427,29 @@ The work finder's build admission reads no PR debt of its own: with 28 PRs in
 `loom:review-requested` and 59 in `loom:pr`, it would still admit new issue
 builds up to its cap, piling more finished work onto queues Judge and Champion
 are not draining. The **build back-off** is a WIP limit on that debt (Phase 2b
-of #9391). While it is **engaged**, the work finder admits no new unstarred
-issue build; sweeps already in flight are untouched, and the freed host
-resources (token pool, load) go to the role runner's judge / doctor / champion
-runs, which #9392 already sizes to the same debt. It adds no PR dispatch path
-of its own.
+of #9391), **per repository** since #10624. While a repo's back-off is
+**engaged**, the work finder admits no new unstarred issue build **in that
+repo**; other repos keep building, sweeps already in flight are untouched, and
+the freed slots go to whatever else is ready, including the role runner's
+judge / doctor / champion runs, which #9392 already sizes to the same debt. It
+adds no PR dispatch path of its own.
 
-- **Input.** Once per multi-workspace tick, the work finder reads the role
+- **Per repo (#10624).** Each registered repo has its own hysteresis state,
+  fed by that repo's own debt, and `high` / `low` apply to each repo
+  separately. One repo's backlog never holds another repo's builds. (Until
+  #10624 the debt was summed host-wide and held every repo, so one repo with
+  most of the fleet's `loom:changes-requested` PRs starved dozens of repos
+  with no PR debt of their own.) A repo that leaves the registry drops its
+  state.
+- **Optional host ceiling.** `hostHigh` / `hostLow` are absent (off) by
+  default. When both are set, the pre-#10624 rule applies on top: the
+  host-wide total (every repo's debt summed) has its own hysteresis, and while
+  it is engaged **every** repo's unstarred builds are held. Use it when the
+  fleet should spend more effort reviewing than building. A crossed or
+  half-set pair leaves the ceiling off with one `WARN` per distinct bad pair.
+
+- **Input.** Once per repo per multi-workspace tick (plus once for the host
+  total when the ceiling is set), the work finder reads the role
   runner's in-memory demand ledger (see [Concurrent across
   repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391))
   with `autonomous.roleRunner.demandWidth.staleSecs`:
@@ -4446,12 +4462,13 @@ of its own.
   `loom:operator-only` — not `loom:operator`, which Doctor still drains;
   #9421), and review is unfiltered. An axis whose every PR is excluded reads
   as observed zero, not unobserved. The ledger covers
-  only the repositories whose roles this host runs, so the back-off is
-  per-host and two hosts can disagree.
+  only the repositories whose roles this host runs, so two hosts can
+  disagree about the same repo.
 - **The ledger comes from the role runner. With the role runner off (or
   `demandWidth.enabled: false`), the ledger stays empty and the back-off is
   inert.**
-- **Fail open.** A ledger with no fresh entry on any axis never engages, and
+- **Fail open.** A repo (or, for the ceiling, a host) with no fresh entry on
+  any axis never engages, and
   releases an engaged back-off (logged as `debt unobserved — failing open`). A
   partly observed ledger sums the axes it has, which can only err toward not
   engaging.
@@ -4477,24 +4494,44 @@ of its own.
   checked first and still holds both.
 - **Explicit dispatch is unaffected** (`dispatch_sweep` over IPC does not go
   through the work-finder tick).
-- **Observability.** One `INFO` line per edge, naming the debt, its per-axis
-  split, `high` and `low`, e.g. `work_finder: build back-off ENGAGED —
+- **Observability.** One `INFO` line per edge, naming the repo (or the host
+  ceiling), the debt, its per-axis split and the thresholds, e.g.
+  `work_finder: build back-off for repo /srv/acme ENGAGED —
   review+changes+merge debt 87 (review=28 changes=0 merge=59) > high=40; new
-  issue builds held until < low=25 (#9410)`. Steady state logs nothing above
-  `DEBUG`. Deferred issues show as `deferred_build_backoff` in `loom-daemon
-  queue`, the tick summary carries `deferred_build_backoff` and
-  `build_backoff_held` (`BUILD-BACKOFF-HELD` in `loom-daemon health`), the
-  decisions metric uses reason `build_backoff`, and the tick result is
-  `build_backoff_held` when nothing was dispatched.
+  issue builds in this repo held until < low=25 (#9410, #10624)`; the host
+  ceiling's line says `for the host ceiling`, `host-wide` and
+  `hostHigh=`/`hostLow=`. A per-repo breakdown of each tick's deferrals,
+  `work_finder: build back-off deferred N issue(s) in M repo(s) this tick:
+  [/srv/acme=5, …]`, is `INFO` when the set of repos changes and `DEBUG`
+  otherwise. The axis line's `build_backoff_held=` reads `2/14 repos` (plus
+  `+ host ceiling`). Deferred issues show as `deferred_build_backoff` in
+  `loom-daemon queue` (each row names its repo), the tick summary carries
+  `deferred_build_backoff` and `build_backoff_held` (true when any repo is
+  held), and the decisions metric uses reason `build_backoff`. The
+  `BUILD-BACKOFF-HELD` tag in `loom-daemon health` and the tick result
+  `build_backoff_held` both need `deferred_build_backoff > 0`: a repo that is
+  held but has no candidates does not mark the tick, so a repo that stays
+  engaged for days cannot turn every idle or capacity-full tick into a hold.
+  The tick result is `build_backoff_held` when nothing was dispatched, no
+  dispatch failed (`error` ranks first) and the back-off deferred at least one
+  candidate (#10624).
+- **Sharded fleets.** The ledger holds debt only for repos whose role runner
+  runs on this host, so the per-repo limit binds on the repo's owner host. On
+  a non-owner host the repo has no fresh entry and fails open (#10654).
 
 | Config (under `autonomous.workFinder.buildBackoff`) | Default | Validation |
 |---|---|---|
 | `enabled` | `true` | non-bool → default. `false` is exactly the pre-#9410 admission (no ledger read) |
-| `high` (`W`) | `40` | positive integer, else default |
-| `low` (`W_low`) | `25` | positive integer, else default. **`low >= high` rejects the pair**: both fall back to `40`/`25`, with one `WARN` per distinct bad pair |
+| `high` (`W`) | `40` | **per repo**. Positive integer, else default |
+| `low` (`W_low`) | `25` | **per repo**. Positive integer, else default. **`low >= high` rejects the pair**: both fall back to `40`/`25`, with one `WARN` per distinct bad pair |
+| `hostHigh` | absent (off) | host-wide total. Positive integer. Only with `hostLow` |
+| `hostLow` | absent (off) | host-wide total. Positive integer, `< hostHigh`. **A crossed pair, or only one of the two set, leaves the ceiling off**, with one `WARN` per distinct bad pair |
 
 Config only (no env tier), re-read every tick from the daemon's primary
-workspace. **Deploy note:** a host whose debt is already above `high` engages
+workspace, and applied to every repo that daemon dispatches for (a repo's own
+`.loom/config.json` does not set its own thresholds). The hyperparameters
+`rework.buildBackoffHigh` / `rework.buildBackoffLow` overlay `high` / `low`
+and are likewise per repo. **Deploy note:** a repo whose debt is already above `high` engages
 on its first tick after upgrade and stops admitting unstarred builds until its
 debt falls below `low`; that is the intended WIP limit. The escape hatches are
 `buildBackoff.enabled: false` and starring an issue.
@@ -5298,9 +5335,11 @@ knobs not yet audited here.
 | `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `0.95` (`4.0` before #5270) | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Since #5270 sits deliberately *below* the host breaker's `2.5` trip: the brake is now the primary "dumb mode" CPU gate and engages first (a single over-threshold reading), the breaker remains the slower sustained-distress trip. **Restart required** — same startup-resolved global as `enabled` above (#5963) |
 | `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` | Seconds of continuous held+0-in-flight before the `WARN`-level `STARVING` log fires once per streak (#5715). `<= 0`/invalid → default. See [Starvation escape hatch](#starvation-escape-hatch-5715) |
 | `autonomous.workFinder.saturationBrake.starvationEscapeSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS` | `900` | Seconds of continuous held+0-in-flight before the escape hatch yields one tick despite the raw load still being over threshold, logged at `ERROR` (#5715). `<= 0`/invalid → default |
-| `autonomous.workFinder.buildBackoff.enabled` | *(config only)* | `true` | Build back-off on review + merge debt (#9410). While engaged, no new unstarred issue build is admitted; starred and red-main-fix issues bypass it. Reads the role runner's demand ledger, so it is inert with the role runner off. `false` → pre-#9410 admission. Non-bool → default. **Live**. See [Build back-off on review and merge debt](#build-back-off-on-review-and-merge-debt-9410) |
-| `autonomous.workFinder.buildBackoff.high` | *(config only)* | `40` | Engage when `review + changes + merge` debt is **strictly above** this. Zero, negative or non-integer → default. **Live** |
-| `autonomous.workFinder.buildBackoff.low` | *(config only)* | `25` | Release when the debt is **strictly below** this. Zero, negative or non-integer → default; `low >= high` rejects the pair (both fall back to `40`/`25`, one `WARN`). **Live** |
+| `autonomous.workFinder.buildBackoff.enabled` | *(config only)* | `true` | Build back-off on review + merge debt (#9410), per repo (#10624). While a repo's is engaged, no new unstarred issue build is admitted in that repo; starred and red-main-fix issues bypass it. Reads the role runner's demand ledger, so it is inert with the role runner off. `false` → pre-#9410 admission. Non-bool → default. **Live**. See [Build back-off on review and merge debt](#build-back-off-on-review-and-merge-debt-9410) |
+| `autonomous.workFinder.buildBackoff.high` | *(config only)* | `40` | Engage a repo's back-off when **its own** `review + changes + merge` debt is **strictly above** this (#10624). Zero, negative or non-integer → default. **Live** |
+| `autonomous.workFinder.buildBackoff.low` | *(config only)* | `25` | Release a repo's back-off when its debt is **strictly below** this. Zero, negative or non-integer → default; `low >= high` rejects the pair (both fall back to `40`/`25`, one `WARN`). **Live** |
+| `autonomous.workFinder.buildBackoff.hostHigh` | *(config only)* | absent (off) | Optional host-wide ceiling (#10624): engage when the **host total** debt is strictly above this; while engaged, every repo's unstarred builds are held. Needs `hostLow` too. **Live** |
+| `autonomous.workFinder.buildBackoff.hostLow` | *(config only)* | absent (off) | Release the host ceiling when the host total is strictly below this. A crossed or half-set `hostHigh`/`hostLow` pair leaves the ceiling off (one `WARN`). **Live** |
 | `autonomous.workFinder.quarantine.enabled` | `LOOM_WORK_FINDER_QUARANTINE` | `true` | Insta-crash quarantine on/off (#3939). A safety backstop — defaults on |
 | `autonomous.workFinder.quarantine.threshold` | `LOOM_WORK_FINDER_QUARANTINE_THRESHOLD` | `3` | Consecutive insta-crashes before an issue is quarantined. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default. This is the **generation-1** TTL; a relapse serves an escalated one (see `ttlMaxSecs`) |
