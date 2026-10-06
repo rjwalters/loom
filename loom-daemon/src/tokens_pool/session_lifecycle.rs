@@ -555,7 +555,14 @@ pub(crate) fn mark_session_managed(profile: &Path, container_name: &str) -> Resu
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerState {
     pub id: String,
+    /// `true` only when Docker reports the container running AND not
+    /// restarting (issue #10453): while Docker backs off before restarting a
+    /// crashed `--restart unless-stopped` container it reports
+    /// `Running=true, Restarting=true`, and nothing can be exec'd into it.
     pub running: bool,
+    /// Docker's `.State.Restarting` — a crash-looping container between
+    /// restart attempts. Never reused by `start`, never "running".
+    pub restarting: bool,
     pub started_at: Option<String>,
     pub image: Option<String>,
     /// The parity-mounted workspace host path this container was created
@@ -712,6 +719,28 @@ impl ProcessContainerRunner {
     }
 }
 
+/// Parse [`ProcessContainerRunner::inspect`]'s tab-separated `--format` line
+/// (`Id, Running, Restarting, StartedAt, Image, workspace label`). A
+/// restarting container is reported as not running (issue #10453).
+#[must_use]
+pub fn parse_inspect_line(stdout: &str) -> Option<ContainerState> {
+    let mut fields = stdout.trim().splitn(6, '\t');
+    let id = fields.next().unwrap_or_default().to_string();
+    let docker_running = fields.next() == Some("true");
+    let restarting = fields.next() == Some("true");
+    let started_at = fields.next().filter(|s| !s.is_empty()).map(str::to_string);
+    let image = fields.next().filter(|s| !s.is_empty()).map(str::to_string);
+    let workspace = fields.next().filter(|s| !s.is_empty()).map(PathBuf::from);
+    (!id.is_empty()).then_some(ContainerState {
+        id,
+        running: docker_running && !restarting,
+        restarting,
+        started_at,
+        image,
+        workspace,
+    })
+}
+
 impl ContainerRunner for ProcessContainerRunner {
     fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
         let label_format = format!("{{{{index .Config.Labels \"{WORKSPACE_LABEL}\"}}}}");
@@ -719,7 +748,7 @@ impl ContainerRunner for ProcessContainerRunner {
             "inspect",
             "--format",
             &format!(
-                "{{{{.Id}}}}\t{{{{.State.Running}}}}\t{{{{.State.StartedAt}}}}\t{{{{.Config.Image}}}}\t{label_format}"
+                "{{{{.Id}}}}\t{{{{.State.Running}}}}\t{{{{.State.Restarting}}}}\t{{{{.State.StartedAt}}}}\t{{{{.Config.Image}}}}\t{label_format}"
             ),
             container,
         ])?;
@@ -729,23 +758,7 @@ impl ContainerRunner for ProcessContainerRunner {
             }
             bail!("docker inspect {container} failed: {}", stderr.trim());
         }
-        let line = stdout.trim();
-        let mut fields = line.splitn(5, '\t');
-        let id = fields.next().unwrap_or_default().to_string();
-        let running = fields.next() == Some("true");
-        let started_at = fields.next().filter(|s| !s.is_empty()).map(str::to_string);
-        let image = fields.next().filter(|s| !s.is_empty()).map(str::to_string);
-        let workspace = fields.next().filter(|s| !s.is_empty()).map(PathBuf::from);
-        if id.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(ContainerState {
-            id,
-            running,
-            started_at,
-            image,
-            workspace,
-        }))
+        Ok(parse_inspect_line(&stdout))
     }
 
     fn create(
@@ -1046,6 +1059,9 @@ pub struct SessionStatus {
     pub name: String,
     pub container_name: String,
     pub running: bool,
+    /// Docker is between restarts of a crashed container (issue #10453);
+    /// `running` is `false` whenever this is `true`.
+    pub restarting: bool,
     pub container_id: Option<String>,
     pub started_at: Option<String>,
     pub image: Option<String>,
@@ -1106,6 +1122,17 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
         }
     }
 
+    /// The Docker seam this lifecycle drives (the session reconciler reads
+    /// container state through it, issue #10453).
+    pub fn runner(&self) -> &R {
+        &self.runner
+    }
+
+    /// Image a later `create` launches from; `None` restores the default.
+    pub fn set_image(&mut self, image: Option<String>) {
+        self.image = image.unwrap_or_else(|| DEFAULT_SESSION_IMAGE.to_string());
+    }
+
     /// Launch (or reuse, if already running; resume, if stopped-but-present)
     /// the account's session container with no explicit workspace override
     /// (defaults to this [`SessionLifecycle`]'s own resolved `workspace`) —
@@ -1144,6 +1171,12 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
                 // Already running: reuse it (idempotent `start`).
                 Self::check_workspace_match(name, &state, &requested_workspace)?;
             }
+            Some(state) if state.restarting => bail!(
+                "session {name:?} ({container}) is restarting — Docker is backing off before \
+                 restarting a crashed container, so it is not reused. Recreate it: \
+                 `loom-daemon accounts session stop {name} --force`, then start it again \
+                 (issue #10453)"
+            ),
             Some(state) => {
                 Self::check_workspace_match(name, &state, &requested_workspace)?;
                 self.runner.start_existing(&container)?;
@@ -1226,6 +1259,7 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
             name: name.to_string(),
             container_name: container,
             running: state.as_ref().is_some_and(|s| s.running),
+            restarting: state.as_ref().is_some_and(|s| s.restarting),
             container_id: state.as_ref().map(|s| s.id.clone()),
             started_at: state.as_ref().and_then(|s| s.started_at.clone()),
             image: state.as_ref().and_then(|s| s.image.clone()),

@@ -58,6 +58,7 @@ impl FakeRunner {
             ContainerState {
                 id: format!("{container}-id"),
                 running: true,
+                restarting: false,
                 started_at: Some("2026-09-05T00:00:00Z".into()),
                 image: Some("ghcr.io/rjwalters/loom-worker-session:test".into()),
                 workspace,

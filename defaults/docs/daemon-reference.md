@@ -8496,6 +8496,47 @@ detection, which is Builder-workflow-invoked rather than periodic. See
 [`troubleshooting.md` → Conflict markers left in `.loom/config.json` after a
 `git stash pop`](troubleshooting.md#conflict-markers-left-in-loomconfigjson-after-a-git-stash-pop-6499).
 
+### Codex session-container reconciler (#10453)
+
+The daemon restarts dead Codex session containers itself
+(`loom-daemon/src/session_reconcile.rs`). The pass runs once at start, then
+every interval. It visits each **enabled**, session-managed Codex account
+across the registered roots:
+
+| Container `loom-codex-session-<acct>` | Action |
+|---|---|
+| running | none |
+| restarting, first pass | none (Docker's `unless-stopped` policy is retrying) |
+| restarting, 2+ consecutive passes | one WARN `crash loop`; never reused or stopped |
+| stopped, host-mounted | `docker start`, via the `accounts session start` path |
+| missing, host-mounted | recreated via the same path, with the workspace and image last seen on it (otherwise the registered roots' common parent) |
+| stopped or missing, private-clone | skipped with one WARN; never recreated host-mounted |
+
+- The pass never stops, removes or restarts a container. A container with an
+  in-flight `docker exec` is never touched (#5119).
+- After a resume or recreate, `refresh_session_health` re-probes the account.
+- A failed inspect or start backs off per account: 120 s, doubling, capped at
+  30 min. It WARNs once per distinct error. No `docker` call runs while
+  backing off.
+- With no enabled session-managed account, the pass makes zero `docker` calls.
+- **Hold:** to keep a container down on purpose, run
+  `loom-daemon accounts disable <acct>` (`enabled=false`). There is no other
+  hold marker.
+
+```json
+{ "autonomous": { "sessionReconcile": { "enabled": true, "intervalSecs": 60 } } }
+```
+
+| Env var | Config key | Precedence | Default |
+|---|---|---|---|
+| `LOOM_SESSION_RECONCILE` | `autonomous.sessionReconcile.enabled` | env > config > default | `true` (on) |
+| `LOOM_SESSION_RECONCILE_INTERVAL_SECS` | `autonomous.sessionReconcile.intervalSecs` | env > config > default | `60` |
+
+Docker reports a crash-looping container as `Running=true, Restarting=true`.
+`accounts session status`, `start`, the login probe and `session-exec posture`
+all treat it as **not running**: `start` refuses to reuse it, and posture
+yields `not-running`.
+
 ### Autonomous periodic support-role runner (#4015)
 
 Before this loop, the periodic **standalone** support roles — Champion,
