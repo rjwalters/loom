@@ -26,6 +26,8 @@ pub enum Fault {
     Overrun,
     /// The loop exited for good.
     Exit,
+    /// A non-authority host reached the ETA sink (#10498).
+    EtaNonAuthorityEmit,
 }
 
 impl Fault {
@@ -36,6 +38,7 @@ impl Fault {
             Self::Panic => "panic",
             Self::Overrun => "overrun",
             Self::Exit => "exit",
+            Self::EtaNonAuthorityEmit => "eta_non_authority_emit",
         }
     }
 }

@@ -1,5 +1,6 @@
 //! Delivery: what the ETA hook offers to the OTLP queues.
 
+use super::authority::{drop_pending, gate_delivery};
 use super::*;
 use crate::eta::tests::{as_of, history_a, provenance};
 use crate::eta::tracker::{EstimateContext, IssueState};
@@ -352,4 +353,46 @@ fn starred_issues_read_every_page_and_an_incomplete_walk_is_unknown() {
 
     std::fs::write(dir.path().join("fail2"), "").unwrap();
     assert!(read_starred_issues(&gh, dir.path(), &labels).is_err());
+}
+
+// ===== One ETA authority per fleet (#10498) =====
+
+#[test]
+fn a_non_authority_host_emits_nothing() {
+    let (emissions, outcomes) = lifecycle(provenance());
+    assert!(!emissions.is_empty() && !outcomes.is_empty());
+    let sink = Capture::default();
+    let delivered =
+        gate_delivery(false, emissions, outcomes, &provenance(), "host-test", false, Some(&sink));
+    assert_eq!(delivered, Delivered::default());
+    assert!(sink.0.lock().unwrap().is_empty(), "no eta.* record from a non-authority host");
+}
+
+#[test]
+fn the_authority_still_emits() {
+    let (emissions, outcomes) = lifecycle(provenance());
+    let sink = Capture::default();
+    let delivered =
+        gate_delivery(true, emissions, outcomes, &provenance(), "host-test", false, Some(&sink));
+    assert!(delivered.emitted > 0 && delivered.outcomes > 0);
+    assert!(!sink.0.lock().unwrap().is_empty());
+}
+
+#[test]
+fn demotion_drops_the_pending_store_once() {
+    let (emissions, _) = lifecycle(provenance());
+    assert!(!emissions.is_empty());
+    let dir = tempfile::tempdir().unwrap();
+    let path = pending_path(dir.path());
+    let mut tracker = Tracker::new(provenance());
+    let pending = vec![EstimateSummary::of(&emissions[0].explanation)];
+    write_pending(&path, &pending);
+    tracker.restore_pending(pending, &Registry::builtin());
+    assert!(path.exists());
+    assert_eq!(drop_pending(&mut tracker, &path), 1);
+    assert!(tracker.pending().is_empty());
+    assert!(!path.exists(), "the persisted store is deleted");
+    // Idempotent: a second drop finds nothing and does not fail.
+    assert_eq!(drop_pending(&mut tracker, &path), 0);
+    assert!(read_pending(&path).is_empty(), "nothing is restored after a restart either");
 }

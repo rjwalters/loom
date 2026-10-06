@@ -365,6 +365,23 @@ pub fn fleet_captain(repo_root: &Path) -> Option<String> {
     }
 }
 
+const FLEET_ETA_AUTHORITY_KEY: &str = "fleet.etaAuthority";
+
+/// The explicit ETA authority host id (#10498): `fleet.etaAuthority` from the
+/// effective config. Same soft-fail contract as [`fleet_captain`]: `None` for
+/// a missing/malformed file, a non-string value or a blank string.
+#[must_use]
+pub fn fleet_eta_authority(repo_root: &Path) -> Option<String> {
+    let effective = resolve_effective_config(repo_root);
+    let raw = get_path(&effective, FLEET_ETA_AUTHORITY_KEY).and_then(Value::as_str)?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 const FLEET_CAPTAIN_ARM_TTL_SECS_KEY: &str = "fleet.captainArmTtlSecs";
 
 /// Env override for [`fleet_captain_arm_ttl_secs`], following the

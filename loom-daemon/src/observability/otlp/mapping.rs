@@ -622,7 +622,16 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::EtaFit(_) => {
             // Issue #9289: the body is the record's JSON (an estimate's whole
             // explanation); scalars ride as `loom.eta.*` attributes.
-            let (event_name, severity, at, attributes, body) = eta::log_parts(&envelope.record)?;
+            let (event_name, severity, at, mut attributes, body) =
+                eta::log_parts(&envelope.record)?;
+            // #10498: only the fleet's ETA authority emits estimates and
+            // outcomes, so the emitting host is the authority.
+            if matches!(
+                envelope.record,
+                TelemetryRecord::EtaEstimate(_) | TelemetryRecord::EtaOutcome(_)
+            ) {
+                attributes.push(kv_string("loom.eta.authority", envelope.host_id.clone()));
+            }
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)

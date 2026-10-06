@@ -24,6 +24,13 @@ fn healthy() -> Facts {
             interval_secs: 3600,
             otlp_exporter: true,
             native_exporter: true,
+            authority: AuthorityFacts {
+                host: Some("robb-studio".into()),
+                reason: "fleet_refresh".into(),
+                is_local: true,
+                others: Vec::new(),
+                detail: "robb-studio (fleet_refresh); this host is the authority".into(),
+            },
         },
         data: DataFacts {
             gate: Gate::Captain,
@@ -360,4 +367,21 @@ fn published_fit_states_map_to_status() {
     let c = find(&c, "fit", "published_fit");
     assert_eq!(c.status, Status::Warn);
     assert!(c.detail.contains("403"), "{}", c.render());
+}
+
+#[test]
+fn the_authority_is_printed_and_a_missing_one_warns() {
+    let ok = authority(&healthy().config.authority);
+    assert_eq!(ok.status, Status::Ok);
+    assert!(ok.detail.contains("robb-studio"), "{}", ok.detail);
+    let none = AuthorityFacts {
+        host: None,
+        reason: "no_candidate".into(),
+        is_local: false,
+        others: Vec::new(),
+        detail: "none (no_candidate)".into(),
+    };
+    let warn = authority(&none);
+    assert_eq!(warn.status, Status::Warn);
+    assert!(warn.remedy.unwrap().contains("fleet.etaAuthority"));
 }

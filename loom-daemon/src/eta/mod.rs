@@ -94,6 +94,7 @@
 //! gates, in order — the phase-2 [`backtest`] first, then live paired scoring
 //! — and the switch that flips the config is [`shadow`].
 
+pub mod authority;
 pub mod backtest;
 pub mod calibration_log;
 pub mod config;
