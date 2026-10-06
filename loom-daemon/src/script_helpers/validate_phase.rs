@@ -1171,21 +1171,25 @@ fn pushed_branch_is_adoptable(wt: &Path) -> bool {
 /// then a personal token) — so this recovery path survives the same window the
 /// Builder's own PR creation now survives, instead of re-failing on the very
 /// 403 that sent it here.
-fn create_recovery_pr(repo_root: &Path, branch: &str, title: &str, body: &str) -> CmdOutcome {
+///
+/// `stars` are the closing issue's priority labels (#10518), applied on BOTH
+/// paths so the recovery PR carries the star like any other.
+fn create_recovery_pr(
+    repo_root: &Path,
+    branch: &str,
+    title: &str,
+    body: &str,
+    stars: &[String],
+) -> CmdOutcome {
+    let mut args = vec!["--head", branch, "--title", title, "--body", body];
+    for label in std::iter::once("loom:review-requested").chain(stars.iter().map(String::as_str)) {
+        args.extend(["--label", label]);
+    }
     let script = repo_root.join(".loom").join("scripts").join("create-pr.sh");
     if script.is_file() {
         let mut cmd = Command::new("bash");
         cmd.arg(&script)
-            .args([
-                "--head",
-                branch,
-                "--title",
-                title,
-                "--label",
-                "loom:review-requested",
-                "--body",
-                body,
-            ])
+            .args(&args)
             .current_dir(repo_root)
             .stdin(std::process::Stdio::null());
         // A spawn failure (no bash, unreadable script) is the only case that
@@ -1199,22 +1203,7 @@ fn create_recovery_pr(repo_root: &Path, branch: &str, title: &str, body: &str) -
             return spawned;
         }
     }
-    run_gh(
-        &[
-            "pr",
-            "create",
-            "--head",
-            branch,
-            "--title",
-            title,
-            "--label",
-            "loom:review-requested",
-            "--body",
-            body,
-        ],
-        repo_root,
-        false,
-    )
+    run_gh(&[&["pr", "create"][..], &args].concat(), repo_root, false)
 }
 
 /// Extract the file path from a `git status --porcelain` line.
@@ -1839,7 +1828,8 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
     let pr_title = conventional_pr_title(&raw_title, issue);
     let pr_body = build_recovery_pr_body(issue, worktree, rate_limited);
 
-    let created = create_recovery_pr(repo_root, &branch, &pr_title, &pr_body);
+    let stars = crate::forge_priority_labels::labels_for_body(repo_root, &pr_body);
+    let created = create_recovery_pr(repo_root, &branch, &pr_title, &pr_body, &stars);
     if !created.succeeded() {
         let head: String = created.stderr_trimmed().chars().take(200).collect();
         let diag = gather_builder_diagnostics(repo_root, issue, worktree);
@@ -2407,12 +2397,14 @@ mod tests {
         )
         .unwrap();
 
-        let r = create_recovery_pr(dir.path(), "feature/issue-1", "fix: t", "Closes #1");
+        let star = vec!["loom:operator-priority".to_string()];
+        let r = create_recovery_pr(dir.path(), "feature/issue-1", "fix: t", "Closes #1", &star);
         assert!(r.succeeded());
         assert_eq!(r.stdout_trimmed(), "https://github.test/o/r/pull/9");
         let argv = std::fs::read_to_string(scripts.join("argv")).unwrap();
         assert!(argv.contains("--head feature/issue-1"), "argv: {argv}");
         assert!(argv.contains("--label loom:review-requested"), "argv: {argv}");
+        assert!(argv.contains("--label loom:operator-priority"), "#10518: argv: {argv}");
     }
 
     /// Test-only helper mirroring the Python's "lowercase the first character"

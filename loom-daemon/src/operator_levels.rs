@@ -20,8 +20,8 @@
 //! Each prompt site below carries a "level list: keep in sync with
 //! operator_levels.rs LEVELS until #10311" note:
 //!
-//! - `defaults/.claude/commands/loom/builder-pr.md`, PR Label Rules: the
-//!   label-copy list a Builder puts on its PR.
+//! - (No longer a site: a PR's label copy is `create-pr.sh` asking
+//!   `forge priority-labels`, which reads this table — #10518.)
 //! - `defaults/.claude/commands/loom/builder.md`, Priority Order and the
 //!   starred-first `for L in …` query.
 //! - `defaults/.claude/commands/loom/curator.md`, Priority 0 `for L in …`.
