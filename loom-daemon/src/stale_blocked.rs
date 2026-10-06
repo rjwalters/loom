@@ -64,6 +64,8 @@ use crate::dep_recheck::{extract, named, premise, recheck};
 pub mod batch;
 pub mod budget;
 pub mod notify;
+pub mod release;
+pub mod release_gh;
 
 /// Which kind of artifact a finding is about.
 ///
@@ -414,6 +416,9 @@ mod batch_tests;
 
 #[cfg(test)]
 mod budget_tests;
+
+#[cfg(test)]
+mod release_tests;
 
 #[cfg(test)]
 mod notify_tests;

@@ -134,6 +134,7 @@ pub(super) fn state(s: &str) -> RefState {
     RefState {
         state: s.to_string(),
         labels: Vec::new(),
+        is_pr: false,
     }
 }
 
@@ -371,6 +372,7 @@ fn verdicts_match_the_existing_fixtures() {
         RefState {
             state: "MERGED".to_string(),
             labels: vec!["loom:blocked".to_string()],
+            is_pr: true,
         },
     );
     // Undocumented (T2a), and a bot-only reference (T2f) over REST's `[bot]`.
@@ -492,8 +494,12 @@ fn ref_state_reads_issues_and_prs_from_one_endpoint() {
     )
     .unwrap();
     assert_eq!(merged.state, "MERGED");
-    let closed_pr = parse_ref_state(r#"{"state":"closed","pull_request":{"merged_at":null}}"#);
-    assert_eq!(closed_pr.unwrap().state, "CLOSED");
+    assert!(!issue.is_pr && merged.is_pr);
+    let closed_pr =
+        parse_ref_state(r#"{"state":"closed","pull_request":{"merged_at":null}}"#).unwrap();
+    // #10556: a closed-unmerged PR is told apart from a closed issue.
+    assert_eq!(closed_pr.state, "CLOSED");
+    assert!(closed_pr.is_pr);
     let open_pr = parse_ref_state(r#"{"state":"open","pull_request":{}}"#).unwrap();
     assert_eq!(open_pr.state, "OPEN");
 }

@@ -482,6 +482,14 @@ pub(crate) enum ScriptPortCommand {
     /// `CheckStaleBlocked` it WRITES (a comment, never a label); `--dry-run`
     /// previews. Always exits 0.
     NotifyClearedBlockers(super::notify_cleared_blockers::NotifyClearedBlockersArgs),
+    /// The deterministic `loom:blocked` release pass (#10556): every open
+    /// `loom:blocked` artifact whose body park records name only resolved
+    /// blockers is released (prior lane label restored), one with some
+    /// resolved is re-parked to the still-open records. No LLM pass. Unlike
+    /// `CheckStaleBlocked` it WRITES (audit comment, then label/body edit);
+    /// `--dry-run` prints the plan. The daemon tick runs the same pass when
+    /// `LOOM_RELEASE_STALE_BLOCKED` is on.
+    ReleaseStaleBlocked(super::release_stale_blocked::ReleaseStaleBlockedArgs),
     /// `sync-labels.sh`'s duplicate-declared-name scan (#8875): a
     /// `labels.yml` that carries two `- name:` entries for the same label
     /// (the pre-#4187-upgrade shape `merge_labels_block` now absorbs on
@@ -589,6 +597,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),
             ScriptPortCommand::SecretScan(args) => args.run(),
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
+            ScriptPortCommand::ReleaseStaleBlocked(args) => args.run(),
             ScriptPortCommand::LabelDuplicates(args) => args.run(),
             ScriptPortCommand::ForgeInventory(cmd) => cmd.run(),
             ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),

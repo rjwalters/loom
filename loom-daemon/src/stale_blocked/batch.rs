@@ -84,6 +84,10 @@ const GRAPHQL_TIMEOUT: Duration = Duration::from_secs(120);
 pub struct RefState {
     pub state: String,
     pub labels: Vec<String>,
+    /// The reference is a pull request (#10556). Without it a PR `CLOSED`
+    /// without merging reads exactly like a closed issue, and only the second
+    /// is a resolved blocker.
+    pub is_pr: bool,
 }
 
 /// One PR declared to close an issue, as the batched query reports it.
@@ -854,6 +858,7 @@ pub fn parse_ref_state(body: &str) -> Result<RefState> {
         pull_request: Option<RawPr>,
     }
     let raw: Raw = serde_json::from_str(body.trim())?;
+    let is_pr = raw.pull_request.is_some();
     let merged = raw.pull_request.is_some_and(|p| p.merged_at.is_some());
     Ok(RefState {
         state: if merged {
@@ -862,6 +867,7 @@ pub fn parse_ref_state(body: &str) -> Result<RefState> {
             raw.state.to_ascii_uppercase()
         },
         labels: raw.labels.into_iter().map(|l| l.name).collect(),
+        is_pr,
     })
 }
 
