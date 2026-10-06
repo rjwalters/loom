@@ -386,3 +386,38 @@ fn the_authority_is_printed_and_a_missing_one_warns() {
     assert_eq!(warn.status, Status::Warn);
     assert!(warn.remedy.unwrap().contains("fleet.etaAuthority"));
 }
+
+#[test]
+fn drift_shows_the_tri_state_and_never_claims_serving_is_adjusted() {
+    use crate::eta::regime::DriftState;
+    let mut f = healthy();
+    let row = |stage: &str, n_recent: u64, state: DriftState| DriftFacts {
+        stage: stage.into(),
+        heuristic: "land-v2".into(),
+        n_recent,
+        state,
+    };
+    f.outcomes.drift = vec![
+        row("building", 2, DriftState::Unknown),
+        row("judging", 9, DriftState::Stable),
+        row("doctoring", 9, DriftState::Drifted),
+    ];
+    let checks = evaluate(&f);
+
+    let unknown = find(&checks, "outcomes", "drift building");
+    assert_eq!(unknown.status, Status::Ok);
+    assert!(unknown.detail.contains("drift unknown"), "{}", unknown.detail);
+    assert!(!unknown.detail.contains("no drift"), "{}", unknown.detail);
+
+    let stable = find(&checks, "outcomes", "drift judging");
+    assert_eq!(stable.status, Status::Ok);
+    assert!(stable.detail.contains("no drift"), "{}", stable.detail);
+    assert!(stable.detail.contains("land-v2"), "{}", stable.detail);
+
+    let drifted = find(&checks, "outcomes", "drift doctoring");
+    assert_eq!(drifted.status, Status::Warn);
+    assert!(drifted.remedy.is_some());
+    // Slice 1 does not apply the factor to served ETAs (#10563 review).
+    assert!(drifted.detail.contains("NOT adjusted"), "{}", drifted.detail);
+    assert!(!drifted.detail.contains("are scaled"), "{}", drifted.detail);
+}

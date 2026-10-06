@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use crate::eta::fit::publish::{FetchKind, PubStatus};
 use crate::eta::fit::run;
 use crate::eta::health::RefreshCycleState;
+use crate::eta::regime::DriftState;
 use crate::telemetry::kinds::eta_fit::EtaFitRecord;
 
 /// A snapshot older than this is a FAIL.
@@ -259,10 +260,14 @@ pub struct OutcomeFacts {
 pub struct DriftFacts {
     /// The stage's wire name.
     pub stage: String,
+    /// The one heuristic whose scored outcomes were checked (the serving
+    /// `land` heuristic when the calibration log records it, else the
+    /// calibration base); heuristics are never pooled.
+    pub heuristic: String,
     /// Scored outcomes in the last 6 h.
     pub n_recent: u64,
-    /// Whether the CUSUM tripped.
-    pub drifted: bool,
+    /// The tri-state verdict: `Unknown` below the sample floor.
+    pub state: DriftState,
 }
 
 /// Everything the doctor reads.
@@ -907,19 +912,32 @@ fn outcomes(f: &Facts) -> Vec<Check> {
     }
     for d in &o.drift {
         let name = format!("drift {}", d.stage);
-        out.push(if d.drifted {
-            Check::bad(
+        out.push(match d.state {
+            DriftState::Drifted => Check::bad(
                 "outcomes",
                 &name,
                 Status::Warn,
                 format!(
-                    "{} scored outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served durations are scaled by the recent residual",
-                    d.n_recent
+                    "{} scored {} outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served ETAs are NOT adjusted for it yet (serving-path application is deferred, #10528)",
+                    d.n_recent, d.heuristic
                 ),
-                "no action needed for serving; the fit is stale for this stage until the next refit on current-regime rows",
-            )
-        } else {
-            Check::ok("outcomes", &name, format!("{} scored outcome(s) in 6h, no drift", d.n_recent))
+                "expect this stage's served ETAs to be biased until the next refit on current-regime rows",
+            ),
+            DriftState::Unknown => Check::ok(
+                "outcomes",
+                &name,
+                format!(
+                    "{} scored {} outcome(s) in 6h: drift unknown (below the {}-outcome floor)",
+                    d.n_recent,
+                    d.heuristic,
+                    super::MIN_SAMPLES
+                ),
+            ),
+            DriftState::Stable => Check::ok(
+                "outcomes",
+                &name,
+                format!("{} scored {} outcome(s) in 6h, no drift", d.n_recent, d.heuristic),
+            ),
         });
     }
     out.push(match o.oldest_pending {
