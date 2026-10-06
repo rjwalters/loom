@@ -708,8 +708,8 @@ pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
         Path::new(&gh),
         repo_root,
         Some(&nwo),
-        &nwo,
-        issue,
+        (&nwo, issue),
+        None,
     );
     let gone = std::cell::Cell::new(false);
     let verdict = match listed {

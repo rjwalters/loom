@@ -853,8 +853,9 @@ impl SweepRegistry {
         let root = &self.config.workspace_root;
         let listed = self.resolve_owner_repo().and_then(|(owner, repo)| {
             let (gh, nwo) = (self.resolved_gh(), format!("{owner}/{repo}"));
-            let caller = "guard.open_pr_listing";
-            crate::worktree_ops::linked_pr_listing::probe(caller, &gh, root, None, &nwo, issue)
+            let (caller, bound) = ("guard.open_pr_listing", Some(reap_gh_timeout()));
+            let target = (nwo.as_str(), issue);
+            crate::worktree_ops::linked_pr_listing::probe(caller, &gh, root, None, target, bound)
         });
         if let Some(verdict) = listed {
             return verdict;

@@ -32,7 +32,12 @@ const FAILING_PULLS_ARM: &str = "case \"$*\" in api*'pulls?state=open'*)\n  \
 /// `repo view`, answers `api graphql` with `graphql` (exit 0) when given and
 /// otherwise refuses it, always refuses the timeline, and answers the #6788
 /// known-PR recheck (`pulls/<n> --jq .state`) with `recheck`.
-fn registry(ws: &Path, pulls_arm: &str, graphql: Option<&str>, recheck: &str) -> (SweepRegistry, PathBuf) {
+fn registry(
+    ws: &Path,
+    pulls_arm: &str,
+    graphql: Option<&str>,
+    recheck: &str,
+) -> (SweepRegistry, PathBuf) {
     let log = ws.join("gh.log");
     let gql = graphql.map_or_else(String::new, |nodes| {
         format!(
@@ -83,8 +88,16 @@ fn the_listing_answers_every_verdict_without_graphql_or_timeline() {
         ours(502).body("Part of #43"),
         row(503, &[]).repo(REPO).body("no phrase"), // head feature/issue-503
         ours(504).body("filed #45 to track it"),
-        row(505, &[]).head("topic").repo("outsider/loom").author("rando", "NONE").body("Closes #46"),
-        row(506, &[]).head("topic").repo("friend/loom").author("pal", "COLLABORATOR").body("Closes #47"),
+        row(505, &[])
+            .head("topic")
+            .repo("outsider/loom")
+            .author("rando", "NONE")
+            .body("Closes #46"),
+        row(506, &[])
+            .head("topic")
+            .repo("friend/loom")
+            .author("pal", "COLLABORATOR")
+            .body("Closes #47"),
     ];
     for (issue, want) in [
         (42, OpenPrProbe::Open(501)),

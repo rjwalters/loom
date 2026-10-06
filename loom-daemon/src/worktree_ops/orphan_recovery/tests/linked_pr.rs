@@ -281,7 +281,10 @@ fn the_open_pr_listing_answers_without_graphql() {
 #[serial]
 fn the_open_pr_listing_answers_without_graphql_body() {
     use crate::claim_reconciliation::open_pr_listing::test_support::row;
-    let linked = [row(5507, &[]).head("topic").repo("rjwalters/loom").body("Closes #5501")];
+    let linked = [row(5507, &[])
+        .head("topic")
+        .repo("rjwalters/loom")
+        .body("Closes #5501")];
     for (rows, resets) in [(&linked[..], false), (&[][..], true)] {
         let dir = tempdir().unwrap();
         let gh = install_fake_gh_with_listing(dir.path(), rows);

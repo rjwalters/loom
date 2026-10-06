@@ -90,7 +90,11 @@ fn the_fork_trust_rule_matches_the_closes_graph_leg() {
 
 #[test]
 fn the_lowest_linked_number_wins() {
-    let rows = [pr(40, "Closes #123"), pr(5, "unrelated"), pr(31, "Part of #123")];
+    let rows = [
+        pr(40, "Closes #123"),
+        pr(5, "unrelated"),
+        pr(31, "Part of #123"),
+    ];
     assert_eq!(verdict(&rows, 123), OpenPrProbe::Open(31));
 }
 

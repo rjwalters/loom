@@ -44,10 +44,11 @@
 //! (#7863).
 
 use std::path::Path;
+use std::time::Duration;
 
 use crate::claim_reconciliation::open_pr_listing::MAX_PAGES;
 use crate::comment_trust::TrustPolicy;
-use crate::forge_pull_listing::{list_open_pulls_cached_as, RestPull};
+use crate::forge_pull_listing::{list_open_pulls_cached_within, RestPull};
 
 use super::gh::{linkage_phrase_regex, OpenPrProbe};
 use super::naming::branch_name;
@@ -61,16 +62,19 @@ use super::naming::branch_name;
 /// exactly like the reconciliation passes, sharing their ETag); the
 /// `worktree_ops` probe passes its own resolved repo because it must never
 /// answer from a `LOOM_REPO` that names a different repo (#5511).
+/// `timeout` bounds each page read (`None` = the conditional-read default);
+/// the registry guard passes its `reap_gh_timeout`, like its other legs.
 pub(crate) fn probe(
     caller: &'static str,
     gh_bin: &Path,
     root: &Path,
     repo_override: Option<&str>,
-    owner_repo: &str,
-    issue: u32,
+    (owner_repo, issue): (&str, u32),
+    timeout: Option<Duration>,
 ) -> Option<OpenPrProbe> {
-    let rows = match list_open_pulls_cached_as(caller, gh_bin, Some(root), repo_override, MAX_PAGES)
-    {
+    let listed =
+        list_open_pulls_cached_within(caller, gh_bin, Some(root), repo_override, MAX_PAGES, timeout);
+    let rows = match listed {
         Ok(rows) => rows,
         Err(e) => {
             log::debug!(
@@ -134,10 +138,7 @@ fn author_json(row: &RestPull) -> serde_json::Value {
     let mut v = serde_json::Map::new();
     if let Some(login) = &row.author {
         let kind = if row.author_is_bot { "Bot" } else { "User" };
-        v.insert(
-            "user".to_string(),
-            serde_json::json!({ "login": login, "type": kind }),
-        );
+        v.insert("user".to_string(), serde_json::json!({ "login": login, "type": kind }));
     }
     if let Some(assoc) = &row.author_association {
         v.insert("author_association".to_string(), serde_json::json!(assoc));

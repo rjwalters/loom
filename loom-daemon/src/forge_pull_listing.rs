@@ -145,14 +145,48 @@ pub fn list_open_pulls_cached_as(
     repo_override: Option<&str>,
     max_pages: usize,
 ) -> Result<Vec<RestPull>> {
+    list_open_pulls_cached_within(caller, gh_bin, cwd, repo_override, max_pages, None)
+}
+
+/// [`list_open_pulls_cached_as`] with every page read bounded by `timeout`
+/// (`None` = the conditional-read default). The open-PR dispatch guard reads
+/// it under its `reap_gh_timeout` bound (#10514), which a wedged `gh` must not
+/// outlast.
+///
+/// # Errors
+/// As [`list_open_pulls_cached_as`]; a timed-out page is an error.
+pub fn list_open_pulls_cached_within(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    max_pages: usize,
+    timeout: Option<Duration>,
+) -> Result<Vec<RestPull>> {
     let refresh = crate::credential_preflight::force_refresh_owner_credential;
-    list_open_pulls_with_refresh(caller, gh_bin, cwd, repo_override, max_pages, &refresh)
+    let site = store::ConditionalRead::new(caller, PR_LIST_OPEN).within(timeout);
+    list_open_pulls_at(site, gh_bin, cwd, repo_override, max_pages, &refresh)
 }
 
 /// [`list_open_pulls_cached_as`] with the #6171 credential refresh injected
 /// (tests cannot drive the process-global primary-workspace mint).
+#[cfg(test)]
 fn list_open_pulls_with_refresh(
     caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    max_pages: usize,
+    refresh: &dyn Fn(&Path) -> bool,
+) -> Result<Vec<RestPull>> {
+    let site = store::ConditionalRead::new(caller, PR_LIST_OPEN);
+    list_open_pulls_at(site, gh_bin, cwd, repo_override, max_pages, refresh)
+}
+
+/// The listing walk behind [`list_open_pulls_cached_within`], each page read
+/// as `site`.
+fn list_open_pulls_at(
+    site: store::ConditionalRead,
     gh_bin: &Path,
     cwd: Option<&Path>,
     repo_override: Option<&str>,
@@ -163,7 +197,6 @@ fn list_open_pulls_with_refresh(
     let read = |page: usize| -> Result<Vec<RestPull>> {
         let url = build_pulls_url(target.repo.as_deref(), page);
         let get = || {
-            let site = store::ConditionalRead::new(caller, PR_LIST_OPEN);
             conditional_get(site, gh_bin, cwd, &target, &url, Kind::Listing)
         };
         let body = retry_404_once(cwd, &url, refresh, get)?;
