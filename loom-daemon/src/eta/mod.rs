@@ -136,6 +136,7 @@ pub mod recalibrate;
 pub mod recency;
 pub mod score;
 pub mod shadow;
+pub mod shadow_fleet;
 pub mod simulate;
 pub mod stage_queue;
 pub mod stall;
@@ -156,6 +157,7 @@ use std::sync::Arc;
 
 pub use explanation::Explanation;
 pub use history::StageSamples;
+pub use shadow_fleet::Tier;
 
 /// The explanation schema tag every estimate carries.
 pub const EXPLANATION_SCHEMA: &str = "eta-explanation/v1";
@@ -635,6 +637,13 @@ pub trait Heuristic: Send + Sync {
     fn models_hold(&self) -> bool {
         false
     }
+    /// What it is for (#10525): a `candidate` unless it declares otherwise.
+    /// Only a candidate is promotable and offered in the ETA chooser; a
+    /// baseline is a reference every candidate is scored beside. No
+    /// registered heuristic is `retired` (a retired id is unregistered).
+    fn tier(&self) -> Tier {
+        Tier::Candidate
+    }
 }
 
 /// Every shipped heuristic, and which one is `current` per kind.
@@ -715,6 +724,32 @@ impl Registry {
     #[must_use]
     pub fn ids(&self) -> Vec<&'static str> {
         self.heuristics.iter().map(|h| h.id()).collect()
+    }
+
+    /// `id`'s tier (#10525): a registered heuristic's declared one,
+    /// [`Tier::Retired`] for a retired id ([`shadow_fleet::RETIRED`]), `None`
+    /// for an id this build never shipped.
+    #[must_use]
+    pub fn tier_of(&self, id: &str) -> Option<Tier> {
+        self.get(id)
+            .map(|h| h.tier())
+            .or_else(|| shadow_fleet::is_retired(id).then_some(Tier::Retired))
+    }
+
+    /// Hold the registry to the shadow budget (#10525): at most `max_active`
+    /// registered heuristics per kind, the current one included.
+    ///
+    /// # Errors
+    ///
+    /// A kind registers more; the error names it and the heuristics past the
+    /// budget, in registration order.
+    pub fn check_budget(&self, max_active: usize) -> Result<(), shadow_fleet::BudgetExceeded> {
+        shadow_fleet::check_budget(
+            [Kind::Start, Kind::Finish, Kind::Land]
+                .into_iter()
+                .map(|kind| (kind, self.for_kind(kind).map(|h| h.id()).collect())),
+            max_active,
+        )
     }
 
     /// Every registered heuristic that predicts `kind`, in registration

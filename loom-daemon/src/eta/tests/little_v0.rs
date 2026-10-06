@@ -314,5 +314,5 @@ fn little_v0_is_never_promoted_even_when_both_gates_pass() {
     assert_eq!(decision.backtest.status, GateStatus::Passed, "{}", decision.backtest.detail);
     assert_eq!(decision.live.status, GateStatus::Passed);
     assert!(!decision.promote);
-    assert!(decision.reason.contains("shadow-only"), "{}", decision.reason);
+    assert!(decision.reason.contains("baseline"), "{}", decision.reason);
 }

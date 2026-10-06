@@ -38,6 +38,7 @@ mod recalibrate;
 mod recency;
 mod score;
 mod shadow;
+mod shadow_fleet;
 mod shadow_gate;
 mod stall;
 mod star_parity;

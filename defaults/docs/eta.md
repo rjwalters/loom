@@ -19,6 +19,7 @@ host-scoped live list the fleet dashboard reads (#9329,
 
 - [The model](#the-model)
 - [Heuristics and versioning](#heuristics-and-versioning)
+- [Shadow fleet management](#shadow-fleet-management)
 - [Fitted coefficients (`eta-fit/v1`)](#fitted-coefficients-eta-fitv1)
 - [The explanation (`eta-explanation/v1`)](#the-explanation-eta-explanationv1)
 - [Features](#features)
@@ -335,7 +336,10 @@ fixture. A behaviour change is a new id registered beside the old one
    `.loom/state/eta/shadow.json` accumulates the running sums.
 4. **Promote it** (`loom-daemon eta promote --candidate land-v2 [--apply]`),
    which applies the two gates **in order**, both required (operator decision
-   2 on #9289):
+   2 on #9289). Only a `candidate`-tier heuristic is ever promoted: a
+   `baseline` or `retired` one is refused whatever its numbers, and the
+   decision record carries `candidate_tier` (see
+   [Shadow fleet management](#shadow-fleet-management)):
    - **Backtest**: the candidate must be the better of the two on the
      identical replay set, judged on the **union of cases, counting
      refusals** (#10233). Before #10233 each side was ranked on the cases
@@ -482,6 +486,55 @@ land-2026-10-04-fresh-tide --compare land-v2 --half-life-days 1|2|7` replays
 any setting on the same snapshot (#10325); it needs a journal that holds
 stage samples (run `eta backfill` first), or every case refuses.
 `land-v4` (#10210) ships the same way.
+
+## Shadow fleet management
+
+Every registered heuristic of a kind is estimated on every pass and scored
+against the same outcomes, so running several shadows at once costs nothing
+in wiring. Two rules keep it safe as their number grows (#10525).
+
+**Tiers.** Each heuristic declares one (`eta::Heuristic::tier`, default
+`candidate`):
+
+| tier | ids | estimated and shadowed | in the ETA chooser | promotable |
+|---|---|---|---|---|
+| `baseline` | `start-v1`, `finish-v1`, `land-v1`, `little-v0` | yes | no | no |
+| `candidate` | every other registered id | yes | yes | yes, through the gates |
+| `retired` | `land-v3`, `land-2026-10-04-amber-heron` ([above](#retired-heuristics)) | no (not registered) | no | no |
+
+A baseline is the reference every candidate is scored beside. `land-v1` is
+also the default `current` for `land`; being a baseline only stops the gate
+from promoting it *back*. Undoing a promotion is an operator config edit.
+Every `eta.snapshot` alternate carries its `tier`; loom-ui's chooser filters
+on it (loom-ui#2031). A retired id stays unregistered, as #10484 decided.
+`eta::shadow_fleet::RETIRED` keeps the id so it is never reused.
+
+**The shadow budget.** `autonomous.eta.shadow.maxActive` (default 10, floor 1)
+caps the registered heuristics **per kind**, `current` included. When a
+build's registry exceeds the configured budget, the ETA tracker does not start.
+The daemon logs `eta: not started: N land heuristics are registered but
+autonomous.eta.shadow.maxActive is M; over the budget: …`, naming the
+heuristics past the budget in registration order. `eta promote` refuses the
+same way. A unit test holds the built-in registry within the default budget,
+so an eleventh registration fails CI first. Retire a heuristic (a code change,
+as in #10484) or raise the budget. The live list adds one more ceiling: at
+most 8 alternates per row (loom-ui slices at 8), so a kind's ninth shadow
+also needs that cap raised on both sides.
+
+**Wrappers are explicit compositions.** A calibration, conformal or
+dependency wrapper over a base is registered as its own id
+(`land-2026-10-06-calm-plover` is calibration over `land-v2`). It is never
+an automatic cross product of wrappers × bases, so each one spends budget
+deliberately.
+
+**Not yet built** (follow-ups on #10525):
+- Retirement proposals from the nightly walk-forward folds (#10492): an
+  auto-filed issue with the evidence, never a silent removal.
+- A top-2 short-list by nightly-fold pinball before the live gate, to limit
+  multiple comparisons.
+- Promotion statistics: an item-clustered bootstrap on the paired pinball
+  difference as the primary test, with day blocks as a consistency check.
+- Adaptation time (`t_p50`, `t_cov`) in promotion and retirement (#10528).
 
 ## Fitted coefficients (`eta-fit/v1`)
 
@@ -1451,7 +1504,8 @@ reference: [`telemetry-schema.md`](telemetry-schema.md).
   not current: exactly one row survives per `(repo, issue, kind)`. Each row
   carries the newest estimate or refusal of every registered shadow heuristic
   under `alternates[]` (#10390), from tracker state only; `schema_version`
-  stays 12.
+  stays 12. Each alternate carries its heuristic's `tier` (`baseline` or
+  `candidate`, #10525), so the ETA chooser can offer only candidates.
 - **A refusal is a row.** An issue with a `no_estimate_reason` and no
   quantiles is carried, not dropped: that it *cannot* be estimated, and why,
   is the answer.
@@ -1736,6 +1790,7 @@ of what is on disk and never needs a refetch.
 | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
 | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245). It runs only with `enabled` too, is read at start, and is a no-op until a fleet snapshot is cached |
 | `current.start` / `current.finish` / `current.land` | none | `start-v1` / `finish-v1` / `land-v1` |
+| `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `10` registered heuristics per kind, floor 1. Over it, the tracker does not start (see [Shadow fleet management](#shadow-fleet-management)) |
 | `fleetRefresh.enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | `true` (#10263) |
 | `fleetRefresh.intervalSecs` | `LOOM_ETA_FLEET_REFRESH_INTERVAL_SECS` | `3600` (floor 900) |
 | `fleetRefresh.maxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_MAX_CALLS` | `300` |
