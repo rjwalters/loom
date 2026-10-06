@@ -1196,7 +1196,14 @@ fn github_shadow_queries_match_the_ratelimit_and_forge_calls_vocabulary() {
     );
 
     let labels = metric_label_keys(GITHUB_SHADOW);
-    for label in ["account", "owner", "resource", "cred_owner", "outcome", "op"] {
+    for label in [
+        "account",
+        "owner",
+        "resource",
+        "cred_owner",
+        "outcome",
+        "op",
+    ] {
         assert!(labels.contains(label), "github-shadow.sql no longer reads label '{label}'");
     }
     for label in &labels {

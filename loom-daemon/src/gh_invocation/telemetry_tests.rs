@@ -306,7 +306,8 @@ fn spans_carry_github_api_kind() {
 #[test]
 fn a_304_span_is_billed_not_modified_with_process_truth_unchanged() {
     let inv = read_op().args(["api", "--include", "repos/acme/widgets/issues"]);
-    let body = "printf 'HTTP/2.0 304 Not Modified\\r\\nX-Ratelimit-Resource: core\\r\\n\\r\\n'; exit 1";
+    let body =
+        "printf 'HTTP/2.0 304 Not Modified\\r\\nX-Ratelimit-Resource: core\\r\\n\\r\\n'; exit 1";
     let (_, spans, _) = run(inv, body);
     let span = &spans[0];
     assert_eq!(attr(span, "github.outcome"), Some("exit_nonzero"));
@@ -343,7 +344,10 @@ fn a_span_without_http_evidence_records_unknown_never_a_guess() {
     assert_eq!(attr(span, "github.billing"), Some("error"));
     assert_eq!(attr(span, "github.resource"), Some("graphql"));
 
-    let (_, spans, _) = run(read_op().args(["pr", "view", "9"]), "echo 'gh: Not Found (HTTP 404)' >&2; exit 1");
+    let (_, spans, _) = run(
+        read_op().args(["pr", "view", "9"]),
+        "echo 'gh: Not Found (HTTP 404)' >&2; exit 1",
+    );
     assert_eq!(attr(&spans[0], "github.http.status"), Some("404"));
     assert_eq!(attr(&spans[0], "github.http.source"), Some("stderr"));
     assert_eq!(attr(&spans[0], "github.http.not_modified"), Some("false"));
@@ -352,9 +356,8 @@ fn a_span_without_http_evidence_records_unknown_never_a_guess() {
 #[test]
 fn a_spawn_failure_span_is_billed_not_sent_with_zero_requests() {
     let inv = read_op().args(["api", "repos/acme/widgets"]);
-    let (result, captured) = capture(|| {
-        inv.execute_with("/nonexistent/gh-10343", GhBinSource::EnvOverride)
-    });
+    let (result, captured) =
+        capture(|| inv.execute_with("/nonexistent/gh-10343", GhBinSource::EnvOverride));
     assert!(result.is_err());
     let span = &captured.spans[0];
     assert_eq!(attr(span, "github.outcome"), Some("spawn_failed"));

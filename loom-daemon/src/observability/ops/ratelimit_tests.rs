@@ -244,7 +244,8 @@ fn the_log_line_rendering_is_unchanged() {
 
 #[test]
 fn a_gauge_tick_emits_remaining_used_and_reset_per_resource() {
-    let points = quota_points(&budget(Some(5000), Some(28)), "octocat", AMBIENT_OWNER, AMBIENT_ROLE);
+    let points =
+        quota_points(&budget(Some(5000), Some(28)), "octocat", AMBIENT_OWNER, AMBIENT_ROLE);
     let mut seen: Vec<(&str, &str, MetricValue)> = points
         .iter()
         .map(|p| (p.name.as_str(), p.labels["resource"].as_str(), p.value))
@@ -484,12 +485,10 @@ fn an_app_host_never_books_the_breakers_fallback_reading() {
 
 #[test]
 fn an_ambient_host_exports_its_probe_or_fallback_as_owner_dash_role_ambient() {
-    let probed = probe_points(&ProbeHost::Ambient, Some(live_budget(7)), || None, || {
-        "octocat".to_string()
-    });
-    let fallback = probe_points(&ProbeHost::Ambient, None, || Some(live_budget(9)), || {
-        "octocat".to_string()
-    });
+    let probed =
+        probe_points(&ProbeHost::Ambient, Some(live_budget(7)), || None, || "octocat".to_string());
+    let fallback =
+        probe_points(&ProbeHost::Ambient, None, || Some(live_budget(9)), || "octocat".to_string());
     assert_eq!(probed.len(), 6);
     assert_eq!(fallback.len(), 6);
     for p in probed.iter().chain(&fallback) {

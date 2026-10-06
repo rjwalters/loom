@@ -392,7 +392,12 @@ pub fn book_budget(budget: &BudgetSnapshot, account: &str, owner: &str) {
     use crate::forge_bucket_book::{insert, BucketKey, Reading, Resource, Source};
     for (resource, remaining, used, reset) in [
         (Resource::Core, budget.core_remaining, budget.core_used, budget.core_reset),
-        (Resource::Graphql, budget.graphql_remaining, budget.graphql_used, budget.graphql_reset),
+        (
+            Resource::Graphql,
+            budget.graphql_remaining,
+            budget.graphql_used,
+            budget.graphql_reset,
+        ),
     ] {
         insert(
             BucketKey::new(account, owner, resource),
@@ -561,7 +566,12 @@ pub async fn record(workspace_root: &Path) {
         let points = probe_points(
             &host,
             crate::rate_limit_breaker::forge::probe_budget(now),
-            || fresh_fallback(crate::rate_limit_breaker::global().and_then(|b| b.last_budget()), now),
+            || {
+                fresh_fallback(
+                    crate::rate_limit_breaker::global().and_then(|b| b.last_budget()),
+                    now,
+                )
+            },
             || account(now),
         );
         (points, crate::forge_bucket_book::writer_account(&root))

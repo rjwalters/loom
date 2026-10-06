@@ -24,14 +24,19 @@ fn billed(args: &[&str], outcome: InvokeOutcome, stdout: &str, stderr: &str) -> 
 }
 
 fn block(status: &str) -> String {
-    format!("HTTP/2.0 {status}\r\nX-Ratelimit-Resource: core\r\nX-Ratelimit-Remaining: 9\r\n\r\n{{}}")
+    format!(
+        "HTTP/2.0 {status}\r\nX-Ratelimit-Resource: core\r\nX-Ratelimit-Remaining: 9\r\n\r\n{{}}"
+    )
 }
 
 #[test]
 fn include_blocks_give_the_status_and_not_modified() {
     let args = ["api", "--include", "repos/acme/widgets"];
     let ok = billed(&args, InvokeOutcome::Ok, &block("200 OK"), "");
-    assert_eq!((ok.status, ok.source, ok.class), (Some(200), BillingSource::Headers, BillingClass::Ok));
+    assert_eq!(
+        (ok.status, ok.source, ok.class),
+        (Some(200), BillingSource::Headers, BillingClass::Ok)
+    );
     assert_eq!(ok.requests, Some(1));
     assert_eq!(ok.resource, "core");
 
@@ -49,7 +54,12 @@ fn include_blocks_give_the_status_and_not_modified() {
 
 #[test]
 fn stderr_markers_give_the_status_when_no_headers_were_asked_for() {
-    let nf = billed(&["pr", "view", "1"], InvokeOutcome::ExitNonzero, "", "gh: Not Found (HTTP 404)\n");
+    let nf = billed(
+        &["pr", "view", "1"],
+        InvokeOutcome::ExitNonzero,
+        "",
+        "gh: Not Found (HTTP 404)\n",
+    );
     assert_eq!((nf.status, nf.source), (Some(404), BillingSource::Stderr));
     assert_eq!(nf.requests, None, "porcelain request count is not known");
 
@@ -59,7 +69,10 @@ fn stderr_markers_give_the_status_when_no_headers_were_asked_for() {
         "",
         "HTTP 403: API rate limit exceeded for installation ID 1.\n",
     );
-    assert_eq!((rl.status, rl.source, rl.class), (Some(403), BillingSource::Stderr, BillingClass::RateLimited));
+    assert_eq!(
+        (rl.status, rl.source, rl.class),
+        (Some(403), BillingSource::Stderr, BillingClass::RateLimited)
+    );
 
     assert_eq!(stderr_status_of("GraphQL: Could not resolve to a Repository"), None);
     assert_eq!(stderr_status_of("error connecting to api.github.com"), None);
@@ -87,8 +100,14 @@ fn a_passthrough_run_is_unknown_never_guessed() {
 
 #[test]
 fn requests_count_pages_downloads_and_nothing_sent() {
-    let pages = "HTTP/2.0 200 OK\r\n\r\n[1]\nHTTP/2.0 200 OK\r\n\r\n[2]\nHTTP/1.1 200 OK\r\n\r\n[3]\n";
-    let paged = billed(&["api", "--paginate", "--include", "repos/o/r/issues"], InvokeOutcome::Ok, pages, "");
+    let pages =
+        "HTTP/2.0 200 OK\r\n\r\n[1]\nHTTP/2.0 200 OK\r\n\r\n[2]\nHTTP/1.1 200 OK\r\n\r\n[3]\n";
+    let paged = billed(
+        &["api", "--paginate", "--include", "repos/o/r/issues"],
+        InvokeOutcome::Ok,
+        pages,
+        "",
+    );
     assert_eq!(paged.requests, Some(3));
     let bare = billed(&["api", "--paginate", "repos/o/r/issues"], InvokeOutcome::Ok, "[]", "");
     assert_eq!(bare.requests, None, "a bare --paginate is unknown");
@@ -101,7 +120,11 @@ fn requests_count_pages_downloads_and_nothing_sent() {
         InvokeOutcome::AdapterUnavailable,
     ] {
         let b = billed(&["api", "repos/o/r"], not_sent, "", "");
-        assert_eq!((b.requests, b.class, b.status), (Some(0), BillingClass::NotSent, None), "{not_sent:?}");
+        assert_eq!(
+            (b.requests, b.class, b.status),
+            (Some(0), BillingClass::NotSent, None),
+            "{not_sent:?}"
+        );
         assert_eq!(b.resource, "core");
     }
     assert_eq!(requests(None, Some(true), true), None);
@@ -112,12 +135,13 @@ fn requests_count_pages_downloads_and_nothing_sent() {
 
 #[test]
 fn identity_values_never_carry_a_token_hash_or_path() {
-    let reader = cred_of_with(
-        Some(std::path::Path::new("/w/.loom/gh-config-by-owner/Acme/123456")),
-        false,
-    );
+    let reader =
+        cred_of_with(Some(std::path::Path::new("/w/.loom/gh-config-by-owner/Acme/123456")), false);
     let b = Billing::not_sent("core", &reader, "reader");
-    assert_eq!((b.account.as_str(), b.cred_owner.as_str(), b.role.as_str()), ("app-123456", "acme", "reader"));
+    assert_eq!(
+        (b.account.as_str(), b.cred_owner.as_str(), b.role.as_str()),
+        ("app-123456", "acme", "reader")
+    );
 
     let env = Billing::not_sent("core", &cred_of_with(None, true), "writer");
     assert_eq!((env.account.as_str(), env.cred_owner.as_str()), ("env-token", "-"));
