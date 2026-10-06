@@ -329,6 +329,41 @@ pub fn loop_features(inputs: &LoopInputs<'_>, as_of: DateTime<Utc>) -> LoopFeatu
     out
 }
 
+/// How many of a set of rows know each friction input: the coverage a fit
+/// or a backtest reports next to its numbers (#10521). Today file overlap
+/// and own CI are 0: their sources are not logged yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopCoverage {
+    /// Rows counted.
+    pub rows: usize,
+    /// Rows with an open episode (a cumulative stage age).
+    pub cum_stage_known: usize,
+    /// Rows whose current stage was visited before.
+    pub stage_looped: usize,
+    /// Rows with a repo Judge rejection rate.
+    pub judge_rate_known: usize,
+    /// Rows with a complete file-overlap roster.
+    pub overlap_known: usize,
+    /// Rows with a known last CI run.
+    pub ci_known: usize,
+}
+
+impl LoopCoverage {
+    /// The coverage of `loops`.
+    #[must_use]
+    pub fn of(loops: &[LoopFeatures]) -> Self {
+        let n = |f: fn(&LoopFeatures) -> bool| loops.iter().filter(|l| f(l)).count();
+        LoopCoverage {
+            rows: loops.len(),
+            cum_stage_known: n(|l| l.cum_stage_h.is_some()),
+            stage_looped: n(|l| l.stage_looped),
+            judge_rate_known: n(|l| l.judge_reject_rate_7d.is_some()),
+            overlap_known: n(|l| l.overlap_prs.is_some()),
+            ci_known: n(|l| l.own_ci_failed.is_some()),
+        }
+    }
+}
+
 /// The model-ready vector in [`LOOP_FEATURES`] order: counts and hours as
 /// `ln(1 + x)`, the rate raw, and a `*_known` indicator beside every feature
 /// that can be missing (a missing value is 0 with its indicator 0).

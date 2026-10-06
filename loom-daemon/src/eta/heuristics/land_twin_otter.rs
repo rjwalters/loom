@@ -107,6 +107,10 @@ pub struct LandTwinOtter {
     /// [`crate::eta::explanation::Features::priority`] is handed to the
     /// core. `None`: twin-otter itself, which reads neither.
     priority_schema: Option<&'static str>,
+    /// `true`: also hand the core the input's
+    /// [`crate::eta::explanation::Features::loops`], the `eta-fit/v3`
+    /// friction predictors (#10521). Only with a `priority_schema`.
+    reads_loops: bool,
 }
 
 impl Default for LandTwinOtter {
@@ -123,6 +127,7 @@ impl LandTwinOtter {
             fit,
             id: LAND_TWIN_OTTER,
             priority_schema: None,
+            reads_loops: false,
         }
     }
 
@@ -139,6 +144,21 @@ impl LandTwinOtter {
             fit,
             id,
             priority_schema: Some(schema),
+            reads_loops: false,
+        }
+    }
+
+    /// [`Self::priority_aware`], also reading the friction predictors
+    /// (`land-2026-10-06-loop-kite`'s PR stages, #10521).
+    #[must_use]
+    pub(super) fn friction_aware(
+        fit: Option<Arc<CoefficientFile>>,
+        id: &'static str,
+        schema: &'static str,
+    ) -> Self {
+        LandTwinOtter {
+            reads_loops: true,
+            ..Self::priority_aware(fit, id, schema)
         }
     }
 }
@@ -206,6 +226,9 @@ impl LandTwinOtter {
         let mut adapted = adapt_input(input, current, stage);
         if self.priority_schema.is_some() {
             adapted.priority = input.features.priority;
+        }
+        if self.reads_loops {
+            adapted.loops = input.features.loops.clone();
         }
         let config = EvalConfig {
             seed: visit_seed(input, current, stage),
@@ -369,6 +392,7 @@ pub fn adapt_input(
         ci_fail: flag(FLAG_CI_FAIL),
         blocked: flag(FLAG_BLOCKED),
         priority: None,
+        loops: None,
     }
 }
 

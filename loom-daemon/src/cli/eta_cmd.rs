@@ -400,7 +400,9 @@ pub(crate) struct EtaBacktestArgs {
     /// copy of `.loom/state/eta/fit/`) to replay fitted heuristics with
     /// (#10524). Each case is estimated with the newest file whose cutoff is
     /// strictly before its `as_of`, as live serving would; without it every
-    /// fitted heuristic refuses `no_model`.
+    /// fitted heuristic refuses `no_model`. Its `v2/` and `v3/`
+    /// subdirectories (`eta-fit/v2`, `eta-fit/v3`) are dated the same way,
+    /// per schema (#10521).
     #[arg(long, value_name = "PATH")]
     pub fit_dir: Option<PathBuf>,
 

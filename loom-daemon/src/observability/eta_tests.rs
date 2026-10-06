@@ -80,12 +80,13 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
     // land-2026-10-06-quick-tern and -swift-tern calibration wrappers
     // (#10524), the land-2026-10-06-held-heron hybrid (#10523), which routes
     // only held or sequenced PRs elsewhere, land-2026-10-06-keen-wren
-    // (#10508), whose pre-PR stages take the dispatch plan and land-v2's
-    // path, and the land-2026-10-06-tandem-wren dependency wrapper (#10510;
-    // no edge, so -b's own answer).
-    assert_eq!(delivered.emitted, 12, "finish + land + the ten answering land shadows");
+    // (#10508) and land-2026-10-06-loop-kite (#10521), whose pre-PR stages
+    // take the dispatch plan and land-v2's path, and the
+    // land-2026-10-06-tandem-wren dependency wrapper (#10510; no edge, so
+    // -b's own answer).
+    assert_eq!(delivered.emitted, 13, "finish + land + the eleven answering land shadows");
     assert_eq!(delivered.refused, 2, "twin-otter and little-v0: unknown_stage before a PR");
-    assert_eq!(delivered.outcomes, 14, "finish finished, every land estimate abandoned");
+    assert_eq!(delivered.outcomes, 15, "finish finished, every land estimate abandoned");
     assert_eq!(delivered.invalid, 0);
     let offered = sink.0.lock().unwrap();
     let kinds: Vec<&str> = offered.iter().map(|e| e.record.kind()).collect();
@@ -106,6 +107,8 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
             "eta.estimate",
             "eta.estimate",
             "eta.estimate",
+            "eta.estimate",
+            "eta.outcome",
             "eta.outcome",
             "eta.outcome",
             "eta.outcome",
@@ -137,7 +140,7 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
         assert_eq!(envelope.host_id, "host-test");
         assert_eq!(envelope.schema_version, 12);
     }
-    let TelemetryRecord::EtaOutcome(outcome) = &offered[14].record else {
+    let TelemetryRecord::EtaOutcome(outcome) = &offered[15].record else {
         panic!("outcome")
     };
     assert_eq!(outcome.estimate.loom, provenance(), "the estimating build");
@@ -153,7 +156,7 @@ fn dry_run_offers_nothing_and_counts_everything() {
     let (emissions, outcomes) = lifecycle(provenance());
     let sink = Capture::default();
     let delivered = deliver(emissions, outcomes, &provenance(), "host-test", true, Some(&sink));
-    assert_eq!((delivered.emitted, delivered.refused, delivered.outcomes), (12, 2, 14));
+    assert_eq!((delivered.emitted, delivered.refused, delivered.outcomes), (13, 2, 15));
     assert!(sink.0.lock().unwrap().is_empty());
 }
 
@@ -167,15 +170,15 @@ fn records_without_valid_provenance_are_never_offered() {
     let (emissions, outcomes) = lifecycle(bad.clone());
     let sink = Capture::default();
     let delivered = deliver(emissions, Vec::new(), &provenance(), "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 14);
+    assert_eq!(delivered.invalid, 15);
     assert!(sink.0.lock().unwrap().is_empty());
     // … and outcomes observed by one, or scoring one.
     let delivered =
         deliver(Vec::new(), outcomes.clone(), &provenance(), "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 14, "the estimating build's provenance is checked too");
+    assert_eq!(delivered.invalid, 15, "the estimating build's provenance is checked too");
     let (_, good_outcomes) = lifecycle(provenance());
     let delivered = deliver(Vec::new(), good_outcomes, &bad, "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 14, "the observing build's provenance is checked too");
+    assert_eq!(delivered.invalid, 15, "the observing build's provenance is checked too");
     assert!(sink.0.lock().unwrap().is_empty());
 }
 
@@ -227,7 +230,7 @@ fn incomplete_provenance_is_emitted_and_marked() {
     let delivered = deliver(emissions, outcomes, &tarball, "host-test", false, Some(&sink));
     assert_eq!(
         (delivered.emitted, delivered.outcomes, delivered.invalid),
-        (12, 14, 0),
+        (13, 15, 0),
         "no data lost"
     );
     for envelope in sink.0.lock().unwrap().iter() {
@@ -264,16 +267,19 @@ fn swap_fit_rebuilds_the_registry_only_when_the_fit_id_changes() {
     let b = fixture_fit(fit_as_of() + chrono::Duration::hours(1));
     assert_ne!(a.id, b.id);
     // The same file again: nothing to do.
-    assert!(swap_fit((Some(&a.id), None), (Some(a.clone()), None)).is_none());
-    assert!(swap_fit((None, None), (None, None)).is_none());
+    assert!(swap_fit((Some(&a.id), None, None), (Some(a.clone()), None, None)).is_none());
+    assert!(swap_fit((None, None, None), (None, None, None)).is_none());
     // A new id (the daily refit): rebuilt around it.
-    let swapped = swap_fit((Some(&a.id), None), (Some(b.clone()), None)).expect("a new id swaps");
+    let swapped =
+        swap_fit((Some(&a.id), None, None), (Some(b.clone()), None, None)).expect("a new id swaps");
     assert_eq!(swapped.fit_id(), Some(b.id.as_str()));
     assert_eq!(twin_otter_answer(&swapped), Ok(b.id.clone()));
     // A file appearing, and one disappearing.
-    let appeared = swap_fit((None, None), (Some(a.clone()), None)).expect("a first file swaps");
+    let appeared =
+        swap_fit((None, None, None), (Some(a.clone()), None, None)).expect("a first file swaps");
     assert_eq!(appeared.fit_id(), Some(a.id.as_str()));
-    let gone = swap_fit((Some(&b.id), None), (None, None)).expect("a missing file swaps");
+    let gone =
+        swap_fit((Some(&b.id), None, None), (None, None, None)).expect("a missing file swaps");
     assert_eq!(gone.fit_id(), None, "the unloaded registry");
     assert_eq!(gone.ids(), Registry::builtin().ids());
     assert_eq!(twin_otter_answer(&gone), Err(crate::eta::NoEstimateReason::NoModel));
@@ -290,8 +296,12 @@ fn a_pass_hot_reloads_a_newer_fit_and_ignores_an_unchanged_one() {
     let now = review_input().as_of;
     let mut registry = Registry::load(root, now);
     let reload = |registry: &mut Registry| match swap_fit(
-        (registry.fit_id(), registry.fit_v2_id()),
-        (fit::load_latest(root, now), fit::v2::load_latest_v2(root, now)),
+        (registry.fit_id(), registry.fit_v2_id(), registry.fit_v3_id()),
+        (
+            fit::load_latest(root, now),
+            fit::v2::load_latest_v2(root, now),
+            fit::v3::load_latest_v3(root, now),
+        ),
     ) {
         Some(rebuilt) => {
             *registry = rebuilt;

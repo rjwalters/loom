@@ -23,8 +23,9 @@
 use super::coeffs::{self, CoefficientFile, FitMeta, FitWindow, Fitter};
 use super::features_v2::PriorityCoverage;
 use super::rows::{self, Assembled};
-use super::{v2, FitStage};
+use super::{v2, v3, FitStage};
 use crate::eta::fleet::{self, FleetSnapshot};
+use crate::eta::loop_features::LoopCoverage;
 use crate::eta::repo_priority::RosterRevision;
 use crate::eta::roster_history::{self, HistoryCoverage};
 use crate::eta::star::StarInputs;
@@ -110,6 +111,12 @@ pub struct FitReport {
     /// The fleet roster history the v2 inputs read (#10586): whether it was
     /// loaded, and on what basis its revisions are knowable.
     pub roster_history: HistoryCoverage,
+    /// The `eta-fit/v3` file's content-derived id (#10521).
+    pub v3_id: String,
+    /// Where the v3 file was (or would have been) written.
+    pub v3_path: PathBuf,
+    /// How many rows know each v3 friction input.
+    pub loop_coverage: LoopCoverage,
 }
 
 /// This build, as the file's `fitter`.
@@ -180,6 +187,14 @@ pub fn fit_v2_of(assembled: &Assembled, as_of: DateTime<Utc>, fitter: &Fitter) -
     )
 }
 
+/// The `eta-fit/v3` file (#10521) of rows [`fit_snapshots_with_star`]
+/// assembled at `as_of`: the same rows, window and fitter, over the
+/// friction-aware features.
+#[must_use]
+pub fn fit_v3_of(assembled: &Assembled, as_of: DateTime<Utc>, fitter: &Fitter) -> CoefficientFile {
+    v3::fit_v3(&fit_meta(assembled, as_of, fitter), assembled)
+}
+
 fn fit_meta(assembled: &Assembled, as_of: DateTime<Utc>, fitter: &Fitter) -> FitMeta {
     let mut window = FitWindow::standard(as_of);
     window.data_through = Some(assembled.data_through);
@@ -235,13 +250,21 @@ fn fit_loaded(
     let dir_v2 = v2::fit_dir_v2(root);
     let path_v2 =
         out.map_or_else(|| dir_v2.join(coeffs::path_for(as_of)), |o| o.with_extension("v2.json"));
+    let file_v3 = fit_v3_of(&assembled, as_of, fitter);
+    let dir_v3 = v3::fit_dir_v3(root);
+    let path_v3 =
+        out.map_or_else(|| dir_v3.join(coeffs::path_for(as_of)), |o| o.with_extension("v3.json"));
     let mut pruned = 0;
     if !dry_run {
         coeffs::write(&path, &file).with_context(|| format!("writing {}", path.display()))?;
         coeffs::write(&path_v2, &file_v2)
             .with_context(|| format!("writing {}", path_v2.display()))?;
+        coeffs::write(&path_v3, &file_v3)
+            .with_context(|| format!("writing {}", path_v3.display()))?;
         if out.is_none() {
-            pruned = prune_dir(&dir, RETAIN_FILES) + prune_dir(&dir_v2, RETAIN_FILES);
+            pruned = prune_dir(&dir, RETAIN_FILES)
+                + prune_dir(&dir_v2, RETAIN_FILES)
+                + prune_dir(&dir_v3, RETAIN_FILES);
         }
     }
 
@@ -288,6 +311,9 @@ fn fit_loaded(
         v2_path: path_v2,
         priority_coverage: PriorityCoverage::of(&assembled.priority_inputs),
         roster_history,
+        v3_id: file_v3.id.clone(),
+        v3_path: path_v3,
+        loop_coverage: LoopCoverage::of(&assembled.loops),
     })
 }
 

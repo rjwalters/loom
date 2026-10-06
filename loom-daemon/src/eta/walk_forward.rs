@@ -16,9 +16,17 @@
 //! case gets the unfitted registry, so a replay is byte-identical to one
 //! built from [`Registry::builtin`].
 //!
+//! The versioned files (`eta-fit/v2`, #10508; `eta-fit/v3`, #10521) are
+//! dated the same way, each schema on its own: a case's registry holds the
+//! newest file **of each schema** strictly before its `as_of`, so
+//! `land-2026-10-06-keen-wren` and `land-2026-10-06-loop-kite` replay
+//! walk-forward beside twin-otter-b for a paired backtest
+//! ([`super::backtest_paired`]). With no v2 or v3 file the dated registries
+//! are exactly the v1-only ones.
+//!
 //! Pure apart from [`DatedFits::load_dir`], which only reads the files.
 
-use super::fit::{coeffs, CoefficientFile};
+use super::fit::{coeffs, v2, v3, CoefficientFile};
 use super::history::StageSamples;
 use super::{EstimateInput, Explanation, Heuristic, Kind, Registry, Tier};
 use chrono::{DateTime, Utc};
@@ -36,41 +44,59 @@ pub struct DatedFits {
 }
 
 impl DatedFits {
-    /// From `files`, in any order. Pure.
+    /// From `files` (`eta-fit/v1`), in any order. Pure.
     #[must_use]
     pub fn new(files: Vec<CoefficientFile>) -> Self {
-        let mut files = files;
-        // Stable: of two files with one cutoff, the later one in `files`
-        // (the later name, for `load_dir`) is kept.
-        files.sort_by_key(|f| f.as_of);
-        let mut dated: Vec<(DateTime<Utc>, Registry)> = Vec::new();
-        for file in files {
-            let cutoff = file.as_of;
-            if dated.last().is_some_and(|(c, _)| *c == cutoff) {
-                dated.pop();
-            }
-            dated.push((cutoff, Registry::with_fit(Some(Arc::new(file)))));
-        }
+        Self::with_schemas(files, Vec::new(), Vec::new())
+    }
+
+    /// From the `eta-fit/v1`, `eta-fit/v2` and `eta-fit/v3` files, each in
+    /// any order. Pure. A registry is dated at every cutoff any schema has,
+    /// and holds, per schema, the newest file whose cutoff is at or before
+    /// it (`None` before that schema's first).
+    #[must_use]
+    pub fn with_schemas(
+        v1: Vec<CoefficientFile>,
+        v2: Vec<CoefficientFile>,
+        v3: Vec<CoefficientFile>,
+    ) -> Self {
+        let (v1, v2, v3) = (by_cutoff(v1), by_cutoff(v2), by_cutoff(v3));
+        let mut cutoffs: Vec<DateTime<Utc>> =
+            v1.iter().chain(&v2).chain(&v3).map(|f| f.as_of).collect();
+        cutoffs.sort();
+        cutoffs.dedup();
+        let at = |files: &[Arc<CoefficientFile>], cutoff: DateTime<Utc>| {
+            let n = files.partition_point(|f| f.as_of <= cutoff);
+            n.checked_sub(1).map(|i| Arc::clone(&files[i]))
+        };
+        let dated = cutoffs
+            .into_iter()
+            .map(|c| (c, Registry::with_all_fits(at(&v1, c), at(&v2, c), at(&v3, c))))
+            .collect();
         DatedFits {
             dated,
             unfitted: Registry::builtin(),
         }
     }
 
-    /// Every readable `eta-fit/v1` file directly in `dir`, read in name
-    /// order ([`coeffs::read`]; an unreadable or foreign file is skipped).
+    /// Every readable `eta-fit/v1` file directly in `dir`, and every
+    /// readable `eta-fit/v2` / `eta-fit/v3` file in its `v2` / `v3`
+    /// subdirectory (the layout `eta fit` writes, [`v2::fit_dir_v2`],
+    /// [`v3::fit_dir_v3`]), each read in name order ([`coeffs::read`],
+    /// [`v2::read_v2`], [`v3::read_v3`]; an unreadable or foreign file is
+    /// skipped, and a missing subdirectory is no file).
     ///
     /// # Errors
     ///
     /// `dir` cannot be listed.
     pub fn load_dir(dir: &Path) -> std::io::Result<Self> {
-        let mut paths: Vec<_> = std::fs::read_dir(dir)?
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "json"))
-            .collect();
-        paths.sort();
-        Ok(Self::new(paths.iter().filter_map(|p| coeffs::read(p)).collect()))
+        let v1 = json_files(dir)?;
+        let sub = |name: &str| json_files(&dir.join(name)).unwrap_or_default();
+        Ok(Self::with_schemas(
+            v1.iter().filter_map(|p| coeffs::read(p)).collect(),
+            sub("v2").iter().filter_map(|p| v2::read_v2(p)).collect(),
+            sub("v3").iter().filter_map(|p| v3::read_v3(p)).collect(),
+        ))
     }
 
     /// How many coefficient files (distinct cutoffs) there are.
@@ -121,6 +147,32 @@ impl DatedFits {
             models_hold: h.models_hold(),
         })
     }
+}
+
+/// `files` sorted by cutoff, one per cutoff: of two files with one cutoff,
+/// the later one in `files` (the later name, for `load_dir`) is kept.
+fn by_cutoff(mut files: Vec<CoefficientFile>) -> Vec<Arc<CoefficientFile>> {
+    // Stable, so the later of a tie stays later.
+    files.sort_by_key(|f| f.as_of);
+    let mut out: Vec<Arc<CoefficientFile>> = Vec::new();
+    for file in files {
+        if out.last().is_some_and(|f| f.as_of == file.as_of) {
+            out.pop();
+        }
+        out.push(Arc::new(file));
+    }
+    out
+}
+
+/// The `*.json` paths directly in `dir`, by name.
+fn json_files(dir: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut paths: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .collect();
+    paths.sort();
+    Ok(paths)
 }
 
 /// One registered heuristic, each estimate served by

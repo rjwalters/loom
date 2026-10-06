@@ -32,6 +32,7 @@ const BUILTIN_TIERS: &[(&str, Tier)] = &[
     ("land-2026-10-06-held-heron", Tier::Candidate),
     ("land-2026-10-06-keen-wren", Tier::Candidate),
     ("land-2026-10-06-bold-lark", Tier::Candidate),
+    ("land-2026-10-06-loop-kite", Tier::Candidate),
     ("land-2026-10-04-twin-otter", Tier::Candidate),
     ("land-2026-10-04-twin-otter-b", Tier::Candidate),
     ("land-2026-10-06-tandem-wren", Tier::Candidate),
@@ -109,7 +110,7 @@ fn the_default_budget_is_current_plus_the_alternates_cap() {
 fn a_registry_over_budget_is_refused_naming_the_excess_in_registration_order() {
     let registry = Registry::builtin();
     let land: Vec<&str> = registry.for_kind(Kind::Land).map(|h| h.id()).collect();
-    assert_eq!(land.len(), 13);
+    assert_eq!(land.len(), 14);
     // Exactly at the land count: fine.
     assert!(registry.check_budget(land.len()).is_ok());
 
@@ -119,13 +120,13 @@ fn a_registry_over_budget_is_refused_naming_the_excess_in_registration_order() {
         BudgetExceeded {
             kind: Kind::Land,
             max_active: 3,
-            registered: 13,
+            registered: 14,
             excess: land[3..].to_vec(),
         }
     );
     let message = over.to_string();
     assert!(message.contains("maxActive is 3"), "{message}");
-    assert!(message.contains("13 land heuristics"), "{message}");
+    assert!(message.contains("14 land heuristics"), "{message}");
     for id in &land[3..] {
         assert!(message.contains(id), "{message} names {id}");
     }
@@ -134,7 +135,7 @@ fn a_registry_over_budget_is_refused_naming_the_excess_in_registration_order() {
     }
 
     // One over: only the last registration is the excess.
-    let one = registry.check_budget(12).unwrap_err();
+    let one = registry.check_budget(13).unwrap_err();
     assert_eq!(one.excess, ["land-2026-10-06-tandem-wren"]);
 }
 
