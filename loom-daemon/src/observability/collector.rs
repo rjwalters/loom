@@ -988,6 +988,11 @@ async fn sample_snapshots(
     // file reads, no forge call; a no-op without the ops sink. After the
     // snapshot so it reports this pass's built snapshot.
     super::ops::eta_health::record(workspace_root).await;
+    // Per-account Codex session-container state (Issue #10455): export the
+    // gauge from the always-on watch's newest observations. No docker call
+    // here (the watch owns the bounded snapshot), so a wedged Docker cannot
+    // stall this pass; the WARN lives in the watch and runs without telemetry.
+    super::ops::codex_session::record();
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant

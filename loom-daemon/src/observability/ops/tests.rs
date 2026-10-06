@@ -281,6 +281,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::EtaHealthSnapshotRows,
         MetricName::EtaHealthSnapshotAlternatesRows,
         MetricName::EtaHealthPendingOverCap,
+        MetricName::CodexSessionState,
         MetricName::CaptainGaugeAgeSeconds,
         MetricName::CaptainGaugeFallback,
     ] {
