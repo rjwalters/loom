@@ -498,6 +498,7 @@ fn daemon_write_paths_are_scoped() {
         ("cli/forge_action.rs", Gated),
         ("role_runner/launch.rs", Gated),
         ("operator_decision/cli.rs", Gated),
+        ("forge_priority_labels.rs", Gated),
         (
             "fleet/drain_reset.rs",
             OperatorOnly("`fleet drain`: the operator's own worker, by name (the claim resetter, split out of fleet/drain.rs by #10089)"),

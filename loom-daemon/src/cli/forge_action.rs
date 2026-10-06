@@ -920,12 +920,9 @@ fn write_target(action: &ForgeAction) -> Option<Option<String>> {
         // write verbs — its `--repo` is exactly the `Option<String>` shape
         // `may_write_from` wants.
         ForgeAction::Comment { repo, .. } => Some(repo.clone()),
-        // #10518: `--audit-pr` posts the inherited-star audit comment.
-        ForgeAction::PriorityLabels {
-            audit_pr: Some(_),
-            repo,
-            ..
-        } => Some(repo.clone()),
+        // #10518: `priority-labels --audit-pr` is NOT vetted here: its target
+        // can come from the audit URL, so `forge_priority_labels` resolves it
+        // once and vets that exact repo itself before posting.
         // #10255: the queue mutations write (dormant today, vetted anyway).
         ForgeAction::MergeQueue {
             action:
