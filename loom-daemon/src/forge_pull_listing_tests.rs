@@ -50,11 +50,26 @@ fn a_sparse_row_parses_leniently_and_garbage_does_not() {
 
 #[test]
 fn mergeable_maps_true_false_null_and_absent() {
-    assert_eq!(parse_mergeable(r#"{"mergeable": true}"#).unwrap(), Some(true));
-    assert_eq!(parse_mergeable(r#"{"mergeable": false}"#).unwrap(), Some(false));
-    assert_eq!(parse_mergeable(r#"{"mergeable": null}"#).unwrap(), None);
-    assert_eq!(parse_mergeable(r#"{"number": 1}"#).unwrap(), None);
-    assert!(parse_mergeable("nope").is_err());
+    let m = |body: &str| parse_pull_state(body).unwrap().mergeable;
+    assert_eq!(m(r#"{"mergeable": true}"#), Some(true));
+    assert_eq!(m(r#"{"mergeable": false}"#), Some(false));
+    assert_eq!(m(r#"{"mergeable": null}"#), None);
+    assert_eq!(m(r#"{"number": 1}"#), None);
+    assert!(parse_pull_state("nope").is_err());
+}
+
+#[test]
+fn pull_state_pairs_mergeable_with_the_same_responses_head() {
+    let rest = r#"{"number": 4, "mergeable": false, "head": {"ref": "b", "sha": "h1"}}"#;
+    let want = PullState {
+        mergeable: Some(false),
+        head_sha: Some("h1".to_string()),
+    };
+    assert_eq!(parse_pull_state(rest).unwrap(), want);
+    let reduced = r#"{"mergeable": false, "head_sha": "h1"}"#;
+    assert_eq!(parse_pull_state(reduced).unwrap(), want, "the cached shape round-trips");
+    assert!(is_current_pull_entry(r#"{"mergeable":null,"head_sha":null}"#));
+    assert!(!is_current_pull_entry(r#"{"mergeable":true}"#), "pre-#10382 shape");
 }
 
 #[test]
@@ -69,7 +84,7 @@ fn the_url_lists_open_prs_newest_first_one_page_at_a_time() {
 /// A fake `gh` that logs its argv, answers page 1 with `page1` rows and every
 /// other page with `[]`, with `200 + ETag` unless the caller presents the
 /// page's ETag (then `304` + exit 1, like real gh). `pulls/<n>` answers
-/// `{"mergeable": false}` with its own ETag on the same rule.
+/// `mergeable: false` at head `h` with its own ETag on the same rule.
 fn write_fake_gh(dir: &Path, page1_rows: usize) -> (PathBuf, PathBuf) {
     let log = dir.join("gh.log");
     let rows: Vec<String> = (1..=page1_rows)
@@ -92,7 +107,7 @@ case "$*" in
     echo '[]' ;;
   *'/pulls/'*)
     printf 'HTTP/2.0 200 OK\r\nEtag: W/"m"\r\n\r\n'
-    echo '{{"mergeable": false}}' ;;
+    echo '{{"mergeable": false, "head": {{"sha": "h"}}}}' ;;
   *)
     echo 'gh: Something went wrong (HTTP 502)' 1>&2
     exit 1 ;;
@@ -135,17 +150,25 @@ fn a_second_listing_is_served_by_a_304() {
 
 #[cfg(unix)]
 #[test]
-fn a_full_page_pages_on_and_the_cap_holds() {
+fn a_full_page_pages_on_and_page_1_is_revalidated() {
     let dir = tempfile::tempdir().unwrap();
     let (gh, log) = write_fake_gh(dir.path(), PER_PAGE);
     let rows = list_open_pulls_cached_as("test", &gh, Some(dir.path()), None, 3).unwrap();
     assert_eq!(rows.len(), PER_PAGE);
-    assert_eq!(log_lines(&log).len(), 2, "page 2 was short");
+    let lines = log_lines(&log);
+    assert_eq!(lines.len(), 3, "page 2 was short, then page 1 revalidates: {lines:?}");
+    assert!(lines[2].contains(r#"If-None-Match: W/"p1""#), "{lines:?}");
+}
 
-    let capped = tempfile::tempdir().unwrap();
-    let (gh, log) = write_fake_gh(capped.path(), PER_PAGE);
-    let rows = list_open_pulls_cached_as("test", &gh, Some(capped.path()), None, 1).unwrap();
-    assert_eq!(rows.len(), PER_PAGE);
+/// #10382: filling every page is an error, not a warning plus a truncated
+/// `Ok` — `pr.list-open` is `complete-required`.
+#[cfg(unix)]
+#[test]
+fn filling_every_page_is_an_error_not_a_truncated_listing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (gh, log) = write_fake_gh(dir.path(), PER_PAGE);
+    let err = list_open_pulls_cached_as("test", &gh, Some(dir.path()), None, 1).unwrap_err();
+    assert!(err.to_string().contains("incomplete"), "{err}");
     assert_eq!(log_lines(&log).len(), 1, "max_pages = 1 never reads page 2");
 }
 
@@ -155,8 +178,8 @@ fn mergeable_is_a_conditional_single_pr_read() {
     let dir = tempfile::tempdir().unwrap();
     let (gh, log) = write_fake_gh(dir.path(), 0);
     for _ in 0..2 {
-        let m = pull_mergeable_cached_as("test", &gh, Some(dir.path()), None, 42).unwrap();
-        assert_eq!(m, Some(false));
+        let m = pull_state_cached_as("test", &gh, Some(dir.path()), None, 42).unwrap();
+        assert_eq!((m.mergeable, m.head_sha.as_deref()), (Some(false), Some("h")));
     }
     let lines = log_lines(&log);
     assert!(lines[0].contains("/pulls/42"), "{lines:?}");
@@ -191,7 +214,7 @@ impl Drop for StoreGuard {
 
 #[cfg(unix)]
 #[test]
-fn a_per_pr_entry_stores_only_mergeable_and_stale_ones_are_pruned() {
+fn a_per_pr_entry_stores_only_mergeable_and_head_and_stale_ones_are_pruned() {
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("store");
     // 0700 regardless of umask: the store purges a dir others could write
@@ -238,8 +261,8 @@ fn a_per_pr_entry_stores_only_mergeable_and_stale_ones_are_pruned() {
         guard.insert(listing_key.clone(), entry(None));
     }
 
-    let m = pull_mergeable_cached_as("test", &gh, Some(dir.path()), None, 42).unwrap();
-    assert_eq!(m, Some(false));
+    let m = pull_state_cached_as("test", &gh, Some(dir.path()), None, 42).unwrap();
+    assert_eq!(m.mergeable, Some(false));
 
     assert!(!stale_disk.exists(), "a per-PR file past the max age is pruned");
     assert!(fresh_disk.exists(), "a fresh per-PR file survives");
@@ -249,7 +272,7 @@ fn a_per_pr_entry_stores_only_mergeable_and_stale_ones_are_pruned() {
     assert!(guard.contains_key(&listing_key), "a hot listing entry is not");
     drop(guard);
 
-    // The new entry holds only the mergeable value, never the full PR body.
+    // The new entry holds only mergeable + head, never the full PR body.
     let written: Vec<_> = std::fs::read_dir(&store_dir)
         .unwrap()
         .filter_map(Result::ok)
@@ -258,7 +281,7 @@ fn a_per_pr_entry_stores_only_mergeable_and_stale_ones_are_pruned() {
         .collect();
     assert_eq!(written.len(), 1, "{written:?}");
     let entry = store::read_disk_entry(&written[0]).unwrap();
-    assert_eq!(entry.body, r#"{"mergeable":false}"#);
+    assert_eq!(entry.body, r#"{"mergeable":false,"head_sha":"h"}"#);
     cache().lock().unwrap().remove(&hot_key);
     cache().lock().unwrap().remove(&listing_key);
 }
@@ -422,3 +445,7 @@ fn a_failed_by_head_lookup_is_an_error_never_an_empty_answer() {
     let err = open_pulls_for_head_as("test", &gh, Some(dir.path()), Some("o/r"), "feature/x");
     assert!(err.unwrap_err().to_string().contains("HTTP 502"));
 }
+
+// Listing edges (#10382): dedupe, mid-walk skew, the 404 retry, legacy entries.
+#[path = "forge_pull_listing_edges_tests.rs"]
+mod edges;

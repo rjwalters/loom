@@ -9,7 +9,8 @@
 //! - `GET repos/{o}/{r}/pulls?state=open` carries everything those listings
 //!   read — number, draft, created/updated timestamps, labels, head ref, head
 //!   sha, base ref — except `mergeable`, which GitHub only returns on a single
-//!   PR's `GET repos/{o}/{r}/pulls/{n}` ([`pull_mergeable_cached_as`]).
+//!   PR's `GET repos/{o}/{r}/pulls/{n}` ([`pull_state_cached_as`], which pairs it
+//!   with that response's `head.sha`).
 //! - Every request is conditional on the ETag of the last `200` for the same
 //!   resolved key ([`store::daemon_cache_key`], #9252): an unchanged page or
 //!   PR is a `304`, free against the REST rate limit. The ETag and body live
@@ -24,7 +25,7 @@
 //!
 //! The listing uses a fixed set of keys (one per page), but the per-PR reads
 //! add keys per distinct PR ever checked. Those entries store only a reduced
-//! body — `{"mergeable": …}` under the `pull-` file prefix, the changed-file
+//! body — `{"mergeable", "head_sha"}` under the `pull-` file prefix, the changed-file
 //! names under `files-` ([`pull_files_cached_as`], #10382; never the patches)
 //! — and both layers drop them [`PULL_ENTRY_MAX_AGE`] after their last `200`,
 //! the same bound as `forge_cached_view`'s `prune_stale`.
@@ -110,13 +111,25 @@ pub fn build_pulls_url(repo: Option<&str>, page: usize) -> String {
 const PR_LIST_OPEN: ForgeOp = ops::PR_LIST_OPEN;
 
 /// Every open PR of the repo `cwd` resolves to (or `repo_override` /
-/// `LOOM_REPO`), up to `max_pages` pages of [`PER_PAGE`], newest first. Each
-/// page is its own conditional read; paging stops at the first short page.
-/// A capped listing whose last page is full logs a truncation warning.
+/// `LOOM_REPO`), up to `max_pages` pages of [`PER_PAGE`], newest first, each
+/// PR number once. Each page is its own conditional read; paging stops at
+/// the first short page.
+///
+/// Pages are read one after another, not atomically (#10382, the
+/// [`crate::forge_listing::list_issues_cached_all_as`] rule): after a
+/// multi-page walk every earlier page is revalidated (a free `304` when
+/// nothing moved), and any change is an error rather than a set that may
+/// have lost or doubled a PR across a page boundary. Rows are also deduped
+/// by number (first occurrence wins). A single-page walk makes no extra read.
 ///
 /// Every forge call is recorded against `caller` in
 /// [`crate::forge_call_stats`] (#9251). Errors carry the `gh` stderr tail so
 /// [`crate::rate_limit_breaker`]'s classifier sees rate-limit text unchanged.
+///
+/// # Errors
+/// A page failed (after the #6171 one-time credential-refresh retry on a
+/// 404), `max_pages` full pages were read (the listing is incomplete — the
+/// `pr.list-open` row is `complete-required`), or the listing moved mid-walk.
 pub fn list_open_pulls_cached_as(
     caller: &'static str,
     gh_bin: &Path,
@@ -124,45 +137,115 @@ pub fn list_open_pulls_cached_as(
     repo_override: Option<&str>,
     max_pages: usize,
 ) -> Result<Vec<RestPull>> {
-    let target = resolve(cwd, repo_override);
-    let mut rows = Vec::new();
-    for page in 1..=max_pages.max(1) {
-        let url = build_pulls_url(target.repo.as_deref(), page);
-        let site = store::ConditionalRead::new(caller, PR_LIST_OPEN);
-        let body = conditional_get(site, gh_bin, cwd, &target, &url, Kind::Listing)?;
-        let batch =
-            parse_rest_pulls(&body).with_context(|| format!("parse REST pulls JSON from {url}"))?;
-        let full = batch.len() >= PER_PAGE;
-        rows.extend(batch);
-        if !full {
-            return Ok(rows);
-        }
-    }
-    log::warn!(
-        "forge_pull_listing: the open-PR listing filled {max_pages} page(s) of {PER_PAGE}; PRs \
-         beyond them are not seen this poll"
-    );
-    Ok(rows)
+    let refresh = crate::credential_preflight::force_refresh_owner_credential;
+    list_open_pulls_with_refresh(caller, gh_bin, cwd, repo_override, max_pages, &refresh)
 }
 
-/// One PR's REST `mergeable` (`true` / `false`, or `None` while GitHub is
-/// still computing it — "no information"), via a conditional
-/// `GET repos/{o}/{r}/pulls/{number}`. The ETag covers the whole body, so a
-/// recomputed mergeability (e.g. after the base branch moved, which does not
-/// bump `updated_at`) is a fresh `200`, never a stale `304`.
-pub fn pull_mergeable_cached_as(
+/// [`list_open_pulls_cached_as`] with the #6171 credential refresh injected
+/// (tests cannot drive the process-global primary-workspace mint).
+fn list_open_pulls_with_refresh(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    max_pages: usize,
+    refresh: &dyn Fn(&Path) -> bool,
+) -> Result<Vec<RestPull>> {
+    let target = resolve(cwd, repo_override);
+    let read = |page: usize| -> Result<Vec<RestPull>> {
+        let url = build_pulls_url(target.repo.as_deref(), page);
+        let get = || {
+            let site = store::ConditionalRead::new(caller, PR_LIST_OPEN);
+            conditional_get(site, gh_bin, cwd, &target, &url, Kind::Listing)
+        };
+        let body = retry_404_once(cwd, &url, refresh, get)?;
+        parse_rest_pulls(&body).with_context(|| format!("parse REST pulls JSON from {url}"))
+    };
+    let max_pages = max_pages.max(1);
+    let mut pages: Vec<Vec<RestPull>> = Vec::new();
+    for page in 1..=max_pages {
+        let rows = read(page)?;
+        let full = rows.len() >= PER_PAGE;
+        pages.push(rows);
+        if !full {
+            for (i, earlier) in pages[..pages.len() - 1].iter().enumerate() {
+                if read(i + 1)? != *earlier {
+                    return Err(anyhow!(
+                        "forge_pull_listing: the open-PR listing changed mid-walk (page {} \
+                         moved); the set is not a consistent snapshot",
+                        i + 1
+                    ));
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            return Ok(pages
+                .into_iter()
+                .flatten()
+                .filter(|r| seen.insert(r.number))
+                .collect());
+        }
+    }
+    Err(anyhow!(
+        "forge_pull_listing: more than {} open PRs; the listing is incomplete",
+        max_pages * PER_PAGE
+    ))
+}
+
+/// `get()`, retried exactly once after a forced credential refresh when a
+/// registered workspace (`Some(cwd)`) sees an HTTP 404 (#6171 — a per-owner
+/// App token minted before the repo was registered). Any other failure, a
+/// `None` cwd, or a refresh that does nothing returns the first error.
+fn retry_404_once(
+    cwd: Option<&Path>,
+    url: &str,
+    refresh: &dyn Fn(&Path) -> bool,
+    get: impl Fn() -> Result<String>,
+) -> Result<String> {
+    let err = match get() {
+        Ok(body) => return Ok(body),
+        Err(e) => e,
+    };
+    if let Some(root) = cwd {
+        if crate::forge_listing::is_404_error(&err.to_string()) && refresh(root) {
+            log::info!(
+                "forge_pull_listing: retrying {url} in {} after a forced per-owner credential \
+                 refresh (#6171)",
+                root.display()
+            );
+            return get();
+        }
+    }
+    Err(err)
+}
+
+/// One PR's state from a single-PR read, `mergeable` paired with the
+/// `head.sha` GitHub computed it for (#10382): a listing row's head may be
+/// older or newer than the per-PR read, so a verdict must name this one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PullState {
+    /// `true` / `false`, or `None` while GitHub is still computing it.
+    pub mergeable: Option<bool>,
+    /// `head.sha` of the same response.
+    pub head_sha: Option<String>,
+}
+
+/// One PR's [`PullState`] via a conditional `GET repos/{o}/{r}/pulls/{number}`.
+/// The ETag covers the whole body, so a recomputed mergeability (e.g. after
+/// the base branch moved, which does not bump `updated_at`) or a pushed head
+/// is a fresh `200`, never a stale `304`.
+pub fn pull_state_cached_as(
     caller: &'static str,
     gh_bin: &Path,
     cwd: Option<&Path>,
     repo_override: Option<&str>,
     number: u32,
-) -> Result<Option<bool>> {
+) -> Result<PullState> {
     let target = resolve(cwd, repo_override);
     let repo_path = target.repo.as_deref().unwrap_or("{owner}/{repo}");
     let url = format!("repos/{repo_path}/pulls/{number}");
     let site = store::ConditionalRead::new(caller, ops::PR_VIEW_STATE);
     let body = conditional_get(site, gh_bin, cwd, &target, &url, Kind::Pull)?;
-    parse_mergeable(&body).with_context(|| format!("parse REST pull JSON from {url}"))
+    parse_pull_state(&body).with_context(|| format!("parse REST pull JSON from {url}"))
 }
 
 /// The changed-file paths of PR `number`, via conditional
@@ -258,19 +341,41 @@ pub fn open_pulls_for_head_as(
     }
 }
 
-/// The `mergeable` field of one `GET pulls/{n}` body (absent or `null` ⇒
-/// `None`).
+/// The [`PullState`] of one `GET pulls/{n}` body — or of the reduced
+/// `{"mergeable", "head_sha"}` body a cached entry stores. An absent or
+/// `null` field is `None`.
 ///
 /// # Errors
 /// Malformed JSON.
-pub fn parse_mergeable(body: &str) -> Result<Option<bool>> {
+pub fn parse_pull_state(body: &str) -> Result<PullState> {
+    #[derive(serde::Deserialize)]
+    struct RawHead {
+        #[serde(default)]
+        sha: Option<String>,
+    }
     #[derive(serde::Deserialize)]
     struct Raw {
         #[serde(default)]
         mergeable: Option<bool>,
+        #[serde(default)]
+        head: Option<RawHead>,
+        #[serde(default)]
+        head_sha: Option<String>,
     }
     let raw: Raw = serde_json::from_str(body.trim())?;
-    Ok(raw.mergeable)
+    Ok(PullState {
+        mergeable: raw.mergeable,
+        head_sha: raw.head.and_then(|h| h.sha).or(raw.head_sha),
+    })
+}
+
+/// Is `body` a per-PR entry in the current reduced shape? Entries written
+/// before #10382 hold only `{"mergeable"}`: presenting their ETag would `304`
+/// forever with no head, so they are treated as a cache miss.
+fn is_current_pull_entry(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|v| v.get("head_sha").is_some())
 }
 
 /// Parse a REST pulls-listing body. Lenient: a missing `head` / `base` /
@@ -380,7 +485,8 @@ fn conditional_get(
         Kind::Pull => store::entry_path_with_prefix(d, PULL_PREFIX, &cache_key),
         Kind::Files => store::entry_path_with_prefix(d, FILES_PREFIX, &cache_key),
     });
-    let sent = cached_entry(&cache_key, disk_path.as_deref());
+    let sent = cached_entry(&cache_key, disk_path.as_deref())
+        .filter(|e| kind != Kind::Pull || is_current_pull_entry(&e.body));
     let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
     let (status, response, stderr) =
         store::fetch_conditional(site, gh_bin, cwd, target, url, sent_etag)?;
@@ -404,9 +510,10 @@ fn conditional_get(
                 // A per-PR entry keeps only what a 304 must reproduce.
                 let stored = match kind {
                     Kind::Listing => Some(r.body.clone()),
-                    Kind::Pull => parse_mergeable(&r.body)
-                        .ok()
-                        .map(|m| serde_json::json!({ "mergeable": m }).to_string()),
+                    Kind::Pull => parse_pull_state(&r.body).ok().map(|s| {
+                        serde_json::json!({ "mergeable": s.mergeable, "head_sha": s.head_sha })
+                            .to_string()
+                    }),
                     Kind::Files => parse_files(&r.body)
                         .ok()
                         .map(|f| serde_json::json!(f).to_string()),

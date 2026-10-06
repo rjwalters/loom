@@ -252,9 +252,14 @@ fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
 /// candidate — but only for one whose decision it can change: a held or
 /// in-flight PR is kept whatever GitHub says, so it is never read and stays
 /// [`Mergeable::Unknown`].
+///
+/// The per-PR read answers `(mergeable, head_sha)` from one response, and a
+/// read PR's `head_sha` is that one, never the listing row's (#10382): the
+/// flag comment must name the head GitHub computed `mergeable` for. A read
+/// with no head is [`Mergeable::Unknown`].
 pub fn conflict_candidates(
     rows: &[RestPull],
-    mut mergeable: impl FnMut(u32) -> Mergeable,
+    mut mergeable: impl FnMut(u32) -> (Mergeable, Option<String>),
 ) -> BTreeMap<u32, ConflictPr> {
     rows.iter()
         .filter(|r| r.has_label(REVIEW_REQUESTED) || r.has_label(MERGE_CONFLICT))
@@ -270,7 +275,11 @@ pub fn conflict_candidates(
                 decide_review_conflict(&pr),
                 ConflictAction::Keep(ConflictKeepReason::Held | ConflictKeepReason::InFlight)
             ) {
-                pr.mergeable = mergeable(r.number);
+                let (m, head_sha) = mergeable(r.number);
+                if head_sha.is_some() {
+                    pr.mergeable = m;
+                }
+                pr.head_sha = head_sha;
             }
             (r.number, pr)
         })
