@@ -353,6 +353,10 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         // #10391: `eta doctor` resolves (never uses) a reader per repo to say
         // whether one exists; it makes no forge call at all.
         "eta/doctor_facts.rs",
+        // W8: the installation snapshot reads `installation/repositories`
+        // under the repo's reader (token env stripped) for visibility and
+        // identity only; the write-scope probe passes the writer explicitly.
+        "forge_repo_facts/installation.rs",
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let re = regex::Regex::new(

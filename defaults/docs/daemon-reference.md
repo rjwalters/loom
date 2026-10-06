@@ -7607,6 +7607,59 @@ as before, and after a transfer it can only shrink.
 | `LOOM_REPO_FACTS` | on | `0` makes every migrated site issue exactly its previous forge call and restores the ETag store's process-lifetime `origin` memo (the rollback switch). |
 | `LOOM_REPO_FACTS_VERIFY_SECS` | `21600` | How long a verified record is used before one conditional re-read. |
 
+### Installation snapshot: one listing per credential (`LOOM_INSTALLATION_SNAPSHOT`)
+
+Telemetry visibility (`visibility.repo`), the D32 repo identity
+(`telemetry.repo_identity`) and the write-scope probe (`write_scope.probe`)
+each read `GET repos/<nwo>` once per repository. An App installation token can
+list every repository it reaches in one call, so each credential now keeps one
+snapshot of `GET installation/repositories?per_page=100` (every page, each
+revalidated with its own `If-None-Match`, so an unchanged installation costs
+only free `304`s). Call row: `repo_facts.installation_snapshot`, operation
+`repo.list-for-installation`. The snapshot
+holds each repository's `id`, `full_name` and `private`. It is kept in the
+private ETag store directory as `instsnap-<hash>.json` (`0700` directory,
+`0600` files, atomic writes), so every daemon and CLI process on the host
+shares it. It is keyed by forge host, `GH_CONFIG_DIR` and a fingerprint of any
+env token, never the token.
+
+- **Visibility and identity** read the snapshot of the repository's reader App
+  when one is usable, else the writer credential for its owner.
+- **The write-scope probe** reads the writer's own snapshot (it stays
+  writer-only). A listed repository is WRITE and an absent one is not.
+  `permissions` (leg 1) runs only for a user token, or when the snapshot
+  cannot be had. Then its WRITE stands, a named lesser role (`pull`, `triage`)
+  stands as a definitive refusal, and an all-`false` answer (what an App token
+  always gets) is `Unknown`.
+- **The two TTLs stack.** The probe caches its answer for
+  `LOOM_WRITE_SCOPE_TTL_SECS` (1 h) on top of a snapshot that may already be
+  an hour old, so a repository removed from the installation can keep a cached
+  WRITE for about 2 h with the defaults, not 1 h. The forge still refuses the
+  write itself.
+- **Fail-private.** A snapshot answers only while it was verified within the
+  TTL. A failed revalidation backs off for 300 s and answers nothing; a stale
+  snapshot is never served, and one stamped later than now (a clock step, a
+  damaged file) is discarded. Visibility treats a failed or stale snapshot,
+  and a repository absent from a fresh one, as **private**.
+- **The trade-off.** While the listing cannot be had at TTL expiry (an outage,
+  a rate limit), records for every repository that credential answers for are
+  stamped **private** until a revalidation succeeds, the public ones included.
+- **Rate limits.** A reader App whose listing is rate limited is withdrawn for
+  that `(app, owner)` bucket until the refusal's reset, and the read falls to
+  the writer's snapshot (else private). It never trips the host-wide
+  rate-limit breaker. The writer's refusal does, with its own `GH_CONFIG_DIR`
+  and response headers.
+- **User credentials** (a PAT, OAuth or `gh auth login` token) are refused the
+  endpoint. The refusal is remembered for the TTL, and those reads keep their
+  per-repo calls exactly as before. A credential that has listed before is
+  only reclassified by that specific refusal; any other `403`/`404` is a failed
+  revalidation (private).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOOM_INSTALLATION_SNAPSHOT` | on | `0` restores every per-repo read (so does `LOOM_REPO_FACTS=0`). |
+| `LOOM_INSTALLATION_SNAPSHOT_TTL_SECS` | `3600` | How long a verified snapshot answers before one conditional revalidation, capped at `3600`. It also bounds how long a public/private flip goes unseen by visibility and identity. |
+
 ### Untargeted reads route to readers; deferrable reads shed (`LOOM_FACADE_CWD_ROUTING`, `LOOM_READ_SHED`)
 
 Most daemon reads are built with no typed repository (`GhTarget::None`) and
