@@ -261,7 +261,7 @@ fn a_successful_multi_candidate_tick_records_the_pick_and_why_the_rest_were_skip
     let r = role_record(tick("judge"), RoleTickResult::Success, obs, "o/r", &[]);
     assert!(r.decisions_observed);
     let order: Vec<u32> = r.candidates.iter().map(|c| c.number).collect();
-    assert_eq!(order, vec![5, 6, 7, 8], "first-seen rank kept across refreshes");
+    assert_eq!(order, vec![8], "the latest snapshot is the served queue");
     let acted: Vec<(u32, &str)> = r
         .acted
         .iter()
@@ -270,14 +270,32 @@ fn a_successful_multi_candidate_tick_records_the_pick_and_why_the_rest_were_skip
     assert_eq!(acted, vec![(6, "claimed"), (6, "approved")]);
     let skipped: Vec<(u32, PickSkipReason)> =
         r.skipped.iter().map(|s| (s.number, s.reason)).collect();
-    assert_eq!(
-        skipped,
-        vec![
-            (5, PickSkipReason::InFlight),
-            (7, PickSkipReason::OperatorHold),
-            (8, PickSkipReason::NotSelected),
-        ]
-    );
+    assert_eq!(skipped, vec![(8, PickSkipReason::NotSelected)]);
+}
+
+#[test]
+fn a_refresh_ranks_the_latest_snapshot_not_a_first_seen_union() {
+    // #3 arrives starred and #1 is gone: neither served queue ranked 1,2,3.
+    let obs = journal(vec![
+        queue(vec![
+            qrow(1, "loom:review-requested", &[], "level=0"),
+            qrow(2, "loom:review-requested", &[], "level=0"),
+        ]),
+        act(1, "claimed"),
+        queue(vec![
+            qrow(3, "loom:review-requested", &["loom:operator-priority"], "level=1"),
+            qrow(2, "loom:review-requested", &[], "level=0"),
+        ]),
+    ]);
+    let r = role_record(tick("judge"), RoleTickResult::Success, obs, "o/r", &[]);
+    let ranked: Vec<(u32, u32)> = r.candidates.iter().map(|c| (c.rank, c.number)).collect();
+    assert_eq!(ranked, vec![(1, 3), (2, 2)]);
+    let acted: Vec<(u32, &str)> = r
+        .acted
+        .iter()
+        .map(|a| (a.number, a.action.as_str()))
+        .collect();
+    assert_eq!(acted, vec![(1, "claimed")], "an earlier act stays recorded");
 }
 
 #[test]

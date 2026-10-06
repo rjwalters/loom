@@ -318,37 +318,42 @@ pub fn record_pr_queue(role: &str, rows: &[Value]) {
     });
 }
 
-/// The journal rows for a served listing: the rows its `--jq` keeps, in
-/// listing order (every row when that cannot be told).
+/// The journal rows for a served listing: the rows its `--jq` prints, in the
+/// order it prints them. `None` when that cannot be told (a projection that
+/// does not name its rows): the listing is then unobserved, not guessed.
 #[must_use]
-pub fn listing_rows(listing: &crate::forge_cached_list::Served) -> Vec<JournalRow> {
-    let keep = listing
-        .surviving()
-        .unwrap_or_else(|| (0..listing.items.len()).collect());
-    keep.into_iter()
-        .filter_map(|i| listing.items.get(i))
-        .enumerate()
-        .map(|(position, item)| JournalRow {
-            number: item.number,
-            stage: listing.labels.clone(),
-            labels: item.labels.clone(),
-            sort_key: Some(PickSortKey {
-                name: "listing_order".to_string(),
-                value: (position + 1).to_string(),
-            }),
-        })
-        .take(MAX_ROWS_PER_ENTRY)
-        .collect()
+pub fn listing_rows(listing: &crate::forge_cached_list::Served) -> Option<Vec<JournalRow>> {
+    let keep = listing.surviving()?;
+    Some(
+        keep.into_iter()
+            .filter_map(|i| listing.items.get(i))
+            .enumerate()
+            .map(|(position, item)| JournalRow {
+                number: item.number,
+                stage: listing.labels.clone(),
+                labels: item.labels.clone(),
+                sort_key: Some(PickSortKey {
+                    name: "listing_order".to_string(),
+                    value: (position + 1).to_string(),
+                }),
+            })
+            .take(MAX_ROWS_PER_ENTRY)
+            .collect(),
+    )
 }
 
-/// Journal a listing the agent `gh` front served. A no-op outside a role tick.
+/// Journal a listing the agent `gh` front served. A no-op outside a role tick
+/// and for a listing whose printed order is unobserved.
 pub fn record_listing(listing: &crate::forge_cached_list::Served) {
     if journal_path().is_none() {
         return;
     }
+    let Some(rows) = listing_rows(listing) else {
+        return;
+    };
     append(&JournalEntry::Listing {
         at: Utc::now(),
-        rows: listing_rows(listing),
+        rows,
     });
 }
 

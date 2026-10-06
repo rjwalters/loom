@@ -53,20 +53,24 @@ no journal is created, when no OTLP exporter runs.
   (`name=value,...`) or the rank. Each row is *acted* (`dispatched`) or *skipped*
   with a reason mapped from its `QueueDisposition`.
 - **Judge, Doctor, Champion** (`candidate_source = serving_queue`). The rows of
-  every `loom-daemon pr-queue --role <role>` call the agent made during the
-  tick, in `pr_planning::ordered_queue` order (operator priority level,
+  the **latest** `loom-daemon pr-queue --role <role>` call the agent made during
+  the tick, in `pr_planning::ordered_queue` order (operator priority level,
   interactive preference, fallback admission and each role's tie-breaks
   applied), so a fallback-only Judge queue is recorded even though the gate
-  listing was empty. Refreshes are merged: an item keeps the rank of the first
-  snapshot it appeared in, later newcomers follow. `stage` is the row's workflow
+  listing was empty. Earlier snapshots are not merged in: a refresh that
+  adds a starred item or drops one is ranked as the queue the role last served,
+  and an item acted on from an earlier snapshot stays in `acted` (actions are
+  recorded independently of the ranking). `stage` is the row's workflow
   label (`loom:review-requested`, `loom:changes-requested`, `loom:pr`) or
   `fallback`; `sort_key` is `pr_queue`, valued
   `level=<operatorPriorityLevel>,reason=<priorityReason>,origin=<origin>,mode=<mode>`.
 - **Curator** and any role that reads its queue with `gh issue|pr list`
   (`candidate_source = listing`). The rows the agent `gh` front served, in the
   order the agent read its listings (Curator's priority queries run in priority
-  order), after the agent's own `--jq` filter: a row survives when the filter
-  yields anything for it alone. `stage` is the listed label; `sort_key` is
+  order), in the order the agent's own `--jq` printed them (the expression runs over the
+  whole array, so `sort_by` and `.[0]` count). A printed value must name its row
+  (an object, a bare number, or a string led by `#<number>`); otherwise the
+  listing is left unobserved rather than guessed. `stage` is the listed label; `sort_key` is
   `listing_order`.
 - **Fallback** (`candidate_source = gate_listing`): no journal was read (the
   agent's runtime does not inherit it, or the queue was never read). The gate's

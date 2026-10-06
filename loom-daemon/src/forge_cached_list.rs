@@ -198,21 +198,84 @@ impl Served {
         }
     }
 
-    /// Indexes of the rows the caller's `--jq` keeps: a row survives when the
-    /// expression yields anything on a one-row array. All rows with no `--jq`;
-    /// `None` when `jq` cannot tell.
+    /// Indexes of the rows the caller's `--jq` serves, in the order it prints
+    /// them. All rows in listing order with no `--jq`.
+    ///
+    /// The expression runs once over the whole array (so `sort_by`, `.[0]`,
+    /// `limit` and the like are honoured), and each printed value is mapped
+    /// back to its row: an object carrying the row's tag, a bare `number`, or a
+    /// string led by `#<number>`. `None` when `jq` is missing or any value
+    /// cannot be traced to a row (a count, a joined string, ...): the order is
+    /// then unobserved, never guessed.
     #[must_use]
     pub fn surviving(&self) -> Option<Vec<usize>> {
         let Some(expr) = &self.jq else {
             return Some((0..self.items.len()).collect());
         };
-        let probe = format!(
-            "[to_entries[] | .key as $i | [.value] | select(([({expr})] | length) > 0) | $i]"
+        let tagged = Value::Array(
+            self.array
+                .as_array()?
+                .iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    let mut row = row.clone();
+                    if let Some(obj) = row.as_object_mut() {
+                        obj.insert(ROW_TAG.to_string(), json!(i));
+                    }
+                    row
+                })
+                .collect(),
         );
-        let out = apply_jq(&self.array, &probe)?;
-        serde_json::from_str(out.trim()).ok()
+        let out = run_jq(&tagged, expr, false)?;
+        let mut order = Vec::new();
+        for line in out.lines().filter(|l| !l.trim().is_empty()) {
+            let value: Value = serde_json::from_str(line).ok()?;
+            let values = match value {
+                Value::Array(values) => values,
+                single => vec![single],
+            };
+            for value in &values {
+                let i = self.row_of(value)?;
+                if !order.contains(&i) {
+                    order.push(i);
+                }
+            }
+        }
+        Some(order)
+    }
+
+    /// The row a printed `--jq` value stands for, if it names exactly one.
+    fn row_of(&self, value: &Value) -> Option<usize> {
+        let by_number = |n: u64| {
+            let mut hits = self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| u64::from(it.number) == n);
+            let first = hits.next()?;
+            hits.next().is_none().then_some(first.0)
+        };
+        match value {
+            Value::Object(obj) => usize::try_from(obj.get(ROW_TAG)?.as_u64()?)
+                .ok()
+                .filter(|i| *i < self.items.len()),
+            Value::Number(n) => by_number(n.as_u64()?),
+            Value::String(text) => {
+                let digits: String = text
+                    .trim_start_matches('#')
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                by_number(digits.parse().ok()?)
+            }
+            _ => None,
+        }
     }
 }
+
+/// Field [`Served::surviving`] adds to each row so a printed object can be
+/// traced back to its listing index.
+const ROW_TAG: &str = "__loom_row";
 
 /// Parse, fetch, filter and project; `None` to decline.
 fn build_served(entity: &str, args: &[String], fetch: &Fetcher) -> Option<Served> {
@@ -287,13 +350,12 @@ fn project_row(it: &crate::forge_listing::RestIssue, fields: &[String]) -> Value
     Value::Object(obj)
 }
 
-/// Apply a `--jq` expression via the system `jq` (compact + raw, matching gh's
-/// `--jq` output). Returns `None` (decline) when `jq` is missing or errors.
-pub(crate) fn apply_jq(array: &Value, expr: &str) -> Option<String> {
+/// Run `jq` over `array` (compact; `raw` also unquotes strings, as gh's `--jq`
+/// does). Returns `None` when `jq` is missing or errors.
+fn run_jq(array: &Value, expr: &str, raw: bool) -> Option<String> {
     let input = serde_json::to_string(array).ok()?;
     let mut child = Command::new("jq")
-        .arg("-c")
-        .arg("-r")
+        .arg(if raw { "-cr" } else { "-c" })
         .arg(expr)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -307,6 +369,12 @@ pub(crate) fn apply_jq(array: &Value, expr: &str) -> Option<String> {
         return None;
     }
     String::from_utf8(out.stdout).ok()
+}
+
+/// Apply a `--jq` expression via the system `jq` (compact + raw, matching gh's
+/// `--jq` output). Returns `None` (decline) when `jq` is missing or errors.
+pub(crate) fn apply_jq(array: &Value, expr: &str) -> Option<String> {
+    run_jq(array, expr, true)
 }
 
 /// Parse the `list` argument vector into a cacheable [`CachedQuery`], or `None`
@@ -686,5 +754,86 @@ mod tests {
         .unwrap();
         let nums: Vec<&str> = out.lines().collect();
         assert_eq!(nums, vec!["5", "6"]);
+    }
+
+    // ===== Served::surviving =====
+
+    fn served(jq: Option<&str>, numbers: &[u32]) -> Option<Served> {
+        if Command::new("jq").arg("--version").output().is_err() {
+            return None; // jq unavailable in this environment
+        }
+        // Listed newest first, so `sort_by(.createdAt)` reverses them.
+        let fetch = |_: &str, _: &str, _: Option<&str>| {
+            Some(CachedListing {
+                issues: numbers
+                    .iter()
+                    .map(|n| {
+                        let mut it = issue(*n, &["loom:issue"], false);
+                        it.created_at = Some(format!("2026-10-0{n}"));
+                        it
+                    })
+                    .collect(),
+                truncated: false,
+            })
+        };
+        let mut args = vec![
+            "list",
+            "--cached",
+            "--label",
+            "loom:issue",
+            "--json",
+            "number,createdAt,title",
+        ];
+        if let Some(jq) = jq {
+            args.extend(["--jq", jq]);
+        }
+        build_served("issue", &argv(&args), &fetch)
+    }
+
+    fn numbers_of(served: &Served) -> Option<Vec<u32>> {
+        Some(
+            served
+                .surviving()?
+                .into_iter()
+                .map(|i| served.items[i].number)
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn surviving_keeps_the_order_a_whole_array_sort_prints() {
+        // Curator's real query shape: sort_by, then a string per row.
+        let Some(s) =
+            served(Some(r##"sort_by(.createdAt) | .[] | "#\(.number): \(.title)""##), &[3, 2, 1])
+        else {
+            return;
+        };
+        assert_eq!(numbers_of(&s), Some(vec![1, 2, 3]));
+        let Some(s) = served(Some("sort_by(.createdAt) | .[].number"), &[3, 2, 1]) else {
+            return;
+        };
+        assert_eq!(numbers_of(&s), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn surviving_honours_a_whole_array_selection() {
+        let Some(s) = served(Some(".[0].number"), &[1, 2, 3]) else {
+            return;
+        };
+        assert_eq!(numbers_of(&s), Some(vec![1]));
+        let Some(s) = served(Some("map(select(.number > 1)) | .[].number"), &[1, 2, 3]) else {
+            return;
+        };
+        assert_eq!(numbers_of(&s), Some(vec![2, 3]));
+    }
+
+    #[test]
+    fn surviving_is_unobserved_for_a_projection_naming_no_row() {
+        let Some(t) = served(Some("map(.title) | join(\",\")"), &[1, 2, 3]) else {
+            return;
+        };
+        assert_eq!(t.surviving(), None);
+        let all = served(None, &[1, 2, 3]).expect("no jq needed");
+        assert_eq!(numbers_of(&all), Some(vec![1, 2, 3]));
     }
 }

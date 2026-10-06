@@ -241,8 +241,8 @@ fn dedup(rows: impl IntoIterator<Item = JournalRow>) -> Vec<JournalRow> {
 
 /// A role tick's decision (#10212, #10432).
 ///
-/// Candidates come from the agent's **serving queue** (`pr-queue`) when it
-/// read one, else from the listings it read through the agent `gh` front
+/// Candidates come from the agent's **serving queue** (the latest `pr-queue`
+/// snapshot) when it read one, else from the listings it read through the agent `gh` front
 /// (Curator), else from the daemon's gate listing. A candidate the agent wrote
 /// to is *acted*; the rest are *skipped* with a label-derived reason or
 /// `not_selected` when the agent's writes were observed, and otherwise
@@ -258,19 +258,24 @@ pub fn role_record(
     let skip_all = tick_skip_reason(result);
     let attached = observed.journal.is_some();
     let journal = observed.journal.unwrap_or_default();
-    let mut queue: Option<Vec<JournalRow>> = None;
+    let mut queue: Option<(DateTime<Utc>, Vec<JournalRow>)> = None;
     let mut listing: Option<Vec<JournalRow>> = None;
     let mut acts = Vec::new();
     let mut queue_acts_observable = true;
     for entry in journal.entries {
         match entry {
             JournalEntry::Queue {
+                at,
                 acts_observable,
                 rows,
                 ..
             } => {
                 queue_acts_observable &= acts_observable;
-                queue.get_or_insert_with(Vec::new).extend(rows);
+                // The latest snapshot is the queue the role last served: an
+                // earlier one may rank differently or hold items since gone.
+                if queue.as_ref().is_none_or(|(prev, _)| at >= *prev) {
+                    queue = Some((at, rows));
+                }
             }
             JournalEntry::Listing { rows, .. } => {
                 listing.get_or_insert_with(Vec::new).extend(rows);
@@ -288,7 +293,7 @@ pub fn role_record(
     let front_active = journal.front_expected || listing.is_some() || !acts.is_empty();
     let decisions_observed =
         attached && skip_all.is_none() && front_active && queue_acts_observable;
-    let (source, rows) = if let Some(rows) = queue {
+    let (source, rows) = if let Some((_, rows)) = queue {
         (source::SERVING_QUEUE, dedup(rows))
     } else if let Some(rows) = listing {
         (source::LISTING, dedup(rows))
