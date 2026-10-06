@@ -671,6 +671,32 @@ pub(crate) fn cached_get(
     url: &str,
     prefix: &'static str,
 ) -> Result<Option<String>> {
+    cached_read(site, gh_bin, cwd, repo, url, prefix).map(|r| r.body)
+}
+
+/// What one [`cached_read`] answered, for a caller that accounts its own
+/// spend (#10480's `forge_cost`): the body as [`cached_get`] returns it,
+/// whether the forge answered `304` (free on the core bucket), and the
+/// response's `x-ratelimit-remaining` when it is the core pool's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedRead {
+    pub(crate) body: Option<String>,
+    pub(crate) not_modified: bool,
+    pub(crate) core_remaining: Option<u64>,
+}
+
+/// [`cached_get`], also reporting the HTTP outcome ([`CachedRead`]).
+///
+/// # Errors
+/// As [`cached_get`].
+pub(crate) fn cached_read(
+    site: ConditionalRead,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo: Option<&str>,
+    url: &str,
+    prefix: &'static str,
+) -> Result<CachedRead> {
     if crate::rate_limit_breaker::global_skip_pass(site.caller) {
         anyhow::bail!("rate-limit breaker is suppressing forge calls");
     }
@@ -685,9 +711,22 @@ pub(crate) fn cached_get(
         .or_else(|| Some(std::sync::Arc::new(read_disk_entry(disk.as_deref()?)?)));
     let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
     let (status, response, stderr) = fetch_conditional(site, gh_bin, cwd, &target, url, sent_etag)?;
+    let core_remaining = response.as_ref().and_then(|r| {
+        let core = r
+            .ratelimit
+            .resource
+            .as_deref()
+            .is_none_or(|res| res == "core");
+        r.ratelimit.remaining.filter(|_| core)
+    });
+    let answered = |body: Option<String>, not_modified: bool| CachedRead {
+        body,
+        not_modified,
+        core_remaining,
+    };
     match response {
         Some(r) if r.status == 304 => match sent {
-            Some(e) => Ok(Some(e.body.clone())),
+            Some(e) => Ok(answered(Some(e.body.clone()), true)),
             None => {
                 if let Ok(mut m) = get_cache().lock() {
                     m.remove(&mem_key);
@@ -711,9 +750,9 @@ pub(crate) fn cached_get(
                     m.insert(mem_key, std::sync::Arc::new(entry));
                 }
             }
-            Ok(Some(r.body))
+            Ok(answered(Some(r.body), false))
         }
-        Some(r) if r.status == 404 => Ok(None),
+        Some(r) if r.status == 404 => Ok(answered(None, false)),
         _ => {
             crate::rate_limit_breaker::global_observe_failure(&stderr, site.caller);
             anyhow::bail!("gh api {url} failed: {stderr}")

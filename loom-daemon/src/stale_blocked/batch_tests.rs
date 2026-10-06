@@ -3,14 +3,16 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{anyhow, Result};
 
 use super::batch::{
     closing_refs_query, gather_all, parse_closing_refs, parse_comments, parse_pr_merge_state,
-    parse_ref_state, ClosingRef, Gathered, Options, RefState, StaleBlockedForge, CLOSING_BATCH,
+    parse_rate_limit, parse_ref_state, ClosingRef, Gathered, Options, RefState, StaleBlockedForge,
+    CLOSING_BATCH,
 };
+use super::budget::{Budget, Floor, Meter};
 use super::{classify, park_self_block, undeclared, Artifact, Verdict};
 use crate::dep_recheck::{extract, recheck};
 use crate::forge_identity::FleetLogins;
@@ -19,21 +21,30 @@ use crate::forge_listing::RestIssue;
 type Key = (Option<String>, i64);
 
 #[derive(Default)]
-struct Fake {
-    rows: Vec<RestIssue>,
-    list_fails: bool,
-    comments: HashMap<u32, Vec<extract::Comment>>,
-    states: HashMap<Key, RefState>,
-    merge: HashMap<u32, (String, String)>,
-    closing: HashMap<u32, Vec<ClosingRef>>,
+pub(super) struct Fake {
+    pub(super) rows: Vec<RestIssue>,
+    pub(super) list_fails: bool,
+    pub(super) comments: HashMap<u32, Vec<extract::Comment>>,
+    pub(super) states: HashMap<Key, RefState>,
+    pub(super) merge: HashMap<u32, (String, String)>,
+    pub(super) closing: HashMap<u32, Vec<ClosingRef>>,
     /// Issues the closing query leaves out (a `null` alias / truncated list).
-    closing_missing: HashSet<u32>,
-    closing_fails: bool,
+    pub(super) closing_missing: HashSet<u32>,
+    pub(super) closing_fails: bool,
+    /// The probe's answer, and whether the breaker is open.
+    pub(super) budget: Option<Budget>,
+    pub(super) breaker: bool,
+    /// `rateLimit.remaining` each successive GraphQL batch reports, and the
+    /// core `x-ratelimit-remaining` each successive REST read reports.
+    pub(super) graphql_remaining: VecDeque<u64>,
+    pub(super) core_remaining: VecDeque<u64>,
+    pub(super) meter: Meter,
     // Call log.
-    comment_calls: Vec<u32>,
-    state_calls: Vec<Key>,
-    merge_calls: Vec<u32>,
-    closing_calls: Vec<usize>,
+    pub(super) comment_calls: Vec<u32>,
+    pub(super) state_calls: Vec<Key>,
+    pub(super) merge_calls: Vec<u32>,
+    pub(super) closing_calls: Vec<usize>,
+    pub(super) budget_calls: usize,
 }
 
 impl StaleBlockedForge for Fake {
@@ -46,6 +57,7 @@ impl StaleBlockedForge for Fake {
 
     fn comments(&mut self, number: u32) -> Result<Vec<extract::Comment>> {
         self.comment_calls.push(number);
+        self.meter.rest(false, self.core_remaining.pop_front());
         self.comments
             .get(&number)
             .cloned()
@@ -55,11 +67,13 @@ impl StaleBlockedForge for Fake {
     fn ref_state(&mut self, repo: Option<&str>, number: i64) -> Result<Option<RefState>> {
         let key = (repo.map(str::to_string), number);
         self.state_calls.push(key.clone());
+        self.meter.rest(true, self.core_remaining.pop_front());
         Ok(self.states.get(&key).cloned())
     }
 
     fn pr_merge_state(&mut self, number: u32) -> Result<(String, String)> {
         self.merge_calls.push(number);
+        self.meter.rest(false, self.core_remaining.pop_front());
         self.merge
             .get(&number)
             .cloned()
@@ -68,6 +82,8 @@ impl StaleBlockedForge for Fake {
 
     fn closing_refs_batch(&mut self, issues: &[u32]) -> Result<HashMap<u32, Vec<ClosingRef>>> {
         self.closing_calls.push(issues.len());
+        self.meter
+            .graphql(Some(1), self.graphql_remaining.pop_front());
         if self.closing_fails {
             return Err(anyhow!("GraphQL: something went wrong"));
         }
@@ -77,9 +93,22 @@ impl StaleBlockedForge for Fake {
             .map(|n| (*n, self.closing.get(n).cloned().unwrap_or_default()))
             .collect())
     }
+
+    fn budget(&mut self) -> Option<Budget> {
+        self.budget_calls += 1;
+        self.budget
+    }
+
+    fn breaker_open(&mut self) -> bool {
+        self.breaker
+    }
+
+    fn meter(&self) -> Meter {
+        self.meter
+    }
 }
 
-fn row(number: u32, body: &str, comments: u32, pr: bool, labels: &[&str]) -> RestIssue {
+pub(super) fn row(number: u32, body: &str, comments: u32, pr: bool, labels: &[&str]) -> RestIssue {
     RestIssue {
         number,
         title: Some(format!("artifact {number}")),
@@ -95,11 +124,11 @@ fn row(number: u32, body: &str, comments: u32, pr: bool, labels: &[&str]) -> Res
     }
 }
 
-fn issue(number: u32, body: &str) -> RestIssue {
+pub(super) fn issue(number: u32, body: &str) -> RestIssue {
     row(number, body, 0, false, &["loom:blocked"])
 }
 
-fn state(s: &str) -> RefState {
+pub(super) fn state(s: &str) -> RefState {
     RefState {
         state: s.to_string(),
         labels: Vec::new(),
@@ -115,19 +144,21 @@ fn comment(login: &str, body: &str) -> extract::Comment {
     }
 }
 
-fn fleet() -> FleetLogins {
+pub(super) fn fleet() -> FleetLogins {
     FleetLogins::single(extract::DEFAULT_BOT_LOGIN)
 }
 
 fn run(fake: &mut Fake) -> (Vec<Gathered>, Option<String>) {
-    gather_all(
+    let g = gather_all(
         fake,
         &fleet(),
         Options {
             limit: 1000,
             no_prs: false,
+            floor: Floor::default(),
         },
-    )
+    );
+    (g.items, g.enumerate_error)
 }
 
 fn verdict_of(g: &Gathered) -> Verdict {
@@ -284,8 +315,9 @@ fn no_prs_and_limit_apply_per_population() {
     let opts = Options {
         limit: 2,
         no_prs: false,
+        floor: Floor::default(),
     };
-    let (out, _) = gather_all(&mut fake, &fleet(), opts);
+    let out = gather_all(&mut fake, &fleet(), opts).items;
     let kinds: Vec<(Artifact, i64)> = out.iter().map(|g| (g.kind, g.number)).collect();
     assert_eq!(
         kinds,
@@ -299,8 +331,9 @@ fn no_prs_and_limit_apply_per_population() {
     let opts = Options {
         limit: 100,
         no_prs: true,
+        floor: Floor::default(),
     };
-    let (out, _) = gather_all(&mut fake, &fleet(), opts);
+    let out = gather_all(&mut fake, &fleet(), opts).items;
     assert!(out.iter().all(|g| g.kind == Artifact::Issue));
     assert_eq!(out.len(), 5);
 }
@@ -470,7 +503,18 @@ fn closing_query_uses_gh_own_arguments() {
     assert!(q.contains("i23: issue(number: 23)"), "{q}");
     assert!(q.contains("closedByPullRequestsReferences(first: 100)"), "{q}");
     assert!(!q.contains("includeClosedPrs"), "gh does not pass it: {q}");
-    assert!(q.starts_with("query { repository(owner: \"o\", name: \"r\")"), "{q}");
+    assert!(
+        q.starts_with("query { rateLimit { cost remaining } repository(owner: \"o\", name: \"r\")"),
+        "{q}"
+    );
+}
+
+#[test]
+fn closing_answer_reports_its_rate_limit_cost() {
+    let body = r#"{"data":{"rateLimit":{"cost":2,"remaining":4870},"repository":{}}}"#;
+    assert_eq!(parse_rate_limit(body), (Some(2), Some(4870)));
+    assert_eq!(parse_rate_limit(r#"{"errors":[{"message":"x"}]}"#), (None, None));
+    assert_eq!(parse_rate_limit("not json"), (None, None));
 }
 
 #[test]

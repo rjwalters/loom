@@ -17,6 +17,17 @@
 //! path over [`loom_daemon::dep_recheck::forge`], remain for
 //! `notify-cleared-blockers`.
 //!
+//! # Budget floor (#10480)
+//!
+//! After the candidate listing the run reads the free budget probe and
+//! projects its own cost; if it would take the GraphQL or core bucket below
+//! `--min-graphql-remaining` / `--min-core-remaining` (default 1,000 each, `0`
+//! disables) it gathers nothing and reports every artifact *not evaluated*.
+//! The same floors are re-checked between reads, from the forge's own
+//! answers. `--json` carries what the run spent as `forge_cost`; the human
+//! report prints the same numbers as one stderr line unless `--quiet`.
+//! The logic is [`loom_daemon::stale_blocked::budget`].
+//!
 //! # Why every failure is still exit 0
 //!
 //! An advisory that can fail is an advisory that gets removed from the
@@ -45,7 +56,7 @@ use loom_daemon::dep_recheck::{extract, forge};
 use loom_daemon::park_record;
 use loom_daemon::script_helpers::gh_query;
 use loom_daemon::stale_blocked::{
-    batch, classify, park_self_block, undeclared, Artifact, Evidence, Verdict,
+    batch, budget, classify, park_self_block, undeclared, Artifact, Evidence, Verdict,
 };
 
 /// How many open `loom:blocked` issues to examine by default.
@@ -86,6 +97,19 @@ pub(crate) struct StaleBlockedArgs {
     /// restoring the issues-only behaviour this check shipped with.
     #[arg(long)]
     pub no_prs: bool,
+
+    /// GraphQL points that must remain after this run (#10480). If the free
+    /// budget probe says the run would go below it, nothing is gathered and
+    /// every artifact is reported not evaluated (still exit 0); it is also
+    /// re-checked between GraphQL batches. `0` disables the check.
+    #[arg(long, value_name = "N", default_value_t = budget::DEFAULT_MIN_GRAPHQL_REMAINING)]
+    pub min_graphql_remaining: u64,
+
+    /// Core (REST) requests that must remain after this run (#10480). Same
+    /// semantics as `--min-graphql-remaining`, re-checked before each REST
+    /// read. `0` disables the check.
+    #[arg(long, value_name = "N", default_value_t = budget::DEFAULT_MIN_CORE_REMAINING)]
+    pub min_core_remaining: u64,
 }
 
 /// One row of the per-artifact enumeration query. Shared by both populations —
@@ -131,8 +155,16 @@ impl StaleBlockedArgs {
         let opts = batch::Options {
             limit: self.limit,
             no_prs: self.no_prs,
+            floor: budget::Floor {
+                graphql: self.min_graphql_remaining,
+                core: self.min_core_remaining,
+            },
         };
-        let (gathered, enumerate_error) = batch::gather_all(&mut forge, &fleet, opts);
+        let batch::Gathering {
+            items: gathered,
+            enumerate_error,
+            cost,
+        } = batch::gather_all(&mut forge, &fleet, opts);
 
         let mut stale: Vec<Finding> = Vec::new();
         let mut superseded: Vec<Finding> = Vec::new();
@@ -177,6 +209,7 @@ impl StaleBlockedArgs {
             prose_only: &prose_only,
             unevaluated: &unevaluated,
             enumerate_error: enumerate_error.as_deref(),
+            cost: &cost,
         };
 
         if self.json {
@@ -198,6 +231,7 @@ struct Sections<'a> {
     prose_only: &'a [Finding],
     unevaluated: &'a [(String, String)],
     enumerate_error: Option<&'a str>,
+    cost: &'a budget::ForgeCost,
 }
 
 impl Sections<'_> {
@@ -477,6 +511,19 @@ fn report(s: &Sections<'_>, quiet: bool) {
         return;
     }
 
+    // Only when something was examined: an empty population stays silent.
+    if s.cost.projected != budget::Projection::default() {
+        let _ = writeln!(w, "{}", s.cost.summary());
+        if let Some(why) = s
+            .cost
+            .budget_refused
+            .as_deref()
+            .or(s.cost.budget_stopped.as_deref())
+        {
+            let _ = writeln!(w, "[stale-blocked] {why}");
+        }
+    }
+
     if s.any() {
         println!(
             "[stale-blocked] WARNING: {} stale, {} superseded, {} undocumented, {} prose-only \
@@ -550,6 +597,7 @@ fn print_json(s: &Sections<'_>) {
             "prose_only": prose_only_json,
             "unevaluated": uneval_json,
             "enumerate_error": s.enumerate_error,
+            "forge_cost": s.cost,
         })
     );
 }
