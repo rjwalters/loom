@@ -584,18 +584,31 @@ calls, another host, an operator) or an uninstrumented caller. A negative
 shadow means the bucket's readings undercount it (sparse readings, or the
 readings describe another bucket — #10571), not that Loom over-spent.
 
-**Codex session-container state (#10455).** On every collector pass the daemon
-reads each enabled, session-managed Codex account's container and exports
+**Codex session-container state (#10455).** An always-on daemon task (started
+with the other observers, whether or not any telemetry exporter is configured)
+reads every enabled, session-managed Codex account's container once a minute.
+Each pass is one bounded snapshot of all `loom-codex-session-*` containers (one
+`docker ps -a` plus one `docker inspect`, killed after 8 s), never a call per
+account, and none at all on a host without such an account. The daemon logs a
+WARN on each state change (recovery included) and repeats it every 15 min while
+the container stays down; it is per account, outside the role runner's
+per-root DEBUG demotion. When telemetry is configured, each collector pass
+exports the newest observations as
 `loom.codex_session.state{account,state,container}`: one point per `state` in
-`running`, `stopped`, `missing`, `stale_mounts` (1 for the current state, 0 for
-the rest), with the standard `host.id` / `service.version` resource attributes.
-`stale_mounts` means a registered workspace root under the container's
-workspace is not mounted. The daemon logs a WARN on each state change
-(recovery included) and repeats it every 15 min while the container stays down;
-it is per account, outside the role runner's per-root DEBUG demotion. A tick
-refused because the container was not running ends as `category=SESSION_DOWN`
-(exit 78 kept), carried as `loom.admission.reason="session-down"` on the
-`loom.role_attempt` span; it records no account hold.
+`running`, `stopped`, `restarting`, `missing`, `stale_mounts` (1 for the
+current state, 0 for the rest), with the standard `host.id` / `service.version`
+resource attributes. The collector never calls docker itself. `restarting` is
+a crash loop Docker is backing off (`State.Restarting`, which Docker reports
+alongside `Running=true`); it counts as down, and the spawn-time posture check
+treats it the same way. `stale_mounts` means a registered workspace root under
+the container's workspace is not mounted. If docker cannot be queried at all
+(CLI missing, Docker daemon unreachable, timeout), nothing about any container
+is known: the tracker holds its last state, no WARN and no gauge point are
+emitted, and one INFO line marks the transition each way. Nothing reads that
+as `missing`. A tick refused because the container was not running ends as
+`category=SESSION_DOWN` (exit 78 kept), carried as
+`loom.admission.reason="session-down"` on the `loom.role_attempt` span; it
+records no account hold.
 
 **Long-running task liveness and self-update decisions (#10414).** Each
 long-running daemon loop beats a process-global liveness registry

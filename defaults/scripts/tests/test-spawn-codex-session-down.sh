@@ -95,11 +95,8 @@ assert_eq "SESSION_DOWN" "$(category)" "the terminal record is SESSION_DOWN, not
 echo "--- a running container is untouched ---"
 run_spawn "mode=host sandbox=danger-full-access gh=skip" 78
 assert_eq "78" "$SPAWN_RC" "exit code passes through"
-case "$(category)" in
-    SESSION_DOWN) actual="relabelled" ;;
-    *) actual="classifier verdict kept" ;;
-esac
-assert_eq "classifier verdict kept" "$actual" "a non-not-running posture is never SESSION_DOWN"
+assert_eq "RECOVERABLE" "$(category)" \
+    "a non-not-running posture keeps the classifier's RECOVERABLE verdict, never SESSION_DOWN"
 
 echo ""
 echo "========================================"

@@ -13,9 +13,7 @@
 
 use crate::tokens_pool::health::TerminalClassification;
 
-use crate::role_tick_telemetry::{
-    is_session_down_reason as is_session_down, SESSION_DOWN_REASON_PREFIX as REASON_PREFIX,
-};
+use crate::role_tick_telemetry::SESSION_DOWN_REASON_PREFIX as REASON_PREFIX;
 
 /// The failure reason for the tick whose header carries `tick_anchor`, when
 /// its own terminal record says the session container was down.
@@ -37,6 +35,7 @@ pub(super) fn reason_in(contents: &str, tick_anchor: &str) -> Option<String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::role_tick_telemetry::is_session_down_reason as is_session_down;
 
     const ANCHOR: &str = "=== tick 1 ===";
 
