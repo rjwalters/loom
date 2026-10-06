@@ -512,3 +512,62 @@ fn a_creation_time_copied_pr_star_is_operator_owned() {
     host.pass(&world, &[input], Vec::new(), t(10, 2));
     assert!(world.starred(slug, 20));
 }
+
+/// A starred issue 10 linking child 11 (task list); one pass materializes
+/// #11's inherited star. No PR exists yet.
+fn materialized_child(world: &World, slug: &str, host: &mut Host) -> RepoInput {
+    world.add(slug, issue_with_body(10, &[STAR], "- [ ] #11\n"));
+    world.add(slug, issue(11, &["loom:issue"]));
+    let mut input = repo_input(slug);
+    starred(&mut input, 10, AT);
+    host.pass(&world.clone(), std::slice::from_ref(&input), Vec::new(), t(10, 0));
+    assert!(world.starred(slug, 11), "#11 inherits the star");
+    input
+}
+
+/// #10591 review: the root closes while starred, so the walk no longer
+/// reaches #11 (kept as a held row). Its new PR still gets the star, naming
+/// the original root — not #11 as a new root.
+#[test]
+fn the_pr_of_a_child_whose_root_closed_while_starred_gets_the_star() {
+    let world = World::default();
+    let slug = "m/prclosed";
+    let mut host = Host::new("a");
+    let input = materialized_child(&world, slug, &mut host);
+    world.repo(slug).items.get_mut(&10).unwrap().state = "closed".into();
+    world.add(slug, pr(21, 11, &["loom:review-requested"]));
+    let r = host.pass(&world, std::slice::from_ref(&input), Vec::new(), t(10, 2));
+    assert!(world.starred(slug, 11), "#11 keeps the star");
+    assert!(r.rows.iter().any(|row| row.issue == 11), "#11 is still a starred row");
+    assert!(world.starred(slug, 21), "#11's PR inherits the star");
+    assert_eq!(marker_root(&world, slug, 21), Some(10), "the marker names the original root");
+    // Settled: a later pass writes nothing more.
+    let before = world.posted(slug).len();
+    host.pass(&world, &[input], Vec::new(), t(10, 4));
+    assert_eq!(world.posted(slug).len(), before);
+}
+
+/// #10591 review: #11 is linked to #10 only from its own side
+/// (`<!-- loom:parent #10 -->`), which the walk does not follow. Its PR still
+/// gets the star with root #10, and loses it once #10 is unstarred.
+#[test]
+fn the_pr_of_a_child_linked_only_child_side_gets_the_star() {
+    let world = World::default();
+    let slug = "m/prchildside";
+    let mut host = Host::new("a");
+    let input = materialized_child(&world, slug, &mut host);
+    {
+        let mut repo = world.repo(slug);
+        repo.items.get_mut(&10).unwrap().body = Some("Epic.\n".into());
+        repo.items.get_mut(&11).unwrap().body = Some("Child.\n<!-- loom:parent #10 -->\n".into());
+    }
+    world.add(slug, pr(21, 11, &["loom:review-requested"]));
+    host.pass(&world, std::slice::from_ref(&input), Vec::new(), t(10, 2));
+    assert!(world.starred(slug, 11), "#11 keeps the star");
+    assert!(world.starred(slug, 21), "#11's PR inherits the star");
+    assert_eq!(marker_root(&world, slug, 21), Some(10), "the marker names the original root");
+    world.human_unstar(slug, 10);
+    host.pass(&world, &[input], Vec::new(), t(10, 4));
+    assert!(!world.starred(slug, 11), "#11's inherited star is removed");
+    assert!(!world.starred(slug, 21), "and so is its PR's");
+}
