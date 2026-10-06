@@ -352,6 +352,7 @@ fi
 # wait-checks reader is the sole status policy (non-required red is RED there).
 # stderr is merged into stdout: the reader prints the sentinel first, then any
 # failing-check detail lines.
+# requires-daemon: forge >= 0.19.707   #10330 added `forge wait-checks` (PR #10351, first shipped in 0.19.707). Approvals only: an older or absent binary prints no sentinel, so the gate refuses the approval (exit 5) naming this floor. Changes-requested verdicts never reach this call.
 REPO=""
 if [[ "$VERDICT" == "approved" ]]; then
   REPO="$(source "$SCRIPT_DIR/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}")" || { echo "post-verdict.sh: not posting the verdict on PR #$PR: loom-daemon forge may-write refused the repo (#9548)" >&2; exit 4; }
@@ -390,7 +391,7 @@ if [[ "$VERDICT" == "approved" ]]; then
       ci_refuse "the checks could not be read" "$PENDING_NEXT" 5
       ;;
     *)
-      ci_refuse "no checks sentinel from '${LOOM_DAEMON_BIN:-loom-daemon} forge wait-checks' (missing or older daemon?) — an unread CI state is never green. Run ./.loom/scripts/resync-installed.sh / roll loom-daemon" "$PENDING_NEXT" 5
+      ci_refuse "no checks sentinel from '${LOOM_DAEMON_BIN:-loom-daemon} forge wait-checks' (missing daemon, or older than 0.19.707?) — an unread CI state is never green. Run ./.loom/scripts/resync-installed.sh / roll loom-daemon" "$PENDING_NEXT" 5
       ;;
   esac
 fi
