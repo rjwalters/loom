@@ -58,6 +58,18 @@ assert_deny "SQL #10335: still block quoted DELETE FROM piped to sqlite3" \
     "printf 'DELETE FROM users' | sqlite3 db" "$SQL_ABSENT_REPO"
 assert_deny "SQL #10335: still block DELETE FROM after an apostrophe (unbalanced quote)" \
     "echo it's; DELETE FROM users;" "$SQL_ABSENT_REPO"
+assert_deny "SQL #10335: still block DELETE FROM executed via python3 -c (psycopg)" \
+    "python3 -c \"import psycopg; c = psycopg.connect(); c.execute('DELETE FROM users;'); c.commit()\"" "$SQL_ABSENT_REPO"
+assert_deny "SQL #10335: still block DELETE FROM executed via node -e" \
+    "node -e \"db.query('DELETE FROM users;')\"" "$SQL_ABSENT_REPO"
+assert_deny "SQL #10335: still block DELETE FROM submitted via curl -d" \
+    "curl -s -d 'DELETE FROM users;' http://db.local/query" "$SQL_ABSENT_REPO"
+assert_deny "SQL #10335: still block DELETE FROM via bash -c" \
+    "bash -c \"run-query 'DELETE FROM users;'\"" "$SQL_ABSENT_REPO"
+assert_deny "SQL #10335: still block DELETE FROM via eval" \
+    "eval \"run-query 'DELETE FROM users;'\"" "$SQL_ABSENT_REPO"
+assert_allow "SQL #10335: allow quoted probe to a script file after a chained segment" \
+    "cd tests && python3 run_probe.py --case 'DELETE FROM users;'" "$SQL_ABSENT_REPO"
 
 # --- Opt-out via config: all five SQL cases pass through as allow ---
 assert_allow "SQL config-off: allow DROP DATABASE" \

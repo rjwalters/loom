@@ -10045,26 +10045,64 @@ fi
 # guards.sqlDdl:false or LOOM_GUARD_SQL=0. sql_guard_enabled() is consulted only
 # after the DELETE-FROM-without-WHERE match, keeping the config read off the hot
 # path for non-SQL commands.
-# #10335: a DELETE FROM that appears ONLY inside a quoted string (an echo/commit
-# message/test-probe argument) and where no SQL client is named anywhere in the
-# command is inert data, not an executed statement. Bare (unquoted) text, or any
-# command naming a SQL client (psql/mysql/sqlite3/...), still denies. An
-# unbalanced quote disables the blanking (fail closed to the old behaviour).
+# #10335: a DELETE FROM that appears ONLY inside a quoted string is inert data
+# ONLY when the simple command carrying it is a provably non-executing consumer
+# (an allowlist, never a client deny-list -- quoting does not make an argument
+# inert: `python3 -c`, `node -e`, `curl -d`, `eval`, any unknown binary can run
+# or submit it). Inert consumers: echo/printf, `git commit|tag|notes`,
+# `gh pr|issue create|comment|edit`, and an interpreter running a script FILE
+# (no -c/-e/-p/-r/-m code flag, no stdin `-`). Everything else fails closed to
+# the old deny: bare (unquoted) text, a segment piped onward, any $( / backtick
+# in the command, an unbalanced quote, or a named SQL client anywhere.
 _sql_delete_executable() {
-    local masked
     if printf '%s' "$COMMAND_NO_COMMENT" | grep -qiE '(^|[^[:alnum:]_.-])(psql|pgcli|mysql|mycli|mariadb|sqlite3?|litecli|sqlcmd|sqlplus|isql|usql|duckdb|clickhouse(-client)?|cockroach|bq|dbt|prisma|sqlx|diesel|mongosh?|redis-cli|cqlsh|snowsql|trino|presto)([^[:alnum:]_-]|$)'; then
         return 0
     fi
-    masked=$(printf '%s' "$COMMAND_NO_COMMENT" | awk '
-        BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); q = ""; out = "" }
-        { if (NR > 1) { out = out "\n" } line = $0
-          for (i = 1; i <= length(line); i++) { c = substr(line, i, 1)
-            if (q == "") { if (c == SQ || c == DQ) { q = c; out = out c } else out = out c }
-            else if (c == q) { q = ""; out = out c }
-            else if (q == DQ && c == "\\") { i++ }
-            else { out = out " " } } }
-        END { if (q != "") exit 1; printf "%s", out }') || masked="$COMMAND_NO_COMMENT"
-    printf '%s' "$masked" | grep -qiE 'DELETE[[:space:]]+FROM[[:space:]]+'
+    printf '%s' "$COMMAND_NO_COMMENT" | grep -qE '\$\(|`' && return 0
+    printf '%s' "$COMMAND_NO_COMMENT" | awk '
+        function inert(s,   n, t, i, w) {
+            n = split(s, t, " ")
+            if (n == 0) return 0
+            w = t[1]
+            if (w == "echo" || w == "printf") return 1
+            if (w == "git") return (t[2] == "commit" || t[2] == "tag" || t[2] == "notes")
+            if (w == "gh") return ((t[2] == "pr" || t[2] == "issue") && (t[3] == "create" || t[3] == "comment" || t[3] == "edit"))
+            if (w ~ /^(bash|sh|zsh|dash|python3?|node|ruby|perl|php)$/) {
+                for (i = 2; i <= n; i++) {
+                    if (t[i] ~ /^-/) {
+                        if (t[i] == "-" || t[i] ~ /^-[a-zA-Z]*[ceEprm][a-zA-Z]*$/ || t[i] ~ /^--(eval|command|exec|print)$/) return 0
+                        continue
+                    }
+                    return (t[i] != "Q")
+                }
+            }
+            return 0
+        }
+        function seg_end(piped) {
+            if (tolower(skel) ~ /delete[[:space:]]+from[[:space:]]+/) bad = 1
+            if (hit && (piped || !inert(skel))) bad = 1
+            skel = ""; hit = 0
+        }
+        function feed(c) {
+            if (q == "") {
+                if (esc) { skel = skel c; esc = 0 }
+                else if (c == "\\") { skel = skel c; esc = 1 }
+                else if (c == SQ || c == DQ) { q = c; span = "" }
+                else if (c == "|") seg_end(1)
+                else if (c == ";" || c == "&" || c == "\n") seg_end(0)
+                else skel = skel c
+            } else if (qesc) { span = span c; qesc = 0 }
+            else if (q == DQ && c == "\\") { span = span c; qesc = 1 }
+            else if (c == q) {
+                if (tolower(span) ~ /delete[[:space:]]+from[[:space:]]+/) hit = 1
+                skel = skel "Q"; q = ""
+            } else span = span c
+        }
+        BEGIN { SQ = sprintf("%c", 39); DQ = sprintf("%c", 34); q = ""; skel = ""; hit = 0; bad = 0; esc = 0; qesc = 0 }
+        { if (NR > 1) feed("\n")
+          for (i = 1; i <= length($0); i++) feed(substr($0, i, 1)) }
+        END { if (q != "") exit 1; seg_end(0); exit bad }'
+    [ $? -ne 0 ]
 }
 if echo "$COMMAND_NO_COMMENT" | grep -qiE 'DELETE[[:space:]]+FROM[[:space:]]+' && \
    ! echo "$COMMAND_NO_COMMENT" | grep -qiE 'WHERE[[:space:]]+' && \
