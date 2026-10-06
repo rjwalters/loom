@@ -179,6 +179,8 @@ struct Pending {
     body: String,
     prose: Vec<i64>,
     named: Vec<named::Dep>,
+    /// Unchecked `## Dependencies` lines `named::parse_entries` cannot read.
+    unparsed_unchecked: usize,
     declared: Vec<crate::park_record::BlockerRef>,
     closing: Vec<ClosingRef>,
     failed: Option<String>,
@@ -303,6 +305,7 @@ fn read_text(
         body: body.clone(),
         prose: Vec::new(),
         named: Vec::new(),
+        unparsed_unchecked: 0,
         declared: Vec::new(),
         closing: Vec::new(),
         failed: None,
@@ -330,9 +333,16 @@ fn read_text(
     };
     let input = extract::Input { body, comments };
     // A qualified park-record blocker is read in its own repo via `declared`,
-    // never as a local `#N` (#10443).
+    // never as a local `#N` (#10443). An issue's `## Dependencies` checklist
+    // lines are judged by the checklist rule alone, never also as prose: a
+    // `- [ ] Blocked by #N` line whose ref merged is Unticked, not Stale (#9274).
+    let prose_body = if kind == Artifact::Issue {
+        named::mask_checklist_lines(&input.body)
+    } else {
+        input.body.clone()
+    };
     let masked = extract::Input {
-        body: crate::park_record::mask_qualified(&input.body),
+        body: crate::park_record::mask_qualified(&prose_body),
         comments: input.comments.clone(),
     };
     p.prose = extract::extract_with(&masked, fleet)
@@ -343,6 +353,8 @@ fn read_text(
     p.declared = crate::park_record::blockers(&p.body);
     if kind == Artifact::Issue {
         p.named = named::parse_entries(&p.body);
+        p.unparsed_unchecked = super::unchecked_lines(&p.body)
+            .saturating_sub(p.named.iter().filter(|d| !d.checked).count());
     }
     (p, Some(input))
 }
@@ -543,6 +555,7 @@ fn evidence_for(
         named,
         prose,
         closing,
+        unparsed_unchecked: p.unparsed_unchecked,
         declared: p.declared.clone(),
         remote,
         self_block: None,
@@ -837,8 +850,9 @@ struct RawLabel {
 }
 
 /// `GET issues/{n}` → state + labels. A PR number answers too: a non-null
-/// `pull_request.merged_at` is `MERGED`, else the uppercased `state` — the
-/// same derivation as `forge_cached_view`'s PR state.
+/// `pull_request.merged_at` is `MERGED`; a PR that is closed with a null
+/// `merged_at` is `CLOSED_UNMERGED` (abandoned work, never a satisfied
+/// dependency, #9274); else the uppercased `state`.
 ///
 /// # Errors
 /// The body is not an issue object.
@@ -860,11 +874,14 @@ pub fn parse_ref_state(body: &str) -> Result<RefState> {
     let raw: Raw = serde_json::from_str(body.trim())?;
     let is_pr = raw.pull_request.is_some();
     let merged = raw.pull_request.is_some_and(|p| p.merged_at.is_some());
+    let state = raw.state.to_ascii_uppercase();
     Ok(RefState {
         state: if merged {
             "MERGED".to_string()
+        } else if is_pr && state == "CLOSED" {
+            "CLOSED_UNMERGED".to_string()
         } else {
-            raw.state.to_ascii_uppercase()
+            state
         },
         labels: raw.labels.into_iter().map(|l| l.name).collect(),
         is_pr,

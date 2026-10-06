@@ -239,7 +239,7 @@ fn an_open_closing_pr_is_not_read_individually() {
     );
     let (out, _) = run(&mut fake);
     assert!(fake.state_calls.is_empty(), "{:?}", fake.state_calls);
-    assert_eq!(verdict_of(&out[0]), Verdict::StillBlocked);
+    assert_eq!(verdict_of(&out[0]), Verdict::Undocumented);
 }
 
 // --- fail-safe ------------------------------------------------------------------
@@ -405,16 +405,16 @@ fn verdicts_match_the_existing_fixtures() {
         Verdict::Stale(r) => assert!(r[0].contains("7:CLOSED"), "{r:?}"),
         v => panic!("178: {v:?}"),
     }
-    match verdict_of(find(&out, 179)) {
-        Verdict::Stale(r) => assert!(r[0].contains("checklist"), "{r:?}"),
-        v => panic!("179: {v:?}"),
-    }
-    match verdict_of(find(&out, 190)) {
-        Verdict::Stale(r) => {
-            assert!(r[0].contains("4743:MERGED:block-label:n/a"), "{r:?}");
+    // #9274: resolved refs on UNCHECKED boxes are Unticked, never Stale.
+    assert_eq!(
+        verdict_of(find(&out, 179)),
+        Verdict::Unticked {
+            resolved_refs: vec!["other/repo#176".to_string(), "#177".to_string()],
+            unparsed: 0
         }
-        v => panic!("190: {v:?}"),
-    }
+    );
+    // #9274: a merged closing PR is not a blocker reference.
+    assert_eq!(verdict_of(find(&out, 190)), Verdict::Undocumented);
     assert_eq!(verdict_of(find(&out, 180)), Verdict::Undocumented);
     assert_eq!(
         verdict_of(find(&out, 183)),
@@ -498,7 +498,7 @@ fn ref_state_reads_issues_and_prs_from_one_endpoint() {
     let closed_pr =
         parse_ref_state(r#"{"state":"closed","pull_request":{"merged_at":null}}"#).unwrap();
     // #10556: a closed-unmerged PR is told apart from a closed issue.
-    assert_eq!(closed_pr.state, "CLOSED");
+    assert_eq!(closed_pr.state, "CLOSED_UNMERGED");
     assert!(closed_pr.is_pr);
     let open_pr = parse_ref_state(r#"{"state":"open","pull_request":{}}"#).unwrap();
     assert_eq!(open_pr.state, "OPEN");
@@ -547,4 +547,61 @@ fn closing_parse_keeps_only_complete_aliases() {
     assert!(parse_closing_refs(r#"{"errors":[{"message":"rate limited"}]}"#, &[1]).is_none());
     assert!(parse_closing_refs(r#"{"data":{"repository":null}}"#, &[1]).is_none());
     assert!(parse_closing_refs("not json", &[1]).is_none());
+}
+
+/// #9274 (Judge, round 3): a checklist line is judged by the checklist rule
+/// alone. `item_re` accepts `- [ ] Blocked by #N`, and the prose extractor reads
+/// the same phrase; without masking, the prose rule turned an unticked box into
+/// Stale. Gather to classify, end to end.
+#[test]
+fn checklist_lines_are_never_also_read_as_prose() {
+    let mut fake = Fake::default();
+    // Supported checklist syntax with a dependency phrase, ref merged.
+    fake.rows.push(issue(
+        186,
+        "## Dependencies\n\n- [ ] Blocked by #187: ratification remains pending\n",
+    ));
+    fake.states.insert((None, 187), state("MERGED"));
+    // An unparseable unchecked line that still contains `Requires #N`.
+    fake.rows.push(issue(
+        256,
+        "## Dependencies\n\n- [ ] vendor sign-off on the pinout. Requires #268 first\n",
+    ));
+    fake.states.insert((None, 268), state("CLOSED"));
+    // An independent prose reference OUTSIDE the checklist is still prose.
+    fake.rows.push(issue(
+        257,
+        "Blocked by #7 (auth).\n\n## Dependencies\n\n- [ ] Blocked by #9: still open\n",
+    ));
+    fake.states.insert((None, 7), state("CLOSED"));
+    fake.states.insert((None, 9), state("OPEN"));
+
+    let (out, err) = run(&mut fake);
+    assert!(err.is_none());
+
+    let g186 = find(&out, 186);
+    assert!(g186.evidence.as_ref().unwrap().prose.is_empty());
+    assert_eq!(
+        verdict_of(g186),
+        Verdict::Unticked {
+            resolved_refs: vec!["#187".to_string()],
+            unparsed: 0
+        }
+    );
+    let g256 = find(&out, 256);
+    assert!(g256.evidence.as_ref().unwrap().prose.is_empty());
+    assert_eq!(
+        verdict_of(g256),
+        Verdict::Unticked {
+            resolved_refs: vec![],
+            unparsed: 1
+        }
+    );
+    match verdict_of(find(&out, 257)) {
+        Verdict::Stale(r) => {
+            assert_eq!(r.len(), 1, "{r:?}");
+            assert!(r[0].contains("7:CLOSED") && !r[0].contains("9:OPEN"), "{r:?}");
+        }
+        v => panic!("257: {v:?}"),
+    }
 }
