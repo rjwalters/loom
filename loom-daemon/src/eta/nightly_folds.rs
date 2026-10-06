@@ -13,7 +13,8 @@
 //! For the UTC day `D` (the cutoff is the end of `D`):
 //!
 //! - one `eta.backtest.fold` per registered `land` heuristic: its own scores on
-//!   the cases whose `as_of` fell on `D`, and its paired delta against the
+//!   `D`'s cohort — the cases first known (resolved) during `D`, whichever day
+//!   they were predicted on ([`cohort`]) — and its paired delta against the
 //!   `current` heuristic on those same cases ([`run_day`]);
 //! - one `eta.backtest.summary` per non-`current` heuristic: the rolling
 //!   per-day win count against `current`, the 95% Wilson lower bound and
@@ -23,17 +24,43 @@
 //!   same gate function, not the same data: the summary also reads the fleet
 //!   snapshots and the offline PR cache, `eta promote` local data only.
 //!
+//! # Cohorts: every case is folded exactly once
+//!
+//! A case is predicted at its `as_of` and known only once it resolves
+//! (`actual_at`), possibly days later. Folding by prediction day would have to
+//! drop a case that crosses midnight (unresolved at its prediction day's
+//! cutoff, and never revisited once that day's file is written), so the
+//! longest-running cases would systematically leave the scoreboard (#10532
+//! review, finding 1). `D`'s cohort is therefore the cases known at `D`'s
+//! cutoff whose identity was not yet known at `D`'s start
+//! ([`backtest::merge_case_sets`]' case identity): each resolved case lands in
+//! exactly one daily fold.
+//!
+//! # Every case is scored by its prediction day's registry
+//!
+//! The prediction itself stays at prediction time: the case's own `as_of`
+//! input, history strictly before it, and the registry the fold for its
+//! **prediction** day serves — the coefficient file newest strictly before
+//! that day began ([`ByDay`]). The daily fold and every later summary score a
+//! case with that same registry, so the summary accumulates the walk-forward
+//! daily fits rather than re-scoring old days with one fit (#10532 review,
+//! finding 2). A prediction day older than every retained coefficient file
+//! (the fit writer keeps 14) has no historical fit to score with; the summary
+//! leaves such cases out and says so (`fitted_from`, `cases_before_fit`)
+//! instead of charging fitted heuristics a `no_model` refusal live serving
+//! never gave.
+//!
 //! # Strictly point-in-time
 //!
 //! [`run_day`] drops, **before** replaying anything, every input observed at
 //! or after the cutoff: sweep-outcome envelopes (`emitted_at`), journal rows
 //! (`observed_at`), history samples, and every replay case that had not
-//! resolved (`actual_at`) by then. The registry's coefficient file is the
-//! newest whose own cutoff is strictly before the fold day began
-//! (`Registry::load`). So the fold is a function of data knowable at the
+//! resolved (`actual_at`) by then. Each case's coefficient file is the newest
+//! whose own cutoff is strictly before its prediction day began
+//! (`Registry::load`'s rule). So the fold is a function of data knowable at the
 //! cutoff only; perturbing anything after it leaves the records bit-identical
-//! (the leak test pins this). A case still open at the cutoff is left out of
-//! that day's fold rather than guessed at.
+//! (the leak test pins this). A case still open at the cutoff is not guessed
+//! at: it joins the cohort of the day it resolves.
 //!
 //! # No forge call, bounded work
 //!
@@ -53,13 +80,14 @@ use super::history::StageSamples;
 use super::journal::{self, JournalEntry};
 use super::score::Score;
 use super::shadow::{self, GateStatus, MIN_FOLDS};
-use super::{Kind, Provenance, Registry};
+use super::{EstimateInput, Explanation, Heuristic, Kind, Provenance, Registry, Tier};
 use crate::telemetry::kinds::eta_backtest::{EtaBacktestFoldRecord, EtaBacktestSummaryRecord};
 use crate::telemetry::TelemetryEnvelope;
 use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The singleton job name this task arms under `fleet.captain`.
 pub const SINGLETON_JOB_NAME: &str = "eta-nightly-folds";
@@ -269,27 +297,161 @@ fn point_in_time(
     // landing resolved after the cutoff.
     history.calibration.clear();
 
-    let mut cases = backtest::cases_from_envelopes(&envelopes);
+    (history, known_cases(inputs, cutoff))
+}
+
+/// The `land` cases known resolved at `cutoff`: built only from evidence
+/// observed before it, predicted and resolved before it.
+fn known_cases(inputs: &Inputs, cutoff: DateTime<Utc>) -> Vec<ReplayCase> {
+    let envelopes: Vec<&TelemetryEnvelope> = inputs
+        .envelopes
+        .iter()
+        .filter(|e| e.emitted_at < cutoff)
+        .collect();
+    let journal: Vec<JournalEntry> = inputs
+        .journal
+        .iter()
+        .filter(|e| e.observed_at < cutoff)
+        .cloned()
+        .collect();
+    let mut cases = backtest::cases_from_envelopes(envelopes);
     cases.extend(backtest::cases_from_journal(&journal));
     let (mut cases, _dropped) = backtest::merge_case_sets(cases, inputs.pr_cases.clone());
     cases.retain(|c| c.kind == KIND && c.as_of < cutoff && c.actual_at < cutoff);
-    (history, cases)
+    cases
 }
 
-/// `history` with the calibrating heuristic's evidence replayed in from
-/// `cases` under `registry`'s base ([`backtest::with_replay_calibration`],
-/// the helper `eta backtest` and `eta promote` call). Leak-free because
-/// `history` and `cases` were already cut at the cutoff ([`point_in_time`]);
-/// without it `land-2026-10-06-calm-plover` would degrade to plain `land-v2`
-/// in every fold.
+/// `day`'s cohort out of `known` (the cases known at its cutoff): those whose
+/// identity was not yet known when `day` began ([`known_cases`] at its start;
+/// identity as [`backtest::merge_case_sets`] keys it, so the same case read
+/// from a second source is not new). Each resolved case is in exactly one
+/// day's cohort: the day it became known, whichever day it was predicted on.
+#[must_use]
+pub fn cohort(inputs: &Inputs, day: NaiveDate, known: &[ReplayCase]) -> Vec<ReplayCase> {
+    let before = known_cases(inputs, day_start(day));
+    let n = before.len();
+    let (merged, _) = backtest::merge_case_sets(before, known.to_vec());
+    merged.into_iter().skip(n).collect()
+}
+
+/// One registry per prediction day: the one the fold for that day serves,
+/// fitted with the coefficient file newest strictly before the day began
+/// (`registry_for(day start)`). A case is scored with its own `as_of` day's
+/// registry by every run that scores it — its day's fold and every later
+/// summary — so no later fit re-scores an earlier day (#10532 review).
+pub struct ByDay {
+    days: BTreeMap<NaiveDate, Registry>,
+    /// Ids, kinds and tiers only (every registry registers the same ones),
+    /// and the registry for a day not in `days` (never asked: `days` covers
+    /// every case it was built from).
+    unfitted: Registry,
+}
+
+impl ByDay {
+    /// The registries for `day` and every prediction day in `cases`.
+    #[must_use]
+    pub fn new(
+        cases: &[ReplayCase],
+        day: NaiveDate,
+        registry_for: &dyn Fn(DateTime<Utc>) -> Registry,
+    ) -> Self {
+        let mut days = BTreeMap::new();
+        for d in cases.iter().map(|c| c.as_of.date_naive()).chain([day]) {
+            days.entry(d).or_insert_with(|| registry_for(day_start(d)));
+        }
+        ByDay {
+            days,
+            unfitted: Registry::builtin(),
+        }
+    }
+
+    /// The registry predictions made on `day` are scored with.
+    #[must_use]
+    pub fn on(&self, day: NaiveDate) -> &Registry {
+        self.days.get(&day).unwrap_or(&self.unfitted)
+    }
+
+    /// `id`, each estimate served by its own `as_of` day's registry.
+    #[must_use]
+    pub fn heuristic(&self, id: &str) -> Option<PerDay<'_>> {
+        let h = self.unfitted.get(id)?;
+        Some(PerDay {
+            by_day: self,
+            id: h.id(),
+            kind: h.kind(),
+            tier: h.tier(),
+            models_hold: h.models_hold(),
+        })
+    }
+
+    /// The first prediction day whose registry carries every coefficient
+    /// schema any day's does (once a day has a file every later one does:
+    /// the newest file is never pruned). `None` when no day has any file.
+    #[must_use]
+    pub fn fitted_from(&self) -> Option<NaiveDate> {
+        let v1 = self.days.values().any(|r| r.fit().is_some());
+        let v2 = self.days.values().any(|r| r.fit_v2().is_some());
+        if !v1 && !v2 {
+            return None;
+        }
+        self.days
+            .iter()
+            .find(|(_, r)| (!v1 || r.fit().is_some()) && (!v2 || r.fit_v2().is_some()))
+            .map(|(d, _)| *d)
+    }
+}
+
+/// One registered heuristic replayed through [`ByDay`].
+pub struct PerDay<'a> {
+    by_day: &'a ByDay,
+    id: &'static str,
+    kind: Kind,
+    tier: Tier,
+    models_hold: bool,
+}
+
+impl Heuristic for PerDay<'_> {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    fn tier(&self) -> Tier {
+        self.tier
+    }
+
+    fn models_hold(&self) -> bool {
+        self.models_hold
+    }
+
+    fn estimate(&self, input: &EstimateInput, history: &StageSamples) -> Explanation {
+        let registry = self.by_day.on(input.as_of.date_naive());
+        registry
+            .get(self.id)
+            .or_else(|| self.by_day.unfitted.get(self.id))
+            .expect("every registry registers the same ids")
+            .estimate(input, history)
+    }
+}
+
+/// `history` with the calibrating heuristics' evidence replayed in from
+/// `cases`, each base estimate served by its prediction day's registry
+/// ([`backtest::with_replay_calibration`], the helper `eta backtest` and
+/// `eta promote` call). Leak-free because `history` and `cases` were already
+/// cut at the cutoff ([`point_in_time`]); without it
+/// `land-2026-10-06-calm-plover` would degrade to plain `land-v2` in every
+/// fold.
 fn calibrated(
-    registry: &Registry,
+    by_day: &ByDay,
     history: &StageSamples,
     cases: &[ReplayCase],
     loom: &Provenance,
 ) -> StageSamples {
     let mut history = history.clone();
-    backtest::with_replay_calibration(|id| registry.get(id), &mut history, cases, loom);
+    backtest::with_replay_calibration(|id| by_day.heuristic(id), &mut history, cases, loom);
     history
 }
 
@@ -331,7 +493,8 @@ fn delta(challenger: Option<f64>, current: Option<f64>) -> Option<f64> {
 /// Pure given its inputs: `scope` applies the configured `historyScope` to
 /// the local history, `registry_for(before)` builds the registry whose fit is
 /// the newest strictly before `before`. Nothing observed at or after the end
-/// of `day` is read (module docs).
+/// of `day` is read (module docs). The fold scores `day`'s [`cohort`], each
+/// case with its prediction day's registry ([`ByDay`]).
 #[must_use]
 pub fn run_day(
     inputs: &Inputs,
@@ -341,25 +504,34 @@ pub fn run_day(
     registry_for: &dyn Fn(DateTime<Utc>) -> Registry,
     loom: &Provenance,
 ) -> DayRecords {
-    let start = day_start(day);
-    let cutoff = start + Duration::days(1);
+    let cutoff = day_start(day) + Duration::days(1);
     let day_s = day.format("%Y-%m-%d").to_string();
     let (uncalibrated, cases) = point_in_time(inputs, cutoff, scope);
-    let day_cases: Vec<ReplayCase> = cases.iter().filter(|c| c.as_of >= start).cloned().collect();
+    let day_cases = cohort(inputs, day, &cases);
     let no_filter = Filter::default();
 
-    let registry = registry_for(start);
-    let day_history = calibrated(&registry, &uncalibrated, &cases, loom);
+    let by_day = ByDay::new(&cases, day, registry_for);
+    let registry = by_day.on(day);
+    let day_history = calibrated(&by_day, &uncalibrated, &cases, loom);
     let history = &day_history;
-    let current = registry.current(KIND, current_land);
+    let Some(current) = by_day.heuristic(registry.current(KIND, current_land).id()) else {
+        return DayRecords {
+            day: day_s,
+            folds: Vec::new(),
+            summaries: Vec::new(),
+        };
+    };
     let current_id = current.id();
-    let current_scores = backtest::replay_scored(current, history, &day_cases, no_filter, loom);
+    let current_scores = backtest::replay_scored(&current, history, &day_cases, no_filter, loom);
     let current_stats = own_stats(&current_scores);
 
     let mut folds = Vec::new();
-    for h in registry.for_kind(KIND) {
+    for h in registry
+        .for_kind(KIND)
+        .filter_map(|h| by_day.heuristic(h.id()))
+    {
         let is_current = h.id() == current_id;
-        let scores = backtest::replay_scored(h, history, &day_cases, no_filter, loom);
+        let scores = backtest::replay_scored(&h, history, &day_cases, no_filter, loom);
         let own = own_stats(&scores);
         let mut fold = EtaBacktestFoldRecord {
             fold_id: crate::telemetry::trace::derived_hex(
@@ -387,7 +559,7 @@ pub fn run_day(
             loom: loom.clone(),
         };
         if !is_current {
-            if let Ok(cmp) = backtest::compare(current, h, history, &day_cases, no_filter, loom) {
+            if let Ok(cmp) = backtest::compare(&current, &h, history, &day_cases, no_filter, loom) {
                 let p = &cmp.paired;
                 fold.paired_pairs = count(p.loss4_pairs);
                 fold.delta_pinball4_loss_sec =
@@ -404,7 +576,7 @@ pub fn run_day(
         folds.push(fold);
     }
 
-    let summaries = summaries_for(&cases, &uncalibrated, current_land, registry_for, day, loom);
+    let summaries = summaries_for(&cases, history, &current, &by_day, day, loom);
     DayRecords {
         day: day_s,
         folds,
@@ -414,33 +586,35 @@ pub fn run_day(
 
 /// The rolling standing of every non-`current` heuristic on every case known at
 /// the cutoff, judged by the gate function `eta promote` uses
-/// ([`shadow::backtest_gate`]). `history` is uncalibrated; it is calibrated
-/// here under the window's own registry.
+/// ([`shadow::backtest_gate`]). Every case is scored exactly as its own day's
+/// fold scored it: with its prediction day's registry ([`ByDay`]) and the
+/// same calibrated `history`. Cases predicted before the first day with a
+/// retained coefficient file ([`ByDay::fitted_from`]) are left out and
+/// counted (`cases_before_fit`): no historical fit survives to score them.
 fn summaries_for(
     cases: &[ReplayCase],
     history: &StageSamples,
-    current_land: Option<&str>,
-    registry_for: &dyn Fn(DateTime<Utc>) -> Registry,
+    current: &PerDay<'_>,
+    by_day: &ByDay,
     day: NaiveDate,
     loom: &Provenance,
 ) -> Vec<EtaBacktestSummaryRecord> {
     let cutoff = day_start(day) + Duration::days(1);
     let day_s = day.format("%Y-%m-%d").to_string();
-    // One registry for the whole window, fitted before its first day: a fit
-    // dated later would have seen the early days' outcomes.
-    let first = cases
+    let fitted_from = by_day.fitted_from();
+    let (window, before_fit): (Vec<ReplayCase>, Vec<ReplayCase>) = cases
         .iter()
-        .map(|c| c.as_of.date_naive())
-        .min()
-        .unwrap_or(day);
-    let registry = registry_for(day_start(first));
-    // Calibrated under this window's registry, as `eta promote` would.
-    let history = &calibrated(&registry, history, cases, loom);
-    let current = registry.current(KIND, current_land);
+        .cloned()
+        .partition(|c| fitted_from.is_none_or(|first| c.as_of.date_naive() >= first));
+    let registry = by_day.on(day);
     let mut out = Vec::new();
-    for h in registry.for_kind(KIND).filter(|h| h.id() != current.id()) {
+    for h in registry
+        .for_kind(KIND)
+        .filter(|h| h.id() != current.id())
+        .filter_map(|h| by_day.heuristic(h.id()))
+    {
         let comparison =
-            backtest::compare(current, h, history, cases, Filter::default(), loom).ok();
+            backtest::compare(current, &h, history, &window, Filter::default(), loom).ok();
         let gate = shadow::backtest_gate(current.id(), h.id(), comparison.as_ref());
         let w = gate.day_wins;
         out.push(EtaBacktestSummaryRecord {
@@ -463,6 +637,8 @@ fn summaries_for(
             min_folds: count(MIN_FOLDS),
             gate_ready: gate.status == GateStatus::Passed,
             gate_detail: gate.detail,
+            fitted_from: fitted_from.map(|d| d.format("%Y-%m-%d").to_string()),
+            cases_before_fit: count(before_fit.len()),
             fit_id: registry.fit_id().map(str::to_string),
             loom: loom.clone(),
         });
@@ -520,11 +696,55 @@ pub fn read_state(root: &Path) -> Option<State> {
     serde_json::from_str(&std::fs::read_to_string(state_path(root)).ok()?).ok()
 }
 
-/// The built-in registry fitted before `before` — the production
-/// `registry_for`.
-#[must_use]
-pub fn registry_before(root: &Path, before: DateTime<Utc>) -> Registry {
-    Registry::load(root, before)
+/// Every retained coefficient file under a workspace (`eta-fit/v1` and
+/// `eta-fit/v2`), read once per run: the production `registry_for`. One run
+/// builds a registry per prediction day ([`ByDay`]), so re-reading the
+/// directory per day ([`Registry::load`]) would parse every file once per day.
+pub struct FitArchive {
+    v1: Vec<Arc<super::fit::CoefficientFile>>,
+    v2: Vec<Arc<super::fit::CoefficientFile>>,
+}
+
+impl FitArchive {
+    /// Read `root`'s fit directories (an unreadable or foreign file is
+    /// skipped, as [`Registry::load`] skips it).
+    #[must_use]
+    pub fn load(root: &Path) -> Self {
+        let read = |dir: PathBuf, schema: &str| -> Vec<Arc<super::fit::CoefficientFile>> {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return Vec::new();
+            };
+            let mut paths: Vec<PathBuf> = entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "json"))
+                .collect();
+            paths.sort();
+            paths
+                .iter()
+                .filter_map(|p| super::fit::coeffs::read_schema(p, schema))
+                .map(Arc::new)
+                .collect()
+        };
+        FitArchive {
+            v1: read(super::fit::coeffs::fit_dir(root), super::fit::SCHEMA),
+            v2: read(super::fit::v2::fit_dir_v2(root), super::fit::features_v2::SCHEMA_V2),
+        }
+    }
+
+    /// The registry [`Registry::load`] builds for `before`: each schema's
+    /// newest file cut off strictly before it, a later name winning a tie.
+    #[must_use]
+    pub fn registry_before(&self, before: DateTime<Utc>) -> Registry {
+        let newest = |files: &[Arc<super::fit::CoefficientFile>]| {
+            files
+                .iter()
+                .filter(|f| f.as_of < before)
+                .max_by(|a, b| a.as_of.cmp(&b.as_of))
+                .cloned()
+        };
+        Registry::with_fits(newest(&self.v1), newest(&self.v2))
+    }
 }
 
 #[cfg(test)]

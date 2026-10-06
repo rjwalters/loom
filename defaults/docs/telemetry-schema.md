@@ -2202,7 +2202,9 @@ fold's cutoff (the end of its UTC day). Ids are derived from `(heuristic, day)`
 alone. Provenance is required and exports as `loom.eta.version` / `revision` /
 `tree_state` / `provenance_complete`. **Absent is never zero.**
 
-`eta.backtest.fold` (one per registered `land` heuristic per day): `fold_id`,
+`eta.backtest.fold` (one per registered `land` heuristic per day; the day's
+cohort is the cases first known on it, each scored with its prediction day's
+coefficient file): `fold_id`,
 `heuristic`, `kind`, `day`, `cutoff`, `compared_to` (the `current` heuristic),
 `is_current`, `n_cases`, `n_answered`, `answer_rate?`, `pinball4_loss_sec?`,
 `cov_25_75?`, `late_surprise?`, `paired_pairs`, `delta_pinball4_loss_sec?`,
@@ -2211,7 +2213,9 @@ alone. Provenance is required and exports as `loom.eta.version` / `revision` /
 `eta.backtest.summary` (one per non-`current` heuristic): `summary_id`,
 `heuristic`, `kind`, `compared_to`, `as_of_day`, `cutoff`, `cases`, `days`,
 `wins`, `ties`, `win_rate?`, `ci_low?`, `ci_high?` (95% Wilson), `min_folds`,
-`gate_ready`, `gate_detail`, `fit_id?`, `loom`.
+`gate_ready`, `gate_detail`, `fitted_from?` (the first prediction day with a
+retained coefficient file; absent with none), `cases_before_fit` (cases
+predicted earlier, left out), `fit_id?`, `loom`.
 
 ### `eta.snapshot`
 

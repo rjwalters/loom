@@ -1036,10 +1036,15 @@ fn backtest(f: &Facts) -> Vec<Check> {
             "backtest",
             &format!("scoreboard {}", s.heuristic),
             format!(
-                "{rate} vs {}; backtest gate {} ({} case(s); needs {} decided days): {}",
+                "{rate} vs {}; backtest gate {} ({} case(s){}; needs {} decided days): {}",
                 s.compared_to,
                 if s.gate_ready { "READY" } else { "not ready" },
                 s.cases,
+                match (&s.fitted_from, s.cases_before_fit) {
+                    (None, _) => ", no coefficient file".to_string(),
+                    (Some(_), 0) => String::new(),
+                    (Some(d), n) => format!(", {n} predicted before the oldest fit ({d}) left out"),
+                },
                 s.min_folds,
                 s.gate_detail
             ),

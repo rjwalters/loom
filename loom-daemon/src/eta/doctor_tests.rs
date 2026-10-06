@@ -442,6 +442,8 @@ fn summary(ready: bool) -> crate::telemetry::kinds::eta_backtest::EtaBacktestSum
         min_folds: 7,
         gate_ready: ready,
         gate_detail: "land-v4 wins".into(),
+        fitted_from: None,
+        cases_before_fit: 0,
         fit_id: None,
         loom: crate::eta::Provenance {
             version: "0.0.0".into(),

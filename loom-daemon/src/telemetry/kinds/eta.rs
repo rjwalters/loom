@@ -145,6 +145,8 @@ pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.eta.backtest.summary.min_folds",
     "loom.eta.backtest.summary.gate_ready",
     "loom.eta.backtest.summary.gate_detail",
+    "loom.eta.backtest.summary.fitted_from",
+    "loom.eta.backtest.summary.cases_before_fit",
     "loom.eta.backtest.summary.fit_id",
 ];
 

@@ -2575,14 +2575,21 @@ day, catches up at most 7 missed days oldest first).
   `host.health.captainless_singleton_jobs`), so set `fleet.captain` for the
   scoreboard to exist. Records are keyed on `(heuristic, day)`, so a duplicate is detectable.
 - **Records** (OTLP-only, `loom.eta.backtest.*` attributes, body = the JSON):
-  - `eta.backtest.fold` — one per registered `land` heuristic per UTC day:
+  - `eta.backtest.fold` — one per registered `land` heuristic per UTC day,
+    over that day's **cohort**: the cases first known (resolved) on it,
+    whichever day they were predicted on, so a case crossing midnight is
+    folded exactly once, on the day it resolves:
     `heuristic`, `day`, `n_cases`, `answer_rate`, `pinball4_loss_sec`,
     `cov_25_75`, `late_surprise`, the paired deltas against `current`
     (`delta_pinball4_loss_sec`, `delta_answer_rate`, `delta_late_surprise`,
     `paired_pairs`, `win`) and `fit_id`. A rate over no cases is omitted, not `0`.
   - `eta.backtest.summary` — one per non-`current` heuristic: the rolling
     per-day wins against `current` (`days`, `wins`, `ties`), the 95% Wilson
-    bounds, `gate_ready` and the gate's own `gate_detail`. `gate_ready` uses
+    bounds, `gate_ready` and the gate's own `gate_detail`. Every case is
+    scored as its daily fold scored it, with its prediction day's coefficient
+    file; cases predicted before the oldest retained file (the fitter keeps
+    14) are left out and counted (`fitted_from`, `cases_before_fit`), not
+    charged a `no_model` refusal. `gate_ready` uses
     the same gate function as `eta promote` (`shadow::backtest_gate`), not the
     same data: the summary also replays fleet snapshots and the offline PR
     cache, `eta promote` local data only.
@@ -2591,11 +2598,12 @@ day, catches up at most 7 missed days oldest first).
     built from the already-cut cases), so it is not folded as plain `land-v2`.
 - **Strictly point-in-time.** Before replaying, the run drops every input
   observed at or after the day's cutoff (the end of the day): outcome
-  envelopes, journal rows, history samples, and cases not yet resolved. The
-  registry's coefficient file is the newest cut off strictly before the day
-  began. Perturbing post-cutoff data leaves the day's records bit-identical
-  (pinned by a test). A case still open at the cutoff is left out of that day's
-  fold.
+  envelopes, journal rows, history samples, and cases not yet resolved. Each
+  case's coefficient file is the newest cut off strictly before its prediction
+  day began, and its estimate reads only history before its own `as_of`.
+  Perturbing post-cutoff data leaves the day's records bit-identical (pinned by
+  a test). A case still open at the cutoff joins the cohort of the day it
+  resolves.
 - **No forge call.** Inputs are this host's journals, the cached fleet
   snapshots (through `historyScope`) and, if present, the offline merged-PR
   cache `.loom/state/eta/backtest/pr-history.json` (what

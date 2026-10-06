@@ -157,12 +157,13 @@ pub fn emit(sink: Option<&dyn QueueSink>, host_id: &str, days: &[DayRecords]) ->
 pub fn fold_due(root: &Path) -> Vec<DayRecords> {
     let eta = crate::eta::config::read(root);
     let scope = eta.history_scope;
+    let fits = nightly_folds::FitArchive::load(root);
     nightly_folds::run_due(
         root,
         Utc::now(),
         eta.current_land.as_deref(),
         &|local| crate::eta::fleet::apply_scope(scope, root, local),
-        &|before| nightly_folds::registry_before(root, before),
+        &|before| fits.registry_before(before),
         &Provenance::current(),
     )
 }

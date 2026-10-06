@@ -34,7 +34,9 @@ pub struct EtaBacktestFoldRecord {
     pub heuristic: String,
     /// The kind it predicts (`land` today).
     pub kind: String,
-    /// The fold's UTC day, `YYYY-MM-DD`: the cases whose `as_of` fell on it.
+    /// The fold's UTC day, `YYYY-MM-DD`: its cohort is the cases first known
+    /// (resolved) on it, whichever day they were predicted on, so every
+    /// resolved case is folded exactly once (#10532 review).
     pub day: String,
     /// The fold's cutoff (the end of `day`): nothing observed at or after it
     /// was read, and the record's time.
@@ -75,8 +77,9 @@ pub struct EtaBacktestFoldRecord {
     /// were no pairs or an exact tie.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub win: Option<bool>,
-    /// The coefficient file the registry was built with for this day (the
-    /// newest whose cutoff is strictly before the day began).
+    /// The coefficient file serving predictions made on this day (the newest
+    /// whose cutoff is strictly before the day began). A cohort case
+    /// predicted on an earlier day is scored with that day's file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fit_id: Option<String>,
     /// The computing build.
@@ -131,7 +134,18 @@ pub struct EtaBacktestSummaryRecord {
     /// The gate's own explanation (`BacktestGate::detail`), so the verdict is
     /// never unexplained.
     pub gate_detail: String,
-    /// The coefficient file the summary's registry was built with.
+    /// The first prediction day scored, `YYYY-MM-DD`: the first whose
+    /// registry carries a retained coefficient file. Each case is scored with
+    /// its own prediction day's file, as its daily fold scored it. Absent when
+    /// this host has no coefficient file at all (every case is then scored
+    /// unfitted, as live serving was).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fitted_from: Option<String>,
+    /// Resolved cases left out because they were predicted before
+    /// `fitted_from`: no historical fit survives to score them with.
+    #[serde(default)]
+    pub cases_before_fit: u64,
+    /// The coefficient file serving `as_of_day`'s own predictions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fit_id: Option<String>,
     /// The computing build.

@@ -323,6 +323,7 @@ pub(super) fn log_parts(
                 kv_int("loom.eta.backtest.summary.min_folds", to_i64(r.min_folds)),
                 kv_bool("loom.eta.backtest.summary.gate_ready", r.gate_ready),
                 kv_string("loom.eta.backtest.summary.gate_detail", r.gate_detail.clone()),
+                kv_int("loom.eta.backtest.summary.cases_before_fit", to_i64(r.cases_before_fit)),
             ];
             provenance(&mut attributes, "loom.eta.", &r.loom);
             for (key, value) in [
@@ -333,6 +334,9 @@ pub(super) fn log_parts(
                 if let Some(value) = value {
                     attributes.push(kv_double(key, value));
                 }
+            }
+            if let Some(day) = &r.fitted_from {
+                attributes.push(kv_string("loom.eta.backtest.summary.fitted_from", day.clone()));
             }
             if let Some(fit_id) = &r.fit_id {
                 attributes.push(kv_string("loom.eta.backtest.summary.fit_id", fit_id.clone()));
