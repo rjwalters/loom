@@ -2597,8 +2597,12 @@ else
   # based on this branch. Retarget open stacked children onto this PR's base
   # first; keep the branch on ANY uncertainty. Only exit 0 authorizes the delete
   # (a binary predating the verb exits 2 => keep). Independent of the #9259
-  # reconcile defer and of --allow-stacked-children.
-  _RC_RC=0; _RC_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr retarget-children --repo "$REPO_NWO" --parent-branch "$PR_BRANCH" --base "$(echo "$PR_JSON" | jq -r '.base.ref // empty' 2>/dev/null)" 2>/dev/null)" || _RC_RC=$?
+  # reconcile defer and of --allow-stacked-children. GitHub-only: the verb
+  # drives `gh pr list/edit`, so on FORGE_TYPE=gitea (the same test
+  # forge_delete_branch dispatches on) it is skipped and the delete below runs
+  # exactly as before #9372; otherwise a Gitea merge would consult a same-named
+  # GitHub repo, or keep every branch when none exists.
+  _RC_RC=0; _RC_OUT=""; [[ "${FORGE_TYPE:-}" == "gitea" ]] || _RC_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr retarget-children --repo "$REPO_NWO" --parent-branch "$PR_BRANCH" --base "$(echo "$PR_JSON" | jq -r '.base.ref // empty' 2>/dev/null)" 2>/dev/null)" || _RC_RC=$?
   while IFS=$'\t' read -r _RC_LVL _RC_MSG; do
     case "$_RC_LVL" in INFO) info "$_RC_MSG" ;; WARNING) warning "$_RC_MSG" ;; esac
   done <<< "$_RC_OUT"

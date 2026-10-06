@@ -146,3 +146,37 @@ fn strict_parse_accepts_rows_and_rejects_anything_unreadable() {
         assert!(parse_children_strict(bad).is_err(), "{bad:?}");
     }
 }
+
+/// Judge P2 (#10406): both live calls carry the typed `owner/repo` target, so
+/// the facade's owner credential selection and reader routing see the repo
+/// (`--repo` in argv populates neither). `GH_REPO` in the env plan is derived
+/// from that same typed target.
+#[test]
+fn live_invocations_carry_the_typed_repo_target() {
+    let list = list_invocation("acme/w", B).unwrap();
+    let edit = edit_invocation("acme/w", 7, "main").unwrap();
+    for (inv, intent) in [(&list, AccessIntent::Read), (&edit, AccessIntent::Write)] {
+        assert_eq!(inv.target().slug().as_deref(), Some("acme/w"));
+        assert_eq!(inv.intent(), intent);
+        let plan = inv.env_plan(None);
+        assert!(
+            plan.iter()
+                .any(|e| e.key == "GH_REPO" && e.value.as_deref() == Some("acme/w".as_ref())),
+            "{plan:?}"
+        );
+    }
+}
+
+/// An invalid repo slug is an error before any `gh` runs, and the decision
+/// then keeps the branch: the delete stays denied.
+#[test]
+fn an_invalid_repo_slug_fails_closed_without_running_gh() {
+    for bad in ["", "acme", "acme/w/x", "acme/ w", "/w"] {
+        assert!(list_invocation(bad, B).is_err(), "{bad:?}");
+        assert!(edit_invocation(bad, 7, "main").is_err(), "{bad:?}");
+        assert!(GhForge.open_children(bad, B).is_err(), "{bad:?}");
+        assert!(GhForge.retarget(bad, 7, "main").is_err(), "{bad:?}");
+        let r = prepare_delete(&GhForge, bad, B, "main");
+        assert_eq!(r.verdict, Verdict::Keep, "{bad:?}");
+    }
+}

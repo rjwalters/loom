@@ -30,14 +30,15 @@ esac
 S
 chmod +x "$TMP/loom-daemon"
 
-run_case() { # mode auto_delete -> prints log
-  local mode="$1" auto="${2:-false}"
+run_case() { # mode auto_delete forge_type -> prints log
+  local mode="$1" auto="${2:-false}" forge="${3:-github}"
   : > "$TMP/log"
   (
     export STUB_MODE="$mode" STUB_LOG="$TMP/log" LOOM_DAEMON_BIN="$TMP/loom-daemon"
+    FORGE_TYPE="$forge"
     info() { :; }; warning() { :; }; success() { :; }
     forge_check_auto_delete() { echo "$auto"; }
-    forge_delete_branch() { echo "DELETE $2" >> "$STUB_LOG"; }
+    forge_delete_branch() { echo "DELETE $2 forge=$FORGE_TYPE" >> "$STUB_LOG"; }
     REPO_NWO=o/r; GH=gh; PR_BRANCH=feature/parent
     PR_JSON='{"base":{"ref":"main"}}'
     eval "$BLOCK"
@@ -59,5 +60,12 @@ done
 
 log="$(run_case fail true)"
 [[ -z "$log" ]] && ok "auto-delete repo: verb not consulted, no delete" || bad "auto-delete: $log"
+
+# Judge P1 (#10406): the verb drives gh, so a Gitea merge must never call it;
+# the delete runs as before #9372, on the Gitea forge. `fail` would keep the
+# branch if the verb were consulted.
+log="$(run_case fail false gitea)"
+! grep -q '^daemon' <<<"$log" && ok "gitea: retarget-children never invoked" || bad "gitea must not call the GitHub verb: $log"
+grep -q '^DELETE feature/parent forge=gitea' <<<"$log" && ok "gitea: delete runs as before" || bad "gitea should delete: $log"
 
 [[ $FAILED -eq 0 ]] && { echo "All passed"; exit 0; } || { echo "$FAILED failed"; exit 1; }

@@ -240,20 +240,50 @@ fn stderr_tail(o: &std::process::Output) -> String {
     }
 }
 
+/// The typed `owner/repo` target both calls carry, so owner-specific
+/// credential selection (`GH_CONFIG_DIR`) and reader routing see the repo:
+/// `--repo` in argv populates neither. An invalid slug is an error, which
+/// [`prepare_delete`] turns into [`Verdict::Keep`].
+fn target(repo: &str) -> Result<GhTarget, String> {
+    GhTarget::repo(repo).map_err(|e| format!("{e} (got {repo:?})"))
+}
+
+/// `gh pr list` for the open PRs based on `branch` in `repo`.
+pub(crate) fn list_invocation(repo: &str, branch: &str) -> Result<GhInvocation, String> {
+    Ok(GhInvocation::new(
+        Operation::new("merge_pr.retarget_children.list"),
+        AccessIntent::Read,
+        target(repo)?,
+        std::time::Duration::from_secs(60),
+    )
+    .args([
+        "pr", "list", "--repo", repo, "--base", branch, "--state", "open",
+    ])
+    .args(["--json", "number,headRefName", "--limit", LIST_LIMIT]))
+}
+
+/// `gh pr edit --base` moving PR `number` in `repo` onto `base`.
+pub(crate) fn edit_invocation(repo: &str, number: i64, base: &str) -> Result<GhInvocation, String> {
+    Ok(GhInvocation::new(
+        Operation::new("merge_pr.retarget_children.edit"),
+        AccessIntent::Write,
+        target(repo)?,
+        std::time::Duration::from_secs(60),
+    )
+    .args([
+        "pr",
+        "edit",
+        &number.to_string(),
+        "--repo",
+        repo,
+        "--base",
+        base,
+    ]))
+}
+
 impl Forge for GhForge {
     fn open_children(&self, repo: &str, branch: &str) -> Result<Vec<Child>, String> {
-        let out = GhInvocation::new(
-            Operation::new("merge_pr.retarget_children.list"),
-            AccessIntent::Read,
-            GhTarget::None,
-            std::time::Duration::from_secs(60),
-        )
-        .args([
-            "pr", "list", "--repo", repo, "--base", branch, "--state", "open",
-        ])
-        .args(["--json", "number,headRefName", "--limit", LIST_LIMIT])
-        .run();
-        match out {
+        match list_invocation(repo, branch)?.run() {
             CmdOutcome::Ran(o) if o.status.success() => {
                 parse_children_strict(&String::from_utf8_lossy(&o.stdout))
             }
@@ -263,23 +293,7 @@ impl Forge for GhForge {
     }
 
     fn retarget(&self, repo: &str, number: i64, base: &str) -> Result<(), String> {
-        let out = GhInvocation::new(
-            Operation::new("merge_pr.retarget_children.edit"),
-            AccessIntent::Write,
-            GhTarget::None,
-            std::time::Duration::from_secs(60),
-        )
-        .args([
-            "pr",
-            "edit",
-            &number.to_string(),
-            "--repo",
-            repo,
-            "--base",
-            base,
-        ])
-        .run();
-        match out {
+        match edit_invocation(repo, number, base)?.run() {
             CmdOutcome::Ran(o) if o.status.success() => Ok(()),
             CmdOutcome::Ran(o) => Err(stderr_tail(&o)),
             CmdOutcome::Unavailable(u) => Err(format!("gh did not answer: {u:?}")),
