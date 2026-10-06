@@ -78,7 +78,7 @@ pub const DEFAULT_SESSION_IMAGE: &str = "ghcr.io/rjwalters/loom-worker-session:l
 
 /// The session image's fixed `CODEX_HOME` mount point
 /// (`docker/session/README.md` § "`CODEX_HOME` mount contract").
-const CONTAINER_CODEX_HOME: &str = "/home/loom/.codex-profile";
+pub(crate) const CONTAINER_CODEX_HOME: &str = "/home/loom/.codex-profile";
 
 /// The session image's fixed uid/gid (`docker/worker/MOUNT-CONTRACT.md` §3).
 /// Advisory only (see [`uid_matches_image`]) — never a hard `start` failure,

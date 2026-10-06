@@ -81,6 +81,28 @@ fn probe(args: &[&str], parent: i32) -> Result<Option<String>> {
     }
 }
 
+/// Exit code of a refused stale-mount dispatch: EX_CONFIG, like every other
+/// pre-exec refusal; the marker is what makes it distinct.
+pub(super) const MOUNT_STALE_EXIT: i32 = 78;
+
+/// The marker plus the operator's recreate instructions, on one line.
+pub(super) fn mount_stale_line(
+    container: &str,
+    workdir: &str,
+    state: &serde_json::Value,
+) -> String {
+    let account = container.trim_start_matches("loom-codex-session-");
+    let workspace = crate::tokens_pool::session_state::workspace_label(state)
+        .map_or_else(|| "<checkout parent>".to_string(), |w| w.display().to_string());
+    format!(
+        "{} container={container} workdir={workdir} session-exec: {workdir} is not mounted in \
+         {container}, which was created before this repository was registered (#10364); \
+         recreate it when idle: loom-daemon accounts session stop {account} && loom-daemon \
+         accounts session start {account} --mount-workspace {workspace}",
+        crate::tokens_pool::session_state::MOUNT_STALE_MARKER
+    )
+}
+
 pub fn run(args: HostArgs) -> Result<i32> {
     signals();
     let parent = unsafe { libc::getppid() };
@@ -120,6 +142,25 @@ pub fn run(args: HostArgs) -> Result<i32> {
         }
         Ok(Some(state)) if state == "true" => {}
         _ => bail!("Session container '{}' is not running. Start it with: loom-daemon accounts session start {}", args.container, args.container.trim_start_matches("loom-codex-session-")),
+    }
+    // #10364: a host-mode container mounts each registered repo separately,
+    // fixed at creation, so a repo registered since is not inside it and
+    // `docker exec --workdir` would die with `chdir to cwd … no such file or
+    // directory`. Refuse before exec with a marker spawn-codex maps to
+    // SESSION_MOUNT_STALE. An inspect that cannot be read fails open: the
+    // exec below reports its own error, as before.
+    if let Some(state) = probe(&["inspect", "--type", "container", &args.container], parent)?
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.get(0).cloned())
+    {
+        if crate::tokens_pool::session_state::workdir_unmounted(&state, &args.workdir) {
+            let line = mount_stale_line(&args.container, &args.workdir, &state);
+            eprintln!("{line}");
+            if let Some(path) = &args.stderr_file {
+                let _ = std::fs::write(path, format!("{line}\n"));
+            }
+            return Ok(MOUNT_STALE_EXIT);
+        }
     }
     if probe(
         &[

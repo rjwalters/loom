@@ -50,3 +50,19 @@ fn another_invocation_cannot_acknowledge_cleanup() {
     assert_eq!(result, other);
     assert!(!clean.load(Ordering::Acquire));
 }
+
+/// #10364: the stale-mount refusal starts with the marker spawn-codex.sh
+/// matches, exits 78, and names the account's own recreate command.
+#[test]
+fn mount_stale_line_carries_the_marker_and_the_recreate_command() {
+    let state = serde_json::json!({"Config": {"Labels": {"loom.workspace": "/home/u/GitHub"}}});
+    let line = host::mount_stale_line("loom-codex-session-agent-3", "/home/u/GitHub/new", &state);
+    assert!(line.starts_with("# LOOM_SESSION_MOUNT_STALE container=loom-codex-session-agent-3 "));
+    assert!(line.contains("workdir=/home/u/GitHub/new"));
+    assert!(line.contains(
+        "accounts session stop agent-3 && loom-daemon accounts session start agent-3 \
+         --mount-workspace /home/u/GitHub"
+    ));
+    assert!(!line.contains('\n'));
+    assert_eq!(host::MOUNT_STALE_EXIT, 78);
+}

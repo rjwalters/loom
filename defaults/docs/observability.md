@@ -589,13 +589,30 @@ reads each enabled, session-managed Codex account's container and exports
 `loom.codex_session.state{account,state,container}`: one point per `state` in
 `running`, `stopped`, `missing`, `stale_mounts` (1 for the current state, 0 for
 the rest), with the standard `host.id` / `service.version` resource attributes.
-`stale_mounts` means a registered workspace root under the container's
-workspace is not mounted. The daemon logs a WARN on each state change
+`stale_mounts` means the container's workspace mounts differ from what
+`accounts session start --mount-workspace <its loom.workspace label>` would
+mount today, in either direction (#10364): a registered root under the label
+is not mounted, or a mount is no longer registered (a deregistered repository
+that Codex can still write with its own sandbox off). Private-clone containers
+never get this verdict. The daemon logs a WARN on each state change
 (recovery included) and repeats it every 15 min while the container stays down;
 it is per account, outside the role runner's per-root DEBUG demotion. A tick
 refused because the container was not running ends as `category=SESSION_DOWN`
 (exit 78 kept), carried as `loom.admission.reason="session-down"` on the
 `loom.role_attempt` span; it records no account hold.
+
+**Stale-mount dispatch refusal (#10364).** Before `docker exec --workdir`,
+`session-exec host` checks that one of the running container's mounts covers
+the workdir. If none does (the repository was registered after the container
+was created), it does not exec: it writes `# LOOM_SESSION_MOUNT_STALE
+container=… workdir=…` with the recreate command to stderr and the capture
+file and exits 78, which `spawn-codex.sh` reports as
+`category=SESSION_MOUNT_STALE`. The tick carries
+`loom.admission.reason="session-mount-stale"` and records no account hold
+(the container is stale, not the account). `loom-daemon workspace add` /
+`remove` print every host-mode session container the registry change left
+drifted, with the manual recreate, until the reconciler recreates idle ones
+itself.
 
 **Long-running task liveness and self-update decisions (#10414).** Each
 long-running daemon loop beats a process-global liveness registry

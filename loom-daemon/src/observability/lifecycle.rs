@@ -264,6 +264,12 @@ pub fn admission_attributes(outcome: &crate::role_runner::RoleTickOutcome) -> Tr
         {
             attrs.insert("loom.admission.reason".into(), "session-down".into());
         }
+        // #10364: so is a refusal because the container lacks the workdir mount.
+        RoleTickOutcome::Failure(reason)
+            if crate::role_tick_telemetry::is_session_mount_stale_reason(reason) =>
+        {
+            attrs.insert("loom.admission.reason".into(), "session-mount-stale".into());
+        }
         RoleTickOutcome::Failure(_) => {
             attrs.insert("loom.admission.reason".into(), "failure".into());
         }
