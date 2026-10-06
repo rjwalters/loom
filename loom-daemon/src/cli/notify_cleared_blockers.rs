@@ -167,8 +167,8 @@ impl NotifyClearedBlockersArgs {
                 // is a cleared block worth a comment.
                 Verdict::Undocumented | Verdict::StillBlocked => continue,
             };
-            let posted = !self.dry_run
-                && post_comment(g.kind, g.number, &cited, &reasons, repo, &root);
+            let posted =
+                !self.dry_run && post_comment(g.kind, g.number, &cited, &reasons, repo, &root);
             notified.push(Notified {
                 kind: g.kind,
                 number: g.number,
