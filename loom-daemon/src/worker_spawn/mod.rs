@@ -7,6 +7,7 @@ pub mod containment;
 // native tap's API-key pool is the wall, and must read the profile the launch
 // would actually use rather than re-deriving one.
 pub(crate) mod credential;
+pub mod egress_policy;
 pub mod egress_proxy;
 mod harness;
 pub mod launch_outcome;

@@ -60,6 +60,27 @@ pub(crate) enum EgressAction {
         #[arg(long)]
         image: Option<String>,
     },
+    /// The container egress boundary (#9989, scope 3): under
+    /// `enforcement.api = required`, start the egress sidecar, run the
+    /// policy's negative canary inside the container's network namespace, and
+    /// print `loom-forge-egress-network: isolated` followed by the `docker
+    /// run` arguments (`--network container:…`, one per line) the worker must
+    /// add. Anything not `required` (no policy, `observe`) prints
+    /// `loom-forge-egress-network: none` and nothing else. A canary that
+    /// reaches the API (`runtime.bypass-open`), one that cannot run, or a
+    /// boundary that cannot be installed (`runtime.unverifiable`) prints
+    /// NOTHING on stdout and exits 78: the spawn is aborted.
+    ContainerNetwork {
+        /// The worker image the container will run (also the canary's image).
+        #[arg(long)]
+        image: String,
+        /// Map `host.docker.internal` (credential proxy path).
+        #[arg(long)]
+        add_host_gateway: bool,
+        /// Remove the sidecar when this host pid exits.
+        #[arg(long)]
+        watch_pid: Option<u32>,
+    },
     /// Admit `image` for a containerised worker under the managed launcher
     /// (#9987): under `enforcement.api = required`, refuse (exit 78) an image
     /// without `python3` (the launcher is Python 3) or whose `gh` does not
@@ -168,6 +189,10 @@ fn assert_prints_findings(report: &forge_egress::Report) -> bool {
 /// (`spawn-claude.sh` matches it literally).
 const CONTAINER_ARGS_STATUS_PREFIX: &str = "loom-forge-egress: ";
 
+/// First line `forge egress container-network` prints (`spawn-claude.sh`
+/// matches it literally; no line means refusal, never "no boundary").
+const CONTAINER_NETWORK_STATUS_PREFIX: &str = "loom-forge-egress-network: ";
+
 /// Print the refusal for `finding` and exit 78 (`EX_CONFIG`).
 fn refuse(finding: &Finding) -> ! {
     eprintln!("{}", forge_egress::worker_env::refusal_message(finding));
@@ -193,6 +218,40 @@ fn container_check(image: &str, egress: &forge_egress::worker_env::WorkerEgress)
 
 /// Dispatch one `forge egress` verb; exits the process with the verdict.
 pub(crate) fn handle(action: EgressAction) -> Result<()> {
+    if let EgressAction::ContainerNetwork {
+        image,
+        add_host_gateway,
+        watch_pid,
+    } = &action
+    {
+        use loom_daemon::worker_spawn::egress_policy as ep;
+        let admission = match forge_egress::worker_env::WorkerEgress::admit_process() {
+            Ok(admission) => admission,
+            Err(finding) => refuse(&finding),
+        };
+        let opts = ep::Options {
+            add_host_gateway: *add_host_gateway,
+            watch_pid: *watch_pid,
+        };
+        let sidecar = match admission.egress.as_ref() {
+            Some(egress) => match ep::establish(egress, image, &opts) {
+                Ok(sidecar) => sidecar,
+                Err(finding) => refuse(&finding),
+            },
+            None => None,
+        };
+        match sidecar {
+            Some(sidecar) => {
+                eprintln!("{}", ep::verified_message(&sidecar));
+                println!("{CONTAINER_NETWORK_STATUS_PREFIX}isolated");
+                for arg in sidecar.network_args() {
+                    println!("{arg}");
+                }
+            }
+            None => println!("{CONTAINER_NETWORK_STATUS_PREFIX}none"),
+        }
+        return Ok(());
+    }
     let image = match &action {
         EgressAction::ContainerArgs { image } => Some(image.clone()),
         EgressAction::ContainerCheck { image } => Some(Some(image.clone())),
@@ -282,7 +341,9 @@ pub(crate) fn handle(action: EgressAction) -> Result<()> {
             }
             report.exit_code()
         }
-        EgressAction::ContainerArgs { .. } | EgressAction::ContainerCheck { .. } => 0, // above
+        EgressAction::ContainerArgs { .. }
+        | EgressAction::ContainerCheck { .. }
+        | EgressAction::ContainerNetwork { .. } => 0, // above
         EgressAction::Guard { for_command } => {
             match forge_egress::guard::check_process(&for_command, &ws) {
                 Some(reason) => {

@@ -356,7 +356,23 @@ pub fn docker_command(
     credentials: &[&str],
     injection: Option<&Injection>,
 ) -> Result<Command, LaunchError> {
-    docker_command_with(
+    let egress = crate::forge_egress::worker_env::WorkerEgress::from_process();
+    // #9989: under `enforcement.api = required` the worker joins a sidecar
+    // that owns a network namespace denying direct GitHub API egress, and the
+    // spawn aborts unless the in-container canary was blocked. Inert otherwise.
+    let sidecar = match egress.as_ref() {
+        Some(egress) if egress.required && which_docker().is_some() => {
+            let opts = super::egress_policy::Options {
+                add_host_gateway: injection.is_some_and(|i| i.add_host_gateway),
+                watch_pid: Some(std::process::id()),
+            };
+            super::egress_policy::establish(egress, &profile.image, &opts).map_err(|f| {
+                LaunchError::config(crate::forge_egress::worker_env::refusal_message(&f))
+            })?
+        }
+        _ => None,
+    };
+    docker_command_network(
         profile,
         workspace,
         cwd,
@@ -364,7 +380,8 @@ pub fn docker_command(
         args,
         credentials,
         injection,
-        crate::forge_egress::worker_env::WorkerEgress::from_process().as_ref(),
+        egress.as_ref(),
+        sidecar.as_ref(),
     )
 }
 
@@ -383,6 +400,27 @@ pub fn docker_command_with(
     injection: Option<&Injection>,
     egress: Option<&crate::forge_egress::worker_env::WorkerEgress>,
 ) -> Result<Command, LaunchError> {
+    docker_command_network(profile, workspace, cwd, log, args, credentials, injection, egress, None)
+}
+
+/// [`docker_command_with`] joined to a container egress boundary (#9989):
+/// `sidecar` puts the worker in the network namespace of an egress sidecar
+/// (`--network container:…`), which docker refuses to combine with
+/// `--add-host`, so the host-gateway mapping is the sidecar's (see
+/// [`super::egress_policy::Options::add_host_gateway`]). `None` is
+/// byte-identical to [`docker_command_with`].
+#[allow(clippy::too_many_arguments)]
+pub fn docker_command_network(
+    profile: &Profile,
+    workspace: &Path,
+    cwd: &Path,
+    log: Option<&Path>,
+    args: &[OsString],
+    credentials: &[&str],
+    injection: Option<&Injection>,
+    egress: Option<&crate::forge_egress::worker_env::WorkerEgress>,
+    sidecar: Option<&super::egress_policy::Sidecar>,
+) -> Result<Command, LaunchError> {
     if which_docker().is_none() {
         return Err(LaunchError::config(
             "native containment is enabled (runtimes.containment.native / LOOM_NATIVE_CONTAINERIZED) but 'docker' is not on PATH. Install docker, or disable containment (LOOM_NATIVE_CONTAINERIZED=0, or remove runtimes.containment.native from .loom/config.json).",
@@ -391,6 +429,9 @@ pub fn docker_command_with(
     let root = profile.ephemeral_root();
     let mut command = Command::new("docker");
     command.arg("run").arg("--rm");
+    if let Some(sidecar) = sidecar {
+        command.args(sidecar.network_args());
+    }
 
     // --- Mounts (MOUNT-CONTRACT.md) -------------------------------------
     // §1 path parity: the workspace is bind-mounted read-write at the
@@ -503,7 +544,7 @@ pub fn docker_command_with(
     // that slipped through — the same ordering rule `ISOLATED_DIRS` relies on,
     // applied in the opposite direction.
     if let Some(injection) = injection {
-        if injection.add_host_gateway {
+        if injection.add_host_gateway && sidecar.is_none() {
             command
                 .arg("--add-host")
                 .arg("host.docker.internal:host-gateway");

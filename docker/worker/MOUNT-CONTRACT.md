@@ -227,6 +227,26 @@ The test runs wherever docker is available (including CI's `worker-image-smoke`
 leg) and **skips cleanly (exit 0, not a failure)** on a docker-less host —
 consistent with `test-image.sh`'s own CI wiring.
 
+## 6. Network namespace under `enforcement.api = required` (#9989)
+
+Under a `required` forge-egress policy the worker container does **not** own
+its network namespace: it joins a Loom-managed egress sidecar's
+(`--network container:<sidecar>`), which denies TCP to `api.github.com` /
+`uploads.github.com` (IPv4 and IPv6, periodically re-resolved) and allows
+`github.apiOrigin` and git transport to `github.com`. Contract for a
+Loom-managed dispatch:
+
+- the worker carries **no** `NET_ADMIN`/`NET_RAW` and must not be launched with
+  `--network host`, `--privileged` or its own `--network` choice;
+- `--add-host`, `--hostname`, `-p` and `--dns` belong to the sidecar (docker
+  refuses them beside `container:`) — Loom applies the credential proxy's
+  `host.docker.internal:host-gateway` there;
+- the spawn is aborted (exit 78) unless the policy's negative canary, run
+  inside this namespace, was blocked. Full mechanism and finding codes:
+  [`README.md`](README.md) § "Forge egress boundary".
+
+With no policy (or `observe`) the worker keeps its default network, unchanged.
+
 ## Related
 
 - [`README.md`](README.md) — the base image's shape decision and `FROM`

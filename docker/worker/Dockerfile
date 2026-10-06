@@ -122,6 +122,7 @@ RUN apt-get update -qq \
         openssh-client \
         unzip \
         less \
+        iptables \
     && mkdir -p -m 755 /etc/apt/keyrings \
     && curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \

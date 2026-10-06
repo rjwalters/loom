@@ -810,6 +810,34 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
             ;;
     esac
     _containment_mounts+=("${_containment_gh[@]:1}")
+    # Container egress boundary (#9989): under `enforcement.api = required`
+    # the worker joins an egress sidecar's network namespace that denies direct
+    # GitHub API egress, and `container-network` has already run the policy's
+    # negative canary inside it. Same decision point, same fail-closed shape as
+    # above: the first line is explicit (`none` | `isolated`); no line (a
+    # bypass-open canary, an unverifiable boundary, an older daemon) REFUSES
+    # (78) — never "no output means no boundary". Only a managed host asks.
+    _containment_net=()
+    if [[ "${_containment_gh[0]:-}" == "loom-forge-egress: managed" ]]; then
+        _containment_net_flags=(--image "$_containment_image" --watch-pid "$$")
+        [[ "$_CONTAINMENT_CRED_PROXY" == "1" ]] && _containment_net_flags+=(--add-host-gateway)
+        _containment_net_out=""
+        if [[ -n "$_containment_gh_bin" ]] && "$_containment_gh_bin" forge egress container-network --help >/dev/null 2>&1; then
+            # stderr passes through: the named refusal (runtime.bypass-open, …) reaches the log.
+            _containment_net_out="$("$_containment_gh_bin" forge egress container-network "${_containment_net_flags[@]}")" || _containment_net_out=""
+        fi
+        while IFS= read -r _containment_net_line; do # Bash 3.2: no mapfile
+            _containment_net+=("$_containment_net_line")
+        done <<<"$_containment_net_out"
+        case "${_containment_net[0]:-}" in
+            "loom-forge-egress-network: none" | "loom-forge-egress-network: isolated") ;;
+            *)
+                log_error "spawn-claude: no explicit container egress answer under a managed forge-egress policy (bypass-open or unverifiable boundary, or a daemon without \`forge egress container-network\`) — refusing to start the worker (#9989)."
+                exit 78 # EX_CONFIG
+                ;;
+        esac
+        _containment_net=("${_containment_net[@]:1}")
+    fi
     # Git commit identity (check-git-identity.sh's global user.name/user.email).
     if [[ -n "${HOME:-}" && -f "${HOME}/.gitconfig" ]]; then
         _containment_mounts+=(-v "${HOME}/.gitconfig:${HOME}/.gitconfig:ro")
@@ -909,6 +937,7 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # exec'd under `worker proxy-exec` from the Dispatch section, after
     # host-side token selection.
     _containment_docker=(docker run --rm
+        ${_containment_net[@]+"${_containment_net[@]}"}
         "${_containment_mounts[@]}"
         -w "$_containment_cwd"
         "${_containment_env[@]}"

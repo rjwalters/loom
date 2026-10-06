@@ -688,3 +688,50 @@ fn a_sink_dir_that_is_not_a_sink_is_neither_mounted_nor_assigned_nor_changed() {
     }
     std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
 }
+
+#[test]
+fn egress_sidecar_joins_the_netns_and_moves_add_host_to_the_sidecar() {
+    use super::egress_policy::Sidecar;
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    let sidecar = Sidecar {
+        name: "loom-egress-t".into(),
+    };
+    let injection = Injection {
+        add_host_gateway: true,
+        ..Injection::default()
+    };
+    let build = |sidecar: Option<&Sidecar>| {
+        argv(
+            &docker_command_network(
+                &profile(None, None),
+                Path::new("/srv/repo"),
+                Path::new("/srv/repo"),
+                None,
+                &[OsString::from("-p"), OsString::from("x")],
+                &[],
+                Some(&injection),
+                None,
+                sidecar,
+            )
+            .expect("docker command"),
+        )
+    };
+    let joined = build(Some(&sidecar));
+    let plain = build(None);
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+    assert!(
+        joined
+            .windows(2)
+            .any(|w| w == ["--network", "container:loom-egress-t"]),
+        "{joined:?}"
+    );
+    assert!(
+        !joined.contains(&"--add-host".to_string()),
+        "docker refuses it with container: {joined:?}"
+    );
+    // No boundary: byte-identical to docker_command_with, add-host kept.
+    assert!(!plain.contains(&"--network".to_string()), "{plain:?}");
+    assert!(plain.contains(&"--add-host".to_string()), "{plain:?}");
+}

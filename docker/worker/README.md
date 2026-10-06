@@ -107,6 +107,61 @@ docker run --rm \
   .loom/scripts/spawn-worker.sh -p "/loom:sweep 123" --dangerously-skip-permissions
 ```
 
+## Forge egress boundary (`enforcement.api = required`, #9989)
+
+Under a machine/env forge-egress policy with `enforcement.api = required`, a
+Loom-dispatched worker container must not be able to reach the GitHub API
+directly — only through the managed `gh` launcher and the policy's
+`github.apiOrigin`. Loom owns this boundary; it installs **no host firewall
+rules** (bare-metal host policy is 2am#1931).
+
+**Mechanism (Docker): a netns-holding sidecar.** `--add-host` only changes name
+resolution, and a `NET_ADMIN` worker could delete its own rules. So before the
+worker starts, Loom (`loom-daemon forge egress container-network`, called from
+`spawn-claude.sh`'s `container-args` decision point; the native path calls the
+same code from `containment.rs`) starts a short-lived sidecar from the worker
+image (override: `LOOM_EGRESS_SIDECAR_IMAGE`; it needs `iptables`, `ip6tables`,
+`getent`, `awk` — this image installs `iptables`) with `NET_ADMIN`/`NET_RAW`
+only, and the worker joins its network namespace with `--network
+container:<sidecar>`, holding no network capability. The sidecar:
+
+- resolves `api.github.com` and `uploads.github.com` over **IPv4 and IPv6**
+  and atomically replaces a dedicated `OUTPUT` chain (`iptables-restore
+  --noflush`): TLS-SNI string match for the blocked hosts (skipped, never
+  fatal, if the kernel lacks `xt_string`), `ACCEPT` for the addresses of
+  `github.apiOrigin` and `github.com` (git transport), `REJECT --reject-with
+  tcp-reset` for the blocked hosts' addresses;
+- **re-resolves every 30 s** (the CDN rotates addresses; a launch-time snapshot
+  is not a boundary) and swaps the chain atomically;
+- is removed by a host-side reaper when the worker's `docker run` client exits
+  (label `loom.egress-sidecar=<name>` finds any stray: `docker ps -a --filter
+  label=loom.egress-sidecar`).
+
+Because the worker shares the sidecar's namespace, docker refuses
+`--add-host`/`--hostname`/`-p`/`--dns` on the worker; the host-gateway mapping
+the credential proxy needs is applied to the sidecar instead.
+
+**Negative canary and abort path.** Before the agent starts, Loom runs
+`enforcement.negativeCanary` (default `curl -sS --max-time 5
+https://api.github.com/zen`) in a throwaway, capability-free container joined
+to the same namespace. Only env/machine-owned policies may name a canary. It
+is classified through the one C1 classifier (`forge_egress::checks::assert_runtime`):
+
+| Canary | Finding | Under `required` |
+|---|---|---|
+| request fails | none: logged `runtime.verified` (from the canary, never config) | worker starts |
+| request succeeds | `runtime.bypass-open` | spawn aborted (exit 78), sidecar removed |
+| cannot run (no `curl`, timeout, docker failure) or rules not installed | `runtime.unverifiable` | spawn aborted (exit 78) |
+
+With no policy, or `observe`, none of this runs and the `docker run` argv is
+byte-identical to before. A bare-metal host keeps `runtime.unverifiable` in
+`loom-daemon forge egress doctor` (exit 2) until 2am's host policy sets
+`enforcement.runtimeEgress` and a `negativeCanary`; Loom never claims host
+enforcement it did not prove. Tests: `cargo test -p loom-daemon egress_policy`;
+the real-Docker matrix (`docker_boundary_blocks_api_and_keeps_git_transport`)
+skips without Docker and runs when `LOOM_EGRESS_DOCKER_TEST_IMAGE` names an
+image with `iptables` and `curl`.
+
 ## Building and testing locally
 
 The Dockerfile expects a pre-built Linux `loom-daemon` release binary in the

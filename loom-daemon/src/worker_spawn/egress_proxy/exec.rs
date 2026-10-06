@@ -293,8 +293,15 @@ fn docker_args(
             out.push(name.into());
         }
     }
-    out.push("--add-host".into());
-    out.push("host.docker.internal:host-gateway".into());
+    // `--network container:<egress sidecar>` (#9989) forbids `--add-host`;
+    // the sidecar carries the mapping.
+    let joins_netns = tail
+        .windows(2)
+        .any(|w| w[0] == "--network" && w[1].to_string_lossy().starts_with("container:"));
+    if !joins_netns {
+        out.push("--add-host".into());
+        out.push("host.docker.internal:host-gateway".into());
+    }
     out.extend(tail.iter().cloned());
     Ok(out)
 }
