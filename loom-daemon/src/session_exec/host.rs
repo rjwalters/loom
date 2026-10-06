@@ -113,13 +113,24 @@ pub fn run(args: HostArgs) -> Result<i32> {
             bail!("session launcher died before supervision started");
         }
     }
-    match probe(&["inspect", "-f", "{{.State.Running}}", &args.container], parent) {
-        Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {
+    // Running and not restarting: the rule `session_state::container_running`
+    // applies to a full inspect object (#10455).
+    let running = "{{and .State.Running (not .State.Restarting)}}";
+    match probe(&["inspect", "-f", running, &args.container], parent) {
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
             eprintln!("session-exec: 'docker' command not found in PATH");
             return Ok(127);
         }
         Ok(Some(state)) if state == "true" => {}
-        _ => bail!("Session container '{}' is not running. Start it with: loom-daemon accounts session start {}", args.container, args.container.trim_start_matches("loom-codex-session-")),
+        _ => {
+            // #10455: name the cause for the daemon's terminal-record parser.
+            refusal::announce(crate::tokens_pool::health::TerminalClassification::SessionDown);
+            bail!("Session container '{}' is not running. Start it with: loom-daemon accounts session start {}", args.container, args.container.trim_start_matches("loom-codex-session-"))
+        }
     }
     if probe(
         &[

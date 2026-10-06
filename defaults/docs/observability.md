@@ -615,8 +615,12 @@ WARNs again when docker answers. A failed `docker inspect` counts as an answer
 only when every error says the container does not exist. Readers of the
 published snapshot on the dispatch path should use `LATEST_MAX_AGE` (120 s, two
 watch intervals) and treat an older, absent or unavailable snapshot as "cannot
-observe". A tick refused because the container was not running ends as
-`category=SESSION_DOWN` (exit 78 kept), carried as
+observe". A tick refused because the container was not running is read by
+the daemon as `category=SESSION_DOWN` (exit 78 kept): `session-exec host`
+announces the cause on stderr as `# LOOM_SESSION_REFUSAL v=1
+category=SESSION_DOWN`, and the terminal-record parser applies it to the
+adapter's generic `RECOVERABLE`/78 record, so no adapter script carries a
+per-cause arm. It is carried as
 `loom.admission.reason="session-down"` on the `loom.role_attempt` span; it
 records no account hold.
 

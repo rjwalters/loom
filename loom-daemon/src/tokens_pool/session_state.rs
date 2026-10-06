@@ -41,10 +41,9 @@
 //! `missing`.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -66,9 +65,6 @@ pub const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(8);
 /// should pass this, not a longer window; an older or absent snapshot is
 /// "cannot observe" (Ungated).
 pub const LATEST_MAX_AGE: Duration = Duration::from_secs(2 * 60);
-
-/// Upper bound on the bytes read from one docker call's stdout.
-const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// What an account's session container is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -316,62 +312,26 @@ struct Ran {
     stderr: String,
 }
 
-/// Run `docker args…`, killing it if it is still running at `until`.
+/// Run `docker args…` through the shared bounded executor
+/// (`proc_exec::run_bounded`): both pipes are drained concurrently, and at
+/// `until` the child's whole process group is killed and reaped.
 fn run_bounded(docker: &str, args: &[&str], until: Instant) -> Result<Ran, String> {
-    let mut child = Command::new(docker)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("could not run {docker}: {error}"))?;
-    // Drain both pipes on their own threads: `docker inspect` of many
-    // containers outgrows a pipe buffer, and a child blocked on a full pipe
-    // would otherwise only end at the deadline.
-    let (out_tx, out_rx) = mpsc::channel();
-    if let Some(stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stdout.take(MAX_OUTPUT_BYTES).read_to_end(&mut bytes);
-            let _ = out_tx.send(bytes);
-        });
-    }
-    let (err_tx, err_rx) = mpsc::channel();
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            let mut text = String::new();
-            let _ = stderr.take(4096).read_to_string(&mut text);
-            let _ = err_tx.send(text);
-        });
-    }
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= until => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("docker {} timed out", args.first().unwrap_or(&"")));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("waiting on docker: {error}"));
-            }
+    use crate::proc_exec::{Completion, ExecError};
+    let mut command = Command::new(docker);
+    command.args(args).stdin(Stdio::null());
+    let remaining = until.saturating_duration_since(Instant::now());
+    match crate::proc_exec::run_bounded(command, remaining) {
+        Ok(Completion::Exited(output)) => Ok(Ran {
+            success: output.status.success(),
+            stdout: output.stdout,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }),
+        Ok(Completion::TimedOut { .. }) => {
+            Err(format!("docker {} timed out", args.first().unwrap_or(&"")))
         }
-    };
-    let remaining = until.saturating_duration_since(Instant::now()) + Duration::from_millis(500);
-    let stdout = out_rx
-        .recv_timeout(remaining)
-        .map_err(|_| "docker output was not closed".to_string())?;
-    let stderr = err_rx
-        .recv_timeout(Duration::from_millis(500))
-        .unwrap_or_default();
-    Ok(Ran {
-        success: status.success(),
-        stdout,
-        stderr,
-    })
+        Err(ExecError::Spawn(error)) => Err(format!("could not run {docker}: {error}")),
+        Err(error) => Err(format!("waiting on docker: {error}")),
+    }
 }
 
 static LATEST: Mutex<Option<(Instant, Arc<Snapshot>)>> = Mutex::new(None);
