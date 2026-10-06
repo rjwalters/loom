@@ -619,12 +619,15 @@ owner = "daemon-ci-telemetry"
 risk = "normal"
 github = { commands = [
   "gh run rerun",
+  "loom-daemon forge rerun",
 ], routes = [
   "POST repos/{owner}/{repo}/actions/runs/{id}/rerun",
+  "POST repos/{owner}/{repo}/actions/runs/{id}/rerun-failed-jobs",
+  "POST repos/{owner}/{repo}/actions/jobs/{id}/rerun",
 ] }
 platform_support = "unknown"
-adapter_coverage = "none"
-caller_integration = "none"
+adapter_coverage = "partial"
+caller_integration = "partial"
 exclusion_reason = "Re-running CI is remediation, not a lifecycle requirement; Loom's CI policy is explicitly conservative (never cancel a distinct commit's run) and a rerun is an operator or Doctor action."
 preflight = "warn-and-disable"
 unknowns = []
@@ -635,6 +638,9 @@ path = ".github/workflows/ci.yml"
 [[operation.callers]]
 kind = "script"
 path = "scripts/ci-result-gate.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_rerun.rs"
 
 # --- releases-distribution ---------------------------------------------------
 

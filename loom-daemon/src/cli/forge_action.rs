@@ -136,6 +136,35 @@ pub(crate) enum ForgeAction {
         max_interval: Option<u64>,
     },
 
+    /// `forge rerun <RUN_ID> [--failed]` / `forge rerun --job <JOB_ID>`
+    /// (#10633) — re-run a workflow run, its failed jobs, or one job in
+    /// place, on the writer credential.
+    ///
+    /// Prints exactly one sentinel on stdout — `LOOM-RERUN-OK <run|job> <id>`
+    /// (0), `LOOM-RERUN-DENIED <class> <detail>` (1 for `permission` /
+    /// `credential` / `forbidden`, 2 for `secondary-rate-limit` /
+    /// `rate-limit`), `LOOM-RERUN-ERROR <reason>` (3). A `permission`
+    /// detail names the App permission to grant. See
+    /// `loom_daemon::forge_rerun`.
+    #[command(name = "rerun")]
+    Rerun {
+        /// The workflow run id (omit with `--job`).
+        #[arg(value_name = "RUN_ID", required_unless_present = "job")]
+        run_id: Option<u64>,
+
+        /// Re-run only the run's failed and cancelled jobs.
+        #[arg(long, conflicts_with = "job")]
+        failed: bool,
+
+        /// Re-run one job by id instead of a run.
+        #[arg(long, value_name = "JOB_ID", conflicts_with = "run_id")]
+        job: Option<u64>,
+
+        /// `owner/repo` (default: `LOOM_REPO`, else the `origin` remote).
+        #[arg(long)]
+        repo: Option<String>,
+    },
+
     /// `forge check-claim <issue> [--force-claim]` — the aggregated
     /// pre-flight claim-CAS probe (#9453 Phase 1): "may I claim issue N
     /// **right now**?" Four legs, cheapest-first, short-circuiting on the
@@ -741,6 +770,17 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 max_interval,
             },
         ),
+        ForgeAction::Rerun {
+            run_id,
+            failed,
+            job,
+            repo,
+        } => loom_daemon::forge_rerun::cli_entrypoint(&loom_daemon::forge_rerun::RerunArgs {
+            run_id,
+            failed,
+            job,
+            repo,
+        }),
         ForgeAction::CheckOpenPr { issue } => ForgeCmd::CheckOpenPr { issue },
         ForgeAction::PrCongestion {
             json,
