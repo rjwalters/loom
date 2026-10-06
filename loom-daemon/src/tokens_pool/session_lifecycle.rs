@@ -70,6 +70,12 @@ use super::account_registry::{
     account_inventory, account_matches_reference, AccountDescriptor, AccountProvider,
 };
 use super::health::{self, ProbeEffect, ProbeOutcome};
+use super::session_hold;
+
+// The pass-level health refresh lives in a sibling (file-size ratchet, #7711).
+#[path = "session_health.rs"]
+mod session_health;
+pub use session_health::{refresh_session_health, refresh_session_health_uncached};
 
 /// Default image this lifecycle launches session containers from
 /// (`docker/session/README.md`). Overridable per-invocation (`--image`) for
@@ -555,7 +561,14 @@ pub(crate) fn mark_session_managed(profile: &Path, container_name: &str) -> Resu
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerState {
     pub id: String,
+    /// `true` only when Docker reports the container running AND not
+    /// restarting (issue #10453): while Docker backs off before restarting a
+    /// crashed `--restart unless-stopped` container it reports
+    /// `Running=true, Restarting=true`, and nothing can be exec'd into it.
     pub running: bool,
+    /// Docker's `.State.Restarting` — a crash-looping container between
+    /// restart attempts. Never reused by `start`, never "running".
+    pub restarting: bool,
     pub started_at: Option<String>,
     pub image: Option<String>,
     /// The parity-mounted workspace host path this container was created
@@ -672,17 +685,10 @@ pub trait ContainerRunner {
 pub struct ProcessContainerRunner;
 
 impl ProcessContainerRunner {
+    /// Bounded by [`super::docker_cli::timeout_for`] (issue #10453): a hung
+    /// Docker daemon fails the call instead of stalling the caller forever.
     fn run_capture(args: &[&str]) -> Result<(bool, String, String)> {
-        let output = Command::new("docker")
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .with_context(|| format!("failed to run `docker {}`", args.join(" ")))?;
-        Ok((
-            output.status.success(),
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ))
+        super::docker_cli::run_bounded("docker", args, super::docker_cli::timeout_for(args))
     }
 
     /// The baseline process set the session image's entrypoint establishes:
@@ -712,6 +718,28 @@ impl ProcessContainerRunner {
     }
 }
 
+/// Parse [`ProcessContainerRunner::inspect`]'s tab-separated `--format` line
+/// (`Id, Running, Restarting, StartedAt, Image, workspace label`). A
+/// restarting container is reported as not running (issue #10453).
+#[must_use]
+pub fn parse_inspect_line(stdout: &str) -> Option<ContainerState> {
+    let mut fields = stdout.trim().splitn(6, '\t');
+    let id = fields.next().unwrap_or_default().to_string();
+    let docker_running = fields.next() == Some("true");
+    let restarting = fields.next() == Some("true");
+    let started_at = fields.next().filter(|s| !s.is_empty()).map(str::to_string);
+    let image = fields.next().filter(|s| !s.is_empty()).map(str::to_string);
+    let workspace = fields.next().filter(|s| !s.is_empty()).map(PathBuf::from);
+    (!id.is_empty()).then_some(ContainerState {
+        id,
+        running: docker_running && !restarting,
+        restarting,
+        started_at,
+        image,
+        workspace,
+    })
+}
+
 impl ContainerRunner for ProcessContainerRunner {
     fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
         let label_format = format!("{{{{index .Config.Labels \"{WORKSPACE_LABEL}\"}}}}");
@@ -719,7 +747,7 @@ impl ContainerRunner for ProcessContainerRunner {
             "inspect",
             "--format",
             &format!(
-                "{{{{.Id}}}}\t{{{{.State.Running}}}}\t{{{{.State.StartedAt}}}}\t{{{{.Config.Image}}}}\t{label_format}"
+                "{{{{.Id}}}}\t{{{{.State.Running}}}}\t{{{{.State.Restarting}}}}\t{{{{.State.StartedAt}}}}\t{{{{.Config.Image}}}}\t{label_format}"
             ),
             container,
         ])?;
@@ -729,23 +757,7 @@ impl ContainerRunner for ProcessContainerRunner {
             }
             bail!("docker inspect {container} failed: {}", stderr.trim());
         }
-        let line = stdout.trim();
-        let mut fields = line.splitn(5, '\t');
-        let id = fields.next().unwrap_or_default().to_string();
-        let running = fields.next() == Some("true");
-        let started_at = fields.next().filter(|s| !s.is_empty()).map(str::to_string);
-        let image = fields.next().filter(|s| !s.is_empty()).map(str::to_string);
-        let workspace = fields.next().filter(|s| !s.is_empty()).map(PathBuf::from);
-        if id.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(ContainerState {
-            id,
-            running,
-            started_at,
-            image,
-            workspace,
-        }))
+        Ok(parse_inspect_line(&stdout))
     }
 
     fn create(
@@ -1046,12 +1058,18 @@ pub struct SessionStatus {
     pub name: String,
     pub container_name: String,
     pub running: bool,
+    /// Docker is between restarts of a crashed container (issue #10453);
+    /// `running` is `false` whenever this is `true`.
+    pub restarting: bool,
     pub container_id: Option<String>,
     pub started_at: Option<String>,
     pub image: Option<String>,
     pub codex_home: PathBuf,
     pub mount_path: &'static str,
     pub session_managed: bool,
+    /// An operator `stop` holds this session down; the reconcile pass
+    /// leaves it alone until an operator `start` (issue #10453).
+    pub held: bool,
     /// The parity-mounted workspace this container was started with (Issue
     /// #7389). `None` for a container never started under this feature.
     pub workspace: Option<PathBuf>,
@@ -1106,6 +1124,17 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
         }
     }
 
+    /// The Docker seam this lifecycle drives (the session reconciler reads
+    /// container state through it, issue #10453).
+    pub fn runner(&self) -> &R {
+        &self.runner
+    }
+
+    /// Image a later `create` launches from; `None` restores the default.
+    pub fn set_image(&mut self, image: Option<String>) {
+        self.image = image.unwrap_or_else(|| DEFAULT_SESSION_IMAGE.to_string());
+    }
+
     /// Launch (or reuse, if already running; resume, if stopped-but-present)
     /// the account's session container with no explicit workspace override
     /// (defaults to this [`SessionLifecycle`]'s own resolved `workspace`) —
@@ -1127,10 +1156,52 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
     /// the currently-mounted workspace — a bind mount cannot be changed by
     /// `docker start` without recreating the container, and silently
     /// serving the old mount would be worse than refusing.
+    ///
+    /// An operator start lifts any operator hold `stop` left and records the
+    /// workspace/image it ended up with ([`session_hold`], issue #10453).
     pub fn start_with_workspace(
         &self,
         name: &str,
         workspace: Option<&Path>,
+    ) -> Result<SessionStatus> {
+        let status = self.start_inner(name, workspace, None)?;
+        let workspace = status
+            .workspace
+            .clone()
+            .unwrap_or_else(|| workspace.map_or_else(|| self.workspace.clone(), Path::to_path_buf));
+        let image = status.image.as_deref().unwrap_or(&self.image);
+        session_hold::record_operator_start(
+            &status.codex_home,
+            &workspace,
+            image,
+            session_hold::now_unix_ms(),
+        )?;
+        Ok(SessionStatus {
+            held: false,
+            ..status
+        })
+    }
+
+    /// The automated start the session reconciler uses (issue #10453): like
+    /// [`Self::start_with_workspace`], but it never lifts a hold or records
+    /// an operator choice, and it re-checks `is_held` after inspecting the
+    /// container and before any `docker start`/`run`, failing with
+    /// [`session_hold::OperatorHeld`] — so a `stop` that wrote its hold
+    /// while this was in flight is never undone.
+    pub fn start_unless_held(
+        &self,
+        name: &str,
+        workspace: Option<&Path>,
+        is_held: &dyn Fn() -> bool,
+    ) -> Result<SessionStatus> {
+        self.start_inner(name, workspace, Some(is_held))
+    }
+
+    fn start_inner(
+        &self,
+        name: &str,
+        workspace: Option<&Path>,
+        is_held: Option<&dyn Fn() -> bool>,
     ) -> Result<SessionStatus> {
         let account = find_codex_account(&self.workspace, name)?;
         let name = account.id.name.as_str();
@@ -1144,11 +1215,23 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
                 // Already running: reuse it (idempotent `start`).
                 Self::check_workspace_match(name, &state, &requested_workspace)?;
             }
+            Some(state) if state.restarting => bail!(
+                "session {name:?} ({container}) is restarting — Docker is backing off before \
+                 restarting a crashed container, so it is not reused. Recreate it: \
+                 `loom-daemon accounts session stop {name} --force`, then start it again \
+                 (issue #10453)"
+            ),
             Some(state) => {
                 Self::check_workspace_match(name, &state, &requested_workspace)?;
+                if is_held.is_some_and(|held| held()) {
+                    return Err(session_hold::OperatorHeld.into());
+                }
                 self.runner.start_existing(&container)?;
             }
             None => {
+                if is_held.is_some_and(|held| held()) {
+                    return Err(session_hold::OperatorHeld.into());
+                }
                 ensure_profile_controls(&profile)?;
                 self.runner.create(
                     &container,
@@ -1192,12 +1275,18 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
     /// in-flight `docker exec` is detected, per this module's restart-safety
     /// doc comment. Idempotent: a session that is already stopped/absent is
     /// success, not an error.
+    ///
+    /// A stop is deliberate, so it stays down: an operator hold
+    /// ([`session_hold::HOLD_FILE`]) is written *before* `docker stop`, and
+    /// the session reconciler leaves a held account alone until an operator
+    /// `start` lifts it (issue #10453).
     pub fn stop(&self, name: &str, force: bool) -> Result<SessionStatus> {
         let account = find_codex_account(&self.workspace, name)?;
         let name = account.id.name.as_str();
         let container = container_name(name);
-        if let Some(state) = self.runner.inspect(&container)? {
-            Self::require_host_mode(&state)?;
+        let state = self.runner.inspect(&container)?;
+        if let Some(state) = &state {
+            Self::require_host_mode(state)?;
             if state.running && !force && self.runner.has_active_exec(&container)? {
                 bail!(
                     "session {name:?} has an in-flight `docker exec`; refusing to stop without \
@@ -1206,9 +1295,11 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
                      override."
                 );
             }
+        }
+        session_hold::write_hold(&account.credential_reference, session_hold::now_unix_ms())?;
+        if state.is_some() {
             self.runner.stop_and_remove(&container, STOP_GRACE)?;
         }
-        let _ = &account; // profile currently unused beyond existence-check; kept for symmetry/logging hooks
         self.status(name)
     }
 
@@ -1226,10 +1317,12 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
             name: name.to_string(),
             container_name: container,
             running: state.as_ref().is_some_and(|s| s.running),
+            restarting: state.as_ref().is_some_and(|s| s.restarting),
             container_id: state.as_ref().map(|s| s.id.clone()),
             started_at: state.as_ref().and_then(|s| s.started_at.clone()),
             image: state.as_ref().and_then(|s| s.image.clone()),
             session_managed: is_session_managed(&profile),
+            held: session_hold::held_across(std::slice::from_ref(&profile)),
             mount_path: CONTAINER_CODEX_HOME,
             workspace: state.as_ref().and_then(|s| s.workspace.clone()),
             codex_home: profile,
@@ -1343,6 +1436,17 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
         now: u64,
     ) -> Result<Vec<SessionHealthOutcome>> {
         let ttl = env_u64("LOOM_CODEX_SESSION_PROBE_TTL_SECS", DEFAULT_SESSION_PROBE_TTL_SECS);
+        self.refresh_health_with_ttl(inventory, now, ttl)
+    }
+
+    /// [`Self::refresh_health_at`] with an explicit probe TTL; `0` probes
+    /// every account regardless of how recently it was probed.
+    pub fn refresh_health_with_ttl(
+        &self,
+        inventory: &[AccountDescriptor],
+        now: u64,
+        ttl: u64,
+    ) -> Result<Vec<SessionHealthOutcome>> {
         let mut outcomes = Vec::new();
         for account in inventory.iter().filter(|account| {
             account.id.provider == AccountProvider::Codex
@@ -1403,45 +1507,6 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
-}
-
-fn probe_enabled() -> bool {
-    !matches!(
-        std::env::var("LOOM_CODEX_SESSION_PROBE")
-            .unwrap_or_default()
-            .as_str(),
-        "0" | "false" | "no"
-    )
-}
-
-/// Best-effort proactive auth-state refresh over `inventory`, for callers on
-/// the account-selection path (issue #6927).
-///
-/// Deliberately infallible: a probe is an *optimization* over discovering a
-/// dead refresh chain by dispatching into it, so a probe that cannot run must
-/// never be the reason a dispatch cannot run. It is also a complete no-op —
-/// zero `docker` invocations — when no enabled account is session-managed,
-/// which is every pool that has not opted into session containers, and when
-/// `LOOM_CODEX_SESSION_PROBE` is set to `0`/`false`/`no`.
-pub fn refresh_session_health(
-    workspace: &Path,
-    inventory: &[AccountDescriptor],
-    now: u64,
-) -> Vec<SessionHealthOutcome> {
-    if !probe_enabled() {
-        return Vec::new();
-    }
-    let any_session_managed = inventory.iter().any(|account| {
-        account.id.provider == AccountProvider::Codex
-            && account.enabled
-            && is_session_managed(&account.credential_reference)
-    });
-    if !any_session_managed {
-        return Vec::new();
-    }
-    SessionLifecycle::new(workspace, ProcessContainerRunner, None)
-        .refresh_health_at(inventory, now)
-        .unwrap_or_default()
 }
 
 /// Advisory-only uid check against the session image's fixed uid

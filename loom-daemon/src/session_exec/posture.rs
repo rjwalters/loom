@@ -213,7 +213,8 @@ fn control_drift(docker: &str, container: &str, codex_home: Option<&Path>) -> Co
 pub fn classify(state: &Value) -> Posture {
     // The same "can it take a `docker exec`" rule as the session-state read
     // (#10455): a container Docker is restarting (crash-loop back-off, where
-    // `Running` is also true) is not running.
+    // `Running` is also true) is not running — nothing can be exec'd into it
+    // (#10453).
     if !crate::tokens_pool::session_state::container_running(state) {
         return Posture::NotRunning;
     }

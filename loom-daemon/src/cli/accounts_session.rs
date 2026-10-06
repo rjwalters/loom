@@ -108,7 +108,15 @@ pub(crate) fn handle_session_command(
                 "{}: {} (container={}, id={}, image={}, started_at={}, codex_home={}, \
                  mount={}, session_managed={}, workspace={}, workspace_mode={})",
                 status.name,
-                if status.running { "running" } else { "stopped" },
+                if status.running {
+                    "running"
+                } else if status.restarting {
+                    "restarting"
+                } else if status.held {
+                    "stopped, held (operator stop)"
+                } else {
+                    "stopped"
+                },
                 status.container_name,
                 status.container_id.as_deref().unwrap_or("-"),
                 status.image.as_deref().unwrap_or("-"),
