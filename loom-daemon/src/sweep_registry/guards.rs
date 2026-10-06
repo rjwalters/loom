@@ -850,13 +850,15 @@ impl SweepRegistry {
     /// empty closes-graph still needs the timeline (#7757). Extracted so the
     /// #6058 retry loop above can invoke it more than once.
     fn probe_open_linked_pr_transports(&self, issue: u32) -> OpenPrProbe {
-        let root = &self.config.workspace_root;
-        let listed = self.resolve_owner_repo().and_then(|(owner, repo)| {
-            let (gh, nwo) = (self.resolved_gh(), format!("{owner}/{repo}"));
-            let (caller, bound) = ("guard.open_pr_listing", Some(reap_gh_timeout()));
-            let target = (nwo.as_str(), issue);
-            crate::worktree_ops::linked_pr_listing::probe(caller, &gh, root, None, target, bound)
-        });
+        // Every leg needs the repo, and each answers `ProbeFailed` without it
+        // (#4452): resolve once, so an unresolvable repo costs one call, not three.
+        let Some((owner, repo)) = self.resolve_owner_repo() else {
+            return OpenPrProbe::ProbeFailed;
+        };
+        let (root, gh, nwo) = (&self.config.workspace_root, self.resolved_gh(), format!("{owner}/{repo}"));
+        let (caller, bound) = ("guard.open_pr_listing", Some(reap_gh_timeout()));
+        let target = (nwo.as_str(), issue);
+        let listed = crate::worktree_ops::linked_pr_listing::probe(caller, &gh, root, None, target, bound);
         if let Some(verdict) = listed {
             return verdict;
         }
