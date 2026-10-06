@@ -385,6 +385,13 @@ pub(crate) struct EtaBacktestArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Base half-life, in days, for `land-2026-10-04-fresh-tide` (whichever
+    /// side of the run names it), via `LandFreshTide::with_half_life`. Without
+    /// it the registered 2-day default is used. Lets one snapshot be replayed
+    /// at 1-, 2- and 7-day settings without registering extra ids (#10325).
+    #[arg(long, value_name = "DAYS")]
+    pub half_life_days: Option<f64>,
+
     /// Opt-in `land` cases from merged PRs' label timelines (#9579).
     #[command(flatten)]
     pub pr_cases: PrCaseArgs,
@@ -398,7 +405,13 @@ impl EtaBacktestArgs {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         let registry = Registry::builtin();
-        let Some(heuristic) = registry.get(&self.heuristic) else {
+        let half_life = super::eta_half_life::fresh_tide_override(
+            &self.heuristic,
+            self.compare.as_deref(),
+            self.half_life_days,
+        )?;
+        let pick = |id: &str| super::eta_half_life::pick(&registry, half_life.as_ref(), id);
+        let Some(heuristic) = pick(&self.heuristic) else {
             bail!(
                 "unknown heuristic id {:?} (known: {})",
                 self.heuristic,
@@ -426,7 +439,7 @@ impl EtaBacktestArgs {
         super::eta_replay_cmd::with_replay_calibration(&registry, &mut history, &cases, &loom);
 
         if let Some(other_id) = &self.compare {
-            let Some(other) = registry.get(other_id) else {
+            let Some(other) = pick(other_id) else {
                 bail!("unknown heuristic id {:?} (known: {})", other_id, registry.ids().join(", "));
             };
             let comparison = backtest::compare(heuristic, other, &history, &cases, filter, &loom)?;
