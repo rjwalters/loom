@@ -22,13 +22,18 @@
 //! Like the daemon's issue listing this trusts every `200` (no #7451 shrink
 //! guard): a just-relabelled PR must drop out of the next pass's view.
 //!
-//! The listing uses a fixed set of keys (one per page), but the per-PR read
-//! adds one key per distinct PR ever checked. Those entries store only
-//! `{"mergeable": …}` (never the PR description) under their own `pull-`
-//! file prefix, and both layers drop them [`PULL_ENTRY_MAX_AGE`] after their
-//! last `200` — the same bound as `forge_cached_view`'s `prune_stale`.
+//! The listing uses a fixed set of keys (one per page), but the per-PR reads
+//! add keys per distinct PR ever checked. Those entries store only a reduced
+//! body — `{"mergeable": …}` under the `pull-` file prefix, the changed-file
+//! names under `files-` ([`pull_files_cached_as`], #10382; never the patches)
+//! — and both layers drop them [`PULL_ENTRY_MAX_AGE`] after their last `200`,
+//! the same bound as `forge_cached_view`'s `prune_stale`.
+//!
+//! [`open_pulls_for_head_as`] is the by-head lookup (`pulls?head=owner:branch`,
+//! #10382) — a plain REST read: its callers are rare, and a per-branch ETag
+//! key would grow the cache without bound.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -48,6 +53,14 @@ pub const PULL_ENTRY_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Disk filename prefix of the per-PR entries (the listing uses `listing-`).
 const PULL_PREFIX: &str = "pull-";
+
+/// Disk filename prefix of the per-PR changed-file pages (#10382).
+const FILES_PREFIX: &str = "files-";
+
+/// `GET pulls/{n}/files` stops at 3000 files — 30 pages of [`PER_PAGE`]. A walk
+/// that fills every page cannot tell "exactly 3000" from "truncated", so it
+/// is an error: a silently truncated set could hide an overlap.
+pub const MAX_FILE_PAGES: usize = 30;
 
 /// An open PR as returned by `GET repos/{o}/{r}/pulls`, reduced to the fields
 /// the daemon's reconciliation passes consume.
@@ -93,10 +106,8 @@ pub fn build_pulls_url(repo: Option<&str>, page: usize) -> String {
     )
 }
 
-/// `GET pulls?state=open` has no inventory row yet (the inventory's PR
-/// discovery row is by-head only) — the same marking `pr_planning`'s queue
-/// listing uses (#9831).
-const PR_LIST_OPEN: ForgeOp = ForgeOp::uninventoried("open-PR listing has no inventory row");
+/// `GET pulls?state=open` — the `pr.list-open` inventory row (#10382).
+const PR_LIST_OPEN: ForgeOp = ops::PR_LIST_OPEN;
 
 /// Every open PR of the repo `cwd` resolves to (or `repo_override` /
 /// `LOOM_REPO`), up to `max_pages` pages of [`PER_PAGE`], newest first. Each
@@ -152,6 +163,99 @@ pub fn pull_mergeable_cached_as(
     let site = store::ConditionalRead::new(caller, ops::PR_VIEW_STATE);
     let body = conditional_get(site, gh_bin, cwd, &target, &url, Kind::Pull)?;
     parse_mergeable(&body).with_context(|| format!("parse REST pull JSON from {url}"))
+}
+
+/// The changed-file paths of PR `number`, via conditional
+/// `GET repos/{o}/{r}/pulls/{number}/files` pages (#10382: was the GraphQL
+/// `gh pr view --json files`). Each page is its own ETag'd read, so an
+/// unchanged PR re-reads as free `304`s; paging stops at the first short page.
+///
+/// # Errors
+/// Any failed or unparseable page, or a walk that fills all
+/// [`MAX_FILE_PAGES`] (GitHub's cap — the set may be truncated).
+pub fn pull_files_cached_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    number: u32,
+) -> Result<BTreeSet<String>> {
+    let target = resolve(cwd, repo_override);
+    let repo_path = target.repo.as_deref().unwrap_or("{owner}/{repo}");
+    let mut files = BTreeSet::new();
+    for page in 1..=MAX_FILE_PAGES {
+        let url = format!("repos/{repo_path}/pulls/{number}/files?per_page={PER_PAGE}&page={page}");
+        let site = store::ConditionalRead::new(caller, ops::PR_DIFF_AND_FILES);
+        let body = conditional_get(site, gh_bin, cwd, &target, &url, Kind::Files)?;
+        let batch =
+            parse_files(&body).with_context(|| format!("parse REST files JSON from {url}"))?;
+        let full = batch.len() >= PER_PAGE;
+        files.extend(batch);
+        if !full {
+            return Ok(files);
+        }
+    }
+    Err(anyhow!(
+        "forge_pull_listing: PR #{number} fills all {MAX_FILE_PAGES} pages of changed files \
+         (GitHub's cap); the file set may be truncated"
+    ))
+}
+
+/// The file names of one `GET pulls/{n}/files` page — the REST objects'
+/// `filename`, or the reduced name array a cached entry stores.
+///
+/// # Errors
+/// Malformed JSON.
+pub fn parse_files(body: &str) -> Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Row {
+        Name(String),
+        File { filename: String },
+    }
+    let rows: Vec<Row> = serde_json::from_str(body.trim())?;
+    Ok(rows
+        .into_iter()
+        .map(|r| match r {
+            Row::Name(n) | Row::File { filename: n } => n,
+        })
+        .collect())
+}
+
+/// The open PRs whose head is `branch` in the repo `cwd` resolves to (or
+/// `repo_override` / `LOOM_REPO`), via `GET pulls?head=owner:branch&state=open`
+/// (#10382: was the GraphQL `gh pr list --head`). Rows are re-filtered on
+/// `head.ref == branch` and `state == "open"`: GitHub ignores a `head` it
+/// cannot resolve and returns every open PR, which must not read as a match.
+///
+/// # Errors
+/// A failed or unparseable read — distinct from `Ok(vec![])` ("confirmed no
+/// open PR"), which an inconclusive read must never collapse into (#7863).
+pub fn open_pulls_for_head_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    branch: &str,
+) -> Result<Vec<u32>> {
+    let target = resolve(cwd, repo_override);
+    let repo_path = target.repo.as_deref().unwrap_or("{owner}/{repo}");
+    let owner = repo_path.split('/').next().unwrap_or("{owner}");
+    // `head=` first: a distinct shape from the open listing's `pulls?state=open`.
+    let url =
+        format!("repos/{repo_path}/pulls?head={owner}:{branch}&state=open&per_page={PER_PAGE}");
+    let site = store::ConditionalRead::new(caller, ops::PR_LIST_BY_HEAD);
+    let (status, response, stderr) =
+        store::fetch_conditional(site, gh_bin, cwd, &target, &url, None)?;
+    match response {
+        Some(r) if r.status == 200 && status.success() => Ok(parse_rest_pulls(&r.body)
+            .with_context(|| format!("parse REST pulls JSON from {url}"))?
+            .into_iter()
+            .filter(|p| p.state == "open" && p.head_ref.as_deref() == Some(branch))
+            .map(|p| p.number)
+            .collect()),
+        _ => Err(anyhow!("gh api {url} failed: {stderr}")),
+    }
 }
 
 /// The `mergeable` field of one `GET pulls/{n}` body (absent or `null` ⇒
@@ -242,11 +346,19 @@ fn resolve(cwd: Option<&Path>, repo_override: Option<&str>) -> store::Target {
 }
 
 /// Which cache an entry belongs to: the bounded-key listing pages, or the
-/// per-PR reads (reduced body, age-pruned).
+/// per-PR reads (reduced body, age-pruned) — mergeability or changed files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Listing,
     Pull,
+    Files,
+}
+
+/// The disk prefixes of the age-pruned per-PR entries.
+const PER_PR_PREFIXES: [&str; 2] = [PULL_PREFIX, FILES_PREFIX];
+
+fn is_per_pr_file(name: &str) -> bool {
+    PER_PR_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 /// One conditional `GET url`: the body of the last `200` on a `304`, else the
@@ -266,6 +378,7 @@ fn conditional_get(
     let disk_path = disk_dir.as_deref().map(|d| match kind {
         Kind::Listing => store::entry_path_in(d, &cache_key),
         Kind::Pull => store::entry_path_with_prefix(d, PULL_PREFIX, &cache_key),
+        Kind::Files => store::entry_path_with_prefix(d, FILES_PREFIX, &cache_key),
     });
     let sent = cached_entry(&cache_key, disk_path.as_deref());
     let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
@@ -294,6 +407,9 @@ fn conditional_get(
                     Kind::Pull => parse_mergeable(&r.body)
                         .ok()
                         .map(|m| serde_json::json!({ "mergeable": m }).to_string()),
+                    Kind::Files => parse_files(&r.body)
+                        .ok()
+                        .map(|f| serde_json::json!(f).to_string()),
                 };
                 if let Some(stored) = stored {
                     if let Some(path) = &disk_path {
@@ -307,12 +423,12 @@ fn conditional_get(
                         let entry = CacheEntry {
                             etag,
                             body: Arc::new(stored),
-                            pull_written: (kind == Kind::Pull).then(SystemTime::now),
+                            pull_written: (kind != Kind::Listing).then(SystemTime::now),
                         };
                         guard.insert(cache_key, entry);
                     }
                 }
-                if kind == Kind::Pull {
+                if kind != Kind::Listing {
                     prune_stale_pulls(disk_dir.as_deref(), SystemTime::now());
                 }
             }
@@ -330,14 +446,14 @@ fn conditional_get(
 struct CacheEntry {
     etag: String,
     body: Arc<String>,
-    /// When a per-PR entry's last `200` was stored (`None` for listing pages,
+    /// When a per-PR (`pull-` / `files-`) entry's last `200` was stored (`None` for listing pages,
     /// which are never pruned).
     pull_written: Option<SystemTime>,
 }
 
 /// Drop per-PR entries whose last `200` is more than [`PULL_ENTRY_MAX_AGE`]
 /// before `now`: hot-layer entries by their stored time, disk entries (only
-/// `pull-` files — listing pages share the directory) by mtime.
+/// `pull-` / `files-` files — listing pages share the directory) by mtime.
 fn prune_stale_pulls(disk_dir: Option<&Path>, now: SystemTime) {
     let stale = |t: SystemTime| now.duration_since(t).is_ok_and(|a| a > PULL_ENTRY_MAX_AGE);
     if let Ok(mut guard) = cache().lock() {
@@ -350,7 +466,7 @@ fn prune_stale_pulls(disk_dir: Option<&Path>, now: SystemTime) {
         let name = entry.file_name();
         let is_pull = name
             .to_str()
-            .is_some_and(|n| n.starts_with(PULL_PREFIX) && n.ends_with(".json"));
+            .is_some_and(|n| is_per_pr_file(n) && n.ends_with(".json"));
         let old = || entry.metadata().and_then(|m| m.modified()).is_ok_and(stale);
         if is_pull && old() {
             let _ = std::fs::remove_file(entry.path());
@@ -369,7 +485,7 @@ fn cached_entry(key: &str, disk: Option<&Path>) -> Option<CacheEntry> {
     let is_pull = disk
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with(PULL_PREFIX));
+        .is_some_and(is_per_pr_file);
     // A promoted per-PR entry keeps its disk age, so promotion never resets it.
     let written = std::fs::metadata(disk).and_then(|m| m.modified()).ok();
     let entry = CacheEntry {

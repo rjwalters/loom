@@ -262,3 +262,163 @@ fn a_per_pr_entry_stores_only_mergeable_and_stale_ones_are_pruned() {
     cache().lock().unwrap().remove(&hot_key);
     cache().lock().unwrap().remove(&listing_key);
 }
+
+/// A fake `gh` for `pulls/<n>/files` pages (#10382): pages `1..=full_pages`
+/// carry [`PER_PAGE`] files each, the next page one file. Each page has its
+/// own ETag and answers `304` when that ETag is presented. `pulls?head=`
+/// answers with `head_rows`.
+fn write_files_gh(dir: &Path, full_pages: usize, head_rows: &str) -> (PathBuf, PathBuf) {
+    let log = dir.join("gh.log");
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *'pulls?head='*)
+    printf 'HTTP/2.0 200 OK\r\n\r\n'
+    echo '{head_rows}'
+    exit 0 ;;
+esac
+p="${{3##*page=}}"
+case "$*" in
+  *"If-None-Match: W/\"f$p\""*)
+    printf 'HTTP/2.0 304 Not Modified\r\n\r\n'
+    exit 1 ;;
+esac
+printf 'HTTP/2.0 200 OK\r\nEtag: W/"f%s"\r\n\r\n' "$p"
+if [ "$p" -le {full_pages} ]; then n={per_page}; else n=1; fi
+i=0; sep='['
+while [ "$i" -lt "$n" ]; do
+  printf '%s{{"filename":"p%s/f%s.rs","patch":"@@ big"}}' "$sep" "$p" "$i"; sep=','; i=$((i+1))
+done
+echo ']'
+"#,
+        log = log.display(),
+        per_page = PER_PAGE,
+    );
+    let bin = dir.join("fake-files-gh.sh");
+    std::fs::write(&bin, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    (bin, log)
+}
+
+#[test]
+fn file_rows_parse_from_rest_objects_and_the_reduced_name_array() {
+    let rest = r#"[{"filename":"a.rs","status":"modified","patch":"@@"},{"filename":"b.md"}]"#;
+    assert_eq!(parse_files(rest).unwrap(), vec!["a.rs", "b.md"]);
+    assert_eq!(parse_files(r#"["a.rs","b.md"]"#).unwrap(), vec!["a.rs", "b.md"]);
+    assert!(parse_files(r#"{"message":"Not Found"}"#).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn changed_files_page_until_a_short_page_and_union_the_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let (gh, log) = write_files_gh(dir.path(), 1, "[]");
+    let files = pull_files_cached_as("test", &gh, Some(dir.path()), None, 7).unwrap();
+    assert_eq!(files.len(), PER_PAGE + 1);
+    assert!(files.contains("p1/f0.rs") && files.contains("p2/f0.rs"), "{files:?}");
+    let lines = log_lines(&log);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].contains("pulls/7/files?per_page=100&page=1"), "{lines:?}");
+    assert!(lines[1].contains("pulls/7/files?per_page=100&page=2"), "{lines:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_walk_that_fills_githubs_file_cap_is_an_error_not_a_truncated_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let (gh, log) = write_files_gh(dir.path(), MAX_FILE_PAGES, "[]");
+    let err = pull_files_cached_as("test", &gh, Some(dir.path()), None, 8).unwrap_err();
+    assert!(err.to_string().contains("truncated"), "{err}");
+    assert_eq!(log_lines(&log).len(), MAX_FILE_PAGES, "never reads past the cap");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_files_entry_stores_only_names_serves_a_304_and_is_age_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("store");
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&store_dir)
+            .unwrap();
+    }
+    store::set_test_daemon_store_dir(Some(store_dir.clone()));
+    let _guard = StoreGuard;
+    let old = SystemTime::now() - PULL_ENTRY_MAX_AGE - Duration::from_secs(60);
+    let stale = store_dir.join(format!("{FILES_PREFIX}00000000deadbeef.json"));
+    let old_listing = store_dir.join("listing-00000000feedface.json");
+    for p in [&stale, &old_listing] {
+        std::fs::write(p, r#"{"etag":"W/\"x\"","body":"[]"}"#).unwrap();
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        f.set_modified(old).unwrap();
+    }
+
+    let (gh, log) = write_files_gh(dir.path(), 0, "[]");
+    let first = pull_files_cached_as("test", &gh, Some(dir.path()), None, 9).unwrap();
+    assert!(!stale.exists(), "a files- entry past the max age is pruned");
+    assert!(old_listing.exists(), "listing pages are never age-pruned");
+
+    let written: Vec<_> = std::fs::read_dir(&store_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p != &old_listing)
+        .collect();
+    assert_eq!(written.len(), 1, "{written:?}");
+    let name = written[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert!(name.starts_with(FILES_PREFIX), "{name}");
+    let entry = store::read_disk_entry(&written[0]).unwrap();
+    assert_eq!(entry.body, r#"["p1/f0.rs"]"#, "names only, never the patch");
+
+    // A second read presents the ETag; the 304 serves the reduced body.
+    let second = pull_files_cached_as("test", &gh, Some(dir.path()), None, 9).unwrap();
+    assert_eq!(first, second);
+    let lines = log_lines(&log);
+    assert!(lines[1].contains(r#"If-None-Match: W/"f1""#), "{lines:?}");
+    cache().lock().unwrap().retain(|_, e| e.etag != r#"W/"f1""#);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_by_head_lookup_keeps_only_open_rows_on_that_exact_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    // GitHub ignores a `head` it cannot resolve and lists every open PR.
+    let rows = r#"[{"number":1,"state":"open","head":{"ref":"main"}},
+{"number":2,"state":"open","head":{"ref":"feature/issue-5"}},
+{"number":3,"state":"closed","head":{"ref":"feature/issue-5"}},
+{"number":4,"state":"open","head":{"ref":"feature/issue-50"}}]"#
+        .replace('\n', "");
+    let (gh, log) = write_files_gh(dir.path(), 0, &rows);
+    let prs = open_pulls_for_head_as("test", &gh, Some(dir.path()), Some("o/r"), "feature/issue-5");
+    assert_eq!(prs.unwrap(), vec![2]);
+    let lines = log_lines(&log);
+    assert!(
+        lines[0].contains("repos/o/r/pulls?head=o:feature/issue-5&state=open&per_page=100"),
+        "{lines:?}"
+    );
+    assert!(!lines[0].contains("If-None-Match"), "{lines:?}");
+
+    let (gh, _) = write_files_gh(dir.path(), 0, "[]");
+    let none = open_pulls_for_head_as("test", &gh, Some(dir.path()), Some("o/r"), "feature/x");
+    assert_eq!(none.unwrap(), Vec::<u32>::new(), "a definitive empty answer");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_by_head_lookup_is_an_error_never_an_empty_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (gh, _) = write_fake_gh(dir.path(), 0); // falls to its HTTP 502 arm
+    let err = open_pulls_for_head_as("test", &gh, Some(dir.path()), Some("o/r"), "feature/x");
+    assert!(err.unwrap_err().to_string().contains("HTTP 502"));
+}

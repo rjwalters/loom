@@ -191,7 +191,10 @@ fn worktree_ops_probes_are_counted_and_keep_their_classification() {
 #[test]
 fn reclaim_open_pr_probe_is_counted() {
     let tmp = tempfile::tempdir().unwrap();
-    let gh = stub(tmp.path(), "gh-pr", "echo '[{\"number\":12}]'");
+    // #10382: REST `pulls?head=` — a row on another head is filtered out.
+    let json = r#"[{"number":11,"state":"open","head":{"ref":"main"}},{"number":12,"state":"open","head":{"ref":"feature/issue-5"}}]"#;
+    let body = format!("printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'; echo '{json}'");
+    let gh = stub(tmp.path(), "gh-pr", &body);
     let mut pr = None;
     let rows = rows_after(|| {
         pr = Some(crate::reclaim_pr_warning::open_pr_on_issue_branch(&gh, tmp.path(), 5));

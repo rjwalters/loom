@@ -47,6 +47,16 @@ fn calls_matching(log: &Path, needle: &str) -> usize {
         .count()
 }
 
+/// Live reads of predecessor PR #1 (`pulls/1`, not its REST `/files` pages,
+/// #10382).
+fn pred_reads(log: &Path) -> usize {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("pulls/1") && !l.contains("/files?"))
+        .count()
+}
+
 /// Run `f` with this thread's caching on and `env` cleared, restoring both.
 fn cached_without(env: &str, f: impl FnOnce()) {
     let prev = std::env::var(env).ok();
@@ -139,7 +149,7 @@ fn an_unchanged_hold_reads_its_marker_and_predecessor_once() {
         sha(2)
     );
     let body = format!(
-        r#"{pulls}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo '{{"files":[{{"path":"src/a.rs"}}]}}'; exit 0; fi
+        r#"{pulls}case "$*" in *'/files?'*) printf 'HTTP/2.0 200 OK\r\n\r\n'; echo '[{{"filename":"src/a.rs"}}]'; exit 0 ;; esac
 case "$*" in
   *issues/2/comments*) echo '{c2}' ;;
   *pulls/1*) echo '{{"state":"open","merged":false,"head":{{"sha":"{s1}"}}}}' ;;
@@ -158,14 +168,14 @@ esac"#,
             assert_eq!(stats.held, 1, "the hold stays in place");
         }
         assert_eq!(calls_matching(&log, "issues/2/comments"), 1, "3 passes, 1 marker walk");
-        assert_eq!(calls_matching(&log, "pulls/1"), 1, "3 passes, 1 predecessor read");
+        assert_eq!(pred_reads(&log), 1, "3 passes, 1 predecessor read");
 
         // Activity on both PRs: exactly one more read of each.
         std::fs::write(&updated, "2026-10-04T00:05:00Z").unwrap();
         reconcile_merge_sequences(&gh, &root);
         reconcile_merge_sequences(&gh, &root);
         assert_eq!(calls_matching(&log, "issues/2/comments"), 2);
-        assert_eq!(calls_matching(&log, "pulls/1"), 2);
+        assert_eq!(pred_reads(&log), 2);
     });
 }
 
@@ -205,7 +215,7 @@ fn a_predecessor_outside_the_listing_is_never_served_from_cache() {
         d = dir.path().display()
     );
     let body = format!(
-        r#"{pulls}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo '{{"files":[{{"path":"src/a.rs"}}]}}'; exit 0; fi
+        r#"{pulls}case "$*" in *'/files?'*) printf 'HTTP/2.0 200 OK\r\n\r\n'; echo '[{{"filename":"src/a.rs"}}]'; exit 0 ;; esac
 case "$*" in
   *issues/2/comments*) echo '{c2}' ;;
   *pulls/1*)
@@ -234,18 +244,18 @@ esac"#,
         for pass in 1..=3 {
             let stats = reconcile_merge_sequences(&gh, &root);
             assert_eq!(stats.released, 1, "pass {pass}: the hold is released");
-            assert_eq!(calls_matching(&log, "pulls/1"), pass, "pass {pass}: one live read");
+            assert_eq!(pred_reads(&log), pass, "pass {pass}: one live read");
         }
 
         // Listed + open: cached by `updatedAt@head` after the first read.
         flag("merged", false);
         flag("listed", true);
-        let before = calls_matching(&log, "pulls/1");
+        let before = pred_reads(&log);
         for _ in 0..3 {
             let stats = reconcile_merge_sequences(&gh, &root);
             assert_eq!((stats.released, stats.held), (0, 1));
         }
-        assert_eq!(calls_matching(&log, "pulls/1"), before + 1, "listed: read once");
+        assert_eq!(pred_reads(&log), before + 1, "listed: read once");
 
         // Dropped from the listing and merged: the cached "open" must not be
         // served — a live re-read releases the hold.
@@ -253,7 +263,7 @@ esac"#,
         flag("merged", true);
         let stats = reconcile_merge_sequences(&gh, &root);
         assert_eq!(stats.released, 1, "an unlisted predecessor is re-read live");
-        assert_eq!(calls_matching(&log, "pulls/1"), before + 2);
+        assert_eq!(pred_reads(&log), before + 2);
     });
     assert_eq!(HOLD_MARKER.max_age, CLAIM_MAX_AGE);
     assert_eq!(PREDECESSOR.max_age, CLAIM_MAX_AGE);
