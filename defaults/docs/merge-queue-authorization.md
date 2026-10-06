@@ -79,9 +79,15 @@ then, only on `LOOM-MERGE-QUEUE-CONTINUE`, `handoff`. The Champion falls
 through to the unchanged direct `merge-pr.sh` call **only** when the first line
 is `LOOM-MERGE-QUEUE-DIRECT` on stdout with exit 0. A daemon that predates the
 `step` verb can already honor `champion.mergeMode=queue`, so an unrecognized
-subcommand is NOT permission to merge directly. Every other result (queued,
-dropped, merged, undetermined, invalid mode, unknown verb, empty output) sets `MERGE_RC=7`: nothing merged, the PR stays
-approved, no direct merge. Because the Champion never calls `merge-pr.sh` in
+subcommand alone is NOT permission to merge directly. #10628 allows the
+pre-#10256 direct merge, logged as `LOOM-MERGE-QUEUE-COMPAT`, only when direct
+mode is *proven*: the same binary's `forge merge-queue mode` prints
+`mode=direct`, or the binary has no `merge-queue` verb at all and so predates
+merge modes. Every other result (queued, dropped, merged, undetermined, invalid
+mode, unprovable mode, empty output) sets `MERGE_RC=7`: nothing merged, the PR
+stays approved, no direct merge. The non-queue 7s are surfaced as
+`CHAMPION-MERGE-QUEUE-STALL` plus one head-keyed PR notice. See
+`merge-pr-exit-code-exceptions.md` → "Exit 7". Because the Champion never calls `merge-pr.sh` in
 queue mode, the direct re-date remedy is never run there. Failure mode guarded:
 a queue-mode PR merged directly, bypassing the authorization protocol.
 
