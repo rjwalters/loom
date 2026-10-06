@@ -895,8 +895,9 @@ impl<'a> Evaluator<'a> {
             .collect();
         let materialized = edges::descendants(&roots, &structural, MAX_INHERIT_DEPTH);
         let mut unreached: BTreeMap<u32, Evaluated> = BTreeMap::new();
-        // (issue, root, starred_at) for each starred issue the pass reaches
-        // by a recorded link: its open PR inherits the star too.
+        // (issue, root, starred_at) for each starred row this pass keeps — a
+        // root, a child reached by a recorded link, or an inherited star kept
+        // without being walked: its open PR inherits the star too.
         let mut pr_targets: Vec<(u32, u32, Option<String>)> = Vec::new();
         for r in &roots {
             let carries = issues.iter().any(|i| {
@@ -914,6 +915,10 @@ impl<'a> Evaluator<'a> {
             };
             if let Some(m) = materialized.get(&n) {
                 pr_targets.push((n, m.root, m.starred_at.clone()));
+            } else if let Some(&root) = classified.held.get(&n) {
+                // Reached only by a landing edge, but it carries an inherited
+                // star of its own: the PR names that star's root.
+                pr_targets.push((n, root, e.starred_at.clone()));
             }
             if let Some(m) = materialized.get(&n).filter(|_| {
                 self.propagate
@@ -935,6 +940,56 @@ impl<'a> Evaluator<'a> {
             super::landing::withhold_inherited_handoff(&e.facts, &mut e.landing, inh.via, inh.root);
             out.push(e);
         }
+        // An inherited star nothing reaches: removed when its root lost its
+        // star and the walk saw everything, else kept as a starred row.
+        let listed: BTreeSet<u32> = issues.iter().map(|i| i.number).collect();
+        let roots_at: BTreeMap<u32, Option<String>> = roots
+            .iter()
+            .map(|r| (r.number, r.starred_at.clone()))
+            .collect();
+        for i in &issues {
+            let n = i.number;
+            if classified.roots.contains(&n) || inherited.contains_key(&n) {
+                continue;
+            }
+            // The kept row's PR inherits the star from the same root its own
+            // marker names — never from the child as a new root (#10591).
+            let mut pr_root = classified.held.get(&n).copied();
+            if let Some(&root) = classified.orphaned.get(&n) {
+                // Only an orphaned star a still-starred parent keeps passes
+                // its star on; one kept only because the walk was incomplete
+                // is on its way out.
+                let wants_pr = self.propagate
+                    && self
+                        .prs_by_issue
+                        .get(&n)
+                        .is_some_and(|pr| !pr.labels.iter().any(|l| l == OPERATOR_PRIORITY_LABEL));
+                let parent_starred =
+                    (walk_complete || wants_pr) && self.has_starred_parent(i, &listed);
+                if walk_complete && !parent_starred {
+                    self.plan
+                        .removes
+                        .push(materialize::Remove { child: n, root });
+                    continue;
+                }
+                if parent_starred {
+                    pr_root = Some(root);
+                }
+            }
+            let e = match unreached.remove(&n) {
+                Some(e) => e,
+                None => self.evaluate_one(i, None, None),
+            };
+            if let Some(root) = pr_root {
+                let at = roots_at
+                    .get(&root)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| e.starred_at.clone());
+                pr_targets.push((n, root, at));
+            }
+            out.push(e);
+        }
         if self.propagate {
             let mut planned: BTreeSet<u32> = BTreeSet::new();
             for (n, root, starred_at) in pr_targets {
@@ -954,28 +1009,6 @@ impl<'a> Evaluator<'a> {
             }
         }
         self.plan.adds.sort_by_key(|a| a.child);
-        // An inherited star nothing reaches: removed when its root lost its
-        // star and the walk saw everything, else kept as a starred row.
-        let listed: BTreeSet<u32> = issues.iter().map(|i| i.number).collect();
-        for i in &issues {
-            let n = i.number;
-            if classified.roots.contains(&n) || inherited.contains_key(&n) {
-                continue;
-            }
-            if let Some(&root) = classified.orphaned.get(&n) {
-                if walk_complete && !self.has_starred_parent(i, &listed) {
-                    self.plan
-                        .removes
-                        .push(materialize::Remove { child: n, root });
-                    continue;
-                }
-            }
-            let e = match unreached.remove(&n) {
-                Some(e) => e,
-                None => self.evaluate_one(i, None, None),
-            };
-            out.push(e);
-        }
         // An inherited PR star whose root lost its star, whose linked issue
         // is neither starred nor inherited (an issue this pass is taking the
         // star off counts as neither), after a complete walk. A star the
