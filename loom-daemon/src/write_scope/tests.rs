@@ -826,6 +826,7 @@ fn daemon_write_paths_are_scoped() {
             Via(DISPATCH, "runs inside a dispatched sweep"),
         ),
         ("merge_pr/redate.rs", ShellVetted("merge-pr.sh")),
+        ("merge_pr/redate/sync_handoff.rs", ShellVetted("merge-pr.sh")),
         (
             "forge_cmd.rs",
             Via("cli/forge_action.rs", "every writing forge verb is vetted first"),
