@@ -10,26 +10,19 @@
 //! command names them and prints the manual recreate.
 //!
 //! Best-effort by contract: nothing here returns an error, and a host with no
-//! session-managed profile costs **zero** docker calls. The only docker call
-//! is [`inspect_containers`]; everything else is pure over its inspect
-//! objects, so it can be swapped for the daemon's container snapshot.
+//! session-managed profile costs **zero** docker calls. The only I/O is one
+//! bounded [`session_state::snapshot`] (a CLI process has no published
+//! snapshot to reuse); [`report_from`] is pure over it. A snapshot docker
+//! could not answer is reported as "not checked", never as drift.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use super::session_lifecycle::SESSION_MARKER_FILE;
-use super::session_state::{mount_drift, workspace_label, MountDrift};
-
-/// Upper bound on the one `docker inspect`: a wedged engine must not hang
-/// `workspace add`.
-const INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Session container name prefix (`session_lifecycle::container_name`).
-const CONTAINER_PREFIX: &str = "loom-codex-session-";
+use super::session_state::{
+    self, mount_drift, workspace_label, MountDrift, Snapshot, CONTAINER_PREFIX,
+};
 
 /// One host-mode session container whose mounts no longer match the registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,62 +54,16 @@ pub fn session_containers(profile_root: &Path) -> Vec<String> {
     containers
 }
 
-/// The one docker call: `docker inspect` of every container in `containers`
-/// at once. Missing containers are simply absent from the result (docker
-/// still prints the ones it found); any failure to ask yields nothing.
-#[must_use]
-pub fn inspect_containers(docker: &str, containers: &[String]) -> Vec<Value> {
-    if containers.is_empty() {
-        return Vec::new();
-    }
-    let Ok(mut child) = Command::new(docker)
-        .args(["inspect", "--type", "container"])
-        .args(containers)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return Vec::new();
-    };
-    let Some(mut stdout) = child.stdout.take() else {
-        return Vec::new();
-    };
-    // Read on a thread so a large inspect cannot fill the pipe and stall the
-    // child while the deadline loop waits on it.
-    let reader = std::thread::spawn(move || {
-        let mut text = Vec::new();
-        let _ = stdout.read_to_end(&mut text);
-        text
-    });
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() < INSPECT_TIMEOUT => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Vec::new();
-            }
-        }
-    }
-    let text = reader.join().unwrap_or_default();
-    match serde_json::from_slice::<Value>(&text) {
-        Ok(Value::Array(objects)) => objects,
-        _ => Vec::new(),
-    }
-}
-
 /// The drifted host-mode session containers among `objects` (inspect
 /// objects) against `registered`. Pure. Private-clone containers and those
 /// without a workspace label get no verdict, so never appear.
 #[must_use]
-pub fn drifted(objects: &[Value], registered: &[PathBuf]) -> Vec<DriftedSession> {
+pub fn drifted<'a>(
+    objects: impl IntoIterator<Item = &'a Value>,
+    registered: &[PathBuf],
+) -> Vec<DriftedSession> {
     objects
-        .iter()
+        .into_iter()
         .filter_map(|state| {
             let container = state["Name"].as_str()?.trim_start_matches('/').to_string();
             let account = container.strip_prefix(CONTAINER_PREFIX)?.to_string();
@@ -180,16 +127,34 @@ pub fn report_lines(drifted: &[DriftedSession]) -> Vec<String> {
     lines
 }
 
+/// The report for one `snapshot` of the session containers. Pure.
+#[must_use]
+pub fn report_from(snapshot: &Snapshot, registered: &[PathBuf]) -> Vec<String> {
+    match snapshot {
+        Snapshot::Available(map) => {
+            report_lines(&drifted(map.values().map(|observed| &observed.inspect), registered))
+        }
+        Snapshot::Unavailable(reason) => vec![format!(
+            "  Codex session containers were not checked for mount drift: docker could not be \
+             queried ({reason}). Check them with `loom-daemon accounts session status <account>`."
+        )],
+    }
+}
+
 /// Everything above for one registry change. `profile_root` is the Codex
 /// profile root (`None` when disabled). Zero docker calls unless a profile is
-/// session-managed.
+/// session-managed; otherwise one bounded snapshot.
 #[must_use]
 pub fn report(profile_root: Option<&Path>, docker: &str, registered: &[PathBuf]) -> Vec<String> {
-    let containers = profile_root.map(session_containers).unwrap_or_default();
-    if containers.is_empty() {
+    if profile_root
+        .map(session_containers)
+        .unwrap_or_default()
+        .is_empty()
+    {
         return Vec::new();
     }
-    report_lines(&drifted(&inspect_containers(docker, &containers), registered))
+    let snapshot = session_state::snapshot(docker, registered, session_state::SNAPSHOT_DEADLINE);
+    report_from(&snapshot, registered)
 }
 
 #[cfg(test)]
@@ -226,7 +191,8 @@ mod tests {
         .unwrap();
     }
 
-    /// A fake docker that records each invocation and prints `inspect`.
+    /// A fake docker that records each invocation, lists every session
+    /// container for `ps` and prints `inspect` for `inspect`.
     fn fake_docker(dir: &Path, inspect: &str) -> (String, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let calls = dir.join("calls.log");
@@ -236,7 +202,9 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\ncat '{}'\n",
+                "#!/bin/sh\necho \"$1\" >> '{}'\ncase \"$1\" in\n  ps) printf \
+                 'loom-codex-session-agent-1\\nloom-codex-session-agent-2\\n\
+                 loom-codex-session-agent-3\\n' ;;\n  *) cat '{}' ;;\nesac\n",
                 calls.display(),
                 payload.display()
             ),
@@ -271,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn one_docker_call_reports_drifted_host_containers_only() {
+    fn one_snapshot_reports_drifted_host_containers_only() {
         let (_tmp, root) = canonical_tempdir();
         let ws = root.join("ws");
         for repo in ["a", "new"] {
@@ -306,7 +274,8 @@ mod tests {
         let registered = vec![ws.join("a"), ws.join("new")];
         let lines = report(Some(&profiles), &docker, &registered);
         let text = lines.join("\n");
-        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+        // One bounded snapshot: `ps` plus a single `inspect` of every container.
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "ps\ninspect\n");
         assert!(text.contains("loom-codex-session-agent-1"), "{text}");
         assert!(!text.contains("loom-codex-session-agent-2"), "{text}");
         assert!(!text.contains("loom-codex-session-agent-3"), "{text}");
@@ -332,6 +301,7 @@ mod tests {
             &[ws.join("a"), ws.join("gone")],
         )];
         let found = drifted(&objects, &[ws.join("a")]);
+        assert_eq!(found[0].account, "agent-1");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].drift.extra, vec![ws.join("gone")]);
         let text = report_lines(&found).join("\n");
@@ -339,14 +309,17 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_or_garbled_docker_is_best_effort() {
+    fn an_unavailable_docker_is_reported_as_unchecked_never_as_drift() {
         let (_tmp, root) = canonical_tempdir();
         let profiles = root.join("profiles");
         mark(&profiles, "1", "loom-codex-session-agent-1");
-        assert!(
-            report(Some(&profiles), &root.join("no-docker").display().to_string(), &[]).is_empty()
-        );
-        let (docker, _calls) = fake_docker(&root, "not json");
-        assert!(report(Some(&profiles), &docker, &[]).is_empty());
+        for docker in [
+            root.join("no-docker").display().to_string(),
+            fake_docker(&root, "not json").0,
+        ] {
+            let lines = report(Some(&profiles), &docker, &[]);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].contains("not checked for mount drift"), "{lines:?}");
+        }
     }
 }

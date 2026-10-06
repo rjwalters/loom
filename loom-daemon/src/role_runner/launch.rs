@@ -292,7 +292,10 @@ pub(super) fn run_role_with_timeout(
                 if let Some(reason) = session_down::reason_in(&full_log, &tick_anchor)
                     .or_else(|| session_mount_stale::reason_in(&full_log, &tick_anchor))
                 {
-                    log::warn!("role_runner: role={role} {reason}");
+                    // No per-tick WARN here (#10455 N2): the failure goes
+                    // through the per-root edge/repeat machine like any other,
+                    // and the undemoted signal is the per-account container
+                    // WARN in `observability::ops::codex_session`.
                     return RoleTickOutcome::Failure(format!(
                         "{reason}: `{}` exited with {status}: {detail}",
                         script.display()

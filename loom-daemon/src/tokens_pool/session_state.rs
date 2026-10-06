@@ -1,27 +1,57 @@
-//! The state of one account's Codex session container, as the daemon's
-//! visibility surfaces see it (#10455; Epic #10452).
+//! The state of every account's Codex session container, as the daemon sees
+//! it (#10455; Epic #10452).
 //!
-//! One small read shared by the SigNoz gauge (`loom.codex_session.state`) and
-//! the WARN-on-change tracker, so "is this account's container down" has one
-//! definition. [`classify_inspect`] is pure over a `docker inspect` object;
-//! [`read`] asks docker.
+//! One read shared by every consumer of "is this account's container usable":
+//! the SigNoz gauge and WARN tracker (`observability::ops::codex_session`,
+//! #10455), the spawn-time posture check (`session_exec::posture::classify`),
+//! and, by design, the reconciler (#10453), liveness-aware selection (#10454)
+//! and mount-drift detection (#10364). It has two layers:
 //!
-//! * `running` — the container is up and mounts every registered workspace
-//!   root under the workspace it was created for.
+//! * [`classify_inspect`] and [`container_running`] are **pure** over one
+//!   `docker inspect` object, so every caller classifies the same way.
+//! * [`snapshot`] is the **only I/O**: one bounded pass that reads every
+//!   `loom-codex-session-*` container at once (`docker ps -a` plus a single
+//!   `docker inspect` of the names it found, never one call per account) and
+//!   returns a [`Snapshot`]. The daemon's watch loop publishes each snapshot
+//!   with [`publish`]; [`latest`] hands it to readers that must not fork
+//!   docker themselves (the dispatch-selection path).
+//!
+//! ## States
+//!
+//! * `running` — up, and mounts every registered workspace root under the
+//!   workspace it was created for.
 //! * `stopped` — it exists but `State.Running` is false.
-//! * `missing` — no container by that name (or docker could not be asked).
-//! * `stale_mounts` — it is running but its workspace mounts differ from
-//!   what `session start` would mount today ([`mount_drift`], #10364): it
-//!   lacks a registered root under its own workspace label (a repository
-//!   registered after it was created), **or** it still mounts one that is no
-//!   longer registered (a deregistered repository, which Codex can still
-//!   write with its own sandbox off, #9979).
+//! * `restarting` — Docker reports `State.Restarting` (a crash loop backing off
+//!   under `--restart unless-stopped`). Docker sets `Running=true` as well, so
+//!   this is checked first; it is down, never `running` or `stale_mounts`.
+//! * `missing` — a successful snapshot holds no container by that name.
+//! * `stale_mounts` — running but its workspace mounts differ from what
+//!   `session start` would mount today ([`mount_drift`], #10364): it lacks a
+//!   registered root under its own workspace label (a repository registered
+//!   after it was created), **or** it still mounts one that is no longer
+//!   registered (a deregistered repository, which Codex can still write with
+//!   its own sandbox off, #9979). A private-clone container
+//!   (`loom.workspace-mode=private-clone`) mounts one repository volume, not
+//!   the registry, so it never gets a drift verdict.
 //!
-//! A private-clone container (`loom.workspace-mode=private-clone`) mounts one
-//! repository volume, not the registry, so it never gets a drift verdict.
+//! ## "Not found" is not "could not ask"
+//!
+//! [`Snapshot::Unavailable`] means docker could not be queried at all: the CLI
+//! is not on PATH, the Docker daemon is unreachable (Docker Desktop down), the
+//! output did not parse, or the [`SNAPSHOT_DEADLINE`] expired (a wedged Docker
+//! Desktop). It says **nothing** about any container. Every caller fails OPEN
+//! on it: the visibility tracker holds its last state and emits no gauge;
+//! #10454's selection must treat it as "cannot observe", i.e. Ungated, the
+//! same rule `runtime_preference/availability.rs` applies to an unreadable
+//! signal. Only an account absent from an [`Snapshot::Available`] map is
+//! `missing`.
 
+use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -30,20 +60,33 @@ use super::session_lifecycle::{
     WORKSPACE_LABEL,
 };
 
+/// The name prefix every session container carries
+/// (`session_lifecycle::container_name`).
+pub const CONTAINER_PREFIX: &str = "loom-codex-session-";
+
+/// Hard deadline for one [`snapshot`] (both docker calls together). On expiry
+/// the docker child is killed and the snapshot is [`Snapshot::Unavailable`].
+pub const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(8);
+
+/// Upper bound on the bytes read from one docker call's stdout.
+const MAX_OUTPUT_BYTES: u64 = 16 * 1024 * 1024;
+
 /// What an account's session container is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SessionState {
     Running,
     Stopped,
+    Restarting,
     Missing,
     StaleMounts,
 }
 
 impl SessionState {
     /// Every state, in the order the gauge emits them.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Running,
         Self::Stopped,
+        Self::Restarting,
         Self::Missing,
         Self::StaleMounts,
     ];
@@ -54,6 +97,7 @@ impl SessionState {
         match self {
             Self::Running => "running",
             Self::Stopped => "stopped",
+            Self::Restarting => "restarting",
             Self::Missing => "missing",
             Self::StaleMounts => "stale_mounts",
         }
@@ -62,7 +106,7 @@ impl SessionState {
     /// Whether dispatch into the container can work at all.
     #[must_use]
     pub fn is_down(self) -> bool {
-        matches!(self, Self::Stopped | Self::Missing)
+        matches!(self, Self::Stopped | Self::Restarting | Self::Missing)
     }
 }
 
@@ -209,6 +253,15 @@ pub fn workdir_unmounted(state: &Value, workdir: &str) -> bool {
     !is_private_clone(state) && !crate::session_exec::posture::mounted(state, workdir)
 }
 
+/// Whether one `docker inspect` object is a container that can take a
+/// `docker exec`: `State.Running` and not `State.Restarting`. The single
+/// definition shared by [`classify_inspect`] and the spawn-time posture check.
+#[must_use]
+pub fn container_running(state: &Value) -> bool {
+    state["State"]["Running"] == Value::Bool(true)
+        && state["State"]["Restarting"] != Value::Bool(true)
+}
+
 /// Classify one `docker inspect` object (`None`: no such container) against
 /// the daemon's registered workspace roots.
 #[must_use]
@@ -216,7 +269,10 @@ pub fn classify_inspect(state: Option<&Value>, registered: &[PathBuf]) -> Sessio
     let Some(state) = state else {
         return SessionState::Missing;
     };
-    if state["State"]["Running"] != Value::Bool(true) {
+    if state["State"]["Restarting"] == Value::Bool(true) {
+        return SessionState::Restarting;
+    }
+    if !container_running(state) {
         return SessionState::Stopped;
     }
     if mount_drift(state, registered).is_empty() {
@@ -226,23 +282,214 @@ pub fn classify_inspect(state: Option<&Value>, registered: &[PathBuf]) -> Sessio
     }
 }
 
-/// Ask docker about `container`. A failure to ask at all reads as `Missing`:
-/// from the daemon's side the container is not usable either way.
-#[must_use]
-pub fn read(docker: &str, container: &str, registered: &[PathBuf]) -> SessionState {
-    let Ok(output) = Command::new(docker)
-        .args(["inspect", container])
-        .stdin(std::process::Stdio::null())
-        .output()
-    else {
-        return SessionState::Missing;
-    };
-    if !output.status.success() {
-        return SessionState::Missing;
+/// One container in an available snapshot: its state against the roots the
+/// snapshot was taken with, and the raw inspect object, so a caller that needs
+/// more (mount drift, #10364) never asks docker again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Observed {
+    pub state: SessionState,
+    pub inspect: Value,
+}
+
+/// Every session container at one moment, or why docker could not say.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Snapshot {
+    /// Docker answered. Keyed by container name; a name not in the map is
+    /// [`SessionState::Missing`].
+    Available(BTreeMap<String, Observed>),
+    /// Docker could not be queried; carries a short reason. Fail open.
+    Unavailable(String),
+}
+
+impl Snapshot {
+    /// `container`'s state, or `None` when the snapshot is unavailable
+    /// ("cannot observe", not "missing").
+    #[must_use]
+    pub fn state_of(&self, container: &str) -> Option<SessionState> {
+        match self {
+            Self::Available(map) => Some(
+                map.get(container)
+                    .map_or(SessionState::Missing, |observed| observed.state),
+            ),
+            Self::Unavailable(_) => None,
+        }
     }
-    let parsed: Option<Value> = serde_json::from_slice(&output.stdout).ok();
-    let object = parsed.as_ref().and_then(|v| v.get(0));
-    classify_inspect(object, registered)
+
+    /// `container`'s raw inspect object, when the snapshot holds it.
+    #[must_use]
+    pub fn inspect_of(&self, container: &str) -> Option<&Value> {
+        match self {
+            Self::Available(map) => map.get(container).map(|observed| &observed.inspect),
+            Self::Unavailable(_) => None,
+        }
+    }
+}
+
+/// Session-container names in `docker ps --format {{.Names}}` output (one
+/// line per container, aliases comma-separated).
+#[must_use]
+pub fn parse_ps_names(stdout: &str) -> Vec<String> {
+    let mut names: Vec<String> = stdout
+        .lines()
+        .flat_map(|line| line.split(','))
+        .map(|name| name.trim().trim_start_matches('/'))
+        .filter(|name| name.starts_with(CONTAINER_PREFIX))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Parse `docker inspect` stdout (a JSON array) into the snapshot map, or
+/// `None` when it is not a JSON array.
+#[must_use]
+pub fn parse_inspect_array(
+    stdout: &[u8],
+    registered: &[PathBuf],
+) -> Option<BTreeMap<String, Observed>> {
+    let parsed: Value = serde_json::from_slice(stdout).ok()?;
+    let objects = parsed.as_array()?;
+    Some(
+        objects
+            .iter()
+            .filter_map(|object| {
+                let name = object["Name"].as_str()?.trim_start_matches('/');
+                Some((
+                    name.to_string(),
+                    Observed {
+                        state: classify_inspect(Some(object), registered),
+                        inspect: object.clone(),
+                    },
+                ))
+            })
+            .collect(),
+    )
+}
+
+/// Read every session container: one `docker ps -a` and, if it found any, one
+/// `docker inspect` of all of them, both inside `deadline`. Blocking; run it
+/// off the async runtime (`spawn_blocking`).
+#[must_use]
+pub fn snapshot(docker: &str, registered: &[PathBuf], deadline: Duration) -> Snapshot {
+    let until = Instant::now() + deadline;
+    let ps = match run_bounded(
+        docker,
+        &[
+            "ps",
+            "-a",
+            "--no-trunc",
+            "--filter",
+            &format!("name={CONTAINER_PREFIX}"),
+            "--format",
+            "{{.Names}}",
+        ],
+        until,
+    ) {
+        Ok(ran) if ran.success => ran,
+        Ok(ran) => return Snapshot::Unavailable(format!("docker ps failed: {}", ran.stderr)),
+        Err(reason) => return Snapshot::Unavailable(reason),
+    };
+    let names = parse_ps_names(&String::from_utf8_lossy(&ps.stdout));
+    if names.is_empty() {
+        return Snapshot::Available(BTreeMap::new());
+    }
+    let mut args = vec!["inspect", "--type", "container", "--"];
+    args.extend(names.iter().map(String::as_str));
+    match run_bounded(docker, &args, until) {
+        // A non-zero exit with a parseable array is a container removed
+        // between the two calls: the rest are still valid, it reads missing.
+        Ok(ran) => parse_inspect_array(&ran.stdout, registered).map_or_else(
+            || Snapshot::Unavailable(format!("docker inspect failed: {}", ran.stderr)),
+            Snapshot::Available,
+        ),
+        Err(reason) => Snapshot::Unavailable(reason),
+    }
+}
+
+struct Ran {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: String,
+}
+
+/// Run `docker args…`, killing it if it is still running at `until`.
+fn run_bounded(docker: &str, args: &[&str], until: Instant) -> Result<Ran, String> {
+    let mut child = Command::new(docker)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not run {docker}: {error}"))?;
+    // Drain both pipes on their own threads: `docker inspect` of many
+    // containers outgrows a pipe buffer, and a child blocked on a full pipe
+    // would otherwise only end at the deadline.
+    let (out_tx, out_rx) = mpsc::channel();
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.take(MAX_OUTPUT_BYTES).read_to_end(&mut bytes);
+            let _ = out_tx.send(bytes);
+        });
+    }
+    let (err_tx, err_rx) = mpsc::channel();
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.take(4096).read_to_string(&mut text);
+            let _ = err_tx.send(text);
+        });
+    }
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= until => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("docker {} timed out", args.first().unwrap_or(&"")));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(error) => return Err(format!("waiting on docker: {error}")),
+        }
+    };
+    let remaining = until.saturating_duration_since(Instant::now()) + Duration::from_millis(500);
+    let stdout = out_rx
+        .recv_timeout(remaining)
+        .map_err(|_| "docker output was not closed".to_string())?;
+    let stderr = err_rx
+        .recv_timeout(Duration::from_millis(500))
+        .unwrap_or_default();
+    Ok(Ran {
+        success: status.success(),
+        stdout,
+        stderr: stderr.trim().lines().next().unwrap_or("").to_string(),
+    })
+}
+
+static LATEST: Mutex<Option<(Instant, Arc<Snapshot>)>> = Mutex::new(None);
+
+/// Record `snapshot` as the newest one (the daemon's watch loop does this once
+/// per pass).
+pub fn publish(snapshot: Arc<Snapshot>) {
+    *LATEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Instant::now(), snapshot));
+}
+
+/// The newest published snapshot, if it is younger than `max_age`. `None`
+/// (none yet, or too old) means "cannot observe", the same as
+/// [`Snapshot::Unavailable`]. The cache is a single slot refreshed by the
+/// watch loop; a reader that needs fresher data calls [`snapshot`] itself.
+#[must_use]
+pub fn latest(max_age: Duration) -> Option<Arc<Snapshot>> {
+    let guard = LATEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() <= max_age)
+        .map(|(_, snapshot)| Arc::clone(snapshot))
 }
 
 #[cfg(test)]
@@ -402,6 +649,24 @@ mod tests {
     }
 
     #[test]
+    fn a_restarting_container_is_restarting_even_though_docker_says_running() {
+        // `docker inspect` during a crash-loop back-off: Running AND Restarting.
+        let ws = Ws::new(&["a", "b"]);
+        let roots = ws.roots(&["a", "b"]);
+        let mut looping = inspect(true, Some(&ws.label()), &[ws.p("a")]);
+        looping["State"]["Restarting"] = json!(true);
+        assert_eq!(
+            classify_inspect(Some(&looping), &roots),
+            SessionState::Restarting,
+            "never running, and never stale_mounts despite the missing b mount"
+        );
+        assert!(!container_running(&looping));
+        let mut settled = inspect(true, Some(&ws.label()), &[ws.p("a"), ws.p("b")]);
+        settled["State"]["Restarting"] = json!(false);
+        assert!(container_running(&settled));
+    }
+
+    #[test]
     fn roots_outside_the_workspace_label_are_not_expected() {
         let ws = Ws::new(&["a", "b"]);
         let other = Ws::new(&["c"]);
@@ -459,11 +724,113 @@ mod tests {
     }
 
     #[test]
-    fn only_stopped_and_missing_are_down() {
+    fn stopped_restarting_and_missing_are_down() {
         let down: Vec<_> = SessionState::ALL
             .into_iter()
             .filter(|s| s.is_down())
             .collect();
-        assert_eq!(down, [SessionState::Stopped, SessionState::Missing]);
+        assert_eq!(
+            down,
+            [
+                SessionState::Stopped,
+                SessionState::Restarting,
+                SessionState::Missing
+            ]
+        );
+    }
+
+    #[test]
+    fn ps_names_keep_only_session_containers() {
+        let out = "loom-codex-session-b\nother,loom-codex-session-a\n/loom-codex-session-a\nweb\n";
+        assert_eq!(parse_ps_names(out), ["loom-codex-session-a", "loom-codex-session-b"]);
+    }
+
+    #[test]
+    fn inspect_array_is_keyed_by_name_and_classified() {
+        let mut a = inspect(true, None, &[]);
+        a["Name"] = json!("/loom-codex-session-a");
+        let mut b = inspect(false, None, &[]);
+        b["Name"] = json!("/loom-codex-session-b");
+        let map = parse_inspect_array(&serde_json::to_vec(&json!([a, b])).unwrap(), &[]).unwrap();
+        let snapshot = Snapshot::Available(map);
+        assert_eq!(snapshot.state_of("loom-codex-session-a"), Some(SessionState::Running));
+        assert_eq!(snapshot.state_of("loom-codex-session-b"), Some(SessionState::Stopped));
+        assert_eq!(snapshot.state_of("loom-codex-session-c"), Some(SessionState::Missing));
+        assert!(snapshot.inspect_of("loom-codex-session-a").is_some());
+        assert!(parse_inspect_array(b"Error: No such object", &[]).is_none());
+        let gone = Snapshot::Unavailable("docker down".into());
+        assert_eq!(gone.state_of("loom-codex-session-a"), None);
+    }
+
+    #[test]
+    fn latest_honours_max_age() {
+        publish(Arc::new(Snapshot::Available(BTreeMap::new())));
+        assert!(latest(Duration::from_secs(60)).is_some());
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(latest(Duration::from_millis(1)).is_none(), "too old to use");
+    }
+
+    #[cfg(unix)]
+    mod with_fake_docker {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn fake(dir: &Path, body: &str) -> String {
+            let path = dir.join("docker");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
+        #[test]
+        fn one_ps_and_one_inspect_for_every_container() {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = dir.path().join("calls");
+            let docker = fake(
+                dir.path(),
+                &format!(
+                    r#"echo "$1" >> '{calls}'
+case "$1" in
+  ps) printf 'loom-codex-session-a\nloom-codex-session-gone\n' ;;
+  inspect) printf '[{{"Name":"/loom-codex-session-a","State":{{"Running":true,"Restarting":true}}}}]'; echo 'Error: No such object: loom-codex-session-gone' >&2; exit 1 ;;
+esac"#,
+                    calls = calls.display()
+                ),
+            );
+            let snap = snapshot(&docker, &[], Duration::from_secs(5));
+            assert_eq!(snap.state_of("loom-codex-session-a"), Some(SessionState::Restarting));
+            assert_eq!(snap.state_of("loom-codex-session-gone"), Some(SessionState::Missing));
+            assert_eq!(std::fs::read_to_string(calls).unwrap(), "ps\ninspect\n");
+        }
+
+        #[test]
+        fn no_containers_means_no_inspect_and_an_empty_available_map() {
+            let dir = tempfile::tempdir().unwrap();
+            let docker = fake(dir.path(), r#"[ "$1" = ps ] || exit 9"#);
+            let snap = snapshot(&docker, &[], Duration::from_secs(5));
+            assert_eq!(snap, Snapshot::Available(BTreeMap::new()));
+            assert_eq!(snap.state_of("loom-codex-session-a"), Some(SessionState::Missing));
+        }
+
+        #[test]
+        fn an_unreachable_docker_daemon_is_unavailable_not_missing() {
+            let dir = tempfile::tempdir().unwrap();
+            let docker = fake(dir.path(), "echo 'Cannot connect to the Docker daemon' >&2; exit 1");
+            let snap = snapshot(&docker, &[], Duration::from_secs(5));
+            assert!(matches!(&snap, Snapshot::Unavailable(r) if r.contains("Cannot connect")));
+            assert_eq!(snap.state_of("loom-codex-session-a"), None);
+            let absent = snapshot("/nonexistent/docker", &[], Duration::from_secs(5));
+            assert!(matches!(absent, Snapshot::Unavailable(_)));
+        }
+
+        #[test]
+        fn a_wedged_docker_is_killed_at_the_deadline() {
+            let dir = tempfile::tempdir().unwrap();
+            let docker = fake(dir.path(), "exec sleep 30");
+            let started = Instant::now();
+            let snap = snapshot(&docker, &[], Duration::from_millis(300));
+            assert!(matches!(&snap, Snapshot::Unavailable(r) if r.contains("timed out")));
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
     }
 }

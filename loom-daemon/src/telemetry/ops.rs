@@ -367,7 +367,7 @@ pub enum MetricName {
     EtaHealthPendingOverCap,
     // ---- Codex session containers (Issue #10455) ---------------------------
     /// Per session-managed Codex account, one point per `state` ∈ `running`,
-    /// `stopped`, `missing`, `stale_mounts`: 1 for the container's current
+    /// `stopped`, `restarting`, `missing`, `stale_mounts`: 1 for the container's current
     /// state, 0 for the rest. Labelled `account` and `container`.
     #[serde(rename = "loom.codex_session.state")]
     CodexSessionState,
@@ -609,7 +609,7 @@ impl MetricName {
             }
             Self::CodexSessionState => {
                 "Codex session container state per account: 1 for the current state \
-                 (running, stopped, missing, stale_mounts), 0 for the others."
+                 (running, stopped, restarting, missing, stale_mounts), 0 for the others."
             }
         }
     }

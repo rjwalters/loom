@@ -15,31 +15,78 @@
 //! The WARN deliberately lives here, **not** in the role runner's
 //! `RootTickLogAction` machine, and never goes through `log::debug!`: it is
 //! per account, not per root, and must stay visible however long the
-//! container is down. It runs on every collector pass whether or not an OTLP
-//! exporter is configured; only the gauge needs the ops sink.
+//! container is down.
+//!
+//! **Two halves, so the WARN does not depend on telemetry.** [`spawn_watch`]
+//! is an always-on daemon task (started with the other observers, whether or
+//! not any exporter is configured) that every [`WATCH_INTERVAL`] takes one
+//! bounded [`session_state::snapshot`], publishes it for other readers
+//! ([`session_state::latest`]), feeds the tracker and keeps the observations.
+//! [`record`], called from the telemetry collector's pass, only turns the
+//! newest observations into gauge points: it never calls docker, so a wedged
+//! Docker cannot stall the collector.
+//!
+//! **Fail open.** When docker cannot be queried ([`Snapshot::Unavailable`])
+//! the tracker holds every account's last state (no WARN, no reminder), the
+//! gauge emits nothing, and one INFO line notes the transition (and one more
+//! when docker answers again). An unqueryable docker says nothing about any
+//! container, so it must never read as `missing`.
 //!
 //! Only session-managed, enabled Codex accounts are read; a pool with none
 //! costs zero docker calls. [`Tracker::observe`] and [`points`] are pure.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::tokens_pool::session_lifecycle::{container_name, is_session_managed};
-use crate::tokens_pool::session_state::{self, SessionState};
+use crate::tokens_pool::session_state::{self, SessionState, Snapshot};
 use crate::tokens_pool::{account_inventory, AccountProvider};
 
 /// How often the WARN repeats while an account's container stays not running.
 pub const REMINDER_SECS: u64 = 15 * 60;
 
+/// How often the watch takes a snapshot: the WARN lands within one interval.
+pub const WATCH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Observations older than this are not exported (the watch has stopped or
+/// docker has been unqueryable since).
+const FRESH_FOR: Duration = Duration::from_secs(3 * 60);
+
 /// Per-account last-seen state and when it was last warned about.
 #[derive(Debug, Default)]
 pub struct Tracker {
     seen: HashMap<String, (SessionState, u64)>,
+    unqueryable: bool,
 }
 
 impl Tracker {
+    /// Docker could not be queried this pass. Every account's state is held;
+    /// returns a note only on the transition into this condition.
+    pub fn unqueryable(&mut self, reason: &str) -> Option<String> {
+        (!std::mem::replace(&mut self.unqueryable, true)).then(|| {
+            format!(
+                "Codex session containers cannot be observed ({reason}); holding the last \
+                 known state until docker answers"
+            )
+        })
+    }
+
+    /// Docker answered this pass; a note when it had not before.
+    pub fn queryable(&mut self) -> Option<String> {
+        std::mem::replace(&mut self.unqueryable, false)
+            .then(|| "Codex session containers are observable again".to_string())
+    }
+
+    /// Forget accounts no longer in the inventory (removed or disabled), so a
+    /// re-added account is treated as first sight.
+    pub fn retain(&mut self, accounts: &[&str]) {
+        self.seen
+            .retain(|account, _| accounts.contains(&account.as_str()));
+    }
+
     /// Feed one observation. Returns the WARN text when this observation is a
     /// state change worth reporting or a due reminder; `None` otherwise (an
     /// account first seen running, or unchanged inside the reminder window).
@@ -71,6 +118,11 @@ impl Tracker {
 
 fn describe(account: &str, container: &str, state: SessionState) -> String {
     match state {
+        SessionState::Restarting => format!(
+            "Codex session container for account {account} ({container}) is restarting \
+             (Docker is backing off a crash loop): Codex ticks on this account are refused; \
+             see `docker logs {container}`"
+        ),
         SessionState::Stopped | SessionState::Missing => format!(
             "Codex session container for account {account} ({container}) is {}: Codex ticks \
              on this account are refused until it is started \
@@ -105,7 +157,10 @@ pub fn points(observed: &[(String, String, SessionState)]) -> Vec<MetricPoint> {
         .collect()
 }
 
+type Observations = Vec<(String, String, SessionState)>;
+
 static TRACKER: Mutex<Option<Tracker>> = Mutex::new(None);
+static LAST: Mutex<Option<(Instant, Arc<Observations>)>> = Mutex::new(None);
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -114,58 +169,135 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Read every session-managed Codex account's container, WARN per the tracker,
-/// and return the observations.
-fn sample(
-    root: &Path,
-    registered: &[PathBuf],
-    docker: &str,
-) -> Vec<(String, String, SessionState)> {
-    let Ok(inventory) = account_inventory(root, AccountProvider::Codex) else {
-        return Vec::new();
-    };
-    let mut observed = Vec::new();
-    for account in inventory
-        .into_iter()
-        .filter(|a| a.enabled && is_session_managed(&a.credential_reference))
-    {
-        let container = container_name(&account.id.name);
-        let state = session_state::read(docker, &container, registered);
-        observed.push((account.id.name, container, state));
+/// What one pass decided: the observations to export (`None`: export
+/// nothing) and the log lines (`warn`, `info`).
+#[derive(Debug, Default, PartialEq)]
+pub struct Pass {
+    pub observed: Option<Observations>,
+    pub warn: Vec<String>,
+    pub info: Vec<String>,
+}
+
+/// Fold one snapshot into the tracker for `accounts` (`(account, container)`).
+/// Pure apart from the tracker.
+pub fn fold(
+    tracker: &mut Tracker,
+    accounts: &[(String, String)],
+    snapshot: &Snapshot,
+    now: u64,
+) -> Pass {
+    let names: Vec<&str> = accounts.iter().map(|(a, _)| a.as_str()).collect();
+    tracker.retain(&names);
+    let mut pass = Pass::default();
+    if let Snapshot::Unavailable(reason) = snapshot {
+        pass.info.extend(tracker.unqueryable(reason));
+        return pass;
     }
+    pass.info.extend(tracker.queryable());
+    let observed: Observations = accounts
+        .iter()
+        .map(|(account, container)| {
+            let state = snapshot
+                .state_of(container)
+                .unwrap_or(SessionState::Missing);
+            (account.clone(), container.clone(), state)
+        })
+        .collect();
+    for (account, container, state) in &observed {
+        pass.warn
+            .extend(tracker.observe(account, container, *state, now));
+    }
+    pass.observed = Some(observed);
+    pass
+}
+
+/// The enabled, session-managed Codex accounts and their container names.
+fn session_accounts(root: &Path) -> Vec<(String, String)> {
+    account_inventory(root, AccountProvider::Codex)
+        .map(|inventory| {
+            inventory
+                .into_iter()
+                .filter(|a| a.enabled && is_session_managed(&a.credential_reference))
+                .map(|a| {
+                    let container = container_name(&a.id.name);
+                    (a.id.name, container)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One watch pass (blocking): snapshot, WARN, keep the observations.
+fn watch_pass(root: &Path) {
+    let accounts = session_accounts(root);
     let mut guard = TRACKER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let tracker = guard.get_or_insert_with(Tracker::default);
-    let now = now_secs();
-    for (account, container, state) in &observed {
-        if let Some(message) = tracker.observe(account, container, *state, now) {
-            log::warn!("session: {message}");
-        }
-    }
-    observed
-}
-
-/// One collector pass: sample, WARN, and export the gauge when an ops sink is
-/// registered.
-pub async fn record(root: &Path) {
-    let root = root.to_path_buf();
-    let observed = tokio::task::spawn_blocking(move || {
-        let registered = crate::workspace_registry::WorkspaceRegistry::load_default()
-            .map(|registry| registry.roots())
-            .unwrap_or_default();
-        let docker = std::env::var("LOOM_CODEX_SESSION_DOCKER")
-            .ok()
-            .filter(|d| !d.is_empty())
-            .unwrap_or_else(|| "docker".to_string());
-        sample(&root, &registered, &docker)
-    })
-    .await
-    .unwrap_or_default();
-    if observed.is_empty() {
+    if accounts.is_empty() {
+        tracker.retain(&[]);
+        *LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         return;
     }
-    super::emit_metrics(points(&observed));
+    let registered: Vec<PathBuf> = crate::workspace_registry::WorkspaceRegistry::load_default()
+        .map(|registry| registry.roots())
+        .unwrap_or_default();
+    let docker = std::env::var("LOOM_CODEX_SESSION_DOCKER")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "docker".to_string());
+    let snapshot =
+        Arc::new(session_state::snapshot(&docker, &registered, session_state::SNAPSHOT_DEADLINE));
+    session_state::publish(Arc::clone(&snapshot));
+    let pass = fold(tracker, &accounts, &snapshot, now_secs());
+    for message in &pass.warn {
+        log::warn!("session: {message}");
+    }
+    for message in &pass.info {
+        log::info!("session: {message}");
+    }
+    *LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = pass
+        .observed
+        .map(|observed| (Instant::now(), Arc::new(observed)));
+}
+
+/// Start the always-on watch for `workspace_root`'s account pool. Runs
+/// whether or not telemetry is configured; each pass is bounded by the
+/// snapshot deadline and runs off the async runtime.
+pub fn spawn_watch(workspace_root: PathBuf) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(WATCH_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let root = workspace_root.clone();
+            let pass = tokio::task::spawn_blocking(move || watch_pass(&root));
+            // The snapshot kills docker at its own deadline; this outer bound
+            // only covers the filesystem reads around it.
+            let bound = session_state::SNAPSHOT_DEADLINE + Duration::from_secs(10);
+            if tokio::time::timeout(bound, pass).await.is_err() {
+                log::info!("session: Codex session watch pass overran {bound:?}; skipped");
+            }
+        }
+    })
+}
+
+/// The collector's part: export the gauge from the watch's newest
+/// observations, when the ops sink is registered. Never calls docker.
+pub fn record() {
+    let observed = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() <= FRESH_FOR)
+        .map(|(_, observed)| Arc::clone(observed));
+    if let Some(observed) = observed.filter(|o| !o.is_empty()) {
+        super::emit_metrics(points(&observed));
+    }
 }
 
 #[cfg(test)]
@@ -233,7 +365,7 @@ mod tests {
     #[test]
     fn gauge_emits_every_state_with_the_current_one_at_one() {
         let pts = points(&[("a".into(), C.into(), SessionState::Stopped)]);
-        assert_eq!(pts.len(), 4);
+        assert_eq!(pts.len(), SessionState::ALL.len());
         for p in &pts {
             let state = &p.labels["state"];
             let expect = i64::from(state == "stopped");
@@ -250,5 +382,69 @@ mod tests {
         assert!(!source
             .replace(&format!("\"{needle}\""), "")
             .contains(&format!("{needle}(")));
+    }
+
+    fn available(states: &[(&str, SessionState)]) -> Snapshot {
+        Snapshot::Available(
+            states
+                .iter()
+                .map(|(c, state)| {
+                    (
+                        (*c).to_string(),
+                        session_state::Observed {
+                            state: *state,
+                            inspect: serde_json::Value::Null,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn restarting_warns_as_down() {
+        let mut t = Tracker::default();
+        t.observe("a", C, SessionState::Running, 0);
+        let m = t.observe("a", C, SessionState::Restarting, 60).unwrap();
+        assert!(m.contains("restarting") && m.contains(C));
+    }
+
+    #[test]
+    fn an_unqueryable_docker_holds_state_and_exports_nothing() {
+        let mut t = Tracker::default();
+        let accounts = vec![("a".to_string(), C.to_string())];
+        let up = fold(&mut t, &accounts, &available(&[(C, SessionState::Running)]), 0);
+        assert_eq!(up.observed.unwrap()[0].2, SessionState::Running);
+        let gone = Snapshot::Unavailable("Cannot connect to the Docker daemon".into());
+        let first = fold(&mut t, &accounts, &gone, 60);
+        assert_eq!(first.observed, None, "no gauge, never `missing`");
+        assert!(first.warn.is_empty());
+        assert_eq!(first.info.len(), 1, "one note on the transition");
+        let again = fold(&mut t, &accounts, &gone, 60 + REMINDER_SECS);
+        assert!(again.warn.is_empty() && again.info.is_empty(), "no storm");
+        // Docker answers again and the container is still up: no state change.
+        let back = fold(&mut t, &accounts, &available(&[(C, SessionState::Running)]), 2_000);
+        assert!(back.warn.is_empty());
+        assert_eq!(back.info.len(), 1);
+    }
+
+    #[test]
+    fn an_account_absent_from_an_available_snapshot_is_missing() {
+        let mut t = Tracker::default();
+        let accounts = vec![("a".to_string(), C.to_string())];
+        let pass = fold(&mut t, &accounts, &available(&[]), 0);
+        assert_eq!(pass.observed.unwrap()[0].2, SessionState::Missing);
+        assert_eq!(pass.warn.len(), 1);
+    }
+
+    #[test]
+    fn accounts_that_leave_the_inventory_are_forgotten() {
+        let mut t = Tracker::default();
+        let a = vec![("a".to_string(), C.to_string())];
+        fold(&mut t, &a, &available(&[(C, SessionState::Stopped)]), 0);
+        fold(&mut t, &[], &available(&[]), 10);
+        // Re-added and still stopped: first sight again, so it warns at once.
+        let pass = fold(&mut t, &a, &available(&[(C, SessionState::Stopped)]), 20);
+        assert_eq!(pass.warn.len(), 1);
     }
 }
