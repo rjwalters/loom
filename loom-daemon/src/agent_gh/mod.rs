@@ -132,6 +132,10 @@ pub fn run(raw: &[OsString]) -> i32 {
         return 127;
     };
     if depth == 0 {
+        // #10432: a role tick's forge writes (claims, verdict labels, merges),
+        // journaled for its `pick.decision`. Parses argv only; a no-op outside
+        // a role tick.
+        crate::observability::pick_journal::record_gh_actions(raw);
         if let Some(out) = serve(raw, &next) {
             record("revalidated", raw);
             let mut stdout = std::io::stdout().lock();
@@ -179,12 +183,16 @@ fn serve(raw: &[OsString], next: &Path) -> Option<String> {
                 .iter()
                 .any(|a| a == "--jq" || a == "-q" || a.starts_with("--jq="));
             let served = pin_repo(served, cwd.as_deref())?;
-            let out = crate::forge_cached_list::build_output_via(
+            let listing = crate::forge_cached_list::build_served_via(
                 STATS_CALLER,
                 entity.as_str(),
                 &served,
                 next,
             )?;
+            // #10432: a role tick's candidate listing, journaled for its
+            // `pick.decision` (a no-op outside a role tick).
+            crate::observability::pick_journal::record_listing(&listing);
+            let out = listing.render()?;
             if jq {
                 return Some(out);
             }

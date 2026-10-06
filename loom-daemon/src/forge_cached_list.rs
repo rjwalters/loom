@@ -155,6 +155,67 @@ pub fn build_output_via(
 /// Core, side-effect-free (given the `fetch` closure) pipeline: parse → fetch →
 /// filter → project → optional jq. Returns `None` to decline.
 pub fn build_output(entity: &str, args: &[String], fetch: &Fetcher) -> Option<String> {
+    build_served(entity, args, fetch)?.render()
+}
+
+/// [`build_served`] against an explicit `gh`, recorded against `caller` — the
+/// agent `gh` front's entry when it also journals the rows (#10432).
+#[must_use]
+pub fn build_served_via(
+    caller: &'static str,
+    entity: &str,
+    args: &[String],
+    gh_bin: &Path,
+) -> Option<Served> {
+    let cwd = std::env::current_dir().ok();
+    build_served(entity, args, &|labels, state, repo| {
+        list_issues_cached_persistent_as(caller, gh_bin, cwd.as_deref(), repo, labels, state).ok()
+    })
+}
+
+/// A listing ready to print: the rows in listing order, before projection,
+/// alongside their projected `--json` array and the caller's `--jq`.
+#[derive(Debug, Clone)]
+pub struct Served {
+    /// The positive labels the query listed (comma-joined).
+    pub labels: String,
+    /// The rows served, in listing order (after `-label:` and `--limit`).
+    pub items: Vec<crate::forge_listing::RestIssue>,
+    array: Value,
+    jq: Option<String>,
+}
+
+impl Served {
+    /// The exact bytes `gh` would print.
+    #[must_use]
+    pub fn render(&self) -> Option<String> {
+        match &self.jq {
+            Some(expr) => apply_jq(&self.array, expr),
+            // gh prints `--json` output as pretty JSON with a trailing newline.
+            None => serde_json::to_string_pretty(&self.array)
+                .ok()
+                .map(|s| format!("{s}\n")),
+        }
+    }
+
+    /// Indexes of the rows the caller's `--jq` keeps: a row survives when the
+    /// expression yields anything on a one-row array. All rows with no `--jq`;
+    /// `None` when `jq` cannot tell.
+    #[must_use]
+    pub fn surviving(&self) -> Option<Vec<usize>> {
+        let Some(expr) = &self.jq else {
+            return Some((0..self.items.len()).collect());
+        };
+        let probe = format!(
+            "[to_entries[] | .key as $i | [.value] | select(([({expr})] | length) > 0) | $i]"
+        );
+        let out = apply_jq(&self.array, &probe)?;
+        serde_json::from_str(out.trim()).ok()
+    }
+}
+
+/// Parse, fetch, filter and project; `None` to decline.
+fn build_served(entity: &str, args: &[String], fetch: &Fetcher) -> Option<Served> {
     let want_pr = match entity {
         "issue" => false,
         "pr" => true,
@@ -169,7 +230,7 @@ pub fn build_output(entity: &str, args: &[String], fetch: &Fetcher) -> Option<St
         return None;
     }
 
-    let mut rows: Vec<Value> = listing
+    let mut items: Vec<_> = listing
         .issues
         .into_iter()
         .filter(|it| it.is_pull_request == want_pr)
@@ -179,21 +240,24 @@ pub fn build_output(entity: &str, args: &[String], fetch: &Fetcher) -> Option<St
                 .iter()
                 .any(|neg| it.labels.iter().any(|l| l == neg))
         })
-        .map(|it| project_row(&it, &q.json_fields))
         .collect();
 
     if let Some(limit) = q.limit {
-        rows.truncate(limit);
+        items.truncate(limit);
     }
 
-    let array = Value::Array(rows);
-    match &q.jq {
-        Some(expr) => apply_jq(&array, expr),
-        // gh prints `--json` output as pretty JSON with a trailing newline.
-        None => serde_json::to_string_pretty(&array)
-            .ok()
-            .map(|s| format!("{s}\n")),
-    }
+    let array = Value::Array(
+        items
+            .iter()
+            .map(|it| project_row(it, &q.json_fields))
+            .collect(),
+    );
+    Some(Served {
+        labels: labels_joined,
+        items,
+        array,
+        jq: q.jq,
+    })
 }
 
 /// Build a gh-`--json`-shaped object with only the requested fields.
