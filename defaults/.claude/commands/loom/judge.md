@@ -1453,7 +1453,7 @@ FEEDBACK
 
 ## CI Status Check (REQUIRED Before Approval)
 
-**CRITICAL: Never approve a PR until ALL checks on the exact reviewed head pass, required or not (#10485).** `post-verdict.sh ... approved` enforces this itself: it reads the head via `loom-daemon forge wait-checks` and refuses an approval — exit **5** (pending, empty-with-required-contexts, head moved, unreadable reader) or **6** (any red check) — posting nothing. **The script, not you, is the authority:** never approve "because the required checks passed", never accept a red or skipped-for-approval non-required check, never weaken a check to get green. Exit 5: do not add `loom:pr`; follow "When CI is Pending". Exit 6: post `changes-requested` per "When CI Fails" (an external approval-required workflow: say so and point at the operator, not the Doctor). Because the gate lives in the script, every approval path (full, Docs-Only, conflict-only, minor-description-fix, trivial-fix) is covered; none may skip it. The `&&` chain means `loom:pr` is unreachable after a refusal.
+**CRITICAL: Never approve a PR until ALL checks on the exact reviewed head pass, required or not (#10485).** `post-verdict.sh ... approved` enforces this itself: it reads the head via `loom-daemon forge wait-checks` and refuses an approval — exit **5** (pending, empty-with-required-contexts, head moved, unreadable reader) or **6** (any red check) — posting nothing. **The script, not you, is the authority:** never approve "because the required checks passed", never accept a red or skipped-for-approval non-required check, never weaken a check to get green. Exit 5: do not add `loom:pr`; follow "When CI is Pending". Exit 6: post `changes-requested` per "When CI Fails" (an external approval-required workflow: say so and point at the operator, not the Doctor). The gate lives in the script, so every approval path (full, Docs-Only, conflict-only, minor-description-fix, trivial-fix) is covered. The `&&` chain means `loom:pr` is unreachable after a refusal.
 
 Local tests passing is not sufficient - you MUST verify that GitHub Actions CI workflows have completed successfully. This prevents situations where a PR is approved while CI is still running or failing.
 
@@ -1580,7 +1580,7 @@ esac
 
 ### Why CI Verification Matters
 
-Issue #1441: a Judge approved on local-test green while CI (shellcheck, frontend tests, CI-only integration) was still failing, costing several Doctor passes. Approve only after `post-verdict.sh` accepts the head; `forge wait-checks` is for evidence, not authority.
+Issue #1441: a Judge approved on local-test green while CI was still failing, costing several Doctor passes. Approve only after `post-verdict.sh` accepts the head; `forge wait-checks` is for evidence, not authority.
 
 ## Formal Review & Inline Thread Reconciliation (REQUIRED Before Approval, #7647)
 

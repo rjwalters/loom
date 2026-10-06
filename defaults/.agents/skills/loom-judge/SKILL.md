@@ -192,7 +192,7 @@ own discipline:
 
 - **Never wait indefinitely on a single tool call.** Long-running commands
   (`buildGate.command`, `gh pr checks --watch`) MUST be given an explicit
-  timeout — e.g. `gh pr checks <n>` (a one-shot snapshot), not `--watch` with no
+  timeout — e.g. `forge wait-checks <n> --timeout 20`, not `--watch` with no
   bound; wrap a build in `timeout <secs> …`. If it does not return, treat the
   check as **inconclusive** and proceed to a verdict rather than blocking.
 - **Emit progress as you go.** Print a short line at each step (checkout, check,
@@ -521,7 +521,7 @@ pre-write state:
 | Pre-Iteration Environment Check (`gh repo view`) | Liveness probe — a cached success hides a broken environment |
 | Stale `loom:reviewing` Claim Check (`claim-staleness.sh`: claim timeline + comment reads) | Claim arbitration — 30s of staleness is exactly the window a competing claim lands in (the script makes these reads itself; never re-issue them through the cache) |
 | **Verdict-Time CAS Recheck** (`gh pr view $N --json labels`) | The entire mechanism is "observe writes that landed *during* my review"; a cached label set defeats it |
-| `gh pr checks` + `gh pr view --json mergeStateStatus` before a verdict | Verdict gating — never approve on a stale green |
+| `forge wait-checks` / `gh pr checks` + `gh pr view --json mergeStateStatus` before a verdict | Verdict gating — never approve on a stale green |
 
 `gh pr checks` and `gh repo view` are passthrough inside the wrapper anyway, so
 those two hold even if wrapped by accident; the rest rely on this list.
@@ -816,7 +816,7 @@ completion write — see `doctor.md`'s "Verdict-Time CAS Recheck".
       bare `gh pr comment` and NOT `gh pr review`
 - [ ] I am using `gh pr edit` for label changes
 - [ ] I understand `gh pr review --approve` WILL fail with "cannot approve your own PR"
-- [ ] All CI checks pass (verified via `gh pr checks`)
+- [ ] All CI checks pass (verified via `forge wait-checks`)
 - [ ] Merge state is CLEAN (verified via `gh pr view --json mergeStateStatus`)
 - [ ] I will NEVER call `gh pr review` in any form
 - [ ] I will run `post-verdict.sh` AND `gh pr edit` atomically (chained with `&&`)
@@ -1468,29 +1468,29 @@ FEEDBACK
 
 ## CI Status Check (REQUIRED Before Approval)
 
-**CRITICAL: Never approve a PR until ALL checks on the exact reviewed head pass, required or not (#10485).** `post-verdict.sh ... approved` enforces this itself: it reads the head via `loom-daemon forge wait-checks` and refuses an approval — exit **5** (pending, empty-with-required-contexts, head moved, unreadable reader) or **6** (any red check) — posting nothing. **The script, not you, is the authority:** never approve "because the required checks passed", never accept a red or skipped-for-approval non-required check, never weaken a check to get green. Exit 5: do not add `loom:pr`; follow "When CI is Pending". Exit 6: post `changes-requested` per "When CI Fails" (an external approval-required workflow: say so and point at the operator, not the Doctor). Because the gate lives in the script, every approval path (full, Docs-Only, conflict-only, minor-description-fix, trivial-fix) is covered; none may skip it. The `&&` chain means `loom:pr` is unreachable after a refusal.
+**CRITICAL: Never approve a PR until ALL checks on the exact reviewed head pass, required or not (#10485).** `post-verdict.sh ... approved` enforces this itself: it reads the head via `loom-daemon forge wait-checks` and refuses an approval — exit **5** (pending, empty-with-required-contexts, head moved, unreadable reader) or **6** (any red check) — posting nothing. **The script, not you, is the authority:** never approve "because the required checks passed", never accept a red or skipped-for-approval non-required check, never weaken a check to get green. Exit 5: do not add `loom:pr`; follow "When CI is Pending". Exit 6: post `changes-requested` per "When CI Fails" (an external approval-required workflow: say so and point at the operator, not the Doctor). The gate lives in the script, so every approval path (full, Docs-Only, conflict-only, minor-description-fix, trivial-fix) is covered. The `&&` chain means `loom:pr` is unreachable after a refusal.
 
 Local tests passing is not sufficient - you MUST verify that GitHub Actions CI workflows have completed successfully. This prevents situations where a PR is approved while CI is still running or failing.
 
-**Every command in this section runs as plain `gh` — never `"$GH_READ"`.** CI
+**Every `gh` read in this section is plain — never `"$GH_READ"`.** CI
 status and merge state are the reads a verdict is gated on, so they must
 observe current state unconditionally; a cached green from 30 seconds ago can
-predate the push that broke the build. (`gh pr checks` is passthrough inside
-the wrapper regardless, so this is belt-and-suspenders for it and load-bearing
-for the `mergeStateStatus` reads.) See "Cached Forge Reads" for the full policy.
+predate the push that broke the build. (`forge wait-checks` revalidates every
+read via ETag, so it is live too.) See "Cached Forge Reads" for the full policy.
 
 ### How to Check CI Status
 
-**Step 1: Check all PR checks**
+**Step 1: Snapshot all PR checks** (`--timeout 0` would read a no-checks repo as `TIMEOUT`)
 
 ```bash
-gh pr checks <PR_NUMBER>
+loom-daemon forge wait-checks <PR_NUMBER> --timeout 20
 ```
 
-This shows the status of all CI checks. Look for:
-- ✅ All checks show `pass` - Safe to approve
-- ❌ Any check shows `fail` - Request changes
-- ⏳ Any check shows `pending` - Wait for completion
+Branch on the first stdout line:
+- ✅ `LOOM-CHECKS-GREEN` / `-NONE` (no checks) - Safe to approve
+- ❌ `-RED` - Request changes (stderr: `<name>\t<url>\t<run_id>` per failure)
+- ⏳ `-TIMEOUT` / `-HEAD-MOVED` - Pending (see "When CI is Pending")
+- `-ERROR` or no sentinel (Gitea / older binary) - run `gh pr checks <PR_NUMBER>` once
 
 **Step 2: Verify merge state**
 
@@ -1517,7 +1517,7 @@ If CI checks are failing, **do NOT approve**. Instead, apply `loom:ci-failure` f
 
 The following CI checks are failing:
 
-[LIST THE FAILING CHECKS FROM `gh pr checks` OUTPUT]
+[LIST THE FAILING CHECKS (RED DETAIL)]
 
 Please fix these issues before the PR can be approved. Common causes:
 - Shellcheck warnings in shell scripts
@@ -1591,11 +1591,11 @@ esac
 
 **If the cap is reached and CI is still pending, do not extend the wait and do not reach for a background watcher instead.** Post a conditional-verdict comment stating plainly that the code review passed but CI had not settled after the bounded wait, then — since there is no batch to hand this off to — release `loom:reviewing` and leave `loom:review-requested` in place, exactly as the skip-and-continue path does, so a later Judge invocation (the next cron tick, or a fresh manual dispatch) can re-evaluate once CI has settled.
 
-**Never substitute an armed `Monitor`/`ScheduleWakeup` timer or a `run_in_background` watcher for either path above.** A timer or background task that is still armed when you end your turn is not "waiting" — in headless `-p` mode it is simply killed along with the process, and the PR is orphaned with a stale claim and no verdict. If you have not personally observed the CI result (via a `gh pr checks` call whose output you read in this turn), you have not verified it, and you MUST NOT write a final message that implies the verdict is settled or "in progress elsewhere."
+**Never substitute an armed `Monitor`/`ScheduleWakeup` timer or a `run_in_background` watcher for either path above.** A timer or background task that is still armed when you end your turn is not "waiting" — in headless `-p` mode it is simply killed along with the process, and the PR is orphaned with a stale claim and no verdict. If you have not personally observed the CI result (a CI result you read in this turn), you have not verified it, and you MUST NOT write a final message that implies the verdict is settled or "in progress elsewhere."
 
 ### Why CI Verification Matters
 
-Issue #1441: a Judge approved on local-test green while CI (shellcheck, frontend tests, CI-only integration) was still failing, costing several Doctor passes. Approve only after `post-verdict.sh` accepts the head; `gh pr checks` is for evidence, not authority.
+Issue #1441: a Judge approved on local-test green while CI was still failing, costing several Doctor passes. Approve only after `post-verdict.sh` accepts the head; `forge wait-checks` is for evidence, not authority.
 
 ## Formal Review & Inline Thread Reconciliation (REQUIRED Before Approval, #7647)
 
@@ -1731,7 +1731,7 @@ Red flags that should trigger a full evaluation instead:
 **3. Verify CI passes — and reconcile formal reviews/inline threads:**
 
 ```bash
-gh pr checks <PR_NUMBER>
+loom-daemon forge wait-checks <PR_NUMBER> --timeout 20   # GREEN/NONE (Step 1)
 gh pr view <PR_NUMBER> --json mergeStateStatus --jq '.mergeStateStatus'
 # A conflict-only re-push does not resolve anyone's outstanding review (#7647).
 ./.loom/scripts/check-review-feedback.sh --number <PR_NUMBER> --head-sha "$REVIEW_HEAD_SHA"
