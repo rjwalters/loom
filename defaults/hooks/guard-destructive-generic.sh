@@ -10070,7 +10070,8 @@ _sql_delete_executable() {
             if (w ~ /^(bash|sh|zsh|dash|python3?|node|ruby|perl|php)$/) {
                 for (i = 2; i <= n; i++) {
                     if (t[i] ~ /^-/) {
-                        if (t[i] == "-" || t[i] ~ /^-[a-zA-Z]*[ceEprm][a-zA-Z]*$/ || t[i] ~ /^--(eval|command|exec|print)$/) return 0
+                        if (t[i] == "--") continue
+                        if (t[i] == "-" || t[i] ~ /^-[a-zA-Z]*[ceEprm][a-zA-Z]*$/ || t[i] ~ /^--/) return 0
                         continue
                     }
                     return (t[i] != "Q")

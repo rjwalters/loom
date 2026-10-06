@@ -62,6 +62,12 @@ assert_deny "SQL #10335: still block DELETE FROM executed via python3 -c (psycop
     "python3 -c \"import psycopg; c = psycopg.connect(); c.execute('DELETE FROM users;'); c.commit()\"" "$SQL_ABSENT_REPO"
 assert_deny "SQL #10335: still block DELETE FROM executed via node -e" \
     "node -e \"db.query('DELETE FROM users;')\"" "$SQL_ABSENT_REPO"
+assert_deny "SQL #10335: still block DELETE FROM via node --eval= with a following positional" \
+    "node --eval=\"db.query('DELETE FROM users;')\" dummy" "$SQL_ABSENT_REPO"
+assert_deny "SQL #10335: still block DELETE FROM via node --print= with a following positional" \
+    "node --print=\"db.query('DELETE FROM users;')\" dummy" "$SQL_ABSENT_REPO"
+assert_deny "SQL #10335: still block DELETE FROM via python3 unknown long option + positional" \
+    "python3 --unknown-opt=\"c.execute('DELETE FROM users;')\" dummy" "$SQL_ABSENT_REPO"
 assert_deny "SQL #10335: still block DELETE FROM submitted via curl -d" \
     "curl -s -d 'DELETE FROM users;' http://db.local/query" "$SQL_ABSENT_REPO"
 assert_deny "SQL #10335: still block DELETE FROM via bash -c" \
