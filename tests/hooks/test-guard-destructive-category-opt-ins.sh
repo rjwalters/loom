@@ -74,6 +74,10 @@ assert_deny "SQL #10335: still block DELETE FROM via bash -c" \
     "bash -c \"run-query 'DELETE FROM users;'\"" "$SQL_ABSENT_REPO"
 assert_deny "SQL #10335: still block DELETE FROM via eval" \
     "eval \"run-query 'DELETE FROM users;'\"" "$SQL_ABSENT_REPO"
+assert_deny "SQL #10335: still block DELETE FROM via python3 -W <value> -c (option value is not a script)" \
+    "python3 -W ignore -c \"conn.execute('DELETE FROM users;')\"" "$SQL_ABSENT_REPO"
+assert_deny "SQL #10335: still block DELETE FROM via bash -o <value> -c (option value is not a script)" \
+    "bash -o pipefail -c \"run-query 'DELETE FROM users;'\"" "$SQL_ABSENT_REPO"
 assert_allow "SQL #10335: allow quoted probe to a script file after a chained segment" \
     "cd tests && python3 run_probe.py --case 'DELETE FROM users;'" "$SQL_ABSENT_REPO"
 
