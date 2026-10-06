@@ -845,3 +845,25 @@ fn role_prefix_missing_evidence_applies_time_rule_and_red_ci_is_left_to_the_forg
     let (v, _) = assess_scoped(base_tip, &ctx(&["Structural Checks"]), &red, Some(&ev));
     assert_eq!(v, Verdict::Fresh, "failing runs are ignored here and refused by the forge");
 }
+
+#[test]
+fn a_nested_role_json_against_a_shared_prefix_edit_stales_the_composite_via_role_prefix() {
+    // The checker discovers roles with `git ls-files -- 'defaults/roles/*.json'`,
+    // whose `*` crosses `/`: a JSON under `defaults/roles/extra/` adds a role
+    // whose whole prefix (both CLAUDE.md files included) is now summed and
+    // budget-checked. `main` editing CLAUDE.md under it is a genuine
+    // interaction, and no other structural component couples the pair — so
+    // only the Role Prompt Prefix spec can refuse it.
+    for (base, pr) in [
+        (&["CLAUDE.md"][..], &["defaults/roles/extra/nested.json"][..]),
+        (&["defaults/roles/extra/nested.json"][..], &["CLAUDE.md"][..]),
+    ] {
+        match structural_verdict(base, pr) {
+            Verdict::StaleInputs { check, reason, .. } => {
+                assert_eq!(check, ROLE_PREFIX_COMPOSITE, "{base:?} vs {pr:?}");
+                assert!(reason.clause.contains("coupled"), "{reason:?}");
+            }
+            v => panic!("{base:?} vs {pr:?}: expected the Role Prefix refusal, got {v:?}"),
+        }
+    }
+}
