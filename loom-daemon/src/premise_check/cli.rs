@@ -262,8 +262,17 @@ fn forge_inputs(opts: &Options, issue: i64, repo_root: &Path) -> Result<Inputs, 
     let use_cache = !opts.no_cache;
     let listing =
         crate::comment_trust::records::fetch_comment_listing(&repo, &num, repo_root, use_cache);
-    let object =
-        crate::comment_trust::records::fetch_issue_object(&repo, &num, repo_root, use_cache);
+    let object = listing.as_ref().and_then(|_| {
+        crate::comment_trust::records::fetch_issue_object(&repo, &num, repo_root, use_cache)
+    });
+    // #10025: REST core and GraphQL are separate quotas. When the REST reads
+    // fail (an exhausted core pool is the case that matters: the issue read
+    // above is GraphQL and just succeeded), read the same comments and
+    // authors over GraphQL. Its records go through the same trust filter.
+    let (listing, object) = match (listing, object) {
+        (Some(listing), Some(object)) => (Some(listing), Some(object)),
+        _ => graphql_listing_and_object(&repo, issue, repo_root).unzip(),
+    };
     let policy = crate::comment_trust::TrustPolicy::for_root(repo_root);
     let labels = v.labels.into_iter().map(|l| l.name).collect();
     let inputs = match (listing, object) {
@@ -273,9 +282,80 @@ fn forge_inputs(opts: &Options, issue: i64, repo_root: &Path) -> Result<Inputs, 
         _ => None,
     };
     inputs.ok_or_else(|| {
-        err(&format!("could not read the comments or author of issue #{issue} in {repo}"));
+        err(&format!(
+            "could not read the comments or author of issue #{issue} in {repo} (REST and GraphQL); \
+             under rate limiting, save the body and run premise-check.sh --body-file <path> --title <title>"
+        ));
         exit::ERROR
     })
+}
+
+/// The comments-with-authors query behind [`graphql_listing_and_object`],
+/// paginated by `gh api graphql --paginate` through `$endCursor`.
+const COMMENTS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$name){issue(number:$number){authorAssociation author{login __typename} comments(first:100,after:$endCursor){pageInfo{hasNextPage endCursor} nodes{body authorAssociation author{login __typename}}}}}}";
+
+/// The REST-exhaustion fallback (#10025) for the two reads the trust filter
+/// needs: issue `number`'s comments and its body's author, over GraphQL.
+/// `None` when `gh` fails or the response does not parse.
+fn graphql_listing_and_object(
+    repo: &str,
+    number: i64,
+    repo_root: &Path,
+) -> Option<(Vec<u8>, serde_json::Value)> {
+    let (owner, name) = repo.split_once('/')?;
+    let out = crate::script_helpers::run_gh(
+        &[
+            "api",
+            "graphql",
+            "--paginate",
+            "-f",
+            &format!("query={COMMENTS_QUERY}"),
+            "-f",
+            &format!("owner={owner}"),
+            "-f",
+            &format!("name={name}"),
+            "-F",
+            &format!("number={number}"),
+        ],
+        repo_root,
+        // The cache wrapper is a REST-read optimisation; this is the path
+        // taken precisely when REST is unavailable.
+        false,
+    );
+    parse_graphql_comments(&out.ok_output()?.stdout)
+}
+
+/// [`graphql_listing_and_object`]'s parse: the paginated responses (one JSON
+/// object per page) become a REST-listing-shaped JSON array of comments and
+/// the issue object, each record keeping its GraphQL author
+/// (`author{login __typename}`, `authorAssociation`) — a shape
+/// [`crate::comment_trust::Author::from_json`] reads, with an App identified
+/// by `__typename: "Bot"` rather than a `[bot]` suffix, so the #9548 trust
+/// filter judges it exactly as it judges the REST listing. `None` when any
+/// page carries `errors` or no issue.
+fn parse_graphql_comments(stdout: &[u8]) -> Option<(Vec<u8>, serde_json::Value)> {
+    use serde_json::Value;
+    let mut object = None;
+    let mut comments = Vec::new();
+    for page in serde_json::Deserializer::from_slice(stdout).into_iter::<Value>() {
+        let page = page.ok()?;
+        if page.get("errors").is_some_and(|e| !e.is_null()) {
+            return None;
+        }
+        let issue = page
+            .pointer("/data/repository/issue")
+            .filter(|i| i.is_object())?;
+        if let Some(Value::Array(nodes)) = issue.pointer("/comments/nodes") {
+            comments.extend(nodes.iter().cloned());
+        }
+        if object.is_none() {
+            object = Some(serde_json::json!({
+                "author": issue.get("author").cloned().unwrap_or(Value::Null),
+                "authorAssociation": issue.get("authorAssociation").cloned().unwrap_or(Value::Null),
+            }));
+        }
+    }
+    Some((serde_json::to_vec(&Value::Array(comments)).ok()?, object?))
 }
 
 /// The gate's [`Inputs`] with every record an untrusted author could have
