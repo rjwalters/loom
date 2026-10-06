@@ -717,6 +717,8 @@ impl Registry {
                 // #10524: wraps twin-otter-b; registered before the
                 // twin-otter pair so `-b` stays last.
                 Box::new(heuristics::LandQuickTern::new(fit.clone())),
+                // #10524 slice 3: quick-tern made drift-aware (#10528).
+                Box::new(heuristics::LandSwiftTern::new(fit.clone())),
                 // #10523: twin-otter-b plus the hold/sequence simulator;
                 // also before the twin-otter pair.
                 Box::new(heuristics::LandHeldHeron::new(fit.clone())),

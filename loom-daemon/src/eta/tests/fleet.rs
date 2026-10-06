@@ -632,6 +632,12 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
         "heuristics/land_quick_tern.rs",
         include_str!("../heuristics/land_quick_tern.rs"),
     ),
+    // #10524 slice 3: the drift-aware variant and the drift check it calls.
+    (
+        "heuristics/land_swift_tern.rs",
+        include_str!("../heuristics/land_swift_tern.rs"),
+    ),
+    ("regime.rs", include_str!("../regime.rs")),
     // #10523: the hold/sequence simulator and the heuristic that routes to it.
     ("hazard_sim.rs", include_str!("../hazard_sim.rs")),
     (

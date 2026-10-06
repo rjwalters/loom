@@ -14,7 +14,9 @@
 //! - [`drift`] runs a two-sided CUSUM over the last [`DRIFT_WINDOW_SEC`] of
 //!   scored outcomes, standardised against the older baseline residuals, and
 //!   yields a `drifted` flag. [`Drift::inflation`] exposes a plain widening
-//!   factor for a conformal layer (#10524) to consume later.
+//!   factor; [`drift_about`] centres the check on a calibrator's own shift.
+//!   Both are consumed by `land-2026-10-06-swift-tern`'s conformal layer
+//!   ([`super::conformal_ipcw::calibrate_drift_aware`], #10524).
 //!
 //! Both are pure and deterministic: no clock, no RNG. Leak-free: an outcome
 //! is used only when it was known strictly before `as_of`. Residuals are
@@ -217,6 +219,20 @@ impl Drift {
 /// The drift verdict for `stage` at `as_of`.
 #[must_use]
 pub fn drift(all: &[Residual], stage: Stage, as_of: DateTime<Utc>) -> Drift {
+    drift_with(all, stage, as_of, None)
+}
+
+/// [`drift`], but the recent residuals are compared with `center` (a
+/// log-ratio) instead of the baseline's mean; the baseline still sets the
+/// spread. A calibrator that has already moved its median by `center`
+/// (#10524) asks this: do recent outcomes still disagree with what it
+/// serves now? A shift it has absorbed no longer trips the check.
+#[must_use]
+pub fn drift_about(all: &[Residual], stage: Stage, as_of: DateTime<Utc>, center: f64) -> Drift {
+    drift_with(all, stage, as_of, Some(center))
+}
+
+fn drift_with(all: &[Residual], stage: Stage, as_of: DateTime<Utc>, center: Option<f64>) -> Drift {
     let recent_from = as_of - Duration::seconds(DRIFT_WINDOW_SEC);
     let base_from = as_of - Duration::seconds(BASELINE_WINDOW_SEC);
     let mut recent = Vec::new();
@@ -240,6 +256,7 @@ pub fn drift(all: &[Residual], stage: Stage, as_of: DateTime<Utc>) -> Drift {
     } else {
         (0.0, DEFAULT_SIGMA)
     };
+    let mu = center.unwrap_or(mu);
     let (mut hi, mut lo, mut peak) = (0.0_f64, 0.0_f64, 0.0_f64);
     for r in &recent {
         let z = (r.log_ratio - mu) / sigma;

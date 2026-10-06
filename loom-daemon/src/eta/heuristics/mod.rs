@@ -15,6 +15,9 @@
 //! ([`crate::eta::hazard_sim`]).
 //! `land-2026-10-06-keen-wren` (#10508) is twin-otter-b's priority-aware
 //! successor: the same evaluation over an `eta-fit/v2` file.
+//! `land-2026-10-06-swift-tern` (#10524) is quick-tern made drift-aware
+//! (#10528's drift check: shorter half-life; the inflation the check asks
+//! for is recorded, not applied).
 //! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
@@ -23,6 +26,7 @@ mod land_dependency;
 mod land_held_heron;
 mod land_keen_wren;
 mod land_quick_tern;
+mod land_swift_tern;
 mod land_twin_otter;
 mod land_twin_otter_b;
 mod land_v1;
@@ -41,6 +45,7 @@ pub use land_held_heron::{
 };
 pub use land_keen_wren::{LandKeenWren, LAND_KEEN_WREN, PRE_PR_METHOD as KEEN_WREN_PRE_PR_METHOD};
 pub use land_quick_tern::{LandQuickTern, LAND_QUICK_TERN};
+pub use land_swift_tern::{LandSwiftTern, LAND_SWIFT_TERN};
 pub(crate) use land_twin_otter::recompute as recompute_twin_otter;
 pub use land_twin_otter::{
     adapt_input, visit_entry, visit_seed, LandTwinOtter, DRAW_ORDER, LAND_TWIN_OTTER, METHOD,
@@ -64,7 +69,7 @@ pub const CALIBRATION_BASE: &str = LAND_V2;
 /// Every heuristic whose landed and still-open `land` estimates are kept as
 /// calibration evidence ([`crate::eta::calibration_log`]): [`CALIBRATION_BASE`]
 /// for `land-2026-10-06-calm-plover`, and [`LAND_TWIN_OTTER_B`] for
-/// `land-2026-10-06-quick-tern` (#10524). Each calibrator filters the rows
+/// `land-2026-10-06-quick-tern` and `land-2026-10-06-swift-tern` (#10524). Each calibrator filters the rows
 /// on its own base, so they never mix.
 pub const CALIBRATION_BASES: &[&str] = &[CALIBRATION_BASE, LAND_TWIN_OTTER_B];
 
