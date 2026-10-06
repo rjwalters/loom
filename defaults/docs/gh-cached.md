@@ -246,7 +246,9 @@ degrades to that real `gh`.
   name, more than 8! orders, `--watch`, `--required`, `--jq`/`--template`,
   `event`/`workflow`, a branch/URL selector, `GH_FORCE_TTY`, `CLICOLOR_FORCE`
   or `GH_DEBUG`/`DEBUG`. Golden fixtures from `gh` 2.100.0 pin the output
-  (`loom-daemon/src/agent_gh/fixtures/pr_checks/`).
+  (`loom-daemon/src/agent_gh/fixtures/pr_checks/`). `gh pr view --json
+  statusCheckRollup` still **passes through**: `gh` prints GraphQL's
+  `contexts` order, which no REST read exposes (#10629).
 - **Escape hatch**: `LOOM_GH_NO_CACHE=1` (also `GH_CACHE_DISABLE=1`) forces a
   real call. Env-only: there is no `--fresh` flag, since plain `gh` rejects it (#3547).
 - **Opt out of the shim**: `LOOM_GH_SHIM=0` at worker spawn or session start.

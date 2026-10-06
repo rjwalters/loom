@@ -174,6 +174,12 @@ const PASSTHROUGH: &[&str] = &[
     "pr view --json number",
     "pr view feature/issue-1 --json number",
     "pr view 42 --json mergeStateStatus,statusCheckRollup",
+    // GraphQL `contexts` order is not REST-derivable, so the rollup is not
+    // reproducible exactly: passthrough until #10629.
+    "pr view 42 --json statusCheckRollup",
+    "pr view 42 --json statusCheckRollup --repo o/r",
+    "pr view 42 --json state,statusCheckRollup -R o/r",
+    "pr view 42 --json statusCheckRollup --jq '.statusCheckRollup[].conclusion'",
     "pr view 42 --json reviews",
     "issue list --label loom:issue",
     "issue list --label loom:issue --json number,labels",

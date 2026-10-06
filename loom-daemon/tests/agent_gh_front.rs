@@ -288,6 +288,64 @@ fn pr_checks_shapes_it_cannot_reproduce_pass_through() {
     assert!(s.calls().iter().all(|c| !c.starts_with("api ")), "{:?}", s.calls());
 }
 
+/// `pr view --json statusCheckRollup` is not served (#10516 slice B split,
+/// tracked in #10629): `gh` prints the GraphQL `contexts` order, which
+/// no REST read exposes, so the front cannot reproduce it exactly. It must reach
+/// the real `gh` byte-identically, with no REST read in front of it, with or
+/// without the escape hatches.
+#[test]
+fn pr_view_status_check_rollup_passes_through() {
+    let s = Sandbox::new();
+    let shapes: [&[&str]; 3] = [
+        &[
+            "pr",
+            "view",
+            "42",
+            "--json",
+            "statusCheckRollup",
+            "--repo",
+            "o/r",
+        ],
+        &[
+            "pr",
+            "view",
+            "42",
+            "--json",
+            "state,statusCheckRollup",
+            "-R",
+            "o/r",
+        ],
+        &[
+            "pr",
+            "view",
+            "42",
+            "--json",
+            "statusCheckRollup",
+            "--repo",
+            "o/r",
+            "--jq",
+            ".statusCheckRollup[].conclusion",
+        ],
+    ];
+    for args in shapes {
+        for env in [
+            None,
+            Some(("LOOM_GH_NO_CACHE", "1")),
+            Some(("GH_CACHE_DISABLE", "1")),
+        ] {
+            let out = s.gh(args, &env.into_iter().collect::<Vec<_>>());
+            let expected: String = args
+                .iter()
+                .map(|a| format!("ARG:{a}\n"))
+                .collect::<String>()
+                + "SENTINEL:1\nSTDIN:\n";
+            assert_eq!(stdout(&out), expected, "{args:?} {env:?}: {out:?}");
+        }
+    }
+    assert!(s.calls().iter().all(|c| !c.starts_with("api ")), "{:?}", s.calls());
+    assert!(s.outcomes().iter().all(|o| o == "bypass"), "{:?}", s.outcomes());
+}
+
 #[test]
 fn mutation_passes_through_byte_identical() {
     let s = Sandbox::new();
