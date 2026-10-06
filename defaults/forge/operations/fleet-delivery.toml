@@ -154,6 +154,42 @@ notes = "Never record a token value in evidence. The accounting layer records pr
 kind = "script"
 path = "defaults/scripts/lib/github-app-token.sh"
 
+[[operation]]
+id = "identity.prohibited-unmanaged-egress"
+group = "identity-authentication"
+summary = "Typed bypasses of the managed gh launcher (`gh api https://…`, `gh auth login|setup-git|refresh`, a GH_HOST override) — prohibited under an enforcing routing policy."
+profile = "required-coordination"
+disposition = "prohibition"
+class = "write"
+inputs = []
+outputs = []
+required_fields = []
+actor = "operator"
+permissions = ["metadata:read"]
+pagination = "not-paginated"
+consistency = "fresh-read"
+idempotency = "not-idempotent"
+retry = "no-auto-retry"
+version_support = { github = "0" }
+test_id = "forge-probe::fleet-delivery::identity-prohibited-unmanaged-egress"
+test_status = "declared"
+owner = "daemon-forge"
+risk = "normal"
+github = { commands = [
+  "gh api https://",
+  "gh auth login",
+  "gh auth setup-git",
+  "gh auth refresh",
+], routes = [] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = []
+notes = "Classified as a PROHIBITION, not an active operation (#9989, C6 of epic #9983): each form reaches the forge with an unmanaged origin or credential, outside the managed launcher's routing. The caller below is the `loom:forge-egress` guard classifier, which names these commands only in order to DENY them and to point at the managed alternative — the opposite of a caller, listed here so the forge-inventory gate resolves its `gh api` / `gh auth` text to this decision."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_egress/guard.rs"
+
 # --- quota-caching-errors ----------------------------------------------------
 
 [[operation]]

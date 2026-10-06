@@ -418,8 +418,11 @@ has 20 landings in the window, else the stage, else all stages, else nothing
 (the base estimate is returned unchanged with no `calibration`; rows logged
 before observations carried the base's p25/p75/p90 and age are not evidence).
 A still-open base estimate is a **lower bound** `ln(elapsed / q_τ)` entering a
-Kaplan–Meier estimate with the landings; an unresolvable tail clamps to the
-largest bound. The change of every shift is limited to `ln 1.2` per day: the
+Kaplan–Meier estimate with the landings. When the landings cannot reach the
+level because the tail past the last landing is all still open, those bounds
+are read as landing at their bound, so the shift is the matching order
+statistic of the open bounds, never the single largest one (that clamp made
+the backtest's p90 days wide). The change of every shift is limited to `ln 1.2` per day: the
 shift is replayed day by day (on `as_of`'s own day lattice) from the oldest
 usable base estimate, each day's raw fit clamped to one step of the day
 before. The anchor is fixed by the evidence, not by `as_of`, so two estimates
@@ -453,6 +456,16 @@ Calm-plover scores each quantile against itself (`ln(actual / q_τ)`), moves
 the median too, conditions on the age bucket, and rate-limits the adjustment.
 That it fixes those defects is the hypothesis the shadow evidence and the
 #10233 gate test; it is not claimed here.
+
+*Backtest* (2026-10-06, `eta backtest --heuristic land-2026-10-06-calm-plover
+--compare land-v2` over 600 merged-PR label timelines of `rjwalters/loom`,
+1,247 common `land` cases, 10 walk-forward daily folds). p25–p75 coverage is
+47.1% (`land-v2`: 36.8%) and late surprise is 5.9% (`land-v2`: 24.1%). The
+three-quantile pinball delta is +336 s, with a 95% issue-bootstrap CI of
+[−632, +1,184] s, so it is not distinguishable from `land-v2`. But `pinball4`,
+the gate's deciding loss, is worse by 23,460 s [17,304, 29,266]: the wider
+p90 costs more than it saves. So the backtest does not make calm-plover a
+promotion candidate. The PR for #10489 records the full report.
 
 `land-2026-10-06-quick-tern` (#10524) ships the same way: registered, not
 current, tier `candidate`, shadowed into `alternates`, and promoted only
@@ -1012,6 +1025,96 @@ version. The fit (`Assembled::priority`, one per training row) and serving
   so twin-otter rows, coefficient files and explanations are unchanged.
   Before a new datestamped heuristic adopts them, a walk-forward in
   2AMLogic/loom-experiments must show they help (item 4 of #10333).
+
+### The `eta-fit/v2` priority inputs (#10508)
+
+`eta-fit/v2` is the feature set of the priority-aware successor to
+twin-otter-b. It is a **separate, versioned contract**
+(`eta::fit::features_v2`): `eta-fit/v1`, its 20 `FEATURES`, the v1
+transform, twin-otter and twin-otter-b are unchanged. A v2 coefficient vector
+is positional against `FEATURES_V2`, so a loader must dispatch on the
+file's `schema`. It must never read a v1 vector as v2.
+
+`FEATURES_V2` keeps v1's 20 positions, with position 16 changed from
+`starred` (the PR's own star) to `starred_any`. Six columns follow:
+
+| Column | Input | Unknown when |
+|--------|-------|--------------|
+| `starred_any` (pos. 16) | PR or linked-issue star (#10372) | see `star_unknown` |
+| `star_unknown` | 1 when the star/level are unknown | linked-star history does not cover the instant **and** the PR's own labels carry no star |
+| `priority_level` | effective level 0/1/2 (#10307) | as `star_unknown` |
+| `repo_rank` | the repo's normalized `fleet_priority` rank (0 dispatched first, 1 last) | no roster revision knowable at the cutoff, or the repo is not a member then |
+| `repo_rank_unknown` | 1 when `repo_rank` is unknown | |
+| `log_ahead_dispatch_fleet` | `ln_1p` of the other same-stage PRs, fleet-wide, that cross-repo dispatch puts first | the rank's history is unknown, the star is unknown, or the repo is out of scope |
+| `ahead_dispatch_fleet_unknown` | 1 when that position is unknown | |
+
+An unknown input is written as `0` with its indicator at `1`, so it is never
+read as a known zero. `PriorityCoverage` counts the rows that know each input,
+for a fit or backtest to report.
+
+- **One builder.** `eta::priority_inputs::priority_inputs` is the only
+  definition. The fit calls it (`rows::build_with_context`, written to
+  `Assembled::priority_inputs`), and serving calls it too
+  (`Tracker::priority_inputs_of`). Both pass the PR's own-label state, its
+  linked star (`None` when unknown), the roster and the roster history, so
+  train/serve skew (#10500) cannot arise in a second copy. A parity test
+  (`eta/tests/priority_inputs.rs`) builds one scenario both ways. Serving's
+  roster is the fleet view's modeled roster, whose entries are dated from the
+  fleet snapshots' label timeline (#10500), as training's are, so the
+  builder's inputs come from the same timeline on both sides.
+- **Fleet-wide position.** This uses `keyed_cmp` over
+  `ETA_FLEET_POSITION_KEYS`: the real dispatch comparator without
+  `main_red_fix`. Each PR's `workspace_priority` comes from the same historic
+  revision, and a non-member repo gets the comparator's default (100). It is
+  separate from #10333's same-repo `ahead_dispatch`, which is unchanged.
+- **Historic roster** (`eta::repo_priority`). A `RosterRevision` holds the
+  fleet store's desired set (`fleet: true`, not `firewall`) at one commit,
+  each member with its defaulted `fleet_priority`. A commit date alone does
+  not prove the change was seen then. A revision is knowable from the later of
+  its commit date and its recorded observation; `basis` says whether one was
+  recorded. `revision_at` takes the last revision in history order knowable
+  before `as_of - 120 s`. When none qualifies, the result is unknown: today's
+  `repos.yml` is never used.
+- **Rank.** `rank = (members with a lower priority + ½ · other members at an
+  equal priority) / (members - 1)`, and 0 for a one-member fleet. Ties
+  share the mid-rank. The denominator is the membership at that revision.
+- **Status: inputs only.** No coefficient file is written
+  with `eta-fit/v2`, and no heuristic reads these inputs yet. Still open in
+  #10508: the fleet-store history reader, the v2 fit and its
+  schema-dispatched loading, the new heuristic and its pre-PR composition,
+  and shadow registration on the ETA authority.
+
+### Friction predictors and cumulative stage age (#10521)
+
+The error analysis of `land-2026-10-04-twin-otter-b`'s misses found that
+most late surprises come from events after the estimate. `eta::loop_features`
+computes the point-in-time predictors that explain part of that. The fit
+(`Assembled::loops`, one per training row, at `t - 120 s`) and serving
+(`Tracker::loop_features_of`, over the same fleet snapshots' label timeline
+at `now - 120 s`, #10500) both call the one builder `loop_features`:
+
+| # | Feature (`LOOP_FEATURES`) | Meaning | Source |
+|---|---------------------------|---------|--------|
+| 1 | `log_overlap_prs`, `log_overlap_files`, `overlap_known` | Other open PRs in the repo whose changed files share a path with this PR's, and how many of this PR's paths they touch | Each PR's file list **as known at `as_of`**: the latest head-commit list read before `as_of`, never the final diff. If this PR's list or **any** open peer's list is not known before `as_of`, both counts are unknown (`overlap_known = 0`): a partly observed roster never reads as zero overlap. Not logged yet, so `overlap_known = 0` everywhere today |
+| 2 | `log_review_requests`, `log_approvals_lost` | `review_wait` entries so far; approvals lost (`merge_wait`/`merge_hold` left for `review_wait`, a stale-main re-review) | Stage episodes |
+| 3 | `own_ci_failed`, `ci_known` | Whether the PR's last CI run that finished before `as_of` failed | SigNoz `ci.run` first, forge only to fill gaps (#10511). Not logged yet, so `ci_known = 0` today |
+| 4 | `judge_reject_rate_7d`, `judge_rate_known` | Share of the repo's Judge verdicts (`review_wait` exits to `doctor` vs to `merge_wait`/`merge_hold`) in the trailing 7 days that sent the PR to Doctor; unknown under 5 verdicts | Stage episodes |
+| - | `log_cum_stage`, `stage_looped` | Hours in the current stage summed over every visit, as `ln(1 + h)`; whether the stage was visited before | Stage episodes |
+
+- **The stage-age fix.** `age_h` restarts at every loop, so a PR on its
+  fourth approval looks minutes old, and a linear age term over-predicts old
+  items. `log_cum_stage` is cumulative time in the stage across loops, logged
+  so the hazard flattens with age. `age_h` keeps its `eta-fit/v1` meaning.
+- **Knowable-at.** An episode counts once entered before `as_of` and as ended
+  only if it ended before `as_of`. A file list or CI run read at or after
+  `as_of` is ignored. A missing source is `null` with its `*_known` indicator
+  0, never a default that reads as "no overlap" or "CI green".
+- **No fleet-wide signals.** CI queue depth, cancellations, host version
+  spread, quota exhaustion and operator activity were shown not to help.
+- **Not a model input yet.** None of these is in `eta-fit/v1`'s `FEATURES`
+  (or `eta-fit/v2`'s `FEATURES_V2`), so twin-otter rows, coefficient files and explanations are unchanged. A new
+  datestamped shadow heuristic adopts them under its own schema version once
+  the loom-experiments walk-forward backtest passes (#10521).
 
 ## The explanation (`eta-explanation/v1`)
 
@@ -1648,7 +1751,9 @@ accepts `--repo-root PATH` (default: the current directory).
   instant and convergence of the interval. With `--compare` it pairs a second
   heuristic on the identical replay set (#9325): the union of cases counting
   refusals, and the walk-forward daily folds with the `--compare` side's
-  per-day win rate and its 95% Wilson interval (#10233). The fleet merges out
+  per-day win rate and its 95% Wilson interval (#10233), plus the paired
+  `compare − heuristic` pinball and `pinball4` deltas with 95% issue-bootstrap
+  intervals (whole issues resampled, fixed seed; #10489). The fleet merges out
   of sweep, so local records rarely carry a `land` case; `--pr-history PATH`
   (offline `eta-pr-case/v1` records) or the opt-in `--forge-pr-cases
   [--pr-limit N] [--save-pr-history PATH]` adds `land` cases from merged PRs'
