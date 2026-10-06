@@ -2307,6 +2307,33 @@ pub struct ForgeCallsStatus {
     /// `None` when the sink is disabled, or from an older daemon.
     #[serde(default)]
     pub identity_roles: Option<Vec<ForgeIdentityRoleCounts>>,
+    /// Host-wide counts over the window per billed bucket (W1), beside the
+    /// bucket book's newest reading. `None` when the sink is disabled, or
+    /// from an older daemon.
+    #[serde(default)]
+    pub buckets: Option<Vec<ForgeBucketStatus>>,
+}
+
+/// One billed GitHub rate-limit bucket of [`ForgeCallsStatus`] (W1):
+/// `(account, cred_owner, resource)`, what this host charged it over the
+/// window, and the bucket book's reading when one is believed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForgeBucketStatus {
+    /// `app-<id>`, `app-unknown`, `env-token`, `ambient` or `unknown`.
+    pub account: String,
+    /// The installation's owner, or `-` when the credential has none.
+    pub cred_owner: String,
+    pub resource: String,
+    /// Requests charged (`ok` rows × pages).
+    pub charged: u64,
+    pub not_modified: u64,
+    pub rate_limited: u64,
+    #[serde(default)]
+    pub used: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub reset_at: Option<DateTime<Utc>>,
 }
 
 /// One identity-role row of [`ForgeCallsStatus`] (#9872).

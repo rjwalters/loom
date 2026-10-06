@@ -27,7 +27,8 @@
 //! and idle slots per host, [`stage_dwell`] forge label-stage dwell, and
 //! [`disposition`] (#9222) one span per ready-queue row's disposition, on
 //! transition or periodic refresh. [`ratelimit`] (#10022) exports GitHub
-//! rate-limit breaker trips, quota gauges and breaker skips, and
+//! rate-limit breaker trips, quota gauges (per bucket since W1) and breaker
+//! skips, [`forge_calls`] (W1) the facade's `loom.forge.calls` counter, and
 //! [`redate_chain`] (#10163) #8508 re-date pressure (re-dated PRs, re-dates
 //! per PR, time to land), and [`eta_health`] (#10391) the per-host ETA
 //! pipeline health gauges. A new emitter adds a `MetricName`/`SpanName`
@@ -42,6 +43,7 @@ pub mod dispatch;
 pub mod disposition;
 pub mod dwell;
 pub mod eta_health;
+pub mod forge_calls;
 pub mod host;
 pub mod liveness;
 pub mod lockout;

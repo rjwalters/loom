@@ -936,34 +936,43 @@ pub fn spawn_reader_refresh(workspace_root: PathBuf, primary_owner_repo: Option<
             let ws = workspace_root.clone();
             let primary = primary_owner_repo.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                let roster = resolve(&ws);
-                if roster.readers.is_empty() {
-                    return;
-                }
-                let Some(factory) = real_minter_factory(&ws) else {
-                    return;
-                };
-                let mut owners: Vec<String> = primary.into_iter().collect();
-                for (owner_repo, _) in crate::credential_preflight::owner_refresh_sources() {
-                    let owner = crate::credential_preflight::owner_of_nwo(&owner_repo).to_string();
-                    if !owners
-                        .iter()
-                        .any(|o| crate::credential_preflight::owner_of_nwo(o) == owner)
-                    {
-                        owners.push(owner_repo);
-                    }
-                }
-                let outcomes = refresh_reader_credentials(&ws, &roster, &owners, &factory);
-                let ok = outcomes.iter().filter(|o| o.result.is_ok()).count();
-                log::debug!(
-                    "forge_identity: reader refresh — {ok}/{} reader×owner token(s) fresh — #9537",
-                    outcomes.len()
-                );
+                refresh_pass(&ws, primary);
+                // W1: one free `rate_limit` probe per published credential
+                // directory, after every pass (a no-op with none published).
+                crate::forge_bucket_book::probe_all(&ws);
             })
             .await;
             tokio::time::sleep(crate::credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
         }
     });
+}
+
+/// One reader-token refresh pass of [`spawn_reader_refresh`]: a cheap no-op
+/// with no readers or no minter script.
+fn refresh_pass(ws: &Path, primary: Option<String>) {
+    let roster = resolve(ws);
+    if roster.readers.is_empty() {
+        return;
+    }
+    let Some(factory) = real_minter_factory(ws) else {
+        return;
+    };
+    let mut owners: Vec<String> = primary.into_iter().collect();
+    for (owner_repo, _) in crate::credential_preflight::owner_refresh_sources() {
+        let owner = crate::credential_preflight::owner_of_nwo(&owner_repo).to_string();
+        if !owners
+            .iter()
+            .any(|o| crate::credential_preflight::owner_of_nwo(o) == owner)
+        {
+            owners.push(owner_repo);
+        }
+    }
+    let outcomes = refresh_reader_credentials(ws, &roster, &owners, &factory);
+    let ok = outcomes.iter().filter(|o| o.result.is_ok()).count();
+    log::debug!(
+        "forge_identity: reader refresh — {ok}/{} reader×owner token(s) fresh — #9537",
+        outcomes.len()
+    );
 }
 
 /// The production minter factory: [`IdentityMinter`] over the workspace's

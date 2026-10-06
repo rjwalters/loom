@@ -15,6 +15,11 @@
 //!   the collector's rate-limit tick: one `gh api rate_limit` probe (free —
 //!   it does not count against the quota), falling back to the breaker's
 //!   trip-time budget when the probe fails.
+//! - **Per-bucket `github.ratelimit.{remaining,used,reset}`** (W1): the same
+//!   gauges for every reading in [`crate::forge_bucket_book`], with an
+//!   `owner` label, so each App installation's pool is its own series.
+//! - **`loom.forge.calls`** (W1): the facade's delta counter
+//!   ([`super::forge_calls`]), flushed on this tick.
 //! - **`github.ratelimit.breaker_skips{reason=<job>}`**, a delta counter: one
 //!   per pass a job skipped because the breaker was suppressing. Skip sites
 //!   call [`record_skip`] (via `rate_limit_breaker::global_skip_pass`), which
@@ -321,6 +326,40 @@ pub fn quota_points(budget: &BudgetSnapshot, account: &str) -> Vec<MetricPoint> 
     points
 }
 
+/// Gauges for every believed bucket-book reading (W1), labelled
+/// `resource`, `account` and `owner` — one series per billed bucket, beside
+/// the single-credential points of [`quota_points`], which stay unchanged.
+#[must_use]
+pub fn bucket_points(
+    readings: &[(crate::forge_bucket_book::BucketKey, crate::forge_bucket_book::Reading)],
+) -> Vec<MetricPoint> {
+    let mut points = Vec::new();
+    for (key, reading) in readings {
+        let point = |name, value| {
+            MetricPoint::int(name, value)
+                .label("resource", key.resource.as_str())
+                .label("account", key.account.as_str())
+                .label("owner", key.owner.as_str())
+        };
+        if let Some(remaining) = reading.remaining {
+            points.push(point(MetricName::GithubRateLimitRemaining, clamp(remaining)));
+        }
+        if let Some(used) = reading.used {
+            points.push(point(MetricName::GithubRateLimitUsed, clamp(used)));
+        }
+        points.push(point(MetricName::GithubRateLimitReset, reading.reset_epoch));
+    }
+    points
+}
+
+/// Emit `points` in batches no larger than one record carries, so a busy
+/// interval's `loom.forge.calls` series are never truncated.
+fn emit_chunked(sink: &super::OpsSink, points: Vec<MetricPoint>, since: Option<DateTime<Utc>>) {
+    for chunk in points.chunks(crate::telemetry::ops::MAX_POINTS_PER_RECORD) {
+        sink.emit_metrics_since(chunk.to_vec(), since);
+    }
+}
+
 /// The collector's rate-limit tick: one free `gh api rate_limit` probe and
 /// one skip-counter flush per interval.
 pub const TICK: std::time::Duration = std::time::Duration::from_secs(60);
@@ -409,6 +448,9 @@ pub async fn record(workspace_root: &Path) {
         .unwrap_or_else(PoisonError::into_inner)
         .replace(now);
     sink.emit_metrics_since(drain_skip_points(), since);
+    emit_chunked(sink, super::forge_calls::drain_points(), since);
+    let book = crate::forge_bucket_book::snapshot(now.timestamp());
+    emit_chunked(sink, bucket_points(&book), None);
     let root = workspace_root.to_path_buf();
     let sampled = tokio::task::spawn_blocking(move || {
         let budget = crate::rate_limit_breaker::forge::probe_budget(now).or_else(|| {

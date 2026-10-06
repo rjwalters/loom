@@ -40,6 +40,14 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     "state",
     "resource",
     "task",
+    // W1: per-bucket rate-limit gauges and `loom.forge.calls`.
+    "owner",
+    "caller",
+    "op",
+    "role",
+    "cred_owner",
+    "target_owner",
+    "outcome",
     "heuristic",
     "kind",
     "repo",
@@ -261,6 +269,12 @@ pub enum MetricName {
     /// `observability::ops::ratelimit::Job`).
     #[serde(rename = "github.ratelimit.breaker_skips")]
     GithubRateLimitBreakerSkips,
+    /// Requests the `gh` facade spent since the previous point (W1),
+    /// labelled `caller`, `op`, `role`, `account`, `cred_owner`,
+    /// `target_owner`, `resource` and `outcome`; a paginated call counts its
+    /// pages when known.
+    #[serde(rename = "loom.forge.calls")]
+    ForgeCalls,
     // ---- Merge-chain re-date pressure (Issue #10163) ----------------------
     /// PRs with at least one #8508 re-date commit in the trailing window,
     /// labelled `state` = `landed` / `pending` / `stuck` (pending with at
@@ -361,6 +375,7 @@ impl MetricName {
             Self::GithubRateLimitUsed => "github.ratelimit.used",
             Self::GithubRateLimitReset => "github.ratelimit.reset",
             Self::GithubRateLimitBreakerSkips => "github.ratelimit.breaker_skips",
+            Self::ForgeCalls => "loom.forge.calls",
             Self::MergeRedatePrs => "loom.merge.redate_prs",
             Self::MergeRedatesMax => "loom.merge.redates_max",
             Self::MergeTimeToLandMax => "loom.merge.time_to_land_max",
@@ -403,6 +418,7 @@ impl MetricName {
             | Self::ForgeStageDwellSamples
             | Self::QueueDispositionRowsDropped
             | Self::GithubRateLimitBreakerSkips
+            | Self::ForgeCalls
             | Self::DaemonTaskFaults => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
@@ -438,6 +454,7 @@ impl MetricName {
             Self::GithubRateLimitRemaining | Self::GithubRateLimitUsed => "{request}",
             Self::GithubRateLimitReset => "s",
             Self::GithubRateLimitBreakerSkips => "{pass}",
+            Self::ForgeCalls => "{request}",
             Self::MergeRedatePrs => "{pull_request}",
             Self::MergeRedatesMax => "{redate}",
             Self::MergeTimeToLandMax => "s",
@@ -508,6 +525,9 @@ impl MetricName {
             Self::GithubRateLimitReset => "GitHub rate-limit window reset, Unix epoch seconds.",
             Self::GithubRateLimitBreakerSkips => {
                 "Job passes skipped by the rate-limit breaker, by job."
+            }
+            Self::ForgeCalls => {
+                "GitHub requests sent by the gh facade, by caller, bucket and outcome."
             }
             Self::MergeRedatePrs => "PRs re-dated in the trailing window, by landing state.",
             Self::MergeRedatesMax => "Most re-dates on one PR in the trailing window, by state.",
