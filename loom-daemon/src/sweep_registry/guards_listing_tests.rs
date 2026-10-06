@@ -175,7 +175,12 @@ fn a_fork_clone_lists_the_resolved_repo_not_origin() {
         assert!(ok, "git {args:?}");
     };
     git(&["init", "-q"]);
-    git(&["remote", "add", "origin", "https://github.com/outsider/loom.git"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/outsider/loom.git",
+    ]);
     let upstream = listing(&[ours(901).body("Closes #90")]);
     let arm = format!(
         "case \"$*\" in\n  \
