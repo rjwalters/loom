@@ -296,6 +296,8 @@ pub struct Tracker {
     orphaned: usize,
     /// Pending estimates dropped by the [`MAX_PENDING`] cap.
     cap_dropped: usize,
+    /// Of those, whole series lost: more distinct series than the cap.
+    cap_series_dropped: usize,
     /// The last pass's fleet view and dispatch plan, for `features` (#10201).
     context: features::PassContext,
     /// Latest queue-friction readings (#10193), copied onto every estimate's
@@ -314,6 +316,9 @@ pub struct Dropped {
     pub orphaned: usize,
     /// Dropped by the [`MAX_PENDING`] cap.
     pub over_cap: usize,
+    /// Of those, the last estimate of a series (#10496): only when there
+    /// are more distinct series than the cap, so such a series is lost.
+    pub series_over_cap: usize,
 }
 
 /// The stage entered when sweep phase `phase` completes, for the phases that
@@ -336,6 +341,7 @@ impl Tracker {
             loom,
             orphaned: 0,
             cap_dropped: 0,
+            cap_series_dropped: 0,
             context: features::PassContext::default(),
             friction: super::friction::FrictionBook::default(),
             answers: Vec::new(),
@@ -348,6 +354,7 @@ impl Tracker {
         Dropped {
             orphaned: std::mem::take(&mut self.orphaned),
             over_cap: std::mem::take(&mut self.cap_dropped),
+            series_over_cap: std::mem::take(&mut self.cap_series_dropped),
         }
     }
 

@@ -40,6 +40,8 @@ pub struct EtaHealth {
     fit_check: Option<(DateTime<Utc>, String)>,
     /// Rows, and rows with alternates, of the last built `eta.snapshot`.
     snapshot_rows: Option<(u64, u64)>,
+    /// Pending estimates the cap evicted since start; `None` before a pass.
+    pending_over_cap: Option<u64>,
     /// Cached fleet snapshot `as_of`, keyed by file, re-read on an mtime change.
     ages: BTreeMap<PathBuf, (SystemTime, String, DateTime<Utc>)>,
     /// Series keys already exported, so a bucket that empties is zeroed
@@ -82,6 +84,23 @@ impl EtaHealth {
     /// Record the last built `eta.snapshot`: its rows and those with alternates.
     pub fn snapshot(&mut self, rows: u64, alternates_rows: u64) {
         self.snapshot_rows = Some((rows, alternates_rows));
+    }
+}
+
+/// Add `n` cap-evicted pending estimates to the cumulative count, and warn
+/// when any were evicted (#10496). `series` of them were the last estimate
+/// of their series — evicted only when distinct series exceed the cap.
+pub fn note_over_cap(n: usize, series: usize) {
+    with(|h| {
+        let total = h.pending_over_cap.unwrap_or(0);
+        h.pending_over_cap = Some(total.saturating_add(n as u64));
+    });
+    if n > 0 {
+        log::warn!(
+            "eta: evicted {n} pending estimate(s) at the {} cap (redundant refreshes, then \
+             pairs to their earliest); {series} whole series lost: more distinct series than the cap",
+            crate::eta::tracker::MAX_PENDING
+        );
     }
 }
 
@@ -137,6 +156,8 @@ pub struct Facts {
     pub last_tick: Option<DateTime<Utc>>,
     pub refresh_repos: BTreeMap<String, u64>,
     pub snapshot_rows: Option<(u64, u64)>,
+    /// Cumulative cap evictions; `None` before the first ETA pass.
+    pub pending_over_cap: Option<u64>,
     /// Items bucket keys exported on earlier passes; zeroed when absent now.
     pub prev_items: BTreeSet<ItemKey>,
     /// Refresh stop reasons exported on earlier passes; zeroed when absent now.
@@ -219,6 +240,9 @@ pub fn points(facts: &Facts) -> Vec<MetricPoint> {
         out.push(MetricPoint::int(MetricName::EtaHealthSnapshotRows, count(rows)));
         out.push(MetricPoint::int(MetricName::EtaHealthSnapshotAlternatesRows, count(alternates)));
     }
+    if let Some(n) = facts.pending_over_cap {
+        out.push(MetricPoint::int(MetricName::EtaHealthPendingOverCap, count(n)));
+    }
     out
 }
 
@@ -293,6 +317,7 @@ fn gather(root: &Path, host_id: &str, now: DateTime<Utc>, health: &mut EtaHealth
         last_tick: tick.map(|(at, _)| at),
         refresh_repos: repos,
         snapshot_rows,
+        pending_over_cap: health.pending_over_cap,
         prev_items: health.emitted_items.clone(),
         prev_reasons: health.emitted_reasons.clone(),
     }
