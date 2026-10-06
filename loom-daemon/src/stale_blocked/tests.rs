@@ -9,6 +9,7 @@
 //! advisory from crying wolf on every sweep.
 
 use super::*;
+use crate::park_record::BlockerRef;
 
 fn dep(number: i64, checked: bool, state: Option<&str>) -> named::Dep {
     named::Dep {
@@ -232,7 +233,7 @@ fn an_unrecognised_state_is_treated_as_open() {
 fn a_parked_pr_whose_blocker_closed_is_stale() {
     let e = Evidence {
         prose: vec![prose_ref(8322, "CLOSED")],
-        declared: vec![8322],
+        declared: vec![BlockerRef::local(8322)],
         self_block: None,
         ..Evidence::default()
     };
@@ -246,7 +247,7 @@ fn a_parked_pr_whose_blocker_closed_is_stale() {
 fn a_parked_pr_with_a_cleared_blocker_but_an_operator_hold_is_superseded() {
     let e = Evidence {
         prose: vec![prose_ref(8322, "CLOSED")],
-        declared: vec![8322],
+        declared: vec![BlockerRef::local(8322)],
         self_block: park_self_block(&{
             let mut p = pr(8314, "OPEN");
             p.labels = vec!["loom:operator".to_string()];
@@ -272,7 +273,7 @@ fn a_parked_pr_that_cannot_land_is_superseded() {
     p.merge_state_status = "DIRTY".to_string();
     let e = Evidence {
         prose: vec![prose_ref(8322, "MERGED")],
-        declared: vec![8322],
+        declared: vec![BlockerRef::local(8322)],
         self_block: park_self_block(&p),
         ..Evidence::default()
     };
@@ -296,7 +297,7 @@ fn a_prs_own_review_state_labels_are_not_a_self_block() {
 
     let e = Evidence {
         prose: vec![prose_ref(8322, "CLOSED")],
-        declared: vec![8322],
+        declared: vec![BlockerRef::local(8322)],
         self_block: park_self_block(&p),
         ..Evidence::default()
     };
@@ -326,7 +327,7 @@ fn a_self_block_alone_never_manufactures_a_finding() {
     p.labels = vec!["loom:operator".to_string()];
     let e = Evidence {
         prose: vec![prose_ref(8322, "OPEN")],
-        declared: vec![8322],
+        declared: vec![BlockerRef::local(8322)],
         self_block: park_self_block(&p),
         ..Evidence::default()
     };
@@ -453,4 +454,55 @@ fn cited_among_reports_every_closed_number_cited_once_each() {
 #[test]
 fn cited_among_is_empty_on_an_empty_input() {
     assert!(cited_among(Artifact::Issue, &input("", &[]), &[180]).is_empty());
+}
+
+fn remote(repo: &str, number: i64, state: &str) -> RemoteRef {
+    RemoteRef {
+        repo: repo.to_string(),
+        number,
+        state: state.to_string(),
+    }
+}
+
+#[test]
+fn a_closed_cross_repo_declared_blocker_is_stale() {
+    let e = Evidence {
+        declared: vec![BlockerRef {
+            repo: Some("2AMLogic/2am".into()),
+            number: 1088,
+        }],
+        remote: vec![remote("2AMLogic/2am", 1088, "CLOSED")],
+        ..Evidence::default()
+    };
+    assert!(!undeclared(&e));
+    match classify(&e) {
+        Verdict::Stale(r) => assert!(r[0].contains("2AMLogic/2am#1088:CLOSED"), "{r:?}"),
+        v => panic!("{v:?}"),
+    }
+}
+
+#[test]
+fn an_open_cross_repo_declared_blocker_stays_blocked() {
+    let e = Evidence {
+        remote: vec![remote("o/r", 5, "OPEN")],
+        ..Evidence::default()
+    };
+    assert_eq!(classify(&e), Verdict::StillBlocked);
+}
+
+#[test]
+fn a_closed_local_number_does_not_clear_a_cross_repo_blocker() {
+    // Local #5 closed (prose), but the park names o/r#5 which is open: the park
+    // text, once masked, carries no local #5 at all.
+    let body = "<!-- loom:park Blocked by: o/r#5 -->";
+    let input = crate::dep_recheck::extract::Input {
+        body: body.to_string(),
+        comments: Vec::new(),
+    };
+    assert!(cited_among(Artifact::Issue, &input, &[5]).is_empty());
+    let local = crate::dep_recheck::extract::Input {
+        body: "<!-- loom:park Blocked by: #5 -->".to_string(),
+        comments: Vec::new(),
+    };
+    assert_eq!(cited_among(Artifact::Issue, &local, &[5]), vec![5]);
 }

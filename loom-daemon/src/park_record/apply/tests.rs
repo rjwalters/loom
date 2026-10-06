@@ -13,7 +13,7 @@ const AT: &str = "2026-10-04T03:00:00Z";
 #[derive(Default)]
 struct Fake {
     state: IssueState,
-    blockers: HashMap<u64, &'static str>,
+    blockers: HashMap<(Option<String>, u64), &'static str>,
     calls: Vec<String>,
     fail_body: bool,
 }
@@ -29,7 +29,11 @@ impl Fake {
         }
     }
     fn blocker(mut self, n: u64, state: &'static str) -> Self {
-        self.blockers.insert(n, state);
+        self.blockers.insert((None, n), state);
+        self
+    }
+    fn remote(mut self, repo: &str, n: u64, state: &'static str) -> Self {
+        self.blockers.insert((Some(repo.to_string()), n), state);
         self
     }
     fn mutations(&self) -> Vec<&String> {
@@ -45,10 +49,11 @@ impl ParkForge for Fake {
         self.calls.push(format!("view {number}"));
         Ok(self.state.clone())
     }
-    fn state(&mut self, number: u64) -> Result<String, String> {
-        self.calls.push(format!("state {number}"));
+    fn state(&mut self, repo: Option<&str>, number: u64) -> Result<String, String> {
+        self.calls
+            .push(format!("state {}{number}", repo.map(|r| format!("{r}#")).unwrap_or_default()));
         self.blockers
-            .get(&number)
+            .get(&(repo.map(str::to_string), number))
             .map(|s| (*s).to_string())
             .ok_or_else(|| "404".to_string())
     }
@@ -76,7 +81,8 @@ impl ParkForge for Fake {
 fn req(blocked_by: &[u64], reason: Option<&str>) -> ApplyRequest {
     ApplyRequest {
         number: 10,
-        blocked_by: blocked_by.to_vec(),
+        repo: Some("me/here".to_string()),
+        blocked_by: blocked_by.iter().map(|n| BlockerRef::local(*n)).collect(),
         reason: reason.map(str::to_string),
         by: Some("builder".to_string()),
         at: AT.to_string(),
@@ -124,7 +130,7 @@ fn body_is_written_before_the_label_and_building_is_dropped_last() {
             "remove_label 10 loom:building"
         ]
     );
-    assert_eq!(park_record_blockers(&f.state.body), vec![11]);
+    assert_eq!(park_record_blockers(&f.state.body), vec![BlockerRef::local(11)]);
     assert!(f
         .state
         .body
@@ -133,7 +139,7 @@ fn body_is_written_before_the_label_and_building_is_dropped_last() {
     assert_eq!(f.state.labels, vec!["loom:blocked".to_string()]);
 }
 
-fn park_record_blockers(body: &str) -> Vec<u64> {
+fn park_record_blockers(body: &str) -> Vec<BlockerRef> {
     super::super::blockers(body)
 }
 
@@ -187,7 +193,10 @@ fn only_undeclared_blockers_are_appended() {
         .blocker(12, "open");
     assert_eq!(run(&mut f, &req(&[11, 12], None)).0, exit::OK);
     assert_eq!(f.state.body.matches("Blocked by: #11").count(), 1);
-    assert_eq!(park_record_blockers(&f.state.body), vec![11, 12]);
+    assert_eq!(
+        park_record_blockers(&f.state.body),
+        vec![BlockerRef::local(11), BlockerRef::local(12)]
+    );
 }
 
 #[test]
@@ -238,7 +247,7 @@ fn an_applied_park_is_visible_to_check_stale_blocked() {
         declared: park_record_blockers(&input.body),
         ..Evidence::default()
     };
-    assert_eq!(e.declared, vec![11]);
+    assert_eq!(e.declared, vec![BlockerRef::local(11)]);
     assert!(!stale_blocked::undeclared(&e), "the park is declared, not prose-only");
     assert_eq!(stale_blocked::classify(&e), Verdict::StillBlocked);
 }
@@ -282,4 +291,42 @@ fn no_role_prompt_adds_loom_blocked_with_a_bare_label_edit() {
          (#10152):\n{}",
         offenders.join("\n")
     );
+}
+
+fn qreq(refs: &[&str]) -> ApplyRequest {
+    ApplyRequest {
+        blocked_by: refs.iter().map(|r| r.parse().unwrap()).collect(),
+        ..req(&[], None)
+    }
+}
+
+#[test]
+fn mixed_blocked_by_shapes_parse_and_apply() {
+    let mut f = Fake::new("body", &["loom:building"])
+        .remote("2AMLogic/2am", 1088, "open")
+        .blocker(5, "open")
+        .blocker(7, "open");
+    let r = qreq(&["2AMLogic/2am#1088", "#5", "7"]);
+    assert_eq!(run(&mut f, &r).0, exit::OK);
+    assert!(f.calls.contains(&"state 2AMLogic/2am#1088".to_string()), "{:?}", f.calls);
+    assert_eq!(park_record_blockers(&f.state.body).len(), 3);
+}
+
+#[test]
+fn a_cross_repo_ref_with_the_issues_own_number_is_not_a_self_block() {
+    let r = qreq(&["other/repo#10"]);
+    assert_eq!(precheck(&r), None);
+    assert!(precheck(&qreq(&["#10"])).is_some());
+    assert!(precheck(&qreq(&["me/here#10"])).is_some(), "same repo is a self-block");
+}
+
+#[test]
+fn a_closed_cross_repo_blocker_is_refused() {
+    let mut f = Fake::new("body", &[])
+        .remote("o/r", 3, "closed")
+        .blocker(3, "open");
+    let (code, _, err) = run(&mut f, &qreq(&["o/r#3"]));
+    assert_eq!(code, exit::REFUSED);
+    assert!(err.contains("o/r#3"), "{err}");
+    assert!(f.mutations().is_empty());
 }
