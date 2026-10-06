@@ -2972,6 +2972,7 @@ rules with `git check-ignore`.
 | `autonomous.eta.fleetRefresh.backfillMaxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_MAX_CALLS` | `600` per cycle for backfill passes, host-wide (was `1500`, most of a 5,000/h installation, #10329); a larger backfill resumes next cycle. Spend per hour is `budget × 3600 / intervalSecs`, so a lowered `intervalSecs` multiplies it |
 | `autonomous.eta.fleetRefresh.reserveCalls` | `LOOM_ETA_FLEET_REFRESH_RESERVE` | `1500` — below this many remaining core calls, skip the rest of that reader installation's repos (App and repo owner, #10329) this cycle |
 | `autonomous.eta.fleetRefresh.backfillDays` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS` | `21` (floor `15`, the fit window + 1) |
+| `autonomous.eta.fleetRefresh.signoz.*` (`enabled`, `endpoint`, `user`, `credentialFile`, `pageSize`, `maxPages`) | `LOOM_ETA_FLEET_SIGNOZ_*` (`_ENABLED`, `_ENDPOINT`, `_USER`, `_CREDENTIAL_FILE`, `_PAGE_SIZE`, `_MAX_PAGES`) | `false` (#9758). Caches the fleet's `sweep.outcome` records from SigNoz (the in-sweep half). Needs `endpoint` (ClickHouse HTTP) and `credentialFile`, the path of an owner-only password file outside every repo, never the secret. `pageSize` `500`, `maxPages` `200`. Runs inside the fleet refresh cycle, so it also needs `fleetRefresh.enabled`. See [`eta.md` → SigNoz in-sweep half](eta.md#signoz-in-sweep-half-fleetrefreshsignoz-9758) |
 
 Model, heuristics, explanation schema, scoring and queries:
 [`eta.md`](eta.md); the fleet refresh task's passes, resume files, rate-limit

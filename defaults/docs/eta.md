@@ -174,14 +174,15 @@ A filter asking for `eta-stage-samples.jsonl` also admits a
 read off label events), and `eta backfill` already writes exactly those rows
 into the local stage journal from the same derivation. `sweep-outcome`
 filters do **not** admit it — a forge timeline cannot see inside a sweep, so
-`finish-v1` is untouched by a snapshot, and a fleet-only history has no
-in-sweep merge share to invent one from.
+`finish-v1` is untouched by a forge snapshot alone, and a fleet-only forge
+history has no in-sweep merge share to invent one from. The same
+`sweep-outcome` filter does admit `signoz:sweep.outcome` (see below).
 
-**Out of scope until harness-ops#249.** Fleet-wide *in-sweep* samples
-(`sweep.curator`, `sweep.builder`) would have to come from the fleet's
-`sweep.outcome` records in SigNoz, which is blocked on fleet workers exporting
-at all. Until then `augment` (the default) keeps this host's journals for the
-in-sweep half and takes the forge's word for the human-gated half.
+Fleet-wide *in-sweep* samples (`sweep.curator`, `sweep.builder`) come from the
+SigNoz half; see [SigNoz in-sweep half](#signoz-in-sweep-half-fleetrefreshsignoz-9758).
+Under `augment` (the default), this host's own sweeps are still read from its
+journal, never twice (deduped by `(host, sweep_id)`), and the forge supplies the
+human-gated half.
 
 ### Operator holds: `merge_hold` and stage episodes (#10218)
 
