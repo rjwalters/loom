@@ -456,6 +456,7 @@ fn daemon_ci_log_attribute_containers() -> BTreeMap<String, &'static str> {
         duration_ms: 0,
         queued_ms: Some(0),
         trigger_reason: Some("new_commit".into()),
+        observed_at: Some(at),
     };
     let job = CiJobRecord {
         repo: "2amlogic/example".into(),
@@ -477,6 +478,7 @@ fn daemon_ci_log_attribute_containers() -> BTreeMap<String, &'static str> {
         shard_index: Some(1),
         shard_total: Some(3),
         shard_kind: "nextest-partition".into(),
+        observed_at: Some(at),
     };
     let chunk = CiJobLogRecord {
         repo: "2amlogic/example".into(),
