@@ -12,9 +12,9 @@
 //! | Column | Meaning |
 //! |---|---|
 //! | `record_id` | `loom.record_id`, else a content hash (webhook export rows carry none) |
-//! | `kind` | `loom.kind`, else the body (the OTLP event name) |
+//! | `kind` | `loom.kind`, else the body's `kind` on a webhook row, else the body (the OTLP event name) |
 //! | `service` | resource `service.name`: [`SERVICE_WEBHOOK`] for the loom-ui export |
-//! | `repo` | `loom.repo`; the queried repo on a `queue.snapshot` row (host-level, no repo) |
+//! | `repo` | the queried repo on a `queue.snapshot` row (host-level, no repo); else `loom.repo`, else the body's `repo` on a webhook row |
 //! | `attrs` / `nums` | the string / number attribute maps, as JSON |
 //! | `body` | the log body: the record's JSON for the JSON-body kinds |
 //! | `event_time_ns` / `knowable_time_ns` | `timestamp` / `observed_timestamp` |
@@ -100,13 +100,26 @@ pub mod reject {
 }
 
 /// The timeline query (see the module docs for its columns).
+///
+/// `kind` and `repo` are the **resolved** values, and the `WHERE` filters on
+/// them, not on the raw attributes: a `loom.kind` / `loom.repo` attribute
+/// wins; on a [`SERVICE_WEBHOOK`] row (empty attribute maps, the D1 record as
+/// a JSON body) they fall back to the body's top-level `kind` / `repo`; any
+/// other row's kind falls back to the body (the OTLP event name) and its repo
+/// to nothing. The body fallback is scoped to the webhook service so a daemon
+/// row's JSON body can never stand in for its missing attributes.
 pub const TIMELINE_SQL: &str = "\
 SELECT
     if(attributes_string['loom.record_id'] != '', attributes_string['loom.record_id'],
        concat('h:', toString(cityHash64(body, toJSONString(attributes_string), timestamp)))) AS record_id,
-    if(attributes_string['loom.kind'] != '', attributes_string['loom.kind'], body) AS kind,
     resources_string['service.name'] AS service,
-    if(kind = 'queue.snapshot', {repo:String}, attributes_string['loom.repo']) AS repo,
+    multiIf(attributes_string['loom.kind'] != '', attributes_string['loom.kind'],
+            service = 'loom-ui-d1-export', JSONExtractString(body, 'kind'),
+            body) AS kind,
+    multiIf(kind = 'queue.snapshot', {repo:String},
+            attributes_string['loom.repo'] != '', attributes_string['loom.repo'],
+            service = 'loom-ui-d1-export', JSONExtractString(body, 'repo'),
+            '') AS repo,
     toJSONString(attributes_string) AS attrs,
     toJSONString(attributes_number) AS nums,
     body,
@@ -115,7 +128,7 @@ SELECT
 FROM signoz_logs.distributed_logs_v2
 WHERE kind IN ('label.transition', 'label.first_seen', 'pr.resolved', 'ci.run', 'ci.job',
                'ci.duration', 'queue.snapshot')
-  AND (lower(attributes_string['loom.repo']) = lower({repo:String}) OR kind = 'queue.snapshot')
+  AND lower(repo) = lower({repo:String})
   AND observed_timestamp >= {since_ns:UInt64}
   AND observed_timestamp <= {until_ns:UInt64}
   AND (observed_timestamp, record_id) > ({after_ns:UInt64}, {after_id:String})
