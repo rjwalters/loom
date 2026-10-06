@@ -11,7 +11,7 @@
 //! |---|---|---|
 //! | `LOOM-MERGE-QUEUE-DIRECT` | 0 | direct mode: proceed exactly as before |
 //! | `LOOM-MERGE-QUEUE-MODE` | 0 | (`--mode-only`) queue mode, nothing read |
-//! | `LOOM-MERGE-QUEUE-CONTINUE` | 0 | queue mode: run the guards, then `handoff` |
+//! | `LOOM-MERGE-QUEUE-CONTINUE` | 0 | queue mode: run the guards, then `handoff` (`step` does both) |
 //! | `LOOM-MERGE-QUEUE-MERGED` | 0 | GitHub confirmed the merge |
 //! | `LOOM-MERGE-QUEUE-QUEUED` | 7 | still queued and authorized: not merged, nothing wrong |
 //! | `LOOM-MERGE-QUEUE-DROPPED` | 7 | GitHub dropped it; reason commented and routed |
@@ -275,6 +275,42 @@ pub fn run(cmd: &MergeQueueCmd, env: &Env, mode: MergeMode) -> Option<Report> {
             };
             let r = handoff(&ctx(env, mode, &l), *pr, approved_sha, &required);
             render_handoff(*pr, approved_sha, &r)
+        }
+        MergeQueueCmd::Step {
+            pr,
+            approved_sha,
+            repo,
+        } => {
+            if mode == MergeMode::Direct {
+                return Some(direct());
+            }
+            let rec = run(
+                &MergeQueueCmd::Reconcile {
+                    pr: Some(*pr),
+                    repo: repo.clone(),
+                    mode_only: false,
+                },
+                env,
+                mode,
+            )?;
+            // Hand off only on the explicit CONTINUE verdict; every other
+            // outcome (queued, dropped, merged, undetermined) is final here.
+            if rec
+                .stdout
+                .first()
+                .is_some_and(|l| l.starts_with("LOOM-MERGE-QUEUE-CONTINUE"))
+            {
+                return run(
+                    &MergeQueueCmd::Handoff {
+                        pr: *pr,
+                        approved_sha: approved_sha.clone(),
+                        repo: repo.clone(),
+                    },
+                    env,
+                    mode,
+                );
+            }
+            rec
         }
         MergeQueueCmd::Revoke { pr, reason, repo } => {
             if mode == MergeMode::Direct {

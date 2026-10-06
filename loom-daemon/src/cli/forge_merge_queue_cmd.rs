@@ -77,6 +77,18 @@ pub(crate) enum MergeQueueAction {
         #[arg(long, value_name = "NWO")]
         repo: Option<String>,
     },
+    /// #10256: the Champion's one call at the merge point: `reconcile`, then
+    /// `handoff` only when reconcile says continue. Direct mode prints
+    /// `LOOM-MERGE-QUEUE-DIRECT` and exits 0 (run `merge-pr.sh` as before);
+    /// any other first line means do NOT run `merge-pr.sh`.
+    Step {
+        #[arg(value_name = "PR")]
+        pr: u32,
+        #[arg(long, value_name = "SHA")]
+        approved_sha: String,
+        #[arg(long, value_name = "NWO")]
+        repo: Option<String>,
+    },
     /// #10256: revoke the queue authorization and dequeue BEFORE a Loom-owned
     /// transition (verdict invalidation, review claim, operator hold). Exit 0
     /// when the transition may proceed (and always in direct mode).
@@ -131,6 +143,15 @@ pub(crate) fn run(action: MergeQueueAction) -> ! {
             approved_sha,
             repo,
         } => MergeQueueCmd::Handoff {
+            pr,
+            approved_sha,
+            repo,
+        },
+        MergeQueueAction::Step {
+            pr,
+            approved_sha,
+            repo,
+        } => MergeQueueCmd::Step {
             pr,
             approved_sha,
             repo,

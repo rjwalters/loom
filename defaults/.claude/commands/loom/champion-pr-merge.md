@@ -1957,10 +1957,9 @@ fi
 ### Step 3: Merge the PR
 
 **Ordering invariant**: Step 2's comment is already on the PR before this runs.
-`merge-pr.sh` records no actor and posts no Champion-identifying comment, so a
-merge performed here without Step 2 having succeeded is indistinguishable after
-the fact from a human running the same script by hand — which is exactly how the
-#4742 incident's hold reversal became unattributable.
+`merge-pr.sh` posts no Champion-identifying comment, so a merge without Step 2
+is indistinguishable from a human running the script (the #4742 incident's
+unattributable hold reversal).
 
 **Timeout invariant (#9096)**: run this block under a **600000 ms** Bash-tool
 timeout, keeping `LOOM_AUTO_MERGE_TIMEOUT` (420s below) **strictly under** it,
@@ -1979,20 +1978,22 @@ echo "Attempting to merge PR #$PR_NUMBER..."
 # merge-pr.sh may not exist on PR branches checked out via gh pr checkout
 git checkout main 2>/dev/null || true
 
-# Worktree-safe merge via the forge API; deletes the branch after. --auto waits
-# then merges HERE, never arming a server-side queue (#8410); merge-pr.sh takes
-# its own fresh, uncached head-SHA read ("Cached forge reads" above) as the
-# merge API's optimistic-concurrency precondition (#5579); --redate-stale-checks
-# performs the #8248 guard's OWN remedy, bypassing nothing (#8508). Capture the
-# exit code, not a bare `||`: 3-6 are DISTINCT from 1, never failures (below).
-# 420s < this call's 600000 ms timeout ("Timeout invariant" above).
+# Queue mode (#10256, merge-queue-authorization.md): only DIRECT falls through.
+QOUT=$(loom-daemon forge merge-queue step "$PR_NUMBER" --approved-sha \
+  "$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid)" 2>&1); QRC=$?
 MERGE_RC=0
-LOOM_AUTO_MERGE_TIMEOUT=420 \
-  ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks || MERGE_RC=$?
+case "$QOUT" in LOOM-MERGE-QUEUE-DIRECT*|*"unrecognized subcommand"*) ;; *)
+  echo "$QOUT (step rc=$QRC)"; MERGE_RC=7 ;; esac
 
-if [ "$MERGE_RC" -eq 3 ] || [ "$MERGE_RC" -eq 4 ] || [ "$MERGE_RC" -eq 5 ] || [ "$MERGE_RC" -eq 6 ]; then
+# Worktree-safe forge-API merge. --auto waits then merges HERE (#8410); head-SHA
+# precondition (#5579); --redate-stale-checks is the #8248 remedy (#8508).
+# 3-6 are DISTINCT from 1, never failures. 420s < 600000 ms ("Timeout invariant").
+[ "$MERGE_RC" -eq 0 ] && { LOOM_AUTO_MERGE_TIMEOUT=420 \
+  ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto --redate-stale-checks || MERGE_RC=$?; }
+
+if [ "$MERGE_RC" -eq 7 ] || [ "$MERGE_RC" -eq 3 ] || [ "$MERGE_RC" -eq 4 ] || [ "$MERGE_RC" -eq 5 ] || [ "$MERGE_RC" -eq 6 ]; then
   # 3 head moved (#5579) / 4 re-dated (#8508) / 5 settle-wait expired (#8896)
-  # / 6 chain-head lock held (#10167). Not failures: nothing merged, the PR
+  # / 6 chain-head lock held (#10167) / 7 queue step. Not failures: nothing merged, the PR
   # stays Judge-approved, nothing goes onto it. See "exit codes 3-6" below.
   echo "PR #$PR_NUMBER not merged this pass (exit $MERGE_RC) — re-queuing instead of failing"
 elif [ "$MERGE_RC" -ne 0 ]; then
