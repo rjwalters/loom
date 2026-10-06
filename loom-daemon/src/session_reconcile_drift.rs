@@ -21,11 +21,13 @@
 //! 3. **Not achievable** → left alone ([`super::Outcome::DriftUnachievable`],
 //!    WARN once, no retry until the drift itself changes): the previous pass
 //!    already recreated it for drift and the fresh container *still* drifts
-//!    (intended ≠ achievable), or the intended mounts would be refused
-//!    before any teardown (`/`, no registered root under the workspace, the
-//!    home directory, a `firewall: true` overlap). Refusing up front matters:
-//!    a teardown whose recreate is then refused would leave the account with
-//!    no container at all.
+//!    (intended ≠ achievable), or it only *lacks* mounts and the intended set
+//!    would be refused (`/`, no registered root under the workspace, the
+//!    home directory, a `firewall: true` overlap). The refusal is checked
+//!    before any teardown: removing a container that is merely missing a
+//!    mount, with nothing allowed in its place, would only lose capacity.
+//!    With `extra` drift a refused recreate does **not** save the container:
+//!    see step 6.
 //! 4. **Fresh re-check**: one direct `docker inspect` must still show the
 //!    same container id, running; otherwise it changed under the pass and is
 //!    left for the next one.
@@ -37,7 +39,25 @@
 //!    (`.session-last-start.json`, which survives a daemon restart), else
 //!    the container's own `loom.workspace` label and image. The new
 //!    container's mounts are computed from the registry **now**. The next
-//!    pass confirms it is running and no longer drifts.
+//!    pass confirms it is running and no longer drifts. If the container has
+//!    `extra` drift and the recreate would be refused, it is still stopped
+//!    and removed, and nothing replaces it
+//!    ([`super::Outcome::DriftRemoved`]): `session start` would not create a
+//!    container with those mounts today, so one must not keep running with
+//!    them. The pass's missing-container path retries the start on its
+//!    backoff and succeeds once the registry or roster allows one.
+//!
+//! # What counts as `extra`
+//!
+//! [`effective_drift`]: Part A's registry comparison, plus any workspace
+//! mount that [`check_mount_denials`] refuses today ([`Denials`]): the home
+//! directory or an ancestor, or a path overlapping a `firewall: true`
+//! repository, **even if it is still registered**. A container created with
+//! `--mount-workspace <one git checkout>` is not `extra` merely because that
+//! checkout is not (or no longer) registered: `session start` accepts an
+//! unregistered checkout as an explicit operator grant, the reconciler
+//! cannot tell "deregistered" from "never registered", and a recreate would
+//! mount it again. It becomes `extra` only through a denial.
 //!
 //! Unlike an operator `accounts session stop`, the teardown writes **no**
 //! hold: the reconciler is replacing the container, not keeping it down, and
@@ -67,8 +87,54 @@ use crate::tokens_pool::session_lifecycle::{
     ContainerRunner, SessionLifecycle, STOP_GRACE,
 };
 use crate::tokens_pool::session_state::{
-    container_running, is_private_clone, mount_drift, workspace_label, MountDrift, Snapshot,
+    container_running, is_private_clone, mount_drift, workspace_label, workspace_mounts,
+    MountDrift, Snapshot,
 };
+
+/// What a session container may not mount whatever the registry says: the
+/// inputs of [`check_mount_denials`], read once per pass.
+#[derive(Debug, Default, Clone)]
+pub struct Denials {
+    pub home: Option<PathBuf>,
+    /// `firewall: true` repository paths from the cached fleet roster.
+    pub firewalled: Vec<PathBuf>,
+}
+
+impl Denials {
+    /// The home directory and the roster's firewalled paths, as `session
+    /// start` reads them for `daemon_root`. An unreadable roster yields no
+    /// firewall verdict here (nothing is torn down on a broken input);
+    /// `session start` itself still fails closed on it.
+    #[must_use]
+    pub fn load(daemon_root: &Path) -> Self {
+        Self {
+            home: dirs::home_dir(),
+            firewalled: firewalled_repo_paths(daemon_root).unwrap_or_else(|error| {
+                log::debug!("session_reconcile: firewall roster unreadable ({error:#})");
+                Vec::new()
+            }),
+        }
+    }
+
+    fn check(&self, roots: &[PathBuf]) -> anyhow::Result<()> {
+        check_mount_denials(roots, self.home.as_deref(), &self.firewalled)
+    }
+}
+
+/// A running container's drift as the reconciler acts on it: the registry
+/// comparison ([`mount_drift`]) plus, as `extra`, every workspace mount that
+/// `denials` refuses today. Empty for a private-clone or unlabelled container.
+#[must_use]
+pub fn effective_drift(inspect: &Value, registered: &[PathBuf], denials: &Denials) -> MountDrift {
+    let mut drift = mount_drift(inspect, registered);
+    for mount in workspace_mounts(inspect) {
+        if !drift.extra.contains(&mount) && denials.check(std::slice::from_ref(&mount)).is_err() {
+            drift.extra.push(mount);
+        }
+    }
+    drift.extra.sort();
+    drift
+}
 
 /// Why a drifted container was not recreated this pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,14 +163,14 @@ pub(super) struct DriftMemory {
 /// drift (a containment gap), `1` running with only `missing` drift, `2`
 /// anything else (including an unavailable snapshot).
 #[must_use]
-pub fn priority(snapshot: &Snapshot, container: &str, registered: &[PathBuf]) -> u8 {
+pub fn priority(snapshot: &Snapshot, container: &str, inputs: &PassInputs<'_>) -> u8 {
     let Some(inspect) = snapshot.inspect_of(container) else {
         return 2;
     };
     if !container_running(inspect) {
         return 2;
     }
-    let drift = mount_drift(inspect, registered);
+    let drift = effective_drift(inspect, inputs.registered, inputs.denials);
     if !drift.extra.is_empty() {
         0
     } else if drift.missing.is_empty() {
@@ -116,13 +182,13 @@ pub fn priority(snapshot: &Snapshot, container: &str, registered: &[PathBuf]) ->
 
 /// Whether recreating against `workspace` with `registered` would be
 /// refused: the checks `session start` itself makes before `docker run`.
-fn refusal(workspace: &Path, registered: &[PathBuf]) -> anyhow::Result<()> {
+fn refusal(workspace: &Path, inputs: &PassInputs<'_>) -> anyhow::Result<()> {
     if workspace.parent().is_none() {
         anyhow::bail!("it would mount the whole filesystem");
     }
-    let roots = workspace_mount_roots(workspace, registered)?;
-    let firewalled = firewalled_repo_paths(workspace)?;
-    check_mount_denials(&roots, dirs::home_dir().as_deref(), &firewalled)
+    inputs
+        .denials
+        .check(&workspace_mount_roots(workspace, inputs.registered)?)
 }
 
 fn paths(list: &[PathBuf]) -> String {
@@ -142,8 +208,9 @@ fn report(container: &str, name: &str, drift: &MountDrift, mem: &mut DriftMemory
     for path in &drift.extra {
         log::warn!(
             "session_reconcile: {container} (account {name}) still mounts {} read-write, which \
-             is no longer in the workspace registry (Codex runs there with its own sandbox off); \
-             recreating it at its first idle moment",
+             it may no longer mount: it left the workspace registry, or is now denied (home \
+             directory, `firewall: true`). Codex runs there with its own sandbox off; \
+             recreating the container at its first idle moment",
             path.display()
         );
     }
@@ -190,7 +257,7 @@ pub(super) fn reconcile_running<R: ContainerRunner>(
     let name = account.id.name.as_str();
     let container = container_name(name);
     let mem = &mut account_mem.drift;
-    let drift = mount_drift(inspect, inputs.registered);
+    let drift = effective_drift(inspect, inputs.registered, inputs.denials);
     if drift.is_empty() {
         if mem.recreated.is_some() {
             log::info!("session_reconcile: {container}: mounts match the registry after recreate");
@@ -225,7 +292,8 @@ pub(super) fn reconcile_running<R: ContainerRunner>(
         None => (label.to_path_buf(), account_mem.image.clone()),
     };
     let mem = &mut account_mem.drift;
-    if let Err(error) = refusal(&workspace, inputs.registered) {
+    let refused = refusal(&workspace, inputs).err();
+    if let Some(error) = refused.as_ref().filter(|_| drift.extra.is_empty()) {
         let why = format!("recreating against {} is refused: {error:#}", workspace.display());
         return Ok(unachievable(&container, name, drift, &why, mem));
     }
@@ -258,6 +326,18 @@ pub(super) fn reconcile_running<R: ContainerRunner>(
         return Err(OperatorHeld.into());
     }
     lifecycle.runner().stop_and_remove(&container, STOP_GRACE)?;
+    if let Some(error) = refused {
+        log::warn!(
+            "session_reconcile: {container} (account {name}) mounted {} which it may no longer \
+             mount, and no session container is allowed in its place ({error:#}); stopped and \
+             removed it (it was idle). It is recreated automatically once `accounts session \
+             start {name} --mount-workspace {}` would be accepted",
+            paths(&drift.extra),
+            workspace.display()
+        );
+        account_mem.drift = DriftMemory::default();
+        return Ok(Outcome::DriftRemoved { drift });
+    }
     recreate_container(lifecycle, name, &workspace, image, &is_held)?;
     account_mem.awaiting_confirm = true;
     account_mem.drift = DriftMemory {

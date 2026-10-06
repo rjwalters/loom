@@ -17,7 +17,8 @@ use crate::tokens_pool::docker_cli::DockerTimedOut;
 use crate::tokens_pool::profile_root_env::ProfileRootEnv;
 use crate::tokens_pool::session_hold;
 use crate::tokens_pool::session_lifecycle::{
-    mark_session_managed, parse_inspect_line, workspace_mount_roots, ExecOutput, WORKSPACE_LABEL,
+    check_mount_denials, mark_session_managed, parse_inspect_line, workspace_mount_roots,
+    ExecOutput, WORKSPACE_LABEL,
 };
 use crate::tokens_pool::session_state::{classify_inspect, Observed};
 
@@ -42,6 +43,8 @@ struct FakeState {
     mounts: Mutex<HashMap<String, Vec<PathBuf>>>,
     /// The workspace registry the pass and `create` see.
     registered: Mutex<Vec<PathBuf>>,
+    /// `firewall: true` paths the pass and `create` see.
+    firewalled: Mutex<Vec<PathBuf>>,
     /// `create` mounts exactly these instead of what the registry implies
     /// (intended ≠ achievable).
     create_mounts: Mutex<Option<Vec<PathBuf>>>,
@@ -83,6 +86,12 @@ impl FakeState {
                 workspace: workspace.map(Path::to_path_buf),
             },
         );
+    }
+    fn denials(&self) -> drift::Denials {
+        drift::Denials {
+            home: None,
+            firewalled: self.firewalled.lock().unwrap().clone(),
+        }
     }
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
@@ -187,15 +196,20 @@ impl ContainerRunner for Fake {
             image.into(),
             workspace.to_path_buf(),
         ));
+        // Like `docker run` behind `session start`: a firewalled root is
+        // refused. (An unregistered workspace is not refused here, so the
+        // #10453 tests can use paths that do not exist.)
+        let registered = self.registered.lock().unwrap().clone();
+        let intended = workspace_mount_roots(workspace, &registered).unwrap_or_default();
+        check_mount_denials(&intended, None, &self.firewalled.lock().unwrap())?;
         let dies = *self.dies_after_start.lock().unwrap();
         self.seed(container, dies.is_none(), dies == Some(true), Some(workspace));
-        let registered = self.registered.lock().unwrap().clone();
         let mounts = self
             .create_mounts
             .lock()
             .unwrap()
             .clone()
-            .unwrap_or_else(|| workspace_mount_roots(workspace, &registered).unwrap_or_default());
+            .unwrap_or(intended);
         self.mounts.lock().unwrap().insert(container.into(), mounts);
         Ok(())
     }
@@ -352,6 +366,7 @@ fn pass_named(
     let index = AccountIndex::from_inventories(&[accounts, other_roots]);
     let fake = lifecycle.runner().clone();
     let registered = fake.registered.lock().unwrap().clone();
+    let denials = fake.denials();
     let mut take = || fake.snapshot(&registered);
     let mut observe = PassSnapshot::new(&mut take);
     let inputs = PassInputs {
@@ -359,6 +374,7 @@ fn pass_named(
         is_private_clone: private,
         fallback_workspace: fallback,
         registered: &registered,
+        denials: &denials,
     };
     reconcile_accounts(lifecycle, accounts, &inputs, &mut observe, state, now)
 }

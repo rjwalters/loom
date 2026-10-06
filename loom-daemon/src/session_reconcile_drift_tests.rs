@@ -287,15 +287,22 @@ fn a_timed_out_teardown_backs_off_the_pass_not_the_account() {
 
 #[test]
 #[serial]
-fn a_recreate_that_would_be_refused_never_tears_the_container_down() {
+fn a_missing_only_drift_whose_recreate_would_be_refused_is_left_running() {
     let env = setup(&["alice"], &["alice"]);
-    let ws = Ws::new(&["a", "gone"]);
+    let ws = Ws::new(&["a", "new"]);
     let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
-    // Every repository under its workspace was deregistered: all its mounts
-    // are `extra`, and `session start` would refuse the workspace outright.
-    seed_running(&lifecycle, "alice", &ws, &["a", "gone"]);
-    let elsewhere = Ws::new(&["c"]);
-    register(&lifecycle, &elsewhere, &["c"]);
+    // It only lacks `new`, and the recorded operator start names `/`, which
+    // no recreate accepts. Nothing it mounts is `extra`, so removing it
+    // would only lose capacity: it is left running.
+    seed_running(&lifecycle, "alice", &ws, &["a"]);
+    register(&lifecycle, &ws, &["a", "new"]);
+    session_hold::record_operator_start(
+        &profile(&env, "alice"),
+        Path::new("/"),
+        "example/session:recorded",
+        session_hold::now_unix_ms(),
+    )
+    .unwrap();
     let mut state = ReconcileState::default();
     for now in [0, 60, 120] {
         assert_eq!(
@@ -305,6 +312,95 @@ fn a_recreate_that_would_be_refused_never_tears_the_container_down() {
     }
     assert_eq!(lifecycle.runner().mutations(), Vec::<String>::new());
     assert_eq!(lifecycle.runner().count("has_active_exec"), 0);
+}
+
+#[test]
+#[serial]
+fn a_still_registered_repo_that_became_firewalled_is_extra_and_recreated_first() {
+    let env = setup(&["alice", "bob"], &["alice", "bob"]);
+    let ws = Ws::new(&["a", "new", "walled"]);
+    let single = Ws::new(&["repo/.git"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    // alice only lacks `new`. bob mounts exactly what the registry lists,
+    // but `walled` is `firewall: true` now.
+    seed_running(&lifecycle, "alice", &ws, &["a", "walled"]);
+    seed_running(&lifecycle, "bob", &ws, &["a", "new", "walled"]);
+    register(&lifecycle, &ws, &["a", "new", "walled"]);
+    let fake = lifecycle.runner().clone();
+    let snapshot = fake.snapshot(&ws.roots(&["a", "new", "walled"]));
+    let bob = snapshot.inspect_of(&container_name("bob")).unwrap();
+    let registered = ws.roots(&["a", "new", "walled"]);
+    assert!(drift::effective_drift(bob, &registered, &fake.denials()).is_empty());
+    *fake.firewalled.lock().unwrap() = ws.roots(&["walled"]);
+    assert_eq!(
+        drift::effective_drift(bob, &registered, &fake.denials()),
+        MountDrift {
+            missing: Vec::new(),
+            extra: ws.roots(&["walled"]),
+        }
+    );
+    // A single unregistered checkout is an explicit grant, not drift.
+    let solo = inspect_json(
+        "loom-codex-session-solo",
+        &st(true, false, Some(single.p("repo").to_str().unwrap())),
+        &single.roots(&["repo"]),
+    );
+    assert!(drift::effective_drift(&solo, &registered, &fake.denials()).is_empty());
+    // The roster marks `walled` but the registry still lists it: no start is
+    // accepted, so both idle containers that mount it are removed, not
+    // recreated, and the start is retried on the ordinary backoff.
+    let mut state = ReconcileState::default();
+    let out = pass(&mut lifecycle, &env, &host, &mut state, 0);
+    assert!(
+        matches!(out[..], [Outcome::DriftRemoved { .. }, Outcome::DriftRemoved { .. }]),
+        "{out:?}"
+    );
+    assert_eq!(lifecycle.runner().mutations(), ["stop_and_remove", "stop_and_remove"]);
+    let out = pass(&mut lifecycle, &env, &host, &mut state, 60);
+    assert!(matches!(out[..], [Outcome::Failed { .. }, Outcome::Failed { .. }]), "{out:?}");
+    assert!(lifecycle.runner().containers.lock().unwrap().is_empty());
+    // The operator deregisters it: both come back without it.
+    register(&lifecycle, &ws, &["a", "new"]);
+    let out = pass(&mut lifecycle, &env, &host, &mut state, 10_000);
+    assert!(out.iter().all(Outcome::started), "{out:?}");
+    assert_eq!(mounts_of(&lifecycle, "bob"), ws.roots(&["a", "new"]));
+}
+
+#[test]
+#[serial]
+fn extra_drift_with_nothing_allowed_in_its_place_is_removed_only_when_idle() {
+    let env = setup(&["alice"], &["alice"]);
+    let ws = Ws::new(&["a", "gone"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    // Every repository under its workspace was deregistered: all its mounts
+    // are `extra`, and `session start` would refuse the workspace outright.
+    seed_running(&lifecycle, "alice", &ws, &["a", "gone"]);
+    let elsewhere = Ws::new(&["c"]);
+    register(&lifecycle, &elsewhere, &["c"]);
+    let container = container_name("alice");
+    lifecycle
+        .runner()
+        .busy
+        .lock()
+        .unwrap()
+        .insert(container.clone(), true);
+    let mut state = ReconcileState::default();
+    assert_eq!(
+        pass(&mut lifecycle, &env, &host, &mut state, 0),
+        vec![Outcome::DriftDeferred {
+            reason: DeferReason::Busy
+        }]
+    );
+    assert_eq!(lifecycle.runner().mutations(), Vec::<String>::new(), "never killed");
+    lifecycle
+        .runner()
+        .busy
+        .lock()
+        .unwrap()
+        .insert(container, false);
+    let out = pass(&mut lifecycle, &env, &host, &mut state, 60);
+    assert!(matches!(out[..], [Outcome::DriftRemoved { .. }]), "{out:?}");
+    assert_eq!(lifecycle.runner().mutations(), ["stop_and_remove"]);
 }
 
 #[test]
@@ -366,6 +462,7 @@ fn a_container_replaced_since_the_snapshot_is_left_for_the_next_pass() {
         is_private_clone: &host,
         fallback_workspace: Path::new("/srv/checkouts"),
         registered: &registered,
+        denials: &drift::Denials::default(),
     };
     let mut state = ReconcileState::default();
     let out =

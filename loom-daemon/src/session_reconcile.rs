@@ -18,6 +18,7 @@
 //! | running, mounts match the registry | nothing |
 //! | running, mount drift, idle | stop + rm, then recreate ([`recreate_container`]) with the current registry roots (#10364; see [`drift`]) |
 //! | running, mount drift, in-flight exec | defer and re-check next pass — never killed |
+//! | running, mounts something no longer allowed, idle, and no start would be allowed | stop + rm, not recreated (fails closed) |
 //! | restarting (1st pass) | nothing — Docker's `unless-stopped` policy is already retrying |
 //! | restarting (2nd+ consecutive pass) | WARN once as a **crash loop**; never reused, never stopped |
 //! | stopped, host-mounted | resume via [`SessionLifecycle::start_with_workspace`] (the `accounts session start` path) |
@@ -313,9 +314,17 @@ pub enum Outcome {
         reason: DeferReason,
     },
     /// Running with mount drift a recreate cannot fix (a fresh container
-    /// still drifted, or the intended mounts are refused): left as is, WARNed
-    /// once, and not retried until the drift itself changes.
+    /// still drifted, or it only lacks mounts and the intended set is
+    /// refused): left as is, WARNed once, and not retried until the drift
+    /// itself changes.
     DriftUnachievable,
+    /// Running, idle, with `extra` drift (it mounts something it must not)
+    /// and no container `session start` would allow in its place: stopped
+    /// and removed, not recreated. Fails closed; the pass's missing-container
+    /// path recreates it once a start is allowed again.
+    DriftRemoved {
+        drift: MountDrift,
+    },
     /// Skipped without any `docker` call until `retry_at` (unix secs).
     BackingOff {
         retry_at: u64,
@@ -456,6 +465,10 @@ pub struct PassInputs<'a> {
     /// The workspace registry's roots **now**: what a drifted container's
     /// mounts are compared against (#10364).
     pub registered: &'a [PathBuf],
+    /// What `session start` refuses to mount whatever the registry says: the
+    /// home directory and the `firewall: true` repositories. A running
+    /// container that mounts one has `extra` drift.
+    pub denials: &'a drift::Denials,
 }
 
 /// The pass's single container read: one [`Snapshot`] from `take`, taken on
@@ -517,9 +530,8 @@ pub fn reconcile_accounts<R: ContainerRunner>(
     {
         let snapshot = observe.get();
         // Stable: accounts without drift keep their registry order.
-        eligible.sort_by_cached_key(|a| {
-            drift::priority(snapshot, &container_name(&a.id.name), inputs.registered)
-        });
+        eligible
+            .sort_by_cached_key(|a| drift::priority(snapshot, &container_name(&a.id.name), inputs));
     }
     let mut out = Vec::new();
     for account in eligible {
@@ -886,6 +898,7 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             .collect::<Vec<_>>(),
     );
     // One container read for the whole pass (every root), taken lazily.
+    let denials = drift::Denials::load(fallback_root);
     let mut take =
         || session_state::snapshot("docker", &registered, session_state::SNAPSHOT_DEADLINE);
     let mut observe = PassSnapshot::new(&mut take);
@@ -911,6 +924,7 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             is_private_clone: &is_private_clone,
             fallback_workspace: &fallback_workspace,
             registered: &registered,
+            denials: &denials,
         };
         let outcomes =
             reconcile_accounts(&mut lifecycle, &accounts, &inputs, &mut observe, state, now);

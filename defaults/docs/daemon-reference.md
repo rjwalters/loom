@@ -8576,9 +8576,15 @@ when it is created, so a later `loom-daemon workspace add` never reaches it
 compares every running container's mounts with what `accounts session start
 --mount-workspace <its loom.workspace label>` would mount **now**:
 
-- Containers that still mount a deregistered path (`extra`, a containment gap,
-  logged at WARN with the container and path) are handled before those that
-  only lack a new one (`missing`).
+- Containers that still mount something they may no longer mount (`extra`, a
+  containment gap, logged at WARN with the container and path) are handled
+  before those that only lack a new one (`missing`). `extra` is a mounted
+  path that left the registry, **or** one `session start` would refuse today
+  even though it is still registered: the home directory, or anything
+  overlapping a `firewall: true` repository in the cached fleet roster. A
+  container started with `--mount-workspace <one git checkout>` is not
+  `extra` just because that checkout is unregistered: `session start` accepts
+  that as an explicit operator grant.
 - An idle one is stopped (graceful, 15 s), removed and recreated against the
   workspace and image of the last operator `session start`
   (`.session-last-start.json`, so a daemon restart does not lose it),
@@ -8588,7 +8594,13 @@ compares every running container's mounts with what `accounts session start
   container (it must be the same container, still running), and checks that
   the recreate would be allowed (not `/`, the home directory or a `firewall:
   true` overlap, and at least one registered root under the workspace). If it
-  would be refused, nothing is stopped.
+  would be refused and the container only lacks mounts, nothing is stopped.
+  If it would be refused and the container has `extra` mounts, the idle
+  container is still stopped and removed, with a WARN, and nothing replaces
+  it: no container may run with mounts `session start` would refuse. The
+  missing-container row above then retries the start on its backoff, and
+  succeeds once the registry or roster allows one. Until then Codex ticks for
+  that account fall through to the next `rolePreference` runtime.
 - If a freshly recreated container still drifts, or the recreate would be
   refused, the pass WARNs once and leaves it alone until the drift changes
   (or the daemon restarts) instead of recreating it every interval. A failed

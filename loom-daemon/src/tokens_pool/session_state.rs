@@ -200,6 +200,24 @@ fn workspace_binds(state: &Value, label: &Path) -> Vec<PathBuf> {
     binds
 }
 
+/// A host-mode container's workspace bind destinations (see
+/// [`workspace_binds`]) under its `loom.workspace` label, in either spelling
+/// of the label. Empty for a private-clone or unlabelled container.
+#[must_use]
+pub fn workspace_mounts(state: &Value) -> Vec<PathBuf> {
+    let Some(label) = workspace_label(state).filter(|_| !is_private_clone(state)) else {
+        return Vec::new();
+    };
+    let canonical = crate::workspace_registry::normalize_path(label);
+    let mut actual = workspace_binds(state, &canonical);
+    if canonical != label {
+        actual.extend(workspace_binds(state, label));
+        actual.sort();
+        actual.dedup();
+    }
+    actual
+}
+
 /// Drift between a host-mode session container's workspace mounts and the
 /// mounts its `loom.workspace` label would get today against `registered`.
 ///
