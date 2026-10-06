@@ -65,6 +65,10 @@ const MARKER_FILES: &[(&str, &str)] = &[
     ("role_runner/roster.rs", "writer; reader in read_roster_comments (FETCH_SITES)"),
     ("role_shard/roster.rs", "constants and pure parsers"),
     (
+        "stale_blocked/batch.rs",
+        "parked issues' own closing refs + comment text for an advisory, not the linked-PR guard",
+    ),
+    (
         "sweep_registry/guards.rs",
         "writer; reader in read_lease_comments (FETCH_SITES)",
     ),
@@ -138,6 +142,12 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     ("role_runner/roster.rs", "create_roster_comment", ""),
     ("role_runner/roster.rs", "delete_roster_comment", ""),
     ("role_runner/roster.rs", "patch_roster_comment", ""),
+    // `check-stale-blocked` (#10480): a read-only advisory that reports and
+    // never acts, reading blocker prose and a parked issue's own closing refs —
+    // the same reads `dep_recheck/forge.rs` makes, not a control read.
+    ("stale_blocked/batch.rs", "comments", ""),
+    ("stale_blocked/batch.rs", "closing_refs_query", ""),
+    ("stale_blocked/batch.rs", "parse_closing_refs", ""),
 ];
 
 /// Production code of a source file: inline test modules cut off, comment

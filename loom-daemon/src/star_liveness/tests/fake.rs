@@ -195,7 +195,6 @@ pub fn issue(number: u32, labels: &[&str]) -> RestIssue {
 /// An issue with a body.
 pub fn issue_with_body(number: u32, labels: &[&str], body: &str) -> RestIssue {
     RestIssue {
-        comments: 0,
         body: Some(body.to_string()),
         ..issue(number, labels)
     }
@@ -204,7 +203,6 @@ pub fn issue_with_body(number: u32, labels: &[&str], body: &str) -> RestIssue {
 /// An open PR closing `closes`.
 pub fn pr(number: u32, closes: u32, labels: &[&str]) -> RestIssue {
     RestIssue {
-        comments: 0,
         body: Some(format!("Summary.\n\nCloses #{closes}\n")),
         is_pull_request: true,
         ..issue(number, labels)
