@@ -468,18 +468,23 @@ pub(crate) enum ViewStatus {
     Failed,
 }
 
-/// What [`fetch_view_for`] answered: the status, and the body on `200`/`304`.
+/// What [`fetch_view_for`] answered: the status, the body on `200`/`304`,
+/// and gh's stderr — a [`ViewStatus::Failed`] caller feeds it to the
+/// rate-limit breaker (`rate_limit_breaker::global_observe_failure`), which
+/// classifies a refusal from that text alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ViewRead {
     pub(crate) status: ViewStatus,
     pub(crate) body: Option<String>,
+    pub(crate) stderr: String,
 }
 
 impl ViewRead {
-    fn failed() -> Self {
+    fn failed(stderr: String) -> Self {
         Self {
             status: ViewStatus::Failed,
             body: None,
+            stderr,
         }
     }
 }
@@ -504,23 +509,29 @@ pub(crate) fn fetch_view_for(
     let prior = path.as_deref().and_then(store::read_disk_entry);
     let prior_etag = prior.as_ref().map(|p| p.etag.as_str());
 
-    let Ok((status, response, _stderr)) =
-        store::fetch_conditional(site, gh_bin, cwd, target, &url, prior_etag)
-    else {
-        return ViewRead::failed();
-    };
+    let (status, response, stderr) =
+        match store::fetch_conditional(site, gh_bin, cwd, target, &url, prior_etag) {
+            Ok(out) => out,
+            Err(e) => return ViewRead::failed(format!("{e:#}")),
+        };
     let answered = |status, body| ViewRead {
         status,
         body: Some(body),
+        stderr: String::new(),
+    };
+    let bare = |status| ViewRead {
+        status,
+        body: None,
+        stderr: String::new(),
     };
     match response {
         Some(r) if r.status == 304 => match (prior, &path) {
             (Some(p), _) => answered(ViewStatus::NotModified, p.body),
             (None, Some(path)) => {
                 let _ = std::fs::remove_file(path);
-                ViewRead::failed()
+                ViewRead::failed(stderr)
             }
-            (None, None) => ViewRead::failed(),
+            (None, None) => ViewRead::failed(stderr),
         },
         Some(r) if r.status == 200 && status.success() => {
             if let (Some(etag), Some(path), Some(dir)) = (r.etag.clone(), &path, dir) {
@@ -535,15 +546,9 @@ pub(crate) fn fetch_view_for(
             }
             answered(ViewStatus::Fresh, r.body)
         }
-        Some(r) if r.status == 404 => ViewRead {
-            status: ViewStatus::NotFound,
-            body: None,
-        },
-        Some(r) if r.status == 410 => ViewRead {
-            status: ViewStatus::Gone,
-            body: None,
-        },
-        _ => ViewRead::failed(),
+        Some(r) if r.status == 404 => bare(ViewStatus::NotFound),
+        Some(r) if r.status == 410 => bare(ViewStatus::Gone),
+        _ => ViewRead::failed(stderr),
     }
 }
 

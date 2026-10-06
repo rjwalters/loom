@@ -7539,11 +7539,15 @@ A `Gate` read always confirms on the writer, and the reader is not withdrawn.
 
 ### Hygiene read path: the checkout's own repo, conditional and fresh (`LOOM_HYGIENE_CONDITIONAL`)
 
-Every consumer that reaps, cleans or switches on issue or PR state — the
-worktree reaper, eager reclaim, `clean` (sweep transients, stale branches,
-the `pr-<N>` probe), `--aggressive`, `checkpoint read` and the
-primary-checkout reaper — reads it through one module,
-`loom-daemon/src/worktree_ops/forge_state.rs`:
+The REST issue and PR reads behind the worktree reaper, eager reclaim,
+`clean` (sweep transients, stale branches, the `pr-<N>` probe),
+`--aggressive`, `checkpoint read` and the primary-checkout reaper go through
+one module, `loom-daemon/src/worktree_ops/forge_state.rs`. Not every hygiene
+read does yet: the GraphQL-backed probes `gh::issue_state` (`gh issue view`,
+in `clean`'s worktree pass and stale-branch cleanup), `check_pr_merged`, and
+the `check_pr_status_for_branch` fallback (`clean` and the primary-checkout
+reaper, when REST is unknown or no owner resolves) still name gh's own
+target and are not conditional.
 
 - **The checkout's own repo.** Reads name gh's base repo for the root,
   resolved and verified by the repo facts above with `GH_REPO`/`LOOM_REPO`
@@ -7563,9 +7567,17 @@ primary-checkout reaper — reads it through one module,
   them.
 - **Identity.** An answer must be the item asked for: its `number`, and its
   repository by `base.repo.id` (when the record knows the id) or by name. A
-  mismatch — a transferred item, a followed redirect — is "unknown", bumps
-  `hygiene.identity_mismatch`, and marks the repo record suspect, so a
-  renamed repo re-resolves on the next read instead of failing every read.
+  mismatch — a transferred item, a followed redirect — is "unknown" and
+  bumps `hygiene.identity_mismatch`. Only a first-hand `200` for the
+  asked-for number that names the repo under a new name (same id, or no id
+  to compare) marks the repo record suspect, as of the request-sent time, so
+  a renamed repo re-resolves on the next read; a `304` body, another number
+  (a transferred issue) or another repo id never does.
+- **Rate-limit breaker.** While the global breaker is cooling, an item read
+  makes no forge call (not even the repo resolve) and is "unknown"; a failed
+  item read's stderr is reported to the breaker, so a rate-limit refusal
+  trips it. The branch listings and the owner read keep their pre-W6
+  behaviour: they never consulted the breaker.
 - **Failure.** A shed, timeout, non-200/304, parse failure or mismatch is
   "unknown"; a `404`/`410` is "gone" (`hygiene.item_gone`). Both are KEEP —
   never "closed" or "no PR".
@@ -7581,7 +7593,7 @@ primary-checkout reaper — reads it through one module,
 
 | Variable | Default | Effect |
 |---|---|---|
-| `LOOM_HYGIENE_CONDITIONAL` | on | `0` makes the single-item hygiene reads unconditional (no `If-None-Match` sent, nothing stored). Every read still reaches the forge. |
+| `LOOM_HYGIENE_CONDITIONAL` | on | `0` makes the single-item reads on a root with a repo fact unconditional: no `If-None-Match` sent, the `view-` entry neither read nor written. Everything else stays: the explicit target, the identity check, reader routing and the breaker. It is not a revert of W6 — no switch restores the pre-W6 `LOOM_REPO` > `origin` target. `LOOM_REPO_FACTS=0` sends every item read down the placeholder path (`{owner}/{repo}`, `GH_REPO` stripped, unconditional). |
 
 ### Merged-PR worktree reaper (#4876)
 

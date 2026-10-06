@@ -41,7 +41,8 @@ fn pull_body(number: u32, merged_at: Option<&str>, sha: &str, repo: &str, id: u6
 
 /// A fake forge for `REPO` (repo id 7). Files in its dir steer it: `item`
 /// (the body of any `issues/<n>` / `pulls/<n>` read), `item_status`
-/// (`404` / `500`), `notmodified` (answer `304` to an `If-None-Match`),
+/// (`404` / `500`), `item_stderr` (gh's stderr on a failed item read),
+/// `notmodified` (answer `304` to an `If-None-Match`),
 /// `pulls` (a `pulls?head=` listing). Every call is logged with the
 /// `GH_REPO` the child saw.
 struct Forge {
@@ -70,7 +71,7 @@ case "$*" in
     esac
     if [ "$st" != 200 ]; then
       case "$*" in *--include*) printf 'HTTP/2.0 %s X\r\n\r\n{{"message":"x"}}' "$st" ;; esac
-      echo "gh: x (HTTP $st)" >&2
+      cat "$D/item_stderr" >&2 2>/dev/null || echo "gh: x (HTTP $st)" >&2
       exit 1
     fi
     case "$*" in *--include*) printf 'HTTP/2.0 200 OK\r\nEtag: W/"i1"\r\n\r\n' ;; esac
@@ -101,6 +102,23 @@ exit 1
 
     fn clear(&self, file: &str) {
         let _ = std::fs::remove_file(self.dir.join(file));
+    }
+
+    /// Every call so far, item reads and repo reads alike.
+    fn all_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dir.join("log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Repo reads (`repos/<o>/<r>` — the facts record's resolve / confirm).
+    fn repo_reads(&self) -> usize {
+        self.all_calls()
+            .iter()
+            .filter(|l| !l.contains("/issues/") && !l.contains("/pulls"))
+            .count()
     }
 
     /// Item reads (`issues/<n>`, `pulls/<n>`) so far.
@@ -369,4 +387,187 @@ fn a_pull_read_carries_status_and_head() {
     assert_eq!(probe.head_sha.as_deref(), Some("cafe"));
     let calls = forge.item_calls();
     assert!(calls[0].contains(&format!("repos/{REPO}/pulls/21")), "{calls:?}");
+}
+
+/// A breaker that is cooling right now.
+fn tripped_breaker() -> std::sync::Arc<crate::rate_limit_breaker::SharedRateLimitBreaker> {
+    use crate::rate_limit_breaker::{RateLimitBreakerConfig, SharedRateLimitBreaker};
+    let b = std::sync::Arc::new(SharedRateLimitBreaker::new(RateLimitBreakerConfig::default()));
+    b.observe_failure("API rate limit exceeded", "test", None, chrono::Utc::now());
+    assert!(b.is_suppressed(chrono::Utc::now()));
+    b
+}
+
+fn fresh_breaker() -> std::sync::Arc<crate::rate_limit_breaker::SharedRateLimitBreaker> {
+    use crate::rate_limit_breaker::{RateLimitBreakerConfig, SharedRateLimitBreaker};
+    std::sync::Arc::new(SharedRateLimitBreaker::new(RateLimitBreakerConfig::default()))
+}
+
+/// While the global breaker is cooling, an item read makes NO forge call —
+/// not the item read, not the repo resolve — and is Unknown (KEEP), on the
+/// fact path and the placeholder path alike.
+#[test]
+#[serial(loom_config_env)]
+fn a_cooling_breaker_suppresses_every_item_read() {
+    for vars in [&[][..], &[("LOOM_REPO_FACTS", "0")][..]] {
+        let (_env, root, forge) = fixture(vars);
+        forge.set("item", &issue_body(7, "closed", REPO));
+        let mut got = Vec::new();
+        crate::rate_limit_breaker::with_test_global(tripped_breaker(), || {
+            run(&forge, || {
+                got.push(format!("{:?}", issue_facts(&root, 7, "worktree.issue_state_rest")));
+                got.push(issue_state_rest(&root, 7));
+                got.push(format!("{:?}", issue_closed_at_rest(&root, 7)));
+                got.push(format!("{:?}", pull_facts(&root, 7, "clean.pr_by_number_rest")));
+            });
+        });
+        assert_eq!(got, ["Unknown", "UNKNOWN", "None", "Unknown"], "{vars:?}");
+        assert_eq!(forge.all_calls(), Vec::<String>::new(), "{vars:?}: zero forge calls");
+    }
+}
+
+/// A rate-limit refusal on an item read is reported to the global breaker,
+/// which trips — on the fact path and the placeholder path alike.
+#[test]
+#[serial(loom_config_env)]
+fn a_rate_limited_item_read_trips_the_breaker() {
+    for vars in [&[][..], &[("LOOM_REPO_FACTS", "0")][..]] {
+        let (_env, root, forge) = fixture(vars);
+        forge.set("item_status", "403");
+        forge.set("item_stderr", "gh: API rate limit exceeded for installation (HTTP 403)");
+        let breaker = fresh_breaker();
+        let mut state = String::new();
+        crate::rate_limit_breaker::with_test_global(breaker.clone(), || {
+            run(&forge, || state = issue_state_rest(&root, 7));
+        });
+        assert_eq!(state, "UNKNOWN", "{vars:?}");
+        assert!(breaker.is_suppressed(chrono::Utc::now()), "{vars:?}: the refusal tripped it");
+    }
+}
+
+/// A plain server error is not a rate limit: the breaker stays closed.
+#[test]
+#[serial(loom_config_env)]
+fn an_ordinary_failure_does_not_trip_the_breaker() {
+    let (_env, root, forge) = fixture(&[]);
+    forge.set("item_status", "500");
+    let breaker = fresh_breaker();
+    crate::rate_limit_breaker::with_test_global(breaker.clone(), || {
+        run(&forge, || assert_eq!(issue_state_rest(&root, 7), "UNKNOWN"));
+    });
+    assert!(!breaker.is_suppressed(chrono::Utc::now()));
+}
+
+fn fact_of(repo_id: Option<u64>) -> Fact {
+    Fact {
+        host: "github.com".to_string(),
+        configured_nwo: REPO.to_string(),
+        owner: "acme".to_string(),
+        name: "w6-app".to_string(),
+        repo_id,
+        verified_at: 0,
+        fresh: false,
+    }
+}
+
+/// Only a body for the asked-for number, naming another repo under the same
+/// id (or with no id to compare), may cast doubt on the record.
+#[test]
+fn only_a_same_item_rename_is_observed() {
+    let seen = |number: u64, repo: &'static str, id: Option<u64>| Seen {
+        number: Some(number),
+        repo: Some(repo),
+        id,
+    };
+    let with_id = fact_of(Some(7));
+    let no_id = fact_of(None);
+    // A rename: same number, same id (or none), new name.
+    assert!(should_observe(&with_id, 9, &seen(9, "acme/renamed", Some(7))));
+    assert!(should_observe(&no_id, 9, &seen(9, "acme/renamed", None)));
+    assert!(should_observe(&with_id, 9, &seen(9, "acme/renamed", None)));
+    // A transferred issue answers with its new repo's number.
+    assert!(!should_observe(&no_id, 9, &seen(41, "acme/elsewhere", None)));
+    // Another repo's id is another repo, not this one renamed.
+    assert!(!should_observe(&with_id, 9, &seen(9, "acme/elsewhere", Some(99))));
+    // The same name says nothing new.
+    assert!(!should_observe(&with_id, 9, &seen(9, REPO, Some(7))));
+}
+
+/// A transferred issue (another number, another repo) is Unknown on every
+/// pass, but never marks the record suspect: no confirm read follows.
+#[test]
+#[serial(loom_config_env)]
+fn a_transferred_issue_never_re_resolves_the_repo() {
+    let (_env, root, forge) = fixture(&[]);
+    forge.set("item", &issue_body(41, "open", "acme/elsewhere"));
+    let mut got = Vec::new();
+    run(&forge, || {
+        for _ in 0..3 {
+            got.push(issue_state_rest(&root, 9));
+        }
+    });
+    assert_eq!(got, ["UNKNOWN", "UNKNOWN", "UNKNOWN"]);
+    let first = forge.repo_reads();
+    assert!(first >= 1, "the record was resolved once: {:?}", forge.all_calls());
+    run(&forge, || got.push(issue_state_rest(&root, 9)));
+    assert_eq!(forge.repo_reads(), first, "no confirm read: {:?}", forge.all_calls());
+}
+
+/// A first-hand body naming the repo under a new name DOES mark it suspect:
+/// the next use confirms the record with a repo read.
+#[test]
+#[serial(loom_config_env)]
+fn a_first_hand_rename_re_resolves_the_repo() {
+    let (_env, root, forge) = fixture(&[]);
+    forge.set("item", &issue_body(9, "open", REPO));
+    run(&forge, || assert_eq!(issue_state_rest(&root, 9), "OPEN"));
+    let before = forge.repo_reads();
+    run(&forge, || assert_eq!(issue_state_rest(&root, 9), "OPEN"));
+    assert_eq!(forge.repo_reads(), before, "a settled record is not re-read");
+    forge.set("item", &issue_body(9, "open", "acme/renamed"));
+    run(&forge, || {
+        let _ = issue_state_rest(&root, 9);
+        let _ = issue_state_rest(&root, 9);
+    });
+    assert!(forge.repo_reads() > before, "suspect → confirm: {:?}", forge.all_calls());
+}
+
+/// A `304` serves a stored body, not this request's answer: even one naming
+/// another repo never casts doubt on the record.
+#[test]
+#[serial(loom_config_env)]
+fn a_not_modified_body_is_never_observed() {
+    let (env, root, forge) = fixture(&[]);
+    let store_dir = env.tmp.path().join("store");
+    store::set_test_daemon_store_dir(Some(store_dir.clone()));
+    forge.set("item", &issue_body(9, "open", REPO));
+    run(&forge, || assert_eq!(issue_state_rest(&root, 9), "OPEN"));
+    let before = forge.repo_reads();
+    let target = store::Target {
+        repo: Some(REPO.to_string()),
+        host: Some("github.com".to_string()),
+    };
+    let url = format!("repos/{REPO}/issues/9");
+    let entry = crate::forge_cached_view::entry_path(
+        &store_dir,
+        "issue",
+        9,
+        &store::cache_key(Some(&root), &target, &url),
+    );
+    store::write_disk_entry(
+        &entry,
+        &store::DiskEntry {
+            etag: r#"W/"i1""#.to_string(),
+            body: issue_body(9, "open", "acme/renamed"),
+        },
+    );
+    forge.set("notmodified", "");
+    run(&forge, || {
+        let _ = issue_state_rest(&root, 9);
+        let _ = issue_state_rest(&root, 9);
+    });
+    store::set_test_daemon_store_dir(None);
+    let calls = forge.item_calls();
+    assert!(calls[1..].iter().all(|c| c.contains("If-None-Match")), "{calls:?}");
+    assert_eq!(forge.repo_reads(), before, "no confirm read: {:?}", forge.all_calls());
 }

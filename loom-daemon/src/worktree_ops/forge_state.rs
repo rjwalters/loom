@@ -1,7 +1,8 @@
-//! The hygiene read path (W6): issue and PR state for every consumer that
-//! reaps, cleans or switches on it — the worktree reaper, eager reclaim,
-//! `clean`, `--aggressive`, the legacy checkpoint command and the
-//! primary-checkout reaper.
+//! The hygiene read path (W6): the REST issue and PR state reads behind the
+//! worktree reaper, eager reclaim, `clean`, `--aggressive`, the legacy
+//! checkpoint command and the primary-checkout reaper. The GraphQL-backed
+//! probes (`gh::issue_state`, `clean::check_pr_merged`, the
+//! `check_pr_status_for_branch` fallback) do not come through here yet.
 //!
 //! # Which repo
 //!
@@ -26,7 +27,8 @@
 //! gate an action, since a lagging replica would serve an unconditional read
 //! the same stale body. No answer is remembered here beyond the `ETag` and
 //! its body: every call reaches the forge. `LOOM_HYGIENE_CONDITIONAL=0`
-//! makes them unconditional again (nothing sent, nothing stored).
+//! makes them unconditional (no `If-None-Match`, the entry neither read nor
+//! written); the target, identity check, routing and breaker are unchanged.
 //!
 //! Branch listings (`pulls?head=`) stay unconditional: `gh-cached
 //! --invalidate` drops only `view-` entries, so a stored listing could
@@ -49,15 +51,25 @@
 //! both are known (rename-proof), else `base.repo.full_name` /
 //! `repository_url` against the canonical name. A mismatch (a transferred
 //! item, a followed redirect) is [`Read::Unknown`], counted as
-//! [`IDENTITY_MISMATCH`], and casts doubt on the repo record
-//! ([`crate::forge_repo_facts::observe`]), so a renamed repo re-resolves on
-//! the next read instead of failing every read forever.
+//! [`IDENTITY_MISMATCH`]. A first-hand (`200`) body for the right number
+//! that names another repo under the same id (or with no id to compare)
+//! casts doubt on the repo record ([`crate::forge_repo_facts::observe`], as
+//! of the request-sent time), so a renamed repo re-resolves on the next read
+//! instead of failing every read forever; a `304` body, another number or
+//! another repo id never does ([`should_observe`]).
 //!
 //! # Failure
 //!
 //! A shed, a timeout, a non-200/304, a parse failure or a mismatch is
 //! [`Read::Unknown`]; a `404`/`410` is [`Read::Gone`]. Consumers map both to
 //! KEEP — never to "closed" or "no PR".
+//!
+//! # Rate-limit breaker
+//!
+//! Item reads honour the global breaker as the pre-W6 `cached_read` issue
+//! reads did: while it is cooling an item read makes no forge call and is
+//! [`Read::Unknown`]; a failed read's stderr is reported to it
+//! (`global_observe_failure`), so a rate-limit refusal here trips it.
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -228,6 +240,12 @@ pub(crate) fn pull_facts(root: &Path, pr: u32, caller: &'static str) -> Read<Pul
 type Parsed<B> = (Option<u64>, Option<String>, Option<u64>, B);
 
 /// One single-item read: resolve, fetch, check identity, parse.
+///
+/// Breaker-aware like every daemon forge poll (and like the
+/// `forge_etag_store::cached_read` path the issue reads used before W6):
+/// while the global rate-limit breaker is cooling the read makes no forge
+/// call and is [`Read::Unknown`], and a failed read's stderr is reported to
+/// the breaker so a rate-limit refusal here trips it.
 fn item_read<B>(
     root: &Path,
     entity: &str,
@@ -235,11 +253,15 @@ fn item_read<B>(
     caller: &'static str,
     parse: impl Fn(&str) -> Option<Parsed<B>>,
 ) -> Read<B> {
+    // Before `resolve`, which may itself read the repo from the forge.
+    if crate::rate_limit_breaker::global_skip_pass(caller) {
+        return Read::Unknown;
+    }
     let op = view_op(entity);
-    let (body, fact) = match resolve(root) {
+    let (body, fact, first_hand) = match resolve(root) {
         Where::Unavailable => return Read::Unknown,
         Where::Placeholder => match placeholder_item(root, entity, number, caller, op) {
-            Read::Ok(body) => (body, None),
+            Read::Ok(body) => (body, None, None),
             Read::Gone => return Read::Gone,
             Read::Unknown => return Read::Unknown,
         },
@@ -248,6 +270,7 @@ fn item_read<B>(
             let dir = conditional().then(store::daemon_store_dir).flatten();
             let site = ConditionalRead::new(caller, op).item_scoped();
             let gh = PathBuf::from(crate::gh_invocation::gh_bin());
+            let sent_at = chrono::Utc::now().timestamp();
             let read = crate::forge_cached_view::fetch_view_for(
                 site,
                 &gh,
@@ -259,8 +282,13 @@ fn item_read<B>(
             );
             use crate::forge_cached_view::ViewStatus as S;
             match (read.status, read.body) {
-                (S::Fresh | S::NotModified, Some(body)) => (body, Some(fact)),
+                (S::Fresh, Some(body)) => (body, Some(fact), Some(sent_at)),
+                (S::NotModified, Some(body)) => (body, Some(fact), None),
                 (S::NotFound | S::Gone, _) => return gone(),
+                (S::Failed, _) => {
+                    crate::rate_limit_breaker::global_observe_failure(&read.stderr, caller);
+                    return Read::Unknown;
+                }
                 _ => return Read::Unknown,
             }
         }
@@ -268,11 +296,27 @@ fn item_read<B>(
     let Some((got_number, got_repo, got_id, parsed)) = parse(&body) else {
         return Read::Unknown;
     };
-    if identity_matches(fact.as_ref(), number, got_number, got_repo.as_deref(), got_id) {
+    let seen = Seen {
+        number: got_number,
+        repo: got_repo.as_deref(),
+        id: got_id,
+    };
+    if let (Some(f), Some(sent_at)) = (fact.as_ref(), first_hand) {
+        observe_repo(f, number, &seen, sent_at);
+    }
+    if identity_matches(fact.as_ref(), number, &seen) {
         Read::Ok(parsed)
     } else {
         Read::Unknown
     }
+}
+
+/// What an answered body says it is.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Seen<'a> {
+    pub(crate) number: Option<u64>,
+    pub(crate) repo: Option<&'a str>,
+    pub(crate) id: Option<u64>,
 }
 
 fn gone<T>() -> Read<T> {
@@ -290,26 +334,14 @@ fn view_op(entity: &str) -> ForgeOp {
 
 /// Is the answered body the item that was asked for? The number always; the
 /// repository when a fact named it (by id when both sides carry one).
-pub(crate) fn identity_matches(
-    fact: Option<&Fact>,
-    number: u32,
-    got_number: Option<u64>,
-    got_repo: Option<&str>,
-    got_id: Option<u64>,
-) -> bool {
-    let number_ok = got_number == Some(u64::from(number));
-    let repo_ok = fact.is_none_or(|f| match (f.repo_id, got_id) {
+pub(crate) fn identity_matches(fact: Option<&Fact>, number: u32, seen: &Seen<'_>) -> bool {
+    let number_ok = seen.number == Some(u64::from(number));
+    let repo_ok = fact.is_none_or(|f| match (f.repo_id, seen.id) {
         (Some(want), Some(got)) => want == got,
-        _ => got_repo.is_some_and(|r| r.eq_ignore_ascii_case(&f.full_name())),
+        _ => seen
+            .repo
+            .is_some_and(|r| r.eq_ignore_ascii_case(&f.full_name())),
     });
-    // A body naming another repo (a rename, even under a matching id, or a
-    // transfer) casts doubt on the record, which then re-resolves before its
-    // next use; the record is never rewritten from this body.
-    if let (Some(f), Some(r)) = (fact, got_repo) {
-        if !r.eq_ignore_ascii_case(&f.full_name()) {
-            facts::observe(&f.host, &f.configured_nwo, r, chrono::Utc::now().timestamp());
-        }
-    }
     if number_ok && repo_ok {
         return true;
     }
@@ -318,10 +350,40 @@ pub(crate) fn identity_matches(
         "forge_state: asked for #{number} of {}, the forge answered #{} of {}; treating it as \
          unknown ({IDENTITY_MISMATCH}={n})",
         fact.map_or_else(|| "{owner}/{repo}".to_string(), Fact::full_name),
-        got_number.map_or_else(|| "?".to_string(), |v| v.to_string()),
-        got_repo.unwrap_or("<none>"),
+        seen.number
+            .map_or_else(|| "?".to_string(), |v| v.to_string()),
+        seen.repo.unwrap_or("<none>"),
     );
     false
+}
+
+/// Whether a body may cast doubt on the repo record: a FIRST-HAND (`200`)
+/// answer for exactly the item asked for, naming another repository — and,
+/// when both sides carry a repo id, under the SAME id (a rename). A `304`
+/// serves a stored body, not a response to this request; a different number
+/// is some other item (a transferred issue answers with its new repo's
+/// number), and a different id is some other repo, not this one renamed —
+/// neither says anything about this record, and feeding them in would mark
+/// it suspect on every pass.
+pub(crate) fn should_observe(fact: &Fact, number: u32, seen: &Seen<'_>) -> bool {
+    let number_ok = seen.number == Some(u64::from(number));
+    let id_ok = match (fact.repo_id, seen.id) {
+        (Some(want), Some(got)) => want == got,
+        _ => true,
+    };
+    let renamed = seen
+        .repo
+        .is_some_and(|r| !r.eq_ignore_ascii_case(&fact.full_name()));
+    number_ok && id_ok && renamed
+}
+
+/// Feed a first-hand body's repository to [`facts::observe`] at the moment
+/// the request was sent, when [`should_observe`] allows it. The record is
+/// never rewritten from the body; it is only re-resolved before its next use.
+fn observe_repo(fact: &Fact, number: u32, seen: &Seen<'_>, sent_at: i64) {
+    if let (true, Some(r)) = (should_observe(fact, number, seen), seen.repo) {
+        facts::observe(&fact.host, &fact.configured_nwo, r, sent_at);
+    }
 }
 
 /// The placeholder fallback for one item: today's unconditional `gh api
@@ -344,6 +406,7 @@ fn placeholder_item(
     if stderr.contains("HTTP 404") || stderr.contains("HTTP 410") {
         gone()
     } else {
+        crate::rate_limit_breaker::global_observe_failure(&stderr, caller);
         Read::Unknown
     }
 }
