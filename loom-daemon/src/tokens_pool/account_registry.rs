@@ -813,8 +813,10 @@ pub fn select_codex_account_where(
     let _ = super::session_lifecycle::refresh_session_health(workspace, &inventory, now);
     // #10454: try the accounts whose session container is running first, so a
     // down session is passed over rather than selected and refused (exit 78).
-    // Falls back to the full inventory — today's behaviour — when nothing live
-    // is selectable or Docker cannot be queried (fail open).
+    // Falls back to the full inventory when nothing live is selectable or the
+    // containers cannot be observed (fail open). #10660: the read is the
+    // shared session snapshot — the daemon's published one in-process, one
+    // bounded snapshot in `tokens select` (see `liveness`'s module doc).
     let live = super::session_lifecycle::liveness::live_preferred(&inventory).and_then(|live| {
         super::health::select_healthy_for_model_at(workspace, provider, &live, model, now).ok()
     });

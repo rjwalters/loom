@@ -1867,7 +1867,7 @@ pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, H
 pub(crate) mod work_finder_tick;
 pub use work_finder_tick::{CapLimiter, CapView, CapacityWait, WorkFinderTickSummary};
 
-mod star_liveness;
+pub mod star_liveness;
 pub use star_liveness::{
     AskKind, DroppedStarIntent, LandingStage, OperatorAsk, StarLandingRow, StarLivenessReport,
 };

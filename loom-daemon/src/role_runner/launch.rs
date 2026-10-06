@@ -4,6 +4,12 @@ use super::*;
 // #10003: an exit-0 Codex tick whose sandbox refused every tool call is a
 // failure, and arms the host-wide hold the preference walk falls through on.
 pub(super) mod sandbox_noop;
+// #10455: a tick refused because the session container was down gets its own
+// failure reason (and `loom.admission.reason`), not a bare RECOVERABLE/78.
+mod session_down;
+// #10364: likewise a tick refused because the running container does not
+// mount the tick's working directory (a repo registered after it was created).
+mod session_mount_stale;
 
 /// Run `spawn-claude.sh -p "<prompt>" --model <model> [--effort <level>]
 /// --dangerously-skip-permissions` in `workspace_root`, appending combined
@@ -285,6 +291,18 @@ pub(super) fn run_role_with_timeout(
                     &tick_anchor,
                     status.code(),
                 );
+                if let Some(reason) = session_down::reason_in(&full_log, &tick_anchor)
+                    .or_else(|| session_mount_stale::reason_in(&full_log, &tick_anchor))
+                {
+                    // No per-tick WARN here (#10455 N2): the failure goes
+                    // through the per-root edge/repeat machine like any other,
+                    // and the undemoted signal is the per-account container
+                    // WARN in `observability::ops::codex_session`.
+                    return RoleTickOutcome::Failure(format!(
+                        "{reason}: `{}` exited with {status}: {detail}",
+                        script.display()
+                    ));
+                }
                 return RoleTickOutcome::Failure(format!(
                     "`{}` exited with {status}: {detail}",
                     script.display()

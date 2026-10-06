@@ -88,7 +88,7 @@ pub const DEFAULT_SESSION_IMAGE: &str = "ghcr.io/rjwalters/loom-worker-session:l
 
 /// The session image's fixed `CODEX_HOME` mount point
 /// (`docker/session/README.md` § "`CODEX_HOME` mount contract").
-const CONTAINER_CODEX_HOME: &str = "/home/loom/.codex-profile";
+pub(crate) const CONTAINER_CODEX_HOME: &str = "/home/loom/.codex-profile";
 
 /// The session image's fixed uid/gid (`docker/worker/MOUNT-CONTRACT.md` §3).
 /// Advisory only (see [`uid_matches_image`]) — never a hard `start` failure,
@@ -115,7 +115,7 @@ const DEFAULT_CODEX_SHELL_ARGS: &[&str] = &["--yolo"];
 /// host path (Issue #7389). Read back by `inspect` so `status` can report it
 /// and `start` can detect a mismatched re-`start` against a different
 /// workspace.
-const WORKSPACE_LABEL: &str = "loom.workspace";
+pub(crate) const WORKSPACE_LABEL: &str = "loom.workspace";
 
 /// Container label recording the security posture a host-mode session
 /// container was created with (issue #9979). `spawn-codex.sh` reads it and

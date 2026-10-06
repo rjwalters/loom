@@ -162,6 +162,27 @@ impl ResolvedLaunch {
     }
 }
 
+/// Stable prefix of a `RoleTickOutcome::Failure` reason for a tick refused
+/// because the account's Codex session container was down (#10455).
+pub const SESSION_DOWN_REASON_PREFIX: &str = "session-down";
+
+/// Whether a failure reason carries [`SESSION_DOWN_REASON_PREFIX`].
+#[must_use]
+pub fn is_session_down_reason(reason: &str) -> bool {
+    reason.starts_with(SESSION_DOWN_REASON_PREFIX)
+}
+
+/// Stable prefix of a `RoleTickOutcome::Failure` reason for a tick refused
+/// because the account's Codex session container did not mount its working
+/// directory (#10364).
+pub const SESSION_MOUNT_STALE_REASON_PREFIX: &str = "session-mount-stale";
+
+/// Whether a failure reason carries [`SESSION_MOUNT_STALE_REASON_PREFIX`].
+#[must_use]
+pub fn is_session_mount_stale_reason(reason: &str) -> bool {
+    reason.starts_with(SESSION_MOUNT_STALE_REASON_PREFIX)
+}
+
 /// Project one [`crate::role_runner::RoleTickOutcome`] onto the
 /// `(result, detail)` pair the record carries.
 ///

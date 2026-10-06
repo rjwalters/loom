@@ -51,6 +51,8 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     "heuristic",
     "kind",
     "repo",
+    // #10455: `loom.codex_session.state` (the session container's name).
+    "container",
 ];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
@@ -363,6 +365,12 @@ pub enum MetricName {
     /// Pending estimates evicted by the MAX_PENDING cap since process start.
     #[serde(rename = "loom.eta.health.pending_over_cap")]
     EtaHealthPendingOverCap,
+    // ---- Codex session containers (Issue #10455) ---------------------------
+    /// Per session-managed Codex account, one point per `state` ∈ `running`,
+    /// `stopped`, `restarting`, `missing`, `stale_mounts`: 1 for the container's current
+    /// state, 0 for the rest. Labelled `account` and `container`.
+    #[serde(rename = "loom.codex_session.state")]
+    CodexSessionState,
     // ---- Fleet gauges produced by the captain (W12) ----------------------
     /// Age of the captain's last production of a fleet gauge job, labelled
     /// `task` = the job (`observability::captain_gauges::Config::jobs`): on the captain its own,
@@ -438,6 +446,7 @@ impl MetricName {
             Self::EtaHealthSnapshotRows => "loom.eta.health.snapshot_rows",
             Self::EtaHealthSnapshotAlternatesRows => "loom.eta.health.snapshot_alternates_rows",
             Self::EtaHealthPendingOverCap => "loom.eta.health.pending_over_cap",
+            Self::CodexSessionState => "loom.codex_session.state",
             Self::CaptainGaugeAgeSeconds => "loom.captain.gauge_age_seconds",
             Self::CaptainGaugeFallback => "loom.captain.gauge_fallback",
         }
@@ -520,6 +529,7 @@ impl MetricName {
             Self::EtaHealthSnapshotRows => "{row}",
             Self::EtaHealthSnapshotAlternatesRows => "{row}",
             Self::EtaHealthPendingOverCap => "{estimate}",
+            Self::CodexSessionState => "1",
             Self::CaptainGaugeAgeSeconds => "s",
             Self::CaptainGaugeFallback => "1",
             _ => "By",
@@ -610,6 +620,10 @@ impl MetricName {
             Self::EtaHealthPendingOverCap => {
                 "Pending ETA estimates evicted by the MAX_PENDING cap since process start; \
                  whole series only when distinct series exceed the cap."
+            }
+            Self::CodexSessionState => {
+                "Codex session container state per account: 1 for the current state \
+                 (running, stopped, restarting, missing, stale_mounts), 0 for the others."
             }
             Self::CaptainGaugeAgeSeconds => {
                 "Age of the fleet captain's last run of a fleet gauge job, by task."

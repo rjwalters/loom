@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use super::base::{BaseRepo, ConfigFp};
+use super::installation::Snapshot;
 use super::record::Record;
 use super::GhRepoEnv;
 
@@ -39,6 +40,12 @@ pub(super) struct State {
     pub(super) confirms: HashMap<(PathBuf, GhRepoEnv, u64), Option<String>>,
     /// `(pass, record key)` confirmed against the forge inside that pass.
     pub(super) confirmed: HashSet<(u64, String)>,
+    /// Installation snapshots by credential key (the hot layer over the disk
+    /// store, W8).
+    pub(super) snapshots: HashMap<String, Snapshot>,
+    /// Credential keys whose latest snapshot revalidation failed (one warn
+    /// line per streak).
+    pub(super) snapshot_failing: HashSet<String>,
 }
 
 #[cfg(not(test))]
