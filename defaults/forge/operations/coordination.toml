@@ -256,6 +256,9 @@ path = "defaults/scripts/lib/forge-helpers.sh"
 [[operation.callers]]
 kind = "role-prompt"
 path = "defaults/.claude/commands/loom/builder-complexity.md"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/sweep_registry/park_forge.rs"
 
 [[operation]]
 id = "issue.close-with-reason"

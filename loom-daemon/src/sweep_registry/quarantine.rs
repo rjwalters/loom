@@ -1059,6 +1059,12 @@ impl SweepRegistry {
             super::park_forge::BoundedParkForge::new(self, "quarantine.label", Some("loom:issue"));
         if let Err(e) = super::park_forge::quarantine_park_via(&mut forge, issue) {
             log::debug!("sweep_registry: quarantine park for #{issue} failed: {e}");
+            // A timed-out park means `gh` is wedged: skip the comment rather
+            // than spend a second full timeout on the read path (#3973). A
+            // non-timeout failure still posts it.
+            if matches!(forge.failure(), Some(super::park_forge::ParkWriteFailure::TimedOut(_))) {
+                return;
+            }
         }
 
         let body = format!(
@@ -2497,70 +2503,6 @@ exit 0
         crate::credential_preflight::clear_owner_root_registry();
     }
 
-    /// Issue #10161: the quarantine's body park record lands BEFORE
-    /// `loom:blocked`, and a rejected body write leaves no label edit (no
-    /// label-only park) while the explanatory comment is still posted.
-    fn park_ordering_registry(dir: &Path, body_edit_exit: i32) -> (SweepRegistry, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-        let gh_log = dir.join("gh.log");
-        let fake = dir.join("fake-gh-park.sh");
-        let script = format!(
-            "#!/usr/bin/env bash\n\
-             printf '%s\\n' \"$*\" >> \"{log}\"\n\
-             {park_view}\
-             if [[ \"$1\" == \"issue\" && \"$2\" == \"edit\" && \"$*\" == *--body* ]]; then\n\
-             exit {body_exit}\n\
-             fi\n\
-             exit 0\n",
-            log = gh_log.display(),
-            park_view = crate::sweep_registry::test_support::fake_gh_park_view_arm(),
-            body_exit = body_edit_exit,
-        );
-        std::fs::write(&fake, script).unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut config = SweepRegistryConfig::new(dir.to_path_buf());
-        config.gh_bin = Some(fake);
-        config.skip_label_flip = false;
-        (SweepRegistry::new(config), gh_log)
-    }
-
-    #[test]
-    #[serial]
-    fn apply_quarantine_label_writes_body_record_before_the_label() {
-        let dir = tempdir().unwrap();
-        let (registry, gh_log) = park_ordering_registry(dir.path(), 0);
-        registry.apply_quarantine_label(9601, 3);
-        let calls: Vec<String> = std::fs::read_to_string(&gh_log)
-            .unwrap()
-            .lines()
-            .map(String::from)
-            .collect();
-        let body = calls
-            .iter()
-            .position(|c| c.contains("--body <!-- loom:park"))
-            .unwrap();
-        let label = calls
-            .iter()
-            .position(|c| c.contains("--add-label loom:blocked"))
-            .unwrap();
-        assert!(body < label, "body record must precede the label: {calls:?}");
-        assert!(calls[body].contains("reason=\"insta-crash quarantine\""), "{calls:?}");
-        assert!(calls[body].contains("by=daemon"), "{calls:?}");
-        assert!(calls[label].contains("--remove-label loom:issue"), "{calls:?}");
-        assert!(calls.iter().any(|c| c.starts_with("issue comment 9601")), "{calls:?}");
-    }
-
-    #[test]
-    #[serial]
-    fn apply_quarantine_label_failed_body_write_applies_no_label() {
-        let dir = tempdir().unwrap();
-        let (registry, gh_log) = park_ordering_registry(dir.path(), 1);
-        registry.apply_quarantine_label(9602, 3);
-        let log = std::fs::read_to_string(&gh_log).unwrap();
-        assert!(!log.contains("--add-label"), "label-only park: {log}");
-        assert!(log.contains("issue comment 9602"), "comment is still posted: {log}");
-    }
-
     /// The unregistered-root counterpart: `release_quarantine_label` on a
     /// single-owner workspace must leave `GH_CONFIG_DIR` untouched.
     #[test]
@@ -2611,6 +2553,12 @@ mod empty_pool_tests;
 #[cfg(test)]
 #[path = "quarantine_dispatch_scope_tests.rs"]
 mod dispatch_scope_tests;
+
+/// Quarantine body park record ordering + timeout budget (#10161), split out
+/// per the file-size ratchet.
+#[cfg(test)]
+#[path = "quarantine_park_tests.rs"]
+mod park_tests;
 
 /// The quarantine-*release* retry policy (#4110 + the #8953 breaker check and
 /// attempt ceiling) — a sibling file per the file-size ratchet, same reason

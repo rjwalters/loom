@@ -809,6 +809,10 @@ fn daemon_write_paths_are_scoped() {
         ("sweep_registry/restore_to_ready.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
+            "sweep_registry/park_forge.rs",
+            Via(DISPATCH, "park adapter for the quarantine + PR-less hold writers"),
+        ),
+        (
             "sweep_registry/prless_retry/hold.rs",
             Via(DISPATCH, "acts on dispatched sweeps"),
         ),
