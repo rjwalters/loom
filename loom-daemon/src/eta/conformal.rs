@@ -30,10 +30,13 @@
 //! `s ≥ ln(elapsed / q_τ)`. These are exactly the slow items, so dropping
 //! them biases every shift down (an optimistic range). Scores and bounds go
 //! through one product-limit (Kaplan–Meier) estimate on the score axis —
-//! a bound stays at risk up to its value and contributes no event, censoring
-//! follows events on a tie, and an unresolvable upper tail clamps to the
-//! largest bound seen (which is conservative: the shift is never below the
-//! bound that could not be resolved).
+//! a bound stays at risk up to its value and contributes no event, and
+//! censoring follows events on a tie. When the tail past the last landing is
+//! all censored and the events cannot reach the level, those bounds are read
+//! as landing at their bound (the smallest values the data allow), so the
+//! shift is the matching order statistic of the unresolved bounds — still
+//! never below what the data force, but not set by one long-open outlier, as
+//! the earlier clamp to the largest bound was (#10489 backtest).
 //!
 //! # Rate limit
 //!
@@ -215,11 +218,25 @@ fn see(o: &CalibrationObservation, base: &str, t: DateTime<Utc>) -> Option<Seen>
 }
 
 /// The `level` quantile of the product-limit estimate over `points`
-/// (`(score, is_event)`), clamped to the largest point when unresolvable.
+/// (`(score, is_event)`).
+///
+/// When the events alone cannot resolve it (the survival curve is still above
+/// `1 − level` after the last event, because the rest of the mass is
+/// censored beyond it), each bound past the last event is read as landing
+/// exactly at its bound — the smallest values the data allow — so the result
+/// is the matching order statistic of those bounds. That is still a lower
+/// bound on the true quantile, but one long-open outlier no longer sets it:
+/// clamping to the largest bound seen made the backtest's p90 several days
+/// wide and its late surprise 2.7% against a 10% target (#10489).
 fn km_quantile(points: &mut [(f64, bool)], level: f64) -> f64 {
     // Ascending; events before bounds on a tie ("censoring follows events").
     points.sort_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
     let horizon = points.last().map_or(0.0, |p| p.0);
+    let last_event = points
+        .iter()
+        .filter(|p| p.1)
+        .map(|p| p.0)
+        .fold(f64::NEG_INFINITY, f64::max);
     let target = 1.0 - level;
     let mut at_risk = points.len() as f64;
     let mut survival = 1.0_f64;
@@ -229,7 +246,7 @@ fn km_quantile(points: &mut [(f64, bool)], level: f64) -> f64 {
         let (mut deaths, mut here) = (0.0, 0.0);
         while i < points.len() && points[i].0 == x {
             here += 1.0;
-            if points[i].1 {
+            if points[i].1 || x > last_event {
                 deaths += 1.0;
             }
             i += 1;

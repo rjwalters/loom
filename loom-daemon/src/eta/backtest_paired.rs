@@ -26,6 +26,7 @@
 //! per-day win rate carries the same deterministic 95% Wilson interval as the
 //! live gate ([`DayWins`]).
 
+use super::super::offline::evaluate::{bootstrap, Estimate, IssueSums, BOOTSTRAP_SEED};
 use super::super::score::{bucket, EstimateSummary, Score};
 use super::super::shadow::{DaySums, DayWins, ANSWER_RATE_SLACK, LATE_SURPRISE_SLACK};
 use super::ReplayCase;
@@ -197,6 +198,13 @@ pub struct Paired {
     pub a_late_rate: Option<f64>,
     /// `b`'s.
     pub b_late_rate: Option<f64>,
+    /// `b − a` mean three-quantile pinball loss over `common`, with its 95%
+    /// issue-bootstrap interval (#10489): whole issues are resampled, so the
+    /// many stage entries of one issue never inflate `n`. Negative favours
+    /// `b`. `None` when nothing was common.
+    pub delta_pinball_loss_sec: Option<Estimate>,
+    /// `b − a` mean `pinball4_loss_sec` over `loss4_pairs`, likewise.
+    pub delta_pinball4_loss_sec: Option<Estimate>,
     /// The walk-forward daily folds, oldest first.
     pub folds: Vec<Fold>,
     /// `b`'s per-day win rate over `a` on the deciding loss, with its 95%
@@ -205,6 +213,10 @@ pub struct Paired {
     /// `B` as the challenger.
     pub day_wins: DayWins,
 }
+
+/// Issue-bootstrap draws behind [`Paired::delta_pinball_loss_sec`] and
+/// [`Paired::delta_pinball4_loss_sec`].
+pub const PAIRED_BOOTSTRAP_RESAMPLES: usize = 1_000;
 
 /// Pair `a` and `b`, replayed over the same cases in the same order.
 pub(super) fn paired_of(a: &[Replayed], b: &[Replayed]) -> Paired {
@@ -218,7 +230,14 @@ pub(super) fn paired_of(a: &[Replayed], b: &[Replayed]) -> Paired {
     let (mut a_loss, mut b_loss, mut a_loss4, mut b_loss4) = (0.0, 0.0, 0.0, 0.0);
     let (mut a_late, mut b_late) = (0_usize, 0_usize);
     let mut days: BTreeMap<String, (usize, DaySums)> = BTreeMap::new();
+    let (mut delta, mut delta4) = (IssueSums::new(), IssueSums::new());
+    let add = |sums: &mut IssueSums, key: &str, d: f64| {
+        let e = sums.entry(key.to_string()).or_insert((0.0, 0));
+        e.0 += d;
+        e.1 += 1;
+    };
     for (ra, rb) in a.iter().zip(b) {
+        let issue = format!("{}#{}", ra.case.subject.repo, ra.case.subject.issue);
         let (sa, sb) = (&ra.score, &rb.score);
         out.a_answered += usize::from(sa.pinball_loss_sec.is_some());
         out.b_answered += usize::from(sb.pinball_loss_sec.is_some());
@@ -230,11 +249,13 @@ pub(super) fn paired_of(a: &[Replayed], b: &[Replayed]) -> Paired {
             out.common += 1;
             a_loss += la;
             b_loss += lb;
+            add(&mut delta, &issue, lb - la);
         }
         if let (Some(la), Some(lb)) = (sa.pinball4_loss_sec, sb.pinball4_loss_sec) {
             out.loss4_pairs += 1;
             a_loss4 += la;
             b_loss4 += lb;
+            add(&mut delta4, &issue, lb - la);
             day.1.pairs += 1;
             day.1.current_loss4_sec += la;
             day.1.candidate_loss4_sec += lb;
@@ -253,6 +274,11 @@ pub(super) fn paired_of(a: &[Replayed], b: &[Replayed]) -> Paired {
     out.b_mean_pinball4_loss_sec = mean(b_loss4, out.loss4_pairs);
     out.a_late_rate = share(a_late, out.late_pairs);
     out.b_late_rate = share(b_late, out.late_pairs);
+    let ci = |sums: &IssueSums| {
+        (!sums.is_empty()).then(|| bootstrap(sums, PAIRED_BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED))
+    };
+    out.delta_pinball_loss_sec = ci(&delta);
+    out.delta_pinball4_loss_sec = ci(&delta4);
     let sums: BTreeMap<String, DaySums> = days.iter().map(|(d, (_, s))| (d.clone(), *s)).collect();
     out.day_wins = DayWins::of(&sums);
     out.folds = days

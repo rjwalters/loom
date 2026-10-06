@@ -121,6 +121,24 @@ fn right_censored_estimates_above_the_base_p90_raise_the_adjusted_quantiles() {
 }
 
 #[test]
+fn an_unresolved_censored_tail_reads_its_bounds_not_its_largest_outlier() {
+    // 60 landings, all at or below the base p90 · e^0.11, and 30 estimates
+    // still open past every landing: 29 open 20 000 s (score
+    // ln(20 000 / 14 400) ≈ 0.33) and one open 1 000 000 s (≈ 4.24). The
+    // events alone leave a third of the mass unresolved, so the p90 is read
+    // off the bounds: the 29 common ones, not the single outlier (#10489).
+    let mut set = landings(Stage::ReviewWait, 60, -0.5, 1.5, "l");
+    set.extend((0..29).map(|i| obs(&format!("o{i}"), Stage::ReviewWait, -20_000 - i, None)));
+    set.push(obs("outlier", Stage::ReviewWait, -1_000_000, None));
+    let record = estimate_with(set).calibration.expect("calibrated");
+    assert_eq!(record.n_censored, 30);
+    let common = (20_000.0_f64 / BASE.3 as f64).ln();
+    let outlier = (1_000_000.0_f64 / BASE.3 as f64).ln();
+    assert!(record.raw_shift.p90 >= common - 0.01, "{record:?}");
+    assert!(record.raw_shift.p90 < outlier - 1.0, "{record:?}");
+}
+
+#[test]
 fn each_quantile_hits_its_own_rate_on_the_calibration_set() {
     // Base far too narrow: actual is 3600·exp(z), z in [-0.5, 2.5].
     let set = landings(Stage::ReviewWait, 200, -0.5, 2.5, "h");
