@@ -590,6 +590,9 @@ notes = "An observed `run cancel` in CI YAML is workflow-level concurrency polic
 [[operation.callers]]
 kind = "workflow"
 path = ".github/workflows/ci.yml"
+[[operation.callers]]
+kind = "script"
+path = "scripts/ci-result-gate.sh"
 
 # --- releases-distribution ---------------------------------------------------
 
