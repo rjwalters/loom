@@ -87,12 +87,21 @@ impl EtaHealth {
     }
 }
 
-/// Add `n` cap-evicted pending estimates to the cumulative count (#10496).
-pub fn note_over_cap(n: usize) {
+/// Add `n` cap-evicted pending estimates to the cumulative count, and warn
+/// when any were evicted (#10496). `series` of them were the last estimate
+/// of their series — evicted only when distinct series exceed the cap.
+pub fn note_over_cap(n: usize, series: usize) {
     with(|h| {
         let total = h.pending_over_cap.unwrap_or(0);
         h.pending_over_cap = Some(total.saturating_add(n as u64));
     });
+    if n > 0 {
+        log::warn!(
+            "eta: evicted {n} pending estimate(s) at the {} cap (redundant refreshes, then \
+             pairs to their earliest); {series} whole series lost: more distinct series than the cap",
+            crate::eta::tracker::MAX_PENDING
+        );
+    }
 }
 
 /// Record a refresh tick in the global state ([`EtaHealth::tick`]).

@@ -1176,16 +1176,7 @@ pub(super) async fn record(
     append_journal(workspace_root, &rows);
     let delivered = deliver(emissions, outcomes, &Provenance::current(), &host_id, dry_run, sink());
     write_pending(&pending_path(workspace_root), &pending);
-    super::ops::eta_health::note_over_cap(dropped.over_cap);
-    if dropped.over_cap > 0 {
-        log::warn!(
-            "eta: evicted {} pending estimate(s) at the {} cap (redundant refreshes, then \
-             pairs to their earliest); {} whole series lost: more distinct series than the cap",
-            dropped.over_cap,
-            crate::eta::tracker::MAX_PENDING,
-            dropped.series_over_cap
-        );
-    }
+    super::ops::eta_health::note_over_cap(dropped.over_cap, dropped.series_over_cap);
     log::info!(
         "eta: pass emitted={} refused={} outcomes={} journaled={} pending={} expired={} \
          invalid={} reads={} deferred_reads={} feature_reads={} orphaned={} over_cap={}",
