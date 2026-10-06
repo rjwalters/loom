@@ -560,12 +560,11 @@ fn gh_api_json(
         .write_all(json.as_bytes())
         .and_then(|()| input.flush())
         .map_err(|e| format!("could not write the gh api request body: {e}"))?;
-    let mut inv =
-        GhInvocation::new(Operation::new(op), intent, GhTarget::None, WRITE_TIMEOUT)
-            .forge_op(forge_op)
-            .program(gh_bin)
-            .arg("api")
-            .arg(path);
+    let mut inv = GhInvocation::new(Operation::new(op), intent, GhTarget::None, WRITE_TIMEOUT)
+        .forge_op(forge_op)
+        .program(gh_bin)
+        .arg("api")
+        .arg(path);
     if let Some(method) = method {
         inv = inv.arg("-X").arg(method);
     }
