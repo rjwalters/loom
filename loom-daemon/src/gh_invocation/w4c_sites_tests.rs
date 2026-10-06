@@ -92,7 +92,14 @@ fn every_deferrable_site_maps_a_shed_to_no_answer() {
 fn the_landed_ladder_never_reads_a_shed_as_landed() {
     let root = tempfile::tempdir().unwrap();
     let _g = install(exhausted());
-    let landed = crate::worktree_ops::landed::probe(root.path(), Some("abc123"), Some(7));
+    // The ladder's own `gh pr list` fallback is replaced by "unavailable" so
+    // the test never spawns the real `gh`; only the shed REST rung is under test.
+    let landed = crate::worktree_ops::landed::probe_with_fallback(
+        root.path(),
+        Some("abc123"),
+        Some(7),
+        &|_, _| crate::worktree_cli::branch_landed::ForgeProbe::unavailable(),
+    );
     assert!(!landed.is_landed(), "{landed:?}");
 }
 
