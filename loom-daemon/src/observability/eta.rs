@@ -635,53 +635,6 @@ fn parse_time(raw: Option<&str>) -> Option<DateTime<Utc>> {
         .map(|t| t.with_timezone(&Utc))
 }
 
-/// The PR rows of a repo's review listings, each keyed to the issue it
-/// closes. A PR that closes no issue is not tracked.
-#[must_use]
-pub fn pr_views(listings: &[Vec<RestIssue>]) -> Vec<PrView> {
-    let mut seen = BTreeSet::new();
-    let mut views = Vec::new();
-    for item in listings.iter().flatten() {
-        if !item.is_pull_request || !seen.insert(item.number) {
-            continue;
-        }
-        let Some(issue) =
-            super::ops::stage_dwell::closing_refs(item.body.as_deref().unwrap_or_default())
-                .first()
-                .copied()
-        else {
-            continue;
-        };
-        views.push(PrView {
-            number: item.number,
-            issue,
-            labels: item.labels.clone(),
-            created_at: parse_time(item.created_at.as_deref()),
-            updated_at: parse_time(item.updated_at.as_deref()),
-        });
-    }
-    views
-}
-
-/// Every listed PR with the issues its body links, by the work finder's rule
-/// (`linkage_refs`: closing keywords and `Part of`), for the star state
-/// (#10372).
-#[must_use]
-pub fn pr_links(listings: &[Vec<RestIssue>]) -> Vec<(u32, Vec<u32>)> {
-    let mut seen = BTreeSet::new();
-    listings
-        .iter()
-        .flatten()
-        .filter(|item| item.is_pull_request && seen.insert(item.number))
-        .map(|item| {
-            (
-                item.number,
-                crate::eta::star::body_links(item.body.as_deref().unwrap_or_default()),
-            )
-        })
-        .collect()
-}
-
 /// The open issues carrying a star label at any level: one ETag-conditional
 /// listing per label, the work finder's own URLs (a `304` costs no rate
 /// limit), walked past page 1 (#10389): a repo can have more than one page
@@ -1222,6 +1175,9 @@ use fit_swap::{log_fit, log_fit_v2, log_fit_v3, swap_fit};
 #[path = "eta_fleet_input.rs"]
 mod fleet_input;
 pub(super) use fleet_input::fleet_state_input;
+#[path = "eta_listings.rs"]
+mod listings;
+pub use listings::{pr_links, pr_views};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
