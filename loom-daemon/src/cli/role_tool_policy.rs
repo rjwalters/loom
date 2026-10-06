@@ -44,12 +44,21 @@
 //!
 //! `--json` prints the full record on **both** exit codes, for a caller that
 //! wants the reason rather than just the verdict.
+//!
+//! # Forge-egress specs (#9989)
+//!
+//! `deny-specs` also appends the forge-egress specs
+//! ([`loom_daemon::role_tool_policy::forge_egress`]) — for **every** role, so
+//! an unresolvable or undeclared role still gets them — when a resolved forge
+//! egress policy enforces the API route. With no policy the output is
+//! byte-for-byte what it was before; `--json` adds `forgeEgressSpecs`.
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::role_tool_policy::{resolve_role_name, RoleToolPolicy};
+use loom_daemon::forge_egress::policy as egress_policy;
+use loom_daemon::role_tool_policy::{forge_egress, resolve_role_name, RoleToolPolicy};
 
 /// No restriction applies, or the role could not be resolved. Not an error.
 pub(crate) const EX_NO_RESTRICTION: i32 = 1;
@@ -122,6 +131,19 @@ impl PolicyArgs {
             RoleToolPolicy::candidate_paths(&role, workspace.as_deref(), &self.roles_dir);
         Some(RoleToolPolicy::load(&role, &candidates))
     }
+
+    /// The forge-egress specs (#9989) for this host and workspace — every
+    /// role, independent of its allowlist; empty unless a resolved policy
+    /// enforces the API route.
+    fn forge_egress_specs(&self) -> Vec<&'static str> {
+        let workspace = self
+            .workspace
+            .clone()
+            .or_else(|| std::env::var_os("WORKSPACE").map(PathBuf::from))
+            .or_else(|| std::env::current_dir().ok());
+        let sources = egress_policy::PolicySources::from_process(workspace.as_deref());
+        forge_egress::deny_specs(&egress_policy::resolve(&sources))
+    }
 }
 
 /// The JSON record both policy verbs emit under `--json`.
@@ -177,12 +199,19 @@ impl RoleToolPolicyCommand {
             }
             RoleToolPolicyCommand::DenySpecs(args) => {
                 let policy = args.resolve();
-                let specs = policy
-                    .as_ref()
-                    .map(RoleToolPolicy::deny_specs)
-                    .unwrap_or_default();
+                let egress = args.forge_egress_specs();
+                let specs = forge_egress::merge(
+                    policy
+                        .as_ref()
+                        .map(RoleToolPolicy::deny_specs)
+                        .unwrap_or_default(),
+                    &egress,
+                );
                 if args.json {
-                    println!("{}", record(policy.as_ref(), &raw_role_of(args.role.as_ref())));
+                    let mut v = record(policy.as_ref(), &raw_role_of(args.role.as_ref()));
+                    v["specs"] = serde_json::json!(specs);
+                    v["forgeEgressSpecs"] = serde_json::json!(egress);
+                    println!("{v}");
                 } else {
                     for spec in &specs {
                         println!("{spec}");
