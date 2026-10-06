@@ -979,6 +979,26 @@ fn host_session_run_args_drop_capabilities_and_privilege_escalation() {
 }
 
 #[test]
+fn host_session_run_args_restart_unless_stopped() {
+    // Issue #10452: a Docker engine restart or host reboot must bring the
+    // session back on its own. `unless-stopped` (not `always`) because
+    // `SessionLifecycle::stop` removes the container, and a policy must never
+    // fight an operator's deliberate stop.
+    let args = run_args_for(&[PathBuf::from("/home/u/GitHub/loom")]);
+    let at = args
+        .iter()
+        .position(|a| a == "--restart")
+        .expect("a restart policy is set");
+    assert_eq!(args.get(at + 1).map(String::as_str), Some("unless-stopped"));
+    assert_eq!(
+        args.iter().filter(|a| *a == "--restart").count(),
+        1,
+        "exactly one restart policy: {args:?}"
+    );
+    assert!(at < args.len() - 1, "the policy precedes the image: {args:?}");
+}
+
+#[test]
 fn host_session_run_args_label_the_posture_spawn_codex_checks() {
     let args = run_args_for(&[PathBuf::from("/home/u/GitHub/loom")]);
     assert!(args.contains(&format!("{SESSION_POSTURE_LABEL}={SESSION_POSTURE}")));
