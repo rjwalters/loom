@@ -68,6 +68,16 @@ pub(crate) enum EgressAction {
         /// The worker image the container will run.
         image: String,
     },
+    /// Classify one Bash command for the `loom:forge-egress` `PreToolUse`
+    /// rule (#9989): under an enforcing policy, a typed bypass of the managed
+    /// launcher prints the denial (`BLOCKED [routing.denied-by-guard]: …`) and
+    /// exits 1. Silent exit 0 otherwise, including with no policy, an
+    /// `observe` one, or `guards.forgeEgress=false`.
+    Guard {
+        /// The (masked) command text the hook is judging.
+        #[arg(long = "for-command")]
+        for_command: String,
+    },
 }
 
 fn workspace() -> PathBuf {
@@ -273,6 +283,15 @@ pub(crate) fn handle(action: EgressAction) -> Result<()> {
             report.exit_code()
         }
         EgressAction::ContainerArgs { .. } | EgressAction::ContainerCheck { .. } => 0, // above
+        EgressAction::Guard { for_command } => {
+            match forge_egress::guard::check_process(&for_command, &ws) {
+                Some(reason) => {
+                    println!("{reason}");
+                    1
+                }
+                None => 0,
+            }
+        }
         EgressAction::Policy => match policy::resolve(&PolicySources::from_process(Some(&ws))) {
             Resolution::Unconfigured => {
                 println!("{}", serde_json::json!({"origin": "unconfigured", "path": null}));

@@ -181,6 +181,15 @@ const CATEGORIES: &[Category] = &[
         tags: &[],
     },
     Category {
+        // Read by `loom-daemon forge egress guard` (#9989) through the shared
+        // resolver, only once a typed bypass matched under an enforcing policy.
+        key: "forgeEgress",
+        env: "LOOM_GUARD_FORGE_EGRESS",
+        kind: tiered_bool(true),
+        tiers: Tiers::All,
+        tags: &["loom:forge-egress"],
+    },
+    Category {
         key: "rmScope",
         env: "LOOM_RM_SCOPE",
         kind: Kind::RmScope,
@@ -1004,6 +1013,7 @@ mod tests {
         assert_eq!(category_for_tag("cloud-cli:aws"), Some("cloudCli"));
         assert_eq!(category_for_tag("force-op:detached"), Some("forceScope"));
         assert_eq!(category_for_tag("stash-scope:main-checkout"), Some("stashScope"));
+        assert_eq!(category_for_tag("loom:forge-egress"), Some("forgeEgress"));
         assert_eq!(category_for_tag("rm-protected-path"), None);
         assert_eq!(category_for_tag("catastrophic:x"), None);
     }
