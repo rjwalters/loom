@@ -111,11 +111,24 @@ impl Landed {
 /// round-trip when ancestry already failed.
 #[must_use]
 pub fn probe(repo_root: &Path, head_sha: Option<&str>, issue_num: Option<u32>) -> Landed {
+    probe_with_fallback(repo_root, head_sha, issue_num, &branch_landed::forge_probe)
+}
+
+/// [`probe`] with the ladder's own forge probe (the rung after REST cannot
+/// answer) injected, so a test can drive the REST rung without the fallback
+/// spawning the real `gh`.
+#[must_use]
+pub(crate) fn probe_with_fallback(
+    repo_root: &Path,
+    head_sha: Option<&str>,
+    issue_num: Option<u32>,
+    fallback: &dyn Fn(&Path, &str) -> ForgeProbe,
+) -> Landed {
     probe_with(
         repo_root,
         head_sha,
         issue_num,
-        &|branch| forge_probe_rest_first(repo_root, branch),
+        &|branch| forge_probe_rest_first(repo_root, branch, fallback),
         Caps::detect(),
     )
 }
@@ -151,10 +164,14 @@ pub fn probe_with(
 /// `gh pr list` goes through the routinely-exhausted GraphQL quota, while
 /// `gh api .../pulls` uses the separate, less-contended REST pool. A REST
 /// failure is `Unknown` for the fallback, never "not merged" (#7812).
-fn forge_probe_rest_first(repo_root: &Path, branch: &str) -> ForgeProbe {
+fn forge_probe_rest_first(
+    repo_root: &Path,
+    branch: &str,
+    fallback: &dyn Fn(&Path, &str) -> ForgeProbe,
+) -> ForgeProbe {
     super::clean_owner::repo_owner(repo_root)
         .and_then(|owner| merged_head_rest(repo_root, &owner, branch))
-        .unwrap_or_else(|| branch_landed::forge_probe(repo_root, branch))
+        .unwrap_or_else(|| fallback(repo_root, branch))
 }
 
 #[derive(serde::Deserialize)]
