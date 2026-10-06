@@ -18,8 +18,10 @@
 //! - one `eta.backtest.summary` per non-`current` heuristic: the rolling
 //!   per-day win count against `current`, the 95% Wilson lower bound and
 //!   `gate_ready`, which is [`shadow::backtest_gate`] — the very function
-//!   `eta promote` calls — evaluated on the same replay, so the two cannot
-//!   disagree on the same data.
+//!   `eta promote` calls — on a replay built the same way (calibration
+//!   evidence included, [`backtest::with_replay_calibration`]). It uses the
+//!   same gate function, not the same data: the summary also reads the fleet
+//!   snapshots and the offline PR cache, `eta promote` local data only.
 //!
 //! # Strictly point-in-time
 //!
@@ -261,12 +263,34 @@ fn point_in_time(
     local.push_journal(&journal, "local");
     let mut history = scope(local);
     prune_history(&mut history, cutoff);
+    // Calibration evidence comes only from the cut replay below
+    // ([`calibrated`]), exactly as `eta backtest` / `eta promote` build it —
+    // never from whatever the scope hook merged in, which could carry a
+    // landing resolved after the cutoff.
+    history.calibration.clear();
 
     let mut cases = backtest::cases_from_envelopes(&envelopes);
     cases.extend(backtest::cases_from_journal(&journal));
     let (mut cases, _dropped) = backtest::merge_case_sets(cases, inputs.pr_cases.clone());
     cases.retain(|c| c.kind == KIND && c.as_of < cutoff && c.actual_at < cutoff);
     (history, cases)
+}
+
+/// `history` with the calibrating heuristic's evidence replayed in from
+/// `cases` under `registry`'s base ([`backtest::with_replay_calibration`],
+/// the helper `eta backtest` and `eta promote` call). Leak-free because
+/// `history` and `cases` were already cut at the cutoff ([`point_in_time`]);
+/// without it `land-2026-10-06-calm-plover` would degrade to plain `land-v2`
+/// in every fold.
+fn calibrated(
+    registry: &Registry,
+    history: &StageSamples,
+    cases: &[ReplayCase],
+    loom: &Provenance,
+) -> StageSamples {
+    let mut history = history.clone();
+    backtest::with_replay_calibration(|id| registry.get(id), &mut history, cases, loom);
+    history
 }
 
 /// One heuristic's own scores on a day's cases.
@@ -320,20 +344,22 @@ pub fn run_day(
     let start = day_start(day);
     let cutoff = start + Duration::days(1);
     let day_s = day.format("%Y-%m-%d").to_string();
-    let (history, cases) = point_in_time(inputs, cutoff, scope);
+    let (uncalibrated, cases) = point_in_time(inputs, cutoff, scope);
     let day_cases: Vec<ReplayCase> = cases.iter().filter(|c| c.as_of >= start).cloned().collect();
     let no_filter = Filter::default();
 
     let registry = registry_for(start);
+    let day_history = calibrated(&registry, &uncalibrated, &cases, loom);
+    let history = &day_history;
     let current = registry.current(KIND, current_land);
     let current_id = current.id();
-    let current_scores = backtest::replay_scored(current, &history, &day_cases, no_filter, loom);
+    let current_scores = backtest::replay_scored(current, history, &day_cases, no_filter, loom);
     let current_stats = own_stats(&current_scores);
 
     let mut folds = Vec::new();
     for h in registry.for_kind(KIND) {
         let is_current = h.id() == current_id;
-        let scores = backtest::replay_scored(h, &history, &day_cases, no_filter, loom);
+        let scores = backtest::replay_scored(h, history, &day_cases, no_filter, loom);
         let own = own_stats(&scores);
         let mut fold = EtaBacktestFoldRecord {
             fold_id: crate::telemetry::trace::derived_hex(
@@ -361,7 +387,7 @@ pub fn run_day(
             loom: loom.clone(),
         };
         if !is_current {
-            if let Ok(cmp) = backtest::compare(current, h, &history, &day_cases, no_filter, loom) {
+            if let Ok(cmp) = backtest::compare(current, h, history, &day_cases, no_filter, loom) {
                 let p = &cmp.paired;
                 fold.paired_pairs = count(p.loss4_pairs);
                 fold.delta_pinball4_loss_sec =
@@ -378,7 +404,7 @@ pub fn run_day(
         folds.push(fold);
     }
 
-    let summaries = summaries_for(&cases, &history, current_land, registry_for, day, loom);
+    let summaries = summaries_for(&cases, &uncalibrated, current_land, registry_for, day, loom);
     DayRecords {
         day: day_s,
         folds,
@@ -387,7 +413,9 @@ pub fn run_day(
 }
 
 /// The rolling standing of every non-`current` heuristic on every case known at
-/// the cutoff — what `eta promote`'s backtest gate would say.
+/// the cutoff, judged by the gate function `eta promote` uses
+/// ([`shadow::backtest_gate`]). `history` is uncalibrated; it is calibrated
+/// here under the window's own registry.
 fn summaries_for(
     cases: &[ReplayCase],
     history: &StageSamples,
@@ -406,6 +434,8 @@ fn summaries_for(
         .min()
         .unwrap_or(day);
     let registry = registry_for(day_start(first));
+    // Calibrated under this window's registry, as `eta promote` would.
+    let history = &calibrated(&registry, history, cases, loom);
     let current = registry.current(KIND, current_land);
     let mut out = Vec::new();
     for h in registry.for_kind(KIND).filter(|h| h.id() != current.id()) {

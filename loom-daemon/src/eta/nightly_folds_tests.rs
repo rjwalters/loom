@@ -1,5 +1,6 @@
 //! The nightly folds (#10492): one record per heuristic per day, strictly
-//! point-in-time, agreeing with `eta promote`'s backtest gate, idempotent.
+//! point-in-time, judged by `eta promote`'s backtest gate function, with the
+//! calibrating heuristic given its replay calibration evidence, idempotent.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -39,6 +40,28 @@ fn busiest_day(inputs: &Inputs) -> NaiveDate {
         .max_by_key(|(day, n)| (*n, *day))
         .map(|(day, _)| day)
         .expect("the fixture has same-day land cases")
+}
+
+/// [`inputs`] plus enough slow, already-landed `land` cases in the two weeks
+/// before `day` for `land-2026-10-06-calm-plover`'s conformal calibration to
+/// engage (every case lands days later than `land-v2` expects).
+fn calibrating_inputs() -> (Inputs, NaiveDate) {
+    let mut inputs = inputs();
+    let day = busiest_day(&inputs);
+    let start = day_start(day);
+    let template = backtest::cases_from_envelopes(&inputs.envelopes)
+        .into_iter()
+        .find(|c| c.kind == Kind::Land && c.as_of.date_naive() == day)
+        .expect("a land case on the day");
+    let n = crate::eta::conformal::MIN_CELL_EVENTS * 2;
+    for i in 0..n {
+        let mut slow = template.clone();
+        slow.subject.issue += 2_000_000 + u32::try_from(i).unwrap();
+        slow.as_of = start - Duration::days(13) + Duration::hours(i64::try_from(i).unwrap() * 6);
+        slow.actual_at = start - Duration::hours(1);
+        inputs.pr_cases.push(slow);
+    }
+    (inputs, day)
 }
 
 fn fold(inputs: &Inputs, day: NaiveDate) -> DayRecords {
@@ -97,8 +120,8 @@ fn a_day_with_no_cases_reports_absent_rates_not_zero() {
 /// the day's records bit-identical.
 #[test]
 fn perturbing_post_cutoff_data_leaves_the_fold_bit_identical() {
-    let base = inputs();
-    let day = busiest_day(&base);
+    // With the calibration path engaged, so the leak test covers it too.
+    let (base, day) = calibrating_inputs();
     let cutoff = day_start(day) + Duration::days(1);
     let baseline = fold(&base, day);
     let baseline_json = serde_json::to_string(&baseline).unwrap();
@@ -128,9 +151,28 @@ fn perturbing_post_cutoff_data_leaves_the_fold_bit_identical() {
     let mut later = template.clone();
     later.as_of = cutoff + Duration::minutes(1);
     later.actual_at = cutoff + Duration::hours(2);
-    perturbed.pr_cases = vec![unresolved, later];
+    // And a post-cutoff case that lands absurdly late, which would move the
+    // calibration if any of it leaked in.
+    let mut slow_later = template.clone();
+    slow_later.subject.issue += 3_000_000;
+    slow_later.as_of = cutoff + Duration::minutes(2);
+    slow_later.actual_at = cutoff + Duration::days(30);
+    perturbed
+        .pr_cases
+        .extend([unresolved, later, slow_later.clone()]);
+    // A calibration observation resolved after the cutoff, through the scope
+    // hook (only the cut replay may supply calibration evidence).
+    let (pit_history, _) = point_in_time(&base, cutoff, &identity);
+    let future_obs = backtest::calibration_from_replay(
+        &crate::eta::heuristics::LandV2,
+        &pit_history,
+        &[slow_later],
+        &provenance(),
+    );
+    assert_eq!(future_obs.len(), 1, "the future observation is real");
     // And a history sample from the future, through the scope hook.
     let future_sample = |mut h: StageSamples| {
+        h.calibration.extend(future_obs.iter().cloned());
         h.stages.push(StageSample {
             repo: "rjwalters/loom".to_string(),
             stage: Stage::MergeWait,
@@ -153,20 +195,23 @@ fn perturbing_post_cutoff_data_leaves_the_fold_bit_identical() {
     let mut resolved = template.clone();
     resolved.actual_at = cutoff - Duration::seconds(1);
     resolved.subject.issue += 1_000_000;
-    control.pr_cases = vec![resolved];
+    control.pr_cases.push(resolved);
     let seen = fold(&control, day);
     assert_ne!(serde_json::to_string(&seen).unwrap(), baseline_json);
 }
 
-/// `gate_ready` is `eta promote`'s backtest gate on the same replay.
+/// `gate_ready` uses `eta promote`'s backtest gate function, on a replay
+/// calibrated the way `eta promote` calibrates it. (Same gate function, not
+/// the same data: in production the summary also reads fleet snapshots.)
 #[test]
-fn gate_ready_agrees_with_the_promote_backtest_gate() {
+fn gate_ready_uses_the_promote_backtest_gate_function() {
     let inputs = inputs();
     let day = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
     let records = fold(&inputs, day);
     let cutoff = day_start(day) + Duration::days(1);
-    let (history, cases) = point_in_time(&inputs, cutoff, &identity);
+    let (mut history, cases) = point_in_time(&inputs, cutoff, &identity);
     let registry = Registry::builtin();
+    backtest::with_replay_calibration(|id| registry.get(id), &mut history, &cases, &provenance());
     let current = registry.current(Kind::Land, None);
     assert!(!records.summaries.is_empty());
     for s in &records.summaries {
@@ -200,6 +245,57 @@ fn gate_ready_agrees_with_the_promote_backtest_gate() {
         assert_eq!(s.days, decision.backtest.day_wins.days as u64);
         assert_eq!(s.wins, decision.backtest.day_wins.wins as u64);
     }
+}
+
+/// #10532 review: the fold gives `land-2026-10-06-calm-plover` the same
+/// replay calibration evidence `eta backtest` / `eta promote` do, so its fold
+/// is the calibrated heuristic's and not its uncalibrated `land-v2` fallback.
+#[test]
+fn the_calibrating_heuristic_is_folded_calibrated_not_as_its_fallback() {
+    use crate::eta::heuristics::LAND_CALM_PLOVER;
+    let (inputs, day) = calibrating_inputs();
+    let start = day_start(day);
+    let cutoff = start + Duration::days(1);
+    let records = fold(&inputs, day);
+
+    let (uncalibrated, cases) = point_in_time(&inputs, cutoff, &identity);
+    assert!(uncalibrated.calibration.is_empty(), "only the cut replay supplies evidence");
+    let registry = Registry::builtin();
+    // The CLI path: `eta backtest` / `eta promote` call exactly this.
+    let mut cli = uncalibrated.clone();
+    backtest::with_replay_calibration(|id| registry.get(id), &mut cli, &cases, &provenance());
+    assert!(cli.calibration.len() >= crate::eta::conformal::MIN_CELL_EVENTS);
+    assert!(
+        cli.calibration
+            .iter()
+            .all(|o| o.resolved_at.is_none_or(|r| r < cutoff)),
+        "calibration evidence is itself point-in-time"
+    );
+
+    let plover = registry
+        .get(LAND_CALM_PLOVER)
+        .expect("calm-plover is registered");
+    let day_cases: Vec<ReplayCase> = cases.iter().filter(|c| c.as_of >= start).cloned().collect();
+    let pinball = |h: &StageSamples| {
+        own_stats(&backtest::replay_scored(
+            plover,
+            h,
+            &day_cases,
+            Filter::default(),
+            &provenance(),
+        ))
+        .pinball4
+    };
+    let (calibrated, fallback) = (pinball(&cli), pinball(&uncalibrated));
+    assert_ne!(calibrated, fallback, "the fixture makes calibration matter");
+
+    let folded = records
+        .folds
+        .iter()
+        .find(|f| f.heuristic == LAND_CALM_PLOVER)
+        .expect("a calm-plover fold");
+    assert_eq!(folded.pinball4_loss_sec, calibrated, "the fold is the CLI path's answer");
+    assert_ne!(folded.pinball4_loss_sec, fallback, "not the uncalibrated fallback");
 }
 
 fn at(day: u32, h: u32, m: u32) -> DateTime<Utc> {

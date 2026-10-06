@@ -614,6 +614,63 @@ pub fn calibration_from_replay(
         .collect()
 }
 
+/// Give the calibrating `land` heuristics (`land-2026-10-06-calm-plover`,
+/// #10489, over `land-v2`; `land-2026-10-06-quick-tern`, #10524, over
+/// `land-2026-10-04-twin-otter-b`) their calibration evidence from the replay
+/// itself: each [`super::heuristics::CALIBRATION_BASES`] estimate at every
+/// `land` case in `cases`, landing at the case's own outcome
+/// ([`calibration_from_replay`]). `base` resolves a base id to the heuristic
+/// that replays it: a registry's own, or a walk-forward one whose fit is
+/// chosen per case ([`super::walk_forward::DatedFits`], the nightly fold's
+/// per-prediction-day registries), so a fitted base's logged quantiles are
+/// the ones the wrapper adjusts.
+///
+/// The one implementation `eta backtest`, `eta promote` and the nightly fold
+/// (#10492) share, so the three cannot drift. Inert for every other
+/// heuristic, which never reads `calibration`. Point-in-time as long as
+/// `history` and `cases` are: it reads nothing else.
+pub fn with_replay_calibration<H: Heuristic>(
+    base: impl Fn(&str) -> Option<H>,
+    history: &mut StageSamples,
+    cases: &[ReplayCase],
+    loom: &Provenance,
+) {
+    // Every base is replayed over the same pre-calibration history: a
+    // base never reads `calibration`, so the order does not matter.
+    let mut replayed = Vec::new();
+    for id in super::heuristics::CALIBRATION_BASES {
+        if let Some(b) = base(id) {
+            replayed.extend(calibration_from_replay(&b, history, cases, loom));
+        }
+    }
+    history.calibration.extend(replayed);
+}
+
+/// A borrowed heuristic is the heuristic, so a lookup may hand out either a
+/// registry's own (`|id| registry.get(id)`) or an owned walk-forward one
+/// ([`with_replay_calibration`]'s `base`).
+impl<T: Heuristic + ?Sized> Heuristic for &T {
+    fn id(&self) -> &'static str {
+        (**self).id()
+    }
+
+    fn kind(&self) -> Kind {
+        (**self).kind()
+    }
+
+    fn estimate(&self, input: &EstimateInput, history: &StageSamples) -> super::Explanation {
+        (**self).estimate(input, history)
+    }
+
+    fn models_hold(&self) -> bool {
+        (**self).models_hold()
+    }
+
+    fn tier(&self) -> super::Tier {
+        (**self).tier()
+    }
+}
+
 /// A paired comparison of two heuristics on the identical replay set —
 /// operator decision 2 on #9289: the first gate for promoting a heuristic.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

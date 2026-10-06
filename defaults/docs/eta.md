@@ -2571,8 +2571,9 @@ day, catches up at most 7 missed days oldest first).
 - **Gate.** Each check passes `fleet.captain` first; the captain arms the
   `eta-nightly-folds` singleton job and folds, every other host stands down and
   emits nothing. With no captain declared **no host folds** (fail-closed, like
-  ci-telemetry; logged at `warn`), so set `fleet.captain` for the scoreboard to
-  exist. Records are keyed on `(heuristic, day)`, so a duplicate is detectable.
+  ci-telemetry; logged at `warn` and listed in
+  `host.health.captainless_singleton_jobs`), so set `fleet.captain` for the
+  scoreboard to exist. Records are keyed on `(heuristic, day)`, so a duplicate is detectable.
 - **Records** (OTLP-only, `loom.eta.backtest.*` attributes, body = the JSON):
   - `eta.backtest.fold` — one per registered `land` heuristic per UTC day:
     `heuristic`, `day`, `n_cases`, `answer_rate`, `pinball4_loss_sec`,
@@ -2581,9 +2582,13 @@ day, catches up at most 7 missed days oldest first).
     `paired_pairs`, `win`) and `fit_id`. A rate over no cases is omitted, not `0`.
   - `eta.backtest.summary` — one per non-`current` heuristic: the rolling
     per-day wins against `current` (`days`, `wins`, `ties`), the 95% Wilson
-    bounds, `gate_ready` and the gate's own `gate_detail`. `gate_ready` is
-    `shadow::backtest_gate`, the function `eta promote` calls, on the same
-    replay, so the two agree on the same data.
+    bounds, `gate_ready` and the gate's own `gate_detail`. `gate_ready` uses
+    the same gate function as `eta promote` (`shadow::backtest_gate`), not the
+    same data: the summary also replays fleet snapshots and the offline PR
+    cache, `eta promote` local data only.
+  - Both give `land-2026-10-06-calm-plover` the replay calibration evidence
+    `eta backtest` / `eta promote` do (`backtest::with_replay_calibration`,
+    built from the already-cut cases), so it is not folded as plain `land-v2`.
 - **Strictly point-in-time.** Before replaying, the run drops every input
   observed at or after the day's cutoff (the end of the day): outcome
   envelopes, journal rows, history samples, and cases not yet resolved. The

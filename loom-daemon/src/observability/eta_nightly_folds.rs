@@ -12,7 +12,8 @@
 //!   [`SINGLETON_JOB_NAME`] singleton job and folds; any other host stands down
 //!   and emits nothing. With no captain declared **no host folds** (fail-closed,
 //!   exactly like ci-telemetry's singleton gate): `fleet.captain` must name a
-//!   host for the scoreboard to exist, and the refusal is logged at `warn`.
+//!   host for the scoreboard to exist. The refusal is logged at `warn` and
+//!   listed in `host.health.captainless_singleton_jobs` (#9014).
 //! - **Isolation.** The fold runs in `spawn_blocking`; a failure or panic is
 //!   logged at `warn` and retried on the next check. It never takes the ETA
 //!   tracker's state lock.
@@ -78,11 +79,19 @@ pub fn gate_tick(root: &Path, host_id: &str, last: &mut Option<FoldGate>) -> Fol
                 Err(_) => FoldGate::StandDown { captain: name },
             }
         }
+        // Both refusals still go through `arm_singleton_job`, as ci-telemetry's
+        // gate does: it records a no-captain refusal in the captainless
+        // registry that `host.health.captainless_singleton_jobs` samples
+        // (#9014) — this job fails closed, so it belongs there — and clears
+        // that entry once a captain is declared. The trailing disarm covers a
+        // `fleet.captain` edit between the two reads: this check never folds.
         CaptainGate::Refused { captain: name, .. } => {
+            let _ = captain::arm_singleton_job(SINGLETON_JOB_NAME, root, host_id);
             captain::disarm_singleton_job(SINGLETON_JOB_NAME);
             FoldGate::StandDown { captain: name }
         }
         CaptainGate::NoCaptainDeclared => {
+            let _ = captain::arm_singleton_job(SINGLETON_JOB_NAME, root, host_id);
             captain::disarm_singleton_job(SINGLETON_JOB_NAME);
             FoldGate::NoCaptain
         }
@@ -255,6 +264,39 @@ mod tests {
             captain: "other".into()
         }
         .folds());
+    }
+
+    /// #10532 review: a no-captain refusal reaches the #9014 captainless
+    /// registry `host.health.captainless_singleton_jobs` samples, and leaves
+    /// it once a captain (even another host) is declared.
+    #[test]
+    fn a_no_captain_tick_lists_the_job_as_captainless() {
+        use crate::fleet_captain::{armed_singleton_job_names, captainless_singleton_job_names};
+        let job = SINGLETON_JOB_NAME.to_string();
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join(crate::config_resolver::LEGACY_CONFIG_REL);
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let mut last = None;
+
+        std::fs::write(&config, "{}").unwrap();
+        assert_eq!(gate_tick(root.path(), "loom-worker-1", &mut last), FoldGate::NoCaptain);
+        assert!(captainless_singleton_job_names().contains(&job));
+        assert!(!armed_singleton_job_names().contains(&job));
+
+        std::fs::write(&config, r#"{"fleet": {"captain": "loom-worker-2"}}"#).unwrap();
+        assert_eq!(
+            gate_tick(root.path(), "loom-worker-1", &mut last),
+            FoldGate::StandDown {
+                captain: "loom-worker-2".into()
+            }
+        );
+        assert!(!captainless_singleton_job_names().contains(&job));
+        assert!(!armed_singleton_job_names().contains(&job));
+
+        assert_eq!(gate_tick(root.path(), "loom-worker-2", &mut last), FoldGate::Captain);
+        assert!(armed_singleton_job_names().contains(&job));
+        assert!(!captainless_singleton_job_names().contains(&job));
+        crate::fleet_captain::disarm_singleton_job(SINGLETON_JOB_NAME);
     }
 
     #[test]
