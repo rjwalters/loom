@@ -26,10 +26,13 @@ source; the full both-legs send (inbox + Matrix) stays in
   `$LOOM_UI_INGEST_KEY_FILE`, `~/.config/loom-ui/ingest.key` (preferred: the
   per-host dashboard key; loom-ui `docs/operator-mail-onboarding.md`), then the
   telemetry tiers (`$LOOM_OBSERVABILITY_INGEST_KEY_FILE`,
-  `observability.ingestKeyFile`, `~/.loom/observability/ingest.key` -- the
-  dashboard key only on hosts exporting directly to `/ingest`). An older daemon without the subcommand
+  `observability.ingestKeyFile`, `~/.loom/observability/ingest.key`) -- but
+  only when the endpoint is that direct `https://.../ingest` dashboard (and
+  `LOOM_UI_INBOX_URL`, if set, is the same origin); a collector host's
+  telemetry key is never borrowed. An older daemon without the subcommand
   gives the env-only behavior. `loom-daemon health` reports an unresolved
-  mail-meant host on every run (`inbox_mail` section).
+  mail-meant host on every run (`inbox_mail` section); a placeholder endpoint
+  or `enabled: false` observability does not make a host mail-meant.
 - **No-op when unconfigured**: neither the env vars nor the daemon resolve a URL and key
   prints one note and returns 0, with no forge read. `inbox_mail on` is the same
   test (status only), for gating a caller's own reads. A failed POST warns and

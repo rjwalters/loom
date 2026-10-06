@@ -14,8 +14,17 @@
 //! else the first key *file* of: `$LOOM_UI_INGEST_KEY_FILE`, then
 //! `~/.config/loom-ui/ingest.key` (when it exists) -- the per-host dashboard
 //! key -- and only then the telemetry tiers
-//! [`crate::observability::resolve_ingest_key_file`] names (a telemetry key
-//! is the dashboard key only on hosts exporting directly to `/ingest`).
+//! [`crate::observability::resolve_ingest_key_file`] names. A telemetry key
+//! is the dashboard key only on hosts exporting directly to `/ingest`, so
+//! those tiers are consulted only when the endpoint is such a direct-dashboard
+//! endpoint (and `$LOOM_UI_INBOX_URL`, if set, names that same dashboard); on
+//! a collector host the key stays unresolved rather than borrowing the
+//! collector's credential.
+//!
+//! A host is *mail-meant* when `$LOOM_UI_INBOX_URL` is set, or when it has a
+//! real observability endpoint: a reserved placeholder host (the committed
+//! `dashboard.example.com` default) or an explicitly disabled observability
+//! block (`enabled: false` / `LOOM_OBSERVABILITY_ENABLED=0`) does not count.
 //! **This module never returns or prints the key value** -- it only checks
 //! the file is present, readable and non-empty.
 
@@ -43,6 +52,9 @@ pub struct InboxInputs {
     pub inbox_url_env: Option<String>,
     pub ingest_key_env_set: bool,
     pub endpoint: Option<String>,
+    /// Observability explicitly disabled (`enabled: false` or a falsy
+    /// `LOOM_OBSERVABILITY_ENABLED`); unset is not "disabled".
+    pub observability_disabled: bool,
     pub key_file: Option<String>,
     /// `Ok(())` when the key file is present, readable and non-empty.
     pub key_file_check: Option<Result<(), String>>,
@@ -58,7 +70,8 @@ pub struct InboxResolution {
     pub key_file: Option<String>,
     /// `env` or `file`.
     pub key_source: Option<String>,
-    /// Does this host look meant to send mail (endpoint or inbox URL set)?
+    /// Does this host look meant to send mail (inbox URL set, or a real,
+    /// not explicitly disabled observability endpoint)?
     pub mail_meant: bool,
     /// Human-readable names of what is unresolved, each with its fix.
     pub missing: Vec<String>,
@@ -99,7 +112,11 @@ pub fn derive_inbox_url(endpoint: &str) -> Option<String> {
 pub fn resolve_from(i: &InboxInputs) -> InboxResolution {
     let mut r = InboxResolution::default();
     let env_url = i.inbox_url_env.as_deref().filter(|s| !s.is_empty());
-    r.mail_meant = env_url.is_some() || i.endpoint.is_some();
+    let real_endpoint = !i.observability_disabled
+        && i.endpoint
+            .as_deref()
+            .is_some_and(|e| reserved_placeholder_host(e).is_none());
+    r.mail_meant = env_url.is_some() || real_endpoint;
     if let Some(u) = env_url {
         r.url = Some(u.trim_end_matches('/').to_string());
         r.url_source = Some("env".into());
@@ -174,27 +191,64 @@ fn default_ui_key_file() -> Option<String> {
 
 /// Key-file precedence (env value excluded; that is shell-side):
 /// `$LOOM_UI_INGEST_KEY_FILE`, then `~/.config/loom-ui/ingest.key` (if
-/// present), then the telemetry tiers. `telemetry` is only evaluated when
-/// both dashboard tiers are absent.
+/// present), then -- only when `telemetry_applies` -- the telemetry tiers.
+/// `telemetry` is only evaluated when both dashboard tiers are absent and the
+/// telemetry key can be the dashboard key.
 fn pick_key_file(
     ui_env: Option<String>,
     ui_default: Option<String>,
+    telemetry_applies: bool,
     telemetry: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
-    ui_env.or(ui_default).or_else(telemetry)
+    ui_env
+        .or(ui_default)
+        .or_else(|| if telemetry_applies { telemetry() } else { None })
+}
+
+/// Can the telemetry ingest key stand in for the dashboard key? Only when the
+/// observability endpoint is a direct-dashboard `https://<host>/ingest`
+/// ([`derive_inbox_url`] resolves it) and an explicit `inbox_url_env`, if
+/// any, names that same origin. A collector, loopback or placeholder
+/// endpoint -- or an inbox on a different host -- means the telemetry key is
+/// some other service's credential.
+fn telemetry_key_applies(inbox_url_env: Option<&str>, endpoint: Option<&str>) -> bool {
+    let Some(dashboard) = endpoint.and_then(derive_inbox_url) else {
+        return false;
+    };
+    let origin = |u: &str| {
+        reqwest::Url::parse(u)
+            .ok()
+            .map(|u| u.origin().ascii_serialization())
+    };
+    inbox_url_env.is_none_or(|env| origin(env).is_some() && origin(env) == origin(&dashboard))
+}
+
+/// `enabled: false` in config, or a set-but-falsy
+/// `$LOOM_OBSERVABILITY_ENABLED`, reusing the daemon's own parser. Unset
+/// everywhere is *not* explicitly disabled.
+fn observability_explicitly_disabled(config: &ObservabilityConfig) -> bool {
+    let explicit =
+        std::env::var_os(observability::ENABLED_ENV).is_some() || config.enabled.is_some();
+    explicit && !observability::resolve_enabled(config)
 }
 
 /// Resolve against the real environment and `root`'s resolved config.
 #[must_use]
 pub fn resolve(root: &Path) -> InboxResolution {
     let config: ObservabilityConfig = observability::read_config(root);
-    let key_file = pick_key_file(env_nonempty(INGEST_KEY_FILE_ENV), default_ui_key_file(), || {
-        observability::resolve_ingest_key_file(&config)
-    });
+    let inbox_url_env = env_nonempty(INBOX_URL_ENV);
+    let endpoint = observability::resolve_endpoint(&config);
+    let key_file = pick_key_file(
+        env_nonempty(INGEST_KEY_FILE_ENV),
+        default_ui_key_file(),
+        telemetry_key_applies(inbox_url_env.as_deref(), endpoint.as_deref()),
+        || observability::resolve_ingest_key_file(&config),
+    );
     resolve_from(&InboxInputs {
-        inbox_url_env: env_nonempty(INBOX_URL_ENV),
+        inbox_url_env,
         ingest_key_env_set: env_nonempty(INGEST_KEY_ENV).is_some(),
-        endpoint: observability::resolve_endpoint(&config),
+        endpoint,
+        observability_disabled: observability_explicitly_disabled(&config),
         key_file_check: key_file.as_deref().map(check_key_file),
         key_file,
     })
@@ -292,18 +346,89 @@ mod tests {
     fn dashboard_key_tiers_precede_telemetry_tiers() {
         let tel = || Some("/telemetry.key".to_string());
         assert_eq!(
-            pick_key_file(Some("/env.key".into()), Some("/ui.key".into()), tel).as_deref(),
+            pick_key_file(Some("/env.key".into()), Some("/ui.key".into()), true, tel).as_deref(),
             Some("/env.key")
         );
-        assert_eq!(pick_key_file(None, Some("/ui.key".into()), tel).as_deref(), Some("/ui.key"));
-        assert_eq!(pick_key_file(None, None, tel).as_deref(), Some("/telemetry.key"));
-        assert_eq!(pick_key_file(None, None, || None), None);
+        assert_eq!(
+            pick_key_file(None, Some("/ui.key".into()), true, tel).as_deref(),
+            Some("/ui.key")
+        );
+        assert_eq!(pick_key_file(None, None, true, tel).as_deref(), Some("/telemetry.key"));
+        assert_eq!(pick_key_file(None, None, true, || None), None);
         let mut called = false;
-        let _ = pick_key_file(None, Some("/ui.key".into()), || {
+        let _ = pick_key_file(None, Some("/ui.key".into()), true, || {
             called = true;
             None
         });
         assert!(!called, "telemetry tiers not consulted when a dashboard tier resolves");
+    }
+
+    /// Judge finding 1 (#10147): the telemetry key is the dashboard key only on
+    /// a direct-dashboard `https://.../ingest` host.
+    #[test]
+    fn telemetry_tiers_only_on_a_direct_dashboard_endpoint() {
+        let mut called = false;
+        let picked = pick_key_file(None, None, false, || {
+            called = true;
+            Some("/collector.key".into())
+        });
+        assert_eq!(picked, None);
+        assert!(!called, "telemetry tiers not even consulted when they cannot apply");
+
+        let direct = Some("https://dash.acme.dev/ingest");
+        assert!(telemetry_key_applies(None, direct));
+        assert!(telemetry_key_applies(Some("https://dash.acme.dev"), direct));
+        assert!(telemetry_key_applies(Some("https://DASH.acme.dev/"), direct));
+        // An explicit inbox on a different origin: the endpoint's key is not its key.
+        assert!(!telemetry_key_applies(Some("https://other.acme.dev"), direct));
+        assert!(!telemetry_key_applies(Some("not a url"), direct));
+        for collector in [
+            "http://127.0.0.1:14318",
+            "http://10.1.2.3:4318",
+            "https://dash.acme.dev/v1/traces",
+            "https://dashboard.example.com/ingest",
+        ] {
+            assert!(!telemetry_key_applies(None, Some(collector)), "{collector}");
+            assert!(
+                !telemetry_key_applies(Some("https://dash.acme.dev"), Some(collector)),
+                "{collector}"
+            );
+        }
+        assert!(!telemetry_key_applies(Some("https://dash.acme.dev"), None));
+    }
+
+    /// Judge addendum (#10147): the committed `.loom/config.json` placeholder
+    /// endpoint, or an explicitly disabled block, is not a mail-meant host.
+    #[test]
+    fn placeholder_or_disabled_endpoint_is_not_mail_meant() {
+        let placeholder = resolve_from(&InboxInputs {
+            endpoint: Some("https://dashboard.example.com/ingest".into()),
+            ..Default::default()
+        });
+        assert!(!placeholder.mail_meant);
+        let disabled = resolve_from(&InboxInputs {
+            endpoint: Some("https://dash.acme.dev/ingest".into()),
+            observability_disabled: true,
+            ..Default::default()
+        });
+        assert!(!disabled.mail_meant);
+        // The env URL still makes the host mail-meant, whatever the endpoint.
+        let env = resolve_from(&InboxInputs {
+            inbox_url_env: Some("https://dash.acme.dev".into()),
+            endpoint: Some("https://dashboard.example.com/ingest".into()),
+            observability_disabled: true,
+            ..Default::default()
+        });
+        assert!(env.mail_meant);
+        // A real collector endpoint still counts (the Degraded line is how
+        // such a host learns to set LOOM_UI_INBOX_URL).
+        assert!(
+            resolve_from(&InboxInputs {
+                endpoint: Some("http://10.1.2.3:4318".into()),
+                ..Default::default()
+            })
+            .mail_meant
+        );
     }
 
     #[test]
@@ -379,6 +504,7 @@ mod tests {
             INGEST_KEY_FILE_ENV,
             observability::ENDPOINT_ENV,
             observability::INGEST_KEY_FILE_ENV,
+            observability::ENABLED_ENV,
         ] {
             std::env::remove_var(v);
         }
@@ -414,6 +540,51 @@ mod tests {
         std::env::remove_var(INGEST_KEY_FILE_ENV);
         assert_eq!(r.key_file.as_deref(), ui.to_str());
         assert!(!render_lines(&r).contains("UIKEY"));
+
+        let write_obs = |obs: serde_json::Value| {
+            let cfg = serde_json::json!({ "observability": obs });
+            std::fs::write(d.path().join(".loom/config.json"), cfg.to_string()).unwrap();
+        };
+
+        // Judge finding 1: a collector host with an explicit inbox URL and a
+        // readable collector key keeps the key unresolved, naming the
+        // dashboard key file -- the collector credential is never borrowed.
+        write_obs(serde_json::json!({
+            "endpoint": "http://127.0.0.1:14318",
+            "ingestKeyFile": key.to_str().unwrap()}));
+        std::env::set_var(INBOX_URL_ENV, "https://dash.acme.dev");
+        let r = resolve(d.path());
+        let h = collect_health(d.path());
+        std::env::remove_var(INBOX_URL_ENV);
+        assert_eq!(r.url.as_deref(), Some("https://dash.acme.dev"));
+        assert_eq!(r.key_file, None, "collector key must not stand in for the dashboard key");
+        assert_eq!(r.missing.len(), 1, "{:?}", r.missing);
+        assert!(r.missing[0].contains("~/.config/loom-ui/ingest.key"), "{:?}", r.missing);
+        assert!(h.is_some(), "mail-meant collector host without a dashboard key => health line");
+
+        // Judge addendum: the committed placeholder config (enabled:false +
+        // dashboard.example.com) is not mail-meant -- no health line, even
+        // though nothing resolves. Same for the placeholder alone, and for a
+        // real endpoint whose block is explicitly disabled.
+        for obs in [
+            serde_json::json!({"enabled": false, "endpoint": "https://dashboard.example.com/ingest"}),
+            serde_json::json!({"endpoint": "https://dashboard.example.com/ingest"}),
+            serde_json::json!({"enabled": false, "endpoint": "https://dash.acme.dev/ingest",
+                               "ingestKeyFile": gone.to_str().unwrap()}),
+        ] {
+            write_obs(obs.clone());
+            let r = resolve(d.path());
+            assert!(!r.mail_meant, "{obs}");
+            assert!(collect_health(d.path()).is_none(), "{obs}");
+        }
+        // ...and the env override disabling observability counts too.
+        write_obs(serde_json::json!({"endpoint": "https://dash.acme.dev/ingest",
+                                     "ingestKeyFile": gone.to_str().unwrap()}));
+        assert!(collect_health(d.path()).is_some(), "enabled-unset real endpoint is mail-meant");
+        std::env::set_var(observability::ENABLED_ENV, "0");
+        let h = collect_health(d.path());
+        std::env::remove_var(observability::ENABLED_ENV);
+        assert!(h.is_none(), "LOOM_OBSERVABILITY_ENABLED=0 => not mail-meant");
     }
 
     #[test]
