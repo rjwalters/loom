@@ -93,6 +93,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "chain_lock.comments"
         | "roster.comments" => ops::COMMENT_LIST,
         "claim.pr_labels" | "sequence.predecessor" | "chain_lock.pr_base" => ops::PR_VIEW_STATE,
+        "park_hold.issue_view" => ops::ISSUE_VIEW_STATE,
+        "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
         "intake.list_open" | "quarantine.issue_list" => ops::ISSUE_LIST,
         "claim.issue_reclaim"
         | "claim.pr_add_label"
@@ -107,7 +109,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "quarantine.label"
         | "quarantine.release"
         | "restore.label"
-        | "prless.hold_label" => ops::ISSUE_EDIT_LABELS,
+        | "prless.hold_label"
+        | "park_hold.issue_labels" => ops::ISSUE_EDIT_LABELS,
         "verdict.anchor_comment"
         | "verdict.reanchor_comment"
         | "verdict.stale_comment"

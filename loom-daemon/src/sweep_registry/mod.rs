@@ -124,6 +124,9 @@ mod model;
 mod noop_cooldown;
 mod outcome_journal;
 mod overflow;
+// `pub`: the daemon-hold record contract (`is_daemon_hold`, #10161) is read
+// by the stale-blocked readers (#10556, #10558).
+pub mod park_hold;
 mod pool_hold_broadcast;
 pub(crate) mod private_dispatch;
 mod prless_retry;
