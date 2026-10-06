@@ -120,6 +120,7 @@ pub mod otlp;
 pub mod outcome;
 pub mod overhead;
 pub mod pick_decision;
+pub mod pick_journal;
 pub mod queue;
 pub mod queue_blocked;
 pub mod queue_snapshot;

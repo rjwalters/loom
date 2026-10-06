@@ -912,6 +912,10 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("classifies an invocation's argv for the github.api span attribute, runs none"),
         ),
         ("role_tick_telemetry/targets.rs", NotAWrite("classifies commands, runs none")),
+        (
+            "observability/pick_journal.rs",
+            NotAWrite("classifies an agent gh argv for pick.decision, runs none"),
+        ),
         ("terminal.rs", NotAWrite("tmux flags")),
         ("fleet_store/gh.rs", NotAWrite("store reads: its one method is `--method GET`")),
         (

@@ -2225,7 +2225,10 @@ daemon-derived id.
 
 One OTLP-only log record per role tick and per work-finder tick (Issue #10212):
 the ranked candidate list (capped at 50, with `candidates_total`), the items
-acted on, and a closed-set reason code per skipped candidate. Empty ticks still
+acted on, and a closed-set reason code per skipped candidate. Role ticks record
+the queue the agent actually consumed (`pr-queue`, or Curator's listings) and
+the writes it issued, via a per-tick pick journal (#10432); `candidate_source`
+and `decisions_observed` say what was seen. Empty ticks still
 emit, so per-host service cadence is measurable. Full field reference, the
 SigNoz rank-at-instant query and the rows/day volume:
 [`telemetry-kind-pick-decision.md`](telemetry-kind-pick-decision.md).
