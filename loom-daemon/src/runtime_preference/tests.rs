@@ -1311,3 +1311,6 @@ fn resolve_for_dispatch_hands_the_slot_to_the_launch_and_the_next_dispatch_sees_
         let _ = std::fs::remove_file(entry.path());
     }
 }
+
+#[path = "session_down_tests.rs"]
+mod session_down;
