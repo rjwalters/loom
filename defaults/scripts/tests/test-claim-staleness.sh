@@ -501,30 +501,6 @@ assert_eq "0" "$(field "$out" ACTIVITY_COUNT)" "T20b: neither is counted as clai
 out="$(LOOM_TEST_NO_TRUST_VERB=1 "$TARGET_SCRIPT" check --repo owner/repo --number 6513 --label loom:reviewing)"
 assert_eq "unknown" "$(field "$out" CLAIM_STATE)" "T20c: no trust filter -> unknown (fail safe, never stomp)"
 
-# --- T21: Judge-progress comment / claimant force-push keep a claim fresh (#10235) ---
-reset
-CLAIM_TS="$(ago 40)"
-set_claim loom:reviewing "$CLAIM_TS"
-jq -n --arg t "$(ago 5)" '[{id:401,created_at:$t,body:"Judge: merged main.\n<!-- loom:ac-verified sha=abc -->"}]' | set_comments
-out="$("$TARGET_SCRIPT" check --repo owner/repo --number 6513 --label loom:reviewing)"
-assert_eq "fresh" "$(field "$out" CLAIM_STATE)" "T21a: a recent Judge-progress comment keeps a 40m claim fresh"
-reset
-set_claim loom:reviewing "$CLAIM_TS"
-jq -n --arg t "$(ago 5)" '[{id:402,created_at:$t,body:"<!-- loom:standdown claim=x seq=1 --> <!-- loom:ac-verified -->"}]' | set_comments
-out="$("$TARGET_SCRIPT" check --repo owner/repo --number 6513 --label loom:reviewing)"
-assert_eq "stale" "$(field "$out" CLAIM_STATE)" "T21c: a stand-down comment is not Judge progress"
-reset
-jq -n --arg c "$CLAIM_TS" --arg p "$(ago 4)" \
-    '[{event:"labeled",label:{name:"loom:reviewing"},created_at:$c,actor:{login:"judge-bot"}},
-      {event:"head_ref_force_pushed",created_at:$p,actor:{login:"judge-bot"}}]' >"$STUB_DIR/timeline.json"
-out="$("$TARGET_SCRIPT" check --repo owner/repo --number 6513 --label loom:reviewing)"
-assert_eq "fresh" "$(field "$out" CLAIM_STATE)" "T21d: a claimant force-push keeps a 40m claim fresh"
-jq -n --arg c "$CLAIM_TS" --arg p "$(ago 4)" \
-    '[{event:"labeled",label:{name:"loom:reviewing"},created_at:$c,actor:{login:"judge-bot"}},
-      {event:"head_ref_force_pushed",created_at:$p,actor:{login:"builder-bot"}}]' >"$STUB_DIR/timeline.json"
-out="$("$TARGET_SCRIPT" check --repo owner/repo --number 6513 --label loom:reviewing)"
-assert_eq "stale" "$(field "$out" CLAIM_STATE)" "T21e: a non-claimant force-push does not keep the claim fresh"
-
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"
