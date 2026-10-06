@@ -90,11 +90,14 @@ pub(crate) fn pulls_arm(rows: &[Row]) -> String {
 
 /// A POSIX-`sh` arm answering every single-PR `GET pulls/<n>` (not its
 /// `/files`, `/comments`, … sub-resources) with `200` and
-/// `{"mergeable": <mergeable>}` (`true` / `false` / `null`).
+/// `{"mergeable": <mergeable>}` (`true` / `false` / `null`) at the head
+/// [`row`] gives PR `n` (`n` in 40-digit hex).
 pub(crate) fn mergeable_arm(mergeable: &str) -> String {
     format!(
         "case \"$*\" in *'/pulls/'*'/'[a-z]*) ;; api*'/pulls/'[0-9]*)\n  \
-         printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'\n  echo '{{\"mergeable\":{mergeable}}}'\n  \
+         a=\"$*\"; n=\"${{a##*/pulls/}}\"; n=\"${{n%% *}}\"\n  \
+         printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'\n  \
+         printf '{{\"mergeable\":{mergeable},\"head\":{{\"sha\":\"%040x\"}}}}\\n' \"$n\"\n  \
          exit 0 ;;\nesac\n"
     )
 }

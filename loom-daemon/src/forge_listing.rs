@@ -221,7 +221,7 @@ fn list_issues_cached_retrying(
 /// Deliberately string-matched rather than a numeric field: callers here only
 /// ever see `gh`'s own formatted diagnostic (`gh: Not Found (HTTP 404)`), not
 /// a structured status code.
-fn is_404_error(error_message: &str) -> bool {
+pub(crate) fn is_404_error(error_message: &str) -> bool {
     error_message.contains("HTTP 404")
 }
 
