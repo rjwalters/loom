@@ -390,3 +390,7 @@ pub fn gate_repo_with(root: &Path, repo: &str, gh: &Path, what: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod gitea_tests;
