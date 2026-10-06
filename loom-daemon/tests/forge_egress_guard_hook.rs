@@ -147,6 +147,40 @@ fn required_policy_denies_every_class_including_wrapped_spellings() {
     }
 }
 
+/// Spellings the shell joins back into `gh` (PR #10543 review): the hook's
+/// prefilter must hand them to the daemon, and the daemon must classify them.
+const ESCAPED: &[&str] = &[
+    r"g\h auth login",
+    r"g\h api https://api.example.test/user",
+    r#"g""h auth login"#,
+    r"g''h auth login",
+    r#""g"h auth login"#,
+    r"$'gh' auth login",
+];
+
+#[test]
+fn escaped_and_quote_joined_spellings_deny_only_under_an_enforcing_policy() {
+    let f = Fixture::new();
+    for cmd in ESCAPED {
+        let (decision, reason) = f.run(cmd, Some("required.json"), &[]);
+        assert_eq!(decision, "deny", "{cmd}");
+        assert!(reason.contains("routing.denied-by-guard"), "{reason}");
+        assert_eq!(f.run(cmd, Some("observe.json"), &[]).0, "allow", "observe: {cmd}");
+        assert_eq!(
+            f.run(cmd, Some("required.json"), &[("LOOM_GUARD_FORGE_EGRESS", "0")])
+                .0,
+            "allow",
+            "toggle off: {cmd}"
+        );
+    }
+    for prose in [
+        r#"git commit -m 'never run g\h auth login'"#,
+        r#"gh issue comment 1 --body 'g""h auth login is denied'"#,
+    ] {
+        assert_eq!(f.run(prose, Some("required.json"), &[]).0, "allow", "{prose}");
+    }
+}
+
 #[test]
 fn managed_commands_and_inert_prose_are_allowed() {
     let f = Fixture::new();

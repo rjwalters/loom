@@ -1772,12 +1772,13 @@ fi
 # this block only passes it the same masked text the merge redirect scans and
 # denies on its exit-1 + `BLOCKED [routing.denied-by-guard]` answer. Inert
 # with no policy, an observe-only one, or no/older daemon (exit 2 = allow).
-# The bash regex is a fork-free prefilter so most commands never exec it.
+# The bash regex is a fork-free prefilter so most commands never exec it; it
+# is also tried with quotes/backslashes stripped so g\h / g""h still reach it.
 # =============================================================================
 
 # requires-daemon: forge optional   a daemon without `forge egress guard` exits 2 on the unknown verb, which this block treats as allow (rule inert).
 FORGE_EGRESS_PREFILTER='(^|[^[:alnum:]_.-])gh([^[:alnum:]_.-]|$)|[Gg][Ii][Tt][Hh][Uu][Bb]|GH_(HOST|CONFIG_DIR)|[Oo][Cc][Tt][Oo]|(^|[^[:alnum:]_])env[[:space:]]+-'
-if [[ "$GH_PR_MERGE_SCAN_TEXT" =~ $FORGE_EGRESS_PREFILTER ]]; then
+if [[ "$GH_PR_MERGE_SCAN_TEXT" =~ $FORGE_EGRESS_PREFILTER || "${GH_PR_MERGE_SCAN_TEXT//[\"\'\\]/}" =~ $FORGE_EGRESS_PREFILTER ]]; then
     FORGE_EGRESS_RC=0
     FORGE_EGRESS_DENY=$(cd "${REPO_ROOT:-${CWD:-.}}" 2>/dev/null && "${LOOM_DAEMON_SELF_BIN:-loom-daemon}" forge egress guard --for-command "$GH_PR_MERGE_SCAN_TEXT" 2>/dev/null) || FORGE_EGRESS_RC=$?
     if [[ "$FORGE_EGRESS_RC" -eq 1 && "$FORGE_EGRESS_DENY" == "BLOCKED [routing.denied-by-guard]"* ]]; then

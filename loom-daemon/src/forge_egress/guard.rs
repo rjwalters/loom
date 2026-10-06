@@ -259,8 +259,37 @@ const WRAPPERS: &[&str] = &[
 ];
 
 /// Classify `command` (the hook's masked text). First matching class wins.
+///
+/// Two readings are tried and either one denies: the text as typed (quotes
+/// are token breaks, which exposes `bash -c "…"` payloads) and [`unquoted`]
+/// (quotes and backslashes removed, which is how the shell joins `g\h`,
+/// `g""h`, `"g"h` or `$'gh'` back into `gh`). The second reading can only add
+/// a denial, never lose one the first reading makes.
 #[must_use]
 pub fn classify(command: &str, launcher: Option<&str>) -> Option<Bypass> {
+    classify_text(command, launcher).or_else(|| {
+        let joined = unquoted(command);
+        if joined == command {
+            None
+        } else {
+            classify_text(&joined, launcher)
+        }
+    })
+}
+
+/// `command` with line continuations joined and every backslash and quote
+/// character (including the `$` of `$'…'` / `$"…"`) removed.
+fn unquoted(command: &str) -> String {
+    command
+        .replace("\\\n", " ")
+        .replace("$'", "'")
+        .replace("$\"", "\"")
+        .chars()
+        .filter(|c| !matches!(c, '\\' | '\'' | '"'))
+        .collect()
+}
+
+fn classify_text(command: &str, launcher: Option<&str>) -> Option<Bypass> {
     if GH_HOST_ENV.is_match(command) {
         return Some(Bypass::GhHostEnv);
     }

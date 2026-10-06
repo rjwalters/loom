@@ -99,6 +99,46 @@ fn heredoc_to_a_shell_or_interpreter_is_live_code() {
     );
 }
 
+/// The shell joins a backslash-escaped or quote-concatenated word back into
+/// `gh` (PR #10543 review): each spelling must classify like the plain one.
+#[test]
+fn escaped_and_quote_joined_spellings_are_denied() {
+    for (want, cmd) in [
+        (Bypass::GhAuthMutation, r"g\h auth login"),
+        (Bypass::GhAuthMutation, r"\gh auth login"),
+        (Bypass::GhAuthMutation, r#"g""h auth login"#),
+        (Bypass::GhAuthMutation, r"g''h auth login"),
+        (Bypass::GhAuthMutation, r#""g"h auth login"#),
+        (Bypass::GhAuthMutation, r#"g"h" auth login"#),
+        (Bypass::GhAuthMutation, r#""gh" auth login"#),
+        (Bypass::GhAuthMutation, r"$'gh' auth login"),
+        (Bypass::GhAuthMutation, r"command g\h auth login"),
+        (Bypass::GhAuthMutation, r#"gh au""th lo''gin"#),
+        (Bypass::GhApiAbsoluteUrl, r"g\h api https://api.example.test/user"),
+        (Bypass::GhApiAbsoluteUrl, r#"g""h api "https://api.example.test/user""#),
+        (Bypass::GhHostEnv, r#"export G""H_HOST=other"#),
+        (Bypass::CanonicalApiClient, r#"cu""rl https://api.git""hub.com/zen"#),
+        (Bypass::CanonicalApiClient, r#"bash -c 'cu\rl https://api.github.com/zen'"#),
+    ] {
+        assert_eq!(class(cmd), Some(want), "{cmd}");
+    }
+}
+
+/// Joining quotes must not turn quoted DATA that spells a bypass into one.
+#[test]
+fn quoted_data_spelling_a_bypass_is_not_denied() {
+    for cmd in [
+        r#"echo "g\h auth login""#,
+        r#"git commit -m 'run g""h auth login'"#,
+        r#"gh pr create --title t --body "see g\h api https://api.example.test/user""#,
+        r#"gh issue comment 1 --body 'g""h auth login is blocked'"#,
+        r#"grep -n "g''h auth" docs/x.md"#,
+        r"printf '%s\n' 'it'\''s fine'",
+    ] {
+        assert_eq!(class(cmd), None, "{cmd}");
+    }
+}
+
 #[test]
 fn managed_commands_are_not_denied() {
     for cmd in [

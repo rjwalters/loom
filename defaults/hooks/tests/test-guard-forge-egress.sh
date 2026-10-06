@@ -67,6 +67,13 @@ for cmd in "bash -c \"$CURL\"" "eval \"$CURL\"" "echo \"$CURL\" | sh" "GH_HOST=x
            "/opt/homebrew/bin/gh issue list" "pip install PyGithub" "env -i gh api user"; do
     [ "$(decision "$cmd")" = deny ] && ok "prefilter passes: $cmd" || bad "prefilter dropped: $cmd"
 done
+# The shell joins these back into `gh`; a literal-`gh` prefilter used to skip
+# the daemon for them (PR #10543 review).
+ESCAPED=('g\h auth login' 'g\h api https://api.example.test/user' 'g""h auth login' "g''h auth login")
+for cmd in "${ESCAPED[@]}"; do
+    [ "$(decision "$cmd")" = deny ] && [ "$(guard_calls)" = 1 ] \
+        && ok "prefilter passes escaped spelling: $cmd" || bad "prefilter dropped escaped spelling: $cmd"
+done
 grep -q -- '^forge egress guard --for-command ' "$TMP/calls" 2>/dev/null \
     && ok "the daemon is called as \`forge egress guard --for-command\`" || bad "no --for-command call recorded"
 
@@ -84,10 +91,15 @@ fi
 
 STUB_MODE=allow
 [ "$(decision "$CURL")" = allow ] && ok "exit 0 allows (no policy / observe / toggle off)" || bad "exit 0 must allow"
+for cmd in "${ESCAPED[@]}"; do
+    [ "$(decision "$cmd")" = allow ] && ok "exit 0 allows escaped spelling: $cmd" || bad "exit 0 must allow: $cmd"
+done
 
 STUB_MODE=old
 [ "$(decision "$CURL")" = allow ] && ok "daemon without \`forge egress guard\` (exit 2) allows: rule inert" \
     || bad "an older daemon must never deny"
+[ "$(decision "${ESCAPED[0]}")" = allow ] && ok "older daemon allows escaped spelling: rule inert" \
+    || bad "an older daemon must never deny an escaped spelling"
 
 STUB_MODE=garbage
 [ "$(decision "$CURL")" = allow ] && ok "exit 1 without the deny prefix allows" || bad "a crash must not deny"
