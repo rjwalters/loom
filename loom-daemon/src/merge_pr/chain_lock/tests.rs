@@ -450,9 +450,11 @@ fn an_unwritable_record_reports_none() {
 // --- forge I/O against a stub `gh` --------------------------------------------
 
 /// A stub `gh`, logging argv to `dir/argv.log`. The repo-wide comment listing
-/// (`api --include repos/o/r/issues/comments?…`) answers from
-/// `dir/comments.json` with an ETag, or a 304 when `If-None-Match` carries it;
-/// `pulls/N` answers from `dir/pull-N.json`. A missing file is a failed read.
+/// (`api --include repos/o/r/issues/comments?…`) answers page 1 from
+/// `dir/comments.json` and page N (`&page=N`) from `dir/comments-pN.json`
+/// (`[]` when that page file is absent), with an ETag derived from the page's
+/// content, or a 304 when `If-None-Match` carries it. `pulls/N` answers from
+/// `dir/pull-N.json`. A missing file is a failed read.
 fn stub_gh(dir: &Path) -> String {
     let path = dir.join("gh");
     let script = format!(
@@ -460,11 +462,17 @@ fn stub_gh(dir: &Path) -> String {
 printf '%s\n' "$*" >> "{d}/argv.log"
 if [ "$2" = "--include" ]; then
   [ -f "{d}/comments.json" ] || exit 1
-  if [[ "$*" == *'If-None-Match: "tag1"'* ]]; then
-    printf 'HTTP/2.0 304 Not Modified\netag: "tag1"\n\n'
+  page=1
+  [[ "$3" =~ \&page=([0-9]+) ]] && page="${{BASH_REMATCH[1]}}"
+  if [ "$page" = 1 ]; then body="$(cat "{d}/comments.json")"
+  elif [ -f "{d}/comments-p$page.json" ]; then body="$(cat "{d}/comments-p$page.json")"
+  else body='[]'; fi
+  tag="\"p$page-$(printf '%s' "$body" | cksum | cut -d' ' -f1)\""
+  if [[ "$*" == *"If-None-Match: $tag"* ]]; then
+    printf 'HTTP/2.0 304 Not Modified\netag: %s\n\n' "$tag"
   else
-    printf 'HTTP/2.0 200 OK\netag: "tag1"\n\n'
-    cat "{d}/comments.json"
+    printf 'HTTP/2.0 200 OK\netag: %s\n\n' "$tag"
+    printf '%s' "$body"
   fi
   exit 0
 fi
@@ -519,8 +527,21 @@ fn guard_with(dir: &Path, pr: u32, base: &str, now: &str) -> Result<Guard, Strin
     })
 }
 
+/// Seed the listing as the forge pages it: 100 comments per page.
 fn seed(dir: &Path, pulls: &[Value], comments: &[Value]) {
-    std::fs::write(dir.join("comments.json"), Value::Array(comments.to_vec()).to_string()).unwrap();
+    for n in 2..=10 {
+        let _ = std::fs::remove_file(dir.join(format!("comments-p{n}.json")));
+    }
+    let mut pages = comments.chunks(COMMENT_PAGE);
+    let first = pages.next().unwrap_or_default();
+    std::fs::write(dir.join("comments.json"), Value::Array(first.to_vec()).to_string()).unwrap();
+    for (n, page) in pages.enumerate() {
+        std::fs::write(
+            dir.join(format!("comments-p{}.json", n + 2)),
+            Value::Array(page.to_vec()).to_string(),
+        )
+        .unwrap();
+    }
     for p in pulls {
         std::fs::write(dir.join(format!("pull-{}.json", p["number"])), p.to_string()).unwrap();
     }
@@ -576,44 +597,128 @@ fn read_guard_keeps_holding_after_the_heads_checks_are_all_green() {
     assert_eq!(guard_with(dir.path(), 7, "main", "2026-10-05T12:10:00Z").unwrap(), Guard::Clear);
 }
 
-#[test]
-fn a_lock_check_with_no_lock_is_one_billable_call_and_an_unchanged_recheck_is_a_304() {
-    let dir = tempfile::tempdir().unwrap();
-    let sink = dir.path().join("sink");
+/// The recorded cost so far: `(chain_lock.comments ok, its 304s, core consumed)`.
+fn cost_so_far() -> (u64, u64, u64) {
+    let report = crate::forge_call_stats::status_report(Utc::now(), None);
+    let rows = report.host_window.expect("sink enabled on this thread");
+    let (ok, not_modified) = rows
+        .iter()
+        .find(|r| r.caller == "chain_lock.comments")
+        .map_or((0, 0), |r| (r.ok, r.not_modified));
+    let core = report
+        .own_window
+        .unwrap()
+        .iter()
+        .filter(|r| r.pool == "core")
+        .map(|r| r.consumed)
+        .sum();
+    (ok, not_modified, core)
+}
+
+/// Run a no-lock check, then an unchanged re-check, recording the forge cost
+/// of each: `[(ok, 304s, core) after the first, after the second]`.
+fn check_twice_costed(dir: &Path) -> [(u64, u64, u64); 2] {
+    let sink = dir.join("sink");
     std::fs::create_dir(&sink).unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&sink, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    // Many open PRs and unrelated comments, but no lock marker anywhere.
-    let chatter = comment("just a review note", "2026-10-05T12:00:20Z", "MEMBER");
-    seed(dir.path(), &[pull(7, "main")], &[chatter]);
     crate::forge_call_stats::set_test_sink_dir(Some(sink));
-    let first = guard_with(dir.path(), 7, "main", "2026-10-05T12:05:00Z");
-    let second = guard_with(dir.path(), 7, "main", "2026-10-05T12:05:30Z");
-    let report = crate::forge_call_stats::status_report(Utc::now(), None);
+    let first = guard_with(dir, 7, "main", "2026-10-05T12:05:00Z");
+    let after_first = cost_so_far();
+    let second = guard_with(dir, 7, "main", "2026-10-05T12:05:30Z");
+    let after_second = cost_so_far();
     crate::forge_call_stats::set_test_sink_dir(None);
     assert_eq!(first.unwrap(), Guard::Clear);
     assert_eq!(second.unwrap(), Guard::Clear);
-    let rows = report.host_window.expect("sink enabled on this thread");
-    let row = rows
-        .iter()
-        .find(|r| r.caller == "chain_lock.comments")
-        .unwrap();
-    assert_eq!((row.ok, row.not_modified), (1, 1), "one billable call, then a free 304");
-    let own = report.own_window.unwrap();
-    let core: u64 = own
-        .iter()
-        .filter(|r| r.pool == "core")
-        .map(|r| r.consumed)
-        .sum();
-    assert_eq!(core, 1, "the whole check costs one billable call");
+    [after_first, after_second]
+}
+
+fn chatter(n: usize) -> Vec<Value> {
+    (0..n)
+        .map(|k| {
+            let mut c = comment("just a review note", "2026-10-05T12:00:20Z", "MEMBER");
+            c["id"] = json!(1000 + k);
+            c["issue_url"] = json!(format!("https://api.github.com/repos/o/r/issues/{}", 100 + k));
+            c
+        })
+        .collect()
+}
+
+#[test]
+fn a_lock_check_with_no_lock_is_one_billable_call_and_an_unchanged_recheck_is_a_304() {
+    let dir = tempfile::tempdir().unwrap();
+    // Unrelated comments, but no lock marker anywhere.
+    seed(dir.path(), &[pull(7, "main")], &chatter(1));
+    let [first, second] = check_twice_costed(dir.path());
+    assert_eq!(first, (1, 0, 1), "the whole check costs one billable call");
+    assert_eq!(second, (1, 1, 1), "the unchanged re-check is a free 304");
     let argv = argv_log(dir.path());
     assert!(
         !argv.contains("pulls/") && !argv.contains("check-runs"),
         "nothing else read: {argv}"
     );
     assert!(argv.contains("If-None-Match"), "the re-check is conditional: {argv}");
+}
+
+#[test]
+fn a_crowded_window_with_no_lock_bills_once_per_page_and_rechecks_free() {
+    // #10448 review: >=100 unrelated comments must not add an unconditional
+    // paginated read on every check, nor a billed one on an unchanged re-check.
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path(), &[pull(7, "main")], &chatter(150));
+    let [first, second] = check_twice_costed(dir.path());
+    assert_eq!(first, (2, 0, 2), "two pages, one billable call each");
+    assert_eq!(second, (2, 2, 2), "the unchanged re-check is two free 304s");
+    let argv = argv_log(dir.path());
+    assert!(!argv.contains("--paginate"), "no unconditional listing: {argv}");
+    assert!(!argv.contains("pulls/"), "no holder read without a marker: {argv}");
+    assert_eq!(argv.matches("If-None-Match").count(), 2, "{argv}");
+}
+
+#[test]
+fn exactly_one_full_page_reads_the_empty_page_behind_it() {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path(), &[pull(7, "main")], &chatter(100));
+    let [first, second] = check_twice_costed(dir.path());
+    assert_eq!(first, (2, 0, 2));
+    assert_eq!(second, (2, 2, 2));
+}
+
+#[test]
+fn a_new_comment_rebills_only_the_last_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut comments = chatter(150);
+    seed(dir.path(), &[pull(7, "main")], &comments);
+    let [first, _] = check_twice_costed(dir.path());
+    assert_eq!(first.0, 2);
+    // A new unrelated comment appends to page 2; page 1 is still a 304.
+    comments.extend(chatter(151).into_iter().skip(150));
+    seed(dir.path(), &[pull(7, "main")], &comments);
+    std::fs::remove_dir_all(dir.path().join("sink")).unwrap();
+    let [third, _] = check_twice_costed(dir.path());
+    assert_eq!(third, (1, 1, 1), "page 1 unchanged (304), page 2 billed");
+}
+
+#[test]
+fn a_lock_beyond_the_first_page_still_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut comments = chatter(230);
+    comments.push(lock_on(9, "2026-10-05T12:00:20Z"));
+    seed(dir.path(), &[pull(9, "main")], &comments);
+    let got = guard_with(dir.path(), 7, "main", "2026-10-05T12:05:00Z").unwrap();
+    assert!(matches!(got, Guard::Held(ref l) if l.holder == 9), "{got:?}");
+    let argv = argv_log(dir.path());
+    assert!(argv.contains("&page=3"), "the walk reaches the marker's page: {argv}");
+}
+
+#[test]
+fn a_failed_later_page_is_unreadable_not_a_truncated_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path(), &[pull(7, "main")], &chatter(150));
+    std::fs::write(dir.path().join("comments-p2.json"), "not json").unwrap();
+    assert!(guard_with(dir.path(), 7, "main", "2026-10-05T12:05:00Z").is_err());
 }
 
 #[test]

@@ -369,11 +369,16 @@ are ordered oldest-lock-first, so they cannot hold each other.
   falls through a tier; anything above 3600 s is clamped to 3600 s).
 - **No budget bypass**: the lock is a separate marker that the #9590 chain
   position never reads, so taking it neither spends nor refunds a re-date.
-- **API cost** (#10448): one repo-wide, ETag'd `GET issues/comments?since=…`
-  (window start floored to 5 minutes so an unchanged re-check is a free 304)
+- **API cost** (#10448): a repo-wide `GET issues/comments?since=…` listing
   finds every marker, recorded in `forge_call_stats` as `chain_lock.comments`.
-  Only a PR with an unexpired marker for this base costs a further
-  `GET pulls/N`. A check with no lock present is at most one billable call.
+  It is read 100 comments per page until a short page, never truncated, and
+  each page is its own ETag'd conditional read. The window start is floored
+  to 5 minutes, so an unchanged re-check is all free 304s, and a new comment
+  re-bills only the last page. Only a PR with an unexpired marker for this
+  base costs a further `GET pulls/N`. A check with no lock present costs one
+  billable call when the window holds fewer than 100 comments, and at most
+  `floor(n / 100) + 1` for `n` comments. A window past 50 pages is reported
+  unreadable (below), not cut short.
 - **Unreadable state** (API error, quota) defers rather than guessing "no
   lock", and records the first unreadable read in
   `.loom/state/chain-lock/` (ignored). Once a whole cap has passed since then,
