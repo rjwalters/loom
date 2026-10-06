@@ -351,7 +351,11 @@ fn gh_shim_session_env_puts_the_front_on_the_session_path_once() {
         ];
         env.extend_from_slice(extra);
         let mut cmd = s.command(&bin, &["gh-shim", "session-env"], &[]);
-        for k in ["LOOM_GH_SHIM", "LOOM_FORGE_EGRESS_POLICY", "LOOM_FORGE_EGRESS_MANAGED"] {
+        for k in [
+            "LOOM_GH_SHIM",
+            "LOOM_FORGE_EGRESS_POLICY",
+            "LOOM_FORGE_EGRESS_MANAGED",
+        ] {
             cmd.env_remove(k);
         }
         let out = cmd.envs(env).output().unwrap();

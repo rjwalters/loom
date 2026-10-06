@@ -668,7 +668,8 @@ fn test_gh_front_wired_check_with() {
     let plain = write_fake_bin(&tmp.path().join("plain"), "gh", "exit 0");
     let dir = |p: &Path| Some(p.parent().unwrap().as_os_str().to_os_string());
     let wired = Some(r#"{"command": "… $HOME/.local/share/loom/defaults/hooks/gh-front-env.sh"}"#);
-    let loom_only = Some(r#"{"command": "… $HOME/.local/share/loom/defaults/hooks/guard-destructive.sh"}"#);
+    let loom_only =
+        Some(r#"{"command": "… $HOME/.local/share/loom/defaults/hooks/guard-destructive.sh"}"#);
     let project = Some(r#"{"command": "\"${CLAUDE_PROJECT_DIR}/.loom/hooks/gh-front-env.sh\""}"#);
     let skipped = |s: &InvariantStatus| matches!(s, InvariantStatus::Skipped(_));
 
@@ -679,7 +680,10 @@ fn test_gh_front_wired_check_with() {
     assert!(check_with(loom_only, None, dir(&front.join("gh")), None).is_violation());
     // Wired (either scope) and the prefix resolves gh to the front.
     assert_eq!(check_with(wired, None, dir(&front.join("gh")), None), InvariantStatus::Ok);
-    assert_eq!(check_with(loom_only, project, dir(&front.join("gh")), None), InvariantStatus::Ok);
+    assert_eq!(
+        check_with(loom_only, project, dir(&front.join("gh")), None),
+        InvariantStatus::Ok
+    );
     // Under a policy, the launcher first is equally correct.
     assert_eq!(check_with(wired, None, dir(&launcher), Some(&launcher)), InvariantStatus::Ok);
     // Wired but ineffective: no shim dir, or a prefix whose gh is neither.

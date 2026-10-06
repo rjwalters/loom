@@ -638,19 +638,24 @@ assert_eq "$(jq -r "$HANDOFF25" "$S25")" "1" "operator's own SessionStart entry 
 deprovision_loom_hooks "$HOME25/.claude" >/dev/null 2>&1
 assert_eq "$(count_marker "$S25" gh-front-env.sh)" "0" "deprovision removed the SessionStart entry"
 assert_eq "$(jq -r "$HANDOFF25" "$S25")" "1" "operator's SessionStart entry survives deprovision"
-# The stub itself: whatever the daemon prints or exits, the hook prints
+# The stub itself: whatever the daemon prints, the hook prints
 # nothing on stdout (SessionStart stdout reaches the model) and exits 0.
 CHK25=$(mktemp -d); mkdir -p "$CHK25/defaults/hooks"
 cp "$REPO_ROOT/defaults/hooks/gh-front-env.sh" "$CHK25/defaults/hooks/"
 ln -s "$REPO_ROOT/defaults/scripts" "$CHK25/defaults/scripts"
 FAKE25="$CHK25/fake-daemon"
 ARGV25="$CHK25/argv"
-printf '#!/bin/sh\necho "$*|$LOOM_PROJECT_ROOT" >> "%s"\necho STDOUT-NOISE\nexit 2\n' "$ARGV25" > "$FAKE25"
+# A fake daemon: `--version` answers the preflight (FAKEVER25), anything else
+# is logged with LOOM_PROJECT_ROOT and prints stdout noise the hook must swallow.
+printf '#!/bin/sh\n[ "$1" = --version ] && { echo "loom-daemon $FAKEVER25"; exit 0; }\necho "$*|$LOOM_PROJECT_ROOT" >> "%s"\necho STDOUT-NOISE\n' "$ARGV25" > "$FAKE25"
 chmod +x "$FAKE25"
 WS25=$(mktemp -d)
-out=$(cd "$WS25" && LOOM_DAEMON_SELF_BIN="$FAKE25" LOOM_PROJECT_ROOT="$WS25" bash "$CHK25/defaults/hooks/gh-front-env.sh" </dev/null 2>/dev/null); rc=$?
-assert_eq "$out|$rc" "|0" "stub is stdout-silent and exits 0 even when the daemon prints and exits 2"
+out=$(cd "$WS25" && FAKEVER25=99.0.0 LOOM_DAEMON_SELF_BIN="$FAKE25" LOOM_PROJECT_ROOT="$WS25" bash "$CHK25/defaults/hooks/gh-front-env.sh" </dev/null 2>/dev/null); rc=$?
+assert_eq "$out|$rc" "|0" "stub is stdout-silent and exits 0 even when the daemon prints on stdout"
 assert_eq "$(cat "$ARGV25" 2>/dev/null)" "gh-shim session-env|$WS25" "stub runs \`gh-shim session-env\` with LOOM_PROJECT_ROOT"
+: > "$ARGV25"
+out=$(cd "$WS25" && FAKEVER25=0.1.0 LOOM_DAEMON_SELF_BIN="$FAKE25" bash "$CHK25/defaults/hooks/gh-front-env.sh" </dev/null 2>/dev/null); rc=$?
+assert_eq "$out|$rc|$(cat "$ARGV25")" "|0|" "a daemon below the declared floor is refused by the preflight: exit 0, never called"
 NOLIB25=$(mktemp -d); cp "$REPO_ROOT/defaults/hooks/gh-front-env.sh" "$NOLIB25/"
 out=$(LOOM_DAEMON_SELF_BIN="$FAKE25" bash "$NOLIB25/gh-front-env.sh" </dev/null 2>&1); rc=$?
 assert_eq "$out|$rc" "|0" "no daemon library -> silent exit 0"

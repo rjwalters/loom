@@ -106,13 +106,20 @@ pub fn append_env(
         return Ok(Written::AlreadyPresent);
     }
     let want: Vec<PathBuf> = std::env::split_paths(prefix).collect();
-    let have: Vec<PathBuf> = current.map(std::env::split_paths).into_iter().flatten().collect();
+    let have: Vec<PathBuf> = current
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect();
     if have.starts_with(&want) {
         return Ok(Written::AlreadyFirst);
     }
     let line = env_line(prefix)
         .ok_or_else(|| std::io::Error::other("the gh shim path is not valid UTF-8"))?;
-    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)?;
     f.write_all(line.as_bytes())?;
     Ok(Written::Appended)
 }
@@ -122,7 +129,11 @@ pub fn append_env(
 /// `CLAUDE_PROJECT_DIR`.
 #[must_use]
 pub fn workspace_root() -> Option<PathBuf> {
-    let env_dir = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let env_dir = |k: &str| {
+        std::env::var_os(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
     if let Some(root) = env_dir("LOOM_PROJECT_ROOT") {
         return Some(root);
     }
@@ -183,7 +194,8 @@ pub fn classify_gh(gh: &Path, launcher: Option<&Path>) -> &'static str {
     let canon = gh.canonicalize().unwrap_or_else(|_| gh.to_path_buf());
     if canon.file_name() == Some(OsStr::new("loom-daemon")) {
         "front"
-    } else if launcher.is_some_and(|l| l.canonicalize().unwrap_or_else(|_| l.to_path_buf()) == canon)
+    } else if launcher
+        .is_some_and(|l| l.canonicalize().unwrap_or_else(|_| l.to_path_buf()) == canon)
     {
         "launcher"
     } else {
