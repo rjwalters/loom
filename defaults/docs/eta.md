@@ -418,8 +418,11 @@ has 20 landings in the window, else the stage, else all stages, else nothing
 (the base estimate is returned unchanged with no `calibration`; rows logged
 before observations carried the base's p25/p75/p90 and age are not evidence).
 A still-open base estimate is a **lower bound** `ln(elapsed / q_τ)` entering a
-Kaplan–Meier estimate with the landings; an unresolvable tail clamps to the
-largest bound. The change of every shift is limited to `ln 1.2` per day: the
+Kaplan–Meier estimate with the landings. When the landings cannot reach the
+level because the tail past the last landing is all still open, those bounds
+are read as landing at their bound, so the shift is the matching order
+statistic of the open bounds, never the single largest one (that clamp made
+the backtest's p90 days wide). The change of every shift is limited to `ln 1.2` per day: the
 shift is replayed day by day (on `as_of`'s own day lattice) from the oldest
 usable base estimate, each day's raw fit clamped to one step of the day
 before. The anchor is fixed by the evidence, not by `as_of`, so two estimates
@@ -453,6 +456,16 @@ Calm-plover scores each quantile against itself (`ln(actual / q_τ)`), moves
 the median too, conditions on the age bucket, and rate-limits the adjustment.
 That it fixes those defects is the hypothesis the shadow evidence and the
 #10233 gate test; it is not claimed here.
+
+*Backtest* (2026-10-06, `eta backtest --heuristic land-2026-10-06-calm-plover
+--compare land-v2` over 600 merged-PR label timelines of `rjwalters/loom`,
+1,247 common `land` cases, 10 walk-forward daily folds). p25–p75 coverage is
+47.1% (`land-v2`: 36.8%) and late surprise is 5.9% (`land-v2`: 24.1%). The
+three-quantile pinball delta is +336 s, with a 95% issue-bootstrap CI of
+[−632, +1,184] s, so it is not distinguishable from `land-v2`. But `pinball4`,
+the gate's deciding loss, is worse by 23,460 s [17,304, 29,266]: the wider
+p90 costs more than it saves. So the backtest does not make calm-plover a
+promotion candidate. The PR for #10489 records the full report.
 
 `land-2026-10-06-quick-tern` (#10524) ships the same way: registered, not
 current, tier `candidate`, shadowed into `alternates`, and promoted only
@@ -1706,7 +1719,9 @@ accepts `--repo-root PATH` (default: the current directory).
   instant and convergence of the interval. With `--compare` it pairs a second
   heuristic on the identical replay set (#9325): the union of cases counting
   refusals, and the walk-forward daily folds with the `--compare` side's
-  per-day win rate and its 95% Wilson interval (#10233). The fleet merges out
+  per-day win rate and its 95% Wilson interval (#10233), plus the paired
+  `compare − heuristic` pinball and `pinball4` deltas with 95% issue-bootstrap
+  intervals (whole issues resampled, fixed seed; #10489). The fleet merges out
   of sweep, so local records rarely carry a `land` case; `--pr-history PATH`
   (offline `eta-pr-case/v1` records) or the opt-in `--forge-pr-cases
   [--pr-limit N] [--save-pr-history PATH]` adds `land` cases from merged PRs'
