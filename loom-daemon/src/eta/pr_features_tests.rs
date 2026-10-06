@@ -396,6 +396,7 @@ fn the_all_check_counts_are_reported_apart_from_the_required_ones() {
     );
     // Required set unknown: the required counts are null, the all-check ones
     // are not.
+    store.required.clear();
     let (f, omitted) = features_at(&store, Some(10), t(0));
     assert_eq!((f.checks_pending, f.checks_failed), (None, None));
     assert_eq!((f.checks_all_pending, f.checks_all_failed), (Some(1), Some(1)));

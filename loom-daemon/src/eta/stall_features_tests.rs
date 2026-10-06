@@ -68,7 +68,12 @@ fn each_source_is_recorded() {
     // Breaker.
     assert_eq!(f.breaker_state.as_deref(), Some("cooldown"));
     assert_eq!(f.breaker_cooldown_until, Some(t(1800)));
-    assert_eq!(omitted.len(), 1, "{omitted:?}");
+    // The writer has no reading in this snapshot (#10334).
+    assert_eq!(
+        reason_of(&omitted, "ratelimit_writer_core_remaining"),
+        Some(reason::NO_WRITER_READING)
+    );
+    assert_eq!(omitted.len(), 3, "{omitted:?}");
 }
 
 #[test]
