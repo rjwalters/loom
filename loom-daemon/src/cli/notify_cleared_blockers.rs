@@ -163,9 +163,13 @@ impl NotifyClearedBlockersArgs {
                 Verdict::Stale(reasons) => reasons,
                 Verdict::Superseded { cleared, .. } => cleared,
                 // StillBlocked: the forge does not (yet) read the cited number
-                // as resolved. Undocumented cannot follow a citation. Neither
-                // is a cleared block worth a comment.
-                Verdict::Undocumented | Verdict::StillBlocked => continue,
+                // as resolved. Undocumented cannot follow a citation. Unticked:
+                // the refs resolved but a `## Dependencies` box is still
+                // unticked, which is unmet until a human confirms it (#9274).
+                // None is a cleared block worth a comment.
+                Verdict::Undocumented | Verdict::StillBlocked | Verdict::Unticked { .. } => {
+                    continue
+                }
             };
             let posted =
                 !self.dry_run && post_comment(g.kind, g.number, &cited, &reasons, repo, &root);
