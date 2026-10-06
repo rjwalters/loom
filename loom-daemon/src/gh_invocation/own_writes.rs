@@ -12,11 +12,18 @@
 //! here, and the guard asks [`written_within`].
 //!
 //! Keyed by `(repo, number)`. The repo comes from the API path, the
-//! `--repo`/`-R` flag, a URL selector, or the invocation's explicit target.
+//! `--repo`/`-R` flag (a `HOST/owner/repo` or URL form is cut to its last two
+//! segments), a URL selector, or the invocation's explicit target, lower-cased.
 //! A write whose repo none of those name (one `gh` resolves from the working
-//! directory) is recorded repo-less and pins that number in every repo: one
-//! extra unconditional read is the safe direction. The record is taken before
-//! the write runs, so a write that fails still pins the next read.
+//! directory, or an API path with `{owner}`/`{repo}` placeholders and no
+//! target) is recorded repo-less, a wildcard that pins that number in every
+//! repo. The parse is deliberately loose: for `gh issue|pr`, every
+//! numeric-looking argument (`N`, `#N`, or a URL ending `/issues/N` or
+//! `/pull/N`) is pinned unless it is the value of a flag that never takes a
+//! number (`--repo`, `--body`, `--add-label`, …), so `--milestone 3 12` pins
+//! both 3 and 12. A mis-parse can only add a pin, never drop one: one extra
+//! unconditional read is the safe direction. The record is taken before the
+//! write runs, so a write that fails still pins the next read.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -25,34 +32,39 @@ use std::time::{Duration, Instant};
 /// Entries older than this are dropped on the next write.
 const KEEP: Duration = Duration::from_secs(3600);
 
-/// `gh issue|pr <verb>` flags that take no value. Every other flag written
-/// without `=` consumes the next argument, so the selector is found
-/// positionally (`issue edit --milestone 3 12` writes #12, not #3).
-const BOOL_FLAGS: &[&str] = &[
-    "--admin",
-    "--auto",
-    "--comments",
-    "--create-if-none",
-    "--delete-branch",
-    "--delete-last",
-    "--disable-auto",
-    "--draft",
-    "--edit-last",
-    "--force",
-    "--merge",
-    "--rebase",
-    "--remove-milestone",
-    "--squash",
-    "--undo",
-    "--web",
-    "--yes",
-    "-c",
-    "-d",
-    "-m",
-    "-r",
-    "-s",
-    "-w",
-    "-y",
+/// `gh issue|pr <verb>` flags that take a value in **every** verb and whose
+/// value is never an issue or PR number. Their spaced value is skipped; every
+/// other numeric-looking argument is pinned. A flag that is boolean in some
+/// verb (`-r`, `-c`, `-m`, `-d`, …) must never be listed here: its "value"
+/// could be the selector, and skipping it would drop a pin.
+const NUMBER_FREE_VALUE_FLAGS: &[&str] = &[
+    "--add-assignee",
+    "--add-label",
+    "--add-project",
+    "--add-reviewer",
+    "--assignee",
+    "--author-email",
+    "--base",
+    "--body",
+    "--body-file",
+    "--head",
+    "--label",
+    "--match-head-commit",
+    "--remove-assignee",
+    "--remove-label",
+    "--remove-project",
+    "--remove-reviewer",
+    "--repo",
+    "--subject",
+    "--title",
+    "-B",
+    "-F",
+    "-H",
+    "-R",
+    "-a",
+    "-b",
+    "-l",
+    "-t",
 ];
 
 /// One recorded write: the repo slug (lower-cased) when known, and the number.
@@ -83,44 +95,49 @@ pub(crate) fn written_within(repo: &str, n: u32, window: Duration) -> bool {
 }
 
 /// The `(repo, number)` pairs a write argv targets: a `gh api` path
-/// `repos/{o}/{r}/(issues|pulls)/{n}[/…]`, or the selector of
-/// `gh issue|pr <verb> <n|url>`. Anything else (GraphQL, a comment edited by
-/// id, a repo-level write) names no number. The repo is lower-cased; `None`
-/// when neither the argv nor `target` names it.
+/// `repos/{o}/{r}/(issues|pulls)/{n}[/…]`, or every numeric-looking argument
+/// of `gh issue|pr <verb> …` that is not the value of a number-free flag.
+/// Anything else (GraphQL, a comment edited by id, a repo-level write) names
+/// no number. The repo is lower-cased; `None` (the wildcard) when neither the
+/// argv nor `target` names it.
 #[must_use]
 pub(crate) fn written_targets(args: &[OsString], target: Option<&str>) -> Vec<Key> {
     let args: Vec<String> = args
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    let target = target.map(str::to_ascii_lowercase);
+    let target = target.and_then(normalise_repo);
+    let mut out: Vec<Key> = Vec::new();
     match args.first().map(String::as_str) {
-        Some("api") => args
-            .iter()
-            .skip(1)
-            .filter_map(|a| api_path_target(a))
-            .collect(),
+        Some("api") => {
+            for a in args.iter().skip(1) {
+                if let Some(key) = api_path_target(a, target.as_deref()) {
+                    out.push(key);
+                }
+            }
+        }
         Some("issue" | "pr") => {
             let rest = args.get(2..).unwrap_or_default();
-            let Some(selector) = positional_selector(rest)
-                .or_else(|| rest.iter().find(|a| selector_number(a).is_some()))
-            else {
-                return Vec::new();
-            };
-            let Some(n) = selector_number(selector) else {
-                return Vec::new();
-            };
-            let repo = repo_flag(rest)
-                .or_else(|| url_repo(selector))
-                .or(target)
-                .map(|r| r.to_ascii_lowercase());
-            vec![(repo, n)]
+            let flag_repo = repo_flag(rest);
+            for a in numeric_candidates(rest) {
+                let Some(n) = selector_number(a) else {
+                    continue;
+                };
+                let repo = flag_repo
+                    .clone()
+                    .or_else(|| url_repo(a))
+                    .or_else(|| target.clone());
+                out.push((repo, n));
+            }
         }
-        _ => Vec::new(),
+        _ => {}
     }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|k| seen.insert(k.clone()));
+    out
 }
 
-fn api_path_target(arg: &str) -> Option<Key> {
+fn api_path_target(arg: &str, target: Option<&str>) -> Option<Key> {
     let path = arg.split('?').next()?;
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let i = segs.iter().position(|s| *s == "repos")?;
@@ -128,40 +145,74 @@ fn api_path_target(arg: &str) -> Option<Key> {
         return None;
     }
     let n = segs.get(i + 4)?.parse().ok()?;
-    let repo = format!("{}/{}", segs.get(i + 1)?, segs.get(i + 2)?).to_ascii_lowercase();
-    Some((Some(repo), n))
+    // `{owner}`/`:owner` placeholders are filled in by `gh` from the working
+    // directory; the literal never matches a real slug, so use the target or
+    // fall back to the wildcard.
+    let repo = slug(segs.get(i + 1)?, segs.get(i + 2)?).or_else(|| target.map(str::to_string));
+    Some((repo, n))
 }
 
-/// The first positional argument after the verb, skipping flags and the
-/// values of flags that take one.
-fn positional_selector(rest: &[String]) -> Option<&String> {
+/// Every argument that could be a number this write targets: all of them
+/// except flags and the spaced value of a [`NUMBER_FREE_VALUE_FLAGS`] flag.
+/// After `--` everything is a candidate.
+fn numeric_candidates(rest: &[String]) -> Vec<&String> {
+    let mut out = Vec::new();
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         if a == "--" {
-            return it.next();
+            out.extend(it.by_ref());
+            break;
         }
-        if !a.starts_with('-') || a == "-" {
-            return Some(a);
+        if a.starts_with('-') && a != "-" {
+            if NUMBER_FREE_VALUE_FLAGS.contains(&a.as_str()) {
+                it.next();
+            }
+            continue;
         }
-        if !a.contains('=') && !BOOL_FLAGS.contains(&a.as_str()) {
-            it.next();
+        out.push(a);
+    }
+    out
+}
+
+/// The normalised value of `--repo`/`-R`: spaced, `=`, or glued (`-Racme/app`).
+fn repo_flag(rest: &[String]) -> Option<String> {
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            return None;
         }
+        let value = if a == "--repo" || a == "-R" {
+            it.next().map(String::as_str)
+        } else if let Some(v) = a.strip_prefix("--repo=") {
+            Some(v)
+        } else if let Some(v) = a.strip_prefix("-R") {
+            Some(v.strip_prefix('=').unwrap_or(v))
+        } else {
+            continue;
+        };
+        return value.and_then(normalise_repo);
     }
     None
 }
 
-/// The value of `--repo`/`-R`, in either the spaced or the `=` form.
-fn repo_flag(rest: &[String]) -> Option<String> {
-    let mut it = rest.iter();
-    while let Some(a) = it.next() {
-        if a == "--repo" || a == "-R" {
-            return it.next().cloned();
-        }
-        if let Some(v) = a.strip_prefix("--repo=").or_else(|| a.strip_prefix("-R=")) {
-            return Some(v.to_string());
-        }
+/// `owner/repo`, `HOST/owner/repo` or a repo URL, cut to its last two path
+/// segments and lower-cased. `None` for anything shorter or a placeholder.
+fn normalise_repo(raw: &str) -> Option<String> {
+    let raw = raw.split(['?', '#']).next()?;
+    let segs: Vec<&str> = raw.split('/').filter(|s| !s.is_empty()).collect();
+    let [.., owner, repo] = segs.as_slice() else {
+        return None;
+    };
+    slug(owner, repo.strip_suffix(".git").unwrap_or(repo))
+}
+
+/// `owner/repo`, lower-cased, unless either part is a `{…}`/`:…` placeholder.
+fn slug(owner: &str, repo: &str) -> Option<String> {
+    let placeholder = |s: &str| s.is_empty() || s.starts_with('{') || s.starts_with(':');
+    if placeholder(owner) || placeholder(repo) {
+        return None;
     }
-    None
+    Some(format!("{owner}/{repo}").to_ascii_lowercase())
 }
 
 /// `owner/repo` of a `https://host/owner/repo/(issues|pull)/n` selector.
@@ -170,17 +221,19 @@ fn url_repo(selector: &str) -> Option<String> {
     let i = segs
         .iter()
         .rposition(|s| matches!(*s, "issues" | "pull" | "pulls"))?;
-    (i >= 2).then(|| format!("{}/{}", segs[i - 2], segs[i - 1]))
-}
-
-fn selector_number(arg: &str) -> Option<u32> {
-    if arg.starts_with('-') {
+    if i < 2 {
         return None;
     }
-    if let Ok(n) = arg.trim_start_matches('#').parse() {
+    slug(segs[i - 2], segs[i - 1])
+}
+
+/// `N`, `#N`, or a URL whose `issues|pull|pulls` segment is followed by `N`.
+fn selector_number(arg: &str) -> Option<u32> {
+    if let Ok(n) = arg.strip_prefix('#').unwrap_or(arg).parse() {
         return Some(n);
     }
-    let segs: Vec<&str> = arg.split('/').collect();
+    let path = arg.split(['?', '#']).next()?;
+    let segs: Vec<&str> = path.split('/').collect();
     let i = segs
         .iter()
         .rposition(|s| matches!(*s, "issues" | "pull" | "pulls"))?;

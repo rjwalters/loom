@@ -75,12 +75,21 @@ fn issue_and_pr_verbs_name_their_selector() {
     }
 }
 
-/// The selector is positional: a flag's numeric value is never taken for it.
+/// A mis-parse may add a pin, never drop one: verb-dependent short flags and
+/// unknown flags cannot swallow the selector, and a numeric flag value may be
+/// pinned alongside it.
 #[test]
-fn a_numeric_flag_value_is_not_the_selector() {
-    assert_eq!(numbers(&["issue", "edit", "--milestone", "3", "12"]), vec![12]);
+fn every_numeric_argument_is_pinned_unless_a_number_free_flag_owns_it() {
+    assert_eq!(numbers(&["issue", "close", "-r", "completed", "12"]), vec![12]);
+    assert_eq!(numbers(&["issue", "close", "12", "-r", "completed"]), vec![12]);
+    let n = numbers(&["issue", "edit", "--milestone", "3", "12"]);
+    assert!(n.contains(&12), "{n:?}");
     assert_eq!(numbers(&["issue", "edit", "--milestone=3", "12"]), vec![12]);
+    let n = numbers(&["issue", "edit", "--milestone", "3", "--unknownflag", "12"]);
+    assert!(n.contains(&12), "{n:?}");
+    assert_eq!(numbers(&["pr", "review", "-r", "-b", "7", "15"]), vec![15]);
     assert_eq!(numbers(&["pr", "comment", "-b", "7", "--", "15"]), vec![15]);
+    assert_eq!(numbers(&["issue", "edit", "12", "--add-label", "404"]), vec![12]);
 }
 
 #[test]
@@ -102,6 +111,49 @@ fn the_repo_comes_from_the_path_the_flag_the_url_or_the_target() {
     );
     assert_eq!(t(&["issue", "edit", "6"], Some("acme/app")), vec![at("acme/app", 6)]);
     assert_eq!(t(&["issue", "edit", "6"], None), vec![(None, 6)]);
+}
+
+/// `{owner}`/`{repo}` (or `:owner`) is filled in by `gh` from the working
+/// directory: the literal is never a slug, so it takes the target or becomes
+/// the wildcard.
+#[test]
+fn a_placeholder_api_path_uses_the_target_or_the_wildcard() {
+    let t = |parts: &[&str], target| written_targets(&argv(parts), target);
+    let path = "repos/{owner}/{repo}/issues/9/labels";
+    assert_eq!(t(&["api", "-X", "POST", path], None), vec![(None, 9)]);
+    assert_eq!(t(&["api", "-X", "POST", path], Some("Acme/App")), vec![at("acme/app", 9)]);
+    assert_eq!(t(&["api", "-X", "PATCH", "repos/:owner/:repo/issues/9"], None), vec![(None, 9)]);
+    assert_eq!(t(&["api", "-X", "PATCH", "repos/acme/{repo}/issues/9"], None), vec![(None, 9)]);
+}
+
+#[test]
+fn the_repo_flag_is_normalised_to_owner_slash_repo() {
+    let t = |parts: &[&str]| written_targets(&argv(parts), Some("acme/target"));
+    assert_eq!(t(&["issue", "edit", "-Racme/app", "4"]), vec![at("acme/app", 4)]);
+    assert_eq!(t(&["issue", "edit", "-R=acme/app", "4"]), vec![at("acme/app", 4)]);
+    assert_eq!(
+        t(&[
+            "issue",
+            "edit",
+            "--repo",
+            "github.example.com/Acme/App",
+            "4"
+        ]),
+        vec![at("acme/app", 4)]
+    );
+    assert_eq!(
+        t(&[
+            "issue",
+            "edit",
+            "--repo=https://github.com/Acme/App.git",
+            "4"
+        ]),
+        vec![at("acme/app", 4)]
+    );
+    assert_eq!(
+        t(&["pr", "edit", "-R", "https://github.com/acme/app/", "4"]),
+        vec![at("acme/app", 4)]
+    );
 }
 
 #[test]
