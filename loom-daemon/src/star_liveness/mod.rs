@@ -79,6 +79,7 @@ pub mod intents;
 pub mod landing;
 pub mod parent_link;
 pub mod progress;
+pub mod propagation_rules;
 pub mod queue;
 pub mod refusal;
 pub mod render;
