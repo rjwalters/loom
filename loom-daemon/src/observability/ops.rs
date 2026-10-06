@@ -31,9 +31,10 @@
 //! skips, [`forge_calls`] (W1) the facade's `loom.forge.calls` counter, and
 //! [`redate_chain`] (#10163) #8508 re-date pressure (re-dated PRs, re-dates
 //! per PR, time to land), [`eta_health`] (#10391) the per-host ETA
-//! pipeline health gauges, and [`reader_withdrawal`] (W4-A) one
-//! `forge.reader.withdrawn` span per reader withdrawal. A new emitter adds a
-//! `MetricName`/`SpanName`
+//! pipeline health gauges, [`reader_withdrawal`] (W4-A) one
+//! `forge.reader.withdrawn` span per reader withdrawal, and [`reader_spill`]
+//! (W4-B) one `forge.reader.spill` span per read-pool spill-latch
+//! transition. A new emitter adds a `MetricName`/`SpanName`
 //! variant and calls the same two functions.
 //!
 //! Tests observe what a seam emitted through the global functions with
@@ -53,6 +54,7 @@ pub mod pool_marks;
 pub mod queue;
 pub mod quota;
 pub mod ratelimit;
+pub mod reader_spill;
 pub mod reader_withdrawal;
 pub mod redate_chain;
 pub mod stage_dwell;

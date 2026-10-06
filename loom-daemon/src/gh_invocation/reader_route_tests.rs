@@ -70,8 +70,16 @@ impl Fixture {
     fn run(&self, inv: GhInvocation) -> Vec<(String, String, Failure)> {
         let withdrawn = RefCell::new(Vec::new());
         let reader = self.reader.clone();
-        let lookup = move |slug: &str, _host: Option<&str>, _resource: Resource| {
-            (slug == "o/r").then(|| (reader.clone(), "app-1".to_string()))
+        let lookup = move |req: &crate::forge_identity::RouteRequest<'_>| {
+            if req.owner_repo == "o/r" {
+                crate::forge_identity::RouteDecision::Reader {
+                    dir: reader.clone(),
+                    app_id: "app-1".to_string(),
+                    placement: crate::forge_identity::Placement::Home,
+                }
+            } else {
+                crate::forge_identity::RouteDecision::NoPool
+            }
         };
         let withdraw = |app: &str, slug: &str, f: Failure, _why: &str| {
             withdrawn
@@ -234,9 +242,9 @@ fn routing_never_changes_the_env_plan_it_starts_from() {
 fn the_lookup_is_asked_for_the_pool_the_call_spends() {
     let f = fixture(OK, OK);
     let asked = RefCell::new(Vec::new());
-    let lookup = |_: &str, _: Option<&str>, resource: Resource| {
-        asked.borrow_mut().push(resource);
-        None
+    let lookup = |req: &crate::forge_identity::RouteRequest<'_>| {
+        asked.borrow_mut().push(req.resource);
+        crate::forge_identity::RouteDecision::NoPool
     };
     let withdraw = |_: &str, _: &str, _: Failure, _: &str| {};
     let _ = f.inv(AccessIntent::Read).execute_routed(&lookup, &withdraw);
@@ -251,4 +259,59 @@ fn the_lookup_is_asked_for_the_pool_the_call_spends() {
     .args(["issue", "view", "1"]);
     let _ = graphql.execute_routed(&lookup, &withdraw);
     assert_eq!(asked.into_inner(), [Resource::Core, Resource::Graphql]);
+}
+
+#[test]
+fn the_route_request_carries_an_etag_blind_affinity_key_and_the_resource() {
+    // W4-B: two reads differing only in If-None-Match (and in --include /
+    // --jq) ask the router with the same key, so they land on one reader.
+    let f = fixture(OK, OK);
+    let seen = RefCell::new(Vec::new());
+    let lookup = |req: &crate::forge_identity::RouteRequest<'_>| {
+        seen.borrow_mut().push((
+            req.owner_repo.to_string(),
+            req.affinity_key.map(str::to_string),
+            req.resource,
+            req.class,
+        ));
+        crate::forge_identity::RouteDecision::NoPool
+    };
+    let withdraw = |_: &str, _: &str, _: Failure, _: &str| {};
+    for etag in ["W/\"1\"", "W/\"2\""] {
+        let inv = GhInvocation::new(
+            Operation::new("issue.view"),
+            AccessIntent::Read,
+            GhTarget::repo("o/r").unwrap(),
+            Duration::from_secs(10),
+        )
+        .parent(ParentContext::Missing)
+        .program(&f.gh)
+        .args(["api", "--include", "repos/o/r/issues/5", "--jq", ".state"])
+        .arg("-H")
+        .arg(format!("If-None-Match: {etag}"));
+        let _ = inv.execute_routed(&lookup, &withdraw);
+    }
+    let seen = seen.into_inner();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0], seen[1], "ETag rotation must not move a URL");
+    assert_eq!(seen[0].0, "o/r");
+    assert_eq!(seen[0].1.as_deref(), Some("api\u{1f}repos/o/r/issues/5"));
+    assert_eq!(seen[0].2, crate::forge_bucket_book::Resource::Core);
+    assert_eq!(seen[0].3, crate::forge_identity::ReadClass::Gate);
+}
+
+#[test]
+fn an_exhausted_route_runs_on_the_writer() {
+    // Every read is Gate until W4-C: Exhausted keeps today's writer path.
+    let f = fixture(OK, OK);
+    let lookup = |_: &crate::forge_identity::RouteRequest<'_>| {
+        crate::forge_identity::RouteDecision::Exhausted {
+            until: std::time::SystemTime::now(),
+        }
+    };
+    let withdraw = |_: &str, _: &str, _: Failure, _: &str| {};
+    let _ = f.inv(AccessIntent::Read).execute_routed(&lookup, &withdraw);
+    let calls = f.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(!is_reader(&f, &calls[0]));
 }

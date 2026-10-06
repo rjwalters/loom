@@ -257,18 +257,48 @@ pub(crate) fn fetch_conditional(
     url: &str,
     etag: Option<&str>,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
+    fetch_conditional_via(site, gh_bin, cwd, target, url, etag, &|req| {
+        crate::forge_identity::route_read(req, std::time::SystemTime::now())
+    })
+}
+
+/// [`fetch_conditional`] with the reader routing injected (tests pass a
+/// fixed [`crate::forge_identity::RouteDecision`]).
+pub(crate) fn fetch_conditional_via(
+    site: ConditionalRead,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    target: &Target,
+    url: &str,
+    etag: Option<&str>,
+    route: &dyn Fn(
+        &crate::forge_identity::RouteRequest<'_>,
+    ) -> crate::forge_identity::RouteDecision,
+) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
     // #9537: a listing is a read, so it goes to the repo's reader App when one
     // is usable. On a credential failure the reader is withdrawn and the SAME
     // request is retried once on the writer, so a broken reader costs one
     // extra call, never a failed poll (the shared shape,
     // `forge_identity::reader_then_writer`, #9872). The cache key deliberately
     // stays on the writer's credential scope: reader choice is deterministic
-    // per repo, so keeping the key means no ETag is invalidated when readers
-    // come online.
-    let reader = target
-        .repo
-        .as_deref()
-        .and_then(|r| crate::forge_identity::read_credential(r, target.host.as_deref()));
+    // per URL (W4-B: the URL is the affinity key, so a split repo's URL
+    // always lands on the same reader), so keeping the key means no ETag is
+    // invalidated when readers come online. The caller's stored ETag is sent
+    // to whichever reader serves the read; GitHub answers 304 only when that
+    // reader's own validator matches, so a URL that moved readers (a spill,
+    // or a split rolled out) costs at most one 200, never a stale body.
+    let affinity = crate::gh_invocation::url_affinity_key(url);
+    let reader = target.repo.as_deref().and_then(|r| {
+        route(
+            &crate::forge_identity::RouteRequest::gate(
+                r,
+                target.host.as_deref(),
+                crate::forge_bucket_book::Resource::Core,
+            )
+            .affinity(Some(&affinity)),
+        )
+        .into_credential()
+    });
     let reader_dir = reader.as_ref().map(|(dir, _)| dir.as_path());
     let http_ok = |r: &FetchResult| {
         r.0.success() || matches!(r.1.as_ref().map(|h| h.status), Some(200 | 304))
@@ -703,3 +733,7 @@ mod tests {
         assert!(!private_dir(&link, false));
     }
 }
+
+#[cfg(test)]
+#[path = "forge_etag_store_route_tests.rs"]
+mod route_tests;

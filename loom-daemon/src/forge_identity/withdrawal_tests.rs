@@ -23,6 +23,7 @@ fn reader(app: &str) -> Identity {
         app_id: app.to_string(),
         slug: None,
         private_key_path: PathBuf::from(format!("/keys/{app}.pem")),
+        owners: None,
     }
 }
 

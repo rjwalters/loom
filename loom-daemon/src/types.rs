@@ -2316,6 +2316,25 @@ pub struct ForgeCallsStatus {
     /// (W4-A), from this daemon's routing table. Empty when none are.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reader_withdrawals: Vec<ReaderWithdrawalStatus>,
+    /// Read-pool spill latches engaged right now (W4-B), from this daemon's
+    /// routing table. Empty when none are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_spills: Vec<ReadSpillStatus>,
+}
+
+/// One engaged read-pool spill latch of [`ForgeCallsStatus`] (W4-B).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadSpillStatus {
+    /// The repo, `owner/repo` lowercased.
+    pub owner_repo: String,
+    /// `core`, `graphql` or `search`.
+    pub resource: String,
+    /// The home reader, `app-<id>`.
+    pub from: String,
+    /// `partial` or `full`.
+    pub mode: String,
+    /// When the latch releases.
+    pub until: DateTime<Utc>,
 }
 
 /// One live scoped reader withdrawal of [`ForgeCallsStatus`] (W4-A).

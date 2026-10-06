@@ -20,8 +20,14 @@
 //!   which a read whose answer depends on **who** asks (a permission or
 //!   write-scope probe, `viewer`, `/user`) must do;
 //! - a fresh reader exists for the repo
-//!   ([`crate::forge_identity::read_credential`]). With no readers configured
-//!   this is always `None`, so such a host behaves byte-for-byte as before.
+//!   ([`crate::forge_identity::route_read`]). With no readers configured
+//!   this is always [`RouteDecision::NoPool`], so such a host behaves
+//!   byte-for-byte as before.
+//!
+//! The request carries its [`super::affinity_key`] (W4-B), so a repo in
+//! `forge.readPool.routing.splitRepos` spreads its reads across the pool
+//! one URL per reader, and the spill latch can move a deterministic share
+//! of them off a home reader that is running dry.
 //!
 //! The reader attempt runs with every token env var removed: `gh` prefers an
 //! env `GH_TOKEN` / `GITHUB_TOKEN` over `GH_CONFIG_DIR`, so an ambient
@@ -31,13 +37,12 @@
 
 use super::{AccessIntent, GhCompletion, GhInvocation, OutputContract};
 use crate::forge_bucket_book::Resource;
-use crate::forge_identity::{self, Failure, IdentityRole};
+use crate::forge_identity::{self, Failure, IdentityRole, ReadClass, RouteDecision, RouteRequest};
 use crate::proc_exec::{Completion, ExecError};
-use std::path::PathBuf;
 
-/// `(owner/repo, host, resource)` → `(reader GH_CONFIG_DIR, reader app id)`.
-pub(super) type ReaderLookup<'a> =
-    &'a dyn Fn(&str, Option<&str>, Resource) -> Option<(PathBuf, String)>;
+/// One read's [`RouteRequest`] → where it goes
+/// ([`forge_identity::route_read`] in production).
+pub(super) type ReaderLookup<'a> = &'a dyn Fn(&RouteRequest<'_>) -> RouteDecision;
 
 /// `(app id, owner/repo, failure, why)` → withdraw that reader.
 pub(super) type Withdraw<'a> = &'a dyn Fn(&str, &str, Failure, &str);
@@ -62,7 +67,9 @@ impl GhInvocation {
 
     /// [`GhInvocation::execute`]'s routing step, with the reader lookup and
     /// the withdrawal injected (production passes
-    /// [`forge_identity::read_credential`] / [`forge_identity::withdraw_after`]).
+    /// [`forge_identity::route_read`] / [`forge_identity::withdraw_after`]).
+    /// [`RouteDecision::NoPool`] and [`RouteDecision::Exhausted`] both run on
+    /// the writer here: every read is [`ReadClass::Gate`] until W4-C.
     pub(super) fn execute_routed(
         self,
         lookup: ReaderLookup<'_>,
@@ -75,7 +82,15 @@ impl GhInvocation {
         // W4-A: the pool this call spends, so a reader withdrawn from this
         // owner's `core` still serves its `graphql` reads (and vice versa).
         let resource = Resource::of_pool(super::accounting::static_pool(&self.args));
-        let Some((dir, app_id)) = lookup(&slug, host.as_deref(), resource) else {
+        let affinity = super::affinity_key(&self.args);
+        let request = RouteRequest {
+            owner_repo: &slug,
+            host: host.as_deref(),
+            resource,
+            affinity_key: Some(&affinity),
+            class: ReadClass::Gate,
+        };
+        let Some((dir, app_id)) = lookup(&request).into_credential() else {
             return self.execute_direct();
         };
         forge_identity::reader_then_writer(
