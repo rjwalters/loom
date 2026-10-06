@@ -755,6 +755,7 @@ fn build_input(
         dispatch: None,
         stalls: Vec::new(),
         held: None,
+        queue: Vec::new(),
     }
 }
 

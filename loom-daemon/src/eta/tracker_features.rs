@@ -52,6 +52,7 @@ use crate::eta::queue_features::{
     self, is_pr_stage, reason, EventKind, EventLog, QueueFeatures, QueueSubject, RosterEntry,
     StageEvent, SINCE_MERGE_CAP_SEC,
 };
+use crate::eta::stage_queue::{stage_queue, StageQueue};
 use crate::eta::stall_features::{self, StallSnapshot};
 use crate::eta::{CurrentState, NoEstimateReason, Stage};
 use crate::types::{PlanState, QueueDisposition};
@@ -481,6 +482,41 @@ impl Tracker {
     /// The host's stall signals (#10232), taken once per pass.
     pub fn on_stall_snapshot(&mut self, snapshot: StallSnapshot) {
         self.context.stall = Some(snapshot);
+    }
+
+    /// The per-stage queue context `little-v0` reads (#10208) for `item` at
+    /// `now`: empty without a fleet view observed before `now`, a PR, or a PR
+    /// stage.
+    pub(super) fn stage_queue_for(
+        &self,
+        key: &ItemKey,
+        item: &Item,
+        current: &CurrentState,
+        now: DateTime<Utc>,
+    ) -> Vec<StageQueue> {
+        let (Some(view), Some(pr), CurrentState::At(stage)) =
+            (&self.context.fleet, item.pr_number, current)
+        else {
+            return Vec::new();
+        };
+        let Some(entered_at) = stage.entered_at else {
+            return Vec::new();
+        };
+        if view.observed_at >= now {
+            return Vec::new();
+        }
+        stage_queue(
+            &key.repo,
+            pr,
+            stage.stage,
+            entered_at,
+            &view.roster,
+            &view.events,
+            &view.scope,
+            now,
+        )
+        .into_iter()
+        .collect()
     }
 
     /// The host-level plan features for an item of `repo` at `now`.

@@ -182,6 +182,7 @@ pub(crate) fn input_for(row: &TwinOtterInput, at: DateTime<Utc>) -> EstimateInpu
         dispatch: None,
         stalls: Vec::new(),
         held: None,
+        queue: Vec::new(),
     }
 }
 

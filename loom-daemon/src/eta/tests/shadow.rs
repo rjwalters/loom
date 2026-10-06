@@ -142,7 +142,7 @@ pub(super) const LEDGER_DAYS: i64 = 10;
 /// `candidate_loss`, `current`'s is `current_loss`, the candidate covers
 /// `covered` of them, nobody is late, and `pairs` tracker passes saw both
 /// sides answering.
-fn ledger_with(
+pub(super) fn ledger_with(
     pairs: usize,
     current_loss: f64,
     candidate_loss: f64,
@@ -217,6 +217,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
             LAND_CALM_PLOVER,
             LAND_FRESH_TIDE,
             LAND_V4,
+            "little-v0",
             LAND_TWIN_OTTER,
             LAND_TWIN_OTTER_B
         ]
@@ -236,7 +237,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
         .filter(|e| e.explanation.kind == Kind::Land)
         .map(|e| e.primary)
         .collect();
-    assert_eq!(land_order, vec![true, false, false, false, false, false, false]);
+    assert_eq!(land_order, vec![true, false, false, false, false, false, false, false]);
 
     // The primary's own number is byte-identical to what a registry with no
     // candidate at all would produce: shadow mode is additive, not a change.
@@ -262,6 +263,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
             LAND_CALM_PLOVER,
             LAND_FRESH_TIDE,
             LAND_V4,
+            "little-v0",
             LAND_TWIN_OTTER,
             LAND_TWIN_OTTER_B
         ]

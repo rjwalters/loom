@@ -27,6 +27,7 @@ mod item_features;
 mod journal;
 pub(crate) mod land_twin_otter;
 mod land_v3;
+mod little_v0;
 mod merge_hold;
 mod offline;
 mod primitives;
@@ -144,5 +145,6 @@ pub(crate) fn input_at(stage: Stage, age_sec: i64, rework_rounds: u32) -> Estima
         dispatch: None,
         stalls: Vec::new(),
         held: None,
+        queue: Vec::new(),
     }
 }

@@ -665,8 +665,12 @@ pub fn evaluate(
             answer_rate_slack: ANSWER_RATE_SLACK,
         }
     };
-    let promote = backtest.status == GateStatus::Passed && live.status == GateStatus::Passed;
-    let reason = if promote {
+    let shadow_only = super::heuristics::is_shadow_only(candidate);
+    let promote =
+        !shadow_only && backtest.status == GateStatus::Passed && live.status == GateStatus::Passed;
+    let reason = if shadow_only {
+        format!("{candidate} is a shadow-only floor baseline and is never promoted")
+    } else if promote {
         format!("both gates passed: {} then {}", backtest.detail, live.detail)
     } else if backtest.status == GateStatus::Passed {
         format!("live gate failed: {}", live.detail)

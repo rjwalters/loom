@@ -231,6 +231,7 @@ fn registry_resolves_current_per_kind() {
             "land-2026-10-06-calm-plover",
             "land-2026-10-04-fresh-tide",
             "land-v4",
+            "little-v0",
             "land-2026-10-04-twin-otter",
             "land-2026-10-04-twin-otter-b"
         ]
@@ -293,6 +294,7 @@ fn for_kind_enumerates_every_registered_heuristic_of_a_kind() {
             "land-2026-10-06-calm-plover",
             "land-2026-10-04-fresh-tide",
             "land-v4",
+            "little-v0",
             "land-2026-10-04-twin-otter",
             "land-2026-10-04-twin-otter-b"
         ]

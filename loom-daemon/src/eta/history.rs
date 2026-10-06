@@ -298,6 +298,17 @@ impl Level {
     }
 }
 
+/// A recency-weighted mean duration ([`StageSamples::weighted_mean`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WeightedMean {
+    /// Level the samples came from.
+    pub level: Level,
+    /// Samples read.
+    pub n: usize,
+    /// Weighted mean, seconds.
+    pub mean_sec: f64,
+}
+
 /// A stage's samples, ready to summarise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
@@ -544,6 +555,51 @@ impl StageSamples {
         sources: &[SampleSource],
     ) -> Option<Selection> {
         self.select_at(repo, stage, as_of, sources, MIN_SAMPLES)
+    }
+
+    /// The recency-weighted mean duration of `stage` (#10208): the samples
+    /// [`Self::select`] would read (same level, window, worked-only filter and
+    /// [`MAX_SAMPLES`] most recent), each weighted `2^(-age / half_life_sec)`
+    /// where `age` is `as_of` minus its `observed_at`.
+    #[must_use]
+    pub fn weighted_mean(
+        &self,
+        repo: &str,
+        stage: Stage,
+        as_of: DateTime<Utc>,
+        sources: &[SampleSource],
+        half_life_sec: i64,
+    ) -> Option<WeightedMean> {
+        let level = self.select(repo, stage, as_of, sources)?.level;
+        let mut picked: Vec<&StageSample> = self
+            .stages
+            .iter()
+            .filter(|s| {
+                s.stage == stage
+                    && admitted(sources, s.source)
+                    && in_window(s.observed_at, as_of)
+                    && (level == Level::Host || same_repo(&s.repo, repo))
+                    && s.worked_admitted()
+            })
+            .collect();
+        picked.sort_by(|a, b| {
+            b.observed_at
+                .cmp(&a.observed_at)
+                .then(a.duration_sec.cmp(&b.duration_sec))
+        });
+        picked.truncate(MAX_SAMPLES);
+        let (mut num, mut den) = (0.0_f64, 0.0_f64);
+        for s in &picked {
+            let age = (as_of - s.observed_at).num_seconds().max(0) as f64;
+            let w = (-age / half_life_sec as f64 * std::f64::consts::LN_2).exp();
+            num += w * s.duration_sec as f64;
+            den += w;
+        }
+        (den > 0.0).then(|| WeightedMean {
+            level,
+            n: picked.len(),
+            mean_sec: num / den,
+        })
     }
 
     /// [`Self::select`] with an explicit floor.
