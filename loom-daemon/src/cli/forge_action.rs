@@ -418,8 +418,10 @@ pub(crate) enum ForgeAction {
     /// 4 refused before any forge call.
     #[command(name = "merge-queue")]
     MergeQueue {
+        // Deferred (#10256): built only when `merge-queue` is, so its verbs
+        // never sit in the debug-build `Commands` augment frame (see the type).
         #[command(subcommand)]
-        action: super::forge_merge_queue_cmd::MergeQueueAction,
+        action: super::forge_merge_queue_cmd::DeferredMergeQueue,
     },
 
     /// `forge token --repo <nwo> [--access read|write] [--force]` (#9537) —
@@ -649,7 +651,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             force,
         } => return super::forge_identity_cmd::token(&repo, &access, force),
         ForgeAction::Egress { action } => return super::forge_egress_cmd::handle(action),
-        ForgeAction::MergeQueue { action } => super::forge_merge_queue_cmd::run(action),
+        ForgeAction::MergeQueue { action } => super::forge_merge_queue_cmd::run(action.0),
         ForgeAction::Parent { action } => return super::forge_parent_cmd::handle(action),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
@@ -827,16 +829,18 @@ fn write_target(action: &ForgeAction) -> Option<Option<String>> {
         // `may_write_from` wants.
         ForgeAction::Comment { repo, .. } => Some(repo.clone()),
         // #10255: the queue mutations write (dormant today, vetted anyway).
-        ForgeAction::MergeQueue {
-            action:
-                super::forge_merge_queue_cmd::MergeQueueAction::Enqueue { repo, .. }
-                | super::forge_merge_queue_cmd::MergeQueueAction::Dequeue { repo, .. }
-                // #10256: these comment, relabel, enqueue or dequeue.
-                // `reconcile` is vetted inside its queue-mode branch instead:
-                // in direct mode (every `merge-pr.sh` run) it writes nothing.
-                | super::forge_merge_queue_cmd::MergeQueueAction::Handoff { repo, .. }
-                | super::forge_merge_queue_cmd::MergeQueueAction::Revoke { repo, .. },
-        } => Some(repo.clone()),
+        ForgeAction::MergeQueue { action } => match &action.0 {
+            super::forge_merge_queue_cmd::MergeQueueAction::Enqueue { repo, .. }
+            | super::forge_merge_queue_cmd::MergeQueueAction::Dequeue { repo, .. }
+            // #10256: these comment, relabel, enqueue or dequeue.
+            // `reconcile` is vetted inside its queue-mode branch instead:
+            // in direct mode (every `merge-pr.sh` run) it writes nothing.
+            | super::forge_merge_queue_cmd::MergeQueueAction::Handoff { repo, .. }
+            | super::forge_merge_queue_cmd::MergeQueueAction::Revoke { repo, .. } => {
+                Some(repo.clone())
+            }
+            _ => None,
+        },
         // #10012: `parent link` stars and links, so it is vetted too.
         ForgeAction::Parent {
             action: super::forge_parent_cmd::ParentAction::Link { repo, .. },
@@ -895,5 +899,70 @@ mod write_target_tests {
         };
         assert_eq!(write_target(&disarm), Some(None));
         assert_eq!(write_target(&ForgeAction::IsFleet { login: "x".into() }), None);
+    }
+
+    #[test]
+    fn deferred_merge_queue_writes_are_still_vetted() {
+        use super::super::forge_merge_queue_cmd::MergeQueueAction as Mq;
+        let mq = |action: Mq| ForgeAction::MergeQueue {
+            action: super::super::forge_merge_queue_cmd::DeferredMergeQueue(action),
+        };
+        let handoff = mq(Mq::Handoff {
+            pr: 7,
+            approved_sha: "a".repeat(40),
+            repo: Some("acme/w".into()),
+        });
+        assert_eq!(write_target(&handoff), Some(Some("acme/w".into())));
+        let revoke = mq(Mq::Revoke {
+            pr: 7,
+            reason: "transition".into(),
+            repo: None,
+        });
+        assert_eq!(write_target(&revoke), Some(None));
+        assert_eq!(write_target(&mq(Mq::Mode)), None, "mode is a read");
+    }
+
+    /// #10256: the deferred slot still parses every verb, and a full build
+    /// (what `--help` walks) still registers them.
+    #[test]
+    fn merge_queue_verbs_parse_through_the_deferred_slot() {
+        use super::super::forge_merge_queue_cmd::MergeQueueAction as Mq;
+        use clap::{CommandFactory, Parser};
+        let sha = "a".repeat(40);
+        let argv = [
+            "loom-daemon",
+            "forge",
+            "merge-queue",
+            "step",
+            "7",
+            "--approved-sha",
+            &sha,
+        ];
+        let cli = crate::Cli::try_parse_from(argv).expect("parse");
+        let Some(crate::Commands::Forge {
+            action: ForgeAction::MergeQueue { action },
+        }) = cli.command
+        else {
+            panic!("expected `forge merge-queue`");
+        };
+        match action.0 {
+            Mq::Step {
+                pr,
+                approved_sha,
+                repo,
+            } => {
+                assert_eq!((pr, approved_sha.as_str(), repo), (7, sha.as_str(), None));
+            }
+            _ => panic!("expected `step`"),
+        }
+        let mut cmd = crate::Cli::command();
+        cmd.build();
+        let mq = cmd
+            .find_subcommand("forge")
+            .and_then(|f| f.find_subcommand("merge-queue"))
+            .expect("forge merge-queue is registered");
+        for verb in ["mode", "reconcile", "handoff", "step", "revoke"] {
+            assert!(mq.find_subcommand(verb).is_some(), "{verb}");
+        }
     }
 }
