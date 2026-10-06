@@ -78,7 +78,10 @@ impl GhInvocation {
             |reader_dir, role| {
                 let inv = self.clone().identity_role(role);
                 match reader_dir {
-                    Some(d) => inv.gh_config_dir(Some(d)).without_token_env(),
+                    Some(d) => inv
+                        .identity_bucket(&forge_identity::reader_bucket(&app_id, &slug))
+                        .gh_config_dir(Some(d))
+                        .without_token_env(),
                     None => inv,
                 }
                 .execute_direct()
