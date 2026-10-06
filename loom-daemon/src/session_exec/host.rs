@@ -1,4 +1,5 @@
 use super::*;
+use crate::tokens_pool::health::TerminalClassification;
 use anyhow::{bail, Context, Result};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -51,11 +52,20 @@ fn probe(args: &[&str], parent: i32) -> Result<Option<String>> {
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()?;
+    // Drain stdout while waiting: a full `docker inspect` object can exceed
+    // the pipe buffer, and a child blocked on a full pipe never exits, which
+    // would read as the probe deadline (#10364).
+    let mut stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).map(|_| text)
+    });
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            let mut text = String::new();
-            child.stdout.take().unwrap().read_to_string(&mut text)?;
+            let text = reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("docker probe reader panicked"))??;
             return Ok(status.success().then(|| text.trim().to_string()));
         }
         if started.elapsed() >= Duration::from_secs(3)
@@ -81,11 +91,43 @@ fn probe(args: &[&str], parent: i32) -> Result<Option<String>> {
     }
 }
 
-/// Exit code of a refused stale-mount dispatch: EX_CONFIG, like every other
-/// pre-exec refusal; the marker is what makes it distinct.
-pub(super) const MOUNT_STALE_EXIT: i32 = 78;
+/// What the one pre-exec `docker inspect` says about a dispatch (#10364).
+#[derive(Debug, PartialEq)]
+pub(super) enum Preflight {
+    /// The inspect did not prove a container that can take an exec: refuse.
+    NotRunning,
+    /// Running, but no mount covers the workdir: refuse. Carries the inspect
+    /// object, for the operator's recreate command.
+    MountStale(serde_json::Value),
+    /// Running and the workdir is mounted.
+    Ready,
+}
 
-/// The marker plus the operator's recreate instructions, on one line.
+/// Read both pre-exec answers from the stdout of one `docker inspect --type
+/// container` (`None`: the inspect failed, timed out or could not be run).
+///
+/// Whether the container is running fails closed, exactly as the
+/// `{{.State.Running}}` template probe this replaces did: anything but a
+/// parsed object that `session_state::container_running` accepts refuses.
+/// The mount check then reads that same object, so it costs no docker call
+/// and has no failure of its own to handle: there is no inspect it could
+/// fail to read that the running check did not already refuse on.
+pub(super) fn preflight(inspect: Option<&str>, workdir: &str) -> Preflight {
+    use crate::tokens_pool::session_state::{container_running, workdir_unmounted};
+    let state = inspect
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .and_then(|value| value.get(0).cloned());
+    match state {
+        Some(state) if !container_running(&state) => Preflight::NotRunning,
+        Some(state) if workdir_unmounted(&state, workdir) => Preflight::MountStale(state),
+        Some(_) => Preflight::Ready,
+        None => Preflight::NotRunning,
+    }
+}
+
+/// What the operator is told when a dispatch is refused for a stale mount:
+/// the cause and the recreate command, on one line. The machine-readable
+/// cause is the `refusal::announce` line printed with it.
 pub(super) fn mount_stale_line(
     container: &str,
     workdir: &str,
@@ -95,11 +137,10 @@ pub(super) fn mount_stale_line(
     let workspace = crate::tokens_pool::session_state::workspace_label(state)
         .map_or_else(|| "<checkout parent>".to_string(), |w| w.display().to_string());
     format!(
-        "{} container={container} workdir={workdir} session-exec: {workdir} is not mounted in \
-         {container}, which was created before this repository was registered (#10364); \
-         recreate it when idle: loom-daemon accounts session stop {account} && loom-daemon \
-         accounts session start {account} --mount-workspace {workspace}",
-        crate::tokens_pool::session_state::MOUNT_STALE_MARKER
+        "session-exec: {workdir} is not mounted in {container}, which was created before this \
+         repository was registered (#10364); recreate it when idle: loom-daemon accounts session \
+         stop {account} && loom-daemon accounts session start {account} --mount-workspace \
+         {workspace}"
     )
 }
 
@@ -135,10 +176,13 @@ pub fn run(args: HostArgs) -> Result<i32> {
             bail!("session launcher died before supervision started");
         }
     }
-    // Running and not restarting: the rule `session_state::container_running`
-    // applies to a full inspect object (#10455).
-    let running = "{{and .State.Running (not .State.Restarting)}}";
-    match probe(&["inspect", "-f", running, &args.container], parent) {
+    // One inspect answers both pre-exec questions: is the container running
+    // (#10455), and does it mount this tick's working directory (#10364)? A
+    // host-mode container mounts each registered repo separately, fixed at
+    // creation, so a repo registered since is not inside it and `docker exec
+    // --workdir` would die with `chdir to cwd … no such file or directory`.
+    // Each refusal names its cause for the daemon's terminal-record parser.
+    let inspect = match probe(&["inspect", "--type", "container", &args.container], parent) {
         Err(error)
             if error
                 .downcast_ref::<std::io::Error>()
@@ -147,30 +191,19 @@ pub fn run(args: HostArgs) -> Result<i32> {
             eprintln!("session-exec: 'docker' command not found in PATH");
             return Ok(127);
         }
-        Ok(Some(state)) if state == "true" => {}
-        _ => {
-            // #10455: name the cause for the daemon's terminal-record parser.
-            refusal::announce(crate::tokens_pool::health::TerminalClassification::SessionDown);
+        Ok(text) => text,
+        Err(_) => None,
+    };
+    match preflight(inspect.as_deref(), &args.workdir) {
+        Preflight::Ready => {}
+        Preflight::NotRunning => {
+            refusal::announce(TerminalClassification::SessionDown);
             bail!("Session container '{}' is not running. Start it with: loom-daemon accounts session start {}", args.container, args.container.trim_start_matches("loom-codex-session-"))
         }
-    }
-    // #10364: a host-mode container mounts each registered repo separately,
-    // fixed at creation, so a repo registered since is not inside it and
-    // `docker exec --workdir` would die with `chdir to cwd … no such file or
-    // directory`. Refuse before exec with a marker spawn-codex maps to
-    // SESSION_MOUNT_STALE. An inspect that cannot be read fails open: the
-    // exec below reports its own error, as before.
-    if let Some(state) = probe(&["inspect", "--type", "container", &args.container], parent)?
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|value| value.get(0).cloned())
-    {
-        if crate::tokens_pool::session_state::workdir_unmounted(&state, &args.workdir) {
-            let line = mount_stale_line(&args.container, &args.workdir, &state);
-            eprintln!("{line}");
-            if let Some(path) = &args.stderr_file {
-                let _ = std::fs::write(path, format!("{line}\n"));
-            }
-            return Ok(MOUNT_STALE_EXIT);
+        Preflight::MountStale(state) => {
+            refusal::announce(TerminalClassification::SessionMountStale);
+            eprintln!("{}", mount_stale_line(&args.container, &args.workdir, &state));
+            return Ok(refusal::REFUSAL_EXIT_CODE);
         }
     }
     if probe(

@@ -630,11 +630,13 @@ records no account hold.
 
 **Stale-mount dispatch refusal (#10364).** Before `docker exec --workdir`,
 `session-exec host` checks that one of the running container's mounts covers
-the workdir. If none does (the repository was registered after the container
-was created), it does not exec: it writes `# LOOM_SESSION_MOUNT_STALE
-container=… workdir=…` with the recreate command to stderr and the capture
-file and exits 78, which `spawn-codex.sh` reports as
-`category=SESSION_MOUNT_STALE`. The tick carries
+the workdir, reading the same single `docker inspect` that tells it the
+container is running, so dispatch makes no extra docker call. If no mount
+covers it (the repository was registered after the container was created), it
+does not exec: it prints the recreate command, announces
+`# LOOM_SESSION_REFUSAL v=1 category=SESSION_MOUNT_STALE` and exits 78. The
+adapter passes both through unchanged and the terminal-record parser relabels
+the tick's record, as for `SESSION_DOWN`. The tick carries
 `loom.admission.reason="session-mount-stale"` and records no account hold
 (the container is stale, not the account). `loom-daemon workspace add` /
 `remove` print every host-mode session container the registry change left

@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
-# test-spawn-codex-session-mount-stale.sh - spawn-codex.sh's SESSION_MOUNT_STALE
-# terminal classification (#10364).
+# test-spawn-codex-session-mount-stale.sh - how a dispatch refused because the
+# running session container does not mount the tick's working directory
+# reaches the daemon as SESSION_MOUNT_STALE (#10364).
 #
 # A host-mode session container mounts each registered repo separately, fixed
-# at creation. When it does not mount the tick's working directory (a repo
-# registered after it was created), `session-exec host` refuses before exec
-# with exit 78 and writes `# LOOM_SESSION_MOUNT_STALE …` into the capture file
-# (LOOM_SESSION_STDERR_FILE). The adapter must keep exit 78 but report
-# `category=SESSION_MOUNT_STALE`. Without the marker, or with another exit
-# code, the classifier's verdict stands, and a not-running container stays
-# SESSION_DOWN.
+# at creation, so a repo registered afterwards is not inside it. The mapping
+# is daemon-side, not shell: `loom-daemon session-exec host` reads the mounts
+# from its one pre-exec `docker inspect`, refuses with exit 78 and announces
+# the cause on stderr as `# LOOM_SESSION_REFUSAL v=1
+# category=SESSION_MOUNT_STALE`; the daemon's terminal-record parser relabels
+# the adapter's generic record from it (`session_exec::refusal`, unit-tested
+# in Rust). What spawn-codex.sh owes is pass-through: keep exit 78, carry the
+# announcement to its stderr untouched, and report its classifier's own
+# category without a per-cause arm.
 #
-# Hermetic: a fake daemon stands in for loom-daemon; docker is never run.
+# Hermetic: a fake daemon stands in for loom-daemon for the adapter cases;
+# docker is never run. The last cases run the real `loom-daemon` when one is
+# on PATH, against a fake docker, to pin the announcement's exact text and
+# the one-inspect dispatch check behind it.
 #
 # Usage:
 #   ./.loom/scripts/tests/test-spawn-codex-session-mount-stale.sh
@@ -61,8 +67,7 @@ printf '#!/usr/bin/env bash\nexit 0\n' >"$WORK/bin/docker"
 printf '#!/usr/bin/env bash\necho "unexpected bare-metal codex" >&2\nexit 99\n' >"$WORK/bin/codex"
 chmod +x "$WORK/bin/docker" "$WORK/bin/codex"
 
-# Fake daemon: posture answers $FAKE_POSTURE; `host` exits $FAKE_HOST_RC and,
-# with FAKE_MARKER=1, writes the mount-stale marker as the real one does.
+# Fake daemon: posture answers $FAKE_POSTURE; `host` exits $FAKE_HOST_RC.
 cat >"$WORK/bin/fake-loom-daemon" <<'FAKE'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -70,15 +75,8 @@ case "${1:-}" in
     session-exec)
         case "${2:-}" in
             posture) echo "$FAKE_POSTURE"; exit 0 ;;
-            host)
-                if [[ "${FAKE_MARKER:-0}" == "1" ]]; then
-                    line="# LOOM_SESSION_MOUNT_STALE container=loom-codex-session-acct workdir=$PWD session-exec: not mounted"
-                    echo "$line" >&2
-                    [[ -z "${LOOM_SESSION_STDERR_FILE:-}" ]] || printf '%s\n' "$line" >"$LOOM_SESSION_STDERR_FILE"
-                else
-                    echo "fake session-exec host refusal" >&2
-                fi
-                exit "${FAKE_HOST_RC:-78}" ;;
+            host) [[ -z "${FAKE_REFUSAL:-}" ]] || echo "$FAKE_REFUSAL" >&2
+                echo "fake session-exec host refusal" >&2; exit "${FAKE_HOST_RC:-78}" ;;
             *) exit 0 ;;
         esac ;;
 esac
@@ -92,41 +90,79 @@ run_spawn() {
         LOOM_CODEX_HOME="$PROFILE" LOOM_ACCOUNT_NAME=acct \
         LOOM_CODEX_SESSION_DOCKER="$WORK/bin/docker" \
         LOOM_DAEMON_SELF_BIN="$WORK/bin/fake-loom-daemon" \
-        PATH="$WORK/bin:$PATH" FAKE_POSTURE="$1" FAKE_HOST_RC="$2" FAKE_MARKER="$3" \
+        PATH="$WORK/bin:$PATH" FAKE_POSTURE="$1" FAKE_HOST_RC="$2" FAKE_REFUSAL="${3:-}" \
         bash "$SPAWN_CODEX" -p "hi" 2>&1 >/dev/null)"
     SPAWN_RC=$?
 }
 record() { printf '%s\n' "$SPAWN_ERR" | grep '^# LOOM_TERMINAL_RESULT ' || true; }
 category() { record | sed -n 's/.* category=\([A-Z_]*\) .*/\1/p'; }
 
+MARKER='# LOOM_SESSION_REFUSAL v=1 category=SESSION_MOUNT_STALE'
+markers() { printf '%s\n' "$SPAWN_ERR" | grep -cxF "$MARKER" || true; }
 HOST="mode=host sandbox=danger-full-access gh=skip"
 
-echo "--- a running container without the workdir mount reports SESSION_MOUNT_STALE ---"
-run_spawn "$HOST" 78 1
+echo "--- a stale-mount refusal announced by session-exec passes through, exit 78 kept ---"
+run_spawn "$HOST" 78 "$MARKER"
 assert_eq "78" "$SPAWN_RC" "the refusal exit code (78) still passes through"
-assert_eq "SESSION_MOUNT_STALE" "$(category)" "the terminal record is SESSION_MOUNT_STALE, not RECOVERABLE"
+assert_eq "1" "$(markers)" "the daemon's refusal announcement reaches stderr once, untouched"
+assert_eq "RECOVERABLE" "$(category)" \
+    "the adapter reports its classifier's category; the daemon relabels it, not the shell"
+assert_eq "0" "$(grep -c 'SESSION_MOUNT_STALE' "$SPAWN_CODEX" || true)" \
+    "spawn-codex.sh carries no SESSION_MOUNT_STALE arm of its own"
 
-echo "--- exit 78 without the marker keeps the classifier's verdict ---"
-run_spawn "$HOST" 78 0
+echo "--- no announcement, no relabel ---"
+run_spawn "$HOST" 78
 assert_eq "78" "$SPAWN_RC" "exit code passes through"
-case "$(category)" in
-    SESSION_MOUNT_STALE) actual="relabelled" ;;
-    *) actual="classifier verdict kept" ;;
-esac
-assert_eq "classifier verdict kept" "$actual" "no marker, no SESSION_MOUNT_STALE"
+assert_eq "0" "$(markers)" "the adapter never invents a refusal announcement"
+assert_eq "RECOVERABLE" "$(category)" "the classifier's RECOVERABLE verdict is kept"
 
-echo "--- the marker with a non-78 exit is not a refusal ---"
-run_spawn "$HOST" 1 1
-assert_eq "1" "$SPAWN_RC" "exit code passes through"
-case "$(category)" in
-    SESSION_MOUNT_STALE) actual="relabelled" ;;
-    *) actual="classifier verdict kept" ;;
-esac
-assert_eq "classifier verdict kept" "$actual" "only exit 78 is the pre-exec refusal"
+# A fake docker that answers `inspect --type container` as a running host-mode
+# container whose one workspace bind is $1, counts its inspect calls, and
+# fails anything else (so a dispatch that gets past the mount check stops at
+# the protocol probe instead of running a worker).
+fake_docker() {
+    : >"$WORK/docker-calls"
+    cat >"$WORK/bin/docker" <<DOCKER
+#!/usr/bin/env bash
+echo "\$1" >>"$WORK/docker-calls"
+[[ "\$1" == inspect ]] || exit 1
+echo '[{"State":{"Running":true},"Config":{"Labels":{"loom.workspace":"$WORK"}},"Mounts":[{"Type":"bind","Destination":"$1","RW":true}]}]'
+DOCKER
+}
+real_host() {
+    REAL_ERR="$(PATH="$WORK/bin:$PATH" loom-daemon session-exec host \
+        --container loom-codex-session-acct --workdir "$WORK/ws" -- true 2>&1 >/dev/null)"
+    REAL_RC=$?
+}
 
-echo "--- a not-running container stays SESSION_DOWN ---"
-run_spawn "mode=not-running sandbox=workspace-write gh=skip" 78 0
-assert_eq "SESSION_DOWN" "$(category)" "SESSION_DOWN is unchanged"
+echo "--- the real daemon announces SESSION_MOUNT_STALE for an unmounted workdir ---"
+if command -v loom-daemon >/dev/null 2>&1 \
+    && loom-daemon session-exec host --help 2>/dev/null | grep -q -- '--container'; then
+    fake_docker "$WORK/other-repo"
+    real_host
+    if printf '%s\n' "$REAL_ERR" | grep -qxF "$MARKER"; then
+        assert_eq "78" "$REAL_RC" "session-exec host refuses with 78 and announces SESSION_MOUNT_STALE"
+        assert_eq "inspect" "$(tr '\n' ' ' <"$WORK/docker-calls" | sed 's/ $//')" \
+            "the refusal costs one docker inspect and no exec"
+        case "$REAL_ERR" in
+            *"accounts session stop acct && loom-daemon accounts session start acct --mount-workspace $WORK"*) actual="named" ;;
+            *) actual="missing" ;;
+        esac
+        assert_eq "named" "$actual" "the refusal names the account's recreate command"
+
+        echo "--- the real daemon lets a mounted workdir through to the protocol probe ---"
+        fake_docker "$WORK/ws"
+        real_host
+        assert_eq "0" "$(printf '%s\n' "$REAL_ERR" | grep -c '^# LOOM_SESSION_REFUSAL ' || true)" \
+            "a container that mounts the workdir is not refused for its mounts"
+        assert_eq "inspect exec" "$(tr '\n' ' ' <"$WORK/docker-calls" | sed 's/ $//')" \
+            "dispatch makes one inspect, then goes on to the protocol exec"
+    else
+        echo "  SKIP: the loom-daemon on PATH predates the stale-mount announcement"
+    fi
+else
+    echo "  SKIP: no loom-daemon on PATH"
+fi
 
 echo ""
 echo "========================================"

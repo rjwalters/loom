@@ -39,6 +39,7 @@ pub const REFUSAL_EXIT_CODE: i32 = 78;
 pub fn wire(category: TerminalClassification) -> Option<&'static str> {
     match category {
         TerminalClassification::SessionDown => Some("SESSION_DOWN"),
+        TerminalClassification::SessionMountStale => Some("SESSION_MOUNT_STALE"),
         _ => None,
     }
 }
@@ -104,7 +105,7 @@ pub fn category_of(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use TerminalClassification::{Fatal, Recoverable, SessionDown, Success};
+    use TerminalClassification::{Fatal, Recoverable, SessionDown, SessionMountStale, Success};
 
     #[test]
     fn the_marker_round_trips_through_the_parser() {
@@ -117,7 +118,7 @@ mod tests {
     /// Add each new refusal category to this list.
     #[test]
     fn every_wire_name_parses_back_to_its_category() {
-        let categories: &[TerminalClassification] = &[SessionDown];
+        let categories: &[TerminalClassification] = &[SessionDown, SessionMountStale];
         for &category in categories {
             let parsed: TerminalClassification = wire(category).unwrap().parse().unwrap();
             assert_eq!(parsed, category);
@@ -132,6 +133,18 @@ mod tests {
         assert_eq!(apply(log, Recoverable, 1), Recoverable);
         assert_eq!(apply(log, Success, 78), Success);
         assert_eq!(apply("no marker", Recoverable, 78), Recoverable);
+    }
+
+    /// #10364: the stale-mount refusal rides the same line; the last
+    /// announcement in the region is the one that refused.
+    #[test]
+    fn a_stale_mount_refusal_is_announced_and_read_back() {
+        let line = marker_line(SessionMountStale).unwrap();
+        assert_eq!(line, "# LOOM_SESSION_REFUSAL v=1 category=SESSION_MOUNT_STALE");
+        assert_eq!(apply(&line, Recoverable, 78), SessionMountStale);
+        assert_eq!(apply(&line, Recoverable, 1), Recoverable);
+        let both = format!("{}\n{line}\n", marker_line(SessionDown).unwrap());
+        assert_eq!(apply(&both, Recoverable, 78), SessionMountStale);
     }
 
     #[test]

@@ -242,11 +242,6 @@ pub fn mount_drift(state: &Value, registered: &[PathBuf]) -> MountDrift {
     }
 }
 
-/// Marker line `session-exec host` writes (to stderr and its capture file)
-/// when it refuses a dispatch because the container does not mount the
-/// workdir. `spawn-codex.sh` maps it, with exit 78, to `SESSION_MOUNT_STALE`.
-pub const MOUNT_STALE_MARKER: &str = "# LOOM_SESSION_MOUNT_STALE";
-
 /// Whether dispatching into `state` with `--workdir workdir` would fail
 /// because no mount of the container covers the workdir (#10364): Docker's
 /// `chdir to cwd … no such file or directory`. Never for a private-clone
