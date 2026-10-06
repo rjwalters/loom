@@ -130,6 +130,17 @@ fn due(root: &Path, interval_secs: u64) -> bool {
     true
 }
 
+/// Whether the inline pass runs now: enabled, not stood down by the W7
+/// singleton, and due, asked in that order. A stood-down host never consults
+/// (or records) the cadence, so taking intake back runs a pass at once.
+fn inline_pass_due(
+    enabled: bool,
+    stands_down: impl FnOnce() -> bool,
+    due: impl FnOnce() -> bool,
+) -> bool {
+    enabled && !stands_down() && due()
+}
+
 /// Run the pass for `root` if enabled and due. Returns issues labeled.
 pub fn maybe_run(gh_bin: &Path, root: &Path) -> usize {
     // Unit tests of other modules drive GhWorkSource with real/fake `gh`; the
@@ -137,10 +148,9 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> usize {
     // W7: with the singleton configured and a captain declared, the captain's
     // own task runs intake; no host runs it inline. Checked before `due` so a
     // host that takes intake back runs its first pass at once.
+    let interval = env_num("LOOM_INTAKE_RECONCILE_INTERVAL_SECS", DEFAULT_INTERVAL_SECS);
     if cfg!(test)
-        || !enabled()
-        || singleton::legacy_stands_down()
-        || !due(root, env_num("LOOM_INTAKE_RECONCILE_INTERVAL_SECS", DEFAULT_INTERVAL_SECS))
+        || !inline_pass_due(enabled(), singleton::legacy_stands_down, || due(root, interval))
     {
         return 0;
     }

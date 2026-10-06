@@ -5,9 +5,14 @@
 //!
 //! The intake pass describes the *forge*, not the host: every dispatcher that
 //! manages a repo lists the same open issues on the same cadence and tries to
-//! add the same `loom:triage` label. N hosts spend N paginated listings on the
-//! writer credential to do one host's worth of work, which is why fleets
+//! add the same `loom:triage` label. N hosts spend N paginated listings (on
+//! the reader pool since W4-C, shed when the readers run dry) and N label
+//! attempts on the writer to do one host's worth of work, which is why fleets
 //! turned the pass off per host (`LOOM_INTAKE_RECONCILE=0`) and lost it.
+//!
+//! The gain is **one producer**, not a smaller bill: against a fleet that
+//! already runs with `LOOM_INTAKE_RECONCILE=0` everywhere, turning this on is
+//! new reader spend (one walk per repo per pass, on the captain).
 //!
 //! # The fix: one producer, assigned
 //!
@@ -22,14 +27,23 @@
 //!
 //! - **Listing**: every registered repo's open issues through
 //!   [`crate::forge_listing::list_open_issues_cached_all_as`]: conditional
-//!   reads on the reader pool, one validator per page. A repo where nothing
-//!   moved answers with `304`s only.
-//! - **Re-read**: before each label, one conditional read of that issue
+//!   reads on the reader pool, one validator per page, as a deferrable
+//!   (`Hygiene`) read. A page whose content did not move is a `304`, but on a
+//!   busy repo most walks still pay `200`s for the pages that did. When every
+//!   reader that can see the repo is out of budget the walk is **shed**: no
+//!   request, never a writer retry, and the repo waits for the next pass
+//!   (`intake.listing_shed`).
+//! - **Re-read**: before each label, one unconditional read of that issue
 //!   confirms it still carries no `loom:*` label, so an issue labelled between
-//!   the listing and the write is left alone.
+//!   the listing and the write is left alone. Unconditional because the
+//!   stored validator almost never matches (the issue is a candidate because
+//!   it just changed), and its body is not cached.
 //! - **Write**: one label request per issue, on the writer, behind a per-repo
 //!   [`crate::write_scope`] check that is only made when there is something
-//!   to label.
+//!   to label. The request's response is the issue's label set as the forge
+//!   stores it after the add: if it carries any other `loom:*` label (someone
+//!   labelled the issue after the re-read), the pass removes the
+//!   `loom:triage` it just added (`intake.triage_reverted`).
 //!
 //! # Repo set
 //!
@@ -38,6 +52,14 @@
 //! remote. Nothing else is consulted. No registry, or no root that resolves to
 //! a slug, is **no pass** ([`registered_repos`]): the captain never guesses a
 //! repo set.
+//!
+//! **Coverage precondition.** Every other host stands down for *every* repo it
+//! manages, but the captain covers only the repos registered on it: a repo
+//! managed by a dispatcher and not registered on the captain gets no intake.
+//! The covered slugs are logged once when this host becomes the captain and
+//! again whenever the set changes. A captain that is down means no intake
+//! anywhere; the only signal today is `intake-reconcile` missing from its
+//! `host.health.armed_singleton_jobs`.
 //!
 //! # Modes ([`Mode`], re-read every [`GATE_INTERVAL`], so an edit needs no restart)
 //!
@@ -57,11 +79,17 @@
 //! # Rate limits
 //!
 //! The pass does not start while the rate-limit breaker is suppressing forge
-//! calls, and stops between repos if it trips. A rate-limited or refused
-//! reader is withdrawn and the read retried once on the writer by the shared
-//! read path ([`crate::forge_etag_store::fetch_conditional`]); a listing that
-//! still fails is a skipped repo, retried next pass. A listing failure is
-//! never reported to the host-wide breaker from here.
+//! calls, and stops between repos if it trips.
+//!
+//! - **Listing**: a rate-limited or refused reader is withdrawn and the next
+//!   reader asked; with none left for budget the walk is shed, never sent to
+//!   the writer. A listing that fails or is shed is a skipped repo, retried
+//!   next pass, and is never reported to the host-wide breaker from here.
+//! - **Re-read**: a `Gate` read on the shared path, so a rate-limited reader
+//!   is withdrawn and the read retried once on the writer. A re-read failure
+//!   **does** reach the breaker, by design: it is reported only after the
+//!   reader was withdrawn and the writer retry also failed (for a rate limit,
+//!   the writer's own bucket is spent, which is the breaker's business).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -87,8 +115,12 @@ pub const SINGLETON_KEY: &str = "fleet.intakeReconcile.singleton";
 pub const GATE_INTERVAL: Duration = Duration::from_secs(60);
 /// Breaker job name and write-scope pass name.
 const PASS: &str = "intake_reconcile";
-/// Disk/memory cache prefix of the per-issue re-read.
-const RECHECK_PREFIX: &str = "intake-";
+/// `loom.forge.facade.events`: a repo's listing was shed (readers out of
+/// budget) and the repo skipped this pass.
+pub const LISTING_SHED: &str = "intake.listing_shed";
+/// `loom.forge.facade.events`: the label response showed another `loom:*`
+/// label, so the `loom:triage` just added was removed again.
+pub const TRIAGE_REVERTED: &str = "intake.triage_reverted";
 
 /// Where intake runs, for this host, this tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,8 +339,14 @@ pub trait IntakeForge {
     /// there is something to label.
     fn may_write(&mut self, repo: &Repo) -> bool;
 
-    /// Add [`TRIAGE_LABEL`] to issue `number`. `false` on any failure.
-    fn add_triage(&mut self, repo: &Repo, number: u32) -> bool;
+    /// Add [`TRIAGE_LABEL`] to issue `number`: the issue's label set as the
+    /// forge answered the write (`Some(vec![])` when the answer did not
+    /// parse), or `None` on any failure.
+    fn add_triage(&mut self, repo: &Repo, number: u32) -> Option<Vec<String>>;
+
+    /// Remove [`TRIAGE_LABEL`] from issue `number`; already absent is
+    /// success. `false` on any failure.
+    fn remove_triage(&mut self, repo: &Repo, number: u32) -> bool;
 }
 
 /// What one repo's pass did.
@@ -319,14 +357,27 @@ pub struct RepoReport {
     /// Issues the listing showed unlabelled that the re-read showed labelled,
     /// closed or gone: left alone.
     pub raced: usize,
+    /// Labelled, then un-labelled: the write's answer showed another
+    /// `loom:*` label.
+    pub reverted: usize,
     /// The listing failed or was incomplete.
     pub listing_failed: bool,
+    /// The listing was shed: every reader was out of budget. Implies
+    /// `listing_failed`.
+    pub listing_shed: bool,
     /// The write-scope check refused the repo.
     pub denied: bool,
 }
 
 fn has_lifecycle_label(labels: &[String]) -> bool {
     labels.iter().any(|l| l.starts_with("loom:"))
+}
+
+/// A `loom:*` label other than [`TRIAGE_LABEL`].
+fn has_other_lifecycle_label(labels: &[String]) -> bool {
+    labels
+        .iter()
+        .any(|l| l.starts_with("loom:") && l != TRIAGE_LABEL)
 }
 
 /// One repo: list, select, and for each selected issue re-read then label.
@@ -339,6 +390,14 @@ pub fn run_repo(
     let mut report = RepoReport::default();
     let rows = match forge.list_open(repo) {
         Ok(rows) => rows,
+        Err(e) if e.downcast_ref::<store::ReadShed>().is_some() => {
+            // Logged (rate-limited) and booked `o=shed` by the read path.
+            log::debug!("intake_reconcile: {} listing shed this pass: {e:#}", repo.slug);
+            crate::forge_call_stats::counters::bump(LISTING_SHED);
+            report.listing_failed = true;
+            report.listing_shed = true;
+            return report;
+        }
         Err(e) => {
             log::warn!("intake_reconcile: {} listing skipped this pass: {e:#}", repo.slug);
             report.listing_failed = true;
@@ -373,11 +432,31 @@ pub fn run_repo(
                 break;
             }
         }
-        if forge.add_triage(repo, number) {
-            report.labelled += 1;
-        } else {
+        let Some(after) = forge.add_triage(repo, number) else {
             log::warn!("intake_reconcile: failed to label {}#{number}", repo.slug);
             break; // likely rate limited / auth; retry next pass
+        };
+        if !has_other_lifecycle_label(&after) {
+            report.labelled += 1;
+            continue;
+        }
+        // Labelled by someone else between the re-read and the write: the
+        // write's own answer (the primary's label set) is the compare step.
+        report.reverted += 1;
+        crate::forge_call_stats::counters::bump(TRIAGE_REVERTED);
+        if forge.remove_triage(repo, number) {
+            log::info!(
+                "intake_reconcile: {}#{number} was labelled concurrently; removed the \
+                 {TRIAGE_LABEL} just added",
+                repo.slug
+            );
+        } else {
+            log::warn!(
+                "intake_reconcile: {}#{number} was labelled concurrently and removing the \
+                 {TRIAGE_LABEL} just added failed; it carries both until curated",
+                repo.slug
+            );
+            break;
         }
     }
     report
@@ -390,6 +469,10 @@ pub struct PassReport {
     pub repos: usize,
     pub labelled: usize,
     pub raced: usize,
+    /// Labels removed again after the write's answer (see [`RepoReport`]).
+    pub reverted: usize,
+    /// Repos whose listing was shed (readers out of budget).
+    pub shed: usize,
 }
 
 /// One pass over `repos`, stopping early while `suppressed` (the rate-limit
@@ -411,6 +494,8 @@ pub fn run_pass(
         pass.repos += usize::from(!report.listing_failed);
         pass.labelled += report.labelled;
         pass.raced += report.raced;
+        pass.reverted += report.reverted;
+        pass.shed += usize::from(report.listing_shed);
     }
     pass
 }
@@ -429,6 +514,17 @@ impl GhIntakeForge {
     pub fn new(gh_bin: PathBuf) -> Self {
         Self { gh_bin }
     }
+}
+
+/// The names in a label-array answer (`POST …/labels`).
+fn label_names(body: &str) -> Option<Vec<String>> {
+    let labels: Vec<Value> = serde_json::from_str(body.trim()).ok()?;
+    Some(
+        labels
+            .iter()
+            .filter_map(|l| l["name"].as_str().map(str::to_owned))
+            .collect(),
+    )
 }
 
 /// An issue row's labels when it is still an open issue, else `None`.
@@ -474,28 +570,36 @@ impl IntakeForge for GhIntakeForge {
     }
 
     fn current_labels(&mut self, repo: &Repo, number: u32) -> Result<Option<Vec<String>>> {
-        let site = store::ConditionalRead::new(
-            "intake.recheck",
-            crate::forge_call_stats::ops::ISSUE_VIEW_STATE,
-        )
-        .item_scoped();
+        const CALLER: &str = "intake.recheck";
+        let site =
+            store::ConditionalRead::new(CALLER, crate::forge_call_stats::ops::ISSUE_VIEW_STATE)
+                .item_scoped();
+        if crate::rate_limit_breaker::global_skip_pass(CALLER) {
+            anyhow::bail!("rate-limit breaker is suppressing forge calls");
+        }
+        // Unconditional and uncached: a candidate issue has usually just
+        // changed, so a stored validator would rarely match, and keeping its
+        // body would grow an unevicted cache by one issue per label.
+        let target = store::resolve_target(Some(&repo.root), env_repo().as_deref());
         let url = format!("repos/{}/issues/{number}", repo.slug);
-        let body = store::cached_get(
-            site,
-            &self.gh_bin,
-            Some(&repo.root),
-            env_repo().as_deref(),
-            &url,
-            RECHECK_PREFIX,
-        )?;
-        body.as_deref().map_or(Ok(None), open_issue_labels)
+        let (status, response, stderr) =
+            store::fetch_conditional(site, &self.gh_bin, Some(&repo.root), &target, &url, None)?;
+        match response {
+            Some(r) if r.status == 200 && status.success() => open_issue_labels(&r.body),
+            Some(r) if r.status == 404 => Ok(None),
+            _ => {
+                // After the reader was withdrawn and the writer retry failed.
+                crate::rate_limit_breaker::global_observe_failure(&stderr, CALLER);
+                Err(anyhow!("gh api {url} failed: {stderr}"))
+            }
+        }
     }
 
     fn may_write(&mut self, repo: &Repo) -> bool {
         crate::write_scope::gate_repo_with(&repo.root, &repo.slug, &self.gh_bin, "intake reconcile")
     }
 
-    fn add_triage(&mut self, repo: &Repo, number: u32) -> bool {
+    fn add_triage(&mut self, repo: &Repo, number: u32) -> Option<Vec<String>> {
         let path = format!("repos/{}/issues/{number}/labels", repo.slug);
         let label = format!("labels[]={TRIAGE_LABEL}");
         let mut call = gh_call::write("intake.add_triage", &self.gh_bin, &repo.root)
@@ -503,7 +607,28 @@ impl IntakeForge for GhIntakeForge {
         if let Some(host) = &repo.host {
             call = call.arg("--hostname").arg(host);
         }
-        gh_call::output(call).is_ok_and(|o| o.status.success())
+        let out = gh_call::output(call).ok().filter(|o| o.status.success())?;
+        // The answer is the issue's whole label set. One that does not parse
+        // proves nothing either way: the label was added, nothing to undo.
+        Some(label_names(&String::from_utf8_lossy(&out.stdout)).unwrap_or_default())
+    }
+
+    fn remove_triage(&mut self, repo: &Repo, number: u32) -> bool {
+        let path = format!("repos/{}/issues/{number}/labels/{TRIAGE_LABEL}", repo.slug);
+        let mut call = gh_call::write("intake.remove_triage", &self.gh_bin, &repo.root)
+            .args(["api", "-X", "DELETE", &path]);
+        if let Some(host) = &repo.host {
+            call = call.arg("--hostname").arg(host);
+        }
+        match gh_call::output(call) {
+            Ok(o) if o.status.success() => true,
+            // Already absent is the end state we want.
+            Ok(o) => {
+                let err = gh_call::stderr(&o);
+                err.contains("404") || err.to_ascii_lowercase().contains("does not exist")
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -518,6 +643,7 @@ fn run_production_pass(daemon_root: &Path) {
         return;
     }
     let repos = registered_repos(daemon_root).unwrap_or_default();
+    log_coverage(&repos);
     if repos.is_empty() {
         log::warn!(
             "intake_reconcile: no registered workspace resolves to a repo; no pass (the captain \
@@ -534,13 +660,51 @@ fn run_production_pass(daemon_root: &Path) {
         cap,
         &crate::rate_limit_breaker::global_is_suppressed,
     );
-    if pass.labelled > 0 || pass.raced > 0 {
+    if pass.labelled > 0 || pass.raced > 0 || pass.reverted > 0 {
         log::info!(
             "intake_reconcile: applied {TRIAGE_LABEL} to {} unlabelled issue(s) across {} \
-             repo(s); {} left alone after the re-read (#10041, W7)",
+             repo(s); {} left alone after the re-read, {} removed again after the write \
+             (#10041, W7)",
             pass.labelled,
             pass.repos,
-            pass.raced
+            pass.raced,
+            pass.reverted
+        );
+    }
+    if pass.shed > 0 {
+        log::info!(
+            "intake_reconcile: {} repo(s) skipped this pass: every reader was out of budget \
+             (shed, not sent to the writer)",
+            pass.shed
+        );
+    }
+}
+
+/// The slugs last logged as covered; `None` while this host is not the
+/// captain, so becoming it logs the set once.
+static COVERED: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+/// `repos`' slugs when they differ from `last` (and records them), else
+/// `None`. Pure apart from `last`.
+fn coverage_changed(last: &mut Option<Vec<String>>, repos: &[Repo]) -> Option<Vec<String>> {
+    let slugs: Vec<String> = repos.iter().map(|r| r.slug.clone()).collect();
+    if last.as_ref() == Some(&slugs) {
+        return None;
+    }
+    *last = Some(slugs.clone());
+    Some(slugs)
+}
+
+/// Log the repos this captain covers, once per change of the set.
+fn log_coverage(repos: &[Repo]) {
+    let mut last = COVERED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(slugs) = coverage_changed(&mut last, repos) {
+        log::info!(
+            "intake_reconcile: the captain covers {} repo(s): [{}]. Every other host stands \
+             down for every repo it manages; a repo missing here gets no intake (register it on \
+             this host) (W7)",
+            slugs.len(),
+            slugs.join(", ")
         );
     }
 }
@@ -551,6 +715,7 @@ fn run_production_pass(daemon_root: &Path) {
 fn tick(daemon_root: &Path, host_id: &str, last_pass: &mut Option<Instant>) {
     if !matches!(gate_tick(daemon_root, host_id), Mode::Captain { .. }) {
         *last_pass = None;
+        *COVERED.lock().unwrap_or_else(PoisonError::into_inner) = None;
         return;
     }
     let interval =

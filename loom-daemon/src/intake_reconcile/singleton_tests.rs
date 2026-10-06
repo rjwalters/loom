@@ -185,16 +185,26 @@ fn the_repo_set_is_one_entry_per_slug_and_leaves_unresolvable_roots_out() {
 struct Fake {
     listing: Vec<IntakeRow>,
     listing_fails: bool,
+    listing_shed: bool,
     /// Issue number → what the re-read answers (absent = read failure).
     current: std::collections::BTreeMap<u32, Option<Vec<String>>>,
     write_denied: bool,
     post_fails: bool,
+    /// Issue number → the label set the write answers (absent = just
+    /// `loom:triage`).
+    post_answers: std::collections::BTreeMap<u32, Vec<String>>,
+    remove_fails: bool,
     calls: Vec<String>,
 }
 
 impl IntakeForge for Fake {
     fn list_open(&mut self, repo: &Repo) -> Result<Vec<IntakeRow>> {
         self.calls.push(format!("list {}", repo.slug));
+        if self.listing_shed {
+            return Err(anyhow::Error::new(store::ReadShed {
+                until: std::time::SystemTime::now(),
+            }));
+        }
         if self.listing_fails {
             return Err(anyhow!("listing changed mid-walk"));
         }
@@ -214,9 +224,19 @@ impl IntakeForge for Fake {
         !self.write_denied
     }
 
-    fn add_triage(&mut self, _: &Repo, number: u32) -> bool {
+    fn add_triage(&mut self, _: &Repo, number: u32) -> Option<Vec<String>> {
         self.calls.push(format!("post {number}"));
-        !self.post_fails
+        (!self.post_fails).then(|| {
+            self.post_answers
+                .get(&number)
+                .cloned()
+                .unwrap_or_else(|| vec![TRIAGE_LABEL.to_string()])
+        })
+    }
+
+    fn remove_triage(&mut self, _: &Repo, number: u32) -> bool {
+        self.calls.push(format!("delete {number}"));
+        !self.remove_fails
     }
 }
 
@@ -384,8 +404,11 @@ impl IntakeForge for Scoped {
     fn may_write(&mut self, _: &Repo) -> bool {
         true
     }
-    fn add_triage(&mut self, repo: &Repo, number: u32) -> bool {
+    fn add_triage(&mut self, repo: &Repo, number: u32) -> Option<Vec<String>> {
         self.0.add_triage(repo, number)
+    }
+    fn remove_triage(&mut self, repo: &Repo, number: u32) -> bool {
+        self.0.remove_triage(repo, number)
     }
 }
 
@@ -408,7 +431,10 @@ fn the_live_pass_re_reads_each_issue_and_an_idle_repo_is_a_304() {
 d={d}
 ok() {{ printf 'HTTP/2.0 200 OK\r\nEtag: W/"%s"\r\n\r\n' "$1"; }}
 case "$*" in
-  *"-X POST"*) echo "$*" >> "$d/posts.log" ;;
+  *"-X POST"*) echo "$*" >> "$d/posts.log"
+    echo '[{{"name": "loom:triage"}}]' ;;
+  *"-X DELETE"*) echo "$*" >> "$d/deletes.log" ;;
+  *If-None-Match*issues/[0-9]*) echo "conditional re-read: $*" >> "$d/calls.log"; exit 1 ;;
   *issues/1*) echo "reread 1" >> "$d/calls.log"; ok i1
     echo '{{"number": 1, "state": "open", "labels": []}}' ;;
   *issues/4*) echo "reread 4" >> "$d/calls.log"; ok i4
@@ -452,4 +478,210 @@ esac
     let rows = forge.list_open(&repo).unwrap();
     assert_eq!(calls(), "list 304\n");
     assert_eq!(rows.iter().map(|r| r.number).collect::<Vec<_>>(), [1, 3, 4]);
+    assert!(!dir.path().join("deletes.log").exists(), "nothing was reverted");
+
+    // The re-read is unconditional every time (the stub fails a conditional
+    // one): a second re-read of #1 sends no validator either.
+    std::fs::remove_file(dir.path().join("calls.log")).unwrap();
+    assert_eq!(forge.current_labels(&repo, 1).unwrap(), labels(&[]));
+    assert_eq!(calls(), "reread 1\n");
+}
+
+/// The write's own answer is the compare step: when it shows another
+/// `loom:*` label, the `loom:triage` just added is removed (a DELETE on the
+/// writer) and counted.
+#[test]
+fn the_live_write_reverts_when_its_answer_carries_another_lifecycle_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let gh = dir.path().join("gh");
+    let script = format!(
+        r#"#!/bin/sh
+d={d}
+case "$*" in
+  *"-X POST"*) echo "$*" >> "$d/writes.log"
+    echo '[{{"name": "bug"}}, {{"name": "loom:triage"}}, {{"name": "loom:issue"}}]' ;;
+  *"-X DELETE"*) echo "$*" >> "$d/writes.log" ;;
+  *) exit 1 ;;
+esac
+"#,
+        d = dir.path().display()
+    );
+    std::fs::write(&gh, script).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let repo = Repo {
+        slug: "acme/widgets".into(),
+        host: None,
+        root: dir.path().to_path_buf(),
+    };
+    let mut forge = GhIntakeForge::new(gh);
+    let after = forge.add_triage(&repo, 9).unwrap();
+    assert!(has_other_lifecycle_label(&after), "{after:?}");
+    assert!(forge.remove_triage(&repo, 9));
+    let writes = std::fs::read_to_string(dir.path().join("writes.log")).unwrap();
+    let lines: Vec<&str> = writes.lines().collect();
+    assert_eq!(lines.len(), 2, "{writes}");
+    assert!(lines[1].contains("-X DELETE repos/acme/widgets/issues/9/labels/loom:triage"));
+}
+
+/// The pass with a fake forge: a write answered with `loom:issue` is
+/// reverted and counted; a write answered with `loom:triage` alone is not.
+#[test]
+fn a_write_answered_with_another_lifecycle_label_is_reverted_and_counted() {
+    let before = crate::forge_call_stats::counters::get(TRIAGE_REVERTED);
+    let mut forge = Fake {
+        listing: vec![row(1, &[]), row(2, &[])],
+        ..Fake::default()
+    };
+    forge.current.insert(1, labels(&[]));
+    forge.current.insert(2, labels(&[]));
+    forge
+        .post_answers
+        .insert(1, vec!["loom:triage".into(), "loom:issue".into()]);
+    let report = run_repo(&mut forge, &repo("acme/a"), now(), 50);
+    assert_eq!(
+        forge.calls,
+        [
+            "list acme/a",
+            "scope",
+            "reread 1",
+            "post 1",
+            "delete 1",
+            "reread 2",
+            "post 2"
+        ]
+    );
+    assert_eq!((report.labelled, report.reverted), (1, 1));
+    assert_eq!(crate::forge_call_stats::counters::get(TRIAGE_REVERTED), before + 1);
+
+    // A failed removal stops the repo's pass (likely rate limited).
+    let mut stuck = Fake {
+        listing: vec![row(1, &[]), row(2, &[])],
+        remove_fails: true,
+        ..Fake::default()
+    };
+    stuck.current.insert(1, labels(&[]));
+    stuck.current.insert(2, labels(&[]));
+    stuck.post_answers.insert(1, vec!["loom:curated".into()]);
+    let report = run_repo(&mut stuck, &repo("acme/a"), now(), 50);
+    assert_eq!(stuck.calls, ["list acme/a", "scope", "reread 1", "post 1", "delete 1"]);
+    assert_eq!((report.labelled, report.reverted), (0, 1));
+}
+
+// ===== readers out of budget =====
+
+/// A shed listing is a skipped repo, counted, with no further call.
+#[test]
+fn a_shed_listing_skips_the_repo_and_is_counted() {
+    let before = crate::forge_call_stats::counters::get(LISTING_SHED);
+    let mut forge = Fake {
+        listing: vec![row(1, &[])],
+        listing_shed: true,
+        ..Fake::default()
+    };
+    let pass = run_pass(&mut forge, &[repo("acme/a"), repo("acme/b")], now(), 50, &|| false);
+    assert_eq!((pass.repos, pass.shed, pass.labelled), (0, 2, 0));
+    assert_eq!(forge.calls, ["list acme/a", "list acme/b"]);
+    assert_eq!(crate::forge_call_stats::counters::get(LISTING_SHED), before + 2);
+}
+
+/// End to end with every reader withdrawn for budget: the captain's walk
+/// makes no call at all (so none on the writer) and the repo is skipped.
+#[test]
+fn with_readers_out_of_budget_the_live_walk_makes_no_writer_call() {
+    use crate::forge_identity::{ExhaustCause, RouteDecision};
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("calls.log");
+    let gh = dir.path().join("gh");
+    std::fs::write(&gh, format!("#!/bin/sh\necho \"$*\" >> '{}'\nexit 1\n", log.display()))
+        .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The root must resolve to its repo, as every root in the captain's set
+    // does (an unresolved one has no reader pool and is never listed).
+    let slug = format!("acme/shed-{}", std::process::id());
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        &format!("https://github.com/{slug}.git"),
+    ]);
+    let _route = store::install_test_route(|_| RouteDecision::Exhausted {
+        until: std::time::SystemTime::now() + Duration::from_secs(600),
+        cause: ExhaustCause::Budget,
+    });
+    let repo = Repo {
+        slug,
+        host: Some("github.com".into()),
+        root: dir.path().to_path_buf(),
+    };
+    let mut forge = GhIntakeForge::new(gh);
+    let before = crate::forge_call_stats::counters::get(LISTING_SHED);
+    let pass = run_pass(&mut forge, std::slice::from_ref(&repo), now(), 50, &|| false);
+    assert_eq!((pass.repos, pass.shed), (0, 1));
+    assert!(!log.exists(), "no gh call at all: {:?}", std::fs::read_to_string(&log));
+    assert_eq!(crate::forge_call_stats::counters::get(LISTING_SHED), before + 1);
+}
+
+// ===== coverage and wiring =====
+
+#[test]
+fn the_covered_set_is_logged_once_per_change() {
+    let mut last = None;
+    let ab = [repo("acme/a"), repo("acme/b")];
+    assert_eq!(
+        coverage_changed(&mut last, &ab),
+        Some(vec!["acme/a".to_string(), "acme/b".to_string()])
+    );
+    assert_eq!(coverage_changed(&mut last, &ab), None, "unchanged: not again");
+    assert_eq!(coverage_changed(&mut last, &ab[..1]), Some(vec!["acme/a".to_string()]));
+    // Losing the captaincy clears it, so taking it back logs again.
+    last = None;
+    assert!(coverage_changed(&mut last, &ab[..1]).is_some());
+}
+
+/// The work finder's inline pass asks [`legacy_stands_down`] before its
+/// cadence: under a resolved captain mode it never runs (and never records a
+/// run), and under a legacy one it does. This test is the only writer of the
+/// process-wide mode in the test binary; `maybe_run` itself is inert under
+/// `cfg(test)`, so its body is covered through `inline_pass_due`.
+#[test]
+fn the_inline_pass_asks_the_resolved_mode_before_its_cadence() {
+    let set = |mode: Option<Mode>| *MODE.lock().unwrap_or_else(PoisonError::into_inner) = mode;
+    let due_unasked = || -> bool { panic!("a stood-down host must not consult the cadence") };
+    for mode in [
+        Mode::Captain {
+            captain: "cap".into(),
+        },
+        Mode::StandDown {
+            captain: "cap".into(),
+        },
+    ] {
+        set(Some(mode.clone()));
+        assert!(
+            !super::super::inline_pass_due(true, legacy_stands_down, due_unasked),
+            "{mode:?}"
+        );
+    }
+    for mode in [
+        None,
+        Some(Mode::Legacy {
+            reason: "no_captain",
+        }),
+    ] {
+        set(mode.clone());
+        assert!(super::super::inline_pass_due(true, legacy_stands_down, || true), "{mode:?}");
+        assert!(!super::super::inline_pass_due(true, legacy_stands_down, || false));
+    }
+    assert!(!super::super::inline_pass_due(false, || false, || true), "disabled");
+    set(None);
 }

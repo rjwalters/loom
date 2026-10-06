@@ -29,6 +29,11 @@ esac
 echo "$n 200" >> "$d/calls.log"
 printf 'HTTP/2.0 200 OK\r\nEtag: W/"%s"\r\n\r\n' "$e"
 cat "$d/page$n.json"
+# A scripted change: after page N is served once, its next version lands.
+if [ -f "$d/next$n.json" ]; then
+  mv "$d/next$n.json" "$d/page$n.json"
+  mv "$d/nextetag$n" "$d/etag$n"
+fi
 "#,
             dir = dir.display()
         ),
@@ -141,4 +146,93 @@ fn the_unfiltered_walk_is_bounded_by_its_own_page_cap() {
         .expect_err("a listing with no last page is incomplete");
     assert!(err.to_string().contains("incomplete"), "{err}");
     assert_eq!(drain_calls(d).len(), MAX_OPEN_PAGES as usize);
+}
+
+/// Page 1 changes to `next` (under ETag `etag`) right after its first read,
+/// i.e. between the walk's first read and its revalidation.
+fn change_after_first_read(dir: &Path, etag: &str, next: &str) {
+    std::fs::write(dir.join("nextetag1"), etag).unwrap();
+    std::fs::write(dir.join("next1.json"), next).unwrap();
+}
+
+/// Rows `numbers`, each carrying `comments` comments.
+fn page_with_comments(numbers: std::ops::Range<u32>, comments: u32) -> String {
+    let rows: Vec<String> = numbers
+        .map(|n| {
+            format!(r#"{{"number": {n}, "state": "open", "labels": [], "comments": {comments}}}"#)
+        })
+        .collect();
+    format!("[{}]\n", rows.join(","))
+}
+
+/// The intake walk compares page MEMBERSHIP: a comment on an open issue
+/// between the first read and the revalidation does not abort it, and the
+/// fresher rows are returned. The strict (row) walk the other callers use
+/// still aborts on the same change.
+#[test]
+fn a_comment_mid_walk_aborts_only_the_strict_walk() {
+    for (snapshot, strict) in [(Snapshot::Membership, false), (Snapshot::Rows, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let repo = format!("test-owner/open-pages-member-{strict}-{}", std::process::id());
+        set_page(d, 1, "a1", &page_with_comments(1..101, 0));
+        set_page(d, 2, "b1", &page(101..103, &[]));
+        change_after_first_read(d, "a2", &page_with_comments(1..101, 1));
+        let gh = stub(d);
+        let site = issue_list("t");
+        let walked =
+            walk_pages(site, &gh, Some(d), Some(&repo), ("", "open"), MAX_OPEN_PAGES, snapshot);
+        assert_eq!(drain_calls(d), ["1 200", "2 200", "1 200"], "{snapshot:?}");
+        if strict {
+            let err = walked.expect_err("a row walk aborts on any changed row");
+            assert!(err.to_string().contains("changed mid-walk"), "{err}");
+        } else {
+            let rows = walked.unwrap();
+            assert_eq!(rows.len(), 102);
+            assert_eq!(rows[0].comments, 1, "the revalidated rows are returned");
+        }
+    }
+}
+
+/// Membership still catches what it exists for: an issue that left page 1
+/// mid-walk shifts the page boundary, and the walk aborts.
+#[test]
+fn a_membership_change_mid_walk_still_aborts() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let repo = format!("test-owner/open-pages-shift-{}", std::process::id());
+    set_page(d, 1, "a1", &page(1..101, &[]));
+    set_page(d, 2, "b1", &page(101..103, &[]));
+    // #1 closes: every later issue moves up one place.
+    change_after_first_read(d, "a2", &page(2..102, &[]));
+    let gh = stub(d);
+    let err = list_open_issues_cached_all_as("t", &gh, Some(d), Some(&repo))
+        .expect_err("a shifted page boundary is not a consistent snapshot");
+    assert!(err.to_string().contains("changed mid-walk"), "{err}");
+}
+
+/// With every reader out of budget the intake walk is shed: not one request
+/// (so not one on the writer), and the error is a [`store::ReadShed`].
+#[test]
+fn the_open_walk_is_shed_when_readers_are_out_of_budget() {
+    use crate::forge_identity::{ExhaustCause, ReadClass, RouteDecision};
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let repo = format!("test-owner/open-pages-shed-{}", std::process::id());
+    set_page(d, 1, "a1", &page(1..3, &[]));
+    let gh = stub(d);
+    let classes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = classes.clone();
+    let _route = store::install_test_route(move |req| {
+        seen.borrow_mut().push(req.class);
+        RouteDecision::Exhausted {
+            until: std::time::SystemTime::now() + std::time::Duration::from_secs(600),
+            cause: ExhaustCause::Budget,
+        }
+    });
+    let err = list_open_issues_cached_all_as("t", &gh, Some(d), Some(&repo))
+        .expect_err("a shed walk is no listing");
+    assert!(err.downcast_ref::<store::ReadShed>().is_some(), "{err:#}");
+    assert!(drain_calls(d).is_empty(), "no request at all");
+    assert_eq!(*classes.borrow(), [ReadClass::Hygiene]);
 }

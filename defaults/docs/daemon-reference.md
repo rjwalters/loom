@@ -7205,17 +7205,37 @@ declared captain. It needs no heartbeat.
 #### Intake reconcile on the captain (W7)
 
 The [intake pass](#curator-intake-reconcile-10041) describes the forge, not
-the host: every dispatcher that manages a repo lists the same open issues, on
-the writer credential, to add the same `loom:triage` label. With
+the host: every dispatcher that manages a repo lists the same open issues (a
+reader-routed `Hygiene` read since W4-C, shed when the readers are out of
+budget) and attempts the same `loom:triage` label on the writer. With
 `fleet.intakeReconcile.singleton` set and a `fleet.captain` declared, the
 captain alone runs it (singleton job **`intake-reconcile`**, in
 `host.health.armed_singleton_jobs`) and no other host makes an intake call.
-Assigned, not elected: there is no standby producer, so while the captain is
-down unlabelled issues wait for it. Code: `intake_reconcile/singleton.rs`.
+Assigned, not elected: there is no standby producer. Code:
+`intake_reconcile/singleton.rs`.
+
+**What this buys, and what it costs.** The benefit is one producer instead of
+N, with a re-read and a post-write check around every label. It is not a
+saving against a fleet that already runs `LOOM_INTAKE_RECONCILE=0` on every
+host: there it is **new reader spend**, one listing walk per covered repo per
+pass, on the captain.
+
+> **Warning: the captain must cover every fleet repo.** Every other host
+> stands down for *every* repo it manages, but the captain reconciles only the
+> workspaces registered **on the captain**. A repo that a dispatcher manages
+> and the captain does not have registered gets no intake at all. The captain
+> logs the slugs it covers (`intake_reconcile: the captain covers N repo(s):
+> [...]`) when it becomes the captain and whenever the set changes; check that
+> line against the fleet's repo list.
+>
+> **A dead captain means no intake anywhere.** Unlabelled issues wait until it
+> is back. Today the only signal is `intake-reconcile` missing from the
+> captain's `host.health.armed_singleton_jobs`; there is no per-repo
+> heartbeat or age gauge yet.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `fleet.intakeReconcile.singleton` | `false` | With a `fleet.captain` declared: only the captain runs intake, from its own task; every other host stops running it. Identical fleet-wide, like `fleet.captain` |
+| `fleet.intakeReconcile.singleton` | `false` | With a `fleet.captain` declared: only the captain runs intake, from its own task; every other host stops running it. Set it **fleet-wide** (identical on every host, like `fleet.captain`): a host that does not see it keeps running intake per host |
 
 | `singleton` | `fleet.captain` | This host | Intake runs |
 |---|---|---|---|
@@ -7238,21 +7258,37 @@ captain that dispatches nothing still runs it:
   other source is read. An unreadable registry, or no root that resolves to a
   slug, is no pass.
 - **Listing**: each repo's open issues, oldest first, as conditional reads on
-  the reader pool with one ETag per page. A repo where nothing moved costs
-  only `304`s; a change costs a `200` for the pages whose rows changed. More
-  than 3000 open items is an incomplete listing and that repo is skipped.
-- **Re-read**: before each label, one conditional read of that issue. An issue
-  labelled, closed or deleted since the listing is left alone.
+  the reader pool with one ETag per page, classed `Hygiene`. A page whose rows
+  did not move is a `304`; on a busy repo most walks still pay a `200` for
+  each page that did, so expect `200`s, not mostly `304`s. More than 3000 open
+  items is an incomplete listing and that repo is skipped. The walk's
+  consistency check compares each page's issue numbers, not whole rows, so a
+  comment on an open issue does not abort it; an issue opened or closed
+  across a page boundary mid-walk does.
+- **Shed, never the writer**: a rate-limited or refused reader is withdrawn
+  and the next reader asked. When every reader that can see the repo is out
+  of budget the walk is shed (no request, an `o=shed` row, the facade event
+  `intake.listing_shed`) and the repo waits for the next pass. Only with no
+  reader pool at all, or readers out for a reason that is not budget (a
+  coverage miss, a stale token), does the writer serve the listing, as for any
+  W4-C deferrable read. `LOOM_READ_SHED=0` turns shedding off.
+- **Re-read**: before each label, one unconditional read of that issue (its
+  body is not cached). An issue labelled, closed or deleted since the listing
+  is left alone. This is a `Gate` read: a rate-limited reader is withdrawn and
+  the read retried once on the writer, and a failure after that reaches the
+  rate-limit breaker.
 - **Write**: one label request per issue on the writer, behind a per-repo
   `write_scope` check that is only made when there is something to label.
-- **Rate limits**: no pass while the rate-limit breaker is open, and the pass
-  stops between repos if it opens. A rate-limited reader is withdrawn and the
-  read retried once on the writer, as for every conditional read; a listing
-  that still fails skips that repo until the next pass and is not reported to
-  the host-wide breaker.
+  The request answers with the issue's full label set; if it carries any other
+  `loom:*` label (someone labelled the issue after the re-read), the captain
+  removes the `loom:triage` it just added (`intake.remove_triage`, facade
+  event `intake.triage_reverted`).
+- **Rate-limit breaker**: no pass while it is open, and the pass stops between
+  repos if it opens. A failed or shed listing is not reported to it.
 
-In the forge-call ledger the pass is `intake.list_open`, `intake.recheck` and
-`intake.add_triage`; with the singleton on, only the captain books them.
+In the forge-call ledger the pass is `intake.list_open`, `intake.recheck`,
+`intake.add_triage` and `intake.remove_triage`; with the singleton on, only
+the captain books them.
 
 **Mixed-version safety.** The key defaults off and older daemons ignore it, so
 an older host keeps running intake per host unless `LOOM_INTAKE_RECONCILE=0`
@@ -7263,13 +7299,19 @@ label: the write is idempotent and each is preceded by a re-read.
 `LOOM_INTAKE_RECONCILE=0`:
 
 1. Deploy a daemon with this feature everywhere.
-2. Enable on the captain: set `fleet.intakeReconcile.singleton: true` and
-   remove `LOOM_INTAKE_RECONCILE=0` from the captain's environment only.
-3. Confirm: the captain lists `intake-reconcile` in
-   `host.health.armed_singleton_jobs`, its `loom-daemon forge calls --by caller`
-   shows `intake.list_open` answering mostly `304`, and no other host books an
-   `intake.*` row.
-4. Remove `LOOM_INTAKE_RECONCILE=0` from the other hosts. They stay off because
+2. Verify coverage: the workspaces registered on the captain must include
+   every repo any dispatcher manages. Register the missing ones on the captain
+   first.
+3. Set `fleet.intakeReconcile.singleton: true` **fleet-wide** (the shared
+   fleet config every host reads, not only the captain's host tier), then
+   remove `LOOM_INTAKE_RECONCILE=0` from the captain's environment only. A
+   host that does not see the key runs intake per host as soon as its own
+   variable is removed.
+4. Confirm: the captain lists `intake-reconcile` in
+   `host.health.armed_singleton_jobs`, logs the covered slugs you expect, and
+   is the only host whose `loom-daemon forge calls --by caller` books
+   `intake.*` rows.
+5. Remove `LOOM_INTAKE_RECONCILE=0` from the other hosts. They stay off because
    the key, not the environment, now stands them down. A host still on an older
    daemon must keep the variable until it is upgraded.
 
