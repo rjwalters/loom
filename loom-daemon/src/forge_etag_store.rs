@@ -39,6 +39,7 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 
+use crate::forge_identity::served;
 use crate::forge_listing::{parse_http_response, HttpResponse};
 use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
 use crate::proc_exec::Completion;
@@ -235,6 +236,11 @@ pub(crate) struct ConditionalRead {
     pub(crate) op: crate::forge_call_stats::ForgeOp,
     /// The read's deadline; `None` = [`FETCH_TIMEOUT`].
     pub(crate) timeout: Option<std::time::Duration>,
+    /// The URL names ONE item (`issues/{n}`, `pulls/{n}`): a reader `404`
+    /// backed by recent coverage evidence for the same repo and endpoint
+    /// family is the item's answer, not a Coverage failure (W6,
+    /// [`crate::forge_identity::served`]).
+    pub(crate) item_scoped: bool,
 }
 
 impl ConditionalRead {
@@ -244,7 +250,15 @@ impl ConditionalRead {
             caller,
             op,
             timeout: None,
+            item_scoped: false,
         }
+    }
+
+    /// Mark this read item-scoped (see [`ConditionalRead::item_scoped`]).
+    #[must_use]
+    pub(crate) const fn item_scoped(mut self) -> Self {
+        self.item_scoped = true;
+        self
     }
 
     /// This read bounded by `timeout` instead of [`FETCH_TIMEOUT`] (`None`
@@ -314,6 +328,8 @@ pub(crate) fn fetch_conditional_via(
         .into_credential()
     });
     let reader_dir = reader.as_ref().map(|(dir, _)| dir.as_path());
+    let family = served::endpoint_family(url);
+    let now = std::time::SystemTime::now;
     let http_ok = |r: &FetchResult| {
         r.0.success() || matches!(r.1.as_ref().map(|h| h.status), Some(200 | 304))
     };
@@ -330,7 +346,7 @@ pub(crate) fn fetch_conditional_via(
                     target.repo.as_deref().unwrap_or_default(),
                 )
             });
-            run_fetch_with(
+            let fetched = run_fetch_with(
                 site,
                 gh_bin,
                 cwd,
@@ -341,10 +357,31 @@ pub(crate) fn fetch_conditional_via(
                 dir.is_some(),
                 role,
                 bucket.as_deref(),
-            )
+            );
+            if let (Some((_, app_id)), Some(_), Ok(r)) = (reader.as_ref(), dir, fetched.as_ref()) {
+                if matches!(r.1.as_ref().map(|h| h.status), Some(200 | 304)) {
+                    served::note_reader_served(app_id, repo_of(target), family, now());
+                }
+            }
+            fetched
         },
         http_ok,
-        reader_failure,
+        |r: &FetchResult| {
+            let failure = reader_failure(r)?;
+            let item_404 = site.item_scoped
+                && failure == crate::forge_identity::Failure::Coverage
+                && r.1.as_ref().map(|h| h.status) == Some(404);
+            let covered = reader.as_ref().is_some_and(|(_, app_id)| {
+                served::reader_recently_served(app_id, repo_of(target), family, now())
+            });
+            if item_404 && covered {
+                // The reader covers this repo's `family`: the 404 is the
+                // item's own answer. No writer retry, no withdrawal (W6).
+                crate::forge_call_stats::counters::bump(served::ITEM_SCOPED_404);
+                return None;
+            }
+            Some(failure)
+        },
         |failure, _| {
             if let Some((_, app_id)) = &reader {
                 let repo = target.repo.as_deref().unwrap_or_default();
@@ -353,6 +390,11 @@ pub(crate) fn fetch_conditional_via(
             }
         },
     )
+}
+
+/// `target`'s `owner/repo`, or `""` (a placeholder read has no reader).
+fn repo_of(target: &Target) -> &str {
+    target.repo.as_deref().unwrap_or_default()
 }
 
 /// What a failed conditional read says about its credential. The parsed
