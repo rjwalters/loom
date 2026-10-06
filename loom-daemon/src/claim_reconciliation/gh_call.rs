@@ -67,12 +67,14 @@ fn build(
 /// `forge_call_stats` row is not `unknown`. One table for both families keeps
 /// a name's mapping in exactly one place.
 ///
-/// `None` is deliberate, not debt, for: issue views (`claim.labels`,
-/// `claim.issue_labels`, `claim.issue_state`, `heal.issue_view`,
-/// `model.issue_body*`) and PR-by-label listings (`claim.pr_list_claimed`,
-/// `verdict.pr_list`, `*.pr_list`, `snapshot.*`) — the inventory has no
-/// single-issue-view or PR-list-by-label row — plus the mixed-purpose
-/// `*.pr_view` dispatchers and `star.api` (a generic `gh api` passthrough).
+/// `None` is deliberate, not debt, for: GraphQL issue views (`claim.labels`,
+/// `claim.issue_labels`, `claim.issue_state`, `model.issue_body*`) and
+/// PR-by-label listings (`claim.pr_list_claimed`, `verdict.pr_list`,
+/// `*.pr_list`, `snapshot.*`) — the inventory has no single-issue-view or
+/// PR-list-by-label row — plus `star.api` (a generic `gh api` passthrough).
+/// `heal.issue_view` is absent because it is an ETag'd REST read that names
+/// its own `issue.view-state` op (#10507); the `*.pr_view` dispatch arms are
+/// gone (#10507).
 #[must_use]
 pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
     Some(match op {

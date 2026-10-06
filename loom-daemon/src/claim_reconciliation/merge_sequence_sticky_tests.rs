@@ -287,7 +287,7 @@ fn fake_gh(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
          'api '*/pulls/*) cat \"{d}/pull-${{2##*/}}.json\" || exit 1 ;;\n\
          'api --include') n=\"${{3%/files*}}\"; n=\"${{n##*/}}\"; [ -f \"{d}/files-$n.json\" ] || exit 1;\
            printf 'HTTP/2.0 200 OK\\r\\n\\r\\n'; cat \"{d}/files-$n.json\" ;;\n\
-         'pr view') cat \"{d}/labels-$3.txt\" 2>/dev/null || true ;;\n\
+         'pr view') echo FORBIDDEN >> \"{log}\"; exit 97 ;;\n\
          'pr comment'|'pr edit') exit 0 ;;\n\
          *) exit 1 ;;\nesac\n",
         log = log.display(),
@@ -378,7 +378,10 @@ fn tick(
     if let Some(v) = prev {
         std::env::set_var(MERGE_SEQUENCE_ENABLED_ENV, v);
     }
-    (stats, std::fs::read_to_string(&log).unwrap())
+    let calls = std::fs::read_to_string(&log).unwrap();
+    // #10507: the label side comes from the listing — no `gh pr view` read.
+    assert!(!calls.contains("FORBIDDEN"), "a GraphQL read was attempted:\n{calls}");
+    (stats, calls)
 }
 
 #[cfg(unix)]

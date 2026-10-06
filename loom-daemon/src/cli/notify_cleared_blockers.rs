@@ -14,13 +14,23 @@
 //!
 //! # Reused, not re-parsed
 //!
-//! Population: [`super::stale_blocked::list_blocked`], the fleet-wide
-//! advisory's own enumeration. Filter: [`cited_among`], which runs
-//! `dep_recheck`'s existing prose extractor and `## Dependencies` parser over
-//! one body+comments read per artifact. Classification: the advisory's own
-//! [`super::stale_blocked::gather`] + [`classify`], only for the artifacts
-//! that cite a closed number. No second reference parser exists here
-//! (`.loom/docs/shell-language-policy.md`).
+//! Population, text and evidence: [`batch`]'s REST + ETag gatherer, the one
+//! `check-stale-blocked` runs, through [`notify::gather_cited`] (#10515). That
+//! filter runs [`loom_daemon::stale_blocked::cited_among`] (`dep_recheck`'s
+//! prose extractor and `## Dependencies` parser) over each artifact's text, so
+//! the closing-PR and blocker-state reads run only for the artifacts that cite
+//! a closed number. Classification: the advisory's own [`classify`]. No second
+//! reference parser exists here (`.loom/docs/shell-language-policy.md`).
+//!
+//! # Cost (#10515)
+//!
+//! This runs once per merge. The per-artifact `gh issue view` gatherer it
+//! used to run cost one GraphQL read per open `loom:blocked` artifact per
+//! merge, plus three or more per citer — thousands of points a day. Now: one
+//! ETag'd REST listing, a comment walk only where there are comments (mostly
+//! `304`s, and warmed by the sweep's `check-stale-blocked` pass), and at most
+//! one GraphQL point per 100 citers. The one remaining GraphQL read is `--pr`'s
+//! closing references.
 //!
 //! # This command WRITES, unlike `check-stale-blocked`
 //!
@@ -46,14 +56,11 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use loom_daemon::cmd_out::CmdOutcome;
-use loom_daemon::dep_recheck::{extract, forge};
 use loom_daemon::script_helpers::run_gh;
-use loom_daemon::stale_blocked::{cited_among, classify, Artifact, Verdict};
+use loom_daemon::stale_blocked::notify::{self, marker_for};
+use loom_daemon::stale_blocked::{batch, budget, classify, Artifact, Verdict};
 
-use super::stale_blocked::{gather, list_blocked, DEFAULT_LIMIT};
-
-/// The idempotency marker's prefix. Rendered as `{MARKER_PREFIX}<N> -->`.
-const MARKER_PREFIX: &str = "<!-- loom:blocker-cleared:#";
+use super::stale_blocked::DEFAULT_LIMIT;
 
 #[derive(clap::Args)]
 pub(crate) struct NotifyClearedBlockersArgs {
@@ -125,104 +132,55 @@ impl NotifyClearedBlockersArgs {
         closed.sort_unstable();
         closed.dedup();
 
-        let mut kinds = vec![Artifact::Issue];
-        if !self.no_prs {
-            kinds.push(Artifact::Pr);
+        let mut forge = batch::GhStaleBlockedForge::new(&root, repo);
+        let fleet = loom_daemon::forge_identity::FleetLogins::for_root(&root);
+        let opts = batch::Options {
+            limit: self.limit,
+            no_prs: self.no_prs,
+            floor: budget::Floor::default(),
+        };
+        let notify::CitedGathering {
+            gathering,
+            mut cited,
+        } = notify::gather_cited(&mut forge, &fleet, opts, &closed);
+        if let Some(why) = gathering.enumerate_error {
+            unread.push(format!("population: {why}"));
         }
 
-        let mut candidates: Vec<(Artifact, i64)> = Vec::new();
-        for kind in kinds {
-            let (rows, err) = list_blocked(kind, &root, repo, self.limit);
-            if let Some(why) = err {
-                unread.push(format!("{} population: {why}", kind.label()));
-            }
-            candidates.extend(rows.into_iter().map(|r| (kind, r.number)));
-        }
-
-        // Bounded-parallel reads: this runs inside merge-pr.sh's post-merge
-        // path, where a serial scan of a ~20-artifact population measured
-        // ~70s. Order is preserved (chunks are joined in order).
-        let dry_run = self.dry_run;
         let mut notified: Vec<Notified> = Vec::new();
-        for chunk in candidates.chunks(READ_CONCURRENCY) {
-            let outcomes: Vec<Outcome> = std::thread::scope(|s| {
-                let handles: Vec<_> = chunk
-                    .iter()
-                    .map(|&(kind, number)| {
-                        let (closed, root) = (&closed, &root);
-                        s.spawn(move || evaluate(kind, number, closed, repo, root, dry_run))
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or(Outcome::Skip))
-                    .collect()
-            });
-            for o in outcomes {
-                match o {
-                    Outcome::Skip => {}
-                    Outcome::Unread(why) => unread.push(why),
-                    Outcome::Notified(n) => notified.push(n),
+        for g in gathering.items {
+            let evidence = match g.evidence {
+                Ok(e) => e,
+                Err(why) => {
+                    unread.push(format!("{} #{}: {why}", g.kind.label(), g.number));
+                    continue;
                 }
-            }
+            };
+            let Some(cited) = cited.remove(&(g.kind, g.number)) else {
+                continue;
+            };
+            let reasons = match classify(&evidence) {
+                Verdict::Stale(reasons) => reasons,
+                Verdict::Superseded { cleared, .. } => cleared,
+                // StillBlocked: the forge does not (yet) read the cited number
+                // as resolved. Undocumented cannot follow a citation. Neither
+                // is a cleared block worth a comment.
+                Verdict::Undocumented | Verdict::StillBlocked => continue,
+            };
+            let posted =
+                !self.dry_run && post_comment(g.kind, g.number, &cited, &reasons, repo, &root);
+            notified.push(Notified {
+                kind: g.kind,
+                number: g.number,
+                cited,
+                reasons,
+                posted,
+            });
         }
 
         report(&notified, &closed, &unread, self.dry_run, self.quiet);
         Ok(())
     }
-}
-
-/// How many artifacts are read concurrently.
-const READ_CONCURRENCY: usize = 8;
-
-enum Outcome {
-    Skip,
-    Unread(String),
-    Notified(Notified),
-}
-
-/// Evaluate one open `loom:blocked` artifact against the closed set, posting
-/// the comment unless `dry_run`.
-fn evaluate(
-    kind: Artifact,
-    number: i64,
-    closed: &[i64],
-    repo: Option<&str>,
-    root: &Path,
-    dry_run: bool,
-) -> Outcome {
-    let unread = |why: String| Outcome::Unread(format!("{} #{number}: {why}", kind.label()));
-    let input = match fetch_input(kind, number, repo, root) {
-        Ok(i) => i,
-        Err(why) => return unread(why),
-    };
-    let cited: Vec<i64> = cited_among(kind, &input, closed)
-        .into_iter()
-        .filter(|n| !has_marker(&input, *n))
-        .collect();
-    if cited.is_empty() {
-        return Outcome::Skip;
-    }
-    let evidence = match gather(kind, number, repo, root) {
-        Ok(e) => e,
-        Err(why) => return unread(why),
-    };
-    let reasons = match classify(&evidence) {
-        Verdict::Stale(reasons) => reasons,
-        Verdict::Superseded { cleared, .. } => cleared,
-        // StillBlocked: the forge does not (yet) read the cited number as
-        // resolved. Undocumented cannot follow a citation. Neither is a
-        // cleared block worth a comment.
-        Verdict::Undocumented | Verdict::StillBlocked => return Outcome::Skip,
-    };
-    let posted = !dry_run && post_comment(kind, number, &cited, &reasons, repo, root);
-    Outcome::Notified(Notified {
-        kind,
-        number,
-        cited,
-        reasons,
-        posted,
-    })
 }
 
 /// The issues a merged PR closed, per the forge's own `closingIssuesReferences`.
@@ -264,29 +222,6 @@ fn parse_close_targets(stdout: &[u8]) -> Result<Vec<i64>, String> {
     serde_json::from_slice::<View>(stdout)
         .map(|v| v.refs.into_iter().map(|r| r.number).collect())
         .map_err(|e| format!("unreadable closingIssuesReferences JSON: {e}"))
-}
-
-fn fetch_input(
-    kind: Artifact,
-    number: i64,
-    repo: Option<&str>,
-    root: &Path,
-) -> Result<extract::Input, String> {
-    match kind {
-        Artifact::Issue => forge::fetch_body_and_comments(number, repo, root),
-        Artifact::Pr => forge::fetch_pr_body_and_comments(number, repo, root),
-    }
-    .map_err(|e| e.to_string())
-}
-
-fn marker_for(closed: i64) -> String {
-    format!("{MARKER_PREFIX}{closed} -->")
-}
-
-/// Whether this artifact already carries `closed`'s marker (idempotency).
-fn has_marker(input: &extract::Input, closed: i64) -> bool {
-    let marker = marker_for(closed);
-    input.body.contains(&marker) || input.comments.iter().any(|c| c.body.contains(&marker))
 }
 
 /// The notification comment. Pure, so the wording is unit-tested.
