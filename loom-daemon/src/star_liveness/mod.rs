@@ -77,6 +77,7 @@ pub mod inherit;
 pub mod inherited_star;
 pub mod intents;
 pub mod landing;
+pub mod parent_link;
 pub mod progress;
 pub mod queue;
 pub mod refusal;

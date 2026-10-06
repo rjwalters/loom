@@ -262,10 +262,12 @@
 # starts from Curator), and may run one starred sweep over the concurrency
 # cap. Skip/park labels still win: a starred issue carrying loom:blocked,
 # loom:operator-only, loom:operator-decision or loom:operator is never
-# dispatched. Applied by: humans (directly or via the loom-ui star). Removed
-# by: humans.
+# dispatched. Applied by: humans (directly or via the loom-ui star), and, for the
+# children of a starred parent, inherited (#10012: `create-issue.sh --parent`
+# stars a new child; the audit comment names `inherited_from=#P`). Removed by:
+# humans; a star propagation applied goes with the parent's star.
 - name: loom:operator-priority
-  description: "Land ASAP, ahead of all other work (not a hold). Applied by: humans, directly or via loom-ui star."
+  description: "Land ASAP, not a hold. Applied by: humans/loom-ui; inherited by a starred parent's children"
   color: "CA8A04"  # yellow-600 - matches loom-ui's star
 
 # loom:operator-high-priority (#10307) is operator priority LEVEL 2, the

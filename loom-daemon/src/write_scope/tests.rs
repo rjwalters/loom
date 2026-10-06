@@ -788,6 +788,10 @@ fn daemon_write_paths_are_scoped() {
         ("worktree_ops/gh.rs", Gated),
         ("star_liveness/task.rs", Gated),
         (
+            "star_liveness/parent_link.rs",
+            Via("cli/forge_action.rs", "`forge parent link` is vetted via write_target"),
+        ),
+        (
             "star_liveness/forge.rs",
             Via("star_liveness/task.rs", "repos pass the task's gate"),
         ),
