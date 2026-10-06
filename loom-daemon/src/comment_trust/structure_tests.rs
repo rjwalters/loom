@@ -69,6 +69,10 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "parked issues' own closing refs + comment text for an advisory, not the linked-PR guard",
     ),
     (
+        "stale_blocked/release.rs",
+        "#10556 hold/idempotency reader: comments from ReleaseForge, trusted via policy.trusts_json",
+    ),
+    (
         "sweep_registry/guards.rs",
         "writer; reader in read_lease_comments (FETCH_SITES)",
     ),
@@ -158,6 +162,10 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     ("stale_blocked/batch.rs", "comments", ""),
     ("stale_blocked/batch.rs", "closing_refs_query", ""),
     ("stale_blocked/batch.rs", "parse_closing_refs", ""),
+    // #10556's release pass: the raw listing goes to `release::execute`, which
+    // trusts each comment through `policy.trusts_json` before reading a hold
+    // or idempotency marker from it.
+    ("stale_blocked/release_gh.rs", "comments", ""),
 ];
 
 /// Production code of a source file: inline test modules cut off, comment

@@ -801,6 +801,7 @@ fn daemon_write_paths_are_scoped() {
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
+        ("stale_blocked/release_gh.rs", Gated),
         (
             "sweep_registry/guards.rs",
             Via(DISPATCH, "claim flip + lease of a dispatched sweep"),
