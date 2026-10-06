@@ -394,6 +394,19 @@ assert_contains "$LAST_STDERR" "1 unchecked line(s) carry no readable ref" \
 assert_not_contains "$LAST_STDERR" "STALE BLOCK" \
     "T1h12: an all-unparseable unchecked checklist is not a stale block"
 
+# 1b-phrase. A dependency phrase after the box (`- [ ] Blocked by #N`) is a
+# checklist entry, never also prose: its merged ref leaves the box unticked.
+set_population '[{"number":185,"title":"Phrase after the box"}]'
+issue_fixture 185 "## Dependencies
+
+- [ ] Blocked by #176: ratification remains pending
+"
+run_check
+assert_contains "$LAST_STDERR" "CHECKLIST REFS RESOLVED, BOXES UNTICKED" \
+    "T1h13: an unticked 'Blocked by #N' checklist line is reported under BOXES UNTICKED"
+assert_not_contains "$LAST_STDERR" "STALE BLOCK" \
+    "T1h14: an unticked 'Blocked by #N' checklist line is not also read as stale prose"
+
 # 1c. A linked closing PR that has merged. #9274: a closing PR answers "what
 # closes this issue", not "what blocks it", so it is no blocker reference.
 # With nothing else cited the issue is undocumented, never stale.

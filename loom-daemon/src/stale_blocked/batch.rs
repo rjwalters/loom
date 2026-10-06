@@ -333,9 +333,16 @@ fn read_text(
     };
     let input = extract::Input { body, comments };
     // A qualified park-record blocker is read in its own repo via `declared`,
-    // never as a local `#N` (#10443).
+    // never as a local `#N` (#10443). An issue's `## Dependencies` checklist
+    // lines are judged by the checklist rule alone, never also as prose: a
+    // `- [ ] Blocked by #N` line whose ref merged is Unticked, not Stale (#9274).
+    let prose_body = if kind == Artifact::Issue {
+        named::mask_checklist_lines(&input.body)
+    } else {
+        input.body.clone()
+    };
     let masked = extract::Input {
-        body: crate::park_record::mask_qualified(&input.body),
+        body: crate::park_record::mask_qualified(&prose_body),
         comments: input.comments.clone(),
     };
     p.prose = extract::extract_with(&masked, fleet)
