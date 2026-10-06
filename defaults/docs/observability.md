@@ -607,9 +607,15 @@ under the label is not mounted, or a mount is no longer registered (a
 deregistered repository that Codex can still write with its own sandbox off).
 Private-clone containers never get this verdict. If docker cannot be queried at all
 (CLI missing, Docker daemon unreachable, timeout), nothing about any container
-is known: the tracker holds its last state, no WARN and no gauge point are
-emitted, and one INFO line marks the transition each way. Nothing reads that
-as `missing`. A tick refused because the container was not running ends as
+is known. The tracker holds each account's last state and no gauge point is
+emitted, so nothing reads that as `missing`. Because it is still a host-wide
+Codex outage on a host with session-managed accounts, the daemon WARNs once
+when docker becomes unqueryable, repeats that every 15 min while it lasts, and
+WARNs again when docker answers. A failed `docker inspect` counts as an answer
+only when every error says the container does not exist. Readers of the
+published snapshot on the dispatch path should use `LATEST_MAX_AGE` (120 s, two
+watch intervals) and treat an older, absent or unavailable snapshot as "cannot
+observe". A tick refused because the container was not running ends as
 `category=SESSION_DOWN` (exit 78 kept), carried as
 `loom.admission.reason="session-down"` on the `loom.role_attempt` span; it
 records no account hold.
