@@ -723,6 +723,9 @@ fn structural_evidence(base: &[&str], pr: &[&str]) -> ScopedEvidence {
     }
 }
 
+/// How `assess_scoped` names a composite component: `"{ctx} ({component})"`.
+const ROLE_PREFIX_COMPOSITE: &str = "Structural Checks (Role Prompt Prefix Ratchet)";
+
 fn structural_verdict(base: &[&str], pr: &[&str]) -> Verdict {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     // Green and re-dated after the tip: only the input predicate can refuse.
@@ -741,20 +744,36 @@ fn structural_verdict(base: &[&str], pr: &[&str]) -> Verdict {
 
 #[test]
 fn role_prefix_false_coupling_no_longer_stales_the_structural_composite() {
-    // Measured tuple: base daemon-reference vs PR eta docs, and ETA docs vs the
-    // Judge prompt, plus the installed mirror. No component reads these jointly.
-    for (base, pr) in [
-        (&["defaults/docs/daemon-reference.md"][..], &["defaults/docs/eta.md"][..]),
-        (&["defaults/docs/eta.md"][..], &["defaults/.claude/commands/loom/judge.md"][..]),
-        (&[".loom/docs/eta.md"][..], &["defaults/.claude/commands/loom/judge.md"][..]),
-        (&["defaults/docs/eta.md"][..], &["CLAUDE.md"][..]),
+    // Measured tuples: base daemon-reference vs PR eta docs, ETA docs vs the
+    // Judge prompt, plus the installed mirror and CLAUDE.md. The Role Prompt
+    // Prefix Ratchet no longer couples them, but the composite still refuses
+    // each one via a later component (Docs/Defaults Parity or Dangling Link).
+    // Pinning that component makes a future narrowing of those checks a
+    // visible, deliberate test change rather than a silent one.
+    for (base, pr, component) in [
+        (
+            &["defaults/docs/daemon-reference.md"][..],
+            &["defaults/docs/eta.md"][..],
+            "Docs/Defaults Parity Check",
+        ),
+        (
+            &["defaults/docs/eta.md"][..],
+            &["defaults/.claude/commands/loom/judge.md"][..],
+            "Dangling Link Check",
+        ),
+        (
+            &[".loom/docs/eta.md"][..],
+            &["defaults/.claude/commands/loom/judge.md"][..],
+            "Dangling Link Check",
+        ),
+        (&["defaults/docs/eta.md"][..], &["CLAUDE.md"][..], "Dangling Link Check"),
     ] {
         let v = structural_verdict(base, pr);
-        // Another component may legitimately couple some of these pairs
-        // (e.g. a link/parity check); assert only that the REASON is not the
-        // role-prefix component.
-        if let Verdict::StaleInputs { check, .. } = &v {
-            assert_ne!(check, "Role Prompt Prefix Ratchet", "{base:?} vs {pr:?}");
+        match v {
+            Verdict::StaleInputs { check, .. } => {
+                assert_eq!(check, format!("Structural Checks ({component})"), "{base:?} vs {pr:?}");
+            }
+            v => panic!("{base:?} vs {pr:?}: expected StaleInputs, got {v:?}"),
         }
     }
 }
@@ -776,7 +795,7 @@ fn clearing_the_role_prefix_false_component_does_not_clear_another_stale_one() {
     let v = structural_verdict(&["defaults/docs/eta.md"], &["defaults/docs/eta.md"]);
     match v {
         Verdict::StaleInputs { check, reason, .. } => {
-            assert_ne!(check, "Role Prompt Prefix Ratchet");
+            assert_ne!(check, ROLE_PREFIX_COMPOSITE);
             assert!(reason.clause.contains("same scanned file"), "{reason:?}");
         }
         v => panic!("a same-file pair must stay stale, got {v:?}"),
@@ -798,13 +817,13 @@ fn clearing_the_role_prefix_false_component_does_not_clear_another_stale_one() {
         &["defaults/docs/eta.md", "scripts/new-helper.sh"],
     );
     match v {
-        Verdict::StaleInputs { check, .. } => assert_ne!(check, "Role Prompt Prefix Ratchet"),
+        Verdict::StaleInputs { check, .. } => assert_ne!(check, ROLE_PREFIX_COMPOSITE),
         v => panic!("another stale component must still refuse, got {v:?}"),
     }
 }
 
 #[test]
-fn role_prefix_missing_evidence_and_red_ci_still_fail_closed() {
+fn role_prefix_missing_evidence_applies_time_rule_and_red_ci_is_left_to_the_forge() {
     let base_tip: DateTime<Utc> = INCIDENT_BASE_TIP.parse().unwrap();
     // No evidence: the time rule applies and a pre-tip run is stale.
     let old = vec![run(
