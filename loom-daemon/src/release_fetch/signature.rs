@@ -171,6 +171,35 @@ pub struct VerifyResult {
     /// downgrade). `None` off-darwin: there is no destination-signature
     /// comparison there.
     pub had_authority: Option<bool>,
+    /// Which verifier actually succeeded, and what it actually checked
+    /// (#10470). `Some` exactly where `outcome` is [`Outcome::Verified`]
+    /// because a verifier RAN and passed; `None` on every skip, failure and
+    /// on the unrecognized-target pass-through (nothing was verified there).
+    /// The required-mode evidence line is built from this alone, so it can
+    /// never report an identity no verifier checked.
+    pub verified_by: Option<VerifiedBy>,
+}
+
+/// What a successful verification actually established (#10470).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedBy {
+    /// macOS `codesign --verify --strict` passed. No signer, team or GitHub
+    /// workflow identity was established by this check.
+    Codesign,
+    /// `cosign verify-blob --key` passed against a public key. No signer or
+    /// GitHub workflow identity was established -- only possession of the key.
+    CosignKey,
+    /// Keyless, against one exact certificate identity
+    /// (`--certificate-identity`).
+    KeylessExactIdentity { identity: String, issuer: String },
+    /// Keyless, against a certificate-identity regexp
+    /// (`--certificate-identity-regexp`). `workflow_pinned` is true only when
+    /// an approved-workflow pin was folded into `regexp` and so enforced.
+    KeylessIdentityRegexp {
+        regexp: String,
+        issuer: String,
+        workflow_pinned: bool,
+    },
 }
 
 /// Inputs to one verification.
@@ -190,11 +219,23 @@ pub struct VerifyInputs<'a> {
 /// Verify `inputs.bin_path`'s signature, present-only.
 #[must_use]
 pub fn verify(inputs: &VerifyInputs<'_>) -> VerifyResult {
+    verify_with_workflow(inputs, None)
+}
+
+/// [`verify`] with an optional approved-workflow pin for the derived keyless
+/// identity (#10470; see [`cosign::identity_regexp_pinned`]). `None` is
+/// exactly [`verify`]. Ignored when an exact identity is supplied through
+/// `inputs.cosign_identity_env`, which is already stricter.
+#[must_use]
+pub fn verify_with_workflow(
+    inputs: &VerifyInputs<'_>,
+    approved_workflow: Option<&str>,
+) -> VerifyResult {
     if inputs.target.ends_with("-apple-darwin") {
         return verify_darwin(inputs.bin_path);
     }
     if inputs.target.contains("-linux-") {
-        return verify_linux(inputs);
+        return verify_linux(inputs, approved_workflow);
     }
     // An unrecognized target verifies nothing rather than failing — the
     // shell's `*) return 0 ;;`.
@@ -203,6 +244,7 @@ pub fn verify(inputs: &VerifyInputs<'_>) -> VerifyResult {
         state: Some(SignatureState::Skipped),
         message: String::new(),
         had_authority: None,
+        verified_by: None,
     }
 }
 
@@ -239,6 +281,7 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
                 ),
             },
             had_authority: None,
+            verified_by: None,
         };
     }
 
@@ -268,6 +311,7 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
                       (checksum is unconditional; signature is optional)."
                 .to_string(),
             had_authority: Some(had_authority),
+            verified_by: None,
         };
     }
 
@@ -290,6 +334,7 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
             state: Some(SignatureState::Verified),
             message: format!("macOS codesign verification passed for {name}."),
             had_authority: Some(had_authority),
+            verified_by: Some(VerifiedBy::Codesign),
         },
         // Ran to completion and reported a bad signature: tamper evidence,
         // still a hard block.
@@ -302,6 +347,7 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
                  evidence."
             ),
             had_authority: Some(had_authority),
+            verified_by: None,
         },
         // Never answered (timed out, or its output could not be collected):
         // UNKNOWN. A loud skip like absent tooling — never a block, and never
@@ -315,6 +361,7 @@ fn verify_darwin(bin_path: &Path) -> VerifyResult {
                  verified)."
             ),
             had_authority: Some(had_authority),
+            verified_by: None,
         },
     }
 }
@@ -328,7 +375,7 @@ fn cosign_available() -> bool {
     )
 }
 
-fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
+fn verify_linux(inputs: &VerifyInputs<'_>, approved_workflow: Option<&str>) -> VerifyResult {
     let name = file_name(inputs.bin_path);
 
     // No .sig asset published for this release (cosign secret was not
@@ -340,6 +387,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
             state: Some(SignatureState::Skipped),
             message: String::new(),
             had_authority: None,
+            verified_by: None,
         };
     };
     let sig_name = file_name(sig_path);
@@ -354,6 +402,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
                  already verified)."
             ),
             had_authority: None,
+            verified_by: None,
         };
     }
 
@@ -364,7 +413,11 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
         let (identity_flag, identity_desc) =
             match inputs.cosign_identity_env.filter(|v| !v.is_empty()) {
                 Some(exact) => ("--certificate-identity", exact.to_string()),
-                None => match cosign::identity_regexp(inputs.repo_slug, inputs.tag) {
+                None => match cosign::identity_regexp_pinned(
+                    inputs.repo_slug,
+                    inputs.tag,
+                    approved_workflow,
+                ) {
                     Some(re) => ("--certificate-identity-regexp", re),
                     None => {
                         return VerifyResult {
@@ -377,6 +430,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
                              a block; checksum already verified)."
                         ),
                             had_authority: None,
+                            verified_by: None,
                         };
                     }
                 },
@@ -404,6 +458,18 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
                      {identity_desc}, issuer {issuer})."
                 ),
                 had_authority: None,
+                verified_by: Some(if identity_flag == "--certificate-identity" {
+                    VerifiedBy::KeylessExactIdentity {
+                        identity: identity_desc,
+                        issuer,
+                    }
+                } else {
+                    VerifiedBy::KeylessIdentityRegexp {
+                        regexp: identity_desc,
+                        issuer,
+                        workflow_pinned: approved_workflow.is_some_and(|w| !w.trim().is_empty()),
+                    }
+                }),
             }
         } else {
             VerifyResult {
@@ -415,6 +481,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
                      {issuer})."
                 ),
                 had_authority: None,
+                verified_by: None,
             }
         };
     }
@@ -431,6 +498,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
                  block; checksum already verified)."
             ),
             had_authority: None,
+            verified_by: None,
         };
     };
 
@@ -449,6 +517,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
             state: Some(SignatureState::Verified),
             message: format!("cosign signature verification passed for {name}."),
             had_authority: None,
+            verified_by: Some(VerifiedBy::CosignKey),
         }
     } else {
         VerifyResult {
@@ -460,6 +529,7 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
                 pubkey.display()
             ),
             had_authority: None,
+            verified_by: None,
         }
     }
 }

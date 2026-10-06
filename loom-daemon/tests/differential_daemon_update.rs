@@ -818,28 +818,132 @@ fn port_bin() -> PathBuf {
 // Divergence classes — recognised by MECHANISM
 // ---------------------------------------------------------------------------
 
-/// No divergence class is recorded today: every frozen answer matches the
-/// port byte for byte.
-///
-/// The enum exists rather than being elided because the *shape* is the
-/// contract — a future divergence gets a variant whose doc comment states its
-/// MECHANISM and the direction of its risk, and [`classify`] must compute what
-/// that mechanism can produce and require the observed difference to be
-/// exactly that. A class recognised by a property of the input ("this case has
-/// a newline in it") is a hole shaped like a class.
+/// The 12-line `Environment:` block #10470 added to `--help` for the opt-in
+/// required-signature mode. It is spelled out here, independently of
+/// `help.txt`, so the class below verifies the EXACT intended text rather than
+/// "whatever the port prints".
+const REQUIRE_SIGNATURE_HELP_BLOCK: &str =
+    "  LOOM_DAEMON_UPDATE_REQUIRE_SIGNATURE  1/true/yes/on switches signature
+                         handling from the default \"present-only\" mode
+                         (#5054: an unsigned release or an unverifiable
+                         signature is a loud skip) to \"required\" mode
+                         (#10470): an unsigned release, or one whose
+                         signature cannot be checked on this host, is
+                         REFUSED before provisioning, with distinct
+                         messages. Default: off.
+  LOOM_DAEMON_UPDATE_APPROVED_WORKFLOW  Required-mode companion: pin the
+                         derived keyless identity to this workflow file
+                         (e.g. release.yml) instead of `[^@]+`. Default:
+                         unset.
+";
+
+/// The line the added block sits directly in front of in the help text.
+const HELP_BLOCK_ANCHOR: &str = "  LOOM_PID_FILE ";
+
+/// Divergence classes, each recognised by MECHANISM.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-enum Divergence {}
+enum Divergence {
+    /// MECHANISM: #10470 added documentation for the opt-in required-signature
+    /// mode to `--help`, which the frozen pre-port shell cannot contain. The
+    /// port's stdout must equal the shell's stdout with exactly
+    /// [`REQUIRE_SIGNATURE_HELP_BLOCK`] inserted immediately before the single
+    /// `LOOM_PID_FILE` entry. Exit code and stderr must be identical. Risk
+    /// direction: documentation only — the new variables default to off, so
+    /// no behaviour the shell had changes. Any other stdout/stderr/rc
+    /// difference (including a different or misplaced block) stays
+    /// unexplained.
+    HelpDocumentsRequireSignature,
+}
 
 /// Classify one difference, or return `Err` for "unexplained".
 ///
 /// stdout and stderr are classified independently — a half that no class
 /// explains is a finding whatever the other half did.
-#[allow(clippy::unnecessary_wraps)]
 fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
-    if shell.rc != port.rc || shell.stdout != port.stdout || shell.stderr != port.stderr {
+    if shell.rc != port.rc || shell.stderr != port.stderr {
         return Err(());
     }
-    Ok(Vec::new())
+    if shell.stdout == port.stdout {
+        return Ok(Vec::new());
+    }
+    let needle = format!("\n{HELP_BLOCK_ANCHOR}");
+    if shell.stdout.matches(&needle).count() != 1 {
+        return Err(());
+    }
+    let at = shell.stdout.find(&needle).ok_or(())? + 1;
+    let mut expected =
+        String::with_capacity(shell.stdout.len() + REQUIRE_SIGNATURE_HELP_BLOCK.len());
+    expected.push_str(&shell.stdout[..at]);
+    expected.push_str(REQUIRE_SIGNATURE_HELP_BLOCK);
+    expected.push_str(&shell.stdout[at..]);
+    if expected == port.stdout {
+        Ok(vec![Divergence::HelpDocumentsRequireSignature])
+    } else {
+        Err(())
+    }
+}
+
+/// The class admits exactly the intended addition and nothing else.
+#[test]
+fn the_help_divergence_class_is_narrow() {
+    let base = Answer {
+        rc: 0,
+        stdout: format!("Environment:\n  LOOM_X  x\n{HELP_BLOCK_ANCHOR}pid file\ntail\n"),
+        stderr: String::new(),
+    };
+    let with_block = |stdout: String| Answer {
+        stdout,
+        ..base.clone()
+    };
+    let good = with_block(base.stdout.replace(
+        &format!("\n{HELP_BLOCK_ANCHOR}"),
+        &format!("\n{REQUIRE_SIGNATURE_HELP_BLOCK}{HELP_BLOCK_ANCHOR}"),
+    ));
+    assert_eq!(classify(&base, &good), Ok(vec![Divergence::HelpDocumentsRequireSignature]));
+    assert_eq!(classify(&base, &base), Ok(Vec::new()));
+
+    // An extra unrelated change alongside the block.
+    let extra = with_block(format!("{}extra\n", good.stdout));
+    assert_eq!(classify(&base, &extra), Err(()));
+    // The block in the wrong place.
+    let misplaced = with_block(format!("{REQUIRE_SIGNATURE_HELP_BLOCK}{}", base.stdout));
+    assert_eq!(classify(&base, &misplaced), Err(()));
+    // A tampered block.
+    let tampered = with_block(good.stdout.replace("Default: off.", "Default: on."));
+    assert_eq!(classify(&base, &tampered), Err(()));
+    // Right stdout, but rc or stderr drifted.
+    assert_eq!(
+        classify(
+            &base,
+            &Answer {
+                rc: 1,
+                ..good.clone()
+            }
+        ),
+        Err(())
+    );
+    assert_eq!(
+        classify(
+            &base,
+            &Answer {
+                stderr: "boom\n".into(),
+                ..good.clone()
+            }
+        ),
+        Err(())
+    );
+    // A shell answer with no anchor cannot be explained by this class.
+    let anchorless = Answer {
+        stdout: "no env block\n".into(),
+        ..base.clone()
+    };
+    assert_eq!(
+        classify(
+            &anchorless,
+            &with_block(format!("{REQUIRE_SIGNATURE_HELP_BLOCK}no env block\n"))
+        ),
+        Err(())
+    );
 }
 
 // ---------------------------------------------------------------------------

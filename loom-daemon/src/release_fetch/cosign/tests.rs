@@ -96,3 +96,29 @@ fn tempdir() -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+// ---- #10470: approved-workflow identity pin ----
+
+#[test]
+fn pinned_none_or_empty_is_identical_to_the_unpinned_default() {
+    let base = identity_regexp("rjwalters/loom", "v1.0.0");
+    assert_eq!(identity_regexp_pinned("rjwalters/loom", "v1.0.0", None), base);
+    assert_eq!(identity_regexp_pinned("rjwalters/loom", "v1.0.0", Some("  ")), base);
+}
+
+#[test]
+fn pinned_workflow_replaces_the_wildcard_and_is_regex_escaped() {
+    let re = identity_regexp_pinned("rjwalters/loom", "v1.0.0", Some("release.yml")).unwrap();
+    assert_eq!(
+        re,
+        r"^https://github\.com/rjwalters/loom/\.github/workflows/release\.yml@refs/tags/v1\.0\.0$"
+    );
+    assert!(!re.contains("[^@]+"));
+    // Metacharacters in the policy value can only ever match literally.
+    let evil = identity_regexp_pinned("o/r", "v1", Some("a.*|b.yml")).unwrap();
+    assert!(evil.contains(r"a\.\*\|b\.yml@"), "{evil}");
+    // A leading slash is tolerated, and the pin needs both slug and tag.
+    let slash = identity_regexp_pinned("o/r", "v1", Some("/release.yml")).unwrap();
+    assert!(slash.contains("workflows/release"), "{slash}");
+    assert_eq!(identity_regexp_pinned("", "v1", Some("release.yml")), None);
+}

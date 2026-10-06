@@ -247,7 +247,9 @@ pub fn fetch_and_verify_artifact(
     repo_slug: &str,
     tag: &str,
 ) -> Result<FetchedArtifact, FetchFailure> {
-    use crate::release_fetch::{fetch_and_verify, FetchInputs, FetchOutcome};
+    use crate::release_fetch::{
+        fetch_and_verify_with_policy, FetchInputs, FetchOutcome, SignaturePolicy,
+    };
 
     let bin_name = format!("loom-daemon-{target}");
     let sha_name = format!("{bin_name}.sha256");
@@ -263,7 +265,7 @@ pub fn fetch_and_verify_artifact(
         cosign_oidc_issuer_env: std::env::var("LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER").ok(),
     };
 
-    match fetch_and_verify(&inputs) {
+    match fetch_and_verify_with_policy(&inputs, &SignaturePolicy::from_env()) {
         FetchOutcome::Verified {
             artifact,
             checksum_line,

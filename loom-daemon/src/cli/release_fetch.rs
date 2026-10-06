@@ -49,7 +49,9 @@
 //!      generic "Artifact download failed" line and exits 1.
 
 use anyhow::Result;
-use loom_daemon::release_fetch::{fetch_and_verify, FetchInputs, FetchOutcome};
+use loom_daemon::release_fetch::{
+    fetch_and_verify_with_policy, FetchInputs, FetchOutcome, SignaturePolicy,
+};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -94,7 +96,7 @@ impl ReleaseFetchArgs {
             cosign_oidc_issuer_env: std::env::var("LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER").ok(),
         };
 
-        match fetch_and_verify(&inputs) {
+        match fetch_and_verify_with_policy(&inputs, &SignaturePolicy::from_env()) {
             FetchOutcome::Verified {
                 artifact,
                 checksum_line,

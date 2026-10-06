@@ -10,6 +10,7 @@ value. Safe to commit: every row below is a placeholder name, not a secret.
 
 | Purpose | Reference | Usage |
 |---|---|---|
+| Cloudflare D1 `loom-fleet-telemetry`: sweep-facts rollup and `landed-size.sql` (#9934, #10066) | AWS SSM `/dev/cloudflare/api-token-joseph` (us-east-1) → env `CLOUDFLARE_API_TOKEN`; account env `CLOUDFLARE_ACCOUNT_ID=a7a402ccb9616532d8f4ee64447affe9` (2amlogic, non-secret) | inject into the one `npx wrangler@4 d1 execute loom-fleet-telemetry --remote …` command's env, never print; the token also carries Workers/Pages write (D1 access is account-wide), so use it for D1 only |
 | Gitea qualification forge origin (#9769) | env var `GITEA_QUAL_INSTANCE_URL` | non-secret; base for API URLs (loopback-only — run on the host or through its SSH tunnel) |
 | Gitea qualification org slug (#9769) | env var `GITEA_QUAL_ORG` | the qualification org |
 | Gitea qualification run namespace (#9769) | env var `GITEA_QUAL_RUN_NS` | prefix for disposable resources created by one run |

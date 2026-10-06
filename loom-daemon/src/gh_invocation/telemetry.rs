@@ -15,6 +15,10 @@
 //! - **Without one** (an ad-hoc daemon tick): its own root, tag
 //!   `loom.github.invoke.*`, keyed by the same facts. `context_source=missing`.
 //!
+//! Besides process truth (`github.outcome`, `github.exit_code`), the span
+//! carries what GitHub billed — HTTP status, `304`, request count, billed
+//! resource and credential identity ([`super::billing`], #10343).
+//!
 //! `github.invocation` is `<pid>.<seq>` — the process id and a process-local
 //! counter — so two invocations that start in the same clock tick under the
 //! same parent never share a span ID. Every derivation input is an attribute
@@ -61,6 +65,16 @@ pub const SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "github.launcher",
     "github.api",
     "context_source",
+    // #10343: what GitHub billed ([`super::billing::Billing`]).
+    "github.http.status",
+    "github.http.not_modified",
+    "github.http.requests",
+    "github.http.source",
+    "github.billing",
+    "github.resource",
+    "github.account",
+    "github.cred_owner",
+    "github.role",
 ];
 
 /// The stderr marker the managed launcher (C4, #9987) prints when it refuses
@@ -336,6 +350,7 @@ impl InvocationSpan {
         outcome: Outcome,
         exit_code: Option<i32>,
         ended_at: DateTime<Utc>,
+        billing: &super::billing::Billing,
     ) -> SpanRecord {
         let mut attributes: TraceAttributes = [
             ("github.operation", inv.operation.as_str().to_string()),
@@ -352,6 +367,9 @@ impl InvocationSpan {
         .collect();
         if let Some(code) = exit_code {
             attributes.insert("github.exit_code".into(), code.to_string());
+        }
+        for (key, value) in billing.attributes() {
+            attributes.insert(key.to_string(), value);
         }
         crate::telemetry::trace::provenance::stamp(&mut attributes);
         SpanRecord {
@@ -371,16 +389,18 @@ impl InvocationSpan {
         }
     }
 
-    /// Emit the span and, for a non-`ok` outcome, the local completion record.
+    /// Emit the span (with `billing`'s HTTP truth and identity, #10343) and,
+    /// for a non-`ok` outcome, the local completion record.
     pub fn finish(
         self,
         inv: &GhInvocation,
         launcher: super::GhBinSource,
         outcome: Outcome,
         exit_code: Option<i32>,
+        billing: &super::billing::Billing,
     ) {
         let ended_at = Utc::now();
-        let span = self.record(inv, launcher, outcome, exit_code, ended_at);
+        let span = self.record(inv, launcher, outcome, exit_code, ended_at, billing);
         if outcome != Outcome::Ok {
             record_failure(&FailureRecord::from_span(&span, inv, outcome, exit_code));
         }

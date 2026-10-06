@@ -321,6 +321,34 @@ the file's absent-is-not-zero claims as observations:
 
 Not yet executed against a live SigNoz over real canary data.
 
+### GitHub shadow-spend reconciliation
+
+`github-shadow.sql` (#10343) answers "how much of what GitHub billed each App
+installation's bucket did Loom attribute?": (0) a preflight that the two
+metric families exist and how SigNoz stored `loom.forge.calls` (its `sumIf`
+is only right while `temporality` reads Delta); (1) GitHub's own bill per
+`(account, owner, resource)` hour — Σ positive increments of
+`github.ratelimit.used` readings keyed by their quota window (the paired
+`github.ratelimit.reset`, resets within 2 s merged), each window charged its
+high-water mark once — a stale reading from another host or an interleaved
+second bucket (#10571) never re-charges; (2) the requests `loom.forge.calls` attributed to that bucket, `ok`
+(surely charged) and `ok`+`error` (an upper bound), with 304s and the free
+probe excluded; (3) the shadow band `shadow_low`/`shadow_high` per
+bucket-hour, NULL when GitHub reported no spend; (4) the `invoke github` span
+cross-check by `github.account`, `github.cred_owner`, `github.resource` and
+`github.billing`. Run it like the queries above:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < github-shadow.sql
+```
+
+Its metric names, metric labels and span attributes are guarded by
+`signoz_trial_artifacts.rs`, and all five queries are **executed verbatim**
+against the pinned ClickHouse by `signoz_github_shadow_queries.rs` (stale
+host readings, a genuine reset, 1 s reset jitter, two interleaved windows, an
+owner-less legacy point). Queries 0–4 have also been run read-only against the
+live store (PR #10565); the one-hour 10 % reconciliation is #10343's Slice 3.
+
 ### Measured usage queries
 
 `usage-queries.sql` (#8528) is the SigNoz half of ClickStack's "Loom measured
@@ -471,6 +499,7 @@ data.
 | Correlated logs | Logs Explorer: exact trace ID and span ID; follow the trace link and inspect related logs from the selected span (`fixture-queries.sql` 6) |
 | Host/token gauges | Metrics Explorer: the actual emitted names and units — the shared fixture emits `loom.tokens.usage_fraction` and `loom.tokens.exhausted` only, labelled by `account`. An absent series is not a measured zero: the fixture's `synthetic-unknown` account intentionally has no `usage_fraction` point while `synthetic-zero` has `0.0` (`fixture-queries.sql` 7) |
 | Subscription quota utilization | Dashboards → New dashboard `Loom quota` → Time series panel. Metric `loom.tokens.usage_fraction` (5-hour window) and a second query on `loom.tokens.usage_fraction_weekly` (rolling 7-day window, #9005), aggregation **Max**, group by `provider`, `account`; time range 7 days. Providers with no utilization source (Codex, OpenCode/Z.ai, Kimi) have no series at all — a gap, never a `0`. Last week's used fraction per provider and the idle headroom thrown away at each weekly reset need window functions, so they live in SQL only (`quota-utilization.sql` 1–3) |
+| GitHub bucket shadow spend | Dashboards → `Loom quota` → Time series panel. Metric `github.ratelimit.used`, aggregation **Max**, group by `account`, `owner`, `resource` (`owner = '-'` is an operator's ambient login; a label set can still carry two interleaved windows, #10571, so the panel is a browsing surface). The per-hour increments, the attributed `loom.forge.calls` and the shadow band need window functions and a join, so they live in SQL only (`github-shadow.sql` 1–4) |
 | Ready-queue dwell | Dashboards → New dashboard `Loom queue` → Time series panel. Metric `loom.queue.oldest_wait`, aggregation **Max**, group by `host.id`, `state`; time range 7 days. A second panel on `loom.queue.starved` (Max, group by `host.id`, `state`) is the alert's own signal. Disposition reasons, mean dispatch wait and one issue's admission trail need `JSONExtractString`/span reads and stay SQL-only (`queue-dwell.sql` 1–5) |
 | Queue starvation alert | Alerts → Import `alerts/queue-starvation.json`. Fires when `loom.queue.starved` for `state = 'ready'` stays above threshold for the 15-minute eval window on any one host; the alert's own query is `queue-dwell.sql` 1 narrowed to that state, minus its `HAVING starved > 0` so SigNoz can still see the series recover. The embedded query plus the committed threshold are executed against the pinned ClickHouse by `signoz_queue_starvation_alert.rs` (see "Queue dwell and starvation queries" above); no rule evaluator or notification has run ([#9006](https://github.com/rjwalters/loom/issues/9006)) |
 | Loom measured usage | Trace Explorer: filter `name = 'loom.runtime.usage'`, group by `loom.model` with **Sum** over the token counters, and separately by `loom.role` / `loom.runtime`. The UI reads these attributes as STRINGS (they are exported as strings, like every span attribute), so a numeric aggregation of them belongs in SQL — and the scope resolution a correct total needs cannot be expressed as an Explorer filter at all. Treat the panel as a browsing surface and the SQL as the figures (`usage-queries.sql` 1 and 2) |

@@ -120,7 +120,17 @@ fn invoke_github_spans_export_with_deterministic_ids_and_service_name() {
     .parent(ParentContext::Parent(parent.clone()));
     let at = Utc::now();
     let open = InvocationSpan::open_at(&inv, at, "42.0".into());
-    let record = open.record(&inv, GhBinSource::Path, Outcome::Ok, Some(0), at);
+    let cred = crate::gh_invocation::accounting::cred_of_with(None, false);
+    let billing = crate::gh_invocation::billing::Billing::sent(
+        Some(200),
+        "",
+        Some(1),
+        crate::gh_invocation::billing::BillingClass::Ok,
+        "graphql",
+        &cred,
+        "writer",
+    );
+    let record = open.record(&inv, GhBinSource::Path, Outcome::Ok, Some(0), at, &billing);
     let again = InvocationSpan::open_at(&inv, at, "42.0".into());
     assert_eq!(open.context, again.context, "IDs recompute from the span's facts");
 
