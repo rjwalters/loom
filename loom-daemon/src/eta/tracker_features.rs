@@ -55,16 +55,19 @@ use super::ready::plan_max_age_secs;
 use super::timeline::{Dated, Timeline};
 use super::{EstimateContext, Item, ItemKey, ReadyPlan, ReadyRow, Tracker};
 use crate::eta::explanation::{FeatureOmitted, Features};
+use crate::eta::fit::features_v2::PriorityInputs;
 use crate::eta::fleet::FleetSnapshot;
 use crate::eta::journal::JournalEntry;
 use crate::eta::labels::stage_from_pr_labels;
 use crate::eta::pr_features::{FeatureRead, PrFeatureStore, Wanted};
 use crate::eta::priority_features::{self, PriorityEntry, PriorityFeatures, PriorityState};
+use crate::eta::priority_inputs::{priority_inputs, PriorityContext};
 use crate::eta::queue_features::{
     self, is_pr_stage, reason, EventKind, EventLog, QueueFeatures, QueueSubject, RosterEntry,
     StageEvent, SINCE_MERGE_CAP_SEC,
 };
 use crate::eta::stage_queue::{stage_queue, StageQueue};
+use crate::eta::repo_priority::RosterRevision;
 use crate::eta::stall_features::{self, StallSnapshot};
 use crate::eta::{CurrentState, NoEstimateReason, Stage};
 use crate::types::{PlanState, QueueDisposition};
@@ -518,6 +521,57 @@ impl Tracker {
             current: entry.stage.map(|s| (s, entry.entered_at)),
         };
         Some(self.priority_features_at(&subject, as_of))
+    }
+
+    /// The `eta-fit/v2` priority inputs (#10508) of listed PR `pr` of `repo`
+    /// at `as_of`, from the last fleet view observed before `as_of`, through
+    /// the one builder the fit calls ([`priority_inputs`]): the PR's own
+    /// label state, its linked-issue star (`None` without a fresh star
+    /// observation), the modeled roster with each entry's linked star, and
+    /// `fleet_history` (the fleet roster's revisions, oldest first; `None`
+    /// leaves the roster-derived inputs unknown). `None` when the view does
+    /// not list the PR. Not part of [`Features`]: no shipped heuristic reads
+    /// it.
+    #[must_use]
+    pub fn priority_inputs_of(
+        &self,
+        repo: &str,
+        pr: u32,
+        as_of: DateTime<Utc>,
+        fleet_history: Option<&[RosterRevision]>,
+    ) -> Option<PriorityInputs> {
+        let view = self
+            .context
+            .fleet
+            .as_ref()
+            .filter(|v| v.observed_at < as_of)?;
+        let entry = view
+            .priority_roster
+            .iter()
+            .find(|e| e.pr == pr && e.repo.eq_ignore_ascii_case(repo))?;
+        let subject = QueueSubject {
+            repo: entry.repo.clone(),
+            pr: Some(pr),
+            current: entry.stage.map(|s| (s, entry.entered_at)),
+        };
+        let roster: Vec<PriorityEntry> = view
+            .priority_roster
+            .iter()
+            .map(|e| PriorityEntry {
+                star: e
+                    .star
+                    .clone()
+                    .with_linked(self.linked_star(&e.repo, e.pr, as_of)),
+                ..e.clone()
+            })
+            .collect();
+        let linked = self.linked_star_known(&entry.repo, pr, as_of);
+        let ctx = PriorityContext {
+            roster: &roster,
+            scope: &view.scope,
+            fleet_history,
+        };
+        Some(priority_inputs(&subject, &entry.star, linked.as_ref(), &ctx, as_of))
     }
 
     /// This pass's feature reads (#10232), at most `budget` of them, for

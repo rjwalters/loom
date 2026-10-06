@@ -1013,6 +1013,61 @@ version. The fit (`Assembled::priority`, one per training row) and serving
   Before a new datestamped heuristic adopts them, a walk-forward in
   2AMLogic/loom-experiments must show they help (item 4 of #10333).
 
+### The `eta-fit/v2` priority inputs (#10508)
+
+`eta-fit/v2` is the feature set of the priority-aware successor to
+twin-otter-b. It is a **separate, versioned contract**
+(`eta::fit::features_v2`): `eta-fit/v1`, its 20 `FEATURES`, the v1
+transform, twin-otter and twin-otter-b are unchanged. A v2 coefficient vector
+is positional against `FEATURES_V2`, so a loader must dispatch on the
+file's `schema`. It must never read a v1 vector as v2.
+
+`FEATURES_V2` keeps v1's 20 positions, with position 16 changed from
+`starred` (the PR's own star) to `starred_any`. Six columns follow:
+
+| Column | Input | Unknown when |
+|--------|-------|--------------|
+| `starred_any` (pos. 16) | PR or linked-issue star (#10372) | see `star_unknown` |
+| `star_unknown` | 1 when the star/level are unknown | linked-star history does not cover the instant **and** the PR's own labels carry no star |
+| `priority_level` | effective level 0/1/2 (#10307) | as `star_unknown` |
+| `repo_rank` | the repo's normalized `fleet_priority` rank (0 dispatched first, 1 last) | no roster revision knowable at the cutoff, or the repo is not a member then |
+| `repo_rank_unknown` | 1 when `repo_rank` is unknown | |
+| `log_ahead_dispatch_fleet` | `ln_1p` of the other same-stage PRs, fleet-wide, that cross-repo dispatch puts first | the rank's history is unknown, the star is unknown, or the repo is out of scope |
+| `ahead_dispatch_fleet_unknown` | 1 when that position is unknown | |
+
+An unknown input is written as `0` with its indicator at `1`, so it is never
+read as a known zero. `PriorityCoverage` counts the rows that know each input,
+for a fit or backtest to report.
+
+- **One builder.** `eta::priority_inputs::priority_inputs` is the only
+  definition. The fit calls it (`rows::build_with_context`, written to
+  `Assembled::priority_inputs`), and serving calls it too
+  (`Tracker::priority_inputs_of`). Both pass the PR's own-label state, its
+  linked star (`None` when unknown), the roster and the roster history, so
+  train/serve skew (#10500) cannot arise in a second copy. A parity test
+  (`eta/tests/priority_inputs.rs`) builds one scenario both ways.
+- **Fleet-wide position.** This uses `keyed_cmp` over
+  `ETA_FLEET_POSITION_KEYS`: the real dispatch comparator without
+  `main_red_fix`. Each PR's `workspace_priority` comes from the same historic
+  revision, and a non-member repo gets the comparator's default (100). It is
+  separate from #10333's same-repo `ahead_dispatch`, which is unchanged.
+- **Historic roster** (`eta::repo_priority`). A `RosterRevision` holds the
+  fleet store's desired set (`fleet: true`, not `firewall`) at one commit,
+  each member with its defaulted `fleet_priority`. A commit date alone does
+  not prove the change was seen then. A revision is knowable from the later of
+  its commit date and its recorded observation; `basis` says whether one was
+  recorded. `revision_at` takes the last revision in history order knowable
+  before `as_of - 120 s`. When none qualifies, the result is unknown: today's
+  `repos.yml` is never used.
+- **Rank.** `rank = (members with a lower priority + ½ · other members at an
+  equal priority) / (members - 1)`, and 0 for a one-member fleet. Ties
+  share the mid-rank. The denominator is the membership at that revision.
+- **Status: inputs only.** No coefficient file is written
+  with `eta-fit/v2`, and no heuristic reads these inputs yet. Still open in
+  #10508: the fleet-store history reader, the v2 fit and its
+  schema-dispatched loading, the new heuristic and its pre-PR composition,
+  and shadow registration on the ETA authority.
+
 ## The explanation (`eta-explanation/v1`)
 
 The heuristic builds the explanation first and computes the numbers from it,

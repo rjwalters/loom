@@ -34,6 +34,7 @@ mod offline;
 mod point_in_time;
 mod primitives;
 mod priority_features;
+mod priority_inputs;
 mod queue_features;
 mod ready;
 mod recalibrate;
