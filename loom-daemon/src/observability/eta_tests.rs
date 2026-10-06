@@ -156,7 +156,7 @@ fn dry_run_offers_nothing_and_counts_everything() {
     let (emissions, outcomes) = lifecycle(provenance());
     let sink = Capture::default();
     let delivered = deliver(emissions, outcomes, &provenance(), "host-test", true, Some(&sink));
-    assert_eq!((delivered.emitted, delivered.refused, delivered.outcomes), (12, 2, 14));
+    assert_eq!((delivered.emitted, delivered.refused, delivered.outcomes), (13, 2, 15));
     assert!(sink.0.lock().unwrap().is_empty());
 }
 
@@ -170,15 +170,15 @@ fn records_without_valid_provenance_are_never_offered() {
     let (emissions, outcomes) = lifecycle(bad.clone());
     let sink = Capture::default();
     let delivered = deliver(emissions, Vec::new(), &provenance(), "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 14);
+    assert_eq!(delivered.invalid, 15);
     assert!(sink.0.lock().unwrap().is_empty());
     // … and outcomes observed by one, or scoring one.
     let delivered =
         deliver(Vec::new(), outcomes.clone(), &provenance(), "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 14, "the estimating build's provenance is checked too");
+    assert_eq!(delivered.invalid, 15, "the estimating build's provenance is checked too");
     let (_, good_outcomes) = lifecycle(provenance());
     let delivered = deliver(Vec::new(), good_outcomes, &bad, "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 14, "the observing build's provenance is checked too");
+    assert_eq!(delivered.invalid, 15, "the observing build's provenance is checked too");
     assert!(sink.0.lock().unwrap().is_empty());
 }
 
@@ -230,7 +230,7 @@ fn incomplete_provenance_is_emitted_and_marked() {
     let delivered = deliver(emissions, outcomes, &tarball, "host-test", false, Some(&sink));
     assert_eq!(
         (delivered.emitted, delivered.outcomes, delivered.invalid),
-        (12, 14, 0),
+        (13, 15, 0),
         "no data lost"
     );
     for envelope in sink.0.lock().unwrap().iter() {

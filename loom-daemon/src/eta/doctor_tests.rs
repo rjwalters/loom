@@ -436,7 +436,8 @@ fn drift_says_served_etas_are_scaled_only_when_brisk_petrel_serves() {
         state: DriftState::Drifted,
         adjusted: true,
     }];
-    let drifted = find(&evaluate(&f), "outcomes", "drift judging");
+    let checks = evaluate(&f);
+    let drifted = find(&checks, "outcomes", "drift judging");
     assert_eq!(drifted.status, Status::Warn);
     assert!(drifted.detail.contains("are scaled"), "{}", drifted.detail);
     assert!(!drifted.detail.contains("NOT adjusted"), "{}", drifted.detail);

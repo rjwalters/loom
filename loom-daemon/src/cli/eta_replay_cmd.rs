@@ -12,7 +12,8 @@ use loom_daemon::eta::Provenance;
 
 /// Give the calibrating `land` heuristics (`land-2026-10-06-calm-plover`,
 /// #10489, over `land-v2`; `land-2026-10-06-quick-tern`, #10524, over
-/// `land-2026-10-04-twin-otter-b`) their calibration evidence
+/// `land-2026-10-04-twin-otter-b`; `land-2026-10-06-brisk-petrel`, #10528,
+/// whose regime residuals are the same `-b` rows) their calibration evidence
 /// from the replay itself: each base heuristic's estimate at every `land` case,
 /// landing at the case's own outcome. Leak-free — the calibrating heuristic
 /// refits at each case's `as_of` ([`backtest::calibration_from_replay`]) — and
