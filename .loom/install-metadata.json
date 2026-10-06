@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.802",
-  "loom_commit": "acd2b0b36f624374faa72e8483c8504c12896f6c",
+  "loom_version": "0.19.810",
+  "loom_commit": "9344cc3ad39969b1161e60789352c437db2e18df",
   "install_date": "2026-04-21",
   "installed_files": [
     ".claude/README.md",

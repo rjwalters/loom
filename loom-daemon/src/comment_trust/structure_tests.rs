@@ -54,7 +54,7 @@ const MARKER_FILES: &[(&str, &str)] = &[
         "forge_check_claim.rs",
         "lease + lease-yield reader in read_freshest_live_lease (FETCH_SITES, #9453)",
     ),
-    ("merge_pr/redate.rs", "writer; reader in remedy_with (FETCH_SITES)"),
+    ("merge_pr/redate.rs", "writer; reader in remedy_with_sync (FETCH_SITES)"),
     (
         "merge_pr/redate/budget.rs",
         "pure parser over remedy_with's trusted listing (#9590)",
@@ -148,7 +148,7 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     // `COMMENTS_QUERY` const, which the scanner cannot see; listed anyway.
     ("premise_check/cli.rs", "graphql_listing_and_object", ""),
     ("premise_check/cli.rs", "parse_graphql_comments", ""),
-    ("merge_pr/redate.rs", "remedy_with", "policy.trusted_listing("),
+    ("merge_pr/redate.rs", "remedy_with_sync", "policy.trusted_listing("),
     ("merge_pr/redate.rs", "post_comment", ""),
     ("role_runner/roster.rs", "read_roster_comments", "trusted_ndjson("),
     ("role_runner/roster.rs", "create_roster_comment", ""),

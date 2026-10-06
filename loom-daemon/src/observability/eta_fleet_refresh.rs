@@ -466,6 +466,11 @@ fn run_production_cycle(
     // it never takes a published fit in place of its own; a host that is not
     // the authority does not fit at all (and emits no `eta.fit` record).
     let fits_here = fit_authority(root, &gate_host);
+    // #10586: the authority fits and serves the v2 priority inputs, which
+    // read the fleet roster's history; refresh its cache before the fit.
+    if fits_here {
+        crate::eta::roster_history::sync_for(root, Utc::now());
+    }
     let serving_published = match &ticked.gate {
         RefreshGate::StandDown { captain } if !fits_here => {
             distribute_fetch(root, captain, Utc::now()).is_some_and(|k| k.serving_published())
