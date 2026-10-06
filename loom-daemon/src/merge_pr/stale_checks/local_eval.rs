@@ -20,11 +20,12 @@
 //! step (`bash --noprofile --norc -eo pipefail <file>`) — run there. All pass
 //! ⇒ those components are fresh for this merge.
 //!
-//! # Opt-in
+//! # Default-on (#10465)
 //!
-//! Off unless the repository opts in: config `merge.reverifyStaleChecks`
-//! (default `false`), env `LOOM_MERGE_REVERIFY_STALE_CHECKS` beating it
-//! ([`enabled_for_root`]). Off, the guard behaves exactly as before #10388.
+//! On unless disabled: config `merge.reverifyStaleChecks` (default `true`),
+//! env `LOOM_MERGE_REVERIFY_STALE_CHECKS` beating it ([`enabled_for_root`]).
+//! Only the toolchain-free [`CHEAP_CHECKS`] allowlist is ever evaluated. Set
+//! it to `false`/`0`/`off` and the guard behaves exactly as before #10388.
 //!
 //! # Fail closed
 //!
@@ -166,7 +167,7 @@ pub const CI_WORKFLOW_PATH: &str = inputs::CI_WORKFLOW;
 /// Per-step timeout default; generous against the ~1–8 s these take.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 180;
 
-/// Config key enabling local re-verification (default `false`).
+/// Config key enabling local re-verification (default `true`, #10465).
 pub const CONFIG_KEY: &str = "merge.reverifyStaleChecks";
 
 /// Env override for [`CONFIG_KEY`] (`1`/`true`/`yes`/`on` or
@@ -177,7 +178,7 @@ pub const ENABLE_ENV: &str = "LOOM_MERGE_REVERIFY_STALE_CHECKS";
 pub const MARKER: &str = "loom:merge-tree-reverify";
 
 /// Is local re-verification enabled for the repository at `root`?
-/// env > config > default (`false`).
+/// env > config > default (`true`).
 #[must_use]
 pub fn enabled_for_root(root: &Path) -> bool {
     resolve_enabled(
@@ -195,7 +196,7 @@ pub fn resolve_enabled(env: Option<&str>, config: &serde_json::Value) -> bool {
             crate::config_resolver::get_path(config, CONFIG_KEY)
                 .and_then(|v| v.as_bool().or_else(|| v.as_str().and_then(parse_flag)))
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 fn parse_flag(s: &str) -> Option<bool> {

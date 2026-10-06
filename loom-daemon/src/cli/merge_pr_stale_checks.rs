@@ -206,7 +206,7 @@ impl StaleChecksArgs {
     /// pass turns it [`Verdict::Fresh`]; anything else returns `verdict`
     /// unchanged (fail closed: the existing refusal and remedy apply). The
     /// result goes to stderr (the merge log) and, when `post`, a PR comment.
-    /// A no-op unless the repository opted in.
+    /// A no-op when the repository opted out (default-on, #10465).
     fn try_local_eval(&self, verdict: Verdict, inputs: &Evidence<'_>, post: bool) -> Verdict {
         if !matches!(verdict, Verdict::Stale { .. } | Verdict::StaleInputs { .. }) {
             return verdict;

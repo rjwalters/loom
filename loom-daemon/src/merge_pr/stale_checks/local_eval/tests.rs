@@ -468,14 +468,14 @@ fn a_component_off_the_allowlist_is_unknown() {
 // --- Opt-in: env > config > default (off) ----------------------------------
 
 #[test]
-fn reverification_is_off_unless_the_repository_opts_in() {
+fn reverification_is_on_unless_disabled() {
     use serde_json::json;
     let none = json!({});
     let on = json!({"merge": {"reverifyStaleChecks": true}});
     let off = json!({"merge": {"reverifyStaleChecks": false}});
-    // Default: off.
-    assert!(!resolve_enabled(None, &none));
-    assert!(!resolve_enabled(None, &json!({"merge": {"treeChecks": ["x"]}})));
+    // Default: on (#10465).
+    assert!(resolve_enabled(None, &none));
+    assert!(resolve_enabled(None, &json!({"merge": {"treeChecks": ["x"]}})));
     // Config opts in or out.
     assert!(resolve_enabled(None, &on));
     assert!(!resolve_enabled(None, &off));
@@ -490,7 +490,9 @@ fn reverification_is_off_unless_the_repository_opts_in() {
     }
     // An unparseable env value falls through to config, then the default.
     assert!(resolve_enabled(Some("maybe"), &on));
-    assert!(!resolve_enabled(Some(""), &none));
+    assert!(resolve_enabled(Some(""), &none));
+    assert!(!resolve_enabled(Some("maybe"), &off));
+    assert!(!resolve_enabled(None, &json!({"merge": {"reverifyStaleChecks": "off"}})));
     assert_eq!(CONFIG_KEY, "merge.reverifyStaleChecks");
     assert_eq!(ENABLE_ENV, "LOOM_MERGE_REVERIFY_STALE_CHECKS");
 }
@@ -501,14 +503,14 @@ fn enabled_for_root_reads_the_repository_config() {
         return; // the env tier would decide; covered by resolve_enabled above
     }
     let t = tempfile::tempdir().unwrap();
-    assert!(!enabled_for_root(t.path()), "no config: off");
+    assert!(enabled_for_root(t.path()), "no config: default on");
     std::fs::create_dir_all(t.path().join(".loom")).unwrap();
     std::fs::write(
         t.path().join(".loom/config.json"),
-        r#"{"merge": {"reverifyStaleChecks": true}}"#,
+        r#"{"merge": {"reverifyStaleChecks": false}}"#,
     )
     .unwrap();
-    assert!(enabled_for_root(t.path()));
+    assert!(!enabled_for_root(t.path()));
 }
 
 // --- Trust boundary: the merge tree, not the forge's file list --------------

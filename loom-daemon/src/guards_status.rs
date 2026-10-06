@@ -284,6 +284,48 @@ pub struct Inputs {
     pub ask_threshold: usize,
     /// Overrides the decision log path (`LOOM_GUARD_DECISION_LOG_FILE`).
     pub log_path: Option<PathBuf>,
+    /// `Some(raw)` runs the `merge.reverifyStaleChecks` floor check (#10465)
+    /// with `raw` = the first line of the resolved `loom-daemon --version`
+    /// (empty when it could not be run); `None` skips it.
+    pub daemon_version: Option<String>,
+    /// Host name for that warning.
+    pub host: String,
+}
+
+/// First loom-daemon release with merge-tree re-verification (#10397). Must
+/// equal `_MP_REVERIFY_FLOOR` in `defaults/scripts/merge-pr.sh` (a test
+/// asserts it).
+pub const REVERIFY_FLOOR: &str = "0.19.741";
+
+fn semver3(s: &str) -> Option<(u64, u64, u64)> {
+    let mut it = s.trim().split('.');
+    let t = (it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+    it.next().is_none().then_some(t)
+}
+
+/// The floor warning, or `None` when re-verification is off or the daemon
+/// meets the floor. An unreadable version warns, like `merge-pr.sh`.
+#[must_use]
+pub fn reverify_floor_warning(enabled: bool, raw_version: &str, host: &str) -> Option<Warning> {
+    if !enabled {
+        return None;
+    }
+    let have = raw_version.split_whitespace().nth(1).unwrap_or("");
+    let floor = semver3(REVERIFY_FLOOR);
+    if semver3(have).is_some() && semver3(have) >= floor {
+        return None;
+    }
+    let shown = if semver3(have).is_some() {
+        have
+    } else {
+        "unknown"
+    };
+    Some(Warning {
+        headline: "REVERIFY-DAEMON-TOO-OLD".into(),
+        detail: format!(
+            "merge.reverifyStaleChecks is on (explicit or default) but loom-daemon on host {host} is {shown}, older than {REVERIFY_FLOOR}, the first release with merge-tree re-verification (#10397): stale required checks fall back to re-dates. Roll this host: .loom/scripts/cli/loom-daemon-update.sh --fetch (#10465)."
+        ),
+    })
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -626,6 +668,12 @@ pub fn collect(inputs: &Inputs) -> Report {
         });
     }
 
+    // (e) reverify on, daemon below the release floor (#10465).
+    if let Some(raw) = &inputs.daemon_version {
+        let on = crate::merge_pr::stale_checks::local_eval::enabled_for_root(repo);
+        warnings.extend(reverify_floor_warning(on, raw, &inputs.host));
+    }
+
     Report {
         categories,
         repo_wiring,
@@ -723,7 +771,60 @@ mod tests {
             now: now(),
             ask_threshold: DEFAULT_ASK_THRESHOLD,
             log_path: None,
+            daemon_version: None,
+            host: "testhost".into(),
         }
+    }
+
+    #[test]
+    fn reverify_floor_matches_merge_pr_sh() {
+        let sh = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../defaults/scripts/merge-pr.sh"
+        ))
+        .unwrap();
+        assert!(sh.contains(&format!("\n_MP_REVERIFY_FLOOR={REVERIFY_FLOOR}\n")));
+    }
+
+    #[test]
+    fn reverify_floor_warning_cases() {
+        assert!(reverify_floor_warning(false, "loom-daemon 0.19.1", "h").is_none());
+        let w = reverify_floor_warning(true, "loom-daemon 0.19.701 (abc)", "h").unwrap();
+        assert!(
+            w.detail.contains("host h")
+                && w.detail.contains("0.19.701")
+                && w.detail.contains("0.19.741")
+        );
+        assert!(reverify_floor_warning(true, "loom-daemon 0.19.741", "h").is_none());
+        assert!(reverify_floor_warning(true, "loom-daemon 0.20.0", "h").is_none());
+        assert!(reverify_floor_warning(true, "", "h")
+            .unwrap()
+            .detail
+            .contains("unknown"));
+    }
+
+    #[test]
+    fn collect_reports_old_daemon_only_when_reverify_effective() {
+        if std::env::var_os(crate::merge_pr::stale_checks::local_eval::ENABLE_ENV).is_some() {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let (repo, home) = (t.path().join("r"), t.path().join("h"));
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let mut i = inputs(&repo, &home);
+        i.daemon_version = Some("loom-daemon 0.19.701".into());
+        let has = |r: &Report| {
+            r.warnings
+                .iter()
+                .any(|w| w.headline == "REVERIFY-DAEMON-TOO-OLD")
+        };
+        assert!(has(&collect(&i)), "default-on");
+        put(&repo, ".loom/config.json", r#"{"merge":{"reverifyStaleChecks":false}}"#);
+        assert!(!has(&collect(&i)), "explicit off is silent");
+        i.daemon_version = None;
+        put(&repo, ".loom/config.json", "{}");
+        assert!(!has(&collect(&i)), "check skipped");
     }
 
     fn ask_line(tag: &str, ts: &str) -> String {
