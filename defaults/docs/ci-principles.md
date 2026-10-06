@@ -43,6 +43,17 @@ the next person to add one will have an equally good argument.
    `cancelled` or red commit is never released; its version may be skipped
    ([release-cadence](release-cadence.md)).
 
+   Tell the two kinds of `cancelled` apart before reading a high rate as a
+   regression (#10670): a run the bound superseded while *pending* has no
+   jobs; a run cancelled after it *started* has some, and that one breaks
+   this rule. On 2026-10-06 54 of the last 100 `main` runs were cancelled and
+   every one was job-less. `signoz/ci-queries.sql` section 18 reports the
+   split (`cancelled_after_start` must stay 0), and loom-daemon's
+   `merge_group_ci::main_cancel` lint fails CI if any workflow change could
+   cancel a started `push` or `merge_group` run: a `cancel-in-progress` that
+   is not provably false there, a group shared with a cancelling PR run, or a
+   run-cancelling step reachable there.
+
 3. **Path-filtering is an optimisation, not a correctness tool.** A check that
    can fail because of a file *outside* its path group must not be filtered by
    path. `conflict-markers` states this in its own comment and is right:
@@ -250,6 +261,7 @@ a cancellation rate.
 
 - #7779 / PR #7803 — the cancellation fix; #9608 — the bounded `main` queue
   (one running + newest pending) that rule 2 now allows
+- #10670 — the `main_cancel` lint and the superseded-vs-started cancel split
 - #7789 / #7791 — flake tracking, and why retry must *record* rather than hide
 - #7745 / #7761 — the same "a skipped check must not read as a pass" rule,
   learned in the resync and guard layers

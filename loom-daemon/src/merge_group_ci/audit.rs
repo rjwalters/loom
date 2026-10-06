@@ -197,7 +197,7 @@ pub fn relied_on_reason(wf: &Workflow, required: &[String]) -> (bool, String) {
 
 /// Whether the workflow is triggered by `event` (for `merge_group`, with a
 /// `types:` filter that admits `checks_requested`).
-fn triggered(wf: &Workflow, event: Event) -> bool {
+pub(super) fn triggered(wf: &Workflow, event: Event) -> bool {
     match event {
         Event::PullRequest => {
             wf.trigger("pull_request").is_some() || wf.trigger("pull_request_target").is_some()
@@ -221,7 +221,7 @@ fn truth_state(t: Truth) -> RunState {
 
 /// Evaluate a job- or step-level condition, with GitHub's implicit
 /// `success() &&` when no status function appears.
-fn eval_condition(cond: Option<&str>, scope: &JobScope<'_>) -> Value {
+pub(super) fn eval_condition(cond: Option<&str>, scope: &JobScope<'_>) -> Value {
     let Some(src) = cond else {
         return scope_success(scope);
     };
@@ -246,7 +246,7 @@ fn scope_success(scope: &JobScope<'_>) -> Value {
 }
 
 /// Resolve every job's run state under one event context.
-fn job_states(wf: &Workflow, ctx: &EventContext) -> BTreeMap<String, RunState> {
+pub(super) fn job_states(wf: &Workflow, ctx: &EventContext) -> BTreeMap<String, RunState> {
     let mut states: BTreeMap<String, RunState> = BTreeMap::new();
     if !triggered(wf, ctx.event) {
         for j in &wf.jobs {
@@ -294,7 +294,7 @@ fn job_states(wf: &Workflow, ctx: &EventContext) -> BTreeMap<String, RunState> {
     states
 }
 
-fn needs_of(job: &Job, states: &BTreeMap<String, RunState>) -> Vec<(String, RunState)> {
+pub(super) fn needs_of(job: &Job, states: &BTreeMap<String, RunState>) -> Vec<(String, RunState)> {
     job.needs
         .iter()
         .map(|n| (n.clone(), states.get(n).copied().unwrap_or(RunState::Unknown)))
