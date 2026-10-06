@@ -346,6 +346,9 @@ pub enum MetricName {
     /// Rows with non-empty alternates in the last built eta.snapshot.
     #[serde(rename = "loom.eta.health.snapshot_alternates_rows")]
     EtaHealthSnapshotAlternatesRows,
+    /// Pending estimates evicted by the MAX_PENDING cap since process start.
+    #[serde(rename = "loom.eta.health.pending_over_cap")]
+    EtaHealthPendingOverCap,
 }
 
 impl MetricName {
@@ -409,6 +412,7 @@ impl MetricName {
             Self::EtaHealthRefreshRepos => "loom.eta.health.refresh_repos",
             Self::EtaHealthSnapshotRows => "loom.eta.health.snapshot_rows",
             Self::EtaHealthSnapshotAlternatesRows => "loom.eta.health.snapshot_alternates_rows",
+            Self::EtaHealthPendingOverCap => "loom.eta.health.pending_over_cap",
         }
     }
 
@@ -486,6 +490,7 @@ impl MetricName {
             Self::EtaHealthRefreshRepos => "{repository}",
             Self::EtaHealthSnapshotRows => "{row}",
             Self::EtaHealthSnapshotAlternatesRows => "{row}",
+            Self::EtaHealthPendingOverCap => "{estimate}",
             _ => "By",
         }
     }
@@ -567,6 +572,9 @@ impl MetricName {
             Self::EtaHealthSnapshotRows => "Rows in the last built eta.snapshot.",
             Self::EtaHealthSnapshotAlternatesRows => {
                 "Rows with non-empty alternates in the last built eta.snapshot."
+            }
+            Self::EtaHealthPendingOverCap => {
+                "Pending ETA estimates evicted by the MAX_PENDING cap since process start."
             }
         }
     }

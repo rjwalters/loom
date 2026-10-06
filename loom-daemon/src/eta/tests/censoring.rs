@@ -514,3 +514,66 @@ fn backfill_append_is_idempotent_and_a_completed_segment_is_counted_once() {
     assert_eq!(history.censored.len(), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ------------------------------------------------- the MAX_PENDING cap (#10496)
+
+#[test]
+fn the_cap_thins_redundant_refreshes_and_keeps_every_series_scoreable() {
+    use crate::eta::explanation::EstimateResult;
+    use crate::eta::score::EstimateSummary;
+    use crate::eta::tracker::{Tracker, MAX_PENDING};
+    use std::collections::BTreeMap;
+
+    let mut explanation = LandV1.estimate(&input_at(Stage::ReviewWait, 0, 0), &history_a());
+    explanation.result = Some(EstimateResult {
+        p25_sec: 600,
+        p50_sec: 1200,
+        p75_sec: 2400,
+        p90_sec: Some(3600),
+        eta_p50_at: as_of() + Duration::seconds(1200),
+        samples_min: 9,
+        stage_marks: Vec::new(),
+        tail_extrapolated: false,
+    });
+    let base = EstimateSummary::of(&explanation);
+
+    // 8 heuristics x a refresh every 300 s for 12 h x 150 items.
+    let refreshes = 12 * 3600 / 300;
+    let mut pending = Vec::new();
+    for step in 0..refreshes {
+        for issue in 0..150_u32 {
+            for h in 0..8 {
+                let mut p = base.clone();
+                p.issue = issue + 1;
+                p.heuristic = format!("land-h{h}");
+                p.as_of = as_of() + Duration::seconds(300 * step);
+                p.estimate_id = format!("e-{step}-{issue}-{h}");
+                pending.push(p);
+            }
+        }
+    }
+    let total = pending.len();
+    assert!(total > MAX_PENDING, "the fixture must overflow the cap");
+
+    let mut tracker = Tracker::new(provenance());
+    tracker.restore_pending(pending);
+    let expired = tracker.expire(as_of() + Duration::hours(12));
+
+    assert!(expired.censored.is_empty(), "cap eviction scored nothing as censored");
+    assert_eq!(tracker.pending().len(), MAX_PENDING);
+    assert_eq!(tracker.drain_dropped().over_cap, total - MAX_PENDING);
+
+    let mut series: BTreeMap<(u32, String), Vec<i64>> = BTreeMap::new();
+    for p in tracker.pending() {
+        series
+            .entry((p.issue, p.heuristic.clone()))
+            .or_default()
+            .push((p.as_of - as_of()).num_seconds());
+    }
+    assert_eq!(series.len(), 150 * 8, "no series lost every estimate");
+    let last = 300 * (refreshes - 1);
+    for (key, offsets) in &series {
+        assert_eq!(offsets.first(), Some(&0), "{key:?} kept its earliest-lead estimate");
+        assert_eq!(offsets.last(), Some(&last), "{key:?} kept its latest estimate");
+    }
+}

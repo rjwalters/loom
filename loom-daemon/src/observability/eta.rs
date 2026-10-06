@@ -1176,17 +1176,18 @@ pub(super) async fn record(
     append_journal(workspace_root, &rows);
     let delivered = deliver(emissions, outcomes, &Provenance::current(), &host_id, dry_run, sink());
     write_pending(&pending_path(workspace_root), &pending);
+    super::ops::eta_health::note_over_cap(dropped.over_cap);
     if dropped.over_cap > 0 {
         log::warn!(
-            "eta: dropped {} pending estimate(s) at the {} cap — the oldest, \
-             which are the long-horizon estimates accuracy scoring needs most",
+            "eta: evicted {} pending estimate(s) at the {} cap (redundant refreshes \
+             first; every series keeps its earliest and latest)",
             dropped.over_cap,
             crate::eta::tracker::MAX_PENDING
         );
     }
     log::info!(
         "eta: pass emitted={} refused={} outcomes={} journaled={} pending={} expired={} \
-         invalid={} reads={} deferred_reads={} feature_reads={} orphaned={}",
+         invalid={} reads={} deferred_reads={} feature_reads={} orphaned={} over_cap={}",
         delivered.emitted,
         delivered.refused,
         delivered.outcomes,
@@ -1197,7 +1198,8 @@ pub(super) async fn record(
         reads_answered(&rows),
         deferred,
         feature_reads,
-        dropped.orphaned
+        dropped.orphaned,
+        dropped.over_cap
     );
 }
 
