@@ -176,6 +176,7 @@ pub mod filing_lock;
 pub mod fleet;
 pub mod fleet_alert;
 pub mod fleet_captain;
+pub mod fleet_singletons;
 pub mod fleet_state;
 pub mod fleet_store;
 pub mod fleet_sync;

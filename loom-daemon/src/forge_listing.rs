@@ -138,11 +138,55 @@ pub fn list_issues_cached_all_as(
     label: &str,
     state: &str,
 ) -> Result<Vec<RestIssue>> {
+    walk_pages(caller, gh_bin, cwd, repo_override, label, state, MAX_PAGES)
+}
+
+/// Most pages [`list_open_issues_cached_all_as`] reads: an unfiltered listing
+/// is every open issue and pull request, so it runs deeper than a label's.
+pub const MAX_OPEN_PAGES: u32 = 30;
+
+/// Every open issue and pull request of the repo, whatever its labels, oldest
+/// first: [`list_issues_cached_all_as`]'s walk over the unfiltered listing
+/// (see [`build_issues_url`]'s empty label), up to [`MAX_OPEN_PAGES`] pages.
+///
+/// Each page is its own URL, so its own cache entry and its own validator: a
+/// repo where nothing moved answers every page with a free `304`, and a change
+/// costs a `200` only for the pages whose rows changed. Oldest first keeps
+/// that set small: a newly filed issue lands on the last page instead of
+/// shifting every page down by one.
+///
+/// # Errors
+///
+/// As [`list_issues_cached_all_as`]: the set is all-or-nothing.
+pub fn list_open_issues_cached_all_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+) -> Result<Vec<RestIssue>> {
+    walk_pages(caller, gh_bin, cwd, repo_override, "", "open", MAX_OPEN_PAGES)
+}
+
+/// The page walk behind [`list_issues_cached_all_as`], bounded by `max_pages`.
+fn walk_pages(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    label: &str,
+    state: &str,
+    max_pages: u32,
+) -> Result<Vec<RestIssue>> {
+    let what = if label.is_empty() {
+        "unfiltered"
+    } else {
+        label
+    };
     let read = |page: u32| {
         list_issues_cached_retrying(caller, gh_bin, cwd, repo_override, label, state, Some(page))
     };
     let mut pages: Vec<Vec<RestIssue>> = Vec::new();
-    for page in 1..=MAX_PAGES {
+    for page in 1..=max_pages {
         let rows = read(page)?;
         let full = rows.len() >= PER_PAGE;
         pages.push(rows);
@@ -152,7 +196,7 @@ pub fn list_issues_cached_all_as(
             for (i, earlier) in pages[..pages.len() - 1].iter().enumerate() {
                 if read(i as u32 + 1)? != *earlier {
                     return Err(anyhow!(
-                        "forge_listing: the {label} listing changed mid-walk (page {} moved); \
+                        "forge_listing: the {what} listing changed mid-walk (page {} moved); \
                          the set is not a consistent snapshot",
                         i + 1
                     ));
@@ -162,8 +206,8 @@ pub fn list_issues_cached_all_as(
         }
     }
     Err(anyhow!(
-        "forge_listing: more than {} {label} items; the listing is incomplete",
-        MAX_PAGES as usize * PER_PAGE
+        "forge_listing: more than {} {what} items; the listing is incomplete",
+        max_pages as usize * PER_PAGE
     ))
 }
 
@@ -383,9 +427,17 @@ fn cached_entry(key: &str, disk: Option<&Path>) -> Option<CacheEntry> {
 
 /// Build the REST listing URL. With no explicit repo, gh's
 /// `{owner}/{repo}` placeholders resolve from the `cwd` repo's remote.
+///
+/// An empty `label` is the **unfiltered** listing (every item in `state`),
+/// sorted oldest first so its page boundaries move as little as possible.
 #[must_use]
 pub fn build_issues_url(repo: Option<&str>, label: &str, state: &str) -> String {
     let repo_path = repo.unwrap_or("{owner}/{repo}");
+    if label.is_empty() {
+        return format!(
+            "repos/{repo_path}/issues?state={state}&sort=created&direction=asc&per_page={PER_PAGE}"
+        );
+    }
     format!("repos/{repo_path}/issues?labels={label}&state={state}&per_page={PER_PAGE}")
 }
 
@@ -696,3 +748,8 @@ pub fn list_issues_cached_persistent_as(
 #[allow(clippy::unwrap_used)]
 #[path = "forge_listing_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "forge_listing_open_pages_tests.rs"]
+mod open_pages_tests;

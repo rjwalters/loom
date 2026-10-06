@@ -3803,6 +3803,10 @@ finder runs, the pass is on unless `LOOM_INTAKE_RECONCILE=0`; also
 `LOOM_INTAKE_RECONCILE_INTERVAL_SECS` (300), `LOOM_INTAKE_RECONCILE_MAX_PER_PASS` (50).
 Writes are gated by `write_scope` (#9548).
 
+On a multi-host fleet the pass can run once, on the fleet captain, instead of
+on every dispatcher: set `fleet.intakeReconcile.singleton`. See
+[Intake reconcile on the captain](#intake-reconcile-on-the-captain-w7).
+
 ## Autonomous work finder (#3810)
 
 The **work finder** (Phase A of epic #3809,
@@ -7116,6 +7120,77 @@ fit is published).
 **ETA queue friction** is already a singleton: it runs inside the ETA pass,
 which only the ETA authority runs (#10498), and the authority defaults to the
 declared captain. It needs no heartbeat.
+
+#### Intake reconcile on the captain (W7)
+
+The [intake pass](#curator-intake-reconcile-10041) describes the forge, not
+the host: every dispatcher that manages a repo lists the same open issues, on
+the writer credential, to add the same `loom:triage` label. With
+`fleet.intakeReconcile.singleton` set and a `fleet.captain` declared, the
+captain alone runs it (singleton job **`intake-reconcile`**, in
+`host.health.armed_singleton_jobs`) and no other host makes an intake call.
+Assigned, not elected: there is no standby producer, so while the captain is
+down unlabelled issues wait for it. Code: `intake_reconcile/singleton.rs`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `fleet.intakeReconcile.singleton` | `false` | With a `fleet.captain` declared: only the captain runs intake, from its own task; every other host stops running it. Identical fleet-wide, like `fleet.captain` |
+
+| `singleton` | `fleet.captain` | This host | Intake runs |
+|---|---|---|---|
+| unset / `false` | any | any | per host, from the work finder, as before |
+| `true` | not declared | any | per host, as before (fail-open, nothing armed) |
+| `true` | declared | the captain | here only |
+| `true` | declared | another host | not here |
+
+The mode is re-read every 60 seconds, so an edit needs no restart.
+`LOOM_INTAKE_RECONCILE=0` still disables the pass on a host in every mode,
+**the captain included**: a captain that carries it logs a warning and the
+fleet has no intake. The cadence and batch cap are the same environment
+variables as before, read on the captain.
+
+**The captain's pass** runs from its own task, not the work finder, so a
+captain that dispatches nothing still runs it:
+
+- **Repo set**: the workspaces registered on the captain (the set its work
+  finder would fan out over), each by the slug of its own `origin` remote. No
+  other source is read. An unreadable registry, or no root that resolves to a
+  slug, is no pass.
+- **Listing**: each repo's open issues, oldest first, as conditional reads on
+  the reader pool with one ETag per page. A repo where nothing moved costs
+  only `304`s; a change costs a `200` for the pages whose rows changed. More
+  than 3000 open items is an incomplete listing and that repo is skipped.
+- **Re-read**: before each label, one conditional read of that issue. An issue
+  labelled, closed or deleted since the listing is left alone.
+- **Write**: one label request per issue on the writer, behind a per-repo
+  `write_scope` check that is only made when there is something to label.
+- **Rate limits**: no pass while the rate-limit breaker is open, and the pass
+  stops between repos if it opens. A rate-limited reader is withdrawn and the
+  read retried once on the writer, as for every conditional read; a listing
+  that still fails skips that repo until the next pass and is not reported to
+  the host-wide breaker.
+
+In the forge-call ledger the pass is `intake.list_open`, `intake.recheck` and
+`intake.add_triage`; with the singleton on, only the captain books them.
+
+**Mixed-version safety.** The key defaults off and older daemons ignore it, so
+an older host keeps running intake per host unless `LOOM_INTAKE_RECONCILE=0`
+stops it. Two hosts running intake at once costs duplicate reads, never a wrong
+label: the write is idempotent and each is preceded by a re-read.
+
+**Rollout order**, for a fleet that turned the pass off per host with
+`LOOM_INTAKE_RECONCILE=0`:
+
+1. Deploy a daemon with this feature everywhere.
+2. Enable on the captain: set `fleet.intakeReconcile.singleton: true` and
+   remove `LOOM_INTAKE_RECONCILE=0` from the captain's environment only.
+3. Confirm: the captain lists `intake-reconcile` in
+   `host.health.armed_singleton_jobs`, its `loom-daemon forge calls --by caller`
+   shows `intake.list_open` answering mostly `304`, and no other host books an
+   `intake.*` row.
+4. Remove `LOOM_INTAKE_RECONCILE=0` from the other hosts. They stay off because
+   the key, not the environment, now stands them down. A host still on an older
+   daemon must keep the variable until it is upgraded.
 
 ### Role-runner host roster (#6704, phases A and B)
 

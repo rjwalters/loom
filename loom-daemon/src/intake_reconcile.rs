@@ -12,9 +12,17 @@
 //! next listing, and an already-lifecycle-labeled issue is never selected. Uses
 //! REST (`gh api`) only, batch-capped per pass, and never fails the tick.
 //!
-//! Config (env only; default ON): `LOOM_INTAKE_RECONCILE=0|false|off` disables,
+//! Config (env; default ON): `LOOM_INTAKE_RECONCILE=0|false|off` disables,
 //! `LOOM_INTAKE_RECONCILE_INTERVAL_SECS` (default 300),
 //! `LOOM_INTAKE_RECONCILE_MAX_PER_PASS` (default 50).
+//!
+//! # One pass per fleet (W7)
+//!
+//! With `fleet.intakeReconcile.singleton` set and a `fleet.captain` declared,
+//! the inline pass here stands down on every host and the captain alone runs
+//! intake from its own task, on reader-pool conditional listings with a
+//! re-read before every label: see [`singleton`]. Unconfigured, or with no
+//! captain declared, this module behaves exactly as described above.
 
 use crate::claim_reconciliation::gh_call;
 use chrono::{DateTime, Duration, Utc};
@@ -22,6 +30,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
+
+pub mod singleton;
 
 /// The intake label applied.
 pub const TRIAGE_LABEL: &str = "loom:triage";
@@ -124,8 +134,12 @@ fn due(root: &Path, interval_secs: u64) -> bool {
 pub fn maybe_run(gh_bin: &Path, root: &Path) -> usize {
     // Unit tests of other modules drive GhWorkSource with real/fake `gh`; the
     // pass is exercised directly via `run_once` instead.
+    // W7: with the singleton configured and a captain declared, the captain's
+    // own task runs intake; no host runs it inline. Checked before `due` so a
+    // host that takes intake back runs its first pass at once.
     if cfg!(test)
         || !enabled()
+        || singleton::legacy_stands_down()
         || !due(root, env_num("LOOM_INTAKE_RECONCILE_INTERVAL_SECS", DEFAULT_INTERVAL_SECS))
     {
         return 0;
