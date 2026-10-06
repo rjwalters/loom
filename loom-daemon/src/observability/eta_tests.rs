@@ -174,6 +174,7 @@ fn no_repo_id_means_no_story_context() {
 #[test]
 fn pr_views_key_each_pr_to_the_issue_it_closes() {
     let row = |number: u32, body: &str, pr: bool| RestIssue {
+        comments: 0,
         number,
         title: None,
         labels: vec!["loom:review-requested".to_string()],

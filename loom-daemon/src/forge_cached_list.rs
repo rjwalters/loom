@@ -348,6 +348,7 @@ mod tests {
 
     fn issue(number: u32, labels: &[&str], is_pr: bool) -> RestIssue {
         RestIssue {
+            comments: 0,
             number,
             title: Some(format!("issue {number}")),
             labels: labels.iter().map(|l| s(l)).collect(),

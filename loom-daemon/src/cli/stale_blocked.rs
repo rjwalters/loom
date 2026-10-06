@@ -10,9 +10,23 @@
 //! Brand-new logic, so it is native from the start per
 //! `.loom/docs/shell-language-policy.md` — the `generate-agent-skills.sh`
 //! precedent — rather than a script to be ported later. The classification
-//! itself lives in [`loom_daemon::stale_blocked`]; this module is the
-//! enumeration, the live reads (all delegated to
-//! [`loom_daemon::dep_recheck::forge`]) and the rendering.
+//! itself lives in [`loom_daemon::stale_blocked`], and the forge reads in
+//! [`loom_daemon::stale_blocked::batch`] (#10480: one REST listing, REST + ETag
+//! comment and blocker-state reads, one GraphQL query per 100 issues); this
+//! module is the rendering. [`list_blocked`] and [`gather`], the per-artifact
+//! path over [`loom_daemon::dep_recheck::forge`], remain for
+//! `notify-cleared-blockers`.
+//!
+//! # Budget floor (#10480)
+//!
+//! After the candidate listing the run reads the free budget probe and
+//! projects its own cost; if it would take the GraphQL or core bucket below
+//! `--min-graphql-remaining` / `--min-core-remaining` (default 1,000 each, `0`
+//! disables) it gathers nothing and reports every artifact *not evaluated*.
+//! The same floors are re-checked between reads, from the forge's own
+//! answers. `--json` carries what the run spent as `forge_cost`; the human
+//! report prints the same numbers as one stderr line unless `--quiet`.
+//! The logic is [`loom_daemon::stale_blocked::budget`].
 //!
 //! # Why every failure is still exit 0
 //!
@@ -23,14 +37,13 @@
 //! posture is that a conclusion drawn from a failed read is worse than no
 //! conclusion. The one thing this command will not do is guess.
 //!
-//! # Both populations, two enumerations (#8925)
+//! # Both populations (#8925)
 //!
 //! `gh issue list` never returns a pull request, so the original single
-//! enumeration could not see a parked PR at all. This command now runs
-//! `gh pr list --label loom:blocked --state open` as well, and reads a PR's body
-//! and comments through [`forge::fetch_pr_body_and_comments`] (`gh issue view`
-//! exits non-zero on a PR number). `--no-prs` restores the issues-only
-//! behaviour for a caller that wants it; nothing in the fleet passes it.
+//! enumeration could not see a parked PR at all. The REST listing the batch
+//! gatherer reads returns both, split by `pull_request`. `--no-prs` restores
+//! the issues-only behaviour for a caller that wants it; nothing in the fleet
+//! passes it.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -43,7 +56,7 @@ use loom_daemon::dep_recheck::{extract, forge};
 use loom_daemon::park_record;
 use loom_daemon::script_helpers::gh_query;
 use loom_daemon::stale_blocked::{
-    classify, park_self_block, undeclared, Artifact, Evidence, Verdict,
+    batch, budget, classify, park_self_block, undeclared, Artifact, Evidence, Verdict,
 };
 
 /// How many open `loom:blocked` issues to examine by default.
@@ -84,20 +97,30 @@ pub(crate) struct StaleBlockedArgs {
     /// restoring the issues-only behaviour this check shipped with.
     #[arg(long)]
     pub no_prs: bool,
+
+    /// GraphQL points that must remain after this run (#10480). If the free
+    /// budget probe says the run would go below it, nothing is gathered and
+    /// every artifact is reported not evaluated (still exit 0); it is also
+    /// re-checked between GraphQL batches. `0` disables the check.
+    #[arg(long, value_name = "N", default_value_t = budget::DEFAULT_MIN_GRAPHQL_REMAINING)]
+    pub min_graphql_remaining: u64,
+
+    /// Core (REST) requests that must remain after this run (#10480). Same
+    /// semantics as `--min-graphql-remaining`, re-checked before each REST
+    /// read. `0` disables the check.
+    #[arg(long, value_name = "N", default_value_t = budget::DEFAULT_MIN_CORE_REMAINING)]
+    pub min_core_remaining: u64,
 }
 
-/// One row of the enumeration query. Shared by both populations — `gh pr list`
-/// and `gh issue list` return the same `number,title` shape.
+/// One row of the per-artifact enumeration query. Shared by both populations —
+/// `gh pr list` and `gh issue list` return the same `number` shape.
 ///
-/// `pub(super)` (rather than private): reused by `notify_cleared_blockers`
-/// (issue #9102), the close-triggered sibling of this fleet-wide advisory,
-/// which enumerates the same `loom:blocked` population via [`list_blocked`]
-/// rather than re-deriving it.
+/// Only `notify_cleared_blockers` (issue #9102), the close-triggered sibling of
+/// this advisory, still enumerates through [`list_blocked`]; this command's own
+/// run reads the REST listing via [`batch`] (#10480).
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct IssueRow {
     pub(super) number: i64,
-    #[serde(default)]
-    pub(super) title: String,
 }
 
 /// One classified artifact, ready to render. `Clone` because a prose-only park is
@@ -127,20 +150,21 @@ impl StaleBlockedArgs {
             Some(r) => r.clone(),
             None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
-        let repo = self.repo.as_deref();
-
-        let mut populations: Vec<(Artifact, Vec<IssueRow>)> = Vec::new();
-        let mut enumerate_errors: Vec<String> = Vec::new();
-
-        let (rows, err) = list_blocked(Artifact::Issue, &root, repo, self.limit);
-        populations.push((Artifact::Issue, rows));
-        enumerate_errors.extend(err);
-
-        if !self.no_prs {
-            let (rows, err) = list_blocked(Artifact::Pr, &root, repo, self.limit);
-            populations.push((Artifact::Pr, rows));
-            enumerate_errors.extend(err);
-        }
+        let mut forge = batch::GhStaleBlockedForge::new(&root, self.repo.as_deref());
+        let fleet = loom_daemon::forge_identity::FleetLogins::for_root(&root);
+        let opts = batch::Options {
+            limit: self.limit,
+            no_prs: self.no_prs,
+            floor: budget::Floor {
+                graphql: self.min_graphql_remaining,
+                core: self.min_core_remaining,
+            },
+        };
+        let batch::Gathering {
+            items: gathered,
+            enumerate_error,
+            cost,
+        } = batch::gather_all(&mut forge, &fleet, opts);
 
         let mut stale: Vec<Finding> = Vec::new();
         let mut superseded: Vec<Finding> = Vec::new();
@@ -148,43 +172,35 @@ impl StaleBlockedArgs {
         let mut prose_only: Vec<Finding> = Vec::new();
         let mut unevaluated: Vec<(String, String)> = Vec::new();
 
-        for (kind, rows) in populations {
-            for row in rows {
-                let evidence = match gather(kind, row.number, repo, &root) {
-                    Ok(e) => e,
-                    Err(why) => {
-                        unevaluated.push((format!("{} #{}", kind.label(), row.number), why));
-                        continue;
-                    }
-                };
-                let finding = Finding {
-                    kind,
-                    number: row.number,
-                    title: row.title.clone(),
-                    verdict: classify(&evidence),
-                    undeclared: undeclared(&evidence),
-                };
-                // A prose-only park is reported REGARDLESS of its verdict: a
-                // still-blocked park whose blocker is unreadable is the defect
-                // in waiting, and waiting for it to go stale is what let #8852
-                // sit through its blocker closing (#8925).
-                if finding.undeclared {
-                    prose_only.push(finding.clone());
+        for g in gathered {
+            let evidence = match g.evidence {
+                Ok(e) => e,
+                Err(why) => {
+                    unevaluated.push((format!("{} #{}", g.kind.label(), g.number), why));
+                    continue;
                 }
-                match finding.verdict {
-                    Verdict::Stale(_) => stale.push(finding),
-                    Verdict::Superseded { .. } => superseded.push(finding),
-                    Verdict::Undocumented => undocumented.push(finding),
-                    Verdict::StillBlocked => {}
-                }
+            };
+            let finding = Finding {
+                kind: g.kind,
+                number: g.number,
+                title: g.title,
+                verdict: classify(&evidence),
+                undeclared: undeclared(&evidence),
+            };
+            // A prose-only park is reported REGARDLESS of its verdict: a
+            // still-blocked park whose blocker is unreadable is the defect
+            // in waiting, and waiting for it to go stale is what let #8852
+            // sit through its blocker closing (#8925).
+            if finding.undeclared {
+                prose_only.push(finding.clone());
+            }
+            match finding.verdict {
+                Verdict::Stale(_) => stale.push(finding),
+                Verdict::Superseded { .. } => superseded.push(finding),
+                Verdict::Undocumented => undocumented.push(finding),
+                Verdict::StillBlocked => {}
             }
         }
-
-        let enumerate_error = if enumerate_errors.is_empty() {
-            None
-        } else {
-            Some(enumerate_errors.join("; "))
-        };
 
         let sections = Sections {
             stale: &stale,
@@ -193,6 +209,7 @@ impl StaleBlockedArgs {
             prose_only: &prose_only,
             unevaluated: &unevaluated,
             enumerate_error: enumerate_error.as_deref(),
+            cost: &cost,
         };
 
         if self.json {
@@ -214,6 +231,7 @@ struct Sections<'a> {
     prose_only: &'a [Finding],
     unevaluated: &'a [(String, String)],
     enumerate_error: Option<&'a str>,
+    cost: &'a budget::ForgeCost,
 }
 
 impl Sections<'_> {
@@ -249,7 +267,7 @@ pub(super) fn list_blocked(
     if let Some(r) = repo {
         args.extend(["--repo", r]);
     }
-    args.extend(["--json", "number,title", "--limit", &limit]);
+    args.extend(["--json", "number", "--limit", &limit]);
 
     let q: Query<Vec<IssueRow>> = gh_query(&args, root, false, |v: &Vec<IssueRow>| v.is_empty());
     match q {
@@ -493,6 +511,19 @@ fn report(s: &Sections<'_>, quiet: bool) {
         return;
     }
 
+    // Only when something was examined: an empty population stays silent.
+    if s.cost.projected != budget::Projection::default() {
+        let _ = writeln!(w, "{}", s.cost.summary());
+        if let Some(why) = s
+            .cost
+            .budget_refused
+            .as_deref()
+            .or(s.cost.budget_stopped.as_deref())
+        {
+            let _ = writeln!(w, "[stale-blocked] {why}");
+        }
+    }
+
     if s.any() {
         println!(
             "[stale-blocked] WARNING: {} stale, {} superseded, {} undocumented, {} prose-only \
@@ -566,6 +597,7 @@ fn print_json(s: &Sections<'_>) {
             "prose_only": prose_only_json,
             "unevaluated": uneval_json,
             "enumerate_error": s.enumerate_error,
+            "forge_cost": s.cost,
         })
     );
 }

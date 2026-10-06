@@ -2307,6 +2307,10 @@ impl SweepRegistry {
         // round trips below have already spent wall-clock time.
         let episode_start = Utc::now();
         let mut lease_order_yield: Option<(String, String)> = None;
+        // #10345: set when the yield is the leaseless-label variant, with the
+        // local window of this dispatcher's own flip, so step 4d can tell a
+        // phantom (own flip misread) from a genuine hand-claim.
+        let mut leaseless_flip_window: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
         if !self.config.skip_label_flip {
             // 4a. Cross-host collision guard (Issue #4085, Phase 0 of #4028;
             //     upgraded from detection-only to enforcement by #5789): read
@@ -2373,9 +2377,11 @@ impl SweepRegistry {
                     //     young LEASELESS foreign `loom:building` — a claim
                     //     from a lane that published no lease record — which
                     //     `yield_identity` reports through this same channel.
-                    lease_order_yield = self
-                        .resolve_lease_order(issue_number, &sweep_id, episode_start)
-                        .yield_identity();
+                    let decision = self.resolve_lease_order(issue_number, &sweep_id, episode_start);
+                    if matches!(decision, LeaseOrderDecision::YieldToLeaselessClaim { .. }) {
+                        leaseless_flip_window = Some((episode_start, Utc::now()));
+                    }
+                    lease_order_yield = decision.yield_identity();
                 }
                 Err(e) => {
                     log::warn!(
@@ -2412,6 +2418,29 @@ impl SweepRegistry {
             );
             self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
             let _ = self.release_lock_owned(issue_number, &sweep_id);
+            // #10345: a leaseless yield whose `loom:building` event is provably
+            // this dispatcher's own flip (fleet actor, inside the flip window,
+            // no foreign lease) is a phantom: revert it in the same step so the
+            // issue is not stranded. Anything unverifiable keeps the label.
+            if let Some((flip_start, flip_end)) = leaseless_flip_window {
+                if self.leaseless_yield_is_own_phantom(
+                    issue_number,
+                    &sweep_id,
+                    flip_start,
+                    flip_end,
+                ) {
+                    log::warn!(
+                        "sweep_registry: leaseless yield for issue #{issue_number} \
+                         sweep_id={sweep_id} is this dispatcher's own phantom `loom:building` \
+                         (#10345) - reverting the label before standing down."
+                    );
+                    if let Err(e) = self.restore_label_to_ready(issue_number) {
+                        log::warn!(
+                            "sweep_registry: phantom-claim revert for #{issue_number} failed: {e}"
+                        );
+                    }
+                }
+            }
             self.post_lease_yield_comment(
                 issue_number,
                 &sweep_id,

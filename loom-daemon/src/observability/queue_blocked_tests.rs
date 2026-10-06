@@ -11,6 +11,7 @@ use crate::types::{QueueDisposition, WorkFinderTickSummary};
 
 fn item(number: u32, labels: &[&str]) -> RestIssue {
     RestIssue {
+        comments: 0,
         number,
         title: Some("secret title".into()),
         labels: labels.iter().map(|l| (*l).to_string()).collect(),
@@ -46,6 +47,7 @@ fn a_blocked_issue_without_loom_issue_becomes_an_unranked_blocked_row() {
         item(6, &["loom:blocked", "loom:issue"]),
         // A PR in the REST issues listing.
         RestIssue {
+            comments: 0,
             is_pull_request: true,
             ..item(7, &["loom:blocked"])
         },

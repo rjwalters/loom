@@ -80,6 +80,11 @@ pub enum SpanName {
     /// trace, naming the App, owner, resource, end and reset source.
     #[serde(rename = "forge.reader.withdrawn")]
     ForgeReaderWithdrawn,
+    /// One read-pool spill-latch transition (W4-B): an instant span, its own
+    /// root trace, naming the repo, resource, home and target reader, mode
+    /// and release instant.
+    #[serde(rename = "forge.reader.spill")]
+    ForgeReaderSpill,
 }
 
 impl SpanName {
@@ -105,6 +110,7 @@ impl SpanName {
             Self::GithubInvoke => "invoke github",
             Self::RateLimitTrip => "loom.ratelimit.trip",
             Self::ForgeReaderWithdrawn => "forge.reader.withdrawn",
+            Self::ForgeReaderSpill => "forge.reader.spill",
         }
     }
 }

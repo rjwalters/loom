@@ -41,6 +41,7 @@ fn load_with(all_comments: bool) -> (World, Vec<RepoInput>, Value) {
             world.add(
                 slug,
                 RestIssue {
+                    comments: 0,
                     number,
                     title: it["title"].as_str().map(str::to_string),
                     labels: it["labels"]

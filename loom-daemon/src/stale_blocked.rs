@@ -61,6 +61,9 @@
 
 use crate::dep_recheck::{extract, named, premise, recheck};
 
+pub mod batch;
+pub mod budget;
+
 /// Which kind of artifact a finding is about.
 ///
 /// Carried rather than inferred: the two populations come from different
@@ -367,3 +370,9 @@ fn one_line(rendered: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod batch_tests;
+
+#[cfg(test)]
+mod budget_tests;

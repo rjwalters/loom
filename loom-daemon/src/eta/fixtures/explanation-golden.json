@@ -416,7 +416,13 @@
     "breaker_state": null,
     "breaker_cooldown_until": null,
     "checks_pending": null,
-    "checks_failed": null
+    "checks_failed": null,
+    "checks_all_pending": null,
+    "checks_all_failed": null,
+    "ratelimit_writer_core_remaining": null,
+    "ratelimit_writer_graphql_remaining": null,
+    "ratelimit_min_remaining": null,
+    "ratelimit_exhausted": null
   },
   "features_omitted": [
     {
@@ -653,6 +659,30 @@
     },
     {
       "name": "checks_failed",
+      "reason": "not_collected"
+    },
+    {
+      "name": "checks_all_pending",
+      "reason": "not_collected"
+    },
+    {
+      "name": "checks_all_failed",
+      "reason": "not_collected"
+    },
+    {
+      "name": "ratelimit_writer_core_remaining",
+      "reason": "not_collected"
+    },
+    {
+      "name": "ratelimit_writer_graphql_remaining",
+      "reason": "not_collected"
+    },
+    {
+      "name": "ratelimit_min_remaining",
+      "reason": "not_collected"
+    },
+    {
+      "name": "ratelimit_exhausted",
       "reason": "not_collected"
     }
   ],

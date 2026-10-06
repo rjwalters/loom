@@ -68,6 +68,9 @@ pub struct RestIssue {
     /// Present when the row is actually a pull request (REST issue listings
     /// include PRs). Call sites filter on this to keep pre-#4428 semantics.
     pub is_pull_request: bool,
+    /// The REST `comments` count (#10480): a row with `0` needs no comment
+    /// read at all. `0` when the forge omitted it.
+    pub comments: u32,
 }
 
 /// List open/closed issues carrying `label`, via the ETag cache.
@@ -221,7 +224,7 @@ fn list_issues_cached_retrying(
 /// Deliberately string-matched rather than a numeric field: callers here only
 /// ever see `gh`'s own formatted diagnostic (`gh: Not Found (HTTP 404)`), not
 /// a structured status code.
-fn is_404_error(error_message: &str) -> bool {
+pub(crate) fn is_404_error(error_message: &str) -> bool {
     error_message.contains("HTTP 404")
 }
 
@@ -481,11 +484,14 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
         user: Option<RawUser>,
         #[serde(default)]
         pull_request: Option<serde_json::Value>,
+        #[serde(default)]
+        comments: u32,
     }
     let rows: Vec<RawIssue> = serde_json::from_str(body.trim())?;
     Ok(rows
         .into_iter()
         .map(|r| RestIssue {
+            comments: r.comments,
             number: r.number,
             title: r.title,
             labels: r.labels.into_iter().map(|l| l.name).collect(),

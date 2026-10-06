@@ -9,7 +9,7 @@
 use chrono::{DateTime, Utc};
 use loom_daemon::health::format_window;
 use loom_daemon::types::{
-    DaemonStatusReport, ForgeBucketStatus, ForgeBudgetReading, ForgeCallCounts,
+    DaemonStatusReport, ForgeBucketStatus, ForgeBudgetReading, ForgeCallCounts, ReadSpillStatus,
     ReaderWithdrawalStatus,
 };
 
@@ -66,6 +66,27 @@ pub fn render_forge_calls_lines(report: &DaemonStatusReport, now: DateTime<Utc>)
     }
     lines.extend(render_bucket_block(fc.buckets.as_deref().unwrap_or_default(), now));
     lines.extend(render_withdrawals(&fc.reader_withdrawals, now));
+    lines.extend(render_spills(&fc.read_spills, now));
+    lines
+}
+
+/// W4-B: each repo whose reads are spilling off a home reader that is
+/// running dry, and when the latch releases.
+fn render_spills(rows: &[ReadSpillStatus], now: DateTime<Utc>) -> Vec<String> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["  read spills:".to_string()];
+    lines.extend(rows.iter().map(|s| {
+        format!(
+            "    {} {} off {} ({}): releases in {}",
+            s.owner_repo,
+            s.resource,
+            s.from,
+            s.mode,
+            ago((s.until - now).num_seconds())
+        )
+    }));
     lines
 }
 
@@ -226,6 +247,7 @@ mod tests {
             identity_roles: None,
             buckets: None,
             reader_withdrawals: Vec::new(),
+            read_spills: Vec::new(),
         };
         let lines = render_forge_calls_lines(&report(Some(fc)), now);
         let text = lines.join("\n");
@@ -330,6 +352,31 @@ mod tests {
             .position(|l| l.contains("reader withdrawals"))
             .unwrap();
         assert!(lines[at + 1].contains("app-7 acme core: back in 1"), "{lines:?}");
+    }
+
+    #[test]
+    fn engaged_read_spills_are_listed() {
+        let now = Utc::now();
+        let fc = ForgeCallsStatus {
+            window_secs: 3600,
+            read_spills: vec![ReadSpillStatus {
+                owner_repo: "acme/hot".into(),
+                resource: "core".into(),
+                from: "app-7".into(),
+                mode: "partial".into(),
+                until: now + chrono::Duration::minutes(40),
+            }],
+            ..Default::default()
+        };
+        let lines = render_forge_calls_lines(&report(Some(fc)), now);
+        let at = lines
+            .iter()
+            .position(|l| l.contains("read spills"))
+            .unwrap();
+        assert!(
+            lines[at + 1].contains("acme/hot core off app-7 (partial): releases in"),
+            "{lines:?}"
+        );
     }
 
     #[test]

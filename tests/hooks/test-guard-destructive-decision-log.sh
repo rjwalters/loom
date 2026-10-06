@@ -333,6 +333,32 @@ done
 
 echo ""
 
+echo -e "${YELLOW}--- Toggle-naming lines in ask/deny messages (#10434) ---${NC}"
+# =========================================================================
+# Toggleable categories name the env var (Claude Code settings "env") and the
+# config key; none suggests an inline env prefix; floor denials name no toggle.
+assert_ask_reason_matches "#10434: cloud-cli ask names LOOM_GUARD_CLOUD and guards.cloudCli" \
+    "aws ec2 terminate-instances --instance-ids i-1234" \
+    'Toggle: set LOOM_GUARD_CLOUD=0 in Claude Code settings "env", or "guards.cloudCli": false in .loom/config.json'
+assert_deny_reason_matches "#10434: sql-ddl deny names LOOM_GUARD_SQL and guards.sqlDdl" \
+    "psql -c 'DROP TABLE users;'" \
+    'Toggle: set LOOM_GUARD_SQL=0 .*"guards.sqlDdl": false'
+_t_out=$(run_guard "aws ec2 terminate-instances --instance-ids i-1234" || true)
+_t_reason=$(echo "$_t_out" | jq -r '.hookSpecificOutput.permissionDecisionReason // empty')
+if grep -qE '(^|[[:space:]])LOOM_GUARD_[A-Z_]+=[^[:space:]]+ (aws|git|rm|psql)' <<<"$_t_reason"; then
+    dl_assert "#10434: message never suggests an inline env prefix" 1 "$_t_reason"
+else
+    dl_assert "#10434: message never suggests an inline env prefix" 0
+fi
+_t_out=$(run_guard "gh repo delete myrepo --yes" || true)
+_t_reason=$(echo "$_t_out" | jq -r '.hookSpecificOutput.permissionDecisionReason // empty')
+if grep -q 'Toggle:' <<<"$_t_reason"; then
+    dl_assert "#10434: ungated-floor denial names no toggle" 1 "$_t_reason"
+else
+    dl_assert "#10434: ungated-floor denial names no toggle" 0
+fi
+echo ""
+
 # =========================================================================
 
 print_summary

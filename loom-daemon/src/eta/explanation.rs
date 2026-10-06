@@ -705,6 +705,27 @@ pub struct Features {
     /// never count.
     #[serde(default)]
     pub checks_failed: Option<u32>,
+    /// Every check run or status on the PR's head not yet completed,
+    /// required or not. Kept apart from `checks_pending` (#10334).
+    #[serde(default)]
+    pub checks_all_pending: Option<u32>,
+    /// Every check run or status on the PR's head that failed, required or
+    /// not. Kept apart from `checks_failed` (#10334).
+    #[serde(default)]
+    pub checks_all_failed: Option<u32>,
+    /// The writer credential's REST (`core`) calls left (#10334).
+    #[serde(default)]
+    pub ratelimit_writer_core_remaining: Option<u32>,
+    /// The writer credential's GraphQL calls left.
+    #[serde(default)]
+    pub ratelimit_writer_graphql_remaining: Option<u32>,
+    /// The fewest calls left over the item's serving reader and the writer,
+    /// both pools: the most constrained identity.
+    #[serde(default)]
+    pub ratelimit_min_remaining: Option<u32>,
+    /// Whether that most constrained identity is at zero (not yet reset).
+    #[serde(default)]
+    pub ratelimit_exhausted: Option<bool>,
 }
 
 /// Why a feature is null.
@@ -718,7 +739,7 @@ pub struct FeatureOmitted {
 
 impl Features {
     /// Every feature name, in field order.
-    pub const NAMES: [&'static str; 64] = [
+    pub const NAMES: [&'static str; 70] = [
         "labels",
         "complexity_marker",
         "points_marker",
@@ -783,6 +804,12 @@ impl Features {
         "breaker_cooldown_until",
         "checks_pending",
         "checks_failed",
+        "checks_all_pending",
+        "checks_all_failed",
+        "ratelimit_writer_core_remaining",
+        "ratelimit_writer_graphql_remaining",
+        "ratelimit_min_remaining",
+        "ratelimit_exhausted",
     ];
 
     /// `omitted` plus a `reason` entry for every null feature it does not

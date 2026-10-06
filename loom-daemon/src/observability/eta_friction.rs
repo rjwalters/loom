@@ -43,8 +43,8 @@ pub const PR_READ_BUDGET: usize = 12;
 
 const CALLER: &str = "eta_friction";
 
-/// Accounting rows (#9831) for the reads the inventory has no row for yet.
-const OPEN_PRS: ForgeOp = ForgeOp::uninventoried("open-PR listing has no inventory row");
+/// Accounting rows (#9831); the last two reads have no inventory row yet.
+const OPEN_PRS: ForgeOp = ops::PR_LIST_OPEN;
 const CHECK_RUNS: ForgeOp = ForgeOp::uninventoried("check-runs read has no inventory row");
 const PR_RUNS: ForgeOp =
     ForgeOp::uninventoried("repo PR workflow-runs listing has no inventory row");

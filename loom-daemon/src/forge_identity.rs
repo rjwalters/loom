@@ -68,6 +68,10 @@ pub use withdrawal::{
     READ_ROUTING_ENV, SECONDARY_WITHDRAWAL,
 };
 
+#[path = "forge_identity/route.rs"]
+pub mod route;
+pub use route::{route_read, Placement, ReadClass, RouteDecision, RouteRequest};
+
 /// The writer slug's env override (shared with `star_liveness::trust`).
 pub const APP_SLUG_ENV: &str = "LOOM_GITHUB_APP_SLUG";
 
@@ -105,6 +109,22 @@ pub struct Identity {
     pub slug: Option<String>,
     /// Absolute path to the App's private key.
     pub private_key_path: PathBuf,
+    /// The owners this reader serves (W4-B), lowercased; `None` (the
+    /// `owners` key absent) serves every owner. A reader limited to some
+    /// owners is left out of every other owner's walk, so adding one never
+    /// moves another owner's repos ([`route::eligible_readers`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owners: Option<Vec<String>>,
+}
+
+impl Identity {
+    /// Whether this reader may serve reads for `owner` (case-insensitive).
+    #[must_use]
+    pub fn serves_owner(&self, owner: &str) -> bool {
+        self.owners
+            .as_ref()
+            .is_none_or(|list| list.iter().any(|o| o.eq_ignore_ascii_case(owner)))
+    }
 }
 
 /// The fleet's identities.
@@ -195,6 +215,7 @@ pub fn from_config(
                         app_id: m.app_id.clone(),
                         slug: None,
                         private_key_path: m.private_key_path.clone(),
+                        owners: None,
                     })
                     .collect(),
                 legacy_logins: Vec::new(),
@@ -217,6 +238,14 @@ pub fn from_config(
 /// misconfiguration is visible where an operator checks, not only in a log.
 #[must_use]
 pub fn config_warnings(effective: &Value) -> Vec<String> {
+    let mut out = writer_warnings(effective);
+    out.extend(owners_warnings(effective));
+    out.extend(route::routing_config_warnings(effective));
+    out
+}
+
+/// The writer half of [`config_warnings`].
+fn writer_warnings(effective: &Value) -> Vec<String> {
     let configured = crate::config_resolver::get_path(effective, "forge.githubApp")
         .and_then(identity_from_value);
     let declared = crate::config_resolver::get_path(effective, "forge.identities")
@@ -295,7 +324,64 @@ fn identity_from_value(v: &Value) -> Option<Identity> {
         app_id,
         slug,
         private_key_path: expand_home(key),
+        owners: owners_from_value(v),
     })
+}
+
+/// A roster entry's optional `owners` list (W4-B): each a valid GitHub
+/// owner, lowercased, duplicates dropped. An invalid name is dropped (and
+/// reported by [`config_warnings`]); `owners` absent or not an array is
+/// `None`, which serves every owner.
+fn owners_from_value(v: &Value) -> Option<Vec<String>> {
+    let list = v.get("owners")?.as_array()?;
+    let mut out: Vec<String> = Vec::new();
+    for owner in list.iter().filter_map(Value::as_str).map(str::trim) {
+        let lc = owner.to_ascii_lowercase();
+        if crate::forge_bucket_book::valid_owner(owner) && !out.contains(&lc) {
+            out.push(lc);
+        }
+    }
+    Some(out)
+}
+
+/// Problems with the readers' `owners` lists (W4-B): an entry that is not a
+/// valid owner name (dropped), or a list that serves no owner at all.
+fn owners_warnings(effective: &Value) -> Vec<String> {
+    let Some(readers) = crate::config_resolver::get_path(effective, "forge.identities.readers")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for r in readers {
+        let id = r
+            .get("appId")
+            .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
+            .unwrap_or_else(|| "?".to_string());
+        let Some(owners) = r.get("owners") else {
+            continue;
+        };
+        let Some(list) = owners.as_array() else {
+            out.push(format!(
+                "forge.identities.readers (app {id}): owners must be an array of owner names; ignored, so the reader serves every owner"
+            ));
+            continue;
+        };
+        for bad in list.iter().filter(|o| {
+            !o.as_str()
+                .is_some_and(|s| crate::forge_bucket_book::valid_owner(s.trim()))
+        }) {
+            out.push(format!(
+                "forge.identities.readers (app {id}): owners entry {bad} is not a GitHub owner name; dropped"
+            ));
+        }
+        if owners_from_value(r).is_some_and(|l| l.is_empty()) {
+            out.push(format!(
+                "forge.identities.readers (app {id}): owners lists no valid owner, so the reader serves no reads — remove the key to serve every owner"
+            ));
+        }
+    }
+    out
 }
 
 /// `~/…` → `$HOME/…`. `github-app-token.sh` does not expand `~`, so a
@@ -448,7 +534,8 @@ pub fn role_of(roster: &Roster, login: &str) -> Option<&'static str> {
 /// Walks forward from the #9376 hash index, so the fallback order is itself
 /// deterministic across hosts, skipping a reader withdrawn as an App (rate
 /// limit, bad credentials) or for this one repo (not covered by its
-/// installation).
+/// installation). The roster view of [`route_read`]'s home placement (no
+/// token files are read): `forge identities` uses it to name the reader.
 #[must_use]
 pub fn reader_for<'a>(roster: &'a Roster, owner_repo: &str) -> Option<&'a Identity> {
     reader_for_at(roster, owner_repo, SystemTime::now())
@@ -486,10 +573,17 @@ pub fn reader_for_resource_at<'a>(
     if crate::forge_egress::publication::github_credential_forbidden(workspace_root()) {
         return None;
     }
-    let n = roster.readers.len();
-    let start = forge_read_pool::assignment_index(owner_repo, n)?;
-    (0..n)
-        .map(|off| &roster.readers[(start + off) % n])
+    let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
+    // The same eligible set and walk as `route_read` (W4-B): a reader
+    // limited to other owners is not counted (legacy: every reader).
+    let readers: Vec<&Identity> = if mode == RoutingMode::Legacy {
+        roster.readers.iter().collect()
+    } else {
+        route::eligible_readers(roster, owner)
+    };
+    let start = forge_read_pool::assignment_index(owner_repo, readers.len())?;
+    forge_read_pool::walk_order(start, readers.len())
+        .map(|i| readers[i])
         .find(|r| reader_eligible(&r.app_id, owner_repo, resource, now, mode))
 }
 
@@ -532,6 +626,14 @@ fn repo_withdrawn_at(app_id: &str, owner_repo: &str, now: SystemTime) -> bool {
     };
     map.get(&(app_id.to_string(), owner_repo.to_ascii_lowercase()))
         .is_some_and(|&until| now < until)
+}
+
+/// When reader `app_id`'s withdrawal from `owner_repo` ends, if live at `now`.
+fn repo_withdrawn_until(app_id: &str, owner_repo: &str, now: SystemTime) -> Option<SystemTime> {
+    let map = repo_withdrawals().lock().ok()?;
+    map.get(&(app_id.to_string(), owner_repo.to_ascii_lowercase()))
+        .copied()
+        .filter(|&until| now < until)
 }
 
 /// Withdraw reader `app_id` for `owner_repo` only, until `until`.
@@ -593,34 +695,28 @@ pub fn dir_is_fresh(dir: &Path, now: SystemTime) -> bool {
 /// `host`: `(GH_CONFIG_DIR, reader app id)`. `None` sends the read to the
 /// writer: no primary workspace yet, a non-github.com host, no readers, every
 /// reader withdrawn, or the chosen reader's token missing or near expiry.
+///
+/// A wrapper over [`route_read`] with no affinity key and
+/// [`ReadClass::Gate`], mapping [`RouteDecision::Exhausted`] to `None`, so
+/// its callers keep the home placement and the writer fallback.
 #[must_use]
 pub fn read_credential(owner_repo: &str, host: Option<&str>) -> Option<(PathBuf, String)> {
     read_credential_for(owner_repo, host, Resource::Core)
 }
 
-/// [`read_credential`] for a read that spends `resource` (W4-A): a reader
-/// withdrawn from this owner's `resource` is skipped.
+/// [`read_credential`] for a read that spends `resource`.
 #[must_use]
 pub fn read_credential_for(
     owner_repo: &str,
     host: Option<&str>,
     resource: Resource,
 ) -> Option<(PathBuf, String)> {
-    if host.is_some_and(|h| !h.eq_ignore_ascii_case("github.com")) {
-        return None;
-    }
-    let ws = workspace_root()?;
-    read_credential_in_for(
-        ws,
-        &cached(ws),
-        owner_repo,
-        resource,
-        SystemTime::now(),
-        RoutingMode::current(),
-    )
+    route_read(&RouteRequest::gate(owner_repo, host, resource), SystemTime::now()).into_credential()
 }
 
-/// Pure-ish core of [`read_credential`] (reads only the sidecar/token files).
+/// Pure-ish core of [`read_credential`] (reads only the sidecar/token files)
+/// for a caller with its own workspace root and roster. No egress check, as
+/// before W4-B; no split (no affinity key).
 #[must_use]
 pub fn read_credential_in(
     workspace_root: &Path,
@@ -638,7 +734,9 @@ pub fn read_credential_in(
     )
 }
 
-/// [`read_credential_in`] for a `resource` read under `mode`.
+/// [`read_credential_in`] for a `resource` read under `mode`: the
+/// [`route_read`] walk with no affinity key (home placement, then forward
+/// past a withdrawn or stale reader), still with no egress check.
 #[must_use]
 pub fn read_credential_in_for(
     workspace_root: &Path,
@@ -648,25 +746,19 @@ pub fn read_credential_in_for(
     now: SystemTime,
     mode: RoutingMode,
 ) -> Option<(PathBuf, String)> {
-    let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
-    if owner.is_empty() {
-        return None;
-    }
-    // Walk the same deterministic order reader_for uses, but also skip a
-    // reader whose token for this owner is missing or near expiry, so one
-    // reader's stalled refresh moves its repos to the next reader rather than
-    // straight onto the writer's budget.
-    let n = roster.readers.len();
-    let start = forge_read_pool::assignment_index(owner_repo, n)?;
-    (0..n)
-        .map(|off| &roster.readers[(start + off) % n])
-        .find_map(|r| {
-            if !reader_eligible(&r.app_id, owner_repo, resource, now, mode) {
-                return None;
-            }
-            let dir = reader_dir(workspace_root, owner, r);
-            dir_is_fresh(&dir, now).then(|| (dir, r.app_id.clone()))
-        })
+    let cfg = route::cached_routing(workspace_root);
+    route::route_read_in(
+        workspace_root,
+        roster,
+        &RouteRequest::gate(owner_repo, None, resource),
+        &route::RouteEnv {
+            mode,
+            egress_forbidden: false,
+            cfg: &cfg,
+        },
+        now,
+    )
+    .into_credential()
 }
 
 /// Point `cmd` at a reader for a read of `owner_repo`, returning the reader's
@@ -715,6 +807,44 @@ impl IdentityRole {
 pub fn reader_bucket(app_id: &str, owner_repo: &str) -> String {
     let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
     format!("reader:{app_id}@{}", owner.to_ascii_lowercase())
+}
+
+/// The prefix of every writer rate-limit bucket label (#10334).
+pub const WRITER_BUCKET_PREFIX: &str = "writer@";
+
+/// The public rate-limit bucket label of the writer credential installed for
+/// `owner` (#10334): `writer@<owner>`, lowercased. A multi-owner fleet holds
+/// one writer credential per managed owner (`.loom/gh-config-by-owner/<owner>`
+/// beside the primary `.loom/gh-config`), each with its own budget, so the
+/// owner — a public name, never a credential, token or App id — keys it.
+/// `None` when `owner` is not a plausible GitHub owner name or is
+/// credential-shaped, so nothing but a public owner label is ever recorded.
+#[must_use]
+pub fn writer_bucket(owner: &str) -> Option<String> {
+    let owner = owner.trim();
+    (crate::forge_bucket_book::valid_owner(owner)
+        && crate::forge_call_stats::sanitize(owner).as_deref() == Some(owner))
+    .then(|| format!("{WRITER_BUCKET_PREFIX}{}", owner.to_ascii_lowercase()))
+}
+
+/// The writer bucket that serves `owner_repo` (#10334), mirroring how a
+/// writer `gh` call picks its credential (`GhInvocation::env_plan`): the
+/// owner's own writer when one is registered for it
+/// (`owner_writer_registered`, `credential_preflight::gh_config_dir_for_owner_slug`),
+/// else the primary writer, booked under the workspace's own owner
+/// (`primary_owner`). With the primary owner unknown, the repo's owner — the
+/// same owner a writer row without a credential owner is booked under.
+#[must_use]
+pub fn serving_writer_bucket(
+    owner_repo: &str,
+    owner_writer_registered: bool,
+    primary_owner: Option<&str>,
+) -> Option<String> {
+    let repo_owner = crate::credential_preflight::owner_of_nwo(owner_repo);
+    match primary_owner {
+        Some(primary) if !owner_writer_registered => writer_bucket(primary),
+        _ => writer_bucket(repo_owner),
+    }
 }
 
 /// The one reader-then-writer retry shape (#9537, shared since #9872 by

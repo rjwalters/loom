@@ -192,7 +192,7 @@ fn unchanged_open_prs_read_their_changed_files_once() {
             .updated("2026-10-03T00:00:00Z")
     };
     let body = format!(
-        r#"{}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then echo '{{"files":[{{"path":"src/a.rs"}}]}}'; fi"#,
+        r#"{}case "$*" in *'/files?'*) printf 'HTTP/2.0 200 OK\r\n\r\n'; echo '[{{"filename":"src/a.rs"}}]' ;; esac"#,
         pulls_arm(&[seq_row(3), seq_row(2), seq_row(1)])
     );
     let (gh, log) = fake_gh(dir.path(), &body);
@@ -202,7 +202,8 @@ fn unchanged_open_prs_read_their_changed_files_once() {
             assert_eq!(report.open_prs, 3);
         }
     });
-    assert_eq!(calls_matching(&log, "--json files"), 3, "one view per PR, not per pass");
+    assert_eq!(calls_matching(&log, "/files?"), 3, "one files read per PR, not per pass");
+    assert_eq!(calls_matching(&log, "--json files"), 0, "no GraphQL files read (#10382)");
 }
 
 #[test]
