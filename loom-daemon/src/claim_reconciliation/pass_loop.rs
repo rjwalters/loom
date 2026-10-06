@@ -90,6 +90,10 @@ pub(super) fn run_reconciliation_pass_over_roots(
         stats
             .verdict_stats
             .merge(forge::reconcile_pr_verdicts(gh_bin, root));
+        // #10256: after the verdict pass (which revokes before it
+        // invalidates), confirm merges and route drops of queued PRs within
+        // this tick. Returns before any forge call in direct mode.
+        crate::forge_merge_queue::gh_lifecycle::daemon_tick(gh_bin, root);
         // #8922: AFTER the verdict pass, so a verdict it just re-queued to
         // `loom:review-requested` is checked for base conflicts on this tick.
         //

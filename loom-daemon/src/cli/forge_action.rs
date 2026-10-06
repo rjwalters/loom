@@ -830,7 +830,12 @@ fn write_target(action: &ForgeAction) -> Option<Option<String>> {
         ForgeAction::MergeQueue {
             action:
                 super::forge_merge_queue_cmd::MergeQueueAction::Enqueue { repo, .. }
-                | super::forge_merge_queue_cmd::MergeQueueAction::Dequeue { repo, .. },
+                | super::forge_merge_queue_cmd::MergeQueueAction::Dequeue { repo, .. }
+                // #10256: these comment, relabel, enqueue or dequeue.
+                // `reconcile` is vetted inside its queue-mode branch instead:
+                // in direct mode (every `merge-pr.sh` run) it writes nothing.
+                | super::forge_merge_queue_cmd::MergeQueueAction::Handoff { repo, .. }
+                | super::forge_merge_queue_cmd::MergeQueueAction::Revoke { repo, .. },
         } => Some(repo.clone()),
         // #10012: `parent link` stars and links, so it is vetted too.
         ForgeAction::Parent {

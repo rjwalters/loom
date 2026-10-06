@@ -9,8 +9,13 @@
 //! - [`github`] — the GitHub [`ops::QueueApi`] (GraphQL via the counted `gh`
 //!   facade).
 //! - [`preflight`] — capability preflight with distinct failure kinds.
-//! - [`authz`] — the fail-closed authorization protocol (#10256, Phase B1;
-//!   not wired into any caller yet).
+//! - [`authz`] — the fail-closed authorization protocol (#10256, Phase B1).
+//! - [`lifecycle`] (+ [`forge`], [`grants`], [`removal`], [`events`],
+//!   [`gh_lifecycle`], [`lifecycle_cli`]) — the guard-preserving handoff,
+//!   drop/merge reconciliation, revocation before Loom-owned transitions and
+//!   deduplicated telemetry (#10256, Phase B2). Called by `merge-pr.sh`, the
+//!   daemon's claim-reconciliation pass and the verdict-invalidation paths,
+//!   all of which return before any forge call in `direct` mode.
 //! - [`handle`] — `loom-daemon forge merge-queue …`, for operators and tests.
 //!
 //! # Dormant by construction
@@ -34,10 +39,17 @@
 //! | `4` | refused before any forge call (`NOT_QUEUE_MODE` / `EXECUTION_DORMANT`) |
 
 pub mod authz;
+pub mod events;
+pub mod forge;
+pub mod gh_lifecycle;
 pub mod github;
+pub mod grants;
+pub mod lifecycle;
+pub mod lifecycle_cli;
 pub mod mode;
 pub mod ops;
 pub mod preflight;
+pub mod removal;
 
 use std::path::PathBuf;
 
@@ -71,6 +83,30 @@ pub enum MergeQueueCmd {
     },
     Dequeue {
         pr: u32,
+        repo: Option<String>,
+    },
+    /// #10256: reconcile one PR (`merge-pr.sh`) or every pending one.
+    Reconcile {
+        pr: Option<u32>,
+        repo: Option<String>,
+        mode_only: bool,
+    },
+    /// #10256: authorize and enqueue after every direct guard passed.
+    Handoff {
+        pr: u32,
+        approved_sha: String,
+        repo: Option<String>,
+    },
+    /// #10256: revoke + dequeue before a Loom-owned transition.
+    Revoke {
+        pr: u32,
+        reason: String,
+        repo: Option<String>,
+    },
+    /// #10256: body of the required `loom/merge-authorization` check.
+    AuthorizeCheck {
+        pr: u32,
+        pr_head: String,
         repo: Option<String>,
     },
 }
@@ -132,6 +168,8 @@ pub struct Env {
     pub default_repo: Option<String>,
     pub mode: Result<ResolvedMergeMode, mode::MergeModeError>,
     pub execution_enabled: bool,
+    /// Workspace root (comment trust policy, telemetry log).
+    pub root: PathBuf,
 }
 
 impl Env {
@@ -148,6 +186,7 @@ impl Env {
             mode: resolve_merge_mode(&root),
             execution_enabled: QUEUE_EXECUTION_ENABLED,
             gh,
+            root,
         }
     }
 
@@ -173,6 +212,11 @@ pub fn run(cmd: &MergeQueueCmd, env: &Env) -> Report {
         Ok(m) => *m,
         Err(e) => return Report::err("INVALID_MERGE_MODE", e, 2),
     };
+    // #10256: the lifecycle verbs answer `direct` before the forge is even
+    // identified, so a Gitea or direct-mode `merge-pr.sh` is unaffected.
+    if let Some(report) = lifecycle_cli::run(cmd, env, mode.mode) {
+        return report;
+    }
     // Mutations are refused before the forge is even identified, so direct
     // mode provably never reaches a queue API.
     if matches!(cmd, MergeQueueCmd::Enqueue { .. } | MergeQueueCmd::Dequeue { .. }) {
@@ -265,6 +309,13 @@ pub fn run(cmd: &MergeQueueCmd, env: &Env) -> Report {
                 }
             })
         }),
+        // Answered by `lifecycle_cli::run` above.
+        MergeQueueCmd::Reconcile { .. }
+        | MergeQueueCmd::Handoff { .. }
+        | MergeQueueCmd::Revoke { .. }
+        | MergeQueueCmd::AuthorizeCheck { .. } => {
+            Report::err("INTERNAL", "lifecycle verb was not dispatched", 1)
+        }
     }
 }
 
@@ -296,5 +347,7 @@ pub fn handle(cmd: &MergeQueueCmd) -> ! {
 
 #[cfg(test)]
 mod authz_tests;
+#[cfg(test)]
+mod lifecycle_tests;
 #[cfg(test)]
 mod tests;
