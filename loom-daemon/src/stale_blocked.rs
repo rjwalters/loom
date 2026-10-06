@@ -331,7 +331,11 @@ pub fn classify(e: &Evidence) -> Verdict {
                 "every `## Dependencies` checklist entry is ticked: {}",
                 one_line(&named::deps_lines(&e.named))
             ));
-        } else if !unchecked.is_empty() && unchecked.iter().all(satisfied) {
+        } else if unchecked.iter().all(satisfied) {
+            // Reached only with at least one unchecked line (parseable or not).
+            // An empty parseable set is vacuously resolved, so an
+            // all-unparseable checklist lands here as `Unticked { [], N }`;
+            // any open/unknown parseable ref keeps it `StillBlocked`.
             unticked = Some(Verdict::Unticked {
                 resolved_refs: unchecked.iter().map(|d| d.reference()).collect(),
                 unparsed: e.unparsed_unchecked,

@@ -120,14 +120,36 @@ fn unparseable_unchecked_line_next_to_resolved_entries_is_unticked() {
     );
 }
 
-/// A checklist whose only unchecked lines are unreadable is documented and unmet.
+/// A checklist whose only unchecked lines are unreadable is documented and
+/// unmet, but it has no open parseable ref: the empty parseable set is
+/// vacuously resolved, so it goes to `Unticked` for a human to read the lines.
 #[test]
-fn only_unparseable_unchecked_lines_is_still_blocked() {
+fn only_unparseable_unchecked_lines_is_unticked() {
     let e = Evidence {
-        unparsed_unchecked: 1,
+        unparsed_unchecked: 2,
         ..Evidence::default()
     };
-    assert_eq!(classify(&e), Verdict::StillBlocked);
+    assert_eq!(
+        classify(&e),
+        Verdict::Unticked {
+            resolved_refs: vec![],
+            unparsed: 2
+        }
+    );
+}
+
+/// An open parseable unchecked ref beside an unparseable line keeps the
+/// checklist `StillBlocked`: the open ref is a real, current blocker.
+#[test]
+fn open_parseable_ref_beside_unparseable_line_is_still_blocked() {
+    for state in [Some("OPEN"), None] {
+        let e = Evidence {
+            named: vec![dep(42, false, state)],
+            unparsed_unchecked: 1,
+            ..Evidence::default()
+        };
+        assert_eq!(classify(&e), Verdict::StillBlocked, "state {state:?}");
+    }
 }
 
 /// gf180-tmds-tx#186: `- [ ] #187: ... do not infer ratification`, #187 merged.
@@ -377,13 +399,12 @@ fn a_blocker_cited_only_in_prose_is_undeclared() {
 /// A checklist reference with no park record counts as prose-only
 /// too: the park record is the declaration, not the reference shape.
 #[test]
-fn a_checklist_or_closing_pr_reference_without_a_record_is_undeclared() {
-    for e in [Evidence {
+fn a_checklist_reference_without_a_record_is_undeclared() {
+    let e = Evidence {
         named: vec![dep(1, false, Some("OPEN"))],
         ..Evidence::default()
-    }] {
-        assert!(undeclared(&e));
-    }
+    };
+    assert!(undeclared(&e));
 }
 
 /// An artifact with nothing cited at all is `Undocumented`, the louder finding —

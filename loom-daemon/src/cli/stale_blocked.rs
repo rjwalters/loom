@@ -326,7 +326,9 @@ fn render(w: &mut impl Write, out: &mut impl Write, s: &Sections<'_>, quiet: boo
                 unparsed,
             } = &f.verdict
             {
-                let _ = writeln!(w, "      - refs resolved: {}", resolved_refs.join(", "));
+                if !resolved_refs.is_empty() {
+                    let _ = writeln!(w, "      - refs resolved: {}", resolved_refs.join(", "));
+                }
                 if *unparsed > 0 {
                     let _ =
                         writeln!(w, "      - {unparsed} unchecked line(s) carry no readable ref");
