@@ -30,14 +30,12 @@
 //!
 //! - **Queue features**: `queue_features(subject, roster, log, scope, t)`.
 //!   The subject's entry is the **split** episode's. The roster is every PR
-//!   open in an episode at `t − LAG`, known at `entered_at + LAG`. The log has
-//!   one event per episode end before `H`, known at `at + LAG`: a merge is one
-//!   `merge` event (never an exit plus a merge, which would double-count the
-//!   departure), every other end (`left` for a stage or a close, `unstaged`)
-//!   an `exit`, both with the episode's stage. So `merge_wait → merge_hold` is
-//!   a `merge_wait` exit, as serving journals it. `log.from` is the latest of
-//!   the snapshots' earliest episode entries, the instant from which every
-//!   repo's log is complete. The scope is every loaded snapshot's repo.
+//!   open in an episode at `t − LAG`, known at `entered_at + LAG`. The log is
+//!   [`SnapshotLog`] (#10500), the one definition serving reads too: one
+//!   event per episode end before `H` (a merge one `merge`, never an exit
+//!   plus a merge), plus every other forge merge of the repo (a PR with no
+//!   loom review label has no episode), each known at `at + LAG`. The scope
+//!   is every loaded snapshot's repo.
 //! - **`age_h`**: hours since the split episode's entry.
 //! - **`rework`**: the PR's `doctor` episodes entered before `t − LAG`, the
 //!   current one included: the Judge rejections knowable at `t`, which is
@@ -87,15 +85,14 @@ use super::{
 use crate::eta::episodes::{EpisodeEnd, EpisodeNext, StageEpisode};
 use crate::eta::flag_timeline::{flags_before, FlagChange};
 use crate::eta::fleet::FleetSnapshot;
+use crate::eta::fleet_log::{one_per_repo, SnapshotLog};
 use crate::eta::labels::{
     FLAG_BLOCKED, FLAG_CI_FAIL, FLAG_CONFLICT, FLAG_OP_HOLD, FLAG_SEQUENCED, FLAG_STARRED,
 };
 use crate::eta::priority_features::{
     priority_features, PriorityEntry, PriorityFeatures, PriorityState,
 };
-use crate::eta::queue_features::{
-    queue_features, EventKind, EventLog, QueueFeatures, QueueSubject, RosterEntry, StageEvent,
-};
+use crate::eta::queue_features::{queue_features, QueueFeatures, QueueSubject, RosterEntry};
 use crate::eta::star::{LinkedStar, StarInputs, StarSource};
 use crate::eta::Stage;
 use chrono::{DateTime, Duration, Utc};
@@ -192,22 +189,6 @@ impl<'a> Pr<'a> {
     }
 }
 
-/// One snapshot per repo: two files for one repo (a case variant) would
-/// otherwise double every PR. The later `(as_of, snapshot_id)` wins, which is
-/// independent of load order.
-fn one_per_repo(snapshots: &[FleetSnapshot]) -> Vec<&FleetSnapshot> {
-    let mut by_repo: BTreeMap<String, &FleetSnapshot> = BTreeMap::new();
-    for snapshot in snapshots {
-        let slot = by_repo
-            .entry(snapshot.repo.to_ascii_lowercase())
-            .or_insert(snapshot);
-        if (snapshot.as_of, &snapshot.snapshot_id) > (slot.as_of, &slot.snapshot_id) {
-            *slot = snapshot;
-        }
-    }
-    by_repo.into_values().collect()
-}
-
 /// Every PR with an episode, in `(repo, pr)` order, its episodes by entry and
 /// its flag changes by instant.
 fn gather<'a>(snapshots: &[&'a FleetSnapshot]) -> Vec<Pr<'a>> {
@@ -255,77 +236,6 @@ fn gather<'a>(snapshots: &[&'a FleetSnapshot]) -> Vec<Pr<'a>> {
         }
     }
     prs.into_values().collect()
-}
-
-/// The stage events: one per episode end before `horizon`, sorted by instant,
-/// plus each repo's merges for the since-merge lookup.
-struct Events {
-    sorted: Vec<StageEvent>,
-    merges_by_repo: BTreeMap<String, Vec<StageEvent>>,
-    from: Option<DateTime<Utc>>,
-}
-
-impl Events {
-    fn new(prs: &[Pr<'_>], horizon: DateTime<Utc>, from: Option<DateTime<Utc>>) -> Self {
-        let lag = Duration::seconds(KNOWABLE_LAG_SEC);
-        let mut sorted: Vec<StageEvent> = Vec::new();
-        for pr in prs {
-            for episode in &pr.episodes {
-                let Some(at) = episode.ended_at().filter(|at| *at < horizon) else {
-                    continue;
-                };
-                let kind = match episode.end {
-                    EpisodeEnd::Left {
-                        next: EpisodeNext::Merged,
-                        ..
-                    } => EventKind::Merge,
-                    _ => EventKind::Exit,
-                };
-                sorted.push(StageEvent {
-                    repo: pr.repo.clone(),
-                    pr: Some(pr.number),
-                    stage: Some(episode.stage),
-                    kind,
-                    at,
-                    known_at: at + lag,
-                });
-            }
-        }
-        sorted.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.cmp(b)));
-        let mut merges_by_repo: BTreeMap<String, Vec<StageEvent>> = BTreeMap::new();
-        for event in sorted.iter().filter(|e| e.kind == EventKind::Merge) {
-            merges_by_repo
-                .entry(event.repo.clone())
-                .or_default()
-                .push(event.clone());
-        }
-        Events {
-            sorted,
-            merges_by_repo,
-            from,
-        }
-    }
-
-    /// The log [`queue_features`] reads at `t`. Equal in effect to the whole
-    /// log: every window it counts over is at most 24 h, and `since_merge`
-    /// reads only each repo's last merge, so the events in `[t − 24 h, t)`
-    /// plus each repo's last merge before that give the same features.
-    fn at(&self, t: DateTime<Utc>) -> EventLog {
-        let window_start = t - Duration::hours(24);
-        let lo = self.sorted.partition_point(|e| e.at < window_start);
-        let hi = self.sorted.partition_point(|e| e.at < t);
-        let mut events: Vec<StageEvent> = self.sorted[lo..hi].to_vec();
-        for merges in self.merges_by_repo.values() {
-            let before = merges.partition_point(|e| e.at < window_start);
-            if let Some(last) = before.checked_sub(1).and_then(|i| merges.get(i)) {
-                events.push(last.clone());
-            }
-        }
-        EventLog {
-            from: self.from,
-            events,
-        }
-    }
 }
 
 fn hours(from: DateTime<Utc>, to: DateTime<Utc>) -> f64 {
@@ -436,18 +346,8 @@ pub fn build_with_star(
         .collect();
     scope.sort();
     scope.dedup();
-    // Only entries before the horizon, so a post-cutoff PR cannot move it.
-    let from = chosen
-        .iter()
-        .filter_map(|s| {
-            s.episodes
-                .iter()
-                .map(|e| e.entered_at)
-                .filter(|at| *at < horizon)
-                .min()
-        })
-        .max();
-    let events = Events::new(&prs, horizon, from);
+    // #10500: the one event-log definition, shared with serving.
+    let events = SnapshotLog::new(&chosen, horizon);
 
     let mut stats = RowStats::default();
     let mut keyed: Vec<((RowKey, FitStage), (TrainingRow, PriorityFeatures))> = Vec::new();

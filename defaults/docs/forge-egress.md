@@ -159,6 +159,12 @@ What Loom does with `launcherPath` (all no-ops with no policy):
   That opt-out affects only which `gh` the daemon execs: worker and container
   credential admission ignores it, so it can never turn a `required` or
   managed-marker host into `unconfigured` (#10446).
+- **Daemon `PATH`** — `loom-daemon-start.sh` (`daemon-start`) puts the launcher's
+  directory first on the `PATH` it bakes into the launchd plist / systemd unit
+  (also ahead of a `LOOM_DAEMON_PATH` override), so scripts, hooks and role
+  prompts the daemon runs resolve the launcher as `gh`; so does the fleet
+  drain's local `gh`. The directory comes from the policy, never from the
+  canonical PATH constant. Re-render (restart) after changing `launcherPath`.
 - **Bare-metal workers** — `loom-daemon spawn-worker` puts the launcher's
   directory first on the worker `PATH` (ahead of the `gh-cached` front, which is
   therefore bypassed under a policy). Under `enforcement.api = required` a worker

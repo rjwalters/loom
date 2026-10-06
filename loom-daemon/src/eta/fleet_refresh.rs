@@ -72,7 +72,9 @@ pub const STATE_SCHEMA: &str = "eta-fleet-refresh-state/v1";
 /// The derivation revision a completed backfill records. Bump it when the
 /// snapshot derivation changes (the kind of change #10245's `flag_changes`
 /// is): every repo then gets a fresh backfill on its next cycle.
-pub const DERIVATION_REV: u32 = 1;
+///
+/// 2 (#10500): `merges` records every forge merge, labelled or not.
+pub const DERIVATION_REV: u32 = 2;
 
 /// Fixed slack subtracted from the watermark when a refresh chooses how far
 /// back to read: clock skew and listing lag.

@@ -29,6 +29,7 @@
 //! | [`Invariant::RuntimesPresent`]  | #4 `.loom/runtimes/` absent in 7 clones (#5002) | yes — converge from `defaults/runtimes/` |
 //! | [`Invariant::TokenRankingFresh`]| #5 stale `.ranking` → wrong concurrency cap     | yes — re-probe via `tokens check --ranking` |
 //! | [`Invariant::ForgeEgressAligned`]| #9984 `gh` would not reach the mandated API origin | no — files/refreshes an issue naming the finding codes; closes it once aligned |
+//! | [`Invariant::GhFrontWired`]| #10516 interactive sessions do not reach the agent `gh` front | no — `loom update` re-provisions the SessionStart hook |
 //!
 //! The remaining six conditions (binary freshness, sidecar reachability,
 //! telemetry identity, sweep liveness, pid file, stale repo-local `.mcp.json`)
@@ -72,6 +73,7 @@ use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::workspace_registry::WorkspaceRegistry;
 
 mod forge_egress_invariant;
+pub mod gh_front_invariant;
 
 // ============================================================================
 // Constants (env overrides + built-in defaults)
@@ -145,6 +147,11 @@ pub enum Invariant {
     /// auto-repairable: the issue names the finding codes and closes itself
     /// once the routing verdict is aligned again.
     ForgeEgressAligned,
+    /// #10516: interactive sessions (and their Task subagents) reach the
+    /// agent `gh` front — the SessionStart `gh-front-env.sh` hook is wired and
+    /// its prefix resolves `gh` to the front (or the managed launcher). Not
+    /// auto-repairable: see [`gh_front_invariant`].
+    GhFrontWired,
 }
 
 impl Invariant {
@@ -155,6 +162,7 @@ impl Invariant {
         Self::RuntimesPresent,
         Self::TokenRankingFresh,
         Self::ForgeEgressAligned,
+        Self::GhFrontWired,
     ];
 
     /// Stable machine identifier — used in the issue-dedup marker and logs.
@@ -166,6 +174,7 @@ impl Invariant {
             Self::RuntimesPresent => "runtimes-present",
             Self::TokenRankingFresh => "token-ranking-fresh",
             Self::ForgeEgressAligned => "forge-egress-aligned",
+            Self::GhFrontWired => "gh-front-wired",
         }
     }
 
@@ -177,6 +186,7 @@ impl Invariant {
             Self::RuntimesPresent => ".loom/runtimes/ is missing configured runtimes",
             Self::TokenRankingFresh => "token-pool .ranking is stale or missing",
             Self::ForgeEgressAligned => "forge egress routing is not aligned with policy",
+            Self::GhFrontWired => "interactive sessions do not reach the agent gh front",
         }
     }
 
@@ -189,7 +199,7 @@ impl Invariant {
     pub fn auto_repairable(self) -> bool {
         match self {
             Self::McpBundleHealth | Self::RuntimesPresent | Self::TokenRankingFresh => true,
-            Self::ForgeEgressAligned => false,
+            Self::ForgeEgressAligned | Self::GhFrontWired => false,
         }
     }
 
@@ -318,6 +328,7 @@ pub fn check(invariant: Invariant, repo_root: &Path, opts: &CheckOptions) -> Inv
             Some(sources) => forge_egress_invariant::check_with(sources, repo_root),
             None => forge_egress_invariant::check(repo_root),
         },
+        Invariant::GhFrontWired => gh_front_invariant::check(repo_root),
     }
 }
 
@@ -537,7 +548,7 @@ pub fn repair(invariant: Invariant, repo_root: &Path, ctx: &RepairContext) -> Re
         Invariant::RuntimesPresent => repair_runtimes(repo_root),
         Invariant::TokenRankingFresh => repair_token_ranking(repo_root, ctx),
         Invariant::McpBundleHealth => repair_mcp_bundle(repo_root, ctx),
-        Invariant::ForgeEgressAligned => unreachable_repair(),
+        Invariant::ForgeEgressAligned | Invariant::GhFrontWired => unreachable_repair(),
     }
 }
 

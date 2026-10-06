@@ -73,7 +73,7 @@ impl Spec {
     }
 
     /// The forge's label timeline of this PR.
-    fn history(&self) -> PrHistory {
+    pub(crate) fn history(&self) -> PrHistory {
         let mut events: Vec<PrEvent> = Vec::new();
         let mut before: &[&str] = &[];
         for (x, labels) in self.steps {
@@ -160,7 +160,7 @@ pub(crate) fn snapshots(specs: &[Spec]) -> Vec<FleetSnapshot> {
 }
 
 /// The fleet listings of `specs` at `at`.
-fn listings_at(specs: &[Spec], at: f64) -> Vec<(String, Vec<ListedPr>)> {
+pub(crate) fn listings_at(specs: &[Spec], at: f64) -> Vec<(String, Vec<ListedPr>)> {
     [REPO, OTHER]
         .into_iter()
         .map(|repo| {
@@ -177,6 +177,24 @@ fn listings_at(specs: &[Spec], at: f64) -> Vec<(String, Vec<ListedPr>)> {
                 })
                 .collect();
             (repo.to_string(), prs)
+        })
+        .collect()
+}
+
+/// The tracker's listing rows of `repo`'s PRs at `at`.
+pub(crate) fn views_at(specs: &[Spec], repo: &str, at: f64) -> Vec<PrView> {
+    specs
+        .iter()
+        .filter(|s| s.repo == repo && s.listed_at(at))
+        .map(|s| {
+            let (labels, updated_at) = s.view_at(at);
+            PrView {
+                number: s.pr,
+                issue: s.issue(),
+                labels,
+                created_at: Some(t(0)),
+                updated_at: Some(updated_at),
+            }
         })
         .collect()
 }
@@ -249,7 +267,7 @@ pub(crate) fn fitted() -> Registry {
 }
 
 /// The twin-otter record of `spec`'s first `land` estimate at [`AT`].
-fn served(
+pub(crate) fn served(
     tracker: &mut Tracker,
     registry: &Registry,
     spec: &Spec,

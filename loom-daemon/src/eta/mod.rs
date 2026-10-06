@@ -115,6 +115,7 @@ pub mod fleet_events_pulls;
 pub mod fleet_events_reviews;
 pub mod fleet_events_webhook;
 pub mod fleet_fetch;
+pub mod fleet_log;
 pub mod fleet_refresh;
 pub mod fleet_signoz;
 pub mod fleet_signoz_refresh;

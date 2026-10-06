@@ -4,7 +4,8 @@
 #
 # Sibling of provision-skills.sh / provision-dispatcher.sh. Where those establish
 # the machine-level `loom` dispatcher and the user-scope `/loom:*` skills, this
-# wires the Loom PreToolUse / UserPromptSubmit / Stop guard HOOKS into the
+# wires the Loom PreToolUse / UserPromptSubmit / Stop guard HOOKS (plus the
+# SessionStart gh front, #10516) into the
 # operator's user-scope `~/.claude/settings.json`, pointing at hook scripts that
 # execute from the SINGLE machine-level checkout instead of a per-repo
 # `.loom/hooks/` copy that drifts stale (the recurring resync-installed.sh pain).
@@ -177,8 +178,13 @@ PROJECT_HOOKS_WIRED=0
 # it, MCP tool calls were the one tool class outside every PreToolUse matcher,
 # while `get_agent_metrics` turned its raw arguments into a shell command line
 # (fixed server-side in #9107; this matcher is the second, independent layer).
-_PHOOK_TYPES=(PreToolUse PreToolUse PreToolUse PreToolUse UserPromptSubmit UserPromptSubmit Stop)
-_PHOOK_MATCHERS=(Bash Bash "Edit|Write" "mcp__loom__.*" "" "" "")
+#
+# `SessionStart` / `gh-front-env.sh` (#10516) is not a guard: it puts the agent
+# `gh` front first on an interactive session's PATH via `$CLAUDE_ENV_FILE`
+# (inherited by Task subagents). Matcher "" covers startup/resume/clear/compact;
+# the hook is fail-open and stdout-silent, and `LOOM_GH_SHIM=0` opts out.
+_PHOOK_TYPES=(PreToolUse PreToolUse PreToolUse PreToolUse UserPromptSubmit UserPromptSubmit Stop SessionStart)
+_PHOOK_MATCHERS=(Bash Bash "Edit|Write" "mcp__loom__.*" "" "" "" "")
 _PHOOK_NAMES=(
     guard-destructive.sh
     guard-loom-workflow.sh
@@ -187,6 +193,7 @@ _PHOOK_NAMES=(
     skill-router.sh
     methodology-inject.sh
     guard-background-subagents.sh
+    gh-front-env.sh
 )
 
 # Emit the fail-open, workspace-gated, transition-deferring command wrapper for a

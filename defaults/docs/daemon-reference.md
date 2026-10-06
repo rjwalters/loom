@@ -2546,6 +2546,26 @@ blocker reads count), and a child of
 several starred issues takes the earliest starred-at. This is the in-memory
 ordering only; the label itself is not written yet.
 
+**What travels to children (#10012 §6).** One table in code
+(`star_liveness::propagation_rules`) says which labels go from a parent to
+its children, always downward. The star goes to child issues and their PRs and
+is removed with the parent's star. `external` goes to child issues and is
+removed when no ancestor carries it any more, so a child of an unapproved
+outside submission cannot get past the maintainer gate. A `tier:*` label is
+only a default: the child gets the nearest tiered ancestor's tier when it has
+none of its own. Propagation never overwrites a child's tier and never removes
+one. Removal only takes off a copy that propagation put there, never one a
+human put on the child, and never after an incomplete walk. The
+`<!-- loom:main-red-fix -->` body marker is copied once, by
+`create-issue.sh --parent`; no pass edits bodies. **Never propagate**: holds
+(`loom:blocked`, `loom:operator`, `loom:operator-only` and its sub-kinds,
+`loom:needs-capability`), claim, lifecycle and PR-lane labels, proposal kinds,
+`loom:epic-phase`, `loom:heavy`, `points:*`, the retired `loom:urgent`, and the
+#10307 level labels, which reach blockers by their own pass. A unit test fails
+when a `defaults/labels.json` label is in neither the table nor the
+never-propagate list. The table is the rule set only. The pass that writes
+these labels is not built yet.
+
 **loom-ui stars.** The `/ingest` ack may carry `operator_priority_intents`
 (`defaults/docs/telemetry-schema.md`). The pass applies each valid one (the one
 label, a managed repo, a `requested_by`) idempotently with one audit comment;

@@ -53,6 +53,11 @@ An Architecture Decision Record captures an important architectural decision mad
   - **Summary**: Records the #9105 decision that merge commits are Loom's default merge method across every Loom-managed repo — the `merge > rebase > squash` preference inversion, fail-open-to-merge (a repo that disallows merge commits then fails loudly instead of silently squashing history), the installer's degenerate fallback enabling merge-commit-only, and the `blame-issue.sh` merge-commit-subject join key — with squash-only repos still respected and migration an explicit operator action
   - **Key Decision**: Merge commits first (full commit/author/timestamp history preserved for blame and audit), rebase second, squash only when it is a repo's sole allowed strategy; the stacked-PR machinery (`reconcile-stack.sh`, the #3747 pre-merge ordering guard, the #3752 amend rebase) is merge-method-agnostic and unchanged
 
+- [ADR-0024: Dedupe Read-Only Forge Pollers Across Hosts With One Captain-Published Snapshot per Repo](0024-cross-host-read-poller-dedupe.md)
+  - **Status**: Proposed
+  - **Summary**: Design note for the cross-host slice of #10512: the `fleet.captain` host (or the loom-ui mirror) publishes one snapshot per repo of the `star_liveness`, `stage_dwell` and `work_finder` listings; other hosts read it when fresh and fall back to their own conditional reads otherwise
+  - **Key Decision**: Additive over an unchanged polling floor, observability/discovery reads only (gate reads stay local); projected fleet total about 8.4k to about 2.7k billable calls/h
+
 ### Orchestration Architecture
 
 - [ADR-0009: Deprecate and Delete Shepherd Brain and Python Daemon (Phase 3)](0009-shepherd-deprecation.md)
