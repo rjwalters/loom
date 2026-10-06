@@ -30,8 +30,8 @@ fn at(h: u32, m: u32) -> chrono::DateTime<Utc> {
 }
 
 /// The canonical record: a `land` row with an estimate and one estimating
-/// plus one refusing alternate, a `land` refusal row, and a `start` row —
-/// every field the wire can carry appears at least once.
+/// (tiered) plus one refusing (untiered) alternate, a `land` refusal row, and
+/// a `start` row — every field the wire can carry appears at least once.
 fn canonical() -> EtaSnapshotRecord {
     let land = EtaSnapshotRow {
         repo: "rjwalters/loom".to_string(),
@@ -50,6 +50,7 @@ fn canonical() -> EtaSnapshotRecord {
         alternates: vec![
             EtaSnapshotAlternate {
                 heuristic: "land-2026-10-04-twin-otter".to_string(),
+                tier: Some(Tier::Candidate),
                 estimate_id: "0a1b2c3d4e5f6071".to_string(),
                 as_of: at(11, 58),
                 p25: Some(900),
@@ -60,6 +61,8 @@ fn canonical() -> EtaSnapshotRecord {
             },
             EtaSnapshotAlternate {
                 heuristic: "land-2026-10-05-shadow".to_string(),
+                // An id this build does not know: `tier` is absent (#10525).
+                tier: None,
                 estimate_id: "8192a3b4c5d6e7f8".to_string(),
                 as_of: at(11, 58),
                 p25: None,
