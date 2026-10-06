@@ -59,7 +59,10 @@ pub fn specs_for(class: Bypass) -> &'static [&'static str] {
         Bypass::GhApiAbsoluteUrl => &["Bash(gh api https://*)", "Bash(gh api http://*)"],
         Bypass::GhHostEnv => &["Bash(GH_HOST=*)", "Bash(export GH_HOST=*)"],
         Bypass::GhConfigDirEnv => &["Bash(GH_CONFIG_DIR=*)", "Bash(export GH_CONFIG_DIR=*)"],
-        Bypass::GhHostnameFlag => &["Bash(gh * --hostname*)"],
+        // Anchored on the subcommands that take `--hostname`, never `gh *`: a
+        // bare `gh * --hostname*` would also match `gh pr comment N --body
+        // '... --hostname ...'`, forge text the hook masks and allows.
+        Bypass::GhHostnameFlag => &["Bash(gh api *--hostname*)", "Bash(gh auth *--hostname*)"],
         Bypass::GhConfigApiHost => &["Bash(gh config set *api_host*)"],
         // The first two are also `forge-secrets` specs; the merge dedupes.
         Bypass::GhAuthMutation => &[

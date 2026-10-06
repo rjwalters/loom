@@ -130,7 +130,12 @@ const GOLDEN: &[(&str, Bypass, &str)] = &[
         "export GH_CONFIG_DIR=/tmp/x",
     ),
     (
-        "Bash(gh * --hostname*)",
+        "Bash(gh api *--hostname*)",
+        Bypass::GhHostnameFlag,
+        "gh api user --hostname other.example",
+    ),
+    (
+        "Bash(gh auth *--hostname*)",
         Bypass::GhHostnameFlag,
         "gh auth status --hostname other.example",
     ),
@@ -199,6 +204,8 @@ const ALLOWED: &[&str] = &[
     "gh pr create --body 'see https://api.github.com/zen and GH_HOST='",
     "gh issue comment 1 --body 'pip install PyGithub was denied'",
     "git commit -m 'deny curl https://api.github.com'",
+    "gh pr comment 1 --body 'gh auth status --hostname x was denied'",
+    "git commit -m 'deny gh api user --hostname other'",
     "./.loom/scripts/merge-pr.sh 123",
     "./.loom/scripts/create-issue.sh --title x",
     "git push -u origin feature/issue-9989",
