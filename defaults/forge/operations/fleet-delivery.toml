@@ -185,10 +185,13 @@ platform_support = "documented"
 adapter_coverage = "none"
 caller_integration = "none"
 unknowns = []
-notes = "Classified as a PROHIBITION, not an active operation (#9989, C6 of epic #9983): each form reaches the forge with an unmanaged origin or credential, outside the managed launcher's routing. The caller below is the `loom:forge-egress` guard classifier, which names these commands only in order to DENY them and to point at the managed alternative — the opposite of a caller, listed here so the forge-inventory gate resolves its `gh api` / `gh auth` text to this decision."
+notes = "Classified as a PROHIBITION, not an active operation (#9989, C6 of epic #9983): each form reaches the forge with an unmanaged origin or credential, outside the managed launcher's routing. The callers below are the `loom:forge-egress` guard classifier and the role tool-policy deny-spec table (`role_tool_policy/forge_egress.rs`), which name these commands only in order to DENY them and to point at the managed alternative — the opposite of a caller, listed here so the forge-inventory gate resolves their `gh api` / `gh auth` text to this decision."
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/forge_egress/guard.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/role_tool_policy/forge_egress.rs"
 
 # --- quota-caching-errors ----------------------------------------------------
 
