@@ -370,6 +370,26 @@ impl DemandLedger {
     /// [`Self::host_debt`] as of `now`.
     #[must_use]
     pub fn host_debt_at(&self, now: Instant, stale: Duration) -> HostDebt {
+        self.debt_at(None, now, stale)
+    }
+
+    /// `root`'s own debt over its entries no older than `stale` (#10624): the
+    /// per-repo read behind the #9410 build back-off's per-repo WIP limit. The
+    /// same fresh / fail-open rules as [`Self::host_debt`], restricted to one
+    /// root — a root with no fresh entry on an axis reads that axis `None`.
+    #[must_use]
+    pub fn repo_debt(&self, root: &Path, stale: Duration) -> HostDebt {
+        self.repo_debt_at(root, Instant::now(), stale)
+    }
+
+    /// [`Self::repo_debt`] as of `now`.
+    #[must_use]
+    pub fn repo_debt_at(&self, root: &Path, now: Instant, stale: Duration) -> HostDebt {
+        self.debt_at(Some(root), now, stale)
+    }
+
+    /// The aggregate over every root (`only: None`) or one root.
+    fn debt_at(&self, only: Option<&Path>, now: Instant, stale: Duration) -> HostDebt {
         self.reads.fetch_add(1, Ordering::Relaxed);
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let mut debt = HostDebt::default();
@@ -377,7 +397,10 @@ impl DemandLedger {
         // included, so a partially stale axis does not under-count the host
         // debt its width is sized from (#9414).
         let mut last_known = [0usize; DebtAxis::ALL.len()];
-        for ((_, axis), (count, at)) in entries.iter() {
+        for ((_, axis), (count, at)) in entries
+            .iter()
+            .filter(|((r, _), _)| only.is_none_or(|o| o == r))
+        {
             last_known[axis.index()] += count;
             if now.saturating_duration_since(*at) > stale {
                 continue;
@@ -404,7 +427,7 @@ impl DemandLedger {
         entries.retain(|(root, _), _| roots.contains(root));
     }
 
-    /// How many times the host debt has been read.
+    /// How many times the host or a repo debt has been read.
     #[must_use]
     pub fn reads(&self) -> usize {
         self.reads.load(Ordering::Relaxed)

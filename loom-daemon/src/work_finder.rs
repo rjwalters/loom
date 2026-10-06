@@ -1610,16 +1610,18 @@ pub fn tick_multi_with_repo_cap<S: WorkSource, D: WorkDispatcher>(
         preferred_slice,
         max_concurrent_per_repo,
         lanes,
-        false,
+        &[],
     )
 }
 
 /// Like [`tick_multi_with_repo_cap`], but additionally honors the **build
-/// back-off** (#9410, [`build_backoff`]): while `build_backoff_held`, pass 2
-/// defers every candidate that is neither starred (`loom:operator-priority`)
-/// nor a verified red-main fix ([`Qd::DeferredBuildBackoff`]). Checked after
-/// the saturation brake and before the overflow / cap gates; in-flight sweeps
-/// are untouched. `false` is [`tick_multi_with_repo_cap`] byte-for-byte.
+/// back-off** (#9410, [`build_backoff`]): `build_backoff_held` is parallel to
+/// `workspaces` (#10624 — a repo's own debt, or the optional host ceiling);
+/// pass 2 defers each candidate of a held workspace that is neither starred
+/// (`loom:operator-priority`) nor a verified red-main fix
+/// ([`Qd::DeferredBuildBackoff`]). Checked after the saturation brake and
+/// before the overflow / cap gates; in-flight sweeps are untouched. An empty
+/// or all-`false` slice is [`tick_multi_with_repo_cap`] byte-for-byte.
 /// `halt_causes` is threaded through unchanged — see
 /// [`tick_multi_with_repo_cap`] for its contract (#9017).
 #[allow(clippy::too_many_arguments)]
@@ -1634,12 +1636,12 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     preferred_slice: Option<&[bool]>,
     max_concurrent_per_repo: Option<usize>,
     lanes: &[RedMainLane],
-    build_backoff_held: bool,
+    build_backoff_held: &[bool],
 ) -> TickReport {
     use crate::workspace_registry::DEFAULT_WORKSPACE_PRIORITY;
 
     let mut report = TickReport::for_tick(saturation_held, max_admissions_per_tick);
-    report.build_backoff_held = build_backoff_held;
+    report.build_backoff_held = build_backoff_held.contains(&true);
 
     // Snapshot per-workspace in-flight sets *first* (immutable borrow) so the
     // dedup filtering below always has the full in-flight view.
@@ -2028,9 +2030,10 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
             ready_queue::resolve(q, &cand, Qd::DeferredSaturation, None);
             continue;
         }
-        // Build back-off (#9410): a WIP policy, so a star (a human's "now")
-        // and a red-main fix (which drains merge debt) both bypass it.
-        if build_backoff_held && !(cand.operator_priority || cand.main_red_fix) {
+        // Build back-off (#9410), per repo since #10624: a WIP policy, so a star
+        // (a human's "now") and a red-main fix (which drains merge debt) both
+        // bypass it.
+        if build_backoff::defers(build_backoff_held, &cand) {
             report.deferred_build_backoff += 1;
             ready_queue::resolve(q, &cand, Qd::DeferredBuildBackoff, None);
             continue;
@@ -2888,8 +2891,9 @@ pub fn spawn_multi_work_finder_task(
         let _ = startup_reconciliation_ready.wait_for(|ready| *ready).await;
         let mut was_halted = false;
         let mut was_pressured = false;
-        // #9410: the build back-off's hysteresis state, held across ticks.
-        let mut build_backoff = build_backoff::BuildBackoff::default();
+        // #9410/#10624: the build back-off's per-repo (and optional host
+        // ceiling) hysteresis states, held across ticks.
+        let mut build_backoff = build_backoff::BuildBackoffs::default();
         // Pre-flight-advisory hold transition state (#5030): log the distinct
         // "held because pre-flight is broken" warning once per transition rather
         // than every tick, mirroring `was_halted`.
@@ -3143,10 +3147,10 @@ pub fn spawn_multi_work_finder_task(
                 in_flight_sweeps,
                 crate::role_runner::global_active_run_count(),
             );
-            // #9410: one in-memory read of the role runner's demand ledger —
-            // no forge call; fails open when the ledger is unobserved.
-            let build_backoff_held =
-                build_backoff.step(&fallback_root, crate::role_runner::demand::global());
+            // #9410/#10624: in-memory reads of the role runner's demand ledger,
+            // one per root — no forge call; fails open when unobserved.
+            let ledger = crate::role_runner::demand::global();
+            let build_backoff_held = build_backoff.step(&fallback_root, &roots, ledger);
             // Per-root claude-wrapper pre-flight-advisory hold (#5030): consult
             // each root's own SweepRegistry breaker. A workspace that has
             // accumulated `threshold` consecutive pre-flight deaths (broken
@@ -3292,7 +3296,7 @@ pub fn spawn_multi_work_finder_task(
                 Some(&preferred_slice),
                 max_concurrent_per_repo,
                 &lanes,
-                build_backoff_held,
+                &build_backoff_held.per_workspace,
             );
 
             // Publish before any logging so `loom-daemon health` sees the same
@@ -3374,6 +3378,8 @@ pub fn spawn_multi_work_finder_task(
                     report.collisions
                 );
             }
+            // #10624: which repos the build back-off deferred (INFO on change).
+            build_backoff.log_deferred(&report.queue, &roots);
 
             if !report.halted {
                 // #5305: see the single-workspace loop above — `token_bound`
