@@ -160,6 +160,8 @@ impl EtaPromoteArgs {
         };
         let kind = candidate.kind();
         let config = loom_daemon::eta::config::read(&root);
+        // #10525: a config the tracker refuses to run is not one to promote under.
+        registry.check_budget(config.shadow_max_active)?;
         let current = registry.current(kind, config.current(kind));
         if current.id() == candidate.id() {
             bail!("{} is already current for {kind}", candidate.id());
@@ -233,6 +235,9 @@ fn render_decision(d: &shadow::PromotionDecision, applied: bool) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "eta promote {} → {} ({})", d.current, d.candidate, d.kind);
+    if let Some(tier) = d.candidate_tier {
+        let _ = writeln!(out, "  candidate tier:  {tier}");
+    }
     let _ =
         writeln!(out, "  gate 1 backtest: {} — {}", d.backtest.status.as_str(), d.backtest.detail);
     let _ = writeln!(out, "  gate 2 live:     {} — {}", d.live.status.as_str(), d.live.detail);

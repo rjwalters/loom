@@ -8,6 +8,7 @@
 //! | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
 //! | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245) |
 //! | `current.start` / `current.finish` / `current.land` | — | `start-v1` / `finish-v1` / `land-v1` |
+//! | `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `10` registered heuristics per kind (floor 1; #10525) |
 //!
 //! `autonomous.eta.fleetRefresh.*` (#10263) — the daemon task that backfills
 //! and refreshes the fleet snapshots (`observability::eta_fleet_refresh`).
@@ -207,6 +208,10 @@ pub struct EtaConfig {
     pub fit_enabled: bool,
     /// The fleet snapshot refresh task (#10263).
     pub fleet_refresh: FleetRefreshConfig,
+    /// The shadow budget (#10525): most registered heuristics per kind. A
+    /// registry over it does not start the tracker
+    /// ([`super::Registry::check_budget`]).
+    pub shadow_max_active: usize,
 }
 
 impl Default for EtaConfig {
@@ -221,6 +226,7 @@ impl Default for EtaConfig {
             current_land: None,
             fit_enabled: true,
             fleet_refresh: FleetRefreshConfig::default(),
+            shadow_max_active: super::shadow_fleet::DEFAULT_MAX_ACTIVE,
         }
     }
 }
@@ -301,6 +307,19 @@ pub fn resolve(config: &serde_json::Value, env: impl Fn(&str) -> Option<String>)
     if let Some(v) = env("LOOM_ETA_FIT_ENABLED").as_deref().and_then(parse_bool) {
         resolved.fit_enabled = v;
     }
+    if let Some(v) = get("shadow")
+        .and_then(|b| b.get("maxActive"))
+        .and_then(serde_json::Value::as_u64)
+    {
+        resolved.shadow_max_active = usize::try_from(v).unwrap_or(usize::MAX);
+    }
+    if let Some(v) = env("LOOM_ETA_SHADOW_MAX_ACTIVE").and_then(|s| s.trim().parse::<usize>().ok())
+    {
+        resolved.shadow_max_active = v;
+    }
+    resolved.shadow_max_active = resolved
+        .shadow_max_active
+        .max(super::shadow_fleet::MIN_MAX_ACTIVE);
     resolved.refresh_secs = resolved.refresh_secs.max(MIN_REFRESH_SECS);
     resolved.fleet_refresh = resolve_fleet_refresh(block.and_then(|b| b.get("fleetRefresh")), &env);
     resolved

@@ -515,6 +515,12 @@ pub fn spawn_task(
     // re-checked on every pass (`record`), never inside an estimate. Loaded
     // before the pending store, which it filters (#10484).
     let registry = Registry::load(&workspace_root, Utc::now());
+    // #10525: a registry over the shadow budget is a config this tracker does
+    // not run, rather than one it silently trims.
+    if let Err(over) = registry.check_budget(config.shadow_max_active) {
+        log::error!("eta: not started: {over}");
+        return None;
+    }
     log_fit(None, registry.fit(), &workspace_root);
     let mut tracker = Tracker::new(loom);
     // Only the ETA authority restores (#10498); a pending estimate of a retired

@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::eta::{Kind, NoEstimateReason, Stage};
+use crate::eta::{Kind, NoEstimateReason, Stage, Tier};
 use crate::telemetry::RepoVisibility;
 
 /// Most rows one record carries. Rows past this are counted in
@@ -70,6 +70,11 @@ pub const MAX_ALTERNATES: usize = 8;
 pub struct EtaSnapshotAlternate {
     /// e.g. `land-2026-10-04-twin-otter`.
     pub heuristic: String,
+    /// The heuristic's tier (#10525): `baseline` or `candidate`. The ETA
+    /// chooser offers only candidates. Absent only for an id the emitting
+    /// build does not know, and in records from before tiers existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<Tier>,
     /// That heuristic's own `eta.estimate` id.
     pub estimate_id: String,
     /// The alternate's own `as_of` (may differ from the row's).

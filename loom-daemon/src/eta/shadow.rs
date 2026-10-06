@@ -47,6 +47,10 @@
 //!      days of `as_of`, the 95% Wilson lower bound of the candidate's
 //!      per-day win rate on the deciding loss is above 50%.
 //!
+//! Only a `candidate`-tier heuristic is ever promoted (#10525,
+//! [`super::shadow_fleet`]): a `baseline` or `retired` one is refused whatever
+//! its numbers, and the decision records the tier.
+//!
 //! Either gate failing leaves `current` exactly as it was. Every evaluation —
 //! promoting or not — produces a [`PromotionDecision`] carrying the numbers
 //! that decided it, so an operator can answer "why did this flip?" (or "why
@@ -66,7 +70,7 @@
 use super::backtest::Comparison;
 use super::score::Score;
 use super::tracker::{PassAnswers, Resolved};
-use super::Kind;
+use super::{Kind, Tier};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -620,6 +624,11 @@ pub struct PromotionDecision {
     pub current: String,
     /// The challenger.
     pub candidate: String,
+    /// The challenger's tier (#10525); only a `candidate` is ever promoted.
+    /// `None` for an id this build never shipped, and in a record logged
+    /// before tiers existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_tier: Option<Tier>,
     /// Gate 1.
     pub backtest: BacktestGate,
     /// Gate 2 — `NotReached` when gate 1 failed.
@@ -665,11 +674,18 @@ pub fn evaluate(
             answer_rate_slack: ANSWER_RATE_SLACK,
         }
     };
-    let shadow_only = super::heuristics::is_shadow_only(candidate);
+    // #10525: the gate considers only `candidate` heuristics. An id this
+    // build never shipped (a test double) is judged on the numbers alone; the
+    // CLI refuses an unknown id before it gets here.
+    let candidate_tier = super::shadow_fleet::builtin_tier(candidate);
+    let promotable = candidate_tier.is_none_or(|tier| tier == Tier::Candidate);
     let promote =
-        !shadow_only && backtest.status == GateStatus::Passed && live.status == GateStatus::Passed;
-    let reason = if shadow_only {
-        format!("{candidate} is a shadow-only floor baseline and is never promoted")
+        promotable && backtest.status == GateStatus::Passed && live.status == GateStatus::Passed;
+    let reason = if let Some(tier) = candidate_tier.filter(|_| !promotable) {
+        format!(
+            "{candidate} is a {tier} heuristic and is never promoted: \
+             the gate considers only candidate heuristics (#10525)"
+        )
     } else if promote {
         format!("both gates passed: {} then {}", backtest.detail, live.detail)
     } else if backtest.status == GateStatus::Passed {
@@ -683,6 +699,7 @@ pub fn evaluate(
         kind,
         current: current.to_string(),
         candidate: candidate.to_string(),
+        candidate_tier,
         backtest,
         live,
         promote,

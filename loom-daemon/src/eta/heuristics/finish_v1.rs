@@ -24,6 +24,11 @@ impl Heuristic for FinishV1 {
         Kind::Finish
     }
 
+    /// A baseline (#10525): the default `current`, the reference every candidate is scored beside; never promoted.
+    fn tier(&self) -> crate::eta::Tier {
+        crate::eta::Tier::Baseline
+    }
+
     fn estimate(&self, input: &EstimateInput, history: &StageSamples) -> Explanation {
         estimate_path(
             PathRules {

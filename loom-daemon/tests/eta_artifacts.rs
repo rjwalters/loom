@@ -320,6 +320,7 @@ fn every_eta_snapshot_field_is_documented_in_the_schema_reference() {
         alternates: vec![
             loom_daemon::telemetry::kinds::eta_snapshot::EtaSnapshotAlternate {
                 heuristic: "land-2026-10-04-twin-otter".to_string(),
+                tier: Some(loom_daemon::eta::Tier::Candidate),
                 estimate_id: "0a1b2c3d4e5f6071".to_string(),
                 as_of: chrono::Utc::now(),
                 p25: Some(1),

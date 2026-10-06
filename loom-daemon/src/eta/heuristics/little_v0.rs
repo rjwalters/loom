@@ -91,6 +91,11 @@ impl Heuristic for LittleV0 {
         Kind::Land
     }
 
+    /// A baseline (#10525): the floor every candidate must clear; never promoted.
+    fn tier(&self) -> crate::eta::Tier {
+        crate::eta::Tier::Baseline
+    }
+
     fn estimate(&self, input: &EstimateInput, history: &StageSamples) -> Explanation {
         let as_of = input.as_of;
         let id = estimate_id(&input.subject, Kind::Land, LITTLE_V0, as_of);

@@ -158,6 +158,7 @@ fn missing_optional_fields_decode_to_the_safe_default() {
 fn alt_estimating() -> EtaSnapshotAlternate {
     EtaSnapshotAlternate {
         heuristic: "land-2026-10-04-twin-otter".to_string(),
+        tier: Some(Tier::Candidate),
         estimate_id: "0a1b2c3d4e5f6071".to_string(),
         as_of: Utc.with_ymd_and_hms(2026, 9, 30, 12, 5, 0).unwrap(),
         p25: Some(100),
@@ -204,12 +205,23 @@ fn an_alternate_carries_exactly_the_agreed_fields() {
             "p25",
             "p50",
             "p75",
-            "p90"
+            "p90",
+            "tier"
         ]
     );
     let refusal = serde_json::to_value(alt_refusing()).unwrap();
-    assert_eq!(keys(&refusal), ["as_of", "estimate_id", "heuristic", "no_estimate_reason"]);
+    assert_eq!(
+        keys(&refusal),
+        [
+            "as_of",
+            "estimate_id",
+            "heuristic",
+            "no_estimate_reason",
+            "tier"
+        ]
+    );
     assert_eq!(refusal["no_estimate_reason"], "no_model");
+    assert_eq!(est["tier"], "candidate");
 }
 
 /// Shape pinned against loom-ui `test/etaState.test.ts`

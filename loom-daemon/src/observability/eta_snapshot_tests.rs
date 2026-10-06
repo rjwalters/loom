@@ -614,3 +614,38 @@ fn retired_heuristics_never_appear_as_alternates_even_when_pending_names_them() 
         assert!(!got.contains(&id));
     }
 }
+
+/// #10525: every alternate carries its heuristic's tier, so the ETA chooser
+/// can offer only candidates. With `land-v4` current, the `land-v1` and
+/// `little-v0` baselines ride along as alternates beside the candidates.
+#[test]
+fn alternates_carry_each_heuristics_tier() {
+    use crate::eta::Tier;
+    let mut current = current();
+    current.insert(Kind::Land, "land-v4".to_string());
+    let pending = vec![
+        summary(REPO, 1, Kind::Land, "land-v4", 0, Some(3_600)),
+        summary(REPO, 1, Kind::Land, "land-v1", 0, Some(3_000)),
+        summary(REPO, 1, Kind::Land, "little-v0", 0, None),
+        summary(REPO, 1, Kind::Land, TWIN, 0, Some(2_000)),
+    ];
+    let selected = select_current(&pending, &current);
+    let alternates = select_alternates(&pending, &current, &registered());
+    let record = build_record_with(&selected, &alternates, &visibility());
+    let tiers: Vec<(&str, Option<Tier>)> = record.rows[0]
+        .alternates
+        .iter()
+        .map(|a| (a.heuristic.as_str(), a.tier))
+        .collect();
+    assert_eq!(
+        tiers,
+        [
+            (TWIN, Some(Tier::Candidate)),
+            ("land-v1", Some(Tier::Baseline)),
+            ("little-v0", Some(Tier::Baseline)),
+        ]
+    );
+    let wire = serde_json::to_value(&record.rows[0]).unwrap();
+    assert_eq!(wire["alternates"][0]["tier"], "candidate");
+    assert_eq!(wire["alternates"][1]["tier"], "baseline");
+}

@@ -287,6 +287,7 @@ pub fn build_record_with(
                 .flatten()
                 .map(|alt| EtaSnapshotAlternate {
                     heuristic: alt.heuristic.clone(),
+                    tier: crate::eta::shadow_fleet::builtin_tier(&alt.heuristic),
                     estimate_id: alt.estimate_id.clone(),
                     as_of: alt.as_of,
                     p25: alt.p25_sec,
