@@ -315,6 +315,12 @@ impl PickDecisionRecord {
         }
     }
 
+    /// Raise `candidates_total` to `total` when the source held more rows than
+    /// it handed over (a capped serving queue); never lowers it.
+    pub fn raise_candidates_total(&mut self, total: usize) {
+        self.candidates_total = self.candidates_total.max(total);
+    }
+
     /// Stamp where the candidates came from and whether decisions were seen.
     #[must_use]
     pub fn with_source(mut self, candidate_source: &str, decisions_observed: bool) -> Self {

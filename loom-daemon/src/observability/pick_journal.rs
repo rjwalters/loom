@@ -72,6 +72,10 @@ pub enum JournalEntry {
         /// Whether the agent's `gh` resolves to the agent `gh` front, so its
         /// forge writes are journaled too.
         acts_observable: bool,
+        /// Rows in the queue before `rows` was capped; `0` on a line written
+        /// before the field existed (read as `rows.len()`).
+        #[serde(default)]
+        total: usize,
         rows: Vec<JournalRow>,
     },
     /// A listing the agent `gh` front served.
@@ -177,19 +181,24 @@ pub struct Journal {
     pub entries: Vec<JournalEntry>,
     /// The agent `gh` front was expected on the agent's `PATH`.
     pub front_expected: bool,
+    /// The journal file was read. `false` when it was missing or unreadable:
+    /// `entries` is then empty because nothing was observed, not because the
+    /// agent did nothing. A file that exists and is empty is `true`.
+    pub read: bool,
 }
 
 /// Drain this thread's journal for `root`: `None` when no journal was
 /// attached (the agent never launched, or no exporter). The file is deleted.
 pub fn take(root: &Path) -> Option<Journal> {
     let (owner, path) = ACTIVE.with(|a| a.borrow_mut().take())?;
-    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let raw = std::fs::read_to_string(&path);
     let _ = std::fs::remove_file(&path);
     if owner != root {
         return None;
     }
     Some(Journal {
-        entries: parse(&raw),
+        read: raw.is_ok(),
+        entries: parse(raw.as_deref().unwrap_or_default()),
         front_expected: front_expected(),
     })
 }
@@ -314,6 +323,7 @@ pub fn record_pr_queue(role: &str, rows: &[Value]) {
         at: Utc::now(),
         role: role.to_string(),
         acts_observable: front_on_path(std::env::var_os("PATH")),
+        total: rows.len(),
         rows: pr_queue_rows(rows),
     });
 }

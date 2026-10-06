@@ -258,7 +258,7 @@ pub fn role_record(
     let skip_all = tick_skip_reason(result);
     let attached = observed.journal.is_some();
     let journal = observed.journal.unwrap_or_default();
-    let mut queue: Option<(DateTime<Utc>, Vec<JournalRow>)> = None;
+    let mut queue: Option<(DateTime<Utc>, usize, Vec<JournalRow>)> = None;
     let mut listing: Option<Vec<JournalRow>> = None;
     let mut acts = Vec::new();
     let mut queue_acts_observable = true;
@@ -267,14 +267,15 @@ pub fn role_record(
             JournalEntry::Queue {
                 at,
                 acts_observable,
+                total,
                 rows,
                 ..
             } => {
                 queue_acts_observable &= acts_observable;
                 // The latest snapshot is the queue the role last served: an
                 // earlier one may rank differently or hold items since gone.
-                if queue.as_ref().is_none_or(|(prev, _)| at >= *prev) {
-                    queue = Some((at, rows));
+                if queue.as_ref().is_none_or(|(prev, ..)| at >= *prev) {
+                    queue = Some((at, total.max(rows.len()), rows));
                 }
             }
             JournalEntry::Listing { rows, .. } => {
@@ -287,13 +288,16 @@ pub fn role_record(
             }
         }
     }
-    // Decisions are observed when the agent ran with a journal and its `gh`
+    // Decisions are observed when the agent ran with a journal that was read
+    // (a missing or unreadable one observed nothing) and its `gh`
     // writes reach the front: expected at launch, or proven by the front's own
     // entries, and not contradicted by `pr-queue`'s PATH check.
     let front_active = journal.front_expected || listing.is_some() || !acts.is_empty();
     let decisions_observed =
-        attached && skip_all.is_none() && front_active && queue_acts_observable;
-    let (source, rows) = if let Some((_, rows)) = queue {
+        attached && journal.read && skip_all.is_none() && front_active && queue_acts_observable;
+    let mut total = 0;
+    let (source, rows) = if let Some((_, queue_total, rows)) = queue {
+        total = queue_total;
         (source::SERVING_QUEUE, dedup(rows))
     } else if let Some(rows) = listing {
         (source::LISTING, dedup(rows))
@@ -358,6 +362,7 @@ pub fn role_record(
         .collect();
     let mut record =
         PickDecisionRecord::build(tick, ranked).with_source(source, decisions_observed);
+    record.raise_candidates_total(total);
     record.add_actions(acts.into_iter().map(|(number, action)| PickAction {
         repo: repo.to_string(),
         number,

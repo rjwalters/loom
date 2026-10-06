@@ -190,6 +190,7 @@ fn journal(entries: Vec<JournalEntry>) -> RoleObservation {
         journal: Some(Journal {
             entries,
             front_expected: true,
+            read: true,
         }),
         // The gate saw listing order 1, 2, 3; the serving queue differs.
         gate: vec![(
@@ -204,6 +205,7 @@ fn queue(rows: Vec<JournalRow>) -> JournalEntry {
         at: at(),
         role: "judge".to_string(),
         acts_observable: true,
+        total: 0,
         rows,
     }
 }
@@ -236,6 +238,7 @@ fn a_fallback_only_queue_is_recorded_though_the_gate_saw_nothing() {
         journal: Some(Journal {
             entries: vec![queue(vec![qrow(42, "fallback", &[], "mode=fallback")])],
             front_expected: true,
+            read: true,
         }),
         gate: vec![("loom:review-requested".to_string(), vec![])],
     };
@@ -317,6 +320,7 @@ fn acts_are_unobserved_when_pr_queue_found_no_gh_front() {
         at: at(),
         role: "champion".to_string(),
         acts_observable: false,
+        total: 0,
         rows: vec![qrow(9, "loom:pr", &[], "x")],
     }]);
     let r = role_record(tick("champion"), RoleTickResult::Success, obs, "o/r", &[]);
@@ -340,6 +344,7 @@ fn curator_candidates_come_from_its_listings() {
                 act(12, "promoted"),
             ],
             front_expected: false,
+            read: true,
         }),
         gate: vec![],
     };
@@ -395,4 +400,66 @@ fn emit_record_routes_through_the_ops_sink_as_a_pick_decision() {
     let got = queue.0.lock().unwrap();
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].record.kind(), "pick.decision");
+}
+
+#[test]
+fn a_queue_past_the_row_cap_keeps_its_uncapped_total() {
+    // The journal kept 200 of 250 rows; the record lists 50 and says 250.
+    let rows: Vec<JournalRow> = (1..=200)
+        .map(|n| qrow(n, "loom:review-requested", &[], "k"))
+        .collect();
+    let obs = journal(vec![JournalEntry::Queue {
+        at: at(),
+        role: "judge".to_string(),
+        acts_observable: true,
+        total: 250,
+        rows,
+    }]);
+    let r = role_record(tick("judge"), RoleTickResult::Success, obs, "o/r", &[]);
+    assert_eq!(r.candidates.len(), 50);
+    assert_eq!(r.candidates_total, 250);
+}
+
+#[test]
+fn a_queue_line_without_a_total_falls_back_to_its_rows() {
+    let obs = journal(vec![queue(vec![
+        qrow(1, "loom:review-requested", &[], "a"),
+        qrow(2, "loom:review-requested", &[], "b"),
+    ])]);
+    let r = role_record(tick("judge"), RoleTickResult::Success, obs, "o/r", &[]);
+    assert_eq!(r.candidates_total, 2);
+}
+
+#[test]
+fn an_unread_journal_leaves_decisions_unobserved() {
+    let gate = vec![("loom:review-requested".to_string(), vec![row(1, &[]), row(2, &[])])];
+    let unread = RoleObservation {
+        journal: Some(Journal {
+            entries: vec![],
+            front_expected: true,
+            read: false,
+        }),
+        gate: gate.clone(),
+    };
+    let r = role_record(tick("judge"), RoleTickResult::Success, unread, "o/r", &[]);
+    assert_eq!(r.candidate_source, "gate_listing");
+    assert!(!r.decisions_observed, "nothing was read, so nothing was observed");
+    assert!(r.skipped.is_empty(), "unread rows are undecided, not not_selected");
+
+    // A journal that was read and is genuinely empty is an observed "no act".
+    let observed = RoleObservation {
+        journal: Some(Journal {
+            entries: vec![],
+            front_expected: true,
+            read: true,
+        }),
+        gate,
+    };
+    let r = role_record(tick("judge"), RoleTickResult::Success, observed, "o/r", &[]);
+    assert!(r.decisions_observed);
+    assert_eq!(r.skipped.len(), 2);
+    assert!(r
+        .skipped
+        .iter()
+        .all(|s| s.reason == PickSkipReason::NotSelected));
 }

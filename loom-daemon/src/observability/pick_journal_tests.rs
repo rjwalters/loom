@@ -153,6 +153,7 @@ fn attach_append_take_round_trips_and_deletes_the_journal() {
         .unwrap();
     let got = take(root).unwrap();
     assert_eq!(got.entries, vec![entry], "the bad line is skipped");
+    assert!(got.read);
     assert!(!path.exists(), "the journal is deleted once read");
     assert!(take(root).is_none(), "drained");
 }
@@ -169,5 +170,43 @@ fn writers_are_no_ops_outside_a_role_tick() {
     if std::env::var_os(PICK_JOURNAL_ENV).is_none() {
         record_pr_queue("judge", &[]);
         record_gh_actions(&[OsString::from("pr")]);
+    }
+}
+
+#[test]
+fn a_missing_journal_file_is_unread_but_an_empty_one_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal_dir = dir.path().join("j");
+    let root = Path::new("/journal-test/unread");
+    let attach_path = |root: &Path| {
+        discard();
+        let mut cmd = Command::new("true");
+        attach_in(&mut cmd, root, "judge", &journal_dir);
+        PathBuf::from(
+            cmd.get_envs()
+                .find(|(k, _)| *k == PICK_JOURNAL_ENV)
+                .and_then(|(_, v)| v)
+                .unwrap(),
+        )
+    };
+    // The agent never wrote: no file, so nothing was observed.
+    let path = attach_path(root);
+    assert!(!path.exists());
+    let got = take(root).unwrap();
+    assert!(!got.read && got.entries.is_empty());
+
+    // An empty file was read.
+    let path = attach_path(root);
+    std::fs::write(&path, b"").unwrap();
+    let got = take(root).unwrap();
+    assert!(got.read && got.entries.is_empty());
+}
+
+#[test]
+fn a_queue_line_written_before_the_total_field_still_parses() {
+    let line = r#"{"kind":"queue","at":"2026-10-04T12:00:00Z","role":"judge","acts_observable":true,"rows":[]}"#;
+    match parse(line).as_slice() {
+        [JournalEntry::Queue { total, .. }] => assert_eq!(*total, 0),
+        other => panic!("unexpected {other:?}"),
     }
 }

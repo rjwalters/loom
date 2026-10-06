@@ -96,6 +96,18 @@ At the end of the tick the daemon reads and deletes the file; a leftover from a
 crashed tick is pruned after a day. Acts are writes the agent *issued*; the
 record does not confirm the forge accepted them.
 
+A `queue` line keeps at most 200 rows but also records the queue's uncapped
+size, which becomes `candidates_total`. If the file is missing or unreadable
+(an agent that never ran `pr-queue` or the `gh` front writes none) nothing was
+observed: `decisions_observed` is `false` and unexplained candidates stay
+undecided. A file that exists but is empty is an observed tick with no acts.
+
+A `queue` line keeps at most 200 rows but also records the queue's uncapped
+size, which becomes `candidates_total`. If the file is missing or unreadable
+(an agent that never ran `pr-queue` or the `gh` front writes none) nothing was
+observed: `decisions_observed` is `false` and unexplained candidates stay
+undecided. A file that exists but is empty is an observed tick with no acts.
+
 **Role actions (closed set).** `claimed` (`loom:reviewing`, `loom:treating`,
 `loom:curating`, `loom:evaluating`, `loom:building`), `approved` (`loom:pr`, or
 `pr review --approve`), `changes_requested`, `merged`, `curated`, `promoted`
