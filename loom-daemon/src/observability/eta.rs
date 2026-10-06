@@ -85,16 +85,10 @@ pub const REVIEW_LABELS: [&str; 3] = [
 
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
 
-mod authority;
-
 /// Where pending estimates persist across restarts.
 #[must_use]
 pub fn pending_path(workspace_root: &Path) -> PathBuf {
-    workspace_root
-        .join(".loom")
-        .join("state")
-        .join("eta")
-        .join("pending.jsonl")
+    workspace_root.join(".loom/state/eta/pending.jsonl")
 }
 
 /// The OTLP queues ETA records are offered to.
@@ -398,8 +392,7 @@ fn current_ids(state: &State) -> BTreeMap<Kind, String> {
 /// tracker already keeps in memory, never a second tick loop.
 pub(super) fn snapshot_input() -> Option<super::eta_snapshot::SnapshotInput> {
     let guard = lock();
-    let state = guard.as_ref()?;
-    authority::active().then_some(())?;
+    let state = guard.as_ref().filter(|_| authority::active())?;
     let registered = [Kind::Start, Kind::Finish, Kind::Land]
         .into_iter()
         .map(|k| {
@@ -524,9 +517,8 @@ pub fn spawn_task(
     let registry = Registry::load(&workspace_root, Utc::now());
     log_fit(None, registry.fit(), &workspace_root);
     let mut tracker = Tracker::new(loom);
-    // #10484: a pending estimate whose heuristic is no longer registered (a
-    // retired id) is dropped here, so it never scores into the shadow ledger
-    // or an `eta.outcome`. #10498: only the ETA authority restores at all.
+    // Only the ETA authority restores (#10498); a pending estimate of a retired
+    // heuristic is dropped, never scored or emitted as an `eta.outcome` (#10484).
     let unregistered = authority::restore(&mut tracker, &workspace_root, &registry);
     log::info!(
         "eta: enabled (dry_run={}, refresh={}s, {} pending restored, \
@@ -1254,6 +1246,7 @@ fn reads_answered(rows: &[JournalEntry]) -> usize {
         .count()
 }
 
+mod authority;
 #[path = "eta_feature_pass.rs"]
 mod feature_pass;
 
