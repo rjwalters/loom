@@ -53,9 +53,11 @@ fn req(names: &[&str]) -> Vec<String> {
 }
 
 /// The 2026-10-04/05 shape: a fleet merge and this PR both touched the role
-/// prompt surface (a shared doc). Only prompt/doc gates go stale.
+/// prompt surface. Only prompt/doc gates go stale. (A shared command prompt,
+/// not a doc: since #9748 Role Prompt Prefix no longer reads `defaults/docs`.)
 fn prompt_surface_evidence() -> ScopedEvidence {
-    evidence(&["defaults/docs/eta.md"], vec![(STRUCT, mv(&["defaults/docs/eta.md"]))])
+    const JUDGE: &str = "defaults/.claude/commands/loom/judge.md";
+    evidence(&[JUDGE], vec![(STRUCT, mv(&[JUDGE]))])
 }
 
 #[test]
