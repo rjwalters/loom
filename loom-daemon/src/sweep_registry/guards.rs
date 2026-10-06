@@ -855,10 +855,12 @@ impl SweepRegistry {
         let Some((owner, repo)) = self.resolve_owner_repo() else {
             return OpenPrProbe::ProbeFailed;
         };
-        let (root, gh, nwo) = (&self.config.workspace_root, self.resolved_gh(), format!("{owner}/{repo}"));
+        let (root, gh, nwo) =
+            (&self.config.workspace_root, self.resolved_gh(), format!("{owner}/{repo}"));
         let (caller, bound) = ("guard.open_pr_listing", Some(reap_gh_timeout()));
         let target = (nwo.as_str(), issue);
-        let listed = crate::worktree_ops::linked_pr_listing::probe(caller, &gh, root, None, target, bound);
+        let listed =
+            crate::worktree_ops::linked_pr_listing::probe(caller, &gh, root, None, target, bound);
         if let Some(verdict) = listed {
             return verdict;
         }
