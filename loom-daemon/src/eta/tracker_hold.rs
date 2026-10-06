@@ -38,7 +38,8 @@
 //! # Two views of a held item (#10284)
 //!
 //! A heuristic that [`models_hold`](crate::eta::Heuristic::models_hold)
-//! (the shadow `land-2026-10-04-twin-otter` and its `-b`) estimates a held
+//! (the shadow `land-2026-10-04-twin-otter-b` and the wrappers over it;
+//! `land-2026-10-04-twin-otter` itself is retired, #10528) estimates a held
 //! PR from its fit's `merge_hold`, which was trained on real queue counts.
 //! So the tracker builds two inputs for a held item:
 //!

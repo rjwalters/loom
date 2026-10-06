@@ -18,13 +18,19 @@
 //!   Both are consumed by `land-2026-10-06-swift-tern`'s conformal layer
 //!   ([`super::conformal_ipcw::calibrate_drift_aware`], #10524).
 //!
-//! Both are pure and deterministic: no clock, no RNG. Leak-free: an outcome
+//! - [`serve`] applies [`adjust`]'s factor to a served estimate only while
+//!   [`drift`] has tripped for its stage ([`gated`]), and records it as the
+//!   explanation's `regime_adjustment`. `land-2026-10-06-brisk-petrel`
+//!   (twin-otter-b plus this) is the heuristic that calls it.
+//!
+//! All are pure and deterministic: no clock, no RNG. Leak-free: an outcome
 //! is used only when it was known strictly before `as_of`. Residuals are
 //! always taken against the *unadjusted* prediction, so the factor is a
 //! function of the recent window and not an accumulating state.
 
+use super::explanation::RegimeAdjustment;
 use super::recalibrate::CalibrationObservation;
-use super::{Stage, MIN_SAMPLES};
+use super::{Explanation, Stage, MIN_SAMPLES};
 use chrono::{DateTime, Duration, Utc};
 
 /// Residual window the adjustment looks back over: 24 hours.
@@ -71,21 +77,36 @@ pub struct Residual {
 /// that is open, or has a non-positive prediction or duration, is skipped.
 #[must_use]
 pub fn residuals(observations: &[CalibrationObservation]) -> Vec<Residual> {
-    let mut out: Vec<Residual> = observations
-        .iter()
-        .filter_map(|o| {
-            let (actual_at, known_at) = (o.actual_at?, o.resolved_at?);
-            let actual = (actual_at - o.as_of).num_seconds();
-            if actual <= 0 || o.p50_sec <= 0 {
-                return None;
-            }
-            Some(Residual {
-                stage: o.stage,
-                known_at,
-                log_ratio: (actual as f64 / o.p50_sec as f64).ln(),
-            })
-        })
-        .collect();
+    sorted(observations.iter().filter_map(residual))
+}
+
+/// [`residuals`] of `heuristic`'s rows only: one track, never pooled across
+/// heuristics (a change in the *mix* must not look like drift).
+#[must_use]
+pub fn residuals_of(observations: &[CalibrationObservation], heuristic: &str) -> Vec<Residual> {
+    sorted(
+        observations
+            .iter()
+            .filter(|o| o.heuristic == heuristic)
+            .filter_map(residual),
+    )
+}
+
+fn residual(o: &CalibrationObservation) -> Option<Residual> {
+    let (actual_at, known_at) = (o.actual_at?, o.resolved_at?);
+    let actual = (actual_at - o.as_of).num_seconds();
+    if actual <= 0 || o.p50_sec <= 0 {
+        return None;
+    }
+    Some(Residual {
+        stage: o.stage,
+        known_at,
+        log_ratio: (actual as f64 / o.p50_sec as f64).ln(),
+    })
+}
+
+fn sorted(rows: impl Iterator<Item = Residual>) -> Vec<Residual> {
+    let mut out: Vec<Residual> = rows.collect();
     out.sort_by_key(|r| r.known_at);
     out
 }
@@ -271,6 +292,67 @@ fn drift_with(all: &[Residual], stage: Stage, as_of: DateTime<Utc>, center: Opti
         statistic: round6(peak),
         drifted: recent.len() >= MIN_SAMPLES && peak >= CUSUM_H,
     }
+}
+
+/// The adjustment a drift-gated server applies (#10528): [`adjust`]'s factor
+/// when [`drift`] has tripped for `stage`, else the identity (with the same
+/// `n_recent`). The gate is the change detector loom-experiments#19 asked
+/// for: an always-on residual tracker over-widens intervals in calm periods.
+#[must_use]
+pub fn gated(all: &[Residual], stage: Stage, as_of: DateTime<Utc>) -> Adjustment {
+    let adjustment = adjust(all, stage, as_of);
+    if adjustment.is_identity() || drift(all, stage, as_of).drifted {
+        adjustment
+    } else {
+        Adjustment {
+            factor: 1.0,
+            ..adjustment
+        }
+    }
+}
+
+/// `(p25, p50, p75, p90)` remaining seconds, each multiplied by `factor` and
+/// rounded. The one place the factor meets a served number, shared by the
+/// server ([`serve`]) and the recompute ([`super::simulate::run_explanation`]).
+#[must_use]
+pub fn scale(q: (i64, i64, i64, i64), factor: f64) -> (i64, i64, i64, i64) {
+    let s = |sec: i64| (sec as f64 * factor).round() as i64;
+    (s(q.0), s(q.1), s(q.2), s(q.3))
+}
+
+/// Serve `explanation` with the drift-gated adjustment ([`gated`]) of its
+/// current stage, computed from `base`'s scored outcomes in `observations`
+/// known strictly before its `as_of`. An explanation with no answer, no
+/// current stage, or an identity adjustment is returned unchanged, with no
+/// `regime_adjustment` record — byte-identical to its base.
+#[must_use]
+pub fn serve(
+    mut explanation: Explanation,
+    observations: &[CalibrationObservation],
+    base: &str,
+) -> Explanation {
+    let Some(stage) = explanation.current_stage.as_ref().map(|c| c.stage) else {
+        return explanation;
+    };
+    let Some(q) = explanation.quantiles_with_p90() else {
+        return explanation;
+    };
+    let as_of = explanation.as_of;
+    let adjustment = gated(&residuals_of(observations, base), stage, as_of);
+    let Some(record) = RegimeAdjustment::of(&adjustment) else {
+        return explanation;
+    };
+    let (p25, p50, p75, p90) = scale(q, adjustment.factor);
+    if let Some(result) = explanation.result.as_mut() {
+        result.p25_sec = p25;
+        result.p50_sec = p50;
+        result.p75_sec = p75;
+        result.p90_sec = Some(p90);
+        result.eta_p50_at = as_of + Duration::seconds(p50);
+    }
+    explanation.regime_adjustment = Some(record);
+    explanation.enforce_cap();
+    explanation
 }
 
 #[cfg(test)]
