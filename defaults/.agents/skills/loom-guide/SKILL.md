@@ -736,7 +736,7 @@ check_and_unblock() {
     local deps=$(parse_dependencies "$body")
 
     if [ -z "$deps" ]; then
-      # No parseable dependencies - skip (may need manual review)
+      # No parseable dependencies - skip
       continue
     fi
 
@@ -777,9 +777,8 @@ check_and_unblock() {
     fi
   done
 
-  # Pull requests (#8925): a parked PR is a SEPARATE enumeration, not a filter
-  # on the loop above — see "Problem: Stuck Blocked Issues" for why
-  # `gh issue list` can never surface one.
+  # Pull requests (#8925): a SEPARATE enumeration (`gh issue list` never
+  # surfaces a PR) — see "Problem: Stuck Blocked Issues".
   check_and_unblock_prs
 }
 ```
