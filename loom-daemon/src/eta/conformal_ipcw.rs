@@ -217,6 +217,55 @@ fn weighted_quantile(points: &[(f64, f64)], level: f64) -> Option<f64> {
     None
 }
 
+/// The shift of quantile `k` when the events' weighted CDF (`points`,
+/// ascending, mass normalised by `total`) never reaches `level`.
+///
+/// The missing mass is rows that have not landed: still open past the last
+/// landing, or lost to the weight cap. An open row is evidence of a *longer*
+/// duration, so such a quantile never moves down (the result is at least 0,
+/// the base). Within that, it is the **smallest value the data allow** (the
+/// calm-plover tail rule, #10557): each open row whose elapsed-time bound
+/// `ln(C / q)` lies past the last landing counts as a landing at that bound,
+/// with its own recency weight, and the shift is the first such bound at
+/// which the mass reaches `level`. One long-open outlier therefore cannot set
+/// it: replaying the walk-forward folds, the earlier "largest open bound"
+/// rule left p90 unresolved for 62% of estimates and moved it a median
+/// `exp(3.0) ≈ 20×` (#10524). Only when even every bound leaves the level
+/// unreached is it the largest bound or landing.
+fn unresolved_tail(
+    points: &[(f64, f64)],
+    members: &[&Member],
+    w: &[f64],
+    total: f64,
+    k: usize,
+    level: f64,
+) -> f64 {
+    let last_landing = points.last().map_or(f64::NEG_INFINITY, |p| p.0);
+    let mut tail: Vec<(f64, f64)> = members
+        .iter()
+        .zip(w)
+        .filter(|(m, _)| !m.event)
+        .map(|(m, wi)| ((m.censor / m.q[k]).ln(), wi / total))
+        .filter(|(bound, _)| *bound >= last_landing)
+        .collect();
+    tail.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut mass: f64 = points.iter().map(|p| p.1).sum();
+    let mut c = None;
+    for (bound, weight) in &tail {
+        mass += weight;
+        if mass >= level - 1e-12 {
+            c = Some(*bound);
+            break;
+        }
+    }
+    let c = c.unwrap_or_else(|| tail.last().map_or(last_landing, |p| p.0.max(last_landing)));
+    if c.is_finite() {
+        c.max(0.0)
+    } else {
+        0.0
+    }
+}
+
 /// The IPCW conformal fit of `members` at `half_life_sec`, or `None` when
 /// its events' effective N is below [`MIN_EFFECTIVE_EVENTS`].
 fn fit_cell(members: &[&Member], half_life_sec: i64) -> Option<Fit> {
@@ -292,20 +341,8 @@ fn fit_cell(members: &[&Member], half_life_sec: i64) -> Option<Fit> {
                 };
             }
             None => {
-                // Unidentified: the missing mass is rows that have not
-                // landed (still open, or lost to the weight cap), and an open
-                // row is evidence of a *longer* duration. Never move such a
-                // quantile down: take the largest of the base (0), any
-                // landing's score and any open row's elapsed-time bound
-                // `ln(C / q)` (#10541 review).
                 unresolved.push(LABELS[k].to_string());
-                let landed = points.last().map_or(0.0, |p| p.0);
-                let open = members
-                    .iter()
-                    .filter(|m| !m.event)
-                    .map(|m| (m.censor / m.q[k]).ln())
-                    .fold(0.0, f64::max);
-                let c = round6(landed.max(open).max(0.0));
+                let c = round6(unresolved_tail(&points, &members, &w, total, k, level));
                 raw_shift[k] = c;
                 shift[k] = c;
             }

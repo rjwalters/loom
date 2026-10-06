@@ -54,6 +54,7 @@ mod star_parity;
 mod tracker;
 mod tracker_hold;
 mod twin_otter_parity;
+mod walk_forward;
 
 use super::explanation::Features;
 use super::history::StageSamples;
