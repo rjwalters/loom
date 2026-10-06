@@ -416,26 +416,7 @@ impl EtaBacktestArgs {
             .clone()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
-        let fits = match &self.fit_dir {
-            Some(dir) => {
-                let fits = DatedFits::load_dir(dir)
-                    .map_err(|e| anyhow::anyhow!("--fit-dir {}: {e}", dir.display()))?;
-                if fits.is_empty() {
-                    bail!("--fit-dir {}: no readable eta-fit/v1 file", dir.display());
-                }
-                eprintln!(
-                    "[eta backtest] walk-forward over {} coefficient file(s), cutoffs {}",
-                    fits.len(),
-                    fits.cutoffs()
-                        .iter()
-                        .map(|c| c.to_rfc3339())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                fits
-            }
-            None => DatedFits::new(Vec::new()),
-        };
+        let fits = super::eta_replay_cmd::load_fits(self.fit_dir.as_deref())?;
         let registry = fits.registry();
         let Some(heuristic) = fits.heuristic(&self.heuristic) else {
             bail!(
