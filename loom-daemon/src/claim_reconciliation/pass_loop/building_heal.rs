@@ -137,15 +137,15 @@ fn read_issue_state_and_labels(
         "heal.issue_view",
         crate::forge_call_stats::ops::ISSUE_VIEW_STATE,
     );
-    let body = match store::cached_get(site, gh_bin, Some(root), loom_repo.as_deref(), &url, "heal-")
-    {
-        Ok(Some(body)) => body,
-        Ok(None) => return None,
-        Err(error) => {
-            log::debug!("building_heal: issue #{issue}: {error}");
-            return None;
-        }
-    };
+    let body =
+        match store::cached_get(site, gh_bin, Some(root), loom_repo.as_deref(), &url, "heal-") {
+            Ok(Some(body)) => body,
+            Ok(None) => return None,
+            Err(error) => {
+                log::debug!("building_heal: issue #{issue}: {error}");
+                return None;
+            }
+        };
     parse_issue_state_and_labels(body.as_bytes())
 }
 
@@ -339,7 +339,10 @@ mod tests {
 
         let calls = std::fs::read_to_string(&gh_log).unwrap();
         assert!(!calls.contains("FORBIDDEN"), "a GraphQL read was attempted:\n{calls}");
-        let reads: Vec<&str> = calls.lines().filter(|l| l.contains("/issues/10507")).collect();
+        let reads: Vec<&str> = calls
+            .lines()
+            .filter(|l| l.contains("/issues/10507"))
+            .collect();
         assert_eq!(reads.len(), 2, "{calls}");
         assert!(!reads[0].contains("If-None-Match"), "{calls}");
         assert!(reads[1].contains(r#"If-None-Match: W/"h1""#), "{calls}");
