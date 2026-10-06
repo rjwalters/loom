@@ -10,9 +10,11 @@ use crate::eta::shadow_fleet::{
     builtin_tier, check_budget, BudgetExceeded, DEFAULT_MAX_ACTIVE, RETIRED,
 };
 use crate::eta::{Kind, Registry, Tier};
+use crate::telemetry::kinds::eta_snapshot::MAX_ALTERNATES;
 use serde_json::json;
 
 const AMBER_HERON: &str = "land-2026-10-04-amber-heron";
+const FRESH_TIDE: &str = "land-2026-10-04-fresh-tide";
 
 /// Every built-in id and its declared tier. A new registration fails this
 /// test until its tier is written down here: the tier is a decision, not a
@@ -23,7 +25,6 @@ const BUILTIN_TIERS: &[(&str, Tier)] = &[
     ("land-v1", Tier::Baseline),
     ("land-v2", Tier::Candidate),
     ("land-2026-10-06-calm-plover", Tier::Candidate),
-    ("land-2026-10-04-fresh-tide", Tier::Candidate),
     ("land-v4", Tier::Candidate),
     ("little-v0", Tier::Baseline),
     ("land-2026-10-06-quick-tern", Tier::Candidate),
@@ -46,7 +47,10 @@ fn every_builtin_heuristic_declares_the_pinned_tier() {
 #[test]
 fn retired_ids_are_unregistered_and_answer_retired() {
     let registry = Registry::builtin();
-    assert_eq!(RETIRED.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [LAND_V3, AMBER_HERON]);
+    assert_eq!(
+        RETIRED.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        [LAND_V3, AMBER_HERON, FRESH_TIDE]
+    );
     for (id, kind) in RETIRED {
         assert!(!registry.registers(*kind, id), "{id} is retired, so not registered");
         assert_eq!(registry.tier_of(id), Some(Tier::Retired));
@@ -68,19 +72,39 @@ fn tiers_serialise_as_snake_case_wire_names() {
     }
 }
 
+/// #10549: `land-2026-10-04-fresh-tide` lost its backtest and was retired.
+/// It answers `retired`, is not registered, and cannot be promoted.
+#[test]
+fn fresh_tide_is_retired() {
+    assert_eq!(builtin_tier(FRESH_TIDE), Some(Tier::Retired));
+    assert!(!Registry::builtin().registers(Kind::Land, FRESH_TIDE));
+    let decision = decide_with_passing_evidence(LAND_V1, FRESH_TIDE);
+    assert!(!decision.promote);
+    assert_eq!(decision.candidate_tier, Some(Tier::Retired));
+}
+
 #[test]
 fn the_builtin_registry_fits_the_default_budget() {
-    assert_eq!(DEFAULT_MAX_ACTIVE, 10);
+    assert_eq!(DEFAULT_MAX_ACTIVE, 13);
     Registry::builtin()
         .check_budget(DEFAULT_MAX_ACTIVE)
         .expect("the shipped registry must fit the default shadow budget");
+}
+
+/// #10549: the default budget is the kind's `current` plus every alternate
+/// one `eta.snapshot` row carries, so a registry within the default budget
+/// never has a shadow the snapshot silently drops from the chooser.
+#[test]
+fn the_default_budget_is_current_plus_the_alternates_cap() {
+    assert_eq!(MAX_ALTERNATES, 12);
+    assert_eq!(DEFAULT_MAX_ACTIVE, MAX_ALTERNATES + 1);
 }
 
 #[test]
 fn a_registry_over_budget_is_refused_naming_the_excess_in_registration_order() {
     let registry = Registry::builtin();
     let land: Vec<&str> = registry.for_kind(Kind::Land).map(|h| h.id()).collect();
-    assert_eq!(land.len(), 9);
+    assert_eq!(land.len(), 8);
     // Exactly at the land count: fine.
     assert!(registry.check_budget(land.len()).is_ok());
 
@@ -90,13 +114,13 @@ fn a_registry_over_budget_is_refused_naming_the_excess_in_registration_order() {
         BudgetExceeded {
             kind: Kind::Land,
             max_active: 3,
-            registered: 9,
+            registered: 8,
             excess: land[3..].to_vec(),
         }
     );
     let message = over.to_string();
     assert!(message.contains("maxActive is 3"), "{message}");
-    assert!(message.contains("9 land heuristics"), "{message}");
+    assert!(message.contains("8 land heuristics"), "{message}");
     for id in &land[3..] {
         assert!(message.contains(id), "{message} names {id}");
     }
@@ -105,7 +129,7 @@ fn a_registry_over_budget_is_refused_naming_the_excess_in_registration_order() {
     }
 
     // One over: only the last registration is the excess.
-    let one = registry.check_budget(8).unwrap_err();
+    let one = registry.check_budget(7).unwrap_err();
     assert_eq!(one.excess, ["land-2026-10-04-twin-otter-b"]);
 }
 

@@ -619,11 +619,7 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
         "heuristics/land_calm_plover.rs",
         include_str!("../heuristics/land_calm_plover.rs"),
     ),
-    (
-        "heuristics/land_fresh_tide.rs",
-        include_str!("../heuristics/land_fresh_tide.rs"),
-    ),
-    // #10209: the recency weighting the heuristic calls.
+    // #10209: the recency weighting the engine and recalibration call.
     ("recency.rs", include_str!("../recency.rs")),
     // #10207: the recalibration fit and transform the heuristic calls.
     ("recalibrate.rs", include_str!("../recalibrate.rs")),

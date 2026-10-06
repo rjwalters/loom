@@ -519,7 +519,7 @@ fn a_shadow_with_a_different_as_of_still_attaches_but_never_creates_a_row() {
 
 #[test]
 fn alternates_are_sorted_by_id_and_truncated() {
-    let ids: Vec<String> = (0..12).rev().map(|i| format!("land-x{i:02}")).collect();
+    let ids: Vec<String> = (0..15).rev().map(|i| format!("land-x{i:02}")).collect();
     let mut registered = registered();
     registered.insert(Kind::Land, ids.clone());
     let mut current = current();
@@ -536,6 +536,34 @@ fn alternates_are_sorted_by_id_and_truncated() {
     sorted.sort_unstable();
     assert_eq!(got, sorted);
     assert_eq!(got[0], "land-x01");
+    assert_eq!(got[11], "land-x12", "the 13th and 14th shadows are cut");
+}
+
+/// #10549: the cap is 12 (was 8). A kind with 12 non-current heuristics
+/// attaches every one of them, in id order, and the row carries all 12.
+#[test]
+fn twelve_non_current_heuristics_all_attach_as_alternates() {
+    use crate::telemetry::kinds::eta_snapshot::MAX_ALTERNATES;
+    assert_eq!(MAX_ALTERNATES, 12);
+    let ids: Vec<String> = (0..13).map(|i| format!("land-x{i:02}")).collect();
+    let mut registered = registered();
+    registered.insert(Kind::Land, ids.clone());
+    let mut current = current();
+    current.insert(Kind::Land, "land-x00".to_string());
+    let pending: Vec<EstimateSummary> = ids
+        .iter()
+        .map(|id| summary(REPO, 1, Kind::Land, id, 0, Some(1)))
+        .collect();
+    let selected = select_current(&pending, &current);
+    let alternates = select_alternates(&pending, &current, &registered);
+    let record = build_record_with(&selected, &alternates, &visibility());
+    let got: Vec<&str> = record.rows[0]
+        .alternates
+        .iter()
+        .map(|a| a.heuristic.as_str())
+        .collect();
+    assert_eq!(got, ids[1..].iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(got.len(), 12, "every non-current heuristic, none dropped");
 }
 
 #[test]
@@ -562,8 +590,9 @@ fn rows_without_alternates_omit_the_key_and_budgets_hold() {
     let wire = serde_json::to_value(&record.rows[0]).unwrap();
     assert!(wire.get("alternates").is_none());
 
-    // 7 alternates with long ids: one row < 2 KB, 200 rows < 512 KB.
-    let ids: Vec<String> = (0..7)
+    // 12 alternates (the cap, #10549) with long ids: one row < 3 KB, 200
+    // rows < 768 KB.
+    let ids: Vec<String> = (0..12)
         .map(|i| format!("land-2026-10-04-long-heuristic-name-{i}"))
         .collect();
     let mut registered = registered();
@@ -579,23 +608,31 @@ fn rows_without_alternates_omit_the_key_and_budgets_hold() {
     let alternates = select_alternates(&pending, &current(), &registered);
     let record = build_record_with(&selected, &alternates, &visibility());
     assert_eq!(record.rows.len(), 200);
-    assert_eq!(record.rows[0].alternates.len(), 7);
-    assert!(serde_json::to_vec(&record.rows[0]).unwrap().len() < 2_048);
-    assert!(serde_json::to_vec(&record).unwrap().len() < 512 * 1_024);
+    assert_eq!(record.rows[0].alternates.len(), 12);
+    let row = serde_json::to_vec(&record.rows[0]).unwrap().len();
+    let all = serde_json::to_vec(&record).unwrap().len();
+    eprintln!("12-alternate row: {row} B; 200-row record: {all} B");
+    assert!(row < 3 * 1_024, "row grew to {row} bytes");
+    assert!(all < 768 * 1_024, "record grew to {all} bytes");
 }
 
 #[test]
-fn registering_a_ninth_land_heuristic_fails_loudly() {
+fn registering_a_fourteenth_land_heuristic_fails_loudly() {
     let land = Registry::builtin().for_kind(Kind::Land).count();
     assert!(land - 1 <= crate::telemetry::kinds::eta_snapshot::MAX_ALTERNATES);
 }
 
 /// #10484: `land-v3` and `land-2026-10-04-amber-heron` were retired from the
-/// live shadow set. Pending estimates restored from disk that still name them
-/// are never offered as `alternates[]`; the live shadows are.
+/// live shadow set, and #10549 `land-2026-10-04-fresh-tide`. Pending
+/// estimates restored from disk that still name them are never offered as
+/// `alternates[]`; the live shadows are.
 #[test]
 fn retired_heuristics_never_appear_as_alternates_even_when_pending_names_them() {
-    let retired = ["land-v3", "land-2026-10-04-amber-heron"];
+    let retired = [
+        "land-v3",
+        "land-2026-10-04-amber-heron",
+        "land-2026-10-04-fresh-tide",
+    ];
     let registered = registered();
     for id in retired {
         assert!(!registered[&Kind::Land].iter().any(|r| r == id), "{id} is retired");
@@ -605,6 +642,7 @@ fn retired_heuristics_never_appear_as_alternates_even_when_pending_names_them() 
         summary(REPO, 1, Kind::Land, "land-v2", 0, Some(3_000)),
         summary(REPO, 1, Kind::Land, "land-v3", 0, Some(2_000)),
         summary(REPO, 1, Kind::Land, "land-2026-10-04-amber-heron", 0, Some(1_000)),
+        summary(REPO, 1, Kind::Land, "land-2026-10-04-fresh-tide", 0, Some(500)),
     ];
     let alternates = select_alternates(&pending, &current(), &registered);
     let list = &alternates[&(REPO.to_string(), 1, Kind::Land)];

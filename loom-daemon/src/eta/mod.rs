@@ -680,7 +680,6 @@ impl Registry {
                 Box::new(heuristics::LandV1),
                 Box::new(heuristics::LandV2),
                 Box::new(heuristics::LandCalmPlover),
-                Box::new(heuristics::LandFreshTide::default()),
                 Box::new(heuristics::LandV4),
                 Box::new(heuristics::LittleV0),
                 // #10524: wraps twin-otter-b; registered before the

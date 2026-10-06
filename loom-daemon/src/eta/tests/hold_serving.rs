@@ -222,7 +222,7 @@ fn each_heuristic_reads_its_own_view_of_a_held_pr() {
         .iter()
         .filter(|e| e.explanation.kind == Kind::Land)
         .collect();
-    assert_eq!(land.len(), 9);
+    assert_eq!(land.len(), 8);
     for emission in land {
         let id = emission.explanation.heuristic.as_str();
         let heuristic = registry.get(id).unwrap();
@@ -283,11 +283,11 @@ fn a_held_twin_otter_series_refreshes_while_the_path_engines_stay_silent() {
     let mut h = Harness::new();
     h.list(&[(501, &[RR], -600)], 0);
     h.list(&[(501, &[PR], 250)], 300);
-    assert_eq!(h.land(&registry, 300, 300).len(), 9);
+    assert_eq!(h.land(&registry, 300, 300).len(), 8);
 
     h.list(&[(501, &[PR, OP], 550)], 600);
     let entry = h.land(&registry, 300, 600);
-    assert_eq!(entry.len(), 9);
+    assert_eq!(entry.len(), 8);
     for e in &entry {
         let id = e.explanation.heuristic.as_str();
         assert_eq!(e.trigger, Trigger::Transition, "{id}");
@@ -309,7 +309,7 @@ fn a_held_twin_otter_series_refreshes_while_the_path_engines_stay_silent() {
     // Released: every series transitions, the path engines answer again.
     h.list(&[(501, &[PR], 1450)], 1500);
     let released = h.land(&registry, 300, 1500);
-    assert_eq!(released.len(), 9);
+    assert_eq!(released.len(), 8);
     assert!(released.iter().all(|e| e.trigger == Trigger::Transition));
     assert!(released
         .iter()
@@ -317,7 +317,7 @@ fn a_held_twin_otter_series_refreshes_while_the_path_engines_stay_silent() {
 
     // Held again, then merged: no further estimate.
     h.list(&[(501, &[PR, OP], 1750)], 1800);
-    assert_eq!(h.land(&registry, 300, 1800).len(), 9);
+    assert_eq!(h.land(&registry, 300, 1800).len(), 8);
     h.list(&[], 2000);
     h.tracker
         .on_pr_resolved(&key(501), PrState::Merged(t(1950)), t(2000));

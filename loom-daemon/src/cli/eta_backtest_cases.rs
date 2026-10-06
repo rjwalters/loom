@@ -359,7 +359,6 @@ mod tests {
             repo: Some("rjwalters/loom".to_string()),
             repo_root: Some(root.to_path_buf()),
             json: false,
-            half_life_days: None,
             pr_cases: cases,
         }
     }

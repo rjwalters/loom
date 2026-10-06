@@ -229,7 +229,6 @@ fn registry_resolves_current_per_kind() {
             "land-v1",
             "land-v2",
             "land-2026-10-06-calm-plover",
-            "land-2026-10-04-fresh-tide",
             "land-v4",
             "little-v0",
             "land-2026-10-06-quick-tern",
@@ -269,12 +268,13 @@ fn registry_resolves_current_per_kind() {
             .id(),
         "land-2026-10-06-quick-tern"
     );
-    // `land-2026-10-04-fresh-tide` (#10209) likewise: registered, not current.
+    // `land-2026-10-04-fresh-tide` (#10209) was retired 2026-10-06 (#10549):
+    // selecting it falls back to the default.
     assert_eq!(
         registry
             .current(Kind::Land, Some("land-2026-10-04-fresh-tide"))
             .id(),
-        "land-2026-10-04-fresh-tide"
+        "land-v1"
     );
     // `land-2026-10-04-twin-otter` (#10243) likewise: registered last, as a
     // shadow, and refusing `no_model` in `builtin()`, which loads no fit.
@@ -300,7 +300,6 @@ fn for_kind_enumerates_every_registered_heuristic_of_a_kind() {
             "land-v1",
             "land-v2",
             "land-2026-10-06-calm-plover",
-            "land-2026-10-04-fresh-tide",
             "land-v4",
             "little-v0",
             "land-2026-10-06-quick-tern",

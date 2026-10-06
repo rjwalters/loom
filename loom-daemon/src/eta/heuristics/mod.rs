@@ -1,7 +1,7 @@
-//! The shipped heuristics. `start-v1`, `finish-v1`, `land-v1`, `land-v2`
-//! and `land-2026-10-04-fresh-tide` share one engine ([`estimate_path`]);
-//! they differ in which history they read, where the path ends, and
-//! (`land-2026-10-04-fresh-tide`) how samples are weighted by recency;
+//! The shipped heuristics. `start-v1`, `finish-v1`, `land-v1` and `land-v2`
+//! share one engine ([`estimate_path`]); they differ in which history they
+//! read and where the path ends (the engine's recency weighting, #10209,
+//! outlived `land-2026-10-04-fresh-tide`, retired and removed in #10549);
 //! `land-v4` (#10210) is the `land-v3` grid step (`land-v3` itself is retired
 //! from the registry, #10484; its module stays as `land-v4`'s step) plus whether a stall's term
 //! is applied and an item beyond its history is answered rather than refused.
@@ -14,7 +14,6 @@
 
 mod finish_v1;
 mod land_calm_plover;
-mod land_fresh_tide;
 mod land_quick_tern;
 mod land_twin_otter;
 mod land_twin_otter_b;
@@ -27,7 +26,6 @@ mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
 pub use land_calm_plover::{LandCalmPlover, LAND_CALM_PLOVER};
-pub use land_fresh_tide::{LandFreshTide, LAND_FRESH_TIDE};
 pub use land_quick_tern::{LandQuickTern, LAND_QUICK_TERN};
 pub(crate) use land_twin_otter::recompute as recompute_twin_otter;
 pub use land_twin_otter::{

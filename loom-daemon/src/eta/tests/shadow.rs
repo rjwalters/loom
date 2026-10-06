@@ -7,8 +7,8 @@ use super::{as_of, history_a, input_at, provenance, subject};
 use crate::eta::backtest::{BacktestReport, Bucket, Comparison, Paired};
 use crate::eta::config::{promote, resolve};
 use crate::eta::heuristics::{
-    LandV1, LandV2, LAND_CALM_PLOVER, LAND_FRESH_TIDE, LAND_QUICK_TERN, LAND_TWIN_OTTER,
-    LAND_TWIN_OTTER_B, LAND_V1, LAND_V2, LAND_V4,
+    LandV1, LandV2, LAND_CALM_PLOVER, LAND_QUICK_TERN, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B, LAND_V1,
+    LAND_V2, LAND_V4,
 };
 use crate::eta::score::{score, EstimateSummary, OutcomeKind, Score};
 use crate::eta::shadow::{
@@ -215,7 +215,6 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
             LAND_V1,
             LAND_V2,
             LAND_CALM_PLOVER,
-            LAND_FRESH_TIDE,
             LAND_V4,
             "little-v0",
             LAND_QUICK_TERN,
@@ -238,7 +237,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
         .filter(|e| e.explanation.kind == Kind::Land)
         .map(|e| e.primary)
         .collect();
-    assert_eq!(land_order, vec![true, false, false, false, false, false, false, false, false]);
+    assert_eq!(land_order, vec![true, false, false, false, false, false, false, false]);
 
     // The primary's own number is byte-identical to what a registry with no
     // candidate at all would produce: shadow mode is additive, not a change.
@@ -262,7 +261,6 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
             LAND_V1,
             LAND_V2,
             LAND_CALM_PLOVER,
-            LAND_FRESH_TIDE,
             LAND_V4,
             "little-v0",
             LAND_QUICK_TERN,

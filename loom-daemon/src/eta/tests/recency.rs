@@ -1,13 +1,16 @@
-//! Recency-weighted stage samples and `land-2026-10-04-fresh-tide` (#10209).
+//! Recency-weighted stage samples and the engine's weighted path (#10209;
+//! `land-2026-10-04-fresh-tide`, its heuristic, retired in #10549).
 
 use super::{as_of, history_a, input_at};
 use crate::eta::grid;
-use crate::eta::heuristics::{LandFreshTide, LandV2, LAND_FRESH_TIDE};
+use crate::eta::heuristics::{estimate_path, LandV2, PathRules};
 use crate::eta::history::{SampleSource, StageSample, StageSamples};
 use crate::eta::recency::{
     effective_n, resolve_half_life, weight, DEFAULT_HALF_LIFE_SEC, MAX_DOUBLINGS,
 };
-use crate::eta::{Heuristic, NoEstimateReason, Stage, MIN_SAMPLES};
+use crate::eta::{
+    EstimateInput, Explanation, Heuristic, Kind, NoEstimateReason, Stage, MIN_SAMPLES,
+};
 use chrono::Duration;
 
 const DAY: i64 = 86_400;
@@ -155,8 +158,7 @@ fn a_short_effective_n_widens_the_half_life_and_records_the_one_used() {
     assert_eq!(picked.observed.len(), 20);
 
     // The explanation records the widened half-life and the effective N.
-    let explanation =
-        LandFreshTide::default().estimate(&input_at(Stage::MergeWait, 0, 0), &history);
+    let explanation = weighted(DEFAULT_HALF_LIFE_SEC, &input_at(Stage::MergeWait, 0, 0), &history);
     assert!(explanation.no_estimate_reason.is_none(), "{:?}", explanation.no_estimate_reason);
     let stage = &explanation.stages[0].distribution;
     assert_eq!(stage.n, 20);
@@ -181,8 +183,7 @@ fn when_no_half_life_clears_the_floor_the_weights_fall_back_to_flat() {
     assert_eq!(picked.half_life_sec, None);
     assert!((picked.effective_n - 8.0).abs() < 1e-9);
     assert!(picked.observed.iter().all(|o| o.1 == 1.0));
-    let explanation =
-        LandFreshTide::default().estimate(&input_at(Stage::MergeWait, 0, 0), &history);
+    let explanation = weighted(DEFAULT_HALF_LIFE_SEC, &input_at(Stage::MergeWait, 0, 0), &history);
     let stage = &explanation.stages[0].distribution;
     assert_eq!(stage.half_life_sec, None, "flat: no half-life on the wire");
     assert_eq!(stage.effective_n, Some(8.0), "…but the effective N still is");
@@ -197,8 +198,7 @@ fn below_the_raw_floor_the_stage_is_still_refused() {
     assert!(history
         .select_weighted("rjwalters/loom", Stage::MergeWait, as_of(), SOURCES, 2 * DAY, true)
         .is_none());
-    let explanation =
-        LandFreshTide::default().estimate(&input_at(Stage::MergeWait, 0, 0), &history);
+    let explanation = weighted(DEFAULT_HALF_LIFE_SEC, &input_at(Stage::MergeWait, 0, 0), &history);
     assert_eq!(explanation.no_estimate_reason, Some(NoEstimateReason::InsufficientSamples));
 }
 
@@ -233,8 +233,8 @@ fn samples_at_or_after_as_of_never_change_the_weighted_result() {
     assert_eq!(pick(&clean), pick(&leaky));
     let input = input_at(Stage::MergeWait, 0, 0);
     assert_eq!(
-        serde_json::to_string(&LandFreshTide::default().estimate(&input, &clean)).unwrap(),
-        serde_json::to_string(&LandFreshTide::default().estimate(&input, &leaky)).unwrap()
+        serde_json::to_string(&weighted(DEFAULT_HALF_LIFE_SEC, &input, &clean)).unwrap(),
+        serde_json::to_string(&weighted(DEFAULT_HALF_LIFE_SEC, &input, &leaky)).unwrap()
     );
 }
 
@@ -264,14 +264,40 @@ fn censored_samples_are_weighted_at_the_same_half_life() {
     assert!(plain.censored.is_empty());
 }
 
-// ------------------------------------------------------------ the heuristic
+// ------------------------------------------------------------ the engine
+
+/// The engine's recency-weighted path (`PathRules::half_life_sec`, #10209):
+/// `land-v2`'s rules at half-life `half_life_sec`. Its one registered
+/// heuristic, `land-2026-10-04-fresh-tide`, was retired and removed (#10549);
+/// the weighting stays in the engine and in `recalibrate`, so it stays
+/// tested here.
+fn weighted(half_life_sec: i64, input: &EstimateInput, history: &StageSamples) -> Explanation {
+    estimate_path(
+        PathRules {
+            id: WEIGHTED,
+            kind: Kind::Land,
+            sources: SOURCES,
+            always_merge: true,
+            censoring: true,
+            adjust: None,
+            models_hold: false,
+            half_life_sec: Some(half_life_sec),
+            stall_term: false,
+            residual_tail: false,
+        },
+        input,
+        history,
+    )
+}
+
+const WEIGHTED: &str = "test-weighted-path";
 
 #[test]
-fn fresh_tide_records_half_life_and_effective_n_on_every_stage() {
+fn a_weighted_path_records_half_life_and_effective_n_on_every_stage() {
     let history = history_a();
     let input = input_at(Stage::ReviewWait, 0, 0);
-    let explanation = LandFreshTide::default().estimate(&input, &history);
-    assert_eq!(explanation.heuristic, LAND_FRESH_TIDE);
+    let explanation = weighted(DEFAULT_HALF_LIFE_SEC, &input, &history);
+    assert_eq!(explanation.heuristic, WEIGHTED);
     assert!(explanation.result.is_some(), "{:?}", explanation.no_estimate_reason);
     assert!(!explanation.stages.is_empty());
     for entry in &explanation.stages {
@@ -308,12 +334,12 @@ fn earlier_heuristics_carry_neither_field_on_the_wire() {
 }
 
 #[test]
-fn flat_fresh_tide_draws_from_exactly_land_v2s_grids() {
+fn a_flat_weighted_path_draws_from_exactly_land_v2s_grids() {
     // A non-positive half-life weighs flat: the weighted grid must then be
     // land-v2's Kaplan–Meier grid, stage for stage.
     let history = history_a();
     let input = input_at(Stage::ReviewWait, 0, 0);
-    let flat = LandFreshTide::with_half_life(0).estimate(&input, &history);
+    let flat = weighted(0, &input, &history);
     let v2 = LandV2.estimate(&input, &history);
     assert_eq!(flat.stages.len(), v2.stages.len());
     for (a, b) in flat.stages.iter().zip(&v2.stages) {
@@ -327,11 +353,8 @@ fn flat_fresh_tide_draws_from_exactly_land_v2s_grids() {
 }
 
 #[test]
-fn the_half_life_is_a_constructor_parameter() {
-    assert_eq!(LandFreshTide::default().half_life_sec(), 2 * DAY);
-    for days in [1, 2, 7] {
-        let h = LandFreshTide::with_half_life(days * DAY);
-        assert_eq!(h.half_life_sec(), days * DAY);
-        assert_eq!(h.id(), LAND_FRESH_TIDE);
-    }
+fn fresh_tide_is_retired_and_unregistered() {
+    let id = "land-2026-10-04-fresh-tide";
+    assert!(crate::eta::Registry::builtin().get(id).is_none(), "#10549");
+    assert_eq!(crate::eta::shadow_fleet::builtin_tier(id), Some(crate::eta::Tier::Retired));
 }
