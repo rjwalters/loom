@@ -13,9 +13,8 @@
 //! itself lives in [`loom_daemon::stale_blocked`], and the forge reads in
 //! [`loom_daemon::stale_blocked::batch`] (#10480: one REST listing, REST + ETag
 //! comment and blocker-state reads, one GraphQL query per 100 issues); this
-//! module is the rendering. [`list_blocked`] and [`gather`], the per-artifact
-//! path over [`loom_daemon::dep_recheck::forge`], remain for
-//! `notify-cleared-blockers`.
+//! module is the rendering. `notify-cleared-blockers` reads through the same
+//! gatherer (#10515).
 //!
 //! # Budget floor (#10480)
 //!
@@ -46,18 +45,12 @@
 //! passes it.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
-use serde::Deserialize;
 
-use loom_daemon::cmd_out::Query;
-use loom_daemon::dep_recheck::{extract, forge};
 use loom_daemon::park_record;
-use loom_daemon::script_helpers::gh_query;
-use loom_daemon::stale_blocked::{
-    batch, budget, classify, park_self_block, undeclared, Artifact, Evidence, Verdict,
-};
+use loom_daemon::stale_blocked::{batch, budget, classify, undeclared, Artifact, Verdict};
 
 /// How many open `loom:blocked` issues to examine by default.
 ///
@@ -110,17 +103,6 @@ pub(crate) struct StaleBlockedArgs {
     /// read. `0` disables the check.
     #[arg(long, value_name = "N", default_value_t = budget::DEFAULT_MIN_CORE_REMAINING)]
     pub min_core_remaining: u64,
-}
-
-/// One row of the per-artifact enumeration query. Shared by both populations —
-/// `gh pr list` and `gh issue list` return the same `number` shape.
-///
-/// Only `notify_cleared_blockers` (issue #9102), the close-triggered sibling of
-/// this advisory, still enumerates through [`list_blocked`]; this command's own
-/// run reads the REST listing via [`batch`] (#10480).
-#[derive(Debug, Clone, Deserialize)]
-pub(super) struct IssueRow {
-    pub(super) number: i64,
 }
 
 /// One classified artifact, ready to render. `Clone` because a prose-only park is
@@ -242,116 +224,6 @@ impl Sections<'_> {
             || !self.undocumented.is_empty()
             || !self.prose_only.is_empty()
     }
-}
-
-/// Every open `loom:blocked` artifact of one kind, plus a reason string when the
-/// enumeration itself did not answer.
-///
-/// `gh issue list --label="loom:blocked" --state=open` is `curator.md`'s own
-/// Priority-2 query shape, reused rather than re-derived; the PR arm is the same
-/// query against `gh pr list`, which is the enumeration #8925 found missing. An
-/// empty result is a fact (`Query::Empty`), not a failure — that is the healthy
-/// repo.
-pub(super) fn list_blocked(
-    kind: Artifact,
-    root: &Path,
-    repo: Option<&str>,
-    limit: u32,
-) -> (Vec<IssueRow>, Option<String>) {
-    let limit = limit.to_string();
-    let entity = match kind {
-        Artifact::Issue => "issue",
-        Artifact::Pr => "pr",
-    };
-    let mut args = vec![entity, "list", "--label", "loom:blocked", "--state", "open"];
-    if let Some(r) = repo {
-        args.extend(["--repo", r]);
-    }
-    args.extend(["--json", "number", "--limit", &limit]);
-
-    let q: Query<Vec<IssueRow>> = gh_query(&args, root, false, |v: &Vec<IssueRow>| v.is_empty());
-    match q {
-        Query::Populated(rows) => (rows, None),
-        Query::Empty => (Vec::new(), None),
-        Query::Malformed { error, .. } => {
-            (Vec::new(), Some(format!("gh {entity} list returned unreadable JSON: {error}")))
-        }
-        Query::Failed { status, .. } => {
-            (Vec::new(), Some(format!("gh {entity} list exited {status}")))
-        }
-        Query::Unavailable(u) => {
-            (Vec::new(), Some(format!("gh {entity} list could not be run: {u:?}")))
-        }
-    }
-}
-
-/// Read one artifact's blocker references in every shape that applies to it.
-///
-/// Every forge read here is a `dep_recheck::forge` call, and the only text this
-/// function parses itself is the park record ([`park_record::blockers`], which
-/// reads the *same* `Blocked by: #N` vocabulary rather than adding a second one).
-/// `fetch_named_deps` runs the `## Dependencies` checklist matcher,
-/// `extract::extract` runs the prose dependency-phrase matcher over the body plus
-/// every non-bot comment, and `fetch_prs` reads the linked closing PRs. That is
-/// the whole point — #8927 asks for a trigger for the existing check, not a
-/// second copy of it.
-///
-/// # What differs for a PR (#8925)
-///
-/// - The body/comments read goes through `gh pr view`, not `gh issue view`.
-/// - There is no `## Dependencies` checklist arm and no linked-closing-PR arm: a
-///   PR body carries `Closes #N`, which is the *opposite* relation, and a PR has
-///   no closing PR of its own. Reading either would answer a question nobody
-///   asked.
-/// - The PR's own state supplies [`Evidence::self_block`], the superseding-block
-///   gate the issue arm gets from `closing` instead.
-pub(super) fn gather(
-    kind: Artifact,
-    number: i64,
-    repo: Option<&str>,
-    root: &Path,
-) -> Result<Evidence, String> {
-    let input = match kind {
-        Artifact::Issue => forge::fetch_body_and_comments(number, repo, root),
-        Artifact::Pr => forge::fetch_pr_body_and_comments(number, repo, root),
-    }
-    .map_err(|e| e.to_string())?;
-
-    let numbers: Vec<i64> =
-        extract::extract_with(&input, &loom_daemon::forge_identity::FleetLogins::for_root(root))
-            .split_whitespace()
-            .filter_map(|t| t.parse().ok())
-            .collect();
-    let prose = if numbers.is_empty() {
-        Vec::new()
-    } else {
-        forge::fetch_refs(&numbers, repo, root).map_err(|e| e.to_string())?
-    };
-
-    // The park record is read from the BODY only. A record in a comment would be
-    // the very thing #8925 is closing: a park nobody can attribute to the
-    // artifact's own declared state.
-    let declared = park_record::blockers(&input.body);
-
-    let (named, closing, self_block) = match kind {
-        Artifact::Issue => (
-            forge::fetch_named_deps(number, repo, root).map_err(|e| e.to_string())?,
-            forge::fetch_prs(number, repo, root).map_err(|e| e.to_string())?,
-            None,
-        ),
-        Artifact::Pr => {
-            let this = forge::fetch_pr(number, repo, root).map_err(|e| e.to_string())?;
-            (Vec::new(), Vec::new(), park_self_block(&this))
-        }
-    };
-
-    Ok(Evidence {
-        named,
-        prose,
-        closing,
-        declared,
-        self_block,
-    })
 }
 
 /// The human report: a bordered stderr warning when anything was found, plus
