@@ -13,6 +13,7 @@ see "Config tiers" below); the operating-core guides (`CLAUDE.md` and
 - [The Ungated Denial Floor](#the-ungated-denial-floor)
 - [Ask-Tier Composition (#7795)](#ask-tier-composition-7795)
 - [Credential content scan on commit and push (#9133)](#credential-content-scan-on-commit-and-push-9133)
+- [`loom-daemon guards status` and toggle messages (#10434)](#loom-daemon-guards-status-and-toggle-messages-10434)
 - [Custom Guard Hooks](#custom-guard-hooks)
 <!-- toc:end -->
 
