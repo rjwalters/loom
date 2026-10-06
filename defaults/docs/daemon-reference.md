@@ -11066,6 +11066,8 @@ seams):
 | `LOOM_DAEMON_UPDATE_COSIGN_PUBKEY` | Path to the cosign public key used to verify a **key-signed** Linux `.sig` (one published without a `.pem`) |
 | `LOOM_DAEMON_UPDATE_COSIGN_IDENTITY` | Pin one exact expected keyless signer identity instead of the derived regexp |
 | `LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER` | Expected keyless certificate issuer (default `https://token.actions.githubusercontent.com`) |
+| `LOOM_DAEMON_UPDATE_REQUIRE_SIGNATURE` | `1`/`true`/`yes`/`on` selects **required** signature mode (#10470): an unsigned release (`SIGNATURE=skipped`) or one whose signature cannot be checked here (`SIGNATURE=unavailable`) is refused before provisioning, with distinct messages, and a sanitized `LOOM_SIGNATURE_EVIDENCE {...}` line (tag, asset sha256, signature state, policy revision, identity regexp) is emitted on success. Default off = the **present-only** compatibility mode (#5054), unchanged |
+| `LOOM_DAEMON_UPDATE_APPROVED_WORKFLOW` | Optional, with required mode: pin the derived keyless identity to this workflow file (regex-escaped) instead of `[^@]+`; a workflow rename then needs an explicit policy update. Also recorded as the evidence line's policy revision |
 
 **No new daemon config keys.** The autonomous self-update loop
 (`autonomous.autoUpdate.*`) needs no new knobs. Since Issue #7609 it drives its

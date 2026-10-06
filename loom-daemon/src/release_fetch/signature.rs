@@ -190,11 +190,23 @@ pub struct VerifyInputs<'a> {
 /// Verify `inputs.bin_path`'s signature, present-only.
 #[must_use]
 pub fn verify(inputs: &VerifyInputs<'_>) -> VerifyResult {
+    verify_with_workflow(inputs, None)
+}
+
+/// [`verify`] with an optional approved-workflow pin for the derived keyless
+/// identity (#10470; see [`cosign::identity_regexp_pinned`]). `None` is
+/// exactly [`verify`]. Ignored when an exact identity is supplied through
+/// `inputs.cosign_identity_env`, which is already stricter.
+#[must_use]
+pub fn verify_with_workflow(
+    inputs: &VerifyInputs<'_>,
+    approved_workflow: Option<&str>,
+) -> VerifyResult {
     if inputs.target.ends_with("-apple-darwin") {
         return verify_darwin(inputs.bin_path);
     }
     if inputs.target.contains("-linux-") {
-        return verify_linux(inputs);
+        return verify_linux(inputs, approved_workflow);
     }
     // An unrecognized target verifies nothing rather than failing — the
     // shell's `*) return 0 ;;`.
@@ -328,7 +340,7 @@ fn cosign_available() -> bool {
     )
 }
 
-fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
+fn verify_linux(inputs: &VerifyInputs<'_>, approved_workflow: Option<&str>) -> VerifyResult {
     let name = file_name(inputs.bin_path);
 
     // No .sig asset published for this release (cosign secret was not
@@ -364,7 +376,11 @@ fn verify_linux(inputs: &VerifyInputs<'_>) -> VerifyResult {
         let (identity_flag, identity_desc) =
             match inputs.cosign_identity_env.filter(|v| !v.is_empty()) {
                 Some(exact) => ("--certificate-identity", exact.to_string()),
-                None => match cosign::identity_regexp(inputs.repo_slug, inputs.tag) {
+                None => match cosign::identity_regexp_pinned(
+                    inputs.repo_slug,
+                    inputs.tag,
+                    approved_workflow,
+                ) {
                     Some(re) => ("--certificate-identity-regexp", re),
                     None => {
                         return VerifyResult {

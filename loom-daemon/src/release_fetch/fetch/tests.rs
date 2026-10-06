@@ -553,3 +553,286 @@ fn fetched_and_verified_signature_reports_the_verified_state() {
         FetchOutcome::DownloadFailed(msg) => panic!("expected Verified, got DownloadFailed: {msg}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// #10470: required-assurance policy
+// ---------------------------------------------------------------------------
+
+fn required() -> SignaturePolicy {
+    SignaturePolicy {
+        require_signature: true,
+        approved_workflow: None,
+    }
+}
+
+fn run_with(fakebin: &Path, inputs: &FetchInputs<'_>, policy: &SignaturePolicy) -> FetchOutcome {
+    let mut outcome = None;
+    with_fake_bin(fakebin, || {
+        outcome = Some(fetch_and_verify_with_policy(inputs, policy));
+    });
+    outcome.unwrap()
+}
+
+fn expect_refusal(outcome: FetchOutcome) -> Vec<String> {
+    match outcome {
+        FetchOutcome::VerificationFailed { lines } => lines,
+        FetchOutcome::Verified { artifact, .. } => {
+            let _ = std::fs::remove_dir_all(&artifact.tmp_dir);
+            panic!("expected a refusal, got Verified")
+        }
+        FetchOutcome::DownloadFailed(m) => panic!("expected a refusal, got DownloadFailed: {m}"),
+    }
+}
+
+fn signed_assets(dir: &Path, bin_name: &str, pem: bool) -> PathBuf {
+    let assets = write_checksummed_assets(dir, bin_name);
+    std::fs::write(assets.join(format!("{bin_name}.sig")), b"sig").unwrap();
+    if pem {
+        std::fs::write(assets.join(format!("{bin_name}.pem")), b"cert").unwrap();
+    }
+    assets
+}
+
+const BIN: &str = "loom-daemon-x86_64-unknown-linux-gnu";
+
+#[test]
+fn policy_from_values_parses_flag_and_workflow() {
+    assert_eq!(SignaturePolicy::from_values(None, None), SignaturePolicy::default());
+    assert_eq!(SignaturePolicy::from_values(Some("0"), None), SignaturePolicy::default());
+    assert_eq!(SignaturePolicy::from_values(Some(""), Some("  ")), SignaturePolicy::default());
+    let p = SignaturePolicy::from_values(Some("1"), Some(" release.yml "));
+    assert!(p.require_signature);
+    assert_eq!(p.approved_workflow.as_deref(), Some("release.yml"));
+}
+
+#[test]
+#[serial]
+fn required_mode_refuses_an_unsigned_release_as_unsigned() {
+    let dir = tempdir();
+    let assets = write_checksummed_assets(&dir, BIN);
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    let lines = expect_refusal(run_with(&fakebin, &linux_inputs(&dir), &required()));
+    assert!(lines.iter().any(|l| l.contains("unsigned release")), "{lines:?}");
+    assert!(!lines.iter().any(|l| l.contains("assurance unavailable")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("left untouched")), "{lines:?}");
+}
+
+#[test]
+#[serial]
+fn required_mode_refuses_missing_cosign_as_unavailable_not_tampering() {
+    let dir = tempdir();
+    let assets = signed_assets(&dir, BIN, true);
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    // No fake cosign; route PATH through the fake dir plus a minimal system
+    // path (as the signature tests do) so the `cosign version` probe fails.
+    let mut outcome = None;
+    with_fake_bin(&fakebin, || {
+        std::env::set_var("PATH", format!("{}:/usr/bin:/bin", fakebin.display()));
+        outcome = Some(fetch_and_verify_with_policy(&linux_inputs(&dir), &required()));
+    });
+    let lines = expect_refusal(outcome.unwrap());
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("assurance unavailable (tooling)")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("NOT evidence of tampering")),
+        "{lines:?}"
+    );
+    assert!(!lines.iter().any(|l| l.contains("unsigned release")), "{lines:?}");
+}
+
+#[test]
+#[serial]
+fn required_mode_refuses_underivable_key_as_unavailable() {
+    // Bare `.sig` (key mode) with no resolvable public key.
+    let dir = tempdir();
+    let assets = signed_assets(&dir, BIN, false);
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    write_script(&fakebin, "cosign", "exit 0\n");
+    let lines = expect_refusal(run_with(&fakebin, &linux_inputs(&dir), &required()));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("assurance unavailable (tooling)")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn required_mode_leaves_an_invalid_signature_classified_as_invalid() {
+    let dir = tempdir();
+    let assets = signed_assets(&dir, BIN, true);
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    write_script(&fakebin, "cosign", "if [[ \"$1\" == version ]]; then exit 0; fi\nexit 1\n");
+    let lines = expect_refusal(run_with(&fakebin, &linux_inputs(&dir), &required()));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("signature verification FAILED")),
+        "{lines:?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("Required signature assurance")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn required_mode_passes_a_verified_signature_and_emits_sanitized_evidence() {
+    let dir = tempdir();
+    let assets = signed_assets(&dir, BIN, true);
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    write_script(&fakebin, "cosign", "exit 0\n");
+    let policy = SignaturePolicy {
+        require_signature: true,
+        approved_workflow: Some("release.yml".to_string()),
+    };
+    match run_with(&fakebin, &linux_inputs(&dir), &policy) {
+        FetchOutcome::Verified {
+            artifact,
+            signature_state,
+            signature_line,
+            ..
+        } => {
+            assert_eq!(signature_state, signature::SignatureState::Verified);
+            let ev = signature_line
+                .lines()
+                .find(|l| l.starts_with("LOOM_SIGNATURE_EVIDENCE "))
+                .unwrap_or_else(|| panic!("no evidence line: {signature_line}"));
+            let v: serde_json::Value =
+                serde_json::from_str(ev.trim_start_matches("LOOM_SIGNATURE_EVIDENCE ")).unwrap();
+            assert_eq!(v["tag"], "v0.16.0");
+            assert_eq!(v["signature_state"], "verified");
+            assert_eq!(v["policy_revision"], "release.yml");
+            assert_eq!(v["asset_sha256"], sha256_hex(b"fake artifact bytes"));
+            assert!(v["identity_regexp"]
+                .as_str()
+                .unwrap()
+                .contains(r"workflows/release\.yml@"));
+            let _ = std::fs::remove_dir_all(&artifact.tmp_dir);
+        }
+        FetchOutcome::VerificationFailed { lines } => panic!("expected Verified: {lines:?}"),
+        FetchOutcome::DownloadFailed(m) => panic!("expected Verified: {m}"),
+    }
+}
+
+/// A valid signature from a workflow that is not the approved one is refused:
+/// the fake cosign only accepts an identity regexp naming `release.yml`.
+#[test]
+#[serial]
+fn required_mode_refuses_a_valid_signature_from_an_unapproved_workflow() {
+    let dir = tempdir();
+    let assets = signed_assets(&dir, BIN, true);
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    // Models a certificate issued to `other.yml`: verify-blob succeeds only
+    // if the expected identity regexp matches that workflow path.
+    write_script(
+        &fakebin,
+        "cosign",
+        r#"if [[ "$1" == version ]]; then exit 0; fi
+for a in "$@"; do
+  if [[ "$a" == *'workflows/other\.yml@'* || "$a" == *'workflows/[^@]+@'* ]]; then exit 0; fi
+done
+exit 1
+"#,
+    );
+    let pinned = SignaturePolicy {
+        require_signature: true,
+        approved_workflow: Some("release.yml".to_string()),
+    };
+    let lines = expect_refusal(run_with(&fakebin, &linux_inputs(&dir), &pinned));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("signature verification FAILED")),
+        "{lines:?}"
+    );
+
+    // Same artifact, unpinned default: the wildcard accepts it (unchanged).
+    match run_with(&fakebin, &linux_inputs(&dir), &required()) {
+        FetchOutcome::Verified { artifact, .. } => {
+            let _ = std::fs::remove_dir_all(&artifact.tmp_dir);
+        }
+        _ => panic!("unpinned identity must still accept"),
+    }
+}
+
+#[test]
+#[serial]
+fn default_policy_still_accepts_unsigned_and_prints_no_evidence() {
+    let dir = tempdir();
+    let assets = write_checksummed_assets(&dir, BIN);
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+    match run_with(&fakebin, &linux_inputs(&dir), &SignaturePolicy::default()) {
+        FetchOutcome::Verified {
+            artifact,
+            signature_state,
+            signature_line,
+            ..
+        } => {
+            assert_eq!(signature_state, signature::SignatureState::Skipped);
+            assert!(signature_line.is_empty(), "{signature_line}");
+            let _ = std::fs::remove_dir_all(&artifact.tmp_dir);
+        }
+        _ => panic!("present-only mode must accept an unsigned release"),
+    }
+}
+
+/// Ordering regression: no candidate `--version` (or any execution of the
+/// downloaded binary) before verification passes. The candidate is a script
+/// that drops a marker file when run.
+#[test]
+#[serial]
+fn candidate_is_never_executed_before_verification_passes() {
+    let dir = tempdir();
+    let marker = dir.join("candidate-ran");
+    let assets = dir.join("assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let body = format!("#!/bin/sh\ntouch {}\necho 'loom-daemon 0.0.1'\n", marker.display());
+    std::fs::write(assets.join(BIN), body.as_bytes()).unwrap();
+    std::fs::write(
+        assets.join(format!("{BIN}.sha256")),
+        format!("{}  {BIN}\n", sha256_hex(body.as_bytes())),
+    )
+    .unwrap();
+    let fakebin = tempdir();
+    write_fake_gh(&fakebin, &assets);
+
+    // Unsigned + required: refused, candidate never ran.
+    let _ = expect_refusal(run_with(&fakebin, &linux_inputs(&dir), &required()));
+    assert!(!marker.exists(), "candidate ran before verification passed");
+
+    // Invalid signature: refused, candidate never ran.
+    std::fs::write(assets.join(format!("{BIN}.sig")), b"sig").unwrap();
+    std::fs::write(assets.join(format!("{BIN}.pem")), b"cert").unwrap();
+    write_script(&fakebin, "cosign", "if [[ \"$1\" == version ]]; then exit 0; fi\nexit 1\n");
+    let _ = expect_refusal(run_with(&fakebin, &linux_inputs(&dir), &SignaturePolicy::default()));
+    assert!(!marker.exists(), "candidate ran before verification passed");
+
+    // Control: once verification passes, the post-verification identity query runs it.
+    write_script(&fakebin, "cosign", "exit 0\n");
+    if let FetchOutcome::Verified { artifact, .. } =
+        run_with(&fakebin, &linux_inputs(&dir), &required())
+    {
+        assert!(marker.exists(), "control: --version should run after verification");
+        let _ = std::fs::remove_dir_all(&artifact.tmp_dir);
+    } else {
+        panic!("control run should verify");
+    }
+}
