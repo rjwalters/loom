@@ -1045,7 +1045,10 @@ for a fit or backtest to report.
   (`Tracker::priority_inputs_of`). Both pass the PR's own-label state, its
   linked star (`None` when unknown), the roster and the roster history, so
   train/serve skew (#10500) cannot arise in a second copy. A parity test
-  (`eta/tests/priority_inputs.rs`) builds one scenario both ways.
+  (`eta/tests/priority_inputs.rs`) builds one scenario both ways. Serving's
+  roster is the fleet view's modeled roster, whose entries are dated from the
+  fleet snapshots' label timeline (#10500), as training's are, so the
+  builder's inputs come from the same timeline on both sides.
 - **Fleet-wide position.** This uses `keyed_cmp` over
   `ETA_FLEET_POSITION_KEYS`: the real dispatch comparator without
   `main_red_fix`. Each PR's `workspace_priority` comes from the same historic
