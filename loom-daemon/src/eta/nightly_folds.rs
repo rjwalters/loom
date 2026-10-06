@@ -480,7 +480,7 @@ impl Heuristic for PerDay<'_> {
 /// ([`backtest::with_replay_calibration`], the helper `eta backtest` and
 /// `eta promote` call). Leak-free because `history` and `cases` were already
 /// cut at the cutoff ([`point_in_time`]); without it
-/// `land-2026-10-06-calm-plover` would degrade to plain `land-v2` in every
+/// `land-2026-10-06-even-lark` would degrade to plain `land-v2` in every
 /// fold.
 fn calibrated(
     by_day: &ByDay,

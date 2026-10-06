@@ -523,9 +523,8 @@ fn load_history(root: &Path, scope: HistoryScopeMode) -> StageSamples {
     history.push_journal(&journal_entries, "local");
     let mut history = fleet::apply_scope(scope, root, history);
     // The daemon's calibration log and pending store, so `eta view` shows the
-    // calibrated interval `land-2026-10-06-calm-plover` (#10489) would; it is
-    // the one registered reader of `history.calibration` since amber-heron
-    // retired (#10484).
+    // calibrated intervals the registered calibrators (`land-2026-10-06-even-lark`,
+    // #10489, and the #10524 IPCW wrappers) would; they read `history.calibration`.
     history.calibration = loom_daemon::eta::calibration_log::load(root);
     history
 }

@@ -221,7 +221,7 @@ fn external_review_path_from_listings_to_merge() {
     assert_eq!(
         merged.outcomes.len(),
         28,
-        "two estimates x land-v1 + the land-v2, calm-plover, brisk-petrel, quick-tern, swift-tern, held-heron, keen-wren, bold-lark, loop-kite, twin-otter-b, land-v4, little-v0 and tandem-wren shadows"
+        "two estimates x land-v1 + the land-v2, even-lark, brisk-petrel, quick-tern, swift-tern, held-heron, keen-wren, bold-lark, loop-kite, twin-otter-b, land-v4, little-v0 and tandem-wren shadows"
     );
     for outcome in &merged.outcomes {
         assert_eq!(outcome.score.outcome, OutcomeKind::Landed);
@@ -263,7 +263,7 @@ fn only_the_issue_closing_not_planned_is_abandoned() {
         t(600),
     );
     // Fourteen: `land-v1` (primary) and the `land-v2`,
-    // `land-2026-10-06-calm-plover`, `land-2026-10-06-brisk-petrel` (#10528),
+    // `land-2026-10-06-even-lark`, `land-2026-10-06-brisk-petrel` (#10528),
     // `land-2026-10-06-quick-tern`, `-swift-tern`,
     // `land-2026-10-06-held-heron`, `land-2026-10-06-keen-wren` (#10508),
     // `land-2026-10-06-bold-lark`, `land-2026-10-06-loop-kite` (#10521),

@@ -647,8 +647,8 @@ fn every_builtin_land_shadow_attaches_and_an_old_twelve_slice_drops_only_a_basel
 }
 
 /// #10484: `land-v3` and `land-2026-10-04-amber-heron` were retired from the
-/// live shadow set, #10549 `land-2026-10-04-fresh-tide`, and #10528
-/// `land-2026-10-04-twin-otter`. Pending
+/// live shadow set, #10549 `land-2026-10-04-fresh-tide`, #10528
+/// `land-2026-10-04-twin-otter`, and #10489 `land-2026-10-06-calm-plover`. Pending
 /// estimates restored from disk that still name them are never offered as
 /// `alternates[]`; the live shadows are.
 #[test]
@@ -658,6 +658,7 @@ fn retired_heuristics_never_appear_as_alternates_even_when_pending_names_them() 
         "land-2026-10-04-amber-heron",
         "land-2026-10-04-fresh-tide",
         "land-2026-10-04-twin-otter",
+        "land-2026-10-06-calm-plover",
     ];
     let registered = registered();
     for id in retired {
@@ -670,6 +671,7 @@ fn retired_heuristics_never_appear_as_alternates_even_when_pending_names_them() 
         summary(REPO, 1, Kind::Land, "land-2026-10-04-amber-heron", 0, Some(1_000)),
         summary(REPO, 1, Kind::Land, "land-2026-10-04-fresh-tide", 0, Some(500)),
         summary(REPO, 1, Kind::Land, "land-2026-10-04-twin-otter", 0, Some(400)),
+        summary(REPO, 1, Kind::Land, "land-2026-10-06-calm-plover", 0, Some(400)),
     ];
     let alternates = select_alternates(&pending, &current(), &registered);
     let list = &alternates[&(REPO.to_string(), 1, Kind::Land)];
