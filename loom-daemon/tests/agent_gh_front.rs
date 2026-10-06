@@ -276,9 +276,15 @@ fn pr_checks_shapes_it_cannot_reproduce_pass_through() {
         let out = s.gh(&args, &[]);
         assert!(stdout(&out).contains("ARG:checks"), "{extra:?}: {out:?}");
     }
-    // Forced colour changes gh's output: pass through.
-    let out = s.gh(CHECKS, &[("CLICOLOR_FORCE", "1")]);
-    assert!(stdout(&out).contains("ARG:checks"), "{out:?}");
+    // Forced colour changes gh's output; the escape hatches force a real call.
+    for env in [
+        ("CLICOLOR_FORCE", "1"),
+        ("LOOM_GH_NO_CACHE", "1"),
+        ("GH_CACHE_DISABLE", "1"),
+    ] {
+        let out = s.gh(CHECKS, &[env]);
+        assert!(stdout(&out).contains("ARG:checks"), "{env:?}: {out:?}");
+    }
     assert!(s.calls().iter().all(|c| !c.starts_with("api ")), "{:?}", s.calls());
 }
 
