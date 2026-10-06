@@ -228,8 +228,6 @@ fn registry_resolves_current_per_kind() {
             "finish-v1",
             "land-v1",
             "land-v2",
-            "land-v3",
-            "land-2026-10-04-amber-heron",
             "land-2026-10-04-fresh-tide",
             "land-v4",
             "land-2026-10-04-twin-otter",
@@ -244,15 +242,15 @@ fn registry_resolves_current_per_kind() {
     // A registered candidate IS selectable as current — that is what the
     // promotion switch flips (#9328).
     assert_eq!(registry.current(Kind::Land, Some("land-v2")).id(), "land-v2");
-    // `land-v3` (#9970) ships registered, not current: the default is
-    // unchanged, and only an explicit config selects it.
-    assert_eq!(registry.current(Kind::Land, Some("land-v3")).id(), "land-v3");
-    // `land-2026-10-04-amber-heron` (#10207) likewise: registered, not current.
+    // `land-v3` (#9970) and `land-2026-10-04-amber-heron` (#10207) were
+    // retired from the registry 2026-10-06 (#10484): selecting either falls
+    // back to the default.
+    assert_eq!(registry.current(Kind::Land, Some("land-v3")).id(), "land-v1");
     assert_eq!(
         registry
             .current(Kind::Land, Some("land-2026-10-04-amber-heron"))
             .id(),
-        "land-2026-10-04-amber-heron"
+        "land-v1"
     );
     // `land-2026-10-04-fresh-tide` (#10209) likewise: registered, not current.
     assert_eq!(
@@ -284,8 +282,6 @@ fn for_kind_enumerates_every_registered_heuristic_of_a_kind() {
         vec![
             "land-v1",
             "land-v2",
-            "land-v3",
-            "land-2026-10-04-amber-heron",
             "land-2026-10-04-fresh-tide",
             "land-v4",
             "land-2026-10-04-twin-otter",

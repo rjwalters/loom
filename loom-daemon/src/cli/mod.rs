@@ -45,7 +45,6 @@ mod eta_fleet_events_cmd;
 mod eta_fleet_signoz_cmd;
 mod eta_half_life;
 mod eta_offline_cmd;
-mod eta_replay_cmd;
 mod fleet_captain_cmd;
 pub(crate) mod fleet_config;
 mod fleet_config_reload;

@@ -1,17 +1,15 @@
-//! The shipped heuristics. `start-v1`, `finish-v1`, `land-v1`, `land-v2`,
-//! `land-v3`, `land-2026-10-04-amber-heron` and `land-2026-10-04-fresh-tide`
-//! share one engine ([`estimate_path`]); they differ in which history they
-//! read, where the path ends, (`land-v3`) how each stage's grid is
-//! calibrated, (`land-2026-10-04-amber-heron`) how the result's interval is
-//! recalibrated, and (`land-2026-10-04-fresh-tide`) how samples are weighted
-//! by recency; `land-v4` (#10210) is `land-v3` plus whether a stall's term
+//! The shipped heuristics. `start-v1`, `finish-v1`, `land-v1`, `land-v2`
+//! and `land-2026-10-04-fresh-tide` share one engine ([`estimate_path`]);
+//! they differ in which history they read, where the path ends, and
+//! (`land-2026-10-04-fresh-tide`) how samples are weighted by recency;
+//! `land-v4` (#10210) is the `land-v3` grid step (`land-v3` itself is retired
+//! from the registry, #10484; its module stays as `land-v4`'s step) plus whether a stall's term
 //! is applied and an item beyond its history is answered rather than refused.
 //! `land-2026-10-04-twin-otter` (#10243) reads no history: it evaluates a
 //! fitted coefficient file handed to it when the registry was built.
 //! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
-mod land_amber_heron;
 mod land_fresh_tide;
 mod land_twin_otter;
 mod land_twin_otter_b;
@@ -22,7 +20,6 @@ mod land_v4;
 mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
-pub use land_amber_heron::{LandAmberHeron, CALIBRATION_BASE, LAND_AMBER_HERON};
 pub use land_fresh_tide::{LandFreshTide, LAND_FRESH_TIDE};
 pub(crate) use land_twin_otter::recompute as recompute_twin_otter;
 pub use land_twin_otter::{
@@ -37,6 +34,11 @@ pub use land_v3::{
 };
 pub use land_v4::{LandV4, LAND_V4};
 pub use start_v1::{StartV1, START_V1};
+
+/// The heuristic whose track record the calibration log (#10207) records.
+/// (The `land-2026-10-04-amber-heron` shadow that consumed it was retired
+/// 2026-10-06, #10484; the log stays — backtests and `eta view` use it.)
+pub const CALIBRATION_BASE: &str = LAND_V2;
 
 use super::explanation::{
     Branches, ChangesRequested, Combination, Conditioning, CurrentStageRecord, DispatchRecord,
