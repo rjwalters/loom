@@ -395,8 +395,9 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// `site` in [`crate::forge_call_stats`] from the `--include` status line
 /// and rate-limit headers — the same [`crate::forge_call_stats::classify`]
 /// the hand-rolled record call here used. [`GhTarget::None`] on purpose: the
-/// writer credential stays the `cwd` root's (#5401) and nothing else, so the
-/// identity a call runs under keeps matching [`credential_scope`]'s cache key.
+/// writer credential stays [`writer_config_dir`]'s (#5401, #5431) and nothing
+/// else, so the identity a call runs under keeps matching
+/// [`credential_scope`]'s cache key.
 #[allow(clippy::too_many_arguments)]
 fn run_fetch_with(
     site: ConditionalRead,
@@ -439,7 +440,15 @@ fn run_fetch_with(
     if strip_token_env {
         inv = inv.without_token_env();
     }
-    let out = match inv.gh_config_dir(reader_dir).execute() {
+    // A cwd-less writer read (`visibility.repo`) keeps its owner's credential
+    // (#5431); with a `cwd` the facade's root lookup already applies.
+    let owner_dir = (reader_dir.is_none() && cwd.is_none())
+        .then(|| writer_config_dir(None, target))
+        .flatten();
+    let out = match inv
+        .gh_config_dir(reader_dir.or(owner_dir.as_deref()))
+        .execute()
+    {
         Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
         Ok(_) => anyhow::bail!("gh api {url} timed out after {}s", FETCH_TIMEOUT.as_secs()),
         Err(e) => return Err(e).with_context(|| format!("failed to invoke {}", gh_bin.display())),
@@ -561,12 +570,26 @@ fn host_scope(target: &Target) -> String {
         .unwrap_or_else(|| "github.com".to_string())
 }
 
-/// The `gh` credential identity a call from `cwd` runs under: the per-owner
-/// `GH_CONFIG_DIR` registered for that root (#5401), else the process's own
-/// `GH_CONFIG_DIR`, else `default`; plus a truncated SHA-256 fingerprint of
-/// any env token (which overrides the config dir in `gh`). Never the token.
-pub(crate) fn credential_scope(cwd: Option<&Path>) -> String {
-    let owner_config = cwd.and_then(crate::credential_preflight::gh_config_dir_for_root);
+/// The writer's per-owner `GH_CONFIG_DIR` for a read from `cwd` against
+/// `target`: the root's (#5401); with no `cwd`, the target owner's (#5431,
+/// the slug lookup a typed `GhTarget::Repo` gets from the facade). `None` =
+/// the process-global credential.
+fn writer_config_dir(cwd: Option<&Path>, target: &Target) -> Option<PathBuf> {
+    match cwd {
+        Some(dir) => crate::credential_preflight::gh_config_dir_for_root(dir),
+        None => target
+            .repo
+            .as_deref()
+            .and_then(crate::credential_preflight::gh_config_dir_for_owner_slug),
+    }
+}
+
+/// The `gh` credential identity a call from `cwd` against `target` runs
+/// under: [`writer_config_dir`], else the process's own `GH_CONFIG_DIR`,
+/// else `default`; plus a truncated SHA-256 fingerprint of any env token
+/// (which overrides the config dir in `gh`). Never the token.
+pub(crate) fn credential_scope(cwd: Option<&Path>, target: &Target) -> String {
+    let owner_config = writer_config_dir(cwd, target);
     let token = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN"]
         .iter()
         .find_map(|v| std::env::var(v).ok().filter(|t| !t.is_empty()));
@@ -593,7 +616,7 @@ pub(crate) fn cache_key(cwd: Option<&Path>, target: &Target, url: &str) -> Strin
         "{}|{}|{}|{url}",
         repo_scope(cwd, target),
         host_scope(target),
-        credential_scope(cwd)
+        credential_scope(cwd, target)
     )
 }
 

@@ -2714,7 +2714,7 @@ telemetry journal shares.
 The write is best-effort like its siblings: a failure is logged and swallowed,
 and can never change whether a role keeps ticking. The emit runs inside the
 tick's existing blocking task, costs one local `git remote get-url origin`, the
-300s-TTL-memoized visibility probe, and a single pass over the tick's own
+1h-TTL-memoized visibility probe (a conditional read, #10512), and a single pass over the tick's own
 transcripts (folding token usage and forge actions together rather than reading
 each file twice).
 
