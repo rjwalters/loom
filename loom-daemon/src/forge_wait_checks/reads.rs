@@ -27,6 +27,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 
 use crate::forge_call_stats::{ops, ForgeOp};
+use crate::forge_denial::{self as denial, Denial};
 use crate::forge_etag_store::{self as store, ConditionalRead, DiskEntry, Target};
 
 /// The `forge_call_stats` caller every read here is recorded under, so
@@ -47,11 +48,26 @@ const PER_PAGE: usize = 100;
 /// Why a read did not produce a body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadError {
-    /// Will not get better by waiting (auth, not found, unprocessable,
+    /// Will not get better by waiting (not found, unprocessable,
     /// unreadable or truncated payload): end the wait with `ERROR`.
     Fatal(String),
     /// A blip (no HTTP answer, 5xx, timeout): retry on the next poll.
     Transient(String),
+    /// GitHub refused the read (401/403/429), classified (#10633): a rate
+    /// limit is retried like [`ReadError::Transient`]; a permission or
+    /// credential refusal ends the wait like [`ReadError::Fatal`] — except
+    /// on the legacy-status read, which degrades (see `forge_wait_checks`).
+    Denied { denial: Denial, why: String },
+}
+
+impl ReadError {
+    /// The one-line reason, whatever the variant.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Fatal(w) | Self::Transient(w) | Self::Denied { why: w, .. } => w,
+        }
+    }
 }
 
 /// The PR facts one poll needs.
@@ -254,7 +270,8 @@ impl GhReads {
                 }
                 Ok(r.body)
             }
-            Some(r) if matches!(r.status, 401 | 403 | 404 | 410 | 422) => {
+            Some(r) if matches!(r.status, 401 | 403 | 429) => Err(denied(url, &r, &stderr)),
+            Some(r) if matches!(r.status, 404 | 410 | 422) => {
                 Err(ReadError::Fatal(format!("HTTP {} for {url}", r.status)))
             }
             Some(r) => Err(ReadError::Transient(format!("HTTP {} for {url}", r.status))),
@@ -268,6 +285,23 @@ impl GhReads {
             }
         }
     }
+}
+
+/// A refused read (401/403/429), classified by [`crate::forge_denial`] from
+/// the response body, `gh`'s stderr and the rate-limit headers (#10633):
+/// `HTTP 403 for <url>: permission (needs statuses:read): Resource not
+/// accessible by integration`, or `…: secondary-rate-limit: …`.
+fn denied(url: &str, r: &crate::forge_listing::HttpResponse, stderr: &str) -> ReadError {
+    let text = format!("{}\n{stderr}", r.body);
+    let kind =
+        denial::classify(Some(r.status), &text, Some(&r.ratelimit)).unwrap_or(Denial::Permission);
+    let message = denial::body_message(&r.body);
+    let why = format!(
+        "HTTP {} for {url}: {}",
+        r.status,
+        denial::describe(kind, url, false, message.as_deref())
+    );
+    ReadError::Denied { denial: kind, why }
 }
 
 /// `nwo`'s `base_ref` required status-check contexts (rulesets and classic
