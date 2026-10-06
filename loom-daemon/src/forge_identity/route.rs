@@ -243,7 +243,7 @@ impl Default for RoutingConfig {
 
 /// The default `shedPct`: between `spillProjectedPct` (70) and `spillFullPct`
 /// (90), so the latch has already started moving traffic before a
-/// deferrable read is shed, and 10% of the bucket stays for Gate reads.
+/// deferrable read is shed, and 20% of the bucket stays for Gate reads.
 pub const DEFAULT_SHED_PCT: f64 = 80.0;
 
 impl RoutingConfig {

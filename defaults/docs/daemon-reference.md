@@ -7444,9 +7444,13 @@ with no working directory derives only from steps 1 and 2 (the argv names
 the repo). Reads that verify the daemon's own just-made write are pinned to
 the writer, since a reader may lag it: the dispatch guard's lease read-back
 (`guard.lease_comments`, behind the claim tie-break and the sole-claim
-confirmation) and post-flip label read (`guard.issue_labels`), the claim
-check's `claim.labels` / `claim.lease_comments`, `comment.api_get` (a
-read-modify-write of a just-created object) and `merge_guard.head_sync`.
+confirmation), post-flip label read (`guard.issue_labels`) and claim
+timeline reads (`guard.claim_timeline`, behind the leaseless-claim yield
+and the phantom-claim revert), the claim check's `claim.labels` /
+`claim.lease_comments`, the reclaim verification (`claim.issue_labels`),
+the outcome write-back dedupe probe (`outcome.writeback_probe`),
+`comment.api_get` (a read-modify-write of a just-created object) and
+`merge_guard.head_sync`.
 `merge_group_ci.read` is pinned because a repo's `permissions` depend on who
 asks. The
 invocation's target is never changed: the reader attempt gets

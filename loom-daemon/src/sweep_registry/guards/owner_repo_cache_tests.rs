@@ -139,8 +139,13 @@ fn own_write_read_backs_never_derive_a_reader_route() {
     });
     let _ = registry.read_lease_comments(7);
     let _ = registry.current_labels_via_rest(7);
+    let _ = registry.fetch_claim_labeled_at(7);
     let seen = seen();
-    for op in ["guard.lease_comments", "guard.issue_labels"] {
+    for op in [
+        "guard.lease_comments",
+        "guard.issue_labels",
+        "guard.claim_timeline",
+    ] {
         let mine: Vec<_> = seen.iter().filter(|s| s.op == op).collect();
         assert!(!mine.is_empty(), "{op} did not run through the facade: {seen:?}");
         assert!(mine.iter().all(|s| s.route_slug.is_none()), "{op} derived: {mine:?}");

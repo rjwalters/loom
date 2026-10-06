@@ -2154,7 +2154,10 @@ pub mod forge {
         }
         let n = issue.to_string();
         let out = gh_call::output(
+            // W4-C: only used to verify this daemon's own reclaim edit, so
+            // the writer that made it answers (a reader may lag the write).
             gh_call::read("claim.issue_labels", gh_bin, root)
+                .writer_identity()
                 .args(["issue", "view", &n, "--json", "labels"])
                 .args(gh_call::loom_repo_flag()),
         )?;
