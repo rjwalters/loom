@@ -453,6 +453,7 @@ fn daemon_write_paths_are_scoped() {
             "script_helpers/validate_phase.rs",
             Via(DISPATCH, "runs inside a dispatched sweep"),
         ),
+        ("forge_rerun.rs", Gated),
         ("merge_pr/redate.rs", ShellVetted("merge-pr.sh")),
         ("merge_pr/redate/sync_handoff.rs", ShellVetted("merge-pr.sh")),
         (

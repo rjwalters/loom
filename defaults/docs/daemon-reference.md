@@ -6444,7 +6444,7 @@ let one of them be read as the sentinel:
 | `LOOM-CHECKS-NONE <sha>` | 0 | zero rows, confirmed by the bounded zero-row settle (`merge_pr::zero_checks`), and the base branch requires no contexts |
 | `LOOM-CHECKS-RED <sha> <names>` | 1 | a terminal failure (`failure`/`timed_out`/`cancelled`/`action_required`, or any other non-success conclusion); stderr lists `<name>\t<url>\t<run_id>` per check for `gh run view <run_id> --log-failed` |
 | `LOOM-CHECKS-TIMEOUT <sha> <pending>` | 2 | the deadline passed with checks pending — including zero rows while required contexts exist (never `NONE`) |
-| `LOOM-CHECKS-ERROR <reason>` | 3 | unreadable or truncated rollup, auth/404, repeated read failures, a required-context lookup still failing after 3 attempts when the wait would otherwise settle (`required-lookup-failed: …`), or Gitea |
+| `LOOM-CHECKS-ERROR <reason>` | 3 | unreadable or truncated rollup, a classified refusal (see below) or 404, repeated read failures, a required-context lookup still failing after 3 attempts when the wait would otherwise settle (`required-lookup-failed: …`), or Gitea |
 | `LOOM-CHECKS-HEAD-MOVED <old> <new>` | 4 | PR mode: the head changed mid-wait, so no verdict for `<old>` applies to `<new>` |
 
 `--timeout 0` is one snapshot poll. Default mode settles on every observed check,
@@ -6460,6 +6460,48 @@ otherwise settle is `ERROR`. Under `--required-only`, a base branch that require
 no contexts falls back to the default-mode decision over every observed check,
 with a stderr note — `gh pr checks --required` errors there ("no required checks
 reported"), so a vacuous `GREEN` would be a false pass.
+
+**Refusals are classified (#10633).** A `401`/`403`/`429` is classified by
+`forge_denial` from the response body, `gh`'s stderr and the rate-limit headers:
+`secondary-rate-limit` (the body names one, or the response carries
+`Retry-After`), `rate-limit` (`429`, `x-ratelimit-remaining: 0`, "API rate limit
+exceeded"), `credential` (`401`), `permission` (a `403` naming access, such as
+"Resource not accessible by integration", with the App permission the endpoint
+needs: `needs checks:read`, `needs statuses:read`), or `forbidden` (any other
+`403`). A rate limit is retried like a blip and ends the wait only as
+`ERROR read-failed: HTTP 403 for <url>: secondary-rate-limit: …`. A permission
+or credential refusal ends it at once (`ERROR HTTP 403 for <url>: permission
+(needs …): …`). The exception is the legacy `commits/{sha}/status` read, which
+needs **Commit statuses: read** on top of the **Checks: read** that check-runs
+need. A permission refusal there degrades the wait to check-runs only, with a
+stderr note, and the status read is not repeated. A required context reported
+only by a legacy status still counts as missing, so a degraded wait never
+settles `GREEN` past it. An empty rollup with unreadable statuses ends
+`ERROR statuses-unreadable: …`, never `NONE`. The HTTP status is also on the
+`invoke github` span (`github.http.status`, #10343).
+
+### Agent CI re-run: `forge rerun` (#10633)
+
+`loom-daemon forge rerun <RUN_ID> [--failed] [--repo O/R]` or
+`forge rerun --job <JOB_ID>` re-runs a workflow run, its failed and cancelled
+jobs (`--failed`), or one job, in place: `POST …/actions/runs/{id}/rerun`,
+`…/rerun-failed-jobs` or `…/actions/jobs/{id}/rerun`. A rerun is a write, so it
+runs on the **writer** identity only, never on a reader App, and is vetted by
+`write_scope` first (#9548) like every writing forge verb. It needs the App
+permission **Actions: write**. It is not retried (`ci.rerun` is
+`no-auto-retry`). It prints one sentinel:
+
+| Sentinel | Exit |
+|---|---|
+| `LOOM-RERUN-OK <run\|job> <id>` | 0 |
+| `LOOM-RERUN-DENIED <class> <detail>`, class `permission` / `credential` / `forbidden` | 1 |
+| `LOOM-RERUN-DENIED <class> <detail>`, class `secondary-rate-limit` / `rate-limit` | 2 |
+| `LOOM-RERUN-ERROR <reason>` | 3 |
+
+The classes are the ones `wait-checks` uses. A `permission` detail names the
+grant, for example `permission (needs actions:write): Resource not accessible by
+integration`. Agent-facing guidance lives in
+`.claude/commands/loom/ci-refusals-reference.md`.
 
 ### Cross-host dispatch-collision detection and enforcement (#4085, Phase 0 of #4028; enforcement added by #5789)
 
