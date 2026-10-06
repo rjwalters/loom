@@ -99,6 +99,7 @@ pub mod backtest;
 pub mod calibration_log;
 pub mod config;
 pub mod conformal;
+pub mod conformal_ipcw;
 pub mod doctor;
 pub mod doctor_facts;
 pub mod emit;
@@ -677,6 +678,9 @@ impl Registry {
                 Box::new(heuristics::LandFreshTide::default()),
                 Box::new(heuristics::LandV4),
                 Box::new(heuristics::LittleV0),
+                // #10524: wraps twin-otter-b; registered before the
+                // twin-otter pair so `-b` stays last.
+                Box::new(heuristics::LandQuickTern::new(fit.clone())),
                 Box::new(heuristics::LandTwinOtter::new(fit.clone())),
                 Box::new(heuristics::LandTwinOtterB::new(fit.clone())),
             ],

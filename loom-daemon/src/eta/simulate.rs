@@ -595,13 +595,17 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
 ///
 /// A twin-otter explanation (#10243) has no stage grids: it recomputes
 /// through its own `twin_otter` record (the adapted input, the config and
-/// the model slice) with the seed in `combination`.
+/// the model slice) with the seed in `combination`. A calibrated one
+/// (`land-2026-10-06-quick-tern`, #10524) then applies its recorded shift
+/// like any other.
 pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)> {
-    if let Some(record) = &explanation.twin_otter {
-        return super::heuristics::recompute_twin_otter(explanation, record);
-    }
-    let spec = spec_from_explanation(explanation)?;
-    let simulated = run(&spec).ok().map(|s| s.quantiles)?;
+    let simulated = match &explanation.twin_otter {
+        Some(record) => super::heuristics::recompute_twin_otter(explanation, record)?,
+        None => {
+            let spec = spec_from_explanation(explanation)?;
+            run(&spec).ok().map(|s| s.quantiles)?
+        }
+    };
     Some(match (&explanation.recalibration, &explanation.calibration) {
         (Some(r), _) => super::recalibrate::apply(simulated.1, &r.ratios, r.mode),
         (None, Some(c)) => super::conformal::apply(simulated, &c.shift),

@@ -269,6 +269,7 @@ only.
 | `land-v1` | `land` | in-sweep phases and the stage-sample journal (turnovers too, for an unstarted issue) | after `merge_wait` |
 | `land-v2` | `land` | the same, with **right-censored** stage samples folded in (Kaplan–Meier grids) | after `merge_wait` |
 | `land-2026-10-06-calm-plover` | `land` | `land-v2`'s path, then **each** of p25/p50/p75/p90 conformally calibrated against its own hit rate from `land-v2`'s landed **and** still-open (right-censored lower-bound) track record in a trailing 14-day window, per (stage, age bucket) → stage → pooled, with the per-day change of the shift rate-limited; fitted at the estimate's own `as_of` (recorded as `calibration`; #10489) | after `merge_wait` |
+| `land-2026-10-06-quick-tern` | `land` | `land-2026-10-04-twin-otter-b`'s estimate, then each of p25/p50/p75/p90 calibrated by **IPCW** split-conformal over twin-otter-b's landed and still-open track record in a **short recent window** (6 h half-life, doubling when there are too few landings), per stage → pooled. There is no rate limit; a shift within 1.5 standard errors of zero is not applied. Fitted at the estimate's own `as_of`, recorded as `calibration` with `ipcw{…}` (#10524) | at the merge |
 | `land-2026-10-04-fresh-tide` | `land` | `land-v2`'s, with every stage sample (observed and censored) weighted `exp(−age / half_life)`, half-life 2 days, and the grid built from the weighted samples; when the effective N `(Σw)²/Σw²` falls below 8 the half-life doubles (up to 6 times, then flat). Records `distribution.half_life_sec` (absent when flat) and `distribution.effective_n` per stage (#10209) | after `merge_wait` |
 | `land-v4` | `land` | the retired `land-v3`'s grid calibration (widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored; recorded per stage as `distribution.adjustment`; #9970), plus the binding stall's term added to every path, operator-held PRs estimated from the stage under the hold, and no `beyond_history` refusal (a flagged residual-life tail instead; #10210) | after `merge_wait` |
 | `little-v0` | `land` | **floor baseline, never promoted** (#10208): Little's law. For a PR in `review_wait` / `doctor` / `merge_wait`, `items_ahead / drain_rate` for the current stage plus the recency-weighted mean duration of each later stage; interval from a Gamma posterior on the rate (shape = observed exits, 400 seeded draws). Refuses with a zero drain rate and items ahead, or with no queue context; a held PR (`merge_hold`) is refused `blocked`, as by every heuristic that does not model the hold | after `merge_wait` |
@@ -391,12 +392,15 @@ fixture. A behaviour change is a new id registered beside the old one
 all of the above.
 `land-v3` (#9970) and `land-2026-10-04-amber-heron` (#10207) shipped the same way and
 were retired on 2026-10-06 (see [Retired heuristics](#retired-heuristics)).
-The calibration log (`.loom/state/eta/calibration.jsonl`, every landed
-`land-v2` outcome the tracker scored) and the recalibration machinery stay in
-the daemon. `land-2026-10-06-calm-plover` (below) reads it, so `eta view`
-loads it and `eta backtest` / `eta promote` derive the same evidence by
-replaying `land-v2` over the cases, leak-free because the calibration is
-refitted at each case's own `as_of`.
+The calibration log (`.loom/state/eta/calibration.jsonl`) and the
+recalibration machinery stay in the daemon. The log holds every landed
+outcome the tracker scored for a **calibration base**
+(`heuristics::CALIBRATION_BASES`): `land-v2` and, since #10524,
+`land-2026-10-04-twin-otter-b`. `land-2026-10-06-calm-plover` and
+`land-2026-10-06-quick-tern` (below) read it, each filtering on its own base,
+so `eta view` loads it. `eta backtest` / `eta promote` derive the same
+evidence by replaying every base over the cases. That is leak-free because
+the calibration is refitted at each case's own `as_of`.
 `land-2026-10-06-calm-plover` (#10489) ships the same way: registered, not
 current, shadowed so it appears in every snapshot's `alternates` (the loom-ui
 ETA chooser), promotion only through the #10233 gate. It is a generic
@@ -449,6 +453,77 @@ Calm-plover scores each quantile against itself (`ln(actual / q_τ)`), moves
 the median too, conditions on the age bucket, and rate-limits the adjustment.
 That it fixes those defects is the hypothesis the shadow evidence and the
 #10233 gate test; it is not claimed here.
+
+`land-2026-10-06-quick-tern` (#10524) ships the same way: registered, not
+current, shadowed into `alternates`, and promoted only through the #10233 gate.
+It wraps `land-2026-10-04-twin-otter-b`'s estimate exactly (same path or model,
+seed and quantiles; only the id is rewritten), so the base quantiles it
+adjusts are the ones logged as twin-otter-b's track record. Like
+twin-otter-b, it models the hold. Registration puts it just before the
+twin-otter pair, so `-b` stays last. The method is in
+`eta::conformal_ipcw`.
+
+*Method.*
+- **Score.** As calm-plover: `ln(a / q_τ)`. The adjusted quantile is
+  `q_τ · exp(c_τ)`.
+- **Censoring.** Every row's censoring time is known: `C = t − as_of`. That
+  is administrative censoring, so the censoring survival `Ĝ(u) = P(C > u)`,
+  the product-limit estimate over those times, is exact.
+- **IPCW.** A landing known at `d = max(actual, known) − as_of < C` is an
+  event, weighted `w / max(Ĝ(d), 0.05)`. The weighted CDF of the scores,
+  normalised by the weight of *all* rows, estimates the uncensored score
+  distribution.
+- **The shift.** `c_τ` is its smallest score reaching `τ(n+1)/n`, with `n`
+  the effective sample size. If mass lost to the weight cap leaves the level
+  unreachable, `c_τ` clamps to the largest resolved score.
+- **Window.** Rows are weighted `2^(−C / half_life)` within eight
+  half-lives (capped at 7 days). The half-life is 6 h, doubling to at most
+  96 h until the events' effective N `(Σw)²/Σw²` reaches 20.
+- **Cells.** Stage, else pooled, else the identity (twin-otter-b's estimate
+  unchanged, with no `calibration`).
+- **Noise floor, not a rate limit.** A raw shift within 1.5 standard errors
+  of zero (floor 0.05 ln) is not applied. The standard error is
+  `sqrt(τ(1−τ)/n_ipcw)` times the sparsity `dc/dτ` from the same weighted
+  CDF. A calibrated base is left exactly alone, and a real shift moves the
+  range within hours.
+- Outputs are monotone.
+
+*Why it differs from calm-plover.*
+- **Speed.** Calm-plover's 14-day window, rate-limited to `ln 1.2`/day,
+  takes days to follow a fleet change. #10528 asks for hours.
+- **Censoring axis.** Calm-plover's Kaplan–Meier runs on the *score* axis.
+  Censoring happens in *time*, and rows carry different `q_τ`, so the two
+  orders differ. IPCW weights on the time axis instead.
+- **Granularity.** Quick-tern does not condition on the age bucket, since a
+  short window's cells would be too thin.
+
+*Fixture evidence* (synthetic only, `eta::tests::conformal_ipcw`):
+- **Regime shifts.** A base calibrated before a x3, x2, x1/2 or x1/3 shift
+  gets p25–p75 coverage of post-shift outcomes back in [40%, 60%], and
+  staying there, within 12 h (`t_cov ≤ 12 h`). The fixtures measure 0–3 h.
+- **No shift.** On the no-shift fixture the wrapper never widens p25–p75 or
+  raises p90, at any half-hour from −12 h to +24 h.
+- **Censoring.** Dropping censored rows instead puts the p90 shift about
+  0.35 ln too low on the same data (IPCW: +0.01).
+- **Real data.** Nothing here is evidence about live coverage. The
+  walk-forward fold backtest and live shadow pairs are.
+
+*The record.* `calibration` as calm-plover's, with `method` =
+`ipcw_split_conformal_log`, `level` `stage` or `pooled`, and the window's
+`from` and rounded-up `days` set by the half-life. It has no
+`max_daily_step` / `replay_from`, and adds `ipcw{censoring, half_life_sec,
+window_sec, n_effective, g_floor, max_weight, deadband{p25..p90},
+unresolved[]}`. The result recomputes from the explanation:
+`run_explanation` replays twin-otter's own record, or the land-v2 path, and
+then applies `shift`.
+
+*Deferred* (#10524, #10528):
+- interval inflation when #10528's drift flag is set (no drift signal exists
+  yet);
+- a drift- or regime-driven adaptive half-life;
+- history-aware (HAPS) conditioning;
+- other bases (#10508, #10523);
+- the loom-experiments walk-forward acceptance backtest.
 
 `little-v0` (#10208) is registered the same way but is a **floor**, not a
 candidate: zero parameters, expected to lose to `land-v2` (long waits are mostly

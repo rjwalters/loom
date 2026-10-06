@@ -7,6 +7,7 @@ mod censoring;
 mod conditioning;
 mod config;
 mod conformal;
+mod conformal_ipcw;
 mod emit;
 mod episodes;
 mod estimate;
