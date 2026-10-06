@@ -2,10 +2,12 @@
 //! parent module's doc comment for the mapping table this file implements;
 //! this module is the field-by-field implementation plus its unit tests.
 
+mod auto_update;
 mod ci;
 mod eta;
 mod metadata;
 mod ops;
+mod pick_decision;
 mod session_output;
 
 use std::collections::BTreeMap;
@@ -167,6 +169,36 @@ pub(super) fn resource_for_host(host_id: &str, daemon_version: Option<&str>) -> 
 // ============================================================================
 // Logs — the four sweep-lifecycle record kinds
 // ============================================================================
+
+/// Deterministic, content-derived id of one envelope (Issue #10196).
+///
+/// `derived_hex(["loom.record", kind, host_id, emitted_at, <record JSON>], 16)`
+/// per `trace-identity.md`: never random, so a retried delivery of the same
+/// envelope hashes identically, while a re-snapshot of unchanged state (a new
+/// `emitted_at`) is a distinct record.
+pub(super) fn record_id(envelope: &TelemetryEnvelope) -> String {
+    // A serialization failure is practically unreachable for these types; if
+    // it ever happens, hash an empty body (as before) but say so loudly, since
+    // distinct records of one kind/host/instant would then share an id.
+    let content = serde_json::to_string(&envelope.record).unwrap_or_else(|err| {
+        log::warn!(
+            "record_id: failed to serialize {} record for hashing ({err}); \
+             id derived from an empty body",
+            envelope.record.kind()
+        );
+        String::new()
+    });
+    crate::telemetry::trace::derived_hex(
+        &[
+            "loom.record",
+            envelope.record.kind(),
+            &envelope.host_id,
+            &crate::telemetry::trace::instant(envelope.emitted_at),
+            &content,
+        ],
+        16,
+    )
+}
 
 /// Maps one lifecycle-kind envelope to a `LogRecord`. Returns `None` for the
 /// two host-level record kinds (`tokens.snapshot`, `host.health`) — those
@@ -584,10 +616,30 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             body_override = Some(r.text.clone());
             (event_name, severity, String::new(), attributes)
         }
-        TelemetryRecord::EtaEstimate(_) | TelemetryRecord::EtaOutcome(_) => {
+        TelemetryRecord::EtaEstimate(_)
+        | TelemetryRecord::EtaOutcome(_)
+        | TelemetryRecord::EtaFleetRefresh(_)
+        | TelemetryRecord::EtaFit(_) => {
             // Issue #9289: the body is the record's JSON (an estimate's whole
             // explanation); scalars ride as `loom.eta.*` attributes.
             let (event_name, severity, at, attributes, body) = eta::log_parts(&envelope.record)?;
+            time_unix_nano = at;
+            body_override = Some(body);
+            (event_name, severity, String::new(), attributes)
+        }
+        TelemetryRecord::AutoUpdateTick(_) => {
+            // Issue #10414: one self-update decision, stamped at the tick's
+            // start; the body is the record's JSON.
+            let (event_name, severity, at, attributes, body) =
+                auto_update::log_parts(&envelope.record)?;
+            time_unix_nano = at;
+            body_override = Some(body);
+            (event_name, severity, String::new(), attributes)
+        }
+        TelemetryRecord::PickDecision(_) => {
+            // Issue #10212: body is the record's JSON (the ranked candidates).
+            let (event_name, severity, at, attributes, body) =
+                pick_decision::log_parts(&envelope.record)?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
@@ -624,6 +676,11 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             return None;
         }
     };
+    // Issue #10196: every log kind carries a content-derived record id so a
+    // replay reader can dedupe at-least-once delivery (`LIMIT 1 BY`) without
+    // a per-kind rule. Inserted first so the 64-attribute bound never drops it.
+    let mut attributes = attributes;
+    attributes.insert(0, kv_string("loom.record_id", record_id(envelope)));
     Some(LogRecord {
         time_unix_nano,
         observed_time_unix_nano,

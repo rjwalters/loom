@@ -921,9 +921,9 @@ mod tests {
             workspace.path(),
             r#"{"version":1,"accounts":[{"provider":"codex","name":"work","credential_kind":"codex_home","credential_reference":"alice","enabled":true}]}"#,
         );
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
         let accounts = account_inventory(workspace.path(), AccountProvider::Codex).unwrap();
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].id.name, "work");
         assert!(!format!("{accounts:?}").contains("recognizable-secret"));
@@ -947,9 +947,9 @@ mod tests {
                 {"provider":"codex","name":"ghost","credential_kind":"codex_home","credential_reference":"ghost","enabled":true}
             ]}"#,
         );
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
         let accounts = account_inventory(workspace.path(), AccountProvider::Codex).unwrap();
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].id.name, "work");
     }
@@ -966,9 +966,9 @@ mod tests {
                 {"provider":"codex","name":"ghost-two","credential_kind":"codex_home","credential_reference":"ghost-two","enabled":false}
             ]}"#,
         );
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
         let accounts = account_inventory(workspace.path(), AccountProvider::Codex).unwrap();
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
         assert!(accounts.is_empty());
     }
 
@@ -988,9 +988,9 @@ mod tests {
                 {"provider":"codex","name":"disabled-ghost","credential_kind":"codex_home","credential_reference":"disabled-ghost","enabled":false}
             ]}"#,
         );
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
         let accounts = account_inventory(workspace.path(), AccountProvider::Codex).unwrap();
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].id.name, "work");
     }
@@ -1004,9 +1004,9 @@ mod tests {
         fs::create_dir(profiles.path().join("bob")).unwrap();
         // Machine-private state below the root must never surface as accounts.
         fs::create_dir(profiles.path().join(".quarantine")).unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
         assert_eq!(account_capacity(workspace.path(), AccountProvider::Codex).unwrap(), 2);
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
@@ -1018,7 +1018,8 @@ mod tests {
         fs::write(profiles.path().join("file"), "not-dir").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), profiles.path().join("escape")).unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
         for reference in ["../outside", "/absolute", "a/b", "file"] {
             registry(
                 workspace.path(),
@@ -1036,7 +1037,6 @@ mod tests {
             );
             assert!(account_inventory(workspace.path(), AccountProvider::Codex).is_err());
         }
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
@@ -1045,7 +1045,8 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let profiles = tempfile::tempdir().unwrap();
         fs::create_dir(profiles.path().join("alice")).unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
         registry(
             workspace.path(),
             r#"{"accounts":[{"provider":"codex","name":"alice","credential_kind":"codex_home","credential_reference":"alice"},{"provider":"codex","name":"alice","credential_kind":"codex_home","credential_reference":"alice"}]}"#,
@@ -1059,7 +1060,6 @@ mod tests {
             r#"{"accounts":[{"provider":"codex","name":"alice","credential_kind":"oauth_token_file","credential_reference":"alice"}]}"#,
         );
         assert!(account_inventory(workspace.path(), AccountProvider::Codex).is_err());
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]
@@ -1067,7 +1067,8 @@ mod tests {
     fn concurrent_registry_updates_do_not_lose_accounts() {
         let workspace = tempfile::tempdir().unwrap();
         let profiles = tempfile::tempdir().unwrap();
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profiles.path());
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
         let workspace_path = workspace.path().to_path_buf();
         let start = std::sync::Arc::new(std::sync::Barrier::new(8));
         let handles: Vec<_> = (0..8)
@@ -1089,7 +1090,6 @@ mod tests {
         assert!(!per_repo_accounts_file(&workspace_path)
             .with_extension("json.lock")
             .exists());
-        std::env::remove_var("LOOM_CODEX_PROFILE_ROOT");
     }
 
     #[test]

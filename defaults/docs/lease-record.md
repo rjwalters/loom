@@ -28,6 +28,7 @@ documented here.
 - [Who writes one (every claim path — #6320, #8193, #9453)](#who-writes-one-every-claim-path--6320-8193-9453)
 - [When it is written](#when-it-is-written)
 - [What this phase explicitly does not do](#what-this-phase-explicitly-does-not-do)
+- [Renewer ownership, completion and request budget (Issue #10229)](#renewer-ownership-completion-and-request-budget-issue-10229)
 - [For Phase 2 (reclamation) and Phase 3 (fencing)](#for-phase-2-reclamation-and-phase-3-fencing)
 - [Phase 2, dispatch-time half: claim-then-verify-order (#6287)](#phase-2-dispatch-time-half-claim-then-verify-order-6287)
 - [Phase 3 (Issue #6309) has now shipped: sweep-side fencing before push/PR-open](#phase-3-issue-6309-has-now-shipped-sweep-side-fencing-before-pushpr-open)
@@ -272,6 +273,54 @@ future reclamation decision's evidence, not the claim's own validity.
 - **No reclamation or fencing logic.** Deciding what to do with a lease that
   has gone stale (Phase 2) and bounding the cost of the underlying
   acquisition race #4028 describes (Phase 3) are both out of scope here.
+
+## Renewer ownership, completion and request budget (Issue #10229)
+
+- **One renewer per (repo, host, sweep, issue).** `sweep-lease-renew.sh start`
+  hands the forked loop to `loom-daemon lease renewer claim`, which records its
+  pid, start-time identity and a per-start token under `~/.loom/lease-renew/`
+  (`LOOM_LEASE_RENEW_STATE_DIR`) behind an exclusive `flock`. A repeated start
+  with a live owner prints that pid and drops its own loop; a dead owner or
+  recycled pid is recovered; other keys never collide.
+- **Completion.** Each cycle reads the issue (an explicit `GET issues/N` via
+  `forge_gh_perm_safe`; the comments response has no state) and asks
+  `lease renewer check`: `closed`, a release or a newer owner ends the loop
+  even while the interactive parent lives; an unreadable state skips that
+  cycle's PATCH and keeps the loop. `release <issue>` ends that key's loop
+  explicitly (idempotent). A daemon predating the verb renews as before. A
+  remote authenticated release marker is not defined.
+- **Budget.** Steady state is three requests per cycle (state read, one
+  non-paginated `?since=` window, one PATCH): 36/h per held lease at the
+  default 300 s, up from 24/h, while loops for closed issues stop instead of
+  renewing until the 4 h / 24 h age cap. Re-list reasons (`full-window`,
+  `missing-comment`, `patch-404`) are logged and exported as
+  `LOOM_LEASE_FALLBACK_REASON` for gh-shim telemetry.
+- **Whose bucket.** Each call asks `loom-daemon forge token` for the host's
+  GitHub App installation: a reader App for the two GETs, the writer App for
+  the PATCH. `forge_gh_perm_safe`'s 403 ladder still runs under that token.
+  A host with no App, or an App attempt that fails for any reason, re-runs
+  the call on the caller's own credential, exactly as before, and tags it
+  `lease-credential=ambient-fallback` on stderr. `LOOM_LEASE_CREDENTIAL`
+  (`app` or `ambient`) is exported for gh-shim telemetry per attempt, not per
+  call: when the ladder recovers an App 403 on a personal rung
+  (`LOOM_PERSONAL_GH_TOKEN` or the ambient personal login), that attempt is
+  `ambient`, an escalated ladder prints one `lease-credential-attempt:` line
+  per attempt, and the call is tagged `lease-credential=ambient-recovered`,
+  even though it succeeded. On a host with an
+  App, a held lease therefore costs the personal login nothing in steady
+  state. The 36/h lands on the App buckets instead.
+- **Why `--paginate` recurred.** A full listing is meant to happen once per
+  loop, on its first cycle. Two paths made it recur. First, a loop with no
+  trusted, matching lease comment exits 2 on every cycle. That clears the
+  cache, so the next cycle lists everything again, for the loop's whole life.
+  Such a loop now stops after two consecutive misses, one interval apart, and
+  any successful renewal in between resets the count. Second, the cached window
+  was anchored at the lease's `created_at`, so it grew for the claim's whole
+  life and could fill a page (`full-window`). The cursor is now the lease
+  comment's `updated_at` as the previous cycle listed it. Every comment
+  created after that listing is still inside the window, so the own-yield
+  guard sees every new `loom:lease-yield`. The window now spans about two
+  intervals.
 
 ## For Phase 2 (reclamation) and Phase 3 (fencing)
 

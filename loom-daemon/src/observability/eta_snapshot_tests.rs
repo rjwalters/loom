@@ -4,7 +4,10 @@ use std::sync::Mutex as StdMutex;
 
 use chrono::{Duration, TimeZone, Utc};
 
-use super::{build_record, decide, fingerprint, is_changed, select_current, EtaSnapshotSink};
+use super::{
+    build_record, build_record_with, decide, fingerprint, fingerprint_with, is_changed,
+    select_alternates, select_current, EtaSnapshotSink, RegisteredIds,
+};
 use crate::eta::score::EstimateSummary;
 use crate::eta::tracker::{EstimateContext, Tracker};
 use crate::eta::{Kind, NoEstimateReason, Provenance, Registry, Stage};
@@ -35,6 +38,15 @@ fn current() -> std::collections::BTreeMap<Kind, String> {
     .collect()
 }
 
+/// The registered ids of each kind, from the builtin registry.
+fn registered() -> RegisteredIds {
+    let registry = Registry::builtin();
+    [Kind::Start, Kind::Finish, Kind::Land]
+        .into_iter()
+        .map(|k| (k, registry.for_kind(k).map(|h| h.id().to_string()).collect()))
+        .collect()
+}
+
 fn summary(
     repo: &str,
     issue: u32,
@@ -60,11 +72,14 @@ fn summary(
         p25_sec: p50.map(|p| p - 60),
         p50_sec: p50,
         p75_sec: p50.map(|p| p + 60),
+        p90_sec: p50.map(|p| p + 120),
         samples_min: Some(12),
         no_estimate_reason: p50
             .is_none()
             .then_some(NoEstimateReason::InsufficientSamples),
         stage_quartiles: Vec::new(),
+        tail_extrapolated: false,
+        stall_cause: None,
     }
 }
 
@@ -250,21 +265,23 @@ fn nothing_is_emitted_when_there_is_nothing_new_to_say() {
     assert!(decide(None, Some(7)).is_none());
 
     // A tracker with no current estimates: no empty/garbage row.
-    assert!(decide(Some((Vec::new(), current())), None).is_none());
+    assert!(decide(Some((Vec::new(), current(), registered())), None).is_none());
     // Nor when everything it holds is a shadow candidate.
     let shadows = vec![summary(REPO, 9329, Kind::Land, "land-v2", 0, Some(60))];
-    assert!(decide(Some((shadows, current())), None).is_none());
+    assert!(decide(Some((shadows, current(), registered())), None).is_none());
 
     // The first pass of a process emits; a restart mid-cadence is exactly
     // this case, and sends the restored set once rather than a stale copy.
-    let (selected, digest) = decide(Some((pending.clone(), current())), None).expect("emits");
+    let (selected, _, digest) =
+        decide(Some((pending.clone(), current(), registered())), None).expect("emits");
     assert_eq!(selected.len(), 1);
 
     // The next pass, unchanged, sends nothing…
-    assert!(decide(Some((pending.clone(), current())), Some(digest)).is_none());
+    assert!(decide(Some((pending.clone(), current(), registered())), Some(digest)).is_none());
     // …and a new estimate for the same item sends again.
     let refreshed = vec![summary(REPO, 9329, Kind::Land, "land-v1", 5, Some(1_800))];
-    let (_, next) = decide(Some((refreshed, current())), Some(digest)).expect("a new estimate");
+    let (_, _, next) =
+        decide(Some((refreshed, current(), registered())), Some(digest)).expect("a new estimate");
     assert_ne!(next, digest);
 }
 
@@ -350,6 +367,7 @@ fn rows_are_built_from_the_trackers_own_pending_estimates() {
         refresh_secs: 300,
         host_id: Some("host-test"),
         repo_ids: &repo_ids,
+        stalls: &crate::eta::stall::StallSnapshot::default(),
     };
     tracker.on_dispatch(REPO, 9289, "sweep-issue-9289-1", at);
     let emissions = tracker.estimate(None, &ctx, at);
@@ -448,4 +466,126 @@ fn a_serialized_row_stays_within_the_measured_budget() {
     let bytes = serde_json::to_vec(&record.rows[0]).unwrap().len();
     // MAX_ROWS is sized on ~250-350 B/row (~50-70 KB/record); see its doc comment.
     assert!(bytes < 500, "row grew to {bytes} bytes");
+}
+
+// ---------------------------------------------------------------------------
+// Alternates (#10390).
+// ---------------------------------------------------------------------------
+
+const TWIN: &str = "land-2026-10-04-twin-otter";
+
+fn alts(pending: &[EstimateSummary]) -> super::Alternates {
+    select_alternates(pending, &current(), &registered())
+}
+
+#[test]
+fn newest_shadow_estimate_wins_and_current_is_excluded() {
+    let pending = vec![
+        summary(REPO, 1, Kind::Land, "land-v1", 0, Some(3_600)),
+        summary(REPO, 1, Kind::Land, TWIN, 1, Some(100)),
+        summary(REPO, 1, Kind::Land, TWIN, 7, Some(200)),
+        summary(REPO, 1, Kind::Land, "land-v1", 9, Some(300)),
+    ];
+    let alternates = alts(&pending);
+    let list = &alternates[&(REPO.to_string(), 1, Kind::Land)];
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].p50_sec, Some(200));
+    assert_eq!(list[0].heuristic, TWIN);
+}
+
+#[test]
+fn unregistered_shadows_are_excluded() {
+    let pending = vec![summary(REPO, 1, Kind::Land, "land-retired", 0, Some(5))];
+    assert!(alts(&pending).is_empty());
+}
+
+#[test]
+fn a_shadow_with_a_different_as_of_still_attaches_but_never_creates_a_row() {
+    let pending = vec![
+        summary(REPO, 1, Kind::Land, "land-v1", 0, Some(3_600)),
+        summary(REPO, 1, Kind::Land, TWIN, 30, None),
+        summary(REPO, 2, Kind::Land, TWIN, 0, Some(10)),
+    ];
+    let selected = select_current(&pending, &current());
+    assert_eq!(selected.len(), 1);
+    let record = build_record_with(&selected, &alts(&pending), &visibility());
+    assert_eq!(record.rows.len(), 1);
+    let alt = &record.rows[0].alternates;
+    assert_eq!(alt.len(), 1);
+    assert_ne!(alt[0].as_of, record.rows[0].as_of);
+    assert_eq!(alt[0].no_estimate_reason, Some(NoEstimateReason::InsufficientSamples));
+    assert_eq!(alt[0].p50, None);
+}
+
+#[test]
+fn alternates_are_sorted_by_id_and_truncated() {
+    let ids: Vec<String> = (0..12).rev().map(|i| format!("land-x{i:02}")).collect();
+    let mut registered = registered();
+    registered.insert(Kind::Land, ids.clone());
+    let mut current = current();
+    current.insert(Kind::Land, "land-x00".to_string());
+    let pending: Vec<EstimateSummary> = ids
+        .iter()
+        .map(|id| summary(REPO, 1, Kind::Land, id, 0, Some(1)))
+        .collect();
+    let alternates = select_alternates(&pending, &current, &registered);
+    let list = &alternates[&(REPO.to_string(), 1, Kind::Land)];
+    assert_eq!(list.len(), crate::telemetry::kinds::eta_snapshot::MAX_ALTERNATES);
+    let got: Vec<&str> = list.iter().map(|e| e.heuristic.as_str()).collect();
+    let mut sorted = got.clone();
+    sorted.sort_unstable();
+    assert_eq!(got, sorted);
+    assert_eq!(got[0], "land-x01");
+}
+
+#[test]
+fn a_shadow_only_change_changes_the_fingerprint_and_triggers_a_snapshot() {
+    let base = vec![
+        summary(REPO, 1, Kind::Land, "land-v1", 0, Some(3_600)),
+        summary(REPO, 1, Kind::Land, TWIN, 0, Some(100)),
+    ];
+    let (_, _, digest) = decide(Some((base.clone(), current(), registered())), None).unwrap();
+    assert!(decide(Some((base.clone(), current(), registered())), Some(digest)).is_none());
+    let mut next = base;
+    next.push(summary(REPO, 1, Kind::Land, TWIN, 5, Some(90)));
+    assert!(decide(Some((next, current(), registered())), Some(digest)).is_some());
+    // No alternates: identical to the plain fingerprint.
+    let one = vec![summary(REPO, 1, Kind::Land, "land-v1", 0, Some(1))];
+    assert_eq!(fingerprint(&one), fingerprint_with(&one, &super::Alternates::new()));
+}
+
+#[test]
+fn rows_without_alternates_omit_the_key_and_budgets_hold() {
+    let pending = vec![summary(REPO, 1, Kind::Finish, "finish-v1", 0, Some(10))];
+    let selected = select_current(&pending, &current());
+    let record = build_record_with(&selected, &alts(&pending), &visibility());
+    let wire = serde_json::to_value(&record.rows[0]).unwrap();
+    assert!(wire.get("alternates").is_none());
+
+    // 7 alternates with long ids: one row < 2 KB, 200 rows < 512 KB.
+    let ids: Vec<String> = (0..7)
+        .map(|i| format!("land-2026-10-04-long-heuristic-name-{i}"))
+        .collect();
+    let mut registered = registered();
+    registered.insert(Kind::Land, [vec!["land-v1".to_string()], ids.clone()].concat());
+    let mut pending = Vec::new();
+    for issue in 0..200 {
+        pending.push(summary(REPO, issue, Kind::Land, "land-v1", 0, Some(3_600)));
+        for id in &ids {
+            pending.push(summary(REPO, issue, Kind::Land, id, 0, Some(100)));
+        }
+    }
+    let selected = select_current(&pending, &current());
+    let alternates = select_alternates(&pending, &current(), &registered);
+    let record = build_record_with(&selected, &alternates, &visibility());
+    assert_eq!(record.rows.len(), 200);
+    assert_eq!(record.rows[0].alternates.len(), 7);
+    assert!(serde_json::to_vec(&record.rows[0]).unwrap().len() < 2_048);
+    assert!(serde_json::to_vec(&record).unwrap().len() < 512 * 1_024);
+}
+
+#[test]
+fn registering_a_ninth_land_heuristic_fails_loudly() {
+    let land = Registry::builtin().for_kind(Kind::Land).count();
+    assert!(land - 1 <= crate::telemetry::kinds::eta_snapshot::MAX_ALTERNATES);
 }

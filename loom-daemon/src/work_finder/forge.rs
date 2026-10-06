@@ -15,7 +15,7 @@
 
 use super::{
     host_class, operator_priority, read_work_finder_config, resolve_extra_skip_labels_with_config,
-    WorkDispatcher, WorkItem, WorkSource, OPERATOR_PRIORITY_LABEL,
+    WorkDispatcher, WorkItem, WorkSource,
 };
 use crate::sweep_registry::SweepRegistry;
 use crate::types::{SweepKind, SweepState};
@@ -43,7 +43,7 @@ impl GhWorkSource {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            gh_bin: PathBuf::from("gh"),
+            gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
             repo: std::env::var("LOOM_REPO").ok(),
             cwd: None,
         }
@@ -58,7 +58,7 @@ impl GhWorkSource {
     #[must_use]
     pub fn for_root(root: &Path) -> Self {
         Self {
-            gh_bin: PathBuf::from("gh"),
+            gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
             repo: std::env::var("LOOM_REPO").ok(),
             cwd: Some(root.to_path_buf()),
         }
@@ -80,6 +80,11 @@ impl Default for GhWorkSource {
 
 impl WorkSource for GhWorkSource {
     fn list_ready_issues(&mut self) -> Result<Vec<WorkItem>> {
+        // Curator intake reconcile (#10041): cadence-gated, fail-soft, REST-only;
+        // gives every unlabeled issue `loom:triage` so Curator has one queue.
+        if let Some(root) = self.cwd.as_deref() {
+            crate::intake_reconcile::maybe_run(&self.gh_bin, root);
+        }
         // ETag-cached REST listing (#4428), replacing the per-tick GraphQL
         // `gh issue list`.
         let ready = self.list_label("loom:issue")?;
@@ -87,15 +92,20 @@ impl WorkSource for GhWorkSource {
         // `loom:issue` (triage, curated, or no workflow label at all). Its
         // failure never costs the `loom:issue` rows: log, feed the rate-limit
         // breaker, and carry on with what the first listing returned.
-        let starred = self
-            .list_label(OPERATOR_PRIORITY_LABEL)
-            .unwrap_or_else(|e| {
+        // #10307: one listing per level label (operator and inherited, every
+        // level): a level-2 issue need not carry the star itself.
+        let mut starred: Vec<WorkItem> = Vec::new();
+        for label in crate::operator_levels::starred_labels(crate::operator_levels::table()) {
+            let rows = self.list_label(label).unwrap_or_else(|e| {
                 log::warn!(
-                    "work_finder: listing starred issues failed ({e}); using loom:issue rows only"
+                    "work_finder: listing {label} issues failed ({e}); using the other rows only"
                 );
                 crate::rate_limit_breaker::global_observe_failure(&e.to_string(), "work_finder");
                 Vec::new()
             });
+            let seen: HashSet<u32> = starred.iter().map(|i| i.number).collect();
+            starred.extend(rows.into_iter().filter(|i| !seen.contains(&i.number)));
+        }
         let mut items = operator_priority::merge_starred(ready, starred);
         let key = operator_priority::repo_key(self.cwd.as_deref(), self.repo.as_deref());
         let mut timeline = operator_priority::GhTimelineStarredAt {

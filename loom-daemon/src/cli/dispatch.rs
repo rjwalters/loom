@@ -4,7 +4,6 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 use loom_daemon::sweep_registry;
 use loom_daemon::types::{Request, Response, SweepKind};
@@ -98,22 +97,19 @@ struct GhIssueLabelsAndBody {
 /// not run this time" and proceeds, exactly as it would with
 /// `--ignore-host-constraint`.
 fn fetch_issue_for_host_check(root: &Path, issue: u32) -> Option<(Vec<String>, Option<String>)> {
-    let mut cmd = Command::new("gh");
-    cmd.arg("issue")
-        .arg("view")
-        .arg(issue.to_string())
-        .arg("--json")
-        .arg("labels,body");
-    cmd.current_dir(root);
-    loom_daemon::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+    use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    // #10089: through the facade (counted, bounded, and run under `root`'s
+    // owner credential).
+    let op = Operation::new("dispatch.host_check");
+    let timeout = std::time::Duration::from_secs(30);
+    let mut inv = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, timeout)
+        .current_dir(root)
+        .args(["issue", "view", &issue.to_string(), "--json", "labels,body"]);
     if let Ok(repo) = std::env::var("LOOM_REPO") {
-        cmd.arg("--repo").arg(repo);
+        inv = inv.arg("--repo").arg(repo);
     }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
+    let outcome = inv.run();
+    let out = outcome.ok_output()?;
     let parsed: GhIssueLabelsAndBody = serde_json::from_slice(&out.stdout).ok()?;
     Some((parsed.labels.into_iter().map(|l| l.name).collect(), parsed.body))
 }

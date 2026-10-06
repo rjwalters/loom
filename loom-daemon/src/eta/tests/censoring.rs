@@ -429,7 +429,7 @@ fn land_v2_equals_land_v1_until_a_censored_sample_exists_then_diverges() {
     // Recomputable: the simulation reads only what the explanation holds, so
     // a KM-gridded explanation replays to the same numbers.
     let replayed = crate::eta::simulate::run_explanation(&v2_after).unwrap();
-    assert_eq!(replayed, v2_after.quantiles().unwrap());
+    assert_eq!(replayed, v2_after.quantiles_with_p90().unwrap());
 }
 
 #[test]
@@ -442,4 +442,75 @@ fn land_v2_keeps_its_own_id_and_never_rewrites_land_v1s() {
     assert_eq!(v2.heuristic, "land-v2");
     assert_ne!(v1.estimate_id, v2.estimate_id, "a different id is a different series");
     assert_eq!(v1.kind, v2.kind);
+}
+
+#[test]
+fn backfill_append_is_idempotent_and_a_completed_segment_is_counted_once() {
+    use crate::eta::journal::{append_dedup, read};
+    use crate::pr_latency::history::{PrEvent, PrHistory, PrState};
+    use crate::pr_latency::REVIEW_REQUESTED;
+
+    let t = |secs: i64| as_of() - Duration::seconds(secs);
+    let waiting = PrHistory::new(
+        9750,
+        t(86_400),
+        PrState::Open,
+        None,
+        vec![REVIEW_REQUESTED.to_string()],
+        vec![PrEvent::Labeled {
+            label: REVIEW_REQUESTED.to_string(),
+            at: t(3_600),
+        }],
+        true,
+    );
+    let dir = std::env::temp_dir().join(format!("loom-eta-9750-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("eta-stage-samples.jsonl");
+
+    // Re-running backfill (even later, so `observed_at` differs) adds nothing.
+    let rows = censored_from_pr_history(&waiting, "rjwalters/loom", as_of(), &provenance());
+    assert_eq!(append_dedup(&path, &rows).unwrap(), 1);
+    let later = censored_from_pr_history(
+        &waiting,
+        "rjwalters/loom",
+        as_of() + Duration::hours(1),
+        &provenance(),
+    );
+    assert_eq!(append_dedup(&path, &later).unwrap(), 0);
+    assert_eq!(append_dedup(&path, &rows).unwrap(), 0);
+    let journal = read(&path);
+    assert_eq!(journal.len(), 1);
+
+    // The segment completes: the real row is appended once, and the stale
+    // bound no longer counts.
+    let mut done = journal[0].clone();
+    done.event = "label.transition".to_string();
+    done.censored_sec = None;
+    done.duration_sec = Some(5_000);
+    assert_eq!(append_dedup(&path, &[done.clone()]).unwrap(), 1);
+    assert_eq!(append_dedup(&path, &[done.clone()]).unwrap(), 0);
+    let journal = read(&path);
+    assert_eq!(journal.len(), 2);
+    let mut history = StageSamples::default();
+    history.push_journal(&journal, "host-test");
+    assert_eq!(history.stages.len(), 1);
+    assert_eq!(history.censored.len(), 0, "the completed segment is not also censored");
+
+    // A different `entered_at` or stage is a different segment: kept.
+    let mut other_entry = journal[0].clone();
+    other_entry.entered_at = Some(t(100));
+    let mut other_stage = journal[0].clone();
+    other_stage.stage = Some(Stage::Doctor);
+    let mut history = StageSamples::default();
+    history.push_journal(
+        &[
+            journal[0].clone(),
+            journal[1].clone(),
+            other_entry,
+            other_stage,
+        ],
+        "h",
+    );
+    assert_eq!(history.censored.len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -3,10 +3,13 @@
 //! ships with the binary and cannot drift per host.
 //!
 //! Slice 1 scope: the registry itself, its query API, and the generator for
-//! the Loom marker block of the two full `labels.yml` copies. The daemon's own
-//! label tables (`PARK_LABELS`, `SKIP_LABELS`, ...) are NOT yet derived from
-//! it; `tests.rs` keeps each one in lockstep with the registry so converting
-//! them later is a pure swap.
+//! the Loom marker block of the two full `labels.yml` copies.
+//!
+//! Slice 2a: the work-finder and hard-exclusion label sets (`PARK_LABELS`,
+//! `SKIP_LABELS`, `HARD_EXCLUSION_LABELS`, `CHAMPION_PATH_LABELS`) are
+//! [`LabelSet`]s derived from registry properties via [`embedded_set`]. The
+//! remaining daemon tables are not converted yet; `tests.rs` keeps each one in
+//! lockstep with the registry so converting it is a pure swap.
 //!
 //! Fields documented as inert (`stale_after_minutes`, `lifecycle`,
 //! `propagate`) have no consumer yet.
@@ -23,6 +26,24 @@ mod tests;
 
 /// The embedded registry source.
 pub const REGISTRY_JSON: &str = include_str!("../../../defaults/labels.json");
+
+/// A label set derived from the embedded registry, computed on first use and
+/// shared for the life of the process. Derefs to `[&'static str]`, so
+/// `.contains()` / `.iter()` read like the `&[&str]` constants it replaces.
+pub type LabelSet = std::sync::LazyLock<Vec<&'static str>>;
+
+/// Names with boolean `property` true in the embedded registry, in registry
+/// order. The initializer for a [`LabelSet`].
+///
+/// # Panics
+/// If `property` is not in [`BOOL_PROPERTIES`] (a programming error caught by
+/// the registry tests, which force every derived set).
+#[must_use]
+pub fn embedded_set(property: &str) -> Vec<&'static str> {
+    Registry::embedded()
+        .with_property(property)
+        .unwrap_or_else(|| panic!("{property} is not a registry boolean property"))
+}
 
 /// Boolean properties queryable through [`Registry::with_property`].
 pub const BOOL_PROPERTIES: &[&str] = &[
@@ -163,6 +184,9 @@ impl Registry {
             }
             if !LIFECYCLES.contains(&l.lifecycle.as_str()) {
                 bail!("{}: unknown lifecycle {}", l.name, l.lifecycle);
+            }
+            if l.park && !l.skip {
+                bail!("{}: a park label must also be a skip label (#4444)", l.name);
             }
         }
         for l in &self.labels {

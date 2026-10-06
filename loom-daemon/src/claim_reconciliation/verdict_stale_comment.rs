@@ -55,8 +55,11 @@
 ///
 /// Distinct from [`super::VERDICT_MARKER_PREFIX`] (`loom:verdict-sha`, which
 /// records which tree a *verdict* describes). This one records which
-/// invalidation has already been announced.
-pub(super) const VERDICT_STALE_MARKER_PREFIX: &str = "<!-- loom:verdict-stale from=";
+/// invalidation has already been announced. Owned by
+/// [`crate::verdict_stale_notice`] since #9709, so the shell guard's notice
+/// carries the identical line.
+pub(super) use crate::verdict_stale_notice::VERDICT_STALE_MARKER_PREFIX;
+use crate::verdict_stale_notice::{UntrustedVerdictMarker, DAEMON_SOURCE};
 
 /// Has this exact `marker_sha -> head_sha` invalidation already been announced
 /// on the PR?
@@ -93,20 +96,43 @@ pub(super) fn should_post(already_recorded: bool, disarmed: bool) -> bool {
 /// `disarm_line` is pre-formatted (leading newline included) or empty — an
 /// empty one contributes no line at all, so the comment never claims a disarm
 /// that did not happen.
+#[cfg(test)]
 pub(super) fn body(label: &str, marker_sha: &str, head_sha: &str, disarm_line: &str) -> String {
-    format!(
-        "{VERDICT_STALE_MARKER_PREFIX}{marker_sha} to={head_sha} -->\n\
-         **Stale review verdict cleared — head SHA moved**\n\n\
-         This PR's `{label}` verdict was rendered against `{marker_sha}`, but the current \
-         head is `{head_sha}`. A review verdict is a statement about a specific tree, so it \
-         does not survive a rebase, a force-push, or new commits.\n\n\
-         - Verdict cleared: `{label}` (recorded for `{marker_sha}`)\n\
-         - Returned to the review queue: `loom:review-requested` (current head `{head_sha}`)\
-         {disarm_line}\n\n\
-         Judge will re-evaluate the tree that is actually here now. No judgment about the new \
-         tree is implied either way — the old verdict simply no longer describes it.\n\n\
-         ---\n\
-         *Automated by loom-daemon claim reconciliation (#5686)*"
+    attributed_body(label, marker_sha, head_sha, disarm_line, None)
+}
+
+/// The notice's bullet for a clear that happened because the equivalence check
+/// could not be MADE, not because the change provably changed (#10134).
+/// Pre-formatted like `disarm_line` (leading newline) so it rides in the same
+/// slot; empty for `None`, so a clear on a proven content change reads exactly
+/// as it always has.
+pub(super) fn unavailable_line(note: Option<&str>) -> String {
+    note.map(|why| {
+        format!(
+            "\n- **Could not check whether the reviewed change is unchanged — cleared to fail \
+             closed, not because a content change was proven.** Why: {why}"
+        )
+    })
+    .unwrap_or_default()
+}
+
+/// [`body`], naming a newer verdict marker the trust filter dropped when there
+/// is one (#9709) — the template itself lives in
+/// [`crate::verdict_stale_notice::body`], shared with the shell guard.
+pub(super) fn attributed_body(
+    label: &str,
+    marker_sha: &str,
+    head_sha: &str,
+    disarm_line: &str,
+    untrusted: Option<&UntrustedVerdictMarker>,
+) -> String {
+    crate::verdict_stale_notice::body(
+        label,
+        marker_sha,
+        head_sha,
+        disarm_line,
+        untrusted,
+        DAEMON_SOURCE,
     )
 }
 
@@ -212,5 +238,17 @@ mod tests {
     #[test]
     fn an_absent_disarm_contributes_no_line() {
         assert!(!body("loom:pr", SHA_A, SHA_B, "").contains("Disarmed"));
+    }
+
+    /// #10134: a fail-closed clear (no equivalence could be evaluated) must
+    /// say so in the posted notice; a clear on a proven change adds nothing.
+    #[test]
+    fn a_fail_closed_clear_names_why_in_the_notice() {
+        let why = "clean-merge: new head X could not be fetched";
+        let b = body("loom:pr", SHA_A, SHA_B, &unavailable_line(Some(why)));
+        assert!(b.contains("Could not check whether the reviewed change is unchanged"));
+        assert!(b.contains(why));
+        assert!(b.starts_with(VERDICT_STALE_MARKER_PREFIX), "dedup marker must stay first");
+        assert_eq!(unavailable_line(None), "");
     }
 }

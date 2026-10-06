@@ -103,9 +103,13 @@
 pub mod backfill;
 pub mod claude_code_telemetry;
 pub mod collector;
+pub mod cycle_guard;
 pub mod daemon_event;
 pub mod endpoint_policy;
 pub mod eta;
+pub mod eta_fit;
+pub mod eta_fleet_refresh;
+mod eta_friction;
 pub mod eta_snapshot;
 pub mod exporter;
 pub mod lifecycle;
@@ -114,6 +118,7 @@ pub mod ops;
 pub mod otlp;
 pub mod outcome;
 pub mod overhead;
+pub mod pick_decision;
 pub mod queue;
 pub mod queue_blocked;
 pub mod queue_snapshot;
@@ -557,6 +562,33 @@ pub fn global_export_status() -> crate::types::ObservabilityExportStatus {
     snapshot
 }
 
+/// Once-per-process warning that telemetry export is off (#10282): the silent
+/// `debug!` this replaces left a daemon with no spans/metrics indistinguishable
+/// from a healthy one. Returns whether this call emitted the warning.
+fn warn_telemetry_off_once() -> bool {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    log::warn!(
+        "observability: telemetry is OFF — no spans or metrics will be exported (set \
+         observability.enabled=true to opt in)"
+    );
+    true
+}
+
+#[cfg(test)]
+mod warn_off_tests {
+    #[test]
+    fn warns_only_once_per_process() {
+        // Other tests may have triggered it already; the invariant is that at
+        // most one call ever returns true, and a repeat call never does.
+        let _ = super::warn_telemetry_off_once();
+        assert!(!super::warn_telemetry_off_once());
+        assert!(!super::warn_telemetry_off_once());
+    }
+}
+
 // ============================================================================
 // Per-exporter status map (Issue #8756)
 // ============================================================================
@@ -779,6 +811,72 @@ fn adopt_legacy_queue_file(workspace_root: &Path, per_name: &Path) {
     }
 }
 
+/// The per-exporter policy pass [`spawn_task`] runs before the ingest key is
+/// read (Issue #7815): the endpoint `entry` exports to, or the
+/// `(endpoint, detail)` its `Misconfigured` status reports. Shared with the
+/// attended live-output tailer (#10116) through [`planned_otlp_endpoints`], so
+/// the two cannot disagree about which destination is acceptable.
+fn entry_endpoint(
+    entry: &ExporterEntry,
+    shared_endpoint: Option<&String>,
+) -> Result<String, (Option<String>, String)> {
+    let Some(endpoint) = entry.endpoint.clone().or_else(|| shared_endpoint.cloned()) else {
+        return Err((
+            None,
+            "observability.endpoint not configured \
+             (set observability.endpoint or $LOOM_OBSERVABILITY_ENDPOINT)"
+                .to_string(),
+        ));
+    };
+    if entry.kind == ExporterKind::Otlp && !endpoint_policy::valid_otlp_endpoint(&endpoint) {
+        return Err((
+            Some(endpoint),
+            "invalid OTLP base URL: use HTTP(S) without credentials, query or fragment".into(),
+        ));
+    }
+    // Refuse reserved placeholder domains BEFORE the ingest key is read
+    // (Issue #7815) — a placeholder is "not configured", not a
+    // destination, and the key must never be loaded for one, let alone
+    // sent to it.
+    if let Some(host) = reserved_placeholder_host(&endpoint) {
+        let detail = format!(
+            "observability.endpoint {endpoint} points at the reserved placeholder \
+             domain {host} (RFC 2606/6761) — refusing to export so the ingest key \
+             is never sent there; set a real endpoint via \
+             $LOOM_OBSERVABILITY_ENDPOINT or .loom-local/local.json, or leave \
+             observability.enabled=false"
+        );
+        return Err((Some(endpoint), detail));
+    }
+    #[cfg(not(feature = "otlp"))]
+    if entry.kind == ExporterKind::Otlp {
+        return Err((
+            Some(endpoint),
+            "exporter=otlp requested but this daemon build was not compiled \
+                 with the `otlp` Cargo feature"
+                .to_string(),
+        ));
+    }
+    Ok(endpoint)
+}
+
+/// The OTLP endpoints [`spawn_task`] would start a sender for under `config`,
+/// after the same policy pass, in config order. Empty when observability is
+/// off or no OTLP exporter survives the pass. Reads no ingest key and starts
+/// nothing (#10116: the attended live-output tailer's gate).
+#[must_use]
+pub fn planned_otlp_endpoints(config: &ObservabilityConfig) -> Vec<String> {
+    if !resolve_enabled(config) {
+        return Vec::new();
+    }
+    let shared_endpoint = resolve_endpoint(config);
+    resolve_exporters(config)
+        .iter()
+        .filter(|entry| entry.kind == ExporterKind::Otlp)
+        .filter_map(|entry| entry_endpoint(entry, shared_endpoint.as_ref()).ok())
+        .collect()
+}
+
 /// Spawn the observability subsystem's background tasks (the collector and
 /// the sender — see the module docs) on the shared daemon runtime, or return
 /// `None` when disabled or under-configured. `enabled: false` (or no block)
@@ -824,7 +922,7 @@ pub fn spawn_task(
     workspace_pool: Arc<WorkspacePool>,
 ) -> Option<Vec<tokio::task::JoinHandle<()>>> {
     if !resolve_enabled(config) {
-        log::debug!("observability: disabled (set observability.enabled=true to opt in)");
+        warn_telemetry_off_once();
         return None;
     }
     let entries = resolve_exporters(config);
@@ -835,11 +933,6 @@ pub fn spawn_task(
     // rule — the key must never be loaded for an endpoint export will refuse,
     // and that reasoning now applies per-sink). Entries that fail a check
     // degrade to their own `Misconfigured` status; the rest are planned.
-    let missing_endpoint_detail = || {
-        "observability.endpoint not configured \
-             (set observability.endpoint or $LOOM_OBSERVABILITY_ENDPOINT)"
-            .to_string()
-    };
     let mut planned: Vec<(&ExporterEntry, String)> = Vec::new();
     let mut statuses: std::collections::BTreeMap<String, Arc<ExportStatus>> =
         std::collections::BTreeMap::new();
@@ -853,48 +946,10 @@ pub fn spawn_task(
         statuses.insert(name.to_string(), Arc::new(ExportStatus::misconfigured(endpoint, detail)));
     };
     for entry in &entries {
-        let name = entry.kind.name();
-        let Some(endpoint) = entry.endpoint.clone().or_else(|| shared_endpoint.clone()) else {
-            reject(&mut statuses, name, None, missing_endpoint_detail());
-            continue;
-        };
-        if entry.kind == ExporterKind::Otlp && !endpoint_policy::valid_otlp_endpoint(&endpoint) {
-            reject(
-                &mut statuses,
-                name,
-                Some(endpoint),
-                "invalid OTLP base URL: use HTTP(S) without credentials, query or fragment".into(),
-            );
-            continue;
+        match entry_endpoint(entry, shared_endpoint.as_ref()) {
+            Ok(endpoint) => planned.push((entry, endpoint)),
+            Err((endpoint, detail)) => reject(&mut statuses, entry.kind.name(), endpoint, detail),
         }
-        // Refuse reserved placeholder domains BEFORE the ingest key is read
-        // (Issue #7815) — a placeholder is "not configured", not a
-        // destination, and the key must never be loaded for one, let alone
-        // sent to it.
-        if let Some(host) = reserved_placeholder_host(&endpoint) {
-            let detail = format!(
-                "observability.endpoint {endpoint} points at the reserved placeholder \
-                 domain {host} (RFC 2606/6761) — refusing to export so the ingest key \
-                 is never sent there; set a real endpoint via \
-                 $LOOM_OBSERVABILITY_ENDPOINT or .loom-local/local.json, or leave \
-                 observability.enabled=false"
-            );
-            reject(&mut statuses, name, Some(endpoint), detail);
-            continue;
-        }
-        #[cfg(not(feature = "otlp"))]
-        if entry.kind == ExporterKind::Otlp {
-            reject(
-                &mut statuses,
-                name,
-                Some(endpoint),
-                "exporter=otlp requested but this daemon build was not compiled \
-                     with the `otlp` Cargo feature"
-                    .to_string(),
-            );
-            continue;
-        }
-        planned.push((entry, endpoint));
     }
     if planned.is_empty() {
         register_global_export_statuses(statuses.clone());
@@ -1118,7 +1173,37 @@ pub fn spawn_task(
     // ETA (#9289): `eta.estimate` / `eta.outcome` are OTLP-only too; the
     // tracker and its bus subscriber run (and journal) even without them.
     eta::register_sink(otlp_queues.clone(), &host_id);
-    ops_handles.extend(eta::spawn_task(bus, workspace_root.clone(), host_id.clone()));
+    let eta_handle =
+        eta::spawn_task(bus, workspace_root.clone(), host_id.clone(), workspace_pool.clone());
+    // #10414: the ETA pass runs inside the collector's 5-minute pass, which
+    // beats it after each `eta::record`; registered only when ETA is on.
+    if eta_handle.is_some() {
+        crate::task_liveness::register(
+            crate::task_liveness::ETA_PASS,
+            SNAPSHOT_INTERVAL,
+            crate::task_liveness::default_stale_after(SNAPSHOT_INTERVAL),
+        );
+    }
+    ops_handles.extend(eta_handle);
+    // The daily ETA refit (#10245) and the fleet snapshot refresh (#10263):
+    // either/or. With fleet refresh on, the refit check runs at the end of
+    // every refresh cycle (`eta_fleet_refresh::owns_fit`), so it always sees
+    // that cycle's snapshots and the standalone refit task is not spawned —
+    // two loops calling `refit_if_due` would only race.
+    if eta_fleet_refresh::owns_fit(&crate::eta::config::read(&workspace_root)) {
+        ops_handles.extend(eta_fleet_refresh::spawn_task(
+            workspace_root.clone(),
+            workspace_pool.clone(),
+            otlp_queues.clone(),
+            host_id.clone(),
+        ));
+    } else {
+        ops_handles.extend(eta_fit::spawn_task(
+            workspace_root.clone(),
+            otlp_queues.clone(),
+            host_id.clone(),
+        ));
+    }
     // Live agent output (#9764): `session.output` is OTLP-only too, and
     // additionally opt-in — `spawn_task` returns `None` unless
     // `observability.liveOutput.enabled` is set. Registered over the
@@ -1130,6 +1215,9 @@ pub fn spawn_task(
         ops::register_global_ops_sink(sink);
         // Slot turnaround (#8929): a bus subscriber, OTLP-only like the sink.
         ops_handles.push(ops::turnaround::spawn_task(bus));
+        // Long-running task liveness gauges (#10414), on their own ticker so
+        // a stuck collector pass cannot hide another loop's death.
+        ops_handles.push(ops::liveness::spawn_task());
     }
     // `queue.snapshot` (Issue #8852, phase 2): the reverse split — native
     // HTTPS queues only, sampled by the collector below.

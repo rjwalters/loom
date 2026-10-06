@@ -44,6 +44,17 @@
 #      `loom:reviewing` / `loom:pr`). Same-head-branch adoption (#6074, item 1
 #      above) always takes precedence: it already returns 0 before this guard
 #      runs.
+#   5. RATE-LIMIT REST FALLBACK (#9226). `gh pr create` is GraphQL-backed, and
+#      GitHub's GraphQL and REST quotas are independent: a fleet can exhaust
+#      the GraphQL pool while REST sits idle, which used to leave a Builder's
+#      pushed branch with no PR. On -- and only on -- a rejection matching the
+#      shared five-signature table (`is_rate_limit_error`, lib/forge-helpers.sh,
+#      the same predicate create-issue.sh's #5047 fallback uses), the filing is
+#      retried as one `POST repos/OWNER/REPO/pulls` (JSON on stdin, never
+#      `-f body=@path`), then labels via `POST .../issues/N/labels` -- the pulls
+#      endpoint takes no labels. A label failure after a successful create
+#      still exits 0 with the URL (the PR exists; re-running would only adopt
+#      it) and names the unapplied labels on stderr.
 #
 # Usage:
 #   create-pr.sh --title TITLE (--body BODY | --body-file PATH) \
@@ -73,7 +84,8 @@
 # `gh pr create`, so a caller parsing the URL needs no change).
 #
 # Exit codes:
-#   0 - A PR exists for this branch (created by this call, or adopted).
+#   0 - A PR exists for this branch (created by this call -- over GraphQL or
+#       the REST fallback -- or adopted).
 #   1 - Creation failed, or the target issue was already closed by a
 #       superseding PR (message on stderr in both cases).
 #   2 - Invalid arguments.
@@ -94,7 +106,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
 
 usage() {
-  sed -n '2,69p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '2,81p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 TITLE=""
@@ -109,23 +121,10 @@ HAVE_BODY=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --help | -h)
-      usage
-      exit 0
-      ;;
-    --title | -t)
-      TITLE="${2:-}"
-      shift 2
-      ;;
-    --body | -b)
-      BODY="${2:-}"
-      HAVE_BODY=true
-      shift 2
-      ;;
-    --body-file | -F)
-      BODY_FILE="${2:-}"
-      shift 2
-      ;;
+    --help | -h) usage; exit 0 ;;
+    --title | -t) TITLE="${2:-}"; shift 2 ;;
+    --body | -b) BODY="${2:-}"; HAVE_BODY=true; shift 2 ;;
+    --body-file | -F) BODY_FILE="${2:-}"; shift 2 ;;
     --label | -l)
       # `gh pr create --label "a,b"` splits on commas; match that so a
       # prompt's existing invocation transfers unchanged.
@@ -137,22 +136,10 @@ while [[ $# -gt 0 ]]; do
       done
       shift 2
       ;;
-    --base | -B)
-      BASE_BRANCH="${2:-}"
-      shift 2
-      ;;
-    --head | -H)
-      HEAD_BRANCH="${2:-}"
-      shift 2
-      ;;
-    --draft | -d)
-      DRAFT=true
-      shift
-      ;;
-    --repo | -R)
-      REPO_NWO="${2:-}"
-      shift 2
-      ;;
+    --base | -B) BASE_BRANCH="${2:-}"; shift 2 ;;
+    --head | -H) HEAD_BRANCH="${2:-}"; shift 2 ;;
+    --draft | -d) DRAFT=true; shift ;;
+    --repo | -R) REPO_NWO="${2:-}"; shift 2 ;;
     *)
       echo "create-pr.sh: unknown argument: $1" >&2
       echo "Run 'create-pr.sh --help' for usage." >&2
@@ -392,12 +379,31 @@ for _label in "${LABELS[@]+"${LABELS[@]}"}"; do
   CREATE_ARGS+=(--label "$_label")
 done
 
-PR_URL="$(forge_gh_perm_safe "${CREATE_ARGS[@]}")" || {
+# stderr is captured (not merged) so stdout stays the URL and the #9226
+# rate-limit predicate can read what `gh` said; it is re-emitted unchanged.
+_cpr_ef="$(mktemp)"; _cpr_rc=0
+PR_URL="$(forge_gh_perm_safe "${CREATE_ARGS[@]}" 2>"$_cpr_ef")" || _cpr_rc=$?
+cat "$_cpr_ef" >&2
+if [[ $_cpr_rc -ne 0 ]] && is_rate_limit_error "$(cat "$_cpr_ef")"; then
+  # #9226: GraphQL pool exhausted -> the identical filing as REST POSTs. REST
+  # requires `base`; an omitted --base is the repo default (also REST).
+  echo "create-pr.sh: gh pr create was rate-limited — retrying as a REST POST to repos/$REPO_NWO/pulls (#9226)" >&2
+  if { [[ -n "$BASE_BRANCH" ]] || BASE_BRANCH="$(gh api "repos/$REPO_NWO" --jq .default_branch 2>"$_cpr_ef")"; } &&
+    _cpr_rest="$(jq -n --arg t "$TITLE" --arg h "$HEAD_BRANCH" --arg b "$BASE_BRANCH" --arg body "$BODY" --argjson d "$DRAFT" \
+      '{title: $t, head: $h, base: $b, body: $body, draft: $d}' | gh api --method POST "repos/$REPO_NWO/pulls" --input - --jq '.html_url, .number' 2>"$_cpr_ef")"; then
+    _cpr_rc=0; PR_URL="${_cpr_rest%%$'\n'*}"; _cpr_num="${_cpr_rest##*$'\n'}"
+    if [[ ${#LABELS[@]} -gt 0 ]] && ! jq -nc '{labels: $ARGS.positional}' --args "${LABELS[@]}" | gh api --method POST "repos/$REPO_NWO/issues/$_cpr_num/labels" --input - >/dev/null 2>"$_cpr_ef"; then
+      echo "create-pr.sh: WARNING: PR $PR_URL was opened over REST but its label(s) were NOT applied: ${LABELS[*]} ($(cat "$_cpr_ef")). Apply them by hand: gh api --method POST repos/$REPO_NWO/issues/$_cpr_num/labels -f 'labels[]=<label>' (#9226)" >&2
+    fi
+  else echo "create-pr.sh: the REST fallback also failed: $(cat "$_cpr_ef")" >&2; fi
+fi
+rm -f "$_cpr_ef"
+if [[ $_cpr_rc -ne 0 ]]; then
   echo "create-pr.sh: could not open a PR for $HEAD_BRANCH. If the commits are \
 pushed, do NOT rebuild — re-run this script (it adopts an existing PR) or open \
 the PR by hand from that branch." >&2
   exit 1
-}
+fi
 # The URL is the script's stdout contract (identical to `gh pr create`'s, so a
 # caller parsing the URL needs no change) — echoed before the best-effort
 # footer step below, which only ever adds stderr.
@@ -410,7 +416,20 @@ echo "$PR_URL"
 # requires-daemon: forge optional   absent or pre-#9818 binary → the footer is skipped with a stderr note; the PR itself is already open (#9774)
 self_bin="$(command -v loom-daemon 2>/dev/null || true)"
 if [[ -n "$self_bin" ]]; then
-  if ! "$self_bin" forge comment --patch-created "$PR_URL" >/dev/null 2>&1; then
-    echo "create-pr.sh: note: could not append the dashboard footer to the PR body (best-effort; the PR itself is open)" >&2
+  # #10140: keep the daemon's stderr + exit code so the note names the cause
+  # (`2>&1 >/dev/null` captures stderr only; stdout stays the URL contract).
+  _footer_rc=0
+  _footer_err="$("$self_bin" forge comment --patch-created "$PR_URL" 2>&1 >/dev/null)" || _footer_rc=$?
+  if [[ "$_footer_rc" -ne 0 ]]; then
+    # First non-empty stderr line (the anyhow top-level message, which embeds
+    # gh's error), capped so a multi-KB dump cannot flood the terminal. Pure
+    # bash: a grep pipeline would trip set -e/pipefail on empty stderr.
+    _footer_line=""
+    while IFS= read -r _l; do
+      [[ "$_l" =~ ^[[:space:]]*$ ]] && continue
+      _footer_line="${_l:0:300}"
+      break
+    done <<<"$_footer_err"
+    echo "create-pr.sh: note: could not append the dashboard footer to the PR body (loom-daemon exit ${_footer_rc}: ${_footer_line:-no stderr}; best-effort, the PR itself is open)" >&2
   fi
 fi

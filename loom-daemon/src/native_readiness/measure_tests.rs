@@ -96,7 +96,10 @@ fn measured(attempt: &AttemptReport, stage: Stage) -> bool {
 fn the_pinned_dependency_is_read_from_the_provisioned_manifest() {
     assert_eq!(
         plugin_pin(crate::native_tools::provision::OPENCODE_PLUGIN_MANIFEST.as_bytes()),
-        "@opencode-ai/plugin@1.18.31"
+        format!(
+            "@opencode-ai/plugin@{}",
+            crate::native_tools::provision::OPENCODE_PLUGIN_VERSION
+        )
     );
     assert_eq!(plugin_pin(br#"{"dependencies":{"b":"2","a":"1"}}"#), "a@1,b@2");
     for unusable in [

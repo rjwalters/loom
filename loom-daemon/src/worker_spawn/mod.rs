@@ -252,7 +252,7 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         .as_ref()
         .and_then(|a| a.child(SpanName::RuntimePreflight, Default::default()))
         .or_else(|| lifecycle::inherited(&root, SpanName::RuntimePreflight, Default::default()));
-    let result = run_preflight(args, &root, preflight.as_ref(), attempt.as_ref());
+    let result = run_preflight(args, &root, preflight.as_ref(), attempt.as_ref(), None);
     if let Some(span) = preflight {
         // A rejected preflight is one of the two shapes an operator reports
         // ("the attempt failed in 300 ms with no runtime span"): record the
@@ -286,6 +286,7 @@ fn run_preflight(
     root: &Path,
     preflight: Option<&crate::observability::lifecycle::Span>,
     attempt: Option<&crate::observability::lifecycle::Span>,
+    egress_sources: Option<&crate::forge_egress::policy::PolicySources>,
 ) -> Result<(), LaunchError> {
     let mut trace_identity = crate::telemetry::trace::TraceAttributes::new();
     let config = crate::config_resolver::resolve_effective_config(root);
@@ -314,7 +315,11 @@ fn run_preflight(
     // Forge egress admission (#9984): `spawn-worker.sh` delegates here, so this
     // is its `forge egress assert`. Under `enforcement.api = required` a routing
     // finding means no worker is spawned; `observe` logs; no policy is a no-op.
-    if let Some(refusal) = crate::forge_egress::gate::spawn_refusal(root) {
+    // `egress_sources` is `None` in production (`from_process`); tests pin it.
+    if let Some(refusal) = egress_sources.map_or_else(
+        || crate::forge_egress::gate::spawn_refusal(root),
+        |sources| crate::forge_egress::gate::spawn_refusal_with(sources, root),
+    ) {
         return Err(LaunchError::config(refusal));
     }
     let scripts = args.scripts_dir.unwrap_or_else(|| scripts_dir(root));
@@ -506,6 +511,13 @@ fn run_preflight(
         selection.apply(&mut command);
     }
     command.env("LOOM_RUNTIME", &runtime);
+    // #10331: plain `gh` in the worker reaches the agent `gh` front first, so
+    // its `issue|pr view|list --json` reads are ETag-revalidated (never stale)
+    // and everything else execs the next `gh` untouched. `LOOM_GH_SHIM=0`
+    // opts out; see defaults/docs/gh-cached.md.
+    if let Some(path) = crate::agent_gh::worker_path(std::env::var_os("PATH").as_deref()) {
+        command.env("PATH", path);
+    }
     // CARGO_INCREMENTAL=0 for every Loom-spawned worker (#8456, parent #8453
     // item 1). Cargo keys a crate's incremental session state by the crate's
     // ABSOLUTE source path, and every Loom worktree is a new path — so state

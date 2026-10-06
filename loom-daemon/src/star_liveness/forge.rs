@@ -12,14 +12,20 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 
+use crate::forge_call_stats::{ops, ForgeOp};
 use crate::forge_etag_store as store;
 use crate::forge_listing::RestIssue;
+
+/// Every star-liveness read is recorded under caller `star_liveness`; the
+/// operation is the caller's, per URL (#9831).
+fn site(op: ForgeOp) -> store::ConditionalRead {
+    store::ConditionalRead::new("star_liveness", op)
+}
 
 /// One issue comment: its body, when it was posted and last edited, and who
 /// wrote it (for [`super::trust`]).
@@ -158,20 +164,22 @@ impl GhStarForge {
     #[must_use]
     pub fn new(root: &Path, slug: &str) -> Self {
         Self {
-            gh_bin: PathBuf::from("gh"),
+            gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
             root: root.to_path_buf(),
             slug: slug.to_string(),
         }
     }
 
     fn api(&self, args: &[&str], context: &str) -> Result<String> {
-        if crate::rate_limit_breaker::global_is_suppressed() {
+        if crate::rate_limit_breaker::global_skip_pass("star_liveness") {
             return Err(anyhow!("rate-limit breaker is suppressing forge calls"));
         }
-        let mut cmd = Command::new(&self.gh_bin);
-        cmd.arg("api").args(args).current_dir(&self.root);
-        crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, Some(&self.root));
-        let out = cmd.output()?;
+        // #10089: counted via the facade (`star.api`); it supplies the #5401
+        // cross-owner GH_CONFIG_DIR from the root.
+        let inv = crate::claim_reconciliation::gh_call::read("star.api", &self.gh_bin, &self.root)
+            .arg("api")
+            .args(args);
+        let out = crate::claim_reconciliation::gh_call::output(inv)?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             crate::rate_limit_breaker::global_observe_failure(&stderr, "star_liveness");
@@ -184,10 +192,11 @@ impl GhStarForge {
         format!("repos/{}/issues/{number}", self.slug)
     }
 
-    /// Conditional GET of `url` (a REST path): `Ok(Some(body))` on a `200` or
-    /// a `304` served from the stored body, `Ok(None)` on a `404`.
-    fn cached_get(&self, url: &str) -> Result<Option<String>> {
-        if crate::rate_limit_breaker::global_is_suppressed() {
+    /// Conditional GET of `url` (a REST path), accounted under `op` (#9831):
+    /// `Ok(Some(body))` on a `200` or a `304` served from the stored body,
+    /// `Ok(None)` on a `404`.
+    fn cached_get(&self, op: ForgeOp, url: &str) -> Result<Option<String>> {
+        if crate::rate_limit_breaker::global_skip_pass("star_liveness") {
             return Err(anyhow!("rate-limit breaker is suppressing forge calls"));
         }
         let cwd = Some(self.root.as_path());
@@ -205,7 +214,7 @@ impl GhStarForge {
             });
         let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
         let (status, response, stderr) =
-            store::fetch_conditional("star_liveness", &self.gh_bin, cwd, &target, url, sent_etag)?;
+            store::fetch_conditional(site(op), &self.gh_bin, cwd, &target, url, sent_etag)?;
         match response {
             Some(r) if r.status == 304 => match sent {
                 Some(e) => Ok(Some(e.body.clone())),
@@ -295,7 +304,12 @@ impl StarForge for GhStarForge {
     }
 
     fn issue(&mut self, number: u32) -> Result<Option<RestIssue>> {
-        let Some(body) = self.cached_get(&self.issue_path(number))? else {
+        let Some(body) = self.cached_get(
+            // A single-issue read: no inventory row exists for it (#9831).
+            ForgeOp::uninventoried("single-issue REST read has no inventory row"),
+            &self.issue_path(number),
+        )?
+        else {
             return Ok(None);
         };
         Ok(crate::forge_listing::parse_rest_issues(&format!("[{body}]"))?
@@ -308,7 +322,7 @@ impl StarForge for GhStarForge {
         for page in 1..=COMMENT_MAX_PAGES {
             let url =
                 format!("{}/comments?per_page={COMMENT_PAGE}&page={page}", self.issue_path(number));
-            let Some(body) = self.cached_get(&url)? else {
+            let Some(body) = self.cached_get(ops::COMMENT_LIST, &url)? else {
                 return Err(anyhow!("gh api {url} failed: HTTP 404"));
             };
             let raw: Vec<RawComment> = serde_json::from_str(&body)
@@ -332,7 +346,7 @@ impl StarForge for GhStarForge {
         let clean: String = phrase.chars().filter(|c| *c != '"').collect();
         let q = format!("\"{clean}\" repo:{} is:issue is:open in:title,body", self.slug);
         let url = format!("search/issues?q={}&per_page=20", url_encode(&q));
-        let Some(body) = self.cached_get(&url)? else {
+        let Some(body) = self.cached_get(ops::ISSUE_SEARCH, &url)? else {
             return Ok(Vec::new());
         };
         let items = serde_json::from_str::<serde_json::Value>(&body)
@@ -525,6 +539,10 @@ mod tests {
     fn no_raw_gh_spawn_outside_the_shared_helper() {
         let src = include_str!("forge.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap();
-        assert_eq!(prod.matches("Command::new(").count(), 1, "only GhStarForge::api spawns");
+        assert_eq!(
+            prod.matches("Command::new(").count(),
+            0,
+            "GhStarForge::api spawns via GhInvocation"
+        );
     }
 }

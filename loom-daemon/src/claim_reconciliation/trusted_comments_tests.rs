@@ -17,6 +17,12 @@ fn comment(login: &str, kind: &str, assoc: &str, sha: &str) -> String {
     )
 }
 
+/// The REST open-PR listing (#10349): PR #300 carries `loom:pr` at `SHA_B`.
+fn pulls_300() -> String {
+    use super::open_pr_listing::test_support::{pulls_arm, row};
+    pulls_arm(&[row(300, &["loom:pr"]).sha(SHA_B)])
+}
+
 /// PR #300 carries `loom:pr` at head `SHA_B`; its comment listing is
 /// `comments` (a JSON array).
 fn reconcile(comments: &str) -> VerdictReconcileStats {
@@ -30,23 +36,29 @@ fn reconcile(comments: &str) -> VerdictReconcileStats {
         &gh,
         format!(
             r#"#!/usr/bin/env bash
-case "$*" in
-  "pr list "*"--label loom:pr "*)
-    echo '[{{"number":300,"headRefOid":"{SHA_B}","labels":[{{"name":"loom:pr"}}]}}]' ;;
-  "pr list "*) echo '[]' ;;
+{pulls}case "$*" in
   "api repos/{{owner}}/{{repo}}/issues/300/comments"*) cat "{listing}" ;;
   "api "*compare/*) echo '{{"status":"ahead","files":[{{"filename":"src/lib.rs"}}]}}' ;;
   *) echo '{{}}' ;;
 esac
 "#,
-            listing = listing.display()
+            listing = listing.display(),
+            pulls = pulls_300(),
         ),
     )
     .unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The #9709 probe spawns through the `gh_invocation` choke point (#9985),
+    // whose resolver honours `LOOM_GH_BIN` rather than the injected `gh`.
+    let prev_gh_bin = std::env::var_os("LOOM_GH_BIN");
+    std::env::set_var("LOOM_GH_BIN", &gh);
     std::env::set_var(VERDICT_ANCHOR_ENABLED_ENV, "0");
     let stats = forge::reconcile_pr_verdicts(&gh, &root);
     std::env::remove_var(VERDICT_ANCHOR_ENABLED_ENV);
+    match prev_gh_bin {
+        Some(v) => std::env::set_var("LOOM_GH_BIN", v),
+        None => std::env::remove_var("LOOM_GH_BIN"),
+    }
     stats
 }
 
@@ -149,4 +161,76 @@ fn claim_activity_counts_only_from_trusted_authors() {
     assert_eq!(forge::fetch_most_recent_claim_activity_at(&gh, dir.path(), 7, claimed_at), None);
     let gh = comments_gh(dir.path(), &ndjson("loom-fleet-dispatch[bot]", "Bot", "NONE", &fields));
     assert!(forge::fetch_most_recent_claim_activity_at(&gh, dir.path(), 7, claimed_at).is_some());
+}
+
+/// #9709: PR #300 carries `loom:pr` at `SHA_B`; the newest TRUSTED approval is
+/// for `SHA_A`, and a newer approval for `SHA_B` came from an admin GitHub
+/// reports as `CONTRIBUTOR`. The verdict is still cleared (trust unchanged),
+/// but the posted notice names the login and `forge.trustedCommenters`
+/// instead of asserting a head move. Returns the posted comment bodies.
+fn reconcile_capturing_notice(comments: &str) -> (VerdictReconcileStats, String) {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let listing = dir.path().join("comments.json");
+    std::fs::write(&listing, comments).unwrap();
+    let posted = dir.path().join("posted.log");
+    let gh = dir.path().join("fake-gh.sh");
+    std::fs::write(
+        &gh,
+        format!(
+            r#"#!/usr/bin/env bash
+{pulls}case "$*" in
+  "pr comment "*) printf '%s\n' "$5" >> "{posted}" ;;
+  "api repos/{{owner}}/{{repo}}/issues/300/comments"*) cat "{listing}" ;;
+  "api "*compare/*) echo '{{"status":"ahead","files":[{{"filename":"src/lib.rs"}}]}}' ;;
+  *) echo '{{}}' ;;
+esac
+"#,
+            listing = listing.display(),
+            posted = posted.display(),
+            pulls = pulls_300(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The #9709 probe spawns through the `gh_invocation` choke point (#9985),
+    // whose resolver honours `LOOM_GH_BIN` rather than the injected `gh`.
+    let prev_gh_bin = std::env::var_os("LOOM_GH_BIN");
+    std::env::set_var("LOOM_GH_BIN", &gh);
+    std::env::set_var(VERDICT_ANCHOR_ENABLED_ENV, "0");
+    let stats = forge::reconcile_pr_verdicts(&gh, &root);
+    std::env::remove_var(VERDICT_ANCHOR_ENABLED_ENV);
+    match prev_gh_bin {
+        Some(v) => std::env::set_var("LOOM_GH_BIN", v),
+        None => std::env::remove_var("LOOM_GH_BIN"),
+    }
+    (stats, std::fs::read_to_string(&posted).unwrap_or_default())
+}
+
+#[test]
+#[serial]
+fn a_dropped_newer_approval_is_named_in_the_stale_notice() {
+    let listing = format!(
+        "[{},{}]",
+        comment("maintainer", "User", "COLLABORATOR", SHA_A),
+        comment("rjwalters", "User", "CONTRIBUTOR", SHA_B),
+    );
+    let (stats, posted) = reconcile_capturing_notice(&listing);
+    assert_eq!(stats.invalidated, 1, "trust is unchanged: still cleared: {stats:?}");
+    assert!(posted.contains(&format!("<!-- loom:verdict-stale from={SHA_A} to={SHA_B} -->")));
+    assert!(posted.contains("`rjwalters`"), "{posted}");
+    assert!(posted.contains("author_association=CONTRIBUTOR"), "{posted}");
+    assert!(posted.contains("forge.trustedCommenters"), "{posted}");
+    assert!(!posted.contains("head SHA moved"), "{posted}");
+}
+
+#[test]
+#[serial]
+fn a_genuine_head_move_still_says_head_sha_moved() {
+    let listing = format!("[{}]", comment("maintainer", "User", "COLLABORATOR", SHA_A));
+    let (stats, posted) = reconcile_capturing_notice(&listing);
+    assert_eq!(stats.invalidated, 1, "{stats:?}");
+    assert!(posted.contains("**Stale review verdict cleared — head SHA moved**"), "{posted}");
+    assert!(!posted.contains("forge.trustedCommenters"), "{posted}");
 }

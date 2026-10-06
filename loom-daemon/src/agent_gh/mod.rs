@@ -1,0 +1,339 @@
+//! The agent `gh` front: plain `gh` reads ETag-revalidated by default (#10331).
+//!
+//! Dispatched workers get `gh` → `loom-daemon` first on `PATH`
+//! ([`worker_path`], applied by `worker_spawn`); `loom-daemon` started under
+//! the name `gh` — or explicitly as `loom-daemon gh <gh argv…>` — lands in
+//! [`run`]. Per call:
+//!
+//! - [`classify::classify`] picks [`classify::Route::EtagView`] /
+//!   [`classify::Route::EtagList`] for the `issue|pr view|list --json …`
+//!   shapes the in-repo ETag modules reproduce exactly, and
+//!   [`classify::Route::Passthrough`] for everything else.
+//! - An ETag route is served in-process by [`crate::forge_cached_view`] /
+//!   [`crate::forge_cached_list`]: a conditional `gh api` request whose `304`
+//!   proves the stored body current and costs no primary quota. It is
+//!   **never stale**, so plain-`gh` gating reads (ADR-0021) stay correct.
+//!   There is deliberately no identical-call TTL here; that stays opt-in via
+//!   `gh-cached`.
+//! - Passthrough — and any ETag route the module declines at run time —
+//!   execs `next_gh` ([`next_gh::resolve`]: `LOOM_GH_BIN`, else the next `gh`
+//!   on `PATH`, e.g. the managed launcher #9987) with argv, streams and exit
+//!   status byte-identical ([`crate::gh_invocation::transparent::exec`]).
+//! - Escape hatch: `LOOM_GH_NO_CACHE=1` (also `GH_CACHE_DISABLE=1`,
+//!   `LOOM_ETAG_LIST_DISABLE=1`). Env-only on purpose: plain `gh` rejects an
+//!   unknown flag, so a `--fresh` would break every host without the front.
+//! - [`SENTINEL_ENV`] marks a call already inside a front, so a nested
+//!   invocation passes straight through; past [`MAX_DEPTH`] it refuses (a
+//!   resolution loop).
+//!
+//! Reads served here are recorded against caller [`STATS_CALLER`] in
+//! `forge_call_stats` (`loom-daemon status` forge-calls row), so the `304`
+//! share is measurable. `forge_etag_store::fetch_conditional` already routes
+//! them to a repo's reader App when one is configured (#9537).
+
+pub mod classify;
+pub mod next_gh;
+
+#[cfg(test)]
+mod tests;
+
+use std::ffi::{OsStr, OsString};
+use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
+
+use classify::Route;
+
+/// Front recursion depth, exported to every `gh` the front execs.
+pub const SENTINEL_ENV: &str = "LOOM_GH_FRONT_ACTIVE";
+
+/// Nested fronts beyond this are a resolution loop, not a real call.
+const MAX_DEPTH: u32 = 8;
+
+/// `forge_call_stats` caller for the front's conditional reads.
+pub const STATS_CALLER: &str = "agent_gh_front";
+
+/// Opt-out for the worker `PATH` prepend.
+pub const OPT_OUT_ENV: &str = "LOOM_GH_SHIM";
+
+/// When this process is the front — started as `gh`, or as `loom-daemon gh …`
+/// / `loom-daemon gh-shim …` — run it and exit. Called before clap parsing,
+/// so `gh`'s own flags never meet `loom-daemon`'s parser.
+pub fn dispatch_if_front() {
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let Some(argv0) = argv.first() else { return };
+    let code = if Path::new(argv0).file_name() == Some(OsStr::new("gh")) {
+        run(&argv[1..])
+    } else {
+        match argv.get(1).and_then(|a| a.to_str()) {
+            Some("gh") => run(&argv[2..]),
+            Some("gh-shim") => shim_command(&argv[2..]),
+            _ => return,
+        }
+    };
+    std::process::exit(code);
+}
+
+/// `loom-daemon gh-shim path`: create the shim directory and print it.
+fn shim_command(args: &[OsString]) -> i32 {
+    if args.len() != 1 || args[0] != "path" {
+        eprintln!(
+            "usage: loom-daemon gh-shim path\n  print a directory holding `gh` -> loom-daemon; \
+             put it first on PATH to route plain `gh` reads through the ETag cache (#10331)"
+        );
+        return 2;
+    }
+    match ensure_shim_dir() {
+        Ok(dir) => {
+            println!("{}", dir.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("loom-daemon gh-shim path: {e}");
+            1
+        }
+    }
+}
+
+fn depth() -> u32 {
+    std::env::var(SENTINEL_ENV)
+        .ok()
+        .and_then(|d| d.parse().ok())
+        .unwrap_or(0)
+}
+
+fn env_on(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|v| v == "1")
+}
+
+/// Any of the documented "force a real call" switches.
+fn no_cache() -> bool {
+    [
+        "LOOM_GH_NO_CACHE",
+        "GH_CACHE_DISABLE",
+        "LOOM_ETAG_LIST_DISABLE",
+    ]
+    .iter()
+    .any(|k| env_on(k))
+}
+
+/// The front proper. Returns the exit code to exit with (a passthrough
+/// replaces this process and never returns).
+#[must_use]
+pub fn run(raw: &[OsString]) -> i32 {
+    let depth = depth();
+    if depth >= MAX_DEPTH {
+        eprintln!("gh (loom front): {SENTINEL_ENV}={depth}: refusing a gh resolution loop");
+        return 127;
+    }
+    let Some(next) = next_gh::resolve() else {
+        eprintln!(
+            "gh: command not found (loom gh front #10331: no other gh on PATH or LOOM_GH_BIN)"
+        );
+        return 127;
+    };
+    if depth == 0 {
+        if let Some(out) = serve(raw, &next) {
+            record("revalidated", raw);
+            let mut stdout = std::io::stdout().lock();
+            // A closed pipe (`gh … | head -1`) is the reader's choice.
+            let _ = stdout.write_all(out.as_bytes());
+            let _ = stdout.flush();
+            return 0;
+        }
+        record("bypass", raw);
+    }
+    let err = crate::gh_invocation::transparent::exec(
+        &next,
+        raw,
+        &[(SENTINEL_ENV, OsString::from((depth + 1).to_string()))],
+    );
+    eprintln!("gh (loom front): failed to exec {}: {err}", next.display());
+    127
+}
+
+/// The ETag-served output, or `None` to pass through. Every failure of the
+/// cache layer lands here as `None`: caching is never a correctness mechanism.
+fn serve(raw: &[OsString], next: &Path) -> Option<String> {
+    if no_cache() || std::io::stdout().is_terminal() {
+        return None; // A TTY gets gh's human/colour output, which we do not reproduce.
+    }
+    let args = raw
+        .iter()
+        .map(|a| a.to_str().map(str::to_string))
+        .collect::<Option<Vec<String>>>()?;
+    let route = classify::classify(&args);
+    if route == Route::Passthrough
+        || crate::forge_cmd::detect_forge(None) == crate::forge_cmd::ForgeType::Gitea
+        || std::env::var("GH_HOST").is_ok_and(|h| !h.is_empty() && h != "github.com")
+    {
+        return None;
+    }
+    let cwd = std::env::current_dir().ok();
+    match route {
+        Route::EtagView(entity) => {
+            let served = pin_repo(args[1..].to_vec(), cwd.as_deref())?;
+            crate::forge_cached_view::build_output_via(STATS_CALLER, entity.as_str(), &served, next)
+        }
+        Route::EtagList(entity, served) => {
+            let jq = served
+                .iter()
+                .any(|a| a == "--jq" || a == "-q" || a.starts_with("--jq="));
+            let served = pin_repo(served, cwd.as_deref())?;
+            let out = crate::forge_cached_list::build_output_via(
+                STATS_CALLER,
+                entity.as_str(),
+                &served,
+                next,
+            )?;
+            if jq {
+                return Some(out);
+            }
+            // The listing module pretty-prints; `gh --json` off a TTY is compact.
+            let v: serde_json::Value = serde_json::from_str(&out).ok()?;
+            serde_json::to_string(&v).ok().map(|s| format!("{s}\n"))
+        }
+        Route::Passthrough => None,
+    }
+}
+
+/// Name the repo `gh` itself would use, as an explicit `--repo`, so the ETag
+/// modules never fall back to `LOOM_REPO` where `gh` would not. `None` (pass
+/// through) whenever that repo is not unambiguous.
+fn pin_repo(mut args: Vec<String>, cwd: Option<&Path>) -> Option<Vec<String>> {
+    let has_repo = args
+        .iter()
+        .any(|a| a == "-R" || a == "--repo" || a.starts_with("--repo="));
+    if has_repo {
+        return Some(args);
+    }
+    let repo = match std::env::var("GH_REPO").ok().filter(|r| !r.is_empty()) {
+        Some(r) => classify::is_slug(&r).then_some(r)?,
+        None => implicit_repo(&git_remote_config(cwd?)?)?,
+    };
+    args.extend(["--repo".to_string(), repo]);
+    Some(args)
+}
+
+/// `git config --get-regexp ^remote\.` in `cwd`.
+fn git_remote_config(cwd: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--get-regexp", r"^remote\."])
+        .current_dir(cwd)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The `owner/name` `gh` resolves from a checkout's remotes, when that is
+/// unambiguous: exactly one remote, named `origin`, on `github.com`, with no
+/// `gh repo set-default` override (`remote.origin.gh-resolved`). With several
+/// remotes `gh` prefers `upstream`/`github` and honours set-default — pass
+/// those through rather than guess.
+#[must_use]
+pub fn implicit_repo(remote_config: &str) -> Option<String> {
+    let mut url = None;
+    for line in remote_config.lines() {
+        let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+        let rest = key.strip_prefix("remote.")?;
+        let (name, field) = rest.rsplit_once('.')?;
+        if name != "origin" {
+            return None;
+        }
+        match field {
+            "url" if url.replace(value.to_string()).is_some() => return None,
+            "gh-resolved" if value != "base" => return None,
+            _ => {}
+        }
+    }
+    let (host, nwo) = crate::forge_etag_store::parse_remote_url(&url?)?;
+    (host == "github.com" && classify::is_slug(&nwo)).then_some(nwo)
+}
+
+/// Append one `x-loom-cache` record to `$GH_CACHE_OUTCOME_LOG` (the opt-in
+/// log `gh-cached` writes), naming only the command and verb — never the
+/// argv, which can carry bodies.
+fn record(outcome: &str, raw: &[OsString]) {
+    let Some(path) = std::env::var_os("GH_CACHE_OUTCOME_LOG").filter(|p| !p.is_empty()) else {
+        return;
+    };
+    let command: Vec<String> = raw
+        .iter()
+        .take(2)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let line = serde_json::json!({
+        "x-loom-cache": outcome,
+        "source": STATS_CALLER,
+        "command": command.join(" "),
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(PathBuf::from(path))
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Create (or refresh) the shim directory — `gh` → this binary — and return
+/// it. Keyed by this binary's path, so two `loom-daemon` builds never fight
+/// over one link. `LOOM_GH_SHIM_BASE` overrides the base (tests).
+///
+/// # Errors
+///
+/// When the directory cannot be made private or the link cannot be written.
+pub fn ensure_shim_dir() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let base = std::env::var("LOOM_GH_SHIM_BASE")
+        .ok()
+        .filter(|b| !b.is_empty())
+        .map_or_else(crate::forge_etag_store::host_tmp_base, PathBuf::from);
+    let dir = base.join(format!(
+        "loom-gh-shim-{}",
+        crate::short_hash::short_sha16(&exe.display().to_string())
+    ));
+    if !crate::forge_etag_store::private_dir(&dir, true) {
+        return Err(std::io::Error::other(format!(
+            "refusing untrusted shim dir {}",
+            dir.display()
+        )));
+    }
+    let link = dir.join("gh");
+    if std::fs::read_link(&link).ok().as_deref() == Some(exe.as_path()) {
+        return Ok(dir);
+    }
+    let tmp = dir.join(format!(".gh-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&exe, &tmp)?;
+    #[cfg(not(unix))]
+    std::fs::copy(&exe, &tmp)?;
+    std::fs::rename(&tmp, &link)?;
+    Ok(dir)
+}
+
+/// The `PATH` a dispatched worker gets: the shim dir first, then `current`.
+/// `None` leaves `PATH` alone — opted out (`LOOM_GH_SHIM=0`), not running as
+/// `loom-daemon` (a test harness), or the shim dir could not be made.
+#[must_use]
+pub fn worker_path(current: Option<&OsStr>) -> Option<OsString> {
+    if std::env::var(OPT_OUT_ENV).is_ok_and(|v| v == "0") {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    if exe.file_name() != Some(OsStr::new("loom-daemon")) {
+        return None;
+    }
+    prepend_path(&ensure_shim_dir().ok()?, current)
+}
+
+/// `dir` first, then `current` minus any earlier copy of `dir`.
+#[must_use]
+pub fn prepend_path(dir: &Path, current: Option<&OsStr>) -> Option<OsString> {
+    let rest = current.map(std::env::split_paths).into_iter().flatten();
+    let dirs = std::iter::once(dir.to_path_buf()).chain(rest.filter(|p| p != dir));
+    std::env::join_paths(dirs).ok()
+}

@@ -26,8 +26,11 @@
 //! span per pool dispatch hold. [`turnaround`] (#8929) covers slot turnaround
 //! and idle slots per host, [`stage_dwell`] forge label-stage dwell, and
 //! [`disposition`] (#9222) one span per ready-queue row's disposition, on
-//! transition or periodic refresh. A new emitter adds a `MetricName`/
-//! `SpanName` variant and calls the same two functions.
+//! transition or periodic refresh. [`ratelimit`] (#10022) exports GitHub
+//! rate-limit breaker trips, quota gauges and breaker skips, and
+//! [`redate_chain`] (#10163) #8508 re-date pressure (re-dated PRs, re-dates
+//! per PR, time to land). A new emitter adds a `MetricName`/`SpanName`
+//! variant and calls the same two functions.
 //!
 //! Tests observe what a seam emitted through the global functions with
 //! [`capture::capture`], a per-thread recorder (test builds only).
@@ -38,10 +41,13 @@ pub mod dispatch;
 pub mod disposition;
 pub mod dwell;
 pub mod host;
+pub mod liveness;
 pub mod lockout;
 pub mod pool_marks;
 pub mod queue;
 pub mod quota;
+pub mod ratelimit;
+pub mod redate_chain;
 pub mod stage_dwell;
 pub mod turnaround;
 
@@ -117,6 +123,19 @@ impl OpsSink {
         ));
     }
 
+    /// The host id this sink stamps on every envelope.
+    #[must_use]
+    pub fn host_id(&self) -> &str {
+        &self.host_id
+    }
+
+    /// Enqueue one OTLP-only log record (Issue #10414: `auto_update.tick`),
+    /// for a loop that has no sink of its own.
+    pub fn emit_record(&self, record: TelemetryRecord) {
+        self.queue
+            .offer(TelemetryEnvelope::new(self.host_id.clone(), record));
+    }
+
     /// Enqueue one completed span, carrying its own context so logs can join
     /// it. Unsampled or invalid spans are not enqueued.
     pub fn emit_span(&self, span: SpanRecord) {
@@ -174,6 +193,18 @@ pub fn emit_metrics(points: Vec<MetricPoint>) {
     };
     if let Some(sink) = global_ops_sink() {
         sink.emit_metrics(points);
+    }
+}
+
+/// Emit one OTLP-only log record through the global sink; a no-op when none
+/// is registered (Issue #10414).
+pub fn emit_record(record: TelemetryRecord) {
+    #[cfg(test)]
+    let Some(record) = capture::record(record) else {
+        return;
+    };
+    if let Some(sink) = global_ops_sink() {
+        sink.emit_record(record);
     }
 }
 

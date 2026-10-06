@@ -100,7 +100,8 @@ mod tests {
     #[test]
     #[serial]
     fn a_loom_repo_override_becomes_the_gh_repo_env_var_never_an_argument() {
-        let mut cmd = Command::new("gh");
+        // Built to inspect, never spawned: the program name is irrelevant.
+        let mut cmd = Command::new("gh-under-test");
         cmd.arg("api").arg("repos/{owner}/{repo}/issues/1");
 
         std::env::set_var("LOOM_REPO", "rjwalters/loom");
@@ -124,7 +125,8 @@ mod tests {
     #[test]
     #[serial]
     fn an_unset_loom_repo_leaves_the_command_untouched() {
-        let mut cmd = Command::new("gh");
+        // Built to inspect, never spawned: the program name is irrelevant.
+        let mut cmd = Command::new("gh-under-test");
         cmd.arg("api").arg("repos/{owner}/{repo}/issues/1");
 
         std::env::remove_var("LOOM_REPO");

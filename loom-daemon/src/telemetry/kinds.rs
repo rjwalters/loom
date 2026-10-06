@@ -158,14 +158,76 @@ pub struct TelemetryKindMeta {
 // `telemetry/mod.rs`; moving them would churn every in-flight PR that touches
 // them for no schema benefit.)
 
+/// `auto_update.tick` (#10414).
+pub mod auto_update_tick;
+
 /// `eta.estimate` / `eta.outcome` (#9289).
 pub mod eta;
+
+/// `eta.fit` (#10391).
+pub mod eta_fit;
+/// `eta.fleet_refresh` (#10263).
+pub mod eta_fleet_refresh;
 
 /// `eta.snapshot` (#9329).
 pub mod eta_snapshot;
 
+/// `pick.decision` (#10212) — what a role / the work finder looked at per tick.
+pub mod pick_decision;
+
 /// `session.output` (#9764) — the live, redacted agent-output feed.
 pub mod session_output;
+
+/// The export-coverage pair `(exporters, exported_kinds)` for `host.health`
+/// (Issue #10196), derived from the per-exporter status map
+/// (`crate::observability::global_export_statuses()`, keyed by
+/// `ExporterKind::name`) as of `now`.
+///
+/// Only exporters that **actually started** count: an entry whose status
+/// classifies as `Misconfigured` (policy rejection, unreadable ingest key,
+/// `otlp` on a build without the feature) or `Disabled` (no `started_at`)
+/// never ran, so advertising it — or the kinds only it carries — would let a
+/// replay reader read that sink's silence as "nothing happened". A started
+/// exporter that is `Failing`/`NeverExported` still counts: its records are
+/// queued durably and retried. When nothing started both lists are empty,
+/// which the contract reads as **unknown**, never "exports nothing".
+#[must_use]
+pub fn export_coverage(
+    statuses: &std::collections::BTreeMap<String, crate::types::ObservabilityExportStatus>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Vec<String>, Vec<String>) {
+    use crate::types::ObservabilityExportState as State;
+    let exporters: Vec<String> = statuses
+        .iter()
+        .filter(|(_, status)| {
+            !matches!(status.classify(now), State::Misconfigured | State::Disabled)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let kinds = exported_kinds_for(&exporters);
+    (exporters, kinds)
+}
+
+/// The sorted wire `kind` tags the given exporters (by
+/// `ExporterKind::name`: `"https"`, `"otlp"`) carry, derived from the registry
+/// rows (Issue #10196). `https` carries `native_ingest` kinds; `otlp` carries
+/// every kind whose class is not [`TelemetryKindOtlp::NotExported`]. Unknown
+/// exporter names contribute nothing.
+#[must_use]
+pub fn exported_kinds_for(exporters: &[String]) -> Vec<String> {
+    let https = exporters.iter().any(|e| e == "https");
+    let otlp = exporters.iter().any(|e| e == "otlp");
+    let mut kinds: Vec<String> = TELEMETRY_KINDS
+        .iter()
+        .filter(|k| {
+            (https && k.native_ingest) || (otlp && k.otlp != TelemetryKindOtlp::NotExported)
+        })
+        .map(|k| k.kind.to_string())
+        .collect();
+    kinds.sort();
+    kinds.dedup();
+    kinds
+}
 
 // ============================================================================
 // THE REGISTRY
@@ -321,6 +383,30 @@ macro_rules! telemetry_kind_table {
             /// See [`session_output`].
             SessionOutput = "session.output" => $crate::telemetry::kinds::session_output::SessionOutputRecord,
                 gate: 13, otlp: Logs, native: false;
+
+            /// One repo's outcome in one cycle of the daemon's fleet snapshot
+            /// refresh (Issue #10263). OTLP-only, like the other `eta.*` log
+            /// kinds. See [`eta_fleet_refresh`].
+            EtaFleetRefresh = "eta.fleet_refresh" => $crate::telemetry::kinds::eta_fleet_refresh::EtaFleetRefreshRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One self-update loop decision (Issue #10414): decision, installed
+            /// and target versions, defer reason, drain state. OTLP-only. See
+            /// [`auto_update_tick`].
+            AutoUpdateTick = "auto_update.tick" => $crate::telemetry::kinds::auto_update_tick::AutoUpdateTickRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One daily-fit check, whether it fitted or skipped (Issue
+            /// #10391). OTLP-only, like the other `eta.*` log kinds. See
+            /// [`eta_fit`].
+            EtaFit = "eta.fit" => $crate::telemetry::kinds::eta_fit::EtaFitRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One role tick's (or work-finder tick's) pick decision (Issue #10212):
+            /// the ranked candidates it considered, what it acted on, and a
+            /// closed-set reason per skip. OTLP-only. See [`pick_decision`].
+            PickDecision = "pick.decision" => $crate::telemetry::kinds::pick_decision::PickDecisionRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays
             // NEW_KIND_SCHEMA_VERSION). Do not renumber or reorder existing rows —

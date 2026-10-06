@@ -115,6 +115,17 @@ fn env_plan_gh_repo_prefers_the_typed_target_over_loom_repo() {
 }
 
 #[test]
+fn env_plan_sets_path_only_under_child_path() {
+    let inherited = read_op(GhTarget::None).env_plan_with(None, None);
+    assert_eq!(env_of(&inherited, "PATH"), None);
+
+    let explicit = read_op(GhTarget::None)
+        .child_path("/opt/gh/bin:/usr/bin")
+        .env_plan_with(None, None);
+    assert_eq!(env_of(&explicit, "PATH"), Some(Some("/opt/gh/bin:/usr/bin".into())));
+}
+
+#[test]
 fn env_plan_scopes_gh_config_dir_by_root_then_target_owner() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("checkout");
@@ -142,6 +153,31 @@ fn env_plan_scopes_gh_config_dir_by_root_then_target_owner() {
 
     let unscoped = read_op(GhTarget::None).env_plan_with(None, None);
     assert_eq!(env_of(&unscoped, "GH_CONFIG_DIR"), None);
+}
+
+/// #10263: a reader-only read removes every token variable `gh` would prefer
+/// over the explicit `GH_CONFIG_DIR`, and leaves that config dir in place.
+#[test]
+fn without_token_env_removes_every_token_variable() {
+    let dir = Path::new("/tmp/reader-app-dir");
+    let plain = read_op(GhTarget::None)
+        .gh_config_dir(Some(dir))
+        .env_plan_with(None, None);
+    for key in TOKEN_ENV_VARS {
+        assert_eq!(env_of(&plain, key), None, "{key} untouched by default");
+    }
+    let stripped = read_op(GhTarget::None)
+        .gh_config_dir(Some(dir))
+        .without_token_env()
+        .env_plan_with(None, None);
+    assert_eq!(TOKEN_ENV_VARS.len(), 4);
+    for key in TOKEN_ENV_VARS {
+        assert_eq!(env_of(&stripped, key), Some(None), "{key} removed");
+    }
+    assert_eq!(
+        env_of(&stripped, "GH_CONFIG_DIR"),
+        Some(Some("/tmp/reader-app-dir".to_string()))
+    );
 }
 
 /// A recording stub `gh`: prints its argv and the facade-owned env.
@@ -198,4 +234,34 @@ fn passthrough_contract_is_preserved_and_returns_the_exit_status() {
         panic!("expected a passthrough completion");
     };
     assert_eq!(status.code(), Some(7));
+}
+
+#[test]
+fn credential_helper_contract_feeds_stdin_and_reports_the_exit_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let seen = tmp.path().join("request");
+    let helper = tmp.path().join("gh-helper");
+    std::fs::write(
+        &helper,
+        format!("#!/bin/sh\ncat > '{}'\necho noise >&2\nexit 3\n", seen.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let inv = read_op(GhTarget::None)
+        .args(["auth", "git-credential", "get"])
+        .credential_helper("protocol=https\nhost=github.com\n\n");
+    assert_eq!(inv.contract(), OutputContract::CredentialHelper);
+    let GhCompletion::Passthrough(status) = inv
+        .execute_with(&helper.to_string_lossy(), GhBinSource::EnvOverride)
+        .unwrap()
+    else {
+        panic!("expected a passthrough completion");
+    };
+    assert_eq!(status.code(), Some(3), "a failed helper is reported, not hidden");
+    assert_eq!(std::fs::read_to_string(&seen).unwrap(), "protocol=https\nhost=github.com\n\n");
+    // Never classified as a captured outcome.
+    assert!(matches!(
+        read_op(GhTarget::None).credential_helper("x").run(),
+        crate::cmd_out::CmdOutcome::Unavailable(_)
+    ));
 }

@@ -130,6 +130,91 @@ pub fn km_grid_of(observed: &[i64], censored: &[i64]) -> Vec<i64> {
         .collect()
 }
 
+/// The 21-point grid over **weighted** samples (#10209): `observed` exact
+/// durations and `censored` lower bounds, each `(duration, weight)` and
+/// ascending by duration, every weight `> 0`.
+///
+/// The weighted twin of [`km_grid_of`]. With no censored samples it is the
+/// weighted nearest rank — the smallest observed value whose cumulative
+/// weight reaches `p` of the total ([`weighted_rank`]); otherwise it is the
+/// weighted product-limit estimate ([`weighted_km_curve`]) read at the 21
+/// percentiles, with the same horizon clamp. With every weight equal to `1`
+/// both reduce exactly to the unweighted grid: the cumulative weights are
+/// then exact integer counts, so every comparison and every hazard is the
+/// same floating-point operation the unweighted code performs.
+#[must_use]
+pub fn weighted_grid_of(observed: &[(i64, f64)], censored: &[(i64, f64)]) -> Vec<i64> {
+    if censored.is_empty() || observed.is_empty() {
+        return (0..GRID_POINTS)
+            .map(|i| weighted_rank(observed, i * 5))
+            .collect();
+    }
+    let curve = weighted_km_curve(observed, censored);
+    let horizon = observed
+        .last()
+        .map_or(0, |o| o.0)
+        .max(censored.last().map_or(0, |c| c.0));
+    (0..GRID_POINTS)
+        .map(|i| km_quantile(&curve, i as f64 * 5.0 / 100.0, horizon))
+        .collect()
+}
+
+/// The weighted nearest-rank `pct`th percentile of `sorted` (ascending by
+/// duration, non-empty): the first value whose cumulative weight is at least
+/// `pct / 100` of the total, and never before the first value. With unit
+/// weights this is [`quantile`]: `ceil(pct·n / 100)` clamped into `1..=n`.
+#[must_use]
+pub fn weighted_rank(sorted: &[(i64, f64)], pct: usize) -> i64 {
+    let total: f64 = sorted.iter().map(|s| s.1).sum();
+    let target = pct as f64 * total / 100.0;
+    let mut cumulative = 0.0_f64;
+    for &(value, weight) in sorted {
+        cumulative += weight;
+        if cumulative >= target {
+            return value;
+        }
+    }
+    // Rounding can leave the running sum a hair under `total` at p100.
+    sorted.last().map_or(0, |s| s.0)
+}
+
+/// The Kaplan–Meier curve over weighted samples: [`km_curve`] with each
+/// sample counting its weight instead of `1`, so
+/// `S(t) = Π (1 − d_w(t_i) / n_w(t_i))` with `d_w` the weight of the events
+/// at `t_i` and `n_w` the weight of every sample (event or censored) whose
+/// duration is `≥ t_i` — the same "censoring follows events" tie rule.
+#[must_use]
+pub fn weighted_km_curve(observed: &[(i64, f64)], censored: &[(i64, f64)]) -> Vec<KmStep> {
+    // Suffix weight sums, so "at risk at t" is one lookup per side.
+    let suffix = |xs: &[(i64, f64)]| {
+        let mut acc = vec![0.0_f64; xs.len() + 1];
+        for i in (0..xs.len()).rev() {
+            acc[i] = acc[i + 1] + xs[i].1;
+        }
+        acc
+    };
+    let observed_tail = suffix(observed);
+    let censored_tail = suffix(censored);
+    let mut curve = Vec::new();
+    let mut survival = 1.0_f64;
+    let mut i = 0;
+    while i < observed.len() {
+        let t = observed[i].0;
+        let mut deaths = 0.0_f64;
+        while i < observed.len() && observed[i].0 == t {
+            deaths += observed[i].1;
+            i += 1;
+        }
+        let at_risk = observed_tail[observed.partition_point(|o| o.0 < t)]
+            + censored_tail[censored.partition_point(|c| c.0 < t)];
+        if at_risk > 0.0 {
+            survival *= 1.0 - deaths / at_risk;
+        }
+        curve.push(KmStep { t, survival });
+    }
+    curve
+}
+
 /// The value at cumulative probability `u ∈ [0, 1]`, interpolating linearly
 /// between grid points.
 #[must_use]

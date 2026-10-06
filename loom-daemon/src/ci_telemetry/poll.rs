@@ -40,8 +40,8 @@ use super::ledger::{Ledger, PendingUnit, UnitDraft, UnitKey, COMPACT_THRESHOLD_B
 use super::logs::{self, LogTarget};
 use super::owners::{discover, resolve_kind, KindCache, Owner, OwnerStatus};
 use super::records::{
-    envelope_identity, job_envelopes, run_envelopes, JobCreationBaselines, JobJson, JobsPage,
-    RepoJson, RunJson, RunsPage,
+    envelope_identity, job_envelopes_with_reason, run_envelopes, JobCreationBaselines, JobJson,
+    JobsPage, RepoJson, RunJson, RunsPage,
 };
 use super::state::{self, CycleLock, CycleSummary, PollStatus};
 use super::story::{self, RepoIdentityFn, RepoStories, Stitch};
@@ -427,7 +427,7 @@ fn run_locked(
     if let Some(until) = status.backoff_until.filter(|until| *until > ctx.now) {
         return Err(CycleError::BackingOff { until: Some(until) });
     }
-    if crate::rate_limit_breaker::global_is_suppressed() {
+    if crate::rate_limit_breaker::global_skip_pass("ci_telemetry") {
         return Err(CycleError::BackingOff { until: None });
     }
 
@@ -647,12 +647,21 @@ fn recover(ledger: &mut Ledger, journal: &Journal) -> io::Result<usize> {
 }
 
 /// Follow `rel="next"` from `first`, collecting each page's parsed items.
+///
+/// Every page is read for `repo` (else the repo `first` names): GitHub spells
+/// page 2+ of a repo listing as `repositories/<id>/…`, which names no repo,
+/// so without it those pages would leave the repo's reader App for the
+/// writer and be accounted under no repo.
 pub(super) fn paginate<T>(
     api: &dyn GithubApi,
+    repo: Option<&str>,
     first: String,
     requests: &mut usize,
     parse: impl Fn(&str) -> Result<Vec<T>, serde_json::Error>,
 ) -> Result<Vec<T>, ApiError> {
+    let repo = repo
+        .map(str::to_string)
+        .or_else(|| super::api::repo_of_path(&first));
     let mut items = Vec::new();
     let mut visited = HashSet::new();
     let mut next = Some(first);
@@ -661,7 +670,7 @@ pub(super) fn paginate<T>(
             break;
         }
         *requests += 1;
-        let response = api.get(&path, None)?;
+        let response = api.get_in(repo.as_deref(), &path, None)?;
         items.extend(parse(&response.body).map_err(|e| ApiError::Parse {
             path: path.clone(),
             detail: e.to_string(),
@@ -758,7 +767,7 @@ fn poll_repo(
     let watermark = recorded.unwrap_or(ctx.now - ctx.initial_lookback);
     let floor = runs_floor(recorded, ctx.now, ctx.initial_lookback, ctx.rescan_window);
     let mut runs: Vec<RunJson> =
-        paginate(api, runs_path(full, floor), &mut report.summary.requests, |body| {
+        paginate(api, Some(full), runs_path(full, floor), &mut report.summary.requests, |body| {
             serde_json::from_str::<RunsPage>(body).map(|p| p.workflow_runs)
         })?;
     runs.sort_by_key(|r| (r.created_at, r.id));
@@ -852,7 +861,7 @@ fn record_run(
         return Ok(RunOutcome::Seen);
     }
     let jobs: Vec<JobJson> =
-        paginate(api, jobs_path(full, run.id), &mut report.summary.requests, |body| {
+        paginate(api, Some(full), jobs_path(full, run.id), &mut report.summary.requests, |body| {
             serde_json::from_str::<JobsPage>(body).map(|p| p.jobs)
         })?;
     if jobs.iter().any(|job| !job.is_completed()) {
@@ -883,10 +892,31 @@ fn record_run(
     // `job.run_attempt`, the same per-job attempt `UnitKey::job` uses —
     // not `run.run_attempt`, which is only the newest.
     let baselines = JobCreationBaselines::of_listing(&jobs);
+    // #10113: a job GitHub refused to start for billing/spending-limit reasons
+    // is its own condition, not a red build — classify it, alert once.
+    let mut not_started = std::collections::HashMap::new();
+    for job in &jobs {
+        if ledger.is_seen(&UnitKey::job(full, run.id, job.id, job.run_attempt)) {
+            continue;
+        }
+        if let Some(reason) =
+            super::billing::classify_job(api, full, job, &mut report.summary.requests)?
+        {
+            super::billing::observe_global(ctx.root, full, run.id, job.id);
+            not_started.insert(job.id, reason);
+        }
+    }
     let mut drafts: Vec<UnitDraft> = jobs
         .iter()
         .map(|job| {
-            let mut envelopes = job_envelopes(repo, run, job, baselines.for_job(job), &ctx.host_id);
+            let mut envelopes = job_envelopes_with_reason(
+                repo,
+                run,
+                job,
+                baselines.for_job(job),
+                &ctx.host_id,
+                not_started.get(&job.id).copied(),
+            );
             if let Some(story) = story {
                 story::stitch_job(&mut envelopes, story, run, job);
             }

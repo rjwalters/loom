@@ -2505,7 +2505,7 @@ where
                     log::info!("rate_limit_breaker: {}", transition.reason);
                     crate::rate_limit_breaker::emit_transition_event(&event_bus, &transition);
                 }
-                if rl.is_suppressed(now) {
+                if rl.skip_if_suppressed("work_finder", now) {
                     if was_rate_limited {
                         log::debug!("work_finder: tick skipped — rate-limit cooldown active");
                     } else {
@@ -2652,7 +2652,7 @@ where
             match tick_with_lanes(
                 &mut source,
                 &mut dispatcher,
-                (CapTerms::new(configured_max, disk, ram), max_admissions_per_tick),
+                (CapTerms::observed(configured_max, disk, ram), max_admissions_per_tick),
                 halted,
                 saturation_held,
                 lane,
@@ -2952,7 +2952,7 @@ pub fn spawn_multi_work_finder_task(
                     log::info!("rate_limit_breaker: {}", transition.reason);
                     crate::rate_limit_breaker::emit_transition_event(&event_bus, &transition);
                 }
-                if rl.is_suppressed(now) {
+                if rl.skip_if_suppressed("work_finder", now) {
                     if was_rate_limited {
                         log::debug!("work_finder: tick skipped — rate-limit cooldown active");
                     } else {
@@ -3284,7 +3284,7 @@ pub fn spawn_multi_work_finder_task(
             let report = tick_multi_with_build_backoff(
                 &mut pairs,
                 &priorities,
-                CapTerms::new(configured_max, disk, ram),
+                CapTerms::observed(configured_max, disk, ram),
                 &halted,
                 Some(&halt_causes),
                 max_admissions_per_tick,

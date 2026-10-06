@@ -7,6 +7,7 @@
 //! `ci_telemetry::logs`, the module under test).
 
 mod api_parsing;
+mod billing_block;
 mod captain_gate;
 mod credential_rejection;
 mod dependency_wait;
@@ -16,6 +17,7 @@ mod join_keys;
 mod journal_view;
 mod owners;
 mod queue_time;
+mod reader_routing;
 mod rerun_window;
 mod shard_queue;
 mod step_spans;

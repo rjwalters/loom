@@ -31,9 +31,23 @@ and the validator never falls back to a cached, default or narrower one:
 2. `/etc/loom/forge-egress/policy.json` (`origin: machine`). Only a missing
    file is absent; one that cannot be stat'ed (e.g. `EACCES`) still wins and
    is `policy.unreadable`, exit 2.
-3. `.loom/config.json` → `forge.egress.policyPath` (`origin: repo`). A relative
+3. `/etc/2am/github-egress/policy.json` (`origin: machine`) — the 2am
+   deployment's path, probed after Loom's own with the same missing-vs-
+   unreadable rule. This is the shared-discovery mechanism: a host provisioned
+   for 2am's `scripts/github-egress.py` (same vendored schema) is found by both
+   validators with no reprovisioning, so the two doctors cannot disagree.
+4. `.loom/config.json` → `forge.egress.policyPath` (`origin: repo`). A relative
    path resolves against the repo root.
-4. None ⇒ `unconfigured`.
+5. None ⇒ `unconfigured`.
+
+**Unconfigured is visible, not silent** (#10168). With no policy, `doctor`,
+`assert` and `status` report a `policy.unconfigured` finding ("GitHub routing is
+neither enforced nor validated on this host"). On a generic install it is a
+non-fatal `notice` (exit 0, daemon gate admits). A host declares itself
+*managed* by setting `LOOM_FORGE_EGRESS_MANAGED=1` (also `true`/`yes`/`on`) or
+by creating the marker file `/etc/loom/forge-egress/managed`; the same finding
+is then `incomplete` and exits 2, matching 2am's doctor. The marker only adds
+strictness; the daemon gate never refuses on an unconfigured host.
 
 Lower-precedence candidates that were present are listed under
 `policy.ignored`, so a repo-local policy can never weaken a machine one. A
@@ -72,15 +86,41 @@ Loom-only codes cover surfaces that 2am's validator cannot see
   requires, or names a different host. This covers Loom's token-only republication (scenario 17,
   #9986).
 - `runtime.bypass-open`: the canary's direct request succeeded.
+- `toolchain.policy-launcher-declined`: the policy's `launcherPath` exists,
+  but the `gh` the daemon itself execs is neither that launcher nor `PATH`'s
+  `gh` (which `toolchain.launcher-not-first` covers). Typically
+  `$LOOM_GH_BIN` with `LOOM_GH_NO_POLICY_LAUNCHER=1`, or with a policy whose
+  origin may not choose the executable (#9995).
 - `telemetry.loom-exporter-not-otlp`: Loom's own observability config has no
   `otlp` exporter.
 
 The checked profiles are the process's `GH_CONFIG_DIR` (or `gh`'s default
 directory when none is exported), plus every profile Loom publishes:
 `.loom/gh-config` and `.loom/gh-config-by-owner/<owner>`. The effective `gh`
-is `$LOOM_GH_BIN`, else `gh` on `PATH`, meaning the binary Loom will exec.
-`gh --version` is probed with no token variables and an empty config
-directory, because `gh` can make a live call even for `--version`.
+is the binary Loom will exec, picked by the `gh_invocation` resolver (first
+hit wins):
+
+1. `toolchain.launcherPath`, only from an **env**- or **machine**-origin
+   policy (a repo-local policy never chooses the executable), and only when
+   that file exists (#9995);
+2. `$LOOM_GH_BIN`;
+3. `gh` on `PATH`.
+
+`LOOM_GH_NO_POLICY_LAUNCHER=1` declines rung 1. Every test harness that stubs
+`gh` sets it, so a host's policy launcher never outranks the stub. It is not
+a silent bypass: env already outranks the machine policy, and the checks
+report where a declined rung lands. The version floor measures the exec
+target. A landing on bare `gh` is `toolchain.launcher-not-first`. A landing
+on `$LOOM_GH_BIN`, or on anything else that is neither the existing launcher
+nor `PATH`'s `gh`, is `toolchain.policy-launcher-declined`. All three are
+routing findings, so under `enforcement.api = required` `assert` fails.
+
+The version floor measures that effective `gh` (`observed.ghPath`; the rung
+that won is `observed.ghSource`). `toolchain.launcher-not-first` measures the
+`gh` an agent's plain `gh` resolves to: bare `gh` on `PATH`, never the
+resolver (`observed.pathGhPath`). `gh --version` is probed with no token
+variables and an empty config directory, because `gh` can make a live call
+even for `--version`.
 
 **Never in any output:** `hosts.yml` contents, tokens, credential-helper
 output, git rewrite URLs or the environment. Reports carry paths, hosts,
@@ -91,19 +131,16 @@ versions, counts and remedies only. Token-shaped strings are redacted.
 | Entry point | Call | On failure under `enforcement.api = required` |
 |---|---|---|
 | daemon startup, then every `LOOM_FORGE_EGRESS_DOCTOR_INTERVAL_SECS` (default 900) | `doctor` | logs each finding + repair command, caches `~/.loom/forge-egress-doctor.json`, publishes `forge.egress.drift` when the code set changes; the daemon stays up |
-| `loom-daemon status` / `status --json` (`forge_egress` key) | fresh `assert` + cached daemon `doctor` | shows the codes and fixes; prints nothing when unconfigured |
+| `loom-daemon status` / `status --json` (`forge_egress` key) | fresh `assert` + cached daemon `doctor` | shows the codes and fixes; shows the `policy.unconfigured` notice when unconfigured |
 | sweep dispatch | `assert` | refuses before any claim or spawn; event `sweep.blocked` with `reason: forge-egress` |
 | worker spawn (`spawn-worker.sh` → `loom-daemon spawn-worker`) | `assert` | does not spawn (exit 78) |
 | `install_self_check` (`forge-egress-aligned`) | `assert` | files an issue naming the codes, refreshes it when the codes change, and closes it once aligned or once no policy is configured |
 | `loom-daemon init` (`install-loom.sh`, `loom update`) | `doctor` | prints the findings; non-zero exit |
+| `resync-installed.sh` | `doctor` | prints the findings after the sync completes; exits with the doctor's code (non-zero only under `required`, or 2 on an unconfigured host declared managed); `--dry-run` never runs it and never fails; a daemon without `forge egress` warns |
 | `/loom:sweep` pre-wave hygiene | `assert` | advisory text in the summary |
 
 `enforcement.api = observe` logs the same findings and proceeds. An unreadable
 policy, or one with an unknown `schemaVersion`, is never treated as observe-only.
-
-Not wired yet: post-publication `assert` + rollback (C3, #9986) and
-`resync-installed.sh` (#9996; run `loom-daemon forge egress doctor` after a
-resync by hand). The facade resolver's policy-launcher rung is #9995.
 
 ## Lockstep with 2am
 

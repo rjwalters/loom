@@ -3244,7 +3244,7 @@ where
             // Shared GitHub rate limit exhausted (#4429): a role session
             // spawned now would burn a token slot just to fail its own gh
             // calls against the same wall — skip until the window resets.
-            if crate::rate_limit_breaker::global_is_suppressed() {
+            if crate::rate_limit_breaker::global_skip_pass("role_runner") {
                 log::debug!(
                     "role_runner: {} tick skipped — rate-limit cooldown (#4429)",
                     spec.name
@@ -3371,8 +3371,11 @@ pub fn spawn_multi_role_task(
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // skip immediate first tick (see module docs)
-                             // Missing-root warn-once-per-period state (#4326), shared discipline
-                             // with `work_finder` via `filter_missing_roots`.
+
+        // #10414: liveness beats once per tick, from spawn on.
+        crate::task_liveness::beat_role(spec.name, interval);
+        // Missing-root warn-once-per-period state (#4326), shared discipline
+        // with `work_finder` via `filter_missing_roots`.
         let mut missing_roots_warned: HashSet<PathBuf> = HashSet::new();
         let mut dispatcher = concurrent_dispatch::RoleDispatcher::new(
             spec,
@@ -3401,7 +3404,7 @@ pub fn spawn_multi_role_task(
                     }
                     continue;
                 }
-                _ = ticker.tick() => {}
+                _ = ticker.tick() => crate::task_liveness::beat_role(spec.name, interval),
             }
             dispatcher.reap_finished();
 
@@ -3419,7 +3422,7 @@ pub fn spawn_multi_role_task(
             // Shared GitHub rate limit exhausted (#4429): a role session
             // spawned now would burn a token slot just to fail its own gh
             // calls against the same wall — skip until the window resets.
-            if crate::rate_limit_breaker::global_is_suppressed() {
+            if crate::rate_limit_breaker::global_skip_pass("role_runner") {
                 log::debug!(
                     "role_runner: {} multi-workspace tick skipped — rate-limit cooldown (#4429)",
                     spec.name

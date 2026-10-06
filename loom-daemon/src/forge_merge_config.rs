@@ -47,15 +47,15 @@
 //! GitHub only; Gitea has no rulesets API and is skipped.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::Result;
 use serde::Deserialize;
 
-use crate::cmd_out::{decode_json, run_command, Query};
+use crate::cmd_out::{decode_json, Query};
 use crate::forge_cmd::{detect_forge, gh_bin, repo_nwo, ForgeType};
 use crate::forge_merge_method::{resolve_merge_method, RepoMergeFlags};
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
 /// Per-probe deadline. Shorter than `FORGE_CMD_TIMEOUT`: this runs inline in
 /// an install and on every resync, and an unanswered probe is only ever
@@ -281,10 +281,17 @@ fn first_line(text: &str) -> String {
         .to_string()
 }
 
-fn gh_api(gh: &str, path: &str) -> Command {
-    let mut cmd = Command::new(gh);
-    cmd.args(["api", path]).stdin(Stdio::null());
-    cmd
+/// One counted (#10089) `gh api <path>` read, run to a classified outcome.
+fn gh_api(gh: &str, path: &str) -> crate::cmd_out::CmdOutcome {
+    GhInvocation::new(
+        Operation::new("merge_config.api"),
+        AccessIntent::Read,
+        GhTarget::None,
+        PROBE_TIMEOUT,
+    )
+    .program(gh)
+    .args(["api", path])
+    .run()
 }
 
 fn query_reason<T>(q: Query<T>) -> Result<T, String> {
@@ -310,7 +317,7 @@ pub(crate) fn github_merge_config(
     };
 
     let settings = match query_reason(decode_json::<RepoSettings, _>(
-        run_command(gh_api(gh, &format!("repos/{nwo}")), PROBE_TIMEOUT),
+        gh_api(gh, &format!("repos/{nwo}")),
         |_| false,
     )) {
         Ok(s) => s,
@@ -340,10 +347,7 @@ pub(crate) fn github_merge_config(
     };
 
     let rules = match query_reason(decode_json::<Vec<BranchRule>, _>(
-        run_command(
-            gh_api(gh, &format!("repos/{nwo}/rules/branches/{branch}?per_page=100")),
-            PROBE_TIMEOUT,
-        ),
+        gh_api(gh, &format!("repos/{nwo}/rules/branches/{branch}?per_page=100")),
         |_| false,
     )) {
         Ok(r) => r,
@@ -368,7 +372,7 @@ pub(crate) fn github_merge_config(
     let mut names = BTreeMap::new();
     if !constraints.allowed_by_ruleset.is_empty() || !constraints.linear_rulesets.is_empty() {
         if let Query::Populated(list) = decode_json::<Vec<RulesetSummary>, _>(
-            run_command(gh_api(gh, &format!("repos/{nwo}/rulesets")), PROBE_TIMEOUT),
+            gh_api(gh, &format!("repos/{nwo}/rulesets")),
             |_| false,
         ) {
             names = list.into_iter().map(|r| (r.id, r.name)).collect();

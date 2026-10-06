@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
     types: [opened, synchronize, reopened]
+  # Merge queue (#10257, Phase C of #9978): validate the COMBINED merge-group
+  # tree. Dormant until a repository enables a merge queue -- GitHub only
+  # emits this event for a queue-enabled branch, and this repository is
+  # user-owned, so today it never fires here. Every job a merge group needs
+  # treats `merge_group` exactly like `push`: no path filter (the `changes`
+  # job is PR-only), the full suite. `loom-daemon merge-group-ci audit`
+  # proves that statically; see defaults/docs/merge-queue-ci.md.
+  merge_group:
+    types: [checks_requested]
 
 # Supersede on a PR; on main, queue at most one run and NEVER cancel a
 # started one (#7779, #9608).
@@ -27,8 +36,15 @@ on:
 # ci-principles.md rule 2. PR runs are unchanged: keyed on the PR number,
 # cancel-in-progress true. This stanza is the ONLY cancellation mechanism on
 # main (rule 4) -- the `changes` job's cancel step is PR-only.
+#
+# #10257: a merge-group run is keyed on its own head SHA, so it can never
+# share a group with a PR run, with `main`, or with another merge group: a
+# pending merge-group run that got superseded would never report its
+# required checks and the queue would time the entry out. cancel-in-progress
+# stays false for it (only `pull_request` cancels), so a started merge-group
+# run is never cancelled (ci-principles.md rule 2).
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'merge_group' && format('merge-group-{0}', github.event.merge_group.head_sha) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Rust caches (#9065): every Swatinem/rust-cache step restores on any ref but
@@ -74,6 +90,7 @@ jobs:
   # step is scoped strictly by `--branch`, and continue-on-error keeps a cancel
   # hiccup from failing the path filter every filtered job `needs`.
   changes:
+    # merge-group-audit: pr-only -- path groups exist only to trim PR runs; push and merge_group run every filtered job unconditionally
     name: Detect Changes
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -247,7 +264,7 @@ jobs:
   release-build:
     name: Release Build Check
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
     # The same `cargo build --release --features otlp` the release workflow
     # runs, on every backend PR. Until #9065 the three binary-running checks
     # each built --release, which caught release-profile-only breakage
@@ -270,7 +287,7 @@ jobs:
   node-packages:
     name: Node Packages (MCP server, dashboard)
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.mcp == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.mcp == 'true')
     # The dashboard half moved to `2AMLogic/loom-ui` (#9104); the display
     # name below is kept as-is so a required-check context is not renamed.
     runs-on: ubuntu-latest
@@ -282,19 +299,19 @@ jobs:
           node-version: "24"
       # --- MCP Server Build ---
       - name: Build unified MCP server
-        if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.mcp == 'true') }}
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.mcp == 'true') }}
         run: cd mcp-loom && npm install && npm run build
       - name: Run MCP server test suite
-        if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.mcp == 'true') }}
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.mcp == 'true') }}
         run: cd mcp-loom && npm test
       - name: Verify build output
-        if: ${{ !cancelled() && (github.event_name == 'push' || needs.changes.outputs.mcp == 'true') }}
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.mcp == 'true') }}
         run: test -f mcp-loom/dist/index.js
 
   backend-lint-and-check:
     name: Rust Linting & Build Check
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -319,7 +336,7 @@ jobs:
   backend-tests:
     name: Rust Unit Tests (${{ matrix.partition }}/${{ strategy.job-total }})
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
     # Partitioned three ways (#9065). Running ~9,500 tests one-process-each is
     # CPU-bound on a 4-vCPU runner: 222s of the job's 402s was test execution
     # alone, on the critical path of every backend PR. `--partition count:k/3`
@@ -395,7 +412,7 @@ jobs:
   backend-otlp-feature:
     name: Rust OTLP Feature Build & Test
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -477,6 +494,14 @@ jobs:
       # that a feature which never varied scores rankCorr 0.5 rather than 0.
       - name: Verify the SigNoz ETA accuracy queries against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_eta_queries -- --ignored --nocapture
+      # #10233: the same technique for the late-surprise, stability,
+      # convergence and answer-rate views (eta-queries.sql Q4-Q7), over their
+      # own fixture. Only this run shows that dropping the common decidable
+      # subset lets a heuristic that refuses the hard cases read as better,
+      # that remaining seconds invert the stability ranking, and that counting
+      # rows inflates the answer rate because refusals are never refreshed.
+      - name: Verify the SigNoz ETA late-surprise/stability/convergence/answer-rate views against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_eta_accuracy_views -- --ignored --nocapture
       # #8528 / #8826: the same technique for section 5 of ci-queries.sql
       # ("Failed run -> logs"), the one standing CI view whose chunk join no
       # deployment has ever exercised -- the live trial capture returned 60 rows
@@ -491,11 +516,30 @@ jobs:
       # asymmetric run_attempt/attempts join keys are both load-bearing.
       - name: Verify the SigNoz CI failed-run log join against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_ci_failed_run_logs -- --ignored --nocapture
+      # #8528 / #9904: the same technique for retention.sql, the trial's last
+      # artifact with no guard of any kind -- and the only one that MUTATES the
+      # operator's deployment. It needs a single-node ClickHouse with an
+      # embedded Keeper rather than `clickhouse local`, because `ON CLUSTER
+      # cluster` requires a real distributed-DDL queue (`clickhouse local`
+      # answers QUERY_IS_PROHIBITED). The live record for this file is "all 16
+      # statements reported status 0" plus an effective TTL per table; neither
+      # can show a retention OUTCOME. Only this run shows that dropping the
+      # `/ 1000` from a millisecond statement deletes every row in the table
+      # rather than nothing (toDateTime saturates at the DateTime maximum and
+      # the interval overflows past it), that `ttl_only_drop_parts` keeps an
+      # over-age row alive indefinitely in a part it shares with an in-window
+      # row, that `MODIFY TTL` silently drops a table-level DELETE WHERE
+      # qualification while keeping column TTLs, that re-widening a shortened
+      # window restores the policy and not the data, and that one failing
+      # statement aborts the file leaving exactly the metric statements -- the
+      # ones that restore 30 days -- unapplied.
+      - name: Verify the SigNoz retention statements against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_retention_ttl -- --ignored --nocapture
 
   backend-otlp-tests:
     name: Rust OTLP Feature Tests (${{ matrix.partition }}/${{ strategy.job-total }})
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
     # The whole loom-daemon suite with `--features otlp`, partitioned three
     # ways for the same reason and by the same mechanism as Rust Unit Tests
     # (#9065): 211s of test execution on one runner was the critical path.
@@ -972,12 +1016,17 @@ jobs:
       # would false-FAIL any PR cut before a sibling defaults/-touching merge
       # bumped the version. The script narrows to merge-base(base, head)
       # itself; this checkout depth is what makes that resolvable.
+      #
+      # #10257: a merge group runs it too, over the combined tree's own range
+      # (merge_group.base_sha..head_sha). Skipping it there would leave this
+      # gate unexercised on exactly the tree that lands. The merge-group ref
+      # is fetched at full depth like the PR merge ref, so both ends resolve.
       - name: Check no version-bearing file's value was hand-edited (#7743)
-        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
         run: |
           bash defaults/scripts/check-defaults-version-bump.sh --forbid-bump \
-            --base "${{ github.event.pull_request.base.sha }}" \
-            --head "${{ github.event.pull_request.head.sha }}"
+            --base "${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}" \
+            --head "${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}"
 
       # component: Shell Syntax (ubuntu-latest)
       # #7728: `check-shell-syntax.sh` existed since #6162 but was never wired
@@ -1181,10 +1230,16 @@ jobs:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BEFORE: ${{ github.event.before }}
           PUSH_AFTER: ${{ github.sha }}
+          # #10257: a merge group scans every commit the combined tree adds
+          # over its base, not just its head commit.
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
         run: |
           set -euo pipefail
           if [ "$EVENT" = pull_request ]; then
             range="$PR_BASE..$PR_HEAD"
+          elif [ "$EVENT" = merge_group ]; then
+            range="$MG_BASE..$MG_HEAD"
           elif [ -n "$PUSH_BEFORE" ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
             range="$PUSH_BEFORE..$PUSH_AFTER"
           else
@@ -1607,7 +1662,7 @@ jobs:
   dep-classification-suites:
     name: Native Port Suites
     needs: [changes, build-daemon]
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
     # Already path-filtered, so it SKIPS whole on a dashboard-only PR and never
     # reaches the download (#9113). `changes.daemon` OR-s `backend` and
     # `scripts` in precisely so this stays true: whenever this job runs,
@@ -1683,6 +1738,8 @@ jobs:
         run: bash defaults/scripts/tests/test-provision-codex-hooks.sh
       - name: spawn-codex merging-role hook gate (#9390)
         run: bash defaults/scripts/tests/test-spawn-codex-guarded.sh
+      - name: spawn-codex sealed-registration trust waiver (#10102)
+        run: bash defaults/scripts/tests/test-spawn-codex-sealed.sh
       # #9517: fleet-send.sh is a thin SILENT stub over `loom-daemon
       # fleet-send` (its whole interface is a best-effort exit 0, so it
       # bypasses lib/script-helper.sh's loud missing-daemon path). The suite
@@ -1786,6 +1843,11 @@ jobs:
       # and host-side `tokens select`, so it needs the binary this job downloads.
       - name: spawn-claude credential egress proxy (#8697)
         run: bash defaults/scripts/tests/test-spawn-claude-credential-proxy.sh
+      # #9979: spawn-codex.sh drops Codex's sandbox in a session container only
+      # after `loom-daemon session-exec posture` has verified the container's
+      # label AND HostConfig, so this suite needs the binary this job downloads.
+      - name: spawn-codex session container boundary (#8518, #9979)
+        run: bash defaults/scripts/tests/test-spawn-codex-session-exec.sh
       # Moved out of shell-suite-tests by #8191 slice 1: merge-pr.sh's
       # closing-reference analysis now delegates to `loom-daemon`, so this
       # suite's require-daemon-bin harness needs the binary this job downloads.
@@ -2107,7 +2169,7 @@ jobs:
   native-port-daemon-lifecycle:
     name: Native Port Suites (daemon lifecycle, watchdog)
     needs: [changes, build-daemon]
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true' || needs.changes.outputs.scripts == 'true')
     # Already path-filtered, so it SKIPS whole on a dashboard-only PR and never
     # reaches the download (#9113). `changes.daemon` OR-s `backend` and
     # `scripts` in precisely so this stays true: whenever this job runs,
@@ -2194,7 +2256,7 @@ jobs:
   installer-tests:
     name: Installer Integration Tests
     needs: [changes, build-daemon]
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true' || needs.changes.outputs.backend == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.scripts == 'true' || needs.changes.outputs.backend == 'true')
     # Already path-filtered, so it SKIPS whole on a dashboard-only PR and never
     # reaches the download (#9113). `changes.daemon` OR-s `backend` and
     # `scripts` in precisely so this stays true: whenever this job runs,
@@ -2234,7 +2296,7 @@ jobs:
   codex-adapter-smoke:
     name: Codex Adapter Smoke (mocked)
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true' || needs.changes.outputs.backend == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.scripts == 'true' || needs.changes.outputs.backend == 'true')
     # Tier-2 admission gate for the Codex runtime adapter (epic #4167 Phase 2,
     # issue #4468): a green leg here is what admits the adapter per
     # defaults/docs/runtime-adapters.md's tier policy.
@@ -2338,7 +2400,7 @@ jobs:
   shell-suite-tests:
     name: Shell Test Suites (hermetic, ${{ matrix.shard }}/${{ strategy.job-total }})
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.scripts == 'true')
     # Audit-and-wire of the defaults/scripts/tests/ population (#4455). Before
     # this job, exactly one suite there ran in CI (Installer Integration Tests)
     # while ~70 others rode to main untested. run-ci-suites.sh runs every suite
@@ -2451,7 +2513,7 @@ jobs:
   worker-image-smoke:
     name: loom-worker Image Smoke Test
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.docker == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2499,7 +2561,7 @@ jobs:
     # ghcr.io/rjwalters/loom-worker — a PR's Dockerfile changes are not
     # published anywhere to pull from, and this keeps the check hermetic.
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.docker == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -2543,7 +2605,7 @@ jobs:
     # docker/native/test-image.sh fail HERE, on the PR that changes a pin,
     # instead of during a release.
     needs: changes
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.docker == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.docker == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

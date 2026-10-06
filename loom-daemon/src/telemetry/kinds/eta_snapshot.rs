@@ -48,10 +48,43 @@ use crate::telemetry::RepoVisibility;
 /// (`land` with `p50`, `land` refusals, then `start`/`finish`), not sort order.
 ///
 /// Measured (#10052): a serialized row is ~245 bytes for a short slug (~350 with long slugs), so 200 rows is ~50-70 KB.
+/// With `alternates` (#10390) a `land` row carrying 7 is ~1.5 KB, so a full
+/// record is at most ~300 KB, well under the dashboard's 2 MiB value limit.
 /// The record lands as one `eta:<hostId>` dashboard state value, so the cap
 /// is held rather than raised: priority cutting, not a bigger record, is
 /// what keeps every repo's `land` rows in.
 pub const MAX_ROWS: usize = 200;
+
+/// Most alternates one row carries; mirrors loom-ui's `MAX_ALTERNATES`
+/// (`src/etaState.ts`), which slices before it filters.
+pub const MAX_ALTERNATES: usize = 8;
+
+/// One shadow heuristic's newest estimate (or refusal) for the same
+/// `(repo, issue, kind)` as its row (#10390). Never the row's answer.
+///
+/// Quantiles are remaining seconds from this alternate's own `as_of`. Absent
+/// is never zero: a refusal has all quantiles absent and
+/// `no_estimate_reason` set. Wire shape mirrors loom-ui
+/// `test/etaState.test.ts` "normalizeEtaSnapshot alternates (#1669)".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EtaSnapshotAlternate {
+    /// e.g. `land-2026-10-04-twin-otter`.
+    pub heuristic: String,
+    /// That heuristic's own `eta.estimate` id.
+    pub estimate_id: String,
+    /// The alternate's own `as_of` (may differ from the row's).
+    pub as_of: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p25: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p75: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p90: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_estimate_reason: Option<NoEstimateReason>,
+}
 
 /// One issue's current estimate for one [`Kind`].
 ///
@@ -88,7 +121,7 @@ pub struct EtaSnapshotRow {
     pub p75: Option<i64>,
     /// The heuristic that made it (`land-v1`, …). Always the kind's
     /// **`current`** heuristic: a shadow candidate's estimate (#9328) is
-    /// never the subject's answer and never appears here.
+    /// never the subject's answer and appears only under `alternates`.
     pub heuristic: String,
     /// The derived id of the estimate, for the on-demand "why this ETA?"
     /// lookup of the full `eta-explanation/v1` record in SigNoz.
@@ -103,6 +136,9 @@ pub struct EtaSnapshotRow {
     /// absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_estimate_reason: Option<NoEstimateReason>,
+    /// Shadow candidates' estimates for this item (#10390). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternates: Vec<EtaSnapshotAlternate>,
 }
 
 /// `eta.snapshot`: one host's live ETA estimate set. Host-scoped, newest per

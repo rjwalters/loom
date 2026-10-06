@@ -1,0 +1,477 @@
+# ci-landing.toml — the required-ci-landing profile.
+#
+# CI readiness, branch update, the guarded merge itself, server-side auto-merge
+# disarming, and branch protection / repository policy. These are the rows
+# where an incomplete or stale answer does not degrade a feature, it lands a
+# bad merge — so every one of them is in a NON_WAIVABLE_GROUPS group and none
+# may be dispositioned optional.
+#
+# `gh pr merge` is PROHIBITED for ordinary sweeps (merge-pr.sh merges via the
+# forge API so a worktree-linked branch cannot break the merge); the installer
+# retains a separate legacy use. That prohibition is recorded as a row so the
+# inventory distinguishes `Loom does not use this` from `nobody checked`.
+
+# --- ci-readiness ------------------------------------------------------------
+
+[[operation]]
+id = "ci.check-runs-for-sha"
+group = "ci-readiness"
+summary = "Read every check run and commit status for a head SHA."
+profile = "required-ci-landing"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "sha"]
+outputs = [
+  "name",
+  "status",
+  "conclusion",
+  "started_at",
+  "completed_at",
+  "head_sha",
+  "details_url",
+]
+required_fields = ["name", "status", "conclusion", "head_sha"]
+actor = "daemon"
+permissions = ["checks:read", "statuses:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::ci-landing::ci-check-runs-for-sha"
+test_status = "declared"
+owner = "daemon-landing"
+risk = "high"
+high_risk_cases = ["queued-hidden-ci"]
+github = { commands = [
+  "gh pr checks",
+], routes = [
+  "GET repos/{owner}/{repo}/commits/{sha}/check-runs",
+  "GET repos/{owner}/{repo}/commits/{sha}/status",
+] }
+platform_support = "unknown"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "a QUEUED workflow reports zero check runs, which is indistinguishable from `no CI configured` unless the runs endpoint is consulted too — #9769 names Gitea first-page Actions behavior as requiring work",
+  "whether failed / cancelled / skipped stay distinguishable; a skipped required check must never count as success",
+  "truncated (first-page) check reads: an unread page can hide the only failure",
+]
+notes = "Seeded first. `gh pr checks` returning zero rows is a known false-settled signal (#6169) even on GitHub; on a new provider the same ambiguity is a merge-safety bug."
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/check-ci-status.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/main_health_gate.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/merge_pr/stale_checks/fetch.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/eta/fleet_events_forge.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_wait_checks/reads.rs"
+
+[[operation]]
+id = "ci.workflow-runs-for-sha"
+group = "ci-readiness"
+summary = "List workflow runs for a head SHA, including queued ones with no check runs."
+profile = "required-ci-landing"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "sha", "status"]
+outputs = ["run_id", "name", "head_sha", "status", "conclusion", "created_at"]
+required_fields = ["run_id", "head_sha", "status"]
+actor = "daemon"
+permissions = ["actions:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::ci-landing::ci-workflow-runs-for-sha"
+test_status = "declared"
+owner = "daemon-ci-telemetry"
+risk = "high"
+high_risk_cases = ["queued-hidden-ci"]
+github = { commands = [
+  "gh run list",
+  "gh run view",
+], routes = [
+  "GET repos/{owner}/{repo}/actions/runs?head_sha={sha}",
+] }
+platform_support = "unknown"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "Gitea Actions documents behavioral differences from GitHub Actions; the run list is the ONLY way to see a queued workflow, so its completeness is a landing-safety property",
+  "whether a required run must execute on Gitea Actions or an explicitly integrated external runner reporting back to the primary forge",
+]
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/ci_telemetry/api.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/ci_telemetry/suites.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/gh_state_probe.rs"
+
+[[operation]]
+id = "ci.stale-check-freshness"
+group = "ci-readiness"
+summary = "Decide whether a green check ran against the base branch's current tip."
+profile = "required-ci-landing"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "sha", "base_sha", "check_started_at"]
+outputs = ["base_tip_sha", "base_tip_committed_at", "verdict"]
+required_fields = ["base_tip_sha", "base_tip_committed_at"]
+actor = "daemon"
+permissions = ["contents:read", "checks:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "reread-then-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::ci-landing::ci-stale-check-freshness"
+test_status = "declared"
+owner = "daemon-landing"
+risk = "high"
+high_risk_cases = ["queued-hidden-ci", "expected-head-merge"]
+github = { commands = [], routes = [
+  "GET repos/{owner}/{repo}/commits/{ref}",
+  "GET repos/{owner}/{repo}/commits/{sha}/check-runs",
+] }
+platform_support = "unknown"
+adapter_coverage = "partial"
+caller_integration = "complete"
+unknowns = [
+  "check-run timestamp granularity and clock source; #8248's ratchet compares a check's start against the base tip's commit time, so a provider with coarse or client-supplied timestamps changes the decision",
+]
+notes = "#8248/#8508: a stale green is evidence about a tree that no longer exists. Exit 2 (cannot determine) must refuse the merge, which makes an unanswerable read a safe outcome rather than a pass."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/merge_pr/stale_checks/fetch.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/merge_pr_stale_checks.rs"
+
+# --- branch-update-guarded-merge ---------------------------------------------
+
+[[operation]]
+id = "merge.expected-head-guarded"
+group = "branch-update-guarded-merge"
+summary = "Merge a PR only if its head still equals an expected SHA, using a chosen merge method."
+profile = "required-ci-landing"
+disposition = "required"
+class = "write"
+inputs = ["owner", "repo", "number", "expected_head_sha", "merge_method", "commit_title"]
+outputs = ["merged", "merge_commit_sha", "head_sha_at_merge"]
+required_fields = ["merged", "merge_commit_sha"]
+actor = "daemon"
+permissions = ["pull_requests:write", "contents:write"]
+pagination = "not-paginated"
+consistency = "fresh-read"
+idempotency = "expected-head-guarded"
+retry = "reread-then-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::ci-landing::merge-expected-head-guarded"
+test_status = "declared"
+owner = "daemon-landing"
+risk = "high"
+high_risk_cases = ["expected-head-merge"]
+github = { commands = [], routes = [
+  "PUT repos/{owner}/{repo}/pulls/{number}/merge",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "Gitea documents a head-guarded merge; whether a MISMATCHED head is rejected with a distinguishable error (rather than merged anyway, or failing like a transient error) is the property that matters and is unverified",
+  "merge-method availability must match the repository's allowed methods, and a method the repo forbids must fail closed rather than silently fall back",
+]
+notes = "The single most safety-critical write Loom makes. A provider that accepts the merge while ignoring `expected head` cannot be a Loom primary forge regardless of what else it supports."
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/merge-pr.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_merge_method.rs"
+
+[[operation]]
+id = "merge.prohibited-cli-merge"
+group = "branch-update-guarded-merge"
+summary = "`gh pr merge` — prohibited for ordinary sweeps; installer legacy use only."
+profile = "required-ci-landing"
+disposition = "prohibition"
+class = "write"
+inputs = []
+outputs = []
+required_fields = []
+actor = "operator"
+permissions = ["pull_requests:write"]
+pagination = "not-paginated"
+consistency = "fresh-read"
+idempotency = "not-idempotent"
+retry = "no-auto-retry"
+version_support = { github = "0" }
+test_id = "forge-probe::ci-landing::merge-prohibited-cli-merge"
+test_status = "declared"
+owner = "role-prompts"
+risk = "normal"
+github = { commands = ["gh pr merge"], routes = [] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = []
+notes = "Classified as a PROHIBITION, not an active operation: it attempts a local checkout that fails when the PR branch is linked to a worktree, and it bypasses merge-pr.sh's guards. Counted here so a grep for `gh pr merge` in the tree resolves to a decision instead of looking like an unmapped caller."
+[[operation.callers]]
+kind = "role-prompt"
+path = "defaults/.claude/commands/loom/champion-pr-merge.md"
+
+[[operation]]
+id = "branch.update-from-base"
+group = "branch-update-guarded-merge"
+summary = "Server-side update of a PR branch from its base."
+profile = "required-ci-landing"
+disposition = "optional"
+class = "write"
+inputs = ["owner", "repo", "number", "expected_head_sha"]
+outputs = ["message", "url"]
+required_fields = []
+actor = "daemon"
+permissions = ["pull_requests:write", "contents:write"]
+pagination = "not-paginated"
+consistency = "fresh-read"
+idempotency = "expected-head-guarded"
+retry = "reread-then-retry"
+version_support = { github = "0" }
+test_id = "forge-probe::ci-landing::branch-update-from-base"
+test_status = "declared"
+owner = "daemon-landing"
+risk = "normal"
+github = { commands = [
+  "gh pr update-branch",
+], routes = [
+  "PUT repos/{owner}/{repo}/pulls/{number}/update-branch",
+] }
+platform_support = "unknown"
+adapter_coverage = "none"
+caller_integration = "none"
+exclusion_reason = "Loom's own rebase path (reconcile-stack, Doctor's rebase) runs locally in a worktree and pushes, so a server-side update endpoint is a convenience rather than a requirement. Its ABSENCE does not block landing."
+preflight = "warn-and-disable"
+# `branch-update-guarded-merge` is non-waivable, so declining this row has to
+# name what still carries the requirement. The landing-safety invariant is the
+# expected-head guard, not the server-side update endpoint.
+requirement_carried_by = ["merge.expected-head-guarded"]
+unknowns = [
+  "whether a provider offers an equivalent at all; if a deployment enables it, the expected-head guard must still apply",
+]
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/lib/forge-helpers.sh"
+
+[[operation]]
+id = "branch.delete-after-merge"
+group = "branch-update-guarded-merge"
+summary = "Delete the merged head ref."
+profile = "required-ci-landing"
+disposition = "required"
+class = "write"
+inputs = ["owner", "repo", "ref"]
+outputs = []
+required_fields = []
+actor = "daemon"
+permissions = ["contents:write"]
+pagination = "not-paginated"
+consistency = "eventual"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::ci-landing::branch-delete-after-merge"
+test_status = "declared"
+owner = "daemon-landing"
+risk = "normal"
+github = { commands = [], routes = [
+  "DELETE repos/{owner}/{repo}/git/refs/heads/{branch}",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "an already-deleted ref must read as success, not as an error; post-merge cleanup is re-run by the worktree reaper on other hosts",
+]
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/merge_pr_delete_branch.rs"
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/merge-pr.sh"
+
+# --- server-side-auto-merge --------------------------------------------------
+
+[[operation]]
+id = "automerge.disable"
+group = "server-side-auto-merge"
+summary = "Disarm a pending server-side auto-merge on a PR."
+profile = "required-ci-landing"
+disposition = "required"
+class = "write"
+inputs = ["pull_request_node_id"]
+outputs = ["auto_merge_enabled"]
+required_fields = ["auto_merge_enabled"]
+actor = "daemon"
+permissions = ["pull_requests:write"]
+pagination = "not-paginated"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "reread-then-retry"
+version_support = { github = "0" }
+test_id = "forge-probe::ci-landing::automerge-disable"
+test_status = "declared"
+owner = "daemon-forge"
+risk = "high"
+high_risk_cases = ["expected-head-merge"]
+github = { commands = [], routes = [
+  "GRAPHQL disablePullRequestAutoMerge",
+] }
+platform_support = "unknown"
+adapter_coverage = "complete"
+caller_integration = "complete"
+unknowns = [
+  "whether a provider has server-side auto-merge at all; if it does NOT, this row is satisfied vacuously, but if it does and cannot be disarmed, an unsafe pending merge has no off switch",
+]
+notes = "Required because DISARMING is active safety behavior, unlike enabling. A provider with an un-disarmable auto-merge is more dangerous than one with none."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_disable_auto_merge.rs"
+
+[[operation]]
+id = "automerge.enable"
+group = "server-side-auto-merge"
+summary = "Enable native auto-merge with an expected head OID (operator compatibility)."
+profile = "optional"
+disposition = "optional"
+class = "write"
+inputs = ["pull_request_node_id", "expected_head_oid", "merge_method"]
+outputs = ["auto_merge_enabled"]
+required_fields = []
+actor = "operator"
+permissions = ["pull_requests:write"]
+pagination = "not-paginated"
+consistency = "fresh-read"
+idempotency = "expected-head-guarded"
+retry = "no-auto-retry"
+version_support = { github = "0" }
+test_id = "forge-probe::ci-landing::automerge-enable"
+test_status = "declared"
+owner = "daemon-forge"
+risk = "normal"
+github = { commands = [], routes = [
+  "GRAPHQL enablePullRequestAutoMerge",
+] }
+platform_support = "unknown"
+adapter_coverage = "partial"
+caller_integration = "none"
+exclusion_reason = "Native auto-merge is operator-only compatibility functionality, NOT Loom's landing mechanism — Champion lands PRs through merge-pr.sh's guarded merge. Excluding it removes no lifecycle capability."
+preflight = "warn-and-disable"
+unknowns = []
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_cmd.rs"
+
+# --- protection-repository-policy --------------------------------------------
+
+[[operation]]
+id = "protection.read-effective-rules"
+group = "protection-repository-policy"
+summary = "Read the branch rules in effect for a branch: required checks, allowed methods, restrictions."
+profile = "required-ci-landing"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "branch"]
+outputs = [
+  "required_status_checks",
+  "allowed_merge_methods",
+  "required_linear_history",
+  "restrictions",
+  "bypass_actors",
+]
+required_fields = ["required_status_checks", "allowed_merge_methods"]
+actor = "daemon"
+permissions = ["administration:read"]
+pagination = "complete-required"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::ci-landing::protection-read-effective-rules"
+test_status = "declared"
+owner = "daemon-landing"
+risk = "high"
+high_risk_cases = ["revoked-permissions"]
+github = { commands = [], routes = [
+  "GET repos/{owner}/{repo}/rules/branches/{branch}",
+  "GET repos/{owner}/{repo}/branches/{branch}/protection",
+  "GET repos/{owner}/{repo}",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "a 403/404 on a protection read means `I may not see it`, not `there is no protection` — unavailable state must never be an affirmative answer (the revoked-permissions case)",
+  "Gitea's branch-protection model names and groups rules differently; required-check NAMES must map exactly or a required check silently stops being required",
+]
+notes = "forge_merge_config derives the effective merge-method set from repo flags plus rules; a wrong read picks a method the repo forbids, which fails the merge at the worst moment."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_merge_config.rs"
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/land-resync-commit.sh"
+
+[[operation]]
+id = "protection.write-rulesets"
+group = "protection-repository-policy"
+summary = "Create/update/delete branch rulesets and repository settings at install time."
+profile = "fleet-bootstrap"
+disposition = "required"
+class = "write"
+inputs = ["owner", "repo", "ruleset"]
+outputs = ["ruleset_id", "name", "enforcement"]
+required_fields = ["ruleset_id"]
+actor = "installer"
+permissions = ["administration:write"]
+pagination = "complete-required"
+consistency = "read-after-write"
+idempotency = "idempotent"
+retry = "reread-then-retry"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::ci-landing::protection-write-rulesets"
+test_status = "declared"
+owner = "installer"
+risk = "high"
+high_risk_cases = ["revoked-permissions"]
+github = { commands = [], routes = [
+  "GET repos/{owner}/{repo}/rulesets",
+  "POST repos/{owner}/{repo}/rulesets",
+  "PUT repos/{owner}/{repo}/rulesets/{id}",
+  "DELETE repos/{owner}/{repo}/rulesets/{id}",
+  "PATCH repos/{owner}/{repo}",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "none"
+unknowns = [
+  "bypass IDENTITY: Loom's merge path needs a declared bypass actor; who may bypass and how that actor is named is provider-specific and unverified",
+  "an installer run with insufficient admin scope must fail loudly rather than leave a repo half-protected",
+]
+[[operation.callers]]
+kind = "installer"
+path = "scripts/install/setup-branch-protection.sh"
+[[operation.callers]]
+kind = "installer"
+path = "scripts/install/setup-repository-settings.sh"

@@ -36,7 +36,7 @@ After any render, run `cargo test --test signoz_deployment_contract`: it re-read
 the committed `pours/` output and fails if a regenerated deployment stops matching
 what this README promises — see [Rendered-deployment contract](#rendered-deployment-contract).
 All component images pin multi-platform index digests in the casting: SigNoz
-**v0.142.1**, its collector **v0.144.10**, ClickHouse and Keeper **25.12.5**,
+**v0.142.1**, its collector **v0.144.10**, ClickHouse **25.12.11**, Keeper **25.12.5**,
 and PostgreSQL **16**. Each index includes Linux amd64 and arm64. The upstream
 histogram helper **v0.0.1** init command is patched declaratively to verify SHA-256
 before extraction and reject unsupported architectures. Independent downloads
@@ -376,9 +376,9 @@ spotlight, outcome mix, top slow jobs, failed run → logs, run waterfall, the
 per-issue ship breakdown, CI time per trigger reason, and (#9089) job queue
 wait, shard imbalance, step timings, slowest suites, suite-level rebalance and
 dependency wait.
-Sections 1–3 read the `loom.ci.*.duration_ms` histograms (kept 30 days);
-4–10, 14 and 15 read the `ci.run` / `ci.job` / `ci.job.log` records (kept 7
-days); 11–13 read `signoz_traces.signoz_index_v3` (kept 7 days). Bind all five parameters
+Sections 1–3 read the `loom.ci.*.duration_ms` histograms (trial: 30 days);
+4–10, 14 and 15 read the `ci.run` / `ci.job` / `ci.job.log` records (trial: 7
+days); 11–13 read `signoz_traces.signoz_index_v3` (trial: 7 days; live: 10 years). Bind all five parameters
 once:
 
 ```console
@@ -404,7 +404,10 @@ return 0 on every row instead of erroring. Policy and pipeline:
 happened, from the `eta.estimate` / `eta.outcome` **log** records. Section 0 is
 the preflight; Q1 is MAE / 25–75 coverage / bias; Q2 is the mean pinball loss
 that decides a promotion; Q3 ranks the recorded features by how well each
-tracks the error. The model is [`eta.md`](../../docs/eta.md). Bind both
+tracks the error; Q4-Q7 (#10233) are the late-surprise rate on the common
+decidable subset, the stability of the predicted landing instant, interval
+convergence by actual lead, and the time-weighted answer rate (proven by
+`loom-daemon/tests/signoz_eta_accuracy_views.rs`). The model is [`eta.md`](../../docs/eta.md). Bind both
 parameters:
 
 ```console
@@ -490,6 +493,7 @@ data.
 | CI critical path | Logs Explorer: filter `body = 'ci.job' AND loom.ci.run_id = <id>`, add columns `loom.ci.job`, `loom.ci.dependency_wait_ms`, `loom.ci.queued_ms`, `loom.ci.duration_ms`, and sort by `loom.ci.duration_ms` descending — the leg with the largest dependency + queue + running sum is the run's critical path, and the three columns say which of the three set it. The `unexplained_s` residual (run wall time minus the run's own queue and that leg's total) requires a run↔job join and is SQL-only (`ci-queries.sql` 14) |
 | ETA accuracy | Logs Explorer: filter `body = 'eta.outcome' AND loom.eta.error_sec EXISTS`, add columns `loom.eta.heuristic`, `loom.eta.revision`, `loom.eta.kind`, `loom.eta.horizon_bucket`, `loom.eta.error_sec`, `loom.eta.covered`; group by `loom.eta.heuristic`, `loom.eta.revision` — **both**, never heuristic alone, or a daemon roll mid-window averages two builds into one number. The `EXISTS` clause is not optional: an abandoned sweep has no error field, and without it the panel scores the abandonment as a perfect prediction. Coverage, bias and the pinball loss that decides a promotion need `avg()`/`median()` over these and stay SQL-only (`eta-queries.sql` 0, Q1, Q2) |
 | ETA feature ranking | SQL-only (`eta-queries.sql` Q3): it expands the estimate's explanation body with `JSONExtractKeysAndValuesRaw` and correlates each numeric feature with the error, neither of which is an Explorer operation. Read `distinct_values` beside `rank_corr` — a feature that never varied scores 0.5, not 0 — and `n` beside both: the section's `HAVING n >= 20` makes a short window return nothing at all |
+| ETA late surprise, stability, convergence, answer rate | SQL-only (`eta-queries.sql` Q4, Q5, Q6, Q7): Q4 keeps an instant only when every heuristic's late surprise there is decided (an Explorer `avg(loom.eta.above_p90)` would let a heuristic that refuses the hard cases read as better), Q5 needs a window over consecutive emissions, Q6 buckets the actual lead, and Q7 weights each emitted state by how long it stood — counting rows overstates the answer rate because a refusal is never refreshed |
 | CI dependency wait | Logs Explorer: filter `body = 'ci.job' AND loom.ci.dependency_wait_ms EXISTS`, add columns `loom.repo`, `loom.ci.workflow`, `loom.ci.job`, `loom.ci.dependency_wait_ms`, `loom.ci.queued_ms`; group by `loom.ci.job` with **P50**/**P90**, time range 7 days. **Alert when a family's p90 dependency wait exceeds its own p90 queue wait**: it is gated by `needs:`, not capacity-starved, and more runners will not move it. An ungated job measures ~0 by construction — treat sub-2s values as job-creation lag, not a serialized edge (`ci-queries.sql` 15) |
 | CI slowest tests | Trace Explorer: filter `name = 'loom.ci.test'`, group by `loom.ci.test.binary`, `loom.ci.test` with **Sum** (and a second query with **P90**), time range 7 days, sorted descending. Add `loom.ci.test.outcome` as a filter to separate `flaky` (failed then passed — the #7789 signal) from `fail`/`error` from a clean `pass` (`ci-queries.sql` 16). **Only each leg's slow tail is emitted** — tests at or above the 250 ms floor, capped at `MAX_TEST_SPANS_PER_JOB` (512) per leg — so this panel is a ranking, never a test inventory: a test missing from it is fast or outside the cap, not unrun |
 | CI test rebalance | Same filter grouped by `loom.ci.run_id`, `loom.ci.job` with **Sum** — one bar per nextest leg of a run, which is the slow-tail time a `--partition count:k/N` split should equalize. Group by `loom.ci.job` and not by `loom.ci.shard.index` alone: both nextest families shard `1..3`, so index alone merges two unrelated partitions. `argMax(test, duration)` per leg (the named test to move) is SQL-only (`ci-queries.sql` 17). The summed tail time is far **less** than the leg's test-step wall time by design (every sub-floor test is excluded), so compare legs of the same run and the same family, never a leg against its own job span |
@@ -584,6 +588,11 @@ real-canary comparison still needs.
 
 ## Retention and operation
 
+> **Trial-only.** This section governs the isolated trial. The live
+> harness-ops store keeps logs 3650 days and traces/metrics 10 years
+> ([#10195](https://github.com/rjwalters/loom/issues/10195)); never apply
+> `retention.sql` there (#8946 item 2 stays held).
+
 Set **seven days for logs and traces and 30 days for metrics** in General
 Settings → Retention (#8826). Metrics outlive raw logs/traces on purpose: the
 CI duration/outcome trends in `ci-queries.sql` 1–3 are the retro asset, and
@@ -596,13 +605,25 @@ ClickHouse after changing the setting, including derived tables; record it in
 rollups, but leaves some metadata, reduced-metric and legacy tables at 15 or
 30 days (one month for `top_level_operations`). For this isolated trial, apply
 the reviewed `retention.sql` after the API settings — it sets those existing
-TTLs to 7 days for logs/traces and 30 days for metrics, and restores 30 days
-on a trial that ran its earlier all-seven-day version — using the private
-bundled client:
+TTLs to 7 days for logs/traces and 30 days for metrics, and restores the
+30-day *policy* (not the data) on a trial that ran its earlier all-seven-day
+version — using the private bundled client:
 
 ```console
 docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --multiquery < retention.sql
 ```
+
+**This deletes data as it runs**, and the deletion is not recoverable:
+`MODIFY TTL` materialises on existing parts, so every row already past the new
+window is gone when the command returns rather than at some later merge. Read
+`retention.sql`'s header before applying it — it carries five behaviours
+measured against the pinned engine by
+`loom-daemon/tests/signoz_retention_ttl.rs` (#8528), including a units slip
+that deletes an entire table while reporting success. **Confirm the command
+printed 16 host rows all reading status 0**: one failing statement stops the
+client, and because the metric statements are last, a partial run shortens
+logs/traces to 7 days while skipping every statement that restores 30 days to
+metrics.
 
 Re-run `queries.sql` after every upgrade or retention-setting change. Resource
 fingerprint tables retain the upstream **30-minute grace beyond seven days**;
@@ -613,8 +634,26 @@ metadata is erased at either boundary. Confirm the split from effective DDL,
 not from the settings page:
 
 ```console
-docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT database, name, extract(create_table_query, 'TTL (.*?)(SETTINGS|\$)') FROM system.tables WHERE database IN ('signoz_logs', 'signoz_traces', 'signoz_metrics') AND create_table_query LIKE '%TTL%' AND engine NOT LIKE 'Distributed%' ORDER BY database, name"
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT database, name, extract(create_table_query, 'TTL (.*?)(SETTINGS|\$)') AS ttl, extract(create_table_query, 'ttl_only_drop_parts = \d') AS only_drop_parts FROM system.tables WHERE database IN ('signoz_logs', 'signoz_traces', 'signoz_metrics') AND create_table_query LIKE '%TTL%' AND engine NOT LIKE 'Distributed%' ORDER BY database, name"
 ```
+
+The TTL column is the **policy**. `ttl_only_drop_parts` is half of the
+**outcome**: where it is set, a part holding one over-age row and one in-window
+row keeps both, so a row well past seven days stays queryable until an
+unrelated merge rewrites that part (measured, with the setting-off and
+two-separate-parts controls run alongside it, in
+`loom-daemon/tests/signoz_retention_ttl.rs`). The other half is per part, and
+needs no per-table time column because ClickHouse stores each part's computed
+TTL instants:
+
+```console
+docker compose --env-file /absolute/private/signoz.env -f pours/deployment/compose.yaml exec -T loom-signoz-telemetrystore-clickhouse-0-0 clickhouse-client --query "SELECT database, table, count() AS parts, sum(rows) AS rows, countIf(delete_ttl_info_max < now()) AS fully_expired_parts, countIf(delete_ttl_info_min < now() AND delete_ttl_info_max >= now()) AS partly_expired_parts, min(delete_ttl_info_min) AS oldest_row_ttl FROM system.parts WHERE active AND database IN ('signoz_logs', 'signoz_traces', 'signoz_metrics') AND delete_ttl_info_min > toDateTime(0) GROUP BY database, table ORDER BY database, table"
+```
+
+`fully_expired_parts` above zero means TTL merges are behind (check the merge
+failure count in "ClickHouse self-telemetry" below).
+`partly_expired_parts` above zero on a `ttl_only_drop_parts = 1` table is the
+stuck case: those rows are past the window and will not be deleted on their own.
 
 `signoz_logs.logs_v2` keys its TTL on a per-row `_retention_days` column rather
 than a literal interval, so read that column's `default_expression` from

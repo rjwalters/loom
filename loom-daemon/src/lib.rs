@@ -129,6 +129,7 @@
 
 pub mod activity;
 pub mod admission_brake;
+pub mod agent_gh;
 pub mod agent_session;
 pub mod agent_skills;
 pub mod api_keys_pool;
@@ -173,6 +174,7 @@ pub mod eta;
 pub mod event_bus;
 pub mod filing_lock;
 pub mod fleet;
+pub mod fleet_alert;
 pub mod fleet_captain;
 pub mod fleet_state;
 pub mod fleet_store;
@@ -186,18 +188,22 @@ pub mod forge_check_claim;
 pub mod forge_check_open_pr;
 pub mod forge_cmd;
 pub mod forge_comment;
+pub mod forge_contract;
 pub mod forge_disable_auto_merge;
 pub mod forge_egress;
 pub(crate) mod forge_etag_store;
 pub mod forge_events;
 pub mod forge_identity;
+pub mod forge_inventory;
 pub mod forge_listing;
 pub mod forge_merge_config;
 pub mod forge_merge_method;
 pub mod forge_parser;
 pub mod forge_pr_congestion;
+pub mod forge_pull_listing;
 pub mod forge_read_pool;
 pub mod forge_tree_unchanged;
+pub mod forge_wait_checks;
 pub mod gh_invocation;
 pub mod gh_repo_env;
 pub mod gh_state_probe;
@@ -215,6 +221,7 @@ pub mod idle_exit;
 pub mod inflight;
 pub mod init;
 pub mod install_self_check;
+pub mod intake_reconcile;
 pub mod ipc;
 pub mod issue_creation_mutex;
 pub mod jev_merge_risk;
@@ -227,12 +234,19 @@ pub mod launchd_env_drift;
 pub mod launchd_reload;
 pub mod limit_calibration;
 pub mod live_claim;
+/// Test-only: a `gh` stand-in prepended to `PATH` before `main`, failing the
+/// run on any spawn of the real `gh` (#10138).
+#[cfg(test)]
+mod live_gh_guard;
 pub mod main_health_gate;
 pub mod mcp_tool_guard;
+pub mod merge_group_ci;
 pub mod merge_pr;
 pub mod metrics_collector;
 pub mod observability;
 pub mod opencode_usage;
+pub mod operator_decision;
+pub mod operator_levels;
 pub mod operator_stop;
 pub mod orphan_process_reaper;
 pub mod overlap_replay;
@@ -324,6 +338,9 @@ pub mod sweep_registry;
 pub mod sweep_usage;
 pub mod tap_usage;
 pub mod target_dir_gc;
+/// Per-task liveness heartbeats for the daemon's long-running loops (Issue
+/// #10414): the `loom.daemon.task_alive` gauge and `Task liveness:` in status.
+pub mod task_liveness;
 pub mod telemetry;
 pub mod terminal;
 pub mod terminal_restore;
@@ -348,6 +365,8 @@ pub mod transcript_tokens;
 pub mod types;
 pub mod usage_source;
 pub mod verdict_equivalence;
+/// The stale-verdict notice both stale-clear paths post (#9709).
+pub mod verdict_stale_notice;
 pub mod watch_registry;
 pub mod watchdog;
 pub mod watchdog_provisioning_guard;

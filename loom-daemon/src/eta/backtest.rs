@@ -25,18 +25,24 @@
 //! would-be-leaking future sample is added to the history it replays
 //! against.
 //!
-//! # Coverage: `land` cases need an in-sweep merge
+//! # Coverage: `land` cases from an in-sweep merge, or from the forge
 //!
-//! A [`Kind::Land`] case exists only where the record's phase sequence ends
-//! with a `merge` — the one place a `sweep.outcome` record witnesses the
-//! landing itself. Where the fleet merges out of sweep (Champion's
-//! auto-merge), no local record ends in `merge` and `land-v1` backtests
-//! against zero cases, even though `eta backfill` gives it plenty of
-//! `merge_wait` *samples* to estimate from. Samples and cases are different
-//! things, and only the latter is missing. Deriving `land` cases from the
-//! same `pr_latency` histories backfill already reads (the real
-//! `review-requested → merged` lead time) is the fix, tracked separately;
-//! it is not a leakage hazard, just a gap in what can be scored.
+//! [`cases_from_record`] yields a [`Kind::Land`] case only where the record's
+//! phase sequence ends with a `merge` — the one place a `sweep.outcome`
+//! record witnesses the landing itself. Where the fleet merges out of sweep
+//! (Champion's auto-merge), no local record ends in `merge`, so that source
+//! alone gives `land-v1` zero cases even though `eta backfill` gives it
+//! plenty of `merge_wait` *samples* to estimate from. Samples and cases are
+//! different things.
+//!
+//! The second `land` source (#9579) is the merged PR's own forge label
+//! timeline ([`pr_cases::cases_from_pr_history`]): every stage entry the
+//! shared label resolver names (`merge_hold` included, #10305) is a replay
+//! instant and the PR's `merged_at` its answer. It is opt-in at the CLI (`eta backtest --pr-history` /
+//! `--forge-pr-cases`) so a default backtest stays offline, and its own
+//! leak-freedom argument is made in [`pr_cases`] rather than inherited from
+//! the one above. A case both sources answer is counted once
+//! ([`merge_case_sets`]).
 //!
 //! # `start` cases come from the stage journal (#9326)
 //!
@@ -56,7 +62,13 @@ use super::{
 use crate::telemetry::{SweepOutcomeRecord, SweepResult, TelemetryEnvelope, TelemetryRecord};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+pub mod pr_cases;
+pub use pr_cases::{
+    cases_from_pr_history, cases_from_pr_records, parse_pr_records, pr_case_entries, PrCaseEntries,
+    PrCaseExclusion, PrCaseRecord, PrCaseSummary, RefusedEntry,
+};
 
 /// Bucket for a record whose `repo` slug was unresolved (Issue #9442),
 /// mirroring [`super::history`]'s own sentinel.
@@ -83,6 +95,11 @@ pub struct ReplayCase {
     /// A `ready_wait` case only (#9326): the dispatch-plan inputs the
     /// tracker read at `as_of`, replayed verbatim.
     pub dispatch: Option<DispatchInput>,
+    /// Seconds already spent in `stage` at `as_of` (#10210). Every case
+    /// derived from a record replays from the stage's entry (`0`); a case
+    /// replayed mid-stage — the only kind that can outlive its history —
+    /// sets it.
+    pub age_sec: i64,
 }
 
 /// Every finish/land replay case one `sweep.outcome` record's own phase
@@ -143,6 +160,7 @@ pub fn cases_from_record(
             outcome: OutcomeKind::Finished,
             actual_at: observed_at,
             dispatch: None,
+            age_sec: 0,
         });
         if landed {
             cases.push(ReplayCase {
@@ -154,6 +172,7 @@ pub fn cases_from_record(
                 outcome: OutcomeKind::Landed,
                 actual_at: observed_at,
                 dispatch: None,
+                age_sec: 0,
             });
         }
         if stage == Stage::Doctor {
@@ -221,10 +240,80 @@ pub fn cases_from_journal(entries: &[JournalEntry]) -> Vec<ReplayCase> {
                 outcome: OutcomeKind::Started,
                 actual_at,
                 dispatch: Some(dispatch),
+                age_sec: 0,
             });
         }
     }
     cases
+}
+
+/// The identity a replay case has whichever source derived it: subject
+/// (repo, case-insensitive, and issue), kind, stage, and which entry of that
+/// stage it is — the *n*-th, by `as_of`, among the subject's cases of that
+/// kind and stage in the same set. Two sources disagree on the exact `as_of`
+/// (a sweep's is reconstructed from phase durations, the forge's is a label
+/// event), so the instant itself cannot be the key; the lap ordinal can.
+type CaseIdentity = (String, u32, Kind, Stage, usize);
+
+fn identities(cases: &[ReplayCase]) -> Vec<CaseIdentity> {
+    let mut groups: BTreeMap<(String, u32, Kind, Stage), Vec<usize>> = BTreeMap::new();
+    for (i, c) in cases.iter().enumerate() {
+        groups
+            .entry((c.subject.repo.to_ascii_lowercase(), c.subject.issue, c.kind, c.stage))
+            .or_default()
+            .push(i);
+    }
+    let mut ids = vec![(String::new(), 0, Kind::Land, Stage::ReviewWait, 0); cases.len()];
+    for ((repo, issue, kind, stage), mut members) in groups {
+        members.sort_by_key(|&i| (cases[i].as_of, i));
+        for (ordinal, i) in members.into_iter().enumerate() {
+            ids[i] = (repo.clone(), issue, kind, stage, ordinal);
+        }
+    }
+    ids
+}
+
+/// `primary` plus every `secondary` case that is not already in it (#9579).
+/// Returns the merged set and how many `secondary` cases were dropped.
+///
+/// Every `primary` case is kept as-is. `secondary` is first reduced to
+/// distinct cases (the same PR read twice — an offline file and a forge
+/// fetch — is the same case, not two), then any case whose
+/// [`CaseIdentity`] `primary` already holds is dropped: a PR merged inside a
+/// sweep is answered by both its `sweep.outcome` record and its forge
+/// timeline, and must be scored once. Genuine second laps keep distinct
+/// ordinals and so are never collapsed.
+#[must_use]
+pub fn merge_case_sets(
+    primary: Vec<ReplayCase>,
+    secondary: Vec<ReplayCase>,
+) -> (Vec<ReplayCase>, usize) {
+    let before = secondary.len();
+    let mut seen_exact = BTreeSet::new();
+    let distinct: Vec<ReplayCase> = secondary
+        .into_iter()
+        .filter(|c| {
+            seen_exact.insert((
+                c.subject.repo.to_ascii_lowercase(),
+                c.subject.issue,
+                c.subject.pr_number,
+                c.kind,
+                c.stage,
+                c.as_of,
+            ))
+        })
+        .collect();
+    let taken: BTreeSet<CaseIdentity> = identities(&primary).into_iter().collect();
+    let ids = identities(&distinct);
+    let mut merged = primary;
+    let mut added = 0_usize;
+    for (case, id) in distinct.into_iter().zip(ids) {
+        if !taken.contains(&id) {
+            merged.push(case);
+            added += 1;
+        }
+    }
+    (merged, before - added)
 }
 
 /// One dimension's aggregate: mean pinball loss, p25-p75 coverage and bias
@@ -295,7 +384,27 @@ pub struct BacktestReport {
     /// Per-horizon-bucket breakdown ([`super::score::bucket`] of the
     /// predicted `p50`).
     pub by_horizon: BTreeMap<String, Bucket>,
+    /// How far the predicted landing instant moves between consecutive
+    /// cases of one series that both answered (#10233). Diagnostic; not a gate.
+    #[serde(default)]
+    pub stability: Stability,
+    /// Interval width per bucket of the actual lead (#10233). Diagnostic;
+    /// not a gate.
+    #[serde(default)]
+    pub convergence: BTreeMap<String, Convergence>,
+    /// Ordinary estimates (`normal`) apart from residual-life tail guesses
+    /// (`tail_extrapolated`, #10210), so a tail guess never hides inside the
+    /// ordinary accuracy. Present only when some case was tail-extrapolated;
+    /// `overall` still counts every case.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_tail: BTreeMap<String, Bucket>,
 }
+
+/// `by_tail` key for an ordinary estimate (or a refusal).
+pub const TAIL_NONE: &str = "normal";
+
+/// `by_tail` key for a residual-life tail estimate (#10210).
+pub const TAIL_EXTRAPOLATED: &str = "tail_extrapolated";
 
 /// Cases [`run`] and [`compare`] accept in addition to `heuristic.kind()`:
 /// narrows the replay set the same way `eta backtest`'s own flags do.
@@ -315,6 +424,30 @@ fn matches(case: &ReplayCase, kind: Kind, filter: Filter<'_>) -> bool {
             .is_none_or(|r| case.subject.repo.eq_ignore_ascii_case(r))
 }
 
+/// The estimator input a replay case describes: its own `as_of`, its stage
+/// entered at that instant, no features.
+fn case_input(case: &ReplayCase, loom: &Provenance) -> EstimateInput {
+    EstimateInput {
+        subject: case.subject.clone(),
+        as_of: case.as_of,
+        current: CurrentState::At(CurrentStage {
+            stage: case.stage,
+            entered_at: Some(case.as_of - Duration::seconds(case.age_sec.max(0))),
+            age_sec: case.age_sec.max(0),
+            age_source: AgeSource::TrackerObserved,
+            rework_rounds: case.rework_rounds,
+            episode_entered_at: None,
+        }),
+        features: explanation::Features::default(),
+        features_omitted: Vec::new(),
+        provenance: loom.clone(),
+        dispatch: case.dispatch.clone(),
+        // No point-in-time stall state is reconstructed for a replay.
+        stalls: Vec::new(),
+        held: None,
+    }
+}
+
 /// Replay every case matching `heuristic.kind()` and `filter` against
 /// `history`, leak-free: each case's own `as_of` is what
 /// [`super::Heuristic::estimate`] sees, and history excludes anything not
@@ -331,39 +464,56 @@ pub fn run(
     filter: Filter<'_>,
     loom: &Provenance,
 ) -> BacktestReport {
-    let kind = heuristic.kind();
-    let mut scores: Vec<(ReplayCase, Score)> = Vec::new();
-    for case in cases {
-        if !matches(case, kind, filter) {
-            continue;
-        }
-        let input = EstimateInput {
-            subject: case.subject.clone(),
-            as_of: case.as_of,
-            current: CurrentState::At(CurrentStage {
-                stage: case.stage,
-                entered_at: Some(case.as_of),
-                age_sec: 0,
-                age_source: AgeSource::TrackerObserved,
-                rework_rounds: case.rework_rounds,
-            }),
-            features: explanation::Features::default(),
-            features_omitted: Vec::new(),
-            provenance: loom.clone(),
-            dispatch: case.dispatch.clone(),
-        };
-        let explanation = heuristic.estimate(&input, history);
-        let summary = EstimateSummary::of(&explanation);
-        let s = score(&summary, case.outcome, case.actual_at, &[]);
-        scores.push((case.clone(), s));
-    }
+    let replayed = replay(heuristic, history, cases, filter, loom);
+    report_of(heuristic, &replayed)
+}
 
-    let all: Vec<&Score> = scores.iter().map(|(_, s)| s).collect();
+/// Every case matching `heuristic.kind()` and `filter`, replayed and scored,
+/// in `cases` order.
+fn replay(
+    heuristic: &dyn Heuristic,
+    history: &StageSamples,
+    cases: &[ReplayCase],
+    filter: Filter<'_>,
+    loom: &Provenance,
+) -> Vec<Replayed> {
+    let kind = heuristic.kind();
+    cases
+        .iter()
+        .filter(|case| matches(case, kind, filter))
+        .map(|case| {
+            let input = case_input(case, loom);
+            let summary = EstimateSummary::of(&heuristic.estimate(&input, history));
+            let score = score(&summary, case.outcome, case.actual_at, &[]);
+            Replayed {
+                case: case.clone(),
+                summary,
+                score,
+            }
+        })
+        .collect()
+}
+
+fn report_of(heuristic: &dyn Heuristic, replayed: &[Replayed]) -> BacktestReport {
+    let kind = heuristic.kind();
+    let all: Vec<&Score> = replayed.iter().map(|r| &r.score).collect();
     let overall = bucket_of(&all);
 
     let mut by_repo_scores: BTreeMap<String, Vec<&Score>> = BTreeMap::new();
     let mut by_horizon_scores: BTreeMap<String, Vec<&Score>> = BTreeMap::new();
-    for (case, s) in &scores {
+    let mut by_tail_scores: BTreeMap<String, Vec<&Score>> = BTreeMap::new();
+    for Replayed {
+        case,
+        score: s,
+        summary,
+    } in replayed
+    {
+        let key = if summary.tail_extrapolated {
+            TAIL_EXTRAPOLATED
+        } else {
+            TAIL_NONE
+        };
+        by_tail_scores.entry(key.to_string()).or_default().push(s);
         by_repo_scores
             .entry(case.subject.repo.clone())
             .or_default()
@@ -382,6 +532,16 @@ pub fn run(
         .into_iter()
         .map(|(k, v)| (k, bucket_of(&v)))
         .collect();
+    // Only a report that has a tail-extrapolated case carries the split, so
+    // every report without one (every pre-#10210 heuristic's) is unchanged.
+    let by_tail = if by_tail_scores.contains_key(TAIL_EXTRAPOLATED) {
+        by_tail_scores
+            .into_iter()
+            .map(|(k, v)| (k, bucket_of(&v)))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
 
     BacktestReport {
         heuristic: heuristic.id().to_string(),
@@ -389,7 +549,39 @@ pub fn run(
         overall,
         by_repo,
         by_horizon,
+        stability: paired::stability_of(replayed),
+        convergence: paired::convergence_of(replayed),
+        by_tail,
     }
+}
+
+/// The calibration observations a replay of `base` over `cases` yields
+/// (#10207): one per `land` case `base` estimated, landing at the case's
+/// `actual_at` and known from that instant on.
+///
+/// This is what lets `eta backtest` score a recalibrating heuristic from the
+/// journals alone, with no live outcome log. It stays leak-free because the
+/// recalibrating heuristic fits its table at each case's own `as_of`
+/// ([`super::recalibrate::fit_table`]): a case's own landing (and every
+/// later one) is known only at or after its `actual_at`, which is never
+/// before its `as_of`, so at most it enters as a censored lower bound.
+#[must_use]
+pub fn calibration_from_replay(
+    base: &dyn Heuristic,
+    history: &StageSamples,
+    cases: &[ReplayCase],
+    loom: &Provenance,
+) -> Vec<super::recalibrate::CalibrationObservation> {
+    cases
+        .iter()
+        .filter(|case| case.kind == Kind::Land && base.kind() == Kind::Land)
+        .filter_map(|case| {
+            let input = case_input(case, loom);
+            let summary = EstimateSummary::of(&base.estimate(&input, history));
+            let s = score(&summary, case.outcome, case.actual_at, &[]);
+            super::recalibrate::CalibrationObservation::from_scored(&summary, &s, case.actual_at)
+        })
+        .collect()
 }
 
 /// A paired comparison of two heuristics on the identical replay set —
@@ -400,14 +592,27 @@ pub struct Comparison {
     pub a: BacktestReport,
     /// The second heuristic's report.
     pub b: BacktestReport,
-    /// The heuristic id with the lower `overall.mean_pinball_loss_sec`.
-    /// `None` when neither scored anything, or they tie exactly.
+    /// Both on the union of cases, every figure on its common decidable
+    /// subset, with the walk-forward daily folds (#10233).
+    #[serde(default)]
+    pub paired: Paired,
+    /// The better heuristic id on [`Self::paired`] (see
+    /// [`compare`]). `None` when neither may win, nothing was paired, or they
+    /// tie exactly.
     pub better: Option<String>,
 }
 
 /// Backtest `a` and `b` on the same `cases`/`history`/`filter`, and rank
-/// them by overall mean pinball loss — lower is better, the proper scoring
-/// rule this whole module is built on.
+/// them on the **union** of cases, counting refusals (#10233).
+///
+/// Each report's own `overall` bucket is over the cases *that* heuristic
+/// answered, so ranking on it let a heuristic that refuses the slowest cases
+/// win by refusing them. The ranking reads [`Paired`] instead: the deciding
+/// loss (`pinball4_loss_sec`, lower is better — the proper scoring rule this
+/// module is built on) over the cases both scored, and a side may win only
+/// if its answer rate over the union and its late-surprise rate do not
+/// regress on the other's (the live gate's slacks). An exact loss tie goes to
+/// the side that answered more.
 ///
 /// # Errors
 ///
@@ -429,19 +634,24 @@ pub fn compare(
             b: (b.id().to_string(), b.kind()),
         });
     }
-    let ra = run(a, history, cases, filter, loom);
-    let rb = run(b, history, cases, filter, loom);
-    let better = match (ra.overall.mean_pinball_loss_sec, rb.overall.mean_pinball_loss_sec) {
-        (Some(pa), Some(pb)) if pa < pb => Some(ra.heuristic.clone()),
-        (Some(pa), Some(pb)) if pb < pa => Some(rb.heuristic.clone()),
-        _ => None,
-    };
+    let replayed_a = replay(a, history, cases, filter, loom);
+    let replayed_b = replay(b, history, cases, filter, loom);
+    let paired = paired::paired_of(&replayed_a, &replayed_b);
+    let better =
+        paired::better_side(&paired).map(|a_wins| if a_wins { a.id() } else { b.id() }.to_string());
     Ok(Comparison {
-        a: ra,
-        b: rb,
+        a: report_of(a, &replayed_a),
+        b: report_of(b, &replayed_b),
+        paired,
         better,
     })
 }
+
+#[path = "backtest_paired.rs"]
+mod paired;
+
+use paired::Replayed;
+pub use paired::{Convergence, Fold, Paired, Stability};
 
 /// [`compare`] was asked to rank two heuristics that predict different
 /// kinds, whose replay sets do not overlap.

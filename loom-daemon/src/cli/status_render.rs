@@ -19,6 +19,9 @@ mod observability_line;
 mod operator_priority_line;
 mod peer_claims_line;
 mod pending_restart_line;
+mod roll_window_line;
+mod task_liveness_line;
+mod telemetry_banner;
 
 use loom_daemon::daemon_install_state;
 use loom_daemon::self_update;
@@ -575,6 +578,8 @@ pub(crate) fn build_status_json_value(
         },
         // Autonomous self-update loop state (#4055) — daemon-side loop status
         // (distinct from the client-side `self_update` staleness read above).
+        // Long-running task liveness (#10414): one entry per registered loop.
+        "task_liveness": report.task_liveness,
         "auto_update": {
             "enabled": report.auto_update_enabled,
             "last_check": report.auto_update_last_check,
@@ -583,6 +588,7 @@ pub(crate) fn build_status_json_value(
             "backoff_secs": report.auto_update_backoff_secs,
             "terminal_reason": report.auto_update_terminal_reason,
             "note": report.auto_update_note,
+            "roll_window": report.auto_update_roll_window,
             // Issue #7609: the release artifact the loop resolved for this
             // host's platform, next to the installed version above. `null`
             // when no artifact resolved (no Releases yet, an unreachable API,
@@ -764,7 +770,7 @@ pub(crate) fn build_status_json_value(
         value["pending_restart"] = pending_restart;
     }
     // Forge egress routing (#9984): fresh assert + the daemon's last doctor;
-    // inserted only when a policy resolves or a cached report exists.
+    // always present; unconfigured hosts carry the policy.unconfigured notice.
     let forge_egress = forge_egress_line::json();
     if !forge_egress.is_null() {
         value["forge_egress"] = forge_egress;
@@ -2221,6 +2227,18 @@ pub(crate) fn print_status_human(
         observability_line::render(report.observability_export.as_ref(), Utc::now())
     );
 
+    // The loud telemetry banner (#9950): the one-line render above is the
+    // data; when telemetry is demonstrably broken the common-tool rule says
+    // the status surface must COMPLAIN — what is broken, what it means
+    // (records accumulating locally), and what to fix — on every invocation,
+    // for as long as it lasts. The 2026-10-01 store-tunnel outage ran ~15h on
+    // accurate-but-ignorable one-liners. The host-id mismatch has its own
+    // WARNING block further up and is not duplicated here.
+    if let Some(banner) = telemetry_banner::render(report.observability_export.as_ref(), Utc::now())
+    {
+        println!("\n{banner}");
+    }
+
     // Forge event-feed consumer (ADR-0021, #8765). Same block, same reason:
     // "off", "never provisioned", "wrong key", "wrong host" and "quiet feed"
     // are five different answers that would otherwise all render as nothing.
@@ -2235,7 +2253,7 @@ pub(crate) fn print_status_human(
     // render` change this daemon's pid has not yet picked up. Nothing at all
     // once the daemon that saw the drift has restarted (or if none ever did).
     pending_restart_line::print(report.daemon_pid);
-    // Forge egress routing (#9984): nothing at all when no policy is configured.
+    // Forge egress routing (#9984): an unconfigured host prints the notice (#10168).
     forge_egress_line::print();
 
     // Watchdog protection state (#4354): this daemon is answering, so it is
@@ -2770,10 +2788,9 @@ pub(crate) fn print_status_human(
             );
         }
         println!();
-        if let Some(note) = &report.auto_update_note {
-            println!("  last tick: {note}");
-        }
+        roll_window_line::print_tail(report);
     }
+    task_liveness_line::print(&report.task_liveness);
 
     println!();
 }

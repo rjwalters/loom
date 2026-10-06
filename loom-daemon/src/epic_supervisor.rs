@@ -977,7 +977,7 @@ where
             log::info!("epic_supervisor: loop started (interval={}s)", interval.as_secs());
             while !shutdown_thread.load(Ordering::Relaxed) {
                 // Shared GitHub rate limit exhausted (#4429): skip the round.
-                if crate::rate_limit_breaker::global_is_suppressed() {
+                if crate::rate_limit_breaker::global_skip_pass("epic_supervisor") {
                     log::debug!("epic_supervisor: round skipped — rate-limit cooldown (#4429)");
                     sleep_interruptible(interval, &shutdown_thread);
                     continue;
@@ -1158,7 +1158,7 @@ pub fn spawn_multi_supervisor_thread(
                 // Shared GitHub rate limit exhausted (#4429): every
                 // supervisor's epic listing is a doomed gh call — skip the
                 // round and re-check after the interval.
-                if crate::rate_limit_breaker::global_is_suppressed() {
+                if crate::rate_limit_breaker::global_skip_pass("epic_supervisor") {
                     log::debug!("epic_supervisor: round skipped — rate-limit cooldown (#4429)");
                     sleep_interruptible(interval, &shutdown_thread);
                     continue;
@@ -1275,7 +1275,7 @@ pub mod forge {
         #[must_use]
         pub fn new() -> Self {
             Self {
-                gh_bin: PathBuf::from("gh"),
+                gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
                 repo: std::env::var("LOOM_REPO").ok(),
                 cwd: None,
             }
@@ -1290,7 +1290,7 @@ pub mod forge {
         #[must_use]
         pub fn for_root(root: &std::path::Path) -> Self {
             Self {
-                gh_bin: PathBuf::from("gh"),
+                gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
                 repo: std::env::var("LOOM_REPO").ok(),
                 cwd: Some(root.to_path_buf()),
             }

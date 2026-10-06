@@ -471,10 +471,11 @@ fi
 # TUI decision, so this section makes that decision the way an operator does —
 # it runs the shipped TUI under tmux in a throwaway container and answers the
 # prompt — rather than passing `--dangerously-bypass-hook-trust` or writing a
-# `trusted_hash` by hand. #8839 forbids both, and neither appears anywhere in
-# this script or in shipped Loom code (`spawn-codex.sh` refuses the flag,
-# asserted by defaults/scripts/tests/test-provision-codex-hooks.sh). What is
-# measured is therefore the production path exactly as it runs.
+# `trusted_hash` by hand. This section measures the RECORDED-trust path, which
+# private-clone sessions (#8839) and bare-metal profiles still rely on.
+# `spawn-codex.sh` passes the waiver only for a sealed host-mode registration
+# (#10102, defaults/docs/guardrail-parity-codex.md § "Sealed registration"),
+# never for this pinned private-control one.
 #
 # Two profiles, provisioned and registered identically, differing ONLY in the
 # answer given to that one prompt:
@@ -547,22 +548,28 @@ mkdir -p "$HOME" "$TMPDIR" /workspace/repo || exit 90
 # hooks for a real working tree, so give it one.
 git init -q -b main /workspace/repo || exit 91
 
+# Any one of several prompt texts counts: the wording is the CLI's, not ours,
+# and it is reworded between releases without the flow changing.
 await() {
-    local want="$1" i
+    local want i pane
     for i in $(seq 1 60); do
-        case "$(tmux capture-pane -p -t trust 2>/dev/null)" in
-            *"$want"*) return 0 ;;
-        esac
+        pane="$(tmux capture-pane -p -t trust 2>/dev/null)"
+        for want in "$@"; do
+            case "$pane" in
+                *"$want"*) return 0 ;;
+            esac
+        done
         sleep 1
     done
-    echo "TRUST_TIMEOUT waiting for: $want"
+    echo "TRUST_TIMEOUT waiting for: $*"
     tmux capture-pane -p -t trust 2>/dev/null
     return 1
 }
 
 tmux new-session -d -s trust -x 200 -y 50 "bash /opt/loom-engine-tui.sh" || exit 92
-# "Do you trust the contents of this directory?" — option 1 is preselected.
-await "trust the contents of this directory" || exit 93
+# The folder-trust prompt — option 1 is preselected. Codex <= 0.149 asks "Do you
+# trust the contents of this directory?"; 0.160 asks "Trust this folder?".
+await "trust the contents of this directory" "Trust this folder?" || exit 93
 tmux send-keys -t trust Enter
 # "Hooks can run outside the sandbox after you trust them." — 2 = trust all,
 # 3 = continue without trusting.
@@ -884,6 +891,143 @@ if [[ "$(engine_line "$UNTRUSTED_OUT" UNTRUSTED_FORCE_EVENT)" == "ABSENT" \
     pass "without persisted hook trust the identical session runs unhooked and the escalation reproduces"
 else
     fail "expected an untrusted hook to be skipped and the force-push to land, so the checks above are non-vacuous: $(engine_turn "$UNTRUSTED_OUT" UNTRUSTED_FORCE_BEGIN UNTRUSTED_FORCE_END)"
+fi
+
+# 13. Does a Codex tool call actually EXECUTE under the host-mode session
+# posture? (issue #9979.) Every Codex role tick in a session container used to
+# fail its first shell command with `bwrap: No permissions to create a new
+# namespace` and exit 0 having done nothing — and nothing above caught it,
+# because no check made Codex run a tool under the posture `loom-daemon
+# accounts session start` actually creates. Codex's own sandbox is bubblewrap,
+# which needs an unprivileged user namespace that Docker's default seccomp
+# (and Ubuntu's AppArmor userns restriction) deny; the operator ruled that the
+# container is the boundary, so spawn-codex.sh runs `-s danger-full-access` in
+# a session container. This drives the REAL `codex exec` through one scripted
+# tool call, under exactly the flags session_lifecycle.rs's
+# `host_session_run_args` passes (non-root, `--cap-drop ALL`,
+# `no-new-privileges`, Docker's default seccomp/AppArmor, a path-parity
+# workspace mount), and asserts the command ran.
+#
+# Credential-free and hermetic, like section 12: `--network none`, a loopback
+# provider that emits one exec_command and a final message, a throwaway
+# profile mounted at the session's CODEX_HOME with its three hook-control files
+# (hooks.json, config.toml, loom-codex-hooks.json) bound READ-ONLY over their
+# own paths, exactly as `host_session_run_args` binds them — so this also
+# proves the pinned CLI runs with them frozen (it writes its state databases,
+# migrations and session files into the profile directory around them), and
+# that the model cannot rewrite, remove, rename or replace them. The bwrap-dependent `workspace-write` mode is driven too, as a
+# recorded observation rather than an assertion — it is expected NOT to run on
+# Docker's defaults, and a host where it does has a userns-capable profile.
+HOSTMODE_DIR=$(mktemp -d)
+mkdir -p "$HOSTMODE_DIR/ws" "$HOSTMODE_DIR/profile"
+chmod 777 "$HOSTMODE_DIR/ws" "$HOSTMODE_DIR/profile"
+printf '{"hooks":{}}\n' > "$HOSTMODE_DIR/profile/hooks.json"
+printf '[projects."/elsewhere"]\ntrust_level = "trusted"\n' > "$HOSTMODE_DIR/profile/config.toml"
+printf '{}\n' > "$HOSTMODE_DIR/profile/loom-codex-hooks.json"
+chmod 644 "$HOSTMODE_DIR/profile/"*
+hostmode_controls() { (cd "$HOSTMODE_DIR/profile" && cat hooks.json config.toml loom-codex-hooks.json | cksum); }
+HOSTMODE_CONTROLS_BEFORE=$(hostmode_controls)
+HOSTMODE_MOUNTS=(-v "$HOSTMODE_DIR/profile:/home/loom/.codex-profile")
+for control in hooks.json config.toml loom-codex-hooks.json; do
+    HOSTMODE_MOUNTS+=(--mount "type=bind,src=$HOSTMODE_DIR/profile/$control,dst=/home/loom/.codex-profile/$control,readonly")
+done
+cleanup_hostmode() { rm -rf "$HOSTMODE_DIR" 2>/dev/null || true; }
+trap 'cleanup; cleanup_protected; cleanup_engine; cleanup_hostmode' EXIT
+
+cat > "$HOSTMODE_DIR/probe.sh" <<'HOSTMODE_PROBE'
+set -u
+WS="$1"
+export HOME=/tmp/home CODEX_HOME=/home/loom/.codex-profile TMPDIR=/tmp
+export FIXTURE_KEY=synthetic-not-a-credential
+mkdir -p "$HOME" "$CODEX_HOME" || exit 90
+git init -q -b main "$WS/repo" || exit 91
+cat > "$TMPDIR/provider.js" <<'PROVIDER'
+const http = require('http');
+const command = process.env.FIXTURE_COMMAND;
+const usage = {input_tokens: 1, output_tokens: 1, total_tokens: 2};
+function sse(res, events) {
+  res.writeHead(200, {'Content-Type': 'text/event-stream'});
+  for (const event of events) {
+    res.write('event: ' + event.type + '\ndata: ' + JSON.stringify(event) + '\n\n');
+  }
+  res.end();
+}
+http.createServer((req, res) => {
+  let body = '';
+  req.on('data', (chunk) => { body += chunk; });
+  req.on('end', () => {
+    const first = !body.includes('function_call_output');
+    sse(res, [
+      {type: 'response.created', response: {id: 'r', status: 'in_progress'}},
+      {type: 'response.output_item.done', output_index: 0, item: first
+        ? {type: 'function_call', id: 'fc1', call_id: 'call_1', name: 'exec_command',
+           arguments: JSON.stringify({cmd: command})}
+        : {type: 'message', id: 'm2', role: 'assistant', status: 'completed',
+           content: [{type: 'output_text', text: 'FIXTURE-TURN-DONE'}]}},
+      {type: 'response.completed', response: {id: 'r', status: 'completed', output: [], usage}},
+    ]);
+  });
+}).listen(8099, '127.0.0.1');
+PROVIDER
+turn() {
+    local mode="$1" marker="$2" provider i
+    FIXTURE_COMMAND="printf ran > $WS/repo/$marker" node "$TMPDIR/provider.js" &
+    provider=$!
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        (exec 3<>/dev/tcp/127.0.0.1/8099) 2>/dev/null && break
+        sleep 1
+    done
+    codex exec \
+        -c model=fixture-model \
+        -c model_provider=fixture \
+        -c 'model_providers.fixture={name="fixture",base_url="http://127.0.0.1:8099/v1",env_key="FIXTURE_KEY",wire_api="responses",request_max_retries=0,stream_max_retries=0}' \
+        -C "$WS/repo" -s "$mode" "run the requested command" </dev/null >"$TMPDIR/$marker.log" 2>&1
+    kill "$provider" 2>/dev/null
+    wait "$provider" 2>/dev/null
+    echo "MARKER_$marker $(cat "$WS/repo/$marker" 2>/dev/null || echo ABSENT)"
+    echo "BWRAP_$marker $(grep -c 'bwrap:' "$TMPDIR/$marker.log" 2>/dev/null || echo 0)"
+}
+turn danger-full-access full
+turn workspace-write sandboxed
+for control in hooks.json config.toml loom-codex-hooks.json; do
+    f="$CODEX_HOME/$control"
+    if (printf x >> "$f") 2>/dev/null || rm -f "$f" 2>/dev/null \
+        || mv "$f" "$f.moved" 2>/dev/null || ln -sf /tmp/x "$f" 2>/dev/null; then
+        echo "CONTROL_$control mutable"
+    else
+        echo "CONTROL_$control frozen"
+    fi
+done
+if (printf ok > "$CODEX_HOME/auth-sibling-probe") 2>/dev/null; then echo "SIBLING writable"; else echo "SIBLING frozen"; fi
+HOSTMODE_PROBE
+chmod 644 "$HOSTMODE_DIR/probe.sh"
+
+HOSTMODE_OUT=$(docker run --rm --network none --user "$PROBE_USER" \
+    --cap-drop ALL --security-opt no-new-privileges \
+    -v "$HOSTMODE_DIR/ws:$HOSTMODE_DIR/ws" "${HOSTMODE_MOUNTS[@]}" \
+    --mount "type=bind,src=$HOSTMODE_DIR/probe.sh,dst=/opt/loom-hostmode-probe.sh,readonly" \
+    --entrypoint bash "$IMAGE" -lc "bash /opt/loom-hostmode-probe.sh $HOSTMODE_DIR/ws" 2>&1)
+if [[ "$(engine_line "$HOSTMODE_OUT" MARKER_full)" == "ran" ]]; then
+    pass "under the host-mode session posture, codex exec -s danger-full-access executes its tool call (#9979)"
+else
+    fail "codex exec -s danger-full-access did not execute a tool call under the session posture (role ticks would no-op, #9979): $HOSTMODE_OUT"
+fi
+for control in hooks.json config.toml loom-codex-hooks.json; do
+    if [[ "$(engine_line "$HOSTMODE_OUT" "CONTROL_$control")" == "frozen" ]]; then
+        pass "host-mode session: $control is a read-only mount point (no write, unlink, rename or symlink-over)"
+    else
+        fail "host-mode session: $control is mutable from inside the container, so a session could void the next one's hook: $HOSTMODE_OUT"
+    fi
+done
+if [[ "$(engine_line "$HOSTMODE_OUT" SIBLING)" == "writable" && "$(hostmode_controls)" == "$HOSTMODE_CONTROLS_BEFORE" ]]; then
+    pass "host-mode session: the rest of the profile stays writable (auth refresh) and the controls are byte-identical after a Codex turn"
+else
+    fail "host-mode session: expected a writable profile directory around unchanged controls: $HOSTMODE_OUT"
+fi
+if [[ "$(engine_line "$HOSTMODE_OUT" MARKER_sandboxed)" == "ran" ]]; then
+    echo "INFO: codex's own workspace-write sandbox also ran here — this Docker host permits unprivileged user namespaces"
+else
+    echo "INFO: codex's own workspace-write sandbox cannot run under this posture (bwrap lines: $(engine_line "$HOSTMODE_OUT" BWRAP_sandboxed)) — why spawn-codex.sh runs danger-full-access in a session container"
 fi
 
 echo "== $FAILURES failure(s) =="

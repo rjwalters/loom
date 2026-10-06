@@ -90,8 +90,9 @@ pub struct QueueSnapshotRow {
     pub detail: Option<String>,
     /// The dispatch-plan fields (Issue #9288), flattened beside `rank`:
     /// `position`, `plan_state`, `keys`, `gate`, `in_slice`, `hot`,
-    /// `owning_shard`, `repo_cap`. The `keys` names are the six
-    /// `candidate_keys` (#9244): `operator_priority`, `operator_priority_at`,
+    /// `owning_shard`, `repo_cap`. The `keys` names are the seven
+    /// `candidate_keys` (#9244, #10307): `operator_priority_level`,
+    /// `operator_priority`, `operator_priority_at`,
     /// `main_red_fix`, `workspace_priority`, `created_at`, `number` (this
     /// row's `issue`). `main_red_fix` and `number` are not otherwise
     /// `QueueSnapshotRow` fields, so `keys` is the only place they appear.

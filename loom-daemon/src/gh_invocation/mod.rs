@@ -3,7 +3,7 @@
 //!
 //! # Why
 //!
-//! `loom-daemon` grew ten hand-rolled `fn gh_bin*` resolvers and well over a
+//! `loom-daemon` grew ten hand-rolled `gh_bin*` resolver functions and well over a
 //! hundred raw `Command::new(gh…)` sites, each deciding for itself whether to
 //! honour `LOOM_GH_BIN`, whether to scope `GH_CONFIG_DIR`, whether to export a
 //! trace context. Nobody can answer "does every daemon `gh` call route the same
@@ -12,7 +12,7 @@
 //! # What lands in slice 1
 //!
 //! - [`resolver`] — the single executable resolver (policy launcher →
-//!   `LOOM_GH_BIN` → `PATH`). `forge_cmd::gh_bin()` delegates to it.
+//!   `LOOM_GH_BIN` → `PATH`). `forge_cmd::gh_bin` re-exports it.
 //! - [`GhInvocation`] — the facade every site will build through: typed
 //!   [`GhTarget`], [`AccessIntent`], a stable [`Operation`] name, a
 //!   [`ParentContext`], and an [`OutputContract`]. It **owns execution**
@@ -27,13 +27,26 @@
 //! - [`GhInvocation::run`] (slice 3) — the `cmd_out::CmdOutcome` bridge, so
 //!   a migrated `run_command` site keeps its exact result classification.
 //!
+//! - [`accounting`] (#10089) — every execution that reached `gh` is one row
+//!   in [`crate::forge_call_stats`], keyed by its [`Operation`], so
+//!   `loom-daemon status` and the breaker's own-versus-external line count it.
+//!
+//! - [`reader_route`] (#9872) — a captured, repo-scoped [`AccessIntent::Read`]
+//!   runs under the repo's reader App when one is configured and fresh, with
+//!   one writer retry on a credential failure; every row records the identity
+//!   role (`reader` / `writer` / `writer-fallback`).
+//!
 //! `gh-cached` substitution for reads, the async/tokio variant and the Gitea
 //! decline move in with the slices that first need them (see #9985's slicing
 //! plan).
 
+pub mod accounting;
+pub mod api_kind;
 mod outcome;
+mod reader_route;
 pub mod resolver;
 pub mod telemetry;
+pub mod transparent;
 
 #[cfg(test)]
 mod tests;
@@ -207,6 +220,12 @@ pub enum OutputContract {
     Captured { timeout: Duration },
     /// Inherit stdio and wait (the `forge_cmd::gh_passthrough` shape).
     Passthrough,
+    /// A git credential helper (`gh auth git-credential …`): stdin fed from
+    /// the buffer given to [`GhInvocation::credential_helper`], stdout
+    /// inherited (it is git's answer), stderr discarded, no deadline.
+    /// Completes as [`GhCompletion::Passthrough`]; the credential never
+    /// passes through the facade's captured output, telemetry or accounting.
+    CredentialHelper,
 }
 
 /// What [`GhInvocation::execute`] observed, per [`OutputContract`].
@@ -214,9 +233,21 @@ pub enum OutputContract {
 pub enum GhCompletion {
     /// A [`OutputContract::Captured`] run; exit vs timeout stay distinct.
     Captured(Completion),
-    /// A [`OutputContract::Passthrough`] run's exit status.
+    /// A [`OutputContract::Passthrough`] or
+    /// [`OutputContract::CredentialHelper`] run's exit status.
     Passthrough(ExitStatus),
 }
+
+/// The environment variables `gh` documents as taking precedence over a
+/// `GH_CONFIG_DIR`'s stored credential. [`GhInvocation::without_token_env`]
+/// removes every one, so a reader-only call cannot silently spend a token the
+/// daemon's own environment happens to carry (#10263).
+pub const TOKEN_ENV_VARS: [&str; 4] = [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+];
 
 /// One environment change the facade applies to the child: `Some` sets the
 /// variable, `None` removes it.
@@ -236,6 +267,22 @@ pub struct GhInvocation {
     contract: OutputContract,
     args: Vec<OsString>,
     cwd: Option<PathBuf>,
+    program: Option<String>,
+    config_dir: Option<PathBuf>,
+    /// An explicit child `PATH` ([`GhInvocation::child_path`]).
+    path: Option<OsString>,
+    /// Remove [`TOKEN_ENV_VARS`] from the child (#10263).
+    strip_token_env: bool,
+    /// The [`OutputContract::CredentialHelper`] request written to stdin.
+    stdin_input: Vec<u8>,
+    /// Never route this read to a reader App (#9872).
+    writer_only: bool,
+    /// The identity role the accounting row records; `None` = writer.
+    role: Option<crate::forge_identity::IdentityRole>,
+    /// The #9777 call identity this execution is accounted under (#9831).
+    /// Empty by default: an unmapped site records `operation = "unknown"`
+    /// (see [`accounting`]), visible rather than absent.
+    identity: crate::forge_call_stats::CallIdentity,
 }
 
 impl GhInvocation {
@@ -257,7 +304,44 @@ impl GhInvocation {
             contract: OutputContract::Captured { timeout },
             args: Vec::new(),
             cwd: None,
+            program: None,
+            config_dir: None,
+            path: None,
+            strip_token_env: false,
+            stdin_input: Vec::new(),
+            writer_only: false,
+            role: None,
+            identity: crate::forge_call_stats::CallIdentity::default(),
         }
+    }
+
+    /// Account this execution under an inventoried forge operation (#9831).
+    /// [`Operation`] is the low-cardinality *telemetry* name; this is the
+    /// inventory row (`defaults/forge/operations/*.toml`) the call serves.
+    #[must_use]
+    pub fn forge_op(mut self, op: crate::forge_call_stats::ForgeOp) -> Self {
+        self.identity.operation = crate::forge_call_stats::CallIdentity::for_op(op).operation;
+        self
+    }
+
+    /// The origin host and `owner/repo` the call acts on, for accounting only
+    /// — they change nothing about how the child runs. For a site whose
+    /// [`GhTarget`] is deliberately [`GhTarget::None`] (the credential must
+    /// stay the working directory's) but which still knows its repository.
+    /// `origin` and `repo` stay separate fields: merging them is exactly what
+    /// lets two forges sharing one slug collapse into one row.
+    #[must_use]
+    pub fn identity_scope(mut self, origin: Option<&str>, repo: Option<&str>) -> Self {
+        let id = std::mem::take(&mut self.identity);
+        let id = match origin {
+            Some(o) => id.with_origin(o),
+            None => id,
+        };
+        self.identity = match repo {
+            Some(r) => id.with_repo(r),
+            None => id,
+        };
+        self
     }
 
     /// Append `gh` arguments (the subcommand onward; never the program).
@@ -272,10 +356,77 @@ impl GhInvocation {
         self
     }
 
+    /// Append one `gh` argument; see [`GhInvocation::args`].
+    #[must_use]
+    pub fn arg(self, arg: impl AsRef<OsStr>) -> Self {
+        self.args([arg])
+    }
+
     /// Run in `dir`. Also keys the cross-owner `GH_CONFIG_DIR` lookup.
     #[must_use]
     pub fn current_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.cwd = Some(dir.as_ref().to_path_buf());
+        self
+    }
+
+    /// Pin the executable to a caller-injected program — the seam for sites
+    /// that hand a `gh_bin: &Path` down their call chain so tests can pass a
+    /// stub. A bare `gh` is "not injected": it goes through the [`resolver`]
+    /// like every other invocation, so production keeps the policy →
+    /// `LOOM_GH_BIN` → `PATH` ladder.
+    #[must_use]
+    pub fn program(mut self, program: impl AsRef<OsStr>) -> Self {
+        let program = program.as_ref().to_string_lossy();
+        self.program = (program != "gh").then(|| program.into_owned());
+        self
+    }
+
+    /// Run under an explicit `GH_CONFIG_DIR` — a credential the caller chose
+    /// itself (a repo's reader App, a store's writer App, #9537) — instead of
+    /// the facade's working-directory / owner lookup. `None` keeps the lookup.
+    #[must_use]
+    pub fn gh_config_dir(mut self, dir: Option<&Path>) -> Self {
+        self.config_dir = dir.map(Path::to_path_buf);
+        self
+    }
+
+    /// Give the child an explicit `PATH` (#10089) — for a site that cannot
+    /// rely on the daemon's inherited one (`fleet::drain`'s claim resets under
+    /// launchd/systemd, #4831). It also steers the lookup of a bare `gh`
+    /// program, exactly as `Command::env("PATH", …)` did at the raw site.
+    #[must_use]
+    pub fn child_path(mut self, path: impl Into<OsString>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    /// Remove every [`TOKEN_ENV_VARS`] entry from the child's environment, so
+    /// the `GH_CONFIG_DIR` this invocation runs under is the **only**
+    /// credential `gh` can see. For a reader-only read (#10263): `gh` prefers
+    /// an env token over a stored one, so without this a daemon started from
+    /// a shell holding the operator's PAT would spend that PAT on a call the
+    /// caller believes runs as a reader App.
+    #[must_use]
+    pub fn without_token_env(mut self) -> Self {
+        self.strip_token_env = true;
+        self
+    }
+
+    /// Keep this read on the writer credential (#9872): for a read whose
+    /// answer depends on **who** asks — a permission or write-scope probe,
+    /// `viewer`, `/user` — which a reader App would answer for itself.
+    #[must_use]
+    pub fn writer_identity(mut self) -> Self {
+        self.writer_only = true;
+        self
+    }
+
+    /// Record this execution under `role` (#9872) — for a caller that routes
+    /// its own reads (`forge_etag_store`, `ci_telemetry`). The choke point's
+    /// own routing sets it itself.
+    #[must_use]
+    pub fn identity_role(mut self, role: crate::forge_identity::IdentityRole) -> Self {
+        self.role = Some(role);
         self
     }
 
@@ -289,6 +440,15 @@ impl GhInvocation {
     #[must_use]
     pub fn passthrough(mut self) -> Self {
         self.contract = OutputContract::Passthrough;
+        self
+    }
+
+    /// Run as a git credential helper ([`OutputContract::CredentialHelper`]),
+    /// writing `request` to the child's stdin.
+    #[must_use]
+    pub fn credential_helper(mut self, request: impl Into<Vec<u8>>) -> Self {
+        self.contract = OutputContract::CredentialHelper;
+        self.stdin_input = request.into();
         self
     }
 
@@ -320,7 +480,8 @@ impl GhInvocation {
     /// The environment the child receives, in application order, when its
     /// `traceparent` is `child_context` (see [`telemetry::InvocationSpan`]).
     ///
-    /// - `GH_CONFIG_DIR`: the cross-owner credential registered for the
+    /// - `GH_CONFIG_DIR`: the explicit [`GhInvocation::gh_config_dir`], else
+    ///   the cross-owner credential registered for the
     ///   working directory, else for the target's owner (the
     ///   `credential_preflight::apply_gh_config_for_{root,owner_slug}`
     ///   lookups). Absent ⇒ the child inherits the process-global value.
@@ -330,6 +491,8 @@ impl GhInvocation {
     ///   `child_context` — the invocation's own span when it is exported, so
     ///   the managed launcher (C4) parents its HTTP spans under it — or both
     ///   removed when there is none.
+    /// - [`TOKEN_ENV_VARS`]: removed, only under
+    ///   [`GhInvocation::without_token_env`].
     #[must_use]
     pub fn env_plan(&self, child_context: Option<&TraceContext>) -> Vec<EnvEntry> {
         self.env_plan_with(std::env::var_os("LOOM_REPO"), child_context)
@@ -343,9 +506,13 @@ impl GhInvocation {
         let mut plan = Vec::new();
         let slug = self.target.slug();
         let config_dir = self
-            .cwd
-            .as_deref()
-            .and_then(crate::credential_preflight::gh_config_dir_for_root)
+            .config_dir
+            .clone()
+            .or_else(|| {
+                self.cwd
+                    .as_deref()
+                    .and_then(crate::credential_preflight::gh_config_dir_for_root)
+            })
             .or_else(|| {
                 slug.as_deref()
                     .and_then(crate::credential_preflight::gh_config_dir_for_owner_slug)
@@ -367,6 +534,17 @@ impl GhInvocation {
             plan.push(EnvEntry {
                 key,
                 value: traceparent.clone(),
+            });
+        }
+        if self.strip_token_env {
+            for key in TOKEN_ENV_VARS {
+                plan.push(EnvEntry { key, value: None });
+            }
+        }
+        if let Some(path) = &self.path {
+            plan.push(EnvEntry {
+                key: "PATH",
+                value: Some(path.clone()),
             });
         }
         plan
@@ -392,12 +570,27 @@ impl GhInvocation {
     /// under its [`OutputContract`], recording one `invoke github` span (and,
     /// unless it succeeded, a local completion record — [`telemetry`]).
     ///
+    /// An eligible read runs under the repo's reader App first and is retried
+    /// once on the writer after a credential failure ([`reader_route`]); each
+    /// attempt is its own span and accounting row.
+    ///
     /// # Errors
     ///
     /// [`ExecError::Spawn`] when `gh` could not be started;
     /// [`ExecError::Collect`] when it started but its result could not be
     /// collected (side effects may have happened — never retry a write on it).
     pub fn execute(self) -> Result<GhCompletion, ExecError> {
+        self.execute_routed(
+            &|slug, host| crate::forge_identity::read_credential(slug, host),
+            &reader_route::withdraw_reader,
+        )
+    }
+
+    /// Run exactly once under the credential already chosen (no routing).
+    fn execute_direct(self) -> Result<GhCompletion, ExecError> {
+        if let Some(program) = self.program.clone() {
+            return self.execute_with(&program, GhBinSource::Injected);
+        }
         let resolved = resolver::resolve();
         self.execute_with(&resolved.program, resolved.source)
     }
@@ -410,6 +603,12 @@ impl GhInvocation {
                 cmd.stdin(Stdio::null());
                 let result = proc_exec::run_bounded(cmd, timeout);
                 let (outcome, code) = telemetry::classify_captured(&result);
+                let captured = match &result {
+                    Ok(Completion::Exited(out)) => Some((&out.stdout[..], &out.stderr[..])),
+                    Ok(Completion::TimedOut { stdout, stderr }) => Some((&stdout[..], &stderr[..])),
+                    Err(_) => None,
+                };
+                accounting::record(&self, outcome, captured);
                 span.finish(&self, source, outcome, code);
                 result.map(GhCompletion::Captured)
             }
@@ -422,9 +621,48 @@ impl GhInvocation {
                     .map_err(ExecError::Spawn)
                     .and_then(|mut child| child.wait().map_err(ExecError::Collect));
                 let (outcome, code) = telemetry::classify_passthrough(&result);
+                accounting::record(&self, outcome, None);
+                span.finish(&self, source, outcome, code);
+                result.map(GhCompletion::Passthrough)
+            }
+            OutputContract::CredentialHelper => {
+                cmd.stdin(Stdio::piped())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::null());
+                let result = cmd.spawn().map_err(ExecError::Spawn).and_then(|mut child| {
+                    // Always reap the child, even when the request could not
+                    // be written (it exited early, closing the pipe).
+                    let written = child.stdin.take().map_or(Ok(()), |mut stdin| {
+                        std::io::Write::write_all(&mut stdin, &self.stdin_input)
+                    });
+                    let status = child.wait().map_err(ExecError::Collect)?;
+                    written.map_err(ExecError::Collect).map(|()| status)
+                });
+                let (outcome, code) = telemetry::classify_passthrough(&result);
+                accounting::record(&self, outcome, None);
                 span.finish(&self, source, outcome, code);
                 result.map(GhCompletion::Passthrough)
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "migrated_sites_tests.rs"]
+mod migrated_sites_tests;
+
+#[cfg(test)]
+#[path = "rest_readers_tests.rs"]
+mod rest_readers_tests;
+
+#[cfg(test)]
+#[path = "migrated_sites_tests_b.rs"]
+mod migrated_sites_tests_b;
+
+#[cfg(test)]
+#[path = "migrated_sites_tests_c.rs"]
+mod migrated_sites_tests_c;
+
+#[cfg(test)]
+#[path = "migrated_sites_tests_d.rs"]
+mod migrated_sites_tests_d;

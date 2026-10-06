@@ -40,7 +40,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::version_policy::{evaluate, Inputs, Verdict};
+use loom_daemon::merge_pr::version_policy::{evaluate, invalid_ref_message, Inputs, Verdict};
 
 #[derive(clap::Args)]
 pub(crate) struct VersionPolicyArgs {
@@ -101,6 +101,14 @@ impl VersionPolicyArgs {
             Verdict::Pass => Ok(()),
             Verdict::Block(msg) => {
                 print!("{}", render("BLOCK", &msg));
+                std::process::exit(1);
+            }
+            // #9106/#9479. A refusal, not a guard fault, so it takes the
+            // BLOCK channel rather than the WARNING one even under
+            // `--dry-run`: the name was never handed to git, so there is no
+            // comparison to report and nothing to preview.
+            Verdict::InvalidRef(e) => {
+                print!("{}", render("BLOCK", &invalid_ref_message(&self.pr, &e)));
                 std::process::exit(1);
             }
         }

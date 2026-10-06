@@ -842,3 +842,178 @@ fn a_registered_workspace_404_forces_one_refresh_and_retries_successfully() {
 // per-caller accounting of both outcomes (#9251).
 #[path = "forge_listing_persist_tests.rs"]
 mod persist;
+
+// ===== list_issues_cached_all_as (#10389) =====
+
+/// A `gh` stub that logs each call's argv to `calls.log`. A `&page=N` request
+/// fails when `fail<N>` exists, else answers `200` with `pages.json`. The
+/// plain URL (page 1) answers `304` to `If-None-Match: W/"<etag1>"` (`p1`
+/// unless `etag1` exists), else `200` + that ETag with `p1.json`. When
+/// `shift` exists, the `&page=2` request first swaps page 1 for `p1b.json`
+/// under ETag `p1b` (a mid-walk change).
+fn paging_stub(dir: &Path) -> PathBuf {
+    let path = dir.join("fake-gh-pages.sh");
+    std::fs::write(
+        &path,
+        format!(
+            r#"#!/bin/sh
+d={dir}
+echo "$*" >> "$d/calls.log"
+case "$*" in
+  *'&page='*)
+    n=$(echo "$*" | sed 's/.*&page=\([0-9]*\).*/\1/')
+    if [ -f "$d/fail$n" ]; then echo 'gh: Server Error (HTTP 502)' 1>&2; exit 1; fi
+    if [ "$n" = 2 ] && [ -f "$d/shift" ]; then cp "$d/p1b.json" "$d/p1.json"; echo p1b > "$d/etag1"; fi
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"pn"\r\n\r\n'
+    cat "$d/pages.json" ;;
+  *)
+    e=p1; [ -f "$d/etag1" ] && e=$(cat "$d/etag1")
+    case "$*" in
+      *"If-None-Match: W/\"$e\""*)
+        printf 'HTTP/2.0 304 Not Modified\r\n\r\n'
+        echo 'gh: Not Modified (HTTP 304)' 1>&2
+        exit 1 ;;
+    esac
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"%s"\r\n\r\n' "$e"
+    cat "$d/p1.json" ;;
+esac
+"#,
+            dir = dir.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+fn page_json(numbers: std::ops::Range<u32>) -> String {
+    let rows: Vec<String> = numbers
+        .map(|n| format!(r#"{{"number": {n}, "state": "open", "labels": []}}"#))
+        .collect();
+    format!("[{}]\n", rows.join(","))
+}
+
+fn calls(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("calls.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// More than one page of starred items (rjwalters/loom has 105): the walk
+/// returns all of them, and its page 1 is the single-page listing's own
+/// cache entry, revalidated with that entry's ETag.
+#[test]
+fn the_paged_listing_reads_past_page_one_through_the_same_cache_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/paged-{}", std::process::id());
+    std::fs::write(dir.path().join("p1.json"), page_json(1..101)).unwrap();
+    std::fs::write(dir.path().join("pages.json"), page_json(101..106)).unwrap();
+    let gh = paging_stub(dir.path());
+    let label = "loom:operator-priority";
+
+    // The single-page listing sees only page 1 and caches it under W/"p1".
+    let single = list_issues_cached_as("t", &gh, Some(dir.path()), Some(&repo), label, "open");
+    assert_eq!(single.unwrap().len(), PER_PAGE);
+
+    let all =
+        list_issues_cached_all_as("t", &gh, Some(dir.path()), Some(&repo), label, "open").unwrap();
+    let numbers: Vec<u32> = all.iter().map(|i| i.number).collect();
+    assert_eq!(numbers, (1..106).collect::<Vec<_>>());
+
+    let calls = calls(dir.path());
+    // Single-listing read, page 1, page 2, then the page 1 revalidation.
+    assert_eq!(calls.len(), 4, "{calls:?}");
+    assert!(!calls[3].contains("&page="), "{calls:?}");
+    assert!(calls[3].contains(r#"If-None-Match: W/"p1""#), "{calls:?}");
+    let plain = build_issues_url(Some(&repo), label, "open");
+    // Page 1: the unchanged URL, presenting the single listing's ETag (so the
+    // same cache key), answered from the cache by a 304.
+    assert!(calls[1].contains(&plain), "{calls:?}");
+    assert!(!calls[1].contains("&page="), "{calls:?}");
+    assert!(calls[1].contains(r#"If-None-Match: W/"p1""#), "{calls:?}");
+    assert!(calls[2].contains(&format!("{plain}&page=2")), "{calls:?}");
+}
+
+/// An incomplete walk is an error, never a partial set: a later page
+/// failing, or every page up to [`MAX_PAGES`] full.
+#[test]
+fn an_incomplete_paged_listing_is_an_error_never_a_partial_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/paged-incomplete-{}", std::process::id());
+    std::fs::write(dir.path().join("p1.json"), page_json(1..101)).unwrap();
+    std::fs::write(dir.path().join("pages.json"), page_json(101..201)).unwrap();
+    let gh = paging_stub(dir.path());
+    let walk = || list_issues_cached_all_as("t", &gh, Some(dir.path()), Some(&repo), "x", "open");
+
+    std::fs::write(dir.path().join("fail3"), "").unwrap();
+    let err = walk().unwrap_err();
+    assert!(format!("{err:#}").contains("HTTP 502"), "{err:#}");
+
+    std::fs::remove_file(dir.path().join("fail3")).unwrap();
+    let before = calls(dir.path()).len();
+    let err = walk().unwrap_err();
+    assert!(format!("{err:#}").contains("incomplete"), "{err:#}");
+    assert_eq!(calls(dir.path()).len() - before, MAX_PAGES as usize);
+
+    // A short page 1 is the whole set, in one request.
+    std::fs::write(dir.path().join("p1.json"), page_json(1..4)).unwrap();
+    let other = format!("{repo}-short");
+    let all = list_issues_cached_all_as("t", &gh, Some(dir.path()), Some(&other), "x", "open");
+    assert_eq!(all.unwrap().len(), 3);
+}
+
+/// A stable multi-page walk returns everything; the only extra request is the
+/// conditional re-read of page 1 (a `304`).
+#[test]
+fn a_stable_multi_page_walk_revalidates_earlier_pages_and_returns_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/paged-stable-{}", std::process::id());
+    std::fs::write(dir.path().join("p1.json"), page_json(1..101)).unwrap();
+    std::fs::write(dir.path().join("pages.json"), page_json(101..106)).unwrap();
+    let gh = paging_stub(dir.path());
+    // Prime page 1's ETag so the revalidation is a 304.
+    list_issues_cached_as("t", &gh, Some(dir.path()), Some(&repo), "x", "open").unwrap();
+    let before = calls(dir.path()).len();
+    let all =
+        list_issues_cached_all_as("t", &gh, Some(dir.path()), Some(&repo), "x", "open").unwrap();
+    assert_eq!(all.len(), 105);
+    let c = calls(dir.path());
+    assert_eq!(c.len() - before, 3, "page 1, page 2, page 1 again: {c:?}");
+    assert!(c[c.len() - 1].contains(r#"If-None-Match: W/"p1""#), "{c:?}");
+}
+
+/// Page 1 changing between the page 1 and page 2 reads (an item unstarred, so
+/// the old first item of page 2 shifts up) is an error, not a set missing it.
+#[test]
+fn a_page_that_changes_mid_walk_is_an_error_not_a_set_missing_the_shifted_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/paged-shift-{}", std::process::id());
+    std::fs::write(dir.path().join("p1.json"), page_json(1..101)).unwrap();
+    // Item 1 leaves page 1 and item 101 moves up into it.
+    std::fs::write(dir.path().join("p1b.json"), page_json(2..102)).unwrap();
+    std::fs::write(dir.path().join("pages.json"), page_json(102..106)).unwrap();
+    std::fs::write(dir.path().join("shift"), "").unwrap();
+    let gh = paging_stub(dir.path());
+    let err = list_issues_cached_all_as("t", &gh, Some(dir.path()), Some(&repo), "x", "open")
+        .expect_err("a walk whose page 1 moved mid-walk is inconsistent");
+    assert!(format!("{err:#}").contains("changed mid-walk"), "{err:#}");
+}
+
+/// A single-page walk makes exactly one request: no revalidation.
+#[test]
+fn a_single_page_walk_makes_no_extra_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = format!("test-owner/paged-single-{}", std::process::id());
+    std::fs::write(dir.path().join("p1.json"), page_json(1..4)).unwrap();
+    let gh = paging_stub(dir.path());
+    let all =
+        list_issues_cached_all_as("t", &gh, Some(dir.path()), Some(&repo), "x", "open").unwrap();
+    assert_eq!(all.len(), 3);
+    assert_eq!(calls(dir.path()).len(), 1);
+}

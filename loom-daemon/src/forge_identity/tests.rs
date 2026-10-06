@@ -329,8 +329,20 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         "forge_identity.rs",
         "forge_identity/tests.rs",
         "forge_etag_store.rs", // issue listings + cached views (GET, conditional)
+        // #10263: the ETA fleet refresh's repo set — issue listings and PR
+        // timelines, GETs only, through `fetch_with_reader`.
+        "observability/eta_fleet_refresh.rs",
         "ci_telemetry/api.rs", // repos/<o>/<r>/actions/... GETs
         "fleet_store/gh.rs",   // fleet-config: commit/tree/blob GETs (`--method GET`)
+        // #9872: the `GhInvocation` choke point. Only `AccessIntent::Read` +
+        // `Captured` + an explicit repo target, never `.writer_identity()`
+        // (`reader_route::reader_slug` is the gate, `reader_route_tests`
+        // pins it).
+        "gh_invocation/mod.rs",
+        "gh_invocation/reader_route.rs",
+        // #10391: `eta doctor` resolves (never uses) a reader per repo to say
+        // whether one exists; it makes no forge call at all.
+        "eta/doctor_facts.rs",
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let re = regex::Regex::new(r"\b(read_credential|read_credential_in|apply_read_credential)\b")

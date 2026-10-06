@@ -133,7 +133,8 @@ pub fn ci_main_red(root: &Path) -> bool {
             return red;
         }
     }
-    let red = !crate::rate_limit_breaker::global_is_suppressed() && probe_ci_main_red(root);
+    let red =
+        !crate::rate_limit_breaker::global_skip_pass("work_finder") && probe_ci_main_red(root);
     if let Ok(mut cache) = ci_cache().lock() {
         cache.insert(root.to_path_buf(), (now, red));
     }
@@ -154,6 +155,7 @@ fn probe_ci_main_red(root: &Path) -> bool {
         crate::gh_invocation::GhTarget::None,
         Duration::from_secs(30),
     )
+    .forge_op(crate::forge_call_stats::ops::CI_WORKFLOW_RUNS_FOR_SHA)
     .args(["run", "list", "--branch", &branch, "--limit", "30"])
     .args(["--json", "headSha,status,conclusion,workflowName"])
     .current_dir(root)

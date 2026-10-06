@@ -112,11 +112,11 @@ fn post_comment_sends_the_footer_through_the_rest_endpoint() {
         "REST endpoint, one number sequence: {recorded}"
     );
     assert!(
-        recorded.contains("--input") && recorded.contains("-"),
-        "JSON on stdin, never -f: {recorded}"
+        recorded.contains("--input") && !recorded.contains(" -f "),
+        "JSON body file, never -f: {recorded}"
     );
-    let payload =
-        std::fs::read_to_string(stub.path().join("gh.stdin")).expect("stub recorded its stdin");
+    let payload = std::fs::read_to_string(stub.path().join("gh.stdin"))
+        .expect("stub recorded the --input body");
     let parsed: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON payload");
     let body = parsed["body"].as_str().expect("body field");
     assert!(
@@ -148,8 +148,9 @@ fn post_comment_surveys_stderr_on_failure() {
 
 /// A stub `gh` whose REST POST fails with `rest_stderr` and whose `api
 /// graphql` calls answer the node-id lookup and the mutation — or fail too,
-/// when `graphql_ok` is false. Every call's stdin lands in `gh.stdin.<n>`
-/// (n = 1-based call index) so the bodies can be compared byte for byte.
+/// when `graphql_ok` is false. Every call's `--input <file>` body lands in
+/// `gh.stdin.<n>` (n = 1-based call index) so the bodies can be compared byte
+/// for byte.
 fn temp_stub_gh_rest_limited(rest_stderr: &str, graphql_ok: bool) -> StubGh {
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path().display();
@@ -167,7 +168,8 @@ fn temp_stub_gh_rest_limited(rest_stderr: &str, graphql_ok: bool) -> StubGh {
 echo \"$@\" >> {d}/gh.args
 n=$(wc -l < {d}/gh.args | tr -d ' ')
 in={d}/gh.stdin.$n
-cat > \"$in\"
+prev=
+for a in \"$@\"; do [ \"$prev\" = --input ] && cat \"$a\" > \"$in\"; prev=\"$a\"; done
 if [ \"$2\" = graphql ]; then
     {graphql}
     exit 0
@@ -185,7 +187,7 @@ exit 1
 
 fn recorded_json(stub: &StubGh, call: usize) -> serde_json::Value {
     let raw = std::fs::read_to_string(stub.path().join(format!("gh.stdin.{call}")))
-        .unwrap_or_else(|e| panic!("stub recorded call {call}'s stdin: {e}"));
+        .unwrap_or_else(|e| panic!("stub recorded call {call}'s --input body: {e}"));
     serde_json::from_str(&raw).expect("each request body is JSON")
 }
 
@@ -201,8 +203,8 @@ fn rest_rate_limit_falls_back_to_graphql_add_comment_byte_identically() {
     let calls: Vec<&str> = args.lines().collect();
     assert_eq!(calls.len(), 3, "REST POST, node-id lookup, addComment: {args}");
     assert!(calls[0].contains("repos/o/r/issues/42/comments"), "{args}");
-    assert!(calls[1].starts_with("api graphql --input -"), "{args}");
-    assert!(calls[2].starts_with("api graphql --input -"), "{args}");
+    assert!(calls[1].starts_with("api graphql --input "), "{args}");
+    assert!(calls[2].starts_with("api graphql --input "), "{args}");
 
     let lookup = recorded_json(&stub, 2);
     assert_eq!(lookup["variables"]["owner"], "o");
@@ -264,7 +266,7 @@ fn write_stub(dir: &Path, exit_code: u8) {
     let stdin_path = dir.join("gh.stdin");
     let script = dir.join("gh");
     let record = format!(
-        "echo \"$@\" >> {args}\ncat > {stdin}\n",
+        "echo \"$@\" >> {args}\nprev=\nfor a in \"$@\"; do [ \"$prev\" = --input ] && cat \"$a\" > {stdin}; prev=\"$a\"; done\n",
         args = args_path.display(),
         stdin = stdin_path.display(),
     );

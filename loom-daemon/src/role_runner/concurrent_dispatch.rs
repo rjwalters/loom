@@ -405,7 +405,7 @@ pub fn forge_queue_probe() -> QueueProbe {
         let gh_bin = std::env::var("LOOM_GH_BIN")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .map_or_else(|| PathBuf::from("gh"), PathBuf::from);
+            .map_or_else(|| PathBuf::from(crate::gh_invocation::gh_bin()), PathBuf::from);
         for label in labels {
             let rows = crate::forge_listing::list_issues_cached_as(
                 QUEUE_GATE_CALLER,
@@ -417,6 +417,7 @@ pub fn forge_queue_probe() -> QueueProbe {
             )
             .map_err(|e| e.to_string())?;
             demand::record_listing(demand::global(), root, label, &rows);
+            crate::observability::pick_decision::record_gate_listing(root, label, &rows);
             if !rows.is_empty() {
                 return Ok(true);
             }
@@ -724,6 +725,7 @@ impl RoleDispatcher {
             let _guard = guard;
             let tick_start = Instant::now();
             let started_at = chrono::Utc::now();
+            crate::observability::pick_decision::clear_gate_listings();
             let mut runner = factory(task_root.clone());
             let outcome = run_gated(&mut *runner, &probe, &task_root, name, &prompt, interval);
             if name == "champion" {

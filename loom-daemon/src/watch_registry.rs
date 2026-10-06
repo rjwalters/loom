@@ -45,12 +45,13 @@
 //! degrades to an empty registry, and a single failing probe is logged and the
 //! watch retained (retried next tick) rather than aborting the whole tick.
 
+use crate::cmd_out::{CmdOutcome, Unavailable};
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 // ============================================================================
@@ -498,7 +499,7 @@ impl GhWatchProbe {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            gh_bin: PathBuf::from("gh"),
+            gh_bin: PathBuf::from(crate::gh_invocation::gh_bin()),
             timeout: DEFAULT_PROBE_TIMEOUT,
         }
     }
@@ -510,28 +511,41 @@ impl GhWatchProbe {
         self
     }
 
-    /// Build the `gh <issue|pr> view` command for `spec`.
-    fn build_command(&self, spec: &WatchSpec) -> Command {
-        let mut cmd = Command::new(&self.gh_bin);
-        match spec.kind {
-            WatchKind::Issue => {
-                cmd.arg("issue").arg("view").arg(spec.number.to_string());
-                cmd.arg("--json").arg("state,labels");
-            }
-            WatchKind::Pr => {
-                cmd.arg("pr").arg("view").arg(spec.number.to_string());
-                cmd.arg("--json").arg("state,labels");
-            }
+    /// Build the `gh <issue|pr> view` invocation for `spec`, counted as
+    /// `watch.view` (#10089); the facade applies the workspace root's
+    /// cross-owner `GH_CONFIG_DIR` (#5401) and the deadline.
+    fn build_invocation(&self, spec: &WatchSpec) -> GhInvocation {
+        let noun = match spec.kind {
+            WatchKind::Issue => "issue",
+            WatchKind::Pr => "pr",
+        };
+        let mut inv = GhInvocation::new(
+            Operation::new("watch.view"),
+            AccessIntent::Read,
+            GhTarget::None,
+            self.timeout,
+        )
+        .program(&self.gh_bin)
+        .args([
+            noun,
+            "view",
+            &spec.number.to_string(),
+            "--json",
+            "state,labels",
+        ]);
+        // A PR watch is the inventoried `pr.view-state` read; there is no
+        // inventoried issue-view operation, so an issue watch stays
+        // `unknown` rather than being mislabelled (#10089).
+        if matches!(spec.kind, WatchKind::Pr) {
+            inv = inv.forge_op(crate::forge_call_stats::ops::PR_VIEW_STATE);
         }
         if let Some(ref repo) = spec.repo {
-            cmd.arg("--repo").arg(repo);
+            inv = inv.args(["--repo", repo]);
         }
         if let Some(ref root) = spec.workspace_root {
-            cmd.current_dir(root);
-            crate::credential_preflight::apply_gh_config_for_root(&mut cmd, Path::new(root));
+            inv = inv.current_dir(root);
         }
-        cmd.stdin(Stdio::null()).stderr(Stdio::piped());
-        cmd
+        inv
     }
 }
 
@@ -576,36 +590,25 @@ pub fn classify_view(_kind: WatchKind, json: &[u8]) -> Option<WatchOutcome> {
 
 impl WatchProbe for GhWatchProbe {
     fn probe(&self, spec: &WatchSpec) -> Result<Option<WatchOutcome>> {
-        let mut cmd = self.build_command(spec);
-        // Wall-clock timeout via a spawned child + poll loop (no extra deps).
-        let mut child = cmd
-            .stdout(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("failed to invoke {}", self.gh_bin.display()))?;
-        let start = std::time::Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                let output = child.wait_with_output()?;
-                if !status.success() {
-                    return Err(anyhow::anyhow!(
-                        "gh view for {} failed: {}",
-                        spec.target_label(),
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ));
-                }
-                return Ok(classify_view(spec.kind, &output.stdout));
+        let output = match self.build_invocation(spec).run() {
+            CmdOutcome::Ran(output) => output,
+            CmdOutcome::Unavailable(Unavailable::TimedOut { .. }) => anyhow::bail!(
+                "gh view for {} timed out after {}s",
+                spec.target_label(),
+                self.timeout.as_secs()
+            ),
+            CmdOutcome::Unavailable(u) => {
+                anyhow::bail!("failed to invoke {}: {u}", self.gh_bin.display())
             }
-            if start.elapsed() >= self.timeout {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(anyhow::anyhow!(
-                    "gh view for {} timed out after {}s",
-                    spec.target_label(),
-                    self.timeout.as_secs()
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(100));
+        };
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "gh view for {} failed: {}",
+                spec.target_label(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
+        Ok(classify_view(spec.kind, &output.stdout))
     }
 }
 
@@ -907,7 +910,7 @@ mod tests {
         assert_eq!(classify_view(WatchKind::Issue, b"not json"), None);
     }
 
-    // ---- GhWatchProbe::build_command / #5401 cross-owner credential wiring ----
+    // ---- GhWatchProbe::build_invocation / #5401 cross-owner credential wiring ----
 
     #[test]
     #[serial]
@@ -922,10 +925,10 @@ mod tests {
         let mut spec = spec(WatchKind::Issue, 1, Some("2AMLogic/marketing"));
         spec.workspace_root = Some(registered.to_string_lossy().into_owned());
 
-        let cmd = GhWatchProbe::new().build_command(&spec);
-        let has_env = cmd.get_envs().any(|(k, v)| {
-            k == "GH_CONFIG_DIR" && v == Some(std::ffi::OsStr::new(owner_dir.as_os_str()))
-        });
+        let plan = GhWatchProbe::new().build_invocation(&spec).env_plan(None);
+        let has_env = plan
+            .iter()
+            .any(|e| e.key == "GH_CONFIG_DIR" && e.value.as_deref() == Some(owner_dir.as_os_str()));
         assert!(
             has_env,
             "a watch rooted in a registered cross-owner workspace must probe with that owner's GH_CONFIG_DIR"
@@ -945,9 +948,9 @@ mod tests {
         let mut spec = spec(WatchKind::Issue, 1, None);
         spec.workspace_root = Some(unregistered.to_string_lossy().into_owned());
 
-        let cmd = GhWatchProbe::new().build_command(&spec);
+        let plan = GhWatchProbe::new().build_invocation(&spec).env_plan(None);
         assert!(
-            cmd.get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"),
+            plan.iter().all(|e| e.key != "GH_CONFIG_DIR"),
             "an unregistered (single-owner) root must not set GH_CONFIG_DIR on the child"
         );
 

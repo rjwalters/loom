@@ -62,7 +62,7 @@ fn fleet_prs() -> Vec<PrHistory> {
 }
 
 /// A snapshot over [`fleet_prs`], as of the fixture estimate instant.
-fn fleet_snapshot() -> FleetSnapshot {
+pub(super) fn fleet_snapshot() -> FleetSnapshot {
     let mut snapshot = FleetSnapshot::empty(REPO);
     snapshot.merge(&fleet_prs(), as_of());
     snapshot
@@ -70,7 +70,7 @@ fn fleet_snapshot() -> FleetSnapshot {
 
 /// A `land-v1` input sitting in `review_wait` with no age, so nothing is
 /// age-conditioned and the estimate depends on history alone.
-fn input() -> EstimateInput {
+pub(super) fn input() -> EstimateInput {
     EstimateInput {
         subject: subject(),
         as_of: as_of(),
@@ -80,11 +80,14 @@ fn input() -> EstimateInput {
             age_sec: 0,
             age_source: AgeSource::LabelEvent,
             rework_rounds: 0,
+            episode_entered_at: None,
         }),
         features: crate::eta::explanation::Features::default(),
         features_omitted: Vec::new(),
         provenance: provenance(),
         dispatch: None,
+        stalls: Vec::new(),
+        held: None,
     }
 }
 
@@ -112,7 +115,7 @@ fn thin_local_history(host: &str, n: usize) -> StageSamples {
     history
 }
 
-fn write_snapshot(root: &Path, snapshot: &FleetSnapshot) -> std::path::PathBuf {
+pub(super) fn write_snapshot(root: &Path, snapshot: &FleetSnapshot) -> std::path::PathBuf {
     let path = fleet::snapshot_path(root, &snapshot.repo);
     fleet::write(&path, snapshot).expect("cache write");
     path
@@ -277,6 +280,7 @@ fn augmenting_a_local_history_reports_fleet_scope_and_both_attributions() {
             age_sec: 0,
             age_source: AgeSource::LabelEvent,
             rework_rounds: 0,
+            episode_entered_at: None,
         }),
         ..input()
     };
@@ -293,7 +297,7 @@ fn augmenting_a_local_history_reports_fleet_scope_and_both_attributions() {
 
 /// Serialize the way a comparison between two hosts would: whole explanation,
 /// canonical JSON, no field skipped.
-fn bytes(explanation: &Explanation) -> Vec<u8> {
+pub(super) fn bytes(explanation: &Explanation) -> Vec<u8> {
     serde_json::to_vec(explanation).expect("an explanation serializes")
 }
 
@@ -609,7 +613,59 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ("heuristics/finish_v1.rs", include_str!("../heuristics/finish_v1.rs")),
     ("heuristics/land_v1.rs", include_str!("../heuristics/land_v1.rs")),
     ("heuristics/land_v2.rs", include_str!("../heuristics/land_v2.rs")),
+    ("heuristics/land_v3.rs", include_str!("../heuristics/land_v3.rs")),
+    (
+        "heuristics/land_amber_heron.rs",
+        include_str!("../heuristics/land_amber_heron.rs"),
+    ),
+    (
+        "heuristics/land_fresh_tide.rs",
+        include_str!("../heuristics/land_fresh_tide.rs"),
+    ),
+    // #10209: the recency weighting the heuristic calls.
+    ("recency.rs", include_str!("../recency.rs")),
+    // #10207: the recalibration fit and transform the heuristic calls.
+    ("recalibrate.rs", include_str!("../recalibrate.rs")),
+    ("twin_otter/mod.rs", include_str!("../twin_otter/mod.rs")),
+    ("twin_otter/eval.rs", include_str!("../twin_otter/eval.rs")),
+    ("twin_otter/path.rs", include_str!("../twin_otter/path.rs")),
+    // #10243: the adapter, refusal map and explanation over the core above.
+    (
+        "heuristics/land_twin_otter.rs",
+        include_str!("../heuristics/land_twin_otter.rs"),
+    ),
+    (
+        "heuristics/land_twin_otter_b.rs",
+        include_str!("../heuristics/land_twin_otter_b.rs"),
+    ),
+    ("heuristics/land_v4.rs", include_str!("../heuristics/land_v4.rs")),
+    // #10259: the stall detector the heuristics call.
+    ("stall.rs", include_str!("../stall.rs")),
 ];
+
+/// `HEURISTIC_SOURCES` is hand-written, so a new heuristic file could silently
+/// escape the purity scan. Every `*.rs` under `heuristics/` and `twin_otter/`
+/// must therefore have an entry. (Helper modules elsewhere in `eta/` cannot be
+/// discovered by directory and stay an explicit list above.)
+#[test]
+fn every_heuristic_source_file_is_scanned_for_purity() {
+    for dir in ["heuristics", "twin_otter"] {
+        let path = format!("{}/src/eta/{dir}", env!("CARGO_MANIFEST_DIR"));
+        for entry in std::fs::read_dir(&path).unwrap_or_else(|e| panic!("read {path}: {e}")) {
+            let entry = entry.expect("dir entry");
+            let file = entry.file_name().to_string_lossy().into_owned();
+            if !file.ends_with(".rs") {
+                continue;
+            }
+            let key = format!("{dir}/{file}");
+            assert!(
+                HEURISTIC_SOURCES.iter().any(|(name, _)| *name == key),
+                "{key} exists on disk but has no entry in HEURISTIC_SOURCES: add \
+                 `(\"{key}\", include_str!(\"../{key}\"))` so the purity scan covers it.",
+            );
+        }
+    }
+}
 
 /// The whole point of #9343's "the estimator stays pure over a snapshot": a
 /// heuristic may read `(input, history)` and nothing else. If it could reach

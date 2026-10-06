@@ -40,6 +40,8 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::{Context, Result};
 
 use crate::forge_listing::{parse_http_response, HttpResponse};
+use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
+use crate::proc_exec::Completion;
 
 /// `${TMPDIR:-/tmp}` — the per-user, per-host scratch base the ETag store and
 /// the forge-call sink ([`crate::forge_call_stats`]) both live under.
@@ -173,14 +175,21 @@ pub(crate) fn create_private_file(path: &Path) -> std::io::Result<std::fs::File>
 /// the same host never observes a half-written file. Best-effort: any failure
 /// just means the next call re-fetches.
 pub(crate) fn write_disk_entry(path: &Path, entry: &DiskEntry) {
+    let Ok(serialized) = serde_json::to_string(entry) else {
+        return;
+    };
+    write_private_atomic(path, serialized.as_bytes());
+}
+
+/// Write `bytes` to `path` atomically (temp file + rename), owner-only, and
+/// only inside a [`private_dir`]. Best-effort, like [`write_disk_entry`]:
+/// any failure leaves the previous file (or none) in place.
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) {
     use std::io::Write;
     let Some(dir) = path.parent() else { return };
     if !private_dir(dir, true) {
         return;
     }
-    let Ok(serialized) = serde_json::to_string(entry) else {
-        return;
-    };
     let tmp = dir.join(format!(
         ".tmp-{}-{}",
         std::process::id(),
@@ -192,20 +201,44 @@ pub(crate) fn write_disk_entry(path: &Path, entry: &DiskEntry) {
         create_private_file(&tmp)
     });
     let Ok(mut file) = file else { return };
-    if file.write_all(serialized.as_bytes()).is_ok() {
+    if file.write_all(bytes).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     } else {
         let _ = std::fs::remove_file(&tmp);
     }
 }
 
+/// Who issued a conditional read and which inventoried forge operation it
+/// serves (#9831).
+///
+/// Both halves are required: `caller` is the facade's telemetry name (a valid
+/// [`Operation`], lowercase `snake_case` segments) and `op` the inventory row
+/// the read is accounted under. There is no default `op`, so a new conditional
+/// reader cannot land in the `unknown` row by omission — a site that maps to
+/// no inventoried operation says so with
+/// [`crate::forge_call_stats::ForgeOp::uninventoried`] and a reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConditionalRead {
+    pub(crate) caller: &'static str,
+    pub(crate) op: crate::forge_call_stats::ForgeOp,
+}
+
+impl ConditionalRead {
+    #[must_use]
+    pub(crate) const fn new(caller: &'static str, op: crate::forge_call_stats::ForgeOp) -> Self {
+        Self { caller, op }
+    }
+}
+
 /// One `gh api --include <url>` invocation against `target`, optionally
 /// conditional on `etag`,
 /// run in `cwd` under that root's credential (#5401). Every call is recorded
-/// against `caller` in [`crate::forge_call_stats`] (#9251) — a local
-/// bookkeeping write, never an extra forge call.
+/// against `site` in [`crate::forge_call_stats`] (#9251, by the
+/// [`GhInvocation`] facade since #10089) — a local bookkeeping write, never an
+/// extra forge call — keyed by `site.op` and `target`'s host and repository
+/// (#9831).
 pub(crate) fn fetch_conditional(
-    caller: &'static str,
+    site: ConditionalRead,
     gh_bin: &Path,
     cwd: Option<&Path>,
     target: &Target,
@@ -215,92 +248,126 @@ pub(crate) fn fetch_conditional(
     // #9537: a listing is a read, so it goes to the repo's reader App when one
     // is usable. On a credential failure the reader is withdrawn and the SAME
     // request is retried once on the writer, so a broken reader costs one
-    // extra call, never a failed poll. The cache key deliberately stays on the
-    // writer's credential scope: reader choice is deterministic per repo, so
-    // keeping the key means no ETag is invalidated when readers come online.
+    // extra call, never a failed poll (the shared shape,
+    // `forge_identity::reader_then_writer`, #9872). The cache key deliberately
+    // stays on the writer's credential scope: reader choice is deterministic
+    // per repo, so keeping the key means no ETag is invalidated when readers
+    // come online.
     let reader = target
         .repo
         .as_deref()
         .and_then(|r| crate::forge_identity::read_credential(r, target.host.as_deref()));
-    if let Some((dir, app_id)) = reader {
-        let first = run_fetch(caller, gh_bin, cwd, target, url, etag, Some(&dir))?;
-        let (status, response, stderr) = &first;
-        let http = response.as_ref().map(|r| r.status);
-        let ok = status.success() || matches!(http, Some(200 | 304));
-        let failure = if ok {
-            None
-        } else {
-            crate::forge_identity::classify_failure(stderr, http)
-        };
-        let Some(failure) = failure else {
-            return Ok(first);
-        };
-        let repo = target.repo.as_deref().unwrap_or_default();
-        let why = format!("{caller} {url}");
-        if failure == crate::forge_identity::Failure::App {
-            crate::forge_identity::withdraw_after(&app_id, repo, failure, None, &why);
-            return run_fetch(caller, gh_bin, cwd, target, url, etag, None);
-        }
-        // A 403/404 is only the READER's coverage gap if the writer can read
-        // the same thing; a genuinely missing resource (a deleted issue) 404s
-        // for both and must not take the repo's reader offline for an hour.
-        let second = run_fetch(caller, gh_bin, cwd, target, url, etag, None)?;
-        let writer_ok =
-            second.0.success() || matches!(second.1.as_ref().map(|r| r.status), Some(200 | 304));
-        if writer_ok {
-            crate::forge_identity::withdraw_after(&app_id, repo, failure, None, &why);
-        }
-        return Ok(second);
-    }
-    run_fetch(caller, gh_bin, cwd, target, url, etag, None)
+    let reader_dir = reader.as_ref().map(|(dir, _)| dir.as_path());
+    let http_ok = |r: &FetchResult| {
+        r.0.success() || matches!(r.1.as_ref().map(|h| h.status), Some(200 | 304))
+    };
+    crate::forge_identity::reader_then_writer(
+        reader_dir,
+        // The reader attempt drops env tokens (#9872): `gh` prefers an env
+        // `GH_TOKEN`/`GITHUB_TOKEN` over `GH_CONFIG_DIR`, so without this an
+        // ambient personal token would serve the "reader" read.
+        |dir, role| run_fetch_with(site, gh_bin, cwd, target, url, etag, dir, dir.is_some(), role),
+        http_ok,
+        |r| crate::forge_identity::classify_failure(&r.2, r.1.as_ref().map(|h| h.status)),
+        |failure, _| {
+            if let Some((_, app_id)) = &reader {
+                let repo = target.repo.as_deref().unwrap_or_default();
+                let why = format!("{} {url}", site.caller);
+                crate::forge_identity::withdraw_after(app_id, repo, failure, None, &why);
+            }
+        },
+    )
 }
+
+/// `(exit status, parsed `--include` response, trimmed stderr)` of one fetch.
+type FetchResult = (ExitStatus, Option<HttpResponse>, String);
+
+/// One `gh api --include <url>` read under **exactly** the reader App whose
+/// `GH_CONFIG_DIR` is `reader_dir` — the reader-only primitive (#10263).
+///
+/// Unlike [`fetch_conditional`] there is no writer anywhere on this path: a
+/// failed read is returned as-is for the caller to classify (and withdraw the
+/// reader through [`crate::forge_identity::withdraw_after`]), never retried on
+/// the writer, and the child runs
+/// [`GhInvocation::without_token_env`], so an env `GH_TOKEN` / `GITHUB_TOKEN`
+/// cannot outrank the reader dir. A caller that must never spend the
+/// operator's credential — the ETA fleet snapshot refresh — uses this and
+/// nothing else. Call accounting, egress routing and the rate-limit headers
+/// are the same [`GhInvocation`] path every conditional read takes.
+pub(crate) fn fetch_with_reader(
+    site: ConditionalRead,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    target: &Target,
+    url: &str,
+    etag: Option<&str>,
+    reader_dir: &Path,
+) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
+    let role = crate::forge_identity::IdentityRole::Reader;
+    run_fetch_with(site, gh_bin, cwd, target, url, etag, Some(reader_dir), true, role)
+}
+
+/// Deadline for one conditional read (they were unbounded `.output()`s before
+/// #10089). A listing is one page, so a minute is generous.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// One `gh api --include` run. `reader_dir` = `Some` runs it under that
 /// reader's `GH_CONFIG_DIR`; `None` under the writer's (#5401 per-owner, else
-/// process-global).
-fn run_fetch(
-    caller: &'static str,
+/// process-global). `strip_token_env` removes every token env var from the
+/// child ([`GhInvocation::without_token_env`]); `role` is the identity the
+/// accounting row records (#9872).
+///
+/// Built through [`GhInvocation`] (#10089), which records the call against
+/// `site` in [`crate::forge_call_stats`] from the `--include` status line
+/// and rate-limit headers — the same [`crate::forge_call_stats::classify`]
+/// the hand-rolled record call here used. [`GhTarget::None`] on purpose: the
+/// writer credential stays the `cwd` root's (#5401) and nothing else, so the
+/// identity a call runs under keeps matching [`credential_scope`]'s cache key.
+#[allow(clippy::too_many_arguments)]
+fn run_fetch_with(
+    site: ConditionalRead,
     gh_bin: &Path,
     cwd: Option<&Path>,
     target: &Target,
     url: &str,
     etag: Option<&str>,
     reader_dir: Option<&Path>,
-) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
-    let mut cmd = Command::new(gh_bin);
-    cmd.arg("api").arg("--include").arg(url);
+    strip_token_env: bool,
+    role: crate::forge_identity::IdentityRole,
+) -> Result<FetchResult> {
+    let mut inv = GhInvocation::new(
+        Operation::new(site.caller),
+        AccessIntent::Read,
+        GhTarget::None,
+        FETCH_TIMEOUT,
+    )
+    .forge_op(site.op)
+    // Accounting only (#9831): the resolved host and repo, as two fields.
+    .identity_scope(target.host.as_deref(), target.repo.as_deref())
+    .program(gh_bin)
+    .identity_role(role)
+    .args(["api", "--include", url]);
     if let Some(host) = &target.host {
         // The URL names the remote-resolved repo explicitly, so name its host
         // too (gh would otherwise use its default host, not the remote's).
-        cmd.arg("--hostname").arg(host);
+        inv = inv.arg("--hostname").arg(host);
     }
     if let Some(e) = etag {
-        cmd.arg("-H").arg(format!("If-None-Match: {e}"));
+        inv = inv.arg("-H").arg(format!("If-None-Match: {e}"));
     }
     if let Some(dir) = cwd {
-        cmd.current_dir(dir);
+        inv = inv.current_dir(dir);
     }
-    match reader_dir {
-        Some(dir) => {
-            cmd.env("GH_CONFIG_DIR", dir);
-        }
-        // #5401: point a cross-owner managed repo's listing at its own owner's
-        // installation-token `GH_CONFIG_DIR` (no-op for single-owner fleets / a
-        // `None` cwd).
-        None => crate::credential_preflight::apply_gh_config_for_cwd(&mut cmd, cwd),
+    if strip_token_env {
+        inv = inv.without_token_env();
     }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .with_context(|| format!("failed to invoke {}", gh_bin.display()))?;
+    let out = match inv.gh_config_dir(reader_dir).execute() {
+        Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
+        Ok(_) => anyhow::bail!("gh api {url} timed out after {}s", FETCH_TIMEOUT.as_secs()),
+        Err(e) => return Err(e).with_context(|| format!("failed to invoke {}", gh_bin.display())),
+    };
     let response = parse_http_response(&String::from_utf8_lossy(&out.stdout));
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    crate::forge_call_stats::record_gh_api(
-        caller,
-        response.as_ref(),
-        out.status.success(),
-        &stderr,
-    );
     Ok((out.status, response, stderr))
 }
 
@@ -310,7 +377,7 @@ fn run_fetch(
 
 /// `(host, owner/repo)` parsed from a git remote URL (`git@host:o/r(.git)`,
 /// `ssh://git@host/o/r`, `https://host/o/r`, `http://host/o/r`).
-fn parse_remote_url(url: &str) -> Option<(String, String)> {
+pub(crate) fn parse_remote_url(url: &str) -> Option<(String, String)> {
     let url = url.trim();
     let stripped = url.strip_suffix(".git").unwrap_or(url);
     let (host, path) = if let Some(rest) = stripped.strip_prefix("git@") {

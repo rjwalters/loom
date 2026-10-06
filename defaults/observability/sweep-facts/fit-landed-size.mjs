@@ -212,11 +212,14 @@ console.log(`            5.0  AS cut_4,`);
 console.log(`            8.0  AS cut_5,`);
 console.log(`            13.0 AS cut_6`);
 console.log(`    ),`);
+// VALUES, not UNION ALL — D1 caps compound SELECT at 5 terms (#10066), and a
+// fleet with six or more fitted models would exceed it as a SELECT chain.
+// Multi-row VALUES is exempt from that limit.
 console.log(`    model_token_factors(model, factor) AS (`);
+console.log(`        VALUES`);
 console.log(modelTokenFactors
-  .map(({ model, factor }, index) =>
-    `        ${index === 0 ? "" : "UNION ALL "}SELECT '${model}', ${round(factor)}`)
-  .join("\n"));
+  .map(({ model, factor }) => `            ('${model}', ${round(factor)})`)
+  .join(",\n"));
 console.log(`    ),`);
 console.log("");
 console.log("-- provenance (paste beside the params CTE) -----------------------------------");

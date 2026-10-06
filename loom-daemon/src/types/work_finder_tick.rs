@@ -135,6 +135,219 @@ pub struct WorkFinderTickSummary {
     /// pre-#9288 payload.
     #[serde(default)]
     pub plan: Option<DispatchPlanContext>,
+    /// The terms of this tick's concurrency cap (Issue #10214): the
+    /// configured `maxConcurrent` and the disk / RAM headroom that may hold
+    /// it lower, so a consumer can say *what* limits the cap. `None` for a
+    /// pre-#10214 payload and before the first tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<CapView>,
+    /// How the starred-at cache answered since this process started: the
+    /// in-process cache, the restart store, a loom-ui intent, or a timeline
+    /// read (known / none / failed). `None` for a payload that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starred_at_cache: Option<StarredAtCacheTally>,
+}
+
+/// Outcome tally of the work finder's starred-at lookups, cumulative since
+/// the daemon started. The `read_*` rows are the forge timeline reads that
+/// remain; `read_none` vs `read_known` is the split that says whether
+/// unknown starred-ats (retried every 10 minutes) dominate them.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StarredAtCacheTally {
+    /// A starred issue the in-process cache already answered.
+    pub mem_hit: u64,
+    /// An in-process miss answered by the restart store.
+    pub disk_hit: u64,
+    /// An in-process miss answered by a loom-ui intent's `requested_at`.
+    pub intent_hit: u64,
+    /// A timeline read that found the starred-at.
+    pub read_known: u64,
+    /// A timeline read that found no star event (unknown; retried later).
+    pub read_none: u64,
+    /// A timeline read that failed (unknown; retried later).
+    pub read_err: u64,
+}
+
+impl StarredAtCacheTally {
+    /// Add `other`'s counts to these.
+    pub fn add(&mut self, other: &Self) {
+        self.mem_hit += other.mem_hit;
+        self.disk_hit += other.disk_hit;
+        self.intent_hit += other.intent_hit;
+        self.read_known += other.read_known;
+        self.read_none += other.read_none;
+        self.read_err += other.read_err;
+    }
+
+    /// How many lookups went to the forge.
+    #[must_use]
+    pub fn reads(&self) -> u64 {
+        self.read_known + self.read_none + self.read_err
+    }
+}
+
+/// What holds a tick's effective concurrency cap where it is (Issue #10214).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapLimiter {
+    /// The configured `maxConcurrent`: an operator setting, not a shortage.
+    Configured,
+    /// Disk headroom on the worktree volume (`free GB / per-worktree GB`).
+    Disk,
+    /// Available-RAM headroom.
+    Ram,
+    /// A limiter this client does not know (forward compatibility).
+    #[serde(other)]
+    Unknown,
+}
+
+impl CapLimiter {
+    /// The kebab-case wire name (identical to the serde form).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::Disk => "disk",
+            Self::Ram => "ram",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// The terms of one tick's concurrency cap (Issue #10214): `min(configured,
+/// disk headroom, ram headroom)`. A headroom term is `None` when it was
+/// unmeasurable (the work finder then skips that clamp).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapView {
+    /// The configured `maxConcurrent`.
+    #[serde(default)]
+    pub configured: usize,
+    /// Disk headroom: how many worktrees the scratch volume can hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<usize>,
+    /// RAM headroom: how many sweeps available memory can hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ram: Option<usize>,
+}
+
+impl CapView {
+    /// From the work finder's raw terms, where `usize::MAX` means "not
+    /// measured, not clamping".
+    #[must_use]
+    pub fn from_terms(configured: usize, disk: usize, ram: usize) -> Self {
+        let known = |n: usize| (n != usize::MAX).then_some(n);
+        Self {
+            configured,
+            disk: known(disk),
+            ram: known(ram),
+        }
+    }
+
+    /// The effective cap.
+    #[must_use]
+    pub fn effective(&self) -> usize {
+        self.configured
+            .min(self.disk.unwrap_or(usize::MAX))
+            .min(self.ram.unwrap_or(usize::MAX))
+    }
+
+    /// The term that binds. A headroom term binds only when it is strictly
+    /// below the configured cap; disk wins a disk / RAM tie.
+    #[must_use]
+    pub fn limiter(&self) -> CapLimiter {
+        let disk = self.disk.unwrap_or(usize::MAX);
+        let ram = self.ram.unwrap_or(usize::MAX);
+        if disk < self.configured && disk <= ram {
+            CapLimiter::Disk
+        } else if ram < self.configured {
+            CapLimiter::Ram
+        } else {
+            CapLimiter::Configured
+        }
+    }
+
+    /// Whether a resource shortage (disk or RAM), not the operator's
+    /// setting, holds the cap below `maxConcurrent`.
+    #[must_use]
+    pub fn resource_limited(&self) -> bool {
+        matches!(self.limiter(), CapLimiter::Disk | CapLimiter::Ram)
+    }
+}
+
+/// Why a starred issue the work finder deferred is still waiting, and where
+/// it stands (Issue #10214). Carried on a `no-capacity` landing row so the
+/// status, the queue view and any escalation can say "queued #88 of 106
+/// (cap 2, disk-limited)" instead of an undifferentiated "no capacity".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityWait {
+    /// The work finder's gate: `capacity`, `ramp`, `saturation`,
+    /// `build-backoff`, `repo-cap`, `repo-slice`, `host-affinity` or
+    /// `host-class`.
+    pub gate: String,
+    /// For the `capacity` gate: which cap term binds, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limiter: Option<CapLimiter>,
+    /// 1-based position among the host's waiting starred issues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<u32>,
+    /// How many starred issues are waiting on the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u32>,
+    /// The effective concurrency cap, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<usize>,
+    /// The configured `maxConcurrent`, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_cap: Option<usize>,
+}
+
+impl CapacityWait {
+    /// Whether this is a queue wait (a capacity-style gate that frees up as
+    /// work ahead completes), as opposed to a host refusal (`host-affinity`,
+    /// `host-class`), which no amount of waiting on this host resolves.
+    #[must_use]
+    pub fn queued(&self) -> bool {
+        !matches!(self.gate.as_str(), "host-affinity" | "host-class")
+    }
+
+    /// The short phrase naming what limits it, e.g. `disk-limited`.
+    #[must_use]
+    pub fn limit_phrase(&self) -> &'static str {
+        match (self.gate.as_str(), self.limiter) {
+            ("capacity", Some(CapLimiter::Disk)) => "disk-limited",
+            ("capacity", Some(CapLimiter::Ram)) => "ram-limited",
+            ("capacity", Some(CapLimiter::Configured)) => "at the configured cap",
+            ("capacity", _) => "concurrency cap full",
+            ("ramp", _) => "per-tick admission ramp",
+            ("saturation", _) => "host saturated",
+            ("build-backoff", _) => "build back-off",
+            ("repo-cap", _) => "per-repo cap",
+            ("repo-slice", _) => "outside this host's repo slice",
+            ("host-affinity", _) => "host affinity names another host",
+            ("host-class", _) => "heavy sweep refused on this host class",
+            _ => "deferred",
+        }
+    }
+
+    /// `queued #88 of 106 (cap 2, disk-limited)`; without a position,
+    /// `waiting (cap 2, disk-limited)`; for a host refusal, `not for this
+    /// host (host affinity names another host)`.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut inner = Vec::new();
+        if let Some(cap) = self.cap {
+            inner.push(format!("cap {cap}"));
+        }
+        inner.push(self.limit_phrase().to_string());
+        let inner = inner.join(", ");
+        if !self.queued() {
+            return format!("not for this host ({inner})");
+        }
+        match (self.position, self.total) {
+            (Some(p), Some(t)) => format!("queued #{p} of {t} ({inner})"),
+            _ => format!("waiting ({inner})"),
+        }
+    }
 }
 
 impl WorkFinderTickSummary {

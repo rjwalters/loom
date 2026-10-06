@@ -225,6 +225,7 @@ case "$*" in *page=2*) cat page2;; *) cat page1;; esac
         let mut cmd = cli(root);
         cmd.args(["pr-queue", "--role", "judge"])
             .env("LOOM_GH_BIN", root.join("gh"))
+            .env("LOOM_GH_NO_POLICY_LAUNCHER", "1")
             .env("GUARD_EXIT", guard);
         output(cmd)
     };
@@ -274,8 +275,8 @@ fn real_fallback_guard_preserves_velocity_alerts_and_decisions() {
         &root.join("gh"),
         r#"
 case "$*" in
+ *'api repos/{owner}/{repo}/pulls/'*) cat pr.json;;
  *pulls*) printf 'HTTP/2 200 OK\r\n\r\n'; cat pulls.json;;
- *'pr view'*) cat pr.json;;
  *comments*)
    if test "${FAIL_GUARD:-0}" = 1; then echo 'fixture forge failure' >&2; exit 1; fi
    cat comments.json;;
@@ -290,6 +291,7 @@ esac
         cmd.current_dir(root)
             .env("PATH", format!("{}:{}", root.display(), std::env::var("PATH").unwrap()))
             .env("LOOM_GH_BIN", root.join("gh"))
+            .env("LOOM_GH_NO_POLICY_LAUNCHER", "1")
             // The guard authenticates marker authors through
             // `loom-daemon forge trusted-comments` (#9548/#9716); without a
             // reachable daemon it reads every marker as absent.
@@ -309,7 +311,9 @@ esac
         std::fs::write(
             root.join("pr.json"),
             serde_json::to_vec(&serde_json::json!({
-                "author":{"login":"operator","is_bot":bot}, "headRefOid":head
+                // The guard's Step 1 is REST `pulls/<N>` (#9340), never GraphQL.
+                "user":{"login":"operator","type":if bot { "Bot" } else { "User" }},
+                "head":{"sha":head}
             }))
             .unwrap(),
         )
@@ -366,7 +370,7 @@ esac
     // A failed guard remains an error, never a successful empty queue.
     std::fs::write(
         root.join("pr.json"),
-        format!(r#"{{"author":{{"login":"operator","is_bot":false}},"headRefOid":"{head}"}}"#),
+        format!(r#"{{"user":{{"login":"operator","type":"User"}},"head":{{"sha":"{head}"}}}}"#),
     )
     .unwrap();
     let mut queue = cli(root);

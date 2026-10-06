@@ -181,10 +181,19 @@ fn the_query_file_and_the_doc_describe_the_same_question_set() {
     let sections = sections(QUERIES);
     assert_eq!(
         sections,
-        vec!["0", "Q1", "Q2", "Q3"],
+        vec!["0", "Q1", "Q2", "Q3", "Q4", "Q5", "Q6", "Q7"],
         "eta-queries.sql's sections changed; update the Queries section of eta.md with them"
     );
-    for id in ["**Section 0**", "**Q1**", "**Q2**", "**Q3**"] {
+    for id in [
+        "**Section 0**",
+        "**Q1**",
+        "**Q2**",
+        "**Q3**",
+        "**Q4**",
+        "**Q5**",
+        "**Q6**",
+        "**Q7**",
+    ] {
         assert!(ETA_DOC.contains(id), "eta.md's Queries section does not describe {id}");
     }
     assert!(
@@ -308,6 +317,18 @@ fn every_eta_snapshot_field_is_documented_in_the_schema_reference() {
         as_of: chrono::Utc::now(),
         stage: Some(loom_daemon::eta::Stage::ReviewWait),
         no_estimate_reason: None,
+        alternates: vec![
+            loom_daemon::telemetry::kinds::eta_snapshot::EtaSnapshotAlternate {
+                heuristic: "land-2026-10-04-twin-otter".to_string(),
+                estimate_id: "0a1b2c3d4e5f6071".to_string(),
+                as_of: chrono::Utc::now(),
+                p25: Some(1),
+                p50: Some(2),
+                p75: Some(3),
+                p90: Some(4),
+                no_estimate_reason: Some(loom_daemon::eta::NoEstimateReason::NoModel),
+            },
+        ],
     };
     let record = EtaSnapshotRecord {
         as_of: row.as_of,
@@ -350,6 +371,17 @@ fn every_eta_snapshot_field_is_documented_in_the_schema_reference() {
             "the eta.snapshot row's `{field}` is not documented in telemetry-schema.md"
         );
     }
+    for field in serde_json::to_value(&row.alternates[0])
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .keys()
+    {
+        assert!(
+            documented(field),
+            "the eta.snapshot alternate's `{field}` is not documented in telemetry-schema.md"
+        );
+    }
     // The routing decision, which is the one thing a dashboard cannot infer
     // from the field list.
     assert!(
@@ -381,4 +413,41 @@ fn the_doc_no_longer_defers_the_live_list_to_a_later_phase() {
     );
     // Both halves of the promotion gate, since either alone is not the rule.
     assert!(ETA_DOC.contains("50 paired observations") && ETA_DOC.contains("[40%, 60%]"));
+}
+
+/// The four #10233 views each guard one specific misreading; the clause that
+/// does it is pinned here, in ordinary CI, beside the Docker-gated proof in
+/// `signoz_eta_accuracy_views.rs`.
+#[test]
+fn the_late_surprise_stability_convergence_and_answer_rate_views_keep_their_guards() {
+    // Q4: the common decidable subset, and censored outcomes counted.
+    assert!(
+        QUERIES.contains("HAVING min(has_p90) = 1"),
+        "Q4 must keep an instant only when EVERY heuristic decided its late surprise"
+    );
+    assert!(QUERIES.contains("mapContains(attributes_bool, 'loom.eta.above_p90')"));
+    assert!(QUERIES.contains("countIf(outcome = 'censored') AS censored"));
+    // Q5: the landing instant, between unchanged emissions only.
+    assert!(
+        QUERIES.contains("as_of_sec + toInt64(attributes_number['loom.eta.p50_sec']) AS landing"),
+        "Q5 measures the predicted landing INSTANT, not remaining seconds"
+    );
+    assert!(QUERIES.contains("stage = prev_stage AND rework = prev_rework"));
+    // Q6: scored outcomes only, bucketed by the actual lead.
+    assert!(QUERIES.contains("'loom.eta.lead_sec'] < 900, 'lt_15m'"));
+    // Q7: time-weighted, never row-counted.
+    assert!(
+        QUERIES.contains("next_t - t AS stood_sec"),
+        "Q7 weights each state by how long it stood; counting rows inflates the \
+         answer rate because refusals are never refreshed"
+    );
+    // The daemon's own gate, documented beside them.
+    for claim in [
+        "MIN_FOLDS",
+        "late surprise",
+        "once per tracker pass",
+        "censored",
+    ] {
+        assert!(ETA_DOC.contains(claim), "eta.md must describe `{claim}`");
+    }
 }

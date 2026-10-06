@@ -2,6 +2,14 @@
 //! appended to `work_finder.rs`: that module is over the 1000-line ratchet
 //! threshold and frozen at its current size (see
 //! `.loom/docs/file-size-policy.md`).
+//!
+//! The label *sets* here ([`PARK_LABELS`], [`SKIP_LABELS`]) are derived from
+//! the label registry's `park` / `skip` properties (`defaults/labels.json`,
+//! #10013), never hand-listed: changing which labels park or skip is an edit
+//! to the registry. The single-label constants are names, not sets; the
+//! registry tests check each one carries the properties its doc claims.
+
+use crate::label_registry::{embedded_set, LabelSet, Registry};
 
 /// Labels marking a **deliberate park** — a human (or an agent acting on a
 /// human's behalf) has taken the issue out of the automation queue and it must
@@ -28,7 +36,10 @@
 /// **`loom:operator` deliberately does NOT belong here** — it is re-evaluable
 /// by design and must never refuse the routes that re-evaluate held work. See
 /// [`OPERATOR_HOLD_LABEL`] for the full vibesql#6664 rationale.
-pub const PARK_LABELS: &[&str] = &["loom:blocked", "loom:operator-only"];
+///
+/// Derived: the registry's `park` labels, in registry order (the order the
+/// park guards report a label in when an issue carries several).
+pub static PARK_LABELS: LabelSet = LabelSet::new(|| embedded_set("park"));
 
 /// The daemon's own claim label. Disqualifies a *fresh* work-finder candidate
 /// (a `loom:building` row is already being worked), but is NOT a park — see
@@ -62,17 +73,21 @@ pub const OPERATOR_HOLD_LABEL: &str = "loom:operator";
 /// exclusive states in the `.github/labels.yml` state machine), but `gh`'s
 /// label cache can be briefly stale, so the finder checks defensively.
 ///
-/// Composed as [`BUILDING_LABEL`], [`PARK_LABELS`], [`OPERATOR_HOLD_LABEL`]
-/// and [`OPERATOR_DECISION_LABEL`] rather than re-listing the label strings,
-/// so the constants can never drift apart (#4444). The operator hold sits in this
-/// list but NOT in [`PARK_LABELS`] — see [`OPERATOR_HOLD_LABEL`] for why.
-pub const SKIP_LABELS: &[&str] = &[
-    BUILDING_LABEL,
-    PARK_LABELS[0],
-    PARK_LABELS[1],
-    OPERATOR_HOLD_LABEL,
-    OPERATOR_DECISION_LABEL,
-];
+/// Derived from the registry's `skip` property, so it can never drift from
+/// [`PARK_LABELS`] (#4444: every park label is also a skip label, which
+/// `Registry::validate` enforces). Ordered as the claim ([`BUILDING_LABEL`]), the
+/// parks, the generic hold ([`OPERATOR_HOLD_LABEL`]), then the sub-kinds that
+/// require a base label ([`OPERATOR_DECISION_LABEL`]). The operator hold sits
+/// in this list but NOT in [`PARK_LABELS`] — see [`OPERATOR_HOLD_LABEL`] for why.
+pub static SKIP_LABELS: LabelSet = LabelSet::new(|| {
+    let reg = Registry::embedded();
+    let mut skip = embedded_set("skip");
+    skip.sort_by_key(|name| {
+        let l = reg.get(name).expect("with_property names a registry label");
+        (l.kind != "claim", !l.park, l.requires_base.is_some())
+    });
+    skip
+});
 
 /// The `loom:operator-only` decision sub-kind (#5671): an owner has to rule.
 ///
@@ -83,4 +98,8 @@ pub const SKIP_LABELS: &[&str] = &[
 /// waiting on an owner's decision must never dispatch a sweep onto it, even
 /// if the base label was dropped. Not a park ([`PARK_LABELS`]): the base
 /// label already is one wherever it matters.
+///
+/// Membership in [`SKIP_LABELS`] now comes from the registry's `skip`
+/// property (#10013), so outside tests this name is documentation only.
+#[cfg_attr(not(test), allow(dead_code))]
 pub const OPERATOR_DECISION_LABEL: &str = "loom:operator-decision";

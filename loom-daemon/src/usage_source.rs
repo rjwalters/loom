@@ -666,17 +666,16 @@ mod tests {
 
         std::env::remove_var(crate::codex_usage::CODEX_HOME_ENV);
         std::env::set_var(crate::codex_usage::CODEX_NATIVE_HOME_ENV, &ambient);
-        std::env::set_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV, &profiles);
+        let _profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::set(&profiles);
         let window = Some((
             "2026-09-21T01:00:00Z".parse().unwrap(),
             "2026-09-21T03:00:00Z".parse().unwrap(),
         ));
         let found = sweep_tokens_by_model(Some("codex"), &workspace, 8594, window);
         // Without the profile root the ambient home alone finds nothing.
-        std::env::set_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV, "");
+        let _profile_root = crate::tokens_pool::profile_root_env::ProfileRootEnv::set("");
         let ambient_only = sweep_tokens_by_model(Some("codex"), &workspace, 8594, window);
         std::env::remove_var(crate::codex_usage::CODEX_NATIVE_HOME_ENV);
-        std::env::remove_var(crate::tokens_pool::paths::CODEX_PROFILE_ROOT_ENV);
 
         let totals = found.expect("the pooled profile's rollout must be found");
         assert_eq!(totals.len(), 1, "{totals:?}");

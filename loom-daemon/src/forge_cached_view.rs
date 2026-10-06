@@ -338,8 +338,9 @@ pub fn build_view_url(entity: &str, repo: Option<&str>, number: u32) -> String {
 
 /// `view-{entity}-{number}-{hash}.json`, keeping view entries distinguishable
 /// from the listing store's `listing-{hash}.json` entries sharing the same
-/// directory ([`store::disk_cache_dir`]).
-fn entry_path(dir: &Path, entity: &str, number: u32, cache_key: &str) -> PathBuf {
+/// directory ([`store::disk_cache_dir`]). Shared with
+/// [`crate::forge_wait_checks`]' PR-head read, so the two hold one ETag.
+pub(crate) fn entry_path(dir: &Path, entity: &str, number: u32, cache_key: &str) -> PathBuf {
     store::entry_path_with_prefix(dir, &format!("{VIEW_PREFIX}{entity}-{number}-"), cache_key)
 }
 
@@ -385,6 +386,20 @@ fn prune_stale(dir: &Path) {
     }
 }
 
+/// The inventoried operation a single-entity view serves (#9831).
+fn view_op(entity: &str) -> crate::forge_call_stats::ForgeOp {
+    if entity == "pr" {
+        crate::forge_call_stats::ops::PR_VIEW_STATE
+    } else {
+        // `GET repos/{o}/{r}/issues/{n}`: the inventory has no single-issue
+        // read row (`issue.list` is the label listing, `comment.list` the
+        // conversation) — recorded as `unknown` until one is inventoried.
+        crate::forge_call_stats::ForgeOp::uninventoried(
+            "single-issue REST read has no inventory row",
+        )
+    }
+}
+
 /// One conditional `gh api --include` GET via the shared
 /// [`store::fetch_conditional`] (recorded against caller `"forge_cached_view"`
 /// in `forge_call_stats`). Returns the body to serve (fresh on `200`, the
@@ -392,6 +407,36 @@ fn prune_stale(dir: &Path) {
 /// non-200/304 answer, or an exit-code failure on what should have been a
 /// `200`.
 fn fetch_conditional(
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    dir: &Path,
+    entity: &str,
+    number: u32,
+    repo_override: Option<&str>,
+) -> Option<String> {
+    fetch_conditional_as("forge_cached_view", gh_bin, cwd, dir, entity, number, repo_override)
+}
+
+/// [`build_output`] against an explicit `gh`, recorded against `caller` in
+/// `forge_call_stats` — the agent `gh` front's in-process entry (#10331),
+/// whose bare `gh` on `PATH` is the front itself.
+#[must_use]
+pub fn build_output_via(
+    caller: &'static str,
+    entity: &str,
+    args: &[String],
+    gh_bin: &Path,
+) -> Option<String> {
+    let cwd = std::env::current_dir().ok();
+    let dir = store::disk_cache_dir();
+    build_output(entity, args, &|e, n, r| {
+        fetch_conditional_as(caller, gh_bin, cwd.as_deref(), &dir, e, n, r)
+    })
+}
+
+/// [`fetch_conditional`] recorded against an explicit `caller`.
+fn fetch_conditional_as(
+    caller: &'static str,
     gh_bin: &Path,
     cwd: Option<&Path>,
     dir: &Path,
@@ -408,9 +453,9 @@ fn fetch_conditional(
     let prior = store::read_disk_entry(&path);
     let prior_etag = prior.as_ref().map(|p| p.etag.as_str());
 
+    let site = store::ConditionalRead::new(caller, view_op(entity));
     let (status, response, _stderr) =
-        store::fetch_conditional("forge_cached_view", gh_bin, cwd, &target, &url, prior_etag)
-            .ok()?;
+        store::fetch_conditional(site, gh_bin, cwd, &target, &url, prior_etag).ok()?;
 
     match response {
         Some(r) if r.status == 304 => match prior {

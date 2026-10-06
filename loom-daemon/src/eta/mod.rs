@@ -10,7 +10,18 @@
 //! ```text
 //! ready_wait → sweep.curator → sweep.builder → review_wait ─┬─ approved ──→ merge_wait → landed
 //!                                              └─ changes_requested → doctor ─┘ (loop, capped)
+//!                                                       approved + operator hold: merge_hold ⇄ merge_wait
 //! ```
+//!
+//! `merge_hold` (#10218) is an approved PR held for a human (`loom:pr` plus
+//! `loom:operator`, `loom:operator-only` or `loom:operator-decision`). It
+//! leaves to `merge_wait` when the hold is lifted, or to `doctor`, a merge or
+//! a close. Every path-engine heuristic still refuses it as `blocked` (the
+//! shadow `land-2026-10-04-twin-otter` estimates it from its fit's own
+//! `merge_hold` stage), and the `merge_wait` samples still run from the
+//! approval to the merge, hold
+//! included (the **pooled** definition); the hold-free `merge_wait` and the
+//! hold itself live in [`episodes`], the record a hold-aware heuristic fits.
 //!
 //! `ready_wait` (#9326) is the stage a ready (`loom:issue`) issue spends
 //! waiting for a dispatch slot. Its distribution is the host's empirical
@@ -54,6 +65,20 @@
 //! produced a number. See [`history`] for the trade-offs and [`fleet`] for the
 //! snapshot's determinism and cost properties.
 //!
+//! # Fitted models (#10221, #10243)
+//!
+//! [`fit`] is the pure core of the daily point-in-time fit (`eta-fit/v1`):
+//! per-stage exit hazards, a censored log-normal direct model and dwell-path
+//! statistics, written as one content-addressed coefficient file that fitted
+//! heuristics load instead of reading fleet history themselves.
+//!
+//! The file is loaded **when the registry is built**, never inside an
+//! estimate: [`Registry::load`] reads the newest fit strictly before an
+//! instant, and [`Registry::with_fit`] is the pure constructor it wraps.
+//! The tracker rebuilds its registry when a later pass finds a fit with a
+//! different id, so a daily refit reaches a running daemon within one pass.
+//! A fitted heuristic with no usable file refuses `no_model`.
+//!
 //! # Versioning
 //!
 //! A heuristic id (`start-v1`, `finish-v1`, `land-v1`) is immutable once shipped: a
@@ -70,19 +95,48 @@
 //! — and the switch that flips the config is [`shadow`].
 
 pub mod backtest;
+pub mod calibration_log;
 pub mod config;
+pub mod doctor;
+pub mod doctor_facts;
 pub mod emit;
+pub mod episodes;
 pub mod explanation;
+pub mod fit;
+pub mod flag_timeline;
 pub mod fleet;
+pub mod fleet_agreement;
+pub mod fleet_events;
+pub mod fleet_events_fanout;
+pub mod fleet_events_forge;
+pub mod fleet_events_pulls;
+pub mod fleet_events_reviews;
+pub mod fleet_events_webhook;
+pub mod fleet_fetch;
+pub mod fleet_refresh;
+pub mod fleet_signoz;
+pub mod fleet_signoz_refresh;
+pub mod fleet_state;
+pub mod fleet_state_prs;
+pub mod friction;
 pub mod grid;
+pub mod health;
 pub mod heuristics;
 pub mod history;
 pub mod journal;
 pub mod labels;
+pub mod offline;
+pub mod priority_features;
+pub mod queue_features;
+pub mod recalibrate;
+pub mod recency;
 pub mod score;
 pub mod shadow;
 pub mod simulate;
+pub mod stall;
+pub mod star;
 pub mod tracker;
+pub mod twin_otter;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -91,6 +145,8 @@ pub(crate) mod tests;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::Path;
+use std::sync::Arc;
 
 pub use explanation::Explanation;
 pub use history::StageSamples;
@@ -173,16 +229,22 @@ pub enum Stage {
     /// is one slot turnover.
     #[serde(rename = "ready_wait")]
     ReadyWait,
+    /// Approved, held for a human (#10218): `loom:pr` plus an operator hold
+    /// ([`labels::MERGE_HOLD_LABELS`]). Declared last, so the derived `Ord`
+    /// every canonical ordering sorts on is unchanged for the other six.
+    #[serde(rename = "merge_hold")]
+    MergeHold,
 }
 
 /// How many [`Stage`] variants there are: the length of per-stage arrays.
-pub const STAGE_COUNT: usize = 6;
+pub const STAGE_COUNT: usize = 7;
 
 impl Stage {
     /// Every post-dispatch stage, in path order. `ready_wait` precedes them
     /// on an unstarted issue's path but is deliberately not in this list, so
     /// every output built over it before #9326 is unchanged ([`Self::EVERY`]
-    /// has all six).
+    /// has all seven). `merge_hold` (#10218) is not in it either, for the same
+    /// reason: no path-engine heuristic visits it.
     pub const ALL: [Stage; 5] = [
         Stage::SweepCurator,
         Stage::SweepBuilder,
@@ -191,7 +253,8 @@ impl Stage {
         Stage::MergeWait,
     ];
 
-    /// Every stage, in path order, `ready_wait` first.
+    /// Every stage, in path order, `ready_wait` first and `merge_hold` last
+    /// (it is visited only on a path that starts there, before `merge_wait`).
     pub const EVERY: [Stage; STAGE_COUNT] = [
         Stage::ReadyWait,
         Stage::SweepCurator,
@@ -199,6 +262,7 @@ impl Stage {
         Stage::ReviewWait,
         Stage::Doctor,
         Stage::MergeWait,
+        Stage::MergeHold,
     ];
 
     /// The wire name.
@@ -211,6 +275,7 @@ impl Stage {
             Stage::Doctor => "doctor",
             Stage::MergeWait => "merge_wait",
             Stage::ReadyWait => "ready_wait",
+            Stage::MergeHold => "merge_hold",
         }
     }
 
@@ -224,6 +289,7 @@ impl Stage {
             Stage::Doctor => 3,
             Stage::MergeWait => 4,
             Stage::ReadyWait => 5,
+            Stage::MergeHold => 6,
         }
     }
 
@@ -287,6 +353,10 @@ pub enum NoEstimateReason {
     UnknownStage,
     /// The inputs are too old to describe the present.
     StaleInputs,
+    /// A fitted heuristic (#10243) has no usable coefficient file: none is
+    /// loaded, it has no direct model, its cutoff is not strictly before
+    /// `as_of`, or its coefficients are malformed.
+    NoModel,
 }
 
 impl NoEstimateReason {
@@ -301,6 +371,7 @@ impl NoEstimateReason {
             NoEstimateReason::NoDispatchPlan => "no_dispatch_plan",
             NoEstimateReason::UnknownStage => "unknown_stage",
             NoEstimateReason::StaleInputs => "stale_inputs",
+            NoEstimateReason::NoModel => "no_model",
         }
     }
 }
@@ -438,6 +509,15 @@ pub struct CurrentStage {
     pub age_source: AgeSource,
     /// Judge rejections this PR has already taken.
     pub rework_rounds: u32,
+    /// When the current **stage episode** began, when it differs from
+    /// `entered_at` (#10218): the instant an operator hold was lifted, for a
+    /// PR back in `merge_wait` after a `merge_hold`. `entered_at` keeps the
+    /// pooled definition (the approval) that every shipped heuristic reads;
+    /// a hold-aware heuristic reads the split age from here. `None` means
+    /// "the same as `entered_at`". Not copied into the explanation's
+    /// `current_stage`, so no shipped explanation changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_entered_at: Option<DateTime<Utc>>,
 }
 
 /// The resolved present of one item: a stage, or the reason it has none.
@@ -514,6 +594,16 @@ pub struct EstimateInput {
     /// The dispatch plan's view of a ready item; `None` for every started
     /// one.
     pub dispatch: Option<DispatchInput>,
+    /// The stall signals that stop this item now (#10210), already narrowed
+    /// to it ([`stall::StallSnapshot::for_item`]). Every heuristic records
+    /// the binding one; only a stall-aware heuristic adds its term.
+    pub stalls: Vec<stall::StallSignal>,
+    /// The stage underneath an operator hold (#10210): set only when
+    /// `current` is a `blocked` refusal whose every hold is an operator
+    /// hold and whose review labels still name a stage. A stall-aware
+    /// heuristic estimates from it (plus the hold's stall term) instead of
+    /// refusing; every other heuristic ignores it.
+    pub held: Option<CurrentStage>,
 }
 
 /// A registered estimator. Implementations must be pure.
@@ -525,25 +615,73 @@ pub trait Heuristic: Send + Sync {
     /// Estimate `input` from `history`. Always returns an explanation; a
     /// refusal sets `no_estimate_reason` and carries no result.
     fn estimate(&self, input: &EstimateInput, history: &StageSamples) -> Explanation;
+    /// Whether it models an operator hold (`merge_hold`, #10218) rather than
+    /// refusing it `blocked`. The tracker hands such a heuristic the held
+    /// item's **modeled** input, with its stage-dependent queue features
+    /// counted from `merge_hold` as training counts them, and refreshes its
+    /// series while held (#10284). Every other heuristic keeps the described
+    /// `blocked` input, byte for byte.
+    fn models_hold(&self) -> bool {
+        false
+    }
 }
 
 /// Every shipped heuristic, and which one is `current` per kind.
 pub struct Registry {
     heuristics: Vec<Box<dyn Heuristic>>,
+    /// The coefficient file the fitted heuristics were built with.
+    fit: Option<Arc<fit::CoefficientFile>>,
 }
 
 impl Registry {
-    /// The built-in heuristics.
+    /// The built-in heuristics, with no coefficient file: reads nothing, so
+    /// every fitted heuristic refuses `no_model`.
     #[must_use]
     pub fn builtin() -> Self {
+        Self::with_fit(None)
+    }
+
+    /// The built-in heuristics, the fitted ones built with `fit`. Pure.
+    /// `land-2026-10-04-twin-otter` (and its pre-PR composition `-b`, last)
+    /// are registered **always**, with
+    /// or without a file, so its refusals are on the record too.
+    #[must_use]
+    pub fn with_fit(fit: Option<Arc<fit::CoefficientFile>>) -> Self {
         Registry {
             heuristics: vec![
                 Box::new(heuristics::StartV1),
                 Box::new(heuristics::FinishV1),
                 Box::new(heuristics::LandV1),
                 Box::new(heuristics::LandV2),
+                Box::new(heuristics::LandV3),
+                Box::new(heuristics::LandAmberHeron),
+                Box::new(heuristics::LandFreshTide::default()),
+                Box::new(heuristics::LandV4),
+                Box::new(heuristics::LandTwinOtter::new(fit.clone())),
+                Box::new(heuristics::LandTwinOtterB::new(fit.clone())),
             ],
+            fit,
         }
+    }
+
+    /// The built-in heuristics with the newest coefficient file under
+    /// `workspace_root` whose cutoff is strictly before `before`
+    /// ([`fit::load_latest`]). The registry's only I/O.
+    #[must_use]
+    pub fn load(workspace_root: &Path, before: DateTime<Utc>) -> Self {
+        Self::with_fit(fit::load_latest(workspace_root, before).map(Arc::new))
+    }
+
+    /// The coefficient file the fitted heuristics were built with.
+    #[must_use]
+    pub fn fit(&self) -> Option<&fit::CoefficientFile> {
+        self.fit.as_deref()
+    }
+
+    /// That file's id, when there is one.
+    #[must_use]
+    pub fn fit_id(&self) -> Option<&str> {
+        self.fit.as_deref().map(|f| f.id.as_str())
     }
 
     /// Look a heuristic up by id.

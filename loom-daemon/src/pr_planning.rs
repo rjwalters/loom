@@ -39,6 +39,23 @@ pub fn has_label(row: &Value, label: &str) -> bool {
     })
 }
 
+/// The row's effective operator priority level (#10307): the highest level
+/// label it carries, own or inherited (0 = unstarred).
+pub fn operator_level(row: &Value) -> u8 {
+    operator_level_in(crate::operator_levels::table(), row)
+}
+
+/// [`operator_level`] against an explicit level `table`.
+pub fn operator_level_in(table: &[crate::operator_levels::PriorityLevel], row: &Value) -> u8 {
+    let labels: Vec<&str> = row["labels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l.as_str().or_else(|| l["name"].as_str()))
+        .collect();
+    crate::operator_levels::level_in(table, &labels)
+}
+
 fn fallback(row: &Value) -> bool {
     row["labels"].as_array().is_some_and(|labels| {
         labels.iter().all(|l| {
@@ -102,7 +119,9 @@ pub fn ordered_queue(
         PrRole::Judge => {}
     }
     candidates.sort_by_key(|r| {
-        let star = !has_label(r, "loom:operator-priority");
+        // Effective level, highest first (#10307): a level-2 row precedes a
+        // plain star, which precedes everything unstarred.
+        let star = std::cmp::Reverse(operator_level(r));
         let human = !(prefer && WorkOrigin::trusted_pr(r, trust) == WorkOrigin::Interactive);
         // Doctor historically applied stars inside each queue. Disabled
         // preference reproduces that ordering exactly.
@@ -120,7 +139,8 @@ pub fn ordered_queue(
         } else {
             "workflow"
         };
-        let reason = if has_label(row, "loom:operator-priority") {
+        let level = operator_level(row);
+        let reason = if level >= 1 {
             "operator-priority"
         } else if prefer && origin == WorkOrigin::Interactive {
             "interactive"
@@ -130,6 +150,7 @@ pub fn ordered_queue(
         row["origin"] = json!(origin);
         row["mode"] = json!(mode);
         row["priorityReason"] = json!(reason);
+        row["operatorPriorityLevel"] = json!(level);
     }
     candidates
 }
