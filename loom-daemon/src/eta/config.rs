@@ -8,7 +8,7 @@
 //! | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
 //! | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245) |
 //! | `current.start` / `current.finish` / `current.land` | — | `start-v1` / `finish-v1` / `land-v1` |
-//! | `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `10` registered heuristics per kind (floor 1; #10525) |
+//! | `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `13` registered heuristics per kind (floor 1; #10525, #10549) |
 //!
 //! `autonomous.eta.fleetRefresh.*` (#10263) — the daemon task that backfills
 //! and refreshes the fleet snapshots (`observability::eta_fleet_refresh`).

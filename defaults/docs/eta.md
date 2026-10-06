@@ -270,7 +270,6 @@ only.
 | `land-v2` | `land` | the same, with **right-censored** stage samples folded in (Kaplan–Meier grids) | after `merge_wait` |
 | `land-2026-10-06-calm-plover` | `land` | `land-v2`'s path, then **each** of p25/p50/p75/p90 conformally calibrated against its own hit rate from `land-v2`'s landed **and** still-open (right-censored lower-bound) track record in a trailing 14-day window, per (stage, age bucket) → stage → pooled, with the per-day change of the shift rate-limited; fitted at the estimate's own `as_of` (recorded as `calibration`; #10489) | after `merge_wait` |
 | `land-2026-10-06-quick-tern` | `land` | `land-2026-10-04-twin-otter-b`'s estimate, then each of p25/p50/p75/p90 calibrated by **IPCW** split-conformal over twin-otter-b's landed and still-open track record in a **short recent window** (6 h half-life, doubling when there are too few landings), per stage → pooled. There is no rate limit; a shift within 1.5 standard errors of zero is not applied. Fitted at the estimate's own `as_of`, recorded as `calibration` with `ipcw{…}` (#10524) | at the merge |
-| `land-2026-10-04-fresh-tide` | `land` | `land-v2`'s, with every stage sample (observed and censored) weighted `exp(−age / half_life)`, half-life 2 days, and the grid built from the weighted samples; when the effective N `(Σw)²/Σw²` falls below 8 the half-life doubles (up to 6 times, then flat). Records `distribution.half_life_sec` (absent when flat) and `distribution.effective_n` per stage (#10209) | after `merge_wait` |
 | `land-v4` | `land` | the retired `land-v3`'s grid calibration (widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored; recorded per stage as `distribution.adjustment`; #9970), plus the binding stall's term added to every path, operator-held PRs estimated from the stage under the hold, and no `beyond_history` refusal (a flagged residual-life tail instead; #10210) | after `merge_wait` |
 | `little-v0` | `land` | **floor baseline, never promoted** (#10208): Little's law. For a PR in `review_wait` / `doctor` / `merge_wait`, `items_ahead / drain_rate` for the current stage plus the recency-weighted mean duration of each later stage; interval from a Gamma posterior on the rate (shape = observed exits, 400 seeded draws). Refuses with a zero drain rate and items ahead, or with no queue context; a held PR (`merge_hold`) is refused `blocked`, as by every heuristic that does not model the hold | after `merge_wait` |
 | `land-2026-10-04-twin-otter` | `land` | no history: the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)). PR stages only (`review_wait`, `doctor`, `merge_wait`, `merge_hold`); the blend of a stage-by-stage exit-hazard Monte Carlo (256 paths, seeded per stage visit) and a log-normal direct model (recorded as `twin_otter`; #10222, #10243) | at the merge |
@@ -295,6 +294,7 @@ registry would be a second mechanism for dominated heuristics).
 |---|---|---|---|
 | `land-v3` | 2026-10-06 | Dominated in live outcomes (48 h of `eta.outcome`, `land`): pinball4 3.51 h, p25-p75 coverage 0.126, late surprise (> p90) 0.611. It sits strictly between `land-v2` and `land-v4` on every calibration figure, and `land-v4` is `land-v3` plus the stall, hold and tail fixes. Its grid step lives on inside `land-v4`. | #9970, #10484 |
 | `land-2026-10-04-amber-heron` | 2026-10-06 | Dominated in live outcomes (same 48 h window): pinball4 8.97 h (the worst of any heuristic that answers broadly), p25-p75 coverage 0.147, late surprise 0.649, barely better than `land-v2`'s 0.71. On the small common subset all seven answered (6 items) it is last on pinball. | #10207, #10484 |
+| `land-2026-10-04-fresh-tide` | 2026-10-06 | Failed the backtest gate: on the 52-fold backtest over verified forge history (the evidence is on #10549) it was +0.49 h [+0.30, +0.69] pinball4 against `land-v2`, winning 17 of 52 days (Wilson lower bound 0.22). Its recency idea is covered by the recent-window calibration of #10541 and the planned regime adjustment of #10528. Its module and the `eta backtest --half-life-days` replay flag (#10325) were removed with it; the engine's recency weighting stays (`recalibrate` uses it). | #10209, #10549 |
 
 A shipped id is **immutable**: a golden test pins each id's output on a fixed
 fixture. A behaviour change is a new id registered beside the old one
@@ -576,13 +576,9 @@ remains a separate future id.
 with no coefficient file, so there it refuses `no_model`: its backtest gate
 cannot pass while it is a shadow, by design. Its live evidence is the
 tracker's, which loads the file (below).
-`land-2026-10-04-fresh-tide` (#10209) ships the same way. Its half-life is a
-constructor parameter (`LandFreshTide::with_half_life`), so a 1/2/7-day
-comparison needs no extra registered ids; only the 2-day default is
-registered and shadowed. `loom-daemon eta backtest --heuristic
-land-2026-10-04-fresh-tide --compare land-v2 --half-life-days 1|2|7` replays
-any setting on the same snapshot (#10325); it needs a journal that holds
-stage samples (run `eta backfill` first), or every case refuses.
+`land-2026-10-04-fresh-tide` (#10209) shipped the same way and was retired
+on 2026-10-06 after failing its backtest gate (#10549; see
+[Retired heuristics](#retired-heuristics)).
 `land-v4` (#10210) ships the same way.
 
 ## Shadow fleet management
@@ -598,7 +594,7 @@ in wiring. Two rules keep it safe as their number grows (#10525).
 |---|---|---|---|---|
 | `baseline` | `start-v1`, `finish-v1`, `land-v1`, `little-v0` | yes | no | no |
 | `candidate` | every other registered id | yes | yes | yes, through the gates |
-| `retired` | `land-v3`, `land-2026-10-04-amber-heron` ([above](#retired-heuristics)) | no (not registered) | no | no |
+| `retired` | `land-v3`, `land-2026-10-04-amber-heron`, `land-2026-10-04-fresh-tide` ([above](#retired-heuristics)) | no (not registered) | no | no |
 
 A baseline is the reference every candidate is scored beside. `land-v1` is
 also the default `current` for `land`; being a baseline only stops the gate
@@ -607,17 +603,20 @@ Every `eta.snapshot` alternate carries its `tier`; loom-ui's chooser filters
 on it (loom-ui#2031). A retired id stays unregistered, as #10484 decided.
 `eta::shadow_fleet::RETIRED` keeps the id so it is never reused.
 
-**The shadow budget.** `autonomous.eta.shadow.maxActive` (default 10, floor 1)
+**The shadow budget.** `autonomous.eta.shadow.maxActive` (default 13, floor 1)
 caps the registered heuristics **per kind**, `current` included. When a
 build's registry exceeds the configured budget, the ETA tracker does not start.
 The daemon logs `eta: not started: N land heuristics are registered but
 autonomous.eta.shadow.maxActive is M; over the budget: …`, naming the
 heuristics past the budget in registration order. `eta promote` refuses the
 same way. A unit test holds the built-in registry within the default budget,
-so an eleventh registration fails CI first. Retire a heuristic (a code change,
-as in #10484) or raise the budget. The live list adds one more ceiling: at
-most 8 alternates per row (loom-ui slices at 8), so a kind's ninth shadow
-also needs that cap raised on both sides.
+so a fourteenth registration fails CI first. Retire a heuristic (a code
+change, as in #10484 and #10549) or raise the budget. The default is the
+kind's `current` plus the 12 alternates one `eta.snapshot` row carries (#10549,
+was 10 and 8), and a unit test holds the two together, so no heuristic within
+the default budget is silently dropped from the chooser. Raising the budget
+past 13 also needs the alternates cap raised on both sides (loom-ui's
+`MAX_ALTERNATES`; a loom-ui still slicing at 8 reads the first 8 by id).
 
 **Wrappers are explicit compositions.** A calibration, conformal or
 dependency wrapper over a base is registered as its own id
@@ -2006,7 +2005,7 @@ of what is on disk and never needs a refetch.
 | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
 | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245). It runs only with `enabled` too, is read at start, and is a no-op until a fleet snapshot is cached |
 | `current.start` / `current.finish` / `current.land` | none | `start-v1` / `finish-v1` / `land-v1` |
-| `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `10` registered heuristics per kind, floor 1. Over it, the tracker does not start (see [Shadow fleet management](#shadow-fleet-management)) |
+| `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `13` registered heuristics per kind (`current` + 12 alternates, #10549), floor 1. Over it, the tracker does not start (see [Shadow fleet management](#shadow-fleet-management)) |
 | `fleetRefresh.enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | `true` (#10263) |
 | `fleetRefresh.intervalSecs` | `LOOM_ETA_FLEET_REFRESH_INTERVAL_SECS` | `3600` (floor 900) |
 | `fleetRefresh.maxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_MAX_CALLS` | `300` |

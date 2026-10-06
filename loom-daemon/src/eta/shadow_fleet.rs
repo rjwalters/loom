@@ -16,7 +16,7 @@
 //! - [`Tier::Candidate`]: a challenger. Only a candidate can be promoted, and
 //!   only candidates are offered in the loom-ui ETA chooser (the tier rides on
 //!   every `eta.snapshot` alternate).
-//! - [`Tier::Retired`]: no longer registered (#10484). It produces no
+//! - [`Tier::Retired`]: no longer registered (#10484, #10549). It produces no
 //!   estimate, no alternate and no ledger pair. The id stays in [`RETIRED`]
 //!   so it is never reused and a lookup still answers what it was.
 //!
@@ -37,7 +37,12 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 /// Default `autonomous.eta.shadow.maxActive`: registered heuristics per kind.
-pub const DEFAULT_MAX_ACTIVE: usize = 10;
+///
+/// 13 is the kind's `current` plus the 12 alternates one `eta.snapshot` row
+/// carries ([`crate::telemetry::kinds::eta_snapshot::MAX_ALTERNATES`],
+/// #10549), so a registry within the default budget never has a shadow the
+/// snapshot silently drops. A unit test holds the two together.
+pub const DEFAULT_MAX_ACTIVE: usize = 13;
 
 /// Smallest budget accepted. A kind always has its `current` heuristic.
 pub const MIN_MAX_ACTIVE: usize = 1;
@@ -72,11 +77,12 @@ impl std::fmt::Display for Tier {
     }
 }
 
-/// Retired heuristic ids and their kind (#10484). Never registered, never
-/// reused; see `eta.md` "Retired heuristics" for why each was retired.
+/// Retired heuristic ids and their kind (#10484, #10549). Never registered,
+/// never reused; see `eta.md` "Retired heuristics" for why each was retired.
 pub const RETIRED: &[(&str, Kind)] = &[
     (super::heuristics::LAND_V3, Kind::Land),
     ("land-2026-10-04-amber-heron", Kind::Land),
+    ("land-2026-10-04-fresh-tide", Kind::Land),
 ];
 
 /// Whether `id` is a retired heuristic id.
