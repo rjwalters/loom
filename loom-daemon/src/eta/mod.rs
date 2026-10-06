@@ -134,6 +134,7 @@ pub mod priority_features;
 pub mod queue_features;
 pub mod recalibrate;
 pub mod recency;
+pub mod regime;
 pub mod score;
 pub mod shadow;
 pub mod shadow_fleet;

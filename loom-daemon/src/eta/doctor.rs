@@ -249,6 +249,20 @@ pub struct OutcomeFacts {
     pub oldest_pending: Option<DateTime<Utc>>,
     /// Pending estimates.
     pub pending: u64,
+    /// Per-stage drift verdicts over the last 6 h of scored outcomes
+    /// (#10528), one per stage that has any recent outcome.
+    pub drift: Vec<DriftFacts>,
+}
+
+/// One stage's drift verdict ([`super::regime::drift`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftFacts {
+    /// The stage's wire name.
+    pub stage: String,
+    /// Scored outcomes in the last 6 h.
+    pub n_recent: u64,
+    /// Whether the CUSUM tripped.
+    pub drifted: bool,
 }
 
 /// Everything the doctor reads.
@@ -883,6 +897,30 @@ fn outcomes(f: &Facts) -> Vec<Check> {
             &format!("pairs {}", p.key),
             format!("{} paired outcome(s); a promotion gate needs 50", p.pairs),
         ));
+    }
+    if o.drift.is_empty() {
+        out.push(Check::skip(
+            "outcomes",
+            "drift",
+            "no scored outcome in the last 6h: nothing to check for regime drift",
+        ));
+    }
+    for d in &o.drift {
+        let name = format!("drift {}", d.stage);
+        out.push(if d.drifted {
+            Check::bad(
+                "outcomes",
+                &name,
+                Status::Warn,
+                format!(
+                    "{} scored outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served durations are scaled by the recent residual",
+                    d.n_recent
+                ),
+                "no action needed for serving; the fit is stale for this stage until the next refit on current-regime rows",
+            )
+        } else {
+            Check::ok("outcomes", &name, format!("{} scored outcome(s) in 6h, no drift", d.n_recent))
+        });
     }
     out.push(match o.oldest_pending {
         None => Check::skip("outcomes", "oldest_pending", "no pending estimates"),

@@ -36,6 +36,7 @@ mod queue_features;
 mod ready;
 mod recalibrate;
 mod recency;
+mod regime;
 mod score;
 mod shadow;
 mod shadow_fleet;

@@ -193,6 +193,7 @@ fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) -> Explanat
         calibration: None,
         twin_otter: None,
         queue: None,
+        regime_adjustment: None,
     }
 }
 

@@ -75,6 +75,7 @@ fn healthy() -> Facts {
             }],
             oldest_pending: Some(hours_ago(30)),
             pending: 4,
+            drift: Vec::new(),
         },
     }
 }
