@@ -136,6 +136,10 @@ pub enum Skip {
     OtherOpenReference,
     /// An issue with an open closing PR.
     OpenClosingPr,
+    /// An unticked `## Dependencies` box (#9274): its ref may have resolved,
+    /// but an unchecked box is unmet until a human confirms its whole
+    /// condition, so the pass never releases over it.
+    UntickedChecklist,
     /// A PR whose own state supersedes the cleared park
     /// ([`super::park_self_block`]).
     Superseded,
@@ -636,10 +640,16 @@ fn veto_from_evidence(
             Some(Skip::OtherOpenReference)
         } else if plan.kind == Artifact::Issue && ev.closing.iter().any(|p| p.state == "OPEN") {
             Some(Skip::OpenClosingPr)
+        } else if ev.unparsed_unchecked > 0 || ev.named.iter().any(|d| !d.checked) {
+            // Checked here, not only via `classify`: a resolved park blocker
+            // also arrives as prose, and the advisory's prose rule then reads
+            // `Stale` over an unticked checklist (#9274).
+            Some(Skip::UntickedChecklist)
         } else {
             match classify(ev) {
                 Verdict::Stale(_) => None,
                 Verdict::Superseded { .. } => Some(Skip::Superseded),
+                Verdict::Unticked { .. } => Some(Skip::UntickedChecklist),
                 // Unreachable with every declared blocker resolved; never
                 // release on a verdict that does not say so.
                 Verdict::StillBlocked | Verdict::Undocumented => Some(Skip::OtherOpenReference),

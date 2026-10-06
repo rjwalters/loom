@@ -431,6 +431,38 @@ fn another_open_prose_reference_vetoes_a_release() {
     assert!(w.no_writes());
 }
 
+/// #9274: a resolved park blocker beside an unticked `## Dependencies` box
+/// whose ref closed is NOT released: the box is unmet until a human ticks it.
+#[test]
+fn unticked_checklist_box_vetoes_a_release() {
+    let mut w = World::new();
+    let body = format!(
+        "## Dependencies\n\n- [ ] #8: hardware bring-up signed off\n\n{}\n",
+        render_park(&[1], Some("builder"), Some("2026-10-01T00:00:00Z"), None)
+    );
+    w.with_body(10, false, &body, &[]);
+    w.state(1, "CLOSED", false);
+    w.state(8, "CLOSED", false);
+    let r = w.run();
+    assert_eq!(skipped(&r, "unticked-checklist"), 1, "{}", r.summary());
+    assert!(w.no_writes());
+}
+
+/// The same veto for an unchecked line no parser reads.
+#[test]
+fn unparseable_unticked_checklist_line_vetoes_a_release() {
+    let mut w = World::new();
+    let body = format!(
+        "## Dependencies\n\n- [ ] vendor confirms the pinout\n\n{}\n",
+        render_park(&[1], Some("builder"), Some("2026-10-01T00:00:00Z"), None)
+    );
+    w.with_body(10, false, &body, &[]);
+    w.state(1, "CLOSED", false);
+    let r = w.run();
+    assert_eq!(skipped(&r, "unticked-checklist"), 1, "{}", r.summary());
+    assert!(w.no_writes());
+}
+
 #[test]
 fn superseded_pr_is_skipped() {
     let mut w = World::new();
