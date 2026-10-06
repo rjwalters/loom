@@ -5,7 +5,9 @@
 use super::{as_of, history_a, input_at};
 use crate::eta::explanation::Explanation;
 use crate::eta::grid;
-use crate::eta::heuristics::{estimate_path, PathRules, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B};
+use crate::eta::heuristics::{
+    estimate_path, PathRules, LAND_QUICK_TERN, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B,
+};
 use crate::eta::history::{SampleSource, StageSample, StageSamples};
 use crate::eta::labels::{
     hold_labels, stage_from_pr_labels, MERGE_HOLD_COMPANION_LABELS, MERGE_HOLD_LABELS,
@@ -133,7 +135,7 @@ fn every_shipped_heuristic_refuses_a_held_pr_exactly_as_before() {
         .ids()
         .into_iter()
         .partition(|id| registry.get(id).unwrap().models_hold());
-    assert_eq!(models_hold, vec![LAND_TWIN_OTTER, LAND_TWIN_OTTER_B]);
+    assert_eq!(models_hold, vec![LAND_QUICK_TERN, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B]);
     assert_eq!(path_engine.len(), 8, "{path_engine:?}");
     for id in path_engine {
         let heuristic = registry.get(id).unwrap();
