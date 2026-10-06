@@ -2157,6 +2157,38 @@ The daemon also keeps the last record at `.loom/state/eta/health/fit-check.json`
 (byte-identical to the body) and the last refresh tick at
 `refresh-cycle.json`, for `loom-daemon eta doctor`.
 
+### `pr.resolved`
+
+A PR the ETA pass saw leave the review listings, with its merge or close
+instant (Issue #10519). Envelopes carry `schema_version: 12`. **OTLP-only**
+(native: `false`). It gives the SigNoz timeline reader
+(`eta::fleet_signoz_timeline`) a merge/close instant wherever the loom-ui
+webhook export has none. When both exist, the webhook's `closed` row is
+primary and this record corroborates it. **No new forge read**: the record is
+built from the `pr.resolved` stage-journal rows the pass already writes, from
+its existing review listing and the PR read the tracker already makes. Only
+the fleet's ETA authority runs the pass, so only it emits these. At most one
+record per `(repo, pr_number, state)` per pass.
+
+The log record's **time is `resolved_at`** and its **observed timestamp is
+`observed_at`** (the knowable-at time, see "Event time vs knowable-at"
+above). The body is the record's JSON. The scalars ride as `loom.repo`,
+`loom.pr_number`, `loom.issue` and `loom.eta.pr.*` attributes (in
+`ETA_LOG_ATTRIBUTE_KEYS`, allowlisted in the collector's `transform/privacy`).
+Provenance is required, as for `eta.estimate`, and exports as
+`loom.eta.version` / `revision` / `tree_state` / `provenance_complete`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `repo` | string | `owner/repo` |
+| `pr_number` | integer | the PR |
+| `issue` | integer? | the issue the tracker follows the PR for |
+| `state` | string | `merged` or `closed` |
+| `resolved_at` | RFC3339 | merge: the forge's `merged_at`; close: the pass that saw it closed (the forge read carries no close instant) |
+| `observed_at` | RFC3339 | when this daemon observed it; never earlier than `resolved_at` |
+| `resolution_sec` | integer | how late `resolved_at` can be: `0` for a merge, the listing interval for a close (polling time) |
+| `loom` | object | the observing daemon's provenance (required) |
+
 ### `eta.snapshot`
 
 This host's **live** ETA estimate set (Issue #9329) — one row per

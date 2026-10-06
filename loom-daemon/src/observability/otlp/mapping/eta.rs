@@ -1,5 +1,6 @@
-//! OTLP mapping for `eta.estimate` / `eta.outcome` (#9289) and
-//! `eta.fleet_refresh` (#10263) and `eta.fit` (#10391).
+//! OTLP mapping for `eta.estimate` / `eta.outcome` (#9289),
+//! `eta.fleet_refresh` (#10263), `eta.fit` (#10391) and `pr.resolved`
+//! (#10519).
 //!
 //! Each is one log record. The **body** is the record's JSON — for an
 //! estimate that is the whole `eta-explanation/v1` explanation — so ClickHouse
@@ -251,6 +252,23 @@ pub(super) fn log_parts(
             }
             let body = serde_json::to_string(r).unwrap_or_default();
             Some(("eta.fit", SeverityNumber::Info, nanos(r.started_at), attributes, body))
+        }
+        TelemetryRecord::PrResolved(r) => {
+            // #10519: stamped at the merge/close instant; the caller sets the
+            // observed timestamp to `observed_at` (the knowable-at time).
+            let instant = crate::telemetry::trace::instant;
+            let mut attributes = vec![
+                kv_string("loom.repo", r.repo.clone()),
+                kv_int("loom.pr_number", i64::from(r.pr_number)),
+                kv_string("loom.eta.pr.state", r.state.as_str()),
+                kv_string("loom.eta.pr.resolved_at", instant(r.resolved_at)),
+                kv_string("loom.eta.pr.observed_at", instant(r.observed_at)),
+                kv_int("loom.eta.pr.resolution_sec", r.resolution_sec),
+            ];
+            provenance(&mut attributes, "loom.eta.", &r.loom);
+            opt_int(&mut attributes, "loom.issue", r.issue.map(i64::from));
+            let body = serde_json::to_string(r).unwrap_or_default();
+            Some(("pr.resolved", SeverityNumber::Info, nanos(r.resolved_at), attributes, body))
         }
         _ => None,
     }
@@ -602,5 +620,57 @@ mod tests {
         };
         let parsed: EtaFitRecord = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed, fit);
+    }
+
+    #[test]
+    fn a_pr_resolved_record_is_stamped_at_the_merge_and_observed_at_the_pass() {
+        use crate::telemetry::kinds::eta::ETA_LOG_ATTRIBUTE_KEYS;
+        use crate::telemetry::kinds::pr_resolved::{PrResolution, PrResolvedRecord};
+        let merged_at = Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap();
+        let observed_at = merged_at + chrono::Duration::seconds(240);
+        let resolved = PrResolvedRecord {
+            repo: "rjwalters/loom".to_string(),
+            pr_number: 10547,
+            issue: Some(10511),
+            state: PrResolution::Merged,
+            resolved_at: merged_at,
+            observed_at,
+            resolution_sec: 0,
+            loom: record().explanation.loom.clone(),
+        };
+        let envelope =
+            TelemetryEnvelope::new("host", TelemetryRecord::PrResolved(resolved.clone()));
+        let log = log_record_for(&envelope).unwrap();
+        assert_eq!(log.event_name, "pr.resolved");
+        assert_eq!(log.time_unix_nano, super::nanos(merged_at), "event time");
+        assert_eq!(log.observed_time_unix_nano, super::nanos(observed_at), "knowable-at");
+        for kv in &log.attributes {
+            assert!(
+                ETA_LOG_ATTRIBUTE_KEYS.contains(&kv.key.as_str())
+                    || [
+                        "loom.repo",
+                        "loom.record_id",
+                        "loom.pr_number",
+                        "loom.issue"
+                    ]
+                    .contains(&kv.key.as_str()),
+                "{} is not allowlisted",
+                kv.key
+            );
+        }
+        for key in ETA_LOG_ATTRIBUTE_KEYS
+            .iter()
+            .filter(|k| k.starts_with("loom.eta.pr."))
+        {
+            assert!(attr(&log, key).is_some(), "{key} is emitted");
+        }
+        assert_eq!(attr(&log, "loom.pr_number"), Some(Value::IntValue(10547)));
+        assert_eq!(attr(&log, "loom.eta.pr.state"), Some(Value::StringValue("merged".to_string())));
+        assert!(attr(&log, "loom.eta.authority").is_none(), "not an estimate");
+        let Some(Value::StringValue(body)) = log.body.as_ref().and_then(|b| b.value.clone()) else {
+            panic!("string body");
+        };
+        let parsed: PrResolvedRecord = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed, resolved);
     }
 }

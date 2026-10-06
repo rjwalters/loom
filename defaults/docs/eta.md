@@ -2603,6 +2603,36 @@ of snapshot together.
   `… signoz show`, and `… signoz query` (the SQL, for a manual
   `clickhouse-client --format JSONEachRow` export).
 
+### SigNoz timeline reader (#10519)
+
+`eta::fleet_signoz_timeline` builds, from SigNoz rows alone, each PR's and
+issue's label timeline, its merge and close instants, CI state per `(repo,
+ref)` (the latest run of each workflow, with its jobs) and the latest ready
+queue. It is a pure reader. The query (`TIMELINE_SQL`), row admission and the
+page walk are in `eta::fleet_signoz_timeline_rows`. Slice 3 (#10520) makes it
+the primary history source, with forge reads only filling gaps.
+
+- **Two sources.** The loom-ui webhook export (`service.name =
+  loom-ui-d1-export`) carries exact receipt times. The daemon's rows are
+  polling-time: stage-journal label sets (diffed into changes; an item's first
+  set is a baseline), `pr.resolved`, `ci.*` and `queue.snapshot`. When both
+  saw one change of one `(repo, number, label, transition)`, it is one event
+  dated by the webhook. A daemon change with no webhook partner keeps the
+  daemon time. Repeats within a source collapse.
+- **Merge and close instants.** Webhook `closed` rows are primary. The daemon's
+  `pr.resolved` record (see [telemetry-schema](telemetry-schema.md)) covers
+  windows and repos the export does not. It is built from the pass's existing
+  reads, with no new forge read.
+- **Point-in-time.** Every row is filtered by `observed_at <= cutoff`
+  (`eta::point_in_time`) before anything else, so a later row cannot change an
+  earlier answer. A webhook row is knowable at its receipt time. A daemon row
+  is knowable at its own `observed_at` field, else at the SigNoz
+  `observed_timestamp`. A row with neither is never knowable.
+- **Coverage.** `Timeline::coverage` gives the earliest knowable row per
+  family and source. `covers(family, cutoff, WINDOW_DAYS)` is true only once
+  the whole fit window (60 days) lies after it. For `ci.*` and `queue.snapshot`
+  that is about 2026-11-27.
+
 ## Queries
 
 [`eta-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/eta-queries.sql)
