@@ -29,9 +29,11 @@
 //!   its hold entry, #10284), otherwise its entry in the fleet snapshots'
 //!   label timeline ([`Tracker::on_fleet_snapshots`], #10500: the same
 //!   episodes `eta fit` trains on), otherwise the listing's `updated_at` (a
-//!   lower bound). A first-seen tracked PR is dated, and its rework counted,
-//!   from the same timeline. Only a PR the timeline cannot date (not yet in a
-//!   snapshot, or re-entered the stage since the cut) keeps the bound.
+//!   lower bound). A tracked PR is dated, and its rework counted, from the
+//!   same timeline on every pass (`Tracker::model_view`), unless the tracker
+//!   observed its entry after the snapshot was cut. Only a PR the timeline
+//!   cannot date (not yet in a snapshot, or re-entered the stage since the
+//!   cut) keeps the bound.
 //! - A hold-aware model reads the **episode roster** captured beside the
 //!   roster (#10312): a tracked `merge_wait` PR released from a hold enters
 //!   at its release, as training's split episode does. A PR the tracker
@@ -207,6 +209,11 @@ impl PassContext {
         self.timeline.held(repo, pr, now)
     }
 
+    /// The fleet snapshots' timeline (#10500).
+    pub(super) fn timeline(&self) -> &Timeline {
+        &self.timeline
+    }
+
     /// `pr`'s doctor rounds from the timeline.
     pub(super) fn timeline_rework(&self, repo: &str, pr: u32, now: DateTime<Utc>) -> u32 {
         self.timeline.doctor_rounds(repo, pr, now)
@@ -319,10 +326,14 @@ impl Tracker {
         events: EventLog,
         observed_at: DateTime<Utc>,
     ) {
-        let tracked: BTreeMap<(&str, u32), &Item> = self
+        // #10500: each followed PR as the model reads it, reconciled
+        // against the label timeline (`Tracker::model_view`).
+        let tracked: BTreeMap<(&str, u32), Item> = self
             .items
             .iter()
-            .filter_map(|(key, item)| Some(((key.repo.as_str(), item.pr_number?), item)))
+            .filter_map(|(key, item)| {
+                Some(((key.repo.as_str(), item.pr_number?), self.model_view(item, observed_at)))
+            })
             .collect();
         let mut roster = Vec::new();
         let mut episode_roster = Vec::new();
@@ -710,5 +721,14 @@ impl Tracker {
             &mut omitted,
         );
         (features, omitted)
+    }
+}
+
+#[cfg(test)]
+impl Tracker {
+    /// The last fleet view's described and episode rosters (#10500 parity).
+    pub(crate) fn fleet_rosters(&self) -> Option<(&[RosterEntry], &[RosterEntry])> {
+        let view = self.context.fleet.as_ref()?;
+        Some((&view.roster, &view.episode_roster))
     }
 }

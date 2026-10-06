@@ -23,6 +23,12 @@
 //!   reads, as training's split episode is;
 //! - **rework**: the PR's `doctor` episodes entered before the cutoff;
 //! - **events**: [`SnapshotLog`], the log `eta fit` counts over.
+//!
+//! First sight writes the timeline's dating into the track
+//! ([`Tracker::first_sight`]); every later estimate and fleet view reads
+//! [`Tracker::model_view`], which reconciles a tracked PR against the
+//! timeline again, so a refresh that lands after first sight (or a
+//! transition observed a pass after its label) reaches the model too.
 
 use super::{Item, ItemKey, PrView, StageTrack, Tracker};
 use crate::eta::episodes::{EpisodeEnd, EpisodeNext, StageEpisode};
@@ -75,6 +81,76 @@ impl Tracker {
         });
         item.clone()
     }
+
+    /// `item` as the model reads it at `now` (#10500): its stage entry,
+    /// hold entry, release and rework reconciled against the timeline on
+    /// **every** pass, not only on first sight, so a PR tracked before its
+    /// snapshot existed (or across a transition observed a pass late) is
+    /// dated and counted as `eta fit`'s training row is.
+    ///
+    /// Only the estimate's input and the fleet roster read this view. The
+    /// item itself is untouched: its journal rows, observed durations and
+    /// verdict attempts keep the tracker's own observations.
+    ///
+    /// The timeline applies only when its episode is the stage visit the
+    /// tracker follows: open in the tracked stage at `now − LAG` (for a held
+    /// PR, in `merge_hold`), and — when the tracker observed an entry or a
+    /// release itself (an exact track) — known through at least that
+    /// instant. A snapshot cut before the tracker saw the PR enter its stage
+    /// describes an earlier visit, so it is never applied over that
+    /// observation. A first-sight track (a lower bound, or an earlier
+    /// timeline's dating) takes the timeline as [`Self::first_sight`] does.
+    pub(super) fn model_view(&self, item: &Item, now: DateTime<Utc>) -> Item {
+        let mut out = item.clone();
+        let (Some(pr), Some(track)) = (item.pr_number, item.stage.as_ref()) else {
+            return out;
+        };
+        let timeline = self.context.timeline();
+        let covers = |t: &StageTrack, through: DateTime<Utc>| !t.exact || through >= t.entered_at;
+        let held = item
+            .hold
+            .open
+            .as_ref()
+            .filter(|_| track.stage == Stage::MergeWait);
+        if let Some(open) = held {
+            let Some((pooled, hold_at, through)) = timeline.held_known(&item.repo, pr, now) else {
+                return out;
+            };
+            if !(covers(track, through) && covers(open, through)) {
+                return out;
+            }
+            if let Some(o) = out.hold.open.as_mut() {
+                o.entered_at = hold_at.min(now);
+                o.source = AgeSource::LabelEvent;
+            }
+            if let Some(s) = out.stage.as_mut() {
+                s.entered_at = pooled.min(now);
+                s.source = AgeSource::LabelEvent;
+            }
+        } else {
+            let Some(dated) = timeline.current(&item.repo, pr, track.stage, now) else {
+                return out;
+            };
+            // A release the tracker observed is an observation too.
+            let released = item
+                .hold
+                .released_at
+                .filter(|at| track.stage == Stage::MergeWait && *at > track.entered_at)
+                .is_none_or(|at| dated.known_through >= at);
+            if !(covers(track, dated.known_through) && released) {
+                return out;
+            }
+            if track.stage == Stage::MergeWait {
+                out.hold.released_at = dated.released_at;
+            }
+            if let Some(s) = out.stage.as_mut() {
+                s.entered_at = dated.entered_at.min(now);
+                s.source = AgeSource::LabelEvent;
+            }
+        }
+        out.rework_rounds = timeline.doctor_rounds(&item.repo, pr, now);
+        out
+    }
 }
 
 /// What the timeline says about a PR's current stage.
@@ -85,6 +161,10 @@ pub(super) struct Dated {
     /// The split episode's entry, when it differs from `entered_at` (a
     /// `merge_wait` released from a hold).
     pub(super) released_at: Option<DateTime<Utc>>,
+    /// The last instant the snapshot describes the open episode at: its
+    /// cut, or its end when it ended after `now − LAG`. A tracker
+    /// observation later than this is one the snapshot has not seen.
+    pub(super) known_through: DateTime<Utc>,
 }
 
 /// Every PR's stage episodes, by `(lowercased repo, pr)`, ascending by entry,
@@ -176,10 +256,12 @@ impl Timeline {
         let episodes = self.view(repo, pr, cutoff);
         let at = Self::open(&episodes, stage, cutoff)?;
         let open = &episodes[at];
+        let known_through = self.known_through(repo, pr, at);
         if stage != Stage::MergeWait {
             return Some(Dated {
                 entered_at: open.entered_at,
                 released_at: None,
+                known_through,
             });
         }
         // Chain back over the hold: the pooled `merge_wait` begins at the
@@ -188,7 +270,16 @@ impl Timeline {
         Some(Dated {
             entered_at: first,
             released_at: held.then_some(open.entered_at).filter(|r| *r > first),
+            known_through,
         })
+    }
+
+    /// [`Dated::known_through`] of `pr`'s episode at `index`. The view at a
+    /// cutoff is a prefix of the episodes (they are sorted by entry and
+    /// [`StageEpisode::view_at`] drops only those entered at or after it),
+    /// so the index is the same in both.
+    fn known_through(&self, repo: &str, pr: u32, index: usize) -> DateTime<Utc> {
+        self.episodes(repo, pr)[index].last_at()
     }
 
     /// For a PR held at `now − LAG`: `(pooled merge_wait entry, hold entry)`.
@@ -198,11 +289,22 @@ impl Timeline {
         pr: u32,
         now: DateTime<Utc>,
     ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.held_known(repo, pr, now)
+            .map(|(pooled, hold_at, _)| (pooled, hold_at))
+    }
+
+    /// [`Self::held`], with the hold episode's [`Dated::known_through`].
+    pub(super) fn held_known(
+        &self,
+        repo: &str,
+        pr: u32,
+        now: DateTime<Utc>,
+    ) -> Option<(DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)> {
         let cutoff = cutoff(now);
         let episodes = self.view(repo, pr, cutoff);
         let at = Self::open(&episodes, Stage::MergeHold, cutoff)?;
         let (first, _) = chain_start(&episodes[..=at]);
-        Some((first, episodes[at].entered_at))
+        Some((first, episodes[at].entered_at, self.known_through(repo, pr, at)))
     }
 
     /// The event log serving counts over at `observed_at`

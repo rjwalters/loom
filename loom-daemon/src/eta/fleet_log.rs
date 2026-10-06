@@ -14,9 +14,12 @@
 //!   (`left` for a stage or a close, `unstaged`) an `exit`, both with the
 //!   episode's stage. So `merge_wait → merge_hold` is a `merge_wait` exit;
 //! - one stage-less `merge` per [`FleetSnapshot::merges`] entry of a PR with
-//!   no episode ending in that merge: **every forge merge** counts, not only
+//!   no episode ending in a merge: **every forge merge** counts, not only
 //!   those of PRs that carried a loom review label. A snapshot written before
-//!   #10500 has no `merges` and counts the episode merges only.
+//!   #10500 has no `merges` and counts the episode merges only. The match is
+//!   on the PR alone, so a PR with a merge-ended episode never also counts a
+//!   stage-less merge: its merge is the episode's, before `H` or not, even
+//!   when the episode's end and the listing's `merged_at` straddle `H`.
 //!
 //! `from` is the latest of the snapshots' earliest episode entries before
 //! `H`, the instant from which every repo's log is complete.
@@ -74,7 +77,17 @@ impl SnapshotLog {
         let mut repos = BTreeSet::new();
         for snapshot in chosen {
             let repo = snapshot.repo.to_ascii_lowercase();
-            let mut merged: BTreeSet<u32> = BTreeSet::new();
+            // The PRs whose merge an episode records, matched on the PR
+            // alone, before the horizon or not: such a PR's merge is its
+            // episode's (counted when that end is before `H`), never also a
+            // stage-less one, even when the episode's end and the listing's
+            // `merged_at` fall on opposite sides of `H`.
+            let merged: BTreeSet<u32> = snapshot
+                .episodes
+                .iter()
+                .filter(|e| e.next() == Some(EpisodeNext::Merged))
+                .map(|e| e.pr_number)
+                .collect();
             for episode in &snapshot.episodes {
                 let Some(at) = episode.ended_at().filter(|at| *at < horizon) else {
                     continue;
@@ -83,10 +96,7 @@ impl SnapshotLog {
                     EpisodeEnd::Left {
                         next: EpisodeNext::Merged,
                         ..
-                    } => {
-                        merged.insert(episode.pr_number);
-                        EventKind::Merge
-                    }
+                    } => EventKind::Merge,
                     _ => EventKind::Exit,
                 };
                 sorted.push(StageEvent {

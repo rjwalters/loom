@@ -95,7 +95,7 @@ use chrono::{DateTime, Utc};
 #[derive(Debug, Clone, Default)]
 pub(super) struct Hold {
     /// The running hold, while the PR is in `merge_hold`.
-    open: Option<StageTrack>,
+    pub(super) open: Option<StageTrack>,
     /// When the last hold was lifted back to `merge_wait`.
     pub(super) released_at: Option<DateTime<Utc>>,
 }
@@ -218,8 +218,8 @@ impl Tracker {
         ctx: &EstimateContext<'_>,
         now: DateTime<Utc>,
     ) -> Option<EstimateInput> {
-        let item = self.items.get(key)?;
-        self.input_for(key, item, Kind::Land, ctx, now)
+        let item = self.model_view(self.items.get(key)?, now);
+        self.input_for(key, &item, Kind::Land, ctx, now)
     }
 
     /// The `land` input a hold-aware heuristic reads for `key` at `now`: the
@@ -230,9 +230,9 @@ impl Tracker {
         ctx: &EstimateContext<'_>,
         now: DateTime<Utc>,
     ) -> Option<EstimateInput> {
-        let item = self.items.get(key)?;
-        let described = self.input_for(key, item, Kind::Land, ctx, now)?;
-        Some(match self.modeled_input(key, item, Kind::Land, &described, ctx) {
+        let item = self.model_view(self.items.get(key)?, now);
+        let described = self.input_for(key, &item, Kind::Land, ctx, now)?;
+        Some(match self.modeled_input(key, &item, Kind::Land, &described, ctx) {
             Some((modeled, _)) => modeled,
             None => described,
         })

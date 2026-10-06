@@ -1236,7 +1236,10 @@ impl Tracker {
         };
         let mut out = Vec::new();
         for key in targets {
-            let Some(item) = self.items.get(&key).cloned() else {
+            // #10500: the item as the model reads it, reconciled against the
+            // label timeline (`tracker_timeline.rs`); the tracked item itself
+            // keeps its own observations.
+            let Some(item) = self.items.get(&key).map(|i| self.model_view(i, now)) else {
                 continue;
             };
             for kind in [Kind::Start, Kind::Finish, Kind::Land] {

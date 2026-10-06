@@ -73,7 +73,7 @@ impl Spec {
     }
 
     /// The forge's label timeline of this PR.
-    fn history(&self) -> PrHistory {
+    pub(crate) fn history(&self) -> PrHistory {
         let mut events: Vec<PrEvent> = Vec::new();
         let mut before: &[&str] = &[];
         for (x, labels) in self.steps {

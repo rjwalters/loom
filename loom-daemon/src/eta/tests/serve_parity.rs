@@ -13,11 +13,18 @@
 //!
 //! The scenario's repo also has a merge of a PR that never carried a loom
 //! review label: both sides count it.
+//!
+//! The same assertion (served input, model features and modeled roster
+//! against training) holds for a tracker that already follows the PRs when
+//! the snapshots arrive: first listed without snapshots, and with each
+//! transition observed a pass after its label. A snapshot cut before an
+//! entry the tracker observed is never applied over it.
 
 use super::fit_rows::{cutoff, h, row, snapshot, REPO};
 use super::hold_parity::{fitted, listings_at, served, snapshots, views_at, Spec, AT, LAST_PASS};
 use super::provenance;
-use crate::eta::fit::{clock, model_features, rows, ModelInputs};
+use crate::eta::fit::rows::is_open_at;
+use crate::eta::fit::{clock, model_features, rows, ModelInputs, KNOWABLE_LAG_SEC};
 use crate::eta::fleet::FleetSnapshot;
 use crate::eta::fleet_log::{one_per_repo, SnapshotLog};
 use crate::eta::queue_features::{EventKind, EventLog, StageEvent};
@@ -27,7 +34,7 @@ use crate::eta::Stage;
 use crate::pr_latency::history::fixtures::t;
 use crate::pr_latency::history::{PrHistory, PrState};
 use crate::pr_latency::{APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED};
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 
 const RR: &str = REVIEW_REQUESTED;
 const CR: &str = CHANGES_REQUESTED;
@@ -134,13 +141,32 @@ fn served_inputs(i: &TwinOtterInput) -> Option<ModelInputs> {
     })
 }
 
-#[test]
-fn a_first_seen_prs_whole_input_is_its_training_row_bit_for_bit() {
-    let specs = specs();
-    let snapshots = fleet(&specs);
-    let trained = rows::build(&snapshots, cutoff());
+/// One listing pass at `at` and its fleet context, with no journal.
+fn pass(tracker: &mut Tracker, specs: &[Spec], at: f64) {
+    tracker.on_listing(REPO, &views_at(specs, REPO, at), h(at), 300);
+    let events = events_from_journal(&[], h(at));
+    tracker.on_fleet_context(&listings_at(specs, at), events, h(at));
+}
+
+/// A tracker that follows the scenario through `passes` **before** any
+/// snapshot exists, then loads `snapshots` (a refresh, or a backfill landing
+/// on a running daemon) and makes the [`LAST_PASS`] pass.
+fn tracked_then_refreshed(specs: &[Spec], passes: &[f64], snapshots: &[FleetSnapshot]) -> Tracker {
+    let mut tracker = Tracker::new(provenance());
+    for &at in passes {
+        pass(&mut tracker, specs, at);
+    }
+    tracker.on_fleet_snapshots(snapshots, h(LAST_PASS));
+    pass(&mut tracker, specs, LAST_PASS);
+    tracker
+}
+
+/// Every subject's served input at [`AT`] equals its training row, field for
+/// field and model feature for model feature, and the tracker's modeled
+/// roster is training's.
+fn assert_serves_training(tracker: &mut Tracker, specs: &[Spec], snapshots: &[FleetSnapshot]) {
+    let trained = rows::build(snapshots, cutoff());
     let registry = fitted();
-    let mut tracker = first_seen(&specs, Some(&snapshots));
 
     // By hand at 20 h: (pr, stage, age_h, rework, ahead, op_hold).
     let by_hand = [
@@ -166,7 +192,7 @@ fn a_first_seen_prs_whole_input_is_its_training_row_bit_for_bit() {
             "PR {pr} trained merges"
         );
 
-        let (input, imputed) = served(&mut tracker, &registry, spec);
+        let (input, imputed) = served(tracker, &registry, spec);
         assert!(imputed.is_empty(), "PR {pr} imputed {imputed:?}");
         assert_eq!(input.stage, stage, "PR {pr} stage");
         assert_eq!(input.as_of, h(AT), "PR {pr} instant");
@@ -175,6 +201,110 @@ fn a_first_seen_prs_whole_input_is_its_training_row_bit_for_bit() {
         let bits = |m: &ModelInputs| model_features(m).map(f64::to_bits);
         assert_eq!(bits(&got), bits(want), "PR {pr}: model features differ");
     }
+
+    // The roster training counts `ahead` and `n_stage_*` over: every PR
+    // open in an episode at `AT − LAG`, entered at that (split) episode.
+    let lagged = h(AT) - Duration::seconds(KNOWABLE_LAG_SEC);
+    let mut want: Vec<(String, u32, Option<Stage>, DateTime<Utc>)> = one_per_repo(snapshots)
+        .into_iter()
+        .flat_map(|s| {
+            s.episodes
+                .iter()
+                .filter(|e| is_open_at(e, lagged))
+                .map(|e| (s.repo.to_ascii_lowercase(), e.pr_number, Some(e.stage), e.entered_at))
+        })
+        .collect();
+    want.sort();
+    let (_, modeled) = tracker.fleet_rosters().expect("a fleet view");
+    let mut got: Vec<_> = modeled
+        .iter()
+        .map(|r| (r.repo.clone(), r.pr, r.stage, r.entered_at))
+        .collect();
+    got.sort();
+    assert_eq!(got, want, "the tracked roster is training's");
+}
+
+#[test]
+fn a_first_seen_prs_whole_input_is_its_training_row_bit_for_bit() {
+    let specs = specs();
+    let snapshots = fleet(&specs);
+    let mut tracker = first_seen(&specs, Some(&snapshots));
+    assert_serves_training(&mut tracker, &specs, &snapshots);
+}
+
+/// The review's case (1): the tracker first lists the scenario with **no**
+/// snapshot, so every PR is dated from `updated_at` (19 h) and PR 51 has one
+/// doctor round; then a refresh supplies the snapshots and the same-stage
+/// listing repeats. The tracked PRs are reconciled against the timeline: the
+/// subject's whole input, and the roster, are training's.
+#[test]
+fn snapshots_arriving_after_first_sight_reconcile_every_tracked_pr() {
+    let specs = specs();
+    let snapshots = fleet(&specs);
+    let mut tracker = tracked_then_refreshed(&specs, &[19.0], &snapshots);
+    assert_serves_training(&mut tracker, &specs, &snapshots);
+}
+
+/// The review's case (2): passes at 10.5, 13.5 and 17.5 h observe each
+/// transition after its label (51's `doctor` at 13.5 h, re-entered at 16 h
+/// unseen; 53's approval at 17.5 h; 57's hold at 17.5 h; 54's hold and
+/// release never), so the tracker's entries are its observations. Once the
+/// snapshots supply the label times, the model reads those.
+#[test]
+fn a_transition_observed_late_is_dated_from_its_label_once_a_snapshot_has_it() {
+    let specs = specs();
+    let snapshots = fleet(&specs);
+    let mut tracker = tracked_then_refreshed(&specs, &[10.5, 13.5, 17.5], &snapshots);
+    assert_serves_training(&mut tracker, &specs, &snapshots);
+}
+
+/// The stale-episode guard: a snapshot cut at 13 h shows PR 51 in `doctor`
+/// since 12 h, but the tracker then saw it leave (14.5 h) and re-enter
+/// (16.5 h). The snapshot predates that observed entry, so it is not
+/// applied: the model keeps the tracker's entry and rework.
+#[test]
+fn a_snapshot_cut_before_an_observed_entry_is_not_applied() {
+    let specs: Vec<Spec> = specs().into_iter().filter(|s| s.pr == 51).collect();
+    let stale = vec![snapshot(REPO, &[specs[0].history()], h(13.0))];
+    let mut tracker = tracked_then_refreshed(&specs, &[13.5, 14.5, 16.5], &stale);
+    let (input, _) = served(&mut tracker, &fitted(), &specs[0]);
+    assert_eq!(input.stage, "doctor_wait");
+    assert_eq!(input.age_h, 3.5, "entered at the observed 16.5 h");
+    assert_eq!(input.rework, 2, "the tracker's two observed rounds");
+}
+
+/// `SnapshotLog` matches a PR's merge record to its merge-ended episode on
+/// the PR alone: when the episode's end and the record straddle the horizon
+/// `H`, the merge is the episode's (counted only when its end is before
+/// `H`), never a stage-less merge as well.
+#[test]
+fn a_merge_straddling_the_horizon_is_the_episodes_alone() {
+    let specs = specs();
+    let mut snapshots = fleet(&specs);
+    let merges_of_55 = |snapshots: &[FleetSnapshot], horizon: f64| -> Vec<Option<Stage>> {
+        let chosen = one_per_repo(snapshots);
+        SnapshotLog::new(&chosen, h(horizon))
+            .at(h(horizon))
+            .events
+            .into_iter()
+            .filter(|e| e.kind == EventKind::Merge && e.pr == Some(55))
+            .map(|e| e.stage)
+            .collect()
+    };
+    let record = |snapshots: &mut [FleetSnapshot], at: f64| {
+        for s in snapshots.iter_mut().filter(|s| s.repo == REPO) {
+            for m in s.merges.iter_mut().filter(|m| m.pr_number == 55) {
+                m.at = h(at);
+            }
+        }
+    };
+    // The episode ends at 17 h. Record before H, episode end at/after it:
+    // no merge yet, rather than a stage-less one.
+    record(&mut snapshots, 16.5);
+    assert_eq!(merges_of_55(&snapshots, 17.0), Vec::<Option<Stage>>::new());
+    // Episode end before H, record after it: the episode's merge, once.
+    record(&mut snapshots, 17.5);
+    assert_eq!(merges_of_55(&snapshots, 17.25), vec![Some(Stage::MergeWait)]);
 }
 
 /// The skew itself: without the snapshots the same listing is dated from
