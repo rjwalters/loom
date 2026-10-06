@@ -123,7 +123,9 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "watchdog.stale_comment"
         | "outcome.writeback_comment"
         | "prless.comment" => ops::COMMENT_CREATE,
-        "roster.delete" | "roster.patch" => ops::COMMENT_EDIT_DELETE,
+        "roster.delete" | "roster.patch" | "sequence.comment_patch" | "sequence.comment_delete" => {
+            ops::COMMENT_EDIT_DELETE
+        }
         _ => return None,
     })
 }

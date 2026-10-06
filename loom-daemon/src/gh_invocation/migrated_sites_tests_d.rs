@@ -83,6 +83,8 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "review_conflict.pr_comment",
         "roster.delete",
         "roster.patch",
+        "sequence.comment_patch",
+        "sequence.comment_delete",
         "guard.open_pr_timeline",
         "outcome.label_timeline",
         "guard.open_pr_graphql",
