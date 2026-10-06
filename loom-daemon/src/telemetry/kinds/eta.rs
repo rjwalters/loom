@@ -105,6 +105,11 @@ pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.eta.fit.coeff_bytes",
     "loom.eta.fit.coeff_sha256",
     "loom.eta.fit.duration_ms",
+    // `pr.resolved` (#10519).
+    "loom.eta.pr.state",
+    "loom.eta.pr.resolved_at",
+    "loom.eta.pr.observed_at",
+    "loom.eta.pr.resolution_sec",
 ];
 
 /// One estimate, with its full `eta-explanation/v1` record.

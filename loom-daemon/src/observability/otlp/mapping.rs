@@ -629,6 +629,15 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
         }
+        TelemetryRecord::PrResolved(r) => {
+            // Issue #10519: event time is the merge/close instant, and the
+            // observed timestamp is when the daemon saw it (knowable-at).
+            let (event_name, severity, at, attributes, body) = eta::log_parts(&envelope.record)?;
+            time_unix_nano = at;
+            observed_time_unix_nano = nanos(r.observed_at);
+            body_override = Some(body);
+            (event_name, severity, String::new(), attributes)
+        }
         TelemetryRecord::AutoUpdateTick(_) => {
             // Issue #10414: one self-update decision, stamped at the tick's
             // start; the body is the record's JSON.
