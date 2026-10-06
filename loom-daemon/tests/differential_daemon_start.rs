@@ -609,6 +609,18 @@ fn classify_stdout(shell: &Answer, port: &Answer) -> Option<Vec<Divergence>> {
 
 #[test]
 fn port_matches_the_frozen_shell_oracle() {
+    // #9987: a machine forge egress policy puts its managed `gh` launcher
+    // directory first on the rendered PATH, which the frozen (policy-free)
+    // shell oracle cannot reproduce. That is the intended behaviour, not a
+    // divergence; `env_clear()` already removes an env-origin policy.
+    use loom_daemon::forge_egress::policy::{DEPLOYMENT_POLICY_PATH, MACHINE_POLICY_PATH};
+    if [MACHINE_POLICY_PATH, DEPLOYMENT_POLICY_PATH]
+        .iter()
+        .any(|p| Path::new(p).exists())
+    {
+        eprintln!("skip: this host has a machine forge egress policy");
+        return;
+    }
     let (meta, cases) = load_oracle();
     assert_eq!(
         meta["argv0"].as_str(),
