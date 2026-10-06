@@ -391,12 +391,7 @@ fn view_op(entity: &str) -> crate::forge_call_stats::ForgeOp {
     if entity == "pr" {
         crate::forge_call_stats::ops::PR_VIEW_STATE
     } else {
-        // `GET repos/{o}/{r}/issues/{n}`: the inventory has no single-issue
-        // read row (`issue.list` is the label listing, `comment.list` the
-        // conversation) — recorded as `unknown` until one is inventoried.
-        crate::forge_call_stats::ForgeOp::uninventoried(
-            "single-issue REST read has no inventory row",
-        )
+        crate::forge_call_stats::ops::ISSUE_VIEW_STATE
     }
 }
 

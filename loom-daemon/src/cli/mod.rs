@@ -58,6 +58,7 @@ mod forge_identity_cmd;
 pub(crate) mod forge_inventory_cmd;
 mod git_blob_lines;
 mod guard_mcp_tools;
+mod guards_status;
 pub(crate) mod health;
 pub(crate) mod inflight;
 mod label_duplicates;

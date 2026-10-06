@@ -162,6 +162,7 @@ fn a_304_serves_the_body_stored_with_the_sent_etag_not_a_swapped_entry() {
     let key =
         daemon_cache_key(Some(dir.path()), &resolve_target(Some(dir.path()), Some(&repo)), &url);
     let swapped = Arc::new(vec![RestIssue {
+        comments: 0,
         number: 666,
         ..first[0].clone()
     }]);

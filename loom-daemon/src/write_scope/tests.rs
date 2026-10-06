@@ -867,7 +867,7 @@ fn daemon_write_paths_are_scoped() {
         ),
         (
             "gh_invocation/affinity.rs",
-            NotAWrite("builds a read's affinity key from its argv, runs none"),
+            NotAWrite("derives a read's routing key from argv; only its tests name `--method`"),
         ),
         (
             "gh_invocation/cwd_route.rs",

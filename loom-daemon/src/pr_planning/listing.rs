@@ -54,10 +54,8 @@ pub fn fetch_queue(root: &Path, gh: &Path, role: PrRole) -> Result<Vec<Value>> {
         let value = read(
             root,
             gh,
-            // `GET pulls?state=open`: the open-PR queue. The inventory's PR
-            // discovery row is by-head only (`pr.list-by-head`), so the full
-            // queue listing has no row yet (#9831).
-            ForgeOp::uninventoried("open-PR queue listing has no inventory row"),
+            // `GET pulls?state=open`: the open-PR queue (`pr.list-open`).
+            ops::PR_LIST_OPEN,
             &format!("pulls?state=open&sort=created&direction=desc&per_page=100&page={page}"),
         )?;
         let batch = value.as_array().context("PR listing must be an array")?;

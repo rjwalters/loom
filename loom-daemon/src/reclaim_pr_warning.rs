@@ -41,8 +41,8 @@
 //!
 //! # Cost
 //!
-//! One `gh pr list --head feature/issue-<N>` per **successful reclaim** — not
-//! per candidate. A healthy pass, which reclaims nothing, pays nothing.
+//! One REST `pulls?head=owner:feature/issue-<N>` read per **successful
+//! reclaim** — not per candidate. A healthy pass, which reclaims nothing, pays nothing.
 
 use std::path::Path;
 
@@ -83,49 +83,30 @@ pub fn open_pr_warning(issue: u32, pr: u32, root: &Path) -> String {
     )
 }
 
-/// `gh pr list --head feature/issue-<N> --state open`, reduced to the first PR
-/// number.
+/// The open PRs whose head is issue `issue`'s worktree branch, via the REST
+/// by-head lookup [`crate::forge_pull_listing::open_pulls_for_head_as`]
+/// (#10382: was the GraphQL `gh pr list --head`). Recorded against `caller`.
+///
+/// # Errors
+/// An inconclusive read — never collapsed into "no open PR" (#7863).
+pub(crate) fn open_prs_on_issue_branch(
+    caller: &'static str,
+    gh_bin: &Path,
+    root: &Path,
+    issue: u32,
+) -> Result<Vec<u32>> {
+    let branch = issue_branch(issue);
+    crate::forge_pull_listing::open_pulls_for_head_as(caller, gh_bin, Some(root), None, &branch)
+}
+
+/// The first open PR on issue `issue`'s worktree branch.
 ///
 /// `None` covers BOTH "no such PR" and every failure (missing/failed `gh`,
 /// unparseable output) — this is a diagnostic, so an unanswerable probe simply
 /// produces no warning and never affects the reclaim that already happened.
 pub(crate) fn open_pr_on_issue_branch(gh_bin: &Path, root: &Path, issue: u32) -> Option<u32> {
-    // #5401: the facade applies the cross-owner GH_CONFIG_DIR for `root`.
-    let mut inv = crate::gh_invocation::GhInvocation::new(
-        crate::gh_invocation::Operation::new("reclaim.open_pr_probe"),
-        crate::gh_invocation::AccessIntent::Read,
-        crate::gh_invocation::GhTarget::None,
-        std::time::Duration::from_secs(60),
-    )
-    .forge_op(crate::forge_call_stats::ops::PR_LIST_BY_HEAD)
-    .program(gh_bin)
-    .current_dir(root)
-    .args(["pr", "list", "--head"])
-    .arg(issue_branch(issue))
-    .args(["--state", "open", "--json", "number", "--limit", "1"]);
-    if let Ok(repo) = std::env::var("LOOM_REPO") {
-        inv = inv.arg("--repo").arg(repo);
-    }
-    let crate::cmd_out::CmdOutcome::Ran(output) = inv.run() else {
-        return None;
-    };
-    if !output.status.success() {
-        return None;
-    }
-    parse_first_pr_number(&String::from_utf8_lossy(&output.stdout))
-}
-
-/// First `number` in a `gh pr list --json number` payload, or `None` for an
-/// empty list or anything unparseable.
-#[must_use]
-pub fn parse_first_pr_number(stdout: &str) -> Option<u32> {
-    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
-    value
-        .as_array()?
-        .first()?
-        .get("number")?
-        .as_u64()
-        .and_then(|n| u32::try_from(n).ok())
+    let prs = open_prs_on_issue_branch("reclaim.open_pr_probe", gh_bin, root, issue).ok()?;
+    prs.first().copied()
 }
 
 #[cfg(test)]
@@ -147,26 +128,5 @@ mod tests {
     #[test]
     fn issue_branch_matches_the_worktree_naming_convention() {
         assert_eq!(issue_branch(8116), "feature/issue-8116");
-    }
-
-    #[test]
-    fn parses_the_first_pr_number_from_a_gh_listing() {
-        assert_eq!(parse_first_pr_number(r#"[{"number":8081},{"number":8082}]"#), Some(8081));
-    }
-
-    #[test]
-    fn an_empty_listing_yields_no_warning() {
-        assert_eq!(parse_first_pr_number("[]"), None);
-        assert_eq!(parse_first_pr_number("[]\n"), None);
-    }
-
-    /// A diagnostic must never manufacture a verdict out of garbage — an
-    /// unparseable payload simply produces no warning.
-    #[test]
-    fn unparseable_output_yields_no_warning() {
-        assert_eq!(parse_first_pr_number(""), None);
-        assert_eq!(parse_first_pr_number("gh: rate limit exceeded"), None);
-        assert_eq!(parse_first_pr_number(r#"[{"number":"eight"}]"#), None);
-        assert_eq!(parse_first_pr_number(r#"[{}]"#), None);
     }
 }

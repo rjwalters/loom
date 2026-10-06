@@ -65,7 +65,6 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "roster.comments",
         "claim.pr_labels",
         "sequence.predecessor",
-        "claim.pr_list_by_head",
         "intake.list_open",
         "quarantine.issue_list",
         "claim.issue_reclaim",

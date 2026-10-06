@@ -94,6 +94,47 @@ kind = "role-prompt"
 path = "defaults/.claude/commands/loom/guide.md"
 
 [[operation]]
+id = "issue.view-state"
+group = "issue-creation-discovery"
+summary = "Read one issue's (or PR's) state and labels by number; a PR's merged flag comes from pull_request.merged_at."
+profile = "required-coordination"
+disposition = "required"
+class = "read"
+inputs = ["owner", "repo", "number"]
+outputs = ["number", "state", "labels", "merged_at"]
+required_fields = ["number", "state"]
+actor = "daemon"
+permissions = ["issues:read"]
+pagination = "not-paginated"
+consistency = "fresh-read"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0", gitea = "1.24" }
+test_id = "forge-probe::coordination::issue-view-state"
+owner = "daemon-sweep"
+risk = "normal"
+github = { commands = [
+  "gh issue view --json state",
+], routes = [
+  "GET repos/{owner}/{repo}/issues/{number}",
+] }
+platform_support = "documented"
+adapter_coverage = "partial"
+caller_integration = "partial"
+unknowns = [
+  "whether another forge's single-issue read also answers for a pull-request number (GitHub's does, which is what lets one read resolve a reference of either kind)",
+]
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/stale_blocked/batch.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_cached_view.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/star_liveness/forge.rs"
+
+[[operation]]
 id = "issue.search"
 group = "issue-creation-discovery"
 summary = "Cross-repository / qualifier-based issue search for duplicate detection."
