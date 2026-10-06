@@ -145,7 +145,9 @@ pub enum Skip {
     Permanent,
     /// A fleet PR-less-retry hold or quarantine comment (#10161).
     DaemonHold,
-    /// The artifact changed between the plan and the write.
+    /// The artifact changed between the plan and the write: its body differs
+    /// from the one the plan and its evidence were read from, its park record
+    /// changed, or it gained a body/label veto.
     ConcurrentEdit,
     /// Over this pass's write cap; next pass.
     WriteCap,
@@ -309,6 +311,30 @@ fn body_skip(body: &str, labels: &[String]) -> Option<Skip> {
         return Some(Skip::Permanent);
     }
     None
+}
+
+/// Whether two reads of one body are the same text, up to line endings and
+/// trailing whitespace.
+///
+/// Any other edit counts: a prose `Depends on #9` or an unchecked
+/// `## Dependencies` box the evidence never saw must abort the write rather
+/// than be released over.
+fn same_body(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        s.replace("\r\n", "\n")
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end()
+            .to_string()
+    };
+    norm(a) == norm(b)
+}
+
+/// The listing body a plan was built from.
+fn planned_body(plan: &Plan) -> &str {
+    plan.row.body.as_deref().unwrap_or_default()
 }
 
 /// The park's declared blockers as local numbers, or `None` when any is
@@ -548,7 +574,16 @@ fn veto_from_evidence(
     };
     // The listing is ETag'd (a free 304 after phase 1's read); only the
     // candidates go on to the closing-PR GraphQL and state reads.
-    let gathering = gather_filtered(gather, fleet, opts, &mut |_, n, _| wanted.contains(&n));
+    // Keep the body each candidate's evidence was read from: a release is
+    // only sound over the text that evidence describes.
+    let mut bodies: HashMap<i64, String> = HashMap::new();
+    let gathering = gather_filtered(gather, fleet, opts, &mut |_, n, input| {
+        let keep = wanted.contains(&n);
+        if keep {
+            bodies.insert(n, input.body.clone());
+        }
+        keep
+    });
     report.cost.meter = gathering.cost.meter;
     report.cost.budget_before = gathering.cost.budget_before;
     report.cost.projected = gathering.cost.projected;
@@ -581,6 +616,17 @@ fn veto_from_evidence(
                 continue;
             }
         };
+        match bodies.get(&i64::from(plan.row.number)) {
+            Some(b) if same_body(b, planned_body(&plan)) => {}
+            Some(_) => {
+                report.skip(Skip::ConcurrentEdit);
+                continue;
+            }
+            None => {
+                report.unread(n, "the body the evidence was read from is unknown");
+                continue;
+            }
+        }
         let other_open = ev.prose.iter().any(|r| r.state == "OPEN")
             || ev
                 .named
@@ -625,7 +671,11 @@ fn execute(
             return false;
         }
     };
+    // The fresh body must be the one the plan (and, for a release, the
+    // evidence — checked equal in phase 2) was read from. Comparing only the
+    // park record would release over a `Depends on #9` added since.
     let unchanged = fresh.labels.iter().any(|l| l == BLOCKED_LABEL)
+        && same_body(&fresh.body, planned_body(plan))
         && local_blockers(&fresh.body).as_ref() == Some(&plan.declared)
         && body_skip(&fresh.body, &fresh.labels).is_none();
     if !unchanged {

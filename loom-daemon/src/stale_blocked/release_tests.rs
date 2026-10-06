@@ -547,6 +547,60 @@ fn concurrent_edit_between_plan_and_write_aborts() {
     assert!(w.no_writes());
 }
 
+/// The body the evidence was read from, then `extra` appended before the
+/// final view. Only park record #1 (closed) is declared; #9 is open.
+fn edited_after_evidence(extra: &str) -> (World, Report) {
+    let mut w = World::new();
+    w.parked(10, false, &[1], &[]);
+    w.state(1, "CLOSED", false);
+    w.state(9, "OPEN", false);
+    w.park.items.get_mut(&10).unwrap().body.push_str(extra);
+    let r = w.run();
+    (w, r)
+}
+
+#[test]
+fn an_open_prose_dependency_added_after_the_evidence_aborts() {
+    let (w, r) = edited_after_evidence("\nDepends on #9\n");
+    assert_eq!(skipped(&r, "concurrent-edit"), 1, "{}", r.summary());
+    assert!(r.released.is_empty() && r.reparked.is_empty() && w.no_writes());
+}
+
+#[test]
+fn an_unchecked_dependencies_box_added_after_the_evidence_aborts() {
+    let (w, r) = edited_after_evidence("\n## Dependencies\n\n- [ ] #9\n");
+    assert_eq!(skipped(&r, "concurrent-edit"), 1, "{}", r.summary());
+    assert!(r.released.is_empty() && r.reparked.is_empty() && w.no_writes());
+}
+
+#[test]
+fn a_reparked_body_edited_after_the_plan_aborts() {
+    let mut w = World::new();
+    w.parked(10, false, &[1, 3], &[]);
+    w.state(1, "CLOSED", false);
+    w.state(3, "OPEN", false);
+    w.park
+        .items
+        .get_mut(&10)
+        .unwrap()
+        .body
+        .push_str("\nNew context.\n");
+    let r = w.run();
+    assert_eq!(skipped(&r, "concurrent-edit"), 1, "{}", r.summary());
+    assert!(r.reparked.is_empty() && w.no_writes());
+}
+
+#[test]
+fn line_endings_and_trailing_whitespace_are_not_an_edit() {
+    let mut w = World::new();
+    w.parked(10, false, &[1], &[]);
+    w.state(1, "CLOSED", false);
+    let item = w.park.items.get_mut(&10).unwrap();
+    item.body = format!("{}  \r\n\r\n", item.body.trim_end().replace('\n', "\r\n"));
+    let r = w.run();
+    assert_eq!(r.released.len(), 1, "{}", r.summary());
+}
+
 #[test]
 fn a_qualified_blocker_added_between_plan_and_write_aborts() {
     let mut w = World::new();
