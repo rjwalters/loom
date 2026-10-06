@@ -40,8 +40,12 @@
 //!    pass confirms it is running and no longer drifts.
 //!
 //! Unlike an operator `accounts session stop`, the teardown writes **no**
-//! hold: the reconciler is replacing the container, not keeping it down. A
-//! failed teardown or recreate takes the pass's ordinary per-account backoff;
+//! hold: the reconciler is replacing the container, not keeping it down, and
+//! it never lifts one. A timed-out `docker` call here (inspect, top, stop,
+//! rm, run: [`crate::tokens_pool::docker_cli::DockerTimedOut`]) propagates
+//! unchanged, so it ends the pass at pass level like any other timeout and
+//! is never counted against the account. Any other failed teardown or
+//! recreate takes the pass's ordinary per-account backoff;
 //! a recreate that was refused after the teardown leaves the container
 //! missing, which the pass's missing-container path then recreates (on the
 //! same backoff).

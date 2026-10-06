@@ -265,6 +265,28 @@ fn a_recreate_that_still_drifts_backs_off_instead_of_looping() {
 
 #[test]
 #[serial]
+fn a_timed_out_teardown_backs_off_the_pass_not_the_account() {
+    let env = setup(&["alice"], &["alice"]);
+    let ws = Ws::new(&["a", "new"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    seed_running(&lifecycle, "alice", &ws, &["a"]);
+    register(&lifecycle, &ws, &["a", "new"]);
+    *lifecycle.runner().stop_times_out.lock().unwrap() = true;
+    let mut state = ReconcileState::default();
+    let out = pass(&mut lifecycle, &env, &host, &mut state, 0);
+    assert!(matches!(out[..], [Outcome::DockerUnavailable { retry_at: 120, .. }]), "{out:?}");
+    assert_eq!(
+        pass(&mut lifecycle, &env, &host, &mut state, 60),
+        vec![Outcome::BackingOff { retry_at: 120 }]
+    );
+    // No per-account failure was counted: once Docker answers, it is recreated.
+    *lifecycle.runner().stop_times_out.lock().unwrap() = false;
+    let out = pass(&mut lifecycle, &env, &host, &mut state, 120);
+    assert!(matches!(out[..], [Outcome::DriftRecreated { .. }]), "{out:?}");
+}
+
+#[test]
+#[serial]
 fn a_recreate_that_would_be_refused_never_tears_the_container_down() {
     let env = setup(&["alice"], &["alice"]);
     let ws = Ws::new(&["a", "gone"]);

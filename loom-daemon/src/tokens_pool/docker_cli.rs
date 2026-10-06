@@ -3,16 +3,24 @@
 //! `ProcessContainerRunner` used to run `docker <args>` with no deadline, so a
 //! wedged Docker daemon stalled the caller forever — for the periodic session
 //! reconcile pass that meant the loop never ran again until the Loom daemon
-//! restarted. Every captured `docker` call now has a wall-clock budget; on
-//! expiry the local client is killed and the call fails, which callers treat
-//! exactly like "Docker unavailable" (the reconcile pass backs off and takes
-//! no action).
+//! restarted. Every captured `docker` call now has a wall-clock budget,
+//! enforced by the crate's shared [`crate::proc_exec::run_bounded`] (which
+//! also kills the child's process group). On expiry the call fails with the
+//! typed [`DockerTimedOut`], which the reconcile pass treats exactly like
+//! "Docker unavailable" — whether the timed-out call was a read or a
+//! `docker start`/`run` — so it ends the pass instead of spending the budget
+//! once per account.
+//!
+//! The operator CLI inherits these budgets too: `accounts session start` on
+//! a first, slow image pull now fails after [`DOCKER_RUN_TIMEOUT`] (it was
+//! unbounded); `docker pull` the image first if that is a risk.
 
-use std::io::Read;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, Result};
+
+use crate::proc_exec::{self, Completion};
 
 /// Budget for a read-only or quick `docker` call (`inspect`, `start`, `top`,
 /// `rm`, `exec tmux …`).
@@ -21,6 +29,25 @@ pub const DOCKER_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DOCKER_RUN_TIMEOUT: Duration = Duration::from_secs(600);
 /// Budget for `docker stop` (its own `-t` grace plus headroom).
 pub const DOCKER_STOP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A `docker` call hit its deadline: the runtime is unresponsive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerTimedOut {
+    pub subcommand: String,
+    pub secs: u64,
+}
+
+impl std::fmt::Display for DockerTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`docker {}` timed out after {}s (container runtime unresponsive)",
+            self.subcommand, self.secs
+        )
+    }
+}
+
+impl std::error::Error for DockerTimedOut {}
 
 /// The budget for `docker <args>`, by subcommand.
 #[must_use]
@@ -33,73 +60,42 @@ pub fn timeout_for(args: &[&str]) -> Duration {
 }
 
 /// Run `program <args>` with stdin closed, capturing stdout/stderr, failing
-/// once `timeout` elapses (the child is killed and reaped). Returns
+/// with [`DockerTimedOut`] once `timeout` elapses. Returns
 /// `(success, stdout, stderr)`.
 pub fn run_bounded(
     program: &str,
     args: &[&str],
     timeout: Duration,
 ) -> Result<(bool, String, String)> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to run `{program} {}`", args.join(" ")))?;
-    // Drain both pipes concurrently so a chatty child can never block on a
-    // full pipe while we poll for its exit.
-    let drain = |pipe: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
-            }
-            String::from_utf8_lossy(&bytes).into_owned()
-        })
-    };
-    let stdout = drain(
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let stderr = drain(
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn Read + Send>),
-    );
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+    let mut command = Command::new(program);
+    command.args(args).stdin(Stdio::null());
+    let subcommand = args.first().copied().unwrap_or_default();
+    match proc_exec::run_bounded(command, timeout)
+        .map_err(|e| anyhow!("failed to run `{program} {subcommand}`: {e}"))?
+    {
+        Completion::Exited(output) => Ok((
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )),
+        Completion::TimedOut { .. } => Err(DockerTimedOut {
+            subcommand: subcommand.to_string(),
+            secs: timeout.as_secs(),
         }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "`{program} {}` timed out after {}s (container runtime unresponsive)",
-                args.first().copied().unwrap_or_default(),
-                timeout.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    };
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
-    Ok((status.success(), stdout, stderr))
+        .into()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn a_hung_command_times_out_instead_of_stalling() {
         let started = Instant::now();
         let error = run_bounded("sleep", &["30"], Duration::from_millis(200)).unwrap_err();
-        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(error.downcast_ref::<DockerTimedOut>().is_some(), "{error:#}");
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 

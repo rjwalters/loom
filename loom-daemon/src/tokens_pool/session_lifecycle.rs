@@ -1114,6 +1114,9 @@ pub struct SessionLifecycle<R> {
     workspace: PathBuf,
     runner: R,
     image: String,
+    /// Other registered workspaces whose profile for the same account an
+    /// operator start lifts holds in, and status reads them from (#10453).
+    peer_roots: Vec<PathBuf>,
 }
 
 impl<R: ContainerRunner> SessionLifecycle<R> {
@@ -1122,7 +1125,23 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
             workspace: workspace.into(),
             runner,
             image: image.unwrap_or_else(|| DEFAULT_SESSION_IMAGE.to_string()),
+            peer_roots: Vec::new(),
         }
+    }
+
+    /// Also lift/read operator holds in these registered roots' profiles.
+    #[must_use]
+    pub fn with_peer_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.peer_roots = roots;
+        self
+    }
+
+    fn account_profiles(&self, account: &AccountDescriptor) -> Vec<PathBuf> {
+        session_hold::account_profiles(
+            &account.credential_reference,
+            &self.peer_roots,
+            &account.id.name,
+        )
     }
 
     /// The Docker seam this lifecycle drives (the session reconciler reads
@@ -1158,29 +1177,36 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
     /// `docker start` without recreating the container, and silently
     /// serving the old mount would be worse than refusing.
     ///
-    /// An operator start lifts any operator hold `stop` left and records the
-    /// workspace/image it ended up with ([`session_hold`], issue #10453).
+    /// An operator start lifts any operator hold `stop` left — deleting it
+    /// in every profile of the account it can see, **before** touching
+    /// Docker, so a failure leaves the session down and held, never running
+    /// and held — then records the workspace/image it ended up with
+    /// ([`session_hold`], issue #10453). Failing to write that record only
+    /// warns: the container is up and unheld, which is what was asked for.
     pub fn start_with_workspace(
         &self,
         name: &str,
         workspace: Option<&Path>,
     ) -> Result<SessionStatus> {
+        let account = find_codex_account(&self.workspace, name)?;
+        session_hold::lift_holds(&self.account_profiles(&account))?;
         let status = self.start_inner(name, workspace, None)?;
         let workspace = status
             .workspace
             .clone()
             .unwrap_or_else(|| workspace.map_or_else(|| self.workspace.clone(), Path::to_path_buf));
         let image = status.image.as_deref().unwrap_or(&self.image);
-        session_hold::record_operator_start(
-            &status.codex_home,
-            &workspace,
-            image,
-            session_hold::now_unix_ms(),
-        )?;
-        Ok(SessionStatus {
-            held: false,
-            ..status
-        })
+        let now = session_hold::now_unix_ms();
+        if let Err(e) =
+            session_hold::record_operator_start(&status.codex_home, &workspace, image, now)
+        {
+            log::warn!(
+                "session {name:?} is running, but its workspace/image could not be recorded \
+                 ({e:#}); if it is recreated after a daemon restart, the reconciler will \
+                 guess the workspace"
+            );
+        }
+        Ok(status)
     }
 
     /// The automated start the session reconciler uses (issue #10453): like
@@ -1288,26 +1314,54 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
         let state = self.runner.inspect(&container)?;
         if let Some(state) = &state {
             Self::require_host_mode(state)?;
-            if state.running && !force && self.runner.has_active_exec(&container)? {
-                bail!(
-                    "session {name:?} has an in-flight `docker exec`; refusing to stop without \
-                     --force (a hard stop here would SIGKILL active work, violating the #5119 \
-                     restart-safety contract). Retry once the exec finishes, or pass --force to \
-                     override."
-                );
-            }
+            self.refuse_if_busy(name, &container, state, force)?;
         }
         session_hold::write_hold(&account.credential_reference, session_hold::now_unix_ms())?;
         if state.is_some() {
-            self.runner.stop_and_remove(&container, STOP_GRACE)?;
+            if let Err(error) = self.runner.stop_and_remove(&container, STOP_GRACE) {
+                // The stop/reconcile race: a reconcile pass whose hold check
+                // ran just before the hold above was written can still
+                // `docker start` the container between our `docker stop` and
+                // `docker rm`, so `rm` finds it running. Every later start
+                // re-checks the (now written) hold, so at most that one start
+                // can be in flight: re-inspect, re-apply the in-flight-exec
+                // refusal, and stop+rm exactly once more.
+                match self.runner.inspect(&container)? {
+                    None => {}
+                    Some(again) if again.running || again.restarting => {
+                        self.refuse_if_busy(name, &container, &again, force)?;
+                        self.runner.stop_and_remove(&container, STOP_GRACE)?;
+                    }
+                    Some(_) => return Err(error),
+                }
+            }
         }
         self.status(name)
+    }
+
+    fn refuse_if_busy(
+        &self,
+        name: &str,
+        container: &str,
+        state: &ContainerState,
+        force: bool,
+    ) -> Result<()> {
+        if state.running && !force && self.runner.has_active_exec(container)? {
+            bail!(
+                "session {name:?} has an in-flight `docker exec`; refusing to stop without \
+                 --force (a hard stop here would SIGKILL active work, violating the #5119 \
+                 restart-safety contract). Retry once the exec finishes, or pass --force to \
+                 override."
+            );
+        }
+        Ok(())
     }
 
     /// Report running/stopped and basic health (container id, uptime, mount
     /// paths).
     pub fn status(&self, name: &str) -> Result<SessionStatus> {
         let account = find_codex_account(&self.workspace, name)?;
+        let held = session_hold::held_across(&self.account_profiles(&account));
         let name = account.id.name.as_str();
         let profile = account.credential_reference;
         let container = container_name(name);
@@ -1323,7 +1377,7 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
             started_at: state.as_ref().and_then(|s| s.started_at.clone()),
             image: state.as_ref().and_then(|s| s.image.clone()),
             session_managed: is_session_managed(&profile),
-            held: session_hold::held_across(std::slice::from_ref(&profile)),
+            held,
             mount_path: CONTAINER_CODEX_HOME,
             workspace: state.as_ref().and_then(|s| s.workspace.clone()),
             codex_home: profile,

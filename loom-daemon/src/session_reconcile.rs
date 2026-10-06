@@ -64,8 +64,10 @@
 //!   container that dies right after each start is retried on the backoff
 //!   schedule, not every interval. The failure count resets only once the
 //!   container is seen running. Every `docker` call is time-bounded
-//!   ([`crate::tokens_pool::docker_cli`]): a timed-out read is "Docker
-//!   unavailable" above, and a timed-out start is a failed start.
+//!   ([`crate::tokens_pool::docker_cli`]). Any timed-out call — a read, a
+//!   `docker start` or a `docker run` — counts as "Docker unavailable" above
+//!   and ends the pass, so a wedged engine costs one budget per pass, not
+//!   one per account.
 //! * **No-op:** with no enabled session-managed account the pass makes zero
 //!   `docker` calls, like [`refresh_session_health`].
 //! * **Opt-out:** `LOOM_SESSION_RECONCILE=0` or
@@ -104,6 +106,7 @@ use std::time::Duration;
 use crate::tokens_pool::account_registry::{
     account_inventory_quiet, AccountDescriptor, AccountProvider,
 };
+use crate::tokens_pool::docker_cli::DockerTimedOut;
 use crate::tokens_pool::private_workspace;
 use crate::tokens_pool::session_hold::{self, LastStart, OperatorHeld};
 use crate::tokens_pool::session_lifecycle::{
@@ -552,7 +555,10 @@ pub fn reconcile_accounts<R: ContainerRunner>(
                 Err(error) if error.downcast_ref::<OperatorHeld>().is_some() => {
                     note_held(&container, mem)
                 }
-                Err(error) if error.downcast_ref::<DockerUnavailable>().is_some() => {
+                Err(error)
+                    if error.downcast_ref::<DockerUnavailable>().is_some()
+                        || error.downcast_ref::<DockerTimedOut>().is_some() =>
+                {
                     let outcome = docker_unavailable(state, &format!("{error:#}"), now);
                     out.push(AccountOutcome {
                         name,
