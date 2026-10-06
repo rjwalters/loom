@@ -126,21 +126,40 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&o.stderr).trim(), "nope");
     }
 
+    /// [`run_with`] on a fresh stub, waiting out `ETXTBSY`: a concurrent test
+    /// thread that forked while the stub's write fd was open holds it until
+    /// its exec, and Linux refuses to exec the script meanwhile (#10446 CI).
+    fn run_stub(dir: &std::path::Path, body: &str) -> CmdOutcome {
+        let program = stub(dir, body);
+        for _ in 0..100 {
+            match run_with(inv(TIMEOUT), &program) {
+                CmdOutcome::Unavailable(Unavailable::Spawn(e)) if e.contains("os error 26") => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                out => return out,
+            }
+        }
+        run_with(inv(TIMEOUT), &program)
+    }
+
     #[test]
     fn launcher_exit_78_is_routing_blocked_and_69_is_adapter_unavailable() {
         let tmp = tempfile::tempdir().unwrap();
-        let out = run_with(inv(TIMEOUT), &stub(tmp.path(), "echo denied >&2; exit 78"));
+        let out = run_stub(tmp.path(), "echo denied >&2; exit 78");
         assert!(
             matches!(&out, CmdOutcome::Unavailable(Unavailable::RoutingBlocked(m)) if m == "denied"),
             "{out:?}"
         );
         assert!(!out.succeeded());
         assert_eq!(out.stdout_lossy(), "");
-        let out = run_with(inv(TIMEOUT), &stub(tmp.path(), "exit 69"));
-        assert!(matches!(out, CmdOutcome::Unavailable(Unavailable::AdapterUnavailable(_))));
+        let out = run_stub(tmp.path(), "exit 69");
+        assert!(
+            matches!(out, CmdOutcome::Unavailable(Unavailable::AdapterUnavailable(_))),
+            "{out:?}"
+        );
         // Every other non-zero status is still an ordinary answer.
-        let out = run_with(inv(TIMEOUT), &stub(tmp.path(), "exit 70"));
-        assert!(matches!(out, CmdOutcome::Ran(_)));
+        let out = run_stub(tmp.path(), "exit 70");
+        assert!(matches!(out, CmdOutcome::Ran(_)), "{out:?}");
     }
 
     #[test]

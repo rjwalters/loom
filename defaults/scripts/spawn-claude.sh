@@ -756,69 +756,46 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
         _containment_mounts+=(-v "${_containment_shared_tokens}:${_containment_shared_tokens}:ro")
     fi
     # gh/git forge auth (docker/worker/README.md "Bootstrap seams"): prefer
-    # the env-var form already in this process's environment (passed through
-    # by the LOOM_*/CLAUDE_*/GH_*/GITHUB_* sweep below); best-effort read-only
-    # bind of ~/.config/gh only when neither token env var is present.
+    # the env-var form already in this process's environment (forwarded by
+    # name); best-effort read-only bind of ~/.config/gh only when neither
+    # token env var is present.
     #
-    # Forge-egress policy (#9987): on a policy-governed host the container gets
-    # 2am's managed `gh` launcher, the pinned upstream gh, the policy and the
-    # credential REFERENCE file, read-only (computed by `loom-daemon forge
-    # egress container-args`), and holds neither ~/.config/gh nor
-    # GH_TOKEN/GITHUB_TOKEN. The legacy credentials are restored ONLY on an
-    # explicit "no policy" answer (`_containment_legacy_gh=1`): the helper's
-    # `unconfigured` / `observe-unmanaged` status line (observe logs its
-    # findings on stderr and proceeds), or no capable daemon on a host with no
-    # policy or managed marker. Empty output, a failed helper, an unknown status
-    # or a too-old daemon on a policy host REFUSES (exit 78) — never empty-means-none.
-    # requires-daemon: forge >= 0.19.758   #9987 — `forge egress container-args` / `container-check`, declared at this repo's VERSION because they land WITH this marker (the first release carrying them is the post-merge bump). Hard on a host with a forge-egress policy (this block refuses, exit 78, below the floor); a host with no policy never needs it and keeps today's behaviour.
+    # Forge-egress policy (#9987): `loom-daemon forge egress container-args`
+    # makes the whole decision and this block only appends its lines. Line 1
+    # is an explicit `loom-forge-egress: <status>`; a managed host gets 2am's
+    # gh launcher, upstream gh, policy and credential REFERENCE read-only and
+    # neither ~/.config/gh nor GH_TOKEN/GITHUB_TOKEN; an unconfigured (or
+    # observe-unmanaged, findings logged) host gets the legacy credentials
+    # above. Without a capable daemon only a host with no policy or managed
+    # marker keeps them. Anything else — a refusal (unreadable/invalid policy,
+    # missing launcher or image check under `required`), a failed helper,
+    # empty output — has no status line and REFUSES (78): never empty-means-none.
+    # requires-daemon: forge >= 0.19.758   #9987 — `forge egress container-args --image`, declared at this repo's VERSION because it lands WITH this marker (the first release carrying it is the post-merge bump). Hard on a host with a forge-egress policy (this block refuses, exit 78, below the floor); a host with no policy never needs it and keeps today's behaviour.
     # shellcheck source=lib/locate-daemon-bin.sh
     source "${_script_dir}/lib/locate-daemon-bin.sh"
-    _containment_refuse_gh() {
-        log_error "spawn-claude: $* — refusing to mount ~/.config/gh or forward GH_TOKEN/GITHUB_TOKEN into the container (#9987)."
+    _containment_gh=()
+    _containment_gh_bin="$(loom_locate_daemon_bin "$WORKSPACE" 2>/dev/null || true)"
+    if [[ -n "$_containment_gh_bin" ]] && "$_containment_gh_bin" forge egress container-args --help >/dev/null 2>&1; then
+        # stderr passes through: the named refusal or observe findings reach the log.
+        _containment_gh_out="$("$_containment_gh_bin" forge egress container-args --image "$_containment_image")" || _containment_gh_out=""
+        while IFS= read -r _containment_gh_line; do # Bash 3.2: no mapfile
+            _containment_gh+=("$_containment_gh_line")
+        done <<<"$_containment_gh_out"
+    elif [[ -z "${LOOM_FORGE_EGRESS_POLICY:-}${LOOM_FORGE_EGRESS_MANAGED:-}" && ! -e /etc/loom/forge-egress/policy.json \
+        && ! -e /etc/2am/github-egress/policy.json && ! -e /etc/loom/forge-egress/managed ]]; then
+        _containment_gh=("loom-forge-egress: unconfigured")
+        for _containment_var in GH_TOKEN GITHUB_TOKEN; do
+            if [[ -n "${!_containment_var+x}" ]]; then _containment_gh+=(-e "$_containment_var"); fi
+        done
+        if [[ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" && -n "${HOME:-}" && -d "${HOME}/.config/gh" ]]; then
+            _containment_gh+=(-v "${HOME}/.config/gh:${HOME}/.config/gh:ro")
+        fi
+    fi
+    if [[ "${_containment_gh[0]:-}" != "loom-forge-egress: "* ]]; then
+        log_error "spawn-claude: no explicit forge egress answer (a refused policy, a failed helper, or a policy host without a capable loom-daemon) — refusing to mount ~/.config/gh or forward GH_TOKEN/GITHUB_TOKEN (#9987)."
         exit 78 # EX_CONFIG
-    }
-    _containment_managed_gh=()
-    _containment_legacy_gh=0
-    _containment_managed_bin="$(loom_locate_daemon_bin "$WORKSPACE" 2>/dev/null || true)"
-    if [[ -n "$_containment_managed_bin" ]] && "$_containment_managed_bin" forge egress container-args --help >/dev/null 2>&1; then
-        # stderr passes through: the refusal or observe findings reach the log.
-        _containment_managed_rc=0
-        _containment_managed_out="$("$_containment_managed_bin" forge egress container-args)" || _containment_managed_rc=$?
-        [[ "$_containment_managed_rc" -eq 0 ]] || _containment_refuse_gh "forge egress container-args exited ${_containment_managed_rc}"
-        # Bash 3.2 has no mapfile: line 1 is the status, then one argument per line.
-        _containment_managed_status=""
-        _containment_managed_first=1
-        while IFS= read -r _containment_managed_line; do
-            if [[ "$_containment_managed_first" == "1" ]]; then
-                _containment_managed_status="$_containment_managed_line"
-                _containment_managed_first=0
-            elif [[ -n "$_containment_managed_line" ]]; then
-                _containment_managed_gh+=("$_containment_managed_line")
-            fi
-        done <<<"$_containment_managed_out"
-        case "${_containment_managed_status}:${#_containment_managed_gh[@]}" in
-            "loom-forge-egress: unconfigured:0" | "loom-forge-egress: observe-unmanaged:0")
-                _containment_legacy_gh=1
-                ;;
-            "loom-forge-egress: managed:0") _containment_refuse_gh "a managed status carried no container arguments" ;;
-            "loom-forge-egress: managed:"*)
-                if ! _containment_managed_msg="$("$_containment_managed_bin" forge egress container-check "$_containment_image" 2>&1)"; then
-                    _containment_refuse_gh "${_containment_managed_msg}"
-                fi
-                ;;
-            *) _containment_refuse_gh "unrecognised forge egress container-args answer '${_containment_managed_status}'" ;;
-        esac
-    elif [[ -n "${LOOM_FORGE_EGRESS_POLICY:-}${LOOM_FORGE_EGRESS_MANAGED:-}" || -e /etc/loom/forge-egress/policy.json \
-        || -e /etc/2am/github-egress/policy.json || -e /etc/loom/forge-egress/managed ]]; then
-        _containment_refuse_gh "a forge egress policy is configured but no loom-daemon supporting 'forge egress container-args' was found; update loom-daemon"
-    else
-        _containment_legacy_gh=1
     fi
-    if [[ ${#_containment_managed_gh[@]} -gt 0 ]]; then
-        _containment_mounts+=("${_containment_managed_gh[@]}")
-    elif [[ "$_containment_legacy_gh" == "1" && -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" && -n "${HOME:-}" && -d "${HOME}/.config/gh" ]]; then
-        _containment_mounts+=(-v "${HOME}/.config/gh:${HOME}/.config/gh:ro")
-    fi
+    _containment_mounts+=("${_containment_gh[@]:1}")
     # Git commit identity (check-git-identity.sh's global user.name/user.email).
     if [[ -n "${HOME:-}" && -f "${HOME}/.gitconfig" ]]; then
         _containment_mounts+=(-v "${HOME}/.gitconfig:${HOME}/.gitconfig:ro")
@@ -857,7 +834,8 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     _containment_env+=(-e "CARGO_INCREMENTAL=0")
 
     # --- Env passthrough ---
-    # Every LOOM_*/CLAUDE_*/SAFEHOUSE*/CODEX_*/GH_TOKEN/GITHUB_TOKEN var
+    # Every LOOM_*/CLAUDE_*/SAFEHOUSE*/CODEX_* var (GH_TOKEN/GITHUB_TOKEN
+    # come from the forge-egress block above, never under a policy, #9987)
     # already present in THIS process's environment (exported by the daemon
     # before it spawned this script — LOOM_SWEEP_CLAIM_OWNED, LOOM_ROLE,
     # LOOM_RUNTIME, LOOM_MODEL/LOOM_EFFORT when set, etc. — or already
@@ -876,10 +854,6 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
     # same host's bare-metal dispatch worked.
     while IFS='=' read -r _containment_var _; do
         case "$_containment_var" in
-            GH_TOKEN | GITHUB_TOKEN)
-                # #9987: only on an explicit no-policy answer, never under a policy.
-                if [[ "$_containment_legacy_gh" == "1" ]]; then _containment_env+=(-e "$_containment_var"); fi
-                ;;
             LOOM_* | CLAUDE_* | SAFEHOUSE* | CODEX_* | TRACEPARENT | OTEL_*)
                 _containment_env+=(-e "$_containment_var")
                 ;;

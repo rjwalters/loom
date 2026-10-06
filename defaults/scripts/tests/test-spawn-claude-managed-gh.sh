@@ -31,21 +31,22 @@ exit 0
 STUB
 chmod +x "$T/bin/docker"
 
-# Fake daemon: behaviour chosen by FAKE_ARGS_RC / FAKE_CHECK_RC.
+# Fake daemon: behaviour chosen by FAKE_ARGS_RC / FAKE_ARGS_EMPTY / FAKE_STATUS / FAKE_RAW.
 cat >"$T/bin/fake-daemon" <<'STUB'
 #!/usr/bin/env bash
 [[ "$*" == *"--help"* ]] && exit 0
 case "$*" in
-    "forge egress container-args")
-        [[ "${FAKE_ARGS_RC:-0}" == "0" ]] || { echo "forge-egress: policy.unreadable" >&2; exit "$FAKE_ARGS_RC"; }
-        [[ "${FAKE_ARGS_EMPTY:-0}" == "1" ]] && exit 0
-        echo "loom-forge-egress: ${FAKE_STATUS:-managed}"
-        [[ "${FAKE_STATUS:-managed}" == "managed" && "${FAKE_NO_ARGS:-0}" != "1" ]] || exit 0
-        printf '%s\n' -v /managed:/managed:ro -e LOOM_FORGE_EGRESS_POLICY=/managed/policy.json
-        ;;
-    "forge egress container-check "*)
+    "forge egress container-args --image "*)
         echo "$*" >>"$FAKE_CHECK_LOG"
-        [[ "${FAKE_CHECK_RC:-0}" == "0" ]] || { echo "forge-egress: toolchain.launcher-python3-missing" >&2; exit "$FAKE_CHECK_RC"; }
+        [[ "${FAKE_ARGS_RC:-0}" == "0" ]] || { echo "forge-egress: ${FAKE_FINDING:-policy.unreadable}" >&2; exit "$FAKE_ARGS_RC"; }
+        [[ "${FAKE_ARGS_EMPTY:-0}" == "1" ]] && exit 0
+        [[ -n "${FAKE_RAW:-}" ]] && { printf '%s\n' "$FAKE_RAW"; exit 0; }
+        echo "loom-forge-egress: ${FAKE_STATUS:-managed}"
+        if [[ "${FAKE_STATUS:-managed}" == "managed" ]]; then
+            printf '%s\n' -v /managed:/managed:ro -e LOOM_FORGE_EGRESS_POLICY=/managed/policy.json
+        else
+            printf '%s\n' -e GH_TOKEN # the daemon's legacy_docker_args
+        fi
         ;;
 esac
 exit 0
@@ -68,24 +69,31 @@ echo "managed-gh container admission (#9987)"
 run "$T/bin/fake-daemon" FAKE_ARGS_RC=78
 check "helper refusal (78) refuses the spawn" '[[ $RC -eq 78 ]]'
 check "helper refusal never reaches docker" '[[ ! -s "$DOCKER_LOG" ]]'
+check "helper refusal: the named finding reaches the log" '[[ "$OUT" == *policy.unreadable* ]]'
+
+run "$T/bin/fake-daemon" FAKE_ARGS_RC=78 FAKE_FINDING=toolchain.launcher-python3-missing
+check "image check refusal (python3 / launcher) refuses the spawn" '[[ $RC -eq 78 && ! -s "$DOCKER_LOG" ]]'
 
 run /bin/false LOOM_FORGE_EGRESS_POLICY="$T/policy.json"
-check "helper failure (/bin/false) with a policy configured refuses" '[[ $RC -eq 78 ]]'
-check "helper failure never reaches docker" '[[ ! -s "$DOCKER_LOG" ]]'
+check "helper failure (/bin/false) with a policy configured refuses" '[[ $RC -eq 78 && ! -s "$DOCKER_LOG" ]]'
+
+run /bin/false env -u LOOM_FORGE_EGRESS_POLICY LOOM_FORGE_EGRESS_MANAGED=1
+check "managed marker + no capable daemon refuses" '[[ $RC -eq 78 && ! -s "$DOCKER_LOG" ]]'
 
 run /bin/false env -u LOOM_FORGE_EGRESS_POLICY
-check "no policy + no helper keeps legacy behaviour (docker reached)" '[[ -s "$DOCKER_LOG" ]]'
+check "no policy + no helper keeps legacy behaviour (docker reached)" '[[ $RC -eq 0 && -s "$DOCKER_LOG" ]]'
+check "no policy + no helper: GH_TOKEN forwarded by name" 'grep -q -- "-e GH_TOKEN" "$DOCKER_LOG"'
+
+run /bin/false env -u LOOM_FORGE_EGRESS_POLICY -u GH_TOKEN
+check "no policy + no helper + no token: legacy gh-config mount" 'grep -q "\.config/gh" "$DOCKER_LOG"'
 
 run "$T/bin/fake-daemon"
 check "managed args: docker reached" '[[ $RC -eq 0 && -s "$DOCKER_LOG" ]]'
 check "managed args: policy mount passed through" 'grep -q -- "/managed:/managed:ro" "$DOCKER_LOG"'
 check "managed args: ~/.config/gh is not mounted" '! grep -q "\.config/gh" "$DOCKER_LOG"'
 check "managed args: GH_TOKEN is not forwarded" '! grep -q -- "-e GH_TOKEN" "$DOCKER_LOG"'
-check "managed args: container-check ran for the image" 'grep -q "container-check " "$T/check.log"'
-
-run "$T/bin/fake-daemon" FAKE_CHECK_RC=78
-check "container-check refusal (python3 / launcher) refuses the spawn" '[[ $RC -eq 78 ]]'
-check "container-check refusal never reaches docker" '! grep -q "managed" "$DOCKER_LOG"'
+check "managed args: the status line is not passed to docker" '! grep -q "loom-forge-egress" "$DOCKER_LOG"'
+check "container-args got the worker image (--image)" 'grep -q "container-args --image " "$T/check.log"'
 
 # Empty output is never "no policy" (#10446 review): only an explicit status is.
 run "$T/bin/fake-daemon" FAKE_ARGS_EMPTY=1 LOOM_FORGE_EGRESS_POLICY="$T/policy.json"
@@ -95,24 +103,14 @@ check "empty helper output never reaches docker (no GH_TOKEN, no gh config)" '[[
 run "$T/bin/fake-daemon" FAKE_ARGS_EMPTY=1 env -u LOOM_FORGE_EGRESS_POLICY
 check "empty helper output refuses even with no policy env visible" '[[ $RC -eq 78 && ! -s "$DOCKER_LOG" ]]'
 
-run "$T/bin/fake-daemon" FAKE_STATUS=bogus
-check "unrecognised status refuses" '[[ $RC -eq 78 && ! -s "$DOCKER_LOG" ]]'
-
-run "$T/bin/fake-daemon" FAKE_NO_ARGS=1
-check "managed status with no arguments refuses" '[[ $RC -eq 78 && ! -s "$DOCKER_LOG" ]]'
-
-run /bin/false env -u LOOM_FORGE_EGRESS_POLICY LOOM_FORGE_EGRESS_MANAGED=1
-check "managed marker + no capable daemon refuses" '[[ $RC -eq 78 && ! -s "$DOCKER_LOG" ]]'
-
-run "$T/bin/fake-daemon" FAKE_STATUS=unconfigured GH_TOKEN=
-check "explicit unconfigured: legacy gh-config mount" 'grep -q "\.config/gh" "$DOCKER_LOG"'
-check "explicit unconfigured: no container-check" '[[ ! -s "$T/check.log" ]]'
+run "$T/bin/fake-daemon" FAKE_RAW=-v
+check "output without a status line refuses" '[[ $RC -eq 78 && ! -s "$DOCKER_LOG" ]]'
 
 run "$T/bin/fake-daemon" FAKE_STATUS=unconfigured
-check "explicit unconfigured: GH_TOKEN forwarded by name" 'grep -q -- "-e GH_TOKEN" "$DOCKER_LOG"'
+check "explicit unconfigured: the daemon's legacy args pass through" 'grep -q -- "-e GH_TOKEN" "$DOCKER_LOG"'
 
 run "$T/bin/fake-daemon" FAKE_STATUS=observe-unmanaged
-check "observe-unmanaged proceeds with legacy credentials" '[[ $RC -eq 0 ]] && grep -q -- "-e GH_TOKEN" "$DOCKER_LOG"'
+check "observe-unmanaged proceeds with the daemon's legacy args" '[[ $RC -eq 0 ]] && grep -q -- "-e GH_TOKEN" "$DOCKER_LOG"'
 
 check "no mapfile in spawn-claude.sh (Bash 3.2)" '! grep -qE "^[^#]*\bmapfile\b" "$SCRIPTS_DIR/spawn-claude.sh"'
 

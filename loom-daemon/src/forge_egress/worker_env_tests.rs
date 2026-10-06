@@ -185,7 +185,10 @@ fn required_policy_without_launcher_path_refuses_never_none() {
     // Absent: schema `required`; the configured policy must not read as none.
     let f = admit_with(|d| {
         d["enforcement"]["api"] = json!("required");
-        d["toolchain"].as_object_mut().unwrap().remove("launcherPath");
+        d["toolchain"]
+            .as_object_mut()
+            .unwrap()
+            .remove("launcherPath");
     })
     .unwrap_err();
     assert_eq!(f.code, "policy.schema");
@@ -243,6 +246,43 @@ fn admission_status_is_explicit_for_every_outcome() {
     assert_eq!(a.status(), "managed");
     assert!(a.warnings.is_empty(), "{:?}", a.warnings);
     assert!(a.egress.unwrap().required);
+}
+
+#[test]
+fn legacy_args_only_without_a_managed_launcher() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".config/gh")).unwrap();
+    let h = home.path().to_path_buf();
+    let lookup = |vars: &'static [(&'static str, &'static str)]| {
+        let h = h.clone();
+        move |k: &str| -> Option<std::ffi::OsString> {
+            if k == "HOME" {
+                return Some(h.clone().into_os_string());
+            }
+            vars.iter().find(|(n, _)| *n == k).map(|(_, v)| (*v).into())
+        }
+    };
+    let mount = format!("{0}:{0}:ro", h.join(".config/gh").display());
+    // No token: the read-only gh config mount, no -e.
+    assert_eq!(legacy_docker_args(lookup(&[])), ["-v", mount.as_str()]);
+    // A token is forwarded by NAME only, and replaces the mount.
+    let args = legacy_docker_args(lookup(&[("GH_TOKEN", "ghp_x"), ("GITHUB_TOKEN", "")]));
+    assert_eq!(args, ["-e", "GH_TOKEN", "-e", "GITHUB_TOKEN"]);
+    // An admission with a launcher never carries any of it.
+    let (_fx, egress) = Fx::new("required");
+    let managed = Admission {
+        configured: true,
+        egress: Some(egress),
+        warnings: vec![],
+    };
+    let args = managed.docker_args(lookup(&[("GH_TOKEN", "ghp_x")]));
+    assert!(
+        !args
+            .iter()
+            .any(|a| a.contains("GH_TOKEN") || a.contains(".config/gh")),
+        "{args:?}"
+    );
+    assert_eq!(Admission::default().docker_args(lookup(&[])), ["-v", mount.as_str()]);
 }
 
 #[test]

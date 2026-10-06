@@ -59,8 +59,8 @@ pub struct Admission {
 impl Admission {
     /// The one-line status `forge egress container-args` prints first, so the
     /// shell never reads "no output" as "no policy": `unconfigured`,
-    /// `managed` (the docker arguments follow), or `observe-unmanaged`
-    /// (a valid observe policy whose launcher is unusable: logged, legacy).
+    /// `managed`, or `observe-unmanaged` (a valid observe policy whose
+    /// launcher is unusable: logged, legacy credentials).
     #[must_use]
     pub fn status(&self) -> &'static str {
         match (&self.egress, self.configured) {
@@ -69,6 +69,39 @@ impl Admission {
             (None, false) => "unconfigured",
         }
     }
+
+    /// The container's `gh` credential arguments: the managed launcher's
+    /// [`WorkerEgress::docker_args`], else [`legacy_docker_args`] (`env` is
+    /// the variable lookup, injectable for tests).
+    #[must_use]
+    pub fn docker_args(&self, env: impl Fn(&str) -> Option<OsString>) -> Vec<String> {
+        self.egress
+            .as_ref()
+            .map_or_else(|| legacy_docker_args(env), WorkerEgress::docker_args)
+    }
+}
+
+/// The pre-#9987 container `gh` credentials, for an admission with no managed
+/// launcher: `GH_TOKEN` / `GITHUB_TOKEN` forwarded by NAME when set (never the
+/// value), and a read-only `~/.config/gh` mount only when neither is
+/// non-empty. Never reached under a configured policy that refused.
+#[must_use]
+pub fn legacy_docker_args(env: impl Fn(&str) -> Option<OsString>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut any_token = false;
+    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Some(v) = env(name) {
+            any_token |= !v.is_empty();
+            out.extend(["-e".to_string(), name.to_string()]);
+        }
+    }
+    let config = env("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(h).join(".config/gh"));
+    if let Some(dir) = config.filter(|d| !any_token && d.is_dir()) {
+        out.extend(["-v".to_string(), format!("{0}:{0}:ro", dir.display())]);
+    }
+    out
 }
 
 impl WorkerEgress {

@@ -591,6 +591,7 @@ fn container_args_status_is_explicit_and_a_bad_configured_policy_refuses() {
     let sb = Sandbox::new();
     let run = |policy: Option<&Path>| {
         let mut c = sb.cmd(&["container-args"]);
+        c.env("GH_TOKEN", "ghp_must_not_be_printed");
         c.env_remove("LOOM_GH_NO_POLICY_LAUNCHER");
         if let Some(p) = policy {
             c.env("LOOM_FORGE_EGRESS_POLICY", p);
@@ -600,17 +601,20 @@ fn container_args_status_is_explicit_and_a_bad_configured_policy_refuses() {
     if !machine_policy_present() {
         let out = run(None);
         assert_eq!(out.status.code(), Some(0));
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "loom-forge-egress: unconfigured\n");
+        // The legacy credentials, by NAME: the daemon makes the whole decision.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stdout, "loom-forge-egress: unconfigured\n-e\nGH_TOKEN\n");
     }
-    let cases: [(&str, Box<dyn Fn(&mut Value)>); 3] = [
-        (
-            "policy.schema",
-            Box::new(|p| {
-                p["toolchain"].as_object_mut().unwrap().remove("launcherPath");
-            }),
-        ),
-        ("policy.schema", Box::new(|p| p["toolchain"]["launcherPath"] = "".into())),
-        ("policy.schema-version", Box::new(|p| p["schemaVersion"] = 2.into())),
+    type Mutate = fn(&mut Value);
+    let cases: [(&str, Mutate); 3] = [
+        ("policy.schema", |p| {
+            p["toolchain"]
+                .as_object_mut()
+                .unwrap()
+                .remove("launcherPath");
+        }),
+        ("policy.schema", |p| p["toolchain"]["launcherPath"] = "".into()),
+        ("policy.schema-version", |p| p["schemaVersion"] = 2.into()),
     ];
     for (code, mutate) in cases {
         let path = sb.policy(|p| {
@@ -628,4 +632,5 @@ fn container_args_status_is_explicit_and_a_bad_configured_policy_refuses() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(stdout.starts_with("loom-forge-egress: managed\n-v\n"), "{stdout}");
+    assert!(!stdout.contains("GH_TOKEN") && !stdout.contains("ghp_"), "{stdout}");
 }

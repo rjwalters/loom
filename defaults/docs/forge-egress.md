@@ -169,15 +169,17 @@ What Loom does with `launcherPath` (all no-ops with no policy):
   (`toolchain.launcher-python3-missing`) and so is one whose `gh` does not
   resolve to the launcher (`toolchain.launcher-not-first`) — on both container
   paths (`spawn-worker` and `spawn-claude.sh`, the latter via `loom-daemon forge
-  egress container-check <image>`, exit 78). The policy is schema-validated
+  egress container-args --image <image>`, exit 78). The policy is schema-validated
   before any routing result: an unreadable policy, an unsupported
   `schemaVersion`, or — unless it is a valid `observe` policy — a schema finding
   or a missing/empty launcher is refused with exit 78 and never falls back to
   `~/.config/gh` / `GH_TOKEN`. `observe` logs those findings and proceeds.
-  `loom-daemon forge egress container-args` prints an explicit status line
-  first (`loom-forge-egress: unconfigured` / `observe-unmanaged` / `managed`,
-  then the docker arguments); `spawn-claude.sh` restores the legacy credentials
-  only on an explicit no-policy status, never on empty output or a failure.
+  `loom-daemon forge egress container-args` makes the whole container
+  credential decision: an explicit status line first (`loom-forge-egress:
+  managed` / `unconfigured` / `observe-unmanaged`), then the docker arguments —
+  the managed mounts, or only for the last two the legacy token-by-name /
+  `~/.config/gh` arguments. `spawn-claude.sh` appends them; empty output, a
+  failure or a missing status line refuses (78), never empty-means-none.
 - **Exit codes** — a launcher exit of `78` is `outcome=routing_blocked` and `69`
   is `outcome=adapter_unavailable`. Neither is a forge answer: the invocation
   surfaces as unavailable (never an empty result) and is not retried.
