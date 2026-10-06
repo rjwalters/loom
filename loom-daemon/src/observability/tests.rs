@@ -714,10 +714,12 @@ async fn spawn_task_fully_configured_spawns_three_tasks() {
     // Issue #9289: the ETA tracker's bus subscriber (on by default) adds one.
     // Issue #10245/#10263: the daily refit, run by the fleet snapshot refresh
     // task (both on by default; either/or, so one handle) adds one.
+    // Issue #10492: the captain-gated nightly backtest-folds task (on by
+    // default, independent of the refit/refresh either/or) adds one.
     assert_eq!(
         handles.len(),
-        5,
-        "collector + daemon_event collector + eta + sender + eta fleet refresh owning the refit (#10263)"
+        6,
+        "collector + daemon_event collector + eta + sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492)"
     );
     for handle in handles {
         handle.abort();
@@ -754,10 +756,11 @@ async fn spawn_task_two_exporters_spawns_collector_plus_two_senders() {
     // Issue #10245/#10263: the fleet refresh task, which owns the daily refit
     // (either/or with the standalone refit task, so one handle).
     // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
+    // Issue #10492: the nightly backtest-folds task (on by default).
     assert_eq!(
         handles.len(),
-        8,
-        "collector + daemon_event + eta + turnaround + two senders + eta fleet refresh owning the refit (#10263) + task-liveness sampler (#10414)"
+        9,
+        "collector + daemon_event + eta + turnaround + two senders + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + task-liveness sampler (#10414)"
     );
     let statuses = global_export_statuses();
     assert_eq!(
@@ -794,10 +797,11 @@ async fn spawn_task_two_exporters_isolate_the_unbuildable_kind() {
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool())
             .expect("the https exporter is fully configured and must still run");
     // Issue #8760: `daemon_event::spawn_task` adds one more handle.
+    // Issue #10492: the nightly backtest-folds task (on by default) adds one.
     assert_eq!(
         handles.len(),
-        5,
-        "collector + daemon_event + eta (#9289) + only the https sender + eta fleet refresh owning the refit (#10263)"
+        6,
+        "collector + daemon_event + eta (#9289) + only the https sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492)"
     );
     let statuses = global_export_statuses();
     assert_eq!(
@@ -909,10 +913,11 @@ async fn spawn_task_otlp_exporter_spawns_three_tasks() {
         spawn_task(&config, dir.path().to_path_buf(), &bus, Instant::now(), test_workspace_pool());
     let handles = handles.expect("fully configured otlp exporter ⇒ spawn_task must return Some");
     // Issue #10414: the OTLP ops sink also adds the task-liveness sampler.
+    // Issue #10492: the nightly backtest-folds task (on by default).
     assert_eq!(
         handles.len(),
-        7,
-        "collector + daemon_event + eta (#9289) + turnaround (#8929) + sender + eta fleet refresh owning the refit (#10263) + task-liveness sampler (#10414)"
+        8,
+        "collector + daemon_event + eta (#9289) + turnaround (#8929) + sender + eta fleet refresh owning the refit (#10263) + eta nightly folds (#10492) + task-liveness sampler (#10414)"
     );
     for handle in handles {
         handle.abort();
