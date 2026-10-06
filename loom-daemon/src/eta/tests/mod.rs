@@ -49,6 +49,7 @@ mod recalibrate;
 mod recency;
 mod regime;
 mod roster_history;
+mod regime_serving;
 mod score;
 mod serve_parity;
 mod shadow;

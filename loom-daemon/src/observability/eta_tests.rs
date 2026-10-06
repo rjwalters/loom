@@ -82,10 +82,11 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
     // only held or sequenced PRs elsewhere, land-2026-10-06-keen-wren
     // (#10508), whose pre-PR stages take the dispatch plan and land-v2's
     // path, and the land-2026-10-06-tandem-wren dependency wrapper (#10510;
-    // no edge, so -b's own answer).
-    assert_eq!(delivered.emitted, 12, "finish + land + the ten answering land shadows");
+    // no edge, so -b's own answer), and land-2026-10-06-brisk-petrel (#10528),
+    // twin-otter-b plus the regime adjustment.
+    assert_eq!(delivered.emitted, 13, "finish + land + the eleven answering land shadows");
     assert_eq!(delivered.refused, 2, "twin-otter and little-v0: unknown_stage before a PR");
-    assert_eq!(delivered.outcomes, 14, "finish finished, every land estimate abandoned");
+    assert_eq!(delivered.outcomes, 15, "finish finished, every land estimate abandoned");
     assert_eq!(delivered.invalid, 0);
     let offered = sink.0.lock().unwrap();
     let kinds: Vec<&str> = offered.iter().map(|e| e.record.kind()).collect();
@@ -106,6 +107,8 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
             "eta.estimate",
             "eta.estimate",
             "eta.estimate",
+            "eta.estimate",
+            "eta.outcome",
             "eta.outcome",
             "eta.outcome",
             "eta.outcome",
@@ -137,7 +140,7 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
         assert_eq!(envelope.host_id, "host-test");
         assert_eq!(envelope.schema_version, 12);
     }
-    let TelemetryRecord::EtaOutcome(outcome) = &offered[14].record else {
+    let TelemetryRecord::EtaOutcome(outcome) = &offered[15].record else {
         panic!("outcome")
     };
     assert_eq!(outcome.estimate.loom, provenance(), "the estimating build");

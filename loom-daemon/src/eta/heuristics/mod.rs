@@ -18,10 +18,13 @@
 //! `land-2026-10-06-swift-tern` (#10524) is quick-tern made drift-aware
 //! (#10528's drift check: shorter half-life; the inflation the check asks
 //! for is recorded, not applied).
+//! `land-2026-10-06-brisk-petrel` (#10528) is twin-otter-b scaled by the
+//! drift-gated latent-regime residual adjustment ([`crate::eta::regime`]).
 //! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
 mod land_bold_lark;
+mod land_brisk_petrel;
 mod land_calm_plover;
 mod land_dependency;
 mod land_held_heron;
@@ -39,6 +42,7 @@ mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
 pub use land_bold_lark::{LandBoldLark, LAND_BOLD_LARK};
+pub use land_brisk_petrel::{LandBriskPetrel, LAND_BRISK_PETREL};
 pub use land_calm_plover::{LandCalmPlover, LAND_CALM_PLOVER};
 pub use land_dependency::{DependencyComposition, LAND_TANDEM_WREN};
 pub use land_held_heron::{

@@ -268,6 +268,9 @@ pub struct DriftFacts {
     pub n_recent: u64,
     /// The tri-state verdict: `Unknown` below the sample floor.
     pub state: DriftState,
+    /// Whether the serving `land` heuristic scales its ETAs for drift
+    /// (`land-2026-10-06-brisk-petrel`, #10528). `false` for every other.
+    pub adjusted: bool,
 }
 
 /// Everything the doctor reads.
@@ -917,10 +920,21 @@ fn outcomes(f: &Facts) -> Vec<Check> {
                 "outcomes",
                 &name,
                 Status::Warn,
-                format!(
-                    "{} scored {} outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served ETAs are NOT adjusted for it yet (serving-path application is deferred, #10528)",
-                    d.n_recent, d.heuristic
-                ),
+                if d.adjusted {
+                    format!(
+                        "{} scored {} outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served ETAs are scaled by the drift-gated regime adjustment ({} is serving)",
+                        d.n_recent,
+                        d.heuristic,
+                        super::heuristics::LAND_BRISK_PETREL
+                    )
+                } else {
+                    format!(
+                        "{} scored {} outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served ETAs are NOT adjusted for it (only the {} candidate adjusts, and it is not serving)",
+                        d.n_recent,
+                        d.heuristic,
+                        super::heuristics::LAND_BRISK_PETREL
+                    )
+                },
                 "expect this stage's served ETAs to be biased until the next refit on current-regime rows",
             ),
             DriftState::Unknown => Check::ok(

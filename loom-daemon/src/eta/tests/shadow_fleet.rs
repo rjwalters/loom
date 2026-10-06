@@ -27,6 +27,7 @@ const BUILTIN_TIERS: &[(&str, Tier)] = &[
     ("land-2026-10-06-calm-plover", Tier::Candidate),
     ("land-v4", Tier::Candidate),
     ("little-v0", Tier::Baseline),
+    ("land-2026-10-06-brisk-petrel", Tier::Candidate),
     ("land-2026-10-06-quick-tern", Tier::Candidate),
     ("land-2026-10-06-swift-tern", Tier::Candidate),
     ("land-2026-10-06-held-heron", Tier::Candidate),

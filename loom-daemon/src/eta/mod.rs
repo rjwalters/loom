@@ -717,6 +717,9 @@ impl Registry {
                 Box::new(heuristics::LandCalmPlover),
                 Box::new(heuristics::LandV4),
                 Box::new(heuristics::LittleV0),
+                // #10528: twin-otter-b plus the drift-gated regime
+                // adjustment; registered ahead of the other -b wrappers.
+                Box::new(heuristics::LandBriskPetrel::new(fit.clone())),
                 // #10524: wraps twin-otter-b; registered before the
                 // twin-otter pair so `-b` stays last.
                 Box::new(heuristics::LandQuickTern::new(fit.clone())),

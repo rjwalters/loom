@@ -396,6 +396,7 @@ fn drift_shows_the_tri_state_and_never_claims_serving_is_adjusted() {
         heuristic: "land-v2".into(),
         n_recent,
         state,
+        adjusted: false,
     };
     f.outcomes.drift = vec![
         row("building", 2, DriftState::Unknown),
@@ -417,7 +418,26 @@ fn drift_shows_the_tri_state_and_never_claims_serving_is_adjusted() {
     let drifted = find(&checks, "outcomes", "drift doctoring");
     assert_eq!(drifted.status, Status::Warn);
     assert!(drifted.remedy.is_some());
-    // Slice 1 does not apply the factor to served ETAs (#10563 review).
+    // Not serving brisk-petrel: the factor is not applied (#10563 review),
+    // and the doctor names the candidate that would apply it.
     assert!(drifted.detail.contains("NOT adjusted"), "{}", drifted.detail);
     assert!(!drifted.detail.contains("are scaled"), "{}", drifted.detail);
+    assert!(drifted.detail.contains("brisk-petrel"), "{}", drifted.detail);
+}
+
+#[test]
+fn drift_says_served_etas_are_scaled_only_when_brisk_petrel_serves() {
+    use crate::eta::regime::DriftState;
+    let mut f = healthy();
+    f.outcomes.drift = vec![DriftFacts {
+        stage: "judging".into(),
+        heuristic: "land-2026-10-04-twin-otter-b".into(),
+        n_recent: 9,
+        state: DriftState::Drifted,
+        adjusted: true,
+    }];
+    let drifted = find(&evaluate(&f), "outcomes", "drift judging");
+    assert_eq!(drifted.status, Status::Warn);
+    assert!(drifted.detail.contains("are scaled"), "{}", drifted.detail);
+    assert!(!drifted.detail.contains("NOT adjusted"), "{}", drifted.detail);
 }
