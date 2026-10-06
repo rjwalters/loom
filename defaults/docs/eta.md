@@ -745,20 +745,24 @@ Every `eta.snapshot` alternate carries its `tier`; loom-ui's chooser filters
 on it (loom-ui#2031). A retired id stays unregistered, as #10484 decided.
 `eta::shadow_fleet::RETIRED` keeps the id so it is never reused.
 
-**The shadow budget.** `autonomous.eta.shadow.maxActive` (default 13, floor 1)
+**The shadow budget.** `autonomous.eta.shadow.maxActive` (default 14, floor 1)
 caps the registered heuristics **per kind**, `current` included. When a
 build's registry exceeds the configured budget, the ETA tracker does not start.
 The daemon logs `eta: not started: N land heuristics are registered but
 autonomous.eta.shadow.maxActive is M; over the budget: …`, naming the
 heuristics past the budget in registration order. `eta promote` refuses the
 same way. A unit test holds the built-in registry within the default budget,
-so a fourteenth registration fails CI first. Retire a heuristic (a code
+so a fifteenth registration fails CI first. Retire a heuristic (a code
 change, as in #10484 and #10549) or raise the budget. The default is the
-kind's `current` plus the 12 alternates one `eta.snapshot` row carries (#10549,
-was 10 and 8), and a unit test holds the two together, so no heuristic within
-the default budget is silently dropped from the chooser. Raising the budget
-past 13 also needs the alternates cap raised on both sides (loom-ui's
-`MAX_ALTERNATES`; a loom-ui still slicing at 8 reads the first 8 by id).
+kind's `current` plus the 13 alternates one `eta.snapshot` row carries
+(#10521, which registered `land-2026-10-06-loop-kite` as the fourteenth land
+heuristic; 12 since #10549, was 10 and 8), and a unit test holds the two
+together, so no heuristic within the default budget is silently dropped from
+the chooser. Raising the budget also needs the alternates cap raised on both
+sides (loom-ui's `MAX_ALTERNATES`). A loom-ui still slicing at 12 reads the
+first 12 by id; with the shipped registry and the default `current`
+(`land-v1`) the 13th by id is `little-v0`, a baseline the chooser never
+offers.
 
 **Wrappers are explicit compositions.** A calibration, conformal or
 dependency wrapper over a base is registered as its own id
@@ -2362,7 +2366,7 @@ of what is on disk and never needs a refetch.
 | `historyScope` | `LOOM_ETA_HISTORY_SCOPE` | `augment` (#9343) |
 | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245). It runs only with `enabled` too, is read at start, and is a no-op until a fleet snapshot is cached |
 | `current.start` / `current.finish` / `current.land` | none | `start-v1` / `finish-v1` / `land-v1` |
-| `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `13` registered heuristics per kind (`current` + 12 alternates, #10549), floor 1. Over it, the tracker does not start (see [Shadow fleet management](#shadow-fleet-management)) |
+| `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `14` registered heuristics per kind (`current` + 13 alternates, #10549, #10521), floor 1. Over it, the tracker does not start (see [Shadow fleet management](#shadow-fleet-management)) |
 | `fleetRefresh.enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | `true` (#10263) |
 | `fleetRefresh.intervalSecs` | `LOOM_ETA_FLEET_REFRESH_INTERVAL_SECS` | `3600` (floor 900) |
 | `fleetRefresh.maxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_MAX_CALLS` | `300` |

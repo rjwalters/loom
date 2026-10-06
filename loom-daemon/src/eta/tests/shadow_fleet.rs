@@ -91,18 +91,18 @@ fn fresh_tide_is_retired() {
 
 #[test]
 fn the_builtin_registry_fits_the_default_budget() {
-    assert_eq!(DEFAULT_MAX_ACTIVE, 13);
+    assert_eq!(DEFAULT_MAX_ACTIVE, 14);
     Registry::builtin()
         .check_budget(DEFAULT_MAX_ACTIVE)
         .expect("the shipped registry must fit the default shadow budget");
 }
 
-/// #10549: the default budget is the kind's `current` plus every alternate
+/// #10549, #10521: the default budget is the kind's `current` plus every alternate
 /// one `eta.snapshot` row carries, so a registry within the default budget
 /// never has a shadow the snapshot silently drops from the chooser.
 #[test]
 fn the_default_budget_is_current_plus_the_alternates_cap() {
-    assert_eq!(MAX_ALTERNATES, 12);
+    assert_eq!(MAX_ALTERNATES, 13);
     assert_eq!(DEFAULT_MAX_ACTIVE, MAX_ALTERNATES + 1);
 }
 
