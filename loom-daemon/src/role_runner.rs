@@ -2714,6 +2714,10 @@ pub fn plan_idle_runs(
         );
         return Vec::new();
     }
+    if roster::repo_is_archived(root, None) {
+        log::debug!("role_runner: idle edge for {} suppressed — archived (#10562)", root.display());
+        return Vec::new();
+    }
     // Concurrent role-agent ceiling (#6102), resolved from this root's own
     // config. Resolved ONCE for the whole edge rather than per-spec so a single
     // idle edge cannot admit a burst that each individually passed a
@@ -3128,6 +3132,11 @@ fn decide_root_tick_detailed(
             root.display(),
             describe_shard_refusal(&shard)
         );
+        return concurrent_dispatch::RootTickDecision::Skip;
+    }
+    // #10562: every role writes to the forge; an archived repo refuses all of it.
+    if roster::repo_is_archived(root, None) {
+        log::debug!("role_runner: {} tick for {} skipped — archived", spec.name, root.display());
         return concurrent_dispatch::RootTickDecision::Skip;
     }
     // Resolved-role-list diagnostic (#5654 AC1): computed once per root per
