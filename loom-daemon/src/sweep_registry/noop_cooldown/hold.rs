@@ -149,6 +149,7 @@ const ISSUE_JQ: &str = "{state: .state, body: .body, labels: [(.labels // [])[] 
 
 impl SweepRegistry {
     /// Streak length for `issue` (0 when none). Observability and tests.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn noop_streak_count(&self, issue: u32) -> u32 {
         self.noop_cooldown
@@ -158,6 +159,7 @@ impl SweepRegistry {
     }
 
     /// Whether this daemon holds `issue` for a no-op loop.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn noop_hold_applied(&self, issue: u32) -> bool {
         self.noop_cooldown
