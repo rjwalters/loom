@@ -36,12 +36,21 @@ use crate::eta::fit::rows::{data_horizon, is_open_at};
 use crate::eta::fit::KNOWABLE_LAG_SEC;
 use crate::eta::fleet::FleetSnapshot;
 use crate::eta::fleet_log::{one_per_repo, SnapshotLog};
+use crate::eta::loop_features::{loop_features, repo_context, LoopFeatures, LoopInputs};
 use crate::eta::queue_features::EventLog;
 use crate::eta::{AgeSource, Stage};
 use chrono::{DateTime, Duration, Utc};
 use std::collections::BTreeMap;
 
 impl Tracker {
+    /// The friction predictors of `pr` of `repo` at `now` (#10521), from the
+    /// fleet snapshots' timeline at `now − LAG`, as a training row at `t`
+    /// reads them at `t − LAG` ([`Timeline::loop_features`]).
+    #[must_use]
+    pub fn loop_features_of(&self, repo: &str, pr: u32, now: DateTime<Utc>) -> LoopFeatures {
+        self.context.timeline().loop_features(repo, pr, now)
+    }
+
     /// Start `key`'s track on first sight of its PR mid-`stage` (a restart,
     /// or a PR new to this host), and return the item.
     ///
@@ -305,6 +314,33 @@ impl Timeline {
         let at = Self::open(&episodes, Stage::MergeHold, cutoff)?;
         let (first, _) = chain_start(&episodes[..=at]);
         Some((first, episodes[at].entered_at, self.known_through(repo, pr, at)))
+    }
+
+    /// The friction predictors of `pr` at `now − LAG` (#10521): the one
+    /// builder [`loop_features`] over the PR's episodes and its repo's, as
+    /// `fit::rows` calls it. File lists and CI runs are not logged yet, so
+    /// those features are `None` on both sides.
+    pub(super) fn loop_features(&self, repo: &str, pr: u32, now: DateTime<Utc>) -> LoopFeatures {
+        let cutoff = cutoff(now);
+        let key = repo.to_ascii_lowercase();
+        let all: Vec<&StageEpisode> = self
+            .prs
+            .range((key.clone(), 0)..=(key, u32::MAX))
+            .flat_map(|(_, episodes)| episodes.iter())
+            .collect();
+        let own: Vec<&StageEpisode> = self.episodes(repo, pr).iter().collect();
+        let context = repo_context(&all, cutoff);
+        loop_features(
+            &LoopInputs {
+                repo,
+                pr,
+                own: &own,
+                repo_episodes: &context,
+                files: None,
+                ci: None,
+            },
+            cutoff,
+        )
     }
 
     /// The event log serving counts over at `observed_at`
