@@ -111,6 +111,14 @@ pub enum TerminalClassification {
     /// `SandboxUnavailable` it records **no** account hold and is not a
     /// success: the account's credentials are fine, the container is down.
     SessionDown,
+    /// The account's Codex session container was running but did not mount
+    /// the tick's working directory (#10364): a repository registered after
+    /// the container was created. Announced by `session-exec host`'s
+    /// pre-exec mount check and applied by the terminal-record parser
+    /// (`session_exec::refusal`), never written by the adapter script. Like
+    /// `SessionDown` it records **no** account hold and is not a success: the
+    /// container is stale, the account is fine.
+    SessionMountStale,
 }
 
 impl std::str::FromStr for TerminalClassification {
@@ -130,6 +138,7 @@ impl std::str::FromStr for TerminalClassification {
             "SESSION_LIMIT" => Self::SessionLimit,
             "SANDBOX_UNAVAILABLE" => Self::SandboxUnavailable,
             "SESSION_DOWN" => Self::SessionDown,
+            "SESSION_MOUNT_STALE" => Self::SessionMountStale,
             other => bail!("unknown terminal classification {other:?}"),
         })
     }
@@ -654,6 +663,7 @@ pub fn record_terminal_for_class_with_reset_at(
                 | TerminalClassification::ModelRefusal
                 | TerminalClassification::SandboxUnavailable
                 | TerminalClassification::SessionDown
+                | TerminalClassification::SessionMountStale
         ) {
             return Ok(());
         }
@@ -764,7 +774,8 @@ pub fn record_terminal_for_class_with_reset_at(
             | TerminalClassification::CwdDeleted
             | TerminalClassification::ModelRefusal
             | TerminalClassification::SandboxUnavailable
-            | TerminalClassification::SessionDown => unreachable!(),
+            | TerminalClassification::SessionDown
+            | TerminalClassification::SessionMountStale => unreachable!(),
         }
         state.accounts.push(entry);
         state
