@@ -1978,14 +1978,12 @@ echo "Attempting to merge PR #$PR_NUMBER..."
 # merge-pr.sh may not exist on PR branches checked out via gh pr checkout
 git checkout main 2>/dev/null || true
 
-# Queue mode (#10256, merge-queue-authorization.md): only an explicit DIRECT
-# sentinel (stdout first line, rc 0) falls through. Unknown verb, invalid or
-# unreadable mode, empty output: NO direct merge.
+# Queue mode (#10256): only a DIRECT first line + rc 0 falls through.
 QOUT=$(loom-daemon forge merge-queue step "$PR_NUMBER" --approved-sha \
   "$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid)" 2>/dev/null); QRC=$?
 MERGE_RC=0
 case "${QOUT%%$'\n'*}" in LOOM-MERGE-QUEUE-DIRECT*) [ "$QRC" -eq 0 ] || MERGE_RC=7 ;; *) MERGE_RC=7 ;; esac
-[ "$MERGE_RC" -eq 0 ] || echo "$QOUT (step rc=$QRC)"
+[ "$MERGE_RC" -eq 0 ] || echo "$QOUT (rc=$QRC)"
 
 # Worktree-safe forge-API merge. --auto waits then merges HERE (#8410); head-SHA
 # precondition (#5579); --redate-stale-checks is the #8248 remedy (#8508).
