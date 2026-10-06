@@ -187,14 +187,21 @@ pub(crate) fn write_disk_entry(path: &Path, entry: &DiskEntry) {
 /// [`write_disk_entry`]'s atomic, owner-only write for any serializable value
 /// (the repo-facts records of [`crate::forge_repo_facts`] share this store).
 pub(crate) fn write_private_json<T: serde::Serialize>(path: &Path, value: &T) {
+    let Ok(serialized) = serde_json::to_string(value) else {
+        return;
+    };
+    write_private_atomic(path, serialized.as_bytes());
+}
+
+/// Write `bytes` to `path` atomically (temp file + rename), owner-only, and
+/// only inside a [`private_dir`]. Best-effort, like [`write_disk_entry`]:
+/// any failure leaves the previous file (or none) in place.
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) {
     use std::io::Write;
     let Some(dir) = path.parent() else { return };
     if !private_dir(dir, true) {
         return;
     }
-    let Ok(serialized) = serde_json::to_string(value) else {
-        return;
-    };
     let tmp = dir.join(format!(
         ".tmp-{}-{}",
         std::process::id(),
@@ -206,7 +213,7 @@ pub(crate) fn write_private_json<T: serde::Serialize>(path: &Path, value: &T) {
         create_private_file(&tmp)
     });
     let Ok(mut file) = file else { return };
-    if file.write_all(serialized.as_bytes()).is_ok() {
+    if file.write_all(bytes).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     } else {
         let _ = std::fs::remove_file(&tmp);

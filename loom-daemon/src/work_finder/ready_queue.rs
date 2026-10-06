@@ -101,7 +101,9 @@ pub fn sort_lanes(items: &mut [WorkItem], repo_red: bool) {
 
 /// The dispatch-order seam (Issue #9288), re-exported beside [`key_of`]:
 /// [`candidate_cmp`] is the lexicographic compare of [`candidate_keys`].
-pub use super::ordering::{candidate_keys, CandidateKey, KeyValue};
+pub use super::ordering::{
+    candidate_keys, keyed_cmp, CandidateKey, KeyValue, ETA_IGNORED_KEYS, ETA_POSITION_KEYS,
+};
 
 /// The comparator's key names, in order — the plan's `ordering`.
 #[must_use]

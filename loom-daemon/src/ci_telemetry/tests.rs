@@ -17,6 +17,7 @@ mod join_keys;
 mod journal_view;
 mod owners;
 mod queue_time;
+mod reader_routing;
 mod rerun_window;
 mod shard_queue;
 mod step_spans;

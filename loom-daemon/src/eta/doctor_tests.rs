@@ -47,6 +47,7 @@ fn healthy() -> Facts {
             latest: Some(("fit1".into(), now() - Duration::hours(12))),
             today_exists: true,
             last_check: Some(fit_record("skipped", Some("today_exists"), 1)),
+            published: PubStatus::default(),
         },
         serving: ServingFacts {
             fit_loaded: true,
@@ -313,4 +314,50 @@ fn render_puts_the_remedy_on_an_indented_line() {
     let json = serde_json::to_value(&c).unwrap();
     assert_eq!(json["status"], "FAIL");
     assert_eq!(json["link"], "data");
+}
+
+#[test]
+fn published_fit_absent_is_a_skip_naming_the_fallback() {
+    let c = evaluate(&healthy());
+    let c = find(&c, "fit", "published_fit");
+    assert_eq!(c.status, Status::Skip);
+    assert!(c.detail.contains("no_model"), "{}", c.render());
+}
+
+#[test]
+fn published_fit_states_map_to_status() {
+    let mut f = healthy();
+    f.fit.published = PubStatus {
+        kind: Some(FetchKind::Installed),
+        fit_id: Some("fitX".into()),
+        captain_host: Some("cap".into()),
+        published_at: Some(hours_ago(2)),
+        ..PubStatus::default()
+    };
+    let c = evaluate(&f);
+    let c = find(&c, "fit", "published_fit");
+    assert_eq!(c.status, Status::Ok);
+    assert!(c.detail.contains("fitX") && c.detail.contains("cap"), "{}", c.render());
+
+    f.fit.published.kind = Some(FetchKind::Stale);
+    let c = evaluate(&f);
+    let c = find(&c, "fit", "published_fit");
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.remedy.is_some() && c.detail.contains("own fit"), "{}", c.render());
+
+    f.fit.published.kind = Some(FetchKind::Refused);
+    f.fit.published.reason = Some("bad_signature".into());
+    let c = evaluate(&f);
+    let c = find(&c, "fit", "published_fit");
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.detail.contains("bad_signature"), "{}", c.render());
+
+    f.fit.published = PubStatus {
+        publish_error: Some("403".into()),
+        ..PubStatus::default()
+    };
+    let c = evaluate(&f);
+    let c = find(&c, "fit", "published_fit");
+    assert_eq!(c.status, Status::Warn);
+    assert!(c.detail.contains("403"), "{}", c.render());
 }
