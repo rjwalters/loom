@@ -18,11 +18,16 @@
 //! [`reason::NO_READER_FOR_REPO`]; a reader with no fresh reading with
 //! [`reason::NO_IDENTITY_READING`] — never another identity's values.
 //!
-//! The writer's budget is its own identity (#10334), kept under the fixed
-//! public label [`crate::forge_identity::WRITER_BUCKET`] and carried as
-//! `ratelimit_writer_*`. `ratelimit_min_remaining` / `ratelimit_exhausted`
-//! summarise the most constrained of the serving reader and the writer, so a
-//! healthy reader cannot hide an exhausted writer.
+//! The writer's budget is its own identity (#10334), carried as
+//! `ratelimit_writer_*`. A multi-owner fleet has one writer credential per
+//! managed owner, so each owner's writer keeps its readings under its own
+//! public label ([`crate::forge_identity::writer_bucket`]: `writer@<owner>`,
+//! never a credential or App id), and an item reads the writer that serves its
+//! repo ([`crate::forge_identity::serving_writer_bucket`]) — never another
+//! owner's. `ratelimit_min_remaining` / `ratelimit_exhausted` summarise the
+//! most constrained of the serving reader and the serving writer, so neither a
+//! healthy reader nor another owner's healthy writer can hide an exhausted
+//! writer.
 
 use super::explanation::{FeatureOmitted, Features};
 use chrono::{DateTime, Duration, Utc};
@@ -121,9 +126,12 @@ pub struct StallSnapshot {
     /// The serving reader's budgets per (lowercased) `owner/repo`. A repo
     /// with no applicable reader is absent.
     pub budgets: BTreeMap<String, RepoBudget>,
-    /// The writer credential's budgets (#10334): one writer per host, kept
-    /// under [`crate::forge_identity::WRITER_BUCKET`], never a reader's.
-    pub writer: RepoBudget,
+    /// The serving writer's budgets per (lowercased) `owner/repo` (#10334):
+    /// the writer credential that serves each repo's owner, kept under its
+    /// own `writer@<owner>` label — never a reader's or another owner's
+    /// writer's. A repo with no fresh writer reading maps to an empty
+    /// [`RepoBudget`].
+    pub writers: BTreeMap<String, RepoBudget>,
     /// The breaker, when one is registered.
     pub breaker: Option<BreakerReading>,
     /// The pool `workspace_root` resolves to.
@@ -164,12 +172,24 @@ pub fn collect(workspace_root: &Path, repos: &[String], now: DateTime<Utc>) -> S
         &buckets,
         now,
     );
-    let writer = writer_budget(&buckets, now);
+    let primary_owner = crate::forge_bucket_book::primary_owner(workspace_root);
+    let writers = repo_budgets(
+        repos,
+        |repo| {
+            crate::forge_identity::serving_writer_bucket(
+                repo,
+                crate::credential_preflight::gh_config_dir_for_owner_slug(repo).is_some(),
+                primary_owner.as_deref(),
+            )
+        },
+        &buckets,
+        now,
+    );
     let pool = crate::tokens_pool::select::spawnable_pool_state(workspace_root);
     StallSnapshot {
         observed_at: now,
         budgets,
-        writer,
+        writers,
         breaker: breaker.map(|b| BreakerReading {
             state: b.phase.as_str().to_string(),
             cooldown_until: b.cooldown_until,
@@ -181,26 +201,11 @@ pub fn collect(workspace_root: &Path, repos: &[String], now: DateTime<Utc>) -> S
     }
 }
 
-/// The writer credential's budgets in `buckets`, from its fixed public label.
-#[must_use]
-pub fn writer_budget(
-    buckets: &BTreeMap<String, Vec<crate::types::ForgeBudgetReading>>,
-    now: DateTime<Utc>,
-) -> RepoBudget {
-    let readings = buckets
-        .get(crate::forge_identity::WRITER_BUCKET)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    RepoBudget {
-        core: reading(readings, "core", now),
-        graphql: reading(readings, "graphql", now),
-    }
-}
-
-/// The budgets of each repo's serving reader: `bucket_of` names the reader
-/// bucket serving a repo (`None` = no reader), `buckets` holds the readings
-/// per bucket. A repo whose reader has no fresh reading maps to an empty
-/// [`RepoBudget`]; one with no reader is left out.
+/// The budgets of each repo's serving identity: `bucket_of` names the reader
+/// (or, for [`StallSnapshot::writers`], writer) bucket serving a repo
+/// (`None` = none), `buckets` holds the readings per bucket. A repo whose
+/// identity has no fresh reading maps to an empty [`RepoBudget`]; one with
+/// none is left out.
 #[must_use]
 pub fn repo_budgets(
     repos: &[String],
@@ -258,9 +263,9 @@ fn budget_to(
     }
 }
 
-/// The writer budget and the most-constrained-identity summary (#10334): the
-/// serving reader's and the writer's budgets each count, so a healthy reader
-/// cannot mask an exhausted writer. A reading whose reset instant has passed
+/// The serving writer's budget and the most-constrained-identity summary
+/// (#10334): the serving reader's and the serving writer's budgets each
+/// count, so a healthy reader cannot mask an exhausted writer. A reading whose reset instant has passed
 /// at `as_of` no longer constrains anything.
 fn write_identity_summary(
     snap: &StallSnapshot,
@@ -269,7 +274,7 @@ fn write_identity_summary(
     features: &mut Features,
     omitted: &mut Vec<FeatureOmitted>,
 ) {
-    let w = &snap.writer;
+    let w = snap.writers.get(repo).cloned().unwrap_or_default();
     for (r, name, out) in [
         (
             &w.core,

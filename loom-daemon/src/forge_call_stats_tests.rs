@@ -269,17 +269,66 @@ fn readings_of_two_reader_buckets_with_one_role_stay_separate() {
     let a = agg.latest_by_bucket[&(Pool::Core, "reader:1@org".to_string())];
     let b = agg.latest_by_bucket[&(Pool::Core, "reader:2@org".to_string())];
     assert_eq!((a.remaining, b.remaining), (0, 4000));
-    // The writer and its fallback share one fixed-label bucket (#10334),
-    // separate from both readers; the pool-wide reading is still the newest.
-    assert_eq!(agg.latest_by_bucket.len(), 3);
-    let w = agg.latest_by_bucket[&(Pool::Core, crate::forge_identity::WRITER_BUCKET.to_string())];
-    assert_eq!(w.remaining, 4999);
+    // A writer line naming no owner (no credential owner, no repo) lands in
+    // no bucket (#10334); the pool-wide reading is still the newest.
+    assert_eq!(agg.latest_by_bucket.len(), 2);
     assert_eq!(agg.latest[&Pool::Core].remaining, 4999);
     // An unattributed line (no role, no bucket) lands in no bucket.
     let mut unattributed = with_bucket(400, "x", None, 1);
     unattributed.ir = None;
     agg.add(&unattributed);
-    assert_eq!(agg.latest_by_bucket.len(), 3);
+    assert_eq!(agg.latest_by_bucket.len(), 2);
+}
+
+/// #10334 (Judge P2): one writer per managed owner. Owner A's writer is
+/// exhausted; owner B's writer answers later with budget left. Each lands
+/// under its own `writer@<owner>` bucket, so B's healthy reading never
+/// overwrites A's exhausted one; the writer fallback lands under the same
+/// owner's writer; and no bucket label is credential-shaped.
+#[test]
+fn two_owners_writers_keep_separate_buckets() {
+    let writer = |t: i64, role: &str, co: Option<&str>, rp: Option<&str>, rem: u64| {
+        let mut l: SinkLine =
+            serde_json::from_str(&line(t, "c", Pool::Core, Outcome::Ok, Some(rem))).unwrap();
+        l.ir = Some(role.to_string());
+        l.ib = None;
+        l.at.co = co.map(str::to_string);
+        l.rp = rp.map(str::to_string);
+        l
+    };
+    let mut agg = Aggregate::default();
+    agg.add(&writer(100, "writer", Some("org-a"), Some("org-a/x"), 0));
+    agg.add(&writer(200, "writer", Some("org-b"), Some("org-b/y"), 4000));
+    let key = |owner: &str| (Pool::Core, crate::forge_identity::writer_bucket(owner).unwrap());
+    assert_eq!(agg.latest_by_bucket[&key("org-a")].remaining, 0);
+    assert_eq!(agg.latest_by_bucket[&key("org-b")].remaining, 4000);
+    // The pool-wide reading still collapses identities (B's, the newest).
+    assert_eq!(agg.latest[&Pool::Core].remaining, 4000);
+
+    // A writer line with no credential owner is booked under its repo's
+    // owner; a writer-fallback resolves to that same owner's writer.
+    agg.add(&writer(300, "writer-fallback", None, Some("Org-A/x"), 1));
+    assert_eq!(agg.latest_by_bucket[&key("org-a")].remaining, 1);
+    assert_eq!(agg.latest_by_bucket[&key("org-b")].remaining, 4000);
+    assert_eq!(agg.latest_by_bucket.len(), 2);
+
+    // A credential-shaped "owner" never becomes a label.
+    agg.add(&writer(400, "writer", Some("ghp_abcdef123456"), None, 9));
+    assert_eq!(agg.latest_by_bucket.len(), 2);
+    for (_, label) in agg.latest_by_bucket.keys() {
+        assert!(label.starts_with(crate::forge_identity::WRITER_BUCKET_PREFIX), "{label}");
+        for shape in [
+            "ghp_",
+            "gho_",
+            "ghs_",
+            "ghu_",
+            "github_pat_",
+            "Bearer ",
+            "-----BEGIN",
+        ] {
+            assert!(!label.contains(shape), "{label}");
+        }
+    }
 }
 
 // ===== #9777 call identity =====

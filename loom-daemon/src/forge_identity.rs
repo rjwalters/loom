@@ -809,11 +809,43 @@ pub fn reader_bucket(app_id: &str, owner_repo: &str) -> String {
     format!("reader:{app_id}@{}", owner.to_ascii_lowercase())
 }
 
-/// The public rate-limit bucket label of the writer credential (#10334). The
-/// writer is one credential per host and owns its own budget, separate from
-/// every reader App's; the label is a fixed word, never a credential or an
-/// App id.
-pub const WRITER_BUCKET: &str = "writer";
+/// The prefix of every writer rate-limit bucket label (#10334).
+pub const WRITER_BUCKET_PREFIX: &str = "writer@";
+
+/// The public rate-limit bucket label of the writer credential installed for
+/// `owner` (#10334): `writer@<owner>`, lowercased. A multi-owner fleet holds
+/// one writer credential per managed owner (`.loom/gh-config-by-owner/<owner>`
+/// beside the primary `.loom/gh-config`), each with its own budget, so the
+/// owner — a public name, never a credential, token or App id — keys it.
+/// `None` when `owner` is not a plausible GitHub owner name or is
+/// credential-shaped, so nothing but a public owner label is ever recorded.
+#[must_use]
+pub fn writer_bucket(owner: &str) -> Option<String> {
+    let owner = owner.trim();
+    (crate::forge_bucket_book::valid_owner(owner)
+        && crate::forge_call_stats::sanitize(owner).as_deref() == Some(owner))
+    .then(|| format!("{WRITER_BUCKET_PREFIX}{}", owner.to_ascii_lowercase()))
+}
+
+/// The writer bucket that serves `owner_repo` (#10334), mirroring how a
+/// writer `gh` call picks its credential (`GhInvocation::env_plan`): the
+/// owner's own writer when one is registered for it
+/// (`owner_writer_registered`, `credential_preflight::gh_config_dir_for_owner_slug`),
+/// else the primary writer, booked under the workspace's own owner
+/// (`primary_owner`). With the primary owner unknown, the repo's owner — the
+/// same owner a writer row without a credential owner is booked under.
+#[must_use]
+pub fn serving_writer_bucket(
+    owner_repo: &str,
+    owner_writer_registered: bool,
+    primary_owner: Option<&str>,
+) -> Option<String> {
+    let repo_owner = crate::credential_preflight::owner_of_nwo(owner_repo);
+    match primary_owner {
+        Some(primary) if !owner_writer_registered => writer_bucket(primary),
+        _ => writer_bucket(repo_owner),
+    }
+}
 
 /// The one reader-then-writer retry shape (#9537, shared since #9872 by
 /// `forge_etag_store::fetch_conditional` and the `GhInvocation` choke point).
