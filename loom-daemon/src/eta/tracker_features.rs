@@ -66,8 +66,8 @@ use crate::eta::queue_features::{
     self, is_pr_stage, reason, EventKind, EventLog, QueueFeatures, QueueSubject, RosterEntry,
     StageEvent, SINCE_MERGE_CAP_SEC,
 };
-use crate::eta::stage_queue::{stage_queue, StageQueue};
 use crate::eta::repo_priority::RosterRevision;
+use crate::eta::stage_queue::{stage_queue, StageQueue};
 use crate::eta::stall_features::{self, StallSnapshot};
 use crate::eta::{CurrentState, NoEstimateReason, Stage};
 use crate::types::{PlanState, QueueDisposition};
