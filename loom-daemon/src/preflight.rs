@@ -11,8 +11,8 @@
 //! re-implements a check.
 //!
 //! State lives in the worktree's git dir (never in the work tree, so it cannot
-//! be committed): a count of failed runs, and a *receipt* recording the `HEAD`
-//! that last passed. `create-pr.sh` calls [`check`], which refuses a PR whose
+//! be committed): a count of failed runs scoped to one dispatch *episode*
+//! (see [`episode_id`]), and a *receipt* recording the `HEAD` that last passed. `create-pr.sh` calls [`check`], which refuses a PR whose
 //! `HEAD` has no receipt.
 //!
 //! Opt-in: no (enabled) `buildGate` block means every entry point is a no-op
@@ -72,10 +72,26 @@ impl Verdict {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct State {
+    /// Dispatch episode the attempt budget belongs to; a different episode
+    /// starts a fresh budget (a released-and-redispatched issue reuses the
+    /// same worktree, so the worktree alone cannot scope the budget).
+    #[serde(default)]
+    episode: String,
     #[serde(default)]
     failed_attempts: u32,
     #[serde(default)]
     passed_head: Option<String>,
+}
+
+/// Identifier of the current Builder dispatch episode: the sweep id the daemon
+/// exports to the session, else the session pid, else empty (a manual run —
+/// one shared episode, so retries stay bounded).
+#[must_use]
+pub fn episode_id() -> String {
+    ["LOOM_SWEEP_ID", "LOOM_AGENT_SESSION_PID"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+        .unwrap_or_default()
 }
 
 fn git_out(worktree: &Path, args: &[&str]) -> Option<String> {
@@ -164,11 +180,22 @@ fn run_command(command: &str, cwd: &Path, timeout: Duration) -> Result<(), Strin
 /// Run the pre-flight gate in `worktree`, recording the outcome.
 #[must_use]
 pub fn run(worktree: &Path) -> Verdict {
+    run_in_episode(worktree, &episode_id())
+}
+
+/// [`run`] with an explicit dispatch episode. Attempts are bounded within one
+/// episode; entering a new one resets the budget.
+#[must_use]
+pub fn run_in_episode(worktree: &Path, episode: &str) -> Verdict {
     let Some(cfg) = crate::main_health_gate::read_build_gate_config(worktree) else {
         return Verdict::Disabled;
     };
     let max = max_attempts(worktree);
     let mut st = load(worktree);
+    if st.episode != episode {
+        st.episode = episode.to_string();
+        st.failed_attempts = 0;
+    }
     if st.failed_attempts >= max {
         // Already terminal: a further run must not reopen the loop.
         return Verdict::Unresolved {
@@ -203,6 +230,28 @@ pub fn run(worktree: &Path) -> Verdict {
             }
         }
     }
+}
+
+/// Release the Builder's claim on `issue` after a terminal verdict, through
+/// the same protected path the reaper uses: the stale `loom:building` claim is
+/// always removed, `loom:issue` is re-added only if the issue is not parked
+/// (`loom:blocked` / `loom:operator-only`), not a PR and not closed, and every
+/// forge call is scoped to `worktree`'s repository (`LOOM_REPO` still wins).
+///
+/// # Errors
+/// The forge mutation could not be run, timed out, or exited non-zero.
+pub fn release_claim(worktree: &Path, issue: u32) -> anyhow::Result<()> {
+    release_claim_with(
+        crate::sweep_registry::SweepRegistryConfig::new(worktree.to_path_buf()),
+        issue,
+    )
+}
+
+fn release_claim_with(
+    config: crate::sweep_registry::SweepRegistryConfig,
+    issue: u32,
+) -> anyhow::Result<()> {
+    crate::sweep_registry::SweepRegistry::new(config).restore_label_to_ready(issue)
 }
 
 /// Enforcement probe for `create-pr.sh`: `true` when the gate is disabled or
@@ -254,22 +303,22 @@ mod tests {
     #[test]
     fn absent_block_is_noop() {
         let d = repo(None);
-        assert_eq!(run(d.path()), Verdict::Disabled);
-        assert_eq!(run(d.path()).exit_code(), 0);
+        assert_eq!(run_in_episode(d.path(), "e1"), Verdict::Disabled);
+        assert_eq!(run_in_episode(d.path(), "e1").exit_code(), 0);
         assert!(check(d.path()));
     }
 
     #[test]
     fn disabled_block_is_noop() {
         let d = repo(Some(r#"{"enabled":false,"command":"false"}"#));
-        assert_eq!(run(d.path()), Verdict::Disabled);
+        assert_eq!(run_in_episode(d.path(), "e1"), Verdict::Disabled);
     }
 
     #[test]
     fn pass_writes_receipt() {
         let d = repo(Some(r#"{"enabled":true,"command":"true"}"#));
         assert!(!check(d.path()), "no receipt before a run");
-        assert_eq!(run(d.path()), Verdict::Pass);
+        assert_eq!(run_in_episode(d.path(), "e1"), Verdict::Pass);
         assert!(check(d.path()));
     }
 
@@ -278,7 +327,7 @@ mod tests {
         let d = repo(Some(
             r#"{"enabled":true,"command":"echo boom-marker; exit 3","preflightMaxAttempts":2}"#,
         ));
-        match run(d.path()) {
+        match run_in_episode(d.path(), "e1") {
             Verdict::Failed {
                 attempt: 1,
                 max: 2,
@@ -287,7 +336,7 @@ mod tests {
             v => panic!("unexpected {v:?}"),
         }
         assert!(!check(d.path()));
-        let v = run(d.path());
+        let v = run_in_episode(d.path(), "e1");
         assert!(
             matches!(
                 v,
@@ -301,13 +350,13 @@ mod tests {
         );
         assert_eq!(v.exit_code(), EXIT_UNRESOLVED);
         // Terminal: stays unresolved without running the command again.
-        assert!(matches!(run(d.path()), Verdict::Unresolved { .. }));
+        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Unresolved { .. }));
     }
 
     #[test]
     fn receipt_invalidated_by_new_commit() {
         let d = repo(Some(r#"{"enabled":true,"command":"true"}"#));
-        assert_eq!(run(d.path()), Verdict::Pass);
+        assert_eq!(run_in_episode(d.path(), "e1"), Verdict::Pass);
         let ok = Command::new("git")
             .args([
                 "-c",
@@ -325,5 +374,113 @@ mod tests {
             .unwrap();
         assert!(ok.success());
         assert!(!check(d.path()));
+    }
+
+    #[test]
+    fn redispatch_into_same_worktree_gets_a_fresh_budget() {
+        let d =
+            repo(Some(r#"{"enabled":true,"command":"test -f fixed","preflightMaxAttempts":2}"#));
+        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Failed { .. }));
+        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Unresolved { .. }));
+        // Same episode stays terminal even once the cause is fixed.
+        std::fs::write(d.path().join("fixed"), "").unwrap();
+        assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::Unresolved { .. }));
+        // A new dispatch into the same worktree starts a fresh budget.
+        assert_eq!(run_in_episode(d.path(), "e2"), Verdict::Pass);
+        assert!(check(d.path()));
+    }
+
+    mod release {
+        use super::*;
+        use crate::sweep_registry::SweepRegistryConfig;
+        use std::os::unix::fs::PermissionsExt;
+
+        /// Fake `gh`: logs `<cwd> <args>`; `labels` is the `loom:*` label
+        /// answer for `issue view`, `state` the issue state, `edit_rc` the
+        /// exit status of `issue edit`.
+        fn fake_gh(dir: &Path, labels: &str, state: &str, edit_rc: i32) -> (PathBuf, PathBuf) {
+            let gh = dir.join("fake-gh.sh");
+            let log = dir.join("gh.log");
+            let script = format!(
+                r#"#!/usr/bin/env bash
+printf '%s | %s\n' "$PWD" "$*" >> "{log}"
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then echo "{labels}"; exit 0; fi
+if [ "$1" = "issue" ] && [ "$2" = "edit" ]; then echo "boom" >&2; exit {edit_rc}; fi
+if [ "$1" = "api" ]; then
+  case "$*" in
+    *".pull_request != null"*) echo false ;;
+    *".state"*) printf '{{"body":"","state":"{state}","closed_at":null,"labels":[]}}' ;;
+    *) echo "" ;;
+  esac
+  exit 0
+fi
+exit 0
+"#,
+                log = log.display()
+            );
+            std::fs::write(&gh, script).unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            (gh, log)
+        }
+
+        fn release(wt: &Path, gh: &Path) -> anyhow::Result<()> {
+            let mut cfg = SweepRegistryConfig::new(wt.to_path_buf());
+            cfg.gh_bin = Some(gh.to_path_buf());
+            release_claim_with(cfg, 77)
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn open_issue_is_requeued_in_the_worktree_repo() {
+            let tools = tempfile::tempdir().unwrap();
+            let wt = tempfile::tempdir().unwrap();
+            let (gh, log) = fake_gh(tools.path(), "false", "open", 0);
+            release(wt.path(), &gh).unwrap();
+            let calls = std::fs::read_to_string(&log).unwrap();
+            let wt_real = std::fs::canonicalize(wt.path()).unwrap();
+            assert!(
+                calls
+                    .lines()
+                    .any(|l| l.starts_with(&wt_real.display().to_string())
+                        && l.contains(
+                            "issue edit 77 --remove-label loom:building --add-label loom:issue"
+                        )),
+                "gh must run inside the requested worktree, not the caller cwd: {calls}"
+            );
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn closed_issue_is_not_requeued() {
+            let tools = tempfile::tempdir().unwrap();
+            let wt = tempfile::tempdir().unwrap();
+            let (gh, log) = fake_gh(tools.path(), "false", "closed", 0);
+            release(wt.path(), &gh).unwrap();
+            let calls = std::fs::read_to_string(&log).unwrap();
+            assert!(calls.contains("--remove-label loom:building"), "{calls}");
+            assert!(!calls.contains("--add-label loom:issue"), "{calls}");
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn parked_issue_is_not_requeued() {
+            let tools = tempfile::tempdir().unwrap();
+            let wt = tempfile::tempdir().unwrap();
+            let (gh, log) = fake_gh(tools.path(), "true", "open", 0);
+            release(wt.path(), &gh).unwrap();
+            let calls = std::fs::read_to_string(&log).unwrap();
+            assert!(calls.contains("--remove-label loom:building"), "{calls}");
+            assert!(!calls.contains("--add-label loom:issue"), "{calls}");
+        }
+
+        #[test]
+        #[serial_test::serial]
+        fn forge_failure_is_reported() {
+            let tools = tempfile::tempdir().unwrap();
+            let wt = tempfile::tempdir().unwrap();
+            let (gh, _log) = fake_gh(tools.path(), "false", "open", 1);
+            let err = release(wt.path(), &gh).unwrap_err().to_string();
+            assert!(err.contains("failed") && err.contains("boom"), "{err}");
+        }
     }
 }

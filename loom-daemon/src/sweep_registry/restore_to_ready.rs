@@ -100,14 +100,22 @@ impl SweepRegistry {
         // path cannot block the registry read indefinitely (Issue #3973).
         args.extend(crate::claim_reconciliation::gh_call::loom_repo_flag());
         let timeout = reap_gh_timeout();
-        if self.gh_write("restore.label", &args)?.is_none() {
-            log::warn!(
-                "sweep_registry: restore_label_to_ready gh for #{issue} exceeded {}s \
-                 and was killed (#3973)",
-                timeout.as_secs()
-            );
+        match self.gh_write("restore.label", &args)? {
+            None => {
+                log::warn!(
+                    "sweep_registry: restore_label_to_ready gh for #{issue} exceeded {}s \
+                     and was killed (#3973)",
+                    timeout.as_secs()
+                );
+                anyhow::bail!("gh issue edit #{issue} timed out after {}s", timeout.as_secs());
+            }
+            Some(out) if !out.status.success() => anyhow::bail!(
+                "gh issue edit #{issue} failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Some(_) => Ok(()),
         }
-        Ok(())
     }
 }
 

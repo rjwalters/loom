@@ -7,7 +7,6 @@
 //! passing receipt for the current `HEAD`.
 
 use std::path::PathBuf;
-use std::process::Command;
 
 use loom_daemon::preflight::{self, Verdict};
 
@@ -57,16 +56,18 @@ impl PreflightArgs {
                     "preflight: reason=preflight_unresolved after {attempts}/{max} attempts — open NO PR.\n{tail}"
                 );
                 if let Some(n) = self.issue {
-                    // Fail closed: hand the issue back so the pipeline can retry.
-                    let _ = Command::new("gh")
-                        .args(["issue", "edit", &n.to_string()])
-                        .args([
-                            "--remove-label",
-                            "loom:building",
-                            "--add-label",
-                            "loom:issue",
-                        ])
-                        .status();
+                    // Fail closed: hand the issue back so the pipeline can
+                    // retry — through the protected, worktree-scoped release
+                    // path, and say so loudly if the forge call fails.
+                    match u32::try_from(n)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|n| preflight::release_claim(&wt, n))
+                    {
+                        Ok(()) => eprintln!("preflight: claim on #{n} released"),
+                        Err(e) => eprintln!(
+                            "preflight: FAILED to release claim on #{n}: {e:#} — release it manually (`loom-recover-orphans --recover`)"
+                        ),
+                    }
                 }
             }
         }

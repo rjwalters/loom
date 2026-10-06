@@ -294,10 +294,10 @@ fi
 # --- Pre-PR gate receipt (#10476) ---------------------------------------------
 # requires-daemon: preflight optional   no binary, or one predating `preflight`, skips this (only an exact exit 7 refuses)
 source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"
-_cpr_pf_bin="$(loom_resolve_self_daemon_bin 2>/dev/null || true)"
-if [[ -n "$_cpr_pf_bin" ]]; then
+_cpr_loom_daemon="$(loom_resolve_self_daemon_bin 2>/dev/null || true)"
+if [[ -n "$_cpr_loom_daemon" ]]; then
   _cpr_pf_rc=0
-  "$_cpr_pf_bin" preflight --check || _cpr_pf_rc=$?
+  "$_cpr_loom_daemon" preflight --check || _cpr_pf_rc=$?
   [[ "$_cpr_pf_rc" -ne 7 ]] || exit 7
 fi
 

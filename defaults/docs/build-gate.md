@@ -89,10 +89,10 @@ The orchestrator-side gate above runs *after* the Builder exits, so the failing 
 |------|---------|
 | `0` | Gate passed (a receipt for `HEAD` is recorded), or no enabled `buildGate` command — a no-op. |
 | `1` | Failed, attempts remain: the output tail is printed; fix, commit, re-run. |
-| `4` | Attempts exhausted: `reason=preflight_unresolved`. The claim is released (`loom:building` -> `loom:issue`) and the Builder opens **no PR**. |
+| `4` | Attempts exhausted: `reason=preflight_unresolved`. The claim is released via the protected restore path (a parked, closed or PR target is not re-queued; a failed release is reported) and the Builder opens **no PR**. |
 | `7` | `--check` only: `HEAD` has no passing receipt. |
 
-Attempts and the receipt live in the worktree's git dir (never committed); `buildGate.preflightMaxAttempts` (default 3) bounds the loop. **Enforcement:** `create-pr.sh` runs `loom-daemon preflight --check` and exits `7` for an un-gated `HEAD`; a binary predating the subcommand skips the check (fail-open, like its sibling guards). A new commit invalidates the receipt, so fixes must be re-gated. Repos with no `buildGate` block are unchanged.
+Attempts and the receipt live in the worktree's git dir (never committed); `buildGate.preflightMaxAttempts` (default 3) bounds the loop within one dispatch episode (`LOOM_SWEEP_ID`); a re-dispatch into the same worktree starts a fresh budget. **Enforcement:** `create-pr.sh` runs `loom-daemon preflight --check` and exits `7` for an un-gated `HEAD`; a binary predating the subcommand skips the check (fail-open, like its sibling guards). A new commit invalidates the receipt, so fixes must be re-gated. Repos with no `buildGate` block are unchanged.
 
 **Measuring first-pass Judge approval (post-merge observation, not a merge gate).** The target (>80%, from ~43%) is the share of PRs whose first Judge verdict is approve, i.e. PRs with exactly one `loom:review-requested` cycle. Query it in SigNoz on the Judge review spans/verdict events grouped by PR (first verdict per PR = approved vs. changes-requested), comparing before/after this lands; a `preflight_unresolved` log line counts sweeps stopped before any PR existed.
 
