@@ -58,6 +58,18 @@ pub fn documents_current_block(record_at: Option<&str>, labeled_at: Option<&str>
     }
 }
 
+/// Whether a Curator review comment posted at `posted_at` reviewed the
+/// `loom:blocked` last applied at `labeled_at`: posted at or after it (a
+/// review follows the label, so no slack). Fails toward "reviewed" (no write)
+/// when either time is missing or unreadable.
+#[must_use]
+pub fn reviews_current_block(posted_at: Option<&str>, labeled_at: Option<&str>) -> bool {
+    match (when(posted_at), when(labeled_at)) {
+        (Some(p), Some(l)) => p >= l,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +98,16 @@ mod tests {
         // Undatable: fail toward documented.
         assert!(documents_current_block(None, Some("2026-10-06T00:00:00Z")));
         assert!(documents_current_block(rec, None));
+    }
+
+    #[test]
+    fn only_a_review_posted_since_the_label_reviews_the_current_block() {
+        let label = Some("2026-10-06T00:00:00Z");
+        assert!(reviews_current_block(Some("2026-10-06T00:00:00Z"), label));
+        assert!(reviews_current_block(Some("2026-10-06T01:00:00Z"), label));
+        assert!(!reviews_current_block(Some("2026-10-05T23:59:59Z"), label));
+        // Undatable: fail toward reviewed (no write).
+        assert!(reviews_current_block(None, label));
+        assert!(reviews_current_block(Some("2026-10-05T00:00:00Z"), None));
     }
 }

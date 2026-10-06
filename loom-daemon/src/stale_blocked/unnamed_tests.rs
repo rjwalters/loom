@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use super::batch_tests::{fleet, row, Fake};
 use super::budget::Floor;
 use super::release::{Config, ReleaseForge};
-use super::unnamed::{run, Report, UNNAMED_LABEL};
+use super::unnamed::{run, Report, REVIEW_MARKER, UNNAMED_LABEL};
 use crate::comment_trust::TrustPolicy;
 use crate::operator_decision::cli::IssueState;
 use crate::park_record::apply::ParkForge;
@@ -82,6 +82,26 @@ impl ReleaseForge for Extra {
 
 fn trusted(body: &str) -> Value {
     json!({"body": body, "user": {"login": "someone"}, "author_association": "MEMBER"})
+}
+
+/// Curator's outcome comment, posted at `at`.
+fn review(at: &str, association: &str) -> Value {
+    json!({
+        "body": format!("Kept: waiting on the vendor.\n\n{REVIEW_MARKER} outcome=kept -->"),
+        "user": {"login": "someone"},
+        "author_association": association,
+        "created_at": at,
+    })
+}
+
+/// A reason record from an earlier hold, older than the current label.
+fn stale_kept_body() -> String {
+    crate::park_record::render_park(
+        &[],
+        Some("curator"),
+        Some("2026-01-01T00:00:00Z"),
+        Some("waiting on the vendor"),
+    )
 }
 
 struct World {
@@ -366,4 +386,66 @@ fn an_unticked_checklist_issue_is_not_queued_as_unnamed() {
     let r = w.run();
     assert!(r.queued.is_empty());
     assert_eq!(r.cleared, vec![2]);
+}
+
+/// Judge (#10602) re-queue loop: Curator keeps the hold with the reason the
+/// stale record already states, so `park-record apply` writes nothing and the
+/// record still predates the label. Its trusted review comment, posted after
+/// the label, stops the next tick from queueing the block again.
+#[test]
+fn keep_with_the_same_reason_is_not_re_queued_next_tick() {
+    let body = stale_kept_body();
+    let mut w = World::new();
+    w.add(1, &body, &[]);
+    w.extra.blocked_at.insert(1, "2026-10-06T00:00:00Z".into());
+    let r = w.run();
+    assert_eq!(r.queued, vec![1]);
+
+    // Curator "kept": same reason, so the body is unchanged (no fresh `at=`).
+    assert!(crate::park_record::apply::compose_body(
+        &body,
+        &[],
+        Some("curator"),
+        "2026-10-06T01:00:00Z",
+        Some("waiting on the vendor"),
+    )
+    .is_none());
+    // It removes the queue label and posts its outcome comment.
+    w.gather.rows.clear();
+    w.gather.unnamed.clear();
+    w.park.writes.clear();
+    w.add(1, &body, &[]);
+    w.extra
+        .comments
+        .insert(1, vec![review("2026-10-06T01:00:00Z", "MEMBER")]);
+
+    let r = w.run();
+    assert!(r.queued.is_empty() && r.cleared.is_empty(), "{}", r.summary());
+    assert_eq!(skipped(&r, "reviewed"), 1);
+    assert!(r.summary().contains("reviewed=1"), "{}", r.summary());
+    assert!(w.park.writes.is_empty(), "{:?}", w.park.writes);
+}
+
+/// A review comment counts only for the block it reviewed: one older than the
+/// latest `loom:blocked` label (an earlier block), or an untrusted one, does
+/// not suppress queueing.
+#[test]
+fn an_older_or_untrusted_review_does_not_suppress_queueing() {
+    let body = stale_kept_body();
+    let mut w = World::new();
+    w.add(1, &body, &[]);
+    w.extra.blocked_at.insert(1, "2026-10-06T00:00:00Z".into());
+    w.extra
+        .comments
+        .insert(1, vec![review("2026-09-01T00:00:00Z", "MEMBER")]);
+    w.add(2, &body, &[]);
+    w.extra.blocked_at.insert(2, "2026-10-06T00:00:00Z".into());
+    w.extra
+        .comments
+        .insert(2, vec![review("2026-10-06T01:00:00Z", "NONE")]);
+    let r = w.run();
+    let mut queued = r.queued.clone();
+    queued.sort_unstable();
+    assert_eq!(queued, vec![1, 2]);
+    assert_eq!(skipped(&r, "reviewed"), 0);
 }

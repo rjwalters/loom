@@ -284,21 +284,6 @@ fn render(w: &mut impl Write, out: &mut impl Write, s: &Sections<'_>, quiet: boo
         );
     }
 
-    if !s.held.is_empty() {
-        let _ = writeln!(
-            w,
-            "HELD WITH A STATED REASON — a park record states why, no numbered blocker ({}):",
-            s.held.len()
-        );
-        for f in s.held {
-            let (by, reason) = match &f.verdict {
-                Verdict::HeldWithReason { by, reason } => (by.as_deref().unwrap_or("?"), reason),
-                _ => ("?", &String::new()),
-            };
-            let _ = writeln!(w, "  {} {} (by {by}: {reason})", f.reference(), f.title);
-        }
-    }
-
     if s.any() {
         let n = s.stale.len()
             + s.superseded.len()
@@ -469,6 +454,23 @@ fn render(w: &mut impl Write, out: &mut impl Write, s: &Sections<'_>, quiet: boo
 
     if quiet {
         return;
+    }
+
+    // Informational, not a warning: a held-with-reason issue needs no action,
+    // so `--quiet` (the sweep pre-flight) never prints it (#10602).
+    if !s.held.is_empty() {
+        let _ = writeln!(
+            w,
+            "HELD WITH A STATED REASON — a park record states why, no numbered blocker ({}):",
+            s.held.len()
+        );
+        for f in s.held {
+            let (by, reason) = match &f.verdict {
+                Verdict::HeldWithReason { by, reason } => (by.as_deref().unwrap_or("?"), reason),
+                _ => ("?", &String::new()),
+            };
+            let _ = writeln!(w, "  {} {} (by {by}: {reason})", f.reference(), f.title);
+        }
     }
 
     // Only when something was examined: an empty population stays silent.
@@ -682,5 +684,45 @@ mod tests {
             assert!(section < footer, "unticked must precede the footer:\n{err}");
             assert!(err.contains("issue #42 parked"));
         }
+    }
+
+    /// Judge (#10602): a held-with-reason issue needs no action, so a run
+    /// where every issue is held prints nothing at all under `--quiet`, and
+    /// without it lists them with no WARNING banner.
+    #[test]
+    fn quiet_prints_nothing_when_every_issue_is_held_with_a_reason() {
+        let held = [Finding {
+            kind: Artifact::Issue,
+            number: 7,
+            title: "waiting".into(),
+            verdict: Verdict::HeldWithReason {
+                by: Some("curator".into()),
+                reason: "vendor answer".into(),
+            },
+            undeclared: false,
+        }];
+        let cost = budget::ForgeCost::default();
+        let s = Sections {
+            stale: &[],
+            superseded: &[],
+            unticked: &[],
+            undocumented: &[],
+            held: &held,
+            prose_only: &[],
+            unevaluated: &[],
+            enumerate_error: None,
+            cost: &cost,
+        };
+        let (mut err, mut out) = (Vec::new(), Vec::new());
+        render(&mut err, &mut out, &s, true);
+        assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+
+        let (mut err, mut out) = (Vec::new(), Vec::new());
+        render(&mut err, &mut out, &s, false);
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("HELD WITH A STATED REASON"), "{err}");
+        assert!(err.contains("issue #7 waiting (by curator: vendor answer)"), "{err}");
+        assert!(!err.contains("WARNING"), "{err}");
     }
 }

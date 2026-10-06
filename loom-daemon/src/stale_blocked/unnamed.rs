@@ -30,9 +30,10 @@
 //!
 //! # Skips — counted, never written
 //!
-//! See [`Skip`]: daemon holds (body record, or pre-#10161 comment), operator-ruled
-//! permanent blocks (#8742), human-held labels, an active claim, a concurrent
-//! edit, the per-pass cap. An archived repository, a refused breaker, and any
+//! See [`Skip`]: daemon holds (body record, or pre-#10161 comment), a Curator
+//! review of the current block ([`REVIEW_MARKER`]), operator-ruled permanent
+//! blocks (#8742), human-held labels, an active claim, a concurrent edit, the
+//! per-pass cap. An archived repository, a refused breaker, and any
 //! unevaluated read (a failed read is never treated as "undocumented") write
 //! nothing at all.
 //!
@@ -61,6 +62,11 @@ use crate::sweep_registry::{PRLESS_HOLD_COMMENT_MARKER, QUARANTINE_COMMENT_MARKE
 /// The queue label: applied here, removed by Curator or by [`run`].
 pub const UNNAMED_LABEL: &str = "loom:blocked-unnamed";
 
+/// Curator's outcome marker (`unnamed-block-review.md`). A trusted one posted
+/// at or after the latest `loom:blocked` application means this block was
+/// already reviewed.
+pub const REVIEW_MARKER: &str = "<!-- loom:unnamed-block-review";
+
 /// An active claim: someone is already working the issue.
 const CLAIM_LABELS: [&str; 2] = ["loom:curating", "loom:building"];
 
@@ -78,6 +84,11 @@ pub enum Skip {
     OperatorHold,
     /// `loom:curating` or `loom:building`.
     ActiveClaim,
+    /// Curator already reviewed the current block: a trusted [`REVIEW_MARKER`]
+    /// comment was posted at or after the latest `loom:blocked` label. Without
+    /// this, a "kept" whose reason matched an older record (`park-record
+    /// apply` then writes nothing) would be re-queued every tick (#10602).
+    Reviewed,
     /// The issue changed between the listing and the write.
     ConcurrentEdit,
     /// Over this pass's write cap; next pass.
@@ -458,6 +469,30 @@ fn queue(
     {
         report.skip(Skip::DaemonHold);
         return;
+    }
+    // A review of an earlier block (older than the latest label) does not
+    // count: that later bare re-block is unreviewed and is queued.
+    let reviews: Vec<&Value> = comments
+        .iter()
+        .filter(|c| policy.trusts_json(c) && body_of(c).contains(REVIEW_MARKER))
+        .collect();
+    if !reviews.is_empty() {
+        let labeled_at = match extra.last_labeled_at(n, BLOCKED_LABEL) {
+            Ok(t) => t,
+            Err(e) => {
+                report.unread(n, format!("label-event read failed: {e}"));
+                return;
+            }
+        };
+        if reviews.iter().any(|c| {
+            super::hold::reviews_current_block(
+                c.get("created_at").and_then(Value::as_str),
+                labeled_at.as_deref(),
+            )
+        }) {
+            report.skip(Skip::Reviewed);
+            return;
+        }
     }
     cap.queued += 1;
     if !dry_run {
