@@ -77,9 +77,10 @@ reaper's merged-PR pass.
 --approved-sha <head>` immediately before `merge-pr.sh`. `step` is `reconcile`
 then, only on `LOOM-MERGE-QUEUE-CONTINUE`, `handoff`. The Champion falls
 through to the unchanged direct `merge-pr.sh` call **only** when the first line
-is `LOOM-MERGE-QUEUE-DIRECT` (or the binary predates the verb, which cannot be
-in queue mode). Every other result (queued, dropped, merged, undetermined,
-invalid mode, empty output) sets `MERGE_RC=7`: nothing merged, the PR stays
+is `LOOM-MERGE-QUEUE-DIRECT` on stdout with exit 0. A daemon that predates the
+`step` verb can already honor `champion.mergeMode=queue`, so an unrecognized
+subcommand is NOT permission to merge directly. Every other result (queued,
+dropped, merged, undetermined, invalid mode, unknown verb, empty output) sets `MERGE_RC=7`: nothing merged, the PR stays
 approved, no direct merge. Because the Champion never calls `merge-pr.sh` in
 queue mode, the direct re-date remedy is never run there. Failure mode guarded:
 a queue-mode PR merged directly, bypassing the authorization protocol.
