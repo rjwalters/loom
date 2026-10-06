@@ -1,8 +1,14 @@
 //! Who owns a star, and what propagation may do about it (#10012 §2–§3).
 //!
 //! Pure decision logic for the star-propagation pass. The pass that writes
-//! labels lands with #9975's `forge star` path; this module fixes the rules
-//! it must follow so they are tested before anything writes.
+//! the labels is [`super::materialize`]; this module fixes the rules it
+//! follows.
+//!
+//! When propagation takes a star back it first posts the same marker with
+//! `action=unstar` ([`unstar_marker`]). That comment is not a star event; it
+//! only tells a later pass that the daemon, not a person, removed the star,
+//! so a child the operator unstarred by hand is never starred again
+//! ([`operator_removed`]).
 //!
 //! # Provenance
 //!
@@ -87,6 +93,95 @@ pub fn parse_marker(body: &str) -> Option<InheritedMarker> {
         root: c.get(2)?.as_str().parse().ok()?,
         requested_at: c.get(1).map(|m| m.as_str().to_string()),
     })
+}
+
+/// The marker propagation posts just before it removes an inherited star.
+#[must_use]
+pub fn unstar_marker(root: u32, child: u32) -> String {
+    format!(
+        "{INTENT_MARKER_PREFIX}{} action=unstar {INHERITED_FROM_FIELD}{root} -->",
+        intent_id(root, child)
+    )
+}
+
+fn any_marker_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"<!--\s*loom:operator-priority-intent=[A-Za-z0-9._:-]+\s+action=(star|unstar)\b[^>]*?\sinherited_from=#[0-9]+\s*-->",
+        )
+        .expect("static inherited-action pattern")
+    })
+}
+
+/// Whether the latest **trusted** inherited marker in `comments` (oldest
+/// first) is a star: propagation starred the item, and it carries no star
+/// now, so someone took it off by hand. Propagation leaves it unstarred.
+/// A latest `action=unstar` (propagation removed it) or no marker at all
+/// means the star may be (re)applied.
+#[must_use]
+pub fn operator_removed(comments: &[super::forge::ForgeComment], me: Option<&str>) -> bool {
+    super::trust::only_trusted(comments, me)
+        .iter()
+        .rev()
+        .find_map(|c| any_marker_re().captures(&c.body).map(|m| m[1].to_string()))
+        .is_some_and(|action| action == "star")
+}
+
+/// The star events in one page of a REST timeline (`GET
+/// /repos/{o}/{r}/issues/{n}/timeline`): every `labeled` event for the star,
+/// and every **trusted** star comment, an inherited marker
+/// ([`StarKind::Inherited`]) or an operator intent ([`StarKind::Intent`]:
+/// loom-ui or `forge star --direction`). An untrusted marker is ignored,
+/// so an outsider cannot make an operator's star look inherited.
+#[must_use]
+pub fn star_events_from_timeline(page: &serde_json::Value, me: Option<&str>) -> Vec<StarEvent> {
+    fn str_at<'v>(v: &'v serde_json::Value, k: &str) -> Option<&'v str> {
+        v.get(k).and_then(serde_json::Value::as_str)
+    }
+    let mut out = Vec::new();
+    for ev in page.as_array().into_iter().flatten() {
+        let Some(at) = str_at(ev, "created_at") else {
+            continue;
+        };
+        match str_at(ev, "event") {
+            Some("labeled")
+                if ev.pointer("/label/name").and_then(|x| x.as_str())
+                    == Some(crate::work_finder::OPERATOR_PRIORITY_LABEL) =>
+            {
+                out.push(StarEvent {
+                    at: at.to_string(),
+                    kind: StarKind::Labeled,
+                });
+            }
+            Some("commented") => {
+                let body = str_at(ev, "body").unwrap_or_default();
+                if !body.contains(INTENT_MARKER_PREFIX) {
+                    continue;
+                }
+                let login = ev
+                    .pointer("/user/login")
+                    .or_else(|| ev.pointer("/actor/login"))
+                    .and_then(|x| x.as_str());
+                if !super::trust::trusted_author(login, str_at(ev, "author_association"), me) {
+                    continue;
+                }
+                let kind = if let Some(m) = parse_marker(body) {
+                    StarKind::Inherited { root: m.root }
+                } else if body.contains(" action=star") && !body.contains(INHERITED_FROM_FIELD) {
+                    StarKind::Intent
+                } else {
+                    continue;
+                };
+                out.push(StarEvent {
+                    at: at.to_string(),
+                    kind,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// One event that put the star on an item, as read from its timeline.

@@ -2543,8 +2543,36 @@ and the dependency phrases of a `loom:blocked` issue even when it is also held
 for the operator (#10012). Inheritance is transitive to depth 3 (a cycle stops), never crosses
 repos, makes at most 50 walk reads per repo per pass (closed children and
 blocker reads count), and a child of
-several starred issues takes the earliest starred-at. This is the in-memory
-ordering only; the label itself is not written yet.
+several starred issues takes the earliest starred-at.
+
+**Materialized star (#10012 §2–§3).** With `propagate` and `escalate` on, the
+pass also writes the inherited star as the `loom:operator-priority` label on
+every open child reached by a link the issue text records (park record, task
+list, the dependency phrase of a `loom:blocked` parent), so Curator, Builder's
+starred-first query, the dashboard and `forge starred` see it too. A
+landing-only edge (a blocker named only in a comment, a merge refusal's
+incident, the red-main fix) orders work in memory but never writes the label.
+Each write posts the inherited audit marker
+(`<!-- loom:operator-priority-intent=… action=star requested_at=<root's
+starred-at> … inherited_from=#P -->`), so the child sorts at the root's star
+time everywhere. A child whose **latest** star event is that daemon marker is
+walked as a child of its root, never as a root of its own. When the root loses
+its star, the next complete pass posts the same marker with `action=unstar`
+and takes the label off every child the root no longer reaches through a
+starred ancestor. Never removed: a star whose latest star event is a human
+`labeled` event, a loom-ui intent or `forge star --direction`; a level-2 or
+higher label; a child of a root that **closed** while starred (labels stay on
+closed issues, so its children keep theirs); anything after an incomplete walk
+(a deferred child, a failed listing). A child the operator unstarred by hand
+after propagation starred it (its latest trusted marker is `action=star`) is
+not starred again. Budget per repo per pass: at most 20 ownership (timeline)
+reads, cached until the item's `updated_at` moves, and at most 10 label writes,
+so a wide epic converges over several passes. Every call honors the rate-limit
+breaker, and only repos passing `write_scope::gate_root` are visited. Links
+written on the child's side (`<!-- loom:parent #P -->`, `Part of #P`, epic
+phase markers, the `[Parent #P]` title prefix, native sub-issues) are not
+walked by the pass; `create-issue.sh --parent` stars such a child at creation.
+PRs are not starred by the pass yet (Builder copies the star at creation).
 
 **What travels to children (#10012 §6).** One table in code
 (`star_liveness::propagation_rules`) says which labels go from a parent to
@@ -2563,8 +2591,8 @@ human put on the child, and never after an incomplete walk. The
 `loom:epic-phase`, `loom:heavy`, `points:*`, the retired `loom:urgent`, and the
 #10307 level labels, which reach blockers by their own pass. A unit test fails
 when a `defaults/labels.json` label is in neither the table nor the
-never-propagate list. The table is the rule set only. The pass that writes
-these labels is not built yet.
+never-propagate list. The pass writes only the star so far (above); it
+writes no `external` or `tier:*` label yet.
 
 **loom-ui stars.** The `/ingest` ack may carry `operator_priority_intents`
 (`defaults/docs/telemetry-schema.md`). The pass applies each valid one (the one
@@ -2580,7 +2608,7 @@ default**):
 | `escalate` | `LOOM_OPERATOR_PRIORITY_ESCALATE` | `true` | post escalations and apply loom-ui intents; `false` still computes and shows every landing state |
 | `intervalSecs` | `LOOM_OPERATOR_PRIORITY_INTERVAL_SECS` | `120` | pass interval |
 | `poolsExhaustedGraceMinutes` | `LOOM_OPERATOR_PRIORITY_POOLS_GRACE_MINUTES` | `10` | wait before a `pools-exhausted` ask; `0` asks at once |
-| `propagate` | `LOOM_OPERATOR_PRIORITY_PROPAGATE` | `true` | a star also reaches its children by park record, task list and dependency phrase; `false` keeps only the blocker / incident / red-main inheritance |
+| `propagate` | `LOOM_OPERATOR_PRIORITY_PROPAGATE` | `true` | a star also reaches its children by park record, task list and dependency phrase, and the pass writes and removes the inherited star label; `false` keeps only the in-memory blocker / incident / red-main inheritance and writes no label |
 
 ### Ready queue view (`loom-daemon queue`, #8852)
 

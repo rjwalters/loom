@@ -39,7 +39,9 @@
 //!    only a block Curator could not name reaches the operator (#10151). With
 //!    `propagate` on (the default), a starred issue's children by every link
 //!    [`edges`] resolves inherit the same way (#10012), transitively to
-//!    [`collect::MAX_INHERIT_DEPTH`].
+//!    [`collect::MAX_INHERIT_DEPTH`], and the pass writes the inherited star
+//!    as the label, taking it back once the root loses its star
+//!    ([`materialize`]).
 //! 5. **loom-ui star intents** ([`intents`]). The `/ingest` ack may carry
 //!    `operator_priority_intents`; the exporter queues them and this module
 //!    validates and applies them idempotently, with one audit comment whose
@@ -77,6 +79,7 @@ pub mod inherit;
 pub mod inherited_star;
 pub mod intents;
 pub mod landing;
+pub mod materialize;
 pub mod parent_link;
 pub mod progress;
 pub mod propagation_rules;
