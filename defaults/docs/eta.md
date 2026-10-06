@@ -277,8 +277,10 @@ only.
 A retired id is **not registered**: it produces no `eta.estimate`, no
 `eta.snapshot` `alternates[]` entry and no shadow-ledger pairs, and
 `eta backtest --heuristic` / `eta promote` reject it as an unknown id. Entries
-for it in an older `shadow.json` or pending store load without error and are
-ignored. The ids stay immutable and are never reused. Historical outcomes remain
+for it in an older `shadow.json` load without error and are ignored; pending-store
+entries are dropped at restore, so a landing never scores them and no `eta.outcome`
+or ledger pair is written for them. A host whose config names a retired id as
+`current` falls back to `land-v1`. The ids stay immutable and are never reused. Historical outcomes remain
 in the outcome journals for audit; replay is not retained (a replay-only
 registry would be a second mechanism for dominated heuristics).
 

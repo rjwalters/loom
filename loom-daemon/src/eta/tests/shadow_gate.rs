@@ -578,18 +578,28 @@ fn legacy_entries_for_retired_heuristics_load_cleanly_and_are_ignored() {
     assert_eq!(loaded, ledger);
     assert_eq!(loaded.stats(Kind::Land, LAND_V1, LAND_V2).pairs, 1, "live pairs intact");
 
-    // Pending estimates naming retired ids restore without error and expire
-    // like any other; they never reach the registry.
+    // Pending estimates naming retired ids restore without error, but the
+    // daemon drops them against the registry before anything can score them:
+    // neither a landing nor a censored expiry may name a retired id.
     let mut tracker = Tracker::new(provenance());
-    tracker.restore_pending(
-        retired
-            .iter()
-            .map(|id| summary(id, 0, (600, 1200, 1800, None)))
-            .collect(),
-    );
-    assert_eq!(tracker.pending().len(), 2);
+    let mut pending: Vec<_> = retired
+        .iter()
+        .map(|id| summary(id, 0, (600, 1200, 1800, Some(3600))))
+        .collect();
+    pending.push(summary(LAND_V1, 0, (600, 1200, 1800, Some(3600))));
+    tracker.restore_pending(pending);
+    assert_eq!(tracker.pending().len(), 3);
+    assert_eq!(tracker.drop_unregistered(&registry), 2);
+    assert_eq!(tracker.pending().len(), 1);
+    assert_eq!(tracker.pending()[0].heuristic, LAND_V1);
     let expired = tracker.expire(as_of() + Duration::days(PENDING_MAX_AGE_DAYS + 1));
-    assert_eq!(expired.dropped, 2);
+    assert!(
+        expired
+            .censored
+            .iter()
+            .all(|r| !retired.contains(&r.estimate.heuristic.as_str())),
+        "no retired id is scored"
+    );
 
     // A promotion evaluation for a retired candidate never promotes.
     for id in retired {

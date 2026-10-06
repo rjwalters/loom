@@ -74,8 +74,8 @@
 //!
 //! # It does not get to skip the gate
 //!
-//! `land-v3` ships **registered, not current**, exactly like `land-v2`
-//! before it: promotion is [`crate::eta::shadow`]'s two-gate rule.
+//! `land-v3` is **retired**: it is no longer registered and emits nothing. The
+//! module is kept only because land-v4 reuses its grid step.
 
 use super::{estimate_path, PathRules};
 use crate::eta::explanation::{FeatureOmitted, Features, StageAdjustment};

@@ -363,6 +363,17 @@ impl Tracker {
         self.pending.sort_by_key(|p| p.as_of);
     }
 
+    /// Drop pending estimates whose heuristic is not registered for its kind
+    /// (a retired id restored from a store persisted by an earlier build), so
+    /// a landing or an expiry never scores them or feeds the shadow ledger.
+    /// Returns how many were dropped.
+    pub fn drop_unregistered(&mut self, registry: &Registry) -> usize {
+        let before = self.pending.len();
+        self.pending
+            .retain(|p| registry.for_kind(p.kind).any(|h| h.id() == p.heuristic));
+        before - self.pending.len()
+    }
+
     /// Items currently tracked.
     #[must_use]
     pub fn item_keys(&self) -> Vec<ItemKey> {

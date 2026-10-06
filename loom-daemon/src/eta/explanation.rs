@@ -300,7 +300,7 @@ pub struct Distribution {
     pub p75: i64,
     /// 90th percentile.
     pub p90: i64,
-    /// How a calibrating heuristic (`land-v3`, #9970) derived `grid_sec`
+    /// How a calibrating heuristic (land-v4 via the v3 step, #9970) derived `grid_sec`
     /// from the raw grid. Absent — and `grid_sec` is the raw grid — for
     /// every heuristic that draws from history unadjusted, so every earlier
     /// heuristic's explanation is byte-identical.
@@ -513,7 +513,7 @@ pub struct Contributions {
 }
 
 /// Recorded context. `null` = not measured, with a [`FeatureOmitted`]
-/// reason. No v1 heuristic reads these (`land-v3` reads two).
+/// reason. No v1 heuristic reads these (land-v4 reads two, via the v3 step).
 ///
 /// The fields from `ahead` on (#10201) post-date the first shipped v1
 /// payloads: an explanation recorded before them still parses (a missing
