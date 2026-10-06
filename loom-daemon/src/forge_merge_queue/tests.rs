@@ -569,6 +569,7 @@ fn env(gh: String, mode: MergeMode, forge: ForgeType) -> Env {
         forge,
         gh,
         default_repo: Some("acme/widgets".into()),
+        root: std::env::temp_dir(),
         mode: Ok(ResolvedMergeMode {
             mode,
             source: MergeModeSource::Config,

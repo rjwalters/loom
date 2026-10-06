@@ -13,6 +13,7 @@ mod emit;
 mod episodes;
 mod estimate;
 mod explanation;
+mod features_v3;
 mod fit;
 mod fit_leak;
 mod fit_parity;

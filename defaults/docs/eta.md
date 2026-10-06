@@ -1204,10 +1204,23 @@ at `now - 120 s`, #10500) both call the one builder `loop_features`:
   0, never a default that reads as "no overlap" or "CI green".
 - **No fleet-wide signals.** CI queue depth, cancellations, host version
   spread, quota exhaustion and operator activity were shown not to help.
+- **`eta-fit/v3` feature layout.** `fit::features_v3` defines the successor
+  schema: the 26 `FEATURES_V2` columns, then the 11 `LOOP_FEATURES` columns in
+  declared order (37 total, `log_cum_stage` first of the appended block).
+  `model_features_v3` is the one transform; training reaches it through
+  `training_inputs_v3` (the row's recorded inputs) and serving through
+  `Tracker::loop_features_of`. A v3 coefficient file carries `schema:
+  "eta-fit/v3"`; v1 and v2 vectors are never reinterpreted. Tests pin the
+  layout, the bit-identical v2 prefix, train/serve parity for every row, and
+  that file lists and CI runs first known after `as_of` move no column. Not
+  yet built: the live file-list and SigNoz `ci.run` readers (file overlap and
+  own-CI are unknown, indicators 0, until logged), the v3 fit and its shadow
+  heuristic, and the walk-forward backtest.
 - **Not a model input yet.** None of these is in `eta-fit/v1`'s `FEATURES`
-  (or `eta-fit/v2`'s `FEATURES_V2`), so twin-otter rows, coefficient files and explanations are unchanged. A new
-  datestamped shadow heuristic adopts them under its own schema version once
-  the loom-experiments walk-forward backtest passes (#10521).
+  (or `eta-fit/v2`'s `FEATURES_V2`), so twin-otter rows, coefficient files and explanations are unchanged. Only
+  `eta-fit/v3` carries them, and no heuristic reads a v3 file yet. A new
+  datestamped shadow heuristic adopts them under that schema once the
+  loom-experiments walk-forward backtest passes (#10550).
 
 ### Dependency-aware ETAs (#10510)
 

@@ -838,6 +838,22 @@ fn daemon_write_paths_are_scoped() {
                  behind QUEUE_EXECUTION_ENABLED=false",
             ),
         ),
+        (
+            "forge_merge_queue/gh_lifecycle.rs",
+            Via(
+                "cli/forge_action.rs",
+                "PR comment (grant marker) / label POST+DELETE writes (#10256) are the \
+                 `GhLifecycleForge` seam. `forge merge-queue handoff|revoke` are vetted via \
+                 write_target (Handoff, Revoke) before dispatch; `reconcile` is vetted by \
+                 may_write_from in lifecycle_cli.rs inside its queue-mode branch. The \
+                 automated callers are behind other gates: `daemon_tick` and the disarm \
+                 path's `revoke_for_root` run only from claim_reconciliation/pass_loop.rs \
+                 after gate_root_with, and forge_disable_auto_merge.rs's call follows its \
+                 shell-vetted guard. Both are no-ops (no forge call) in direct mode; an \
+                 unresolved mode/repo reports `NOT confirmed` rather than writing; dormant \
+                 behind QUEUE_EXECUTION_ENABLED=false",
+            ),
+        ),
         ("cli/forge_action.rs", Gated),
         ("role_runner/launch.rs", Gated),
         ("operator_decision/cli.rs", Gated),

@@ -345,6 +345,13 @@ pub enum RemedyOutcome {
 /// happen. A recompute failure is reported on stderr and the generic body is
 /// written instead; it never blocks the remedy.
 pub fn remedy(nwo: &str, branch: &str, expected_head_sha: &str, pr: &str) -> RemedyOutcome {
+    // #10256: never re-date in merge-queue mode. This is the remedy's own
+    // refusal (fail-closed on an unresolvable mode too); the direct-path
+    // freshness guard in merge-pr.sh is deliberately untouched, and Champion
+    // never reaches it in queue mode because it hands off instead.
+    if let Err(why) = crate::forge_merge_queue::lifecycle::redate_permitted(&repo_root()) {
+        return RemedyOutcome::Failed(why);
+    }
     let cfg = BudgetConfig::for_root(&repo_root());
     remedy_with(&gh_bin(), nwo, branch, expected_head_sha, pr, cfg, chrono::Utc::now(), || {
         match attribution::recompute(nwo, pr, expected_head_sha) {
