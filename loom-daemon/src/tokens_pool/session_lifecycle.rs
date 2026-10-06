@@ -410,6 +410,15 @@ pub fn ensure_profile_controls(profile: &Path) -> Result<()> {
 ///   GitHub App installation-token dirs ([`gh_credential_dirs`]).
 /// * the network, through Docker's default bridge (Codex's API, GitHub).
 ///
+/// `--restart unless-stopped` brings the container back after a Docker
+/// engine restart or a host reboot (issue #10452). Before it, the policy was
+/// `no`: a Docker Desktop restart on robb-studio (2026-10-05, again 10-06) or a
+/// stop of every container on loom-worker-2 left each session down until an
+/// operator ran `accounts session start` by hand, and every Codex-first role
+/// tick routed to it exited 78 meanwhile. It never resurrects a session an
+/// operator retired: [`SessionLifecycle::stop`] is `docker stop` + `docker rm`,
+/// so a stopped session is gone, not merely stopped.
+///
 /// Deliberately absent: the Claude token pool (`~/.loom/tokens`) and the
 /// operator's personal `~/.config/gh`, both mounted here before #9979. Codex
 /// needs neither, and with Codex's sandbox off any file in the container is
@@ -430,6 +439,8 @@ pub fn host_session_run_args(
         "-d".into(),
         "--name".into(),
         container.into(),
+        "--restart".into(),
+        "unless-stopped".into(),
         "--cap-drop".into(),
         "ALL".into(),
         "--security-opt".into(),
