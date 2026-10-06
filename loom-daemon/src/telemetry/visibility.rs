@@ -268,6 +268,7 @@ fn fetch_visibility_via_gh(owner_repo: &str) -> Result<RepoVisibility, ProbeFail
         Duration::from_secs(30),
     )
     .forge_op(crate::forge_call_stats::ops::REPO_VIEW)
+    .read_class(crate::gh_invocation::ReadClass::Observability)
     .args(["api", &path, "--jq", ".private"])
     .run()
     {

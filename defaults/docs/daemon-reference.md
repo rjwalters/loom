@@ -7408,6 +7408,71 @@ as before, and after a transfer it can only shrink.
 | `LOOM_REPO_FACTS` | on | `0` makes every migrated site issue exactly its previous forge call and restores the ETag store's process-lifetime `origin` memo (the rollback switch). |
 | `LOOM_REPO_FACTS_VERIFY_SECS` | `21600` | How long a verified record is used before one conditional re-read. |
 
+### Untargeted reads route to readers; deferrable reads shed (`LOOM_FACADE_CWD_ROUTING`, `LOOM_READ_SHED`)
+
+Most daemon reads are built with no typed repository (`GhTarget::None`) and
+a working directory: `gh` itself works out the repo. Before W4-C such a read
+never reached a reader App, so it spent the writer's bucket. The `gh` choke
+point (`gh_invocation/cwd_route.rs`) now derives the repository for the
+**reader attempt only**. The authority is explicit repo, then
+`LOOM_REPO`/`GH_REPO`, then the sole local resolution:
+
+1. an explicit `-R`/`--repo` (or `gh repo view OWNER/REPO`) on an
+   `issue`/`pr`/`repo` subcommand;
+2. a `gh api repos/<owner>/<repo>/…` endpoint with a literal owner and repo;
+3. for a call gh resolves from its environment (a `{owner}/{repo}`
+   placeholder, or `issue|pr view|list|status` with no `-R`): `LOOM_REPO`
+   when it is set (the facade exports it as `GH_REPO`), else an inherited
+   `GH_REPO` — exactly the repo gh would read;
+4. otherwise the checkout's base repo (repo facts, above), only when it is
+   unambiguous, not pinned to legacy, and equal to the `origin` identity. Any
+   disagreement keeps the writer and bumps `facade.cwd_route.disagree`
+   (logged once per root);
+5. nothing else is derived: `api graphql`, `search`, `run`, `release`,
+   non-`repos/` endpoints, URL arguments, a non-`github.com` host, any
+   `gh api` call that is not a `GET` (a mutation sent through a read-intent
+   helper), and the asker-dependent endpoints (`/user`, `/installation/*`,
+   `collaborators/*/permission`, branch protection, rulesets).
+
+Only a captured, unpinned read qualifies (no `.writer_identity()`,
+`.gh_config_dir()`, `.identity_role()` or `.without_token_env()`). The
+invocation's target is never changed: the reader attempt gets
+`GH_REPO=<derived>`, and the accounting row books `rp=<derived>`,
+`ro=derived`. The writer attempt (no reader, or the writer fallback) keeps
+exactly its pre-W4-C `GH_CONFIG_DIR` and `GH_REPO`.
+
+**Read classes.** `GhInvocation::read_class` tags a read `Gate` (the
+default), `Hygiene` or `Observability`. When the reader fails with a rate
+limit or a refused credential it is withdrawn and the next eligible reader
+serves the read (a `Gate` read takes any usable reader; a deferrable one only
+a reader projected below `targetMaxPct` or with no reading). When no reader is left (or the router reports every reader
+exhausted up front), a `Gate` read goes to the writer as before, while a
+`Hygiene`/`Observability` read is **shed**: no request is sent, and the
+caller sees `Unavailable::Shed` ("deferred: reader budget low until
+<rfc3339> (loom-shed)"), which every such site maps to `UNKNOWN`,
+`PrStatus::Unknown`, `None` or a skipped pass, and which matches no
+rate-limit signature, so it never trips the breaker. A shed books an
+`o=shed` row (charged nothing) and exports a `forge.read.shed` span
+(`forge.read.{op,class,app,owner,resource,until}`). Classified sites:
+Hygiene — `worktree.issue_state`, `worktree.issue_state_rest`,
+`worktree.issue_closed_at`, `worktree.has_open_pr`, `clean.pr_list`,
+`clean.pr_by_number_rest`, `clean.pr_status_rest`, `worktree.landed_pulls`,
+`intake.list_open`; Observability — `stage_dwell`'s `api.rest`,
+`visibility.repo`, `telemetry.repo_identity`. Nothing under `sweep_registry/`,
+`claim_reconciliation`, `merge_*`, verdict, quarantine or reclaim is ever
+anything but `Gate` (a test enforces it).
+
+**Gone memo.** A reader 404 followed by a writer 404 for the same
+`(owner/repo, request)` is remembered for 3600 s: inside that window a
+`Hygiene`/`Observability` read returns the reader's 404 with no writer retry.
+A `Gate` read always confirms on the writer, and the reader is not withdrawn.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOOM_FACADE_CWD_ROUTING` | on | `0` disables the derivation: every untargeted read stays on the writer. Read on every call. |
+| `LOOM_READ_SHED` | on | `0` treats every read as `Gate`: no shed and no gone-memo shortcut, so `Hygiene`/`Observability` reads fall back to the writer. Read on every call. |
+| `LOOM_READ_ROUTING` | `v2` | `legacy` restores the pre-W4 path exactly (no derivation, no classes, the unconditional reader → writer fallback), together with W4-A's and W4-B's layers. Read on every call. |
+
 ### Merged-PR worktree reaper (#4876)
 
 CLAUDE.md states the contract: *"Loom-managed worktrees (with the

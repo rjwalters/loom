@@ -146,13 +146,19 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> usize {
 /// One ungated pass (tests call this directly).
 pub fn run_once(gh_bin: &Path, root: &Path, now: DateTime<Utc>, cap: usize) -> usize {
     const JQ: &str = r#".[] | select(.pull_request|not) | [.number, .created_at, ([.labels[].name]|join(","))] | @tsv"#;
-    let listing = gh_call::ok_stdout(gh_call::read("intake.list_open", gh_bin, root).args([
-        "api",
-        "--paginate",
-        "repos/{owner}/{repo}/issues?state=open&per_page=100",
-        "--jq",
-        JQ,
-    ]));
+    // W4-C: Hygiene — a shed listing is a skipped pass (`None` below),
+    // retried on the next tick.
+    let listing = gh_call::ok_stdout(
+        gh_call::read("intake.list_open", gh_bin, root)
+            .read_class(crate::gh_invocation::ReadClass::Hygiene)
+            .args([
+                "api",
+                "--paginate",
+                "repos/{owner}/{repo}/issues?state=open&per_page=100",
+                "--jq",
+                JQ,
+            ]),
+    );
     let Some(stdout) = listing else {
         log::warn!("intake_reconcile: open-issue listing failed in {}", root.display());
         return 0;

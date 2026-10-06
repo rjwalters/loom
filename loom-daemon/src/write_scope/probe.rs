@@ -124,6 +124,8 @@ impl GhProbe {
         )
         .program(&self.gh)
         .gh_config_dir(self.config_dir.as_deref())
+        // Asker-dependent: the probe measures THIS credential's write scope.
+        .writer_identity()
         .arg("api")
         .args(args);
         match inv.run() {

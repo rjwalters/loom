@@ -654,3 +654,52 @@ fn env_overrides_turn_layers_off() {
     assert!(nosplit.spill && nosplit.split_repos.is_empty());
     assert_eq!(cfg.clone().with_env(Some("1"), Some("")), cfg);
 }
+
+// ---- W4-C: class-aware fallback -----------------------------------------------
+
+#[test]
+fn past_a_withdrawn_home_a_deferrable_read_needs_headroom_and_a_gate_read_does_not() {
+    let r = roster(vec![reader("81201", None), reader("81202", None)]);
+    let ws = workspace(&r, &["acme"]);
+    // Spill off: only the fallback walk is under test.
+    let cfg = RoutingConfig::default().with_env(Some("0"), None);
+    let now = SystemTime::now();
+    let repo = "acme/class-walk";
+    let home = forge_read_pool::assignment_index(repo, 2).unwrap();
+    let (home_app, other) = (r.readers[home].app_id.clone(), r.readers[1 - home].app_id.clone());
+    forge_read_pool::withdraw_scoped_until(
+        &home_app,
+        "acme",
+        forge_read_pool::ResourceScope::Core,
+        now + Duration::from_secs(600),
+    );
+    let class = |c: ReadClass| RouteRequest {
+        class: c,
+        ..req(repo, Some("k"))
+    };
+    // Unknown reading on the other reader: every class may move to it.
+    for c in [
+        ReadClass::Gate,
+        ReadClass::Hygiene,
+        ReadClass::Observability,
+    ] {
+        let d = route_read_in(ws.path(), &r, &class(c), &v2(&cfg), now);
+        assert_eq!(app_of(&d), other, "{c:?}");
+    }
+    // The other reader projected at 75% (≥ targetMaxPct 60): a Gate read
+    // still takes it; a deferrable read finds no reader and is exhausted.
+    book_projected(&other, "acme", 75.0, now);
+    let d = route_read_in(ws.path(), &r, &class(ReadClass::Gate), &v2(&cfg), now);
+    assert_eq!(app_of(&d), other);
+    for c in [ReadClass::Hygiene, ReadClass::Observability] {
+        let d = route_read_in(ws.path(), &r, &class(c), &v2(&cfg), now);
+        assert!(matches!(d, RouteDecision::Exhausted { .. }), "{c:?}: {d:?}");
+    }
+    // Legacy ignores the class entirely.
+    let legacy = RouteEnv {
+        mode: RoutingMode::Legacy,
+        ..v2(&cfg)
+    };
+    let d = route_read_in(ws.path(), &r, &class(ReadClass::Hygiene), &legacy, now);
+    assert_eq!(app_of(&d), home_app, "legacy has no scoped withdrawal");
+}

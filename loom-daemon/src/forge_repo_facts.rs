@@ -49,7 +49,7 @@ mod record;
 mod state;
 
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -76,6 +76,14 @@ pub(crate) const SUSPECT_BACKOFF_SECS: i64 = 300;
 pub(crate) fn enabled() -> bool {
     let killed = state::env_var("LOOM_REPO_FACTS").is_some_and(|v| v.trim() == "0");
     !killed && state::default_on()
+}
+
+/// Whether `root` is pinned to its legacy forge calls under `env` (its
+/// local answer disagreed with gh's own): such a root's local resolution is
+/// not trusted for read routing either (W4-C).
+pub(crate) fn is_legacy_pinned(root: &Path, env: GhRepoEnv) -> bool {
+    let pin = (root.to_path_buf(), env);
+    state::with(|s| s.legacy.contains(&pin))
 }
 
 /// How long a verified record is used without a re-read

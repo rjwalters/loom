@@ -2380,6 +2380,9 @@ pub struct ForgeIdentityRoleCounts {
     pub not_modified: u64,
     pub rate_limited: u64,
     pub error: u64,
+    /// Reads shed without a request (W4-C).
+    #[serde(default)]
+    pub shed: u64,
 }
 
 /// One call-identity row of [`ForgeCallsStatus`] (Issue #9777).
@@ -2405,6 +2408,9 @@ pub struct ForgeOperationCounts {
     pub not_modified: u64,
     pub rate_limited: u64,
     pub error: u64,
+    /// Reads shed without a request (W4-C).
+    #[serde(default)]
+    pub shed: u64,
 }
 
 /// One caller × pool row of [`ForgeCallsStatus`].
@@ -2422,6 +2428,10 @@ pub struct ForgeCallCounts {
     pub rate_limited: u64,
     /// Any other failure.
     pub error: u64,
+    /// Reads a reader route deferred without a request (W4-C): charged
+    /// nothing.
+    #[serde(default)]
+    pub shed: u64,
 }
 
 /// A remaining-budget reading for one pool.
