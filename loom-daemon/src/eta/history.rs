@@ -265,6 +265,11 @@ pub struct StageSamples {
     /// through [`Self::select_episodes`]; no shipped heuristic reads it, so
     /// adding it changes no shipped estimate.
     pub episodes: Vec<super::episodes::StageEpisode>,
+    /// Every PR's label-flag timeline (#10245), with its repo (#10523): how
+    /// `land-2026-10-06-held-heron` finds sequenced spells. Copied from the
+    /// fleet snapshot beside [`Self::episodes`]; no other heuristic reads it,
+    /// so adding it changes no other estimate.
+    pub flag_changes: Vec<super::flag_timeline::RepoFlagChange>,
     /// Whose history this is (#9343): `Local` when every sample came from
     /// this host's own journals, `Fleet` as soon as one host-independent
     /// (forge-derived) sample is in it. [`Self::merge`] is the only thing that
@@ -365,7 +370,7 @@ pub(super) fn selection_of(
     }
 }
 
-fn same_repo(a: &str, b: &str) -> bool {
+pub(crate) fn same_repo(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
@@ -419,6 +424,7 @@ impl StageSamples {
         self.paths.extend(other.paths);
         self.calibration.extend(other.calibration);
         self.episodes.extend(other.episodes);
+        self.flag_changes.extend(other.flag_changes);
         self.outcome_keys.extend(other.outcome_keys);
         if other.scope == HistoryScope::Fleet {
             self.scope = HistoryScope::Fleet;

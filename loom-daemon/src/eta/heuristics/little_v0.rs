@@ -131,6 +131,7 @@ impl Heuristic for LittleV0 {
             twin_otter: None,
             queue: None,
             regime_adjustment: None,
+            held_heron: None,
         };
         let current = match &input.current {
             CurrentState::Refused(reason) => return refuse(explanation, *reason),

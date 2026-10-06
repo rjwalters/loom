@@ -124,6 +124,7 @@ pub mod fleet_state;
 pub mod fleet_state_prs;
 pub mod friction;
 pub mod grid;
+pub mod hazard_sim;
 pub mod health;
 pub mod heuristics;
 pub mod history;
@@ -686,6 +687,9 @@ impl Registry {
                 // #10524: wraps twin-otter-b; registered before the
                 // twin-otter pair so `-b` stays last.
                 Box::new(heuristics::LandQuickTern::new(fit.clone())),
+                // #10523: twin-otter-b plus the hold/sequence simulator;
+                // also before the twin-otter pair.
+                Box::new(heuristics::LandHeldHeron::new(fit.clone())),
                 Box::new(heuristics::LandTwinOtter::new(fit.clone())),
                 Box::new(heuristics::LandTwinOtterB::new(fit.clone())),
             ],
