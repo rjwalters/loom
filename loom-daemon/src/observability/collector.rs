@@ -963,6 +963,10 @@ async fn sample_snapshots(
     // only when the set changed. After `eta::record` so it carries this
     // pass's estimates rather than the previous pass's.
     super::eta_snapshot::record().await;
+    // ETA pipeline health gauges (Issue #10391), OTLP-only: local state and
+    // file reads, no forge call; a no-op without the ops sink. After the
+    // snapshot so it reports this pass's built snapshot.
+    super::ops::eta_health::record(workspace_root).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant
