@@ -21,14 +21,14 @@
 //! host), the estimate is twin-otter-b's unchanged and carries no
 //! `calibration` record.
 //!
-//! Ships **registered, not current**. Promotion is [`crate::eta::shadow`]'s
-//! two-gate rule (#10233).
+//! Ships **registered, not current**, tier `candidate` (#10525). Promotion
+//! is [`crate::eta::shadow`]'s two-gate rule (#10233).
 
 use super::{LandTwinOtterB, LAND_TWIN_OTTER_B};
 use crate::eta::conformal_ipcw;
 use crate::eta::fit::CoefficientFile;
 use crate::eta::history::StageSamples;
-use crate::eta::{estimate_id, EstimateInput, Explanation, Heuristic, Kind};
+use crate::eta::{estimate_id, EstimateInput, Explanation, Heuristic, Kind, Tier};
 use std::sync::Arc;
 
 /// The id. Immutable once shipped.
@@ -57,6 +57,12 @@ impl Heuristic for LandQuickTern {
 
     fn kind(&self) -> Kind {
         Kind::Land
+    }
+
+    /// A candidate (#10525): a calibrated twin-otter-b, eligible for
+    /// promotion through the #10233 gate, counted in the shadow budget.
+    fn tier(&self) -> Tier {
+        Tier::Candidate
     }
 
     /// As its base: twin-otter-b models an operator hold (#10218).

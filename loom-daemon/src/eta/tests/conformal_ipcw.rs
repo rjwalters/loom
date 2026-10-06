@@ -366,3 +366,36 @@ fn quick_tern_is_shadow_registered_records_its_method_and_recomputes() {
     assert!(bytes(&e).contains("\"ipcw\""));
     assert!(!bytes(&e).contains("max_daily_step"));
 }
+
+/// #10541 review: a heavily censored cell. 500 estimates made 100 h ago; 25
+/// landed after 10 minutes, 475 are still open. Only 5% of the mass
+/// resolves, so every level is unidentified, and the open rows prove that
+/// 95% run past 100 h. The calibrator must not shrink the range to the
+/// fast landings (it once returned 600 s for every quantile); it moves each
+/// unidentified quantile up to at least the open rows' elapsed time.
+#[test]
+fn an_unidentified_tail_is_moved_conservatively_never_down() {
+    let made = -100 * HOUR;
+    let mut rows: Vec<CalibrationObservation> = (0..25)
+        .map(|i| obs(&format!("fast{i}"), Stage::ReviewWait, made, Some(600)))
+        .collect();
+    rows.extend((0..475).map(|i| obs(&format!("open{i}"), Stage::ReviewWait, made, None)));
+    let base = base_explanation();
+    let out = conformal_ipcw::calibrate(base.clone(), &rows, LAND_TWIN_OTTER_B);
+    let record = out.calibration.as_ref().expect("enough landings to fit");
+    let ipcw = record.ipcw.as_ref().unwrap();
+    assert_eq!(ipcw.unresolved, ["p25", "p50", "p75", "p90"], "{record:?}");
+    assert_eq!((record.n_events, record.n_censored), (25, 475));
+    for (k, shift) in record.shift.to_array().into_iter().enumerate() {
+        assert!(shift >= 0.0, "quantile {k} moved down: {record:?}");
+    }
+    // On the rows' own base: every quantile at least the 100 h already run.
+    let (p25, p50, p75, p90) = apply(BASE, &record.shift);
+    for q in [p25, p50, p75, p90] {
+        assert!(q >= 100 * HOUR, "{q} < 100 h: {record:?}");
+    }
+    // And the production estimate never drops below its base.
+    let (b, o) = (base.quantiles_with_p90().unwrap(), out.quantiles_with_p90().unwrap());
+    assert!(o.0 >= b.0 && o.1 >= b.1 && o.2 >= b.2 && o.3 >= b.3, "{o:?} vs {b:?}");
+    assert_eq!(run_explanation(&out), out.quantiles_with_p90());
+}

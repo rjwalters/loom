@@ -455,7 +455,12 @@ That it fixes those defects is the hypothesis the shadow evidence and the
 #10233 gate test; it is not claimed here.
 
 `land-2026-10-06-quick-tern` (#10524) ships the same way: registered, not
-current, shadowed into `alternates`, and promoted only through the #10233 gate.
+current, tier `candidate`, shadowed into `alternates`, and promoted only
+through the #10233 gate. It is the ninth `land` registration, within the
+default shadow budget of 10. With it, `land`'s eight non-current
+registrations exactly fill the 8-alternate cap of the live list (see
+[Shadow fleet management](#shadow-fleet-management)), so a further `land`
+shadow first needs a retirement or a raised cap.
 It wraps `land-2026-10-04-twin-otter-b`'s estimate exactly (same path or model,
 seed and quantiles; only the id is rewritten), so the base quantiles it
 adjusts are the ones logged as twin-otter-b's track record. Like
@@ -474,8 +479,13 @@ twin-otter pair, so `-b` stays last. The method is in
   normalised by the weight of *all* rows, estimates the uncensored score
   distribution.
 - **The shift.** `c_τ` is its smallest score reaching `τ(n+1)/n`, with `n`
-  the effective sample size. If mass lost to the weight cap leaves the level
-  unreachable, `c_τ` clamps to the largest resolved score.
+  the effective sample size. If the level is unreachable, the quantile is
+  unidentified. That happens when the missing mass is rows that have not
+  landed (still open when the window ends, or lost to the weight cap). An
+  open row is evidence of a *longer* duration, so such a quantile never
+  moves down: `c_τ` is the largest of 0 (the base), any landing's score and
+  any open row's elapsed-time bound `ln(C / q_τ)`. It is listed in
+  `ipcw.unresolved`.
 - **Window.** Rows are weighted `2^(−C / half_life)` within eight
   half-lives (capped at 7 days). The half-life is 6 h, doubling to at most
   96 h until the events' effective N `(Σw)²/Σw²` reaches 20.
@@ -598,7 +608,9 @@ also needs that cap raised on both sides.
 
 **Wrappers are explicit compositions.** A calibration, conformal or
 dependency wrapper over a base is registered as its own id
-(`land-2026-10-06-calm-plover` is calibration over `land-v2`). It is never
+(`land-2026-10-06-calm-plover` is calibration over `land-v2`;
+`land-2026-10-06-quick-tern` is IPCW calibration over
+`land-2026-10-04-twin-otter-b`). It is never
 an automatic cross product of wrappers × bases, so each one spends budget
 deliberately.
 

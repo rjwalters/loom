@@ -27,9 +27,12 @@
 //!   are recent. The weighted CDF of the scores, normalised by the weight of
 //!   *all* rows, estimates the score distribution as if nothing were
 //!   censored. `c_τ` is its smallest score reaching `τ (n+1)/n`, with
-//!   `n` the effective sample size. If the level cannot be reached (mass
-//!   lost to the weight cap), the shift clamps to the largest resolved
-//!   score: never below any landing seen.
+//!   `n` the effective sample size. If the level cannot be reached (the
+//!   missing mass is rows that have not landed: still open past the
+//!   window's resolution, or lost to the weight cap), the quantile is
+//!   unidentified and is moved **conservatively**, never down: the shift is
+//!   the largest of 0 (the base), any landing's score and any open row's
+//!   elapsed-time bound `ln(C / q)`.
 //! - **Recent window.** Rows are weighted `2^(−C/half_life)`, starting from
 //!   [`HALF_LIFE_SEC`] (6 h), within [`WINDOW_HALF_LIVES`] half-lives
 //!   (capped at [`WINDOW_DAYS`]). When the events' effective N falls below
@@ -84,7 +87,8 @@ pub const WINDOW_DAYS: i64 = 7;
 
 /// The window at a half-life is this many half-lives (capped at
 /// [`WINDOW_DAYS`]): an older row would weigh under 0.4%, and it would only
-/// carry the old regime's tail into the conservative clamp.
+/// carry the old regime's tail into the conservative bound of an
+/// unidentified quantile.
 pub const WINDOW_HALF_LIVES: i64 = 8;
 
 /// The first (shortest) recency half-life tried, seconds.
@@ -131,8 +135,9 @@ pub struct IpcwRecord {
     /// The noise floor per quantile, ln units: a raw shift smaller in
     /// magnitude is not applied. `0` for an unresolved quantile.
     pub deadband: Q4<f64>,
-    /// Quantiles whose level the weighted CDF could not reach, clamped to
-    /// the largest resolved score.
+    /// Quantiles whose level the weighted CDF could not reach, moved
+    /// conservatively: to the largest of the base, any landing and any open
+    /// row's elapsed time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<String>,
 }
@@ -287,10 +292,20 @@ fn fit_cell(members: &[&Member], half_life_sec: i64) -> Option<Fit> {
                 };
             }
             None => {
-                // Mass lost to the weight cap: clamp to the largest resolved
-                // score, never below any landing seen.
+                // Unidentified: the missing mass is rows that have not
+                // landed (still open, or lost to the weight cap), and an open
+                // row is evidence of a *longer* duration. Never move such a
+                // quantile down: take the largest of the base (0), any
+                // landing's score and any open row's elapsed-time bound
+                // `ln(C / q)` (#10541 review).
                 unresolved.push(LABELS[k].to_string());
-                let c = round6(points.last().map_or(0.0, |p| p.0));
+                let landed = points.last().map_or(0.0, |p| p.0);
+                let open = members
+                    .iter()
+                    .filter(|m| !m.event)
+                    .map(|m| (m.censor / m.q[k]).ln())
+                    .fold(0.0, f64::max);
+                let c = round6(landed.max(open).max(0.0));
                 raw_shift[k] = c;
                 shift[k] = c;
             }
