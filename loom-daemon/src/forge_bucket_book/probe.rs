@@ -12,7 +12,9 @@
 //! reads directory names, the presence of `hosts.yml` and a reader's
 //! `identity.json` sidecar; it never opens `hosts.yml` or reads a token.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
@@ -173,27 +175,121 @@ pub fn probe_all(workspace_root: &Path) {
 pub fn probe_all_with(workspace_root: &Path, program: Option<&Path>, now: SystemTime) -> usize {
     let targets = probe_targets(workspace_root, now);
     for target in &targets {
-        let CmdOutcome::Ran(out) = probe_invocation(target, program).run() else {
-            continue;
-        };
-        if !out.status.success() {
-            continue;
-        }
-        let Some(resp) =
-            crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout))
-        else {
-            continue;
-        };
-        let at = chrono::Utc::now().timestamp();
-        for (resource, reading) in parse_probe(&resp.body, at) {
-            super::insert(BucketKey::new(&target.account, &target.owner, resource), reading);
-        }
+        run_probe(target, program);
     }
+    persist_to_sink();
+    targets.len()
+}
+
+/// Run one probe and book its readings. `false` when it produced none.
+fn run_probe(target: &ProbeTarget, program: Option<&Path>) -> bool {
+    let CmdOutcome::Ran(out) = probe_invocation(target, program).run() else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let Some(resp) =
+        crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout))
+    else {
+        return false;
+    };
+    let at = chrono::Utc::now().timestamp();
+    let readings = parse_probe(&resp.body, at);
+    let any = !readings.is_empty();
+    for (resource, reading) in readings {
+        super::insert(BucketKey::new(&target.account, &target.owner, resource), reading);
+    }
+    any
+}
+
+/// Snapshot the book into the forge-call sink, when one is configured.
+fn persist_to_sink() {
     if let Some(dir) = crate::forge_call_stats::host_sink_dir() {
         let now = chrono::Utc::now().timestamp();
         if let Err(e) = super::persist(&dir, now) {
             log::debug!("forge_bucket_book: snapshot to {} failed: {e}", dir.display());
         }
     }
-    targets.len()
+}
+
+// ---------------------------------------------------------------------------
+// On-demand probe after a reader refusal (W4-A)
+// ---------------------------------------------------------------------------
+
+/// Fewest seconds between two on-demand probes of one `(app, owner)`.
+pub const PROBE_ONE_INTERVAL_SECS: u64 = 60;
+
+/// `(app id, owner lowercased)` -> when it was last probed on demand.
+fn probe_one_last() -> &'static Mutex<HashMap<(String, String), SystemTime>> {
+    static LAST: OnceLock<Mutex<HashMap<(String, String), SystemTime>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Claim the `(app, owner)` probe slot at `now`: `false` when one was
+/// claimed less than [`PROBE_ONE_INTERVAL_SECS`] ago.
+fn claim_probe_slot(app_id: &str, owner: &str, now: SystemTime) -> bool {
+    let Ok(mut last) = probe_one_last().lock() else {
+        return false; // a poisoned lock never adds forge calls
+    };
+    let key = (app_id.to_string(), owner.to_ascii_lowercase());
+    let throttled = last.get(&key).is_some_and(|&at| {
+        now.duration_since(at)
+            .is_ok_and(|d| d < Duration::from_secs(PROBE_ONE_INTERVAL_SECS))
+            || at > now
+    });
+    if throttled {
+        return false;
+    }
+    last.insert(key, now);
+    true
+}
+
+/// Probe reader `app_id`'s bucket for `owner` now, so a withdrawal after a
+/// refusal that carried no `x-ratelimit-reset` can still use the bucket's
+/// real reset (W4-A). Free (`rate_limit` is not charged; booked to
+/// [`crate::forge_call_stats::Pool::Other`]), and run under exactly that
+/// reader's directory with every token env var removed, like every other
+/// probe. Throttled to once per `(app, owner)` per
+/// [`PROBE_ONE_INTERVAL_SECS`]; a no-op outside a daemon (no workspace
+/// registered). Returns whether a probe booked a reading.
+pub fn probe_one(app_id: &str, owner: &str) -> bool {
+    let Some(ws) = crate::forge_identity::workspace_root() else {
+        return false;
+    };
+    probe_one_with(ws, app_id, owner, None, SystemTime::now())
+}
+
+/// [`probe_one`] against an explicit workspace, `gh` and clock (tests).
+/// `owner` is used as given for the directory (the refresh loop publishes
+/// it under the spelling it was configured with) and lowercased for the
+/// bucket key.
+pub fn probe_one_with(
+    workspace_root: &Path,
+    app_id: &str,
+    owner: &str,
+    program: Option<&Path>,
+    now: SystemTime,
+) -> bool {
+    if app_id.is_empty() || !super::valid_owner(owner) {
+        return false;
+    }
+    let dir = crate::forge_read_pool::gh_config_dir_for_owner_app(workspace_root, owner, app_id);
+    if !crate::forge_identity::dir_is_fresh(&dir, now) {
+        return false;
+    }
+    if !claim_probe_slot(app_id, owner, now) {
+        return false;
+    }
+    let target = ProbeTarget {
+        dir,
+        role: IdentityRole::Reader,
+        account: crate::observability::ops::ratelimit::app_account_label(app_id),
+        owner: owner.to_ascii_lowercase(),
+    };
+    let booked = run_probe(&target, program);
+    if booked {
+        persist_to_sink();
+    }
+    booked
 }

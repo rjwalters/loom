@@ -5,7 +5,7 @@ use super::*;
 use crate::forge_identity::IdentityRole;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 fn headers(reset: i64) -> RateLimitHeaders {
     RateLimitHeaders {
@@ -14,6 +14,7 @@ fn headers(reset: i64) -> RateLimitHeaders {
         used: Some(1000),
         reset_epoch: Some(reset),
         limit: Some(5000),
+        retry_after_secs: None,
     }
 }
 
@@ -275,4 +276,128 @@ fn parse_probe_reads_core_graphql_and_search() {
     let resources: Vec<Resource> = got.iter().map(|(r, _)| *r).collect();
     assert_eq!(resources, [Resource::Core, Resource::Search]);
     assert!(parse_probe("not json", 0).is_empty());
+}
+
+// ===== W4-A: projection, refusal, on-demand probe =====
+
+fn reading_at(used: u64, limit: u64, reset: i64, observed_at: i64) -> Reading {
+    Reading {
+        limit: Some(limit),
+        remaining: Some(limit - used),
+        used: Some(used),
+        reset_epoch: reset,
+        observed_at,
+        source: Source::Header,
+    }
+}
+
+#[test]
+fn the_projection_extrapolates_use_over_the_elapsed_window() {
+    let now = 1_900_000_000;
+    // Half the window gone (reset in 1800 s), 2000 of 5000 used: 40 % / 0.5.
+    let p = projected_pct_of(&reading_at(2000, 5000, now + 1800, now), now).unwrap();
+    assert!((p - 80.0).abs() < 1e-9, "{p}");
+    // 5 minutes in with 60 % used: past the warm-up guard (remaining < 50 %),
+    // and the elapsed fraction is floored at 1/6.
+    let p = projected_pct_of(&reading_at(3000, 5000, now + 3300, now), now).unwrap();
+    assert!((p - 360.0).abs() < 1e-9, "{p}");
+    // 5 minutes in with most of the pool left: withheld.
+    assert_eq!(projected_pct_of(&reading_at(500, 5000, now + 3300, now), now), None);
+    // 15 minutes in: believed even with most left, floor 1/6 not reached.
+    let p = projected_pct_of(&reading_at(500, 5000, now + 2700, now), now).unwrap();
+    assert!((p - 40.0).abs() < 1e-9, "{p}");
+    // No limit to measure against.
+    let mut r = reading_at(500, 5000, now + 1800, now);
+    r.limit = None;
+    r.remaining = None;
+    assert_eq!(projected_pct_of(&r, now), None);
+    // Unknown key: None.
+    assert_eq!(
+        projected_used_pct(&BucketKey::new("app-950000", "acme", Resource::Core), now),
+        None
+    );
+}
+
+#[test]
+fn a_refusal_books_the_bucket_exhausted_until_its_reset() {
+    let now = chrono::Utc::now().timestamp();
+    let key = BucketKey::new("app-950001", "acme", Resource::Core);
+    insert(key.clone(), reading_at(4000, 5000, now + 1200, now - 60));
+    mark_exhausted_at(key.clone(), now + 1200, now);
+    let r = reading(&key, now).unwrap();
+    assert_eq!(
+        (r.remaining, r.used, r.limit, r.source),
+        (Some(0), Some(5000), Some(5000), Source::Refusal)
+    );
+    let p = projected_used_pct(&key, now).unwrap();
+    assert!(p >= 100.0, "{p}");
+    // A reset already past books nothing.
+    let other = BucketKey::new("app-950001", "beta", Resource::Core);
+    mark_exhausted_at(other.clone(), now - 1, now);
+    assert!(reading(&other, now).is_none());
+}
+
+#[test]
+fn probe_one_is_throttled_per_app_and_owner_and_runs_under_that_readers_dir() {
+    let ws = tempfile::tempdir().unwrap();
+    let now = chrono::Utc::now();
+    let app = "950002";
+    let dir = crate::forge_read_pool::gh_config_dir_for_owner_app(ws.path(), "acme", app);
+    write_sidecar(&dir, app, now + chrono::Duration::hours(1));
+    let other_dir = crate::forge_read_pool::gh_config_dir_for_owner_app(ws.path(), "beta", app);
+    write_sidecar(&other_dir, app, now + chrono::Duration::hours(1));
+
+    let bin = tempfile::tempdir().unwrap();
+    let log = bin.path().join("probes");
+    let reset = now.timestamp() + 1500;
+    let body = format!(
+        r#"{{"resources":{{"core":{{"limit":5000,"used":5000,"remaining":0,"reset":{reset}}}}}}}"#
+    );
+    let gh = bin.path().join("gh-probe");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\necho \"$GH_CONFIG_DIR|${{GH_TOKEN-unset}}|${{GITHUB_TOKEN-unset}}|$*\" >> '{}'\n\
+             printf 'HTTP/2.0 200 OK\\r\\n\\r\\n%s' '{body}'\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let sink = tempfile::tempdir().unwrap();
+    crate::forge_call_stats::set_test_sink_dir(Some(sink.path().to_path_buf()));
+    let t = SystemTime::now();
+    let first = probe_one_with(ws.path(), app, "acme", Some(&gh), t);
+    let again = probe_one_with(ws.path(), app, "acme", Some(&gh), t + Duration::from_secs(59));
+    let other_owner = probe_one_with(ws.path(), app, "beta", Some(&gh), t + Duration::from_secs(1));
+    let later = probe_one_with(ws.path(), app, "acme", Some(&gh), t + Duration::from_secs(61));
+    let rows = crate::forge_call_stats::status_report(chrono::Utc::now(), None)
+        .host_window
+        .unwrap_or_default();
+    crate::forge_call_stats::set_test_sink_dir(None);
+
+    assert_eq!((first, again, other_owner, later), (true, false, true, true));
+    let calls = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = calls.lines().collect();
+    assert_eq!(lines.len(), 3, "{calls}");
+    for (l, d) in lines.iter().zip([&dir, &other_dir, &dir]) {
+        let f: Vec<&str> = l.split('|').collect();
+        assert_eq!(
+            (f[0], f[1], f[2], f[3]),
+            (d.to_str().unwrap(), "unset", "unset", "api --include rate_limit"),
+            "{l}"
+        );
+    }
+    let rl = rows.iter().find(|r| r.caller == PROBE_OPERATION).unwrap();
+    assert_eq!(rl.pool.as_str(), "other", "free: booked to other");
+    let r = reading(
+        &BucketKey::new("app-950002", "acme", Resource::Core),
+        chrono::Utc::now().timestamp(),
+    )
+    .unwrap();
+    assert_eq!((r.remaining, r.reset_epoch, r.source), (Some(0), reset, Source::Probe));
+
+    // No fresh reader dir: no probe, and no slot claimed.
+    assert!(!probe_one_with(ws.path(), "950003", "acme", Some(&gh), t));
 }

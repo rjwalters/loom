@@ -581,7 +581,9 @@ impl GhInvocation {
     /// collected (side effects may have happened — never retry a write on it).
     pub fn execute(self) -> Result<GhCompletion, ExecError> {
         self.execute_routed(
-            &|slug, host| crate::forge_identity::read_credential(slug, host),
+            &|slug, host, resource| {
+                crate::forge_identity::read_credential_for(slug, host, resource)
+            },
             &reader_route::withdraw_reader,
         )
     }

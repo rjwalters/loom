@@ -44,6 +44,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
+use crate::forge_bucket_book::Resource;
+
 /// Env override for the read pool, highest precedence — mirroring
 /// `LOOM_GITHUB_APP_ID` / `LOOM_GITHUB_APP_KEY_PATH`'s precedence over
 /// `forge.githubApp.*` in `github-app-token.sh`.
@@ -265,6 +267,123 @@ pub fn is_withdrawn_at(app_id: &str, now: SystemTime) -> bool {
         return false; // fail open: a poisoned lock must not withdraw everything
     };
     map.get(app_id).is_some_and(|&until| now < until)
+}
+
+// ---------------------------------------------------------------------------
+// Withdrawal scoped to one (app, owner, resource) bucket (W4-A)
+// ---------------------------------------------------------------------------
+
+/// Which of an installation's rate-limit pools a scoped withdrawal covers.
+///
+/// GitHub meters each `(App, owner)` installation separately and, within it,
+/// each resource separately: an exhausted `core` pool for one owner says
+/// nothing about the same App's `graphql` pool, or about its installation on
+/// another owner. [`ResourceScope::All`] is for failures that are not about
+/// one pool — a secondary (abuse/concurrency) limit, or bad credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ResourceScope {
+    Core,
+    Graphql,
+    Search,
+    /// Every resource of the installation.
+    All,
+}
+
+impl ResourceScope {
+    /// The scope covering exactly `resource`.
+    #[must_use]
+    pub fn of(resource: Resource) -> Self {
+        match resource {
+            Resource::Core => Self::Core,
+            Resource::Graphql => Self::Graphql,
+            Resource::Search => Self::Search,
+        }
+    }
+
+    /// Whether this scope covers `resource`.
+    #[must_use]
+    pub fn covers(self, resource: Resource) -> bool {
+        self == Self::All || self == Self::of(resource)
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Graphql => "graphql",
+            Self::Search => "search",
+            Self::All => "all",
+        }
+    }
+}
+
+/// `(app id, owner lowercased, scope)` -> the instant it becomes eligible.
+type ScopedKey = (String, String, ResourceScope);
+
+fn scoped_withdrawals() -> &'static Mutex<HashMap<ScopedKey, SystemTime>> {
+    static SCOPED: OnceLock<Mutex<HashMap<ScopedKey, SystemTime>>> = OnceLock::new();
+    SCOPED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Withdraw reader `app_id` from `owner`'s `scope` until `until`. Like
+/// [`withdraw_until`], an existing withdrawal is only ever extended, never
+/// shortened. Returns the instant the withdrawal now ends (the longer of the
+/// held and the requested one).
+pub fn withdraw_scoped_until(
+    app_id: &str,
+    owner: &str,
+    scope: ResourceScope,
+    until: SystemTime,
+) -> SystemTime {
+    let Ok(mut map) = scoped_withdrawals().lock() else {
+        return until; // a poisoned lock must not take reads down
+    };
+    let held = map
+        .entry((app_id.to_string(), owner.to_ascii_lowercase(), scope))
+        .or_insert(until);
+    if until > *held {
+        *held = until;
+    }
+    *held
+}
+
+/// Whether reader `app_id` is withdrawn from `owner`'s `resource` at `now`,
+/// by a withdrawal of that resource or of [`ResourceScope::All`].
+#[must_use]
+pub fn is_withdrawn_scoped_at(
+    app_id: &str,
+    owner: &str,
+    resource: Resource,
+    now: SystemTime,
+) -> bool {
+    let Ok(map) = scoped_withdrawals().lock() else {
+        return false; // fail open, as is_withdrawn_at
+    };
+    let owner = owner.to_ascii_lowercase();
+    [ResourceScope::of(resource), ResourceScope::All]
+        .into_iter()
+        .any(|scope| {
+            map.get(&(app_id.to_string(), owner.clone(), scope))
+                .is_some_and(|&until| now < until)
+        })
+}
+
+/// Every scoped withdrawal still live at `now`, as `(app id, owner, scope,
+/// until)` in key order — what `loom-daemon status` lists.
+#[must_use]
+pub fn live_scoped_withdrawals(
+    now: SystemTime,
+) -> Vec<(String, String, ResourceScope, SystemTime)> {
+    let Ok(map) = scoped_withdrawals().lock() else {
+        return Vec::new();
+    };
+    let mut out: Vec<_> = map
+        .iter()
+        .filter(|(_, &until)| now < until)
+        .map(|((app, owner, scope), &until)| (app.clone(), owner.clone(), *scope, until))
+        .collect();
+    out.sort_by(|a, b| (&a.0, &a.1, a.2).cmp(&(&b.0, &b.1, b.2)));
+    out
 }
 
 // ---------------------------------------------------------------------------

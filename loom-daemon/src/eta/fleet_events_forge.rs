@@ -439,34 +439,17 @@ fn withdraw_reader(
     use super::fleet_fetch::ReadFailure;
     use super::fleet_refresh::StopReason;
     let why = format!("{CALLER} {url}");
-    let failure =
-        super::fleet_fetch::classify(stderr, Some(response.status), response.ratelimit.remaining);
-    match failure {
-        ReadFailure::RateLimited => {
-            let until = response
-                .ratelimit
-                .reset_epoch
-                .and_then(|s| u64::try_from(s).ok())
-                .map(|s| std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s));
-            crate::forge_identity::withdraw_after(
-                &reader.app_id,
-                repo,
-                crate::forge_identity::Failure::App,
-                until,
-                &why,
-            );
-            StopReason::RateLimited
-        }
-        ReadFailure::Coverage => {
-            crate::forge_identity::withdraw_after(
-                &reader.app_id,
-                repo,
-                crate::forge_identity::Failure::Coverage,
-                None,
-                &why,
-            );
-            StopReason::Coverage
-        }
+    let failure = super::fleet_fetch::reader_failure(
+        stderr,
+        Some(response.status),
+        Some(&response.ratelimit),
+    );
+    if let Some(f) = failure {
+        crate::forge_identity::withdraw_after(&reader.app_id, repo, f, &why);
+    }
+    match ReadFailure::of(failure) {
+        ReadFailure::RateLimited => StopReason::RateLimited,
+        ReadFailure::Coverage => StopReason::Coverage,
         ReadFailure::Other => StopReason::ForgeError,
     }
 }

@@ -250,7 +250,12 @@ impl Transport for GhTransport {
         if use_reader {
             let status = response.as_ref().map(|r| r.status);
             let ok = matches!(status, Some(200..=299 | 304));
-            if !ok && crate::forge_identity::classify_failure(&stderr, status).is_some() {
+            let headers = response.as_ref().map(|r| &r.ratelimit);
+            let resource = crate::forge_bucket_book::Resource::Core;
+            if !ok
+                && crate::forge_identity::classify_failure(&stderr, status, headers, resource)
+                    .is_some()
+            {
                 // A reader that cannot serve this store (not installed on the
                 // owner, rate-limited) costs one request, then the writer.
                 *self.reader_failed.borrow_mut() = true;

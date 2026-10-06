@@ -383,25 +383,31 @@ fn only_reviewed_read_paths_request_reader_credentials() {
 }
 
 #[test]
-fn failures_are_scoped_app_wide_or_to_one_repo() {
-    use super::Failure::{App, Coverage};
+fn failures_are_rate_limits_credentials_or_coverage() {
+    let c = |s, h| classify_failure_in(RoutingMode::Scoped, s, h, None, Resource::Core);
     assert_eq!(
-        classify_failure("gh: API rate limit exceeded for installation (HTTP 403)", Some(403)),
-        Some(App)
+        c("gh: API rate limit exceeded for installation (HTTP 403)", Some(403)),
+        Some(Failure::rate_limited(Resource::Core))
     );
+    assert!(
+        matches!(
+            c("secondary rate limit", Some(403)),
+            Some(Failure::RateLimited {
+                secondary: true,
+                ..
+            })
+        ),
+        "a rate-limited 403 is a rate limit, not coverage"
+    );
+    assert_eq!(c("", Some(429)), Some(Failure::rate_limited(Resource::Core)));
+    assert_eq!(c("Bad credentials (HTTP 401)", Some(401)), Some(Failure::Credential));
+    assert_eq!(c("gh: Not Found (HTTP 404)", Some(404)), Some(Failure::Coverage));
     assert_eq!(
-        classify_failure("secondary rate limit", Some(403)),
-        Some(App),
-        "rate-limited 403 is App-wide"
+        c("Resource not accessible by integration (HTTP 403)", Some(403)),
+        Some(Failure::Coverage)
     );
-    assert_eq!(classify_failure("", Some(429)), Some(App));
-    assert_eq!(classify_failure("Bad credentials (HTTP 401)", Some(401)), Some(App));
-    assert_eq!(classify_failure("gh: Not Found (HTTP 404)", Some(404)), Some(Coverage));
-    assert_eq!(
-        classify_failure("Resource not accessible by integration (HTTP 403)", Some(403)),
-        Some(Coverage)
-    );
-    assert_eq!(classify_failure("Server Error (HTTP 502)", Some(502)), None);
+    assert_eq!(c("Server Error (HTTP 502)", Some(502)), None);
+    assert!(Failure::Credential.is_app_wide() && !Failure::Coverage.is_app_wide());
 }
 
 #[test]
@@ -417,7 +423,7 @@ fn a_coverage_withdrawal_affects_only_that_repo() {
         .map(|i| format!("owner/repo-{i}"))
         .find(|repo| reader_for(&r, repo).unwrap().app_id == first)
         .unwrap();
-    withdraw_after(&first, "owner/repo-0", Failure::Coverage, None, "test");
+    withdraw_after(&first, "owner/repo-0", Failure::Coverage, "test");
     assert_ne!(
         reader_for(&r, "owner/repo-0").unwrap().app_id,
         first,
@@ -432,14 +438,20 @@ fn a_coverage_withdrawal_affects_only_that_repo() {
 }
 
 #[test]
-fn an_app_withdrawal_honours_the_reported_reset() {
-    let reset = SystemTime::now() + Duration::from_secs(1800);
-    withdraw_after("reset-app", "o/r", Failure::App, Some(reset), "test");
-    assert!(forge_read_pool::is_withdrawn_at(
-        "reset-app",
-        SystemTime::now() + Duration::from_secs(1700)
+fn a_rate_limit_withdrawal_honours_the_reported_reset_for_that_bucket_only() {
+    let now = SystemTime::now();
+    let reset = now + Duration::from_secs(1800);
+    let f = Failure::rate_limited(Resource::Core).with_reset(Some(reset));
+    withdraw_after_in(RoutingMode::Scoped, "930001", "o/r", f, "test", now, &|_, _, _| None);
+    let during = now + Duration::from_secs(1700);
+    assert!(forge_read_pool::is_withdrawn_scoped_at("930001", "o", Resource::Core, during));
+    assert!(!forge_read_pool::is_withdrawn_scoped_at(
+        "930001",
+        "o",
+        Resource::Core,
+        reset + Duration::from_secs(1)
     ));
-    assert!(!forge_read_pool::is_withdrawn_at("reset-app", reset + Duration::from_secs(1)));
+    assert!(!forge_read_pool::is_withdrawn_at("930001", during), "not App-wide");
 }
 
 #[test]

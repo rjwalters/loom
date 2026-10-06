@@ -182,6 +182,7 @@ fn sink_round_trips_prunes_old_hours_and_feeds_status() {
         used: Some(679),
         reset_epoch: Some(now + 900),
         limit: None,
+        retry_after_secs: None,
     };
     record("test_sink_caller", Pool::Core, Outcome::NotModified, Some(&headers));
     record("test_sink_caller", Pool::Core, Outcome::Ok, None);

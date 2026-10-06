@@ -268,19 +268,31 @@ pub(crate) fn fetch_conditional(
         // ambient personal token would serve the "reader" read.
         |dir, role| run_fetch_with(site, gh_bin, cwd, target, url, etag, dir, dir.is_some(), role),
         http_ok,
-        |r| crate::forge_identity::classify_failure(&r.2, r.1.as_ref().map(|h| h.status)),
+        reader_failure,
         |failure, _| {
             if let Some((_, app_id)) = &reader {
                 let repo = target.repo.as_deref().unwrap_or_default();
                 let why = format!("{} {url}", site.caller);
-                crate::forge_identity::withdraw_after(app_id, repo, failure, None, &why);
+                crate::forge_identity::withdraw_after(app_id, repo, failure, &why);
             }
         },
     )
 }
 
+/// What a failed conditional read says about its credential. The parsed
+/// `--include` headers travel with it (W4-A), so a rate-limit refusal names
+/// its pool and its real `x-ratelimit-reset` rather than the flat default.
+pub(crate) fn reader_failure(r: &FetchResult) -> Option<crate::forge_identity::Failure> {
+    crate::forge_identity::classify_failure(
+        &r.2,
+        r.1.as_ref().map(|h| h.status),
+        r.1.as_ref().map(|h| &h.ratelimit),
+        crate::forge_bucket_book::Resource::Core,
+    )
+}
+
 /// `(exit status, parsed `--include` response, trimmed stderr)` of one fetch.
-type FetchResult = (ExitStatus, Option<HttpResponse>, String);
+pub(crate) type FetchResult = (ExitStatus, Option<HttpResponse>, String);
 
 /// One `gh api --include <url>` read under **exactly** the reader App whose
 /// `GH_CONFIG_DIR` is `reader_dir` — the reader-only primitive (#10263).

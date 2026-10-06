@@ -30,12 +30,14 @@
 //! [`crate::forge_identity::reader_then_writer`] shape.
 
 use super::{AccessIntent, GhCompletion, GhInvocation, OutputContract};
+use crate::forge_bucket_book::Resource;
 use crate::forge_identity::{self, Failure, IdentityRole};
 use crate::proc_exec::{Completion, ExecError};
 use std::path::PathBuf;
 
-/// `(owner/repo, host)` → `(reader GH_CONFIG_DIR, reader app id)`.
-pub(super) type ReaderLookup<'a> = &'a dyn Fn(&str, Option<&str>) -> Option<(PathBuf, String)>;
+/// `(owner/repo, host, resource)` → `(reader GH_CONFIG_DIR, reader app id)`.
+pub(super) type ReaderLookup<'a> =
+    &'a dyn Fn(&str, Option<&str>, Resource) -> Option<(PathBuf, String)>;
 
 /// `(app id, owner/repo, failure, why)` → withdraw that reader.
 pub(super) type Withdraw<'a> = &'a dyn Fn(&str, &str, Failure, &str);
@@ -70,7 +72,10 @@ impl GhInvocation {
             return self.execute_direct();
         };
         let host = super::accounting::resolved_identity(&self).origin;
-        let Some((dir, app_id)) = lookup(&slug, host.as_deref()) else {
+        // W4-A: the pool this call spends, so a reader withdrawn from this
+        // owner's `core` still serves its `graphql` reads (and vice versa).
+        let resource = Resource::of_pool(super::accounting::static_pool(&self.args));
+        let Some((dir, app_id)) = lookup(&slug, host.as_deref(), resource) else {
             return self.execute_direct();
         };
         forge_identity::reader_then_writer(
@@ -84,7 +89,7 @@ impl GhInvocation {
                 .execute_direct()
             },
             succeeded,
-            failure_of,
+            |result| failure_of(result, resource),
             |failure, _| {
                 let why = format!("{} via the gh choke point", self.operation.as_str());
                 withdraw(&app_id, &slug, failure, &why);
@@ -99,22 +104,29 @@ fn succeeded(result: &GhCompletion) -> bool {
 }
 
 /// What a non-zero captured exit says about the credential. A timeout is not
-/// the credential's fault and is never retried.
-fn failure_of(result: &GhCompletion) -> Option<Failure> {
+/// the credential's fault and is never retried. The response's own
+/// `x-ratelimit-*` / `Retry-After` headers (a `--include` call) name the
+/// refused pool and its reset (W4-A); `resource` is the pool the call
+/// statically spends, used when they do not.
+fn failure_of(result: &GhCompletion, resource: Resource) -> Option<Failure> {
     let GhCompletion::Captured(Completion::Exited(out)) = result else {
         return None;
     };
     if out.status.success() {
         return None;
     }
-    let http = crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout))
-        .map(|r| r.status);
-    forge_identity::classify_failure(&String::from_utf8_lossy(&out.stderr), http)
+    let response = crate::forge_listing::parse_http_response(&String::from_utf8_lossy(&out.stdout));
+    forge_identity::classify_failure(
+        &String::from_utf8_lossy(&out.stderr),
+        response.as_ref().map(|r| r.status),
+        response.as_ref().map(|r| &r.ratelimit),
+        resource,
+    )
 }
 
-/// The production withdrawal: the forge's reset time is not known here.
+/// The production withdrawal: the reset travels inside `failure` (W4-A).
 pub(super) fn withdraw_reader(app_id: &str, slug: &str, failure: Failure, why: &str) {
-    forge_identity::withdraw_after(app_id, slug, failure, None, why);
+    forge_identity::withdraw_after(app_id, slug, failure, why);
 }
 
 /// Which role an execution is accounted under: the one the routing step (or

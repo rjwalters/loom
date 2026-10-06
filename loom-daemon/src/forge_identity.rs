@@ -56,7 +56,17 @@ use serde_json::Value;
 
 use crate::credential_preflight::{GithubAppMinter, GithubAppOutcome};
 use crate::dep_recheck::extract::{normalise_login, DEFAULT_BOT_LOGIN};
+use crate::forge_bucket_book::Resource;
 use crate::forge_read_pool::{self, PoolMember};
+
+#[path = "forge_identity/withdrawal.rs"]
+mod withdrawal;
+pub use withdrawal::{
+    classify_failure, classify_failure_in, epoch_time, plan_withdrawal, probed_reset,
+    probed_reset_with, withdraw_after, withdraw_after_in, Failure, ProbeReset, ResetSource,
+    RoutingMode, Withdrawal, CREDENTIAL_WITHDRAWAL, MAX_SCOPED_WITHDRAWAL, MIN_SCOPED_WITHDRAWAL,
+    READ_ROUTING_ENV, SECONDARY_WITHDRAWAL,
+};
 
 /// The writer slug's env override (shared with `star_liveness::trust`).
 pub const APP_SLUG_ENV: &str = "LOOM_GITHUB_APP_SLUG";
@@ -444,12 +454,26 @@ pub fn reader_for<'a>(roster: &'a Roster, owner_repo: &str) -> Option<&'a Identi
     reader_for_at(roster, owner_repo, SystemTime::now())
 }
 
-/// [`reader_for`] with an injected clock.
+/// [`reader_for`] with an injected clock (for a `core` read).
 #[must_use]
 pub fn reader_for_at<'a>(
     roster: &'a Roster,
     owner_repo: &str,
     now: SystemTime,
+) -> Option<&'a Identity> {
+    reader_for_resource_at(roster, owner_repo, Resource::Core, now, RoutingMode::current())
+}
+
+/// [`reader_for_at`] for a read of `resource`, under `mode`: a reader
+/// withdrawn from `owner_repo`'s owner for that resource (W4-A) is skipped
+/// too, unless `mode` is [`RoutingMode::Legacy`].
+#[must_use]
+pub fn reader_for_resource_at<'a>(
+    roster: &'a Roster,
+    owner_repo: &str,
+    resource: Resource,
+    now: SystemTime,
+    mode: RoutingMode,
 ) -> Option<&'a Identity> {
     // #9986: the gateway owns the pool on a `required` egress host.
     // `workspace_root()` is `None` when `WORKSPACE_ROOT` was never registered
@@ -466,10 +490,26 @@ pub fn reader_for_at<'a>(
     let start = forge_read_pool::assignment_index(owner_repo, n)?;
     (0..n)
         .map(|off| &roster.readers[(start + off) % n])
-        .find(|r| {
-            !forge_read_pool::is_withdrawn_at(&r.app_id, now)
-                && !repo_withdrawn_at(&r.app_id, owner_repo, now)
-        })
+        .find(|r| reader_eligible(&r.app_id, owner_repo, resource, now, mode))
+}
+
+/// Whether reader `app_id` may serve a `resource` read of `owner_repo` at
+/// `now`: not withdrawn App-wide, not for this repo, and (outside legacy
+/// mode) not for this owner's `resource` (W4-A).
+fn reader_eligible(
+    app_id: &str,
+    owner_repo: &str,
+    resource: Resource,
+    now: SystemTime,
+    mode: RoutingMode,
+) -> bool {
+    if forge_read_pool::is_withdrawn_at(app_id, now) || repo_withdrawn_at(app_id, owner_repo, now) {
+        return false;
+    }
+    let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
+    mode == RoutingMode::Legacy
+        || owner.is_empty()
+        || !forge_read_pool::is_withdrawn_scoped_at(app_id, owner, resource, now)
 }
 
 /// `(app id, owner/repo)` -> eligible again. A coverage failure is about one
@@ -549,17 +589,35 @@ pub fn dir_is_fresh(dir: &Path, now: SystemTime) -> bool {
         .is_ok_and(|left| left >= READER_MIN_REMAINING)
 }
 
-/// A usable reader credential for a read of `owner_repo` against `host`:
-/// `(GH_CONFIG_DIR, reader app id)`. `None` sends the read to the writer:
-/// no primary workspace yet, a non-github.com host, no readers, every reader
-/// withdrawn, or the chosen reader's token missing or near expiry.
+/// A usable reader credential for a `core` read of `owner_repo` against
+/// `host`: `(GH_CONFIG_DIR, reader app id)`. `None` sends the read to the
+/// writer: no primary workspace yet, a non-github.com host, no readers, every
+/// reader withdrawn, or the chosen reader's token missing or near expiry.
 #[must_use]
 pub fn read_credential(owner_repo: &str, host: Option<&str>) -> Option<(PathBuf, String)> {
+    read_credential_for(owner_repo, host, Resource::Core)
+}
+
+/// [`read_credential`] for a read that spends `resource` (W4-A): a reader
+/// withdrawn from this owner's `resource` is skipped.
+#[must_use]
+pub fn read_credential_for(
+    owner_repo: &str,
+    host: Option<&str>,
+    resource: Resource,
+) -> Option<(PathBuf, String)> {
     if host.is_some_and(|h| !h.eq_ignore_ascii_case("github.com")) {
         return None;
     }
     let ws = workspace_root()?;
-    read_credential_in(ws, &cached(ws), owner_repo, SystemTime::now())
+    read_credential_in_for(
+        ws,
+        &cached(ws),
+        owner_repo,
+        resource,
+        SystemTime::now(),
+        RoutingMode::current(),
+    )
 }
 
 /// Pure-ish core of [`read_credential`] (reads only the sidecar/token files).
@@ -569,6 +627,26 @@ pub fn read_credential_in(
     roster: &Roster,
     owner_repo: &str,
     now: SystemTime,
+) -> Option<(PathBuf, String)> {
+    read_credential_in_for(
+        workspace_root,
+        roster,
+        owner_repo,
+        Resource::Core,
+        now,
+        RoutingMode::current(),
+    )
+}
+
+/// [`read_credential_in`] for a `resource` read under `mode`.
+#[must_use]
+pub fn read_credential_in_for(
+    workspace_root: &Path,
+    roster: &Roster,
+    owner_repo: &str,
+    resource: Resource,
+    now: SystemTime,
+    mode: RoutingMode,
 ) -> Option<(PathBuf, String)> {
     let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
     if owner.is_empty() {
@@ -583,9 +661,7 @@ pub fn read_credential_in(
     (0..n)
         .map(|off| &roster.readers[(start + off) % n])
         .find_map(|r| {
-            if forge_read_pool::is_withdrawn_at(&r.app_id, now)
-                || repo_withdrawn_at(&r.app_id, owner_repo, now)
-            {
+            if !reader_eligible(&r.app_id, owner_repo, resource, now, mode) {
                 return None;
             }
             let dir = reader_dir(workspace_root, owner, r);
@@ -604,47 +680,6 @@ pub fn apply_read_credential(
     let (dir, app_id) = read_credential(owner_repo, host)?;
     cmd.env("GH_CONFIG_DIR", dir);
     Some(app_id)
-}
-
-/// What a failed read says about the reader that served it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Failure {
-    /// The App as a whole cannot serve right now (rate limit, bad
-    /// credentials): withdraw it everywhere.
-    App,
-    /// This repo is outside the reader's installation (404, "not accessible
-    /// by integration"): withdraw it for this repo only.
-    Coverage,
-}
-
-/// Classify a failed read, or `None` when the failure is not the
-/// credential's (a 5xx, a network error): retrying on the writer would not
-/// help and withdrawing the reader would be wrong.
-#[must_use]
-pub fn classify_failure(stderr: &str, http_status: Option<u16>) -> Option<Failure> {
-    let s = stderr.to_ascii_lowercase();
-    // Rate limits come as 403 or 429 with a telling message, so check the
-    // text before the status: a rate-limited 403 is App-wide, not coverage.
-    if s.contains("rate limit")
-        || s.contains("bad credentials")
-        || matches!(http_status, Some(401 | 429))
-        || s.contains("http 401")
-        || s.contains("http 429")
-    {
-        return Some(Failure::App);
-    }
-    if matches!(http_status, Some(403 | 404))
-        || s.contains("resource not accessible by integration")
-        // GraphQL (`gh pr view`, `gh issue view`) has no HTTP status for a
-        // repo outside the installation: it says it cannot resolve the repo
-        // (#9872 routes those reads too).
-        || s.contains("could not resolve to a repository")
-        || s.contains("http 403")
-        || s.contains("http 404")
-    {
-        return Some(Failure::Coverage);
-    }
-    None
 }
 
 /// Which identity served one attempt of a read (#9872): recorded on the
@@ -677,9 +712,12 @@ impl IdentityRole {
 ///
 /// With no `reader_dir`, `run` is called once on the writer. Otherwise it runs
 /// on the reader first; a success, or a failure that is not the credential's
-/// (`failure_of` → `None`), is returned as-is. On [`Failure::App`] the reader
+/// (`failure_of` → `None`), is returned as-is. On a rate limit or credential
+/// failure the reader
 /// is withdrawn (`withdraw`, handed the reader's failed result) and the read
-/// re-runs once on the writer. On a
+/// re-runs once on the writer (any [`Failure::is_app_wide`] failure: a rate
+/// limit or a refused credential; W4-A scopes the withdrawal, not this
+/// retry). On a
 /// 403/404 ([`Failure::Coverage`]) the read re-runs on the writer and the
 /// reader is withdrawn **only if the writer succeeds**: a resource missing for
 /// everyone must not take the repo's reader offline.
@@ -705,7 +743,7 @@ pub fn reader_then_writer<T, E>(
     let Some(failure) = failure_of(&first) else {
         return Ok(first);
     };
-    if failure == Failure::App {
+    if failure.is_app_wide() {
         withdraw(failure, &first);
         return run(None, IdentityRole::WriterFallback);
     }
@@ -719,10 +757,12 @@ pub fn reader_then_writer<T, E>(
 /// Whether a failed read is the credential's fault (see [`classify_failure`]).
 #[must_use]
 pub fn is_credential_failure(stderr: &str, http_status: Option<u16>) -> bool {
-    classify_failure(stderr, http_status).is_some()
+    classify_failure(stderr, http_status, None, Resource::Core).is_some()
 }
 
-/// Withdraw reader `app_id` App-wide (a mint failure, or no repo to scope to).
+/// Withdraw reader `app_id` App-wide: a mint or key failure, which no owner
+/// or resource scope describes. Rate-limit and credential refusals of a
+/// read go through [`withdraw_after`] instead (W4-A).
 pub fn withdraw_reader(app_id: &str, why: &str) {
     log::warn!(
         "forge_identity: reader app {app_id} withdrawn for {}s ({why}); reads fall back to \
@@ -730,39 +770,16 @@ pub fn withdraw_reader(app_id: &str, why: &str) {
         forge_read_pool::DEFAULT_WITHDRAWAL.as_secs()
     );
     forge_read_pool::withdraw(app_id);
-}
-
-/// Withdraw reader `app_id` after `failure` on a read of `owner_repo`: the
-/// whole App for [`Failure::App`] (until `app_until` when the forge reported
-/// a reset, else the default window), just this repo for
-/// [`Failure::Coverage`].
-pub fn withdraw_after(
-    app_id: &str,
-    owner_repo: &str,
-    failure: Failure,
-    app_until: Option<SystemTime>,
-    why: &str,
-) {
-    match failure {
-        Failure::App => {
-            log::warn!(
-                "forge_identity: reader app {app_id} withdrawn App-wide after a failed read \
-                 ({why}); reads fall back to the next reader or the writer — #9537"
-            );
-            match app_until {
-                Some(t) => forge_read_pool::withdraw_until(app_id, t),
-                None => forge_read_pool::withdraw(app_id),
-            }
-        }
-        Failure::Coverage => {
-            log::info!(
-                "forge_identity: reader app {app_id} does not cover {owner_repo} ({why}); \
-                 withdrawn for that repo for {}s, other repos unaffected — #9537",
-                REPO_WITHDRAWAL.as_secs()
-            );
-            withdraw_reader_for_repo_until(app_id, owner_repo, SystemTime::now() + REPO_WITHDRAWAL);
-        }
-    }
+    crate::observability::ops::reader_withdrawal::record_withdrawn(
+        &crate::observability::ops::reader_withdrawal::Withdrawn {
+            app: app_id,
+            owner: "-",
+            resource: "app",
+            until: (SystemTime::now() + forge_read_pool::DEFAULT_WITHDRAWAL).into(),
+            source: "default",
+            secondary: false,
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
