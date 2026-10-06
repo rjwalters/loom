@@ -730,7 +730,7 @@ check_and_unblock() {
 
     for dep in $deps; do
       local state=$(gh issue view "$dep" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
-      if [ "$state" != "CLOSED" ]; then
+      if [ "$state" != "CLOSED" ] && [ "$state" != "MERGED" ]; then
         all_resolved=false
         break
       fi
