@@ -285,7 +285,10 @@ pub fn resolved(state: &str) -> bool {
 /// section, parseable or not.
 #[must_use]
 pub(crate) fn unchecked_lines(body: &str) -> usize {
-    let re = regex::Regex::new(r"^[ \t]*[-*][ \t]*\[ \]").expect("static regex");
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"^[ \t]*[-*][ \t]*\[ \]").expect("static unchecked-box pattern")
+    });
     named::dependencies_section(body)
         .lines()
         .filter(|l| re.is_match(l))
