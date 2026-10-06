@@ -16,8 +16,9 @@
 //!   [`crate::forge_bucket_book`] is exported once per tick, and the 60 s
 //!   `gh api rate_limit` probe (free — it does not count against the quota)
 //!   is booked there under `(writer account, primary owner, resource)`
-//!   first, so no point leaves without an `owner` and two series never
-//!   interleave one bucket's `used`. An ambient-login host (an operator's
+//!   first, so no point leaves without an `owner` and the legacy owner-less
+//!   series no longer interleaves with a bucket's. (One label set is still
+//!   not guaranteed to be one GitHub bucket — #10571.) An ambient-login host (an operator's
 //!   own `gh`) has no bucket book entries of its own: it exports the probe
 //!   (falling back to the breaker's trip-time budget) as `owner="-"`,
 //!   `role="ambient"`.
@@ -483,7 +484,15 @@ fn on_app_host(workspace_root: &Path) -> bool {
 
 /// The tick's [`ProbeHost`] for the workspace at `workspace_root`.
 fn probe_host(workspace_root: &Path) -> ProbeHost {
-    if on_app_host(workspace_root) {
+    probe_host_for(workspace_root, on_app_host(workspace_root))
+}
+
+/// [`probe_host`] with the App-host predicate supplied. The App key is the
+/// same `(writer_account, primary_owner)` derivation
+/// [`crate::forge_bucket_book::probe_targets`] uses for the same
+/// `.loom/gh-config` directory, so the 60 s probe adds no key of its own.
+fn probe_host_for(workspace_root: &Path, on_app: bool) -> ProbeHost {
+    if on_app {
         ProbeHost::App {
             account: crate::forge_bucket_book::writer_account(workspace_root),
             owner: crate::forge_bucket_book::primary_owner(workspace_root)

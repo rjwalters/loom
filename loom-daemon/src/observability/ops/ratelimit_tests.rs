@@ -499,3 +499,29 @@ fn an_ambient_host_exports_its_probe_or_fallback_as_owner_dash_role_ambient() {
     }
     assert!(probe_points(&ProbeHost::Ambient, None, || None, || "x".to_string()).is_empty());
 }
+
+/// #10343 review: the 60 s probe is booked under exactly the key the
+/// reader-refresh probe pass already uses for the same `.loom/gh-config`
+/// directory — it introduces no new `(account, owner)` derivation (#10571
+/// tracks keys that can still carry two buckets).
+#[test]
+fn the_tick_probe_books_under_the_primary_probe_targets_key() {
+    let root = tempfile::tempdir().unwrap();
+    let primary = crate::credential_preflight::github_app_gh_config_dir(root.path());
+    std::fs::create_dir_all(&primary).unwrap();
+    std::fs::write(primary.join("hosts.yml"), "github.com:\n").unwrap();
+    let targets =
+        crate::forge_bucket_book::probe_targets(root.path(), std::time::SystemTime::now());
+    let target = targets
+        .iter()
+        .find(|t| t.dir == primary)
+        .expect("primary target");
+    assert_eq!(
+        probe_host_for(root.path(), true),
+        ProbeHost::App {
+            account: target.account.clone(),
+            owner: target.owner.clone(),
+        }
+    );
+    assert_eq!(probe_host_for(root.path(), false), ProbeHost::Ambient);
+}

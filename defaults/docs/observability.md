@@ -551,8 +551,11 @@ reading of every `(account, owner, resource)` pool it spends, from the free
 reader-refresh pass, plus the 60 s probe above. Each believed reading is
 exported once per tick as `github.ratelimit.{remaining,used,reset}` labelled
 `resource`, `account`, `owner` and `role` (`writer`|`reader`) — since #10343
-no point leaves without `owner`, so one series is one bucket and its `used`
-never interleaves two installations.
+no point leaves without `owner`. A label set is still **not** guaranteed to
+be one GitHub bucket: live data shows some `(account, owner, resource)` keys
+carrying two interleaved hourly reset windows (#10571), and several hosts
+export one bucket with readings of different ages. Read `used` together with
+its `reset` (the window), never as a monotone series.
 `loom.forge.calls` is a delta counter of the requests the `gh` facade sent,
 labelled by caller, inventoried operation, identity role, credential bucket
 (`account`, `cred_owner`, `resource`), `target_owner` and `outcome`; the free
@@ -566,16 +569,20 @@ same facts per call (#10343): `github.http.{status,not_modified,requests,source}
 the bucket join keys `github.{resource,account,cred_owner,role}`.
 
 **Shadow reconciliation (#10343).** *Shadow* spend is what GitHub billed a
-bucket that Loom did not attribute: Σ positive increments of
-`github.ratelimit.used` per `(account, owner, resource)` hour, minus that
-bucket's `loom.forge.calls`. It is a band, not a point: `outcome="ok"` rows
+bucket that Loom did not attribute: GitHub's bill per `(account, owner,
+resource)` hour, minus that bucket's `loom.forge.calls`. The bill keys every
+`github.ratelimit.used` reading by its quota window (the paired
+`github.ratelimit.reset`) and charges each window's high-water mark once, so
+stale readings from another host and interleaved windows never re-charge. It is a band, not a point: `outcome="ok"` rows
 are surely charged (the band's high end), and `ok`+`error` bounds the
 attributed figure from above (an `error` may be a charged 4xx or a local
 failure that sent nothing); 304s and the free probe are excluded. The
 recipe is `defaults/observability/signoz/github-shadow.sql`
 (queries 1–3, with query 4 cross-checking against the spans); a large
 shadow on a bucket means spend from outside this fleet's daemons (agent `gh`
-calls, another host, an operator) or an uninstrumented caller.
+calls, another host, an operator) or an uninstrumented caller. A negative
+shadow means the bucket's readings undercount it (sparse readings, or the
+readings describe another bucket — #10571), not that Loom over-spent.
 
 **Long-running task liveness and self-update decisions (#10414).** Each
 long-running daemon loop beats a process-global liveness registry

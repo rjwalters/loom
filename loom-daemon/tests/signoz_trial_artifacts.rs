@@ -1185,14 +1185,18 @@ fn queue_starvation_alert_matches_the_ops_metric_vocabulary() {
 #[test]
 fn github_shadow_queries_match_the_ratelimit_and_forge_calls_vocabulary() {
     let datapoint_keys = &keep_keys_by_context()["datapoint"];
-    let expected: BTreeSet<String> = [MetricName::GithubRateLimitUsed, MetricName::ForgeCalls]
-        .iter()
-        .map(|name| name.as_str().to_owned())
-        .collect();
+    let expected: BTreeSet<String> = [
+        MetricName::GithubRateLimitUsed,
+        MetricName::GithubRateLimitReset,
+        MetricName::ForgeCalls,
+    ]
+    .iter()
+    .map(|name| name.as_str().to_owned())
+    .collect();
     assert_eq!(
         all_metric_name_literals(GITHUB_SHADOW),
         expected,
-        "github-shadow.sql must read exactly github.ratelimit.used and loom.forge.calls"
+        "github-shadow.sql must read exactly github.ratelimit.{{used,reset}} and loom.forge.calls"
     );
 
     let labels = metric_label_keys(GITHUB_SHADOW);
