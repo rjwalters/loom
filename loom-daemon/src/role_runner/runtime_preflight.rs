@@ -33,6 +33,12 @@
 //!   by the proactive probe the selector runs (#6927), so it is not counted as
 //!   blocking either. The probe shells out to `docker`; it is deliberately NOT
 //!   run here, on the role loop's synchronous decision phase.
+//! - **A session-managed account whose container is down** (`SessionDown`,
+//!   #10454) IS counted as blocking: spawn-codex.sh refuses it with exit 78,
+//!   so counting it would select a tap only to kill it. This is one bounded,
+//!   cached `docker ps` per pass (`session_lifecycle::liveness`), never a
+//!   per-account probe, and it fails open: when Docker cannot be queried no
+//!   account is marked down.
 //!
 //! An inventory or health-state read error is the one fail-closed case: the
 //! selector reads the same files and fails the same way (exit `78`).
@@ -293,6 +299,12 @@ pub(crate) struct CodexPoolState {
     /// release — see the module doc for why class-scoped holds and
     /// session-managed re-auth holds are not counted as blocking.
     pub spawnable: usize,
+    /// Enabled session-managed accounts whose `loom-codex-session-<name>`
+    /// container a successful `docker ps` did not list as running (#10454,
+    /// reason `SessionDown`). Never counted spawnable: spawn-codex.sh refuses
+    /// a stopped session with exit 78. Always 0 when Docker could not be
+    /// queried (fail open) or no account is session-managed.
+    pub session_down: usize,
     /// Earliest account-wide cooldown deadline (epoch seconds) among the
     /// blocked accounts, when any has one.
     pub earliest_clear: Option<u64>,
@@ -314,6 +326,7 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
     let mut state = CodexPoolState {
         enabled: 0,
         spawnable: 0,
+        session_down: 0,
         earliest_clear: None,
         read_error: None,
     };
@@ -338,8 +351,20 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
             return state;
         }
     };
+    // #10454: one batched, fail-open `docker ps` for the whole pass — and none
+    // at all unless some enabled account is session-managed.
+    let liveness = crate::tokens_pool::session_lifecycle::liveness::liveness_for(&inventory);
     for account in inventory.iter().filter(|account| account.enabled) {
         state.enabled += 1;
+        // Before the no-health-entry `continue` below: an account the health
+        // file has never heard of is still unspawnable if its container is down.
+        if crate::tokens_pool::session_lifecycle::liveness::is_session_down(
+            account,
+            liveness.as_ref(),
+        ) {
+            state.session_down += 1;
+            continue;
+        }
         let Some(health) = health_state.get(&account.id) else {
             state.spawnable += 1;
             continue;
@@ -361,6 +386,22 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
         state.spawnable += 1;
     }
     state
+}
+
+/// Why an enabled, readable codex pool has nothing spawnable — shared by the
+/// pre-spawn skip and `runtime_preference::availability`'s Exhausted detail so
+/// both name `SessionDown` (#10454) the same way.
+pub(crate) fn codex_exhausted_reason(state: &CodexPoolState) -> String {
+    if state.session_down == 0 {
+        return "every enabled account is cooling down or needs re-auth".to_string();
+    }
+    format!(
+        "every enabled account is cooling down, needs re-auth, or is {} ({}/{} session \
+         container(s) not running — `loom-daemon accounts session start <name>`; #10454)",
+        crate::tokens_pool::session_lifecycle::liveness::SESSION_DOWN,
+        state.session_down,
+        state.enabled
+    )
 }
 
 /// The account provider `spawn-codex.sh` will select from for `admitted`'s
@@ -451,10 +492,7 @@ fn codex_gate(
         None if state.enabled == 0 => {
             (PoolHold::Unprovisioned, "no enabled codex account is provisioned".to_string())
         }
-        None => (
-            PoolHold::SelfHealing,
-            "every enabled account is cooling down or needs re-auth".to_string(),
-        ),
+        None => (PoolHold::SelfHealing, codex_exhausted_reason(&state)),
     };
     note_pre_spawn_skip(
         logs,

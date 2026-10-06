@@ -37,6 +37,16 @@
 //! sums scale with the host count, the mean (`dwell / samples`) does not.
 //! `loom.forge.stage_items{state}` counts the open items under each stage
 //! label, summed over this host's repos.
+//!
+//! # One sampler per fleet (W12)
+//!
+//! With `fleet.captainGauges` configured, the declared fleet captain samples
+//! (`stage-dwell` is one of its singleton jobs) and a dispatcher that opted
+//! in skips every repo the captain's fresh heartbeat covers: no listing and
+//! no per-item read for it, and its sampler state for the repo is dropped,
+//! so taking the repo back after a stale heartbeat starts from a baseline.
+//! See [`crate::observability::captain_gauges`]. Unconfigured, every host
+//! samples as before.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -76,6 +86,10 @@ pub const FETCH_BUDGET: usize = 8;
 
 /// Samples a pending PR lookup is retried before it is dropped.
 pub const MAX_TRIES: u8 = 3;
+
+/// This sampler's fleet-captain singleton job (W12,
+/// [`crate::observability::captain_gauges`]).
+const STAGE_JOB: &str = crate::observability::captain_gauges::STAGE_DWELL_JOB;
 
 /// Timeout for one per-item `gh api` read.
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -471,6 +485,16 @@ impl Sampler {
     pub fn last_at(&self) -> Option<DateTime<Utc>> {
         self.last_at
     }
+
+    /// Drop everything known about `slug`: its stage sets, pending samples
+    /// and cached label times. Used while the fleet captain samples the repo
+    /// (W12), so that when this host takes it back its first sample is a
+    /// fresh baseline rather than a diff against a stale one, which would
+    /// replay every transition it missed as new.
+    pub fn forget(&mut self, slug: &str) {
+        self.repos.remove(slug);
+        self.label_times.retain(|(s, _, _), _| s != slug);
+    }
 }
 
 /// The metric points for one sample: the dwell delta pair per stage with a
@@ -583,6 +607,7 @@ pub(in crate::observability) async fn record(
     };
     let mut inputs = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut left_to_captain = Vec::new();
     for root in crate::observability::collector::provisioned_roots(workspace_pool) {
         let root_str = root.to_string_lossy().to_string();
         let Some(slug) =
@@ -591,6 +616,11 @@ pub(in crate::observability) async fn record(
             continue;
         };
         if !seen.insert(slug.clone()) {
+            continue;
+        }
+        // W12: the fleet captain samples this repo and its data is fresh.
+        if crate::observability::captain_gauges::captain_covers(STAGE_JOB, &slug) {
+            left_to_captain.push(slug);
             continue;
         }
         let mut input = RepoInput {
@@ -628,10 +658,15 @@ pub(in crate::observability) async fn record(
             Err(std::sync::TryLockError::WouldBlock) => return,
         };
         let sampler = guard.get_or_insert_with(Sampler::default);
+        for slug in &left_to_captain {
+            sampler.forget(slug);
+        }
         let previous = sampler.last_at();
         let samples = sampler.sample(&inputs, Utc::now(), &mut GhStageFetcher);
         drop(guard);
         sink.emit_metrics_since(stage_points(&samples, &inputs), previous);
+        let sampled = inputs.iter().map(|input| input.slug.clone());
+        crate::observability::captain_gauges::note_produced(STAGE_JOB, sampled, Utc::now());
     }));
 }
 

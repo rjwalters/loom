@@ -371,6 +371,16 @@ pub enum MetricName {
     /// state, 0 for the rest. Labelled `account` and `container`.
     #[serde(rename = "loom.codex_session.state")]
     CodexSessionState,
+    // ---- Fleet gauges produced by the captain (W12) ----------------------
+    /// Age of the captain's last production of a fleet gauge job, labelled
+    /// `task` = the job (`observability::captain_gauges::JOBS`): on the captain its own,
+    /// on a dispatcher the published `as_of` it last read.
+    #[serde(rename = "loom.captain.gauge_age_seconds")]
+    CaptainGaugeAgeSeconds,
+    /// 1 while a dispatcher produces a fleet gauge job locally because the
+    /// captain's data is stale or absent, 0 while it stands down; by `task` (the job).
+    #[serde(rename = "loom.captain.gauge_fallback")]
+    CaptainGaugeFallback,
 }
 
 impl MetricName {
@@ -437,6 +447,8 @@ impl MetricName {
             Self::EtaHealthSnapshotAlternatesRows => "loom.eta.health.snapshot_alternates_rows",
             Self::EtaHealthPendingOverCap => "loom.eta.health.pending_over_cap",
             Self::CodexSessionState => "loom.codex_session.state",
+            Self::CaptainGaugeAgeSeconds => "loom.captain.gauge_age_seconds",
+            Self::CaptainGaugeFallback => "loom.captain.gauge_fallback",
         }
     }
 
@@ -518,6 +530,8 @@ impl MetricName {
             Self::EtaHealthSnapshotAlternatesRows => "{row}",
             Self::EtaHealthPendingOverCap => "{estimate}",
             Self::CodexSessionState => "1",
+            Self::CaptainGaugeAgeSeconds => "s",
+            Self::CaptainGaugeFallback => "1",
             _ => "By",
         }
     }
@@ -610,6 +624,12 @@ impl MetricName {
             Self::CodexSessionState => {
                 "Codex session container state per account: 1 for the current state \
                  (running, stopped, restarting, missing, stale_mounts), 0 for the others."
+            }
+            Self::CaptainGaugeAgeSeconds => {
+                "Age of the fleet captain's last run of a fleet gauge job, by task."
+            }
+            Self::CaptainGaugeFallback => {
+                "1 while a dispatcher produces a fleet gauge job locally (captain stale)."
             }
         }
     }

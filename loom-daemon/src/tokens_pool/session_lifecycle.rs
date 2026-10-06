@@ -71,6 +71,10 @@ use super::account_registry::{
 };
 use super::health::{self, ProbeEffect, ProbeOutcome};
 
+/// Batched, fail-open "is this account's session container running?" read
+/// (Issue #10454) — what lets selection pass over a down session account.
+pub mod liveness;
+
 /// Default image this lifecycle launches session containers from
 /// (`docker/session/README.md`). Overridable per-invocation (`--image`) for
 /// tests and for an operator pinning a specific published tag.

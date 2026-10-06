@@ -201,6 +201,8 @@ pub(super) fn run_role_with_timeout(
     }
 
     crate::observability::lifecycle::role_command(&mut cmd);
+    // #10432: the agent's pick journal, read back into this tick's `pick.decision`.
+    crate::observability::pick_journal::attach(&mut cmd, workspace_root, role);
     if let Some(selection) = &selection {
         selection.apply(&mut cmd);
     }
