@@ -53,6 +53,21 @@ fn opt_int(attributes: &mut Vec<KeyValue>, key: &str, value: Option<i64>) {
     }
 }
 
+/// #10498: only the fleet's ETA authority emits estimates and outcomes, so
+/// the emitting host *is* the authority. Pushes `loom.eta.authority` for those
+/// two kinds; a no-op for every other record. Kept here, not in the caller,
+/// because this file is the one place `loom.eta.*` attributes are produced
+/// (`tests/eta_artifacts.rs` scans it).
+pub(super) fn push_authority(
+    attributes: &mut Vec<KeyValue>,
+    record: &TelemetryRecord,
+    host_id: &str,
+) {
+    if matches!(record, TelemetryRecord::EtaEstimate(_) | TelemetryRecord::EtaOutcome(_)) {
+        attributes.push(kv_string("loom.eta.authority", host_id.to_string()));
+    }
+}
+
 /// `(event_name, severity, record time, attributes, body)` for an ETA
 /// record; `None` for every other kind.
 pub(super) fn log_parts(
