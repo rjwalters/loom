@@ -1639,8 +1639,9 @@ Never an issue number, sha or path.
 Fleet gauges produced by the captain (W12, `observability/captain_gauges.rs`).
 Gauges on the collector pass, emitted only on a host that is the armed captain
 or a dispatcher with `fleet.captainGauges.standDown`. `task` is the singleton job
-name (`stage-dwell`), the same label key the task-liveness gauges use; never a
-repo or issue. Configuration is in
+name (`stage-dwell`, and `star-facts` / `queue-blocked` where those switches
+are on), the same label key the task-liveness gauges use; never a repo or
+issue. Configuration is in
 [`daemon-reference.md`](daemon-reference.md#fleet-gauges-produced-by-the-captain-w12).
 
 | Metric | Unit | Labels | Meaning |

@@ -659,7 +659,7 @@ fn daemon_write_paths_are_scoped() {
                 let text = std::fs::read_to_string(src.join(file)).unwrap_or_default();
                 assert!(matches(file), "stale entry: {file} ({why}) no longer writes");
                 // The guard is the first statement of `publish`, not merely defined.
-                let guarded = text.find("pub fn publish(").is_some_and(|f| {
+                let guarded = text.find("fn publish(").is_some_and(|f| {
                     let sig = &text[f..];
                     sig.find(") -> Result<")
                         .and_then(|b| sig[b..].find(" {\n").map(|o| &sig[b + o + 3..]))

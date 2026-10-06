@@ -9,8 +9,9 @@ use serde_json::{json, Value};
 
 use super::store::{self, FetchCache, Fetched, Heartbeat, JobFacts, PublishCache};
 use super::{
-    coverage, points, resolve_role, Config, Role, DEFAULT_MAX_AGE_SECS,
-    DEFAULT_PUBLISH_INTERVAL_SECS, STAGE_DWELL_JOB, STAND_DOWN_ENV,
+    content_key, coverage, fresh_job, publish_due, resolve_role, Config, Role,
+    DEFAULT_MAX_AGE_SECS, DEFAULT_PUBLISH_INTERVAL_SECS, QUEUE_BLOCKED_JOB, STAGE_DWELL_JOB,
+    STAND_DOWN_ENV, STAR_FACTS_JOB,
 };
 use crate::fleet_captain::CaptainGate;
 use crate::fleet_store::fetch::{Reply, Transport};
@@ -33,10 +34,18 @@ fn config(block: Value) -> Config {
 }
 
 fn facts(as_of: DateTime<Utc>, repos: &[&str]) -> JobFacts {
-    JobFacts {
-        as_of,
-        repos: repos.iter().map(|r| (*r).to_string()).collect(),
-    }
+    JobFacts::covering(as_of, repos.iter().map(|r| (*r).to_string()).collect())
+}
+
+/// The part 1 gauges: one job.
+fn points(
+    role: &Role,
+    produced: &BTreeMap<String, JobFacts>,
+    heartbeat: Option<&Heartbeat>,
+    covered: &super::Coverage,
+    now: DateTime<Utc>,
+) -> Vec<MetricPoint> {
+    super::points(&[STAGE_DWELL_JOB], role, produced, heartbeat, covered, now)
 }
 
 fn heartbeat(captain: &str, as_of: DateTime<Utc>, repos: &[&str]) -> Heartbeat {
@@ -414,4 +423,188 @@ fn the_publication_branch_defaults_to_the_eta_fit_branch() {
     let (location, base) = store::location_for(&configured, &no_env).unwrap();
     assert_eq!((location.repo.as_str(), location.reference.as_str()), ("o/store", "eta-fit"));
     assert_eq!(base, "main");
+}
+
+// ---- part 2: the fact jobs -------------------------------------------------
+
+fn dispatcher() -> Role {
+    Role::Dispatcher {
+        captain: CAPTAIN.into(),
+    }
+}
+
+#[test]
+fn the_part_two_jobs_are_off_until_their_own_switches() {
+    // A part 1 fleet (`enabled` / `standDown` only) runs one job.
+    let part_one = config(json!({"enabled": true, "standDown": true}));
+    assert!(!part_one.star_facts && !part_one.queue_blocked);
+    assert_eq!(part_one.jobs(), [STAGE_DWELL_JOB]);
+    let both = config(json!({"standDown": true, "starFacts": true, "queueBlocked": true}));
+    assert_eq!(both.jobs(), [STAGE_DWELL_JOB, STAR_FACTS_JOB, QUEUE_BLOCKED_JOB]);
+    let one = config(json!({"queueBlocked": true, "starFacts": "yes"}));
+    assert_eq!(one.jobs(), [STAGE_DWELL_JOB, QUEUE_BLOCKED_JOB]);
+}
+
+#[test]
+fn a_job_is_relied_on_only_by_a_dispatcher_with_its_switch_and_fresh_data() {
+    let on = config(json!({"standDown": true, "starFacts": true}));
+    let off = config(json!({"standDown": true}));
+    let hb = Heartbeat::new(
+        CAPTAIN,
+        at(0),
+        [(STAR_FACTS_JOB.to_string(), facts(at(0), &["acme/app"]))].into(),
+    );
+    let role = dispatcher();
+    let ask = |role: Option<&Role>, cfg: Option<&Config>, hb: Option<&Heartbeat>, now| {
+        fresh_job(role, cfg, hb, STAR_FACTS_JOB, now).is_some()
+    };
+    assert!(ask(Some(&role), Some(&on), Some(&hb), at(10)));
+    // Judged at the time of use: the same heartbeat is stale later, with no
+    // collector pass in between.
+    assert!(!ask(Some(&role), Some(&on), Some(&hb), at(31)));
+    // The switch is off on this host, or the pass has not resolved yet.
+    assert!(!ask(Some(&role), Some(&off), Some(&hb), at(10)));
+    assert!(!ask(None, Some(&on), Some(&hb), at(10)));
+    assert!(!ask(Some(&role), None, Some(&hb), at(10)));
+    assert!(!ask(Some(&role), Some(&on), None, at(10)));
+    // The captain itself, and a local host, never read their own heartbeat.
+    let captain = Role::Captain {
+        captain: CAPTAIN.into(),
+    };
+    assert!(!ask(Some(&captain), Some(&on), Some(&hb), at(10)));
+    let local = Role::Local { reason: "no_store" };
+    assert!(!ask(Some(&local), Some(&on), Some(&hb), at(10)));
+    // Published by a former captain.
+    let other = Role::Dispatcher {
+        captain: "new-captain".into(),
+    };
+    assert!(!ask(Some(&other), Some(&on), Some(&hb), at(10)));
+    // A job the heartbeat does not carry (an older captain).
+    assert!(fresh_job(Some(&role), Some(&on), Some(&hb), QUEUE_BLOCKED_JOB, at(10)).is_none());
+}
+
+#[test]
+fn a_changed_fact_is_published_at_once_and_an_unchanged_one_waits() {
+    let interval = Duration::seconds(DEFAULT_PUBLISH_INTERVAL_SECS);
+    let quiet: BTreeMap<String, JobFacts> =
+        [(STAR_FACTS_JOB.to_string(), facts(at(0), &["acme/app"]))].into();
+    let key = content_key(&quiet);
+    assert!(publish_due(None, &key, at(0), interval), "nothing published yet");
+    // The same facts five minutes later differ only in `as_of`: not due.
+    let later: BTreeMap<String, JobFacts> =
+        [(STAR_FACTS_JOB.to_string(), facts(at(5), &["acme/app"]))].into();
+    assert_eq!(content_key(&later), key);
+    assert!(!publish_due(Some((at(0), &key)), &content_key(&later), at(5), interval));
+    assert!(publish_due(Some((at(0), &key)), &key, at(10), interval), "the interval elapsed");
+    // A star appears, or a repo drops out of coverage: due now.
+    let mut starred = later.clone();
+    starred
+        .get_mut(STAR_FACTS_JOB)
+        .unwrap()
+        .counts
+        .insert("acme/app".into(), 1);
+    assert!(publish_due(Some((at(0), &key)), &content_key(&starred), at(5), interval));
+    let dropped: BTreeMap<String, JobFacts> =
+        [(STAR_FACTS_JOB.to_string(), facts(at(5), &[]))].into();
+    assert!(publish_due(Some((at(0), &key)), &content_key(&dropped), at(5), interval));
+}
+
+#[test]
+fn the_fact_fields_round_trip_and_stay_out_of_a_part_one_heartbeat() {
+    let s = Store::default();
+    let part_one = heartbeat(CAPTAIN, at(0), &["acme/app"]);
+    store::publish(&s, &s, &loc("eta-fit"), "main", &part_one, &mut PublishCache::default())
+        .unwrap();
+    let body = s.file.borrow().as_ref().unwrap().0.clone();
+    for field in ["labels", "counts", "blocked"] {
+        assert!(!body.contains(field), "{field} is omitted when empty: {body}");
+    }
+
+    let mut star = facts(at(1), &["acme/app", "acme/lib"]);
+    star.labels = ["loom:operator-priority".to_string()].into();
+    star.counts.insert("acme/lib".into(), 2);
+    let mut blocked = facts(at(1), &["acme/app"]);
+    blocked.blocked.insert(
+        "acme/app".into(),
+        vec![store::BlockedFact {
+            number: 12,
+            created_at: Some("2026-09-01T00:00:00Z".into()),
+            labels: vec!["loom:blocked".into(), "tier:2".into()],
+        }],
+    );
+    let hb = Heartbeat::new(
+        CAPTAIN,
+        at(1),
+        [
+            (STAR_FACTS_JOB.to_string(), star),
+            (QUEUE_BLOCKED_JOB.to_string(), blocked),
+        ]
+        .into(),
+    );
+    let mut cache = PublishCache::default();
+    store::publish(&s, &s, &loc("eta-fit"), "main", &hb, &mut cache).unwrap();
+    let mut fetch = FetchCache::default();
+    assert_eq!(store::fetch(&s, &loc("eta-fit"), &mut fetch), Fetched::Updated);
+    assert_eq!(fetch.heartbeat.as_ref(), Some(&hb));
+}
+
+#[test]
+fn a_reader_that_predates_the_fact_fields_still_reads_the_heartbeat() {
+    // The part 1 reader's view of a job: `as_of` and `repos`, nothing else.
+    #[derive(serde::Deserialize)]
+    struct OldJob {
+        as_of: DateTime<Utc>,
+        #[serde(default)]
+        repos: BTreeSet<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct OldHeartbeat {
+        schema: String,
+        jobs: BTreeMap<String, OldJob>,
+    }
+    let mut star = facts(at(1), &["acme/app"]);
+    star.counts.insert("acme/app".into(), 1);
+    let hb = Heartbeat::new(
+        CAPTAIN,
+        at(1),
+        [
+            (STAGE_DWELL_JOB.to_string(), facts(at(1), &["acme/app"])),
+            (STAR_FACTS_JOB.to_string(), star),
+        ]
+        .into(),
+    );
+    let old: OldHeartbeat = serde_json::from_str(&serde_json::to_string(&hb).unwrap()).unwrap();
+    assert_eq!(old.schema, store::SCHEMA);
+    assert_eq!(old.jobs[STAGE_DWELL_JOB].as_of, at(1));
+    assert!(old.jobs[STAGE_DWELL_JOB].repos.contains("acme/app"));
+    // And this reader takes a part 1 heartbeat (no fact fields at all).
+    let part_one = format!(
+        r#"{{"schema":"{}","captain_host":"{CAPTAIN}","published_at":"2026-10-06T12:00:00Z",
+            "jobs":{{"stage-dwell":{{"as_of":"2026-10-06T12:00:00Z","repos":["acme/app"]}}}}}}"#,
+        store::SCHEMA
+    );
+    let parsed = store::parse(part_one.as_bytes()).unwrap();
+    assert!(parsed.jobs[STAGE_DWELL_JOB].counts.is_empty());
+    assert!(!parsed.jobs.contains_key(STAR_FACTS_JOB), "so every dispatcher stays local");
+}
+
+#[test]
+fn a_dispatcher_reports_fallback_per_job_it_takes_part_in() {
+    let hb = Heartbeat::new(
+        CAPTAIN,
+        at(0),
+        [(STAGE_DWELL_JOB.to_string(), facts(at(0), &["acme/app"]))].into(),
+    );
+    let covered = coverage(Some(&hb), CAPTAIN, at(10), Duration::minutes(30));
+    let jobs = [STAGE_DWELL_JOB, STAR_FACTS_JOB];
+    let out = super::points(&jobs, &dispatcher(), &BTreeMap::new(), Some(&hb), &covered, at(10));
+    let star_fallback =
+        MetricPoint::int(MetricName::CaptainGaugeFallback, 1).label("task", STAR_FACTS_JOB);
+    assert!(
+        out.contains(&star_fallback),
+        "an older captain publishes no star-facts: {out:?}"
+    );
+    assert!(out.contains(&point(MetricName::CaptainGaugeFallback, 0)));
+    assert!(!out.iter().any(|p| *p
+        == MetricPoint::int(MetricName::CaptainGaugeFallback, 1).label("task", QUEUE_BLOCKED_JOB)));
 }

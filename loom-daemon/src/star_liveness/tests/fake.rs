@@ -21,6 +21,8 @@ pub struct Repo {
     pub comments: BTreeMap<u32, Vec<ForgeComment>>,
     /// Every comment posted through the fake: (number, body).
     pub posted: Vec<(u32, String)>,
+    /// Label listings made through the fake.
+    pub listings: usize,
     /// Comment reads made through the fake.
     pub comment_reads: usize,
     /// Issue searches made through the fake.
@@ -78,7 +80,8 @@ pub struct FakeForge {
 
 impl StarForge for FakeForge {
     fn list_open(&mut self, label: &str) -> Result<Vec<RestIssue>> {
-        let repo = self.world.repo(&self.slug);
+        let mut repo = self.world.repo(&self.slug);
+        repo.listings += 1;
         if repo.fail_listing {
             return Err(anyhow!("listing failed"));
         }
