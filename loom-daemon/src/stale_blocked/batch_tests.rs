@@ -40,6 +40,7 @@ pub(super) struct Fake {
     pub(super) core_remaining: VecDeque<u64>,
     pub(super) meter: Meter,
     // Call log.
+    pub(super) list_calls: usize,
     pub(super) comment_calls: Vec<u32>,
     pub(super) state_calls: Vec<Key>,
     pub(super) merge_calls: Vec<u32>,
@@ -49,6 +50,7 @@ pub(super) struct Fake {
 
 impl StaleBlockedForge for Fake {
     fn list_blocked(&mut self) -> Result<Vec<RestIssue>> {
+        self.list_calls += 1;
         if self.list_fails {
             return Err(anyhow!("HTTP 502"));
         }
@@ -135,7 +137,7 @@ pub(super) fn state(s: &str) -> RefState {
     }
 }
 
-fn comment(login: &str, body: &str) -> extract::Comment {
+pub(super) fn comment(login: &str, body: &str) -> extract::Comment {
     extract::Comment {
         author: extract::Author {
             login: login.to_string(),

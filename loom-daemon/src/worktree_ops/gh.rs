@@ -152,70 +152,75 @@ pub fn issue_state(repo_root: &Path, issue: u32) -> String {
     }
 }
 
-/// `gh api repos/{owner}/{repo}/issues/<N> --jq .state`, normalized to
-/// `"OPEN"` / `"CLOSED"` / `"UNKNOWN"`.
+/// `GET repos/{owner}/{repo}/issues/<N>` as JSON, through the shared ETag
+/// store (#10512): the `ETag` and body persist on disk under `issue-`, so a
+/// re-probe of an unchanged issue — the reaper's every-15-minute case, and
+/// the `closed_at` read right after `state` — is a `304`, free on the core
+/// bucket. Booked under `op`. An explicit `LOOM_REPO` names the repo, else
+/// the checkout's `origin`, else gh's placeholder (the store's
+/// `resolve_target` rule). `None` on any failure or a `404`: each caller's
+/// fail-closed answer.
+///
+/// Routed as a `Gate` read by the store, so under reader-budget exhaustion it
+/// is no longer shed (W4-C `Hygiene`); it falls through to the writer, where
+/// it is mostly a `304`.
+fn cached_issue_json(op: &'static str, repo_root: &Path, issue: u32) -> Option<serde_json::Value> {
+    use crate::forge_etag_store as store;
+    let loom_repo = std::env::var("LOOM_REPO")
+        .ok()
+        .filter(|r| !r.trim().is_empty());
+    let target = store::resolve_target(Some(repo_root), loom_repo.as_deref());
+    let url = match &target.repo {
+        Some(r) => format!("repos/{r}/issues/{issue}"),
+        None => format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
+    };
+    let read = store::cached_read(
+        store::ConditionalRead::new(op, crate::forge_call_stats::ops::ISSUE_VIEW_STATE),
+        &std::path::PathBuf::from(gh_bin()),
+        Some(repo_root),
+        loom_repo.as_deref(),
+        &url,
+        "issue-",
+    )
+    .ok()?;
+    serde_json::from_str(&read.body?).ok()
+}
+
+/// The issue's REST `.state`, normalized to `"OPEN"` / `"CLOSED"` /
+/// `"UNKNOWN"` (any failure, `404`, or other value).
 ///
 /// Deliberately the REST endpoint rather than [`issue_state`]'s `gh issue
 /// view` (which goes through GraphQL): GraphQL quota exhaustion under
 /// concurrent agents is a live failure mode in this repo, and the callers of
 /// this probe are bulk hygiene passes that can issue one call per stale file
 /// (#4450). REST returns lowercase states, so they are upper-cased here to
-/// match [`issue_state`]'s contract.
+/// match [`issue_state`]'s contract. Conditional since #10512
+/// ([`cached_issue_json`]).
 #[must_use]
 pub fn issue_state_rest(repo_root: &Path, issue: u32) -> String {
-    let out = bounded_hygiene(
-        "worktree.issue_state_rest",
-        repo_root,
-        [
-            "api",
-            &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
-            "--jq",
-            ".state",
-        ],
-    );
-    match out {
-        Some(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_uppercase();
-            match s.as_str() {
-                "OPEN" | "CLOSED" => s,
-                _ => "UNKNOWN".to_string(),
-            }
-        }
+    let state = cached_issue_json("worktree.issue_state_rest", repo_root, issue)
+        .and_then(|v| v.get("state")?.as_str().map(str::to_uppercase));
+    match state.as_deref() {
+        Some(s @ ("OPEN" | "CLOSED")) => s.to_string(),
         _ => "UNKNOWN".to_string(),
     }
 }
 
-/// `gh api repos/{owner}/{repo}/issues/<N> --jq .closed_at`: the issue's own
-/// close timestamp (issue #6653), REST rather than GraphQL for the same
-/// quota-isolation reason as [`issue_state_rest`].
+/// The issue's REST `.closed_at`: its own close timestamp (issue #6653), REST
+/// rather than GraphQL for the same quota-isolation reason as
+/// [`issue_state_rest`], and the same conditional read ([`cached_issue_json`]).
 ///
 /// Used to gate the grace period for a closed issue whose worktree never had
 /// a PR opened at all (`clean::PrStatus::NoPr`) — there is no PR
 /// `closedAt`/`mergedAt` to read in that case, so the issue's own close time
 /// is the only timestamp available. `None` on any failure, an empty/`null`
-/// response, or an issue that is not (yet) closed — a probe failure must
+/// value, or an issue that is not (yet) closed — a probe failure must
 /// never be read as "grace period already elapsed".
 #[must_use]
 pub fn issue_closed_at_rest(repo_root: &Path, issue: u32) -> Option<String> {
-    let out = bounded_hygiene(
-        "worktree.issue_closed_at",
-        repo_root,
-        [
-            "api",
-            &format!("repos/{{owner}}/{{repo}}/issues/{issue}"),
-            "--jq",
-            ".closed_at",
-        ],
-    )?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() || s == "null" {
-        None
-    } else {
-        Some(s)
-    }
+    let json = cached_issue_json("worktree.issue_closed_at", repo_root, issue)?;
+    let s = json.get("closed_at")?.as_str()?.trim();
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1387,3 +1392,7 @@ mod tests {
         assert!(out.is_none(), "a spawn failure must stay a no-answer: {out:?}");
     }
 }
+
+#[cfg(test)]
+#[path = "gh_issue_json_tests.rs"]
+mod issue_json_tests;

@@ -1,9 +1,10 @@
-//! Batched evidence gathering for `check-stale-blocked` (issue #10480).
+//! Batched evidence gathering for `check-stale-blocked` (issue #10480) and,
+//! through [`gather_filtered`], `notify-cleared-blockers` (#10515).
 //!
-//! The per-artifact gatherer (`cli/stale_blocked.rs::gather`, over
-//! [`crate::dep_recheck::forge`]) spends 3–6 GraphQL `gh … view` calls per
-//! artifact and repeats them for every artifact citing the same blocker: about
-//! 1,700 points for 300 parked issues. This module reads the same facts in bulk:
+//! The per-artifact gatherer it replaced (over [`crate::dep_recheck::forge`])
+//! spent 3–6 GraphQL `gh … view` calls per artifact and repeated them for
+//! every artifact citing the same blocker: about 1,700 points for 300 parked
+//! issues. This module reads the same facts in bulk:
 //!
 //! - **Candidates**: one REST + ETag `loom:blocked` listing, which returns
 //!   issues *and* PRs and already carries each body, labels and comment count
@@ -189,6 +190,19 @@ pub fn gather_all(
     fleet: &FleetLogins,
     opts: Options,
 ) -> Gathering {
+    gather_filtered(forge, fleet, opts, &mut |_, _, _| true)
+}
+
+/// [`gather_all`], keeping only the artifacts `keep` accepts once their text
+/// is read (#10515). A rejected artifact costs no closing-PR or blocker-state
+/// read and is not in the result. An artifact whose text read **failed** is
+/// always kept, unevaluated: it is never filtered away as "not cited".
+pub fn gather_filtered(
+    forge: &mut dyn StaleBlockedForge,
+    fleet: &FleetLogins,
+    opts: Options,
+    keep: &mut dyn FnMut(Artifact, i64, &extract::Input) -> bool,
+) -> Gathering {
     let mut cost = ForgeCost {
         floor: opts.floor,
         ..ForgeCost::default()
@@ -247,10 +261,13 @@ pub fn gather_all(
     }
 
     let mut guard = Guard::new(opts.floor);
-    let mut pending: Vec<Pending> = selected
-        .into_iter()
-        .map(|(kind, row)| read_text(forge, fleet, kind, row, &mut guard))
-        .collect();
+    let mut pending: Vec<Pending> = Vec::new();
+    for (kind, row) in selected {
+        let (p, input) = read_text(forge, fleet, kind, row, &mut guard);
+        if input.is_none_or(|i| keep(kind, i64::from(p.row.number), &i)) {
+            pending.push(p);
+        }
+    }
     read_closing(forge, &mut pending, &mut guard);
     let states = read_states(forge, &pending, &mut guard);
     let items = pending
@@ -267,14 +284,15 @@ pub fn gather_all(
 }
 
 /// Body (from the listing row) and comments (read only when there are any),
-/// and every reference the text cites.
+/// and every reference the text cites. The text is returned too, `None` when
+/// its read failed.
 fn read_text(
     forge: &mut dyn StaleBlockedForge,
     fleet: &FleetLogins,
     kind: Artifact,
     row: RestIssue,
     guard: &mut Guard,
-) -> Pending {
+) -> (Pending, Option<extract::Input>) {
     let body = row.body.clone().unwrap_or_default();
     let mut p = Pending {
         kind,
@@ -291,7 +309,7 @@ fn read_text(
     } else {
         if let Err(why) = guard.core(&forge.meter()) {
             p.failed = Some(why);
-            return p;
+            return (p, None);
         }
         match forge.comments(p.row.number) {
             Ok(c) => c,
@@ -302,7 +320,7 @@ fn read_text(
                     kind.label(),
                     p.row.number
                 ));
-                return p;
+                return (p, None);
             }
         }
     };
@@ -316,7 +334,7 @@ fn read_text(
     if kind == Artifact::Issue {
         p.named = named::parse_entries(&p.body);
     }
-    p
+    (p, Some(input))
 }
 
 /// The closing PRs of every still-evaluable issue, [`CLOSING_BATCH`] per

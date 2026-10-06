@@ -7484,11 +7484,13 @@ rate-limit signature, so it never trips the breaker. A shed books an
 `info` line per operation at most every 300 s (the rest at `debug`), and
 `intake_reconcile` reports a shed listing as a skipped pass, not a failure.
 Classified sites:
-Hygiene — `worktree.issue_state`, `worktree.issue_state_rest`,
-`worktree.issue_closed_at`, `worktree.has_open_pr`, `clean.pr_list`,
+Hygiene — `worktree.issue_state`, `worktree.has_open_pr`, `clean.pr_list`,
 `clean.pr_by_number_rest`, `clean.pr_status_rest`, `worktree.landed_pulls`,
 `intake.list_open`; Observability — `stage_dwell`'s `api.rest`,
-`visibility.repo`, `telemetry.repo_identity`. Nothing under `sweep_registry/`,
+`telemetry.repo_identity`. `worktree.issue_state_rest`,
+`worktree.issue_closed_at` and `visibility.repo` are conditional reads
+through the shared ETag store (#10512) and route as `Gate` — not shed, but
+mostly free `304`s. Nothing under `sweep_registry/`,
 `claim_reconciliation`, `merge_*`, verdict, quarantine or reclaim, nor
 `forge_check_claim`, `cli/lease_co_occupancy`, `role_runner/roster`,
 `worktree_reaper` or `primary_checkout_reaper`, is ever anything but `Gate`
@@ -7509,7 +7511,7 @@ A `Gate` read always confirms on the writer, and the reader is not withdrawn.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `LOOM_FACADE_CWD_ROUTING` | on | `0` disables the derivation: every untargeted read stays on the writer. Typed reads keep the class-aware chain, so a typed `Observability` read (`visibility.repo`, `telemetry.repo_identity`) can still be shed. Read on every call. |
+| `LOOM_FACADE_CWD_ROUTING` | on | `0` disables the derivation: every untargeted read stays on the writer. Typed reads keep the class-aware chain, so a typed `Observability` read (`telemetry.repo_identity`) can still be shed. Read on every call. |
 | `LOOM_READ_SHED` | on | `0` treats every read as `Gate`: no shed and no gone-memo shortcut, so `Hygiene`/`Observability` reads fall back to the writer. Derivation stays on. Read on every call. |
 | `LOOM_READ_ROUTING` | `v2` | `legacy` is the only exact revert: the pre-W4 path (no derivation, no classes, no reserve, the unconditional reader → writer fallback), and it reverts W4-A's scoped withdrawal and W4-B's split and spill with it. `LOOM_FACADE_CWD_ROUTING=0` plus `LOOM_READ_SHED=0` together restore W4-C's load placement only (untargeted reads on the writer, nothing shed), keeping W4-A/W4-B, the retry on the next reader and the writer pins. Read on every call. |
 

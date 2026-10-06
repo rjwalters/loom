@@ -45,8 +45,9 @@ fn every_deferrable_site_maps_a_shed_to_no_answer() {
     };
 
     step("worktree.issue_state", gh::issue_state(root, 7) == "UNKNOWN");
-    step("worktree.issue_state_rest", gh::issue_state_rest(root, 7) == "UNKNOWN");
-    step("worktree.issue_closed_at", gh::issue_closed_at_rest(root, 7).is_none());
+    // `worktree.issue_state_rest` / `worktree.issue_closed_at` and
+    // `visibility.repo` left this list in #10512: they are conditional reads
+    // through the shared ETag store, routed `Gate` (mostly free `304`s).
     step("worktree.has_open_pr", gh::has_open_pr(root, "feature/x") == (false, false));
     step("clean.pr_list", clean::check_pr_merged(root, 7) == PrStatus::Unknown);
     step(
@@ -75,11 +76,6 @@ fn every_deferrable_site_maps_a_shed_to_no_answer() {
     step(
         "telemetry.repo_identity",
         crate::telemetry::repo_identity::resolve("acme/w4c-shed-identity").is_none(),
-    );
-    crate::telemetry::visibility::refresh_visibility_cache("acme/w4c-shed-visibility");
-    step(
-        "visibility.repo",
-        crate::telemetry::visibility::cached_visibility("acme/w4c-shed-visibility").is_none(),
     );
 
     // Every shed read was classified and routed to the derived / typed repo.

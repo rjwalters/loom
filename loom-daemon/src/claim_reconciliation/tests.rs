@@ -2931,7 +2931,7 @@ fn resolve_stale_treating_minutes_defaults_and_overrides() {
 /// Write a fake `gh` script (tests only) that logs every invocation to
 /// `gh_log`, reports exactly one PR carrying the requested claim label
 /// for `pr list`, and reports `extra_labels` (plus nothing else) for
-/// `pr view --json labels` -- letting a test control whether the
+/// the REST `pulls/{n}` read (#10507) -- letting a test control whether the
 /// safety-net `loom:review-requested` backfill should fire.
 fn write_fake_gh_pr(
     dir: &std::path::Path,
@@ -2950,7 +2950,7 @@ fn write_fake_gh_pr(
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{log}"
-{pulls}if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+{pulls}if [ "$*" = "api repos/{{owner}}/{{repo}}/pulls/{pr_number}" ]; then
   echo '{{"labels":[{labels_json}]}}'
   exit 0
 fi
