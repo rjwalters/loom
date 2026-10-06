@@ -171,7 +171,12 @@ fn watch_probe_is_counted_and_keeps_its_classification() {
 #[serial(loom_config_env)]
 fn worktree_ops_probes_are_counted_and_keep_their_classification() {
     let tmp = tempfile::tempdir().unwrap();
-    let gh = stub(tmp.path(), "gh-closed", "echo closed");
+    // #10512: the issue probes are `gh api --include` conditional reads now.
+    let gh = stub(
+        tmp.path(),
+        "gh-closed",
+        r#"printf 'HTTP/2.0 200 OK\r\nEtag: W/"e1"\r\n\r\n{"state":"closed","closed_at":"2026-10-06T00:00:00Z"}'"#,
+    );
     std::env::set_var("LOOM_GH_BIN", &gh);
     let (mut state, mut closed_at, mut building) = (None, None, None);
     let rows = rows_after(|| {
@@ -181,7 +186,7 @@ fn worktree_ops_probes_are_counted_and_keep_their_classification() {
     });
     std::env::remove_var("LOOM_GH_BIN");
     assert_eq!(state.as_deref(), Some("CLOSED"));
-    assert_eq!(closed_at, Some(Some("closed".to_string())));
+    assert_eq!(closed_at, Some(Some("2026-10-06T00:00:00Z".to_string())));
     assert_eq!(building, Some(true), "non-JSON stdout is a parse error");
     assert_eq!(calls(&rows, "worktree.issue_state_rest"), 1, "{rows:?}");
     assert_eq!(calls(&rows, "worktree.issue_closed_at"), 1, "{rows:?}");

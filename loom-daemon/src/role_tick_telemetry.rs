@@ -33,7 +33,7 @@
 //!   for the rate derivation that forces the split.
 //! - **No forge call on the tick path beyond the cached one.** The repo slug
 //!   comes from a local `git remote get-url origin`; the visibility tag comes
-//!   from [`crate::telemetry::visibility::derive_visibility`]'s 300s-TTL
+//!   from [`crate::telemetry::visibility::derive_visibility`]'s 1h-TTL
 //!   memo, which is the same one every `sweep.outcome` already pays.
 //! - **Runtime-dispatched token source (Issue #8507).** The Claude-transcript
 //!   scan above is the DEFAULT source, used whenever this tick's own
@@ -529,8 +529,9 @@ fn models_used_from(rows: &[ModelUsageTotals]) -> Option<Vec<String>> {
 /// The slug comes from the checkout's own `origin` remote — a local `git`
 /// call, never a forge round trip — falling back to the root's path exactly
 /// the way `sweep.outcome`'s own construction site falls back. The visibility
-/// tag is the 300s-TTL memoized probe, so a busy host pays at most one `gh`
-/// call per repo per five minutes for it regardless of tick rate, and any
+/// tag is the 1h-TTL memoized probe, so a busy host pays at most one `gh`
+/// call (a conditional read, usually a free `304`) per repo per hour for it
+/// regardless of tick rate, and any
 /// probe failure resolves to [`RepoVisibility::Private`].
 #[must_use]
 fn resolve_repo(root: &Path) -> (String, RepoVisibility) {
