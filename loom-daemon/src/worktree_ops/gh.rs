@@ -588,8 +588,22 @@ pub fn parse_open_linked_pr_timeline_trusted(stdout: &str, issue: u32, root: &Pa
 /// the wrong closes-graph — which, for orphan recovery, is a false
 /// `NoneOpen` that greenlights resetting a live claim (#5511). `None` on any
 /// failure, which callers must treat as a probe failure.
+///
+/// Answered from the repo-facts record (`gh repo view` semantics: `GH_REPO`
+/// ignored, post-redirect) when facts are on; the `gh repo view` call below
+/// when they are off or the root is pinned to legacy (W3a).
 #[must_use]
 pub fn resolve_owner_repo(repo_root: &Path) -> Option<(String, String)> {
+    match crate::forge_repo_facts::canonical(repo_root, crate::forge_repo_facts::GhRepoEnv::Ignore)
+    {
+        crate::forge_repo_facts::Lookup::Fact(f) => Some((f.owner, f.name)),
+        crate::forge_repo_facts::Lookup::Unavailable => None,
+        crate::forge_repo_facts::Lookup::Legacy => resolve_owner_repo_legacy(repo_root),
+    }
+}
+
+/// The pre-facts `gh repo view` resolve behind [`resolve_owner_repo`].
+fn resolve_owner_repo_legacy(repo_root: &Path) -> Option<(String, String)> {
     let out = run_read(
         "worktree.resolve_repo",
         repo_root,
@@ -651,48 +665,97 @@ pub fn resolve_owner_repo(repo_root: &Path) -> Option<(String, String)> {
 /// comment thread refused dispatch of `#N` for as long as that PR stayed open.
 #[must_use]
 pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
+    use crate::forge_repo_facts::{self as facts, GhRepoEnv, Lookup};
     // Repo resolution failure is a PROBE FAILURE, not a verified absence.
-    let Some((owner, repo)) = resolve_owner_repo(repo_root) else {
-        return OpenPrProbe::ProbeFailed;
+    let (owner, repo, fact) = match facts::canonical(repo_root, GhRepoEnv::Ignore) {
+        Lookup::Fact(f) => (f.owner.clone(), f.name.clone(), Some(f)),
+        Lookup::Unavailable => return OpenPrProbe::ProbeFailed,
+        Lookup::Legacy => match resolve_owner_repo_legacy(repo_root) {
+            Some((o, r)) => (o, r, None),
+            None => return OpenPrProbe::ProbeFailed,
+        },
     };
+    let gone = std::cell::Cell::new(false);
     let graphql = run_probe(
         "worktree.linked_pr_graphql",
         repo_root,
         open_linked_pr_args(&owner, &repo, issue),
         &|s| parse_open_linked_pr_trusted(s, repo_root),
+        &gone,
     );
-    if matches!(graphql, OpenPrProbe::Open(_)) {
-        return graphql;
+    let verdict = if matches!(graphql, OpenPrProbe::Open(_)) {
+        graphql
+    } else {
+        let timeline = run_probe(
+            "worktree.linked_pr_timeline",
+            repo_root,
+            open_linked_pr_timeline_args(&owner, &repo, issue),
+            &|s| parse_open_linked_pr_timeline_trusted(s, issue, repo_root),
+            &gone,
+        );
+        // A verified NoneOpen from leg 1 survives a leg-2 probe failure: leg 2
+        // is a superset *when it answers*, and an unanswered superset is no
+        // evidence.
+        if matches!(timeline, OpenPrProbe::ProbeFailed) {
+            graphql
+        } else {
+            timeline
+        }
+    };
+    let Some(fact) = fact else {
+        return verdict;
+    };
+    // W3a: a repo the forge could not resolve under the remembered name is
+    // suspect, and nothing computed from it is a verdict.
+    if gone.get() {
+        facts::invalidate(repo_root, "linked-PR probe could not resolve the repository");
+        return OpenPrProbe::ProbeFailed;
     }
-    let timeline = run_probe(
-        "worktree.linked_pr_timeline",
-        repo_root,
-        open_linked_pr_timeline_args(&owner, &repo, issue),
-        &|s| parse_open_linked_pr_timeline_trusted(s, issue, repo_root),
-    );
-    // A verified NoneOpen from leg 1 survives a leg-2 probe failure: leg 2 is a
-    // superset *when it answers*, and an unanswered superset is no evidence.
-    if matches!(timeline, OpenPrProbe::ProbeFailed) {
-        return graphql;
+    // A NoneOpen greenlights claim resets (orphan recovery, check-claim): it
+    // is a verdict only when the owner it was asked under is confirmed now.
+    if verdict == OpenPrProbe::NoneOpen
+        && !fact.fresh
+        && !facts::confirmed_in_pass(&fact)
+        && !facts::confirm_owner(repo_root, GhRepoEnv::Ignore, &fact.owner)
+    {
+        return OpenPrProbe::ProbeFailed;
     }
-    timeline
+    verdict
 }
 
 /// Run one `gh` transport for [`probe_open_linked_pr`] and classify it.
 ///
 /// A spawn error or non-zero exit (rate limit, auth failure, transient forge
-/// error) is a PROBE FAILURE, never a verified "no open PR".
+/// error) is a PROBE FAILURE, never a verified "no open PR". An answer saying
+/// the repository itself does not resolve sets `gone`.
 fn run_probe(
     op: &'static str,
     repo_root: &Path,
     args: Vec<String>,
     classify: &dyn Fn(&str) -> OpenPrProbe,
+    gone: &std::cell::Cell<bool>,
 ) -> OpenPrProbe {
     match run_read(op, repo_root, args) {
-        CmdOutcome::Ran(o) if o.status.success() => classify(&String::from_utf8_lossy(&o.stdout)),
-        _ => OpenPrProbe::ProbeFailed,
+        CmdOutcome::Ran(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            if stdout.contains(REPO_UNRESOLVED) {
+                gone.set(true);
+            }
+            classify(&stdout)
+        }
+        CmdOutcome::Ran(o) => {
+            let said = |b: &[u8]| String::from_utf8_lossy(b).contains(REPO_UNRESOLVED);
+            if said(&o.stdout) || said(&o.stderr) {
+                gone.set(true);
+            }
+            OpenPrProbe::ProbeFailed
+        }
+        CmdOutcome::Unavailable(_) => OpenPrProbe::ProbeFailed,
     }
 }
+
+/// GitHub's GraphQL error for a repository that does not resolve.
+const REPO_UNRESOLVED: &str = "Could not resolve to a Repository";
 
 /// #9548: both writers below resolve the repo from `repo_root`'s remotes;
 /// refuse unless this installation may write there.

@@ -72,6 +72,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::forge_listing::HttpResponse;
 
+#[path = "forge_call_stats_counters.rs"]
+pub mod counters;
 #[path = "forge_call_stats_ops.rs"]
 pub mod ops;
 use crate::types::{ForgeBudgetReading, ForgeCallCounts, ForgeCallsStatus, ForgeOperationCounts};

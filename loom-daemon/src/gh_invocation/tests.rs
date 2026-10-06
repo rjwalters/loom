@@ -114,6 +114,20 @@ fn env_plan_gh_repo_prefers_the_typed_target_over_loom_repo() {
     assert_eq!(env_of(&ambient, "GH_REPO"), Some(Some("other/repo".into())));
 }
 
+/// `strip_env` is applied after the `LOOM_REPO` mapping, so the child of a
+/// `gh repo view` cross-check never sees a `GH_REPO` (W3a).
+#[test]
+fn env_plan_strip_env_wins_over_the_loom_repo_mapping() {
+    let stripped = read_op(GhTarget::None)
+        .strip_env("GH_REPO")
+        .env_plan_with(Some("other/repo".into()), None);
+    let last = stripped.iter().rev().find(|e| e.key == "GH_REPO").unwrap();
+    assert_eq!(last.value, None, "the removal is applied last: {stripped:?}");
+    let set_at = stripped.iter().position(|e| e.key == "GH_REPO").unwrap();
+    let removed_at = stripped.iter().rposition(|e| e.key == "GH_REPO").unwrap();
+    assert!(set_at < removed_at);
+}
+
 #[test]
 fn env_plan_sets_path_only_under_child_path() {
     let inherited = read_op(GhTarget::None).env_plan_with(None, None);
