@@ -1887,6 +1887,8 @@ jobs:
         run: bash defaults/scripts/tests/test-merge-pr-defaults-version-bump-collision.sh
       - name: merge-pr merge-ordering guard (#3747 item 2 / #7982, #8191 slice)
         run: bash defaults/scripts/tests/test-merge-pr-merge-ordering-guard.sh
+      - name: merge-pr workflow token-scope preflight (#10539)
+        run: bash defaults/scripts/tests/test-merge-pr-workflow-scope-preflight.sh
       # Split out of test-loom-daemon-update.sh by #7977: these assertions
       # now drive `loom-daemon release-resolve` through the stub's delegation,
       # so they need the binary this job downloads. The parent suite stays in
