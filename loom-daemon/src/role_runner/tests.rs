@@ -4268,6 +4268,7 @@ fn tick_admitted(root: &Path) -> bool {
     decision.is_some()
 }
 
+mod archived_gate;
 mod concierge_gate;
 mod invoke;
 mod model_resolution;

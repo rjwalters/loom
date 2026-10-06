@@ -100,6 +100,13 @@ pub struct ClosingRef {
 /// What the batch gatherer needs from the forge. Production is
 /// [`GhStaleBlockedForge`]; tests use a counting fake.
 pub trait StaleBlockedForge {
+    /// Whether the repository is archived (#10562): one REST `repos/{slug}`
+    /// read through [`probe_archived`], the same probe the release pass uses.
+    ///
+    /// # Errors
+    /// The read failed, or the answer carried no `archived` flag.
+    fn archived(&mut self) -> Result<bool, String>;
+
     /// Every open item labelled `loom:blocked`, issues and PRs together.
     ///
     /// # Errors
@@ -170,6 +177,10 @@ pub struct Gathering {
     pub items: Vec<Gathered>,
     pub enumerate_error: Option<String>,
     pub cost: ForgeCost,
+    /// The archived-repository probe's answer (#10562): `Some(true)` means
+    /// nothing was listed or gathered; `None` when the probe was not run
+    /// ([`gather_all`]) or did not answer (then `enumerate_error` says so).
+    pub archived: Option<bool>,
 }
 
 /// One artifact while its evidence is being assembled.
@@ -188,6 +199,38 @@ struct Pending {
 
 /// A blocker reference: `(repo, number)`, `None` meaning the invoking repo.
 type RefKey = (Option<String>, i64);
+
+/// [`gather_all`] behind the archived-repository probe (#10562), for
+/// `check-stale-blocked`. An archived repository is read-only, so no role can
+/// act on its rows: it is reported `archived` with nothing listed or gathered.
+/// A probe that did not answer is an enumeration failure — unevaluated, never
+/// archived and never clean.
+pub fn gather_checked(
+    forge: &mut dyn StaleBlockedForge,
+    fleet: &FleetLogins,
+    opts: Options,
+) -> Gathering {
+    let (archived, enumerate_error) = match forge.archived() {
+        Ok(false) => {
+            return Gathering {
+                archived: Some(false),
+                ..gather_all(forge, fleet, opts)
+            }
+        }
+        Ok(true) => (Some(true), None),
+        Err(e) => (None, Some(format!("archived-repository probe failed: {e}"))),
+    };
+    Gathering {
+        items: Vec::new(),
+        enumerate_error,
+        cost: ForgeCost {
+            floor: opts.floor,
+            meter: forge.meter(),
+            ..ForgeCost::default()
+        },
+        archived,
+    }
+}
 
 /// Gather the evidence for every open `loom:blocked` artifact, within the
 /// budget floor ([`super::budget`]).
@@ -220,6 +263,7 @@ pub fn gather_filtered(
                 items: Vec::new(),
                 enumerate_error: Some(format!("loom:blocked listing failed: {e}")),
                 cost,
+                archived: None,
             }
         }
     };
@@ -262,6 +306,7 @@ pub fn gather_filtered(
                 items,
                 enumerate_error: None,
                 cost,
+                archived: None,
             };
         }
     }
@@ -286,6 +331,7 @@ pub fn gather_filtered(
         items,
         enumerate_error: None,
         cost,
+        archived: None,
     }
 }
 
@@ -646,6 +692,20 @@ impl GhStaleBlockedForge {
 }
 
 impl StaleBlockedForge for GhStaleBlockedForge {
+    fn archived(&mut self) -> Result<bool, String> {
+        let site = store::ConditionalRead::new(CALLER, ops::REPO_VIEW);
+        let (archived, read) = probe_archived(
+            site,
+            &self.gh_bin,
+            &self.root,
+            self.repo.as_deref(),
+            &self.slug,
+            "stale-",
+        )?;
+        self.meter.rest(read.not_modified, read.core_remaining);
+        Ok(archived)
+    }
+
     fn list_blocked(&mut self) -> Result<Vec<RestIssue>> {
         crate::forge_listing::list_issues_cached_all_as(
             CALLER,
@@ -756,6 +816,47 @@ impl StaleBlockedForge for GhStaleBlockedForge {
     fn meter(&self) -> Meter {
         self.meter
     }
+}
+
+/// The one archived-repository probe (#10556, #10562): `GET repos/{slug}`
+/// through the shared ETag store, so a warm re-run is a free `304`. Shared by
+/// `check-stale-blocked` ([`GhStaleBlockedForge`]), the release pass
+/// ([`super::release_gh::GhReleaseForge`]) and the role runner's archived-root
+/// gate; each passes its own call site and cache prefix. Returns the read too,
+/// for a caller that meters its spend.
+///
+/// # Errors
+/// The read failed (or answered `404`), or the answer is not a repository
+/// object carrying a boolean `archived`: a missing flag is never read as
+/// "not archived".
+pub(crate) fn probe_archived(
+    site: store::ConditionalRead,
+    gh_bin: &Path,
+    root: &Path,
+    repo: Option<&str>,
+    slug: &str,
+    prefix: &'static str,
+) -> Result<(bool, store::CachedRead), String> {
+    let url = format!("repos/{slug}");
+    let read = store::cached_read(site, gh_bin, Some(root), repo, &url, prefix)
+        .map_err(|e| e.to_string())?;
+    let body = read
+        .body
+        .as_deref()
+        .ok_or_else(|| format!("gh api {url}: HTTP 404"))?;
+    let archived = parse_archived(body).map_err(|e| format!("{url}: {e}"))?;
+    Ok((archived, read))
+}
+
+/// `GET repos/{slug}` → its `archived` flag.
+///
+/// # Errors
+/// The body is not JSON, or carries no boolean `archived`.
+pub fn parse_archived(body: &str) -> Result<bool, String> {
+    let v: serde_json::Value = serde_json::from_str(body.trim()).map_err(|e| e.to_string())?;
+    v.get("archived")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "no boolean `archived` in the repository answer".to_string())
 }
 
 /// `owner/name`, each part `[A-Za-z0-9._-]+` so it can sit in a GraphQL

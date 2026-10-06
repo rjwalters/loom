@@ -454,3 +454,6 @@ mod release_tests;
 
 #[cfg(test)]
 mod notify_tests;
+
+#[cfg(test)]
+mod archived_tests;
