@@ -39,7 +39,9 @@
 //!    only a block Curator could not name reaches the operator (#10151). With
 //!    `propagate` on (the default), a starred issue's children by every link
 //!    [`edges`] resolves inherit the same way (#10012), transitively to
-//!    [`collect::MAX_INHERIT_DEPTH`].
+//!    [`collect::MAX_INHERIT_DEPTH`], and the pass writes the inherited star
+//!    as the label, taking it back once the root loses its star
+//!    ([`materialize`]).
 //! 5. **Priority levels** ([`levels`], #10307). Every open issue that
 //!    blocks a level >= 2 issue (`loom:operator-high-priority`), directly or
 //!    transitively and across managed repos, carries the level's derived
@@ -93,6 +95,7 @@ pub mod inherited_star;
 pub mod intents;
 pub mod landing;
 pub mod levels;
+pub mod materialize;
 pub mod parent_link;
 pub mod progress;
 pub mod propagation_rules;

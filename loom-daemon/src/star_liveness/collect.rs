@@ -32,10 +32,12 @@ use anyhow::Result;
 
 use super::edges::{self, Edge, EdgeSource, Node, Root};
 use super::forge::StarForge;
+use super::inherited_star::RootState;
 use super::landing::{
     classify, BlockerRef, Capacity, ItemFacts, Landing, MergeRefusal, PrFacts, StarFacts,
     BLOCKED_LABEL,
 };
+use super::materialize::{self, Classified, OwnerCache, Plan};
 use super::progress::{fingerprint, short_hash};
 use super::refusal::{self, Detected};
 use super::stale::{self, CommentFacts};
@@ -90,6 +92,8 @@ pub struct RefusalCache {
     /// Children the read cap deferred, not yet evaluated, each with the edges
     /// from its starred root down to it.
     deferred: BTreeMap<(String, u32), Vec<Edge>>,
+    /// Who owns each starred issue's star (#10012 §3).
+    owners: OwnerCache,
 }
 
 /// Everything about the repo that is not a forge read.
@@ -203,6 +207,9 @@ pub struct Evaluator<'a> {
     reads: usize,
     /// While set, no read past this count reaches the forge (the walk).
     read_cap: Option<usize>,
+    /// The star writes this pass's walk calls for (#10012 §2–§3), made by
+    /// the caller ([`materialize::apply`]). Empty with `propagate` off.
+    pub plan: Plan,
 }
 
 impl<'a> Evaluator<'a> {
@@ -221,6 +228,7 @@ impl<'a> Evaluator<'a> {
             propagate: true,
             reads: 0,
             read_cap: None,
+            plan: Plan::default(),
         }
     }
 
@@ -512,6 +520,67 @@ impl<'a> Evaluator<'a> {
             .min()
     }
 
+    /// The state of `root`, the root an inherited star names: starred when it
+    /// is in this pass's starred listing or, closed, still carries an
+    /// operator label (labels are never cleaned on close, AC 5).
+    fn root_state(&mut self, root: u32, listed: &BTreeSet<u32>) -> RootState {
+        if listed.contains(&root) {
+            return RootState::Starred;
+        }
+        match self.issue(root) {
+            Some(i)
+                if crate::operator_levels::own_level_in(
+                    crate::operator_levels::table(),
+                    &i.labels,
+                ) >= 1 =>
+            {
+                RootState::Starred
+            }
+            Some(_) => RootState::Unstarred,
+            None => RootState::Unknown,
+        }
+    }
+
+    /// Whether `issue` names, in its own text, a parent that is still
+    /// starred (or unreadable): a child-side link the walk does not follow,
+    /// checked before an orphaned star is removed.
+    fn has_starred_parent(&mut self, issue: &RestIssue, listed: &BTreeSet<u32>) -> bool {
+        let node = Node {
+            number: issue.number,
+            title: issue.title.as_deref().unwrap_or_default(),
+            body: issue.body.as_deref().unwrap_or_default(),
+            labels: &issue.labels,
+            is_pull_request: issue.is_pull_request,
+        };
+        let parents: Vec<u32> = edges::parent_edges(self.ctx.slug, &node)
+            .into_iter()
+            .map(|e| e.parent)
+            .collect();
+        parents
+            .into_iter()
+            .any(|p| self.root_state(p, listed) != RootState::Unstarred)
+    }
+
+    /// Split the starred listing by owner (#10012 §3). With `propagate` off
+    /// every starred issue is a root, as before.
+    fn classify(&mut self, issues: &[RestIssue]) -> Classified {
+        let listed: BTreeSet<u32> = issues.iter().map(|i| i.number).collect();
+        if !self.propagate {
+            return Classified {
+                roots: listed,
+                ..Classified::default()
+            };
+        }
+        let known = materialize::owners(
+            self.forge,
+            &mut self.refusals.owners,
+            self.ctx.slug,
+            issues,
+            materialize::MAX_OWNER_READS_PER_PASS,
+        );
+        materialize::classify(&known, |root| self.root_state(root, &listed))
+    }
+
     /// One step of the walk onto `child`: skip it when it is known to
     /// inherit nothing, defer it when the cap is reached, else evaluate it.
     fn visit(&mut self, child: u32, cap: usize, now: u64) -> Visit {
@@ -625,12 +694,15 @@ impl<'a> Evaluator<'a> {
         // starred, and a level-2 issue need not also carry the star. The
         // star's own listing failing still fails the repo, as before.
         let mut by_number: BTreeMap<u32, RestIssue> = BTreeMap::new();
+        // A failed level listing may hide a root: nothing is unstarred then.
+        let mut listings_complete = true;
         for label in crate::operator_levels::operator_labels(crate::operator_levels::table()) {
             let rows = match self.forge.list_open(label) {
                 Ok(rows) => rows,
                 Err(e) if label == OPERATOR_PRIORITY_LABEL => return Err(e),
                 Err(e) => {
                     log::debug!("star_liveness: listing {label} in {} failed: {e}", self.ctx.slug);
+                    listings_complete = false;
                     Vec::new()
                 }
             };
@@ -673,9 +745,13 @@ impl<'a> Evaluator<'a> {
         for i in &issues {
             self.issues.insert(i.number, Some(i.clone()));
         }
+        // An inherited star is walked as a child of its root, not as a root
+        // of its own (#10012 §3).
+        let classified = self.classify(&issues);
 
         let mut out: Vec<Evaluated> = issues
             .iter()
+            .filter(|i| classified.roots.contains(&i.number))
             .map(|i| self.evaluate_one(i, None, None))
             .collect();
         let roots: Vec<Root> = out
@@ -691,7 +767,7 @@ impl<'a> Evaluator<'a> {
         // decides, per child, which starred ancestor it inherits from
         // (earliest starred-at). Every open child inherits, not only the
         // first one named (#10012).
-        let mut seen: BTreeSet<u32> = issues.iter().map(|i| i.number).collect();
+        let mut seen: BTreeSet<u32> = classified.roots.clone();
         let mut found: Vec<Evaluated> = Vec::new();
         let mut graph: Vec<Edge> = Vec::new();
         // Nodes to expand, by depth: a deferred child resumed below joins its
@@ -797,16 +873,70 @@ impl<'a> Evaluator<'a> {
             }
         }
         self.read_cap = None;
+        let walk_complete =
+            listings_complete && !self.refusals.deferred.keys().any(|(s, _)| *s == slug);
         let open: BTreeSet<u32> = found.iter().map(|e| e.facts.issue.number).collect();
         graph.retain(|e| open.contains(&e.child));
         let inherited = edges::descendants(&roots, &graph, MAX_INHERIT_DEPTH);
+        // Only a parent/child link the issue text records materializes as
+        // the label (#10012 §1). A landing-only edge (a blocker named in a
+        // comment, a merge refusal's incident, the red-main fix) is a
+        // transient liveness fact: it orders the work in memory but never
+        // writes a lasting star.
+        let structural: Vec<Edge> = graph
+            .iter()
+            .filter(|e| e.source != EdgeSource::LandingBlocker)
+            .copied()
+            .collect();
+        let materialized = edges::descendants(&roots, &structural, MAX_INHERIT_DEPTH);
+        let mut unreached: BTreeMap<u32, Evaluated> = BTreeMap::new();
         for mut e in found {
-            let Some(inh) = inherited.get(&e.facts.issue.number) else {
+            let n = e.facts.issue.number;
+            let Some(inh) = inherited.get(&n) else {
+                unreached.insert(n, e);
                 continue;
             };
+            if let Some(m) = materialized.get(&n).filter(|_| {
+                self.propagate
+                    && !e
+                        .facts
+                        .issue
+                        .labels
+                        .iter()
+                        .any(|l| l == OPERATOR_PRIORITY_LABEL)
+            }) {
+                self.plan.adds.push(materialize::Add {
+                    child: n,
+                    root: m.root,
+                    starred_at: m.starred_at.clone(),
+                });
+            }
             e.inherited_from = Some(inh.via);
             e.starred_at = inh.starred_at.clone().or(e.starred_at);
             super::landing::withhold_inherited_handoff(&e.facts, &mut e.landing, inh.via, inh.root);
+            out.push(e);
+        }
+        self.plan.adds.sort_by_key(|a| a.child);
+        // An inherited star nothing reaches: removed when its root lost its
+        // star and the walk saw everything, else kept as a starred row.
+        let listed: BTreeSet<u32> = issues.iter().map(|i| i.number).collect();
+        for i in &issues {
+            let n = i.number;
+            if classified.roots.contains(&n) || inherited.contains_key(&n) {
+                continue;
+            }
+            if let Some(&root) = classified.orphaned.get(&n) {
+                if walk_complete && !self.has_starred_parent(i, &listed) {
+                    self.plan
+                        .removes
+                        .push(materialize::Remove { child: n, root });
+                    continue;
+                }
+            }
+            let e = match unreached.remove(&n) {
+                Some(e) => e,
+                None => self.evaluate_one(i, None, None),
+            };
             out.push(e);
         }
         Ok(out)
