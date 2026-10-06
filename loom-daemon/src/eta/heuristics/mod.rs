@@ -21,6 +21,7 @@
 //! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
+mod land_bold_lark;
 mod land_calm_plover;
 mod land_dependency;
 mod land_held_heron;
@@ -37,6 +38,7 @@ mod little_v0;
 mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
+pub use land_bold_lark::{LandBoldLark, LAND_BOLD_LARK};
 pub use land_calm_plover::{LandCalmPlover, LAND_CALM_PLOVER};
 pub use land_dependency::{DependencyComposition, LAND_TANDEM_WREN};
 pub use land_held_heron::{
@@ -69,9 +71,10 @@ pub const CALIBRATION_BASE: &str = LAND_V2;
 /// Every heuristic whose landed and still-open `land` estimates are kept as
 /// calibration evidence ([`crate::eta::calibration_log`]): [`CALIBRATION_BASE`]
 /// for `land-2026-10-06-calm-plover`, and [`LAND_TWIN_OTTER_B`] for
-/// `land-2026-10-06-quick-tern` and `land-2026-10-06-swift-tern` (#10524). Each calibrator filters the rows
+/// `land-2026-10-06-quick-tern` and `land-2026-10-06-swift-tern` (#10524), and
+/// [`LAND_KEEN_WREN`] for `land-2026-10-06-bold-lark` (#10524). Each calibrator filters the rows
 /// on its own base, so they never mix.
-pub const CALIBRATION_BASES: &[&str] = &[CALIBRATION_BASE, LAND_TWIN_OTTER_B];
+pub const CALIBRATION_BASES: &[&str] = &[CALIBRATION_BASE, LAND_TWIN_OTTER_B, LAND_KEEN_WREN];
 
 use super::explanation::{
     Branches, ChangesRequested, Combination, Conditioning, CurrentStageRecord, DispatchRecord,

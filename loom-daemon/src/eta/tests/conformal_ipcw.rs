@@ -7,7 +7,8 @@ use super::{as_of, history_a, input_at};
 use crate::eta::conformal::{apply, Calibration};
 use crate::eta::conformal_ipcw::{self, HALF_LIFE_SEC, METHOD};
 use crate::eta::heuristics::{
-    LandQuickTern, LandV2, CALIBRATION_BASES, LAND_QUICK_TERN, LAND_TWIN_OTTER_B, LAND_V2,
+    LandBoldLark, LandQuickTern, LandV2, CALIBRATION_BASES, LAND_BOLD_LARK, LAND_KEEN_WREN,
+    LAND_QUICK_TERN, LAND_TWIN_OTTER_B, LAND_V2,
 };
 use crate::eta::recalibrate::{CalibrationObservation, OBSERVATION_SCHEMA};
 use crate::eta::simulate::run_explanation;
@@ -403,4 +404,104 @@ fn an_unidentified_tail_is_moved_conservatively_never_down() {
     let (b, o) = (base.quantiles_with_p90().unwrap(), out.quantiles_with_p90().unwrap());
     assert!(o.0 >= b.0 && o.1 >= b.1 && o.2 >= b.2 && o.3 >= b.3, "{o:?} vs {b:?}");
     assert_eq!(run_explanation(&out), out.quantiles_with_p90());
+}
+
+/// `fixture` rows re-attributed to `heuristic`.
+fn rows_of(heuristic: &str, rows: Vec<CalibrationObservation>) -> Vec<CalibrationObservation> {
+    rows.into_iter()
+        .map(|mut o| {
+            o.heuristic = heuristic.to_string();
+            o
+        })
+        .collect()
+}
+
+/// #10524 slice 4: the wrapper over keen-wren is registered, wraps keen-wren's
+/// answer under its own id, and only ever reads keen-wren's logged rows.
+#[test]
+fn bold_lark_wraps_keen_wren_and_reads_only_its_rows() {
+    let registry = Registry::builtin();
+    assert!(registry
+        .for_kind(Kind::Land)
+        .any(|h| h.id() == LAND_BOLD_LARK));
+    assert!(CALIBRATION_BASES.contains(&LAND_KEEN_WREN));
+    let heuristic = registry.get(LAND_BOLD_LARK).unwrap();
+    assert!(heuristic.models_hold(), "as keen-wren");
+
+    // Pre-PR stage: keen-wren answers from the dispatch-plan path.
+    let input = input_at(Stage::SweepBuilder, 0, 0);
+    let mut history = super::ready::history_ready();
+    history.calibration.clear();
+    let bare = heuristic.estimate(&input, &history);
+    assert_eq!(bare.heuristic, LAND_BOLD_LARK);
+    let base_q = bare.quantiles_with_p90().expect("keen-wren answers pre-PR");
+    assert!(bare.calibration.is_none(), "no evidence, no record");
+
+    let slow = |heuristic: &str| -> Vec<CalibrationObservation> {
+        rows_of(
+            heuristic,
+            rows_between(1.0, -2 * DAY, 0, 300)
+                .into_iter()
+                .map(|mut o| {
+                    o.stage = Stage::SweepBuilder;
+                    let slow = (o.actual_at.unwrap() - o.as_of) * 3;
+                    o.actual_at = Some(o.as_of + slow);
+                    o.resolved_at = o.actual_at;
+                    o
+                })
+                .collect(),
+        )
+    };
+
+    // Another base's rows are not evidence.
+    history.calibration = slow(LAND_TWIN_OTTER_B);
+    assert!(heuristic.estimate(&input, &history).calibration.is_none());
+
+    history.calibration = slow(LAND_KEEN_WREN);
+    let e = heuristic.estimate(&input, &history);
+    let record = e.calibration.as_ref().expect("calibrated");
+    assert_eq!(record.method, METHOD);
+    assert_eq!(record.base, LAND_KEEN_WREN);
+    assert_eq!(record.ipcw.as_ref().unwrap().censoring, conformal_ipcw::CENSORING_MODEL);
+    let q = e.quantiles_with_p90().unwrap();
+    assert!(q.1 > base_q.1 && q.2 > base_q.2, "{q:?} vs {base_q:?}");
+    assert_eq!(run_explanation(&e), e.quantiles_with_p90());
+}
+
+/// The leak test, through bold-lark: outcomes known at or after `as_of`, and
+/// estimates made at or after it, cannot enter the calibration set.
+#[test]
+fn bold_lark_leak_post_as_of_outcomes_cannot_enter_the_calibration_set() {
+    let mut rows = rows_of(LAND_KEEN_WREN, fixture(1.0, 600));
+    rows.retain(|o| o.as_of < at(0));
+    // A pre-PR stage: keen-wren answers without an `eta-fit/v2` file, and
+    // the review_wait evidence is pooled.
+    let input = input_at(Stage::SweepBuilder, 0, 0);
+    let mut history = super::ready::history_ready();
+    history.calibration = rows.clone();
+    let a = LandBoldLark::default().estimate(&input, &history);
+    assert!(a.calibration.is_some(), "the leak test exercises calibration");
+    // Post-as_of estimates with extreme outcomes, and a pre-as_of estimate
+    // whose landing is only known afterwards.
+    history.calibration.extend(rows_of(
+        LAND_KEEN_WREN,
+        (0..60)
+            .map(|i| obs(&format!("g{i}"), Stage::ReviewWait, i * 60 + 1, Some(10 * DAY)))
+            .collect(),
+    ));
+    let mut late = obs("late", Stage::ReviewWait, -HOUR, Some(600));
+    late.heuristic = LAND_KEEN_WREN.to_string();
+    late.resolved_at = Some(at(500));
+    let mut late_b = late.clone();
+    late_b.actual_at = Some(at(-60));
+    let mut with_a = history.clone();
+    with_a.calibration.push(late);
+    let mut with_b = history.clone();
+    with_b.calibration.push(late_b);
+    assert_eq!(
+        bytes(&LandBoldLark::default().estimate(&input, &with_a)),
+        bytes(&LandBoldLark::default().estimate(&input, &with_b)),
+    );
+    let b = LandBoldLark::default().estimate(&input, &history);
+    assert_eq!(bytes(&a), bytes(&b));
 }
