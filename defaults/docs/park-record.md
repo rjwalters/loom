@@ -65,7 +65,7 @@ reference) — the one-line-per-blocker rule binds the *writer*, not the parser.
 ## Who writes one, and when — `park-record apply` (#10152)
 
 **Cross-repo blockers (#10443).** A blocker in another repository is written
-`OWNER/REPO#N` (`Blocked by: 2AMLogic/2am#1088`). `--blocked-by` accepts `N`,
+`OWNER/REPO#N` (`Blocked by: example-org/tool-repo#202`). `--blocked-by` accepts `N`,
 `#N` (this repo) and `OWNER/REPO#N`, mixed and comma-separated; still one record
 per blocker. A qualified reference is **never** resolved against the local repo:
 `check-stale-blocked` reads its state in its own repo, `apply` refuses a closed
