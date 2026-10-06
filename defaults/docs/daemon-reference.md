@@ -2578,9 +2578,10 @@ never-propagate list. The table is the rule set only. The pass that writes
 these labels is not built yet.
 
 **loom-ui stars.** The `/ingest` ack may carry `operator_priority_intents`
-(`defaults/docs/telemetry-schema.md`). The pass applies each valid one (the one
-label, a managed repo, a `requested_by`) idempotently with one audit comment;
-the intent's `requested_at` is the starred-at.
+(`defaults/docs/telemetry-schema.md`). The pass applies each valid one (an
+operator label of any level — the star or `loom:operator-high-priority`, #10307
+— on a managed repo, with a `requested_by`) idempotently with one audit comment
+whose marker names the `label=`; the intent's `requested_at` is the starred-at.
 
 Config (`.loom/config.json → autonomous.operatorPriority`, **env > config >
 default**):
@@ -2588,10 +2589,26 @@ default**):
 | Key | Env | Default | Meaning |
 |---|---|---|---|
 | `noProgressMinutes` | `LOOM_OPERATOR_PRIORITY_NO_PROGRESS_MINUTES` | `30` | watchdog window |
-| `escalate` | `LOOM_OPERATOR_PRIORITY_ESCALATE` | `true` | post escalations and apply loom-ui intents; `false` still computes and shows every landing state |
+| `escalate` | `LOOM_OPERATOR_PRIORITY_ESCALATE` | `true` | post escalations, apply loom-ui intents, and write the derived level labels and their body markers (#10307); `false` still computes and shows every landing state, and the work finder still sees inherited levels in memory |
 | `intervalSecs` | `LOOM_OPERATOR_PRIORITY_INTERVAL_SECS` | `120` | pass interval |
 | `poolsExhaustedGraceMinutes` | `LOOM_OPERATOR_PRIORITY_POOLS_GRACE_MINUTES` | `10` | wait before a `pools-exhausted` ask; `0` asks at once |
 | `propagate` | `LOOM_OPERATOR_PRIORITY_PROPAGATE` | `true` | a star also reaches its children by park record, task list and dependency phrase; `false` keeps only the blocker / incident / red-main inheritance |
+| `levelCaps` | — | `{"2": 5}` (the level table) | per-level cap on open issues carrying the level's operator label; over the cap is flagged in the digest, never refused |
+
+**Priority levels (#10307).** Every pass also walks each level ≥ 2 issue's
+(`loom:operator-high-priority`) blockers, transitively and into every managed
+repo, and writes `loom:high-priority-inherited` on each open one. Provenance
+goes into the blocker's **issue body** first, as
+`<!-- loom:priority-inherited inherited_from=owner/repo#N level=2 requested_at=… id=… -->`
+(what loom-ui reads; one marker per level, replaced in place when the source
+changes, nothing else in the body touched). The label is skipped when that
+write fails, so the next pass retries both. The work finder orders the blocker
+at the marker's `requested_at`. The label and marker come off once no level-2
+issue reaches the blocker, after a complete walk only (a failed listing, issue
+read or native-dependency read adds and never removes), and only on a host
+that manages the marker's source repo. Containment (task lists, sub-issues) never carries a
+level. A blocker in an unmanaged repo is listed, not followed; an
+operator-only / operator-decision blocker leads the digest.
 
 ### Ready queue view (`loom-daemon queue`, #8852)
 

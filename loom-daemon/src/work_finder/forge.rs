@@ -123,6 +123,21 @@ impl WorkSource for GhWorkSource {
             inner: &mut timeline,
         };
         operator_priority::resolve_starred_at(&key, &mut items, &mut source);
+        // #10307: a blocker inheriting a level orders at its source's
+        // starred-at, which its body provenance marker carries (the listing
+        // already returned the body).
+        let table = crate::operator_levels::table();
+        for item in &mut items {
+            let item_key = (self.repo.clone().unwrap_or_default(), item.number);
+            if let Some(at) = crate::star_liveness::levels::inherited_requested_at(
+                table,
+                &item_key,
+                &item.labels,
+                item.body.as_deref(),
+            ) {
+                item.operator_priority_at = Some(at);
+            }
+        }
         crate::star_liveness::inherit::apply(self.cwd.as_deref(), &mut items);
         Ok(items)
     }
