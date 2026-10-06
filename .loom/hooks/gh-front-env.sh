@@ -29,6 +29,6 @@ LOOM_SCRIPT_HELPER_MISSING_RC=0
 BIN="$(loom_daemon_self_bin_override || loom_locate_daemon_bin "${LOOM_PROJECT_ROOT:-${CLAUDE_PROJECT_DIR:-$PWD}}")" 2>/dev/null
 [[ -n "$BIN" && -x "$BIN" ]] || exit 0
 
-# requires-daemon: gh-shim >= 0.19.770   #10516 — `gh-shim session-env`; below this floor the preflight explains on stderr and exits 0, so the session keeps its PATH. (One-version window: a build of exactly this VERSION from the parent commit prints gh-shim usage and exits 2, which SessionStart reports to the user without blocking.)
+# requires-daemon: gh-shim >= 0.19.772   #10516 — `gh-shim session-env`; below this floor the preflight explains on stderr and exits 0, so the session keeps its PATH. (One-version window: a build of exactly this VERSION from the parent commit prints gh-shim usage and exits 2, which SessionStart reports to the user without blocking.)
 loom_daemon_version_preflight gh-shim "$BIN"
 exec "$BIN" gh-shim session-env 1>&2
