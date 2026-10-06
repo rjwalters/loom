@@ -37,6 +37,7 @@ mod ready;
 mod recalibrate;
 mod recency;
 mod score;
+mod serve_parity;
 mod shadow;
 mod shadow_fleet;
 mod shadow_gate;

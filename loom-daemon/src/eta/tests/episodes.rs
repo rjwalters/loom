@@ -425,8 +425,10 @@ fn a_snapshot_carries_episodes_and_merge_hold_samples_but_no_merge_hold_fleet_sa
 fn a_pre_episode_snapshot_file_still_parses_and_keeps_its_id() {
     let mut snapshot = snapshot_at(t(10_000));
     snapshot.episodes.clear();
-    // #10245's flag timeline is cleared too: a pre-#10218 file had neither.
+    // #10245's flag timeline and #10500's merges are cleared too: a
+    // pre-#10218 file had none of them.
     snapshot.flag_changes.clear();
+    snapshot.merges.clear();
     // Re-seal without episodes: the id is the pre-#10218 formula over the
     // samples alone.
     snapshot.merge(&[], snapshot.as_of);

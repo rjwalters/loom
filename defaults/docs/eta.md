@@ -643,10 +643,19 @@ order of snapshots, episodes or flag changes.
   `FitStage::from_stage`, which serving also uses.
 - **Queue features** come from the one shared `queue_features` call:
   - The roster is every PR open in an episode, known at entry + 120 s.
-  - The log has one event per episode end, known at end + 120 s. A merge is
-    one `merge` event, never an exit plus a merge. Every other end is an
-    `exit` of the episode's stage, so `merge_wait → merge_hold` counts as a
-    `merge_wait` exit.
+  - The log is `eta::fleet_log::SnapshotLog`, which serving reads too
+    (#10500). It has one event per episode end, known at end + 120 s. A
+    merge is one `merge` event, never an exit plus a merge. Every other end
+    is an `exit` of the episode's stage, so `merge_wait → merge_hold` counts
+    as a `merge_wait` exit.
+  - **Every forge merge counts** (#10500), not only the merges of PRs that
+    carried a loom review label. The snapshot's `merges` list records each
+    merged PR the refresh read, labelled or not. A merge with no episode
+    ending in it is a stage-less `merge` event: it moves `merges_*` and
+    `since_merge_h`, not `exits_*`. A snapshot written before #10500 has no
+    `merges`, and `DERIVATION_REV` 2 makes the daemon backfill it again. A
+    fit published before that backfill counted labelled merges only, so its
+    coefficients are on the old definition until the next `eta fit`.
 - **`age_h`** is measured within the current (split) episode.
 - **`rework`** counts the PR's entries into `doctor` (Judge rejections)
   knowable at `t`, including the current one.
@@ -741,15 +750,18 @@ it:
   (it refuses `no_model`), so a replay cannot see a later fit.
 
 **Serving `land-2026-10-04-twin-otter`.** The adapter maps the estimate's
-input onto the model's (train and serve share each definition):
+input onto the model's. Train and serve share each definition, and serving
+reads the same fleet snapshots training does (#10500), so a PR's served
+vector at a row instant equals its training row bit for bit
+(`eta/tests/serve_parity.rs`):
 
 | model input | from |
 |---|---|
 | `stage` | `review_wait`, `doctor` → `doctor_wait`, `merge_wait`, `merge_hold`; every pre-PR stage refuses `unknown_stage` (the `-b` composition answers them from `land-v2`'s path) |
-| `age_h` | whole seconds in the current stage episode (since `episode_entered_at`, the release after a hold; else `entered_at`; else `age_sec`) |
-| `ahead`, `n_stage_repo`, `n_stage_fleet`, `exits_repo_6h`, `exits_repo_24h`, `exits_fleet_6h`, `merges_repo_24h`, `merges_fleet_6h` | the same-named queue features; `null` is imputed at the training mean and named in `twin_otter.imputed` |
+| `age_h` | whole seconds in the current stage episode (since `episode_entered_at`, the release after a hold; else `entered_at`; else `age_sec`). A PR first seen mid-stage is dated from the snapshots' episode open at `as_of − 120 s`, as training dates its row; only a PR no snapshot can date keeps the `updated_at` lower bound |
+| `ahead`, `n_stage_repo`, `n_stage_fleet`, `exits_repo_6h`, `exits_repo_24h`, `exits_fleet_6h`, `merges_repo_24h`, `merges_fleet_6h` | the same-named queue features, over the roster dated as above and training's event log (below); `null` is imputed at the training mean and named in `twin_otter.imputed` |
 | `since_merge_h` | `since_merge_sec / 3600` |
-| `rework` | `doctor_cycles_so_far` (Judge rejections so far), else the resolver's count; at least 1 in `doctor` |
+| `rework` | the larger of the tracker's `doctor_cycles_so_far` (else the resolver's count; at least 1 in `doctor`) and training's count: the snapshots' `doctor` episodes entered before `as_of − 120 s` |
 | the six flags | `eta::labels::pr_flags(labels)`: bit 0 `op_hold` (`loom:operator`, `loom:operator-only`, `loom:operator-decision`), 1 `sequenced`, 2 `starred` (`loom:operator-priority`), 3 `conflict` (`loom:merge-conflict`), 4 `ci_fail` (`loom:ci-failure`), 5 `blocked` |
 
 The Monte Carlo seed is `seed_for_visit("<repo_key>#<issue>", stage,
@@ -791,8 +803,10 @@ released PR, as in training. This view keeps the item's own emit signature
 (never `merge_hold`), so cadence, caps, pooled samples and outcomes are
 unchanged, and the explanation records the features it used, so a replay
 reads what the model read. Limits: the release instant is the tracker's
-observation of it (at most one listing interval late); an untracked PR keeps
-the `updated_at` lower bound; an unavailable or stale fleet view stays
+observation of it (at most one listing interval late); an untracked PR is
+dated from the fleet snapshots' episodes (#10500), and keeps the
+`updated_at` lower bound only when no snapshot can date it; an unavailable
+or stale fleet view stays
 omitted and imputed; and a later release never rewrites an earlier
 observation. The six path-engine heuristics keep the described input, so
 their `features` are byte-identical to before.
@@ -1108,21 +1122,31 @@ passes (a bus event) reuses the last pass's view. The journal's
 `observed_at` is never used as `known_at`: a `pr.resolved` row's
 `observed_at` is the merge instant, even when the read that found it came
 passes later. Training sets `known_at` to the event time plus 2 min
-(#10221): the function is the same, only the source of `known_at` differs.
+(#10221), and so does serving for an event it takes from the fleet
+snapshots (#10500): the function is the same, only the source of a journal
+event's `known_at` differs.
 
 **Serve-side sources, and their limits.**
 
 - **Roster:** every PR in the pass's review listings, including PRs that
   close no issue. Its `entered_at` is the tracker's own stage entry when the
-  tracker follows the PR in that stage, otherwise the listing's
-  `updated_at`, a lower bound. So `ahead` is approximate for first-seen PRs
-  until exact entry times come from the label stream (#10218).
-- **Events:** the ETA stage journal. A row with a `stage` and a `left_at` is
-  a departure (PR stages only). A `pr.resolved` row that is not a close,
-  and a `sweep.phase` `merge` row, are merges. The journal holds only PRs
-  this host tracks, which are the PRs that close an issue. The history's
-  start, for the 168 h rule, is the journal's oldest row; daemon downtime
-  inside that span is not visible.
+  tracker follows the PR in that stage. Otherwise it is the entry of the
+  PR's episode in that stage in the fleet snapshots, open at `as_of − 120 s`
+  (#10500, training's definition). Only a PR no snapshot can date (not yet
+  read, or re-entered the stage since the snapshot) falls back to the
+  listing's `updated_at`, a lower bound.
+- **Events** (#10500): the fleet snapshots' log, the very
+  `eta::fleet_log::SnapshotLog` training counts over (every forge merge
+  included), for every event before the snapshots' horizon
+  `H = min(as_of − 120 s, oldest snapshot as_of)` in a repo a snapshot
+  covers. After `H`, and in a repo no snapshot covers, events come from the
+  ETA stage journal: a row with a `stage` and a `left_at` is a departure (PR
+  stages only); a `pr.resolved` row that is not a close, and a `sweep.phase`
+  `merge` row, are merges. The journal holds only PRs this host tracks (the
+  PRs that close an issue), so an unlabelled merge after `H` is missing
+  until the next snapshot refresh moves `H`. The history's start, for the
+  168 h rule, is the snapshots' (as training's), else the journal's oldest
+  row.
 
 ### Item facts: issue, sweep, verdicts (#10231)
 

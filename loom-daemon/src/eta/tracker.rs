@@ -787,18 +787,9 @@ impl Tracker {
                 continue;
             };
             if is_new || item.stage.is_none() && item.verdict_pending_since.is_none() {
-                // First sight mid-stage: entry is at most `updated_at` ago.
-                let entered_at = pr.updated_at.unwrap_or(now).min(now);
-                if stage == Stage::Doctor {
-                    item.rework_rounds = item.rework_rounds.max(1);
-                }
-                item.stage = Some(StageTrack {
-                    stage,
-                    entered_at,
-                    source: AgeSource::UpdatedAtLowerBound,
-                    exact: false,
-                });
-                let item = item.clone();
+                // First sight mid-stage: dated from the label timeline, else
+                // at most `updated_at` ago (#10500, `tracker_timeline.rs`).
+                let item = self.first_sight(&key, pr, stage, now);
                 let mut row = self.row("label.first_seen", &item, now);
                 row.next_stage = Some(stage);
                 row.raw = serde_json::json!({"labels": pr.labels, "updated_at": pr.updated_at});
@@ -1245,7 +1236,10 @@ impl Tracker {
         };
         let mut out = Vec::new();
         for key in targets {
-            let Some(item) = self.items.get(&key).cloned() else {
+            // #10500: the item as the model reads it, reconciled against the
+            // label timeline (`tracker_timeline.rs`); the tracked item itself
+            // keeps its own observations.
+            let Some(item) = self.items.get(&key).map(|i| self.model_view(i, now)) else {
                 continue;
             };
             for kind in [Kind::Start, Kind::Finish, Kind::Land] {
@@ -1333,6 +1327,9 @@ pub use features::{events_from_journal, ListedPr, NOT_LISTED_YET};
 
 #[path = "tracker_hold.rs"]
 mod hold;
+
+#[path = "tracker_timeline.rs"]
+mod timeline;
 
 pub use ready::{
     ReadyPlan, ReadyRow, READY_FIRST_SEEN, READY_PLAN_MAX_AGE_SECS, SLOT_TURNOVER_REPO,
