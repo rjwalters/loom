@@ -7388,8 +7388,8 @@ layers:
 1. **The base repo**, resolved locally the way gh resolves it (`GH_REPO` >
    `gh repo set-default` > `upstream` > `github` > `origin`, the same port
    write scoping uses). Each site keeps its own `GH_REPO` rule: placeholder
-   (`gh api`) sites honour `LOOM_REPO`/`GH_REPO`, `gh repo view` sites ignore
-   it. The answer is memoised until any git config file that defines it
+   (`gh api`) sites honour `LOOM_REPO`/`GH_REPO`, `gh repo view` sites and
+   the hygiene read path (below) ignore it. The answer is memoised until any git config file that defines it
    changes. The fingerprint is `(dev, inode, length, mtime)` of every file
    `git config --list --show-origin` read (system, global, includes),
    `<common-dir>/config` and `<git-dir>/config.worktree` (presence counts),
@@ -7517,12 +7517,13 @@ rate-limit signature, so it never trips the breaker. A shed books an
 `intake_reconcile` reports a shed listing as a skipped pass, not a failure.
 Classified sites:
 Hygiene — `worktree.issue_state`, `worktree.has_open_pr`, `clean.pr_list`,
-`clean.pr_by_number_rest`, `clean.pr_status_rest`, `worktree.landed_pulls`,
-`intake.list_open`; Observability — `stage_dwell`'s `api.rest`,
-`telemetry.repo_identity`. `worktree.issue_state_rest`,
-`worktree.issue_closed_at` and `visibility.repo` are conditional reads
-through the shared ETag store (#10512) and route as `Gate` — not shed, but
-mostly free `304`s. Nothing under `sweep_registry/`,
+`clean.pr_status_rest`, `worktree.landed_pulls`, `intake.list_open`, and
+`clean.pr_by_number_rest` / `worktree.issue_state_rest` /
+`worktree.issue_closed_at` on a root without a repo fact; Observability —
+`stage_dwell`'s `api.rest`, `telemetry.repo_identity`. `visibility.repo`, and
+the single-item hygiene reads on a root with a repo fact, are conditional
+reads through the shared ETag store (#10512, W6) and route as `Gate` — not
+shed, but mostly free `304`s. Nothing under `sweep_registry/`,
 `claim_reconciliation`, `merge_*`, verdict, quarantine or reclaim, nor
 `forge_check_claim`, `cli/lease_co_occupancy`, `role_runner/roster`,
 `worktree_reaper` or `primary_checkout_reaper`, is ever anything but `Gate`
@@ -7546,6 +7547,64 @@ A `Gate` read always confirms on the writer, and the reader is not withdrawn.
 | `LOOM_FACADE_CWD_ROUTING` | on | `0` disables the derivation: every untargeted read stays on the writer. Typed reads keep the class-aware chain, so a typed `Observability` read (`telemetry.repo_identity`) can still be shed. Read on every call. |
 | `LOOM_READ_SHED` | on | `0` treats every read as `Gate`: no shed and no gone-memo shortcut, so `Hygiene`/`Observability` reads fall back to the writer. Derivation stays on. Read on every call. |
 | `LOOM_READ_ROUTING` | `v2` | `legacy` is the only exact revert: the pre-W4 path (no derivation, no classes, no reserve, the unconditional reader → writer fallback), and it reverts W4-A's scoped withdrawal and W4-B's split and spill with it. `LOOM_FACADE_CWD_ROUTING=0` plus `LOOM_READ_SHED=0` together restore W4-C's load placement only (untargeted reads on the writer, nothing shed), keeping W4-A/W4-B, the retry on the next reader and the writer pins. Read on every call. |
+
+### Hygiene read path: the checkout's own repo, conditional and fresh (`LOOM_HYGIENE_CONDITIONAL`)
+
+The REST issue and PR reads behind the worktree reaper, eager reclaim,
+`clean` (sweep transients, stale branches, the `pr-<N>` probe),
+`--aggressive`, `checkpoint read` and the primary-checkout reaper go through
+one module, `loom-daemon/src/worktree_ops/forge_state.rs`. Not every hygiene
+read does yet: the GraphQL-backed probes `gh::issue_state` (`gh issue view`,
+in `clean`'s worktree pass and stale-branch cleanup), `check_pr_merged`, and
+the `check_pr_status_for_branch` fallback (`clean` and the primary-checkout
+reaper, when REST is unknown or no owner resolves) still name gh's own
+target and are not conditional.
+
+- **The checkout's own repo.** Reads name gh's base repo for the root,
+  resolved and verified by the repo facts above with `GH_REPO`/`LOOM_REPO`
+  ignored, by its canonical (post-rename) name. A process that exported
+  `LOOM_REPO` for another repo never reads that repo's issue `N` for this
+  checkout. A root the facts cannot model keeps gh's `{owner}/{repo}`
+  placeholder, unconditional, with `GH_REPO` stripped from the child. A fact
+  that cannot be established now is "unknown" (keep). The `head=` owner for
+  PR listings follows the same rule.
+- **Conditional and fresh.** `issues/{n}` (state and `closed_at` in one
+  read) and `pulls/{n}` (status and `head.sha`) are conditional `GET`s on the
+  agents' shared `view-` entry, so an unchanged item is a free `304` and
+  `gh-cached --invalidate N` drops the entry after a write. Nothing is
+  remembered beyond the `ETag` and its body: every read reaches the forge,
+  and a `304` is server-fresh (ADR-0021). Branch listings
+  (`pulls?head=`) stay unconditional, because `--invalidate` does not drop
+  them.
+- **Identity.** An answer must be the item asked for: its `number`, and its
+  repository by `base.repo.id` (when the record knows the id) or by name. A
+  mismatch — a transferred item, a followed redirect — is "unknown" and
+  bumps `hygiene.identity_mismatch`. Only a first-hand `200` for the
+  asked-for number that names the repo under a new name (same id, or no id
+  to compare) marks the repo record suspect, as of the request-sent time, so
+  a renamed repo re-resolves on the next read; a `304` body, another number
+  (a transferred issue) or another repo id never does.
+- **Rate-limit breaker.** While the global breaker is cooling, an item read
+  makes no forge call (not even the repo resolve) and is "unknown"; a failed
+  item read's stderr is reported to the breaker, so a rate-limit refusal
+  trips it. The branch listings and the owner read keep their pre-W6
+  behaviour: they never consulted the breaker.
+- **Failure.** A shed, timeout, non-200/304, parse failure or mismatch is
+  "unknown"; a `404`/`410` is "gone" (`hygiene.item_gone`). Both are KEEP —
+  never "closed" or "no PR".
+- **Item-scoped `404`.** A reader `404` on `issues/{n}` or `pulls/{n}` is the
+  item's answer (no writer retry, no withdrawal, `forge.item_scoped_404`)
+  only when the same reader answered a `200`/`304` for the same repo and the
+  same endpoint family (`issues` vs `pulls`) within the last hour. Otherwise
+  it is a coverage failure, retried on the writer as before.
+- **Trust boundary.** A `304` serves the body stored next to the `ETag` in
+  the `0700` per-user store. Any process of the same uid (agents included)
+  can write it; that is accepted, as the same uid can already edit the
+  worktrees and the daemon's state. Other users are refused.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOOM_HYGIENE_CONDITIONAL` | on | `0` makes the single-item reads on a root with a repo fact unconditional: no `If-None-Match` sent, the `view-` entry neither read nor written. Everything else stays: the explicit target, the identity check, reader routing and the breaker. It is not a revert of W6 — no switch restores the pre-W6 `LOOM_REPO` > `origin` target. `LOOM_REPO_FACTS=0` sends every item read down the placeholder path (`{owner}/{repo}`, `GH_REPO` stripped, unconditional). |
 
 ### Merged-PR worktree reaper (#4876)
 

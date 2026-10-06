@@ -38,7 +38,7 @@
 
 use std::path::Path;
 
-use super::{clean, gh, naming};
+use super::{clean, naming};
 use crate::worktree_cli::branch_landed::{
     self, Answer, Caps, Evidence, ForgeProbe, ForgeStatus, Verdict,
 };
@@ -205,7 +205,7 @@ struct RestRepo {
     full_name: Option<String>,
 }
 
-/// `repos/{owner}/{repo}/pulls?state=all&head=<owner>:<branch>` — same query
+/// `repos/<repo>/pulls?state=all&head=<owner>:<branch>` — same query
 /// as [`clean::check_pr_status_for_branch_rest`], but carrying the merged
 /// PR's head SHA the tip-match rung needs. `None` = REST could not answer.
 ///
@@ -219,12 +219,17 @@ fn merged_head_rest(
     owner: &crate::forge_repo_facts::OwnerFact,
     branch: &str,
 ) -> Option<ForgeProbe> {
-    let path = format!(
-        "repos/{{owner}}/{{repo}}/pulls?state=all&head={}:{branch}&per_page=30",
-        owner.owner
-    );
+    // W6: the fact's canonical repo by name (never `GH_REPO`/`LOOM_REPO`).
+    let path = super::forge_state::pulls_by_head_path(owner.fact.as_ref(), &owner.owner, branch);
     let sent_at = chrono::Utc::now().timestamp();
-    let out = gh::bounded_hygiene("worktree.landed_pulls", repo_root, ["api", &path])?;
+    let out = super::forge_state::hygiene_get(
+        "worktree.landed_pulls",
+        None,
+        repo_root,
+        &path,
+        owner.fact.as_ref(),
+        crate::gh_invocation::ReadClass::Hygiene,
+    )?;
     if !out.status.success() {
         return None;
     }
