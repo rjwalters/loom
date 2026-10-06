@@ -162,14 +162,18 @@ impl NotifyClearedBlockersArgs {
             let reasons = match classify(&evidence) {
                 Verdict::Stale(reasons) => reasons,
                 Verdict::Superseded { cleared, .. } => cleared,
+                // Unticked (#9274): every checklist ref resolved but a box is
+                // still unticked. Not stale (an unticked box is unmet until a
+                // human confirms it), yet "tick the box or drop the block" is
+                // exactly the human signal this advisory exists to send.
+                Verdict::Unticked {
+                    resolved_refs,
+                    unparsed,
+                } => vec![unticked_reason(&resolved_refs, unparsed)],
                 // StillBlocked: the forge does not (yet) read the cited number
-                // as resolved. Undocumented cannot follow a citation. Unticked:
-                // the refs resolved but a `## Dependencies` box is still
-                // unticked, which is unmet until a human confirms it (#9274).
-                // None is a cleared block worth a comment.
-                Verdict::Undocumented | Verdict::StillBlocked | Verdict::Unticked { .. } => {
-                    continue
-                }
+                // as resolved. Undocumented cannot follow a citation. Neither is
+                // a cleared block worth a comment.
+                Verdict::Undocumented | Verdict::StillBlocked => continue,
             };
             let posted =
                 !self.dry_run && post_comment(g.kind, g.number, &cited, &reasons, repo, &root);
@@ -226,6 +230,21 @@ fn parse_close_targets(stdout: &[u8]) -> Result<Vec<i64>, String> {
     serde_json::from_slice::<View>(stdout)
         .map(|v| v.refs.into_iter().map(|r| r.number).collect())
         .map_err(|e| format!("unreadable closingIssuesReferences JSON: {e}"))
+}
+
+/// The reason line for a [`Verdict::Unticked`] citer (#9274). Pure, so the
+/// wording is unit-tested.
+fn unticked_reason(resolved_refs: &[String], unparsed: usize) -> String {
+    let mut r = "the cited `## Dependencies` ref closed, but its checklist box is still unticked"
+        .to_string();
+    if !resolved_refs.is_empty() {
+        r.push_str(&format!(": {}", resolved_refs.join(", ")));
+    }
+    if unparsed > 0 {
+        r.push_str(&format!(" (plus {unparsed} unchecked line(s) with no readable ref)"));
+    }
+    r.push_str(". Tick the box once its whole condition is confirmed, or drop the block");
+    r
 }
 
 /// The notification comment. Pure, so the wording is unit-tested.

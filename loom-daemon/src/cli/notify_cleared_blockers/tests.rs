@@ -93,3 +93,14 @@ fn notify_never_reads_the_forge_per_artifact() {
         assert!(!src.contains(banned), "notify_cleared_blockers.rs must not use `{banned}`");
     }
 }
+
+/// #9274: an Unticked citer is notified, and the reason names the unticked box.
+#[test]
+fn unticked_reason_names_the_ref_and_the_unticked_box() {
+    let r = unticked_reason(&["#200".to_string()], 0);
+    assert!(r.contains("#200"), "{r}");
+    assert!(r.contains("checklist box is still unticked"), "{r}");
+    assert!(!r.contains("no readable ref"), "{r}");
+    let r = unticked_reason(&[], 2);
+    assert!(r.contains("2 unchecked line(s) with no readable ref"), "{r}");
+}
