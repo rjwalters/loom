@@ -144,7 +144,9 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     ("role_runner/roster.rs", "patch_roster_comment", ""),
     // `check-stale-blocked` (#10480): a read-only advisory that reports and
     // never acts, reading blocker prose and a parked issue's own closing refs —
-    // the same reads `dep_recheck/forge.rs` makes, not a control read.
+    // the same reads `dep_recheck/forge.rs` makes, not a control read. Also
+    // `notify-cleared-blockers` (#10515), which acts only by posting an
+    // advisory comment and never edits a label.
     ("stale_blocked/batch.rs", "comments", ""),
     ("stale_blocked/batch.rs", "closing_refs_query", ""),
     ("stale_blocked/batch.rs", "parse_closing_refs", ""),
