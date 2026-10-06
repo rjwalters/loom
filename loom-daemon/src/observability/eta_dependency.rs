@@ -72,12 +72,15 @@ pub fn native_blockers(page: &Value) -> Option<Vec<(NodeKey, Option<DateTime<Utc
     })
 }
 
-/// The same-repo park-record parents an issue body declares.
+/// The same-repo park-record parents an issue body declares. A blocker
+/// qualified with another repository (#10443) is not a same-repo edge and
+/// is skipped.
 #[must_use]
 pub fn park_blockers(slug: &str, body: &str) -> Vec<NodeKey> {
     let mut out: Vec<NodeKey> = crate::park_record::parse(body)
         .into_iter()
-        .filter_map(|r| u32::try_from(r.blocker?).ok())
+        .filter_map(|r| r.blocker.filter(|b| b.is_local(Some(slug))))
+        .filter_map(|b| u32::try_from(b.number).ok())
         .map(|n| NodeKey::new(slug, n))
         .collect();
     out.sort();
@@ -277,6 +280,10 @@ mod tests {
             ]
         );
         assert!(park_blockers("o/r", "no record").is_empty());
+        // A qualified blocker (#10443) counts only when it names this repo.
+        let qualified = "<!-- loom:park Blocked by: Other/Repo#5 -->\n\
+                         <!-- loom:park Blocked by: owner/repo#6 -->";
+        assert_eq!(park_blockers("Owner/Repo", qualified), vec![NodeKey::new("owner/repo", 6)]);
     }
 
     #[test]
