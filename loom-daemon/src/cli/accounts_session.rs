@@ -100,6 +100,18 @@ pub(crate) fn handle_session_command(
         ProcessContainerRunner, SessionLifecycle, SessionStatus,
     };
 
+    /// The other registered workspaces: an operator start lifts an operator
+    /// hold in each one's profile for the account, and status reads them
+    /// (issue #10453).
+    fn peer_roots(workspace: &std::path::Path) -> Vec<PathBuf> {
+        loom_daemon::workspace_registry::WorkspaceRegistry::load_default()
+            .map(|registry| registry.roots())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|root| root != workspace)
+            .collect()
+    }
+
     fn print_session_status(status: &SessionStatus, json: bool) -> Result<()> {
         if json {
             println!("{}", serde_json::to_string_pretty(status)?);
@@ -173,7 +185,9 @@ pub(crate) fn handle_session_command(
             if private::configured(&workspace, &name)? {
                 anyhow::bail!("account uses private-clone mode; repeat start --private-clone URL --base BRANCH; host-mount reuse is refused");
             }
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image);
+            let peers = peer_roots(&workspace);
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image)
+                .with_peer_roots(peers);
             print_session_status(
                 &lifecycle.start_with_workspace(&name, workspace_arg.as_deref())?,
                 json,
@@ -190,21 +204,27 @@ pub(crate) fn handle_session_command(
             if private::configured(&workspace, &name)? {
                 return print_private(&private::stop(&workspace, &name, force)?, json);
             }
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
+            let peers = peer_roots(&workspace);
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
+                .with_peer_roots(peers);
             print_session_status(&lifecycle.stop(&name, force)?, json)
         }
         SessionAction::Status { name, json } => {
             if private::configured(&workspace, &name)? {
                 return print_private(&private::status(&workspace, &name)?, json);
             }
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
+            let peers = peer_roots(&workspace);
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
+                .with_peer_roots(peers);
             print_session_status(&lifecycle.status(&name)?, json)
         }
         SessionAction::Attach { name } => {
             if private::configured(&workspace, &name)? {
                 anyhow::bail!("private sessions do not permit unleased tmux attach; use session job --kind interactive --owner NAME -- COMMAND (TTY input is unsupported)");
             }
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
+            let peers = peer_roots(&workspace);
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
+                .with_peer_roots(peers);
             let code = lifecycle.attach(&name)?;
             if code != 0 {
                 std::process::exit(code);
@@ -219,7 +239,9 @@ pub(crate) fn handle_session_command(
             if private::configured(&workspace, &name)? {
                 anyhow::bail!("private sessions do not permit unleased shell; use session job --kind interactive --owner NAME -- COMMAND (TTY input is unsupported)");
             }
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None);
+            let peers = peer_roots(&workspace);
+            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
+                .with_peer_roots(peers);
             let code = lifecycle.shell(&name, workspace_arg.as_deref(), &args)?;
             if code != 0 {
                 std::process::exit(code);

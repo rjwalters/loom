@@ -10,6 +10,7 @@ use serial_test::serial;
 use super::*;
 use crate::tokens_pool::account_lifecycle::{AccountLifecycle, ProcessCodexRunner};
 use crate::tokens_pool::account_registry::account_inventory;
+use crate::tokens_pool::docker_cli::DockerTimedOut;
 use crate::tokens_pool::profile_root_env::ProfileRootEnv;
 use crate::tokens_pool::session_hold;
 use crate::tokens_pool::session_lifecycle::{mark_session_managed, parse_inspect_line, ExecOutput};
@@ -32,6 +33,12 @@ struct Fake {
     /// `accounts session stop`: write the hold into this profile, then
     /// `docker stop` the container (still present, not yet `rm`ed).
     stop_on_inspect: Mutex<Option<(usize, PathBuf)>>,
+    /// The next `stop_and_remove` loses the stop/reconcile race once: a
+    /// reconcile `docker start` lands between its `docker stop` and `docker
+    /// rm`, so `rm` fails on a running container.
+    start_races_stop: Mutex<bool>,
+    /// `docker start` hits its deadline (wedged engine).
+    start_times_out: Mutex<bool>,
 }
 
 impl Fake {
@@ -108,6 +115,13 @@ impl ContainerRunner for Fake {
     }
     fn start_existing(&self, container: &str) -> Result<()> {
         self.log("start_existing");
+        if *self.start_times_out.lock().unwrap() {
+            return Err(DockerTimedOut {
+                subcommand: "start".into(),
+                secs: 60,
+            }
+            .into());
+        }
         let dies = *self.dies_after_start.lock().unwrap();
         let mut containers = self.containers.lock().unwrap();
         let state = containers
@@ -123,7 +137,18 @@ impl ContainerRunner for Fake {
     }
     fn stop_and_remove(&self, container: &str, _grace: Duration) -> Result<()> {
         self.log("stop_and_remove");
-        self.containers.lock().unwrap().remove(container);
+        let mut containers = self.containers.lock().unwrap();
+        if std::mem::take(&mut *self.start_races_stop.lock().unwrap()) {
+            if let Some(state) = containers.get_mut(container) {
+                state.running = true;
+                state.restarting = false;
+            }
+            bail!(
+                "docker rm {container} failed: You cannot remove a running container. Stop \
+                 the container before attempting removal or force remove"
+            );
+        }
+        containers.remove(container);
         Ok(())
     }
     fn attach_interactive(&self, _container: &str, _tmux: &str) -> Result<i32> {
@@ -761,4 +786,112 @@ fn the_after_start_probe_ignores_a_recent_cached_probe() {
         .unwrap();
     assert!(fresh[0].effect.is_some(), "{fresh:?}");
     assert_eq!(lifecycle.runner().count("exec_capture"), 1);
+}
+
+// ---- round 2 (verdict r2) ---------------------------------------------------
+
+#[test]
+#[serial]
+fn a_clock_step_back_between_start_and_stop_does_not_drop_the_hold() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    lifecycle
+        .start_with_workspace("alice", Some(Path::new("/w")))
+        .unwrap();
+    // The recorded start is 5 s in the future relative to the stop's clock.
+    let dir = profile(&env, "alice");
+    let mut start = session_hold::read_last_start(&dir).unwrap();
+    start.started_at_unix_ms = session_hold::now_unix_ms() + 5_000;
+    std::fs::write(dir.join(session_hold::LAST_START_FILE), serde_json::to_vec(&start).unwrap())
+        .unwrap();
+    assert!(lifecycle.stop("alice", false).unwrap().held);
+    let mut state = ReconcileState::default();
+    assert_eq!(pass(&mut lifecycle, &env, &host, &mut state, 0), vec![Outcome::Held]);
+    assert_eq!(lifecycle.runner().creates.lock().unwrap().len(), 1, "no recreate");
+    assert!(lifecycle.status("alice").unwrap().held);
+}
+
+#[test]
+#[serial]
+fn stop_wins_the_race_with_a_reconcile_start_between_its_stop_and_rm() {
+    let env = setup(&["alice"], &["alice"]);
+    let lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    let container = container_name("alice");
+    // Dead container, so `docker stop` is instant and the race window open.
+    lifecycle
+        .runner()
+        .seed(&container, false, false, Some(Path::new("/w")));
+    *lifecycle.runner().start_races_stop.lock().unwrap() = true;
+    let status = lifecycle.stop("alice", false).unwrap();
+    assert!(status.held && !status.running && status.container_id.is_none());
+    assert!(lifecycle.runner().containers.lock().unwrap().is_empty());
+    assert_eq!(lifecycle.runner().count("stop_and_remove"), 2);
+    // ...and the retry still honours an in-flight exec without --force.
+    lifecycle
+        .runner()
+        .seed(&container, false, false, Some(Path::new("/w")));
+    *lifecycle.runner().start_races_stop.lock().unwrap() = true;
+    lifecycle
+        .runner()
+        .busy
+        .lock()
+        .unwrap()
+        .insert(container.clone(), true);
+    let error = lifecycle.stop("alice", false).unwrap_err().to_string();
+    assert!(error.contains("in-flight"), "{error}");
+    assert!(lifecycle.status("alice").unwrap().held, "the hold stays; nothing restarts it");
+    lifecycle.stop("alice", true).unwrap();
+    assert!(lifecycle.runner().containers.lock().unwrap().is_empty());
+}
+
+#[test]
+#[serial]
+fn a_timed_out_docker_start_ends_the_pass_like_an_unavailable_docker() {
+    let env = setup(&["alice", "bob"], &["alice", "bob"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    for name in ["alice", "bob"] {
+        lifecycle
+            .runner()
+            .seed(&container_name(name), false, false, Some(Path::new("/w")));
+    }
+    *lifecycle.runner().start_times_out.lock().unwrap() = true;
+    let mut state = ReconcileState::default();
+    let first = pass(&mut lifecycle, &env, &host, &mut state, 0);
+    assert!(
+        matches!(first[..], [Outcome::DockerUnavailable { retry_at: 120, .. }]),
+        "{first:?}"
+    );
+    assert_eq!(lifecycle.runner().count("start_existing"), 1, "one budget per pass");
+    let second = pass(&mut lifecycle, &env, &host, &mut state, 60);
+    assert!(second
+        .iter()
+        .all(|o| matches!(o, Outcome::BackingOff { .. })));
+    // No per-account failure was counted: once Docker answers, both resume.
+    *lifecycle.runner().start_times_out.lock().unwrap() = false;
+    assert_eq!(
+        pass(&mut lifecycle, &env, &host, &mut state, 120),
+        vec![Outcome::Resumed, Outcome::Resumed]
+    );
+}
+
+#[test]
+#[serial]
+fn an_operator_start_is_never_left_running_and_held() {
+    let env = setup(&["alice"], &["alice"]);
+    let lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    let dir = profile(&env, "alice");
+    lifecycle.stop("alice", false).unwrap();
+    // The hold cannot be lifted: the start fails before touching Docker, so
+    // the session stays down and held.
+    std::fs::remove_file(dir.join(session_hold::HOLD_FILE)).unwrap();
+    std::fs::create_dir_all(dir.join(session_hold::HOLD_FILE).join("x")).unwrap();
+    assert!(lifecycle.start("alice").is_err());
+    assert_eq!(lifecycle.runner().count("create"), 0);
+    assert!(lifecycle.status("alice").unwrap().held);
+    std::fs::remove_dir_all(dir.join(session_hold::HOLD_FILE)).unwrap();
+    // The start record cannot be written: the start still succeeds, running
+    // and unheld (a warning, not an error).
+    std::fs::create_dir_all(dir.join(session_hold::LAST_START_FILE).join("x")).unwrap();
+    let status = lifecycle.start("alice").unwrap();
+    assert!(status.running && !status.held, "{status:?}");
 }

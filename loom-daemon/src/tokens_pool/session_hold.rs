@@ -7,23 +7,38 @@
 //!
 //! * [`HOLD_FILE`] (`.session-hold.json`) — present means **held**:
 //!   `{"schema_version":1,"reason":"operator stop","held_at_unix_ms":<ms>}`.
-//!   Written by `SessionLifecycle::stop` *before* `docker stop`, removed by
-//!   an operator `start`/`start_with_workspace`/`shell`. The session reconcile
-//!   pass never writes or removes it; it only reads it, before any `docker`
-//!   call and again right before it would mutate a container.
+//!   Written by `SessionLifecycle::stop` *before* `docker stop`. Only an
+//!   operator `start`/`start_with_workspace`/`shell` removes it — by
+//!   **deleting** it, before that start touches Docker ([`lift_holds`]). The
+//!   session reconcile pass never writes or removes it; it only reads it,
+//!   before any `docker` call and again right before it would mutate a
+//!   container.
 //! * [`LAST_START_FILE`] (`.session-last-start.json`) —
 //!   `{"schema_version":1,"workspace":"<abs path>","image":"<ref>","started_at_unix_ms":<ms>}`,
 //!   written by an operator start once the container is up, so a container
 //!   that disappears across a daemon restart is recreated against the
 //!   `--mount-workspace` the operator chose rather than a guessed parent.
 //!
+//! **A hold is never out-dated, only deleted.** Whether an account is held
+//! is the existence of a hold file — no timestamp comparison — so a wall
+//! clock stepping back between a start and a stop (NTP step, VM resume)
+//! cannot make a fresh hold read as older than the start it follows. The
+//! timestamps are informational; [`write_hold`] still stamps
+//! `max(now, last start + 1)` so the record reads in order.
+//!
 //! Profile directories normally sit under one host-wide profile root, so a
 //! sidecar is per **account**, not per registered root. When two roots do
-//! resolve the same account name to different directories, the reader takes
-//! every directory into account ([`held_across`], [`latest_start`]): the
-//! account is held iff the newest hold is not older than the newest operator
-//! start anywhere. A hold file that exists but cannot be parsed counts as
-//! held (a deliberate stop fails safe: down).
+//! resolve the same account name to different directories, a hold in any of
+//! them holds the account ([`held_across`]), and an operator start deletes
+//! the hold in every one it can see (its own root and the registered peers,
+//! [`account_profiles`]). A hold file that exists but cannot be parsed —
+//! including an empty one left by a crash mid-write — counts as held (a
+//! deliberate stop fails safe: down).
+//!
+//! The stop/reconcile race (a pass whose hold check ran just before `stop`
+//! wrote the hold, so its `docker start` lands between `stop`'s `docker
+//! stop` and `docker rm`) is closed in `SessionLifecycle::stop`, which
+//! retries the stop+rm once when `rm` finds the container running again.
 
 use std::path::{Path, PathBuf};
 
@@ -81,19 +96,39 @@ fn write_json_atomic<T: Serialize>(dir: &Path, file: &str, value: &T) -> Result<
     std::fs::rename(&temp, &path).with_context(|| format!("failed to commit {}", path.display()))
 }
 
-/// Record an operator hold in `profile` (atomic replace).
+/// Record an operator hold in `profile` (atomic replace), stamped
+/// `max(at_ms, that directory's last start + 1)`.
 pub fn write_hold(profile: &Path, at_ms: u64) -> Result<()> {
+    let floor = read_last_start(profile).map_or(0, |s| s.started_at_unix_ms.saturating_add(1));
     let hold = Hold {
         schema_version: 1,
         reason: HOLD_REASON_OPERATOR_STOP.into(),
-        held_at_unix_ms: at_ms,
+        held_at_unix_ms: at_ms.max(floor),
     };
     write_json_atomic(profile, HOLD_FILE, &hold)
 }
 
-/// Lift the hold in `profile` and record what the operator started, in that
-/// order of visibility: the start record lands first, so a reader never sees
-/// "no hold, no newer start" for an account another root still holds.
+/// Delete the hold in every one of `profiles` — the operator-start half of
+/// the hold contract, done **before** the start touches Docker so a failure
+/// here leaves the container exactly as it was (down and held), never
+/// running-but-held.
+pub fn lift_holds(profiles: &[PathBuf]) -> Result<()> {
+    for profile in profiles {
+        let path = profile.join(HOLD_FILE);
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| {
+                    format!("failed to lift the session hold {}", path.display())
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Record what an operator start brought up. Informational for recreation:
+/// callers treat a failure as a warning, never as a failed start.
 pub fn record_operator_start(
     profile: &Path,
     workspace: &Path,
@@ -106,28 +141,7 @@ pub fn record_operator_start(
         image: image.to_string(),
         started_at_unix_ms: at_ms,
     };
-    write_json_atomic(profile, LAST_START_FILE, &start)?;
-    match std::fs::remove_file(profile.join(HOLD_FILE)) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            Err(e).context("failed to lift the session hold")
-        }
-        _ => Ok(()),
-    }
-}
-
-/// The hold's timestamp in `profile`: `None` when there is no hold file,
-/// `u64::MAX` when one exists but cannot be read (fail safe: held).
-fn hold_at(profile: &Path) -> Option<u64> {
-    let path = profile.join(HOLD_FILE);
-    if !path.exists() {
-        return None;
-    }
-    Some(
-        std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Hold>(&b).ok())
-            .map_or(u64::MAX, |h| h.held_at_unix_ms),
-    )
+    write_json_atomic(profile, LAST_START_FILE, &start)
 }
 
 #[must_use]
@@ -145,15 +159,31 @@ pub fn latest_start(profiles: &[PathBuf]) -> Option<LastStart> {
         .max_by_key(|s| s.started_at_unix_ms)
 }
 
-/// Whether the account whose profile directories are `profiles` is held:
-/// the newest hold is at least as new as the newest operator start.
+/// Whether the account whose profile directories are `profiles` is held: a
+/// hold file (readable or not) exists in any of them.
 #[must_use]
 pub fn held_across(profiles: &[PathBuf]) -> bool {
-    let Some(hold) = profiles.iter().filter_map(|p| hold_at(p)).max() else {
-        return false;
-    };
-    let start = latest_start(profiles).map_or(0, |s| s.started_at_unix_ms);
-    hold >= start
+    profiles.iter().any(|p| p.join(HOLD_FILE).exists())
+}
+
+/// `own` plus the profile directory `name` resolves to in each of
+/// `peer_roots` (other registered workspaces), deduplicated. A root whose
+/// inventory cannot be read contributes nothing.
+#[must_use]
+pub fn account_profiles(own: &Path, peer_roots: &[PathBuf], name: &str) -> Vec<PathBuf> {
+    use super::account_registry::{account_inventory_quiet, AccountProvider};
+    let mut profiles = vec![own.to_path_buf()];
+    for root in peer_roots {
+        let Ok(inventory) = account_inventory_quiet(root, AccountProvider::Codex) else {
+            continue;
+        };
+        for account in inventory.into_iter().filter(|a| a.id.name == name) {
+            if !profiles.contains(&account.credential_reference) {
+                profiles.push(account.credential_reference);
+            }
+        }
+    }
+    profiles
 }
 
 #[cfg(test)]
