@@ -42,6 +42,7 @@
 
 #[cfg(test)]
 pub mod capture;
+pub mod codex_session;
 pub mod dispatch;
 pub mod disposition;
 pub mod dwell;

@@ -407,6 +407,10 @@ fn daemon_write_paths_are_scoped() {
             "claim_reconciliation/merge_sequence_sticky.rs",
             Via(PASS, "merge-sequence sticky operator-release record"),
         ),
+        (
+            "claim_reconciliation/merge_sequence_landing.rs",
+            Via(PASS, "merge-sequence landing-order comment upsert (#10634)"),
+        ),
         ("claim_reconciliation/pass_loop/building_heal.rs", Via(PASS, "heal pass")),
         (
             "forge_disable_auto_merge.rs",
@@ -454,6 +458,7 @@ fn daemon_write_paths_are_scoped() {
             "script_helpers/validate_phase.rs",
             Via(DISPATCH, "runs inside a dispatched sweep"),
         ),
+        ("forge_rerun.rs", Gated),
         ("merge_pr/redate.rs", ShellVetted("merge-pr.sh")),
         ("merge_pr/redate/sync_handoff.rs", ShellVetted("merge-pr.sh")),
         (

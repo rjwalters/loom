@@ -75,6 +75,9 @@ pub const CI_WORKFLOW_RUNS_FOR_SHA: ForgeOp = ForgeOp::inventoried("ci.workflow-
 pub const CI_RUN_LOGS_AND_ARTIFACTS: ForgeOp = ForgeOp::inventoried("ci.run-logs-and-artifacts");
 /// `GET orgs/{o}/repos` / `GET users/{u}/repos`.
 pub const REPO_LIST_FOR_OWNER: ForgeOp = ForgeOp::inventoried("repo.list-for-owner");
+/// `GET installation/repositories` — every repo a credential's App
+/// installation reaches (the W8 per-credential snapshot).
+pub const REPO_LIST_FOR_INSTALLATION: ForgeOp = ForgeOp::inventoried("repo.list-for-installation");
 /// Git-database / contents reads of the fleet store.
 pub const GIT_READ_OBJECTS: ForgeOp = ForgeOp::inventoried("git.read-objects");
 /// Git-database / contents / ref writes of the fleet store.
@@ -101,6 +104,9 @@ pub const PR_DIFF_AND_FILES: ForgeOp = ForgeOp::inventoried("pr.diff-and-files")
 /// Resolve a release and download its artifact (`gh release view|download`).
 pub const RELEASE_RESOLVE_AND_FETCH: ForgeOp = ForgeOp::inventoried("release.resolve-and-fetch");
 
+/// Re-run a workflow run or job in place (`forge rerun`, #10633).
+pub const CI_RERUN: ForgeOp = ForgeOp::inventoried("ci.rerun");
+
 /// Every inventoried constant above — the set the inventory test checks.
 pub const ALL_INVENTORIED: &[ForgeOp] = &[
     ISSUE_LIST,
@@ -115,7 +121,9 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     CI_CHECK_RUNS_FOR_SHA,
     CI_WORKFLOW_RUNS_FOR_SHA,
     CI_RUN_LOGS_AND_ARTIFACTS,
+    CI_RERUN,
     REPO_LIST_FOR_OWNER,
+    REPO_LIST_FOR_INSTALLATION,
     GIT_READ_OBJECTS,
     GIT_WRITE_REFS_AND_CONTENTS,
     TIMELINE_READ,

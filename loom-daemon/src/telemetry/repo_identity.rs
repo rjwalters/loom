@@ -119,10 +119,30 @@ fn warn_once(key: &str) {
     }
 }
 
+/// The identity of `owner_repo` from the forge.
+///
+/// The installation snapshot answers first (W8): a repo it lists needs no
+/// call. Anything else — a user credential, a repo it does not list, a
+/// snapshot that cannot be had right now — keeps the per-repo read, which has
+/// no disclosure stake here (an identity is never a visibility).
+fn fetch_via_gh(owner_repo: &str) -> Option<RepoIdentity> {
+    let snapshot = crate::forge_repo_facts::installation::lookup_repo(owner_repo.trim());
+    from_snapshot(&snapshot).or_else(|| fetch_per_repo(owner_repo))
+}
+
+/// The identity a snapshot answer carries, if it lists the repo.
+fn from_snapshot(answer: &crate::forge_repo_facts::installation::Answer) -> Option<RepoIdentity> {
+    use crate::forge_repo_facts::installation::Answer;
+    match answer {
+        Answer::Listed(Some(e)) => parse(&format!("{} {}", e.id, e.full_name)),
+        _ => None,
+    }
+}
+
 /// One `gh api repos/{owner}/{repo}` read through the facade, counted as
 /// `telemetry.repo_identity` (#10089). The typed target keys the cross-owner
 /// `GH_CONFIG_DIR` lookup (#5401); a malformed slug is no identity.
-fn fetch_via_gh(owner_repo: &str) -> Option<RepoIdentity> {
+fn fetch_per_repo(owner_repo: &str) -> Option<RepoIdentity> {
     use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     let target = GhTarget::repo(owner_repo).ok()?;
     let path = format!("repos/{owner_repo}");
@@ -192,6 +212,33 @@ mod tests {
         assert_eq!(resolve_with("owner-a/cached", fetch).unwrap().id, 7);
         assert_eq!(resolve_with(" OWNER-A/Cached ", fetch).unwrap().full_name, "Owner-A/Cached");
         assert_eq!(calls.get(), 1);
+    }
+
+    /// W8: a repo the installation snapshot lists needs no per-repo read;
+    /// every other answer leaves the per-repo read to run.
+    #[test]
+    fn the_snapshot_supplies_id_and_full_name() {
+        use crate::forge_repo_facts::installation::{Answer, RepoEntry};
+        let listed = Answer::Listed(Some(RepoEntry {
+            id: 42,
+            full_name: "Owner-C/Listed".into(),
+            private: true,
+        }));
+        assert_eq!(
+            from_snapshot(&listed),
+            Some(RepoIdentity {
+                id: 42,
+                full_name: "Owner-C/Listed".into()
+            })
+        );
+        for other in [
+            Answer::Listed(None),
+            Answer::Unavailable,
+            Answer::PerRepo,
+            Answer::Disabled,
+        ] {
+            assert_eq!(from_snapshot(&other), None, "{other:?}");
+        }
     }
 
     #[test]

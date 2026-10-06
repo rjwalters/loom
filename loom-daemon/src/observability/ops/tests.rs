@@ -281,6 +281,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::EtaHealthSnapshotRows,
         MetricName::EtaHealthSnapshotAlternatesRows,
         MetricName::EtaHealthPendingOverCap,
+        MetricName::CodexSessionState,
         MetricName::CaptainGaugeAgeSeconds,
         MetricName::CaptainGaugeFallback,
     ] {
@@ -344,6 +345,46 @@ fn tick_result_precedence() {
     assert_eq!(with(|r| r.errors = 1), "error");
     assert_eq!(with(|r| r.deferred_ramp_cap = 2), "capacity_full");
     assert_eq!(with(|r| r.skipped_backoff = 3), "all_skipped");
+}
+
+/// #10624: the build back-off result keys on an actual deferral, ranks after
+/// `error`, and a repo that is merely held does not mask the tick's outcome.
+#[test]
+fn build_backoff_result_needs_a_deferral_and_yields_to_error() {
+    let held = |f: fn(&mut TickReport)| {
+        let mut report = TickReport {
+            seen: 3,
+            build_backoff_held: true,
+            ..TickReport::default()
+        };
+        f(&mut report);
+        tick_result(&report)
+    };
+    assert_eq!(held(|r| r.deferred_build_backoff = 2), "build_backoff_held");
+    assert_eq!(
+        held(|r| {
+            r.deferred_build_backoff = 2;
+            r.deferred_capacity = 1;
+        }),
+        "build_backoff_held"
+    );
+    // Another repo's dispatch failed: `error` is not masked.
+    assert_eq!(
+        held(|r| {
+            r.deferred_build_backoff = 2;
+            r.errors = 1;
+        }),
+        "error"
+    );
+    // One held repo with no candidates, another repo capacity-full.
+    assert_eq!(held(|r| r.deferred_capacity = 3), "capacity_full");
+    // Held, nothing deferred, nothing else: per-issue skips, not a hold.
+    assert_eq!(held(|r| r.skipped_backoff = 3), "all_skipped");
+    let idle = TickReport {
+        build_backoff_held: true,
+        ..TickReport::default()
+    };
+    assert_eq!(tick_result(&idle), "no_eligible_work");
 }
 
 #[test]

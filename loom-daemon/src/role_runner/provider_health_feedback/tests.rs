@@ -525,3 +525,59 @@ category=SANDBOX_UNAVAILABLE exit_code=0 model=none'\n\
         "the no-op arms the host-wide sandbox hold"
     );
 }
+
+/// #10455: a codex tick refused because the account's session container was
+/// not running ends as `category=SESSION_DOWN` (exit 78 kept). It must get a
+/// distinct failure reason and `loom.admission.reason` — not bare
+/// `RECOVERABLE`/78 — and, like the sandbox no-op, record no account hold and
+/// no `last_success`: the account's credentials are fine.
+#[test]
+#[serial]
+fn codex_role_tick_session_down_is_a_distinct_outcome_with_no_account_hold() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    codex_judge_workspace(workspace.path());
+    write_executable(
+        &workspace.path().join(".loom/scripts/spawn-worker.sh"),
+        "#!/bin/sh\n\
+         echo '# LOOM_ACCOUNT name=alice'\n\
+         echo 'session container loom-codex-session-alice posture not verified (not-running)'\n\
+         echo '# LOOM_TERMINAL_RESULT v=2 provider=codex account=alice \
+category=SESSION_DOWN exit_code=78 model=none'\n\
+         exit 78\n",
+    );
+
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
+    let RoleTickOutcome::Failure(detail) = &outcome else {
+        panic!("a refused tick must be a Failure, got {outcome:?}");
+    };
+    assert!(crate::role_tick_telemetry::is_session_down_reason(detail), "{detail}");
+    assert!(detail.contains("alice"), "{detail}");
+    let attrs = crate::observability::lifecycle::admission_attributes(&outcome);
+    assert_eq!(attrs["loom.admission.reason"], "session-down");
+
+    let health = tokens_pool::account_health(workspace.path(), &codex_id("alice")).unwrap();
+    assert!(
+        health
+            .as_ref()
+            .is_none_or(|h| h.cooldown_until.is_none() && h.last_success.is_none()),
+        "SESSION_DOWN must neither hold the account nor stamp a success: {health:?}"
+    );
+}
+
+#[test]
+fn session_down_parses_and_a_generic_failure_keeps_the_generic_reason() {
+    use std::str::FromStr;
+    assert_eq!(
+        tokens_pool::health::TerminalClassification::from_str("SESSION_DOWN").unwrap(),
+        tokens_pool::health::TerminalClassification::SessionDown
+    );
+    let generic = RoleTickOutcome::Failure("`x` exited with 78: boom".into());
+    let attrs = crate::observability::lifecycle::admission_attributes(&generic);
+    assert_eq!(attrs["loom.admission.reason"], "failure");
+}

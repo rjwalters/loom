@@ -77,8 +77,10 @@
 //! carried forward (#9416 owns proven equivalence), no substantive Judge
 //! rejection is suppressed (only THIS pass's base-conflict auto-flag
 //! consults the sequence state), and independent PRs are untouched. Every
-//! write is idempotent: an identical marker already on the PR suppresses the
-//! repeat comment, so competing daemons converge instead of spamming.
+//! write is idempotent: the landing comment is upserted by its order key
+//! (after PR, both heads — not the churning plan id), duplicates of it are
+//! deleted, and one host per workspace runs the pass ([`landing`], #10634),
+//! so competing daemons converge instead of spamming.
 //!
 //! Kill switch: [`MERGE_SEQUENCE_ENABLED_ENV`] (default ON), nested inside
 //! the master `LOOM_STALE_CLAIM_RECONCILE` switch like the review-conflict
@@ -126,6 +128,10 @@ pub mod ready;
 // Tree-identical re-dates keep a hold; operator releases stick (#10398).
 #[path = "merge_sequence_sticky.rs"]
 pub mod sticky;
+
+// One landing-order comment per follower, upserted by key (#10634).
+#[path = "merge_sequence_landing.rs"]
+pub mod landing;
 
 /// The durable hold label this pass applies (defined by #9378).
 pub const SEQUENCE_LABEL: &str = "loom:sequenced";
@@ -997,10 +1003,11 @@ pub fn plan_report(gh_bin: &Path, root: &Path) -> Result<PlanReport> {
     }
     for g in &report.groups {
         for e in &g.edges {
-            if markers
-                .get(&e.follower)
-                .is_some_and(|m| marker_text(m) == marker_text(&edge_marker(e)))
-            {
+            // #10634: the order key, not the plan id — the live pass keeps a
+            // comment whose key matches, whatever plan id it carries.
+            if markers.get(&e.follower).is_some_and(|m| {
+                landing::LandingKey::of(m) == landing::LandingKey::of(&edge_marker(e))
+            }) {
                 report.already_planned += 1;
             }
         }
@@ -1020,7 +1027,7 @@ fn release_hold(gh_bin: &Path, root: &Path, number: u32, body: &str) -> Result<(
     Ok(())
 }
 
-/// Apply one planned edge: marker comment + label, idempotent PER SIDE.
+/// Apply one planned edge: landing comment + label, idempotent PER SIDE.
 /// Returns `Ok(false)` only when both sides already agree — the convergence
 /// guard that makes competing daemons settle without duplicate comments.
 ///
@@ -1033,36 +1040,32 @@ fn release_hold(gh_bin: &Path, root: &Path, number: u32, body: &str) -> Result<(
 /// side is checked independently, so the follow-up adds the missing label
 /// without re-posting the comment.
 ///
-/// The two sides are read differently (#10507). The marker side — the one
-/// that guards against duplicate comments — stays LIVE: `bodies` is this
-/// follower's fresh trusted-comment read. The label side comes from the
-/// tick-start REST listing (`label_present`), not a per-follower
-/// `gh pr view` (GraphQL, ~284/h): the caller only reaches here for
-/// followers that were NOT holders in that listing, so a live read almost
-/// always said "absent" anyway. The one race — another daemon adds the label
-/// between the listing and this write — costs one redundant `--add-label`,
-/// which the forge no-ops for a label already present.
+/// The comment side is [`landing::plan`] over this follower's fresh trusted
+/// comments (#10634): keep, patch in place, or post once, keyed by the order
+/// rather than the plan id. The label side comes from the tick-start REST
+/// listing (`label_present`, #10507), not a per-follower `gh pr view`: the
+/// caller only reaches here for followers that were NOT holders in that
+/// listing. The one race — another daemon adds the label between the listing
+/// and this write — costs one redundant `--add-label`, which the forge no-ops.
 fn apply_edge(
     gh_bin: &Path,
     root: &Path,
     edge: &SequenceEdge,
-    marker: &SequenceMarker,
-    bodies: &[String],
+    plan: &landing::LandingPlan,
     label_present: bool,
 ) -> Result<bool> {
-    let marker_present = bodies.iter().any(|b| b.contains(&marker_text(marker)));
-    if marker_present && label_present {
-        return Ok(false);
-    }
-    let n = edge.follower.to_string();
-    if !marker_present {
-        let body = apply_comment_body(marker, edge.reason);
-        gh_pr(gh_bin, root, &["comment", &n, "--body", &body])?;
-    }
-    if !label_present {
-        gh_pr(gh_bin, root, &["edit", &n, "--add-label", SEQUENCE_LABEL])?;
-    }
-    Ok(true)
+    let wrote = if plan.write == landing::LandingWrite::Keep && label_present {
+        false
+    } else {
+        landing::write(gh_bin, root, edge.follower, edge.reason, plan)?;
+        if !label_present {
+            let n = edge.follower.to_string();
+            gh_pr(gh_bin, root, &["edit", &n, "--add-label", SEQUENCE_LABEL])?;
+        }
+        true
+    };
+    landing::delete_duplicates(gh_bin, root, edge.follower, plan);
+    Ok(wrote)
 }
 
 // --- The pass ------------------------------------------------------------
@@ -1083,6 +1086,29 @@ pub(super) fn reconcile_merge_sequences_with(
     gh_bin: &Path,
     root: &Path,
     prefetched: Option<&[super::open_pr_listing::RestPull]>,
+) -> MergeSequenceStats {
+    // #10634: one host per workspace plans and posts — the role-runner shard
+    // (#6374/#6704) that already makes one host of a sharded fleet own a
+    // workspace's other forge-writing passes (`stale_blocked`). Unsharded
+    // hosts own everything, so a lone daemon is unaffected. Releasing an
+    // existing hold is not gated (see `reconcile_merge_sequences_gated`).
+    let owned = cfg!(test) || crate::role_shard::decide(root).admits_role_tick();
+    reconcile_merge_sequences_gated(gh_bin, root, prefetched, owned)
+}
+
+/// [`reconcile_merge_sequences_with`] with the shard verdict supplied
+/// (#10634). A host that does not own `root` still runs Phase 1's releases —
+/// they are idempotent, and a slice with no live owner (its static-shard host
+/// down, a roster yielding everywhere, the owner skipped by write scope) must
+/// not keep `loom:sequenced` on PRs that `merge-pr.sh` then refuses (Judge,
+/// PR #10651). It does not plan or post: no new landing-order comment, no
+/// re-anchor record, no stall escalation. With no hold in the listing it
+/// makes no forge call beyond the listing.
+pub(super) fn reconcile_merge_sequences_gated(
+    gh_bin: &Path,
+    root: &Path,
+    prefetched: Option<&[super::open_pr_listing::RestPull]>,
+    owned: bool,
 ) -> MergeSequenceStats {
     let mut stats = MergeSequenceStats::default();
     if !merge_sequence_enabled() {
@@ -1217,8 +1243,11 @@ pub(super) fn reconcile_merge_sequences_with(
                 release_hold(gh_bin, root, pr.number, REPLAN_NOTE_BODY).map(|_| action)
             }
             HoldAction::HoldSoft | HoldAction::HoldHard => match reanchored.as_ref() {
-                Some(m) => sticky::record_reanchor(gh_bin, root, pr.number, m).map(|_| action),
-                None => Ok(action),
+                // Re-anchor records are posting: the owner writes them.
+                Some(m) if owned => {
+                    sticky::record_reanchor(gh_bin, root, pr.number, m).map(|_| action)
+                }
+                _ => Ok(action),
             },
         };
         match result {
@@ -1239,6 +1268,16 @@ pub(super) fn reconcile_merge_sequences_with(
                 );
             }
         }
+    }
+
+    // #10634: everything below plans or posts — the workspace's owner only.
+    if !owned {
+        log::debug!(
+            "claim_reconciliation (merge sequence): {} is owned by another host's shard — \
+             holds evaluated, planning skipped (#10634)",
+            root.display()
+        );
+        return stats;
     }
 
     // Phase 1b: one escalation per stalled chain (#10060), deduped on the
@@ -1276,6 +1315,7 @@ pub(super) fn reconcile_merge_sequences_with(
     }
     let files = files.known(eligible.iter().map(|p| p.number));
     let markers = fetch_markers(gh_bin, root, &eligible, &read_markers);
+    let fleet = crate::forge_identity::FleetLogins::for_root(root);
     for group in plan_repo(&open, &files, &markers) {
         stats.groups += 1;
         for edge in group.edges {
@@ -1286,8 +1326,19 @@ pub(super) fn reconcile_merge_sequences_with(
             if markers.contains_key(&edge.follower) || holder_numbers.contains(&edge.follower) {
                 continue;
             }
-            let bodies = fetch_trusted_bodies(&bin, root, "{owner}/{repo}", edge.follower)
-                .unwrap_or_default();
+            // #10634: one read gives the sticky check its bodies and the
+            // landing upsert its comment ids. A failed read skips the edge —
+            // "no comment" read from a read that did not happen is a repost.
+            let Some(thread) = landing::fetch_thread(gh_bin, root, edge.follower) else {
+                log::warn!(
+                    "claim_reconciliation (merge sequence): PR #{} in {}: could not read \
+                     trusted comments — edge skipped this tick",
+                    edge.follower,
+                    root.display()
+                );
+                continue;
+            };
+            let bodies = landing::bodies(&thread);
             // #10398: an operator's release of this pair sticks while the tree holds.
             match sticky::check(gh_bin, root, &edge, &open, &bodies) {
                 sticky::OperatorRelease::None => {}
@@ -1304,12 +1355,12 @@ pub(super) fn reconcile_merge_sequences_with(
                     continue;
                 }
             }
-            let marker = edge_marker(&edge);
+            let plan = landing::plan(&thread, &edge_marker(&edge), |l| fleet.contains(l));
             // Label side from the tick-start listing (#10507); see `apply_edge`.
             let label_present = open
                 .iter()
                 .any(|p| p.number == edge.follower && p.has(SEQUENCE_LABEL));
-            match apply_edge(gh_bin, root, &edge, &marker, &bodies, label_present) {
+            match apply_edge(gh_bin, root, &edge, &plan, label_present) {
                 Ok(true) => {
                     stats.applied += 1;
                     log::info!(
