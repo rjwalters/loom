@@ -13,7 +13,7 @@ use crate::eta::hazard_sim::{
 };
 use crate::eta::heuristics::{
     side_state, LandHeldHeron, LandTwinOtterB, HELD_HERON_METHOD, LAND_HELD_HERON, LAND_KEEN_WREN,
-    LAND_TWIN_OTTER, LAND_TWIN_OTTER_B,
+    LAND_TANDEM_WREN, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B,
 };
 use crate::eta::labels::FLAG_SEQUENCED;
 use crate::eta::simulate::run_explanation;
@@ -168,14 +168,16 @@ fn held_heron_is_a_registered_land_candidate_before_the_twin_otter_pair() {
     let fitted = Registry::with_fit(Some(Arc::new(fixture_fit(fit_as_of()))));
     for registry in [Registry::builtin(), fitted] {
         let land: Vec<&str> = registry.for_kind(Kind::Land).map(Heuristic::id).collect();
-        // keen-wren (#10508) is registered between it and the twin-otter pair.
+        // keen-wren (#10508) is registered between it and the twin-otter
+        // pair; `land-2026-10-06-tandem-wren` (#10510) after the pair.
         assert_eq!(
-            land[land.len() - 4..],
+            land[land.len() - 5..],
             [
                 LAND_HELD_HERON,
                 LAND_KEEN_WREN,
                 LAND_TWIN_OTTER,
-                LAND_TWIN_OTTER_B
+                LAND_TWIN_OTTER_B,
+                LAND_TANDEM_WREN
             ]
         );
         let heron = registry.get(LAND_HELD_HERON).expect("registered");

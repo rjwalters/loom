@@ -8,8 +8,8 @@ use super::{as_of, history_a, provenance};
 use crate::eta::emit::{Trigger, HOURLY_CAP};
 use crate::eta::explanation::Explanation;
 use crate::eta::heuristics::{
-    LandTwinOtter, LAND_HELD_HERON, LAND_KEEN_WREN, LAND_QUICK_TERN, LAND_TWIN_OTTER,
-    LAND_TWIN_OTTER_B, LAND_V4,
+    LandTwinOtter, LAND_HELD_HERON, LAND_KEEN_WREN, LAND_QUICK_TERN, LAND_SWIFT_TERN,
+    LAND_TANDEM_WREN, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B, LAND_V4,
 };
 use crate::eta::queue_features::{reason, EventLog};
 use crate::eta::simulate::run_explanation;
@@ -27,14 +27,19 @@ const RR: &str = "loom:review-requested";
 const PR: &str = "loom:pr";
 const OP: &str = "loom:operator";
 /// `land-2026-10-06-quick-tern` (#10524) wraps `-b`, so it models the hold
-/// too, `land-2026-10-06-held-heron` (#10523) answers it, and
-/// `land-2026-10-06-keen-wren` (#10508) is twin-otter's evaluation over v2.
-const HOLD_AWARE: [&str; 5] = [
+/// too, `land-2026-10-06-swift-tern` (#10524) wraps `-b` like quick-tern,
+/// `land-2026-10-06-held-heron` (#10523) answers it,
+/// `land-2026-10-06-keen-wren` (#10508) is twin-otter's evaluation over v2,
+/// and `land-2026-10-06-tandem-wren` (#10510) reads exactly what its base
+/// twin-otter-b reads.
+const HOLD_AWARE: [&str; 7] = [
     LAND_QUICK_TERN,
+    LAND_SWIFT_TERN,
     LAND_HELD_HERON,
     LAND_KEEN_WREN,
     LAND_TWIN_OTTER,
     LAND_TWIN_OTTER_B,
+    LAND_TANDEM_WREN,
 ];
 /// Does not model the hold, but answers an operator-held PR from the stage
 /// under it plus the `operator_hold` stall term (#10210), on the described
@@ -236,7 +241,7 @@ fn each_heuristic_reads_its_own_view_of_a_held_pr() {
         .iter()
         .filter(|e| e.explanation.kind == Kind::Land)
         .collect();
-    assert_eq!(land.len(), 10);
+    assert_eq!(land.len(), 12);
     for emission in land {
         let id = emission.explanation.heuristic.as_str();
         let heuristic = registry.get(id).unwrap();
@@ -297,11 +302,11 @@ fn a_held_twin_otter_series_refreshes_while_the_path_engines_stay_silent() {
     let mut h = Harness::new();
     h.list(&[(501, &[RR], -600)], 0);
     h.list(&[(501, &[PR], 250)], 300);
-    assert_eq!(h.land(&registry, 300, 300).len(), 10);
+    assert_eq!(h.land(&registry, 300, 300).len(), 12);
 
     h.list(&[(501, &[PR, OP], 550)], 600);
     let entry = h.land(&registry, 300, 600);
-    assert_eq!(entry.len(), 10);
+    assert_eq!(entry.len(), 12);
     for e in &entry {
         let id = e.explanation.heuristic.as_str();
         assert_eq!(e.trigger, Trigger::Transition, "{id}");
@@ -323,7 +328,7 @@ fn a_held_twin_otter_series_refreshes_while_the_path_engines_stay_silent() {
     // Released: every series transitions, the path engines answer again.
     h.list(&[(501, &[PR], 1450)], 1500);
     let released = h.land(&registry, 300, 1500);
-    assert_eq!(released.len(), 10);
+    assert_eq!(released.len(), 12);
     assert!(released.iter().all(|e| e.trigger == Trigger::Transition));
     assert!(released
         .iter()
@@ -331,7 +336,7 @@ fn a_held_twin_otter_series_refreshes_while_the_path_engines_stay_silent() {
 
     // Held again, then merged: no further estimate.
     h.list(&[(501, &[PR, OP], 1750)], 1800);
-    assert_eq!(h.land(&registry, 300, 1800).len(), 10);
+    assert_eq!(h.land(&registry, 300, 1800).len(), 12);
     h.list(&[], 2000);
     h.tracker
         .on_pr_resolved(&key(501), PrState::Merged(t(1950)), t(2000));

@@ -183,6 +183,7 @@ pub(crate) fn input_for(row: &TwinOtterInput, at: DateTime<Utc>) -> EstimateInpu
         stalls: Vec::new(),
         held: None,
         queue: Vec::new(),
+        dependencies: None,
     }
 }
 
@@ -220,10 +221,11 @@ fn twin_otter_is_registered_last_as_a_land_shadow_with_or_without_a_fit() {
     let fitted = Registry::with_fit(Some(Arc::new(fixture_fit(fit_as_of()))));
     for registry in [Registry::builtin(), fitted] {
         let ids = registry.ids();
-        assert_eq!(ids[ids.len() - 2], LAND_TWIN_OTTER, "-b (#10244) follows it");
+        // -b (#10244) follows it, then -tandem-wren (#10510) over -b.
+        assert_eq!(ids[ids.len() - 3], LAND_TWIN_OTTER, "-b and -tandem-wren follow it");
         assert_eq!(registry.get(LAND_TWIN_OTTER).map(Heuristic::kind), Some(Kind::Land));
         let land: Vec<&str> = registry.for_kind(Kind::Land).map(Heuristic::id).collect();
-        assert_eq!(land[land.len() - 2], LAND_TWIN_OTTER);
+        assert_eq!(land[land.len() - 3], LAND_TWIN_OTTER);
         // Shadow: never the default `current`.
         assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
         assert_eq!(Registry::default_current(Kind::Land), "land-v1");
@@ -802,9 +804,16 @@ fn at_stage(stage: Stage) -> EstimateInput {
 fn twin_otter_b_is_registered_after_twin_otter_as_a_land_shadow() {
     let fitted = Registry::with_fit(Some(Arc::new(fixture_fit(fit_as_of()))));
     for registry in [Registry::builtin(), fitted] {
-        assert_eq!(registry.ids().last(), Some(&LAND_TWIN_OTTER_B));
+        // `land-2026-10-06-tandem-wren` (#10510) composes over `-b`, after it.
         let land: Vec<&str> = registry.for_kind(Kind::Land).map(Heuristic::id).collect();
-        assert_eq!(land[land.len() - 2..], [LAND_TWIN_OTTER, LAND_TWIN_OTTER_B]);
+        assert_eq!(
+            land[land.len() - 3..],
+            [
+                LAND_TWIN_OTTER,
+                LAND_TWIN_OTTER_B,
+                crate::eta::heuristics::LAND_TANDEM_WREN
+            ]
+        );
         assert_eq!(registry.current(Kind::Land, None).id(), "land-v1");
     }
 }

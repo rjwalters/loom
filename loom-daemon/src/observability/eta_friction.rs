@@ -28,6 +28,7 @@ use crate::eta::friction::{
     ci_status, open_pr_count, pr_mergeability, typical_ci_duration, FrictionBook, PrFriction,
     Reading, RepoFriction,
 };
+use crate::eta::tracker::PrView;
 use crate::forge_call_stats::{ops, ForgeOp};
 use crate::forge_etag_store as store;
 use crate::types::QueueDisposition;
@@ -51,7 +52,7 @@ const PR_RUNS: ForgeOp =
 
 /// One conditional GET of `url` against the ETag store, as JSON, recorded
 /// as `op`. `None` on any failure.
-fn cached_get(root: &Path, slug: &str, url: &str, op: ForgeOp) -> Option<Value> {
+pub(super) fn cached_get(root: &Path, slug: &str, url: &str, op: ForgeOp) -> Option<Value> {
     let gh = PathBuf::from(crate::gh_invocation::gh_bin());
     let target = store::resolve_target(Some(root), Some(slug));
     let path = store::disk_cache_path(&store::cache_key(Some(root), &target, url));
@@ -183,6 +184,19 @@ fn lockout_reading(tick: Option<&Tick>, key: &str) -> Reading<bool> {
         Some((_, failed)) if failed.contains(key) => Err("listing_failed"),
         Some((locked, _)) => locked.get(key).copied().ok_or("nothing_ready"),
     }
+}
+
+/// The `(root, slug, open PRs under review)` rows [`refresh`] reads, from
+/// the pass's `(root, slug, PR views, ..)` listing rows.
+pub(super) fn repos_of<B>(
+    repos: &[(PathBuf, String, Vec<PrView>, B)],
+) -> Vec<(PathBuf, String, Vec<u32>)> {
+    repos
+        .iter()
+        .map(|(root, slug, prs, _)| {
+            (root.clone(), slug.clone(), prs.iter().map(|p| p.number).collect())
+        })
+        .collect()
 }
 
 /// Refresh the due part of `book` for `repos` — `(root, slug, open PRs under

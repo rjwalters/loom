@@ -40,4 +40,7 @@ pub mod fetch;
 pub mod glibc;
 pub mod signature;
 
-pub use fetch::{fetch_and_verify, FetchInputs, FetchOutcome, VerifiedArtifact};
+pub use fetch::{
+    evidence_line, fetch_and_verify, fetch_and_verify_with_policy, FetchInputs, FetchOutcome,
+    SignaturePolicy, VerifiedArtifact,
+};

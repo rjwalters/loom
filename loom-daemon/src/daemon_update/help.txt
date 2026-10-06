@@ -199,6 +199,18 @@ Environment:
   LOOM_DAEMON_UPDATE_COSIGN_OIDC_ISSUER  Expected keyless certificate issuer
                          (default https://token.actions.githubusercontent.com,
                          i.e. GitHub Actions' OIDC provider).
+  LOOM_DAEMON_UPDATE_REQUIRE_SIGNATURE  1/true/yes/on switches signature
+                         handling from the default "present-only" mode
+                         (#5054: an unsigned release or an unverifiable
+                         signature is a loud skip) to "required" mode
+                         (#10470): an unsigned release, or one whose
+                         signature cannot be checked on this host, is
+                         REFUSED before provisioning, with distinct
+                         messages. Default: off.
+  LOOM_DAEMON_UPDATE_APPROVED_WORKFLOW  Required-mode companion: pin the
+                         derived keyless identity to this workflow file
+                         (e.g. release.yml) instead of `[^@]+`. Default:
+                         unset.
   LOOM_PID_FILE         #6386: the pid file consulted for liveness detection,
                          TIER 1 -- ahead of the $PWD/machine-derived
                          "<state home>/.daemon.pid". Same precedence

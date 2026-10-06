@@ -130,6 +130,7 @@ impl Heuristic for LittleV0 {
             calibration: None,
             twin_otter: None,
             queue: None,
+            dependencies: None,
             regime_adjustment: None,
             held_heron: None,
         };

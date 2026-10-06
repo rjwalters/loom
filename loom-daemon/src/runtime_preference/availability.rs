@@ -206,6 +206,11 @@ fn claude(root: &Path) -> Availability {
 /// ["codex","claude"]` fall through to Claude when Codex can run nothing.
 /// The hold is self-healing (`PoolHold::SelfHealing`): it ages out and the next
 /// tick re-tests the sandbox.
+///
+/// **Session down (#10454).** A session-managed account whose container is not
+/// running is not spawnable (spawn-codex.sh refuses it), so a pool of only
+/// such accounts is Exhausted with a detail naming `SessionDown`. When Docker
+/// cannot be queried the count stays at zero — cannot observe, not down.
 fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
     let source = CredentialSource::CodexAccounts;
     if let Some(hold) = super::sandbox_hold::active("codex", now) {
@@ -268,9 +273,9 @@ fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
             "0/{} spawnable ({}) — #8408",
             state.enabled,
             if state.enabled == 0 {
-                "no enabled codex account is provisioned"
+                "no enabled codex account is provisioned".to_string()
             } else {
-                "every enabled account is cooling down or needs re-auth"
+                crate::role_runner::runtime_preflight::codex_exhausted_reason(&state)
             }
         ),
     }

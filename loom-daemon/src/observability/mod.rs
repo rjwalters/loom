@@ -101,12 +101,14 @@
 //! host (#5336).
 
 pub mod backfill;
+pub mod captain_gauges;
 pub mod claude_code_telemetry;
 pub mod collector;
 pub mod cycle_guard;
 pub mod daemon_event;
 pub mod endpoint_policy;
 pub mod eta;
+mod eta_dependency;
 pub mod eta_fit;
 pub mod eta_fleet_refresh;
 mod eta_friction;
@@ -119,6 +121,7 @@ pub mod otlp;
 pub mod outcome;
 pub mod overhead;
 pub mod pick_decision;
+pub mod pick_journal;
 pub mod queue;
 pub mod queue_blocked;
 pub mod queue_snapshot;

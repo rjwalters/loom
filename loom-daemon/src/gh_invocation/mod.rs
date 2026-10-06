@@ -43,6 +43,7 @@
 pub mod accounting;
 mod affinity;
 pub mod api_kind;
+pub mod billing;
 pub(crate) mod cwd_route;
 mod outcome;
 pub(crate) mod own_writes;
@@ -717,8 +718,8 @@ impl GhInvocation {
                     Ok(Completion::TimedOut { stdout, stderr }) => Some((&stdout[..], &stderr[..])),
                     Err(_) => None,
                 };
-                accounting::record(&self, outcome, captured);
-                span.finish(&self, source, outcome, code);
+                let billing = accounting::record(&self, outcome, captured);
+                span.finish(&self, source, outcome, code, &billing);
                 result.map(GhCompletion::Captured)
             }
             OutputContract::Passthrough => {
@@ -730,8 +731,8 @@ impl GhInvocation {
                     .map_err(ExecError::Spawn)
                     .and_then(|mut child| child.wait().map_err(ExecError::Collect));
                 let (outcome, code) = telemetry::classify_passthrough(&result);
-                accounting::record(&self, outcome, None);
-                span.finish(&self, source, outcome, code);
+                let billing = accounting::record(&self, outcome, None);
+                span.finish(&self, source, outcome, code, &billing);
                 result.map(GhCompletion::Passthrough)
             }
             OutputContract::CredentialHelper => {
@@ -748,8 +749,8 @@ impl GhInvocation {
                     written.map_err(ExecError::Collect).map(|()| status)
                 });
                 let (outcome, code) = telemetry::classify_passthrough(&result);
-                accounting::record(&self, outcome, None);
-                span.finish(&self, source, outcome, code);
+                let billing = accounting::record(&self, outcome, None);
+                span.finish(&self, source, outcome, code, &billing);
                 result.map(GhCompletion::Passthrough)
             }
         }

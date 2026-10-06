@@ -15,24 +15,29 @@ use crate::eta::{Explanation, Heuristic, Kind, Registry, Stage};
 use chrono::{DateTime, Duration, Utc};
 use std::f64::consts::LN_2;
 
-const HOUR: i64 = 3_600;
-const DAY: i64 = 86_400;
+pub(super) const HOUR: i64 = 3_600;
+pub(super) const DAY: i64 = 86_400;
 
 /// The base quantiles every fixture row carries.
-const BASE: (i64, i64, i64, i64) = (1_800, 3_600, 7_200, 14_400);
+pub(super) const BASE: (i64, i64, i64, i64) = (1_800, 3_600, 7_200, 14_400);
 
 /// Logistic scale for which [`BASE`] is exactly calibrated: an outcome
 /// `3600 · exp(S · L)`, `L` standard logistic, has quantiles 1800 / 3600 /
 /// 7200 / 14400 at 25 / 50 / 75 / 90%.
-fn scale() -> f64 {
+pub(super) fn scale() -> f64 {
     LN_2 / 3f64.ln()
 }
 
-fn at(secs: i64) -> DateTime<Utc> {
+pub(super) fn at(secs: i64) -> DateTime<Utc> {
     as_of() + Duration::seconds(secs)
 }
 
-fn obs(id: &str, stage: Stage, made: i64, remaining: Option<i64>) -> CalibrationObservation {
+pub(super) fn obs(
+    id: &str,
+    stage: Stage,
+    made: i64,
+    remaining: Option<i64>,
+) -> CalibrationObservation {
     CalibrationObservation {
         schema: OBSERVATION_SCHEMA.to_string(),
         estimate_id: id.to_string(),
@@ -55,7 +60,7 @@ fn obs(id: &str, stage: Stage, made: i64, remaining: Option<i64>) -> Calibration
 /// fixture instant to 30 h after it. Outcomes follow the calibrated
 /// logistic, multiplied by `factor` for estimates made at or after the
 /// fixture instant (the regime shift).
-fn fixture(factor: f64, step: i64) -> Vec<CalibrationObservation> {
+pub(super) fn fixture(factor: f64, step: i64) -> Vec<CalibrationObservation> {
     rows_between(factor, -5 * DAY, 30 * HOUR, step)
 }
 
@@ -77,7 +82,7 @@ fn rows_between(factor: f64, from: i64, to: i64, step: i64) -> Vec<CalibrationOb
 
 /// A `review_wait` base estimate (`land-v2`'s, any answered one will do:
 /// the record's shift is what is checked).
-fn base_explanation() -> Explanation {
+pub(super) fn base_explanation() -> Explanation {
     let e = LandV2.estimate(&input_at(Stage::ReviewWait, 0, 0), &history_a());
     assert!(e.quantiles_with_p90().is_some(), "the fixture base answers");
     e
@@ -95,20 +100,20 @@ fn record_at(
     conformal_ipcw::calibrate(e, observations, LAND_TWIN_OTTER_B).calibration
 }
 
-fn logistic(x: f64) -> f64 {
+pub(super) fn logistic(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
 
 /// For an estimate with base quantiles [`BASE`] calibrated by `record`:
 /// the share of outcomes from the `factor` regime inside `[p25, p75]`, and
 /// beyond `p90` (late surprise).
-fn coverage(record: &Calibration, factor: f64) -> (f64, f64) {
+pub(super) fn coverage(record: &Calibration, factor: f64) -> (f64, f64) {
     let (p25, _, p75, p90) = apply(BASE, &record.shift);
     let z = |sec: i64| (sec as f64 / (3_600.0 * factor)).ln() / scale();
     (logistic(z(p75)) - logistic(z(p25)), 1.0 - logistic(z(p90)))
 }
 
-fn bytes(e: &Explanation) -> String {
+pub(super) fn bytes(e: &Explanation) -> String {
     serde_json::to_string(e).unwrap()
 }
 

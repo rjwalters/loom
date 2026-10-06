@@ -867,3 +867,8 @@ async fn an_unreachable_collector_never_holds_the_tailer_up() {
 /// calling, and which of its lines belong to the claimed issue.
 #[path = "attended_scope_tests.rs"]
 mod scope;
+
+/// #10125: the start diagnostic's file, stale-file sweeping, and ending a
+/// foreground subagent's run at its parent's result.
+#[path = "attended_upkeep_tests.rs"]
+mod upkeep_tests;

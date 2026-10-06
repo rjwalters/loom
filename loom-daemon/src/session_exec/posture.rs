@@ -211,7 +211,12 @@ fn control_drift(docker: &str, container: &str, codex_home: Option<&Path>) -> Co
 /// Classify one `docker inspect` object.
 #[must_use]
 pub fn classify(state: &Value) -> Posture {
-    if state["State"]["Running"] != Value::Bool(true) {
+    // A crash-looping `--restart unless-stopped` container reads
+    // `Running=true, Restarting=true` between restarts; nothing can be exec'd
+    // into it, so it is not running (issue #10453).
+    if state["State"]["Running"] != Value::Bool(true)
+        || state["State"]["Restarting"] == Value::Bool(true)
+    {
         return Posture::NotRunning;
     }
     let labels = &state["Config"]["Labels"];

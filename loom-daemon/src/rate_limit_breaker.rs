@@ -579,20 +579,45 @@ pub fn register_global(breaker: Arc<SharedRateLimitBreaker>) {
 /// The process-global breaker handle, if one has been registered.
 #[must_use]
 pub fn global() -> Option<Arc<SharedRateLimitBreaker>> {
+    #[cfg(test)]
+    if let Some(b) = TEST_GLOBAL.with(|t| t.borrow().clone()) {
+        return Some(b);
+    }
     GLOBAL.get().cloned()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GLOBAL: std::cell::RefCell<Option<Arc<SharedRateLimitBreaker>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `breaker` standing in for the process-global one on THIS
+/// thread only: [`register_global`] is first-wins for the whole test binary,
+/// so a test that registered (and tripped) the real global would suppress
+/// every other test's forge calls.
+#[cfg(test)]
+pub(crate) fn with_test_global<R>(
+    breaker: Arc<SharedRateLimitBreaker>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let prev = TEST_GLOBAL.with(|t| t.replace(Some(breaker)));
+    let out = f();
+    TEST_GLOBAL.with(|t| *t.borrow_mut() = prev);
+    out
 }
 
 /// Whether the process-global breaker is currently suppressing forge polling.
 /// `false` when no breaker is registered (zero behavior change).
 #[must_use]
 pub fn global_is_suppressed() -> bool {
-    GLOBAL.get().is_some_and(|b| b.is_suppressed(Utc::now()))
+    global().is_some_and(|b| b.is_suppressed(Utc::now()))
 }
 
 /// A snapshot of the process-global breaker, or `None` when unregistered.
 #[must_use]
 pub fn global_snapshot() -> Option<RateLimitSnapshot> {
-    GLOBAL.get().map(|b| b.snapshot(Utc::now()))
+    global().map(|b| b.snapshot(Utc::now()))
 }
 
 /// One-call hook for gh error arms: classify `error_text`, and on a
@@ -610,9 +635,7 @@ pub fn global_observe_failure(error_text: &str, source: &str) -> Option<Transiti
 /// `job` (see [`SharedRateLimitBreaker::skip_if_suppressed`]).
 #[must_use]
 pub fn global_skip_pass(job: &str) -> bool {
-    GLOBAL
-        .get()
-        .is_some_and(|b| b.skip_if_suppressed(job, Utc::now()))
+    global().is_some_and(|b| b.skip_if_suppressed(job, Utc::now()))
 }
 
 /// Export one fresh trip as a `loom.ratelimit.trip` span (Issue #10022) and,

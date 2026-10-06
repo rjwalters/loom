@@ -8,6 +8,8 @@ mod conditioning;
 mod config;
 mod conformal;
 mod conformal_ipcw;
+mod conformal_ipcw_drift;
+mod dependency;
 mod emit;
 mod episodes;
 mod estimate;
@@ -44,6 +46,7 @@ mod ready;
 mod recalibrate;
 mod recency;
 mod regime;
+mod roster_history;
 mod score;
 mod serve_parity;
 mod shadow;
@@ -157,5 +160,6 @@ pub(crate) fn input_at(stage: Stage, age_sec: i64, rework_rounds: u32) -> Estima
         stalls: Vec::new(),
         held: None,
         queue: Vec::new(),
+        dependencies: None,
     }
 }

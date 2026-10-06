@@ -57,11 +57,15 @@
 //! landing known only later is a censored row at `t`. Perturbing any
 //! post-`as_of` outcome leaves the output bit-identical (pinned by a test).
 //!
+//! # Drift-aware variant (#10524 slice 3)
+//!
+//! [`calibrate_drift_aware`] (`land-2026-10-06-swift-tern`) adds the #10528
+//! drift check: a drift-shortened half-life ladder. The interval inflation
+//! the check would ask for is recorded but withheld. See its doc.
+//!
 //! # Deferred (#10524 / #10528)
 //!
-//! - Interval inflation when the #10528 drift flag is set. No drift signal
-//!   exists yet.
-//! - A drift- or regime-driven adaptive half-life.
+//! - Serving the drift inflation, behind a gate that live evidence supports.
 //! - History-aware conditioning.
 //!
 //! Pure: no clock, no file, no forge.
@@ -69,13 +73,16 @@
 use super::conformal::{apply, round6, Calibration, CalibrationWindow, Q4, TAUS};
 use super::explanation::Explanation;
 use super::recalibrate::CalibrationObservation;
-use super::Stage;
+use super::{recency, regime, Stage};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::LN_2;
 
 /// Recorded in [`Calibration::method`].
 pub const METHOD: &str = "ipcw_split_conformal_log";
+
+/// Recorded in [`Calibration::method`] by [`calibrate_drift_aware`].
+pub const METHOD_DRIFT: &str = "ipcw_split_conformal_log_drift";
 
 /// Recorded in [`IpcwRecord::censoring`]: the censoring survival is the
 /// product-limit estimate over fully observed (administrative) censoring
@@ -140,6 +147,11 @@ pub struct IpcwRecord {
     /// row's elapsed time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<String>,
+    /// The drift check of [`calibrate_drift_aware`]; absent for
+    /// [`calibrate`], for a pooled cell, and below the drift check's sample
+    /// floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drift: Option<DriftRecord>,
 }
 
 /// One row as knowable at the fit instant.
@@ -266,6 +278,36 @@ fn unresolved_tail(
     }
 }
 
+/// What the drift-aware variant ([`calibrate_drift_aware`]) checked and did,
+/// recorded in [`IpcwRecord::drift`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DriftRecord {
+    /// Recent residuals (known in the last [`regime::DRIFT_WINDOW_SEC`]).
+    pub n_recent: usize,
+    /// Baseline residuals (known before the recent window, within
+    /// [`regime::BASELINE_WINDOW_SEC`]).
+    pub n_baseline: usize,
+    /// The p50 shift the first check was centred on: the default-window
+    /// fit's applied `shift.p50`.
+    pub center: f64,
+    /// The CUSUM statistic about [`Self::center`], in baseline standard
+    /// deviations.
+    pub statistic: f64,
+    /// Whether that statistic reached [`regime::CUSUM_H`].
+    pub drifted: bool,
+    /// The first half-life the ladder tried: [`HALF_LIFE_SEC`], or
+    /// `HALF_LIFE_SEC /` [`recency::DRIFTED_DIVISOR`] when drifted.
+    pub half_life_start_sec: i64,
+    /// The CUSUM statistic about the final fit's `shift.p50`: the drift the
+    /// shorter window did not absorb. Equals [`Self::statistic`] when not
+    /// drifted.
+    pub residual_statistic: f64,
+    /// The widening about p50 #10528 would apply for the residual drift
+    /// ([`regime::Drift::inflation`] of the residual check), **not applied**
+    /// (see [`calibrate_drift_aware`]). `1` is none.
+    pub withheld_inflation: f64,
+}
+
 /// The IPCW conformal fit of `members` at `half_life_sec`, or `None` when
 /// its events' effective N is below [`MIN_EFFECTIVE_EVENTS`].
 fn fit_cell(members: &[&Member], half_life_sec: i64) -> Option<Fit> {
@@ -363,10 +405,10 @@ fn fit_cell(members: &[&Member], half_life_sec: i64) -> Option<Fit> {
     })
 }
 
-/// The fit at the shortest half-life on the doubling ladder whose events'
-/// effective N reaches [`MIN_EFFECTIVE_EVENTS`], or `None`.
-fn fit_ladder(members: &[&Member]) -> Option<Fit> {
-    let mut half_life = HALF_LIFE_SEC;
+/// The fit at the shortest half-life on the doubling ladder from `start_sec`
+/// whose events' effective N reaches [`MIN_EFFECTIVE_EVENTS`], or `None`.
+fn fit_ladder(members: &[&Member], start_sec: i64) -> Option<Fit> {
+    let mut half_life = start_sec;
     loop {
         if let Some(fit) = fit_cell(members, half_life) {
             return Some(fit);
@@ -386,9 +428,87 @@ fn fit_ladder(members: &[&Member]) -> Option<Fit> {
 /// effective events at any half-life.
 #[must_use]
 pub fn calibrate(
+    explanation: Explanation,
+    observations: &[CalibrationObservation],
+    base: &str,
+) -> Explanation {
+    calibrate_with(explanation, observations, base, false)
+}
+
+/// [`calibrate`], made **drift-aware** with the #10528 drift check
+/// ([`regime::drift_about`]); the calibrator behind
+/// `land-2026-10-06-swift-tern`. Pure.
+///
+/// For a stage cell, the residuals `ln(actual / p50)` of `base`'s landings
+/// known before `as_of` are checked by CUSUM against the default fit's
+/// served p50 shift (not the baseline's mean: a shift the calibrator has
+/// already absorbed must not keep the flag up). When the check trips:
+/// - **Adaptive half-life.** The ladder restarts from
+///   `HALF_LIFE_SEC /` [`recency::DRIFTED_DIVISOR`] (1.5 h): the old regime
+///   is forgotten faster. The effective-N floor still applies, so the
+///   shorter window never rests on fewer than [`MIN_EFFECTIVE_EVENTS`].
+/// - **Inflation is measured, not applied.** The check is re-run about the
+///   shorter fit's p50 shift, and the widening #10528 would apply for the
+///   drift left over ([`regime::Drift::inflation`]) is recorded as
+///   [`DriftRecord::withheld_inflation`]. Applying it over-covers: right
+///   after a shift the recent residuals are a mixture of both regimes, so
+///   the check stays up after the shorter window has already caught up. On
+///   the x0.1 fixture it held p25–p75 coverage at 0.83–0.89 from 1.5 h to
+///   6 h after the shift, against 0.42–0.62 without it
+///   (`eta::tests::conformal_ipcw_drift`). Serving it
+///   needs a gate and live evidence first (as #10563 found for the
+///   residual tracker).
+///
+/// When the check does not trip, or is below its sample floor, or the cell
+/// is pooled, the answer is exactly [`calibrate`]'s (plus the `drift`
+/// record when the check ran).
+#[must_use]
+pub fn calibrate_drift_aware(
+    explanation: Explanation,
+    observations: &[CalibrationObservation],
+    base: &str,
+) -> Explanation {
+    calibrate_with(explanation, observations, base, true)
+}
+
+/// The cell fit (stage, else pooled) with the ladder starting at `start_sec`.
+fn choose(members: &[Member], stage: Stage, start_sec: i64) -> Option<(&'static str, Fit)> {
+    for level in ["stage", "pooled"] {
+        let cell: Vec<&Member> = members
+            .iter()
+            .filter(|m| level == "pooled" || m.stage == stage)
+            .collect();
+        if let Some(fit) = fit_ladder(&cell, start_sec) {
+            return Some((level, fit));
+        }
+    }
+    None
+}
+
+/// The residuals of `base`'s landings known strictly before `t`, the same
+/// point-in-time rule as [`member`].
+fn residuals_before(
+    observations: &[CalibrationObservation],
+    base: &str,
+    t: DateTime<Utc>,
+) -> Vec<regime::Residual> {
+    let known: Vec<CalibrationObservation> = observations
+        .iter()
+        .filter(|o| {
+            o.heuristic == base
+                && o.as_of < t
+                && matches!((o.actual_at, o.resolved_at), (Some(a), Some(k)) if a.max(k) < t)
+        })
+        .cloned()
+        .collect();
+    regime::residuals(&known)
+}
+
+fn calibrate_with(
     mut explanation: Explanation,
     observations: &[CalibrationObservation],
     base: &str,
+    drift_aware: bool,
 ) -> Explanation {
     let Some(stage) = explanation.current_stage.as_ref().map(|c| c.stage) else {
         return explanation;
@@ -401,24 +521,42 @@ pub fn calibrate(
         .iter()
         .filter_map(|o| member(o, base, as_of))
         .collect();
-    let mut chosen = None;
-    for level in ["stage", "pooled"] {
-        let cell: Vec<&Member> = members
-            .iter()
-            .filter(|m| level == "pooled" || m.stage == stage)
-            .collect();
-        if let Some(fit) = fit_ladder(&cell) {
-            chosen = Some((level, fit));
-            break;
-        }
-    }
-    let Some((level, fit)) = chosen else {
+    let Some((level, mut fit)) = choose(&members, stage, HALF_LIFE_SEC) else {
         return explanation;
     };
+    let mut drift_record = None;
+    if drift_aware && level == "stage" {
+        let residuals = residuals_before(observations, base, as_of);
+        let first = regime::drift_about(&residuals, stage, as_of, fit.shift[1]);
+        if first.state() != regime::DriftState::Unknown {
+            let mut record = DriftRecord {
+                n_recent: first.n_recent,
+                n_baseline: first.n_baseline,
+                center: fit.shift[1],
+                statistic: first.statistic,
+                drifted: first.drifted,
+                half_life_start_sec: HALF_LIFE_SEC,
+                residual_statistic: first.statistic,
+                withheld_inflation: 1.0,
+            };
+            if first.drifted {
+                let start = HALF_LIFE_SEC / recency::DRIFTED_DIVISOR;
+                let cell: Vec<&Member> = members.iter().filter(|m| m.stage == stage).collect();
+                if let Some(short) = fit_ladder(&cell, start) {
+                    fit = short;
+                }
+                let residual = regime::drift_about(&residuals, stage, as_of, fit.shift[1]);
+                record.half_life_start_sec = start;
+                record.residual_statistic = residual.statistic;
+                record.withheld_inflation = residual.inflation();
+            }
+            drift_record = Some(record);
+        }
+    }
     let shift = Q4::from_array(fit.shift);
     let (p25, p50, p75, p90) = apply(base_q, &shift);
     let record = Calibration {
-        method: METHOD.to_string(),
+        method: if drift_aware { METHOD_DRIFT } else { METHOD }.to_string(),
         base: base.to_string(),
         window: CalibrationWindow {
             from: as_of - Duration::seconds(fit.window_sec),
@@ -444,6 +582,7 @@ pub fn calibrate(
             max_weight: fit.max_weight,
             deadband: Q4::from_array(fit.deadband),
             unresolved: fit.unresolved,
+            drift: drift_record,
         }),
         base_quantiles_sec: Q4 {
             p25: base_q.0,

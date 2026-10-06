@@ -194,6 +194,36 @@ fn a_repo_missing_from_a_sample_keeps_its_state() {
 }
 
 #[test]
+fn a_repo_taken_back_from_the_captain_starts_from_a_baseline() {
+    // W12: while the captain samples a repo this host forgets it, so taking
+    // it back after a stale heartbeat never replays what the captain saw.
+    let mut fake = Fake::default();
+    for n in [7, 8] {
+        fake.labels
+            .insert(n, BTreeMap::from([(CURATED.to_string(), at(10))]));
+    }
+    let mut sampler = Sampler::default();
+    sampler.sample(&[repo(&[(CURATED, vec![issue(7, 0)])])], at(20), &mut fake);
+    sampler.forget("acme/app");
+    // Back under this host with a new curated issue and a promotion: both
+    // happened while the captain sampled, so neither is sampled here.
+    let back = [
+        (CURATED, vec![issue(7, 0), issue(8, 0)]),
+        (ISSUE, vec![issue(7, 0)]),
+    ];
+    assert!(sampler
+        .sample(&[repo(&back)], at(3600), &mut fake)
+        .is_empty());
+    // From the new baseline on, transitions are sampled as usual.
+    let promoted = [
+        (CURATED, vec![issue(7, 0), issue(8, 0)]),
+        (ISSUE, vec![issue(7, 0), issue(8, 0)]),
+    ];
+    let samples = sampler.sample(&[repo(&promoted)], at(3900), &mut fake);
+    assert_eq!(stage(&samples, "curated_to_issue"), [3890]);
+}
+
+#[test]
 fn points_are_delta_pairs_and_gauges_labelled_by_state_only() {
     let samples = [
         DwellSample {

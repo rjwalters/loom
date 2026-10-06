@@ -1,0 +1,317 @@
+{
+  "total_count": 26,
+  "check_runs": [
+    {
+      "id": 112230215784,
+      "name": "Native Port Suites (daemon lifecycle, watchdog)",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-10-06T10:45:45Z",
+      "completed_at": null,
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112230215784",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112230215565,
+      "name": "Daemon Checks",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-06T10:45:44Z",
+      "completed_at": "2026-10-06T10:46:05Z",
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112230215565",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112230215549,
+      "name": "Installer Integration Tests",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-10-06T10:45:44Z",
+      "completed_at": null,
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112230215549",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112230215535,
+      "name": "Install Surface Checks",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-06T10:45:44Z",
+      "completed_at": "2026-10-06T10:46:16Z",
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112230215535",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112230215531,
+      "name": "Native Port Suites",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-10-06T10:45:44Z",
+      "completed_at": null,
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112230215531",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229438850,
+      "name": "loom-worker-native Image Smoke Test",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-06T10:43:31Z",
+      "completed_at": "2026-10-06T10:43:31Z",
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229438850",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229438205,
+      "name": "loom-worker Image Smoke Test",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-06T10:43:31Z",
+      "completed_at": "2026-10-06T10:43:31Z",
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229438205",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229437726,
+      "name": "loom-worker-session Image Smoke Test",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-06T10:43:31Z",
+      "completed_at": "2026-10-06T10:43:31Z",
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229437726",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229437419,
+      "name": "Node Packages (MCP server, dashboard)",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-06T10:43:31Z",
+      "completed_at": "2026-10-06T10:43:31Z",
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229437419",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229436612,
+      "name": "Rust Unit Tests (2/3)",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-10-06T10:43:33Z",
+      "completed_at": null,
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229436612",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229436578,
+      "name": "Rust Unit Tests (3/3)",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-10-06T10:43:33Z",
+      "completed_at": null,
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229436578",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229436556,
+      "name": "Rust OTLP Feature Tests (2/3)",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-10-06T10:43:33Z",
+      "completed_at": null,
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229436556",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229436534,
+      "name": "Rust Unit Tests (1/3)",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-10-06T10:43:33Z",
+      "completed_at": null,
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229436534",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229436525,
+      "name": "Rust OTLP Feature Tests (3/3)",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-10-06T10:43:33Z",
+      "completed_at": null,
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229436525",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229436515,
+      "name": "Rust Linting & Build Check",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-10-06T10:43:33Z",
+      "completed_at": null,
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229436515",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229436476,
+      "name": "Release Build Check",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-10-06T10:43:33Z",
+      "completed_at": null,
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229436476",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229436474,
+      "name": "Build loom-daemon (debug, shared)",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-06T10:43:33Z",
+      "completed_at": "2026-10-06T10:45:42Z",
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229436474",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229436432,
+      "name": "Rust OTLP Feature Tests (1/3)",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-10-06T10:43:33Z",
+      "completed_at": null,
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229436432",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229436428,
+      "name": "Codex Adapter Smoke (mocked)",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-10-06T10:43:33Z",
+      "completed_at": null,
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229436428",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229436418,
+      "name": "Shell Test Suites (hermetic, 1/2)",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-06T10:43:33Z",
+      "completed_at": "2026-10-06T10:46:24Z",
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229436418",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229436378,
+      "name": "Shell Test Suites (hermetic, 2/2)",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-10-06T10:43:33Z",
+      "completed_at": null,
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229436378",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229436335,
+      "name": "Rust OTLP Feature Build & Test",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-10-06T10:43:33Z",
+      "completed_at": null,
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229436335",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229400651,
+      "name": "Structural Checks",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-06T10:43:27Z",
+      "completed_at": "2026-10-06T10:44:12Z",
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229400651",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229400576,
+      "name": "Repo Hygiene Checks",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-06T10:43:27Z",
+      "completed_at": "2026-10-06T10:43:38Z",
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229400576",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229400575,
+      "name": "Detect Changes",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-06T10:43:27Z",
+      "completed_at": "2026-10-06T10:43:30Z",
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229400575",
+      "check_suite": {
+        "id": 101443588392
+      }
+    },
+    {
+      "id": 112229400373,
+      "name": "Shell Syntax (macos-latest)",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-06T10:43:32Z",
+      "completed_at": "2026-10-06T10:43:56Z",
+      "details_url": "https://github.com/rjwalters/loom/actions/runs/37451655923/job/112229400373",
+      "check_suite": {
+        "id": 101443588392
+      }
+    }
+  ]
+}

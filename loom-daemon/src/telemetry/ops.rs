@@ -363,6 +363,16 @@ pub enum MetricName {
     /// Pending estimates evicted by the MAX_PENDING cap since process start.
     #[serde(rename = "loom.eta.health.pending_over_cap")]
     EtaHealthPendingOverCap,
+    // ---- Fleet gauges produced by the captain (W12) ----------------------
+    /// Age of the captain's last production of a fleet gauge job, labelled
+    /// `task` = the job (`observability::captain_gauges::JOBS`): on the captain its own,
+    /// on a dispatcher the published `as_of` it last read.
+    #[serde(rename = "loom.captain.gauge_age_seconds")]
+    CaptainGaugeAgeSeconds,
+    /// 1 while a dispatcher produces a fleet gauge job locally because the
+    /// captain's data is stale or absent, 0 while it stands down; by `task` (the job).
+    #[serde(rename = "loom.captain.gauge_fallback")]
+    CaptainGaugeFallback,
 }
 
 impl MetricName {
@@ -428,6 +438,8 @@ impl MetricName {
             Self::EtaHealthSnapshotRows => "loom.eta.health.snapshot_rows",
             Self::EtaHealthSnapshotAlternatesRows => "loom.eta.health.snapshot_alternates_rows",
             Self::EtaHealthPendingOverCap => "loom.eta.health.pending_over_cap",
+            Self::CaptainGaugeAgeSeconds => "loom.captain.gauge_age_seconds",
+            Self::CaptainGaugeFallback => "loom.captain.gauge_fallback",
         }
     }
 
@@ -508,6 +520,8 @@ impl MetricName {
             Self::EtaHealthSnapshotRows => "{row}",
             Self::EtaHealthSnapshotAlternatesRows => "{row}",
             Self::EtaHealthPendingOverCap => "{estimate}",
+            Self::CaptainGaugeAgeSeconds => "s",
+            Self::CaptainGaugeFallback => "1",
             _ => "By",
         }
     }
@@ -558,8 +572,8 @@ impl MetricName {
             Self::QueueDispositionRowsDropped => {
                 "Ready-queue rows dropped from a disposition export pass, by reason."
             }
-            Self::GithubRateLimitRemaining => "GitHub API requests left, by resource and account.",
-            Self::GithubRateLimitUsed => "GitHub API requests spent this window, by resource.",
+            Self::GithubRateLimitRemaining => "GitHub API requests left, per bucket.",
+            Self::GithubRateLimitUsed => "GitHub API requests spent this window, per bucket.",
             Self::GithubRateLimitReset => "GitHub rate-limit window reset, Unix epoch seconds.",
             Self::GithubRateLimitBreakerSkips => {
                 "Job passes skipped by the rate-limit breaker, by job."
@@ -596,6 +610,12 @@ impl MetricName {
             Self::EtaHealthPendingOverCap => {
                 "Pending ETA estimates evicted by the MAX_PENDING cap since process start; \
                  whole series only when distinct series exceed the cap."
+            }
+            Self::CaptainGaugeAgeSeconds => {
+                "Age of the fleet captain's last run of a fleet gauge job, by task."
+            }
+            Self::CaptainGaugeFallback => {
+                "1 while a dispatcher produces a fleet gauge job locally (captain stale)."
             }
         }
     }

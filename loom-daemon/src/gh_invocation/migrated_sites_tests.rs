@@ -171,11 +171,12 @@ fn watch_probe_is_counted_and_keeps_its_classification() {
 #[serial(loom_config_env)]
 fn worktree_ops_probes_are_counted_and_keep_their_classification() {
     let tmp = tempfile::tempdir().unwrap();
-    // #10512: the issue probes are `gh api --include` conditional reads now.
+    // W6: a root the repo facts cannot model (here: not a checkout) reads
+    // through gh's placeholder, unconditional, so the stub prints the body.
     let gh = stub(
         tmp.path(),
         "gh-closed",
-        r#"printf 'HTTP/2.0 200 OK\r\nEtag: W/"e1"\r\n\r\n{"state":"closed","closed_at":"2026-10-06T00:00:00Z"}'"#,
+        r#"echo '{"number":7,"state":"closed","closed_at":"2026-10-06T00:00:00Z"}'"#,
     );
     std::env::set_var("LOOM_GH_BIN", &gh);
     let (mut state, mut closed_at, mut building) = (None, None, None);

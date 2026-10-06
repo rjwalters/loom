@@ -602,6 +602,14 @@ pub fn spec_from_explanation(explanation: &Explanation) -> Option<PathSpec> {
 /// A `land-2026-10-06-held-heron` simulator answer (#10523) recomputes by
 /// solving its recorded chain ([`super::hazard_sim::solve`]) from `as_of`.
 pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)> {
+    // A dependency composition (#10510) recomputes from its node records.
+    if let Some(record) = explanation
+        .dependencies
+        .as_ref()
+        .filter(|d| !d.nodes.is_empty())
+    {
+        return super::dependency::recompute(record);
+    }
     if let Some(record) = &explanation.held_heron {
         return super::hazard_sim::solve(record, explanation.as_of).map(|s| s.quantiles);
     }

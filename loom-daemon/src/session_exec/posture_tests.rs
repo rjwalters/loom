@@ -152,6 +152,25 @@ fn a_missing_stopped_or_unreadable_container_keeps_the_sandbox() {
     }
 }
 
+/// Issue #10453: Docker reports a crash-looping `--restart unless-stopped`
+/// container as `Running=true, Restarting=true` between restarts. It must
+/// read `not-running` (the clean refusal), never `host`.
+#[test]
+fn a_restarting_container_is_not_running() {
+    for mut state in [hardened_host(), private_clone()] {
+        state["State"]["Restarting"] = json!(true);
+        assert_eq!(classify(&state), Posture::NotRunning);
+        let d = judge(Some(&state), &Env::default());
+        assert_eq!(
+            (d.code, d.mode.as_str(), d.sandbox.as_str()),
+            (0, "not-running", "workspace-write")
+        );
+    }
+    let mut settled = hardened_host();
+    settled["State"]["Restarting"] = json!(false);
+    assert_eq!(classify(&settled), Posture::Host);
+}
+
 #[test]
 fn the_codex_escape_hatch_keeps_the_requested_sandbox_and_bad_values_refuse() {
     let env = Env {

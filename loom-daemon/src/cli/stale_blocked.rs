@@ -150,6 +150,7 @@ impl StaleBlockedArgs {
 
         let mut stale: Vec<Finding> = Vec::new();
         let mut superseded: Vec<Finding> = Vec::new();
+        let mut unticked: Vec<Finding> = Vec::new();
         let mut undocumented: Vec<Finding> = Vec::new();
         let mut prose_only: Vec<Finding> = Vec::new();
         let mut unevaluated: Vec<(String, String)> = Vec::new();
@@ -179,6 +180,7 @@ impl StaleBlockedArgs {
             match finding.verdict {
                 Verdict::Stale(_) => stale.push(finding),
                 Verdict::Superseded { .. } => superseded.push(finding),
+                Verdict::Unticked { .. } => unticked.push(finding),
                 Verdict::Undocumented => undocumented.push(finding),
                 Verdict::StillBlocked => {}
             }
@@ -187,6 +189,7 @@ impl StaleBlockedArgs {
         let sections = Sections {
             stale: &stale,
             superseded: &superseded,
+            unticked: &unticked,
             undocumented: &undocumented,
             prose_only: &prose_only,
             unevaluated: &unevaluated,
@@ -209,6 +212,7 @@ impl StaleBlockedArgs {
 struct Sections<'a> {
     stale: &'a [Finding],
     superseded: &'a [Finding],
+    unticked: &'a [Finding],
     undocumented: &'a [Finding],
     prose_only: &'a [Finding],
     unevaluated: &'a [(String, String)],
@@ -221,6 +225,7 @@ impl Sections<'_> {
     fn any(&self) -> bool {
         !self.stale.is_empty()
             || !self.superseded.is_empty()
+            || !self.unticked.is_empty()
             || !self.undocumented.is_empty()
             || !self.prose_only.is_empty()
     }
@@ -233,8 +238,11 @@ impl Sections<'_> {
 /// caller of this on the sweep path captures stderr to a log file, which is the
 /// same reasoning `script_helpers::emit` records for its own diagnostics.
 fn report(s: &Sections<'_>, quiet: bool) {
-    let mut w = std::io::stderr();
+    render(&mut std::io::stderr(), &mut std::io::stdout(), s, quiet);
+}
 
+/// [`report`] over arbitrary writers, so a test can assert section placement.
+fn render(w: &mut impl Write, out: &mut impl Write, s: &Sections<'_>, quiet: bool) {
     if let Some(why) = s.enumerate_error {
         let _ =
             writeln!(w, "[stale-blocked] could not enumerate open loom:blocked artifacts: {why}");
@@ -246,7 +254,11 @@ fn report(s: &Sections<'_>, quiet: bool) {
     }
 
     if s.any() {
-        let n = s.stale.len() + s.superseded.len() + s.undocumented.len() + s.prose_only.len();
+        let n = s.stale.len()
+            + s.superseded.len()
+            + s.unticked.len()
+            + s.undocumented.len()
+            + s.prose_only.len();
         let _ = writeln!(w);
         let _ = writeln!(w, "{}", "=".repeat(72));
         let _ = writeln!(
@@ -297,6 +309,36 @@ fn report(s: &Sections<'_>, quiet: bool) {
         }
         let _ =
             writeln!(w, "  Do NOT unpark these on the cleared dependency alone (#4634, #7267).");
+    }
+
+    if !s.unticked.is_empty() {
+        let _ = writeln!(w);
+        let _ = writeln!(
+            w,
+            "CHECKLIST REFS RESOLVED, BOXES UNTICKED: confirm each condition, tick it, or \
+             unpark ({}):",
+            s.unticked.len()
+        );
+        for f in s.unticked {
+            let _ = writeln!(w, "  {} {}", f.reference(), f.title);
+            if let Verdict::Unticked {
+                resolved_refs,
+                unparsed,
+            } = &f.verdict
+            {
+                if !resolved_refs.is_empty() {
+                    let _ = writeln!(w, "      - refs resolved: {}", resolved_refs.join(", "));
+                }
+                if *unparsed > 0 {
+                    let _ =
+                        writeln!(w, "      - {unparsed} unchecked line(s) carry no readable ref");
+                }
+            }
+        }
+        let _ = writeln!(
+            w,
+            "  An unticked box is unmet: a merge or close does not prove its whole condition."
+        );
     }
 
     if !s.undocumented.is_empty() {
@@ -397,18 +439,23 @@ fn report(s: &Sections<'_>, quiet: bool) {
     }
 
     if s.any() {
-        println!(
-            "[stale-blocked] WARNING: {} stale, {} superseded, {} undocumented, {} prose-only \
-             loom:blocked artifact(s). See stderr for details.",
+        let _ = writeln!(
+            out,
+            "[stale-blocked] WARNING: {} stale, {} superseded, {} unticked, {} undocumented, \
+             {} prose-only loom:blocked artifact(s). See stderr for details.",
             s.stale.len(),
             s.superseded.len(),
+            s.unticked.len(),
             s.undocumented.len(),
             s.prose_only.len()
         );
     } else if s.enumerate_error.is_some() {
-        println!("[stale-blocked] could not enumerate loom:blocked artifacts; see stderr.");
+        let _ = writeln!(
+            out,
+            "[stale-blocked] could not enumerate loom:blocked artifacts; see stderr."
+        );
     } else {
-        println!("[stale-blocked] no stale, superseded, undocumented or prose-only loom:blocked artifacts.");
+        let _ = writeln!(out, "[stale-blocked] no stale, superseded, undocumented or prose-only loom:blocked artifacts.");
     }
 }
 
@@ -453,6 +500,22 @@ fn print_json(s: &Sections<'_>) {
             v
         })
         .collect();
+    let unticked_json: Vec<_> = s
+        .unticked
+        .iter()
+        .map(|f| {
+            let mut v = row(f);
+            if let Verdict::Unticked {
+                resolved_refs,
+                unparsed,
+            } = &f.verdict
+            {
+                v["resolved_refs"] = serde_json::json!(resolved_refs);
+                v["unparsed"] = serde_json::json!(unparsed);
+            }
+            v
+        })
+        .collect();
     let undoc_json: Vec<_> = s.undocumented.iter().map(row).collect();
     let prose_only_json: Vec<_> = s.prose_only.iter().map(row).collect();
     let uneval_json: Vec<_> = s
@@ -465,6 +528,7 @@ fn print_json(s: &Sections<'_>) {
         serde_json::json!({
             "stale": stale_json,
             "superseded": superseded_json,
+            "unticked": unticked_json,
             "undocumented": undoc_json,
             "prose_only": prose_only_json,
             "unevaluated": uneval_json,
@@ -472,4 +536,58 @@ fn print_json(s: &Sections<'_>) {
             "forge_cost": s.cost,
         })
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unticked() -> Finding {
+        Finding {
+            kind: Artifact::Issue,
+            number: 42,
+            title: "parked".into(),
+            verdict: Verdict::Unticked {
+                resolved_refs: vec!["#187".into()],
+                unparsed: 0,
+            },
+            undeclared: false,
+        }
+    }
+
+    fn rendered(quiet: bool) -> String {
+        let f = [unticked()];
+        let uneval = [("issue #7".to_string(), "timeout".to_string())];
+        let cost = budget::ForgeCost::default();
+        let s = Sections {
+            stale: &[],
+            superseded: &[],
+            unticked: &f,
+            undocumented: &[],
+            prose_only: &[],
+            unevaluated: &uneval,
+            enumerate_error: None,
+            cost: &cost,
+        };
+        let (mut err, mut out) = (Vec::new(), Vec::new());
+        render(&mut err, &mut out, &s, quiet);
+        String::from_utf8(err).unwrap()
+    }
+
+    /// The unticked section sits inside the bordered report body (#9274): listed
+    /// under `--quiet`, and before the closing remedy footer.
+    #[test]
+    fn unticked_section_is_inside_report_body_even_when_quiet() {
+        for quiet in [false, true] {
+            let err = rendered(quiet);
+            let section = err
+                .find("CHECKLIST REFS RESOLVED, BOXES UNTICKED")
+                .unwrap_or_else(|| panic!("unticked section missing (quiet={quiet}):\n{err}"));
+            let uneval = err.find("NOT EVALUATED").expect("unevaluated section");
+            let footer = err.find("To re-check one issue").expect("footer");
+            assert!(section < uneval, "unticked must precede NOT EVALUATED:\n{err}");
+            assert!(section < footer, "unticked must precede the footer:\n{err}");
+            assert!(err.contains("issue #42 parked"));
+        }
+    }
 }

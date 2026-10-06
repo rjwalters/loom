@@ -125,7 +125,8 @@ pub fn precheck(req: &ApplyRequest) -> Option<String> {
 /// already declares them (idempotence).
 ///
 /// With blockers, only the ones no park record in `body` already names are
-/// rendered. Without, one `(unstated)` record is rendered unless one exists.
+/// rendered. Without, one `(unstated)` record is rendered unless one with the
+/// same reason exists.
 #[must_use]
 pub fn compose_body(
     body: &str,
@@ -135,10 +136,18 @@ pub fn compose_body(
     reason: Option<&str>,
 ) -> Option<String> {
     let lines = if blocked_by.is_empty() {
-        if parse(body).iter().any(|r| r.blocker.is_none()) {
+        let rendered = render_park(&[], by, Some(at), reason);
+        // Idempotent per reason, compared as rendered (sanitized), not across
+        // reasons: a released daemon hold leaves its own `(unstated)` record in
+        // the body (#10161), and it must not swallow a later operator park.
+        let want = parse(&rendered).into_iter().next().and_then(|r| r.reason);
+        if parse(body)
+            .iter()
+            .any(|r| r.blocker.is_none() && r.reason == want)
+        {
             return None;
         }
-        render_park(&[], by, Some(at), reason)
+        rendered
     } else {
         let declared = blockers(body);
         let missing: Vec<BlockerRef> = blocked_by

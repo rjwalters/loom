@@ -1007,7 +1007,7 @@ pub(super) async fn record(
         .as_ref()
         .map(|state| state.host_id.clone())
         .unwrap_or_default();
-    let ((history, events), repo_ids, loaded_fit, snapshots) =
+    let ((history, events), repo_ids, (loaded_fit, roster), snapshots) =
         tokio::task::spawn_blocking(move || {
             let ids: BTreeMap<String, u64> = slugs
                 .iter()
@@ -1021,30 +1021,34 @@ pub(super) async fn record(
                 fit::load_latest(&journal_root, listed_at),
                 fit::v2::load_latest_v2(&journal_root, listed_at),
             );
+            // #10586: the roster history the fit read, from the same cache.
+            let roster = crate::eta::roster_history::load_for(&journal_root, listed_at).0;
             // #10500: the label timeline serving dates first-seen PRs from.
             let snapshots = crate::eta::fleet::load_all(&journal_root);
-            (load_history(&history_roots, &journal_root, &host), ids, loaded_fit, snapshots)
+            (
+                load_history(&history_roots, &journal_root, &host),
+                ids,
+                (loaded_fit, roster),
+                snapshots,
+            )
         })
         .await
         .unwrap_or_default();
 
     let ready = ready_rows(slug_cache).await;
     // Queue friction (#10193), read BEFORE `now`: every reading is then
-    // knowable at the estimates this pass makes.
-    let (book, tracked) = lock()
+    // knowable at the estimates this pass makes. Dependency edges (#10510)
+    // are read from the same snapshot, also before `now`.
+    let (book, tracked, dep_seed) = lock()
         .as_ref()
         .map(|s| {
             let repos = s.tracker.item_keys().into_iter().map(|k| k.repo).collect();
-            (s.tracker.friction.clone(), repos)
+            (s.tracker.friction.clone(), repos, super::eta_dependency::seed(&s.tracker))
         })
         .unwrap_or_default();
-    let friction_repos = repos
-        .iter()
-        .map(|(root, slug, prs, _)| {
-            (root.clone(), slug.clone(), prs.iter().map(|p| p.number).collect())
-        })
-        .collect();
+    let friction_repos = super::eta_friction::repos_of(&repos);
     let book = super::eta_friction::refresh(book, friction_repos, tracked, slug_cache).await;
+    let dependencies = super::eta_dependency::refresh(dep_seed, &repos).await;
     let now = Utc::now();
     let pool_exhausted = pool_brake_tripped(workspace_pool, &roots, now);
     let mut effects = Vec::new();
@@ -1072,7 +1076,9 @@ pub(super) async fn record(
         );
         state.repo_ids.extend(repo_ids);
         state.tracker.on_fleet_snapshots(&snapshots, listed_at);
+        state.tracker.set_fleet_history(roster);
         state.tracker.friction = book;
+        state.tracker.dependencies = dependencies;
         state.pool_exhausted = pool_exhausted;
         state.locked_repos = super::ops::lockout::locked_slugs()
             .into_iter()

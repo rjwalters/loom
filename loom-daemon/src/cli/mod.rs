@@ -12,6 +12,11 @@
 #[path = "../live_gh_guard.rs"]
 mod live_gh_guard;
 
+// Whole-`Cli` parsing for tests, on an 8 MiB thread like the binary's main
+// thread (#10616). `main.rs` is size-frozen, so it is mounted here.
+#[cfg(test)]
+pub(crate) mod whole_cli_parse;
+
 pub(crate) mod accounts;
 pub(crate) mod accounts_args;
 pub(crate) mod accounts_session;

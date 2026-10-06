@@ -6,8 +6,8 @@ use super::{as_of, history_a, input_at};
 use crate::eta::explanation::Explanation;
 use crate::eta::grid;
 use crate::eta::heuristics::{
-    estimate_path, PathRules, LAND_HELD_HERON, LAND_KEEN_WREN, LAND_QUICK_TERN, LAND_TWIN_OTTER,
-    LAND_TWIN_OTTER_B,
+    estimate_path, PathRules, LAND_HELD_HERON, LAND_KEEN_WREN, LAND_QUICK_TERN, LAND_SWIFT_TERN,
+    LAND_TANDEM_WREN, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B,
 };
 use crate::eta::history::{SampleSource, StageSample, StageSamples};
 use crate::eta::labels::{
@@ -136,14 +136,17 @@ fn every_shipped_heuristic_refuses_a_held_pr_exactly_as_before() {
         .ids()
         .into_iter()
         .partition(|id| registry.get(id).unwrap().models_hold());
+    // `-tandem-wren` (#10510) composes over `-b` and reads its input.
     assert_eq!(
         models_hold,
         vec![
             LAND_QUICK_TERN,
+            LAND_SWIFT_TERN,
             LAND_HELD_HERON,
             LAND_KEEN_WREN,
             LAND_TWIN_OTTER,
-            LAND_TWIN_OTTER_B
+            LAND_TWIN_OTTER_B,
+            LAND_TANDEM_WREN
         ]
     );
     assert_eq!(path_engine.len(), 7, "{path_engine:?}");

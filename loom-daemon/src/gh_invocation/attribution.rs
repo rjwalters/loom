@@ -215,6 +215,30 @@ fn is_status_line(line: &str) -> bool {
     status.len() >= 3 && status.as_bytes()[..3].iter().all(u8::is_ascii_digit)
 }
 
+/// Three ASCII digits at the start of `s` followed by `end`, as an HTTP
+/// status (100–599).
+fn status_then(s: &str, end: char) -> Option<u16> {
+    let digits = s.get(..3)?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) || !s[3..].starts_with(end) {
+        return None;
+    }
+    digits.parse().ok().filter(|c| (100..=599).contains(c))
+}
+
+/// The HTTP status `gh` printed on stderr (#10343), if any: its formatted
+/// API error `… (HTTP 404)`, or a bare `HTTP 403: …` line. Anything else —
+/// a GraphQL error, a network failure, a local refusal — is `None`: the
+/// status is unknown, never guessed.
+#[must_use]
+pub fn stderr_status(stderr: &str) -> Option<u16> {
+    stderr.lines().find_map(|line| {
+        let line = line.trim();
+        line.match_indices("(HTTP ")
+            .find_map(|(i, m)| status_then(&line[i + m.len()..], ')'))
+            .or_else(|| line.strip_prefix("HTTP ").and_then(|r| status_then(r, ':')))
+    })
+}
+
 /// `(pg, pu)` for one call: the request count when the call is known to
 /// stand for more than one, and whether that count is unknown.
 ///

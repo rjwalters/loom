@@ -43,6 +43,7 @@
 //! invocation — [`forge_call_stats::record_with_identity`] already
 //! guarantees that.
 
+use super::billing::{self, Billing};
 use super::telemetry::Outcome as InvokeOutcome;
 use super::GhInvocation;
 use crate::forge_call_stats::{self, CallIdentity, Outcome, Pool};
@@ -51,7 +52,8 @@ use std::ffi::OsString;
 #[path = "attribution.rs"]
 mod attribution;
 pub use attribution::{
-    cred_of, cred_of_with, cwd_route_disagrees, pages, remote_repo, CredAttr, RepoOrigin,
+    cred_of, cred_of_with, cwd_route_disagrees, pages, remote_repo, stderr_status, CredAttr,
+    RepoOrigin,
 };
 
 /// The pool an invocation spends, from its argv alone (no response needed).
@@ -214,9 +216,14 @@ fn is_rate_limit_probe(args: &[OsString]) -> bool {
     args.first().is_some_and(|a| a == "api") && static_pool(args) == Pool::Other
 }
 
-/// Record one completed invocation (see the module docs for what is skipped).
+/// Record one completed invocation (see the module docs for what is skipped)
+/// and return its [`Billing`] facts for the `invoke github` span (#10343).
 /// `captured` is `(stdout, stderr)` for a captured run, `None` for passthrough.
-pub(super) fn record(inv: &GhInvocation, outcome: InvokeOutcome, captured: Option<(&[u8], &[u8])>) {
+pub(super) fn record(
+    inv: &GhInvocation,
+    outcome: InvokeOutcome,
+    captured: Option<(&[u8], &[u8])>,
+) -> Billing {
     if matches!(
         outcome,
         InvokeOutcome::SpawnFailed
@@ -224,7 +231,11 @@ pub(super) fn record(inv: &GhInvocation, outcome: InvokeOutcome, captured: Optio
             | InvokeOutcome::RoutingBlocked
             | InvokeOutcome::AdapterUnavailable
     ) {
-        return;
+        return Billing::not_sent(
+            static_pool(&inv.args).as_str(),
+            &cred_of(inv),
+            super::reader_route::role_of(inv).as_str(),
+        );
     }
     let caller = inv.operation.as_str();
     let (identity, ro) =
@@ -311,6 +322,15 @@ pub(super) fn record(inv: &GhInvocation, outcome: InvokeOutcome, captured: Optio
     }
 
     record_metric(caller, &identity, &cred, &resource, classified, pg);
+    Billing::sent(
+        response.as_ref().map(|r| r.status),
+        stderr,
+        billing::requests(pg, pu, response.is_some()),
+        classified.into(),
+        &resource,
+        &cred,
+        identity.role.as_deref().unwrap_or("unknown"),
+    )
 }
 
 /// Record a shed read (W4-C): no request was sent, so the row charges

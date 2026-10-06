@@ -17,16 +17,22 @@
 //!
 //! With `LOOM_REPO_FACTS=0` (or a root pinned to legacy) every function here
 //! issues exactly the pre-facts calls.
+//!
+//! The repo is the checkout's own (W6, [`super::forge_state`]): gh's base
+//! repo with `GH_REPO` / `LOOM_REPO` ignored, and a listing built from a
+//! fact names that repo explicitly instead of gh's placeholder.
 
 use std::path::Path;
 
 use super::clean::{self, PrStatus};
-use super::gh;
 use crate::forge_repo_facts::{self as facts, GhRepoEnv, Lookup, OwnerFact};
 
 /// One row of `GET repos/{o}/{r}/pulls…` (or `pulls/<n>`).
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct PrRowRest {
+    /// The PR number (identity check of a single-PR read, W6).
+    #[serde(default)]
+    pub(crate) number: Option<u64>,
     pub(crate) state: String,
     #[serde(default)]
     pub(crate) merged_at: Option<String>,
@@ -61,6 +67,9 @@ pub(crate) struct PrSideRest {
 
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct PrRepoRest {
+    /// The numeric repository id: rename-proof identity (W6).
+    #[serde(default)]
+    pub(crate) id: Option<u64>,
     #[serde(default)]
     pub(crate) full_name: Option<String>,
     #[serde(default)]
@@ -101,18 +110,28 @@ pub(crate) enum RowsError {
     Gone,
 }
 
-/// `repos/{owner}/{repo}/pulls?state=all&head=<owner>:<branch>&per_page=30` —
-/// the one REST list call [`clean::check_pr_status_for_branch_rest`] has
-/// always made, unchanged (same argv, same `clean.pr_status_rest` row).
+/// `repos/<repo>/pulls?state=all&head=<owner>:<branch>&per_page=30` — the
+/// one REST list call [`clean::check_pr_status_for_branch_rest`] has always
+/// made (same `clean.pr_status_rest` row). `<repo>` is the fact's canonical
+/// repo when the owner came from one, else gh's placeholder; `GH_REPO` is
+/// stripped either way (W6). Unconditional: a listing is not dropped by
+/// `gh-cached --invalidate`, so a stored one could outlive a merge.
 pub(crate) fn fetch_pr_rows(
     repo_root: &Path,
     owner: &str,
     branch: &str,
+    fact: Option<&facts::Fact>,
 ) -> Result<Vec<PrRowRest>, RowsError> {
-    let path =
-        format!("repos/{{owner}}/{{repo}}/pulls?state=all&head={owner}:{branch}&per_page=30");
-    let out = gh::bounded_hygiene("clean.pr_status_rest", repo_root, ["api", &path])
-        .ok_or(RowsError::Failed)?;
+    let path = super::forge_state::pulls_by_head_path(fact, owner, branch);
+    let out = super::forge_state::hygiene_get(
+        "clean.pr_status_rest",
+        None,
+        repo_root,
+        &path,
+        fact,
+        crate::gh_invocation::ReadClass::Hygiene,
+    )
+    .ok_or(RowsError::Failed)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         if stderr.contains("HTTP 404") || stderr.contains("HTTP 410") {
@@ -134,8 +153,8 @@ pub(crate) fn rows_status(rows: &[PrRowRest]) -> PrStatus {
     }))
 }
 
-/// The owner `gh api repos/{owner}/{repo}` would report for `repo_root`
-/// (`GH_REPO`/`LOOM_REPO` honoured, post-redirect).
+/// The owner of `repo_root`'s own repo (gh's base repo, `GH_REPO` /
+/// `LOOM_REPO` ignored — W6), post-redirect.
 ///
 /// From the canonical record when facts are on; the legacy
 /// [`clean::repo_owner_rest`] call when they are off or the root is pinned to
@@ -143,7 +162,7 @@ pub(crate) fn rows_status(rows: &[PrRowRest]) -> PrStatus {
 /// fallback.
 #[must_use]
 pub(crate) fn repo_owner(repo_root: &Path) -> Option<OwnerFact> {
-    match facts::canonical(repo_root, GhRepoEnv::Honour) {
+    match facts::canonical(repo_root, GhRepoEnv::Ignore) {
         Lookup::Fact(f) => Some(OwnerFact::from_fact(f)),
         Lookup::Unavailable => None,
         Lookup::Legacy => clean::repo_owner_rest(repo_root).map(OwnerFact::legacy),
@@ -192,7 +211,7 @@ pub(crate) fn pr_status_validated(repo_root: &Path, owner: &OwnerFact, branch: &
         return clean::check_pr_status_for_branch_rest(repo_root, &owner.owner, branch);
     };
     let sent_at = unix_now();
-    match fetch_pr_rows(repo_root, &owner.owner, branch) {
+    match fetch_pr_rows(repo_root, &owner.owner, branch, Some(fact)) {
         Ok(rows) if rows_match(fact, &rows, sent_at) => rows_status(&rows),
         Ok(_) => PrStatus::Unknown,
         Err(RowsError::Gone) => {
@@ -214,7 +233,7 @@ pub(crate) fn pr_status_confirmed(repo_root: &Path, owner: &OwnerFact, branch: &
     if owner.fact.is_none() || !matches!(status, PrStatus::NoPr) {
         return status;
     }
-    if facts::confirm_owner(repo_root, GhRepoEnv::Honour, &owner.owner) {
+    if facts::confirm_owner(repo_root, GhRepoEnv::Ignore, &owner.owner) {
         PrStatus::NoPr
     } else {
         PrStatus::Unknown

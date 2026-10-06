@@ -470,6 +470,11 @@ jobs:
       # clamps to zero headroom rather than negative.
       - name: Verify the SigNoz queue/quota gauge queries against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_queue_quota_queries -- --ignored --nocapture
+      # #10343: github-shadow.sql's bill must charge each quota window once --
+      # stale host readings, interleaved buckets and reset jitter must not
+      # re-charge (the PR #10565 review's live 61k-in-2h inflation).
+      - name: Verify the SigNoz GitHub shadow-spend queries against a real pinned ClickHouse
+        run: cargo test --package loom-daemon --features otlp --test signoz_github_shadow_queries -- --ignored --nocapture
       # #8528 / #8856: the same technique for the trial's one saved ALERT RULE
       # (alerts/queue-starvation.json), the last query artifact in this trial
       # with only a vocabulary guard. An alert that returns no rows -- or rows
