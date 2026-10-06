@@ -546,29 +546,22 @@ fn run_preflight(
     // #10331: plain `gh` in the worker reaches the agent `gh` front first, so
     // its `issue|pr view|list --json` reads are ETag-revalidated (never stale)
     // and everything else execs the next `gh` untouched. `LOOM_GH_SHIM=0`
-    // opts out; see defaults/docs/gh-cached.md.
-    if let Some(path) = crate::agent_gh::worker_path(std::env::var_os("PATH").as_deref()) {
-        command.env("PATH", path);
+    // opts out; see defaults/docs/gh-cached.md. #9987: the managed launcher
+    // stays ahead of the front; under `enforcement.api = required` a worker
+    // whose first `gh` is anything else is not spawned. The order is
+    // `agent_gh::session_path`, shared with interactive sessions (#10516).
+    let current = std::env::var_os("PATH");
+    let path = crate::agent_gh::session_path(current.as_deref(), worker_egress.as_ref());
+    if let Some(finding) = worker_egress
+        .as_ref()
+        .and_then(|e| e.launcher_first_finding(path.as_deref().or(current.as_deref())))
+    {
+        return Err(LaunchError::config(crate::forge_egress::worker_env::refusal_message(
+            &finding,
+        )));
     }
-    // #9987: the managed launcher stays ahead of the cache front; under
-    // `enforcement.api = required` a worker whose first `gh` is anything else
-    // is not spawned.
-    if let Some(egress) = &worker_egress {
-        let current = command
-            .get_envs()
-            .find(|(k, _)| *k == "PATH")
-            .and_then(|(_, v)| v.map(std::ffi::OsString::from))
-            .or_else(|| std::env::var_os("PATH"));
-        let path = egress.worker_path(current.as_deref());
-        if let Some(finding) = egress.launcher_first_finding(path.as_deref().or(current.as_deref()))
-        {
-            return Err(LaunchError::config(crate::forge_egress::worker_env::refusal_message(
-                &finding,
-            )));
-        }
-        if let Some(path) = path {
-            command.env("PATH", path);
-        }
+    if let Some(path) = path {
+        command.env("PATH", path);
     }
     // CARGO_INCREMENTAL=0 for every Loom-spawned worker (#8456, parent #8453
     // item 1). Cargo keys a crate's incremental session state by the crate's
