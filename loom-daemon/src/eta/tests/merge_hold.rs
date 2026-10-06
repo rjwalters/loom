@@ -134,7 +134,7 @@ fn every_shipped_heuristic_refuses_a_held_pr_exactly_as_before() {
         .into_iter()
         .partition(|id| registry.get(id).unwrap().models_hold());
     assert_eq!(models_hold, vec![LAND_TWIN_OTTER, LAND_TWIN_OTTER_B]);
-    assert_eq!(path_engine.len(), 6, "{path_engine:?}");
+    assert_eq!(path_engine.len(), 7, "{path_engine:?}");
     for id in path_engine {
         let heuristic = registry.get(id).unwrap();
         let explanation = heuristic.estimate(&held, &history_a());

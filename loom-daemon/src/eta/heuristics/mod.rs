@@ -10,6 +10,7 @@
 //! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
+mod land_calm_plover;
 mod land_fresh_tide;
 mod land_twin_otter;
 mod land_twin_otter_b;
@@ -20,6 +21,7 @@ mod land_v4;
 mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
+pub use land_calm_plover::{LandCalmPlover, LAND_CALM_PLOVER};
 pub use land_fresh_tide::{LandFreshTide, LAND_FRESH_TIDE};
 pub(crate) use land_twin_otter::recompute as recompute_twin_otter;
 pub use land_twin_otter::{
@@ -37,7 +39,7 @@ pub use start_v1::{StartV1, START_V1};
 
 /// The heuristic whose track record the calibration log (#10207) records.
 /// (The `land-2026-10-04-amber-heron` shadow that consumed it was retired
-/// 2026-10-06, #10484; the log stays — backtests and `eta view` use it.)
+/// 2026-10-06, #10484; `land-2026-10-06-calm-plover` consumes it now, #10489.)
 pub const CALIBRATION_BASE: &str = LAND_V2;
 
 use super::explanation::{
@@ -186,6 +188,7 @@ fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) -> Explanat
         stalled: stall::binding(&input.stalls, as_of),
         truncated: Vec::new(),
         recalibration: None,
+        calibration: None,
         twin_otter: None,
     }
 }

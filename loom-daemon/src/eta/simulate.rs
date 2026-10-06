@@ -602,9 +602,10 @@ pub fn run_explanation(explanation: &Explanation) -> Option<(i64, i64, i64, i64)
     }
     let spec = spec_from_explanation(explanation)?;
     let simulated = run(&spec).ok().map(|s| s.quantiles)?;
-    Some(match &explanation.recalibration {
-        Some(r) => super::recalibrate::apply(simulated.1, &r.ratios, r.mode),
-        None => simulated,
+    Some(match (&explanation.recalibration, &explanation.calibration) {
+        (Some(r), _) => super::recalibrate::apply(simulated.1, &r.ratios, r.mode),
+        (None, Some(c)) => super::conformal::apply(simulated, &c.shift),
+        (None, None) => simulated,
     })
 }
 

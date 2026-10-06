@@ -97,6 +97,7 @@
 pub mod backtest;
 pub mod calibration_log;
 pub mod config;
+pub mod conformal;
 pub mod doctor;
 pub mod doctor_facts;
 pub mod emit;
@@ -656,6 +657,7 @@ impl Registry {
                 Box::new(heuristics::FinishV1),
                 Box::new(heuristics::LandV1),
                 Box::new(heuristics::LandV2),
+                Box::new(heuristics::LandCalmPlover),
                 Box::new(heuristics::LandFreshTide::default()),
                 Box::new(heuristics::LandV4),
                 Box::new(heuristics::LandTwinOtter::new(fit.clone())),

@@ -615,6 +615,10 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ("heuristics/land_v2.rs", include_str!("../heuristics/land_v2.rs")),
     ("heuristics/land_v3.rs", include_str!("../heuristics/land_v3.rs")),
     (
+        "heuristics/land_calm_plover.rs",
+        include_str!("../heuristics/land_calm_plover.rs"),
+    ),
+    (
         "heuristics/land_fresh_tide.rs",
         include_str!("../heuristics/land_fresh_tide.rs"),
     ),
@@ -622,6 +626,8 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ("recency.rs", include_str!("../recency.rs")),
     // #10207: the recalibration fit and transform the heuristic calls.
     ("recalibrate.rs", include_str!("../recalibrate.rs")),
+    // #10489: the conformal calibration the calm-plover heuristic calls.
+    ("conformal.rs", include_str!("../conformal.rs")),
     ("twin_otter/mod.rs", include_str!("../twin_otter/mod.rs")),
     ("twin_otter/eval.rs", include_str!("../twin_otter/eval.rs")),
     ("twin_otter/path.rs", include_str!("../twin_otter/path.rs")),
