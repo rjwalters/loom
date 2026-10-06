@@ -10,10 +10,14 @@
 //! `land-2026-10-06-calm-plover` (#10489) and `land-2026-10-06-quick-tern`
 //! (#10524) are calibration wrappers over `land-v2` and
 //! `land-2026-10-04-twin-otter-b` respectively.
+//! `land-2026-10-06-held-heron` (#10523) is twin-otter-b with a held or
+//! sequenced PR routed to the competing-risks simulator
+//! ([`crate::eta::hazard_sim`]).
 //! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
 mod land_calm_plover;
+mod land_held_heron;
 mod land_quick_tern;
 mod land_twin_otter;
 mod land_twin_otter_b;
@@ -26,6 +30,10 @@ mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
 pub use land_calm_plover::{LandCalmPlover, LAND_CALM_PLOVER};
+pub use land_held_heron::{
+    side_state, LandHeldHeron, DRAW_ORDER as HELD_HERON_DRAW_ORDER, LAND_HELD_HERON,
+    METHOD as HELD_HERON_METHOD,
+};
 pub use land_quick_tern::{LandQuickTern, LAND_QUICK_TERN};
 pub(crate) use land_twin_otter::recompute as recompute_twin_otter;
 pub use land_twin_otter::{
@@ -204,6 +212,7 @@ fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) -> Explanat
         twin_otter: None,
         queue: None,
         regime_adjustment: None,
+        held_heron: None,
     }
 }
 

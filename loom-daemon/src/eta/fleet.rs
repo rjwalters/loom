@@ -81,7 +81,7 @@
 use super::config::HistoryScopeMode;
 use super::episodes::{derive, input_from_pr_history, StageEpisode};
 use super::explanation::HistoryScope;
-use super::flag_timeline::{self, flag_changes_from_input, FlagChange};
+use super::flag_timeline::{self, flag_changes_from_input, FlagChange, RepoFlagChange};
 use super::history::{SampleSource, StageSample, StageSamples, VerdictSample};
 use super::journal::{censored_from_pr_history, entries_from_pr_history, JournalEntry};
 use super::{Provenance, Stage, WINDOW_DAYS};
@@ -423,7 +423,9 @@ impl FleetSnapshot {
     /// when it left for a stage or a merge, censored otherwise) so
     /// `select(repo, MergeHold, …)` answers. The split `merge_wait` episodes
     /// are deliberately **not** samples: `merge_wait` samples keep the pooled
-    /// definition every shipped heuristic reads.
+    /// definition every shipped heuristic reads. The flag timeline (#10245)
+    /// is copied into [`StageSamples::flag_changes`] with this snapshot's
+    /// repo (#10523).
     #[must_use]
     pub fn stage_samples(&self) -> StageSamples {
         let mut history = StageSamples {
@@ -457,6 +459,15 @@ impl FleetSnapshot {
             }
         }
         history.episodes = self.episodes.clone();
+        // #10523: the flag timeline, tagged with this snapshot's repo.
+        history.flag_changes = self
+            .flag_changes
+            .iter()
+            .map(|change| RepoFlagChange {
+                repo: self.repo.clone(),
+                change: *change,
+            })
+            .collect();
         history
     }
 

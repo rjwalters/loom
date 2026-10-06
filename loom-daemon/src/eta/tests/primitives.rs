@@ -232,6 +232,7 @@ fn registry_resolves_current_per_kind() {
             "land-v4",
             "little-v0",
             "land-2026-10-06-quick-tern",
+            "land-2026-10-06-held-heron",
             "land-2026-10-04-twin-otter",
             "land-2026-10-04-twin-otter-b"
         ]
@@ -268,6 +269,13 @@ fn registry_resolves_current_per_kind() {
             .id(),
         "land-2026-10-06-quick-tern"
     );
+    // `land-2026-10-06-held-heron` (#10523) likewise: registered, not current.
+    assert_eq!(
+        registry
+            .current(Kind::Land, Some("land-2026-10-06-held-heron"))
+            .id(),
+        "land-2026-10-06-held-heron"
+    );
     // `land-2026-10-04-fresh-tide` (#10209) was retired 2026-10-06 (#10549):
     // selecting it falls back to the default.
     assert_eq!(
@@ -303,6 +311,7 @@ fn for_kind_enumerates_every_registered_heuristic_of_a_kind() {
             "land-v4",
             "little-v0",
             "land-2026-10-06-quick-tern",
+            "land-2026-10-06-held-heron",
             "land-2026-10-04-twin-otter",
             "land-2026-10-04-twin-otter-b"
         ]

@@ -115,6 +115,13 @@ pub struct Explanation {
     /// every other heuristic, so their explanations are byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<QueueRecord>,
+    /// What `land-2026-10-06-held-heron` (#10523) simulated for a held or
+    /// sequenced PR: the side state, the hazards and their evidence, and
+    /// everything the forward solution reads. Absent for every other
+    /// heuristic, and for a held-heron answer served by twin-otter-b, so
+    /// their explanations are byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_heron: Option<super::hazard_sim::HeldHeronRecord>,
     /// The latent-regime residual adjustment applied to a stage (#10528).
     /// Absent when no adjustment applied (below the row floor, or the recent
     /// residuals are noise), so every such explanation is byte-identical to

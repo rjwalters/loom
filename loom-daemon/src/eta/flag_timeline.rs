@@ -50,6 +50,18 @@ impl FlagChange {
     }
 }
 
+/// One [`FlagChange`] with the repo it belongs to: how a flag timeline
+/// reaches an estimator ([`super::history::StageSamples::flag_changes`],
+/// #10523). A fleet snapshot is per repo, so its changes carry no repo of
+/// their own; a history merges several snapshots, so each change needs one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RepoFlagChange {
+    /// `owner/repo`.
+    pub repo: String,
+    /// The change.
+    pub change: FlagChange,
+}
+
 /// `input`'s flag timeline as knowable at `as_of`: an entry at its first label
 /// event, then one per change of the mask.
 #[must_use]

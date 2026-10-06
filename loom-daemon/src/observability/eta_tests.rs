@@ -76,11 +76,13 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
     // answer (land-v3 and amber-heron retired, #10484; fresh-tide retired,
     // #10549); the land-2026-10-04-twin-otter shadow (#10243) and
     // little-v0 (#10208) refuse this pre-PR stage; the twin-otter -b
-    // composition (#10244) answers it from land-v2's path, and so does its
-    // land-2026-10-06-quick-tern calibration wrapper (#10524).
-    assert_eq!(delivered.emitted, 7, "finish + land + the five answering land shadows");
+    // composition (#10244) answers it from land-v2's path, and so do its
+    // land-2026-10-06-quick-tern calibration wrapper (#10524) and the
+    // land-2026-10-06-held-heron hybrid (#10523), which routes only held or
+    // sequenced PRs elsewhere.
+    assert_eq!(delivered.emitted, 8, "finish + land + the six answering land shadows");
     assert_eq!(delivered.refused, 2, "twin-otter and little-v0: unknown_stage before a PR");
-    assert_eq!(delivered.outcomes, 9, "finish finished, every land estimate abandoned");
+    assert_eq!(delivered.outcomes, 10, "finish finished, every land estimate abandoned");
     assert_eq!(delivered.invalid, 0);
     let offered = sink.0.lock().unwrap();
     let kinds: Vec<&str> = offered.iter().map(|e| e.record.kind()).collect();
@@ -96,6 +98,8 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
             "eta.estimate",
             "eta.estimate",
             "eta.estimate",
+            "eta.estimate",
+            "eta.outcome",
             "eta.outcome",
             "eta.outcome",
             "eta.outcome",
@@ -122,7 +126,7 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
         assert_eq!(envelope.host_id, "host-test");
         assert_eq!(envelope.schema_version, 12);
     }
-    let TelemetryRecord::EtaOutcome(outcome) = &offered[9].record else {
+    let TelemetryRecord::EtaOutcome(outcome) = &offered[10].record else {
         panic!("outcome")
     };
     assert_eq!(outcome.estimate.loom, provenance(), "the estimating build");
@@ -138,7 +142,7 @@ fn dry_run_offers_nothing_and_counts_everything() {
     let (emissions, outcomes) = lifecycle(provenance());
     let sink = Capture::default();
     let delivered = deliver(emissions, outcomes, &provenance(), "host-test", true, Some(&sink));
-    assert_eq!((delivered.emitted, delivered.refused, delivered.outcomes), (7, 2, 9));
+    assert_eq!((delivered.emitted, delivered.refused, delivered.outcomes), (8, 2, 10));
     assert!(sink.0.lock().unwrap().is_empty());
 }
 
@@ -152,15 +156,15 @@ fn records_without_valid_provenance_are_never_offered() {
     let (emissions, outcomes) = lifecycle(bad.clone());
     let sink = Capture::default();
     let delivered = deliver(emissions, Vec::new(), &provenance(), "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 9);
+    assert_eq!(delivered.invalid, 10);
     assert!(sink.0.lock().unwrap().is_empty());
     // … and outcomes observed by one, or scoring one.
     let delivered =
         deliver(Vec::new(), outcomes.clone(), &provenance(), "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 9, "the estimating build's provenance is checked too");
+    assert_eq!(delivered.invalid, 10, "the estimating build's provenance is checked too");
     let (_, good_outcomes) = lifecycle(provenance());
     let delivered = deliver(Vec::new(), good_outcomes, &bad, "host-test", false, Some(&sink));
-    assert_eq!(delivered.invalid, 9, "the observing build's provenance is checked too");
+    assert_eq!(delivered.invalid, 10, "the observing build's provenance is checked too");
     assert!(sink.0.lock().unwrap().is_empty());
 }
 
@@ -212,7 +216,7 @@ fn incomplete_provenance_is_emitted_and_marked() {
     let delivered = deliver(emissions, outcomes, &tarball, "host-test", false, Some(&sink));
     assert_eq!(
         (delivered.emitted, delivered.outcomes, delivered.invalid),
-        (7, 9, 0),
+        (8, 10, 0),
         "no data lost"
     );
     for envelope in sink.0.lock().unwrap().iter() {
