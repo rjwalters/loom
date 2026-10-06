@@ -11,7 +11,7 @@
 
 use std::f64::consts::{FRAC_1_SQRT_2, TAU};
 
-use super::{MAX_NEWTON_ITERATIONS, N_FEATURES, STD_EPS};
+use super::{MAX_NEWTON_ITERATIONS, STD_EPS};
 
 /// The rational-approximation coefficients, in one scope so the precision
 /// allow covers these tables only.
@@ -382,9 +382,9 @@ pub fn cholesky_solve(a: &[f64], b: &[f64]) -> Option<Vec<f64>> {
 /// Per-feature mean and population standard deviation plus [`STD_EPS`],
 /// two-pass. An empty input gives means of 0 and deviations of `STD_EPS`.
 #[must_use]
-pub fn standardization(xs: &[[f64; N_FEATURES]]) -> (Vec<f64>, Vec<f64>) {
-    let mut mu = vec![0.0; N_FEATURES];
-    let mut sd = vec![STD_EPS; N_FEATURES];
+pub fn standardization<const N: usize>(xs: &[[f64; N]]) -> (Vec<f64>, Vec<f64>) {
+    let mut mu = vec![0.0; N];
+    let mut sd = vec![STD_EPS; N];
     if xs.is_empty() {
         return (mu, sd);
     }
@@ -401,8 +401,8 @@ pub fn standardization(xs: &[[f64; N_FEATURES]]) -> (Vec<f64>, Vec<f64>) {
 
 /// `(x − mu) / sd`, elementwise.
 #[must_use]
-pub fn standardize(x: &[f64; N_FEATURES], mu: &[f64], sd: &[f64]) -> [f64; N_FEATURES] {
-    let mut z = [0.0; N_FEATURES];
+pub fn standardize<const N: usize>(x: &[f64; N], mu: &[f64], sd: &[f64]) -> [f64; N] {
+    let mut z = [0.0; N];
     for (j, v) in z.iter_mut().enumerate() {
         *v = (x[j] - mu[j]) / sd[j];
     }

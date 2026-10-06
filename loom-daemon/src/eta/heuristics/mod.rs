@@ -13,12 +13,15 @@
 //! `land-2026-10-06-held-heron` (#10523) is twin-otter-b with a held or
 //! sequenced PR routed to the competing-risks simulator
 //! ([`crate::eta::hazard_sim`]).
+//! `land-2026-10-06-keen-wren` (#10508) is twin-otter-b's priority-aware
+//! successor: the same evaluation over an `eta-fit/v2` file.
 //! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
 mod land_calm_plover;
 mod land_dependency;
 mod land_held_heron;
+mod land_keen_wren;
 mod land_quick_tern;
 mod land_twin_otter;
 mod land_twin_otter_b;
@@ -36,6 +39,7 @@ pub use land_held_heron::{
     side_state, LandHeldHeron, DRAW_ORDER as HELD_HERON_DRAW_ORDER, LAND_HELD_HERON,
     METHOD as HELD_HERON_METHOD,
 };
+pub use land_keen_wren::{LandKeenWren, LAND_KEEN_WREN, PRE_PR_METHOD as KEEN_WREN_PRE_PR_METHOD};
 pub use land_quick_tern::{LandQuickTern, LAND_QUICK_TERN};
 pub(crate) use land_twin_otter::recompute as recompute_twin_otter;
 pub use land_twin_otter::{

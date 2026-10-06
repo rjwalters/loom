@@ -52,7 +52,7 @@ use chrono::{DateTime, Utc};
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::eta::calibration_log;
 use crate::eta::config::EtaConfig;
-use crate::eta::fit::{self, CoefficientFile};
+use crate::eta::fit;
 use crate::eta::journal::{self, JournalEntry};
 use crate::eta::queue_features::EventLog;
 use crate::eta::recalibrate::CalibrationObservation;
@@ -524,6 +524,7 @@ pub fn spawn_task(
         return None;
     }
     log_fit(None, registry.fit(), &workspace_root);
+    log_fit_v2(None, registry.fit_v2());
     let mut tracker = Tracker::new(loom);
     // Only the ETA authority restores (#10498); a pending estimate of a retired
     // heuristic is dropped, never scored or emitted as an `eta.outcome` (#10484).
@@ -897,37 +898,6 @@ async fn estimate_isolated(keys: Option<Vec<ItemKey>>, now: DateTime<Utc>) -> Ve
     .unwrap_or_default()
 }
 
-/// The registry to swap in after a pass loaded `loaded` while the live
-/// registry was built with `registered` (#10243), or `None` to keep it.
-/// Pure, and keyed on the id alone: the same file again swaps nothing; a new
-/// id (the daily refit), or a file appearing or disappearing, rebuilds the
-/// whole registry, which is the same as rebuilding the one fitted heuristic.
-fn swap_fit(registered: Option<&str>, loaded: Option<CoefficientFile>) -> Option<Registry> {
-    if registered == loaded.as_ref().map(|f| f.id.as_str()) {
-        return None;
-    }
-    Some(Registry::with_fit(loaded.map(Arc::new)))
-}
-
-/// Log a change of coefficient file: the new id and cutoff, or one warning
-/// naming the directory when there is none.
-fn log_fit(old: Option<&str>, new: Option<&CoefficientFile>, workspace_root: &Path) {
-    match new {
-        Some(file) => log::info!(
-            "eta: coefficient file {} (as_of {}) loaded for the fitted heuristics, replacing {}",
-            file.id,
-            file.as_of.to_rfc3339(),
-            old.unwrap_or("none")
-        ),
-        None => log::warn!(
-            "eta: no coefficient file under {} (replacing {}); \
-             land-2026-10-04-twin-otter refuses no_model until a fit is written",
-            fit::fit_dir(workspace_root).display(),
-            old.unwrap_or("none")
-        ),
-    }
-}
-
 /// The history one ETA pass estimates from: the `sweep.outcome` journal of
 /// every managed root plus the ETA stage journal, then the configured scope
 /// applied on top (#9343).
@@ -1047,7 +1017,10 @@ pub(super) async fn record(
                 })
                 .collect();
             // #10243: a daily refit reaches the running estimator here.
-            let loaded_fit = fit::load_latest(&journal_root, listed_at);
+            let loaded_fit = (
+                fit::load_latest(&journal_root, listed_at),
+                fit::v2::load_latest_v2(&journal_root, listed_at),
+            );
             // #10500: the label timeline serving dates first-seen PRs from.
             let snapshots = crate::eta::fleet::load_all(&journal_root);
             (load_history(&history_roots, &journal_root, &host), ids, loaded_fit, snapshots)
@@ -1080,8 +1053,12 @@ pub(super) async fn record(
             return;
         };
         state.history = history;
-        if let Some(registry) = swap_fit(state.registry.fit_id(), loaded_fit) {
-            log_fit(state.registry.fit_id(), registry.fit(), &state.workspace_root);
+        let registered = (state.registry.fit_id(), state.registry.fit_v2_id());
+        if let Some(registry) = swap_fit(registered, loaded_fit) {
+            if registry.fit_id() != state.registry.fit_id() {
+                log_fit(state.registry.fit_id(), registry.fit(), &state.workspace_root);
+            }
+            log_fit_v2(state.registry.fit_v2_id(), registry.fit_v2());
             state.registry = registry;
         }
         // #10207: every still-pending base estimate is a censored lower bound
@@ -1253,6 +1230,9 @@ fn reads_answered(rows: &[JournalEntry]) -> usize {
 mod authority;
 #[path = "eta_feature_pass.rs"]
 mod feature_pass;
+#[path = "eta_fit_swap.rs"]
+mod fit_swap;
+use fit_swap::{log_fit, log_fit_v2, swap_fit};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

@@ -29,6 +29,7 @@ mod hold_parity;
 mod hold_serving;
 mod item_features;
 mod journal;
+mod keen_wren;
 pub(crate) mod land_twin_otter;
 mod land_v3;
 mod little_v0;
@@ -54,6 +55,7 @@ mod star_parity;
 mod tracker;
 mod tracker_hold;
 mod twin_otter_parity;
+mod walk_forward;
 
 use super::explanation::Features;
 use super::history::StageSamples;

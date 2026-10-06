@@ -21,8 +21,9 @@
 //! explicit `--out` path prunes nothing.
 
 use super::coeffs::{self, CoefficientFile, FitMeta, FitWindow, Fitter};
+use super::features_v2::PriorityCoverage;
 use super::rows::{self, Assembled};
-use super::FitStage;
+use super::{v2, FitStage};
 use crate::eta::fleet::{self, FleetSnapshot};
 use crate::eta::star::StarInputs;
 use crate::eta::Provenance;
@@ -98,6 +99,12 @@ pub struct FitReport {
     pub rows_star_issue_only: usize,
     /// Old files removed by retention.
     pub pruned: usize,
+    /// The `eta-fit/v2` file's content-derived id (#10508).
+    pub v2_id: String,
+    /// Where the v2 file was (or would have been) written.
+    pub v2_path: PathBuf,
+    /// How many rows know each v2 priority input.
+    pub priority_coverage: PriorityCoverage,
 }
 
 /// This build, as the file's `fitter`.
@@ -137,15 +144,32 @@ pub fn fit_snapshots_with_star(
     star: Option<&StarInputs>,
 ) -> (CoefficientFile, Assembled) {
     let assembled = rows::build_with_star(snapshots, as_of, star);
+    let meta = fit_meta(&assembled, as_of, fitter);
+    let file = coeffs::fit(&meta, &assembled.rows, &assembled.dwells);
+    (file, assembled)
+}
+
+/// The `eta-fit/v2` file (#10508) of rows [`fit_snapshots_with_star`]
+/// assembled at `as_of`: the same rows, window and fitter, over the
+/// priority-aware features.
+#[must_use]
+pub fn fit_v2_of(assembled: &Assembled, as_of: DateTime<Utc>, fitter: &Fitter) -> CoefficientFile {
+    v2::fit_v2(
+        &fit_meta(assembled, as_of, fitter),
+        &assembled.rows,
+        &assembled.priority_inputs,
+        &assembled.dwells,
+    )
+}
+
+fn fit_meta(assembled: &Assembled, as_of: DateTime<Utc>, fitter: &Fitter) -> FitMeta {
     let mut window = FitWindow::standard(as_of);
     window.data_through = Some(assembled.data_through);
-    let meta = FitMeta {
+    FitMeta {
         as_of,
         window,
         fitter: fitter.clone(),
-    };
-    let file = coeffs::fit(&meta, &assembled.rows, &assembled.dwells);
-    (file, assembled)
+    }
 }
 
 /// Fit every snapshot under `root` at `as_of` and write the file to `out`, or
@@ -186,11 +210,17 @@ fn fit_loaded(
     let (file, assembled) = fit_snapshots_with_star(snapshots, as_of, fitter, Some(&star));
     let dir = coeffs::fit_dir(root);
     let path = out.map_or_else(|| dir.join(coeffs::path_for(as_of)), Path::to_path_buf);
+    let file_v2 = fit_v2_of(&assembled, as_of, fitter);
+    let dir_v2 = v2::fit_dir_v2(root);
+    let path_v2 =
+        out.map_or_else(|| dir_v2.join(coeffs::path_for(as_of)), |o| o.with_extension("v2.json"));
     let mut pruned = 0;
     if !dry_run {
         coeffs::write(&path, &file).with_context(|| format!("writing {}", path.display()))?;
+        coeffs::write(&path_v2, &file_v2)
+            .with_context(|| format!("writing {}", path_v2.display()))?;
         if out.is_none() {
-            pruned = prune_dir(&dir, RETAIN_FILES);
+            pruned = prune_dir(&dir, RETAIN_FILES) + prune_dir(&dir_v2, RETAIN_FILES);
         }
     }
 
@@ -233,6 +263,9 @@ fn fit_loaded(
         rows_starred_any: assembled.stats.rows_starred_any,
         rows_star_issue_only: assembled.stats.rows_star_issue_only,
         pruned,
+        v2_id: file_v2.id.clone(),
+        v2_path: path_v2,
+        priority_coverage: PriorityCoverage::of(&assembled.priority_inputs),
     })
 }
 

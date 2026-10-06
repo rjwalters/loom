@@ -275,6 +275,7 @@ only.
 | `little-v0` | `land` | **floor baseline, never promoted** (#10208): Little's law. For a PR in `review_wait` / `doctor` / `merge_wait`, `items_ahead / drain_rate` for the current stage plus the recency-weighted mean duration of each later stage; interval from a Gamma posterior on the rate (shape = observed exits, 400 seeded draws). Refuses with a zero drain rate and items ahead, or with no queue context; a held PR (`merge_hold`) is refused `blocked`, as by every heuristic that does not model the hold | after `merge_wait` |
 | `land-2026-10-04-twin-otter` | `land` | no history: the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)). PR stages only (`review_wait`, `doctor`, `merge_wait`, `merge_hold`); the blend of a stage-by-stage exit-hazard Monte Carlo (256 paths, seeded per stage visit) and a log-normal direct model (recorded as `twin_otter`; #10222, #10243) | at the merge |
 | `land-2026-10-04-twin-otter-b` | `land` | the pre-PR/PR composition of twin-otter (#10244): `ready_wait`, `sweep.curator` and `sweep.builder` are answered with `land-v2`'s path rules (same refusals, so its answer rate there equals `land-v2`'s; `combination.method` is `land_v2_path_prefix`); `review_wait`, `doctor`, `merge_wait` and `merge_hold` are `land-2026-10-04-twin-otter`'s own answer, unchanged | at the merge |
+| `land-2026-10-06-keen-wren` | `land` | twin-otter-b's **priority-aware** successor (#10508): pre-PR stages from the work finder's dispatch-plan position and `land-v2`'s path rules (`combination.method` is `dispatch_plan_path_prefix`); PR stages from the twin-otter evaluation over the newest **`eta-fit/v2`** file, fed the item's recorded `features.priority` (see [The `eta-fit/v2` priority inputs](#the-eta-fitv2-priority-inputs-10508)). Refuses its PR stages `no_model` until a v2 file exists. Shadow, tier `candidate` | at the merge |
 | `land-2026-10-06-tandem-wren` | `land` | `land-2026-10-04-twin-otter-b` composed over the dependency graph (#10510, [Dependency-aware ETAs](#dependency-aware-etas-10510)): a blocked or parked item starts after its parents land, a stacked or sequenced PR merges after its parent. An item with no parent that applies at `as_of` gets twin-otter-b's own explanation, bit for bit (re-identified) | at the merge |
 
 ### Retired heuristics
@@ -1171,11 +1172,50 @@ for a fit or backtest to report.
 - **Rank.** `rank = (members with a lower priority + ½ · other members at an
   equal priority) / (members - 1)`, and 0 for a one-member fleet. Ties
   share the mid-rank. The denominator is the membership at that revision.
-- **Status: inputs only.** No coefficient file is written
-  with `eta-fit/v2`, and no heuristic reads these inputs yet. Still open in
-  #10508: the fleet-store history reader, the v2 fit and its
-  schema-dispatched loading, the new heuristic and its pre-PR composition,
-  and shadow registration on the ETA authority.
+- **The v2 fit and its file.** Every fit (`eta fit`, the daily refit) also
+  writes an `eta-fit/v2` coefficient file from the **same rows**
+  (`eta::fit::v2::fit_v2`): the same hazard, direct-model and path fits,
+  generic over the feature width (`logistic::fit_stage_x`, `aft::fit_x`), over
+  `FEATURES_V2`. The file has `schema: "eta-fit/v2"` and lives in its own
+  directory, `<fit_dir>/v2/fit-<T>.json`, pruned to the same 14 files. With an
+  explicit `--out PATH` it is written beside it as `<stem>.v2.json`. The v1
+  file is byte-identical to before. `FitReport` carries `v2_id`, `v2_path` and
+  `priority_coverage`.
+- **Schema-dispatched loading.** `fit::read_schema` / `fit::load_latest_in`
+  refuse a file whose `schema` tag is not the one asked for. `fit::read` and
+  `fit::load_latest` stay v1-only (and never look in `v2/`);
+  `fit::v2::read_v2` / `load_latest_v2` are v2-only. The registry loads both
+  (`Registry::load`, `Registry::with_fits`). Twin-otter and twin-otter-b get the
+  v1 file, keen-wren the v2 file and nothing else. The tracker rebuilds the
+  registry when either id changes.
+- **Serving.** Each estimate's `features.priority` (absent when the item
+  has no PR listed in a fleet view before `as_of`) is the builder's output,
+  computed by `Tracker::priority_inputs_of`. Every heuristic's explanation
+  records it. Only keen-wren reads it. The twin-otter evaluation core selects
+  its transform from the model's feature names: all `FEATURES` names use the
+  v1 transform exactly as before; all `FEATURES_V2` names use
+  `model_features_v2` with `twin_otter.input.priority`. So a v2 explanation
+  recomputes from its own record, as v1's does.
+- **Roster history.** The tracker's roster history is set with
+  `Tracker::set_fleet_history` and the fit's with `rows::build_with_context`.
+  Today no reader of the fleet store's `repos.yml` commit history feeds
+  either, so both sides pass `None`. `repo_rank` and
+  `ahead_dispatch_fleet` are then unknown in training and serving alike (the
+  indicators are 1, the standardized columns constant). They are not
+  silently filled from today's file.
+- **`ready_wait`.** keen-wren's start comes from the item's position in the
+  work finder's own dispatch plan. The planner sorts that plan with the real
+  comparator: level, star, star time, main-red fix, the workspace's
+  `fleet_priority`, age, number. A starred, level-2, or higher-priority-repo
+  issue is therefore earlier in the plan and gets an earlier start. No
+  second ordering is defined for the ETA to drift from (#10528).
+- **Status.** keen-wren is registered in shadow (tier `candidate`,
+  after `held-heron`, before the twin-otter pair). Still open in #10508: the
+  fleet-store roster-history reader; publishing the v2 file from the captain
+  to other hosts (`fit::publish` carries v1 only, so only the fitting host
+  has a v2 file); the walk-forward backtest against twin-otter-b; and live
+  evidence that the ETA authority, the loom-ui chooser and the nightly
+  scoring pick the new id up.
 
 ### Friction predictors and cumulative stage age (#10521)
 

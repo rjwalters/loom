@@ -313,7 +313,7 @@ impl CoefficientFile {
     pub fn derive_id(&self) -> String {
         let mut blank = self.clone();
         blank.id = String::new();
-        let text = serde_json::to_string(&blank).expect("an eta-fit/v1 file always serializes");
+        let text = serde_json::to_string(&blank).expect("an eta-fit file always serializes");
         crate::telemetry::trace::derived_hex(&["loom.eta.fit", &text], 16)
     }
 
@@ -395,7 +395,7 @@ pub fn path_for(as_of: DateTime<Utc>) -> String {
 /// The file's bytes: pretty JSON plus a trailing newline.
 #[must_use]
 pub fn to_json(file: &CoefficientFile) -> String {
-    let text = serde_json::to_string_pretty(file).expect("an eta-fit/v1 file always serializes");
+    let text = serde_json::to_string_pretty(file).expect("an eta-fit file always serializes");
     format!("{text}\n")
 }
 
@@ -422,9 +422,17 @@ pub fn write(path: &Path, file: &CoefficientFile) -> std::io::Result<()> {
 /// from the stored one even for an untouched file.
 #[must_use]
 pub fn read(path: &Path) -> Option<CoefficientFile> {
+    read_schema(path, SCHEMA)
+}
+
+/// [`read`] for the file tagged `schema` (`eta-fit/v1` or `eta-fit/v2`,
+/// #10508): any other tag is a refusal, so a loader never parses one
+/// version's positional vectors as another's.
+#[must_use]
+pub fn read_schema(path: &Path, schema: &str) -> Option<CoefficientFile> {
     let text = std::fs::read_to_string(path).ok()?;
     let file: CoefficientFile = serde_json::from_str(&text).ok()?;
-    (file.schema == SCHEMA).then_some(file)
+    (file.schema == schema).then_some(file)
 }
 
 /// The newest readable fit under `workspace_root` whose `as_of` is strictly
@@ -432,7 +440,14 @@ pub fn read(path: &Path) -> Option<CoefficientFile> {
 /// the later file name.
 #[must_use]
 pub fn load_latest(workspace_root: &Path, before: DateTime<Utc>) -> Option<CoefficientFile> {
-    let entries = std::fs::read_dir(fit_dir(workspace_root)).ok()?;
+    load_latest_in(&fit_dir(workspace_root), before, SCHEMA)
+}
+
+/// [`load_latest`]'s rule over the `*.json` files directly in `dir` tagged
+/// `schema`.
+#[must_use]
+pub fn load_latest_in(dir: &Path, before: DateTime<Utc>, schema: &str) -> Option<CoefficientFile> {
+    let entries = std::fs::read_dir(dir).ok()?;
     let mut paths: Vec<PathBuf> = entries
         .filter_map(Result::ok)
         .map(|e| e.path())
@@ -441,7 +456,7 @@ pub fn load_latest(workspace_root: &Path, before: DateTime<Utc>) -> Option<Coeff
     paths.sort();
     paths
         .iter()
-        .filter_map(|p| read(p))
+        .filter_map(|p| read_schema(p, schema))
         .filter(|f| f.as_of < before)
         .max_by(|a, b| a.as_of.cmp(&b.as_of))
 }

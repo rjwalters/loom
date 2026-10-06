@@ -97,22 +97,55 @@ pub const DRAW_ORDER: &str = "per path: its own splitmix64 sub-stream, seeded by
 
 /// `land-2026-10-04-twin-otter`, holding the coefficient set it was built
 /// with (`None`: every estimate refuses `no_model`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LandTwinOtter {
     fit: Option<Arc<CoefficientFile>>,
+    /// The id its explanations carry.
+    id: &'static str,
+    /// `Some(schema)`: the priority-aware evaluation (#10508) — the fit must
+    /// carry this schema tag (else `no_model`) and the input's
+    /// [`crate::eta::explanation::Features::priority`] is handed to the
+    /// core. `None`: twin-otter itself, which reads neither.
+    priority_schema: Option<&'static str>,
+}
+
+impl Default for LandTwinOtter {
+    fn default() -> Self {
+        LandTwinOtter::new(None)
+    }
 }
 
 impl LandTwinOtter {
     /// The heuristic over `fit`.
     #[must_use]
     pub fn new(fit: Option<Arc<CoefficientFile>>) -> Self {
-        LandTwinOtter { fit }
+        LandTwinOtter {
+            fit,
+            id: LAND_TWIN_OTTER,
+            priority_schema: None,
+        }
+    }
+
+    /// The same evaluation under another id, reading the priority inputs
+    /// and requiring a fit tagged `schema` (`land-2026-10-06-keen-wren`'s
+    /// PR stages, #10508). Twin-otter itself is [`Self::new`], unchanged.
+    #[must_use]
+    pub(super) fn priority_aware(
+        fit: Option<Arc<CoefficientFile>>,
+        id: &'static str,
+        schema: &'static str,
+    ) -> Self {
+        LandTwinOtter {
+            fit,
+            id,
+            priority_schema: Some(schema),
+        }
     }
 }
 
 impl Heuristic for LandTwinOtter {
     fn id(&self) -> &'static str {
-        LAND_TWIN_OTTER
+        self.id
     }
 
     fn kind(&self) -> Kind {
@@ -124,7 +157,7 @@ impl Heuristic for LandTwinOtter {
     }
 
     fn estimate(&self, input: &EstimateInput, _history: &StageSamples) -> Explanation {
-        let mut explanation = blank(LAND_TWIN_OTTER, Kind::Land, input);
+        let mut explanation = blank(self.id, Kind::Land, input);
         let current = match &input.current {
             CurrentState::Refused(reason) => return refuse(explanation, *reason),
             CurrentState::At(current) => current,
@@ -164,9 +197,16 @@ impl LandTwinOtter {
             .fit
             .as_deref()
             .filter(|fit| fit.as_of < input.as_of)
+            .filter(|fit| {
+                self.priority_schema
+                    .is_none_or(|schema| fit.schema == schema)
+            })
             .ok_or(NoEstimateReason::NoModel)?;
         let model = TwinOtterModel::of(fit).ok_or(NoEstimateReason::NoModel)?;
-        let adapted = adapt_input(input, current, stage);
+        let mut adapted = adapt_input(input, current, stage);
+        if self.priority_schema.is_some() {
+            adapted.priority = input.features.priority;
+        }
         let config = EvalConfig {
             seed: visit_seed(input, current, stage),
             ..EvalConfig::default()
@@ -328,6 +368,7 @@ pub fn adapt_input(
         conflict: flag(FLAG_CONFLICT),
         ci_fail: flag(FLAG_CI_FAIL),
         blocked: flag(FLAG_BLOCKED),
+        priority: None,
     }
 }
 

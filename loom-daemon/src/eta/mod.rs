@@ -153,6 +153,7 @@ pub mod stall_features;
 pub mod star;
 pub mod tracker;
 pub mod twin_otter;
+pub mod walk_forward;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -674,6 +675,9 @@ pub struct Registry {
     heuristics: Vec<Box<dyn Heuristic>>,
     /// The coefficient file the fitted heuristics were built with.
     fit: Option<Arc<fit::CoefficientFile>>,
+    /// The `eta-fit/v2` file `land-2026-10-06-keen-wren` was built with
+    /// (#10508).
+    fit_v2: Option<Arc<fit::CoefficientFile>>,
 }
 
 impl Registry {
@@ -690,6 +694,17 @@ impl Registry {
     /// or without a file, so its refusals are on the record too.
     #[must_use]
     pub fn with_fit(fit: Option<Arc<fit::CoefficientFile>>) -> Self {
+        Self::with_fits(fit, None)
+    }
+
+    /// [`Self::with_fit`], with `fit_v2` the `eta-fit/v2` file (#10508)
+    /// `land-2026-10-06-keen-wren` reads; each heuristic gets only the
+    /// schema it reads. Pure.
+    #[must_use]
+    pub fn with_fits(
+        fit: Option<Arc<fit::CoefficientFile>>,
+        fit_v2: Option<Arc<fit::CoefficientFile>>,
+    ) -> Self {
         Registry {
             heuristics: vec![
                 Box::new(heuristics::StartV1),
@@ -705,20 +720,40 @@ impl Registry {
                 // #10523: twin-otter-b plus the hold/sequence simulator;
                 // also before the twin-otter pair.
                 Box::new(heuristics::LandHeldHeron::new(fit.clone())),
+                // #10508: twin-otter-b's priority-aware successor, also
+                // before the twin-otter pair.
+                Box::new(heuristics::LandKeenWren::new(fit_v2.clone())),
                 Box::new(heuristics::LandTwinOtter::new(fit.clone())),
                 Box::new(heuristics::LandTwinOtterB::new(fit.clone())),
                 Box::new(heuristics::DependencyComposition::tandem_wren(fit.clone())),
             ],
             fit,
+            fit_v2,
         }
     }
 
     /// The built-in heuristics with the newest coefficient file under
     /// `workspace_root` whose cutoff is strictly before `before`
-    /// ([`fit::load_latest`]). The registry's only I/O.
+    /// ([`fit::load_latest`]), and the newest `eta-fit/v2` file by the same
+    /// rule ([`fit::v2::load_latest_v2`]). The registry's only I/O.
     #[must_use]
     pub fn load(workspace_root: &Path, before: DateTime<Utc>) -> Self {
-        Self::with_fit(fit::load_latest(workspace_root, before).map(Arc::new))
+        Self::with_fits(
+            fit::load_latest(workspace_root, before).map(Arc::new),
+            fit::v2::load_latest_v2(workspace_root, before).map(Arc::new),
+        )
+    }
+
+    /// The `eta-fit/v2` file `land-2026-10-06-keen-wren` was built with.
+    #[must_use]
+    pub fn fit_v2(&self) -> Option<&fit::CoefficientFile> {
+        self.fit_v2.as_deref()
+    }
+
+    /// That file's id, when there is one.
+    #[must_use]
+    pub fn fit_v2_id(&self) -> Option<&str> {
+        self.fit_v2.as_deref().map(|f| f.id.as_str())
     }
 
     /// The coefficient file the fitted heuristics were built with.

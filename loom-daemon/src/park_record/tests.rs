@@ -285,3 +285,51 @@ fn mask_qualified_removes_only_qualified_refs_inside_markers() {
     assert!(m.starts_with("see o/r#4 and #3"), "{m}");
     assert!(m.contains("Blocked by: , #3"), "{m}");
 }
+
+// --- #10556: re-park rewrite and the qualified-ref skip --------------------
+
+#[test]
+fn drop_blockers_removes_only_the_resolved_records() {
+    let body = format!("Intro text.\n\n{}\n{}\n\nTrailer.\n", render(&rec(1)), render(&rec(3)));
+    let out = drop_blockers(&body, &[1]);
+    assert_eq!(blockers(&out), n(&[3]));
+    assert_eq!(out, format!("Intro text.\n\n{}\n\nTrailer.\n", render(&rec(3))));
+    // Nothing resolved: byte-for-byte unchanged.
+    assert_eq!(drop_blockers(&body, &[99]), body);
+}
+
+#[test]
+fn drop_blockers_rerenders_a_mixed_hand_written_marker() {
+    let body = "x\n<!-- loom:park Blocked by: #1, #2 by=guide -->\ny\n";
+    let out = drop_blockers(body, &[1]);
+    assert_eq!(blockers(&out), n(&[2]));
+    assert!(out.starts_with("x\n<!-- loom:park Blocked by: #2 by=guide -->"));
+    assert!(out.ends_with("\ny\n"));
+}
+
+#[test]
+fn drop_blockers_keeps_an_inline_marker_line() {
+    let body = format!("See {} here.\n", render(&rec(1)));
+    assert_eq!(drop_blockers(&body, &[1]), "See  here.\n");
+}
+
+#[test]
+fn qualified_refs_are_detected_outside_the_reason_only() {
+    assert!(has_qualified_ref("<!-- loom:park Blocked by: 2AMLogic/loom-ui#1891 -->"));
+    assert!(!has_qualified_ref(&render(&rec(5))));
+    assert!(!has_qualified_ref(
+        "<!-- loom:park Blocked by: #5 reason=\"after other/repo#9 lands\" -->"
+    ));
+    // Outside any marker: prose, not a park.
+    assert!(!has_qualified_ref("Depends on other/repo#9"));
+}
+
+#[test]
+fn drop_blockers_never_drops_a_qualified_record_by_its_number() {
+    // A local `#1` resolving must not take `o/r#1` — another repo's artifact —
+    // with it (#10443 x #10556).
+    let body = "x\n<!-- loom:park Blocked by: #1, o/r#1 by=guide -->\ny\n";
+    let out = drop_blockers(body, &[1]);
+    assert_eq!(blockers(&out), vec![q("o/r", 1)]);
+    assert!(has_qualified_ref(&out), "{out}");
+}

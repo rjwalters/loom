@@ -650,6 +650,10 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
         "heuristics/land_twin_otter_b.rs",
         include_str!("../heuristics/land_twin_otter_b.rs"),
     ),
+    // #10508: twin-otter-b's priority-aware successor, and the v2 transform
+    // the evaluation core calls for it.
+    ("heuristics/land_keen_wren.rs", include_str!("../heuristics/land_keen_wren.rs")),
+    ("fit/features_v2.rs", include_str!("../fit/features_v2.rs")),
     ("heuristics/land_v4.rs", include_str!("../heuristics/land_v4.rs")),
     // #10510: the dependency wrapper and the composition it calls.
     (

@@ -7,8 +7,8 @@ use super::{as_of, history_a, input_at, provenance, subject};
 use crate::eta::backtest::{BacktestReport, Bucket, Comparison, Paired};
 use crate::eta::config::{promote, resolve};
 use crate::eta::heuristics::{
-    LandV1, LandV2, LAND_CALM_PLOVER, LAND_HELD_HERON, LAND_QUICK_TERN, LAND_TANDEM_WREN,
-    LAND_TWIN_OTTER, LAND_TWIN_OTTER_B, LAND_V1, LAND_V2, LAND_V4,
+    LandV1, LandV2, LAND_CALM_PLOVER, LAND_HELD_HERON, LAND_KEEN_WREN, LAND_QUICK_TERN,
+    LAND_TANDEM_WREN, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B, LAND_V1, LAND_V2, LAND_V4,
 };
 use crate::eta::score::{score, EstimateSummary, OutcomeKind, Score};
 use crate::eta::shadow::{
@@ -219,6 +219,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
             "little-v0",
             LAND_QUICK_TERN,
             LAND_HELD_HERON,
+            LAND_KEEN_WREN,
             LAND_TWIN_OTTER,
             LAND_TWIN_OTTER_B,
             LAND_TANDEM_WREN
@@ -241,7 +242,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
         .collect();
     assert_eq!(
         land_order,
-        vec![true, false, false, false, false, false, false, false, false, false]
+        vec![true, false, false, false, false, false, false, false, false, false, false]
     );
 
     // The primary's own number is byte-identical to what a registry with no
@@ -270,6 +271,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
             "little-v0",
             LAND_QUICK_TERN,
             LAND_HELD_HERON,
+            LAND_KEEN_WREN,
             LAND_TWIN_OTTER,
             LAND_TWIN_OTTER_B,
             LAND_TANDEM_WREN
