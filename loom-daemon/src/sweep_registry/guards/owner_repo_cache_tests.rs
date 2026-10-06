@@ -111,3 +111,43 @@ fn resolve_owner_repo_loom_repo_override_never_spawns_gh() {
         "the LOOM_REPO override must short-circuit before any `gh repo view` spawn"
     );
 }
+
+/// W4-C: the reads that verify this daemon's own just-made write — the
+/// lease read-back behind `resolve_lease_order` / `confirm_sole_claim`, and
+/// the label read after a flip — never take a reader route, even with a
+/// reader on offer and a repo every source agrees on. A reader may lag the
+/// write, and those callers fail open after a few retries.
+#[test]
+#[serial]
+fn own_write_read_backs_never_derive_a_reader_route() {
+    use crate::forge_identity::{Placement, RouteDecision};
+    use crate::gh_invocation::cwd_route::{CwdAnswer, DeriveEnv};
+    use crate::gh_invocation::test_routing::{install, seen, TestRouting};
+    std::env::remove_var("LOOM_REPO");
+    let dir = tempdir().unwrap();
+    let (registry, _) = crate::sweep_registry::test_support::fixture_registry(dir.path());
+    *registry.owner_repo_cache.lock().unwrap() = Some(("acme".into(), "widget".into()));
+    let _g = install(TestRouting {
+        decision: RouteDecision::Reader {
+            dir: dir.path().join("reader"),
+            app_id: "1".into(),
+            placement: Placement::Home,
+        },
+        env: DeriveEnv::default(),
+        checkout: CwdAnswer::Sole("acme/widget".into()),
+        shed: true,
+    });
+    let _ = registry.read_lease_comments(7);
+    let _ = registry.current_labels_via_rest(7);
+    let _ = registry.fetch_claim_labeled_at(7);
+    let seen = seen();
+    for op in [
+        "guard.lease_comments",
+        "guard.issue_labels",
+        "guard.claim_timeline",
+    ] {
+        let mine: Vec<_> = seen.iter().filter(|s| s.op == op).collect();
+        assert!(!mine.is_empty(), "{op} did not run through the facade: {seen:?}");
+        assert!(mine.iter().all(|s| s.route_slug.is_none()), "{op} derived: {mine:?}");
+    }
+}

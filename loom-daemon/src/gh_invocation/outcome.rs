@@ -76,6 +76,10 @@ pub(super) fn classify(
         Ok(GhCompletion::Passthrough(status)) => CmdOutcome::Unavailable(Unavailable::Collect(
             format!("passthrough completion ({status}) has no captured output"),
         )),
+        // W4-C: a deferred read is "no answer", never a negative one.
+        Ok(GhCompletion::Shed { until, .. }) => {
+            CmdOutcome::Unavailable(Unavailable::Shed { until })
+        }
         Err(ExecError::Spawn(e)) => CmdOutcome::Unavailable(Unavailable::Spawn(e.to_string())),
         Err(ExecError::Collect(e)) => CmdOutcome::Unavailable(Unavailable::Collect(e.to_string())),
     }

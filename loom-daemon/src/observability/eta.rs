@@ -513,23 +513,30 @@ pub fn spawn_task(
             loom.tree_state
         );
     }
+    // #10243: the fitted heuristics' coefficient file, loaded once here and
+    // re-checked on every pass (`record`), never inside an estimate. Loaded
+    // before the pending store, which it filters (#10484).
+    let registry = Registry::load(&workspace_root, Utc::now());
+    log_fit(None, registry.fit(), &workspace_root);
     let mut tracker = Tracker::new(loom);
-    tracker.restore_pending(read_pending(&pending_path(&workspace_root)));
+    // #10484: a pending estimate whose heuristic is no longer registered (a
+    // retired id) is dropped here, so it never scores into the shadow ledger
+    // or an `eta.outcome`.
+    let unregistered =
+        tracker.restore_pending(read_pending(&pending_path(&workspace_root)), &registry);
     log::info!(
-        "eta: enabled (dry_run={}, refresh={}s, {} pending restored)",
+        "eta: enabled (dry_run={}, refresh={}s, {} pending restored, \
+         {} dropped for an unregistered heuristic)",
         config.dry_run,
         config.refresh_secs,
-        tracker.pending().len()
+        tracker.pending().len(),
+        unregistered
     );
     let (shadow, unreadable) =
         shadow::load_ledger(&shadow::ledger_path(&workspace_root), Utc::now());
     if let Some(note) = unreadable {
         log::error!("eta: {note}");
     }
-    // #10243: the fitted heuristics' coefficient file, loaded once here and
-    // re-checked on every pass (`record`), never inside an estimate.
-    let registry = Registry::load(&workspace_root, Utc::now());
-    log_fit(None, registry.fit(), &workspace_root);
     *lock() = Some(State {
         tracker,
         turnover: super::ops::turnaround::TurnoverLedger::default(),

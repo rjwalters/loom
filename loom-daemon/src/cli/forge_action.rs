@@ -412,6 +412,16 @@ pub(crate) enum ForgeAction {
         verbose: bool,
     },
 
+    /// `forge merge-queue <mode|preflight|status|enqueue|dequeue>` (#10255)
+    /// — dormant merge-queue controls (`champion.mergeMode`, default
+    /// `direct`). Exit: 0 ok, 1 failed, 2 invalid config, 3 undetermined,
+    /// 4 refused before any forge call.
+    #[command(name = "merge-queue")]
+    MergeQueue {
+        #[command(subcommand)]
+        action: super::forge_merge_queue_cmd::MergeQueueAction,
+    },
+
     /// `forge token --repo <nwo> [--access read|write] [--force]` (#9537) —
     /// the single entry point for "which App's token should this call use".
     /// `read` returns the repo's reader App token (deterministic per repo),
@@ -631,6 +641,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             force,
         } => return super::forge_identity_cmd::token(&repo, &access, force),
         ForgeAction::Egress { action } => return super::forge_egress_cmd::handle(action),
+        ForgeAction::MergeQueue { action } => super::forge_merge_queue_cmd::run(action),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
         ForgeAction::Calls(args) => return super::forge_calls_cmd::handle(args),
@@ -806,6 +817,12 @@ fn write_target(action: &ForgeAction) -> Option<Option<String>> {
         // write verbs — its `--repo` is exactly the `Option<String>` shape
         // `may_write_from` wants.
         ForgeAction::Comment { repo, .. } => Some(repo.clone()),
+        // #10255: the queue mutations write (dormant today, vetted anyway).
+        ForgeAction::MergeQueue {
+            action:
+                super::forge_merge_queue_cmd::MergeQueueAction::Enqueue { repo, .. }
+                | super::forge_merge_queue_cmd::MergeQueueAction::Dequeue { repo, .. },
+        } => Some(repo.clone()),
         _ => None,
     }
 }

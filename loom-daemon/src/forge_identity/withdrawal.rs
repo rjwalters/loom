@@ -453,7 +453,14 @@ fn apply(app_id: &str, owner_repo: &str, failure: Failure, plan: &Withdrawal, wh
             source,
             secondary,
         } => {
-            let held = forge_read_pool::withdraw_scoped_until(app_id, owner, *scope, *until);
+            // A rate limit (primary or secondary) is a budget withdrawal: the
+            // one cause W4-C may shed a deferrable read on. A refused
+            // credential is not — those reads still fall back to the writer.
+            let held = if matches!(failure, Failure::RateLimited { .. }) {
+                forge_read_pool::withdraw_scoped_budget_until(app_id, owner, *scope, *until)
+            } else {
+                forge_read_pool::withdraw_scoped_until(app_id, owner, *scope, *until)
+            };
             log::warn!(
                 "forge_identity: reader app {app_id} withdrawn from {owner} {} for {}s \
                  (end from {}{}; {why}); its other owners and resources keep serving — W4-A",

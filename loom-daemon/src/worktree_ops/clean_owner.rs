@@ -111,7 +111,7 @@ pub(crate) fn fetch_pr_rows(
 ) -> Result<Vec<PrRowRest>, RowsError> {
     let path =
         format!("repos/{{owner}}/{{repo}}/pulls?state=all&head={owner}:{branch}&per_page=30");
-    let out = gh::bounded_counted("clean.pr_status_rest", repo_root, ["api", &path])
+    let out = gh::bounded_hygiene("clean.pr_status_rest", repo_root, ["api", &path])
         .ok_or(RowsError::Failed)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);

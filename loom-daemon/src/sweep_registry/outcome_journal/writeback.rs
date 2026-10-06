@@ -277,7 +277,7 @@ impl SweepRegistry {
         );
         let args = ["api", path.as_str(), "--paginate", "--jq", jq.as_str()];
         let output = self
-            .gh_read("outcome.writeback_probe", args)
+            .gh_read_own_write("outcome.writeback_probe", args)
             .ok()
             .flatten()?;
         if !output.status.success() {

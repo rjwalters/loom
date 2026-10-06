@@ -656,8 +656,6 @@ impl Registry {
                 Box::new(heuristics::FinishV1),
                 Box::new(heuristics::LandV1),
                 Box::new(heuristics::LandV2),
-                Box::new(heuristics::LandV3),
-                Box::new(heuristics::LandAmberHeron),
                 Box::new(heuristics::LandFreshTide::default()),
                 Box::new(heuristics::LandV4),
                 Box::new(heuristics::LandTwinOtter::new(fit.clone())),
@@ -694,6 +692,13 @@ impl Registry {
             .iter()
             .find(|h| h.id() == id)
             .map(|h| h.as_ref())
+    }
+
+    /// Whether `id` is a registered heuristic predicting `kind`. A persisted
+    /// estimate naming anything else (a retired id, #10484) is not scored.
+    #[must_use]
+    pub fn registers(&self, kind: Kind, id: &str) -> bool {
+        self.get(id).is_some_and(|h| h.kind() == kind)
     }
 
     /// Every registered id.

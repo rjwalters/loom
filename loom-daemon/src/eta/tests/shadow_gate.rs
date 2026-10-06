@@ -5,7 +5,7 @@
 
 use super::{as_of, history_a, input_at, provenance};
 use crate::eta::backtest::Comparison;
-use crate::eta::heuristics::{LandV1, LAND_V1, LAND_V2};
+use crate::eta::heuristics::{LandV1, LAND_V1, LAND_V2, LAND_V4};
 use crate::eta::history::{SampleSource, StageSample};
 use crate::eta::score::{score, EstimateSummary, OutcomeKind};
 use crate::eta::shadow::{
@@ -13,8 +13,8 @@ use crate::eta::shadow::{
     MIN_LIVE_PAIRS,
 };
 use crate::eta::tracker::{
-    censor, EstimateContext, PassAnswers, ReadyPlan, ReadyRow, Resolved, Tracker, CENSOR_SOURCE,
-    PENDING_MAX_AGE_DAYS, SLOT_TURNOVER_REPO,
+    censor, EstimateContext, ItemKey, PassAnswers, PrState, PrView, ReadyPlan, ReadyRow, Resolved,
+    Tracker, CENSOR_SOURCE, PENDING_MAX_AGE_DAYS, SLOT_TURNOVER_REPO,
 };
 use crate::eta::{Heuristic, Kind, Registry, Stage};
 use crate::types::{DispatchPlanContext, PlanGate, PlanSlots, PlanState, RowPlan};
@@ -367,14 +367,17 @@ fn the_per_day_folds_are_bounded() {
 fn an_expiring_estimate_past_its_p90_is_scored_as_a_late_surprise_first() {
     let mut tracker = Tracker::new(provenance());
     let hour = 3600;
-    tracker.restore_pending(vec![
-        // p90 one hour: decided late long before it expires.
-        summary(LAND_V1, 0, (600, 1200, 1800, Some(hour))),
-        // p90 of 40 days: not yet behind it at expiry — undecided.
-        summary(LAND_V2, 0, (600, 1200, 1800, Some(40 * 24 * hour))),
-        // No p90 recorded: undecided.
-        summary("land-v3", 0, (600, 1200, 1800, None)),
-    ]);
+    tracker.restore_pending(
+        vec![
+            // p90 one hour: decided late long before it expires.
+            summary(LAND_V1, 0, (600, 1200, 1800, Some(hour))),
+            // p90 of 40 days: not yet behind it at expiry — undecided.
+            summary(LAND_V2, 0, (600, 1200, 1800, Some(40 * 24 * hour))),
+            // No p90 recorded: undecided.
+            summary(LAND_V4, 0, (600, 1200, 1800, None)),
+        ],
+        &Registry::builtin(),
+    );
     let early = tracker.expire(as_of() + Duration::days(1));
     assert_eq!((early.dropped, early.censored.len()), (0, 0), "nothing expires early");
 
@@ -534,4 +537,132 @@ fn answer_rates_are_counted_once_per_pass_not_once_per_emitted_row() {
     let stats = ledger.stats(Kind::Land, LAND_V1, LAND_V2);
     assert_eq!(stats.answer_pairs, 6);
     assert_eq!(stats.current_answer_rate, Some(0.5));
+}
+
+// ------------------------------------- retired heuristics (#10484)
+
+/// `land-v3` and `land-2026-10-04-amber-heron` left the registry on
+/// 2026-10-06. A ledger and a pending set persisted before that still name
+/// them: both must load, the live pairs must be untouched, the restored
+/// pending entries for them are dropped before a landing or a censoring can
+/// score them (no `eta.outcome`, no new ledger pair), and a promotion
+/// evaluation naming a retired candidate never promotes.
+#[test]
+fn legacy_entries_for_retired_heuristics_load_cleanly_and_are_ignored() {
+    let retired = ["land-v3", "land-2026-10-04-amber-heron"];
+    let registry = Registry::builtin();
+    for id in retired {
+        assert!(registry.get(id).is_none(), "{id} is retired");
+    }
+
+    let at = as_of() + Duration::seconds(500);
+    let current_land = |_: Kind| LAND_V1.to_string();
+    let q = (600, 1200, 1800, Some(3600));
+    let mut ledger = ShadowLedger::default();
+    for id in retired {
+        ledger.record(
+            &current_land,
+            &[
+                resolved(summary(LAND_V1, 0, q), OutcomeKind::Landed, at),
+                resolved(summary(id, 0, q), OutcomeKind::Landed, at),
+            ],
+        );
+    }
+    ledger.record(
+        &current_land,
+        &[
+            resolved(summary(LAND_V1, 1, q), OutcomeKind::Landed, at),
+            resolved(summary(LAND_V2, 1, q), OutcomeKind::Landed, at),
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = shadow::ledger_path(dir.path());
+    shadow::write_ledger(&path, &ledger).unwrap();
+    let (loaded, note) = shadow::load_ledger(&path, as_of());
+    assert_eq!(note, None, "a legacy ledger is not an unreadable one");
+    assert_eq!(loaded, ledger);
+    assert_eq!(loaded.stats(Kind::Land, LAND_V1, LAND_V2).pairs, 1, "live pairs intact");
+
+    // Pending estimates naming retired ids, persisted with a decided p90 so
+    // both scoring paths would take them, are dropped at restore: the item
+    // that lands and the item that is censored at expiry score only the
+    // registered heuristics, so no `eta.outcome` and no ledger pair names a
+    // retired id.
+    let landed_issue = 9289;
+    let censored_issue = 9290;
+    let for_issue = |id: &str, issue: u32| {
+        let mut s = summary(id, 0, (600, 1200, 1800, Some(3600)));
+        s.issue = issue;
+        s
+    };
+    let mut persisted = Vec::new();
+    for issue in [landed_issue, censored_issue] {
+        for id in [LAND_V1, LAND_V2].into_iter().chain(retired) {
+            persisted.push(for_issue(id, issue));
+        }
+    }
+    let mut tracker = Tracker::new(provenance());
+    let dropped = tracker.restore_pending(persisted, &registry);
+    assert_eq!(dropped, 4, "both retired ids, on both items");
+    assert_eq!(tracker.pending().len(), 4);
+    assert!(tracker
+        .pending()
+        .iter()
+        .all(|p| !retired.contains(&p.heuristic.as_str())));
+
+    let repo = "rjwalters/loom";
+    let listed = PrView {
+        number: 9301,
+        issue: landed_issue,
+        labels: vec!["loom:pr".to_string()],
+        created_at: Some(as_of()),
+        updated_at: Some(as_of()),
+    };
+    tracker.on_listing(repo, &[listed], at, 300);
+    let merged = tracker.on_pr_resolved(
+        &ItemKey::new(repo, landed_issue),
+        PrState::Merged(at),
+        at + Duration::seconds(60),
+    );
+    let landed: Vec<&str> = merged
+        .outcomes
+        .iter()
+        .map(|r| r.estimate.heuristic.as_str())
+        .collect();
+    assert_eq!(landed, [LAND_V1, LAND_V2], "the landing scores only registered ids");
+
+    let expired = tracker.expire(as_of() + Duration::days(PENDING_MAX_AGE_DAYS + 1));
+    assert_eq!(expired.dropped, 2);
+    let censored: Vec<&str> = expired
+        .censored
+        .iter()
+        .map(|r| r.estimate.heuristic.as_str())
+        .collect();
+    assert_eq!(censored, [LAND_V1, LAND_V2], "censoring scores only registered ids");
+    assert!(tracker.pending().is_empty());
+
+    // What the daemon folds into the shadow ledger (`note_outcomes`) and
+    // emits as `eta.outcome` (`deliver`) is exactly these outcomes.
+    let mut live = ShadowLedger::default();
+    live.record(&current_land, &merged.outcomes);
+    live.record(&current_land, &expired.censored);
+    for id in retired {
+        let stats = live.stats(Kind::Land, LAND_V1, id);
+        assert_eq!((stats.pairs, stats.late_pairs), (0, 0), "no ledger pair for retired {id}");
+    }
+    let keys: Vec<(String, String)> = live
+        .all()
+        .into_iter()
+        .map(|st| (st.key.current, st.key.candidate))
+        .collect();
+    assert_eq!(keys, [(LAND_V1.to_string(), LAND_V2.to_string())], "only the live pair");
+    let stats = live.stats(Kind::Land, LAND_V1, LAND_V2);
+    assert_eq!((stats.pairs, stats.late_pairs), (1, 2), "landed pair + censored late pair");
+
+    // A promotion evaluation for a retired candidate never promotes.
+    for id in retired {
+        let stats = loaded.stats(Kind::Land, LAND_V1, id);
+        let decision = shadow::evaluate(Kind::Land, LAND_V1, id, None, &stats, as_of());
+        assert!(!decision.promote, "a retired candidate is never promoted");
+    }
 }

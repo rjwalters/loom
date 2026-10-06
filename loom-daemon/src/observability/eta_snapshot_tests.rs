@@ -589,3 +589,28 @@ fn registering_a_ninth_land_heuristic_fails_loudly() {
     let land = Registry::builtin().for_kind(Kind::Land).count();
     assert!(land - 1 <= crate::telemetry::kinds::eta_snapshot::MAX_ALTERNATES);
 }
+
+/// #10484: `land-v3` and `land-2026-10-04-amber-heron` were retired from the
+/// live shadow set. Pending estimates restored from disk that still name them
+/// are never offered as `alternates[]`; the live shadows are.
+#[test]
+fn retired_heuristics_never_appear_as_alternates_even_when_pending_names_them() {
+    let retired = ["land-v3", "land-2026-10-04-amber-heron"];
+    let registered = registered();
+    for id in retired {
+        assert!(!registered[&Kind::Land].iter().any(|r| r == id), "{id} is retired");
+    }
+    let pending = vec![
+        summary(REPO, 1, Kind::Land, "land-v1", 0, Some(3_600)),
+        summary(REPO, 1, Kind::Land, "land-v2", 0, Some(3_000)),
+        summary(REPO, 1, Kind::Land, "land-v3", 0, Some(2_000)),
+        summary(REPO, 1, Kind::Land, "land-2026-10-04-amber-heron", 0, Some(1_000)),
+    ];
+    let alternates = select_alternates(&pending, &current(), &registered);
+    let list = &alternates[&(REPO.to_string(), 1, Kind::Land)];
+    let got: Vec<&str> = list.iter().map(|e| e.heuristic.as_str()).collect();
+    assert_eq!(got, vec!["land-v2"]);
+    for id in retired {
+        assert!(!got.contains(&id));
+    }
+}

@@ -103,6 +103,11 @@ pub enum Unavailable {
     RoutingBlocked(String),
     /// The managed `gh` launcher exited `69`: its adapter is down (#9987).
     AdapterUnavailable(String),
+    /// Not run (W4-C): a deferrable forge read whose reader budget is
+    /// exhausted until `until`. Nothing was sent. Its text deliberately
+    /// matches no rate-limit signature, so feeding it to the rate-limit
+    /// breaker can never trip it.
+    Shed { until: std::time::SystemTime },
 }
 
 impl std::fmt::Display for Unavailable {
@@ -113,6 +118,12 @@ impl std::fmt::Display for Unavailable {
             Unavailable::TimedOut { after, .. } => write!(f, "timed out after {after:?}"),
             Unavailable::RoutingBlocked(e) => write!(f, "routing_blocked: {e}"),
             Unavailable::AdapterUnavailable(e) => write!(f, "adapter_unavailable: {e}"),
+            Unavailable::Shed { until } => write!(
+                f,
+                "deferred: reader budget low until {} (loom-shed)",
+                chrono::DateTime::<chrono::Utc>::from(*until)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
         }
     }
 }

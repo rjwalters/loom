@@ -128,6 +128,12 @@ pub(crate) fn read(op: &'static str, gh_bin: &Path, root: &Path) -> GhInvocation
     inv(op, AccessIntent::Read, gh_bin, root)
 }
 
+/// A read pinned to the writer: a read-back of a forge fact this daemon just
+/// wrote itself, where a reader App could still lag the write (W4-C).
+pub(crate) fn read_own_write(op: &'static str, gh_bin: &Path, root: &Path) -> GhInvocation {
+    read(op, gh_bin, root).writer_identity()
+}
+
 /// A write ([`AccessIntent::Write`]).
 pub(crate) fn write(op: &'static str, gh_bin: &Path, root: &Path) -> GhInvocation {
     inv(op, AccessIntent::Write, gh_bin, root)

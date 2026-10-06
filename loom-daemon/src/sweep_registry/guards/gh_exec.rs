@@ -94,6 +94,26 @@ impl SweepRegistry {
         self.run_counted(self.gh_inv(op, AccessIntent::Read, &gh).args(args))
     }
 
+    /// [`Self::gh_read`] pinned to the writer: for a read-back of a forge fact
+    /// this daemon just wrote itself (its own label flip, lease, claim), where
+    /// a reader App could still lag the write. Never derives a reader route.
+    pub(in crate::sweep_registry) fn gh_read_own_write<I, S>(
+        &self,
+        op: &'static str,
+        args: I,
+    ) -> std::io::Result<Option<Output>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let gh = self.configured_gh();
+        self.run_counted(
+            self.gh_inv(op, AccessIntent::Read, &gh)
+                .writer_identity()
+                .args(args),
+        )
+    }
+
     /// [`Self::gh_read`] for a write.
     pub(in crate::sweep_registry) fn gh_write<I, S>(
         &self,

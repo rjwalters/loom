@@ -518,6 +518,7 @@ fn gh_json(root: &Path, path: &str) -> Option<serde_json::Value> {
         GhTarget::None,
         GH_TIMEOUT,
     )
+    .read_class(crate::gh_invocation::ReadClass::Observability)
     .args(["api", path])
     .current_dir(root)
     .run() else {

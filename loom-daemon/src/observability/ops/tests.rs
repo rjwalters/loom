@@ -269,6 +269,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::GithubRateLimitReset,
         MetricName::GithubRateLimitBreakerSkips,
         MetricName::ForgeCalls,
+        MetricName::ForgeFacadeEvents,
         MetricName::EtaHealthItems,
         MetricName::EtaHealthFitLoaded,
         MetricName::EtaHealthFitAgeSeconds,

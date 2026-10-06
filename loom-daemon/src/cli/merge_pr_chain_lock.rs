@@ -71,6 +71,7 @@ impl ChainLockArgs {
             cap_secs,
             now,
             policy: &policy,
+            cache_dir: None,
         });
         match read {
             Ok(Guard::Clear) => {
@@ -82,8 +83,8 @@ impl ChainLockArgs {
                 chain_lock::clear_unreadable(&state);
                 println!(
                     "{HELD} pr={} holder=#{} head={} expires={}\nPR #{}'s merge onto '{}' is deferred: \
-chain head #{} was re-dated at {} and holds the chain-head merge lock (#10167) until its required \
-checks report, its head moves, it lands or closes, or {} (the cap), whichever is first. Nothing was \
+chain head #{} was re-dated at {} and holds the chain-head merge lock (#10167) until it lands or \
+closes, its head moves, a required check fails, or {} (the cap), whichever is first. Nothing was \
 written. Re-attempt on a later pass, or set {OVERRIDE_ENV}=1 to merge anyway.",
                     self.pr,
                     l.holder,
@@ -98,7 +99,7 @@ written. Re-attempt on a later pass, or set {OVERRIDE_ENV}=1 to merge anyway.",
                 std::process::exit(DEFER_EXIT);
             }
             Err(why) => {
-                let Some(first) = chain_lock::note_unreadable(&state, now) else {
+                let Some(first) = chain_lock::note_unreadable(&state, now, cap_secs) else {
                     println!(
                         "{FAIL_OPEN} pr={} the chain-head merge lock state could not be read ({why}) \
 and the first-failure record at {} could not be written, so the cap cannot be measured; proceeding \

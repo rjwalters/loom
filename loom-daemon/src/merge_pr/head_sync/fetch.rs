@@ -28,6 +28,9 @@ fn gh_api(args: &[&str]) -> Result<String, String> {
         crate::gh_invocation::GhTarget::None,
         std::time::Duration::from_secs(60),
     )
+    // W4-C: attributes the head's last move to our own sync, so it must see
+    // the writer's view of it (a reader may lag that push).
+    .writer_identity()
     .program(gh_bin())
     .arg("api")
     .args(args)

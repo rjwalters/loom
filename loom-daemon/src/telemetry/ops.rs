@@ -134,6 +134,14 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "forge.spill.to",
     "forge.spill.mode",
     "forge.spill.until",
+    // `forge.read.shed` spans (W4-C): which deferred read, of which class,
+    // for which (owner, resource) bucket, until when.
+    "forge.read.op",
+    "forge.read.class",
+    "forge.read.app",
+    "forge.read.owner",
+    "forge.read.resource",
+    "forge.read.until",
 ];
 
 /// Longest label value kept, in bytes.
@@ -291,6 +299,12 @@ pub enum MetricName {
     /// pages when known.
     #[serde(rename = "loom.forge.calls")]
     ForgeCalls,
+    /// The `gh` facade's named event counters since the previous point
+    /// (`crate::forge_call_stats::counters`), labelled `reason` = the
+    /// counter (`facade.cwd_route.disagree`, `repo_facts.redirected`,
+    /// `repo_facts.resolver_disagree`): signals that are not forge calls.
+    #[serde(rename = "loom.forge.facade.events")]
+    ForgeFacadeEvents,
     // ---- Merge-chain re-date pressure (Issue #10163) ----------------------
     /// PRs with at least one #8508 re-date commit in the trailing window,
     /// labelled `state` = `landed` / `pending` / `stuck` (pending with at
@@ -392,6 +406,7 @@ impl MetricName {
             Self::GithubRateLimitReset => "github.ratelimit.reset",
             Self::GithubRateLimitBreakerSkips => "github.ratelimit.breaker_skips",
             Self::ForgeCalls => "loom.forge.calls",
+            Self::ForgeFacadeEvents => "loom.forge.facade.events",
             Self::MergeRedatePrs => "loom.merge.redate_prs",
             Self::MergeRedatesMax => "loom.merge.redates_max",
             Self::MergeTimeToLandMax => "loom.merge.time_to_land_max",
@@ -435,6 +450,7 @@ impl MetricName {
             | Self::QueueDispositionRowsDropped
             | Self::GithubRateLimitBreakerSkips
             | Self::ForgeCalls
+            | Self::ForgeFacadeEvents
             | Self::DaemonTaskFaults => MetricKind::DeltaCounter,
             _ => MetricKind::Gauge,
         }
@@ -471,6 +487,7 @@ impl MetricName {
             Self::GithubRateLimitReset => "s",
             Self::GithubRateLimitBreakerSkips => "{pass}",
             Self::ForgeCalls => "{request}",
+            Self::ForgeFacadeEvents => "{event}",
             Self::MergeRedatePrs => "{pull_request}",
             Self::MergeRedatesMax => "{redate}",
             Self::MergeTimeToLandMax => "s",
@@ -544,6 +561,9 @@ impl MetricName {
             }
             Self::ForgeCalls => {
                 "GitHub requests sent by the gh facade, by caller, bucket and outcome."
+            }
+            Self::ForgeFacadeEvents => {
+                "Named gh-facade events that are not forge calls, by reason (counter name)."
             }
             Self::MergeRedatePrs => "PRs re-dated in the trailing window, by landing state.",
             Self::MergeRedatesMax => "Most re-dates on one PR in the trailing window, by state.",
