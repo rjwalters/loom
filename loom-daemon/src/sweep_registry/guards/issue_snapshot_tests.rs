@@ -320,3 +320,37 @@ fn the_park_guard_still_wins_attribution_on_the_conditional_read() {
     assert_eq!(typed.issue, 9109);
     assert!(!views(&log).iter().any(|l| l == "legacy"));
 }
+
+/// Cost (W9): an own write drops the `If-None-Match` from both guard reads
+/// but moves neither identity. 2.5 stays on its reader; 2.7 is on the writer
+/// with or without a write.
+#[test]
+fn an_own_write_drops_the_etag_but_keeps_each_guards_identity() {
+    use crate::forge_etag_store::ReadPin;
+    let state = |own_write| guard_read_pin(false, own_write);
+    let labels = |own_write| guard_read_pin(true, own_write);
+    assert_eq!(state(false), ReadPin::default(), "2.5: reader-first, conditional");
+    assert_eq!(
+        state(true),
+        ReadPin {
+            writer: false,
+            unconditional: true
+        },
+        "2.5 after an own write: still the reader, no If-None-Match"
+    );
+    assert_eq!(
+        labels(false),
+        ReadPin {
+            writer: true,
+            unconditional: false
+        }
+    );
+    assert_eq!(
+        labels(true),
+        ReadPin {
+            writer: true,
+            unconditional: true
+        },
+        "2.7 after an own write: the writer, no If-None-Match"
+    );
+}

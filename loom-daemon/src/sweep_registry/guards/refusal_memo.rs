@@ -13,11 +13,16 @@
 //! A crash resume (#4256, `resume_bypass_pr = Some(pr)`) is the one place an
 //! `Open(pr)` answer **permits** work: the reaper resumes because the probe
 //! named a PR, and 2.6 then lets the dispatch through for that PR. So every
-//! resume decision reads the forge live:
+//! resume decision skips the fresh-memo short circuit and probes the forge:
 //!
 //! - the reaper's eligibility probe calls [`SweepRegistry::live_open_pr_probe`];
 //! - [`SweepRegistry::dispatch_open_pr_memo`] never short-circuits a resume;
 //! - [`SweepRegistry::dispatch_open_pr_probe`] runs the live probe for one.
+//!
+//! Caveat: when every transport fails, the live probe's #6788 known-PR
+//! backstop takes the PR number from a memo entry of **any** age and checks
+//! only that PR's openness live. On that path the link itself is not
+//! re-verified.
 //!
 //! The other memo readers (the reaper's #4366 no-progress exemption, the
 //! PR-less retry tally and its `loom:blocked` hold veto) keep today's
@@ -26,8 +31,9 @@
 //! # The ledger: distinct versus repeated refusals
 //!
 //! Every open-PR refusal bumps one of two `loom.forge.facade.events`
-//! counters: [`REFUSED_MEMO`] (served by the memo, zero calls) or
-//! [`REFUSED_PROBED`] (a live probe answered). A refusal of an
+//! counters: [`REFUSED_MEMO`] (the 2.5 short circuit, zero calls) or
+//! [`REFUSED_PROBED`] (the 2.6 probe, which for an ordinary dispatch can
+//! itself be answered from the memo when an entry became fresh after 2.5). A refusal of an
 //! `(issue, PR)` pair this workspace has not refused yet in the current UTC
 //! hour also bumps [`REFUSED_DISTINCT`]. Per hour, `distinct / (memo +
 //! probed)` is the share of refusals that were new, which is what the plan's
@@ -38,7 +44,9 @@ use std::collections::HashSet;
 
 /// An open-PR refusal served by the fresh memo (no forge call).
 pub(crate) const REFUSED_MEMO: &str = "guard.open_pr.refused_memo";
-/// An open-PR refusal answered by a live probe.
+/// An open-PR refusal at the 2.6 probe. For an ordinary dispatch that probe
+/// is memo-aware, so a memo entry that became fresh after the 2.5 check is
+/// counted here too: "refused at 2.6", not "a forge call was spent".
 pub(crate) const REFUSED_PROBED: &str = "guard.open_pr.refused_probed";
 /// The first refusal of an `(issue, PR)` pair in a workspace this UTC hour.
 pub(crate) const REFUSED_DISTINCT: &str = "guard.open_pr.refused_distinct";

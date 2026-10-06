@@ -671,10 +671,10 @@ impl GhInvocation {
     /// [`ExecError::Collect`] when it started but its result could not be
     /// collected (side effects may have happened — never retry a write on it).
     pub fn execute(self) -> Result<GhCompletion, ExecError> {
-        // W9: every write pins the next guard read of its number to the
-        // writer, unconditionally (see `own_writes`).
+        // W9: every write makes the next guard reads of its (repo, number)
+        // unconditional (see `own_writes`).
         if self.intent == AccessIntent::Write {
-            own_writes::note(&self.args);
+            own_writes::note(&self.args, self.target.slug().as_deref());
         }
         #[cfg(test)]
         if let Some(routed) = test_routing::run(&self) {

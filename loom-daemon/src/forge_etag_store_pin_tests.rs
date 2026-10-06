@@ -130,3 +130,29 @@ fn an_unconditional_pin_sends_no_etag_and_refreshes_the_entry() {
     assert!(seen[1].ends_with(" sent="), "the pinned read sent an ETag: {seen:?}");
     assert!(seen[2].ends_with("-2\""), "the entry was not refreshed: {seen:?}");
 }
+
+/// The 2.5 guard's own-write pin (W9): unconditional but not writer-pinned,
+/// so it rides the reader and sends no `If-None-Match`.
+#[test]
+fn an_unconditional_reader_pin_rides_the_reader_without_an_etag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (gh, log) = stub(tmp.path());
+    std::fs::create_dir_all(tmp.path().join("reader-d")).unwrap();
+    let route = reader(&tmp.path().join("reader-d"));
+    let at = (Some("acme/pin-reader"), "repos/acme/pin-reader/issues/4", "test-pin-d-");
+    let fresh = ReadPin {
+        writer: false,
+        unconditional: true,
+    };
+    cached_read_via(SITE, &gh, None, at, ReadPin::default(), &route).unwrap();
+    let after = cached_read_via(SITE, &gh, None, at, fresh, &route).unwrap();
+    assert!(!after.not_modified, "an unconditional read is never a 304");
+    assert_eq!(
+        calls(&log),
+        vec![
+            "dir=reader-d sent=".to_string(),
+            "dir=reader-d sent=".to_string()
+        ],
+        "both reads rode the reader, and the pinned one sent no ETag"
+    );
+}

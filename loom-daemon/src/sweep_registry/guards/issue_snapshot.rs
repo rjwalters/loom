@@ -28,11 +28,15 @@
 //!
 //! # After our own write
 //!
-//! For [`OWN_WRITE_PIN`] after this process wrote issue N through the `gh`
-//! facade ([`crate::gh_invocation::own_writes`], hooked once in
+//! For [`OWN_WRITE_PIN`] after this process wrote issue N of the repo through
+//! the `gh` facade ([`crate::gh_invocation::own_writes`], hooked once in
 //! `GhInvocation::execute` rather than per write site), both reads of N are
-//! sent on the writer **without** `If-None-Match`, so neither a lagging
-//! reader nor a lagging replica's `304` can answer them.
+//! sent **without** `If-None-Match`, so a lagging replica's `304` cannot
+//! answer them. Each keeps its identity ([`guard_read_pin`]): 2.7 is on the
+//! writer anyway (W4-C), and 2.5 stays on its reader. Moving 2.5 to the
+//! writer would add writer-bucket spend, which W9 exists to cut, and 2.5
+//! reads state and PR-ness, which the daemon's own label writes do not
+//! change.
 //!
 //! # Fail-open
 //!
@@ -52,8 +56,8 @@ use crate::forge_etag_store::{self as store, ConditionalRead, ReadPin};
 pub const GUARD_ISSUE_SNAPSHOT_ENV: &str = "LOOM_GUARD_ISSUE_SNAPSHOT";
 
 /// How long after this process wrote an issue its guard reads stay
-/// writer-pinned and unconditional. A reader or replica lags a write by
-/// seconds; ten minutes is a wide margin.
+/// unconditional. A replica lags a write by seconds; ten minutes is a wide
+/// margin.
 pub(crate) const OWN_WRITE_PIN: Duration = Duration::from_secs(600);
 
 /// Store prefix of the 2.5 (reader-first) entry.
@@ -113,6 +117,19 @@ fn enabled() -> bool {
     on && store::daemon_store_dir().is_some()
 }
 
+/// The [`ReadPin`] of a guard read. `writer_site` is 2.7's W4-C writer pin;
+/// a recent own write to the issue only drops the `If-None-Match`, and never
+/// moves 2.5 off its reader. 2.5 was reader-first before W9 and reads state
+/// and PR-ness, which the daemon's own label and comment writes do not
+/// change; pinning it to the writer would add writer-bucket spend.
+#[must_use]
+pub(crate) fn guard_read_pin(writer_site: bool, own_write: bool) -> ReadPin {
+    ReadPin {
+        writer: writer_site,
+        unconditional: own_write,
+    }
+}
+
 impl SweepRegistry {
     /// Step 2.5: is `issue` closed or a PR? The conditional read, else
     /// [`Self::issue_is_closed_or_pr`].
@@ -144,15 +161,13 @@ impl SweepRegistry {
             return None;
         }
         let (owner, repo) = self.resolve_owner_repo()?;
-        let own_write = crate::gh_invocation::own_writes::written_within(issue, OWN_WRITE_PIN);
-        let pin = ReadPin {
-            writer: writer || own_write,
-            unconditional: own_write,
-        };
-        let site = ConditionalRead::new(caller, crate::forge_call_stats::ops::ISSUE_VIEW_STATE)
-            .within(Some(reap_gh_timeout()));
         let (slug, url) =
             (format!("{owner}/{repo}"), format!("repos/{owner}/{repo}/issues/{issue}"));
+        let own_write =
+            crate::gh_invocation::own_writes::written_within(&slug, issue, OWN_WRITE_PIN);
+        let pin = guard_read_pin(writer, own_write);
+        let site = ConditionalRead::new(caller, crate::forge_call_stats::ops::ISSUE_VIEW_STATE)
+            .within(Some(reap_gh_timeout()));
         let root = Some(self.config.workspace_root.as_path());
         let gh = self.resolved_gh();
         let read = store::cached_read_pinned(site, &gh, root, Some(&slug), &url, prefix, pin);

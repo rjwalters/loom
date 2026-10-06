@@ -16,6 +16,26 @@ fn gh_calls(log: &Path) -> usize {
         .count()
 }
 
+/// [`open_pr_guard_registry`] whose forge answers "no open linked PR" on
+/// every leg the live probe reads: the closes-graph (empty), the
+/// `issues/<n>/timeline` REST union (empty), and the #6788 known-PR backstop
+/// (`pulls/<n>` is `closed`). The base fixture's catch-all `repos/*` arm
+/// would otherwise answer the timeline with an issue-state body, which is
+/// `ProbeFailed`, not `NoneOpen`. Both arms go before that catch-all, which
+/// also matches their paths.
+fn none_open_registry(ws: &Path) -> (SweepRegistry, PathBuf) {
+    let (reg, log) = open_pr_guard_registry(ws, "", 0, false);
+    let gh = ws.join("fake-gh.sh");
+    let script = std::fs::read_to_string(&gh).unwrap();
+    let catch_all = "if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]";
+    let arms =
+        format!("{}{}", fake_gh_timeline_rest_arm("", 0), fake_gh_pulls_state_arm("closed", 0));
+    let patched = script.replacen(catch_all, &format!("{arms}{catch_all}"), 1);
+    assert_ne!(patched, script, "the catch-all arm moved; update this fixture");
+    std::fs::write(&gh, patched).unwrap();
+    (reg, log)
+}
+
 #[test]
 fn the_ledger_counts_a_pair_once_per_utc_hour() {
     let mut ledger = HourLedger::default();
@@ -44,8 +64,8 @@ fn a_resume_never_consults_the_memo() {
     std::env::remove_var(OPEN_PR_MEMO_ENABLE_ENV);
     std::env::set_var("LOOM_REPO", "acme/widget");
     let dir = tempdir().unwrap();
-    // The forge answers "no open linked PR".
-    let (reg, log) = open_pr_guard_registry(dir.path(), "", 0, false);
+    // The forge answers "no open linked PR" on every leg.
+    let (reg, log) = none_open_registry(dir.path());
     reg.seed_open_pr_memo(9201, 9301, Utc::now());
 
     let memo = reg
@@ -109,7 +129,9 @@ fn a_resume_is_decided_by_the_live_answer() {
 
 /// The skeptic's resume hole: a fresh memo naming P must not make a crashed
 /// sweep resume-eligible when the forge says P is gone. The reaper's
-/// eligibility probe reads live, so no `SweepResumeDispatched` fires.
+/// eligibility probe reads live, the forge answers `NoneOpen` on every leg
+/// (closes-graph, timeline, and `pulls/P` is `closed` for the #6788
+/// backstop), so no `SweepResumeDispatched` fires.
 #[tokio::test]
 #[serial]
 async fn a_fresh_memo_never_makes_a_crash_resume_eligible() {
@@ -119,7 +141,7 @@ async fn a_fresh_memo_never_makes_a_crash_resume_eligible() {
     std::env::set_var("LOOM_REPO", "acme/widget");
     let tmp = tempdir().unwrap();
     // The forge: no open linked PR. The memo: a fresh Open(9304).
-    let (mut reg, gh_log) = open_pr_guard_registry(tmp.path(), "", 0, false);
+    let (mut reg, gh_log) = none_open_registry(tmp.path());
     reg.seed_open_pr_memo(9204, 9304, Utc::now());
     let bus = Arc::new(EventBus::new());
     reg.set_event_bus(bus.clone());
