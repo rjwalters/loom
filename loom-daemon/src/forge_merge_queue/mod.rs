@@ -24,8 +24,9 @@
 //! phases install the lifecycle safety contract and the required merge-group
 //! checks, every mutating entry point refuses with `EXECUTION_DORMANT` even
 //! when `champion.mergeMode=queue` — and under `direct` (the default) it
-//! refuses with `NOT_QUEUE_MODE` before any forge call. No role, script, or
-//! daemon loop invokes this module yet; `merge-pr.sh` is unchanged. The
+//! refuses with `NOT_QUEUE_MODE` before any forge call. The daemon tick
+//! and the stale-verdict paths call the lifecycle (no-ops in direct mode); no
+//! role prompt or `merge-pr.sh` invokes the handoff yet (honest gap, #10256). The
 //! read-only `status`, `preflight`, and `mode` verbs are always available.
 //!
 //! # CLI exit codes

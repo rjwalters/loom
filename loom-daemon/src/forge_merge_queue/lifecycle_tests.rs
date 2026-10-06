@@ -600,8 +600,8 @@ fn known_gap_merge_after_revocation_is_flagged_in_telemetry() {
         }
     ));
     assert!(ev.all().iter().any(|e| e.merged_after_revocation));
-    assert!(!super::authz::INVARIANT_FULLY_DEMONSTRATED);
-    assert!(!super::QUEUE_EXECUTION_ENABLED);
+    const { assert!(!super::authz::INVARIANT_FULLY_DEMONSTRATED) };
+    const { assert!(!super::QUEUE_EXECUTION_ENABLED) };
 }
 
 // ------------------------------------------------------------ pure pieces
