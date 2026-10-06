@@ -445,7 +445,10 @@ fn run_fetch_with(
     let owner_dir = (reader_dir.is_none() && cwd.is_none())
         .then(|| writer_config_dir(None, target))
         .flatten();
-    let out = match inv.gh_config_dir(reader_dir.or(owner_dir.as_deref())).execute() {
+    let out = match inv
+        .gh_config_dir(reader_dir.or(owner_dir.as_deref()))
+        .execute()
+    {
         Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
         Ok(_) => anyhow::bail!("gh api {url} timed out after {}s", FETCH_TIMEOUT.as_secs()),
         Err(e) => return Err(e).with_context(|| format!("failed to invoke {}", gh_bin.display())),

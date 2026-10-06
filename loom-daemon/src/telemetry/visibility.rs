@@ -602,7 +602,10 @@ printf 'HTTP/2.0 200 OK\r\nEtag: W/"v1"\r\n\r\n{{"private":false}}'
         assert!(lines[1].contains(r#"If-None-Match: W/"v1""#), "{argv}");
         let rows = report.host_window.unwrap_or_default();
         let sum = |f: fn(&crate::types::ForgeCallCounts) -> u64| -> u64 {
-            rows.iter().filter(|r| r.caller == "visibility.repo").map(f).sum()
+            rows.iter()
+                .filter(|r| r.caller == "visibility.repo")
+                .map(f)
+                .sum()
         };
         assert_eq!((sum(|r| r.ok), sum(|r| r.not_modified)), (1, 1), "{rows:?}");
     }
