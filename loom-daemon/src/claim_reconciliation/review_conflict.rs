@@ -229,7 +229,6 @@ pub fn flag_comment_body(head_sha: &str) -> String {
 /// applied, returning stdout on success.
 fn gh_pr(gh_bin: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let inv = match args.first().copied() {
-        Some("view") => gh_call::read("review_conflict.pr_view", gh_bin, root),
         Some("comment") => gh_call::write("review_conflict.pr_comment", gh_bin, root),
         _ => gh_call::write("review_conflict.pr_edit", gh_bin, root),
     };
