@@ -129,6 +129,7 @@ fn fetch_via_gh(owner_repo: &str) -> Option<RepoIdentity> {
     let op = Operation::new("telemetry.repo_identity");
     let out = GhInvocation::new(op, AccessIntent::Read, target, PROBE_TIMEOUT)
         .forge_op(crate::forge_call_stats::ops::REPO_VIEW)
+        .read_class(crate::gh_invocation::ReadClass::Observability)
         .args(["api", &path, "--jq", r#""\(.id) \(.full_name)""#])
         .run();
     out.ok_output()

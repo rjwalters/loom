@@ -128,6 +128,9 @@ fn github_merge_method(gh: &str, nwo: &str, requested: Option<&str>) -> i32 {
         FORGE_CMD_TIMEOUT,
     )
     .forge_op(crate::forge_call_stats::ops::REPO_VIEW)
+    // The `allow_*_merge` flags may be hidden from a reader App (W4-C
+    // writer_only): the writer that will merge must read them itself.
+    .writer_identity()
     .program(gh)
     .args(["api", &format!("repos/{nwo}")])
     .run();

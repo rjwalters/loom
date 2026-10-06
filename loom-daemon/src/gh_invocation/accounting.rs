@@ -141,7 +141,8 @@ fn hostname_arg(args: &[OsString]) -> Option<String> {
 /// - provider: `github` — `gh` is the GitHub family's client.
 /// - origin: the site's, else `gh api --hostname`, else `GH_HOST`, else
 ///   `github.com` (`gh`'s own default host resolution, in that order).
-/// - repo: the site's, else the typed [`super::GhTarget`], else `LOOM_REPO`
+/// - repo: the site's, else the typed [`super::GhTarget`], else (W4-C) the
+///   facade's derived reader route (`ro=derived`), else `LOOM_REPO`
 ///   (the same `GH_REPO` fallback [`GhInvocation::env_plan`] hands the child),
 ///   else (W1) the working directory's `origin` remote — a memoised local
 ///   read, never a forge call ([`remote_repo`]).
@@ -185,6 +186,7 @@ fn resolve_with(
             .target
             .slug()
             .map(|r| (r, RepoOrigin::Target))
+            .or_else(|| inv.route_slug.clone().map(|r| (r, RepoOrigin::Derived)))
             .or_else(|| {
                 loom_repo
                     .filter(|r| !r.is_empty())
@@ -302,6 +304,50 @@ pub(super) fn record(inv: &GhInvocation, outcome: InvokeOutcome, captured: Optio
     record_metric(caller, &identity, &cred, &resource, classified, pg);
 }
 
+/// Record a shed read (W4-C): no request was sent, so the row charges
+/// nothing (`o=shed`). It names the reader route it was destined for —
+/// `role=reader`, the last reader tried (`ca`, `none` when the router said
+/// exhausted up front), the owner (`co`) and the resource (`rr`) — and adds
+/// a `shed` sample to `loom.forge.calls`.
+pub(super) fn record_shed(
+    inv: &GhInvocation,
+    app: Option<&str>,
+    owner: &str,
+    resource: crate::forge_bucket_book::Resource,
+    _until: std::time::SystemTime,
+) {
+    let caller = inv.operation.as_str();
+    let routed = inv
+        .clone()
+        .identity_role(crate::forge_identity::IdentityRole::Reader);
+    let (identity, ro) =
+        resolve_with(&routed, std::env::var("GH_HOST").ok(), std::env::var("LOOM_REPO").ok());
+    let pool = Pool::from_resource(resource.as_str());
+    let account = app.map_or_else(
+        || "none".to_string(),
+        crate::observability::ops::ratelimit::app_account_label,
+    );
+    let attribution = forge_call_stats::CallAttribution {
+        ro: Some(ro.as_str().to_string()),
+        ca: forge_call_stats::sanitize(&account),
+        co: forge_call_stats::sanitize(owner),
+        tk: Some("shed".to_string()),
+        rr: Some(resource.as_str().to_string()),
+        pg: None,
+        pu: None,
+        rd: None,
+        // Nothing was sent; `o=shed` alone already says "never charged".
+        fr: None,
+    };
+    forge_call_stats::record_attributed(caller, &identity, pool, Outcome::Shed, None, &attribution);
+    let cred = CredAttr {
+        account,
+        owner: Some(owner.to_string()),
+        kind: "shed",
+    };
+    record_metric(caller, &identity, &cred, resource.as_str(), Outcome::Shed, None);
+}
+
 /// Add the row to `loom.forge.calls` (a no-op without an ops sink).
 fn record_metric(
     caller: &'static str,
@@ -332,6 +378,7 @@ fn record_metric(
             Outcome::NotModified => CallOutcome::NotModified,
             Outcome::RateLimited => CallOutcome::RateLimited,
             Outcome::Error => CallOutcome::Error,
+            Outcome::Shed => CallOutcome::Shed,
         },
     };
     forge_calls::record(labels, u64::from(pg.unwrap_or(1).max(1)));

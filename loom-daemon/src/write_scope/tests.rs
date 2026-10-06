@@ -866,6 +866,14 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("classifies an invocation's argv for call accounting, runs none"),
         ),
         (
+            "gh_invocation/affinity.rs",
+            NotAWrite("builds a read's affinity key from its argv, runs none"),
+        ),
+        (
+            "gh_invocation/cwd_route.rs",
+            NotAWrite("classifies an invocation's argv to refuse mutations a reader route, runs none"),
+        ),
+        (
             "gh_invocation/api_kind.rs",
             NotAWrite("classifies an invocation's argv for the github.api span attribute, runs none"),
         ),

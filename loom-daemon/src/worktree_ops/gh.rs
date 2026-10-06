@@ -20,7 +20,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 use crate::cmd_out::{CmdOutcome, Unavailable};
-use crate::gh_invocation::{gh_bin, AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::gh_invocation::{gh_bin, AccessIntent, GhInvocation, GhTarget, Operation, ReadClass};
 
 /// Deadline for the unbounded-by-history `gh` calls this module made through a
 /// bare `Command::output()` (#10089: the facade always bounds its child).
@@ -95,6 +95,22 @@ pub(crate) fn bounded_via(inv: GhInvocation) -> Option<Output> {
     }
 }
 
+/// [`bounded_counted`] for a deferrable hygiene probe (W4-C,
+/// [`ReadClass::Hygiene`]): when every reader for the repo's owner is
+/// withdrawn the probe is shed instead of spending the writer's bucket, and
+/// the shed is "no answer" (`None`) exactly like a timeout — so each caller
+/// keeps its fail-closed `UNKNOWN` / `PrStatus::Unknown` path.
+pub(crate) fn bounded_hygiene(
+    op: &'static str,
+    repo_root: &Path,
+    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+) -> Option<Output> {
+    bounded_via(
+        invocation(op, AccessIntent::Read, repo_root, GH_PROBE_TIMEOUT, args)
+            .read_class(ReadClass::Hygiene),
+    )
+}
+
 /// A bounded counted read probe: the `None`-on-no-answer contract of
 /// [`bounded_via`] for a `gh <args>` call run from `repo_root`, booked under
 /// `op`.
@@ -110,7 +126,7 @@ pub(crate) fn bounded_counted(
 /// failure (matches `clean.py`'s `except Exception: issue_state = "UNKNOWN"`).
 #[must_use]
 pub fn issue_state(repo_root: &Path, issue: u32) -> String {
-    let out = bounded_counted(
+    let out = bounded_hygiene(
         "worktree.issue_state",
         repo_root,
         [
@@ -147,7 +163,7 @@ pub fn issue_state(repo_root: &Path, issue: u32) -> String {
 /// match [`issue_state`]'s contract.
 #[must_use]
 pub fn issue_state_rest(repo_root: &Path, issue: u32) -> String {
-    let out = bounded_counted(
+    let out = bounded_hygiene(
         "worktree.issue_state_rest",
         repo_root,
         [
@@ -181,7 +197,7 @@ pub fn issue_state_rest(repo_root: &Path, issue: u32) -> String {
 /// never be read as "grace period already elapsed".
 #[must_use]
 pub fn issue_closed_at_rest(repo_root: &Path, issue: u32) -> Option<String> {
-    let out = bounded_counted(
+    let out = bounded_hygiene(
         "worktree.issue_closed_at",
         repo_root,
         [
@@ -213,13 +229,17 @@ struct PrRow {
 /// lookup must not be silently treated as "no open PR".
 #[must_use]
 pub fn has_open_pr(repo_root: &Path, branch: &str) -> (bool, bool) {
-    let out = run_read(
+    let out = invocation(
         "worktree.has_open_pr",
+        AccessIntent::Read,
         repo_root,
+        GH_CALL_TIMEOUT,
         [
             "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1",
         ],
-    );
+    )
+    .read_class(ReadClass::Hygiene)
+    .run();
     match out {
         CmdOutcome::Ran(o) if o.status.success() => {
             let rows: Result<Vec<PrRow>, _> = serde_json::from_slice(&o.stdout);
