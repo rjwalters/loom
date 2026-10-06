@@ -106,6 +106,11 @@ pub enum TerminalClassification {
     /// so it neither clears a hold nor stamps `last_success`. The runtime-level
     /// fall-through lives in `runtime_preference::sandbox_hold`.
     SandboxUnavailable,
+    /// The account's Codex session container was not running when the tick
+    /// tried to dispatch into it (#10455). Produced by `spawn-codex.sh`. Like
+    /// `SandboxUnavailable` it records **no** account hold and is not a
+    /// success: the account's credentials are fine, the container is down.
+    SessionDown,
 }
 
 impl std::str::FromStr for TerminalClassification {
@@ -124,6 +129,7 @@ impl std::str::FromStr for TerminalClassification {
             "MODEL_REFUSAL" => Self::ModelRefusal,
             "SESSION_LIMIT" => Self::SessionLimit,
             "SANDBOX_UNAVAILABLE" => Self::SandboxUnavailable,
+            "SESSION_DOWN" => Self::SessionDown,
             other => bail!("unknown terminal classification {other:?}"),
         })
     }
@@ -647,6 +653,7 @@ pub fn record_terminal_for_class_with_reset_at(
                 | TerminalClassification::CwdDeleted
                 | TerminalClassification::ModelRefusal
                 | TerminalClassification::SandboxUnavailable
+                | TerminalClassification::SessionDown
         ) {
             return Ok(());
         }
@@ -756,7 +763,8 @@ pub fn record_terminal_for_class_with_reset_at(
             | TerminalClassification::Fatal
             | TerminalClassification::CwdDeleted
             | TerminalClassification::ModelRefusal
-            | TerminalClassification::SandboxUnavailable => unreachable!(),
+            | TerminalClassification::SandboxUnavailable
+            | TerminalClassification::SessionDown => unreachable!(),
         }
         state.accounts.push(entry);
         state

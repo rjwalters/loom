@@ -258,6 +258,12 @@ pub fn admission_attributes(outcome: &crate::role_runner::RoleTickOutcome) -> Tr
     insert_worked(&mut attrs, Some(result.spawned()));
     match outcome {
         RoleTickOutcome::Success | RoleTickOutcome::QueueEmpty => {}
+        // #10455: a container-down refusal is its own cause, not a bare failure.
+        RoleTickOutcome::Failure(reason)
+            if crate::role_tick_telemetry::is_session_down_reason(reason) =>
+        {
+            attrs.insert("loom.admission.reason".into(), "session-down".into());
+        }
         RoleTickOutcome::Failure(_) => {
             attrs.insert("loom.admission.reason".into(), "failure".into());
         }

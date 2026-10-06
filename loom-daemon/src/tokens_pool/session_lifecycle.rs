@@ -105,7 +105,7 @@ const DEFAULT_CODEX_SHELL_ARGS: &[&str] = &["--yolo"];
 /// host path (Issue #7389). Read back by `inspect` so `status` can report it
 /// and `start` can detect a mismatched re-`start` against a different
 /// workspace.
-const WORKSPACE_LABEL: &str = "loom.workspace";
+pub(crate) const WORKSPACE_LABEL: &str = "loom.workspace";
 
 /// Container label recording the security posture a host-mode session
 /// container was created with (issue #9979). `spawn-codex.sh` reads it and

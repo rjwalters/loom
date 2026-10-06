@@ -93,6 +93,7 @@ pub mod rng;
 pub mod rotation;
 pub mod select;
 pub mod session_lifecycle;
+pub mod session_state;
 pub mod status_order;
 
 pub use account_registry::{

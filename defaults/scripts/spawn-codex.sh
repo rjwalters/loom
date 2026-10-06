@@ -1283,6 +1283,15 @@ if [[ -f "$_classifier_lib" ]]; then
         log_warn "spawn-codex: exited 0 but the sandbox refused every shell command ($_noop_detail); reporting SANDBOX_UNAVAILABLE (#10003)"
         printf '# LOOM_RUNTIME_NOOP runtime=codex reason=sandbox-unavailable %s\n' "$_noop_detail" >&2
     fi
+    # #10455: posture saw the session container not running and the dispatch
+    # was refused (`session-exec host` exits 78). Report SESSION_DOWN rather
+    # than the generic RECOVERABLE/78 so the role-failure watch can group by
+    # cause. The exit code still passes through unchanged.
+    if [[ "$CODEX_SESSION_EXEC" == "true" && "${_posture_mode:-}" == "mode=not-running" \
+        && "$_exit_code" -eq 78 ]]; then
+        _terminal_category="SESSION_DOWN"
+        log_warn "spawn-codex: session container $CODEX_SESSION_CONTAINER is not running; reporting SESSION_DOWN (#10455)"
+    fi
     _terminal_account="${LOOM_ACCOUNT_NAME:-${CODEX_PROFILE_NAME:-unknown}}"
     [[ "$_terminal_account" =~ ^[A-Za-z0-9._-]+$ ]] || _terminal_account="unknown"
     # `none` when nothing was pinned, when the #5499 guard stripped the pin
@@ -1296,7 +1305,7 @@ if [[ -f "$_classifier_lib" ]]; then
         # emits no credit-exhaustion pattern of its own today, so this arm is
         # unreachable for provider=codex — but an allowlist that silently drops
         # a valid category is exactly how terminal feedback goes missing.
-        SUCCESS|TOKEN_EXPIRED|TOKEN_EXHAUSTED|MODEL_CREDITS_EXHAUSTED|RECOVERABLE|TIMEOUT|FATAL|CWD_DELETED|MODEL_REFUSAL|SESSION_LIMIT|SANDBOX_UNAVAILABLE)
+        SUCCESS|TOKEN_EXPIRED|TOKEN_EXHAUSTED|MODEL_CREDITS_EXHAUSTED|RECOVERABLE|TIMEOUT|FATAL|CWD_DELETED|MODEL_REFUSAL|SESSION_LIMIT|SANDBOX_UNAVAILABLE|SESSION_DOWN)
             printf '# LOOM_TERMINAL_RESULT v=2 provider=codex account=%s category=%s exit_code=%s model=%s\n' \
                 "$_terminal_account" "$_terminal_category" "$_exit_code" "$_terminal_model" >&2
             ;;

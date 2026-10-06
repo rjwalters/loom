@@ -556,6 +556,19 @@ bucket. On a host
 without an exporter, `loom-daemon forge calls --by bucket` shows the same
 picture from the local forge-call sink.
 
+**Codex session-container state (#10455).** On every collector pass the daemon
+reads each enabled, session-managed Codex account's container and exports
+`loom.codex_session.state{account,state,container}`: one point per `state` in
+`running`, `stopped`, `missing`, `stale_mounts` (1 for the current state, 0 for
+the rest), with the standard `host.id` / `service.version` resource attributes.
+`stale_mounts` means a registered workspace root under the container's
+workspace is not mounted. The daemon logs a WARN on each state change
+(recovery included) and repeats it every 15 min while the container stays down;
+it is per account, outside the role runner's per-root DEBUG demotion. A tick
+refused because the container was not running ends as `category=SESSION_DOWN`
+(exit 78 kept), carried as `loom.admission.reason="session-down"` on the
+`loom.role_attempt` span; it records no account hold.
+
 **Long-running task liveness and self-update decisions (#10414).** Each
 long-running daemon loop beats a process-global liveness registry
 (`crate::task_liveness`) once per finished iteration. The loops are the

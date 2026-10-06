@@ -986,6 +986,10 @@ async fn sample_snapshots(
     // file reads, no forge call; a no-op without the ops sink. After the
     // snapshot so it reports this pass's built snapshot.
     super::ops::eta_health::record(workspace_root).await;
+    // Per-account Codex session-container state (Issue #10455): the gauge
+    // is OTLP-only, but the WARN on a state change runs regardless. Zero
+    // docker calls unless an enabled account is session-managed.
+    super::ops::codex_session::record(workspace_root).await;
 }
 
 /// Parse a `.ranking` row's binding-window reset text into the typed instant

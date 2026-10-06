@@ -406,7 +406,8 @@ processors:
           # outcome — operation names and owners, never a repo number or path.
           # loom.eta.health.* (#10391) adds heuristic and kind (fixed ETA
           # vocabularies); repo was already kept (per cached fleet snapshot).
-          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome", "heuristic", "kind"])
+          # loom.codex_session.state (#10455) adds container (a session container name).
+          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome", "heuristic", "kind", "container"])
 exporters:
   otlp_http/clickstack:
     endpoint: http://clickstack-collector:4318
