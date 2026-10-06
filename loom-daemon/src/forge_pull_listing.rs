@@ -86,6 +86,14 @@ pub struct RestPull {
     pub head_sha: Option<String>,
     /// `base.ref` — the branch the PR targets.
     pub base_ref: Option<String>,
+    /// The PR description (#10514: the open-PR guard's `Closes #N` filter).
+    pub body: Option<String>,
+    /// `author_association` (`OWNER` / `MEMBER` / `NONE` …), for the H14 rule.
+    pub author_association: Option<String>,
+    /// `user.type == "Bot"` — an App author.
+    pub author_is_bot: bool,
+    /// `head.repo.full_name` — `None` when GitHub omits it (a deleted fork).
+    pub head_repo: Option<String>,
 }
 
 impl RestPull {
@@ -388,17 +396,26 @@ pub fn parse_rest_pulls(body: &str) -> Result<Vec<RestPull>> {
     struct RawLabel {
         name: String,
     }
+    #[derive(serde::Deserialize)]
+    struct RawRepo {
+        #[serde(default)]
+        full_name: Option<String>,
+    }
     #[derive(serde::Deserialize, Default)]
     struct RawRef {
         #[serde(default, rename = "ref")]
         ref_name: Option<String>,
         #[serde(default)]
         sha: Option<String>,
+        #[serde(default)]
+        repo: Option<RawRepo>,
     }
     #[derive(serde::Deserialize)]
     struct RawUser {
         #[serde(default)]
         login: Option<String>,
+        #[serde(default, rename = "type")]
+        kind: Option<String>,
     }
     #[derive(serde::Deserialize)]
     struct RawPull {
@@ -421,12 +438,20 @@ pub fn parse_rest_pulls(body: &str) -> Result<Vec<RestPull>> {
         head: Option<RawRef>,
         #[serde(default)]
         base: Option<RawRef>,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        author_association: Option<String>,
     }
     let rows: Vec<RawPull> = serde_json::from_str(body.trim())?;
     Ok(rows
         .into_iter()
         .map(|r| {
             let head = r.head.unwrap_or_default();
+            let author_is_bot = r
+                .user
+                .as_ref()
+                .is_some_and(|u| u.kind.as_deref() == Some("Bot"));
             RestPull {
                 number: r.number,
                 state: r.state,
@@ -439,6 +464,10 @@ pub fn parse_rest_pulls(body: &str) -> Result<Vec<RestPull>> {
                 head_ref: head.ref_name,
                 head_sha: head.sha,
                 base_ref: r.base.and_then(|b| b.ref_name),
+                body: r.body,
+                author_association: r.author_association,
+                author_is_bot,
+                head_repo: head.repo.and_then(|repo| repo.full_name),
             }
         })
         .collect())

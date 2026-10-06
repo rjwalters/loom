@@ -385,7 +385,7 @@ pub fn open_linked_pr_timeline_args(owner: &str, repo: &str, issue: u32) -> Vec<
 ///
 /// Returns `None` only if the regex itself fails to compile, which callers must
 /// treat as a probe failure rather than an absence.
-fn linkage_phrase_regex(issue: u32) -> Option<regex::Regex> {
+pub(crate) fn linkage_phrase_regex(issue: u32) -> Option<regex::Regex> {
     regex::Regex::new(&format!(
         r"(?i)(?:^|[^0-9A-Za-z]){LINKAGE_PHRASE}[*_:\s]*#{issue}(?:[^0-9]|$)"
     ))
@@ -657,8 +657,12 @@ fn resolve_owner_repo_legacy(repo_root: &Path) -> Option<(String, String)> {
 /// The `worktree_ops` counterpart of
 /// `sweep_registry::guards::SweepRegistry::probe_open_linked_pr`, resolved
 /// against `repo_root` instead of a registry workspace, and — since #8116 —
-/// sharing that probe's two-transport union rather than only its first leg:
+/// sharing that probe's transports rather than only its first leg:
 ///
+/// 0. **Cached open-PR listing** ([`super::linked_pr_listing`], #10514). When
+///    the ETag'd REST listing reads, its verdict is final and legs 1-2 never
+///    run: the normal path spends no GraphQL and no timeline walk. Legs 1-2
+///    below are its fallback for a listing that could not be read.
 /// 1. **GraphQL closes-graph** ([`open_linked_pr_args`] /
 ///    [`parse_open_linked_pr`]). Decisive when it finds an OPEN PR.
 /// 2. **REST timeline** ([`open_linked_pr_timeline_args`] /
@@ -695,32 +699,22 @@ pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
             None => return OpenPrProbe::ProbeFailed,
         },
     };
-    let gone = std::cell::Cell::new(false);
-    let graphql = run_probe(
-        "worktree.linked_pr_graphql",
+    // Leg 0 (#10514): the cached open-PR listing, pinned to the repo just
+    // resolved (never `LOOM_REPO`, #5511). A read listing is decisive.
+    let nwo = format!("{owner}/{repo}");
+    let gh = gh_bin();
+    let listed = super::linked_pr_listing::probe(
+        "worktree.linked_pr_listing",
+        Path::new(&gh),
         repo_root,
-        open_linked_pr_args(&owner, &repo, issue),
-        &|s| parse_open_linked_pr_trusted(s, repo_root),
-        &gone,
+        Some(&nwo),
+        &nwo,
+        issue,
     );
-    let verdict = if matches!(graphql, OpenPrProbe::Open(_)) {
-        graphql
-    } else {
-        let timeline = run_probe(
-            "worktree.linked_pr_timeline",
-            repo_root,
-            open_linked_pr_timeline_args(&owner, &repo, issue),
-            &|s| parse_open_linked_pr_timeline_trusted(s, issue, repo_root),
-            &gone,
-        );
-        // A verified NoneOpen from leg 1 survives a leg-2 probe failure: leg 2
-        // is a superset *when it answers*, and an unanswered superset is no
-        // evidence.
-        if matches!(timeline, OpenPrProbe::ProbeFailed) {
-            graphql
-        } else {
-            timeline
-        }
+    let gone = std::cell::Cell::new(false);
+    let verdict = match listed {
+        Some(verdict) => verdict,
+        None => legacy_union(repo_root, &owner, &repo, issue, &gone),
     };
     let Some(fact) = fact else {
         return verdict;
@@ -741,6 +735,42 @@ pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
         return OpenPrProbe::ProbeFailed;
     }
     verdict
+}
+
+/// The pre-#10514 GraphQL-then-timeline union of [`probe_open_linked_pr`], now
+/// only its fallback when the open-PR listing could not be read.
+fn legacy_union(
+    repo_root: &Path,
+    owner: &str,
+    repo: &str,
+    issue: u32,
+    gone: &std::cell::Cell<bool>,
+) -> OpenPrProbe {
+    let graphql = run_probe(
+        "worktree.linked_pr_graphql",
+        repo_root,
+        open_linked_pr_args(owner, repo, issue),
+        &|s| parse_open_linked_pr_trusted(s, repo_root),
+        gone,
+    );
+    if matches!(graphql, OpenPrProbe::Open(_)) {
+        return graphql;
+    }
+    let timeline = run_probe(
+        "worktree.linked_pr_timeline",
+        repo_root,
+        open_linked_pr_timeline_args(owner, repo, issue),
+        &|s| parse_open_linked_pr_timeline_trusted(s, issue, repo_root),
+        gone,
+    );
+    // A verified NoneOpen from leg 1 survives a leg-2 probe failure: leg 2
+    // is a superset *when it answers*, and an unanswered superset is no
+    // evidence.
+    if matches!(timeline, OpenPrProbe::ProbeFailed) {
+        graphql
+    } else {
+        timeline
+    }
 }
 
 /// Run one `gh` transport for [`probe_open_linked_pr`] and classify it.

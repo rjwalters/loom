@@ -7,9 +7,10 @@ use std::time::{Duration, SystemTime};
 const FULL_ROW: &str = r#"[{
   "number": 502, "state": "open", "draft": true, "title": "t",
   "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-02T00:00:00Z",
-  "user": {"login": "alice"},
+  "user": {"login": "alice", "type": "User"},
+  "author_association": "MEMBER", "body": "Closes #77",
   "labels": [{"name": "loom:reviewing"}, {"name": "loom:pr"}],
-  "head": {"ref": "feature/issue-77", "sha": "abc"},
+  "head": {"ref": "feature/issue-77", "sha": "abc", "repo": {"full_name": "o/r"}},
   "base": {"ref": "main"},
   "mergeable": true
 }]"#;
@@ -31,6 +32,10 @@ fn parses_every_field_the_passes_read() {
             head_ref: Some("feature/issue-77".to_string()),
             head_sha: Some("abc".to_string()),
             base_ref: Some("main".to_string()),
+            body: Some("Closes #77".to_string()),
+            author_association: Some("MEMBER".to_string()),
+            author_is_bot: false,
+            head_repo: Some("o/r".to_string()),
         }]
     );
     assert!(rows[0].has_label("loom:pr"));
@@ -44,6 +49,9 @@ fn a_sparse_row_parses_leniently_and_garbage_does_not() {
     assert!(!rows[0].draft);
     assert_eq!((rows[0].head_sha.as_deref(), rows[0].base_ref.as_deref()), (None, None));
     assert!(rows[0].labels.is_empty());
+    assert_eq!((rows[0].body.as_deref(), rows[0].head_repo.as_deref()), (None, None));
+    let bot = parse_rest_pulls(r#"[{"number": 4, "user": {"login": "x[bot]", "type": "Bot"}}]"#);
+    assert!(bot.unwrap()[0].author_is_bot);
     assert!(parse_rest_pulls("not json").is_err());
     assert!(parse_rest_pulls(r#"{"message": "Not Found"}"#).is_err());
 }

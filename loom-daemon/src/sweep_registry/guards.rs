@@ -542,6 +542,16 @@ impl SweepRegistry {
     /// [`reap_gh_timeout`] exactly like the label flips so it cannot block the
     /// dispatch path.
     ///
+    /// **Leg 0: the cached open-PR listing (#10514).** Each round first reads
+    /// the ETag'd REST open-PR listing the claim-reconciliation passes already
+    /// keep warm (an unchanged repo is a free `304`) and classifies it with
+    /// [`crate::worktree_ops::linked_pr_listing`]: a `Closes`/`Part of #N`
+    /// body or a same-repo `feature/issue-N` head links, under the same H14
+    /// fork-trust rule. A read listing is the verdict; the GraphQL/timeline
+    /// union below runs only when it could not be read, and a failed read is
+    /// never "no PR" (#7863). The listing does not see sidebar links or
+    /// cross-repo / URL-form closing references (see that module).
+    ///
     /// The query itself
     /// ([`crate::worktree_ops::gh::open_linked_pr_args`]) and its
     /// classification ([`crate::worktree_ops::gh::parse_open_linked_pr`] — the
@@ -833,11 +843,22 @@ impl SweepRegistry {
         guard.insert(issue, OpenPrMemoEntry { pr, verified_at });
     }
 
-    /// One GraphQL/REST union round of [`probe_open_linked_pr`]. A closing PR
-    /// is decisive; an empty closes-graph still needs the timeline (#7757).
-    /// Extracted so the #6058 retry loop above can invoke it more than once
-    /// without duplicating the transport-selection logic.
+    /// One round of [`probe_open_linked_pr`]. Leg 0 (#10514): the cached REST
+    /// open-PR listing, shared (one ETag) with the claim-reconciliation passes
+    /// — when it reads, its verdict is final. Only a listing that could not be
+    /// read falls back to the GraphQL/REST union: a closing PR is decisive; an
+    /// empty closes-graph still needs the timeline (#7757). Extracted so the
+    /// #6058 retry loop above can invoke it more than once.
     fn probe_open_linked_pr_transports(&self, issue: u32) -> OpenPrProbe {
+        let root = &self.config.workspace_root;
+        let listed = self.resolve_owner_repo().and_then(|(owner, repo)| {
+            let (gh, nwo) = (self.resolved_gh(), format!("{owner}/{repo}"));
+            let caller = "guard.open_pr_listing";
+            crate::worktree_ops::linked_pr_listing::probe(caller, &gh, root, None, &nwo, issue)
+        });
+        if let Some(verdict) = listed {
+            return verdict;
+        }
         let graphql = self.probe_open_linked_pr_graphql(issue);
         if matches!(graphql, OpenPrProbe::Open(_)) {
             return graphql;
@@ -3746,6 +3767,10 @@ mod union_tests;
 #[cfg(test)]
 #[path = "guards_preflip_tests.rs"]
 mod preflip_tests;
+
+#[cfg(test)]
+#[path = "guards_listing_tests.rs"]
+mod listing_tests;
 
 // Issue #8263's `gh api` GH_REPO regression coverage. A plain child module
 // (guards/repo_env_tests.rs) rather than another `#[path]` sibling: this file
