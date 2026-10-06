@@ -490,4 +490,11 @@ fn the_backtest_scoreboard_lists_each_challenger_and_warns_when_stale() {
     let c = find(&c, "backtest", "nightly_folds");
     assert_eq!(c.status, Status::Skip);
     assert!(c.detail.contains("cap"), "{}", c.render());
+
+    // Fail-closed with no captain: the doctor says how to turn it on.
+    f.data.gate = Gate::NoCaptain;
+    let c = evaluate(&f);
+    let c = find(&c, "backtest", "nightly_folds");
+    assert_eq!(c.status, Status::Skip);
+    assert!(c.detail.contains("fleet.captain"), "{}", c.render());
 }

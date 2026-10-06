@@ -984,6 +984,9 @@ fn backtest(f: &Facts) -> Vec<Check> {
     let Some(state) = &b.state else {
         let who = match &f.data.gate {
             Gate::StandDown { captain } => format!("the fleet captain ({captain}) runs it"),
+            Gate::NoCaptain => {
+                "no fleet.captain is declared, so no host runs it: set `fleet.captain`".to_string()
+            }
             _ => "it runs once a day after 00:30 UTC".to_string(),
         };
         return vec![Check::skip(
