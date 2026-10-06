@@ -282,11 +282,15 @@ fn star_only(own: &PriorityState, linked: Option<&LinkedStar>) -> PriorityInputs
     priority_inputs(&subject(A, 1, 1.0), own, linked, &ctx, now())
 }
 
+/// One `star_sources_levels_and_unknowns` case: label, own state, linked star,
+/// expected star flag, expected level.
+type StarCase<'a> = (&'a str, PriorityState, Option<&'a LinkedStar>, Option<bool>, Option<u8>);
+
 #[test]
 fn star_sources_levels_and_unknowns() {
     let none = LinkedStar::default();
     let linked = linked_from(ago(2.0));
-    let cases: Vec<(&str, PriorityState, Option<&LinkedStar>, Option<bool>, Option<u8>)> = vec![
+    let cases: Vec<StarCase<'_>> = vec![
         ("PR-only star", labels(&[STAR]), Some(&none), Some(true), Some(1)),
         ("linked-issue-only star", labels(&[]), Some(&linked), Some(true), Some(1)),
         ("both", labels(&[STAR]), Some(&linked), Some(true), Some(1)),
