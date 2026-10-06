@@ -6,7 +6,8 @@ use super::{as_of, history_a, input_at};
 use crate::eta::explanation::Explanation;
 use crate::eta::grid;
 use crate::eta::heuristics::{
-    estimate_path, PathRules, LAND_HELD_HERON, LAND_QUICK_TERN, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B,
+    estimate_path, PathRules, LAND_HELD_HERON, LAND_KEEN_WREN, LAND_QUICK_TERN, LAND_TWIN_OTTER,
+    LAND_TWIN_OTTER_B,
 };
 use crate::eta::history::{SampleSource, StageSample, StageSamples};
 use crate::eta::labels::{
@@ -140,6 +141,7 @@ fn every_shipped_heuristic_refuses_a_held_pr_exactly_as_before() {
         vec![
             LAND_QUICK_TERN,
             LAND_HELD_HERON,
+            LAND_KEEN_WREN,
             LAND_TWIN_OTTER,
             LAND_TWIN_OTTER_B
         ]
