@@ -260,7 +260,7 @@ fn blocked_canary_admits_the_worker_into_the_sidecar() {
     let calls = fake.calls.borrow();
     let canary = calls
         .iter()
-        .find(|c| c.contains(&"--rm".to_string()))
+        .find(|c| c.contains(&"--rm".to_string()) && !c.contains(&"-d".to_string()))
         .unwrap();
     assert!(canary.contains(&format!("container:{}", sidecar.name)));
     assert!(canary.contains(&DEFAULT_CANARY.to_string()));

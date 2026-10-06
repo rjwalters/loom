@@ -61,7 +61,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::forge_egress::checks::{assert_runtime, CanaryOutcome, Observed};
-use crate::forge_egress::policy::{dig, dig_str, expected_api_host};
+use crate::forge_egress::policy::{dig, expected_api_host};
 use crate::forge_egress::report::Finding;
 use crate::forge_egress::worker_env::WorkerEgress;
 

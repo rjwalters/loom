@@ -691,7 +691,7 @@ fn a_sink_dir_that_is_not_a_sink_is_neither_mounted_nor_assigned_nor_changed() {
 
 #[test]
 fn egress_sidecar_joins_the_netns_and_moves_add_host_to_the_sidecar() {
-    use super::egress_policy::Sidecar;
+    use crate::worker_spawn::egress_policy::Sidecar;
     let _g = env_lock();
     clear_env();
     std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");

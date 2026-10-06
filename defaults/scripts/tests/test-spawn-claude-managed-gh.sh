@@ -48,6 +48,13 @@ case "$*" in
             printf '%s\n' -e GH_TOKEN # the daemon's legacy_docker_args
         fi
         ;;
+    "forge egress container-network --image "*)
+        echo "$*" >>"$FAKE_NET_LOG"
+        [[ "${FAKE_NET_RC:-0}" == "0" ]] || { echo "forge-egress: runtime.bypass-open" >&2; exit "$FAKE_NET_RC"; }
+        [[ "${FAKE_NET_EMPTY:-0}" == "1" ]] && exit 0
+        echo "loom-forge-egress-network: ${FAKE_NET:-isolated}"
+        [[ "${FAKE_NET:-isolated}" == "isolated" ]] && printf '%s\n' --network container:fake-sidecar
+        ;;
 esac
 exit 0
 STUB
@@ -58,8 +65,9 @@ run() { # run <daemon-bin> [ENV=VAL ...]; stdout+stderr, exit code in RC
     shift
     : >"$DOCKER_LOG"
     : >"$T/check.log"
+    : >"$T/net.log"
     OUT="$(env -u GITHUB_TOKEN HOME="$T/home" LOOM_WORKSPACE="$WS" LOOM_DAEMON_BIN="$bin" PATH="$T/bin:$PATH" \
-        FAKE_CHECK_LOG="$T/check.log" LOOM_SWEEP_CPU_QUOTA=0 GH_TOKEN=ghp_secret "$@" \
+        FAKE_CHECK_LOG="$T/check.log" FAKE_NET_LOG="$T/net.log" LOOM_SWEEP_CPU_QUOTA=0 GH_TOKEN=ghp_secret "$@" \
         "$SCRIPTS_DIR/spawn-claude.sh" -p ping 2>&1)"
     RC=$?
 }
@@ -104,6 +112,21 @@ check "managed args: ~/.config/gh is not mounted" '! grep -q "\.config/gh" "$DOC
 check "managed args: GH_TOKEN is not forwarded" '! grep -q -- "-e GH_TOKEN" "$DOCKER_LOG"'
 check "managed args: the status line is not passed to docker" '! grep -q "loom-forge-egress" "$DOCKER_LOG"'
 check "container-args got the worker image (--image)" 'grep -q "container-args --image " "$T/check.log"'
+
+# Container egress boundary (#9989): managed => the sidecar network args reach
+# docker; any answer but an explicit status refuses (a bypass-open canary
+# exits non-zero with no stdout; an older daemon prints nothing).
+check "managed: container-network was asked, with the worker image" 'grep -q "container-network --image " "$T/net.log"'
+check "managed: the sidecar network args reach docker" 'grep -q -- "--network container:fake-sidecar" "$DOCKER_LOG"'
+check "managed: the network status line is not passed to docker" '! grep -q "loom-forge-egress-network" "$DOCKER_LOG"'
+run "$T/bin/fake-daemon" FAKE_NET=none
+check "network none: proceeds with no sidecar args" '[[ $RC -eq 0 ]] && ! grep -q -- "container:" "$DOCKER_LOG"'
+run "$T/bin/fake-daemon" FAKE_NET_RC=78
+check "bypass-open canary (container-network exit 78) aborts before docker" '[[ $RC -eq 78 && ! -s "$DOCKER_LOG" ]]'
+run "$T/bin/fake-daemon" FAKE_NET_EMPTY=1
+check "empty container-network output refuses" '[[ $RC -eq 78 && ! -s "$DOCKER_LOG" ]]'
+run "$T/bin/fake-daemon" FAKE_STATUS=unconfigured
+check "unconfigured: container-network is never asked" '[[ ! -s "$T/net.log" ]]'
 
 # Empty output is never "no policy" (#10446 review): only an explicit status is.
 run "$T/bin/fake-daemon" FAKE_ARGS_EMPTY=1 LOOM_FORGE_EGRESS_POLICY="$T/policy.json"
