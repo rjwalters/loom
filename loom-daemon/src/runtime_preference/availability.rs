@@ -209,8 +209,10 @@ fn claude(root: &Path) -> Availability {
 ///
 /// **Session down (#10454).** A session-managed account whose container is not
 /// running is not spawnable (spawn-codex.sh refuses it), so a pool of only
-/// such accounts is Exhausted with a detail naming `SessionDown`. When Docker
-/// cannot be queried the count stays at zero — cannot observe, not down.
+/// such accounts is Exhausted with a detail naming `SessionDown`. The read is
+/// the session watch's published snapshot (#10660), never a `docker` process;
+/// with no fresh snapshot, or Docker unqueryable, the count stays at zero —
+/// cannot observe, not down.
 fn codex(root: &Path, admitted: &ResolvedRuntime, now: u64) -> Availability {
     let source = CredentialSource::CodexAccounts;
     if let Some(hold) = super::sandbox_hold::active("codex", now) {
