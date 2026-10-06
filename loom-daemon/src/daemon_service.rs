@@ -1751,10 +1751,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // or dispatch side effect.
     let _stash_summary_refresh_handle = {
         let interval = quarantine_stash_status::DEFAULT_STASH_SUMMARY_REFRESH_INTERVAL;
-        log::info!(
-            "quarantine_stash_status: enabled (multi-workspace, interval={}s)",
-            interval.as_secs()
-        );
+        // Duration's Debug renders whole seconds as `<n>s`, same text as before.
+        log::info!("quarantine_stash_status: enabled (multi-workspace, interval={interval:?})");
         quarantine_stash_status::spawn_multi_stash_summary_refresh_task(
             sweep_workspace.clone(),
             interval,
