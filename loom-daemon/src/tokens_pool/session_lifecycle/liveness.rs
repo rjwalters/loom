@@ -1,124 +1,217 @@
-//! Batched session-container liveness read (Issue #10454, Epic #10452).
+//! Session-container liveness for account selection (Issue #10454, converged
+//! on the shared snapshot by #10660; Epic #10452).
 //!
 //! A session-managed Codex account (one adopted by `accounts session start`,
 //! see [`super::is_session_managed`]) can only be dispatched into while its
-//! `loom-codex-session-<name>` container is running: `spawn-codex.sh`'s
-//! session-exec posture check refuses a stopped one with exit 78. Before this
-//! module the role runner's pre-spawn gate and the ordered preference
-//! resolver counted such an account as spawnable anyway, so a
-//! `rolePreference.judge = ["codex", "claude"]` tick with every session
-//! container down selected Codex, picked an account and was killed — it never
-//! fell through to Claude. That broke `runtime_preference::availability`'s
-//! own rule: *a tap that would refuse at spawn must be passed over, not
-//! selected and then killed.*
+//! `loom-codex-session-<name>` container can take a `docker exec`:
+//! `spawn-codex.sh`'s session-exec posture check refuses a down one with exit
+//! 78. The role runner's pre-spawn gate and the ordered preference resolver
+//! therefore must not count such an account as spawnable — *a tap that would
+//! refuse at spawn must be passed over, not selected and then killed*
+//! (`runtime_preference::availability`).
 //!
-//! # One `docker ps` per pass, never one `inspect` per account
+//! # No Docker read of its own
 //!
-//! [`running_sessions`] lists every running `loom-codex-session-*` container
-//! in a single `docker ps` and caches the answer for [`CACHE_TTL`], so the
-//! preflight gate and the availability mapping — which both read the pool in
-//! the same tick — share one Docker round trip. The call is bounded by
-//! [`LIVENESS_TIMEOUT`] (the same kill-on-overrun helper the reaper uses for
-//! its own `docker ps`), so a wedged dockerd cannot stall a role tick.
+//! This module is a thin adapter over [`session_state`]: it never builds a
+//! `docker` command line. "Down" is [`SessionState::is_down`] — stopped,
+//! restarting (a crash loop backing off) or missing — the same rule the
+//! visibility gauge, the posture check and the reconciler classify with, so
+//! the readers cannot drift apart. There are two ways to get a snapshot:
+//!
+//! * **In the daemon** ([`published`]): the newest snapshot the always-on
+//!   watch (`observability::ops::codex_session::spawn_watch`, every 60 s)
+//!   published, read with [`session_state::latest`] and
+//!   [`session_state::LATEST_MAX_AGE`]. A mutex read: the pre-spawn gate and
+//!   the preference resolver run on every role tick and start **zero**
+//!   `docker` processes, so a wedged dockerd costs the role loop nothing.
+//! * **Outside the daemon** ([`for_selector`]): `loom-daemon tokens select`
+//!   (run by `spawn-codex.sh`) and the worker launcher are separate,
+//!   short-lived processes that cannot see the daemon's in-memory snapshot.
+//!   The choice made in #10660 is that the selector takes **one** bounded
+//!   [`session_state::snapshot`] itself — the same code path, the same
+//!   [`session_state::SNAPSHOT_DEADLINE`], the same classification — rather
+//!   than having the daemon pass a verdict down through the adapter's
+//!   environment (which would have needed new portable shell, and a second
+//!   encoding of the verdict to keep in step). It is taken only when some
+//!   enabled Codex account is session-managed; every other pool starts no
+//!   process at all. A process that runs the watch ([`mark_watch_runs_here`])
+//!   never takes it: there the selector reads [`published`] like every other
+//!   in-daemon reader, including while no fresh snapshot exists.
+//!
+//! The selector's own snapshot is taken with no registered workspace roots,
+//! so it never classifies `stale_mounts`; that changes nothing here, because
+//! of the next rule.
+//!
+//! # `stale_mounts` is not down
+//!
+//! A running container that lacks the mount of some registered root can still
+//! serve every repository it does mount. Whether it can serve *this* dispatch
+//! is the per-dispatch mount check's question (#10364), not selection's, so a
+//! `stale_mounts` account stays selectable.
 //!
 //! # Fail open
 //!
-//! When Docker cannot be queried at all — no binary, a non-zero exit, a
-//! timeout — the answer is `None`: *cannot observe*, which every caller treats
-//! as "no account is down" (`availability`'s `Ungated` rule). Only a
-//! successful listing that does not name an account's container marks that
-//! account down. A bare-metal (non-session-managed) account is never
-//! consulted at all, and no `docker` process is started unless some enabled
-//! account is session-managed.
+//! `None` (no snapshot younger than the max age — including the first moments
+//! after daemon start, before the watch's first pass) and
+//! [`Snapshot::Unavailable`] (Docker could not be queried: no binary, an
+//! unreachable or wedged daemon) both mean *cannot observe*, which every
+//! caller treats as "no account is down" (`availability`'s `Ungated` rule).
+//! Only an [`Snapshot::Available`] map marks anything down. A bare-metal
+//! (non-session-managed) account is never gated on a container at all.
+//!
+//! # Operator holds
+//!
+//! [`is_held`] reads the `.session-hold.json` sidecar `accounts session stop`
+//! leaves (`tokens_pool::session_hold`). A hold never changes whether an
+//! account is down — that is the snapshot's answer alone — only how a down
+//! account is described: the skip text must not tell the operator to
+//! `accounts session start` a container they stopped on purpose. It reads the
+//! account's own profile directory; a hold recorded only under another
+//! registered root's differently-resolved profile is not seen from here.
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use super::super::account_registry::{AccountDescriptor, AccountProvider};
+use super::super::session_hold;
+use super::super::session_state::{self, SessionState, Snapshot};
 use super::{container_name, is_session_managed};
 
-/// Wall-clock bound on the one `docker ps` a pass makes.
-pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long one listing answers for. Long enough to cover the preflight gate
-/// and the availability mapping reading the pool in the same tick, short
-/// enough that a container the reconciler just restarted is seen next tick.
-pub const CACHE_TTL: Duration = Duration::from_secs(5);
-
-/// The skip/count reason this module introduces. A count reason, never a
+/// The skip/count reason selection reports. A count reason, never a
 /// persisted `HealthReason` — no `account-health.json` schema change.
 pub const SESSION_DOWN: &str = "SessionDown";
 
-/// The set of session containers Docker reported as running.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SessionLiveness {
-    running: HashSet<String>,
+/// One shared snapshot, read by account name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionLiveness(Arc<Snapshot>);
+
+impl Default for SessionLiveness {
+    /// Docker answered and listed no session container: every account's
+    /// container is missing.
+    fn default() -> Self {
+        Self(Arc::new(Snapshot::Available(std::collections::BTreeMap::new())))
+    }
 }
 
 impl SessionLiveness {
-    /// Build from container names (as `docker ps --format {{.Names}}` prints
-    /// them). Names outside the `loom-codex-session-` namespace are ignored.
-    pub fn from_container_names<I, S>(names: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let prefix = container_name("");
-        Self {
-            running: names
-                .into_iter()
-                .map(|name| name.as_ref().trim().to_string())
-                .filter(|name| name.len() > prefix.len() && name.starts_with(&prefix))
-                .collect(),
-        }
+    #[must_use]
+    pub fn from_snapshot(snapshot: Arc<Snapshot>) -> Self {
+        Self(snapshot)
     }
 
-    /// Parse `docker ps --format {{.Names}}` stdout (one name per line).
+    /// `account_name`'s container state; `None` when the snapshot is
+    /// unavailable (cannot observe).
     #[must_use]
-    pub fn parse_ps(stdout: &str) -> Self {
-        Self::from_container_names(stdout.lines())
+    pub fn state_of(&self, account_name: &str) -> Option<SessionState> {
+        self.0.state_of(&container_name(account_name))
     }
 
-    /// Whether `account_name`'s session container is running.
+    /// Whether the snapshot positively shows `account_name`'s container
+    /// cannot take a dispatch ([`SessionState::is_down`]).
     #[must_use]
-    pub fn is_running(&self, account_name: &str) -> bool {
-        self.running.contains(&container_name(account_name))
+    pub fn is_down(&self, account_name: &str) -> bool {
+        self.state_of(account_name)
+            .is_some_and(SessionState::is_down)
     }
 }
 
 /// `true` iff `account` is session-managed AND `liveness` positively shows
-/// its container is not running. `None` liveness (Docker unobservable) is
+/// its container is down. `None` liveness and an unavailable snapshot are
 /// never "down" — the fail-open rule.
 #[must_use]
 pub fn is_session_down(account: &AccountDescriptor, liveness: Option<&SessionLiveness>) -> bool {
     liveness.is_some_and(|live| {
-        is_session_managed(&account.credential_reference) && !live.is_running(&account.id.name)
+        live.is_down(&account.id.name) && is_session_managed(&account.credential_reference)
     })
 }
 
-/// The liveness read for `inventory`: `None` without starting any process when
-/// no enabled Codex account is session-managed, else [`running_sessions`].
+/// Whether the operator holds `account`'s session down (`accounts session
+/// stop`). File reads only. See the module doc for what this does and does
+/// not decide.
 #[must_use]
-pub fn liveness_for(inventory: &[AccountDescriptor]) -> Option<SessionLiveness> {
+pub fn is_held(account: &AccountDescriptor) -> bool {
+    session_hold::held_across(std::slice::from_ref(&account.credential_reference))
+}
+
+/// The in-daemon read: the watch's newest published snapshot, if fresh.
+/// Never starts a process.
+#[must_use]
+pub fn published() -> Option<SessionLiveness> {
+    #[cfg(test)]
+    {
+        test_support::published()
+    }
+    #[cfg(not(test))]
+    {
+        session_state::latest(session_state::LATEST_MAX_AGE).map(SessionLiveness)
+    }
+}
+
+static WATCH_RUNS_HERE: AtomicBool = AtomicBool::new(false);
+
+/// Declare that this process runs the session watch, so [`for_selector`]
+/// reads what it publishes and never forks `docker` here. Called once where
+/// the daemon starts the watch.
+pub fn mark_watch_runs_here() {
+    WATCH_RUNS_HERE.store(true, Ordering::Release);
+}
+
+/// The account selector's read for `inventory`: `None` without starting any
+/// process when no enabled Codex account is session-managed; else the
+/// published snapshot (in the daemon), else one bounded snapshot.
+#[must_use]
+pub fn for_selector(inventory: &[AccountDescriptor]) -> Option<SessionLiveness> {
     let any_session_managed = inventory.iter().any(|account| {
         account.id.provider == AccountProvider::Codex
             && account.enabled
             && is_session_managed(&account.credential_reference)
     });
-    if any_session_managed {
-        running_sessions()
-    } else {
-        None
+    if !any_session_managed {
+        return None;
     }
+    #[cfg(test)]
+    let (watched, docker) = test_support::selector();
+    #[cfg(not(test))]
+    let (watched, docker) = (
+        WATCH_RUNS_HERE.load(Ordering::Acquire),
+        Some(
+            std::env::var("LOOM_CODEX_SESSION_DOCKER")
+                .ok()
+                .filter(|docker| !docker.is_empty())
+                .unwrap_or_else(|| "docker".to_string()),
+        ),
+    );
+    selector_read(published(), watched, docker.as_deref())
+}
+
+/// [`for_selector`]'s decision. `published` wins; a process that runs the
+/// watch stops there; only a process with neither takes one snapshot from
+/// `docker` (`None`: no binary to ask — cannot observe).
+fn selector_read(
+    published: Option<SessionLiveness>,
+    watched: bool,
+    docker: Option<&str>,
+) -> Option<SessionLiveness> {
+    if published.is_some() || watched {
+        return published;
+    }
+    let snapshot = session_state::snapshot(docker?, &[], session_state::SNAPSHOT_DEADLINE);
+    if let Snapshot::Unavailable(reason) = &snapshot {
+        log::warn!(
+            "session liveness: Codex session containers cannot be observed ({reason}) — not \
+             marking any session down (fail open, #10454)"
+        );
+    }
+    Some(SessionLiveness(Arc::new(snapshot)))
 }
 
 /// The accounts in `inventory` the selector should try first: everything
 /// except session-managed accounts whose container is down. `None` when there
-/// is nothing to prefer — Docker unobservable, no account down, or no account
+/// is nothing to prefer — cannot observe, no account down, or no account
 /// live — so the caller selects from the full inventory exactly as before.
 #[must_use]
 pub fn live_preferred(inventory: &[AccountDescriptor]) -> Option<Vec<AccountDescriptor>> {
-    let liveness = liveness_for(inventory)?;
+    let liveness = for_selector(inventory)?;
     let live: Vec<AccountDescriptor> = inventory
         .iter()
         .filter(|account| !is_session_down(account, Some(&liveness)))
@@ -128,116 +221,102 @@ pub fn live_preferred(inventory: &[AccountDescriptor]) -> Option<Vec<AccountDesc
     (live.len() < inventory.len() && any_live_enabled).then_some(live)
 }
 
-/// Every running `loom-codex-session-*` container, from one bounded
-/// `docker ps`, cached for [`CACHE_TTL`]. `None` when Docker could not be
-/// queried (fail open — see the module doc).
-#[must_use]
-pub fn running_sessions() -> Option<SessionLiveness> {
-    #[cfg(test)]
-    {
-        test_support::current()
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::Mutex;
-        use std::time::Instant;
-        static CACHE: Mutex<Option<(Instant, Option<SessionLiveness>)>> = Mutex::new(None);
-        let mut cache = CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((at, value)) = cache.as_ref() {
-            if at.elapsed() < CACHE_TTL {
-                return value.clone();
-            }
-        }
-        let value = query_docker();
-        *cache = Some((Instant::now(), value.clone()));
-        value
-    }
-}
-
-#[cfg_attr(test, allow(dead_code))]
-fn query_docker() -> Option<SessionLiveness> {
-    let mut cmd = std::process::Command::new("docker");
-    cmd.args([
-        "ps",
-        "--filter",
-        "status=running",
-        "--filter",
-        &format!("name={}", container_name("")),
-        "--format",
-        "{{.Names}}",
-    ])
-    .stdin(std::process::Stdio::null());
-    match crate::sweep_registry::reaper::output_with_timeout(cmd, LIVENESS_TIMEOUT) {
-        Ok(Some(out)) if out.status.success() => {
-            Some(SessionLiveness::parse_ps(&String::from_utf8_lossy(&out.stdout)))
-        }
-        Ok(Some(out)) => {
-            log::debug!(
-                "session liveness: `docker ps` exited {:?} — not marking any session down \
-                 (fail open, #10454)",
-                out.status.code()
-            );
-            None
-        }
-        Ok(None) => {
-            log::warn!(
-                "session liveness: `docker ps` timed out after {LIVENESS_TIMEOUT:?} — not \
-                 marking any session down (fail open, #10454)"
-            );
-            None
-        }
-        Err(e) => {
-            log::debug!(
-                "session liveness: `docker ps` could not run ({e}) — not marking any session \
-                 down (fail open, #10454)"
-            );
-            None
-        }
-    }
-}
-
-/// Test seam: under `cfg(test)` [`running_sessions`] never shells out to
-/// Docker. It answers what the current thread installed with [`set`], and by
-/// default `None` (unobservable) — so a test that marks an account
-/// session-managed for an unrelated reason is unaffected by whatever
-/// containers happen to be running on the test host.
+/// Test seam: under `cfg(test)` nothing here reads the process-wide published
+/// snapshot (other tests publish to it) or the host's Docker. [`published`]
+/// answers what the current thread installed with [`set`], by default `None`
+/// (cannot observe) — so a test that marks an account session-managed for an
+/// unrelated reason is unaffected by whatever containers happen to be running
+/// on the test host. The selector's one-snapshot path runs only against a
+/// fake `docker` a test names with [`set_selector_docker`].
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::SessionLiveness;
+    use super::{container_name, Arc, SessionLiveness, SessionState, Snapshot};
+    use crate::tokens_pool::session_state::Observed;
     use std::cell::RefCell;
 
+    #[derive(Default)]
+    struct Seam {
+        published: Option<SessionLiveness>,
+        watched: bool,
+        docker: Option<String>,
+    }
+
     thread_local! {
-        static OVERRIDE: RefCell<Option<SessionLiveness>> = const { RefCell::new(None) };
+        static SEAM: RefCell<Seam> = RefCell::new(Seam::default());
     }
 
-    pub(crate) fn current() -> Option<SessionLiveness> {
-        OVERRIDE.with(|cell| cell.borrow().clone())
+    pub(crate) fn published() -> Option<SessionLiveness> {
+        SEAM.with(|seam| seam.borrow().published.clone())
     }
 
-    /// Restores "unobservable" on drop, including across a panic.
+    pub(crate) fn selector() -> (bool, Option<String>) {
+        SEAM.with(|seam| (seam.borrow().watched, seam.borrow().docker.clone()))
+    }
+
+    /// Restores the default seam on drop, including across a panic.
     pub(crate) struct LivenessGuard;
 
     impl Drop for LivenessGuard {
         fn drop(&mut self) {
-            OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+            SEAM.with(|seam| *seam.borrow_mut() = Seam::default());
         }
     }
 
-    /// Answer every [`super::running_sessions`] on this thread with
-    /// `liveness` (`None` = Docker could not be queried) until the guard drops.
+    /// Answer every [`super::published`] on this thread with `liveness`
+    /// (`None` = no fresh snapshot) until the guard drops.
     #[must_use]
     pub(crate) fn set(liveness: Option<SessionLiveness>) -> LivenessGuard {
-        OVERRIDE.with(|cell| *cell.borrow_mut() = liveness);
+        SEAM.with(|seam| {
+            *seam.borrow_mut() = Seam {
+                published: liveness,
+                ..Seam::default()
+            };
+        });
         LivenessGuard
     }
 
-    /// Liveness listing exactly `accounts`' session containers as running.
+    /// Nothing published; the selector may take its one snapshot from the
+    /// fake `docker`, unless `watched` says this "process" runs the watch.
+    #[must_use]
+    pub(crate) fn set_selector_docker(docker: &str, watched: bool) -> LivenessGuard {
+        SEAM.with(|seam| {
+            *seam.borrow_mut() = Seam {
+                published: None,
+                watched,
+                docker: Some(docker.to_string()),
+            };
+        });
+        LivenessGuard
+    }
+
+    /// An available snapshot holding exactly `accounts`' containers in the
+    /// given states; any other account's container is missing.
+    pub(crate) fn states(accounts: &[(&str, SessionState)]) -> Option<SessionLiveness> {
+        let map = accounts
+            .iter()
+            .map(|(name, state)| {
+                let observed = Observed {
+                    state: *state,
+                    inspect: serde_json::Value::Null,
+                };
+                (container_name(name), observed)
+            })
+            .collect();
+        Some(SessionLiveness(Arc::new(Snapshot::Available(map))))
+    }
+
+    /// A snapshot listing exactly `accounts`' session containers as running.
     pub(crate) fn running(accounts: &[&str]) -> Option<SessionLiveness> {
-        Some(SessionLiveness::from_container_names(
-            accounts.iter().map(|name| super::container_name(name)),
-        ))
+        let up: Vec<_> = accounts
+            .iter()
+            .map(|name| (*name, SessionState::Running))
+            .collect();
+        states(&up)
+    }
+
+    /// A fresh snapshot in which Docker could not be queried.
+    pub(crate) fn unavailable() -> Option<SessionLiveness> {
+        Some(SessionLiveness(Arc::new(Snapshot::Unavailable("docker ps timed out".into()))))
     }
 }
 

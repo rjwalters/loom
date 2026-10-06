@@ -6,12 +6,12 @@
 //! #10455), and its running rule by the spawn-time posture check
 //! (`session_exec::posture::classify`) and `session-exec host`.
 //!
-//! It is built so the other readers can share it, but they do not yet: the
-//! reconciler (#10453, `session_reconcile.rs`) inspects each account itself,
-//! and liveness-aware selection (#10454, `session_lifecycle/liveness.rs`)
-//! keeps its own cached `docker ps`. Moving both, and mount-drift detection
+//! Liveness-aware selection (#10454, `session_lifecycle/liveness.rs`) reads
+//! it too since #10660: [`latest`] in the daemon, one [`snapshot`] in the
+//! out-of-process selector. The reconciler (#10453, `session_reconcile.rs`)
+//! still inspects each account itself; moving it, and mount-drift detection
 //! (#10364), onto [`snapshot`] / [`latest`] is a tracked follow-up, so there
-//! are three docker read paths until then. It has two layers:
+//! are two docker read paths until then. It has two layers:
 //!
 //! * [`classify_inspect`] and [`container_running`] are **pure** over one
 //!   `docker inspect` object, so every caller classifies the same way.
