@@ -6465,7 +6465,8 @@ settles `GREEN` past it. An empty rollup with unreadable statuses ends
 `forge rerun --job <JOB_ID>` re-runs a workflow run, its failed and cancelled
 jobs (`--failed`), or one job, in place: `POST …/actions/runs/{id}/rerun`,
 `…/rerun-failed-jobs` or `…/actions/jobs/{id}/rerun`. A rerun is a write, so it
-runs on the **writer** identity only, never on a reader App. It needs the App
+runs on the **writer** identity only, never on a reader App, and is vetted by
+`write_scope` first (#9548) like every writing forge verb. It needs the App
 permission **Actions: write**. It is not retried (`ci.rerun` is
 `no-auto-retry`). It prints one sentinel:
 

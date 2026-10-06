@@ -16,7 +16,9 @@
 //!
 //! A rerun is a write, so it runs on the **writer** identity only
 //! ([`AccessIntent::Write`] + [`GhInvocation::writer_identity`]); it is never
-//! routed to a reader App, which holds no write permission at all.
+//! routed to a reader App, which holds no write permission at all. Like every
+//! writing forge verb it is vetted by [`crate::write_scope::may_write_from`]
+//! first (#9548): only a managed repository the credential can write.
 //!
 //! # Contract
 //!
@@ -213,19 +215,23 @@ fn run_cli(args: &RerunArgs) -> Outcome {
             )
         }
     };
-    let cwd = std::env::current_dir().ok();
+    let Ok(cwd) = std::env::current_dir() else {
+        return Outcome::Error("cannot read the working directory".into());
+    };
     let env_repo = std::env::var("LOOM_REPO").ok().filter(|v| !v.is_empty());
-    let target = crate::forge_etag_store::resolve_target(
-        cwd.as_deref(),
+    // #9548: a write goes only to a managed repository the credential can
+    // write; this also resolves the repo (`--repo`, `LOOM_REPO`, else origin).
+    let nwo = match crate::write_scope::may_write_from(
+        &cwd,
         args.repo.as_deref().or(env_repo.as_deref()),
-    );
-    let Some(nwo) = target.repo else {
-        return Outcome::Error(
-            "cannot resolve owner/repo (pass --repo or run inside a clone)".into(),
-        );
+    ) {
+        crate::write_scope::Verdict::Allow(nwo) => nwo,
+        crate::write_scope::Verdict::Deny(why) => {
+            return Outcome::Error(format!("refusing the write (#9548): {why}"))
+        }
     };
     let gh = PathBuf::from(crate::gh_invocation::gh_bin());
-    rerun(&gh, cwd.as_deref(), &nwo, what)
+    rerun(&gh, Some(&cwd), &nwo, what)
 }
 
 #[cfg(test)]
