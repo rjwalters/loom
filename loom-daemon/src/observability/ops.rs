@@ -29,7 +29,8 @@
 //! transition or periodic refresh. [`ratelimit`] (#10022) exports GitHub
 //! rate-limit breaker trips, quota gauges and breaker skips, and
 //! [`redate_chain`] (#10163) #8508 re-date pressure (re-dated PRs, re-dates
-//! per PR, time to land). A new emitter adds a `MetricName`/`SpanName`
+//! per PR, time to land), and [`eta_health`] (#10391) the per-host ETA
+//! pipeline health gauges. A new emitter adds a `MetricName`/`SpanName`
 //! variant and calls the same two functions.
 //!
 //! Tests observe what a seam emitted through the global functions with
@@ -40,6 +41,7 @@ pub mod capture;
 pub mod dispatch;
 pub mod disposition;
 pub mod dwell;
+pub mod eta_health;
 pub mod host;
 pub mod liveness;
 pub mod lockout;

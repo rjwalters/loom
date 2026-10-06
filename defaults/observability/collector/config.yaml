@@ -401,7 +401,9 @@ processors:
           # stops stripping the existing loom.tokens.* per-provider label.
           # github.ratelimit.* (#10022) adds resource (core|graphql).
           # loom.daemon.task_* (#10414) adds task (a fixed daemon loop name).
-          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task"])
+          # loom.eta.health.* (#10391) adds heuristic and kind (fixed ETA
+          # vocabularies); repo was already kept (per cached fleet snapshot).
+          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "heuristic", "kind"])
 exporters:
   otlp_http/clickstack:
     endpoint: http://clickstack-collector:4318

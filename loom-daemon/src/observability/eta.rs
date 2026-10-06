@@ -411,6 +411,14 @@ pub(super) fn snapshot_input() -> Option<super::eta_snapshot::SnapshotInput> {
     Some((state.tracker.pending().to_vec(), current_ids(state), registered))
 }
 
+/// Live ETA items per `(kind, heuristic, reason)` for the health gauges
+/// (#10391), counted under the tracker lock without cloning the pending set.
+/// `None` when ETA is disabled.
+pub(super) fn health_items() -> Option<std::collections::BTreeMap<(String, String, String), u64>> {
+    let guard = lock();
+    Some(super::ops::eta_health::buckets(guard.as_ref()?.tracker.pending()))
+}
+
 /// Fold `outcomes` into the shadow ledger and persist it (#9328).
 ///
 /// Every heuristic of a kind estimated the same subject at the same `as_of`,

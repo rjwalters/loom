@@ -264,6 +264,16 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::MergeTimeToLandMax,
         MetricName::DaemonTaskAlive,
         MetricName::DaemonTaskFaults,
+        MetricName::EtaHealthItems,
+        MetricName::EtaHealthFitLoaded,
+        MetricName::EtaHealthFitAgeSeconds,
+        MetricName::EtaHealthFitCheckAgeSeconds,
+        MetricName::EtaHealthSnapshotAgeSeconds,
+        MetricName::EtaHealthRefreshGate,
+        MetricName::EtaHealthRefreshLastCycleAgeSeconds,
+        MetricName::EtaHealthRefreshRepos,
+        MetricName::EtaHealthSnapshotRows,
+        MetricName::EtaHealthSnapshotAlternatesRows,
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }
