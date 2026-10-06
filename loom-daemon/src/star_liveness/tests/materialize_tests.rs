@@ -375,3 +375,140 @@ fn operator_removed_reads_the_latest_trusted_inherited_marker() {
         "an outsider's marker counts for nothing"
     );
 }
+
+// ---- PRs (#10591, #10012 AC 8) ----
+
+use super::fake::pr;
+
+/// A starred issue 10 with child 11 (task list), each with an open PR.
+fn with_prs(world: &World, slug: &str) -> RepoInput {
+    world.add(slug, issue_with_body(10, &[STAR], "- [ ] #11\n"));
+    world.add(slug, issue(11, &["loom:issue"]));
+    world.add(slug, pr(20, 10, &["loom:review-requested"]));
+    world.add(slug, pr(21, 11, &["loom:review-requested"]));
+    let mut input = repo_input(slug);
+    starred(&mut input, 10, AT);
+    input
+}
+
+fn marker_root(world: &World, slug: &str, n: u32) -> Option<u32> {
+    markers(world, slug)
+        .into_iter()
+        .find(|(c, _)| *c == n)
+        .map(|(_, m)| m.root)
+}
+
+/// AC 1 + 2: the PR of a directly starred issue is marked with that issue;
+/// the PR of an inherited child with the root; both lose it after unstar.
+#[test]
+fn prs_of_starred_and_inherited_issues_are_starred_and_unstarred() {
+    let world = World::default();
+    let slug = "m/prs";
+    let input = with_prs(&world, slug);
+    let mut host = Host::new("a");
+    host.pass(&world, std::slice::from_ref(&input), Vec::new(), t(10, 0));
+    assert!(world.starred(slug, 11) && world.starred(slug, 20) && world.starred(slug, 21));
+    assert_eq!(marker_root(&world, slug, 20), Some(10));
+    assert_eq!(marker_root(&world, slug, 21), Some(10));
+    world.human_unstar(slug, 10);
+    host.pass(&world, std::slice::from_ref(&input), Vec::new(), t(10, 2));
+    assert!(!world.starred(slug, 11));
+    assert!(!world.starred(slug, 20), "the direct issue's PR loses it");
+    assert!(!world.starred(slug, 21), "the child's PR loses it");
+    // Nothing starred is left: a later pass is quiet.
+    let before = world.posted(slug).len();
+    host.pass(&world, &[input], Vec::new(), t(10, 4));
+    assert_eq!(world.posted(slug).len(), before);
+}
+
+/// AC 3: a PR the operator starred keeps it when its issue's root is unstarred.
+#[test]
+fn an_operator_starred_pr_keeps_its_star() {
+    let world = World::default();
+    let slug = "m/prop";
+    let input = with_prs(&world, slug);
+    world.human_star(slug, 21);
+    let mut host = Host::new("a");
+    host.pass(&world, std::slice::from_ref(&input), Vec::new(), t(10, 0));
+    assert!(world.starred(slug, 20));
+    world.human_unstar(slug, 10);
+    host.pass(&world, &[input], Vec::new(), t(10, 2));
+    assert!(!world.starred(slug, 11) && !world.starred(slug, 20));
+    assert!(world.starred(slug, 21), "the operator's PR star stays");
+}
+
+/// AC 4: propagate or escalate off writes nothing, PRs included.
+#[test]
+fn propagate_or_escalate_off_stars_no_pr() {
+    for s in [
+        Settings {
+            propagate: false,
+            ..settings()
+        },
+        Settings {
+            escalate: false,
+            ..settings()
+        },
+    ] {
+        let world = World::default();
+        let slug = "m/proff";
+        let input = with_prs(&world, slug);
+        Host::new("a").pass_with(&world, &[input], Vec::new(), t(10, 0), s);
+        assert!(!world.starred(slug, 20) && !world.starred(slug, 21), "{s:?}");
+        assert!(markers(&world, slug).is_empty());
+    }
+}
+
+/// AC 6: no PR is unstarred after an incomplete walk.
+#[test]
+fn no_pr_star_is_removed_after_an_incomplete_walk() {
+    let world = World::default();
+    let slug = "m/inc";
+    let input = with_prs(&world, slug);
+    let mut host = Host::new("a");
+    host.pass(&world, std::slice::from_ref(&input), Vec::new(), t(10, 0));
+    world.human_unstar(slug, 10);
+    // A level listing failing hides a root: the walk is incomplete.
+    world.repo(slug).fail_listing = true;
+    host.pass(&world, std::slice::from_ref(&input), Vec::new(), t(10, 2));
+    assert!(world.starred(slug, 20) && world.starred(slug, 21));
+    world.repo(slug).fail_listing = false;
+    host.pass(&world, &[input], Vec::new(), t(10, 4));
+    assert!(!world.starred(slug, 20) && !world.starred(slug, 21));
+}
+
+/// AC 6: PR writes count against the per-pass cap.
+#[test]
+fn pr_writes_count_against_the_write_cap() {
+    let world = World::default();
+    let slug = "m/prcap";
+    let nums: Vec<u32> = (100..110).collect();
+    for &n in &nums {
+        world.add(slug, issue_with_body(n, &[STAR], ""));
+        world.add(slug, pr(n + 100, n, &["loom:review-requested"]));
+    }
+    let mut input = repo_input(slug);
+    for &n in &nums {
+        starred(&mut input, n, AT);
+    }
+    let mut host = Host::new("a");
+    host.pass(&world, std::slice::from_ref(&input), Vec::new(), t(10, 0));
+    let count = |w: &World| nums.iter().filter(|n| w.starred(slug, **n + 100)).count();
+    assert_eq!(count(&world), MAX_STAR_WRITES_PER_PASS);
+    host.pass(&world, &[input], Vec::new(), t(10, 2));
+    assert_eq!(count(&world), nums.len());
+}
+
+/// A creation-time copy (label, no marker) reads as the operator's: kept.
+#[test]
+fn a_creation_time_copied_pr_star_is_operator_owned() {
+    let world = World::default();
+    let slug = "m/copy";
+    let input = with_prs(&world, slug);
+    world.human_star(slug, 20);
+    let mut host = Host::new("a");
+    host.pass(&world, std::slice::from_ref(&input), Vec::new(), t(10, 0));
+    world.human_unstar(slug, 10);
+    host.pass(&world, &[input], Vec::new(), t(10, 2));
+    assert!(world.starred(slug, 20));
+}
