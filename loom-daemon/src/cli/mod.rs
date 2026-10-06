@@ -72,6 +72,7 @@ mod merge_pr_chain_lock;
 mod merge_pr_check_runs_rollup;
 mod merge_pr_check_runs_streak;
 mod merge_pr_checks_failure;
+mod merge_pr_ci_result;
 mod merge_pr_cleanup_paths;
 mod merge_pr_closed_building;
 mod merge_pr_consolidate;

@@ -240,6 +240,7 @@ pub mod chain_lock;
 pub mod check_runs_rollup;
 pub mod check_runs_streak;
 pub mod checks_failure;
+pub mod ci_result;
 pub mod cleanup_paths;
 pub mod closed_building;
 pub mod consolidate;

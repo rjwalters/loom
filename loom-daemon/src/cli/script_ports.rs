@@ -619,6 +619,12 @@ pub(crate) enum MergePrCommand {
     /// 6 = deferred (HELD / UNREADABLE). Never writes to the forge.
     ChainLock(super::merge_pr_chain_lock::ChainLockArgs),
 
+    /// Refuse a merge whose head's latest `CI` workflow run did not conclude
+    /// `success` (#10444), naming the cancelled/failed jobs. Exit 0+CLEAN =
+    /// success, 0+UNVERIFIED = no definite verdict (caller warns), 1 = refuse,
+    /// 2 = forge unreachable (caller warns).
+    CiResult(super::merge_pr_ci_result::CiResultArgs),
+
     /// The stale-cached-mergeable recheck decision (#6104): once REST
     /// `.mergeable` has read `false`, classify the backoff re-reads plus the
     /// local `git merge-tree` corroboration into `merge:` / `refuse-stale:` /
@@ -914,6 +920,7 @@ impl MergePrCommand {
             MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::TreeChecks(args) => args.run(),
             MergePrCommand::ChainLock(args) => args.run(),
+            MergePrCommand::CiResult(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::RedateReport(args) => args.run(),
