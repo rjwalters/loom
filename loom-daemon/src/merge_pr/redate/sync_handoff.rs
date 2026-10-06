@@ -25,7 +25,7 @@
 use serde_json::Value;
 use std::path::Path;
 
-use super::{gh_api_body, gh_api_with, post_comment, RemedyOutcome};
+use super::{gh_api_body, gh_api_with, post_comment, read_nonempty, RemedyOutcome};
 
 /// Default sync handoffs per PR.
 pub const DEFAULT_HANDOFFS: u32 = 1;
@@ -147,6 +147,7 @@ fn is_conflict(err: &str) -> bool {
 pub(super) fn attempt(
     gh: &str,
     nwo: &str,
+    branch: &str,
     pr: &str,
     head: &str,
     trusted_bodies: &str,
@@ -203,10 +204,30 @@ post {} by hand or a second sync may run",
             Some(RemedyOutcome::SyncConflict { notice_posted })
         }
         Err(e) => {
-            eprintln!(
-                "Note: base sync for PR #{pr} failed ({e}); falling back to the operator hold (#10388)"
-            );
-            None
+            // The head was checked before the comment read, so a concurrent push can
+            // make the forge reject our `expected_head_sha`. That is the
+            // `HeadMoved` retry path (the new head gets a fresh chain), not an
+            // exhausted budget: re-read the live head before falling back.
+            match read_nonempty(
+                gh,
+                &[
+                    &format!("repos/{nwo}/git/refs/heads/{branch}"),
+                    "--jq",
+                    ".object.sha",
+                ],
+                &format!("ref heads/{branch} resolved to an empty sha"),
+            ) {
+                Ok(current) if current != head => Some(RemedyOutcome::HeadMoved { current }),
+                Ok(_) => {
+                    eprintln!(
+                        "Note: base sync for PR #{pr} failed ({e}); falling back to the operator hold (#10388)"
+                    );
+                    None
+                }
+                Err(re) => Some(RemedyOutcome::Failed(format!(
+                    "base sync for PR #{pr} failed ({e}) and the head could not be re-read ({re})"
+                ))),
+            }
         }
     }
 }

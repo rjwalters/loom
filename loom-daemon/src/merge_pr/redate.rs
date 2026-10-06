@@ -485,6 +485,7 @@ fn remedy_with_sync(
                 if let Some(out) = sync_handoff::attempt(
                     gh,
                     nwo,
+                    branch,
                     pr,
                     &current,
                     &bodies,

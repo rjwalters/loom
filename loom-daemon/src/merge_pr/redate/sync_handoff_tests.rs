@@ -32,7 +32,8 @@ fn exhausted_chain() -> Value {
     )
 }
 
-/// `mode`: `ok` (202), `conflict` (422 merge conflict), `other` (some other failure).
+/// `mode`: `ok` (202), `conflict` (422 merge conflict), `other` (some other failure),
+/// `moved` (update-branch rejects the expected SHA; later ref reads return a new head).
 fn stub(name: &str, listing: &Value, mode: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let dir = tmp_dir(name);
     fs::write(dir.join("comments.json"), listing.to_string()).expect("listing");
@@ -49,10 +50,12 @@ for arg in "$@"; do
 done
 {{ printf '%s\nSTDIN:%s\n<<<REDATE-STUB-CALL-END>>>\n' "$*" "$BODY"; }} >> "{dir}/argv.log"
 case "$PATH_ARG" in
-  */git/refs/heads/*) echo abc0000 ;;
+  */git/refs/heads/*)
+    if [ -e "{dir}/moved.flag" ]; then echo def1111; else echo abc0000; fi ;;
   */pulls/*/update-branch)
     case "{mode}" in
       ok) echo '{{"message":"Updating pull request branch."}}' ;;
+      moved) touch "{dir}/moved.flag"; echo "gh: expected head sha didn't match current head (HTTP 422)" >&2; exit 1 ;;
       conflict) echo "gh: merge conflict between base and head (HTTP 422)" >&2; exit 1 ;;
       *) echo "gh: Server Error (HTTP 500)" >&2; exit 1 ;;
     esac ;;
@@ -195,6 +198,22 @@ fn zero_handoffs_is_todays_behaviour() {
 fn a_non_conflict_sync_failure_falls_back_to_the_hold() {
     let (dir, gh) = stub("sync-500", &json!([exhausted_chain()]), "other");
     assert!(matches!(go(&gh, 1), RemedyOutcome::Escalated { .. }));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_sync_rejected_because_the_head_moved_is_head_moved_not_a_hold() {
+    let (dir, gh) = stub("sync-moved", &json!([exhausted_chain()]), "moved");
+    assert_eq!(
+        go(&gh, 1),
+        RemedyOutcome::HeadMoved {
+            current: "def1111".into()
+        }
+    );
+    let log = argv(&dir);
+    assert!(!log.contains("/labels"), "no operator label: {log}");
+    assert!(!log.contains(&hold_marker("abc0000")), "no hold marker: {log}");
+    assert!(!log.contains(SYNC_PREFIX), "no sync marker: {log}");
     let _ = fs::remove_dir_all(&dir);
 }
 
