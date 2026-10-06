@@ -2365,6 +2365,9 @@ pub struct ForgeBucketStatus {
     pub account: String,
     /// The installation's owner, or `-` when the credential has none.
     pub cred_owner: String,
+    /// The App installation the bucket was read under (#10571), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation: Option<String>,
     pub resource: String,
     /// Requests charged (`ok` rows × pages).
     pub charged: u64,

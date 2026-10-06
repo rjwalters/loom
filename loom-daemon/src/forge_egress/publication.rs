@@ -292,7 +292,7 @@ pub fn gateway_owned_preflight() -> crate::credential_preflight::GithubAppPrefli
             checked_at: chrono::Utc::now(),
             pool: None,
         },
-        minted_gh_token: None,
+        minted: None,
     }
 }
 

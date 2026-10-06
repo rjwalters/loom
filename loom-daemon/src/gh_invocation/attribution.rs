@@ -22,6 +22,8 @@ pub struct CredAttr {
     pub owner: Option<String>,
     /// `reader`, `writer`, `env` or `ambient`.
     pub kind: &'static str,
+    /// The App installation the credential's sidecar names (#10571).
+    pub installation: Option<String>,
 }
 
 impl CredAttr {
@@ -30,6 +32,7 @@ impl CredAttr {
             account: "ambient".to_string(),
             owner: None,
             kind: "ambient",
+            installation: None,
         }
     }
 
@@ -66,6 +69,10 @@ pub fn cred_of(inv: &GhInvocation) -> CredAttr {
 /// - `…/.loom/gh-config-by-owner/<owner>` ⇒ the writer App, that owner;
 /// - `…/.loom/gh-config` ⇒ the writer App, the workspace's own owner;
 /// - anything else, or none ⇒ `ambient`.
+///
+/// A writer directory's App and owner are the ones its `identity.json`
+/// sidecar says were minted into it, when it has one (#10571,
+/// [`forge_bucket_book::dir_identity`]); the roster and remote otherwise.
 #[must_use]
 pub fn cred_of_with(dir: Option<&Path>, env_token: bool) -> CredAttr {
     if env_token {
@@ -73,35 +80,26 @@ pub fn cred_of_with(dir: Option<&Path>, env_token: bool) -> CredAttr {
             account: "env-token".to_string(),
             owner: None,
             kind: "env",
+            installation: None,
         };
     }
     let Some(dir) = dir else {
         return CredAttr::ambient();
     };
-    match forge_bucket_book::classify_dir(dir) {
-        DirClass::Reader { owner, app_id } => {
-            let label = crate::observability::ops::ratelimit::app_account_label(&app_id);
-            CredAttr {
-                account: if label == "unknown" {
-                    "app-unknown".to_string()
-                } else {
-                    label
-                },
-                owner: Some(owner),
-                kind: "reader",
-            }
-        }
-        DirClass::OwnerWriter { root, owner } => CredAttr {
-            account: forge_bucket_book::writer_account(&root),
-            owner: Some(owner),
-            kind: "writer",
+    let class = forge_bucket_book::classify_dir(dir);
+    let kind = match class {
+        DirClass::Reader { .. } => "reader",
+        DirClass::OwnerWriter { .. } | DirClass::PrimaryWriter { .. } => "writer",
+        DirClass::Other => return CredAttr::ambient(),
+    };
+    match forge_bucket_book::dir_identity(dir, &class) {
+        Some(id) => CredAttr {
+            account: id.account,
+            owner: id.owner,
+            kind,
+            installation: id.installation,
         },
-        DirClass::PrimaryWriter { root } => CredAttr {
-            account: forge_bucket_book::writer_account(&root),
-            owner: forge_bucket_book::primary_owner(&root),
-            kind: "writer",
-        },
-        DirClass::Other => CredAttr::ambient(),
+        None => CredAttr::ambient(),
     }
 }
 

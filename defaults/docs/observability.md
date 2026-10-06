@@ -558,15 +558,16 @@ reading of every `(account, owner, resource)` pool it spends, from the free
 `gh api rate_limit` probe per published credential directory after every
 reader-refresh pass, plus the 60 s probe above. Each believed reading is
 exported once per tick as `github.ratelimit.{remaining,used,reset}` labelled
-`resource`, `account`, `owner` and `role` (`writer`|`reader`) — since #10343
-no point leaves without `owner`. A label set is still **not** guaranteed to
-be one GitHub bucket: live data shows some `(account, owner, resource)` keys
-carrying two interleaved hourly reset windows (#10571), and several hosts
-export one bucket with readings of different ages. Read `used` together with
-its `reset` (the window), never as a monotone series.
+`resource`, `account`, `owner`, `installation` and `role` (`writer`|`reader`)
+— since #10343 no point leaves without `owner`, and since #10571 `account`/
+`owner` are keyed by the identity minted into each credential directory (its
+`identity.json` sidecar), so a label set is one GitHub bucket. Several hosts
+still export one bucket with readings of different ages, and older daemons'
+data can interleave two windows: read `used` together with its `reset` (the
+window), never as a monotone series.
 `loom.forge.calls` is a delta counter of the requests the `gh` facade sent,
 labelled by caller, inventoried operation, identity role, credential bucket
-(`account`, `cred_owner`, `resource`), `target_owner` and `outcome`; the free
+(`account`, `cred_owner`, `installation`, `resource`), `target_owner` and `outcome`; the free
 `rate_limit` probe appears under `resource="other"` and is never charged to a
 bucket. On a host
 without an exporter, `loom-daemon forge calls --by bucket` shows the same
@@ -595,8 +596,8 @@ recipe is `defaults/observability/signoz/github-shadow.sql`
 (queries 1–3, with query 4 cross-checking against the spans); a large
 shadow on a bucket means spend from outside this fleet's daemons (agent `gh`
 calls, another host, an operator) or an uninstrumented caller. A negative
-shadow means the bucket's readings undercount it (sparse readings, or the
-readings describe another bucket — #10571), not that Loom over-spent.
+shadow means the bucket's readings undercount it (sparse readings, or a
+pre-#10571 daemon's readings of another bucket), not that Loom over-spent.
 
 **Codex session-container state (#10455).** An always-on daemon task (started
 with the other observers, whether or not any telemetry exporter is configured)

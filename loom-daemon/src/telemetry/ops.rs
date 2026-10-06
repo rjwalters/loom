@@ -47,6 +47,9 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     "role",
     "cred_owner",
     "target_owner",
+    // #10571: the App installation a bucket was minted under (one per
+    // `(account, owner)`, so it adds no series).
+    "installation",
     "outcome",
     "heuristic",
     "kind",

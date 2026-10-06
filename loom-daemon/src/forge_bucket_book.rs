@@ -13,6 +13,14 @@
 //! - **owner** — the GitHub owner the installation covers, lowercased;
 //! - **resource** — `core`, `graphql` or `search`.
 //!
+//! The account and owner of an App credential directory come from the
+//! identity actually minted into it — its `identity.json` sidecar — and
+//! only fall back to the roster and the `origin` remote without one
+//! ([`dir_identity`], #10571). Each key also carries the **installation** id
+//! it was read under, as a witness label: on GitHub an App is installed at
+//! most once per owner, so `(account, owner)` names one installation and
+//! the installation never splits a key.
+//!
 //! Two sources feed it: the free `x-ratelimit-*` headers of any `gh api
 //! --include` call the facade attributed to an App credential
 //! ([`observe`]), and one free `gh api rate_limit` probe per published
@@ -24,7 +32,9 @@
 //! it rather than keep a second copy. Every operation is in-memory or a
 //! local file; none can fail or block a forge call.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -32,6 +42,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::forge_call_stats::RateLimitHeaders;
 
+mod identity;
+pub use identity::{dir_identity, CredIdentity, IdentitySource, WRITER_IDENTITY_MISMATCH};
 mod probe;
 pub use probe::{
     parse_probe, probe_all, probe_all_with, probe_invocation, probe_one, probe_one_with,
@@ -94,14 +106,28 @@ impl Resource {
     }
 }
 
-/// One billed bucket.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// [`BucketKey::installation`] when no sidecar named one.
+pub const NO_INSTALLATION: &str = "-";
+
+fn no_installation() -> String {
+    NO_INSTALLATION.to_string()
+}
+
+/// One billed bucket: `(account, owner, resource)`. Equality, hashing and
+/// order use those three only; `installation` is the witness label they
+/// imply (see the module docs), so a lookup that does not know it still
+/// finds the bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketKey {
     /// `app-<id>` / `app-unknown`.
     pub account: String,
     /// The installation's owner, lowercased.
     pub owner: String,
     pub resource: Resource,
+    /// The installation id the reading was minted under (#10571), or
+    /// [`NO_INSTALLATION`]. Absent from a pre-#10571 snapshot.
+    #[serde(default = "no_installation")]
+    pub installation: String,
 }
 
 impl BucketKey {
@@ -112,7 +138,47 @@ impl BucketKey {
             account: account.to_string(),
             owner: owner.to_ascii_lowercase(),
             resource,
+            installation: no_installation(),
         }
+    }
+
+    /// This key, witnessed by `installation` when one is known.
+    #[must_use]
+    pub fn with_installation(mut self, installation: Option<&str>) -> Self {
+        if let Some(id) = installation.filter(|id| !id.is_empty()) {
+            self.installation = id.to_string();
+        }
+        self
+    }
+
+    fn identity(&self) -> (&str, &str, Resource) {
+        (&self.account, &self.owner, self.resource)
+    }
+}
+
+impl PartialEq for BucketKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+
+impl Eq for BucketKey {}
+
+impl Hash for BucketKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.identity().hash(state);
+    }
+}
+
+impl PartialOrd for BucketKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BucketKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.identity().cmp(&other.identity())
     }
 }
 
@@ -167,8 +233,9 @@ fn book() -> &'static Mutex<HashMap<BucketKey, Reading>> {
     BOOK.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Keep `reading` for `key` unless a newer one is already held.
-pub fn insert(key: BucketKey, reading: Reading) {
+/// Keep `reading` for `key` unless a newer one is already held. A key
+/// without an installation keeps the one already witnessed for its bucket.
+pub fn insert(mut key: BucketKey, reading: Reading) {
     let Ok(mut book) = book().lock() else {
         return;
     };
@@ -179,6 +246,13 @@ pub fn insert(key: BucketKey, reading: Reading) {
         .get(&key)
         .is_none_or(|held| held.observed_at <= reading.observed_at);
     if newer {
+        if let Some((held, _)) = book.get_key_value(&key) {
+            if key.installation == NO_INSTALLATION {
+                key.installation.clone_from(&held.installation);
+            }
+        }
+        // Remove first: `HashMap::insert` keeps the held key's witness.
+        book.remove(&key);
         book.insert(key, reading);
     }
 }

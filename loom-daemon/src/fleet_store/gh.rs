@@ -291,10 +291,10 @@ fn writer_credential(workspace_root: &Path, repo: &str) -> Credential {
         cwd: workspace_root.to_path_buf(),
     };
     match minter.mint(repo) {
-        GithubAppOutcome::Minted { token, .. } => {
+        ref outcome @ GithubAppOutcome::Minted { .. } => {
             let dir =
                 cp::github_app_gh_config_dir_for_owner(workspace_root, cp::owner_of_nwo(repo));
-            match cp::publish_github_app_token(&dir, &token) {
+            match cp::publish_outcome(&dir, outcome, repo) {
                 Ok(()) => Credential::ConfigDir {
                     dir,
                     label: "writer app".to_string(),

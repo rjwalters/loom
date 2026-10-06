@@ -473,11 +473,11 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // exactly the pre-#4430 path, with zero extra subprocess overhead.
         None => credential_preflight::GithubAppPreflight {
             report: credential_preflight::run(&credential_preflight_probe),
-            minted_gh_token: None,
+            minted: None,
         },
     };
     // #4458: deliver the minted installation token via a daemon-owned
-    // `GH_CONFIG_DIR` (`credential_preflight::publish_github_app_token`)
+    // `GH_CONFIG_DIR` (`credential_preflight::publish_minted`, #10571 sidecar)
     // instead of exporting it as this process's `GH_TOKEN`. Every `gh` child
     // this daemon spawns (`Command::new("gh")` without `env_clear`, ~76
     // call sites — see the issue body's census) re-reads
@@ -508,8 +508,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // publication branch below never runs there.
     let mut github_app_gh_config_dir_active =
         github_credential_forbidden && egress::activate_tokenless_profile(&github_app_config_dir);
-    if let Some(token) = &github_app_preflight.minted_gh_token {
-        match credential_preflight::publish_github_app_token(&github_app_config_dir, token) {
+    if let Some(minted) = &github_app_preflight.minted {
+        match credential_preflight::publish_minted(&github_app_config_dir, minted) {
             Ok(()) => {
                 std::env::remove_var("GH_TOKEN");
                 std::env::remove_var("GITHUB_TOKEN");
@@ -552,7 +552,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // never called per owner before now.
     //
     // Only runs when the App mechanism is actually the active credential this
-    // run (`minted_gh_token.is_some()`) — an ambient `gh` auth / PAT host is
+    // run (`minted.is_some()`) — an ambient `gh` auth / PAT host is
     // not subject to the single-installation limit. A single-owner fleet
     // yields no plans, registers nothing, and is byte-identical to pre-#5401.
     // Each established plan is registered into
@@ -565,7 +565,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     if let (Some(root_owner_repo), Some(script_path), true) = (
         &github_app_owner_repo,
         &github_app_script,
-        github_app_preflight.minted_gh_token.is_some(),
+        github_app_preflight.minted.is_some(),
     ) {
         let root_owner = credential_preflight::owner_of_nwo(root_owner_repo).to_string();
         let cross_owner_registry =
@@ -588,16 +588,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     &sweep_workspace,
                     &plan.owner,
                 );
-                match credential_preflight::GithubAppMinter::mint(
-                    &minter,
-                    &plan.representative_owner_repo,
-                ) {
-                    credential_preflight::GithubAppOutcome::Minted {
-                        token,
-                        installation_id,
-                        app_id,
+                let repo = &plan.representative_owner_repo;
+                match credential_preflight::GithubAppMinter::mint(&minter, repo) {
+                    ref outcome @ credential_preflight::GithubAppOutcome::Minted {
+                        ref installation_id,
+                        ref app_id,
                         ..
-                    } => match credential_preflight::publish_github_app_token(&owner_dir, &token) {
+                    } => match credential_preflight::publish_outcome(&owner_dir, outcome, repo) {
                         Ok(()) => {
                             for root in &plan.roots {
                                 credential_preflight::register_root_gh_config_dir(root, &owner_dir);
@@ -652,7 +649,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
                         );
                     }
                     credential_preflight::GithubAppOutcome::NotConfigured => {
-                        // Unreachable in practice: `minted_gh_token.is_some()`
+                        // Unreachable in practice: `minted.is_some()`
                         // above already proved the app is configured. Treat as
                         // a no-op rather than a failure.
                     }
@@ -712,26 +709,28 @@ pub(crate) async fn run_daemon() -> Result<()> {
         let cwd = sweep_workspace.clone();
         let owner_repo = owner_repo.clone();
         let config_dir = github_app_config_dir.clone();
-        let mut current_token = github_app_preflight.minted_gh_token.clone();
+        let mut current_token = github_app_preflight.minted.map(|m| m.token);
         let mut config_dir_active = github_app_gh_config_dir_active;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
                 let script_path = script_path.clone();
                 let cwd = cwd.clone();
-                let owner_repo = owner_repo.clone();
+                let repo = owner_repo.clone();
                 let outcome = tokio::task::spawn_blocking(move || {
                     let minter = credential_preflight::RealGithubAppMinter { script_path, cwd };
-                    credential_preflight::GithubAppMinter::mint(&minter, &owner_repo)
+                    credential_preflight::GithubAppMinter::mint(&minter, &repo)
                 })
                 .await;
                 match outcome {
-                    Ok(credential_preflight::GithubAppOutcome::Minted {
-                        token,
-                        installation_id,
-                        app_id,
-                        ..
-                    }) => {
+                    Ok(
+                        ref minted @ credential_preflight::GithubAppOutcome::Minted {
+                            ref token,
+                            ref installation_id,
+                            ref app_id,
+                            ..
+                        },
+                    ) => {
                         // #5630: a successful mint (fresh or cache hit) ends this
                         // source's credential-failure streak, so the main-health
                         // gate goes back to trusting its forge answers on the very
@@ -745,7 +744,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
                         // `std::env::set_var` anywhere in this arm once
                         // `config_dir_active` is already true (the common
                         // case: activation happened at startup above).
-                        if gh_token_needs_update(current_token.as_deref(), &token) {
+                        if gh_token_needs_update(current_token.as_deref(), token) {
                             // Rare edge case: the app becomes configured
                             // *after* startup (e.g. the shell helper's own
                             // config appears mid-run) without the daemon
@@ -763,12 +762,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
                                 std::env::set_var("GH_CONFIG_DIR", &config_dir);
                                 config_dir_active = true;
                             }
-                            match credential_preflight::publish_github_app_token(
+                            match credential_preflight::publish_outcome(
                                 &config_dir,
-                                &token,
+                                minted,
+                                &owner_repo,
                             ) {
                                 Ok(()) => {
-                                    current_token = Some(token);
+                                    current_token = Some(token.clone());
                                     log::debug!(
                                         "credential_preflight: github-app refresh tick rotated \
                                          GH_TOKEN (app {app_id} installation {installation_id}) \
@@ -878,9 +878,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     // failing owner's streak.
                     let source = credential_preflight::credential_source_for_owner(owner_repo);
                     match outcome {
-                        Ok(credential_preflight::GithubAppOutcome::Minted { token, .. }) => {
+                        Ok(ref minted @ credential_preflight::GithubAppOutcome::Minted { .. }) => {
                             if let Err(e) =
-                                credential_preflight::publish_github_app_token(config_dir, &token)
+                                credential_preflight::publish_outcome(config_dir, minted, owner_repo)
                             {
                                 credential_preflight::record_forge_credential_failure(
                                     &source,

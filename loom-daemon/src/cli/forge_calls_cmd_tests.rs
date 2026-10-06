@@ -67,11 +67,11 @@ fn report(by: GroupBy) -> String {
 fn by_bucket_golden() {
     let want = "\
 Forge calls, last 1h by bucket — 5 row(s) as of 2030-03-17 17:46 UTC
-  ACCOUNT  CRED_OWNER  RESOURCE  RESET    CHARGED    304  LIMITED  ERROR
-  ambient  -           core      -              1      0        0      0
-  app-42   acme        core      18:06Z         3      1        0      0
-  app-7    acme        graphql   -              0      0        1      0
-  unknown  -           graphql   -              1      0        0      0
+  ACCOUNT  CRED_OWNER  INSTALLATION  RESOURCE  RESET    CHARGED    304  LIMITED  ERROR
+  ambient  -           -             core      -              1      0        0      0
+  app-42   acme        -             core      18:06Z         3      1        0      0
+  app-7    acme        -             graphql   -              0      0        1      0
+  unknown  -           -             graphql   -              1      0        0      0
   unattributed: 1 without a repo, 1 without a credential (older binary); 1 paginated row(s) with unknown pages; 1 cwd-route disagreement(s)
 Bucket readings (newest, < 10m old):
   ACCOUNT        OWNER          RESOURCE    USED   LIMIT REMAINING  RESET   SOURCE

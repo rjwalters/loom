@@ -306,6 +306,7 @@ pub(super) fn record(
         ro: Some(ro.as_str().to_string()),
         ca: forge_call_stats::sanitize(&cred.account),
         co: cred.owner.as_deref().and_then(forge_call_stats::sanitize),
+        ci: cred.installation.as_deref().and_then(forge_call_stats::sanitize),
         tk: Some(cred.kind.to_string()),
         rr: forge_call_stats::sanitize(&resource),
         pg,
@@ -322,7 +323,8 @@ pub(super) fn record(
             .and_then(crate::forge_bucket_book::Resource::parse);
         if let (true, Some(resource)) = (cred.is_app(), bucket) {
             crate::forge_bucket_book::observe(
-                crate::forge_bucket_book::BucketKey::new(&cred.account, owner, resource),
+                crate::forge_bucket_book::BucketKey::new(&cred.account, owner, resource)
+                    .with_installation(cred.installation.as_deref()),
                 h,
                 crate::forge_bucket_book::Source::Header,
             );
@@ -369,6 +371,7 @@ pub(super) fn record_shed(
         ro: Some(ro.as_str().to_string()),
         ca: forge_call_stats::sanitize(&account),
         co: forge_call_stats::sanitize(owner),
+        ci: None,
         tk: Some("shed".to_string()),
         rr: Some(resource.as_str().to_string()),
         pg: None,
@@ -382,6 +385,7 @@ pub(super) fn record_shed(
         account,
         owner: Some(owner.to_string()),
         kind: "shed",
+        installation: None,
     };
     record_metric(caller, &identity, &cred, resource.as_str(), Outcome::Shed, None);
 }
@@ -409,6 +413,10 @@ fn record_metric(
         role: identity.role.clone().unwrap_or_else(unknown),
         account: cred.account.clone(),
         cred_owner: cred.owner.clone().unwrap_or_else(unknown),
+        installation: cred
+            .installation
+            .clone()
+            .unwrap_or_else(|| crate::forge_bucket_book::NO_INSTALLATION.to_string()),
         target_owner,
         resource: resource.to_string(),
         outcome: match outcome {

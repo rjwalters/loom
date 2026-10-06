@@ -187,7 +187,7 @@ fn required_stance_resolves_from_policy_and_unreadable_fails_closed() {
 #[test]
 fn gateway_owned_preflight_holds_no_token() {
     let p = gateway_owned_preflight();
-    assert!(p.minted_gh_token.is_none());
+    assert!(p.minted.is_none());
     assert_eq!(p.report.mechanism, "gateway");
 }
 

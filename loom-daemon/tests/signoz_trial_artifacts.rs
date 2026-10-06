@@ -1207,6 +1207,7 @@ fn github_shadow_queries_match_the_ratelimit_and_forge_calls_vocabulary() {
         "cred_owner",
         "outcome",
         "op",
+        "installation",
     ] {
         assert!(labels.contains(label), "github-shadow.sql no longer reads label '{label}'");
     }
