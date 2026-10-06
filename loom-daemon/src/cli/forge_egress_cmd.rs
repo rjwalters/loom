@@ -41,6 +41,33 @@ pub(crate) enum EgressAction {
     /// document with anything token-shaped redacted). Always exits 0 unless
     /// the policy is unreadable (2).
     Policy,
+    /// Print the container `gh` credential arguments (#9987) — the whole
+    /// decision, so `spawn-claude.sh` only appends lines. The first stdout
+    /// line is always an explicit status, never empty-means-none:
+    /// `loom-forge-egress: managed` (then the read-only launcher, upstream
+    /// `gh`, policy and credential-reference `docker run` arguments, and no
+    /// `~/.config/gh` / `GH_TOKEN` / `GITHUB_TOKEN`), or `unconfigured` /
+    /// `observe-unmanaged` (no env/machine policy, or a valid `observe` one
+    /// whose launcher is unusable — findings on stderr; then the pre-#9987
+    /// arguments: the token variables forwarded by name, else the read-only
+    /// `~/.config/gh` mount). One argument per line. A configured policy that
+    /// cannot be honoured (unreadable, unsupported `schemaVersion`, invalid
+    /// or missing/empty launcher under `required`) — or, with `--image`, an
+    /// image `container-check` refuses — prints NOTHING on stdout and exits
+    /// 78 with the named refusal on stderr.
+    ContainerArgs {
+        /// Also run `container-check` for this worker image first.
+        #[arg(long)]
+        image: Option<String>,
+    },
+    /// Admit `image` for a containerised worker under the managed launcher
+    /// (#9987): under `enforcement.api = required`, refuse (exit 78) an image
+    /// without `python3` (the launcher is Python 3) or whose `gh` does not
+    /// resolve to the launcher. Silent, exit 0, with no policy.
+    ContainerCheck {
+        /// The worker image the container will run.
+        image: String,
+    },
 }
 
 fn workspace() -> PathBuf {
@@ -127,8 +154,63 @@ fn assert_prints_findings(report: &forge_egress::Report) -> bool {
     report.exit_code() != 0 && !report.routing.is_empty()
 }
 
+/// The first line `forge egress container-args` prints, before the status
+/// (`spawn-claude.sh` matches it literally).
+const CONTAINER_ARGS_STATUS_PREFIX: &str = "loom-forge-egress: ";
+
+/// Print the refusal for `finding` and exit 78 (`EX_CONFIG`).
+fn refuse(finding: &Finding) -> ! {
+    eprintln!("{}", forge_egress::worker_env::refusal_message(finding));
+    std::process::exit(78);
+}
+
+/// `container-check`: under `enforcement.api = required`, refuse (exit 78) an
+/// image without `python3` or whose `gh` does not resolve to the launcher.
+fn container_check(image: &str, egress: &forge_egress::worker_env::WorkerEgress) {
+    use forge_egress::worker_env as we;
+    use loom_daemon::worker_spawn::containment;
+    if !egress.required {
+        return;
+    }
+    if !containment::image_has_python3(image) {
+        refuse(&we::python3_missing_finding(image));
+    }
+    let resolved = containment::image_resolved_gh(image, egress);
+    if let Some(f) = we::container_launcher_finding(egress, image, resolved.as_deref()) {
+        refuse(&f);
+    }
+}
+
 /// Dispatch one `forge egress` verb; exits the process with the verdict.
 pub(crate) fn handle(action: EgressAction) -> Result<()> {
+    let image = match &action {
+        EgressAction::ContainerArgs { image } => Some(image.clone()),
+        EgressAction::ContainerCheck { image } => Some(Some(image.clone())),
+        _ => None,
+    };
+    if let Some(image) = image {
+        // A configured-but-failing policy is a named refusal (exit 78) with
+        // nothing on stdout; an absent one says `unconfigured` explicitly, so
+        // the caller never reads empty output as leave to restore ambient
+        // credentials (#9987).
+        let admission = match forge_egress::worker_env::WorkerEgress::admit_process() {
+            Ok(admission) => admission,
+            Err(finding) => refuse(&finding),
+        };
+        if let (Some(image), Some(egress)) = (image, &admission.egress) {
+            container_check(&image, egress);
+        }
+        if matches!(action, EgressAction::ContainerArgs { .. }) {
+            for warning in &admission.warnings {
+                eprintln!("{}", forge_egress::worker_env::observe_message(warning));
+            }
+            println!("{CONTAINER_ARGS_STATUS_PREFIX}{}", admission.status());
+            for arg in admission.docker_args(|k| std::env::var_os(k)) {
+                println!("{arg}");
+            }
+        }
+        return Ok(());
+    }
     let ws = workspace();
     let code = match action {
         EgressAction::Assert { quiet } => {
@@ -190,6 +272,7 @@ pub(crate) fn handle(action: EgressAction) -> Result<()> {
             }
             report.exit_code()
         }
+        EgressAction::ContainerArgs { .. } | EgressAction::ContainerCheck { .. } => 0, // above
         EgressAction::Policy => match policy::resolve(&PolicySources::from_process(Some(&ws))) {
             Resolution::Unconfigured => {
                 println!("{}", serde_json::json!({"origin": "unconfigured", "path": null}));

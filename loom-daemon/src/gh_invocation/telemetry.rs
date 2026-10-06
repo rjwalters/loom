@@ -89,7 +89,16 @@ pub enum Outcome {
     CollectFailed,
     /// The managed launcher refused to route the request.
     RoutingRefused,
+    /// The managed launcher exited `78`: routing is blocked (#9987).
+    RoutingBlocked,
+    /// The managed launcher exited `69`: its adapter is down (#9987).
+    AdapterUnavailable,
 }
+
+/// The managed launcher's exit status for "routing blocked" (EX_CONFIG).
+pub const EXIT_ROUTING_BLOCKED: i32 = 78;
+/// The managed launcher's exit status for "adapter unavailable" (EX_UNAVAILABLE).
+pub const EXIT_ADAPTER_UNAVAILABLE: i32 = 69;
 
 impl Outcome {
     #[must_use]
@@ -102,11 +111,13 @@ impl Outcome {
             Outcome::SpawnFailed => "spawn_failed",
             Outcome::CollectFailed => "collect_failed",
             Outcome::RoutingRefused => "routing_refused",
+            Outcome::RoutingBlocked => "routing_blocked",
+            Outcome::AdapterUnavailable => "adapter_unavailable",
         }
     }
 
     /// Every value, for vocabulary tests and docs.
-    pub const ALL: [Outcome; 7] = [
+    pub const ALL: [Outcome; 9] = [
         Outcome::Ok,
         Outcome::ExitNonzero,
         Outcome::Signaled,
@@ -114,6 +125,8 @@ impl Outcome {
         Outcome::SpawnFailed,
         Outcome::CollectFailed,
         Outcome::RoutingRefused,
+        Outcome::RoutingBlocked,
+        Outcome::AdapterUnavailable,
     ];
 }
 
@@ -158,6 +171,10 @@ pub fn classify_passthrough(
 fn classify_status(status: std::process::ExitStatus, refused: bool) -> (Outcome, Option<i32>) {
     match status.code() {
         Some(0) => (Outcome::Ok, Some(0)),
+        Some(EXIT_ROUTING_BLOCKED) => (Outcome::RoutingBlocked, Some(EXIT_ROUTING_BLOCKED)),
+        Some(EXIT_ADAPTER_UNAVAILABLE) => {
+            (Outcome::AdapterUnavailable, Some(EXIT_ADAPTER_UNAVAILABLE))
+        }
         Some(code) if refused => (Outcome::RoutingRefused, Some(code)),
         Some(code) => (Outcome::ExitNonzero, Some(code)),
         None => (Outcome::Signaled, None),

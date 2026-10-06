@@ -69,7 +69,9 @@ A downstream image (e.g. klayout-tools' EDA sim overlay) that does
 ## What this image deliberately does NOT include
 
 - **No language/build toolchain beyond the C basics above** — no Rust, Node,
-  Python, or domain-specific compiler/simulator. Per-repo build-gate
+  or domain-specific compiler/simulator. (`python3` is present as a bare
+  interpreter only, because 2am's managed `gh` launcher is a Python 3 script
+  (#9987); a policy-governed dispatch refuses an image without it.) Per-repo build-gate
   toolchains are a downstream layer's job (this is the "generic worker
   mechanism" the issue's owner decision describes; domain toolchains build
   `FROM` this image, they do not live in it).

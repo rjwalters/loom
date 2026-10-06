@@ -544,3 +544,84 @@ fn an_unbounded_cpu_axis_emits_no_flag_at_all() {
     assert!(!args.iter().any(|a| a.starts_with("loom.dispatch.cpus")), "{args:?}");
     std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
 }
+
+fn build_with(egress: Option<&crate::forge_egress::worker_env::WorkerEgress>) -> Vec<String> {
+    let command = docker_command_with(
+        &profile(None, None),
+        Path::new("/srv/repo"),
+        Path::new("/srv/repo"),
+        None,
+        &[OsString::from("-p"), OsString::from("x")],
+        &[],
+        None,
+        egress,
+    )
+    .expect("docker command");
+    argv(&command)
+}
+
+#[test]
+fn managed_gh_withholds_tokens_and_carries_the_policy_read_only() {
+    use crate::forge_egress::worker_env::WorkerEgress;
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    std::env::set_var("GH_TOKEN", "ghp_not_a_real_token");
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let launcher = bin.join("gh");
+    std::fs::write(&launcher, "x").unwrap();
+    let policy = dir.path().join("policy.json");
+    std::fs::write(&policy, "{}").unwrap();
+    let egress = WorkerEgress {
+        launcher: launcher.clone(),
+        upstream_gh: None,
+        policy_file: policy.clone(),
+        credential_file: None,
+        required: true,
+    };
+    let managed = build_with(Some(&egress));
+    let plain = build_with(None);
+    std::env::remove_var("GH_TOKEN");
+    // No policy: today's behaviour, token forwarded by name.
+    assert!(plain.contains(&"GH_TOKEN".to_string()), "{plain:?}");
+    assert!(!plain.iter().any(|a| a.contains("GITHUB_EGRESS_POLICY")));
+    // Policy: no token, launcher dir + policy mounted ro at their host paths.
+    assert!(!managed.contains(&"GH_TOKEN".to_string()), "{managed:?}");
+    let ro = |p: &Path| format!("{0}:{0}:ro", p.display());
+    assert!(managed.contains(&ro(&bin)), "{managed:?}");
+    assert!(managed.contains(&ro(&policy)), "{managed:?}");
+    assert!(managed.contains(&format!("GITHUB_EGRESS_POLICY={}", policy.display())));
+    assert!(managed.contains(&format!("LOOM_FORGE_EGRESS_POLICY={}", policy.display())));
+}
+
+#[test]
+fn managed_gh_never_mounts_the_host_gh_config() {
+    let _g = env_lock();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".config/gh")).unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let old = (
+        std::env::var_os("HOME"),
+        std::env::var_os("GH_TOKEN"),
+        std::env::var_os("GITHUB_TOKEN"),
+    );
+    std::env::set_var("HOME", home.path());
+    std::env::remove_var("GH_TOKEN");
+    std::env::remove_var("GITHUB_TOKEN");
+    let unmanaged = extra_mounts("/root", None, ws.path(), false);
+    let managed = extra_mounts("/root", None, ws.path(), true);
+    for (k, v) in [
+        ("HOME", old.0),
+        ("GH_TOKEN", old.1),
+        ("GITHUB_TOKEN", old.2),
+    ] {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    assert!(unmanaged.iter().any(|(_, c, _)| c.ends_with("/config/gh")));
+    assert!(!managed.iter().any(|(_, c, _)| c.ends_with("/config/gh")));
+}

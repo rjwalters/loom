@@ -356,6 +356,33 @@ pub fn docker_command(
     credentials: &[&str],
     injection: Option<&Injection>,
 ) -> Result<Command, LaunchError> {
+    docker_command_with(
+        profile,
+        workspace,
+        cwd,
+        log,
+        args,
+        credentials,
+        injection,
+        crate::forge_egress::worker_env::WorkerEgress::from_process().as_ref(),
+    )
+}
+
+/// [`docker_command`] with the forge-egress policy injected (#9987). `Some`
+/// carries the launcher, upstream `gh`, policy and credential reference into
+/// the container read-only and withholds `~/.config/gh` and
+/// `GH_TOKEN`/`GITHUB_TOKEN`; `None` is byte-identical to the pre-#9987 command.
+#[allow(clippy::too_many_arguments)]
+pub fn docker_command_with(
+    profile: &Profile,
+    workspace: &Path,
+    cwd: &Path,
+    log: Option<&Path>,
+    args: &[OsString],
+    credentials: &[&str],
+    injection: Option<&Injection>,
+    egress: Option<&crate::forge_egress::worker_env::WorkerEgress>,
+) -> Result<Command, LaunchError> {
     if which_docker().is_none() {
         return Err(LaunchError::config(
             "native containment is enabled (runtimes.containment.native / LOOM_NATIVE_CONTAINERIZED) but 'docker' is not on PATH. Install docker, or disable containment (LOOM_NATIVE_CONTAINERIZED=0, or remove runtimes.containment.native from .loom/config.json).",
@@ -376,8 +403,16 @@ pub fn docker_command(
     // Everything ELSE on the host is simply absent from the container — the
     // "read-only view of everything outside the worktree" the issue asks for
     // is the container boundary itself, not a flag.
-    for (host, container, read_only) in extra_mounts(&root, log, workspace) {
+    for (host, container, read_only) in extra_mounts(&root, log, workspace, egress.is_some()) {
         command.arg("-v").arg(mount(&host, &container, read_only));
+    }
+    if let Some(egress) = egress {
+        for (host, container, read_only) in egress.container_mounts() {
+            command.arg("-v").arg(mount(&host, &container, read_only));
+        }
+        for (key, value) in egress.container_env() {
+            command.arg("-e").arg(format!("{key}={value}"));
+        }
     }
     // Mask host directories the workspace mount would otherwise expose (#8674:
     // a per-repo `.loom/api-keys/` pool). An empty tmpfs, mode 0555 — readable
@@ -434,6 +469,11 @@ pub fn docker_command(
     // target point a contained worker back at a shared (or nonexistent) host
     // path — the isolation is the point of this module.
     names.retain(|name| !is_isolated_dir(name));
+    // #9987: a policy-governed container never holds a real GitHub token; its
+    // `gh` is the managed launcher, which carries only a placeholder.
+    if egress.is_some() {
+        names.retain(|name| !matches!(name.as_str(), "GH_TOKEN" | "GITHUB_TOKEN"));
+    }
     // #8674: a withheld name must never be forwarded by name — that is what
     // would put the REAL credential in the container's environment.
     if let Some(injection) = injection {
@@ -541,6 +581,51 @@ fn which_docker() -> Option<PathBuf> {
     })
 }
 
+/// Whether `image` has `python3` on its PATH (#9987: the managed `gh`
+/// launcher is Python 3). Only a probe that RAN and found nothing is `false`;
+/// a probe that could not run is left to the real launch to report.
+pub fn image_has_python3(image: &str) -> bool {
+    match Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--entrypoint",
+            "sh",
+            image,
+            "-c",
+            "command -v python3",
+        ])
+        .output()
+    {
+        // `sh` exits 1 when `command -v` finds nothing; 125-127 are docker's
+        // own failures (no image, no sh), which are not a verdict on python3.
+        Ok(out) => out.status.code() != Some(1),
+        Err(_) => true,
+    }
+}
+
+/// What `command -v gh` resolves to inside `image` with `egress`'s mounts and
+/// launcher directory first on `PATH` (#9987). `None` when the probe could not
+/// run (no docker, no image, no `sh`) — that is not a verdict on the launcher.
+pub fn image_resolved_gh(
+    image: &str,
+    egress: &crate::forge_egress::worker_env::WorkerEgress,
+) -> Option<String> {
+    let dir = egress.launcher_dir()?;
+    let out = Command::new("docker")
+        .args(["run", "--rm", "--entrypoint", "sh"])
+        .args(egress.docker_args())
+        .arg(image)
+        .args(["-c", "PATH=\"$1:$PATH\"; command -v gh", "sh"])
+        .arg(dir)
+        .output()
+        .ok()?;
+    match out.status.code() {
+        Some(0 | 1) => Some(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+        _ => None,
+    }
+}
+
 fn mount(host: &Path, container: &str, read_only: bool) -> OsString {
     let mut spec = OsString::from(host);
     spec.push(":");
@@ -561,6 +646,7 @@ fn extra_mounts(
     ephemeral_root: &str,
     log: Option<&Path>,
     workspace: &Path,
+    managed_gh: bool,
 ) -> Vec<(PathBuf, String, bool)> {
     let mut out = Vec::new();
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -570,7 +656,8 @@ fn extra_mounts(
             out.push((gitconfig, format!("{CONTAINER_HOME}/.gitconfig"), true));
         }
         let gh = home.join(".config/gh");
-        if env_nonempty("GH_TOKEN").is_none()
+        if !managed_gh
+            && env_nonempty("GH_TOKEN").is_none()
             && env_nonempty("GITHUB_TOKEN").is_none()
             && gh.is_dir()
         {

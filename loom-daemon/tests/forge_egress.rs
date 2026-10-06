@@ -582,3 +582,153 @@ fn no_policy_launcher_opt_out_makes_the_stub_win_over_the_launcher() {
         assert_eq!(o["ghSource"], "policy", "{opt_out:?}: {o:#}");
     }
 }
+
+/// #9987: `container-args` never lets "no output" mean "no policy". The status
+/// line is explicit, and a configured policy that cannot be honoured exits 78
+/// with no status (so `spawn-claude.sh` cannot restore ambient credentials).
+#[test]
+fn container_args_status_is_explicit_and_a_bad_configured_policy_refuses() {
+    let sb = Sandbox::new();
+    let run = |policy: Option<&Path>| {
+        let mut c = sb.cmd(&["container-args"]);
+        c.env("GH_TOKEN", "ghp_must_not_be_printed");
+        c.env_remove("LOOM_GH_NO_POLICY_LAUNCHER");
+        if let Some(p) = policy {
+            c.env("LOOM_FORGE_EGRESS_POLICY", p);
+        }
+        c.output().unwrap()
+    };
+    if !machine_policy_present() {
+        let out = run(None);
+        assert_eq!(out.status.code(), Some(0));
+        // The legacy credentials, by NAME: the daemon makes the whole decision.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stdout, "loom-forge-egress: unconfigured\n-e\nGH_TOKEN\n");
+    }
+    type Mutate = fn(&mut Value);
+    let cases: [(&str, Mutate); 3] = [
+        ("policy.schema", |p| {
+            p["toolchain"]
+                .as_object_mut()
+                .unwrap()
+                .remove("launcherPath");
+        }),
+        ("policy.schema", |p| p["toolchain"]["launcherPath"] = "".into()),
+        ("policy.schema-version", |p| p["schemaVersion"] = 2.into()),
+    ];
+    for (code, mutate) in cases {
+        let path = sb.policy(|p| {
+            p["enforcement"]["api"] = "required".into();
+            mutate(p);
+        });
+        let out = run(Some(&path));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{code}: {stderr}");
+        assert!(out.stdout.is_empty(), "{code}: no status, no args");
+        assert!(stderr.contains(code), "{code}: {stderr}");
+    }
+    let path = sb.policy(|p| p["enforcement"]["api"] = "required".into());
+    let out = run(Some(&path));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.starts_with("loom-forge-egress: managed\n-v\n"), "{stdout}");
+    assert!(!stdout.contains("GH_TOKEN") && !stdout.contains("ghp_"), "{stdout}");
+}
+
+/// #10446 review: `LOOM_GH_NO_POLICY_LAUNCHER=1` (the resolver's stub-`gh`
+/// seam, exported by the shell test harnesses) must never relax container
+/// credential admission: a required policy stays managed (no token), an
+/// invalid one still refuses, and a managed marker without a policy refuses.
+#[test]
+fn container_args_ignores_the_no_policy_launcher_opt_out() {
+    let sb = Sandbox::new();
+    let run = |envs: &[(&str, &std::ffi::OsStr)]| {
+        let mut c = sb.cmd(&["container-args"]);
+        c.env("LOOM_GH_NO_POLICY_LAUNCHER", "1")
+            .env("GH_TOKEN", "ghp_must_not_leak");
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    };
+    let path = sb.policy(|p| p["enforcement"]["api"] = "required".into());
+    let out = run(&[("LOOM_FORGE_EGRESS_POLICY", path.as_os_str())]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.starts_with("loom-forge-egress: managed\n"), "{stdout}");
+    assert!(!stdout.contains("GH_TOKEN") && !stdout.contains(".config/gh"), "{stdout}");
+
+    let path = sb.policy(|p| {
+        p["enforcement"]["api"] = "required".into();
+        p["toolchain"]["launcherPath"] = "".into();
+    });
+    let out = run(&[("LOOM_FORGE_EGRESS_POLICY", path.as_os_str())]);
+    assert_eq!(out.status.code(), Some(78));
+    assert!(out.stdout.is_empty());
+
+    if !machine_policy_present() {
+        let out = run(&[("LOOM_FORGE_EGRESS_MANAGED", std::ffi::OsStr::new("1"))]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{stderr}");
+        assert!(out.stdout.is_empty());
+        assert!(stderr.contains("policy.unconfigured"), "{stderr}");
+    }
+}
+
+/// The native half of the same regression: under the opt-out a required
+/// policy's launcher still goes first on the worker PATH, and a managed
+/// marker without a policy still refuses the spawn.
+#[test]
+#[cfg(unix)]
+fn spawn_worker_ignores_the_no_policy_launcher_opt_out() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new();
+    let scripts = sb.path().join("scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    let seen = sb.path().join("seen-path");
+    let runtime = scripts.join("spawn-claude.sh");
+    std::fs::write(&runtime, format!("#!/bin/sh\nprintf '%s' \"$PATH\" >'{}'\n", seen.display()))
+        .unwrap();
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Routed through the gateway with no stored token: what `required` wants.
+    let profile = sb.path().join("home-required/.config/gh");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(
+        profile.join("hosts.yml"),
+        "github.com:\n    user: fixture-user\n    git_protocol: https\n    api_host: github-proxy.fixture.invalid\n",
+    )
+    .unwrap();
+    let spawn = |envs: &[(&str, &std::ffi::OsStr)]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+        c.args(["spawn-worker", "--scripts-dir"])
+            .arg(&scripts)
+            .args(["--", "-p", "hello"])
+            .current_dir(sb.path())
+            .env_clear()
+            .env("PATH", sb.path_env())
+            // No hosts.yml token: `required` publishes none (#9986).
+            .env("HOME", sb.path().join("home-required"))
+            .env("LOOM_WORKSPACE", sb.path())
+            .env("LOOM_RUNTIME", "claude")
+            .env("LOOM_GH_NO_POLICY_LAUNCHER", "1");
+        for (k, v) in envs {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    };
+    let path = sb.policy(|p| p["enforcement"]["api"] = "required".into());
+    let out = spawn(&[("LOOM_FORGE_EGRESS_POLICY", path.as_os_str())]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let seen_path = std::fs::read_to_string(&seen).unwrap();
+    let first = std::env::split_paths(&seen_path).next().unwrap();
+    assert_eq!(first, sb.path(), "the launcher dir leads the worker PATH: {seen_path}");
+
+    if !machine_policy_present() {
+        std::fs::remove_file(&seen).unwrap();
+        let out = spawn(&[("LOOM_FORGE_EGRESS_MANAGED", std::ffi::OsStr::new("1"))]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{stderr}");
+        assert!(stderr.contains("policy.unconfigured"), "{stderr}");
+        assert!(!seen.exists(), "no worker may be spawned");
+    }
+}

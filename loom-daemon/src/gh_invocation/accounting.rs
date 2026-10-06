@@ -217,7 +217,13 @@ fn is_rate_limit_probe(args: &[OsString]) -> bool {
 /// Record one completed invocation (see the module docs for what is skipped).
 /// `captured` is `(stdout, stderr)` for a captured run, `None` for passthrough.
 pub(super) fn record(inv: &GhInvocation, outcome: InvokeOutcome, captured: Option<(&[u8], &[u8])>) {
-    if matches!(outcome, InvokeOutcome::SpawnFailed | InvokeOutcome::RoutingRefused) {
+    if matches!(
+        outcome,
+        InvokeOutcome::SpawnFailed
+            | InvokeOutcome::RoutingRefused
+            | InvokeOutcome::RoutingBlocked
+            | InvokeOutcome::AdapterUnavailable
+    ) {
         return;
     }
     let caller = inv.operation.as_str();
