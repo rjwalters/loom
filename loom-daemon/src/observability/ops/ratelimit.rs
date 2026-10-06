@@ -392,7 +392,12 @@ pub fn bucket_points(
 /// trip-time fallback would carry the wrong `observed_at`.
 ///
 /// [`Source::Probe`]: crate::forge_bucket_book::Source::Probe
-pub fn book_budget(budget: &BudgetSnapshot, account: &str, owner: &str, installation: Option<&str>) {
+pub fn book_budget(
+    budget: &BudgetSnapshot,
+    account: &str,
+    owner: &str,
+    installation: Option<&str>,
+) {
     use crate::forge_bucket_book::{insert, BucketKey, Reading, Resource, Source};
     for (resource, remaining, used, reset) in [
         (Resource::Core, budget.core_remaining, budget.core_used, budget.core_reset),

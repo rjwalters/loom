@@ -135,7 +135,20 @@ pub fn drain_points() -> Vec<MetricPoint> {
     drained
         .into_iter()
         .map(
-            |((caller, op, role, account, cred_owner, installation, target_owner, resource, outcome), n)| {
+            |(
+                (
+                    caller,
+                    op,
+                    role,
+                    account,
+                    cred_owner,
+                    installation,
+                    target_owner,
+                    resource,
+                    outcome,
+                ),
+                n,
+            )| {
                 MetricPoint::int(MetricName::ForgeCalls, i64::try_from(n).unwrap_or(i64::MAX))
                     .label("caller", caller)
                     .label("op", op)

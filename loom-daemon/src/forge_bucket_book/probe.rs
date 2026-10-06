@@ -94,11 +94,11 @@ pub fn probe_targets(workspace_root: &Path, now: SystemTime) -> Vec<ProbeTarget>
                 continue;
             }
             out.push(ProbeTarget {
+                installation: installation_of(&dir),
                 dir,
                 role: IdentityRole::Reader,
                 account: crate::observability::ops::ratelimit::app_account_label(&app_id),
                 owner: owner_lc.clone(),
-                installation: installation_of(&dir),
             });
         }
     }

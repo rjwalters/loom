@@ -34,7 +34,9 @@ fn workspace(owner: &str, roster_app: Option<&str>) -> tempfile::TempDir {
         std::fs::create_dir_all(ws.path().join(".loom")).unwrap();
         std::fs::write(
             ws.path().join(".loom/config.json"),
-            format!(r#"{{"forge": {{"githubApp": {{"appId": "{app}", "privateKeyPath": "/k.pem"}}}}}}"#),
+            format!(
+                r#"{{"forge": {{"githubApp": {{"appId": "{app}", "privateKeyPath": "/k.pem"}}}}}}"#
+            ),
         )
         .unwrap();
     }
@@ -135,7 +137,10 @@ fn two_minters_republishing_one_dir_never_share_a_key() {
         .collect();
     assert_eq!(
         keys,
-        [("app-1057111".into(), "71".into()), ("app-1057112".into(), "72".into())]
+        [
+            ("app-1057111".into(), "71".into()),
+            ("app-1057112".into(), "72".into())
+        ]
     );
 }
 
@@ -213,7 +218,10 @@ fn installation_witnesses_a_key_without_splitting_it() {
     super::super::insert(witnessed, reading(10, now - 2));
     // A later reading that does not know the installation keeps the witness.
     super::super::insert(bare.clone(), reading(20, now - 1));
-    let held: Vec<_> = snapshot(now).into_iter().filter(|(k, _)| *k == bare).collect();
+    let held: Vec<_> = snapshot(now)
+        .into_iter()
+        .filter(|(k, _)| *k == bare)
+        .collect();
     assert_eq!(held.len(), 1);
     assert_eq!((held[0].0.installation.as_str(), held[0].1.used), ("41", Some(20)));
 }
@@ -250,6 +258,9 @@ fn an_old_snapshot_without_installation_still_loads() {
     );
     persist(dir.path(), now).unwrap();
     let back = load(dir.path(), now);
-    let (k, _) = back.iter().find(|(k, _)| k.account == "app-1057152").unwrap();
+    let (k, _) = back
+        .iter()
+        .find(|(k, _)| k.account == "app-1057152")
+        .unwrap();
     assert_eq!(k.installation, "52");
 }

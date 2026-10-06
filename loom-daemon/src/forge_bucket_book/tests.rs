@@ -126,7 +126,11 @@ fn every_gauge_carries_an_owner_installation_and_role_label() {
         ));
         let keys: Vec<&str> = p.labels.keys().map(String::as_str).collect();
         assert_eq!(keys, ["account", "installation", "owner", "resource", "role"], "{p:?}");
-        let want = if p.labels["account"] == "app-1" { "11" } else { NO_INSTALLATION };
+        let want = if p.labels["account"] == "app-1" {
+            "11"
+        } else {
+            NO_INSTALLATION
+        };
         assert_eq!(p.labels["installation"], want, "{p:?}");
     }
     assert!(points

@@ -135,7 +135,11 @@ mod tests {
     #[test]
     fn publish_minted_writes_the_sidecar_after_the_token() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".loom").join("gh-config-by-owner").join("2AMLogic");
+        let dir = tmp
+            .path()
+            .join(".loom")
+            .join("gh-config-by-owner")
+            .join("2AMLogic");
         publish_outcome(&dir, &outcome(), "2AMLogic/2am").unwrap();
         assert!(dir.join("hosts.yml").is_file(), "token published");
         let side = read_sidecar(&dir).unwrap();

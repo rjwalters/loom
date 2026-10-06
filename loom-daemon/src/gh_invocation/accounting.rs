@@ -306,7 +306,10 @@ pub(super) fn record(
         ro: Some(ro.as_str().to_string()),
         ca: forge_call_stats::sanitize(&cred.account),
         co: cred.owner.as_deref().and_then(forge_call_stats::sanitize),
-        ci: cred.installation.as_deref().and_then(forge_call_stats::sanitize),
+        ci: cred
+            .installation
+            .as_deref()
+            .and_then(forge_call_stats::sanitize),
         tk: Some(cred.kind.to_string()),
         rr: forge_call_stats::sanitize(&resource),
         pg,

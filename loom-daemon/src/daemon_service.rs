@@ -879,9 +879,9 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     let source = credential_preflight::credential_source_for_owner(owner_repo);
                     match outcome {
                         Ok(ref minted @ credential_preflight::GithubAppOutcome::Minted { .. }) => {
-                            if let Err(e) =
-                                credential_preflight::publish_outcome(config_dir, minted, owner_repo)
-                            {
+                            if let Err(e) = credential_preflight::publish_outcome(
+                                config_dir, minted, owner_repo,
+                            ) {
                                 credential_preflight::record_forge_credential_failure(
                                     &source,
                                     &format!("could not publish the minted token: {e}"),

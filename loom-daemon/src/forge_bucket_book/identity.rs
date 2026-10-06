@@ -51,7 +51,8 @@ fn numeric(id: &str) -> Option<String> {
 /// `dir`'s sidecar, memoised on the file's modification time and length.
 fn cached_sidecar(dir: &Path) -> Option<Sidecar> {
     type Stamp = Option<(SystemTime, u64)>;
-    static MEMO: OnceLock<Mutex<HashMap<PathBuf, (Stamp, Option<Sidecar>)>>> = OnceLock::new();
+    type Memo = HashMap<PathBuf, (Stamp, Option<Sidecar>)>;
+    static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
     let stamp: Stamp = std::fs::metadata(dir.join(SIDECAR))
         .ok()
         .and_then(|m| Some((m.modified().ok()?, m.len())));
@@ -100,9 +101,7 @@ pub fn dir_identity(dir: &Path, class: &DirClass) -> Option<CredIdentity> {
                 installation,
             });
         }
-        DirClass::OwnerWriter { root, owner } => {
-            (super::writer_account(root), Some(owner.clone()))
-        }
+        DirClass::OwnerWriter { root, owner } => (super::writer_account(root), Some(owner.clone())),
         DirClass::PrimaryWriter { root } => {
             (super::writer_account(root), super::primary_owner(root))
         }
