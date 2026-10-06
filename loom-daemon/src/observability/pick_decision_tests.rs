@@ -159,6 +159,7 @@ fn an_empty_role_tick_records_cadence_with_no_candidates() {
 fn gate_stash_keeps_only_open_prs_and_drains_per_root() {
     clear_gate_listings();
     let pr = |n: u32, state: &str, is_pr: bool| RestIssue {
+        comments: 0,
         number: n,
         title: None,
         labels: vec![],

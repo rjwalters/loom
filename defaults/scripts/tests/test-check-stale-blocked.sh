@@ -142,44 +142,120 @@ mkdir -p "$STUB_DIR"
 
 cat >"$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
+# The check reads the forge in bulk (#10480): one REST `loom:blocked` listing
+# (issues AND PRs), REST comment / single-issue / pull reads, and one aliased
+# GraphQL query per 100 issues for the closing PRs. This stub answers each of
+# those from the SAME fixture files the per-artifact `gh issue|pr view` shape
+# used, so every case below keeps its meaning. Any `gh issue|pr view|list` is
+# unhandled on purpose: the batch path must never make one.
 set -uo pipefail
 D="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
-kind="${1:-}"; sub="${2:-}"
-shift 2 2>/dev/null || true
+printf '%s\n' "$*" >>"$D/calls.log"
 
-# The check enumerates BOTH populations (#8925): `gh issue list --label
-# loom:blocked` and `gh pr list --label loom:blocked`. Both must be answerable
-# or the PR arm's read failure is reported as "could not enumerate", masking the
-# issue arm's real verdict — the shape that made 5 cases here fail once the PR
-# enumeration landed. An absent fixture file answers `[]` (the empty
-# population), which is what every issue-only case below wants.
-if [[ ( "$kind" == "issue" || "$kind" == "pr" ) && "$sub" == "list" ]]; then
-  f="$D/$kind-list.json"
-  if [[ -f "$f" ]]; then cat "$f"; else printf '[]'; fi
-  exit 0
-fi
+http() { # <status line> <body>
+  printf 'HTTP/2.0 %s\r\nContent-Type: application/json\r\n\r\n%s' "$1" "$2"
+}
+not_found() { http "404 Not Found" '{"message":"Not Found"}'; echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
 
-if [[ ( "$kind" == "issue" || "$kind" == "pr" ) && "$sub" == "view" ]]; then
-  num=""
+# label_objs: normalise a fixture's labels (objects or names) to REST objects.
+LABELS='(.labels // []) | map({name: (if type == "object" then .name else . end)})'
+
+if [[ "${1:-}" == "api" ]]; then
+  shift
+  url="" query=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --json|--repo|--jq|--limit|--state|--label) shift 2 ;;
-      -*) shift ;;
-      *) [[ -z "$num" ]] && num="$1"; shift ;;
+      --include|-i) shift ;;
+      -H|--hostname|--method|-X) shift 2 ;;
+      -f|-F|--raw-field|--field) [[ "${2:-}" == query=* ]] && query="${2#query=}"; shift 2 ;;
+      *) [[ -z "$url" ]] && url="$1"; shift ;;
     esac
   done
-  f="$D/$kind-$num.json"
-  [[ -f "$f" ]] || { echo "stub gh: no fixture for $kind #$num" >&2; exit 1; }
-  cat "$f"
-  exit 0
+
+  if [[ "$url" == "graphql" ]]; then
+    repo='{}'
+    for n in $(grep -oE 'i[0-9]+: issue' <<<"$query" | tr -dc '0-9\n'); do
+      f="$D/issue-$n.json"
+      if [[ ! -f "$f" ]]; then
+        repo="$(jq -c --arg k "i$n" '. + {($k): null}' <<<"$repo")"
+        continue
+      fi
+      nodes='[]'
+      for m in $(jq -r '(.closedByPullRequestsReferences // [])[].number' "$f"); do
+        st="$(jq -r '.state // "OPEN"' "$D/pr-$m.json" 2>/dev/null || echo OPEN)"
+        nodes="$(jq -c --argjson m "$m" --arg s "$st" '. + [{number: $m, state: $s}]' <<<"$nodes")"
+      done
+      repo="$(jq -c --arg k "i$n" --argjson nodes "$nodes" \
+        '. + {($k): {closedByPullRequestsReferences: {totalCount: ($nodes|length), nodes: $nodes}}}' <<<"$repo")"
+    done
+    jq -c -n --argjson r "$repo" '{data: {repository: $r}}'
+    exit 0
+  fi
+
+  path="${url%%\?*}"
+  case "$path" in
+    repos/*/*/issues)
+      [[ "$url" == *"&page="* ]] && { http "200 OK" '[]'; exit 0; }
+      out='[]'
+      for kind in issue pr; do
+        lf="$D/$kind-list.json"
+        [[ -f "$lf" ]] || continue
+        for n in $(jq -r '.[].number' "$lf"); do
+          title="$(jq -r --argjson n "$n" '.[] | select(.number == $n) | .title' "$lf")"
+          fx='{}'
+          [[ -f "$D/$kind-$n.json" ]] && fx="$(cat "$D/$kind-$n.json")"
+          out="$(jq -c --argjson n "$n" --arg t "$title" --arg k "$kind" --argjson fx "$fx" \
+            ". + [{number: \$n, title: \$t, state: \"open\", user: {login: \"someone\"},
+                   body: (\$fx.body // \"\"), comments: ((\$fx.comments // []) | length),
+                   labels: ([{name: \"loom:blocked\"}] + (\$fx | $LABELS))}
+                  + (if \$k == \"pr\" then {pull_request: {url: \"x\"}} else {} end)]" <<<"$out")"
+        done
+      done
+      http "200 OK" "$out"
+      exit 0
+      ;;
+    repos/*/*/issues/*/comments)
+      n="$(cut -d/ -f5 <<<"$path")"
+      [[ "$url" == *"&page=1"* ]] || { http "200 OK" '[]'; exit 0; }
+      f="$D/issue-$n.json"; [[ -f "$f" ]] || f="$D/pr-$n.json"
+      [[ -f "$f" ]] || not_found
+      http "200 OK" "$(jq -c '(.comments // []) | map({user: {login: .author.login}, body})' "$f")"
+      exit 0
+      ;;
+    repos/*/*/issues/*)
+      n="${path##*/}"
+      for kind in issue pr; do
+        f="$D/$kind-$n.json"
+        [[ -f "$f" ]] && jq -e 'has("state")' "$f" >/dev/null || continue
+        http "200 OK" "$(jq -c --arg k "$kind" \
+          "{number, state: (if .state == \"OPEN\" then \"open\" else \"closed\" end),
+            labels: ($LABELS)}
+           + (if \$k == \"pr\" then {pull_request: {merged_at:
+               (if .state == \"MERGED\" then \"2026-01-01T00:00:00Z\" else null end)}} else {} end)" "$f")"
+        exit 0
+      done
+      not_found
+      ;;
+    repos/*/*/pulls/*)
+      f="$D/pr-${path##*/}.json"
+      [[ -f "$f" ]] || not_found
+      http "200 OK" "$(jq -c '{number, state: (.state | ascii_downcase),
+        mergeable: (if .mergeable == "MERGEABLE" then true elif .mergeable == "CONFLICTING" then false else null end),
+        mergeable_state: ((.mergeStateStatus // "unknown") | ascii_downcase)}' "$f")"
+      exit 0
+      ;;
+  esac
 fi
 
-echo "stub gh: unhandled args: $kind $sub $*" >&2
+echo "stub gh: unhandled args: $*" >&2
 exit 3
 STUB
 chmod +x "$STUB_DIR/gh"
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
+# The batch path's ETag store must never touch the user's real cache (the stub
+# sends no ETag, so nothing is stored, but keep it out of the real dir anyway).
+export LOOM_LISTING_CACHE_DIR="$WORKDIR/etag-cache"
 
 # run_check [extra args...] — invoke the subject against the stub fixtures.
 # Stdout and stderr are captured separately, because which stream a message
@@ -190,15 +266,16 @@ LAST_STDERR=""
 LAST_RC=0
 run_check() {
     LAST_RC=0
+    : >"$STUB_DIR/calls.log"
     LAST_STDOUT="$("$SCRIPT" --repo owner/repo --repo-root "$STUB_DIR" "$@" \
         2>"$STUB_DIR/stderr.txt")" || LAST_RC=$?
     LAST_STDERR="$(cat "$STUB_DIR/stderr.txt")"
 }
 
-# set_population <jq-array-json> — what `gh issue list` answers.
+# set_population <jq-array-json> — the issue rows of the REST listing.
 set_population() { printf '%s' "$1" >"$STUB_DIR/issue-list.json"; }
 
-# set_pr_population <jq-array-json> — what `gh pr list` answers (#8925's PR arm).
+# set_pr_population <jq-array-json> — the PR rows of the REST listing (#8925).
 set_pr_population() { printf '%s' "$1" >"$STUB_DIR/pr-list.json"; }
 
 # issue_fixture <number> <body> [comments-json] [closing-prs-json]
@@ -445,6 +522,35 @@ assert_contains "$LAST_STDERR" "STALE BLOCK" \
 # --no-prs skips the PR enumeration entirely.
 run_check --no-prs
 assert_eq "" "$LAST_STDERR" "T6h: --no-prs does not enumerate the PR population"
+
+# --- Group 7: the batched read shape (#10480) -------------------------------
+# Three issues citing the same blocker, plus a parked PR: one listing, one
+# GraphQL query for all the issues, one state read for the shared blocker, and
+# never a per-artifact `gh issue view` / `gh pr view`.
+echo "Group 7: batched reads"
+set_population '[{"number":301,"title":"a"},{"number":302,"title":"b"},{"number":303,"title":"c"}]'
+set_pr_population '[]'
+for n in 301 302 303; do issue_fixture "$n" "Blocked by #7."; done
+state_fixture issue 7 "CLOSED"
+run_check --json
+CALLS="$(cat "$STUB_DIR/calls.log")"
+assert_eq "3" "$(jq -r '.stale | length' <<<"$LAST_STDOUT")" "T7a: every citer of the closed blocker is stale"
+assert_not_contains "$CALLS" "issue view" "T7b: no per-artifact \`gh issue view\`"
+assert_not_contains "$CALLS" "pr view" "T7c: no per-artifact \`gh pr view\`"
+assert_eq "1" "$(grep -c '^api graphql' <<<"$CALLS")" "T7d: one GraphQL query for the whole issue population"
+assert_eq "1" "$(grep -cE 'repos/owner/repo/issues/7( |$)' <<<"$CALLS")" \
+    "T7e: a blocker cited three times is read once"
+assert_eq "1" "$(grep -cE 'repos/owner/repo/issues\?labels=loom:blocked' <<<"$CALLS")" \
+    "T7f: one REST listing covers both populations"
+
+# A REST bot login (`name[bot]`) is the automation's own comment, exactly as the
+# GraphQL spelling was (T2f).
+set_population '[{"number":304,"title":"Only the bot (REST spelling) mentioned a blocker"}]'
+issue_fixture 304 "Nothing cited." \
+    '[{"author":{"login":"loom-fleet-dispatch[bot]"},"body":"Blocked by #7, per the last pass."}]'
+run_check
+assert_contains "$LAST_STDERR" "UNDOCUMENTED BLOCK" \
+    "T7g: a \`[bot]\`-suffixed fleet comment does not count as documentation"
 
 # --- summary ---------------------------------------------------------------
 echo ""

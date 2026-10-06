@@ -643,6 +643,90 @@ pub(crate) fn daemon_cache_key(cwd: Option<&Path>, target: &Target, url: &str) -
     key
 }
 
+// ============================================================================
+// One conditional GET with a memory + disk ETag cache
+// ============================================================================
+
+/// Conditional GET of the REST path `url` against `repo` (else `cwd`'s
+/// remote), accounted under `site` (#9831): `Ok(Some(body))` on a `200`, or on
+/// a `304` served from the stored body; `Ok(None)` on a `404`.
+///
+/// The one copy of this mechanism (#10480): star liveness and the batched
+/// `check-stale-blocked` gatherer both call it. Entries live in a
+/// process-global memory map backed by [`daemon_store_dir`] under
+/// `prefix` (`"star-"`, `"stale-"`), so a short-lived CLI process still gets
+/// a free `304` from the previous run's ETag. A `304` with nothing sent is
+/// anomalous: the entry is dropped and the read fails, so the next call
+/// re-fetches unconditionally. Honours the rate-limit breaker under
+/// `site.caller`.
+///
+/// # Errors
+/// The breaker is suppressing calls, `gh` could not run, or the read failed
+/// with anything but a `404`.
+pub(crate) fn cached_get(
+    site: ConditionalRead,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo: Option<&str>,
+    url: &str,
+    prefix: &'static str,
+) -> Result<Option<String>> {
+    if crate::rate_limit_breaker::global_skip_pass(site.caller) {
+        anyhow::bail!("rate-limit breaker is suppressing forge calls");
+    }
+    let target = resolve_target(cwd, repo);
+    let key = daemon_cache_key(cwd, &target, url);
+    let mem_key = format!("{prefix}{key}");
+    let disk = daemon_store_dir().map(|d| entry_path_with_prefix(&d, prefix, &key));
+    let sent = get_cache()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&mem_key).cloned())
+        .or_else(|| Some(std::sync::Arc::new(read_disk_entry(disk.as_deref()?)?)));
+    let sent_etag = sent.as_ref().map(|e| e.etag.as_str());
+    let (status, response, stderr) = fetch_conditional(site, gh_bin, cwd, &target, url, sent_etag)?;
+    match response {
+        Some(r) if r.status == 304 => match sent {
+            Some(e) => Ok(Some(e.body.clone())),
+            None => {
+                if let Ok(mut m) = get_cache().lock() {
+                    m.remove(&mem_key);
+                }
+                if let Some(p) = &disk {
+                    let _ = std::fs::remove_file(p);
+                }
+                anyhow::bail!("gh api {url}: 304 but the cache entry vanished")
+            }
+        },
+        Some(r) if r.status == 200 && status.success() => {
+            if let Some(etag) = r.etag.clone() {
+                let entry = DiskEntry {
+                    etag,
+                    body: r.body.clone(),
+                };
+                if let Some(p) = &disk {
+                    write_disk_entry(p, &entry);
+                }
+                if let Ok(mut m) = get_cache().lock() {
+                    m.insert(mem_key, std::sync::Arc::new(entry));
+                }
+            }
+            Ok(Some(r.body))
+        }
+        Some(r) if r.status == 404 => Ok(None),
+        _ => {
+            crate::rate_limit_breaker::global_observe_failure(&stderr, site.caller);
+            anyhow::bail!("gh api {url} failed: {stderr}")
+        }
+    }
+}
+
+/// [`cached_get`]'s process-global hot layer, keyed `prefix + cache key`.
+fn get_cache() -> &'static Mutex<HashMap<String, std::sync::Arc<DiskEntry>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, std::sync::Arc<DiskEntry>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

@@ -178,6 +178,7 @@ pub fn outsider(body: &str) -> ForgeComment {
 /// An open issue.
 pub fn issue(number: u32, labels: &[&str]) -> RestIssue {
     RestIssue {
+        comments: 0,
         number,
         title: Some(format!("issue {number}")),
         labels: labels.iter().map(|l| (*l).to_string()).collect(),

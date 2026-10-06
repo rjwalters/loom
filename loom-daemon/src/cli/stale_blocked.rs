@@ -10,9 +10,12 @@
 //! Brand-new logic, so it is native from the start per
 //! `.loom/docs/shell-language-policy.md` — the `generate-agent-skills.sh`
 //! precedent — rather than a script to be ported later. The classification
-//! itself lives in [`loom_daemon::stale_blocked`]; this module is the
-//! enumeration, the live reads (all delegated to
-//! [`loom_daemon::dep_recheck::forge`]) and the rendering.
+//! itself lives in [`loom_daemon::stale_blocked`], and the forge reads in
+//! [`loom_daemon::stale_blocked::batch`] (#10480: one REST listing, REST + ETag
+//! comment and blocker-state reads, one GraphQL query per 100 issues); this
+//! module is the rendering. [`list_blocked`] and [`gather`], the per-artifact
+//! path over [`loom_daemon::dep_recheck::forge`], remain for
+//! `notify-cleared-blockers`.
 //!
 //! # Why every failure is still exit 0
 //!
@@ -23,14 +26,13 @@
 //! posture is that a conclusion drawn from a failed read is worse than no
 //! conclusion. The one thing this command will not do is guess.
 //!
-//! # Both populations, two enumerations (#8925)
+//! # Both populations (#8925)
 //!
 //! `gh issue list` never returns a pull request, so the original single
-//! enumeration could not see a parked PR at all. This command now runs
-//! `gh pr list --label loom:blocked --state open` as well, and reads a PR's body
-//! and comments through [`forge::fetch_pr_body_and_comments`] (`gh issue view`
-//! exits non-zero on a PR number). `--no-prs` restores the issues-only
-//! behaviour for a caller that wants it; nothing in the fleet passes it.
+//! enumeration could not see a parked PR at all. The REST listing the batch
+//! gatherer reads returns both, split by `pull_request`. `--no-prs` restores
+//! the issues-only behaviour for a caller that wants it; nothing in the fleet
+//! passes it.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -43,7 +45,7 @@ use loom_daemon::dep_recheck::{extract, forge};
 use loom_daemon::park_record;
 use loom_daemon::script_helpers::gh_query;
 use loom_daemon::stale_blocked::{
-    classify, park_self_block, undeclared, Artifact, Evidence, Verdict,
+    batch, classify, park_self_block, undeclared, Artifact, Evidence, Verdict,
 };
 
 /// How many open `loom:blocked` issues to examine by default.
@@ -86,18 +88,15 @@ pub(crate) struct StaleBlockedArgs {
     pub no_prs: bool,
 }
 
-/// One row of the enumeration query. Shared by both populations — `gh pr list`
-/// and `gh issue list` return the same `number,title` shape.
+/// One row of the per-artifact enumeration query. Shared by both populations —
+/// `gh pr list` and `gh issue list` return the same `number` shape.
 ///
-/// `pub(super)` (rather than private): reused by `notify_cleared_blockers`
-/// (issue #9102), the close-triggered sibling of this fleet-wide advisory,
-/// which enumerates the same `loom:blocked` population via [`list_blocked`]
-/// rather than re-deriving it.
+/// Only `notify_cleared_blockers` (issue #9102), the close-triggered sibling of
+/// this advisory, still enumerates through [`list_blocked`]; this command's own
+/// run reads the REST listing via [`batch`] (#10480).
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct IssueRow {
     pub(super) number: i64,
-    #[serde(default)]
-    pub(super) title: String,
 }
 
 /// One classified artifact, ready to render. `Clone` because a prose-only park is
@@ -127,20 +126,13 @@ impl StaleBlockedArgs {
             Some(r) => r.clone(),
             None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
-        let repo = self.repo.as_deref();
-
-        let mut populations: Vec<(Artifact, Vec<IssueRow>)> = Vec::new();
-        let mut enumerate_errors: Vec<String> = Vec::new();
-
-        let (rows, err) = list_blocked(Artifact::Issue, &root, repo, self.limit);
-        populations.push((Artifact::Issue, rows));
-        enumerate_errors.extend(err);
-
-        if !self.no_prs {
-            let (rows, err) = list_blocked(Artifact::Pr, &root, repo, self.limit);
-            populations.push((Artifact::Pr, rows));
-            enumerate_errors.extend(err);
-        }
+        let mut forge = batch::GhStaleBlockedForge::new(&root, self.repo.as_deref());
+        let fleet = loom_daemon::forge_identity::FleetLogins::for_root(&root);
+        let opts = batch::Options {
+            limit: self.limit,
+            no_prs: self.no_prs,
+        };
+        let (gathered, enumerate_error) = batch::gather_all(&mut forge, &fleet, opts);
 
         let mut stale: Vec<Finding> = Vec::new();
         let mut superseded: Vec<Finding> = Vec::new();
@@ -148,43 +140,35 @@ impl StaleBlockedArgs {
         let mut prose_only: Vec<Finding> = Vec::new();
         let mut unevaluated: Vec<(String, String)> = Vec::new();
 
-        for (kind, rows) in populations {
-            for row in rows {
-                let evidence = match gather(kind, row.number, repo, &root) {
-                    Ok(e) => e,
-                    Err(why) => {
-                        unevaluated.push((format!("{} #{}", kind.label(), row.number), why));
-                        continue;
-                    }
-                };
-                let finding = Finding {
-                    kind,
-                    number: row.number,
-                    title: row.title.clone(),
-                    verdict: classify(&evidence),
-                    undeclared: undeclared(&evidence),
-                };
-                // A prose-only park is reported REGARDLESS of its verdict: a
-                // still-blocked park whose blocker is unreadable is the defect
-                // in waiting, and waiting for it to go stale is what let #8852
-                // sit through its blocker closing (#8925).
-                if finding.undeclared {
-                    prose_only.push(finding.clone());
+        for g in gathered {
+            let evidence = match g.evidence {
+                Ok(e) => e,
+                Err(why) => {
+                    unevaluated.push((format!("{} #{}", g.kind.label(), g.number), why));
+                    continue;
                 }
-                match finding.verdict {
-                    Verdict::Stale(_) => stale.push(finding),
-                    Verdict::Superseded { .. } => superseded.push(finding),
-                    Verdict::Undocumented => undocumented.push(finding),
-                    Verdict::StillBlocked => {}
-                }
+            };
+            let finding = Finding {
+                kind: g.kind,
+                number: g.number,
+                title: g.title,
+                verdict: classify(&evidence),
+                undeclared: undeclared(&evidence),
+            };
+            // A prose-only park is reported REGARDLESS of its verdict: a
+            // still-blocked park whose blocker is unreadable is the defect
+            // in waiting, and waiting for it to go stale is what let #8852
+            // sit through its blocker closing (#8925).
+            if finding.undeclared {
+                prose_only.push(finding.clone());
+            }
+            match finding.verdict {
+                Verdict::Stale(_) => stale.push(finding),
+                Verdict::Superseded { .. } => superseded.push(finding),
+                Verdict::Undocumented => undocumented.push(finding),
+                Verdict::StillBlocked => {}
             }
         }
-
-        let enumerate_error = if enumerate_errors.is_empty() {
-            None
-        } else {
-            Some(enumerate_errors.join("; "))
-        };
 
         let sections = Sections {
             stale: &stale,
@@ -249,7 +233,7 @@ pub(super) fn list_blocked(
     if let Some(r) = repo {
         args.extend(["--repo", r]);
     }
-    args.extend(["--json", "number,title", "--limit", &limit]);
+    args.extend(["--json", "number", "--limit", &limit]);
 
     let q: Query<Vec<IssueRow>> = gh_query(&args, root, false, |v: &Vec<IssueRow>| v.is_empty());
     match q {
