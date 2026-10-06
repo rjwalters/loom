@@ -270,6 +270,7 @@ only.
 | `land-v2` | `land` | the same, with **right-censored** stage samples folded in (Kaplan–Meier grids) | after `merge_wait` |
 | `land-2026-10-06-calm-plover` | `land` | `land-v2`'s path, then **each** of p25/p50/p75/p90 conformally calibrated against its own hit rate from `land-v2`'s landed **and** still-open (right-censored lower-bound) track record in a trailing 14-day window, per (stage, age bucket) → stage → pooled, with the per-day change of the shift rate-limited; fitted at the estimate's own `as_of` (recorded as `calibration`; #10489) | after `merge_wait` |
 | `land-2026-10-06-quick-tern` | `land` | `land-2026-10-04-twin-otter-b`'s estimate, then each of p25/p50/p75/p90 calibrated by **IPCW** split-conformal over twin-otter-b's landed and still-open track record in a **short recent window** (6 h half-life, doubling when there are too few landings), per stage → pooled. There is no rate limit; a shift within 1.5 standard errors of zero is not applied. Fitted at the estimate's own `as_of`, recorded as `calibration` with `ipcw{…}` (#10524) | at the merge |
+| `land-2026-10-06-held-heron` | `land` | `land-2026-10-04-twin-otter-b`'s estimate, except a PR that is **held** (`merge_hold`) or **sequenced** (`merge_wait` with `loom:sequenced`) at `as_of`. That PR is answered by a competing-risks hold and sequencing chain whose hazards are events ÷ exposure over the 14 days before `as_of`, read from the stage episodes and the PR flag timeline; there are no draws. Too little evidence answers as twin-otter-b. Recorded as `held_heron` (#10523) | at the merge |
 | `land-v4` | `land` | the retired `land-v3`'s grid calibration (widened about its median, Builder scaled by `points:N`, review/merge shifted by `queue_running`, review floored; recorded per stage as `distribution.adjustment`; #9970), plus the binding stall's term added to every path, operator-held PRs estimated from the stage under the hold, and no `beyond_history` refusal (a flagged residual-life tail instead; #10210) | after `merge_wait` |
 | `little-v0` | `land` | **floor baseline, never promoted** (#10208): Little's law. For a PR in `review_wait` / `doctor` / `merge_wait`, `items_ahead / drain_rate` for the current stage plus the recency-weighted mean duration of each later stage; interval from a Gamma posterior on the rate (shape = observed exits, 400 seeded draws). Refuses with a zero drain rate and items ahead, or with no queue context; a held PR (`merge_hold`) is refused `blocked`, as by every heuristic that does not model the hold | after `merge_wait` |
 | `land-2026-10-04-twin-otter` | `land` | no history: the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)). PR stages only (`review_wait`, `doctor`, `merge_wait`, `merge_hold`); the blend of a stage-by-stage exit-hazard Monte Carlo (256 paths, seeded per stage visit) and a log-normal direct model (recorded as `twin_otter`; #10222, #10243) | at the merge |
@@ -549,6 +550,95 @@ then applies `shift`.
 - other bases (#10508, #10523);
 - the loom-experiments walk-forward acceptance backtest.
 
+`land-2026-10-06-held-heron` (#10523) ships the same way: registered, not
+current, tier `candidate`, it models the hold, and it is promoted only
+through the #10233 gate. Registration puts it after quick-tern and before
+the twin-otter pair. It depends on #10549, which retires
+`land-2026-10-04-fresh-tide` and raises the live list's alternate cap to 12
+(and the default budget to 13). With that change in place, it is the ninth
+`land` registration and its eight alternates fit the cap.
+
+*Evidence.* Offline (loom-experiments#19: 52 point-in-time daily folds on
+verified history, leak-tested), a competing-risks event simulator alone
+lost to twin-otter-b: pinball4 +1.75 h [+1.13, +2.27]. It won on PRs that
+are sequenced (−11.1 h on the grid set) or held (−2.0 h) at `as_of`. This
+composition beat twin-otter-b: −0.53 h [−0.90, −0.21] over all folds, 31 of
+52 days, and −0.83 h on the 09-28..10-05 test folds. The split was chosen
+after looking at subsets, and the gain sits in the folds since sequencing
+began, so it needs shadow evidence before it can become a default.
+
+*The switching rule.*
+
+| state at `as_of` | answered by |
+|---|---|
+| `merge_hold` | the simulator |
+| `merge_wait` with `loom:sequenced` on the PR | the simulator |
+| anything else, refusals included | twin-otter-b, byte for byte apart from `heuristic` and `estimate_id` |
+
+A hold outranks sequencing. When the simulator lacks evidence, the item is
+answered by twin-otter-b, never by a fabricated chain. Evidence means 5
+exits from the item's side state and 5 free merges, at the repo level and
+then across every repo in the history. An operator hold on a PR that is not
+approved is still twin-otter-b's `blocked` refusal.
+
+*The chain* (`eta::hazard_sim`) has four states plus landed:
+- **Free `merge_wait`** exits by merge, hold entry or sequence entry.
+- **`merge_hold`** exits by release (back to `merge_wait`) or a direct merge.
+- **Sequenced** exits by de-sequence or a merge.
+- **The current spell** (the hold or sequencing the item is in) exits as
+  its state does, with two differences:
+  - Its release or de-sequence hazard is read by the spell's age, in bins
+    at 1, 4, 12, 24 and 72 h. Each bin is shrunk toward the pooled rate by
+    one pseudo-event.
+  - Every exit from a hold, current or later, is multiplied by an
+    **operator-availability** weight by UTC hour of day: that hour's
+    observed hold exits over its expected ones. The weight is shrunk toward
+    1 by two pseudo-events and normalised to an exposure-weighted mean of 1.
+
+The spell age comes from different places per state. For a hold it is the
+hold visit's age. For a sequenced PR it is the time since the flag
+timeline last set `loom:sequenced` (without a timeline, the pooled rate is
+used).
+
+*Point in time.*
+- Every hazard is events ÷ exposure over the 14 days before `as_of`.
+- The sources are the split `merge_wait` / `merge_hold` episodes (#10218),
+  each viewed at `as_of`, and the PR flag timeline (#10245), changes
+  strictly before `as_of`.
+- The flag timeline reaches the estimator as `StageSamples.flag_changes`,
+  copied from the fleet snapshot with its repo.
+- Sequenced time is the part of a `merge_wait` episode covered by a
+  sequenced spell.
+- Censored, not modelled: a Doctor round, a close, and a hold placed over a
+  sequenced PR.
+
+*The forward solution has no draws.* The forward equations are integrated
+in 5-minute steps, each split into 30 substeps, out to 14 days. The hour
+weight and the spell's age bin are read at each step. In every substep a
+state loses `1 − e^{−qΔt}` of its mass, split over its exits. The four
+quantiles are read off the landed mass, and a level not reached by the
+horizon reads as the horizon. There is no conformal layer; a calibrated
+variant would be a new id.
+
+*The record.* `held_heron` holds:
+- `state` (`merge_hold` | `sequenced`), `level` and `window_days`;
+- `rates_per_h` and the `events` and `exposure` behind them;
+- `spell_age_sec` and `age_bounds_sec`;
+- `spell_exit_by_age_per_h` and `hold_exit_by_hour`;
+- `step_sec`, `substeps`, `horizon_sec` and `landed_by_horizon`.
+
+`combination.method` is `held_heron_competing_risks`, with `draws` 0 and
+`rng` `none`. Every number the solution reads is stored rounded to six
+decimals, so `run_explanation` recomputes `result` from the JSON alone.
+
+*Deferred* (#10523):
+- event probabilities in the explanation, shown only behind a recent-rate
+  tracker (raw values run about 2× high out of sample);
+- the held/sequenced subset report in the shadow gate;
+- Champion vs operator holds (needs label actors in the fleet snapshot);
+- covariates on the hazards;
+- coupling a sequenced PR to its predecessor's ETA (#10510).
+
 `little-v0` (#10208) is registered the same way but is a **floor**, not a
 candidate: zero parameters, expected to lose to `land-v2` (long waits are mostly
 PRs held for a human, which a queue model cannot see), reported beside every
@@ -624,7 +714,9 @@ dependency wrapper over a base is registered as its own id
 (`land-2026-10-06-calm-plover` is calibration over `land-v2`;
 `land-2026-10-06-quick-tern` is IPCW calibration over, and
 `land-2026-10-06-tandem-wren` the dependency wrapper over,
-`land-2026-10-04-twin-otter-b`). It is never
+`land-2026-10-04-twin-otter-b`; `land-2026-10-06-held-heron` is
+twin-otter-b with held and sequenced PRs routed to the hold simulator). It
+is never
 an automatic cross product of wrappers × bases, so each one spends budget
 deliberately.
 
@@ -1262,6 +1354,15 @@ stage entry's so the list is self-contained. The terminal stage's mark is the
 path completion time, so its `p50_at` is exactly `eta_p50_at`; a stage no
 path visits carries `null` times, never a fabricated one. A timeline can be
 drawn from `stage_marks` alone.
+
+`held_heron` (#10523) is how a `land-2026-10-06-held-heron` simulator
+answer recomputes. It is the competing-risks chain for a held or sequenced
+PR: the rates, the evidence and the solution's settings (see
+[the heuristic](#heuristics-and-versioning)). `run_explanation` solves it
+again from `as_of`. `combination.method` is `held_heron_competing_risks`,
+and `path`, `stages`, `branches`, `contributions` and the history fields
+are empty. The field is absent for every other heuristic, and for a
+held-heron answer twin-otter-b served.
 
 `twin_otter` (#10243) is how a fitted estimate recomputes without stage
 grids: `fit_id` and `fit_as_of` (the coefficient file), `input` (the adapted

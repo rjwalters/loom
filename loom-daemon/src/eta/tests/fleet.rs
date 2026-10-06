@@ -632,6 +632,12 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
         "heuristics/land_quick_tern.rs",
         include_str!("../heuristics/land_quick_tern.rs"),
     ),
+    // #10523: the hold/sequence simulator and the heuristic that routes to it.
+    ("hazard_sim.rs", include_str!("../hazard_sim.rs")),
+    (
+        "heuristics/land_held_heron.rs",
+        include_str!("../heuristics/land_held_heron.rs"),
+    ),
     ("twin_otter/mod.rs", include_str!("../twin_otter/mod.rs")),
     ("twin_otter/eval.rs", include_str!("../twin_otter/eval.rs")),
     ("twin_otter/path.rs", include_str!("../twin_otter/path.rs")),

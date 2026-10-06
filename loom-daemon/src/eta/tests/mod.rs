@@ -23,6 +23,7 @@ mod fleet;
 mod fleet_refresh;
 mod fleet_signoz;
 mod friction;
+mod held_heron;
 mod hold_parity;
 mod hold_serving;
 mod item_features;
