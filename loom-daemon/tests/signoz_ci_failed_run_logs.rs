@@ -782,6 +782,39 @@ fn section_eighteen_separates_superseded_from_started_cancellations() {
     assert!((ratio("verified_ratio") - 0.429).abs() < 1e-9, "{r:?}");
 }
 
+/// A run whose `ci.run` record lands just after `since` but whose job record
+/// is stamped just before it still reads as STARTED: `run_jobs` looks back a
+/// day before `since`, so the job join is not cut at the window edge.
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn section_eighteen_keeps_jobs_stamped_just_before_since() {
+    // SINCE (2026-09-20 00:00:00 UTC) is 1789862400; the run lands 1 min
+    // after it, its job 1 h before it.
+    let edge = format!(
+        "INSERT INTO signoz_logs.logs_v2 \
+         (timestamp, body, attributes_string, attributes_number, attributes_bool, resources_string) VALUES\n\
+         (1789862460000000000, 'ci.run', \
+          {{'loom.repo': '{MAIN_REPO}', 'loom.ci.workflow': 'CI', 'loom.ci.conclusion': 'cancelled', \
+            'loom.ci.event': 'push', 'loom.ci.ref': 'main'}}, \
+          {{'loom.ci.run_id': 5009, 'loom.ci.run_attempt': 1}}, {{}}, {{}}),\n\
+         (1789858800000000000, 'ci.job', \
+          {{'loom.repo': '{MAIN_REPO}', 'loom.ci.workflow': 'CI', 'loom.ci.job': 'Build', \
+            'loom.ci.conclusion': 'cancelled'}}, \
+          {{'loom.ci.run_id': 5009, 'loom.ci.attempts': 1, 'loom.ci.job_id': 80009}}, \
+          {{'loom.ci.timed_out': false}}, {{}});"
+    );
+    let rows: Vec<Row> = clickhouse(
+        &format!("{FIXTURE}\n{}\n{edge}\n{};", main_cancel_rows(), section_eighteen()),
+        MAIN_REPO,
+    )
+    .lines()
+    .filter(|l| !l.trim().is_empty())
+    .map(|l| serde_json::from_str(l).expect("JSONEachRow line"))
+    .collect();
+    assert_eq!(num(&rows[0], "cancelled_after_start"), Some(2), "{rows:?}");
+    assert_eq!(num(&rows[0], "superseded_before_start"), Some(3), "{rows:?}");
+}
+
 /// The run-attempt join key is load-bearing: joining on run_id alone would
 /// let attempt 1's job mark attempt 2 (never started) as started.
 #[test]

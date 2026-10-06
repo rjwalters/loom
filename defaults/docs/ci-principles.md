@@ -52,7 +52,13 @@ the next person to add one will have an equally good argument.
    `merge_group_ci::main_cancel` lint fails CI if any workflow change could
    cancel a started `push` or `merge_group` run: a `cancel-in-progress` that
    is not provably false there, a group shared with a cancelling PR run, or a
-   run-cancelling step reachable there.
+   run-cancelling step reachable there. The lint runs on every PR that
+   touches any `.github/workflows/**` file (ci.yml's `Workflow Cancellation
+   Lint` job), not only on Rust changes. One gap is known: concurrency groups
+   are repo-wide, but the lint compares groups only within one workflow, so
+   two *different* workflows sharing a literal group (one on `push`, one
+   cancelling on `pull_request`) is not detected. Keep every group prefixed
+   with its workflow's name, as all current ones are.
 
 3. **Path-filtering is an optimisation, not a correctness tool.** A check that
    can fail because of a file *outside* its path group must not be filtered by

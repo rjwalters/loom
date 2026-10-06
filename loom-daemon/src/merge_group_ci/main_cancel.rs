@@ -62,17 +62,21 @@ impl std::fmt::Display for CancelFinding {
     }
 }
 
-/// Whether a step's body or action cancels workflow runs.
+/// Whether a step's body or action cancels workflow runs. Shell comment
+/// lines (`# ...`) are skipped for every pattern, so a step that only
+/// *mentions* cancelling (`# never gh run cancel here`) is not a cancel step.
 #[must_use]
 pub fn is_cancel_step(step: &Step) -> bool {
     let run_cancels = step.run.as_deref().is_some_and(|r| {
-        r.contains("run cancel")
-            || r.contains("force-cancel")
-            || r.lines().any(|l| {
-                let l = l.trim();
-                !l.starts_with('#')
-                    && (l.contains("/cancel\"") || l.contains("/cancel ") || l.ends_with("/cancel"))
-            })
+        r.lines().any(|l| {
+            let l = l.trim();
+            !l.starts_with('#')
+                && (l.contains("run cancel")
+                    || l.contains("force-cancel")
+                    || l.contains("/cancel\"")
+                    || l.contains("/cancel ")
+                    || l.ends_with("/cancel"))
+        })
     });
     let uses_cancels = step
         .uses
@@ -335,6 +339,16 @@ jobs:
             assert_eq!(f.len(), 1, "{body}: {f:?}");
             assert_eq!(f[0].job.as_deref(), Some("test"));
         }
+    }
+
+    /// A comment that only mentions cancelling is not a cancel step, for
+    /// every pattern (`run cancel`, `force-cancel`, the `/cancel` endpoint).
+    #[test]
+    fn comment_lines_are_not_cancel_steps() {
+        let body = "      - run: |\n          # never __GH__ run cancel here, nor force-cancel, nor POST .../cancel\n          echo ok\n";
+        let src = PR_ONLY_CANCEL_STEP
+            .replace("      - run: cargo test\n", &format!("      - run: cargo test\n{body}"));
+        assert_eq!(lint(&[wf(&src)]), Vec::new());
     }
 
     #[test]

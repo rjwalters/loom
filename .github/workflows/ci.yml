@@ -111,6 +111,7 @@ jobs:
       mcp: ${{ steps.filter.outputs.mcp }}
       scripts: ${{ steps.filter.outputs.scripts }}
       docker: ${{ steps.filter.outputs.docker }}
+      workflows: ${{ steps.filter.outputs.workflows }}
       # Whether anything in this PR can be measured by a gate that runs the
       # shared debug daemon. Computed below, not a raw paths-filter output.
       daemon: ${{ steps.daemon.outputs.needed }}
@@ -231,6 +232,12 @@ jobs:
               - '.github/dependabot.yml'
               - '**/package.json'
               - '.github/workflows/ci.yml'
+            # Every workflow file, for the Workflow Cancellation Lint job
+            # (#10670). The `backend` group lists only ci.yml, so without this
+            # a security.yml-only (or new-workflow) PR would merge with the
+            # main_cancel lint never having run.
+            workflows:
+              - '.github/workflows/**'
 
       # Does this run need the shared debug daemon built at all? (#9113)
       #
@@ -476,6 +483,37 @@ jobs:
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
           retention-days: 14
+
+  # Workflow Cancellation Lint (#10670). The `main_cancel` lint, the
+  # every-workflow parse check and the merge-group audit are Rust unit tests in
+  # `merge_group_ci`, so `backend-tests` runs them -- but only when the
+  # `backend` group matches, and of the workflow files that group lists only
+  # ci.yml. This repo has no merge queue, so the PR run is the only check before
+  # merge: a PR touching only security.yml, codeql.yml, release.yml or a new
+  # workflow would otherwise land with the lint unrun, and the first run to
+  # catch a cancel regression would be the main push it can already cancel.
+  # This job runs just that test module on any `.github/workflows/**` change
+  # (a lib-test build of one crate, not the three-leg suite), and on every push
+  # and merge_group like every other filtered job. On a PR that also matches
+  # `backend` the module runs twice (here and in a backend-tests leg); the
+  # price is one more runner doing a cache-restored lib-test build of one
+  # crate, in parallel, so it adds no wall-clock time to the run.
+  workflow-cancel-lint:
+    name: Workflow Cancellation Lint
+    needs: changes
+    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.workflows == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Lint every workflow for cancellation of a started main run
+        run: cargo test -p loom-daemon --lib merge_group_ci
 
   backend-otlp-feature:
     name: Rust OTLP Feature Build & Test
@@ -2812,6 +2850,7 @@ jobs:
       - node-packages
       - backend-lint-and-check
       - backend-tests
+      - workflow-cancel-lint
       - backend-otlp-feature
       - structural-checks
       - daemon-checks

@@ -1038,7 +1038,9 @@ LIMIT {top:UInt32};
 --     accepted too); edit the literals for a repository whose default branch
 --     differs. A job record can lag its run
 --     record by one poll, so a run cancelled in the last few minutes may
---     briefly read `superseded_before_start`.
+--     briefly read `superseded_before_start`. `run_jobs` reads one day
+--     before `since`, so a run that completed just after `since` keeps the
+--     job records stamped just before it.
 --
 --     Logs-backed (`ci.run` + `ci.job` records): 7 days.
 WITH main_runs AS (
@@ -1062,7 +1064,11 @@ run_jobs AS (
            uniqExact(toUInt64(attributes_number['loom.ci.job_id'])) AS jobs
     FROM signoz_logs.logs_v2
     WHERE body = 'ci.job'
-      AND timestamp >= toUInt64(toUnixTimestamp({since:DateTime})) * 1000000000
+      -- One day of lookback before `since`: a run whose `ci.run` record lands
+      -- just after `since` can have job records stamped just before it, and
+      -- dropping those would misread a started run as superseded.
+      AND timestamp >= (toUInt64(toUnixTimestamp({since:DateTime})) - 86400) * 1000000000
+      AND ({repo:String} = '' OR attributes_string['loom.repo'] = {repo:String})
     GROUP BY repo, run_id, run_attempt
 )
 SELECT r.repo AS repo, r.workflow AS workflow,
