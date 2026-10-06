@@ -86,6 +86,14 @@ pub struct RestPull {
     pub head_sha: Option<String>,
     /// `base.ref` — the branch the PR targets.
     pub base_ref: Option<String>,
+    /// The PR description (#10514: the open-PR guard's `Closes #N` filter).
+    pub body: Option<String>,
+    /// `author_association` (`OWNER` / `MEMBER` / `NONE` …), for the H14 rule.
+    pub author_association: Option<String>,
+    /// `user.type == "Bot"` — an App author.
+    pub author_is_bot: bool,
+    /// `head.repo.full_name` — `None` when GitHub omits it (a deleted fork).
+    pub head_repo: Option<String>,
 }
 
 impl RestPull {
@@ -137,14 +145,48 @@ pub fn list_open_pulls_cached_as(
     repo_override: Option<&str>,
     max_pages: usize,
 ) -> Result<Vec<RestPull>> {
+    list_open_pulls_cached_within(caller, gh_bin, cwd, repo_override, max_pages, None)
+}
+
+/// [`list_open_pulls_cached_as`] with every page read bounded by `timeout`
+/// (`None` = the conditional-read default). The open-PR dispatch guard reads
+/// it under its `reap_gh_timeout` bound (#10514), which a wedged `gh` must not
+/// outlast.
+///
+/// # Errors
+/// As [`list_open_pulls_cached_as`]; a timed-out page is an error.
+pub fn list_open_pulls_cached_within(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    max_pages: usize,
+    timeout: Option<Duration>,
+) -> Result<Vec<RestPull>> {
     let refresh = crate::credential_preflight::force_refresh_owner_credential;
-    list_open_pulls_with_refresh(caller, gh_bin, cwd, repo_override, max_pages, &refresh)
+    let site = store::ConditionalRead::new(caller, PR_LIST_OPEN).within(timeout);
+    list_open_pulls_at(site, gh_bin, cwd, repo_override, max_pages, &refresh)
 }
 
 /// [`list_open_pulls_cached_as`] with the #6171 credential refresh injected
 /// (tests cannot drive the process-global primary-workspace mint).
+#[cfg(test)]
 fn list_open_pulls_with_refresh(
     caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    max_pages: usize,
+    refresh: &dyn Fn(&Path) -> bool,
+) -> Result<Vec<RestPull>> {
+    let site = store::ConditionalRead::new(caller, PR_LIST_OPEN);
+    list_open_pulls_at(site, gh_bin, cwd, repo_override, max_pages, refresh)
+}
+
+/// The listing walk behind [`list_open_pulls_cached_within`], each page read
+/// as `site`.
+fn list_open_pulls_at(
+    site: store::ConditionalRead,
     gh_bin: &Path,
     cwd: Option<&Path>,
     repo_override: Option<&str>,
@@ -154,10 +196,7 @@ fn list_open_pulls_with_refresh(
     let target = resolve(cwd, repo_override);
     let read = |page: usize| -> Result<Vec<RestPull>> {
         let url = build_pulls_url(target.repo.as_deref(), page);
-        let get = || {
-            let site = store::ConditionalRead::new(caller, PR_LIST_OPEN);
-            conditional_get(site, gh_bin, cwd, &target, &url, Kind::Listing)
-        };
+        let get = || conditional_get(site, gh_bin, cwd, &target, &url, Kind::Listing);
         let body = retry_404_once(cwd, &url, refresh, get)?;
         parse_rest_pulls(&body).with_context(|| format!("parse REST pulls JSON from {url}"))
     };
@@ -388,17 +427,26 @@ pub fn parse_rest_pulls(body: &str) -> Result<Vec<RestPull>> {
     struct RawLabel {
         name: String,
     }
+    #[derive(serde::Deserialize)]
+    struct RawRepo {
+        #[serde(default)]
+        full_name: Option<String>,
+    }
     #[derive(serde::Deserialize, Default)]
     struct RawRef {
         #[serde(default, rename = "ref")]
         ref_name: Option<String>,
         #[serde(default)]
         sha: Option<String>,
+        #[serde(default)]
+        repo: Option<RawRepo>,
     }
     #[derive(serde::Deserialize)]
     struct RawUser {
         #[serde(default)]
         login: Option<String>,
+        #[serde(default, rename = "type")]
+        kind: Option<String>,
     }
     #[derive(serde::Deserialize)]
     struct RawPull {
@@ -421,12 +469,20 @@ pub fn parse_rest_pulls(body: &str) -> Result<Vec<RestPull>> {
         head: Option<RawRef>,
         #[serde(default)]
         base: Option<RawRef>,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        author_association: Option<String>,
     }
     let rows: Vec<RawPull> = serde_json::from_str(body.trim())?;
     Ok(rows
         .into_iter()
         .map(|r| {
             let head = r.head.unwrap_or_default();
+            let author_is_bot = r
+                .user
+                .as_ref()
+                .is_some_and(|u| u.kind.as_deref() == Some("Bot"));
             RestPull {
                 number: r.number,
                 state: r.state,
@@ -439,6 +495,10 @@ pub fn parse_rest_pulls(body: &str) -> Result<Vec<RestPull>> {
                 head_ref: head.ref_name,
                 head_sha: head.sha,
                 base_ref: r.base.and_then(|b| b.ref_name),
+                body: r.body,
+                author_association: r.author_association,
+                author_is_bot,
+                head_repo: head.repo.and_then(|repo| repo.full_name),
             }
         })
         .collect())

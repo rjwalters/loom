@@ -42,6 +42,8 @@ pub mod clean;
 pub(crate) mod clean_owner;
 pub mod gh;
 pub mod landed;
+/// Leg 0 of both open-linked-PR probes: the cached open-PR listing (#10514).
+pub(crate) mod linked_pr_listing;
 pub(crate) mod liveness;
 pub mod logs;
 /// `pub` rather than `pub(crate)` since #9444: the `record-rework` subcommand

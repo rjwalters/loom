@@ -233,12 +233,26 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) {
 pub(crate) struct ConditionalRead {
     pub(crate) caller: &'static str,
     pub(crate) op: crate::forge_call_stats::ForgeOp,
+    /// The read's deadline; `None` = [`FETCH_TIMEOUT`].
+    pub(crate) timeout: Option<std::time::Duration>,
 }
 
 impl ConditionalRead {
     #[must_use]
     pub(crate) const fn new(caller: &'static str, op: crate::forge_call_stats::ForgeOp) -> Self {
-        Self { caller, op }
+        Self {
+            caller,
+            op,
+            timeout: None,
+        }
+    }
+
+    /// This read bounded by `timeout` instead of [`FETCH_TIMEOUT`] (`None`
+    /// keeps the default) — for a caller on a latency-bounded path (#10514).
+    #[must_use]
+    pub(crate) const fn within(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 
@@ -411,11 +425,12 @@ fn run_fetch_with(
     role: crate::forge_identity::IdentityRole,
     bucket: Option<&str>,
 ) -> Result<FetchResult> {
+    let timeout = site.timeout.unwrap_or(FETCH_TIMEOUT);
     let mut inv = GhInvocation::new(
         Operation::new(site.caller),
         AccessIntent::Read,
         GhTarget::None,
-        FETCH_TIMEOUT,
+        timeout,
     )
     .forge_op(site.op)
     // Accounting only (#9831): the resolved host and repo, as two fields.
@@ -450,7 +465,7 @@ fn run_fetch_with(
         .execute()
     {
         Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
-        Ok(_) => anyhow::bail!("gh api {url} timed out after {}s", FETCH_TIMEOUT.as_secs()),
+        Ok(_) => anyhow::bail!("gh api {url} timed out after {}s", timeout.as_secs()),
         Err(e) => return Err(e).with_context(|| format!("failed to invoke {}", gh_bin.display())),
     };
     let response = parse_http_response(&String::from_utf8_lossy(&out.stdout));
