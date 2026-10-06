@@ -146,7 +146,7 @@ policy, or one with an unknown `schemaVersion`, is never treated as observe-only
 ## The managed `gh` launcher (Loom consumes it; it does not provision it)
 
 On a policy-governed host every `gh` is 2am's managed launcher
-(`scripts/gh-managed.py`, 2AMLogic/2am#2002), provisioned as an executable named
+(`scripts/gh-managed.py`, 2am#2002), provisioned as an executable named
 `gh` at `toolchain.launcherPath`. Provisioning it is host/image/CI work
 (2am#1931 / #1928); Loom ships no second implementation of that security
 boundary. To use it, point `toolchain.launcherPath` at the provisioned file (and
