@@ -239,7 +239,7 @@ fn an_open_closing_pr_is_not_read_individually() {
     );
     let (out, _) = run(&mut fake);
     assert!(fake.state_calls.is_empty(), "{:?}", fake.state_calls);
-    assert_eq!(verdict_of(&out[0]), Verdict::StillBlocked);
+    assert_eq!(verdict_of(&out[0]), Verdict::Undocumented);
 }
 
 // --- fail-safe ------------------------------------------------------------------
@@ -405,16 +405,16 @@ fn verdicts_match_the_existing_fixtures() {
         Verdict::Stale(r) => assert!(r[0].contains("7:CLOSED"), "{r:?}"),
         v => panic!("178: {v:?}"),
     }
-    match verdict_of(find(&out, 179)) {
-        Verdict::Stale(r) => assert!(r[0].contains("checklist"), "{r:?}"),
-        v => panic!("179: {v:?}"),
-    }
-    match verdict_of(find(&out, 190)) {
-        Verdict::Stale(r) => {
-            assert!(r[0].contains("4743:MERGED:block-label:n/a"), "{r:?}");
+    // #9274: resolved refs on UNCHECKED boxes are Unticked, never Stale.
+    assert_eq!(
+        verdict_of(find(&out, 179)),
+        Verdict::Unticked {
+            resolved_refs: vec!["other/repo#176".to_string(), "#177".to_string()],
+            unparsed: 0
         }
-        v => panic!("190: {v:?}"),
-    }
+    );
+    // #9274: a merged closing PR is not a blocker reference.
+    assert_eq!(verdict_of(find(&out, 190)), Verdict::Undocumented);
     assert_eq!(verdict_of(find(&out, 180)), Verdict::Undocumented);
     assert_eq!(
         verdict_of(find(&out, 183)),
@@ -498,7 +498,7 @@ fn ref_state_reads_issues_and_prs_from_one_endpoint() {
     let closed_pr =
         parse_ref_state(r#"{"state":"closed","pull_request":{"merged_at":null}}"#).unwrap();
     // #10556: a closed-unmerged PR is told apart from a closed issue.
-    assert_eq!(closed_pr.state, "CLOSED");
+    assert_eq!(closed_pr.state, "CLOSED_UNMERGED");
     assert!(closed_pr.is_pr);
     let open_pr = parse_ref_state(r#"{"state":"open","pull_request":{}}"#).unwrap();
     assert_eq!(open_pr.state, "OPEN");

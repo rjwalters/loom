@@ -150,6 +150,7 @@ impl StaleBlockedArgs {
 
         let mut stale: Vec<Finding> = Vec::new();
         let mut superseded: Vec<Finding> = Vec::new();
+        let mut unticked: Vec<Finding> = Vec::new();
         let mut undocumented: Vec<Finding> = Vec::new();
         let mut prose_only: Vec<Finding> = Vec::new();
         let mut unevaluated: Vec<(String, String)> = Vec::new();
@@ -179,6 +180,7 @@ impl StaleBlockedArgs {
             match finding.verdict {
                 Verdict::Stale(_) => stale.push(finding),
                 Verdict::Superseded { .. } => superseded.push(finding),
+                Verdict::Unticked { .. } => unticked.push(finding),
                 Verdict::Undocumented => undocumented.push(finding),
                 Verdict::StillBlocked => {}
             }
@@ -187,6 +189,7 @@ impl StaleBlockedArgs {
         let sections = Sections {
             stale: &stale,
             superseded: &superseded,
+            unticked: &unticked,
             undocumented: &undocumented,
             prose_only: &prose_only,
             unevaluated: &unevaluated,
@@ -209,6 +212,7 @@ impl StaleBlockedArgs {
 struct Sections<'a> {
     stale: &'a [Finding],
     superseded: &'a [Finding],
+    unticked: &'a [Finding],
     undocumented: &'a [Finding],
     prose_only: &'a [Finding],
     unevaluated: &'a [(String, String)],
@@ -221,6 +225,7 @@ impl Sections<'_> {
     fn any(&self) -> bool {
         !self.stale.is_empty()
             || !self.superseded.is_empty()
+            || !self.unticked.is_empty()
             || !self.undocumented.is_empty()
             || !self.prose_only.is_empty()
     }
@@ -246,7 +251,11 @@ fn report(s: &Sections<'_>, quiet: bool) {
     }
 
     if s.any() {
-        let n = s.stale.len() + s.superseded.len() + s.undocumented.len() + s.prose_only.len();
+        let n = s.stale.len()
+            + s.superseded.len()
+            + s.unticked.len()
+            + s.undocumented.len()
+            + s.prose_only.len();
         let _ = writeln!(w);
         let _ = writeln!(w, "{}", "=".repeat(72));
         let _ = writeln!(
@@ -383,6 +392,34 @@ fn report(s: &Sections<'_>, quiet: bool) {
         return;
     }
 
+    if !s.unticked.is_empty() {
+        let _ = writeln!(w);
+        let _ = writeln!(
+            w,
+            "CHECKLIST REFS RESOLVED, BOXES UNTICKED: confirm each condition, tick it, or \
+             unpark ({}):",
+            s.unticked.len()
+        );
+        for f in s.unticked {
+            let _ = writeln!(w, "  {} {}", f.reference(), f.title);
+            if let Verdict::Unticked {
+                resolved_refs,
+                unparsed,
+            } = &f.verdict
+            {
+                let _ = writeln!(w, "      - refs resolved: {}", resolved_refs.join(", "));
+                if *unparsed > 0 {
+                    let _ =
+                        writeln!(w, "      - {unparsed} unchecked line(s) carry no readable ref");
+                }
+            }
+        }
+        let _ = writeln!(
+            w,
+            "  An unticked box is unmet: a merge or close does not prove its whole condition."
+        );
+    }
+
     // Only when something was examined: an empty population stays silent.
     if s.cost.projected != budget::Projection::default() {
         let _ = writeln!(w, "{}", s.cost.summary());
@@ -398,10 +435,11 @@ fn report(s: &Sections<'_>, quiet: bool) {
 
     if s.any() {
         println!(
-            "[stale-blocked] WARNING: {} stale, {} superseded, {} undocumented, {} prose-only \
-             loom:blocked artifact(s). See stderr for details.",
+            "[stale-blocked] WARNING: {} stale, {} superseded, {} unticked, {} undocumented, \
+             {} prose-only loom:blocked artifact(s). See stderr for details.",
             s.stale.len(),
             s.superseded.len(),
+            s.unticked.len(),
             s.undocumented.len(),
             s.prose_only.len()
         );
@@ -453,6 +491,22 @@ fn print_json(s: &Sections<'_>) {
             v
         })
         .collect();
+    let unticked_json: Vec<_> = s
+        .unticked
+        .iter()
+        .map(|f| {
+            let mut v = row(f);
+            if let Verdict::Unticked {
+                resolved_refs,
+                unparsed,
+            } = &f.verdict
+            {
+                v["resolved_refs"] = serde_json::json!(resolved_refs);
+                v["unparsed"] = serde_json::json!(unparsed);
+            }
+            v
+        })
+        .collect();
     let undoc_json: Vec<_> = s.undocumented.iter().map(row).collect();
     let prose_only_json: Vec<_> = s.prose_only.iter().map(row).collect();
     let uneval_json: Vec<_> = s
@@ -465,6 +519,7 @@ fn print_json(s: &Sections<'_>) {
         serde_json::json!({
             "stale": stale_json,
             "superseded": superseded_json,
+            "unticked": unticked_json,
             "undocumented": undoc_json,
             "prose_only": prose_only_json,
             "unevaluated": uneval_json,

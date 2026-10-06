@@ -141,6 +141,10 @@ pub struct Evidence {
     /// is resolved against the local repo — a cross-repo number there would be
     /// read as a different local artifact.
     pub remote: Vec<RemoteRef>,
+    /// Unchecked `## Dependencies` lines that `named::parse_entries` cannot read
+    /// (no `#N` directly after the box, or no ref at all). They are unmet
+    /// prerequisites that must not drop out of the count (#9274).
+    pub unparsed_unchecked: usize,
     /// For a parked **PR**: its own superseding block, if any
     /// ([`park_self_block`]). Always `None` for an issue, whose superseding-block
     /// question is answered by [`Evidence::closing`] instead.
@@ -175,8 +179,7 @@ impl RemoteRef {
 /// own.
 #[must_use]
 pub fn undeclared(e: &Evidence) -> bool {
-    let has_reference =
-        !e.named.is_empty() || !e.prose.is_empty() || !e.closing.is_empty() || !e.remote.is_empty();
+    let has_reference = !e.named.is_empty() || !e.prose.is_empty() || !e.remote.is_empty();
     has_reference && e.declared.is_empty()
 }
 
@@ -228,8 +231,11 @@ pub enum Verdict {
     /// line per triggering signal — an issue can be stale in more than one
     /// way at once, and which signal fired is the whole value of the report.
     Stale(Vec<String>),
-    /// `loom:blocked` with no parseable blocker reference anywhere in the body
-    /// or comments (#8927's item 4, and its #180 evidence row). Not
+    /// `loom:blocked` with no parseable blocker reference. Scope (#9274): a
+    /// `## Dependencies` checklist and a park record are read from the **body
+    /// only**; prose phrases (`Blocked by #N`, ...) from the body and non-fleet
+    /// comments. A linked closing PR is not a blocker reference (#8927's item
+    /// 4, and its #180 evidence row). Not
     /// verifiable or clearable by anyone who was not present when it was
     /// applied — a defect on its own terms, independent of whether the block
     /// is real.
@@ -246,76 +252,96 @@ pub enum Verdict {
         /// What supersedes them.
         block: String,
     },
+    /// Every parseable unchecked `## Dependencies` entry is satisfied, but a
+    /// box is still unticked or an unchecked line could not be parsed (#9274).
+    /// An unchecked box is unmet until a human confirms its whole condition, so
+    /// this is never folded into [`Verdict::Stale`].
+    Unticked {
+        /// The satisfied entries' references, e.g. `#187`.
+        resolved_refs: Vec<String>,
+        /// Unchecked lines no parser could read.
+        unparsed: usize,
+    },
     /// A blocker is cited and is still open. The expected, non-event case.
     StillBlocked,
 }
 
-/// Whether a forge state string means "no longer open".
+/// Whether a forge state string means the blocker is satisfied.
 ///
-/// `MERGED` and `CLOSED`-without-merging both count as resolved, matching
-/// [`named::verdict`]'s own rule and `curator.md`'s "When Dependencies
-/// Complete". Anything else — including an empty or unrecognised string — is
-/// treated as still open, because this check must never manufacture a stale
-/// verdict out of a state it did not understand.
+/// `MERGED` (a PR) and `CLOSED` (an issue; a PR closed without merging is
+/// `CLOSED_UNMERGED`, see `batch::parse_ref_state`) are satisfied. A
+/// closed-unmerged PR is abandoned work and is NOT satisfied (#9274), nor is
+/// `OPEN` or any empty/unrecognised string: this check must never manufacture a
+/// stale verdict out of a state it did not understand.
+///
+/// This is deliberately local: `named::verdict` / `premise::compute` feed
+/// Curator's dep-recheck `CONCLUSION_HASH` and keep their own rule.
 #[must_use]
-fn resolved(state: &str) -> bool {
+pub fn resolved(state: &str) -> bool {
     state == "MERGED" || state == "CLOSED"
+}
+
+/// Count unchecked (`- [ ]` / `* [ ]`) lines in the body's `## Dependencies`
+/// section, parseable or not.
+#[must_use]
+pub(crate) fn unchecked_lines(body: &str) -> usize {
+    let re = regex::Regex::new(r"^[ \t]*[-*][ \t]*\[ \]").expect("static regex");
+    named::dependencies_section(body)
+        .lines()
+        .filter(|l| re.is_match(l))
+        .count()
 }
 
 /// Classify one issue's evidence.
 ///
 /// Order matters only for the undocumented case: "no reference at all" is
 /// answered first, because with nothing cited there is nothing whose staleness
-/// could be assessed.
+/// could be assessed. A linked closing PR is not a reference (#9274): it answers
+/// "what closes this issue", not "what blocks it".
 ///
-/// A *mixed* reference set — one blocker closed, another still open — is
-/// reported as [`Verdict::Stale`], not `StillBlocked`. That is
-/// [`premise::compute`]'s existing rule ("`stale-premise` iff **any**
-/// reference is no longer OPEN") applied consistently to the other two shapes,
-/// and it is the right direction for an advisory: the issue's stated grounds
-/// have partially moved, which is worth a human's ten seconds. Suppressing it
-/// until the *last* blocker cleared is how #178 stayed invisible for eleven
-/// months.
+/// A *mixed* prose reference set — one blocker satisfied, another still open —
+/// is reported as [`Verdict::Stale`], not `StillBlocked`: the issue's stated
+/// grounds have partially moved, which is worth a human's ten seconds.
+/// Suppressing it until the *last* blocker cleared is how #178 stayed invisible
+/// for eleven months. The `## Dependencies` checklist is stricter: an unchecked
+/// box is unmet whatever refs its line mentions, so it is Stale only when every
+/// box is ticked.
 #[must_use]
 pub fn classify(e: &Evidence) -> Verdict {
-    let has_named = !e.named.is_empty();
+    let has_checklist = !e.named.is_empty() || e.unparsed_unchecked > 0;
     let has_prose = !e.prose.is_empty();
-    let has_closing = !e.closing.is_empty();
     let has_remote = !e.remote.is_empty();
 
-    if !has_named && !has_prose && !has_closing && !has_remote {
+    if !has_checklist && !has_prose && !has_remote {
         return Verdict::Undocumented;
     }
 
     let mut reasons = Vec::new();
+    let mut unticked: Option<Verdict> = None;
 
-    // (a) The `## Dependencies` checklist. `named::verdict` is `clear` iff no
-    // unchecked entry is still OPEN, so `clear` with a non-empty checklist is
-    // exactly "every stated prerequisite is resolved or ticked".
-    if has_named && named::verdict(&e.named) == "clear" {
-        reasons.push(format!(
-            "every `## Dependencies` checklist entry is resolved or ticked: {}",
-            one_line(&named::deps_lines(&e.named))
-        ));
+    // (a) The `## Dependencies` checklist.
+    if has_checklist {
+        let unchecked: Vec<&named::Dep> = e.named.iter().filter(|d| !d.checked).collect();
+        let satisfied = |d: &&named::Dep| resolved(d.state.as_deref().unwrap_or(""));
+        if unchecked.is_empty() && e.unparsed_unchecked == 0 {
+            reasons.push(format!(
+                "every `## Dependencies` checklist entry is ticked: {}",
+                one_line(&named::deps_lines(&e.named))
+            ));
+        } else if !unchecked.is_empty() && unchecked.iter().all(satisfied) {
+            unticked = Some(Verdict::Unticked {
+                resolved_refs: unchecked.iter().map(|d| d.reference()).collect(),
+                unparsed: e.unparsed_unchecked,
+            });
+        }
     }
 
     // (b) Prose `Blocked by #N` / `Depends on #N` / `Requires #N` / `**Epic**
     // #N` references, from the body and every non-bot comment.
-    if has_prose && premise::compute(&e.prose).verdict == "stale-premise" {
+    if e.prose.iter().any(|r| resolved(&r.state)) {
         reasons.push(format!(
             "a cited blocker is no longer open: {}",
             one_line(&premise::refs_lines(&e.prose))
-        ));
-    }
-
-    // (c) A linked closing PR. `recheck::verdict` is deliberately NOT consulted
-    // here: it answers "is this PR blocked" (open + a superseding label or a
-    // conflict), which is a different question. What makes the ISSUE's block
-    // stale is the PR no longer being open at all.
-    if has_closing && e.closing.iter().all(|p| resolved(&p.state)) {
-        reasons.push(format!(
-            "every linked closing PR is merged or closed: {}",
-            one_line(&recheck::blockers(&e.closing))
         ));
     }
 
@@ -327,7 +353,7 @@ pub fn classify(e: &Evidence) -> Verdict {
     }
 
     if reasons.is_empty() {
-        return Verdict::StillBlocked;
+        return unticked.unwrap_or(Verdict::StillBlocked);
     }
 
     // (d) The #4634/#7267 superseding-block gate, PR side (#8925). Applied LAST,
