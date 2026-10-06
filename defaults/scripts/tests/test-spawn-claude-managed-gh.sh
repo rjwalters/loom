@@ -80,6 +80,16 @@ check "helper failure (/bin/false) with a policy configured refuses" '[[ $RC -eq
 run /bin/false env -u LOOM_FORGE_EGRESS_POLICY LOOM_FORGE_EGRESS_MANAGED=1
 check "managed marker + no capable daemon refuses" '[[ $RC -eq 78 && ! -s "$DOCKER_LOG" ]]'
 
+# A root-owned 0700 policy dir hides policy.json from `-e`; the dir itself
+# must still count as a policy host (#10446 review).
+mkdir -p "$T/etc-forge-egress" && touch "$T/etc-forge-egress/policy.json" && chmod 000 "$T/etc-forge-egress"
+run /bin/false env -u LOOM_FORGE_EGRESS_POLICY LOOM_FORGE_EGRESS_PROBE_DIRS="$T/etc-forge-egress"
+check "unsearchable policy dir + no capable daemon refuses" '[[ $RC -eq 78 && ! -s "$DOCKER_LOG" ]]'
+chmod 700 "$T/etc-forge-egress"
+
+run "$T/bin/fake-daemon" FAKE_RAW="loom-forge-egress: bogus"
+check "an unknown status word refuses" '[[ $RC -eq 78 && ! -s "$DOCKER_LOG" ]]'
+
 run /bin/false env -u LOOM_FORGE_EGRESS_POLICY
 check "no policy + no helper keeps legacy behaviour (docker reached)" '[[ $RC -eq 0 && -s "$DOCKER_LOG" ]]'
 check "no policy + no helper: GH_TOKEN forwarded by name" 'grep -q -- "-e GH_TOKEN" "$DOCKER_LOG"'

@@ -228,10 +228,8 @@ impl WorkerEgress {
         })
     }
 
-    /// Resolve from the live process. Off in a unit-test build and under
-    /// [`crate::gh_invocation::resolver::NO_POLICY_LAUNCHER_ENV`], like the
-    /// resolver's policy rung, so a policy on the test host cannot alter a
-    /// golden spawn env.
+    /// Resolve from the live process. Off in a unit-test build only, so a
+    /// policy on the test host cannot alter a golden spawn env.
     #[must_use]
     pub fn from_process() -> Option<Self> {
         Self::try_from_process().ok().flatten()
@@ -246,14 +244,20 @@ impl WorkerEgress {
     }
 
     /// [`Self::admit`] against the live process (off, i.e. unconfigured, in a
-    /// unit-test build and under the resolver's opt-out, like
-    /// [`Self::from_process`]).
+    /// unit-test build only).
+    ///
+    /// Deliberately NOT gated on the resolver's
+    /// [`crate::gh_invocation::resolver::NO_POLICY_LAUNCHER_ENV`] opt-out:
+    /// that only lets a test's stub `gh` outrank the policy launcher for the
+    /// daemon's own `gh` (and `forge egress assert` reports it). It must never
+    /// relax credential admission — honouring it here turned a `required` or
+    /// managed-marker host into `unconfigured` and forwarded `GH_TOKEN`
+    /// (#10446 review).
     ///
     /// # Errors
     /// The [`Finding`] naming the policy or launcher failure.
     pub fn admit_process() -> Result<Admission, Box<Finding>> {
-        use crate::gh_invocation::resolver::{policy_rung_declined, NO_POLICY_LAUNCHER_ENV};
-        if cfg!(test) || policy_rung_declined(std::env::var_os(NO_POLICY_LAUNCHER_ENV).as_deref()) {
+        if cfg!(test) {
             return Ok(Admission::default());
         }
         Self::admit(&PolicySources::from_process(None))

@@ -781,20 +781,34 @@ if [[ "$CONTAINMENT_ENABLED" == "1" ]]; then
         while IFS= read -r _containment_gh_line; do # Bash 3.2: no mapfile
             _containment_gh+=("$_containment_gh_line")
         done <<<"$_containment_gh_out"
-    elif [[ -z "${LOOM_FORGE_EGRESS_POLICY:-}${LOOM_FORGE_EGRESS_MANAGED:-}" && ! -e /etc/loom/forge-egress/policy.json \
-        && ! -e /etc/2am/github-egress/policy.json && ! -e /etc/loom/forge-egress/managed ]]; then
-        _containment_gh=("loom-forge-egress: unconfigured")
-        for _containment_var in GH_TOKEN GITHUB_TOKEN; do
-            if [[ -n "${!_containment_var+x}" ]]; then _containment_gh+=(-e "$_containment_var"); fi
+    else
+        # No capable daemon: only a host with nothing policy-shaped keeps the
+        # legacy credentials. Probe the policy DIRECTORIES, not the files: a
+        # root-owned 0700 dir hides its policy/marker from `-e` (EACCES), and
+        # like the daemon only "not there at all" means absent. The env list
+        # can only ADD directories (tests), never remove the fixed two.
+        _containment_gh_policy="${LOOM_FORGE_EGRESS_POLICY:-}${LOOM_FORGE_EGRESS_MANAGED:-}"
+        # shellcheck disable=SC2086 # word-split the optional extra dirs
+        for _containment_var in /etc/loom/forge-egress /etc/2am/github-egress ${LOOM_FORGE_EGRESS_PROBE_DIRS:-}; do
+            if [[ -e "$_containment_var" || -L "$_containment_var" ]]; then _containment_gh_policy+="$_containment_var"; fi
         done
-        if [[ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" && -n "${HOME:-}" && -d "${HOME}/.config/gh" ]]; then
-            _containment_gh+=(-v "${HOME}/.config/gh:${HOME}/.config/gh:ro")
+        if [[ -z "$_containment_gh_policy" ]]; then
+            _containment_gh=("loom-forge-egress: unconfigured")
+            for _containment_var in GH_TOKEN GITHUB_TOKEN; do
+                if [[ -n "${!_containment_var+x}" ]]; then _containment_gh+=(-e "$_containment_var"); fi
+            done
+            if [[ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" && -n "${HOME:-}" && -d "${HOME}/.config/gh" ]]; then
+                _containment_gh+=(-v "${HOME}/.config/gh:${HOME}/.config/gh:ro")
+            fi
         fi
     fi
-    if [[ "${_containment_gh[0]:-}" != "loom-forge-egress: "* ]]; then
-        log_error "spawn-claude: no explicit forge egress answer (a refused policy, a failed helper, or a policy host without a capable loom-daemon) — refusing to mount ~/.config/gh or forward GH_TOKEN/GITHUB_TOKEN (#9987)."
-        exit 78 # EX_CONFIG
-    fi
+    case "${_containment_gh[0]:-}" in
+        "loom-forge-egress: managed" | "loom-forge-egress: unconfigured" | "loom-forge-egress: observe-unmanaged") ;;
+        *)
+            log_error "spawn-claude: no explicit forge egress answer (a refused policy, a failed helper, or a policy host without a capable loom-daemon) — refusing to mount ~/.config/gh or forward GH_TOKEN/GITHUB_TOKEN (#9987)."
+            exit 78 # EX_CONFIG
+            ;;
+    esac
     _containment_mounts+=("${_containment_gh[@]:1}")
     # Git commit identity (check-git-identity.sh's global user.name/user.email).
     if [[ -n "${HOME:-}" && -f "${HOME}/.gitconfig" ]]; then

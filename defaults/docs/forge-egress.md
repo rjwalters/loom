@@ -156,6 +156,9 @@ machine-origin policy. A repo-origin policy never chooses an executable.
 What Loom does with `launcherPath` (all no-ops with no policy):
 
 - **Daemon `gh`** — the resolver's first rung (see `NO_POLICY_LAUNCHER_ENV`).
+  That opt-out affects only which `gh` the daemon execs: worker and container
+  credential admission ignores it, so it can never turn a `required` or
+  managed-marker host into `unconfigured` (#10446).
 - **Bare-metal workers** — `loom-daemon spawn-worker` puts the launcher's
   directory first on the worker `PATH` (ahead of the `gh-cached` front, which is
   therefore bypassed under a policy). Under `enforcement.api = required` a worker
@@ -163,7 +166,11 @@ What Loom does with `launcherPath` (all no-ops with no policy):
 - **Containers** (`spawn-claude.sh`, native containment) — the launcher directory,
   `toolchain.upstreamGhPath`, the policy file and the `principal.credentialRef`
   file (`file:/abs/path`) are mounted read-only at their host paths, and
-  `LOOM_FORGE_EGRESS_POLICY` / `GITHUB_EGRESS_POLICY` name the policy. `~/.config/gh`
+  `LOOM_FORGE_EGRESS_POLICY` / `GITHUB_EGRESS_POLICY` name the policy. The
+  whole launcher directory is mounted, so give `launcherPath` a dedicated
+  directory: a shared one such as `/usr/local/bin` would shadow the image's
+  copy (where `docker/worker/Dockerfile` installs `loom-daemon`) and expose
+  its siblings. `~/.config/gh`
   is not mounted and `GH_TOKEN` / `GITHUB_TOKEN` are not forwarded. The launcher
   is Python 3: under `required`, an image without `python3` is refused
   (`toolchain.launcher-python3-missing`) and so is one whose `gh` does not
