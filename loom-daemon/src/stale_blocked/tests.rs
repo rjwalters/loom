@@ -549,3 +549,62 @@ fn a_closed_local_number_does_not_clear_a_cross_repo_blocker() {
     };
     assert_eq!(cited_among(Artifact::Issue, &local, &[5]), vec![5]);
 }
+
+// --- HeldWithReason (#10558) ---------------------------------------------------
+
+fn held(by: &str, reason: &str) -> Option<Held> {
+    Some(Held {
+        by: Some(by.to_string()),
+        reason: reason.to_string(),
+    })
+}
+
+#[test]
+fn a_reason_only_record_is_held_with_reason_not_undocumented() {
+    let e = Evidence {
+        held: held("curator", "waiting on a ruling"),
+        ..Evidence::default()
+    };
+    assert_eq!(
+        classify(&e),
+        Verdict::HeldWithReason {
+            by: Some("curator".to_string()),
+            reason: "waiting on a ruling".to_string(),
+        }
+    );
+}
+
+#[test]
+fn an_unstated_record_with_no_reason_stays_undocumented() {
+    // `held` is only ever populated from a non-empty reason (batch.rs), so an
+    // `(unstated)` record with an empty reason arrives as `held: None`.
+    assert_eq!(classify(&Evidence::default()), Verdict::Undocumented);
+}
+
+#[test]
+fn a_reason_record_plus_a_numbered_ref_is_classified_by_the_ref() {
+    let e = Evidence {
+        prose: vec![prose_ref(7, "CLOSED")],
+        held: held("curator", "x"),
+        ..Evidence::default()
+    };
+    assert!(matches!(classify(&e), Verdict::Stale(_)));
+    let open = Evidence {
+        prose: vec![prose_ref(7, "OPEN")],
+        held: held("curator", "x"),
+        ..Evidence::default()
+    };
+    assert_eq!(classify(&open), Verdict::StillBlocked);
+}
+
+#[test]
+fn a_daemon_hold_record_is_held_with_reason() {
+    let e = Evidence {
+        held: held("daemon", "pr-less hold"),
+        ..Evidence::default()
+    };
+    assert!(matches!(
+        classify(&e),
+        Verdict::HeldWithReason { by: Some(b), .. } if b == "daemon"
+    ));
+}

@@ -113,6 +113,13 @@ pub trait StaleBlockedForge {
     /// The listing did not answer completely.
     fn list_blocked(&mut self) -> Result<Vec<RestIssue>>;
 
+    /// Every open item labelled `loom:blocked-unnamed` (#10558), which may no
+    /// longer carry `loom:blocked`.
+    ///
+    /// # Errors
+    /// The listing did not answer completely.
+    fn list_unnamed(&mut self) -> Result<Vec<RestIssue>>;
+
     /// Every comment on an issue or PR, oldest first.
     ///
     /// # Errors
@@ -193,6 +200,7 @@ struct Pending {
     /// Unchecked `## Dependencies` lines `named::parse_entries` cannot read.
     unparsed_unchecked: usize,
     declared: Vec<crate::park_record::BlockerRef>,
+    held: Option<super::Held>,
     closing: Vec<ClosingRef>,
     failed: Option<String>,
 }
@@ -353,6 +361,7 @@ fn read_text(
         named: Vec::new(),
         unparsed_unchecked: 0,
         declared: Vec::new(),
+        held: None,
         closing: Vec::new(),
         failed: None,
         row,
@@ -397,6 +406,13 @@ fn read_text(
         .collect();
     // The park record is read from the BODY only (#8925).
     p.declared = crate::park_record::blockers(&p.body);
+    p.held = crate::park_record::parse(&p.body)
+        .into_iter()
+        .find(|r| r.blocker.is_none() && r.reason.as_deref().is_some_and(|x| !x.trim().is_empty()))
+        .map(|r| super::Held {
+            by: r.by,
+            reason: r.reason.unwrap_or_default().trim().to_string(),
+        });
     if kind == Artifact::Issue {
         p.named = named::parse_entries(&p.body);
         p.unparsed_unchecked = super::unchecked_lines(&p.body)
@@ -605,6 +621,7 @@ fn evidence_for(
         declared: p.declared.clone(),
         remote,
         self_block: None,
+        held: p.held.clone(),
     };
     if p.kind == Artifact::Pr && matches!(classify(&evidence), Verdict::Stale(_)) {
         guard.core(&forge.meter())?;
@@ -713,6 +730,17 @@ impl StaleBlockedForge for GhStaleBlockedForge {
             Some(&self.root),
             self.repo.as_deref(),
             "loom:blocked",
+            "open",
+        )
+    }
+
+    fn list_unnamed(&mut self) -> Result<Vec<RestIssue>> {
+        crate::forge_listing::list_issues_cached_all_as(
+            CALLER,
+            &self.gh_bin,
+            Some(&self.root),
+            self.repo.as_deref(),
+            super::unnamed::UNNAMED_LABEL,
             "open",
         )
     }

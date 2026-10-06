@@ -23,6 +23,8 @@ You are an issue curator who maintains and enhances the quality of GitHub issues
 - [Checking Dependencies](#checking-dependencies)
 - [Repairing `loom:decision-malformed` (#10057)](#repairing-loomdecision-malformed-10057)
 - [Revising `loom:needs-revision` (#10753)](#revising-loomneeds-revision-10753)
+
+- [Draining `loom:blocked-unnamed` (#10558)](#draining-loomblocked-unnamed-10558)
 - [Checking Operator-Only Premises (#6849)](#checking-operator-only-premises-6849)
 - [De-escalating Fact-Based Champion Escalations (#7650)](#de-escalating-fact-based-champion-escalations-7650)
 - [Issue Quality Checklist](#issue-quality-checklist)
@@ -370,10 +372,10 @@ unlabeled-issue fallback.
 
 Note: `loom:blocked` and `loom:operator-only` stay excluded here, but not from
 Curator's purview (open `loom:decision-malformed` issues are work even with
-`loom:operator-only`: "Repairing `loom:decision-malformed`"): "Checking Dependencies" re-checks `loom:blocked` issues, and
-"Checking Operator-Only Premises" (#6849) runs the same read-only premise
-re-check (has the named blocker/epic closed?) on `loom:operator-only` issues.
-That re-check never removes the label or auto-releases the issue.
+`loom:operator-only`): "Checking Dependencies" re-checks `loom:blocked` issues, and
+"Checking Operator-Only Premises" (#6849) runs the same read-only re-check
+(has the named blocker/epic closed?) on `loom:operator-only` issues, never
+removing the label or auto-releasing the issue.
 
 **Workflow**:
 1. Priority 0 (starred, red-main fixes, then `loom:needs-revision`) first; then Priority 1
@@ -657,7 +659,7 @@ If, during curation, you determine an issue is too large to be a single Builder 
 4. **Do not close the parent during decomposition** — it now tracks its children; keep it open (or relabel it as a tracking issue). Closing here would orphan the sub-issues. (Closing/rescoping in general is allowed with a rationale — see "Issues Are Suggestions — Close or Rescope With Rationale" below — but a freshly-decomposed parent is not a close candidate.)
 5. **Do not self-curate your own sub-issues in the same session.** A separate Curator pass (could be the same human-role agent in a later session, or a different agent) must independently review each sub-issue before it can earn `loom:curated`.
 6. **Serialize this `gh issue create` burst against any other issue-creating agent (#3707).** Do not run your sub-issue creation concurrently with another issue-creating agent (Architect / another Curator-decomposition / Champion epic-phase) in the same repo — concurrent `gh issue create` bursts race on server-assigned issue numbers and cross-contaminate bodies. One filer finishes its full burst before the next starts. See `sweep.md` → "Execution Model → Only Builders parallelize" for the invariant.
-7. **File each sub-issue with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create` (#5047).** `gh issue create` is GraphQL-backed and dies outright once the shared GraphQL pool exhausts — while the independent REST pool sits ~99% unused. The script takes the same flags (`--title`, `--body`/`--body-file`, repeatable `--label`, `--repo`) and prints the same issue URL, but falls back to a single REST POST that applies labels **atomically with creation**. A decomposition burst files several issues in a row, so it is the likeliest place in a Curator run to meet an exhausted pool mid-sequence. Recipe and rationale: `.loom/docs/gh-issue-create-rest-fallback.md`. (`loom-daemon forge issue create` is a byte-identical `gh` passthrough — NOT a fallback.)
+7. **File each sub-issue with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create` (#5047).** `gh issue create` is GraphQL-backed and dies once the GraphQL pool exhausts, while the REST pool sits unused. The script takes the same flags (`--title`, `--body`/`--body-file`, repeatable `--label`, `--repo`) and prints the same URL, but falls back to one REST POST that applies labels atomically. Recipe: `.loom/docs/gh-issue-create-rest-fallback.md`. (`loom-daemon forge issue create` is a `gh` passthrough, NOT a fallback.)
 
 **Why a separate pass**: it catches AC gaps, drifted file:line citations, missed sub-issue dependencies, and loose scope guards at curate time, not as a Builder scope-guard trigger or Doctor cycle.
 
@@ -1750,11 +1752,9 @@ silently.
 | Same orthogonal condition, second pass | Silent skip via the `loom:operator-only` terminal check — exactly one escalation per condition |
 | Orthogonal condition clears, tracked blocker still stale | `ORTHOGONAL` empties, the hash changes again, the ordinary "changed conclusion" comment fires |
 
-**This does not consume the reserved #4967 counter above.** That hook counts *N
-unchanged confirmations of the same blocker* and still does not exist. This
-branch is the opposite trigger: it fires immediately, on the first pass whose
-reasoning names a different active condition, and needs no tally because the
-finding is a change of identity, not a repetition.
+**This does not consume the reserved #4967 counter above** (*N unchanged
+confirmations of the same blocker*; it does not exist). This branch fires on the
+first pass naming a different active condition: a change of identity, no tally.
 
 ## Repairing `loom:decision-malformed` (#10057)
 
@@ -1797,6 +1797,14 @@ A routing comment carrying `<!-- champion:revision-exhausted -->` is the
 preference or authority failure goes to the operator; a factual one gets a
 `<!-- champion:revision-disposition -->` round: close, split or file a decision,
 never edit. Bounds: `.loom/docs/promotion-throughput.md`.
+
+## Draining `loom:blocked-unnamed` (#10558)
+
+The daemon tick labels an open `loom:blocked` issue naming no blocker and stating
+no reason `loom:blocked-unnamed`; nothing else re-examines it. Query
+`gh issue list --label loom:blocked-unnamed` oldest first, at most **3 per pass**.
+Procedure and the three outcomes (named, kept, released):
+`.loom/docs/unnamed-block-review.md`. Never add `loom:issue`.
 
 ## Checking Operator-Only Premises (#6849)
 

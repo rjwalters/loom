@@ -295,7 +295,7 @@ fn resolution(s: &RefState) -> Option<bool> {
     }
 }
 
-fn has_operator_hold(labels: &[String]) -> bool {
+pub(super) fn has_operator_hold(labels: &[String]) -> bool {
     labels
         .iter()
         .any(|l| OPERATOR_HOLD_LABELS.contains(&l.as_str()))
@@ -328,7 +328,7 @@ fn body_skip(body: &str, labels: &[String]) -> Option<Skip> {
 /// Any other edit counts: a prose `Depends on #9` or an unchecked
 /// `## Dependencies` box the evidence never saw must abort the write rather
 /// than be released over.
-fn same_body(a: &str, b: &str) -> bool {
+pub(super) fn same_body(a: &str, b: &str) -> bool {
     let norm = |s: &str| {
         s.replace("\r\n", "\n")
             .lines()
@@ -660,7 +660,9 @@ fn veto_from_evidence(
                 Verdict::Unticked { .. } => Some(Skip::UntickedChecklist),
                 // Unreachable with every declared blocker resolved; never
                 // release on a verdict that does not say so.
-                Verdict::StillBlocked | Verdict::Undocumented => Some(Skip::OtherOpenReference),
+                Verdict::StillBlocked | Verdict::Undocumented | Verdict::HeldWithReason { .. } => {
+                    Some(Skip::OtherOpenReference)
+                }
             }
         };
         match veto {
