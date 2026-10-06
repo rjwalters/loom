@@ -7431,6 +7431,40 @@ as before, and after a transfer it can only shrink.
 | `LOOM_REPO_FACTS` | on | `0` makes every migrated site issue exactly its previous forge call and restores the ETag store's process-lifetime `origin` memo (the rollback switch). |
 | `LOOM_REPO_FACTS_VERIFY_SECS` | `21600` | How long a verified record is used before one conditional re-read. |
 
+### Installation snapshot: one listing per credential (`LOOM_INSTALLATION_SNAPSHOT`)
+
+Telemetry visibility (`visibility.repo`), the D32 repo identity
+(`telemetry.repo_identity`) and the write-scope probe (`write_scope.probe`)
+each read `GET repos/<nwo>` once per repository. An App installation token can
+list every repository it reaches in one call, so each credential now keeps one
+snapshot of `GET installation/repositories?per_page=100` (every page, each
+revalidated with its own `If-None-Match`, so an unchanged installation costs
+only free `304`s). Call row: `repo_facts.installation_snapshot`. The snapshot
+holds each repository's `id`, `full_name` and `private`. It is kept in the
+private ETag store directory as `instsnap-<hash>.json` (`0700` directory,
+`0600` files, atomic writes), so every daemon and CLI process on the host
+shares it. It is keyed by forge host, `GH_CONFIG_DIR` and a fingerprint of any
+env token, never the token.
+
+- **Visibility and identity** read the snapshot of the repository's reader App
+  when one is usable, else the writer credential for its owner.
+- **The write-scope probe** reads the writer's own snapshot (it stays
+  writer-only). A listed repository is WRITE and an absent one is not.
+  `permissions` (leg 1) runs only for a user token, or when the snapshot
+  cannot be had, and then only its WRITE stands.
+- **Fail-private.** A snapshot answers only while it was verified within the
+  TTL. A failed revalidation backs off for 300 s and answers nothing; a stale
+  snapshot is never served. Visibility treats a failed or stale snapshot, and a
+  repository absent from a fresh one, as **private**.
+- **User credentials** (a PAT, OAuth or `gh auth login` token) are refused the
+  endpoint. The refusal is remembered for the TTL, and those reads keep their
+  per-repo calls exactly as before.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOOM_INSTALLATION_SNAPSHOT` | on | `0` restores every per-repo read (so does `LOOM_REPO_FACTS=0`). |
+| `LOOM_INSTALLATION_SNAPSHOT_TTL_SECS` | `3600` | How long a verified snapshot answers before one conditional revalidation. It also bounds how long a public/private flip goes unseen. |
+
 ### Untargeted reads route to readers; deferrable reads shed (`LOOM_FACADE_CWD_ROUTING`, `LOOM_READ_SHED`)
 
 Most daemon reads are built with no typed repository (`GhTarget::None`) and

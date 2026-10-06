@@ -66,6 +66,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 pub(crate) mod probe;
+mod probe_snapshot;
 pub(crate) mod target;
 
 use probe::{Permission, PermissionProbe};

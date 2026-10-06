@@ -159,6 +159,32 @@ pub(crate) fn classify_repo_permissions(json: &str) -> Option<Permission> {
 
 impl PermissionProbe for GhProbe {
     fn permission(&self, repo: &str) -> Permission {
+        // W8: the writer's own installation snapshot answers the installation
+        // leg; leg 1 runs only for a user token or when it cannot answer.
+        let cred =
+            crate::forge_repo_facts::installation::Credential::writer(self.config_dir.clone());
+        let snapshot = crate::forge_repo_facts::installation::lookup(&self.gh, &cred, repo);
+        if let Some(p) = super::probe_snapshot::from_snapshot(&snapshot, || self.repo_leg(repo)) {
+            return p;
+        }
+        self.legacy_permission(repo)
+    }
+
+    fn cache_scope(&self) -> CacheScope {
+        CacheScope::GitHub
+    }
+}
+
+impl GhProbe {
+    /// Leg 1 alone: `GET repos/{repo}` → `permissions`.
+    fn repo_leg(&self, repo: &str) -> Result<Option<Permission>, String> {
+        let path = format!("repos/{repo}");
+        self.api(&[&path, "--jq", ".permissions // {}"])
+            .map(|s| classify_repo_permissions(&s))
+    }
+
+    /// Both legs, as before W8 (the snapshot is switched off).
+    fn legacy_permission(&self, repo: &str) -> Permission {
         let path = format!("repos/{repo}");
         let leg1 = self
             .api(&[&path, "--jq", ".permissions // {}"])
@@ -181,10 +207,6 @@ impl PermissionProbe for GhProbe {
             (Ok(None), Err(e)) => Permission::Unknown(format!("unparseable permissions ({e})")),
             (Err(e), Err(_)) => Permission::Unknown(e),
         }
-    }
-
-    fn cache_scope(&self) -> CacheScope {
-        CacheScope::GitHub
     }
 }
 

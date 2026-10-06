@@ -611,7 +611,9 @@ pub(crate) fn credential_scope(cwd: Option<&Path>, target: &Target) -> String {
     credential_scope_with(owner_config.as_deref(), token.as_deref())
 }
 
-fn credential_scope_with(owner_config: Option<&Path>, token: Option<&str>) -> String {
+/// [`credential_scope`] with the config dir and env token given (the
+/// installation snapshots of [`crate::forge_repo_facts`] key on it too).
+pub(crate) fn credential_scope_with(owner_config: Option<&Path>, token: Option<&str>) -> String {
     let config = owner_config
         .map(|p| p.display().to_string())
         .or_else(|| {
