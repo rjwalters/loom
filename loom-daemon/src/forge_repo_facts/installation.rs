@@ -29,17 +29,36 @@
 //!
 //! # Fail-private
 //!
-//! A snapshot answers only while it was verified within [`ttl_secs`]. Past
-//! that it is revalidated; when that fails it answers [`Answer::Unavailable`]
-//! — a stale snapshot is never served. Visibility maps `Unavailable` and a
-//! repo absent from a fresh snapshot ([`Answer::Listed`]`(None)`) to
-//! PRIVATE, so this layer can never serve a stale "public".
+//! A snapshot answers only while it was verified within [`ttl_secs`] (never
+//! more than [`SNAPSHOT_TTL_MAX_SECS`]). Past that it is revalidated; when
+//! that fails it answers [`Answer::Unavailable`] — a stale snapshot is never
+//! served. A snapshot stamped later than now (a clock step, a damaged file)
+//! is no snapshot at all. Visibility maps `Unavailable` and a repo absent
+//! from a fresh snapshot ([`Answer::Listed`]`(None)`) to PRIVATE, so this
+//! layer can never serve a stale "public".
+//!
+//! The price of that: while the listing cannot be had at TTL expiry (an
+//! outage, a rate limit), every repo this credential answers for — PUBLIC
+//! ones included — is stamped private until a revalidation succeeds.
 //!
 //! # User credentials
 //!
 //! A user token (PAT, OAuth, `gh auth login`) is refused this endpoint. That
 //! refusal is remembered for the same TTL as [`Answer::PerRepo`]: the caller
-//! keeps its own per-repo read, exactly as before W8.
+//! keeps its own per-repo read, exactly as before W8. Only the forge saying
+//! so ([`failure::is_installation_token_refusal`]) turns a verified
+//! installation snapshot into a user credential: any other `403`/`404` on a
+//! credential that listed before is a failed revalidation, never a downgrade.
+//!
+//! # Rate limits
+//!
+//! A refused listing is reported for the credential that made it
+//! ([`failure::report`]): a READER is withdrawn for its own `(app, owner)`
+//! bucket and the lookup falls through to the writer's snapshot (or to
+//! private) — it never reaches the host-wide breaker, which would stop every
+//! forge call on the host for one read-only App's dry pool. The WRITER's
+//! refusal does reach the breaker, with its `GH_CONFIG_DIR` and the response
+//! head so the breaker reads the bucket that was refused.
 //!
 //! # Kill switch
 //!
@@ -62,6 +81,10 @@ use super::state;
 pub(crate) const SNAPSHOT_CALLER: &str = "repo_facts.installation_snapshot";
 /// Default for `LOOM_INSTALLATION_SNAPSHOT_TTL_SECS`.
 pub(crate) const SNAPSHOT_TTL_DEFAULT_SECS: i64 = 3600;
+/// The longest a verified snapshot may answer, whatever the override says:
+/// the TTL is the bound on an unseen public → private flip, so a typo must
+/// not stretch it to a day.
+pub(crate) const SNAPSHOT_TTL_MAX_SECS: i64 = 3600;
 /// No new read of a snapshot whose last revalidation failed, for this long.
 pub(crate) const SNAPSHOT_FAILURE_BACKOFF_SECS: i64 = super::SUSPECT_BACKOFF_SECS;
 const PER_PAGE: u64 = 100;
@@ -112,12 +135,28 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    /// Verified within `ttl` — and not in the future: a stamp later than
+    /// `now` says nothing about how old the data is.
     fn fresh(&self, now: i64, ttl: i64) -> bool {
-        self.verified_at > 0 && now - self.verified_at < ttl
+        self.verified_at > 0 && !self.stamped_ahead_of(now) && now - self.verified_at < ttl
     }
 
+    /// Stamped later than `now` (the clock stepped back, or the file is
+    /// damaged): [`load`] treats it as absent.
+    fn stamped_ahead_of(&self, now: i64) -> bool {
+        self.verified_at > now
+    }
+
+    /// Backing off — but never longer than one backoff window from `now`, so
+    /// a damaged `failed_until` cannot silence a credential for good.
     fn in_backoff(&self, now: i64) -> bool {
-        self.failed_until.is_some_and(|u| u > now)
+        self.failed_until
+            .is_some_and(|u| u > now && u - now <= SNAPSHOT_FAILURE_BACKOFF_SECS)
+    }
+
+    /// A listing the forge once confirmed for this credential.
+    fn verified_installation(&self) -> bool {
+        self.kind == Kind::Installation && self.verified_at > 0
     }
 
     fn find(&self, owner_repo: &str) -> Option<RepoEntry> {
@@ -164,6 +203,8 @@ pub(crate) struct Credential {
     pub(crate) role: IdentityRole,
     /// The reader's rate-limit bucket label, for the ledger.
     pub(crate) bucket: Option<String>,
+    /// The reader App's id: who to withdraw when its listing is refused.
+    pub(crate) app_id: Option<String>,
 }
 
 impl Credential {
@@ -172,14 +213,17 @@ impl Credential {
             config_dir,
             role: IdentityRole::Writer,
             bucket: None,
+            app_id: None,
         }
     }
 
-    pub(crate) fn reader(dir: PathBuf, bucket: String) -> Self {
+    /// Reader App `app_id`'s credential (`dir`) for `owner_repo`'s owner.
+    pub(crate) fn reader(dir: PathBuf, app_id: &str, owner_repo: &str) -> Self {
         Self {
             config_dir: Some(dir),
             role: IdentityRole::Reader,
-            bucket: Some(bucket),
+            bucket: Some(crate::forge_identity::reader_bucket(app_id, owner_repo)),
+            app_id: Some(app_id.to_string()),
         }
     }
 
@@ -213,13 +257,15 @@ pub(crate) fn enabled() -> bool {
 }
 
 /// How long a verified snapshot answers before one conditional revalidation
-/// (`LOOM_INSTALLATION_SNAPSHOT_TTL_SECS`, default one hour). It is also the
-/// bound on how long a public/private flip goes unseen.
+/// (`LOOM_INSTALLATION_SNAPSHOT_TTL_SECS`, default one hour, never more than
+/// [`SNAPSHOT_TTL_MAX_SECS`]). It is also the bound on how long a
+/// public/private flip goes unseen by THIS layer; a consumer that caches the
+/// answer for its own TTL (the write-scope probe) stacks on top of it.
 pub(crate) fn ttl_secs() -> i64 {
     state::env_var("LOOM_INSTALLATION_SNAPSHOT_TTL_SECS")
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(SNAPSHOT_TTL_DEFAULT_SECS)
+        .map_or(SNAPSHOT_TTL_DEFAULT_SECS, |v| v.min(SNAPSHOT_TTL_MAX_SECS))
 }
 
 fn snapshot_path(key: &str) -> Option<PathBuf> {
@@ -228,10 +274,20 @@ fn snapshot_path(key: &str) -> Option<PathBuf> {
 }
 
 /// The newest snapshot for `key`: memory, unless the disk holds one verified
-/// later (another process on this host revalidated it).
-fn load(key: &str) -> Option<Snapshot> {
-    let mem = state::with(|s| s.snapshots.get(key).cloned());
-    let disk: Option<Snapshot> = snapshot_path(key).and_then(|p| store::read_private_json(&p));
+/// later (another process on this host revalidated it). One stamped later
+/// than `now` is dropped from both — it reads as no snapshot, so the caller
+/// refetches unconditionally rather than trusting it or its validators.
+fn load(key: &str, now: i64) -> Option<Snapshot> {
+    let sane = |s: &Snapshot| !s.stamped_ahead_of(now);
+    let mem = state::with(|s| {
+        if s.snapshots.get(key).is_some_and(|m| !sane(m)) {
+            s.snapshots.remove(key);
+        }
+        s.snapshots.get(key).cloned()
+    });
+    let disk: Option<Snapshot> = snapshot_path(key)
+        .and_then(|p| store::read_private_json(&p))
+        .filter(sane);
     let newest = match (mem, disk) {
         (Some(m), Some(d)) if d.verified_at > m.verified_at => Some(d),
         (Some(m), _) => Some(m),
@@ -269,7 +325,7 @@ pub(crate) fn lookup(gh: &Path, cred: &Credential, owner_repo: &str) -> Answer {
     if let Some(answer) = hot {
         return answer;
     }
-    let prior = load(&key);
+    let prior = load(&key, now);
     if let Some(s) = prior.as_ref().filter(|s| s.fresh(now, ttl)) {
         return s.answer(owner_repo);
     }
@@ -278,6 +334,12 @@ pub(crate) fn lookup(gh: &Path, cred: &Credential, owner_repo: &str) -> Answer {
     let known_user = prior
         .as_ref()
         .is_some_and(|s| s.kind == Kind::NotInstallation && s.verified_at > 0);
+    let request = Request {
+        gh,
+        cred,
+        owner_repo,
+        verified_installation: prior.as_ref().is_some_and(Snapshot::verified_installation),
+    };
     let unavailable = || {
         if known_user {
             Answer::PerRepo
@@ -291,7 +353,7 @@ pub(crate) fn lookup(gh: &Path, cred: &Credential, owner_repo: &str) -> Answer {
     if crate::rate_limit_breaker::global_skip_pass(SNAPSHOT_CALLER) {
         return unavailable();
     }
-    match revalidate(gh, cred, prior.as_ref(), now) {
+    match revalidate(&request, prior.as_ref(), now) {
         Ok(snap) => {
             save(&key, &snap);
             note_recovered(&key, cred);
@@ -319,8 +381,7 @@ pub(crate) fn lookup(gh: &Path, cred: &Credential, owner_repo: &str) -> Answer {
 pub(crate) fn read_credentials(owner_repo: &str) -> Vec<Credential> {
     let mut creds = Vec::new();
     if let Some((dir, app_id)) = crate::forge_identity::read_credential(owner_repo, None) {
-        let bucket = crate::forge_identity::reader_bucket(&app_id, owner_repo);
-        creds.push(Credential::reader(dir, bucket));
+        creds.push(Credential::reader(dir, &app_id, owner_repo));
     }
     creds.push(Credential::writer(crate::credential_preflight::gh_config_dir_for_owner_slug(
         owner_repo,
@@ -365,20 +426,27 @@ pub(crate) fn lookup_repo_with(gh: &Path, creds: &[Credential], owner_repo: &str
 /// Why a revalidation produced no snapshot.
 type Failure = String;
 
-/// Re-read every page of `cred`'s listing, conditionally on the validators
-/// `prior` holds. Any page failing fails the whole revalidation.
-fn revalidate(
-    gh: &Path,
-    cred: &Credential,
-    prior: Option<&Snapshot>,
-    now: i64,
-) -> Result<Snapshot, Failure> {
+/// One revalidation: the credential, the `gh` to run, the repo the lookup
+/// was for (the owner a refused reader is withdrawn from), and whether the
+/// forge has confirmed this credential as an installation before.
+struct Request<'a> {
+    gh: &'a Path,
+    cred: &'a Credential,
+    owner_repo: &'a str,
+    verified_installation: bool,
+}
+
+/// Re-read every page of the credential's listing, conditionally on the
+/// validators `prior` holds. Any page failing fails the whole revalidation:
+/// a listing is never assembled from some pages of this read and none of
+/// another.
+fn revalidate(req: &Request<'_>, prior: Option<&Snapshot>, now: i64) -> Result<Snapshot, Failure> {
     let prior_page = |i: usize| {
         prior
-            .filter(|p| p.kind == Kind::Installation && p.verified_at > 0)
+            .filter(|p| p.verified_installation())
             .and_then(|p| p.pages.get(i))
     };
-    let first = fetch_page(gh, cred, 1, prior_page(0))?;
+    let first = fetch_page(req, 1, prior_page(0))?;
     let (page1, total) = match first {
         PageOutcome::NotInstallation => {
             return Ok(Snapshot {
@@ -399,7 +467,7 @@ fn revalidate(
     let mut pages = vec![page1];
     for n in 2..=wanted {
         let i = usize::try_from(n - 1).unwrap_or(usize::MAX);
-        match fetch_page(gh, cred, n, prior_page(i))? {
+        match fetch_page(req, n, prior_page(i))? {
             PageOutcome::Unchanged(page) | PageOutcome::Fetched(page, _) => pages.push(page),
             PageOutcome::NotInstallation => {
                 return Err(format!("page {n} refused after page 1 was served"))
@@ -428,19 +496,26 @@ fn page_url(n: u64) -> String {
     format!("installation/repositories?per_page={PER_PAGE}&page={n}")
 }
 
-fn fetch_page(
-    gh: &Path,
-    cred: &Credential,
-    n: u64,
-    prior: Option<&Page>,
-) -> Result<PageOutcome, Failure> {
+fn fetch_page(req: &Request<'_>, n: u64, prior: Option<&Page>) -> Result<PageOutcome, Failure> {
     let etag = prior.and_then(|p| p.etag.as_deref());
-    let (response, stderr) = fetch(gh, cred, &page_url(n), etag)?;
+    let url = page_url(n);
+    let Fetched {
+        response,
+        stderr,
+        head,
+    } = fetch(req.gh, req.cred, &url, etag)?;
     let fail = |why: String| {
-        crate::rate_limit_breaker::global_observe_failure(&stderr, SNAPSHOT_CALLER);
+        failure::report(
+            req,
+            &failure::Refusal {
+                response: response.as_ref(),
+                stderr: &stderr,
+                head: head.as_deref(),
+            },
+        );
         Err(why)
     };
-    let Some(r) = response else {
+    let Some(r) = response.as_ref() else {
         return fail(format!("no HTTP response: {stderr}"));
     };
     match r.status {
@@ -458,7 +533,24 @@ fn fetch_page(
             )),
             None => fail("unparseable installation listing".to_string()),
         },
-        403 | 404 if !is_rate_limited(&r, &stderr) => Ok(PageOutcome::NotInstallation),
+        403 | 404 if !is_rate_limited(r, &stderr) => {
+            // The forge saying "not an installation token" is a user
+            // credential. Any other 403/404 is only that for a credential
+            // never seen listing; one that listed before keeps its kind and
+            // fails this revalidation (private), rather than being demoted
+            // to per-repo reads by a transient or unrelated refusal.
+            if failure::is_installation_token_refusal(&r.body, &stderr)
+                || !req.verified_installation
+            {
+                Ok(PageOutcome::NotInstallation)
+            } else {
+                fail(format!(
+                    "HTTP {} without the installation-token refusal on a verified \
+                     installation: {stderr}",
+                    r.status
+                ))
+            }
+        }
         status => fail(format!("HTTP {status}: {stderr}")),
     }
 }
@@ -497,22 +589,22 @@ pub(crate) fn parse_page(body: &str) -> Option<(Vec<RepoEntry>, u64)> {
     Some((repos, total))
 }
 
+/// One page read: the parsed response, `gh`'s stderr, and the raw response
+/// head (status line + headers) for the breaker's reset evidence.
+struct Fetched {
+    response: Option<HttpResponse>,
+    stderr: String,
+    head: Option<String>,
+}
+
 /// One `gh api --include <url>` under exactly `cred`, counted as
 /// [`SNAPSHOT_CALLER`]. The explicit `GH_CONFIG_DIR` (or the writer pin)
 /// keeps the facade from routing it elsewhere: a snapshot measures the
 /// credential it is filed under.
-fn fetch(
-    gh: &Path,
-    cred: &Credential,
-    url: &str,
-    etag: Option<&str>,
-) -> Result<(Option<HttpResponse>, String), Failure> {
+fn fetch(gh: &Path, cred: &Credential, url: &str, etag: Option<&str>) -> Result<Fetched, Failure> {
     use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
     use crate::proc_exec::Completion;
-    let op = crate::forge_call_stats::ForgeOp::uninventoried(
-        "installation repository listing: one snapshot serves repo.view's visibility and \
-         identity reads and the write-scope probe",
-    );
+    let op = crate::forge_call_stats::ops::REPO_LIST_FOR_INSTALLATION;
     let mut inv = GhInvocation::new(
         Operation::new(SNAPSHOT_CALLER),
         AccessIntent::Read,
@@ -538,10 +630,15 @@ fn fetch(
         inv = inv.arg("-H").arg(format!("If-None-Match: {e}"));
     }
     match inv.execute() {
-        Ok(GhCompletion::Captured(Completion::Exited(out))) => Ok((
-            parse_http_response(&String::from_utf8_lossy(&out.stdout)),
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        )),
+        Ok(GhCompletion::Captured(Completion::Exited(out))) => {
+            let raw = String::from_utf8_lossy(&out.stdout);
+            let response = parse_http_response(&raw);
+            Ok(Fetched {
+                head: response.as_ref().map(|_| failure::response_head(&raw)),
+                response,
+                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            })
+        }
         Ok(_) => Err(format!("gh api {url} timed out")),
         Err(e) => Err(format!("failed to invoke {}: {e}", gh.display())),
     }
@@ -574,6 +671,12 @@ fn note_recovered(key: &str, cred: &Credential) {
     }
 }
 
+mod failure;
+
 #[cfg(test)]
 #[path = "installation_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "installation_guard_tests.rs"]
+mod guard_tests;

@@ -47,18 +47,62 @@ fn a_user_token_is_decided_by_leg_one() {
     assert!(matches!(from_snapshot(&Answer::PerRepo, failed), Some(Permission::Unknown(_))));
 }
 
-/// With no snapshot to be had, only a verified leg-1 WRITE stands: an App
+/// With no snapshot to be had, a verified leg-1 WRITE stands, and an App
 /// token's all-false `permissions` is never turned into a cached refusal or
 /// a grant.
 #[test]
-fn an_unavailable_snapshot_keeps_only_a_leg_one_write() {
+fn an_unavailable_snapshot_keeps_a_leg_one_write_and_not_an_all_false_role() {
+    use crate::write_scope::probe::classify_repo_permissions;
     let push = || Ok(Some(Permission::Write));
     assert_eq!(from_snapshot(&Answer::Unavailable, push), Some(Permission::Write));
-    let all_false = || Ok(Some(Permission::Insufficient("repository role `none`".into())));
+    // The real classifier's reading of what an App token is served.
+    for body in ["{}", r#"{"admin":false,"push":false,"pull":false}"#] {
+        let all_false = || Ok(classify_repo_permissions(body));
+        assert!(
+            matches!(from_snapshot(&Answer::Unavailable, all_false), Some(Permission::Unknown(_))),
+            "{body}"
+        );
+    }
+    let unparseable = || Ok(None);
     assert!(matches!(
-        from_snapshot(&Answer::Unavailable, all_false),
+        from_snapshot(&Answer::Unavailable, unparseable),
         Some(Permission::Unknown(_))
     ));
+    let failed = || Err("boom".to_string());
+    assert!(matches!(
+        from_snapshot(&Answer::Unavailable, failed),
+        Some(Permission::Unknown(_))
+    ));
+}
+
+/// Hardening (e): a NAMED lesser role is a user token's definitive answer.
+/// A failed listing does not blur it into a one-minute `Unknown`.
+#[test]
+fn an_unavailable_snapshot_keeps_a_named_lesser_role_as_insufficient() {
+    use crate::write_scope::probe::classify_repo_permissions;
+    for (body, role) in [
+        (r#"{"admin":false,"push":false,"triage":false,"pull":true}"#, "pull"),
+        (r#"{"admin":false,"push":false,"triage":true,"pull":true}"#, "triage"),
+    ] {
+        let leg = || Ok(classify_repo_permissions(body));
+        match from_snapshot(&Answer::Unavailable, leg) {
+            Some(Permission::Insufficient(why)) => assert!(why.contains(role), "{why}"),
+            other => panic!("{role}: expected Insufficient, got {other:?}"),
+        }
+    }
+}
+
+/// The same end to end: the listing fails, leg 1 says `pull`.
+#[test]
+fn a_failed_listing_with_a_pull_role_probes_insufficient() {
+    let env = Env::new(&[]);
+    let fake = Listing::new(env.tmp.path());
+    fake.set("mode", "fail");
+    fake.set("repo", r#"{"push":false,"pull":true}"#);
+    let probe = GhProbe::new(fake.gh.clone(), Some(env.tmp.path().join("cfg-user")));
+    assert!(matches!(probe.permission("acme/app"), Permission::Insufficient(_)));
+    fake.set("repo", "{}");
+    assert!(matches!(probe.permission("acme/other"), Permission::Unknown(_)));
 }
 
 /// End to end: the probe reads the writer's own snapshot once, under its

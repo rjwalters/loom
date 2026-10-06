@@ -6,12 +6,23 @@
 //! (the probe stays writer-only). So a fresh installation snapshot decides
 //! alone, with no per-repo read: listed is WRITE, absent is `Insufficient`.
 //! A user token has no installation listing, and leg 1 (`permissions`)
-//! decides. When the snapshot cannot be had, only a leg-1 WRITE stands; an
-//! installation token's all-`false` leg 1 is no verdict, so anything else is
-//! `Unknown`, which the caller fails closed on (the probe cache's
-//! stale-WRITE grace still applies).
+//! decides.
+//!
+//! When the snapshot cannot be had, leg 1 decides what it can:
+//!
+//! - a WRITE stands;
+//! - a named lesser role (`pull`, `triage`) stands as `Insufficient`. Only a
+//!   user token is told a role, and for a user token leg 1 is the whole
+//!   answer — a definitive refusal, not an outage to retry every minute;
+//! - an all-`false` `permissions` is what an App installation token gets
+//!   everywhere, so it is no verdict: `Unknown`, which the caller fails
+//!   closed on (the probe cache's stale-WRITE grace still applies).
+//!
+//! **Age.** The snapshot answers for up to its own TTL and the probe cache
+//! then keeps the answer for the probe's: the two stack (about two hours
+//! with the defaults), see [`super::probe`].
 
-use super::probe::Permission;
+use super::probe::{names_a_lesser_role, Permission};
 use crate::forge_repo_facts::installation::Answer;
 
 /// Leg 1's outcome: `Ok(Some)` classified, `Ok(None)` unparseable, `Err`
@@ -38,6 +49,7 @@ pub(crate) fn from_snapshot(
         }),
         Answer::Unavailable => Some(match repo_leg() {
             Ok(Some(Permission::Write)) => Permission::Write,
+            Ok(Some(lesser)) if names_a_lesser_role(&lesser) => lesser,
             Ok(_) => Permission::Unknown(
                 "installation snapshot unavailable and the repository role is not WRITE".into(),
             ),

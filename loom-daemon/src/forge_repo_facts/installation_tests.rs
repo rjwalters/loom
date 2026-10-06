@@ -12,9 +12,12 @@ use crate::forge_repo_facts::state;
 use crate::forge_repo_facts::test_support::Env;
 
 /// A fake `gh` serving `installation/repositories` (and a per-repo read).
-/// Files in its dir steer it: `mode` (`ok` / `fail` / `user`), `page1` /
-/// `page2` (the listing bodies), `notmodified`
-/// (answer a conditional read `304`), `repo` (the per-repo body).
+/// Files in its dir steer it: `mode` (`ok` / `fail` / `user` / `failpage2`
+/// — only page 2 fails / `limited` — a primary rate limit whose reset is the
+/// `reset` file / `limited_bare` — the same with no rate-limit headers /
+/// `forbidden` — a `403` that is neither), `page1` / `page2` (the listing
+/// bodies), `notmodified` (answer a conditional read `304`), `repo` (the
+/// per-repo body).
 pub(crate) struct Listing {
     pub(crate) dir: PathBuf,
     pub(crate) gh: PathBuf,
@@ -35,6 +38,10 @@ case "$*" in
     case "$mode" in
       fail) echo "gh: Server Error (HTTP 502)" >&2; printf 'HTTP/2.0 502 Bad Gateway\r\n\r\n{{}}'; exit 1 ;;
       user) printf 'HTTP/2.0 403 Forbidden\r\n\r\n{{"message":"You must authenticate with an installation access token in order to list repositories for an installation."}}'; exit 1 ;;
+      limited) echo "gh: API rate limit exceeded for installation ID 1 (HTTP 403)" >&2; printf 'HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Resource: core\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: %s\r\n\r\n{{"message":"API rate limit exceeded for installation ID 1."}}' "$(cat "$D/reset")"; exit 1 ;;
+      limited_bare) echo "gh: API rate limit exceeded for installation ID 1 (HTTP 403)" >&2; printf 'HTTP/2.0 403 Forbidden\r\n\r\n{{}}'; exit 1 ;;
+      forbidden) echo "gh: Resource not accessible by integration (HTTP 403)" >&2; printf 'HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Remaining: 4000\r\n\r\n{{"message":"Resource not accessible by integration"}}'; exit 1 ;;
+      failpage2) case "$*" in *"page=2"*) echo "gh: Server Error (HTTP 502)" >&2; printf 'HTTP/2.0 502 Bad Gateway\r\n\r\n{{}}'; exit 1 ;; esac ;;
     esac
     case "$*" in *"page=2"*) p=2 ;; *) p=1 ;; esac
     case "$*" in
@@ -88,11 +95,11 @@ pub(crate) fn page(total: u64, rows: &[(u64, &str, bool)]) -> String {
     format!(r#"{{"total_count":{total},"repositories":[{}]}}"#, repos.join(","))
 }
 
-fn writer(env: &Env) -> Credential {
+pub(crate) fn writer(env: &Env) -> Credential {
     Credential::writer(Some(env.tmp.path().join("cfg-writer")))
 }
 
-fn listed(name: &str, id: u64, private: bool) -> Answer {
+pub(crate) fn listed(name: &str, id: u64, private: bool) -> Answer {
     Answer::Listed(Some(RepoEntry {
         id,
         full_name: name.to_string(),
@@ -268,7 +275,7 @@ fn credentials_never_share_a_snapshot() {
     let fake = Listing::new(env.tmp.path());
     fake.set("page1", &page(1, &[(1, "acme/pub", false)]));
     let a = Credential::writer(Some(env.tmp.path().join("cfg-a")));
-    let b = Credential::reader(env.tmp.path().join("cfg-b"), "reader:1:acme".into());
+    let b = Credential::reader(env.tmp.path().join("cfg-b"), "1", "acme/pub");
     assert_ne!(a.key(), b.key());
     let _ = lookup(&fake.gh, &a, "acme/pub");
     let _ = lookup(&fake.gh, &b, "acme/pub");
@@ -285,7 +292,7 @@ fn lookup_repo_with_falls_through_credentials() {
     let writer_fake = Listing::new(&env.tmp.path().join("w"));
     reader_fake.set("page1", &page(1, &[(1, "acme/one", false)]));
     writer_fake.set("page1", &page(1, &[(2, "acme/two", true)]));
-    let reader = Credential::reader(env.tmp.path().join("cfg-r"), "reader:1:acme".into());
+    let reader = Credential::reader(env.tmp.path().join("cfg-r"), "1", "acme/one");
     let w = writer(&env);
     // Two gh stubs stand in for two credentials: look each up once so its
     // snapshot is filed under its own key, then ask through both.
@@ -325,4 +332,28 @@ fn parse_page_drops_malformed_rows() {
     assert_eq!(repos[0].full_name, "a/ok");
     assert!(parse_page(r#"{"repositories":[]}"#).is_none(), "no total_count");
     assert!(parse_page("not json").is_none());
+}
+
+/// The listing is booked under its own inventoried operation
+/// (`repo.list-for-installation`), never `unknown`: the constant the fetch
+/// names is an active row whose declared caller is this module.
+#[test]
+fn repo_list_for_installation_is_the_inventoried_operation() {
+    let op = crate::forge_call_stats::ops::REPO_LIST_FOR_INSTALLATION;
+    assert_eq!(op.id(), Some("repo.list-for-installation"));
+    assert!(crate::forge_call_stats::ops::ALL_INVENTORIED.contains(&op));
+    let inv = crate::forge_inventory::load_embedded().unwrap();
+    let row = inv
+        .operations
+        .iter()
+        .find(|o| Some(o.id.as_str()) == op.id())
+        .expect("a row in defaults/forge/operations/*.toml");
+    assert!(row.is_active());
+    assert!(
+        row.callers
+            .iter()
+            .any(|c| c.path == "loom-daemon/src/forge_repo_facts/installation.rs"),
+        "{:?}",
+        row.callers
+    );
 }

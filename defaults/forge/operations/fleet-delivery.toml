@@ -430,6 +430,47 @@ kind = "rust"
 path = "loom-daemon/src/ci_telemetry/owners.rs"
 
 [[operation]]
+id = "repo.list-for-installation"
+group = "repository-discovery-creation"
+summary = "List every repository a credential's App installation reaches, with its id and visibility."
+profile = "fleet-bootstrap"
+disposition = "optional"
+class = "read"
+inputs = ["host"]
+outputs = ["id", "full_name", "private", "total_count"]
+required_fields = []
+actor = "daemon"
+permissions = ["metadata:read"]
+pagination = "complete-required"
+consistency = "eventual"
+idempotency = "idempotent"
+retry = "backoff-safe"
+version_support = { github = "0" }
+test_id = "forge-probe::fleet-delivery::repo-list-for-installation"
+test_status = "implemented"
+test_path = "loom-daemon/src/forge_repo_facts/installation_tests.rs"
+owner = "daemon-forge"
+risk = "normal"
+github = { commands = [
+  "gh api --include installation/repositories",
+], routes = [
+  "GET installation/repositories",
+] }
+platform_support = "documented"
+adapter_coverage = "none"
+caller_integration = "complete"
+exclusion_reason = "A quota optimisation, not a requirement: one listing per credential replaces the per-repository `repo.view` reads for visibility, repo identity and the write-scope probe's installation leg. A credential the endpoint refuses (a user token) and a provider with no installation concept keep those per-repository reads, which is what `LOOM_INSTALLATION_SNAPSHOT=0` restores everywhere."
+preflight = "warn-and-disable"
+unknowns = [
+  "the listing is defined for an App installation token only; a provider with no equivalent of 'every repository this credential reaches, in one read' has nothing to serve it from",
+  "an unavailable or partial listing must read as PRIVATE and as no write grant, never as the last known answer",
+]
+notes = "Per credential, conditional per page (If-None-Match), revalidated at most hourly. A refused reader App is withdrawn for its own bucket and never trips the host-wide breaker; the writer's refusal does."
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/forge_repo_facts/installation.rs"
+
+[[operation]]
 id = "repo.create-and-clone"
 group = "repository-discovery-creation"
 summary = "Create a repository and clone it during bootstrap."

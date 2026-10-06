@@ -66,6 +66,37 @@ fn a_failed_snapshot_fetch_is_private_with_no_per_repo_read() {
     assert_eq!(per_repo_calls(&fake), 0);
 }
 
+/// Page 2 failing mid-listing: a repo page 1 listed as public is private.
+#[test]
+fn a_listing_that_fails_on_a_later_page_is_private() {
+    let env = Env::new(&[]);
+    let fake = Listing::new(env.tmp.path());
+    let first: Vec<(u64, String, bool)> = (1..=100)
+        .map(|i| (i, format!("acme/w8-p{i}"), false))
+        .collect();
+    let rows: Vec<(u64, &str, bool)> = first.iter().map(|(i, n, p)| (*i, n.as_str(), *p)).collect();
+    fake.set("page1", &page(101, &rows));
+    fake.set("mode", "failpage2");
+    let slug = "acme/w8-p1";
+    let answer = lookup_repo_with(&fake.gh, &[writer(&env)], slug);
+    assert_eq!(answer, Answer::Unavailable);
+    assert_eq!(derive_visibility_from(slug, answer), RepoVisibility::Private);
+    assert_eq!(per_repo_calls(&fake), 0);
+}
+
+/// The slug's case does not matter, to either answer.
+#[test]
+fn visibility_ignores_the_slugs_case() {
+    let env = Env::new(&[]);
+    let fake = Listing::new(env.tmp.path());
+    fake.set("page1", &page(2, &[(1, "Acme/W8-Open", false), (2, "Acme/W8-Closed", true)]));
+    let creds = [writer(&env)];
+    let open = lookup_repo_with(&fake.gh, &creds, "acme/w8-open");
+    assert_eq!(derive_visibility_from("acme/w8-open", open), RepoVisibility::Public);
+    let closed = lookup_repo_with(&fake.gh, &creds, "ACME/W8-CLOSED");
+    assert_eq!(derive_visibility_from("ACME/W8-CLOSED", closed), RepoVisibility::Private);
+}
+
 #[test]
 fn a_repo_absent_from_the_snapshot_is_private() {
     let env = Env::new(&[]);

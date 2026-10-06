@@ -20,6 +20,14 @@
 //! on-disk entry so short-lived `loom-daemon forge may-write` invocations from
 //! shell share one probe); an `Unknown` is kept for a minute only.
 //!
+//! **The two TTLs stack.** The installation leg is answered from the writer's
+//! installation snapshot ([`crate::forge_repo_facts::installation`], W8),
+//! which is itself up to an hour old when this probe reads it, and the
+//! answer is then cached here for [`ttl`]. So a repository removed from the
+//! installation can keep a cached WRITE for up to about two hours with the
+//! defaults (snapshot TTL + probe TTL), not one. The write itself is still
+//! refused by the forge; what lags is this pre-check.
+//!
 //! **Stale-while-unverifiable.** When an expired WRITE is re-probed and the
 //! probe cannot answer (rate limit, outage), a WRITE verified within the last
 //! [`STALE_WRITE_GRACE`] still answers WRITE. Without that, one GitHub blip at
@@ -140,6 +148,18 @@ impl GhProbe {
                 .to_string()),
         }
     }
+}
+
+/// Leg 1's finding for a `permissions` object with no role set. It is what a
+/// user with no access gets — and what an App installation token gets even on
+/// a repository it writes to, so on its own it is no verdict about an App.
+pub(crate) const NO_REPOSITORY_ROLE: &str = "repository role `none`";
+
+/// Whether leg 1 named a real role below WRITE (`pull`, `triage`). Only a
+/// user token is ever told one, and for a user token leg 1 is the whole
+/// answer: definitive, whatever the installation listing would have said.
+pub(crate) fn names_a_lesser_role(p: &Permission) -> bool {
+    matches!(p, Permission::Insufficient(why) if why != NO_REPOSITORY_ROLE)
 }
 
 /// Classify leg 1's `permissions` object.
