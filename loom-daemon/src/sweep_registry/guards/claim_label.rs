@@ -201,6 +201,96 @@ pub(crate) fn claim_label_is_live_foreign(
         && episode_start - labeled_at <= chrono::Duration::seconds(LEASELESS_CLAIM_LABEL_GRACE_SECS)
 }
 
+/// Slack, in seconds, between this dispatcher's own flip window and a
+/// `labeled loom:building` event's forge timestamp for the event to still be
+/// attributable to that flip (Issue #10345). Covers forge timestamps being
+/// truncated to whole seconds plus ordinary clock skew; anything farther away
+/// is treated as someone else's claim.
+pub(crate) const OWN_FLIP_ATTRIBUTION_SLACK_SECS: i64 = 2;
+
+/// Whether a `labeled loom:building` event (`actor`, `created_at`) is
+/// attributable to this dispatcher's OWN label flip, performed inside
+/// `[flip_start, flip_end]` on the local clock (Issue #10345). Pure.
+///
+/// Both legs must hold: the actor is the fleet's own forge identity (a human
+/// or any other login is a hand-claim), AND the event falls within
+/// [`OWN_FLIP_ATTRIBUTION_SLACK_SECS`] of the flip window (the shared bot
+/// identity at an unrelated time is some other fleet lane's claim).
+pub(crate) fn claim_event_is_own_flip(
+    actor: &str,
+    created_at: DateTime<Utc>,
+    flip_start: DateTime<Utc>,
+    flip_end: DateTime<Utc>,
+    fleet: &crate::forge_identity::FleetLogins,
+) -> bool {
+    if actor.trim().is_empty() || !fleet.contains(actor) {
+        return false;
+    }
+    let slack = chrono::Duration::seconds(OWN_FLIP_ATTRIBUTION_SLACK_SECS);
+    created_at >= flip_start - slack && created_at <= flip_end + slack
+}
+
+/// Parse `actor<TAB>timestamp` lines (one per `--paginate` page) into the
+/// newest event's `(actor, created_at)`. `None` when no line parses.
+pub(crate) fn parse_claim_event(stdout: &[u8]) -> Option<(String, DateTime<Utc>)> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| {
+            let (actor, ts) = line.trim().split_once('\t')?;
+            let ts = DateTime::parse_from_rfc3339(ts.trim().trim_matches('"')).ok()?;
+            Some((actor.trim().to_string(), ts.with_timezone(&Utc)))
+        })
+        .max_by_key(|(_, ts)| *ts)
+}
+
+impl SweepRegistry {
+    /// The newest `labeled loom:building` event's `(actor login, created_at)`.
+    /// `None` on any read failure or unparseable output (callers fail closed).
+    pub(crate) fn fetch_claim_event(&self, issue: u32) -> Option<(String, DateTime<Utc>)> {
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/timeline");
+        let jq = r#"[.[] | select(.event == "labeled" and .label.name == "loom:building")] | max_by(.created_at) | select(. != null) | "\(.actor.login // "")\t\(.created_at)""#;
+        let output = self
+            .gh_read("guard.claim_timeline", ["api", &path, "--paginate", "--jq", jq])
+            .ok()
+            .flatten()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_claim_event(&output.stdout)
+    }
+
+    /// Whether a leaseless yield's `loom:building` label is *provably* this
+    /// dispatcher's own phantom (Issue #10345), so it may be reverted.
+    ///
+    /// Requires: the newest label event is attributable to this dispatcher's
+    /// flip ([`claim_event_is_own_flip`]), AND a fresh lease-comment read shows
+    /// no lease record other than this sweep's own. FAIL-CLOSED: every
+    /// unverifiable read returns `false` (keep the label, as before #10345) so
+    /// a real hand-claim's mutex (#5270/#9453) is never destroyed on a guess.
+    pub(crate) fn leaseless_yield_is_own_phantom(
+        &self,
+        issue: u32,
+        sweep_id: &str,
+        flip_start: DateTime<Utc>,
+        flip_end: DateTime<Utc>,
+    ) -> bool {
+        let Some((actor, created_at)) = self.fetch_claim_event(issue) else {
+            return false;
+        };
+        let fleet = crate::forge_identity::FleetLogins::for_root(&self.config.workspace_root);
+        if !claim_event_is_own_flip(&actor, created_at, flip_start, flip_end, &fleet) {
+            return false;
+        }
+        let host = self.published_host_id();
+        let Some(comments) = self.read_lease_comments(issue) else {
+            return false;
+        };
+        comments
+            .iter()
+            .all(|c| c.host == host && c.sweep_id == sweep_id)
+    }
+}
+
 impl LeaseOrderDecision {
     /// Chain [`SweepRegistry::resolve_leaseless_claim_order`] onto a
     /// comment-order verdict (Issue #9453 Phase 3.1): the label leg runs ONLY
