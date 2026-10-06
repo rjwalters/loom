@@ -574,7 +574,8 @@ impl MetricName {
                 "Rows with non-empty alternates in the last built eta.snapshot."
             }
             Self::EtaHealthPendingOverCap => {
-                "Pending ETA estimates evicted by the MAX_PENDING cap since process start."
+                "Pending ETA estimates evicted by the MAX_PENDING cap since process start; \
+                 whole series only when distinct series exceed the cap."
             }
         }
     }

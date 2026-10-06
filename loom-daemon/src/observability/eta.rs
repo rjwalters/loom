@@ -1179,10 +1179,11 @@ pub(super) async fn record(
     super::ops::eta_health::note_over_cap(dropped.over_cap);
     if dropped.over_cap > 0 {
         log::warn!(
-            "eta: evicted {} pending estimate(s) at the {} cap (redundant refreshes \
-             first; every series keeps its earliest and latest)",
+            "eta: evicted {} pending estimate(s) at the {} cap (redundant refreshes, then \
+             pairs to their earliest); {} whole series lost: more distinct series than the cap",
             dropped.over_cap,
-            crate::eta::tracker::MAX_PENDING
+            crate::eta::tracker::MAX_PENDING,
+            dropped.series_over_cap
         );
     }
     log::info!(
