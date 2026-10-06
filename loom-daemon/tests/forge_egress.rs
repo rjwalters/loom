@@ -690,6 +690,14 @@ fn spawn_worker_ignores_the_no_policy_launcher_opt_out() {
     std::fs::write(&runtime, format!("#!/bin/sh\nprintf '%s' \"$PATH\" >'{}'\n", seen.display()))
         .unwrap();
     std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Routed through the gateway with no stored token: what `required` wants.
+    let profile = sb.path().join("home-required/.config/gh");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(
+        profile.join("hosts.yml"),
+        "github.com:\n    user: fixture-user\n    git_protocol: https\n    api_host: github-proxy.fixture.invalid\n",
+    )
+    .unwrap();
     let spawn = |envs: &[(&str, &std::ffi::OsStr)]| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
         c.args(["spawn-worker", "--scripts-dir"])
