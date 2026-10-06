@@ -1029,20 +1029,23 @@ pub(super) async fn record(
         .as_ref()
         .map(|state| state.host_id.clone())
         .unwrap_or_default();
-    let ((history, events), repo_ids, loaded_fit) = tokio::task::spawn_blocking(move || {
-        let ids: BTreeMap<String, u64> = slugs
-            .iter()
-            .filter_map(|slug| {
-                crate::telemetry::repo_identity::resolve(slug)
-                    .map(|id| (slug.to_ascii_lowercase(), id.id))
-            })
-            .collect();
-        // #10243: a daily refit reaches the running estimator here.
-        let loaded_fit = fit::load_latest(&journal_root, listed_at);
-        (load_history(&history_roots, &journal_root, &host), ids, loaded_fit)
-    })
-    .await
-    .unwrap_or_default();
+    let ((history, events), repo_ids, loaded_fit, snapshots) =
+        tokio::task::spawn_blocking(move || {
+            let ids: BTreeMap<String, u64> = slugs
+                .iter()
+                .filter_map(|slug| {
+                    crate::telemetry::repo_identity::resolve(slug)
+                        .map(|id| (slug.to_ascii_lowercase(), id.id))
+                })
+                .collect();
+            // #10243: a daily refit reaches the running estimator here.
+            let loaded_fit = fit::load_latest(&journal_root, listed_at);
+            // #10500: the label timeline serving dates first-seen PRs from.
+            let snapshots = crate::eta::fleet::load_all(&journal_root);
+            (load_history(&history_roots, &journal_root, &host), ids, loaded_fit, snapshots)
+        })
+        .await
+        .unwrap_or_default();
 
     let ready = ready_rows(slug_cache).await;
     // Queue friction (#10193), read BEFORE `now`: every reading is then
@@ -1083,6 +1086,7 @@ pub(super) async fn record(
             state.tracker.pending(),
         );
         state.repo_ids.extend(repo_ids);
+        state.tracker.on_fleet_snapshots(&snapshots, listed_at);
         state.tracker.friction = book;
         state.pool_exhausted = pool_exhausted;
         state.locked_repos = super::ops::lockout::locked_slugs()

@@ -97,7 +97,7 @@ pub(super) struct Hold {
     /// The running hold, while the PR is in `merge_hold`.
     open: Option<StageTrack>,
     /// When the last hold was lifted back to `merge_wait`.
-    released_at: Option<DateTime<Utc>>,
+    pub(super) released_at: Option<DateTime<Utc>>,
 }
 
 /// The item's current stage when it is held: `merge_hold`, entered at the
@@ -333,6 +333,8 @@ impl Tracker {
         effects: &mut Effects,
     ) {
         let raw = serde_json::json!({"labels": pr.labels});
+        let held = self.context.timeline_held(&key.repo, pr.number, now);
+        let timeline_rework = self.context.timeline_rework(&key.repo, pr.number, now);
         let mark = effects.journal.len();
         let item = self
             .items
@@ -342,14 +344,29 @@ impl Tracker {
         if is_new || item.stage.is_none() && item.verdict_pending_since.is_none() {
             // First sight while held: both tracks start at the `updated_at`
             // lower bound, so neither ever yields a duration.
+            // The label timeline dates both when it has the PR (#10500).
+            let (pooled, hold_at) = match held {
+                Some((pooled, hold_at)) => (pooled, hold_at),
+                None => {
+                    let at = pr.updated_at.unwrap_or(now);
+                    (at, at)
+                }
+            };
+            let source = if held.is_some() {
+                AgeSource::LabelEvent
+            } else {
+                AgeSource::UpdatedAtLowerBound
+            };
             let track = StageTrack {
                 stage: Stage::MergeWait,
-                entered_at: pr.updated_at.unwrap_or(now).min(now),
-                source: AgeSource::UpdatedAtLowerBound,
+                entered_at: pooled.min(now),
+                source,
                 exact: false,
             };
+            item.rework_rounds = item.rework_rounds.max(timeline_rework);
             item.hold.open = Some(StageTrack {
                 stage: Stage::MergeHold,
+                entered_at: hold_at.min(now),
                 ..track.clone()
             });
             item.stage = Some(track);

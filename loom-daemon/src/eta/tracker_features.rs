@@ -7,9 +7,11 @@
 //!
 //! - **The fleet view** ([`Tracker::on_fleet_context`]): every open PR of each
 //!   repo whose review listings were read completely, including PRs that
-//!   close no issue (they never become tracker items), plus the stage events
-//!   derived from the ETA stage journal ([`events_from_journal`]). The repos
-//!   are the fleet scope.
+//!   close no issue (they never become tracker items), plus the stage events:
+//!   the fleet snapshots' log (`fleet_log::SnapshotLog`, the one `eta fit`
+//!   counts over, #10500) before its horizon, the ETA stage journal's
+//!   ([`events_from_journal`]) after it and for any repo no snapshot covers.
+//!   The repos are the fleet scope.
 //! - **The dispatch plan** ([`Tracker::on_ready_queue`]): the host-level queue
 //!   values `queue_ready`, `queue_running`, `max_concurrent`,
 //!   `active_sweeps_host` and `repo_pr_open_skip`, now recorded on **every**
@@ -24,17 +26,23 @@
 //!
 //! - A roster PR's `entered_at` is the tracker's own stage entry when it
 //!   tracks the PR in the stage its labels show (for a held PR, `merge_hold`:
-//!   its hold entry, #10284), otherwise the listing's `updated_at` (a lower
-//!   bound). So `ahead` is approximate for first-seen PRs until exact entry
-//!   times come from the label stream (#10218).
+//!   its hold entry, #10284), otherwise its entry in the fleet snapshots'
+//!   label timeline ([`Tracker::on_fleet_snapshots`], #10500: the same
+//!   episodes `eta fit` trains on), otherwise the listing's `updated_at` (a
+//!   lower bound). A first-seen tracked PR is dated, and its rework counted,
+//!   from the same timeline. Only a PR the timeline cannot date (not yet in a
+//!   snapshot, or re-entered the stage since the cut) keeps the bound.
 //! - A hold-aware model reads the **episode roster** captured beside the
 //!   roster (#10312): a tracked `merge_wait` PR released from a hold enters
 //!   at its release, as training's split episode does. A PR the tracker
-//!   does not follow keeps the `updated_at` lower bound there too.
-//! - The journal records only PRs this host tracks, which are the PRs that
-//!   close an issue. Departures and merges of other PRs are not counted.
-//! - The log's `from` is the journal's oldest row. Daemon downtime inside
-//!   the journal's span is not visible.
+//!   does not follow enters at its split episode's entry in the timeline,
+//!   else the `updated_at` lower bound.
+//! - Events come from the snapshots up to their horizon (one refresh
+//!   interval behind at most). After it, and with no snapshot, they come from
+//!   the journal, which records only PRs this host tracks (the PRs that close
+//!   an issue): departures and merges of other PRs there are not counted.
+//! - The log's `from` is the snapshots' (as training's), else the journal's
+//!   oldest row. Daemon downtime inside the journal's span is not visible.
 //! - Priority levels (#10333) are observed pass by pass: a level change
 //!   dates from the first pass that showed it, and a PR already starred on
 //!   the tracker's first pass of its repo has an unknown star instant (it
@@ -42,8 +50,10 @@
 
 use super::hold;
 use super::ready::plan_max_age_secs;
+use super::timeline::{Dated, Timeline};
 use super::{EstimateContext, Item, ItemKey, ReadyPlan, ReadyRow, Tracker};
 use crate::eta::explanation::{FeatureOmitted, Features};
+use crate::eta::fleet::FleetSnapshot;
 use crate::eta::journal::JournalEntry;
 use crate::eta::labels::stage_from_pr_labels;
 use crate::eta::pr_features::{FeatureRead, PrFeatureStore, Wanted};
@@ -171,6 +181,36 @@ pub(super) struct PassContext {
     reads: PrFeatureStore,
     /// The last pass's stall signals (#10232).
     stall: Option<StallSnapshot>,
+    /// Each PR's label-transition timeline from the fleet snapshots (#10500).
+    timeline: Timeline,
+}
+
+impl PassContext {
+    /// `pr`'s current-stage entry from the timeline (see [`Timeline::current`]).
+    pub(super) fn timeline_dated(
+        &self,
+        repo: &str,
+        pr: u32,
+        stage: Stage,
+        now: DateTime<Utc>,
+    ) -> Option<Dated> {
+        self.timeline.current(repo, pr, stage, now)
+    }
+
+    /// `pr`'s hold entries from the timeline (see [`Timeline::held`]).
+    pub(super) fn timeline_held(
+        &self,
+        repo: &str,
+        pr: u32,
+        now: DateTime<Utc>,
+    ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.timeline.held(repo, pr, now)
+    }
+
+    /// `pr`'s doctor rounds from the timeline.
+    pub(super) fn timeline_rework(&self, repo: &str, pr: u32, now: DateTime<Utc>) -> u32 {
+        self.timeline.doctor_rounds(repo, pr, now)
+    }
 }
 
 fn omission(name: &str, why: &str) -> FeatureOmitted {
@@ -258,6 +298,15 @@ pub fn events_from_journal(rows: &[JournalEntry], known_at: DateTime<Utc>) -> Ev
 }
 
 impl Tracker {
+    /// The fleet snapshots, loaded at `now` (#10500): the label-transition
+    /// timeline the tracker dates a first-seen PR's stage entry and rework
+    /// from, and the event log it counts departures and merges over, as
+    /// `eta fit`'s training rows do. Replaces the previous load; call it
+    /// before the pass's listings.
+    pub fn on_fleet_snapshots(&mut self, snapshots: &[FleetSnapshot], now: DateTime<Utc>) {
+        self.context.timeline = Timeline::from_snapshots(snapshots, now);
+    }
+
     /// The fleet view one pass observed at `observed_at`: each completely
     /// listed repo's open review-label PRs (`listings`, by `owner/repo`), and
     /// the stage events. Replaces the previous pass's view.
@@ -292,11 +341,25 @@ impl Tracker {
                 );
                 let stage = stage_from_pr_labels(&pr.labels).ok();
                 let item = tracked.get(&(repo.as_str(), pr.number));
-                let entry = |followed: Option<DateTime<Utc>>| RosterEntry {
+                // A PR the tracker does not follow is dated from the label
+                // timeline when it has it (#10500), else `updated_at`.
+                let dated = stage.and_then(|s| {
+                    self.context
+                        .timeline
+                        .current(&repo, pr.number, s, observed_at)
+                });
+                let entry = |followed: Option<DateTime<Utc>>, split: bool| RosterEntry {
                     repo: repo.clone(),
                     pr: pr.number,
                     stage,
                     entered_at: followed
+                        .or(dated.map(|d| {
+                            if split {
+                                d.released_at.unwrap_or(d.entered_at)
+                            } else {
+                                d.entered_at
+                            }
+                        }))
                         .or(pr.updated_at)
                         .unwrap_or(observed_at)
                         .min(observed_at),
@@ -310,8 +373,8 @@ impl Tracker {
                         hold::roster_entry(item, stage)
                     }
                 };
-                roster.push(entry(followed(false)));
-                let modeled = entry(followed(true));
+                roster.push(entry(followed(false), false));
+                let modeled = entry(followed(true), true);
                 priority_roster.push(PriorityEntry {
                     repo: modeled.repo.clone(),
                     pr: modeled.pr,
@@ -327,6 +390,8 @@ impl Tracker {
         }
         self.context.star_repos.extend(scope.iter().cloned());
         self.context.stars = stars;
+        // #10500: the snapshots' log (training's) where it reaches.
+        let events = self.context.timeline.events(events, observed_at);
         self.context.fleet = Some(FleetView {
             roster,
             episode_roster,
