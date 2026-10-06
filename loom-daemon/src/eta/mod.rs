@@ -129,6 +129,7 @@ pub mod heuristics;
 pub mod history;
 pub mod journal;
 pub mod labels;
+pub mod loop_features;
 pub mod offline;
 pub mod point_in_time;
 pub mod pr_features;

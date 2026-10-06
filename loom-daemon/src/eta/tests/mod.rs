@@ -29,6 +29,7 @@ mod journal;
 pub(crate) mod land_twin_otter;
 mod land_v3;
 mod little_v0;
+mod loop_features;
 mod merge_hold;
 mod offline;
 mod point_in_time;
