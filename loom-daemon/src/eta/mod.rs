@@ -726,6 +726,8 @@ impl Registry {
                 // #10508: twin-otter-b's priority-aware successor, also
                 // before the twin-otter pair.
                 Box::new(heuristics::LandKeenWren::new(fit_v2.clone())),
+                // #10524 slice 4: keen-wren wrapped by IPCW split-conformal.
+                Box::new(heuristics::LandBoldLark::new(fit_v2.clone())),
                 Box::new(heuristics::LandTwinOtter::new(fit.clone())),
                 Box::new(heuristics::LandTwinOtterB::new(fit.clone())),
                 Box::new(heuristics::DependencyComposition::tandem_wren(fit.clone())),

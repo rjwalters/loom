@@ -8,7 +8,9 @@
 //!
 //! - [`classify::classify`] picks [`classify::Route::EtagView`] /
 //!   [`classify::Route::EtagList`] for the `issue|pr view|list --json …`
-//!   shapes the in-repo ETag modules reproduce exactly, and
+//!   shapes the in-repo ETag modules reproduce exactly,
+//!   [`classify::Route::EtagChecks`] for the `pr checks <N>` shapes
+//!   [`pr_checks`] reproduces from REST (#10516), and
 //!   [`classify::Route::Passthrough`] for everything else.
 //! - An ETag route is served in-process by [`crate::forge_cached_view`] /
 //!   [`crate::forge_cached_list`]: a conditional `gh api` request whose `304`
@@ -33,7 +35,9 @@
 //! them to a repo's reader App when one is configured (#9537).
 
 pub mod classify;
+pub mod go_sort;
 pub mod next_gh;
+pub mod pr_checks;
 pub mod session_env;
 
 #[cfg(test)]
@@ -130,6 +134,24 @@ fn no_cache() -> bool {
     .any(|k| env_on(k))
 }
 
+/// A served call: what `gh` would have written and its exit status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Served {
+    pub stdout: String,
+    pub stderr: String,
+    pub code: i32,
+}
+
+impl Served {
+    fn ok(stdout: String) -> Self {
+        Self {
+            stdout,
+            stderr: String::new(),
+            code: 0,
+        }
+    }
+}
+
 /// The front proper. Returns the exit code to exit with (a passthrough
 /// replaces this process and never returns).
 #[must_use]
@@ -154,9 +176,10 @@ pub fn run(raw: &[OsString]) -> i32 {
             record("revalidated", raw);
             let mut stdout = std::io::stdout().lock();
             // A closed pipe (`gh … | head -1`) is the reader's choice.
-            let _ = stdout.write_all(out.as_bytes());
+            let _ = stdout.write_all(out.stdout.as_bytes());
             let _ = stdout.flush();
-            return 0;
+            let _ = std::io::stderr().lock().write_all(out.stderr.as_bytes());
+            return out.code;
         }
         record("bypass", raw);
     }
@@ -171,7 +194,7 @@ pub fn run(raw: &[OsString]) -> i32 {
 
 /// The ETag-served output, or `None` to pass through. Every failure of the
 /// cache layer lands here as `None`: caching is never a correctness mechanism.
-fn serve(raw: &[OsString], next: &Path) -> Option<String> {
+fn serve(raw: &[OsString], next: &Path) -> Option<Served> {
     if no_cache() || std::io::stdout().is_terminal() {
         return None; // A TTY gets gh's human/colour output, which we do not reproduce.
     }
@@ -191,6 +214,14 @@ fn serve(raw: &[OsString], next: &Path) -> Option<String> {
         Route::EtagView(entity) => {
             let served = pin_repo(args[1..].to_vec(), cwd.as_deref())?;
             crate::forge_cached_view::build_output_via(STATS_CALLER, entity.as_str(), &served, next)
+                .map(Served::ok)
+        }
+        Route::EtagChecks => {
+            if gh_output_altered() {
+                return None;
+            }
+            let served = pin_repo(args[2..].to_vec(), cwd.as_deref())?;
+            pr_checks::serve(&served, next, cwd.as_deref())
         }
         Route::EtagList(entity, served) => {
             let jq = served
@@ -208,14 +239,26 @@ fn serve(raw: &[OsString], next: &Path) -> Option<String> {
             crate::observability::pick_journal::record_listing(&listing);
             let out = listing.render()?;
             if jq {
-                return Some(out);
+                return Some(Served::ok(out));
             }
             // The listing module pretty-prints; `gh --json` off a TTY is compact.
             let v: serde_json::Value = serde_json::from_str(&out).ok()?;
-            serde_json::to_string(&v).ok().map(|s| format!("{s}\n"))
+            serde_json::to_string(&v)
+                .ok()
+                .map(|s| Served::ok(format!("{s}\n")))
         }
         Route::Passthrough => None,
     }
+}
+
+/// Environment that makes `gh` print something else off a TTY: a forced
+/// TTY, forced colour (colourised `--json`), or debug output on stderr.
+fn gh_output_altered() -> bool {
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.is_empty());
+    set("GH_FORCE_TTY")
+        || set("GH_DEBUG")
+        || set("DEBUG")
+        || std::env::var("CLICOLOR_FORCE").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 /// Name the repo `gh` itself would use, as an explicit `--repo`, so the ETag

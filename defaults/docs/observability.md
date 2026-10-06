@@ -626,7 +626,11 @@ category=SESSION_DOWN`, and the terminal-record parser applies it to the
 adapter's generic `RECOVERABLE`/78 record, so no adapter script carries a
 per-cause arm. It is carried as
 `loom.admission.reason="session-down"` on the `loom.role_attempt` span; it
-records no account hold.
+records no account hold. `session-down` on the span includes "Docker did not
+answer at spawn" (a failed `docker inspect`), not only a stopped, restarting or
+missing container; the watch's unqueryable-docker WARN is what tells the two
+apart. A spawn-time probe that was abandoned (deadline, signal) is not labelled
+`session-down`.
 
 **Stale-mount dispatch refusal (#10364).** Before `docker exec --workdir`,
 `session-exec host` checks that one of the running container's mounts covers

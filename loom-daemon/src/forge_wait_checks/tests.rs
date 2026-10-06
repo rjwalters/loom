@@ -48,6 +48,12 @@ for a in "$@"; do
   prev="$a"
 done
 k=$(printf '%s' "$url" | tr -c 'A-Za-z0-9' '_')
+if [ -f '{d}'/"$k.raw" ]; then
+  echo "RAW - $url" >> '{d}/calls.log'
+  cat '{d}'/"$k.raw"
+  cat '{d}'/"$k.err" 1>&2
+  exit 1
+fi
 if [ -f '{d}'/"$k.out" ]; then
   echo "OUT - $url" >> '{d}/calls.log'
   cat '{d}'/"$k.out"
@@ -92,6 +98,23 @@ cat '{d}'/"$k.body"
         let etag = format!("W/\"{}\"", crate::short_hash::short_sha16(&text));
         std::fs::write(self.dir.path().join(format!("{}.body", key(url))), &text).unwrap();
         std::fs::write(self.dir.path().join(format!("{}.etag", key(url))), etag).unwrap();
+    }
+
+    /// Refuse `url` with `status` (a raw `--include` response and gh's
+    /// stderr line), until [`Forge::serve`] is called for it again.
+    fn refuse(&self, url: &str, status: u16, headers: &str, body: &str) {
+        let raw = format!("HTTP/2.0 {status} Forbidden\r\n{headers}\r\n{body}");
+        let msg = crate::forge_denial::body_message(body).unwrap_or_default();
+        std::fs::write(self.dir.path().join(format!("{}.raw", key(url))), raw).unwrap();
+        std::fs::write(
+            self.dir.path().join(format!("{}.err", key(url))),
+            format!("gh: {msg} (HTTP {status})\n"),
+        )
+        .unwrap();
+    }
+
+    fn unrefuse(&self, url: &str) {
+        let _ = std::fs::remove_file(self.dir.path().join(format!("{}.raw", key(url))));
     }
 
     fn pull(&self, sha: &str) {
@@ -679,4 +702,97 @@ fn required_only_waits_for_a_required_check_that_has_not_been_created() {
     o.required_only = true;
     assert_eq!(go(&f, Selector::Pr(42), &o, &mut clock), Outcome::Green { sha: SHA.into() });
     assert_eq!(f.polls(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// #10633: 403s are classified; a statuses permission refusal degrades
+// ---------------------------------------------------------------------------
+
+const NOT_ACCESSIBLE: &str =
+    r#"{"message":"Resource not accessible by integration","status":"403"}"#;
+const SECONDARY: &str = r#"{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}"#;
+
+#[test]
+fn a_statuses_permission_refusal_degrades_to_check_runs_only_with_a_note() {
+    let f = Forge::new();
+    f.runs(SHA, &[run("build", "completed", Some("success"))]);
+    f.refuse(&status_url(SHA), 403, "", NOT_ACCESSIBLE);
+    let (o, notes) = wait(&mut f.reads(), &Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    assert_eq!(o.sentinel(), format!("LOOM-CHECKS-GREEN {SHA}"));
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("permission (needs statuses:read)"), "{notes:?}");
+    assert!(notes[0].contains("Resource not accessible by integration"), "{notes:?}");
+    assert!(notes[0].contains("Commit statuses: Read"), "{notes:?}");
+}
+
+#[test]
+fn a_degraded_wait_stops_asking_for_statuses_and_still_waits_for_a_required_status() {
+    let f = Forge::new();
+    f.runs(SHA, &[run("build", "completed", Some("success"))]);
+    // `ci/jenkins` is required and reported only as a legacy status we cannot
+    // read: the verdict must never be GREEN.
+    f.required(&["ci/jenkins"]);
+    f.refuse(&status_url(SHA), 403, "", NOT_ACCESSIBLE);
+    let o = go(&f, Selector::Pr(42), &opts(600), &mut FakeClock::new());
+    assert_eq!(o.sentinel(), format!("LOOM-CHECKS-TIMEOUT {SHA} ci/jenkins"));
+    let status_reads = f.calls().iter().filter(|c| c.contains("/status?")).count();
+    assert_eq!(status_reads, 1, "{:?}", f.calls());
+}
+
+#[test]
+fn an_empty_rollup_with_unreadable_statuses_is_error_never_none() {
+    let f = Forge::new();
+    f.runs(SHA, &[]);
+    f.refuse(&status_url(SHA), 403, "", NOT_ACCESSIBLE);
+    let o = go(&f, Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    match &o {
+        Outcome::Error(w) => {
+            assert!(w.starts_with("statuses-unreadable: HTTP 403"), "{w}");
+            assert!(w.contains("permission (needs statuses:read)"), "{w}");
+        }
+        other => panic!("expected ERROR, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_check_runs_permission_refusal_is_error_naming_the_permission() {
+    let f = Forge::new();
+    f.refuse(&runs_url(SHA), 403, "", NOT_ACCESSIBLE);
+    let o = go(&f, Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    match &o {
+        Outcome::Error(w) => {
+            assert!(w.starts_with("HTTP 403 for repos/o/r/commits/"), "{w}");
+            assert!(w.contains("permission (needs checks:read)"), "{w}");
+        }
+        other => panic!("expected ERROR, got {other:?}"),
+    }
+    assert_eq!(f.polls(), 1, "a permission refusal is not retried");
+}
+
+#[test]
+fn a_secondary_rate_limit_403_is_retried_not_reported_as_permission() {
+    let f = Forge::new();
+    f.runs(SHA, &[run("build", "completed", Some("success"))]);
+    f.refuse(&status_url(SHA), 403, "Retry-After: 60\r\n", SECONDARY);
+    let url = status_url(SHA);
+    let mut clock = FakeClock::new().at(30, || f.unrefuse(&url));
+    let (o, notes) = wait(&mut f.reads(), &Selector::Pr(42), &opts(1800), &mut clock);
+    assert_eq!(o.sentinel(), format!("LOOM-CHECKS-GREEN {SHA}"));
+    assert!(notes.is_empty(), "a rate limit never degrades: {notes:?}");
+}
+
+#[test]
+fn a_persistent_secondary_rate_limit_ends_as_read_failed_naming_the_class() {
+    let f = Forge::new();
+    f.runs(SHA, &[run("build", "completed", Some("success"))]);
+    f.refuse(&status_url(SHA), 403, "Retry-After: 60\r\n", SECONDARY);
+    let o = go(&f, Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    match &o {
+        Outcome::Error(w) => {
+            assert!(w.starts_with("read-failed: HTTP 403"), "{w}");
+            assert!(w.contains("secondary-rate-limit"), "{w}");
+            assert!(!w.contains("permission"), "{w}");
+        }
+        other => panic!("expected ERROR, got {other:?}"),
+    }
 }

@@ -263,8 +263,8 @@ host_refusal() {
     # $1 = body of the fake docker; prints host's stderr then "rc=<code>"
     printf '#!/usr/bin/env bash\n%s\n' "$1" > "$HOST_DOCKER_DIR/docker"
     chmod +x "$HOST_DOCKER_DIR/docker"
-    (PATH="$HOST_DOCKER_DIR:$PATH" "$LOOM_DAEMON_SELF_BIN" session-exec host \
-        --container loom-codex-session-acct --workdir "$WS" -- true 2>&1 >/dev/null; echo "rc=$?")
+    ( { PATH="$HOST_DOCKER_DIR:$PATH" "$LOOM_DAEMON_SELF_BIN" session-exec host \
+          --container loom-codex-session-acct --workdir "$WS" -- true >/dev/null; } 2>&1; echo "rc=$?")
 }
 out="$(host_refusal 'echo false')"
 assert_contains "$REFUSAL" "$out" "session-exec host announces SESSION_DOWN for a container that is not running"
