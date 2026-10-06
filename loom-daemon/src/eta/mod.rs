@@ -129,6 +129,7 @@ pub mod history;
 pub mod journal;
 pub mod labels;
 pub mod offline;
+pub mod point_in_time;
 pub mod pr_features;
 pub(crate) mod pr_features_forge;
 pub mod priority_features;

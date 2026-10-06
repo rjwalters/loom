@@ -30,6 +30,7 @@ mod land_v3;
 mod little_v0;
 mod merge_hold;
 mod offline;
+mod point_in_time;
 mod primitives;
 mod priority_features;
 mod queue_features;

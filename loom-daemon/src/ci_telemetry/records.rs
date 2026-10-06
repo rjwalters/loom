@@ -715,6 +715,9 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
     let workflow = run.workflow();
     let ctx = run_context(&repo.full_name, run.id, run.run_attempt);
     let trigger_reason = run.trigger_reason().as_str();
+    // #10511: the knowable-at instant — when this daemon built the record
+    // from what GitHub returned, not GitHub's own event time.
+    let observed_at = Some(Utc::now());
     let record = CiRunRecord {
         repo: repo.full_name.clone(),
         visibility: repo.visibility(),
@@ -736,6 +739,7 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
         duration_ms: duration,
         queued_ms: run.queued_ms(),
         trigger_reason: Some(trigger_reason.to_string()),
+        observed_at,
     };
     let duration_record = CiDurationRecord {
         metric: CiDurationMetric::Run,
@@ -751,6 +755,7 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
         started_at,
         completed_at,
         duration_ms: duration,
+        observed_at,
     };
     let span = SpanRecord {
         context: ctx.clone(),
@@ -830,6 +835,8 @@ pub fn job_envelopes_with_reason(
     let run_span = run_context(&repo.full_name, run.id, job.run_attempt).span_id;
     let shard = parse_shard(&job.name);
     let dependency_wait_ms = job.dependency_wait_ms(baseline);
+    // #10511: see `run_envelopes`.
+    let observed_at = Some(Utc::now());
     let record = CiJobRecord {
         repo: repo.full_name.clone(),
         visibility: repo.visibility(),
@@ -850,6 +857,7 @@ pub fn job_envelopes_with_reason(
         shard_index: shard.index,
         shard_total: shard.total,
         shard_kind: shard.kind.as_str().to_string(),
+        observed_at,
     };
     let duration_record = CiDurationRecord {
         metric: CiDurationMetric::Job,
@@ -865,6 +873,7 @@ pub fn job_envelopes_with_reason(
         started_at,
         completed_at,
         duration_ms: duration,
+        observed_at,
     };
     let span = SpanRecord {
         context: ctx.clone(),
