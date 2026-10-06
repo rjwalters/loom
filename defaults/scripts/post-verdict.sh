@@ -373,26 +373,12 @@ if [[ "$VERDICT" == "approved" ]]; then
   }
   PENDING_NEXT="Nothing was posted. Do NOT add loom:pr: release your claim, leave loom:review-requested, and re-evaluate once CI settles on this head."
   case "$CI_TOKEN" in
-    LOOM-CHECKS-GREEN|LOOM-CHECKS-NONE)
-      if [[ -z "$CI_SHA" || "$CI_SHA" != "$SHA"* ]]; then
-        ci_refuse "checks were read for ${CI_SHA:-an unknown head}, not the reviewed head $SHA" "$PENDING_NEXT" 5
-      fi
-      ;;
-    LOOM-CHECKS-RED)
-      ci_refuse "a check on $SHA is failing (required or not — an all-CI policy refuses both)" "Nothing was posted. Post changes-requested naming the checks above (loom:ci-failure); if the only failure is an external approval-required workflow, point at the operator rather than the Doctor." 6
-      ;;
-    LOOM-CHECKS-TIMEOUT)
-      ci_refuse "checks on $SHA are pending (or empty while contexts are required)" "$PENDING_NEXT" 5
-      ;;
-    LOOM-CHECKS-HEAD-MOVED)
-      ci_refuse "the PR head moved during inspection" "$PENDING_NEXT" 5
-      ;;
-    LOOM-CHECKS-ERROR)
-      ci_refuse "the checks could not be read" "$PENDING_NEXT" 5
-      ;;
-    *)
-      ci_refuse "no checks sentinel from '${LOOM_DAEMON_BIN:-loom-daemon} forge wait-checks' (missing daemon, or older than 0.19.707?) — an unread CI state is never green. Run ./.loom/scripts/resync-installed.sh / roll loom-daemon" "$PENDING_NEXT" 5
-      ;;
+    LOOM-CHECKS-GREEN|LOOM-CHECKS-NONE) [[ -n "$CI_SHA" && "$CI_SHA" == "$SHA"* ]] || ci_refuse "checks were read for ${CI_SHA:-an unknown head}, not the reviewed head $SHA" "$PENDING_NEXT" 5 ;;
+    LOOM-CHECKS-RED) ci_refuse "a check on $SHA is failing (required or not — an all-CI policy refuses both)" "Nothing was posted. Post changes-requested naming the checks above (loom:ci-failure); if the only failure is an external approval-required workflow, point at the operator rather than the Doctor." 6 ;;
+    LOOM-CHECKS-TIMEOUT) ci_refuse "checks on $SHA are pending (or empty while contexts are required)" "$PENDING_NEXT" 5 ;;
+    LOOM-CHECKS-HEAD-MOVED) ci_refuse "the PR head moved during inspection" "$PENDING_NEXT" 5 ;;
+    LOOM-CHECKS-ERROR) ci_refuse "the checks could not be read" "$PENDING_NEXT" 5 ;;
+    *) ci_refuse "no checks sentinel from '${LOOM_DAEMON_BIN:-loom-daemon} forge wait-checks' (missing daemon, or older than 0.19.707?) — an unread CI state is never green. Run ./.loom/scripts/resync-installed.sh / roll loom-daemon" "$PENDING_NEXT" 5 ;;
   esac
 fi
 
