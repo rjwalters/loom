@@ -615,10 +615,6 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ("heuristics/land_v2.rs", include_str!("../heuristics/land_v2.rs")),
     ("heuristics/land_v3.rs", include_str!("../heuristics/land_v3.rs")),
     (
-        "heuristics/land_amber_heron.rs",
-        include_str!("../heuristics/land_amber_heron.rs"),
-    ),
-    (
         "heuristics/land_fresh_tide.rs",
         include_str!("../heuristics/land_fresh_tide.rs"),
     ),

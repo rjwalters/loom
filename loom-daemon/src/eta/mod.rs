@@ -656,8 +656,6 @@ impl Registry {
                 Box::new(heuristics::FinishV1),
                 Box::new(heuristics::LandV1),
                 Box::new(heuristics::LandV2),
-                Box::new(heuristics::LandV3),
-                Box::new(heuristics::LandAmberHeron),
                 Box::new(heuristics::LandFreshTide::default()),
                 Box::new(heuristics::LandV4),
                 Box::new(heuristics::LandTwinOtter::new(fit.clone())),

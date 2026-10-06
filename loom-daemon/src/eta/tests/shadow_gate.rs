@@ -535,3 +535,66 @@ fn answer_rates_are_counted_once_per_pass_not_once_per_emitted_row() {
     assert_eq!(stats.answer_pairs, 6);
     assert_eq!(stats.current_answer_rate, Some(0.5));
 }
+
+// ------------------------------------- retired heuristics (#10484)
+
+/// `land-v3` and `land-2026-10-04-amber-heron` left the registry on
+/// 2026-10-06. A ledger and a pending set persisted before that still name
+/// them: both must load and the live pairs must be untouched; a promotion
+/// evaluation naming a retired candidate never promotes.
+#[test]
+fn legacy_entries_for_retired_heuristics_load_cleanly_and_are_ignored() {
+    let retired = ["land-v3", "land-2026-10-04-amber-heron"];
+    let registry = Registry::builtin();
+    for id in retired {
+        assert!(registry.get(id).is_none(), "{id} is retired");
+    }
+
+    let at = as_of() + Duration::seconds(500);
+    let current_land = |_: Kind| LAND_V1.to_string();
+    let q = (600, 1200, 1800, Some(3600));
+    let mut ledger = ShadowLedger::default();
+    for id in retired {
+        ledger.record(
+            &current_land,
+            &[
+                resolved(summary(LAND_V1, 0, q), OutcomeKind::Landed, at),
+                resolved(summary(id, 0, q), OutcomeKind::Landed, at),
+            ],
+        );
+    }
+    ledger.record(
+        &current_land,
+        &[
+            resolved(summary(LAND_V1, 1, q), OutcomeKind::Landed, at),
+            resolved(summary(LAND_V2, 1, q), OutcomeKind::Landed, at),
+        ],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = shadow::ledger_path(dir.path());
+    shadow::write_ledger(&path, &ledger).unwrap();
+    let (loaded, note) = shadow::load_ledger(&path, as_of());
+    assert_eq!(note, None, "a legacy ledger is not an unreadable one");
+    assert_eq!(loaded, ledger);
+    assert_eq!(loaded.stats(Kind::Land, LAND_V1, LAND_V2).pairs, 1, "live pairs intact");
+
+    // Pending estimates naming retired ids restore without error and expire
+    // like any other; they never reach the registry.
+    let mut tracker = Tracker::new(provenance());
+    tracker.restore_pending(
+        retired
+            .iter()
+            .map(|id| summary(id, 0, (600, 1200, 1800, None)))
+            .collect(),
+    );
+    assert_eq!(tracker.pending().len(), 2);
+    let expired = tracker.expire(as_of() + Duration::days(PENDING_MAX_AGE_DAYS + 1));
+    assert_eq!(expired.dropped, 2);
+
+    // A promotion evaluation for a retired candidate never promotes.
+    for id in retired {
+        let stats = loaded.stats(Kind::Land, LAND_V1, id);
+        let decision = shadow::evaluate(Kind::Land, LAND_V1, id, None, &stats, as_of());
+        assert!(!decision.promote, "a retired candidate is never promoted");
+    }
+}
