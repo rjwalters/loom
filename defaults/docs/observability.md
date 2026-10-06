@@ -584,6 +584,12 @@ calls, another host, an operator) or an uninstrumented caller. A negative
 shadow means the bucket's readings undercount it (sparse readings, or the
 readings describe another bucket — #10571), not that Loom over-spent.
 
+**Uncovered `gh` callers (#10343, tracked in #10618).** Spend from `safehouse.rs`,
+`auto_update`/`release_resolve`, `credential_preflight`, `sweep-lease-renew.sh`,
+`peer_coord.rs` and `main_health_gate` bypasses the `invoke github` span, so it
+reads as shadow spend. The span-vs-`/rate_limit` hourly reconciliation is an
+operational check on a fleet host (shadow recipe above), not a CI check.
+
 **Long-running task liveness and self-update decisions (#10414).** Each
 long-running daemon loop beats a process-global liveness registry
 (`crate::task_liveness`) once per finished iteration. The loops are the
