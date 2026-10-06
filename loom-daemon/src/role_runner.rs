@@ -2333,7 +2333,9 @@ pub fn resolve_role_prompt(spec: &RoleSpec, config: &RoleRunnerConfig) -> String
 // ============================================================================
 
 /// Shared "a role invocation is currently running" set, keyed by
-/// `(workspace_root, role_name)`.
+/// `(workspace_root, role_name, lane)`. Lane `0` is the one classic run per
+/// `(root, role)`; only doctor's per-repository width opens lanes above it
+/// (#10632, [`concurrent_dispatch::lanes`]).
 ///
 /// Shared (one instance, cloned) between the interval role loops
 /// ([`spawn_multi_role_task`]) and the idle-edge-triggered path
@@ -2342,7 +2344,7 @@ pub fn resolve_role_prompt(spec: &RoleSpec, config: &RoleRunnerConfig) -> String
 /// idle path refuses to fire while the entry is present (and vice versa). This
 /// is **in-process shared state only** — deliberately not an event-bus topic
 /// (the taxonomy is frozen, #4364).
-pub type InProgressGuard = Arc<Mutex<HashSet<(PathBuf, &'static str)>>>;
+pub type InProgressGuard = Arc<Mutex<HashSet<(PathBuf, &'static str, usize)>>>;
 
 static ROLE_RUN_START_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -2408,7 +2410,7 @@ pub fn role_run_start_generation() -> u64 {
 #[derive(Debug)]
 pub struct RoleRunGuard {
     set: InProgressGuard,
-    key: (PathBuf, &'static str),
+    key: (PathBuf, &'static str, usize),
 }
 
 /// The outcome of one role-agent admission attempt ([`RoleRunGuard::admit`]).
@@ -2525,7 +2527,7 @@ impl RoleRunGuard {
         ceiling: usize,
         role_budget: usize,
     ) -> RoleAdmission {
-        let key = (root, role);
+        let key = (root, role, 0);
         {
             let mut guard = set.lock().unwrap_or_else(PoisonError::into_inner);
             if guard.contains(&key) {
@@ -2535,7 +2537,7 @@ impl RoleRunGuard {
             if active >= ceiling {
                 return RoleAdmission::CeilingReached { active, ceiling };
             }
-            let role_active = guard.iter().filter(|(_, r)| *r == role).count();
+            let role_active = guard.iter().filter(|(_, r, _)| *r == role).count();
             if role_active >= role_budget {
                 return RoleAdmission::RoleBudgetReached {
                     role,
