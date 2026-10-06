@@ -500,6 +500,79 @@ fn a_spill_never_targets_a_reader_projected_at_60_or_more() {
 }
 
 #[test]
+fn a_held_latch_keeps_its_target_while_the_targets_projection_crosses_60() {
+    // Review finding on #10466: the target used to be re-chosen from its
+    // live projection on every call, so a target oscillating around
+    // targetMaxPct flapped spilled URLs between readers (one 200 per move).
+    let r = roster(vec![reader("81121", None), reader("81122", None)]);
+    let ws = workspace(&r, &["acme"]);
+    let cfg = latch_cfg();
+    let t0 = SystemTime::now();
+    let repo = "acme/pinned-target";
+    let home = forge_read_pool::assignment_index(repo, 2).unwrap();
+    let (home_app, other) = (r.readers[home].app_id.clone(), r.readers[1 - home].app_id.clone());
+    book_projected(&home_app, "acme", 95.0, t0);
+    let keys = urls(repo, 20);
+    for (i, pct) in [55.0, 65.0, 50.0, 85.0].into_iter().enumerate() {
+        let at = t0 + Duration::from_secs(5 * i as u64);
+        book_projected(&other, "acme", pct, at);
+        for url in &keys {
+            let d = route_read_in(ws.path(), &r, &req(repo, Some(url)), &v2(&cfg), at);
+            assert_eq!(
+                (app_of(&d), placement_of(&d)),
+                (other.as_str(), Placement::Spill),
+                "{url} at target {pct}%: a held latch never re-picks a usable target"
+            );
+        }
+        assert_eq!(pinned_target(repo, Resource::Core, &home_app).as_deref(), Some(other.as_str()));
+    }
+}
+
+#[test]
+fn a_withdrawn_or_full_target_is_re_picked() {
+    let r = roster(vec![
+        reader("81131", None),
+        reader("81132", None),
+        reader("81133", None),
+    ]);
+    let ws = workspace(&r, &["acme"]);
+    let cfg = latch_cfg();
+    let t0 = SystemTime::now();
+    let repo = "acme/repick";
+    let home = forge_read_pool::assignment_index(repo, 3).unwrap();
+    let home_app = r.readers[home].app_id.clone();
+    let first = r.readers[(home + 1) % 3].app_id.clone();
+    let second = r.readers[(home + 2) % 3].app_id.clone();
+    book_projected(&home_app, "acme", 95.0, t0);
+    let route = |at| {
+        app_of(&route_read_in(ws.path(), &r, &req(repo, Some("k")), &v2(&cfg), at)).to_string()
+    };
+    assert_eq!(route(t0), first, "the first reader with headroom is pinned");
+
+    // The pinned target reaches spillFullPct: re-picked to the next one.
+    let t1 = t0 + Duration::from_secs(5);
+    book_projected(&first, "acme", 91.0, t1);
+    assert_eq!(route(t1), second);
+    assert_eq!(pinned_target(repo, Resource::Core, &home_app).as_deref(), Some(second.as_str()));
+
+    // The first reader cools off: the new pin holds, nothing moves back.
+    let t2 = t0 + Duration::from_secs(10);
+    book_projected(&first, "acme", 10.0, t2);
+    assert_eq!(route(t2), second);
+
+    // The pinned target is withdrawn: re-picked to the first reader again.
+    let t3 = t0 + Duration::from_secs(15);
+    forge_read_pool::withdraw_scoped_until(
+        &second,
+        "acme",
+        forge_read_pool::ResourceScope::Core,
+        t3 + Duration::from_secs(600),
+    );
+    assert_eq!(route(t3), first);
+    assert_eq!(pinned_target(repo, Resource::Core, &home_app).as_deref(), Some(first.as_str()));
+}
+
+#[test]
 fn an_unknown_home_reading_never_moves_anything() {
     let r = roster(vec![reader("81111", None), reader("81112", None)]);
     let ws = workspace(&r, &["acme"]);

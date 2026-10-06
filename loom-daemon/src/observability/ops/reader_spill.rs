@@ -7,6 +7,9 @@
 //! (`partial` / `full`) or released (`off`) — is one instant span naming the
 //! repo, the bucket's resource, the home reader (`from`), the target (`to`,
 //! `home` when none has headroom or on release) and the release instant.
+//! The latch pins its target; when a held latch has to re-pick one (the
+//! pinned target was withdrawn, went stale or reached `spillFullPct`), that
+//! re-pick is one more span with the latch's current mode and the new `to`.
 //! Spills should be rare (a few per repo per day); this is how that is
 //! verified.
 //!

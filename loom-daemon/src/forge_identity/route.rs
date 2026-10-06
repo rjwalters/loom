@@ -18,9 +18,14 @@
 //!   (≥ `spillProjectedPct`) or all (≥ `spillFullPct`, or withdrawn) of its
 //!   requests move to the next reader that has headroom
 //!   (< `targetMaxPct`, or unknown). The latch holds until the home bucket's
-//!   reset, so a URL moves at most once away and once back per window. An
-//!   unknown home reading never engages it, and no target with headroom
-//!   means the request stays home.
+//!   reset, and it **pins** the target it chose: later readings of the
+//!   target never move a spilled URL (GitHub ETags are credential-specific,
+//!   so every move costs a full `200`). The pin is re-chosen only when the
+//!   target becomes unusable — withdrawn, a stale token, or projected at or
+//!   above `spillFullPct` — and each re-pick is a `forge.reader.spill` span.
+//!   So while the target stays usable a URL moves at most once away and
+//!   once back per window. An unknown home reading never engages the latch,
+//!   and no target with headroom means the request stays home.
 //!
 //! With no `splitRepos` and no home reading at or above `spillProjectedPct`
 //! the choice is byte-identical to the pre-W4-B walk.
@@ -469,13 +474,22 @@ pub fn step(
 /// split repo's two homes latch independently (an unsplit repo has one).
 type LatchKey = (String, Resource, String);
 
-fn latches() -> &'static Mutex<HashMap<LatchKey, Latch>> {
-    static LATCHES: OnceLock<Mutex<HashMap<LatchKey, Latch>>> = OnceLock::new();
+/// An engaged latch and the spill target it pinned (`None` until a target
+/// with headroom was found).
+type Held = (Latch, Option<String>);
+
+fn latches() -> &'static Mutex<HashMap<LatchKey, Held>> {
+    static LATCHES: OnceLock<Mutex<HashMap<LatchKey, Held>>> = OnceLock::new();
     LATCHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn latch_key(owner_repo: &str, resource: Resource, home_app: &str) -> LatchKey {
+    (owner_repo.to_ascii_lowercase(), resource, home_app.to_string())
+}
+
 /// Advance the latch for `(owner_repo, resource, home)` and return it with
-/// the transitions taken.
+/// the transitions taken and the target it has pinned. A release drops the
+/// pin; an escalation (partial → full) keeps it.
 fn advance(
     owner_repo: &str,
     resource: Resource,
@@ -483,21 +497,53 @@ fn advance(
     home: &HomeState,
     cfg: &RoutingConfig,
     now: SystemTime,
-) -> (Option<Latch>, Vec<Transition>) {
+) -> (Option<Latch>, Vec<Transition>, Option<String>) {
     let Ok(mut map) = latches().lock() else {
-        return (None, Vec::new()); // a poisoned lock must not move reads
+        return (None, Vec::new(), None); // a poisoned lock must not move reads
     };
-    let key = (owner_repo.to_ascii_lowercase(), resource, home_app.to_string());
-    let (next, transitions) = step(map.get(&key).copied(), home, cfg, now);
+    let key = latch_key(owner_repo, resource, home_app);
+    let held = map.get(&key).cloned();
+    let (next, transitions) = step(held.as_ref().map(|h| h.0), home, cfg, now);
+    let released = transitions.contains(&Transition::Released);
+    let pin = if released {
+        None
+    } else {
+        held.and_then(|h| h.1)
+    };
     match next {
         Some(l) => {
-            map.insert(key, l);
+            map.insert(key, (l, pin.clone()));
         }
         None => {
             map.remove(&key);
         }
     }
-    (next, transitions)
+    (next, transitions, if next.is_some() { pin } else { None })
+}
+
+/// Record `target` as the pinned spill target of the engaged latch for
+/// `(owner_repo, resource, home)`; a no-op once it has released.
+fn pin_target(owner_repo: &str, resource: Resource, home_app: &str, target: Option<&str>) {
+    let Ok(mut map) = latches().lock() else {
+        return;
+    };
+    if let Some(held) = map.get_mut(&latch_key(owner_repo, resource, home_app)) {
+        held.1 = target.map(str::to_string);
+    }
+}
+
+/// The pinned spill target of the latch for `(owner_repo, resource, home)`.
+#[cfg(test)]
+pub(crate) fn pinned_target(
+    owner_repo: &str,
+    resource: Resource,
+    home_app: &str,
+) -> Option<String> {
+    latches()
+        .lock()
+        .ok()?
+        .get(&latch_key(owner_repo, resource, home_app))
+        .and_then(|h| h.1.clone())
 }
 
 /// Every latch engaged at `now`: `(owner/repo, resource, home app, latch)`.
@@ -508,8 +554,8 @@ pub fn live_latches(now: SystemTime) -> Vec<(String, Resource, String, Latch)> {
     };
     let mut out: Vec<_> = map
         .iter()
-        .filter(|(_, l)| now < l.release_at)
-        .map(|((repo, res, app), l)| (repo.clone(), *res, app.clone(), *l))
+        .filter(|(_, (l, _))| now < l.release_at)
+        .map(|((repo, res, app), (l, _))| (repo.clone(), *res, app.clone(), *l))
         .collect();
     out.sort_by(|a, b| (&a.0, a.1, &a.2).cmp(&(&b.0, b.1, &b.2)));
     out
@@ -647,11 +693,12 @@ pub fn route_read_in(
                 now,
             ),
         };
-        let (latch, transitions) =
+        let (latch, transitions, pinned) =
             advance(req.owner_repo, req.resource, &nominal.app_id, &state, env.cfg, now);
-        // The first reader after home, in walk order, that is usable and
-        // has headroom (projected below targetMaxPct, or unknown).
-        let target = || {
+        // A fresh target: the first reader after home, in walk order, that
+        // is usable and has headroom (projected below targetMaxPct, or
+        // unknown).
+        let fresh_target = || {
             (1..n).find_map(|off| {
                 let r = readers[(start + off) % n];
                 let headroom = bucket_key(&r.app_id, owner, req.resource)
@@ -663,22 +710,24 @@ pub fn route_read_in(
                 usable(r).map(|dir| (r, dir))
             })
         };
-        for t in &transitions {
-            let to = match t {
-                Transition::Released => None,
-                Transition::Engaged(_) => target().map(|(r, _)| r.app_id.clone()),
-            };
-            crate::observability::ops::reader_spill::record_spill(
-                &crate::observability::ops::reader_spill::Spill {
-                    owner_repo: req.owner_repo,
-                    resource: req.resource.as_str(),
-                    from: &nominal.app_id,
-                    to: to.as_deref().unwrap_or("home"),
-                    mode: t.mode_str(),
-                    until: latch.map_or(now, |l| l.release_at).into(),
-                },
-            );
-        }
+        // The pinned target, while it stays usable: a later reading of it
+        // under spillFullPct never moves a spilled URL (ETags are
+        // credential-specific, so each move is a full 200). Only a target
+        // that is withdrawn, stale or projected at spillFullPct or more is
+        // re-chosen.
+        let kept_target = |app: &str| {
+            let r = *readers.iter().find(|r| r.app_id == app)?;
+            if r.app_id == nominal.app_id {
+                return None;
+            }
+            let full = bucket_key(&r.app_id, owner, req.resource)
+                .and_then(|k| forge_bucket_book::projected_used_pct(&k, now_epoch))
+                .is_some_and(|p| p >= env.cfg.spill_full_pct);
+            if full {
+                return None;
+            }
+            usable(r).map(|dir| (r, dir))
+        };
         let moves = latch.is_some_and(|l| match l.mode {
             LatchMode::Full => true,
             LatchMode::Partial => {
@@ -687,8 +736,58 @@ pub fn route_read_in(
                     == Some(1)
             }
         });
+        let engaged = transitions
+            .iter()
+            .any(|t| matches!(t, Transition::Engaged(_)));
+        let chosen = if latch.is_some() && (moves || engaged) {
+            match pinned.as_deref().and_then(kept_target) {
+                Some(kept) => Some(kept),
+                None => {
+                    let found = fresh_target();
+                    let to = found.as_ref().map(|(r, _)| r.app_id.as_str());
+                    if to != pinned.as_deref() {
+                        pin_target(req.owner_repo, req.resource, &nominal.app_id, to);
+                        // An engagement reports its target below; a re-pick
+                        // of a held latch is reported here.
+                        if !engaged {
+                            if let Some(l) = latch {
+                                crate::observability::ops::reader_spill::record_spill(
+                                    &crate::observability::ops::reader_spill::Spill {
+                                        owner_repo: req.owner_repo,
+                                        resource: req.resource.as_str(),
+                                        from: &nominal.app_id,
+                                        to: to.unwrap_or("home"),
+                                        mode: l.mode.as_str(),
+                                        until: l.release_at.into(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    found
+                }
+            }
+        } else {
+            None
+        };
+        for t in &transitions {
+            let to = match t {
+                Transition::Released => None,
+                Transition::Engaged(_) => chosen.as_ref().map(|(r, _)| r.app_id.as_str()),
+            };
+            crate::observability::ops::reader_spill::record_spill(
+                &crate::observability::ops::reader_spill::Spill {
+                    owner_repo: req.owner_repo,
+                    resource: req.resource.as_str(),
+                    from: &nominal.app_id,
+                    to: to.unwrap_or("home"),
+                    mode: t.mode_str(),
+                    until: latch.map_or(now, |l| l.release_at).into(),
+                },
+            );
+        }
         if moves {
-            if let Some((r, dir)) = target() {
+            if let Some((r, dir)) = chosen {
                 return pick(r, dir, Placement::Spill);
             }
         }

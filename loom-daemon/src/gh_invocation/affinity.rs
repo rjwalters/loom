@@ -13,7 +13,9 @@
 //! - **dropped**: `-H` / `--header` (a rotating `If-None-Match` must never
 //!   move a URL), `--jq` / `-q`, `--template` / `-t`, `--include` / `-i`,
 //!   `--paginate`, `--hostname` and `--cache`, which only shape or transport
-//!   the same response.
+//!   the same response. Both value spellings are dropped: the separate
+//!   (`-H v`, `--jq v`), the `--x=v` and the pflag glued short form
+//!   (`-HIf-None-Match:…`, `-q.x`, `-q=.x`).
 
 use std::ffi::OsString;
 
@@ -31,6 +33,15 @@ const DROPPED_VALUED: &[&str] = &[
 
 /// Flags that shape or transport a response, with no value.
 const DROPPED_BARE: &[&str] = &["-i", "--include", "--paginate"];
+
+/// A dropped valued short flag with its value glued on (pflag accepts
+/// `-Hvalue` and `-q=value` as well as `-H value`).
+fn is_glued_short(arg: &str) -> bool {
+    DROPPED_VALUED
+        .iter()
+        .filter(|f| f.len() == 2)
+        .any(|f| arg.len() > 2 && arg.starts_with(f))
+}
 
 /// Separator between kept arguments: a byte no argv element normally holds,
 /// so `["a b"]` and `["a", "b"]` never collide.
@@ -52,6 +63,11 @@ pub fn affinity_key(args: &[OsString]) -> String {
         if DROPPED_VALUED.contains(&name) {
             // `--jq=.x` carries its value inline; `--jq .x` in the next arg.
             i += if inline_value { 1 } else { 2 };
+            continue;
+        }
+        if is_glued_short(&arg) {
+            // `-HIf-None-Match:…`, `-q.x`, `-q=.x`: flag and value in one arg.
+            i += 1;
             continue;
         }
         if DROPPED_BARE.contains(&name) {
@@ -112,6 +128,13 @@ mod tests {
                 "--jq=.state",
                 "--header=X: y",
             ],
+            &[
+                "api",
+                "repos/acme/hot/issues/7",
+                "-HIf-None-Match: \"c\"",
+                "-q.state",
+            ],
+            &["api", "repos/acme/hot/issues/7", "-q=.state", "-t{{.x}}"],
         ] {
             assert_eq!(key(variant), bare, "{variant:?}");
         }
