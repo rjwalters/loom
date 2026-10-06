@@ -622,7 +622,9 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
         | TelemetryRecord::EtaFit(_) => {
             // Issue #9289: the body is the record's JSON (an estimate's whole
             // explanation); scalars ride as `loom.eta.*` attributes.
-            let (event_name, severity, at, attributes, body) = eta::log_parts(&envelope.record)?;
+            let (event_name, severity, at, mut attributes, body) =
+                eta::log_parts(&envelope.record)?;
+            eta::push_authority(&mut attributes, &envelope.record, &envelope.host_id);
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)

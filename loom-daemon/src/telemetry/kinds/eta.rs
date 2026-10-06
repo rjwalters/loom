@@ -27,6 +27,8 @@ use serde::{Deserialize, Serialize};
 pub const ETA_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.story",
     "loom.eta.estimate_id",
+    // `eta.estimate` / `eta.outcome` (#10498): the authority host id.
+    "loom.eta.authority",
     "loom.eta.kind",
     "loom.eta.heuristic",
     "loom.eta.primary",

@@ -20,8 +20,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::doctor::{
-    ConfigFacts, DataFacts, FitFacts, Gate, HeuristicTally, OutcomeFacts, PairFacts, RepoFacts,
-    ServingFacts,
+    AuthorityFacts, ConfigFacts, DataFacts, FitFacts, Gate, HeuristicTally, OutcomeFacts,
+    PairFacts, RepoFacts, ServingFacts,
 };
 use super::{calibration_log, config, fit, fleet, fleet_refresh, health, shadow, Kind, Registry};
 use crate::eta::doctor::Facts;
@@ -45,6 +45,16 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
         interval_secs: eta.fleet_refresh.interval_secs,
         otlp_exporter: exporters.iter().any(|e| e.kind == ExporterKind::Otlp),
         native_exporter: exporters.iter().any(|e| e.kind == ExporterKind::Https),
+        authority: {
+            let r = crate::eta::authority::resolve_with(root, host_id, |k| std::env::var(k).ok());
+            AuthorityFacts {
+                host: r.authority.host.clone(),
+                reason: r.authority.reason.as_str().to_string(),
+                is_local: r.is_authority(),
+                others: r.authority.others.clone(),
+                detail: r.describe(),
+            }
+        },
     };
 
     // The read-only gate resolver: it must never arm the singleton job.

@@ -461,19 +461,29 @@ fn run_production_cycle(
     // After the records: a fit that panics must not cost the cycle's telemetry.
     // #10395: a non-captain first takes the captain's published fit, and fits
     // itself only when there is none to serve.
+    //
+    // #10498: the ETA authority fits locally whoever `fleet.captain` names, so
+    // it never takes a published fit in place of its own; a host that is not
+    // the authority does not fit at all (and emits no `eta.fit` record).
+    let fits_here = fit_authority(root, &gate_host);
     let serving_published = match &ticked.gate {
-        RefreshGate::StandDown { captain } => {
+        RefreshGate::StandDown { captain } if !fits_here => {
             distribute_fetch(root, captain, Utc::now()).is_some_and(|k| k.serving_published())
         }
         _ => false,
     };
     let fit_started = Utc::now();
     let began = std::time::Instant::now();
-    let check =
-        after_cycle(root, fit_started, ticked.fit_held, fit_enabled && !serving_published, fitter);
+    let check = after_cycle(
+        root,
+        fit_started,
+        ticked.fit_held,
+        fit_enabled && fits_here && !serving_published,
+        fitter,
+    );
     // Serving the captain's fit, no fit check ran: emit no `eta.fit` record
     // (it would read `disabled`); `fit-pub/status.json` records the outcome.
-    if !serving_published {
+    if !serving_published && fits_here {
         super::eta_fit::finish(
             root,
             sink,
@@ -491,6 +501,15 @@ fn run_production_cycle(
         let captain = crate::config_resolver::fleet_captain(root).unwrap_or(gate_host);
         distribute_publish(root, &captain, Utc::now());
     }
+}
+
+/// Whether this host runs the ETA fit (#10498): only the fleet's ETA authority
+/// does, independent of `fleet.captain`.
+#[must_use]
+pub fn fit_authority(root: &Path, host_id: &str) -> bool {
+    let resolution = crate::eta::authority::resolve_with(root, host_id, |k| std::env::var(k).ok());
+    crate::eta::authority::log_change(&resolution);
+    resolution.is_authority()
 }
 
 /// #10395, non-captain: fetch the captain's published fit and install it.

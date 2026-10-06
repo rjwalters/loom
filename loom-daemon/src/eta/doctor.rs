@@ -143,6 +143,23 @@ pub struct ConfigFacts {
     pub otlp_exporter: bool,
     /// The native HTTPS exporter is configured (`eta.snapshot` is native-only).
     pub native_exporter: bool,
+    /// The fleet's ETA authority as this host resolves it (#10498).
+    pub authority: AuthorityFacts,
+}
+
+/// The ETA authority resolution as the doctor sees it (#10498).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityFacts {
+    /// The authority host id, `None` when no host qualifies.
+    pub host: Option<String>,
+    /// Why (`explicit`, `fleet_refresh`, `lowest_id_fallback`, `no_candidate`).
+    pub reason: String,
+    /// This host is the authority.
+    pub is_local: bool,
+    /// Other qualifying hosts: a conflict when non-empty.
+    pub others: Vec<String>,
+    /// The resolver's one-line explanation.
+    pub detail: String,
 }
 
 /// One repo in the `data` link.
@@ -313,6 +330,7 @@ fn config(f: &Facts) -> Vec<Check> {
         "LOOM_ETA_FLEET_REFRESH_ENABLED",
         false,
     ));
+    out.push(authority(&c.authority));
     out.push(if c.otlp_exporter {
         Check::ok("config", "otlp_exporter", "an OTLP exporter is configured")
     } else {
@@ -336,6 +354,21 @@ fn config(f: &Facts) -> Vec<Check> {
         )
     });
     out
+}
+
+/// #10498: which host is the fleet's one ETA authority, and why.
+fn authority(a: &AuthorityFacts) -> Check {
+    if a.host.is_none() || !a.others.is_empty() {
+        return Check::bad(
+            "config",
+            "authority",
+            Status::Warn,
+            format!("ETA authority: {}", a.detail),
+            "set fleet.etaAuthority (or LOOM_ETA_AUTHORITY) to the one host that should emit \
+             eta.* records",
+        );
+    }
+    Check::ok("config", "authority", format!("ETA authority: {}", a.detail))
 }
 
 fn data(f: &Facts) -> Vec<Check> {

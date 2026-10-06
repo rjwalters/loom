@@ -1408,6 +1408,8 @@ issue's D32 story trace.
 
 ## The live list (`eta.snapshot`)
 
+> Only the fleet's [ETA authority](#one-eta-authority-per-fleet-fleetetaauthority-10498) emits it (#10498).
+
 The estimates above are emitted one at a time as `eta.estimate` log records
 and live in SigNoz, which is what accuracy scoring needs and what a dashboard
 list does not: answering "what is this host estimating *right now*" from an
@@ -1745,6 +1747,47 @@ estimates report `scope = fleet`. That is #9343's designed path; set
 `historyScope = local` to keep a host on its own journals.
 
 Each pass logs `eta: pass emitted=N refused=M outcomes=K …`.
+
+### One ETA authority per fleet (`fleet.etaAuthority`, #10498)
+
+Exactly one host computes and emits ETAs, so SigNoz holds one series per item,
+not one per host.
+
+- **The rule** (re-read every pass, no restart):
+  1. `fleet.etaAuthority: "<host id>"` (or `LOOM_ETA_AUTHORITY`) names it:
+     reason `explicit`. This is the override, and is how the authority is
+     later moved to the captain.
+  2. Else the fleet refresher: the declared `fleet.captain`, or, with none
+     declared, this host when its own `autonomous.eta.fleetRefresh.enabled` is
+     on: reason `fleet_refresh`.
+  3. Several candidates and no explicit key: the lowest host id wins (reason
+     `lowest_id_fallback`) and the others log one warning per change naming the
+     conflict.
+  4. No candidate and no explicit key: no authority (`no_candidate`); `eta
+     doctor` warns.
+- **How a host learns its peers' state: it does not.** There is no peer
+  roster, and a network read in a per-pass gate would turn a peer outage into
+  an ETA outage. The candidate set uses this host's own inputs plus the
+  committed `fleet.captain` / `fleet.etaAuthority`. `fleetRefresh.enabled`
+  defaults to `true`, so two default hosts with no captain and no
+  `fleet.etaAuthority` each think they are the authority. On a multi-host
+  fleet declare one of the two keys. A fleet where no host has fleetRefresh on
+  and no key is set has no ETA emitter at all.
+- **The authority** runs the tracker passes that emit `eta.estimate`,
+  `eta.outcome` and `eta.snapshot`, and is the only host that fits
+  (`eta-fit/v1`), **locally, even when `fleet.captain` names another host**: it
+  never takes a published fit in place of its own. Published fits (#10395)
+  stay for redundancy. Every `eta.estimate` / `eta.outcome` carries
+  `loom.eta.authority`, the authority's host id.
+- **Every other host** makes no forge read for the ETA pass, emits no
+  `eta.estimate`, `eta.outcome`, `eta.snapshot` or `eta.fit`, and **drops its
+  pending-estimate store** (`.loom/state/eta/pending.jsonl`) on start and on
+  demotion, so it never scores a stale outcome. Its stage journal still
+  records what it saw, and the `eta` CLI keeps working read-only.
+- **Observability.** `eta doctor` prints the authority host and why
+  (`config.authority`). A non-authority host that reaches the ETA sink anyway
+  drops the records and counts
+  `loom.daemon.task_faults{task=eta_pass,reason=eta_non_authority_emit}`.
 
 ### Fleet refresh task (`autonomous.eta.fleetRefresh`, #10263)
 

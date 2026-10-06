@@ -319,6 +319,11 @@ pub fn spawn_task(
 /// One check, off the async workers and behind `catch_unwind`; always emits
 /// its `eta.fit` record.
 async fn check(root: PathBuf, fitter: Fitter, host_id: String, sink: Option<Arc<dyn QueueSink>>) {
+    // #10498: only the fleet's ETA authority fits (re-read every check).
+    if !super::eta_fleet_refresh::fit_authority(&root, &crate::sweep_registry::host_identity()) {
+        log::debug!("eta fit: this host is not the ETA authority; no fit check");
+        return;
+    }
     let started_at = Utc::now();
     let began = std::time::Instant::now();
     let blocking_root = root.clone();

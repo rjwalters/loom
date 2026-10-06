@@ -88,11 +88,7 @@ const GH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Where pending estimates persist across restarts.
 #[must_use]
 pub fn pending_path(workspace_root: &Path) -> PathBuf {
-    workspace_root
-        .join(".loom")
-        .join("state")
-        .join("eta")
-        .join("pending.jsonl")
+    workspace_root.join(".loom/state/eta/pending.jsonl")
 }
 
 /// The OTLP queues ETA records are offered to.
@@ -396,7 +392,7 @@ fn current_ids(state: &State) -> BTreeMap<Kind, String> {
 /// tracker already keeps in memory, never a second tick loop.
 pub(super) fn snapshot_input() -> Option<super::eta_snapshot::SnapshotInput> {
     let guard = lock();
-    let state = guard.as_ref()?;
+    let state = guard.as_ref().filter(|_| authority::active())?;
     let registered = [Kind::Start, Kind::Finish, Kind::Land]
         .into_iter()
         .map(|k| {
@@ -473,6 +469,9 @@ async fn apply_event(effects: Effects, now: DateTime<Utc>) {
         };
         (state.config.dry_run, state.workspace_root.clone(), state.host_id.clone())
     };
+    if authority::journal_only(&root, &effects.journal) {
+        return;
+    }
     let mut dirty = effects.dirty;
     dirty.sort();
     dirty.dedup();
@@ -481,8 +480,7 @@ async fn apply_event(effects: Effects, now: DateTime<Utc>) {
     if let Some(state) = lock().as_mut() {
         note_outcomes(state, &effects.outcomes, now);
     }
-    let loom = Provenance::current();
-    deliver(emissions, effects.outcomes, &loom, &host_id, dry_run, sink());
+    authority::deliver_checked(emissions, effects.outcomes, &host_id, dry_run);
 }
 
 /// The workspace root → slug, resolving and caching on first sight.
@@ -519,11 +517,9 @@ pub fn spawn_task(
     let registry = Registry::load(&workspace_root, Utc::now());
     log_fit(None, registry.fit(), &workspace_root);
     let mut tracker = Tracker::new(loom);
-    // #10484: a pending estimate whose heuristic is no longer registered (a
-    // retired id) is dropped here, so it never scores into the shadow ledger
-    // or an `eta.outcome`.
-    let unregistered =
-        tracker.restore_pending(read_pending(&pending_path(&workspace_root)), &registry);
+    // Only the ETA authority restores (#10498); a pending estimate of a retired
+    // heuristic is dropped, never scored or emitted as an `eta.outcome` (#10484).
+    let unregistered = authority::restore(&mut tracker, &workspace_root, &registry);
     log::info!(
         "eta: enabled (dry_run={}, refresh={}s, {} pending restored, \
          {} dropped for an unregistered heuristic)",
@@ -979,7 +975,7 @@ pub(super) async fn record(
     slug_cache: &mut HashMap<String, String>,
 ) {
     let resolution_sec = super::SNAPSHOT_INTERVAL.as_secs() as i64;
-    if lock().is_none() {
+    if lock().is_none() || !authority::refresh(workspace_root) {
         return;
     }
     let mut roots = super::collector::provisioned_roots(workspace_pool);
@@ -1174,7 +1170,7 @@ pub(super) async fn record(
         .map(|state| state.tracker.pending().to_vec())
         .unwrap_or_default();
     append_journal(workspace_root, &rows);
-    let delivered = deliver(emissions, outcomes, &Provenance::current(), &host_id, dry_run, sink());
+    let delivered = authority::deliver_checked(emissions, outcomes, &host_id, dry_run);
     write_pending(&pending_path(workspace_root), &pending);
     super::ops::eta_health::note_over_cap(dropped.over_cap, dropped.series_over_cap);
     log::info!(
@@ -1244,6 +1240,7 @@ fn reads_answered(rows: &[JournalEntry]) -> usize {
         .count()
 }
 
+mod authority;
 #[path = "eta_feature_pass.rs"]
 mod feature_pass;
 
