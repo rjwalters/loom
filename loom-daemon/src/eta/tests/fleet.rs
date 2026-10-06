@@ -629,6 +629,12 @@ const HEURISTIC_SOURCES: &[(&str, &str)] = &[
     ("recalibrate.rs", include_str!("../recalibrate.rs")),
     // #10489: the conformal calibration the calm-plover heuristic calls.
     ("conformal.rs", include_str!("../conformal.rs")),
+    // #10524: the IPCW conformal calibration the quick-tern heuristic calls.
+    ("conformal_ipcw.rs", include_str!("../conformal_ipcw.rs")),
+    (
+        "heuristics/land_quick_tern.rs",
+        include_str!("../heuristics/land_quick_tern.rs"),
+    ),
     ("twin_otter/mod.rs", include_str!("../twin_otter/mod.rs")),
     ("twin_otter/eval.rs", include_str!("../twin_otter/eval.rs")),
     ("twin_otter/path.rs", include_str!("../twin_otter/path.rs")),

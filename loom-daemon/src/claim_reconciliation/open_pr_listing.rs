@@ -28,7 +28,7 @@ pub use crate::forge_pull_listing::RestPull;
 /// workspace with at most 100 open PRs costs one request, and unchanged pages
 /// are free `304`s. More open PRs than this is an error, never a silently
 /// truncated listing (#10382: `pr.list-open` is `complete-required`).
-pub(super) const MAX_PAGES: usize = 10;
+pub(crate) const MAX_PAGES: usize = 10;
 
 /// Every open PR of `root`'s repository (`LOOM_REPO` wins), newest first.
 pub(super) fn list_open_prs(gh_bin: &Path, root: &Path) -> Result<Vec<RestPull>> {

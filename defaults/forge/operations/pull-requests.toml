@@ -96,12 +96,12 @@ path = "loom-daemon/src/forge_pull_listing.rs"
 [[operation]]
 id = "pr.list-open"
 group = "pr-creation-discovery-state"
-summary = "List every open PR of a repo (the daemon's PR-side reconciliation passes, client-side label filter)."
+summary = "List every open PR of a repo (the daemon's PR-side reconciliation passes, client-side label filter; the open-linked-PR guard's leg 0)."
 profile = "required-coordination"
 disposition = "required"
 class = "read"
 inputs = ["owner", "repo", "state"]
-outputs = ["number", "state", "draft", "labels", "head_ref", "head_sha", "base_ref", "updated_at"]
+outputs = ["number", "state", "draft", "labels", "head_ref", "head_sha", "base_ref", "updated_at", "body", "author_association"]
 required_fields = ["number", "state", "labels", "head_ref"]
 actor = "daemon"
 permissions = ["pull_requests:read"]
@@ -122,10 +122,13 @@ github = { commands = [
 platform_support = "documented"
 adapter_coverage = "partial"
 caller_integration = "partial"
-notes = "ETag'd REST pages (#10349); an unchanged repo answers with free 304s. A truncated listing is a completeness bug, not a display one."
+notes = "ETag'd REST pages (#10349); an unchanged repo answers with free 304s. A truncated listing is a completeness bug, not a display one. Since #10514 it is also leg 0 of both open-linked-PR probes (body linking phrase or feature/issue-N head); the closes-graph is only their fallback."
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/forge_pull_listing.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/worktree_ops/linked_pr_listing.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/pr_planning/listing.rs"

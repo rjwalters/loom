@@ -426,7 +426,7 @@ pub(super) fn health_items() -> Option<std::collections::BTreeMap<(String, Strin
 /// 50-pair gate, never a wrong answer.
 ///
 /// Also the calibration outcome log (#10207): every landed
-/// [`crate::eta::heuristics::CALIBRATION_BASE`] outcome is appended to it and
+/// [`crate::eta::heuristics::CALIBRATION_BASES`] outcome (#10524) is appended to it and
 /// to the in-memory history, so the recalibrating heuristic's next refit sees
 /// the landing (its point-in-time fit admits it only from `now` on).
 fn note_outcomes(state: &mut State, outcomes: &[Resolved], now: DateTime<Utc>) {
@@ -435,7 +435,9 @@ fn note_outcomes(state: &mut State, outcomes: &[Resolved], now: DateTime<Utc>) {
     }
     let landed: Vec<CalibrationObservation> = outcomes
         .iter()
-        .filter(|r| r.estimate.heuristic == crate::eta::heuristics::CALIBRATION_BASE)
+        .filter(|r| {
+            crate::eta::heuristics::CALIBRATION_BASES.contains(&r.estimate.heuristic.as_str())
+        })
         .filter_map(|r| CalibrationObservation::from_scored(&r.estimate, &r.score, now))
         .collect();
     if !landed.is_empty() {

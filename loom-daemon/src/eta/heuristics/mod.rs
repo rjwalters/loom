@@ -7,11 +7,15 @@
 //! is applied and an item beyond its history is answered rather than refused.
 //! `land-2026-10-04-twin-otter` (#10243) reads no history: it evaluates a
 //! fitted coefficient file handed to it when the registry was built.
+//! `land-2026-10-06-calm-plover` (#10489) and `land-2026-10-06-quick-tern`
+//! (#10524) are calibration wrappers over `land-v2` and
+//! `land-2026-10-04-twin-otter-b` respectively.
 //! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
 mod land_calm_plover;
 mod land_fresh_tide;
+mod land_quick_tern;
 mod land_twin_otter;
 mod land_twin_otter_b;
 mod land_v1;
@@ -24,6 +28,7 @@ mod start_v1;
 pub use finish_v1::{FinishV1, FINISH_V1};
 pub use land_calm_plover::{LandCalmPlover, LAND_CALM_PLOVER};
 pub use land_fresh_tide::{LandFreshTide, LAND_FRESH_TIDE};
+pub use land_quick_tern::{LandQuickTern, LAND_QUICK_TERN};
 pub(crate) use land_twin_otter::recompute as recompute_twin_otter;
 pub use land_twin_otter::{
     adapt_input, visit_entry, visit_seed, LandTwinOtter, DRAW_ORDER, LAND_TWIN_OTTER, METHOD,
@@ -43,6 +48,13 @@ pub use start_v1::{StartV1, START_V1};
 /// (The `land-2026-10-04-amber-heron` shadow that consumed it was retired
 /// 2026-10-06, #10484; `land-2026-10-06-calm-plover` consumes it now, #10489.)
 pub const CALIBRATION_BASE: &str = LAND_V2;
+
+/// Every heuristic whose landed and still-open `land` estimates are kept as
+/// calibration evidence ([`crate::eta::calibration_log`]): [`CALIBRATION_BASE`]
+/// for `land-2026-10-06-calm-plover`, and [`LAND_TWIN_OTTER_B`] for
+/// `land-2026-10-06-quick-tern` (#10524). Each calibrator filters the rows
+/// on its own base, so they never mix.
+pub const CALIBRATION_BASES: &[&str] = &[CALIBRATION_BASE, LAND_TWIN_OTTER_B];
 
 use super::explanation::{
     Branches, ChangesRequested, Combination, Conditioning, CurrentStageRecord, DispatchRecord,

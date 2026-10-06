@@ -1,7 +1,8 @@
 //! The agent `gh` front: plain `gh` reads ETag-revalidated by default (#10331).
 //!
 //! Dispatched workers get `gh` → `loom-daemon` first on `PATH`
-//! ([`worker_path`], applied by `worker_spawn`); `loom-daemon` started under
+//! ([`session_path`], applied by `worker_spawn`); interactive sessions get the
+//! same order through a SessionStart hook ([`session_env`], #10516). `loom-daemon` started under
 //! the name `gh` — or explicitly as `loom-daemon gh <gh argv…>` — lands in
 //! [`run`]. Per call:
 //!
@@ -33,6 +34,7 @@
 
 pub mod classify;
 pub mod next_gh;
+pub mod session_env;
 
 #[cfg(test)]
 mod tests;
@@ -73,23 +75,35 @@ pub fn dispatch_if_front() {
     std::process::exit(code);
 }
 
-/// `loom-daemon gh-shim path`: create the shim directory and print it.
+/// `loom-daemon gh-shim path|session-env|status`.
+///
+/// - `path`: create the shim directory and print it.
+/// - `session-env`: the SessionStart hook's half (#10516) — see [`session_env`].
+/// - `status`: which `gh` this shell actually resolves — see [`session_env`].
 fn shim_command(args: &[OsString]) -> i32 {
-    if args.len() != 1 || args[0] != "path" {
-        eprintln!(
-            "usage: loom-daemon gh-shim path\n  print a directory holding `gh` -> loom-daemon; \
-             put it first on PATH to route plain `gh` reads through the ETag cache (#10331)"
-        );
-        return 2;
-    }
-    match ensure_shim_dir() {
-        Ok(dir) => {
-            println!("{}", dir.display());
-            0
-        }
-        Err(e) => {
-            eprintln!("loom-daemon gh-shim path: {e}");
-            1
+    match args.first().and_then(|a| a.to_str()) {
+        Some("path") if args.len() == 1 => match ensure_shim_dir() {
+            Ok(dir) => {
+                println!("{}", dir.display());
+                0
+            }
+            Err(e) => {
+                eprintln!("loom-daemon gh-shim path: {e}");
+                1
+            }
+        },
+        Some("session-env") if args.len() == 1 => session_env::run(),
+        Some("status") if args.len() == 1 => session_env::status(),
+        _ => {
+            eprintln!(
+                "usage: loom-daemon gh-shim path|session-env|status\n  \
+                 path         print a directory holding `gh` -> loom-daemon; put it first on PATH to \
+                 route plain `gh` reads through the ETag cache (#10331)\n  \
+                 session-env  (SessionStart hook) put that directory first on PATH via \
+                 $CLAUDE_ENV_FILE (#10516)\n  \
+                 status       print `front|launcher|bypassed: <gh>` for this shell's PATH"
+            );
+            2
         }
     }
 }
@@ -315,11 +329,10 @@ pub fn ensure_shim_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// The `PATH` a dispatched worker gets: the shim dir first, then `current`.
-/// `None` leaves `PATH` alone — opted out (`LOOM_GH_SHIM=0`), not running as
-/// `loom-daemon` (a test harness), or the shim dir could not be made.
+/// The front's shim dir, or `None`: opted out (`LOOM_GH_SHIM=0`), not
+/// running as `loom-daemon` (a test harness), or the dir could not be made.
 #[must_use]
-pub fn worker_path(current: Option<&OsStr>) -> Option<OsString> {
+pub fn front_dir() -> Option<PathBuf> {
     if std::env::var(OPT_OUT_ENV).is_ok_and(|v| v == "0") {
         return None;
     }
@@ -327,7 +340,48 @@ pub fn worker_path(current: Option<&OsStr>) -> Option<OsString> {
     if exe.file_name() != Some(OsStr::new("loom-daemon")) {
         return None;
     }
-    prepend_path(&ensure_shim_dir().ok()?, current)
+    ensure_shim_dir().ok()
+}
+
+/// The `PATH` a dispatched worker gets: the shim dir first, then `current`.
+/// `None` leaves `PATH` alone (see [`front_dir`]).
+#[must_use]
+pub fn worker_path(current: Option<&OsStr>) -> Option<OsString> {
+    prepend_path(&front_dir()?, current)
+}
+
+/// The one `gh` ordering shared by a dispatched worker and an interactive
+/// session (#10516): the managed launcher (#9987) first when a policy resolves
+/// one, then the front, then `current` — so with no policy the front's own
+/// reads still reach whatever `gh` came first before (e.g. the 2am telemetry
+/// shim) as their `next_gh`. `None` leaves `PATH` alone.
+#[must_use]
+pub fn session_path(
+    current: Option<&OsStr>,
+    egress: Option<&crate::forge_egress::worker_env::WorkerEgress>,
+) -> Option<OsString> {
+    compose_path(
+        front_dir().as_deref(),
+        egress.and_then(crate::forge_egress::worker_env::WorkerEgress::launcher_dir),
+        current,
+    )
+}
+
+/// [`session_path`] with its inputs injected: `front` prepended to `current`,
+/// then `launcher` on top. `None` when neither applies.
+#[must_use]
+pub fn compose_path(
+    front: Option<&Path>,
+    launcher: Option<&Path>,
+    current: Option<&OsStr>,
+) -> Option<OsString> {
+    let mut path: Option<OsString> = None;
+    for dir in [front, launcher].into_iter().flatten() {
+        if let Some(next) = prepend_path(dir, path.as_deref().or(current)) {
+            path = Some(next);
+        }
+    }
+    path
 }
 
 /// `dir` first, then `current` minus any earlier copy of `dir`.

@@ -251,6 +251,52 @@ fn merged_linked_pr_does_not_block_recovery_body() {
         .any(|r| r.action == "reset_issue_label"));
 }
 
+/// [`install_fake_gh`] whose fake also serves the open-PR listing `rows`
+/// (#10514 leg 0), and whose closes-graph arm refuses (exit 97).
+#[cfg(unix)]
+fn install_fake_gh_with_listing(
+    dir: &Path,
+    rows: &[crate::claim_reconciliation::open_pr_listing::test_support::Row],
+) -> FakeGh {
+    let gh = install_fake_gh(dir, "FORBIDDEN", 97);
+    let fake = dir.join("bin").join("gh");
+    let script = std::fs::read_to_string(&fake).unwrap();
+    let (head, rest) = script.split_once('\n').unwrap();
+    let (log_line, rest) = rest.split_once('\n').unwrap();
+    let arm = crate::claim_reconciliation::open_pr_listing::test_support::pulls_arm(rows);
+    std::fs::write(&fake, format!("{head}\n{log_line}\n{arm}{rest}")).unwrap();
+    gh
+}
+
+/// (e) #10514: orphan recovery's probe answers from the open-PR listing
+/// alone — a `Closes #5501` PR blocks the reset, an empty listing allows it,
+/// and neither spawns the closes-graph nor walks the timeline.
+#[cfg(unix)]
+#[test]
+#[serial(loom_config_env)]
+fn the_open_pr_listing_answers_without_graphql() {
+    the_open_pr_listing_answers_without_graphql_body();
+}
+
+#[serial]
+fn the_open_pr_listing_answers_without_graphql_body() {
+    use crate::claim_reconciliation::open_pr_listing::test_support::row;
+    let linked = [row(5507, &[])
+        .head("topic")
+        .repo("rjwalters/loom")
+        .body("Closes #5501")];
+    for (rows, resets) in [(&linked[..], false), (&[][..], true)] {
+        let dir = tempdir().unwrap();
+        let gh = install_fake_gh_with_listing(dir.path(), rows);
+        let mut recovery = OrphanRecoveryResult::default();
+        recover_issue(dir.path(), 5501, "no_spawn_loop_entry", &mut recovery, 600);
+        let calls = gh.calls();
+        assert_eq!(calls.contains("issue edit"), resets, "{calls}");
+        assert!(calls.contains("pulls?state=open"), "{calls}");
+        assert!(!calls.contains("graphql") && !calls.contains("timeline"), "{calls}");
+    }
+}
+
 /// #9548 negative control: the (b) fixture, but the credential only has
 /// `pull`. The real write-scope check refuses the label writer, so the
 /// reset never reaches `gh issue edit`.

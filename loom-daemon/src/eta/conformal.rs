@@ -80,7 +80,7 @@ pub const MIN_CELL_EVENTS: usize = 20;
 pub const MAX_DAILY_STEP: f64 = 0.18;
 
 /// The four quantile levels, in [`Q4`] order.
-const TAUS: [f64; 4] = [0.25, 0.50, 0.75, 0.90];
+pub(crate) const TAUS: [f64; 4] = [0.25, 0.50, 0.75, 0.90];
 
 /// Age-bucket upper edges, seconds; the last bucket is open.
 const AGE_EDGES: [i64; 3] = [3_600, 4 * 3_600, 24 * 3_600];
@@ -102,7 +102,7 @@ pub struct Q4<T> {
 }
 
 impl<T: Copy> Q4<T> {
-    fn from_array(a: [T; 4]) -> Self {
+    pub(crate) fn from_array(a: [T; 4]) -> Self {
         Q4 {
             p25: a[0],
             p50: a[1],
@@ -155,17 +155,24 @@ pub struct Calibration {
     pub n_events: usize,
     /// Still-open (right-censored) base estimates behind it.
     pub n_censored: usize,
-    /// The largest one-day move allowed ([`MAX_DAILY_STEP`]).
-    pub max_daily_step: f64,
+    /// The largest one-day move allowed ([`MAX_DAILY_STEP`]). Absent for a
+    /// method with no rate limit (the IPCW wrapper, #10524, which must adapt
+    /// within hours; [`super::conformal_ipcw`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_daily_step: Option<f64>,
     /// Where the rate-limit replay started: the first point of `as_of`'s
     /// day lattice after the oldest usable base estimate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_from: Option<DateTime<Utc>>,
+    /// The IPCW method's censoring model, half-life and weights (#10524).
+    /// Absent for every other method, so their records are byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipcw: Option<super::conformal_ipcw::IpcwRecord>,
     /// The base estimate's quantiles, before calibration, seconds.
     pub base_quantiles_sec: Q4<i64>,
 }
 
-fn round6(x: f64) -> f64 {
+pub(crate) fn round6(x: f64) -> f64 {
     (x * 1_000_000.0).round() / 1_000_000.0
 }
 
@@ -424,8 +431,9 @@ pub fn calibrate(
         raw_shift: Q4::from_array(fit.shift),
         n_events: fit.n_events,
         n_censored: fit.n_censored,
-        max_daily_step: MAX_DAILY_STEP,
+        max_daily_step: Some(MAX_DAILY_STEP),
         replay_from: Some(replay_from),
+        ipcw: None,
         base_quantiles_sec: Q4 {
             p25: base_q.0,
             p50: base_q.1,

@@ -481,6 +481,22 @@ const PROMPT_SURFACE: &[&str] = &[
     ".claude/commands/loom/**",
 ];
 
+/// Everything `scripts/check-role-prompt-budget.sh` reads (#9748): the two
+/// shared prefixes (`SHARED_PREFIX`), role discovery (`git ls-files
+/// 'defaults/roles/*.json'`) and the command directory (`CMD_DIR`) whose entry
+/// points and transitively linked bare siblings are summed. It never reads
+/// `defaults/docs`, installed `.loom/docs`, or the installed mirrors. The
+/// command-directory set is conservative (every markdown file there, not a
+/// per-role graph). A test runs the real checker's `--files` and fails if its
+/// read surface outgrows this set (ci-principles rule 9: refine what a result
+/// covers from the checker's own source; the check still runs on every PR).
+const ROLE_PROMPT_PREFIX_READS: &[&str] = &[
+    "CLAUDE.md",
+    "defaults/.loom/CLAUDE.md",
+    "defaults/roles/*.json",
+    "defaults/.claude/commands/loom/*.md",
+];
+
 /// The two mirrored trees the resync-parity gate pairs up.
 const RESYNC_PAIRS: &[&str] = &[
     "defaults/hooks/**",
@@ -684,7 +700,7 @@ pub const SPECS: &[CheckSpec<'static>] = &[
             CI_WORKFLOW,
         ],
         scanned: &[],
-        coupled: PROMPT_SURFACE,
+        coupled: ROLE_PROMPT_PREFIX_READS,
         removal_sensitive: true,
     },
     // A content scan of every tracked file, strictly per-file.

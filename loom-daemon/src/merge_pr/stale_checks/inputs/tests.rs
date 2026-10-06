@@ -89,8 +89,8 @@ fn a_coupled_aggregate_check_is_stale_when_both_sides_touch_the_set() {
     // Role Prompt Prefix Ratchet sums a role's WHOLE file set, so two disjoint
     // per-file edits still move the aggregate.
     let s = spec("Role Prompt Prefix Ratchet");
-    let d = set(&["defaults/roles/builder.md"]);
-    let p = set(&["defaults/roles/judge.md"]);
+    let d = set(&["defaults/.claude/commands/loom/builder.md"]);
+    let p = set(&["defaults/.claude/commands/loom/judge.md"]);
     let reason = stale_reason(s, &d, &p).expect("disjoint files still move one SUM");
     assert!(reason.clause.contains("coupled"), "{reason:?}");
 
@@ -579,4 +579,192 @@ fn the_pr_side_narrowing_is_confined_to_clauses_1_and_2() {
     let d = set(&["docs/some-page.md"]);
     let p = set_with_removal(&[], &["scripts/gone.sh"]);
     assert!(stale_reason_scoped(spec("Dangling Link Check"), &d, &p, &none).is_some());
+}
+
+// --- Role Prompt Prefix Ratchet: dedicated read surface (#9748) ---------------
+//
+// `scripts/check-role-prompt-budget.sh` reads exactly: the two shared prefixes,
+// `defaults/roles/*.json` (role discovery), and the command-directory markdown
+// (entry points + transitively linked bare siblings). It never reads
+// `defaults/docs`, installed `.loom/docs`, or the installed mirrors.
+
+const ROLE_PREFIX: &str = "Role Prompt Prefix Ratchet";
+
+/// Both orientations of an ordinary-modification pair: no `StaleReason`.
+fn assert_role_prefix_fresh_both_ways(a: &[&str], b: &[&str]) {
+    let s = spec(ROLE_PREFIX);
+    assert_eq!(stale_reason(s, &set(a), &set(b)), None, "base={a:?} pr={b:?}");
+    assert_eq!(stale_reason(s, &set(b), &set(a)), None, "base={b:?} pr={a:?}");
+}
+
+/// Both orientations of an interacting pair: a `StaleReason` each way.
+fn assert_role_prefix_stale_both_ways(a: &[&str], b: &[&str]) {
+    let s = spec(ROLE_PREFIX);
+    assert!(stale_reason(s, &set(a), &set(b)).is_some(), "base={a:?} pr={b:?}");
+    assert!(stale_reason(s, &set(b), &set(a)).is_some(), "base={b:?} pr={a:?}");
+}
+
+const JUDGE_CMD: &str = "defaults/.claude/commands/loom/judge.md";
+const BUILDER_CMD: &str = "defaults/.claude/commands/loom/builder.md";
+
+#[test]
+fn role_prefix_ignores_documentation_edits_on_both_sides() {
+    // The measured #10423/#10497 tuple.
+    assert_role_prefix_fresh_both_ways(
+        &["defaults/docs/daemon-reference.md"],
+        &["defaults/docs/eta.md"],
+    );
+    // Same doc on both sides is still not this check's input.
+    assert_role_prefix_fresh_both_ways(&["defaults/docs/eta.md"], &["defaults/docs/eta.md"]);
+}
+
+#[test]
+fn role_prefix_ignores_eta_docs_against_the_judge_prompt() {
+    // PR #10486's recorded refusal: base ETA docs vs the PR's Judge prompt.
+    assert_role_prefix_fresh_both_ways(&["defaults/docs/eta.md"], &[JUDGE_CMD]);
+}
+
+#[test]
+fn role_prefix_ignores_docs_against_the_shared_claude_md() {
+    assert_role_prefix_fresh_both_ways(&["defaults/docs/eta.md"], &["CLAUDE.md"]);
+    assert_role_prefix_fresh_both_ways(&["defaults/docs/eta.md"], &["defaults/.loom/CLAUDE.md"]);
+}
+
+#[test]
+fn role_prefix_ignores_installed_mirrors_and_unread_prompt_files() {
+    // Installed `.loom/docs`, `.loom/roles`, `.claude/commands` mirrors, the
+    // role markdown, AGENTS.md and the installed CLAUDE.md are not read.
+    for unread in [
+        ".loom/docs/eta.md",
+        ".loom/docs/daemon-reference.md",
+        ".loom/roles/judge.md",
+        ".claude/commands/loom/judge.md",
+        ".loom/CLAUDE.md",
+        "AGENTS.md",
+        "defaults/.loom/AGENTS.md",
+        "defaults/roles/judge.md",
+        "defaults/roles/README.md",
+        "defaults/docs/ci-principles.md",
+    ] {
+        assert_role_prefix_fresh_both_ways(&[unread], &[JUDGE_CMD]);
+        assert_role_prefix_fresh_both_ways(&[unread], &["CLAUDE.md"]);
+        assert_role_prefix_fresh_both_ways(&[".loom/docs/eta.md"], &[unread]);
+    }
+}
+
+#[test]
+fn role_prefix_still_couples_every_declared_read() {
+    // Positive controls: two interacting reads on opposite sides stay stale.
+    assert_role_prefix_stale_both_ways(&[JUDGE_CMD], &[BUILDER_CMD]);
+    assert_role_prefix_stale_both_ways(&["CLAUDE.md"], &[JUDGE_CMD]);
+    assert_role_prefix_stale_both_ways(&["CLAUDE.md"], &["defaults/.loom/CLAUDE.md"]);
+    // A transitively reached sibling (not a role entry point) is a command-dir
+    // markdown file and is covered.
+    assert_role_prefix_stale_both_ways(
+        &["defaults/.claude/commands/loom/probe-protocol.md"],
+        &["CLAUDE.md"],
+    );
+    // Role discovery (`defaults/roles/*.json`) against a command input.
+    assert_role_prefix_stale_both_ways(&["defaults/roles/judge.json"], &[JUDGE_CMD]);
+    assert_role_prefix_stale_both_ways(&["defaults/roles/newrole.json"], &["CLAUDE.md"]);
+}
+
+#[test]
+fn role_prefix_keeps_its_global_inputs() {
+    let s = spec(ROLE_PREFIX);
+    for global in [
+        "scripts/check-role-prompt-budget.sh",
+        "scripts/role-prompt-budget.txt",
+        CI_WORKFLOW,
+    ] {
+        assert!(s.global.contains(&global), "{global} must stay global");
+        // Budget/checker/workflow change against a measured input, both ways.
+        assert_role_prefix_stale_both_ways(&[global], &[JUDGE_CMD]);
+        assert_role_prefix_stale_both_ways(&[global], &["CLAUDE.md"]);
+        assert_role_prefix_stale_both_ways(&[global], &["defaults/roles/judge.json"]);
+    }
+    // A global move against a PR that touches only docs has nothing to re-judge.
+    let d = set(&["scripts/role-prompt-budget.txt"]);
+    assert_eq!(stale_reason(s, &d, &set(&["defaults/docs/eta.md"])), None);
+}
+
+#[test]
+fn role_prefix_keeps_conservative_removal_handling() {
+    let s = spec(ROLE_PREFIX);
+    assert!(s.removal_sensitive);
+    // Deleting/renaming a relevant input while the other side touches a read.
+    let d = set_with_removal(&[], &[JUDGE_CMD]);
+    assert!(stale_reason(s, &d, &set(&["CLAUDE.md"])).is_some());
+    assert!(stale_reason(s, &set(&["CLAUDE.md"]), &d).is_some());
+    let d = set_with_removal(&[], &["defaults/roles/judge.json"]);
+    assert!(stale_reason(s, &d, &set(&[BUILDER_CMD])).is_some());
+    assert!(stale_reason(s, &set(&[BUILDER_CMD]), &d).is_some());
+    // The removal clause does not couple to unread docs on the other side.
+    let d = set_with_removal(&[], &[JUDGE_CMD]);
+    assert_eq!(stale_reason(s, &d, &set(&["defaults/docs/eta.md"])), None);
+}
+
+#[test]
+fn only_role_prefix_got_a_dedicated_surface() {
+    // Neighbouring prompt ratchets keep the broad shared set.
+    let md = spec("Markdown Token Ratchet");
+    assert_eq!(md.scanned, PROMPT_SURFACE);
+    assert!(md.scanned.contains(&"defaults/docs/**"));
+    assert!(!spec(ROLE_PREFIX).coupled.contains(&"defaults/docs/**"));
+    assert!(PROMPT_SURFACE.contains(&"defaults/docs/**"));
+    assert!(PROMPT_SURFACE.contains(&".loom/docs/**"));
+}
+
+/// Source contract (#9748): the declared coupled set must cover everything the
+/// REAL checker's `--files` resolution reads, and nothing it names may fall
+/// outside the declared inputs. A fixture that grows the checker's read
+/// surface (a new shared prefix, a second command dir) fails here.
+#[test]
+fn role_prefix_inputs_cover_the_real_checkers_read_surface() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let out = std::process::Command::new("bash")
+        .arg(root.join("scripts/check-role-prompt-budget.sh"))
+        .arg("--files")
+        .current_dir(&root)
+        .output()
+        .expect("the role-prompt checker must be runnable");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let s = spec(ROLE_PREFIX);
+    let mut read: BTreeSet<String> = BTreeSet::new();
+    for line in stdout.lines() {
+        // Per-file rows are "<tokens>  <path>"; role headers start with "==".
+        let mut cols = line.split_whitespace();
+        if let (Some(n), Some(path), None) = (cols.next(), cols.next(), cols.next()) {
+            if n.chars().all(|c| c.is_ascii_digit()) {
+                read.insert(path.to_string());
+            }
+        }
+    }
+    assert!(
+        read.contains("CLAUDE.md") && read.contains("defaults/.loom/CLAUDE.md"),
+        "{read:?}"
+    );
+    assert!(
+        read.iter().any(|p| p.ends_with("/probe-protocol.md")),
+        "the fixture must include a transitively reached sibling: {read:?}"
+    );
+    for path in &read {
+        assert!(
+            s.coupled.iter().any(|pat| glob_match(pat, path)),
+            "the checker reads `{path}` but the Role Prompt Prefix spec does not couple it"
+        );
+    }
+    // Role discovery: every tracked role JSON is declared, and the checker
+    // reads no documentation tree.
+    assert!(s
+        .coupled
+        .iter()
+        .any(|pat| glob_match(pat, "defaults/roles/judge.json")));
+    assert!(read.iter().all(|p| !p.contains("/docs/")), "{read:?}");
+    // And the declared command-dir surface is not wider than one directory
+    // level of markdown (the checker only follows bare sibling links).
+    for pat in s.coupled {
+        assert!(!pat.contains("**"), "unexpectedly broad coupled glob `{pat}`");
+    }
 }

@@ -1,6 +1,8 @@
 //! The calibration outcome log, `.loom/state/eta/calibration.jsonl` (#10207):
-//! every **landed** `land-v2` estimate the tracker scored, kept so the
-//! recalibrating heuristic can refit its interval from `land-v2`'s own track
+//! every **landed** estimate of a calibration base
+//! ([`super::heuristics::CALIBRATION_BASES`]: `land-v2`, and since #10524
+//! `land-2026-10-04-twin-otter-b`) the tracker scored, kept so a
+//! calibrating heuristic can refit its interval from its base's own track
 //! record. Scored outcomes are otherwise OTLP-only, so without this log a
 //! daemon restart would forget every landing.
 //!
@@ -8,7 +10,7 @@
 //! never sees a path. The still-open half of the evidence is not logged here
 //! at all: it is the tracker's pending store, converted on read.
 
-use super::heuristics::CALIBRATION_BASE;
+use super::heuristics::CALIBRATION_BASES;
 use super::recalibrate::CalibrationObservation;
 use super::score::EstimateSummary;
 use std::collections::BTreeSet;
@@ -86,7 +88,7 @@ pub fn append(path: &Path, rows: &[CalibrationObservation]) -> std::io::Result<(
 }
 
 /// The landed estimates in `scored` plus every still-open
-/// [`CALIBRATION_BASE`] estimate in `pending`, deduplicated by estimate id
+/// [`CALIBRATION_BASES`] estimate in `pending`, deduplicated by estimate id
 /// (a scored row wins: it carries the landing).
 #[must_use]
 pub fn combine(
@@ -101,7 +103,9 @@ pub fn combine(
         }
     }
     for summary in pending {
-        if summary.heuristic != CALIBRATION_BASE || seen.contains(&summary.estimate_id) {
+        if !CALIBRATION_BASES.contains(&summary.heuristic.as_str())
+            || seen.contains(&summary.estimate_id)
+        {
             continue;
         }
         if let Some(row) = CalibrationObservation::from_pending(summary) {
