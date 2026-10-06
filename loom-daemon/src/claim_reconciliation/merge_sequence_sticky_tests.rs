@@ -229,6 +229,36 @@ fn an_operator_removal_older_than_the_live_marker_is_not_a_release() {
     assert_eq!(ev(&[marker_comment(&other, "2026-10-05T07:00:00Z"), late]), None);
 }
 
+/// Judge finding on PR #10651: the #10634 landing upsert PATCHes a marker
+/// into a comment that already existed, so the comment's `created_at` is
+/// older than the marker it now carries. A removal between the original post
+/// and the edit released the OLD marker, not this one: the carrying comment
+/// is dated by the later of `created_at` and `updated_at`.
+#[test]
+fn a_removal_before_an_in_place_edit_does_not_release_the_edited_marker() {
+    let m = marker_2_after_1();
+    let ev = |e: &[serde_json::Value]| operator_unlabeled(&timeline(e), &m, fleet);
+    let edited = |updated: serde_json::Value| {
+        let mut c = marker_comment(&m, "2026-10-05T07:00:00Z");
+        c["updated_at"] = updated;
+        c
+    };
+    let labeled = label_event("labeled", Some("loom-fleet-dispatch[bot]"), "2026-10-05T07:00:01Z");
+    let removal = label_event("unlabeled", Some("rjwalters"), "2026-10-05T08:00:00Z");
+    // Posted at 07:00, operator removal at 08:00, edited in place at 09:00.
+    let patched = edited(serde_json::json!("2026-10-05T09:00:00Z"));
+    assert_eq!(ev(&[labeled.clone(), removal.clone(), patched.clone()]), Some(false));
+    // A removal after the edit is still a release.
+    let after = label_event("unlabeled", Some("rjwalters"), "2026-10-05T09:30:00Z");
+    assert_eq!(ev(&[labeled.clone(), patched, after]), Some(true));
+    // `updated_at` equal to (or absent beside) `created_at` changes nothing.
+    let unedited = edited(serde_json::json!("2026-10-05T07:00:00Z"));
+    assert_eq!(ev(&[labeled.clone(), removal.clone(), unedited]), Some(true));
+    // An unreadable `updated_at` is an unknown, never a release.
+    let garbled = edited(serde_json::json!("later"));
+    assert_eq!(ev(&[labeled, removal, garbled]), None);
+}
+
 #[test]
 fn the_decision_is_scoped_to_the_pair_and_the_tree() {
     let live = pr(2, &redated(), &["loom:pr"]);
