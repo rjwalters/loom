@@ -1,8 +1,11 @@
 //! Issue #10453: the session reconcile pass, driven through a fake
-//! [`ContainerRunner`] so no test needs Docker.
+//! [`ContainerRunner`] so no test needs Docker. The pass's snapshot is the
+//! fake's containers rendered as `docker inspect` objects (one logged
+//! `inspect` per snapshot).
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Result};
 use serial_test::serial;
@@ -12,11 +15,35 @@ use crate::tokens_pool::account_lifecycle::{AccountLifecycle, ProcessCodexRunner
 use crate::tokens_pool::account_registry::account_inventory;
 use crate::tokens_pool::profile_root_env::ProfileRootEnv;
 use crate::tokens_pool::session_hold;
-use crate::tokens_pool::session_lifecycle::{mark_session_managed, parse_inspect_line, ExecOutput};
+use crate::tokens_pool::session_lifecycle::{
+    mark_session_managed, parse_inspect_line, workspace_mount_roots, ExecOutput, WORKSPACE_LABEL,
+};
+use crate::tokens_pool::session_state::{classify_inspect, Observed};
+
+#[path = "session_reconcile_drift_tests.rs"]
+mod drift_tests;
+
+/// Shared so a pass can snapshot it while the lifecycle owns it.
+#[derive(Default, Clone)]
+struct Fake(Arc<FakeState>);
+
+impl Deref for Fake {
+    type Target = FakeState;
+    fn deref(&self) -> &FakeState {
+        &self.0
+    }
+}
 
 #[derive(Default)]
-struct Fake {
+struct FakeState {
     containers: Mutex<HashMap<String, ContainerState>>,
+    /// Workspace bind destinations per container (path parity).
+    mounts: Mutex<HashMap<String, Vec<PathBuf>>>,
+    /// The workspace registry the pass and `create` see.
+    registered: Mutex<Vec<PathBuf>>,
+    /// `create` mounts exactly these instead of what the registry implies
+    /// (intended ≠ achievable).
+    create_mounts: Mutex<Option<Vec<PathBuf>>>,
     busy: Mutex<HashMap<String, bool>>,
     /// Every runner call, by method name, in order.
     calls: Mutex<Vec<String>>,
@@ -34,7 +61,7 @@ struct Fake {
     stop_on_inspect: Mutex<Option<(usize, PathBuf)>>,
 }
 
-impl Fake {
+impl FakeState {
     fn seed(&self, container: &str, running: bool, restarting: bool, workspace: Option<&Path>) {
         self.containers.lock().unwrap().insert(
             container.into(),
@@ -64,25 +91,74 @@ impl Fake {
     fn log(&self, method: &str) {
         self.calls.lock().unwrap().push(method.into());
     }
-}
-
-impl ContainerRunner for Fake {
-    fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
+    /// Count this read; on the configured read, act like a concurrent
+    /// `accounts session stop` (hold written, container stopped, not rm'd).
+    fn read(&self, containers: &mut HashMap<String, ContainerState>) {
         self.log("inspect");
-        if let Some(error) = self.fail_inspect.lock().unwrap().clone() {
-            bail!("docker inspect {container} failed: {error}");
-        }
         let n = self.count("inspect");
-        let mut containers = self.containers.lock().unwrap();
         if let Some((at, profile)) = self.stop_on_inspect.lock().unwrap().clone() {
             if n == at {
                 session_hold::write_hold(&profile, session_hold::now_unix_ms()).unwrap();
-                if let Some(state) = containers.get_mut(container) {
+                for state in containers.values_mut() {
                     state.running = false;
                     state.restarting = false;
                 }
             }
         }
+    }
+    /// The pass's one read: every container as a `docker inspect` object.
+    fn snapshot(&self, registered: &[PathBuf]) -> Snapshot {
+        if let Some(error) = self.fail_inspect.lock().unwrap().clone() {
+            self.log("inspect");
+            return Snapshot::Unavailable(format!("docker ps failed: {error}"));
+        }
+        let mut containers = self.containers.lock().unwrap();
+        self.read(&mut containers);
+        let mounts = self.mounts.lock().unwrap();
+        let map: BTreeMap<String, Observed> = containers
+            .iter()
+            .map(|(name, state)| {
+                let inspect =
+                    inspect_json(name, state, mounts.get(name).map_or(&[], Vec::as_slice));
+                let observed = Observed {
+                    state: classify_inspect(Some(&inspect), registered),
+                    inspect,
+                };
+                (name.clone(), observed)
+            })
+            .collect();
+        Snapshot::Available(map)
+    }
+}
+
+/// `state` (and its workspace binds) as `docker inspect` reports it.
+fn inspect_json(name: &str, state: &ContainerState, mounts: &[PathBuf]) -> Value {
+    let mut labels = serde_json::Map::new();
+    if let Some(workspace) = &state.workspace {
+        labels.insert(WORKSPACE_LABEL.into(), workspace.display().to_string().into());
+        if workspace == Path::new(private_workspace::REPO) {
+            labels.insert("loom.workspace-mode".into(), "private-clone".into());
+        }
+    }
+    serde_json::json!({
+        "Name": format!("/{name}"),
+        "Id": state.id,
+        "State": {"Running": state.running || state.restarting, "Restarting": state.restarting},
+        "Config": {"Image": state.image, "Labels": labels},
+        "Mounts": mounts.iter().map(|m| serde_json::json!({
+            "Type": "bind", "Source": m, "Destination": m, "RW": true,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+impl ContainerRunner for Fake {
+    fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
+        if let Some(error) = self.fail_inspect.lock().unwrap().clone() {
+            self.log("inspect");
+            bail!("docker inspect {container} failed: {error}");
+        }
+        let mut containers = self.containers.lock().unwrap();
+        self.read(&mut containers);
         Ok(containers.get(container).cloned())
     }
     fn create(
@@ -104,6 +180,14 @@ impl ContainerRunner for Fake {
         ));
         let dies = *self.dies_after_start.lock().unwrap();
         self.seed(container, dies.is_none(), dies == Some(true), Some(workspace));
+        let registered = self.registered.lock().unwrap().clone();
+        let mounts = self
+            .create_mounts
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| workspace_mount_roots(workspace, &registered).unwrap_or_default());
+        self.mounts.lock().unwrap().insert(container.into(), mounts);
         Ok(())
     }
     fn start_existing(&self, container: &str) -> Result<()> {
@@ -124,6 +208,7 @@ impl ContainerRunner for Fake {
     fn stop_and_remove(&self, container: &str, _grace: Duration) -> Result<()> {
         self.log("stop_and_remove");
         self.containers.lock().unwrap().remove(container);
+        self.mounts.lock().unwrap().remove(container);
         Ok(())
     }
     fn attach_interactive(&self, _container: &str, _tmux: &str) -> Result<i32> {
@@ -214,11 +299,34 @@ fn pass_with(
     state: &mut ReconcileState,
     now: u64,
 ) -> Vec<Outcome> {
-    let index = AccountIndex::from_inventories(&[accounts, other_roots]);
-    reconcile_accounts(lifecycle, accounts, &index, private, fallback, state, now)
+    pass_named(lifecycle, accounts, other_roots, private, fallback, state, now)
         .into_iter()
         .map(|o| o.outcome)
         .collect()
+}
+
+/// [`pass_with`], keeping each outcome's account.
+fn pass_named(
+    lifecycle: &mut SessionLifecycle<Fake>,
+    accounts: &[AccountDescriptor],
+    other_roots: &[AccountDescriptor],
+    private: &dyn Fn(&AccountDescriptor) -> anyhow::Result<bool>,
+    fallback: &Path,
+    state: &mut ReconcileState,
+    now: u64,
+) -> Vec<AccountOutcome> {
+    let index = AccountIndex::from_inventories(&[accounts, other_roots]);
+    let fake = lifecycle.runner().clone();
+    let registered = fake.registered.lock().unwrap().clone();
+    let mut take = || fake.snapshot(&registered);
+    let mut observe = PassSnapshot::new(&mut take);
+    let inputs = PassInputs {
+        index: &index,
+        is_private_clone: private,
+        fallback_workspace: fallback,
+        registered: &registered,
+    };
+    reconcile_accounts(lifecycle, accounts, &inputs, &mut observe, state, now)
 }
 
 // ---- decision function ------------------------------------------------------

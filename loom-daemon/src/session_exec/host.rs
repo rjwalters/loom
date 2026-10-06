@@ -97,8 +97,9 @@ pub(super) fn mount_stale_line(
     format!(
         "{} container={container} workdir={workdir} session-exec: {workdir} is not mounted in \
          {container}, which was created before this repository was registered (#10364); \
-         recreate it when idle: loom-daemon accounts session stop {account} && loom-daemon \
-         accounts session start {account} --mount-workspace {workspace}",
+         the daemon's session reconciler recreates it once idle (by hand: loom-daemon accounts \
+         session stop {account} && loom-daemon accounts session start {account} \
+         --mount-workspace {workspace})",
         crate::tokens_pool::session_state::MOUNT_STALE_MARKER
     )
 }

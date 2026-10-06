@@ -482,10 +482,11 @@ pub fn host_session_run_args(
     args
 }
 
-/// Grace period `stop` gives `docker stop` (SIGTERM) before it would
+/// Grace period `stop` (and the reconciler's mount-drift recreate of an idle
+/// container, #10364) gives `docker stop` (SIGTERM) before it would
 /// escalate to SIGKILL — the same shape as `docker stop`'s own `-t` timeout,
 /// never bypassed by going straight to `docker kill`.
-const STOP_GRACE: Duration = Duration::from_secs(15);
+pub const STOP_GRACE: Duration = Duration::from_secs(15);
 
 /// Wall-clock budget for one in-container `codex login status` probe (issue
 /// #6927), bounded for the same reason the host-direct probe's

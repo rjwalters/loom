@@ -5,9 +5,11 @@
 //! created, so a registry change never reaches a running container: a newly
 //! registered repo is unreachable from it (every Codex tick there fails), and
 //! a deregistered one stays mounted read-write (a containment gap, since Codex
-//! runs with its own sandbox off, #9979). Until the reconciler recreates idle
-//! drifted containers itself (#10364 Part B, after #10453), the registry
-//! command names them and prints the manual recreate.
+//! runs with its own sandbox off, #9979). The daemon's session reconciler
+//! recreates idle drifted containers itself (#10364 Part B,
+//! `session_reconcile::drift`); the registry command names them, says so, and
+//! prints the manual recreate as an override for when the daemon is down or
+//! the reconciler is opted out.
 //!
 //! Best-effort by contract: nothing here returns an error, and a host with no
 //! session-managed profile costs **zero** docker calls. The only I/O is one
@@ -86,8 +88,9 @@ pub fn report_lines(drifted: &[DriftedSession]) -> Vec<String> {
         return Vec::new();
     }
     let mut lines = vec![format!(
-        "  {} Codex session container(s) no longer match the workspace registry; each must be \
-         recreated when idle (#10364):",
+        "  {} Codex session container(s) no longer match the workspace registry; the daemon's \
+         session reconciler recreates each one automatically once it has no tick in flight \
+         (#10364):",
         drifted.len()
     )];
     for session in drifted {
@@ -107,8 +110,9 @@ pub fn report_lines(drifted: &[DriftedSession]) -> Vec<String> {
         }
     }
     lines.push(
-        "  Until the daemon recreates these itself, run for each one once it has no tick in \
-         flight (`stop` refuses a busy container):"
+        "  To recreate one by hand instead (the daemon is down, or the reconciler is opted out \
+         with LOOM_SESSION_RECONCILE=0 / autonomous.sessionReconcile.enabled=false), run once it \
+         has no tick in flight (`stop` refuses a busy container):"
             .into(),
     );
     for session in drifted {
@@ -285,6 +289,8 @@ mod tests {
              --mount-workspace {label}"
         )));
         assert!(text.contains("--private-clone"), "{text}");
+        assert!(text.contains("recreates each one automatically"), "{text}");
+        assert!(text.contains("LOOM_SESSION_RECONCILE=0"), "{text}");
     }
 
     #[test]

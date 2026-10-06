@@ -317,7 +317,8 @@ fn auto_init_missing_sweep_command(canonical: &std::path::Path) -> Result<()> {
 /// sees a `workspace add`/`remove`, so a new repo stays unreachable from it and
 /// a removed one stays mounted read-write. Best-effort (never fails the
 /// command) and zero `docker` calls unless a profile is session-managed.
-/// Recreating them is the reconciler's job once it exists (#10364 Part B).
+/// The session reconciler recreates them once idle (`session_reconcile::drift`,
+/// #10364 Part B); the report says so and keeps the manual recreate.
 fn report_session_mount_drift(registry: &loom_daemon::workspace_registry::WorkspaceRegistry) {
     let profile_root = loom_daemon::tokens_pool::paths::codex_profile_root();
     let docker = std::env::var("LOOM_CODEX_SESSION_DOCKER")

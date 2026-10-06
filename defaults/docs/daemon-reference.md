@@ -8512,9 +8512,14 @@ across the registered roots:
 | stopped, host-mounted | `docker start`, via the `accounts session start` path |
 | missing, host-mounted | recreated with the workspace and image of the last operator `session start`; otherwise the label last seen on it; otherwise the registered roots' common parent, logged as a guess. Never `/`: that is refused and reported |
 | stopped or missing, private-clone | skipped with one WARN; never recreated host-mounted |
+| running, workspace mounts drifted, idle | stopped, removed and recreated with the current registry (#10364, below) |
+| running, workspace mounts drifted, in-flight exec | deferred and re-checked next pass; never stopped |
 
-- The pass never stops, removes or restarts a container. A container with an
-  in-flight `docker exec` is never touched (#5119).
+- The pass never stops or removes a container except to recreate an **idle**
+  one whose mounts drifted. A container with an in-flight `docker exec` is
+  never stopped (#5119).
+- The pass reads every container once: one bounded `docker ps -a` plus one
+  `docker inspect`, taken fresh on the first account that needs it.
 - After a resume or recreate, the account is re-probed at once, bypassing the
   300 s probe cache.
 - A failed start backs off per account: 120 s, doubling, capped at 30 min. It
@@ -8549,6 +8554,39 @@ across the registered roots:
 |---|---|---|---|
 | `LOOM_SESSION_RECONCILE` | `autonomous.sessionReconcile.enabled` | env > config > default | `true` (on) |
 | `LOOM_SESSION_RECONCILE_INTERVAL_SECS` | `autonomous.sessionReconcile.intervalSecs` | env > config > default | `60` |
+
+**Mount drift (#10364).** A host-mode container's workspace mounts are fixed
+when it is created, so a later `loom-daemon workspace add` never reaches it
+(every Codex tick in the new repository fails `chdir to cwd`) and a later
+`workspace remove` leaves the old repository mounted read-write. Each pass
+compares every running container's mounts with what `accounts session start
+--mount-workspace <its loom.workspace label>` would mount **now**:
+
+- Containers that still mount a deregistered path (`extra`, a containment gap,
+  logged at WARN with the container and path) are handled before those that
+  only lack a new one (`missing`).
+- An idle one is stopped (graceful, 15 s), removed and recreated against the
+  workspace and image of the last operator `session start`
+  (`.session-last-start.json`, so a daemon restart does not lose it),
+  otherwise its own `loom.workspace` label. No hold is written. A busy one
+  (`docker top` shows an exec) is left running and re-checked next pass.
+- Before stopping anything, the pass re-checks the hold, re-inspects the
+  container (it must be the same container, still running), and checks that
+  the recreate would be allowed (not `/`, the home directory or a `firewall:
+  true` overlap, and at least one registered root under the workspace). If it
+  would be refused, nothing is stopped.
+- If a freshly recreated container still drifts, or the recreate would be
+  refused, the pass WARNs once and leaves it alone until the drift changes
+  (or the daemon restarts) instead of recreating it every interval. A failed
+  stop or recreate takes the per-account backoff above.
+- Held, disabled, private-clone (`loom.workspace-mode=private-clone`, or
+  configured under `.private-sessions`) and non-session-managed accounts are
+  never drift-recreated.
+
+`loom-daemon workspace add`/`remove` lists the containers the change left
+drifted, says the reconciler will recreate them, and prints the manual
+`session stop` / `session start` pair for when the daemon is down or the
+reconciler is opted out.
 
 Docker reports a crash-looping container as `Running=true, Restarting=true`.
 `accounts session status`, `start`, the login probe and `session-exec posture`
