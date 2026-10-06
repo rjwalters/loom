@@ -590,6 +590,14 @@ pub(crate) enum ForgeAction {
         action: super::forge_egress_cmd::EgressAction,
     },
 
+    /// `forge parent body|link` (#10012 §4) — the logic behind
+    /// `create-issue.sh --parent N`: the `loom:parent` marker, the parent's
+    /// red-main marker, the inherited star, the native sub-issue link.
+    Parent {
+        #[command(subcommand)]
+        action: super::forge_parent_cmd::ParentAction,
+    },
+
     /// `forge dashboard-link <owner/repo> <number> [--pr]` — print the exact
     /// dashboard footer (#9772) for `number` in `owner/repo`, byte-for-byte
     /// as `forge comment` would append it. The shell twin's format-pinning
@@ -642,6 +650,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         } => return super::forge_identity_cmd::token(&repo, &access, force),
         ForgeAction::Egress { action } => return super::forge_egress_cmd::handle(action),
         ForgeAction::MergeQueue { action } => super::forge_merge_queue_cmd::run(action),
+        ForgeAction::Parent { action } => return super::forge_parent_cmd::handle(action),
         ForgeAction::IsFleet { login } => return super::forge_identity_cmd::is_fleet(&login),
         ForgeAction::Identities { json } => return super::forge_identity_cmd::identities(json),
         ForgeAction::Calls(args) => return super::forge_calls_cmd::handle(args),
@@ -822,6 +831,10 @@ fn write_target(action: &ForgeAction) -> Option<Option<String>> {
             action:
                 super::forge_merge_queue_cmd::MergeQueueAction::Enqueue { repo, .. }
                 | super::forge_merge_queue_cmd::MergeQueueAction::Dequeue { repo, .. },
+        } => Some(repo.clone()),
+        // #10012: `parent link` stars and links, so it is vetted too.
+        ForgeAction::Parent {
+            action: super::forge_parent_cmd::ParentAction::Link { repo, .. },
         } => Some(repo.clone()),
         _ => None,
     }

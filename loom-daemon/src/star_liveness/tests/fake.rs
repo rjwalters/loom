@@ -32,6 +32,8 @@ pub struct Repo {
     pub fail_listing: bool,
     /// Labels whose removal fails (write-failure injection).
     pub fail_remove: Vec<String>,
+    /// Make every `post_comment` fail.
+    pub fail_post: bool,
 }
 
 /// A forge world: repos by slug.
@@ -149,6 +151,9 @@ impl StarForge for FakeForge {
 
     fn post_comment(&mut self, number: u32, body: &str) -> Result<()> {
         let mut repo = self.world.repo(&self.slug);
+        if repo.fail_post {
+            return Err(anyhow!("post failed"));
+        }
         repo.posted.push((number, body.to_string()));
         repo.comments.entry(number).or_default().push(bot(body));
         Ok(())

@@ -16,6 +16,7 @@ mod landing_tests;
 mod level_tests;
 mod named_blocker_tests;
 mod notice_tests;
+mod parent_link_tests;
 mod park_apply_tests;
 mod pass_tests;
 mod propagation_tests;
