@@ -59,6 +59,8 @@ pub enum ReadError {
 pub struct PullHead {
     pub sha: String,
     pub base_ref: String,
+    /// `head.ref` — the branch `gh pr checks` names when no checks exist.
+    pub head_ref: Option<String>,
 }
 
 /// Conditional REST reads for one repository.
@@ -68,6 +70,7 @@ pub struct GhReads {
     store_dir: PathBuf,
     target: Target,
     memo: HashMap<String, DiskEntry>,
+    caller: &'static str,
 }
 
 impl GhReads {
@@ -93,7 +96,16 @@ impl GhReads {
             store_dir,
             target,
             memo: HashMap::new(),
+            caller: CALLER,
         })
+    }
+
+    /// Record reads under `caller` instead of [`CALLER`] (the agent `gh`
+    /// front's `gh pr checks`, #10516, shares these reads and their entries).
+    #[must_use]
+    pub fn with_caller(mut self, caller: &'static str) -> Self {
+        self.caller = caller;
+        self
     }
 
     fn nwo(&self) -> &str {
@@ -114,7 +126,11 @@ impl GhReads {
                 .map(String::from)
         };
         match (field("head", "sha"), field("base", "ref")) {
-            (Some(sha), Some(base_ref)) => Ok(PullHead { sha, base_ref }),
+            (Some(sha), Some(base_ref)) => Ok(PullHead {
+                sha,
+                base_ref,
+                head_ref: field("head", "ref"),
+            }),
             _ => Err(ReadError::Fatal("unreadable: pull request has no head.sha/base.ref".into())),
         }
     }
@@ -207,7 +223,7 @@ impl GhReads {
                 .cloned()
                 .or_else(|| store::read_disk_entry(p))
         });
-        let site = ConditionalRead::new(CALLER, op);
+        let site = ConditionalRead::new(self.caller, op);
         let etag = prior.as_ref().map(|p| p.etag.as_str());
         let (status, response, stderr) = store::fetch_conditional(
             site,

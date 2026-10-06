@@ -28,6 +28,27 @@ case "$*" in
     printf '{"number": 42, "node_id": "I_1", "state": "open", "labels": [{"node_id": "LA_1", "name": "loom:issue", "description": null, "color": "fff"}]}\n'
     exit 0
     ;;
+  'api --include repos/o/r/pulls/42'|'api --include repos/o/r/pulls/43')
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"p1"\r\n\r\n'
+    n="${3##*/}"
+    printf '{"number": %s, "head": {"ref": "feat-%s", "sha": "sha%s"}, "base": {"ref": "main"}}\n' "$n" "$n" "$n"
+    exit 0
+    ;;
+  'api --include repos/o/r/commits/sha42/check-runs?per_page=100')
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"c1"\r\n\r\n'
+    printf '{"total_count": 2, "check_runs": [{"name": "build", "status": "completed", "conclusion": "success", "started_at": "2026-10-01T00:00:00Z", "completed_at": "2026-10-01T00:00:05Z", "details_url": "https://ci/build"}, {"name": "lint", "status": "completed", "conclusion": "failure", "started_at": "2026-10-01T00:00:01Z", "completed_at": "2026-10-01T00:01:01Z", "details_url": "https://ci/lint"}]}\n'
+    exit 0
+    ;;
+  'api --include repos/o/r/commits/sha43/check-runs?per_page=100')
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"c2"\r\n\r\n'
+    printf '{"total_count": 0, "check_runs": []}\n'
+    exit 0
+    ;;
+  'api --include repos/o/r/commits/sha4'[23]'/status?per_page=100')
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"s1"\r\n\r\n'
+    printf '{"state": "pending", "total_count": 0, "statuses": []}\n'
+    exit 0
+    ;;
   'api --include repos/o/r/issues?'*)
     printf 'HTTP/2.0 200 OK\r\nEtag: W/"l1"\r\n\r\n'
     printf '[{"number": 7, "title": "seven", "state": "open", "labels": [{"name": "loom:issue"}], "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-02T00:00:00Z", "closed_at": null, "body": null, "user": {"login": "x"}}]\n'
@@ -91,6 +112,10 @@ impl Sandbox {
             "GH_REPO",
             "GH_HOST",
             "STUB_EXIT",
+            "GH_FORCE_TTY",
+            "CLICOLOR_FORCE",
+            "GH_DEBUG",
+            "DEBUG",
         ] {
             cmd.env_remove(k);
         }
@@ -179,6 +204,71 @@ fn list_is_etag_served_compact_with_gh_default_limit() {
     assert_eq!(calls.len(), 2, "{calls:?}");
     assert!(calls[0].starts_with("api --include repos/o/r/issues?labels=loom:issue"));
     assert!(calls[1].contains("If-None-Match: W/\"l1\""), "{calls:?}");
+}
+
+const CHECKS: &[&str] = &["pr", "checks", "42", "--repo", "o/r"];
+
+#[test]
+fn pr_checks_is_served_from_rest_and_a_repeat_is_304_only() {
+    let s = Sandbox::new();
+    let want = "lint\tfail\t1m0s\thttps://ci/lint\t\nbuild\tpass\t5s\thttps://ci/build\t\n";
+    let first = s.gh(CHECKS, &[]);
+    assert_eq!((stdout(&first).as_str(), first.status.code()), (want, Some(1)), "{first:?}");
+    assert!(first.stderr.is_empty(), "{first:?}");
+    assert_eq!(
+        s.calls(),
+        [
+            "api --include repos/o/r/pulls/42",
+            "api --include repos/o/r/commits/sha42/check-runs?per_page=100",
+            "api --include repos/o/r/commits/sha42/status?per_page=100",
+        ]
+    );
+    // The repeat: three conditional requests, each answered 304 (no quota).
+    let second = s.gh(CHECKS, &[]);
+    assert_eq!((stdout(&second).as_str(), second.status.code()), (want, Some(1)));
+    let calls = s.calls();
+    assert_eq!(calls.len(), 6, "{calls:?}");
+    assert!(calls[3..].iter().all(|c| c.contains("If-None-Match: W/")), "{calls:?}");
+    assert_eq!(s.outcomes(), ["revalidated", "revalidated"]);
+
+    // `--json` over the same reads: compact, sorted keys, exit 0.
+    let json = s.gh(&["pr", "checks", "42", "-R", "o/r", "--json", "name,bucket"], &[]);
+    assert_eq!(
+        (stdout(&json).as_str(), json.status.code()),
+        ("[{\"bucket\":\"fail\",\"name\":\"lint\"},{\"bucket\":\"pass\",\"name\":\"build\"}]\n", Some(0))
+    );
+}
+
+#[test]
+fn pr_checks_with_no_checks_prints_gh_empty_read_signature() {
+    let s = Sandbox::new();
+    for args in [
+        &["pr", "checks", "43", "--repo", "o/r"][..],
+        &["pr", "checks", "43", "--repo", "o/r", "--json", "bucket,name"][..],
+    ] {
+        let out = s.gh(args, &[]);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert_eq!(stdout(&out), "");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "no checks reported on the 'feat-43' branch\n"
+        );
+    }
+}
+
+#[test]
+fn pr_checks_shapes_it_cannot_reproduce_pass_through() {
+    let s = Sandbox::new();
+    for extra in [&["--watch"][..], &["--required"], &["--json", "workflow"]] {
+        let mut args = CHECKS.to_vec();
+        args.extend_from_slice(extra);
+        let out = s.gh(&args, &[]);
+        assert!(stdout(&out).contains("ARG:checks"), "{extra:?}: {out:?}");
+    }
+    // Forced colour changes gh's output: pass through.
+    let out = s.gh(CHECKS, &[("CLICOLOR_FORCE", "1")]);
+    assert!(stdout(&out).contains("ARG:checks"), "{out:?}");
+    assert!(s.calls().iter().all(|c| !c.starts_with("api ")), "{:?}", s.calls());
 }
 
 #[test]
