@@ -8,6 +8,7 @@ fn app(slug: &str) -> Identity {
         app_id: format!("id-{slug}"),
         slug: Some(slug.to_string()),
         private_key_path: "/k.pem".into(),
+        owners: None,
     }
 }
 

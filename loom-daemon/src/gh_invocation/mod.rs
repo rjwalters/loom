@@ -41,12 +41,15 @@
 //! plan).
 
 pub mod accounting;
+mod affinity;
 pub mod api_kind;
 mod outcome;
 mod reader_route;
 pub mod resolver;
 pub mod telemetry;
 pub mod transparent;
+
+pub use affinity::{affinity_key, url_affinity_key};
 
 #[cfg(test)]
 mod tests;
@@ -581,9 +584,7 @@ impl GhInvocation {
     /// collected (side effects may have happened — never retry a write on it).
     pub fn execute(self) -> Result<GhCompletion, ExecError> {
         self.execute_routed(
-            &|slug, host, resource| {
-                crate::forge_identity::read_credential_for(slug, host, resource)
-            },
+            &|req| crate::forge_identity::route_read(req, std::time::SystemTime::now()),
             &reader_route::withdraw_reader,
         )
     }

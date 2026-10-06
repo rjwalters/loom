@@ -953,6 +953,7 @@ pub fn status_report(
         identity_roles: window.as_ref().map(Aggregate::role_rows),
         buckets: sink_dir().map(|d| buckets::status_rows(&d, now_ts)),
         reader_withdrawals: reader_withdrawal_rows(now),
+        read_spills: read_spill_rows(now),
         host_window: window.map(|w| w.rows()),
         since_start,
         since,
@@ -970,6 +971,20 @@ fn reader_withdrawal_rows(now: DateTime<Utc>) -> Vec<crate::types::ReaderWithdra
             owner,
             resource: scope.as_str().to_string(),
             until: until.into(),
+        })
+        .collect()
+}
+
+/// This process's engaged read-pool spill latches (W4-B), for `status`.
+fn read_spill_rows(now: DateTime<Utc>) -> Vec<crate::types::ReadSpillStatus> {
+    crate::forge_identity::route::live_latches(now.into())
+        .into_iter()
+        .map(|(owner_repo, resource, app, latch)| crate::types::ReadSpillStatus {
+            owner_repo,
+            resource: resource.as_str().to_string(),
+            from: crate::observability::ops::ratelimit::app_account_label(&app),
+            mode: latch.mode.as_str().to_string(),
+            until: latch.release_at.into(),
         })
         .collect()
 }

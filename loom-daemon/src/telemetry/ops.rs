@@ -123,6 +123,14 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "forge.reader.until",
     "forge.reader.source",
     "forge.reader.secondary",
+    // `forge.reader.spill` spans (W4-B): one read-pool spill-latch
+    // transition — repo, resource, home and target reader, mode, release.
+    "forge.spill.owner_repo",
+    "forge.spill.resource",
+    "forge.spill.from",
+    "forge.spill.to",
+    "forge.spill.mode",
+    "forge.spill.until",
 ];
 
 /// Longest label value kept, in bytes.
