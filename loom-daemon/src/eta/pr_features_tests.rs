@@ -317,6 +317,7 @@ fn every_read_feature_is_a_value_or_has_exactly_one_reason() {
     let names: Vec<&str> = PR_SIZE_FEATURES
         .iter()
         .chain(&CHECK_FEATURES)
+        .chain(&ALL_CHECK_FEATURES)
         .chain(&ISSUE_FEATURES)
         .copied()
         .collect();
@@ -374,6 +375,35 @@ fn an_optional_check_failing_is_not_counted_as_failed() {
     assert_eq!(required(&["Backend", "lint", "docs"]), (1, 1));
     // A branch that requires nothing has nothing pending or failed.
     assert_eq!(required(&[]), (0, 0));
+}
+
+/// #10334: with an optional check failing and every required one passing, the
+/// required-failed count is 0 while the all-check counts still report it.
+#[test]
+fn the_all_check_counts_are_reported_apart_from_the_required_ones() {
+    let mut store = answered(t(-60), &pull_body("open", false, 40, "abc", -120));
+    store.answer(
+        &read(ReadKind::Checks, 10, Some("abc")),
+        Some(&checks_body(
+            &[
+                ("Backend", "completed", Some("success")),
+                ("lint", "completed", Some("failure")),
+                ("docs", "in_progress", None),
+            ],
+            3,
+        )),
+        t(-60),
+    );
+    // Required set unknown: the required counts are null, the all-check ones
+    // are not.
+    let (f, omitted) = features_at(&store, Some(10), t(0));
+    assert_eq!((f.checks_pending, f.checks_failed), (None, None));
+    assert_eq!((f.checks_all_pending, f.checks_all_failed), (Some(1), Some(1)));
+    assert!(reason_of(&omitted, "checks_all_failed").is_none());
+    store.answer(&required_read("main"), Some(&required_body(&["Backend"])), t(-60));
+    let (f, _) = features_at(&store, Some(10), t(0));
+    assert_eq!((f.checks_pending, f.checks_failed), (Some(0), Some(0)));
+    assert_eq!((f.checks_all_pending, f.checks_all_failed), (Some(1), Some(1)));
 }
 
 /// #10232 finding 2: a failed required-context lookup leaves the check

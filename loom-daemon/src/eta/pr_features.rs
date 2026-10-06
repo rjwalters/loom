@@ -84,6 +84,10 @@ pub const PR_SIZE_FEATURES: [&str; 4] = [
 /// The check features, in [`Features`] field order.
 pub const CHECK_FEATURES: [&str; 2] = ["checks_pending", "checks_failed"];
 
+/// The all-check counts (#10334), kept apart from [`CHECK_FEATURES`]: every
+/// run on the head, required or not. They need no required-context lookup.
+pub const ALL_CHECK_FEATURES: [&str; 2] = ["checks_all_pending", "checks_all_failed"];
+
 /// The issue-body features, in [`Features`] field order.
 pub const ISSUE_FEATURES: [&str; 3] = ["complexity_marker", "points_marker", "author"];
 
@@ -260,6 +264,14 @@ pub struct ChecksSnapshot {
 }
 
 impl ChecksSnapshot {
+    /// `(pending, failed)` over every check seen, required or not (#10334).
+    #[must_use]
+    pub fn all_counts(&self) -> (u32, u32) {
+        let n = |c: usize| u32::try_from(c).unwrap_or(u32::MAX);
+        let pending = self.pending.difference(&self.failing).count();
+        (n(pending), n(self.failing.len()))
+    }
+
     /// `(pending, failed)` over the `required` contexts only. A required
     /// context that failed is failed; one still running, or with no run on
     /// the commit yet, is pending. Every other check is ignored, so with
@@ -743,7 +755,16 @@ impl PrFeatureStore {
                 features.pr_changed_files = Some(snap.changed_files);
                 features.pr_commits = Some(snap.commits);
                 let base = snap.base_ref.as_deref();
-                let checks = self.checks_at(repo, pr, as_of).and_then(|c| {
+                let all = self.checks_at(repo, pr, as_of);
+                match &all {
+                    Ok(c) => {
+                        let (pending, failed) = c.all_counts();
+                        features.checks_all_pending = Some(pending);
+                        features.checks_all_failed = Some(failed);
+                    }
+                    Err(why) => omit(omitted, &ALL_CHECK_FEATURES, why),
+                }
+                let checks = all.and_then(|c| {
                     self.required_at(repo, base, as_of)
                         .map(|r| c.required_counts(&r.contexts))
                 });
@@ -758,6 +779,7 @@ impl PrFeatureStore {
             Err(why) => {
                 omit(omitted, &PR_SIZE_FEATURES, why);
                 omit(omitted, &CHECK_FEATURES, why);
+                omit(omitted, &ALL_CHECK_FEATURES, why);
             }
         }
         match self.issue_at(repo, issue, as_of) {

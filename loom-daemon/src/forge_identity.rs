@@ -809,6 +809,12 @@ pub fn reader_bucket(app_id: &str, owner_repo: &str) -> String {
     format!("reader:{app_id}@{}", owner.to_ascii_lowercase())
 }
 
+/// The public rate-limit bucket label of the writer credential (#10334). The
+/// writer is one credential per host and owns its own budget, separate from
+/// every reader App's; the label is a fixed word, never a credential or an
+/// App id.
+pub const WRITER_BUCKET: &str = "writer";
+
 /// The one reader-then-writer retry shape (#9537, shared since #9872 by
 /// `forge_etag_store::fetch_conditional` and the `GhInvocation` choke point).
 ///

@@ -17,6 +17,12 @@
 //! reader (it reads on the writer) is omitted with
 //! [`reason::NO_READER_FOR_REPO`]; a reader with no fresh reading with
 //! [`reason::NO_IDENTITY_READING`] — never another identity's values.
+//!
+//! The writer's budget is its own identity (#10334), kept under the fixed
+//! public label [`crate::forge_identity::WRITER_BUCKET`] and carried as
+//! `ratelimit_writer_*`. `ratelimit_min_remaining` / `ratelimit_exhausted`
+//! summarise the most constrained of the serving reader and the writer, so a
+//! healthy reader cannot hide an exhausted writer.
 
 use super::explanation::{FeatureOmitted, Features};
 use chrono::{DateTime, Duration, Utc};
@@ -30,7 +36,7 @@ pub const MAX_AGE_SEC: i64 = 15 * 60;
 pub const READING_MAX_AGE_SEC: i64 = 15 * 60;
 
 /// The stall features, in [`Features`] field order.
-pub const NAMES: [&str; 8] = [
+pub const NAMES: [&str; 12] = [
     "pool_usable_accounts",
     "pool_exhausted",
     "ratelimit_core_remaining",
@@ -39,6 +45,10 @@ pub const NAMES: [&str; 8] = [
     "ratelimit_graphql_reset_at",
     "breaker_state",
     "breaker_cooldown_until",
+    "ratelimit_writer_core_remaining",
+    "ratelimit_writer_graphql_remaining",
+    "ratelimit_min_remaining",
+    "ratelimit_exhausted",
 ];
 
 /// Omission reasons this module assigns (`features_omitted[].reason`).
@@ -56,6 +66,11 @@ pub mod reason {
     pub const NO_IDENTITY_READING: &str = "no_identity_reading";
     /// The reading carried no reset instant (a breaker probe).
     pub const NO_RESET_IN_READING: &str = "no_reset_in_reading";
+    /// The writer credential has no fresh budget reading.
+    pub const NO_WRITER_READING: &str = "no_writer_reading";
+    /// No identity (the serving reader or the writer) has a fresh reading, so
+    /// there is no most-constrained one.
+    pub const NO_BUDGET_READING: &str = "no_budget_reading";
     /// No rate-limit breaker is registered in this process.
     pub const BREAKER_NOT_REGISTERED: &str = "breaker_not_registered";
     /// The breaker is closed, so there is no cooldown.
@@ -106,6 +121,9 @@ pub struct StallSnapshot {
     /// The serving reader's budgets per (lowercased) `owner/repo`. A repo
     /// with no applicable reader is absent.
     pub budgets: BTreeMap<String, RepoBudget>,
+    /// The writer credential's budgets (#10334): one writer per host, kept
+    /// under [`crate::forge_identity::WRITER_BUCKET`], never a reader's.
+    pub writer: RepoBudget,
     /// The breaker, when one is registered.
     pub breaker: Option<BreakerReading>,
     /// The pool `workspace_root` resolves to.
@@ -146,10 +164,12 @@ pub fn collect(workspace_root: &Path, repos: &[String], now: DateTime<Utc>) -> S
         &buckets,
         now,
     );
+    let writer = writer_budget(&buckets, now);
     let pool = crate::tokens_pool::select::spawnable_pool_state(workspace_root);
     StallSnapshot {
         observed_at: now,
         budgets,
+        writer,
         breaker: breaker.map(|b| BreakerReading {
             state: b.phase.as_str().to_string(),
             cooldown_until: b.cooldown_until,
@@ -158,6 +178,22 @@ pub fn collect(workspace_root: &Path, repos: &[String], now: DateTime<Utc>) -> S
             usable: pool.usable,
             total: pool.total,
         },
+    }
+}
+
+/// The writer credential's budgets in `buckets`, from its fixed public label.
+#[must_use]
+pub fn writer_budget(
+    buckets: &BTreeMap<String, Vec<crate::types::ForgeBudgetReading>>,
+    now: DateTime<Utc>,
+) -> RepoBudget {
+    let readings = buckets
+        .get(crate::forge_identity::WRITER_BUCKET)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    RepoBudget {
+        core: reading(readings, "core", now),
+        graphql: reading(readings, "graphql", now),
     }
 }
 
@@ -222,6 +258,54 @@ fn budget_to(
     }
 }
 
+/// The writer budget and the most-constrained-identity summary (#10334): the
+/// serving reader's and the writer's budgets each count, so a healthy reader
+/// cannot mask an exhausted writer. A reading whose reset instant has passed
+/// at `as_of` no longer constrains anything.
+fn write_identity_summary(
+    snap: &StallSnapshot,
+    repo: &str,
+    as_of: DateTime<Utc>,
+    features: &mut Features,
+    omitted: &mut Vec<FeatureOmitted>,
+) {
+    let w = &snap.writer;
+    for (r, name, out) in [
+        (
+            &w.core,
+            "ratelimit_writer_core_remaining",
+            &mut features.ratelimit_writer_core_remaining,
+        ),
+        (
+            &w.graphql,
+            "ratelimit_writer_graphql_remaining",
+            &mut features.ratelimit_writer_graphql_remaining,
+        ),
+    ] {
+        match r {
+            Some(r) => *out = Some(u32::try_from(r.remaining).unwrap_or(u32::MAX)),
+            None => omit(omitted, name, reason::NO_WRITER_READING),
+        }
+    }
+    let reader = snap.budgets.get(repo);
+    let live: Vec<&BudgetReading> = [&w.core, &w.graphql]
+        .into_iter()
+        .chain(reader.iter().flat_map(|b| [&b.core, &b.graphql]))
+        .flatten()
+        .filter(|r| r.reset_at.is_none_or(|at| at > as_of))
+        .collect();
+    match live.iter().map(|r| r.remaining).min() {
+        Some(min) => {
+            features.ratelimit_min_remaining = Some(u32::try_from(min).unwrap_or(u32::MAX));
+            features.ratelimit_exhausted = Some(min == 0);
+        }
+        None => {
+            omit(omitted, "ratelimit_min_remaining", reason::NO_BUDGET_READING);
+            omit(omitted, "ratelimit_exhausted", reason::NO_BUDGET_READING);
+        }
+    }
+}
+
 /// Write the stall features of `snapshot` at `as_of`, and a reason for each
 /// one left null. A snapshot taken at or after `as_of` is not used.
 pub fn write_to(
@@ -268,6 +352,7 @@ pub fn write_to(
         &mut features.ratelimit_graphql_reset_at,
         omitted,
     );
+    write_identity_summary(snap, repo, as_of, features, omitted);
     match &snap.breaker {
         None => {
             omit(omitted, "breaker_state", reason::BREAKER_NOT_REGISTERED);

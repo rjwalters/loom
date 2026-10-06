@@ -610,10 +610,11 @@ struct Aggregate {
     /// Counts per identity role (#9872); a line without one is `unknown`.
     roles: BTreeMap<String, Counts>,
     latest: BTreeMap<Pool, Reading>,
-    /// The newest reading per `(pool, reader bucket)` (#10232): `latest`
-    /// above collapses every identity, but each reader App installation owns
-    /// a separate budget (two readers share the `reader` role, so the role
-    /// is not a key). Only lines that name a bucket land here.
+    /// The newest reading per `(pool, identity bucket)` (#10232, #10334):
+    /// `latest` above collapses every identity, but each reader App
+    /// installation and the writer own separate budgets (two readers share
+    /// the `reader` role, so the role is not a key). Only lines that name a
+    /// bucket, or ran as the writer, land here.
     latest_by_bucket: BTreeMap<(Pool, String), Reading>,
 }
 
@@ -645,7 +646,14 @@ impl Aggregate {
                 };
                 self.latest.insert(line.p, reading);
             }
-            if let Some(bucket) = line.ib.clone() {
+            // A reader names its bucket; a writer (or writer-fallback) line
+            // lands under the fixed writer label (#10334), so a healthy
+            // reader's reading cannot stand in for an exhausted writer.
+            let bucket = line.ib.clone().or_else(|| {
+                matches!(line.ir.as_deref(), Some("writer" | "writer-fallback"))
+                    .then(|| crate::forge_identity::WRITER_BUCKET.to_string())
+            });
+            if let Some(bucket) = bucket {
                 let key = (line.p, bucket);
                 if self
                     .latest_by_bucket
@@ -1058,11 +1066,12 @@ fn exhausted_in(latest: &BTreeMap<Pool, Reading>, now: i64) -> Vec<(Pool, Option
 }
 
 /// The newest header budget reading of each pool, per **reader rate-limit
-/// bucket** (#10232), keyed by the public bucket label
-/// ([`crate::forge_identity::reader_bucket`]). Unlike [`status_report`]'s
-/// `budget` this never mixes identities: two readers of the same role are
-/// separate buckets, and a line that named no bucket (the writer, an
-/// unattributed call) is not returned at all. Never a credential.
+/// identity bucket** (#10232, #10334), keyed by the public bucket label
+/// ([`crate::forge_identity::reader_bucket`], or
+/// [`crate::forge_identity::WRITER_BUCKET`] for the writer and its
+/// fallback). Unlike [`status_report`]'s `budget` this never mixes
+/// identities: two readers of the same role are separate buckets, and an
+/// unattributed call is not returned at all. Never a credential.
 #[must_use]
 pub fn bucket_readings(now: DateTime<Utc>) -> BTreeMap<String, Vec<ForgeBudgetReading>> {
     let window = sink_dir().map(|d| read_window(&d, now.timestamp()));

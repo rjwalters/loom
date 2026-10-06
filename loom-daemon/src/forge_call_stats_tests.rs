@@ -269,9 +269,17 @@ fn readings_of_two_reader_buckets_with_one_role_stay_separate() {
     let a = agg.latest_by_bucket[&(Pool::Core, "reader:1@org".to_string())];
     let b = agg.latest_by_bucket[&(Pool::Core, "reader:2@org".to_string())];
     assert_eq!((a.remaining, b.remaining), (0, 4000));
-    // Writer / fallback lines update the pool-wide reading only.
-    assert_eq!(agg.latest_by_bucket.len(), 2);
+    // The writer and its fallback share one fixed-label bucket (#10334),
+    // separate from both readers; the pool-wide reading is still the newest.
+    assert_eq!(agg.latest_by_bucket.len(), 3);
+    let w = agg.latest_by_bucket[&(Pool::Core, crate::forge_identity::WRITER_BUCKET.to_string())];
+    assert_eq!(w.remaining, 4999);
     assert_eq!(agg.latest[&Pool::Core].remaining, 4999);
+    // An unattributed line (no role, no bucket) lands in no bucket.
+    let mut unattributed = with_bucket(400, "x", None, 1);
+    unattributed.ir = None;
+    agg.add(&unattributed);
+    assert_eq!(agg.latest_by_bucket.len(), 3);
 }
 
 // ===== #9777 call identity =====

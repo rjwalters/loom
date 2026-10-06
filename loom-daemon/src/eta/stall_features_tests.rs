@@ -26,6 +26,7 @@ fn snapshot() -> StallSnapshot {
                 }),
             },
         )]),
+        writer: RepoBudget::default(),
         breaker: Some(BreakerReading {
             state: "cooldown".to_string(),
             cooldown_until: Some(t(1800)),
@@ -209,4 +210,89 @@ fn two_readers_of_one_role_and_a_writer_fallback_are_never_mixed() {
         remaining(&snap, "org-a/w"),
         (None, Some(reason::NO_IDENTITY_READING.to_string()))
     );
+}
+
+/// #10334: a healthy reader cannot mask an exhausted writer.
+#[test]
+fn an_exhausted_writer_shows_through_a_healthy_reader() {
+    let buckets = BTreeMap::from([
+        (
+            "reader:1@org".to_string(),
+            vec![reading_of(4000, "core"), reading_of(5000, "graphql")],
+        ),
+        (
+            crate::forge_identity::WRITER_BUCKET.to_string(),
+            vec![reading_of(0, "core"), reading_of(900, "graphql")],
+        ),
+    ]);
+    let repos = vec![REPO.to_string()];
+    let mut snap = snapshot();
+    snap.budgets = repo_budgets(&repos, |_| Some("reader:1@org".to_string()), &buckets, t(0));
+    snap.writer = writer_budget(&buckets, t(0));
+    let (f, omitted) = write(Some(&snap), t(0));
+    assert_eq!(f.ratelimit_core_remaining, Some(4000));
+    assert_eq!(f.ratelimit_writer_core_remaining, Some(0));
+    assert_eq!(f.ratelimit_writer_graphql_remaining, Some(900));
+    assert_eq!(f.ratelimit_min_remaining, Some(0));
+    assert_eq!(f.ratelimit_exhausted, Some(true));
+    assert!(reason_of(&omitted, "ratelimit_exhausted").is_none());
+
+    // Both healthy: not exhausted, the minimum is the writer's GraphQL.
+    let healthy = BTreeMap::from([
+        ("reader:1@org".to_string(), vec![reading_of(4000, "core")]),
+        (
+            crate::forge_identity::WRITER_BUCKET.to_string(),
+            vec![reading_of(3000, "core"), reading_of(900, "graphql")],
+        ),
+    ]);
+    snap.budgets = repo_budgets(&repos, |_| Some("reader:1@org".to_string()), &healthy, t(0));
+    snap.writer = writer_budget(&healthy, t(0));
+    let (f, _) = write(Some(&snap), t(0));
+    assert_eq!((f.ratelimit_min_remaining, f.ratelimit_exhausted), (Some(900), Some(false)));
+
+    // A zero reading whose reset has passed constrains nothing.
+    let mut reset = reading_of(0, "core");
+    reset.reset_at = Some(t(-1));
+    snap.writer = writer_budget(
+        &BTreeMap::from([(crate::forge_identity::WRITER_BUCKET.to_string(), vec![reset])]),
+        t(0),
+    );
+    snap.budgets.clear();
+    let (f, _) = write(Some(&snap), t(0));
+    assert_eq!(f.ratelimit_exhausted, None);
+    assert_eq!(
+        reason_of(&write(Some(&snap), t(0)).1, "ratelimit_exhausted"),
+        Some(reason::NO_BUDGET_READING)
+    );
+}
+
+/// #10334: nothing recorded or carried is credential-shaped.
+#[test]
+fn no_credential_shaped_string_is_carried() {
+    let buckets = BTreeMap::from([(
+        crate::forge_identity::WRITER_BUCKET.to_string(),
+        vec![reading_of(5, "core")],
+    )]);
+    let mut snap = snapshot();
+    snap.writer = writer_budget(&buckets, t(0));
+    let (f, omitted) = write(Some(&snap), t(0));
+    let text = format!(
+        "{}{}{}",
+        serde_json::to_string(&f).unwrap(),
+        serde_json::to_string(&omitted.iter().map(|o| o.reason.clone()).collect::<Vec<_>>())
+            .unwrap(),
+        crate::forge_identity::WRITER_BUCKET,
+    );
+    for shape in [
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "ghu_",
+        "github_pat_",
+        "Bearer ",
+        "-----BEGIN",
+    ] {
+        assert!(!text.contains(shape), "{shape}");
+    }
+    assert_eq!(crate::forge_identity::WRITER_BUCKET, "writer");
 }
