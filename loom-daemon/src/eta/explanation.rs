@@ -98,6 +98,13 @@ pub struct Explanation {
     /// every other heuristic, so their explanations are byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recalibration: Option<super::recalibrate::Recalibration>,
+    /// How a conformal calibration wrapper (#10489) moved the base's four
+    /// quantiles into `result`: the base, the trailing window, the shift per
+    /// quantile and the evidence behind it. Absent — and `result` is the
+    /// simulation's own — for every other heuristic, so their explanations
+    /// are byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<super::conformal::Calibration>,
     /// What `land-2026-10-04-twin-otter` (#10243) evaluated: the coefficient
     /// file, the adapted input, both parts' quantiles and the model slice
     /// that recomputes them. Absent for every other heuristic and on every

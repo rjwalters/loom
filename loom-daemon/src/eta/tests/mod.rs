@@ -6,6 +6,7 @@ mod backtest_union;
 mod censoring;
 mod conditioning;
 mod config;
+mod conformal;
 mod emit;
 mod episodes;
 mod estimate;

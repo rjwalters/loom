@@ -34,6 +34,10 @@ fn landed(id: &str, stage: Stage, made: i64, p50: i64, remaining: i64) -> Calibr
         p50_sec: p50,
         actual_at: Some(at(made + remaining)),
         resolved_at: Some(at(made + remaining)),
+        age_sec: None,
+        p25_sec: None,
+        p75_sec: None,
+        p90_sec: None,
     }
 }
 

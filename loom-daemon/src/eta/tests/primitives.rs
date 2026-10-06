@@ -228,6 +228,7 @@ fn registry_resolves_current_per_kind() {
             "finish-v1",
             "land-v1",
             "land-v2",
+            "land-2026-10-06-calm-plover",
             "land-2026-10-04-fresh-tide",
             "land-v4",
             "land-2026-10-04-twin-otter",
@@ -251,6 +252,13 @@ fn registry_resolves_current_per_kind() {
             .current(Kind::Land, Some("land-2026-10-04-amber-heron"))
             .id(),
         "land-v1"
+    );
+    // `land-2026-10-06-calm-plover` (#10489) likewise: registered, not current.
+    assert_eq!(
+        registry
+            .current(Kind::Land, Some("land-2026-10-06-calm-plover"))
+            .id(),
+        "land-2026-10-06-calm-plover"
     );
     // `land-2026-10-04-fresh-tide` (#10209) likewise: registered, not current.
     assert_eq!(
@@ -282,6 +290,7 @@ fn for_kind_enumerates_every_registered_heuristic_of_a_kind() {
         vec![
             "land-v1",
             "land-v2",
+            "land-2026-10-06-calm-plover",
             "land-2026-10-04-fresh-tide",
             "land-v4",
             "land-2026-10-04-twin-otter",
