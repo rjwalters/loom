@@ -843,6 +843,13 @@ pub(crate) enum MergePrCommand {
     /// — see `cli::merge_pr_version_policy`.
     VersionPolicy(super::merge_pr_version_policy::VersionPolicyArgs),
 
+    /// The pre-merge `workflow` token-scope guard (#10539): refuse a PR that
+    /// touches `.github/workflows/` when the `gh` token's `X-OAuth-Scopes` is
+    /// present and lacks `workflow`. Exit 1 = block (message on stdout), 0 =
+    /// proceed; fails open on any lookup error — see
+    /// `cli::merge_pr_workflow_scope`.
+    WorkflowScope(super::merge_pr_workflow_scope::WorkflowScopeArgs),
+
     /// The pre-merge merge-ordering guard (#3747 item 2, reshaped by #7982):
     /// discover open CHILD PRs still targeting this parent branch and
     /// ESTABLISH the postcondition `reconcile-stack.sh` needs by pinning the
@@ -1019,6 +1026,7 @@ impl MergePrCommand {
             MergePrCommand::CheckRunsStreak(args) => args.run(),
             MergePrCommand::CheckRunsRollup(args) => args.run(),
             MergePrCommand::VersionPolicy(args) => args.run(),
+            MergePrCommand::WorkflowScope(args) => args.run(),
             MergePrCommand::StackedChildren(args) => args.run(),
             MergePrCommand::WorktreePrimary(args) => args.run(),
             MergePrCommand::WorktreeBranchFor(args) => args.run(),

@@ -622,6 +622,11 @@ _check_defaults_version_bump_collision() {
 # API call — same reasoning as _check_no_open_stacked_children above.
 _check_defaults_version_bump_collision
 
+# Pre-merge workflow-scope guard (#10539): `loom-daemon merge-pr workflow-scope`.
+# Exit 1 = PR touches .github/workflows/ and the token lacks `workflow`; anything else proceeds (fail open, so an older daemon is a skip).
+_check_workflow_scope() { local out rc=0; [[ "${FORGE_TYPE:-github}" == "github" ]] || return 0; out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr workflow-scope --repo "$REPO_NWO" --pr "$PR_NUMBER" 2>/dev/null)" || rc=$?; [[ $rc -eq 1 ]] || return 0; [[ "${DRY_RUN:-false}" != "true" ]] || { warning "[dry-run] Would BLOCK: $out"; return 0; }; error "$out"; }
+_check_workflow_scope
+
 # _trusted_pr_comments <nwo> <pr> -- emit the bodies of `<nwo>`'s PR <pr>`
 # comments whose authors Loom trusts as control-signal sources (#9548): a repo
 # insider by author_association, one of THIS fleet's Apps, this daemon's own
