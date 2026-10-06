@@ -30,7 +30,8 @@
 //! rate-limit breaker trips, quota gauges (per bucket since W1) and breaker
 //! skips, [`forge_calls`] (W1) the facade's `loom.forge.calls` counter, and
 //! [`redate_chain`] (#10163) #8508 re-date pressure (re-dated PRs, re-dates
-//! per PR, time to land), [`reader_withdrawal`] (W4-A) one
+//! per PR, time to land), [`eta_health`] (#10391) the per-host ETA
+//! pipeline health gauges, [`reader_withdrawal`] (W4-A) one
 //! `forge.reader.withdrawn` span per reader withdrawal, and [`reader_spill`]
 //! (W4-B) one `forge.reader.spill` span per read-pool spill-latch
 //! transition. A new emitter adds a `MetricName`/`SpanName`
@@ -44,6 +45,7 @@ pub mod capture;
 pub mod dispatch;
 pub mod disposition;
 pub mod dwell;
+pub mod eta_health;
 pub mod forge_calls;
 pub mod host;
 pub mod liveness;

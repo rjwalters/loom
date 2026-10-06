@@ -125,6 +125,13 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     // must filter it (`policy.trusted_listing(`), checked below.
     ("premise_check/cli.rs", "forge_inputs", "trusted_inputs("),
     ("premise_check/cli.rs", "trusted_inputs", "policy.trusted_listing("),
+    // #10025's GraphQL fallback: it returns the raw listing + issue object to
+    // `forge_inputs`, which hands both to `trusted_inputs(` (checked above),
+    // so the records reach `policy.trusted_listing(` like the REST ones.
+    // `graphql_listing_and_object` selects `comments(...)` through the
+    // `COMMENTS_QUERY` const, which the scanner cannot see; listed anyway.
+    ("premise_check/cli.rs", "graphql_listing_and_object", ""),
+    ("premise_check/cli.rs", "parse_graphql_comments", ""),
     ("merge_pr/redate.rs", "remedy_with", "policy.trusted_listing("),
     ("merge_pr/redate.rs", "post_comment", ""),
     ("role_runner/roster.rs", "read_roster_comments", "trusted_ndjson("),

@@ -492,6 +492,15 @@ impl GhInvocation {
         self
     }
 
+    /// Record the reader rate-limit bucket this execution spent (#10232), for
+    /// a caller that routes its own reads; see
+    /// [`crate::forge_identity::reader_bucket`].
+    #[must_use]
+    pub fn identity_bucket(mut self, bucket: &str) -> Self {
+        self.identity = std::mem::take(&mut self.identity).with_bucket(bucket);
+        self
+    }
+
     #[must_use]
     pub fn parent(mut self, parent: ParentContext) -> Self {
         self.parent = parent;

@@ -274,6 +274,10 @@ pub fn emit_record(
         log::warn!("eta fit: dropped eta.fit record: invalid provenance");
         return false;
     }
+    super::ops::eta_health::note_fit_check(
+        record.started_at,
+        record.skip_reason.as_deref().unwrap_or(&record.outcome),
+    );
     if let Ok(body) = serde_json::to_string(&record) {
         crate::eta::health::write_fit_check(root, &body);
     }

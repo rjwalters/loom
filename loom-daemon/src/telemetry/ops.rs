@@ -48,6 +48,9 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     "cred_owner",
     "target_owner",
     "outcome",
+    "heuristic",
+    "kind",
+    "repo",
 ];
 
 /// Span attribute keys the ops span names (`loom.dispatch.tick`,
@@ -320,6 +323,37 @@ pub enum MetricName {
     /// point, labelled `task` and `reason` = `panic` / `overrun` / `exit`.
     #[serde(rename = "loom.daemon.task_faults")]
     DaemonTaskFaults,
+    // ---- ETA pipeline health (Issue #10391) ------------------------------
+    /// Live ETA items on this host, by kind, heuristic and answered/refusal reason.
+    #[serde(rename = "loom.eta.health.items")]
+    EtaHealthItems,
+    /// 1 when a fit coefficient file is loaded, 0 when none is.
+    #[serde(rename = "loom.eta.health.fit_loaded")]
+    EtaHealthFitLoaded,
+    /// Age of the loaded fit coefficient file's cutoff.
+    #[serde(rename = "loom.eta.health.fit_age_seconds")]
+    EtaHealthFitAgeSeconds,
+    /// Time since the last fit check, by its outcome or skip reason.
+    #[serde(rename = "loom.eta.health.fit_check_age_seconds")]
+    EtaHealthFitCheckAgeSeconds,
+    /// Age of each cached fleet snapshot, by repo.
+    #[serde(rename = "loom.eta.health.snapshot_age_seconds")]
+    EtaHealthSnapshotAgeSeconds,
+    /// 1 for the fleet refresh gate state this host is in.
+    #[serde(rename = "loom.eta.health.refresh_gate")]
+    EtaHealthRefreshGate,
+    /// Time since the last fleet refresh tick.
+    #[serde(rename = "loom.eta.health.refresh_last_cycle_age_seconds")]
+    EtaHealthRefreshLastCycleAgeSeconds,
+    /// Repos per stop reason in the last refreshing tick.
+    #[serde(rename = "loom.eta.health.refresh_repos")]
+    EtaHealthRefreshRepos,
+    /// Rows in the last built eta.snapshot.
+    #[serde(rename = "loom.eta.health.snapshot_rows")]
+    EtaHealthSnapshotRows,
+    /// Rows with non-empty alternates in the last built eta.snapshot.
+    #[serde(rename = "loom.eta.health.snapshot_alternates_rows")]
+    EtaHealthSnapshotAlternatesRows,
 }
 
 impl MetricName {
@@ -371,6 +405,18 @@ impl MetricName {
             Self::MergeTimeToLandMax => "loom.merge.time_to_land_max",
             Self::DaemonTaskAlive => "loom.daemon.task_alive",
             Self::DaemonTaskFaults => "loom.daemon.task_faults",
+            Self::EtaHealthItems => "loom.eta.health.items",
+            Self::EtaHealthFitLoaded => "loom.eta.health.fit_loaded",
+            Self::EtaHealthFitAgeSeconds => "loom.eta.health.fit_age_seconds",
+            Self::EtaHealthFitCheckAgeSeconds => "loom.eta.health.fit_check_age_seconds",
+            Self::EtaHealthSnapshotAgeSeconds => "loom.eta.health.snapshot_age_seconds",
+            Self::EtaHealthRefreshGate => "loom.eta.health.refresh_gate",
+            Self::EtaHealthRefreshLastCycleAgeSeconds => {
+                "loom.eta.health.refresh_last_cycle_age_seconds"
+            }
+            Self::EtaHealthRefreshRepos => "loom.eta.health.refresh_repos",
+            Self::EtaHealthSnapshotRows => "loom.eta.health.snapshot_rows",
+            Self::EtaHealthSnapshotAlternatesRows => "loom.eta.health.snapshot_alternates_rows",
         }
     }
 
@@ -438,6 +484,16 @@ impl MetricName {
             Self::MergeTimeToLandMax => "s",
             Self::DaemonTaskAlive => "1",
             Self::DaemonTaskFaults => "{fault}",
+            Self::EtaHealthItems => "{item}",
+            Self::EtaHealthFitLoaded => "1",
+            Self::EtaHealthFitAgeSeconds => "s",
+            Self::EtaHealthFitCheckAgeSeconds => "s",
+            Self::EtaHealthSnapshotAgeSeconds => "s",
+            Self::EtaHealthRefreshGate => "1",
+            Self::EtaHealthRefreshLastCycleAgeSeconds => "s",
+            Self::EtaHealthRefreshRepos => "{repository}",
+            Self::EtaHealthSnapshotRows => "{row}",
+            Self::EtaHealthSnapshotAlternatesRows => "{row}",
             _ => "By",
         }
     }
@@ -504,6 +560,22 @@ impl MetricName {
             }
             Self::DaemonTaskAlive => "1 while a long-running daemon loop is beating, by task.",
             Self::DaemonTaskFaults => "Faults of a long-running daemon loop, by task and reason.",
+            Self::EtaHealthItems => {
+                "Live ETA items on this host, by kind, heuristic and answered/refusal reason."
+            }
+            Self::EtaHealthFitLoaded => "1 when a fit coefficient file is loaded, 0 when none is.",
+            Self::EtaHealthFitAgeSeconds => "Age of the loaded fit coefficient file's cutoff.",
+            Self::EtaHealthFitCheckAgeSeconds => {
+                "Time since the last fit check, by its outcome or skip reason."
+            }
+            Self::EtaHealthSnapshotAgeSeconds => "Age of each cached fleet snapshot, by repo.",
+            Self::EtaHealthRefreshGate => "1 for the fleet refresh gate state this host is in.",
+            Self::EtaHealthRefreshLastCycleAgeSeconds => "Time since the last fleet refresh tick.",
+            Self::EtaHealthRefreshRepos => "Repos per stop reason in the last refreshing tick.",
+            Self::EtaHealthSnapshotRows => "Rows in the last built eta.snapshot.",
+            Self::EtaHealthSnapshotAlternatesRows => {
+                "Rows with non-empty alternates in the last built eta.snapshot."
+            }
         }
     }
 }

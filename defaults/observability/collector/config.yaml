@@ -404,7 +404,9 @@ processors:
           # W1 adds owner (per-bucket github.ratelimit.* gauges) and
           # loom.forge.calls' caller, op, role, cred_owner, target_owner and
           # outcome — operation names and owners, never a repo number or path.
-          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome"])
+          # loom.eta.health.* (#10391) adds heuristic and kind (fixed ETA
+          # vocabularies); repo was already kept (per cached fleet snapshot).
+          - keep_keys(attributes, ["account", "rank", "pool", "slot", "model", "window", "state", "repo", "workflow", "job", "runner", "conclusion", "reason", "provider", "resource", "task", "owner", "caller", "op", "role", "cred_owner", "target_owner", "outcome", "heuristic", "kind"])
 exporters:
   otlp_http/clickstack:
     endpoint: http://clickstack-collector:4318

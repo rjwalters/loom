@@ -1467,7 +1467,7 @@ inventing a record kind per signal. Envelopes carry `schema_version: 10`.
 | `interval_start` | RFC 3339, optional | start of the interval the batch's delta counters cover (OTLP `start_time_unix_nano`; the tick start for `loom.dispatch.decisions`); defaults to `captured_at` |
 | `points[].name` | string | closed vocabulary, `telemetry::ops::MetricName` |
 | `points[].value` | int or float | non-finite floats are dropped before the queue (at emit) and again at export |
-| `points[].labels` | object | optional; keys limited to `reason`, `provider`, `account`, `model`, `state`; values ≤128 bytes, no control chars, ≤8 per point |
+| `points[].labels` | object | optional; keys limited to `OPS_METRIC_LABEL_KEYS` (`reason`, `provider`, `account`, `model`, `state`, `resource`, `task`, `heuristic`, `kind`, `repo`); values ≤128 bytes, no control chars, ≤8 per point |
 
 Each name fixes its OTLP kind. `loom.dispatch.decisions` is a monotonic
 **delta `Sum`**, one point per non-zero work-finder outcome per tick, labelled
@@ -1609,6 +1609,26 @@ fixed daemon loop name: `auto_update`, `eta_fleet_refresh`, `eta_pass` or
 | `loom.daemon.task_alive` | `1` | `task` | `1` while the loop has beaten within its staleness window (two intervals plus 60 s, plus the loop's own iteration bound where it has one), `0` once it has gone silent past the window or marked itself dead |
 | `loom.daemon.task_faults` | `{fault}` | `task`, `reason` ∈ `panic`, `overrun`, `exit` | a delta counter: an iteration panicked and was caught, an iteration ran past the loop's bound, or the loop stopped for good |
 
+ETA pipeline health (Issue #10391, `observability/ops/eta_health.rs`). All
+gauges, sampled once per collector pass, so they stay alive when no
+`eta.fleet_refresh` record is emitted (a stood-down host). An unmeasurable
+reading emits no point. `kind` is `start`/`finish`/`land`; `heuristic` is a
+registered heuristic id; `repo` is `owner/repo` of a cached fleet snapshot.
+Never an issue number, sha or path.
+
+| Metric | Unit | Labels | Meaning |
+|---|---|---|---|
+| `loom.eta.health.items` | `{item}` | `kind`, `heuristic`, `reason` ∈ `answered` or a `no_estimate_reason` | live items in the tracker's pending set (newest estimate per item and heuristic). Answer rate is `answered / sum`. Omitted when ETA is disabled |
+| `loom.eta.health.fit_loaded` | `1` | none | `1` when a coefficient file is loaded, else `0` |
+| `loom.eta.health.fit_age_seconds` | `s` | none | now minus the loaded file's cutoff. Omitted when none is loaded |
+| `loom.eta.health.fit_check_age_seconds` | `s` | `reason` (the last fit check's outcome or skip reason) | time since the last fit check. Omitted until one has run in this process |
+| `loom.eta.health.snapshot_age_seconds` | `s` | `repo` | now minus each cached fleet snapshot's `as_of` |
+| `loom.eta.health.refresh_gate` | `1` | `state` ∈ `captain`, `no_captain`, `stand_down`, `disabled` | `1` for the current gate state, `0` for the other three. Before the first tick it is the state the read-only captain resolver reports (`disabled` when the loop does not run) |
+| `loom.eta.health.refresh_last_cycle_age_seconds` | `s` | none | time since the last refresh tick (stand-down ticks count). Omitted before the first tick; keeps growing if the loop stalls |
+| `loom.eta.health.refresh_repos` | `{repository}` | `reason` (a fleet-refresh stop reason) | repos per stop reason in the last tick that refreshed; a reason that drops out is exported once as `0` |
+| `loom.eta.health.snapshot_rows` | `{row}` | none | rows in the last `eta.snapshot` this process built. Omitted until one was built |
+| `loom.eta.health.snapshot_alternates_rows` | `{row}` | none | of those, rows with non-empty `alternates` (#10390) |
+
 The dwell names (#8856) are `loom.queue.oldest_wait`, `loom.queue.starved`,
 `loom.queue.starved.by_reason` and `loom.queue.dispatch_wait[.samples]`. They
 measure how long ready-queue issues have waited; for depth, use
@@ -1725,7 +1745,7 @@ GitHub rate limit (Issue #10022):
 |---|---|---|---|
 | `loom.ratelimit.trip` span | instant span, own root trace (derived from `loom.ratelimit.source` + trip instant) | `loom.ratelimit.source` (the tripping job), `loom.ratelimit.cooldown_until` (RFC 3339), `github.ratelimit.core.used`, `.core.own`, `.core.external`, and the same three for `graphql` | one per rate-limit breaker trip; a re-trip while cooling emits nothing. `used` is the trip-time probe's pool-wide count, `own` this host's forge-call ledger for the window, `external` = `used − own`. Each is **omitted** (not 0) when unknown: no `used` in the probe, an untrusted probe reading (#8997), or the ledger sink off |
 | `forge.reader.withdrawn` span | instant span, own root trace (derived from the App, owner, resource and the instant) | `forge.reader.app` (the reader App id), `forge.reader.owner` (lowercased; `-` for an App-wide withdrawal), `forge.reader.resource` (`core`, `graphql`, `search`, `all`, or `app` for an App-wide withdrawal), `forge.reader.until` (RFC 3339), `forge.reader.source` (`header`, `probe` or `default`: where the end came from), `forge.reader.secondary` (`true` for a secondary limit) | one per reader withdrawal (W4-A). A rate limit withdraws only the refused `(owner, resource)` bucket; a secondary limit or a refused credential withdraws that owner's `all`; a mint or key failure, or any failure under `LOOM_READ_ROUTING=legacy`, withdraws the App (`app`). A per-repo coverage withdrawal emits nothing |
-| `forge.reader.spill` span | instant span, own root trace (derived from the repo, resource, home reader, mode and instant) | `forge.spill.owner_repo`, `forge.spill.resource` (`core` / `graphql` / `search`), `forge.spill.from` (home reader App id), `forge.spill.to` (target reader App id, or `home` when none has headroom and on release), `forge.spill.mode` (`partial` / `full` / `off`), `forge.spill.until` (RFC 3339 release instant) | one per read-pool spill-latch transition (W4-B, [daemon-reference](daemon-reference.md) `forge.readPool.routing`): engaged when the home bucket is projected at or above `spillProjectedPct` / `spillFullPct` or is withdrawn, released at the home bucket's reset. A few per repo per day is normal; a steady stream means the pool is short of readers |
+| `forge.reader.spill` span | instant span, own root trace (derived from the repo, resource, home reader, mode and instant) | `forge.spill.owner_repo`, `forge.spill.resource` (`core` / `graphql` / `search`), `forge.spill.from` (home reader App id), `forge.spill.to` (target reader App id, or `home` when none has headroom and on release), `forge.spill.mode` (`partial` / `full` / `off`), `forge.spill.until` (RFC 3339 release instant) | one per read-pool spill-latch transition (W4-B, [daemon-reference](daemon-reference.md) `forge.readPool.routing`): engaged when the home bucket is projected at or above `spillProjectedPct` / `spillFullPct` or is withdrawn, released at the home bucket's reset; one more when a held latch re-picks a target that was withdrawn, went stale or reached `spillFullPct` (current mode, new `to`). A few per repo per day is normal; a steady stream means the pool is short of readers |
 | `github.ratelimit.remaining` | `Gauge` | `{request}`; labels `resource`, `account` | requests left in the pool, from a `gh api rate_limit` probe every 60 s (falling back to the breaker's last trip-time reading when the probe fails, only while that reading's reset windows are still open). An unresolvable `account` stays `unknown` and is retried at most every 20 min, never while the breaker is suppressing |
 | `github.ratelimit.used` | `Gauge` | `{request}`; labels `resource`, `account` | requests spent this window; absent when the response carried no `used` |
 | `github.ratelimit.reset` | `Gauge` | `s` (Unix epoch seconds); labels `resource`, `account` | when the pool's window resets |

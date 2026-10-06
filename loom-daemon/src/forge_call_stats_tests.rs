@@ -19,6 +19,7 @@ fn line(t: i64, caller: &str, p: Pool, o: Outcome, rem: Option<u64>) -> String {
         og: None,
         rp: None,
         ir: None,
+        ib: None,
         at: CallAttribution::default(),
     })
     .unwrap()
@@ -44,6 +45,7 @@ fn id_line(t: i64, caller: &str, o: Outcome, identity: &CallIdentity) -> String 
         og: identity.origin.clone(),
         rp: identity.repo.clone(),
         ir: identity.role.clone(),
+        ib: identity.bucket.clone(),
         at: CallAttribution::default(),
     })
     .unwrap()
@@ -245,6 +247,31 @@ fn a_newer_breaker_probe_overrides_an_older_header_reading() {
     assert_eq!((core.remaining, core.observed_at), (7, probed_at));
     // The probe's pool-wide spend rides along (#9855).
     assert_eq!((core.used, gql.used), (Some(4993), Some(4992)));
+}
+
+#[test]
+fn readings_of_two_reader_buckets_with_one_role_stay_separate() {
+    let with_bucket = |t: i64, role: &str, bucket: Option<&str>, rem: u64| {
+        let mut l: SinkLine =
+            serde_json::from_str(&line(t, "c", Pool::Core, Outcome::Ok, Some(rem))).unwrap();
+        l.ir = Some(role.to_string());
+        l.ib = bucket.map(str::to_string);
+        l
+    };
+    let mut agg = Aggregate::default();
+    // Reader A exhausted; reader B (same `reader` role) answers more recently
+    // with budget left; the writer's fallback read and an unattributed line
+    // name no bucket.
+    agg.add(&with_bucket(100, "reader", Some("reader:1@org"), 0));
+    agg.add(&with_bucket(200, "reader", Some("reader:2@org"), 4000));
+    agg.add(&with_bucket(250, "writer-fallback", None, 3000));
+    agg.add(&with_bucket(300, "writer", None, 4999));
+    let a = agg.latest_by_bucket[&(Pool::Core, "reader:1@org".to_string())];
+    let b = agg.latest_by_bucket[&(Pool::Core, "reader:2@org".to_string())];
+    assert_eq!((a.remaining, b.remaining), (0, 4000));
+    // Writer / fallback lines update the pool-wide reading only.
+    assert_eq!(agg.latest_by_bucket.len(), 2);
+    assert_eq!(agg.latest[&Pool::Core].remaining, 4999);
 }
 
 // ===== #9777 call identity =====

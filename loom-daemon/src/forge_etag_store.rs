@@ -308,7 +308,27 @@ pub(crate) fn fetch_conditional_via(
         // The reader attempt drops env tokens (#9872): `gh` prefers an env
         // `GH_TOKEN`/`GITHUB_TOKEN` over `GH_CONFIG_DIR`, so without this an
         // ambient personal token would serve the "reader" read.
-        |dir, role| run_fetch_with(site, gh_bin, cwd, target, url, etag, dir, dir.is_some(), role),
+        |dir, role| {
+            // The reader's public bucket label (#10232), only on the reader attempt.
+            let bucket = dir.and(reader.as_ref()).map(|(_, app_id)| {
+                crate::forge_identity::reader_bucket(
+                    app_id,
+                    target.repo.as_deref().unwrap_or_default(),
+                )
+            });
+            run_fetch_with(
+                site,
+                gh_bin,
+                cwd,
+                target,
+                url,
+                etag,
+                dir,
+                dir.is_some(),
+                role,
+                bucket.as_deref(),
+            )
+        },
         http_ok,
         reader_failure,
         |failure, _| {
@@ -358,7 +378,7 @@ pub(crate) fn fetch_with_reader(
     reader_dir: &Path,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
     let role = crate::forge_identity::IdentityRole::Reader;
-    run_fetch_with(site, gh_bin, cwd, target, url, etag, Some(reader_dir), true, role)
+    run_fetch_with(site, gh_bin, cwd, target, url, etag, Some(reader_dir), true, role, None)
 }
 
 /// Deadline for one conditional read (they were unbounded `.output()`s before
@@ -388,6 +408,7 @@ fn run_fetch_with(
     reader_dir: Option<&Path>,
     strip_token_env: bool,
     role: crate::forge_identity::IdentityRole,
+    bucket: Option<&str>,
 ) -> Result<FetchResult> {
     let mut inv = GhInvocation::new(
         Operation::new(site.caller),
@@ -401,6 +422,9 @@ fn run_fetch_with(
     .program(gh_bin)
     .identity_role(role)
     .args(["api", "--include", url]);
+    if let Some(bucket) = bucket {
+        inv = inv.identity_bucket(bucket);
+    }
     if let Some(host) = &target.host {
         // The URL names the remote-resolved repo explicitly, so name its host
         // too (gh would otherwise use its default host, not the remote's).
