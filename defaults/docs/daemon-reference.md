@@ -8629,6 +8629,79 @@ detection, which is Builder-workflow-invoked rather than periodic. See
 [`troubleshooting.md` → Conflict markers left in `.loom/config.json` after a
 `git stash pop`](troubleshooting.md#conflict-markers-left-in-loomconfigjson-after-a-git-stash-pop-6499).
 
+### Codex session-container reconciler (#10453)
+
+The daemon restarts dead Codex session containers itself
+(`loom-daemon/src/session_reconcile.rs`). The pass runs once at start, then
+every interval. It visits each **enabled**, session-managed Codex account
+across the registered roots:
+
+| Container `loom-codex-session-<acct>` | Action |
+|---|---|
+| held (operator stop) | none, and no `docker` call |
+| running | none |
+| restarting, first pass | none (Docker's `unless-stopped` policy is retrying) |
+| restarting, 2+ consecutive passes | one WARN `crash loop`; never reused or stopped |
+| stopped, host-mounted | `docker start`, via the `accounts session start` path |
+| missing, host-mounted | recreated with the workspace and image of the last operator `session start`; otherwise the label last seen on it; otherwise the registered roots' common parent, logged as a guess. Never `/`: that is refused and reported |
+| stopped or missing, private-clone | skipped with one WARN; never recreated host-mounted |
+
+- The pass never stops, removes or restarts a container. A container with an
+  in-flight `docker exec` is never touched (#5119).
+- After a resume or recreate, the account is re-probed at once, bypassing the
+  300 s probe cache.
+- A failed start backs off per account: 120 s, doubling, capped at 30 min. It
+  WARNs once per distinct error. No `docker` call runs while backing off. A
+  start that "succeeds" but whose container is not running at the next pass
+  (stopped, gone or restarting) counts as a failed start. The count resets
+  only once the container is seen running.
+- If reading a container fails, or any `docker` call (including a start or
+  `run`) times out, Docker is treated as unavailable. The rest of the pass is skipped and the **pass** backs off on
+  the same schedule. No start is attempted and no per-account failure is
+  counted.
+- Every `docker` call has a deadline: 60 s, 120 s for `stop`, 600 s for `run`.
+  The operator CLI inherits these deadlines. An `accounts session start` that
+  has to pull the image for the first time on a slow link fails after 600 s,
+  where it used to wait indefinitely. `docker pull` the image beforehand if
+  that is a risk.
+- With no enabled session-managed account, the pass makes zero `docker` calls.
+- **Hold:** `loom-daemon accounts session stop <acct>` keeps the container
+  down. It writes `.session-hold.json` in the account's profile directory
+  *before* `docker stop`. Only an operator `accounts session start` (or
+  `shell`) removes it, by deleting it before that start touches Docker.
+  Whether an account is held depends only on whether the file exists, never
+  on timestamps, so a wall clock stepping back between a start and a stop
+  cannot drop the hold. The pass checks the hold before any `docker` call and
+  again just before a start. If a pass already past that check still
+  `docker start`s the container between `stop`'s `docker stop` and its
+  `docker rm`, the `rm` fails. `stop` then re-inspects, re-applies the
+  in-flight-exec refusal, and stops and removes the container once more. That
+  one retry suffices because every later start sees the hold. `session status`
+  shows `stopped, held (operator stop)`, and `session status --json` carries
+  `"held": true|false`, a field added in #10453. The hold is per account: a
+  hold, or `enabled=false`, in any registered root holds the account in all
+  of them. An operator start deletes the hold in the account's profile in
+  every registered root. `accounts disable <acct>` also keeps it down, but it
+  takes the account out of dispatch too.
+- An operator `session start` also records its workspace and image in
+  `.session-last-start.json` next to the hold. A container recreated after a
+  daemon restart uses those values. If that record cannot be written, the
+  start still succeeds, with a warning: the container is up and unheld.
+
+```json
+{ "autonomous": { "sessionReconcile": { "enabled": true, "intervalSecs": 60 } } }
+```
+
+| Env var | Config key | Precedence | Default |
+|---|---|---|---|
+| `LOOM_SESSION_RECONCILE` | `autonomous.sessionReconcile.enabled` | env > config > default | `true` (on) |
+| `LOOM_SESSION_RECONCILE_INTERVAL_SECS` | `autonomous.sessionReconcile.intervalSecs` | env > config > default | `60` |
+
+Docker reports a crash-looping container as `Running=true, Restarting=true`.
+`accounts session status`, `start`, the login probe and `session-exec posture`
+all treat it as **not running**: `start` refuses to reuse it, and posture
+yields `not-running`.
+
 ### Autonomous periodic support-role runner (#4015)
 
 Before this loop, the periodic **standalone** support roles — Champion,
