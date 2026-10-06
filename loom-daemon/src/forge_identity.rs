@@ -70,7 +70,7 @@ pub use withdrawal::{
 
 #[path = "forge_identity/route.rs"]
 pub mod route;
-pub use route::{route_read, Placement, ReadClass, RouteDecision, RouteRequest};
+pub use route::{route_read, ExhaustCause, Placement, ReadClass, RouteDecision, RouteRequest};
 
 /// The writer slug's env override (shared with `star_liveness::trust`).
 pub const APP_SLUG_ENV: &str = "LOOM_GITHUB_APP_SLUG";

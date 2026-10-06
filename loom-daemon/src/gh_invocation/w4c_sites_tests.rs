@@ -7,7 +7,7 @@
 use super::cwd_route::{derive_with, CwdAnswer, Derivation, DeriveEnv};
 use super::test_routing::{install, seen, sheds, TestRouting};
 use super::{AccessIntent, GhInvocation, GhTarget, Operation};
-use crate::forge_identity::{ReadClass, RouteDecision};
+use crate::forge_identity::{ExhaustCause, ReadClass, RouteDecision};
 use crate::forge_repo_facts::GhRepoEnv;
 use crate::worktree_ops::clean::PrStatus;
 use std::path::Path;
@@ -19,6 +19,7 @@ fn exhausted() -> TestRouting {
     TestRouting {
         decision: RouteDecision::Exhausted {
             until: SystemTime::now() + Duration::from_secs(900),
+            cause: ExhaustCause::Budget,
         },
         env: DeriveEnv::default(),
         checkout: CwdAnswer::Sole("acme/shed".into()),
@@ -119,7 +120,15 @@ fn decision_gating_modules_never_opt_out_of_gate() {
                 || rel.contains("/merge_")
                 || rel.starts_with("verdict")
                 || rel.starts_with("quarantine")
-                || rel.starts_with("reclaim");
+                || rel.starts_with("reclaim")
+                // Claim and lease decisions, and the reapers that delete
+                // checkouts on what they read.
+                || rel == "forge_check_claim.rs"
+                || rel == "cli/lease_co_occupancy.rs"
+                || rel == "role_runner/roster.rs"
+                || rel == "worktree_reaper.rs"
+                || rel.starts_with("worktree_reaper/")
+                || rel == "primary_checkout_reaper.rs";
             if !gated || path.extension().is_none_or(|e| e != "rs") {
                 continue;
             }
@@ -134,6 +143,17 @@ fn decision_gating_modules_never_opt_out_of_gate() {
         }
     }
     assert!(offenders.is_empty(), "a decision-gating read was made sheddable: {offenders:?}");
+    // The single files named above must still exist: a rename must move
+    // the guard with it, never silently drop it.
+    for file in [
+        "forge_check_claim.rs",
+        "cli/lease_co_occupancy.rs",
+        "role_runner/roster.rs",
+        "worktree_reaper.rs",
+        "primary_checkout_reaper.rs",
+    ] {
+        assert!(src.join(file).is_file(), "{file} moved: update this guard");
+    }
 }
 
 /// Shapes of the AC carry-over sites, as each builds its argv.
@@ -251,4 +271,68 @@ fn the_seam_routes_a_gate_read_to_the_writer_not_a_shed() {
     let out = crate::worktree_ops::gh::resolve_owner_repo(root.path());
     assert!(out.is_none());
     assert_eq!(sheds(), 0);
+}
+
+/// A routing that would put any derivable read on a reader.
+fn deriving(root: &Path) -> TestRouting {
+    TestRouting {
+        decision: RouteDecision::Reader {
+            dir: root.join("reader"),
+            app_id: "1".into(),
+            placement: crate::forge_identity::Placement::Home,
+        },
+        env: DeriveEnv::default(),
+        checkout: CwdAnswer::Sole("acme/widget".into()),
+        shed: true,
+    }
+}
+
+/// The claim check's reads (its caller may just have written the label or
+/// lease it checks) and `merge_group_ci.read` (`permissions` depend on who
+/// asks) are pinned to the writer: driven through their own helpers with a
+/// reader on offer, none derives a route. The unpinned shapes would.
+#[test]
+fn claim_check_and_merge_group_reads_never_derive() {
+    let root = tempfile::tempdir().unwrap();
+    let _g = install(deriving(root.path()));
+    let gh = Path::new("gh");
+    let _ = crate::forge_check_claim::read_claim_labels(gh, root.path(), 7);
+    let _ = crate::forge_check_claim::read_freshest_live_lease(
+        gh,
+        root.path(),
+        7,
+        chrono::Utc::now(),
+        30.0,
+    );
+    let _ = crate::merge_group_ci::eligibility::probe("gh", "acme/widget", Some("main"));
+    let seen = seen();
+    for op in [
+        "claim.labels",
+        "claim.lease_comments",
+        "merge_group_ci.read",
+    ] {
+        let mine: Vec<_> = seen.iter().filter(|s| s.op == op).collect();
+        assert!(!mine.is_empty(), "{op} did not run through the facade: {seen:?}");
+        assert!(mine.iter().all(|s| s.route_slug.is_none()), "{op} derived: {mine:?}");
+    }
+    // Control: unpinned, the same shapes derive (merge_group_ci's has no
+    // cwd, and still derives because its path names the repo).
+    let lone = |_: &Path, _: GhRepoEnv| CwdAnswer::Sole("acme/widget".to_string());
+    for inv in [
+        shape("claim.labels", &["issue", "view", "7", "--json", "labels"]),
+        shape("claim.lease_comments", &["api", "repos/{owner}/{repo}/issues/7/comments"]),
+        GhInvocation::new(
+            Operation::new("merge_group_ci.read"),
+            AccessIntent::Read,
+            GhTarget::None,
+            Duration::from_secs(10),
+        )
+        .args(["api", "--method", "GET", "repos/acme/widget"]),
+    ] {
+        assert!(
+            matches!(derive_with(&inv, &DeriveEnv::default(), &lone), Derivation::Route { .. }),
+            "{}",
+            inv.operation().as_str()
+        );
+    }
 }

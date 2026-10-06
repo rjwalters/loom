@@ -477,3 +477,103 @@ fn a_get_with_query_fields_still_derives() {
         }
     );
 }
+
+// ===== review fixes =====
+
+#[test]
+fn a_repo_flag_never_makes_a_write_subcommand_a_read() {
+    // The allowlist is checked before `-R`: a write, or a viewer-relative
+    // `status`, never derives whatever repo it names.
+    let cwd = PathBuf::from("/tmp/w4c-writes");
+    for args in [
+        &["pr", "edit", "4", "-R", "acme/widget", "--add-label", "x"][..],
+        &["issue", "comment", "3", "-R", "acme/widget", "--body", "hi"],
+        &["pr", "merge", "4", "-R", "acme/widget", "--merge"],
+        &["pr", "merge", "4", "--repo=acme/widget"],
+        &["issue", "close", "3", "-Racme/widget"],
+        &["pr", "status", "-R", "acme/widget"],
+        &["issue", "status"],
+        &["pr", "status"],
+    ] {
+        let d = derive_with(&read_in(&cwd, args), &env(), &sole("acme/widget"));
+        assert_eq!(d, Derivation::Writer, "{args:?}");
+    }
+    // The read subcommands still derive from `-R`.
+    for args in [
+        &["pr", "view", "4", "-R", "acme/widget"][..],
+        &["issue", "list", "--repo", "acme/widget"],
+    ] {
+        let d = derive_with(&read_in(&cwd, args), &env(), &sole("acme/other"));
+        assert_eq!(slug_of(&d), Some("acme/widget"), "{args:?}");
+    }
+}
+
+#[test]
+fn a_read_naming_the_viewer_stays_on_the_writer() {
+    let cwd = PathBuf::from("/tmp/w4c-me");
+    for args in [
+        &["pr", "list", "--author", "@me"][..],
+        &["issue", "list", "-R", "acme/widget", "--assignee", "@me"],
+        &["issue", "list", "--assignee=@me"],
+        &["pr", "list", "--search", "review-requested:@me"],
+        &["api", "repos/acme/widget/issues?assignee=@me"],
+    ] {
+        let d = derive_with(&read_in(&cwd, args), &env(), &sole("acme/widget"));
+        assert_eq!(d, Derivation::Writer, "{args:?}");
+    }
+}
+
+#[test]
+fn a_glued_field_flag_is_a_body_so_not_a_get() {
+    let cwd = PathBuf::from("/tmp/w4c-glued");
+    for args in [
+        &["api", "repos/acme/widget/issues/3/labels", "-flabels[]=x"][..],
+        &["api", "repos/{owner}/{repo}/issues/3/comments", "-Fbody=hi"],
+    ] {
+        let d = derive_with(&read_in(&cwd, args), &env(), &sole("acme/widget"));
+        assert_eq!(d, Derivation::Writer, "{args:?}");
+    }
+}
+
+#[test]
+fn a_named_shape_derives_without_a_cwd_and_nothing_else_does() {
+    let bare = |args: &[&str]| {
+        GhInvocation::new(
+            Operation::new("comment.api_get"),
+            AccessIntent::Read,
+            GhTarget::None,
+            Duration::from_secs(10),
+        )
+        .args(args.iter().copied())
+    };
+    let e = DeriveEnv {
+        loom_repo: Some("acme/scoped".into()),
+        ..env()
+    };
+    for args in [
+        &["api", "repos/acme/widget/issues/3"][..],
+        &["issue", "view", "3", "-R", "acme/widget"],
+        &["repo", "view", "acme/widget"],
+    ] {
+        let d = derive_with(&bare(args), &e, &sole("acme/other"));
+        assert_eq!(slug_of(&d), Some("acme/widget"), "{args:?}");
+    }
+    for args in [PLACEHOLDER, &["issue", "view", "3"], &["repo", "view"]] {
+        let d = derive_with(&bare(args), &e, &sole("acme/other"));
+        assert_eq!(d, Derivation::Writer, "{args:?}");
+    }
+}
+
+#[test]
+fn a_disagreement_is_counted_once_per_call() {
+    let cwd = PathBuf::from("/tmp/w4c-once");
+    let before = crate::forge_call_stats::buckets::cwd_route_disagreements();
+    let inv = read_in(&cwd, PLACEHOLDER)
+        .with_derived_route_in(&DeriveEnv::default(), &|_: &Path, _: GhRepoEnv| {
+            CwdAnswer::Disagree
+        });
+    assert_eq!(crate::forge_call_stats::buckets::cwd_route_disagreements(), before + 1);
+    assert_eq!(crate::forge_call_stats::counters::get(DISAGREE_COUNTER), before + 1);
+    // The writer row it books then knows not to count it again.
+    assert!(inv.disagree_counted);
+}

@@ -269,7 +269,10 @@ pub(super) fn record(inv: &GhInvocation, outcome: InvokeOutcome, captured: Optio
     let (pg, pu) = pages(&inv.args, include, captured.map(|(out, _)| out));
     let rd = match (ro, inv.cwd.as_deref(), identity.repo.as_deref()) {
         (RepoOrigin::Remote, Some(cwd), Some(repo)) if cwd_route_disagrees(cwd, repo) => {
-            forge_call_stats::buckets::bump_cwd_route_disagree();
+            // The W4-C derivation may already have counted this call.
+            if !inv.disagree_counted {
+                forge_call_stats::buckets::bump_cwd_route_disagree();
+            }
             Some(true)
         }
         _ => None,

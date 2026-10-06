@@ -146,22 +146,33 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> usize {
 /// One ungated pass (tests call this directly).
 pub fn run_once(gh_bin: &Path, root: &Path, now: DateTime<Utc>, cap: usize) -> usize {
     const JQ: &str = r#".[] | select(.pull_request|not) | [.number, .created_at, ([.labels[].name]|join(","))] | @tsv"#;
-    // W4-C: Hygiene — a shed listing is a skipped pass (`None` below),
-    // retried on the next tick.
-    let listing = gh_call::ok_stdout(
-        gh_call::read("intake.list_open", gh_bin, root)
-            .read_class(crate::gh_invocation::ReadClass::Hygiene)
-            .args([
-                "api",
-                "--paginate",
-                "repos/{owner}/{repo}/issues?state=open&per_page=100",
-                "--jq",
-                JQ,
-            ]),
-    );
-    let Some(stdout) = listing else {
-        log::warn!("intake_reconcile: open-issue listing failed in {}", root.display());
-        return 0;
+    // W4-C: Hygiene — a shed listing is a skipped pass, retried on the next
+    // tick. The shed itself is logged (rate-limited) by the facade, so it is
+    // not reported here as a failure every tick.
+    let outcome = gh_call::read("intake.list_open", gh_bin, root)
+        .read_class(crate::gh_invocation::ReadClass::Hygiene)
+        .args([
+            "api",
+            "--paginate",
+            "repos/{owner}/{repo}/issues?state=open&per_page=100",
+            "--jq",
+            JQ,
+        ])
+        .run();
+    let stdout = match outcome {
+        crate::cmd_out::CmdOutcome::Ran(out) if out.status.success() => out.stdout,
+        crate::cmd_out::CmdOutcome::Unavailable(crate::cmd_out::Unavailable::Shed { until }) => {
+            log::debug!(
+                "intake_reconcile: open-issue listing deferred in {} (reader budget low until \
+                 {until:?}); skipped this pass",
+                root.display()
+            );
+            return 0;
+        }
+        _ => {
+            log::warn!("intake_reconcile: open-issue listing failed in {}", root.display());
+            return 0;
+        }
     };
     let rows = parse_rows(&String::from_utf8_lossy(&stdout));
     let mut labeled = 0;

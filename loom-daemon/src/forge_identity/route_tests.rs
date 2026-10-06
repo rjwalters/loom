@@ -139,7 +139,7 @@ fn every_reader_withdrawn_is_exhausted_until_the_earliest_return() {
     let now = SystemTime::now();
     let soon = now + Duration::from_secs(120);
     let later = now + Duration::from_secs(900);
-    forge_read_pool::withdraw_scoped_until(
+    forge_read_pool::withdraw_scoped_budget_until(
         "81021",
         "acme",
         forge_read_pool::ResourceScope::Core,
@@ -152,7 +152,16 @@ fn every_reader_withdrawn_is_exhausted_until_the_earliest_return() {
         soon,
     );
     let d = route_read_in(ws.path(), &r, &req("acme/dry", None), &v2(&cfg), now);
-    assert_eq!(d, RouteDecision::Exhausted { until: soon });
+    // 81021 is out of budget, but 81022's withdrawal is not a rate limit
+    // (a plain scoped withdrawal, as a refused credential records): not a
+    // budget exhaustion, so nothing may be shed on it.
+    assert_eq!(
+        d,
+        RouteDecision::Exhausted {
+            until: soon,
+            cause: ExhaustCause::Unavailable
+        }
+    );
     assert_eq!(d.into_credential(), None, "a Gate caller goes to the writer");
     // The scoped withdrawal is core-only for 81021: graphql still routes.
     let g = RouteRequest::gate("acme/dry", None, Resource::Graphql);
@@ -667,7 +676,7 @@ fn past_a_withdrawn_home_a_deferrable_read_needs_headroom_and_a_gate_read_does_n
     let repo = "acme/class-walk";
     let home = forge_read_pool::assignment_index(repo, 2).unwrap();
     let (home_app, other) = (r.readers[home].app_id.clone(), r.readers[1 - home].app_id.clone());
-    forge_read_pool::withdraw_scoped_until(
+    forge_read_pool::withdraw_scoped_budget_until(
         &home_app,
         "acme",
         forge_read_pool::ResourceScope::Core,
@@ -693,7 +702,16 @@ fn past_a_withdrawn_home_a_deferrable_read_needs_headroom_and_a_gate_read_does_n
     assert_eq!(app_of(&d), other);
     for c in [ReadClass::Hygiene, ReadClass::Observability] {
         let d = route_read_in(ws.path(), &r, &class(c), &v2(&cfg), now);
-        assert!(matches!(d, RouteDecision::Exhausted { .. }), "{c:?}: {d:?}");
+        assert!(
+            matches!(
+                d,
+                RouteDecision::Exhausted {
+                    cause: ExhaustCause::Budget,
+                    ..
+                }
+            ),
+            "{c:?}: {d:?}"
+        );
     }
     // Legacy ignores the class entirely.
     let legacy = RouteEnv {
@@ -702,4 +720,178 @@ fn past_a_withdrawn_home_a_deferrable_read_needs_headroom_and_a_gate_read_does_n
     };
     let d = route_read_in(ws.path(), &r, &class(ReadClass::Hygiene), &legacy, now);
     assert_eq!(app_of(&d), home_app, "legacy has no scoped withdrawal");
+}
+
+// ---- W4-C: why a route is exhausted, and the headroom reserve --------------
+
+fn hygiene<'a>(owner_repo: &'a str) -> RouteRequest<'a> {
+    RouteRequest {
+        class: ReadClass::Hygiene,
+        ..req(owner_repo, Some("k"))
+    }
+}
+
+fn cause_of(d: &RouteDecision) -> ExhaustCause {
+    match d {
+        RouteDecision::Exhausted { cause, .. } => *cause,
+        other => panic!("expected an exhausted route, got {other:?}"),
+    }
+}
+
+#[test]
+fn every_reader_coverage_withdrawn_is_not_a_budget_exhaustion() {
+    let r = roster(vec![reader("81301", None), reader("81302", None)]);
+    let ws = workspace(&r, &["acme"]);
+    let cfg = RoutingConfig::default();
+    let now = SystemTime::now();
+    let repo = "acme/unseen";
+    for app in ["81301", "81302"] {
+        super::super::withdraw_reader_for_repo_until(app, repo, now + Duration::from_secs(3600));
+    }
+    let d = route_read_in(ws.path(), &r, &hygiene(repo), &v2(&cfg), now);
+    assert_eq!(
+        cause_of(&d),
+        ExhaustCause::Unavailable,
+        "no reader sees it: the writer reads it"
+    );
+    // Another repo of the same owner is unaffected.
+    let d = route_read_in(ws.path(), &r, &hygiene("acme/seen"), &v2(&cfg), now);
+    assert!(matches!(d, RouteDecision::Reader { .. }), "{d:?}");
+}
+
+#[test]
+fn no_fresh_reader_dir_is_not_a_budget_exhaustion() {
+    let r = roster(vec![reader("81311", None), reader("81312", None)]);
+    // Token dirs published for another owner only: none for `acme`.
+    let ws = workspace(&r, &["other"]);
+    let cfg = RoutingConfig::default();
+    let d = route_read_in(ws.path(), &r, &hygiene("acme/no-dir"), &v2(&cfg), SystemTime::now());
+    assert_eq!(cause_of(&d), ExhaustCause::Unavailable);
+}
+
+#[test]
+fn a_credential_withdrawal_beside_a_budget_one_is_not_a_budget_exhaustion() {
+    let r = roster(vec![reader("81321", None), reader("81322", None)]);
+    let ws = workspace(&r, &["acme"]);
+    let cfg = RoutingConfig::default();
+    let now = SystemTime::now();
+    let until = now + Duration::from_secs(600);
+    forge_read_pool::withdraw_scoped_budget_until(
+        "81321",
+        "acme",
+        forge_read_pool::ResourceScope::Core,
+        until,
+    );
+    // A refused credential: scoped, All, but no rate limit behind it.
+    forge_read_pool::withdraw_scoped_until(
+        "81322",
+        "acme",
+        forge_read_pool::ResourceScope::All,
+        until,
+    );
+    let d = route_read_in(ws.path(), &r, &hygiene("acme/mixed"), &v2(&cfg), now);
+    assert_eq!(cause_of(&d), ExhaustCause::Unavailable);
+}
+
+#[test]
+fn every_reader_rate_limited_is_a_budget_exhaustion() {
+    let r = roster(vec![reader("81331", None), reader("81332", None)]);
+    let ws = workspace(&r, &["acme"]);
+    let cfg = RoutingConfig::default();
+    let now = SystemTime::now();
+    for app in ["81331", "81332"] {
+        forge_read_pool::withdraw_scoped_budget_until(
+            app,
+            "acme",
+            forge_read_pool::ResourceScope::Core,
+            now + Duration::from_secs(600),
+        );
+    }
+    let d = route_read_in(ws.path(), &r, &hygiene("acme/dry-budget"), &v2(&cfg), now);
+    assert_eq!(cause_of(&d), ExhaustCause::Budget);
+    // A coverage-withdrawn reader is outside the repo's pool: one reader
+    // rate-limited and the other unable to see the repo is still budget.
+    let r = roster(vec![reader("81333", None), reader("81334", None)]);
+    let ws = workspace(&r, &["acme"]);
+    let repo = "acme/half-seen";
+    forge_read_pool::withdraw_scoped_budget_until(
+        "81333",
+        "acme",
+        forge_read_pool::ResourceScope::All,
+        now + Duration::from_secs(60),
+    );
+    super::super::withdraw_reader_for_repo_until("81334", repo, now + Duration::from_secs(3600));
+    let d = route_read_in(ws.path(), &r, &hygiene(repo), &v2(&cfg), now);
+    assert_eq!(cause_of(&d), ExhaustCause::Budget);
+}
+
+#[test]
+fn the_headroom_reserve_sheds_a_deferrable_read_before_a_real_limit() {
+    let r = roster(vec![reader("81341", None), reader("81342", None)]);
+    let ws = workspace(&r, &["acme"]);
+    // Spill latch off: only the reserve is under test.
+    let cfg = RoutingConfig::default().with_env(Some("0"), None);
+    assert_eq!(cfg.shed_pct, DEFAULT_SHED_PCT);
+    let now = SystemTime::now();
+    let repo = "acme/reserve";
+    let home = forge_read_pool::assignment_index(repo, 2).unwrap();
+    let (home_app, other) = (r.readers[home].app_id.clone(), r.readers[1 - home].app_id.clone());
+
+    // Home below shedPct: a deferrable read stays home.
+    book_projected(&home_app, "acme", 75.0, now);
+    let d = route_read_in(ws.path(), &r, &hygiene(repo), &v2(&cfg), now);
+    assert_eq!(app_of(&d), home_app);
+
+    // Home at shedPct, the other reader with headroom: it moves there.
+    book_projected(&home_app, "acme", 85.0, now);
+    book_projected(&other, "acme", 30.0, now);
+    let d = route_read_in(ws.path(), &r, &hygiene(repo), &v2(&cfg), now);
+    assert_eq!(app_of(&d), other);
+    assert_eq!(placement_of(&d), Placement::Spill);
+
+    // No spill target with headroom: shed (budget), with no withdrawal.
+    book_projected(&other, "acme", 65.0, now);
+    let d = route_read_in(ws.path(), &r, &hygiene(repo), &v2(&cfg), now);
+    assert_eq!(cause_of(&d), ExhaustCause::Budget);
+    // ... while a Gate read keeps the reserve: it is served at home.
+    let gate = req(repo, Some("k"));
+    let d = route_read_in(ws.path(), &r, &gate, &v2(&cfg), now);
+    assert_eq!(app_of(&d), home_app);
+}
+
+#[test]
+fn a_lone_reader_past_the_reserve_sheds_deferrable_reads() {
+    let r = roster(vec![reader("81351", None)]);
+    let ws = workspace(&r, &["acme"]);
+    let cfg = RoutingConfig::default();
+    let now = SystemTime::now();
+    book_projected("81351", "acme", 82.0, now);
+    let d = route_read_in(ws.path(), &r, &hygiene("acme/lone"), &v2(&cfg), now);
+    assert_eq!(cause_of(&d), ExhaustCause::Budget);
+    let d = route_read_in(ws.path(), &r, &req("acme/lone", Some("k")), &v2(&cfg), now);
+    assert_eq!(app_of(&d), "81351", "Gate is never held back by the reserve");
+}
+
+#[test]
+fn shed_pct_is_validated_between_target_and_full() {
+    let parse = |v: serde_json::Value| {
+        RoutingConfig::parse(&serde_json::json!({"forge": {"readPool": {"routing": v}}}))
+    };
+    let (cfg, w) = parse(serde_json::json!({"shedPct": 85}));
+    assert_eq!((cfg.shed_pct, w.len()), (85.0, 0));
+    let (cfg, w) = parse(serde_json::json!({"shedPct": 90}));
+    assert_eq!((cfg.shed_pct, w.len()), (90.0, 0), "shedPct may equal spillFullPct");
+    for bad in [
+        serde_json::json!(60),
+        serde_json::json!(95),
+        serde_json::json!("x"),
+    ] {
+        let (cfg, w) = parse(serde_json::json!({"shedPct": bad}));
+        assert_eq!((cfg.shed_pct, w.len()), (DEFAULT_SHED_PCT, 1), "{bad}: {w:?}");
+    }
+    // Unset under a lower spillFullPct: the default is clamped to it.
+    let (cfg, w) = parse(serde_json::json!({
+        "targetMaxPct": 50, "spillProjectedPct": 60, "spillFullPct": 75
+    }));
+    assert_eq!((cfg.shed_pct, w.len()), (75.0, 0));
 }

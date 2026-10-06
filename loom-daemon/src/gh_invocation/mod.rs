@@ -311,6 +311,10 @@ pub struct GhInvocation {
     /// How this read may be treated when its readers run dry (W4-C).
     /// [`ReadClass::Gate`] — the default — is never shed.
     read_class: ReadClass,
+    /// The derivation already counted this call's local repo disagreement
+    /// (`facade.cwd_route.disagree`), so its accounting row must not count
+    /// it again (one counter, one count per call).
+    disagree_counted: bool,
 }
 
 impl GhInvocation {
@@ -343,6 +347,7 @@ impl GhInvocation {
             identity: crate::forge_call_stats::CallIdentity::default(),
             route_slug: None,
             read_class: ReadClass::Gate,
+            disagree_counted: false,
         }
     }
 

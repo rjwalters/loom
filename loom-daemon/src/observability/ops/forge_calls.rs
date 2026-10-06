@@ -145,10 +145,43 @@ pub fn drain_points() -> Vec<MetricPoint> {
         .collect()
 }
 
+/// Drain the facade's named event counters
+/// ([`crate::forge_call_stats::counters`]) into `loom.forge.facade.events`
+/// points, one per counter that moved, labelled `reason` = the counter name
+/// (a fixed, code-defined vocabulary — never a path or a repo). Delta
+/// semantics, like [`drain_points`].
+#[must_use]
+pub fn drain_event_points() -> Vec<MetricPoint> {
+    crate::forge_call_stats::counters::drain_deltas()
+        .into_iter()
+        .map(|(name, n)| {
+            MetricPoint::int(MetricName::ForgeFacadeEvents, i64::try_from(n).unwrap_or(i64::MAX))
+                .label("reason", name)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn the_disagree_counter_is_exported_by_name() {
+        let _ = drain_event_points();
+        crate::forge_call_stats::buckets::bump_cwd_route_disagree();
+        crate::forge_call_stats::buckets::bump_cwd_route_disagree();
+        let points = drain_event_points();
+        let p = points
+            .iter()
+            .find(|p| {
+                p.labels.get("reason").map(String::as_str) == Some("facade.cwd_route.disagree")
+            })
+            .unwrap();
+        assert_eq!(p.name, MetricName::ForgeFacadeEvents);
+        assert_eq!(p.value, crate::telemetry::ops::MetricValue::Int(2));
+        assert!(drain_event_points().is_empty(), "delta: nothing new");
+    }
 
     fn labels(i: usize, outcome: CallOutcome) -> CallLabels {
         // Every label but `caller` varies, so only a fully fixed overflow

@@ -27,6 +27,14 @@
 //!   once back per window. An unknown home reading never engages the latch,
 //!   and no target with headroom means the request stays home.
 //!
+//! W4-C adds, for deferrable reads only ([`ReadClass::Hygiene`] /
+//! [`ReadClass::Observability`]), a **headroom reserve**: the first reader
+//! that could serve one must be projected below `shedPct`, any later one
+//! below `targetMaxPct`. When nothing qualifies the answer is
+//! [`RouteDecision::Exhausted`] with an [`ExhaustCause`], which is
+//! [`ExhaustCause::Budget`] — the one cause a deferrable read may be shed
+//! on — only when every reader that can see the repo is out of budget.
+//!
 //! With no `splitRepos` and no home reading at or above `spillProjectedPct`
 //! the choice is byte-identical to the pre-W4-B walk.
 //! `LOOM_READ_ROUTING=legacy` restores that walk exactly (no owners filter,
@@ -145,9 +153,45 @@ pub enum RouteDecision {
         app_id: String,
         placement: Placement,
     },
-    /// Readers exist, but each is withdrawn or holds a stale token for this
-    /// owner and resource; `until` is the earliest any is expected back.
-    Exhausted { until: SystemTime },
+    /// Readers exist, but none may serve this read; `until` is the earliest
+    /// any is expected back, `cause` says why (only
+    /// [`ExhaustCause::Budget`] may shed a deferrable read).
+    Exhausted {
+        until: SystemTime,
+        cause: ExhaustCause,
+    },
+}
+
+/// Why [`RouteDecision::Exhausted`] found no reader (W4-C).
+///
+/// The distinction is what keeps a shed honest: shedding defers a read
+/// because the readers' **budget** is spent and the writer's must be kept
+/// for decision-gating reads. A reader that cannot see the repo, holds a
+/// stale or refused token, or is withdrawn App-wide says nothing about
+/// budget — shedding on those would stop a repo's housekeeping for as long
+/// as the condition lasts (a coverage miss is an hour; an unpublished token
+/// directory is forever), so those reads go to the writer like a Gate read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExhaustCause {
+    /// Every reader that could serve the repo is out of budget: a live
+    /// rate-limit withdrawal, or (deferrable reads only) a projection at or
+    /// above the headroom reserve. At least one such reader exists and no
+    /// reader is excluded for any other reason.
+    Budget,
+    /// Some reader is excluded for a reason other than budget (stale or
+    /// unpublished token, refused credential, App-wide withdrawal), or no
+    /// reader covers the repo at all.
+    Unavailable,
+}
+
+impl ExhaustCause {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Budget => "budget",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 impl RouteDecision {
@@ -178,6 +222,10 @@ pub struct RoutingConfig {
     pub spill_projected_pct: f64,
     pub spill_full_pct: f64,
     pub target_max_pct: f64,
+    /// W4-C headroom reserve (`shedPct`): a deferrable read whose placement
+    /// reader is projected at or above this, and that finds no other reader
+    /// with headroom, is shed so the remainder stays for Gate reads.
+    pub shed_pct: f64,
 }
 
 impl Default for RoutingConfig {
@@ -188,9 +236,15 @@ impl Default for RoutingConfig {
             spill_projected_pct: 70.0,
             spill_full_pct: 90.0,
             target_max_pct: 60.0,
+            shed_pct: DEFAULT_SHED_PCT,
         }
     }
 }
+
+/// The default `shedPct`: between `spillProjectedPct` (70) and `spillFullPct`
+/// (90), so the latch has already started moving traffic before a
+/// deferrable read is shed, and 10% of the bucket stays for Gate reads.
+pub const DEFAULT_SHED_PCT: f64 = 80.0;
 
 impl RoutingConfig {
     /// Parse `forge.readPool.routing` from the effective config, with the
@@ -267,6 +321,29 @@ impl RoutingConfig {
                 }
             }
         }
+        // shedPct is validated against the thresholds actually in force:
+        // targetMaxPct < shedPct <= spillFullPct. Unset (or invalid), it is
+        // the default clamped into that range.
+        let fallback = DEFAULT_SHED_PCT.min(cfg.spill_full_pct);
+        let fallback = if fallback > cfg.target_max_pct {
+            fallback
+        } else {
+            cfg.spill_full_pct
+        };
+        cfg.shed_pct = match pct("shedPct", fallback) {
+            Ok(v) if cfg.target_max_pct < v && v <= cfg.spill_full_pct => v,
+            Ok(v) => {
+                warnings.push(format!(
+                    "{ROUTING_KEY}: need targetMaxPct ({}) < shedPct ({v}) <= spillFullPct ({}); using {fallback}",
+                    cfg.target_max_pct, cfg.spill_full_pct
+                ));
+                fallback
+            }
+            Err(e) => {
+                warnings.push(format!("{e}; using {fallback}"));
+                fallback
+            }
+        };
         (cfg, warnings)
     }
 
@@ -793,35 +870,80 @@ pub fn route_read_in(
         }
     }
 
-    // W4-C: a deferrable read (not [`ReadClass::Gate`]) moves off its
-    // placement only to a reader with headroom, the spill target rule; a
-    // Gate read takes any usable reader, whatever its projection.
-    let fallback_ok = |r: &Identity| {
-        legacy
-            || req.class == ReadClass::Gate
-            || bucket_key(&r.app_id, owner, req.resource)
-                .and_then(|k| forge_bucket_book::projected_used_pct(&k, epoch(now)))
-                .is_none_or(|p| p < env.cfg.target_max_pct)
+    // W4-C fallback walk. Each reader is either picked or excluded, and an
+    // exclusion is booked as budget or not ([`ExhaustCause`]):
+    //
+    // - a reader withdrawn from this repo (coverage) is not part of the
+    //   repo's pool at all and counts as neither;
+    // - a live rate-limit withdrawal is budget;
+    // - an App-wide withdrawal, a refused credential or a stale/unpublished
+    //   token directory is not;
+    // - a deferrable read (not [`ReadClass::Gate`]) also needs headroom: on
+    //   the first reader that could serve it (its placement, or the first
+    //   one past readers that cannot) below `shedPct`, the headroom
+    //   reserve; on any later one below `targetMaxPct`, the spill target
+    //   rule. Missing headroom is budget. A Gate read takes any usable
+    //   reader, whatever its projection.
+    let deferrable = !legacy && req.class != ReadClass::Gate;
+    let now_epoch = epoch(now);
+    let projected = |r: &Identity| {
+        bucket_key(&r.app_id, owner, req.resource)
+            .and_then(|k| forge_bucket_book::projected_used_pct(&k, now_epoch))
     };
+    let (mut budget, mut other, mut first_seen) = (0_usize, 0_usize, false);
     for off in 0..n {
         let r = readers[(start + off) % n];
-        if off > 0 && !fallback_ok(r) {
+        if forge_read_pool::is_withdrawn_at(&r.app_id, now) {
+            other += 1;
             continue;
         }
-        if let Some(dir) = usable(r) {
-            return pick(
-                r,
-                dir,
-                if off == 0 {
-                    placement
-                } else {
-                    Placement::Spill
-                },
-            );
+        if super::repo_withdrawn_at(&r.app_id, req.owner_repo, now) {
+            continue;
         }
+        if !legacy && forge_read_pool::is_withdrawn_scoped_at(&r.app_id, owner, req.resource, now) {
+            if forge_read_pool::is_budget_withdrawn_at(&r.app_id, owner, req.resource, now) {
+                budget += 1;
+                first_seen = true;
+            } else {
+                other += 1;
+            }
+            continue;
+        }
+        let dir = super::reader_dir(workspace_root, owner, r);
+        if !super::dir_is_fresh(&dir, now) {
+            other += 1;
+            continue;
+        }
+        if deferrable {
+            let limit = if first_seen {
+                env.cfg.target_max_pct
+            } else {
+                env.cfg.shed_pct
+            };
+            first_seen = true;
+            if projected(r).is_some_and(|p| p >= limit) {
+                budget += 1;
+                continue;
+            }
+        }
+        return pick(
+            r,
+            dir,
+            if off == 0 {
+                placement
+            } else {
+                Placement::Spill
+            },
+        );
     }
+    let cause = if budget > 0 && other == 0 {
+        ExhaustCause::Budget
+    } else {
+        ExhaustCause::Unavailable
+    };
     RouteDecision::Exhausted {
         until: exhausted_until(&readers, req, owner, legacy, now),
+        cause,
     }
 }
 
@@ -847,7 +969,15 @@ fn exhausted_until(
                     forge_read_pool::scoped_withdrawal_until(&r.app_id, owner, req.resource, now)
                 },
             ];
-            ends.into_iter().flatten().max().unwrap_or(refresh)
+            // No withdrawal: a reader short of headroom is back at its
+            // bucket's reset, a stale one at the next token refresh.
+            ends.into_iter().flatten().max().unwrap_or_else(|| {
+                bucket_key(&r.app_id, owner, req.resource)
+                    .and_then(|k| forge_bucket_book::reading(&k, epoch(now)))
+                    .and_then(|reading| system_time(reading.reset_epoch))
+                    .filter(|&reset| reset > now)
+                    .map_or(refresh, |reset| reset.min(refresh))
+            })
         })
         .min()
         .unwrap_or(refresh)

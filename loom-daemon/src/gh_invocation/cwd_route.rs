@@ -24,12 +24,14 @@
 //! resolution — the order `gh` itself applies, and the explicit-repo-wins
 //! step of `forge_etag_store::resolve_target`:
 //!
-//! 1. an explicit `-R` / `--repo` (or `gh repo view OWNER/REPO`) on an
-//!    `issue` / `pr` / `repo` subcommand;
+//! 1. an explicit `-R` / `--repo` on an `issue|pr view|list` (or
+//!    `gh repo view OWNER/REPO`) — only those read subcommands: the
+//!    allowlist is checked **before** the flag, so `pr edit -R`,
+//!    `issue comment -R` or `pr merge -R` never derive;
 //! 2. a `gh api` endpoint `repos/<owner>/<repo>[/…]` with a literal owner
 //!    and repo;
 //! 3. for a call `gh` resolves from its environment — a `{owner}/{repo}`
-//!    placeholder, or an `issue|pr view|list|status` with no `-R` — the
+//!    placeholder, or an `issue|pr view|list` with no `-R` — the
 //!    `GH_REPO` the child will see: `LOOM_REPO` when it is set (the facade
 //!    exports it as `GH_REPO`), else an inherited `GH_REPO`;
 //! 4. otherwise, the checkout's base repo
@@ -43,7 +45,14 @@
 //!    read-intent helper) has no route and stays on the writer.
 //!
 //! Endpoints whose answer depends on who asks are never derived even when
-//! a site forgot `.writer_identity()` ([`asker_dependent_path`]).
+//! a site forgot `.writer_identity()` ([`asker_dependent_path`]), and
+//! neither is any argv naming `@me` (`--assignee @me`, `author:@me`): a
+//! reader App would answer for itself. `issue|pr status` is viewer-relative
+//! for the same reason and is not on the allowlist.
+//!
+//! A read with no working directory derives only from a shape that names
+//! its repository (`-R`, `repo view OWNER/REPO`, a literal
+//! `repos/<o>/<r>` path); everything else needs the checkout.
 //!
 //! # Kill switches
 //!
@@ -236,6 +245,8 @@ fn api_method(rest: &[String]) -> String {
             || a.starts_with("--field=")
             || a.starts_with("--raw-field=")
             || a.starts_with("--input=")
+            // Glued short forms: `-fkey=val`, `-Fkey=val`.
+            || (a.len() > 2 && (a.starts_with("-f") || a.starts_with("-F")))
         {
             body = true;
         }
@@ -367,6 +378,10 @@ fn shape(args: &[OsString]) -> Shape {
     else {
         return Shape::Unroutable;
     };
+    // `@me` is the asker: a reader App would answer for itself.
+    if rest.iter().any(|w| names_the_viewer(w)) {
+        return Shape::Unroutable;
+    }
     match cmd {
         "api" => {
             if foreign_hostname(rest) {
@@ -412,25 +427,38 @@ fn shape(args: &[OsString]) -> Shape {
                     None => Shape::FromCheckout,
                 };
             }
+            // The read allowlist comes first: `-R` says which repo, never
+            // whether the subcommand is a read (`pr edit -R`, `issue
+            // comment -R`, `pr merge -R` are writes). `status` is not on it:
+            // its answer is the viewer's.
+            if !matches!(sub, "view" | "list") {
+                return Shape::Unroutable;
+            }
             match repo_flag(after) {
                 Some(Some(v)) => {
                     github_nwo(v).map_or(Shape::Unroutable, |s| Shape::Named(s, Via::RepoFlag))
                 }
                 Some(None) => Shape::Unroutable,
-                None if matches!(sub, "view" | "list" | "status") => Shape::FromEnv,
-                None => Shape::Unroutable,
+                None => Shape::FromEnv,
             }
         }
         _ => Shape::Unroutable,
     }
 }
 
-/// Whether `inv` may have a route derived at all (the preconditions).
+/// Whether an argv word names the viewer (`@me`, `--assignee=@me`,
+/// `author:@me` in a search query).
+fn names_the_viewer(word: &str) -> bool {
+    word == "@me" || word.ends_with("=@me") || word.contains(":@me")
+}
+
+/// Whether `inv` may have a route derived at all (the preconditions). A
+/// working directory is not one of them: a read without one may still
+/// derive from a shape that names its repository ([`derive_with`]).
 fn eligible(inv: &GhInvocation) -> bool {
     inv.intent == AccessIntent::Read
         && matches!(inv.contract, OutputContract::Captured { .. })
         && inv.target == GhTarget::None
-        && inv.cwd.is_some()
         && inv.config_dir.is_none()
         && inv.role.is_none()
         && !inv.strip_token_env
@@ -446,6 +474,14 @@ pub(crate) fn derive_with(
     if env.disabled() || !eligible(inv) {
         return Derivation::Writer;
     }
+    let shape = shape(&inv.args);
+    if let Shape::Named(slug, via) = &shape {
+        // The argv names the repo: no checkout (or cwd) is consulted.
+        return Derivation::Route {
+            slug: slug.clone(),
+            via: *via,
+        };
+    }
     let Some(cwd) = inv.cwd.as_deref() else {
         return Derivation::Writer;
     };
@@ -458,7 +494,7 @@ pub(crate) fn derive_with(
         CwdAnswer::Disagree => Derivation::Disagree,
         CwdAnswer::Unresolved => Derivation::Writer,
     };
-    match shape(&inv.args) {
+    match shape {
         Shape::Named(slug, via) => Derivation::Route { slug, via },
         Shape::Unroutable => Derivation::Writer,
         Shape::FromCheckout => from_checkout(GhRepoEnv::Ignore),
@@ -507,11 +543,14 @@ pub(crate) fn checkout_answer(cwd: &Path, gh_env: GhRepoEnv) -> CwdAnswer {
 }
 
 /// Count one disagreement and warn once per root.
+///
+/// One counter for the whole facade
+/// ([`crate::forge_call_stats::buckets::bump_cwd_route_disagree`], which W1's
+/// accounting also bumps for a row whose `origin` repo disagrees with `gh`'s
+/// resolution). The invocation is marked counted, so its writer row does
+/// not bump it a second time.
 fn note_disagreement(cwd: &Path, op: &str) {
-    // The named counter only: the writer row this read now books carries
-    // W1's own `rd` flag (and bumps W1's row count) when its `origin` repo
-    // disagrees, so bumping that here too would count one call twice.
-    let n = crate::forge_call_stats::counters::bump(DISAGREE_COUNTER);
+    let n = crate::forge_call_stats::buckets::bump_cwd_route_disagree();
     static WARNED: OnceLock<Mutex<HashSet<std::path::PathBuf>>> = OnceLock::new();
     let first = WARNED
         .get_or_init(|| Mutex::new(HashSet::new()))
@@ -554,6 +593,7 @@ impl GhInvocation {
             Derivation::Disagree => {
                 if let Some(cwd) = self.cwd.as_deref() {
                     note_disagreement(cwd, self.operation.as_str());
+                    self.disagree_counted = true;
                 }
             }
             Derivation::Writer => {}

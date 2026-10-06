@@ -6,7 +6,9 @@ use super::super::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation
 use super::v2::{is_gone_at, ShedPolicy};
 use crate::cmd_out::{CmdOutcome, Unavailable};
 use crate::forge_bucket_book::Resource;
-use crate::forge_identity::{Failure, Placement, ReadClass, RouteDecision, RouteRequest};
+use crate::forge_identity::{
+    ExhaustCause, Failure, Placement, ReadClass, RouteDecision, RouteRequest,
+};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
@@ -105,13 +107,27 @@ impl Pool {
 
     /// Run `inv` against a two-reader router (`reader-2` home, `reader-1`
     /// next) that honours this run's withdrawals; `pre` readers start
-    /// withdrawn. Returns the completion and the withdrawals.
+    /// withdrawn. With every reader withdrawn the router answers a
+    /// [`ExhaustCause::Budget`] exhaustion. Returns the completion and the
+    /// withdrawals.
     fn run(
         &self,
         inv: GhInvocation,
         pre: &[&str],
         policy: ShedPolicy,
         now: SystemTime,
+    ) -> (GhCompletion, Vec<(String, String, Failure)>, Vec<String>) {
+        self.run_as(inv, pre, policy, now, ExhaustCause::Budget)
+    }
+
+    /// [`Pool::run`] with the router's exhaustion `cause`.
+    fn run_as(
+        &self,
+        inv: GhInvocation,
+        pre: &[&str],
+        policy: ShedPolicy,
+        now: SystemTime,
+        cause: ExhaustCause,
     ) -> (GhCompletion, Vec<(String, String, Failure)>, Vec<String>) {
         let withdrawn: RefCell<HashSet<String>> =
             RefCell::new(pre.iter().map(|s| (*s).to_string()).collect());
@@ -132,6 +148,7 @@ impl Pool {
             }
             RouteDecision::Exhausted {
                 until: now + Duration::from_secs(900),
+                cause,
             }
         };
         let withdraw = |app: &str, slug: &str, f: Failure, _why: &str| {
@@ -223,6 +240,66 @@ fn exhausted_up_front_gate_runs_on_the_writer_and_hygiene_sheds() {
     );
     assert!(matches!(out, GhCompletion::Shed { .. }), "{out:?}");
     assert!(p.who().is_empty(), "no request at all");
+}
+
+#[test]
+fn a_hygiene_read_no_reader_can_serve_for_a_non_budget_cause_runs_on_the_writer() {
+    // Every reader coverage-withdrawn from the repo, or no fresh token dir:
+    // the router says Unavailable up front, and the read goes to the writer
+    // (a plain writer read, no reader was tried) instead of being shed.
+    let p = pool(OK, OK, OK);
+    let (out, _, _) = p.run_as(
+        p.read("unseen-a", ReadClass::Hygiene),
+        &["app-1", "app-2"],
+        SHED_ON,
+        SystemTime::now(),
+        ExhaustCause::Unavailable,
+    );
+    assert!(matches!(out, GhCompletion::Captured(_)), "{out:?}");
+    assert_eq!(p.who(), vec![Who::Writer]);
+
+    // Readers that refuse the credential: withdrawn, and once none is left
+    // the router (honestly) says Unavailable: a writer fallback, not a shed.
+    const BAD: &str = "echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1";
+    let p = pool(BAD, BAD, OK);
+    let (out, withdrawn, _) = p.run_as(
+        p.read("unseen-b", ReadClass::Observability),
+        &[],
+        SHED_ON,
+        SystemTime::now(),
+        ExhaustCause::Unavailable,
+    );
+    assert!(matches!(out, GhCompletion::Captured(_)), "{out:?}");
+    assert_eq!(p.who(), vec![Who::R2, Who::R1, Who::Writer]);
+    assert!(withdrawn.iter().all(|w| w.2 == Failure::Credential), "{withdrawn:?}");
+}
+
+#[test]
+fn a_pool_that_vanishes_mid_read_falls_back_to_the_writer() {
+    let p = pool(OK, LIMITED, OK);
+    let first = std::cell::Cell::new(true);
+    let r2 = p.r2.clone();
+    let out = p
+        .read("vanish", ReadClass::Hygiene)
+        .execute_routed_v2_at(
+            &|_: &RouteRequest<'_>| {
+                if first.replace(false) {
+                    RouteDecision::Reader {
+                        dir: r2.clone(),
+                        app_id: "app-2".into(),
+                        placement: Placement::Home,
+                    }
+                } else {
+                    RouteDecision::NoPool
+                }
+            },
+            &|_: &str, _: &str, _: Failure, _: &str| {},
+            SHED_ON,
+            SystemTime::now(),
+        )
+        .unwrap();
+    assert!(matches!(out, GhCompletion::Captured(_)), "{out:?}");
+    assert_eq!(p.who(), vec![Who::R2, Who::Writer]);
 }
 
 #[test]

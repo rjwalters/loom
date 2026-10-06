@@ -19,7 +19,6 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 
@@ -29,17 +28,20 @@ use super::{Outcome, SinkLine};
 /// repo `gh` itself would resolve from the same checkout (`rd`).
 pub const CWD_ROUTE_DISAGREE: &str = "facade.cwd_route.disagree";
 
-static CWD_ROUTE_DISAGREEMENTS: AtomicU64 = AtomicU64::new(0);
-
-/// Count one [`CWD_ROUTE_DISAGREE`] row in this process.
-pub fn bump_cwd_route_disagree() {
-    CWD_ROUTE_DISAGREEMENTS.fetch_add(1, Ordering::Relaxed);
+/// Count one [`CWD_ROUTE_DISAGREE`] event in this process and return the
+/// new count. The one counter both W1's accounting (a row whose `origin`
+/// repo disagrees with `gh`'s resolution) and W4-C's derivation (local
+/// sources that disagree, so the read keeps the writer) bump — at most once
+/// per call. It lives in [`super::counters`], so it is exported with the
+/// other named counters (`loom.forge.facade.events`).
+pub fn bump_cwd_route_disagree() -> u64 {
+    super::counters::bump(CWD_ROUTE_DISAGREE)
 }
 
 /// This process's [`CWD_ROUTE_DISAGREE`] count since start.
 #[must_use]
 pub fn cwd_route_disagreements() -> u64 {
-    CWD_ROUTE_DISAGREEMENTS.load(Ordering::Relaxed)
+    super::counters::get(CWD_ROUTE_DISAGREE)
 }
 
 /// What [`aggregate_since`] groups rows by.

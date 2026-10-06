@@ -8,10 +8,16 @@
 //! 2. on a rate limit or a refused credential: withdraw it (W4-A's scope),
 //!    then ask the router again — the next eligible reader serves the read;
 //! 3. when no reader is left, a [`ReadClass::Gate`] read goes to the writer
-//!    exactly as before, while a [`ReadClass::Hygiene`] /
-//!    [`ReadClass::Observability`] read is **shed**: it returns
-//!    [`GhCompletion::Shed`] without a request. The same holds when the
-//!    router answers [`RouteDecision::Exhausted`] up front.
+//!    exactly as before. A [`ReadClass::Hygiene`] /
+//!    [`ReadClass::Observability`] read is **shed** — it returns
+//!    [`GhCompletion::Shed`] without a request — only when the readers are
+//!    out of **budget** ([`ExhaustCause::Budget`]: live rate-limit
+//!    withdrawals, or the router's headroom reserve). When they are out for
+//!    any other reason (a coverage miss, a stale or unpublished token, a
+//!    refused credential) the read goes to the writer like a Gate read:
+//!    shedding there would stop the repo's housekeeping for as long as the
+//!    condition lasts, which may be forever. The same holds when the router
+//!    answers [`RouteDecision::Exhausted`] up front.
 //!
 //! A 403/404 keeps today's rule (re-run on the writer; withdraw the reader
 //! for the repo only if the writer could read it). When both answer 404, the
@@ -31,7 +37,9 @@ use std::time::{Duration, SystemTime};
 
 use super::{failure_of, succeeded, ReaderLookup, Withdraw};
 use crate::forge_bucket_book::Resource;
-use crate::forge_identity::{Failure, IdentityRole, ReadClass, RouteDecision, RouteRequest};
+use crate::forge_identity::{
+    ExhaustCause, Failure, IdentityRole, ReadClass, RouteDecision, RouteRequest,
+};
 use crate::gh_invocation::{GhCompletion, GhInvocation};
 use crate::proc_exec::{Completion, ExecError};
 
@@ -128,6 +136,35 @@ fn is_not_found(result: &GhCompletion) -> bool {
     status.is_none() && stderr.contains("http 404")
 }
 
+/// How often a shed is logged at `info` per operation; the rest are `debug`
+/// (the `forge.read.shed` span still records every one).
+const SHED_LOG_EVERY: Duration = Duration::from_secs(300);
+
+/// Whether a shed of `op` at `now` should be logged at `info`: the first,
+/// then at most one per [`SHED_LOG_EVERY`].
+fn shed_log_due(op: &str, now: SystemTime) -> bool {
+    static LAST: OnceLock<Mutex<HashMap<String, SystemTime>>> = OnceLock::new();
+    let Ok(mut m) = LAST.get_or_init(|| Mutex::new(HashMap::new())).lock() else {
+        return false;
+    };
+    match m.get(op) {
+        Some(&at) if now.duration_since(at).is_ok_and(|d| d < SHED_LOG_EVERY) => false,
+        _ => {
+            m.insert(op.to_string(), now);
+            true
+        }
+    }
+}
+
+/// The cause of running out of readers after `failure`: a rate limit is
+/// budget, anything else is not.
+fn cause_after(failure: Option<Failure>) -> ExhaustCause {
+    match failure {
+        Some(Failure::RateLimited { .. }) => ExhaustCause::Budget,
+        _ => ExhaustCause::Unavailable,
+    }
+}
+
 /// When a withdrawn reader is expected back, for a shed's `until`.
 fn until_after(failure: Failure, now: SystemTime) -> SystemTime {
     match failure {
@@ -177,6 +214,7 @@ impl GhInvocation {
         let why = format!("{} via the gh choke point", self.operation.as_str());
         let mut tried: HashSet<String> = HashSet::new();
         let mut last_app: Option<String> = None;
+        let mut last_failure: Option<Failure> = None;
         let mut decision = lookup(&request);
         loop {
             let (dir, app_id) = match decision {
@@ -188,9 +226,10 @@ impl GhInvocation {
                         self.writer_fallback()
                     };
                 }
-                RouteDecision::Exhausted { until } => {
+                RouteDecision::Exhausted { until, cause } => {
                     return self.no_reader_left(
                         class,
+                        cause,
                         &owner,
                         resource,
                         until,
@@ -202,10 +241,12 @@ impl GhInvocation {
             };
             if tried.contains(&app_id) || tried.len() >= MAX_READERS_TRIED {
                 // The router offered a reader this read already failed on:
-                // treat it as no reader left.
+                // treat it as no reader left (budget only if what it failed
+                // on was a rate limit).
                 let until = now + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
                 return self.no_reader_left(
                     class,
+                    cause_after(last_failure),
                     &owner,
                     resource,
                     until,
@@ -247,9 +288,13 @@ impl GhInvocation {
             withdraw(&app_id, &slug, failure, &why);
             tried.insert(app_id.clone());
             last_app = Some(app_id);
+            last_failure = Some(failure);
             decision = match lookup(&request) {
+                // The pool went away under us: nothing says budget, so the
+                // writer serves it (a fallback, since a reader was tried).
                 RouteDecision::NoPool => RouteDecision::Exhausted {
                     until: until_after(failure, now),
+                    cause: ExhaustCause::Unavailable,
                 },
                 other => other,
             };
@@ -263,19 +308,23 @@ impl GhInvocation {
             .execute_direct()
     }
 
-    /// No reader can serve this read: `Gate` goes to the writer (as a
-    /// fallback when a reader was tried, else as the plain writer read it
-    /// was before W4), anything else is shed.
+    /// No reader can serve this read. A deferrable read whose readers are
+    /// out of budget is shed; everything else — every `Gate` read, and a
+    /// deferrable read whose readers are out for any other cause — goes to
+    /// the writer (as a fallback when a reader was tried, else as the plain
+    /// writer read it was before W4).
+    #[allow(clippy::too_many_arguments)]
     fn no_reader_left(
         &self,
         class: ReadClass,
+        cause: ExhaustCause,
         owner: &str,
         resource: Resource,
         until: SystemTime,
         app: Option<&str>,
         tried: bool,
     ) -> Result<GhCompletion, ExecError> {
-        if class == ReadClass::Gate {
+        if class == ReadClass::Gate || cause != ExhaustCause::Budget {
             return if tried {
                 self.writer_fallback()
             } else {
@@ -295,11 +344,24 @@ impl GhInvocation {
                 until: until.into(),
             },
         );
-        log::debug!(
-            "gh_invocation: {} shed — every reader for {owner} {} is withdrawn {SHED_MARKER}",
-            self.operation.as_str(),
-            resource.as_str()
-        );
+        let op = self.operation.as_str();
+        let until_s = chrono::DateTime::<chrono::Utc>::from(until)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        if shed_log_due(op, SystemTime::now()) {
+            log::info!(
+                "gh_invocation: {op} shed — every reader for {owner} {} is out of budget \
+                 until {until_s}; deferred, not sent to the writer {SHED_MARKER} \
+                 (logged at most every {}s per operation)",
+                resource.as_str(),
+                SHED_LOG_EVERY.as_secs()
+            );
+        } else {
+            log::debug!(
+                "gh_invocation: {op} shed — every reader for {owner} {} is out of budget \
+                 until {until_s} {SHED_MARKER}",
+                resource.as_str()
+            );
+        }
         Ok(GhCompletion::Shed {
             owner: owner.to_string(),
             resource,
