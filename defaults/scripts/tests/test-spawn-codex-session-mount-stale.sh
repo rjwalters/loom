@@ -136,11 +136,16 @@ real_host() {
 }
 
 echo "--- the real daemon announces SESSION_MOUNT_STALE for an unmounted workdir ---"
-if command -v loom-daemon >/dev/null 2>&1 \
-    && loom-daemon session-exec host --help 2>/dev/null | grep -q -- '--container'; then
+# Captured, then matched without a pipe: under `pipefail` a `cmd | grep -q`
+# can fail on the writer's SIGPIPE (scripts/check-pipefail-early-exit.sh).
+HOST_HELP=""
+if command -v loom-daemon >/dev/null 2>&1; then
+    HOST_HELP="$(loom-daemon session-exec host --help 2>/dev/null || true)"
+fi
+if [[ "$HOST_HELP" == *"--container"* ]]; then
     fake_docker "$WORK/other-repo"
     real_host
-    if printf '%s\n' "$REAL_ERR" | grep -qxF "$MARKER"; then
+    if grep -qxF "$MARKER" <<<"$REAL_ERR"; then
         assert_eq "78" "$REAL_RC" "session-exec host refuses with 78 and announces SESSION_MOUNT_STALE"
         assert_eq "inspect" "$(tr '\n' ' ' <"$WORK/docker-calls" | sed 's/ $//')" \
             "the refusal costs one docker inspect and no exec"
@@ -161,7 +166,7 @@ if command -v loom-daemon >/dev/null 2>&1 \
         echo "  SKIP: the loom-daemon on PATH predates the stale-mount announcement"
     fi
 else
-    echo "  SKIP: no loom-daemon on PATH"
+    echo "  SKIP: no loom-daemon with \`session-exec host\` on PATH"
 fi
 
 echo ""
