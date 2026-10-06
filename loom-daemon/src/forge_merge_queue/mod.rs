@@ -9,6 +9,8 @@
 //! - [`github`] — the GitHub [`ops::QueueApi`] (GraphQL via the counted `gh`
 //!   facade).
 //! - [`preflight`] — capability preflight with distinct failure kinds.
+//! - [`authz`] — the fail-closed authorization protocol (#10256, Phase B1;
+//!   not wired into any caller yet).
 //! - [`handle`] — `loom-daemon forge merge-queue …`, for operators and tests.
 //!
 //! # Dormant by construction
@@ -31,6 +33,7 @@
 //! | `3` | could not determine (rate limit, unreadable config, transport) |
 //! | `4` | refused before any forge call (`NOT_QUEUE_MODE` / `EXECUTION_DORMANT`) |
 
+pub mod authz;
 pub mod github;
 pub mod mode;
 pub mod ops;
@@ -291,5 +294,7 @@ pub fn handle(cmd: &MergeQueueCmd) -> ! {
     std::process::exit(report.code)
 }
 
+#[cfg(test)]
+mod authz_tests;
 #[cfg(test)]
 mod tests;
