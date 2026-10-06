@@ -39,8 +39,15 @@
 //!
 //! The shift at `t` is the raw fit at `t`, clamped to within
 //! [`MAX_DAILY_STEP`] (log units) of the shift at `t − 1 day`, itself
-//! clamped likewise back [`STEPS`] days. It is stateless — recomputed from
-//! the same evidence — so one bad day moves the range by at most one step.
+//! clamped likewise, back to the first point of that day lattice after the
+//! **oldest usable estimate**. The anchor is fixed by the evidence, not by
+//! `t`, so the replay for `t + 1 day` is the replay for `t` plus one clamped
+//! step: two evaluations one day apart differ by at most one step, whatever
+//! enters or leaves the window. It is stateless — recomputed from the same
+//! evidence, so a backtest replays it exactly. (A replay anchored a fixed
+//! number of days back would re-seed from an unconstrained raw fit each day
+//! and could jump by many steps; #10497.) Only compacting the log
+//! ([`super::calibration_log::MAX_ROWS`]) moves the anchor.
 //!
 //! # Point-in-time
 //!
@@ -71,9 +78,6 @@ pub const MIN_CELL_EVENTS: usize = 20;
 /// Largest change of any quantile's shift (ln units) between two
 /// evaluations one day apart: `ln 1.2 ≈ 0.18` is a 20% move of the range.
 pub const MAX_DAILY_STEP: f64 = 0.18;
-
-/// Days of clamped history the rate limit is anchored over.
-pub const STEPS: i64 = 7;
 
 /// The four quantile levels, in [`Q4`] order.
 const TAUS: [f64; 4] = [0.25, 0.50, 0.75, 0.90];
@@ -107,7 +111,9 @@ impl<T: Copy> Q4<T> {
         }
     }
 
-    fn to_array(self) -> [T; 4] {
+    /// `[p25, p50, p75, p90]`.
+    #[must_use]
+    pub fn to_array(self) -> [T; 4] {
         [self.p25, self.p50, self.p75, self.p90]
     }
 }
@@ -151,6 +157,10 @@ pub struct Calibration {
     pub n_censored: usize,
     /// The largest one-day move allowed ([`MAX_DAILY_STEP`]).
     pub max_daily_step: f64,
+    /// Where the rate-limit replay started: the first point of `as_of`'s
+    /// day lattice after the oldest usable base estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_from: Option<DateTime<Utc>>,
     /// The base estimate's quantiles, before calibration, seconds.
     pub base_quantiles_sec: Q4<i64>,
 }
@@ -237,16 +247,34 @@ struct Fit {
     n_censored: usize,
 }
 
-/// The raw (un-rate-limited) fit at `t`: the narrowest cell with
-/// [`MIN_CELL_EVENTS`] landings, or `None`.
+/// The usable evidence for `base`: its rows with a full quantile set,
+/// ascending by `as_of` (so a window is a slice).
+fn usable<'a>(
+    observations: &'a [CalibrationObservation],
+    base: &str,
+) -> Vec<&'a CalibrationObservation> {
+    let mut rows: Vec<&CalibrationObservation> = observations
+        .iter()
+        .filter(|o| {
+            o.heuristic == base && o.p25_sec.is_some() && o.p75_sec.is_some() && o.p90_sec.is_some()
+        })
+        .collect();
+    rows.sort_by_key(|o| o.as_of);
+    rows
+}
+
+/// The raw (un-rate-limited) fit at `t` over `evidence` (from [`usable`]):
+/// the narrowest cell with [`MIN_CELL_EVENTS`] landings, or `None`.
 fn raw_fit(
-    observations: &[CalibrationObservation],
+    evidence: &[&CalibrationObservation],
     base: &str,
     t: DateTime<Utc>,
     stage: Stage,
     bucket: usize,
 ) -> Option<Fit> {
-    let seen: Vec<Seen> = observations
+    let from = evidence.partition_point(|o| o.as_of < t - Duration::days(WINDOW_DAYS));
+    let to = evidence.partition_point(|o| o.as_of < t);
+    let seen: Vec<Seen> = evidence[from..to]
         .iter()
         .filter_map(|o| see(o, base, t))
         .collect();
@@ -287,20 +315,39 @@ fn raw_fit(
     None
 }
 
-/// The fit at `t` and its rate-limited shift. `None` when `t` itself has no
-/// cell with enough landings.
+/// The fit at `t`, its rate-limited shift, and the instant the rate-limit
+/// replay started from. `None` when `t` itself has no cell with enough
+/// landings.
+///
+/// The replay walks the lattice `t − k days` forward from its first point
+/// after the oldest usable estimate — an anchor fixed by the evidence, not
+/// by `t` — so the replay for `t + 1 day` is the replay for `t` plus one
+/// more clamped step, and the applied shift moves by at most
+/// [`MAX_DAILY_STEP`] between evaluations one day apart (#10497). A lattice
+/// point with no qualifying cell carries the previous shift forward.
 fn limited_fit(
     observations: &[CalibrationObservation],
     base: &str,
     t: DateTime<Utc>,
     stage: Stage,
     bucket: usize,
-) -> Option<(Fit, [f64; 4])> {
+) -> Option<(Fit, [f64; 4], DateTime<Utc>)> {
+    let evidence = usable(observations, base);
+    let oldest = evidence.first()?.as_of;
+    if oldest >= t {
+        return None;
+    }
+    // The largest `k` with `t − k days` strictly after `oldest` (evidence
+    // must be made before the instant it informs).
+    let mut steps: i64 = 0;
+    while t - Duration::days(steps + 1) > oldest {
+        steps += 1;
+    }
     let mut previous: Option<[f64; 4]> = None;
     let mut last: Option<Fit> = None;
-    for k in (0..=STEPS).rev() {
+    for k in (0..=steps).rev() {
         let at = t - Duration::days(k);
-        let raw = raw_fit(observations, base, at, stage, bucket);
+        let raw = raw_fit(&evidence, base, at, stage, bucket);
         if let Some(fit) = &raw {
             previous = Some(match previous {
                 None => fit.shift,
@@ -318,7 +365,7 @@ fn limited_fit(
             last = raw;
         }
     }
-    Some((last?, previous?))
+    Some((last?, previous?, t - Duration::days(steps)))
 }
 
 /// `(p25, p50, p75, p90)` from the base's quantiles and the shifts.
@@ -356,7 +403,8 @@ pub fn calibrate(
     };
     let as_of = explanation.as_of;
     let bucket = age_bucket(age);
-    let Some((fit, shift)) = limited_fit(observations, base, as_of, stage, bucket) else {
+    let Some((fit, shift, replay_from)) = limited_fit(observations, base, as_of, stage, bucket)
+    else {
         return explanation;
     };
     let shift = Q4::from_array(shift);
@@ -377,6 +425,7 @@ pub fn calibrate(
         n_events: fit.n_events,
         n_censored: fit.n_censored,
         max_daily_step: MAX_DAILY_STEP,
+        replay_from: Some(replay_from),
         base_quantiles_sec: Q4 {
             p25: base_q.0,
             p50: base_q.1,

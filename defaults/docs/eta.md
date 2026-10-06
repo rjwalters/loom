@@ -410,9 +410,13 @@ has 20 landings in the window, else the stage, else all stages, else nothing
 before observations carried the base's p25/p75/p90 and age are not evidence).
 A still-open base estimate is a **lower bound** `ln(elapsed / q_τ)` entering a
 Kaplan–Meier estimate with the landings; an unresolvable tail clamps to the
-largest bound. The change of every shift is limited to `ln 1.2` per day,
-recomputed statelessly over the preceding 7 days, so one bad day cannot swing
-the range. Outputs are made monotone (`p25 ≤ p50 ≤ p75 ≤ p90`).
+largest bound. The change of every shift is limited to `ln 1.2` per day: the
+shift is replayed day by day (on `as_of`'s own day lattice) from the oldest
+usable base estimate, each day's raw fit clamped to one step of the day
+before. The anchor is fixed by the evidence, not by `as_of`, so two estimates
+a day apart differ by at most one step whatever enters or leaves the window,
+and a backtest replays it exactly; only log compaction moves the anchor
+(#10497). Outputs are made monotone (`p25 ≤ p50 ≤ p75 ≤ p90`).
 
 *Point-in-time.* Everything is a function of the estimate's own `as_of`: a
 base estimate made at or after it, and an outcome *known* at or after it, are
@@ -421,7 +425,7 @@ post-`as_of` outcome and requires bit-identical output.
 
 *The record.* `calibration{method, base, window{from,to,days}, level, stage,
 age_bucket, shift{p25,p50,p75,p90}, raw_shift, n_events, n_censored,
-max_daily_step, base_quantiles_sec}` — the shifts are natural-log units, so
+max_daily_step, replay_from, base_quantiles_sec}` — the shifts are natural-log units, so
 "why this range?" is `base_quantiles_sec × exp(shift)`; the result recomputes
 from the explanation alone.
 

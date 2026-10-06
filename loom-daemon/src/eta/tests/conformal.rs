@@ -156,22 +156,127 @@ fn each_quantile_hits_its_own_rate_on_the_calibration_set() {
     assert!(p25 <= p50 && p50 <= p75 && p75 <= p90);
 }
 
+const DAY: i64 = 86_400;
+
+/// The calibration record of the same base estimate made `day` days after
+/// the fixture instant, against the same `observations` — only `as_of`
+/// moves, so any change is the evidence that became visible in that day.
+fn calibration_on(
+    observations: &[CalibrationObservation],
+    day: i64,
+) -> Option<conformal::Calibration> {
+    let mut bare = history_a();
+    bare.calibration.clear();
+    let mut base = LandCalmPlover.estimate(&input_at(Stage::ReviewWait, 0, 0), &bare);
+    assert!(base.calibration.is_none());
+    base.as_of += Duration::days(day);
+    conformal::calibrate(base, observations, LAND_V2).calibration
+}
+
+/// Every pair of evaluations one day apart in `days` (same evidence) moves
+/// each applied shift by at most [`conformal::MAX_DAILY_STEP`]; returns the
+/// records for further assertions.
+fn assert_daily_bound(
+    observations: &[CalibrationObservation],
+    days: std::ops::RangeInclusive<i64>,
+) -> Vec<(i64, conformal::Calibration)> {
+    let records: Vec<(i64, conformal::Calibration)> = days
+        .filter_map(|d| calibration_on(observations, d).map(|c| (d, c)))
+        .collect();
+    for pair in records.windows(2) {
+        let ((d0, a), (d1, b)) = (&pair[0], &pair[1]);
+        if d1 - d0 != 1 {
+            continue;
+        }
+        for (x, y) in a.shift.to_array().into_iter().zip(b.shift.to_array()) {
+            assert!(
+                (y - x).abs() <= conformal::MAX_DAILY_STEP + 1e-6,
+                "day {d0} -> {d1}: applied shift {x} -> {y} (raw {:?} -> {:?})",
+                a.raw_shift,
+                b.raw_shift
+            );
+        }
+    }
+    records
+}
+
 #[test]
-fn the_shift_moves_at_most_one_step_per_day() {
-    // A week of well-calibrated landings, then a sudden bad day: raw shifts
-    // jump, the applied ones may only inch.
+fn the_applied_shift_moves_at_most_one_step_between_days_when_a_cohort_leaves_the_window() {
+    // The Judge's reproduction on PR #10497: a large calm cohort at day
+    // -20.5 and a small 20x-late cohort at day -9. The calm cohort leaves the
+    // 14-day window between days -7 and -6, so the raw p50 shift jumps from
+    // ~0 to ~3 and stays there; a replay anchored a fixed number of days
+    // back re-seeded from that jumped raw fit the next day.
+    let late = (3_600.0 * 3.0_f64.exp()).round() as i64;
+    let mut set: Vec<CalibrationObservation> = (0..1_000)
+        .map(|i| obs(&format!("calm{i}"), Stage::ReviewWait, -20 * DAY - DAY / 2, Some(3_600)))
+        .collect();
+    set.extend((0..100).map(|i| obs(&format!("late{i}"), Stage::ReviewWait, -9 * DAY, Some(late))));
+    let records = assert_daily_bound(&set, -12..=4);
+    let today = &records
+        .iter()
+        .find(|(d, _)| *d == 0)
+        .expect("calibrated today")
+        .1;
+    assert!(today.raw_shift.p50 > 2.9, "{today:?}");
+    assert!(today.shift.p50 < today.raw_shift.p50, "limited: {today:?}");
+    // It does converge, one step a day.
+    let last = &records.last().unwrap().1;
+    assert!(last.shift.p50 > today.shift.p50);
+}
+
+#[test]
+fn the_applied_shift_moves_at_most_one_step_between_days_as_a_shock_enters_and_leaves() {
+    // Six weeks of well-calibrated landings, one every three hours, plus a
+    // shock: 60 estimates on day -12 that all ran ~20x late. The shock
+    // enters the window, then leaves it (and leaves any fixed seven-day
+    // replay horizon) while the calm evidence stays: the applied shift must
+    // ramp up and back down one step a day, not jump when an anchor moves.
+    let mut set: Vec<CalibrationObservation> = (0..336)
+        .map(|i| {
+            let z = -1.0 + 2.0 * (i % 21) as f64 / 20.0;
+            let remaining = (BASE.1 as f64 * z.exp()).round() as i64;
+            obs(&format!("calm{i}"), Stage::ReviewWait, -42 * DAY + 10_800 * i, Some(remaining))
+        })
+        .collect();
+    set.extend(
+        (0..60)
+            .map(|i| obs(&format!("bad{i}"), Stage::ReviewWait, -12 * DAY + 60 * i, Some(70_000))),
+    );
+    let records = assert_daily_bound(&set, -14..=6);
+    // The shock was visible and limited...
+    assert!(
+        records
+            .iter()
+            .any(|(_, c)| c.raw_shift.p90 - c.shift.p90 > conformal::MAX_DAILY_STEP),
+        "the limit never bound"
+    );
+    // ...and after it left the window the applied shift is still walking
+    // back down rather than snapping to the raw fit.
+    let (_, after) = records.iter().find(|(d, _)| *d == 3).expect("calibrated");
+    assert!(after.shift.p90 > after.raw_shift.p90 + 1e-6, "{after:?}");
+}
+
+#[test]
+fn the_applied_shift_is_a_function_of_the_evidence_not_of_the_replay_length() {
+    // Two evaluations one day apart agree on everything up to the earlier
+    // one: the later is exactly one clamped step from it.
     let mut set = landings(Stage::ReviewWait, 120, -1.0, 1.0, "calm");
-    let before = estimate_with(set.clone()).calibration.unwrap();
-    // The last day: 60 estimates that all ran 30x late, landed before as_of.
     set.extend(
         (0..60).map(|i| obs(&format!("bad{i}"), Stage::ReviewWait, -80_000 - 10 * i, Some(70_000))),
     );
-    let after = estimate_with(set).calibration.unwrap();
-    assert!(after.raw_shift.p50 > after.shift.p50, "limited: {after:?}");
-    assert!(
-        (after.shift.p50 - before.shift.p50).abs()
-            <= conformal::MAX_DAILY_STEP * conformal::STEPS as f64 + 1e-6
-    );
+    let (today, tomorrow) = (calibration_on(&set, 0).unwrap(), calibration_on(&set, 1).unwrap());
+    for ((prev, raw), next) in today
+        .shift
+        .to_array()
+        .into_iter()
+        .zip(tomorrow.raw_shift.to_array())
+        .zip(tomorrow.shift.to_array())
+    {
+        let expected =
+            raw.clamp(prev - conformal::MAX_DAILY_STEP, prev + conformal::MAX_DAILY_STEP);
+        assert!((next - expected).abs() <= 1e-6, "{prev} {raw} {next}");
+    }
 }
 
 #[test]
