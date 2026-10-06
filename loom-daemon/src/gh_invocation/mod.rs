@@ -45,6 +45,7 @@ mod affinity;
 pub mod api_kind;
 pub(crate) mod cwd_route;
 mod outcome;
+pub(crate) mod own_writes;
 mod reader_route;
 pub mod resolver;
 pub mod telemetry;
@@ -670,6 +671,11 @@ impl GhInvocation {
     /// [`ExecError::Collect`] when it started but its result could not be
     /// collected (side effects may have happened — never retry a write on it).
     pub fn execute(self) -> Result<GhCompletion, ExecError> {
+        // W9: every write pins the next guard read of its number to the
+        // writer, unconditionally (see `own_writes`).
+        if self.intent == AccessIntent::Write {
+            own_writes::note(&self.args);
+        }
         #[cfg(test)]
         if let Some(routed) = test_routing::run(&self) {
             return routed;

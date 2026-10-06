@@ -23,9 +23,14 @@ pub(crate) mod claim_label;
 
 /// The registry's facade `gh` helpers, shared by every `sweep_registry` module.
 mod gh_exec;
+/// Conditional 2.5/2.7 issue reads (W9), a child module because this file is
+/// frozen by `scripts/file-size-baseline.txt`.
+pub(crate) mod issue_snapshot;
 mod rate_limit_report;
 #[cfg(test)]
 mod rate_limit_report_tests;
+/// The dispatch path's memo gating (resume reads live) and refusal ledger (W9).
+pub(crate) mod refusal_memo;
 
 /// Three-state result of the open-linked-PR probe (Issue #4452).
 ///
@@ -631,7 +636,14 @@ impl SweepRegistry {
             );
             return OpenPrProbe::Open(memo.pr);
         }
+        self.live_open_pr_probe(issue)
+    }
 
+    /// [`Self::probe_open_linked_pr`] without the fresh-memo short circuit:
+    /// the forge answers (with the #6058 retry and the #6788 known-PR recheck
+    /// backstop). Every decision that a memo answer would *permit* rather
+    /// than refuse, the #4256 resume, calls this (W9, see `refusal_memo`).
+    pub(crate) fn live_open_pr_probe(&self, issue: u32) -> OpenPrProbe {
         for attempt in 1..=OPEN_PR_PROBE_MAX_ATTEMPTS {
             let verdict = self.probe_open_linked_pr_transports(issue);
             if verdict != OpenPrProbe::ProbeFailed {
