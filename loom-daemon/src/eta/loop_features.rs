@@ -28,7 +28,7 @@
 //!
 //! | # | feature | source |
 //! |---|---|---|
-//! | 1 | [`LoopFeatures::overlap_prs`], [`LoopFeatures::overlap_files`] | each open PR's changed-file list **as known at `as_of`** ([`FileSnapshot`]) |
+//! | 1 | [`LoopFeatures::overlap_prs`], [`LoopFeatures::overlap_files`] | each open PR's changed-file list **as known at `as_of`** ([`FileSnapshot`]); `None` if the subject's or any open peer's list is unknown then |
 //! | 2 | [`LoopFeatures::review_requests`], [`LoopFeatures::approvals_lost`] | stage episodes |
 //! | 3 | [`LoopFeatures::own_ci_failed`] | the PR's last CI run before `as_of` ([`CiObservation`]; SigNoz `ci.run` first) |
 //! | 4 | [`LoopFeatures::judge_reject_rate_7d`] | the repo's `review_wait` exits over the trailing 7 days |
@@ -150,9 +150,12 @@ pub struct LoopFeatures {
     /// PR to Doctor; `None` under [`MIN_JUDGE_VERDICTS`].
     pub judge_reject_rate_7d: Option<f64>,
     /// Other open PRs of the repo whose files (as known at `as_of`) share a
-    /// path with the subject's; `None` when the subject has no list.
+    /// path with the subject's; `None` when the subject has no list or any
+    /// other open PR has none known before `as_of` (a partly observed
+    /// roster is unknown, not zero).
     pub overlap_prs: Option<u32>,
-    /// Distinct subject paths touched by another open PR.
+    /// Distinct subject paths touched by another open PR; `None` exactly
+    /// when [`Self::overlap_prs`] is.
     pub overlap_files: Option<u32>,
     /// Whether the subject's last CI run before `as_of` failed; `None` when
     /// none is known.
@@ -243,7 +246,9 @@ pub fn loop_features(inputs: &LoopInputs<'_>, as_of: DateTime<Utc>) -> LoopFeatu
         .collect();
     let mut out = LoopFeatures::default();
 
-    if let Some(current) = mine.iter().find(|e| is_open_at(e, as_of)) {
+    // The last open episode, as `Timeline::open` picks (`rposition`); only
+    // differs from the first when open episodes overlap.
+    if let Some(current) = mine.iter().rev().find(|e| is_open_at(e, as_of)) {
         let visits: Vec<&&StageEpisode> =
             mine.iter().filter(|e| e.stage == current.stage).collect();
         out.cum_stage_h = Some(
@@ -288,9 +293,14 @@ pub fn loop_features(inputs: &LoopInputs<'_>, as_of: DateTime<Utc>) -> LoopFeatu
                 .collect();
             let mut prs = 0_usize;
             let mut touched: BTreeSet<&str> = BTreeSet::new();
+            // A peer whose list is not known before `as_of` makes the roster
+            // partly observed: the counts stay `None` rather than reading as
+            // a confident "no overlap".
+            let mut complete = true;
             for pr in open_others {
                 let Some(snap) = latest_files(files, inputs.repo, pr, as_of) else {
-                    continue;
+                    complete = false;
+                    break;
                 };
                 let shared: Vec<&str> = snap
                     .files
@@ -303,8 +313,10 @@ pub fn loop_features(inputs: &LoopInputs<'_>, as_of: DateTime<Utc>) -> LoopFeatu
                     touched.extend(shared);
                 }
             }
-            out.overlap_prs = Some(count(prs));
-            out.overlap_files = Some(count(touched.len()));
+            if complete {
+                out.overlap_prs = Some(count(prs));
+                out.overlap_files = Some(count(touched.len()));
+            }
         }
     }
     if let Some(ci) = inputs.ci {

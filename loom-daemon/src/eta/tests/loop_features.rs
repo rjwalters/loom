@@ -177,6 +177,8 @@ fn file_lists_are_the_ones_known_at_as_of_not_the_final_diff() {
         snap(1, 25.0, &["q.rs"]),
         snap(2, 1.0, &["c.rs"]),
         snap(2, 20.0, &["a.rs", "c.rs"]),
+        snap(3, 1.0, &["z.rs"]),
+        snap(4, 1.0, &["y.rs"]),
     ];
     let eps = overlap_fleet();
     assert_eq!(compute(&eps, 1, Some(&files), None, 10.0).overlap_prs, Some(0));
@@ -192,6 +194,49 @@ fn file_lists_are_the_ones_known_at_as_of_not_the_final_diff() {
         compute(&eps, 1, Some(&perturbed), None, 10.0),
         compute(&eps, 1, Some(&files), None, 10.0)
     );
+}
+
+#[test]
+fn an_open_peer_without_a_list_leaves_overlap_unknown() {
+    // #1, #2, #4 have lists; open #3 has none at all. A partly observed
+    // roster is unknown, never a confident zero.
+    let files = [
+        snap(1, 1.0, &["a.rs"]),
+        snap(2, 1.0, &["c.rs"]),
+        snap(4, 1.0, &["y.rs"]),
+    ];
+    let f = compute(&overlap_fleet(), 1, Some(&files), None, 10.0);
+    assert_eq!((f.overlap_prs, f.overlap_files), (None, None));
+    assert_eq!(loop_vector(&f)[7], 0.0, "overlap_known = 0");
+    // Even when a known peer does overlap, the count stays unknown.
+    let overlapping = [
+        snap(1, 1.0, &["a.rs"]),
+        snap(2, 1.0, &["a.rs"]),
+        snap(4, 1.0, &["y.rs"]),
+    ];
+    let f = compute(&overlap_fleet(), 1, Some(&overlapping), None, 10.0);
+    assert_eq!((f.overlap_prs, f.overlap_files), (None, None));
+}
+
+#[test]
+fn a_peer_list_first_seen_at_or_after_as_of_leaves_overlap_unknown() {
+    // #3's only list is read at 10 h: unknown at as_of = 10 h (boundary)
+    // and before, known strictly after.
+    let files = [
+        snap(1, 1.0, &["a.rs"]),
+        snap(2, 1.0, &["c.rs"]),
+        snap(3, 10.0, &["z.rs"]),
+        snap(4, 1.0, &["y.rs"]),
+    ];
+    let eps = overlap_fleet();
+    for as_of in [5.0, 10.0] {
+        let f = compute(&eps, 1, Some(&files), None, as_of);
+        assert_eq!((f.overlap_prs, f.overlap_files), (None, None), "as_of {as_of}");
+        assert_eq!(loop_vector(&f)[7], 0.0);
+    }
+    let f = compute(&eps, 1, Some(&files), None, 11.0);
+    assert_eq!((f.overlap_prs, f.overlap_files), (Some(0), Some(0)));
+    assert_eq!(loop_vector(&f)[7], 1.0, "fully observed zero is known");
 }
 
 #[test]
