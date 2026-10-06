@@ -46,11 +46,13 @@ use super::{EstimateContext, Item, ItemKey, ReadyPlan, ReadyRow, Tracker};
 use crate::eta::explanation::{FeatureOmitted, Features};
 use crate::eta::journal::JournalEntry;
 use crate::eta::labels::stage_from_pr_labels;
+use crate::eta::pr_features::{FeatureRead, PrFeatureStore, Wanted};
 use crate::eta::priority_features::{self, PriorityEntry, PriorityFeatures, PriorityState};
 use crate::eta::queue_features::{
     self, is_pr_stage, reason, EventKind, EventLog, QueueFeatures, QueueSubject, RosterEntry,
     StageEvent, SINCE_MERGE_CAP_SEC,
 };
+use crate::eta::stall_features::{self, StallSnapshot};
 use crate::eta::{CurrentState, NoEstimateReason, Stage};
 use crate::types::{PlanState, QueueDisposition};
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
@@ -164,6 +166,10 @@ pub(super) struct PassContext {
     /// The repos a pass has listed: a PR new to one of these was opened (or
     /// entered review) since, so a star it carries is about that new.
     star_repos: BTreeSet<String>,
+    /// The feature reads' answers so far (#10232).
+    reads: PrFeatureStore,
+    /// The last pass's stall signals (#10232).
+    stall: Option<StallSnapshot>,
 }
 
 fn omission(name: &str, why: &str) -> FeatureOmitted {
@@ -437,6 +443,46 @@ impl Tracker {
         Some(self.priority_features_at(&subject, as_of))
     }
 
+    /// This pass's feature reads (#10232), at most `budget` of them, for
+    /// every live item; only items of `readable` repos (lowercased slugs
+    /// with a checkout this pass) plan a read. Call it before the pass's
+    /// `as_of`, so its answers are known to that pass's estimates.
+    pub fn plan_feature_reads(
+        &mut self,
+        readable: &[String],
+        now: DateTime<Utc>,
+        budget: usize,
+    ) -> Vec<FeatureRead> {
+        let wanted: Vec<Wanted> = self
+            .items
+            .iter()
+            .filter(|(_, item)| !item.landed)
+            .map(|(key, item)| Wanted {
+                repo: key.repo.clone(),
+                issue: key.issue,
+                pr: item.pr_number,
+                readable: readable.iter().any(|r| r.eq_ignore_ascii_case(&key.repo)),
+            })
+            .collect();
+        self.context.reads.plan(&wanted, now, budget)
+    }
+
+    /// The answers to [`Tracker::plan_feature_reads`]' reads, each with the
+    /// instant it returned (`None` body: the read failed).
+    pub fn on_feature_reads(
+        &mut self,
+        answers: &[(FeatureRead, Option<serde_json::Value>, DateTime<Utc>)],
+    ) {
+        for (read, body, at) in answers {
+            self.context.reads.answer(read, body.as_ref(), *at);
+        }
+    }
+
+    /// The host's stall signals (#10232), taken once per pass.
+    pub fn on_stall_snapshot(&mut self, snapshot: StallSnapshot) {
+        self.context.stall = Some(snapshot);
+    }
+
     /// The host-level plan features for an item of `repo` at `now`.
     fn plan_features(
         &self,
@@ -551,6 +597,17 @@ impl Tracker {
             .write_to(&mut features, &mut omitted);
         self.item_features(key, item, ctx.history, now, &mut features, &mut omitted);
         self.star_features(key, item, now, &mut features);
+        let pr = item.pr_number.ok_or(reason::NO_PR_YET);
+        self.context
+            .reads
+            .write_to(&key.repo, key.issue, pr, now, &mut features, &mut omitted);
+        stall_features::write_to(
+            self.context.stall.as_ref(),
+            &key.repo,
+            now,
+            &mut features,
+            &mut omitted,
+        );
         (features, omitted)
     }
 }

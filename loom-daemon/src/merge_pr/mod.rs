@@ -236,6 +236,7 @@
 //! caller and passed in; this module owns only the two-input decision and its
 //! byte-frozen message text, consolidating three copies into one.
 
+pub mod chain_lock;
 pub mod check_runs_rollup;
 pub mod check_runs_streak;
 pub mod checks_failure;

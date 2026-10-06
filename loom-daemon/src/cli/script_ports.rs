@@ -606,6 +606,12 @@ pub(crate) enum MergePrCommand {
     /// 2 = could not run (must also refuse).
     TreeChecks(super::merge_pr_tree_checks::TreeChecksArgs),
 
+    /// The chain-head merge lock (#10167): defer this merge while another
+    /// PR on the same base is a re-dating chain head whose required checks
+    /// have not reported. Exit 0 = proceed (CLEAR / OVERRIDDEN / FAIL-OPEN),
+    /// 6 = deferred (HELD / UNREADABLE). Never writes to the forge.
+    ChainLock(super::merge_pr_chain_lock::ChainLockArgs),
+
     /// The stale-cached-mergeable recheck decision (#6104): once REST
     /// `.mergeable` has read `false`, classify the backoff re-reads plus the
     /// local `git merge-tree` corroboration into `merge:` / `refuse-stale:` /
@@ -900,6 +906,7 @@ impl MergePrCommand {
             MergePrCommand::MergeableRecheck(args) => args.run(),
             MergePrCommand::StaleChecks(args) => args.run(),
             MergePrCommand::TreeChecks(args) => args.run(),
+            MergePrCommand::ChainLock(args) => args.run(),
             MergePrCommand::HeadSyncRetry(args) => args.run(),
             MergePrCommand::RedateChecks(args) => args.run(),
             MergePrCommand::RedateReport(args) => args.run(),

@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 pub const MAX_BYTES: usize = 32 * 1024;
 
 /// The size an ordinary explanation should stay under.
-pub const TARGET_BYTES: usize = 8 * 1024;
+pub const TARGET_BYTES: usize = 10 * 1024;
 
 /// `truncated[]` entry when `features` was dropped.
 pub const TRUNCATED_FEATURES: &str = "features";
@@ -518,7 +518,9 @@ pub struct Contributions {
 /// The fields from `ahead` on (#10201) post-date the first shipped v1
 /// payloads: an explanation recorded before them still parses (a missing
 /// `Option` reads as `None`), so the change is additive and the schema stays
-/// `eta-explanation/v1`. Their definitions are [`super::queue_features`]'s.
+/// `eta-explanation/v1`. Their definitions are [`super::queue_features`]'s;
+/// the read and stall features' are [`super::pr_features`]'s and
+/// [`super::stall_features`]'s (#10232).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Features {
     /// Current labels.
@@ -677,6 +679,32 @@ pub struct Features {
     /// Where the star comes from: `none`, `pr`, `issue` or `both`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub star_source: Option<String>,
+    /// The host's REST (`core`) rate-limit calls left (#10232).
+    #[serde(default)]
+    pub ratelimit_core_remaining: Option<u32>,
+    /// When the REST budget resets.
+    #[serde(default)]
+    pub ratelimit_core_reset_at: Option<DateTime<Utc>>,
+    /// The host's GraphQL rate-limit calls left.
+    #[serde(default)]
+    pub ratelimit_graphql_remaining: Option<u32>,
+    /// When the GraphQL budget resets.
+    #[serde(default)]
+    pub ratelimit_graphql_reset_at: Option<DateTime<Utc>>,
+    /// The rate-limit breaker: `closed` or `cooldown`.
+    #[serde(default)]
+    pub breaker_state: Option<String>,
+    /// When the breaker's cooldown releases.
+    #[serde(default)]
+    pub breaker_cooldown_until: Option<DateTime<Utc>>,
+    /// Required contexts on the PR's head not yet completed (or not yet
+    /// registered). Optional checks never count.
+    #[serde(default)]
+    pub checks_pending: Option<u32>,
+    /// Required contexts on the PR's head that failed. Optional checks
+    /// never count.
+    #[serde(default)]
+    pub checks_failed: Option<u32>,
 }
 
 /// Why a feature is null.
@@ -690,7 +718,7 @@ pub struct FeatureOmitted {
 
 impl Features {
     /// Every feature name, in field order.
-    pub const NAMES: [&'static str; 56] = [
+    pub const NAMES: [&'static str; 64] = [
         "labels",
         "complexity_marker",
         "points_marker",
@@ -747,6 +775,14 @@ impl Features {
         "pr_merge_conflict",
         "pr_friction_observed_at",
         "operator_hold",
+        "ratelimit_core_remaining",
+        "ratelimit_core_reset_at",
+        "ratelimit_graphql_remaining",
+        "ratelimit_graphql_reset_at",
+        "breaker_state",
+        "breaker_cooldown_until",
+        "checks_pending",
+        "checks_failed",
     ];
 
     /// `omitted` plus a `reason` entry for every null feature it does not

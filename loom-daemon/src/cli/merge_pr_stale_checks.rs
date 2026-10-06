@@ -42,6 +42,21 @@
 //!
 //! The `--from-stdin` payload accepts the new evidence as OPTIONAL fields
 //! (`pr_files`, `base_moves`); a payload without them behaves exactly as before.
+//!
+//! # Local merge-tree re-verification (#10388, opt-in)
+//!
+//! Only when the repository opts in (`merge.reverifyStaleChecks`, default
+//! `false`; env `LOOM_MERGE_REVERIFY_STALE_CHECKS` beats it): when every stale
+//! component is on
+//! [`loom_daemon::merge_pr::stale_checks::local_eval::CHEAP_CHECKS`], their CI
+//! steps run on the merge tree of the judged base tip + the head, and a pass
+//! prints the CLEAN sentinel (exit 0). Any other result leaves the refusal
+//! (exit 1) standing. Off, nothing here runs and the output is unchanged.
+//!
+//! `--from-stdin` re-verifies only when the payload also carries
+//! `"reverify": true` (so a suite or a pasted debug payload never fetches by
+//! accident), using the cwd's repository and `origin`, and it posts no PR
+//! comment: the comment it would post goes to stderr instead.
 
 use anyhow::Result;
 use loom_daemon::merge_pr::stale_checks::evidence::{
@@ -51,7 +66,7 @@ use loom_daemon::merge_pr::stale_checks::inputs::{BaseMove, ScopedEvidence};
 use loom_daemon::merge_pr::stale_checks::repo_specs::RepoSpecs;
 use loom_daemon::merge_pr::stale_checks::workflow_scope::{self, CiScope};
 use loom_daemon::merge_pr::stale_checks::{
-    assess_scoped, stale_inputs_message, unknown_message, Verdict, CLEAN,
+    assess_scoped, local_eval, stale_inputs_message, unknown_message, Verdict, CLEAN,
 };
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -95,6 +110,18 @@ impl StaleChecksArgs {
                         inputs.scoped.as_ref(),
                     );
                     warn_all(&warnings);
+                    let verdict = if inputs.reverify {
+                        let ev = Evidence {
+                            tip_sha: &inputs.tip_sha,
+                            base_tip: inputs.base_tip,
+                            required: &inputs.required,
+                            runs: &inputs.runs,
+                            scoped: inputs.scoped.as_ref(),
+                        };
+                        self.try_local_eval(verdict, &ev, false)
+                    } else {
+                        verdict
+                    };
                     (inputs.tip_sha, verdict)
                 }
                 Err(why) => (String::new(), Verdict::Unknown(why)),
@@ -119,6 +146,14 @@ impl StaleChecksArgs {
                         inputs.scoped.as_ref(),
                     );
                     warn_all(&warnings);
+                    let ev = Evidence {
+                        tip_sha: &inputs.tip_sha,
+                        base_tip: inputs.base_tip,
+                        required: &inputs.required,
+                        runs: &inputs.runs,
+                        scoped: inputs.scoped.as_ref(),
+                    };
+                    let verdict = self.try_local_eval(verdict, &ev, true);
                     (inputs.tip_sha.clone(), verdict)
                 }
                 Err(why) => (String::new(), Verdict::Unknown(why)),
@@ -163,6 +198,97 @@ impl StaleChecksArgs {
                 println!("{}", unknown_message(&self.pr, &why));
                 std::process::exit(2);
             }
+        }
+    }
+
+    /// #10388: a stale verdict whose every stale component is a cheap,
+    /// deterministic tree check is re-evaluated on the exact merge tree. A
+    /// pass turns it [`Verdict::Fresh`]; anything else returns `verdict`
+    /// unchanged (fail closed: the existing refusal and remedy apply). The
+    /// result goes to stderr (the merge log) and, when `post`, a PR comment.
+    /// A no-op unless the repository opted in.
+    fn try_local_eval(&self, verdict: Verdict, inputs: &Evidence<'_>, post: bool) -> Verdict {
+        if !matches!(verdict, Verdict::Stale { .. } | Verdict::StaleInputs { .. }) {
+            return verdict;
+        }
+        let root = loom_daemon::repo_root::find_repo_root_from_cwd()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        if !local_eval::enabled_for_root(&root) {
+            return verdict;
+        }
+        let Some(components) = local_eval::locally_evaluable(
+            inputs.base_tip,
+            inputs.required,
+            inputs.runs,
+            inputs.scoped,
+        ) else {
+            return verdict;
+        };
+        eprintln!(
+            "Note: stale required-check components [{}] are cheap tree checks; evaluating them \
+locally on the merge tree of {} + {} (#10388).",
+            components.join(", "),
+            inputs.tip_sha,
+            self.head_sha
+        );
+        let outcome = local_eval::evaluate(
+            &root,
+            "origin",
+            &self.pr,
+            &self.base_ref,
+            &self.head_sha,
+            inputs.tip_sha,
+            &components,
+            local_eval::CHEAP_CHECKS,
+            std::time::Duration::from_secs(local_eval::DEFAULT_TIMEOUT_SECS),
+        );
+        match outcome {
+            local_eval::Outcome::Passed(record) => {
+                eprintln!("{}", local_eval::log_line(&self.pr, "pass", &record));
+                self.comment(&local_eval::comment_body(&record, None), post);
+                Verdict::Fresh
+            }
+            local_eval::Outcome::Failed {
+                record,
+                step,
+                output,
+                ..
+            } => {
+                eprintln!("{}", local_eval::log_line(&self.pr, "fail", &record));
+                eprintln!("{output}");
+                self.comment(&local_eval::comment_body(&record, Some((&step, &output))), post);
+                verdict
+            }
+            local_eval::Outcome::Unknown(why) => {
+                eprintln!(
+                    "Warning: local merge-tree evaluation (#10388) gave no verdict, so the \
+freshness refusal stands: {why}"
+                );
+                verdict
+            }
+        }
+    }
+
+    /// Best-effort PR comment: the evidence is the evaluation itself, so a
+    /// comment that cannot be posted is a warning, never a different verdict.
+    fn comment(&self, body: &str, post: bool) {
+        if !post {
+            eprintln!("Note: --from-stdin posts no PR comment; it would post:\n{body}");
+            return;
+        }
+        if std::env::var("LOOM_STALE_CHECKS_DRY_RUN").as_deref() == Ok("true") {
+            return; // merge-pr.sh --dry-run: report only, no forge writes
+        }
+        if let Err(e) = loom_daemon::forge_comment::post_comment(
+            loom_daemon::gh_invocation::gh_bin(),
+            None,
+            &self.repo,
+            &self.pr,
+            true,
+            body,
+        ) {
+            eprintln!("Warning: could not record the local evaluation on PR #{}: {e}", self.pr);
         }
     }
 
@@ -236,6 +362,7 @@ impl StaleChecksArgs {
             required,
             runs,
             scoped: scoped_from_json(&v),
+            reverify: v.get("reverify").and_then(serde_json::Value::as_bool) == Some(true),
         })
     }
 }
@@ -247,6 +374,18 @@ struct StdinInputs {
     required: Vec<String>,
     runs: Vec<loom_daemon::merge_pr::stale_checks::CheckRun>,
     scoped: Option<ScopedEvidence>,
+    /// `"reverify": true`: also run the #10388 local re-verification (still
+    /// subject to the repository's opt-in).
+    reverify: bool,
+}
+
+/// What the local re-verification needs from either input path.
+struct Evidence<'a> {
+    tip_sha: &'a str,
+    base_tip: chrono::DateTime<chrono::Utc>,
+    required: &'a [String],
+    runs: &'a [loom_daemon::merge_pr::stale_checks::CheckRun],
+    scoped: Option<&'a ScopedEvidence>,
 }
 
 /// Print every degradation on stderr, so stdout keeps carrying only the

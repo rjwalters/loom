@@ -61,6 +61,16 @@ impl SweepRegistry {
             .unwrap_or_else(|| PathBuf::from(crate::gh_invocation::gh_bin()))
     }
 
+    /// The workspace's repo-facts answer under `gh repo view` semantics (W3a),
+    /// read with this registry's own `gh`.
+    pub(in crate::sweep_registry) fn owner_repo_fact(&self) -> crate::forge_repo_facts::Lookup {
+        crate::forge_repo_facts::canonical_with(
+            &self.configured_gh(),
+            &self.config.workspace_root,
+            crate::forge_repo_facts::GhRepoEnv::Ignore,
+        )
+    }
+
     /// The configured `gh` binary, else bare `gh` — which the facade resolves
     /// through its own ladder (so the span records the real source).
     fn configured_gh(&self) -> PathBuf {

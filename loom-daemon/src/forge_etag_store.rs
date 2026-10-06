@@ -104,6 +104,12 @@ pub(crate) struct DiskEntry {
 /// Read the entry at `path` — only from a [`private_dir`] (never from a
 /// directory another local user could have planted entries in).
 pub(crate) fn read_disk_entry(path: &Path) -> Option<DiskEntry> {
+    read_private_json(path)
+}
+
+/// Read any JSON value stored at `path` by [`write_private_json`] — only from
+/// a [`private_dir`], exactly like [`read_disk_entry`].
+pub(crate) fn read_private_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     if !private_dir(path.parent()?, false) {
         return None;
     }
@@ -175,7 +181,13 @@ pub(crate) fn create_private_file(path: &Path) -> std::io::Result<std::fs::File>
 /// the same host never observes a half-written file. Best-effort: any failure
 /// just means the next call re-fetches.
 pub(crate) fn write_disk_entry(path: &Path, entry: &DiskEntry) {
-    let Ok(serialized) = serde_json::to_string(entry) else {
+    write_private_json(path, entry);
+}
+
+/// [`write_disk_entry`]'s atomic, owner-only write for any serializable value
+/// (the repo-facts records of [`crate::forge_repo_facts`] share this store).
+pub(crate) fn write_private_json<T: serde::Serialize>(path: &Path, value: &T) {
+    let Ok(serialized) = serde_json::to_string(value) else {
         return;
     };
     write_private_atomic(path, serialized.as_bytes());
@@ -296,7 +308,27 @@ pub(crate) fn fetch_conditional_via(
         // The reader attempt drops env tokens (#9872): `gh` prefers an env
         // `GH_TOKEN`/`GITHUB_TOKEN` over `GH_CONFIG_DIR`, so without this an
         // ambient personal token would serve the "reader" read.
-        |dir, role| run_fetch_with(site, gh_bin, cwd, target, url, etag, dir, dir.is_some(), role),
+        |dir, role| {
+            // The reader's public bucket label (#10232), only on the reader attempt.
+            let bucket = dir.and(reader.as_ref()).map(|(_, app_id)| {
+                crate::forge_identity::reader_bucket(
+                    app_id,
+                    target.repo.as_deref().unwrap_or_default(),
+                )
+            });
+            run_fetch_with(
+                site,
+                gh_bin,
+                cwd,
+                target,
+                url,
+                etag,
+                dir,
+                dir.is_some(),
+                role,
+                bucket.as_deref(),
+            )
+        },
         http_ok,
         reader_failure,
         |failure, _| {
@@ -346,7 +378,7 @@ pub(crate) fn fetch_with_reader(
     reader_dir: &Path,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
     let role = crate::forge_identity::IdentityRole::Reader;
-    run_fetch_with(site, gh_bin, cwd, target, url, etag, Some(reader_dir), true, role)
+    run_fetch_with(site, gh_bin, cwd, target, url, etag, Some(reader_dir), true, role, None)
 }
 
 /// Deadline for one conditional read (they were unbounded `.output()`s before
@@ -376,6 +408,7 @@ fn run_fetch_with(
     reader_dir: Option<&Path>,
     strip_token_env: bool,
     role: crate::forge_identity::IdentityRole,
+    bucket: Option<&str>,
 ) -> Result<FetchResult> {
     let mut inv = GhInvocation::new(
         Operation::new(site.caller),
@@ -389,6 +422,9 @@ fn run_fetch_with(
     .program(gh_bin)
     .identity_role(role)
     .args(["api", "--include", url]);
+    if let Some(bucket) = bucket {
+        inv = inv.identity_bucket(bucket);
+    }
     if let Some(host) = &target.host {
         // The URL names the remote-resolved repo explicitly, so name its host
         // too (gh would otherwise use its default host, not the remote's).
@@ -442,7 +478,15 @@ pub(crate) fn parse_remote_url(url: &str) -> Option<(String, String)> {
 /// daemon's loops hit ~58 roots × several labels every tick, and forking
 /// `git remote get-url` each time is pure waste. Only successful resolutions
 /// are memoised, so a not-yet-configured remote is re-tried next call.
+///
+/// With repo facts on ([`crate::forge_repo_facts::enabled`]) the memo is
+/// invalidated by the checkout's git-config fingerprint, so an origin moved
+/// with `git remote set-url` is seen without a restart. `LOOM_REPO_FACTS=0`
+/// restores the process-lifetime memo below exactly.
 pub(crate) fn remote_identity(cwd: &Path) -> Option<(String, String)> {
+    if crate::forge_repo_facts::enabled() {
+        return crate::forge_repo_facts::origin_identity(cwd);
+    }
     static MEMO: OnceLock<Mutex<HashMap<PathBuf, (String, String)>>> = OnceLock::new();
     let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(hit) = memo.lock().ok().and_then(|m| m.get(cwd).cloned()) {

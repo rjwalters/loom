@@ -47,6 +47,7 @@ fn w1_line(t: i64, caller: &str, o: Outcome, at: CallAttribution) -> String {
         og: Some("github.com".into()),
         rp: Some("acme/widget".into()),
         ir: Some("reader".into()),
+        ib: None,
         at,
     })
     .unwrap()

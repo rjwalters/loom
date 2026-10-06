@@ -367,6 +367,12 @@ pub(super) async fn record() {
         record.rows_truncated_by_kind,
         record.as_of
     );
+    let with_alternates = record
+        .rows
+        .iter()
+        .filter(|r| !r.alternates.is_empty())
+        .count();
+    super::ops::eta_health::note_snapshot(record.rows.len() as u64, with_alternates as u64);
     sink.push(record);
     *LAST_EMITTED
         .lock()
