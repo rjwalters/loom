@@ -104,6 +104,7 @@ test-guide-docs-pr-exclude-refresh.sh
 test-guide-docs-pr-race.sh
 test-guide-docs-telemetry.sh
 test-guide-operator-attention-fold.sh
+test-guide-blocked-unblock-limit.sh
 test-guide-operator-only-exclude.sh
 test-guide-plan-body-stable-sort.sh
 test-guide-pool-pressure-defer.sh
