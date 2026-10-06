@@ -492,7 +492,7 @@ fn spec(repo: &'static str, pr: u32, steps: &'static [(f64, &'static [&'static s
 /// `REPO`: 51 issue-only star, 52 PR-only, 53 both, 54 star removed, 55
 /// none, 56 level 2, 57 inherited level 2. `OTHER` (no star coverage): 61
 /// unstarred, 62 PR-starred.
-fn specs() -> Vec<Spec> {
+pub(crate) fn specs() -> Vec<Spec> {
     vec![
         spec(REPO, 51, &[(10.0, &[RR])]),
         spec(REPO, 52, &[(10.0, &[RR, STAR])]),
@@ -553,7 +553,7 @@ fn fleet_history() -> Vec<RosterRevision> {
     ]
 }
 
-fn trained(specs: &[Spec], history: Option<&[RosterRevision]>) -> Assembled {
+pub(crate) fn trained(specs: &[Spec], history: Option<&[RosterRevision]>) -> Assembled {
     let mut inputs = StarInputs::default();
     inputs
         .repos
@@ -692,4 +692,39 @@ fn the_v2_features_ignore_roster_edits_knowable_at_or_after_the_cutoff() {
     let mut early = fleet_history();
     early.push(revision(h(2.0), Some(h(2.0)), edit));
     assert_ne!(xs(&trained(&specs, Some(&early))), xs(&base));
+}
+
+/// #10586: the history both sides read comes from one cache. Polled from a
+/// fake store (the 0 h and 5 h revisions, then a backdated edit first seen
+/// after `AT`), loaded once, and passed to the fit's builder and the
+/// tracker: the inputs agree, the rank is known, and the late edit is not
+/// read.
+#[test]
+fn the_cached_roster_history_feeds_training_and_serving_alike() {
+    use super::roster_history::{location, roster_yaml, FakeStore};
+    use crate::eta::roster_history::{load, sync, HistoryStatus};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = FakeStore::new();
+    store.commit(h(0.0), &roster_yaml(100, 100));
+    store.commit(h(5.0), &roster_yaml(100, 10));
+    sync(&store, tmp.path(), &location(), h(6.0)).unwrap();
+    store.commit(h(1.0), &roster_yaml(0, 100));
+    sync(&store, tmp.path(), &location(), h(AT + 1.0)).unwrap();
+    let (history, coverage) = load(tmp.path(), h(AT + 1.0));
+    assert_eq!((coverage.status, coverage.observed), (HistoryStatus::Loaded, 1));
+    let history = history.unwrap();
+
+    let specs = specs();
+    let a = trained(&specs, Some(&history));
+    let mut tracker = served_tracker(&specs);
+    tracker.set_fleet_history(Some(history.clone()));
+    for (repo, pr) in [(REPO, 51), (REPO, 55), (OTHER, 61), (OTHER, 62)] {
+        let serving = tracker
+            .priority_inputs_of(repo, pr, h(AT), Some(&history))
+            .unwrap();
+        assert_eq!(serving, trained_at(&a, repo, pr), "{repo}#{pr}");
+    }
+    assert_eq!(trained_at(&a, OTHER, 61).repo_rank, Some(0.0), "the 5 h revision");
+    assert_eq!(trained_at(&a, REPO, 55).repo_rank, Some(1.0), "not the late edit");
+    assert!(PriorityCoverage::of(&a.priority_inputs).repo_rank_known > 0);
 }

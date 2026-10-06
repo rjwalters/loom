@@ -25,6 +25,8 @@ use super::features_v2::PriorityCoverage;
 use super::rows::{self, Assembled};
 use super::{v2, FitStage};
 use crate::eta::fleet::{self, FleetSnapshot};
+use crate::eta::repo_priority::RosterRevision;
+use crate::eta::roster_history::{self, HistoryCoverage};
 use crate::eta::star::StarInputs;
 use crate::eta::Provenance;
 use anyhow::{bail, Context, Result};
@@ -105,6 +107,9 @@ pub struct FitReport {
     pub v2_path: PathBuf,
     /// How many rows know each v2 priority input.
     pub priority_coverage: PriorityCoverage,
+    /// The fleet roster history the v2 inputs read (#10586): whether it was
+    /// loaded, and on what basis its revisions are knowable.
+    pub roster_history: HistoryCoverage,
 }
 
 /// This build, as the file's `fitter`.
@@ -143,7 +148,20 @@ pub fn fit_snapshots_with_star(
     fitter: &Fitter,
     star: Option<&StarInputs>,
 ) -> (CoefficientFile, Assembled) {
-    let assembled = rows::build_with_star(snapshots, as_of, star);
+    fit_snapshots_with_context(snapshots, as_of, fitter, star, None)
+}
+
+/// [`fit_snapshots_with_star`], also reading the fleet roster's history
+/// (#10586) for the v2 priority inputs. The v1 file is the same either way.
+#[must_use]
+pub fn fit_snapshots_with_context(
+    snapshots: &[FleetSnapshot],
+    as_of: DateTime<Utc>,
+    fitter: &Fitter,
+    star: Option<&StarInputs>,
+    fleet_history: Option<&[RosterRevision]>,
+) -> (CoefficientFile, Assembled) {
+    let assembled = rows::build_with_context(snapshots, as_of, star, fleet_history);
     let meta = fit_meta(&assembled, as_of, fitter);
     let file = coeffs::fit(&meta, &assembled.rows, &assembled.dwells);
     (file, assembled)
@@ -207,7 +225,10 @@ fn fit_loaded(
     }
     let repos: Vec<String> = snapshots.iter().map(|s| s.repo.clone()).collect();
     let star = StarInputs::load(root, &repos);
-    let (file, assembled) = fit_snapshots_with_star(snapshots, as_of, fitter, Some(&star));
+    // The cache the tracker's pass also loads (#10586): one history value.
+    let (history, roster_history) = roster_history::load_for(root, as_of);
+    let (file, assembled) =
+        fit_snapshots_with_context(snapshots, as_of, fitter, Some(&star), history.as_deref());
     let dir = coeffs::fit_dir(root);
     let path = out.map_or_else(|| dir.join(coeffs::path_for(as_of)), Path::to_path_buf);
     let file_v2 = fit_v2_of(&assembled, as_of, fitter);
@@ -266,6 +287,7 @@ fn fit_loaded(
         v2_id: file_v2.id.clone(),
         v2_path: path_v2,
         priority_coverage: PriorityCoverage::of(&assembled.priority_inputs),
+        roster_history,
     })
 }
 
