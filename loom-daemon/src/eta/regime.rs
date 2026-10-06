@@ -84,7 +84,7 @@ pub fn residuals(observations: &[CalibrationObservation]) -> Vec<Residual> {
             })
         })
         .collect();
-    out.sort_by(|a, b| a.known_at.cmp(&b.known_at));
+    out.sort_by_key(|r| r.known_at);
     out
 }
 
@@ -231,7 +231,7 @@ pub fn drift(all: &[Residual], stage: Stage, as_of: DateTime<Utc>) -> Drift {
             base.push(r.log_ratio);
         }
     }
-    recent.sort_by(|a, b| a.known_at.cmp(&b.known_at));
+    recent.sort_by_key(|r| r.known_at);
     let (mu, sigma) = if base.len() >= MIN_SAMPLES {
         let n = base.len() as f64;
         let mu = base.iter().sum::<f64>() / n;

@@ -218,13 +218,10 @@ fn adaptive_half_life_shortens_on_drift_lengthens_when_stable_and_keeps_the_floo
         .map(|i| 3 * 86_400 + i * 3_600)
         .collect();
     let h = resolve_half_life_adaptive(&old, base, MIN_SAMPLES, DriftState::Drifted);
-    match h {
-        Some(h) => {
-            let ess = crate::eta::recency::effective_n(
-                old.iter().map(|&a| crate::eta::recency::weight(a, Some(h))),
-            );
-            assert!(ess >= MIN_SAMPLES as f64, "{h} -> {ess}");
-        }
-        None => {}
+    if let Some(h) = h {
+        let ess = crate::eta::recency::effective_n(
+            old.iter().map(|&a| crate::eta::recency::weight(a, Some(h))),
+        );
+        assert!(ess >= MIN_SAMPLES as f64, "{h} -> {ess}");
     }
 }
