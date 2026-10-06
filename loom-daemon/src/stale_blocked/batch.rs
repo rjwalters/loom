@@ -23,6 +23,14 @@
 //! Every warm re-run is free on the core bucket (all `304`s), and the GraphQL
 //! cost is ⌈issues/100⌉ points.
 //!
+//! # Budget floor
+//!
+//! Before any evidence read the run's projected cost is checked against the
+//! free budget probe, and re-checked between reads from the forge's own
+//! answers; a run that would cross the floor stops and reports the rest as
+//! unevaluated. See [`super::budget`]. What was spent is returned as a
+//! [`ForgeCost`].
+//!
 //! # Fail safe, unchanged
 //!
 //! A read that did not answer leaves the artifacts that depend on it
@@ -40,6 +48,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
+use super::budget::{self, Budget, Floor, ForgeCost, Guard, Meter};
 use super::{classify, park_self_block, Artifact, Evidence, Verdict};
 use crate::dep_recheck::{extract, named, premise, recheck};
 use crate::forge_call_stats::{ops, ForgeOp};
@@ -117,6 +126,16 @@ pub trait StaleBlockedForge {
     /// # Errors
     /// The whole batch did not answer.
     fn closing_refs_batch(&mut self, issues: &[u32]) -> Result<HashMap<u32, Vec<ClosingRef>>>;
+
+    /// The live budget from the free `/rate_limit` + GraphQL `rateLimit`
+    /// probe; `None` when it did not answer.
+    fn budget(&mut self) -> Option<Budget>;
+
+    /// Whether the rate-limit breaker is suppressing forge calls.
+    fn breaker_open(&mut self) -> bool;
+
+    /// What the reads above have spent so far.
+    fn meter(&self) -> Meter;
 }
 
 /// One examined artifact and its evidence, or why it could not be evaluated.
@@ -135,6 +154,17 @@ pub struct Options {
     pub limit: u32,
     /// Skip the PR population.
     pub no_prs: bool,
+    /// The remaining-points floor the run must not cross.
+    pub floor: Floor,
+}
+
+/// One run's result: the examined artifacts, the enumeration failure when
+/// the listing itself did not answer, and what the run spent.
+#[derive(Debug, Clone)]
+pub struct Gathering {
+    pub items: Vec<Gathered>,
+    pub enumerate_error: Option<String>,
+    pub cost: ForgeCost,
 }
 
 /// One artifact while its evidence is being assembled.
@@ -152,19 +182,29 @@ struct Pending {
 /// A blocker reference: `(repo, number)`, `None` meaning the invoking repo.
 type RefKey = (Option<String>, i64);
 
-/// Gather the evidence for every open `loom:blocked` artifact, plus the
-/// enumeration failure when the listing itself did not answer.
+/// Gather the evidence for every open `loom:blocked` artifact, within the
+/// budget floor ([`super::budget`]).
 pub fn gather_all(
     forge: &mut dyn StaleBlockedForge,
     fleet: &FleetLogins,
     opts: Options,
-) -> (Vec<Gathered>, Option<String>) {
+) -> Gathering {
+    let mut cost = ForgeCost {
+        floor: opts.floor,
+        ..ForgeCost::default()
+    };
     let rows = match forge.list_blocked() {
         Ok(rows) => rows,
-        Err(e) => return (Vec::new(), Some(format!("loom:blocked listing failed: {e}"))),
+        Err(e) => {
+            return Gathering {
+                items: Vec::new(),
+                enumerate_error: Some(format!("loom:blocked listing failed: {e}")),
+                cost,
+            }
+        }
     };
     let limit = opts.limit as usize;
-    let mut pending: Vec<Pending> = Vec::new();
+    let mut selected: Vec<(Artifact, RestIssue)> = Vec::new();
     for (kind, want_pr) in [(Artifact::Issue, false), (Artifact::Pr, true)] {
         if want_pr && opts.no_prs {
             continue;
@@ -173,16 +213,57 @@ pub fn gather_all(
             .iter()
             .filter(|r| r.is_pull_request == want_pr)
             .take(limit);
-        pending.extend(rows.map(|row| read_text(forge, fleet, kind, row.clone())));
+        selected.extend(rows.map(|row| (kind, row.clone())));
     }
 
-    read_closing(forge, &mut pending);
-    let states = read_states(forge, &pending);
-    let out = pending
+    // Nothing to gather, nothing to probe.
+    if !selected.is_empty() {
+        cost.projected = budget::project(&selected);
+        let refused = if forge.breaker_open() {
+            Some("rate-limit breaker is suppressing forge calls — not evaluated this run".into())
+        } else {
+            cost.budget_before = forge.budget();
+            cost.budget_before
+                .and_then(|b| budget::refusal(&b, cost.projected, opts.floor))
+        };
+        if let Some(why) = refused {
+            let items = selected
+                .into_iter()
+                .map(|(kind, row)| Gathered {
+                    kind,
+                    number: i64::from(row.number),
+                    title: row.title.unwrap_or_default(),
+                    evidence: Err(why.clone()),
+                })
+                .collect();
+            cost.budget_refused = Some(why);
+            cost.meter = forge.meter();
+            return Gathering {
+                items,
+                enumerate_error: None,
+                cost,
+            };
+        }
+    }
+
+    let mut guard = Guard::new(opts.floor);
+    let mut pending: Vec<Pending> = selected
         .into_iter()
-        .map(|p| assemble(forge, p, &states))
+        .map(|(kind, row)| read_text(forge, fleet, kind, row, &mut guard))
         .collect();
-    (out, None)
+    read_closing(forge, &mut pending, &mut guard);
+    let states = read_states(forge, &pending, &mut guard);
+    let items = pending
+        .into_iter()
+        .map(|p| assemble(forge, p, &states, &mut guard))
+        .collect();
+    cost.meter = forge.meter();
+    cost.budget_stopped = guard.stopped();
+    Gathering {
+        items,
+        enumerate_error: None,
+        cost,
+    }
 }
 
 /// Body (from the listing row) and comments (read only when there are any),
@@ -192,6 +273,7 @@ fn read_text(
     fleet: &FleetLogins,
     kind: Artifact,
     row: RestIssue,
+    guard: &mut Guard,
 ) -> Pending {
     let body = row.body.clone().unwrap_or_default();
     let mut p = Pending {
@@ -207,6 +289,10 @@ fn read_text(
     let comments = if p.row.comments == 0 {
         Vec::new()
     } else {
+        if let Err(why) = guard.core(&forge.meter()) {
+            p.failed = Some(why);
+            return p;
+        }
         match forge.comments(p.row.number) {
             Ok(c) => c,
             Err(e) => {
@@ -235,7 +321,7 @@ fn read_text(
 
 /// The closing PRs of every still-evaluable issue, [`CLOSING_BATCH`] per
 /// query, serially (loom#9191 secondary limits).
-fn read_closing(forge: &mut dyn StaleBlockedForge, pending: &mut [Pending]) {
+fn read_closing(forge: &mut dyn StaleBlockedForge, pending: &mut [Pending], guard: &mut Guard) {
     let issues: Vec<u32> = pending
         .iter()
         .filter(|p| p.kind == Artifact::Issue && p.failed.is_none())
@@ -244,7 +330,13 @@ fn read_closing(forge: &mut dyn StaleBlockedForge, pending: &mut [Pending]) {
     let mut answers: HashMap<u32, Vec<ClosingRef>> = HashMap::new();
     let mut batch_errors: HashMap<u32, String> = HashMap::new();
     for chunk in issues.chunks(CLOSING_BATCH) {
-        match forge.closing_refs_batch(chunk) {
+        // Re-checked between batches, from the previous batch's own
+        // `rateLimit.remaining`.
+        let answer = match guard.graphql(&forge.meter()) {
+            Ok(()) => forge.closing_refs_batch(chunk),
+            Err(why) => Err(anyhow!(why)),
+        };
+        match answer {
             Ok(map) => answers.extend(map),
             Err(e) => {
                 for n in chunk {
@@ -289,6 +381,7 @@ fn all_resolved(closing: &[ClosingRef]) -> bool {
 fn read_states(
     forge: &mut dyn StaleBlockedForge,
     pending: &[Pending],
+    guard: &mut Guard,
 ) -> HashMap<RefKey, Result<RefState, String>> {
     let mut keys: BTreeSet<RefKey> = BTreeSet::new();
     for p in pending.iter().filter(|p| p.failed.is_none()) {
@@ -305,6 +398,9 @@ fn read_states(
     }
     keys.into_iter()
         .map(|key| {
+            if let Err(why) = guard.core(&forge.meter()) {
+                return (key, Err(why));
+            }
             let state = match forge.ref_state(key.0.as_deref(), key.1) {
                 Ok(Some(s)) if !s.state.is_empty() => Ok(s),
                 Ok(Some(_)) => Err("the forge returned no state".to_string()),
@@ -321,10 +417,11 @@ fn assemble(
     forge: &mut dyn StaleBlockedForge,
     p: Pending,
     states: &HashMap<RefKey, Result<RefState, String>>,
+    guard: &mut Guard,
 ) -> Gathered {
     let evidence = match p.failed.clone() {
         Some(why) => Err(why),
-        None => evidence_for(forge, &p, states),
+        None => evidence_for(forge, &p, states, guard),
     };
     Gathered {
         kind: p.kind,
@@ -338,6 +435,7 @@ fn evidence_for(
     forge: &mut dyn StaleBlockedForge,
     p: &Pending,
     states: &HashMap<RefKey, Result<RefState, String>>,
+    guard: &mut Guard,
 ) -> Result<Evidence, String> {
     let lookup = |key: RefKey, what: String| -> Result<RefState, String> {
         match states.get(&key) {
@@ -402,6 +500,7 @@ fn evidence_for(
         self_block: None,
     };
     if p.kind == Artifact::Pr && matches!(classify(&evidence), Verdict::Stale(_)) {
+        guard.core(&forge.meter())?;
         evidence.self_block = self_block(forge, &p.row)?;
     }
     Ok(evidence)
@@ -445,6 +544,8 @@ pub struct GhStaleBlockedForge {
     /// `owner/name` for URLs: `repo`, else `root`'s remote, else `gh`'s
     /// `{owner}/{repo}` placeholder.
     slug: String,
+    /// What this run's evidence reads have spent.
+    meter: Meter,
 }
 
 impl GhStaleBlockedForge {
@@ -463,20 +564,23 @@ impl GhStaleBlockedForge {
             root: root.to_path_buf(),
             repo,
             slug,
+            meter: Meter::default(),
         }
     }
 
     /// A conditional GET through the shared ETag store. `repo` overrides the
     /// invoking repo (a cross-repo named dependency).
-    fn get(&self, op: ForgeOp, repo: Option<&str>, url: &str) -> Result<Option<String>> {
-        store::cached_get(
+    fn get(&mut self, op: ForgeOp, repo: Option<&str>, url: &str) -> Result<Option<String>> {
+        let read = store::cached_read(
             store::ConditionalRead::new(CALLER, op),
             &self.gh_bin,
             Some(&self.root),
             repo.or(self.repo.as_deref()),
             url,
             "stale-",
-        )
+        )?;
+        self.meter.rest(read.not_modified, read.core_remaining);
+        Ok(read.body)
     }
 }
 
@@ -552,17 +656,44 @@ impl StaleBlockedForge for GhStaleBlockedForge {
         .args(["api", "graphql", "-f", field.as_str()]);
         let out = match inv.execute() {
             Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
-            Ok(_) => return Err(anyhow!("gh api graphql timed out")),
+            Ok(_) => {
+                // It may still have been charged.
+                self.meter.graphql(None, None);
+                return Err(anyhow!("gh api graphql timed out"));
+            }
             Err(e) => return Err(anyhow!("gh api graphql could not run: {e:?}")),
         };
         // `gh` exits non-zero when the answer carries any `errors` entry, but
         // still prints the partial `data`: parse first, judge per alias.
         let stdout = String::from_utf8_lossy(&out.stdout);
+        let (cost, remaining) = parse_rate_limit(&stdout);
+        self.meter.graphql(cost, remaining);
         parse_closing_refs(&stdout, issues).ok_or_else(|| {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             crate::rate_limit_breaker::global_observe_failure(&stderr, CALLER);
             anyhow!("gh api graphql (closing PRs) failed: {stderr}")
         })
+    }
+
+    fn budget(&mut self) -> Option<Budget> {
+        let ctx = crate::rate_limit_breaker::report::FailureContext::for_root(
+            &self.root,
+            self.gh_bin.to_string_lossy().into_owned(),
+        );
+        crate::rate_limit_breaker::forge::probe_budget_ctx(&ctx, chrono::Utc::now()).map(|b| {
+            Budget {
+                core_remaining: b.core_remaining,
+                graphql_remaining: b.graphql_remaining,
+            }
+        })
+    }
+
+    fn breaker_open(&mut self) -> bool {
+        crate::rate_limit_breaker::global_skip_pass(CALLER)
+    }
+
+    fn meter(&self) -> Meter {
+        self.meter
     }
 }
 
@@ -593,7 +724,23 @@ pub fn closing_refs_query(owner: &str, name: &str, issues: &[u32]) -> String {
             )
         })
         .collect();
-    format!("query {{ repository(owner: \"{owner}\", name: \"{name}\") {{{fields} }} }}")
+    format!(
+        "query {{ rateLimit {{ cost remaining }} repository(owner: \"{owner}\", name: \
+         \"{name}\") {{{fields} }} }}"
+    )
+}
+
+/// The `rateLimit { cost remaining }` a [`closing_refs_query`] answer carries:
+/// `(cost, remaining)`, each `None` when absent (a refused or unparseable
+/// answer).
+#[must_use]
+pub fn parse_rate_limit(body: &str) -> (Option<u64>, Option<u64>) {
+    let json: serde_json::Value = match serde_json::from_str(body.trim()) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+    let r = &json["data"]["rateLimit"];
+    (r["cost"].as_u64(), r["remaining"].as_u64())
 }
 
 /// Parse a [`closing_refs_query`] answer. `None` when there is no

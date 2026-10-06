@@ -172,6 +172,23 @@ if [[ "${1:-}" == "api" ]]; then
     esac
   done
 
+  # The free budget probe (#10480): `api rate_limit` (body only) and the
+  # GraphQL `rateLimit` query (`-i`, head + body), both answered from
+  # `rate_limit.json` ({"core":N,"graphql":N}) and unhandled without it, so
+  # every case that does not set one sees a probe that did not answer.
+  RL="$D/rate_limit.json"
+  if [[ "$url" == "rate_limit" ]]; then
+    [[ -f "$RL" ]] || { echo "stub gh: no rate_limit fixture" >&2; exit 3; }
+    jq -c '{resources: {core: {limit: 5000, used: (5000 - .core), remaining: .core, reset: 4102444800}}}' "$RL"
+    exit 0
+  fi
+  if [[ "$url" == "graphql" && "$query" == *"rateLimit{limit"* ]]; then
+    [[ -f "$RL" ]] || { echo "stub gh: no rate_limit fixture" >&2; exit 3; }
+    http "200 OK" "$(jq -c '{data: {rateLimit: {limit: 5000, used: (5000 - .graphql),
+      remaining: .graphql, resetAt: "2100-01-01T00:00:00Z"}}}' "$RL")"
+    exit 0
+  fi
+
   if [[ "$url" == "graphql" ]]; then
     repo='{}'
     for n in $(grep -oE 'i[0-9]+: issue' <<<"$query" | tr -dc '0-9\n'); do
@@ -188,7 +205,10 @@ if [[ "${1:-}" == "api" ]]; then
       repo="$(jq -c --arg k "i$n" --argjson nodes "$nodes" \
         '. + {($k): {closedByPullRequestsReferences: {totalCount: ($nodes|length), nodes: $nodes}}}' <<<"$repo")"
     done
-    jq -c -n --argjson r "$repo" '{data: {repository: $r}}'
+    left="$(jq -r '.graphql // 4999' "$RL" 2>/dev/null)"
+    [[ "$left" =~ ^[0-9]+$ ]] || left=4999
+    jq -c -n --argjson r "$repo" --argjson left "$left" \
+      '{data: {rateLimit: {cost: 1, remaining: $left}, repository: $r}}'
     exit 0
   fi
 
@@ -551,6 +571,52 @@ issue_fixture 304 "Nothing cited." \
 run_check
 assert_contains "$LAST_STDERR" "UNDOCUMENTED BLOCK" \
     "T7g: a \`[bot]\`-suffixed fleet comment does not count as documentation"
+
+# --- Group 8: the budget floor and forge_cost (#10480) ----------------------
+echo "Group 8: budget floor"
+set_population '[{"number":178,"title":"Comment moderation"}]'
+set_pr_population '[]'
+issue_fixture 178 "Blocked by #7 (user authentication)."
+state_fixture issue 7 "CLOSED"
+printf '{"core":5000,"graphql":500}' >"$STUB_DIR/rate_limit.json"
+run_check --json
+CALLS="$(cat "$STUB_DIR/calls.log")"
+assert_eq "0" "$LAST_RC" "T8a: a run refused by the budget floor still exits 0"
+assert_eq "1" "$(jq -r '.unevaluated | length' <<<"$LAST_STDOUT")" \
+    "T8b: the refused artifact is reported not evaluated, never clear"
+assert_contains "$(jq -r '.unevaluated[0].reason' <<<"$LAST_STDOUT")" \
+    "budget floor: graphql remaining 500, projected 1, floor 1000" "T8c: the reason names the floor"
+assert_contains "$(jq -r '.forge_cost.budget_refused' <<<"$LAST_STDOUT")" "budget floor" \
+    "T8d: forge_cost.budget_refused records the refusal"
+assert_eq "0" "$(grep -c '^api graphql' <<<"$CALLS")" "T8e: no closing-reference query is sent"
+assert_eq "0" "$(grep -cE 'repos/owner/repo/issues/7( |$)' <<<"$CALLS")" "T8f: no blocker is read"
+
+run_check
+assert_contains "$LAST_STDERR" "NOT EVALUATED" "T8g: the human report lists the refused artifact"
+assert_contains "$LAST_STDERR" "forge cost: graphql 0 queries" "T8h: the stderr cost line is printed"
+
+run_check --json --min-graphql-remaining 0
+assert_eq "1" "$(jq -r '.stale | length' <<<"$LAST_STDOUT")" "T8i: a floor of 0 disables the check"
+assert_eq "1" "$(jq -r '.forge_cost.graphql_queries' <<<"$LAST_STDOUT")" "T8j: forge_cost counts the query"
+assert_eq "1" "$(jq -r '.forge_cost.graphql_points' <<<"$LAST_STDOUT")" \
+    "T8k: forge_cost takes the points from rateLimit.cost"
+assert_eq "500" "$(jq -r '.forge_cost.budget_before.graphql_remaining' <<<"$LAST_STDOUT")" \
+    "T8l: forge_cost records the probe's reading"
+assert_eq "1" "$(jq -r '.forge_cost.rest_requests' <<<"$LAST_STDOUT")" \
+    "T8m: forge_cost counts the REST blocker read"
+
+# Overwritten rather than removed: an empty fixture is unparseable, so both
+# probe legs fail exactly as with no fixture at all.
+: >"$STUB_DIR/rate_limit.json"
+run_check --json
+assert_eq "1" "$(jq -r '.stale | length' <<<"$LAST_STDOUT")" \
+    "T8n: a probe that does not answer never refuses the run"
+assert_eq "null" "$(jq -c '.forge_cost.budget_before' <<<"$LAST_STDOUT")" \
+    "T8o: an unanswered probe is reported as budget_before: null"
+
+HELP="$("$SCRIPT" --help 2>&1)"
+assert_contains "$HELP" "--min-graphql-remaining" "T8p: --help documents --min-graphql-remaining"
+assert_contains "$HELP" "--min-core-remaining" "T8q: --help documents --min-core-remaining"
 
 # --- summary ---------------------------------------------------------------
 echo ""
