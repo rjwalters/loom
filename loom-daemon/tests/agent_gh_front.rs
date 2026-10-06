@@ -329,3 +329,77 @@ fn gh_shim_path_links_gh_to_this_binary() {
     let bad = s.command(&bin, &["gh-shim"], &env).output().unwrap();
     assert_eq!(bad.status.code(), Some(2));
 }
+
+/// #10516: `gh-shim session-env` (the SessionStart hook) writes the front into
+/// `$CLAUDE_ENV_FILE` once — with the managed launcher ahead of it under a
+/// policy, as for a worker — prints nothing on stdout, always exits 0, and
+/// no-ops without an env file, under `LOOM_GH_SHIM=0`, or outside a workspace.
+#[test]
+fn gh_shim_session_env_puts_the_front_on_the_session_path_once() {
+    let s = Sandbox::new();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_loom-daemon"));
+    std::fs::create_dir_all(s.p("work/.loom")).unwrap();
+    std::fs::write(s.p("work/.loom/config.json"), "{}").unwrap();
+    let base = s.p("shim-base").display().to_string();
+    let work = s.p("work").display().to_string();
+    let run = |env_file: &Path, extra: &[(&str, &str)]| {
+        let file = env_file.display().to_string();
+        let mut env = vec![
+            ("LOOM_GH_SHIM_BASE", base.as_str()),
+            ("CLAUDE_ENV_FILE", file.as_str()),
+            ("LOOM_PROJECT_ROOT", work.as_str()),
+        ];
+        env.extend_from_slice(extra);
+        let mut cmd = s.command(&bin, &["gh-shim", "session-env"], &[]);
+        for k in ["LOOM_GH_SHIM", "LOOM_FORGE_EGRESS_POLICY", "LOOM_FORGE_EGRESS_MANAGED"] {
+            cmd.env_remove(k);
+        }
+        let out = cmd.envs(env).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        std::fs::read_to_string(env_file).unwrap_or_default()
+    };
+    let sourced_status = |env_file: &Path, extra: &[(&str, &str)]| {
+        let script = format!(". '{}'; '{}' gh-shim status", env_file.display(), bin.display());
+        let mut cmd = s.command(Path::new("sh"), &["-c", &script], &[]);
+        cmd.env("PATH", "/usr/bin:/bin")
+            .env_remove("LOOM_FORGE_EGRESS_POLICY")
+            .envs(extra.iter().copied());
+        stdout(&cmd.output().unwrap())
+    };
+
+    // No-ops.
+    assert_eq!(run(&s.p("a.sh"), &[("CLAUDE_ENV_FILE", "")]), "");
+    assert_eq!(run(&s.p("b.sh"), &[("LOOM_GH_SHIM", "0")]), "");
+    let home = s.p("home").display().to_string();
+    assert_eq!(run(&s.p("c.sh"), &[("LOOM_PROJECT_ROOT", home.as_str())]), "");
+    assert!(!s.p("a.sh").exists() && !s.p("b.sh").exists() && !s.p("c.sh").exists());
+
+    // Written once; sourcing it makes plain `gh` the front.
+    let front = run(&s.p("d.sh"), &[]);
+    assert_eq!(run(&s.p("d.sh"), &[]), front, "a second SessionStart must not append");
+    assert_eq!(front.lines().count(), 1, "{front}");
+    assert!(front.contains(&base), "{front}");
+    let status = sourced_status(&s.p("d.sh"), &[]);
+    assert!(status.starts_with("front: ") && status.contains(&base), "{status}");
+
+    // Under a policy the managed launcher comes first, exactly as for a worker.
+    let managed = s.p("managed/gh");
+    std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+    std::fs::write(&managed, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut policy: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/forge-egress/policy.example.json")).unwrap();
+    policy["toolchain"]["launcherPath"] = managed.display().to_string().into();
+    policy["enforcement"]["api"] = "observe".into();
+    let policy_file = s.p("policy.json");
+    std::fs::write(&policy_file, policy.to_string()).unwrap();
+    let policy_env = policy_file.display().to_string();
+    let with_policy = [("LOOM_FORGE_EGRESS_POLICY", policy_env.as_str())];
+    let line = run(&s.p("e.sh"), &with_policy);
+    let managed_dir = s.p("managed").display().to_string();
+    let (at_launcher, at_front) = (line.find(&managed_dir).unwrap(), line.find(&base).unwrap());
+    assert!(at_launcher < at_front, "{line}");
+    let status = sourced_status(&s.p("e.sh"), &with_policy);
+    assert_eq!(status.trim(), format!("launcher: {}", managed.display()), "{status}");
+}

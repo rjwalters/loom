@@ -61,7 +61,7 @@ fn search(name: &str, path: &[PathBuf], is_me: &dyn Fn(&Path) -> bool) -> Option
         .find(|c| is_executable(c) && !is_me(c))
 }
 
-fn is_executable(p: &Path) -> bool {
+pub(crate) fn is_executable(p: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(p) else {
         return false;
     };
