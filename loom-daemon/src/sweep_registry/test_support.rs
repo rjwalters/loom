@@ -2371,3 +2371,16 @@ pub(crate) fn write_local_cfg(dir: &Path, body: &str) {
     std::fs::create_dir_all(full.parent().unwrap()).unwrap();
     std::fs::write(full, body).unwrap();
 }
+
+/// A fake-`gh` arm answering the park adapter's `gh issue view N --json
+/// body,labels` (#10161) with an empty, unparked issue, so a daemon `loom:blocked`
+/// writer's body-record step has a body to read. Splice it before any broader
+/// `issue view` arm; the read-back probe uses `--json labels --jq`, which this
+/// arm does not match.
+pub(crate) fn fake_gh_park_view_arm() -> String {
+    "if [[ \"$1\" == \"issue\" && \"$2\" == \"view\" && \"$*\" == *body,labels* ]]; then\n\
+     printf '%s\\n' '{\"body\":\"\",\"labels\":[{\"name\":\"loom:issue\"}]}'\n\
+     exit 0\n\
+     fi\n"
+        .to_string()
+}

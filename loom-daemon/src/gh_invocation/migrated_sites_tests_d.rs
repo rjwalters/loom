@@ -92,6 +92,7 @@ fn every_mapped_claim_name_is_an_inventoried_op() {
         "quarantine.release",
         "restore.label",
         "prless.hold_label",
+        "park.body",
         "guard.lease_comment",
         "guard.lease_yield_comment",
         "quarantine.comment",

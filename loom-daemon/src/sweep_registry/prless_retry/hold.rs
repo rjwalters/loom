@@ -368,33 +368,31 @@ impl SweepRegistry {
         issue: u32,
         remove_loom_issue: bool,
     ) -> Result<(), HoldEditFailure> {
-        let issue_arg = issue.to_string();
-        let mut edit = vec!["issue", "edit", &issue_arg, "--add-label", "loom:blocked"];
-        if remove_loom_issue {
-            edit.extend(["--remove-label", "loom:issue"]);
-        }
-        let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();
-        edit.extend(repo_flag.iter().map(String::as_str));
-        // Counted as `prless.hold_label` (#10089), scoped to the workspace
-        // (#5401). Bounded (Issue #3973): this runs from `reap_once`, which is
-        // on the `ListSweeps` / `GetSweepStatus` read path.
-        let timeout = reap_gh_timeout();
-        match self.gh_write("prless.hold_label", edit) {
-            Ok(Some(out)) if out.status.success() => Ok(()),
-            Ok(Some(out)) => Err(HoldEditFailure::Rejected(format!(
-                "`gh issue edit` exited {}: {}",
-                out.status
-                    .code()
-                    .map_or_else(|| "on a signal".to_string(), |c| c.to_string()),
-                truncate_gh_stderr(&out.stderr)
-            ))),
-            Ok(None) => Err(HoldEditFailure::TimedOut(format!(
-                "`gh issue edit` exceeded {}s and was killed (#3973)",
-                timeout.as_secs()
-            ))),
-            Err(e) => {
-                Err(HoldEditFailure::Rejected(format!("`gh issue edit` could not be run: {e}")))
-            }
+        // Body park record BEFORE `loom:blocked` (#10161), through the bounded
+        // `ParkForge` adapter: counted as `prless.hold_label` (#10089), scoped
+        // to the workspace (#5401), and bounded per call (#3973) — this runs
+        // from `reap_once`, on the `ListSweeps` / `GetSweepStatus` read path.
+        // A failed body write stops before the label (no label-only park).
+        let mut forge = crate::sweep_registry::park_forge::BoundedParkForge::new(
+            self,
+            "prless.hold_label",
+            remove_loom_issue.then_some("loom:issue"),
+        );
+        match crate::sweep_registry::park_forge::prless_hold_park_via(
+            &mut forge,
+            issue,
+            remove_loom_issue,
+        ) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(match forge.failure() {
+                Some(crate::sweep_registry::park_forge::ParkWriteFailure::TimedOut(d)) => {
+                    HoldEditFailure::TimedOut(d.clone())
+                }
+                Some(crate::sweep_registry::park_forge::ParkWriteFailure::Rejected(d)) => {
+                    HoldEditFailure::Rejected(truncate_gh_stderr(d.as_bytes()))
+                }
+                None => HoldEditFailure::Rejected(e),
+            }),
         }
     }
 
@@ -464,6 +462,7 @@ mod tests {
         let script = format!(
             "#!/usr/bin/env bash\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             {park_view}\
              {timeline}\
              {gql}\
              if [[ \"$1\" == \"api\" && \"$2\" == repos/* ]]; then\n\
@@ -476,6 +475,7 @@ mod tests {
              fi\n\
              exit 0\n",
             log = gh_log.display(),
+            park_view = crate::sweep_registry::test_support::fake_gh_park_view_arm(),
             timeline = fake_gh_timeline_rest_arm(timeline_pr, 0),
             gql = fake_gh_graphql_arm(graphql_prs, 0),
             state = state_probe_json(issue_state, false),
@@ -517,6 +517,7 @@ mod tests {
         let script = format!(
             "#!/usr/bin/env bash\n\
              printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             {park_view}\
              if [[ \"$1\" == \"issue\" && \"$2\" == \"edit\" ]]; then\n\
              if [[ \"$*\" == *\"--remove-label\"* ]]; then\n\
              if [[ {combined} -ne 0 ]]; then\n\
@@ -548,6 +549,7 @@ mod tests {
             combined = combined_exit,
             add_only = add_only_exit,
             blocked = blocked_probe,
+            park_view = crate::sweep_registry::test_support::fake_gh_park_view_arm(),
             timeline = fake_gh_timeline_rest_arm("", 0),
             gql = fake_gh_graphql_arm("", 0),
             state = state_probe_json("open", false),
@@ -607,7 +609,17 @@ mod tests {
         hold_at_threshold(&mut reg, 7893, 2, "builder crashed without opening a PR");
 
         assert!(reg.prless_retry_held(7893), "the threshold must hold the issue");
-        let edits = gh_calls_starting_with(&gh_log, "issue edit ");
+        let all_edits = gh_calls_starting_with(&gh_log, "issue edit ");
+        // #10161: the body park record lands BEFORE the label flip.
+        assert!(
+            all_edits[0].contains("--body") && all_edits[0].contains("reason=\"pr-less hold\""),
+            "first edit must be the body park record, got: {all_edits:?}"
+        );
+        assert!(all_edits[0].contains("by=daemon"), "{all_edits:?}");
+        let edits: Vec<String> = all_edits
+            .into_iter()
+            .filter(|e| e.contains("--add-label"))
+            .collect();
         assert_eq!(edits.len(), 1, "exactly one label flip at the threshold, got: {edits:?}");
         assert_eq!(
             edits[0], "issue edit 7893 --add-label loom:blocked --remove-label loom:issue",
@@ -853,7 +865,10 @@ mod tests {
             reg.prless_retry_held(7893),
             "the add-only fallback applied `loom:blocked`, so the issue IS held"
         );
-        let edits = gh_calls_starting_with(&gh_log, "issue edit ");
+        let edits: Vec<String> = gh_calls_starting_with(&gh_log, "issue edit ")
+            .into_iter()
+            .filter(|e| e.contains("--add-label"))
+            .collect();
         assert_eq!(edits.len(), 2, "combined flip then add-only retry, got: {edits:?}");
         assert_eq!(
             edits[1], "issue edit 7893 --add-label loom:blocked",
