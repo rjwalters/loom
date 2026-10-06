@@ -152,6 +152,7 @@ pub mod stall_features;
 pub mod star;
 pub mod tracker;
 pub mod twin_otter;
+pub mod walk_forward;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

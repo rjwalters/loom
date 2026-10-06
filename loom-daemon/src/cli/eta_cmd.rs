@@ -32,6 +32,7 @@ use loom_daemon::eta::history::StageSamples;
 use loom_daemon::eta::journal::{self, censored_from_pr_history, entries_from_pr_history};
 use loom_daemon::eta::labels as eta_labels;
 use loom_daemon::eta::shadow;
+use loom_daemon::eta::walk_forward::DatedFits;
 use loom_daemon::eta::{
     AgeSource, CurrentStage, CurrentState, EstimateInput, Kind, NoEstimateReason, Provenance,
     Registry, Stage, Subject,
@@ -188,7 +189,12 @@ impl EtaPromoteArgs {
         let mut cases = backtest::cases_from_envelopes(&envelopes);
         cases.extend(backtest::cases_from_journal(&journal_entries));
         let loom = Provenance::current();
-        super::eta_replay_cmd::with_replay_calibration(&registry, &mut history, &cases, &loom);
+        super::eta_replay_cmd::with_replay_calibration(
+            &DatedFits::new(Vec::new()),
+            &mut history,
+            &cases,
+            &loom,
+        );
         let comparison =
             backtest::compare(current, candidate, &history, &cases, filter, &loom).ok();
 
@@ -390,6 +396,14 @@ pub(crate) struct EtaBacktestArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Directory of `eta-fit/v1` coefficient files (`eta fit --out`, or a
+    /// copy of `.loom/state/eta/fit/`) to replay fitted heuristics with
+    /// (#10524). Each case is estimated with the newest file whose cutoff is
+    /// strictly before its `as_of`, as live serving would; without it every
+    /// fitted heuristic refuses `no_model`.
+    #[arg(long, value_name = "PATH")]
+    pub fit_dir: Option<PathBuf>,
+
     /// Opt-in `land` cases from merged PRs' label timelines (#9579).
     #[command(flatten)]
     pub pr_cases: PrCaseArgs,
@@ -402,8 +416,28 @@ impl EtaBacktestArgs {
             .clone()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
-        let registry = Registry::builtin();
-        let Some(heuristic) = registry.get(&self.heuristic) else {
+        let fits = match &self.fit_dir {
+            Some(dir) => {
+                let fits = DatedFits::load_dir(dir)
+                    .map_err(|e| anyhow::anyhow!("--fit-dir {}: {e}", dir.display()))?;
+                if fits.is_empty() {
+                    bail!("--fit-dir {}: no readable eta-fit/v1 file", dir.display());
+                }
+                eprintln!(
+                    "[eta backtest] walk-forward over {} coefficient file(s), cutoffs {}",
+                    fits.len(),
+                    fits.cutoffs()
+                        .iter()
+                        .map(|c| c.to_rfc3339())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                fits
+            }
+            None => DatedFits::new(Vec::new()),
+        };
+        let registry = fits.registry();
+        let Some(heuristic) = fits.heuristic(&self.heuristic) else {
             bail!(
                 "unknown heuristic id {:?} (known: {})",
                 self.heuristic,
@@ -428,13 +462,14 @@ impl EtaBacktestArgs {
             eprintln!("{note}");
         }
         let loom = Provenance::current();
-        super::eta_replay_cmd::with_replay_calibration(&registry, &mut history, &cases, &loom);
+        super::eta_replay_cmd::with_replay_calibration(&fits, &mut history, &cases, &loom);
 
         if let Some(other_id) = &self.compare {
-            let Some(other) = registry.get(other_id) else {
+            let Some(other) = fits.heuristic(other_id) else {
                 bail!("unknown heuristic id {:?} (known: {})", other_id, registry.ids().join(", "));
             };
-            let comparison = backtest::compare(heuristic, other, &history, &cases, filter, &loom)?;
+            let comparison =
+                backtest::compare(&heuristic, &other, &history, &cases, filter, &loom)?;
             if self.json {
                 println!("{}", serde_json::to_string_pretty(&comparison)?);
             } else {
@@ -443,7 +478,7 @@ impl EtaBacktestArgs {
             return Ok(());
         }
 
-        let report = backtest::run(heuristic, &history, &cases, filter, &loom);
+        let report = backtest::run(&heuristic, &history, &cases, filter, &loom);
         if self.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
