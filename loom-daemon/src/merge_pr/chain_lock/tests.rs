@@ -244,10 +244,32 @@ fn a_head_move_voids_the_lock() {
 }
 
 #[test]
-fn reported_checks_release_the_lock() {
+fn a_failed_required_check_releases_the_lock() {
     let lock = observed(1200, "2026-10-05T12:00:00Z");
     let got = evaluate(&lock, &holder(9), 1200, at("2026-10-05T12:01:00Z"), || Ok(true)).unwrap();
-    assert_eq!(got, Liveness::Expired(Expiry::ChecksReported));
+    assert_eq!(got, Liveness::Expired(Expiry::ChecksFailed));
+}
+
+#[test]
+fn green_checks_keep_a_follower_held_until_the_head_lands_or_the_cap_ends_it() {
+    // #10448: every required check is green (none failed), yet the lock holds.
+    let lock = observed(1200, "2026-10-05T12:00:00Z");
+    let held = |now: &str, h: &Holder| evaluate(&lock, h, 1200, at(now), pending).unwrap();
+    let live = Liveness::Live {
+        expires_at: at("2026-10-05T12:20:00Z"),
+    };
+    assert_eq!(held("2026-10-05T12:01:00Z", &holder(9)), live);
+    assert_eq!(held("2026-10-05T12:19:59Z", &holder(9)), live, "still held just before the cap");
+    // The head merging closes it: released.
+    let mut merged = holder(9);
+    merged.open = false;
+    assert_eq!(held("2026-10-05T12:10:00Z", &merged), Liveness::Expired(Expiry::Closed));
+    // A moved head releases early.
+    let mut moved = holder(9);
+    moved.head_sha = OTHER.into();
+    assert_eq!(held("2026-10-05T12:10:00Z", &moved), Liveness::Expired(Expiry::HeadMoved));
+    // The cap releases a head that never lands.
+    assert_eq!(held("2026-10-05T12:20:00Z", &holder(9)), Liveness::Expired(Expiry::Cap));
 }
 
 #[test]
@@ -291,24 +313,46 @@ fn checks_are_read_only_for_an_otherwise_live_lock_and_a_failed_read_is_unreadab
     assert_eq!(err, Err("rate limited".to_string()));
 }
 
+fn run_with(name: &str, status: &str, conclusion: Option<&str>, started: &str) -> CheckRun {
+    CheckRun {
+        conclusion: conclusion.map(Into::into),
+        ..run(name, status, started)
+    }
+}
+
 #[test]
-fn checks_reported_judges_each_required_context_by_its_latest_run() {
+fn checks_failed_is_red_only_for_a_completed_non_success_latest_run() {
     let req = vec!["build".to_string(), "test".to_string()];
-    let all = [
+    let green = [
         run("build", "completed", "2026-10-05T12:00:00Z"),
         run("test", "completed", "2026-10-05T12:00:00Z"),
     ];
-    assert!(checks_reported(&req, &all));
+    assert!(!checks_failed(&req, &green), "all green is not red");
+    let red = [
+        green[0].clone(),
+        run_with("test", "completed", Some("failure"), "2026-10-05T12:00:00Z"),
+    ];
+    assert!(checks_failed(&req, &red));
     let rerun = [
-        run("build", "completed", "2026-10-05T12:00:00Z"),
-        run("test", "completed", "2026-10-05T11:00:00Z"),
+        run_with("test", "completed", Some("failure"), "2026-10-05T11:00:00Z"),
         run("test", "in_progress", "2026-10-05T12:00:00Z"),
     ];
-    assert!(!checks_reported(&req, &rerun), "the latest run of `test` is still running");
-    assert!(!checks_reported(&req, &all[..1]), "a missing required context has not reported");
-    assert!(!checks_reported(&[], &[]), "no runs yet has not reported");
-    assert!(checks_reported(&[], &all));
-    assert!(!checks_reported(&[], &rerun));
+    assert!(!checks_failed(&req, &rerun), "the latest run of `test` is still running");
+    assert!(!checks_failed(&req, &green[..1]), "a missing context has not failed");
+    assert!(!checks_failed(&[], &[]), "no runs yet has not failed");
+    assert!(checks_failed(&[], &red));
+    for c in ["neutral", "skipped"] {
+        assert!(!checks_failed(
+            &[],
+            &[run_with("x", "completed", Some(c), "2026-10-05T12:00:00Z")]
+        ));
+    }
+    for c in ["cancelled", "timed_out", "action_required"] {
+        assert!(checks_failed(
+            &[],
+            &[run_with("x", "completed", Some(c), "2026-10-05T12:00:00Z")]
+        ));
+    }
 }
 
 // --- guard decision -----------------------------------------------------------
@@ -367,15 +411,31 @@ fn the_first_unreadable_read_is_recorded_once_and_cleared_by_a_good_read() {
     let path = unreadable_state_path(dir.path(), "release/1.x");
     assert!(path.ends_with("unreadable-release_1.x.json"), "{}", path.display());
     let first = at("2026-10-05T12:00:00Z");
-    assert_eq!(note_unreadable(&path, first), Some(first));
+    assert_eq!(note_unreadable(&path, first, 1200), Some(first));
     assert_eq!(
-        note_unreadable(&path, at("2026-10-05T12:15:00Z")),
+        note_unreadable(&path, at("2026-10-05T12:15:00Z"), 1200),
         Some(first),
         "kept, not reset"
     );
     clear_unreadable(&path);
     let later = at("2026-10-05T13:00:00Z");
-    assert_eq!(note_unreadable(&path, later), Some(later));
+    assert_eq!(note_unreadable(&path, later, 1200), Some(later));
+}
+
+#[test]
+fn a_record_older_than_twice_the_cap_counts_as_a_fresh_first_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = unreadable_state_path(dir.path(), "main");
+    let first = at("2026-10-05T12:00:00Z");
+    assert_eq!(note_unreadable(&path, first, 1200), Some(first));
+    // 2x cap is 2400 s: just inside, the record still stands.
+    let inside = at("2026-10-05T12:39:59Z");
+    assert_eq!(note_unreadable(&path, inside, 1200), Some(first));
+    // At 2x the cap it is a leftover: the failure is fresh, so it defers.
+    let later = at("2026-10-05T13:00:00Z");
+    let got = note_unreadable(&path, later, 1200).unwrap();
+    assert_eq!(got, later);
+    assert!(matches!(decide_unreadable(got, 1200, later), Unreadable::Defer { .. }));
 }
 
 #[test]
@@ -384,21 +444,32 @@ fn an_unwritable_record_reports_none() {
     let blocker = dir.path().join(".loom");
     std::fs::write(&blocker, "a file, not a directory").unwrap();
     let path = unreadable_state_path(dir.path(), "main");
-    assert_eq!(note_unreadable(&path, at("2026-10-05T12:00:00Z")), None);
+    assert_eq!(note_unreadable(&path, at("2026-10-05T12:00:00Z"), 1200), None);
 }
 
 // --- forge I/O against a stub `gh` --------------------------------------------
 
-/// A stub `gh` answering the pulls listing and each PR's comments from files
-/// in `dir`, logging argv to `dir/argv.log`. A missing file is a failed read.
+/// A stub `gh`, logging argv to `dir/argv.log`. The repo-wide comment listing
+/// (`api --include repos/o/r/issues/comments?…`) answers from
+/// `dir/comments.json` with an ETag, or a 304 when `If-None-Match` carries it;
+/// `pulls/N` answers from `dir/pull-N.json`. A missing file is a failed read.
 fn stub_gh(dir: &Path) -> String {
     let path = dir.join("gh");
     let script = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "{d}/argv.log"
+if [ "$2" = "--include" ]; then
+  [ -f "{d}/comments.json" ] || exit 1
+  if [[ "$*" == *'If-None-Match: "tag1"'* ]]; then
+    printf 'HTTP/2.0 304 Not Modified\netag: "tag1"\n\n'
+  else
+    printf 'HTTP/2.0 200 OK\netag: "tag1"\n\n'
+    cat "{d}/comments.json"
+  fi
+  exit 0
+fi
 case "$2" in
-  repos/o/r/pulls\?*) f="{d}/pulls.json" ;;
-  repos/o/r/issues/*/comments\?*) n="${{2#repos/o/r/issues/}}"; f="{d}/comments-${{n%%/*}}.json" ;;
+  repos/o/r/pulls/*) n="${{2#repos/o/r/pulls/}}"; f="{d}/pull-${{n%%/*}}.json" ;;
   repos/o/r/commits/*/check-runs*) f="{d}/runs.json" ;;
   repos/o/r/rules/branches/*) exit 0 ;;
   graphql) exit 0 ;;
@@ -424,9 +495,17 @@ fn pull(number: u32, base: &str) -> Value {
     })
 }
 
+/// A lock comment on PR `n`, as the repo-wide listing returns it.
+fn lock_on(n: u32, created: &str) -> Value {
+    let mut c = comment(&lock_comment_body(&marker(1200)), created, "MEMBER");
+    c["issue_url"] = json!(format!("https://api.github.com/repos/o/r/issues/{n}"));
+    c
+}
+
 fn guard_with(dir: &Path, pr: u32, base: &str, now: &str) -> Result<Guard, String> {
     let gh = stub_gh(dir);
     let policy = policy();
+    let cache = dir.join("etag-cache");
     read_guard(&GuardInputs {
         gh: &gh,
         root: dir,
@@ -436,37 +515,37 @@ fn guard_with(dir: &Path, pr: u32, base: &str, now: &str) -> Result<Guard, Strin
         cap_secs: 1200,
         now: at(now),
         policy: &policy,
+        cache_dir: Some(&cache),
     })
 }
 
-fn seed(dir: &Path, pulls: &[Value], holder_comments: &[Value]) {
-    std::fs::write(dir.join("pulls.json"), Value::Array(pulls.to_vec()).to_string()).unwrap();
-    std::fs::write(dir.join("comments-9.json"), Value::Array(holder_comments.to_vec()).to_string())
-        .unwrap();
-    std::fs::write(dir.join("comments-7.json"), "[]").unwrap();
+fn seed(dir: &Path, pulls: &[Value], comments: &[Value]) {
+    std::fs::write(dir.join("comments.json"), Value::Array(comments.to_vec()).to_string()).unwrap();
+    for p in pulls {
+        std::fs::write(dir.join(format!("pull-{}.json", p["number"])), p.to_string()).unwrap();
+    }
     let runs = json!({"total_count": 1, "check_runs": [
         {"name": "build", "status": "in_progress", "conclusion": null, "started_at": "2026-10-05T12:00:40Z"}
     ]});
     std::fs::write(dir.join("runs.json"), runs.to_string()).unwrap();
 }
 
+fn argv_log(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join("argv.log")).unwrap_or_default()
+}
+
 #[test]
-fn read_guard_holds_another_pr_behind_a_live_lock_and_reads_nothing_it_does_not_need() {
+fn read_guard_holds_another_pr_behind_a_live_lock() {
     let dir = tempfile::tempdir().unwrap();
-    let lock = comment(&lock_comment_body(&marker(1200)), "2026-10-05T12:00:20Z", "MEMBER");
-    seed(dir.path(), &[pull(9, "main"), pull(7, "main")], &[lock]);
+    seed(dir.path(), &[pull(9, "main")], &[lock_on(9, "2026-10-05T12:00:20Z")]);
     let got = guard_with(dir.path(), 7, "main", "2026-10-05T12:05:00Z").unwrap();
     let Guard::Held(l) = got else {
         panic!("expected a hold, got {got:?}")
     };
     assert_eq!(l.holder, 9);
     assert_eq!(l.expires_at, at("2026-10-05T12:20:20Z"));
-    let argv = std::fs::read_to_string(dir.path().join("argv.log")).unwrap();
-    assert!(argv.contains("pulls?state=open&base=main"), "{argv}");
-    assert!(
-        argv.contains("since=2026-10-05T11%3A45%3A00Z"),
-        "comments read from the window: {argv}"
-    );
+    let argv = argv_log(dir.path());
+    assert!(argv.contains("issues/comments?since=2026-10-05T11%3A45%3A00Z"), "{argv}");
     assert!(
         !argv.contains("-X") && !argv.contains("POST"),
         "the guard writes nothing: {argv}"
@@ -474,46 +553,104 @@ fn read_guard_holds_another_pr_behind_a_live_lock_and_reads_nothing_it_does_not_
 }
 
 #[test]
+fn read_guard_keeps_holding_after_the_heads_checks_are_all_green() {
+    // #10448: the head's required check completed green; the follower is still held.
+    let dir = tempfile::tempdir().unwrap();
+    seed(dir.path(), &[pull(9, "main")], &[lock_on(9, "2026-10-05T12:00:20Z")]);
+    let runs = json!({"total_count": 1, "check_runs": [
+        {"name": "build", "status": "completed", "conclusion": "success", "started_at": "2026-10-05T12:00:40Z"}
+    ]});
+    std::fs::write(dir.path().join("runs.json"), runs.to_string()).unwrap();
+    let got = guard_with(dir.path(), 7, "main", "2026-10-05T12:10:00Z").unwrap();
+    assert!(matches!(got, Guard::Held(ref l) if l.holder == 9), "{got:?}");
+    // A red check releases it.
+    let runs = json!({"total_count": 1, "check_runs": [
+        {"name": "build", "status": "completed", "conclusion": "failure", "started_at": "2026-10-05T12:00:40Z"}
+    ]});
+    std::fs::write(dir.path().join("runs.json"), runs.to_string()).unwrap();
+    assert_eq!(guard_with(dir.path(), 7, "main", "2026-10-05T12:10:00Z").unwrap(), Guard::Clear);
+    // A head that merged (closed) releases it.
+    let mut closed = pull(9, "main");
+    closed["state"] = json!("closed");
+    seed(dir.path(), &[closed], &[lock_on(9, "2026-10-05T12:00:20Z")]);
+    assert_eq!(guard_with(dir.path(), 7, "main", "2026-10-05T12:10:00Z").unwrap(), Guard::Clear);
+}
+
+#[test]
+fn a_lock_check_with_no_lock_is_one_billable_call_and_an_unchanged_recheck_is_a_304() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = dir.path().join("sink");
+    std::fs::create_dir(&sink).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sink, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    // Many open PRs and unrelated comments, but no lock marker anywhere.
+    let chatter = comment("just a review note", "2026-10-05T12:00:20Z", "MEMBER");
+    seed(dir.path(), &[pull(7, "main")], &[chatter]);
+    crate::forge_call_stats::set_test_sink_dir(Some(sink));
+    let first = guard_with(dir.path(), 7, "main", "2026-10-05T12:05:00Z");
+    let second = guard_with(dir.path(), 7, "main", "2026-10-05T12:05:30Z");
+    let report = crate::forge_call_stats::status_report(Utc::now(), None);
+    crate::forge_call_stats::set_test_sink_dir(None);
+    assert_eq!(first.unwrap(), Guard::Clear);
+    assert_eq!(second.unwrap(), Guard::Clear);
+    let rows = report.host_window.expect("sink enabled on this thread");
+    let row = rows
+        .iter()
+        .find(|r| r.caller == "chain_lock.comments")
+        .unwrap();
+    assert_eq!((row.ok, row.not_modified), (1, 1), "one billable call, then a free 304");
+    let own = report.own_window.unwrap();
+    let core: u64 = own
+        .iter()
+        .filter(|r| r.pool == "core")
+        .map(|r| r.consumed)
+        .sum();
+    assert_eq!(core, 1, "the whole check costs one billable call");
+    let argv = argv_log(dir.path());
+    assert!(
+        !argv.contains("pulls/") && !argv.contains("check-runs"),
+        "nothing else read: {argv}"
+    );
+    assert!(argv.contains("If-None-Match"), "the re-check is conditional: {argv}");
+}
+
+#[test]
 fn read_guard_does_not_hold_the_chain_head_itself() {
     let dir = tempfile::tempdir().unwrap();
-    let lock = comment(&lock_comment_body(&marker(1200)), "2026-10-05T12:00:20Z", "MEMBER");
-    seed(dir.path(), &[pull(9, "main")], &[lock]);
+    seed(dir.path(), &[pull(9, "main")], &[lock_on(9, "2026-10-05T12:00:20Z")]);
     assert_eq!(guard_with(dir.path(), 9, "main", "2026-10-05T12:05:00Z").unwrap(), Guard::Clear);
 }
 
 #[test]
-fn read_guard_clears_past_the_cap_and_skips_stale_prs_entirely() {
+fn read_guard_clears_past_the_cap_without_reading_the_holder() {
     let dir = tempfile::tempdir().unwrap();
-    let lock = comment(&lock_comment_body(&marker(1200)), "2026-10-05T12:00:20Z", "MEMBER");
-    seed(dir.path(), &[pull(9, "main")], &[lock]);
+    seed(dir.path(), &[pull(9, "main")], &[lock_on(9, "2026-10-05T12:00:20Z")]);
     assert_eq!(guard_with(dir.path(), 7, "main", "2026-10-05T12:30:00Z").unwrap(), Guard::Clear);
-    let argv = std::fs::read_to_string(dir.path().join("argv.log")).unwrap();
-    assert!(
-        !argv.contains("issues/9/comments"),
-        "a PR not updated inside the window is not read: {argv}"
-    );
+    let argv = argv_log(dir.path());
+    assert!(!argv.contains("pulls/9"), "an expired lock's holder is not read: {argv}");
 }
 
 #[test]
 fn read_guard_ignores_a_lock_on_another_base() {
     let dir = tempfile::tempdir().unwrap();
-    let lock = comment(&lock_comment_body(&marker(1200)), "2026-10-05T12:00:20Z", "MEMBER");
-    // The listing for base `release` returns only PRs on `release`; a lock
-    // recorded for `main` on such a PR is not this base's lock.
-    seed(dir.path(), &[pull(9, "release")], &[lock]);
+    // The marker is for `main`; a merge onto `release` is not held by it.
+    seed(dir.path(), &[pull(9, "main")], &[lock_on(9, "2026-10-05T12:00:20Z")]);
     assert_eq!(
         guard_with(dir.path(), 7, "release", "2026-10-05T12:05:00Z").unwrap(),
         Guard::Clear
     );
+    assert!(!argv_log(dir.path()).contains("pulls/9"));
 }
 
 #[test]
 fn read_guard_reports_a_failed_read_as_unreadable() {
     let dir = tempfile::tempdir().unwrap();
-    seed(dir.path(), &[pull(9, "main")], &[]);
-    std::fs::remove_file(dir.path().join("comments-9.json")).unwrap();
+    seed(dir.path(), &[pull(9, "main")], &[lock_on(9, "2026-10-05T12:00:20Z")]);
+    std::fs::remove_file(dir.path().join("pull-9.json")).unwrap();
     assert!(guard_with(dir.path(), 7, "main", "2026-10-05T12:05:00Z").is_err());
-    std::fs::remove_file(dir.path().join("pulls.json")).unwrap();
+    std::fs::remove_file(dir.path().join("comments.json")).unwrap();
     assert!(guard_with(dir.path(), 7, "main", "2026-10-05T12:05:00Z").is_err());
 }
 

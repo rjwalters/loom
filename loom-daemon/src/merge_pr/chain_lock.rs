@@ -38,7 +38,11 @@
 //!   The embedded `acquired=` is informational only: a forged or skewed
 //!   timestamp cannot extend a lock, and the effective cap is the smaller of
 //!   the marker's and the reader's, both clamped to [`MAX_CAP_SECS`];
-//! - the holder's required checks have not all reported.
+//! - no required check on the holder's head has failed. Green checks do NOT
+//!   release the lock (#10448): every held PR would become clear at once and
+//!   race the head, and an unrelated winner would stale the head again. The
+//!   lock holds until the head lands (it closes), the cap ends it, or a
+//!   required check goes red (the head will not land as it stands).
 //!
 //! # Bounded by construction
 //!
@@ -55,7 +59,17 @@
 //! exists for. It defers, and records the first unreadable read locally
 //! (`.loom/state/chain-lock/`, ignored); once a whole cap has passed since
 //! then, no lock acquired before the outage can still be live, so it fails
-//! open. A successful read clears the record.
+//! open. A successful read clears the record, and a record older than twice
+//! the cap is a leftover from a past outage: it counts as a fresh first
+//! failure (#10448) rather than letting the next failed read proceed at once.
+//!
+//! # API cost
+//!
+//! One repo-wide, ETag'd `GET issues/comments?since=<window start>` finds
+//! every lock marker (the window start is quantised so an unchanged re-check
+//! is a free 304). Only a PR with a marker on this base that the cap has not
+//! already expired costs a further `GET pulls/N`, so a check with no lock
+//! present is one billable call, or none on a 304 (#10448).
 
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use serde_json::Value;
@@ -159,8 +173,8 @@ pub fn lock_comment_body(m: &LockMarker) -> String {
     let short = &m.head[..m.head.len().min(7)];
     format!(
         "{}\n**Chain-head merge lock (#10167)**: this PR was just re-dated at `{short}`. Other \
-PRs targeting `{}` defer their merge (`merge-pr.sh` exit 6) until its required checks report, its \
-head moves, it lands or closes, or {} s pass, whichever is first.",
+PRs targeting `{}` defer their merge (`merge-pr.sh` exit 6) until it lands or closes, its head \
+moves, a required check fails, or {} s pass, whichever is first.",
         marker_text(m),
         m.base,
         m.cap_secs
@@ -256,8 +270,8 @@ pub enum Expiry {
     Cap,
     /// The holder's head moved (a push voids the lock).
     HeadMoved,
-    /// Every required check on the holder's head has reported.
-    ChecksReported,
+    /// A required check on the holder's head failed: it will not land as is.
+    ChecksFailed,
     /// The holder landed or closed.
     Closed,
     /// The holder no longer targets the marker's base.
@@ -283,14 +297,14 @@ pub fn cap_expiry(lock: &ObservedLock, reader_cap: u64) -> DateTime<Utc> {
 }
 
 /// Evaluate one lock. The cheap, already-fetched conditions are checked
-/// first; `checks_reported` (a forge read) runs only for a lock that would
+/// first; `checks_failed` (a forge read) runs only for a lock that would
 /// otherwise be live, and its error is the caller's "unreadable".
 pub fn evaluate(
     lock: &ObservedLock,
     holder: &Holder,
     reader_cap: u64,
     now: DateTime<Utc>,
-    checks_reported: impl FnOnce() -> Result<bool, String>,
+    checks_failed: impl FnOnce() -> Result<bool, String>,
 ) -> Result<Liveness, String> {
     if !holder.open {
         return Ok(Liveness::Expired(Expiry::Closed));
@@ -308,30 +322,35 @@ pub fn evaluate(
     if now >= expires_at {
         return Ok(Liveness::Expired(Expiry::Cap));
     }
-    if checks_reported()? {
-        return Ok(Liveness::Expired(Expiry::ChecksReported));
+    if checks_failed()? {
+        return Ok(Liveness::Expired(Expiry::ChecksFailed));
     }
     Ok(Liveness::Live { expires_at })
 }
 
-/// Have the head's required checks all reported (completed, any conclusion)?
+/// Has a required check on the head failed (#10448)?
 ///
 /// Each required context is judged by its latest run, as branch protection
-/// does. A context with no run has not reported. With no required contexts
-/// at all, every check run on the head stands in, and a head with no runs
-/// yet has not reported. A required context that is a commit status rather
-/// than a check run never reports here; the cap still ends that lock.
+/// does. A run that is missing, queued or in progress has not failed, and a
+/// completed run that succeeded (or was neutral/skipped) has not either: only
+/// a completed run with any other conclusion is red. With no required
+/// contexts at all, every check run on the head stands in. A required context
+/// that is a commit status rather than a check run never goes red here; the
+/// cap still ends that lock.
 #[must_use]
-pub fn checks_reported(required: &[String], runs: &[CheckRun]) -> bool {
-    let done = |r: &CheckRun| r.status == "completed";
+pub fn checks_failed(required: &[String], runs: &[CheckRun]) -> bool {
+    let red = |r: &CheckRun| {
+        r.status == "completed"
+            && !matches!(r.conclusion.as_deref(), Some("success" | "neutral" | "skipped"))
+    };
     if required.is_empty() {
-        return !runs.is_empty() && runs.iter().all(done);
+        return runs.iter().any(red);
     }
-    required.iter().all(|ctx| {
+    required.iter().any(|ctx| {
         runs.iter()
             .filter(|r| &r.name == ctx)
             .max_by_key(|r| r.started_at)
-            .is_some_and(done)
+            .is_some_and(red)
     })
 }
 
@@ -407,16 +426,19 @@ pub fn unreadable_state_path(root: &Path, base: &str) -> PathBuf {
 }
 
 /// The first unreadable read on record at `path`, recording `now` when there
-/// is none. `None` when the record cannot be written: with nothing durable to
+/// is none, or when the record is older than twice `cap` (a leftover from a
+/// past outage, #10448: trusting it would let the next failed read proceed at
+/// once). `None` when the record cannot be written: with nothing durable to
 /// measure the cap from, the caller fails open rather than defer forever.
-pub fn note_unreadable(path: &Path, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+pub fn note_unreadable(path: &Path, now: DateTime<Utc>, cap: u64) -> Option<DateTime<Utc>> {
+    let max_age = TimeDelta::seconds(i64::try_from(cap.min(MAX_CAP_SECS)).unwrap_or(0) * 2);
     let existing = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|v| v.get("first_unreadable")?.as_str().map(str::to_string))
         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
         .map(|d| d.with_timezone(&Utc))
-        .filter(|d| *d <= now);
+        .filter(|d| *d <= now && now - *d < max_age);
     if existing.is_some() {
         return existing;
     }
@@ -447,18 +469,6 @@ fn encode_query(s: &str) -> String {
         }
     }
     out
-}
-
-/// Every element of a `--paginate`d listing (concatenated JSON arrays).
-fn concat_arrays(stdout: &[u8]) -> Option<Vec<Value>> {
-    let mut items = Vec::new();
-    for page in serde_json::Deserializer::from_slice(stdout).into_iter::<Value>() {
-        match page.ok()? {
-            Value::Array(a) => items.extend(a),
-            _ => return None,
-        }
-    }
-    Some(items)
 }
 
 /// Project one pulls-API object; `None` when a field the decision needs is
@@ -502,42 +512,133 @@ pub struct GuardInputs<'a> {
     pub cap_secs: u64,
     pub now: DateTime<Utc>,
     pub policy: &'a TrustPolicy,
+    /// The ETag store directory; `None` is the shared host store.
+    pub cache_dir: Option<&'a Path>,
+}
+
+/// The window start is floored to this many seconds so the request URL (and
+/// the response) is stable between checks and an unchanged re-check is a 304.
+/// A wider window is harmless: liveness is judged from `created_at` and the cap.
+const WINDOW_QUANTUM_SECS: i64 = 300;
+/// A full page may have more behind it; fall back to the paginated read.
+const COMMENT_PAGE: usize = 100;
+
+fn window_start(now: DateTime<Utc>, cap_secs: u64) -> DateTime<Utc> {
+    let raw = now - TimeDelta::seconds(i64::try_from(cap_secs).unwrap_or(0));
+    let floored = raw.timestamp().div_euclid(WINDOW_QUANTUM_SECS) * WINDOW_QUANTUM_SECS;
+    DateTime::from_timestamp(floored, 0).unwrap_or(raw)
+}
+
+/// The repo-wide comment listing since `since` as a JSON array body: one
+/// ETag'd conditional read (recorded in `forge_call_stats`), a free 304 when
+/// nothing changed. A full first page falls back to the paginated read.
+fn fetch_window_comments(i: &GuardInputs<'_>, since: &str) -> Result<Vec<u8>, String> {
+    use crate::forge_etag_store as store;
+    let url = format!(
+        "repos/{}/issues/comments?since={}&per_page={COMMENT_PAGE}",
+        i.nwo,
+        encode_query(since)
+    );
+    let target = store::resolve_target(Some(i.root), Some(i.nwo));
+    // One entry per repo: the `since` bucket moves, an ETag from an older
+    // bucket simply mismatches and costs one 200.
+    let key = store::cache_key(
+        Some(i.root),
+        &target,
+        &format!("repos/{}/issues/comments#chain-lock", i.nwo),
+    );
+    let dir = i
+        .cache_dir
+        .map_or_else(store::disk_cache_dir, Path::to_path_buf);
+    let path = store::entry_path_with_prefix(&dir, "chainlock-", &key);
+    let prior = store::read_disk_entry(&path);
+    let site = store::ConditionalRead::new(
+        "chain_lock.comments",
+        crate::forge_call_stats::ops::COMMENT_LIST,
+    );
+    let (status, response, _stderr) = store::fetch_conditional(
+        site,
+        Path::new(i.gh),
+        Some(i.root),
+        &target,
+        &url,
+        prior.as_ref().map(|p| p.etag.as_str()),
+    )
+    .map_err(|e| format!("the comment read failed: {e}"))?;
+    let body = match response {
+        Some(r) if r.status == 304 => prior
+            .map(|p| p.body)
+            .ok_or("an unconditional comment read answered 304")?,
+        Some(r) if r.status == 200 && status.success() => {
+            if let Some(etag) = r.etag.clone() {
+                store::write_disk_entry(
+                    &path,
+                    &store::DiskEntry {
+                        etag,
+                        body: r.body.clone(),
+                    },
+                );
+            }
+            r.body
+        }
+        _ => return Err("the chain_lock.comments read failed".to_string()),
+    };
+    let full = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v.as_array().map(Vec::len))
+        .ok_or("the comment listing did not parse")?
+        >= COMMENT_PAGE;
+    if full {
+        return gh_read("chain_lock.comments", i.gh, i.root, &["api", &url, "--paginate"]);
+    }
+    Ok(body.into_bytes())
+}
+
+/// The PR number a comment belongs to, from its `issue_url`.
+fn comment_issue(c: &Value) -> Option<u32> {
+    c.get("issue_url")?
+        .as_str()?
+        .rsplit('/')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Read the lock state for `pr`'s base and decide. `Err` is "unreadable".
 ///
-/// Only open PRs on the same base updated inside the cap window are read
-/// further (posting the lock comment bumps `updated_at`, so an older PR
-/// cannot carry a live lock), and only their comments since the window
-/// opened. Checks are read only for a lock that is otherwise live.
+/// One repo-wide comment listing finds every lock marker. Only a PR whose
+/// newest marker is for this base and not yet past its cap is read further
+/// (`GET pulls/N`), and its checks only if the lock is otherwise live. With
+/// no marker in the window that is the whole check: at most one billable call.
 pub fn read_guard(i: &GuardInputs<'_>) -> Result<Guard, String> {
-    let window = i.now - TimeDelta::seconds(i64::try_from(i.cap_secs).unwrap_or(0));
-    let pulls_path =
-        format!("repos/{}/pulls?state=open&base={}&per_page=100", i.nwo, encode_query(i.base));
-    let listing =
-        gh_read("chain_lock.open_prs", i.gh, i.root, &["api", &pulls_path, "--paginate"])?;
-    let pulls = concat_arrays(&listing).ok_or("the open-PR listing did not parse")?;
-    let since = window.to_rfc3339_opts(SecondsFormat::Secs, true);
+    let since = window_start(i.now, i.cap_secs).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let raw = fetch_window_comments(i, &since)?;
+    let trusted = i
+        .policy
+        .trusted_listing(&raw)
+        .ok_or("the comment listing did not parse")?;
+    let mut by_pr: std::collections::BTreeMap<u32, Vec<Value>> = std::collections::BTreeMap::new();
+    for c in trusted {
+        if let Some(n) = comment_issue(&c) {
+            by_pr.entry(n).or_default().push(c);
+        }
+    }
     let mut required: Option<Vec<String>> = None;
     let mut live = Vec::new();
-    for holder in pulls.iter().filter_map(holder_from_json) {
-        if holder.base_ref != i.base || holder.updated_at.is_some_and(|u| u < window) {
-            continue;
-        }
-        let path = format!(
-            "repos/{}/issues/{}/comments?since={}&per_page=100",
-            i.nwo,
-            holder.number,
-            encode_query(&since)
-        );
-        let raw = gh_read("chain_lock.comments", i.gh, i.root, &["api", &path, "--paginate"])?;
-        let trusted = i
-            .policy
-            .trusted_listing(&raw)
-            .ok_or_else(|| format!("PR #{}'s comment listing did not parse", holder.number))?;
-        let Some(lock) = newest_lock(&trusted) else {
+    for (number, comments) in &by_pr {
+        let Some(lock) = newest_lock(comments) else {
             continue;
         };
+        if lock.marker.base != i.base || i.now >= cap_expiry(&lock, i.cap_secs) {
+            continue;
+        }
+        let path = format!("repos/{}/pulls/{number}", i.nwo);
+        let body = gh_read("chain_lock.pr_base", i.gh, i.root, &["api", &path])?;
+        let holder = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .as_ref()
+            .and_then(holder_from_json)
+            .ok_or_else(|| format!("PR #{number} did not parse"))?;
         let liveness = evaluate(&lock, &holder, i.cap_secs, i.now, || {
             if required.is_none() {
                 let (ctx, _notices) = crate::merge_pr::stale_checks::fetch::required_contexts_with(
@@ -550,7 +651,7 @@ pub fn read_guard(i: &GuardInputs<'_>) -> Result<Guard, String> {
                 i.nwo,
                 &holder.head_sha,
             )?;
-            Ok(checks_reported(required.as_deref().unwrap_or_default(), &runs))
+            Ok(checks_failed(required.as_deref().unwrap_or_default(), &runs))
         })?;
         if let Liveness::Live { expires_at } = liveness {
             live.push(LiveLock {
