@@ -144,7 +144,8 @@ pub fn emit(root: &Path, facts: &TickFacts, targets: &BTreeSet<Target>) {
         );
         return;
     };
-    let mut spans = plan(facts, &identity, &slug, &numbers, &resolved);
+    // #10637: `loom.repo` is GitHub's spelling, as on the tick's own root.
+    let mut spans = plan(facts, &identity, &identity.full_name, &numbers, &resolved);
     spans.extend(super::usage::attempt_usage(
         &spans,
         facts.tokens_by_model.as_deref(),
@@ -206,7 +207,7 @@ fn target_key(story: &StoryRef) -> String {
     }
 }
 
-/// One tick's span in `story`.
+/// One tick's span in `story`; `slug` is its `loom.repo`, as given.
 #[must_use]
 pub fn story_span(facts: &TickFacts, slug: &str, story: &StoryRef) -> SpanRecord {
     let context =
@@ -218,7 +219,7 @@ pub fn story_span(facts: &TickFacts, slug: &str, story: &StoryRef) -> SpanRecord
         ("loom.issue", story.issue.to_string()),
         ("loom.story", story.story.clone()),
         ("loom.story.key_version", STORY_KEY_VERSION.to_string()),
-        ("loom.repo", slug.to_ascii_lowercase()),
+        ("loom.repo", slug.to_string()),
         ("loom.result", facts.result.clone()),
         ("loom.sweep_id", facts.trace.execution.clone()),
         ("loom.timing_source", "tick".to_string()),

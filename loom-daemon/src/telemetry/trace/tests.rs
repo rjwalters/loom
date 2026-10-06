@@ -377,6 +377,39 @@ fn execution_root_is_derived_from_repo_and_sweep_id() {
     );
 }
 
+/// #10637: `loom.repo` on a span keyed by [`TraceStore::fallback_repo`] is the
+/// same repo spelled as GitHub spells it, and its ASCII lowercase is always
+/// exactly the key. A canonical record naming the repo supplies the spelling;
+/// with no record, or one naming a different repo (a renamed or transferred
+/// remote), the name stays as written. `LOOM_GH_BIN` is the fake forge's
+/// (the `loom_config_env` key); the default group guards `LOOM_REPO`.
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn repo_attribute_spells_the_key_as_github_does() {
+    repo_attribute_body();
+}
+
+#[serial_test::serial]
+fn repo_attribute_body() {
+    use crate::forge_repo_facts::test_support::{Env, Forge};
+    std::env::remove_var("LOOM_REPO");
+    let check = |remote: &str, forge_says: &str, facts: &str, expected: &str| {
+        let env = Env::new(&[("LOOM_REPO_FACTS", facts)]);
+        let url = format!("https://github.com/{remote}.git");
+        let root = env.repo("r", &[("origin", url.as_str())]);
+        let forge = Forge::new(env.tmp.path(), forge_says);
+        std::env::set_var("LOOM_GH_BIN", &forge.gh);
+        let attribute = TraceStore::repo_attribute(&root);
+        std::env::remove_var("LOOM_GH_BIN");
+        assert_eq!(attribute, expected, "origin {remote}, forge {forge_says}, facts {facts}");
+        assert_eq!(attribute.to_ascii_lowercase(), TraceStore::fallback_repo(&root));
+    };
+    check("twoam-fixture/loom-ui", "TwoAM-Fixture/Loom-UI", "1", "TwoAM-Fixture/Loom-UI");
+    check("TwoAM-Fixture/Loom-UI", "TwoAM-Fixture/Loom-UI", "0", "TwoAM-Fixture/Loom-UI");
+    check("twoam-fixture/loom-ui", "TwoAM-Fixture/Loom-UI", "0", "twoam-fixture/loom-ui");
+    check("oldco-fixture/app", "NewCo-Fixture/App", "1", "oldco-fixture/app");
+}
+
 #[test]
 fn story_execution_span_is_derived_from_the_story_and_sweep_id() {
     let dir = tempfile::tempdir().unwrap();

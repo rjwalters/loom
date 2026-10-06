@@ -312,10 +312,10 @@ fn journalling_is_idempotent_per_span_id() {
 fn every_story_attribute_survives_the_daemon_allowlist() {
     let span = story_span(
         &facts("doctor"),
-        "rjwalters/loom",
+        "RJWalters/Loom",
         &StoryRef {
             repo_id: REPO_ID,
-            story: "rjwalters/loom#1".into(),
+            story: "RJWalters/Loom#1".into(),
             issue: 1,
             pr_number: Some(2),
             root: story_context(REPO_ID, 1).unwrap(),
@@ -324,6 +324,8 @@ fn every_story_attribute_survives_the_daemon_allowlist() {
     for key in STORY_SPAN_ATTRIBUTE_KEYS {
         assert!(span.attributes.contains_key(*key), "allowlist drops {key}");
     }
+    // #10637: GitHub's spelling, never lowercased.
+    assert_eq!(span.attributes["loom.repo"], "RJWalters/Loom");
 }
 
 // ------------------------------------------------------------------------
