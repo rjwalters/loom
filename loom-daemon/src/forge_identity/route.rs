@@ -694,8 +694,21 @@ pub fn route_read_in(
         }
     }
 
+    // W4-C: a deferrable read (not [`ReadClass::Gate`]) moves off its
+    // placement only to a reader with headroom, the spill target rule; a
+    // Gate read takes any usable reader, whatever its projection.
+    let fallback_ok = |r: &Identity| {
+        legacy
+            || req.class == ReadClass::Gate
+            || bucket_key(&r.app_id, owner, req.resource)
+                .and_then(|k| forge_bucket_book::projected_used_pct(&k, epoch(now)))
+                .is_none_or(|p| p < env.cfg.target_max_pct)
+    };
     for off in 0..n {
         let r = readers[(start + off) % n];
+        if off > 0 && !fallback_ok(r) {
+            continue;
+        }
         if let Some(dir) = usable(r) {
             return pick(
                 r,

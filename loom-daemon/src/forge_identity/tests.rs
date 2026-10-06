@@ -343,6 +343,9 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         // pins it).
         "gh_invocation/mod.rs",
         "gh_invocation/reader_route.rs",
+        // W4-C: the choke point's class-aware chain (the same reviewed
+        // routing step, with the router injected).
+        "gh_invocation/reader_route_v2.rs",
         // #10391: `eta doctor` resolves (never uses) a reader per repo to say
         // whether one exists; it makes no forge call at all.
         "eta/doctor_facts.rs",

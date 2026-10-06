@@ -131,6 +131,14 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "forge.spill.to",
     "forge.spill.mode",
     "forge.spill.until",
+    // `forge.read.shed` spans (W4-C): which deferred read, of which class,
+    // for which (owner, resource) bucket, until when.
+    "forge.read.op",
+    "forge.read.class",
+    "forge.read.app",
+    "forge.read.owner",
+    "forge.read.resource",
+    "forge.read.until",
 ];
 
 /// Longest label value kept, in bytes.

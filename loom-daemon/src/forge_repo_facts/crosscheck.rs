@@ -31,6 +31,10 @@ pub(super) fn gh_answer(gh: &Path, root: &Path, env: GhRepoEnv) -> Option<String
         CROSSCHECK_TIMEOUT,
     )
     .forge_op(crate::forge_call_stats::ops::REPO_VIEW)
+    // The question is what gh resolves for the site's own call, as that
+    // site ran it: never on a derived reader route (whose `GH_REPO` would
+    // answer it for gh), so pinned to the writer (W4-C).
+    .writer_identity()
     .program(gh)
     .current_dir(root);
     match env {

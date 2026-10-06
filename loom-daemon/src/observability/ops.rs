@@ -52,6 +52,7 @@ pub mod pool_marks;
 pub mod queue;
 pub mod quota;
 pub mod ratelimit;
+pub mod read_shed;
 pub mod reader_spill;
 pub mod reader_withdrawal;
 pub mod redate_chain;

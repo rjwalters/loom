@@ -207,7 +207,7 @@ fn merged_head_rest(
         owner.owner
     );
     let sent_at = chrono::Utc::now().timestamp();
-    let out = gh::bounded_counted("worktree.landed_pulls", repo_root, ["api", &path])?;
+    let out = gh::bounded_hygiene("worktree.landed_pulls", repo_root, ["api", &path])?;
     if !out.status.success() {
         return None;
     }

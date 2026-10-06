@@ -479,6 +479,8 @@ mod forge {
             GhTarget::None,
             Duration::from_secs(30),
         )
+        // Asker-dependent: `/user` is whoever asks (W4-C writer_only).
+        .writer_identity()
         .args(["api", "user", "--jq", ".login"])
         .run();
         let CmdOutcome::Ran(output) = outcome else {

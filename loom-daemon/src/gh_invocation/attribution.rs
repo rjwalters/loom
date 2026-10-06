@@ -114,6 +114,9 @@ pub enum RepoOrigin {
     Target,
     /// The machine-global `LOOM_REPO`.
     LoomRepo,
+    /// The facade's derived reader route for an untargeted read (W4-C,
+    /// [`crate::gh_invocation::cwd_route`]).
+    Derived,
     /// The working directory's `origin` remote.
     Remote,
     /// Not resolved.
@@ -127,6 +130,7 @@ impl RepoOrigin {
             Self::Site => "site",
             Self::Target => "target",
             Self::LoomRepo => "loom_repo",
+            Self::Derived => "derived",
             Self::Remote => "remote",
             Self::None => "none",
         }

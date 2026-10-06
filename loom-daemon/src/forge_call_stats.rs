@@ -98,6 +98,9 @@ pub enum Outcome {
     RateLimited,
     /// Any other failure.
     Error,
+    /// Not sent (W4-C): a Hygiene / Observability read deferred because
+    /// every reader for its bucket was withdrawn. Charges nothing.
+    Shed,
 }
 
 /// The rate-limit pool a call spends.
@@ -555,6 +558,7 @@ struct Counts {
     not_modified: u64,
     rate_limited: u64,
     error: u64,
+    shed: u64,
 }
 
 /// Add one outcome to a counter bucket.
@@ -564,6 +568,7 @@ fn bump(c: &mut Counts, outcome: Outcome) {
         Outcome::NotModified => c.not_modified += 1,
         Outcome::RateLimited => c.rate_limited += 1,
         Outcome::Error => c.error += 1,
+        Outcome::Shed => c.shed += 1,
     }
 }
 
@@ -646,6 +651,7 @@ impl Aggregate {
                 not_modified: c.not_modified,
                 rate_limited: c.rate_limited,
                 error: c.error,
+                shed: c.shed,
             })
             .collect()
     }
@@ -660,6 +666,7 @@ impl Aggregate {
                 not_modified: c.not_modified,
                 rate_limited: c.rate_limited,
                 error: c.error,
+                shed: c.shed,
             })
             .collect()
     }
@@ -677,6 +684,7 @@ impl Aggregate {
                 not_modified: c.not_modified,
                 rate_limited: c.rate_limited,
                 error: c.error,
+                shed: c.shed,
             })
             .collect()
     }

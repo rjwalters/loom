@@ -12,7 +12,8 @@
 //!
 //! - the intent is [`AccessIntent::Read`] and the contract is
 //!   [`OutputContract::Captured`] (a passthrough stream cannot be retried);
-//! - the target is an explicit `owner/repo` ([`GhTarget::Repo`]);
+//! - the target is an explicit `owner/repo` ([`GhTarget::Repo`]), or (W4-C)
+//!   the facade derived one for an untargeted read ([`super::cwd_route`]);
 //! - the caller did not pick a credential itself
 //!   ([`GhInvocation::gh_config_dir`], [`GhInvocation::without_token_env`])
 //!   and does not route its own reads ([`GhInvocation::identity_role`]);
@@ -34,6 +35,10 @@
 //! personal token would otherwise serve the "reader" read. A credential
 //! failure falls back to the writer through the shared
 //! [`crate::forge_identity::reader_then_writer`] shape.
+//!
+//! Since W4-C [`GhInvocation::execute`] runs the class-aware chain in
+//! [`v2`] instead; `LOOM_READ_ROUTING=legacy` keeps the
+//! [`GhInvocation::execute_routed`] path below exactly.
 
 use super::{AccessIntent, GhCompletion, GhInvocation, OutputContract};
 use crate::forge_bucket_book::Resource;
@@ -49,7 +54,8 @@ pub(super) type Withdraw<'a> = &'a dyn Fn(&str, &str, Failure, &str);
 
 impl GhInvocation {
     /// The `owner/repo` this invocation may be served for by a reader, or
-    /// `None` when it must stay on the writer (see the module docs).
+    /// `None` when it must stay on the writer (see the module docs). An
+    /// untargeted read offers its derived route (W4-C, [`super::cwd_route`]).
     #[must_use]
     pub(super) fn reader_slug(&self) -> Option<String> {
         let eligible = self.intent == AccessIntent::Read
@@ -59,7 +65,7 @@ impl GhInvocation {
             && self.config_dir.is_none()
             && !self.strip_token_env;
         if eligible {
-            self.target.slug()
+            self.target.slug().or_else(|| self.route_slug.clone())
         } else {
             None
         }
@@ -151,6 +157,14 @@ pub(super) fn role_of(inv: &GhInvocation) -> IdentityRole {
     inv.role.unwrap_or(IdentityRole::Writer)
 }
 
+#[path = "reader_route_v2.rs"]
+mod v2;
+pub use v2::{ShedPolicy, READ_SHED_ENV, SHED_MARKER};
+
 #[cfg(test)]
 #[path = "reader_route_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "reader_route_v2_tests.rs"]
+mod v2_tests;
