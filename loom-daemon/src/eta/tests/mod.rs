@@ -8,6 +8,7 @@ mod conditioning;
 mod config;
 mod conformal;
 mod conformal_ipcw;
+mod dependency;
 mod emit;
 mod episodes;
 mod estimate;
@@ -157,5 +158,6 @@ pub(crate) fn input_at(stage: Stage, age_sec: i64, rework_rounds: u32) -> Estima
         stalls: Vec::new(),
         held: None,
         queue: Vec::new(),
+        dependencies: None,
     }
 }

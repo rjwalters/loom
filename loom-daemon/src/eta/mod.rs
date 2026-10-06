@@ -100,6 +100,7 @@ pub mod calibration_log;
 pub mod config;
 pub mod conformal;
 pub mod conformal_ipcw;
+pub mod dependency;
 pub mod doctor;
 pub mod doctor_facts;
 pub mod emit;
@@ -374,6 +375,13 @@ pub enum NoEstimateReason {
     /// loaded, it has no direct model, its cutoff is not strictly before
     /// `as_of`, or its coefficients are malformed.
     NoModel,
+    /// A dependency composition (#10510): the item is on a dependency cycle.
+    DependencyCycle,
+    /// A dependency composition: a parent is not in the graph.
+    BlockedByUnknown,
+    /// A dependency composition: a parent has no estimate. The explanation's
+    /// `dependencies.blocked_by` names it and its reason.
+    BlockedBy,
 }
 
 impl NoEstimateReason {
@@ -389,6 +397,9 @@ impl NoEstimateReason {
             NoEstimateReason::UnknownStage => "unknown_stage",
             NoEstimateReason::StaleInputs => "stale_inputs",
             NoEstimateReason::NoModel => "no_model",
+            NoEstimateReason::DependencyCycle => "dependency_cycle",
+            NoEstimateReason::BlockedByUnknown => "blocked_by_unknown",
+            NoEstimateReason::BlockedBy => "blocked_by",
         }
     }
 }
@@ -626,6 +637,10 @@ pub struct EstimateInput {
     /// observed before `as_of`. Empty when no fleet view was observed yet.
     /// Only `little-v0` reads it.
     pub queue: Vec<stage_queue::StageQueue>,
+    /// The pass's dependency graph (#10510), point-in-time: only a
+    /// dependency composition ([`dependency::compose`]) reads it. `None`
+    /// when no edge was observed.
+    pub dependencies: Option<Arc<dependency::DependencyGraph>>,
 }
 
 /// A registered estimator. Implementations must be pure.
@@ -710,6 +725,7 @@ impl Registry {
                 Box::new(heuristics::LandKeenWren::new(fit_v2.clone())),
                 Box::new(heuristics::LandTwinOtter::new(fit.clone())),
                 Box::new(heuristics::LandTwinOtterB::new(fit.clone())),
+                Box::new(heuristics::DependencyComposition::tandem_wren(fit.clone())),
             ],
             fit,
             fit_v2,

@@ -15,8 +15,8 @@ use crate::eta::fit::{
     TrainingRow, FEATURES, SCHEMA,
 };
 use crate::eta::heuristics::{
-    LandKeenWren, LandTwinOtter, LandV2, KEEN_WREN_PRE_PR_METHOD, LAND_KEEN_WREN, LAND_TWIN_OTTER,
-    LAND_TWIN_OTTER_B,
+    LandKeenWren, LandTwinOtter, LandV2, KEEN_WREN_PRE_PR_METHOD, LAND_KEEN_WREN, LAND_TANDEM_WREN,
+    LAND_TWIN_OTTER, LAND_TWIN_OTTER_B,
 };
 use crate::eta::simulate::run_explanation;
 use crate::eta::twin_otter::{evaluate, EvalConfig, TwinOtterModel, PROBIT_TAUS};
@@ -338,7 +338,16 @@ fn keen_wren_is_a_land_candidate_registered_before_the_twin_otter_pair() {
     );
     for registry in [Registry::builtin(), fitted] {
         let land: Vec<&str> = registry.for_kind(Kind::Land).map(Heuristic::id).collect();
-        assert_eq!(land[land.len() - 3..], [LAND_KEEN_WREN, LAND_TWIN_OTTER, LAND_TWIN_OTTER_B]);
+        // `land-2026-10-06-tandem-wren` (#10510) is registered after the pair.
+        assert_eq!(
+            land[land.len() - 4..],
+            [
+                LAND_KEEN_WREN,
+                LAND_TWIN_OTTER,
+                LAND_TWIN_OTTER_B,
+                LAND_TANDEM_WREN
+            ]
+        );
         assert_eq!(registry.tier_of(LAND_KEEN_WREN), Some(Tier::Candidate));
         assert_eq!(registry.current(Kind::Land, None).id(), "land-v1", "shadow");
         assert!(registry.get(LAND_KEEN_WREN).unwrap().models_hold());

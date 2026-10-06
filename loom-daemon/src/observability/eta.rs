@@ -1030,21 +1030,18 @@ pub(super) async fn record(
 
     let ready = ready_rows(slug_cache).await;
     // Queue friction (#10193), read BEFORE `now`: every reading is then
-    // knowable at the estimates this pass makes.
-    let (book, tracked) = lock()
+    // knowable at the estimates this pass makes. Dependency edges (#10510)
+    // are read from the same snapshot, also before `now`.
+    let (book, tracked, dep_seed) = lock()
         .as_ref()
         .map(|s| {
             let repos = s.tracker.item_keys().into_iter().map(|k| k.repo).collect();
-            (s.tracker.friction.clone(), repos)
+            (s.tracker.friction.clone(), repos, super::eta_dependency::seed(&s.tracker))
         })
         .unwrap_or_default();
-    let friction_repos = repos
-        .iter()
-        .map(|(root, slug, prs, _)| {
-            (root.clone(), slug.clone(), prs.iter().map(|p| p.number).collect())
-        })
-        .collect();
+    let friction_repos = super::eta_friction::repos_of(&repos);
     let book = super::eta_friction::refresh(book, friction_repos, tracked, slug_cache).await;
+    let dependencies = super::eta_dependency::refresh(dep_seed, &repos).await;
     let now = Utc::now();
     let pool_exhausted = pool_brake_tripped(workspace_pool, &roots, now);
     let mut effects = Vec::new();
@@ -1073,6 +1070,7 @@ pub(super) async fn record(
         state.repo_ids.extend(repo_ids);
         state.tracker.on_fleet_snapshots(&snapshots, listed_at);
         state.tracker.friction = book;
+        state.tracker.dependencies = dependencies;
         state.pool_exhausted = pool_exhausted;
         state.locked_repos = super::ops::lockout::locked_slugs()
             .into_iter()

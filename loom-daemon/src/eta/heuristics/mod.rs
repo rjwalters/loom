@@ -19,6 +19,7 @@
 
 mod finish_v1;
 mod land_calm_plover;
+mod land_dependency;
 mod land_held_heron;
 mod land_keen_wren;
 mod land_quick_tern;
@@ -33,6 +34,7 @@ mod start_v1;
 
 pub use finish_v1::{FinishV1, FINISH_V1};
 pub use land_calm_plover::{LandCalmPlover, LAND_CALM_PLOVER};
+pub use land_dependency::{DependencyComposition, LAND_TANDEM_WREN};
 pub use land_held_heron::{
     side_state, LandHeldHeron, DRAW_ORDER as HELD_HERON_DRAW_ORDER, LAND_HELD_HERON,
     METHOD as HELD_HERON_METHOD,
@@ -184,7 +186,7 @@ fn current_of(rules: PathRules, input: &EstimateInput) -> Result<&CurrentStage, 
 
 /// The explanation of `heuristic`'s estimate of `input` before anything is
 /// estimated: identity, provenance, subject and the recorded features.
-fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) -> Explanation {
+pub(crate) fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) -> Explanation {
     let as_of = input.as_of;
     let features_omitted = input
         .features
@@ -215,6 +217,7 @@ fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) -> Explanat
         calibration: None,
         twin_otter: None,
         queue: None,
+        dependencies: None,
         regime_adjustment: None,
         held_heron: None,
     }

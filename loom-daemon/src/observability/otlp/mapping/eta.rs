@@ -296,6 +296,7 @@ mod tests {
             stalls: Vec::new(),
             held: None,
             queue: Vec::new(),
+            dependencies: None,
         };
         EtaEstimateRecord {
             trigger: Trigger::Transition,
