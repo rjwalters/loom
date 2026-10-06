@@ -1700,8 +1700,8 @@ not one per host.
 
 - **The rule** (re-read every pass, no restart):
   1. `fleet.etaAuthority: "<host id>"` (or `LOOM_ETA_AUTHORITY`) names it:
-     reason `explicit`. This is the override, and later moves it to the
-     captain (2AMLogic/2am#2814).
+     reason `explicit`. This is the override, and is how the authority is
+     later moved to the captain.
   2. Else the fleet refresher: the declared `fleet.captain`, or, with none
      declared, this host when its own `autonomous.eta.fleetRefresh.enabled` is
      on: reason `fleet_refresh`.

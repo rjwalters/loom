@@ -11,8 +11,8 @@
 //! # The rule
 //!
 //! 1. `fleet.etaAuthority` (or `LOOM_ETA_AUTHORITY`) names the authority:
-//!    [`Reason::Explicit`]. It wins over everything, and later moves to the
-//!    captain (2AMLogic/2am#2814).
+//!    [`Reason::Explicit`]. It wins over everything, and is how the
+//!    authority is later moved to the captain.
 //! 2. Otherwise the authority is the fleet-wide refresher: the declared
 //!    `fleet.captain` (the only host whose fleet refresh runs, #10329), or,
 //!    with no captain declared, this host when its own
