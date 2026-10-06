@@ -49,6 +49,57 @@ pub(crate) enum MergeQueueAction {
         #[arg(long, value_name = "NWO")]
         repo: Option<String>,
     },
+    /// #10256: reconcile a PR with the queue (`merge-pr.sh` calls this with
+    /// `--pr`), or every pending queued PR (no `--pr`). Confirms merges,
+    /// comments and routes drops with GitHub's verified reason, revokes and
+    /// dequeues a queued PR that lost its authorization. Prints
+    /// `LOOM-MERGE-QUEUE-DIRECT` and exits 0 in direct mode without any forge
+    /// call. Exit 7 = queued/dropped (not merged, nothing wrong), 3 = could
+    /// not determine (do not merge).
+    Reconcile {
+        #[arg(long, value_name = "PR")]
+        pr: Option<u32>,
+        #[arg(long, value_name = "NWO")]
+        repo: Option<String>,
+        /// Only report the mode; read and write nothing (dry runs).
+        #[arg(long)]
+        mode_only: bool,
+    },
+    /// #10256: authorize and enqueue an approved PR after every direct merge
+    /// guard passed. Refuses (exit 4) in direct mode and while dormant;
+    /// refuses unless the ruleset requires `loom/merge-authorization`. Exit 7
+    /// = handed off (NOT merged). Never falls back to a direct merge.
+    Handoff {
+        #[arg(value_name = "PR")]
+        pr: u32,
+        #[arg(long, value_name = "SHA")]
+        approved_sha: String,
+        #[arg(long, value_name = "NWO")]
+        repo: Option<String>,
+    },
+    /// #10256: revoke the queue authorization and dequeue BEFORE a Loom-owned
+    /// transition (verdict invalidation, review claim, operator hold). Exit 0
+    /// when the transition may proceed (and always in direct mode).
+    Revoke {
+        #[arg(value_name = "PR")]
+        pr: u32,
+        /// Short token recorded in the revoke marker, e.g. `stale-verdict`.
+        #[arg(long, default_value = "transition")]
+        reason: String,
+        #[arg(long, value_name = "NWO")]
+        repo: Option<String>,
+    },
+    /// #10256: the required `loom/merge-authorization` check body for the PR
+    /// head a merge group was built from. Exit 0 = success, 1 = failure
+    /// (any unknown fact, outage or forge error fails).
+    AuthorizeCheck {
+        #[arg(value_name = "PR")]
+        pr: u32,
+        #[arg(long, value_name = "SHA")]
+        pr_head: String,
+        #[arg(long, value_name = "NWO")]
+        repo: Option<String>,
+    },
 }
 
 pub(crate) fn run(action: MergeQueueAction) -> ! {
@@ -66,6 +117,28 @@ pub(crate) fn run(action: MergeQueueAction) -> ! {
             repo,
         },
         MergeQueueAction::Dequeue { pr, repo } => MergeQueueCmd::Dequeue { pr, repo },
+        MergeQueueAction::Reconcile {
+            pr,
+            repo,
+            mode_only,
+        } => MergeQueueCmd::Reconcile {
+            pr,
+            repo,
+            mode_only,
+        },
+        MergeQueueAction::Handoff {
+            pr,
+            approved_sha,
+            repo,
+        } => MergeQueueCmd::Handoff {
+            pr,
+            approved_sha,
+            repo,
+        },
+        MergeQueueAction::Revoke { pr, reason, repo } => MergeQueueCmd::Revoke { pr, reason, repo },
+        MergeQueueAction::AuthorizeCheck { pr, pr_head, repo } => {
+            MergeQueueCmd::AuthorizeCheck { pr, pr_head, repo }
+        }
     };
     handle(&cmd)
 }

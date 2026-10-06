@@ -233,6 +233,10 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // here feeds it — attribution, never evidence.
         ("verdict_stale_notice.rs", "attribution of dropped markers; never control"),
         ("verdict_stale_notice/tests.rs", "test"),
+        // #10256: fixture only. The queue's reader (`forge_merge_queue/
+        // gh_lifecycle.rs`) filters through `TrustPolicy::for_root` before
+        // `extract_latest_verdict_sha` sees a body.
+        ("forge_merge_queue/lifecycle_tests.rs", "test fixture"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),
     ];
