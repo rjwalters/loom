@@ -7719,12 +7719,16 @@ A `Gate` read always confirms on the writer, and the reader is not withdrawn.
 The REST issue and PR reads behind the worktree reaper, eager reclaim,
 `clean` (sweep transients, stale branches, the `pr-<N>` probe),
 `--aggressive`, `checkpoint read` and the primary-checkout reaper go through
-one module, `loom-daemon/src/worktree_ops/forge_state.rs`. Not every hygiene
-read does yet: the GraphQL-backed probes `gh::issue_state` (`gh issue view`,
-in `clean`'s worktree pass and stale-branch cleanup), `check_pr_merged`, and
-the `check_pr_status_for_branch` fallback (`clean` and the primary-checkout
-reaper, when REST is unknown or no owner resolves) still name gh's own
-target and are not conditional.
+one module, `loom-daemon/src/worktree_ops/forge_state.rs`. Since W6 PR2 the
+number-keyed probes of `clean` do too (its worktree pass and its stale-branch
+pass read the issue through this path instead of `gh issue view`, and the
+worktree pass asks the REST listing for the branch's PR first). What is left
+on GraphQL are branch lookups with no item number, each a last resort behind
+the REST listing: `check_pr_merged` (the reaper and `clean` when no owner
+resolves; `clean` also when REST is unknown) and `check_pr_status_for_branch`
+(`clean`'s no-remote stale-branch check when REST is unknown or no owner
+resolves; the primary-checkout reaper when no owner resolves). They still
+name gh's own target and are not conditional.
 
 - **The checkout's own repo.** Reads name gh's base repo for the root,
   resolved and verified by the repo facts above with `GH_REPO`/`LOOM_REPO`
@@ -7737,9 +7741,10 @@ target and are not conditional.
 - **Conditional and fresh.** `issues/{n}` (state and `closed_at` in one
   read) and `pulls/{n}` (status and `head.sha`) are conditional `GET`s on the
   agents' shared `view-` entry, so an unchanged item is a free `304` and
-  `gh-cached --invalidate N` drops the entry after a write. Nothing is
-  remembered beyond the `ETag` and its body: every read reaches the forge,
-  and a `304` is server-fresh (ADR-0021). Branch listings
+  `gh-cached --invalidate N` drops the entry after a write. This module
+  remembers nothing beyond the `ETag` and its body: every read it is asked
+  for reaches the forge, and a `304` is server-fresh (ADR-0021). What a pass
+  may hold on top of that is the next section. Branch listings
   (`pulls?head=`) stay unconditional, because `--invalidate` does not drop
   them.
 - **Identity.** An answer must be the item asked for: its `number`, and its
@@ -7771,6 +7776,73 @@ target and are not conditional.
 | Variable | Default | Effect |
 |---|---|---|
 | `LOOM_HYGIENE_CONDITIONAL` | on | `0` makes the single-item reads on a root with a repo fact unconditional: no `If-None-Match` sent, the `view-` entry neither read nor written. Everything else stays: the explicit target, the identity check, reader routing and the breaker. It is not a revert of W6 — no switch restores the pre-W6 `LOOM_REPO` > `origin` target. `LOOM_REPO_FACTS=0` sends every item read down the placeholder path (`{owner}/{repo}`, `GH_REPO` stripped, unconditional). |
+
+### Hygiene passes: held for one pass, merged remembered, every removal confirmed (`LOOM_HYGIENE_MEMO`)
+
+Hygiene removes worktrees and branches, so everything here fails toward
+KEEP. `loom-daemon/src/worktree_ops/hygiene_pass.rs` (W6 PR2) sits between
+the reaping and cleaning passes and the read path above.
+
+- **Held for one pass.** The worktree reaper asks about every kept worktree
+  twice per tick (once for removal, once for reclaiming its build
+  artifacts), and an issue's `closed_at` is a third question answered by the
+  same body. A pass now holds each issue (`issues/{n}`), each PR
+  (`pulls/{n}`) and each branch's PR status (`pulls?head=`) the first time it
+  reads it and answers the rest from memory (`hygiene.memo_hit`). Only real
+  answers are held: an unknown, a `404` or a failed read is asked again.
+  Nothing is persisted and nothing outlives the pass; the eager reclaim pass
+  is a pass of its own.
+- **Remembered across passes: a merged PR, and nothing else.** A merged PR
+  stays merged, so a kept `pr-<N>` worktree whose PR merged costs no read
+  after the first (`hygiene.terminal_hit`). A CLOSED issue or a
+  closed-without-merge PR can be reopened and is read every pass; OPEN,
+  unknown, gone and errors are never stored. Entries are
+  `hygiene-merged-*.json` files in the shared store directory, one per
+  `(forge host, repository, credential, PR number)`. The repository is the
+  forge's numeric repo id when the repo-facts record has one — a renamed or
+  transferred repo keeps its entries, and a new repo under an old name never
+  reads them — else the canonical `owner/name` in a separate namespace; a
+  root with no repo fact is never stored. Entries older than 30 days are
+  dropped on the next write.
+- **Every removal is confirmed first.** A held answer, a remembered merge
+  and a `304`-served body are discovery; none of them is the last word
+  before data is destroyed (ADR-0021: a read that gates an action never
+  comes from a held cache, and the store is writable by any process of the
+  same uid). Immediately before a quarantine or a removal the pass makes ONE
+  unconditional read (no `If-None-Match`, nothing read from or written to the
+  store) of the numbered item the decision rested on: the issue for an
+  `issue-<N>` worktree or branch (`hygiene.confirm_issue` in the ledger), the
+  PR for a `pr-<N>` worktree (`hygiene.confirm_pr`; status and head SHA must
+  both match). If the answer differs from what the pass held, or is unknown
+  or gone (a transferred or missing item included), the worktree is kept,
+  `hygiene.confirm_downgrade` is bumped, a `warn` line names both answers,
+  and what was held is forgotten; a contradicted merged entry is deleted.
+  Sites: the worktree reaper and eager reclaim (`issue-<N>` and `pr-<N>`),
+  `clean`'s worktree pass (a kept worktree prints the reason under "skipping
+  (may need investigation)"; under a non-`--safe` interactive run the read
+  precedes the prompt), `clean`'s stale-branch pass for a CLOSED issue (an
+  unconfirmed one is reported as `UNCONFIRMED` and the branch kept), and
+  `clean --aggressive` when its decision read the issue ("Skipped (fresh
+  forge read did not confirm the issue state)"). A dry run confirms nothing.
+- **What is not confirmed, and why.** A decision that used no forge state
+  for the item holds nothing, so no read is made: an unregistered orphan
+  directory (#6652), and `--aggressive` removing landed work whatever the
+  issue says. A branch listing has no item number to re-read; it is always
+  unconditional, and a removal that would rest on an unmerged listing answer
+  (closed without merge, or no PR) taken from the pass's memory rather than
+  read for that decision is kept (counted as a downgrade) and read again
+  next pass. The primary-checkout reaper and `clean`'s no-remote stale-branch
+  check read only listings, once each, immediately before they act; they
+  hold nothing and are unchanged. `clean`'s sweep-transient and log pruning
+  keep their own reads.
+- **Rate-limit breaker.** While the global breaker is cooling a pass makes
+  no item call at all — not the read, not the store lookup (which may
+  resolve the repo), not the confirm — so every answer is unknown and
+  everything is kept.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOOM_HYGIENE_MEMO` | on | `0` restores the pre-PR2 behaviour: nothing is held for the pass except the reaper's `pr-<N>` probe (which predates this), no merged entry is read or written, no confirm read is made, and `clean`'s issue-keyed probes go back to `gh issue view` / `gh pr list`. Read at the start of each pass. |
 
 ### Merged-PR worktree reaper (#4876)
 
