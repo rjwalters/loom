@@ -2271,8 +2271,7 @@ daemon-derived id.
 
 **The contract is a golden (#10391).**
 `loom-daemon/src/telemetry/kinds/fixtures/eta-snapshot-golden.json` is the
-wire record byte for byte; changing it means re-vendoring it in loom-ui
-([2AMLogic/loom-ui#1854](https://github.com/2AMLogic/loom-ui/issues/1854)).
+wire record byte for byte; changing it means re-vendoring it in the downstream loom-ui consumer.
 A vendored loom-ui consumer fixture (`fixtures/loom-ui/`) must find every key
 path it reads in the golden with a compatible type.
 
