@@ -258,6 +258,9 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     ".loom/stuck-config.json",
     ".loom/metrics/",
     ".loom/usage-cache.json",
+    // Closed-item poll cursor (#10150), written by the daemon into the primary
+    // clone; unignored it is untracked dirt for `check-main-clean.sh`.
+    ".loom/closed-watch-cursor.json",
     ".loom/claude-config/",
     // Sibling copies (renamed/backup) of the harness auth-store dir, e.g.
     // `claude-config.disabled-<ts>/` or `claude-config-old/` (#9134, extending

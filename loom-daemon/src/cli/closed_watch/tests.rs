@@ -54,6 +54,39 @@ fn close_with_no_merge_pr_script_triggers_scan_and_advances_cursor() {
     assert_eq!(load_cursor(dir.path()).as_deref(), Some("2026-10-04T10:00:00Z"));
 }
 
+/// The cursor is written into the primary clone, so the managed `.gitignore`
+/// block must ignore it (and its `.tmp` sibling) or `check-main-clean.sh`
+/// reads main as dirty and `--quarantine` can stash the cursor away. Paths come
+/// from `cursor_path` itself, answered by real `git check-ignore`.
+#[test]
+fn cursor_file_is_ignored_by_the_managed_gitignore_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("run git")
+    };
+    assert!(git(&["init", "-q"]).status.success(), "git init failed");
+    loom_daemon::init::update_gitignore(root).unwrap();
+    let cursor = cursor_path(root);
+    let tmp = cursor.with_extension("json.tmp");
+    for abs in [&cursor, &tmp] {
+        let rel = abs.strip_prefix(root).unwrap().to_str().unwrap();
+        assert!(
+            git(&["check-ignore", "-q", "--no-index", rel])
+                .status
+                .success(),
+            "{rel} is daemon runtime state but NOT ignored by the managed block"
+        );
+    }
+}
+
 #[test]
 fn cursor_persists_across_polls_and_idle_tick_never_scans() {
     let dir = tempfile::tempdir().unwrap();
