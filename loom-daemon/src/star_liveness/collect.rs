@@ -125,9 +125,31 @@ pub struct Evaluated {
     pub fingerprint: String,
     /// The issue as a work item (for the inheritance registry).
     pub item: WorkItem,
+    /// The level >= 2 source this row inherits a level from, as
+    /// `owner/repo#N` (#10307; set by [`super::levels`]).
+    pub level_inherited_from: Option<String>,
+    /// The inherited level, when [`Self::level_inherited_from`] is set.
+    pub inherited_level: u8,
+    /// That level's inherited label, from the table the walk used.
+    pub inherited_label: Option<&'static str>,
+    /// The level source's starred-at, when [`Self::level_inherited_from`]
+    /// is set: a row promoted to that level sorts by it (#10307).
+    pub level_requested_at: Option<String>,
 }
 
-fn item_facts(r: &RestIssue) -> ItemFacts {
+impl Evaluated {
+    /// The row's effective operator priority level (#10307): its own level
+    /// labels, an inherited level, or the in-memory inherited star (1).
+    #[must_use]
+    pub fn level(&self) -> u8 {
+        self.item
+            .operator_level()
+            .max(self.inherited_level)
+            .max(u8::from(self.inherited_from.is_some()))
+    }
+}
+
+pub(crate) fn item_facts(r: &RestIssue) -> ItemFacts {
     ItemFacts {
         number: r.number,
         labels: r.labels.clone(),
@@ -138,7 +160,7 @@ fn item_facts(r: &RestIssue) -> ItemFacts {
     }
 }
 
-fn work_item(r: &RestIssue) -> WorkItem {
+pub(crate) fn work_item(r: &RestIssue) -> WorkItem {
     WorkItem::with_created_at(r.number, r.labels.clone(), r.created_at.clone())
         .with_body(r.body.clone())
         .with_updated_at(r.updated_at.clone())
@@ -586,6 +608,10 @@ impl<'a> Evaluator<'a> {
             inherited_from,
             fingerprint: fp,
             item: work_item(issue),
+            level_inherited_from: None,
+            inherited_level: 0,
+            level_requested_at: None,
+            inherited_label: None,
         }
     }
 
@@ -809,5 +835,9 @@ pub fn unmanaged(slug: &str, number: u32, starred_at: Option<String>) -> Evaluat
         inherited_from: None,
         fingerprint: String::new(),
         item: WorkItem::new(number, Vec::new()),
+        level_inherited_from: None,
+        inherited_level: 0,
+        level_requested_at: None,
+        inherited_label: None,
     }
 }

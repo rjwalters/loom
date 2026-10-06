@@ -2578,9 +2578,10 @@ never-propagate list. The table is the rule set only. The pass that writes
 these labels is not built yet.
 
 **loom-ui stars.** The `/ingest` ack may carry `operator_priority_intents`
-(`defaults/docs/telemetry-schema.md`). The pass applies each valid one (the one
-label, a managed repo, a `requested_by`) idempotently with one audit comment;
-the intent's `requested_at` is the starred-at.
+(`defaults/docs/telemetry-schema.md`). The pass applies each valid one (an
+operator label of any level — the star or `loom:operator-high-priority`, #10307
+— on a managed repo, with a `requested_by`) idempotently with one audit comment
+whose marker names the `label=`; the intent's `requested_at` is the starred-at.
 
 Config (`.loom/config.json → autonomous.operatorPriority`, **env > config >
 default**):
@@ -2588,10 +2589,26 @@ default**):
 | Key | Env | Default | Meaning |
 |---|---|---|---|
 | `noProgressMinutes` | `LOOM_OPERATOR_PRIORITY_NO_PROGRESS_MINUTES` | `30` | watchdog window |
-| `escalate` | `LOOM_OPERATOR_PRIORITY_ESCALATE` | `true` | post escalations and apply loom-ui intents; `false` still computes and shows every landing state |
+| `escalate` | `LOOM_OPERATOR_PRIORITY_ESCALATE` | `true` | post escalations, apply loom-ui intents, and write the derived level labels and their body markers (#10307); `false` still computes and shows every landing state, and the work finder still sees inherited levels in memory |
 | `intervalSecs` | `LOOM_OPERATOR_PRIORITY_INTERVAL_SECS` | `120` | pass interval |
 | `poolsExhaustedGraceMinutes` | `LOOM_OPERATOR_PRIORITY_POOLS_GRACE_MINUTES` | `10` | wait before a `pools-exhausted` ask; `0` asks at once |
 | `propagate` | `LOOM_OPERATOR_PRIORITY_PROPAGATE` | `true` | a star also reaches its children by park record, task list and dependency phrase; `false` keeps only the blocker / incident / red-main inheritance |
+| `levelCaps` | — | `{"2": 5}` (the level table) | per-level cap on open issues carrying the level's operator label; over the cap is flagged in the digest, never refused |
+
+**Priority levels (#10307).** Every pass also walks each level ≥ 2 issue's
+(`loom:operator-high-priority`) blockers, transitively and into every managed
+repo, and writes `loom:high-priority-inherited` on each open one. Provenance
+goes into the blocker's **issue body** first, as
+`<!-- loom:priority-inherited inherited_from=owner/repo#N level=2 requested_at=… id=… -->`
+(what loom-ui reads; one marker per level, replaced in place when the source
+changes, nothing else in the body touched). The label is skipped when that
+write fails, so the next pass retries both. The work finder orders the blocker
+at the marker's `requested_at`. The label and marker come off once no level-2
+issue reaches the blocker, after a complete walk only (a failed listing, issue
+read or native-dependency read adds and never removes), and only on a host
+that manages the marker's source repo. Containment (task lists, sub-issues) never carries a
+level. A blocker in an unmanaged repo is listed, not followed; an
+operator-only / operator-decision blocker leads the digest.
 
 ### Ready queue view (`loom-daemon queue`, #8852)
 
@@ -4427,13 +4444,29 @@ The work finder's build admission reads no PR debt of its own: with 28 PRs in
 `loom:review-requested` and 59 in `loom:pr`, it would still admit new issue
 builds up to its cap, piling more finished work onto queues Judge and Champion
 are not draining. The **build back-off** is a WIP limit on that debt (Phase 2b
-of #9391). While it is **engaged**, the work finder admits no new unstarred
-issue build; sweeps already in flight are untouched, and the freed host
-resources (token pool, load) go to the role runner's judge / doctor / champion
-runs, which #9392 already sizes to the same debt. It adds no PR dispatch path
-of its own.
+of #9391), **per repository** since #10624. While a repo's back-off is
+**engaged**, the work finder admits no new unstarred issue build **in that
+repo**; other repos keep building, sweeps already in flight are untouched, and
+the freed slots go to whatever else is ready, including the role runner's
+judge / doctor / champion runs, which #9392 already sizes to the same debt. It
+adds no PR dispatch path of its own.
 
-- **Input.** Once per multi-workspace tick, the work finder reads the role
+- **Per repo (#10624).** Each registered repo has its own hysteresis state,
+  fed by that repo's own debt, and `high` / `low` apply to each repo
+  separately. One repo's backlog never holds another repo's builds. (Until
+  #10624 the debt was summed host-wide and held every repo, so one repo with
+  most of the fleet's `loom:changes-requested` PRs starved dozens of repos
+  with no PR debt of their own.) A repo that leaves the registry drops its
+  state.
+- **Optional host ceiling.** `hostHigh` / `hostLow` are absent (off) by
+  default. When both are set, the pre-#10624 rule applies on top: the
+  host-wide total (every repo's debt summed) has its own hysteresis, and while
+  it is engaged **every** repo's unstarred builds are held. Use it when the
+  fleet should spend more effort reviewing than building. A crossed or
+  half-set pair leaves the ceiling off with one `WARN` per distinct bad pair.
+
+- **Input.** Once per repo per multi-workspace tick (plus once for the host
+  total when the ceiling is set), the work finder reads the role
   runner's in-memory demand ledger (see [Concurrent across
   repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391))
   with `autonomous.roleRunner.demandWidth.staleSecs`:
@@ -4446,12 +4479,13 @@ of its own.
   `loom:operator-only` — not `loom:operator`, which Doctor still drains;
   #9421), and review is unfiltered. An axis whose every PR is excluded reads
   as observed zero, not unobserved. The ledger covers
-  only the repositories whose roles this host runs, so the back-off is
-  per-host and two hosts can disagree.
+  only the repositories whose roles this host runs, so two hosts can
+  disagree about the same repo.
 - **The ledger comes from the role runner. With the role runner off (or
   `demandWidth.enabled: false`), the ledger stays empty and the back-off is
   inert.**
-- **Fail open.** A ledger with no fresh entry on any axis never engages, and
+- **Fail open.** A repo (or, for the ceiling, a host) with no fresh entry on
+  any axis never engages, and
   releases an engaged back-off (logged as `debt unobserved — failing open`). A
   partly observed ledger sums the axes it has, which can only err toward not
   engaging.
@@ -4477,24 +4511,44 @@ of its own.
   checked first and still holds both.
 - **Explicit dispatch is unaffected** (`dispatch_sweep` over IPC does not go
   through the work-finder tick).
-- **Observability.** One `INFO` line per edge, naming the debt, its per-axis
-  split, `high` and `low`, e.g. `work_finder: build back-off ENGAGED —
+- **Observability.** One `INFO` line per edge, naming the repo (or the host
+  ceiling), the debt, its per-axis split and the thresholds, e.g.
+  `work_finder: build back-off for repo /srv/acme ENGAGED —
   review+changes+merge debt 87 (review=28 changes=0 merge=59) > high=40; new
-  issue builds held until < low=25 (#9410)`. Steady state logs nothing above
-  `DEBUG`. Deferred issues show as `deferred_build_backoff` in `loom-daemon
-  queue`, the tick summary carries `deferred_build_backoff` and
-  `build_backoff_held` (`BUILD-BACKOFF-HELD` in `loom-daemon health`), the
-  decisions metric uses reason `build_backoff`, and the tick result is
-  `build_backoff_held` when nothing was dispatched.
+  issue builds in this repo held until < low=25 (#9410, #10624)`; the host
+  ceiling's line says `for the host ceiling`, `host-wide` and
+  `hostHigh=`/`hostLow=`. A per-repo breakdown of each tick's deferrals,
+  `work_finder: build back-off deferred N issue(s) in M repo(s) this tick:
+  [/srv/acme=5, …]`, is `INFO` when the set of repos changes and `DEBUG`
+  otherwise. The axis line's `build_backoff_held=` reads `2/14 repos` (plus
+  `+ host ceiling`). Deferred issues show as `deferred_build_backoff` in
+  `loom-daemon queue` (each row names its repo), the tick summary carries
+  `deferred_build_backoff` and `build_backoff_held` (true when any repo is
+  held), and the decisions metric uses reason `build_backoff`. The
+  `BUILD-BACKOFF-HELD` tag in `loom-daemon health` and the tick result
+  `build_backoff_held` both need `deferred_build_backoff > 0`: a repo that is
+  held but has no candidates does not mark the tick, so a repo that stays
+  engaged for days cannot turn every idle or capacity-full tick into a hold.
+  The tick result is `build_backoff_held` when nothing was dispatched, no
+  dispatch failed (`error` ranks first) and the back-off deferred at least one
+  candidate (#10624).
+- **Sharded fleets.** The ledger holds debt only for repos whose role runner
+  runs on this host, so the per-repo limit binds on the repo's owner host. On
+  a non-owner host the repo has no fresh entry and fails open (#10654).
 
 | Config (under `autonomous.workFinder.buildBackoff`) | Default | Validation |
 |---|---|---|
 | `enabled` | `true` | non-bool → default. `false` is exactly the pre-#9410 admission (no ledger read) |
-| `high` (`W`) | `40` | positive integer, else default |
-| `low` (`W_low`) | `25` | positive integer, else default. **`low >= high` rejects the pair**: both fall back to `40`/`25`, with one `WARN` per distinct bad pair |
+| `high` (`W`) | `40` | **per repo**. Positive integer, else default |
+| `low` (`W_low`) | `25` | **per repo**. Positive integer, else default. **`low >= high` rejects the pair**: both fall back to `40`/`25`, with one `WARN` per distinct bad pair |
+| `hostHigh` | absent (off) | host-wide total. Positive integer. Only with `hostLow` |
+| `hostLow` | absent (off) | host-wide total. Positive integer, `< hostHigh`. **A crossed pair, or only one of the two set, leaves the ceiling off**, with one `WARN` per distinct bad pair |
 
 Config only (no env tier), re-read every tick from the daemon's primary
-workspace. **Deploy note:** a host whose debt is already above `high` engages
+workspace, and applied to every repo that daemon dispatches for (a repo's own
+`.loom/config.json` does not set its own thresholds). The hyperparameters
+`rework.buildBackoffHigh` / `rework.buildBackoffLow` overlay `high` / `low`
+and are likewise per repo. **Deploy note:** a repo whose debt is already above `high` engages
 on its first tick after upgrade and stops admitting unstarred builds until its
 debt falls below `low`; that is the intended WIP limit. The escape hatches are
 `buildBackoff.enabled: false` and starring an issue.
@@ -5298,9 +5352,11 @@ knobs not yet audited here.
 | `autonomous.workFinder.saturationBrake.loadPerCoreHold` | `LOOM_ADMISSION_BRAKE_LOAD_PER_CORE` | `0.95` (`4.0` before #5270) | Load-per-core at/over which new admissions are held for that tick. `<= 0`/invalid → default. Since #5270 sits deliberately *below* the host breaker's `2.5` trip: the brake is now the primary "dumb mode" CPU gate and engages first (a single over-threshold reading), the breaker remains the slower sustained-distress trip. **Restart required** — same startup-resolved global as `enabled` above (#5963) |
 | `autonomous.workFinder.saturationBrake.starvationWarnSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_WARN_SECS` | `300` | Seconds of continuous held+0-in-flight before the `WARN`-level `STARVING` log fires once per streak (#5715). `<= 0`/invalid → default. See [Starvation escape hatch](#starvation-escape-hatch-5715) |
 | `autonomous.workFinder.saturationBrake.starvationEscapeSecs` | `LOOM_ADMISSION_BRAKE_STARVATION_ESCAPE_SECS` | `900` | Seconds of continuous held+0-in-flight before the escape hatch yields one tick despite the raw load still being over threshold, logged at `ERROR` (#5715). `<= 0`/invalid → default |
-| `autonomous.workFinder.buildBackoff.enabled` | *(config only)* | `true` | Build back-off on review + merge debt (#9410). While engaged, no new unstarred issue build is admitted; starred and red-main-fix issues bypass it. Reads the role runner's demand ledger, so it is inert with the role runner off. `false` → pre-#9410 admission. Non-bool → default. **Live**. See [Build back-off on review and merge debt](#build-back-off-on-review-and-merge-debt-9410) |
-| `autonomous.workFinder.buildBackoff.high` | *(config only)* | `40` | Engage when `review + changes + merge` debt is **strictly above** this. Zero, negative or non-integer → default. **Live** |
-| `autonomous.workFinder.buildBackoff.low` | *(config only)* | `25` | Release when the debt is **strictly below** this. Zero, negative or non-integer → default; `low >= high` rejects the pair (both fall back to `40`/`25`, one `WARN`). **Live** |
+| `autonomous.workFinder.buildBackoff.enabled` | *(config only)* | `true` | Build back-off on review + merge debt (#9410), per repo (#10624). While a repo's is engaged, no new unstarred issue build is admitted in that repo; starred and red-main-fix issues bypass it. Reads the role runner's demand ledger, so it is inert with the role runner off. `false` → pre-#9410 admission. Non-bool → default. **Live**. See [Build back-off on review and merge debt](#build-back-off-on-review-and-merge-debt-9410) |
+| `autonomous.workFinder.buildBackoff.high` | *(config only)* | `40` | Engage a repo's back-off when **its own** `review + changes + merge` debt is **strictly above** this (#10624). Zero, negative or non-integer → default. **Live** |
+| `autonomous.workFinder.buildBackoff.low` | *(config only)* | `25` | Release a repo's back-off when its debt is **strictly below** this. Zero, negative or non-integer → default; `low >= high` rejects the pair (both fall back to `40`/`25`, one `WARN`). **Live** |
+| `autonomous.workFinder.buildBackoff.hostHigh` | *(config only)* | absent (off) | Optional host-wide ceiling (#10624): engage when the **host total** debt is strictly above this; while engaged, every repo's unstarred builds are held. Needs `hostLow` too. **Live** |
+| `autonomous.workFinder.buildBackoff.hostLow` | *(config only)* | absent (off) | Release the host ceiling when the host total is strictly below this. A crossed or half-set `hostHigh`/`hostLow` pair leaves the ceiling off (one `WARN`). **Live** |
 | `autonomous.workFinder.quarantine.enabled` | `LOOM_WORK_FINDER_QUARANTINE` | `true` | Insta-crash quarantine on/off (#3939). A safety backstop — defaults on |
 | `autonomous.workFinder.quarantine.threshold` | `LOOM_WORK_FINDER_QUARANTINE_THRESHOLD` | `3` | Consecutive insta-crashes before an issue is quarantined. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default. This is the **generation-1** TTL; a relapse serves an escalated one (see `ttlMaxSecs`) |
@@ -7567,6 +7623,59 @@ as before, and after a transfer it can only shrink.
 |---|---|---|
 | `LOOM_REPO_FACTS` | on | `0` makes every migrated site issue exactly its previous forge call and restores the ETag store's process-lifetime `origin` memo (the rollback switch). |
 | `LOOM_REPO_FACTS_VERIFY_SECS` | `21600` | How long a verified record is used before one conditional re-read. |
+
+### Installation snapshot: one listing per credential (`LOOM_INSTALLATION_SNAPSHOT`)
+
+Telemetry visibility (`visibility.repo`), the D32 repo identity
+(`telemetry.repo_identity`) and the write-scope probe (`write_scope.probe`)
+each read `GET repos/<nwo>` once per repository. An App installation token can
+list every repository it reaches in one call, so each credential now keeps one
+snapshot of `GET installation/repositories?per_page=100` (every page, each
+revalidated with its own `If-None-Match`, so an unchanged installation costs
+only free `304`s). Call row: `repo_facts.installation_snapshot`, operation
+`repo.list-for-installation`. The snapshot
+holds each repository's `id`, `full_name` and `private`. It is kept in the
+private ETag store directory as `instsnap-<hash>.json` (`0700` directory,
+`0600` files, atomic writes), so every daemon and CLI process on the host
+shares it. It is keyed by forge host, `GH_CONFIG_DIR` and a fingerprint of any
+env token, never the token.
+
+- **Visibility and identity** read the snapshot of the repository's reader App
+  when one is usable, else the writer credential for its owner.
+- **The write-scope probe** reads the writer's own snapshot (it stays
+  writer-only). A listed repository is WRITE and an absent one is not.
+  `permissions` (leg 1) runs only for a user token, or when the snapshot
+  cannot be had. Then its WRITE stands, a named lesser role (`pull`, `triage`)
+  stands as a definitive refusal, and an all-`false` answer (what an App token
+  always gets) is `Unknown`.
+- **The two TTLs stack.** The probe caches its answer for
+  `LOOM_WRITE_SCOPE_TTL_SECS` (1 h) on top of a snapshot that may already be
+  an hour old, so a repository removed from the installation can keep a cached
+  WRITE for about 2 h with the defaults, not 1 h. The forge still refuses the
+  write itself.
+- **Fail-private.** A snapshot answers only while it was verified within the
+  TTL. A failed revalidation backs off for 300 s and answers nothing; a stale
+  snapshot is never served, and one stamped later than now (a clock step, a
+  damaged file) is discarded. Visibility treats a failed or stale snapshot,
+  and a repository absent from a fresh one, as **private**.
+- **The trade-off.** While the listing cannot be had at TTL expiry (an outage,
+  a rate limit), records for every repository that credential answers for are
+  stamped **private** until a revalidation succeeds, the public ones included.
+- **Rate limits.** A reader App whose listing is rate limited is withdrawn for
+  that `(app, owner)` bucket until the refusal's reset, and the read falls to
+  the writer's snapshot (else private). It never trips the host-wide
+  rate-limit breaker. The writer's refusal does, with its own `GH_CONFIG_DIR`
+  and response headers.
+- **User credentials** (a PAT, OAuth or `gh auth login` token) are refused the
+  endpoint. The refusal is remembered for the TTL, and those reads keep their
+  per-repo calls exactly as before. A credential that has listed before is
+  only reclassified by that specific refusal; any other `403`/`404` is a failed
+  revalidation (private).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOOM_INSTALLATION_SNAPSHOT` | on | `0` restores every per-repo read (so does `LOOM_REPO_FACTS=0`). |
+| `LOOM_INSTALLATION_SNAPSHOT_TTL_SECS` | `3600` | How long a verified snapshot answers before one conditional revalidation, capped at `3600`. It also bounds how long a public/private flip goes unseen by visibility and identity. |
 
 ### Untargeted reads route to readers; deferrable reads shed (`LOOM_FACADE_CWD_ROUTING`, `LOOM_READ_SHED`)
 

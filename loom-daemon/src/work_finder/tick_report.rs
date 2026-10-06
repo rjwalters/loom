@@ -194,9 +194,10 @@ pub struct TickReport {
     /// indistinguishable from a healthy idle one, which is the exact reporting
     /// gap #4903 was filed on.
     pub saturation_held: bool,
-    /// True when the build back-off (#9410) was engaged for this tick, even
-    /// when nothing was deferred (the [`saturation_held`](Self::saturation_held)
-    /// shape).
+    /// True when the build back-off (#9410) held at least one repo this tick
+    /// (#10624: the hold is per repo), even when nothing was deferred. The tick
+    /// result keys on [`deferred_build_backoff`](Self::deferred_build_backoff)
+    /// instead, so a repo that stays held cannot mask other outcomes.
     pub build_backoff_held: bool,
     /// Candidates deferred THIS TICK because they fell outside this host's
     /// preferred repo slice while the slice still had at least one eligible

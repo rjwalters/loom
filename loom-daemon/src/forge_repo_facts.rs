@@ -9,7 +9,7 @@
 //! open-linked-PR probe, the dispatch guards, the telemetry collector). The
 //! answer changes only on a rename, a transfer or a remote edit.
 //!
-//! # Two halves
+//! # Three layers
 //!
 //! 1. **The base repo** ([`base_repo`]) — resolved locally exactly as gh
 //!    resolves it ([`crate::write_scope::target::gh_target`]), zero forge
@@ -36,6 +36,13 @@
 //! repo) or merely drop data (the telemetry collector), `Unavailable` is
 //! treated like `Legacy`: last-known answer, else the pre-facts call.
 //!
+//! 3. **The installation snapshot** ([`installation`], W8) — per credential,
+//!    one conditional `GET installation/repositories` listing `id`,
+//!    `full_name` and `private` for every repo the installation reaches,
+//!    revalidated hourly. Telemetry visibility, the D32 repo identity and the
+//!    write-scope probe read it instead of one `GET repos/<nwo>` per repo. A
+//!    missing, stale or failed answer is never "public".
+//!
 //! # Kill switch
 //!
 //! `LOOM_REPO_FACTS=0` makes every migrated site issue exactly its previous
@@ -45,6 +52,7 @@
 mod base;
 mod confirm;
 mod crosscheck;
+pub(crate) mod installation;
 mod record;
 mod state;
 

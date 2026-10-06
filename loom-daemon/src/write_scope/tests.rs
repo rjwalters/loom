@@ -407,6 +407,10 @@ fn daemon_write_paths_are_scoped() {
             "claim_reconciliation/merge_sequence_sticky.rs",
             Via(PASS, "merge-sequence sticky operator-release record"),
         ),
+        (
+            "claim_reconciliation/merge_sequence_landing.rs",
+            Via(PASS, "merge-sequence landing-order comment upsert (#10634)"),
+        ),
         ("claim_reconciliation/pass_loop/building_heal.rs", Via(PASS, "heal pass")),
         (
             "forge_disable_auto_merge.rs",

@@ -205,9 +205,29 @@ fn timestamp(v: &serde_json::Value) -> Option<chrono::DateTime<chrono::FixedOffs
     chrono::DateTime::parse_from_rfc3339(v.pointer("/created_at")?.as_str()?).ok()
 }
 
+/// When a timeline comment last took its current body: the later of its
+/// `created_at` and `updated_at`. The #10634 landing upsert PATCHes a new
+/// marker into an existing comment, so `created_at` alone back-dates it
+/// (Judge, PR #10651). An absent `updated_at` (or JSON `null`) means never
+/// edited; a present but unparseable one is an unknown (`None`).
+fn comment_timestamp(v: &serde_json::Value) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let created = timestamp(v)?;
+    match v.pointer("/updated_at") {
+        None | Some(serde_json::Value::Null) => Some(created),
+        Some(u) => {
+            let updated = chrono::DateTime::parse_from_rfc3339(u.as_str()?).ok()?;
+            Some(created.max(updated))
+        }
+    }
+}
+
 /// Is the newest `loom:sequenced` label event in `events` (a paginated
 /// issue-timeline body) a removal by an actor `is_fleet` does not claim,
 /// made AFTER the comment that wrote `marker`?
+///
+/// A carrying comment is dated by the later of its `created_at` and
+/// `updated_at`: the landing upsert (#10634) edits a marker into an existing
+/// comment in place, and the marker is only as old as that edit.
 ///
 /// `Some(false)` for no such event, a newest `labeled`, a fleet actor, or a
 /// removal no newer than the marker comment (it released an earlier hold,
@@ -258,7 +278,7 @@ pub fn operator_unlabeled(
             && str_at(e, "/body").is_some_and(|b| carries_marker(&b, marker))
     }) {
         // Any carrying comment with an unreadable timestamp is an unknown.
-        let at = timestamp(c)?;
+        let at = comment_timestamp(c)?;
         marker_at = Some(marker_at.map_or(at, |m: chrono::DateTime<_>| m.max(at)));
     }
     Some(removed_at > marker_at?)
