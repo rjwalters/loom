@@ -101,6 +101,7 @@
 //! host (#5336).
 
 pub mod backfill;
+pub mod captain_gauges;
 pub mod claude_code_telemetry;
 pub mod collector;
 pub mod cycle_guard;

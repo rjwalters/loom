@@ -1,0 +1,417 @@
+//! Captain-produced fleet gauges (W12): config, role, freshness, gauges, and
+//! the heartbeat's store round trip against an in-memory contents API.
+
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+
+use chrono::{DateTime, Duration, TimeZone, Utc};
+use serde_json::{json, Value};
+
+use super::store::{self, FetchCache, Fetched, Heartbeat, JobFacts, PublishCache};
+use super::{
+    coverage, points, resolve_role, Config, Role, DEFAULT_MAX_AGE_SECS,
+    DEFAULT_PUBLISH_INTERVAL_SECS, STAGE_DWELL_JOB, STAND_DOWN_ENV,
+};
+use crate::fleet_captain::CaptainGate;
+use crate::fleet_store::fetch::{Reply, Transport};
+use crate::fleet_store::propose::WriteTransport;
+use crate::fleet_store::StoreLocation;
+use crate::telemetry::ops::{MetricName, MetricPoint};
+
+const CAPTAIN: &str = "captain-host";
+
+fn at(mins: i64) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 6, 12, 0, 0).unwrap() + Duration::minutes(mins)
+}
+
+fn no_env(_: &str) -> Option<String> {
+    None
+}
+
+fn config(block: Value) -> Config {
+    Config::from_effective(&json!({ "fleet": { "captainGauges": block } }), &no_env)
+}
+
+fn facts(as_of: DateTime<Utc>, repos: &[&str]) -> JobFacts {
+    JobFacts {
+        as_of,
+        repos: repos.iter().map(|r| (*r).to_string()).collect(),
+    }
+}
+
+fn heartbeat(captain: &str, as_of: DateTime<Utc>, repos: &[&str]) -> Heartbeat {
+    Heartbeat::new(captain, as_of, [(STAGE_DWELL_JOB.to_string(), facts(as_of, repos))].into())
+}
+
+// ---- config + role ---------------------------------------------------------
+
+#[test]
+fn an_unconfigured_host_keeps_todays_behaviour() {
+    let cfg = Config::from_effective(&json!({}), &no_env);
+    assert!(!cfg.enabled && !cfg.stand_down);
+    assert_eq!(cfg.max_age, Duration::seconds(DEFAULT_MAX_AGE_SECS));
+    assert_eq!(cfg.publish_interval, Duration::seconds(DEFAULT_PUBLISH_INTERVAL_SECS));
+    // Whatever the captain gate says, nothing changes without the switches.
+    for gate in [
+        CaptainGate::Armed {
+            captain: CAPTAIN.into(),
+        },
+        CaptainGate::Refused {
+            captain: CAPTAIN.into(),
+            current_host_id: "dispatcher".into(),
+        },
+        CaptainGate::NoCaptainDeclared,
+    ] {
+        assert!(matches!(resolve_role(&gate, &cfg, true), Role::Local { .. }), "{gate:?}");
+    }
+}
+
+#[test]
+fn config_reads_every_key_and_ignores_bad_values() {
+    let cfg = config(json!({
+        "enabled": true, "standDown": true, "maxAgeSecs": 900, "publishIntervalSecs": 300
+    }));
+    assert!(cfg.enabled && cfg.stand_down);
+    assert_eq!(cfg.max_age, Duration::seconds(900));
+    assert_eq!(cfg.publish_interval, Duration::seconds(300));
+    let bad = config(json!({"enabled": "yes", "maxAgeSecs": 0, "publishIntervalSecs": -5}));
+    assert!(!bad.enabled);
+    assert_eq!(bad.max_age, Duration::seconds(DEFAULT_MAX_AGE_SECS));
+    assert_eq!(bad.publish_interval, Duration::seconds(DEFAULT_PUBLISH_INTERVAL_SECS));
+}
+
+#[test]
+fn the_env_switch_overrides_stand_down_both_ways() {
+    let effective = json!({"fleet": {"captainGauges": {"standDown": true}}});
+    let off = |k: &str| (k == STAND_DOWN_ENV).then(|| "0".to_string());
+    assert!(!Config::from_effective(&effective, &off).stand_down);
+    let on = |k: &str| (k == STAND_DOWN_ENV).then(|| "true".to_string());
+    assert!(Config::from_effective(&json!({}), &on).stand_down);
+    let junk = |k: &str| (k == STAND_DOWN_ENV).then(|| "maybe".to_string());
+    assert!(Config::from_effective(&effective, &junk).stand_down);
+}
+
+#[test]
+fn role_follows_the_gate_and_the_switches() {
+    let both = config(json!({"enabled": true, "standDown": true}));
+    let armed = CaptainGate::Armed {
+        captain: CAPTAIN.into(),
+    };
+    let refused = CaptainGate::Refused {
+        captain: CAPTAIN.into(),
+        current_host_id: "dispatcher".into(),
+    };
+    assert_eq!(
+        resolve_role(&armed, &both, false),
+        Role::Captain {
+            captain: CAPTAIN.into()
+        },
+        "the captain produces even with no store; it just cannot publish"
+    );
+    assert_eq!(
+        resolve_role(&refused, &both, true),
+        Role::Dispatcher {
+            captain: CAPTAIN.into()
+        }
+    );
+    assert_eq!(resolve_role(&refused, &both, false), Role::Local { reason: "no_store" });
+    // No captain declared is fail-open: produce locally everywhere.
+    assert_eq!(
+        resolve_role(&CaptainGate::NoCaptainDeclared, &both, true),
+        Role::Local {
+            reason: "no_captain"
+        }
+    );
+    // Captain arming and dispatcher stand-down are independent switches.
+    let only_stand_down = config(json!({"standDown": true}));
+    assert!(matches!(resolve_role(&armed, &only_stand_down, true), Role::Local { .. }));
+    let only_enabled = config(json!({"enabled": true}));
+    assert!(matches!(resolve_role(&refused, &only_enabled, true), Role::Local { .. }));
+}
+
+// ---- freshness + coverage --------------------------------------------------
+
+#[test]
+fn a_dispatcher_stands_down_only_on_fresh_data_from_the_declared_captain() {
+    let max_age = Duration::seconds(DEFAULT_MAX_AGE_SECS);
+    let hb = heartbeat(CAPTAIN, at(0), &["acme/app"]);
+    // Fresh, up to and including the bound.
+    assert!(hb.fresh(STAGE_DWELL_JOB, CAPTAIN, at(0), max_age).is_some());
+    assert!(hb
+        .fresh(STAGE_DWELL_JOB, CAPTAIN, at(30), max_age)
+        .is_some());
+    // Stale one second later: the captain is down, the dispatcher takes over.
+    let stale = at(30) + Duration::seconds(1);
+    assert!(hb.fresh(STAGE_DWELL_JOB, CAPTAIN, stale, max_age).is_none());
+    // Published by a former captain: never trusted.
+    assert!(hb
+        .fresh(STAGE_DWELL_JOB, "other-host", at(1), max_age)
+        .is_none());
+    // An as_of from the future beyond the skew is refused.
+    assert!(hb
+        .fresh(STAGE_DWELL_JOB, CAPTAIN, at(-6), max_age)
+        .is_none());
+    assert!(hb
+        .fresh(STAGE_DWELL_JOB, CAPTAIN, at(-4), max_age)
+        .is_some());
+    // A job the captain does not produce is never covered.
+    assert!(hb.fresh("other-job", CAPTAIN, at(1), max_age).is_none());
+}
+
+#[test]
+fn coverage_is_per_job_and_per_repo() {
+    let max_age = Duration::minutes(30);
+    let hb = heartbeat(CAPTAIN, at(0), &["acme/app", "acme/lib"]);
+    let covered = coverage(Some(&hb), CAPTAIN, at(10), max_age);
+    let repos: BTreeSet<String> = ["acme/app".to_string(), "acme/lib".to_string()].into();
+    assert_eq!(covered.get(STAGE_DWELL_JOB), Some(&repos));
+    assert!(coverage(Some(&hb), CAPTAIN, at(31), max_age).is_empty());
+    assert!(coverage(None, CAPTAIN, at(1), max_age).is_empty());
+}
+
+// ---- gauges ----------------------------------------------------------------
+
+fn point(name: MetricName, value: i64) -> MetricPoint {
+    MetricPoint::int(name, value).label("task", STAGE_DWELL_JOB)
+}
+
+#[test]
+fn a_dispatcher_reports_the_captains_age_and_whether_it_fell_back() {
+    let role = Role::Dispatcher {
+        captain: CAPTAIN.into(),
+    };
+    let hb = heartbeat(CAPTAIN, at(0), &["acme/app"]);
+    let max_age = Duration::minutes(30);
+    let fresh = coverage(Some(&hb), CAPTAIN, at(10), max_age);
+    let out = points(&role, &BTreeMap::new(), Some(&hb), &fresh, at(10));
+    assert_eq!(
+        out,
+        vec![
+            point(MetricName::CaptainGaugeAgeSeconds, 600),
+            point(MetricName::CaptainGaugeFallback, 0)
+        ]
+    );
+    // Captain down: the age keeps growing and the fallback flag goes up.
+    let stale = coverage(Some(&hb), CAPTAIN, at(45), max_age);
+    let out = points(&role, &BTreeMap::new(), Some(&hb), &stale, at(45));
+    assert_eq!(
+        out,
+        vec![
+            point(MetricName::CaptainGaugeAgeSeconds, 2700),
+            point(MetricName::CaptainGaugeFallback, 1)
+        ]
+    );
+    // Nothing published yet: no age point (unknown is not zero), fallback 1.
+    let out = points(&role, &BTreeMap::new(), None, &BTreeMap::new(), at(1));
+    assert_eq!(out, vec![point(MetricName::CaptainGaugeFallback, 1)]);
+}
+
+#[test]
+fn the_captain_reports_its_own_age_and_a_local_host_reports_nothing() {
+    let captain = Role::Captain {
+        captain: CAPTAIN.into(),
+    };
+    let produced = [(STAGE_DWELL_JOB.to_string(), facts(at(0), &["acme/app"]))].into();
+    let out = points(&captain, &produced, None, &BTreeMap::new(), at(5));
+    assert_eq!(out, vec![point(MetricName::CaptainGaugeAgeSeconds, 300)]);
+    assert!(points(&captain, &BTreeMap::new(), None, &BTreeMap::new(), at(5)).is_empty());
+    let local = Role::Local {
+        reason: "stand_down_off",
+    };
+    assert!(points(&local, &produced, None, &BTreeMap::new(), at(5)).is_empty());
+}
+
+// ---- store -----------------------------------------------------------------
+
+fn loc(reference: &str) -> StoreLocation {
+    StoreLocation {
+        repo: "o/store".into(),
+        reference: reference.into(),
+    }
+}
+
+fn reply(status: u16, body: impl Into<String>) -> Reply {
+    Reply {
+        status,
+        etag: None,
+        body: body.into(),
+    }
+}
+
+/// An in-memory contents API for one file on one branch.
+#[derive(Default)]
+struct Store {
+    file: RefCell<Option<(String, u32)>>,
+    branch: RefCell<bool>,
+    down: RefCell<bool>,
+    /// Make the next PUT answer 409 (a stale sha) once.
+    conflict: RefCell<bool>,
+    gets: RefCell<Vec<String>>,
+    writes: RefCell<Vec<(String, String, Value)>>,
+}
+
+impl Transport for Store {
+    fn get(
+        &self,
+        api_path: &str,
+        accept: Option<&str>,
+        etag: Option<&str>,
+    ) -> anyhow::Result<Reply> {
+        self.gets.borrow_mut().push(api_path.to_string());
+        if *self.down.borrow() {
+            anyhow::bail!("network down");
+        }
+        if api_path.contains("/git/ref/heads/") {
+            return Ok(reply(if *self.branch.borrow() { 200 } else { 404 }, ""));
+        }
+        if api_path.contains("/commits/") {
+            return Ok(reply(200, "a".repeat(40)));
+        }
+        assert!(api_path.contains(store::HEARTBEAT_PATH), "{api_path}");
+        let file = self.file.borrow();
+        let Some((body, version)) = file.as_ref() else {
+            return Ok(reply(404, ""));
+        };
+        let tag = format!("\"v{version}\"");
+        if etag == Some(tag.as_str()) {
+            return Ok(reply(304, ""));
+        }
+        if accept.is_some_and(|a| a.contains("raw")) {
+            return Ok(Reply {
+                status: 200,
+                etag: Some(tag),
+                body: body.clone(),
+            });
+        }
+        Ok(reply(200, json!({"sha": format!("sha{version}")}).to_string()))
+    }
+}
+
+impl WriteTransport for Store {
+    fn write(&self, method: &str, api_path: &str, body: &Value) -> anyhow::Result<Reply> {
+        self.writes
+            .borrow_mut()
+            .push((method.to_string(), api_path.to_string(), body.clone()));
+        if api_path.ends_with("/git/refs") {
+            *self.branch.borrow_mut() = true;
+            return Ok(reply(201, "{}"));
+        }
+        let mut file = self.file.borrow_mut();
+        let version = file.as_ref().map_or(0, |(_, v)| *v);
+        let expected = (version > 0).then(|| format!("sha{version}"));
+        let sent = body.get("sha").and_then(Value::as_str).map(str::to_string);
+        if std::mem::take(&mut *self.conflict.borrow_mut()) || sent != expected {
+            return Ok(reply(409, "{}"));
+        }
+        let content = body["content"].as_str().unwrap();
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(content)
+            .unwrap();
+        let next = version + 1;
+        *file = Some((String::from_utf8(bytes).unwrap(), next));
+        Ok(reply(200, json!({"content": {"sha": format!("sha{next}")}}).to_string()))
+    }
+}
+
+fn puts(s: &Store) -> usize {
+    s.writes
+        .borrow()
+        .iter()
+        .filter(|(m, ..)| m == "PUT")
+        .count()
+}
+
+#[test]
+fn the_heartbeat_round_trips_and_reuses_the_blob_sha() {
+    let s = Store::default();
+    let mut cache = PublishCache::default();
+    let hb = heartbeat(CAPTAIN, at(0), &["acme/app"]);
+    store::publish(&s, &s, &loc("eta-fit"), "main", &hb, &mut cache).unwrap();
+    assert!(*s.branch.borrow(), "the publication branch is created from the base");
+    let hb2 = heartbeat(CAPTAIN, at(10), &["acme/app"]);
+    let gets_before = s.gets.borrow().len();
+    store::publish(&s, &s, &loc("eta-fit"), "main", &hb2, &mut cache).unwrap();
+    assert_eq!(s.gets.borrow().len(), gets_before, "the second publish makes no read at all");
+    assert_eq!(puts(&s), 2);
+
+    let mut fetch = FetchCache::default();
+    assert_eq!(store::fetch(&s, &loc("eta-fit"), &mut fetch), Fetched::Updated);
+    assert_eq!(fetch.heartbeat.as_ref(), Some(&hb2));
+    // Unchanged: a 304, and the cached heartbeat is still served.
+    assert_eq!(store::fetch(&s, &loc("eta-fit"), &mut fetch), Fetched::NotModified);
+    assert_eq!(fetch.heartbeat.as_ref(), Some(&hb2));
+}
+
+#[test]
+fn a_stale_sha_is_reread_once() {
+    let s = Store::default();
+    *s.branch.borrow_mut() = true;
+    let mut cache = PublishCache::default();
+    store::publish(&s, &s, &loc("eta-fit"), "main", &heartbeat(CAPTAIN, at(0), &[]), &mut cache)
+        .unwrap();
+    *s.conflict.borrow_mut() = true;
+    store::publish(&s, &s, &loc("eta-fit"), "main", &heartbeat(CAPTAIN, at(1), &[]), &mut cache)
+        .unwrap();
+    assert_eq!(puts(&s), 3, "one conflict, one retry");
+}
+
+#[test]
+fn the_heartbeat_never_lands_on_the_reviewed_branch_or_main() {
+    let s = Store::default();
+    let hb = heartbeat(CAPTAIN, at(0), &[]);
+    for (reference, base) in [
+        ("main", "main"),
+        ("stable", "stable"),
+        ("Main", "x"),
+        ("refs/heads/g", "main"),
+    ] {
+        let err = store::publish(&s, &s, &loc(reference), base, &hb, &mut PublishCache::default());
+        assert!(err.is_err(), "{reference} vs {base}");
+    }
+    assert!(s.writes.borrow().is_empty());
+}
+
+#[test]
+fn a_read_failure_keeps_the_last_heartbeat_ageing_and_a_404_clears_it() {
+    let s = Store::default();
+    let hb = heartbeat(CAPTAIN, at(0), &["acme/app"]);
+    store::publish(&s, &s, &loc("eta-fit"), "main", &hb, &mut PublishCache::default()).unwrap();
+    let mut fetch = FetchCache::default();
+    store::fetch(&s, &loc("eta-fit"), &mut fetch);
+    *s.down.borrow_mut() = true;
+    assert!(matches!(store::fetch(&s, &loc("eta-fit"), &mut fetch), Fetched::Failed(_)));
+    let max_age = Duration::minutes(30);
+    // Still standing down while the captain's last known output is fresh ...
+    assert!(!coverage(fetch.heartbeat.as_ref(), CAPTAIN, at(20), max_age).is_empty());
+    // ... and back to local production once it is stale: no gap either way.
+    assert!(coverage(fetch.heartbeat.as_ref(), CAPTAIN, at(31), max_age).is_empty());
+
+    *s.down.borrow_mut() = false;
+    *s.file.borrow_mut() = None;
+    assert_eq!(store::fetch(&s, &loc("eta-fit"), &mut fetch), Fetched::Absent);
+    assert!(fetch.heartbeat.is_none());
+}
+
+#[test]
+fn a_malformed_heartbeat_is_never_trusted() {
+    let s = Store::default();
+    *s.file.borrow_mut() = Some((r#"{"schema": "captain-gauges/v0"}"#.to_string(), 1));
+    let mut fetch = FetchCache::default();
+    assert!(matches!(store::fetch(&s, &loc("eta-fit"), &mut fetch), Fetched::Failed(_)));
+    assert!(fetch.heartbeat.is_none());
+}
+
+#[test]
+fn the_publication_branch_defaults_to_the_eta_fit_branch() {
+    assert_eq!(store::resolve_ref(&json!({})), "eta-fit");
+    assert_eq!(store::resolve_ref(&json!({"fleet": {"etaFitRef": "pub"}})), "pub");
+    let own = json!({"fleet": {"etaFitRef": "pub", "captainGauges": {"ref": "gauges"}}});
+    assert_eq!(store::resolve_ref(&own), "gauges");
+    // No fleet store: the feature is off.
+    assert!(store::location_for(&json!({}), &no_env).is_none());
+    let configured = json!({"fleet": {"repo": "o/store"}});
+    let (location, base) = store::location_for(&configured, &no_env).unwrap();
+    assert_eq!((location.repo.as_str(), location.reference.as_str()), ("o/store", "eta-fit"));
+    assert_eq!(base, "main");
+}

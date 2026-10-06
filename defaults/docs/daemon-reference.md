@@ -7033,6 +7033,69 @@ repo, and every existing snapshot). Then re-enable `fleetRefresh` on any host
 where it was turned off as a mitigation; the other hosts stand down by
 themselves.
 
+#### Fleet gauges produced by the captain (W12)
+
+Some collector gauges describe the forge, not the host. The forge label-stage
+dwell (`loom.forge.stage_dwell`, `loom.forge.stage_items`; singleton job
+**`stage-dwell`**) lists the same stage labels of the same repos on every host
+that manages them, so N hosts spend N times the reader budget to export N
+copies of one fact. With `fleet.captainGauges` configured, the declared
+captain produces it for the fleet and a dispatcher stops producing it for the
+repos the captain covers, **only while the captain's output is fresh**.
+Assigned, not elected: there is no standby producer. Per-host gauges and
+dispatch gates (`role_queue_gate`, `role_demand`, the work finder's listings)
+are unchanged on every host. Code: `observability/captain_gauges.rs`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `fleet.captainGauges.enabled` | `false` | On the declared captain: arm the singleton jobs (`host.health.armed_singleton_jobs`) and publish their freshness |
+| `fleet.captainGauges.standDown` | `false` | On a dispatcher: skip a job for the repos a fresh heartbeat covers. Env `LOOM_CAPTAIN_GAUGES_STAND_DOWN` (`0`/`1`) overrides it per host |
+| `fleet.captainGauges.maxAgeSecs` | `1800` | A job's published `as_of` older than this is stale and the dispatcher produces locally again. Two publish intervals plus two collector passes, the fleet refresh's own liveness rule |
+| `fleet.captainGauges.publishIntervalSecs` | `600` | How often the captain writes the heartbeat |
+| `fleet.captainGauges.ref` | `fleet.etaFitRef` (`eta-fit`) | The fleet-store branch the heartbeat lives on. Never the store's reviewed branch or `main` |
+
+**How a dispatcher knows the captain is fresh.** Hosts have no channel to
+each other's telemetry, so the captain publishes a heartbeat to the fleet
+store (`fleet.repo`), beside its ETA fit and through the same transport and
+credentials (#10395): `captain/gauges.json`, schema `captain-gauges/v1`, with
+per job the `as_of` of the captain's last finished pass (its points handed to
+the OTLP sink) and the repos it covered. A dispatcher reads it once per
+collector pass with `If-None-Match` (a `304` when unchanged) and stands down
+for a job and repo only when the heartbeat names the declared captain and the
+`as_of` is within `maxAgeSecs`. A read failure keeps the last heartbeat, which
+keeps ageing; a missing or malformed one counts as absent. Without
+`fleet.repo` there is no heartbeat and every host produces locally. When a
+dispatcher takes a repo back it starts from a fresh baseline, so the
+transitions the captain already sampled are not replayed.
+
+| Gate | `fleet.captainGauges` | What the pass does |
+|---|---|---|
+| `Armed` | `enabled` | Arms `stage-dwell`, produces as before, publishes the heartbeat every `publishIntervalSecs` |
+| `Refused` | `standDown`, store configured | Skips the repos the fresh heartbeat covers; produces the rest |
+| anything else | | Produces locally, exactly as before |
+
+**Captain down** shows as `loom.captain.gauge_age_seconds{task}` growing on
+every dispatcher, then `loom.captain.gauge_fallback{task} = 1` once it passes
+`maxAgeSecs` while the dispatchers produce locally: the gauges never go
+missing. Alert on `gauge_fallback == 1` or on the age passing the bound. See
+[`telemetry-schema.md`](telemetry-schema.md#metricpoints).
+
+**Mixed-version safety.** Both switches default off and older daemons ignore
+the keys, so an unconfigured or older host keeps today's behaviour. A
+dispatcher stands down only on fresh data from the current captain, so an
+older captain (no heartbeat) leaves every dispatcher producing.
+
+**Rollout order**: deploy everywhere; set `fleet.captainGauges.enabled` and
+confirm the captain's `loom.captain.gauge_age_seconds` stays under
+`maxAgeSecs`; then set `fleet.captainGauges.standDown`. The captain needs the
+OTLP exporter, the fleet repos provisioned, and the writer App's
+`contents:write` on the store's publication branch (already true where the ETA
+fit is published).
+
+**ETA queue friction** is already a singleton: it runs inside the ETA pass,
+which only the ETA authority runs (#10498), and the authority defaults to the
+declared captain. It needs no heartbeat.
+
 ### Role-runner host roster (#6704, phases A and B)
 
 The design record — [`role-runner-roster.md`](role-runner-roster.md) — picked
