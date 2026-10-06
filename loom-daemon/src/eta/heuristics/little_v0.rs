@@ -122,6 +122,7 @@ impl Heuristic for LittleV0 {
             stalled: stall::binding(&input.stalls, as_of),
             truncated: Vec::new(),
             recalibration: None,
+            calibration: None,
             twin_otter: None,
             queue: None,
         };
