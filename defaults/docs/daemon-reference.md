@@ -6267,6 +6267,18 @@ nothing to do" must never accrete toward a `loom:blocked` hold, and
 `LOOM_WORK_FINDER_PRLESS_RETRY=0` or
 `autonomous.workFinder.prlessRetry.enabled = false`.
 
+**Phaseless deaths have a durable floor (#10642).** The tally above is
+in-memory: a daemon restart resets it, and a streak more than `maxBackoffSecs`
+old goes cold. Sweeps that die before any phase checkpoint with no classifier
+label (`failure_class = unclassified:no-phase-signal`, ~90 s each) slipped
+through both on `2AMLogic/2am` — 278 in a day, one issue 47 times. For that
+class only, this host's own count of such deaths for the issue in the last 24 h
+is read back from the `sweep.outcome` journal and used as a lower bound on the
+consecutive count, so the hold lands at `threshold` per issue per day
+regardless of restarts or spacing. A landing in the journal, or any clear above
+(open PR, merge, self-reported no-op), ends that count. The hold comment
+carries the record's `no_phase_cause` (exit code, last step, reason).
+
 **Verified-open-PR memo (#6788).** The three brakes above bound how often an
 issue is *re-dispatched*. A fourth, narrower problem sits one layer down, in the
 #4123 open-PR guard's own probe: an issue whose closing PR is parked awaiting a

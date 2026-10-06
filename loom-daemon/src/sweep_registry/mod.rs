@@ -676,7 +676,7 @@ pub struct SweepRegistry {
     /// self-reported conclusion), [`dispatch_backoff`](Self::dispatch_backoff)
     /// (a crash/no-progress cadence), [`decline_cooldown`](Self::decline_cooldown)
     /// (a standing question) and the quarantine tally (a fast-crash brake).
-    prless_retry: HashMap<u32, PrlessRetryState>,
+    prless_retry: PrlessTally,
     /// Per-issue memo of the last **verified** open linked PR (Issue #6788),
     /// written only by [`probe_open_linked_pr`](Self::probe_open_linked_pr) and
     /// consumed only by it. See [`OpenPrMemoEntry`] and
@@ -1174,7 +1174,7 @@ impl SweepRegistry {
             decline_cooldown_config: DeclineCooldownConfig::default(),
             decline_cooldown: HashMap::new(),
             prless_retry_config: PrlessRetryConfig::default(),
-            prless_retry: HashMap::new(),
+            prless_retry: PrlessTally::default(),
             open_pr_memo: Mutex::new(HashMap::new()),
             token_selection_failures: HashMap::new(),
             label_flip_log: HashMap::new(),

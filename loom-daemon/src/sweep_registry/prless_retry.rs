@@ -172,6 +172,17 @@ pub use hold::*;
 #[cfg(test)]
 mod fleet_tests;
 
+/// The durable half of the tally (Issue #10642): `no-phase-signal` deaths
+/// counted from this host's outcome journal, so a daemon restart or a cold
+/// in-memory streak cannot reset them. See its own header.
+mod durable;
+pub(crate) use durable::PrlessTally;
+
+/// Phaseless deaths (`unclassified:no-phase-signal`, Issue #10642) driven end
+/// to end through `reap_once`.
+#[cfg(test)]
+mod no_phase_tests;
+
 /// Env var toggling the PR-less retry bound (Issue #7972). `0`/`false`/`no`/
 /// `off` disables; `1`/`true`/`yes`/`on` forces on. Overrides config. Defaults
 /// ON, like every sibling brake — it is a dispatch-efficiency backstop, and the
@@ -518,7 +529,9 @@ impl SweepRegistry {
                      its PR-less retry tally untouched (fail-open, #7972)"
                 );
             }
-            OpenPrProbe::NoneOpen => self.record_prless_release(issue, reason),
+            // #10642: through the durable floor, so a phaseless death counts
+            // across a daemon restart and past the in-memory cold window.
+            OpenPrProbe::NoneOpen => self.record_prless_release_for(issue, sweep_id, reason),
         }
     }
 
@@ -624,6 +637,15 @@ impl SweepRegistry {
     /// A no-op when the mechanism is disabled, mirroring
     /// [`Self::record_noop_release`]'s disabled-path contract.
     pub(crate) fn record_prless_release(&mut self, issue: u32, reason: &str) {
+        self.record_prless_release_floored(issue, reason, 0);
+    }
+
+    /// [`Self::record_prless_release`] with a lower bound on this host's
+    /// consecutive count (Issue #10642): `floor` is the durable count of
+    /// `no-phase-signal` deaths read from the outcome journal (see
+    /// [`durable`]), which survives a daemon restart and the in-memory
+    /// streak-cold rule. `0` is exactly the in-memory behaviour.
+    pub(crate) fn record_prless_release_floored(&mut self, issue: u32, reason: &str, floor: u32) {
         if !self.prless_retry_config.enabled {
             return;
         }
@@ -635,7 +657,8 @@ impl SweepRegistry {
                 prev.consecutive.saturating_add(1)
             }
             _ => 1,
-        };
+        }
+        .max(floor);
         // #9292: the peer term. Each peer reports only its OWN running total
         // and this host's own ad is never folded back into its view, so the
         // sum is disjoint from `consecutive` above. Zero without peer
@@ -746,6 +769,9 @@ impl SweepRegistry {
     /// conclusion is not a failed attempt, and #6670's own cooldown is the
     /// right brake for it).
     pub(crate) fn clear_prless_retry(&mut self, issue: u32) -> bool {
+        // #10642: remember WHEN, so the durable floor never counts the
+        // journal records this clear just excused.
+        self.prless_retry.note_cleared(issue, Utc::now());
         self.prless_retry.remove(&issue).is_some()
     }
 
