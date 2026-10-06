@@ -152,7 +152,7 @@ pub fn probe_with(
 /// `gh api .../pulls` uses the separate, less-contended REST pool. A REST
 /// failure is `Unknown` for the fallback, never "not merged" (#7812).
 fn forge_probe_rest_first(repo_root: &Path, branch: &str) -> ForgeProbe {
-    clean::repo_owner_rest(repo_root)
+    super::clean_owner::repo_owner(repo_root)
         .and_then(|owner| merged_head_rest(repo_root, &owner, branch))
         .unwrap_or_else(|| branch_landed::forge_probe(repo_root, branch))
 }
@@ -166,6 +166,8 @@ struct RestPr {
     closed_at: Option<String>,
     #[serde(default)]
     head: Option<RestHead>,
+    #[serde(default)]
+    base: Option<RestBase>,
 }
 
 #[derive(serde::Deserialize)]
@@ -174,17 +176,58 @@ struct RestHead {
     sha: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+struct RestBase {
+    #[serde(default)]
+    repo: Option<RestRepo>,
+}
+
+#[derive(serde::Deserialize)]
+struct RestRepo {
+    #[serde(default)]
+    full_name: Option<String>,
+}
+
 /// `repos/{owner}/{repo}/pulls?state=all&head=<owner>:<branch>` — same query
 /// as [`clean::check_pr_status_for_branch_rest`], but carrying the merged
 /// PR's head SHA the tip-match rung needs. `None` = REST could not answer.
-fn merged_head_rest(repo_root: &Path, owner: &str, branch: &str) -> Option<ForgeProbe> {
-    let path =
-        format!("repos/{{owner}}/{{repo}}/pulls?state=all&head={owner}:{branch}&per_page=30");
+///
+/// When the owner came from a repo fact, every row must target the canonical
+/// repo (`base.repo.full_name`); a foreign row is no answer (`None`, so the
+/// ladder's own probe decides) and casts doubt on the record (W3a). An empty
+/// answer stays `NotFound` without a confirm: here that is already the
+/// conservative reading.
+fn merged_head_rest(
+    repo_root: &Path,
+    owner: &crate::forge_repo_facts::OwnerFact,
+    branch: &str,
+) -> Option<ForgeProbe> {
+    let path = format!(
+        "repos/{{owner}}/{{repo}}/pulls?state=all&head={}:{branch}&per_page=30",
+        owner.owner
+    );
+    let sent_at = chrono::Utc::now().timestamp();
     let out = gh::bounded_counted("worktree.landed_pulls", repo_root, ["api", &path])?;
     if !out.status.success() {
         return None;
     }
     let rows = serde_json::from_slice::<Vec<RestPr>>(&out.stdout).ok()?;
+    if let Some(fact) = &owner.fact {
+        let canonical = fact.full_name();
+        let base_of = |r: &RestPr| r.base.as_ref()?.repo.as_ref()?.full_name.clone();
+        if let Some(foreign) = rows.iter().map(base_of).find(|b| {
+            !b.as_deref()
+                .is_some_and(|b| b.eq_ignore_ascii_case(&canonical))
+        }) {
+            if let Some(full) = foreign.as_deref() {
+                crate::forge_repo_facts::observe(&fact.host, &fact.configured_nwo, full, sent_at);
+            }
+            return None;
+        }
+        if !rows.is_empty() {
+            crate::forge_repo_facts::observe(&fact.host, &fact.configured_nwo, &canonical, sent_at);
+        }
+    }
     rest_rows_to_probe(rows)
 }
 
@@ -323,6 +366,7 @@ mod tests {
             head: Some(RestHead {
                 sha: sha.map(str::to_string),
             }),
+            base: None,
         }
     }
 

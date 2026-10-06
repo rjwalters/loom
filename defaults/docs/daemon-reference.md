@@ -7339,6 +7339,74 @@ this loop uses), and `health --json`'s `tokens.detail.per_repo` surfaces it —
 see [token-pool.md's `loom-daemon health` distinction](token-pool.md#loom-daemon-healths-daemon-cwd-vs-operator-repo-distinction-5269)
 for the full incident writeup and the now-obsolete `$HOME`-refresh workaround.
 
+### Repo facts: base repo and canonical owner without a call per use (`LOOM_REPO_FACTS`)
+
+Several hot paths used to ask the forge the same static question on every
+pass: the worktree and primary-checkout reapers, `landed` and `clean` ran
+`gh api repos/{owner}/{repo} --jq .owner.login` (`clean.repo_owner`), and the
+open-linked-PR probe, the dispatch guards and the telemetry collector ran
+`gh repo view` (`worktree.resolve_repo`, `guard.repo_nwo`,
+`collector.repo_slug`). The answer changes only on a rename, a transfer or a
+remote edit. `loom-daemon/src/forge_repo_facts.rs` now answers it from two
+layers:
+
+1. **The base repo**, resolved locally the way gh resolves it (`GH_REPO` >
+   `gh repo set-default` > `upstream` > `github` > `origin`, the same port
+   write scoping uses). Each site keeps its own `GH_REPO` rule: placeholder
+   (`gh api`) sites honour `LOOM_REPO`/`GH_REPO`, `gh repo view` sites ignore
+   it. The answer is memoised until any git config file that defines it
+   changes. The fingerprint is `(dev, inode, length, mtime)` of every file
+   `git config --list --show-origin` read (system, global, includes),
+   `<common-dir>/config` and `<git-dir>/config.worktree` (presence counts),
+   plus the effective `GH_REPO`. A memo hit re-stats those files and forks
+   nothing. The ETag store's `origin` identity uses the same fingerprint, so a
+   `git remote set-url` is seen without a restart.
+2. **The canonical record**: the post-redirect `owner/name` from one
+   conditional `GET repos/<nwo>` (reader-first, call row `repo_facts.verify`,
+   op `repo.view`). It is kept in the private ETag store directory as
+   `repofacts-<hash>.json` (`0700` directory, atomic writes) and is re-read at
+   most every `LOOM_REPO_FACTS_VERIFY_SECS`. First-hand responses that name
+   the repo (issue listings' `repository_url`, pulls rows'
+   `base.repo.full_name`) refresh it for free when they match. When they do
+   not match, the record is marked suspect and re-read before its next use.
+   It is never rewritten from an observed body. A failed read backs off for
+   300 s. A 404, a 410 or "Could not resolve to a Repository" from a call that
+   used the fact marks the record suspect.
+
+**Ambiguous roots.** A checkout whose local answer may differ from gh's is
+cross-checked once per fingerprint against gh itself, using the command the
+site replaced (`repo_facts.crosscheck`). Such checkouts have more than one
+remote, a `gh-resolved` pin, a non-`github.com` or ssh-alias host, a
+`GH_REPO`/`LOOM_REPO` that differs from origin, or a `url.*.insteadOf` rewrite.
+On disagreement the root keeps its legacy forge calls for the life of the
+process, the counter `repo_facts.resolver_disagree` is bumped and a warning is
+logged. A remote that names a pre-rename slug bumps `repo_facts.redirected`
+and logs once per root. Fix it with `git remote set-url`.
+
+**Verified negatives are confirmed.** A `head=<owner>:<branch>` filter built
+from a stale owner returns `[]`, which reads as "no PR". So, for an owner that
+came from a record:
+
+- every row of a non-empty pulls answer must name the canonical repo as its
+  `base.repo.full_name`, else the status is `Unknown`;
+- an empty answer is `NoPr` only after a forced re-read of the record
+  (`repo_facts.confirm`) says the owner is unchanged. That costs at most one
+  read per root per reaper pass. A changed owner or a failed read gives
+  `Unknown`, which the reapers map to `SkipUnknownPrStatus`;
+- the open-linked-PR probe's `NoneOpen` gets the same confirm unless the
+  record was read in this lookup or this pass. A failed confirm is
+  `ProbeFailed`, so orphan recovery and check-claim never reset a claim on an
+  unconfirmed negative.
+
+`classify_worktree`, `classify_primary_checkout` and the landed ladder are
+unchanged. With a reachable forge the set of removals and switches is the same
+as before, and after a transfer it can only shrink.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOOM_REPO_FACTS` | on | `0` makes every migrated site issue exactly its previous forge call and restores the ETag store's process-lifetime `origin` memo (the rollback switch). |
+| `LOOM_REPO_FACTS_VERIFY_SECS` | `21600` | How long a verified record is used before one conditional re-read. |
+
 ### Merged-PR worktree reaper (#4876)
 
 CLAUDE.md states the contract: *"Loom-managed worktrees (with the

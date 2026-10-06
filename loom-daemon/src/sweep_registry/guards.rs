@@ -1151,6 +1151,26 @@ impl SweepRegistry {
                 }
             }
         }
+        // W3a: the repo-facts record (fingerprint-invalidated, `gh repo view`
+        // semantics) answers without a forge call, and each answer also
+        // refreshes the in-process cache. `Legacy` AND `Unavailable` fall
+        // through to that cache + `gh repo view` below: every guard
+        // downstream fails OPEN on `None`, so a failed record verify (a
+        // blip, the breaker, the 300 s suspect backoff that follows it)
+        // must never cost a repo answer the process already had or that
+        // the pre-facts path would still produce.
+        match self.owner_repo_fact() {
+            crate::forge_repo_facts::Lookup::Fact(f) => {
+                let pair = (f.owner, f.name);
+                *self
+                    .owner_repo_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pair.clone());
+                return Some(pair);
+            }
+            crate::forge_repo_facts::Lookup::Unavailable
+            | crate::forge_repo_facts::Lookup::Legacy => {}
+        }
         if let Some(cached) = self
             .owner_repo_cache
             .lock()

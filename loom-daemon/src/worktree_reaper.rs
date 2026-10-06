@@ -708,8 +708,11 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
     let opts = reaper_clean_options(resolve_grace_period(config));
     let active_issues = crate::worktree_ops::liveness::active_spawn_loop_issues(repo_root);
 
-    // Resolved once per pass (one REST call), not once per worktree.
-    let owner = clean::repo_owner_rest(repo_root);
+    // Resolved once per pass, not once per worktree: from the repo-facts
+    // record (no call when warm), else one REST call. Owner confirmations
+    // for a `NoPr` are memoised for this pass (W3a).
+    let _facts_pass = crate::forge_repo_facts::PassScope::enter();
+    let owner = crate::worktree_ops::clean_owner::repo_owner(repo_root);
     // #6652: likewise, one `git worktree list` per pass — see
     // `clean::registered_worktree_paths` doc comment for the fail-closed
     // contract on a `None` (undeterminable) snapshot.
@@ -720,8 +723,12 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
     // #6653: the safety criterion for gating `PrStatus::NoPr`'s grace period
     // — REST, same quota-isolation rationale as every other probe here.
     let issue_closed_at_fn = |n: u32| crate::worktree_ops::gh::issue_closed_at_rest(repo_root, n);
-    let pr_status_fn = |n: u32| match owner.as_deref() {
-        Some(owner) => clean::check_pr_merged_rest(repo_root, owner, n),
+    let pr_status_fn = |n: u32| match owner.as_ref() {
+        Some(owner) => crate::worktree_ops::clean_owner::pr_status_confirmed(
+            repo_root,
+            owner,
+            &crate::worktree_ops::naming::branch_name(n),
+        ),
         // No owner ⇒ no REST head filter is constructible; fall back to the
         // GraphQL-backed probe rather than silently reporting Unknown forever.
         None => clean::check_pr_merged(repo_root, n),

@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 
+use super::clean_owner::PrRowRest;
 use super::gh;
 use super::liveness::active_spawn_loop_issues;
 use super::naming::{self, BRANCH_PREFIX};
@@ -351,7 +352,7 @@ fn gh_pr_list_by_issue_search(repo_root: &Path, issue_num: u32) -> Option<Vec<Pr
 ///    closed PR) — covers `ClosedNoMerge`/`Unknown` rows.
 ///
 /// An empty row list resolves to [`PrStatus::NoPr`].
-fn select_pr_status<I: IntoIterator<Item = PrStatus>>(rows: I) -> PrStatus {
+pub(crate) fn select_pr_status<I: IntoIterator<Item = PrStatus>>(rows: I) -> PrStatus {
     let mut best: Option<PrStatus> = None;
     for status in rows {
         if matches!(status, PrStatus::Merged { .. }) {
@@ -414,26 +415,6 @@ pub fn check_pr_status_for_branch(repo_root: &Path, branch: &str) -> PrStatus {
     rows_to_status(gh_pr_list_by_head(repo_root, branch))
 }
 
-#[derive(serde::Deserialize)]
-struct PrRowRest {
-    state: String,
-    #[serde(default)]
-    merged_at: Option<String>,
-    #[serde(default)]
-    closed_at: Option<String>,
-    #[serde(default)]
-    head: Option<PrHeadRest>,
-}
-
-/// The `head` object of a REST pull-request payload. Only `sha` is read: it is
-/// the safety criterion for force-deleting a `pr-<N>` worktree's local branch
-/// (issue #5939, mirroring `merge-pr.sh`'s #4100 rule).
-#[derive(Debug, serde::Deserialize)]
-struct PrHeadRest {
-    #[serde(default)]
-    sha: Option<String>,
-}
-
 /// Resolve the repository owner via the **REST** API
 /// (`gh api repos/{owner}/{repo} --jq .owner.login`).
 ///
@@ -489,20 +470,10 @@ pub fn check_pr_merged_rest(repo_root: &Path, owner: &str, issue_num: u32) -> Pr
 /// [`select_pr_status`] for the preference order applied across rows.
 #[must_use]
 pub fn check_pr_status_for_branch_rest(repo_root: &Path, owner: &str, branch: &str) -> PrStatus {
-    let path =
-        format!("repos/{{owner}}/{{repo}}/pulls?state=all&head={owner}:{branch}&per_page=30");
-    let Some(out) = gh::bounded_counted("clean.pr_status_rest", repo_root, ["api", &path]) else {
-        return PrStatus::Unknown;
-    };
-    if !out.status.success() {
-        return PrStatus::Unknown;
+    match super::clean_owner::fetch_pr_rows(repo_root, owner, branch) {
+        Ok(rows) => super::clean_owner::rows_status(&rows),
+        Err(_) => PrStatus::Unknown,
     }
-    let Ok(rows) = serde_json::from_slice::<Vec<PrRowRest>>(&out.stdout) else {
-        return PrStatus::Unknown;
-    };
-    select_pr_status(rows.into_iter().map(|row| {
-        classify_pr_row(row.state.as_str(), row.merged_at.as_deref(), row.closed_at.as_deref())
-    }))
 }
 
 /// Map a REST pull-request `(state, merged_at, closed_at)` triple onto a
@@ -2263,8 +2234,8 @@ pub fn branch_reachable_from_remotes(repo_root: &Path, branch: &str) -> bool {
 /// question, while `landed`'s forge rung also carries the merged head SHA the
 /// #7872 tip-match rule needs.
 fn branch_pr_merged(repo_root: &Path, branch: &str) -> bool {
-    let status = match repo_owner_rest(repo_root)
-        .map(|owner| check_pr_status_for_branch_rest(repo_root, &owner, branch))
+    let status = match super::clean_owner::repo_owner(repo_root)
+        .map(|owner| super::clean_owner::pr_status_validated(repo_root, &owner, branch))
     {
         Some(PrStatus::Unknown) | None => check_pr_status_for_branch(repo_root, branch),
         Some(status) => status,
