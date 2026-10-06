@@ -1473,7 +1473,7 @@ auth**. A reader that cannot serve the store falls through to the writer after
 one request. The App needs read access to the store repo (`contents: read`).
 Calls are counted in the forge-call stats as `fleet_store`. GitHub only.
 
-### `fleet-config render [--host H] [--check] [--offline]`
+### `fleet-config render [--host H] [--check] [--offline] [--allow-reduce]`
 
 Computes the host's machine tier as `deep_merge(fleet/defaults.json,
 fleet/hosts/<H>/defaults.json)` — the same `config_resolver::deep_merge` the
@@ -1489,6 +1489,17 @@ so a no-op render makes no backup.
 `--check` writes nothing: it prints a per-path diff (`~ key: disk -> store`,
 `+`, `-`) and exits `1` on drift, `0` in sync, `2` on error — the drift
 detector. Comparison is semantic (parsed JSON), not textual.
+
+**Lossy-reduction guard (2am#1653):** a write that would DROP a top-level
+block the file on disk carries but the store's render does not is refused by
+default (exit `2`; `--check` reports it as `LOSSY REDUCTION`) — the store is
+the tier's record of truth, so the block belongs there first
+(`fleet-config propose adopt [--host H]` proposes exactly that). Pass
+`--allow-reduce` to accept the loss knowingly. This CLI flag is the operator's
+answer to that prompt; the daemon's own unattended writes (the startup pass,
+and the timer pass under `fleet.autoApply`) apply the identical guard but have
+no operator to ask, so they just skip the write and surface the loss via the
+sync status (`ConfigPass.error` / the tier's `detail`) instead of writing.
 
 If the forge is unreachable, `render` (and `state`) use the last good snapshot
 and print a `CACHED … last confirmed current <age> ago` warning; `--offline`
