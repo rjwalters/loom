@@ -6,7 +6,7 @@
 use super::{as_of, history_a, history_a_envelopes, input_at, provenance};
 use crate::eta::backtest::{self, Filter};
 use crate::eta::calibration_log;
-use crate::eta::heuristics::{LandV2, CALIBRATION_BASE, LAND_V2};
+use crate::eta::heuristics::{LandV2, CALIBRATION_BASE, LAND_TWIN_OTTER_B, LAND_V2};
 use crate::eta::recalibrate::{
     apply, fit_table, recalibrate, CalibrationObservation, CalibrationTable, Mode, Weighting,
     MIN_POOLED_EVENTS, MIN_STAGE_EVENTS, OBSERVATION_SCHEMA,
@@ -320,9 +320,15 @@ fn only_landed_land_estimates_become_observations_and_the_log_round_trips() {
     let mut foreign = summary.clone();
     foreign.estimate_id = "pending-foreign".to_string();
     foreign.heuristic = "land-v1".to_string();
-    let combined = calibration_log::combine(read, &[summary, other, foreign]);
-    assert_eq!(combined.len(), 2);
+    // #10524: twin-otter-b is a calibration base too (quick-tern's).
+    let mut twin = summary.clone();
+    twin.estimate_id = "pending-twin".to_string();
+    twin.heuristic = LAND_TWIN_OTTER_B.to_string();
+    let combined = calibration_log::combine(read, &[summary, other, foreign, twin]);
+    assert_eq!(combined.len(), 3);
     assert_eq!(combined[0], row);
     assert_eq!(combined[1].estimate_id, "pending-other");
     assert_eq!(combined[1].actual_at, None);
+    assert_eq!(combined[2].estimate_id, "pending-twin");
+    assert_eq!(combined[2].heuristic, LAND_TWIN_OTTER_B);
 }

@@ -49,6 +49,12 @@
 //!   timeline read from its flag changes before `t − LAG`
 //!   ([`PriorityState::from_flags`]), plus the linked-issue star run
 //!   (#10372) when star inputs are given.
+//! - **v2 priority inputs** (#10508, [`Assembled::priority_inputs`], not
+//!   read by the v1 fit): [`crate::eta::priority_inputs::priority_inputs`],
+//!   the one builder serving calls too, over the same roster, with the
+//!   subject's own flag timeline, its linked-issue star at `t − LAG` (`None`
+//!   when the cache does not cover it) and the fleet roster history given to
+//!   [`build_with_context`] (`None` = every roster-derived input unknown).
 //! - A row whose needed queue feature is `None` is dropped and counted in
 //!   [`RowStats::rows_dropped_missing`].
 //! - **Exit label**: `Some` iff `t + `[`EXIT_HORIZON_SEC`]` < H`; then whether
@@ -78,6 +84,7 @@
 //! Rows are sorted by `(t, repo, pr, stage)` and dwells by `(stage, repo, pr,
 //! entered_at)`, repos lowercased: total keys, never input order.
 
+use super::features_v2::PriorityInputs;
 use super::{
     clock, DwellEnd, DwellRow, FitStage, MergeLabel, ModelInputs, TrainingRow, EXIT_HORIZON_SEC,
     KNOWABLE_LAG_SEC, ROW_STEP_SEC, WINDOW_DAYS,
@@ -92,7 +99,9 @@ use crate::eta::labels::{
 use crate::eta::priority_features::{
     priority_features, PriorityEntry, PriorityFeatures, PriorityState,
 };
+use crate::eta::priority_inputs::{priority_inputs, PriorityContext};
 use crate::eta::queue_features::{queue_features, QueueFeatures, QueueSubject, RosterEntry};
+use crate::eta::repo_priority::RosterRevision;
 use crate::eta::star::{LinkedStar, StarInputs, StarSource};
 use crate::eta::Stage;
 use chrono::{DateTime, Duration, Utc};
@@ -144,6 +153,10 @@ pub struct Assembled {
     /// candidate inputs for the next model version, not read by the current
     /// fit, so the coefficient file is unchanged.
     pub priority: Vec<PriorityFeatures>,
+    /// `priority_inputs[i]` is the `eta-fit/v2` priority input set of
+    /// `rows[i]` (#10508), from the builder serving shares. Not read by the
+    /// v1 fit, so the coefficient file is unchanged.
+    pub priority_inputs: Vec<PriorityInputs>,
     /// What was dropped.
     pub stats: RowStats,
     /// The data horizon `H` (see the module docs).
@@ -332,6 +345,19 @@ pub fn build_with_star(
     as_of: DateTime<Utc>,
     star: Option<&StarInputs>,
 ) -> Assembled {
+    build_with_context(snapshots, as_of, star, None)
+}
+
+/// [`build_with_star`], also reading the fleet roster's history (oldest
+/// first) for the v2 priority inputs (#10508). `None` leaves every
+/// roster-derived input unknown.
+#[must_use]
+pub fn build_with_context(
+    snapshots: &[FleetSnapshot],
+    as_of: DateTime<Utc>,
+    star: Option<&StarInputs>,
+    fleet_history: Option<&[RosterRevision]>,
+) -> Assembled {
     let lag = Duration::seconds(KNOWABLE_LAG_SEC);
     let step = Duration::seconds(ROW_STEP_SEC);
     let exit_horizon = Duration::seconds(EXIT_HORIZON_SEC);
@@ -350,7 +376,7 @@ pub fn build_with_star(
     let events = SnapshotLog::new(&chosen, horizon);
 
     let mut stats = RowStats::default();
-    let mut keyed: Vec<((RowKey, FitStage), (TrainingRow, PriorityFeatures))> = Vec::new();
+    let mut keyed: Vec<KeyedRow> = Vec::new();
     let mut t = window_start;
     while t < horizon {
         let cutoff = t - lag;
@@ -422,6 +448,16 @@ pub fn build_with_star(
                     .map(|e| e.star.clone())
                     .unwrap_or_default();
                 let prio = priority_features(&subject, &own, &priority_roster, &scope, t);
+                let ctx = PriorityContext {
+                    roster: &priority_roster,
+                    scope: &scope,
+                    fleet_history,
+                };
+                let linked = star
+                    .and_then(|s| s.repos.get(&pr.repo))
+                    .and_then(|r| r.linked_at(pr.number, cutoff));
+                let own_flags = PriorityState::from_flags(&pr.flags, cutoff).unwrap_or_default();
+                let prio_v2 = priority_inputs(&subject, &own_flags, linked.as_ref(), &ctx, t);
                 let rework = pr
                     .episodes
                     .iter()
@@ -453,6 +489,7 @@ pub fn build_with_star(
                             merge: merge_label(pr, t, horizon),
                         },
                         prio,
+                        prio_v2,
                     ),
                 ));
             }
@@ -463,10 +500,12 @@ pub fn build_with_star(
     let mut row_keys = Vec::with_capacity(keyed.len());
     let mut rows = Vec::with_capacity(keyed.len());
     let mut priority = Vec::with_capacity(keyed.len());
-    for ((key, _), (row, prio)) in keyed {
+    let mut priority_inputs = Vec::with_capacity(keyed.len());
+    for ((key, _), (row, prio, prio_v2)) in keyed {
         row_keys.push(key);
         rows.push(row);
         priority.push(prio);
+        priority_inputs.push(prio_v2);
     }
 
     Assembled {
@@ -474,6 +513,7 @@ pub fn build_with_star(
         row_keys,
         dwells: dwells(&prs, window_start, horizon),
         priority,
+        priority_inputs,
         stats,
         data_through: horizon,
     }
@@ -481,6 +521,9 @@ pub fn build_with_star(
 
 /// A dwell's canonical sort key: `(stage, repo, pr, entered_at)`.
 type DwellKey<'a> = (FitStage, &'a str, u32, DateTime<Utc>);
+
+/// One assembled row with its sort key, v1 priority candidates and v2 inputs.
+type KeyedRow = ((RowKey, FitStage), (TrainingRow, PriorityFeatures, PriorityInputs));
 
 /// The dwells, in canonical order (see the module docs).
 fn dwells(prs: &[Pr<'_>], window_start: DateTime<Utc>, horizon: DateTime<Utc>) -> Vec<DwellRow> {

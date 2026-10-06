@@ -50,6 +50,11 @@ pub const CI_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.ci.triggered_by",
     "loom.ci.started_at",
     "loom.ci.completed_at",
+    // `ci.run` / `ci.job` (#10511): when this daemon *observed* the completed
+    // run/job — its knowable-at instant, distinct from GitHub's own
+    // `completed_at`. A point-in-time reader filters on it
+    // (`eta::point_in_time`), never on the event time.
+    "loom.ci.observed_at",
     "loom.ci.duration_ms",
     // `ci.run` (#9007 follow-up: `run_started_at − created_at`) AND `ci.job`
     // (#9089: `started_at − created_at`) — the CI queue segment for each, so
@@ -252,6 +257,13 @@ pub struct CiRunRecord {
     /// journal line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_reason: Option<String>,
+    /// When this daemon observed the record (#10511): the instant it became
+    /// knowable to Loom, as opposed to GitHub's event time (`completed_at`).
+    /// Training and serving filter on it (`observed_at <= cutoff`, see
+    /// `eta::point_in_time`), so a run backfilled later can never leak into a
+    /// cutoff it was not knowable at. `None` only on a pre-#10511 record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<DateTime<Utc>>,
 }
 
 impl CiRunRecord {
@@ -284,6 +296,9 @@ impl CiRunRecord {
         }
         if let Some(reason) = &self.trigger_reason {
             out.push(("loom.ci.trigger_reason", CiAttr::Str(reason.clone())));
+        }
+        if let Some(observed_at) = self.observed_at {
+            out.push(("loom.ci.observed_at", CiAttr::Str(observed_at.to_rfc3339())));
         }
         out
     }
@@ -351,6 +366,13 @@ pub struct CiJobRecord {
     /// an absence.
     #[serde(default = "shard_kind_none")]
     pub shard_kind: String,
+    /// When this daemon observed the record (#10511): the instant it became
+    /// knowable to Loom, as opposed to GitHub's event time (`completed_at`).
+    /// Training and serving filter on it (`observed_at <= cutoff`, see
+    /// `eta::point_in_time`), so a run backfilled later can never leak into a
+    /// cutoff it was not knowable at. `None` only on a pre-#10511 record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<DateTime<Utc>>,
 }
 
 fn shard_kind_none() -> String {
@@ -392,6 +414,9 @@ impl CiJobRecord {
             out.push(("loom.ci.shard.total", CiAttr::Int(i64::from(total))));
         }
         out.push(("loom.ci.shard.kind", CiAttr::Str(self.shard_kind.clone())));
+        if let Some(observed_at) = self.observed_at {
+            out.push(("loom.ci.observed_at", CiAttr::Str(observed_at.to_rfc3339())));
+        }
         out
     }
 }
@@ -511,6 +536,13 @@ pub struct CiDurationRecord {
     pub started_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
     pub duration_ms: i64,
+    /// When this daemon observed the sample (#10511) — see
+    /// [`CiRunRecord::observed_at`]. Never a metric label (unbounded
+    /// cardinality): it rides on the native-HTTPS record only, and the
+    /// histogram point keeps `completed_at` as its time. `None` only on a
+    /// pre-#10511 record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<DateTime<Utc>>,
 }
 
 impl CiDurationRecord {

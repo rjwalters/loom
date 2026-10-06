@@ -99,6 +99,7 @@ pub mod backtest;
 pub mod calibration_log;
 pub mod config;
 pub mod conformal;
+pub mod conformal_ipcw;
 pub mod doctor;
 pub mod doctor_facts;
 pub mod emit;
@@ -129,13 +130,16 @@ pub mod history;
 pub mod journal;
 pub mod labels;
 pub mod offline;
+pub mod point_in_time;
 pub mod pr_features;
 pub(crate) mod pr_features_forge;
 pub mod priority_features;
+pub mod priority_inputs;
 pub mod queue_features;
 pub mod recalibrate;
 pub mod recency;
 pub mod regime;
+pub mod repo_priority;
 pub mod score;
 pub mod shadow;
 pub mod shadow_fleet;
@@ -679,6 +683,9 @@ impl Registry {
                 Box::new(heuristics::LandFreshTide::default()),
                 Box::new(heuristics::LandV4),
                 Box::new(heuristics::LittleV0),
+                // #10524: wraps twin-otter-b; registered before the
+                // twin-otter pair so `-b` stays last.
+                Box::new(heuristics::LandQuickTern::new(fit.clone())),
                 Box::new(heuristics::LandTwinOtter::new(fit.clone())),
                 Box::new(heuristics::LandTwinOtterB::new(fit.clone())),
             ],

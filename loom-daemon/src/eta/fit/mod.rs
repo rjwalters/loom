@@ -65,6 +65,7 @@
 pub mod aft;
 pub mod coeffs;
 pub mod features;
+pub mod features_v2;
 pub mod logistic;
 pub mod math;
 pub mod paths;

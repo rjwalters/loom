@@ -109,10 +109,18 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "probe_open_linked_pr_rest",
         "parse_open_linked_pr_timeline_trusted(",
     ),
+    // #10514: leg 0 (the open-PR listing) first; the old union is the fallback.
+    ("worktree_ops/gh.rs", "probe_open_linked_pr", "linked_pr_listing::probe("),
+    ("worktree_ops/gh.rs", "legacy_union", "parse_open_linked_pr_timeline_trusted("),
     (
-        "worktree_ops/gh.rs",
-        "probe_open_linked_pr",
-        "parse_open_linked_pr_timeline_trusted(",
+        "worktree_ops/linked_pr_listing.rs",
+        "probe",
+        "classify_open_linked_pr_rows(&rows, issue, owner_repo, &policy)",
+    ),
+    (
+        "worktree_ops/linked_pr_listing.rs",
+        "classify_open_linked_pr_rows",
+        "policy.known_untrusted(",
     ),
     ("worktree_ops/gh.rs", "parse_open_linked_pr_trusted", "drop_untrusted_fork_prs("),
     // Posting-dedup of its own notice, not a control read.
