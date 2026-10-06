@@ -1,0 +1,102 @@
+# Gitea qualification CI workflow (#9790, epic #9769 phase 1).
+#
+# Copied, with the rest of ci-fixture/, into a disposable
+# `$GITEA_QUAL_RUN_NS`-prefixed repository on gitea-1. Every job does real
+# work: there is no step that unconditionally reports success. The live run
+# induces failure by committing a failing test (see the runbook in
+# docs/research/gitea-1-ci-delivery-qualification.md), cancels a run by hand,
+# and reruns a failed job; the `skip-probe` job exists only to produce a
+# genuine `skipped` state for the negative-result matrix.
+#
+# Action pins are the SAME revisions the production GitHub workflows use, so a
+# pass or failure here speaks to the actions Loom actually depends on. Their
+# compatibility with Gitea Actions is exactly what the live run decides.
+#
+# `runs-on: loom-qual` is deliberate: only the isolated qualification runner
+# carries that label, so a job can never land on a runner registered on the
+# forge host itself (runners stay off the forge host, 2AMLogic/2am#117).
+name: qual-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Loom's no-cancellation policy for distinct started commits: one group per
+# commit, never cancel-in-progress.
+concurrency:
+  group: qual-ci-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: qual / build
+    runs-on: loom-qual
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Record environment
+        run: |
+          set -eu
+          echo "head_sha=${GITHUB_SHA}"
+          echo "event=${GITHUB_EVENT_NAME} ref=${GITHUB_REF} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT:-unknown}"
+          uname -m
+          (. /etc/os-release && echo "os=${PRETTY_NAME}") || true
+          rustc -Vv
+          cargo -V
+      - name: Build
+        run: cargo build --all-targets
+
+  test:
+    name: qual / test
+    needs: build
+    runs-on: loom-qual
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Test
+        run: |
+          set -o pipefail
+          cargo test 2>&1 | tee "test-${GITHUB_SHA}.log"
+      - name: Upload test log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-log-${{ github.sha }}
+          path: test-${{ github.sha }}.log
+
+  package:
+    name: qual / package
+    needs: test
+    runs-on: loom-qual
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Build release binary and checksum
+        run: |
+          set -eu
+          cargo build --release
+          mkdir -p dist
+          name="loom-qual-fixture-$(uname -m)-${GITHUB_SHA}"
+          cp target/release/loom-qual-fixture "dist/${name}"
+          (cd dist && sha256sum "${name}" > "${name}.sha256")
+          # Smoke the packaged binary before publishing it: a binary that
+          # cannot order versions is not an artifact worth downloading.
+          test "$("dist/${name}" newest v0.19.9 nightly v0.19.10)" = "0.19.10"
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package-${{ github.sha }}
+          path: dist/
+
+  skip-probe:
+    name: qual / skip-probe
+    # Never runs: its only purpose is a real `skipped` job result.
+    if: ${{ github.event_name == 'never' }}
+    runs-on: loom-qual
+    steps:
+      - run: exit 1

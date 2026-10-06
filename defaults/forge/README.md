@@ -27,6 +27,7 @@ loom-daemon forge-inventory gate                     # any new unclassified dire
 loom-daemon forge-inventory report                   # four-axis coverage view
 loom-daemon forge-inventory probe-manifest --profile required-coordination
 loom-daemon forge-inventory observed                 # host call sink vs inventory, both directions (#9831)
+loom-daemon forge-inventory workflow-deps            # what workflows fetch from GitHub at run time (#9790)
 ```
 
 `validate` and `gate` also run as Rust tests
@@ -95,6 +96,26 @@ not this ledger's. Scanning is lexical on purpose: a gate that had to resolve a
 shell variable could not answer for exactly the dynamic command construction
 #9777 asks to be counted, and an over-counting scan costs one baseline entry
 where an under-counting clever one costs an invisible bypass.
+
+## Workflow delivery dependencies and the qualification fixture (#9790)
+
+The operation rows count *forge API coordination*. `workflow-deps` lists the
+other half separately: what tracked `.github/workflows/` and `.gitea/workflows/`
+files fetch from GitHub **while they run** — `uses:` action sources, GHCR
+images, GitHub Releases / raw-content downloads — each on its own plane with a
+per-kind integration estimate, plus the `gh`/`api.github.com` lines tagged
+`forge-api` so the two lists can be told apart. It is a lexical scan
+(`static_only: true`): what an action downloads internally, or what a runner
+image bakes in, only a live run can show, so a clean scan is never a
+network-independence claim. `--file <path>` scans named files instead.
+
+`qualification/ci-fixture/` is the bounded real build/test/artifact fixture a
+gitea-1 qualification run copies into a disposable repository, with its
+`.gitea/workflows/qual-ci.yml`. A Rust test
+(`loom-daemon/src/forge_inventory/tests/qualification_fixture.rs`) compiles and
+tests it, breaks it, and asserts the result changes — so the fixture cannot
+silently become a green stub. Live results, dispositions and the runbook are in
+`docs/research/gitea-1-ci-delivery-qualification.md`.
 
 ## Evidence constraints
 

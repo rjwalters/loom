@@ -12,6 +12,7 @@
 //! | `report` | always (read-only view) | — | could not run |
 //! | `probe-manifest` | always (read-only view) | — | could not run |
 //! | `observed` | always (read-only view of the host call sink) | — | could not run |
+//! | `workflow-deps` | always (read-only static scan of workflow files) | — | could not run |
 //!
 //! `gate --update` rewrites the baseline instead of judging it, and
 //! `--manifest-dir` points the whole family at a synthetic manifest so a test
@@ -23,7 +24,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use loom_daemon::forge_inventory::{
-    self, gate, model::Profile, observed, probe, report, validate, Inventory,
+    self, gate, model::Profile, observed, probe, report, validate, workflow_deps, Inventory,
 };
 
 #[derive(clap::Subcommand)]
@@ -40,6 +41,10 @@ pub(crate) enum ForgeInventoryCommand {
     /// sink observed, in both directions. Runtime traces supplement the
     /// inventory; they never prove it exhaustive.
     Observed(ObservedArgs),
+    /// List what workflow files fetch from GitHub at run time — action
+    /// sources, GHCR images, release downloads — separately from forge API
+    /// coordination (#9790). A static scan, never a network measurement.
+    WorkflowDeps(WorkflowDepsArgs),
 }
 
 impl ForgeInventoryCommand {
@@ -50,6 +55,7 @@ impl ForgeInventoryCommand {
             ForgeInventoryCommand::Report(a) => a.run(),
             ForgeInventoryCommand::ProbeManifest(a) => a.run(),
             ForgeInventoryCommand::Observed(a) => a.run(),
+            ForgeInventoryCommand::WorkflowDeps(a) => a.run(),
         }
     }
 }
@@ -432,6 +438,64 @@ impl ObservedArgs {
             println!("{}", serde_json::to_string_pretty(&diff)?);
         } else {
             print!("{}", observed::render_text(&diff));
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// workflow-deps
+// ============================================================================
+
+#[derive(clap::Args)]
+pub(crate) struct WorkflowDepsArgs {
+    /// Repo root whose tracked `.github/workflows/` and `.gitea/workflows/`
+    /// files are scanned.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    root: PathBuf,
+    /// Scan these files instead (repeatable; repo-relative or absolute).
+    #[arg(long = "file", value_name = "PATH")]
+    files: Vec<PathBuf>,
+    #[arg(long)]
+    json: bool,
+}
+
+impl WorkflowDepsArgs {
+    pub(crate) fn run(self) -> Result<()> {
+        let paths: Vec<String> = if self.files.is_empty() {
+            let mut v: Vec<String> = tracked_files(&self.root)?
+                .into_iter()
+                .filter(|p| workflow_deps::is_workflow_file(p))
+                .collect();
+            v.sort();
+            anyhow::ensure!(
+                !v.is_empty(),
+                "no tracked workflow files under {} — the scan is broken, not the tree",
+                self.root.display()
+            );
+            v
+        } else {
+            self.files
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        };
+        let mut inputs = Vec::with_capacity(paths.len());
+        for p in paths {
+            let full = if std::path::Path::new(&p).is_absolute() {
+                PathBuf::from(&p)
+            } else {
+                self.root.join(&p)
+            };
+            let text = std::fs::read_to_string(&full)
+                .with_context(|| format!("reading {}", full.display()))?;
+            inputs.push((p, text));
+        }
+        let audit = workflow_deps::audit(&inputs);
+        if self.json {
+            println!("{}", serde_json::to_string_pretty(&audit)?);
+        } else {
+            print!("{}", workflow_deps::render_text(&audit));
         }
         Ok(())
     }

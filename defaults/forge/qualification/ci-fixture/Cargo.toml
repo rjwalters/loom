@@ -1,0 +1,20 @@
+# Gitea qualification CI fixture (#9790, epic #9769 phase 1).
+#
+# A deliberately tiny, dependency-free crate that does REAL build and test
+# work, so a qualification run on gitea-1 exercises the platform's CI and
+# artifact path without a stub that unconditionally publishes success. It is
+# copied into a disposable `$GITEA_QUAL_RUN_NS`-prefixed repository; it is not
+# a member of this workspace (the empty `[workspace]` table makes it its own
+# root) and is never built by Loom's own CI except through the fixture test in
+# loom-daemon/src/forge_inventory/tests/qualification_fixture.rs.
+[package]
+name = "loom-qual-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "loom-qual-fixture"
+path = "src/main.rs"
+
+[workspace]

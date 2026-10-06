@@ -5,6 +5,10 @@ collected.** The builder host had none of the `GITEA_QUAL_*` variables set
 (names in `.loom/credentials.md`), no loopback/SSH-tunnel access to gitea-1
 was established, and no isolated qualification runner was confirmed. Every row
 below is therefore `UNRESOLVED`; nothing here counts as a pass for #9792.
+A second builder pass (2026-10-06) found the same state. That host had no
+`GITEA_QUAL_*` variables and no SSM read access to `/gitea/*`. That pass added
+only locally verifiable pieces: a real CI fixture and a static
+GitHub-dependency audit (see "Local evidence" below).
 
 ## Scope
 
@@ -56,11 +60,68 @@ Record exact head SHA, run/job ids, timestamps and sanitized output per row.
 | Stale-head result (success on prior SHA) | not-green for current head | UNRESOLVED |
 | Admin bypass | recorded separately from ordinary behavior | UNRESOLVED |
 
+## Local evidence (verifiable without gitea-1)
+
+Neither item below is live evidence. Neither counts as a pass for any work-list
+row or negative-matrix case above.
+
+### Fixture: real build, test and artifact work
+
+`defaults/forge/qualification/ci-fixture/` is a dependency-free Rust crate (a
+version-ordering library and a CLI). It ships with
+`.gitea/workflows/qual-ci.yml`, which runs `build → test → package` with
+`needs:`, uploads a SHA-named test log and a SHA-named binary with its
+`sha256`, smoke-runs the packaged binary before uploading it, and includes a
+`skip-probe` job whose only role is a genuine `skipped` result. It has no
+success stub. Four static properties are enforced by a test:
+
+- Every job has `runs-on: loom-qual`, so only the isolated runner can pick it
+  up.
+- Actions are pinned to the same SHAs the production workflows pin.
+- There are no `gh`/forge-API calls.
+- It sets `cancel-in-progress: false`.
+
+`loom-daemon/src/forge_inventory/tests/qualification_fixture.rs` copies the
+fixture to a tempdir and runs `cargo test`, which passes. It then mutates
+`compare` to order versions lexically, reruns `cargo test`, and asserts that
+the run fails and names `numeric_not_lexical_ordering`. This is the local half
+of test-plan item 1. Whether the same fixture runs on gitea-1 (push/PR
+triggers, `needs:`, artifact upload with these action revisions, rerun and
+cancel) is still `UNRESOLVED`.
+
+### Static GitHub delivery-dependency audit
+
+```bash
+loom-daemon forge-inventory workflow-deps          # text
+loom-daemon forge-inventory workflow-deps --json   # per-reference file:line evidence
+```
+
+This command lists, per plane, what tracked workflows fetch from GitHub at run
+time. It keeps forge API coordination (`gh`, `api.github.com`) on its own
+plane, so neither list can hide the other. The figures below are from this
+PR's build base (`1fecbabd9c9f`), 16 workflow files:
+
+| Plane | Refs | Distinct | What zero-GitHub would take (estimate) |
+|---|---|---|---|
+| action-source | 134 | 19 actions | mirror each action at its pinned SHA on the forge; `DEFAULT_ACTIONS_URL=self` or absolute `uses:` URLs |
+| package-registry (GHCR) | 23 | 8 image refs | move `loom-worker*` push/pull to the forge's OCI registry (release.yml, ci.yml, ci-daily.yml) |
+| release-download | 2 | 2 URLs | mirror shellcheck and lychee archives, or bake them into the runner image |
+| forge-api | 41 | 41 lines | counted by the operation inventory (`forge-inventory report`), not here |
+| github-other | 2 | 1 | OIDC issuer (`token.actions.githubusercontent.com`), reviewed individually |
+
+This is a lexical scan (`static_only: true`). It cannot see what an action
+downloads internally (for example `dtolnay/rust-toolchain` → rustup, or
+`taiki-e/install-action` → its tool sources) or what a runner image bakes in.
+It is therefore **not** a network-independence claim. Measuring those
+dependencies during a run on gitea-1 is still `UNRESOLVED`.
+
 ## Remaining live steps
 
-- Port a bounded real build/test/artifact fixture to a namespaced disposable
-  repo (`$GITEA_QUAL_RUN_NS`-prefixed); no stub that always succeeds; show a
-  failing test differs from the passing run.
+- Copy `defaults/forge/qualification/ci-fixture/` into a namespaced disposable
+  repo (`$GITEA_QUAL_RUN_NS`-prefixed) and register the isolated runner with
+  the `loom-qual` label. Push it, then push a commit that applies the same
+  lexical-ordering mutation the local test uses. Record both runs' head SHAs
+  and results, and show that the results differ.
 - Push and PR triggers, required contexts, multi-job `needs`, permissions,
   concurrency, rerun attempts, log and artifact download tied to the SHA.
 - Branch protection with real results; guarded merge only on current-head success.

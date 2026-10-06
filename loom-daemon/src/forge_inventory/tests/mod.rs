@@ -15,6 +15,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+mod qualification_fixture;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 

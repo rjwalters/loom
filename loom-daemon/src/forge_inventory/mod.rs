@@ -14,6 +14,7 @@
 //! | Probe manifest | `forge-inventory probe-manifest` | What must a hosted probe exercise, and with what semantics? |
 //! | Coverage report | `forge-inventory report` | Platform support vs adapter coverage vs caller integration vs unknowns |
 //! | Observed diff | `forge-inventory observed` | Which inventoried operations the host's call sink saw, and which it saw that are not inventoried (#9831) — a runtime supplement, never proof of exhaustiveness |
+//! | Workflow dependencies | `forge-inventory workflow-deps` | What workflows fetch from GitHub at run time (actions, GHCR, release downloads), kept apart from forge API coordination (#9790) — a static scan, never a network measurement |
 //!
 //! # The manifest is embedded, not discovered
 //!
@@ -71,6 +72,7 @@ pub mod observed;
 pub mod probe;
 pub mod report;
 pub mod validate;
+pub mod workflow_deps;
 
 use std::path::Path;
 
