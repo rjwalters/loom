@@ -1021,8 +1021,13 @@ mod tests {
     /// production does — `LOOM_CONFIG_DEFAULTS_FILE` set to an empty string
     /// (see `config_resolver::private_defaults_path`'s doc comment) — rather
     /// than relying on the host happening not to have one provisioned.
+    ///
+    /// Also holds `loom_config_env`, the key every other bin-target writer of
+    /// `LOOM_CONFIG_DEFAULTS_FILE` serializes on (`fleet_captain_cmd`'s tests,
+    /// #9850): this test's trailing `remove_var` would otherwise re-open the
+    /// host tier under one of those tests mid-run in a threaded `cargo test`.
     #[test]
-    #[serial_test::serial(codesign_identity_env)]
+    #[serial_test::serial(codesign_identity_env, loom_config_env)]
     fn resolve_configured_codesign_identity_is_none_when_unconfigured() {
         let tmp = tempfile::tempdir().unwrap();
 

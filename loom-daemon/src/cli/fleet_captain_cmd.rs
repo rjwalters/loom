@@ -221,6 +221,9 @@ impl FleetCaptainArgs {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV;
+    use serial_test::serial;
+    use std::ffi::OsString;
     use tempfile::tempdir;
 
     /// Write `contents` as the tracked `.loom/config.json` under `root`.
@@ -230,8 +233,91 @@ mod tests {
         std::fs::write(&path, contents).unwrap();
     }
 
+    /// Pins the machine-level private-defaults tier
+    /// ([`PRIVATE_DEFAULTS_ENV`]) for one test's scope and restores the
+    /// prior value on drop — including through a mid-test panic (#9850).
+    ///
+    /// # Why these tests cannot rely on `private_defaults_path`'s own guard
+    ///
+    /// `config_resolver::private_defaults_path` refuses the
+    /// `~/.local/share/loom/config/defaults.json` fallback under `cfg(test)`
+    /// (#8584) — but that is the **lib** crate's `cfg(test)`. These tests
+    /// live in the `loom-daemon` **bin** target, which links the `loom_daemon`
+    /// lib compiled *without* `cfg(test)`, so the home fallback is live here.
+    /// On every provisioned fleet host that file declares `fleet.captain`,
+    /// which turned each "no captain declared" fixture into a refusal (exit
+    /// 3, not 4) and kept `buildGate` red on dispatch workers
+    /// (#9850 / #9728 / #10580). CI never saw it: runners have no such file.
+    ///
+    /// Every test here that resolves the gate therefore takes
+    /// [`Self::disabled`] — the empty-string value is the documented
+    /// "tier off" spelling, the same one the crate's integration tests pass
+    /// to their child processes — under the crate's keyed `loom_config_env`
+    /// lock, so a plain multi-threaded `cargo test` cannot interleave another
+    /// writer of the variable mid-test.
+    struct DefaultsTierPin(Option<OsString>);
+
+    impl DefaultsTierPin {
+        /// The tier is off: no machine-level config is merged at all.
+        fn disabled() -> Self {
+            Self::set(OsString::new())
+        }
+
+        /// The tier points at `path` — used only to prove the tier is live
+        /// in this target (see `host_defaults_tier_is_live_in_the_bin_target_and_pinned_off_here`).
+        fn at(path: &Path) -> Self {
+            Self::set(path.as_os_str().to_owned())
+        }
+
+        fn set(value: OsString) -> Self {
+            let prior = std::env::var_os(PRIVATE_DEFAULTS_ENV);
+            std::env::set_var(PRIVATE_DEFAULTS_ENV, value);
+            Self(prior)
+        }
+    }
+
+    impl Drop for DefaultsTierPin {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var(PRIVATE_DEFAULTS_ENV, v),
+                None => std::env::remove_var(PRIVATE_DEFAULTS_ENV),
+            }
+        }
+    }
+
     #[test]
+    #[serial(loom_config_env)]
+    fn host_defaults_tier_is_live_in_the_bin_target_and_pinned_off_here() {
+        // Pins the isolation itself, so it cannot silently regress to
+        // "lib tests only" again (#9728's acceptance). A machine tier that
+        // declares some other host as captain stands in for a fleet host's
+        // real `~/.local/share/loom/config/defaults.json`.
+        let host_tier = tempdir().unwrap();
+        let defaults = host_tier.path().join("defaults.json");
+        std::fs::write(&defaults, r#"{"fleet": {"captain": "loom-fleet-captain"}}"#).unwrap();
+        let repo = tempdir().unwrap();
+        write_config(repo.path(), r#"{"nextAgentNumber": 3}"#);
+
+        {
+            // The tier IS merged in this target: a captain declared only at
+            // the machine level refuses this host. This is the leak that
+            // made the "no captain" tests below measure the host.
+            let _tier = DefaultsTierPin::at(&defaults);
+            let (code, message) = evaluate(repo.path(), "loom-worker-1", "forge-queue-check");
+            assert_eq!(code, EX_NOT_CAPTAIN, "{message}");
+            assert!(message.contains("loom-fleet-captain"), "{message}");
+        }
+
+        // …and the pin the other tests take shuts it out entirely.
+        let _tier = DefaultsTierPin::disabled();
+        let (code, message) = evaluate(repo.path(), "loom-worker-1", "forge-queue-check");
+        assert_eq!(code, EX_NO_CAPTAIN, "{message}");
+    }
+
+    #[test]
+    #[serial(loom_config_env)]
     fn armed_on_the_captain_host_exits_zero() {
+        let _tier = DefaultsTierPin::disabled();
         let dir = tempdir().unwrap();
         write_config(dir.path(), r#"{"fleet": {"captain": "loom-worker-1"}}"#);
         let (code, message) = evaluate(dir.path(), "loom-worker-1", "forge-queue-check");
@@ -241,7 +327,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn refused_on_a_non_captain_host_exits_3_and_names_the_captain() {
+        let _tier = DefaultsTierPin::disabled();
         let dir = tempdir().unwrap();
         write_config(dir.path(), r#"{"fleet": {"captain": "loom-worker-1"}}"#);
         let (code, message) = evaluate(dir.path(), "loom-worker-2", "forge-queue-check");
@@ -253,7 +341,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn no_captain_declared_exits_4_not_3() {
+        let _tier = DefaultsTierPin::disabled();
         // The distinct code is the whole point: "nobody is the captain" is a
         // misconfiguration a wrapper can surface, not a routine "not my turn".
         let dir = tempdir().unwrap();
@@ -265,14 +355,18 @@ mod tests {
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn missing_config_file_is_no_captain_declared_not_an_error() {
+        let _tier = DefaultsTierPin::disabled();
         let dir = tempdir().unwrap();
         let (code, _) = evaluate(dir.path(), "loom-worker-1", "forge-queue-check");
         assert_eq!(code, EX_NO_CAPTAIN);
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn evaluating_does_not_touch_the_armed_registry() {
+        let _tier = DefaultsTierPin::disabled();
         // A CLI check is stateless by design (see the module doc): arming
         // here would write a process-lifetime entry that dies with the
         // process, publishing a phantom `armed_singleton_jobs` value.
@@ -299,7 +393,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn evaluate_and_record_writes_a_durable_arm_on_the_armed_path_only() {
+        let _tier = DefaultsTierPin::disabled();
         let dir = tempdir().unwrap();
         write_config(dir.path(), r#"{"fleet": {"captain": "loom-worker-1"}}"#);
         let job = format!("durable-arm-test-{}", std::process::id());
@@ -330,7 +426,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(loom_config_env)]
     fn captain_handoff_clears_the_old_captains_durable_arm_9014() {
+        let _tier = DefaultsTierPin::disabled();
         // Regression for #9014: armed on A, `fleet.captain` moves to B, A's
         // next check is refused — and must remove A's durable arm record at
         // once rather than leaving it to age out over the 6h TTL.
