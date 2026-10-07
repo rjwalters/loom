@@ -18,7 +18,9 @@ pub const TREATING: &str = "loom:treating";
 pub const APPROVED: &str = "loom:pr";
 
 /// Issue labels of the human-gated intake and approval stages.
-pub const HUMAN_GATED_LABELS: &[&str] = &["loom:triage", "loom:curating", "loom:curated"];
+/// Derived (#10013): the registry's `human_gated` labels.
+pub static HUMAN_GATED_LABELS: crate::label_registry::LabelSet =
+    crate::label_registry::LabelSet::new(|| crate::label_registry::embedded_set("human_gated"));
 
 /// The ready label: approved, not yet dispatched.
 pub const READY_LABEL: &str = "loom:issue";
