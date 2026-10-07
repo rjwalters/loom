@@ -152,3 +152,7 @@ disable-auto-merge`, the claim-reconciliation revoke, and the live
 narrowed by B4 but still open, so `INVARIANT_FULLY_DEMONSTRATED` and
 `QUEUE_EXECUTION_ENABLED` stay `false`. Production enablement also needs
 Phase C qualification (`merge-queue-ci.md`).
+
+## Group-aware revocation wiring (Phase B5)
+
+`group_github` adds the GitHub adapters (queue entries via GraphQL `mergeQueue.entries`, group commit = entry `headCommit`, members = entries `1..=k`; commit-status write for `loom/merge-authorization`). `revoke_for_root` and `forge merge-queue revoke` now call `revoke_for_transition_groups`, which revokes, re-fails every live group containing the PR, then dequeues, and reports an unconfirmed re-fail as the residual window in the transition comment. Still not wired: the `merge_group` workflow running `group_check`, a durable GrantStore, `judge.md`. `QUEUE_EXECUTION_ENABLED` and `INVARIANT_FULLY_DEMONSTRATED` stay false.

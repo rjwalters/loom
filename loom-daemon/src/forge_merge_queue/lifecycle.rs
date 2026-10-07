@@ -61,7 +61,13 @@ impl Ctx<'_> {
             }
         }
     }
-    fn removed_event(&self, pr: u32, rec: &GrantRecord, reason: String, raw: Option<String>) {
+    pub(super) fn removed_event(
+        &self,
+        pr: u32,
+        rec: &GrantRecord,
+        reason: String,
+        raw: Option<String>,
+    ) {
         if let GrantRecord::Live { sha, nonce, at } = rec {
             let now = self.at();
             self.emit(&QueueEvent {
