@@ -43,10 +43,10 @@
 //! The `--from-stdin` payload accepts the new evidence as OPTIONAL fields
 //! (`pr_files`, `base_moves`); a payload without them behaves exactly as before.
 //!
-//! # Local merge-tree re-verification (#10388, opt-in)
+//! # Local merge-tree re-verification (#10388; default-on since #10465)
 //!
-//! Only when the repository opts in (`merge.reverifyStaleChecks`, default
-//! `false`; env `LOOM_MERGE_REVERIFY_STALE_CHECKS` beats it): when every stale
+//! Unless the repository opts out (`merge.reverifyStaleChecks`, default
+//! `true`; env `LOOM_MERGE_REVERIFY_STALE_CHECKS` beats it): when every stale
 //! component is on
 //! [`loom_daemon::merge_pr::stale_checks::local_eval::CHEAP_CHECKS`], their CI
 //! steps run on the merge tree of the judged base tip + the head, and a pass
@@ -206,7 +206,7 @@ impl StaleChecksArgs {
     /// pass turns it [`Verdict::Fresh`]; anything else returns `verdict`
     /// unchanged (fail closed: the existing refusal and remedy apply). The
     /// result goes to stderr (the merge log) and, when `post`, a PR comment.
-    /// A no-op unless the repository opted in.
+    /// A no-op when the repository opted out (default-on, #10465).
     fn try_local_eval(&self, verdict: Verdict, inputs: &Evidence<'_>, post: bool) -> Verdict {
         if !matches!(verdict, Verdict::Stale { .. } | Verdict::StaleInputs { .. }) {
             return verdict;
@@ -375,7 +375,7 @@ struct StdinInputs {
     runs: Vec<loom_daemon::merge_pr::stale_checks::CheckRun>,
     scoped: Option<ScopedEvidence>,
     /// `"reverify": true`: also run the #10388 local re-verification (still
-    /// subject to the repository's opt-in).
+    /// subject to the repository's `merge.reverifyStaleChecks`, default on).
     reverify: bool,
 }
 
