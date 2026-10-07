@@ -24,8 +24,8 @@ const SOURCE_ALLOWLIST: &[(&str, &str)] = &[
     ("guards_status.rs", "loom:forge-egress"),
     ("host_affinity.rs", "loom:host:"),
     ("intake_reconcile.rs", "loom:"),
-    ("label_registry/mod.rs", "loom:"),
     ("intake_reconcile/singleton.rs", "loom:"),
+    ("label_registry/mod.rs", "loom:"),
     ("merge_pr/chain_lock.rs", "loom:chain-head-lock"),
     ("merge_pr/consolidate.rs", "loom:consolidation"),
     ("merge_pr/consolidate.rs", "loom:consolidation-abort"),
@@ -90,71 +90,94 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Remove the brace-matched body of every inline `#[cfg(test)] mod name { .. }`
-/// and nothing else. Other `#[cfg(test)]` items (a `mod tests;` declaration, a
-/// `use`, a helper fn) are left in place, so the production code after them is
-/// still scanned.
+/// Remove only the bodies of inline `#[cfg(test)] (#[..])* [pub..] mod name { .. }`
+/// blocks. Everything else stays in the scan: `#[cfg(test)] mod name;`
+/// declarations (their file is filtered by name in `rs_files`), test-only
+/// `use` items and helper fns, and all production code after them. The block
+/// end is the first line that is exactly `}` at the `#[cfg(test)]` line's
+/// indentation (rustfmt layout, which CI enforces), so braces inside comments,
+/// raw strings or char literals cannot move it. Both failure modes are loud or
+/// strict, never blind: an unterminated block panics, and a stray `}` line
+/// inside a multi-line raw string would only end the strip early, scanning
+/// MORE test code, not less production code.
 fn strip_inline_test_mods(text: &str) -> String {
-    let attr = Regex::new(
-        r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{",
-    )
-    .expect("regex");
+    let lines: Vec<&str> = text.lines().collect();
+    let mod_re = Regex::new(r"^\s*(pub(\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{\s*$")
+        .expect("regex");
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(m) = attr.find(rest) {
-        out.push_str(&rest[..m.start()]);
-        let after = &rest[m.end()..];
-        let mut depth = 1usize;
-        let mut in_str = false;
-        let mut esc = false;
-        let mut end = after.len();
-        for (i, c) in after.char_indices() {
-            if in_str {
-                if esc {
-                    esc = false;
-                } else if c == '\\' {
-                    esc = true;
-                } else if c == '"' {
-                    in_str = false;
-                }
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim() == "#[cfg(test)]" {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].trim_start().starts_with("#[") {
+                j += 1;
+            }
+            if j < lines.len() && mod_re.is_match(lines[j]) {
+                let close = format!("{indent}}}");
+                let end = (j + 1..lines.len())
+                    .find(|&k| lines[k].trim_end() == close)
+                    .unwrap_or_else(|| panic!("unterminated #[cfg(test)] mod at line {}", i + 1));
+                i = end + 1;
                 continue;
             }
-            match c {
-                '"' => in_str = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
         }
-        rest = &after[end..];
+        out.push_str(line);
+        out.push('\n');
+        i += 1;
     }
-    out.push_str(rest);
     out
 }
 
 #[test]
-fn strip_keeps_production_code_after_non_inline_cfg_test_items() {
-    let src = "#[cfg(test)]\nmod tests;\nfn prod() { let _ = \"loom:prod\"; }\n\
-               #[cfg(test)]\nmod t { fn x() { let _ = \"loom:test}\"; } }\nfn after() { let _ = \"loom:after\"; }\n";
-    let body = strip_inline_test_mods(src);
-    assert!(body.contains("loom:prod"), "code after `mod tests;` must stay scanned");
-    assert!(body.contains("loom:after"), "code after an inline test mod must stay scanned");
-    assert!(!body.contains("loom:test"), "inline test mod body must be stripped");
+fn strip_inline_test_mods_keeps_production_code_around_test_items() {
+    // Unbalanced braces in comments, raw strings, char literals and strings
+    // inside the test module must not move its end: the end is found by
+    // layout (the column-0 `}`), never by counting braces (#10735 review).
+    let src = r#"
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests;
+#[cfg(test)]
+use crate::x::y;
+const A: &str = "loom:production-a";
+#[cfg(test)]
+pub(crate) mod inline_tests {
+    // example payload: {
+    /* unbalanced { in a block comment */
+    const T: &str = "loom:test-only";
+    const R: &str = r"{ raw string brace";
+    const C: char = '{';
+    fn f() {
+        let _ = "loom:test-only-nested }";
+    }
+}
+const B: &str = "loom:production-b";
+"#;
+    let kept = strip_inline_test_mods(src);
+    assert!(kept.contains("loom:production-a"), "{kept}");
+    assert!(kept.contains("loom:production-b"), "{kept}");
+    assert!(!kept.contains("loom:test-only"), "{kept}");
 }
 
 #[test]
-fn guard_scans_label_heavy_files_past_their_first_cfg_test() {
-    let src = repo_root().join("loom-daemon/src");
-    let text = std::fs::read_to_string(src.join("work_finder.rs")).expect("read");
+#[should_panic(expected = "unterminated #[cfg(test)] mod")]
+fn strip_inline_test_mods_refuses_an_unterminated_test_module() {
+    strip_inline_test_mods("#[cfg(test)]\nmod tests {\n    fn f() {}\n  }\n");
+}
+
+#[test]
+fn guard_scans_production_code_past_early_cfg_test_items() {
+    // work_finder.rs has a `#[cfg(test)] use` at line ~133 and its test
+    // modules out-of-line; the scan must still cover nearly the whole file.
+    let text = std::fs::read_to_string(repo_root().join("loom-daemon/src/work_finder.rs"))
+        .expect("read work_finder.rs");
+    let kept = strip_inline_test_mods(&text).lines().count();
+    let total = text.lines().count();
     assert!(
-        strip_inline_test_mods(&text).lines().count() > 1000,
-        "work_finder.rs must be scanned well past its first #[cfg(test)]"
+        kept * 10 >= total * 9,
+        "guard scans only {kept} of {total} lines of work_finder.rs"
     );
 }
 
