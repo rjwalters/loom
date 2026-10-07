@@ -220,6 +220,14 @@ pub fn journal_phase_usage(
         })
         .collect();
     attempts.sort_by_key(|span| span.started_at);
+    // #10749: the billing class lives on the launch's `loom.runtime.run` span.
+    let runs: Vec<SpanRecord> = journal
+        .completed()?
+        .into_iter()
+        .filter(|span| {
+            span.name == SpanName::RuntimeRun && span.context.trace_id == saved.context.trace_id
+        })
+        .collect();
     let pricing = cost::Pricing::active();
     let mut spans = Vec::new();
     for phase in phases {
@@ -230,6 +238,9 @@ pub fn journal_phase_usage(
             continue;
         };
         let mut common = TraceAttributes::new();
+        if let Some(run) = billing_run(&runs, parent) {
+            super::llm_billing::copy_into(&run.attributes, &mut common);
+        }
         common.insert("loom.sweep_id".into(), execution.to_string());
         common.insert("loom.role".into(), phase.role.to_string());
         common.insert("loom.phase".into(), phase.role.to_string());
@@ -247,6 +258,19 @@ pub fn journal_phase_usage(
         ));
     }
     spans::append_new(&journal, spans)
+}
+
+/// The `loom.runtime.run` span carrying billing for the attempt `parent`: its
+/// own child run when there is one, else the latest run in the trace.
+fn billing_run<'a>(runs: &'a [SpanRecord], parent: &TraceContext) -> Option<&'a SpanRecord> {
+    let stamped = || {
+        runs.iter()
+            .filter(|run| run.attributes.contains_key(super::llm_billing::BILLING_KEY))
+    };
+    stamped()
+        .filter(|run| run.parent_span_id.as_ref() == Some(&parent.span_id))
+        .max_by_key(|run| run.ended_at)
+        .or_else(|| stamped().max_by_key(|run| run.ended_at))
 }
 
 /// The `loom.role_attempt` span `attempt` of `role` refers to: the one whose own
@@ -313,6 +337,9 @@ pub fn journal_usage(
     if let Some(runtime) = runtime.filter(|r| !r.is_empty()) {
         common.insert("loom.runtime".into(), runtime.to_string());
     }
+    if let Some(run) = &run {
+        super::llm_billing::copy_into(&run.attributes, &mut common);
+    }
     let spans = spans::model_usage_spans(
         parent,
         (started_at, ended_at),
@@ -333,6 +360,12 @@ mod tests;
 #[allow(clippy::unwrap_used)]
 #[path = "runtime_usage/model_tests.rs"]
 mod model_tests;
+
+// `llm.billing` on sweep-scope usage spans (Issue #10749).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+#[path = "runtime_usage/billing_tests.rs"]
+mod billing_tests;
 
 // Per-phase usage on the execution's `loom.role_attempt` spans (Issue #9443).
 #[cfg(test)]
