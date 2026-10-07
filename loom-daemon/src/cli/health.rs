@@ -224,6 +224,11 @@ pub(crate) async fn handle_health_command(since: Option<String>, json: bool) -> 
         None => Duration::from_secs(health::DEFAULT_WINDOW_SECS),
     };
 
+    // #10179: a deliberately disabled host is not an outage - say so, exit 0.
+    if crate::cli::host::report_disabled(json) {
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        std::process::exit(0);
+    }
     let report = collect(window).await;
 
     if json {
