@@ -22,6 +22,8 @@
 //! - [`roster`] — `repos.yml` → desired workspace set, diffed against the
 //!   daemon's workspace registry. Fails closed.
 //! - [`state`] — this host's desired run state from `fleet/state.yml`.
+//! - [`floor`] — the fleet-wide minimum Loom version, `loom_min_version`
+//!   (#10711), from `fleet.json` or else the top level of `repos.yml`.
 //! - [`propose`] — the one *write* path: open a PR against the store instead
 //!   of hand-editing it (#9599).
 //! - [`reload`] — classify a changed config path as live-reloadable or
@@ -34,6 +36,7 @@
 
 pub mod admins;
 pub mod fetch;
+pub mod floor;
 pub mod gh;
 pub mod pending_restart;
 pub mod propose;
@@ -71,6 +74,11 @@ pub const FLEET_DEFAULTS_PATH: &str = "fleet/defaults.json";
 /// publishes it, and comment trust fails closed while it is.
 pub const ADMINS_PATH: &str = "fleet/admins.json";
 
+/// Store-relative path of the compiled fleet document (#10705). Fetched when
+/// the store has it; absent until fleet-gitops ships it, which is not an
+/// error. Today only [`floor`] reads it (`loom_min_version`, #10711).
+pub const FLEET_JSON_PATH: &str = "fleet.json";
+
 /// Store-relative path of `host`'s machine-tier overlay.
 #[must_use]
 pub fn host_defaults_path(host: &str) -> String {
@@ -87,7 +95,10 @@ pub fn host_local_path(host: &str) -> String {
 /// store (docs, `hosts.yml`, …) is ignored.
 #[must_use]
 pub fn is_contract_path(path: &str) -> bool {
-    if matches!(path, ROSTER_PATH | STATE_PATH | FLEET_DEFAULTS_PATH | ADMINS_PATH) {
+    if matches!(
+        path,
+        ROSTER_PATH | STATE_PATH | FLEET_DEFAULTS_PATH | ADMINS_PATH | FLEET_JSON_PATH
+    ) {
         return true;
     }
     let Some(rest) = path.strip_prefix("fleet/hosts/") else {
