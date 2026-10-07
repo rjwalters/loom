@@ -1668,10 +1668,13 @@ pub(crate) async fn run_daemon() -> Result<()> {
             None
         };
 
-    // GitHub Actions CI telemetry poller (Issue #8824): FLAGS-OFF
-    // (`autonomous.ciTelemetry.enabled`); `None` and zero side effects when off.
-    // Feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns` is on.
-    let _ci_poller = loom_daemon::ci_telemetry::spawn_task_on(sweep_workspace.clone(), &event_bus);
+    // Fleet-captain singleton tasks that own their loop (`fleet_singletons`):
+    // the GitHub Actions CI telemetry poller (Issue #8824): FLAGS-OFF
+    // (`autonomous.ciTelemetry.enabled`), no task and zero side effects when
+    // off, feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns`
+    // is on; and the intake reconcile singleton (W7), a config read per tick
+    // unless `fleet.intakeReconcile.singleton` makes this host the producer.
+    let _singletons = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone(), &event_bus);
 
     // Codex session-container reconcile pass (#10453); LOOM_SESSION_RECONCILE=0 opts out.
     let _session_reconcile = loom_daemon::session_reconcile::spawn_from_config(&sweep_workspace);

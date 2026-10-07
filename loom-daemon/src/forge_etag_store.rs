@@ -39,7 +39,7 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 
-use crate::forge_identity::served;
+use crate::forge_identity::{served, ReadClass};
 use crate::forge_listing::{parse_http_response, HttpResponse};
 use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
 use crate::proc_exec::Completion;
@@ -221,6 +221,11 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) {
     }
 }
 
+mod deferrable;
+#[cfg(test)]
+pub(crate) use deferrable::install_test_route;
+pub(crate) use deferrable::ReadShed;
+
 /// Who issued a conditional read and which inventoried forge operation it
 /// serves (#9831).
 ///
@@ -241,6 +246,10 @@ pub(crate) struct ConditionalRead {
     /// family is the item's answer, not a Coverage failure (W6,
     /// [`crate::forge_identity::served`]).
     pub(crate) item_scoped: bool,
+    /// How the read is treated when its readers run dry (W4-C).
+    /// [`ReadClass::Gate`], the default, retries on the writer;
+    /// a deferrable class is shed instead, see [`deferrable`].
+    pub(crate) class: ReadClass,
 }
 
 impl ConditionalRead {
@@ -251,7 +260,17 @@ impl ConditionalRead {
             op,
             timeout: None,
             item_scoped: false,
+            class: ReadClass::Gate,
         }
+    }
+
+    /// This read as a deferrable one of `class`: when every reader that can
+    /// see the repo is out of budget it fails with [`ReadShed`] and no
+    /// request, and is never retried on the writer for that reason.
+    #[must_use]
+    pub(crate) const fn deferrable(mut self, class: ReadClass) -> Self {
+        self.class = class;
+        self
     }
 
     /// Mark this read item-scoped (see [`ConditionalRead::item_scoped`]).
@@ -285,6 +304,10 @@ pub(crate) fn fetch_conditional(
     url: &str,
     etag: Option<&str>,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
+    #[cfg(test)]
+    if let Some(route) = deferrable::test_route() {
+        return fetch_conditional_via(site, gh_bin, cwd, target, url, etag, &*route);
+    }
     fetch_conditional_via(site, gh_bin, cwd, target, url, etag, &|req| {
         crate::forge_identity::route_read(req, std::time::SystemTime::now())
     })
@@ -303,6 +326,9 @@ pub(crate) fn fetch_conditional_via(
         &crate::forge_identity::RouteRequest<'_>,
     ) -> crate::forge_identity::RouteDecision,
 ) -> Result<(ExitStatus, Option<HttpResponse>, String)> {
+    if site.class != ReadClass::Gate && deferrable::shedding_enabled() {
+        return deferrable::fetch(site, gh_bin, cwd, target, url, etag, route);
+    }
     // #9537: a listing is a read, so it goes to the repo's reader App when one
     // is usable. On a credential failure the reader is withdrawn and the SAME
     // request is retried once on the writer, so a broken reader costs one

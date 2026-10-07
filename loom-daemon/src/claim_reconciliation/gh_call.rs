@@ -102,6 +102,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "quarantine.issue_release"
         | "heal.issue_add_label"
         | "intake.add_triage"
+        | "intake.remove_triage"
         | "verdict.clear_labels"
         | "sequence.pr_edit"
         | "review_conflict.pr_edit"
