@@ -218,25 +218,41 @@ fn pr_target_problem(step: &Step) -> Option<&'static str> {
         .filter(|l| !l.trim().starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
-    // The run selection must be a pipeline whose *first* stage is the PR-only
-    // filter: `'.[] | select(.event == "pull_request") | <plain filters>'`.
+    // The run selection is the `--jq` program of the one `gh run list` whose
+    // output feeds the cancel: its pipeline's *first* stage must be the PR-only
+    // filter `'.[] | select(.event == "pull_request") | <plain filters>'`.
     // Anything after it may only narrow or project that stream. A widened
     // predicate (`... or .event == "push"`), a stage before the filter, or a
     // construct that can emit values from outside the filtered stream (a comma
     // branch such as `.[] | ., select(...)`, `..`, variables, constructors) is
-    // unrecognised and fails closed.
-    let squashed = compact(&code);
-    let prefix = r#"'.[]|select(.event=="pull_request")|"#;
-    let only_pr_events = squashed.matches(".event").count() == 1
-        && squashed.find(prefix).is_some_and(|i| {
-            let rest = &squashed[i + prefix.len()..];
-            let program = rest.split('\'').next().unwrap_or("");
-            !program.is_empty()
+    // unrecognised and fails closed. The program is read from the actual
+    // command, never from elsewhere in the script, so the same text inside an
+    // `echo` or a string proves nothing; more than one `gh run list`, a `-q`
+    // alias, or a list that does not pipe into the cancel is unrecognised too.
+    let squashed = compact(&code.replace("\\\n", " "));
+    let prefix = r#"--jq'.[]|select(.event=="pull_request")|"#;
+    let only_pr_events = squashed.matches("ghrunlist").count() == 1
+        && squashed.split_once("ghrunlist").is_some_and(|(_, list)| {
+            let Some(i) = list.find("--jq") else {
+                return false;
+            };
+            let Some(rest) = list[i..].strip_prefix(prefix) else {
+                return false;
+            };
+            let Some((program, after)) = rest.split_once('\'') else {
+                return false;
+            };
+            !list[..i].contains("-q")
+                && !program.contains(".event")
+                && !program.is_empty()
                 && !program.contains([',', '$', '[', '{', '/', '?'])
                 && !program.contains("..")
                 && !["input", "reduce", "foreach", "limit", "env", "path"]
                     .iter()
                     .any(|w| program.contains(w))
+                && after
+                    .strip_prefix('|')
+                    .is_some_and(|c| c.contains("ghruncancel"))
         });
     if !only_pr_events {
         return Some("its run selection is not exactly `select(.event == \"pull_request\")`, so it can list and cancel push runs");
@@ -436,6 +452,34 @@ jobs:
             assert_eq!(f[0].event, Event::PullRequest);
             assert!(f[0].detail.contains("started main run"), "{}", f[0].detail);
         }
+    }
+
+    /// The safe filter appearing in an `echo`/string must not vouch for an
+    /// unsafe actual selection (#10677 review, #10670 criterion 3).
+    #[test]
+    fn safe_filter_in_echo_does_not_vouch_for_unsafe_selection() {
+        let safe = r#"echo '.[] | select(.event == "pull_request") | .databaseId'"#;
+        let src = PR_ONLY_CANCEL_STEP
+            .replace(
+                r#"--jq '.[] | select(.event == "pull_request") | .databaseId'"#,
+                "--jq '.[] | .databaseId'",
+            )
+            .replace(
+                "          __GH__ run list",
+                &format!("          {safe}\n          __GH__ run list"),
+            );
+        assert!(src.contains(safe));
+        let f = lint(&[wf(&src)]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].detail.contains("started main run"), "{}", f[0].detail);
+    }
+
+    /// A list that does not pipe into the cancel is not the selection.
+    #[test]
+    fn selection_not_feeding_the_cancel_fails_closed() {
+        let src = PR_ONLY_CANCEL_STEP
+            .replace(" | while read -r id; do", "; __GH__ run list | while read -r id; do");
+        assert_eq!(lint(&[wf(&src)]).len(), 1);
     }
 
     /// The #7779 shape: the cancel job runs on every event, and on a push its
