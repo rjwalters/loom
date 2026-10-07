@@ -395,7 +395,10 @@ pub fn input_from_pr_history(h: &PrHistory, repo: &str) -> EpisodeInput {
             let (label, at, added) = match event {
                 PrEvent::Labeled { label, at } => (label, at, true),
                 PrEvent::Unlabeled { label, at } => (label, at, false),
-                PrEvent::Pushed { .. } | PrEvent::Merged { .. } => return None,
+                PrEvent::Pushed { .. }
+                | PrEvent::Merged { .. }
+                | PrEvent::Closed { .. }
+                | PrEvent::Reopened { .. } => return None,
             };
             Some(LabelEvent {
                 at: *at,

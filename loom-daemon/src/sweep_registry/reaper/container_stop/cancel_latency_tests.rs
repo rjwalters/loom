@@ -11,12 +11,20 @@
 //! and the SIGTERM went out behind it too.
 //!
 //! The fake docker CLI below makes that deterministic and hermetic: its `ps`
-//! records its argv and then stalls for [`PS_STALL`], far past the fixture's
-//! cancellation grace. **Nothing here touches the host's docker service, a real
-//! container, a credential or a model** — the stall is `sleep` in a script this
+//! records its argv and then blocks on a *gate file* the test releases only
+//! after every assertion about the stalled window has been made. No pass
+//! condition here is a wall-clock latency bound (those flake under host load):
+//! each is "this completed while docker was provably still blocked", with only
+//! a large hang guard as the failure path. To keep that true, the test pins
+//! `LOOM_REAP_GH_TIMEOUT_SECS` far above the hang guard: production's 5s
+//! discovery budget would otherwise kill the stalled `ps` mid-window, and a
+//! slow host would then be indistinguishable from the #8776 regression.
+//! **Nothing here touches the host's docker service, a real
+//! container, a credential or a model** — the stall is a poll loop in a script this
 //! test writes into its own tempdir, so the assertions hold identically on a
 //! host with no docker installed, a healthy one, and a wedged one.
 
+use super::super::REAP_GH_TIMEOUT_ENV;
 use super::DOCKER_BIN_ENV;
 use crate::sweep_registry::test_support::{fixture_registry, wait_for_condition};
 use crate::sweep_registry::BeginCancel;
@@ -26,35 +34,56 @@ use serial_test::serial;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
-/// How long the fake `docker ps` stalls. Must be comfortably longer than
-/// [`GRACE`] *and* than every latency bound asserted below, so a regression
-/// that puts discovery back on the caller's thread cannot pass by luck.
-const PS_STALL: Duration = Duration::from_millis(2_500);
+/// Hang guard (milliseconds) for every wait on an event the test expects to
+/// happen. Never a pass condition: it only bounds how long a regression (or a
+/// wedged host) can keep the test alive before it fails.
+const HANG_GUARD_MS: u64 = 60_000;
+
+/// Hang guard for channel receives.
+const HANG_GUARD: Duration = Duration::from_millis(HANG_GUARD_MS);
 
 /// Cancellation grace the fixture drives the split cancel with.
 const GRACE: Duration = Duration::from_millis(1_000);
-
-/// Latency ceiling for the two lock-scoped cancel steps and for host SIGTERM
-/// delivery. Generous next to their real cost (a thread spawn plus a `kill(2)`,
-/// i.e. sub-millisecond) but a third of [`PS_STALL`], so "discovery ran inline"
-/// is unambiguously distinguishable from "the host was briefly busy".
-const PROMPT: Duration = Duration::from_millis(800);
 
 /// Container the fake `docker ps` reports once its stall elapses, so the
 /// begin/finish halves still exercise the real `stop`/`kill` argv after the
 /// move off the caller's thread.
 const FAKE_CONTAINER: &str = "deadbeef9c01";
 
+/// Discovery timeout the test pins (seconds); must exceed [`HANG_GUARD_MS`].
+const PINNED_GH_TIMEOUT_SECS: &str = "300";
+
+/// Restores (or removes) an env var on drop, including on panic.
+struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+impl EnvRestore {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let prev = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self(key, prev)
+    }
+}
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        match &self.1 {
+            Some(v) => std::env::set_var(self.0, v),
+            None => std::env::remove_var(self.0),
+        }
+    }
+}
+
 /// Write a fake docker CLI that records every invocation's argv and, for `ps`,
-/// stalls [`PS_STALL`] before reporting [`FAKE_CONTAINER`]. `stop`/`kill`
+/// blocks until `<dir>/release` exists before reporting [`FAKE_CONTAINER`]
+/// (bounded at ~120s, and also abandoned once its tempdir is gone, so a
+/// leaked process cannot live forever). `stop`/`kill`
 /// return immediately — the point of the fixture is a wedged *discovery*.
 ///
-/// The argv record is written BEFORE the stall so a test can observe that the
+/// The argv record is written BEFORE the gate so a test can observe that the
 /// probe started without waiting for it to finish.
 fn stalling_docker(dir: &Path) -> PathBuf {
     let script = dir.join("fake-docker");
@@ -64,12 +93,11 @@ fn stalling_docker(dir: &Path) -> PathBuf {
             "#!/bin/bash\n\
              printf '%s\\n' \"$*\" >> {dir}/invocations\n\
              if [[ \"$1\" == ps ]]; then\n\
-             \x20 sleep {stall}\n\
+             \x20 for ((i = 0; i < 6000; i++)); do [[ -e {dir}/release || ! -d {dir} ]] && break; sleep 0.02; done\n\
              \x20 printf '%s\\t%s\\n' '{id}' 'claude-ephemeral'\n\
              fi\n\
              exit 0\n",
             dir = dir.display(),
-            stall = PS_STALL.as_secs_f32(),
             id = FAKE_CONTAINER,
         ),
     )
@@ -121,26 +149,46 @@ fn stalled_docker_discovery_delays_neither_sigterm_nor_unrelated_reads() {
     let fake_dir = dir.path().join("docker");
     std::fs::create_dir_all(&fake_dir).unwrap();
     let fake = stalling_docker(&fake_dir);
-    // SAFETY-of-scope: restored at the end of the test; see `#[serial]` above.
-    std::env::set_var(DOCKER_BIN_ENV, &fake);
+    // SAFETY-of-scope: restored on drop; see `#[serial]` above.
+    let _docker_env = EnvRestore::set(DOCKER_BIN_ENV, &fake);
+    // Keep production's 5s discovery budget out of the test (see module doc).
+    let _timeout_env = EnvRestore::set(REAP_GH_TIMEOUT_ENV, PINNED_GH_TIMEOUT_SECS);
 
     let (registry, _record_log) = fixture_registry(dir.path());
     let registry = Arc::new(Mutex::new(registry));
 
+    // Opens the gate (and thereby unblocks any leaked fake `ps`) on every exit
+    // path, including a failed assertion.
+    struct OpenGate(PathBuf);
+    impl Drop for OpenGate {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, b"");
+        }
+    }
+    let release = fake_dir.join("release");
+    let _gate = OpenGate(release.clone());
+
     // A real child that survives SIGTERM (so the cancel is forced to poll the
-    // full grace and escalate) but records the moment it received one.
+    // full grace and escalate) but records the moment it received one. It
+    // touches `ready` only after its TERM trap is installed.
     let termed = dir.path().join("termed");
+    let ready = dir.path().join("ready");
     let mut child = Command::new("bash")
         .arg("-c")
         .arg(format!(
-            "trap 'touch {}' TERM; while true; do sleep 0.05; done",
-            termed.display()
+            "trap 'touch {}' TERM; touch {}; while true; do sleep 0.05; done",
+            termed.display(),
+            ready.display()
         ))
         .spawn()
         .expect("spawn fixture child");
     let target_pid = child.id();
-    // Let bash install the trap before anything TERMs it.
-    thread::sleep(Duration::from_millis(150));
+    let ready_seen = wait_for_condition(HANG_GUARD_MS, || ready.exists());
+    if !ready_seen {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(ready_seen, "fixture child never installed its TERM trap");
 
     let target = "sweep-cancel-stalled-docker".to_string();
     let other = "sweep-unrelated-reader".to_string();
@@ -159,12 +207,14 @@ fn stalled_docker_discovery_delays_neither_sigterm_nor_unrelated_reads() {
     }
 
     // Thread A: the split cancel exactly as the non-blocking IPC handler
-    // drives it (#3807) — lock, begin, unlock, poll, lock, finish.
+    // drives it (#3807) — lock, begin, unlock, poll, lock, finish. It reports
+    // each half's completion over channels so the main thread can assert
+    // "completed while docker was still blocked" without a stopwatch.
     let reg_a = Arc::clone(&registry);
     let target_a = target.clone();
-    let started = Instant::now();
+    let (begin_tx, begin_rx) = mpsc::channel::<()>();
+    let (finish_tx, finish_rx) = mpsc::channel();
     let canceller = thread::spawn(move || {
-        let begin_started = Instant::now();
         let (pid, kind, started_at) = match reg_a.lock().unwrap().begin_cancel(&target_a, GRACE) {
             Ok(BeginCancel::Signalled {
                 pid,
@@ -173,7 +223,7 @@ fn stalled_docker_discovery_delays_neither_sigterm_nor_unrelated_reads() {
             }) => (pid, kind, started_at),
             unexpected => panic!("target should have been running: {unexpected:?}"),
         };
-        let begin_elapsed = begin_started.elapsed();
+        let _ = begin_tx.send(());
 
         let deadline = Instant::now() + GRACE;
         let mut exited = reg_a.lock().unwrap().poll_cancel(&target_a, pid);
@@ -182,70 +232,85 @@ fn stalled_docker_discovery_delays_neither_sigterm_nor_unrelated_reads() {
             exited = reg_a.lock().unwrap().poll_cancel(&target_a, pid);
         }
 
-        let finish_started = Instant::now();
         let outcome = reg_a
             .lock()
             .unwrap()
             .finish_cancel(&target_a, pid, &kind, started_at, exited);
-        (begin_elapsed, finish_started.elapsed(), outcome)
+        let _ = finish_tx.send(());
+        outcome
     });
 
-    // AC2: the host SIGTERM goes out promptly even though `docker ps` is
-    // wedged for PS_STALL. Measured on the CHILD, not on our own call — this
-    // is delivery, not intent.
-    let term_seen =
-        wait_for_condition(u64::try_from(PROMPT.as_millis()).unwrap(), || termed.exists());
-    let term_latency = started.elapsed();
-    assert!(
-        term_seen,
-        "fixture child never saw SIGTERM within {PROMPT:?} — docker discovery \
-         delayed cancellation signalling (#8776); docker invocations so far: {}",
-        invocations(&fake_dir)
-    );
+    // Everything below runs with the docker gate CLOSED: if discovery were
+    // inline under the registry mutex, the step in question would block until
+    // the hang guard and the test would fail.
+    let mut fail = |what: &str| -> ! {
+        let log = invocations(&fake_dir);
+        let _ = std::fs::write(&release, b"");
+        let _ = child.kill();
+        panic!("{what} while `docker ps` was blocked (#8776); docker invocations: {log}");
+    };
 
-    // AC1: an unrelated sweep's status read stays prompt while the cancel is
-    // in flight and the fake `docker ps` is still stalled.
-    let read_started = Instant::now();
-    let info = registry.lock().unwrap().get_status(&other);
-    let read_elapsed = read_started.elapsed();
-    assert!(info.is_some(), "the unrelated sweep should still be queryable");
-    assert!(
-        read_elapsed < Duration::from_millis(400),
-        "an unrelated get_status blocked for {read_elapsed:?} while cancellation was in \
-         progress — the registry mutex was held across docker discovery (stall is \
-         {PS_STALL:?}, grace {GRACE:?}) (#8776)"
-    );
+    // AC2: the host SIGTERM is delivered even though `docker ps` is wedged.
+    // Observed on the CHILD — this is delivery, not intent.
+    if !wait_for_condition(HANG_GUARD_MS, || termed.exists()) {
+        fail("fixture child never saw SIGTERM: docker discovery delayed cancellation signalling");
+    }
 
-    let (begin_elapsed, finish_elapsed, outcome) =
-        canceller.join().expect("cancel thread panicked");
-    assert!(
-        begin_elapsed < PROMPT,
-        "begin_cancel held the registry mutex for {begin_elapsed:?} against a {PS_STALL:?} \
-         `docker ps` stall — discovery is back on the caller's thread (#8776)"
-    );
-    assert!(
-        finish_elapsed < PROMPT,
-        "finish_cancel held the registry mutex for {finish_elapsed:?} against a {PS_STALL:?} \
-         `docker ps` stall — the escalation half re-lists inline (#8776)"
-    );
+    // begin_cancel returned (did not hold the caller across discovery).
+    if begin_rx.recv_timeout(HANG_GUARD).is_err() {
+        fail("begin_cancel never returned: discovery is back on the caller's thread");
+    }
+
+    // AC1: an unrelated sweep's status read completes while the cancel is in
+    // flight and the gate is closed. Run on a helper thread so a mutex held
+    // across discovery shows up as a hang-guard timeout, not a deadlock.
+    let (read_tx, read_rx) = mpsc::channel();
+    let reg_r = Arc::clone(&registry);
+    let other_r = other.clone();
+    thread::spawn(move || {
+        let _ = read_tx.send(reg_r.lock().unwrap().get_status(&other_r));
+    });
+    match read_rx.recv_timeout(HANG_GUARD) {
+        Ok(info) => assert!(info.is_some(), "the unrelated sweep should still be queryable"),
+        Err(_) => fail("an unrelated get_status never completed: the registry mutex is held across docker discovery"),
+    }
+
+    // finish_cancel returned too (the escalation half does not re-list inline).
+    if finish_rx.recv_timeout(HANG_GUARD).is_err() {
+        fail("finish_cancel never returned: the escalation half re-lists inline");
+    }
+    let outcome = canceller.join().expect("cancel thread panicked");
     assert!(outcome.was_running);
     assert!(
         outcome.sigkill_sent,
         "a TERM-trapping child should have survived the grace and escalated to SIGKILL"
     );
+
+    // Discovery really was in flight, and still blocked, during all of the above.
+    if !wait_for_condition(HANG_GUARD_MS, || invocations(&fake_dir).contains("ps ")) {
+        fail("no `docker ps` was ever started");
+    }
     assert!(
-        term_latency < PROMPT,
-        "SIGTERM reached the child only after {term_latency:?} (#8776)"
+        !release.exists(),
+        "the gate must still be closed when the stalled-window assertions finish"
     );
+    assert!(
+        !invocations(&fake_dir).contains("stop --time 1"),
+        "docker stop ran before discovery was released: {}",
+        invocations(&fake_dir)
+    );
+
+    // Release the gate: discovery may now finish and the teardown proceed.
+    std::fs::write(&release, b"").unwrap();
 
     // Reap the killed child so its pid leaves the process table.
     let _ = child.wait();
 
     // AC3/AC4: moving discovery off the caller's thread must not DROP the
     // teardown. Both halves still discover by label and still issue their
-    // bounded `stop` / `kill` — just later, and off the lock. Budget covers
-    // both stalls back to back plus scheduling slop.
-    let budget = u64::try_from(PS_STALL.as_millis()).unwrap() * 3 + 5_000;
+    // bounded `stop` / `kill` — just later, and off the lock. The budget is a
+    // hang guard only.
+    let budget = HANG_GUARD_MS;
     let stop_seen = wait_for_condition(budget, || {
         invocations(&fake_dir).contains(&format!("stop --time 1 {FAKE_CONTAINER}"))
     });
@@ -269,6 +334,4 @@ fn stalled_docker_discovery_delays_neither_sigterm_nor_unrelated_reads() {
         2,
         "each half must discover by the issue+dispatch label filter, once: {log}"
     );
-
-    std::env::remove_var(DOCKER_BIN_ENV);
 }

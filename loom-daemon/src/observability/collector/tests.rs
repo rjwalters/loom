@@ -900,11 +900,13 @@ async fn collect_managed_repos_reports_every_provisioned_registrys_repo_even_whe
                 slug: "loom-test-fixture/repo-a".to_string(),
                 visibility: RepoVisibility::Public,
                 priority: Some(0),
+                stale_blocked_release: None,
             },
             ManagedRepoEntry {
                 slug: "loom-test-fixture/repo-b".to_string(),
                 visibility: RepoVisibility::Private,
                 priority: None,
+                stale_blocked_release: None,
             },
         ],
         "both registered repos are in the roster, each with its derived visibility, \

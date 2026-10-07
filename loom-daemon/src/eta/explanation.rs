@@ -138,6 +138,12 @@ pub struct Explanation {
     /// one made before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regime_adjustment: Option<RegimeAdjustment>,
+    /// The planner regime the estimate was served under
+    /// ([`super::planner_version::planner_version`], #10528). Stamped once at
+    /// the serve seam; absent otherwise, so such explanations are
+    /// byte-identical to ones made before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_version: Option<String>,
 }
 
 /// A stage's latent-regime adjustment ([`super::regime::adjust`]).

@@ -187,9 +187,22 @@ pub fn load_inputs(root: &Path) -> Inputs {
     let pr_cases = std::fs::read_to_string(pr_history_path(root))
         .ok()
         .and_then(|text| backtest::parse_pr_records(&text).ok())
-        .map(|records| {
-            // v2 priority inputs (#10508) from the cached roster history.
-            let history = super::roster_history::load_for(root, Utc::now()).0;
+        .map(|mut records| {
+            // v2 priority inputs (#10508) from the cached roster history and
+            // the cached raw star events.
+            let now = Utc::now();
+            let history = super::roster_history::load_for(root, now).0;
+            let repos: Vec<String> = records
+                .iter()
+                .map(|r| r.repo.to_ascii_lowercase())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            backtest::fill_linked_stars(
+                &mut records,
+                &super::star::StarInputs::load(root, &repos),
+                now,
+            );
             backtest::cases_from_pr_records_with_roster(&records, history.as_deref()).0
         })
         .unwrap_or_default();

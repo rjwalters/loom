@@ -116,6 +116,7 @@ pub mod eta_nightly_folds;
 pub mod eta_snapshot;
 pub mod exporter;
 pub mod lifecycle;
+pub mod llm_billing;
 pub mod ops;
 #[cfg(feature = "otlp")]
 pub mod otlp;

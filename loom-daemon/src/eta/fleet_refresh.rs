@@ -675,7 +675,7 @@ pub(super) struct Answer {
 
 /// One repo's walk within a cycle.
 pub(super) struct Walk<'a> {
-    root: &'a Path,
+    pub(super) root: &'a Path,
     pub(super) target: &'a RepoTarget,
     reader: &'a Reader,
     forge: &'a mut dyn ForgeRead,

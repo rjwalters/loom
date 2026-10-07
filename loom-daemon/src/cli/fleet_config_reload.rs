@@ -127,7 +127,7 @@ fn matching_repo<'a>(
     })
 }
 
-fn fetch_status() -> Option<DaemonStatusReport> {
+pub(crate) fn fetch_status() -> Option<DaemonStatusReport> {
     let socket_path = resolve_socket_path().ok()?;
     match block_on_query(&socket_path)? {
         Response::DaemonStatus(report) => Some(*report),

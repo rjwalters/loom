@@ -797,3 +797,105 @@ fn step_in_queue_mode_never_looks_direct_when_it_cannot_read_the_forge() {
         "{r:?}"
     );
 }
+
+// ------------------------------------------- group-aware transition (B5 seam)
+
+use super::group_authz::{Member, MergeGroup, StatusApi, StatusState};
+use super::group_github::{group_transition_line, revoke_for_transition_groups, GroupForge};
+
+/// Fake [`GroupForge`]: a fixed discovery result and a status write that can
+/// be made to fail. Records every call so direct mode can assert none.
+struct Groups {
+    found: Result<Vec<MergeGroup>, String>,
+    status_fails: bool,
+    posted: RefCell<Vec<String>>,
+    calls: Cell<u32>,
+}
+
+impl Groups {
+    fn new(found: Result<Vec<MergeGroup>, String>) -> Self {
+        Self {
+            found,
+            status_fails: false,
+            posted: RefCell::new(Vec::new()),
+            calls: Cell::new(0),
+        }
+    }
+}
+
+impl StatusApi for Groups {
+    fn post_status(&self, commit: &str, state: StatusState, _d: &str) -> Result<(), String> {
+        self.calls.set(self.calls.get() + 1);
+        assert!(matches!(state, StatusState::Failure), "revocation only fails");
+        if self.status_fails {
+            return Err("HTTP 502".into());
+        }
+        self.posted.borrow_mut().push(commit.into());
+        Ok(())
+    }
+}
+
+impl GroupForge for Groups {
+    fn groups(&self) -> Result<Vec<MergeGroup>, String> {
+        self.calls.set(self.calls.get() + 1);
+        self.found.clone()
+    }
+}
+
+fn group_with_pr() -> Vec<MergeGroup> {
+    vec![MergeGroup {
+        commit: SHA2.into(),
+        members: vec![Member {
+            pr: PR,
+            head: SHA1.into(),
+        }],
+    }]
+}
+
+#[test]
+fn group_transition_is_a_no_op_in_direct_mode() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    let groups = Groups::new(Ok(group_with_pr()));
+    let c = ctx(&gh, &ev, MergeMode::Direct, t0());
+    assert!(revoke_for_transition_groups(&c, &groups, PR, "stale-verdict").is_none());
+    assert_eq!(gh.calls.get(), 0);
+    assert_eq!(groups.calls.get(), 0, "no group read or status write");
+}
+
+#[test]
+fn group_transition_refails_the_group_containing_the_pr() {
+    let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+    hand(&gh, &ev).unwrap();
+    let groups = Groups::new(Ok(group_with_pr()));
+    let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(1));
+    let rev = revoke_for_transition_groups(&c, &groups, PR, "stale-verdict").unwrap();
+    assert!(rev.passed_checks_withdrawn());
+    assert_eq!(*groups.posted.borrow(), vec![SHA2.to_string()]);
+    let line = group_transition_line(&rev);
+    assert!(line.contains("re-failed 1 merge-group commit(s)"), "{line}");
+    assert!(!line.contains("residual window"), "{line}");
+}
+
+#[test]
+fn group_refail_errors_surface_in_the_audit_line() {
+    for (what, groups) in [
+        ("status write fails", {
+            let mut g = Groups::new(Ok(group_with_pr()));
+            g.status_fails = true;
+            g
+        }),
+        ("discovery fails", Groups::new(Err("queue unreadable".into()))),
+    ] {
+        let (gh, ev) = (Gh::new(), MemoryEventSink::default());
+        hand(&gh, &ev).unwrap();
+        let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(1));
+        let rev = revoke_for_transition_groups(&c, &groups, PR, "stale-verdict").unwrap();
+        assert!(rev.refailed.is_err(), "{what}");
+        assert!(!rev.passed_checks_withdrawn(), "{what}");
+        assert!(rev.safe_to_transition(), "{what}: grant revoke still confirmed");
+        let line = group_transition_line(&rev);
+        assert!(line.contains("merge-group re-fail NOT confirmed"), "{what}: {line}");
+        assert!(line.contains("residual window"), "{what}: {line}");
+        assert!(gh.queued.borrow().is_none(), "{what}: dequeue still attempted");
+    }
+}

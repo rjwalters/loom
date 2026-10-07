@@ -7,6 +7,11 @@
 //! (`fleet/state.yml`). Daemons read it straight from the forge; the forge is
 //! the state store, and a change to the fleet lands as a reviewed commit.
 //!
+//! A store that publishes the compiled fleet document, `fleet.json` (#10705),
+//! is read from that one file instead: roster, run state and both config tiers
+//! come from it ([`compiled`]). The legacy files are read only when it is
+//! absent; a present-but-invalid `fleet.json` fails closed.
+//!
 //! Nothing here names a particular store. Its location is config key
 //! `fleet.repo` (`OWNER/REPO`, env `LOOM_FLEET_REPO`) and ref `fleet.ref`
 //! (env `LOOM_FLEET_REF`, default `main`). With neither set the feature is off
@@ -16,12 +21,16 @@
 //!
 //! - [`fetch`] — conditional fetch into a local cache, through the daemon's
 //!   own `gh` forge path and GitHub App credentials ([`gh`]).
+//! - [`compiled`] — `fleet.json`, the compiled fleet document; the primary
+//!   source for roster, state and tiers when the store has it (#10705).
 //! - [`admins`] — the fleet admin roster (`fleet/admins.json`) that comment
 //!   trust consults (#10303). Fails closed.
 //! - [`render`] — the host's machine tier and host-local tier, and drift.
 //! - [`roster`] — `repos.yml` → desired workspace set, diffed against the
 //!   daemon's workspace registry. Fails closed.
 //! - [`state`] — this host's desired run state from `fleet/state.yml`.
+//! - [`floor`] — the fleet-wide minimum Loom version, `loom_min_version`
+//!   (#10711), from `fleet.json` or else the top level of `repos.yml`.
 //! - [`propose`] — the one *write* path: open a PR against the store instead
 //!   of hand-editing it (#9599).
 //! - [`reload`] — classify a changed config path as live-reloadable or
@@ -33,7 +42,9 @@
 //! §"Fleet store".
 
 pub mod admins;
+pub mod compiled;
 pub mod fetch;
+pub mod floor;
 pub mod gh;
 pub mod pending_restart;
 pub mod propose;
@@ -71,6 +82,13 @@ pub const FLEET_DEFAULTS_PATH: &str = "fleet/defaults.json";
 /// publishes it, and comment trust fails closed while it is.
 pub const ADMINS_PATH: &str = "fleet/admins.json";
 
+/// Store-relative path of the compiled fleet document (#10705). Fetched when
+/// the store has it; when present it is the only source of the roster, run
+/// state and config tiers ([`compiled`]), and the legacy files above are the
+/// fallback only while it is absent. [`floor`] also reads it
+/// (`loom_min_version`, #10711), raw, with its own `repos.yml` fallback.
+pub const FLEET_JSON_PATH: &str = "fleet.json";
+
 /// Store-relative path of `host`'s machine-tier overlay.
 #[must_use]
 pub fn host_defaults_path(host: &str) -> String {
@@ -87,7 +105,10 @@ pub fn host_local_path(host: &str) -> String {
 /// store (docs, `hosts.yml`, …) is ignored.
 #[must_use]
 pub fn is_contract_path(path: &str) -> bool {
-    if matches!(path, ROSTER_PATH | STATE_PATH | FLEET_DEFAULTS_PATH | ADMINS_PATH) {
+    if matches!(
+        path,
+        ROSTER_PATH | STATE_PATH | FLEET_DEFAULTS_PATH | ADMINS_PATH | FLEET_JSON_PATH
+    ) {
         return true;
     }
     let Some(rest) = path.strip_prefix("fleet/hosts/") else {
