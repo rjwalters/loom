@@ -482,6 +482,12 @@ fn docker_boundary_blocks_api_and_keeps_git_transport() {
         .ok()
         .filter(|i| !i.is_empty())
     else {
+        // CI sets LOOM_EGRESS_DOCKER_TEST_REQUIRED so a missing image fails
+        // instead of silently skipping the only runtime evidence.
+        assert!(
+            std::env::var_os("LOOM_EGRESS_DOCKER_TEST_REQUIRED").is_none(),
+            "LOOM_EGRESS_DOCKER_TEST_IMAGE is required in this environment"
+        );
         eprintln!("skip: LOOM_EGRESS_DOCKER_TEST_IMAGE not set");
         return;
     };
@@ -490,6 +496,10 @@ fn docker_boundary_blocks_api_and_keeps_git_transport() {
         .output()
         .map_or(true, |o| !o.status.success())
     {
+        assert!(
+            std::env::var_os("LOOM_EGRESS_DOCKER_TEST_REQUIRED").is_none(),
+            "docker is required in this environment"
+        );
         eprintln!("skip: docker unavailable");
         return;
     }
@@ -525,8 +535,42 @@ fn docker_boundary_blocks_api_and_keeps_git_transport() {
             )
             .map(|(c, _)| c)
     };
-    assert_ne!(run("curl -sS --max-time 5 https://api.github.com/zen"), Some(0));
-    assert_ne!(run("curl -sS -6 --max-time 5 https://api.github.com/zen"), Some(0));
+    // Positive controls: the same requests from a worker with NO boundary must
+    // reach the target, so a nonzero result under the boundary means the rules
+    // blocked it, not that DNS failed or the runner has no route. A denial is
+    // only credited for curl's refused/reset statuses (7, 35, 55, 56).
+    let control = |flags: &str| {
+        RealDocker
+            .run(
+                &[
+                    "run".into(),
+                    "--rm".into(),
+                    "--entrypoint".into(),
+                    "sh".into(),
+                    image.clone(),
+                    "-c".into(),
+                    format!("curl -sS {flags} --max-time 8 https://api.github.com/zen >/dev/null"),
+                ],
+                Duration::from_secs(40),
+            )
+            .map(|(c, _)| c)
+    };
+    let blocked = |c: Option<i32>| matches!(c, Some(7 | 35 | 55 | 56));
+    assert_eq!(control("-4"), Some(0), "IPv4 control must reach api.github.com");
+    assert!(
+        blocked(run("curl -sS -4 --max-time 5 https://api.github.com/zen")),
+        "IPv4 api.github.com must be refused by the boundary"
+    );
+    // Many runners (and the default bridge) have no IPv6 egress; the v6 leg is
+    // only asserted when the control proves v6 could otherwise get through.
+    if control("-6") == Some(0) {
+        assert!(
+            blocked(run("curl -sS -6 --max-time 5 https://api.github.com/zen")),
+            "IPv6 api.github.com must be refused by the boundary"
+        );
+    } else {
+        eprintln!("note: no IPv6 egress on this runner; IPv6 denial leg not asserted");
+    }
     // The worker holds no network capability: it cannot remove the rules.
     assert_ne!(run("iptables -F LOOM_FORGE_EGRESS"), Some(0));
     assert_eq!(run("git ls-remote https://github.com/rjwalters/loom HEAD >/dev/null"), Some(0));

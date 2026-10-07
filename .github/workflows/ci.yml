@@ -2769,6 +2769,14 @@ jobs:
       # this runner's real docker daemon.
       - name: Run the run-job seam end-to-end test (client in a socket-less container)
         run: ./docker/worker/test-run-job.sh loom-worker:ci-smoke
+      # #9989 slice 3: the container egress boundary needs NET_ADMIN, which this
+      # runner's docker daemon grants. Runs the live matrix against the shipped
+      # image; REQUIRED turns the test's no-image/no-docker skips into failures.
+      - name: Run the container egress boundary acceptance test (shipped image, NET_ADMIN)
+        env:
+          LOOM_EGRESS_DOCKER_TEST_IMAGE: loom-worker:ci-smoke
+          LOOM_EGRESS_DOCKER_TEST_REQUIRED: "1"
+        run: cargo test -j2 -p loom-daemon --lib -- docker_boundary_blocks_api_and_keeps_git_transport --nocapture
 
   session-image-smoke:
     name: loom-worker-session Image Smoke Test

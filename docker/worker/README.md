@@ -161,7 +161,7 @@ byte-identical to before. A bare-metal host keeps `runtime.unverifiable` in
 `enforcement.runtimeEgress` and a `negativeCanary`; Loom never claims host
 enforcement it did not prove. Tests: `cargo test -p loom-daemon egress_policy`;
 the real-Docker matrix (`docker_boundary_blocks_api_and_keeps_git_transport`)
-skips without Docker and runs when `LOOM_EGRESS_DOCKER_TEST_IMAGE` names an
+skips without Docker (CI sets `LOOM_EGRESS_DOCKER_TEST_REQUIRED=1` so it fails there instead) and runs when `LOOM_EGRESS_DOCKER_TEST_IMAGE` names an
 image with `iptables` and `curl`.
 
 ## Building and testing locally
