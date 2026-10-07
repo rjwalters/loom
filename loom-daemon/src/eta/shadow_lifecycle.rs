@@ -38,7 +38,10 @@
 //!    independence: see the operator's note on #10525);
 //! 3. another candidate **dominates** it over at least [`RETIREMENT_MIN_DAYS`]
 //!    common days: strictly lower mean pinball, coverage error (distance of
-//!    the p25-p75 coverage from 50%) and late-surprise rate no higher.
+//!    the p25-p75 coverage from 50%) and late-surprise rate no higher. A day
+//!    is common only when both folds scored the whole day cohort (see
+//!    `metrics`): a fold's aggregates are over its own answered subset, so
+//!    anything less does not establish the same items.
 //!
 //! Any missing or non-finite required value refuses the proposal. The
 //! evidence identity ([`RetirementProposal::evidence_id`]) hashes the window
@@ -366,7 +369,20 @@ struct DayMetrics {
     late: f64,
 }
 
+/// A fold's metrics for the candidate-to-candidate domination test, or `None`
+/// when the day cannot be compared.
+///
+/// A fold's `pinball4`, coverage and late-surprise are each the heuristic's
+/// *own* aggregate over the cases it answered (and carried a p90 for), so two
+/// folds sharing a day do not thereby share items: a model answering only the
+/// easy cases would look better than one answering all of them. Only a fold
+/// that answered every case of the day's cohort **and** was paired on every
+/// case (`paired_pairs`: p90 present on both sides) scored the whole cohort,
+/// so only two such folds scored the same items. Any other day refuses.
 fn metrics(f: &EtaBacktestFoldRecord) -> Option<DayMetrics> {
+    if f.n_cases == 0 || f.n_answered != f.n_cases || f.paired_pairs != f.n_cases {
+        return None;
+    }
     let finite = |v: Option<f64>| v.filter(|x| x.is_finite());
     Some(DayMetrics {
         pinball: finite(f.pinball4_loss_sec)?,
@@ -603,9 +619,11 @@ pub struct FilingReport {
 /// File every proposal not yet filed through `forge` (the supported creator
 /// is `.loom/scripts/create-issue.sh`). Dedup is two-layered: this host's
 /// ledger ([`filed_path`]), then the forge itself, searched for the
-/// [`dedup_key`] marker every body carries, so two hosts reading the same
-/// folds file one issue between them. A forge that cannot be searched refuses
-/// the filing (fails closed); it is retried next run.
+/// [`dedup_key`] marker every body carries (so a declined proposal is not
+/// re-filed). The search-then-create is **not atomic**: the caller must be
+/// the only filer fleet-wide (`loom-daemon eta retire --file` is gated on
+/// `fleet.captain`). A forge that cannot be searched refuses the filing
+/// (fails closed); it is retried next run.
 ///
 /// # Errors
 /// The ledger could not be written after a filing (the proposal is then

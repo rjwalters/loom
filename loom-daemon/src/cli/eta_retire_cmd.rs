@@ -16,6 +16,9 @@ use chrono::Utc;
 use loom_daemon::eta::shadow_lifecycle::{self as lifecycle, ProposalForge};
 use loom_daemon::eta::{Kind, Registry, Tier};
 
+/// The singleton job name `--file` is gated under (`fleet.captain`).
+const JOB_NAME: &str = "eta-retire-file";
+
 #[derive(clap::Args)]
 pub(crate) struct EtaRetireArgs {
     /// The Loom workspace whose folds and config to read. Defaults to the
@@ -24,7 +27,8 @@ pub(crate) struct EtaRetireArgs {
     pub repo_root: Option<PathBuf>,
 
     /// File each proposal not already filed (on this host or on the forge)
-    /// as an issue. Without it this only prints.
+    /// as an issue. Only the fleet captain files (`fleet.captain`); any other
+    /// host refuses. Without it this only prints.
     #[arg(long)]
     pub file: bool,
 
@@ -75,6 +79,13 @@ impl EtaRetireArgs {
         if !self.file || proposals.is_empty() {
             return Ok(());
         }
+        // Search-then-create is not atomic on the forge, so two hosts could
+        // both find nothing and both file. Only the fleet captain files
+        // (#8848): one owner, so the race cannot occur by construction.
+        require_captain(&loom_daemon::fleet_captain::resolve_gate_for_root(
+            &root,
+            &loom_daemon::sweep_registry::host_identity(),
+        ))?;
         let Some(script) = issue_script(&root) else {
             bail!("no executable .loom/scripts/create-issue.sh under {}", root.display());
         };
@@ -97,6 +108,15 @@ impl EtaRetireArgs {
         eprintln!("eta retire: filed {:?}; already filed {:?}", report.filed, report.already);
         Ok(())
     }
+}
+
+/// Filing is a singleton job: refused unless this host is the declared fleet
+/// captain (or no captain is declared, which also refuses).
+fn require_captain(gate: &loom_daemon::fleet_captain::CaptainGate) -> Result<()> {
+    if gate.is_armed() {
+        return Ok(());
+    }
+    bail!("refusing to file retirement proposals: {}", gate.message(JOB_NAME))
 }
 
 fn issue_script(root: &Path) -> Option<PathBuf> {
@@ -138,8 +158,8 @@ impl ProposalForge for ScriptForge<'_> {
 
     fn file(&mut self, title: &str, body: &str) -> Result<String, String> {
         // `--repo`: the write names the vetted repository explicitly (#9548).
-        // `--force`: the dedup is ours (the marker key), not the script's
-        // title-similarity check.
+        // `--force`: the dedup is ours (the marker key, with the captain as
+        // the only filer), not the script's title-similarity check.
         let out = Command::new(&self.script)
             .current_dir(self.root)
             .args([
@@ -185,6 +205,7 @@ fn first_trusted_url(
 mod tests {
     use super::*;
     use loom_daemon::comment_trust::TrustPolicy;
+    use loom_daemon::fleet_captain::resolve_gate;
 
     fn policy() -> TrustPolicy {
         TrustPolicy::for_root(Path::new("/nonexistent-loom-root"))
@@ -219,5 +240,14 @@ mod tests {
     fn an_unreadable_reply_refuses_rather_than_reading_as_no_hit() {
         assert!(first_trusted_url(&policy(), b"not json").is_err());
         assert!(first_trusted_url(&policy(), b"{}").is_err());
+    }
+
+    #[test]
+    fn only_the_declared_captain_files() {
+        assert!(require_captain(&resolve_gate(Some("w1"), "w1")).is_ok());
+        let other = require_captain(&resolve_gate(Some("w1"), "w2")).unwrap_err();
+        assert!(other.to_string().contains("captain is w1"), "{other}");
+        // No captain declared refuses too: never "everywhere".
+        assert!(require_captain(&resolve_gate(None, "w1")).is_err());
     }
 }

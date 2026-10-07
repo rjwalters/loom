@@ -193,6 +193,54 @@ fn retirement_refuses_short_windows_baselines_and_missing_evidence() {
     assert!(retirement_proposals(&noisy, CUR, &["bad", "good", "odd"]).is_empty());
 }
 
+#[test]
+fn domination_refuses_days_whose_scored_items_may_differ() {
+    let names = ["bad", "good", "odd"];
+    let proposed = |d: &[DayRecords]| retirement_proposals(d, CUR, &names);
+    assert_eq!(proposed(&retire_fixture(RETIREMENT_MIN_DAYS)).len(), 1);
+
+    // `odd` also dominates `bad`, so both dominators are made incomparable
+    // in turn. `good` answered only part of each day's cohort (its own
+    // aggregates are over an easier subset): it cannot dominate `bad`.
+    let mut subset = retire_fixture(RETIREMENT_MIN_DAYS);
+    for day in &mut subset {
+        for f in &mut day.folds[1..3] {
+            f.n_answered = 25;
+            f.answer_rate = Some(0.625);
+        }
+    }
+    assert!(proposed(&subset).is_empty());
+
+    // Same answer counts, but `good` lacked a p90 on some cases, so its
+    // pinball4/late are over fewer items than the cohort.
+    let mut no_p90 = retire_fixture(RETIREMENT_MIN_DAYS);
+    for day in &mut no_p90 {
+        for f in &mut day.folds[1..3] {
+            f.paired_pairs = 30;
+        }
+    }
+    assert!(proposed(&no_p90).is_empty());
+
+    // Only the dominator's incomparable days are dropped: with one day of
+    // them the common window falls under the minimum.
+    let mut one_day = retire_fixture(RETIREMENT_MIN_DAYS);
+    for f in &mut one_day[3].folds[1..3] {
+        f.n_answered = 39;
+    }
+    assert!(proposed(&one_day).is_empty());
+
+    // An empty cohort proves nothing.
+    let mut empty = retire_fixture(RETIREMENT_MIN_DAYS);
+    for day in &mut empty {
+        for f in &mut day.folds[1..3] {
+            f.n_cases = 0;
+            f.n_answered = 0;
+            f.paired_pairs = 0;
+        }
+    }
+    assert!(proposed(&empty).is_empty());
+}
+
 /// A fake forge: issues are bodies in memory; `find` greps them.
 #[derive(Default)]
 struct FakeForge {

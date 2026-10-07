@@ -830,19 +830,30 @@ when all of these hold:
    lower mean pinball, and coverage error (`|cov_25_75 - 0.5|`) and late
    surprise no higher.
 
+Domination compares the folds' own aggregates, so it needs both folds to have
+scored the **whole** day cohort: a day counts only when the fold answered every
+case (`n_answered == n_cases`) and was paired on every case (`paired_pairs ==
+n_cases`, so a p90 was present). A fold that answered a subset, or lacked a p90
+somewhere, cannot be shown to share items with another, so that day refuses
+rather than comparing an easy subset to the full cohort.
+
 Missing or non-finite values refuse. Each proposal carries an `evidence_id`
 (a hash of the window, the numbers and the fold ids). The dedup key is the
 heuristic alone, so neither an unchanged window nor a slid one files a second
 issue. `eta retire --file` files each new proposal with
-`.loom/scripts/create-issue.sh` (label `loom:triage`), and dedups twice:
+`.loom/scripts/create-issue.sh` (label `loom:triage`). **Only the fleet
+captain files** (`fleet.captain`, #8848): any other host, or a fleet with no
+captain declared, refuses. Search-then-create is not atomic on the forge, so
+one owner is what prevents two hosts both finding nothing and both filing. The
+captain dedups twice:
 
-- first against this host's `.loom/state/eta/retirement-proposals.json`;
+- first against its `.loom/state/eta/retirement-proposals.json`;
 - then against the forge, by a REST search for the key marker in any issue,
   open or closed, counting only issues by a trusted author
-  (`comment-trust.md`: anyone else's copy of the marker is ignored), so two
-  hosts reading the same folds file one issue between them, and a declined
-  proposal is not re-filed. GitHub's search index lags writes, so two hosts
-  racing within that window can still double-file.
+  (`comment-trust.md`: anyone else's copy of the marker is ignored), so a
+  declined proposal is not re-filed, and a change of captain does not re-file
+  once the first issue is indexed (GitHub's search index lags writes, so a
+  handover inside that window can still double-file).
 
 A failed search refuses the filing; it is retried on the next run. Nothing
 schedules `eta retire --file` yet: run it by hand or from cron.
@@ -2264,9 +2275,10 @@ accepts `--repo-root PATH` (default: the current directory).
 - **`loom-daemon eta retire [--file] [--json]`** (#10525) — the retirement
   proposals the saved nightly folds support, with their evidence
   ([Shadow fleet management](#shadow-fleet-management)). Without `--file` it
-  only prints. With it, each proposal not already filed (on this host's
-  `.loom/state/eta/retirement-proposals.json` or on the forge) is filed via
-  `.loom/scripts/create-issue.sh`. It never unregisters a heuristic.
+  only prints. With it, and only on the fleet captain (`fleet.captain`; other
+  hosts refuse), each proposal not already filed (in `.loom/state/eta/retirement-proposals.json`
+  or on the forge) is filed via `.loom/scripts/create-issue.sh`. It never
+  unregisters a heuristic.
 - **`loom-daemon eta fleet backfill|refresh|show [--repo OWNER/NAME] [--limit N] [--as-of RFC3339] [--progress] [--dry-run] [--json]`**
   — build, top up and inspect the fleet-wide forge-derived history snapshot
   (#9343), cached at `.loom/state/eta/fleet/fleet-<owner>-<repo>.json`.
