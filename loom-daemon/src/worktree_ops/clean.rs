@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 
+use super::branch_holders::{branch_holders, held_by_worktree, kept_line, skip_if_held};
 use super::gh;
 use super::liveness::active_spawn_loop_issues;
 use super::naming::{self, BRANCH_PREFIX};
@@ -1387,11 +1388,12 @@ pub fn cleanup_worktree(
         "classify_worktree=Remove",
     );
 
-    let deleted = Command::new("git")
-        .args(["branch", "-d", &branch_name])
-        .current_dir(repo_root)
-        .status()
-        .is_ok_and(|s| s.success());
+    let deleted = skip_if_held(repo_root, &branch_name)
+        || Command::new("git")
+            .args(["branch", "-d", &branch_name])
+            .current_dir(repo_root)
+            .status()
+            .is_ok_and(|s| s.success());
     if !deleted {
         let _ = Command::new("git")
             .args(["branch", "-D", &branch_name])
@@ -1751,6 +1753,7 @@ pub fn cleanup_pr_worktree(
                      pr-{pr_num}'s worktree"
                 );
             }
+            _ if skip_if_held(repo_root, &branch_name) => {}
             BranchDeleteMode::ForceSafe => {
                 // Every commit on the branch is part of what the forge merged
                 // (tip == head SHA), so `-D` cannot lose anything — and it is
@@ -2043,25 +2046,20 @@ pub fn current_branch(repo_root: &Path) -> Option<String> {
     }
 }
 
-fn checked_out_branches(repo_root: &Path) -> std::collections::HashSet<String> {
-    let mut out_set = std::collections::HashSet::new();
-    let Ok(out) = Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(repo_root)
-        .output()
-    else {
-        return out_set;
-    };
-    if !out.status.success() {
-        return out_set;
+/// Tally a failed `git branch -D`: a worktree-held branch is a skip
+/// (`kept_branches`, no error); anything else is a real error.
+pub(super) fn record_branch_delete_failure(
+    stats: &mut CleanupStats,
+    branch: &str,
+    target: &str,
+    cause: &str,
+) {
+    if let Some(path) = held_by_worktree(cause) {
+        println!("  {}", kept_line(&path, branch));
+        stats.kept_branches += 1;
+    } else {
+        stats.record_error(target, "git branch -D", cause);
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    for line in stdout.lines() {
-        if let Some(name) = line.strip_prefix("branch refs/heads/") {
-            out_set.insert(name.trim().to_string());
-        }
-    }
-    out_set
 }
 
 /// The repo's default branch, resolved from `origin/HEAD` — `None` if that
@@ -2247,7 +2245,9 @@ fn delete_stale_branch(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool
     }
     match force_delete_branch(repo_root, branch) {
         Ok(()) => stats.cleaned_branches += 1,
-        Err(cause) => stats.record_error(&format!("branch {branch}"), "git branch -D", &cause),
+        Err(cause) => {
+            record_branch_delete_failure(stats, branch, &format!("branch {branch}"), &cause);
+        }
     }
 }
 
@@ -2333,11 +2333,16 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
     if let Some(c) = current_branch(repo_root) {
         protected.insert(c);
     }
-    protected.extend(checked_out_branches(repo_root));
+    let holders = branch_holders(repo_root);
 
     let mut issue_pass_candidates: Vec<String> = Vec::new();
     for branch in &branches {
         if protected.contains(branch) {
+            continue;
+        }
+        if let Some(path) = holders.get(branch) {
+            println!("  {}", kept_line(path, branch));
+            stats.kept_branches += 1;
             continue;
         }
         if !remote_branch_exists(repo_root, branch) {
@@ -2364,9 +2369,10 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
                 if !opts.dry_run {
                     match force_delete_branch(repo_root, branch) {
                         Ok(()) => stats.cleaned_branches += 1,
-                        Err(cause) => stats.record_error(
+                        Err(cause) => record_branch_delete_failure(
+                            stats,
+                            branch,
                             &format!("branch {branch} (issue #{issue_num} CLOSED)"),
-                            "git branch -D",
                             &cause,
                         ),
                     }
