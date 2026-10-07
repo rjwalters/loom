@@ -75,7 +75,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::tokens_pool::round_summary::{self, RoundSummary};
 use crate::workspace_registry::WorkspaceRegistry;
+
+pub mod telemetry;
 
 // ============================================================================
 // Constants
@@ -141,6 +144,13 @@ pub trait RankingRefreshRunner {
     /// spawn failure, timeout, or non-zero exit is a [`RefreshOutcome::Failure`],
     /// never a propagated error.
     fn refresh(&mut self) -> RefreshOutcome;
+
+    /// The per-account summary the last [`Self::refresh`] reported, if any
+    /// (issue #10744). Taken, so a second call returns `None`. A runner that
+    /// cannot see per-account results keeps the default.
+    fn take_summary(&mut self) -> Option<RoundSummary> {
+        None
+    }
 }
 
 /// The concrete [`RankingRefreshRunner`]: shells out to **its own binary**
@@ -162,6 +172,8 @@ pub struct ScriptRankingRefreshRunner {
     /// Production leaves this `None` and resolves via [`Self::resolve_bin`].
     bin: Option<PathBuf>,
     timeout: Duration,
+    /// What the last child reported through its summary file (#10744).
+    last_summary: Option<RoundSummary>,
 }
 
 impl ScriptRankingRefreshRunner {
@@ -172,6 +184,7 @@ impl ScriptRankingRefreshRunner {
             repo_root,
             bin: None,
             timeout: DEFAULT_PROBE_TIMEOUT,
+            last_summary: None,
         }
     }
 
@@ -206,11 +219,24 @@ impl ScriptRankingRefreshRunner {
 
 impl RankingRefreshRunner for ScriptRankingRefreshRunner {
     fn refresh(&mut self) -> RefreshOutcome {
+        self.last_summary = None;
         let bin = match self.resolve_bin() {
             Ok(p) => p,
             Err(e) => return RefreshOutcome::Failure(e),
         };
-        run_probe_with_timeout(&bin, &self.repo_root, self.timeout)
+        // Issue #10744: the child writes what it probed here (see
+        // `tokens_pool::round_summary`). Absent after an older child or an
+        // early failure, which the record reports as `source: unknown`.
+        let summary_path = std::env::temp_dir()
+            .join(format!("loom-token-ranking-summary-{}.json", uuid::Uuid::new_v4()));
+        let outcome = run_probe_with_timeout(&bin, &self.repo_root, self.timeout, &summary_path);
+        self.last_summary = round_summary::read_summary(&summary_path);
+        let _ = std::fs::remove_file(&summary_path);
+        outcome
+    }
+
+    fn take_summary(&mut self) -> Option<RoundSummary> {
+        self.last_summary.take()
     }
 }
 
@@ -218,7 +244,14 @@ impl RankingRefreshRunner for ScriptRankingRefreshRunner {
 /// as both the `--workspace` argument and the child's cwd, capturing combined
 /// output to a temp file (never a pipe — avoids the pipe-buffer deadlock the
 /// health gate's equivalent helper documents) and killing it after `timeout`.
-fn run_probe_with_timeout(bin: &Path, repo_root: &Path, timeout: Duration) -> RefreshOutcome {
+/// `summary_path` is handed to the child in
+/// [`round_summary::ROUND_SUMMARY_FILE_ENV`].
+fn run_probe_with_timeout(
+    bin: &Path,
+    repo_root: &Path,
+    timeout: Duration,
+    summary_path: &Path,
+) -> RefreshOutcome {
     let log_path = std::env::temp_dir()
         .join(format!("loom-token-ranking-refresh-{}.log", uuid::Uuid::new_v4()));
     let out_file = match std::fs::File::create(&log_path) {
@@ -242,6 +275,7 @@ fn run_probe_with_timeout(bin: &Path, repo_root: &Path, timeout: Duration) -> Re
         .arg("--workspace")
         .arg(repo_root)
         .current_dir(repo_root)
+        .env(round_summary::ROUND_SUMMARY_FILE_ENV, summary_path)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(stderr_file))
@@ -468,21 +502,27 @@ pub fn spawn_multi_token_ranking_refresh_task(
                          or LOOM_TOKEN_RANKING_REFRESH unset-falsy) — skipping",
                         root.display()
                     );
+                    // #10744: a disabled workspace still reports its round.
+                    telemetry::record_disabled(&root);
                     continue;
                 }
                 let root_for_task = root.clone();
+                let started_at = chrono::Utc::now();
                 let joined = tokio::task::spawn_blocking(move || {
-                    let mut runner = ScriptRankingRefreshRunner::new(root_for_task);
-                    runner.refresh()
+                    let mut runner = ScriptRankingRefreshRunner::new(root_for_task.clone());
+                    telemetry::refresh_and_record(&root_for_task, &mut runner)
                 })
                 .await;
                 match joined {
                     Ok(outcome) => outcomes.push((root, outcome)),
-                    Err(e) => log::error!(
-                        "token_ranking_refresh: refresh task for {} panicked ({e}); continuing to the \
-                         next repo",
-                        root.display()
-                    ),
+                    Err(e) => {
+                        log::error!(
+                            "token_ranking_refresh: refresh task for {} panicked ({e}); continuing to \
+                             the next repo",
+                            root.display()
+                        );
+                        telemetry::record_panic(&root, started_at);
+                    }
                 }
             }
             log_tick_outcomes(&outcomes);

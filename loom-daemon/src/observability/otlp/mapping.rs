@@ -10,6 +10,7 @@ mod ops;
 mod pass;
 mod pick_decision;
 mod session_output;
+mod token_ranking;
 
 use std::collections::BTreeMap;
 
@@ -641,11 +642,13 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)
         }
-        TelemetryRecord::AutoUpdateTick(_) => {
+        TelemetryRecord::AutoUpdateTick(_) | TelemetryRecord::TokenRankingRefresh(_) => {
             // Issue #10414: one self-update decision, stamped at the tick's
-            // start; the body is the record's JSON.
+            // start; the body is the record's JSON. Issue #10744: one
+            // token-ranking refresh round, same shape.
             let (event_name, severity, at, attributes, body) =
-                auto_update::log_parts(&envelope.record)?;
+                auto_update::log_parts(&envelope.record)
+                    .or_else(|| token_ranking::log_parts(&envelope.record))?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)

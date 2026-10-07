@@ -706,6 +706,12 @@ loop also emits one `auto_update.tick` log per tick. It records the decision
 the drain state and the deciding build's version and revision. A host that
 stops converging now says why on every tick. See
 [`telemetry-schema.md` → `auto_update.tick`](telemetry-schema.md#auto_updatetick).
+The token-ranking refresh loop (default-on, every 600 s) emits one
+`token_ranking.refresh` log per workspace per round (#10744). It records the
+accounts probed against `api.anthropic.com`, each account's outcome and
+credential kind, and `api_key_probe_count`, the probes that were metered spend.
+Before #10744 this recurring provider call from every host was invisible. See
+[`telemetry-schema.md` → `token_ranking.refresh`](telemetry-schema.md#token_rankingrefresh).
 
 **IPC latency (#10765).** `loom.daemon.ipc.latency_max{kind}`,
 `loom.daemon.ipc.latency{kind}` and `loom.daemon.ipc.requests{kind}` time

@@ -187,6 +187,9 @@ pub mod pr_resolved;
 /// `session.output` (#9764) — the live, redacted agent-output feed.
 pub mod session_output;
 
+/// `token_ranking.refresh` (#10744) — one token-ranking refresh round.
+pub mod token_ranking_refresh;
+
 /// The export-coverage pair `(exporters, exported_kinds)` for `host.health`
 /// (Issue #10196), derived from the per-exporter status map
 /// (`crate::observability::global_export_statuses()`, keyed by
@@ -444,6 +447,13 @@ macro_rules! telemetry_kind_table {
             /// reason, blockers with their states, labels changed. OTLP-only.
             /// See [`pass`].
             PassVerdict = "pass.verdict" => $crate::telemetry::kinds::pass::PassVerdictRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// One workspace's token-ranking refresh round (Issue #10744):
+            /// accounts probed, per-account outcome and credential kind, and
+            /// how many probes used a metered API key. OTLP-only. See
+            /// [`token_ranking_refresh`].
+            TokenRankingRefresh = "token_ranking.refresh" => $crate::telemetry::kinds::token_ranking_refresh::TokenRankingRefreshRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

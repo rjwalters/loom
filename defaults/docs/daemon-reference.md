@@ -7904,6 +7904,21 @@ pool, gated by that repo's own config (an empty registry reduces to the single
 daemon workspace). See `loom-daemon/src/token_ranking_refresh.rs` for the
 implementation.
 
+**Every round is recorded (#10744).** Each tick emits one
+`token_ranking.refresh` OTLP log record per registered workspace: `success`,
+`failure` (spawn error, timeout, non-zero exit, panic) or `disabled`. It names
+which accounts were actually sent a `max_tokens: 1` probe, each account's
+outcome (`ok` / `rate_limited` / `auth_dead` / `skipped_fresh` / `error` /
+`unsupported`), each account's credential kind (`oauth` / `api_key`), and
+whether a fresh claude-monitor `ranking.json` served the round
+(`skipped_fresh`). `api_key_probe_count` counts the probes that were metered
+spend. Account names only, never token values. The child `tokens check`
+reports per-account results to the loop through a summary file named in
+`LOOM_TOKEN_RANKING_SUMMARY_FILE`, which only the loop sets. When a round
+probes an API-key account the daemon also logs a `WARN` naming it. Probing
+behavior is unchanged: API-key accounts are still probed. See
+[`telemetry-schema.md` → `token_ranking.refresh`](telemetry-schema.md#token_rankingrefresh).
+
 **This loop's scope is per-repo; `loom-daemon health`'s tokens section used to
 be single-pool only (#5269).** This refresher keeps every registered repo's
 OWN pool fresh independently — but through v0.18.0, `loom-daemon health`/

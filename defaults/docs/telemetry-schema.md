@@ -2177,6 +2177,41 @@ otherwise.
 | `duration_ms` | integer | wall time of the tick |
 | `loom` | object | the deciding (running) daemon's provenance (required) |
 
+### `token_ranking.refresh`
+
+One workspace's round of the token-ranking refresh loop (Issue #10744). The
+loop is described in [`daemon-reference.md`](daemon-reference.md). There is one
+record per registered workspace per round, every
+`autonomous.tokenRankingRefresh.intervalSecs` (default 600 s), including a
+workspace with the loop disabled and a round that failed. Envelopes carry
+`schema_version: 12`. **OTLP-only** (native: `false`). The body is the record's
+JSON, which carries the per-account entries. The round-level scalars ride as
+`loom.token_ranking.*` attributes (`TOKEN_RANKING_LOG_ATTRIBUTE_KEYS`, which the
+collector's `transform/privacy` allowlists), including one count per account
+outcome (`ok_count`, `rate_limited_count`, `auth_dead_count`,
+`skipped_fresh_count`, `error_count`, `unsupported_count`), `account_count` and
+the boolean `skipped_fresh` (`source == monitor`). The record time is the
+round's start. Provenance is required, as for `auto_update.tick`: it exports
+as `loom.token_ranking.version` / `revision` / `tree_state` /
+`provenance_complete`. Severity is `WARN` for a failed round or a round with
+`api_key_probe_count > 0`, and `INFO` otherwise. **No credential material**:
+accounts appear by pool name, and the credential kind is derived from the
+token's prefix inside the probing process.
+
+| Field | Type | Notes |
+|---|---|---|
+| `round_id` | string | derived, never random: `derived_hex(["loom.token_ranking.refresh", host_id, workspace, round start], 32)` |
+| `started_at` | RFC3339 | the round's start |
+| `workspace` | string | the workspace root refreshed |
+| `outcome` | string | `success` (the `tokens check --ranking` child exited 0), `failure`, `disabled` (`autonomous.tokenRankingRefresh.enabled=false` or the env override; nothing ran) |
+| `failure_class` | string? | for a failure: `spawn_error`, `timeout`, `nonzero_exit`, `poll_error`, `panic`, `error`. The child's output is never exported |
+| `source` | string | `monitor` (a fresh claude-monitor `ranking.json` served the round; only overdue rows were re-probed), `probe` (every account was probed), `unknown` (no summary from the child: an early failure, a disabled workspace, or an older binary) |
+| `probed_count` | integer | requests sent to the provider this round |
+| `api_key_probe_count` | integer | of those, requests that used an API-key credential (`x-api-key`): metered spend |
+| `accounts` | array | one `{account, provider, status, outcome, credential_kind, probed}` per account. `outcome` is `ok` / `rate_limited` (`rate_limited` or `exhausted`) / `auth_dead` (`blocked`) / `skipped_fresh` / `error` / `unsupported`; `status` is the raw `tokens check` status; `credential_kind` is `oauth` / `api_key` / `unknown` (not a Claude credential shape, a non-Claude provider, or unreadable) |
+| `duration_ms` | integer | wall time of the round |
+| `loom` | object | the running daemon's provenance (required) |
+
 ### `eta.fit`
 
 One daily-fit check (Issue #10391), whether it fitted or not. Envelopes carry
