@@ -258,19 +258,85 @@ fn cancel_consumes_filtered_ids(code: &str) -> bool {
     }
     let body: Vec<&str> = it.collect();
     let all: Vec<&str> = norm.split_whitespace().collect();
-    let is_cancel = |w: &[&str]| w == ["gh", "run", "cancel"];
-    if all.windows(3).filter(|w| is_cancel(w)).count() != 1 {
+    if all
+        .windows(3)
+        .filter(|w| *w == ["gh", "run", "cancel"])
+        .count()
+        != 1
+    {
         return false;
     }
-    let assign = format!("{var}=");
-    if body.iter().any(|t| *t == "read" || t.starts_with(&assign)) {
+    loop_body_is_supported(&body, var)
+}
+
+/// A shell word that cannot run a command or write a variable: no command or
+/// process substitution, no legacy `$[...]` arithmetic, and no `${...=...}`
+/// assigning expansion.
+fn inert_word(w: &str) -> bool {
+    if ["$(", "`", "$[", "<(", ">("].iter().any(|p| w.contains(p)) {
         return false;
     }
-    let Some(at) = body.windows(3).position(is_cancel) else {
+    w.split("${")
+        .skip(1)
+        .all(|r| !r.split('}').next().unwrap_or("").contains('='))
+}
+
+/// `$name`, `${name}` or either quoted: a plain variable read.
+fn plain_var_read(w: &str) -> bool {
+    let w = w.trim_matches('"');
+    let name = w
+        .strip_prefix("${")
+        .and_then(|r| r.strip_suffix('}'))
+        .or_else(|| w.strip_prefix('$'));
+    name.is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// Allowlist of the loop body (the tokens after `do`, ending in `done`). Each
+/// statement must be one of: `if [[ <read> (!=|==) <read> ]]`, `then`, `fi`,
+/// `echo <inert words>`, or the one `gh run cancel $VAR [--repo <inert>]`
+/// optionally followed by `|| echo <inert words>`. A statement outside that
+/// set (`printf -v`, `eval`, `declare`, `id=...`, `read`, a pipeline, ...) is a
+/// command whose effect on the target is not understood, so it fails closed.
+fn loop_body_is_supported(body: &[&str], var: &str) -> bool {
+    let Some((&"done", stmts)) = body.split_last() else {
         return false;
     };
-    let arg = body.get(at + 3).map(|a| a.trim_matches('"'));
-    arg == Some(format!("${var}").as_str()) || arg == Some(format!("${{{var}}}").as_str())
+    let echo_ok =
+        |s: &[&str]| s.first() == Some(&"echo") && s.iter().all(|w| *w != "|" && inert_word(w));
+    let mut cancels = 0;
+    for stmt in stmts.split(|t| *t == ";") {
+        let stmt = match stmt {
+            ["then", rest @ ..] if !rest.is_empty() => rest,
+            s => s,
+        };
+        let ok = match stmt {
+            [] | ["then"] | ["fi"] => true,
+            ["if", "[[", a, "!=" | "==", b, "]]"] => plain_var_read(a) && plain_var_read(b),
+            ["echo", ..] => echo_ok(stmt),
+            ["gh", "run", "cancel", arg, rest @ ..] => {
+                let (flags, fallback) = match rest.iter().position(|t| *t == "|") {
+                    Some(i) => (&rest[..i], Some(&rest[i..])),
+                    None => (rest, None),
+                };
+                let arg = arg.trim_matches('"');
+                let target = arg == format!("${var}") || arg == format!("${{{var}}}");
+                let flags_ok = match flags {
+                    [] => true,
+                    ["--repo", v] => inert_word(v),
+                    _ => false,
+                };
+                let fallback_ok =
+                    fallback.is_none_or(|f| matches!(f, ["|", "|", ..]) && echo_ok(&f[2..]));
+                cancels += 1;
+                target && flags_ok && fallback_ok
+            }
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    cancels == 1
 }
 
 /// Whether the whitespace-stripped jq `program` after the PR-only filter keeps
@@ -599,6 +665,14 @@ jobs:
             (cancel, "            __GH__ run cancel $id\n            __GH__ run cancel 123\n"),
             (cancel, "            id=123\n            __GH__ run cancel $id\n"),
             (cancel, "            read -r id\n            __GH__ run cancel $id\n"),
+            (cancel, "            printf -v id '%s' 123\n            __GH__ run cancel $id\n"),
+            (cancel, "            eval id=123\n            __GH__ run cancel $id\n"),
+            (cancel, "            declare id=123\n            __GH__ run cancel $id\n"),
+            (cancel, "            echo $((id=123))\n            __GH__ run cancel $id\n"),
+            (cancel, "            echo ${id:=123}\n            __GH__ run cancel $id\n"),
+            (cancel, "            echo $(printf 123)\n            __GH__ run cancel $id\n"),
+            (cancel, "            [[ 1 -eq id=123 ]]\n            __GH__ run cancel $id\n"),
+            (cancel, "            __GH__ run cancel $id 123\n"),
             (cancel, "            __GH__ api -X POST repos/o/r/actions/runs/123/cancel\n"),
             (cancel, "            __GH__ api -X POST 'repos/o/r/actions/runs/123/cancel'\n"),
             ("          done\n", "          done\n          __GH__ run cancel 123\n"),
