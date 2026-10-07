@@ -227,6 +227,13 @@ assert_contains "$STEP4" "independently identified preference or authority quest
     "operator routing after exhausted rounds requires a named preference/authority question"
 assert_doc_contains "$THROUGHPUT_DOC" "Exhausted rounds alone never make a factual finding a human call" \
     "the doc keeps factual exhausted rounds with agents"
+STANDDOWN_ROW="$(printf '%s\n' "$STEP4" | grep -F 'disposition round already granted' || true)"
+assert_contains "$STANDDOWN_ROW" '--remove-label "loom:evaluating"' \
+    "the exhausted stand-down releases the loom:evaluating claim it took"
+assert_not_contains "$STANDDOWN_ROW" "no label change" \
+    "the exhausted stand-down no longer leaves the claim behind"
+assert_doc_contains "$THROUGHPUT_DOC" "Stand down: release the \`loom:evaluating\` claim" \
+    "the doc's stand-down row matches the claim release"
 assert_contains "$STEP4" "loom-daemon operator-decision apply" "an escalation is filed as a ranked decision"
 assert_contains "$STEP4" "--also-label loom:operator-only" "the decision keeps the operator-only skip"
 assert_not_contains "$STEP4" '--add-label "loom:operator-only' "Step 4 never hand-applies loom:operator-only"

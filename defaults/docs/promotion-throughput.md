@@ -131,7 +131,7 @@ fits:
 | No trusted `<!-- champion:revision-exhausted -->` comment on the issue | One final Curator round, carrying that marker |
 | The final round failed and an independently identified preference or authority question exists | File a ranked decision on that question |
 | The final round failed and every remaining finding is factual | One disposition round (`<!-- champion:revision-disposition -->`): Curator closes, splits or files a decision, not another edit |
-| Otherwise | Stand down; the silent-skip ladder holds the issue |
+| Otherwise | Stand down: release the `loom:evaluating` claim, leave routing labels untouched, post no verdict, continue the batch; the silent-skip ladder holds the issue |
 
 With the default of 2:
 
