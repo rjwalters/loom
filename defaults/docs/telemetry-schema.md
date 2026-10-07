@@ -2270,6 +2270,12 @@ as "no such issue" instead. No field carries forge free text (no title, no
 label text, no comment body): every value is an enum, a number, or a
 daemon-derived id.
 
+**The contract is a golden (#10391).**
+`loom-daemon/src/telemetry/kinds/fixtures/eta-snapshot-golden.json` is the
+wire record byte for byte; changing it means re-vendoring it in the downstream loom-ui consumer.
+A vendored loom-ui consumer fixture (`fixtures/loom-ui/`) must find every key
+path it reads in the golden with a compatible type.
+
 ### `pick.decision`
 
 One OTLP-only log record per role tick and per work-finder tick (Issue #10212):
