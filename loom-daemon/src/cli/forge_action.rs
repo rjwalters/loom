@@ -1181,7 +1181,7 @@ mod write_target_tests {
     #[test]
     fn merge_queue_verbs_parse_through_the_deferred_slot() {
         use super::super::forge_merge_queue_cmd::MergeQueueAction as Mq;
-        use clap::{CommandFactory, Parser};
+        use clap::CommandFactory;
         let sha = "a".repeat(40);
         let argv = [
             "loom-daemon",
@@ -1192,7 +1192,10 @@ mod write_target_tests {
             "--approved-sha",
             &sha,
         ];
-        let cli = crate::Cli::try_parse_from(argv).expect("parse");
+        // #10616: whole-`Cli` parses run on the binary's 8 MiB main-thread
+        // stack, never libtest's 2 MiB worker (the #10581 verdict verbs pushed
+        // the debug-build `ForgeAction` frames past it).
+        let cli = super::super::whole_cli_parse::try_parse_cli(&argv).expect("parse");
         let Some(crate::Commands::Forge {
             action: ForgeAction::MergeQueue { action },
         }) = cli.command
@@ -1209,15 +1212,23 @@ mod write_target_tests {
             }
             _ => panic!("expected `step`"),
         }
-        let mut cmd = crate::Cli::command();
-        cmd.build();
-        let mq = cmd
-            .find_subcommand("forge")
-            .and_then(|f| f.find_subcommand("merge-queue"))
-            .expect("forge merge-queue is registered");
-        for verb in ["mode", "reconcile", "handoff", "step", "revoke"] {
-            assert!(mq.find_subcommand(verb).is_some(), "{verb}");
-        }
+        let missing = super::super::whole_cli_parse::on_stack(
+            "merge-queue-verbs-8MiB",
+            super::super::whole_cli_parse::MAIN_THREAD_STACK,
+            || {
+                let mut cmd = crate::Cli::command();
+                cmd.build();
+                let mq = cmd
+                    .find_subcommand("forge")
+                    .and_then(|f| f.find_subcommand("merge-queue"))
+                    .expect("forge merge-queue is registered");
+                ["mode", "reconcile", "handoff", "step", "revoke"]
+                    .into_iter()
+                    .filter(|verb| mq.find_subcommand(verb).is_none())
+                    .collect::<Vec<_>>()
+            },
+        );
+        assert!(missing.is_empty(), "unregistered merge-queue verbs: {missing:?}");
     }
 
     /// #10581: a direct `verdict-labels --repo unmanaged/repo` is vetted
