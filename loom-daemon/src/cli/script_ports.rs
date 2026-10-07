@@ -965,6 +965,12 @@ pub(crate) enum MergePrCommand {
     /// the shell falls back to the budget on any fault — see
     /// `cli::merge_pr_retries_used`.
     RetriesUsed(super::merge_pr_retries_used::RetriesUsedArgs),
+
+    /// The post-`--auto`-wait re-read decision (#8410/#8896, #8191 slice):
+    /// stdin is the uncached PR payload; prints MERGED / NO-HEAD / MOVED <sha>
+    /// / CLEAR + labels. The shell refuses on any other output — see
+    /// `cli::merge_pr_revalidate_head`.
+    RevalidateHead(super::merge_pr_revalidate_head::RevalidateHeadArgs),
 }
 
 impl MergePrCommand {
@@ -1014,6 +1020,7 @@ impl MergePrCommand {
             MergePrCommand::RemoveGate(args) => args.run(),
             MergePrCommand::DiscoveredWorktree(args) => args.run(),
             MergePrCommand::RetriesUsed(args) => args.run(),
+            MergePrCommand::RevalidateHead(args) => args.run(),
             MergePrCommand::CleanupPaths(args) => args.run(),
         }
     }

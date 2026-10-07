@@ -106,6 +106,7 @@ mod merge_pr_remove_gate;
 mod merge_pr_response;
 mod merge_pr_retarget_children;
 mod merge_pr_retries_used;
+mod merge_pr_revalidate_head;
 mod merge_pr_sequence;
 mod merge_pr_stacked_children;
 mod merge_pr_stale_checks;

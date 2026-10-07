@@ -2141,34 +2141,15 @@ unset _MPS_JSON _MPS_FRESH_SHA; [[ "$MERGE_PRECONDITION_SHA" == "$PR_HEAD_SHA" |
 # that guard to cover the wait window is a separate policy call; the window
 # left here is the same one the pre-#8410 UNSTABLE wait path always had.
 _revalidate_merge_guards() {
-  local fresh fresh_sha
-  fresh="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
-  # Merged underneath us while we waited — nothing left to guard.
-  [[ "$(echo "$fresh" | jq -r '.merged // false')" == "true" ]] && return 0
-
-  # Head moved during the wait (PR #8220's 07:12 force-push). The approval and
-  # the check results this run validated describe a tree that is no longer the
-  # head, so this is the #5579 "re-queue, not a failure" signal (exit 3), not a
-  # merge we should complete against the new tree.
-  # #8896: an unusable re-read (the `|| echo '{}'` fallback above, or any
-  # payload with no head SHA in it) must SAY that. It used to fall through to
-  # the loom:pr guard, which reported the genuine-absence wording ("does not
-  # carry the `loom:pr` label") — failing closed, correctly, but sending the
-  # operator to re-review a PR whose approval was never actually read. Nothing
-  # about the verdict changes here: an unreadable response is evidence neither
-  # that loom:pr is present nor that it is absent, so the merge still refuses.
-  fresh_sha="$(echo "$fresh" | jq -r '.head.sha // empty')"; [[ -n "$fresh_sha" ]] || error "Merge blocked: could not re-read PR #$PR_NUMBER after --auto's settle-wait — the uncached re-read returned no usable payload (no head SHA), so neither the head nor the label set could be re-validated against current state. This is a forge read failure, NOT a missing \`loom:pr\` label: refusing to merge rather than treating an unreadable response as a verdict. Re-run once the forge API is healthy."
-  if [[ -n "$fresh_sha" && -n "$MERGE_PRECONDITION_SHA" && "$fresh_sha" != "$MERGE_PRECONDITION_SHA" ]]; then
-    error_head_moved "PR #$PR_NUMBER: head moved while --auto waited for this head's checks to settle (#8410)" \
-      "$MERGE_PRECONDITION_SHA" "$fresh_sha"
-  fi
-
-  # Re-point the guards' input at the state just read, then re-run them. A
-  # loom:verdict-stale revocation (#5686), a Judge re-claim, or a contradicting
-  # verdict label (#8112) now blocks the merge exactly as it would have at
-  # queue time. --allow-unapproved still overrides the loom:pr block, as it
-  # does on the queue-time evaluation.
-  PR_LABELS="$(echo "$fresh" | jq -r '.labels[]?.name // empty' 2>/dev/null || true)"
+  local fresh v; fresh="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
+  # The merged / no-head / head-moved decision, and the label set to re-check, are `loom-daemon merge-pr revalidate-head` (Rust, loom-daemon/src/merge_pr/revalidate_head.rs — #8191 slice): MERGED = merged underneath us while we waited (nothing left to guard); MOVED = the head moved during the wait (PR #8220's 07:12 force-push), the #5579 "re-queue, not a failure" signal (exit 3); NO-HEAD = the re-read was unusable (#8896: a forge read failure, NOT a missing loom:pr). No verdict at all (missing/older binary) refuses like NO-HEAD: "head unchanged" and "never looked" must not read alike.
+  v="$(printf '%s' "$fresh" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr revalidate-head --precondition-sha "${MERGE_PRECONDITION_SHA:-}" 2>/dev/null)" || v=""
+  # CLEAR: re-point the guards' input at the state just read, then re-run them. A loom:verdict-stale revocation (#5686), a Judge re-claim, or a contradicting verdict label (#8112) now blocks the merge exactly as it would have at queue time. --allow-unapproved still overrides the loom:pr block, as on the queue-time evaluation.
+  case "${v%%$'\n'*}" in "LOOM-REVALIDATE MERGED") return 0 ;;
+    "LOOM-REVALIDATE MOVED "*) error_head_moved "PR #$PR_NUMBER: head moved while --auto waited for this head's checks to settle (#8410)" "$MERGE_PRECONDITION_SHA" "${v#LOOM-REVALIDATE MOVED }" ;;
+    "LOOM-REVALIDATE CLEAR") ;;
+    *) error "Merge blocked: could not re-read PR #$PR_NUMBER after --auto's settle-wait — the uncached re-read returned no usable payload (no head SHA), so neither the head nor the label set could be re-validated against current state. This is a forge read failure, NOT a missing \`loom:pr\` label: refusing to merge rather than treating an unreadable response as a verdict. Re-run once the forge API is healthy.$([[ "${v%%$'\n'*}" == "LOOM-REVALIDATE NO-HEAD" ]] || echo " (The re-validation helper 'loom-daemon merge-pr revalidate-head' also gave no verdict — missing or older binary.)")" ;; esac
+  PR_LABELS=""; [[ "$v" != *$'\n'* ]] || PR_LABELS="${v#*$'\n'}"
   _check_loom_pr_label
   # #10567: the CI-run conclusion gate (deferred above while the run was still
   # in flight) is decided here against the head about to be merged. Joined onto
