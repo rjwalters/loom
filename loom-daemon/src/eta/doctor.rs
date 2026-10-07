@@ -203,6 +203,9 @@ pub struct FitFacts {
     /// The captain-published fit state (`fit-pub/status.json`, #10395);
     /// default when the file is absent.
     pub published: PubStatus,
+    /// The `eta-fit/v2` lane's state (`fit-pub/status-v2.json`, #10508);
+    /// default when the file is absent. Independent of [`Self::published`].
+    pub published_v2: PubStatus,
 }
 
 /// One heuristic's pending-estimate tally.
@@ -614,7 +617,8 @@ fn fit(f: &Facts) -> Vec<Check> {
         ),
         Some(r) => last_check(f.now, r),
     });
-    out.push(published_fit(f.now, &x.published));
+    out.push(published_fit(f.now, &x.published, "published_fit"));
+    out.push(published_fit(f.now, &x.published_v2, "published_fit_v2"));
     let snapshot_dates: Vec<DateTime<Utc>> = f
         .data
         .repos
@@ -641,23 +645,24 @@ fn fit(f: &Facts) -> Vec<Check> {
     out
 }
 
-/// The captain-published fit (#10395). Informational unless the last fetch or
+/// The captain-published fit (#10395), for the lane `check` names
+/// (`published_fit` for v1, `published_fit_v2` for #10508's v2 lane). Informational unless the last fetch or
 /// publish failed: an absent or stale publication just means this host uses
 /// its own fit, or refuses `no_model`, exactly as before publication existed.
-fn published_fit(now: DateTime<Utc>, p: &PubStatus) -> Check {
+fn published_fit(now: DateTime<Utc>, p: &PubStatus, check: &str) -> Check {
     let publish_failed = p.publish_error.as_deref();
     let Some(kind) = p.kind else {
         return match publish_failed {
             Some(e) => Check::bad(
                 "fit",
-                "published_fit",
+                check,
                 Status::Warn,
                 format!("captain publish failing: {e}"),
                 "check `fleet.repo`, `fleet.etaFitRef` and the captain's write credential",
             ),
             None => Check::skip(
                 "fit",
-                "published_fit",
+                check,
                 "no published fit: this host uses its own fit, or refuses no_model",
             ),
         };
@@ -680,23 +685,23 @@ fn published_fit(now: DateTime<Utc>, p: &PubStatus) -> Check {
         FetchKind::Installed | FetchKind::Current | FetchKind::NotModified
             if publish_failed.is_none() =>
         {
-            Check::ok("fit", "published_fit", detail)
+            Check::ok("fit", check, detail)
         }
         FetchKind::Absent => Check::skip(
             "fit",
-            "published_fit",
+            check,
             format!("{detail}: nothing published, this host uses its own fit or refuses no_model"),
         ),
         FetchKind::Stale => Check::bad(
             "fit",
-            "published_fit",
+            check,
             Status::Warn,
             format!("{detail}: stale publication ignored, this host uses its own fit or refuses no_model"),
             "the captain has stopped publishing; see the captain's `eta doctor` (fit.last_check, fit.published_fit)",
         ),
         _ => Check::bad(
             "fit",
-            "published_fit",
+            check,
             Status::Warn,
             detail,
             "the previous fit stays in service; check `fleet.repo`/`fleet.etaFitRef` and the refusal code",
