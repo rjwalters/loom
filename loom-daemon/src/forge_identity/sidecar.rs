@@ -81,8 +81,12 @@ pub fn write_sidecar(dir: &Path, side: &Sidecar) -> std::io::Result<()> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!(".{SIDECAR}.{}.{seq}.tmp", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_vec(side).unwrap_or_default())?;
-    std::fs::rename(tmp, dir.join(SIDECAR))
+    let written = std::fs::write(&tmp, serde_json::to_vec(side).unwrap_or_default())
+        .and_then(|()| std::fs::rename(&tmp, dir.join(SIDECAR)));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Remove `dir`'s sidecar (a token-less profile describes no identity).

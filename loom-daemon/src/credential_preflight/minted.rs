@@ -88,17 +88,42 @@ impl Minted {
 /// profile (`enforcement.api=required`, #9986) holds no identity: its
 /// sidecar is removed instead.
 ///
+/// The sidecar is accounting metadata, so writing it is **best-effort**: once
+/// the token is published, a sidecar-only failure is logged and never fails
+/// the publication (or the refresh that called it). The directory's old
+/// sidecar is removed in that case, because it may describe the previous
+/// publisher's token; the bucket book then falls back to the roster
+/// derivation for that directory, as for any pre-#10571 directory.
+///
 /// # Errors
 ///
-/// When the token or the sidecar cannot be written.
+/// Only when the token cannot be published.
 pub fn publish_minted(dir: &Path, minted: &Minted) -> std::io::Result<()> {
+    publish_minted_with(dir, minted, write_sidecar)
+}
+
+/// [`publish_minted`] with the sidecar writer injected (tests).
+fn publish_minted_with(
+    dir: &Path,
+    minted: &Minted,
+    write: impl FnOnce(&Path, &Sidecar) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     super::publish_github_app_token(dir, &minted.token)?;
     let workspace = workspace_of_profile_dir(dir);
     if matches!(stance_for(workspace.as_deref()), Stance::Required { .. }) {
         remove_sidecar(dir);
         return Ok(());
     }
-    write_sidecar(dir, &minted.sidecar())
+    if let Err(e) = write(dir, &minted.sidecar()) {
+        remove_sidecar(dir);
+        log::warn!(
+            "credential_preflight: token published to {}, but its identity sidecar could not be \
+             written ({e}); removed any stale sidecar, so this directory's bucket readings fall \
+             back to the roster derivation (#10571)",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// [`publish_minted`] for a writer `outcome` minted for `owner_repo`.
@@ -168,6 +193,45 @@ mod tests {
         publish_outcome(&dir, &other, "acme/repo").unwrap();
         let side = read_sidecar(&dir).unwrap();
         assert_eq!((side.app_id.as_str(), side.installation_id.as_str()), ("2", "9"));
+    }
+
+    /// A sidecar-only failure never fails the token publication: the token
+    /// is published, the call is `Ok`, and a stale sidecar from the previous
+    /// publisher is removed rather than left describing the new token.
+    #[test]
+    fn a_sidecar_failure_does_not_fail_the_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".loom").join("gh-config");
+        publish_outcome(&dir, &outcome(), "acme/repo").unwrap();
+        assert_eq!(read_sidecar(&dir).unwrap().installation_id, "151241341");
+        let next = Minted {
+            token: "ghs_next".into(),
+            installation_id: "9".into(),
+            ..Minted::of(&outcome(), "acme/repo").unwrap()
+        };
+        let failing = |_: &Path, _: &Sidecar| Err(std::io::Error::other("disk full"));
+        publish_minted_with(&dir, &next, failing).unwrap();
+        let hosts = std::fs::read_to_string(dir.join("hosts.yml")).unwrap();
+        assert!(hosts.contains("ghs_next"), "the new token is published");
+        assert!(read_sidecar(&dir).is_none(), "the stale identity is removed");
+    }
+
+    /// The same through the real writer: `identity.json` is a directory, so
+    /// the sidecar rename fails while the token write succeeds.
+    #[test]
+    fn an_unwritable_sidecar_path_still_publishes_the_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".loom").join("gh-config");
+        std::fs::create_dir_all(dir.join("identity.json").join("blocker")).unwrap();
+        publish_outcome(&dir, &outcome(), "acme/repo").unwrap();
+        assert!(dir.join("hosts.yml").is_file(), "token published");
+        assert!(read_sidecar(&dir).is_none());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with(".identity.json.") && n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "the failed write cleans its temp file: {leftovers:?}");
     }
 
     #[test]
