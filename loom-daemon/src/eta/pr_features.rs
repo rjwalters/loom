@@ -240,6 +240,8 @@ pub struct PullSnapshot {
     pub head_sha: Option<String>,
     /// `base.ref`.
     pub base_ref: Option<String>,
+    /// `head.ref`: the branch a stacked PR's child is based on (#10526).
+    pub head_ref: Option<String>,
     /// `updated_at`.
     pub updated_at: Option<DateTime<Utc>>,
 }
@@ -328,6 +330,7 @@ pub fn parse_pull(body: &Value, read_at: DateTime<Utc>) -> Option<PullSnapshot> 
         commits: body["commits"].as_i64()?,
         head_sha: body["head"]["sha"].as_str().map(str::to_string),
         base_ref: body["base"]["ref"].as_str().map(str::to_string),
+        head_ref: body["head"]["ref"].as_str().map(str::to_string),
         updated_at: time(&body["updated_at"]),
     })
 }
@@ -629,6 +632,16 @@ impl PrFeatureStore {
                 settle(self.required.entry(base_key(read)).or_default(), parsed, read_at);
             }
         }
+    }
+
+    /// `(head, base)` branch names of `repo`'s PR `pr` from its last answered
+    /// `pulls/{n}` read, when that read saw it open (#10526). No read of
+    /// its own: the dependency pass reuses what the feature pass fetched.
+    #[must_use]
+    pub fn open_pull_refs(&self, repo: &str, pr: u32) -> Option<(Option<String>, Option<String>)> {
+        let snap = self.pulls.get(&(repo.to_string(), pr))?.last.as_ref()?;
+        snap.open
+            .then(|| (snap.head_ref.clone(), snap.base_ref.clone()))
     }
 
     /// The PR snapshot usable at `as_of`, or why there is none.

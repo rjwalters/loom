@@ -964,6 +964,11 @@ pub struct DependencyBook {
     pub landed: BTreeMap<NodeKey, DateTime<Utc>>,
     /// When each `(child, source)` was last read.
     read_at: BTreeMap<(NodeKey, EdgeSource), DateTime<Utc>>,
+    /// Each item's `loom:epic:<epic>:phase:<n>` marker as last read (#10526).
+    phases: BTreeMap<NodeKey, (u32, u32)>,
+    /// Items whose issue read reported sub-issues: the only ones whose
+    /// sub-issue listing is worth a read (#10526).
+    has_subs: BTreeSet<NodeKey>,
 }
 
 impl DependencyBook {
@@ -1025,12 +1030,83 @@ impl DependencyBook {
             .collect()
     }
 
+    /// Record `child`'s epic-phase marker `(epic, phase)`, or its absence.
+    /// Returns whether a marker was there before and is gone now, which
+    /// the caller answers by clearing the item's phase edges.
+    pub fn set_phase(&mut self, child: &NodeKey, marker: Option<(u32, u32)>) -> bool {
+        match marker {
+            Some(m) => {
+                self.phases.insert(child.clone(), m);
+                false
+            }
+            None => self.phases.remove(child).is_some(),
+        }
+    }
+
+    /// Record whether `item`'s issue read reported sub-issues.
+    pub fn set_has_subs(&mut self, item: &NodeKey, has: bool) {
+        if has {
+            self.has_subs.insert(item.clone());
+        } else {
+            self.has_subs.remove(item);
+        }
+    }
+
+    /// Whether `item`'s last issue read reported sub-issues.
+    #[must_use]
+    pub fn has_subs(&self, item: &NodeKey) -> bool {
+        self.has_subs.contains(item)
+    }
+
+    /// Whether any edge, from any source, makes `child` wait on `parent`.
+    #[must_use]
+    pub fn waits_on(&self, child: &NodeKey, parent: &NodeKey) -> bool {
+        self.edges
+            .iter()
+            .any(|e| &e.child == child && &e.parent == parent)
+    }
+
+    /// Phase order over the markers read so far: within one epic, every
+    /// member of a phase waits on **every** member of the nearest lower
+    /// phase read (a gap, or a phase nobody read, is skipped, never
+    /// bridged by guessing); the lowest phase waits on nothing. One
+    /// `(member, parents)` row per marked item, so the caller can replace
+    /// each member's phase edges outright.
+    #[must_use]
+    pub fn phase_parents(&self) -> Vec<(NodeKey, Vec<NodeKey>)> {
+        type Levels = BTreeMap<u32, Vec<NodeKey>>;
+        let mut epics: BTreeMap<(&str, u32), Levels> = BTreeMap::new();
+        for (key, (epic, phase)) in &self.phases {
+            epics
+                .entry((key.repo.as_str(), *epic))
+                .or_default()
+                .entry(*phase)
+                .or_default()
+                .push(key.clone());
+        }
+        let mut out = Vec::new();
+        for levels in epics.values() {
+            let mut previous: Vec<NodeKey> = Vec::new();
+            for members in levels.values() {
+                for m in members {
+                    // An epic's own issue is never its own phase's parent.
+                    let parents = previous.iter().filter(|p| *p != m).cloned().collect();
+                    out.push((m.clone(), parents));
+                }
+                previous.clone_from(members);
+            }
+        }
+        out
+    }
+
     /// Keep only the edges (and reads) of `children`, and the landings of
     /// parents an edge still names.
     pub fn retain(&mut self, children: &BTreeSet<NodeKey>) {
         self.edges.retain(|e| children.contains(&e.child));
         self.read_at
             .retain(|(child, _), _| children.contains(child));
+        self.phases.retain(|child, _| children.contains(child));
+        self.has_subs.retain(|child| children.contains(child));
         let named: BTreeSet<&NodeKey> = self.edges.iter().map(|e| &e.parent).collect();
         self.landed.retain(|parent, _| named.contains(parent));
     }

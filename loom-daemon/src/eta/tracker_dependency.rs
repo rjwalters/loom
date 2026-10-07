@@ -28,6 +28,11 @@ pub struct DependencyCandidate {
     /// Its PR carries `loom:sequenced`: a sequence marker names its
     /// predecessor.
     pub sequenced: bool,
+    /// Its open PR's head branch, from the feature reads' last answer
+    /// (#10526); `None` until one has answered.
+    pub head_ref: Option<String>,
+    /// Its open PR's base branch, same source.
+    pub base_ref: Option<String>,
 }
 
 impl Tracker {
@@ -37,15 +42,24 @@ impl Tracker {
         self.items
             .iter()
             .filter(|(_, item)| !item.landed)
-            .map(|(key, item)| DependencyCandidate {
-                key: key.clone(),
-                pr_number: item.pr_number,
-                parked: item.pr_number.is_none()
-                    && matches!(
-                        item.refused,
-                        Some(NoEstimateReason::Blocked | NoEstimateReason::NoDispatchPlan)
-                    ),
-                sequenced: item.pr_number.is_some() && pr_flags(&item.labels) & FLAG_SEQUENCED != 0,
+            .map(|(key, item)| {
+                let refs = item
+                    .pr_number
+                    .and_then(|pr| self.context.open_pull_refs(&key.repo, pr));
+                let (head_ref, base_ref) = refs.unwrap_or_default();
+                DependencyCandidate {
+                    key: key.clone(),
+                    pr_number: item.pr_number,
+                    head_ref,
+                    base_ref,
+                    parked: item.pr_number.is_none()
+                        && matches!(
+                            item.refused,
+                            Some(NoEstimateReason::Blocked | NoEstimateReason::NoDispatchPlan)
+                        ),
+                    sequenced: item.pr_number.is_some()
+                        && pr_flags(&item.labels) & FLAG_SEQUENCED != 0,
+                }
             })
             .collect()
     }
