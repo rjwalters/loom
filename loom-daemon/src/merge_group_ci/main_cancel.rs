@@ -216,18 +216,25 @@ fn pr_target_problem(step: &Step) -> Option<&'static str> {
         .filter(|l| !l.trim().starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
-    // The restriction must be the *whole* event predicate: a lone
-    // `select(.event == "pull_request")` and no other `.event` mention. A
-    // widened filter (`... or .event == "push"`, `... or true`) still contains
-    // the substring but lists push runs.
+    // The run selection must be a pipeline whose *first* stage is the PR-only
+    // filter: `'.[] | select(.event == "pull_request") | <plain filters>'`.
+    // Anything after it may only narrow or project that stream. A widened
+    // predicate (`... or .event == "push"`), a stage before the filter, or a
+    // construct that can emit values from outside the filtered stream (a comma
+    // branch such as `.[] | ., select(...)`, `..`, variables, constructors) is
+    // unrecognised and fails closed.
     let squashed = compact(&code);
-    let exact = r#"select(.event=="pull_request")"#;
+    let prefix = r#"'.[]|select(.event=="pull_request")|"#;
     let only_pr_events = squashed.matches(".event").count() == 1
-        && squashed.find(exact).is_some_and(|i| {
-            squashed[i + exact.len()..]
-                .chars()
-                .next()
-                .is_none_or(|c| matches!(c, '|' | '\'' | '"' | '\\'))
+        && squashed.find(prefix).is_some_and(|i| {
+            let rest = &squashed[i + prefix.len()..];
+            let program = rest.split('\'').next().unwrap_or("");
+            !program.is_empty()
+                && !program.contains([',', '$', '[', '{', '/', '?'])
+                && !program.contains("..")
+                && !["input", "reduce", "foreach", "limit", "env", "path"]
+                    .iter()
+                    .any(|w| program.contains(w))
         });
     if !only_pr_events {
         return Some("its run selection is not exactly `select(.event == \"pull_request\")`, so it can list and cancel push runs");
@@ -397,6 +404,28 @@ jobs:
                 r#"select(.event == "pull_request" or true)"#,
             ),
             (r#"select(.event == "pull_request")"#, r#"select(.event != "schedule")"#),
+            // A comma branch emits the unfiltered element too (jq prints the
+            // push ID once per branch), so the exact `select` is not proof.
+            (
+                r#"'.[] | select(.event == "pull_request") | .databaseId'"#,
+                r#"'.[] | ., select(.event == "pull_request") | .databaseId'"#,
+            ),
+            (
+                r#"'.[] | select(.event == "pull_request") | .databaseId'"#,
+                r#"'.[] | select(.event == "pull_request"), . | .databaseId'"#,
+            ),
+            (
+                r#"'.[] | select(.event == "pull_request") | .databaseId'"#,
+                r#"'.[] | select(.event == "pull_request") | ., .databaseId'"#,
+            ),
+            (
+                r#"'.[] | select(.event == "pull_request") | .databaseId'"#,
+                r#"'(.[] | select(.event == "pull_request")), .[] | .databaseId'"#,
+            ),
+            (
+                r#"'.[] | select(.event == "pull_request") | .databaseId'"#,
+                r#"'.[] | select(.event == "pull_request") | $ENV.X'"#,
+            ),
         ] {
             let src = PR_ONLY_CANCEL_STEP.replace(from, to);
             assert_ne!(src, PR_ONLY_CANCEL_STEP, "{from}");
