@@ -892,6 +892,9 @@ fn load_history(roots: &[PathBuf], journal_root: &Path, host_id: &str) -> (Stage
 /// starred issues (`None` when a listing failed or the repo lists no PR).
 type RepoStars = (String, Vec<(u32, Vec<u32>)>, Option<Vec<u32>>);
 
+/// One repo's slug and each listed PR's linked issues (`fleet.state` PR links).
+type RepoPrLinks = (String, Vec<(u32, Vec<u32>)>);
+
 /// One ETA pass: list, resolve, reload history, estimate, deliver. A no-op
 /// when ETA is disabled.
 pub(super) async fn record(
@@ -911,7 +914,7 @@ pub(super) async fn record(
     // #10372: per repo, each listed PR's linked issues and the open starred
     // issues (`None` when any star listing failed: unknown, not unstarred).
     let mut stars: Vec<RepoStars> = Vec::new();
-    let mut pr_link_rows: Vec<(String, Vec<(u32, Vec<u32>)>)> = Vec::new();
+    let mut pr_link_rows: Vec<RepoPrLinks> = Vec::new();
     let mut seen = BTreeSet::new();
     for root in &roots {
         let Some(slug) =
