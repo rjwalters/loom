@@ -14,8 +14,9 @@ use crate::eta::conformal_ipcw::{METHOD, METHOD_DRIFT};
 use crate::eta::conformal_wrap::{Calibrator, IpcwWrap, CALIBRATED};
 use crate::eta::explanation::RegimeAdjustment;
 use crate::eta::heuristics::{
-    LandQuickTern, LandSwiftTern, LandTwinOtterB, LandV2, StartV1, LAND_CALM_PLOVER,
-    LAND_HELD_HERON, LAND_QUICK_TERN, LAND_SWIFT_TERN, LAND_TWIN_OTTER_B, LAND_V2,
+    LandQuickTern, LandSwiftTern, LandTwinOtterB, LandV2, StartV1, CALIBRATION_BASES,
+    LAND_BOLD_LARK, LAND_EVEN_LARK, LAND_HELD_HERON, LAND_QUICK_TERN, LAND_SWIFT_TERN,
+    LAND_TWIN_OTTER_B, LAND_V2,
 };
 use crate::eta::recalibrate::CalibrationObservation;
 use crate::eta::regime;
@@ -277,7 +278,15 @@ fn refusals_never_twice_and_nothing_registered() {
     assert_eq!(twice.calibration, quick.calibration);
     assert_eq!(twice.quantiles_with_p90(), quick.quantiles_with_p90());
     assert_eq!(twice.heuristic, "quick+ipcw");
-    assert_eq!(CALIBRATED, [LAND_CALM_PLOVER, LAND_QUICK_TERN, LAND_SWIFT_TERN]);
+    assert_eq!(
+        CALIBRATED,
+        [
+            LAND_EVEN_LARK,
+            LAND_QUICK_TERN,
+            LAND_SWIFT_TERN,
+            LAND_BOLD_LARK
+        ]
+    );
 
     // Names round-trip; a wrapped id is never a registered one.
     for c in Calibrator::ALL {
@@ -289,6 +298,39 @@ fn refusals_never_twice_and_nothing_registered() {
     let registry = Registry::builtin();
     assert!(registry.ids().iter().all(|id| !id.contains('+')));
     assert!(registry.get(V2_IPCW).is_none());
+}
+
+/// Every registered `land` heuristic that calibrates its own estimate is in
+/// [`CALIBRATED`], so `eta backtest --wrap` refuses it by name rather than
+/// scoring the identity under a `+ipcw` id. bold-lark (keen-wren's IPCW
+/// calibrator) was missing from the list (#10747 review).
+#[test]
+fn calibrated_lists_every_registered_self_calibrating_land_heuristic() {
+    let input = input_at(Stage::SweepBuilder, 0, 0);
+    let rows = CALIBRATION_BASES
+        .iter()
+        .flat_map(|base| evidence(base, Stage::SweepBuilder, 3.0))
+        .collect();
+    let history = with_evidence(super::ready::history_ready(), rows);
+    let registry = Registry::builtin();
+    let calibrating: Vec<&str> = registry
+        .for_kind(Kind::Land)
+        .filter(|h| {
+            let e = h.estimate(&input, &history);
+            e.calibration.is_some() || e.recalibration.is_some()
+        })
+        .map(|h| h.id())
+        .collect();
+    for id in &calibrating {
+        assert!(CALIBRATED.contains(id), "{id} calibrates itself but is not in CALIBRATED");
+    }
+    // Not vacuous: the IPCW calibrators did calibrate on this evidence.
+    for id in [LAND_QUICK_TERN, LAND_BOLD_LARK] {
+        assert!(calibrating.contains(&id), "{id} did not calibrate: {calibrating:?}");
+    }
+    for id in CALIBRATED {
+        assert!(registry.registers(Kind::Land, id), "{id} is not a registered land heuristic");
+    }
 }
 
 #[test]

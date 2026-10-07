@@ -666,8 +666,9 @@ twin-otter-b it reproduces quick-tern (`Calibrator::Ipcw`) and swift-tern
 The wrapper has four rules:
 - It wraps `land` bases only.
 - It never calibrates twice. A base that already calibrates itself
-  (calm-plover, quick-tern, swift-tern) comes back unchanged, only
-  re-identified.
+  (even-lark, quick-tern, swift-tern, bold-lark) comes back unchanged, only
+  re-identified, and `eta backtest --wrap` refuses it by name
+  (`conformal_wrap::CALIBRATED`).
 - It degrades to the base. With thin evidence, the base's answer comes back
   without a `calibration` record.
 - Its point-in-time rule is quick-tern's.
@@ -703,8 +704,8 @@ base later means a new datestamped id built from `IpcwWrap::new`.
 - the drift signal is computed per estimate from the calibration log, not
   consumed from a fleet-level #10528 drift event (none is emitted yet);
 - history-aware (HAPS) conditioning;
-- registering a wrapped base (#10508, #10523), which needs a shadow-budget
-  slot and the backtest evidence above;
+- registering another wrapped base (#10523; keen-wren's is bold-lark), which
+  needs a shadow-budget slot and the backtest evidence above;
 - the loom-experiments walk-forward acceptance backtest.
 
 `land-2026-10-06-held-heron` (#10523) ships the same way: registered, not

@@ -28,8 +28,8 @@
 //! - **`land` only.** The calibration evidence is landings; [`IpcwWrap::new`]
 //!   refuses any other kind.
 //! - **Never twice.** A base whose explanation already carries a
-//!   `calibration` or `recalibration` record (calm-plover, quick-tern,
-//!   swift-tern) is left as the base answered, only re-identified: a second
+//!   `calibration` or `recalibration` record (even-lark, quick-tern,
+//!   swift-tern, bold-lark) is left as the base answered, only re-identified: a second
 //!   shift would overwrite the first record and the explanation would no
 //!   longer recompute.
 //! - **Transform order is the recompute's.** A regime-adjusted base
@@ -45,7 +45,7 @@
 //! Pure: no clock, no file, no forge.
 
 use super::conformal_ipcw;
-use super::heuristics::{LAND_CALM_PLOVER, LAND_QUICK_TERN, LAND_SWIFT_TERN};
+use super::heuristics::{LAND_BOLD_LARK, LAND_EVEN_LARK, LAND_QUICK_TERN, LAND_SWIFT_TERN};
 use super::history::StageSamples;
 use super::regime;
 use super::simulate::run_explanation;
@@ -54,7 +54,12 @@ use super::{estimate_id, EstimateInput, Explanation, Heuristic, Kind, Tier};
 /// The registered `land` heuristics that already calibrate their own
 /// estimate. Wrapping one is the identity (see "Never twice"), so `eta
 /// backtest --wrap` refuses them.
-pub const CALIBRATED: &[&str] = &[LAND_CALM_PLOVER, LAND_QUICK_TERN, LAND_SWIFT_TERN];
+pub const CALIBRATED: &[&str] = &[
+    LAND_EVEN_LARK,
+    LAND_QUICK_TERN,
+    LAND_SWIFT_TERN,
+    LAND_BOLD_LARK,
+];
 
 /// Which IPCW calibrator wraps the base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
