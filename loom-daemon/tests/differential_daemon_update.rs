@@ -840,6 +840,16 @@ const REQUIRE_SIGNATURE_HELP_BLOCK: &str =
 /// The line the added block sits directly in front of in the help text.
 const HELP_BLOCK_ANCHOR: &str = "  LOOM_PID_FILE ";
 
+/// The usage line #10709 added to `--help` for the `--fetch --tag <TAG>` pin.
+/// Spelled out here, independently of `help.txt`, so the class below verifies
+/// the EXACT intended text rather than "whatever the port prints".
+const TAG_PIN_HELP_LINE: &str =
+    "  ./.loom/scripts/cli/loom-daemon-update.sh --fetch --tag v0.19.831  Pin the artifact fetch to EXACTLY this release tag (Issue #10709) instead of resolving the newest one, so the version installed is the one a roll targeted. A tag that does not exist, or a release with no artifact for this host's platform, hard-fails (exit 1) and never falls back to a source build or to another release. Without --tag, resolution is the newest release, unchanged. Cannot be combined with --no-fetch or --resolve-json. The daemon's auto-update tick passes the tag its own verdict resolved.\n";
+
+/// The usage line the tag-pin line sits directly in front of (the `--no-fetch`
+/// entry, which follows the `--fetch` entry in the help text).
+const TAG_PIN_ANCHOR: &str = "  ./.loom/scripts/cli/loom-daemon-update.sh --no-fetch ";
+
 /// Divergence classes, each recognised by MECHANISM.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 enum Divergence {
@@ -853,6 +863,15 @@ enum Divergence {
     /// difference (including a different or misplaced block) stays
     /// unexplained.
     HelpDocumentsRequireSignature,
+    /// MECHANISM: #10709 added the `--fetch --tag <TAG>` usage line to
+    /// `--help`, which the frozen pre-port shell cannot contain. The port's
+    /// stdout must equal the shell's stdout with exactly [`TAG_PIN_HELP_LINE`]
+    /// inserted immediately before the single `--no-fetch` usage entry (that
+    /// is, directly after the `--fetch` entry). Exit code and stderr must be
+    /// identical. Risk direction: documentation only — the flag is opt-in, and
+    /// without it resolution is the newest release as before. Any other
+    /// difference (an extra, misplaced, or tampered line) stays unexplained.
+    HelpDocumentsTagPin,
 }
 
 /// Classify one difference, or return `Err` for "unexplained".
@@ -866,21 +885,53 @@ fn classify(shell: &Answer, port: &Answer) -> Result<Vec<Divergence>, ()> {
     if shell.stdout == port.stdout {
         return Ok(Vec::new());
     }
-    let needle = format!("\n{HELP_BLOCK_ANCHOR}");
-    if shell.stdout.matches(&needle).count() != 1 {
-        return Err(());
+    // `--help` now carries both documented additions, so accept each one alone
+    // or both together — never anything else.
+    let additions: [(Divergence, &str, &str); 2] = [
+        (Divergence::HelpDocumentsTagPin, TAG_PIN_ANCHOR, TAG_PIN_HELP_LINE),
+        (
+            Divergence::HelpDocumentsRequireSignature,
+            HELP_BLOCK_ANCHOR,
+            REQUIRE_SIGNATURE_HELP_BLOCK,
+        ),
+    ];
+    for mask in 1u8..(1 << additions.len()) {
+        let mut expected = shell.stdout.clone();
+        let mut classes = Vec::new();
+        let mut applicable = true;
+        for (i, (class, anchor, block)) in additions.iter().enumerate() {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            match insert_before_unique(&expected, anchor, block) {
+                Some(next) => expected = next,
+                None => {
+                    applicable = false;
+                    break;
+                }
+            }
+            classes.push(*class);
+        }
+        if applicable && expected == port.stdout {
+            return Ok(classes);
+        }
     }
-    let at = shell.stdout.find(&needle).ok_or(())? + 1;
-    let mut expected =
-        String::with_capacity(shell.stdout.len() + REQUIRE_SIGNATURE_HELP_BLOCK.len());
-    expected.push_str(&shell.stdout[..at]);
-    expected.push_str(REQUIRE_SIGNATURE_HELP_BLOCK);
-    expected.push_str(&shell.stdout[at..]);
-    if expected == port.stdout {
-        Ok(vec![Divergence::HelpDocumentsRequireSignature])
-    } else {
-        Err(())
+    Err(())
+}
+
+/// `text` with `block` inserted at the start of the single line beginning with
+/// `anchor`; `None` when that line is absent or not unique.
+fn insert_before_unique(text: &str, anchor: &str, block: &str) -> Option<String> {
+    let needle = format!("\n{anchor}");
+    if text.matches(&needle).count() != 1 {
+        return None;
     }
+    let at = text.find(&needle)? + 1;
+    let mut out = String::with_capacity(text.len() + block.len());
+    out.push_str(&text[..at]);
+    out.push_str(block);
+    out.push_str(&text[at..]);
+    Some(out)
 }
 
 /// The class admits exactly the intended addition and nothing else.
@@ -942,6 +993,95 @@ fn the_help_divergence_class_is_narrow() {
             &anchorless,
             &with_block(format!("{REQUIRE_SIGNATURE_HELP_BLOCK}no env block\n"))
         ),
+        Err(())
+    );
+}
+
+/// The tag-pin class admits exactly the intended line, alone or together with
+/// the required-signature block, and nothing else.
+#[test]
+fn the_tag_pin_help_divergence_class_is_narrow() {
+    let base = Answer {
+        rc: 0,
+        stdout: format!(
+            "Usage:\n  ./.loom/scripts/cli/loom-daemon-update.sh --fetch  f\n{TAG_PIN_ANCHOR} d\n\
+             Environment:\n  LOOM_X  x\n{HELP_BLOCK_ANCHOR}pid file\ntail\n"
+        ),
+        stderr: String::new(),
+    };
+    let with_stdout = |stdout: String| Answer {
+        stdout,
+        ..base.clone()
+    };
+    let tag_only = with_stdout(base.stdout.replace(
+        &format!("\n{TAG_PIN_ANCHOR}"),
+        &format!("\n{TAG_PIN_HELP_LINE}{TAG_PIN_ANCHOR}"),
+    ));
+    assert_eq!(classify(&base, &tag_only), Ok(vec![Divergence::HelpDocumentsTagPin]));
+
+    // Both additions together, as the real `--help` output now has.
+    let both = with_stdout(tag_only.stdout.replace(
+        &format!("\n{HELP_BLOCK_ANCHOR}"),
+        &format!("\n{REQUIRE_SIGNATURE_HELP_BLOCK}{HELP_BLOCK_ANCHOR}"),
+    ));
+    assert_eq!(
+        classify(&base, &both),
+        Ok(vec![
+            Divergence::HelpDocumentsTagPin,
+            Divergence::HelpDocumentsRequireSignature
+        ])
+    );
+
+    // An extra unrelated change alongside the line.
+    assert_eq!(classify(&base, &with_stdout(format!("{}extra\n", tag_only.stdout))), Err(()));
+    // The line in the wrong place.
+    let misplaced = with_stdout(format!("{TAG_PIN_HELP_LINE}{}", base.stdout));
+    assert_eq!(classify(&base, &misplaced), Err(()));
+    // The line twice.
+    let doubled = with_stdout(
+        tag_only
+            .stdout
+            .replace(TAG_PIN_HELP_LINE, &format!("{TAG_PIN_HELP_LINE}{TAG_PIN_HELP_LINE}")),
+    );
+    assert_eq!(classify(&base, &doubled), Err(()));
+    // A tampered line.
+    let tampered = with_stdout(
+        tag_only
+            .stdout
+            .replace("EXACTLY this release tag", "any release tag"),
+    );
+    assert_eq!(classify(&base, &tampered), Err(()));
+    // A tampered line next to a good signature block.
+    let both_tampered = with_stdout(both.stdout.replace("never falls back", "may fall back"));
+    assert_eq!(classify(&base, &both_tampered), Err(()));
+    // Right stdout, but rc or stderr drifted.
+    assert_eq!(
+        classify(
+            &base,
+            &Answer {
+                rc: 1,
+                ..tag_only.clone()
+            }
+        ),
+        Err(())
+    );
+    assert_eq!(
+        classify(
+            &base,
+            &Answer {
+                stderr: "boom\n".into(),
+                ..tag_only.clone()
+            }
+        ),
+        Err(())
+    );
+    // A shell answer with no anchor cannot be explained by this class.
+    let anchorless = Answer {
+        stdout: "no usage block\n".into(),
+        ..base.clone()
+    };
+    assert_eq!(
+        classify(&anchorless, &with_stdout(format!("{TAG_PIN_HELP_LINE}no usage block\n"))),
         Err(())
     );
 }
