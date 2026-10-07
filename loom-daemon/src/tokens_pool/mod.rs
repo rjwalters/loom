@@ -101,6 +101,7 @@ pub mod session_hold;
 pub mod session_hold_roots;
 pub mod session_lifecycle;
 pub mod session_mount_gate;
+pub mod session_seats;
 pub mod session_state;
 pub mod status_order;
 

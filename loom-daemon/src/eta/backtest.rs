@@ -107,6 +107,13 @@ pub struct ReplayCase {
     /// [`super::stage_queue::stage_queue`], the same function the tracker
     /// serves from.
     pub queue: Vec<super::stage_queue::StageQueue>,
+    /// [`super::labels::pr_flags`] of the PR's own labels in force at
+    /// `as_of` (#10524), when the source reconstructs them: a forge
+    /// label-timeline case ([`pr_cases`]) does, a `sweep.outcome` or journal
+    /// case does not (`None`). Read only by the subset breakdown
+    /// ([`BacktestReport::by_subset`]); it is **not** fed to the estimator,
+    /// so the replayed answer is unchanged.
+    pub pr_flags: Option<u8>,
 }
 
 /// Every finish/land replay case one `sweep.outcome` record's own phase
@@ -169,6 +176,7 @@ pub fn cases_from_record(
             dispatch: None,
             age_sec: 0,
             queue: Vec::new(),
+            pr_flags: None,
         });
         if landed {
             cases.push(ReplayCase {
@@ -182,6 +190,7 @@ pub fn cases_from_record(
                 dispatch: None,
                 age_sec: 0,
                 queue: Vec::new(),
+                pr_flags: None,
             });
         }
         if stage == Stage::Doctor {
@@ -251,6 +260,7 @@ pub fn cases_from_journal(entries: &[JournalEntry]) -> Vec<ReplayCase> {
                 dispatch: Some(dispatch),
                 age_sec: 0,
                 queue: Vec::new(),
+                pr_flags: None,
             });
         }
     }
@@ -408,6 +418,11 @@ pub struct BacktestReport {
     /// `overall` still counts every case.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_tail: BTreeMap<String, Bucket>,
+    /// The starred, held and sequenced cases apart (#10524), each with its
+    /// late-surprise rate; keys and membership in [`subsets`]. Present only
+    /// when some case is held or knows its PR labels.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub by_subset: BTreeMap<String, SubsetBucket>,
 }
 
 /// `by_tail` key for an ordinary estimate (or a refusal).
@@ -582,6 +597,7 @@ fn report_of(heuristic: &dyn Heuristic, replayed: &[Replayed]) -> BacktestReport
         stability: paired::stability_of(replayed),
         convergence: paired::convergence_of(replayed),
         by_tail,
+        by_subset: subsets::subsets_of(replayed),
     }
 }
 
@@ -616,10 +632,11 @@ pub fn calibration_from_replay(
 
 /// Give the calibrating `land` heuristics (`land-2026-10-06-calm-plover`,
 /// #10489, over `land-v2`; `land-2026-10-06-quick-tern`, #10524, over
-/// `land-2026-10-04-twin-otter-b`) their calibration evidence from the replay
-/// itself: each [`super::heuristics::CALIBRATION_BASES`] estimate at every
-/// `land` case in `cases`, landing at the case's own outcome
-/// ([`calibration_from_replay`]). `base` resolves a base id to the heuristic
+/// `land-2026-10-04-twin-otter-b`; `land-2026-10-06-brisk-petrel`, #10528,
+/// whose regime residuals are the same `-b` rows) their calibration evidence
+/// from the replay itself: each [`super::heuristics::CALIBRATION_BASES`]
+/// estimate at every `land` case in `cases`, landing at the case's own
+/// outcome ([`calibration_from_replay`]). `base` resolves a base id to the heuristic
 /// that replays it: a registry's own, or a walk-forward one whose fit is
 /// chosen per case ([`super::walk_forward::DatedFits`], the nightly fold's
 /// per-prediction-day registries), so a fitted base's logged quantiles are
@@ -739,6 +756,11 @@ mod paired;
 
 use paired::Replayed;
 pub use paired::{Convergence, Fold, Paired, Stability};
+
+#[path = "backtest_subsets.rs"]
+pub mod subsets;
+
+pub use subsets::SubsetBucket;
 
 /// [`compare`] was asked to rank two heuristics that predict different
 /// kinds, whose replay sets do not overlap.

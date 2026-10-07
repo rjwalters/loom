@@ -423,6 +423,7 @@ impl LeaseEnsureArgs {
         host: &str,
         sweep_id: &str,
     ) -> Outcome {
+        mark_inherited_fds_cloexec();
         let result = Command::new(renew_script)
             .arg("start")
             .arg(self.issue.to_string())
@@ -451,6 +452,40 @@ impl LeaseEnsureArgs {
             }
             Ok(o) => Outcome::RenewalFailed(o.status.code()),
             Err(_) => Outcome::RenewalFailed(None),
+        }
+    }
+}
+
+/// Mark every fd above 2 that this process inherited as close-on-exec, so the
+/// renewal loop `start_renewal` spawns cannot inherit it (#10203).
+///
+/// `worktree.sh` keeps its caller's stdout on fd 3 and calls `lease ensure`;
+/// Rust's `Command` passes every non-CLOEXEC fd straight through, and the
+/// detached loop then held the read side of a `worktree.sh N | tail` pipe open
+/// for its whole 4h lifetime. This is a one-shot CLI that never means to hand
+/// an inherited fd to a child, so marking them all is safe; the fds stay open
+/// here, they just stop crossing `exec`. Done in the parent rather than in
+/// `pre_exec` because enumerating `/dev/fd` allocates, which is not safe
+/// between fork and exec.
+pub(crate) fn mark_inherited_fds_cloexec() {
+    let Ok(entries) = std::fs::read_dir("/dev/fd") else {
+        return;
+    };
+    // Collect first: the directory handle is itself an fd, closed once
+    // `entries` drops, and fcntl on its stale number is a harmless EBADF.
+    let fds: Vec<libc::c_int> = entries
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|fd| *fd > 2)
+        .collect();
+    for fd in fds {
+        // SAFETY: F_GETFD/F_SETFD only read and set the descriptor's own
+        // close-on-exec flag; they touch no memory, and a number that is no
+        // longer open just returns -1 (EBADF), which is ignored.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
         }
     }
 }

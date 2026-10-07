@@ -20,7 +20,7 @@ use crate::tokens_pool::session_lifecycle::{
     check_mount_denials, mark_session_managed, parse_inspect_line, workspace_mount_roots,
     ExecOutput, WORKSPACE_LABEL,
 };
-use crate::tokens_pool::session_state::{classify_inspect, Observed};
+use crate::tokens_pool::session_state::{DriftInputs, Observed};
 
 #[path = "session_reconcile_drift_tests.rs"]
 mod drift_tests;
@@ -177,10 +177,7 @@ impl FakeState {
             .map(|(name, state)| {
                 let inspect =
                     inspect_json(name, state, mounts.get(name).map_or(&[], Vec::as_slice));
-                let observed = Observed {
-                    state: classify_inspect(Some(&inspect), registered),
-                    inspect,
-                };
+                let observed = Observed::of(inspect, &DriftInputs::registry(registered));
                 (name.clone(), observed)
             })
             .collect();

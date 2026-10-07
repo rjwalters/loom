@@ -9207,6 +9207,44 @@ across the registered roots:
 | `LOOM_SESSION_RECONCILE` | `autonomous.sessionReconcile.enabled` | env > config > default | `true` (on) |
 | `LOOM_SESSION_RECONCILE_INTERVAL_SECS` | `autonomous.sessionReconcile.intervalSecs` | env > config > default | `60` |
 
+**Seeing it: `loom-daemon status` (#10600).** `status` lists every
+session-managed Codex account across the registered roots under `Session
+containers:`, one line each: the state (`running`, `stopped`, `missing`,
+`restarting`); the mounts (`ok`, or `stale (missing N, extra M, denied K)`,
+where `denied` is a mount `session start` refuses today and is not counted in
+`extra`); the posture (`host`, `private-clone`, or `unverified` when the
+container is not running or not hardened); `held (operator stop)`; `removed
+(denied mount: <path>)` while a removal record stands; and the reconciler's
+last action in this daemon process (`started`, `recreated`, `recreated (mount
+drift)`, `deferred (in-flight)`, `backoff until <time>`, …). `status --json`
+carries the same as `session_containers`. A seat that is not running, has
+stale mounts or has a standing removal record makes the block read
+`DEGRADED`, with one line naming the accounts. So does a host whose
+containers cannot be observed. A held seat is listed but does not degrade it:
+the operator stopped it on purpose. `loom-daemon health` has the same verdict
+as its conditional `session_containers` section. A host without a
+session-managed account shows neither.
+
+`status` makes no `docker` call. It reads the snapshot the session watch
+publishes every 60 s, with the drift verdict computed there. That verdict is
+the reconciler's own definition, so a container the reconciler is about to
+remove never reads `running` (the `loom.codex_session.state` gauge and the
+`workspace add/remove` report use it too). With no snapshot, or one older than
+120 s, the block reads `unavailable`, never a container state. The watch reads
+every registered root's accounts, not only the daemon root's. It is registered
+with task liveness as `codex_session_watch` (`Task liveness:` in `status`), and
+WARNs every 15 min while seats exist and its newest snapshot is older than
+120 s. After a pass starts or recreates a container it publishes a fresh
+snapshot, so dispatch selection sees the container at once. An operator's
+`accounts session start` runs in another process and cannot publish, so
+selection sees that container at the watch's next pass, within 60 s.
+
+**Acting by hand.** The reconciler replaces the hand-recreate steps. Check
+`loom-daemon status` first. The one manual override, for a daemon that is down,
+a reconciler that is opted out, or a restart the reconciler does not make
+(changed profile control files), is in
+[`guardrail-parity-codex.md`](guardrail-parity-codex.md#restarting-or-recreating-session-containers-by-hand).
+
 **Mount drift (#10364).** A host-mode container's workspace mounts are fixed
 when it is created, so a later `loom-daemon workspace add` never reaches it
 (every Codex tick in the new repository fails `chdir to cwd`) and a later
@@ -10336,6 +10374,26 @@ loop is not reusable as the reporter). It has three cooperating parts:
    capture into the same log via the rendered job/unit's stdout/stderr redirect)
    — **and, since #5391, recovers**: see "The watchdog recovers, it is not a
    report-only detector" below.
+
+**Host opt-out: `autonomy-disabled` (#10179).** The strongest state, above the
+marker and the `.stopped` operator-stop record (#9588). `loom-daemon host disable
+--reason "<why>"` writes `<loom_dir>/autonomy-disabled` (`reason=`/`who=`/`when=`;
+the machine-level `~/.loom`, so it covers every repo on the host; a
+`LOOM_AUTONOMY_MARKER` override moves it too), removes `autonomy-desired`, and runs
+`loom-daemon-stop.sh` to stop the daemon and its launchd/systemd daemon + watchdog
+jobs. While it exists each of these exits non-zero naming reason, who, when and
+`loom-daemon host enable`, with no side effects: `daemon-start` /
+`loom-daemon-start.sh`, the watchdog tick (no recovery, no page), the watchdog
+provisioning guard, `daemon-update` (restart / relaunch / provision, and so the
+auto-update roll), daemon startup itself (supervised relaunch), and
+`resync-installed.sh` / `install-loom.sh` (via `loom-daemon host check`, which
+exits **10** when disabled; the shell guards refuse only on 10, so an older binary
+that exits 1/2 for the unknown `host` subcommand never reads as an opt-out).
+`heal_marker` never re-arms the marker, and `loom-daemon status` / `health` print
+`disabled by operator: <reason> (<when>)` and exit 0 instead of reporting an
+outage. An unreadable marker still counts as disabled (fail closed).
+`loom-daemon host enable` removes it (idempotent) and starts nothing; `host status`
+prints the state. Agents must never start or repair a daemon on a marked host.
 
 **The watchdog recovers, it is not a report-only detector (#5391).** Through
 #5118 the only automatic remediation was two deliberately narrow gates

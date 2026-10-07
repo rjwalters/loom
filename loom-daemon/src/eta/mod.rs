@@ -17,7 +17,7 @@
 //! `loom:operator`, `loom:operator-only` or `loom:operator-decision`). It
 //! leaves to `merge_wait` when the hold is lifted, or to `doctor`, a merge or
 //! a close. Every path-engine heuristic still refuses it as `blocked` (the
-//! shadow `land-2026-10-04-twin-otter` estimates it from its fit's own
+//! shadow `land-2026-10-04-twin-otter-b` estimates it from its fit's own
 //! `merge_hold` stage), and the `merge_wait` samples still run from the
 //! approval to the merge, hold
 //! included (the **pooled** definition); the hold-free `merge_wait` and the
@@ -693,9 +693,10 @@ impl Registry {
     }
 
     /// The built-in heuristics, the fitted ones built with `fit`. Pure.
-    /// `land-2026-10-04-twin-otter` (and its pre-PR composition `-b`, last)
-    /// are registered **always**, with
-    /// or without a file, so its refusals are on the record too.
+    /// `land-2026-10-04-twin-otter-b` (the fitted twin-otter evaluation plus
+    /// its pre-PR composition) is registered **always**, with or without a
+    /// file, so its refusals are on the record too. `land-2026-10-04-twin-otter`
+    /// itself is retired (#10528); `-b` still evaluates it for PR stages.
     #[must_use]
     pub fn with_fit(fit: Option<Arc<fit::CoefficientFile>>) -> Self {
         Self::with_fits(fit, None)
@@ -718,20 +719,24 @@ impl Registry {
                 Box::new(heuristics::LandCalmPlover),
                 Box::new(heuristics::LandV4),
                 Box::new(heuristics::LittleV0),
-                // #10524: wraps twin-otter-b; registered before the
-                // twin-otter pair so `-b` stays last.
+                // #10528: twin-otter-b plus the drift-gated regime
+                // adjustment; registered ahead of the other -b wrappers.
+                Box::new(heuristics::LandBriskPetrel::new(fit.clone())),
+                // #10524: wraps twin-otter-b; registered before `-b` so
+                // `-b` stays last but for tandem-wren.
                 Box::new(heuristics::LandQuickTern::new(fit.clone())),
                 // #10524 slice 3: quick-tern made drift-aware (#10528).
                 Box::new(heuristics::LandSwiftTern::new(fit.clone())),
                 // #10523: twin-otter-b plus the hold/sequence simulator;
-                // also before the twin-otter pair.
+                // also before `-b`.
                 Box::new(heuristics::LandHeldHeron::new(fit.clone())),
                 // #10508: twin-otter-b's priority-aware successor, also
-                // before the twin-otter pair.
+                // before `-b`.
                 Box::new(heuristics::LandKeenWren::new(fit_v2.clone())),
                 // #10524 slice 4: keen-wren wrapped by IPCW split-conformal.
                 Box::new(heuristics::LandBoldLark::new(fit_v2.clone())),
-                Box::new(heuristics::LandTwinOtter::new(fit.clone())),
+                // `land-2026-10-04-twin-otter` is retired (#10528): its
+                // evaluation lives on inside `-b`, which stays registered.
                 Box::new(heuristics::LandTwinOtterB::new(fit.clone())),
                 Box::new(heuristics::DependencyComposition::tandem_wren(fit.clone())),
             ],

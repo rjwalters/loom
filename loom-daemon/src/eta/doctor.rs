@@ -269,6 +269,9 @@ pub struct DriftFacts {
     pub n_recent: u64,
     /// The tri-state verdict: `Unknown` below the sample floor.
     pub state: DriftState,
+    /// Whether the serving `land` heuristic scales its ETAs for drift
+    /// (`land-2026-10-06-brisk-petrel`, #10528). `false` for every other.
+    pub adjusted: bool,
 }
 
 /// `backtest` link inputs (#10492): the captain's nightly walk-forward folds.
@@ -577,7 +580,7 @@ fn fit(f: &Facts) -> Vec<Check> {
             "fit",
             "coefficient_file",
             Status::Fail,
-            "no coefficient file: twin-otter refuses no_model",
+            "no coefficient file: twin-otter-b refuses no_model",
             fit_remedy(x.last_check.as_ref()),
         ),
         Some((id, cutoff)) if f.now - *cutoff > Duration::hours(FIT_FAIL_HOURS) => Check::bad(
@@ -809,7 +812,7 @@ fn serving(f: &Facts) -> Vec<Check> {
             "serving",
             "twin_otter_model",
             Status::Fail,
-            "no coefficient file loaded: land-2026-10-04-twin-otter refuses no_model",
+            "no coefficient file loaded: land-2026-10-04-twin-otter-b refuses no_model on PR stages",
             "see the `fit` link: a fit must be written before twin-otter can answer",
         )
     });
@@ -931,10 +934,21 @@ fn outcomes(f: &Facts) -> Vec<Check> {
                 "outcomes",
                 &name,
                 Status::Warn,
-                format!(
-                    "{} scored {} outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served ETAs are NOT adjusted for it yet (serving-path application is deferred, #10528)",
-                    d.n_recent, d.heuristic
-                ),
+                if d.adjusted {
+                    format!(
+                        "{} scored {} outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served ETAs are scaled by the drift-gated regime adjustment ({} is serving)",
+                        d.n_recent,
+                        d.heuristic,
+                        super::heuristics::LAND_BRISK_PETREL
+                    )
+                } else {
+                    format!(
+                        "{} scored {} outcome(s) in 6h disagree with the baseline (regime drift, cause unknown); served ETAs are NOT adjusted for it (only the {} candidate adjusts, and it is not serving)",
+                        d.n_recent,
+                        d.heuristic,
+                        super::heuristics::LAND_BRISK_PETREL
+                    )
+                },
                 "expect this stage's served ETAs to be biased until the next refit on current-regime rows",
             ),
             DriftState::Unknown => Check::ok(

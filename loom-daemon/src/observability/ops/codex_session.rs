@@ -41,6 +41,32 @@
 //!
 //! Only session-managed, enabled Codex accounts are read; a pool with none
 //! costs zero docker calls. [`Tracker::observe`] and [`points`] are pure.
+//!
+//! **Every registered root (#10600).** The seats are those of every
+//! registered root ([`session_seats::seats`], the reconciler's own rule), not
+//! only the daemon's: a host whose daemon root has no session-managed account
+//! but another root does is watched too, so that root's selection is not
+//! silently blind. The seats are published with [`published_seats`] for
+//! `loom-daemon status`.
+//!
+//! **One drift definition (#10600).** The snapshot is classified with the
+//! reconciler's own [`session_state::effective_drift`], denials included, so
+//! a container mounting a still-registered `firewall: true` repository reads
+//! `stale_mounts` here, not `running`, while the reconciler removes it. An
+//! unreadable registry gives no drift verdict (never `stale_mounts`).
+//!
+//! **Staleness (#10600).** Every reader fails open once the newest snapshot
+//! is older than [`session_state::LATEST_MAX_AGE`]. The watch is registered
+//! with the daemon's task-liveness tracking ([`crate::task_liveness`],
+//! `codex_session_watch`), and each tick WARNs, on the same reminder cadence,
+//! while seats exist and the newest snapshot is that old (a pass that keeps
+//! overrunning); `loom-daemon status` shows the section `unavailable`.
+//!
+//! Besides the state gauge, each pass exports, per seat,
+//! `loom.codex_session.record{account,container,kind}` (`hold`,
+//! `drift_removal`: 1 while that on-disk record stands) and
+//! `loom.codex_session.mount_drift{account,container,kind}` (`missing`,
+//! `extra`, `denied`: how many paths; only when there is a drift verdict).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -49,9 +75,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
-use crate::tokens_pool::session_lifecycle::{container_name, is_session_managed};
-use crate::tokens_pool::session_state::{self, SessionState, Snapshot};
-use crate::tokens_pool::{account_inventory, AccountProvider};
+use crate::tokens_pool::session_seats::{self, Seat};
+use crate::tokens_pool::session_state::{
+    self, DriftInputs, EffectiveDrift, SessionState, Snapshot,
+};
+use crate::tokens_pool::{session_drift_removal, session_hold};
 
 /// How often the WARN repeats while an account's container stays not running.
 pub const REMINDER_SECS: u64 = 15 * 60;
@@ -145,16 +173,18 @@ fn describe(account: &str, container: &str, state: SessionState) -> String {
         ),
         SessionState::Stopped | SessionState::Missing => format!(
             "Codex session container for account {account} ({container}) is {}: Codex ticks \
-             on this account are refused until it is started \
-             (`loom-daemon accounts session start {account} --mount-workspace <checkout parent>`)",
+             on this account are refused until it runs again. The session reconciler restarts \
+             it unless it is held, kept down by a removal record, or opted out; see \
+             `loom-daemon status` (manual override: `loom-daemon accounts session start \
+             {account} --mount-workspace <checkout parent>`)",
             state.as_str()
         ),
         SessionState::StaleMounts => format!(
             "Codex session container for account {account} ({container}) is running but its \
-             workspace mounts no longer match the registry (stale_mounts: a registered root is \
-             not mounted, or a deregistered one still is, #10364); when the session reconciler is \
-             enabled it recreates the container once idle, otherwise recreate it by hand: \
-             `loom-daemon accounts session stop {account}` then `session start`"
+             workspace mounts no longer match what it may mount (stale_mounts: a registered root \
+             is not mounted, a deregistered one still is, or a mount is now denied, #10364); the \
+             session reconciler recreates (or, for a denied mount, removes) it once idle; see \
+             `loom-daemon status`"
         ),
         SessionState::Running => {
             format!("Codex session container for account {account} ({container}) is running")
@@ -180,8 +210,134 @@ pub fn points(observed: &[(String, String, SessionState)]) -> Vec<MetricPoint> {
 
 type Observations = Vec<(String, String, SessionState)>;
 
+/// One seat's on-disk records and drift verdict, for the extra gauges.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeatFacts {
+    pub account: String,
+    pub container: String,
+    pub held: bool,
+    pub drift_removal: bool,
+    /// `None`: no drift verdict (missing, private-clone, unlabelled, or the
+    /// registry was unreadable).
+    pub drift: Option<EffectiveDrift>,
+}
+
+/// The `record` and `mount_drift` gauge points for `facts`. Pure.
+#[must_use]
+pub fn fact_points(facts: &[SeatFacts]) -> Vec<MetricPoint> {
+    let mut points = Vec::new();
+    for fact in facts {
+        let labelled = |point: MetricPoint, kind: &'static str| {
+            point
+                .label("account", fact.account.clone())
+                .label("kind", kind)
+                .label("container", fact.container.clone())
+        };
+        for (kind, on) in [("hold", fact.held), ("drift_removal", fact.drift_removal)] {
+            let point = MetricPoint::int(MetricName::CodexSessionRecord, i64::from(on));
+            points.push(labelled(point, kind));
+        }
+        if let Some(drift) = &fact.drift {
+            for (kind, n) in [
+                ("missing", drift.drift.missing.len()),
+                ("extra", drift.extra_not_denied().len()),
+                ("denied", drift.denied.len()),
+            ] {
+                let n = i64::try_from(n).unwrap_or(i64::MAX);
+                points
+                    .push(labelled(MetricPoint::int(MetricName::CodexSessionMountDrift, n), kind));
+            }
+        }
+    }
+    points
+}
+
+/// Each seat's facts from one available snapshot and the on-disk records.
+#[must_use]
+pub fn seat_facts(
+    seats: &[Seat],
+    snapshot: &Snapshot,
+    held: &dyn Fn(&[PathBuf]) -> bool,
+    removal: &dyn Fn(&[PathBuf]) -> bool,
+) -> Vec<SeatFacts> {
+    let Snapshot::Available(map) = snapshot else {
+        return Vec::new();
+    };
+    seats
+        .iter()
+        .map(|seat| SeatFacts {
+            account: seat.account.clone(),
+            container: seat.container.clone(),
+            held: held(&seat.profiles),
+            drift_removal: removal(&seat.profiles),
+            drift: map.get(&seat.container).and_then(|o| o.drift.clone()),
+        })
+        .collect()
+}
+
+/// What one pass leaves for the collector to export.
+#[derive(Debug, Default)]
+struct Exported {
+    observed: Observations,
+    facts: Vec<SeatFacts>,
+}
+
 static TRACKER: Mutex<Option<Tracker>> = Mutex::new(None);
-static LAST: Mutex<Option<(Instant, Arc<Observations>)>> = Mutex::new(None);
+static LAST: Mutex<Option<(Instant, Arc<Exported>)>> = Mutex::new(None);
+static SEATS: Mutex<Option<Arc<Vec<Seat>>>> = Mutex::new(None);
+
+/// The seats the newest watch pass found (every registered root), for
+/// `loom-daemon status`. `None` before the first pass.
+#[must_use]
+pub fn published_seats() -> Option<Arc<Vec<Seat>>> {
+    SEATS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn publish_seats(seats: Vec<Seat>) {
+    *SEATS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(seats));
+}
+
+/// The staleness WARN's memory: when it last warned.
+#[derive(Debug, Default)]
+pub struct Staleness {
+    warned_at: Option<u64>,
+}
+
+impl Staleness {
+    /// The WARN text when seats exist and the newest snapshot is older than
+    /// [`session_state::LATEST_MAX_AGE`] (on entry, then every
+    /// [`REMINDER_SECS`]), or once when it is fresh again. Pure.
+    pub fn check(&mut self, seats: bool, age: Option<Duration>, now: u64) -> Option<String> {
+        let stale = seats && age.is_some_and(|age| age > session_state::LATEST_MAX_AGE);
+        if !stale {
+            return self.warned_at.take().map(|_| {
+                "Codex session container snapshots are fresh again; selection sees the \
+                 containers again"
+                    .to_string()
+            });
+        }
+        if self
+            .warned_at
+            .is_some_and(|at| now.saturating_sub(at) < REMINDER_SECS)
+        {
+            return None;
+        }
+        self.warned_at = Some(now);
+        Some(format!(
+            "the newest Codex session container snapshot is {}s old (over {}s): the session \
+             watch is not completing passes, so dispatch selection and `loom-daemon status` \
+             cannot see the containers (they fail open); reminder every {} min",
+            age.unwrap_or_default().as_secs(),
+            session_state::LATEST_MAX_AGE.as_secs(),
+            REMINDER_SECS / 60
+        ))
+    }
+}
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -233,22 +389,6 @@ pub fn fold(
     pass
 }
 
-/// The enabled, session-managed Codex accounts and their container names.
-fn session_accounts(root: &Path) -> Vec<(String, String)> {
-    account_inventory(root, AccountProvider::Codex)
-        .map(|inventory| {
-            inventory
-                .into_iter()
-                .filter(|a| a.enabled && is_session_managed(&a.credential_reference))
-                .map(|a| {
-                    let container = container_name(&a.id.name);
-                    (a.id.name, container)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Set while a watch pass runs, so a slow pass is never joined by another.
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
@@ -264,7 +404,12 @@ impl Drop for InFlight {
 /// One watch pass (blocking): snapshot, then fold it under the tracker lock,
 /// WARN, and keep the observations.
 fn watch_pass(root: &Path) {
-    let accounts = session_accounts(root);
+    let seats = session_seats::seats(root);
+    publish_seats(seats.clone());
+    let accounts: Vec<(String, String)> = seats
+        .iter()
+        .map(|seat| (seat.account.clone(), seat.container.clone()))
+        .collect();
     if accounts.is_empty() {
         TRACKER
             .lock()
@@ -276,18 +421,24 @@ fn watch_pass(root: &Path) {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         return;
     }
-    let registered: Vec<PathBuf> = crate::workspace_registry::WorkspaceRegistry::load_default()
-        .map(|registry| registry.roots())
-        .unwrap_or_default();
+    // An unreadable registry is `None`: no drift verdict, never "all stale".
+    let registered: Option<Vec<PathBuf>> =
+        crate::workspace_registry::WorkspaceRegistry::load_default()
+            .ok()
+            .map(|registry| registry.roots());
     let docker = std::env::var("LOOM_CODEX_SESSION_DOCKER")
         .ok()
         .filter(|d| !d.is_empty())
         .unwrap_or_else(|| "docker".to_string());
     // The docker call runs without the tracker lock held.
     let started = Instant::now();
+    let inputs = DriftInputs::new(registered.as_deref());
     let snapshot =
-        Arc::new(session_state::snapshot(&docker, &registered, session_state::SNAPSHOT_DEADLINE));
+        Arc::new(session_state::snapshot(&docker, &inputs, session_state::SNAPSHOT_DEADLINE));
     session_state::publish(Arc::clone(&snapshot), started);
+    let facts = seat_facts(&seats, &snapshot, &session_hold::held_across, &|profiles| {
+        session_drift_removal::read(profiles).is_some()
+    });
     let pass = {
         let mut guard = TRACKER
             .lock()
@@ -299,20 +450,36 @@ fn watch_pass(root: &Path) {
     }
     *LAST
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        pass.observed.map(|observed| (started, Arc::new(observed)));
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = pass
+        .observed
+        .map(|observed| (started, Arc::new(Exported { observed, facts })));
 }
 
-/// Start the always-on watch for `workspace_root`'s account pool. Runs
-/// whether or not telemetry is configured; each pass runs off the async
-/// runtime, its docker calls are killed at the snapshot deadline, and a tick
-/// is skipped while the previous pass is still running.
+/// Start the always-on watch for the account pools of every root registered
+/// with `workspace_root`'s daemon. Runs whether or not telemetry is
+/// configured; each pass runs off the async runtime, its docker calls are
+/// killed at the snapshot deadline, and a tick is skipped while the previous
+/// pass is still running. Registered with task liveness as
+/// [`crate::task_liveness::CODEX_SESSION_WATCH`]; it beats once per completed
+/// pass.
 pub fn spawn_watch(workspace_root: PathBuf) -> tokio::task::JoinHandle<()> {
+    use crate::task_liveness::{self, CODEX_SESSION_WATCH};
+    task_liveness::register(
+        CODEX_SESSION_WATCH,
+        WATCH_INTERVAL,
+        task_liveness::default_stale_after(WATCH_INTERVAL),
+    );
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(WATCH_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut staleness = Staleness::default();
         loop {
             ticker.tick().await;
+            let seats = published_seats().is_some_and(|seats| !seats.is_empty());
+            let age = session_state::newest().map(|(age, _)| age);
+            if let Some(message) = staleness.check(seats, age, now_secs()) {
+                log::warn!("session: {message}");
+            }
             if IN_FLIGHT.swap(true, Ordering::AcqRel) {
                 log::info!(
                     "session: previous Codex session watch pass still running; tick skipped"
@@ -323,6 +490,7 @@ pub fn spawn_watch(workspace_root: PathBuf) -> tokio::task::JoinHandle<()> {
             let pass = tokio::task::spawn_blocking(move || {
                 let _in_flight = InFlight;
                 watch_pass(&root);
+                task_liveness::beat_if_registered(CODEX_SESSION_WATCH);
             });
             // This only stops *waiting*: a blocking pass cannot be cancelled.
             // `IN_FLIGHT` is what keeps an overrunning pass from being joined
@@ -338,14 +506,16 @@ pub fn spawn_watch(workspace_root: PathBuf) -> tokio::task::JoinHandle<()> {
 /// The collector's part: export the gauge from the watch's newest
 /// observations, when the ops sink is registered. Never calls docker.
 pub fn record() {
-    let observed = LAST
+    let exported = LAST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
         .filter(|(at, _)| at.elapsed() <= FRESH_FOR)
-        .map(|(_, observed)| Arc::clone(observed));
-    if let Some(observed) = observed.filter(|o| !o.is_empty()) {
-        super::emit_metrics(points(&observed));
+        .map(|(_, exported)| Arc::clone(exported));
+    if let Some(exported) = exported.filter(|e| !e.observed.is_empty()) {
+        let mut all = points(&exported.observed);
+        all.extend(fact_points(&exported.facts));
+        super::emit_metrics(all);
     }
 }
 
@@ -443,6 +613,7 @@ mod tests {
                         session_state::Observed {
                             state: *state,
                             inspect: serde_json::Value::Null,
+                            drift: None,
                         },
                     )
                 })
@@ -502,6 +673,90 @@ mod tests {
         let pass = fold(&mut t, &accounts, &available(&[]), 0);
         assert_eq!(pass.observed.unwrap()[0].2, SessionState::Missing);
         assert_eq!(pass.warn.len(), 1);
+    }
+
+    #[test]
+    fn a_stale_snapshot_warns_while_seats_exist_then_recovers_once() {
+        let mut st = Staleness::default();
+        let old = Some(session_state::LATEST_MAX_AGE + Duration::from_secs(1));
+        let fresh = Some(Duration::from_secs(5));
+        assert!(st.check(false, old, 0).is_none(), "no seats: nothing is blind");
+        assert!(st.check(true, fresh, 0).is_none());
+        assert!(st.check(true, None, 0).is_none(), "nothing published yet");
+        let warn = st.check(true, old, 100).unwrap();
+        assert!(warn.contains("121s old") && warn.contains("fail open"), "{warn}");
+        assert!(st.check(true, old, 100 + REMINDER_SECS - 1).is_none());
+        assert!(st.check(true, old, 100 + REMINDER_SECS).is_some(), "bounded reminder");
+        assert!(st
+            .check(true, fresh, 2_000)
+            .unwrap()
+            .contains("fresh again"));
+        assert!(st.check(true, fresh, 2_060).is_none());
+    }
+
+    #[test]
+    fn fact_points_carry_records_and_drift_counts() {
+        let drift = EffectiveDrift {
+            drift: session_state::MountDrift {
+                missing: vec![PathBuf::from("/ws/b")],
+                extra: vec![PathBuf::from("/ws/old"), PathBuf::from("/ws/secret")],
+            },
+            denied: vec![PathBuf::from("/ws/secret")],
+        };
+        let facts = [
+            SeatFacts {
+                account: "a".into(),
+                container: C.into(),
+                held: true,
+                drift_removal: false,
+                drift: Some(drift),
+            },
+            SeatFacts {
+                account: "b".into(),
+                container: "loom-codex-session-b".into(),
+                held: false,
+                drift_removal: true,
+                drift: None,
+            },
+        ];
+        let pts = fact_points(&facts);
+        let value = |account: &str, name: MetricName, kind: &str| {
+            pts.iter()
+                .find(|p| {
+                    p.name == name && p.labels["account"] == account && p.labels["kind"] == kind
+                })
+                .map(|p| p.value)
+        };
+        use crate::telemetry::ops::MetricValue::Int;
+        assert_eq!(value("a", MetricName::CodexSessionRecord, "hold"), Some(Int(1)));
+        assert_eq!(value("a", MetricName::CodexSessionRecord, "drift_removal"), Some(Int(0)));
+        assert_eq!(value("a", MetricName::CodexSessionMountDrift, "missing"), Some(Int(1)));
+        assert_eq!(value("a", MetricName::CodexSessionMountDrift, "extra"), Some(Int(1)));
+        assert_eq!(value("a", MetricName::CodexSessionMountDrift, "denied"), Some(Int(1)));
+        assert_eq!(value("b", MetricName::CodexSessionRecord, "drift_removal"), Some(Int(1)));
+        assert_eq!(
+            value("b", MetricName::CodexSessionMountDrift, "missing"),
+            None,
+            "no drift verdict, no drift points"
+        );
+        assert!(pts
+            .iter()
+            .all(|p| p.labels["container"].starts_with("loom-codex-session-")));
+    }
+
+    #[test]
+    fn seat_facts_need_an_available_snapshot() {
+        let seats = vec![Seat {
+            account: "a".into(),
+            container: C.into(),
+            profiles: vec![PathBuf::from("/p/a")],
+        }];
+        let yes = |_: &[PathBuf]| true;
+        let gone = Snapshot::Unavailable("down".into());
+        assert!(seat_facts(&seats, &gone, &yes, &yes).is_empty());
+        let facts = seat_facts(&seats, &available(&[]), &yes, &yes);
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].held && facts[0].drift_removal && facts[0].drift.is_none());
     }
 
     #[test]

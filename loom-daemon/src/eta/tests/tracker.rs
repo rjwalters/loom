@@ -221,7 +221,7 @@ fn external_review_path_from_listings_to_merge() {
     assert_eq!(
         merged.outcomes.len(),
         26,
-        "two estimates x land-v1 + the land-v2, calm-plover, quick-tern, swift-tern, held-heron, keen-wren, bold-lark, both twin-otter, land-v4, little-v0 and tandem-wren shadows"
+        "two estimates x land-v1 + the land-v2, calm-plover, brisk-petrel, quick-tern, swift-tern, held-heron, keen-wren, bold-lark, twin-otter-b, land-v4, little-v0 and tandem-wren shadows"
     );
     for outcome in &merged.outcomes {
         assert_eq!(outcome.score.outcome, OutcomeKind::Landed);
@@ -262,14 +262,16 @@ fn only_the_issue_closing_not_planned_is_abandoned() {
         IssueState::ClosedNotPlanned(t(400)),
         t(600),
     );
-    // Twelve: `land-v1` (primary) and the `land-v2`,
-    // `land-2026-10-06-calm-plover`, `land-2026-10-06-quick-tern`, `-swift-tern`,
+    // Thirteen: `land-v1` (primary) and the `land-v2`,
+    // `land-2026-10-06-calm-plover`, `land-2026-10-06-brisk-petrel` (#10528),
+    // `land-2026-10-06-quick-tern`, `-swift-tern`,
     // `land-2026-10-06-held-heron`, `land-2026-10-06-keen-wren` (#10508),
-    // `land-2026-10-04-twin-otter`, `-b`, `land-v4`, `little-v0` and
-    // `land-2026-10-06-tandem-wren` shadows, scored against the same outcome
-    // at the same `as_of` — the live pairs (#9328, #10489, #10524, #10523,
-    // #10508, #10243, #10210, #10208, #10510; `land-v3` and `-amber-heron`
-    // retired, #10484).
+    // `land-2026-10-06-bold-lark`, `land-2026-10-04-twin-otter-b`, `land-v4`,
+    // `little-v0` and `land-2026-10-06-tandem-wren` shadows, scored against
+    // the same outcome at the same `as_of` — the live pairs (#9328, #10489,
+    // #10524, #10523, #10508, #10244, #10210, #10208, #10510, #10528;
+    // `land-v3` and `-amber-heron` retired, #10484; `-fresh-tide`, #10549;
+    // `land-2026-10-04-twin-otter`, #10528).
     assert_eq!(not_planned.outcomes.len(), 13);
     assert_eq!(not_planned.outcomes[0].score.outcome, OutcomeKind::Abandoned);
     assert_eq!(not_planned.outcomes[0].score.error_sec, None);

@@ -2,6 +2,7 @@
 
 mod backtest;
 mod backtest_pr;
+mod backtest_subsets;
 mod backtest_union;
 mod censoring;
 mod conditioning;
@@ -48,6 +49,7 @@ mod ready;
 mod recalibrate;
 mod recency;
 mod regime;
+mod regime_serving;
 mod roster_history;
 mod score;
 mod serve_parity;
