@@ -443,7 +443,7 @@ FULL_BODY="$FULL_BODY
 # two identical callers cannot both pass the dedupe read. Fail closed (exit 9).
 # Host-local: independent hosts share no lock, so the final step below
 # (verdict-reconcile) re-reads the forge and arbitrates a cross-host race.
-"${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-lock acquire "$PR" --repo "$REPO" || { echo "post-verdict.sh: could not take the per-PR verdict lock; nothing was posted (#10581)" >&2; exit 9; }
+"${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-lock acquire "$PR" --repo "$REPO" || { echo "post-verdict.sh: could not take the per-PR verdict lock; nothing was posted (#10581). A loom-daemon older than 0.19.875 has no verdict-lock: roll loom-daemon together with ./.loom/scripts/resync-installed.sh." >&2; exit 9; }
 trap '"${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-lock release "$PR" --repo "$REPO"' EXIT
 # Final compare (#10485): the head must still be the reviewed one right before
 # the write; an unreadable head is a refusal, never a pass.
@@ -460,7 +460,8 @@ fi
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
 # Verdict gate + label transition (#10581): the logic is the daemon's
 # (loom_daemon::verdict_gate); only a positive sentinel lets an approval post.
-# requires-daemon: forge >= 0.19.830   verdict-gate, verdict-labels, verdict-lock and verdict-reconcile (#10581) first ship in the release after 0.19.830. An older binary fails the lock step (exit 9, nothing posted); run ./.loom/scripts/resync-installed.sh and roll loom-daemon.
+# requires-daemon: forge >= 0.19.875   verdict-gate, verdict-labels, verdict-lock and verdict-reconcile (#10581) first ship in the build that merges #10684 (0.19.875 = the base VERSION it was rebased on, 0.19.874, + 1 patch). An older binary fails the lock step (exit 9, nothing posted), so every Judge on that host stalls.
+# Roll together: this script and loom-daemon must move as a pair. On a host, roll loom-daemon to >= 0.19.875 FIRST (or in the same step) and only then run ./.loom/scripts/resync-installed.sh; never resync these scripts ahead of the daemon. In a checkout where .loom/scripts symlinks into defaults/scripts (the loom repo itself), a `git pull` past #10684 IS the script roll.
 VG_RC=0; VG_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-gate "$PR" --repo "$REPO" --verdict "$VERDICT" --sha "$SHA" --overrules-prior "$OVERRULE" 2>&1)" || VG_RC=$?  # set -e is on (forge-helpers.sh)
 case "$VG_RC:$VG_OUT" in
   "0:LOOM-VERDICT-GATE PROCEED"*) forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1 || exit 1 ;;
