@@ -3019,28 +3019,18 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
       # operator can re-run with --worktree-path.
       DISCOVERED_WT="$(_find_worktree_by_branch "$PR_BRANCH")"
       if [[ -n "$DISCOVERED_WT" ]]; then
-        if _is_primary_worktree_path "$DISCOVERED_WT"; then
-          # The PR branch is checked out in the PRIMARY (main) working copy,
-          # not a linked worktree at all (#4171). `git worktree remove` /
-          # `--worktree-path` can never apply here — git itself refuses to
-          # remove the main working tree — so never suggest either. The
-          # subsequent _maybe_delete_local_branch call below prints the
-          # correct two-step remediation (switch to the default branch, then
-          # delete) once the branch-delete attempt fails as "checked out".
-          info "PR branch '$PR_BRANCH' is checked out in the primary repository checkout ($DISCOVERED_WT) — not a removable worktree."
-        elif [[ -f "$DISCOVERED_WT/.loom-managed" ]]; then
-          # Rare case: Loom-managed worktree at a non-standard path. The
-          # sentinel says it's safe to remove — unless the close-target-aware
-          # gate (#4186), or the #6694 landed-branch override
-          # _worktree_cleanup_decide shares with the default-path call site
-          # above, says preserve.
-          _worktree_cleanup_decide discovered "$DISCOVERED_WT"
-        else
-          warning "Discovered worktree for branch '$PR_BRANCH' at: $DISCOVERED_WT"
-          warning "Worktree lacks .loom-managed sentinel — not removing (user-owned)."
-          warning "To clean it up, re-run with: --worktree-path '$DISCOVERED_WT'"
-          warning "Or manually: git worktree remove '$DISCOVERED_WT'"
-        fi
+        # Classification (primary checkout / managed / user-owned) and its
+        # message text are `loom-daemon merge-pr discovered-worktree` (#8191
+        # slice); the primary comparison and the removal stay here. Only a
+        # positively received DECIDE can lead to a removal — a missing/older
+        # daemon yields no verdict and removes nothing.
+        _DW_OUT="$(_mp_worktree discovered-worktree --branch "$PR_BRANCH" --path "$DISCOVERED_WT" --primary "$(_is_primary_worktree_path "$DISCOVERED_WT" && echo true || echo false)")" || _DW_OUT=""; _DW_ACT="${_DW_OUT%%$'\n'*}"
+        case "$_DW_ACT" in
+          "LOOM-DISCOVERED DECIDE"|"LOOM-DISCOVERED NOTE")
+            while IFS=$'\t' read -r level text; do [[ -z "$level" ]] || { [[ "$level" == WARNING ]] && warning "$text" || info "$text"; }; done <<<"${_DW_OUT#"$_DW_ACT"}"
+            [[ "$_DW_ACT" != *DECIDE ]] || _worktree_cleanup_decide discovered "$DISCOVERED_WT" ;;
+          *) warning "Discovered worktree $DISCOVERED_WT for '$PR_BRANCH' was left in place — 'loom-daemon merge-pr discovered-worktree' gave no verdict (a loom-daemon predating #8191's slice has no such verb)." ;;
+        esac
       else
         info "No worktree found at $DEFAULT_WT_PATH (and none tracking '$PR_BRANCH' in 'git worktree list')"
       fi
