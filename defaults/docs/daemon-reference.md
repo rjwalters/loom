@@ -4633,13 +4633,18 @@ items and feeds them to the same core (one batched `loom:blocked` read per tick)
 
 Precedence is env > config > default. The poll is REST
 (`gh api repos/{o}/{r}/issues?state=closed&since=...`), runs against the
-primary workspace, and persists a cursor (max `updated_at` seen) in
-`.loom/closed-watch-cursor.json`. The first run looks back 24h and a pass reads
-at most 5 pages of 100. The cursor advances only when every read answered (the
-listing, each merged PR's closing references, the `loom:blocked` listing,
-every candidate's text/evidence read) and every owed comment posted; otherwise the
-tick retries, and the marker keeps the retry from re-posting. With nothing
-newly closed no `loom:blocked` read is made.
+primary workspace, and persists a cursor in `.loom/closed-watch-cursor.json`:
+the highest `(updated_at, number)` key scanned. The listing order, the cursor,
+and the "past the cursor" test all use that one key, and each request
+re-anchors `since` at the cursor (keyset paging), so a pass truncated by its
+cap (5 pages of new rows) or reordered by a concurrent update leaves the rest
+past the cursor for the next tick (#10638). `closed_at` is not a filter, so a
+comment on an old closed item rescans its number; the marker makes that a
+no-op. The first run looks back 24h. The cursor advances only when every read
+answered (the listing, each merged PR's closing references, the `loom:blocked`
+listing, every candidate's text/evidence read) and every owed comment posted;
+otherwise the tick retries, and the marker keeps the retry from re-posting.
+With nothing past the cursor no `loom:blocked` read is made.
 It never edits labels, and failures are logged, never fatal. Two hosts polling
 one repo may both post in the check-then-post window; the duplicate is harmless
 and accepted. Source: `loom-daemon/src/cli/closed_watch.rs`.

@@ -4,7 +4,7 @@
 //! the post) against a fake forge.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::anyhow;
 use loom_daemon::dep_recheck::extract;
@@ -17,19 +17,51 @@ use loom_daemon::stale_blocked::Artifact;
 use super::super::notify_cleared_blockers::scan_cleared_with;
 use super::*;
 
-fn item(n: i64, closed: &str, updated: &str) -> ClosedItem {
+fn ts(s: &str) -> DateTime<Utc> {
+    parse_ts(s).unwrap()
+}
+
+/// A closed item as listed; its `closed_at` plays no part in the cursor.
+fn item(n: i64, updated: &str) -> ClosedItem {
     ClosedItem {
         number: n,
-        closed_at: closed.into(),
-        updated_at: updated.into(),
+        updated_at: ts(updated),
         merged_pr: false,
     }
 }
 
 fn now() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2026-10-04T12:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc)
+    ts("2026-10-04T12:00:00Z")
+}
+
+/// The forge listing as `gh api .../issues?state=closed&since=S&sort=updated
+/// &direction=asc&per_page=100&page=P` serves it: `updated_at >= since`,
+/// oldest-updated first (ties in listing order), one page of [`PAGE_SIZE`].
+fn serve(rows: &[ClosedItem], since: &str, page: usize) -> Vec<ClosedItem> {
+    let since = ts(since);
+    let mut hits: Vec<ClosedItem> = rows
+        .iter()
+        .filter(|r| r.updated_at >= since)
+        .cloned()
+        .collect();
+    hits.sort_by_key(|r| r.updated_at);
+    hits.into_iter()
+        .skip((page - 1) * PAGE_SIZE)
+        .take(PAGE_SIZE)
+        .collect()
+}
+
+fn cursor_at(root: &Path) -> Option<String> {
+    load_cursor(root).map(|c| fmt_ts(c.at))
+}
+
+fn save_at(root: &Path, at: &str) {
+    save_cursor(root, &Cursor::starting_at(ts(at))).unwrap();
+}
+
+/// `secs` seconds after `base`, formatted.
+fn plus(base: &str, secs: i64) -> String {
+    fmt_ts(ts(base) + ChronoDuration::seconds(secs))
 }
 
 #[test]
@@ -39,19 +71,19 @@ fn close_with_no_merge_pr_script_triggers_scan_and_advances_cursor() {
     let out = poll_with(
         dir.path(),
         now(),
-        |since| {
-            // First run is bounded to the 24h lookback.
-            assert_eq!(since, "2026-10-03T12:00:00Z");
-            Ok(vec![item(7, "2026-10-04T10:00:00Z", "2026-10-04T10:00:00Z")])
+        |since, page| {
+            // First run is bounded to the 24h lookback (less the 1s overlap).
+            assert_eq!((since, page), ("2026-10-03T11:59:59Z", 1));
+            Ok(vec![item(7, "2026-10-04T10:00:00Z")])
         },
-        |fresh| {
-            scanned.borrow_mut().extend(fresh.iter().map(|i| i.number));
+        |batch| {
+            scanned.borrow_mut().extend(batch.iter().map(|i| i.number));
             Ok(())
         },
     );
     assert_eq!(out, PollOutcome::Scanned { closed: 1 });
     assert_eq!(*scanned.borrow(), vec![7]);
-    assert_eq!(load_cursor(dir.path()).as_deref(), Some("2026-10-04T10:00:00Z"));
+    assert_eq!(cursor_at(dir.path()).as_deref(), Some("2026-10-04T10:00:00Z"));
 }
 
 /// The cursor is written into the primary clone, so the managed `.gitignore`
@@ -90,54 +122,248 @@ fn cursor_file_is_ignored_by_the_managed_gitignore_block() {
 #[test]
 fn cursor_persists_across_polls_and_idle_tick_never_scans() {
     let dir = tempfile::tempdir().unwrap();
-    save_cursor(dir.path(), "2026-10-04T10:00:00Z").unwrap();
+    save_at(dir.path(), "2026-10-04T10:00:00Z");
     let out = poll_with(
         dir.path(),
         now(),
-        |since| {
-            assert_eq!(since, "2026-10-04T10:00:00Z");
+        |since, _| {
+            assert_eq!(since, "2026-10-04T09:59:59Z");
             Ok(vec![])
         },
-        |_| panic!("the loom:blocked scan must not run when nothing closed"),
+        |_| panic!("the loom:blocked scan must not run when nothing is past the cursor"),
     );
     assert_eq!(out, PollOutcome::Idle);
 }
 
 #[test]
-fn comment_on_old_closed_item_is_not_a_new_close() {
+fn cursor_round_trips_its_seen_set_and_reads_the_old_format() {
     let dir = tempfile::tempdir().unwrap();
-    save_cursor(dir.path(), "2026-10-04T10:00:00Z").unwrap();
+    let c = Cursor {
+        at: ts("2026-10-04T10:00:00Z"),
+        seen: BTreeSet::from([4, 9]),
+    };
+    save_cursor(dir.path(), &c).unwrap();
+    assert_eq!(load_cursor(dir.path()), Some(c));
+    // The first #10150 format had no `seen`: it loads with an empty set.
+    std::fs::write(cursor_path(dir.path()), r#"{"cursor":"2026-10-04T10:00:00Z"}"#).unwrap();
+    assert_eq!(load_cursor(dir.path()), Some(Cursor::starting_at(ts("2026-10-04T10:00:00Z"))));
+}
+
+/// A row already scanned at the cursor second is not rescanned; the same
+/// closed item updated later (say, commented on) is, and the per-number
+/// marker makes that rescan a no-op (see the fake-forge tests below).
+#[test]
+fn scanned_rows_stay_scanned_but_a_later_update_rescans() {
+    let dir = tempfile::tempdir().unwrap();
+    save_cursor(
+        dir.path(),
+        &Cursor {
+            at: ts("2026-10-04T10:00:00Z"),
+            seen: BTreeSet::from([3]),
+        },
+    )
+    .unwrap();
+    let rows = vec![item(3, "2026-10-04T10:00:00Z")];
     let out = poll_with(
         dir.path(),
         now(),
-        |_| Ok(vec![item(3, "2026-10-01T00:00:00Z", "2026-10-04T11:00:00Z")]),
-        |_| panic!("an old close must not rescan"),
+        |since, page| Ok(serve(&rows, since, page)),
+        |_| panic!("an already-scanned key must not rescan"),
     );
     assert_eq!(out, PollOutcome::Idle);
-    // The cursor still moves past the comment's updated_at.
-    assert_eq!(load_cursor(dir.path()).as_deref(), Some("2026-10-04T11:00:00Z"));
+
+    let rows = vec![item(3, "2026-10-04T11:00:00Z")];
+    let out = poll_with(dir.path(), now(), |since, page| Ok(serve(&rows, since, page)), |_| Ok(()));
+    assert_eq!(out, PollOutcome::Scanned { closed: 1 });
+    assert_eq!(cursor_at(dir.path()).as_deref(), Some("2026-10-04T11:00:00Z"));
 }
 
 #[test]
 fn failed_scan_holds_the_cursor_so_the_next_tick_retries() {
     let dir = tempfile::tempdir().unwrap();
-    save_cursor(dir.path(), "2026-10-04T09:00:00Z").unwrap();
+    save_at(dir.path(), "2026-10-04T09:00:00Z");
     let out = poll_with(
         dir.path(),
         now(),
-        |_| Ok(vec![item(7, "2026-10-04T10:00:00Z", "2026-10-04T10:00:00Z")]),
+        |_, _| Ok(vec![item(7, "2026-10-04T10:00:00Z")]),
         |_| Err("boom".into()),
     );
     assert_eq!(out, PollOutcome::Failed("boom".into()));
-    assert_eq!(load_cursor(dir.path()).as_deref(), Some("2026-10-04T09:00:00Z"));
+    assert_eq!(cursor_at(dir.path()).as_deref(), Some("2026-10-04T09:00:00Z"));
 }
 
 #[test]
 fn failed_listing_holds_the_cursor() {
     let dir = tempfile::tempdir().unwrap();
-    let out = poll_with(dir.path(), now(), |_| Err("rate".into()), |_| Ok(()));
+    let out = poll_with(dir.path(), now(), |_, _| Err("rate".into()), |_| Ok(()));
     assert_eq!(out, PollOutcome::Failed("rate".into()));
     assert_eq!(load_cursor(dir.path()), None);
+}
+
+/// A read failing mid-walk fails the whole pass: nothing is scanned and the
+/// cursor holds, rather than advancing over the rows already read.
+#[test]
+fn failed_later_page_holds_the_cursor_and_scans_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    save_at(dir.path(), "2026-10-04T09:00:00Z");
+    let rows: Vec<ClosedItem> = (1..=150)
+        .map(|n| item(n, &plus("2026-10-04T10:00:00Z", n)))
+        .collect();
+    let calls = RefCell::new(0);
+    let out = poll_with(
+        dir.path(),
+        now(),
+        |since, page| {
+            *calls.borrow_mut() += 1;
+            if *calls.borrow() == 2 {
+                return Err("rate".into());
+            }
+            Ok(serve(&rows, since, page))
+        },
+        |_| panic!("a partial walk must not scan"),
+    );
+    assert_eq!(out, PollOutcome::Failed("rate".into()));
+    assert_eq!(cursor_at(dir.path()).as_deref(), Some("2026-10-04T09:00:00Z"));
+}
+
+/// Run polls over `rows` until one is idle; return how many times each number
+/// was scanned and the largest number of requests any one poll made.
+fn drain(
+    root: &Path,
+    rows: &RefCell<Vec<ClosedItem>>,
+    max_ticks: usize,
+) -> (HashMap<i64, usize>, usize) {
+    let mut scanned: HashMap<i64, usize> = HashMap::new();
+    let mut max_requests = 0;
+    for _ in 0..max_ticks {
+        let requests = RefCell::new(0);
+        let out = poll_with(
+            root,
+            now(),
+            |since, page| {
+                *requests.borrow_mut() += 1;
+                Ok(serve(&rows.borrow(), since, page))
+            },
+            |batch| {
+                for i in batch {
+                    *scanned.entry(i.number).or_default() += 1;
+                }
+                Ok(())
+            },
+        );
+        max_requests = max_requests.max(requests.into_inner());
+        match out {
+            PollOutcome::Idle => return (scanned, max_requests),
+            PollOutcome::Scanned { .. } => {}
+            PollOutcome::Failed(e) => panic!("unexpected failure: {e}"),
+        }
+    }
+    panic!("still scanning after {max_ticks} polls");
+}
+
+/// Judge P1 on #10180 / #10638. 500 rows closed 10:00 and updated 11:00 fill
+/// the 5-page cap; #501 closed 10:30 but was updated (commented on) at 11:30,
+/// so the capped first pass never lists it. The old filter (`closed_at >=
+/// cursor`, cursor = max `updated_at`) then rejected #501 on the next pass
+/// (10:30 < 11:00) and skipped it forever. With one key for both, the second
+/// pass takes it, after paging past the same-second run (more than five pages).
+#[test]
+fn capped_listing_never_drops_a_close_updated_past_the_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    save_at(dir.path(), "2026-10-04T09:00:00Z");
+    let mut rows: Vec<ClosedItem> = (1..=500).map(|n| item(n, "2026-10-04T11:00:00Z")).collect();
+    rows.push(item(501, "2026-10-04T11:30:00Z"));
+
+    let requests = RefCell::new(Vec::new());
+    let poll = |scanned: &mut Vec<i64>| {
+        requests.borrow_mut().clear();
+        poll_with(
+            dir.path(),
+            now(),
+            |since, page| {
+                requests.borrow_mut().push(page);
+                Ok(serve(&rows, since, page))
+            },
+            |batch| {
+                scanned.extend(batch.iter().map(|i| i.number));
+                Ok(())
+            },
+        )
+    };
+
+    // Pass 1: the cap stops at the first 500 rows.
+    let mut first = Vec::new();
+    assert_eq!(poll(&mut first), PollOutcome::Scanned { closed: 500 });
+    assert!(!first.contains(&501));
+    assert_eq!(cursor_at(dir.path()).as_deref(), Some("2026-10-04T11:00:00Z"));
+
+    // Pass 2: #501 is taken, and only #501 (the 500 are not rescanned).
+    let mut second = Vec::new();
+    assert_eq!(poll(&mut second), PollOutcome::Scanned { closed: 1 });
+    assert_eq!(second, vec![501]);
+    assert!(
+        requests.borrow().iter().any(|p| *p > MAX_PAGES),
+        "must page past the same-second run: {:?}",
+        requests.borrow()
+    );
+    assert_eq!(cursor_at(dir.path()).as_deref(), Some("2026-10-04T11:30:00Z"));
+
+    // Pass 3: nothing left.
+    assert_eq!(poll(&mut Vec::new()), PollOutcome::Idle);
+}
+
+/// Equal-timestamp boundaries: same-second runs of several lengths, including
+/// runs straddling every page and cap boundary, are each scanned exactly once
+/// across polls, and no poll exceeds the request bound.
+#[test]
+fn same_second_runs_across_page_boundaries_are_scanned_exactly_once() {
+    for (total, per_second) in [(700, 700), (1200, 1), (1000, 7), (1050, 150), (520, 100)] {
+        let dir = tempfile::tempdir().unwrap();
+        save_at(dir.path(), "2026-10-04T09:00:00Z");
+        let rows: Vec<ClosedItem> = (1..=total)
+            .map(|n| item(n, &plus("2026-10-04T09:30:00Z", (n - 1) / per_second)))
+            .collect();
+        let rows = RefCell::new(rows);
+        let (scanned, max_requests) = drain(dir.path(), &rows, 50);
+        let case = format!("{total} rows, {per_second} per second");
+        assert_eq!(scanned.len(), usize::try_from(total).unwrap(), "{case}: every row scanned");
+        assert!(scanned.values().all(|c| *c == 1), "{case}: no row scanned twice");
+        assert!(max_requests <= MAX_REQUESTS, "{case}: {max_requests} requests");
+    }
+}
+
+/// An update during a walk moves a row to the end of the listing, shifting
+/// every later page by one. Numbered paging then skips the row that slid onto
+/// the previous page; the re-anchored walk does not.
+#[test]
+fn update_reordering_the_listing_mid_walk_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    save_at(dir.path(), "2026-10-04T09:00:00Z");
+    let rows = RefCell::new(
+        (1..=300)
+            .map(|n| item(n, &plus("2026-10-04T10:00:00Z", n)))
+            .collect::<Vec<_>>(),
+    );
+    let first = RefCell::new(true);
+    let mut scanned: HashSet<i64> = HashSet::new();
+    let out = poll_with(
+        dir.path(),
+        now(),
+        |since, page| {
+            let out = serve(&rows.borrow(), since, page);
+            if first.replace(false) {
+                // #50 (already on page 1) is commented on after page 1 is read.
+                rows.borrow_mut()[49].updated_at = ts("2026-10-04T11:59:00Z");
+            }
+            Ok(out)
+        },
+        |batch| {
+            scanned.extend(batch.iter().map(|i| i.number));
+            Ok(())
+        },
+    );
+    assert_eq!(out, PollOutcome::Scanned { closed: 300 });
+    assert_eq!(scanned, (1..=300).collect::<HashSet<_>>());
 }
 
 #[test]
@@ -151,7 +377,11 @@ fn parse_page_reads_issues_and_prs_and_drops_open_items() {
     let items = parse_page(json).unwrap();
     assert_eq!(items.iter().map(|i| i.number).collect::<Vec<_>>(), vec![1, 2]);
     assert!(!items[0].merged_pr && items[1].merged_pr);
+    assert_eq!(items[0].updated_at, ts("2026-10-04T10:01:00Z"));
     assert!(parse_page(b"nope").is_err());
+    // An unreadable updated_at fails the page instead of guessing a key.
+    let bad = br#"[{"number":1,"closed_at":"2026-10-04T10:00:00Z","updated_at":"later"}]"#;
+    assert!(parse_page(bad).is_err());
 }
 
 #[test]
@@ -280,7 +510,7 @@ impl World {
         poll_with(
             root,
             now(),
-            |_| Ok(listing),
+            |since, page| Ok(serve(&listing, since, page)),
             |fresh| {
                 scan_fresh(
                     fresh,
@@ -326,10 +556,10 @@ impl World {
     }
 }
 
-fn merged(n: i64, closed: &str, updated: &str) -> ClosedItem {
+fn merged(n: i64, updated: &str) -> ClosedItem {
     ClosedItem {
         merged_pr: true,
-        ..item(n, closed, updated)
+        ..item(n, updated)
     }
 }
 
@@ -341,14 +571,9 @@ fn failed_candidate_read_holds_cursor_then_retry_posts_once() {
     let root = tempfile::tempdir().unwrap();
     let (none, targets) = (HashSet::new(), HashMap::new());
     // #300 is an unrelated close updated later in the same window, so a
-    // wrongly-advanced cursor would land on 11:00, past #200's 10:00 close.
-    let listing = || {
-        vec![
-            item(200, "2026-10-04T10:00:00Z", "2026-10-04T10:00:00Z"),
-            item(300, "2026-10-04T10:30:00Z", LATEST),
-        ]
-    };
-    save_cursor(root.path(), SINCE).unwrap();
+    // wrongly-advanced cursor would land on 11:00, past #200's 10:00 key.
+    let listing = || vec![item(200, "2026-10-04T10:00:00Z"), item(300, LATEST)];
+    save_at(root.path(), SINCE);
     let mut world = World {
         comments_fail: true,
         ..World::default()
@@ -357,7 +582,7 @@ fn failed_candidate_read_holds_cursor_then_retry_posts_once() {
     // Pass 1: #201's comment read fails transiently.
     let out = world.poll(root.path(), listing(), &none, &targets);
     assert!(matches!(out, PollOutcome::Failed(_)), "{out:?}");
-    assert_eq!(load_cursor(root.path()).as_deref(), Some(SINCE), "cursor must hold");
+    assert_eq!(cursor_at(root.path()).as_deref(), Some(SINCE), "cursor must hold");
     assert!(world.posted.is_empty());
 
     // Pass 2: the read recovers; the notice is actually posted.
@@ -369,15 +594,15 @@ fn failed_candidate_read_holds_cursor_then_retry_posts_once() {
     assert!(world.posted[0]
         .1
         .contains("<!-- loom:blocker-cleared:#200 -->"));
-    assert_eq!(load_cursor(root.path()).as_deref(), Some(LATEST));
+    assert_eq!(cursor_at(root.path()).as_deref(), Some(LATEST));
 
-    // Pass 3: the same listing again. #200's close is now behind the cursor.
+    // Pass 3: the same listing again. Both keys are now behind the cursor.
     let out = world.poll(root.path(), listing(), &none, &targets);
     assert_eq!(out, PollOutcome::Idle);
 
-    // Pass 4: #200 re-listed as a fresh close (reopened and re-closed): the
+    // Pass 4: #200 updated again (a comment, or reopened and re-closed): the
     // scan runs, but the marker on #201 makes it a no-op.
-    let relisted = vec![item(200, "2026-10-04T11:30:00Z", "2026-10-04T11:30:00Z")];
+    let relisted = vec![item(200, "2026-10-04T11:30:00Z")];
     let out = world.poll(root.path(), relisted, &none, &targets);
     assert_eq!(out, PollOutcome::Scanned { closed: 1 });
     assert_eq!(world.posted.len(), 1, "no duplicate notice");
@@ -388,19 +613,14 @@ fn failed_closing_reference_expansion_holds_cursor_then_retry_posts() {
     let root = tempfile::tempdir().unwrap();
     // Merged PR #400 closed #200; only the expansion names #200 here.
     let targets = HashMap::from([(400, vec![200])]);
-    let listing = || {
-        vec![
-            merged(400, "2026-10-04T10:00:00Z", "2026-10-04T10:00:00Z"),
-            item(300, "2026-10-04T10:30:00Z", LATEST),
-        ]
-    };
-    save_cursor(root.path(), SINCE).unwrap();
+    let listing = || vec![merged(400, "2026-10-04T10:00:00Z"), item(300, LATEST)];
+    save_at(root.path(), SINCE);
     let mut world = World::default();
 
     // Pass 1: PR #400's closing-reference read fails.
     let out = world.poll(root.path(), listing(), &HashSet::from([400]), &targets);
     assert!(matches!(out, PollOutcome::Failed(_)), "{out:?}");
-    assert_eq!(load_cursor(root.path()).as_deref(), Some(SINCE), "cursor must hold");
+    assert_eq!(cursor_at(root.path()).as_deref(), Some(SINCE), "cursor must hold");
     assert!(world.posted.is_empty());
 
     // Pass 2: expansion recovers; #201 is notified about #200.
@@ -408,7 +628,7 @@ fn failed_closing_reference_expansion_holds_cursor_then_retry_posts() {
     assert_eq!(out, PollOutcome::Scanned { closed: 2 });
     assert_eq!(world.posted.len(), 1);
     assert_eq!(world.posted[0].0, 201);
-    assert_eq!(load_cursor(root.path()).as_deref(), Some(LATEST));
+    assert_eq!(cursor_at(root.path()).as_deref(), Some(LATEST));
 
     // Pass 3: nothing new; no duplicate.
     let out = world.poll(root.path(), listing(), &HashSet::new(), &targets);

@@ -9,19 +9,30 @@
 //!
 //! * REST only (`gh api repos/.../issues?state=closed&since=...`; the endpoint
 //!   returns issues and PRs together), so it works under GraphQL exhaustion.
-//! * The cursor is the max `updated_at` seen. `closed_at <= updated_at`, so an
-//!   item closed after the cursor is always in the next window, whatever
-//!   page-cap truncation did. "Newly closed" is `closed_at >= since`; a
-//!   re-listed old close is harmless because the notify marker dedupes.
-//! * The first run looks back [`LOOKBACK_HOURS`] only, and a pass reads at
-//!   most [`MAX_PAGES`] pages.
-//! * The cursor advances only after a successful scan, so a failed tick
-//!   retries. "Successful" means every required read answered: the listing,
-//!   each merged PR's closing references, the `loom:blocked` listing,
-//!   every candidate's text/evidence read, and every owed comment post. Any
-//!   one unanswered holds the cursor; the marker keeps the retry from
-//!   re-posting what this pass already posted. With nothing newly closed
-//!   there is no `loom:blocked` read at all.
+//! * One ordering key for everything: `(updated_at, number)`. The listing is
+//!   sorted by `updated_at`, the [`Cursor`] is the highest key processed (the
+//!   max `updated_at` plus the numbers already taken AT that second), and an
+//!   item is in the batch iff its key is past the cursor. `closed_at` is
+//!   deliberately not a filter: a capped listing ordered by `updated_at`
+//!   cannot be cut by `closed_at` without dropping an unseen close whose
+//!   later update pushed it past the cap (#10638, Judge P1 on #10180). The
+//!   cost is that a comment on an old closed item rescans its number; the
+//!   per-number `<!-- loom:blocker-cleared:#N -->` marker makes that rescan
+//!   post nothing it already posted.
+//! * Keyset paging, so truncation and reordering lose nothing: each request
+//!   re-anchors `since` at the cursor (less 1s, so an exclusive `since` also
+//!   works) instead of walking page numbers over a list that moves under
+//!   updates; page numbers only advance inside one same-second run. A pass
+//!   takes at most [`MAX_PAGES`] pages of new rows (and [`MAX_REQUESTS`]
+//!   requests); whatever it did not reach is still past the cursor next tick.
+//! * The first run looks back [`LOOKBACK_HOURS`] only.
+//! * The cursor advances only after a successful scan, and only to the key of
+//!   what was scanned, so a failed tick retries. "Successful" means every
+//!   required read answered: the listing, each merged PR's closing
+//!   references, the `loom:blocked` listing, every candidate's text/evidence
+//!   read, and every owed comment post. Any one unanswered holds the cursor;
+//!   the marker keeps the retry from re-posting what this pass already
+//!   posted. With nothing past the cursor there is no `loom:blocked` read.
 //! * Two hosts polling one repo can both post in the check-then-post window;
 //!   a duplicate notice is harmless and accepted by design.
 //! * Never edits a label; every failure is logged, never fatal.
@@ -30,6 +41,7 @@
 //! `LOOM_CLOSED_WATCH` / `LOOM_CLOSED_WATCH_INTERVAL_SECS` (env > config >
 //! default; default off).
 
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -48,8 +60,11 @@ pub(crate) const DEFAULT_INTERVAL_SECS: u64 = 300;
 /// First-run lookback.
 pub(crate) const LOOKBACK_HOURS: i64 = 24;
 const PAGE_SIZE: usize = 100;
-/// Hard bound on pages read in one pass.
+/// Bound on pages carrying new rows taken in one pass.
 const MAX_PAGES: usize = 5;
+/// Hard bound on requests in one pass, counting the pages that only re-read
+/// rows already at the cursor (a same-second run longer than a page).
+const MAX_REQUESTS: usize = MAX_PAGES * 4;
 const CURSOR_FILE: &str = "closed-watch-cursor.json";
 
 /// `autonomous.closedWatch` as read from config.
@@ -102,8 +117,7 @@ fn resolve_interval_secs(env: Option<&str>, config: &ClosedWatchConfig) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClosedItem {
     pub number: i64,
-    pub closed_at: String,
-    pub updated_at: String,
+    pub updated_at: DateTime<Utc>,
     pub merged_pr: bool,
 }
 
@@ -124,23 +138,29 @@ struct RawPr {
     merged_at: Option<String>,
 }
 
-/// Parse one REST page. Pure. Items with no `closed_at` are dropped.
+fn parse_ts(s: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(|e| format!("unreadable timestamp {s:?}: {e}"))
+}
+
+/// Parse one REST page. Pure. Items with no `closed_at` are dropped; an
+/// unreadable `updated_at` fails the page (the cursor must not guess).
 pub(crate) fn parse_page(stdout: &[u8]) -> Result<Vec<ClosedItem>, String> {
     let raw: Vec<RawItem> =
         serde_json::from_slice(stdout).map_err(|e| format!("unreadable closed-items JSON: {e}"))?;
-    Ok(raw
-        .into_iter()
-        .filter_map(|r| {
-            let closed_at = r.closed_at?;
-            let updated_at = r.updated_at.unwrap_or_else(|| closed_at.clone());
-            Some(ClosedItem {
-                number: r.number,
-                closed_at,
-                updated_at,
-                merged_pr: r.pull_request.is_some_and(|p| p.merged_at.is_some()),
-            })
-        })
-        .collect())
+    let mut out = Vec::with_capacity(raw.len());
+    for r in raw {
+        let Some(closed_at) = r.closed_at else {
+            continue;
+        };
+        out.push(ClosedItem {
+            number: r.number,
+            updated_at: parse_ts(r.updated_at.as_deref().unwrap_or(&closed_at))?,
+            merged_pr: r.pull_request.is_some_and(|p| p.merged_at.is_some()),
+        });
+    }
+    Ok(out)
 }
 
 fn fmt_ts(t: DateTime<Utc>) -> String {
@@ -151,112 +171,169 @@ fn cursor_path(root: &Path) -> PathBuf {
     root.join(".loom").join(CURSOR_FILE)
 }
 
-/// Persisted cursor, if present and parseable.
-pub(crate) fn load_cursor(root: &Path) -> Option<String> {
+/// Position in the `(updated_at, number)` order: everything at or before it
+/// has been scanned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Cursor {
+    /// Highest `updated_at` scanned.
+    pub at: DateTime<Utc>,
+    /// Numbers already scanned whose `updated_at` is exactly [`Self::at`], so
+    /// the rest of a same-second run cut by the page cap is still taken and
+    /// the part already taken is not.
+    pub seen: BTreeSet<i64>,
+}
+
+impl Cursor {
+    fn starting_at(at: DateTime<Utc>) -> Self {
+        Self {
+            at,
+            seen: BTreeSet::new(),
+        }
+    }
+
+    /// Whether `item`'s key is past this cursor.
+    pub(crate) fn admits(&self, item: &ClosedItem) -> bool {
+        item.updated_at > self.at
+            || (item.updated_at == self.at && !self.seen.contains(&item.number))
+    }
+
+    /// Move past `item` (which this cursor admits).
+    fn take(&mut self, item: &ClosedItem) {
+        if item.updated_at > self.at {
+            self.at = item.updated_at;
+            self.seen.clear();
+        }
+        self.seen.insert(item.number);
+    }
+}
+
+/// Persisted cursor, if present and parseable. A file without `seen` (the
+/// first #10150 format) loads with an empty set: the items at that second are
+/// rescanned once, which the marker makes a no-op.
+pub(crate) fn load_cursor(root: &Path) -> Option<Cursor> {
     let text = std::fs::read_to_string(cursor_path(root)).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let c = v.get("cursor")?.as_str()?.to_string();
-    DateTime::parse_from_rfc3339(&c).ok()?;
-    Some(c)
+    let at = parse_ts(v.get("cursor")?.as_str()?).ok()?;
+    let seen = match v.get("seen") {
+        None => BTreeSet::new(),
+        Some(s) => serde_json::from_value(s.clone()).ok()?,
+    };
+    Some(Cursor { at, seen })
 }
 
 /// Atomically persist the cursor (tmp + rename).
-pub(crate) fn save_cursor(root: &Path, cursor: &str) -> std::io::Result<()> {
+pub(crate) fn save_cursor(root: &Path, cursor: &Cursor) -> std::io::Result<()> {
     let path = cursor_path(root);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::json!({ "cursor": cursor }).to_string())?;
+    let body = serde_json::json!({ "cursor": fmt_ts(cursor.at), "seen": cursor.seen });
+    std::fs::write(&tmp, body.to_string())?;
     std::fs::rename(&tmp, &path)
 }
 
-/// List closed items updated since `since`, oldest-updated first, bounded by
-/// [`MAX_PAGES`]. `Err` is a failed read (the caller must not advance).
-fn list_closed_rest(
+/// One REST page of closed items updated at or after `since`, oldest-updated
+/// first. `Err` is a failed read (the caller must not advance).
+fn fetch_closed_page(
     root: &Path,
     repo: Option<&str>,
     since: &str,
+    page: usize,
 ) -> Result<Vec<ClosedItem>, String> {
     let slug = repo.map_or_else(|| "{owner}/{repo}".to_string(), str::to_string);
-    let mut all = Vec::new();
-    for page in 1..=MAX_PAGES {
-        let endpoint = format!(
-            "repos/{slug}/issues?state=closed&since={since}&sort=updated&direction=asc\
-             &per_page={PAGE_SIZE}&page={page}"
-        );
-        let out = match run_gh(&["api", &endpoint], root, false) {
-            CmdOutcome::Ran(o) if o.status.success() => o.stdout,
-            CmdOutcome::Ran(o) => return Err(format!("gh api exited {}", o.status)),
-            CmdOutcome::Unavailable(u) => return Err(format!("gh api could not be run: {u:?}")),
-        };
-        let raw_len = serde_json::from_slice::<Vec<serde_json::Value>>(&out)
-            .map_err(|e| format!("unreadable closed-items JSON: {e}"))?
-            .len();
-        all.extend(parse_page(&out)?);
-        if raw_len < PAGE_SIZE {
+    let endpoint = format!(
+        "repos/{slug}/issues?state=closed&since={since}&sort=updated&direction=asc\
+         &per_page={PAGE_SIZE}&page={page}"
+    );
+    match run_gh(&["api", &endpoint], root, false) {
+        CmdOutcome::Ran(o) if o.status.success() => parse_page(&o.stdout),
+        CmdOutcome::Ran(o) => Err(format!("gh api exited {}", o.status)),
+        CmdOutcome::Unavailable(u) => Err(format!("gh api could not be run: {u:?}")),
+    }
+}
+
+/// Keyset walk from `start`: everything the listing holds past `start`, in
+/// key order, bounded by [`MAX_PAGES`] / [`MAX_REQUESTS`], plus the cursor
+/// that covers exactly what was returned. `fetch(since, page)` is one page of
+/// the forge listing. Each request re-anchors `since` at the walk's cursor, so
+/// rows the cap cut off, or that an update moved later mid-walk, are still past
+/// the returned cursor. A same-second run longer than a page cannot move the
+/// anchor, so only then does the page number advance.
+pub(crate) fn walk(
+    start: &Cursor,
+    mut fetch: impl FnMut(&str, usize) -> Result<Vec<ClosedItem>, String>,
+) -> Result<(Vec<ClosedItem>, Cursor), String> {
+    let mut cur = start.clone();
+    let mut batch: Vec<ClosedItem> = Vec::new();
+    let mut in_batch: HashSet<i64> = HashSet::new();
+    let (mut page, mut pages_taken) = (1, 0);
+    for _ in 0..MAX_REQUESTS {
+        // Less 1s: correct whether the forge's `since` is inclusive or not.
+        let since = fmt_ts(cur.at - ChronoDuration::seconds(1));
+        let mut rows = fetch(&since, page)?;
+        let full = rows.len() >= PAGE_SIZE;
+        rows.sort_by_key(|r| (r.updated_at, r.number));
+        let anchor = cur.at;
+        let mut took = false;
+        for r in rows {
+            if !cur.admits(&r) {
+                continue;
+            }
+            cur.take(&r);
+            took = true;
+            // Updated again mid-walk: one scan of the number is enough.
+            if in_batch.insert(r.number) {
+                batch.push(r);
+            }
+        }
+        pages_taken += usize::from(took);
+        if !full || pages_taken >= MAX_PAGES {
             break;
         }
+        page = if cur.at == anchor { page + 1 } else { 1 };
     }
-    Ok(all)
+    Ok((batch, cur))
 }
 
 /// What one poll did.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PollOutcome {
-    /// Nothing newly closed; no scan was run.
+    /// Nothing past the cursor; no scan was run.
     Idle,
-    /// Scanned this many newly closed numbers; cursor advanced.
+    /// Scanned this many closed numbers; cursor advanced past them.
     Scanned { closed: usize },
     /// The listing or the scan failed; cursor unchanged (retry next tick).
     Failed(String),
 }
 
-/// One poll against injected seams: `list(since)` returns closed items,
-/// `scan(closed_numbers)` runs the re-check and returns `Err` if it should be
-/// retried. Cursor advances only on success.
+/// One poll against injected seams: `fetch(since, page)` is one page of the
+/// closed listing (see [`walk`]), `scan(batch)` runs the re-check and returns
+/// `Err` if it should be retried. The cursor advances only on success, and
+/// only to the key of the batch it scanned.
 pub(crate) fn poll_with(
     root: &Path,
     now: DateTime<Utc>,
-    list: impl FnOnce(&str) -> Result<Vec<ClosedItem>, String>,
+    fetch: impl FnMut(&str, usize) -> Result<Vec<ClosedItem>, String>,
     scan: impl FnOnce(&[ClosedItem]) -> Result<(), String>,
 ) -> PollOutcome {
-    let since =
-        load_cursor(root).unwrap_or_else(|| fmt_ts(now - ChronoDuration::hours(LOOKBACK_HOURS)));
-    let items = match list(&since) {
-        Ok(i) => i,
+    let start = load_cursor(root)
+        .unwrap_or_else(|| Cursor::starting_at(now - ChronoDuration::hours(LOOKBACK_HOURS)));
+    let (batch, next) = match walk(&start, fetch) {
+        Ok(w) => w,
         Err(e) => return PollOutcome::Failed(e),
     };
-    // `since` was already filtered server-side on updated_at; closed_at picks
-    // out real closes from mere comments on old closed items.
-    let fresh: Vec<ClosedItem> = items
-        .iter()
-        .filter(|i| i.closed_at.as_str() >= since.as_str())
-        .cloned()
-        .collect();
-    let next = items
-        .iter()
-        .map(|i| i.updated_at.as_str())
-        .max()
-        .unwrap_or(&since)
-        .max(&since)
-        .to_string();
-    if !fresh.is_empty() {
-        if let Err(e) = scan(&fresh) {
-            return PollOutcome::Failed(e);
-        }
+    if batch.is_empty() {
+        return PollOutcome::Idle;
     }
-    if next != since {
-        if let Err(e) = save_cursor(root, &next) {
-            return PollOutcome::Failed(format!("could not persist cursor: {e}"));
-        }
+    if let Err(e) = scan(&batch) {
+        return PollOutcome::Failed(e);
     }
-    if fresh.is_empty() {
-        PollOutcome::Idle
-    } else {
-        PollOutcome::Scanned {
-            closed: fresh.len(),
-        }
+    if let Err(e) = save_cursor(root, &next) {
+        return PollOutcome::Failed(format!("could not persist cursor: {e}"));
+    }
+    PollOutcome::Scanned {
+        closed: batch.len(),
     }
 }
 
@@ -267,7 +344,7 @@ pub(crate) fn poll_once(root: &Path) -> PollOutcome {
     let outcome = poll_with(
         root,
         Utc::now(),
-        |since| list_closed_rest(root, repo, since),
+        |since, page| fetch_closed_page(root, repo, since, page),
         |fresh| {
             scan_fresh(fresh, &mut |pr| pr_close_targets(pr, repo, root), |closed| {
                 let opts = ScanOptions {
@@ -287,7 +364,7 @@ pub(crate) fn poll_once(root: &Path) -> PollOutcome {
     outcome
 }
 
-/// The re-check for one batch of fresh closes: expand each merged PR to the
+/// The re-check for one batch of closed items past the cursor: expand each merged PR to the
 /// issues it closed (`close_targets`), run `scan` once over the whole closed
 /// set, and return `Err` when the cursor must hold.
 pub(crate) fn scan_fresh(
@@ -317,8 +394,8 @@ pub(crate) fn scan_fresh(
     }
     // Any unanswered read holds the cursor: an unexpanded merged PR may have
     // closed an issue someone cites, and an unread candidate may cite a
-    // closed number. Advancing past either would drop that close event for
-    // good (`closed_at < since` on every later tick).
+    // closed number. Advancing past either would drop that close event
+    // until the item happens to be updated again.
     if !unread.is_empty() || rep.needs_retry(false) {
         Err(format!(
             "{} read(s) unanswered or a comment post failed",
