@@ -1826,7 +1826,22 @@ coding plan) and, when absent, treats a profile that reads a provider
 credential as metered (`api`/`api-key`) and a credential-less one as
 `unknown`. An LLM-gateway route is always `api`/`api-key`. Usage spans copy
 the class from the launch's `loom.runtime.run` span (role ticks: from the
-launch record's `llmBilling`/`llmCredentialKind`, else the runtime). Only this
+launch record's `llmBilling`/`llmCredentialKind`, else the runtime), and only
+when that launch is established — otherwise they say `unknown`:
+
+- **`execution` scope** totals every launch of the sweep per model and cannot
+  split them, so it carries the class *all* of the execution's runs share; a
+  sweep with differently billed launches (or an unstamped run) is `unknown`,
+  and `llm.credential.kind` / `llm.provider.profile` are kept only when every
+  run shares them. For such a sweep, split cash from subscription with its
+  `attempt` spans.
+- **`attempt` scope** takes the runs in the attempt's own span ancestry (a run
+  under the `loom.role_attempt`, or the run it sits under), else a run that
+  belongs to no attempt and whose interval encloses the attempt's. Those must
+  agree; none, or a disagreement, is `unknown`. A run under another attempt is
+  never borrowed.
+
+Count `unknown` separately — never as `api` nor as `subscription`. Only this
 closed vocabulary and the profile name are emitted: no key value, account
 name or token path. Sum metered spend per day with
 `llm.billing = api` grouped by `llm.provider.profile`.

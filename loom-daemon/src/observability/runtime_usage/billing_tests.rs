@@ -88,7 +88,7 @@ fn each_billing_class_reaches_the_execution_usage_span() {
 }
 
 #[test]
-fn a_run_without_billing_stamps_nothing_on_its_usage_span() {
+fn a_run_without_billing_states_unknown_on_its_usage_span() {
     let tmp = tempfile::tempdir().unwrap();
     let store = TraceStore::new(tmp.path());
     let saved = store.load_or_create(tmp.path(), "sweep-x").unwrap();
@@ -108,5 +108,6 @@ fn a_run_without_billing_stamps_nothing_on_its_usage_span() {
         .unwrap();
     let window = (Utc::now() - Duration::hours(1), Utc::now());
     let spans = journal_usage(tmp.path(), "sweep-x", window, Some(&[row()]), None).unwrap();
-    assert!(!spans[0].attributes.contains_key("llm.billing"));
+    assert_eq!(spans[0].attributes["llm.billing"], "unknown");
+    assert!(!spans[0].attributes.contains_key("llm.credential.kind"));
 }

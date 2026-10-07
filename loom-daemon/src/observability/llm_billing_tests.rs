@@ -63,3 +63,25 @@ fn parse_rejects_free_text() {
     let b = LlmBilling::parse("api", Some("/home/x/token"), None).unwrap();
     assert_eq!(b.credential_kind, None);
 }
+
+#[test]
+fn launches_that_disagree_on_billing_agree_on_unknown() {
+    let sub = LlmBilling::for_runtime("claude", None, false);
+    let api = LlmBilling::native(Some("quick-cerebras"), None, true, "pool");
+    assert_eq!(LlmBilling::agreed([sub.clone(), api]), LlmBilling::unknown());
+    assert_eq!(LlmBilling::agreed([]), LlmBilling::unknown());
+    assert_eq!(LlmBilling::agreed([sub.clone(), sub.clone()]), sub);
+    // An unstamped launch is unknown, so it never yields to a stamped one.
+    let unstamped = LlmBilling::of_launch(&TraceAttributes::new());
+    assert_eq!(LlmBilling::agreed([sub, unstamped]), LlmBilling::unknown());
+}
+
+#[test]
+fn agreed_keeps_only_the_shared_kind_and_profile() {
+    let a = LlmBilling::native(Some("quick-cerebras"), None, true, "pool");
+    let b = LlmBilling::native(Some("gemini-flash"), None, true, "pool");
+    let agreed = LlmBilling::agreed([a, b]);
+    assert_eq!(agreed.billing, "api");
+    assert_eq!(agreed.credential_kind.as_deref(), Some("api-key"));
+    assert_eq!(agreed.profile, None);
+}

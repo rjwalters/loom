@@ -115,6 +115,42 @@ impl LlmBilling {
         Some(Self::new(billing, kind.and_then(known_kind), profile))
     }
 
+    /// Nothing establishes how the usage was billed.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::new("unknown", None, None)
+    }
+
+    /// A launch span's class; a span that carries none is `unknown`.
+    #[must_use]
+    pub fn of_launch(attributes: &TraceAttributes) -> Self {
+        Self::from_attributes(attributes).unwrap_or_else(Self::unknown)
+    }
+
+    /// The class every launch in `launches` agrees on, for usage that cannot
+    /// be split between them. Launches billed differently (or none at all)
+    /// give `unknown`; a credential kind or profile is kept only when every
+    /// launch shares it. Never picks one launch's class for all of them.
+    #[must_use]
+    pub fn agreed(launches: impl IntoIterator<Item = Self>) -> Self {
+        let mut launches = launches.into_iter();
+        let Some(mut agreed) = launches.next() else {
+            return Self::unknown();
+        };
+        for launch in launches {
+            if launch.billing != agreed.billing {
+                return Self::unknown();
+            }
+            if launch.credential_kind != agreed.credential_kind {
+                agreed.credential_kind = None;
+            }
+            if launch.profile != agreed.profile {
+                agreed.profile = None;
+            }
+        }
+        agreed
+    }
+
     pub fn stamp(&self, attributes: &mut TraceAttributes) {
         attributes.insert(BILLING_KEY.into(), self.billing.clone());
         if let Some(kind) = &self.credential_kind {
@@ -133,13 +169,6 @@ impl LlmBilling {
             attributes.get(CREDENTIAL_KIND_KEY).map(String::as_str),
             attributes.get(PROFILE_KEY).map(String::as_str),
         )
-    }
-}
-
-/// Copy the billing keys from `source` into `common` (no-op when absent).
-pub fn copy_into(source: &TraceAttributes, common: &mut TraceAttributes) {
-    if let Some(billing) = LlmBilling::from_attributes(source) {
-        billing.stamp(common);
     }
 }
 
