@@ -344,9 +344,23 @@ fixture. A behaviour change is a new id registered beside the old one
      (`--pr-history` / `--forge-pr-cases`) can be in them; compare them with
      `labels_known`, the cases whose labels were reconstructed, not with
      `overall`. A star that reaches the PR only through its linked issue is
-     not seen. The labels select cases only and are not fed to the
-     estimator. The section is absent when no case is held and none knows
-     its labels.
+     not seen by `starred`. The labels select cases only and are not fed to
+     the estimator.
+     Three more subsets split the cases by the `eta-fit/v2` input
+     `starred_any` (PR **or linked-issue** star, read point-in-time by the
+     one priority-input builder, #10508): **`starred_any`** (known on),
+     **`unstarred_any`** (known off) and **`star_any_unknown`** (the case
+     carries priority inputs but the star is unknown; it is never counted
+     as unstarred). Only cases that carry priority inputs
+     (`--pr-history` / `--forge-pr-cases`) can be in them. The section is
+     absent when no case is held, none knows its labels and none carries
+     priority inputs.
+   - **paired by subset** (`paired_by_subset`, `--compare` only, #10508):
+     inside each subset, the two heuristics' deciding loss (`pinball4`)
+     with the `b − a` difference and its 95% issue-bootstrap interval and
+     distinct-issue count, and both late-surprise rates, each over the
+     cases of the subset both sides decided. A report only: `better` does
+     not read it.
 3. **Let it run in shadow** — from the moment it is registered, the tracker
    estimates **every** heuristic of the kind at the same `as_of` for the same
    subject. Each is its own `eta.estimate`; only `current`'s carries
@@ -1518,6 +1532,38 @@ for a fit or backtest to report.
   Still open in #10508: the walk-forward backtest against twin-otter-b; and
   live evidence that the ETA authority, the loom-ui chooser and the nightly
   scoring pick the new id up.
+- **Backtest decision rule (predeclared, #10508).** Stated before the run,
+  so the result cannot pick its own bar. The run is
+  `eta backtest --heuristic land-2026-10-04-twin-otter-b --compare
+  land-2026-10-06-keen-wren --forge-pr-cases …` over the walk-forward folds
+  in 2AMLogic/loom-experiments. `--forge-pr-cases` reads through `gh`, so
+  it runs as whatever `GH_TOKEN` holds: set it to a GitHub App installation
+  token (2AMLogic/loom-experiments#15), never the operator token. Or replay
+  records an App-authenticated run saved with `--pr-history`. `a` is twin-otter-b, `b` is keen-wren; every figure below
+  is in the comparison report.
+  - *Pinball (primary).* keen-wren **beats** twin-otter-b when the 95%
+    issue-bootstrap interval of `paired.delta_pinball4_loss_sec` lies
+    wholly below 0. It **matches** when that interval's upper bound is at
+    most 5% of twin-otter-b's `paired.a_mean_pinball4_loss_sec` (the
+    non-inferiority margin). Otherwise it fails. Its answer rate must not
+    fall more than `ANSWER_RATE_SLACK` (1 point) below twin-otter-b's.
+  - *Starred items.* From `paired_by_subset.starred_any`: keen-wren's
+    `b_late_rate` must not exceed twin-otter-b's `a_late_rate`; the target
+    it moves toward is ≤ 15%.
+  - *Unstarred items (no regression).* From
+    `paired_by_subset.unstarred_any`: keen-wren's late rate at most
+    `LATE_SURPRISE_SLACK` (2 points) above twin-otter-b's, and the upper
+    bound of its `delta_pinball4_loss_sec` interval within the same 5%
+    margin of that subset's `a_mean_pinball4_loss_sec`.
+  - *Power.* A subset whose `delta4_items` is below `MIN_DISTINCT_ITEMS`
+    (100, the live gate's floor) is **underpowered**: its figures and n are
+    reported, and no gain is claimed from them. Stars have history only
+    from about 2026-10-03, so the starred subset is expected to be
+    underpowered at first.
+  - *Coverage.* The report states the `star_any_unknown` count beside the
+    two star subsets, and the fit's `priority_coverage` and
+    `roster_history` coverage, so a result over mostly-unknown inputs is
+    visible as such.
 - **Publishing the v2 file** (`eta::fit::publish_v2`, #10508, item 3 of
   #10586). Beside v1's publication (#10395, which moves only the v1 file),
   the captain publishes its newest `eta-fit/v2` file on the same branch
