@@ -777,6 +777,13 @@ pub(crate) enum MergePrCommand {
     /// `cli::merge_pr_worktree_teardown`.
     WorktreeTeardown(super::merge_pr_worktree_teardown::WorktreeTeardownArgs),
 
+    /// `merge-pr.sh --help`'s usage text (#8191 slice): the option list, the
+    /// cleanup semantics and the exit-code table, byte-frozen against the
+    /// retired `show_help` heredoc. Prints `LOOM-MERGE-PR-USAGE` then the
+    /// text; always exits 0. The shell prints a one-line usage instead when
+    /// the sentinel is absent — see `cli::merge_pr_usage`.
+    Usage(super::merge_pr_usage::UsageArgs),
+
     /// Decide ONE zero-row check-runs poll of `--auto`'s settle wait (#9091):
     /// settle now, keep waiting, or report the whole wait spent. Bounded only
     /// when the base branch requires no status-check contexts; a lookup that
@@ -962,6 +969,7 @@ impl MergePrCommand {
             MergePrCommand::DeleteBranch(args) => args.run(),
             MergePrCommand::DirtyGuard(args) => args.run(),
             MergePrCommand::WorktreeTeardown(args) => args.run(),
+            MergePrCommand::Usage(args) => args.run(),
             MergePrCommand::ZeroChecksSettle(args) => args.run(),
             MergePrCommand::CheckRunsStreak(args) => args.run(),
             MergePrCommand::CheckRunsRollup(args) => args.run(),
