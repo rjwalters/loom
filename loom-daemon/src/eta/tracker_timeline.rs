@@ -36,7 +36,9 @@ use crate::eta::fit::rows::{data_horizon, is_open_at};
 use crate::eta::fit::KNOWABLE_LAG_SEC;
 use crate::eta::fleet::FleetSnapshot;
 use crate::eta::fleet_log::{one_per_repo, SnapshotLog};
-use crate::eta::loop_features::{loop_features, repo_context, LoopFeatures, LoopInputs};
+use crate::eta::loop_features::{
+    loop_features, repo_context, FileSnapshot, LoopFeatures, LoopInputs,
+};
 use crate::eta::queue_features::EventLog;
 use crate::eta::{AgeSource, Stage};
 use chrono::{DateTime, Duration, Utc};
@@ -48,7 +50,9 @@ impl Tracker {
     /// reads them at `t − LAG` ([`Timeline::loop_features`]).
     #[must_use]
     pub fn loop_features_of(&self, repo: &str, pr: u32, now: DateTime<Utc>) -> LoopFeatures {
-        self.context.timeline().loop_features(repo, pr, now)
+        self.context
+            .timeline()
+            .loop_features(repo, pr, now, self.file_snapshots())
     }
 
     /// Start `key`'s track on first sight of its PR mid-`stage` (a restart,
@@ -318,9 +322,15 @@ impl Timeline {
 
     /// The friction predictors of `pr` at `now − LAG` (#10521): the one
     /// builder [`loop_features`] over the PR's episodes and its repo's, as
-    /// `fit::rows` calls it. File lists and CI runs are not logged yet, so
-    /// those features are `None` on both sides.
-    pub(super) fn loop_features(&self, repo: &str, pr: u32, now: DateTime<Utc>) -> LoopFeatures {
+    /// `fit::rows` calls it. File lists are the logged ones (#10550; `None`
+    /// until loaded), CI runs are not logged yet.
+    pub(super) fn loop_features(
+        &self,
+        repo: &str,
+        pr: u32,
+        now: DateTime<Utc>,
+        files: Option<&[FileSnapshot]>,
+    ) -> LoopFeatures {
         let cutoff = cutoff(now);
         let key = repo.to_ascii_lowercase();
         let all: Vec<&StageEpisode> = self
@@ -336,7 +346,7 @@ impl Timeline {
                 pr,
                 own: &own,
                 repo_episodes: &context,
-                files: None,
+                files,
                 ci: None,
             },
             cutoff,

@@ -99,7 +99,9 @@ use crate::eta::fleet_log::{one_per_repo, SnapshotLog};
 use crate::eta::labels::{
     FLAG_BLOCKED, FLAG_CI_FAIL, FLAG_CONFLICT, FLAG_OP_HOLD, FLAG_SEQUENCED, FLAG_STARRED,
 };
-use crate::eta::loop_features::{loop_features, repo_context, LoopFeatures, LoopInputs};
+use crate::eta::loop_features::{
+    loop_features, repo_context, FileSnapshot, LoopFeatures, LoopInputs,
+};
 use crate::eta::priority_features::{
     priority_features, PriorityEntry, PriorityFeatures, PriorityState,
 };
@@ -367,6 +369,21 @@ pub fn build_with_context(
     star: Option<&StarInputs>,
     fleet_history: Option<&[RosterRevision]>,
 ) -> Assembled {
+    build_with_files(snapshots, as_of, star, fleet_history, None)
+}
+
+/// [`build_with_context`], also reading each open PR's changed-file list as
+/// logged before each row's cutoff (#10550) for the file-overlap predictor.
+/// `None` leaves it unknown; `Some` reads only snapshots whose `known_at` is
+/// before `t - lag`, never the PR's final diff.
+#[must_use]
+pub fn build_with_files(
+    snapshots: &[FleetSnapshot],
+    as_of: DateTime<Utc>,
+    star: Option<&StarInputs>,
+    fleet_history: Option<&[RosterRevision]>,
+    files: Option<&[FileSnapshot]>,
+) -> Assembled {
     let lag = Duration::seconds(KNOWABLE_LAG_SEC);
     let step = Duration::seconds(ROW_STEP_SEC);
     let exit_horizon = Duration::seconds(EXIT_HORIZON_SEC);
@@ -485,7 +502,7 @@ pub fn build_with_context(
                         pr: pr.number,
                         own: &pr.episodes,
                         repo_episodes: context.get(pr.repo.as_str()).map_or(&[], Vec::as_slice),
-                        files: None,
+                        files,
                         ci: None,
                     },
                     cutoff,

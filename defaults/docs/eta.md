@@ -1462,7 +1462,7 @@ at `now - 120 s`, #10500) both call the one builder `loop_features`:
 
 | # | Feature (`LOOP_FEATURES`) | Meaning | Source |
 |---|---------------------------|---------|--------|
-| 1 | `log_overlap_prs`, `log_overlap_files`, `overlap_known` | Other open PRs in the repo whose changed files share a path with this PR's, and how many of this PR's paths they touch | Each PR's file list **as known at `as_of`**: the latest head-commit list read before `as_of`, never the final diff. If this PR's list or **any** open peer's list is not known before `as_of`, both counts are unknown (`overlap_known = 0`): a partly observed roster never reads as zero overlap. Not logged yet, so `overlap_known = 0` everywhere today |
+| 1 | `log_overlap_prs`, `log_overlap_files`, `overlap_known` | Other open PRs in the repo whose changed files share a path with this PR's, and how many of this PR's paths they touch | Each PR's file list **as known at `as_of`**: the latest head-commit list read before `as_of`, never the final diff. If this PR's list or **any** open peer's list is not known before `as_of`, both counts are unknown (`overlap_known = 0`): a partly observed roster never reads as zero overlap. Logged by the file-list reader (#10550, see [File-list log](#file-list-log-10550)); before a PR's first read, or for training rows older than the log, `overlap_known = 0` |
 | 2 | `log_review_requests`, `log_approvals_lost` | `review_wait` entries so far; approvals lost (`merge_wait`/`merge_hold` left for `review_wait`, a stale-main re-review) | Stage episodes |
 | 3 | `own_ci_failed`, `ci_known` | Whether the PR's last CI run that finished before `as_of` failed | SigNoz `ci.run` first, forge only to fill gaps (#10511). Not logged yet, so `ci_known = 0` today |
 | 4 | `judge_reject_rate_7d`, `judge_rate_known` | Share of the repo's Judge verdicts (`review_wait` exits to `doctor` vs to `merge_wait`/`merge_hold`) in the trailing 7 days that sent the PR to Doctor; unknown under 5 verdicts | Stage episodes |
@@ -1510,15 +1510,45 @@ at `now - 120 s`, #10500) both call the one builder `loop_features`:
   So loop-kite and twin-otter-b are scored on the same cases from the files
   each day would have served. With no v3 file, loop-kite refuses `no_model`
   and the v1-only replay is unchanged.
-- **Still open (#10550).** The live file-list reader (forge, ETag'd, reader
-  Apps, budgeted) and the SigNoz `ci.run` reader, so file overlap and own CI
-  stay unknown (indicators 0) in training and serving alike. The
-  loom-experiments walk-forward backtest and its results (pinball against
-  twin-otter-b, late surprise with paired CIs, starred / held / sequenced
-  subsets) have not been run. Promotion is the #10233 gate's decision.
+- **File-list log (#10550).** See [File-list log](#file-list-log-10550):
+  predictor 1 is logged and passed as `files: Some(..)` in the fit and in
+  serving.
+- **Still open (#10550).** The SigNoz `ci.run` reader (forge check runs only
+  to fill gaps), so own CI stays unknown (`ci_known = 0`) in training and
+  serving alike. The loom-experiments walk-forward backtest and its results
+  (pinball against twin-otter-b, late surprise with paired CIs, starred /
+  held / sequenced subsets) have not been run: they need loom-experiments and
+  fleet data, not the sweep host. Promotion is the #10233 gate's decision.
 - **v1 and v2 are unchanged.** None of these is in `eta-fit/v1`'s `FEATURES`
   or `eta-fit/v2`'s `FEATURES_V2`, so twin-otter, twin-otter-b and keen-wren
   rows, coefficient files and fixtures are unchanged.
+
+#### File-list log (#10550)
+
+Predictor 1 needs each open PR's changed-file list **as known at `as_of`**.
+`eta::pr_file_log` logs one `FileSnapshot {repo, pr, known_at, files}` per
+change of a PR's list, stamped with the instant the read returned, in
+`pr-files.jsonl` beside the fleet snapshots (`.loom/state/eta/fleet/`; the
+extension keeps `fleet::load_all`'s `*.json` listing to snapshots alone).
+
+- **Reads** are forge only: one ETag'd conditional GET of
+  `pulls/{n}/files?per_page=100` per PR through the shared ETag store and the
+  repo's reader App (`pr_features_forge::fetch_pr_files`), at most
+  `FILE_READ_BUDGET` (6) calls per ETA pass and none while the rate-limit
+  breaker suppresses polling. Never-read PRs go first, then the stalest; a PR
+  not updated since its last read is left alone, and an unchanged list (a
+  `304`, or an equal body) appends nothing.
+- **A full page is not logged.** 100 entries may be truncated, and a partial
+  list would read as a confident smaller overlap, so that PR stays unknown.
+- **Point in time.** The builder reads the latest snapshot strictly before
+  `as_of` (`t - lag` in the fit, `now - lag` serving), so a later push, or a
+  list first read later, moves no earlier row. The log starts when the reader
+  first runs: older rows keep `overlap_known = 0`.
+- **Both sides.** `eta fit` loads the log (`fit_snapshots_with_files`) and the
+  tracker is handed the same file each cycle
+  (`Tracker::set_file_snapshots`); both pass `files: Some(..)` to
+  `loop_features`. Snapshots older than 120 days are dropped when the log
+  grows past 20 000 entries.
 
 ### Dependency-aware ETAs (#10510)
 

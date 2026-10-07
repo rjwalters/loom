@@ -112,8 +112,9 @@ pub struct CiObservation {
 }
 
 /// What the builder reads. `files` and `ci` are `None` when the source is
-/// not logged for the caller (the fit today): the dependent features are
-/// then `None`.
+/// not logged for the caller: the dependent features are then `None`. File
+/// lists are logged since #10550 ([`super::pr_file_log`]); CI runs are not
+/// yet.
 #[derive(Debug, Clone, Copy)]
 pub struct LoopInputs<'a> {
     /// `owner/repo` of the subject.
@@ -330,8 +331,9 @@ pub fn loop_features(inputs: &LoopInputs<'_>, as_of: DateTime<Utc>) -> LoopFeatu
 }
 
 /// How many of a set of rows know each friction input: the coverage a fit
-/// or a backtest reports next to its numbers (#10521). Today file overlap
-/// and own CI are 0: their sources are not logged yet.
+/// or a backtest reports next to its numbers (#10521). File overlap
+/// is 0 for rows older than the file-list log (#10550) and own CI everywhere
+/// until its source is logged.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopCoverage {
     /// Rows counted.
