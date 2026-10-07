@@ -69,7 +69,6 @@
 
 use super::ReplayCase;
 use crate::eta::episodes::{input_from_pr_history, replay};
-use crate::eta::fit::features_v2::PriorityInputs;
 use crate::eta::flag_timeline::FlagChange;
 use crate::eta::labels::{
     hold_labels, pr_flags, stage_from_pr_labels, APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED,
