@@ -1,7 +1,7 @@
 //! Shadow lifecycle from the nightly folds (#10525): the promotion short-list
 //! and retirement proposals.
 
-use crate::eta::heuristics::{LAND_CALM_PLOVER, LAND_TWIN_OTTER_B};
+use crate::eta::heuristics::{LAND_EVEN_LARK, LAND_TWIN_OTTER_B};
 use crate::eta::nightly_folds::DayRecords;
 use crate::eta::shadow_lifecycle::{
     dedup_key, file_proposals, retirement_proposals, shortlist, ProposalForge, MAX_STALE_DAYS,
@@ -318,7 +318,7 @@ fn filing_is_idempotent_across_runs_and_hosts_and_keeps_failures_for_retry() {
     assert!(body.contains("proposal only"));
     // Nothing is unregistered: the registry is a compile-time table, and a
     // proposal for a real candidate leaves it registered.
-    assert!(Registry::builtin().get(LAND_CALM_PLOVER).is_some());
+    assert!(Registry::builtin().get(LAND_EVEN_LARK).is_some());
 }
 
 #[test]
@@ -327,7 +327,7 @@ fn a_real_candidate_is_proposed_from_its_folds_and_stays_registered() {
     let d = wobbled(days(
         RETIREMENT_MIN_DAYS,
         &[
-            (LAND_CALM_PLOVER, (40.0, 900.0, 0.8, 0.2)),
+            (LAND_EVEN_LARK, (40.0, 900.0, 0.8, 0.2)),
             (LAND_TWIN_OTTER_B, (-20.0, 700.0, 0.5, 0.1)),
         ],
     ));
@@ -338,8 +338,8 @@ fn a_real_candidate_is_proposed_from_its_folds_and_stays_registered() {
         .collect();
     let p = retirement_proposals(&d, CUR, &eligible);
     assert_eq!(p.len(), 1, "{p:?}");
-    assert_eq!(p[0].heuristic, LAND_CALM_PLOVER);
-    assert_eq!(registry.tier_of(LAND_CALM_PLOVER), Some(Tier::Candidate));
+    assert_eq!(p[0].heuristic, LAND_EVEN_LARK);
+    assert_eq!(registry.tier_of(LAND_EVEN_LARK), Some(Tier::Candidate));
 }
 
 #[test]
@@ -355,7 +355,7 @@ fn builtin_candidates_are_the_only_eligible_ids() {
     }
 }
 
-/// A workspace whose saved folds make `calm-plover` a dominated, worse
+/// A workspace whose saved folds make `even-lark` a dominated, worse
 /// candidate (against `twin-otter-b`), declaring `captain` as `fleet.captain`.
 fn scheduled_root(captain: Option<&str>) -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
@@ -367,7 +367,7 @@ fn scheduled_root(captain: Option<&str>) -> tempfile::TempDir {
     let d = wobbled(days(
         RETIREMENT_MIN_DAYS,
         &[
-            (LAND_CALM_PLOVER, (40.0, 900.0, 0.8, 0.2)),
+            (LAND_EVEN_LARK, (40.0, 900.0, 0.8, 0.2)),
             (LAND_TWIN_OTTER_B, (-20.0, 700.0, 0.5, 0.1)),
         ],
     ));
@@ -403,7 +403,7 @@ fn scheduled_filing_files_exactly_once_across_reruns_and_removes_nothing() {
         assert_eq!(report.filed.len(), usize::from(run == 0), "run {run}");
     }
     assert_eq!(forge.issues.len(), 1);
-    assert!(forge.issues[0].1.contains(&dedup_key(LAND_CALM_PLOVER)));
+    assert!(forge.issues[0].1.contains(&dedup_key(LAND_EVEN_LARK)));
     assert_eq!(Registry::builtin().ids(), before, "nothing unregistered");
 }
 
@@ -444,7 +444,7 @@ fn scheduled_filing_refuses_when_the_forge_cannot_be_searched_then_retries() {
     assert!(!crate::eta::shadow_lifecycle::filed_path(root.path()).exists());
     forge.search_down = false;
     let ok = file_gated(root.path(), &g, &proposed.proposals, Utc::now(), &mut forge).unwrap();
-    assert_eq!(ok.filed, vec![LAND_CALM_PLOVER]);
+    assert_eq!(ok.filed, vec![LAND_EVEN_LARK]);
 }
 
 #[test]

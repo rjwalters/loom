@@ -2843,7 +2843,7 @@ day, catches up at most 7 missed days oldest first).
     the same gate function as `eta promote` (`shadow::backtest_gate`), not the
     same data: the summary also replays fleet snapshots and the offline PR
     cache, `eta promote` local data only.
-  - Both give `land-2026-10-06-calm-plover` the replay calibration evidence
+  - Both give `land-2026-10-06-even-lark` the replay calibration evidence
     `eta backtest` / `eta promote` do (`backtest::with_replay_calibration`,
     built from the already-cut cases), so it is not folded as plain `land-v2`.
 - **Strictly point-in-time.** Before replaying, the run drops every input
