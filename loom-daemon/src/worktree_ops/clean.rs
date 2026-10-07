@@ -1835,14 +1835,15 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
         .collect();
     worktree_dirs.sort_by_key(std::fs::DirEntry::path);
 
-    let issue_state_fn = |n: u32| gh::issue_state(repo_root, n);
-    // #6653: REST is fine here even though `issue_state_fn` above uses the
-    // GraphQL-backed `gh issue view` — this probe is only ever consulted for
-    // a `PrStatus::NoPr` worktree (rare), so there is no meaningful GraphQL
-    // quota pressure to avoid the way there is for the reaper's per-tick,
-    // per-worktree probes.
-    let issue_closed_at_fn = |n: u32| gh::issue_closed_at_rest(repo_root, n);
-    let pr_status_fn = |n: u32| check_pr_merged(repo_root, n);
+    // W6 PR2 (`hygiene_pass`): the issue is the REST item read of the
+    // checkout's own repo, held for this pass (its `closed_at`, #6653, is the
+    // same body), and the PR status is the owner-confirmed REST listing with
+    // `gh pr list` as the last resort. `LOOM_HYGIENE_MEMO=0` restores
+    // `gh issue view` / `gh pr list`.
+    let pass = super::hygiene_pass::Pass::begin(repo_root);
+    let issue_state_fn = |n: u32| pass.clean_issue_state(n);
+    let issue_closed_at_fn = |n: u32| pass.issue_closed_at(n);
+    let pr_status_fn = |n: u32| pass.clean_pr_status(n);
     let branch_reachable_fn =
         |n: u32| branch_reachable_from_remotes(repo_root, &naming::branch_name(n));
     // #6652: one `git worktree list` per pass, not once per worktree.
@@ -1867,7 +1868,10 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
 
         println!("Checking worktree: issue-{issue_num}");
 
-        match classify_worktree(&worktree_path, issue_num, opts, &probes) {
+        // A decision that removes is confirmed by one fresh unconditional
+        // read first, and comes back as a skip when that read disagrees.
+        let decision = classify_worktree(&worktree_path, issue_num, opts, &probes);
+        match pass.gate(issue_num, opts.dry_run, decision) {
             WorktreeDecision::SkipInUse(reason) => {
                 println!("  {reason} - preserving");
                 stats.skipped_in_use += 1;
@@ -2351,7 +2355,8 @@ pub fn clean_branches(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanOp
             continue;
         };
 
-        let status = gh::issue_state(repo_root, issue_num);
+        // `CLOSED` deletes the branch: confirmed by a fresh read (W6 PR2).
+        let status = super::hygiene_pass::branch_issue_state(repo_root, issue_num, opts.dry_run);
         match status.as_str() {
             "CLOSED" => {
                 let hint = sha_hint(repo_root, branch);
