@@ -179,7 +179,7 @@ fn resolve_release(
     if tag.is_empty() {
         r.reason = match pinned_tag {
             Some(pinned) => format!(
-                "'gh release view {pinned}' found no release tagged {pinned} for {} (no such tag, an unreachable/rate-limited API, or an auth failure)",
+                "found no release tagged {pinned} for {} (no such tag, an unreachable/rate-limited API, or an auth failure)",
                 r.repo_slug
             ),
             None => format!(
