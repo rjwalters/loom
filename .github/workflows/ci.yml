@@ -326,6 +326,34 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --package loom-daemon --package loom-api -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
       - run: cargo check --workspace --all-targets
+      # Default-feature coverage of the `#[cfg(not(feature = "otlp"))]` tests
+      # (#10823). Rust Unit Tests runs the whole workspace with `otlp` on, so
+      # these tests never execute there; the full default-feature suite runs
+      # nightly (ci-daily.yml `full-suite`). The names are DERIVED from source
+      # (a test attribute between the cfg and the fn), never hand-listed
+      # (ci-principles rules 7 and 9); an empty derivation or an empty
+      # selection fails. This is an additional run, not a filterset that skips
+      # work.
+      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
+        with:
+          tool: nextest
+      - name: Run the cfg(not(otlp)) tests (default features)
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          names=$(grep -rl 'cfg(not(feature = "otlp"))' loom-daemon/src | sort | xargs awk '
+            /#\[cfg\(not\(feature = "otlp"\)\)\]/ { pend=1; ist=0; next }
+            pend && /#\[(tokio::)?test/ { ist=1; next }
+            pend && /^[ \t]*(pub )?(async )?fn / {
+              if (ist) { l=$0; sub(/.*fn /, "", l); sub(/\(.*/, "", l); print l }
+              pend=0; next }
+            pend && /^[ \t]*(#\[|\/\/|$)/ { next }
+            { pend=0 }
+          ' | sort -u)
+          test -n "$names" || { echo "derived no cfg(not(otlp)) tests" >&2; exit 1; }
+          echo "derived tests:"; echo "$names"
+          filter=$(echo "$names" | sed 's|.*|test(/::&$/)|' | paste -sd'|' - | sed 's/|/ | /g')
+          cargo nextest run -p loom-daemon --lib --profile ci --no-tests=fail -E "$filter"
       # Folded in from the former Rust Doctests job (#9065): nextest does not
       # run doctests, so libtest still owns them (#4385). `!cancelled()` so a
       # clippy failure above does not hide a doctest failure.
@@ -378,7 +406,7 @@ jobs:
         with:
           tool: nextest
       - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
-        run: cargo nextest run --workspace --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
+        run: cargo nextest run --workspace --features loom-daemon/otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
       - name: Upload per-test timings (#9456)
         # The JUnit XML `.config/nextest.toml`'s `[profile.ci.junit]` writes is
         # the only surface that carries per-test durations out of a finished
@@ -395,9 +423,9 @@ jobs:
         # with `ci-test-timings` and pairs on
         # `-<family>-<k>-<N>`, where `<family>` is this job's display name with
         # its `(k/N)` suffix stripped and slugified
-        # (`ci_telemetry::nextest::job_family_slug`; `ci.yml` has TWO
-        # nextest-partition families both sharding 1..3, so the family is what
-        # disambiguates them). Renaming this artifact — or renaming the job
+        # (`ci_telemetry::nextest::job_family_slug`; the family keeps the
+        # pairing key unambiguous against any other job sharding 1..3).
+        # Renaming this artifact — or renaming the job
         # without renaming the artifact — silently stops test spans, which
         # `ci_telemetry::tests::test_spans` asserts against this file. See
         # defaults/docs/ci-observability.md §"Per-test spans (#9456)".
@@ -432,10 +460,12 @@ jobs:
       # own unit tests (`otlp/mod.rs`, `otlp/mapping.rs`) are linted too, not
       # just its non-test code paths.
       - run: cargo clippy --package loom-daemon --features otlp --all-targets -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
-      # The feature's full nextest run lives in the partitioned
-      # backend-otlp-tests job below (#9065). It is NOT deduplicated against
-      # Rust Unit Tests: `otlp` is not purely additive -- two tests are
-      # `#[cfg(not(feature = "otlp"))]` -- so neither run subsumes the other.
+      # The feature's full nextest run lives in the partitioned Rust Unit Tests
+      # job (#10823): the whole workspace runs once, with the shipped `otlp`
+      # configuration. `otlp` is not purely additive -- some tests are
+      # `#[cfg(not(feature = "otlp"))]` -- so the default-feature coverage is
+      # the targeted step in backend-lint-and-check plus ci-daily.yml's
+      # `full-suite`.
       - name: Verify OTLP with a real pinned Collector
         run: cargo test --package loom-daemon --features otlp --test otlp_collector -- --ignored --nocapture
       # #8665: executes the committed cycle-time SQL verbatim against a real
@@ -540,49 +570,6 @@ jobs:
       # ones that restore 30 days -- unapplied.
       - name: Verify the SigNoz retention statements against a real pinned ClickHouse
         run: cargo test --package loom-daemon --features otlp --test signoz_retention_ttl -- --ignored --nocapture
-
-  backend-otlp-tests:
-    name: Rust OTLP Feature Tests (${{ matrix.partition }}/${{ strategy.job-total }})
-    needs: changes
-    if: always() && (github.event_name == 'push' || github.event_name == 'merge_group' || needs.changes.outputs.backend == 'true')
-    # The whole loom-daemon suite with `--features otlp`, partitioned three
-    # ways for the same reason and by the same mechanism as Rust Unit Tests
-    # (#9065): 211s of test execution on one runner was the critical path.
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [1, 2, 3]
-        # The denominator is `strategy.job-total`, never a literal: editing
-        # this list alone cannot silently drop a slice (a gap such as [1, 3]
-        # yields an out-of-range k/N, which fails loudly).
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
-        with:
-          tool: nextest
-      - name: Run tests (otlp feature, partition ${{ matrix.partition }}/${{ strategy.job-total }})
-        run: cargo nextest run --package loom-daemon --features otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
-      - name: Upload per-test timings (#9456)
-        # Same contract as the `Rust Unit Tests` leg above, with this job's own
-        # family slug: the poller pairs `ci-test-timings-<family>-<k>-<N>` on
-        # the family, because both nextest-partition families shard 1..3 and
-        # `(kind, k, N)` alone would match two jobs. See
-        # defaults/docs/ci-observability.md §"Per-test spans (#9456)".
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ci-test-timings-rust-otlp-feature-tests-${{ matrix.partition }}-${{ strategy.job-total }}
-          path: target/nextest/ci/junit.xml
-          if-no-files-found: ignore
-          retention-days: 14
 
   structural-checks:
     name: Structural Checks
@@ -2788,7 +2775,6 @@ jobs:
       - backend-lint-and-check
       - backend-tests
       - backend-otlp-feature
-      - backend-otlp-tests
       - structural-checks
       - daemon-checks
       - install-surface-checks
