@@ -1,7 +1,9 @@
 //! Text rendering for `loom-daemon eta backtest` (#9325), moved out of
 //! `eta_cmd.rs` to keep it under the file-size budget (#10245).
 
-use loom_daemon::eta::backtest::{BacktestReport, Bucket, Comparison};
+use loom_daemon::eta::backtest::{
+    adaptation, BacktestReport, Bucket, Comparison, RegimeAdaptation,
+};
 
 fn opt(value: Option<f64>, render: impl Fn(f64) -> String) -> String {
     value.map(render).unwrap_or_else(|| "-".to_string())
@@ -76,7 +78,38 @@ pub(super) fn render_report(r: &BacktestReport) -> String {
             ));
         }
     }
+    if let Some(a) = &r.regime_adaptation {
+        out.push_str(&render_adaptation(a));
+    }
     out
+}
+
+fn hours(value: Option<i64>) -> String {
+    value.map_or_else(|| "never".to_string(), |h| format!("{h}h"))
+}
+
+/// The `--adaptation` lines (#10528).
+pub(super) fn render_adaptation(a: &RegimeAdaptation) -> String {
+    format!(
+        "regime adaptation (x{} shift injected at {} on {}, before={} after={} over {}h):\n  \
+         t_p50={} (<= {}h) t_cov={} (<= {}h) t_alarm={} (<= {}h) false_alarm={} \
+         pre_coverage={} meets_targets={}\n",
+        a.shift_factor,
+        a.shift_at.to_rfc3339(),
+        a.stage.as_str(),
+        a.n_before,
+        a.n_after,
+        a.horizon_h,
+        hours(a.t_p50_h),
+        adaptation::TARGET_T_P50_H,
+        hours(a.t_cov_h),
+        adaptation::TARGET_T_COV_H,
+        hours(a.t_alarm_h),
+        adaptation::TARGET_T_ALARM_H,
+        hours(a.false_alarm_h),
+        pct(a.pre_coverage),
+        a.meets_targets(),
+    )
 }
 
 /// The human `eta backtest --compare` report: both reports, then the paired
@@ -140,4 +173,42 @@ pub(super) fn render_comparison(c: &Comparison) -> String {
     ));
     out.push_str(&format!("better: {}\n", c.better.as_deref().unwrap_or("neither")));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_adaptation;
+    use chrono::{TimeZone, Utc};
+    use loom_daemon::eta::backtest::RegimeAdaptation;
+    use loom_daemon::eta::Stage;
+
+    #[test]
+    fn adaptation_lines_name_every_figure_and_its_target() {
+        let a = RegimeAdaptation {
+            stage: Stage::ReviewWait,
+            shift_at: Utc.with_ymd_and_hms(2026, 10, 3, 0, 0, 0).unwrap(),
+            shift_factor: 2.0,
+            n_before: 40,
+            n_after: 30,
+            horizon_h: 24,
+            t_p50_h: Some(3),
+            t_cov_h: Some(9),
+            t_alarm_h: None,
+            false_alarm_h: None,
+            pre_coverage: Some(0.5),
+        };
+        let text = render_adaptation(&a);
+        for part in [
+            "x2 shift",
+            "review_wait",
+            "t_p50=3h (<= 6h)",
+            "t_cov=9h (<= 12h)",
+            "t_alarm=never (<= 3h)",
+            "false_alarm=never",
+            "pre_coverage=50.0%",
+            "meets_targets=false",
+        ] {
+            assert!(text.contains(part), "{part:?} in {text}");
+        }
+    }
 }

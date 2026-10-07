@@ -423,6 +423,12 @@ pub(crate) struct EtaBacktestArgs {
     #[arg(long, value_name = "PATH")]
     pub fit_dir: Option<PathBuf>,
 
+    /// Also report the regime layer's adaptation times (`t_p50`, `t_cov`,
+    /// `t_alarm`) on this heuristic's residuals under an injected x2 shift
+    /// (#10528). Diagnostic; not with `--compare`.
+    #[arg(long, conflicts_with = "compare")]
+    pub adaptation: bool,
+
     /// Opt-in `land` cases from merged PRs' label timelines (#9579).
     #[command(flatten)]
     pub pr_cases: PrCaseArgs,
@@ -478,7 +484,8 @@ impl EtaBacktestArgs {
             return Ok(());
         }
 
-        let report = backtest::run(&heuristic, &history, &cases, filter, &loom);
+        let run = backtest::runner(self.adaptation);
+        let report = run(&heuristic, &history, &cases, filter, &loom);
         if self.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {

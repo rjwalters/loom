@@ -922,7 +922,9 @@ record says so rather than implying the check passed.
 **Not yet built** (follow-ups on #10525):
 
 - A producer of `t_p50` / `t_cov` per heuristic (#10528). Until one exists,
-  the adaptation check records `not_measured`. Retirement domination does not
+  the adaptation check records `not_measured`. (`eta backtest --adaptation`
+  measures the shared regime layer on a heuristic's residuals, not the
+  heuristic's own recovery, so it is not that producer.) Retirement domination does not
   yet consider adaptation either; the proposal body says so.
 - loom-ui's chooser filtering on `tier` is owned by loom-ui#2031 / #2097 and
   is not verified here.
@@ -2334,7 +2336,16 @@ accepts `--repo-root PATH` (default: the current directory).
   operator-held approval replays as `merge_hold` and its release as
   `merge_wait`; entries the resolver refuses (`blocked`, `unknown_stage`)
   yield no case and are reported as refused entries (#10305). Without either
-  flag the backtest makes no forge call.
+  flag the backtest makes no forge call. `--adaptation` (not with
+  `--compare`) adds `regime_adaptation` (#10528): on the busiest stage, a
+  synthetic x2 shift is injected into the heuristic's own scored residuals at
+  their median outcome, and the drift-gated regime layer (`eta::regime`) is
+  replayed hour by hour for 24 h, reporting `t_p50` (served p50 within 25% of
+  the new truth), `t_cov` (trailing-6 h p25–p75 coverage of post-shift
+  outcomes back in 40–60%), `t_alarm` (drift check trips) against the 6 h / 12 h / 3 h targets,
+  plus `false_alarm` on the unshifted stream. It measures the regime layer
+  on this heuristic's noise, not the heuristic's own adaptation, so it does
+  not feed the promotion gate's `adaptation` check.
 - **`loom-daemon eta view OWNER/NAME#ISSUE [--explain] [--json]`** — the
   current estimate(s) for one issue (#9327). State resolution, in order:
   1. An **open linked PR**: its review labels
