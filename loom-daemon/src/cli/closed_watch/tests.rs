@@ -188,6 +188,12 @@ struct World {
 }
 
 impl StaleBlockedForge for World {
+    /// Required since #10562; the notify path (`gather_cited`) never probes
+    /// it, and this world's repository is live.
+    fn archived(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+
     fn list_blocked(&mut self) -> anyhow::Result<Vec<RestIssue>> {
         Ok(vec![RestIssue {
             number: 201,
