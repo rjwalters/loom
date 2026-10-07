@@ -493,3 +493,20 @@ fn an_older_or_untrusted_review_does_not_suppress_queueing() {
     assert_eq!(queued, vec![1, 2]);
     assert_eq!(skipped(&r, "reviewed"), 0);
 }
+
+#[test]
+fn a_queued_issue_that_gains_a_hold_loses_the_marker_and_a_claim_defers_it() {
+    let mut w = World::new();
+    w.add(1, "x", &[UNNAMED_LABEL, "loom:operator-only"]);
+    w.add(2, "x\n<!-- loom:permanent-block -->", &[UNNAMED_LABEL]);
+    w.add(3, "x", &[UNNAMED_LABEL, "loom:building"]);
+    w.add(4, "x", &[UNNAMED_LABEL, "loom:curating"]);
+    let r = w.run();
+    assert_eq!(r.cleared, vec![1, 2]);
+    assert_eq!(skipped(&r, "operator-hold"), 1);
+    assert_eq!(skipped(&r, "permanent"), 1);
+    assert_eq!(skipped(&r, "active-claim"), 2);
+    assert_eq!(r.already_queued, 0);
+    assert!(r.queued.is_empty());
+    assert_eq!(w.park.writes.len(), 2);
+}

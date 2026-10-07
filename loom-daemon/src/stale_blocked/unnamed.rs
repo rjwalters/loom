@@ -16,7 +16,10 @@
 //!   blocker, parks with a stated reason (which makes the issue
 //!   [`Verdict::HeldWithReason`], so it is never re-queued), or releases it.
 //! - **Clear**: remove [`UNNAMED_LABEL`] from any issue that is no longer
-//!   `loom:blocked` or no longer `Undocumented`.
+//!   `loom:blocked` or no longer `Undocumented`, or that gained an operator
+//!   hold or permanent-block marker after being queued (a queue marker never
+//!   outlives the vetoes that would have refused it). An already-queued issue
+//!   with an active claim keeps the marker, deferred; the drain rechecks.
 //!
 //! # Only the current hold's record counts
 //!
@@ -254,11 +257,16 @@ pub fn run(
             }
             continue;
         }
-        if !queued {
-            if let Some(why) = label_skip(&body, &row.labels) {
-                report.skip(why);
-                continue;
+        if let Some(why) = label_skip(&body, &row.labels) {
+            // A queue marker must not authorize Curator past a hold the issue
+            // gained after it was queued: strip it. An active claim is not a
+            // hold, and the claimant may be Curator mid-drain, so the marker
+            // stays (deferred) and only the skip is counted.
+            if queued && why != Skip::ActiveClaim {
+                clear(park, u64::from(row.number), cfg.dry_run, &mut cap, &mut report);
             }
+            report.skip(why);
+            continue;
         }
         wanted.insert(i64::from(row.number));
         candidates.push((queued, row));

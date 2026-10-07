@@ -32,6 +32,24 @@ unblock" is not evidence. Idempotency: if the newest trusted comment already
 carries `<!-- loom:unnamed-block-review` and nothing changed since, only remove
 the label and post nothing.
 
+**The label is a hint, not authorization.** The daemon may have queued the issue
+before it gained a hold or a claim, so recheck eligibility live, from a fresh
+`gh issue view <n> --json labels,body`, at two points: before you claim it, and
+again immediately before any write (`park-record apply`, label removal,
+comment). **Skip the issue and write nothing** if it carries:
+
+- a `loom:operator`, `loom:operator-only` or other operator-hold label, or
+  `<!-- loom:permanent-block` in its body or a trusted comment. Do not remove
+  `loom:blocked`; the daemon strips the queue label on its next tick.
+- `loom:building`, or a `loom:curating` claim that is not yours. Run Curator's
+  "Stale `loom:curating` Claim Check" (`claim-staleness.sh`) and stand down on
+  `fresh`/`unknown`; reclaim only on `stale`, as for any Curator work.
+- no longer `loom:blocked`, or a body naming a blocker or reason: only remove
+  `loom:blocked-unnamed`.
+
+Claim with `loom:curating` before the first write (Curator's "Claiming Work")
+and release it when done.
+
 Then do **exactly one** of:
 
 | Finding | Action |
@@ -49,5 +67,8 @@ the per-outcome count source for the dashboard.
 - A blocker named only in a comment (`waiting on #123`, still open): **named**.
 - "Needs the vendor's answer": a human/external step with no number: **kept**
   with the reason; if it is a real operator ruling, route it instead.
+- Queued, then an operator adds `loom:operator-only` or a Builder adds
+  `loom:building` before you run: **skip**, no write, even though the body and
+  documentation verdict are unchanged.
 - A stale hold whose recorded cause is closed and nothing else open:
   **released**, no `loom:issue`, evidence comment.
