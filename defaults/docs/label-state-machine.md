@@ -98,7 +98,8 @@ says so, and no role applies it).
 - **Operator-derived only (#10012).** No role stars on its own judgment. The
   daemon relays a loom-ui star intent; Builder copies it onto the PR it opens;
   `create-issue.sh --parent N` stars a new child of a starred N (audit comment
-  `inherited_from=#N`), and the star-liveness pass writes it on every open
+  `inherited_from=#N`), and, when `autonomous.operatorPriority.materializeLabels`
+  is on (default off), the star-liveness pass writes it on every open
   child a starred issue's text links, removing it once that root loses its
   star (never an operator's own star, never because the root closed).
   Never propagated: holds, claim/lifecycle labels, `loom:heavy`, `points:*`.

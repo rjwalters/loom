@@ -220,14 +220,20 @@ impl LivenessState {
             };
             let mut forge = forges(&repo.root, &repo.slug);
             let mut evaluator = collect::Evaluator::new(forge.as_mut(), ctx, &mut self.refusals)
-                .with_propagate(settings.propagate);
+                .with_propagate(settings.propagate)
+                .with_materialize(settings.materialize_labels);
             let result = evaluator.run();
             let plan = std::mem::take(&mut evaluator.plan);
             drop(evaluator);
             // #10012 §2–§3: write the inherited star, and take back the ones
-            // whose root lost its star. Off with `escalate` (no forge writes)
-            // or `propagate` (no plan).
-            if settings.escalate && result.is_ok() && !plan.is_empty() {
+            // whose root lost its star. Off unless `materializeLabels` is on
+            // (default off; no plan otherwise), and off with `escalate` (no
+            // forge writes) or `propagate` (no plan).
+            if settings.materialize_labels
+                && settings.escalate
+                && result.is_ok()
+                && !plan.is_empty()
+            {
                 let done = materialize::apply(
                     forge.as_mut(),
                     &repo.slug,

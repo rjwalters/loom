@@ -203,12 +203,16 @@ pub struct Evaluator<'a> {
     issues: HashMap<u32, Option<RestIssue>>,
     prs_by_issue: BTreeMap<u32, RestIssue>,
     propagate: bool,
+    /// Whether the pass plans label writes for the inherited star
+    /// (`autonomous.operatorPriority.materializeLabels`, default off).
+    materialize: bool,
     /// Single-issue forge reads (cache misses) made so far.
     reads: usize,
     /// While set, no read past this count reaches the forge (the walk).
     read_cap: Option<usize>,
     /// The star writes this pass's walk calls for (#10012 §2–§3), made by
-    /// the caller ([`materialize::apply`]). Empty with `propagate` off.
+    /// the caller ([`materialize::apply`]). Empty unless both `propagate`
+    /// and `materialize` are on.
     pub plan: Plan,
 }
 
@@ -226,6 +230,7 @@ impl<'a> Evaluator<'a> {
             issues: HashMap::new(),
             prs_by_issue: BTreeMap::new(),
             propagate: true,
+            materialize: false,
             reads: 0,
             read_cap: None,
             plan: Plan::default(),
@@ -239,6 +244,21 @@ impl<'a> Evaluator<'a> {
     pub fn with_propagate(mut self, propagate: bool) -> Self {
         self.propagate = propagate;
         self
+    }
+
+    /// Whether the pass plans the inherited star as label writes, and reads
+    /// star owners to do so (`autonomous.operatorPriority.materializeLabels`,
+    /// #10012 §2–§3). Off by default: the walk then treats every starred
+    /// issue as a root and the plan stays empty, as before materialization.
+    #[must_use]
+    pub fn with_materialize(mut self, materialize: bool) -> Self {
+        self.materialize = materialize;
+        self
+    }
+
+    /// Whether this pass materializes: `propagate` and `materialize` both on.
+    fn writes_labels(&self) -> bool {
+        self.propagate && self.materialize
     }
 
     /// The children of `parent`: the issues its landing says inherit
@@ -561,11 +581,12 @@ impl<'a> Evaluator<'a> {
             .any(|p| self.root_state(p, listed) != RootState::Unstarred)
     }
 
-    /// Split the starred listing by owner (#10012 §3). With `propagate` off
-    /// every starred issue is a root, as before.
+    /// Split the starred listing by owner (#10012 §3). Without
+    /// materialization every starred issue is a root, as before, and no
+    /// owner is read.
     fn classify(&mut self, issues: &[RestIssue]) -> Classified {
         let listed: BTreeSet<u32> = issues.iter().map(|i| i.number).collect();
-        if !self.propagate {
+        if !self.writes_labels() {
             return Classified {
                 roots: listed,
                 ..Classified::default()
@@ -723,7 +744,7 @@ impl<'a> Evaluator<'a> {
             .filter(|r| r.is_pull_request)
             .cloned()
             .collect();
-        if issues.is_empty() && !(self.propagate && !starred_prs.is_empty()) {
+        if issues.is_empty() && !(self.writes_labels() && !starred_prs.is_empty()) {
             return Ok(Vec::new());
         }
         let mut prs: BTreeMap<u32, RestIssue> =
@@ -921,7 +942,7 @@ impl<'a> Evaluator<'a> {
                 pr_targets.push((n, root, e.starred_at.clone()));
             }
             if let Some(m) = materialized.get(&n).filter(|_| {
-                self.propagate
+                self.writes_labels()
                     && !e
                         .facts
                         .issue
@@ -959,7 +980,7 @@ impl<'a> Evaluator<'a> {
                 // Only an orphaned star a still-starred parent keeps passes
                 // its star on; one kept only because the walk was incomplete
                 // is on its way out.
-                let wants_pr = self.propagate
+                let wants_pr = self.writes_labels()
                     && self
                         .prs_by_issue
                         .get(&n)
@@ -990,7 +1011,7 @@ impl<'a> Evaluator<'a> {
             }
             out.push(e);
         }
-        if self.propagate {
+        if self.writes_labels() {
             let mut planned: BTreeSet<u32> = BTreeSet::new();
             for (n, root, starred_at) in pr_targets {
                 let Some(pr) = self.prs_by_issue.get(&n) else {

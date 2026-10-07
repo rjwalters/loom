@@ -119,6 +119,8 @@ pub const INTERVAL_SECS_ENV: &str = "LOOM_OPERATOR_PRIORITY_INTERVAL_SECS";
 pub const POOLS_GRACE_MINUTES_ENV: &str = "LOOM_OPERATOR_PRIORITY_POOLS_GRACE_MINUTES";
 /// Env override for [`Settings::propagate`] (`0`/`false` turns it off).
 pub const PROPAGATE_ENV: &str = "LOOM_OPERATOR_PRIORITY_PROPAGATE";
+/// Env override for [`Settings::materialize_labels`] (#10012 §2–§3).
+pub const MATERIALIZE_LABELS_ENV: &str = "LOOM_OPERATOR_PRIORITY_MATERIALIZE_LABELS";
 
 /// Default watchdog window.
 pub const DEFAULT_NO_PROGRESS_MINUTES: u64 = 30;
@@ -148,6 +150,13 @@ pub struct Settings {
     /// (`loom:blocked` blockers, refusal incident, red-main fix), which
     /// always inherit (#10012).
     pub propagate: bool,
+    /// `materializeLabels`: whether the pass writes the inherited star as the
+    /// `loom:operator-priority` label (and its PR's), and takes it back once
+    /// the root loses its star (#10012 §2–§3, [`materialize`]). **Off by
+    /// default**: an opt-in until the fleet has run it, since a revert leaves
+    /// the labels it added. Needs `propagate` and `escalate` too; with it off
+    /// the inherited star stays an in-memory ordering, as before.
+    pub materialize_labels: bool,
     /// `levelCaps`: the most open issues fleet-wide (as this host sees it)
     /// that may carry each level's operator label (#10307), by level. Over
     /// the cap is reported in the digest, never refused.
@@ -205,6 +214,7 @@ impl Default for Settings {
             interval: Duration::from_secs(DEFAULT_INTERVAL_SECS),
             pools_grace: Duration::from_secs(DEFAULT_POOLS_GRACE_MINUTES * 60),
             propagate: true,
+            materialize_labels: false,
             level_caps: LevelCaps::default(),
         }
     }
@@ -255,12 +265,16 @@ impl Settings {
         let propagate = env_bool(PROPAGATE_ENV)
             .or_else(|| cfg("propagate").and_then(serde_json::Value::as_bool))
             .unwrap_or(d.propagate);
+        let materialize_labels = env_bool(MATERIALIZE_LABELS_ENV)
+            .or_else(|| cfg("materializeLabels").and_then(serde_json::Value::as_bool))
+            .unwrap_or(d.materialize_labels);
         Self {
             no_progress: Duration::from_secs(minutes.saturating_mul(60)),
             escalate,
             interval: Duration::from_secs(interval),
             pools_grace: Duration::from_secs(grace.saturating_mul(60)),
             propagate,
+            materialize_labels,
             level_caps: LevelCaps::from_block(cfg("levelCaps")),
         }
     }

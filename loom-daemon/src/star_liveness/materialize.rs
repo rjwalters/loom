@@ -28,12 +28,21 @@
 //! but no longer reaches it stays (the removal rule keys on the root's star,
 //! not on the edge).
 //!
+//! A star whose owner is **unread** (never read, the per-pass read budget
+//! ran out, or the read failed) is neither: it is not a root, because it may
+//! be an inherited star at the depth cap, and walking from it would start a
+//! fresh [`super::collect::MAX_INHERIT_DEPTH`] below it, so each cold pass
+//! could push the label one cap further down. It keeps its star and its row,
+//! nothing is written from it, and it is never removed, until a later pass
+//! reads its owner. A real root reaches it as a child meanwhile.
+//!
 //! # Budget
 //!
 //! - Ownership needs one timeline read per item whose only operator label is
 //!   the star, cached until the item's `updated_at` moves, at most
 //!   [`MAX_OWNER_READS_PER_PASS`] per repo per pass (least recently checked
-//!   first). An item not checked yet is a root and is never removed.
+//!   first). An item not checked yet is not a root, originates no write and
+//!   is never removed.
 //! - At most [`MAX_STAR_WRITES_PER_PASS`] adds and removes per repo per pass,
 //!   so a starred epic with many children converges over several passes.
 //! - Nothing is removed after an incomplete walk (a deferred child, a failed
@@ -154,9 +163,13 @@ pub fn owners(
 /// The starred listing split by owner.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Classified {
-    /// Where the walk starts: operator stars, and any star whose owner is
-    /// not known fresh as inherited.
+    /// Where the walk starts: stars whose owner is read as the operator
+    /// (fresh or stale).
     pub roots: BTreeSet<u32>,
+    /// Stars whose owner is unread ([`Known::Unknown`]): kept, but neither
+    /// walked from nor removed, so an unread inherited star cannot restart
+    /// the depth cap.
+    pub unread: BTreeSet<u32>,
     /// Inherited stars whose root still carries a star (or could not be
     /// read): walked as children, kept when nothing reaches them.
     pub held: BTreeMap<u32, u32>,
@@ -186,6 +199,9 @@ pub fn classify(
             // never removed on it, but not a root either.
             Known::Stale(Owner::Inherited { root }) if root != n => {
                 out.held.insert(n, root);
+            }
+            Known::Unknown => {
+                out.unread.insert(n);
             }
             _ => {
                 out.roots.insert(n);

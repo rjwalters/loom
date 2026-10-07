@@ -272,6 +272,83 @@ fn propagate_or_escalate_off_writes_no_label() {
     }
 }
 
+/// The P1 on #10590: a cold owner cache must not let an unread inherited
+/// star act as a root. Host A materializes a depth-3 task-list chain from
+/// #900. Host B starts cold with 25 more starred issues ahead of the chain in
+/// the read order, so the 20-read budget leaves the chain's owners unread on
+/// its first pass. Treating the unread #903 (depth 3) as a root would star
+/// #904 at depth 4. It stays unstarred on that pass and on every later one,
+/// once the owners are read.
+#[test]
+fn an_unread_owner_does_not_restart_the_depth_cap() {
+    let world = World::default();
+    let slug = "m/cold";
+    world.add(slug, issue_with_body(900, &[STAR], "- [ ] #901\n"));
+    world.add(slug, issue_with_body(901, &[], "- [ ] #902\n"));
+    world.add(slug, issue_with_body(902, &[], "- [ ] #903\n"));
+    world.add(slug, issue_with_body(903, &[], "- [ ] #904\n"));
+    world.add(slug, issue(904, &[]));
+    let mut input = repo_input(slug);
+    starred(&mut input, 900, AT);
+    let mut warm = Host::new("a");
+    for m in 0..3 {
+        warm.pass(&world, std::slice::from_ref(&input), Vec::new(), t(10, m * 2));
+    }
+    assert!((901..=903).all(|n| world.starred(slug, n)), "depth 1..3 starred");
+    assert!(!world.starred(slug, 904), "depth 4 is not");
+
+    // 25 operator stars that sort ahead of the chain in the cold read order.
+    for n in 100..125 {
+        world.add(slug, issue(n, &[]));
+        world.human_star(slug, n);
+    }
+    let markers_before = markers(&world, slug).len();
+    let mut cold = Host::new("b");
+    let reads_before = world.repo(slug).timeline_reads;
+    cold.pass(&world, std::slice::from_ref(&input), Vec::new(), t(11, 0));
+    assert_eq!(
+        world.repo(slug).timeline_reads - reads_before,
+        materialize::MAX_OWNER_READS_PER_PASS,
+        "the read budget ran out before the chain"
+    );
+    assert!(!world.starred(slug, 904), "an unread #903 is not a root");
+    assert_eq!(markers(&world, slug).len(), markers_before, "nothing written from unread stars");
+    assert!((901..=903).all(|n| world.starred(slug, n)), "unread stars are never removed");
+
+    for m in 1..4 {
+        cold.pass(&world, std::slice::from_ref(&input), Vec::new(), t(11, m * 2));
+    }
+    assert!(!world.starred(slug, 904), "the cap holds once the owners are read");
+    assert!((901..=903).all(|n| world.starred(slug, n)));
+}
+
+/// `materializeLabels` is off by default: without it the pass reads no star
+/// owner and writes no star label, and the walk still orders the children in
+/// memory. Config and env turn it on.
+#[test]
+fn materialize_labels_is_off_by_default() {
+    assert!(!Settings::default().materialize_labels);
+    assert!(!Settings::from_block(None).materialize_labels);
+    let on = Settings::from_block(Some(&serde_json::json!({"materializeLabels": true})));
+    assert!(on.materialize_labels);
+
+    let world = World::default();
+    let slug = "m/default-off";
+    let input = decomposition(&world, slug);
+    let off = Settings {
+        materialize_labels: false,
+        ..settings()
+    };
+    let r = Host::new("a").pass_with(&world, &[input], Vec::new(), t(10, 0), off);
+    assert!((11..=13).all(|n| !world.starred(slug, n)), "no label written");
+    assert!(markers(&world, slug).is_empty(), "no marker posted");
+    assert_eq!(world.repo(slug).timeline_reads, 0, "no owner read");
+    for n in 11..=13 {
+        let row = r.rows.iter().find(|row| row.issue == n).unwrap();
+        assert_eq!(row.inherited_from, Some(10), "#{n} still inherits in memory");
+    }
+}
+
 /// A peer host's fresh star (a marker the stale listing does not show yet)
 /// is not written twice.
 #[test]
@@ -284,8 +361,9 @@ fn a_second_host_does_not_star_the_same_child_again() {
     assert_eq!(markers(&world, slug).len(), 3, "one marker per child fleet-wide");
 }
 
-/// Operator, unknown and stale stars: roots or held, never orphaned; only a
-/// fresh inherited star whose root is unstarred can be removed.
+/// Operator stars are roots; stale inherited ones are held; an unread owner
+/// is neither a root nor removable (it may be an inherited star at the depth
+/// cap); only a fresh inherited star whose root is unstarred can be removed.
 #[test]
 fn classify_splits_the_listing_by_owner() {
     let known = std::collections::BTreeMap::from([
@@ -305,7 +383,8 @@ fn classify_splits_the_listing_by_owner() {
     assert_eq!(
         c,
         Classified {
-            roots: [13, 14].into_iter().collect(),
+            roots: [14].into_iter().collect(),
+            unread: [13].into_iter().collect(),
             held: [(12, 10), (15, 99)].into_iter().collect(),
             orphaned: [(11, 10)].into_iter().collect(),
         }

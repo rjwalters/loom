@@ -353,9 +353,12 @@ pub fn repo_input(slug: &str) -> RepoInput {
     }
 }
 
+/// Test settings: escalation and label materialization on (materialization
+/// is default-off in production; [`Settings::default`]).
 pub fn settings() -> Settings {
     Settings {
         escalate: true,
+        materialize_labels: true,
         ..Settings::default()
     }
 }

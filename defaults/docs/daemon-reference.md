@@ -2585,8 +2585,8 @@ repos, makes at most 50 walk reads per repo per pass (closed children and
 blocker reads count), and a child of
 several starred issues takes the earliest starred-at.
 
-**Materialized star (#10012 §2–§3).** With `propagate` and `escalate` on, the
-pass also writes the inherited star as the `loom:operator-priority` label on
+**Materialized star (#10012 §2–§3).** With `materializeLabels` on (default
+**off**, an opt-in) together with `propagate` and `escalate`, the pass also writes the inherited star as the `loom:operator-priority` label on
 every open child reached by a link the issue text records (park record, task
 list, the dependency phrase of a `loom:blocked` parent), so Curator, Builder's
 starred-first query, the dashboard and `forge starred` see it too. A
@@ -2596,7 +2596,11 @@ Each write posts the inherited audit marker
 (`<!-- loom:operator-priority-intent=… action=star requested_at=<root's
 starred-at> … inherited_from=#P -->`), so the child sorts at the root's star
 time everywhere. A child whose **latest** star event is that daemon marker is
-walked as a child of its root, never as a root of its own. When the root loses
+walked as a child of its root, never as a root of its own. A star whose owner
+is still unread (the read budget below ran out, or the read failed) is neither:
+no walk starts from it, nothing is written from it and it is never removed until
+a later pass reads its owner, so a cold cache cannot restart the depth cap below
+an inherited star. When the root loses
 its star, the next complete pass posts the same marker with `action=unstar`
 and takes the label off every child the root no longer reaches through a
 starred ancestor. Never removed: a star whose latest star event is a human
@@ -2657,6 +2661,7 @@ default**):
 | `intervalSecs` | `LOOM_OPERATOR_PRIORITY_INTERVAL_SECS` | `120` | pass interval |
 | `poolsExhaustedGraceMinutes` | `LOOM_OPERATOR_PRIORITY_POOLS_GRACE_MINUTES` | `10` | wait before a `pools-exhausted` ask; `0` asks at once |
 | `propagate` | `LOOM_OPERATOR_PRIORITY_PROPAGATE` | `true` | a star also reaches its children by park record, task list and dependency phrase; `false` keeps only the blocker / incident / red-main inheritance |
+| `materializeLabels` | `LOOM_OPERATOR_PRIORITY_MATERIALIZE_LABELS` | `false` | write the inherited star as the `loom:operator-priority` label (and on the linked PR) and take it back when the root loses its star ("Materialized star" above); needs `propagate` and `escalate`. Off, the inherited star is an in-memory ordering only, no star owner is read and no star label is written |
 | `levelCaps` | — | `{"2": 5}` (the level table) | per-level cap on open issues carrying the level's operator label; over the cap is flagged in the digest, never refused |
 
 **Priority levels (#10307).** Every pass also walks each level ≥ 2 issue's
