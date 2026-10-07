@@ -101,7 +101,7 @@ jobs:
         run: cargo nextest run --workspace --profile ci
       - name: nextest, loom-daemon with --features otlp, UNPARTITIONED
         if: ${{ !cancelled() }}
-        # `otlp` is not purely additive (two tests are `cfg(not(feature =
+        # `otlp` is not purely additive (three tests are `cfg(not(feature =
         # "otlp"))`), so neither this nor the default-feature run subsumes the
         # other. `--workspace --features otlp` is not a thing in a virtual
         # workspace where only one member declares the feature.
