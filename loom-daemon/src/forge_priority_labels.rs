@@ -41,6 +41,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::merge_pr::refs::{
     closing_refs, has_unnegated_closing_ref, loom_issue_trailer_refs, partial_increment_refs,
 };
@@ -159,10 +160,15 @@ pub fn audit_comment(issue: u32, pr: u32, labels: &[String], starred_at: Option<
 /// is not a JSON array of strings.
 pub fn fetch_labels(root: &Path, slug: &str, issue: u32) -> Result<Vec<String>, String> {
     let path = format!("repos/{slug}/issues/{issue}");
-    let out = crate::worktree_ops::gh::bounded_counted(
-        "forge.priority_labels",
-        root,
-        ["api", path.as_str(), "--jq", "[.labels[].name]"],
+    let out = crate::worktree_ops::gh::bounded_via(
+        GhInvocation::new(
+            Operation::new("forge.priority_labels"),
+            AccessIntent::Read,
+            GhTarget::None,
+            crate::worktree_ops::gh::GH_PROBE_TIMEOUT,
+        )
+        .args(["api", path.as_str(), "--jq", "[.labels[].name]"])
+        .current_dir(root),
     )
     .ok_or_else(|| "gh did not answer".to_string())?;
     if !out.status.success() {
