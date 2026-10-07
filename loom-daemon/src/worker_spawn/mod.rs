@@ -448,15 +448,22 @@ fn run_preflight(
                     &crate::forge_egress::worker_env::python3_missing_finding(&profile.image),
                 )));
             }
-            let mut command = containment::docker_command_with(
+            // #9989: the egress boundary must be established on THIS path —
+            // the one that actually launches the worker — so `required`
+            // never reaches `docker run` without the sidecar and canary.
+            let injection = prepared.as_ref().map(|p| &p.injection);
+            let sidecar =
+                containment::establish_egress_sidecar(&profile, injection, worker_egress.as_ref())?;
+            let mut command = containment::docker_command_network(
                 &profile,
                 root,
                 &std::env::current_dir().map_err(|e| LaunchError::config(e.to_string()))?,
                 options.log.as_deref(),
                 &args.args,
                 &credentials,
-                prepared.as_ref().map(|p| &p.injection),
+                injection,
                 worker_egress.as_ref(),
+                sidecar.as_ref(),
             )?;
             llm_gateway::scrub(&mut command);
             let mut log = attach_log(&mut command, options.log.as_deref())?;
@@ -806,5 +813,35 @@ mod codex_adapter_tests {
                 .collect::<Vec<_>>();
             assert_eq!(super::codex_adapter_model(&args).as_deref(), Some("gpt-5"));
         }
+    }
+}
+
+#[cfg(test)]
+mod egress_boundary_wiring_tests {
+    /// #9989 regression: the `worker run` containment branch is the only
+    /// production launcher, so it must establish the egress sidecar and hand
+    /// it to `docker_command_network`. Calling `docker_command_with` there
+    /// (which passes no sidecar) would let `enforcement.api = required` reach
+    /// `docker run` with no boundary and no canary. The branch execs the
+    /// worker, so it is pinned at the call site rather than run.
+    #[test]
+    fn worker_run_establishes_sidecar_before_docker_run() {
+        let src = include_str!("mod.rs");
+        let production = src
+            .split("mod egress_boundary_wiring_tests")
+            .next()
+            .expect("production source");
+        assert!(
+            production.contains("containment::establish_egress_sidecar("),
+            "worker run must establish the egress sidecar"
+        );
+        assert!(
+            production.contains("containment::docker_command_network("),
+            "worker run must pass the sidecar to docker_command_network"
+        );
+        assert!(
+            !production.contains("containment::docker_command_with("),
+            "worker run must not launch through the sidecar-less builder"
+        );
     }
 }

@@ -357,21 +357,7 @@ pub fn docker_command(
     injection: Option<&Injection>,
 ) -> Result<Command, LaunchError> {
     let egress = crate::forge_egress::worker_env::WorkerEgress::from_process();
-    // #9989: under `enforcement.api = required` the worker joins a sidecar
-    // that owns a network namespace denying direct GitHub API egress, and the
-    // spawn aborts unless the in-container canary was blocked. Inert otherwise.
-    let sidecar = match egress.as_ref() {
-        Some(egress) if egress.required && which_docker().is_some() => {
-            let opts = super::egress_policy::Options {
-                add_host_gateway: injection.is_some_and(|i| i.add_host_gateway),
-                watch_pid: Some(std::process::id()),
-            };
-            super::egress_policy::establish(egress, &profile.image, &opts).map_err(|f| {
-                LaunchError::config(crate::forge_egress::worker_env::refusal_message(&f))
-            })?
-        }
-        _ => None,
-    };
+    let sidecar = establish_egress_sidecar(profile, injection, egress.as_ref())?;
     docker_command_network(
         profile,
         workspace,
@@ -383,6 +369,32 @@ pub fn docker_command(
         egress.as_ref(),
         sidecar.as_ref(),
     )
+}
+
+/// #9989: under `enforcement.api = required` the worker joins a sidecar that
+/// owns a network namespace denying direct GitHub API egress, and the spawn
+/// aborts unless the in-container canary was blocked. Inert (`None`) otherwise.
+///
+/// The sidecar's lifetime is tied to THIS process (`watch_pid`), so the caller
+/// must be the process that runs or execs the worker's `docker run` — the
+/// `worker run` launcher, never the long-lived daemon.
+pub fn establish_egress_sidecar(
+    profile: &Profile,
+    injection: Option<&Injection>,
+    egress: Option<&crate::forge_egress::worker_env::WorkerEgress>,
+) -> Result<Option<super::egress_policy::Sidecar>, LaunchError> {
+    match egress {
+        Some(egress) if egress.required && which_docker().is_some() => {
+            let opts = super::egress_policy::Options {
+                add_host_gateway: injection.is_some_and(|i| i.add_host_gateway),
+                watch_pid: Some(std::process::id()),
+            };
+            super::egress_policy::establish(egress, &profile.image, &opts).map_err(|f| {
+                LaunchError::config(crate::forge_egress::worker_env::refusal_message(&f))
+            })
+        }
+        _ => Ok(None),
+    }
 }
 
 /// [`docker_command`] with the forge-egress policy injected (#9987). `Some`
