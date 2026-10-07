@@ -267,13 +267,35 @@ fn the_ci_fallback_reads_the_repos_default_branch() {
 
 // ---- #10118: unpromoted fixes (triage / curated) and escalation ----
 
+use crate::comment_trust::{Author, TrustPolicy};
+use crate::forge_identity::FleetLogins;
 use crate::work_finder::main_red_fix::{merge_red_fix_candidates, RedFixWatch};
 
 const MARKER_BODY: &str = "Fixes red main.\n\n<!-- loom:main-red-fix -->\n";
 
-/// A marker-bearing fix still carrying `label` (`loom:triage` / `loom:curated`).
+/// A marker-bearing fix still carrying `label` (`loom:triage` / `loom:curated`),
+/// filed by the repo owner (a trusted author, #9548).
 fn unpromoted(n: u32, label: &str) -> WorkItem {
-    WorkItem::new(n, vec![label.into()]).with_body(Some(MARKER_BODY.into()))
+    unpromoted_by(n, label, Author::new(Some("rjwalters"), Some("OWNER")))
+}
+
+/// [`unpromoted`], filed by `author`.
+fn unpromoted_by(n: u32, label: &str, author: Author) -> WorkItem {
+    WorkItem::new(n, vec![label.into()])
+        .with_body(Some(MARKER_BODY.into()))
+        .with_author(Some(author))
+}
+
+/// The trust rules a repo with one fleet App (`loom-fleet-dispatch`) resolves
+/// to: insiders by association, the fleet App, nothing else.
+fn policy() -> TrustPolicy {
+    TrustPolicy::new(FleetLogins::single("loom-fleet-dispatch"), None, Vec::new())
+}
+
+/// [`merge_red_fix_candidates`] under [`policy`].
+fn merge(ready: Vec<WorkItem>, rows: Vec<WorkItem>) -> Vec<WorkItem> {
+    let policy = policy();
+    merge_red_fix_candidates(ready, rows, |a| policy.trusts(a))
 }
 
 /// Run one multi-workspace tick over `items` with `lane`; return what was
@@ -397,17 +419,74 @@ fn the_unpromoted_listing_keeps_only_unclaimed_marker_rows() {
         row.labels.push(extra.into());
         rows.push(row);
     }
-    let merged = merge_red_fix_candidates(ready, rows);
+    let merged = merge(ready, rows);
     let numbers: Vec<u32> = merged.iter().map(|i| i.number).collect();
     assert_eq!(numbers, vec![1, 2]);
     // The second listing dedups against the first.
-    let merged = merge_red_fix_candidates(merged, vec![unpromoted(2, "loom:curated")]);
+    let merged = merge(merged, vec![unpromoted(2, "loom:curated")]);
     assert_eq!(merged.len(), 2);
     // A promoted or starred fix is not "unpromoted": it is a candidate anyway.
     assert!(!fix(1).is_unpromoted_red_fix());
     let mut starred = unpromoted(2, "loom:triage");
     starred.labels.push(OPERATOR_PRIORITY_LABEL.into());
     assert!(!starred.is_unpromoted_red_fix());
+}
+
+/// #10118 / #9548: the marker is content, not control, unless a trusted
+/// identity filed the issue. An outsider's marker-bearing triage issue is not
+/// admitted unpromoted (it would otherwise skip the human `loom:issue`
+/// promotion on a red repo); the fleet App's and an insider's are.
+#[test]
+fn an_untrusted_authors_marker_is_not_admitted_unpromoted() {
+    let rows = vec![
+        unpromoted_by(1, "loom:triage", Author::new(Some("mallory"), Some("NONE"))),
+        // A merged fork PR makes anyone a contributor: still untrusted.
+        unpromoted_by(2, "loom:triage", Author::new(Some("eve"), Some("CONTRIBUTOR"))),
+        // A user account named like the fleet App is not the App.
+        unpromoted_by(3, "loom:curated", Author::new(Some("loom-fleet-dispatch"), Some("NONE"))),
+        // Another installation's App is not ours.
+        unpromoted_by(4, "loom:triage", Author::new(Some("other-fleet[bot]"), Some("NONE"))),
+        // No author at all (a listing without one) is never trusted.
+        WorkItem::new(5, vec!["loom:triage".into()]).with_body(Some(MARKER_BODY.into())),
+        // Trusted: the fleet App, a member, the owner.
+        unpromoted_by(
+            6,
+            "loom:triage",
+            Author::new(Some("loom-fleet-dispatch[bot]"), Some("NONE")),
+        ),
+        unpromoted_by(7, "loom:curated", Author::new(Some("teammate"), Some("MEMBER"))),
+        unpromoted(8, "loom:triage"),
+    ];
+    let merged = merge(Vec::new(), rows);
+    let numbers: Vec<u32> = merged.iter().map(|i| i.number).collect();
+    assert_eq!(numbers, vec![6, 7, 8]);
+
+    // End to end on a red, halted repo: only the trusted fix is dispatched,
+    // and the untrusted one is not even seen.
+    let rows = vec![
+        unpromoted_by(1, "loom:triage", Author::new(Some("mallory"), Some("NONE"))),
+        unpromoted(2, "loom:triage"),
+    ];
+    let (dispatched, seen) = multi_tick(merge(Vec::new(), rows), RED, true, false);
+    assert_eq!(dispatched, vec![2]);
+    assert_eq!(seen, 1);
+}
+
+/// The trust policy is consulted only for marker-bearing rows that survive
+/// the other filters, so a repo with no such row never resolves one.
+#[test]
+fn trust_is_consulted_only_for_marker_rows() {
+    let mut asked = Vec::new();
+    let rows = vec![
+        WorkItem::new(1, vec!["loom:triage".into()]),
+        unpromoted_by(2, "loom:triage", Author::new(Some("mallory"), Some("NONE"))),
+    ];
+    let merged = merge_red_fix_candidates(Vec::new(), rows, |a| {
+        asked.push(a.login.clone());
+        false
+    });
+    assert!(merged.is_empty());
+    assert_eq!(asked, vec![Some("mallory".to_string())]);
 }
 
 #[test]

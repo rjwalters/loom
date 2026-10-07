@@ -309,6 +309,10 @@ pub struct WorkItem {
     /// Set when this issue blocks a starred issue and inherits its star
     /// (#9244 C): the starred issue's number. See [`crate::star_liveness::inherit`].
     pub operator_priority_inherited_from: Option<u32>,
+    /// Who filed the issue, when the listing supplied it (#10118). Only a
+    /// trusted author's red-main-fix marker admits an unpromoted row (#9548);
+    /// `None` (a synthetic item) is never trusted. See [`main_red_fix`].
+    pub author: Option<crate::comment_trust::Author>,
 }
 
 impl WorkItem {
@@ -330,6 +334,7 @@ impl WorkItem {
             updated_at: None,
             operator_priority_at: None,
             operator_priority_inherited_from: None,
+            author: None,
         }
     }
 

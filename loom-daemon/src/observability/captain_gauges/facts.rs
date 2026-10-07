@@ -121,6 +121,7 @@ pub fn as_listing(facts: &[BlockedFact]) -> Vec<RestIssue> {
             state: "open".to_string(),
             body: None,
             author: None,
+            author_association: None,
             is_pull_request: false,
             comments: 0,
         })

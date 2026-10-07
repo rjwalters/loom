@@ -130,6 +130,7 @@ pub(super) fn row(number: u32, body: &str, comments: u32, pr: bool, labels: &[&s
         state: "open".to_string(),
         body: Some(body.to_string()),
         author: None,
+        author_association: None,
         is_pull_request: pr,
         comments,
     }

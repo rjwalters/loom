@@ -2453,8 +2453,11 @@ tick, made only when the repo has a marker-bearing candidate.
 **Unpromoted red-main fixes (#10118).** A fix is usually filed in `loom:triage`,
 so it would never reach the `loom:issue` listing while `main` stays red. Each
 tick therefore also makes ETag-cached listings of `loom:triage` and
-`loom:curated` and keeps only rows carrying the marker (line-anchored), not
-already listed, and not `loom:building`, `loom:curating` or on the Champion path
+`loom:curated` and keeps only rows carrying the marker (line-anchored) **in an
+issue a trusted identity filed** (the comment-trust rules, #9548: a repo
+insider, this fleet's Apps, the daemon's own identity, `forge.trustedCommenters`
+or the fleet admin roster; an outsider's marker is content, not control, and
+that issue waits for normal promotion), not already listed, and not `loom:building`, `loom:curating` or on the Champion path
 (`loom:epic`, `loom:architect`, `loom:hermit`, `loom:auditor`). A failed listing
 costs only its own rows. These rows are candidates **only while the repo is
 red** (verified red, or the CI fallback above); on a green repo they are dropped

@@ -371,6 +371,7 @@ fn gate_stash_keeps_only_open_prs_and_drains_per_root() {
         state: state.to_string(),
         body: None,
         author: None,
+        author_association: None,
         is_pull_request: is_pr,
     };
     let root = Path::new("/stash-test/a");

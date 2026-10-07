@@ -124,7 +124,7 @@ says so, and no role applies it).
   pre-existing failure confirmed on `origin/main`). Curator takes these next,
   after starred work, and never promotes them: while that repo's `main` is
   verified red the work finder admits them from `loom:triage`/`loom:curated`
-  itself, and alerts the operator if one stays unclaimed (#10118).
+  itself (only when a trusted identity filed them, #9548), and alerts the operator if one stays unclaimed (#10118).
 
 ## Entry points
 

@@ -135,9 +135,17 @@ impl WorkSource for GhWorkSource {
         // #10118: marker-bearing fixes still in triage / curated. Merged after
         // star inheritance so such a row never looks starred; the lane drops
         // them again unless this repo's `main` is red (`main_red_fix::evaluate`).
+        // Only a trusted filer's marker counts (#9548); the policy is resolved
+        // at most once per tick, and only if a marker-bearing row needs it.
+        let mut policy: Option<crate::comment_trust::TrustPolicy> = None;
+        let root = self.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
         for label in super::main_red_fix::UNPROMOTED_LABELS {
             let rows = self.list_side_label(label);
-            items = super::main_red_fix::merge_red_fix_candidates(items, rows);
+            items = super::main_red_fix::merge_red_fix_candidates(items, rows, |author| {
+                policy
+                    .get_or_insert_with(|| crate::comment_trust::TrustPolicy::for_root(&root))
+                    .trusts(author)
+            });
         }
         Ok(items)
     }
@@ -178,6 +186,12 @@ impl GhWorkSource {
                 WorkItem::with_created_at(r.number, r.labels, r.created_at)
                     .with_body(r.body)
                     .with_updated_at(r.updated_at)
+                    .with_author(r.author.as_deref().map(|login| {
+                        crate::comment_trust::Author::new(
+                            Some(login),
+                            r.author_association.as_deref(),
+                        )
+                    }))
             })
             .collect())
     }

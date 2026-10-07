@@ -240,6 +240,7 @@ pub fn issue(number: u32, labels: &[&str]) -> RestIssue {
         state: "open".to_string(),
         body: Some(String::new()),
         author: None,
+        author_association: None,
         is_pull_request: false,
     }
 }

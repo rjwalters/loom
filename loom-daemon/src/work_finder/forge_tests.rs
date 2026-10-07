@@ -15,17 +15,19 @@ const STARRED: &str = r#"[
   {"number":5,"labels":[{"name":"loom:building"},{"name":"loom:operator-priority"}]}
 ]"#;
 
-/// Pre-promotion rows (#10118): only marker-bearing, unclaimed ones are kept.
+/// Pre-promotion rows (#10118): only marker-bearing, unclaimed ones filed by
+/// a trusted author (#9548) are kept. #10 is an outsider's marker.
 const TRIAGE: &str = r#"[
-  {"number":3,"labels":[{"name":"loom:triage"},{"name":"loom:operator-priority"}],"body":"<!-- loom:main-red-fix -->"},
-  {"number":6,"labels":[{"name":"loom:triage"}],"body":"Fix CI.\n<!-- loom:main-red-fix -->\n"},
-  {"number":7,"labels":[{"name":"loom:triage"}],"body":"No marker here."},
-  {"number":8,"labels":[{"name":"loom:triage"},{"name":"loom:building"}],"body":"<!-- loom:main-red-fix -->"}
+  {"number":3,"labels":[{"name":"loom:triage"},{"name":"loom:operator-priority"}],"body":"<!-- loom:main-red-fix -->","user":{"login":"rjwalters"},"author_association":"OWNER"},
+  {"number":6,"labels":[{"name":"loom:triage"}],"body":"Fix CI.\n<!-- loom:main-red-fix -->\n","user":{"login":"rjwalters"},"author_association":"OWNER"},
+  {"number":7,"labels":[{"name":"loom:triage"}],"body":"No marker here.","user":{"login":"rjwalters"},"author_association":"OWNER"},
+  {"number":8,"labels":[{"name":"loom:triage"},{"name":"loom:building"}],"body":"<!-- loom:main-red-fix -->","user":{"login":"rjwalters"},"author_association":"OWNER"},
+  {"number":10,"labels":[{"name":"loom:triage"}],"body":"<!-- loom:main-red-fix -->","user":{"login":"mallory","type":"User"},"author_association":"NONE"}
 ]"#;
 
 const CURATED: &str = r#"[
-  {"number":6,"labels":[{"name":"loom:curated"}],"body":"<!-- loom:main-red-fix -->"},
-  {"number":9,"labels":[{"name":"loom:curated"}],"body":"<!-- loom:main-red-fix -->"}
+  {"number":6,"labels":[{"name":"loom:curated"}],"body":"<!-- loom:main-red-fix -->","user":{"login":"rjwalters"},"author_association":"OWNER"},
+  {"number":9,"labels":[{"name":"loom:curated"}],"body":"<!-- loom:main-red-fix -->","user":{"login":"teammate"},"author_association":"MEMBER"}
 ]"#;
 
 /// A fake `gh` answering the four listings and the timeline read, logging
@@ -82,8 +84,17 @@ fn starred_rows_are_merged_deduped_and_stamped_with_starred_at() {
     let numbers: Vec<u32> = items.iter().map(|i| i.number).collect();
     // #1 deduped, #4 (a PR) and #5 (already claimed) dropped. Then the
     // unpromoted red-main fixes (#10118): #3 already listed as starred, #7
-    // has no marker, #8 is claimed, #6 is listed once.
+    // has no marker, #8 is claimed, #6 is listed once, and #10's marker is
+    // an outsider's (#9548): not admitted.
     assert_eq!(numbers, vec![1, 2, 3, 6, 9]);
+    let owner = items[3]
+        .author
+        .as_ref()
+        .expect("the listing carries the author");
+    assert_eq!(
+        (owner.login.as_deref(), owner.association.as_deref()),
+        (Some("rjwalters"), Some("OWNER"))
+    );
     assert!(items[3].is_unpromoted_red_fix() && items[4].is_unpromoted_red_fix());
     assert!(!items[2].is_unpromoted_red_fix(), "a starred fix is a candidate anyway");
     assert_eq!(items[0].operator_priority_at.as_deref(), Some("2026-09-01T00:00:00Z"));

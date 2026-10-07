@@ -32,6 +32,14 @@
 //! unpromoted issue needs no new path: the registry's pre-flip classifier
 //! returns `NotYetApproved` and the child sweep starts from Curator.
 //!
+//! Because that path skips the human `loom:issue` promotion, the marker on an
+//! unpromoted row counts **only when a trusted identity filed the issue**
+//! (the [`crate::comment_trust`] rules, #9548: a repo insider, this fleet's
+//! Apps, the daemon's own identity, or the configured allowlist / fleet admin
+//! roster). The repo is public and the marker is an invisible HTML comment,
+//! so an outsider's issue that reaches triage carrying it is content, not
+//! control: it is not admitted, and waits for promotion like any other issue.
+//!
 //! If a fix stays unclaimed on a red repo for longer than
 //! [`RED_FIX_ESCALATE_AFTER`] (config:
 //! `autonomous.workFinder.redFixEscalateAfterSecs`), the operator is alerted
@@ -76,6 +84,13 @@ impl WorkItem {
             && !self.is_operator_priority()
     }
 
+    /// Builder-style setter for [`Self::author`] (#10118).
+    #[must_use]
+    pub fn with_author(mut self, author: Option<crate::comment_trust::Author>) -> Self {
+        self.author = author;
+        self
+    }
+
     /// True when [`Self::body`] carries [`MAIN_RED_FIX_MARKER`] at the start
     /// of a line (the same line-anchored style as the complexity and
     /// recheck-interval markers, so prose quoting the marker mid-sentence does
@@ -94,13 +109,39 @@ impl WorkItem {
 /// the rows [`super::operator_priority::excluded_from_side_listing`] drops
 /// from the starred listing (claimed, being curated, or Champion-path). Every
 /// kept row still goes through the normal skip filters.
+///
+/// A row is kept only when `trusts` believes its [`WorkItem::author`] (#9548):
+/// an unpromoted row skips the human promotion, so its marker must come from
+/// a trusted filer. A row with no author (a listing without one) is never
+/// kept. `trusts` runs only for marker-bearing rows, so a repo with none never
+/// resolves a trust policy.
 #[must_use]
-pub fn merge_red_fix_candidates(mut ready: Vec<WorkItem>, rows: Vec<WorkItem>) -> Vec<WorkItem> {
+pub fn merge_red_fix_candidates(
+    mut ready: Vec<WorkItem>,
+    rows: Vec<WorkItem>,
+    mut trusts: impl FnMut(&crate::comment_trust::Author) -> bool,
+) -> Vec<WorkItem> {
     let listed: HashSet<u32> = ready.iter().map(|i| i.number).collect();
     ready.extend(rows.into_iter().filter(|i| {
-        i.is_main_red_fix()
-            && !listed.contains(&i.number)
-            && !super::operator_priority::excluded_from_side_listing(i)
+        if !i.is_main_red_fix()
+            || listed.contains(&i.number)
+            || super::operator_priority::excluded_from_side_listing(i)
+        {
+            return false;
+        }
+        let trusted = i.author.as_ref().is_some_and(&mut trusts);
+        if !trusted {
+            log::debug!(
+                "work_finder: #{} carries the red-main-fix marker but its author ({}) is not \
+                 trusted; not admitting it unpromoted (#10118, #9548)",
+                i.number,
+                i.author
+                    .as_ref()
+                    .and_then(|a| a.login.as_deref())
+                    .unwrap_or("unknown"),
+            );
+        }
+        trusted
     }));
     ready
 }
