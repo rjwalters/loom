@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -45,7 +45,9 @@ use crate::comment_trust::TrustPolicy;
 use crate::forge_call_stats::ops;
 use crate::forge_etag_store as store;
 use crate::forge_identity::FleetLogins;
+use crate::gh_invocation::{AccessIntent, GhCompletion, GhInvocation, GhTarget, Operation};
 use crate::operator_decision::cli::GhForge;
+use crate::proc_exec::Completion;
 
 /// Every read here is recorded under this caller in `forge_call_stats`.
 const CALLER: &str = "stale_blocked_release";
@@ -226,6 +228,57 @@ pub fn zero_row_message(cross_check_rows: usize, slug: &str) -> Option<String> {
     })
 }
 
+/// Deadline for the zero-row cross-check's one `gh api` call. The task visits
+/// roots sequentially, so an unbounded read here would stall every later root.
+const CROSS_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Open `loom:blocked` rows an uncached REST read of `slug` returns (at most
+/// one is asked for). Every failure — spawn, timeout, non-zero exit, a body that
+/// is not a JSON array — is an `Err`, never a clean empty result.
+fn cross_check_rows(
+    gh_bin: &Path,
+    root: &Path,
+    slug: &str,
+    timeout: Duration,
+) -> Result<usize, String> {
+    let url = format!("repos/{slug}/issues?labels=loom:blocked&state=open&per_page=1");
+    let out = match GhInvocation::new(
+        Operation::new(CALLER),
+        AccessIntent::Read,
+        GhTarget::None,
+        timeout,
+    )
+    .program(gh_bin)
+    .current_dir(root)
+    .args(["api", &url])
+    .execute()
+    {
+        Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
+        Ok(_) => return Err(format!("timed out after {}s", timeout.as_secs_f32())),
+        Err(e) => return Err(format!("could not run gh: {e}")),
+    };
+    if !out.status.success() {
+        return Err(format!(
+            "gh api exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    serde_json::from_slice::<Vec<Value>>(&out.stdout)
+        .map(|rows| rows.len())
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+/// The pass's `enumerate_error` text for a cross-check result: the anomaly for
+/// missed rows, an explicit failure when the check itself could not complete,
+/// `None` only for a verified empty listing.
+fn zero_row_verdict(rows: Result<usize, String>, slug: &str) -> Option<String> {
+    match rows {
+        Ok(n) => zero_row_message(n, slug),
+        Err(why) => Some(format!("zero-row cross-check of {slug} failed: {why} (#10763)")),
+    }
+}
+
 /// [`ReleaseForge`] over `gh`: REST + ETag reads through
 /// [`crate::forge_etag_store`], the comment through
 /// [`crate::forge_comment::post_comment`] after a write-scope check.
@@ -270,15 +323,10 @@ impl GhReleaseForge {
         if !anomaly_check_due(&self.slug, Instant::now()) {
             return None;
         }
-        let url = format!("repos/{}/issues?labels=loom:blocked&state=open&per_page=1", self.slug);
-        let out = std::process::Command::new(&self.gh_bin)
-            .current_dir(&self.root)
-            .args(["api", &url])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())?;
-        let rows: Vec<Value> = serde_json::from_slice(&out.stdout).ok()?;
-        zero_row_message(rows.len(), &self.slug)
+        zero_row_verdict(
+            cross_check_rows(&self.gh_bin, &self.root, &self.slug, CROSS_CHECK_TIMEOUT),
+            &self.slug,
+        )
     }
 
     fn get(&self, op: crate::forge_call_stats::ForgeOp, url: &str) -> Result<String, String> {
@@ -387,5 +435,48 @@ mod anomaly_tests {
         assert!(anomaly_check_due("anomaly-test/a", now));
         assert!(!anomaly_check_due("anomaly-test/a", now));
         assert!(anomaly_check_due("anomaly-test/b", now));
+    }
+
+    #[cfg(unix)]
+    fn fake_gh(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("gh");
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_cross_check_times_out_and_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let gh = fake_gh(dir.path(), "sleep 30");
+        let t = Instant::now();
+        let r = cross_check_rows(&gh, dir.path(), "o/r", Duration::from_millis(500));
+        assert!(t.elapsed().as_secs() < 10, "the hung read must not block the visit");
+        let why = r.clone().unwrap_err();
+        assert!(why.contains("timed out"), "{why}");
+        let msg = zero_row_verdict(r, "o/r").unwrap();
+        assert!(msg.contains("cross-check of o/r failed"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_check_failures_are_not_a_clean_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_exit = fake_gh(dir.path(), "echo boom >&2; exit 1");
+        assert!(cross_check_rows(&bad_exit, dir.path(), "o/r", Duration::from_secs(5))
+            .unwrap_err()
+            .contains("boom"));
+        let bad_body = fake_gh(dir.path(), "echo not-json");
+        assert!(cross_check_rows(&bad_body, dir.path(), "o/r", Duration::from_secs(5))
+            .unwrap_err()
+            .contains("invalid response"));
+        let missing = dir.path().join("nope");
+        assert!(cross_check_rows(&missing, dir.path(), "o/r", Duration::from_secs(5)).is_err());
+        let empty = fake_gh(dir.path(), "echo '[]'");
+        let ok = cross_check_rows(&empty, dir.path(), "o/r", Duration::from_secs(5));
+        assert_eq!(ok, Ok(0));
+        assert!(zero_row_verdict(ok, "o/r").is_none());
     }
 }
