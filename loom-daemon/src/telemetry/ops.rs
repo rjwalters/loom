@@ -371,6 +371,18 @@ pub enum MetricName {
     /// state, 0 for the rest. Labelled `account` and `container`.
     #[serde(rename = "loom.codex_session.state")]
     CodexSessionState,
+    /// Per session-managed Codex account, one point per `kind` ∈ `hold`,
+    /// `drift_removal`: 1 while that on-disk record stands (an operator
+    /// `stop`; the reconciler's fail-closed removal for a denied mount),
+    /// else 0. Labelled `account` and `container` (#10600).
+    #[serde(rename = "loom.codex_session.record")]
+    CodexSessionRecord,
+    /// Per session-managed Codex account with a drift verdict, one point per
+    /// `kind` ∈ `missing`, `extra`, `denied`: how many workspace paths drift
+    /// that way (`extra` excludes `denied`). Labelled `account` and
+    /// `container` (#10600).
+    #[serde(rename = "loom.codex_session.mount_drift")]
+    CodexSessionMountDrift,
     // ---- Fleet gauges produced by the captain (W12) ----------------------
     /// Age of the captain's last production of a fleet gauge job, labelled
     /// `task` = the job (`observability::captain_gauges::Config::jobs`): on the captain its own,
@@ -447,6 +459,8 @@ impl MetricName {
             Self::EtaHealthSnapshotAlternatesRows => "loom.eta.health.snapshot_alternates_rows",
             Self::EtaHealthPendingOverCap => "loom.eta.health.pending_over_cap",
             Self::CodexSessionState => "loom.codex_session.state",
+            Self::CodexSessionRecord => "loom.codex_session.record",
+            Self::CodexSessionMountDrift => "loom.codex_session.mount_drift",
             Self::CaptainGaugeAgeSeconds => "loom.captain.gauge_age_seconds",
             Self::CaptainGaugeFallback => "loom.captain.gauge_fallback",
         }
@@ -530,6 +544,8 @@ impl MetricName {
             Self::EtaHealthSnapshotAlternatesRows => "{row}",
             Self::EtaHealthPendingOverCap => "{estimate}",
             Self::CodexSessionState => "1",
+            Self::CodexSessionRecord => "1",
+            Self::CodexSessionMountDrift => "{path}",
             Self::CaptainGaugeAgeSeconds => "s",
             Self::CaptainGaugeFallback => "1",
             _ => "By",
@@ -624,6 +640,14 @@ impl MetricName {
             Self::CodexSessionState => {
                 "Codex session container state per account: 1 for the current state \
                  (running, stopped, restarting, missing, stale_mounts), 0 for the others."
+            }
+            Self::CodexSessionRecord => {
+                "1 while an operator hold or a drift-removal record stands for a Codex \
+                 session account, by kind."
+            }
+            Self::CodexSessionMountDrift => {
+                "Workspace paths a Codex session container is missing, mounts extra, or \
+                 mounts though denied, by kind."
             }
             Self::CaptainGaugeAgeSeconds => {
                 "Age of the fleet captain's last run of a fleet gauge job, by task."

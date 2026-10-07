@@ -210,7 +210,11 @@ therefore creates the container with:
 A file bind does not follow a host-side replace: after `provision-codex-hooks.sh
 install` or accepting hook trust, the container sees the old file, or (Docker
 Desktop) no file. So after either step, **restart the session**:
-`accounts session stop` and then `start`. Until then dispatch exits 78. Codex
+`accounts session stop` and then `start`. The daemon's session reconciler does
+not do this for you (it restarts stopped or missing containers and recreates
+ones whose mounts drifted, not ones whose control files changed); the loop is
+in `guardrail-parity-codex.md`, "Restarting or recreating session containers
+by hand". Until then dispatch exits 78. Codex
 0.160 runs normally with these files frozen. The exception is its interactive
 TUI, which cannot save a folder-trust or hook-trust decision. For now, take
 those decisions in a throwaway container with the profile writable (see

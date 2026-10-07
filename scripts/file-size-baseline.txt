@@ -40,7 +40,7 @@
 2299 loom-daemon/src/init/scaffolding/tests.rs
 1916 loom-daemon/src/init/tests.rs
 1344 loom-daemon/src/install_self_check.rs
-2319 loom-daemon/src/ipc.rs
+2301 loom-daemon/src/ipc.rs
 4099 loom-daemon/src/ipc/tests.rs
 1045 loom-daemon/src/main.rs
 1788 loom-daemon/src/main_health_gate.rs

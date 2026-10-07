@@ -5,7 +5,7 @@
 //! created (#9979). A repository registered later is unreachable from it
 //! (every Codex tick there fails `chdir to cwd`), and one deregistered later
 //! stays mounted read-write while Codex runs with its own sandbox off. Part A
-//! detects both ([`mount_drift`]) and refuses a dispatch into an unmounted
+//! detects both ([`session_state::mount_drift`]) and refuses a dispatch into an unmounted
 //! workdir; this module fixes the container.
 //!
 //! # Safety rules
@@ -91,9 +91,11 @@
 //!
 //! # What counts as `extra`
 //!
-//! Part A's registry comparison, plus any workspace mount the denials refuse
-//! today (the home directory or an ancestor, an overlap with a `firewall:
-//! true` repository) **even if it is still registered**. A container created
+//! [`assess`] is [`session_state::effective_drift`], the one drift definition
+//! the gauge, `loom-daemon status` and the `workspace add/remove` report read
+//! too (#10600): Part A's registry comparison, plus any workspace mount the
+//! denials refuse today (the home directory or an ancestor, an overlap with a
+//! `firewall: true` repository) **even if it is still registered**. A container created
 //! with `--mount-workspace <one git checkout>` is not `extra` merely because
 //! that checkout is unregistered: `session start` accepts that as an explicit
 //! operator grant, and a recreate would mount it again. Such a container
@@ -117,8 +119,11 @@ use crate::tokens_pool::session_lifecycle::{
     container_name, workspace_mount_roots, ContainerRunner, SessionLifecycle, STOP_GRACE,
 };
 pub use crate::tokens_pool::session_mount_gate::Denials;
+/// One running container's drift as the reconciler acts on it:
+/// [`session_state::EffectiveDrift`], the shared definition (#10600).
+pub use crate::tokens_pool::session_state::EffectiveDrift as Assessed;
 use crate::tokens_pool::session_state::{
-    container_running, is_private_clone, mount_drift, workspace_label, workspace_mounts,
+    self, container_running, is_private_clone, workspace_label, workspace_mounts, DriftInputs,
     MountDrift, Snapshot,
 };
 use crate::workspace_registry::normalize_path;
@@ -161,41 +166,22 @@ pub(super) struct DriftMemory {
     healthy_beside_record: u32,
 }
 
-/// One running container's drift as the reconciler acts on it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Assessed {
-    /// [`mount_drift`], with every `denied` mount added to `extra`.
-    pub drift: MountDrift,
-    /// Mounted paths the denials positively refuse. Empty when `denials` is
-    /// `None` (unknown is not denied).
-    pub denied: Vec<PathBuf>,
-}
-
 /// Assess `inspect` against `registered` and, when they could be read, the
-/// `denials` for its workspace. Empty for a private-clone or unlabelled
-/// container.
+/// `denials` for its workspace: [`session_state::effective_drift`]. Empty for
+/// a private-clone or unlabelled container.
 #[must_use]
 pub fn assess(inspect: &Value, registered: &[PathBuf], denials: Option<&Denials>) -> Assessed {
-    let mut drift = mount_drift(inspect, registered);
-    let denied: Vec<PathBuf> = denials.map_or_else(Vec::new, |denials| {
-        workspace_mounts(inspect)
-            .into_iter()
-            .filter(|mount| denials.check(std::slice::from_ref(mount)).is_err())
-            .collect()
-    });
-    for mount in &denied {
-        if !drift.extra.contains(mount) {
-            drift.extra.push(mount.clone());
-        }
-    }
-    drift.extra.sort();
-    Assessed { drift, denied }
+    session_state::effective_drift(inspect, registered, denials)
 }
 
+/// The shared verdict with this pass's inputs (`None`: the registry is
+/// unknown, or the container is private-clone or unlabelled).
 fn assess_for(inspect: &Value, inputs: &PassInputs<'_>) -> Option<Assessed> {
-    let registered = inputs.registered?;
-    let denials = workspace_label(inspect).and_then(|label| (inputs.denials_for)(label).ok());
-    Some(assess(inspect, registered, denials.as_ref()))
+    DriftInputs {
+        registered: inputs.registered,
+        denials_for: inputs.denials_for,
+    }
+    .verdict(inspect)
 }
 
 /// The last [`priority`] class.

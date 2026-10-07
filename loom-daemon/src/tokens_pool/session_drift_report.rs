@@ -16,6 +16,12 @@
 //! bounded [`session_state::snapshot`] (a CLI process has no published
 //! snapshot to reuse); [`report_from`] is pure over it. A snapshot docker
 //! could not answer is reported as "not checked", never as drift.
+//!
+//! "Drifted" is the reconciler's own definition
+//! ([`session_state::effective_drift`], #10600): a mount `session start`
+//! would refuse today (the home directory, a `firewall: true` repository)
+//! counts even when it is still registered, and is named as denied, because
+//! the reconciler removes such a container rather than recreating it.
 
 use std::path::{Path, PathBuf};
 
@@ -23,7 +29,7 @@ use serde_json::Value;
 
 use super::session_lifecycle::SESSION_MARKER_FILE;
 use super::session_state::{
-    self, mount_drift, workspace_label, MountDrift, Snapshot, CONTAINER_PREFIX,
+    self, workspace_label, DriftInputs, EffectiveDrift, MountDrift, Snapshot, CONTAINER_PREFIX,
 };
 
 /// One host-mode session container whose mounts no longer match the registry.
@@ -33,7 +39,10 @@ pub struct DriftedSession {
     pub account: String,
     /// Its `loom.workspace` label: the `--mount-workspace` to recreate with.
     pub workspace: PathBuf,
+    /// `extra` includes `denied`.
     pub drift: MountDrift,
+    /// Mounts `session start` refuses today, whether registered or not.
+    pub denied: Vec<PathBuf>,
 }
 
 /// The session containers this host's session-managed Codex profiles were
@@ -56,28 +65,32 @@ pub fn session_containers(profile_root: &Path) -> Vec<String> {
     containers
 }
 
+/// One container's entry, when its verdict is drift.
+fn drifted_session(state: &Value, drift: Option<&EffectiveDrift>) -> Option<DriftedSession> {
+    let drift = drift.filter(|d| !d.is_empty())?;
+    let container = state["Name"].as_str()?.trim_start_matches('/').to_string();
+    let account = container.strip_prefix(CONTAINER_PREFIX)?.to_string();
+    Some(DriftedSession {
+        container,
+        account,
+        workspace: workspace_label(state)?.to_path_buf(),
+        drift: drift.drift.clone(),
+        denied: drift.denied.clone(),
+    })
+}
+
 /// The drifted host-mode session containers among `objects` (inspect
-/// objects) against `registered`. Pure. Private-clone containers and those
-/// without a workspace label get no verdict, so never appear.
+/// objects) with `inputs`. Pure apart from `inputs`. Private-clone
+/// containers and those without a workspace label get no verdict, so never
+/// appear.
 #[must_use]
 pub fn drifted<'a>(
     objects: impl IntoIterator<Item = &'a Value>,
-    registered: &[PathBuf],
+    inputs: &DriftInputs<'_>,
 ) -> Vec<DriftedSession> {
     objects
         .into_iter()
-        .filter_map(|state| {
-            let container = state["Name"].as_str()?.trim_start_matches('/').to_string();
-            let account = container.strip_prefix(CONTAINER_PREFIX)?.to_string();
-            let workspace = workspace_label(state)?.to_path_buf();
-            let drift = mount_drift(state, registered);
-            (!drift.is_empty()).then_some(DriftedSession {
-                container,
-                account,
-                workspace,
-                drift,
-            })
-        })
+        .filter_map(|state| drifted_session(state, inputs.verdict(state).as_ref()))
         .collect()
 }
 
@@ -98,11 +111,20 @@ pub fn report_lines(drifted: &[DriftedSession], private_clones: bool) -> Vec<Str
     for session in drifted {
         lines.push(format!("    {} (account {})", session.container, session.account));
         for path in &session.drift.extra {
-            lines.push(format!(
-                "      still mounts {} read-write, which is no longer registered (Codex runs \
-                 there with its own sandbox off)",
-                path.display()
-            ));
+            lines.push(if session.denied.contains(path) {
+                format!(
+                    "      mounts {} read-write, which `session start` now refuses (the home \
+                     directory, or `firewall: true`): the reconciler removes this container \
+                     once idle and starts nothing in its place",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "      still mounts {} read-write, which is no longer registered (Codex runs \
+                     there with its own sandbox off)",
+                    path.display()
+                )
+            });
         }
         for path in &session.drift.missing {
             lines.push(format!(
@@ -185,10 +207,12 @@ pub fn report_from(snapshot: &Snapshot, registered: &[PathBuf]) -> Vec<String> {
     match snapshot {
         Snapshot::Available(map) => {
             let objects = || map.values().map(|observed| &observed.inspect);
-            let mut lines = report_lines(
-                &drifted(objects(), registered),
-                objects().any(session_state::is_private_clone),
-            );
+            // The verdict the snapshot was classified with.
+            let drifted: Vec<DriftedSession> = map
+                .values()
+                .filter_map(|o| drifted_session(&o.inspect, o.drift.as_ref()))
+                .collect();
+            let mut lines = report_lines(&drifted, objects().any(session_state::is_private_clone));
             lines.extend(single_checkout_lines(&unregistered_single_checkouts(
                 objects(),
                 registered,
@@ -214,7 +238,8 @@ pub fn report(profile_root: Option<&Path>, docker: &str, registered: &[PathBuf])
     {
         return Vec::new();
     }
-    let snapshot = session_state::snapshot(docker, registered, session_state::SNAPSHOT_DEADLINE);
+    let inputs = DriftInputs::new(Some(registered));
+    let snapshot = session_state::snapshot(docker, &inputs, session_state::SNAPSHOT_DEADLINE);
     report_from(&snapshot, registered)
 }
 
@@ -363,7 +388,7 @@ mod tests {
             json!({WORKSPACE_LABEL: label}),
             &[ws.join("a"), ws.join("gone")],
         )];
-        let found = drifted(&objects, &[ws.join("a")]);
+        let found = drifted(&objects, &DriftInputs::registry(&[ws.join("a")]));
         assert_eq!(found[0].account, "agent-1");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].drift.extra, vec![ws.join("gone")]);
@@ -375,6 +400,42 @@ mod tests {
             .join("\n")
             .contains("--private-clone"));
         assert!(report_lines(&[], true).is_empty(), "no drift, no report");
+    }
+
+    #[test]
+    fn a_registered_but_denied_mount_is_drift_named_as_denied() {
+        // The reconciler's definition (#10600): still registered, but `session
+        // start` would refuse it today, so the reconciler removes the container.
+        let (_tmp, root) = canonical_tempdir();
+        let ws = root.join("ws");
+        for repo in ["a", "walled"] {
+            std::fs::create_dir_all(ws.join(repo)).unwrap();
+        }
+        let objects = [container(
+            "loom-codex-session-agent-1",
+            json!({WORKSPACE_LABEL: ws.display().to_string()}),
+            &[ws.join("a"), ws.join("walled")],
+        )];
+        let registered = vec![ws.join("a"), ws.join("walled")];
+        assert!(drifted(&objects, &DriftInputs::registry(&registered)).is_empty());
+        let walled = ws.join("walled");
+        let denials = |_: &Path| {
+            Ok(session_state::Denials {
+                home: None,
+                firewalled: vec![walled.clone()],
+            })
+        };
+        let inputs = DriftInputs {
+            registered: Some(&registered),
+            denials_for: &denials,
+        };
+        let found = drifted(&objects, &inputs);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].denied, vec![walled.clone()]);
+        let text = report_lines(&found, false).join("\n");
+        assert!(text.contains("now refuses"), "{text}");
+        assert!(text.contains("starts nothing in its place"), "{text}");
+        assert!(!text.contains("no longer registered"), "{text}");
     }
 
     #[test]
@@ -399,7 +460,7 @@ mod tests {
         // Still registered: nothing to say.
         assert!(unregistered_single_checkouts(&objects, std::slice::from_ref(&repo)).is_empty());
         // `workspace remove solo`: not drift, but the operator is told.
-        assert!(drifted(&objects[..1], &[]).is_empty());
+        assert!(drifted(&objects[..1], &DriftInputs::registry(&[])).is_empty());
         let found = unregistered_single_checkouts(&objects, &[]);
         assert_eq!(found, vec![("agent-1".to_string(), repo.clone())]);
         let text = single_checkout_lines(&found).join("\n");
