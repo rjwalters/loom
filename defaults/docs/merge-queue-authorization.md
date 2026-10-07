@@ -73,10 +73,14 @@ fixes three ways the single-PR check above leaves a revoked PR mergeable:
    the group.
 2. **Early pass.** `group_check` reports `pending`, which blocks, until every
    other required check on the group commit has succeeded, and only then
-   reads the live facts. A hold added while CI runs is seen at the final
-   evaluation with no daemon involvement. If nothing re-runs the check
-   (daemon or runner outage), it stays pending and GitHub times the entry out
-   rather than merging it.
+   reads the live facts. Until then the live facts are not read, so a
+   facts-API or grant-store outage while CI runs also leaves it `pending`;
+   the only early `failure` is a definite grant denial (no grant, or a grant
+   for another head), which needs no live read. An unknown at the final
+   evaluation is a `failure`, never a pass. A hold added while CI runs is
+   seen at the final evaluation with no daemon involvement. If nothing
+   re-runs the check (daemon or runner outage), it stays pending and GitHub
+   times the entry out rather than merging it.
 3. **Green but not yet merged** (GitHub's minimum-group-size wait).
    `revoke_refail_dequeue` revokes the grant, posts a `failure` commit status
    for `loom/merge-authorization` on every live group commit that contains

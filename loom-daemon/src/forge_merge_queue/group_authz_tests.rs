@@ -233,6 +233,59 @@ fn authz_never_concludes_before_other_required_checks() {
     assert!(matches!(c, GroupConclusion::Pending(_)), "unreadable others never pass");
 }
 
+/// Regression (#10790 review): with other checks still pending, an outage
+/// of the live-facts read leaves the check Pending (conclude last) and the
+/// read is not even attempted; it concludes only after CI succeeds, and an
+/// unknown then is a Failure, never a pass.
+#[test]
+fn facts_outage_while_others_pending_stays_pending() {
+    let s = MemoryGrantStore::default();
+    let q = FakeQueue::with(&[(A, HA), (B, HB)], &s);
+    let g = q.group_of(B);
+    let others = || Ok(vec![(CI.to_string(), CheckState::Pending)]);
+    let reads = Cell::new(0u32);
+    let down = |_: u32| -> Result<AuthzFacts, String> {
+        reads.set(reads.get() + 1);
+        Err("pulls api 503".into())
+    };
+    let c = group_check(&s, &g, others(), &down);
+    assert!(matches!(c, GroupConclusion::Pending(_)), "{c:?}");
+    assert_eq!(reads.get(), 0, "live facts are not read before others succeed");
+    let c = group_check(&s, &g, Err("checks api 502".into()), &down);
+    assert!(matches!(c, GroupConclusion::Pending(_)), "{c:?}");
+    let ok = Ok(vec![(CI.to_string(), CheckState::Success)]);
+    assert!(matches!(group_check(&s, &g, ok, &down), GroupConclusion::Failure(_)));
+    assert!(reads.get() > 0);
+}
+
+/// A grant-store outage while others are pending also waits; it fails
+/// (fail closed) once the check concludes.
+#[test]
+fn grant_store_outage_while_others_pending_stays_pending() {
+    let s = MemoryGrantStore::default();
+    let q = FakeQueue::with(&[(A, HA)], &s);
+    s.set_down(true);
+    assert!(matches!(q.run_authz(&s, A), GroupConclusion::Pending(_)));
+    q.ci(A, CheckState::Success);
+    assert!(matches!(q.run_authz(&s, A), GroupConclusion::Failure(_)));
+    assert!(q.try_merge().is_empty());
+}
+
+/// A definite grant denial needs no live read and still fails fast while
+/// other checks are pending.
+#[test]
+fn revoked_grant_fails_fast_while_others_pending() {
+    let s = MemoryGrantStore::default();
+    let q = FakeQueue::with(&[(A, HA), (B, HB)], &s);
+    s.revoke(A).unwrap();
+    let c = q.run_authz(&s, B);
+    assert!(
+        matches!(&c, GroupConclusion::Failure(w) if w.iter().all(|(pr, _)| *pr == A)),
+        "{c:?}"
+    );
+    assert!(q.try_merge().is_empty());
+}
+
 /// Hold added while CI is still running, daemon down, nobody revokes: the
 /// final evaluation happens after CI and sees the hold.
 #[test]

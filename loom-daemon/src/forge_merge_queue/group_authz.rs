@@ -15,9 +15,12 @@
 //!    CI time is invisible unless something re-evaluates. [`group_check`]
 //!    **concludes last**: it reports [`GroupConclusion::Pending`], which
 //!    blocks, until every *other* required check on the group commit has
-//!    succeeded, and only then reads the live facts. Nothing re-running it
-//!    (daemon or workflow outage) leaves it pending, so GitHub times the entry
-//!    out instead of merging it.
+//!    succeeded, and only then reads the live facts. Until then the live
+//!    facts are not read at all, so a facts or grant-store outage while CI
+//!    runs also leaves it pending; only a definite grant denial (no grant,
+//!    grant for another head) fails early. Nothing re-running it (daemon or
+//!    workflow outage) leaves it pending, so GitHub times the entry out
+//!    instead of merging it.
 //! 3. **GitHub may hold a fully green group** (minimum group size and wait
 //!    time). [`revoke_refail_dequeue`] revokes the grant, then posts a
 //!    `failure` status for [`REQUIRED_CHECK_CONTEXT`] on **every live group
@@ -43,7 +46,8 @@
 use std::fmt;
 
 use super::authz::{
-    evaluate, AuthzDecision, AuthzFacts, DenyReason, GrantStore, Revocation, REQUIRED_CHECK_CONTEXT,
+    evaluate, AuthzDecision, AuthzFacts, DenyReason, Grant, GrantStore, Revocation,
+    REQUIRED_CHECK_CONTEXT,
 };
 use super::mode::MergeMode;
 use super::ops;
@@ -121,23 +125,33 @@ pub fn members_for(top: u32, queue: &[Member]) -> Option<Vec<Member>> {
     Some(queue[..=idx].to_vec())
 }
 
+/// The member's grant, or why it does not authorize `m.head`. Reads only
+/// the grant store, never the live PR state.
+fn member_grant(store: &dyn GrantStore, m: &Member) -> Result<Grant, DenyReason> {
+    let grant = match store.get(m.pr) {
+        Ok(Some(g)) => g,
+        Ok(None) => return Err(DenyReason::NoGrant),
+        Err(e) => return Err(DenyReason::StoreUnavailable(e.0)),
+    };
+    if !grant.approved_sha.eq_ignore_ascii_case(&m.head) {
+        return Err(DenyReason::GrantForOtherHead {
+            granted: grant.approved_sha,
+            actual: m.head.clone(),
+        });
+    }
+    Ok(grant)
+}
+
 fn member_denials(
     store: &dyn GrantStore,
     m: &Member,
-    facts: Result<AuthzFacts, String>,
+    facts_for: &dyn Fn(u32) -> Result<AuthzFacts, String>,
 ) -> Vec<DenyReason> {
-    let grant = match store.get(m.pr) {
-        Ok(Some(g)) => g,
-        Ok(None) => return vec![DenyReason::NoGrant],
-        Err(e) => return vec![DenyReason::StoreUnavailable(e.0)],
+    let grant = match member_grant(store, m) {
+        Ok(g) => g,
+        Err(r) => return vec![r],
     };
-    if !grant.approved_sha.eq_ignore_ascii_case(&m.head) {
-        return vec![DenyReason::GrantForOtherHead {
-            granted: grant.approved_sha,
-            actual: m.head.clone(),
-        }];
-    }
-    match facts {
+    match facts_for(m.pr) {
         Err(e) => vec![DenyReason::StoreUnavailable(e)],
         Ok(f) => match evaluate(&f, &grant.approved_sha) {
             AuthzDecision::Authorized => Vec::new(),
@@ -150,10 +164,15 @@ fn member_denials(
 ///
 /// `others` are the *other* required contexts on the group commit (an `Err`
 /// is an outage). `facts_for` reads one PR's live facts. Order: the other
-/// checks are read first; only if they all succeeded are the members'
-/// facts read and the check concluded, so the decision is as late as
-/// Loom can make it. A denial found while others are still pending is
-/// reported at once (fail fast).
+/// checks are read first. While any is not yet successful (or they are
+/// unreadable) `facts_for` is **not called** and the result is
+/// [`GroupConclusion::Pending`], so an outage of the live-facts read (or of
+/// the grant store) never concludes early. The one exception is a definite
+/// grant denial (no grant, or a grant for another head), which needs no
+/// live read and fails at once (fail fast). Only once every other check
+/// has succeeded are the members' facts read and the check concluded, so
+/// the decision is as late as Loom can make it. An unknown at that point
+/// is a `Failure`, never a pass.
 #[must_use]
 pub fn group_check(
     store: &dyn GrantStore,
@@ -179,21 +198,35 @@ pub fn group_check(
             (!not_done.is_empty()).then(|| format!("waiting on {}", not_done.join(", ")))
         }
     };
+    if let Some(w) = waiting {
+        // Others not done: no live-facts read. Fail fast only on a definite
+        // grant denial; a grant-store outage waits like any other unknown.
+        let denied: Vec<(u32, DenyReason)> = group
+            .members
+            .iter()
+            .filter_map(|m| match member_grant(store, m) {
+                Err(DenyReason::StoreUnavailable(_)) | Ok(_) => None,
+                Err(r) => Some((m.pr, r)),
+            })
+            .collect();
+        if denied.is_empty() {
+            return GroupConclusion::Pending(w);
+        }
+        return GroupConclusion::Failure(denied);
+    }
     let denied: Vec<(u32, DenyReason)> = group
         .members
         .iter()
         .flat_map(|m| {
-            member_denials(store, m, facts_for(m.pr))
+            member_denials(store, m, facts_for)
                 .into_iter()
                 .map(move |r| (m.pr, r))
         })
         .collect();
-    if !denied.is_empty() {
-        return GroupConclusion::Failure(denied);
-    }
-    match waiting {
-        Some(w) => GroupConclusion::Pending(w),
-        None => GroupConclusion::Success,
+    if denied.is_empty() {
+        GroupConclusion::Success
+    } else {
+        GroupConclusion::Failure(denied)
     }
 }
 
