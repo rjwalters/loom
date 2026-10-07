@@ -121,14 +121,15 @@ fn untrusted(body: &str) -> Value {
 
 // --- fixtures -----------------------------------------------------------------
 
-struct World {
+/// The release pass over fakes; shared with `release_telemetry_tests`.
+pub(super) struct World {
     gather: Fake,
     park: Park,
     extra: Extra,
 }
 
 impl World {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             gather: Fake::default(),
             park: Park::default(),
@@ -138,7 +139,7 @@ impl World {
 
     /// An open parked artifact whose body declares `declared`, listed and
     /// viewable, carrying `labels` plus `loom:blocked`.
-    fn parked(&mut self, number: u32, pr: bool, declared: &[u64], labels: &[&str]) {
+    pub(super) fn parked(&mut self, number: u32, pr: bool, declared: &[u64], labels: &[&str]) {
         let body = format!(
             "Some work.\n\n{}\n",
             render_park(declared, Some("builder"), Some("2026-10-01T00:00:00Z"), None)
@@ -146,7 +147,7 @@ impl World {
         self.with_body(number, pr, &body, labels);
     }
 
-    fn with_body(&mut self, number: u32, pr: bool, body: &str, labels: &[&str]) {
+    pub(super) fn with_body(&mut self, number: u32, pr: bool, body: &str, labels: &[&str]) {
         let mut all: Vec<&str> = vec!["loom:blocked"];
         all.extend_from_slice(labels);
         self.gather.rows.push(row(number, body, 0, pr, &all));
@@ -164,7 +165,7 @@ impl World {
         }
     }
 
-    fn state(&mut self, number: i64, state: &str, is_pr: bool) {
+    pub(super) fn state(&mut self, number: i64, state: &str, is_pr: bool) {
         self.gather.states.insert(
             (None, number),
             RefState {
@@ -175,7 +176,15 @@ impl World {
         );
     }
 
-    fn run_with(&mut self, cfg: Config) -> Report {
+    /// The budget probe's answer.
+    pub(super) fn budget(&mut self, core_remaining: u64, graphql_remaining: u64) {
+        self.gather.budget = Some(Budget {
+            core_remaining,
+            graphql_remaining,
+        });
+    }
+
+    pub(super) fn run_with(&mut self, cfg: Config) -> Report {
         run(
             &mut self.gather,
             &mut self.park,
@@ -186,7 +195,7 @@ impl World {
         )
     }
 
-    fn run(&mut self) -> Report {
+    pub(super) fn run(&mut self) -> Report {
         self.run_with(cfg())
     }
 
@@ -199,7 +208,7 @@ impl World {
     }
 }
 
-fn cfg() -> Config {
+pub(super) fn cfg() -> Config {
     Config {
         dry_run: false,
         max_writes: 20,

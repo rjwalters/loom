@@ -7,6 +7,7 @@ mod ci;
 mod eta;
 mod metadata;
 mod ops;
+mod pass;
 mod pick_decision;
 mod session_output;
 
@@ -645,6 +646,14 @@ fn log_record_for(envelope: &TelemetryEnvelope) -> Option<LogRecord> {
             // start; the body is the record's JSON.
             let (event_name, severity, at, attributes, body) =
                 auto_update::log_parts(&envelope.record)?;
+            time_unix_nano = at;
+            body_override = Some(body);
+            (event_name, severity, String::new(), attributes)
+        }
+        TelemetryRecord::PassSummary(_) | TelemetryRecord::PassVerdict(_) => {
+            // Issue #10752: one pass / one artifact verdict, stamped when
+            // decided; the body is the record's JSON.
+            let (event_name, severity, at, attributes, body) = pass::log_parts(&envelope.record)?;
             time_unix_nano = at;
             body_override = Some(body);
             (event_name, severity, String::new(), attributes)

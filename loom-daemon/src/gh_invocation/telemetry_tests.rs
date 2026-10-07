@@ -255,12 +255,28 @@ fn ambient_parsing_rejects_garbage_and_never_reads_third_party_traceparent() {
 
 #[test]
 fn every_span_attribute_survives_export_bounding() {
-    let inv = read_op();
+    // A write inside a caller scope, so the #10752 keys (`github.caller`,
+    // `github.number`, `github.repo`) are set too.
+    let _scope = super::super::caller_scope::enter("stale_blocked_release");
+    let inv = GhInvocation::new(
+        Operation::new("api.rest"),
+        AccessIntent::Write,
+        GhTarget::repo("acme/widgets").unwrap(),
+        Duration::from_secs(10),
+    )
+    .parent(ParentContext::Missing)
+    .args([
+        "api",
+        "-X",
+        "DELETE",
+        "repos/acme/widgets/issues/42/labels/loom%3Ablocked",
+    ]);
     let billing = super::super::billing::Billing::not_sent(
         "graphql",
         &super::super::accounting::cred_of_with(None, false),
         "writer",
-    );
+    )
+    .with_repo(Some("acme/widgets"));
     let span = InvocationSpan::open(&inv).record(
         &inv,
         GhBinSource::Policy,

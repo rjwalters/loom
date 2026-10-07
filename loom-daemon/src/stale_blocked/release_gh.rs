@@ -28,7 +28,10 @@
 //! 5. Forge-write scope (#9548): [`crate::write_scope::gate_root_with`].
 //!
 //! `LOOM_RELEASE_STALE_BLOCKED_MAX_WRITES` (default 20) caps the artifacts
-//! acted on per pass. One `log::info!` line per pass carries every count.
+//! acted on per pass. One `log::info!` line per pass carries every count, and
+//! with an OTLP exporter the pass also leaves a `pass.summary` record, a
+//! `pass.verdict` per artifact and `github.caller` on its GitHub calls
+//! ([`super::release_telemetry`], #10752).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -153,6 +156,9 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> Option<Report> {
         record(root, outcome, None);
         return None;
     }
+    // #10752: every GitHub call of the pass carries `github.caller`, and the
+    // pass leaves `pass.summary` and `pass.verdict` records in SigNoz.
+    let observer = super::release_telemetry::Observer::start(CALLER);
     let report = gated(mode, owned, |dry_run| {
         if !dry_run && !crate::write_scope::gate_root_with(root, gh_bin, "stale-blocked release") {
             return Report {
@@ -171,6 +177,7 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> Option<Report> {
         )
     })?;
     record(root, classify_report(mode == Mode::DryRun, &report), Some(&report));
+    observer.finish(root, &report);
     log::info!("stale_blocked_release: {} — {} (#10556)", root.display(), report.summary());
     Some(report)
 }

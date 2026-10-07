@@ -17,7 +17,10 @@
 //!
 //! Besides process truth (`github.outcome`, `github.exit_code`), the span
 //! carries what GitHub billed — HTTP status, `304`, request count, billed
-//! resource and credential identity ([`super::billing`], #10343).
+//! resource and credential identity ([`super::billing`], #10343). Since
+//! #10752 it also carries `github.caller` (the daemon pass inside whose
+//! [`super::caller_scope`] it ran), `github.repo` (the repo the ledger booked
+//! it under) and, on a write, `github.number` (the issue/PR it targets).
 //!
 //! `github.invocation` is `<pid>.<seq>` — the process id and a process-local
 //! counter — so two invocations that start in the same clock tick under the
@@ -75,7 +78,37 @@ pub const SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "github.account",
     "github.cred_owner",
     "github.role",
+    // #10752: the daemon pass the call served ([`super::caller_scope`]), the
+    // repo the ledger booked it under, and the number(s) a write targets.
+    "github.caller",
+    "github.repo",
+    "github.number",
 ];
+
+/// At most this many numbers in a write span's `github.number`.
+const MAX_WRITE_NUMBERS: usize = 5;
+
+/// The issue/PR number(s) a write targets, comma-joined in argv order: the
+/// `repos/{o}/{r}/(issues|pulls)/{n}` path of a `gh api` write, or the
+/// selectors of a `gh issue|pr` write ([`super::own_writes::written_targets`],
+/// whose loose `gh issue|pr` parse can also pick up a numeric flag value).
+/// `None` when the argv names none (GraphQL, a comment edited by id).
+fn write_numbers(inv: &GhInvocation) -> Option<String> {
+    let mut numbers: Vec<u32> = Vec::new();
+    for (_, n) in super::own_writes::written_targets(&inv.args, inv.target.slug().as_deref()) {
+        if !numbers.contains(&n) {
+            numbers.push(n);
+        }
+    }
+    numbers.truncate(MAX_WRITE_NUMBERS);
+    (!numbers.is_empty()).then(|| {
+        numbers
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    })
+}
 
 /// The stderr marker the managed launcher (C4, #9987) prints when it refuses
 /// to route a request (`routing.denied`). Only a captured run can see it; a
@@ -371,6 +404,19 @@ impl InvocationSpan {
         for (key, value) in billing.attributes() {
             attributes.insert(key.to_string(), value);
         }
+        // #10752: which pass drove the call, and what a write touched, so a
+        // label change joins to the mechanism that made it.
+        if let Some(caller) = super::caller_scope::current() {
+            attributes.insert("github.caller".into(), caller.to_string());
+        }
+        if let Some(repo) = &billing.repo {
+            attributes.insert("github.repo".into(), repo.clone());
+        }
+        if inv.intent == super::AccessIntent::Write {
+            if let Some(numbers) = write_numbers(inv) {
+                attributes.insert("github.number".into(), numbers);
+            }
+        }
         crate::telemetry::trace::provenance::stamp(&mut attributes);
         SpanRecord {
             context: self.context.clone(),
@@ -400,6 +446,10 @@ impl InvocationSpan {
         billing: &super::billing::Billing,
     ) {
         let ended_at = Utc::now();
+        super::caller_scope::note(
+            inv.intent == super::AccessIntent::Write,
+            billing.status == Some(304),
+        );
         let span = self.record(inv, launcher, outcome, exit_code, ended_at, billing);
         if outcome != Outcome::Ok {
             record_failure(&FailureRecord::from_span(&span, inv, outcome, exit_code));

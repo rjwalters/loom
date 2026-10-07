@@ -108,6 +108,11 @@ pub struct Billing {
     pub cred_owner: String,
     /// `reader`, `writer`, `writer-fallback` or `unknown`.
     pub role: String,
+    /// The `owner/repo` the ledger booked the call under (#10752): the
+    /// site's, the typed target, `LOOM_REPO` or the working directory's
+    /// remote ([`super::accounting::resolved_identity`]). `None` when nothing
+    /// named one, or nothing was sent. The span's `github.repo`.
+    pub repo: Option<String>,
 }
 
 /// A label value through the ledger's sanitizer and narrowed to a short
@@ -177,7 +182,29 @@ impl Billing {
             account: clean(&cred.account, "unknown"),
             cred_owner: clean(cred.owner.as_deref().unwrap_or("-"), "-"),
             role: clean(role, "unknown"),
+            repo: None,
         }
+    }
+
+    /// These facts with the ledger's resolved `owner/repo` (#10752). A value
+    /// that is not a plain `owner/repo` slug is dropped, never exported.
+    #[must_use]
+    pub fn with_repo(mut self, repo: Option<&str>) -> Self {
+        self.repo = repo.and_then(forge_call_stats::sanitize).filter(|r| {
+            let mut parts = r.split('/');
+            let slug_part = |p: Option<&str>| {
+                p.is_some_and(|p| {
+                    !p.is_empty()
+                        && p.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                })
+            };
+            r.len() <= 140
+                && slug_part(parts.next())
+                && slug_part(parts.next())
+                && parts.next().is_none()
+        });
+        self
     }
 
     /// The span attributes, every key always present (`unknown` when not
