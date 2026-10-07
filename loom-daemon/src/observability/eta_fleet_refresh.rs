@@ -785,8 +785,10 @@ fn gated(root: &Path, target: &RepoTarget, stop: StopReason) -> RepoReport {
 /// reserve, and for everything left
 /// once one sync is rate limited or meets the open breaker. With SigNoz
 /// history on (#10520) each repo also follows its [`EventsGate`]: none for a
-/// covered repo, gap-fill (counted, and capped by `gap`'s per-repo budget
-/// less what the snapshot pass spent) otherwise.
+/// covered repo (whose cache coverage is frozen, so stars read unknown past
+/// it), gap-fill (counted, and capped by `gap`'s per-repo budget less what
+/// the snapshot pass spent) otherwise. A refresh that completes stamps its
+/// listing's `synced_through` at `now`: the cache was caught up then.
 fn sync_all_events(
     root: &Path,
     targets: &[RepoTarget],
@@ -816,7 +818,11 @@ fn sync_all_events(
             continue;
         };
         let mut gate = EventsGate::for_repo(repo_report, gap_budget);
-        if repo_report.stop == StopReason::Coverage || gate == EventsGate::Skip {
+        if gate == EventsGate::Skip {
+            crate::eta::fleet_signoz_history::freeze_raw_cache(root, &target.repo);
+            continue;
+        }
+        if repo_report.stop == StopReason::Coverage {
             continue;
         }
         let cursor_file = fleet_events::cursor_path(root, &target.repo);
@@ -840,6 +846,15 @@ fn sync_all_events(
                 continue;
             }
             let (appended, spent, stop) = events(target, reader, endpoint, allowed, mode);
+            if mode == SyncMode::Refresh && stop.is_none() {
+                // A completed refresh: the cache is caught up with this listing.
+                let key = format!("{}:{}", fleet_events::SOURCE_FORGE, endpoint.name());
+                if let Err(e) =
+                    fleet_events::mark_synced_through(&cursor_file, &target.repo, &key, now)
+                {
+                    log::warn!("eta fleet refresh: {}: could not stamp {key}: {e}", target.repo);
+                }
+            }
             *left = left.saturating_sub(spent);
             repo_report.raw_events_added =
                 Some(repo_report.raw_events_added.unwrap_or(0) + appended);

@@ -44,11 +44,20 @@
 //!
 //! The same cycle's raw-event sync (`observability::eta_fleet_refresh`,
 //! issue events and pulls listings) follows [`EventsGate`]: a repo SigNoz
-//! covered makes **no** raw-event read (its raw cache is not advanced while
-//! SigNoz covers it; star inputs read an uncovered span as unknown, never as
-//! unstarred); an uncovered repo's event reads are gap-fill, drawn from what
-//! its snapshot pass left of the same per-repo budget; an unavailable SigNoz
-//! leaves them under the pass-kind budgets, counted.
+//! covered makes **no** raw-event read; an uncovered repo's event reads are
+//! gap-fill, drawn from what its snapshot pass left of the same per-repo
+//! budget; an unavailable SigNoz leaves them under the pass-kind budgets,
+//! counted.
+//!
+//! A covered repo's raw cache is therefore not advanced, and star inputs
+//! (`eta::star`, read from that cache) must not read the span it missed as
+//! "unstarred". Each listing's cursor carries `synced_through`, the instant
+//! the cache was last caught up with it (stamped whenever a refresh
+//! completes); star coverage ends there, so a later cutoff reads as
+//! **unknown**. A covered repo's stamps simply stop advancing; one with no
+//! stamp yet (a cache from before #10520) is frozen at its newest cached
+//! forge row by [`freeze_raw_cache`] — never later than the cache can vouch
+//! for.
 //!
 //! Every forge read made while SigNoz history is configured — snapshot and
 //! raw-event alike — is counted (`gap_fill_calls` on the repo's report and its
@@ -59,12 +68,24 @@
 //! # When an item is complete from SigNoz alone
 //!
 //! [`item_complete`]: the item's `opened` event is in the timeline (so its
-//! whole label history since birth is), and it never carried
-//! `loom:changes-requested`. The second rule is about pushes: SigNoz records
+//! whole label history since birth is), every label of the daemon's first
+//! label set is explained by a recorded change, and it never carried
+//! `loom:changes-requested`. The last rule is about pushes: SigNoz records
 //! no push, and a Doctor lap ends at the push that answered a rejection
 //! (`journal`'s PL4), so such a PR's history needs the forge timeline. An
-//! item the daemon only ever saw as a label-set baseline (no `opened`) is
-//! gap-filled for the same reason: its first labels have no known time.
+//! item the daemon only ever saw as a label-set baseline (no `opened`), or
+//! whose baseline carries a label no change dates, is gap-filled for the same
+//! reason: those labels have no known time, and none is invented.
+//!
+//! # Every PR SigNoz knows is planned
+//!
+//! [`plan`] enumerates every PR item of the timeline, *including* one the
+//! daemon only ever saw as label sets (a first baseline, or repeated
+//! identical sets): such an item has no label or lifecycle event, but its
+//! sets ([`ItemTimeline::label_sets`]) keep it, and their observations count
+//! as touches. So the gap-fill decision sees it, rather than the covered pass
+//! silently dropping it. Its listing labels are the latest set's
+//! ([`ItemTimeline::current_labels`]).
 //!
 //! A gap-filled item takes its *events* from the forge timeline and its
 //! listing facts (state, merge instant) from SigNoz, with the forge's own
@@ -223,6 +244,41 @@ impl EventsGate {
     }
 }
 
+/// A covered repo's raw cache is not read this cycle: make sure each of its
+/// repo-wide listings has a `synced_through` stamp, so star coverage ends
+/// where the cache does (see the module docs). A listing already stamped
+/// keeps its stamp (it stops advancing); an unstamped one is stamped at the
+/// newest cached forge row, the latest instant the cache vouches for. An
+/// empty cache needs no stamp: star inputs already read it as uncovered.
+pub fn freeze_raw_cache(root: &Path, repo: &str) {
+    use super::fleet_events::{self, EventsCursor, SOURCE_FORGE};
+    let cursor_file = fleet_events::cursor_path(root, repo);
+    let cursor = EventsCursor::read(&cursor_file, repo);
+    let unstamped: Vec<String> = super::star::listing_keys()
+        .into_iter()
+        .filter(|k| {
+            cursor
+                .endpoints
+                .get(k)
+                .is_none_or(|e| e.synced_through.is_none())
+        })
+        .collect();
+    if unstamped.is_empty() {
+        return;
+    }
+    let newest = fleet_events::load_events(&fleet_events::events_path(root, repo))
+        .iter()
+        .filter(|e| e.source == SOURCE_FORGE)
+        .map(|e| e.event_time)
+        .max();
+    let Some(newest) = newest else { return };
+    for key in unstamped {
+        if let Err(e) = fleet_events::mark_synced_through(&cursor_file, repo, &key, newest) {
+            log::warn!("eta fleet refresh: {repo}: could not freeze {key}'s coverage: {e}");
+        }
+    }
+}
+
 /// One PR the pass merges.
 #[derive(Debug, Clone)]
 pub struct Candidate {
@@ -311,22 +367,24 @@ pub fn plan(timeline: &Timeline, cutoff: DateTime<Utc>, since: DateTime<Utc>) ->
     Plan { candidates }
 }
 
+/// Whether `item` was touched (a change, or a daemon label set, became
+/// knowable) at or after `since`.
 fn touched_since(item: &ItemTimeline, since: DateTime<Utc>) -> bool {
-    let label = item.labels.iter().map(|e| e.at.max(e.observed_at));
-    let life = item.lifecycle.iter().map(|e| e.at.max(e.observed_at));
-    label.chain(life).any(|at| at >= since)
+    item.seen_at().any(|at| at >= since)
 }
 
 /// Whether SigNoz alone answers for `item` (see the module docs): its
-/// `opened` is known, and it never needed a push to explain a Doctor lap.
+/// `opened` is known, its baseline labels are all dated, and it never needed
+/// a push to explain a Doctor lap.
 #[must_use]
 pub fn item_complete(item: &ItemTimeline) -> bool {
     let born = item.lifecycle.iter().any(|e| e.event == Lifecycle::Opened);
+    let dated = item.undated_baseline_labels().is_empty();
     let rejected = item
         .labels
         .iter()
         .any(|e| e.label == CHANGES_REQUESTED && e.transition == Transition::Added);
-    born && !rejected
+    born && dated && !rejected
 }
 
 /// The listing facts SigNoz knows for `item` at `cutoff`.
@@ -347,12 +405,13 @@ pub fn listed_pr(item: &ItemTimeline, cutoff: DateTime<Utc>) -> ListedPr {
         .iter()
         .map(|e| e.at)
         .chain(item.lifecycle.iter().map(|e| e.at))
+        .chain(item.label_sets.iter().map(|(seen, _)| *seen))
         .min();
     ListedPr {
         created_at: opened.or(earliest).unwrap_or(cutoff),
         state,
         merged_at: item.merged_at(),
-        labels: item.labels_at(cutoff).into_iter().collect(),
+        labels: item.current_labels(cutoff).into_iter().collect(),
     }
 }
 

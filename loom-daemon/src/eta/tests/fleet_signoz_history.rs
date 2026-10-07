@@ -168,9 +168,43 @@ fn webhook(
     .to_string()
 }
 
+/// One daemon stage-journal row (`label.first_seen`, as `TIMELINE_SQL`
+/// returns it): PR `number`'s whole label set, observed at `seen`.
+fn label_set_row(id: &str, number: u32, labels: &[&str], seen: DateTime<Utc>) -> String {
+    let body = json!({
+        "schema": "eta-stage-sample/v1",
+        "observed_at": seen.to_rfc3339(),
+        "event": "label.first_seen",
+        "repo": A,
+        "issue": 1,
+        "pr_number": number,
+        "stage": null,
+        "resolution_sec": 300,
+        "in_sweep": false,
+        "raw": {"labels": labels},
+    });
+    json!({
+        "record_id": id,
+        "kind": "label.first_seen",
+        "service": "loom",
+        "repo": A,
+        "attrs": json!({"loom.repo": A}).to_string(),
+        "nums": "{}",
+        "body": body.to_string(),
+        "event_time_ns": ns(seen),
+        "knowable_time_ns": ns(seen),
+    })
+    .to_string()
+}
+
 /// The SigNoz rows for `prs`, plus (when `anchored`) one issue opened and
 /// labelled 25 days back, so both families cover the 21-day window.
 fn signoz_rows(prs: &[Truth], anchored: bool) -> FileRows {
+    FileRows::parse(&signoz_lines(prs, anchored).join("\n")).unwrap()
+}
+
+/// [`signoz_rows`]' export lines.
+fn signoz_lines(prs: &[Truth], anchored: bool) -> Vec<String> {
     let mut lines = Vec::new();
     if anchored {
         let old = now() - Duration::days(25);
@@ -188,7 +222,7 @@ fn signoz_rows(prs: &[Truth], anchored: bool) -> FileRows {
             lines.push(webhook(&format!("{n}-m"), "pr", n, "closed", None, at, true));
         }
     }
-    FileRows::parse(&lines.join("\n")).unwrap()
+    lines
 }
 
 /// The REST timeline `pr`'s forge read returns.
@@ -231,6 +265,20 @@ impl Counting {
         let needle = format!("repos/{A}/issues/{number}/timeline");
         self.gets.iter().filter(|u| u.starts_with(&needle)).count()
     }
+}
+
+/// The labels `pr` carries after all its changes: what the forge listing
+/// reports.
+fn final_labels(pr: &Truth) -> std::collections::BTreeSet<&'static str> {
+    let mut labels = std::collections::BTreeSet::new();
+    for (added, label, _) in &pr.labels {
+        if *added {
+            labels.insert(*label);
+        } else {
+            labels.remove(label);
+        }
+    }
+    labels
 }
 
 fn last_activity(pr: &Truth) -> DateTime<Utc> {
@@ -286,7 +334,8 @@ impl ForgeRead for Counting {
                        "state": if p.merged.is_some() { "closed" } else { "open" },
                        "created_at": p.opened.to_rfc3339(),
                        "updated_at": last_activity(p).to_rfc3339(),
-                       "labels": [],
+                       "labels": final_labels(p).iter().map(|l| json!({"name": l}))
+                           .collect::<Vec<_>>(),
                        "pull_request": {"merged_at": p.merged.map(|m| m.to_rfc3339())}})
             })
             .collect();
@@ -783,6 +832,190 @@ fn the_production_cycle_counts_and_caps_raw_event_reads_too() {
     assert_eq!((seen.len(), r.forge_calls, r.gap_fill_calls), (2, 8, None));
 }
 
+// -- star coverage of a raw cache SigNoz stops (#10520, judge round 3) ---------
+
+/// A pre-#10520 raw cache for [`A`]: PR 101 links issue 7 (known at
+/// `linked`), and issue 7 is labelled (no star) at `linked` and again at
+/// `labeled`, the newest row. No cursor stamp.
+fn plant_raw_cache(root: &Path, linked: DateTime<Utc>, labeled: DateTime<Utc>) {
+    use crate::eta::fleet_events::{self, EventKind, EventLog, ItemKind, RawEvent};
+    let rows = [
+        RawEvent::new(
+            A,
+            101,
+            ItemKind::Pr,
+            EventKind::ClosingRef,
+            Some("closes".into()),
+            linked,
+            "forge",
+            1,
+            linked,
+        )
+        .with_target(Some(7)),
+        RawEvent::new(
+            A,
+            7,
+            ItemKind::Issue,
+            EventKind::LabelAdded,
+            Some("loom:issue".into()),
+            linked,
+            "forge",
+            2,
+            linked,
+        ),
+        RawEvent::new(
+            A,
+            7,
+            ItemKind::Issue,
+            EventKind::LabelAdded,
+            Some("loom:ready".into()),
+            labeled,
+            "forge",
+            3,
+            labeled,
+        ),
+    ];
+    EventLog::open(&fleet_events::events_path(root, A))
+        .unwrap()
+        .append(&rows)
+        .unwrap();
+}
+
+/// The judge's star finding at the production boundary: SigNoz covers the
+/// repo, so its raw cache is not read and stops advancing. Before the fix the
+/// cache still "covered" every later cutoff, so a link or star added after it
+/// stopped read as known-unstarred. Now the cycle freezes the cache's
+/// coverage at its newest row, and a cutoff after it reads unknown (`None`);
+/// before it the cache still answers. A completed refresh (SigNoz history
+/// off) stamps the listings at the cycle's `now` instead.
+#[test]
+fn a_covered_repo_freezes_raw_cache_coverage_so_stars_read_unknown_after_it() {
+    use crate::eta::fleet_events::{self, EventsCursor};
+    use crate::eta::star::{listing_keys, StarInputs};
+    let prs = [approved(101, now() - Duration::hours(10))];
+    let (linked, labeled) = (now() - Duration::days(3), now() - Duration::days(2));
+    let repos = [A.to_string()];
+
+    // Covered: no raw-event read, coverage frozen at the newest cached row.
+    let dir = tempfile::tempdir().unwrap();
+    plant_raw_cache(dir.path(), linked, labeled);
+    let mut forge = Counting::with(&prs);
+    let mut signoz = signoz_rows(&prs, true);
+    let (r, seen) = production_cycle(dir.path(), &mut forge, Some(&mut signoz), 5);
+    assert_eq!((r.history, seen.len()), (Some(HistorySource::Signoz), 0));
+    let star = StarInputs::load(dir.path(), &repos);
+    let star = &star.repos[A];
+    assert_eq!(star.synced_through, Some(labeled), "frozen at the newest cached row");
+    let after = labeled + Duration::hours(1);
+    assert_eq!(star.state_at(101, 0, None, after), None, "after the cache stopped: unknown");
+    assert!(star.state_at(101, 0, None, labeled).is_some(), "before it, the cache answers");
+
+    // A frozen stamp stays put on later covered cycles.
+    let mut signoz = signoz_rows(&prs, true);
+    production_cycle(dir.path(), &mut forge, Some(&mut signoz), 5);
+    let cursor = EventsCursor::read(&fleet_events::cursor_path(dir.path(), A), A);
+    assert_eq!(cursor.synced_through(&listing_keys()), Some(labeled));
+
+    // History off, both listings refreshing to completion: stamped at `now`.
+    let dir = tempfile::tempdir().unwrap();
+    plant_raw_cache(dir.path(), linked, labeled);
+    let cursor_file = fleet_events::cursor_path(dir.path(), A);
+    let mut cursor = EventsCursor::read(&cursor_file, A);
+    for key in listing_keys() {
+        cursor.endpoints.entry(key).or_default().backfill_complete = true;
+    }
+    cursor.write(&cursor_file).unwrap();
+    let mut forge = Counting::with(&prs);
+    let (_, seen) = production_cycle(dir.path(), &mut forge, None, 5);
+    assert_eq!(seen.len(), 2, "both listings refreshed");
+    let star = StarInputs::load(dir.path(), &repos);
+    assert_eq!(star.repos[A].synced_through, Some(now()));
+    assert!(star.repos[A].state_at(101, 0, None, now()).is_some());
+}
+
+// -- baseline-only PRs (#10520, judge round 3) --------------------------------
+
+/// Requested at `opened` and nothing since: open, awaiting review.
+fn requested(number: u32, opened: DateTime<Utc>) -> Truth {
+    Truth {
+        number,
+        opened,
+        labels: vec![(true, RR, opened)],
+        merged: None,
+        pushed: None,
+    }
+}
+
+/// [`signoz_rows`] for `complete`, plus PR `baseline`'s daemon label sets
+/// only — `sets` identical `[RR]` sets five minutes apart, no `opened` and no
+/// transition row: what SigNoz holds for a PR the daemon first saw mid-pass.
+fn with_baseline(complete: &[Truth], baseline: &Truth, sets: usize) -> FileRows {
+    let mut lines = signoz_lines(complete, true);
+    for i in 0..sets {
+        let seen = baseline.opened + Duration::minutes(3 + 5 * i as i64);
+        lines.push(label_set_row(&format!("set-{i}"), baseline.number, &[RR], seen));
+    }
+    FileRows::parse(&lines.join("\n")).unwrap()
+}
+
+/// The judge's case: old issue rows cover both families; PR 401 is known to
+/// SigNoz only by its daemon label-set baseline (once, or repeated
+/// identically) — no `opened`, no transition. The covered pass must not drop
+/// it: it is planned, gap-filled with exactly one timeline read (no listing,
+/// no invented transition time), and the published snapshot equals the
+/// forge-built one. At the production boundary the raw-event phase still
+/// makes no read.
+#[test]
+fn a_baseline_only_pr_is_gap_filled_not_dropped() {
+    let complete = [approved(101, now() - Duration::hours(30))];
+    let baseline = requested(401, now() - Duration::hours(6));
+    let all = [complete[0].clone(), baseline.clone()];
+
+    for sets in [1, 3] {
+        let via_signoz = tempfile::tempdir().unwrap();
+        let root = via_signoz.path();
+        let mut signoz = with_baseline(&complete, &baseline, sets);
+        let mut forge = Counting::with(&all);
+        let report = run_cycle_with(
+            root,
+            &[target(root)],
+            &mut forge,
+            Some((&mut signoz, limits())),
+            budgets(100),
+            now(),
+        );
+        let r = &report.repos[0];
+        assert_eq!(forge.timeline_reads(401), 1, "{sets} set(s): 401 is gap-filled");
+        assert_eq!(forge.gets.len(), 1, "no listing, nothing else: {:?}", forge.gets);
+        assert_eq!(r.history, Some(HistorySource::SignozGapFill));
+        assert_eq!((r.stop, r.gap_fill_calls), (StopReason::Complete, Some(1)));
+
+        let via_forge = tempfile::tempdir().unwrap();
+        let mut forge = Counting::with(&all);
+        run_cycle(via_forge.path(), &[target(via_forge.path())], &mut forge, budgets(100), now());
+
+        let (s, f) = (published(root), published(via_forge.path()));
+        assert_eq!(s.prs, vec![101, 401], "{sets} set(s): the baseline-only PR is published");
+        assert_eq!(s.prs, f.prs);
+        assert!(!f.samples.is_empty(), "a non-trivial comparison");
+        assert_eq!(s.samples, f.samples, "{sets} set(s)");
+        assert_eq!(s.episodes, f.episodes, "{sets} set(s)");
+        assert_eq!(s.flag_changes, f.flag_changes, "{sets} set(s)");
+        assert_eq!(s.merges, f.merges, "{sets} set(s)");
+
+        // The production cycle: same single read, and no raw-event read.
+        let dir = tempfile::tempdir().unwrap();
+        let mut forge = Counting::with(&all);
+        let mut signoz = with_baseline(&complete, &baseline, sets);
+        let (r, seen) = production_cycle(dir.path(), &mut forge, Some(&mut signoz), 5);
+        assert_eq!(forge.gets.len(), 1, "{:?}", forge.gets);
+        assert_eq!(forge.timeline_reads(401), 1);
+        assert!(seen.is_empty(), "covered: no raw-event read: {seen:?}");
+        assert_eq!((r.history, r.gap_fill_calls), (Some(HistorySource::SignozGapFill), Some(1)));
+        assert_eq!(published(dir.path()).prs, vec![101, 401]);
+    }
+}
+
 // -- the adapter --------------------------------------------------------------
 
 fn timeline_of(prs: &[Truth], anchored: bool) -> Timeline {
@@ -807,6 +1040,15 @@ fn an_item_is_complete_only_when_born_in_the_window_and_never_rejected() {
         .lifecycle
         .retain(|e| e.event != crate::eta::fleet_signoz_timeline_rows::Lifecycle::Opened);
     assert!(!item_complete(&unborn), "no `opened`: its first labels may predate the window");
+
+    // Born, never rejected, but its daemon baseline carries a label no
+    // recorded change dates: not complete (its addition time is unknown).
+    let mut undated = item(1).clone();
+    let seen = base + Duration::minutes(5);
+    undated.label_sets = vec![(seen, [RR, "loom:bystander"].map(String::from).into())];
+    assert!(!item_complete(&undated), "an undated baseline label needs the forge");
+    undated.label_sets = vec![(seen, [RR].map(String::from).into())];
+    assert!(item_complete(&undated), "a baseline the recorded changes explain is fine");
 }
 
 #[test]

@@ -304,10 +304,54 @@ fn a_daemon_items_first_label_set_is_a_baseline_and_dates_nothing() {
     let item = pr(21);
     let rows = vec![label_set("d1", &item, &[RR, "bug"], Some(100))];
     let timeline = Timeline::build(&rows, t(1_000));
-    assert!(timeline
+    let i = timeline
         .items
         .get(&item)
-        .is_none_or(|i| i.labels.is_empty()));
+        .expect("a baseline-only item is still an item (#10520)");
+    assert!(i.labels.is_empty(), "the baseline dates nothing");
+    let set = BTreeSet::from([RR.to_string(), "bug".to_string()]);
+    assert_eq!(i.label_sets, vec![(t(100), set.clone())]);
+    assert_eq!(i.labels_at(t(1_000)), BTreeSet::new(), "no recorded change");
+    assert_eq!(i.current_labels(t(1_000)), set, "the baseline is what it carried");
+    assert_eq!(i.current_labels(t(99)), BTreeSet::new(), "nothing knowable before it");
+    assert_eq!(i.undated_baseline_labels(), set);
+    assert_eq!(i.seen_at().collect::<Vec<_>>(), vec![t(100)]);
+}
+
+/// Repeated identical sets diff to nothing, yet the item and every sighting
+/// are kept; a set observed after the cutoff is not.
+#[test]
+fn repeated_identical_label_sets_keep_the_item_and_every_sighting() {
+    let item = pr(24);
+    let rows = vec![
+        label_set("d1", &item, &[RR], Some(100)),
+        label_set("d2", &item, &[RR], Some(400)),
+        label_set("d3", &item, &[RR], Some(700)),
+        label_set("d4", &item, &[RR, APPROVED], Some(2_000)),
+    ];
+    let timeline = Timeline::build(&rows, t(1_000));
+    let i = &timeline.items[&item];
+    assert!(i.labels.is_empty());
+    let seen: Vec<_> = i.label_sets.iter().map(|(at, _)| *at).collect();
+    assert_eq!(seen, vec![t(100), t(400), t(700)], "point-in-time: d4 is not knowable");
+    assert_eq!(i.current_labels(t(1_000)), BTreeSet::from([RR.to_string()]));
+}
+
+/// A baseline label a recorded change explains is dated; one only the set
+/// carries is not, and the latest set plus later changes is the current set.
+#[test]
+fn a_baseline_label_is_dated_only_by_a_recorded_change() {
+    let item = pr(25);
+    let rows = vec![
+        label(Source::Webhook, "w1", &item, RR, Transition::Added, 50),
+        label_set("d1", &item, &[RR, "bug"], Some(100)),
+        label(Source::Webhook, "w2", &item, RR, Transition::Removed, 300),
+    ];
+    let timeline = Timeline::build(&rows, t(1_000));
+    let i = &timeline.items[&item];
+    assert_eq!(i.undated_baseline_labels(), BTreeSet::from(["bug".to_string()]));
+    assert_eq!(i.current_labels(t(1_000)), BTreeSet::from(["bug".to_string()]));
+    assert_eq!(i.current_labels(t(200)), BTreeSet::from([RR.to_string(), "bug".to_string()]));
 }
 
 #[test]
