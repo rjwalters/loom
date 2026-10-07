@@ -71,6 +71,7 @@ pub mod logistic;
 pub mod math;
 pub mod paths;
 pub mod publish;
+pub mod publish_v2;
 pub mod rows;
 pub mod run;
 pub mod v2;

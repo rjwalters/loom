@@ -95,7 +95,7 @@ use super::cycle_guard::{CycleGuard, CycleTick};
 pub use super::eta_fit::FitCheck;
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use crate::eta::config::{EtaConfig, FleetRefreshConfig};
-use crate::eta::fit::{publish, run, Fitter};
+use crate::eta::fit::{publish, publish_v2, run, Fitter};
 use crate::eta::fleet;
 use crate::eta::fleet_events::{self, EventLog, EventsCursor, SyncMode};
 use crate::eta::fleet_events_forge::{ForgeEndpoint, ForgeEventSource};
@@ -528,14 +528,10 @@ pub fn distribute_fetch(
     let (loc, _) = publish::publication_location(root)?;
     let effective = crate::config_resolver::resolve_effective_config(root);
     let transport = crate::fleet_store::gh::GhTransport::new(root, &loc.repo);
-    Some(publish::fetch_and_install(
-        &transport,
-        &loc,
-        root,
-        captain,
-        now,
-        publish::resolve_max_age(&effective),
-    ))
+    let max_age = publish::resolve_max_age(&effective);
+    // The v2 lane (#10508) is independent: its outcome never changes v1's.
+    let _ = publish_v2::fetch_and_install_v2(&transport, &loc, root, captain, now, max_age);
+    Some(publish::fetch_and_install(&transport, &loc, root, captain, now, max_age))
 }
 
 /// #10395, captain: publish the newest local fit unless already published. A
@@ -546,6 +542,7 @@ pub fn distribute_publish(root: &Path, captain: &str, now: DateTime<Utc>) {
     };
     let transport = crate::fleet_store::gh::GhTransport::new(root, &loc.repo);
     let _ = publish::publish_newest(&transport, &transport, &loc, &base, root, captain, now);
+    let _ = publish_v2::publish_newest_v2(&transport, &transport, &loc, &base, root, captain, now);
 }
 
 /// Refresh every repo's SigNoz in-sweep snapshot (#9758) through the
