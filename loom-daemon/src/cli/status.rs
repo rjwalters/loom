@@ -390,6 +390,7 @@ pub(crate) async fn handle_status_command(
 
     let report = match query_daemon_status(&socket_path, &timeout_info).await {
         Ok(report) => report,
+        Err(_) if crate::cli::host::report_disabled(json) => return Ok(()),
         Err(e) => {
             // Issue #4069 (AC3 of #4011): classify WHY the daemon is
             // unreachable using the same autonomy-desired marker + heartbeat

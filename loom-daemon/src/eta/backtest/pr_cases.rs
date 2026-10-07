@@ -60,8 +60,9 @@
 //! strictly after that lap's own entry. [`super::run`] reaches history only
 //! through `select`/`select_at` (`observed_at < as_of`), so a PR's own future
 //! segments are excluded by the same structural rule as everything else.
-//! Each case's predictor inputs — `as_of`, `stage`, `rework_rounds` — are
-//! computed only from events at or before its entry (the replay is causal:
+//! Each case's predictor inputs — `as_of`, `stage`, `rework_rounds` — and
+//! its subset flags (`pr_flags`, #10524) are computed only from events at or
+//! before its entry (the replay is causal:
 //! each instant's resolution reads only the labels in force after it), so
 //! later labels, rejections and the final rework count cannot reach them;
 //! `tests/backtest_pr.rs` pins both properties.
@@ -69,7 +70,8 @@
 use super::ReplayCase;
 use crate::eta::episodes::{input_from_pr_history, replay};
 use crate::eta::labels::{
-    hold_labels, stage_from_pr_labels, APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED, TREATING,
+    hold_labels, pr_flags, stage_from_pr_labels, APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED,
+    TREATING,
 };
 use crate::eta::queue_features::{EventKind, EventLog, RosterEntry, StageEvent};
 use crate::eta::score::OutcomeKind;
@@ -441,8 +443,9 @@ fn land_terminal(
 }
 
 /// One instant the PR's resolved stage changed: `None` when its last review
-/// label was removed (a gap in review, not a refusal).
-type LabelEntry = (DateTime<Utc>, Option<Result<Stage, NoEstimateReason>>);
+/// label was removed (a gap in review, not a refusal), with
+/// [`pr_flags`] of the labels in force at that instant (#10524).
+type LabelEntry = (DateTime<Utc>, Option<Result<Stage, NoEstimateReason>>, u8);
 
 /// The stage transitions of one PR's label timeline strictly before
 /// `cutoff`, gaps included, and the instants of its rejection laps. Shared by
@@ -473,14 +476,15 @@ fn label_entries(
         if named == Some(Stage::Doctor) && prev_named != Some(Stage::Doctor) {
             rejections.push(at);
         }
+        let flags = pr_flags(present);
         match resolved {
             Some(Ok(stage)) if prev_resolved != Some(Ok(stage)) => {
-                entries.push((at, Some(Ok(stage))));
+                entries.push((at, Some(Ok(stage)), flags));
             }
             Some(Err(reason)) if prev_resolved != Some(Err(reason)) || prev_named != named => {
-                entries.push((at, Some(Err(reason))));
+                entries.push((at, Some(Err(reason)), flags));
             }
-            None if prev_resolved.is_some() => entries.push((at, None)),
+            None if prev_resolved.is_some() => entries.push((at, None, flags)),
             _ => {}
         }
         prev_resolved = resolved;
@@ -524,7 +528,7 @@ fn pr_occupancy(repo: &str, h: &PrHistory) -> Option<Occupancy> {
     let stints = entries
         .iter()
         .enumerate()
-        .map(|(i, (at, resolved))| Stint {
+        .map(|(i, (at, resolved, _))| Stint {
             stage: resolved.as_ref().and_then(|r| r.as_ref().ok().copied()),
             entered_at: *at,
             left_at: entries.get(i + 1).map_or(cutoff, |next| next.0),
@@ -571,7 +575,7 @@ pub fn pr_case_entries(
         merged_at: Some(merged_at),
         ..PrCaseEntries::default()
     };
-    for (as_of, resolved) in entries {
+    for (as_of, resolved, flags) in entries {
         // A gap (every review label removed) is no case and no refusal.
         let Some(resolved) = resolved else { continue };
         match resolved {
@@ -586,6 +590,7 @@ pub fn pr_case_entries(
                 dispatch: None,
                 age_sec: 0,
                 queue: Vec::new(),
+                pr_flags: Some(flags),
             }),
             Err(reason) => out.refused.push(RefusedEntry { at: as_of, reason }),
         }

@@ -44,6 +44,18 @@ pub(super) fn render_report(r: &BacktestReport) -> String {
             out.push_str(&render_bucket(h, b));
         }
     }
+    if !r.by_subset.is_empty() {
+        out.push_str("by subset (#10524):\n");
+        for (name, sb) in &r.by_subset {
+            out.push_str(&render_bucket(name, &sb.bucket));
+            out.push_str(&format!(
+                "  {:<28} late surprise={:>7} over {} case(s)\n",
+                "",
+                pct(sb.late_rate),
+                sb.late_decided
+            ));
+        }
+    }
     let s = &r.stability;
     out.push_str(&format!(
         "stability (predicted landing instant): steps={} median_shift={}s max_shift={}s\n",

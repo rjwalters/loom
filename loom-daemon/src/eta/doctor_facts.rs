@@ -23,7 +23,9 @@ use super::doctor::{
     AuthorityFacts, BacktestFacts, ConfigFacts, DataFacts, DriftFacts, FitFacts, Gate,
     HeuristicTally, OutcomeFacts, PairFacts, RepoFacts, ServingFacts,
 };
-use super::heuristics::{CALIBRATION_BASE, CALIBRATION_BASES};
+use super::heuristics::{
+    CALIBRATION_BASE, CALIBRATION_BASES, LAND_BRISK_PETREL, LAND_TWIN_OTTER_B,
+};
 use super::{
     calibration_log, config, fit, fleet, fleet_refresh, health, nightly_folds, regime, shadow,
     Kind, Registry, Stage,
@@ -162,8 +164,13 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
     // every logged heuristic would let a change in the *mix* of heuristics
     // trip the CUSUM with no real regime change. That track is the serving
     // `land` heuristic's when the log records it, else the calibration base.
+    // brisk-petrel (#10528) adjusts on twin-otter-b's track, so that is the
+    // track its drift is checked on.
     let serving_land = registry.current(Kind::Land, eta.current(Kind::Land)).id();
-    let drift_heuristic = if CALIBRATION_BASES.contains(&serving_land) {
+    let adjusted = serving_land == LAND_BRISK_PETREL;
+    let drift_heuristic = if adjusted {
+        LAND_TWIN_OTTER_B
+    } else if CALIBRATION_BASES.contains(&serving_land) {
         serving_land
     } else {
         CALIBRATION_BASE
@@ -184,6 +191,7 @@ pub fn gather(root: &Path, host_id: &str, now: DateTime<Utc>) -> Facts {
             heuristic: drift_heuristic.to_string(),
             n_recent: u64::try_from(d.n_recent).unwrap_or(u64::MAX),
             state: d.state(),
+            adjusted,
         })
         .collect();
     let outcomes = OutcomeFacts {
