@@ -18,6 +18,7 @@ mod explanation;
 mod features_v3;
 mod fit;
 mod fit_leak;
+mod fit_newton;
 mod fit_parity;
 mod fit_publish;
 mod fit_publish_v2;

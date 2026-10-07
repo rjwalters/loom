@@ -11,10 +11,12 @@
 use super::coeffs::{HazardFit, HazardSkip, SkipReason};
 use super::math::{
     mirror_upper, newton, sigmoid, softplus, standardization, standardize, Derivatives, Stop,
+    DECREASE_RTOL, STEP_RTOL,
 };
 use super::{model_features, TrainingRow, HAZARD_C, MIN_STAGE_EXITS, MIN_STAGE_ROWS, N_FEATURES};
 
-/// Newton stops once a full step is below this (`‖·‖∞`).
+/// Newton stops once a full step is below this (`‖·‖∞`), or at the noise
+/// floor ([`DECREASE_RTOL`], [`STEP_RTOL`]; #10501).
 const STEP_TOL: f64 = 1e-12;
 
 /// Fit one stage's hazard from `rows` — that stage's rows with an exit label;
@@ -79,6 +81,8 @@ pub fn fit_stage_x<const N: usize>(
     let stop = Stop {
         grad_tol: 0.0,
         step_tol: STEP_TOL,
+        decrease_rtol: DECREASE_RTOL,
+        step_rtol: STEP_RTOL,
     };
     let min = newton(
         x0,
