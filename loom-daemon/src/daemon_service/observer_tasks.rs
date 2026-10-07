@@ -76,7 +76,9 @@ pub fn spawn(
 
     // Codex session-container watch (#10455). Observe-only like the two
     // above: it logs, publishes a snapshot and feeds the gauge; it changes no
-    // dispatch path.
+    // dispatch path. Selection reads what it publishes (#10660), so mark this
+    // process as the one that never forks `docker` to select an account.
+    loom_daemon::tokens_pool::session_lifecycle::liveness::mark_watch_runs_here();
     let codex_session =
         observability::ops::codex_session::spawn_watch(workspace_root.to_path_buf());
 

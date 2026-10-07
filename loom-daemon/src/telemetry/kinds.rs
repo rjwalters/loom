@@ -175,6 +175,9 @@ pub mod eta_snapshot;
 /// `pick.decision` (#10212) — what a role / the work finder looked at per tick.
 pub mod pick_decision;
 
+/// `pr.resolved` (#10519) — a PR's merge or close instant, from the ETA pass.
+pub mod pr_resolved;
+
 /// `session.output` (#9764) — the live, redacted agent-output feed.
 pub mod session_output;
 
@@ -406,6 +409,13 @@ macro_rules! telemetry_kind_table {
             /// the ranked candidates it considered, what it acted on, and a
             /// closed-set reason per skip. OTLP-only. See [`pick_decision`].
             PickDecision = "pick.decision" => $crate::telemetry::kinds::pick_decision::PickDecisionRecord,
+                gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
+
+            /// A PR the ETA pass saw leave the review listings, with its merge
+            /// or close instant (Issue #10519). Built from rows the pass
+            /// already journals, so no new forge read. OTLP-only. See
+            /// [`pr_resolved`].
+            PrResolved = "pr.resolved" => $crate::telemetry::kinds::pr_resolved::PrResolvedRecord,
                 gate: $crate::telemetry::NEW_KIND_SCHEMA_VERSION, otlp: Logs, native: false;
 
             // APPEND NEW KINDS ABOVE THIS LINE (one row; `gate:` stays

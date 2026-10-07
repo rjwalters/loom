@@ -581,3 +581,61 @@ fn session_down_parses_and_a_generic_failure_keeps_the_generic_reason() {
     let attrs = crate::observability::lifecycle::admission_attributes(&generic);
     assert_eq!(attrs["loom.admission.reason"], "failure");
 }
+
+/// #10364: a codex tick refused because the running session container does
+/// not mount its working directory ends as `category=SESSION_MOUNT_STALE`
+/// (exit 78 kept). The adapter only passes `session-exec host`'s refusal
+/// announcement through and packages its classifier's generic `RECOVERABLE`; the daemon
+/// derives the category from the marker. It gets its own failure reason and
+/// `loom.admission.reason`, distinct from SESSION_DOWN and from a bare
+/// failure, and records no account hold and no `last_success`: the container
+/// is stale, the account is fine.
+#[test]
+#[serial]
+fn codex_role_tick_mount_stale_is_a_distinct_outcome_with_no_account_hold() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    codex_judge_workspace(workspace.path());
+    write_executable(
+        &workspace.path().join(".loom/scripts/spawn-worker.sh"),
+        "#!/bin/sh\n\
+         echo '# LOOM_ACCOUNT name=alice'\n\
+         echo '# LOOM_SESSION_REFUSAL v=1 category=SESSION_MOUNT_STALE'\n\
+         echo '# LOOM_TERMINAL_RESULT v=2 provider=codex account=alice \
+category=RECOVERABLE exit_code=78 model=none'\n\
+         exit 78\n",
+    );
+
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
+    let RoleTickOutcome::Failure(detail) = &outcome else {
+        panic!("a refused tick must be a Failure, got {outcome:?}");
+    };
+    assert!(crate::role_tick_telemetry::is_session_mount_stale_reason(detail), "{detail}");
+    assert!(!crate::role_tick_telemetry::is_session_down_reason(detail), "{detail}");
+    assert!(detail.contains("alice"), "{detail}");
+    let attrs = crate::observability::lifecycle::admission_attributes(&outcome);
+    assert_eq!(attrs["loom.admission.reason"], "session-mount-stale");
+
+    let health = tokens_pool::account_health(workspace.path(), &codex_id("alice")).unwrap();
+    assert!(
+        health
+            .as_ref()
+            .is_none_or(|h| h.cooldown_until.is_none() && h.last_success.is_none()),
+        "SESSION_MOUNT_STALE must neither hold the account nor stamp a success, though the \
+         adapter's own record said RECOVERABLE: {health:?}"
+    );
+}
+
+#[test]
+fn session_mount_stale_parses_and_marks_no_pool_reason() {
+    use std::str::FromStr;
+    let class =
+        tokens_pool::health::TerminalClassification::from_str("SESSION_MOUNT_STALE").unwrap();
+    assert_eq!(class, tokens_pool::health::TerminalClassification::SessionMountStale);
+    assert!(crate::observability::ops::pool_marks::MarkReason::from_codex(class).is_none());
+}

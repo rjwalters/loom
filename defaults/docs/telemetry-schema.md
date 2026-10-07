@@ -1635,7 +1635,7 @@ Never an issue number, sha or path.
 | `loom.eta.health.snapshot_rows` | `{row}` | none | rows in the last `eta.snapshot` this process built. Omitted until one was built |
 | `loom.eta.health.snapshot_alternates_rows` | `{row}` | none | of those, rows with non-empty `alternates` (#10390) |
 | `loom.eta.health.pending_over_cap` | `{estimate}` | none | cumulative pending estimates evicted by the `MAX_PENDING` cap since process start (#10496). Omitted before the first ETA pass; a rising value means refreshes are being thinned (redundant middles, then pairs to their earliest). Whole series are evicted only when distinct series alone exceed the cap; the daemon log's `whole series lost` count reports those |
-| `loom.codex_session.state` | `1` | `account`, `state` ∈ `running`, `stopped`, `restarting`, `missing`, `stale_mounts`, `container` | per session-managed Codex account, `1` for the container's current state and `0` for the other four (#10455). `restarting`: Docker is backing off a crash loop (`State.Restarting`; counts as down). `stale_mounts`: a registered workspace root under the container's workspace label is not mounted. Only emitted when an enabled account is session-managed, and omitted for a pass where docker could not be queried (never reported as `missing`) |
+| `loom.codex_session.state` | `1` | `account`, `state` ∈ `running`, `stopped`, `restarting`, `missing`, `stale_mounts`, `container` | per session-managed Codex account, `1` for the container's current state and `0` for the other four (#10455). `restarting`: Docker is backing off a crash loop (`State.Restarting`; counts as down). `stale_mounts`: the container's workspace mounts differ from what its workspace label would mount today, either a registered root under the label is not mounted or a mount is no longer registered (#10364). Only emitted when an enabled account is session-managed, and omitted for a pass where docker could not be queried (never reported as `missing`) |
 
 Fleet gauges produced by the captain (W12, `observability/captain_gauges.rs`).
 Gauges on the collector pass, emitted only on a host that is the armed captain
@@ -2156,6 +2156,38 @@ apply. `fit_id` joins to the `fit_id` on every twin-otter explanation.
 The daemon also keeps the last record at `.loom/state/eta/health/fit-check.json`
 (byte-identical to the body) and the last refresh tick at
 `refresh-cycle.json`, for `loom-daemon eta doctor`.
+
+### `pr.resolved`
+
+A PR the ETA pass saw leave the review listings, with its merge or close
+instant (Issue #10519). Envelopes carry `schema_version: 12`. **OTLP-only**
+(native: `false`). It gives the SigNoz timeline reader
+(`eta::fleet_signoz_timeline`) a merge/close instant wherever the loom-ui
+webhook export has none. When both exist, the webhook's `closed` row is
+primary and this record corroborates it. **No new forge read**: the record is
+built from the `pr.resolved` stage-journal rows the pass already writes, from
+its existing review listing and the PR read the tracker already makes. Only
+the fleet's ETA authority runs the pass, so only it emits these. At most one
+record per `(repo, pr_number, state)` per pass.
+
+The log record's **time is `resolved_at`** and its **observed timestamp is
+`observed_at`** (the knowable-at time, see "Event time vs knowable-at"
+above). The body is the record's JSON. The scalars ride as `loom.repo`,
+`loom.pr_number`, `loom.issue` and `loom.eta.pr.*` attributes (in
+`ETA_LOG_ATTRIBUTE_KEYS`, allowlisted in the collector's `transform/privacy`).
+Provenance is required, as for `eta.estimate`, and exports as
+`loom.eta.version` / `revision` / `tree_state` / `provenance_complete`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `repo` | string | `owner/repo` |
+| `pr_number` | integer | the PR |
+| `issue` | integer? | the issue the tracker follows the PR for |
+| `state` | string | `merged` or `closed` |
+| `resolved_at` | RFC3339 | merge: the forge's `merged_at`; close: the pass that saw it closed (the forge read carries no close instant) |
+| `observed_at` | RFC3339 | when this daemon observed it; never earlier than `resolved_at` |
+| `resolution_sec` | integer | how late `resolved_at` can be: `0` for a merge, the listing interval for a close (polling time) |
+| `loom` | object | the observing daemon's provenance (required) |
 
 ### `eta.snapshot`
 

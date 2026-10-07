@@ -2578,9 +2578,10 @@ never-propagate list. The table is the rule set only. The pass that writes
 these labels is not built yet.
 
 **loom-ui stars.** The `/ingest` ack may carry `operator_priority_intents`
-(`defaults/docs/telemetry-schema.md`). The pass applies each valid one (the one
-label, a managed repo, a `requested_by`) idempotently with one audit comment;
-the intent's `requested_at` is the starred-at.
+(`defaults/docs/telemetry-schema.md`). The pass applies each valid one (an
+operator label of any level — the star or `loom:operator-high-priority`, #10307
+— on a managed repo, with a `requested_by`) idempotently with one audit comment
+whose marker names the `label=`; the intent's `requested_at` is the starred-at.
 
 Config (`.loom/config.json → autonomous.operatorPriority`, **env > config >
 default**):
@@ -2588,10 +2589,26 @@ default**):
 | Key | Env | Default | Meaning |
 |---|---|---|---|
 | `noProgressMinutes` | `LOOM_OPERATOR_PRIORITY_NO_PROGRESS_MINUTES` | `30` | watchdog window |
-| `escalate` | `LOOM_OPERATOR_PRIORITY_ESCALATE` | `true` | post escalations and apply loom-ui intents; `false` still computes and shows every landing state |
+| `escalate` | `LOOM_OPERATOR_PRIORITY_ESCALATE` | `true` | post escalations, apply loom-ui intents, and write the derived level labels and their body markers (#10307); `false` still computes and shows every landing state, and the work finder still sees inherited levels in memory |
 | `intervalSecs` | `LOOM_OPERATOR_PRIORITY_INTERVAL_SECS` | `120` | pass interval |
 | `poolsExhaustedGraceMinutes` | `LOOM_OPERATOR_PRIORITY_POOLS_GRACE_MINUTES` | `10` | wait before a `pools-exhausted` ask; `0` asks at once |
 | `propagate` | `LOOM_OPERATOR_PRIORITY_PROPAGATE` | `true` | a star also reaches its children by park record, task list and dependency phrase; `false` keeps only the blocker / incident / red-main inheritance |
+| `levelCaps` | — | `{"2": 5}` (the level table) | per-level cap on open issues carrying the level's operator label; over the cap is flagged in the digest, never refused |
+
+**Priority levels (#10307).** Every pass also walks each level ≥ 2 issue's
+(`loom:operator-high-priority`) blockers, transitively and into every managed
+repo, and writes `loom:high-priority-inherited` on each open one. Provenance
+goes into the blocker's **issue body** first, as
+`<!-- loom:priority-inherited inherited_from=owner/repo#N level=2 requested_at=… id=… -->`
+(what loom-ui reads; one marker per level, replaced in place when the source
+changes, nothing else in the body touched). The label is skipped when that
+write fails, so the next pass retries both. The work finder orders the blocker
+at the marker's `requested_at`. The label and marker come off once no level-2
+issue reaches the blocker, after a complete walk only (a failed listing, issue
+read or native-dependency read adds and never removes), and only on a host
+that manages the marker's source repo. Containment (task lists, sub-issues) never carries a
+level. A blocker in an unmanaged repo is listed, not followed; an
+operator-only / operator-decision blocker leads the digest.
 
 ### Ready queue view (`loom-daemon queue`, #8852)
 
@@ -4299,7 +4316,8 @@ repository is now the parallelism boundary:
   `(root, role)` run starts on its own blocking task and holds its in-progress
   entry until it finishes; the tick does not wait for it. A run still going at
   the next tick is refused by the per-`(root, role)` overlap check (#4364), so a
-  repository never has two instances of one role. Finished runs are reaped as
+  repository never has two instances of one role — except doctor on a
+  repository deep in its own changes debt (per-repository doctor lanes, below). Finished runs are reaped as
   they complete, where the fail/recover log dedup (#4349) and the empty-pool
   brake feed (#7607) run as before.
 - **Different roles run in the same repository at once.** The in-progress key
@@ -4401,6 +4419,32 @@ repository is now the parallelism boundary:
   Idle-edge runs keep the Phase 1 budget. `demandWidth.enabled: false` restores
   exactly the Phase 1 admission (no ledger reads, no reservation, no `loom:pr`
   count).
+- **Per-repository doctor lanes (#10632).** One doctor per repository, fixing
+  one PR per run, cannot drain a repository with dozens of
+  `loom:changes-requested` PRs, however much host budget is idle. So a
+  repository's doctor may hold up to
+  `lanes = clamp(ceil(repo changes debt / perRun), 1, doctorMaxPerRepo)` runs at
+  once, sized from **that repository's own** ledger entry (not the host total;
+  an unobserved or stale entry is `1`). Each run occupies a lane of the
+  in-progress key `(root, role, lane)` and counts against the host ceiling,
+  doctor's (demand-width) budget and the Champion-first reservation like any
+  other run, so lanes only let one hot repository use doctor slots the host
+  already allows. A walk still decides each repository once per tick, so a hot
+  repository gains at most one lane per tick and other repositories keep their
+  round-robin turn. When `lanes > 1`, every doctor run for that repository is
+  **assigned a different PR** instead of taking the queue head: before any
+  agent starts, the run reads the shared Doctor queue (the same ordering as
+  `loom-daemon pr-queue --role doctor`, which already skips `loom:treating`,
+  `loom:blocked` and `loom:operator-only`), reserves the first row no other lane
+  on this host holds, runs `verdict-staleness-guard.sh <PR> --clear` on it
+  (exit `0`/`11` take it; `10`/`12`/error skip it; at most 3 rows per run), and
+  dispatches `/loom:doctor <PR>` — PR Fix Mode, which still runs the stale
+  `loom:treating` claim check. A lane with nothing assignable ends `QueueEmpty`
+  without spawning an agent. If the queue cannot be read, lane `0` falls back to
+  the classic `/loom:doctor` (fail open) and extra lanes stand down. Each
+  multi-lane admission logs one `INFO` line naming the lane and
+  `doctorMaxPerRepo`. Every other role, and idle-edge runs, keep one instance
+  per `(repository, role)`; `doctorMaxPerRepo: 1` restores that for doctor too.
 
 **Observability.** `loom-daemon status` prints the live count and its ceiling
 immediately under the in-flight sweep table, plus the total:
@@ -5394,6 +5438,7 @@ knobs not yet audited here.
 | `autonomous.roleRunner.demandWidth.max` | *(config only)* | `4` | Upper clamp on judge, doctor and champion width. Still capped by the role's `roleMaxConcurrent` budget, so at the default ceiling of 7 (budget 3) it binds only where the budget is 4 or more — demand never raises a role above its budget. Zero, negative or non-integer drops to the default. **Live** |
 | `autonomous.roleRunner.demandWidth.reserve` | *(config only)* | `true` | Champion-first ceiling reservation: admitting a role leaves free the unfilled `min(width, repositories with debt)` of each higher-priority PR role (champion > judge > doctor > others). `false` keeps the width but reserves nothing. **Live** |
 | `autonomous.roleRunner.demandWidth.nonPrFloor` | *(config only)* | `1` | Ceiling slots the reservation always leaves for non-PR roles: the reservation never exceeds `maxConcurrent − nonPrFloor`. Zero, negative or non-integer drops to the default. **Live** |
+| `autonomous.roleRunner.demandWidth.doctorMaxPerRepo` | *(config only)* | `3` | **Per-repository doctor lanes (#10632).** The most doctor runs one repository may hold at once: `clamp(ceil(repo changes debt / perRun), 1, doctorMaxPerRepo)`, from that repository's own ledger entry. Each lane is dispatched as `/loom:doctor <PR>` on a different assigned PR and counts against the host ceiling, doctor's budget and the reservation. `1` is the classic one doctor per repository. Zero, negative or non-integer drops to the default; values above `8` are clamped to `8`. Resolved per root, **live**. See [Concurrent across repositories](#concurrent-across-repositories-one-instance-per-repository-role-9391) |
 | `autonomous.roleRunner.demandWidth.staleSecs` | *(config only)* | `1800` | Demand-ledger entries older than this many seconds are stale; an axis with no fresh entry is unobserved and falls back to Phase 1 behaviour. The reservation and the #9410 build back-off sum only fresh entries; the PR-role **width** adds in every stale entry's last-known count (#9414), so it is unobserved only when the axis has no fresh entry or a zero total. Zero, negative or non-integer drops to the default. **Live** |
 | `autonomous.roleRunner.model` | *(config only)* | `sonnet` | Model every role child is pinned to via `--model` (#4501). Resolved through the same `resolve_dispatch_model` chain as sweep dispatch: this key > `autonomous.model` > shipped default; blanks treated as unset. A role child never inherits the account's interactive CLI default |
 | `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of all **8** shipped roles — the 7 above **plus `architect`**, which is reachable here and nowhere else by default (#5656) — to fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
@@ -7607,6 +7652,59 @@ as before, and after a transfer it can only shrink.
 | `LOOM_REPO_FACTS` | on | `0` makes every migrated site issue exactly its previous forge call and restores the ETag store's process-lifetime `origin` memo (the rollback switch). |
 | `LOOM_REPO_FACTS_VERIFY_SECS` | `21600` | How long a verified record is used before one conditional re-read. |
 
+### Installation snapshot: one listing per credential (`LOOM_INSTALLATION_SNAPSHOT`)
+
+Telemetry visibility (`visibility.repo`), the D32 repo identity
+(`telemetry.repo_identity`) and the write-scope probe (`write_scope.probe`)
+each read `GET repos/<nwo>` once per repository. An App installation token can
+list every repository it reaches in one call, so each credential now keeps one
+snapshot of `GET installation/repositories?per_page=100` (every page, each
+revalidated with its own `If-None-Match`, so an unchanged installation costs
+only free `304`s). Call row: `repo_facts.installation_snapshot`, operation
+`repo.list-for-installation`. The snapshot
+holds each repository's `id`, `full_name` and `private`. It is kept in the
+private ETag store directory as `instsnap-<hash>.json` (`0700` directory,
+`0600` files, atomic writes), so every daemon and CLI process on the host
+shares it. It is keyed by forge host, `GH_CONFIG_DIR` and a fingerprint of any
+env token, never the token.
+
+- **Visibility and identity** read the snapshot of the repository's reader App
+  when one is usable, else the writer credential for its owner.
+- **The write-scope probe** reads the writer's own snapshot (it stays
+  writer-only). A listed repository is WRITE and an absent one is not.
+  `permissions` (leg 1) runs only for a user token, or when the snapshot
+  cannot be had. Then its WRITE stands, a named lesser role (`pull`, `triage`)
+  stands as a definitive refusal, and an all-`false` answer (what an App token
+  always gets) is `Unknown`.
+- **The two TTLs stack.** The probe caches its answer for
+  `LOOM_WRITE_SCOPE_TTL_SECS` (1 h) on top of a snapshot that may already be
+  an hour old, so a repository removed from the installation can keep a cached
+  WRITE for about 2 h with the defaults, not 1 h. The forge still refuses the
+  write itself.
+- **Fail-private.** A snapshot answers only while it was verified within the
+  TTL. A failed revalidation backs off for 300 s and answers nothing; a stale
+  snapshot is never served, and one stamped later than now (a clock step, a
+  damaged file) is discarded. Visibility treats a failed or stale snapshot,
+  and a repository absent from a fresh one, as **private**.
+- **The trade-off.** While the listing cannot be had at TTL expiry (an outage,
+  a rate limit), records for every repository that credential answers for are
+  stamped **private** until a revalidation succeeds, the public ones included.
+- **Rate limits.** A reader App whose listing is rate limited is withdrawn for
+  that `(app, owner)` bucket until the refusal's reset, and the read falls to
+  the writer's snapshot (else private). It never trips the host-wide
+  rate-limit breaker. The writer's refusal does, with its own `GH_CONFIG_DIR`
+  and response headers.
+- **User credentials** (a PAT, OAuth or `gh auth login` token) are refused the
+  endpoint. The refusal is remembered for the TTL, and those reads keep their
+  per-repo calls exactly as before. A credential that has listed before is
+  only reclassified by that specific refusal; any other `403`/`404` is a failed
+  revalidation (private).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOOM_INSTALLATION_SNAPSHOT` | on | `0` restores every per-repo read (so does `LOOM_REPO_FACTS=0`). |
+| `LOOM_INSTALLATION_SNAPSHOT_TTL_SECS` | `3600` | How long a verified snapshot answers before one conditional revalidation, capped at `3600`. It also bounds how long a public/private flip goes unseen by visibility and identity. |
+
 ### Untargeted reads route to readers; deferrable reads shed (`LOOM_FACADE_CWD_ROUTING`, `LOOM_READ_SHED`)
 
 Most daemon reads are built with no typed repository (`GhTarget::None`) and
@@ -7719,12 +7817,16 @@ A `Gate` read always confirms on the writer, and the reader is not withdrawn.
 The REST issue and PR reads behind the worktree reaper, eager reclaim,
 `clean` (sweep transients, stale branches, the `pr-<N>` probe),
 `--aggressive`, `checkpoint read` and the primary-checkout reaper go through
-one module, `loom-daemon/src/worktree_ops/forge_state.rs`. Not every hygiene
-read does yet: the GraphQL-backed probes `gh::issue_state` (`gh issue view`,
-in `clean`'s worktree pass and stale-branch cleanup), `check_pr_merged`, and
-the `check_pr_status_for_branch` fallback (`clean` and the primary-checkout
-reaper, when REST is unknown or no owner resolves) still name gh's own
-target and are not conditional.
+one module, `loom-daemon/src/worktree_ops/forge_state.rs`. Since W6 PR2 the
+number-keyed probes of `clean` do too (its worktree pass and its stale-branch
+pass read the issue through this path instead of `gh issue view`, and the
+worktree pass asks the REST listing for the branch's PR first). What is left
+on GraphQL are branch lookups with no item number, each a last resort behind
+the REST listing: `check_pr_merged` (the reaper and `clean` when no owner
+resolves; `clean` also when REST is unknown) and `check_pr_status_for_branch`
+(`clean`'s no-remote stale-branch check when REST is unknown or no owner
+resolves; the primary-checkout reaper when no owner resolves). They still
+name gh's own target and are not conditional.
 
 - **The checkout's own repo.** Reads name gh's base repo for the root,
   resolved and verified by the repo facts above with `GH_REPO`/`LOOM_REPO`
@@ -7737,9 +7839,10 @@ target and are not conditional.
 - **Conditional and fresh.** `issues/{n}` (state and `closed_at` in one
   read) and `pulls/{n}` (status and `head.sha`) are conditional `GET`s on the
   agents' shared `view-` entry, so an unchanged item is a free `304` and
-  `gh-cached --invalidate N` drops the entry after a write. Nothing is
-  remembered beyond the `ETag` and its body: every read reaches the forge,
-  and a `304` is server-fresh (ADR-0021). Branch listings
+  `gh-cached --invalidate N` drops the entry after a write. This module
+  remembers nothing beyond the `ETag` and its body: every read it is asked
+  for reaches the forge, and a `304` is server-fresh (ADR-0021). What a pass
+  may hold on top of that is the next section. Branch listings
   (`pulls?head=`) stay unconditional, because `--invalidate` does not drop
   them.
 - **Identity.** An answer must be the item asked for: its `number`, and its
@@ -7771,6 +7874,73 @@ target and are not conditional.
 | Variable | Default | Effect |
 |---|---|---|
 | `LOOM_HYGIENE_CONDITIONAL` | on | `0` makes the single-item reads on a root with a repo fact unconditional: no `If-None-Match` sent, the `view-` entry neither read nor written. Everything else stays: the explicit target, the identity check, reader routing and the breaker. It is not a revert of W6 — no switch restores the pre-W6 `LOOM_REPO` > `origin` target. `LOOM_REPO_FACTS=0` sends every item read down the placeholder path (`{owner}/{repo}`, `GH_REPO` stripped, unconditional). |
+
+### Hygiene passes: held for one pass, merged remembered, every removal confirmed (`LOOM_HYGIENE_MEMO`)
+
+Hygiene removes worktrees and branches, so everything here fails toward
+KEEP. `loom-daemon/src/worktree_ops/hygiene_pass.rs` (W6 PR2) sits between
+the reaping and cleaning passes and the read path above.
+
+- **Held for one pass.** The worktree reaper asks about every kept worktree
+  twice per tick (once for removal, once for reclaiming its build
+  artifacts), and an issue's `closed_at` is a third question answered by the
+  same body. A pass now holds each issue (`issues/{n}`), each PR
+  (`pulls/{n}`) and each branch's PR status (`pulls?head=`) the first time it
+  reads it and answers the rest from memory (`hygiene.memo_hit`). Only real
+  answers are held: an unknown, a `404` or a failed read is asked again.
+  Nothing is persisted and nothing outlives the pass; the eager reclaim pass
+  is a pass of its own.
+- **Remembered across passes: a merged PR, and nothing else.** A merged PR
+  stays merged, so a kept `pr-<N>` worktree whose PR merged costs no read
+  after the first (`hygiene.terminal_hit`). A CLOSED issue or a
+  closed-without-merge PR can be reopened and is read every pass; OPEN,
+  unknown, gone and errors are never stored. Entries are
+  `hygiene-merged-*.json` files in the shared store directory, one per
+  `(forge host, repository, credential, PR number)`. The repository is the
+  forge's numeric repo id when the repo-facts record has one — a renamed or
+  transferred repo keeps its entries, and a new repo under an old name never
+  reads them — else the canonical `owner/name` in a separate namespace; a
+  root with no repo fact is never stored. Entries older than 30 days are
+  dropped on the next write.
+- **Every removal is confirmed first.** A held answer, a remembered merge
+  and a `304`-served body are discovery; none of them is the last word
+  before data is destroyed (ADR-0021: a read that gates an action never
+  comes from a held cache, and the store is writable by any process of the
+  same uid). Immediately before a quarantine or a removal the pass makes ONE
+  unconditional read (no `If-None-Match`, nothing read from or written to the
+  store) of the numbered item the decision rested on: the issue for an
+  `issue-<N>` worktree or branch (`hygiene.confirm_issue` in the ledger), the
+  PR for a `pr-<N>` worktree (`hygiene.confirm_pr`; status and head SHA must
+  both match). If the answer differs from what the pass held, or is unknown
+  or gone (a transferred or missing item included), the worktree is kept,
+  `hygiene.confirm_downgrade` is bumped, a `warn` line names both answers,
+  and what was held is forgotten; a contradicted merged entry is deleted.
+  Sites: the worktree reaper and eager reclaim (`issue-<N>` and `pr-<N>`),
+  `clean`'s worktree pass (a kept worktree prints the reason under "skipping
+  (may need investigation)"; under a non-`--safe` interactive run the read
+  precedes the prompt), `clean`'s stale-branch pass for a CLOSED issue (an
+  unconfirmed one is reported as `UNCONFIRMED` and the branch kept), and
+  `clean --aggressive` when its decision read the issue ("Skipped (fresh
+  forge read did not confirm the issue state)"). A dry run confirms nothing.
+- **What is not confirmed, and why.** A decision that used no forge state
+  for the item holds nothing, so no read is made: an unregistered orphan
+  directory (#6652), and `--aggressive` removing landed work whatever the
+  issue says. A branch listing has no item number to re-read; it is always
+  unconditional, and a removal that would rest on an unmerged listing answer
+  (closed without merge, or no PR) taken from the pass's memory rather than
+  read for that decision is kept (counted as a downgrade) and read again
+  next pass. The primary-checkout reaper and `clean`'s no-remote stale-branch
+  check read only listings, once each, immediately before they act; they
+  hold nothing and are unchanged. `clean`'s sweep-transient and log pruning
+  keep their own reads.
+- **Rate-limit breaker.** While the global breaker is cooling a pass makes
+  no item call at all — not the read, not the store lookup (which may
+  resolve the repo), not the confirm — so every answer is unknown and
+  everything is kept.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LOOM_HYGIENE_MEMO` | on | `0` restores the pre-PR2 behaviour: nothing is held for the pass except the reaper's `pr-<N>` probe (which predates this), no merged entry is read or written, no confirm read is made, and `clean`'s issue-keyed probes go back to `gh issue view` / `gh pr list`. Read at the start of each pass. |
 
 ### Merged-PR worktree reaper (#4876)
 
@@ -8884,6 +9054,7 @@ leaves the daemon's behavior byte-for-byte unchanged:
 | — | `autonomous.roleRunner.demandWidth.max` | config only | `4` (width clamp, still capped by the role budget) |
 | — | `autonomous.roleRunner.demandWidth.reserve` | config only | `true` (Champion-first ceiling reservation) |
 | — | `autonomous.roleRunner.demandWidth.nonPrFloor` | config only | `1` (slots always left for non-PR roles) |
+| — | `autonomous.roleRunner.demandWidth.doctorMaxPerRepo` | config only | `3` (most doctor runs one repository may hold at once, each on its own assigned PR, #10632; `1` = one per repository) |
 | — | `autonomous.roleRunner.demandWidth.staleSecs` | config only | `1800` (ledger entries older than this are stale: unobserved for the reservation and the #9410 back-off, counted at their last-known value for PR-role width, #9414) |
 | — | `autonomous.roleRunner.onIdle` | config only | `[]` (none; may name any of the 8 shipped roles, `architect` included) |
 | — | `autonomous.roleRunner.model` | config only (`roleRunner.model` > `autonomous.model` > default) | `sonnet` (`DEFAULT_DISPATCH_MODEL`) |

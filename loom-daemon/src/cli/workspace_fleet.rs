@@ -312,6 +312,27 @@ fn auto_init_missing_sweep_command(canonical: &std::path::Path) -> Result<()> {
     }
 }
 
+/// After a registry change, name the host-mode Codex session containers whose
+/// workspace mounts no longer match it (#10364): a running container never
+/// sees a `workspace add`/`remove`, so a new repo stays unreachable from it and
+/// a removed one stays mounted read-write. Best-effort (never fails the
+/// command) and zero `docker` calls unless a profile is session-managed.
+/// Recreating them is the reconciler's job once it exists (#10364 Part B).
+fn report_session_mount_drift(registry: &loom_daemon::workspace_registry::WorkspaceRegistry) {
+    let profile_root = loom_daemon::tokens_pool::paths::codex_profile_root();
+    let docker = std::env::var("LOOM_CODEX_SESSION_DOCKER")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "docker".to_string());
+    for line in loom_daemon::tokens_pool::session_drift_report::report(
+        profile_root.as_deref(),
+        &docker,
+        &registry.roots(),
+    ) {
+        println!("{line}");
+    }
+}
+
 /// Handle the `workspace` subcommand — mutate/inspect the machine-level
 /// workspace registry (`~/.loom/workspaces.json`) directly on the filesystem.
 /// This runs whether or not the daemon is up; a running daemon re-reads the
@@ -368,6 +389,7 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
                 } => {
                     registry.save(&path)?;
                     println!("Registered workspace: {} (priority {priority})", canonical.display());
+                    report_session_mount_drift(&registry);
                     if !looks_like_workspace {
                         eprintln!(
                             "  warning: {} has no .git or .loom — register it anyway, but confirm \
@@ -446,6 +468,7 @@ pub(crate) fn handle_workspace_command(action: WorkspaceAction) -> Result<()> {
             if registry.remove(std::path::Path::new(&repo_path)) {
                 registry.save(&path)?;
                 println!("Deregistered workspace: {repo_path}");
+                report_session_mount_drift(&registry);
             } else {
                 println!("Not registered (no-op): {repo_path}");
             }

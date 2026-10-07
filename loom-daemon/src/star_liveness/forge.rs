@@ -133,6 +133,16 @@ pub trait StarForge {
         None
     }
 
+    /// The issues the forge's native dependency graph says block `number`
+    /// ("blocked by"), as `(owner/repo, N)`, open ones only (#10307). A forge
+    /// without the feature answers none.
+    ///
+    /// # Errors
+    /// The read failed.
+    fn blocked_by(&mut self, _number: u32) -> Result<Vec<(String, u32)>> {
+        Ok(Vec::new())
+    }
+
     /// Add `label` (a no-op when already present).
     ///
     /// # Errors
@@ -150,6 +160,12 @@ pub trait StarForge {
     /// # Errors
     /// The write failed.
     fn post_comment(&mut self, number: u32, body: &str) -> Result<()>;
+
+    /// Replace an issue's body (the level provenance marker, #10307).
+    ///
+    /// # Errors
+    /// The write failed.
+    fn set_body(&mut self, number: u32, body: &str) -> Result<()>;
 }
 
 /// [`StarForge`] over `gh api`, for the repo checked out at `root` whose
@@ -205,6 +221,28 @@ impl GhStarForge {
             "star-",
         )
     }
+}
+
+/// The open issues in a `GET …/dependencies/blocked_by` answer, as
+/// `(owner/repo, N)` from each item's `html_url` (PRs and closed items
+/// dropped). Anything unparseable is skipped.
+#[must_use]
+pub fn parse_blocked_by(body: &str, slug: &str) -> Vec<(String, u32)> {
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(body)
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|v| v.get("pull_request").is_none())
+        .filter(|v| {
+            v.get("state")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| s.eq_ignore_ascii_case("open"))
+        })
+        .filter_map(|v| v.get("html_url")?.as_str())
+        .filter_map(|u| super::edges::ref_target(u, slug))
+        .collect()
 }
 
 /// Percent-encode a query value (unreserved characters pass through).
@@ -317,6 +355,18 @@ impl StarForge for GhStarForge {
             .collect())
     }
 
+    fn blocked_by(&mut self, number: u32) -> Result<Vec<(String, u32)>> {
+        let url = format!("{}/dependencies/blocked_by?per_page=100", self.issue_path(number));
+        let Some(body) = self.cached_get(
+            ForgeOp::uninventoried("native issue-dependency read has no inventory row (#10307)"),
+            &url,
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(parse_blocked_by(&body, &self.slug))
+    }
+
     fn self_login(&mut self) -> Option<String> {
         static CACHE: OnceLock<Mutex<HashMap<PathBuf, LoginLookup>>> = OnceLock::new();
         // Registers the configured fleet App with `trust` for this process.
@@ -352,6 +402,14 @@ impl StarForge for GhStarForge {
         let path = format!("{}/comments", self.issue_path(number));
         let field = format!("body={body}");
         self.api(&["-X", "POST", &path, "-f", &field], &path)
+            .map(|_| ())
+    }
+
+    fn set_body(&mut self, number: u32, body: &str) -> Result<()> {
+        let path = self.issue_path(number);
+        // `-f` is a raw field: a body starting with `@` is never read as a file.
+        let field = format!("body={body}");
+        self.api(&["-X", "PATCH", &path, "-f", &field], &path)
             .map(|_| ())
     }
 }

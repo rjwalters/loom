@@ -1291,3 +1291,7 @@ fn every_session_down_sends_judge_to_the_next_tap_body() {
     assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
     assert_eq!(fs::read_to_string(&marker).unwrap_or_default(), "claude");
 }
+
+// #10660: the same gate read from the shared session snapshot.
+#[path = "session_snapshot_tests.rs"]
+mod session_snapshot;

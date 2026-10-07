@@ -451,6 +451,8 @@ mod tests {
             inherited_from: None,
             operator_priority_at: None,
             last_progress_at: None,
+            level: 1,
+            level_inherited_from: None,
         };
         let quiet = StarLandingRow {
             issue: 1,
