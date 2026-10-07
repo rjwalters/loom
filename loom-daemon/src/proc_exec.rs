@@ -45,14 +45,23 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// How long to let the reader threads finish after the process group has been
-/// terminated, before returning whatever they have collected.
+/// **terminated** (timeout, cancellation, unanswered forwarded signal), before
+/// giving up on them.
 ///
 /// After a `SIGKILL` to the group every writer is gone, so the pipes reach EOF
-/// promptly; this is a bound on that, not an expected wait. If a reader somehow
-/// does not finish (a pipe write end escaped to a process outside the group —
-/// e.g. inherited by a daemon started earlier), the partial bytes collected so
-/// far are returned instead of blocking the caller forever. Silence would
+/// promptly; this is a bound on that, not an expected wait. A reader delivers
+/// its bytes only once, at EOF, so a reader that misses this window contributes
+/// **no** bytes for its stream — not a partial prefix. That is acceptable only
+/// on these paths, whose result already says the answer is missing
+/// ([`Completion::TimedOut`] or [`ExecError::Collect`]); blocking instead would
 /// reintroduce exactly the class of hang this module exists to bound.
+///
+/// It is deliberately **not** used after a normal exit (issue #10799): there a
+/// missed drain used to surface as `Exited` with empty stdout — a successful
+/// command that "printed nothing". The normal-exit drain uses the call's
+/// remaining budget instead, and fails with [`ExecError::Collect`] if it cannot
+/// complete (see [`drain_after_exit`]). This constant doubles as that drain's
+/// minimum budget, so a child that exits right at the deadline still gets one.
 const DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 /// Poll cadence while waiting for the child to exit.
@@ -155,7 +164,9 @@ impl std::error::Error for ExecError {}
 /// # Errors
 ///
 /// [`ExecError::Spawn`] if the child could not be started; [`ExecError::Collect`]
-/// if it started but waiting on it failed.
+/// if it started but waiting on it failed, or if it exited but its output could
+/// not be fully drained within the remaining budget (`ErrorKind::TimedOut`,
+/// e.g. a descendant still holds the pipe) — never `Exited` with missing output.
 pub fn run_bounded(cmd: Command, timeout: Duration) -> Result<Completion, ExecError> {
     run_bounded_cancellable(cmd, timeout, || false)
 }
@@ -280,10 +291,11 @@ fn run_bounded_inner(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // The child is gone, so both pipes are closed and the readers
-                // will reach EOF; collect what they read.
-                let stdout = collect(&stdout_rx, DRAIN_GRACE);
-                let stderr = collect(&stderr_rx, DRAIN_GRACE);
+                // The child exited on its own. Its pipes reach EOF once every
+                // writer is gone — which a lingering descendant can delay — so
+                // drain against the call's remaining budget, and fail rather
+                // than report success with missing output (#10799).
+                let (stdout, stderr) = drain_after_exit(&stdout_rx, &stderr_rx, deadline)?;
                 return Ok(Completion::Exited(Output {
                     status,
                     stdout,
@@ -347,12 +359,55 @@ fn spawn_reader<R: io::Read + Send + 'static>(pipe: Option<R>) -> Option<mpsc::R
     Some(rx)
 }
 
+/// Collect both streams after a **normal** exit, or fail (issue #10799).
+///
+/// The budget is whatever remains of the call's `deadline` (already shortened
+/// by a forwarded signal's grace, if any), floored at [`DRAIN_GRACE`] so a child
+/// that exits right at the deadline still gets a drain. It is **one** budget
+/// shared by both streams, not one per stream, so the call overruns its
+/// deadline by at most the floor.
+///
+/// A reader that has not reached EOF by then (a descendant still holds the
+/// write end, or the host is too loaded to schedule the reader) yields
+/// [`ExecError::Collect`] with [`io::ErrorKind::TimedOut`]: the command ran,
+/// but its output is not known, and reporting `Exited` with an empty stream
+/// would let a caller read "succeeded, printed nothing" as "no items". The
+/// descendants are left alone, as before — the leader has been reaped, so its
+/// pid no longer safely names a group this module owns.
+fn drain_after_exit(
+    stdout_rx: &Option<mpsc::Receiver<Vec<u8>>>,
+    stderr_rx: &Option<mpsc::Receiver<Vec<u8>>>,
+    deadline: Instant,
+) -> Result<(Vec<u8>, Vec<u8>), ExecError> {
+    let now = Instant::now();
+    let drain_deadline = now + deadline.saturating_duration_since(now).max(DRAIN_GRACE);
+    let take = |rx: &Option<mpsc::Receiver<Vec<u8>>>, stream: &str| match rx {
+        None => Ok(Vec::new()),
+        Some(rx) => rx
+            .recv_timeout(drain_deadline.saturating_duration_since(Instant::now()))
+            .map_err(|e| {
+                ExecError::Collect(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "child exited but its {stream} did not reach EOF within the \
+                         call's remaining budget ({e}); output incomplete"
+                    ),
+                ))
+            }),
+    };
+    let stdout = take(stdout_rx, "stdout")?;
+    let stderr = take(stderr_rx, "stderr")?;
+    Ok((stdout, stderr))
+}
+
 /// Take a reader thread's bytes, waiting at most `grace`.
 ///
-/// Returns empty on timeout rather than blocking: after the process group has
-/// been killed the writers are gone and EOF is immediate, so exceeding `grace`
-/// means a pipe write end escaped the group. Blocking there would reintroduce
-/// the unbounded wait this module exists to eliminate.
+/// Only for the paths that have **terminated** the process group. Returns empty
+/// on timeout rather than blocking: after the group has been killed the writers
+/// are gone and EOF is immediate, so exceeding `grace` means a pipe write end
+/// escaped the group. Blocking there would reintroduce the unbounded wait this
+/// module exists to eliminate. A normal exit uses [`drain_after_exit`] instead,
+/// because there an empty miss is indistinguishable from real empty output.
 fn collect(rx: &Option<mpsc::Receiver<Vec<u8>>>, grace: Duration) -> Vec<u8> {
     match rx {
         Some(rx) => rx.recv_timeout(grace).unwrap_or_default(),
