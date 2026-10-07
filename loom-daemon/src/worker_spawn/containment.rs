@@ -451,6 +451,13 @@ pub fn docker_command_with(
     command
         .arg("-e")
         .arg(format!("LOOM_NATIVE_CONTAINMENT={KIND}"));
+    // #10607: the host sink the front writes, by assignment (and mounted in
+    // `extra_mounts`); the by-name pass below must not re-read the host's.
+    let sink = crate::forge_call_stats::agent::worker_sink_dir();
+    if let Some(dir) = &sink {
+        let key = crate::forge_call_stats::agent::SINK_DIR_ENV;
+        command.arg("-e").arg(format!("{key}={}", dir.display()));
+    }
 
     // --- Env passthrough, BY NAME ----------------------------------------
     let mut names: Vec<String> = std::env::vars_os()
@@ -469,6 +476,9 @@ pub fn docker_command_with(
     // target point a contained worker back at a shared (or nonexistent) host
     // path — the isolation is the point of this module.
     names.retain(|name| !is_isolated_dir(name));
+    if sink.is_some() {
+        names.retain(|name| name != crate::forge_call_stats::agent::SINK_DIR_ENV);
+    }
     // #9987: a policy-governed container never holds a real GitHub token; its
     // `gh` is the managed launcher, which carries only a placeholder.
     if egress.is_some() {
@@ -688,6 +698,14 @@ fn extra_mounts(
                 let spec = dir.display().to_string();
                 out.push((dir, spec, false));
             }
+        }
+    }
+    // #10607: the agent `gh` front's sink (the daemon's), parity-mounted
+    // read-write so a contained worker's rows outlive `--rm`.
+    if let Some(dir) = crate::forge_call_stats::agent::worker_sink_dir() {
+        if !dir.starts_with(workspace) {
+            let spec = dir.display().to_string();
+            out.push((dir, spec, false));
         }
     }
     out

@@ -606,6 +606,12 @@ fn run_preflight(
         selection.apply(&mut command);
     }
     command.env("LOOM_RUNTIME", &runtime);
+    // #10607: the same sink variables every tmux session gets (W5,
+    // `agent_session::isolation`), so the worker's `gh` front books into this
+    // host's sink whatever TMPDIR its runtime pins. The directory is made
+    // owner-only first, so a container's mount of it finds it private.
+    let _ = crate::forge_call_stats::agent::worker_sink_dir();
+    command.envs(crate::agent_session::isolation::ledger_vars());
     // #10331: plain `gh` in the worker reaches the agent `gh` front first, so
     // its `issue|pr view|list --json` reads are ETag-revalidated (never stale)
     // and everything else execs the next `gh` untouched. `LOOM_GH_SHIM=0`

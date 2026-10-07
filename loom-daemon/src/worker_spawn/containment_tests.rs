@@ -625,3 +625,26 @@ fn managed_gh_never_mounts_the_host_gh_config() {
     assert!(unmanaged.iter().any(|(_, c, _)| c.ends_with("/config/gh")));
     assert!(!managed.iter().any(|(_, c, _)| c.ends_with("/config/gh")));
 }
+
+/// #10607: the agent `gh` front's sink (the daemon's) is parity-mounted
+/// read-write and named to the container, so its rows outlive `--rm`.
+#[test]
+fn the_agent_front_sink_is_parity_mounted_read_write_and_named() {
+    let _g = env_lock();
+    clear_env();
+    std::env::set_var("LOOM_TEST_ASSUME_DOCKER", "1");
+    let host = tempfile::tempdir().unwrap();
+    let sink = host.path().join("loom-forge-call-stats");
+    crate::forge_call_stats::set_test_sink_dir(Some(sink.clone()));
+    let args = build(&profile(None, Some("1g")), &[]);
+    crate::forge_call_stats::set_test_sink_dir(None);
+    let spec = format!("{0}:{0}", sink.display());
+    assert!(args.contains(&spec), "a read-write parity mount: {args:?}");
+    let assign = format!("LOOM_FORGE_CALL_STATS_DIR={}", sink.display());
+    assert!(args.contains(&assign), "{args:?}");
+    assert!(sink.is_dir(), "created owner-only before docker could make it root-owned");
+    // Off: neither.
+    let args = build(&profile(None, Some("1g")), &[]);
+    std::env::remove_var("LOOM_TEST_ASSUME_DOCKER");
+    assert!(!args.iter().any(|a| a.contains("loom-forge-call-stats")), "{args:?}");
+}
