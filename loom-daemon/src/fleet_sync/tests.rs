@@ -514,6 +514,7 @@ fn sample_status() -> FleetSyncStatus {
         roster: RosterPass::default(),
         state: StatePass::default(),
         enforced: Enforcement::Proceed,
+        floor: FloorPass::default(),
     }
 }
 
@@ -761,4 +762,185 @@ fn a_state_that_could_not_be_read_is_never_silent() {
     // error either, adds no run-state line (pre-#9598 output, byte for byte).
     let quiet = render_line(Some(&sample_status()), now).expect("a line");
     assert!(!quiet.contains("run state"), "{quiet}");
+}
+
+// ------------------------------------------------------------------------
+// The fleet version floor (#10711)
+// ------------------------------------------------------------------------
+
+fn valid(v: &str) -> Result<FloorRead, String> {
+    Ok(FloorRead::Valid {
+        version: v.to_string(),
+        source: "repos.yml",
+    })
+}
+
+fn malformed() -> Result<FloorRead, String> {
+    Ok(FloorRead::Malformed {
+        source: "repos.yml",
+        detail: "got 1.2".to_string(),
+    })
+}
+
+#[test]
+fn an_absent_floor_is_unset_and_reports_nothing() {
+    let pass = resolve_floor(Ok(FloorRead::Absent), Some("0.19.830"));
+    assert_eq!(pass, FloorPass::default(), "removing the key clears the floor");
+    assert!(pass.is_unset());
+}
+
+#[test]
+fn a_valid_floor_is_set_with_its_source() {
+    let pass = resolve_floor(valid("0.19.831"), Some("0.19.830"));
+    assert_eq!(pass.floor.as_deref(), Some("0.19.831"));
+    assert_eq!(pass.source.as_deref(), Some("repos.yml"));
+    assert!(!pass.carried);
+    assert_eq!(pass.error, None);
+}
+
+#[test]
+fn a_malformed_floor_keeps_the_last_good_one_and_alerts() {
+    let pass = resolve_floor(malformed(), Some("0.19.830"));
+    assert_eq!(pass.floor.as_deref(), Some("0.19.830"), "never read as no floor");
+    assert!(pass.carried);
+    let err = pass.error.as_deref().expect("an alert");
+    assert!(err.contains("malformed"), "{err}");
+    assert!(err.contains("keeping the last good floor 0.19.830"), "{err}");
+}
+
+#[test]
+fn a_first_ever_malformed_floor_leaves_it_unset_and_alerts() {
+    let pass = resolve_floor(malformed(), None);
+    assert_eq!(pass.floor, None);
+    assert!(!pass.carried);
+    assert!(pass.error.is_some());
+    assert!(!pass.is_unset(), "the alert is reported");
+}
+
+#[test]
+fn an_unreadable_snapshot_keeps_the_last_good_floor() {
+    let pass = resolve_floor(Err("no cached snapshot".to_string()), Some("0.19.830"));
+    assert_eq!(pass.floor.as_deref(), Some("0.19.830"));
+    assert!(pass.error.is_some());
+}
+
+#[test]
+fn the_last_good_floor_survives_across_passes() {
+    // valid -> malformed -> malformed -> valid -> absent, threading each
+    // pass's result into the next exactly as `run_pass` does.
+    let mut last: Option<String> = None;
+    let mut step = |read: Result<FloorRead, String>| {
+        let pass = resolve_floor(read, last.as_deref());
+        last = pass.floor.clone();
+        pass
+    };
+    assert_eq!(step(valid("0.19.830")).floor.as_deref(), Some("0.19.830"));
+    assert_eq!(step(malformed()).floor.as_deref(), Some("0.19.830"));
+    assert_eq!(step(malformed()).floor.as_deref(), Some("0.19.830"));
+    assert_eq!(step(valid("0.19.840")).floor.as_deref(), Some("0.19.840"));
+    assert_eq!(step(Ok(FloorRead::Absent)).floor, None);
+}
+
+#[test]
+fn the_floor_half_reads_the_refreshed_cache_without_a_forge_request() {
+    let mut files = sample_files();
+    let roster = files.get("repos.yml").cloned().expect("roster");
+    files.insert("repos.yml".to_string(), format!("loom_min_version: \"0.19.830\"\n{roster}"));
+    let forge = FakeForge::new(files);
+    let dir = tempfile::tempdir().expect("dir");
+    let (machine, local) = tier_paths(dir.path());
+    let cache = dir.path().join("cache");
+    config_pass(
+        &forge,
+        &cache,
+        &location(),
+        "build-1",
+        &machine,
+        &local,
+        Mode::Check,
+        Utc::now(),
+    );
+    forge.calls.borrow_mut().clear();
+
+    let pass = floor_half(&cache, &location(), None, Utc::now());
+    assert_eq!(pass.floor.as_deref(), Some("0.19.830"));
+    assert_eq!(pass.source.as_deref(), Some("repos.yml"));
+    assert!(forge.calls.borrow().is_empty(), "no extra forge request");
+
+    // A store change lands on the next pass with no restart.
+    let mut files = forge.files.borrow().clone();
+    files.insert("fleet.json".to_string(), r#"{"loom_min_version":"0.19.900"}"#.to_string());
+    *forge.files.borrow_mut() = files;
+    config_pass(
+        &forge,
+        &cache,
+        &location(),
+        "build-1",
+        &machine,
+        &local,
+        Mode::Check,
+        Utc::now(),
+    );
+    let pass = floor_half(&cache, &location(), pass.floor.as_deref(), Utc::now());
+    assert_eq!(pass.floor.as_deref(), Some("0.19.900"));
+    assert_eq!(pass.source.as_deref(), Some("fleet.json"));
+}
+
+#[test]
+fn the_floor_half_with_no_cache_keeps_the_last_good_floor() {
+    let dir = tempfile::tempdir().expect("dir");
+    let pass = floor_half(&dir.path().join("none"), &location(), Some("0.19.830"), Utc::now());
+    assert_eq!(pass.floor.as_deref(), Some("0.19.830"));
+    assert!(pass.error.is_some());
+}
+
+#[test]
+fn a_snapshot_without_a_floor_omits_the_field_and_still_round_trips() {
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join(STATUS_FILENAME);
+    let status = sample_status();
+    write_status(&path, &status).expect("write");
+    let raw = std::fs::read_to_string(&path).expect("raw");
+    assert!(!raw.contains("\"floor\""), "no floor, no field: {raw}");
+    assert_eq!(read_status(&path).expect("read"), Some(status));
+}
+
+#[test]
+fn a_pre_floor_snapshot_still_deserializes() {
+    let mut value = serde_json::to_value(sample_status()).expect("value");
+    value.as_object_mut().expect("object").remove("floor");
+    let status: FleetSyncStatus = serde_json::from_value(value).expect("old shape reads");
+    assert_eq!(status.floor, FloorPass::default());
+}
+
+#[test]
+fn a_snapshot_with_a_floor_round_trips() {
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join(STATUS_FILENAME);
+    let mut status = sample_status();
+    status.floor = resolve_floor(malformed(), Some("0.19.830"));
+    write_status(&path, &status).expect("write");
+    assert_eq!(read_status(&path).expect("read"), Some(status));
+}
+
+#[test]
+fn status_line_shows_the_floor_and_a_malformed_one_is_an_error() {
+    let mut status = sample_status();
+    status.floor = resolve_floor(valid("0.19.830"), None);
+    let block = render_line(Some(&status), Utc::now()).expect("block");
+    assert!(block.contains("loom_min_version: 0.19.830 (from repos.yml)"), "{block}");
+    assert!(!status.errored());
+
+    status.floor = resolve_floor(malformed(), Some("0.19.830"));
+    let block = render_line(Some(&status), Utc::now()).expect("block");
+    assert!(block.contains("LAST GOOD"), "{block}");
+    assert!(block.contains("loom_min_version: ERROR"), "{block}");
+    assert!(status.errored(), "a malformed floor alerts through the drift topic");
+}
+
+#[test]
+fn no_floor_leaves_the_status_line_unchanged() {
+    let status = sample_status();
+    let block = render_line(Some(&status), Utc::now()).expect("block");
+    assert!(!block.contains("loom_min_version"), "{block}");
 }

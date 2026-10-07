@@ -61,6 +61,7 @@ mod tests {
             roster: fleet_sync::RosterPass::default(),
             state: loom_daemon::fleet_state::StatePass::default(),
             enforced: loom_daemon::fleet_state::Enforcement::Proceed,
+            floor: fleet_sync::FloorPass::default(),
         };
         let value = json(Some(&status));
         assert_eq!(value["repo"], serde_json::json!("acme/fleet"));
@@ -87,6 +88,7 @@ mod tests {
                 ..Default::default()
             },
             enforced: loom_daemon::fleet_state::Enforcement::Hold,
+            floor: fleet_sync::FloorPass::default(),
         };
         let block = fleet_sync::render_line(Some(&status), chrono::Utc::now())
             .expect("a snapshot renders a block");
