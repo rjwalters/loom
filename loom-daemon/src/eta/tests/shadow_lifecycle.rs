@@ -1,7 +1,7 @@
 //! Shadow lifecycle from the nightly folds (#10525): the promotion short-list
 //! and retirement proposals.
 
-use crate::eta::heuristics::{LAND_TWIN_OTTER, LAND_TWIN_OTTER_B};
+use crate::eta::heuristics::{LAND_CALM_PLOVER, LAND_TWIN_OTTER_B};
 use crate::eta::nightly_folds::DayRecords;
 use crate::eta::shadow_lifecycle::{
     dedup_key, file_proposals, retirement_proposals, shortlist, ProposalForge, MAX_STALE_DAYS,
@@ -318,7 +318,7 @@ fn filing_is_idempotent_across_runs_and_hosts_and_keeps_failures_for_retry() {
     assert!(body.contains("proposal only"));
     // Nothing is unregistered: the registry is a compile-time table, and a
     // proposal for a real candidate leaves it registered.
-    assert!(Registry::builtin().get(LAND_TWIN_OTTER).is_some());
+    assert!(Registry::builtin().get(LAND_CALM_PLOVER).is_some());
 }
 
 #[test]
@@ -327,7 +327,7 @@ fn a_real_candidate_is_proposed_from_its_folds_and_stays_registered() {
     let d = wobbled(days(
         RETIREMENT_MIN_DAYS,
         &[
-            (LAND_TWIN_OTTER, (40.0, 900.0, 0.8, 0.2)),
+            (LAND_CALM_PLOVER, (40.0, 900.0, 0.8, 0.2)),
             (LAND_TWIN_OTTER_B, (-20.0, 700.0, 0.5, 0.1)),
         ],
     ));
@@ -338,8 +338,8 @@ fn a_real_candidate_is_proposed_from_its_folds_and_stays_registered() {
         .collect();
     let p = retirement_proposals(&d, CUR, &eligible);
     assert_eq!(p.len(), 1, "{p:?}");
-    assert_eq!(p[0].heuristic, LAND_TWIN_OTTER);
-    assert_eq!(registry.tier_of(LAND_TWIN_OTTER), Some(Tier::Candidate));
+    assert_eq!(p[0].heuristic, LAND_CALM_PLOVER);
+    assert_eq!(registry.tier_of(LAND_CALM_PLOVER), Some(Tier::Candidate));
 }
 
 #[test]
