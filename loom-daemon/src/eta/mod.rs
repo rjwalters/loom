@@ -121,6 +121,8 @@ pub mod fleet_log;
 pub mod fleet_refresh;
 pub mod fleet_signoz;
 pub mod fleet_signoz_refresh;
+pub mod fleet_signoz_timeline;
+pub mod fleet_signoz_timeline_rows;
 pub mod fleet_state;
 pub mod fleet_state_prs;
 pub mod friction;

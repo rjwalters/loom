@@ -36,6 +36,15 @@
 //! posture is that a conclusion drawn from a failed read is worse than no
 //! conclusion. The one thing this command will not do is guess.
 //!
+//! # Archived repositories (#10562)
+//!
+//! The run first reads the repository's `archived` flag (one REST + ETag
+//! `repos/{owner}/{repo}` read, the probe the release pass shares). An
+//! archived repository is read-only, so no role can act on its rows: nothing
+//! is listed or gathered, `--json` reports `archived: true`, and the human
+//! report is one line. A probe that did not answer is an enumeration failure
+//! — unknown, never archived and never clear.
+//!
 //! # Both populations (#8925)
 //!
 //! `gh issue list` never returns a pull request, so the original single
@@ -146,7 +155,8 @@ impl StaleBlockedArgs {
             items: gathered,
             enumerate_error,
             cost,
-        } = batch::gather_all(&mut forge, &fleet, opts);
+            archived,
+        } = batch::gather_checked(&mut forge, &fleet, opts);
 
         let mut stale: Vec<Finding> = Vec::new();
         let mut superseded: Vec<Finding> = Vec::new();
@@ -195,6 +205,7 @@ impl StaleBlockedArgs {
             unevaluated: &unevaluated,
             enumerate_error: enumerate_error.as_deref(),
             cost: &cost,
+            archived,
         };
 
         if self.json {
@@ -218,6 +229,8 @@ struct Sections<'a> {
     unevaluated: &'a [(String, String)],
     enumerate_error: Option<&'a str>,
     cost: &'a budget::ForgeCost,
+    /// The archived probe's answer (#10562); `None` when it did not answer.
+    archived: Option<bool>,
 }
 
 impl Sections<'_> {
@@ -243,6 +256,18 @@ fn report(s: &Sections<'_>, quiet: bool) {
 
 /// [`report`] over arbitrary writers, so a test can assert section placement.
 fn render(w: &mut impl Write, out: &mut impl Write, s: &Sections<'_>, quiet: bool) {
+    // Nothing was listed, so the count is unknown and the line says so. It
+    // goes to stdout like the clear-confirmation, so `--quiet` suppresses it.
+    if s.archived == Some(true) {
+        if !quiet {
+            let _ = writeln!(
+                out,
+                "[stale-blocked] repository is archived; its open loom:blocked artifacts were \
+                 not evaluated (read-only: no role can act on them)."
+            );
+        }
+        return;
+    }
     if let Some(why) = s.enumerate_error {
         let _ =
             writeln!(w, "[stale-blocked] could not enumerate open loom:blocked artifacts: {why}");
@@ -534,6 +559,7 @@ fn print_json(s: &Sections<'_>) {
             "unevaluated": uneval_json,
             "enumerate_error": s.enumerate_error,
             "forge_cost": s.cost,
+            "archived": s.archived,
         })
     );
 }
@@ -568,10 +594,42 @@ mod tests {
             unevaluated: &uneval,
             enumerate_error: None,
             cost: &cost,
+            archived: Some(false),
         };
         let (mut err, mut out) = (Vec::new(), Vec::new());
         render(&mut err, &mut out, &s, quiet);
         String::from_utf8(err).unwrap()
+    }
+
+    /// An archived repository is one stdout line and nothing on stderr
+    /// (#10562); `--quiet` silences it.
+    #[test]
+    fn archived_repo_is_one_line() {
+        let cost = budget::ForgeCost::default();
+        let s = Sections {
+            stale: &[],
+            superseded: &[],
+            unticked: &[],
+            undocumented: &[],
+            prose_only: &[],
+            unevaluated: &[],
+            enumerate_error: None,
+            cost: &cost,
+            archived: Some(true),
+        };
+        for quiet in [false, true] {
+            let (mut err, mut out) = (Vec::new(), Vec::new());
+            render(&mut err, &mut out, &s, quiet);
+            assert!(err.is_empty());
+            let out = String::from_utf8(out).unwrap();
+            if quiet {
+                assert!(out.is_empty(), "{out}");
+            } else {
+                assert_eq!(out.lines().count(), 1, "{out}");
+                assert!(out.contains("repository is archived"), "{out}");
+                assert!(!out.contains("no stale"), "never reported clear: {out}");
+            }
+        }
     }
 
     /// The unticked section sits inside the bordered report body (#9274): listed

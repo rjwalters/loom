@@ -381,7 +381,8 @@ fn demand_config_defaults_and_per_key_fallback() {
             max: 6,
             reserve: false,
             non_pr_floor: 2,
-            stale_secs: 90
+            stale_secs: 90,
+            doctor_max_per_repo: 3
         }
     );
     let ws = workspace(r#"{"autonomous":{"roleRunner":{"demandWidth":{"perRun":7}}}}"#);

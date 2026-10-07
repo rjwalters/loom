@@ -15,12 +15,19 @@ use super::*;
 /// skip/remove/fail bookkeeping — is identical for both classes by
 /// construction, which is the point: the `pr-<N>` pass cannot drift from the
 /// `issue-<N>` pass's gate handling because there is only one copy of it.
+///
+/// `confirm` is the pre-removal fresh read (W6 PR2,
+/// [`crate::worktree_ops::hygiene_pass`]): it runs once for every worktree
+/// the gates decided to remove, immediately before the quarantine or the
+/// removal, and `Some(reason)` keeps the worktree. It is never asked about a
+/// worktree a gate already preserved.
 pub(super) fn reap_worktrees_generic(
     repo_root: &Path,
     parse_name: &dyn Fn(&str) -> Option<u32>,
     classify: &dyn Fn(&Path, u32) -> WorktreeDecision,
     quarantine: &dyn Fn(&Path, u32) -> Option<String>,
     remove: &dyn Fn(&Path, u32) -> bool,
+    confirm: &dyn Fn(u32) -> Option<String>,
 ) -> ReapReport {
     let mut report = ReapReport::default();
 
@@ -47,6 +54,18 @@ pub(super) fn reap_worktrees_generic(
         // signals — a live `loom-daemon inflight` claim on this tree, or a write
         // inside the activity window — downgrading a removal to `SkipInUse`.
         let decision = removal_veto(&worktree_path, classify(&worktree_path, num));
+
+        // W6 PR2: what `classify` read may have been held for the pass,
+        // remembered across passes or served from a `304`. Before anything is
+        // quarantined or removed, one fresh unconditional read must agree.
+        // The stuck-removal record is left alone: a confirm that could not
+        // be made (forge unreachable) says nothing about eligibility.
+        if skip_reason(&decision).is_none() {
+            if let Some(reason) = confirm(num) {
+                report.skipped.push((num, reason));
+                continue;
+            }
+        }
 
         if matches!(decision, WorktreeDecision::RemoveWithQuarantine) {
             match quarantine(&worktree_path, num) {
@@ -99,6 +118,52 @@ pub(super) fn reap_worktrees_generic(
     report
 }
 
+/// [`reap_worktrees`] with the pre-removal confirm (see
+/// [`reap_worktrees_generic`]); `reap_worktrees` itself confirms nothing.
+pub(super) fn reap_worktrees_confirmed(
+    repo_root: &Path,
+    opts: &CleanOptions,
+    probes: &WorktreeProbes<'_>,
+    quarantine: &dyn Fn(&Path, u32) -> Option<String>,
+    remove: &dyn Fn(&Path, u32) -> bool,
+    confirm: &dyn Fn(u32) -> Option<String>,
+) -> ReapReport {
+    reap_worktrees_generic(
+        repo_root,
+        &crate::worktree_ops::naming::issue_from_worktree,
+        &|path, issue_num| clean::classify_worktree(path, issue_num, opts, probes),
+        quarantine,
+        remove,
+        confirm,
+    )
+}
+
+/// [`reap_pr_worktrees`] with the pre-removal confirm.
+pub(super) fn reap_pr_worktrees_confirmed(
+    repo_root: &Path,
+    opts: &CleanOptions,
+    probes: &clean::PrWorktreeProbes<'_>,
+    remove: &dyn Fn(&Path, u32) -> bool,
+    confirm: &dyn Fn(u32) -> Option<String>,
+) -> ReapReport {
+    reap_worktrees_generic(
+        repo_root,
+        &crate::worktree_ops::naming::pr_from_worktree,
+        &|path, pr_num| clean::classify_pr_worktree(path, pr_num, opts, probes),
+        // `classify_pr_worktree` never returns `RemoveWithQuarantine` (issue
+        // #6653's quarantine-then-reclaim path is scoped to issue-<N>
+        // worktrees only, so far) — this closure is unreachable for the
+        // `pr-<N>` pass.
+        &|_: &Path, _: u32| None,
+        remove,
+        confirm,
+    )
+}
+
+#[cfg(test)]
+#[path = "confirm_tests.rs"]
+mod confirm_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +181,7 @@ mod tests {
             &|_, _| panic!("host worktree classification must not run"),
             &|_, _| panic!("host quarantine must not run"),
             &|_, _| panic!("host removal must not run"),
+            &|_| panic!("the confirm must not run"),
         );
         assert_eq!(report.scanned, 1);
         assert_eq!(report.skipped.len(), 1);

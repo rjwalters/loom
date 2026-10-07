@@ -102,7 +102,8 @@ impl MarkReason {
             | TerminalClassification::CwdDeleted
             | TerminalClassification::ModelRefusal
             | TerminalClassification::SandboxUnavailable
-            | TerminalClassification::SessionDown => None,
+            | TerminalClassification::SessionDown
+            | TerminalClassification::SessionMountStale => None,
         }
     }
 

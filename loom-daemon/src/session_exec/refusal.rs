@@ -49,6 +49,7 @@ pub const REFUSAL_EXIT_CODE: i32 = 78;
 pub fn wire(category: TerminalClassification) -> Option<&'static str> {
     match category {
         TerminalClassification::SessionDown => Some("SESSION_DOWN"),
+        TerminalClassification::SessionMountStale => Some("SESSION_MOUNT_STALE"),
         _ => None,
     }
 }
@@ -115,7 +116,8 @@ pub fn category_of(
 mod tests {
     use super::*;
     use TerminalClassification::{
-        Fatal, Recoverable, SessionDown, SessionLimit, Success, TokenExhausted, TokenExpired,
+        Fatal, Recoverable, SessionDown, SessionLimit, SessionMountStale, Success, TokenExhausted,
+        TokenExpired,
     };
 
     #[test]
@@ -129,7 +131,7 @@ mod tests {
     /// Add each new refusal category to this list.
     #[test]
     fn every_wire_name_parses_back_to_its_category() {
-        let categories: &[TerminalClassification] = &[SessionDown];
+        let categories: &[TerminalClassification] = &[SessionDown, SessionMountStale];
         for &category in categories {
             let parsed: TerminalClassification = wire(category).unwrap().parse().unwrap();
             assert_eq!(parsed, category);
@@ -144,11 +146,25 @@ mod tests {
         assert_eq!(apply("no marker", Recoverable, 78), Recoverable);
     }
 
+    /// #10364: the stale-mount refusal rides the same line; the last
+    /// announcement in the region is the one that refused.
+    #[test]
+    fn a_stale_mount_refusal_is_announced_and_read_back() {
+        let line = marker_line(SessionMountStale).unwrap();
+        assert_eq!(line, "# LOOM_SESSION_REFUSAL v=1 category=SESSION_MOUNT_STALE");
+        assert_eq!(apply(&line, Recoverable, 78), SessionMountStale);
+        assert_eq!(apply(&line, Recoverable, 1), Recoverable);
+        let both = format!("{}\n{line}\n", marker_line(SessionDown).unwrap());
+        assert_eq!(apply(&both, Recoverable, 78), SessionMountStale);
+    }
+
     #[test]
     fn a_marker_never_erases_an_account_hold_or_any_other_verdict() {
         let log = "# LOOM_SESSION_REFUSAL v=1 category=SESSION_DOWN\n";
+        let stale = "# LOOM_SESSION_REFUSAL v=1 category=SESSION_MOUNT_STALE\n";
         for kept in [TokenExhausted, TokenExpired, SessionLimit, Fatal, Success] {
             assert_eq!(apply(log, kept, 78), kept, "{kept:?} at exit 78 stays as reported");
+            assert_eq!(apply(stale, kept, 78), kept, "{kept:?} at exit 78 stays as reported");
         }
         let fields =
             std::collections::HashMap::from([("category", "TOKEN_EXHAUSTED"), ("exit_code", "78")]);

@@ -604,8 +604,12 @@ current state, 0 for the rest), with the standard `host.id` / `service.version`
 resource attributes. The collector never calls docker itself. `restarting` is
 a crash loop Docker is backing off (`State.Restarting`, which Docker reports
 alongside `Running=true`); it counts as down, and the spawn-time posture check
-treats it the same way. `stale_mounts` means a registered workspace root under
-the container's workspace is not mounted. If docker cannot be queried at all
+treats it the same way. `stale_mounts` means the container's workspace mounts
+differ from what `accounts session start --mount-workspace <its loom.workspace
+label>` would mount today, in either direction (#10364): a registered root
+under the label is not mounted, or a mount is no longer registered (a
+deregistered repository that Codex can still write with its own sandbox off).
+Private-clone containers never get this verdict. If docker cannot be queried at all
 (CLI missing, Docker daemon unreachable, timeout), nothing about any container
 is known. The tracker holds each account's last state and no gauge point is
 emitted, so nothing reads that as `missing`. Because it is still a host-wide
@@ -627,6 +631,21 @@ answer at spawn" (a failed `docker inspect`), not only a stopped, restarting or
 missing container; the watch's unqueryable-docker WARN is what tells the two
 apart. A spawn-time probe that was abandoned (deadline, signal) is not labelled
 `session-down`.
+
+**Stale-mount dispatch refusal (#10364).** Before `docker exec --workdir`,
+`session-exec host` checks that one of the running container's mounts covers
+the workdir, reading the same single `docker inspect` that tells it the
+container is running, so dispatch makes no extra docker call. If no mount
+covers it (the repository was registered after the container was created), it
+does not exec: it prints the recreate command, announces
+`# LOOM_SESSION_REFUSAL v=1 category=SESSION_MOUNT_STALE` and exits 78. The
+adapter passes both through unchanged and the terminal-record parser relabels
+the tick's record, as for `SESSION_DOWN`. The tick carries
+`loom.admission.reason="session-mount-stale"` and records no account hold
+(the container is stale, not the account). `loom-daemon workspace add` /
+`remove` print every host-mode session container the registry change left
+drifted, with the manual recreate, until the reconciler recreates idle ones
+itself.
 
 **Uncovered `gh` callers (#10343, tracked in #10618).** Spend from `safehouse.rs`,
 `auto_update`/`release_resolve`, `credential_preflight`, `sweep-lease-renew.sh`,

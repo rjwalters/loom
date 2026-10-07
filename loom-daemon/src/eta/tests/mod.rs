@@ -24,6 +24,8 @@ mod flag_timeline;
 mod fleet;
 mod fleet_refresh;
 mod fleet_signoz;
+mod fleet_signoz_timeline;
+mod fleet_signoz_timeline_sql;
 mod friction;
 mod held_heron;
 mod hold_parity;

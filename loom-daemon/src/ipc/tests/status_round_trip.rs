@@ -147,6 +147,8 @@ fn test_daemon_status_request_response_round_trip() {
                 inherited_from: None,
                 operator_priority_at: None,
                 last_progress_at: None,
+                level: 2,
+                level_inherited_from: Some("o/other#7".to_string()),
             }],
             ..Default::default()
         }),

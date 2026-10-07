@@ -93,6 +93,7 @@ pub mod ranking_weekly;
 pub mod rng;
 pub mod rotation;
 pub mod select;
+pub mod session_drift_report;
 pub mod session_hold;
 pub mod session_lifecycle;
 pub mod session_state;

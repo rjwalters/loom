@@ -1,8 +1,11 @@
 //! The hygiene read path (W6): the REST issue and PR state reads behind the
 //! worktree reaper, eager reclaim, `clean`, `--aggressive`, the legacy
-//! checkpoint command and the primary-checkout reaper. The GraphQL-backed
-//! probes (`gh::issue_state`, `clean::check_pr_merged`, the
-//! `check_pr_status_for_branch` fallback) do not come through here yet.
+//! checkpoint command and the primary-checkout reaper. Since W6 PR2 the
+//! number-keyed probes of `clean` come through here too; what is held for a
+//! pass, what is remembered across passes and the pre-removal confirm live
+//! in [`super::hygiene_pass`]. The branch lookups with no item number
+//! (`clean::check_pr_merged` and `check_pr_status_for_branch`, both last
+//! resorts behind the REST listing) still name gh's own target.
 //!
 //! # Which repo
 //!
@@ -29,6 +32,11 @@
 //! its body: every call reaches the forge. `LOOM_HYGIENE_CONDITIONAL=0`
 //! makes them unconditional (no `If-None-Match`, the entry neither read nor
 //! written); the target, identity check, routing and breaker are unchanged.
+//!
+//! [`issue_facts_fresh`] / [`pull_facts_fresh`] are always unconditional
+//! ([`Mode::Unconditional`]): the read [`super::hygiene_pass`] makes
+//! immediately before a removal, which must be this request's own answer
+//! and never a body served from the store.
 //!
 //! Branch listings (`pulls?head=`) stay unconditional: `gh-cached
 //! --invalidate` drops only `view-` entries, so a stored listing could
@@ -165,6 +173,17 @@ pub(crate) fn target_of(fact: &Fact) -> Target {
     }
 }
 
+/// How a single-item read reaches the forge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Conditional on the shared `view-` entry (unless
+    /// `LOOM_HYGIENE_CONDITIONAL=0`): a `304` serves the stored body.
+    Conditional,
+    /// No `If-None-Match`, the entry neither read nor written: the answer
+    /// is always this request's own `200`.
+    Unconditional,
+}
+
 fn conditional() -> bool {
     std::env::var(CONDITIONAL_ENV)
         .ok()
@@ -185,7 +204,16 @@ struct IssueBody {
 
 /// One issue's state and `closed_at`, read fresh, booked under `caller`.
 pub(crate) fn issue_facts(root: &Path, issue: u32, caller: &'static str) -> Read<IssueFacts> {
-    let read = item_read(root, "issue", issue, caller, |body| {
+    issue_facts_in(root, issue, caller, Mode::Conditional)
+}
+
+/// [`issue_facts`], unconditional: never a body served from the store.
+pub(crate) fn issue_facts_fresh(root: &Path, issue: u32, caller: &'static str) -> Read<IssueFacts> {
+    issue_facts_in(root, issue, caller, Mode::Unconditional)
+}
+
+fn issue_facts_in(root: &Path, issue: u32, caller: &'static str, mode: Mode) -> Read<IssueFacts> {
+    let read = item_read(root, "issue", issue, caller, mode, |body| {
         let b: IssueBody = serde_json::from_str(body).ok()?;
         let repo = b
             .repository_url
@@ -212,7 +240,16 @@ pub(crate) fn issue_facts(root: &Path, issue: u32, caller: &'static str) -> Read
 
 /// One PR's status and head SHA, read fresh, booked under `caller`.
 pub(crate) fn pull_facts(root: &Path, pr: u32, caller: &'static str) -> Read<PullFacts> {
-    let read = item_read(root, "pr", pr, caller, |body| {
+    pull_facts_in(root, pr, caller, Mode::Conditional)
+}
+
+/// [`pull_facts`], unconditional: never a body served from the store.
+pub(crate) fn pull_facts_fresh(root: &Path, pr: u32, caller: &'static str) -> Read<PullFacts> {
+    pull_facts_in(root, pr, caller, Mode::Unconditional)
+}
+
+fn pull_facts_in(root: &Path, pr: u32, caller: &'static str, mode: Mode) -> Read<PullFacts> {
+    let read = item_read(root, "pr", pr, caller, mode, |body| {
         let row: PrRowRest = serde_json::from_str(body).ok()?;
         let repo = row.base_full_name().map(str::to_string);
         let id = row.base.as_ref().and_then(|b| b.repo.as_ref()?.id);
@@ -251,6 +288,7 @@ fn item_read<B>(
     entity: &str,
     number: u32,
     caller: &'static str,
+    mode: Mode,
     parse: impl Fn(&str) -> Option<Parsed<B>>,
 ) -> Read<B> {
     // Before `resolve`, which may itself read the repo from the forge.
@@ -267,7 +305,9 @@ fn item_read<B>(
         },
         Where::Repo(fact) => {
             let target = target_of(&fact);
-            let dir = conditional().then(store::daemon_store_dir).flatten();
+            let dir = (mode == Mode::Conditional && conditional())
+                .then(store::daemon_store_dir)
+                .flatten();
             let site = ConditionalRead::new(caller, op).item_scoped();
             let gh = PathBuf::from(crate::gh_invocation::gh_bin());
             let sent_at = chrono::Utc::now().timestamp();
