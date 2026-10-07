@@ -7,7 +7,7 @@ use crate::eta::explanation::Explanation;
 use crate::eta::grid;
 use crate::eta::heuristics::{
     estimate_path, PathRules, LAND_BOLD_LARK, LAND_BRISK_PETREL, LAND_HELD_HERON, LAND_KEEN_WREN,
-    LAND_QUICK_TERN, LAND_SWIFT_TERN, LAND_TANDEM_WREN, LAND_TWIN_OTTER_B,
+    LAND_LOOP_KITE, LAND_QUICK_TERN, LAND_SWIFT_TERN, LAND_TANDEM_WREN, LAND_TWIN_OTTER_B,
 };
 use crate::eta::history::{SampleSource, StageSample, StageSamples};
 use crate::eta::labels::{
@@ -146,6 +146,7 @@ fn every_shipped_heuristic_refuses_a_held_pr_exactly_as_before() {
             LAND_HELD_HERON,
             LAND_KEEN_WREN,
             LAND_BOLD_LARK,
+            LAND_LOOP_KITE,
             LAND_TWIN_OTTER_B,
             LAND_TANDEM_WREN
         ]

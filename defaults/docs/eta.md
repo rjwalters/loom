@@ -280,6 +280,7 @@ only.
 | `land-2026-10-04-twin-otter-b` | `land` | the pre-PR/PR composition of twin-otter (#10244): `ready_wait`, `sweep.curator` and `sweep.builder` are answered with `land-v2`'s path rules (same refusals, so its answer rate there equals `land-v2`'s; `combination.method` is `land_v2_path_prefix`); `review_wait`, `doctor`, `merge_wait` and `merge_hold` are the twin-otter evaluation's own answer, unchanged: no history, the newest `eta-fit/v1` coefficient file cut off strictly before `as_of` (see [Fitted coefficients](#fitted-coefficients-eta-fitv1)), the blend of a stage-by-stage exit-hazard Monte Carlo and a log-normal direct model (recorded as `twin_otter`; #10222, #10243). `land-2026-10-04-twin-otter` itself, which answered PR stages only, is [retired](#retired-heuristics) (#10528) | at the merge |
 | `land-2026-10-06-keen-wren` | `land` | twin-otter-b's **priority-aware** successor (#10508): pre-PR stages from the work finder's dispatch-plan position and `land-v2`'s path rules (`combination.method` is `dispatch_plan_path_prefix`); PR stages from the twin-otter evaluation over the newest **`eta-fit/v2`** file, fed the item's recorded `features.priority` (see [The `eta-fit/v2` priority inputs](#the-eta-fitv2-priority-inputs-10508)). Refuses its PR stages `no_model` until a v2 file exists. Shadow, tier `candidate` | at the merge |
 | `land-2026-10-06-tandem-wren` | `land` | `land-2026-10-04-twin-otter-b` composed over the dependency graph (#10510, [Dependency-aware ETAs](#dependency-aware-etas-10510)): a blocked or parked item starts after its parents land, a stacked or sequenced PR merges after its parent. An item with no parent that applies at `as_of` gets twin-otter-b's own explanation, bit for bit (re-identified) | at the merge |
+| `land-2026-10-06-loop-kite` | `land` | keen-wren's **friction-aware** successor (#10521): pre-PR stages exactly as keen-wren (`dispatch_plan_path_prefix`); PR stages from the twin-otter evaluation over the newest **`eta-fit/v3`** file, fed `features.priority` and the recorded friction predictors `features.loops` (review loops, approvals lost, repo Judge rejection rate, file overlap, own CI, cumulative stage age; see [Friction predictors and cumulative stage age](#friction-predictors-and-cumulative-stage-age-10521)). Refuses its PR stages `no_model` until a v3 file exists. Shadow, tier `candidate` | at the merge |
 
 ### Retired heuristics
 
@@ -758,20 +759,24 @@ Every `eta.snapshot` alternate carries its `tier`; loom-ui's chooser filters
 on it (loom-ui#2031). A retired id stays unregistered, as #10484 decided.
 `eta::shadow_fleet::RETIRED` keeps the id so it is never reused.
 
-**The shadow budget.** `autonomous.eta.shadow.maxActive` (default 13, floor 1)
+**The shadow budget.** `autonomous.eta.shadow.maxActive` (default 14, floor 1)
 caps the registered heuristics **per kind**, `current` included. When a
 build's registry exceeds the configured budget, the ETA tracker does not start.
 The daemon logs `eta: not started: N land heuristics are registered but
 autonomous.eta.shadow.maxActive is M; over the budget: …`, naming the
 heuristics past the budget in registration order. `eta promote` refuses the
 same way. A unit test holds the built-in registry within the default budget,
-so a fourteenth registration fails CI first. Retire a heuristic (a code
+so a fifteenth registration fails CI first. Retire a heuristic (a code
 change, as in #10484, #10549 and #10528) or raise the budget. The default is the
-kind's `current` plus the 12 alternates one `eta.snapshot` row carries (#10549,
-was 10 and 8), and a unit test holds the two together, so no heuristic within
-the default budget is silently dropped from the chooser. Raising the budget
-past 13 also needs the alternates cap raised on both sides (loom-ui's
-`MAX_ALTERNATES`; a loom-ui still slicing at 8 reads the first 8 by id).
+kind's `current` plus the 13 alternates one `eta.snapshot` row carries
+(#10521, which registered `land-2026-10-06-loop-kite` as the fourteenth land
+heuristic; 12 since #10549, was 10 and 8), and a unit test holds the two
+together, so no heuristic within the default budget is silently dropped from
+the chooser. Raising the budget also needs the alternates cap raised on both
+sides (loom-ui's `MAX_ALTERNATES`). A loom-ui still slicing at 12 reads the
+first 12 by id; with the shipped registry and the default `current`
+(`land-v1`) the 13th by id is `little-v0`, a baseline the chooser never
+offers.
 
 **Wrappers are explicit compositions.** A calibration, conformal or
 dependency wrapper over a base is registered as its own id
@@ -1329,15 +1334,39 @@ at `now - 120 s`, #10500) both call the one builder `loop_features`:
   `Tracker::loop_features_of`. A v3 coefficient file carries `schema:
   "eta-fit/v3"`; v1 and v2 vectors are never reinterpreted. Tests pin the
   layout, the bit-identical v2 prefix, train/serve parity for every row, and
-  that file lists and CI runs first known after `as_of` move no column. Not
-  yet built: the live file-list and SigNoz `ci.run` readers (file overlap and
-  own-CI are unknown, indicators 0, until logged), the v3 fit and its shadow
-  heuristic, and the walk-forward backtest.
-- **Not a model input yet.** None of these is in `eta-fit/v1`'s `FEATURES`
-  (or `eta-fit/v2`'s `FEATURES_V2`), so twin-otter rows, coefficient files and explanations are unchanged. Only
-  `eta-fit/v3` carries them, and no heuristic reads a v3 file yet. A new
-  datestamped shadow heuristic adopts them under that schema once the
-  loom-experiments walk-forward backtest passes (#10550).
+  that file lists and CI runs first known after `as_of` move no column.
+- **The v3 fit.** `eta fit` and the daily refit also write
+  `<fit_dir>/v3/fit-<T>.json` (`fit::v3::fit_v3`, the v1 fitters over the v3
+  vectors of the same rows; retention keeps 14; beside an explicit `--out`
+  as `<out>.v3.json`). `FitReport` adds `v3_id`, `v3_path` and
+  `loop_coverage` (rows knowing each friction input). `fit::v3::read_v3` /
+  `load_latest_v3` are v3-only; the v1 and v2 loaders never read it.
+- **Serving: `land-2026-10-06-loop-kite`.** Every PR item's explanation
+  records `features.loops` (`Tracker::loop_features_of`, the training
+  builder). loop-kite alone reads it. The twin-otter core selects the v3
+  transform from a model's `FEATURES_V3` names and reads
+  `twin_otter.input.loops`, so a v3 explanation recomputes from its record.
+  Over the survival steps the cumulative stage age advances with the clock,
+  as `age_h` does; the other friction inputs stay frozen at `as_of`. A
+  missing `features.loops` reads as the default set (no loop, every
+  `*_known` 0). The registry loads the v3 file beside v1 and v2
+  (`Registry::load`, `Registry::with_all_fits`); the tracker rebuilds it when
+  any of the three ids changes.
+- **Paired backtest.** `eta backtest --fit-dir DIR` replays walk-forward over
+  `DIR` and its `v2/` and `v3/` subdirectories (`DatedFits::load_dir`): each
+  case gets, per schema, the newest file cut off strictly before its `as_of`.
+  So loop-kite and twin-otter-b are scored on the same cases from the files
+  each day would have served. With no v3 file, loop-kite refuses `no_model`
+  and the v1-only replay is unchanged.
+- **Still open (#10550).** The live file-list reader (forge, ETag'd, reader
+  Apps, budgeted) and the SigNoz `ci.run` reader, so file overlap and own CI
+  stay unknown (indicators 0) in training and serving alike. The
+  loom-experiments walk-forward backtest and its results (pinball against
+  twin-otter-b, late surprise with paired CIs, starred / held / sequenced
+  subsets) have not been run. Promotion is the #10233 gate's decision.
+- **v1 and v2 are unchanged.** None of these is in `eta-fit/v1`'s `FEATURES`
+  or `eta-fit/v2`'s `FEATURES_V2`, so twin-otter, twin-otter-b and keen-wren
+  rows, coefficient files and fixtures are unchanged.
 
 ### Dependency-aware ETAs (#10510)
 
@@ -2353,7 +2382,7 @@ of what is on disk and never needs a refetch.
 | `fit.enabled` | `LOOM_ETA_FIT_ENABLED` | `true`: the daily refit (#10245). It runs only with `enabled` too, is read at start, and is a no-op until a fleet snapshot is cached |
 | `nightlyFolds.enabled` | `LOOM_ETA_NIGHTLY_FOLDS_ENABLED` | `true` (#10492): the captain's nightly walk-forward backtest folds ([below](#nightly-backtest-folds-autonomousetanightlyfolds-10492)). Runs only with `enabled` too; read at start |
 | `current.start` / `current.finish` / `current.land` | none | `start-v1` / `finish-v1` / `land-v1` |
-| `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `13` registered heuristics per kind (`current` + 12 alternates, #10549), floor 1. Over it, the tracker does not start (see [Shadow fleet management](#shadow-fleet-management)) |
+| `shadow.maxActive` | `LOOM_ETA_SHADOW_MAX_ACTIVE` | `14` registered heuristics per kind (`current` + 13 alternates, #10549, #10521), floor 1. Over it, the tracker does not start (see [Shadow fleet management](#shadow-fleet-management)) |
 | `fleetRefresh.enabled` | `LOOM_ETA_FLEET_REFRESH_ENABLED` | `true` (#10263) |
 | `fleetRefresh.intervalSecs` | `LOOM_ETA_FLEET_REFRESH_INTERVAL_SECS` | `3600` (floor 900) |
 | `fleetRefresh.maxCallsPerCycle` | `LOOM_ETA_FLEET_REFRESH_MAX_CALLS` | `300` |

@@ -38,11 +38,12 @@ use std::sync::OnceLock;
 
 /// Default `autonomous.eta.shadow.maxActive`: registered heuristics per kind.
 ///
-/// 13 is the kind's `current` plus the 12 alternates one `eta.snapshot` row
+/// 14 is the kind's `current` plus the 13 alternates one `eta.snapshot` row
 /// carries ([`crate::telemetry::kinds::eta_snapshot::MAX_ALTERNATES`],
-/// #10549), so a registry within the default budget never has a shadow the
-/// snapshot silently drops. A unit test holds the two together.
-pub const DEFAULT_MAX_ACTIVE: usize = 13;
+/// #10549; 13 -> 14 with `land-2026-10-06-loop-kite`, #10521), so a registry
+/// within the default budget never has a shadow the snapshot silently drops.
+/// A unit test holds the two together.
+pub const DEFAULT_MAX_ACTIVE: usize = 14;
 
 /// Smallest budget accepted. A kind always has its `current` heuristic.
 pub const MIN_MAX_ACTIVE: usize = 1;

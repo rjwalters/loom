@@ -24,6 +24,10 @@
 //! `land-2026-10-06-swift-tern` (#10524) is quick-tern made drift-aware
 //! (#10528's drift check: shorter half-life; the inflation the check asks
 //! for is recorded, not applied).
+//! `land-2026-10-06-loop-kite` (#10521) is keen-wren's friction-aware
+//! successor: the same evaluation over an `eta-fit/v3` file, which adds the
+//! review-loop, Judge-rate, file-overlap and own-CI predictors and the
+//! cumulative stage age.
 //! Their ids are immutable: a behaviour change is a new id.
 
 mod finish_v1;
@@ -33,6 +37,7 @@ mod land_calm_plover;
 mod land_dependency;
 mod land_held_heron;
 mod land_keen_wren;
+mod land_loop_kite;
 mod land_quick_tern;
 mod land_swift_tern;
 mod land_twin_otter;
@@ -54,6 +59,7 @@ pub use land_held_heron::{
     METHOD as HELD_HERON_METHOD,
 };
 pub use land_keen_wren::{LandKeenWren, LAND_KEEN_WREN, PRE_PR_METHOD as KEEN_WREN_PRE_PR_METHOD};
+pub use land_loop_kite::{LandLoopKite, LAND_LOOP_KITE};
 pub use land_quick_tern::{LandQuickTern, LAND_QUICK_TERN};
 pub use land_swift_tern::{LandSwiftTern, LAND_SWIFT_TERN};
 pub(crate) use land_twin_otter::recompute as recompute_twin_otter;

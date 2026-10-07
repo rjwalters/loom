@@ -525,6 +525,7 @@ pub fn spawn_task(
     }
     log_fit(None, registry.fit(), &workspace_root);
     log_fit_v2(None, registry.fit_v2());
+    log_fit_v3(None, registry.fit_v3());
     let mut tracker = Tracker::new(loom);
     // Only the ETA authority restores (#10498); a pending estimate of a retired
     // heuristic is dropped, never scored or emitted as an `eta.outcome` (#10484).
@@ -1020,6 +1021,7 @@ pub(super) async fn record(
             let loaded_fit = (
                 fit::load_latest(&journal_root, listed_at),
                 fit::v2::load_latest_v2(&journal_root, listed_at),
+                fit::v3::load_latest_v3(&journal_root, listed_at),
             );
             // #10586: the roster history the fit read, from the same cache.
             let roster = crate::eta::roster_history::load_for(&journal_root, listed_at).0;
@@ -1060,12 +1062,14 @@ pub(super) async fn record(
             return;
         };
         state.history = history;
-        let registered = (state.registry.fit_id(), state.registry.fit_v2_id());
+        let registered =
+            (state.registry.fit_id(), state.registry.fit_v2_id(), state.registry.fit_v3_id());
         if let Some(registry) = swap_fit(registered, loaded_fit) {
             if registry.fit_id() != state.registry.fit_id() {
                 log_fit(state.registry.fit_id(), registry.fit(), &state.workspace_root);
             }
             log_fit_v2(state.registry.fit_v2_id(), registry.fit_v2());
+            log_fit_v3(state.registry.fit_v3_id(), registry.fit_v3());
             state.registry = registry;
         }
         // #10207: every still-pending base estimate is a censored lower bound
@@ -1242,7 +1246,7 @@ mod feature_pass;
 #[path = "eta_fit_swap.rs"]
 mod fit_swap;
 mod pr_resolved;
-use fit_swap::{log_fit, log_fit_v2, swap_fit};
+use fit_swap::{log_fit, log_fit_v2, log_fit_v3, swap_fit};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
