@@ -206,10 +206,12 @@ fn lint_event(wf: &Workflow, event: Event, out: &mut Vec<CancelFinding>) {
 }
 
 /// Why a cancel step that runs on a PR could still reach a main run, if it can.
-/// `uses:` cancel actions carry no inspectable target and are left to the
-/// push-context check above.
+/// A step with no `run:` body (a `uses:` cancel action) has a target the lint
+/// cannot inspect, so it fails closed.
 fn pr_target_problem(step: &Step) -> Option<&'static str> {
-    let run = step.run.as_deref()?;
+    let Some(run) = step.run.as_deref() else {
+        return Some("it is an opaque `uses:` cancel action whose target runs cannot be inspected");
+    };
     let compact = |s: &str| s.split_whitespace().collect::<String>();
     let code: String = run
         .lines()
@@ -487,6 +489,21 @@ jobs:
             assert_eq!(f.len(), 1, "{body}: {f:?}");
             assert_eq!(f[0].job.as_deref(), Some("test"));
         }
+    }
+
+    /// An opaque `uses:` cancel action reachable on a PR cannot be proven to
+    /// spare main runs, so it must not pass silently (#10677 review).
+    #[test]
+    fn pr_only_uses_cancel_action_fails_closed() {
+        let src = PR_ONLY_CANCEL_STEP.replace(
+            "      - name: Cancel older runs\n        env:\n          REF: ${{ github.head_ref }}\n        run: |\n          __GH__ run list --branch \"$REF\" --json databaseId,event --jq '.[] | select(.event == \"pull_request\") | .databaseId' | while read -r id; do\n            __GH__ run cancel $id\n          done\n",
+            "      - name: Cancel older runs\n        uses: styfle/cancel-workflow-action@0.12.1\n",
+        );
+        assert_ne!(src, PR_ONLY_CANCEL_STEP);
+        let f = lint(&[wf(&src)]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].event, Event::PullRequest);
+        assert!(f[0].detail.contains("opaque `uses:`"), "{}", f[0].detail);
     }
 
     /// A comment that only mentions cancelling is not a cancel step, for
