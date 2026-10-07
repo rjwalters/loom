@@ -429,7 +429,7 @@ impl Stage {
         // unusable fleet-wide once releases fell behind `main`.
         let mut fetch_release_behind_source = false;
         if a.fetch_mode != FetchMode::Off {
-            let r = artifact::fetch_resolve_latest(&roots.repo_root);
+            let r = artifact::fetch_resolve_latest(&roots.repo_root, a.tag.as_deref());
             if r.ok {
                 fetch_repo_slug = r.repo_slug.clone();
                 fetch_latest_version = r.latest_version.clone();
@@ -473,6 +473,16 @@ impl Stage {
                         r.latest_tag, r.latest_version
                     ));
                 }
+            } else if let Some(tag) = a.tag.as_deref() {
+                // #10709: a pinned tag names the ONE release to install. A
+                // source build or another release would leave the roll's
+                // target unmet while reporting success, so this is exit 1
+                // (the daemon's Retryable bucket) in every fetch mode.
+                out::err(&format!(
+                    "Artifact-fetch pinned to {tag} could not resolve it: {} — refusing to fall back to a source build or another release.",
+                    r.reason
+                ));
+                exit(1);
             } else {
                 artifact_fallback_reason = r.reason.clone();
                 out::warn(&format!(

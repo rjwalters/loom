@@ -1510,7 +1510,13 @@ impl AutoUpdateProbe for ArtifactFakeProbe {
     fn resolve_artifact(&self) -> ArtifactResolution {
         self.artifact.clone()
     }
-    fn fetch_artifact(&mut self, _low_priority: bool) -> RebuildOutcome {
+    fn fetch_artifact(&mut self, tag: &str, _low_priority: bool) -> RebuildOutcome {
+        // #10709: every artifact roll in this suite must pin the child to the
+        // exact release the verdict compared, never an unpinned `latest`.
+        if let ArtifactResolution::Resolved(info) = &self.artifact {
+            assert_eq!(tag, info.tag, "fetch must pin the verdict's tag");
+            assert!(!tag.is_empty());
+        }
         self.fetch_calls.fetch_add(1, Ordering::SeqCst);
         self.fetch_outcome.clone()
     }
