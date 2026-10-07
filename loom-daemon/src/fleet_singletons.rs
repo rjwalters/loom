@@ -25,12 +25,26 @@ pub struct SingletonHandles {
     /// call only on the declared captain with
     /// `fleet.intakeReconcile.singleton` set.
     pub intake_reconcile: tokio::task::JoinHandle<()>,
+    /// The `loom:blocked` release task (#10763). Not a captain singleton: it
+    /// is sharded per workspace by the role-runner shard, and owns its loop so
+    /// the pass runs on the shard owner whether or not its work finder does.
+    pub stale_blocked_release: tokio::task::JoinHandle<()>,
 }
 
 /// Spawn every loop-owning singleton task against `workspace_root`'s config.
-pub fn spawn(workspace_root: PathBuf, bus: &EventBus) -> SingletonHandles {
+/// `loops` is which daemon loops actually started; the release task serves a
+/// workspace only through one of them.
+pub fn spawn(
+    workspace_root: PathBuf,
+    bus: &EventBus,
+    loops: crate::stale_blocked::release_task::Loops,
+) -> SingletonHandles {
     SingletonHandles {
         ci_telemetry: crate::ci_telemetry::spawn_task_on(workspace_root.clone(), bus),
-        intake_reconcile: crate::intake_reconcile::singleton::spawn_task(workspace_root),
+        intake_reconcile: crate::intake_reconcile::singleton::spawn_task(workspace_root.clone()),
+        stale_blocked_release: crate::stale_blocked::release_task::spawn_task(
+            workspace_root,
+            loops,
+        ),
     }
 }
