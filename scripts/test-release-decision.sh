@@ -137,6 +137,7 @@ assert "workflow_run)" in body and "\n            push)" not in body
 assert "bash .release-tooling/scripts/release-decision.sh" in body
 assert '--target "$SHA"' in body and "--latest=false" in body
 assert 'tag_commit" != "$SHA"' in body, "resolve must verify the tag names the tested commit"
+assert 'git rev-parse HEAD)" != "$SHA"' in body, "resolve must assert the checkout is the tested commit (git rev-parse HEAD == $SHA)"
 ok("resolve: checkout ref and SHA are workflow_run.head_sha; decision script wired; tag verified")
 
 # Nothing that decides what is built or tagged may read github.sha/github.ref,
@@ -154,6 +155,11 @@ for name, job in jobs.items():
 ok("downstream jobs: check out the resolved tag and are gated on resolve's verdict")
 PY
 else
-  echo "skip: PyYAML unavailable, wiring check not run"
+  if [ "${CI:-}" = "true" ]; then
+    echo "FAIL: PyYAML unavailable in CI; the wiring check must not be skipped" >&2
+    fail=1
+  else
+    echo "skip: PyYAML unavailable, wiring check not run"
+  fi
 fi
 exit $fail
