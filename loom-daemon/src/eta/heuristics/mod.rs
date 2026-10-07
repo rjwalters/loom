@@ -243,6 +243,7 @@ pub(crate) fn blank(heuristic: &'static str, kind: Kind, input: &EstimateInput) 
         queue: None,
         dependencies: None,
         regime_adjustment: None,
+        planner_version: None,
         held_heron: None,
     }
 }

@@ -194,6 +194,21 @@ pub fn is_open_at(episode: &StageEpisode, cutoff: DateTime<Utc>) -> bool {
     episode.entered_at < cutoff && episode.ended_at().is_none_or(|at| at >= cutoff)
 }
 
+/// The rows (and their keys) observed under `planner_version`, in their
+/// given canonical order; rows with no stamp are dropped (#10528). Pure: for
+/// a fit that must learn only the current planner regime.
+#[must_use]
+pub fn restrict_to_regime(
+    rows: Vec<TrainingRow>,
+    row_keys: Vec<RowKey>,
+    planner_version: &str,
+) -> (Vec<TrainingRow>, Vec<RowKey>) {
+    rows.into_iter()
+        .zip(row_keys)
+        .filter(|(row, _)| row.planner_version.as_deref() == Some(planner_version))
+        .unzip()
+}
+
 /// One PR, gathered from its snapshot.
 struct Pr<'a> {
     repo: String,
@@ -534,6 +549,7 @@ pub fn build_with_files(
                             inputs,
                             starred_any,
                             star_source,
+                            planner_version: None,
                             exit,
                             merge: merge_label(pr, t, horizon),
                         },

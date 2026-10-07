@@ -60,6 +60,7 @@ fn assembled(n: usize, exits: usize) -> Assembled {
         rows.extend((0..n).map(|i| TrainingRow {
             starred_any: None,
             star_source: None,
+            planner_version: None,
             stage,
             group: format!("{stage}#{i}"),
             inputs: ModelInputs {
