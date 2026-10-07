@@ -79,7 +79,11 @@ fn a_second_signal_also_kills_a_docker_group_that_ignores_the_first() {
         .unwrap();
     assert_eq!(out.status.signal(), Some(libc::SIGINT), "{:?}", out.status);
     assert!(!String::from_utf8_lossy(&out.stdout).contains("survived-second"));
-    let group: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    let group: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     // Gone (an orphaned zombie is reaped by init within moments).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     // SAFETY: signal 0 only checks for existence of the group.
