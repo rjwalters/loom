@@ -1,10 +1,13 @@
-//! Conformal calibration wrapper (#10489): the point-in-time leak test,
-//! censoring, per-quantile hit rates, the rate limit, the explanation
-//! record, and the shadow registration.
+//! Conformal calibration on the log scale (#10489): the point-in-time leak
+//! test, censoring, per-quantile hit rates, the rate limit and the
+//! explanation record. Its heuristic, `land-2026-10-06-calm-plover`, is
+//! retired (replaced by the seconds-scale `land-2026-10-06-even-lark`,
+//! [`super::conformal_seconds`]); the log scale stays for persisted
+//! calm-plover explanations, so these tests calibrate `land-v2` directly.
 
 use super::{as_of, history_a, input_at};
 use crate::eta::conformal::{self, apply, Q4};
-use crate::eta::heuristics::{LandCalmPlover, LAND_CALM_PLOVER, LAND_V2};
+use crate::eta::heuristics::{LandV2, LAND_V2};
 use crate::eta::recalibrate::{CalibrationObservation, OBSERVATION_SCHEMA};
 use crate::eta::simulate::run_explanation;
 use crate::eta::{Heuristic, Kind, Registry, Stage};
@@ -48,10 +51,19 @@ fn landings(stage: Stage, n: usize, lo: f64, hi: f64, tag: &str) -> Vec<Calibrat
         .collect()
 }
 
+/// What the retired calm-plover answered: `land-v2`'s estimate, calibrated
+/// on the log scale against `land-v2`'s track record in `history`.
+pub(super) fn log_calibrated(
+    input: &crate::eta::EstimateInput,
+    history: &crate::eta::history::StageSamples,
+) -> crate::eta::Explanation {
+    conformal::calibrate(LandV2.estimate(input, history), &history.calibration, LAND_V2)
+}
+
 fn estimate_with(observations: Vec<CalibrationObservation>) -> crate::eta::Explanation {
     let mut history = history_a();
     history.calibration = observations;
-    LandCalmPlover.estimate(&input_at(Stage::ReviewWait, 0, 0), &history)
+    log_calibrated(&input_at(Stage::ReviewWait, 0, 0), &history)
 }
 
 fn bytes(e: &crate::eta::Explanation) -> String {
@@ -59,7 +71,7 @@ fn bytes(e: &crate::eta::Explanation) -> String {
 }
 
 #[test]
-fn calm_plover_leak_perturbing_post_as_of_outcomes_is_bit_identical() {
+fn log_scale_leak_perturbing_post_as_of_outcomes_is_bit_identical() {
     let mut base = landings(Stage::ReviewWait, 80, -0.5, 2.5, "a");
     // Still open at the fit instant.
     base.extend((0..10).map(|i| obs(&format!("o{i}"), Stage::ReviewWait, -7_200 - i, None)));
@@ -185,7 +197,7 @@ fn calibration_on(
 ) -> Option<conformal::Calibration> {
     let mut bare = history_a();
     bare.calibration.clear();
-    let mut base = LandCalmPlover.estimate(&input_at(Stage::ReviewWait, 0, 0), &bare);
+    let mut base = LandV2.estimate(&input_at(Stage::ReviewWait, 0, 0), &bare);
     assert!(base.calibration.is_none());
     base.as_of += Duration::days(day);
     conformal::calibrate(base, observations, LAND_V2).calibration
@@ -305,10 +317,7 @@ fn too_little_evidence_leaves_the_base_estimate_unchanged() {
     let mut bare = history_a();
     bare.calibration.clear();
     let input = input_at(Stage::ReviewWait, 0, 0);
-    assert_eq!(
-        LandCalmPlover.estimate(&input, &bare).quantiles_with_p90(),
-        e.quantiles_with_p90()
-    );
+    assert_eq!(LandV2.estimate(&input, &bare).quantiles_with_p90(), e.quantiles_with_p90());
     // Rows persisted before the base quantiles were logged are no evidence.
     let mut old = landings(Stage::ReviewWait, 80, -0.5, 2.5, "old");
     for o in &mut old {
@@ -334,7 +343,7 @@ fn a_thin_age_bucket_falls_back_to_the_stage_then_the_pool() {
 }
 
 #[test]
-fn apply_is_monotone_and_the_wrapper_is_shadow_registered() {
+fn apply_is_monotone_and_the_log_wrapper_is_retired() {
     let wild = Q4 {
         p25: 2.0,
         p50: -1.0,
@@ -344,9 +353,18 @@ fn apply_is_monotone_and_the_wrapper_is_shadow_registered() {
     let (a, b, c, d) = apply(BASE, &wild);
     assert!(a <= b && b <= c && c <= d, "{a} {b} {c} {d}");
 
+    // A log-scale record (a persisted calm-plover explanation) recomputes
+    // through `apply_record` exactly as through `apply`.
+    let e = estimate_with(landings(Stage::ReviewWait, 80, -0.5, 2.5, "r"));
+    let record = e.calibration.as_ref().expect("calibrated");
+    assert_eq!(record.method, conformal::METHOD);
+    let q = record.base_quantiles_sec;
+    let base = (q.p25, q.p50, q.p75, q.p90);
+    assert_eq!(conformal::apply_record(base, record), apply(base, &record.shift));
+
     let registry = Registry::builtin();
-    assert!(registry
+    assert!(!registry
         .for_kind(Kind::Land)
-        .any(|h| h.id() == LAND_CALM_PLOVER));
+        .any(|h| h.id() == "land-2026-10-06-calm-plover"));
     assert_eq!(Registry::default_current(Kind::Land), "land-v1");
 }

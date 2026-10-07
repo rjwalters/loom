@@ -669,7 +669,7 @@ pub fn calibration_from_replay(
         .collect()
 }
 
-/// Give the calibrating `land` heuristics (`land-2026-10-06-calm-plover`,
+/// Give the calibrating `land` heuristics (`land-2026-10-06-even-lark`,
 /// #10489, over `land-v2`; `land-2026-10-06-quick-tern`, #10524, over
 /// `land-2026-10-04-twin-otter-b`; `land-2026-10-06-brisk-petrel`, #10528,
 /// whose regime residuals are the same `-b` rows) their calibration evidence

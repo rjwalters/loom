@@ -735,7 +735,9 @@ impl Registry {
                 Box::new(heuristics::FinishV1),
                 Box::new(heuristics::LandV1),
                 Box::new(heuristics::LandV2),
-                Box::new(heuristics::LandCalmPlover),
+                // #10489: conformal calibration over land-v2 on the seconds
+                // scale; it replaced the retired log-scale calm-plover here.
+                Box::new(heuristics::LandEvenLark),
                 Box::new(heuristics::LandV4),
                 Box::new(heuristics::LittleV0),
                 // #10528: twin-otter-b plus the drift-gated regime

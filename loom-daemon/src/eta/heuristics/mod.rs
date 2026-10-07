@@ -11,9 +11,10 @@
 //! `land-2026-10-04-twin-otter-b` (#10244) for PR stages, and its module stays
 //! for `-b`, keen-wren, held-heron and the fit (`recompute`, `adapt_input`,
 //! `visit_*`, `DRAW_ORDER`).
-//! `land-2026-10-06-calm-plover` (#10489) and `land-2026-10-06-quick-tern`
+//! `land-2026-10-06-even-lark` (#10489) and `land-2026-10-06-quick-tern`
 //! (#10524) are calibration wrappers over `land-v2` and
-//! `land-2026-10-04-twin-otter-b` respectively.
+//! `land-2026-10-04-twin-otter-b` respectively (even-lark replaced the
+//! log-scale `land-2026-10-06-calm-plover`, retired and removed in #10489).
 //! `land-2026-10-06-held-heron` (#10523) is twin-otter-b with a held or
 //! sequenced PR routed to the competing-risks simulator
 //! ([`crate::eta::hazard_sim`]).
@@ -33,8 +34,8 @@
 mod finish_v1;
 mod land_bold_lark;
 mod land_brisk_petrel;
-mod land_calm_plover;
 mod land_dependency;
+mod land_even_lark;
 mod land_held_heron;
 mod land_keen_wren;
 mod land_loop_kite;
@@ -52,8 +53,8 @@ mod start_v1;
 pub use finish_v1::{FinishV1, FINISH_V1};
 pub use land_bold_lark::{LandBoldLark, LAND_BOLD_LARK};
 pub use land_brisk_petrel::{LandBriskPetrel, LAND_BRISK_PETREL};
-pub use land_calm_plover::{LandCalmPlover, LAND_CALM_PLOVER};
 pub use land_dependency::{DependencyComposition, LAND_TANDEM_WREN};
+pub use land_even_lark::{LandEvenLark, LAND_EVEN_LARK};
 pub use land_held_heron::{
     side_state, LandHeldHeron, DRAW_ORDER as HELD_HERON_DRAW_ORDER, LAND_HELD_HERON,
     METHOD as HELD_HERON_METHOD,
@@ -79,12 +80,13 @@ pub use start_v1::{StartV1, START_V1};
 
 /// The heuristic whose track record the calibration log (#10207) records.
 /// (The `land-2026-10-04-amber-heron` shadow that consumed it was retired
-/// 2026-10-06, #10484; `land-2026-10-06-calm-plover` consumes it now, #10489.)
+/// 2026-10-06, #10484, and so was its successor `land-2026-10-06-calm-plover`,
+/// #10489; `land-2026-10-06-even-lark` consumes it now, #10489.)
 pub const CALIBRATION_BASE: &str = LAND_V2;
 
 /// Every heuristic whose landed and still-open `land` estimates are kept as
 /// calibration evidence ([`crate::eta::calibration_log`]): [`CALIBRATION_BASE`]
-/// for `land-2026-10-06-calm-plover`, and [`LAND_TWIN_OTTER_B`] for
+/// for `land-2026-10-06-even-lark`, and [`LAND_TWIN_OTTER_B`] for
 /// `land-2026-10-06-quick-tern` and `land-2026-10-06-swift-tern` (#10524), and
 /// [`LAND_KEEN_WREN`] for `land-2026-10-06-bold-lark` (#10524). Each calibrator filters the rows
 /// on its own base, so they never mix.

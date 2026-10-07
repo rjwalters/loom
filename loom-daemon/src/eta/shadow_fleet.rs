@@ -78,7 +78,7 @@ impl std::fmt::Display for Tier {
     }
 }
 
-/// Retired heuristic ids and their kind (#10484, #10549, #10528). Never
+/// Retired heuristic ids and their kind (#10484, #10549, #10528, #10489). Never
 /// registered, never reused; see `eta.md` "Retired heuristics" for why each
 /// was retired. `land-2026-10-04-twin-otter`'s evaluation lives on inside
 /// `land-2026-10-04-twin-otter-b` (and keen-wren's PR stages); only its own
@@ -88,6 +88,7 @@ pub const RETIRED: &[(&str, Kind)] = &[
     ("land-2026-10-04-amber-heron", Kind::Land),
     ("land-2026-10-04-fresh-tide", Kind::Land),
     (super::heuristics::LAND_TWIN_OTTER, Kind::Land),
+    ("land-2026-10-06-calm-plover", Kind::Land),
 ];
 
 /// Whether `id` is a retired heuristic id.

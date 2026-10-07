@@ -45,7 +45,7 @@ fn busiest_day(inputs: &Inputs) -> NaiveDate {
 }
 
 /// [`inputs`] plus enough slow, already-landed `land` cases in the two weeks
-/// before `day` for `land-2026-10-06-calm-plover`'s conformal calibration to
+/// before `day` for `land-2026-10-06-even-lark`'s conformal calibration to
 /// engage (every case lands days later than `land-v2` expects).
 fn calibrating_inputs() -> (Inputs, NaiveDate) {
     let mut inputs = inputs();
@@ -249,12 +249,12 @@ fn gate_ready_uses_the_promote_backtest_gate_function() {
     }
 }
 
-/// #10532 review: the fold gives `land-2026-10-06-calm-plover` the same
+/// #10532 review: the fold gives `land-2026-10-06-even-lark` the same
 /// replay calibration evidence `eta backtest` / `eta promote` do, so its fold
 /// is the calibrated heuristic's and not its uncalibrated `land-v2` fallback.
 #[test]
 fn the_calibrating_heuristic_is_folded_calibrated_not_as_its_fallback() {
-    use crate::eta::heuristics::LAND_CALM_PLOVER;
+    use crate::eta::heuristics::LAND_EVEN_LARK;
     let (inputs, day) = calibrating_inputs();
     let start = day_start(day);
     let cutoff = start + Duration::days(1);
@@ -274,9 +274,9 @@ fn the_calibrating_heuristic_is_folded_calibrated_not_as_its_fallback() {
         "calibration evidence is itself point-in-time"
     );
 
-    let plover = registry
-        .get(LAND_CALM_PLOVER)
-        .expect("calm-plover is registered");
+    let lark = registry
+        .get(LAND_EVEN_LARK)
+        .expect("even-lark is registered");
     // The day's cohort: here, the cases that resolved on it.
     let day_cases: Vec<ReplayCase> = cases
         .iter()
@@ -284,14 +284,8 @@ fn the_calibrating_heuristic_is_folded_calibrated_not_as_its_fallback() {
         .cloned()
         .collect();
     let pinball = |h: &StageSamples| {
-        own_stats(&backtest::replay_scored(
-            plover,
-            h,
-            &day_cases,
-            Filter::default(),
-            &provenance(),
-        ))
-        .pinball4
+        own_stats(&backtest::replay_scored(lark, h, &day_cases, Filter::default(), &provenance()))
+            .pinball4
     };
     let (calibrated, fallback) = (pinball(&cli), pinball(&uncalibrated));
     assert_ne!(calibrated, fallback, "the fixture makes calibration matter");
@@ -299,8 +293,8 @@ fn the_calibrating_heuristic_is_folded_calibrated_not_as_its_fallback() {
     let folded = records
         .folds
         .iter()
-        .find(|f| f.heuristic == LAND_CALM_PLOVER)
-        .expect("a calm-plover fold");
+        .find(|f| f.heuristic == LAND_EVEN_LARK)
+        .expect("an even-lark fold");
     assert_eq!(folded.pinball4_loss_sec, calibrated, "the fold is the CLI path's answer");
     assert_ne!(folded.pinball4_loss_sec, fallback, "not the uncalibrated fallback");
 }

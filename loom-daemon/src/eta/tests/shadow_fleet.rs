@@ -16,6 +16,7 @@ use serde_json::json;
 const AMBER_HERON: &str = "land-2026-10-04-amber-heron";
 const FRESH_TIDE: &str = "land-2026-10-04-fresh-tide";
 const TWIN_OTTER: &str = "land-2026-10-04-twin-otter";
+const CALM_PLOVER: &str = "land-2026-10-06-calm-plover";
 
 /// Every built-in id and its declared tier. A new registration fails this
 /// test until its tier is written down here: the tier is a decision, not a
@@ -25,7 +26,7 @@ const BUILTIN_TIERS: &[(&str, Tier)] = &[
     ("finish-v1", Tier::Baseline),
     ("land-v1", Tier::Baseline),
     ("land-v2", Tier::Candidate),
-    ("land-2026-10-06-calm-plover", Tier::Candidate),
+    ("land-2026-10-06-even-lark", Tier::Candidate),
     ("land-v4", Tier::Candidate),
     ("little-v0", Tier::Baseline),
     ("land-2026-10-06-brisk-petrel", Tier::Candidate),
@@ -56,7 +57,7 @@ fn retired_ids_are_unregistered_and_answer_retired() {
     let registry = Registry::builtin();
     assert_eq!(
         RETIRED.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-        [LAND_V3, AMBER_HERON, FRESH_TIDE, TWIN_OTTER]
+        [LAND_V3, AMBER_HERON, FRESH_TIDE, TWIN_OTTER, CALM_PLOVER]
     );
     for (id, kind) in RETIRED {
         assert!(!registry.registers(*kind, id), "{id} is retired, so not registered");
@@ -102,6 +103,18 @@ fn twin_otter_is_retired_and_b_stays_a_candidate() {
     assert!(!decision.promote);
     assert_eq!(decision.candidate_tier, Some(Tier::Retired));
     assert_eq!(builtin_tier("land-2026-10-04-twin-otter-b"), Some(Tier::Candidate));
+}
+
+/// #10489: `land-2026-10-06-calm-plover` hit its rates but lost `pinball4`
+/// to `land-v2` on the walk-forward backtest; `land-2026-10-06-even-lark`
+/// (the same calibration on the seconds scale) replaced it.
+#[test]
+fn calm_plover_is_retired() {
+    assert_eq!(builtin_tier(CALM_PLOVER), Some(Tier::Retired));
+    assert!(!Registry::builtin().registers(Kind::Land, CALM_PLOVER));
+    let decision = decide_with_passing_evidence(LAND_V1, CALM_PLOVER);
+    assert!(!decision.promote);
+    assert_eq!(decision.candidate_tier, Some(Tier::Retired));
 }
 
 #[test]

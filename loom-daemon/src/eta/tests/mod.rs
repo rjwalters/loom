@@ -11,6 +11,7 @@ mod config;
 mod conformal;
 mod conformal_ipcw;
 mod conformal_ipcw_drift;
+mod conformal_seconds;
 mod dependency;
 mod emit;
 mod episodes;

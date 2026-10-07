@@ -7,7 +7,7 @@ use super::{as_of, history_a, input_at, provenance, subject};
 use crate::eta::backtest::{BacktestReport, Bucket, Comparison, Paired};
 use crate::eta::config::{promote, resolve};
 use crate::eta::heuristics::{
-    LandV1, LandV2, LAND_BOLD_LARK, LAND_BRISK_PETREL, LAND_CALM_PLOVER, LAND_HELD_HERON,
+    LandV1, LandV2, LAND_BOLD_LARK, LAND_BRISK_PETREL, LAND_EVEN_LARK, LAND_HELD_HERON,
     LAND_KEEN_WREN, LAND_LOOP_KITE, LAND_QUICK_TERN, LAND_SWIFT_TERN, LAND_TANDEM_WREN,
     LAND_TWIN_OTTER_B, LAND_V1, LAND_V2, LAND_V4,
 };
@@ -241,7 +241,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
             "finish-v1",
             LAND_V1,
             LAND_V2,
-            LAND_CALM_PLOVER,
+            LAND_EVEN_LARK,
             LAND_V4,
             "little-v0",
             LAND_BRISK_PETREL,
@@ -299,7 +299,7 @@ fn shadow_estimates_every_registered_heuristic_without_moving_the_primary() {
         vec![
             LAND_V1,
             LAND_V2,
-            LAND_CALM_PLOVER,
+            LAND_EVEN_LARK,
             LAND_V4,
             "little-v0",
             LAND_BRISK_PETREL,

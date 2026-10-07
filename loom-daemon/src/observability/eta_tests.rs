@@ -72,7 +72,7 @@ fn delivery_offers_story_scoped_estimates_and_outcomes() {
     let sink = Capture::default();
     let delivered = deliver(emissions, outcomes, &rolled, "host-test", false, Some(&sink));
     // finish-v1, land-v1 (primary) and the land-v2 /
-    // land-2026-10-06-calm-plover / land-v4 shadows (#9328, #10489, #10210)
+    // land-2026-10-06-even-lark / land-v4 shadows (#9328, #10489, #10210)
     // answer (land-v3 and amber-heron retired, #10484; fresh-tide retired,
     // #10549; land-2026-10-04-twin-otter, which refused this pre-PR stage,
     // retired, #10528); little-v0 (#10208) refuses it; the twin-otter -b
