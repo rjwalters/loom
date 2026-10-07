@@ -688,11 +688,15 @@ BASE --wrap ipcw|ipcw-drift [--compare BASE]`:
   identical replay set. That is the acceptance's "pinball no worse than the
   unwrapped base".
 
-The replay serves `eta-fit/v1` files only (`--fit-dir`). So
-`land-2026-10-06-keen-wren`, which reads `eta-fit/v2`, refuses `no_model`
-there until the replay learns v2 files. Held-heron, land-v4 and the
-twin-otter pair are wrappable today. Registering a wrapped base later means
-a new datestamped id built from `IpcwWrap::new`.
+`--fit-dir DIR` replays every fitted base walk-forward from the
+versioned layout `eta fit` writes: `eta-fit/v1` files directly in `DIR`,
+`eta-fit/v2` files in `DIR/v2/` and `eta-fit/v3` files in `DIR/v3/`
+(`DatedFits::load_dir`). A case gets the newest file of each schema strictly
+before its `as_of`, so keen-wren (v2) and loop-kite (v3) are wrappable beside
+held-heron, land-v4 and the twin-otter pair. A regime-adjusted base
+(brisk-petrel) is calibrated on its raw quantiles with the regime factor
+re-applied last, the order `run_explanation` replays. Registering a wrapped
+base later means a new datestamped id built from `IpcwWrap::new`.
 
 *Deferred* (#10524, #10528):
 - serving the drift inflation, behind a gate that live evidence supports;
@@ -700,8 +704,7 @@ a new datestamped id built from `IpcwWrap::new`.
   consumed from a fleet-level #10528 drift event (none is emitted yet);
 - history-aware (HAPS) conditioning;
 - registering a wrapped base (#10508, #10523), which needs a shadow-budget
-  slot and the backtest evidence above; `eta-fit/v2` in the replay for
-  keen-wren;
+  slot and the backtest evidence above;
 - the loom-experiments walk-forward acceptance backtest.
 
 `land-2026-10-06-held-heron` (#10523) ships the same way: registered, not

@@ -9,13 +9,16 @@ use super::held_heron::{held, heron, hold_history};
 use super::land_twin_otter::{fit_as_of, fixture_fit};
 use super::{history_a, history_a_envelopes, input_at, provenance};
 use crate::eta::backtest::{self, Filter};
+use crate::eta::conformal;
 use crate::eta::conformal_ipcw::{METHOD, METHOD_DRIFT};
 use crate::eta::conformal_wrap::{Calibrator, IpcwWrap, CALIBRATED};
+use crate::eta::explanation::RegimeAdjustment;
 use crate::eta::heuristics::{
     LandQuickTern, LandSwiftTern, LandTwinOtterB, LandV2, StartV1, LAND_CALM_PLOVER,
     LAND_HELD_HERON, LAND_QUICK_TERN, LAND_SWIFT_TERN, LAND_TWIN_OTTER_B, LAND_V2,
 };
 use crate::eta::recalibrate::CalibrationObservation;
+use crate::eta::regime;
 use crate::eta::simulate::run_explanation;
 use crate::eta::{Explanation, Heuristic, Kind, Registry, Stage, StageSamples};
 use std::sync::Arc;
@@ -184,6 +187,76 @@ fn a_wrapped_simulator_base_recomputes_its_calibrated_answer() {
     assert_eq!(run_explanation(&parsed), Some(q));
     // The unwrapped simulator answer still recomputes as before.
     assert_eq!(run_explanation(&bare), Some(base_q));
+}
+
+const REGIMED: &str = "land-v2-regimed";
+
+/// land-v2 served brisk-petrel style (#10528): scaled by a fixed regime
+/// factor, with the `regime_adjustment` record the recompute applies last.
+#[derive(Debug, Clone)]
+struct Regimed;
+
+impl Heuristic for Regimed {
+    fn id(&self) -> &'static str {
+        REGIMED
+    }
+    fn kind(&self) -> Kind {
+        Kind::Land
+    }
+    fn tier(&self) -> crate::eta::Tier {
+        crate::eta::Tier::Candidate
+    }
+    fn models_hold(&self) -> bool {
+        LandV2.models_hold()
+    }
+    fn estimate(&self, input: &crate::eta::EstimateInput, history: &StageSamples) -> Explanation {
+        let mut e = LandV2.estimate(input, history);
+        e.heuristic = REGIMED.to_string();
+        let (p25, p50, p75, p90) = regime::scale(e.quantiles_with_p90().unwrap(), 1.2);
+        let r = e.result.as_mut().unwrap();
+        (r.p25_sec, r.p50_sec, r.p75_sec, r.p90_sec) = (p25, p50, p75, Some(p90));
+        r.eta_p50_at = e.as_of + chrono::Duration::seconds(p50);
+        e.regime_adjustment = Some(RegimeAdjustment {
+            stage: Stage::ReviewWait.as_str().to_string(),
+            factor: 1.2,
+            n_recent: 50,
+            half_life: 3_600,
+        });
+        e
+    }
+}
+
+#[test]
+fn a_wrapped_regime_adjusted_base_keeps_the_recompute_order() {
+    // Calibration then regime factor, as `run_explanation` replays it: both
+    // round, so calibrating the already-scaled quantiles would not recompute.
+    let input = input_at(Stage::ReviewWait, 0, 0);
+    let bare = Regimed.estimate(&input, &history_a());
+    assert_eq!(run_explanation(&bare), bare.quantiles_with_p90(), "the base replays");
+    let raw = LandV2
+        .estimate(&input, &history_a())
+        .quantiles_with_p90()
+        .unwrap();
+
+    let history = with_evidence(history_a(), evidence(REGIMED, Stage::ReviewWait, 3.0));
+    for calibrator in Calibrator::ALL {
+        let wrap = IpcwWrap::new("land-v2-regimed+ipcw", Regimed, calibrator).unwrap();
+        let e = wrap.estimate(&input, &history);
+        let record = e.calibration.as_ref().expect("calibrated");
+        assert_eq!(record.base, REGIMED);
+        let regime = e
+            .regime_adjustment
+            .as_ref()
+            .expect("the regime record survives");
+        assert!((regime.factor - 1.2).abs() < f64::EPSILON);
+        let q = e.quantiles_with_p90().unwrap();
+        assert_ne!(Some(q), bare.quantiles_with_p90(), "the shift moved it");
+        assert_eq!(q, regime::scale(conformal::apply(raw, &record.shift), 1.2));
+        assert_eq!(run_explanation(&e), Some(q));
+        let parsed: Explanation = serde_json::from_str(&bytes(&e)).unwrap();
+        assert_eq!(run_explanation(&parsed), parsed.quantiles_with_p90());
+        assert_eq!(parsed.quantiles_with_p90(), Some(q));
+    }
 }
 
 #[test]

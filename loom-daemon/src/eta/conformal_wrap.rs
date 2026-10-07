@@ -32,6 +32,9 @@
 //!   swift-tern) is left as the base answered, only re-identified: a second
 //!   shift would overwrite the first record and the explanation would no
 //!   longer recompute.
+//! - **Transform order is the recompute's.** A regime-adjusted base
+//!   (brisk-petrel, #10528) is calibrated on its raw quantiles and the
+//!   regime factor re-applied last, as [`run_explanation`] replays it.
 //! - **Degrades to the base.** A refusal, a base without p90, or too few
 //!   effective landings is the base's answer unchanged (re-identified, with
 //!   no `calibration` record), as for quick-tern.
@@ -44,6 +47,8 @@
 use super::conformal_ipcw;
 use super::heuristics::{LAND_CALM_PLOVER, LAND_QUICK_TERN, LAND_SWIFT_TERN};
 use super::history::StageSamples;
+use super::regime;
+use super::simulate::run_explanation;
 use super::{estimate_id, EstimateInput, Explanation, Heuristic, Kind, Tier};
 
 /// The registered `land` heuristics that already calibrate their own
@@ -144,6 +149,39 @@ impl<H: Heuristic> Heuristic for IpcwWrap<H> {
         {
             return explanation;
         }
+        let Some(regime) = explanation.regime_adjustment.clone() else {
+            return self.calibrate(explanation, history);
+        };
+        // A regime-adjusted base (brisk-petrel, #10528). The recompute
+        // ([`run_explanation`]) applies calibration to the *raw* base and the
+        // regime factor last; both round, so they do not commute on the
+        // served integers. Calibrate the raw base, then re-apply the factor,
+        // so the answer replays from its own fields. Unrecomputable or
+        // uncalibrated: the base as it answered.
+        let mut raw = explanation.clone();
+        raw.regime_adjustment = None;
+        let Some(raw_q) = run_explanation(&raw) else {
+            return explanation;
+        };
+        set_quantiles(&mut raw, raw_q);
+        let mut calibrated = self.calibrate(raw, history);
+        let Some(q) = calibrated
+            .calibration
+            .is_some()
+            .then(|| calibrated.quantiles_with_p90())
+            .flatten()
+        else {
+            return explanation;
+        };
+        set_quantiles(&mut calibrated, regime::scale(q, regime.factor));
+        calibrated.regime_adjustment = Some(regime);
+        calibrated.enforce_cap();
+        calibrated
+    }
+}
+
+impl<H: Heuristic> IpcwWrap<H> {
+    fn calibrate(&self, explanation: Explanation, history: &StageSamples) -> Explanation {
         let base = self.base.id();
         match self.calibrator {
             Calibrator::Ipcw => conformal_ipcw::calibrate(explanation, &history.calibration, base),
@@ -151,5 +189,15 @@ impl<H: Heuristic> Heuristic for IpcwWrap<H> {
                 conformal_ipcw::calibrate_drift_aware(explanation, &history.calibration, base)
             }
         }
+    }
+}
+
+/// Serve `q` as `explanation`'s answer.
+fn set_quantiles(explanation: &mut Explanation, q: (i64, i64, i64, i64)) {
+    let as_of = explanation.as_of;
+    if let Some(result) = explanation.result.as_mut() {
+        (result.p25_sec, result.p50_sec, result.p75_sec) = (q.0, q.1, q.2);
+        result.p90_sec = Some(q.3);
+        result.eta_p50_at = as_of + chrono::Duration::seconds(q.1);
     }
 }
