@@ -256,8 +256,8 @@ impl RepoStar {
     /// Read a repo's raw events (any order). Only [`SOURCE_FORGE`] rows set
     /// coverage: the coverage floors name the forge listings, and an imported
     /// webhook-mirror row (#10197) would move them and replay a star twice.
-    /// A [`SOURCE_SIGNOZ`] row (#10746) is a star change only, appended for a
-    /// window whose issue history SigNoz proved contiguous; it sets no floor.
+    /// A [`SOURCE_SIGNOZ`] row (#10746) is a star change only: it sets no
+    /// floor and no stamp, so it counts only where the forge listings cover.
     #[must_use]
     pub fn from_events(events: &[RawEvent]) -> Self {
         let mut star = RepoStar::default();

@@ -1,4 +1,5 @@
-//! #10746: star coverage keeps advancing under `historyPrimary`, each
+//! #10746: star coverage keeps advancing under `historyPrimary` (from the
+//! forge only; SigNoz star rows are recorded, never a coverage proof), each
 //! listing is frozen from its own rows, and a gap-filled PR closed unmerged
 //! resolves closed. A child of the #10520 history tests, sharing their
 //! fixtures.
@@ -324,27 +325,35 @@ fn star_of(root: &Path, pr: u32, cutoff: DateTime<Utc>) -> Option<bool> {
         .map(|s| s.source.starred())
 }
 
-/// Two successive covered windows advance linked-issue star coverage from
-/// SigNoz; a later transition changes only rows whose cutoffs include it, and
-/// a link learned after a cutoff never stars that cutoff.
-#[test]
-fn signoz_star_history_advances_coverage_across_covered_windows() {
+/// The forge refresh completing at `at`: both star listings caught up.
+fn forge_caught_up(root: &Path, at: DateTime<Utc>) {
     use crate::eta::fleet_events_forge::ForgeEndpoint::{IssuesEvents, Pulls};
-    use crate::eta::fleet_signoz_history::advance_star_coverage;
+    stamp(root, Pulls, at);
+    stamp(root, IssuesEvents, at);
+}
+
+/// SigNoz-dated star changes are recorded across successive covered windows,
+/// idempotently, but never move a listing's stamp: coverage is the forge's.
+/// A later transition changes only rows whose cutoffs include it, and a link
+/// learned after a cutoff never stars that cutoff.
+#[test]
+fn signoz_star_rows_are_recorded_idempotently_but_never_advance_coverage() {
+    use crate::eta::fleet_events_forge::ForgeEndpoint::{IssuesEvents, Pulls};
+    use crate::eta::fleet_signoz_history::record_signoz_stars;
     const STAR: &str = "loom:operator-priority";
     let s0 = now() - Duration::days(2);
     let dir = tempfile::tempdir().unwrap();
     plant_star_cache(dir.path(), s0);
 
-    // Window 1: starred at s0+1h.
+    // Window 1: starred at s0+1h. Recorded, but the stamps stay at s0.
     let l1 = s0 + Duration::hours(2);
     let plan = star_plan(&[(STAR, true, s0 + Duration::hours(1))], true, l1);
-    assert!(advance_star_coverage(dir.path(), A, &plan));
-    assert_eq!(stamp_of(dir.path(), IssuesEvents), Some(l1));
-    // The pulls listing (links) is the forge's: until it refreshes, coverage
-    // stays at its stamp.
-    assert_eq!(star_of(dir.path(), 101, s0 + Duration::minutes(90)), None);
-    stamp(dir.path(), Pulls, l1);
+    assert_eq!(record_signoz_stars(dir.path(), A, &plan), 1);
+    assert_eq!(stamp_of(dir.path(), IssuesEvents), Some(s0), "SigNoz moves no stamp");
+    assert_eq!(stamp_of(dir.path(), Pulls), Some(s0));
+    assert_eq!(star_of(dir.path(), 101, s0 + Duration::minutes(90)), None, "unknown");
+    // The forge refresh establishes coverage through l1.
+    forge_caught_up(dir.path(), l1);
     assert_eq!(
         star_of(dir.path(), 101, s0 + Duration::minutes(30)),
         Some(false),
@@ -360,7 +369,7 @@ fn signoz_star_history_advances_coverage_across_covered_windows() {
     assert_eq!(star_of(dir.path(), 102, s0 + Duration::minutes(80)), Some(false));
     assert_eq!(star_of(dir.path(), 102, s0 + Duration::minutes(100)), Some(true));
 
-    // Window 2: unstarred at s0+3h. Re-applying window 1's data is idempotent.
+    // Window 2: unstarred at s0+3h. Re-recording window 1's data adds nothing.
     let l2 = s0 + Duration::hours(4);
     let plan = star_plan(
         &[
@@ -370,9 +379,11 @@ fn signoz_star_history_advances_coverage_across_covered_windows() {
         true,
         l2,
     );
-    assert!(advance_star_coverage(dir.path(), A, &plan));
-    assert!(advance_star_coverage(dir.path(), A, &plan));
-    stamp(dir.path(), Pulls, l2);
+    assert_eq!(record_signoz_stars(dir.path(), A, &plan), 1, "only the unstar is new");
+    assert_eq!(record_signoz_stars(dir.path(), A, &plan), 0, "idempotent");
+    assert_eq!(stamp_of(dir.path(), IssuesEvents), Some(l1));
+    assert_eq!(star_of(dir.path(), 101, s0 + Duration::minutes(210)), None);
+    forge_caught_up(dir.path(), l2);
     assert_eq!(
         star_of(dir.path(), 101, s0 + Duration::minutes(150)),
         Some(true),
@@ -386,47 +397,100 @@ fn signoz_star_history_advances_coverage_across_covered_windows() {
     assert_eq!(star_of(dir.path(), 101, l2 + Duration::hours(1)), None);
 }
 
-/// A star transition after a training cutoff must not leak into that row, and
-/// coverage SigNoz cannot prove is never advanced.
+/// No SigNoz shape proves issue coverage: neither PR rows alone nor an old
+/// issue row plus a successful query. A star transition after a window's
+/// cutoff never leaks into it.
 #[test]
-fn signoz_star_coverage_needs_issue_history_and_never_reads_unstarred() {
+fn signoz_never_proves_star_coverage_and_never_reads_unstarred() {
     use crate::eta::fleet_events_forge::ForgeEndpoint::IssuesEvents;
-    use crate::eta::fleet_signoz_history::advance_star_coverage;
+    use crate::eta::fleet_signoz_history::record_signoz_stars;
     const STAR: &str = "loom:operator-priority";
     let s0 = now() - Duration::days(2);
     let l1 = s0 + Duration::hours(2);
 
-    // PR rows alone (no issue row at all): the PR-history query succeeding
-    // proves nothing about issue labels.
-    let dir = tempfile::tempdir().unwrap();
-    plant_star_cache(dir.path(), s0);
-    let plan = star_plan(&[], false, l1);
-    assert!(!advance_star_coverage(dir.path(), A, &plan));
-    assert_eq!(stamp_of(dir.path(), IssuesEvents), Some(s0), "stamp did not move");
-
-    // Issue rows that begin after the stamp leave a gap: not contiguous.
-    let dir = tempfile::tempdir().unwrap();
-    plant_star_cache(dir.path(), s0);
-    let late = [(STAR, true, s0 + Duration::hours(1))];
-    let plan = star_plan(&late, false, l1);
-    assert!(!advance_star_coverage(dir.path(), A, &plan));
-    assert_eq!(stamp_of(dir.path(), IssuesEvents), Some(s0));
-    assert_eq!(star_of(dir.path(), 101, s0 + Duration::minutes(90)), None);
+    for anchored in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        plant_star_cache(dir.path(), s0);
+        let plan = star_plan(&[(STAR, true, s0 + Duration::hours(1))], anchored, l1);
+        record_signoz_stars(dir.path(), A, &plan);
+        assert_eq!(stamp_of(dir.path(), IssuesEvents), Some(s0), "anchored={anchored}");
+        assert_eq!(star_of(dir.path(), 101, s0 + Duration::minutes(90)), None);
+    }
 
     // A change after the cutoff of a window is not in it.
     let dir = tempfile::tempdir().unwrap();
     plant_star_cache(dir.path(), s0);
     let plan = star_plan(&[(STAR, true, l1 + Duration::hours(1))], true, l1);
-    assert!(advance_star_coverage(dir.path(), A, &plan));
-    crate::eta::fleet_events::EventLog::open(&crate::eta::fleet_events::events_path(dir.path(), A))
-        .unwrap();
-    stamp(dir.path(), crate::eta::fleet_events_forge::ForgeEndpoint::Pulls, l1);
+    assert_eq!(record_signoz_stars(dir.path(), A, &plan), 0);
+    forge_caught_up(dir.path(), l1);
     assert_eq!(star_of(dir.path(), 101, l1), Some(false), "a later star never leaks back");
+}
 
-    // A cache with no stamp and no rows: nothing to advance from.
+/// A star change the Worker received before a pass's listing instant but
+/// SigNoz exported only after it (#10746 review): pass one sees an unrelated
+/// old issue row and no issue-7 change, pass two the delayed row with its
+/// original receipt time. Pass one leaves coverage unknown; once the forge
+/// establishes it, the delayed row, though dated before the stamp, is still
+/// recorded and repairs the cutoffs after it.
+#[test]
+fn a_delayed_signoz_star_never_advances_coverage_and_repairs_later_cutoffs() {
+    use crate::eta::fleet_events_forge::ForgeEndpoint::IssuesEvents;
+    use crate::eta::fleet_signoz_history::record_signoz_stars;
+    const STAR: &str = "loom:operator-priority";
+    let s0 = now() - Duration::days(2);
+    let (t1, l1, l2) = (s0 + Duration::hours(1), s0 + Duration::hours(2), s0 + Duration::hours(4));
     let dir = tempfile::tempdir().unwrap();
-    let plan = star_plan(&[(STAR, true, s0)], true, l1);
-    assert!(!advance_star_coverage(dir.path(), A, &plan));
+    plant_star_cache(dir.path(), s0);
+
+    // Pass one: the star (received at t1 < l1) is not exported yet.
+    let plan = star_plan(&[], true, l1);
+    assert_eq!(record_signoz_stars(dir.path(), A, &plan), 0);
+    assert_eq!(stamp_of(dir.path(), IssuesEvents), Some(s0), "coverage not advanced");
+    assert_eq!(star_of(dir.path(), 101, t1 + Duration::minutes(30)), None, "never unstarred");
+    assert_eq!(star_of(dir.path(), 101, l1), None);
+
+    // The forge establishes coverage through l1 (its rows in this cache lack
+    // the change), then pass two sees the delayed row, dated t1 < the stamp.
+    forge_caught_up(dir.path(), l1);
+    let plan = star_plan(&[(STAR, true, t1)], true, l2);
+    assert_eq!(record_signoz_stars(dir.path(), A, &plan), 1, "not discarded");
+    assert_eq!(stamp_of(dir.path(), IssuesEvents), Some(l1), "still the forge's stamp");
+    assert_eq!(star_of(dir.path(), 101, t1 - Duration::minutes(30)), Some(false));
+    assert_eq!(star_of(dir.path(), 101, t1 + Duration::minutes(30)), Some(true), "repaired");
+    assert_eq!(star_of(dir.path(), 101, l1), Some(true), "repaired");
+    assert_eq!(star_of(dir.path(), 101, l2), None, "past coverage: unknown");
+}
+
+/// The same for a delayed unstar: a star the cache holds is not retained past
+/// the unstar once its row arrives.
+#[test]
+fn a_delayed_signoz_unstar_never_advances_coverage_and_repairs_later_cutoffs() {
+    use crate::eta::fleet_events::{EventKind as K, ItemKind as I};
+    use crate::eta::fleet_events_forge::ForgeEndpoint::IssuesEvents;
+    use crate::eta::fleet_signoz_history::record_signoz_stars;
+    const STAR: &str = "loom:operator-priority";
+    let s0 = now() - Duration::days(2);
+    let (t1, l1, l2) = (s0 + Duration::hours(1), s0 + Duration::hours(2), s0 + Duration::hours(4));
+    let starred = s0 - Duration::minutes(30);
+    let dir = tempfile::tempdir().unwrap();
+    plant_star_cache(dir.path(), s0);
+    let star_row = forge_row(7, I::Issue, K::LabelAdded, Some(STAR), starred, 9);
+    plant(dir.path(), &[star_row]);
+
+    // Pass one: the unstar (received at t1 < l1) is not exported yet.
+    let plan = star_plan(&[(STAR, true, starred)], true, l1);
+    record_signoz_stars(dir.path(), A, &plan);
+    assert_eq!(stamp_of(dir.path(), IssuesEvents), Some(s0), "coverage not advanced");
+    assert_eq!(star_of(dir.path(), 101, t1 + Duration::minutes(30)), None, "unknown");
+
+    forge_caught_up(dir.path(), l1);
+    assert_eq!(star_of(dir.path(), 101, t1 + Duration::minutes(30)), Some(true));
+    let plan = star_plan(&[(STAR, true, starred), (STAR, false, t1)], true, l2);
+    assert_eq!(record_signoz_stars(dir.path(), A, &plan), 1, "not discarded");
+    assert_eq!(stamp_of(dir.path(), IssuesEvents), Some(l1));
+    assert_eq!(star_of(dir.path(), 101, t1 - Duration::minutes(30)), Some(true));
+    assert_eq!(star_of(dir.path(), 101, t1 + Duration::minutes(30)), Some(false), "repaired");
+    assert_eq!(star_of(dir.path(), 101, l1), Some(false), "repaired");
 }
 
 /// A production cycle (spending 3 calls per listing) over a covered repo whose
@@ -475,39 +539,33 @@ fn mark_backfilled(root: &Path) {
     cursor.write(&file).unwrap();
 }
 
-/// At the production boundary a covered repo refreshes only the listings
-/// SigNoz cannot answer for, counted against (and capped by) the per-repo
-/// gap-fill budget: the pulls listing (links) always, the issue-events
-/// listing only when SigNoz did not prove its coverage. An interrupted
-/// refresh stamps nothing, so coverage stays frozen, never "unstarred".
+/// At the production boundary a covered repo refreshes its two star
+/// listings, counted against (and capped by) the per-repo gap-fill budget:
+/// the issue-events listing too, even when SigNoz holds issue rows, since
+/// SigNoz has no ingestion watermark to prove a window complete (#10746). An
+/// interrupted refresh stamps nothing, so coverage stays frozen, never
+/// "unstarred".
 #[test]
-fn a_covered_repo_refreshes_only_the_star_listings_signoz_cannot_answer() {
+fn a_covered_repo_refreshes_both_star_listings_from_the_forge() {
     use crate::eta::fleet_events_forge::ForgeEndpoint::{IssuesEvents, Pulls};
     let s0 = now() - Duration::days(2);
-
-    // SigNoz proves issue coverage: only the pulls listing is read.
-    let dir = tempfile::tempdir().unwrap();
-    plant_star_cache(dir.path(), s0);
-    mark_backfilled(dir.path());
     let prs = [approved(101, now() - Duration::hours(10))];
-    let mut signoz = signoz_rows(&prs, true);
-    let (r, seen) = star_cycle(dir.path(), &mut signoz, 5, None);
-    assert_eq!(seen, vec![(Pulls, 5)], "issue events come from SigNoz");
-    assert_eq!((r.forge_calls, r.gap_fill_calls), (3, Some(3)), "counted as gap-fill");
-    assert_eq!(stamp_of(dir.path(), IssuesEvents), Some(now()));
-    assert_eq!(stamp_of(dir.path(), Pulls), Some(now()));
-    assert_eq!(star_of(dir.path(), 101, now()), Some(false));
 
-    // No issue rows in SigNoz: the issue-events listing is read too, within
-    // the same cap (5 = 3 + the 2 left).
-    let dir = tempfile::tempdir().unwrap();
-    plant_star_cache(dir.path(), s0);
-    mark_backfilled(dir.path());
-    let old_pr = approved(90, now() - Duration::days(25));
-    let mut signoz = signoz_rows(&[old_pr, prs[0].clone()], false);
-    let (r, seen) = star_cycle(dir.path(), &mut signoz, 5, None);
-    assert_eq!(seen, vec![(IssuesEvents, 5), (Pulls, 2)]);
-    assert_eq!(r.gap_fill_calls, Some(5), "never over the budget");
+    // With or without issue rows in SigNoz, both listings are read, within
+    // the same cap (5 = 3 + the 2 left), and stamped on completion.
+    for anchored in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        plant_star_cache(dir.path(), s0);
+        mark_backfilled(dir.path());
+        let old_pr = approved(90, now() - Duration::days(25));
+        let mut signoz = signoz_rows(&[old_pr, prs[0].clone()], anchored);
+        let (r, seen) = star_cycle(dir.path(), &mut signoz, 5, None);
+        assert_eq!(seen, vec![(IssuesEvents, 5), (Pulls, 2)], "anchored={anchored}");
+        assert_eq!((r.forge_calls, r.gap_fill_calls), (5, Some(5)), "never over the budget");
+        assert_eq!(stamp_of(dir.path(), IssuesEvents), Some(now()));
+        assert_eq!(stamp_of(dir.path(), Pulls), Some(now()));
+        assert_eq!(star_of(dir.path(), 101, now()), Some(false));
+    }
 
     // An interrupted refresh stamps nothing: coverage stays frozen.
     let dir = tempfile::tempdir().unwrap();
@@ -515,6 +573,7 @@ fn a_covered_repo_refreshes_only_the_star_listings_signoz_cannot_answer() {
     mark_backfilled(dir.path());
     let mut signoz = signoz_rows(&prs, true);
     star_cycle(dir.path(), &mut signoz, 5, Some(StopReason::Budget));
+    assert_eq!(stamp_of(dir.path(), IssuesEvents), Some(s0));
     assert_eq!(stamp_of(dir.path(), Pulls), Some(s0));
     assert_eq!(star_of(dir.path(), 101, now()), None, "unknown, never unstarred");
 }

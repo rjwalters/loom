@@ -62,16 +62,24 @@
 //! # Star coverage keeps advancing (#10746)
 //!
 //! Frozen coverage would, over time, turn every later star input unknown. So
-//! a covered pass advances it ([`advance_star_coverage`]): SigNoz dates the
-//! star changes on issues (its `label.transition` rows), which it appends as
-//! [`SOURCE_SIGNOZ`] raw rows and stamps the issue-events listing through the
-//! pass's `L`, but only when an **issue** row at or before the listing's
-//! stamp proves the history contiguous (a PR-history query succeeding proves
-//! nothing about issues). SigNoz knows no PR links, so the pulls listing is
-//! refreshed from the forge — a completed backfill's ETag'd refresh, counted
-//! as gap-fill and capped by the repo's budget — and the issue-events listing
-//! too when SigNoz could not prove it. An interrupted refresh stamps nothing:
-//! coverage stays where it was, unknown, never "unstarred".
+//! a covered repo's two star listings (issue events and pulls) still get the
+//! forge's cheap refresh: a completed backfill's ETag'd refresh, counted as
+//! gap-fill and capped by the repo's budget, which stamps its listing on
+//! completion. An interrupted refresh stamps nothing: coverage stays where it
+//! was, unknown, never "unstarred".
+//!
+//! SigNoz never moves a stamp. A webhook row is dated by the Worker's receipt
+//! time, whatever its later export time
+//! ([`super::fleet_signoz_timeline_rows`]), so a successful query, even one
+//! holding an old issue row, does not prove every change up to the listing
+//! instant has been exported: a change received before the pass but exported
+//! after it would be missing, and a stamp moved past it would read its cutoffs
+//! as known. Without an explicit issue-label ingestion watermark (SigNoz has
+//! none today), the forge alone establishes coverage. What SigNoz dates is
+//! still recorded ([`record_signoz_stars`]): every issue star change of the
+//! pass, as [`SOURCE_SIGNOZ`] raw rows, reconciled idempotently (a row's id is
+//! its content, so a re-read never duplicates it), including a delayed export
+//! dated at or before a listing's stamp, which repairs the cutoffs after it.
 //!
 //! Every forge read made while SigNoz history is configured — snapshot and
 //! raw-event alike — is counted (`gap_fill_calls` on the repo's report and its
@@ -344,10 +352,6 @@ pub struct Plan {
     pub listed_at: Option<DateTime<Utc>>,
     /// The star changes the timeline dates on issues (see [`issue_stars`]).
     pub issue_stars: Vec<(IssueStarChange, String)>,
-    /// The earliest row SigNoz has about any **issue**. A PR-history query
-    /// that succeeded says nothing about issue labels, so star coverage is
-    /// proved from issue rows alone.
-    pub issue_first: Option<DateTime<Utc>>,
 }
 
 impl Plan {
@@ -423,26 +427,7 @@ pub fn plan(timeline: &Timeline, cutoff: DateTime<Utc>, since: DateTime<Utc>) ->
         candidates,
         listed_at: Some(cutoff),
         issue_stars: issue_stars(timeline),
-        issue_first: issue_first(timeline),
     }
-}
-
-/// The earliest row (label change, lifecycle event or daemon label set) of
-/// any issue in `timeline`.
-#[must_use]
-pub fn issue_first(timeline: &Timeline) -> Option<DateTime<Utc>> {
-    timeline
-        .items
-        .iter()
-        .filter(|(key, _)| key.target == Target::Issue)
-        .flat_map(|(_, item)| {
-            item.labels
-                .iter()
-                .map(|e| e.at)
-                .chain(item.lifecycle.iter().map(|e| e.at))
-                .chain(item.label_sets.iter().map(|(seen, _)| *seen))
-        })
-        .min()
 }
 
 /// Every star change `timeline` dates on an issue, by the one star-label
@@ -489,45 +474,26 @@ pub fn issue_stars(timeline: &Timeline) -> Vec<(IssueStarChange, String)> {
 /// listing never wrote).
 pub const SOURCE_SIGNOZ: &str = "signoz";
 
-/// A covered pass's chance to keep a covered repo's star coverage moving
-/// (#10746). SigNoz knows issue label changes but nothing about a PR's
-/// links, so it can advance only the issue-events listing's coverage; the
-/// pulls listing (links) is refreshed from the forge, budgeted and ETag'd, by
-/// the raw-event phase. Returns whether the issue-events listing advanced.
+/// Record the star changes a covered pass's SigNoz timeline dates on issues
+/// (#10746) as [`SOURCE_SIGNOZ`] raw rows: every change knowable at the
+/// pass's listing instant, whatever the listings' stamps. Returns how many
+/// rows were new.
 ///
-/// It advances only when contiguity is proved: the cache is stamped (a cache
-/// with no stamp is first frozen), and SigNoz has an **issue** row at or
-/// before that stamp, so every issue change after it is in `plan`. The star
-/// changes knowable in `(stamp, listed_at]` are appended as
-/// [`SOURCE_SIGNOZ`] rows and the listing's stamp moves to `listed_at`.
-/// Otherwise nothing changes: coverage stays where it was, never
-/// "unstarred".
-pub fn advance_star_coverage(root: &Path, repo: &str, plan: &Plan) -> bool {
-    use super::fleet_events::{self, EventKind, EventLog, EventsCursor, ItemKind, RawEvent};
-    use super::fleet_events_forge::ForgeEndpoint;
+/// It never moves a stamp (see the module docs): a row SigNoz has not
+/// exported yet may still carry a receipt time before the listing instant,
+/// so only the forge refresh establishes coverage. Recording is idempotent
+/// (a row's id is its content, and the log skips known ids), and a change
+/// exported late, dated at or before a stamp, is recorded too: it repairs the
+/// cutoffs after it rather than being discarded.
+pub fn record_signoz_stars(root: &Path, repo: &str, plan: &Plan) -> usize {
+    use super::fleet_events::{self, EventKind, EventLog, ItemKind, RawEvent};
     let Some(listed_at) = plan.listed_at else {
-        return false;
+        return 0;
     };
-    freeze_raw_cache(root, repo);
-    let key = format!("{}:{}", fleet_events::SOURCE_FORGE, ForgeEndpoint::IssuesEvents.name());
-    let cursor_file = fleet_events::cursor_path(root, repo);
-    let Some(stamp) = EventsCursor::read(&cursor_file, repo)
-        .endpoints
-        .get(&key)
-        .and_then(|e| e.synced_through)
-    else {
-        return false;
-    };
-    if stamp >= listed_at {
-        return true;
-    }
-    if !plan.issue_first.is_some_and(|first| first <= stamp) {
-        return false;
-    }
     let rows: Vec<RawEvent> = plan
         .issue_stars
         .iter()
-        .filter(|(c, _)| c.at > stamp && c.at <= listed_at)
+        .filter(|(c, _)| c.at <= listed_at)
         .map(|(c, label)| {
             RawEvent::new(
                 repo,
@@ -546,19 +512,16 @@ pub fn advance_star_coverage(root: &Path, repo: &str, plan: &Plan) -> bool {
             )
         })
         .collect();
-    if !rows.is_empty() {
-        let appended = EventLog::open(&fleet_events::events_path(root, repo))
-            .and_then(|mut log| log.append(&rows).map(drop));
-        if let Err(e) = appended {
-            log::warn!("eta fleet refresh: {repo}: could not record SigNoz star changes: {e}");
-            return false;
-        }
+    if rows.is_empty() {
+        return 0;
     }
-    match fleet_events::mark_synced_through(&cursor_file, repo, &key, listed_at) {
-        Ok(()) => true,
+    match EventLog::open(&fleet_events::events_path(root, repo))
+        .and_then(|mut log| log.append(&rows))
+    {
+        Ok(appended) => appended,
         Err(e) => {
-            log::warn!("eta fleet refresh: {repo}: could not advance {key}'s coverage: {e}");
-            false
+            log::warn!("eta fleet refresh: {repo}: could not record SigNoz star changes: {e}");
+            0
         }
     }
 }
@@ -730,8 +693,8 @@ impl Walk<'_> {
         match load {
             Load::Covered(plan) => {
                 self.report.history = Some(HistorySource::Signoz);
-                self.report.star_issues_from_signoz =
-                    advance_star_coverage(self.root, &repo, &plan);
+                freeze_raw_cache(self.root, &repo);
+                record_signoz_stars(self.root, &repo, &plan);
                 self.gap_left = Some(gap_budget);
                 if plan.gap_fills() > 0 {
                     log::info!(

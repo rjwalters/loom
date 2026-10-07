@@ -764,7 +764,6 @@ fn gated(root: &Path, target: &RepoTarget, stop: StopReason) -> RepoReport {
         raw_events_added: None,
         gap_fill_calls: None,
         history: None,
-        star_issues_from_signoz: false,
         duration_ms: 0,
     };
     match target.reader {
@@ -782,9 +781,10 @@ fn gated(root: &Path, target: &RepoTarget, stop: StopReason) -> RepoReport {
 /// every repo on a reader installation (App and owner, #10329) that hit the
 /// reserve, and for everything left
 /// once one sync is rate limited or meets the open breaker. With SigNoz
-/// history on (#10520) each repo also follows its [`EventsGate`]: none for a
-/// covered repo (whose cache coverage is frozen, so stars read unknown past
-/// it), gap-fill (counted, and capped by `gap`'s per-repo budget less what
+/// history on (#10520) each repo also follows its [`EventsGate`]: for a
+/// covered repo only its backfilled star listings' ETag'd refreshes (#10746;
+/// otherwise its coverage stays frozen, so stars read unknown past it),
+/// gap-fill (counted, and capped by `gap`'s per-repo budget less what
 /// the snapshot pass spent) otherwise. A refresh that completes stamps its
 /// listing's `synced_through` at `now`: the cache was caught up then.
 fn sync_all_events(
@@ -819,8 +819,9 @@ fn sync_all_events(
         // A covered repo (#10746): its cache is frozen, then only the
         // star-bearing listings refresh, and only a completed backfill's
         // cheap ETag'd refresh, drawn from what the snapshot pass left of the
-        // per-repo gap-fill budget. The issue-events listing is skipped when
-        // SigNoz advanced its star coverage this cycle.
+        // per-repo gap-fill budget. SigNoz never stands in for the
+        // issue-events listing: it has no ingestion watermark proving a
+        // window complete, so only this refresh advances its coverage.
         let covered = gate == EventsGate::Skip;
         if covered {
             crate::eta::fleet_signoz_history::freeze_raw_cache(root, &target.repo);
@@ -846,9 +847,7 @@ fn sync_all_events(
                 let star_listing = crate::eta::star::listing_keys()
                     .iter()
                     .any(|k| *k == format!("{}:{}", fleet_events::SOURCE_FORGE, endpoint.name()));
-                let issue_events_done =
-                    endpoint == ForgeEndpoint::IssuesEvents && repo_report.star_issues_from_signoz;
-                if !star_listing || issue_events_done || !complete {
+                if !star_listing || !complete {
                     continue;
                 }
             }
