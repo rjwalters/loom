@@ -1856,6 +1856,10 @@ jobs:
       # label AND HostConfig, so this suite needs the binary this job downloads.
       - name: spawn-codex session container boundary (#8518, #9979)
         run: bash defaults/scripts/tests/test-spawn-codex-session-exec.sh
+      # #10661: the stale-mount announcement and session lock need this
+      # checkout's build (--self-only), which this job downloads.
+      - name: spawn-codex stale session mount (#10661)
+        run: bash defaults/scripts/tests/test-spawn-codex-session-mount-stale.sh
       # Moved out of shell-suite-tests by #8191 slice 1: merge-pr.sh's
       # closing-reference analysis now delegates to `loom-daemon`, so this
       # suite's require-daemon-bin harness needs the binary this job downloads.
