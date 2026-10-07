@@ -3,8 +3,9 @@
 //!
 //! # What changes
 //!
-//! With `autonomous.eta.fleetRefresh.signoz` enabled and `historyPrimary` on
-//! (the default once SigNoz is enabled), each repo's pass first walks its
+//! With `autonomous.eta.fleetRefresh.signoz` enabled and `historyPrimary`
+//! opted in (default `false`, so turning SigNoz on never silently switches
+//! the fit's input source), each repo's pass first walks its
 //! SigNoz timeline ([`super::fleet_signoz_timeline_rows::walk`]) and builds
 //! a [`Timeline`] as knowable at the pass's listing instant `L`. Three
 //! outcomes ([`Load`]):

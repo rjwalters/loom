@@ -26,7 +26,7 @@
 //! | `reserveCalls` | `LOOM_ETA_FLEET_REFRESH_RESERVE` | `1500` |
 //! | `backfillDays` | `LOOM_ETA_FLEET_REFRESH_BACKFILL_DAYS` | `21` (min `fit::WINDOW_DAYS + 1`) |
 //! | `gapFillMaxCallsPerPass` | `LOOM_ETA_FLEET_REFRESH_GAP_FILL_MAX_CALLS` | `100`: forge gap-fill reads per repo per cycle with SigNoz history on (#10520) |
-//! | `signoz.historyPrimary` | `LOOM_ETA_FLEET_SIGNOZ_HISTORY_PRIMARY` | `true`: with `signoz.enabled`, SigNoz is the history source and the forge only gap-fills (#10520) |
+//! | `signoz.historyPrimary` | `LOOM_ETA_FLEET_SIGNOZ_HISTORY_PRIMARY` | `false` (opt-in): with `signoz.enabled`, SigNoz is the history source and the forge only gap-fills (#10520) |
 
 use super::Kind;
 use std::path::Path;
@@ -186,7 +186,8 @@ pub struct FleetSignozConfig {
     /// Pages per repo per cycle.
     pub max_pages: u32,
     /// With [`Self::enabled`], take fleet-refresh history from SigNoz first
-    /// and read the forge only to fill gaps (#10520).
+    /// and read the forge only to fill gaps (#10520). Off by default
+    /// (opt-in) so enabling SigNoz never silently switches the fit's input.
     pub history_primary: bool,
 }
 
@@ -199,7 +200,7 @@ impl Default for FleetSignozConfig {
             credential_file: None,
             page_size: DEFAULT_FLEET_SIGNOZ_PAGE_SIZE,
             max_pages: DEFAULT_FLEET_SIGNOZ_MAX_PAGES,
-            history_primary: true,
+            history_primary: false,
         }
     }
 }

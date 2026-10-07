@@ -101,19 +101,28 @@ fn fleet_refresh_is_on_by_default_with_the_pinned_budgets() {
 }
 
 #[test]
-fn signoz_history_is_primary_once_signoz_is_on_and_the_gap_fill_budget_is_configurable() {
+fn signoz_history_primary_is_opt_in_and_the_gap_fill_budget_is_configurable() {
     let c = resolve(&json!({}), no_env).fleet_refresh;
-    assert!(c.signoz.history_primary, "follows signoz.enabled by default");
+    assert!(!c.signoz.history_primary, "off by default (FLAGS-OFF)");
+    let c = resolve(
+        &json!({"autonomous": {"eta": {"fleetRefresh": {"signoz": {"enabled": true}}}}}),
+        no_env,
+    )
+    .fleet_refresh;
+    assert!(
+        !c.signoz.history_primary,
+        "enabling SigNoz alone does not switch the history source"
+    );
     let c = resolve(
         &json!({"autonomous": {"eta": {"fleetRefresh": {
             "gapFillMaxCallsPerPass": 7,
-            "signoz": {"historyPrimary": false}
+            "signoz": {"historyPrimary": true}
         }}}}),
         no_env,
     )
     .fleet_refresh;
     assert_eq!(c.gap_fill_max_calls_per_pass, 7);
-    assert!(!c.signoz.history_primary);
+    assert!(c.signoz.history_primary, "opt-in via config");
     let env = |k: &str| match k {
         "LOOM_ETA_FLEET_REFRESH_GAP_FILL_MAX_CALLS" => Some("3".to_string()),
         "LOOM_ETA_FLEET_SIGNOZ_HISTORY_PRIMARY" => Some("1".to_string()),
