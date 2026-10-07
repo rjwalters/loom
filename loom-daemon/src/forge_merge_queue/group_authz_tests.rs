@@ -253,6 +253,7 @@ fn facts_outage_while_others_pending_stays_pending() {
     assert_eq!(reads.get(), 0, "live facts are not read before others succeed");
     let c = group_check(&s, &g, Err("checks api 502".into()), &down);
     assert!(matches!(c, GroupConclusion::Pending(_)), "{c:?}");
+    assert_eq!(reads.get(), 0, "nor while others are unreadable");
     let ok = Ok(vec![(CI.to_string(), CheckState::Success)]);
     assert!(matches!(group_check(&s, &g, ok, &down), GroupConclusion::Failure(_)));
     assert!(reads.get() > 0);
