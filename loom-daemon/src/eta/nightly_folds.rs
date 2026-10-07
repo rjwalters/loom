@@ -186,7 +186,11 @@ pub fn load_inputs(root: &Path) -> Inputs {
     let pr_cases = std::fs::read_to_string(pr_history_path(root))
         .ok()
         .and_then(|text| backtest::parse_pr_records(&text).ok())
-        .map(|records| backtest::cases_from_pr_records(&records).0)
+        .map(|records| {
+            // v2 priority inputs (#10508) from the cached roster history.
+            let history = super::roster_history::load_for(root, Utc::now()).0;
+            backtest::cases_from_pr_records_with_roster(&records, history.as_deref()).0
+        })
         .unwrap_or_default();
     Inputs {
         envelopes,

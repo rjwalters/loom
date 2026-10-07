@@ -137,6 +137,7 @@ fn case(i: i64, stage: Stage, flags: Option<u8>, actual_sec: i64) -> ReplayCase 
         age_sec: 0,
         queue: Vec::new(),
         pr_flags: flags,
+        priority: None,
     }
 }
 

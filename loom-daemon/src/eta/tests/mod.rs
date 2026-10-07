@@ -3,6 +3,7 @@
 mod backtest;
 mod backtest_adaptation;
 mod backtest_pr;
+mod backtest_priority;
 mod backtest_subsets;
 mod backtest_union;
 mod censoring;

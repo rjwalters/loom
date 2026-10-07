@@ -174,6 +174,7 @@ fn one_case(t: chrono::DateTime<chrono::Utc>) -> ReplayCase {
     ReplayCase {
         queue: Vec::new(),
         pr_flags: None,
+        priority: None,
         subject: subject(),
         as_of: t,
         stage: Stage::MergeWait,

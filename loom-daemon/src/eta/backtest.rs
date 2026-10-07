@@ -66,8 +66,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub mod pr_cases;
 pub use pr_cases::{
-    cases_from_pr_history, cases_from_pr_records, parse_pr_records, pr_case_entries, PrCaseEntries,
-    PrCaseExclusion, PrCaseRecord, PrCaseSummary, RefusedEntry,
+    cases_from_pr_history, cases_from_pr_records, cases_from_pr_records_with_roster,
+    parse_pr_records, pr_case_entries, PrCaseEntries, PrCaseExclusion, PrCaseRecord, PrCaseSummary,
+    RefusedEntry,
 };
 
 /// Bucket for a record whose `repo` slug was unresolved (Issue #9442),
@@ -114,6 +115,15 @@ pub struct ReplayCase {
     /// ([`BacktestReport::by_subset`]); it is **not** fed to the estimator,
     /// so the replayed answer is unchanged.
     pub pr_flags: Option<u8>,
+    /// The `eta-fit/v2` priority inputs at `as_of` (#10508), built by the one
+    /// builder the fit and serving call
+    /// ([`super::priority_inputs::priority_inputs`]) from the batch's PR
+    /// timelines, when a source supplies them
+    /// ([`pr_cases::cases_from_pr_records_with_roster`]). `None` leaves the
+    /// replayed estimate's `features.priority` absent, as before. Fed to the
+    /// estimator (unlike [`Self::pr_flags`]) but read only by a heuristic over
+    /// an `eta-fit/v2` file: every other answer is unchanged.
+    pub priority: Option<super::fit::features_v2::PriorityInputs>,
 }
 
 /// Every finish/land replay case one `sweep.outcome` record's own phase
@@ -177,6 +187,7 @@ pub fn cases_from_record(
             age_sec: 0,
             queue: Vec::new(),
             pr_flags: None,
+            priority: None,
         });
         if landed {
             cases.push(ReplayCase {
@@ -191,6 +202,7 @@ pub fn cases_from_record(
                 age_sec: 0,
                 queue: Vec::new(),
                 pr_flags: None,
+                priority: None,
             });
         }
         if stage == Stage::Doctor {
@@ -261,6 +273,7 @@ pub fn cases_from_journal(entries: &[JournalEntry]) -> Vec<ReplayCase> {
                 age_sec: 0,
                 queue: Vec::new(),
                 pr_flags: None,
+                priority: None,
             });
         }
     }
@@ -469,7 +482,10 @@ fn case_input(case: &ReplayCase, loom: &Provenance) -> EstimateInput {
             rework_rounds: case.rework_rounds,
             episode_entered_at: None,
         }),
-        features: explanation::Features::default(),
+        features: explanation::Features {
+            priority: case.priority,
+            ..explanation::Features::default()
+        },
         features_omitted: Vec::new(),
         provenance: loom.clone(),
         dispatch: case.dispatch.clone(),

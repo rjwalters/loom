@@ -23,7 +23,8 @@ use serde::Deserialize;
 
 use loom_daemon::cmd_out::Query;
 use loom_daemon::eta::backtest::{
-    self, cases_from_pr_records, parse_pr_records, PrCaseRecord, PrCaseSummary, ReplayCase,
+    self, cases_from_pr_records_with_roster, parse_pr_records, PrCaseRecord, PrCaseSummary,
+    ReplayCase,
 };
 use loom_daemon::script_helpers::gh_query;
 
@@ -267,7 +268,10 @@ pub(crate) fn add_pr_cases(
         records.extend(fetched);
     }
 
-    let (pr_cases, summary) = cases_from_pr_records(&records);
+    // The `eta-fit/v2` priority inputs (#10508): the cached fleet roster
+    // history, or unknown (never today's `repos.yml`) when there is none.
+    let history = loom_daemon::eta::roster_history::load_for(root, chrono::Utc::now()).0;
+    let (pr_cases, summary) = cases_from_pr_records_with_roster(&records, history.as_deref());
     let (merged, dropped) = backtest::merge_case_sets(base, pr_cases);
     Ok((merged, Some(describe(&summary, dropped))))
 }
