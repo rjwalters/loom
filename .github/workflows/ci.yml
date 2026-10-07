@@ -2039,6 +2039,11 @@ jobs:
       # same reasoning as race-rescue just above.
       - name: worktree branch-conflict auto-recovery (ported in #8195 slice 7)
         run: bash defaults/scripts/tests/test-worktree-json-purity.sh
+      # #10203: `sweep-lease-renew.sh start` re-enters through
+      # `loom-daemon lease renewer sanitize-exec` so its detached loop holds no
+      # fd of the caller's; pins the binary like the suite above.
+      - name: lease renewer holds no caller fd (#10203)
+        run: bash defaults/scripts/tests/test-sweep-lease-renew-fd-hygiene.sh
       # #9083: the closed-unmerged arm of worktree.sh's branch-resolution
       # contract. #5657 already skips reuse of an origin/feature/issue-N
       # whose tip is a MERGED PR's head; this covers the strictly worse
