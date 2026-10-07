@@ -911,6 +911,7 @@ pub(super) async fn record(
     // #10372: per repo, each listed PR's linked issues and the open starred
     // issues (`None` when any star listing failed: unknown, not unstarred).
     let mut stars: Vec<RepoStars> = Vec::new();
+    let mut pr_link_rows: Vec<(String, Vec<(u32, Vec<u32>)>)> = Vec::new();
     let mut seen = BTreeSet::new();
     for root in &roots {
         let Some(slug) =
@@ -944,6 +945,7 @@ pub(super) async fn record(
             } else {
                 starred_issues(root).await
             };
+            pr_link_rows.push((slug.clone(), links.clone()));
             stars.push((slug.clone(), links, starred));
             repos.push((root.clone(), slug, pr_views(&listings), listed));
         }
@@ -1084,6 +1086,9 @@ pub(super) async fn record(
             state
                 .tracker
                 .on_star_context(slug, links, starred.as_deref(), listed_at);
+        }
+        for (slug, links) in &pr_link_rows {
+            state.tracker.on_pr_links(slug, links);
         }
         state.tracker.on_fleet_context(&fleet, events, listed_at);
     }

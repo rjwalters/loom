@@ -2543,6 +2543,13 @@ disabled (`autonomous.eta.enabled = false`, so there is no tracker) or no OTLP
 exporter. With ETA on, an anchor with zero rows is still sent, because it
 truthfully says "nothing in flight here".
 
+A row is keyed by issue. A listed PR whose body only says `Part of #N` (no closing
+keyword) is not a tracker item, so its row comes from the review roster and
+the pass's PR links instead: the first issue its body links, no `host` or
+`slot`, and `entered_at_lower_bound: true`. A tracker item for the same issue
+wins, then the lowest PR number. A PR linking no issue has no row and is in
+the census only.
+
 **Anchors and deltas.** The first pass of a daemon process sends a full
 **anchor** (`anchor: true`, every row), and so does any pass at which the last
 anchor is at least 3600 s old. Between anchors a pass sends a **delta**

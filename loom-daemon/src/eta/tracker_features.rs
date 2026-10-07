@@ -99,8 +99,8 @@ pub struct ListedPr {
 }
 
 #[derive(Debug, Clone)]
-struct FleetView {
-    roster: Vec<RosterEntry>,
+pub(super) struct FleetView {
+    pub(super) roster: Vec<RosterEntry>,
     /// The roster as a hold-aware model's training sees it (#10312): a
     /// tracked released `merge_wait` PR enters at its release. Captured with
     /// `roster`, from the tracker's state at the same observation.
@@ -175,7 +175,10 @@ impl PlanView {
 /// What the last pass observed.
 #[derive(Debug, Clone, Default)]
 pub(super) struct PassContext {
-    fleet: Option<FleetView>,
+    pub(super) fleet: Option<FleetView>,
+    /// Each listed PR's linked issues (closing keywords and `Part of`), per
+    /// repo, as the last pass read them (#10196).
+    pub(super) pr_links: BTreeMap<(String, u32), Vec<u32>>,
     pub(super) plan: Option<PlanView>,
     /// Each listed PR's star timeline as the passes observed it (#10333),
     /// carried from pass to pass; a PR that leaves the listings drops out.
