@@ -143,3 +143,121 @@ fn after_an_operator_start_clears_the_record_a_stopped_container_is_resumed_agai
     assert_eq!(pass(&mut lifecycle, &env, &host, &mut state, 120), vec![Outcome::Resumed]);
     let _ = ws_with;
 }
+
+// ---- round 4: stopping a RUNNING container needs a positive, current finding
+
+/// alice runs mounting only `a`; a record from an earlier removal (for the
+/// then-firewalled `walled`) is still on disk.
+fn running_beside_a_leftover_record() -> (Env, tempfile::TempDir, PathBuf, SessionLifecycle<Fake>) {
+    let (env, ws_dir, ws, lifecycle) = removed_for_a_firewalled_repo();
+    let fake = lifecycle.runner().clone();
+    let container = container_name("alice");
+    fake.mounts
+        .lock()
+        .unwrap()
+        .insert(container, vec![ws.join("a")]);
+    session_drift_removal::record(
+        &profile(&env, "alice"),
+        &DriftRemoval {
+            schema_version: 1,
+            workspace: ws.clone(),
+            denied: vec![ws.join("walled")],
+            reason: "firewall".into(),
+            removed_at_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    (env, ws_dir, ws, lifecycle)
+}
+
+fn left_running(fake: &Fake, out: &[Outcome]) {
+    assert_eq!(fake.mutations(), Vec::<String>::new(), "{out:?}");
+    assert!(fake.containers.lock().unwrap()[&container_name("alice")].running, "{out:?}");
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, Outcome::DriftRemoved { .. })),
+        "{out:?}"
+    );
+}
+
+/// The Judge's case: the denial has since been lifted, but the roster cannot
+/// be read, so nothing proves the record is over. Unknown is no reason to
+/// stop a running container.
+#[test]
+#[serial]
+fn a_leftover_record_never_stops_a_running_container_when_the_roster_is_unreadable() {
+    let (env, _ws_dir, _ws, mut lifecycle) = running_beside_a_leftover_record();
+    let fake = lifecycle.runner().clone();
+    fake.firewalled.lock().unwrap().clear();
+    *fake.roster_unreadable.lock().unwrap() = true;
+    let mut state = ReconcileState::default();
+    let mut out = Vec::new();
+    for tick in 0..4 {
+        out.extend(pass(&mut lifecycle, &env, &host, &mut state, interval(tick)));
+    }
+    left_running(&fake, &out);
+    assert!(session_drift_removal::read(&[profile(&env, "alice")]).is_some(), "kept");
+}
+
+#[test]
+#[serial]
+fn a_leftover_record_never_stops_a_running_container_when_the_registry_is_unreadable() {
+    let (env, _ws_dir, _ws, mut lifecycle) = running_beside_a_leftover_record();
+    let fake = lifecycle.runner().clone();
+    fake.firewalled.lock().unwrap().clear();
+    *fake.registry_unreadable.lock().unwrap() = true;
+    let mut state = ReconcileState::default();
+    let mut out = Vec::new();
+    for tick in 0..4 {
+        out.extend(pass(&mut lifecycle, &env, &host, &mut state, interval(tick)));
+    }
+    left_running(&fake, &out);
+}
+
+/// Inputs readable, the recorded denial still stands, but this container
+/// mounts nothing denied: it is left running (the record stays, so it still
+/// blocks a recreate) and nothing recreates it either.
+#[test]
+#[serial]
+fn a_running_container_with_no_denied_mount_is_left_running_under_a_standing_record() {
+    let (env, _ws_dir, _ws, mut lifecycle) = running_beside_a_leftover_record();
+    let fake = lifecycle.runner().clone();
+    let mut state = ReconcileState::default();
+    let mut out = Vec::new();
+    for tick in 0..4 {
+        out.extend(pass(&mut lifecycle, &env, &host, &mut state, interval(tick)));
+    }
+    left_running(&fake, &out);
+    assert!(out.iter().all(|o| *o == Outcome::Running), "{out:?}");
+    assert!(session_drift_removal::read(&[profile(&env, "alice")]).is_some());
+}
+
+/// The outcome names only mounts the container actually has.
+#[test]
+#[serial]
+fn a_removed_running_container_reports_only_its_own_denied_mounts() {
+    let (env, _ws_dir, ws, mut lifecycle) = removed_for_a_firewalled_repo();
+    let fake = lifecycle.runner().clone();
+    session_drift_removal::record(
+        &profile(&env, "alice"),
+        &DriftRemoval {
+            schema_version: 1,
+            workspace: ws.clone(),
+            denied: vec![ws.join("walled"), ws.join("elsewhere")],
+            reason: "firewall".into(),
+            removed_at_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    let mut state = ReconcileState::default();
+    assert_eq!(
+        pass(&mut lifecycle, &env, &host, &mut state, 0),
+        vec![Outcome::DriftRemoved {
+            drift: MountDrift {
+                missing: Vec::new(),
+                extra: vec![ws.join("walled")],
+            },
+        }]
+    );
+    let _ = fake;
+}

@@ -781,8 +781,10 @@ fn reconcile_one<R: ContainerRunner>(
     }
     // A recorded fail-closed removal is finished, never undone: a container
     // still present under it is removed, never started (#10364).
-    if inspect.is_some() {
-        if let Some(outcome) = drift::finish_recorded_removal(lifecycle, account, ctx, mem)? {
+    if let Some(inspect) = inspect {
+        if let Some(outcome) =
+            drift::finish_recorded_removal(lifecycle, account, inspect, ctx, mem)?
+        {
             return Ok(outcome);
         }
     }

@@ -9227,9 +9227,16 @@ The drift path follows four safety rules:
    and the path, and `.session-drift-removed.json` is written in the account's
    profile directory first (if that write fails, nothing is removed). While
    the record stands the pass never `docker start`s or recreates the
-   container, across daemon restarts. If the container is still present (the
-   `docker rm` failed after the `docker stop`, or something outside the pass
-   started it again), the pass finishes the removal: when idle, under the
+   container, across daemon restarts. If the container is still present and
+   **stopped** (the `docker rm` failed after the `docker stop`), the pass
+   finishes the removal. If it is **running** (something outside the pass
+   started it), the pass stops it only on a positive, current finding: its
+   own mounts include a path the loaded roster denies. If the registry or
+   roster cannot be read it is left running, with a WARN; if none of its
+   mounts is denied it is left running too, the record is kept (it still
+   blocks any recreate) and a WARN on a backoff cadence says so, so an
+   operator can clear it with `accounts session start`. A stale record alone
+   never stops a running container. A removal runs when idle, under the
    dispatch lock, with a WARN on every attempt and the per-account backoff
    while it keeps failing. A stopped container whose own mounts include a
    positively denied path is never resumed: it is recorded and removed the
