@@ -1755,6 +1755,32 @@ pub struct ManagedRepoEntry {
     /// workspace (the empty-registry cwd fallback) and on older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u32>,
+    /// This host's `loom:blocked` release-pass tallies for the repo since the
+    /// daemon started (#10763). Absent before the pass's first tick for the
+    /// repo on this host and on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_blocked_release: Option<StaleBlockedReleaseCounters>,
+}
+
+/// One repo's `loom:blocked` release-pass tallies on one host (#10763),
+/// carried on [`ManagedRepoEntry`] so a fleet where the pass never acts is
+/// diagnosable without host logs: `ticks` counts every per-repo tick by
+/// outcome (`ran`, `not_due`, `skipped_shard`, `denied_scope`, `not_served`,
+/// `rate_limited`, `skipped_off`, `dry_run`, `archived`, `enumerate_error`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaleBlockedReleaseCounters {
+    /// Artifacts released (applied writes only).
+    #[serde(default)]
+    pub released: u64,
+    /// Artifacts re-parked (applied writes only).
+    #[serde(default)]
+    pub reparked: u64,
+    /// The most recent tick's outcome key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<String>,
+    /// Ticks per outcome key.
+    #[serde(default)]
+    pub ticks: std::collections::BTreeMap<String, u64>,
 }
 
 /// One entry of a [`SessionSummaryRecord`]'s tool-call histogram: how many

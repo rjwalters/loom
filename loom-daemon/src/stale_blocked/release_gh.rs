@@ -4,22 +4,28 @@
 //!
 //! # The tick
 //!
-//! Called from the work finder's per-root listing, beside
-//! [`crate::intake_reconcile::maybe_run`] (#10041), so it runs only after the
-//! rate-limit breaker has passed. Fail-soft: it never fails the tick.
+//! Driven by its own daemon task, [`super::release_task`] (#10763), once per
+//! registered workspace per minute — no longer from the work finder's
+//! per-root listing, which never ran on a host whose work finder is off even
+//! when that host owned the workspace's role shard. Fail-soft: it never fails
+//! the task.
 //!
-//! Gates, in order — each one that refuses leaves the forge untouched:
+//! Gates, in order — each one that refuses leaves the forge untouched and
+//! records its [`Outcome`](super::release_outcome::Outcome) (#10763):
 //!
 //! 1. `LOOM_RELEASE_STALE_BLOCKED` — **default on**, like `intake_reconcile`
 //!    (#10041): `0`/`false`/`off`/`no` disables, `dry-run` plans and logs
 //!    without writing. On by default because `label-state-machine.md` already
 //!    promises `loom:blocked` clears once its declared blocker resolves, and
 //!    the rule here is stricter than Guide's.
-//! 2. Cadence: `LOOM_RELEASE_STALE_BLOCKED_INTERVAL_SECS` (default 300) per
+//! 2. Served: the work finder or the role runner runs for the workspace on
+//!    this host, and the rate-limit breaker is not suppressing forge calls
+//!    (both checked by the task).
+//! 3. Cadence: `LOOM_RELEASE_STALE_BLOCKED_INTERVAL_SECS` (default 300) per
 //!    workspace.
-//! 3. Shard ownership: [`crate::role_shard::decide`] — one host of a sharded
+//! 4. Shard ownership: [`crate::role_shard::decide`] — one host of a sharded
 //!    fleet acts on a given workspace.
-//! 4. Forge-write scope (#9548): [`crate::write_scope::gate_root_with`].
+//! 5. Forge-write scope (#9548): [`crate::write_scope::gate_root_with`].
 //!
 //! `LOOM_RELEASE_STALE_BLOCKED_MAX_WRITES` (default 20) caps the artifacts
 //! acted on per pass. One `log::info!` line per pass carries every count.
@@ -34,6 +40,7 @@ use serde_json::Value;
 use super::batch::GhStaleBlockedForge;
 use super::budget::Floor;
 use super::release::{run, Config, ReleaseForge, Report};
+use super::release_outcome::{classify_gate, classify_report, record};
 use crate::comment_trust::TrustPolicy;
 use crate::forge_call_stats::ops;
 use crate::forge_etag_store as store;
@@ -120,19 +127,30 @@ fn due(root: &Path, interval_secs: u64) -> bool {
     true
 }
 
-/// The daemon tick: run the pass for `root` if enabled, due, owned and in
-/// write scope. Never fails; returns the report when a pass ran.
+/// The switch as the environment sets it now.
+#[must_use]
+pub fn mode() -> Mode {
+    Mode::parse(std::env::var(ENABLE_ENV).ok().as_deref())
+}
+
+/// The per-root tick, after [`super::release_task`]'s served and rate-limit
+/// gates: run the pass for `root` if enabled, due, owned and in write scope.
+/// Never fails; returns the report when a pass ran. Every call records exactly
+/// one [`super::release_outcome::Outcome`] (#10763).
 pub fn maybe_run(gh_bin: &Path, root: &Path) -> Option<Report> {
-    // Other modules' unit tests drive GhWorkSource with a fake `gh`; the pass
-    // is exercised directly through `release::run` and `gated` instead.
+    // The pass is exercised directly through `release::run` and `gated`.
     if cfg!(test) {
         return None;
     }
-    let mode = Mode::parse(std::env::var(ENABLE_ENV).ok().as_deref());
-    if mode == Mode::Off || !due(root, env_num(INTERVAL_ENV, DEFAULT_INTERVAL_SECS)) {
+    let mode = mode();
+    // Each gate is asked only when every earlier one passed: `Off` must not
+    // burn the cadence window, and a host not due need not resolve its shard.
+    let due_now = mode != Mode::Off && due(root, env_num(INTERVAL_ENV, DEFAULT_INTERVAL_SECS));
+    let owned = due_now && crate::role_shard::decide(root).admits_role_tick();
+    if let Some(outcome) = classify_gate(mode, due_now, owned) {
+        record(root, outcome, None);
         return None;
     }
-    let owned = crate::role_shard::decide(root).admits_role_tick();
     let report = gated(mode, owned, |dry_run| {
         if !dry_run && !crate::write_scope::gate_root_with(root, gh_bin, "stale-blocked release") {
             return Report {
@@ -150,6 +168,7 @@ pub fn maybe_run(gh_bin: &Path, root: &Path) -> Option<Report> {
             },
         )
     })?;
+    record(root, classify_report(mode == Mode::DryRun, &report), Some(&report));
     log::info!("stale_blocked_release: {} — {} (#10556)", root.display(), report.summary());
     Some(report)
 }
@@ -160,14 +179,51 @@ pub fn run_for_root(root: &Path, repo: Option<&str>, cfg: &Config) -> Report {
     let mut gather = GhStaleBlockedForge::new(root, repo);
     let mut park = GhForge::new(root.to_path_buf(), repo.map(str::to_string));
     let mut extra = GhReleaseForge::new(root, repo);
-    run(
+    let mut report = run(
         &mut gather,
         &mut park,
         &mut extra,
         &FleetLogins::for_root(root),
         &TrustPolicy::for_root(root),
         cfg,
-    )
+    );
+    if let Some(why) = extra.zero_row_anomaly(&report) {
+        report.enumerate_error = Some(why);
+    }
+    report
+}
+
+/// Minimum seconds between two zero-row cross-checks of one repo.
+pub const ANOMALY_CHECK_SECS: u64 = 3600;
+
+static ANOMALY_CHECKED: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// True (and records the check) when `slug` may be cross-checked at `now`.
+fn anomaly_check_due(slug: &str, now: Instant) -> bool {
+    let mut map = ANOMALY_CHECKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if map
+        .get(slug)
+        .is_some_and(|prev| now.duration_since(*prev).as_secs() < ANOMALY_CHECK_SECS)
+    {
+        return false;
+    }
+    map.insert(slug.to_string(), now);
+    true
+}
+
+/// The anomaly text when the cross-check found open rows the listing missed.
+#[must_use]
+pub fn zero_row_message(cross_check_rows: usize, slug: &str) -> Option<String> {
+    (cross_check_rows > 0).then(|| {
+        format!(
+            "anomaly: loom:blocked listing returned 0 rows but an uncached read of {slug} \
+             found open loom:blocked issues (stale ETag cache entry, wrong slug or token \
+             scope?) (#10763)"
+        )
+    })
 }
 
 /// [`ReleaseForge`] over `gh`: REST + ETag reads through
@@ -200,6 +256,29 @@ impl GhReleaseForge {
             slug,
             write_ok: None,
         }
+    }
+
+    /// #10763: a clean zero-row `loom:blocked` listing is cross-checked
+    /// against one uncached REST read (bypassing the ETag cache and the
+    /// shared listing path), at most once per [`ANOMALY_CHECK_SECS`] per
+    /// repo. Open `loom:blocked` rows the listing missed make the pass an
+    /// error rather than a silent empty report.
+    fn zero_row_anomaly(&self, report: &Report) -> Option<String> {
+        if report.examined != 0 || report.archived || report.enumerate_error.is_some() {
+            return None;
+        }
+        if !anomaly_check_due(&self.slug, Instant::now()) {
+            return None;
+        }
+        let url = format!("repos/{}/issues?labels=loom:blocked&state=open&per_page=1", self.slug);
+        let out = std::process::Command::new(&self.gh_bin)
+            .current_dir(&self.root)
+            .args(["api", &url])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        let rows: Vec<Value> = serde_json::from_slice(&out.stdout).ok()?;
+        zero_row_message(rows.len(), &self.slug)
     }
 
     fn get(&self, op: crate::forge_call_stats::ForgeOp, url: &str) -> Result<String, String> {
@@ -288,5 +367,25 @@ impl ReleaseForge for GhReleaseForge {
             body,
         )
         .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod anomaly_tests {
+    use super::*;
+
+    #[test]
+    fn zero_row_listing_with_open_rows_is_an_anomaly() {
+        assert!(zero_row_message(1, "o/r").unwrap().contains("anomaly"));
+        assert!(zero_row_message(0, "o/r").is_none());
+    }
+
+    #[test]
+    fn anomaly_check_is_rate_limited_per_repo() {
+        let now = Instant::now();
+        assert!(anomaly_check_due("anomaly-test/a", now));
+        assert!(!anomaly_check_due("anomaly-test/a", now));
+        assert!(anomaly_check_due("anomaly-test/b", now));
     }
 }

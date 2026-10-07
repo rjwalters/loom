@@ -66,6 +66,8 @@ pub mod budget;
 pub mod notify;
 pub mod release;
 pub mod release_gh;
+pub mod release_outcome;
+pub mod release_task;
 
 /// Which kind of artifact a finding is about.
 ///

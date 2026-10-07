@@ -84,9 +84,8 @@ impl WorkSource for GhWorkSource {
         // gives every unlabeled issue `loom:triage` so Curator has one queue.
         if let Some(root) = self.cwd.as_deref() {
             crate::intake_reconcile::maybe_run(&self.gh_bin, root);
-            // Deterministic `loom:blocked` release (#10556): opt-in, cadence-
-            // and shard-gated, write-scoped, fail-soft.
-            crate::stale_blocked::release_gh::maybe_run(&self.gh_bin, root);
+            // The `loom:blocked` release pass (#10556) has its own task since
+            // #10763: `crate::stale_blocked::release_task`.
         }
         // ETag-cached REST listing (#4428), replacing the per-tick GraphQL
         // `gh issue list`.

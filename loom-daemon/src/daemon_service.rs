@@ -1673,7 +1673,8 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // (`autonomous.ciTelemetry.enabled`), no task and zero side effects when
     // off, feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns`
     // is on; and the intake reconcile singleton (W7), a config read per tick
-    // unless `fleet.intakeReconcile.singleton` makes this host the producer.
+    // unless `fleet.intakeReconcile.singleton` makes this host the producer;
+    // and the shard-owned `loom:blocked` release task (#10763).
     let _singletons = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone(), &event_bus);
 
     // Codex session-container reconcile pass (#10453); LOOM_SESSION_RECONCILE=0 opts out.

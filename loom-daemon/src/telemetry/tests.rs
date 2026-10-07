@@ -159,11 +159,13 @@ fn host_health() -> TelemetryRecord {
                 slug: "rjwalters/loom".to_string(),
                 visibility: RepoVisibility::Public,
                 priority: Some(0),
+                stale_blocked_release: None,
             },
             ManagedRepoEntry {
                 slug: "2AMLogic/gf180-pll".to_string(),
                 visibility: RepoVisibility::Private,
                 priority: None,
+                stale_blocked_release: None,
             },
         ],
         roles: RoleTickHealth {
@@ -898,6 +900,7 @@ fn managed_repo_entry_priority_is_on_the_wire_only_when_known() {
         slug: "rjwalters/loom".to_string(),
         visibility: RepoVisibility::Public,
         priority: Some(0),
+        stale_blocked_release: None,
     };
     let wire = serde_json::to_value(&known).unwrap();
     assert_eq!(wire["priority"], 0);
@@ -907,6 +910,37 @@ fn managed_repo_entry_priority_is_on_the_wire_only_when_known() {
     };
     let wire = serde_json::to_value(&unknown).unwrap();
     assert!(wire.get("priority").is_none(), "{wire}");
+}
+
+#[test]
+fn managed_repo_entry_carries_release_counters_only_once_ticked() {
+    // #10763: the release pass's per-repo tallies ride `managed_repos`, and
+    // are omitted (never a fabricated zero) before the pass ticked the repo.
+    let mut entry = ManagedRepoEntry {
+        slug: "2AMLogic/loom-ui".to_string(),
+        visibility: RepoVisibility::Private,
+        priority: None,
+        stale_blocked_release: None,
+    };
+    let wire = serde_json::to_value(&entry).unwrap();
+    assert!(wire.get("stale_blocked_release").is_none(), "{wire}");
+    entry.stale_blocked_release = Some(StaleBlockedReleaseCounters {
+        released: 3,
+        reparked: 2,
+        last_outcome: Some("ran".to_string()),
+        ticks: std::collections::BTreeMap::from([("ran".to_string(), 1)]),
+    });
+    let wire = serde_json::to_value(&entry).unwrap();
+    assert_eq!(wire["stale_blocked_release"]["released"], 3);
+    assert_eq!(wire["stale_blocked_release"]["reparked"], 2);
+    assert_eq!(wire["stale_blocked_release"]["ticks"]["ran"], 1);
+    let back: ManagedRepoEntry = serde_json::from_value(wire).unwrap();
+    assert_eq!(back, entry);
+    // A pre-#10763 entry still decodes.
+    let old: ManagedRepoEntry =
+        serde_json::from_value(serde_json::json!({"slug": "o/r", "visibility": "private"}))
+            .unwrap();
+    assert!(old.stale_blocked_release.is_none());
 }
 
 // ------------------------------------------------------------------
