@@ -274,7 +274,7 @@ fn the_calibrating_heuristic_is_folded_calibrated_not_as_its_fallback() {
         "calibration evidence is itself point-in-time"
     );
 
-    let lark = registry
+    let plover = registry
         .get(LAND_EVEN_LARK)
         .expect("even-lark is registered");
     // The day's cohort: here, the cases that resolved on it.
@@ -284,8 +284,14 @@ fn the_calibrating_heuristic_is_folded_calibrated_not_as_its_fallback() {
         .cloned()
         .collect();
     let pinball = |h: &StageSamples| {
-        own_stats(&backtest::replay_scored(lark, h, &day_cases, Filter::default(), &provenance()))
-            .pinball4
+        own_stats(&backtest::replay_scored(
+            plover,
+            h,
+            &day_cases,
+            Filter::default(),
+            &provenance(),
+        ))
+        .pinball4
     };
     let (calibrated, fallback) = (pinball(&cli), pinball(&uncalibrated));
     assert_ne!(calibrated, fallback, "the fixture makes calibration matter");
@@ -549,9 +555,7 @@ fn walk_forward_gate(
 /// the whole window.
 #[test]
 fn the_summary_scores_each_case_with_its_prediction_days_fit() {
-    // `-b` is the registered fitted heuristic (twin-otter itself is retired,
-    // #10528): its PR stages are twin-otter's evaluation over the dated fit.
-    use crate::eta::heuristics::LAND_TWIN_OTTER_B;
+    use crate::eta::heuristics::LAND_TWIN_OTTER;
     let inputs = inputs();
     let days = prediction_days(&inputs);
     assert!(days.len() >= 4, "the fixture spans several prediction days");
@@ -580,12 +584,12 @@ fn the_summary_scores_each_case_with_its_prediction_days_fit() {
     let s = records
         .summaries
         .iter()
-        .find(|s| s.heuristic == LAND_TWIN_OTTER_B)
-        .expect("a twin-otter-b summary");
+        .find(|s| s.heuristic == LAND_TWIN_OTTER)
+        .expect("a twin-otter summary");
 
     let walked =
-        walk_forward_gate(&inputs, day, vec![a.clone(), b], Some(days[0]), LAND_TWIN_OTTER_B);
-    let only_a = walk_forward_gate(&inputs, day, vec![a], Some(days[0]), LAND_TWIN_OTTER_B);
+        walk_forward_gate(&inputs, day, vec![a.clone(), b], Some(days[0]), LAND_TWIN_OTTER);
+    let only_a = walk_forward_gate(&inputs, day, vec![a], Some(days[0]), LAND_TWIN_OTTER);
     assert_ne!(walked.detail, only_a.detail, "the two fits are distinguishable");
     assert_eq!(s.gate_detail, walked.detail);
     assert_eq!(
@@ -606,9 +610,7 @@ fn the_summary_scores_each_case_with_its_prediction_days_fit() {
 /// `no_model` refusal; with no file at all nothing is left out.
 #[test]
 fn cases_predicted_before_every_retained_fit_are_left_out_and_counted() {
-    // `-b` is the registered fitted heuristic (twin-otter itself is retired,
-    // #10528): its PR stages are twin-otter's evaluation over the dated fit.
-    use crate::eta::heuristics::LAND_TWIN_OTTER_B;
+    use crate::eta::heuristics::LAND_TWIN_OTTER;
     let inputs = inputs();
     let days = prediction_days(&inputs);
     let from = days[days.len() / 2];
@@ -623,7 +625,7 @@ fn cases_predicted_before_every_retained_fit_are_left_out_and_counted() {
         .filter(|c| c.as_of.date_naive() < from)
         .count();
     assert!(before_fit > 0, "the fixture has cases before the fit");
-    let walked = walk_forward_gate(&inputs, day, vec![only], Some(from), LAND_TWIN_OTTER_B);
+    let walked = walk_forward_gate(&inputs, day, vec![only], Some(from), LAND_TWIN_OTTER);
     for s in &records.summaries {
         assert_eq!(s.fitted_from.as_deref(), Some(from.format("%Y-%m-%d").to_string().as_str()));
         assert_eq!(s.cases_before_fit, before_fit as u64);
@@ -631,7 +633,7 @@ fn cases_predicted_before_every_retained_fit_are_left_out_and_counted() {
     let s = records
         .summaries
         .iter()
-        .find(|s| s.heuristic == LAND_TWIN_OTTER_B)
+        .find(|s| s.heuristic == LAND_TWIN_OTTER)
         .unwrap();
     assert_eq!(s.gate_detail, walked.detail);
 
