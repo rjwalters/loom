@@ -266,7 +266,7 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: DrainTrigger>(
                     ""
                 }
             );
-            let outcome = probe.fetch_artifact(low_priority);
+            let outcome = probe.fetch_artifact(&tag, low_priority);
             let info = match &artifact {
                 ArtifactResolution::Resolved(info) => info.clone(),
                 // Unreachable: a `FetchArtifact` decision is only ever
