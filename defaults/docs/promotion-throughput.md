@@ -129,7 +129,9 @@ fits:
 |---|---|
 | The gap is a product-level call | File a ranked decision |
 | No trusted `<!-- champion:revision-exhausted -->` comment on the issue | One final Curator round, carrying that marker |
-| Otherwise | File a ranked decision |
+| The final round failed and an independently identified preference or authority question exists | File a ranked decision on that question |
+| The final round failed and every remaining finding is factual | One disposition round (`<!-- champion:revision-disposition -->`): Curator closes, splits or files a decision, not another edit |
+| Otherwise | Stand down; the silent-skip ladder holds the issue |
 
 With the default of 2:
 
@@ -138,9 +140,9 @@ With the default of 2:
 | 1st | 0 | Curator round 1 |
 | 2nd (on the revised body) | 1 | Curator round 2 |
 | 3rd | 2 | Final Curator round (marker), or a decision if the gap is product-level |
-| 4th | 3 | Ranked decision. The marker is already on the issue |
+| 4th | 3 | Ranked decision if a preference or authority question is named; otherwise one disposition round for factual findings. The final-round marker is already on the issue |
 
-**At most three Curator rounds, then one well-formed decision.** The marker
+**At most three Curator rounds, then one terminal step: a well-formed decision or a Curator disposition.** The marker
 stays on the issue, so a final round is never granted twice. If Curator
 removes the label without editing the body, or the verdict predates this
 loop, the existing silent-skip ladder (#4967) reaches the same bound.
@@ -155,10 +157,16 @@ Champion never applies a bare operator hold. There are two cases:
 - **The gap is product-level from the start.** For example, whether the work
   is wanted at all, or a choice between two legitimate directions that facts
   cannot settle.
-- **The final round came back and still fails.** Champion and Curator have
-  not converged in three rounds. Keeping, reshaping or dropping the issue is
-  then the product owner's call. The usual options are revise to a named
-  scope, close as not planned, or accept as filed.
+- **The final round came back and still fails on a preference or authority
+  question.** The question must be identified independently of the failed
+  rounds, by the falsifiability test in `label-state-machine.md`. The usual
+  options are revise to a named scope, close as not planned, or accept as
+  filed.
+
+Exhausted rounds alone never make a factual finding a human call. If every
+remaining finding is factual (an incorrect path, a missing registry audit),
+the issue gets one disposition round, in which Curator must close, split or
+file a decision. It does not get another edit.
 
 `apply` rewrites the body. Champion therefore stamps the post-apply body hash
 as the verdict marker in its escalation comment. If the operator un-parks the

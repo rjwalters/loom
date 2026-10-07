@@ -219,6 +219,14 @@ else
         "the routing note follows **Recommended actions, outside the findings list"
 fi
 assert_contains "$STEP4" "<!-- champion:revision-exhausted -->" "the bound grants one final Curator round, keyed on a marker"
+assert_contains "$STEP4" "<!-- champion:revision-disposition -->" \
+    "exhausted rounds with only factual findings get an agent-owned disposition round"
+assert_contains "$STEP4" "every remaining finding is factual" \
+    "the exhausted-round row distinguishes factual findings from a preference call"
+assert_contains "$STEP4" "independently identified preference or authority question" \
+    "operator routing after exhausted rounds requires a named preference/authority question"
+assert_doc_contains "$THROUGHPUT_DOC" "Exhausted rounds alone never make a factual finding a human call" \
+    "the doc keeps factual exhausted rounds with agents"
 assert_contains "$STEP4" "loom-daemon operator-decision apply" "an escalation is filed as a ranked decision"
 assert_contains "$STEP4" "--also-label loom:operator-only" "the decision keeps the operator-only skip"
 assert_not_contains "$STEP4" '--add-label "loom:operator-only' "Step 4 never hand-applies loom:operator-only"

@@ -736,8 +736,9 @@ verdict, routing the issue to Curator instead of waiting for someone to edit
 it. Champion's discovery skips it. Curator revises the body (a dated
 `## Revision` section) and removes it, and the new body hash brings Champion
 back. After at most two rounds plus one final round, Champion files a ranked
-decision with `operator-decision apply`, never a bare `loom:operator-only`
-hold. Contract and bound: [`promotion-throughput.md`](promotion-throughput.md).
+decision with `operator-decision apply` when a preference or authority
+question is named (never a bare `loom:operator-only` hold); factual findings
+get one Curator disposition round instead. Contract and bound: [`promotion-throughput.md`](promotion-throughput.md).
 
 ## `loom:needs-capability` — a narrower claim than `loom:operator-only` (#5817)
 

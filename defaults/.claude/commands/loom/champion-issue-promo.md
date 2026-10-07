@@ -1362,9 +1362,11 @@ Implemented per #7657.]
 |---|---|
 | The gap is a product-level call: whether the work is wanted, or a choice between legitimate directions that no fact settles (#10001) | File a ranked decision (below) |
 | No trusted `<!-- champion:revision-exhausted -->` comment on this issue yet | Final Curator round: post the NEEDS REVISION template below with that marker on the line after `$VERDICT_MARKER`, adding `loom:needs-revision` as usual |
-| Otherwise (the final round came back and still fails) | File a ranked decision: three rounds did not converge, so keep / reshape / drop is the product owner's call |
+| The final round came back and still fails, and you can name an independently identified preference or authority question (the axis two well-informed people would still disagree on, shown to be a preference, not a fact) | File a ranked decision on that question |
+| The final round came back and still fails, every remaining finding is factual (a wrong path, a missing registry audit, an unverifiable citation), and no trusted `<!-- champion:revision-disposition -->` comment exists yet | Disposition round: post the NEEDS REVISION template below with that marker on the line after `$VERDICT_MARKER`, adding `loom:needs-revision`, and say that Curator must end in a terminal disposition (close, split, or decision), not another edit |
+| Otherwise (factual findings, disposition round already granted) | Stand down: no label change, no operator routing. The silent-skip ladder (#4967) holds the issue; exhausted rounds alone never establish a human-only question |
 
-Never apply a bare `loom:operator-only` hold here. **Filing the decision:** write 2-4 ranked options from the recurring findings, each with a why (typically revise to a named scope / close as not planned / accept as filed; `.loom/docs/operator-decision.md`), then:
+Exhausted rounds are not evidence of a preference call: three failed edits to an incorrect path are still a factual defect, owned by agents. Never apply a bare `loom:operator-only` hold here. **Filing the decision:** write 2-4 ranked options from the recurring findings, each with a why (typically revise to a named scope / close as not planned / accept as filed; `.loom/docs/operator-decision.md`), then:
 
 ```bash
 ESCALATE_MARKER="<!-- champion:proposal-escalated -->"

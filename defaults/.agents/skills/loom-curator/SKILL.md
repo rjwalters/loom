@@ -1812,8 +1812,10 @@ REVISION` comment: its first bullet list is the findings. Then do one of these:
   remove the label.
 
 A routing comment carrying `<!-- champion:revision-exhausted -->` is the
-**final round**: a further failure goes to the operator, so prefer a split, a
-close or a decision to a marginal edit. Loop and bound:
+**final round**: prefer a split, a close or a decision to a marginal edit. A
+failure on a preference or authority question goes to the operator; a factual
+one gets a `<!-- champion:revision-disposition -->` round, where you must close,
+split or file a decision, never edit again. Loop and bound:
 `.loom/docs/promotion-throughput.md`.
 
 ## Checking Operator-Only Premises (#6849)
