@@ -433,6 +433,7 @@ fn daemon_write_paths_are_scoped() {
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
+        ("eta/retire_filing.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
         ("stale_blocked/release_gh.rs", Gated),
         (
@@ -495,7 +496,6 @@ fn daemon_write_paths_are_scoped() {
             ),
         ),
         ("cli/forge_action.rs", Gated),
-        ("cli/eta_retire_cmd.rs", Gated),
         ("role_runner/launch.rs", Gated),
         ("operator_decision/cli.rs", Gated),
         (
