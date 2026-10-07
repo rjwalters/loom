@@ -163,6 +163,12 @@ first build, the whole release target matrix minus signing, every
 parallelism 1 and 8 and on macOS/bash 3.2, `nextest` three times over for
 flakes, Rust beta, and the Docker smokes without their path filter.
 
+The full **default-feature** suite runs only here (#10823): `ci.yml`'s
+`Rust Unit Tests` legs run the whole workspace with `--features
+loom-daemon/otlp` (the shipped configuration), and the PR gate adds only a
+targeted `--lib` step for the `#[cfg(not(feature = "otlp"))]` tests, whose
+names it derives from source.
+
 **A red daily run nobody reads is worse than none**, because it trains people
 to ignore red. So the `report` job is part of the mechanism, not a nicety:
 

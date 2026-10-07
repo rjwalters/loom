@@ -51,7 +51,7 @@ impl AutoUpdateProbe for ScriptedProbe {
         }
         self.artifact.clone()
     }
-    fn fetch_artifact(&mut self, _low_priority: bool) -> RebuildOutcome {
+    fn fetch_artifact(&mut self, _tag: &str, _low_priority: bool) -> RebuildOutcome {
         self.fetch.clone()
     }
     fn check(&self) -> UpdateCheck {
