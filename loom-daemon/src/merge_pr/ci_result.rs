@@ -126,6 +126,14 @@ pub fn has_ci_workflow(workflows: &Value) -> Result<bool, String> {
     {
         return Ok(true);
     }
+    // A record without a string `name` could be the `CI` workflow, so the list
+    // cannot establish its absence.
+    if let Some(i) = arr
+        .iter()
+        .position(|w| w.get("name").and_then(Value::as_str).is_none())
+    {
+        return Err(format!("workflow record {i} has no string `name`"));
+    }
     match workflows.get("total_count").and_then(Value::as_u64) {
         Some(n) if n as usize <= arr.len() => Ok(false),
         Some(n) => Err(format!("workflow list truncated ({} of {n} read)", arr.len())),

@@ -133,6 +133,26 @@ fn no_ci_workflow_is_a_separate_policy_from_cannot_inspect() {
     // Unexpected payload shape is unreadable, never no-CI.
     let v = assess("1", "abc", &empty, || Ok(json!({"message": "Not Found"})), |_| unreachable!());
     assert!(matches!(v, Verdict::Unreadable(_)), "{v:?}");
+    // A record with a missing or non-string name cannot prove `CI` is absent,
+    // alone or mixed with valid records.
+    for list in [
+        json!([{}]),
+        json!([{"name": 7}]),
+        json!([{"name": null}]),
+        json!([{"name": "Release"}, {}]),
+        json!([{}, {"name": "Release"}]),
+    ] {
+        let payload = json!({"total_count": list.as_array().unwrap().len(), "workflows": list});
+        let v = assess("1", "abc", &empty, || Ok(payload), |_| unreachable!());
+        let Verdict::Unreadable(m) = v else {
+            panic!("{list}: {v:?}")
+        };
+        assert!(m.contains("no string `name`"), "{m}");
+    }
+    // A found `CI` still wins over a malformed sibling record.
+    let mixed = json!({"total_count": 2, "workflows": [{}, {"name": "CI"}]});
+    let v = assess("1", "abc", &empty, || Ok(mixed), |_| unreachable!());
+    assert!(matches!(v, Verdict::Unverified(_)), "{v:?}");
     // A disabled `CI` workflow is still a declared gate.
     let disabled =
         json!({"total_count": 1, "workflows": [{"name": "CI", "state": "disabled_manually"}]});
