@@ -5,6 +5,48 @@
 
 use super::*;
 
+/// Host-independent Codex resolution for the codex tick (#9964): the parent
+/// module's `ClearedLoomRuntimeEnv` points `LOOM_CODEX_PROFILE_ROOT` at an empty
+/// tempdir, and the pins below are cleared so a developer shell's `CODEX_HOME`
+/// cannot short-circuit the path CI takes. Restored on drop, panic included.
+struct IsolatedCodexEnv(
+    Vec<(&'static str, Option<std::ffi::OsString>)>,
+    #[allow(dead_code)] ClearedLoomRuntimeEnv,
+);
+
+impl IsolatedCodexEnv {
+    fn new() -> Self {
+        let profile_root = ClearedLoomRuntimeEnv::new();
+        let pins = [
+            "CODEX_HOME",
+            "LOOM_CODEX_HOME",
+            "LOOM_CODEX_PROFILE",
+            "LOOM_CODEX_NO_EXEC",
+            "LOOM_SPAWN_NO_EXPORT",
+        ];
+        let prior = pins
+            .iter()
+            .map(|key| {
+                let prior = std::env::var_os(key);
+                std::env::remove_var(key);
+                (*key, prior)
+            })
+            .collect();
+        Self(prior, profile_root)
+    }
+}
+
+impl Drop for IsolatedCodexEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.0.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 fn admitted(runtime: &str) -> crate::runtime_admission::ResolvedRuntime {
     crate::runtime_admission::ResolvedRuntime {
         role: "champion".into(),
@@ -64,6 +106,7 @@ fn tick(runtime: &str) -> String {
 #[test]
 #[serial]
 fn a_claude_or_codex_role_tick_never_carries_the_llm_gateway_contract() {
+    let _codex = IsolatedCodexEnv::new();
     for runtime in ["claude", "codex"] {
         assert_eq!(tick(runtime), format!("{runtime}|__unset__|__unset__"));
     }

@@ -48,7 +48,17 @@ fn worker(root: &Path, runtime: &str) -> Command {
         .env_remove("FIXTURE_VERSION_EXIT")
         .env_remove("CEREBRAS_API_KEY")
         .env_remove("ZAI_API_KEY")
-        .env_remove("ZHIPU_API_KEY");
+        .env_remove("ZHIPU_API_KEY")
+        // #9964: the codex launch resolves its profile root. An empty override
+        // disables it, so the binary never reads the host's real
+        // `~/.loom/codex-profiles`, and the pins are cleared so a developer
+        // shell's `CODEX_HOME` cannot take a different path than CI does.
+        .env("LOOM_CODEX_PROFILE_ROOT", "")
+        .env_remove("CODEX_HOME")
+        .env_remove("LOOM_CODEX_HOME")
+        .env_remove("LOOM_CODEX_PROFILE")
+        .env_remove("LOOM_CODEX_NO_EXEC")
+        .env_remove("LOOM_SPAWN_NO_EXPORT");
     // A developer shell exporting the contract must not leak into a fixture.
     for name in GATEWAY_ENV {
         c.env_remove(name);
