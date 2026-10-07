@@ -32,6 +32,7 @@ use loom_daemon::eta::history::StageSamples;
 use loom_daemon::eta::journal::{self, censored_from_pr_history, entries_from_pr_history};
 use loom_daemon::eta::labels as eta_labels;
 use loom_daemon::eta::shadow;
+use loom_daemon::eta::shadow_lifecycle as lifecycle;
 use loom_daemon::eta::walk_forward::DatedFits;
 use loom_daemon::eta::{
     AgeSource, CurrentStage, CurrentState, EstimateInput, Kind, NoEstimateReason, Provenance,
@@ -89,6 +90,9 @@ pub(crate) enum EtaCommand {
     /// (#10391), with the remedy for each failure:
     /// `loom-daemon eta doctor [--repo-root PATH] [--json]`.
     Doctor(super::eta_doctor_cmd::EtaDoctorArgs),
+    /// Retirement proposals from the nightly folds (#10525); `--file` files
+    /// each new one as an issue. Never unregisters anything.
+    Retire(super::eta_retire_cmd::EtaRetireArgs),
 }
 
 impl EtaCommand {
@@ -103,6 +107,7 @@ impl EtaCommand {
             EtaCommand::Offline(args) => args.run(),
             EtaCommand::Fit(args) => args.run(),
             EtaCommand::Doctor(args) => args.run(),
+            EtaCommand::Retire(args) => args.run(),
         }
     }
 }
@@ -198,7 +203,12 @@ impl EtaPromoteArgs {
         let mut ledger = shadow::read_ledger(&ledger_path)?;
         let now = Utc::now();
         let config_path = loom_daemon::eta::config::promotion_config_path(&root);
-        let decision = if self.apply {
+        // #10525: only the top candidates by nightly-fold pinball reach the
+        // live gate; missing or stale fold evidence refuses (fails closed).
+        let shortlist =
+            lifecycle::shortlist_for(&root, &registry, current.id(), candidate.id(), now);
+        let admitted = shortlist.admits(candidate.id());
+        let mut decision = if admitted.is_ok() && self.apply {
             let decision = shadow::promote_if_ready(
                 &mut ledger,
                 kind,
@@ -216,6 +226,11 @@ impl EtaPromoteArgs {
             let stats = ledger.stats(kind, current.id(), candidate.id());
             shadow::evaluate(kind, current.id(), candidate.id(), comparison.as_ref(), &stats, now)
         };
+        if let Err(why) = admitted {
+            decision.promote = false;
+            decision.reason = why;
+        }
+        decision.shortlist = Some(shortlist);
 
         // Every evaluation is recorded, promoting or not: "why has this not
         // flipped yet?" is the question an operator actually asks.
@@ -240,9 +255,15 @@ fn render_decision(d: &shadow::PromotionDecision, applied: bool) -> String {
     if let Some(tier) = d.candidate_tier {
         let _ = writeln!(out, "  candidate tier:  {tier}");
     }
+    if let Some(list) = &d.shortlist {
+        let _ = writeln!(out, "  short-list:      {:?}", list.selected);
+    }
     let _ =
         writeln!(out, "  gate 1 backtest: {} — {}", d.backtest.status.as_str(), d.backtest.detail);
     let _ = writeln!(out, "  gate 2 live:     {} — {}", d.live.status.as_str(), d.live.detail);
+    if let Some(a) = &d.adaptation {
+        let _ = writeln!(out, "  adaptation:      {:?} — {}", a.status, a.detail);
+    }
     let _ = writeln!(out, "  decision: {}", d.reason);
     match (&d.config_path, d.promote, applied) {
         (Some(path), _, _) => {

@@ -3,6 +3,7 @@
 //! rates counted per tracker pass, the per-day win rate, and the ledger
 //! defects that would have silently reset or biased all of it.
 
+use super::shadow::{BACKTEST_CASES, PASSING_PAIRS};
 use super::{as_of, history_a, input_at, provenance};
 use crate::eta::backtest::Comparison;
 use crate::eta::heuristics::{LandV1, LAND_V1, LAND_V2, LAND_V4};
@@ -10,7 +11,6 @@ use crate::eta::history::{SampleSource, StageSample};
 use crate::eta::score::{score, EstimateSummary, OutcomeKind};
 use crate::eta::shadow::{
     self, wilson, GateStatus, PromotionDecision, ShadowLedger, DECISION_SCHEMA, MIN_FOLDS,
-    MIN_LIVE_PAIRS,
 };
 use crate::eta::tracker::{
     censor, EstimateContext, ItemKey, PassAnswers, PrState, PrView, ReadyPlan, ReadyRow, Resolved,
@@ -66,8 +66,8 @@ const fn side(loss: f64, covered: bool, late: bool) -> Side {
     }
 }
 
-/// Record a pair of `current` and `candidate` at `as_of() + offset`.
-fn record(ledger: &mut ShadowLedger, offset: i64, current: Side, candidate: Side) {
+/// Record a pair of `current` and `candidate` for `issue` at `as_of() + offset`.
+fn record(ledger: &mut ShadowLedger, issue: u32, offset: i64, current: Side, candidate: Side) {
     let at = as_of() + Duration::seconds(offset);
     let q = (0, 0, 0, Some(0));
     let mut group = vec![
@@ -79,6 +79,7 @@ fn record(ledger: &mut ShadowLedger, offset: i64, current: Side, candidate: Side
         r.score.pinball4_loss_sec = Some(s.loss);
         r.score.covered = Some(s.covered);
         r.score.above_p90 = Some(s.late);
+        r.estimate.issue = issue;
     }
     ledger.record(&current_land, &group);
 }
@@ -94,13 +95,13 @@ fn answers(passes: usize, current: bool, candidate: bool) -> Vec<PassAnswers> {
     vec![pass; passes]
 }
 
-/// `n` pairs over `days` UTC days; pair `i` is `f(i)`.
+/// `n` pairs over `days` UTC days, each its own item; pair `i` is `f(i)`.
 fn ledger(n: usize, days: i64, f: impl Fn(usize) -> (Side, Side)) -> ShadowLedger {
     let mut ledger = ShadowLedger::default();
     for i in 0..n {
         let offset = (i as i64 % days) * 86_400 + i as i64 * 10;
         let (current, candidate) = f(i);
-        record(&mut ledger, offset, current, candidate);
+        record(&mut ledger, 10_000 + i as u32, offset, current, candidate);
     }
     ledger.record_answers(&current_land, &answers(n, true, true));
     ledger
@@ -113,7 +114,7 @@ fn winning(i: usize) -> (Side, Side) {
 
 /// A backtest the candidate wins, on every walk-forward fold.
 fn won_backtest() -> Comparison {
-    super::shadow::comparison(1000.0, 800.0, 40)
+    super::shadow::comparison(1000.0, 800.0, BACKTEST_CASES)
 }
 
 fn decide(ledger: &ShadowLedger) -> PromotionDecision {
@@ -123,7 +124,7 @@ fn decide(ledger: &ShadowLedger) -> PromotionDecision {
 
 #[test]
 fn the_fixture_ledger_passes_on_its_own() {
-    let decision = decide(&ledger(MIN_LIVE_PAIRS, 10, winning));
+    let decision = decide(&ledger(PASSING_PAIRS, 10, winning));
     assert!(decision.promote, "{}", decision.reason);
     assert_eq!(decision.live.stats.day_wins.days, 10);
 }
@@ -187,7 +188,7 @@ fn an_unreadable_ledger_is_set_aside_loudly_never_silently_reset() {
 
 #[test]
 fn an_old_decision_record_still_parses_and_the_schema_tag_is_unchanged() {
-    let decision = decide(&ledger(MIN_LIVE_PAIRS, 10, winning));
+    let decision = decide(&ledger(PASSING_PAIRS, 10, winning));
     assert_eq!(decision.schema, DECISION_SCHEMA);
     assert_eq!(DECISION_SCHEMA, "eta-promotion-decision/v1", "additive, so still v1");
     assert_eq!(decision.live.min_folds, MIN_FOLDS);
@@ -223,7 +224,7 @@ fn an_old_decision_record_still_parses_and_the_schema_tag_is_unchanged() {
 fn a_candidate_that_wins_on_pinball_but_is_late_22_percent_of_the_time_is_refused() {
     // current is late 10% of the time, the candidate 22% — while beating it
     // on loss every single day.
-    let late = ledger(MIN_LIVE_PAIRS, 10, |i| {
+    let late = ledger(PASSING_PAIRS, 10, |i| {
         let (mut current, mut candidate) = winning(i);
         current.late = i.is_multiple_of(10);
         candidate.late = i % 50 < 11;
@@ -256,11 +257,11 @@ fn a_candidate_that_wins_on_pinball_but_is_late_22_percent_of_the_time_is_refuse
 
 #[test]
 fn an_answer_rate_regression_is_refused() {
-    let mut ledger = ledger(MIN_LIVE_PAIRS, 10, winning);
-    // Ten more passes where only `current` answered: 50/60 vs 60/60.
-    ledger.record_answers(&current_land, &answers(10, true, false));
+    let mut ledger = ledger(PASSING_PAIRS, 10, winning);
+    // Twenty more passes where only `current` answered: 100/120 vs 120/120.
+    ledger.record_answers(&current_land, &answers(20, true, false));
     let stats = ledger.stats(Kind::Land, LAND_V1, LAND_V2);
-    assert_eq!(stats.answer_pairs, 60);
+    assert_eq!(stats.answer_pairs, 120);
     assert_eq!(stats.current_answer_rate, Some(1.0));
     let decision = decide(&ledger);
     assert!(!decision.promote);
@@ -272,7 +273,7 @@ fn refusing_the_hard_cases_buys_the_candidate_nothing() {
     // The candidate refuses every case current found hard. On the
     // common decidable subset those cases leave BOTH sides' loss sums, so
     // the refusal is no loss advantage...
-    let mut ledger = ledger(MIN_LIVE_PAIRS, 10, winning);
+    let mut ledger = ledger(PASSING_PAIRS, 10, winning);
     let before = ledger.stats(Kind::Land, LAND_V1, LAND_V2);
     for i in 0..20 {
         let offset = 20 * 86_400 + i * 10;
@@ -307,7 +308,7 @@ fn one_lucky_day_does_not_carry_the_per_day_win_rate() {
     // Day 0: the candidate is flawless and current terrible. Days 1-9: the
     // candidate is slightly worse. The pooled mean favours the candidate —
     // 54s vs 145s — but it won one day of ten.
-    let ledger = ledger(MIN_LIVE_PAIRS, 10, |i| {
+    let ledger = ledger(PASSING_PAIRS, 10, |i| {
         if i.is_multiple_of(10) {
             (side(1000.0, true, false), side(0.0, i.is_multiple_of(2), false))
         } else {
@@ -329,7 +330,7 @@ fn one_lucky_day_does_not_carry_the_per_day_win_rate() {
 
 #[test]
 fn fewer_than_min_folds_decided_days_is_not_enough() {
-    let short = ledger(MIN_LIVE_PAIRS, MIN_FOLDS as i64 - 1, winning);
+    let short = ledger(PASSING_PAIRS, MIN_FOLDS as i64 - 1, winning);
     let decision = decide(&short);
     assert!(!decision.promote);
     assert!(
@@ -340,7 +341,7 @@ fn fewer_than_min_folds_decided_days_is_not_enough() {
         "{}",
         decision.live.detail
     );
-    assert!(decide(&ledger(MIN_LIVE_PAIRS, MIN_FOLDS as i64, winning)).promote);
+    assert!(decide(&ledger(PASSING_PAIRS, MIN_FOLDS as i64, winning)).promote);
 }
 
 #[test]
@@ -353,6 +354,39 @@ fn the_wilson_interval_is_deterministic_and_correct() {
     let (low, high) = wilson(5, 7);
     assert!(low < 0.5 && high > 0.9, "{low} {high}: five of seven is not significant");
     assert_eq!(wilson(5, 7), wilson(5, 7));
+}
+
+#[test]
+fn refreshing_the_same_items_manufactures_no_live_evidence() {
+    // 600 winning pairs over 10 days, but only 30 items refreshed 20 times
+    // each: plenty of pairs, nowhere near enough independent items.
+    let mut refreshed = ShadowLedger::default();
+    for i in 0..600_usize {
+        let offset = (i as i64 % 10) * 86_400 + i as i64 * 10;
+        let (current, candidate) = winning(i);
+        record(&mut refreshed, 10_000 + (i % 30) as u32, offset, current, candidate);
+    }
+    refreshed.record_answers(&current_land, &answers(600, true, true));
+    let stats = refreshed.stats(Kind::Land, LAND_V1, LAND_V2);
+    assert_eq!(stats.loss4_pairs, 600);
+    let item = stats.item_test.as_ref().unwrap();
+    assert_eq!((item.distinct_items, item.observations), (30, 600));
+    let decision = decide(&refreshed);
+    assert!(!decision.promote);
+    assert!(decision.live.detail.contains("30 distinct item(s)"), "{}", decision.live.detail);
+}
+
+#[test]
+fn the_per_item_sums_are_bounded_and_evict_the_least_recently_seen() {
+    let mut ledger = ShadowLedger::default();
+    let n = shadow::MAX_ITEMS + 5;
+    for i in 0..n {
+        let offset = i as i64 * 600;
+        record(&mut ledger, i as u32, offset, side(100.0, true, false), side(60.0, true, false));
+    }
+    let items = ledger.items.values().next().unwrap();
+    assert_eq!(items.len(), shadow::MAX_ITEMS);
+    assert!(!items.keys().any(|k| k.ends_with("#0")), "the oldest item went first");
 }
 
 #[test]
