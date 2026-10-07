@@ -26,9 +26,16 @@
 //!    ref" step whose ref fell back to `main` on a push and cancelled every
 //!    in-progress main run.
 //!
-//! What it deliberately does not police: PR runs. Superseding a PR run is
-//! correct (rule 2), so `cancel-in-progress` on `pull_request` and the PR-only
-//! cancel steps are left alone.
+//! 4. A cancel step that runs on `pull_request` but can *target* a main run:
+//!    the job gate keeps it off a push, yet a PR run holds `actions: write`, so
+//!    a step that lists `main` (or any run that is not a `pull_request` run)
+//!    cancels a started main run from the PR side. The lint pins the target
+//!    safety of every PR-reachable `run:` cancel step: its ref must be
+//!    `github.head_ref` with no fallback, and its run selection must filter on
+//!    `.event == \"pull_request\"`.
+//!
+//! What it deliberately does not police: superseding a PR run is correct
+//! (rule 2), so `cancel-in-progress` on `pull_request` is left alone.
 
 use super::audit::{eval_condition, job_states, needs_of, triggered};
 use super::context::{Event, EventContext, JobScope, RunState, WorkflowScope};
@@ -107,6 +114,9 @@ pub fn lint(workflows: &[Workflow]) -> Vec<CancelFinding> {
             if triggered(wf, event) {
                 lint_event(wf, event, &mut out);
             }
+        }
+        if triggered(wf, Event::PullRequest) {
+            lint_pr_targets(wf, &mut out);
         }
     }
     out
@@ -195,6 +205,67 @@ fn lint_event(wf: &Workflow, event: Event, out: &mut Vec<CancelFinding>) {
     }
 }
 
+/// Why a cancel step that runs on a PR could still reach a main run, if it can.
+/// `uses:` cancel actions carry no inspectable target and are left to the
+/// push-context check above.
+fn pr_target_problem(step: &Step) -> Option<&'static str> {
+    let run = step.run.as_deref()?;
+    let compact = |s: &str| s.split_whitespace().collect::<String>();
+    let code: String = run
+        .lines()
+        .filter(|l| !l.trim().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !compact(&code).contains(r#".event=="pull_request""#) {
+        return Some("its run selection does not filter on `.event == \"pull_request\"`, so it can list and cancel push runs");
+    }
+    let unsafe_ref =
+        |v: &str| v.contains("ref_name") || v.contains("github.ref") || v.contains("||");
+    let head_ref = |v: &str| compact(v) == "${{github.head_ref}}";
+    if code.contains("ref_name") || step.env.iter().any(|(_, v)| unsafe_ref(v)) {
+        return Some(
+            "its target ref falls back to `ref_name`/`github.ref`, which is `main` on a push",
+        );
+    }
+    if !step.env.iter().any(|(_, v)| head_ref(v)) {
+        return Some("its target ref is not `github.head_ref` (no `env:` value is exactly `${{ github.head_ref }}`)");
+    }
+    None
+}
+
+/// Rule 4: PR-reachable cancel steps must not be able to target a main run.
+fn lint_pr_targets(wf: &Workflow, out: &mut Vec<CancelFinding>) {
+    let ctx = EventContext::new(Event::PullRequest, &wf.name);
+    let states = job_states(wf, &ctx);
+    for job in &wf.jobs {
+        if states[&job.id] == RunState::Skipped {
+            continue;
+        }
+        let scope = JobScope {
+            event: &ctx,
+            needs: needs_of(job, &states),
+            job_level: false,
+        };
+        for step in job.steps.iter().filter(|s| is_cancel_step(s)) {
+            if eval_condition(step.if_cond.as_deref(), &scope).truth() == Truth::False {
+                continue;
+            }
+            if let Some(why) = pr_target_problem(step) {
+                out.push(CancelFinding {
+                    workflow: wf.file.clone(),
+                    job: Some(job.id.clone()),
+                    step: Some(step.label()),
+                    line: step.line,
+                    event: Event::PullRequest,
+                    detail: format!(
+                        "a cancel step reachable on pull_request can target a started main run: {why} (ci-principles.md rule 2)"
+                    ),
+                });
+            }
+        }
+    }
+}
+
 fn check_concurrency(
     c: &Concurrency,
     scope: &dyn expr::Context,
@@ -261,7 +332,7 @@ mod tests {
         workflow::parse("t.yml", &src.replace("__GH__", "gh")).unwrap()
     }
 
-    const PR_ONLY_CANCEL_STEP: &str = r"
+    const PR_ONLY_CANCEL_STEP: &str = r#"
 name: CI
 on:
   push:
@@ -276,19 +347,42 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Cancel older runs
+        env:
+          REF: ${{ github.head_ref }}
         run: |
-          __GH__ run list --branch x --json databaseId | while read -r id; do
+          __GH__ run list --branch "$REF" --json databaseId,event --jq '.[] | select(.event == "pull_request") | .databaseId' | while read -r id; do
             __GH__ run cancel $id
           done
   test:
     runs-on: ubuntu-latest
     steps:
       - run: cargo test
-";
+"#;
 
     #[test]
     fn pr_only_cancellation_is_clean() {
         assert_eq!(lint(&[wf(PR_ONLY_CANCEL_STEP)]), Vec::new());
+    }
+
+    /// The PR-side hole (#10677 review): the job gate keeps the step off a
+    /// push, but a PR run can still cancel main if the step targets it.
+    #[test]
+    fn pr_only_step_targeting_main_is_flagged() {
+        for (from, to) in [
+            (
+                r#"--jq '.[] | select(.event == "pull_request") | .databaseId'"#,
+                "--jq '.[] | .databaseId'",
+            ),
+            ("REF: ${{ github.head_ref }}", "REF: ${{ github.head_ref || github.ref_name }}"),
+            ("REF: ${{ github.head_ref }}", "REF: main"),
+        ] {
+            let src = PR_ONLY_CANCEL_STEP.replace(from, to);
+            assert_ne!(src, PR_ONLY_CANCEL_STEP, "{from}");
+            let f = lint(&[wf(&src)]);
+            assert_eq!(f.len(), 1, "{to}: {f:?}");
+            assert_eq!(f[0].event, Event::PullRequest);
+            assert!(f[0].detail.contains("started main run"), "{}", f[0].detail);
+        }
     }
 
     /// The #7779 shape: the cancel job runs on every event, and on a push its
@@ -335,7 +429,10 @@ jobs:
         ] {
             let src = PR_ONLY_CANCEL_STEP
                 .replace("      - run: cargo test\n", &format!("      - run: cargo test\n{body}"));
-            let f = lint(&[wf(&src)]);
+            let f: Vec<_> = lint(&[wf(&src)])
+                .into_iter()
+                .filter(|x| x.event == Event::Push)
+                .collect();
             assert_eq!(f.len(), 1, "{body}: {f:?}");
             assert_eq!(f[0].job.as_deref(), Some("test"));
         }
