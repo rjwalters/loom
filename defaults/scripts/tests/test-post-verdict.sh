@@ -170,6 +170,10 @@ export PATH="$STUB_DIR:$PATH"
 # is the verdict semantics over the GH ladder, so pin the SELF daemon to a
 # mock that refuses (the pre-#9818 shape) — the gh stub above stays the path
 # under test, deterministically, whatever binary the host happens to have.
+# #10581: the verdict gate / label verbs are the daemon's (their logic is
+# tested in loom_daemon::verdict_gate and test-post-verdict-gate.sh against
+# the real binary); here they answer from scenario files so this suite pins
+# post-verdict.sh's WIRING: gate-answer ("<rc> <line>"), labels-fail.
 cat > "$STUB_DIR/loom-daemon" <<'MOCK'
 #!/usr/bin/env bash
 # #10485: `forge wait-checks` is the exact-head CI reader the approval gate
@@ -198,6 +202,22 @@ if [[ "${1:-} ${2:-}" == "forge wait-checks" ]]; then
   echo "LOOM-CHECKS-GREEN $(cat "$LOOM_TEST_STUB_DIR/cur-sha")"
   exit 0
 fi
+D="$LOOM_TEST_STUB_DIR"
+if [[ "${1:-} ${2:-}" == "forge verdict-gate" ]]; then
+  printf '%s\n' "$*" >> "$D/daemon-calls.log"
+  [[ -f "$D/gate-answer" ]] || { echo "LOOM-VERDICT-GATE PROCEED ok"; exit 0; }
+  read -r rc line < "$D/gate-answer"; echo "$line"; exit "$rc"
+fi
+if [[ "${1:-} ${2:-}" == "forge verdict-lock" ]]; then
+  printf '%s\n' "$*" >> "$D/daemon-calls.log"
+  [[ "${3:-}" == acquire && -f "$D/lock-fail" ]] && { echo "forge verdict-lock: could not take the lock" >&2; exit 9; }
+  exit 0
+fi
+if [[ "${1:-} ${2:-}" == "forge verdict-labels" ]]; then
+  printf '%s\n' "$*" >> "$D/daemon-calls.log"
+  [[ -f "$D/labels-fail" ]] && { echo "forge verdict-labels: did not hold: missing loom:pr.  Repair: gh pr edit $3 --add-label loom:pr" >&2; exit 1; }
+  echo "LOOM-VERDICT-LABELS OK"; exit 0
+fi
 echo "mock loom-daemon: forge comment not under test here" >&2
 exit 127
 MOCK
@@ -214,7 +234,8 @@ cd "$STUB_DIR/checkout"
 reset_state() {
   rm -f "$STUB_DIR"/comment-fail-* "$STUB_DIR/last-pr.txt" "$STUB_DIR/last-body.txt" \
     "$STUB_DIR"/ci-stdout "$STUB_DIR"/ci-stderr "$STUB_DIR"/ci-garbage "$STUB_DIR"/ci-absent "$STUB_DIR"/ci-empty "$STUB_DIR"/ci-required \
-    "$STUB_DIR"/final-head "$STUB_DIR"/final-head-fail "$STUB_DIR/wait-checks-calls.log"
+    "$STUB_DIR"/final-head "$STUB_DIR"/final-head-fail "$STUB_DIR/wait-checks-calls.log" \
+    "$STUB_DIR/gate-answer" "$STUB_DIR/labels-fail" "$STUB_DIR/lock-fail" "$STUB_DIR/daemon-calls.log"
 }
 
 run_pv() {
@@ -502,6 +523,78 @@ echo "LOOM-CHECKS-RED $CI_SHA_FULL build" > "$STUB_DIR/ci-stdout"
 run_pv 315 changes-requested "$CI_SHA_FULL" --body "CI failing: build"
 assert_eq "0" "$EXIT_CODE" "changes-requested posts even when CI is red"
 assert_eq "" "$(cat "$STUB_DIR/wait-checks-calls.log" 2>/dev/null || true)" "changes-requested does not read CI"
+
+# --- T15: verdict gate + label transition wiring (#10581) -------------------
+no_comment() {
+  assert_eq "" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "$1: no comment posted"
+}
+
+# Success: gate consulted with the verdict, SHA, repo and overrule text; then
+# the label verb runs for the same verdict.
+reset_state
+run_pv 300 approved abc1234 --body "ok" --overrules-prior "each prior point was fixed in the follow-up commit"
+assert_eq "0" "$EXIT_CODE" "gate PROCEED + labels OK -> exit 0"
+CALLS="$(cat "$STUB_DIR/daemon-calls.log" 2>/dev/null || true)"
+assert_contains "$CALLS" "forge verdict-gate 300 --repo owner/repo --verdict approved --sha abc1234 --overrules-prior each prior point" "gate gets PR, repo, verdict, sha, overrule"
+assert_contains "$CALLS" "forge verdict-labels 300 --repo owner/repo --verdict approved" "label transition runs after the post"
+assert_contains "$CALLS" "forge verdict-lock acquire 300 --repo owner/repo" "the per-PR lock is taken before the gate"
+assert_contains "$CALLS" "forge verdict-lock release 300 --repo owner/repo" "the per-PR lock is released at exit"
+
+# Lock timeout: exit 9 (fail closed), the gate never runs, nothing is posted.
+reset_state
+touch "$STUB_DIR/lock-fail"
+run_pv 309 approved abc1234 --body "ok"
+assert_eq "9" "$EXIT_CODE" "lock unavailable -> exit 9"
+assert_eq "" "$(grep verdict-gate "$STUB_DIR/daemon-calls.log" 2>/dev/null || true)" "lock unavailable: gate never ran"
+no_comment "lock unavailable"
+rm -f "$STUB_DIR/lock-fail"
+
+# REFUSE: exit 7, nothing posted, labels untouched (same-head contradiction,
+# loom:ci-failure, unread state all arrive here as REFUSE).
+reset_state
+echo "3 LOOM-VERDICT-GATE REFUSE the PR carries loom:ci-failure" > "$STUB_DIR/gate-answer"
+run_pv 301 approved abc1234 --body "ok"
+assert_eq "7" "$EXIT_CODE" "gate REFUSE -> exit 7"
+assert_contains "$OUTPUT" "loom:ci-failure" "refusal reason is shown"
+no_comment "refuse"
+assert_eq "" "$(grep verdict-labels "$STUB_DIR/daemon-calls.log" 2>/dev/null || true)" "refuse: no label write"
+
+# DEDUPE: no second comment, labels still applied, exit 0.
+reset_state
+echo "10 LOOM-VERDICT-GATE DEDUPE a changes-requested verdict for abc1234 was posted 30s ago" > "$STUB_DIR/gate-answer"
+run_pv 302 changes-requested abc1234 --body "dup"
+assert_eq "0" "$EXIT_CODE" "gate DEDUPE -> exit 0"
+no_comment "dedupe"
+assert_contains "$(cat "$STUB_DIR/daemon-calls.log")" "forge verdict-labels 302" "dedupe: labels still applied"
+
+# A gate answer without the sentinel (old daemon, crash) never passes an approval...
+reset_state
+echo "2 error: unrecognized subcommand 'verdict-gate'" > "$STUB_DIR/gate-answer"
+run_pv 303 approved abc1234 --body "ok"
+assert_eq "7" "$EXIT_CODE" "no gate sentinel on an approval -> exit 7"
+no_comment "gate unavailable (approve)"
+# ... a sentinel line with the wrong exit code does not either ...
+reset_state
+echo "1 LOOM-VERDICT-GATE PROCEED ok" > "$STUB_DIR/gate-answer"
+run_pv 304 approved abc1234 --body "ok"
+assert_eq "7" "$EXIT_CODE" "PROCEED with a non-zero exit -> exit 7"
+no_comment "rc/sentinel mismatch"
+# ... but a changes-requested still posts (it cannot merge anything).
+reset_state
+echo "2 error: unrecognized subcommand 'verdict-gate'" > "$STUB_DIR/gate-answer"
+run_pv 305 changes-requested abc1234 --body "please fix"
+assert_eq "0" "$EXIT_CODE" "no gate sentinel on changes-requested -> still posts"
+assert_contains "$OUTPUT" "WARNING" "degraded gate is loud"
+assert_eq "305" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "changes-requested comment posted"
+
+# Label write failure after the post (#10605): non-zero, with the repair hint.
+reset_state
+touch "$STUB_DIR/labels-fail"
+run_pv 306 approved abc1234 --body "ok"
+assert_eq "8" "$EXIT_CODE" "label transition failure -> exit 8"
+assert_contains "$OUTPUT" "Repair: gh pr edit 306" "repair command is printed"
+assert_contains "$OUTPUT" "forge verdict-labels 306 --repo owner/repo --verdict approved" "re-run command is printed"
+assert_eq "306" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "the comment itself was posted"
 
 # --- Summary ---
 echo ""

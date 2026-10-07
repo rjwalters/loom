@@ -510,6 +510,7 @@ fn daemon_write_paths_are_scoped() {
             ),
         ),
         ("cli/forge_action.rs", Gated),
+        ("cli/forge_verdict_cmd.rs", ShellVetted("post-verdict.sh")),
         ("role_runner/launch.rs", Gated),
         ("operator_decision/cli.rs", Gated),
         ("forge_priority_labels.rs", Gated),

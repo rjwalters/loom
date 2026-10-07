@@ -24,12 +24,24 @@
 # appended unconditionally — there is no code path that posts a verdict
 # comment without one.
 #
-# What this script deliberately does NOT do: it does not touch labels. The
-# label transition that follows a verdict comment (loom:review-requested ->
-# loom:pr / loom:changes-requested, plus per-PR companions like
-# loom:ci-failure / loom:merge-conflict) still varies by call site and stays
-# in the caller, chained with `&&` exactly as before — only the
-# comment-posting half is centralized. It also does not decide FRESH/STALE/
+# VERDICT GATE AND LABEL TRANSITION (#10581)
+#
+# Before posting, `loom-daemon forge verdict-gate` reads the PR's trusted
+# comments and labels. An approval is REFUSED (exit 7, nothing posted) while
+# `loom:ci-failure` is on the PR, when the newest verdict marker at this same
+# head is changes-requested (unless --overrules-prior explains why each point
+# no longer blocks), or when either read fails. A second verdict identical to
+# one posted at the same head in the last 10 minutes (two concurrent Judges) is
+# DEDUPED: no second comment, the labels are still applied. After posting,
+# `loom-daemon forge verdict-labels` applies the base transition itself (approve:
+# +loom:pr, -loom:changes-requested -loom:ci-failure -loom:reviewing
+# -loom:review-requested; changes-requested: +loom:changes-requested, -loom:pr
+# -loom:reviewing -loom:review-requested), verifies it, and on failure this
+# script exits 8 with a repair command — a verdict comment never silently
+# lacks its label (#10605). Companion labels a verdict ADDS (loom:ci-failure,
+# loom:merge-conflict on a changes-requested) stay with the caller.
+#
+# What this script deliberately does NOT do: decide FRESH/STALE/
 # UNVERIFIABLE — that reasoning, and the marker FORMAT it depends on, stays
 # single-sourced in verdict-staleness-guard.sh; this script's job is only to
 # guarantee that whatever marker DOES get posted matches what that guard
@@ -85,7 +97,8 @@
 #
 # Usage:
 #   post-verdict.sh <pr-number> <approved|changes-requested> <sha> \
-#       (--body TEXT | --body-file PATH) [--reviews-reconciled TEXT]
+#       (--body TEXT | --body-file PATH) [--reviews-reconciled TEXT] \
+#       [--overrules-prior TEXT]
 #
 #   PATH may be "-" to read the body from stdin.
 #
@@ -93,6 +106,11 @@
 #       reviews / inline threads that check-review-feedback.sh reported. Must
 #       cite every blocking review id it named. Ignored for
 #       `changes-requested` (the gate only guards approvals).
+#
+#   --overrules-prior TEXT   Approvals only: why each point of a changes-requested
+#       verdict at this SAME head no longer blocks (at least 40 chars). Without
+#       it such an approval is refused (#10581); with no new push, the usual
+#       answer is to wait for the Doctor rather than to overrule.
 #
 # Output: whatever `gh pr comment` prints on success (the comment URL) —
 # unchanged, so a caller parsing that output needs no change.
@@ -108,6 +126,13 @@
 #   6 - approval refused, a check on <sha> is red (#10485), required or not.
 #   4 - refused: the PR's repo is not one this installation may write to
 #       (loom_write_repo, lib/forge-helpers.sh, #9548); nothing was posted
+#   7 - refused by the verdict gate (#10581): loom:ci-failure on an approval,
+#       a same-head changes-requested verdict not overruled, an unread PR
+#       state, or a daemon without the verb; nothing was posted
+#   8 - the comment is posted (or deduped) but the label transition did not
+#       hold; stderr carries the repair command (#10581)
+#   9 - the per-PR verdict lock could not be taken (loom-daemon forge
+#       verdict-lock, #10581); nothing was posted
 #
 # NOTE: GitHub-specific (uses `gh pr comment`), like create-pr.sh /
 # merge-pr.sh. On a Gitea forge, post the equivalent comment via that forge's
@@ -116,7 +141,7 @@
 set -uo pipefail
 
 usage() {
-  sed -n '2,112p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '2,139p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -137,7 +162,7 @@ shift 3
 BODY=""
 BODY_FILE=""
 HAVE_BODY=false
-RECONCILED=""
+RECONCILED="" OVERRULE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -150,10 +175,8 @@ while [[ $# -gt 0 ]]; do
       BODY_FILE="${2:-}"
       shift 2
       ;;
-    --reviews-reconciled)
-      RECONCILED="${2:-}"
-      shift 2
-      ;;
+    --reviews-reconciled) RECONCILED="${2:-}"; shift 2 ;;
+    --overrules-prior) OVERRULE="${2:-}"; shift 2 ;;
     *)
       echo "post-verdict.sh: unknown argument: $1" >&2
       exit 2
@@ -393,6 +416,7 @@ if [[ -n "$RECONCILIATION_NOTE" ]]; then
 
 $RECONCILIATION_NOTE"
 fi
+if [[ -n "$OVERRULE" ]]; then FULL_BODY="$FULL_BODY"$'\n\n---\n\n**Overrules prior verdict (#10581)** — '"$OVERRULE"; fi
 if [[ -n "$RECONCILIATION_MARKER" ]]; then
   FULL_BODY="$FULL_BODY
 
@@ -408,6 +432,15 @@ FULL_BODY="$FULL_BODY
 # sourced inside the command substitution because it turns on `set -e`.
 # (An approval already vetted it above, before the CI read.)
 [[ -n "$REPO" ]] || REPO="$(source "$SCRIPT_DIR/lib/forge-helpers.sh" && loom_write_repo "${LOOM_REPO:-}")" || { echo "post-verdict.sh: not posting the verdict on PR #$PR: loom-daemon forge may-write refused the repo (#9548)" >&2; exit 4; }
+# Serialize the per-PR verdict transaction (#10581): the final head compare, gate,
+# post and labels run under one host lock (loom-daemon forge verdict-lock), taken
+# before the head compare so that compare sits immediately before the write. A
+# rival verdict cannot land between this caller's gate read and its writes, and
+# two identical callers cannot both pass the dedupe read. Fail closed (exit 9).
+# Host-local: independent hosts share no lock, so cross-host the gate's read-time
+# check is the only guard.
+"${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-lock acquire "$PR" --repo "$REPO" || { echo "post-verdict.sh: could not take the per-PR verdict lock; nothing was posted (#10581)" >&2; exit 9; }
+trap '"${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-lock release "$PR" --repo "$REPO"' EXIT
 # Final compare (#10485): the head must still be the reviewed one right before
 # the write; an unreadable head is a refusal, never a pass.
 if [[ "$VERDICT" == "approved" ]]; then
@@ -421,4 +454,15 @@ fi
 # verdict posts via the daemon chokepoint when a binary resolves — dashboard
 # footer included — and via the gh ladder when it does not.
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
-forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1
+# Verdict gate + label transition (#10581): the logic is the daemon's
+# (loom_daemon::verdict_gate); only a positive sentinel lets an approval post.
+# requires-daemon: forge >= 0.19.830   verdict-gate, verdict-labels and verdict-lock (#10581) first ship in the release after 0.19.830. An older binary fails the lock step (exit 9, nothing posted); run ./.loom/scripts/resync-installed.sh and roll loom-daemon.
+VG_RC=0; VG_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-gate "$PR" --repo "$REPO" --verdict "$VERDICT" --sha "$SHA" --overrules-prior "$OVERRULE" 2>&1)" || VG_RC=$?  # set -e is on (forge-helpers.sh)
+case "$VG_RC:$VG_OUT" in
+  "0:LOOM-VERDICT-GATE PROCEED"*) forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1 || exit 1 ;;
+  "10:LOOM-VERDICT-GATE DEDUPE"*) echo "post-verdict.sh: not posting a duplicate verdict on PR #$PR (applying its labels only): $VG_OUT" >&2 ;;
+  "3:LOOM-VERDICT-GATE REFUSE"*) echo "post-verdict.sh: REFUSING to post the $VERDICT verdict on PR #$PR — nothing was posted: $VG_OUT" >&2; exit 7 ;;
+  *) [[ "$VERDICT" == "approved" ]] && { echo "post-verdict.sh: REFUSING to post an approval on PR #$PR: '${LOOM_DAEMON_BIN:-loom-daemon} forge verdict-gate' gave no answer (missing or older daemon?): ${VG_OUT:0:500}. An unrun gate is never a pass; roll loom-daemon / run ./.loom/scripts/resync-installed.sh." >&2; exit 7; }
+     echo "post-verdict.sh: WARNING — verdict gate unavailable (${VG_OUT:0:200}); posting the changes-requested verdict anyway" >&2; forge_gh_comment_rl_safe "$REPO" "$PR" "$FULL_BODY" 1 || exit 1 ;;
+esac
+VL_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-labels "$PR" --repo "$REPO" --verdict "$VERDICT" 2>&1)" || { printf 'post-verdict.sh: the %s verdict on PR #%s is posted, but its label transition did not complete (#10581):\n%s\nRe-run: loom-daemon forge verdict-labels %s --repo %s --verdict %s\n' "$VERDICT" "$PR" "$VL_OUT" "$PR" "$REPO" "$VERDICT" >&2; exit 8; }
