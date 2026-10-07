@@ -100,16 +100,37 @@ pub(crate) fn handle_session_command(
         ProcessContainerRunner, SessionLifecycle, SessionStatus,
     };
 
-    /// The other registered workspaces: an operator start lifts an operator
-    /// hold in each one's profile for the account, and status reads them
-    /// (issue #10453).
+    /// The other roots of the one hold root set the reconcile pass also uses
+    /// (the registered workspaces plus the daemon's recorded fallback root,
+    /// #10661): an operator start lifts an operator hold in each one's
+    /// profile for the account, and status reads them (issue #10453).
     fn peer_roots(workspace: &std::path::Path) -> Vec<PathBuf> {
-        loom_daemon::workspace_registry::WorkspaceRegistry::load_default()
+        use loom_daemon::tokens_pool::session_hold_roots as roots;
+        let registered = loom_daemon::workspace_registry::WorkspaceRegistry::load_default()
             .map(|registry| registry.roots())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|root| root != workspace)
-            .collect()
+            .unwrap_or_default();
+        let fallback = roots::recorded_daemon_fallback_root();
+        roots::cli_peer_roots(workspace, &registered, fallback.as_deref())
+    }
+
+    /// Operator `start`/`shell` (#10661): Ctrl-C/SIGTERM is forwarded to the
+    /// running `docker` child, and a missing image is pulled under its own
+    /// budget before a first `docker run` (the reconciler does neither).
+    fn prepare_operator_start(
+        lifecycle: &SessionLifecycle<ProcessContainerRunner>,
+        name: &str,
+        image: Option<&str>,
+    ) -> Result<()> {
+        use loom_daemon::tokens_pool::{docker_cli, operator_interrupt, session_lifecycle};
+        if let Err(error) = operator_interrupt::install() {
+            eprintln!("note: Ctrl-C will not reach the `docker` command ({error:#})");
+        }
+        if lifecycle.status(name)?.container_id.is_none() {
+            docker_cli::ensure_image_for_operator(
+                image.unwrap_or(session_lifecycle::DEFAULT_SESSION_IMAGE),
+            )?;
+        }
+        Ok(())
     }
 
     fn print_session_status(status: &SessionStatus, json: bool) -> Result<()> {
@@ -207,8 +228,10 @@ pub(crate) fn handle_session_command(
                 anyhow::bail!("account uses private-clone mode; repeat start --private-clone URL --base BRANCH; host-mount reuse is refused");
             }
             let peers = peer_roots(&workspace);
+            let pull = image.clone();
             let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image)
                 .with_peer_roots(peers);
+            prepare_operator_start(&lifecycle, &name, pull.as_deref())?;
             print_session_status(
                 &lifecycle.start_with_workspace(&name, workspace_arg.as_deref())?,
                 json,
@@ -292,6 +315,7 @@ pub(crate) fn handle_session_command(
             let peers = peer_roots(&workspace);
             let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
                 .with_peer_roots(peers);
+            prepare_operator_start(&lifecycle, &name, None)?;
             let code = lifecycle.shell(&name, workspace_arg.as_deref(), &args)?;
             if code != 0 {
                 std::process::exit(code);

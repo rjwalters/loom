@@ -116,7 +116,7 @@ use crate::tokens_pool::session_dispatch_lock::{self, Exclusive};
 use crate::tokens_pool::session_drift_removal::{self, DriftRemoval};
 use crate::tokens_pool::session_hold::{now_unix_ms, OperatorHeld};
 use crate::tokens_pool::session_lifecycle::{
-    container_name, workspace_mount_roots, ContainerRunner, SessionLifecycle, STOP_GRACE,
+    container_name, workspace_mount_roots, ContainerRunner, SessionLifecycle, UndoLock, STOP_GRACE,
 };
 pub use crate::tokens_pool::session_mount_gate::Denials;
 /// One running container's drift as the reconciler acts on it:
@@ -162,8 +162,28 @@ pub(super) struct DriftMemory {
     /// The standing removal record was already WARNed about.
     removal_reported: bool,
     /// Passes a record has stood beside this running container whose mounts
-    /// are not denied; WARNed at 1, 2, 4, 8, … (a backoff cadence).
+    /// are not denied; WARNed on a capped backoff ([`healthy_record_warn_due`]).
     healthy_beside_record: u32,
+    /// When that was last WARNed (unix secs).
+    healthy_warned_at: Option<u64>,
+}
+
+/// The longest gap between two WARNs that a removal record stands beside a
+/// healthy running container (#10661): about a day, so the stale record stays
+/// visible however long it stands.
+pub const HEALTHY_RECORD_WARN_MAX_SECS: u64 = 24 * 60 * 60;
+
+/// Whether the `passes`-th consecutive sighting of a record beside a healthy
+/// container WARNs: on passes 1, 2, 4, 8, … (a backoff), and whenever
+/// [`HEALTHY_RECORD_WARN_MAX_SECS`] have passed since the last WARN. The count
+/// lives in memory, so a daemon restart starts it over at pass 1, which
+/// WARNs at once: a restart never makes the record quieter. A large
+/// backward step of the wall clock mutes the 24 h cap until the clock
+/// catches up again; the doubling cadence still fires meanwhile.
+#[must_use]
+pub fn healthy_record_warn_due(passes: u32, warned_at: Option<u64>, now: u64) -> bool {
+    passes.is_power_of_two()
+        || warned_at.is_none_or(|at| now.saturating_sub(at) >= HEALTHY_RECORD_WARN_MAX_SECS)
 }
 
 /// Assess `inspect` against `registered` and, when they could be read, the
@@ -429,7 +449,9 @@ pub(super) fn reconcile_running<R: ContainerRunner>(
         return Ok(Outcome::DriftRemoved { drift });
     }
     lifecycle.runner().stop_and_remove(&container, STOP_GRACE)?;
-    recreate_container(lifecycle, name, &workspace, image, &is_held)?;
+    // This teardown still holds the container's dispatch lock exclusively.
+    let undo = UndoLock::HeldByCaller;
+    recreate_container(lifecycle, name, &workspace, image, &is_held, undo)?;
     account_mem.awaiting_confirm = true;
     account_mem.drift = DriftMemory {
         recreated: Some(drift.clone()),
@@ -551,6 +573,7 @@ pub(super) fn finish_recorded_removal<R: ContainerRunner>(
     let container = container_name(name);
     let Some(removal) = standing(name, None, inputs, &mut account_mem.drift) else {
         account_mem.drift.healthy_beside_record = 0;
+        account_mem.drift.healthy_warned_at = None;
         return Ok(None);
     };
     account_mem.awaiting_confirm = false;
@@ -567,8 +590,10 @@ pub(super) fn finish_recorded_removal<R: ContainerRunner>(
         };
         let denied = assess(inspect, registered, Some(&denials)).denied;
         if denied.is_empty() {
-            mem.healthy_beside_record += 1;
-            if mem.healthy_beside_record.is_power_of_two() {
+            mem.healthy_beside_record = mem.healthy_beside_record.saturating_add(1);
+            let now = now_unix_ms() / 1000;
+            if healthy_record_warn_due(mem.healthy_beside_record, mem.healthy_warned_at, now) {
+                mem.healthy_warned_at = Some(now);
                 log::warn!(
                     "session_reconcile: {container} (account {name}) is running and mounts \
                      nothing denied, but a removal record for {} ({}) still stands and blocks \
@@ -585,6 +610,7 @@ pub(super) fn finish_recorded_removal<R: ContainerRunner>(
         mounted_of(inspect, &removal.denied)
     };
     mem.healthy_beside_record = 0;
+    mem.healthy_warned_at = None;
     let why = format!(
         "it was removed for mounting {} ({}) and is present again",
         paths(&reported),

@@ -9135,29 +9135,85 @@ across the registered roots:
   the same schedule. No start is attempted and no per-account failure is
   counted.
 - Every `docker` call has a deadline: 60 s, 120 s for `stop`, 600 s for `run`.
-  The operator CLI inherits these deadlines. An `accounts session start` that
-  has to pull the image for the first time on a slow link fails after 600 s,
-  where it used to wait indefinitely. `docker pull` the image beforehand if
-  that is a risk.
+  The operator CLI inherits these deadlines, with one addition (#10661): when
+  the container is missing, an operator `accounts session start` (or `shell`)
+  first checks that the image is present and, if not, pulls it under its own
+  60 min budget, with a note on stderr. A slow first pull therefore no longer
+  fails the start at 600 s. The pull is not streamed: the note is all you see
+  until it finishes. The reconciler never pulls separately (a long pull would
+  hold the whole pass); its `docker run` keeps the 600 s budget.
+- **Ctrl-C on an operator command (#10661).** Each `docker` call runs in its
+  own process group, so the deadline can kill its descendants. That group is
+  not the terminal's, so Ctrl-C reaches only `loom-daemon`. An operator
+  `accounts session start` or `shell` therefore traps SIGINT and SIGTERM and
+  forwards the signal to the running `docker` command's group. It gives that
+  command 10 s to exit, then kills the group. The command then fails with
+  `interrupted by signal N` and starts no further `docker` call. Where the
+  account ends up depends on the phase (below): interrupted during the
+  preparation (the container inspect, the image check or the pull) it is
+  still **held** and down; interrupted during the start itself it is
+  **unheld** and down. A second Ctrl-C (or SIGTERM) kills the running
+  `docker` command's group (SIGKILL) and then the command, at once. The daemon never traps these signals for its `docker` calls: the
+  reconciler's behaviour is unchanged.
 - With no enabled session-managed account, the pass makes zero `docker` calls.
 - **Hold:** `loom-daemon accounts session stop <acct>` keeps the container
   down. It writes `.session-hold.json` in the account's profile directory
   *before* `docker stop`. Only an operator `accounts session start` (or
-  `shell`) removes it, by deleting it before that start touches Docker.
+  `shell`) removes it, by deleting it before that start's own `docker
+  start`/`run`.
   Whether an account is held depends only on whether the file exists, never
   on timestamps, so a wall clock stepping back between a start and a stop
   cannot drop the hold. The pass checks the hold before any `docker` call and
   again just before a start. If a pass already past that check still
   `docker start`s the container between `stop`'s `docker stop` and its
   `docker rm`, the `rm` fails. `stop` then re-inspects, re-applies the
-  in-flight-exec refusal, and stops and removes the container once more. That
-  one retry suffices because every later start sees the hold. `session status`
+  in-flight-exec refusal, and stops and removes the container once more. The
+  same race exists when `stop` finds **no** container: a pass may `docker
+  run` one right after the hold is written, leaving it running and held. So
+  `stop` inspects once more after writing the hold and stops and removes
+  whatever is there now (#10661). The in-flight-exec refusal applies (unless
+  `--force`), and the dispatch lock `stop` already holds covers the retry. If
+  that container is busy, `stop` refuses as usual. The hold stays, and a
+  retry or `--force` finishes the stop. `stop`'s retries alone are not
+  enough: a `docker run` already in flight (an image pull can take minutes)
+  can finish after both of `stop`'s inspects. So the guarantee is
+  two-sided. After its own `docker start` or `docker run` returns, the
+  pass checks the hold again. If it is now held, the pass stops and removes
+  the container it just started, and reports the account as held (no failure
+  is counted). Whichever side acts second sees the other: if the pass's check
+  comes after the hold was written, the pass removes its container; if it
+  comes before, its start finished before the hold existed, and `stop`'s
+  inspect sees the container. This undo follows `stop`'s rules too. It
+  takes the dispatch lock, waiting up to 30 s for a concurrent `stop` to
+  return, and never stops a container with an in-flight exec. In those
+  cases it leaves the container running, with a WARN naming
+  `accounts session stop`. `session status`
   shows `stopped, held (operator stop)`, and `session status --json` carries
   `"held": true|false`, a field added in #10453. The hold is per account: a
-  hold, or `enabled=false`, in any registered root holds the account in all
-  of them. An operator start deletes the hold in the account's profile in
-  every registered root. `accounts disable <acct>` also keeps it down, but it
-  takes the account out of dispatch too.
+  hold, or `enabled=false`, in the account's profile in any **hold root**
+  holds the account in all of them. The hold roots are every registered root,
+  plus the daemon's fallback root (its `LOOM_WORKSPACE` or working directory)
+  when that is not registered. The pass reads holds in exactly these roots.
+  The CLI lifts and shows them in the same roots, plus its own `--workspace`
+  (#10661). The CLI runs in another process, so the daemon records its
+  fallback root in `~/.loom/session-reconcile-fallback-root.json`
+  (`LOOM_SESSION_FALLBACK_ROOT_FILE` overrides the path) when the reconcile
+  loop starts. Without that record the CLI uses the registered roots and its
+  own. A stale record only adds a root. The record is one per home
+  directory: two daemons sharing a `$HOME` keep only the last one's root,
+  and the other's fallback root gets the pre-#10661 behaviour. An operator
+  start deletes the hold in every hold root. `accounts disable <acct>` also keeps it down, but it takes
+  the account out of dispatch too.
+- **An operator start has two phases.** First the CLI prepares: it inspects
+  the container and, if it is missing, checks for the image and pulls it.
+  The hold is still in place, so a failure or a Ctrl-C here leaves the
+  account **held** and down, exactly as before the start. Then the start
+  deletes the hold, *before* its own `docker start`/`run`, so it can never
+  leave the container running and held. **Lift succeeded, start failed:** if
+  that `docker start`/`run` fails (or is interrupted), the account is
+  **unheld and down**. The reconciler then owns it. It restarts the container
+  on the per-account backoff above, because the operator asked for it to
+  run. To keep it down instead, run `accounts session stop`.
 - An operator `session start` also records its workspace and image in
   `.session-last-start.json` next to the hold. A container recreated after a
   daemon restart uses those values. If that record cannot be written, the
@@ -9272,8 +9328,11 @@ The drift path follows four safety rules:
    own mounts include a path the loaded roster denies. If the registry or
    roster cannot be read it is left running, with a WARN; if none of its
    mounts is denied it is left running too, the record is kept (it still
-   blocks any recreate) and a WARN on a backoff cadence says so, so an
-   operator can clear it with `accounts session start`. A stale record alone
+   blocks any recreate) and a WARN says so, so an operator can clear it with
+   `accounts session start`. The WARN comes on passes 1, 2, 4, 8 and so on,
+   but never more than 24 h apart (#10661). The count is in memory, so a
+   daemon restart starts it over. The first pass after a restart WARNs at
+   once. A stale record alone
    never stops a running container. A removal runs when idle, under the
    dispatch lock, with a WARN on every attempt and the per-account backoff
    while it keeps failing. A stopped container whose own mounts include a
@@ -9310,7 +9369,10 @@ The drift path follows four safety rules:
    holds when they run as the same user with the same environment. If they
    differ, each side silently locks its own file and only `docker top`
    protects a starting dispatch. Test suites set `LOOM_SESSION_LOCK_DIR` to a
-   temporary directory and fail if the real one changed. The `docker top` check remains as the second
+   temporary directory and fail if the real one changed. They also check that
+   the expected fixture lock appeared in that temporary directory (#10661).
+   Otherwise a regression that re-opens a pre-existing real lock would go
+   unseen, because it changes neither the lock's presence nor its mtime. The `docker top` check remains as the second
    line.
 
 **Known gap: a session started on one checkout.** A container started with

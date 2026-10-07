@@ -281,3 +281,69 @@ fn succeeded_reports_false_for_a_nonzero_exit() {
     assert!(!c.succeeded());
     assert!(c.output().is_some(), "a completed execution still yields its Output");
 }
+
+// ---- #10661: forwarding an interactive caller's signal --------------------
+
+#[test]
+fn forwarding_without_a_pending_signal_is_run_bounded() {
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "echo out; exit 4"]);
+    let completion = run_bounded_forwarding(
+        cmd,
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        &|| None,
+        |_| {},
+    )
+    .unwrap();
+    let Completion::Exited(output) = completion else {
+        panic!("timed out")
+    };
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "out");
+}
+
+#[test]
+fn a_forwarded_signal_reaches_the_group_and_the_childs_own_exit_is_kept() {
+    let start = Instant::now();
+    let pending = move || (start.elapsed() >= Duration::from_millis(200)).then_some(libc::SIGTERM);
+    let mut cmd = Command::new("sh");
+    cmd.args([
+        "-c",
+        "trap 'kill $! 2>/dev/null; exit 9' TERM; sleep 30 & wait",
+    ]);
+    let completion = run_bounded_forwarding(
+        cmd,
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+        &pending,
+        |_| {},
+    )
+    .unwrap();
+    let Completion::Exited(output) = completion else {
+        panic!("timed out")
+    };
+    assert_eq!(output.status.code(), Some(9), "the child handled the forwarded SIGTERM");
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn a_child_ignoring_a_forwarded_signal_is_killed_after_the_grace() {
+    let start = Instant::now();
+    let pending = move || (start.elapsed() >= Duration::from_millis(100)).then_some(libc::SIGINT);
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "trap '' INT; sleep 30"]);
+    let error = run_bounded_forwarding(
+        cmd,
+        Duration::from_secs(30),
+        Duration::from_millis(300),
+        &pending,
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, ExecError::Collect(e) if e.kind() == io::ErrorKind::Interrupted),
+        "{error}"
+    );
+    assert!(start.elapsed() < Duration::from_secs(10), "{:?}", start.elapsed());
+}
