@@ -146,6 +146,7 @@ pub mod recalibrate;
 pub mod recency;
 pub mod regime;
 pub mod repo_priority;
+pub mod retire_filing;
 pub mod roster_history;
 pub mod score;
 pub mod shadow;

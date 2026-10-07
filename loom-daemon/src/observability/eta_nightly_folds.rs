@@ -27,6 +27,14 @@
 //! - **No forge call.** It reads this host's journals, the cached fleet
 //!   snapshots and, when present, an offline merged-PR cache. See
 //!   [`crate::eta::nightly_folds`].
+//! - **Retirement filing (#10525).** With `autonomous.eta.nightlyFolds.
+//!   retirementFiling` (default **off**), each captain tick that has the folds
+//!   saved then runs [`file_retirements`]: the same path as `loom-daemon eta
+//!   retire --file` ([`crate::eta::retire_filing`]), which re-checks the
+//!   captain gate, dedups against its ledger and the forge, and fails closed
+//!   if the forge cannot be searched. It files issues only; it never
+//!   unregisters a heuristic. An error is logged at `warn`, never fatal to the
+//!   fold job, and retried next tick.
 //! - **Config.** `autonomous.eta.nightlyFolds.enabled` /
 //!   `LOOM_ETA_NIGHTLY_FOLDS_ENABLED`, default on (and only with
 //!   `autonomous.eta.enabled`); read at spawn. Default on because the gate
@@ -203,6 +211,16 @@ pub fn fold_due(root: &Path) -> Vec<DayRecords> {
     )
 }
 
+/// File retirement proposals from the saved folds (#10525). Logs the outcome;
+/// an error is a `warn`, never fatal to the fold job.
+pub fn file_retirements(root: &Path, host_id: &str) {
+    match crate::eta::retire_filing::run_scheduled(root, host_id) {
+        Ok(r) if r.filed.is_empty() => {}
+        Ok(r) => log::info!("eta retirement filing: filed {:?}; already {:?}", r.filed, r.already),
+        Err(e) => log::warn!("eta retirement filing: {e}"),
+    }
+}
+
 /// Start the nightly folds for `workspace_root`. `None` when disabled.
 pub fn spawn_task(
     workspace_root: PathBuf,
@@ -219,6 +237,7 @@ pub fn spawn_task(
         );
         return None;
     }
+    let file_retirement_proposals = config.retirement_filing_enabled;
     let sink: Option<Arc<dyn QueueSink>> = (!otlp_queues.is_empty())
         .then(|| Arc::new(FanoutQueue::new(otlp_queues)) as Arc<dyn QueueSink>);
     Some(tokio::spawn(async move {
@@ -237,6 +256,9 @@ pub fn spawn_task(
             let tick = move || {
                 let days = fold_due(&root);
                 deliver_pending(&root, tick_sink.as_deref(), &tick_host);
+                if file_retirement_proposals {
+                    file_retirements(&root, &tick_host);
+                }
                 days
             };
             match tokio::task::spawn_blocking(tick).await {
