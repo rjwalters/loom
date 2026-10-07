@@ -59,6 +59,8 @@ cat > "$RUNNER" <<'EOF'
 set -euo pipefail
 # shellcheck disable=SC1090
 source "$LOOM_TEST_HARNESS"
+# shellcheck disable=SC1090
+[[ -z "${RACE_HOOK:-}" ]] || source "$RACE_HOOK"
 loom_test_require_daemon_bin "$@"
 loom_test_require_daemon_bin "$@"
 loom_test_skip "fixture skip"
@@ -132,6 +134,24 @@ assert_eq "0" "$rc" "the override accepts the other checkout's build"
 assert_contains "allowed by LOOM_TEST_ALLOW_DAEMON_MISMATCH=1" "$out" "…and the line says it was allowed"
 run CARGO_TARGET_DIR="$WORKDIR/none" LOOM_TEST_ALLOW_DAEMON_MISMATCH=1 -- "$SCRIPTS" sub
 assert_eq "1" "$rc" "…but never re-enables the installed binary on PATH"
+
+echo "P10: the shared file is replaced between the check and the snapshot"
+# The #8176 clobber, aimed at the provenance check: the hook wraps a step the
+# harness runs AFTER choosing the candidate and BEFORE copying it, and uses it
+# to overwrite the shared file with another commit's build — what a concurrent
+# `cargo build` in another worktree does. The verdict must be the copy's.
+RACED="$WORKDIR/raced"
+fake_bin "$RACED/debug/loom-daemon" "$(ver "$HEAD_SHA" clean)"
+fake_bin "$WORKDIR/foreign/loom-daemon" "$(ver "$OTHER_SHA" clean)"
+cat > "$WORKDIR/race-hook.sh" <<EOF
+_loom_test_daemon_bin_fingerprint() { cp "$WORKDIR/foreign/loom-daemon" "\$1"; echo raced; }
+EOF
+run CARGO_TARGET_DIR="$RACED" RACE_HOOK="$WORKDIR/race-hook.sh" -- "$SCRIPTS" sub
+assert_eq "1" "$rc" "the harness fails when the file it chose was replaced before the copy"
+assert_contains "daemon under test: $RACED/debug/loom-daemon ($(ver "$OTHER_SHA" clean)) — source $OTHER_SHA is NOT this checkout's HEAD $HEAD_SHA" "$out" \
+    "…reporting the commit the pinned copy actually carries"
+assert_contains "private copy of candidate $RACED/debug/loom-daemon" "$out" "…and that it checked the private copy of that candidate"
+assert_not_contains "source matches HEAD" "$out" "…never certifying the file it checked before the swap"
 
 echo "P8: skips are announced and counted"
 run CARGO_TARGET_DIR="$SHARED" LOOM_TEST_ALLOW_DAEMON_MISMATCH=1 -- "$SCRIPTS" sub
