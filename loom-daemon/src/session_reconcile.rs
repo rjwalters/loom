@@ -779,6 +779,13 @@ fn reconcile_one<R: ContainerRunner>(
         // `stop` wrote its hold while we were inspecting.
         return Err(OperatorHeld.into());
     }
+    // A recorded fail-closed removal is finished, never undone: a container
+    // still present under it is removed, never started (#10364).
+    if inspect.is_some() {
+        if let Some(outcome) = drift::finish_recorded_removal(lifecycle, account, ctx, mem)? {
+            return Ok(outcome);
+        }
+    }
     if std::mem::take(&mut mem.awaiting_confirm) {
         if !state.as_ref().is_some_and(|s| s.running) {
             anyhow::bail!(
@@ -875,6 +882,14 @@ fn reconcile_one<R: ContainerRunner>(
             Outcome::PrivateCloneSkipped
         }
         Decision::Resume { workspace } => {
+            // Never `docker start` a container that mounts a denied path.
+            if let Some(inspect) = inspect {
+                if let Some(out) =
+                    drift::denied_while_stopped(lifecycle, account, inspect, ctx, mem)?
+                {
+                    return Ok(out);
+                }
+            }
             lifecycle.start_unless_held(name, workspace.as_deref(), &is_held)?;
             mem.awaiting_confirm = true;
             log::warn!("session_reconcile: {container}: was stopped; resumed it (docker start)");

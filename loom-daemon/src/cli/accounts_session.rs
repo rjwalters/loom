@@ -113,9 +113,27 @@ pub(crate) fn handle_session_command(
     }
 
     fn print_session_status(status: &SessionStatus, json: bool) -> Result<()> {
+        // The reconciler's fail-closed removal record (#10364), read from the
+        // profile so `SessionStatus` itself is unchanged.
+        let removal = loom_daemon::tokens_pool::session_drift_removal::read(std::slice::from_ref(
+            &status.codex_home,
+        ));
         if json {
-            println!("{}", serde_json::to_string_pretty(status)?);
-        } else {
+            let mut value = serde_json::to_value(status)?;
+            value["drift_removal"] = serde_json::to_value(&removal)?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            return Ok(());
+        }
+        let removed = removal.as_ref().map(|r| {
+            let denied: Vec<String> = r.denied.iter().map(|p| p.display().to_string()).collect();
+            format!(
+                ", removed (denied mount: {}) at unix_ms={} by the session reconciler; it stays \
+                 down until the denial no longer applies or an operator `session start`",
+                denied.join(", "),
+                r.removed_at_unix_ms
+            )
+        });
+        {
             println!(
                 "{}: {} (container={}, id={}, image={}, started_at={}, codex_home={}, \
                  mount={}, session_managed={}, workspace={}, workspace_mode={})",
@@ -142,6 +160,9 @@ pub(crate) fn handle_session_command(
                     .map_or_else(|| "-".to_string(), |w| w.display().to_string()),
                 status.workspace_mode,
             );
+            if let Some(removed) = removed {
+                println!("{}: {}", status.name, removed.trim_start_matches(", "));
+            }
         }
         Ok(())
     }
@@ -206,6 +227,7 @@ pub(crate) fn handle_session_command(
             }
             let peers = peer_roots(&workspace);
             let lock = loom_daemon::tokens_pool::session_dispatch_lock::for_operator_stop;
+            let workspace_for_lock = workspace.clone();
             let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
                 .with_peer_roots(peers);
             // A dispatch that is only starting is invisible to `docker top`;
@@ -213,8 +235,27 @@ pub(crate) fn handle_session_command(
             let _no_dispatch = if force {
                 None
             } else {
-                // The lock is keyed by the resolved account's container.
-                Some(lock(&lifecycle.status(&name)?.container_name)?)
+                // The lock is keyed by the resolved account's container. A
+                // reference that does not resolve here is left to `stop`
+                // itself to report; a failed `docker inspect` must not abort
+                // the stop, so the container name is resolved from the
+                // accounts registry, not from `status` (no docker call).
+                let resolved = loom_daemon::tokens_pool::account_registry::account_inventory(
+                    &workspace_for_lock,
+                    loom_daemon::tokens_pool::account_registry::AccountProvider::Codex,
+                )
+                .ok()
+                .and_then(|inventory| {
+                    inventory.into_iter().find(|a| {
+                        loom_daemon::tokens_pool::account_registry::account_matches_reference(
+                            a, &name,
+                        )
+                    })
+                })
+                .map_or_else(|| name.clone(), |account| account.id.name);
+                let container =
+                    loom_daemon::tokens_pool::session_lifecycle::container_name(&resolved);
+                Some(lock(&container)?)
             };
             print_session_status(&lifecycle.stop(&name, force)?, json)
         }

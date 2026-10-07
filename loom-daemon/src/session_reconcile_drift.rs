@@ -30,13 +30,23 @@
 //!    asked of [`PassInputs::would_create_accept`], which in production is
 //!    [`session_mount_gate::create_roots`] — the function
 //!    `ProcessContainerRunner::create` itself calls, with the same argument.
-//! 3. **A removal is never repeated, and never undone by the pass.** A
-//!    fail-closed removal is recorded on disk first
-//!    ([`session_drift_removal`]). While the record stands, the
-//!    missing-container path does not recreate the container
-//!    ([`removal_stands`]) and a container that reappears with a denied
-//!    mount is WARNed about, not removed again. The record is cleared only
-//!    when the denial positively no longer applies, or by an operator start.
+//! 3. **A removal is finished, never undone.** A fail-closed removal is
+//!    recorded on disk first ([`session_drift_removal`]). While the record
+//!    stands the pass never `docker start`s or creates the account's
+//!    container: not on the missing-container path ([`removal_stands`]) and
+//!    not on the stopped-container path. A container that is still present
+//!    under the record — a `docker rm` that failed after its `docker stop`,
+//!    or one something outside the pass started again — has its removal
+//!    finished ([`finish_recorded_removal`]): when idle, under the dispatch
+//!    lock, WARNed and retried on the pass's backoff while it fails. A
+//!    stopped container whose own mounts include a positively denied path is
+//!    never resumed either ([`denied_while_stopped`]); it is recorded and
+//!    removed. The trade-off: a containment gap is never left open to bound
+//!    churn. The churn is bounded anyway, because the pass itself never
+//!    brings such a container back — only an outside actor can, and each
+//!    time it does the container is removed again. The record is cleared
+//!    only when the denial positively no longer applies, or by an operator
+//!    start.
 //! 4. **A dispatch is never stopped**, including one that is only starting:
 //!    the teardown takes the per-container dispatch lock exclusively
 //!    ([`session_dispatch_lock`]) right before `docker stop` and defers if a
@@ -376,12 +386,6 @@ pub(super) fn reconcile_running<R: ContainerRunner>(
             let why = format!("recreating against {} is refused: {error:#}", workspace.display());
             return Ok(unachievable(&container, name, drift, &why, mem));
         }
-        if session_drift_removal::read(inputs.index.profiles(name)).is_some() {
-            // Removed once for a denial and it is back (started by something
-            // that does not share this pass's verdict). Never remove twice.
-            let why = "it was already removed once for a denied mount and has been started again";
-            return Ok(unachievable(&container, name, drift, why, mem));
-        }
     }
     let snapshot_id = inspect["Id"].as_str().unwrap_or_default();
     match lifecycle.runner().inspect(&container)? {
@@ -450,20 +454,21 @@ pub(super) fn reconcile_running<R: ContainerRunner>(
     Ok(Outcome::DriftRecreated { workspace, drift })
 }
 
-/// Whether a recorded fail-closed removal still forbids recreating `name`'s
-/// missing container against `workspace`. It stands unless every input can
-/// be read and says the denial is over: the registry is known, the denials
-/// for the workspace load, `create` would accept the workspace, and none of
-/// the recorded paths is still both denied and about to be mounted.
-/// Clears the record (and returns `None`) once it no longer stands.
-pub(super) fn removal_stands(
+/// The removal recorded for `name`, if it still stands for `workspace`. It
+/// stands unless every input can be read and says the denial is over: the
+/// registry is known, the denials for the workspace load, `create` would
+/// accept the workspace, and none of the recorded paths is still both denied
+/// and about to be mounted. Clears the record (and returns `None`) once it no
+/// longer stands.
+fn standing(
     name: &str,
-    workspace: &Path,
+    workspace: Option<&Path>,
     inputs: &PassInputs<'_>,
-    account_mem: &mut AccountMemory,
-) -> Option<Outcome> {
+    mem: &mut DriftMemory,
+) -> Option<DriftRemoval> {
     let profiles = inputs.index.profiles(name);
     let removal = session_drift_removal::read(profiles)?;
+    let workspace = workspace.unwrap_or(&removal.workspace);
     let over = || -> Option<()> {
         let registered = inputs.registered?;
         let denials = (inputs.denials_for)(workspace).ok()?;
@@ -477,17 +482,29 @@ pub(super) fn removal_stands(
         };
         (removal.schema_version == 1 && !removal.denied.iter().any(still)).then_some(())
     };
-    let mem = &mut account_mem.drift;
-    if over().is_some() {
+    if workspace.parent().is_some() && over().is_some() {
         log::info!(
             "session_reconcile: {} (account {name}): the denied mount it was removed for no \
-             longer applies; recreating it",
+             longer applies; normal reconcile resumes",
             container_name(name)
         );
         session_drift_removal::clear(profiles);
         mem.removal_reported = false;
         return None;
     }
+    Some(removal)
+}
+
+/// Missing container: whether a recorded removal still forbids recreating
+/// it against `workspace` ([`standing`]).
+pub(super) fn removal_stands(
+    name: &str,
+    workspace: &Path,
+    inputs: &PassInputs<'_>,
+    account_mem: &mut AccountMemory,
+) -> Option<Outcome> {
+    let mem = &mut account_mem.drift;
+    let removal = standing(name, Some(workspace), inputs, mem)?;
     if !std::mem::replace(&mut mem.removal_reported, true) {
         log::warn!(
             "session_reconcile: {} (account {name}) stays down: it was removed for mounting {} \
@@ -500,4 +517,124 @@ pub(super) fn removal_stands(
         );
     }
     Some(Outcome::DriftRemovalStands)
+}
+
+/// A container that is still **present** (running, stopped or restarting)
+/// while a removal record stands — a `docker rm` that failed after the
+/// `docker stop`, or something outside the pass started it again. The pass
+/// never starts it; it finishes the removal ([`teardown`]): deferred while
+/// busy, retried on the pass's backoff while the teardown fails, WARNed each
+/// attempt. `None`: no standing record, carry on as usual.
+pub(super) fn finish_recorded_removal<R: ContainerRunner>(
+    lifecycle: &mut SessionLifecycle<R>,
+    account: &AccountDescriptor,
+    inputs: &PassInputs<'_>,
+    account_mem: &mut AccountMemory,
+) -> anyhow::Result<Option<Outcome>> {
+    let name = account.id.name.as_str();
+    let Some(removal) = standing(name, None, inputs, &mut account_mem.drift) else {
+        return Ok(None);
+    };
+    account_mem.awaiting_confirm = false;
+    let why = format!(
+        "it was removed for mounting {} ({}) and is present again",
+        paths(&removal.denied),
+        removal.reason
+    );
+    Ok(Some(match teardown(lifecycle, name, inputs, &mut account_mem.drift, &why)? {
+        Ok(()) => Outcome::DriftRemoved {
+            drift: MountDrift {
+                missing: Vec::new(),
+                extra: removal.denied,
+            },
+        },
+        Err(deferred) => deferred,
+    }))
+}
+
+/// A **stopped** container about to be resumed: if its own mounts include a
+/// positively denied path (the denials for its workspace loaded and refuse
+/// one), it is never `docker start`ed. The removal is recorded first, then
+/// finished like any recorded removal. `None`: nothing positively denied
+/// (an unreadable roster is not a denial), resume as usual.
+pub(super) fn denied_while_stopped<R: ContainerRunner>(
+    lifecycle: &mut SessionLifecycle<R>,
+    account: &AccountDescriptor,
+    inspect: &Value,
+    inputs: &PassInputs<'_>,
+    account_mem: &mut AccountMemory,
+) -> anyhow::Result<Option<Outcome>> {
+    let Some(label) = workspace_label(inspect).filter(|_| !is_private_clone(inspect)) else {
+        return Ok(None);
+    };
+    let Ok(denials) = (inputs.denials_for)(label) else {
+        return Ok(None);
+    };
+    let Assessed { denied, .. } = assess(inspect, inputs.registered.unwrap_or(&[]), Some(&denials));
+    if denied.is_empty() {
+        return Ok(None);
+    }
+    let removal = DriftRemoval {
+        schema_version: 1,
+        workspace: label.to_path_buf(),
+        denied: denied.clone(),
+        reason: "the stopped container mounts a denied path".into(),
+        removed_at_unix_ms: now_unix_ms(),
+    };
+    if let Err(error) = session_drift_removal::record(&account.credential_reference, &removal) {
+        // Neither started nor removed: it stays stopped, and the next pass
+        // asks again.
+        anyhow::bail!("not resuming a container that mounts {}: {error:#}", paths(&denied));
+    }
+    finish_recorded_removal(lifecycle, account, inputs, account_mem)
+}
+
+/// Stop and remove `name`'s container under the dispatch lock: `Ok(Ok)`
+/// when it is gone (or already was), `Ok(Err(deferred))` when a dispatch is
+/// in flight or the lock state is unknown. A failed stop/rm is WARNed every
+/// time and returned as `Err`, which takes the pass's per-account backoff.
+fn teardown<R: ContainerRunner>(
+    lifecycle: &mut SessionLifecycle<R>,
+    name: &str,
+    inputs: &PassInputs<'_>,
+    mem: &mut DriftMemory,
+    why: &str,
+) -> anyhow::Result<Result<(), Outcome>> {
+    let container = container_name(name);
+    let Some(now) = lifecycle.runner().inspect(&container)? else {
+        return Ok(Ok(()));
+    };
+    if now.running && lifecycle.runner().has_active_exec(&container)? {
+        let detail = "an in-flight `docker exec`; finishing the removal once it is idle";
+        return Ok(Err(defer(&container, DeferReason::Busy, detail, mem)));
+    }
+    if inputs.index.is_held(name) {
+        return Err(OperatorHeld.into());
+    }
+    let _teardown = match session_dispatch_lock::try_exclusive(inputs.dispatch_locks, &container) {
+        Exclusive::Acquired(lock) => lock,
+        Exclusive::Busy => {
+            let detail = "a dispatch is starting or running; finishing the removal later";
+            return Ok(Err(defer(&container, DeferReason::Busy, detail, mem)));
+        }
+        Exclusive::Unknown(lock_error) => {
+            let detail = format!("the dispatch lock is unusable ({lock_error}); not stopping it");
+            return Ok(Err(defer(&container, DeferReason::LockUnknown, &detail, mem)));
+        }
+    };
+    if let Err(error) = lifecycle.runner().stop_and_remove(&container, STOP_GRACE) {
+        log::warn!(
+            "session_reconcile: {container} (account {name}): {why}; removing it failed \
+             ({error:#}). It is never started while this lasts; retrying on the backoff schedule"
+        );
+        return Err(error);
+    }
+    log::warn!(
+        "session_reconcile: {container} (account {name}): {why}; stopped and removed it. It \
+         stays down until the denial no longer applies, or until `loom-daemon accounts session \
+         start {name} --mount-workspace <checkout parent>`"
+    );
+    mem.deferred = None;
+    mem.removal_reported = true;
+    Ok(Ok(()))
 }

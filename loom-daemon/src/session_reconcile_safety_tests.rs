@@ -86,7 +86,7 @@ impl FakeDocker {
     }
 }
 
-fn ws_with(repos: &[&str]) -> (tempfile::TempDir, PathBuf) {
+pub(super) fn ws_with(repos: &[&str]) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
     for repo in repos {
@@ -336,7 +336,8 @@ fn an_unreadable_roster_tears_nothing_down() {
 
 // ---- rule 3: a removal is recorded, never repeated, cleared by an operator --
 
-fn removed_for_a_firewalled_repo() -> (Env, tempfile::TempDir, PathBuf, SessionLifecycle<Fake>) {
+pub(super) fn removed_for_a_firewalled_repo(
+) -> (Env, tempfile::TempDir, PathBuf, SessionLifecycle<Fake>) {
     let env = setup(&["alice"], &["alice"]);
     let (ws_dir, ws) = ws_with(&["a", "walled"]);
     let lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
@@ -355,7 +356,7 @@ fn removed_for_a_firewalled_repo() -> (Env, tempfile::TempDir, PathBuf, SessionL
 
 #[test]
 #[serial]
-fn a_removal_survives_a_daemon_restart_and_a_reappearing_container_is_not_removed_again() {
+fn a_removal_survives_a_daemon_restart_and_a_reappearing_container_is_removed_never_recreated() {
     let (env, _ws_dir, ws, mut lifecycle) = removed_for_a_firewalled_repo();
     let fake = lifecycle.runner().clone();
     let out = pass(&mut lifecycle, &env, &host, &mut ReconcileState::default(), 0);
@@ -367,21 +368,24 @@ fn a_removal_survives_a_daemon_restart_and_a_reappearing_container_is_not_remove
         pass(&mut lifecycle, &env, &host, &mut ReconcileState::default(), 60),
         vec![Outcome::DriftRemovalStands]
     );
-    // Something that does not share the verdict brings it back, denied mount
-    // and all: it is reported, not removed a second time.
+    // Something outside the pass brings it back, denied mount and all: the
+    // record still stands, so it is removed again (when idle) and the pass
+    // itself never starts or recreates it. The cycle is bounded because only
+    // that outside actor ever brings it back.
     let container = container_name("alice");
     fake.seed(&container, true, false, Some(&ws));
     let mounts = vec![ws.join("a"), ws.join("walled")];
     fake.mounts.lock().unwrap().insert(container, mounts);
     let mut state = ReconcileState::default();
-    for now in [120, 180] {
-        assert_eq!(
-            pass(&mut lifecycle, &env, &host, &mut state, now),
-            vec![Outcome::DriftUnachievable]
-        );
-    }
-    assert_eq!(fake.count("stop_and_remove"), 1);
+    let out = pass(&mut lifecycle, &env, &host, &mut state, 120);
+    assert!(matches!(out[..], [Outcome::DriftRemoved { .. }]), "{out:?}");
+    assert_eq!(
+        pass(&mut lifecycle, &env, &host, &mut state, 180),
+        vec![Outcome::DriftRemovalStands]
+    );
+    assert_eq!(fake.count("stop_and_remove"), 2);
     assert_eq!(fake.count("create"), 0);
+    assert_eq!(fake.count("start_existing"), 0);
 }
 
 #[test]

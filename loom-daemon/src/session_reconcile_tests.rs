@@ -24,6 +24,8 @@ use crate::tokens_pool::session_state::{classify_inspect, Observed};
 
 #[path = "session_reconcile_drift_tests.rs"]
 mod drift_tests;
+#[path = "session_reconcile_removal_tests.rs"]
+mod removal_tests;
 #[path = "session_reconcile_safety_tests.rs"]
 mod safety_tests;
 
@@ -86,6 +88,9 @@ struct FakeState {
     start_times_out: Mutex<bool>,
     /// `docker stop` hits its deadline (a drift recreate's teardown).
     stop_times_out: Mutex<bool>,
+    /// The next N `stop_and_remove` calls stop the container, then fail the
+    /// `docker rm` (it stays present, stopped).
+    rm_fails: Mutex<u32>,
 }
 
 impl FakeState {
@@ -281,6 +286,15 @@ impl ContainerRunner for Fake {
             .into());
         }
         let mut containers = self.containers.lock().unwrap();
+        let mut rm_fails = self.rm_fails.lock().unwrap();
+        if *rm_fails > 0 {
+            *rm_fails -= 1;
+            if let Some(state) = containers.get_mut(container) {
+                state.running = false;
+                state.restarting = false;
+            }
+            bail!("docker rm {container} failed: removal of container is already in progress");
+        }
         if std::mem::take(&mut *self.start_races_stop.lock().unwrap()) {
             if let Some(state) = containers.get_mut(container) {
                 state.running = true;

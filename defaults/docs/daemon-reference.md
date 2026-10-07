@@ -8928,18 +8928,26 @@ The drift path follows four safety rules:
    the recreate would be accepted, using the same function `session start`'s
    `docker run` path uses, with the same workspace
    (`tokens_pool/session_mount_gate.rs`). There is no second implementation.
-3. **A removal is recorded, never repeated, and never undone by the pass.**
+3. **A removal is recorded, finished, and never undone by the pass.**
    When an idle container mounts a positively denied path and no start would
    be accepted, it is stopped and removed, with a WARN naming the container
    and the path, and `.session-drift-removed.json` is written in the account's
    profile directory first (if that write fails, nothing is removed). While
-   the record stands the pass does not recreate the container, across daemon
-   restarts, and a container that reappears with the denied mount is WARNed
-   about but not removed a second time. The record is cleared when the denial
+   the record stands the pass never `docker start`s or recreates the
+   container, across daemon restarts. If the container is still present (the
+   `docker rm` failed after the `docker stop`, or something outside the pass
+   started it again), the pass finishes the removal: when idle, under the
+   dispatch lock, with a WARN on every attempt and the per-account backoff
+   while it keeps failing. A stopped container whose own mounts include a
+   positively denied path is never resumed: it is recorded and removed the
+   same way. The trade-off is deliberate: the pass never leaves a denied
+   mount running to avoid churn. Churn stays bounded because the pass itself
+   never brings such a container back. The record is cleared when the denial
    positively no longer applies (the repository was deregistered, or the
    roster no longer marks it), or by an operator `accounts session start`.
-   It is not an operator hold: `session status` does not show the account as
-   held, and the pass never writes or lifts `.session-hold.json`. Until it
+   `accounts session status` shows it as `removed (denied mount: <path>) at
+   unix_ms=<ms>`, and `--json` carries it as `drift_removal`. It is not an
+   operator hold: `session status` does not show the account as held, and the pass never writes or lifts `.session-hold.json`. Until it
    clears, Codex ticks for that account fall through to the next
    `rolePreference` runtime.
 4. **A dispatch is never stopped, including one that is only starting.**
@@ -8954,7 +8962,17 @@ The drift path follows four safety rules:
    the teardown is deferred too. A dispatch that finds a teardown in progress
    waits up to 30 s for it, and proceeds unlocked if the lock is unusable.
    `accounts session stop` without `--force` takes the same lock and refuses
-   while a dispatch holds it. The `docker top` check remains as the second
+   while a dispatch holds it; if the lock is unusable it says so and falls
+   back to the `docker top` check alone. Lock files persist: one empty file
+   per session container that has ever been dispatched to or torn down,
+   never deleted (deleting a `flock`ed file would split later holders onto a
+   new inode), so the directory stays small and bounded by the number of
+   accounts. The lock is per `$HOME` (or per `LOOM_SESSION_LOCK_DIR`): the
+   daemon and the dispatches it launches must resolve the same one, which
+   holds when they run as the same user with the same environment. If they
+   differ, each side silently locks its own file and only `docker top`
+   protects a starting dispatch. Test suites set `LOOM_SESSION_LOCK_DIR` to a
+   temporary directory and fail if the real one changed. The `docker top` check remains as the second
    line.
 
 **Known gap: a session started on one checkout.** A container started with

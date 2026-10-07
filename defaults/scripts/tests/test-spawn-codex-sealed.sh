@@ -49,7 +49,7 @@ check() { # <description> <command...>: passes when the command succeeds
 }
 
 TMPROOT="$(mktemp -d)"
-trap 'rm -rf "$TMPROOT"' EXIT
+source "$SCRIPT_DIR/lib/session-lock-sandbox.sh" "$TMPROOT"
 WS="$TMPROOT/ws"
 mkdir -p "$WS/.loom/hooks"
 cp "$SCRIPTS_DIR/../hooks/guard-codex-bridge.sh" "$WS/.loom/hooks/"

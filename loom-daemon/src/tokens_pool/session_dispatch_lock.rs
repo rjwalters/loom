@@ -22,6 +22,12 @@
 //! reap. The existing `docker top` check stays as the second line (it covers
 //! an operator's interactive `attach`, which takes no lock).
 //!
+//! The files persist (one empty file per container; deleting a `flock`ed
+//! file would split later holders onto a new inode). The lock only works when
+//! the daemon and its dispatches resolve the same [`lock_dir`], i.e. the same
+//! `$HOME` or `LOOM_SESSION_LOCK_DIR`; otherwise `docker top` alone protects
+//! a starting dispatch.
+//!
 //! **Fail-safe both ways.** If the lock file cannot be created or opened, a
 //! dispatch proceeds as it always did ([`shared`] returns `None`), and a
 //! teardown gets [`Exclusive::Unknown`], which the reconciler treats as
@@ -140,7 +146,14 @@ pub fn try_exclusive(dir: Option<&Path>, container: &str) -> Exclusive {
 pub fn for_operator_stop(container: &str) -> anyhow::Result<Option<DispatchLock>> {
     match try_exclusive(lock_dir().as_deref(), container) {
         Exclusive::Acquired(lock) => Ok(Some(lock)),
-        Exclusive::Unknown(_) => Ok(None),
+        Exclusive::Unknown(why) => {
+            eprintln!(
+                "note: the dispatch lock for {container} is unusable ({why}); checking for an \
+                 in-flight exec with `docker top` only, which cannot see a dispatch that is just \
+                 starting"
+            );
+            Ok(None)
+        }
         Exclusive::Busy => anyhow::bail!(
             "{container} has a dispatch starting or running; refusing to stop without \
              --force (the #5119 restart-safety contract). Retry once it finishes, or pass \
