@@ -205,6 +205,64 @@ fn lint_event(wf: &Workflow, event: Event, out: &mut Vec<CancelFinding>) {
     }
 }
 
+/// Whether the one `gh run cancel` in `code` takes its run ID from the loop
+/// variable of `... --jq '<PR-only filter>' | while read [-r] VAR; do ...`, so
+/// every cancellation target is an ID the PR-only selection emitted. Fails
+/// closed on anything else: a stage between the filter and the loop, a second
+/// cancel (including `force-cancel` and the REST `/cancel` endpoint), a cancel
+/// argument other than `$VAR`, or the loop variable being re-read or reassigned.
+fn cancel_consumes_filtered_ids(code: &str) -> bool {
+    if code.contains("force-cancel") || code.contains("/cancel") {
+        return false;
+    }
+    let norm = code
+        .replace("\\\n", " ")
+        .replace('|', " | ")
+        .replace([';', '\n'], " ; ");
+    let Some((_, list)) = norm.split_once("gh run list") else {
+        return false;
+    };
+    let Some(i) = list.find("--jq") else {
+        return false;
+    };
+    let mut quotes = list[i..].splitn(3, '\'');
+    let (Some(_), Some(_), Some(tail)) = (quotes.next(), quotes.next(), quotes.next()) else {
+        return false;
+    };
+    let toks: Vec<&str> = tail.split_whitespace().collect();
+    let mut it = toks.iter().copied();
+    if it.next() != Some("|") || it.next() != Some("while") || it.next() != Some("read") {
+        return false;
+    }
+    let mut var = it.next();
+    if var == Some("-r") {
+        var = it.next();
+    }
+    let Some(var) =
+        var.filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    else {
+        return false;
+    };
+    if it.next() != Some(";") || it.next() != Some("do") {
+        return false;
+    }
+    let body: Vec<&str> = it.collect();
+    let all: Vec<&str> = norm.split_whitespace().collect();
+    let is_cancel = |w: &[&str]| w == ["gh", "run", "cancel"];
+    if all.windows(3).filter(|w| is_cancel(w)).count() != 1 {
+        return false;
+    }
+    let assign = format!("{var}=");
+    if body.iter().any(|t| *t == "read" || t.starts_with(&assign)) {
+        return false;
+    }
+    let Some(at) = body.windows(3).position(is_cancel) else {
+        return false;
+    };
+    let arg = body.get(at + 3).map(|a| a.trim_matches('"'));
+    arg == Some(format!("${var}").as_str()) || arg == Some(format!("${{{var}}}").as_str())
+}
+
 /// Why a cancel step that runs on a PR could still reach a main run, if it can.
 /// A step with no `run:` body (a `uses:` cancel action) has a target the lint
 /// cannot inspect, so it fails closed.
@@ -239,7 +297,7 @@ fn pr_target_problem(step: &Step) -> Option<&'static str> {
             let Some(rest) = list[i..].strip_prefix(prefix) else {
                 return false;
             };
-            let Some((program, after)) = rest.split_once('\'') else {
+            let Some((program, _)) = rest.split_once('\'') else {
                 return false;
             };
             !list[..i].contains("-q")
@@ -250,9 +308,7 @@ fn pr_target_problem(step: &Step) -> Option<&'static str> {
                 && !["input", "reduce", "foreach", "limit", "env", "path"]
                     .iter()
                     .any(|w| program.contains(w))
-                && after
-                    .strip_prefix('|')
-                    .is_some_and(|c| c.contains("ghruncancel"))
+                && cancel_consumes_filtered_ids(&code)
         });
     if !only_pr_events {
         return Some("its run selection is not exactly `select(.event == \"pull_request\")`, so it can list and cancel push runs");
@@ -480,6 +536,47 @@ jobs:
         let src = PR_ONLY_CANCEL_STEP
             .replace(" | while read -r id; do", "; __GH__ run list | while read -r id; do");
         assert_eq!(lint(&[wf(&src)]).len(), 1);
+    }
+
+    /// The cancel must consume the filtered stream's IDs: a fixed or unrelated
+    /// target, an extra cancel, or a stage that replaces the IDs fails closed
+    /// (#10677 review, #10670 criterion 3).
+    #[test]
+    fn cancel_not_consuming_filtered_ids_fails_closed() {
+        let cancel = "            __GH__ run cancel $id\n";
+        for (from, to) in [
+            (cancel, "            __GH__ run cancel 123\n"),
+            (cancel, "            __GH__ run cancel $other\n"),
+            (cancel, "            __GH__ run cancel $id\n            __GH__ run cancel 123\n"),
+            (cancel, "            id=123\n            __GH__ run cancel $id\n"),
+            (cancel, "            read -r id\n            __GH__ run cancel $id\n"),
+            (cancel, "            __GH__ api -X POST repos/o/r/actions/runs/123/cancel\n"),
+            ("          done\n", "          done\n          __GH__ run cancel 123\n"),
+            (" | while read -r id; do", " | sed 's/.*/123/' | while read -r id; do"),
+        ] {
+            let src = PR_ONLY_CANCEL_STEP.replace(from, to);
+            assert_ne!(src, PR_ONLY_CANCEL_STEP, "{to}");
+            let f = lint(&[wf(&src)]);
+            assert!(
+                f.iter().any(|x| x.event == Event::PullRequest
+                    && x.detail.contains("started main run")),
+                "{to}: {f:?}"
+            );
+        }
+    }
+
+    /// The `${id}` / quoted forms and extra loop logic (as in ci.yml) stay clean.
+    #[test]
+    fn cancel_consuming_filtered_ids_in_supported_shapes_is_clean() {
+        let cancel = "            __GH__ run cancel $id\n";
+        for to in [
+            "            __GH__ run cancel \"$id\" --repo r\n",
+            "            __GH__ run cancel \"${id}\"\n",
+            "            if [[ \"$id\" != \"$CUR\" ]]; then\n              __GH__ run cancel \"$id\" || echo warn\n            fi\n",
+        ] {
+            let src = PR_ONLY_CANCEL_STEP.replace(cancel, to);
+            assert_eq!(lint(&[wf(&src)]), Vec::new(), "{to}");
+        }
     }
 
     /// The #7779 shape: the cancel job runs on every event, and on a push its
